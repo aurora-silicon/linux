@@ -39,7 +39,7 @@ impl QosIds {
         let mut used = self.used.lock();
         let id = used.trailing_ones();
         if id == 128 {
-            return Err(ENOSPC);
+            return Err(super::capacity::refused(super::capacity::Site::QosIds));
         }
         *used |= 1u128 << id;
         Ok(QosLease {
@@ -121,6 +121,8 @@ pub(crate) struct Context {
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
     render_blocks: AtomicUsize,
+    /// Timestamp pages of retired compute commands, mapped in this context's VM.
+    compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
@@ -194,11 +196,15 @@ impl Context {
             work_base,
             render,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
+            compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
         self.execution.vm()
+    }
+    pub(crate) fn compute_timestamps(&self) -> &Arc<super::completion::ComputeTimestampCache> {
+        &self.compute_timestamps
     }
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
@@ -387,7 +393,8 @@ impl WorkStateLease {
     }
 
     pub(crate) fn render_slot(&self, pair: u8) -> Result<u32> {
-        self.context.work.lock().render.get(pair).ok_or(ENOSPC)
+        self.context.work.lock().render.get(pair).ok_or_else(||
+            super::capacity::refused(super::capacity::Site::RenderWorkSlots))
     }
     pub(crate) fn channel_payload(&self, pair: u8, ordinal: u64) -> Result<u8> {
         self.context
@@ -404,5 +411,39 @@ impl Drop for WorkStateLease {
         if word != FREE {
             self.context.states.release(word);
         }
+    }
+}
+
+impl QosIds {
+    pub(crate) fn used(&self) -> u32 {
+        (*self.used.lock() & !3u128).count_ones()
+    }
+}
+
+#[kunit_tests(asahi_g17_qos_capacity)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn failed_client_construction_returns_every_qos_id() {
+        let ids = QosIds::new().unwrap();
+        for _ in 0..8 {
+            let mut clients = KVec::with_capacity(126, GFP_KERNEL).unwrap();
+            for _ in 0..126 {
+                clients.push(ids.acquire().unwrap(), GFP_KERNEL).unwrap();
+            }
+            assert_eq!(ids.used(), 126);
+            assert!(matches!(ids.acquire(), Err(ENOSPC)));
+            drop(clients);
+            assert_eq!(ids.used(), 0);
+            assert_eq!(*ids.used.lock(), 3);
+        }
+    }
+}
+
+impl Context {
+    pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>, scope: &str, index: usize) -> kernel::fmt::Result {
+        writeln!(f, "context scope={} index={} id={} work_used={} work_total={} render_used={} render_total=2",
+                 scope, index, self.id(), self.states.used(), STATE_COUNT, self.work.lock().render.used())
     }
 }

@@ -25,6 +25,7 @@ mod gpu;
 mod hw;
 mod initdata;
 mod mem;
+mod memacct;
 mod m3;
 mod microseq;
 mod mmu;
@@ -35,6 +36,7 @@ mod regs;
 mod slotalloc;
 mod stats;
 mod sysfs_exports;
+mod timestamp;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
@@ -171,6 +173,18 @@ module! {
             default: 1,
             // permissions: 0,
             description: "Export AGX firmware stats to sysfs (1 = on, 0 = off)",
+        },
+        mem_limit_pct: u32 {
+            default: 67,
+            description: "Device-wide GPU memory limit in percent of RAM (0 or >= 100: none)",
+        },
+        client_mem_limit_pct: u32 {
+            default: 50,
+            description: "Per-client GPU memory limit in percent of RAM (0: the device limit)",
+        },
+        oom_attribution: u8 {
+            default: 1,
+            description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
         },
     },
 }

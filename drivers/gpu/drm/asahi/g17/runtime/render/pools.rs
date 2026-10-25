@@ -239,3 +239,11 @@ fn descriptor_words(table: &KernelObject, id: u16) -> Result<[&AtomicU64; 4]> {
         table.dword(offset + 24)?,
     ])
 }
+
+impl Pools {
+    pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        writeln!(f, "render_pool_leases used={} total={} retained={}",
+                 self.leases.iter().flatten().filter(|lease| !lease.released()).count(),
+                 POOLS - FIRST_RENDER_POOL, self.leases.iter().flatten().count())
+    }
+}

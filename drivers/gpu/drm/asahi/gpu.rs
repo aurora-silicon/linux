@@ -11,7 +11,6 @@
 //! are unified, so that the top level of the driver itself (in `driver`) does not have to concern
 //! itself with version dependence.
 
-use crate::module_parameters;
 use core::any::Any;
 use core::ops::Range;
 use core::slice;
@@ -268,6 +267,11 @@ pub(crate) struct GpuManager {
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
+    /// Admission bound checked before copying the userspace command stream.
+    fn max_cmdbuf_size(&self) -> usize {
+        usize::MAX
+    }
+
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
 
@@ -285,6 +289,10 @@ pub(crate) trait Gpu: Send + Sync {
     fn is_crashed(&self) -> bool;
     /// Fill in the hardware description reported to userspace.
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result;
+    /// Whether unmapped GPU reads return zero (fault_control programmed into the firmware).
+    fn supports_soft_faults(&self) -> bool {
+        *crate::module_parameters::fault_control.value() == 0xb
+    }
     /// Whether user VMs retain a sticky error and support a userspace mirror.
     fn supports_vm_status(&self) -> bool {
         false
@@ -303,7 +311,7 @@ pub(crate) trait Gpu: Send + Sync {
         if self.queue_limits().is_some() {
             flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES as u64;
         }
-        if self.soft_faults() && *module_parameters::fault_control.value() == 0xb {
+        if self.soft_faults() && self.supports_soft_faults() {
             flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
         flags
@@ -312,32 +320,39 @@ pub(crate) trait Gpu: Send + Sync {
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         None
     }
+    /// The VA range that user VMs may use (`vm_start..vm_end` of GET_PARAMS).
+    fn user_range(&self) -> Range<u64> {
+        self.uat_geometry().user_usable_range()
+    }
+    /// Whether this GPU uses the tracked submission model of `file.rs` (besides G17, which
+    /// `file.rs` recognizes by type): VM_BIND batches are validated as a whole against
+    /// driver-reserved ranges before any change, and SUBMIT copies the command buffer before
+    /// resolving syncs because the queue installs a fence in every output sync even on failure.
+    fn tracked_submission(&self) -> bool {
+        false
+    }
+    /// Whether SOFT_FAULTS may be advertised when `fault_control` selects soft faults.
+    fn soft_faults(&self) -> bool {
+        true
+    }
+    /// Whether new user objects must be populated, cleaned to the point of coherency and pinned
+    /// at creation, before any CPU view exists (GPUs whose device is not DMA-coherent and whose
+    /// default CPU mappings are write-combined).
+    fn prepare_new_objects(&self) -> bool {
+        false
+    }
+    /// The largest VM_BIND batch, if the GPU's UAPI contract bounds it; with a bound, a batch also
+    /// needs at least one operation, a non-null pointer and a stride that is a multiple of 8 and at
+    /// most a page (EINVAL otherwise). `None` keeps the shared rules.
+    fn bind_batch_limit(&self) -> Option<u32> {
+        None
+    }
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
-    /// Backend-specific user address aperture; other GPUs keep their geometry's range.
-    fn user_range(&self) -> Range<u64> {
-        self.uat_geometry().user_usable_range()
-    }
-    /// Use tracked command publication and sticky VM status on this backend.
-    fn tracked_submission(&self) -> bool {
-        false
-    }
-    /// Whether faults may be reported as recoverable to userspace.
-    fn soft_faults(&self) -> bool {
-        true
-    }
-    /// Populate and clean fresh object backing before any WC CPU mapping.
-    fn prepare_new_objects(&self) -> bool {
-        false
-    }
-    /// Optional backend-specific upper bound for a VM_BIND batch.
-    fn bind_batch_limit(&self) -> Option<u32> {
-        None
-    }
-    /// A userspace VM handle was closed; release backend-only registry references.
-    fn vm_closed(&self) {}
+    /// A userspace VM handle was destroyed (VM_DESTROY); release backend-only registry references.
+    fn vm_destroyed(&self) {}
     /// Whether a file may create a VM: `params_size` is the largest size it asked GET_PARAMS
     /// for the global parameters with, `flags` its VM_CREATE flags. Every GPU but the M3
     /// T8122 runtime admits any client.
@@ -350,6 +365,13 @@ pub(crate) trait Gpu: Send + Sync {
     }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
+    /// Create a VM charged to a DRM file when the backend bounds retained bindings.
+    fn new_vm_for_file(&self, kernel_range: Range<u64>, _file_id: u64) -> Result<mmu::Vm> {
+        self.new_vm(kernel_range)
+    }
+    /// Release the backend's handle owner after closing user mapping admission.
+    /// Accepted jobs and firmware resource leases retain their own references.
+    fn vm_closed(&self, _vm: &mmu::Vm) {}
     /// Create a new user command queue.
     fn new_queue(
         &self,
@@ -359,12 +381,12 @@ pub(crate) trait Gpu: Send + Sync {
         priority: u32,
         usc_exec_base: u64,
     ) -> Result<KBox<dyn queue::Queue>>;
-    /// Map a BO as a timestamp buffer
+    /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
     fn map_timestamp_buffer(
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
-    ) -> Result<mmu::KernelMapping>;
+    ) -> Result<crate::timestamp::Buffer>;
 }
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
@@ -752,6 +774,7 @@ impl GpuManager::ver {
                 },
                 map_kernel_to_user,
                 mmu::UatFirmware::Handoff,
+                mmu::UatQuirks::DEFAULT,
             )?,
             GFP_KERNEL,
         )?)
@@ -1427,15 +1450,15 @@ impl Gpu for GpuManager::ver {
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
-    ) -> Result<mmu::KernelMapping> {
-        bo.map_range_into_range(
+    ) -> Result<crate::timestamp::Buffer> {
+        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
             self.uat.kernel_vm(),
             range,
             IOVA_KERN_TIMESTAMP_RANGE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
             false,
-        )
+        )?)
     }
 }
 

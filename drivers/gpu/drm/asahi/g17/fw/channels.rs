@@ -498,7 +498,7 @@ impl WorkSlot {
             data_master: data_master as u32,
             items_end,
             qid,
-            first: first as u8,
+            first: u8::from(first),
         })
     }
 }

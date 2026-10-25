@@ -103,7 +103,6 @@ impl drm::driver::Driver for AsahiDrmDriver {
     type ParentDevice<Ctx: DeviceContext> = platform::Device<Ctx>;
 
     const INFO: drm::driver::DriverInfo = INFO;
-    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
     const FEAT_RENDER: bool = true;
     const FEAT_SYNCOBJ: bool = true;
     const FEAT_SYNCOBJ_TIMELINE: bool = true;
@@ -152,6 +151,10 @@ kernel::of_device_table!(
         (
             of::DeviceId::new(c"apple,agx-t8140"),
             ProbeConfig::G17(&hw::t8140::CONFIG)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6040"),
+            ProbeConfig::G17(&hw::t6040::CONFIG)
         ),
         (
             of::DeviceId::new(c"apple,agx-t8103"),
@@ -233,6 +236,7 @@ impl platform::Driver for AsahiPlatformDriver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         debug::update_debug_flags();
+        crate::memacct::LEDGER.configure();
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
@@ -419,6 +423,11 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
+        if let Err(error) =
+            crate::sysfs_exports::register_idle(raw_dev, crate::g17::power::IDLE_HOLD_MS.as_ptr())
+        {
+            dev_warn!(pdev.as_ref(), "idle_off_delay_ms not registered: {:?}\n", error);
+        }
         Ok(AsahiPlatformDriverData {
             _device: reg.device().into(),
             _reg: reg,
@@ -433,7 +442,7 @@ impl AsahiPlatformDriver {
 
 impl Drop for AsahiPlatformDriverData<'_> {
     fn drop(&mut self) {
-        // SAFETY: `self.raw_dev` was set in `probe` from the platform
+        // `self.raw_dev` was set in `probe` from the platform
         // device's `as_raw()`, valid for the lifetime of the bound driver.
         if !self.raw_dev.is_null() {
             crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);

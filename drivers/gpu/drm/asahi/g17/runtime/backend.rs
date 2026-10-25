@@ -18,8 +18,39 @@ impl Backend {
     }
 
     fn stop_after_error(&self) {
+        // Scheduler/fence callbacks never synchronously join builders or RTKit
+        // receive work. The event worker performs the bounded runtime stop.
         self.shared.lose_device_quietly();
-        self.shared.stop_queues();
+    }
+
+    fn rollback_unpublished_compute(&self) -> Result {
+        // No outer preparation lease survives compute_packet's return. Hold a
+        // fresh epoch through alias destruction so recovery can join this work.
+        loop {
+        let lease = self.shared.preparations.enter(false)?;
+        let mut retired = None;
+        let mut state = self.shared.state.lock();
+        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+        if !lease.is_current() { drop(state); drop(lease); continue; }
+        let mut binding = None;
+        if let Some(index) = firmware.queues.compute.iter().position(|entry| {
+            entry.as_ref().and_then(|entry| entry.queue.as_deref())
+                .is_some_and(|queue| queue.owner() == Some(self.owner))
+        }) {
+            let entry = firmware.queues.compute[index].as_mut().ok_or(EIO)?;
+            let (cancel, replaced) = entry.queue.as_deref_mut().ok_or(EIO)?
+                .rollback_unpublished(self.owner, &self.context)?;
+            binding = replaced;
+            if cancel {
+                retired = entry.queue.take().map(|queue| (entry.reservation, queue));
+            }
+        }
+        drop(state);
+        drop(binding);
+        self.finish_uninstalled_compute(retired)?;
+        self.shared.queue_events();
+        return Ok(());
+        }
     }
 
     /// Complete all failure fanout before signalling this packet's unpublished
@@ -36,6 +67,11 @@ impl Backend {
             }
             deferred.finish();
             if !packet.is_published() {
+                if packet.engine() == Engine::Compute {
+                    if self.rollback_unpublished_compute().is_err() {
+                        self.stop_after_error();
+                    }
+                }
                 packet.completion.fail_unpublished(error);
             }
             Err(error)
@@ -46,6 +82,9 @@ impl Backend {
     }
 
     fn release_queue(&self) -> Result {
+        // A builder may own only an off-lock reservation when close arrives.
+        // Record intent before scanning queues; every later install/rearm checks it.
+        self.closed.store(true, Ordering::Release);
         let mut state = self.shared.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
@@ -75,7 +114,11 @@ impl job::Backend for Backend {
     }
 
     fn ensure_compute(&self, scs_pages: u16) -> Result {
-        Backend::ensure_compute(self, scs_pages)
+        // A reverse timeline chain must be submitted before the host signal.
+        // Validate here, but do not consume physical capacity behind unsignalled
+        // DRM dependencies. compute_packet admits it when the job can run.
+        crate::g17::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)
+            .map(|_| ())
     }
 
     fn fail_vm(&self, error: Error) {
@@ -147,7 +190,17 @@ impl job::Backend for Backend {
     }
 
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status {
+        // A packet still in publication, for example waiting for capacity or
+        // for its render pair's graph, has nothing visible to firmware and may
+        // not even have an installed pair. Its publisher owns its bounded wait
+        // and result, and it keeps its place in the backlog so that a later
+        // dependency-free command is not published from its ioctl ahead of it.
+        // It is not a hang and does not count towards the timeout storm limit.
+        if !packet.is_published() {
+            return sched::Status::NoHang;
+        }
         self.release_backlog(&packet);
+        if self.shared.watchdog_timeout() { return sched::Status::NoHang; }
         let result = match packet.engine() {
             Engine::Compute => self.timeout_compute(&packet),
             Engine::Render => self.timeout_render(&packet),
@@ -177,10 +230,47 @@ impl job::Backend for Backend {
         if packet.engine() == Engine::Compute {
             return self.defer_compute_timeout(packet, renewals);
         }
-        let mut state = self.shared.state.lock();
-        (*state)
-            .as_deref_mut()
-            .is_some_and(|firmware| firmware.queues.defer_render_timeout(packet, ETIMEDOUT))
+        use crate::g17::timeout::{self, Decision};
+        // As for compute, a final retirement pass precedes the attribution, and all completion
+        // callbacks run after releasing the device mutex. Without a collector the attribution
+        // goes ahead without that pass, as it did before it existed.
+        let mut deferred = DeferredBatch::worker().ok();
+        let result = (|| -> Result<bool> {
+            let mut state = self.shared.state.lock();
+            let Some(firmware) = (*state).as_deref_mut() else {
+                return Ok(false);
+            };
+            if let Some(deferred) = deferred.as_mut() {
+                firmware.scan_renders(deferred)?;
+            }
+            // Borrowed-graph and queued-retirement deferrals share the renewal bound.
+            if timeout::transaction_grace(renewals)
+                && firmware.queues.defer_render_timeout(packet, ETIMEDOUT)
+            {
+                return Ok(true);
+            }
+            let verdict = firmware.queues.render_timeout_decision(packet, renewals);
+            let decision = verdict.map_or(Decision::Own, |verdict| verdict.decision);
+            // As compute does: work still blocked behind another VM's older unfinished work
+            // after the whole grace is innocent, so its failure must stay non-sticky. The pair's
+            // quarantine extends the class to the pair's other groups.
+            if decision == Decision::Spare {
+                packet.completion.classify(crate::g17::recovery::Class::Spared);
+            }
+            if let Some(verdict) = verdict {
+                if let Some(blocker) = verdict.reported_blocker(renewals) {
+                    dev_warn!(self.shared.dev.as_ref(),
+                        "Render watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
+                        self.owner, verdict.own.vm, verdict.own.published, renewals, decision,
+                        blocker.vm, blocker.published, u8::from(blocker.failed));
+                }
+            }
+            Ok(decision == Decision::Defer)
+        })();
+        if let Some(deferred) = deferred.as_mut() {
+            deferred.finish();
+        }
+        matches!(result, Ok(true))
     }
 
     fn try_early(&self, packet: &Arc<Packet>) -> bool {

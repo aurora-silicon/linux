@@ -56,10 +56,16 @@ pub(crate) struct Frontend {
     allocation_failure: Fence,
     range: Range<u64>,
     window: UscWindow,
+    variant: &'static crate::g17::fw::Variant,
 }
 
 impl Frontend {
-    pub(crate) fn new(priority: u32, usc_base: u64, range: Range<u64>) -> Result<Self> {
+    pub(crate) fn new(
+        priority: u32,
+        usc_base: u64,
+        range: Range<u64>,
+        variant: &'static crate::g17::fw::Variant,
+    ) -> Result<Self> {
         if priority > 3 {
             return Err(EINVAL);
         }
@@ -71,6 +77,7 @@ impl Frontend {
             allocation_failure,
             range,
             window,
+            variant,
         })
     }
 }
@@ -85,6 +92,7 @@ pub(crate) struct Queue<B: Backend> {
     allocation_failure: Fence,
     range: Range<u64>,
     window: UscWindow,
+    variant: &'static crate::g17::fw::Variant,
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
@@ -93,6 +101,8 @@ pub(crate) struct Queue<B: Backend> {
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
 }
+
+type ValidatedBatch = (KVec<(Validated, Order, Destinations)>, KVec<mmu::VmJobGuard>);
 
 impl<B: Backend> Queue<B> {
     pub(crate) fn new(
@@ -107,6 +117,7 @@ impl<B: Backend> Queue<B> {
             allocation_failure,
             range,
             window,
+            variant,
         } = frontend;
         let render = Some(Scheduler::new(dev, backend.clone(), Engine::Render)?);
         Ok(Self {
@@ -119,6 +130,7 @@ impl<B: Backend> Queue<B> {
             allocation_failure,
             range,
             window,
+            variant,
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
@@ -128,7 +140,8 @@ impl<B: Backend> Queue<B> {
     }
 
     fn ensure_compute(&mut self, scs_pages: u16) -> Result {
-        // Admission is checked even when this queue already owns a scheduler.
+        // Validate every request, including an existing scheduler. Physical
+        // admission happens after its DRM dependencies, in backend publication.
         self.backend.ensure_compute(scs_pages)?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
@@ -156,6 +169,10 @@ impl<B: Backend> Queue<B> {
         });
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Enqueue keeps validated command, ordering, and destination owners explicit."
+    )]
     fn enqueue(
         &mut self,
         id: u64,
@@ -270,6 +287,13 @@ impl<B: Backend> Queue<B> {
         // either order and must each consume an input's error status before running.
         for sync in inputs {
             if let Some(fence) = &sync.fence {
+                // An input that already signalled without error orders nothing and has no status
+                // left to consume (like a completed frontier producer above). Keeping it would
+                // send the render through the scheduler thread instead of inline publication:
+                // most compositor and client renders carry such already-signalled buffer fences.
+                if job::fence_status(fence) > 0 {
+                    continue;
+                }
                 dependencies.push(fence.clone(), GFP_KERNEL)?;
                 checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             }
@@ -307,7 +331,7 @@ impl<B: Backend> Queue<B> {
         &mut self,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result<(KVec<(Validated, Order, Destinations)>, KVec<mmu::VmJobGuard>)> {
+    ) -> Result<ValidatedBatch> {
         let parse_guard = self.context.vm().retain_first_job()?;
         let mut parser = Parser::new(bytes);
         // All historical ordinals use the same entry counters; publication
@@ -320,6 +344,7 @@ impl<B: Backend> Queue<B> {
                 self.context.vm(),
                 self.range.clone(),
                 &self.window,
+                self.variant,
                 &command.payload,
             )?;
             let engine = match &payload {
@@ -384,7 +409,10 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (pending, guards) = self.prepare_submission(bytes, objects)?;
+            let (mut pending, guards) = self.prepare_submission(bytes, objects)?;
+            if super::timeout::select_submission(pending.iter().map(|(cmd, _, _)| cmd.long_job())) {
+                for (command, _, _) in pending.iter_mut() { command.allow_long_job(); }
+            }
             let mut guards = guards.into_iter();
             let aggregate = outputs.publish(self.context.clone())?;
             for (command, order, destinations) in pending {

@@ -87,6 +87,8 @@ pub(crate) trait Host {
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn install_pair(&mut self, registration: &RenderRegistration) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
+    /// The next publication number, shared with compute (timeout ordering).
+    fn next_publication(&mut self) -> Result<u64>;
     fn publish_outer_pair(
         &mut self,
         priority: u8,
@@ -120,6 +122,8 @@ struct Prepared {
     mcache: Option<McacheTable>,
 }
 struct Active {
+    /// Publication number, shared with compute (crate::g17::timeout).
+    published: u64,
     qos_completed: bool,
     flist_completed: bool,
     outer_published: bool,
@@ -152,8 +156,11 @@ pub(crate) struct Pair {
     owner: Option<u64>,
     ordinal: u64,
     initial_packet: u64,
+    graph_started: bool,
     clusters: u32,
+    deflake: abi::Deflake,
     descriptor_flags: [u32; 2],
+    variant: &'static crate::g17::fw::Variant,
     installed: [bool; 2],
     configs: [Option<crate::g17::fw::queue::QueueConfig>; 2],
     cursors: [u32; 2],
@@ -168,14 +175,28 @@ pub(crate) struct Pair {
     previous: Option<RetiredBinding>,
     displaced: Option<RetiredBinding>,
     context_update: bool,
-    /// A retired, never-executed group awaiting republication on this pair.
-    replay: Option<Arc<Packet>>,
+    /// Retired, never-executed groups awaiting republication on this pair, in
+    /// their original order. Nothing else is prepared on the pair before them.
+    replay: Tracker<Arc<Packet>>,
+    /// When the oldest parked group was parked or the last one republished.
+    replay_since: Option<u64>,
+    /// Scheduler page of the context of the last published command: the
+    /// scheduler the firmware last ran these queues for. Zero for a fresh graph.
+    executed: u64,
+    /// An owner change in flight: the previous scheduler page and the ordinal of
+    /// the new owner's first command, until that command leaves the pair.
+    switch: Option<(u64, u64)>,
 }
 impl Pair {
     #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The packet constructor spells out the paired render firmware inputs."
+    )]
     pub(crate) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
+        rings: &Arc<kick::RenderRings>,
         ids: [kick::Id; 2],
         slot: u8,
         owner: u64,
@@ -186,7 +207,9 @@ impl Pair {
         pm_generation: u64,
         first: &Arc<Packet>,
         clusters: u32,
+        deflake: abi::Deflake,
         descriptor_flags: [u32; 2],
+        variant: &'static crate::g17::fw::Variant,
     ) -> Result<KBox<Self>> {
         if slot == 0
             || usize::from(slot) >= queues::RENDER_SLOTS
@@ -211,10 +234,11 @@ impl Pair {
         if word == u32::MAX {
             return Err(EINVAL);
         }
-        let layout = target::Layout::new(pass, clusters)?;
+        let layout = target::Layout::new(pass, clusters, variant.programs)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
-        let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm())?;
-        let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm())?;
+        let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
+        let (fragment, fragment_alias) =
+            kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
         let (memory, aliases) = memory::Memory::new(
             alloc,
             pool,
@@ -226,9 +250,10 @@ impl Pair {
             pm_generation,
             0,
             word,
+            variant,
         )?;
         storage.write_init(kernel::try_init!(Self {
-            kick_aliases: Some([Some(ta_alias), Some(fragment_alias)]),
+            kick_aliases: Some([ta_alias, fragment_alias]),
             memory,
             kicks: [tiling, fragment],
             free_list,
@@ -239,8 +264,11 @@ impl Pair {
             owner: Some(owner),
             ordinal: 0,
             initial_packet: first.id,
+            graph_started: false,
             clusters,
+            deflake,
             descriptor_flags,
+            variant,
             installed: [false; 2],
             configs: [None; 2],
             cursors: [0; 2],
@@ -251,8 +279,11 @@ impl Pair {
             terminal: None,
             previous: None,
             displaced: None,
-            replay: None,
+            replay: Tracker::new(),
+            replay_since: None,
             context_update: true,
+            executed: 0,
+            switch: None,
         }))
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
@@ -280,20 +311,25 @@ impl Pair {
         &mut self.memory.manager
     }
     pub(crate) fn in_flight(&self) -> bool {
-        self.active.len() != 0 || self.replay.is_some()
+        self.active.len() != 0 || self.replay.len() != 0
     }
     /// A replay or an abandonment grace period needs the worker to poll.
     pub(crate) fn replay_polling(&self) -> bool {
-        self.replay.is_some() || self.active.iter().any(|a| a.abandoned_since.is_some())
+        self.replay.len() != 0 || self.active.iter().any(|a| a.abandoned_since.is_some())
+    }
+    pub(crate) fn replay_stalled(&self, now: u64) -> bool {
+        self.replay.len() != 0 && crate::g17::timeout::background_stalled(self.replay_since, now)
     }
     pub(crate) fn replay_front(&self) -> Option<Arc<Packet>> {
-        self.replay.clone()
+        self.replay.front().cloned()
     }
     pub(crate) fn finish_replay(&mut self, packet: &Arc<Packet>) -> Result {
-        if !self.replay.as_ref().is_some_and(|front| Arc::ptr_eq(front, packet)) {
+        if !self.replay.front().is_some_and(|front| Arc::ptr_eq(front, packet)) {
             return Err(EIO);
         }
-        self.replay = None;
+        self.replay.pop();
+        // Progress: the expiry restarts for the next parked group, if any.
+        self.replay_since = (self.replay.len() != 0).then(crate::g17::now_ns);
         Ok(())
     }
     pub(crate) fn published_in_flight(&self) -> bool {
@@ -315,6 +351,7 @@ impl Pair {
         addresses: RenderAddresses,
     ) -> Result {
         if !self.room()
+            || self.replay.front().is_some_and(|front| !Arc::ptr_eq(front, packet))
             || !Arc::ptr_eq(&self.memory.context, &packet.context)
             || !packet.context.is_current()
         {
@@ -334,14 +371,17 @@ impl Pair {
         let work = packet.completion.work_state()?;
         let node = work.node_va()?;
         let word = work.word();
-        let layout = target::Layout::new(pass, self.clusters)?;
+        let layout = target::Layout::new(pass, self.clusters, self.variant.programs)?;
+        let deflake_layout = self.deflake;
         let owners = self.memory.owners();
         self.memory
             .target
             .ensure_capacity(alloc.dev, packet.context.vm(), &layout, &owners)?;
         let target = self.memory.target.prepare(ordinal, &layout)?;
         let scene = self.memory.manager.prepare_scene(ordinal)?;
-        self.memory.generation(ordinal)?.prepare(ordinal, pass)?;
+        self.memory
+            .generation(ordinal)?
+            .prepare(ordinal, pass, deflake_layout.viewport)?;
         let [deflake, ta_status, fragment_status, fragment_fw, auxiliary] =
             self.memory.generation(ordinal)?.addresses();
         let lifecycle = if ordinal != 0 || packet.id != self.initial_packet {
@@ -371,6 +411,7 @@ impl Pair {
             heapmeta_va: target.heap,
             tpc_va: self.memory.target.tpc_va(),
             tpc_size: layout.tpc_size as u64,
+            gtp_va: self.memory.target.gtp_va(&layout)?,
             deflake_va: deflake,
             ta_status_va: ta_status,
             fragment_status_va: fragment_status,
@@ -402,11 +443,18 @@ impl Pair {
                 stamp_va: addresses.stamps[1][0],
                 aux_stamp_va: addresses.stamps[1][1],
             },
+            programs: self.variant.programs,
+            deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
+        // Without an MCache table kick-entry bit 58 stays clear.
+        let attachments = match self.variant.mcache {
+            true => attachments[1].as_slice(),
+            false => &[][..],
+        };
         let result = self.memory.write_descriptors(
             &args,
-            attachments[1].as_slice(),
+            attachments,
             packet.context.id().try_into()?,
         );
         let mcache = match result {
@@ -503,9 +551,17 @@ impl Pair {
         };
         use core::sync::atomic::{fence, Ordering};
         let (epoch, mcache, policy) = self.publication_preflight(&packet, host)?;
+        self.graph_started = true;
         let ordinal = self.ordinal;
         let next_ordinal = ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let qids = self.qids();
+        let kick_ids = self.kicks.each_ref().map(kick::Queue::id);
+        // Command preparation assigns context channel state before publishing
+        // producers. Pin identities before that assignment; warming never
+        // enters this path and can still give its unused identities back.
+        for id in kick_ids {
+            host.publish_qid(id)?;
+        }
         let kicks = self.kicks.each_ref().map(kick::Queue::timestamp);
         let parents = self.kicks.each_ref().map(kick::Queue::parent);
         let work = packet.completion.work_state()?;
@@ -517,6 +573,13 @@ impl Pair {
         let covered = stamps.map(|stamp| retirement::stamp_covers(stamp, ordinal));
         self.memory
             .completion_links(ordinal, kicks, payload, !covered[1])?;
+        let leads = match self.variant.lead_commands {
+            true => {
+                let init_manager = !self.memory.manager.initialized();
+                self.memory.write_leads(ordinal, kicks[0], init_manager)?
+            }
+            false => [false; 2],
+        };
         let context = &packet.context;
         let ring = 1u8 << policy.priority();
         let qos = context.qos_id();
@@ -619,6 +682,7 @@ impl Pair {
             abi::TaDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(0, ordinal),
                 ray_query[0].scratch.enabled(),
+                self.variant.programs,
             )?,
             None,
         );
@@ -628,6 +692,7 @@ impl Pair {
             abi::FragmentDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(1, ordinal),
                 ray_query[1].scratch.enabled(),
+                self.variant.programs,
             )?,
             mcache,
         );
@@ -649,6 +714,7 @@ impl Pair {
                 configs[0],
                 present[0],
                 kicks[0],
+                leads[0],
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -658,6 +724,7 @@ impl Pair {
                 configs[1],
                 present[1],
                 kicks[1],
+                leads[1],
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
@@ -694,8 +761,10 @@ impl Pair {
         let next_inner = (next_ordinal as u32).wrapping_mul(2);
         let flist_submission = self.free_list.prepare_submission(2)?;
         let pm_submission = memory.manager.prepare_submission()?;
+        let published = host.next_publication()?;
         self.active
             .push(Active {
+                published,
                 qos_completed: false,
                 flist_completed: false,
                 outer_published: false,
@@ -730,9 +799,6 @@ impl Pair {
                 host.install_pair(&registration)?;
                 self.registered = Some(policy.priority());
             }
-            for kick in &self.kicks {
-                host.publish_qid(kick.id())?;
-            }
             host.publish_outer_pair(
                 policy.priority(),
                 &fragment_slot,
@@ -747,7 +813,12 @@ impl Pair {
             )
         })();
         let outer_next = match result {
-            Ok(next) => next,
+            Ok(next) => {
+                if leads[0] {
+                    self.memory.manager.mark_initialized();
+                }
+                next
+            }
             Err(error) => {
                 self.quarantined = true;
                 if !packet.completion.spared() && self.terminal.is_none() {
@@ -781,6 +852,11 @@ impl Pair {
         if let Some(previous) = self.previous.as_mut().filter(|p| p.publication.is_none()) {
             previous.publication = Some(ordinal);
         }
+        let scheduler = packet.context.scheduler_va();
+        if self.executed != 0 && self.executed != scheduler {
+            self.switch = Some((self.executed, ordinal));
+        }
+        self.executed = scheduler;
         packet.context.mark_published();
         self.announce_publication(
             host,
@@ -924,6 +1000,22 @@ impl Pair {
                 .all(|qid| masks[usize::from(qid) / 64] & (1u64 << (qid % 64)) != 0)
         })
     }
+    /// The oldest published group still running, for cross-VM timeout attribution
+    /// (crate::g17::timeout). A quarantined pair's work holds the GPU until the firmware drains
+    /// it, so it stays visible to other VMs' watchdogs, as compute does, marked as failed.
+    pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
+        self.active
+            .iter()
+            .filter(|active| active.outer_published)
+            .find(|active| active.drained_result.is_none())
+            .map(|active| crate::g17::timeout::Head {
+                vm: active.packet.context.vm().id(),
+                published: active.published,
+                finished: false,
+                failed: self.quarantined,
+            })
+    }
+
     pub(crate) fn contains_packet(&self, packet: &Arc<Packet>) -> bool {
         self.active
             .iter()
@@ -934,7 +1026,7 @@ impl Pair {
                 .is_some_and(|prepared| Arc::ptr_eq(&prepared.packet, packet))
     }
     pub(crate) fn replay_contains(&self, packet: &Arc<Packet>) -> bool {
-        self.replay.as_ref().is_some_and(|replay| Arc::ptr_eq(replay, packet))
+        self.replay.iter().any(|replay| Arc::ptr_eq(replay, packet))
     }
     pub(crate) fn take_deferred_timeout(&self) -> Option<(Arc<Packet>, Error)> {
         self.active.iter().find_map(|active| {
@@ -955,7 +1047,7 @@ impl Pair {
         let Validated::Render { pass, .. } = &packet.command else {
             return Err(EINVAL);
         };
-        let required = target::Layout::new(pass, self.clusters)?.tvb_blocks;
+        let required = target::Layout::new(pass, self.clusters, self.variant.programs)?.tvb_blocks;
         self.memory.manager.note_required(required, crate::g17::now_ns());
         if self.in_flight() {
             return Ok(None);
@@ -1084,117 +1176,42 @@ impl Pair {
         let qos = self.qos_owners();
         let pool = self.free_list.id();
         let buffer = self.buffer_id();
-        loop {
-            let Some(front) = self.active.front_mut() else {
-                return Ok(false);
-            };
-            if !front.outer_published {
-                return Ok(false);
-            }
-            if !Arc::ptr_eq(&front.packet.context, &self.memory.context)
-                || !self.memory.owns(front.ticket.ordinal)
-            {
-                return Err(EIO);
-            }
-            let mut observer = Observer {
-                memory: &self.memory,
-                qids,
-                host,
-            };
-            let result = if let Some(observed) = observed {
-                if observed.ticket != front.ticket {
-                    return Err(EIO);
-                }
-                retirement::poll_observed(&mut front.ticket, &mut observer, observed.snapshot)
-            } else {
-                retirement::poll(&mut front.ticket, &mut observer)
-            };
-            let timestamps = match result {
-                Ok(retirement::Poll::Complete(timestamps)) => timestamps,
-                Ok(retirement::Poll::Pending) => return self.replay_abandoned(host, defer),
-                Ok(retirement::Poll::Retry) => return Ok(false),
-                Err(error) => {
-                    self.quarantine(error, defer)?;
-                    return Ok(false);
-                }
-            };
-            let ordinal = front.ticket.ordinal;
-            let context_update = front.context_update;
-            self.note_retirement(ordinal, context_update);
-            let front = self.active.front_mut().ok_or(EIO)?;
-            if !front.flist_completed {
-                host.complete_render(
-                    (!front.qos_completed).then_some(qos),
-                    pool,
-                    front.generation,
-                    buffer,
-                )?;
-                front.qos_completed = true;
-                front.flist_completed = true;
-            }
-            defer(Deferred::Retired(
-                front.packet.completion.clone(),
-                Ok(timestamps),
-            ))?;
-            self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
-            return Ok(true);
-        }
-    }
-
-    /// The front group was retired and unlinked by firmware without executing
-    /// (job list empty, stamps cover it, no recovery, fragment end never
-    /// written). Nothing of this group reached its attachments, so the same
-    /// command is published again instead of failing the owner's VM. The
-    /// proof is the strict timeout witness, taken twice ABANDON_GRACE_NS apart,
-    /// and only for a lone group whose completion still accepts a replay.
-    fn replay_abandoned(
-        &mut self,
-        host: &mut impl Host,
-        defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result<bool> {
-        use retirement::Memory;
-        if self.quarantined || self.active.len() != 1 || self.replay.is_some() {
+        let Some(front) = self.active.front_mut() else {
+            return Ok(false);
+        };
+        if !front.outer_published {
             return Ok(false);
         }
-        let front = self.active.front().ok_or(EIO)?;
-        if !front.outer_published || front.failed {
-            return Ok(false);
+        if !Arc::ptr_eq(&front.packet.context, &self.memory.context)
+            || !self.memory.owns(front.ticket.ordinal)
+        {
+            return Err(EIO);
         }
         let mut observer = Observer {
             memory: &self.memory,
-            qids: self.qids(),
+            qids,
             host,
         };
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        let snapshot = observer.snapshot(front.ticket.ordinal)?;
-        let stamps = observer.stamps()?;
-        let (_, state) = observer.host.epoch()?;
-        let abandoned =
-            retirement::abandoned(&front.ticket, snapshot, stamps, state, false)?;
-        let now = crate::g17::now_ns();
-        let front = self.active.front_mut().ok_or(EIO)?;
-        if !abandoned {
-            front.abandoned_since = None;
-            return Ok(false);
-        }
-        let Some(since) = front.abandoned_since else {
-            front.abandoned_since = Some(now);
-            return Ok(false);
+        let result = if let Some(observed) = observed {
+            if observed.ticket != front.ticket {
+                return Err(EIO);
+            }
+            retirement::poll_observed(&mut front.ticket, &mut observer, observed.snapshot)
+        } else {
+            retirement::poll(&mut front.ticket, &mut observer)
         };
-        if now.saturating_sub(since) < ABANDON_GRACE_NS {
-            return Ok(false);
-        }
-        if crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults) {
-            pr_info!(
-                "render slot {} retired without execution (pass {:?}); replaying\n",
-                self.slot,
-                snapshot.pass
-            );
-        }
-        let qos = self.qos_owners();
-        let buffer = self.buffer_id();
-        let pool = self.free_list.id();
+        let timestamps = match result {
+            Ok(retirement::Poll::Complete(timestamps)) => timestamps,
+            Ok(retirement::Poll::Pending) => return self.replay_abandoned(host, defer, true),
+            Ok(retirement::Poll::Retry) => return Ok(false),
+            Err(error) => {
+                self.quarantine(error, defer)?;
+                return Ok(false);
+            }
+        };
+        let ordinal = front.ticket.ordinal;
+        let context_update = front.context_update;
+        self.note_retirement(ordinal, context_update);
         let front = self.active.front_mut().ok_or(EIO)?;
         if !front.flist_completed {
             host.complete_render(
@@ -1203,42 +1220,174 @@ impl Pair {
                 front.generation,
                 buffer,
             )?;
-            front.flist_completed = true;
             front.qos_completed = true;
+            front.flist_completed = true;
         }
-        let ordinal = front.ticket.ordinal;
-        let packet = front.packet.clone();
-        if !packet.completion.begin_replay() {
-            if !packet.completion.spared() {
-                packet.completion.status().record(EIO);
-                if self.terminal.is_none() {
-                    self.terminal = Some((packet.completion.status().clone(), EIO));
-                }
-            }
-            defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
-            self.memory.retire(ordinal)?;
-            self.active.pop().ok_or(EIO)?;
-            return Ok(true);
-        }
+        defer(Deferred::Retired(
+            front.packet.completion.clone(),
+            Ok(timestamps),
+        ))?;
         self.memory.retire(ordinal)?;
         self.active.pop().ok_or(EIO)?;
-        packet.reset_publication_for_replay();
-        self.replay = Some(packet);
+        Ok(true)
+    }
+
+    /// Every retained group was retired and unlinked by firmware without
+    /// executing (job list empty, stamps cover it, no recovery, fragment end
+    /// never written): after another VM's recovery the firmware drops an
+    /// innocent pair's queued groups this way (seen on 25G83 and 26A428).
+    /// Nothing of them reached their attachments, so the same commands are
+    /// published again, in order, instead of failing their owners. Only the
+    /// whole set is replayed; a replayed prefix would run after a live
+    /// successor. `grace` asks for the strict witness twice ABANDON_GRACE_NS
+    /// apart (worker polling); the render timeout, long after publication,
+    /// takes it once as its retirement does. A single sample can still
+    /// straddle a firmware update of the fragment end record; the cost is
+    /// that a group which did execute runs a second time (blending twice).
+    fn replay_abandoned(
+        &mut self,
+        host: &mut impl Host,
+        defer: &mut impl FnMut(Deferred) -> Result,
+        grace: bool,
+    ) -> Result<bool> {
+        use retirement::Memory;
+        if self.quarantined || self.active.len() == 0 || self.replay.len() != 0 {
+            return Ok(false);
+        }
+        use crate::g17::replay::{self, Decision, Group};
+        let qids = self.qids();
+        let memory = &self.memory;
+        let mut failure = None;
+        let groups = self.active.iter().map(|active| {
+            let innocent =
+                active.outer_published && !active.failed && !active.packet.completion.guilty();
+            let blamed = active.packet.completion.blamed();
+            let exhausted =
+                active.packet.completion.replay_count() >= crate::g17::completion::MAX_REPLAYS;
+            // decide() stops at the first group that is not abandoned, an error included.
+            let abandoned = innocent
+                && !blamed
+                && (|| -> Result<bool> {
+                    let mut observer = Observer {
+                        memory,
+                        qids,
+                        host: &mut *host,
+                    };
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                    let snapshot = observer.snapshot(active.ticket.ordinal)?;
+                    let stamps = observer.stamps()?;
+                    let (_, state) = observer.host.epoch()?;
+                    // A torn sample is no proof; a later poll or the timeout looks again.
+                    Ok(matches!(
+                        retirement::abandoned(&active.ticket, snapshot, stamps, state, false),
+                        Ok(true)
+                    ))
+                })()
+                .unwrap_or_else(|error: Error| {
+                    failure = Some(error);
+                    false
+                });
+            Group {
+                innocent,
+                blamed,
+                abandoned,
+                exhausted,
+            }
+        });
+        let decision = replay::decide(groups);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let now = crate::g17::now_ns();
+        let front = self.active.front_mut().ok_or(EIO)?;
+        match decision {
+            Decision::Refuse => return Ok(false),
+            Decision::Wait => {
+                front.abandoned_since = None;
+                return Ok(false);
+            }
+            Decision::Replay => {}
+        }
+        if grace {
+            let Some(since) = front.abandoned_since else {
+                front.abandoned_since = Some(now);
+                return Ok(false);
+            };
+            if now.saturating_sub(since) < ABANDON_GRACE_NS {
+                return Ok(false);
+            }
+        }
+        // decide() lets only the front be exhausted. An exhausted front fails, and its
+        // successors, which consume its output, fail with it rather than run without it.
+        let mut failing = self.active.front().is_some_and(|front| {
+            front.packet.completion.replay_count() >= crate::g17::completion::MAX_REPLAYS
+        });
+        if failing {
+            pr_warn!(
+                "G17: render slot {}: {} groups retired without execution; replay limit reached, failing them\n",
+                self.slot,
+                self.active.len()
+            );
+        } else if !grace || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults) {
+            pr_warn!(
+                "G17: render slot {}: {} groups retired without execution; replaying\n",
+                self.slot,
+                self.active.len()
+            );
+        }
+        let qos = self.qos_owners();
+        let buffer = self.buffer_id();
+        let pool = self.free_list.id();
+        // Every group parked below shares this expiry (an early return keeps it).
+        self.replay_since = Some(now);
+        while let Some(front) = self.active.front_mut() {
+            if !front.flist_completed {
+                host.complete_render(
+                    (!front.qos_completed).then_some(qos),
+                    pool,
+                    front.generation,
+                    buffer,
+                )?;
+                front.flist_completed = true;
+                front.qos_completed = true;
+            }
+            let ordinal = front.ticket.ordinal;
+            let packet = front.packet.clone();
+            failing = failing || !packet.completion.begin_replay();
+            if failing {
+                if !packet.completion.spared() {
+                    packet.completion.status().record(EIO);
+                    if self.terminal.is_none() {
+                        self.terminal = Some((packet.completion.status().clone(), EIO));
+                    }
+                }
+                defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
+                self.memory.retire(ordinal)?;
+                self.active.pop().ok_or(EIO)?;
+                continue;
+            }
+            self.memory.retire(ordinal)?;
+            self.active.pop().ok_or(EIO)?;
+            packet.reset_publication_for_replay();
+            self.replay.push(packet).map_err(|_| EIO)?;
+        }
         Ok(true)
     }
 
     /// The pending replay cannot proceed (closed owner, cancellation or a
-    /// publication refusal). ECANCELED leaves the VM usable; any other error
-    /// is the ordinary device-loss outcome the replay tried to avoid.
+    /// publication refusal). Its successors cannot run without it and fail with
+    /// it. ECANCELED leaves the VM usable; any other error is the ordinary
+    /// device-loss outcome the replay tried to avoid.
     pub(crate) fn fail_replay(
         &mut self,
         error: Error,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        let Some(packet) = self.replay.take() else {
-            return Ok(());
-        };
-        defer(Deferred::Retired(packet.completion.clone(), Err(error)))
+        self.replay_since = None;
+        while let Some(packet) = self.replay.pop() {
+            defer(Deferred::Retired(packet.completion.clone(), Err(error)))?;
+        }
+        Ok(())
     }
 
     /// A closed preparation epoch invalidates only this unpublished descriptor.
@@ -1357,22 +1506,51 @@ impl Pair {
         if !self.active.iter().any(|a| Arc::ptr_eq(&a.packet, packet)) {
             return Ok(false);
         }
-        if !self.quarantined && self.active.len() == 1 {
-            let active = self.active.front().ok_or(EIO)?;
-            let mut observer = Observer {
-                memory: &self.memory,
-                qids: self.qids(),
-                host,
-            };
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-            let snapshot = observer.snapshot(active.ticket.ordinal)?;
-            let stamps = observer.stamps()?;
-            let (_, state) = observer.host.epoch()?;
-            if active.outer_published
-                && retirement::abandoned(&active.ticket, snapshot, stamps, state, false)?
-            {
+        // Groups the firmware dropped unexecuted are published again, with their successors.
+        if self.replay_abandoned(host, defer, false)? {
+            return Ok(true);
+        }
+        // Fallback when a live or exhausted group prevents an ordered replay: a spared front group
+        // the firmware retired without executing during another VM's recovery is retired on its
+        // own even with successors queued, so the pair is not quarantined into a sticky EIO. It
+        // fails with ECANCELED, which spared work never reports as device loss; consecutive
+        // abandoned spared successors are retired the same way.
+        let front_spared = self.active.front().is_some_and(|a| {
+            Arc::ptr_eq(&a.packet, packet) && a.packet.completion.spared()
+        });
+        if !self.quarantined && (self.active.len() == 1 || front_spared) {
+            let mut retired = false;
+            loop {
+                let Some(active) = self.active.front() else {
+                    break;
+                };
+                let spared = active.packet.completion.spared();
+                if retired && !spared {
+                    break;
+                }
+                let mut observer = Observer {
+                    memory: &self.memory,
+                    qids: self.qids(),
+                    host,
+                };
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+                let snapshot = observer.snapshot(active.ticket.ordinal)?;
+                let stamps = observer.stamps()?;
+                let (_, state) = observer.host.epoch()?;
+                // A torn sample is no proof, as in replay_abandoned(): the group stays retained
+                // (quarantined with the pair if nothing was retired) instead of the error
+                // stopping the runtime for every client.
+                if !active.outer_published
+                    || !matches!(
+                        retirement::abandoned(&active.ticket, snapshot, stamps, state, false),
+                        Ok(true)
+                    )
+                {
+                    break;
+                }
                 let qos = self.qos_owners();
                 let buffer = self.buffer_id();
+                let left = self.active.len() - 1;
                 let active = self.active.front_mut().ok_or(EIO)?;
                 if !active.flist_completed {
                     host.complete_render(
@@ -1384,19 +1562,30 @@ impl Pair {
                     active.flist_completed = true;
                     active.qos_completed = true;
                 }
-                if !active.failed && !active.packet.completion.spared() {
+                if !active.failed && !spared {
                     active.packet.completion.status().record(EIO);
                     if self.terminal.is_none() {
                         self.terminal = Some((active.packet.completion.status().clone(), error));
                     }
                 }
+                pr_warn!(
+                    "G17: render retired unexecuted after a recovery (ordinal {}, {} groups left)\n",
+                    active.ticket.ordinal,
+                    left
+                );
                 defer(Deferred::Retired(
                     active.packet.completion.clone(),
-                    Err(EIO),
+                    Err(if spared { ECANCELED } else { EIO }),
                 ))?;
                 let ordinal = active.ticket.ordinal;
                 self.memory.retire(ordinal)?;
                 self.active.pop().ok_or(EIO)?;
+                retired = true;
+                if !spared {
+                    break;
+                }
+            }
+            if retired {
                 return Ok(true);
             }
         }
@@ -1424,7 +1613,8 @@ impl Pair {
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
         }
-        if let Some(packet) = self.replay.take() {
+        self.replay_since = None;
+        while let Some(packet) = self.replay.pop() {
             defer(Deferred::Drained(packet.completion.clone(), Err(EIO)))?;
         }
         if let Some(previous) = self.previous.as_mut() {
@@ -1578,6 +1768,18 @@ impl Pair {
             }
         }
     }
+    /// The scheduler page these queues last ran a command for, when the next
+    /// publication for `context` changes the queues' owner.
+    pub(crate) fn owner_switch_from(&self, context: &Context) -> Option<u64> {
+        (self.executed != 0 && self.executed != context.scheduler_va()).then_some(self.executed)
+    }
+    /// The previous scheduler page of an owner change whose first command has
+    /// not left the pair yet.
+    pub(crate) fn switch_in_flight(&self) -> Option<u64> {
+        let (from, first) = self.switch?;
+        (self.replay.len() != 0 || self.active.iter().any(|active| active.ticket.ordinal == first))
+            .then_some(from)
+    }
     pub(crate) fn take_retired_binding(&mut self) -> Option<RetiredBinding> {
         if self.displaced.is_some() {
             return self.displaced.take();
@@ -1621,6 +1823,10 @@ impl Pair {
         self.owner = None;
     }
     #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Binding keeps the render owners and first packet explicit."
+    )]
     pub(crate) fn prepare_bind(
         &mut self,
         alloc: &Allocator<'_>,
@@ -1654,7 +1860,7 @@ impl Pair {
             let Validated::Render { pass, .. } = &first.command else {
                 return Err(EINVAL);
             };
-            let layout = target::Layout::new(pass, self.clusters)?;
+            let layout = target::Layout::new(pass, self.clusters, self.variant.programs)?;
             let aliases = [
                 self.kicks[0].prepare_client_alias(context.vm())?,
                 self.kicks[1].prepare_client_alias(context.vm())?,
@@ -1670,6 +1876,7 @@ impl Pair {
                 pm_generation,
                 self.ordinal,
                 first.completion.work_state()?.word(),
+                self.variant,
             )?;
             (Some(memory), Some(persistent), Some(aliases))
         };
@@ -1736,6 +1943,7 @@ impl Pair {
         self.memory.context = binding.context.clone();
         self.owner = Some(binding.owner);
         self.initial_packet = binding.initial_packet;
+        if foreign { self.graph_started = false; }
         self.context_update = true;
         if foreign {
             self.cursors = [0; 2];

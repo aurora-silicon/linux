@@ -27,19 +27,22 @@ impl Backend {
             let Some(own) = queue.timeout_head() else {
                 return Ok(Decision::Own);
             };
-            let others = firmware.queues.compute.iter().flatten()
+            let computes = firmware.queues.compute.iter().flatten()
                 .filter_map(|entry| entry.queue.as_deref())
                 .filter(|other| other.owner() != Some(self.owner))
                 .filter_map(|other| other.timeout_head());
-            let decision = timeout::classify(own, renewals, others);
+            let others = Iterator::chain(computes, firmware.queues.render_timeout_heads());
+            let verdict = timeout::attribute(own, renewals, others);
+            let decision = verdict.decision;
             if decision == Decision::Spare {
                 firmware.queues.compute(self.owner).ok_or(EIO)?
                     .classify(&|_| Class::Spared);
             }
-            if decision != Decision::Own && (renewals == 0 || decision == Decision::Spare) {
+            if let Some(blocker) = verdict.reported_blocker(renewals) {
                 dev_warn!(self.shared.dev.as_ref(),
-                    "Compute watchdog owner={} publication={} renewals={} decision={:?} behind earlier work of another VM\n",
-                    self.owner, own.published, renewals, decision);
+                    "Compute watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
+                    self.owner, own.vm, own.published, renewals, decision,
+                    blocker.vm, blocker.published, u8::from(blocker.failed));
             }
             Ok(decision)
         })();
@@ -50,7 +53,10 @@ impl Backend {
     /// The caller owns cancellation of a packet that never claimed publication.
     /// A missing retained packet may already have a healthy callback waiting off-lock.
     pub(super) fn timeout_compute(&self, packet: &Arc<Packet>) -> Result {
-        let mut deferred = DeferredBatch::worker()?;
+        // Without a collector the watchdog expires again and retries.
+        let Ok(mut deferred) = DeferredBatch::worker() else {
+            return Ok(());
+        };
         let result = (|| {
             let mut state = self.shared.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {

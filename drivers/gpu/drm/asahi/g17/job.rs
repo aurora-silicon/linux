@@ -13,7 +13,7 @@ use kernel::{
     sync::Arc,
 };
 
-pub(super) const TIMEOUT_MS: kernel::time::Msecs = 2000;
+pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
 const RENDER_CREDITS: u32 = 32;
 const COMPUTE_CREDITS: u32 = 16;
 
@@ -143,23 +143,40 @@ impl Packet {
         }
     }
 
+    /// Replay holds the device mutex. Its original inputs were satisfied before
+    /// first publication; never sleep on a fence that needs event service here.
+    pub(crate) fn check_replay_dependencies(&self) -> Result {
+        for fence in &self.inputs {
+            super::dependency::replay_status(fence_status(fence))?;
+        }
+        for fence in &self.firmware { check_status(fence)?; }
+        Ok(())
+    }
+
     /// Scheduler dependency readiness includes failed fences. Consume the actual
     /// status before publication, and retain the references through that check.
     pub(crate) fn check_dependencies(&self) -> Result {
+        let polls = if self.command.long_job() { 5 } else { 1 };
+        let deadline = super::now_ns().saturating_add(u64::from(TIMEOUT_MS) * polls * 1_000_000);
         for fence in &self.inputs {
-            // SAFETY: The retained fence owns the pointer throughout the wait and read.
-            let waited = unsafe {
-                bindings::dma_fence_wait_timeout(
-                    fence.raw(),
-                    true,
-                    kernel::task::MAX_SCHEDULE_TIMEOUT,
-                )
-            };
-            if waited < 0 {
-                return Err(super::dependency::inherited_error(Error::from_errno(waited as i32)));
-            }
-            if waited == 0 {
-                return Err(ECANCELED);
+            loop {
+                if self.cancel_requested() || self.completion.status().get() != 0 {
+                    return Err(ECANCELED);
+                }
+                if fence_status(fence) != 0 { break; }
+                if super::now_ns() >= deadline { return Err(ECANCELED); }
+                // SAFETY: The retained fence owns the pointer throughout the bounded wait.
+                let waited = unsafe {
+                    bindings::dma_fence_wait_timeout(
+                        fence.raw(),
+                        true,
+                        kernel::time::msecs_to_jiffies(10) as isize,
+                    )
+                };
+                if waited < 0 {
+                    return Err(super::dependency::inherited_error(Error::from_errno(waited as i32)));
+                }
+                if waited > 0 { break; }
             }
             check_status(fence)?;
         }
@@ -178,6 +195,13 @@ impl Packet {
         self.publication
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+    /// Gives up a claim taken from the submitting ioctl before the job was
+    /// pushed: nothing became visible, and the scheduler claims it again.
+    pub(crate) fn abandon_publication(&self) {
+        let _ = self
+            .publication
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
     }
     pub(crate) fn mark_published(&self) {
         self.publication.store(2, Ordering::Release);
@@ -201,7 +225,7 @@ impl Packet {
     }
     pub(crate) fn set_early_result(&self, result: Result) {
         self.early.store(
-            result.map_or_else(|error| error.to_errno(), |_| 1),
+            result.map_or_else(|error| error.to_errno(), |()| 1),
             Ordering::Release,
         );
     }
@@ -242,7 +266,8 @@ pub(crate) trait Backend: Send + Sync {
         None
     }
 
-    /// Lazily create or rebind this logical queue's physical compute graph.
+    /// Validate compute sizing without reserving a physical channel. Queued
+    /// commands may wait on a host signal submitted after this ioctl returns.
     fn ensure_compute(&self, scs_pages: u16) -> Result;
     fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
         if pages != [0; 2] { return Err(EINVAL); }
@@ -271,6 +296,7 @@ struct Job<B: Backend> {
 struct Timeout<B: Backend> {
     backend: Arc<B>,
     victim_renewals: u8,
+    execution_renewals: u8,
     packet: Arc<Packet>,
 }
 
@@ -287,12 +313,14 @@ impl<B: Backend> Drop for Job<B> {
 
 impl<B: Backend> sched::JobImpl for Job<B> {
     type TimeoutData = Timeout<B>;
-    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+    const MODULE: Option<&'static kernel::ThisModule> =
+        Some(&crate::THIS_MODULE);
 
     fn timeout_data(&self) -> Timeout<B> {
         Timeout {
             backend: self.backend.clone(),
             victim_renewals: 0,
+            execution_renewals: 0,
             packet: self.packet.clone(),
         }
     }
@@ -301,9 +329,14 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         if finished || job.packet.completion.take_replay_timeout() {
             return true;
         }
+        if super::timeout::renew_execution(
+            job.packet.is_published(), job.packet.command.long_job(), &mut job.execution_renewals,
+        ) {
+            return true;
+        }
         let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
-        if deferred && job.packet.engine() == Engine::Compute {
-            job.victim_renewals += 1;
+        if deferred {
+            job.victim_renewals = job.victim_renewals.saturating_add(1);
         }
         deferred
     }

@@ -11,6 +11,8 @@ use kernel::prelude::*;
 
 /// The bounded shared-ring transport; recognized malformed entries return errors after consume.
 pub(super) trait Transport {
+    /// The firmware instances of this GPU: the primary, and the secondary where one exists.
+    fn roles(&self) -> &'static [Role];
     fn trace(&mut self, role: Role);
     fn statistics(&mut self, role: Role);
     fn drain(
@@ -81,10 +83,10 @@ pub(super) fn service<H: Host>(host: &mut H) -> Result<Pending> {
         return Ok(Pending::default());
     }
     host.observe_render_releases()?;
-    for role in [Role::Primary, Role::Secondary] {
+    for &role in host.roles() {
         host.trace(role);
     }
-    for role in [Role::Primary, Role::Secondary] {
+    for &role in host.roles() {
         host.statistics(role);
     }
     let mut masks = [0; 2];
@@ -110,7 +112,7 @@ pub(super) fn service<H: Host>(host: &mut H) -> Result<Pending> {
             return Err(EIO);
         }
     }
-    if !host.control_backpressured() {
+    if !host.control_backpressured() && host.roles().contains(&Role::Secondary) {
         batch(host, Role::Secondary, &mut masks)?;
     }
     host.retain_render_completions(masks);

@@ -66,21 +66,37 @@ pub(crate) enum Recordless {
 }
 
 /// How long a command whose exact completion record is present waits for its completion stamp
-/// before it retires on the record alone. The firmware stores the stamp after the cache
-/// maintenance that follows the record; it occasionally never stores it for a command, most
-/// visibly while a render of the same VM is running.
-pub(crate) const STAMP_GRACE_NS: u64 = 1_000_000;
+/// before it retires on the record alone.
+///
+/// The firmware stores the stamp after the cache maintenance that follows the record, so the
+/// stamp, not the record, proves that the command's writes are complete and that its mappings
+/// may be released. While other commands of the same submit ioctl are still running, the stamp
+/// routinely lands several milliseconds after the record (on J700 under games, up to about 3 ms
+/// after the 1 ms this used to wait). Only a stamp still missing well past that is treated as
+/// never stored. The bound stays far below the scheduler timeout, so such a command cannot fail
+/// its VM.
+pub(crate) const STAMP_FALLBACK_NS: u64 = 50_000_000;
+
+// A command that waits out the fallback must still retire well inside the scheduler timeout.
+const _: () = assert!(STAMP_FALLBACK_NS * 4 <= crate::g17::job::TIMEOUT_MS as u64 * 1_000_000);
+
+/// Whether a completion record latched at `observed_at` (host time, ns) has waited out
+/// [`STAMP_FALLBACK_NS`] by `now`.
+pub(crate) fn record_aged(observed_at: Option<u64>, now: u64) -> bool {
+    observed_at.is_some_and(|at| now.saturating_sub(at) >= STAMP_FALLBACK_NS)
+}
 
 static STAMPLESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Counts a command that retired on its record without its completion stamp; logs the first and
-/// every 64th.
+/// Counts a command that retired on its record because its completion stamp never arrived;
+/// logs the first and every 64th.
 pub(crate) fn note_stampless(qid: u8, kick: u64) {
     let count = STAMPLESS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     if count == 1 || count % 64 == 0 {
         pr_info!(
-            "G17: {} compute commands retired on their completion record without a completion stamp (latest: queue {} kick {:#x})\n",
+            "G17: {} compute commands retired on their completion record after {} ms without a completion stamp (latest: queue {} kick {:#x})\n",
             count,
+            STAMP_FALLBACK_NS / 1_000_000,
             qid,
             kick
         );
@@ -90,7 +106,12 @@ pub(crate) fn note_stampless(qid: u8, kick: u64) {
 /// A zero-duration record fails before visibility polling. It proves execution did not occur;
 /// ownership still requires a separate retirement witness before mappings can be released.
 /// The command is complete when its stamp covers it, or when its exact completion record has
-/// been present for [`STAMP_GRACE_NS`] (`record_aged`); in both cases its items must be consumed.
+/// been present for [`STAMP_FALLBACK_NS`] without one (`record_aged`); in both cases its items
+/// must be consumed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Retirement validates the ticket against independent firmware observations."
+)]
 pub(crate) fn poll(
     ticket: &Ticket,
     observed: Option<Observation>,
@@ -208,7 +229,8 @@ impl Batch {
         if descriptor == 0 || record.read(7)? == 0 {
             return Ok(());
         }
-        let kick = (((control >> 8) & 0xffff_ffff_00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
+        let kick =
+            (((control >> 8) & 0x00ff_ffff_ff00) | ((control >> 48) & 0xff)) & 0xff_ffff_ffff;
         let requests = self.requests.get_mut(start..start + count).ok_or(EIO)?;
         let Some(request) = requests
             .iter_mut()
@@ -238,5 +260,145 @@ impl Batch {
             .find(|r| r.descriptor == ticket.descriptor && r.kick == ticket.kick)
             .ok_or(EIO)?;
         Ok(request.observed.take())
+    }
+}
+
+#[kunit_tests(asahi_g17_compute_stamp_wait)]
+mod tests {
+    use super::*;
+
+    const KICK: u64 = 0x12_3456_7801;
+
+    fn ticket() -> Ticket {
+        Ticket {
+            owner: 1,
+            submission: 1,
+            context_id: 1,
+            qid: 28,
+            descriptor: 0x1000,
+            work_node: 0x2000,
+            kick: KICK,
+            ordinal: 1,
+            item_producer: 4,
+            item_count: 64,
+            epoch: 1,
+        }
+    }
+
+    fn consumed() -> Cursors {
+        Cursors {
+            producer: 4,
+            consumer: 4,
+            count: 64,
+        }
+    }
+
+    fn own(kick: u64) -> u32 {
+        (kick as u32).wrapping_shl(8)
+    }
+
+    #[test]
+    fn stamp_covers_its_kick_and_earlier_ones() {
+        assert!(stamp_covers(own(KICK), KICK));
+        assert!(stamp_covers(own(KICK + 1), KICK));
+        assert!(!stamp_covers(own(KICK - 1), KICK));
+        assert!(!stamp_covers(own(KICK) | 1, KICK));
+        assert!(stamp_covers(0, 0xff_ffff));
+    }
+
+    #[test]
+    fn a_late_stamp_is_waited_for() {
+        // Under games on J700 the stamp lands up to about 4 ms after the record while the
+        // rest of the command's ioctl runs: the command keeps its mappings until then.
+        let record = Some(Observation { timestamps: [10, 20] });
+        let at = 1_000_000;
+        assert!(!record_aged(Some(at), at + 4_000_000));
+        assert!(!record_aged(Some(at), at + 10_000_000));
+        let waiting = poll(
+            &ticket(),
+            record,
+            consumed(),
+            own(KICK - 1),
+            Recordless::NotYet,
+            0,
+            None,
+            record_aged(Some(at), at + 10_000_000),
+        );
+        assert_eq!(waiting, Ok(None));
+        let stamped = poll(
+            &ticket(),
+            record,
+            consumed(),
+            own(KICK),
+            Recordless::NotYet,
+            0,
+            None,
+            false,
+        );
+        assert_eq!(stamped, Ok(Some([10, 20])));
+    }
+
+    #[test]
+    fn a_later_kick_stamp_retires_it() {
+        let record = Some(Observation { timestamps: [10, 20] });
+        let result = poll(
+            &ticket(),
+            record,
+            consumed(),
+            own(KICK + 3),
+            Recordless::NotYet,
+            0,
+            None,
+            false,
+        );
+        assert_eq!(result, Ok(Some([10, 20])));
+    }
+
+    #[test]
+    fn a_stamp_that_never_comes_retires_on_the_record_after_the_fallback() {
+        let record = Some(Observation { timestamps: [0x1111, 0x2222] });
+        let at = 1_000_000;
+        assert!(record_aged(Some(at), at + STAMP_FALLBACK_NS));
+        assert!(!record_aged(None, u64::MAX));
+        let result = poll(
+            &ticket(),
+            record,
+            consumed(),
+            own(KICK - 1),
+            Recordless::NotYet,
+            0,
+            None,
+            record_aged(Some(at), at + STAMP_FALLBACK_NS),
+        );
+        // The record's own timestamps are published, never synthesized ones.
+        assert_eq!(result, Ok(Some([0x1111, 0x2222])));
+    }
+
+    #[test]
+    fn an_aged_record_still_waits_for_consumed_items() {
+        let record = Some(Observation { timestamps: [10, 20] });
+        let busy = Cursors {
+            producer: 4,
+            consumer: 2,
+            count: 64,
+        };
+        let result = poll(&ticket(), record, busy, 0, Recordless::Allowed, 0, None, true);
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn a_zero_duration_record_fails() {
+        let record = Some(Observation { timestamps: [5, 5] });
+        let result = poll(
+            &ticket(),
+            record,
+            consumed(),
+            own(KICK),
+            Recordless::Allowed,
+            0,
+            None,
+            true,
+        );
+        assert_eq!(result, Err(ENODATA));
     }
 }

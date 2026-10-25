@@ -23,6 +23,7 @@ mod command;
 pub(crate) use command::Attachments;
 mod completion;
 pub(crate) mod context;
+mod data_segment;
 mod dependency;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 pub(crate) use dependency::inherited_error;
@@ -35,13 +36,15 @@ mod ids;
 pub(crate) mod hazard;
 mod initdata;
 mod job;
+mod capacity;
 mod kick;
 mod object;
-mod power;
+pub(crate) mod power;
 mod preparation;
 mod qos;
 mod queue;
 mod recovery;
+mod replay;
 mod runtime;
 pub(crate) mod status;
 mod teardown;
@@ -149,12 +152,63 @@ pub(crate) struct Config {
     pub(crate) uat_ias: u32,
     /// Output (physical) address bits of the UAT.
     pub(crate) uat_oas: u32,
-    /// Offset of the secondary coprocessor's kernel root in the `pagetables` region.
-    pub(crate) secondary_root_offset: u64,
-    /// Crash log buffer of each [`Role`].
-    pub(crate) crash_buffers: [FixedBuffer; 2],
+    /// Offset of the secondary coprocessor's kernel root in the `pagetables` region; `None` for
+    /// a single-instance firmware.
+    pub(crate) secondary_root_offset: Option<u64>,
+    /// Where the coprocessors' crash log buffers live.
+    pub(crate) crash_buffers: CrashBuffers,
     /// Parameter buffer page metrics shared with the firmware.
     pub(crate) pm_metrics: FixedBuffer,
+    /// Register windows the firmware maps through the hardware data.
+    pub(crate) windows: &'static [fw::initdata::RegisterWindow],
+    /// Register-map slots that are reserved but have no window.
+    pub(crate) reserved_slots: &'static [usize],
+    /// Per-SoC parts of the performance tables.
+    pub(crate) perf: &'static fw::initdata::PerfConfig,
+    /// Number of operating points the device tree lists.
+    pub(crate) opps: usize,
+    /// UAT policy where it differs from the A18 Pro's.
+    pub(crate) uat_quirks: mmu::UatQuirks,
+    /// Snapshot the firmware root's own top-level entries after the firmware booted, clear the
+    /// others and confirm the snapshot after building (A18 Pro). Otherwise the root is used as
+    /// the firmware left it, which is the only way the M4 Pro has run.
+    pub(crate) adopt_root_entries: bool,
+    /// Enable the GPU-to-fabric bridge and dynamic core power gating before the firmware
+    /// starts (A18 Pro). The M4 Pro has only run with neither written.
+    pub(crate) fabric_bridge: bool,
+    /// The SoC's values of region C.
+    pub(crate) region_c: &'static fw::initdata::RegionCConfig,
+    /// Physical address of the firmware's per-slot recovery keys, read while the firmware is
+    /// halted to attribute a fault; `None` where it is unknown (recovery then relies on the
+    /// firmware's own blame).
+    pub(crate) recovery_slot_keys: Option<u64>,
+    /// GPU generation reported to userspace.
+    pub(crate) gpu_generation: hw::GpuGen,
+    /// The firmware builds this SoC runs.
+    pub(crate) firmware: fw::variant::Firmware,
+    /// Layouts of the command buffers that follow the GPU's core layout.
+    pub(crate) core_layout: CoreLayout,
+}
+
+/// Layouts of the firmware command buffers that follow a SoC's GPU core layout.
+pub(crate) struct CoreLayout {
+    /// The cluster and enabled core counts the layouts were measured on, which the GPU must
+    /// report at probe; `None` where the layouts hold for every configuration of the SoC.
+    pub(crate) cores: Option<(u32, u32)>,
+    /// A compute queue's operand-state buffer.
+    pub(crate) operand_state: fw::compute::OperandState,
+    /// A render's deflake buffer.
+    pub(crate) deflake: fw::render::Deflake,
+}
+
+/// Where a G17 target's crash log buffers live.
+pub(crate) enum CrashBuffers {
+    /// One buffer per [`Role`] that the firmware requests at a fixed address of the kernel
+    /// lower root, mapped by the driver before the coprocessors start.
+    Fixed([FixedBuffer; 2]),
+    /// The firmware places its crash log in its own data segment, the `fw-data` reserved
+    /// region, and asks for it there by physical address.
+    FirmwareData,
 }
 
 /// A firmware coprocessor instance.
@@ -197,6 +251,9 @@ const RECEIVER_RETRY_MS: i64 = 20;
 /// counters are sampled initially and after at most [`OPENING_RETIRE_POLLS`] waits.
 const OPENING_RETIRE_POLL_MS: i64 = 1;
 const OPENING_RETIRE_POLLS: usize = 100;
+/// One-millisecond polls for a firmware that acknowledges its initialization only in status A
+/// ([`fw::variant::InitAck::Status`]).
+const INIT_ACCEPT_POLLS: usize = 3000;
 
 /// Address bits of a buffer the coprocessor places itself; the coprocessor sets higher bits in
 /// its buffer requests.
@@ -207,7 +264,15 @@ const CRASH_BUFFER_FILL: [u8; 2] = [0xa5, 0x5a];
 /// A crash log buffer handed to RTKit.
 pub(crate) struct CrashLog {
     iova: usize,
-    map: shmem::VMapOwned<AsahiObject>,
+    map: CrashLogMap,
+}
+
+/// The CPU mapping of a crash log buffer.
+enum CrashLogMap {
+    /// The driver's buffer ([`CrashBuffers::Fixed`]).
+    Object(shmem::VMapOwned<AsahiObject>),
+    /// A buffer in the firmware's data segment ([`CrashBuffers::FirmwareData`]).
+    FirmwareData(data_segment::DataSegmentLog),
 }
 
 impl rtkit::Buffer for CrashLog {
@@ -216,7 +281,10 @@ impl rtkit::Buffer for CrashLog {
     }
 
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        Ok(IoSysMap::from((&self.map).as_view()))
+        match &mut self.map {
+            CrashLogMap::Object(map) => Ok(IoSysMap::from((&*map).as_view())),
+            CrashLogMap::FirmwareData(log) => log.buf(),
+        }
     }
 }
 
@@ -225,8 +293,8 @@ impl rtkit::Buffer for CrashLog {
 struct RoleState {
     role: Role,
     shared: Arc<Shared>,
-    crash_log: FixedBuffer,
-    crash_map: shmem::VMapOwned<AsahiObject>,
+    /// The fixed crash log buffer and its mapping; `None` where the firmware places its own.
+    crash_log: Option<(FixedBuffer, shmem::VMapOwned<AsahiObject>)>,
     crashed: AtomicBool,
     #[pin]
     ack: Opaque<kernel::bindings::completion>,
@@ -305,13 +373,23 @@ impl rtkit::Operations for RoleOps {
         iova: usize,
         size: usize,
     ) -> Result<CrashLog> {
-        if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != data.crash_log.va || size > data.crash_log.size
-        {
-            return Err(EINVAL);
+        if let Some((buffer, map)) = data.crash_log.as_ref() {
+            if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != buffer.va || size > buffer.size {
+                return Err(EINVAL);
+            }
+            return Ok(CrashLog {
+                iova,
+                map: CrashLogMap::Object(map.owner().owned_vmap()?),
+            });
         }
+        // The firmware places its buffers in its data segment, at their physical address.
         Ok(CrashLog {
             iova,
-            map: data.crash_map.owner().owned_vmap()?,
+            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(
+                &data.shared.dev,
+                iova,
+                size,
+            )?),
         })
     }
 }
@@ -324,7 +402,7 @@ struct Coprocessor {
     running: bool,
     rtkit: rtkit::RtKit<RoleOps>,
     state: Arc<RoleState>,
-    _crash_buffer: KernelObject,
+    _crash_buffer: Option<KernelObject>,
 }
 
 impl Coprocessor {
@@ -338,27 +416,32 @@ impl Coprocessor {
         role: Role,
     ) -> Result<Coprocessor> {
         let index = role as usize;
-        let buffer = &cfg.crash_buffers[index];
-        let mut crash_buffer = KernelObject::new(
-            dev,
-            uat.kernel_lower_vm(),
-            Placement::At(buffer.va),
-            buffer.size,
-            mmu::PROT_FW_SHARED_RW,
-            CpuMap::WriteCombined,
-        )?;
-        crash_buffer.bytes_mut().fill(CRASH_BUFFER_FILL[index]);
-
-        let crash_map = crash_buffer.kernel_map()?;
+        let (crash_buffer, crash_log) = match &cfg.crash_buffers {
+            CrashBuffers::Fixed(buffers) => {
+                let buffer = &buffers[index];
+                let mut crash_buffer = KernelObject::new(
+                    dev,
+                    uat.kernel_lower_vm(),
+                    Placement::At(buffer.va),
+                    buffer.size,
+                    mmu::PROT_FW_SHARED_RW,
+                    CpuMap::WriteCombined,
+                )?;
+                crash_buffer.bytes_mut().fill(CRASH_BUFFER_FILL[index]);
+                let crash_map = crash_buffer.kernel_map()?;
+                let fixed = FixedBuffer {
+                    va: buffer.va,
+                    size: buffer.size,
+                };
+                (Some(crash_buffer), Some((fixed, crash_map)))
+            }
+            CrashBuffers::FirmwareData => (None, None),
+        };
         let state = Arc::pin_init(
             pin_init!(RoleState {
                 role,
                 shared: shared.clone(),
-                crash_log: FixedBuffer {
-                    va: buffer.va,
-                    size: buffer.size,
-                },
-                crash_map,
+                crash_log,
                 crashed: AtomicBool::new(false),
                 ack <- Opaque::ffi_init(|ptr| {
                     // SAFETY: ptr is valid uninitialized completion storage that is pinned
@@ -404,8 +487,9 @@ impl Coprocessor {
         Pin::new(&mut self.rtkit).boot()
     }
 
-    /// Starts the firmware endpoints and hands the firmware its initialization root.
-    fn init(&mut self, root_va: u64) -> Result {
+    /// Starts the firmware endpoints and hands the firmware its initialization root. An
+    /// acknowledgment message is awaited here; one in status A is the caller's to poll.
+    fn init(&mut self, root_va: u64, ack: fw::variant::InitAck) -> Result {
         let mut rtkit = Pin::new(&mut self.rtkit);
         rtkit.as_mut().start_endpoint(EP_FIRMWARE)?;
         rtkit.as_mut().start_endpoint(EP_DOORBELL)?;
@@ -413,7 +497,10 @@ impl Coprocessor {
             EP_FIRMWARE,
             MSG_INITDATA | (root_va & MSG_INITDATA_ADDR_MASK),
         )?;
-        self.state.wait_for_ack()
+        match ack {
+            fw::variant::InitAck::Message => self.state.wait_for_ack(),
+            fw::variant::InitAck::Status => Ok(()),
+        }
     }
 
     /// Sends a host notification to the firmware.
@@ -452,6 +539,14 @@ impl Bridge {
         Ok(bridge)
     }
 
+    /// Keeps the register block for a target that runs without the bridge.
+    fn unused(regs: regs::G17Resources) -> Bridge {
+        Bridge {
+            regs,
+            enabled: false,
+        }
+    }
+
     fn disable(&mut self) {
         if self.enabled {
             self.regs.disable_g17_bridge();
@@ -472,15 +567,21 @@ impl Drop for Bridge {
 /// dropped, the bridge is disabled once they are stopped, and the firmware objects and their
 /// mappings go before the UAT. Page tables the firmware or the bootloader own are never freed.
 struct Firmware {
-    secondary: Coprocessor,
+    /// The secondary instance, on GPUs whose firmware runs on two (A18 Pro). A single-instance
+    /// firmware (M4 Pro) carries both roles on the primary.
+    secondary: Option<Coprocessor>,
     primary: Coprocessor,
     bridge: Bridge,
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
+    hold: power::Hold,
     registration_power_release_pending: bool,
+    variant: &'static fw::Variant,
     queues: runtime::Registry,
     pool: Arc<object::Pool>,
+    /// Render kick ring storage, kept and reused for the life of the device.
+    render_rings: Arc<kick::RenderRings>,
     render_ids: Arc<freelist::RenderIds>,
     init: initdata::InitData,
     _render_global: mmu::Vm,
@@ -490,7 +591,9 @@ struct Firmware {
 
 impl Drop for Firmware {
     fn drop(&mut self) {
-        self.secondary.stop();
+        if let Some(secondary) = self.secondary.as_mut() {
+            secondary.stop();
+        }
         self.primary.stop();
         self.pool.stop_after_firmware();
         // RTKit destruction releases the mailbox power references. Clear the bridge while
@@ -500,6 +603,15 @@ impl Drop for Firmware {
 }
 
 impl Firmware {
+    /// The firmware instances this GPU runs.
+    fn roles(&self) -> &'static [Role] {
+        if self.secondary.is_some() {
+            &[Role::Primary, Role::Secondary]
+        } else {
+            &[Role::Primary]
+        }
+    }
+
     /// Publishes controls only while the restart handshake is closed. The device mutex remains
     /// held through publication and the following mailbox notification.
     fn publish_control(&mut self, record: &fw::channels::ControlRecord) -> Result<u32> {
@@ -519,6 +631,11 @@ impl Firmware {
     }
 
     fn release_registration_power(&mut self) -> Result {
+        // An idle hold keeps the cores powered past registration; it releases them itself.
+        if self.hold.active() {
+            self.registration_power_release_pending = false;
+            return Ok(());
+        }
         power::release(self)
     }
 
@@ -548,14 +665,49 @@ impl Firmware {
     /// Returns the delay in ns for a follow-up idle check. Queue owners report only submitted,
     /// unretired work; quarantined work retaining mappings is excluded.
     fn idle_check(&mut self, now_ns: u64, in_flight: bool) -> Result<Option<u64>> {
-        match self.effort.idle(now_ns, in_flight) {
-            power::IdleAction::None => Ok(None),
+        let effort = match self.effort.idle(now_ns, in_flight) {
+            power::IdleAction::None => None,
             power::IdleAction::Clear => {
                 self.apply_effort(0)?;
-                Ok(None)
+                None
             }
-            power::IdleAction::Recheck(delay) => Ok(Some(delay)),
+            power::IdleAction::Recheck(delay) => Some(delay),
+        };
+        Ok(match (effort, self.idle_hold(now_ns, in_flight)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        })
+    }
+
+    /// Drives the idle hold (see power::Hold); returns the delay in ns for its next check. A
+    /// refused control (recovery in progress) is retried on a later check.
+    fn idle_hold(&mut self, now_ns: u64, in_flight: bool) -> Option<u64> {
+        const RETRY_NS: u64 = 1_000_000;
+        let hold_ms = power::IDLE_HOLD_MS.load(Ordering::Relaxed);
+        for _ in 0..2 {
+            match self.hold.step(now_ns, in_flight, self.effort.submissions(), hold_ms) {
+                power::HoldAction::None => return None,
+                power::HoldAction::Recheck(delay) => return Some(delay),
+                power::HoldAction::Assert => {
+                    if self.set_idle_control(false).is_err() {
+                        return None;
+                    }
+                    self.hold.asserted();
+                }
+                power::HoldAction::Release => {
+                    if self.set_idle_control(true).is_err() {
+                        return Some(RETRY_NS);
+                    }
+                    self.hold.released();
+                    return None;
+                }
+            }
         }
+        None
+    }
+
+    fn set_idle_control(&mut self, enabled: bool) -> Result<u32> {
+        power::Control::set_idle(self, enabled)
     }
 }
 
@@ -610,6 +762,11 @@ struct Shared {
     drm: Mutex<Option<AsahiDevRef>>,
     clusters: u32,
     active_cores: u32,
+    variant: &'static fw::Variant,
+    /// Layout of compute queues' operand-state buffers for this GPU's cores.
+    operand_state: &'static fw::compute::OperandState,
+    /// Layout of renders' deflake buffers for this GPU's cores.
+    deflake: fw::render::Deflake,
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
@@ -742,12 +899,20 @@ impl Shared {
     }
 
     fn drain_reclaims(self: &Arc<Self>) {
+        let mut reclaimed = false;
         loop {
             let next = self.reclaim.lock().take_one();
             let Some(next) = next else {
                 break;
             };
             next.finish();
+            reclaimed = true;
+        }
+        if reclaimed {
+            // Context release returns its execution root off-lock. The next
+            // device pass can now detach idle compute aliases and their QoS
+            // leases, without depending on a new client's submission/event.
+            self.queue_events();
         }
     }
 
@@ -826,6 +991,7 @@ pub(crate) struct Gpu {
     geometry: mmu::UatGeometry,
     ids: gpu::SequenceIDs,
     shared: Arc<Shared>,
+    _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
 }
 
 impl Gpu {
@@ -836,6 +1002,7 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::G17Resources,
     ) -> Result<Arc<Gpu>> {
+        let variant = Self::firmware_variant(dev, &cfg.firmware)?;
         let id = regs.get_g17_id()?;
         if id.family != cfg.identity.family
             || id.variant != cfg.identity.variant
@@ -860,12 +1027,28 @@ impl Gpu {
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
+        if cfg
+            .core_layout
+            .cores
+            .is_some_and(|cores| cores != (id.num_clusters, active_cores))
+        {
+            dev_err!(
+                dev.as_ref(),
+                "Unsupported GPU core layout: {} clusters with {} cores\n",
+                id.num_clusters,
+                active_cores
+            );
+            return Err(ENODEV);
+        }
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
                 dev: dev.as_ref().as_ref().into(),
                 clusters: id.num_clusters,
                 active_cores,
+                variant,
+                operand_state: &cfg.core_layout.operand_state,
+                deflake: cfg.core_layout.deflake,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
                 feed,
@@ -884,6 +1067,11 @@ impl Gpu {
             GFP_KERNEL,
         )?;
 
+        let directory = kernel::debugfs::Dir::new(c"asahi-g17");
+        let capacity = KBox::pin_init(
+            directory.read_only_file(c"capacity", capacity::View(shared.clone())),
+            GFP_KERNEL,
+        )?;
         let gpu = Arc::new(
             Gpu {
                 cfg,
@@ -892,6 +1080,7 @@ impl Gpu {
                 geometry,
                 ids: Default::default(),
                 shared,
+                _capacity: capacity,
             },
             GFP_KERNEL,
         )?;
@@ -899,6 +1088,42 @@ impl Gpu {
         *gpu.shared.state.lock() = Some(firmware);
         gpu.shared.queue_events();
         Ok(gpu)
+    }
+
+    /// Returns the variant of the loaded firmware build. An identified SoC refuses a build it
+    /// does not know, before anything is written to the GPU.
+    fn firmware_variant(
+        dev: &AsahiDrmDevice,
+        firmware: &fw::variant::Firmware,
+    ) -> Result<&'static fw::Variant> {
+        let builds = match firmware {
+            fw::variant::Firmware::Fixed(variant) => return Ok(variant),
+            fw::variant::Firmware::Identified(builds) => builds,
+        };
+        let version = Self::os_firmware_version(dev);
+        if let Some(build) = builds.iter().find(|build| Some(build.os_version) == version) {
+            dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
+            return Ok(build.variant);
+        }
+        dev_err!(
+            dev.as_ref(),
+            "Unsupported GPU firmware: macOS version {:?} (apple,firmware-version)\n",
+            version
+        );
+        for build in builds.iter() {
+            dev_err!(dev.as_ref(), "Supported GPU firmware: {}\n", build.name);
+        }
+        Err(ENODEV)
+    }
+
+    /// The macOS version the boot loader reports for the boot firmware that loaded the GPU
+    /// firmware: `apple,firmware-version` of the GPU node, which m1n1 writes from the ADT.
+    fn os_firmware_version(dev: &AsahiDrmDevice) -> Option<[u32; 3]> {
+        let node = dev.as_ref().as_ref().of_node()?;
+        let cells = node
+            .get_property::<KVec<u32>>(c_str!("apple,firmware-version"))
+            .ok()?;
+        cells.as_slice().try_into().ok()
     }
 
     /// Returns the highest advertised operating-point frequency without changing table order.
@@ -932,6 +1157,7 @@ impl Gpu {
                 mmu::UatFirmware::PublishedRoots {
                     secondary_root_offset: cfg.secondary_root_offset,
                 },
+                cfg.uat_quirks,
             )?,
             GFP_KERNEL,
         )?;
@@ -948,11 +1174,20 @@ impl Gpu {
         )?;
         let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
             .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
-        let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)
-            .inspect_err(|e| dev_err!(dev.as_ref(), "Secondary coprocessor setup failed: {:?}\n", e))?;
+        let secondary = match cfg.secondary_root_offset {
+            Some(_) => Some(
+                Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary).inspect_err(|e| {
+                    dev_err!(dev.as_ref(), "Secondary coprocessor setup failed: {:?}\n", e)
+                })?,
+            ),
+            None => None,
+        };
         let render_global = uat.new_vm(0, geometry.user_range())?;
 
-        let bridge = Bridge::enable(regs)?;
+        let bridge = match cfg.fabric_bridge {
+            true => Bridge::enable(regs)?,
+            false => Bridge::unused(regs),
+        };
 
         // Install all session ownership before either CPU starts. Error unwinding then runs
         // Firmware::drop, stopping both CPUs before releasing shared objects or translations.
@@ -964,9 +1199,17 @@ impl Gpu {
                 rings: channel::Rings::new(),
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                hold: power::Hold::new(),
                 registration_power_release_pending: false,
-                queues <- runtime::Registry::new(shared.clusters, shared.descriptor_flags),
+                variant: shared.variant,
+                queues <- runtime::Registry::new(
+                    shared.clusters,
+                    shared.deflake,
+                    shared.descriptor_flags,
+                    shared.variant,
+                ),
                 pool: object::Pool::new()?,
+                render_rings: kick::RenderRings::new()?,
                 render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
                 init: initdata::InitData::new(),
                 _render_global: render_global,
@@ -977,29 +1220,77 @@ impl Gpu {
         )?;
         let session = &mut *firmware;
         session.primary.boot()?;
-        session.secondary.boot()?;
-        let root_entries = session.uat.adopt_firmware_root_entries()?;
+        if let Some(secondary) = session.secondary.as_mut() {
+            secondary.boot()?;
+        }
+        // The firmware built its root and kernel-window tables while booting.
+        session.uat.invalidate_reserved_tables();
+        let root_entries = match cfg.adopt_root_entries {
+            true => Some(session.uat.adopt_firmware_root_entries()?),
+            false => None,
+        };
         session.init.build(
             dev,
             cfg,
             &session.uat,
             &session._render_global,
             &session._pm_metrics,
+            shared.clusters,
+            shared.active_cores,
+            shared.variant,
         )?;
-        session.uat.confirm_firmware_root_entries(root_entries)?;
+        if let Some(root_entries) = root_entries {
+            session.uat.confirm_firmware_root_entries(root_entries)?;
+        }
         session.uat.mirror_secondary_root()?;
-        session.bridge.regs.enable_g17_gating()?;
-        session.primary.init(session.init.root_va(Role::Primary)?)?;
-        session
-            .secondary
-            .init(session.init.root_va(Role::Secondary)?)?;
-        session.primary.notify(MSG_POWER_ON_DONE)?;
-        session.secondary.notify(MSG_POWER_ON_DONE)?;
-        Self::wait_for_opening(dev, &session.init, &session.primary, &session.secondary)?;
+        if cfg.fabric_bridge {
+            session.bridge.regs.enable_g17_gating()?;
+        }
+        let ack = shared.variant.init_ack;
+        session.primary.init(session.init.root_va(Role::Primary)?, ack)?;
+        if ack == fw::variant::InitAck::Status {
+            Self::wait_for_init_accepted(dev, &session.init, &session.primary)?;
+        }
+        if let Some(secondary) = session.secondary.as_mut() {
+            secondary.init(session.init.root_va(Role::Secondary)?, ack)?;
+        }
+        if shared.variant.power_on_done {
+            session.primary.notify(MSG_POWER_ON_DONE)?;
+            if let Some(secondary) = session.secondary.as_mut() {
+                secondary.notify(MSG_POWER_ON_DONE)?;
+            }
+        }
+        Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
         session
             .uat
             .activate_render_context(&session._render_global)?;
         Ok(firmware)
+    }
+
+    /// Waits for a firmware that sends no acknowledgment message to accept its
+    /// initialization in status A.
+    fn wait_for_init_accepted(
+        dev: &AsahiDrmDevice,
+        init: &initdata::InitData,
+        primary: &Coprocessor,
+    ) -> Result {
+        for poll in 0..=INIT_ACCEPT_POLLS {
+            if primary.state.crashed.load(Ordering::Acquire) {
+                return Err(EIO);
+            }
+            if init.init_accepted()? {
+                return Ok(());
+            }
+            if poll < INIT_ACCEPT_POLLS {
+                fsleep(Delta::from_millis(1));
+            }
+        }
+        dev_err!(
+            dev.as_ref(),
+            "Firmware did not accept its initialization: status A {:#x?}\n",
+            init.status_read_words::<4>(Role::Primary, 0x10)?
+        );
+        Err(ETIMEDOUT)
     }
 
     /// Waits for both coprocessors to retire their opening device-control records.
@@ -1007,15 +1298,17 @@ impl Gpu {
         dev: &AsahiDrmDevice,
         init: &initdata::InitData,
         primary: &Coprocessor,
-        secondary: &Coprocessor,
+        secondary: Option<&Coprocessor>,
     ) -> Result {
         for poll in 0..=OPENING_RETIRE_POLLS {
             if primary.state.crashed.load(Ordering::Acquire)
-                || secondary.state.crashed.load(Ordering::Acquire)
+                || secondary.is_some_and(|s| s.state.crashed.load(Ordering::Acquire))
             {
                 return Err(EIO);
             }
-            if init.opening_retired(Role::Primary)? && init.opening_retired(Role::Secondary)? {
+            if init.opening_retired(Role::Primary)?
+                && (secondary.is_none() || init.opening_retired(Role::Secondary)?)
+            {
                 return Ok(());
             }
             if poll < OPENING_RETIRE_POLLS {
@@ -1081,12 +1374,20 @@ impl gpu::Gpu for Gpu {
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         params.features |=
-            uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY as u64;
-        params.gpu_generation = hw::GpuGen::G17 as u32;
+            u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
+        let variant = self.shared.variant;
+        if variant.few_primitives {
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
+        }
+        if variant.ray_traversal {
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
+        }
+        params.gpu_generation = self.cfg.gpu_generation as u32;
         params.gpu_variant = self.cfg.identity.gpu_variant as u32;
         params.gpu_revision = self.id.gpu_rev as u32;
         params.chip_id = self.cfg.chip_id;
@@ -1115,9 +1416,18 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// The G17 runtime never programs fault_control into the firmware, so unmapped reads are not
+    /// guaranteed to return zero. Advertising soft faults made Mesa point out-of-bounds vec3/vec4
+    /// vertex fetches at address 0 and skip bounds checks on bounded loads; on T6040 those reads
+    /// returned non-zero data (2026-10-19: every robustness2 rgba32 vertex_attribute_fetch case
+    /// failed; all pass with soft faults off).
+    fn supports_soft_faults(&self) -> bool {
+        false
+    }
+
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         Some(uapi::drm_asahi_queue_limits {
-            max_queues: mmu::MAX_EXECUTION_CONTEXTS,
+            max_queues: kick::queue_limit(self.shared.variant.qid_floor),
             max_in_flight_per_queue: hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u32,
             ..Default::default()
         })
@@ -1156,12 +1466,26 @@ impl gpu::Gpu for Gpu {
     ) -> Result<KBox<dyn crate::queue::Queue>> {
         let dev = self.shared.drm()?;
         let owner = self.ids.queue.next();
-        let frontend =
-            queue::Frontend::new(priority, usc_exec_base, self.geometry.user_usable_range())?;
+        let frontend = queue::Frontend::new(
+            priority,
+            usc_exec_base,
+            self.geometry.user_usable_range(),
+            self.shared.variant,
+        )?;
         let policy = scheduling_policy(priority)?;
+        let admission_started = now_ns();
         let (backend, slot) = loop {
             match runtime::Backend::new(&self.shared, &vm, owner, policy) {
                 Err(error) if error == EAGAIN => continue,
+                Err(error) if error == ENOSPC => {
+                    // Closed logical queues can still own execution/QoS IDs
+                    // until the scheduler release is consumed and reclaimed.
+                    // Backend construction has rolled back all temporary leases.
+                    if now_ns().saturating_sub(admission_started)
+                        >= job::TIMEOUT_MS as u64 * 1_000_000 { return Err(EBUSY); }
+                    self.shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                }
                 result => break result?,
             }
         };
@@ -1185,27 +1509,28 @@ impl gpu::Gpu for Gpu {
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
-    ) -> Result<mmu::KernelMapping> {
+    ) -> Result<crate::timestamp::Buffer> {
         let state = self.shared.state.lock();
         let firmware = (*state).as_ref().ok_or(ENODEV)?;
         let mut addresses = firmware.uat.geometry().kernel_range();
         addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
-        bo.map_range_into_range(
+        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
             firmware.uat.kernel_vm(),
             range,
             addresses,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
             false,
-        )
+        )?)
     }
 }
 
 /// Scheduling profile of a new logical queue. `file.rs` passes
-/// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses HIGH and REALTIME, so
-/// MEDIUM arrives as 2 and LOW as 3.
+/// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses REALTIME, so HIGH
+/// arrives as 1, MEDIUM as 2 and LOW as 3.
 fn scheduling_policy(priority: u32) -> Result<fw::queue::Policy> {
     match priority {
+        1 => Ok(hw::t8140::scheduling::HIGH),
         2 => Ok(hw::t8140::scheduling::MEDIUM),
         3 => Ok(hw::t8140::scheduling::LOW),
         _ => Err(EINVAL),

@@ -9,11 +9,12 @@
 
 mod attribution;
 mod slot;
+mod safety;
 pub(crate) use attribution::Sources;
 use attribution::Attribution;
 
-pub(super) fn slot_key(slot: usize) -> Option<u64> {
-    slot::key(slot).ok()
+pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {
+    slot::key(slot, slot_keys?).ok()
 }
 
 use super::status::VmStatus;
@@ -99,6 +100,8 @@ struct Request {
 pub(super) struct State {
     accepted: u64,
     pending: Option<Request>,
+    timeouts: safety::Storm,
+    restarts: safety::Storm,
 }
 
 /// Non-fatal post-recovery failures. The firmware handshake has already closed successfully.
@@ -112,8 +115,12 @@ impl State {
         Self {
             accepted: 0,
             pending: None,
+            timeouts: safety::Storm::new(),
+            restarts: safety::Storm::new(),
         }
     }
+    pub(super) fn timeout_limit(&mut self, now: u64) -> bool { self.timeouts.note(now) }
+    pub(super) fn restart_limit(&mut self, now: u64) -> bool { self.restarts.note(now) }
     pub(super) fn generation(&self) -> u64 {
         self.accepted
     }
@@ -220,9 +227,17 @@ pub(super) fn service<H: Host>(
     }
     host.recovery_mut().pending = None;
 
-    let cancelled = classify(host, entries, request.blamed, &mut sources);
+    let (cancelled, blame) = classify(host, entries, request.blamed, &mut sources);
     if let Some(qid) = request.blamed {
-        host.settle_blamed_render(qid, EIO);
+        pr_warn!(
+            "G17: GPU recovery (reason {:?}): firmware blamed queue {}, {}\n",
+            sources.reason,
+            qid,
+            if blame { "failing its oldest render" } else { "attribution cleared it; spared" }
+        );
+        if blame {
+            host.settle_blamed_render(qid, EIO);
+        }
     }
     if cancelled != 0 {
         host.settle_cancelled_renders(cancelled);
@@ -235,7 +250,10 @@ pub(super) fn service<H: Host>(
 /// Resolves guilty QIDs before changing any completion's classification. Unknown ownership or
 /// too many distinct guilty VMs leaves all prior classifications intact. The oldest spared work
 /// of a QID makes later blame collateral to its previous recovery, rather than new VM guilt.
-fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sources: &mut Sources) -> u128 {
+/// Also returns whether the firmware's blamed QID is still guilty after attribution: a blamed
+/// render that had not started while others had (or with no culprit at all) is innocent, and its
+/// work is spared like that of every other innocent VM instead of failing with EIO.
+fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sources: &mut Sources) -> (u128, bool) {
     let mut guilty_qids = entries.guilty | blamed.map_or(0, |qid| 1u128 << qid);
     let cancelled = entries.cancelled;
     let attribution = sources.attribute(blamed, |qid, stamp| queues.render_pass_started(qid, stamp));
@@ -245,8 +263,9 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sou
         Attribution::NoCulprit => guilty_qids = 0,
     }
     let no_culprit = attribution == Attribution::NoCulprit;
+    let blame = blamed.is_some_and(|qid| guilty_qids & (1u128 << qid) != 0);
     if guilty_qids == 0 && !no_culprit {
-        return 0;
+        return (0, blame);
     }
     let mut guilty: [Option<Arc<VmStatus>>; MAX_GUILTY_VMS] = Default::default();
     let mut count = 0;
@@ -282,7 +301,7 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sou
         }
     }
     if unresolved || (count == 0 && collateral == 0 && !no_culprit) {
-        return 0;
+        return (0, blame);
     }
     let spared = queues.classify_work(&|status| {
         guilty[..count]
@@ -295,5 +314,5 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, sou
             })
             .unwrap_or(Class::Spared)
     });
-    cancelled & !(guilty_qids & !collateral) & spared
+    (cancelled & !(guilty_qids & !collateral) & spared, blame)
 }

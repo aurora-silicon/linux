@@ -83,7 +83,7 @@ impl Firmware {
                         .ok_or(EIO)?
                         .prepare_replay(&packet)?;
                     let owner = owner.ok_or(EIO)?;
-                    packet.check_dependencies()?;
+                    packet.check_replay_dependencies()?;
                     let dependencies = self.queues.render_prefix(owner, &packet)?;
                     self.publish_compute(owner, packet.clone(), dependencies.as_slice(), deferred)
                 })() };

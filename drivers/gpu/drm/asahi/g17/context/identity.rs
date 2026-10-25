@@ -69,3 +69,12 @@ impl RenderSlots {
         Some(ordinal.checked_sub(origin)?.wrapping_add(1) as u8)
     }
 }
+
+impl WorkStates {
+    pub(super) fn used(&self) -> usize {
+        self.live.iter().filter(|word| word.load(Ordering::Acquire) != FREE).count()
+    }
+}
+impl RenderSlots {
+    pub(super) fn used(&self) -> usize { self.pairs.iter().flatten().count() }
+}

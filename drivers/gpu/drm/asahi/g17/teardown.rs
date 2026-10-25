@@ -75,6 +75,21 @@ impl Pending {
         self.entries.is_empty()
     }
 
+    /// The context's scheduler release is armed or published, and the queues it
+    /// last ran have not been detached yet. Until then the firmware may still
+    /// process the release against those queues: none of them may change owner.
+    pub(crate) fn releasing(&self, context: &Arc<Context>) -> bool {
+        self.find(context)
+            .is_some_and(|index| self.entries[index].phase != Phase::Deferred)
+    }
+
+    /// `releasing` for the context that owns scheduler page `scheduler`.
+    pub(crate) fn releasing_scheduler(&self, scheduler: u64) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.phase != Phase::Deferred && entry.context.scheduler_va() == scheduler
+        })
+    }
+
     fn find(&self, context: &Arc<Context>) -> Option<usize> {
         self.entries
             .iter()

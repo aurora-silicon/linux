@@ -9,7 +9,12 @@ pub(crate) mod retirement;
 use crate::g17::{
     channel::Rings,
     context::Context,
-    fw::{channels::ControlRecord, compute::COMPUTE_DESCRIPTOR_SIZE, queue::*},
+    fw::{
+        channels::ControlRecord,
+        compute::{OperandState, COMPUTE_DESCRIPTOR_SIZE},
+        queue::*,
+        variant::PointerLayout,
+    },
     object::{Allocator, CpuMap, KernelObject},
 };
 use crate::{hw::t8140::dynamic, mmu};
@@ -113,17 +118,26 @@ struct Graph {
     records: KernelObject,
     record_ends: [Option<u32>; RECORD_SLOTS],
     reclaimed: u32,
+    /// Host words of the pointer block in this firmware build.
+    pointers: PointerLayout,
+    /// Layout of the operand-state buffer for the GPU's cores.
+    operand_state: &'static OperandState,
 }
 
 impl Graph {
-    fn new(alloc: &Allocator<'_>, context: &Context) -> Result<Self> {
+    fn new(
+        alloc: &Allocator<'_>,
+        context: &Context,
+        pointers: PointerLayout,
+        operand_state: &'static OperandState,
+    ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let cpu = CpuMap::WriteCombined;
         let ring = DescriptorRing::new(alloc)?;
         let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
         let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
-        let operand = alloc.lower(0x14000, page, prot, cpu)?;
+        let operand = alloc.lower(operand_state.size, page, prot, cpu)?;
         let mut support = alloc.kernel(0xc000, page, prot, cpu)?;
         let support_va = support.gpu_va();
         support.write(0, support_va + page)?;
@@ -141,7 +155,7 @@ impl Graph {
                 owner_pid: context.owner_pid(),
                 policy: context.policy(),
             });
-            view.pointers = PointerBlock::new();
+            view.pointers = PointerBlock::new(&pointers)?;
             view.jobs = JobListHead::new(graph_va + 0x200);
             Ok(())
         })?;
@@ -160,6 +174,8 @@ impl Graph {
             records,
             record_ends: [None; RECORD_SLOTS],
             reclaimed: 0,
+            pointers,
+            operand_state,
         })
     }
 
@@ -221,7 +237,7 @@ impl Graph {
 
     fn cursors(&self) -> Result<Cursors> {
         Ok(Cursors {
-            producer: self.graph.word(POINTERS + 0x40)?.load(Ordering::Relaxed),
+            producer: self.graph.word(POINTERS + self.pointers.producer)?.load(Ordering::Relaxed),
             consumer: self.graph.word(POINTERS)?.load(Ordering::Relaxed),
             count: self.graph.word(POINTERS + 0x60)?.load(Ordering::Relaxed),
         })
@@ -258,7 +274,7 @@ impl Graph {
         if let Some(end) = *self.record_ends.get(slot).ok_or(EINVAL)? {
             let cursors = self.cursors()?;
             if !cursors.consumed(end, cursors.count)? {
-                return Err(EBUSY);
+                return Err(EAGAIN);
             }
         }
         Ok(())
@@ -276,7 +292,9 @@ impl Graph {
             self.graph.dword(ITEMS + index * 8)?.store(0, Ordering::Relaxed);
         }
         fence(Ordering::SeqCst);
-        self.graph.word(POINTERS + 0x40)?.store(cursors.consumer, Ordering::Relaxed);
+        self.graph
+            .word(POINTERS + self.pointers.producer)?
+            .store(cursors.consumer, Ordering::Relaxed);
         self.reclaimed = cursors.consumer;
         fence(Ordering::SeqCst);
         Ok(())
@@ -389,11 +407,21 @@ struct Active {
     failure_deferred: bool,
     qos_pending: bool,
 }
-struct Previous {
-    binding: Option<Binding>,
-    context: Arc<Context>,
+struct Previous<B = Binding, C = Arc<Context>> {
+    binding: Option<B>,
+    context: C,
     publication: Option<(u64, u64)>,
 }
+impl<B, C> Previous<B, C> {
+    /// The exact drain witness covers the replacement publication even when
+    /// its public fence failed. An unpublished replacement still needs rollback.
+    fn retire_witnessed(previous: &mut Option<Self>) {
+        if previous.as_ref().is_some_and(|p| p.publication.is_some()) {
+            drop(previous.take());
+        }
+    }
+}
+
 /// Per-queue addresses of the bound owner, read under the publication preflight.
 struct BindingAddresses {
     preempt: u64,
@@ -453,12 +481,21 @@ pub(crate) enum PoolPhase {
     Vacant,
 }
 
+/// Builder ownership of one physical release transaction. The preparation
+/// lease pins this registry until abort/commit; owner close may remove lookups.
+#[derive(Clone, Copy)]
+pub(crate) struct Growth {
+    qid: u8,
+    phase: PoolPhase,
+}
+
 pub(crate) struct Queue {
     owner: Option<u64>,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
     pool_phase: PoolPhase,
+    release_sent_ns: Option<u64>,
     growing: bool,
     growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
@@ -471,6 +508,8 @@ pub(crate) struct Queue {
     /// `None` after an exited owner was detached; a new owner binds afresh.
     binding: Option<Binding>,
     previous: Option<Previous>,
+    /// This binding has never crossed the successor visibility boundary.
+    unpublished_binding: bool,
     kick: kick::Queue,
     pool: ComputePool,
     graph: Graph,
@@ -509,9 +548,11 @@ impl Queue {
         backing: Backing,
         owner: u64,
         context: Arc<Context>,
+        pointers: PointerLayout,
+        operand_state: &'static OperandState,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
-        let mut graph = Graph::new(alloc, &context)?;
+        let mut graph = Graph::new(alloc, &context, pointers, operand_state)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
@@ -520,6 +561,7 @@ impl Queue {
             owner: Some(owner),
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
+            release_sent_ns: None,
             growing: false,
             growth_blocks: 0,
             needs_fresh_backing: false,
@@ -527,6 +569,7 @@ impl Queue {
             free_list_generation: 0,
             binding: Some(binding),
             previous: None,
+            unpublished_binding: true,
             kick,
             pool,
             graph,
@@ -566,6 +609,21 @@ impl Queue {
     pub(crate) fn context(&self) -> Option<&Arc<Context>> {
         self.binding.as_ref().map(|binding| &binding.context)
     }
+    /// The first command after an owner change away from `context` has been
+    /// published and not retired: the queue still runs that scheduler's state.
+    pub(crate) fn switching_from(&self, context: &Arc<Context>) -> bool {
+        self.previous.as_ref().is_some_and(|previous| {
+            previous.publication.is_some() && Arc::ptr_eq(&previous.context, context)
+        })
+    }
+    /// The context these queue records were bound to before an owner change
+    /// whose first command is not published yet.
+    pub(crate) fn pending_switch_from(&self) -> Option<&Arc<Context>> {
+        self.previous
+            .as_ref()
+            .filter(|previous| previous.publication.is_none())
+            .map(|previous| &previous.context)
+    }
     /// Quarantined commands still retain the scheduler until their retirement witness.
     pub(crate) fn idle_for_context(&self, context: &Arc<Context>) -> bool {
         !self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
@@ -574,18 +632,16 @@ impl Queue {
     pub(crate) fn in_flight(&self) -> bool {
         self.active.len != 0 && !self.quarantined
     }
-    pub(crate) fn room(&self) -> bool {
-        !self.quarantined && !self.released && self.replays.len == 0 && self.active.len < IN_FLIGHT
-    }
     /// Quarantines without a pending witness no longer describe live pipe order.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         if self.quarantined && !self.awaiting_witness {
             return None;
         }
         self.active.front().map(|active| crate::g17::timeout::Head {
-            vm: Arc::as_ptr(active.packet.completion.status()) as usize,
+            vm: active.packet.context.vm().id(),
             published: active.published,
             finished: active.observed.is_some(),
+            failed: self.quarantined,
         })
     }
 
@@ -624,6 +680,25 @@ impl Queue {
     /// when firmware has no more events to send. Do not poll idle or failed queues.
     pub(crate) fn retirement_polling(&self) -> bool {
         !self.quarantined && self.retire_pending
+    }
+
+    /// A release has no completion event: keep observing the control consumer
+    /// until its witness lets the idle physical queue be re-armed.
+    pub(crate) fn pool_release_pending(&self) -> bool {
+        matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
+    }
+
+    pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
+        self.pool_release_pending() && crate::g17::timeout::background_stalled(self.release_sent_ns, now)
+    }
+
+    /// A closed owner can still retain its last commands or their completion
+    /// stamps. Admission may wait for retirement, without treating that close
+    /// as permission to reuse any firmware-owned backing.
+    pub(crate) fn release_settling(&self) -> bool {
+        // release_owner keeps the old owner while its last commands retire.
+        // Waiting only once owner is None misses precisely that interval.
+        release_pending(self.released, self.quarantined, self.active.len, self.retire_pending)
     }
 
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
@@ -780,9 +855,7 @@ impl Queue {
                     .skip(1)
                     .find_map(|a| a.observed.map(|o| o.timestamps[1]));
                 let stamp = self.graph.stamp()?;
-                let record_aged = front
-                    .observed_at
-                    .is_some_and(|at| now_ns().saturating_sub(at) >= retirement::STAMP_GRACE_NS);
+                let record_aged = retirement::record_aged(front.observed_at, now_ns());
                 let timestamps = retirement::poll(
                     &ticket,
                     front.observed,
@@ -829,6 +902,7 @@ impl Queue {
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
                         self.owner = None;
+                        self.released_at = now_ns();
                     }
                 }
                 Ok(None) | Err(EAGAIN) => {
@@ -929,6 +1003,10 @@ impl Queue {
         self.retirement_proved = false;
         self.replay_retirement = false;
         self.spared_deferred = false;
+        // The stamp and fully consumed ring proved the replacement retired.
+        // Keeping its predecessor only on the fault path prevents recycling
+        // forever: neither another retirement nor an exit kill can release it.
+        Previous::retire_witnessed(&mut self.previous);
         if self.spared_quarantine {
             self.spared_quarantine = false;
             self.quarantine_error = None;
@@ -937,15 +1015,9 @@ impl Queue {
             self.quarantined = false;
             self.retire_pending = false;
             self.retirement_ready = true;
-            if self
-                .previous
-                .as_ref()
-                .is_some_and(|p| p.publication.is_some())
-            {
-                drop(self.previous.take());
-            }
             if self.released {
                 self.owner = None;
+                self.released_at = now_ns();
             }
         }
         Ok(())
@@ -1024,6 +1096,102 @@ impl Queue {
             drop(self.active.pop());
         }
         Ok(())
+    }
+}
+
+/// Validate the complete unpublished item budget before changing descriptors,
+/// work counts or queue producers. Leave one item empty across ring wrap.
+fn item_capacity(cursors: Cursors, entry_signal: bool) -> Result {
+    if cursors.count != ITEM_RING_ENTRIES { return Err(EIO); }
+    if cursors.producer >= cursors.count || cursors.consumer >= cursors.count {
+        return Err(ERANGE);
+    }
+    let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
+    if free < if entry_signal { 4 } else { 3 } {
+        let _ = crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeItems);
+        return Err(EAGAIN);
+    }
+   Ok(())
+}
+
+/// Retained commands are capacity, not a failed VM. Nothing has been written
+/// when this check runs, so the outer publisher can wait for retirement under
+/// its original admission deadline, just as it does for a full firmware ring.
+fn retained_capacity(
+    quarantined: bool, released: bool, active: usize, replays: usize, replay_front: bool,
+) -> Result {
+    if quarantined || released {
+        return Err(EBUSY);
+    }
+    if active >= IN_FLIGHT || (replays != 0 && !replay_front) {
+        return Err(EAGAIN);
+    }
+    Ok(())
+}
+
+/// Logical close promises a future healthy handoff, not immediate reuse.
+/// Exact retirement still owns the transition.
+fn release_pending(released: bool, quarantined: bool, active: usize, retiring: bool) -> bool {
+    released && !quarantined && (active != 0 || retiring)
+}
+
+#[kunit_tests(asahi_g17_compute_admission)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn retained_ring_pressure_waits_without_discarding_work() {
+        let mut active = Fifo::new();
+        for sequence in 0..IN_FLIGHT {
+            active.push(sequence).unwrap();
+        }
+        assert_eq!(retained_capacity(false, false, active.len, 0, false), Err(EAGAIN));
+        assert_eq!(active.front(), Some(&0));
+        assert_eq!(active.len, IN_FLIGHT);
+        assert_eq!(active.pop(), Some(0));
+        assert_eq!(retained_capacity(false, false, active.len, 0, false), Ok(()));
+        assert_eq!(active.front(), Some(&1));
+    }
+
+    #[test]
+    fn replay_front_and_terminal_ownership_remain_distinct() {
+        assert_eq!(retained_capacity(false, false, 0, 1, false), Err(EAGAIN));
+        assert_eq!(retained_capacity(false, false, 0, 1, true), Ok(()));
+        assert_eq!(retained_capacity(false, false, IN_FLIGHT, 1, true), Err(EAGAIN));
+        for (quarantined, released) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(retained_capacity(quarantined, released, 0, 1, true), Err(EBUSY));
+        }
+    }
+
+    #[test]
+    fn item_refusal_is_retryable_and_preserves_the_empty_slot() {
+        let n = ITEM_RING_ENTRIES;
+        assert_eq!(item_capacity(Cursors { producer: 0, consumer: 4, count: n }, false), Ok(()));
+        assert_eq!(item_capacity(Cursors { producer: 0, consumer: 4, count: n }, true), Err(EAGAIN));
+        assert_eq!(item_capacity(Cursors { producer: n - 2, consumer: 2, count: n }, false), Ok(()));
+        assert_eq!(item_capacity(Cursors { producer: n - 2, consumer: 2, count: n }, true), Err(EAGAIN));
+        assert_eq!(item_capacity(Cursors { producer: 10, consumer: 10, count: n }, true), Ok(()));
+    }
+
+    #[test]
+    fn bad_item_cursors_are_not_backpressure() {
+        let n = ITEM_RING_ENTRIES;
+        assert_eq!(item_capacity(Cursors { producer: 0, consumer: 0, count: 0 }, false), Err(EIO));
+        assert_eq!(item_capacity(Cursors { producer: n, consumer: 0, count: n }, false), Err(ERANGE));
+        assert_eq!(item_capacity(Cursors { producer: 0, consumer: n, count: n }, true), Err(ERANGE));
+    }
+
+    #[test]
+    fn closed_owner_waits_for_its_last_command() {
+        assert!(release_pending(true, false, 1, false));
+        assert!(release_pending(true, false, 0, true));
+        assert!(!release_pending(true, false, 0, false));
+    }
+
+    #[test]
+    fn live_or_quarantined_owners_do_not_promise_capacity() {
+        assert!(!release_pending(false, false, 1, true));
+        assert!(!release_pending(true, true, 1, true));
     }
 }
 
@@ -1107,6 +1275,7 @@ impl Queue {
         }
         context.mark_published();
         self.owner = Some(owner);
+        self.unpublished_binding = true;
         self.released = false;
         self.retirement_ready = false;
         self.retired_by_teardown = false;
@@ -1132,6 +1301,13 @@ impl Queue {
                 } else {
                     self.binding.as_mut().ok_or(EIO)?.context = previous.context;
                 }
+                self.retirement_ready = true;
+            }
+            // Rebinding an already detached queue has no Previous. If its
+            // first command is rejected or cancelled before publication, the
+            // empty active FIFO is still the original idle witness. No future
+            // completion can turn retirement_ready back on for this owner.
+            if self.previous.is_none() {
                 self.retirement_ready = true;
             }
             if self.retirement_ready {
@@ -1259,6 +1435,7 @@ impl Queue {
         );
         let cursor = Rings::publish_control(init, &record)?;
         self.pool_phase = PoolPhase::ReleaseSent(cursor);
+        self.release_sent_ns = Some(crate::g17::now_ns());
         fence(Ordering::SeqCst);
         Ok(())
     }
@@ -1283,7 +1460,7 @@ impl Queue {
         let pages = self.pool.take_pages();
         let descriptors = self.binding.as_mut().and_then(|binding| binding.descriptors.take());
         let ring = self.graph.vacate_ring();
-        self.pool_phase = PoolPhase::Vacant;
+        self.pool_phase = PoolPhase::Vacant; self.release_sent_ns = None;
         Ok(Some(Vacated {
             _alias: alias,
             _pages: pages,
@@ -1298,12 +1475,11 @@ impl Queue {
         pages: crate::g17::freelist::Pages,
         ring: DescriptorRing,
     ) -> Result<(u16, u64)> {
-        if self.pool_phase != PoolPhase::Vacant || !(self.reusable() || self.recycled_pending()) {
-            return Err(EAGAIN);
-        }
+        if !self.can_rearm() { return Err(EAGAIN); }
         self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
         self.pool_phase = PoolPhase::Populated;
+        self.release_sent_ns = None;
         self.needs_fresh_backing = false;
         Ok((self.pool.id(), self.pool.page_list_va()?))
     }
@@ -1314,11 +1490,7 @@ impl Queue {
     /// Only a capacity increase waits for this queue's previously published work.
     /// Other queues and ordinary submissions keep their existing concurrency.
     pub(crate) fn begin_growth(&mut self, init: &crate::g17::initdata::InitData, blocks: usize) -> Result<bool> {
-        if self.growing {
-            if blocks < self.growth_blocks { return Err(EAGAIN); }
-            self.growth_blocks = blocks;
-            return Ok(false);
-        }
+        if self.growing { return Err(EAGAIN); }
         if self.quarantined || self.released || self.exit.is_some()
             || self.active.len != 0 || self.replays.len != 0 || self.previous.is_some()
             || (self.installed && !self.retirement_ready)
@@ -1327,7 +1499,8 @@ impl Queue {
             let record = ControlRecord::FreeListRelease(self.pool.release_record(self.free_list_generation));
             let cursor = Rings::publish_control(init, &record)?;
             self.pool_phase = PoolPhase::ReleaseSent(cursor);
-        } else { self.pool_phase = PoolPhase::Vacant; }
+        self.release_sent_ns = Some(crate::g17::now_ns());
+        } else { self.pool_phase = PoolPhase::Vacant; self.release_sent_ns = None; }
         self.growing = true;
         self.growth_blocks = blocks;
         Ok(self.installed)
@@ -1344,16 +1517,35 @@ impl Queue {
                 return Err(EAGAIN);
             }
         }
+        if alias.is_none() { return Err(EINVAL); }
+        let fresh = pages.as_ref().ok_or(EINVAL)?;
         let binding = self.binding.as_mut().ok_or(EFAULT)?;
-        let old_alias = binding.pool_alias.take();
-        let old_pages = self.pool.take_pages();
-        self.pool.rearm(pages.take().ok_or(EINVAL)?)?;
-        init.initialize_compute_pool_blocks(self.pool.id(), self.pool.page_list_va()?, blocks)?;
-        binding.pool_alias = alias.take();
+        // No ownership moves before every fallible descriptor/header operation.
+        // The old release is consumed; no queue can use this row until commit.
+        init.initialize_compute_pool_blocks(self.pool.id(), fresh.page_list_va(), blocks)?;
+        self.pool.replace_pages(pages)?;
+        let old_alias = core::mem::replace(&mut binding.pool_alias, alias.take());
         self.pool_phase = PoolPhase::Populated;
+        self.release_sent_ns = None;
         self.growing = false;
         self.growth_blocks = 0;
-        Ok(Vacated { _alias: old_alias, _pages: old_pages, _descriptors: None, _ring: None })
+        Ok(Vacated { _alias: old_alias, _pages: pages.take(), _descriptors: None, _ring: None })
+    }
+
+    pub(crate) fn growth_token(&self) -> Option<Growth> {
+        self.growing.then_some(Growth { qid: self.qid(), phase: self.pool_phase })
+    }
+
+    /// Transfer an abandoned builder's release back to the event worker. Do not
+    /// revoke the published release or free backing here: vacancy still requires
+    /// its exact control-consumer witness. A different transaction is untouched.
+    pub(crate) fn abort_growth(&mut self, token: Growth) -> Result<Option<bool>> {
+        if !self.growing || self.qid() != token.qid || self.pool_phase != token.phase {
+            return Ok(None);
+        }
+        self.growing = false;
+        self.growth_blocks = 0;
+        self.release_owner().map(Some)
     }
 
     /// Exact host identity remains valid even when several commands share an ioctl ID.
@@ -1436,14 +1628,17 @@ impl Queue {
     }
     /// Firmware is halted and publication is closed while its target is copied.
     pub(crate) fn publish_recovery_target(&self) -> Result {
+        let Some(target) = self.graph.pointers.recovery_target else {
+            return Ok(());
+        };
         let producer = self
             .graph
             .graph
-            .word(POINTERS + PointerBlock::PRODUCER)?
+            .word(POINTERS + self.graph.pointers.producer)?
             .load(Ordering::Relaxed);
         self.graph
             .graph
-            .word(POINTERS + PointerBlock::RECOVERY_TARGET)?
+            .word(POINTERS + target)?
             .store(producer, Ordering::Relaxed);
         Ok(())
     }
@@ -1535,7 +1730,7 @@ impl Graph {
             return Err(EBUSY);
         }
         let slot = self.graph.dword(ITEMS + expected as usize * 8)?;
-        let producer = self.graph.word(POINTERS + 0x40)?;
+        let producer = self.graph.word(POINTERS + self.pointers.producer)?;
         if slot.load(Ordering::Relaxed) != 0 {
             return Err(EBUSY);
         }
@@ -1618,6 +1813,7 @@ impl Queue {
             || dependencies
                 .iter()
                 .any(|dependency| dependency.qid() != qid);
+        item_capacity(self.graph.cursors()?, entry_signal)?;
         let record_slot = (!first).then_some(self.ordinal as usize % RECORD_SLOTS);
         if let Some(slot) = record_slot {
             self.graph.ensure_record_slot(slot)?;
@@ -1640,6 +1836,7 @@ impl Queue {
             kick: kick_timestamp,
             preempt_va: addresses.preempt,
             operand_state_va: addresses.operand,
+            operand: self.graph.operand_state,
             usage_va: addresses.usage,
             usage_fw_va: self.graph.usage.gpu_va(),
             free_list_slot: u32::from(self.pool.id()),
@@ -1726,16 +1923,6 @@ impl Queue {
             }
             let config_va = self.graph.record(record_slot, CONFIG, 0xc0, config)?;
             let cursors = self.graph.cursors()?;
-            if cursors.count != ITEM_RING_ENTRIES {
-                return Err(EIO);
-            }
-            if cursors.producer >= cursors.count || cursors.consumer >= cursors.count {
-                return Err(ERANGE);
-            }
-            let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
-            if free < if entry_signal { 4 } else { 3 } {
-                return Err(ENOSPC);
-            }
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;
             if first {
@@ -1743,6 +1930,7 @@ impl Queue {
                 host.prepare_compute_shared()?;
                 packet.mark_published();
                 visible = true;
+                self.unpublished_binding = false;
                 let qos = host.qos_publish(
                     qos::Owner {
                         qid,
@@ -1779,6 +1967,7 @@ impl Queue {
                         Err(error)
                     })?;
                 visible = true;
+                self.unpublished_binding = false;
                 let qos = host.qos_publish(
                     qos::Owner {
                         qid,
@@ -1898,11 +2087,8 @@ impl Queue {
             .replays
             .front()
             .is_some_and(|front| Arc::ptr_eq(front, packet));
-        if !self.room()
-            && !(replay_front && !self.quarantined && !self.released && self.active.len < IN_FLIGHT)
-        {
-            return Err(EBUSY);
-        }
+        retained_capacity(self.quarantined, self.released, self.active.len,
+                          self.replays.len, replay_front)?;
         if !packet.context.is_current()
             || !self
                 .binding
@@ -1969,7 +2155,7 @@ impl Graph {
         let first = self.graph.dword(ITEMS)?;
         let second = self.graph.dword(ITEMS + 8)?;
         let third = self.graph.dword(ITEMS + 16)?;
-        let producer = self.graph.word(POINTERS + 0x40)?;
+        let producer = self.graph.word(POINTERS + self.pointers.producer)?;
         first.store(address, Ordering::Relaxed);
         second.store(0, Ordering::Relaxed);
         third.store(0, Ordering::Relaxed);
@@ -1980,5 +2166,155 @@ impl Graph {
 impl Queue {
     pub(crate) fn take_terminal(&mut self) -> Option<(Arc<VmStatus>, Error)> {
         self.terminal.take()
+    }
+}
+
+impl Queue {
+    pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} awaiting_witness={} previous={} exit={} growing={} pool={:?} active={} total={} ",
+               self.qid(), u8::from(self.owner.is_some()), u8::from(self.released), u8::from(self.reusable()),
+               u8::from(self.quarantined), u8::from(self.awaiting_witness), u8::from(self.previous.is_some()),
+               u8::from(self.exit.is_some()), u8::from(self.growing), self.pool_phase, self.active.len, IN_FLIGHT)?;
+        match self.graph.cursors() {
+            Ok(cursors) if cursors.count != 0 => writeln!(f, "items_used={} items_total={}",
+                cursors.producer.wrapping_sub(cursors.consumer) % cursors.count, cursors.count - 1),
+            _ => writeln!(f, "items_unavailable=1"),
+        }?;
+        writeln!(f, "compute_settling qid={} release={} pool_release={}", self.qid(),
+                 u8::from(self.release_settling()), u8::from(self.pool_release_pending()))?;
+        if let Some(binding) = self.binding.as_ref() {
+            binding.context.write_capacity(f, "compute", usize::from(self.qid()))?;
+        }
+        if let Some(previous) = self.previous.as_ref() {
+            previous.context.write_capacity(f, "compute_previous", usize::from(self.qid()))?;
+        }
+        Ok(())
+    }
+}
+
+#[kunit_tests(asahi_g17_fault_ownership)]
+mod fault_ownership_tests {
+    use super::*;
+    use core::sync::atomic::AtomicUsize;
+
+    struct Lease(Arc<AtomicUsize>);
+    impl Lease {
+        fn new(used: &Arc<AtomicUsize>) -> Self {
+            used.fetch_add(1, Ordering::Relaxed);
+            Self(used.clone())
+        }
+    }
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    // This tests the production predecessor ownership operation without firmware
+    // storage. Runtime tests must separately establish its drain/kill witness.
+    fn faulting_clients(publication: Option<(u64, u64)>) {
+        let used = Arc::new(AtomicUsize::new(0), GFP_KERNEL).unwrap();
+        for _ in 0..512 {
+            let mut previous = Some(Previous {
+                binding: Some(Lease::new(&used)),
+                context: Lease::new(&used),
+                publication,
+            });
+            assert_eq!(used.load(Ordering::Relaxed), 2);
+            Previous::retire_witnessed(&mut previous);
+            assert_eq!(previous.is_none(), publication.is_some());
+            if publication.is_none() {
+                assert_eq!(used.load(Ordering::Relaxed), 2);
+                // An unpublished replacement returns its original owner on close.
+                drop(previous.take());
+            }
+            assert_eq!(used.load(Ordering::Relaxed), 0);
+            Previous::retire_witnessed(&mut previous);
+            assert_eq!(used.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn faulted_published_replacements_return_to_baseline() {
+        faulting_clients(Some((1, 7)));
+    }
+
+    #[test]
+    fn unpublished_replacements_survive_until_rollback() {
+        faulting_clients(None);
+    }
+
+    #[test]
+    fn same_vm_replacement_without_binding_returns_its_context() {
+        let used = Arc::new(AtomicUsize::new(0), GFP_KERNEL).unwrap();
+        let mut previous = Some(Previous::<Lease, Lease> {
+            binding: None,
+            context: Lease::new(&used),
+            publication: Some((9, 3)),
+        });
+        Previous::retire_witnessed(&mut previous);
+        assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+}
+
+impl Queue {
+    /// Offer an open client's idle physical channel to another ready job.
+    /// Logical queue/context ownership is unchanged. The existing binding is
+    /// retained through the successor's exact replacement witness.
+    pub(crate) fn share_idle(&mut self) -> Result<bool> {
+        if !self.installed || self.owner.is_none() || !self.retirement_ready
+            || self.growing || self.quarantined || self.awaiting_witness
+            || self.exit.is_some() || self.active.len != 0 || self.replays.len != 0
+            || self.previous.is_some() || self.pool_phase != PoolPhase::Populated
+        {
+            return Ok(false);
+        }
+        self.release_owner()?;
+        Ok(self.reusable())
+    }
+}
+
+impl Queue {
+    pub(crate) fn can_rearm(&self) -> bool {
+        self.pool_phase == PoolPhase::Vacant && (self.reusable() || self.recycled_pending())
+    }
+}
+
+impl Queue {
+    /// A failed first attempt has no future completion to undo its binding.
+    /// Return the replaced aliases to the caller for off-lock destruction. The
+    /// caller validates the current preparation epoch and cancels only a true
+    /// result's never-published QID; installed rings and identities stay intact.
+    pub(crate) fn rollback_unpublished(
+        &mut self, owner: u64, context: &Arc<Context>,
+    ) -> Result<(bool, Option<Binding>)> {
+        if self.owner != Some(owner) || !self.unpublished_binding
+            || self.binding.as_ref().is_none_or(|binding| !Arc::ptr_eq(&binding.context, context))
+            || self.growing || self.quarantined || self.awaiting_witness
+            || self.exit.is_some() || self.active.len != 0 || self.replays.len != 0
+            || self.retire_pending || self.failure_status_pending
+            || self.pool_phase != PoolPhase::Populated
+            || self.previous.as_ref().is_some_and(|previous| previous.publication.is_some())
+        {
+            return Ok((false, None));
+        }
+        if !self.installed { return Ok((true, None)); }
+        let mut retired = None;
+        if let Some(previous) = self.previous.as_ref() {
+            self.graph.set_owner(&previous.context)?;
+        }
+        if let Some(mut previous) = self.previous.take() {
+            if let Some(binding) = previous.binding.take() {
+                retired = self.binding.replace(binding);
+            } else {
+                self.binding.as_mut().ok_or(EIO)?.context = previous.context;
+            }
+        }
+        self.unpublished_binding = false;
+        self.retirement_ready = true;
+        self.released = true;
+        self.owner = None;
+        self.released_at = now_ns();
+        Ok((false, retired))
     }
 }

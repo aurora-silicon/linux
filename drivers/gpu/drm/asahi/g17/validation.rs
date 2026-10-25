@@ -90,10 +90,11 @@ impl Proof {
         vm: &mmu::Vm,
         range: Range<u64>,
         window: &UscWindow,
+        variant: &crate::g17::fw::Variant,
         payload: &Payload,
     ) -> Result<Validated> {
         let requests = RefCell::new(Requests::new());
-        let optimistic = payload.validate(window, &Space::Record(&range, &requests));
+        let optimistic = payload.validate(window, variant, &Space::Record(&range, &requests));
         let requests = requests.into_inner();
         if optimistic.is_ok() && !requests.overflow {
             if self.covers(vm.mapping_validation_epoch(), &requests) {
@@ -107,7 +108,7 @@ impl Proof {
             self.epoch = None;
         }
         // Preserve per-range validation's failure and concurrent-mutation behavior.
-        payload.validate(window, &Space::Checked(&range, vm))
+        payload.validate(window, variant, &Space::Checked(&range, vm))
     }
 }
 

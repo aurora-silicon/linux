@@ -24,14 +24,17 @@ struct Service<'a> {
 }
 
 impl event::Transport for Service<'_> {
+    fn roles(&self) -> &'static [Role] {
+        self.firmware.roles()
+    }
     fn trace(&mut self, role: Role) {
-        let firmware = &mut self.firmware;
+        let firmware = &mut *self.firmware;
         firmware
             .rings
             .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
     }
     fn statistics(&mut self, role: Role) {
-        let firmware = &mut self.firmware;
+        let firmware = &mut *self.firmware;
         firmware
             .rings
             .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
@@ -263,6 +266,7 @@ impl Firmware {
 
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
+        if self.recovery.restart_limit(super::now_ns()) { return Err(ETIMEDOUT); }
         let shared = self.primary.state.shared.clone();
         let mut service = Service {
             firmware: self,
@@ -300,7 +304,7 @@ impl crate::g17::Shared {
     /// boundary; the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
-            self.stop_queues();
+            self.stop_runtime();
             return;
         }
         let mut deferred = {
@@ -324,7 +328,7 @@ impl crate::g17::Shared {
         if let Err(error) = result {
             dev_err!(self.dev.as_ref(), "GPU event service failed: {:?}\n", error);
             self.lose_device_quietly();
-            self.stop_queues();
+            self.stop_runtime();
         }
     }
 
@@ -345,7 +349,7 @@ impl crate::g17::Shared {
         };
         deferred.finish();
         if recover {
-            self.preparations.wait_drained();
+            self.preparations.wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
@@ -419,7 +423,7 @@ impl crate::g17::Shared {
                 .iter()
                 .flatten()
                 .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.retirement_polling());
+                .any(|queue| queue.retirement_polling() || queue.pool_release_pending());
         if polling {
             self.queue_poll();
         }
@@ -444,7 +448,8 @@ impl crate::g17::Shared {
         } else if !recover
             && !polling
             && (channel::Events::pending(&firmware.init, Role::Primary)?
-                || channel::Events::pending(&firmware.init, Role::Secondary)?)
+                || (firmware.secondary.is_some()
+                    && channel::Events::pending(&firmware.init, Role::Secondary)?))
         {
             // A full bounded pass must not depend on a fresh notification for
             // records that arrived while it was consuming the same ring.

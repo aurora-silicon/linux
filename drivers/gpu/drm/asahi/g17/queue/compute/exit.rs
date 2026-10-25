@@ -220,6 +220,9 @@ impl Queue {
             ))?;
             drop(self.active.pop());
         }
+        // The acknowledged kill and command settlement replace the ordinary
+        // drain witness, including a failed first publication after rebinding.
+        super::Previous::retire_witnessed(&mut self.previous);
         self.exit.as_mut().ok_or(EIO)?.phase = Phase::Released;
         self.quarantined = true;
         self.awaiting_witness = false;

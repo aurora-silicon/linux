@@ -25,6 +25,7 @@ use super::{
     kick, qos,
     queue::{self, admission, compute},
 };
+use super::preparation::Admission;
 use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
@@ -70,20 +71,20 @@ impl Registry {
     /// registry on the probe stack. No additional allocation is required.
     pub(super) fn new(
         clusters: u32,
+        deflake: crate::g17::fw::render::Deflake,
         descriptor_flags: [u32; 2],
+        variant: &'static crate::g17::fw::Variant,
     ) -> impl Init<Self, Error> {
         kernel::try_init!(Self {
-            qids <- kick::QueueIds::new().chain(|qids| {
-                qids.reserve(1, DataMaster::Tiling, Some(0))?;
-                qids.reserve(2, DataMaster::Fragment, Some(1))?;
-                Ok(())
+            qids <- kick::QueueIds::new(variant.qid_floor).chain(|qids| {
+                qids.reserve_initial_render()
             }),
             buffers <- BufferIds::new(),
             accounting: qos::Accounting::new(),
             metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
-            admission: admission::Pool::new()?,
-            render: render::RenderState::new(clusters, descriptor_flags)?,
+            admission: admission::Pool::new(kick::queue_limit(variant.qid_floor))?,
+            render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
             identities: queue::Identities::new(),
             compute: {
                 let mut compute = KVec::with_capacity(QIDS, GFP_KERNEL)?;
@@ -121,7 +122,8 @@ impl Registry {
     /// replacement context must succeed before its old binding is displaced.
     /// A vacant queue (USC backing given back) is offered for re-arming only
     /// when no populated idle queue exists.
-    pub(super) fn rebind_compute(&mut self, owner: u64, context: &Arc<Context>, required: usize) -> Result<Rebind> {
+    pub(super) fn rebind_compute(&mut self, owner: u64, context: &Arc<Context>, required: usize, admission: &Admission<'_>) -> Result<Rebind> {
+        admission.check()?;
         if let Some(queue) = self.compute(owner) {
             return Ok(if queue.matches(owner, queue.qid(), context)? {
                 if queue.pool_fits(required) { Rebind::Done } else { Rebind::Grow }
@@ -129,7 +131,14 @@ impl Registry {
                 Rebind::Fresh
             });
         }
+        // Physical channels are a device budget, not a permanent entitlement
+        // of each open logical queue. Only exact idle retirement can yield one.
+        for queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
+            admission.check()?;
+            queue.share_idle()?;
+        }
         let mut vacant = None;
+        let teardown = &self.teardown;
         for queue in self
             .compute
             .iter_mut()
@@ -137,6 +146,13 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .filter(|queue| queue.reusable())
         {
+            admission.check()?;
+            // The release of the scheduler these records were bound to is armed
+            // or not yet consumed: the firmware may process it against this
+            // queue, which therefore must not change owner until it has.
+            if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+                continue;
+            }
             if queue.pool_vacant() {
                 vacant.get_or_insert(queue.qid());
                 continue;
@@ -167,6 +183,7 @@ impl Registry {
     }
 
     pub(super) fn bind_rearmed(&mut self, qid: u8, owner: u64, context: &Arc<Context>) -> Result {
+        let teardown = &self.teardown;
         let queue = self
             .compute
             .iter_mut()
@@ -174,6 +191,10 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.qid() == qid && queue.reusable())
             .ok_or(EAGAIN)?;
+        // Its last owner may have closed while the backing was rebuilt.
+        if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+            return Err(EAGAIN);
+        }
         queue.bind_owner(owner, context.clone())
     }
 
@@ -267,12 +288,24 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
+            if !deferred.vacated_room() { break; }
             if let Some(vacated) = queue.observe_vacancy(consumer, producer)? {
                 deferred.defer_vacated(vacated);
                 freed += 1;
             }
         }
         Ok(freed)
+    }
+
+    /// Builders and released queues waiting for their exact retirement or pool
+    /// witness temporarily occupy identities. A failed admission must let those
+    /// transactions finish rather than fail a healthy successor immediately.
+    fn compute_admission_error(&self, error: Error) -> Error {
+        if error == ENOSPC {
+            EAGAIN
+        } else {
+            error
+        }
     }
 
     pub(super) fn reserve_compute(&mut self, owner: u64) -> Result<ComputeReservation> {
@@ -292,11 +325,13 @@ impl Registry {
             .compute
             .iter()
             .position(Option::is_none)
-            .ok_or(ENOSPC)?;
+            .ok_or_else(|| self.compute_admission_error(
+                crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeSlots)))?;
         let identity = self.identities.reserve(1)?.start;
         let id = self
             .qids
-            .reserve(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID))?;
+            .reserve(identity, DataMaster::Compute, Some(FIRST_COMPUTE_QID))
+            .map_err(|error| self.compute_admission_error(error))?;
         let reservation = ComputeReservation { slot, id, owner };
         self.compute[slot] = Some(ComputeEntry {
             reservation,
@@ -373,6 +408,32 @@ pub(super) enum Rebind {
     Fresh,
 }
 
+
+#[kunit_tests(asahi_g17_uninstalled_cleanup)]
+mod uninstalled_cleanup_tests {
+    use super::*;
+    use crate::g17::fw::render::Deflake;
+    use crate::g17::fw::variant::V26A428;
+    #[test]
+    fn empty_reservation_prevents_reuse_until_explicit_cancellation() {
+        let mut registry = KBox::init(
+            Registry::new(1, Deflake::ONE_CLUSTER, [0; 2], &V26A428),
+            GFP_KERNEL,
+        )
+        .unwrap();
+        let first = registry.reserve_compute(1).unwrap();
+        assert!(registry.reserved(first).is_ok());
+        assert!(registry.reserve_compute(1).is_err());
+        let second = registry.reserve_compute(2).unwrap();
+        assert_ne!(first.id.qid(), second.id.qid());
+        registry.cancel_compute(first).unwrap();
+        assert!(registry.reserved(first).is_err());
+        let next = registry.reserve_compute(3).unwrap();
+        assert_eq!(first.id.qid(), next.id.qid());
+        assert!(first.id != next.id);
+    }
+}
+
 /// An immutable logical owner shared by its two scheduler entities. Installed
 /// physical graphs retain the context independently of this frontend lifetime.
 pub(super) struct Backend {
@@ -380,6 +441,7 @@ pub(super) struct Backend {
     pub(super) context: Arc<Context>,
     owner: u64,
     backlog: core::sync::atomic::AtomicU32,
+    closed: core::sync::atomic::AtomicBool,
 }
 
 impl Backend {
@@ -389,24 +451,54 @@ impl Backend {
         owner: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
-        let lease = shared.preparations.enter(true)?;
-        let dev = shared.drm()?;
-        let (uat, pool, qos, execution, slot) = {
+        // A closed queue keeps its application context until its scheduler
+        // release is consumed and the context is returned. When only such
+        // contexts block this one, wait (bounded) for the teardown instead of
+        // failing a live client; the preparation lease is not held while
+        // sleeping, and nothing of the new queue is visible yet.
+        const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
+        let started = now_ns();
+        let (lease, uat, pool, qos, execution, slot) = loop {
+            let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
             }
             let slot = firmware.queues.admission.reserve_queue()?;
-            let execution = firmware.uat.new_execution_context(vm)?;
-            (
-                firmware.uat.clone(),
-                firmware.pool.clone(),
-                firmware.queues.qos_ids.clone(),
-                execution,
-                slot,
-            )
+            match firmware.uat.new_execution_context(vm) {
+                Ok(execution) => {
+                    break (
+                        lease,
+                        firmware.uat.clone(),
+                        firmware.pool.clone(),
+                        firmware.queues.qos_ids.clone(),
+                        execution,
+                        slot,
+                    )
+                }
+                Err(error) if error == ENOSPC => {
+                    // Every open queue holds one context; this one is counted
+                    // in `queues()` already but holds none yet.
+                    let open = firmware.queues.admission.queues().saturating_sub(1);
+                    let closing = firmware.uat.execution_contexts_used().saturating_sub(open);
+                    if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
+                        return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
+                    }
+                    drop(slot);
+                    drop(state);
+                    drop(lease);
+                    // Nothing is visible yet: a signalled creator restarts.
+                    if kernel::current!().signal_pending() {
+                        return Err(ERESTARTSYS);
+                    }
+                    shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
         };
+        let dev = shared.drm()?;
         let alloc = super::object::Allocator {
             dev: &dev,
             uat: &uat,
@@ -429,6 +521,7 @@ impl Backend {
                     context,
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
+                    closed: core::sync::atomic::AtomicBool::new(false),
                 },
                 GFP_KERNEL,
             )?,
@@ -438,13 +531,15 @@ impl Backend {
 
     /// The shared aperture has exactly one builder. Other queues sleep without
     /// holding the device mutex; recovery joins its lease before closing roots.
-    fn shared_compute(&self) -> Result {
+    fn shared_compute(&self, admission: &Admission<'_>) -> Result {
         loop {
-            let lease = self.shared.preparations.enter(false)?;
+            admission.check()?;
+            let lease = self.shared.preparations.enter_until(admission)?;
             let dev = self.shared.drm()?;
             let uat = {
                 let mut state = self.shared.state.lock();
                 loop {
+                    admission.check()?;
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                     if self
                         .shared
@@ -463,7 +558,9 @@ impl Backend {
                         firmware.queues.compute_building = true;
                         break firmware.uat.clone();
                     }
-                    self.shared.changed.wait(&mut state);
+                    let _ = self.shared.changed.wait_timeout(
+                        &mut state, kernel::time::msecs_to_jiffies(admission.slice_ms()?)
+                    );
                 }
             };
             let alloc = super::object::Allocator {
@@ -474,7 +571,9 @@ impl Backend {
             let result = {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                if !lease.is_current() {
+                if let Err(error) = admission.check() {
+                    Err(error)
+                } else if !lease.is_current() {
                     Err(EAGAIN)
                 } else {
                     built
@@ -507,10 +606,12 @@ impl Backend {
         &self,
         alloc: &super::object::Allocator<'_>,
         lease: &super::preparation::Lease,
+        admission: &Admission<'_>,
     ) -> Result {
         {
             let mut state = self.shared.state.lock();
             loop {
+                admission.check()?;
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                 if !lease.is_current() {
                     return Err(EAGAIN);
@@ -522,14 +623,18 @@ impl Backend {
                     firmware.queues.compute_scheduler_building = true;
                     break;
                 }
-                self.shared.changed.wait(&mut state);
+                let _ = self.shared.changed.wait_timeout(
+                    &mut state, kernel::time::msecs_to_jiffies(admission.slice_ms()?)
+                );
             }
         }
         let mut built = Some(super::initdata::ComputeScheduler::new(alloc));
         let result = {
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-            if !lease.is_current() {
+            if let Err(error) = admission.check() {
+                Err(error)
+            } else if !lease.is_current() {
                 Err(EAGAIN)
             } else {
                 built
@@ -551,8 +656,23 @@ impl Backend {
         result
     }
 
-    fn grow_compute(&self, required: usize) -> Result {
+    /// The caller keeps its preparation lease through this two-phase rollback.
+    /// An empty registry entry prevents reusing the QID/free-list identity while
+    /// its old aliases still occupy canonical or client addresses. Recovery joins
+    /// this lease before removing the session, even if its epoch was invalidated.
+    fn finish_uninstalled_compute(
+        &self, retired: Option<(ComputeReservation, KBox<compute::Queue>)>,
+    ) -> Result {
+        let Some((reservation, queue)) = retired else { return Ok(()); };
+        drop(queue);
+        let mut state = self.shared.state.lock();
+        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+        firmware.queues.cancel_compute(reservation)
+    }
+
+    fn grow_compute(&self, required: usize, admission: &Admission<'_>) -> Result {
         use kernel::time::{delay::fsleep, Delta};
+        admission.check()?;
         {
             let state = self.shared.state.lock();
             let firmware = state.as_ref().ok_or(ENODEV)?;
@@ -560,45 +680,79 @@ impl Backend {
                 return Ok(());
             }
         }
-        let lease = self.shared.preparations.enter(false)?;
+        let lease = self.shared.preparations.enter_until(admission)?;
         let dev = self.shared.drm()?;
         let uat = self.shared.state.lock().as_ref().ok_or(ENODEV)?.uat.clone();
         let alloc = super::object::Allocator { dev: &dev, uat: &uat };
         let mut pages = Some(super::freelist::Pages::compute_sized(&alloc, required)?);
         let mut alias = Some(pages.as_ref().ok_or(EIO)?.map_client(self.context.vm())?);
         let mut deferred = DeferredBatch::publication()?;
-        let started = now_ns();
-        loop {
+        let mut growth = None;
+        let result = (|| loop {
             let result = (|| {
                 let mut state = self.shared.state.lock();
+                admission.check()?;
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                 if !lease.is_current() { return Err(EAGAIN); }
                 if self.shared.crashed.load(Ordering::Acquire) { return Err(EIO); }
                 firmware.scan_compute(None, &mut deferred)?;
-                let queue = firmware.queues.compute_mut(self.owner).ok_or(EIO)?;
+                let queue = firmware.queues.compute_mut(self.owner).ok_or(EAGAIN)?;
                 if queue.pool_fits(required) { return Ok(None); }
-                if queue.begin_growth(&firmware.init, required)? {
-                    fence(Ordering::SeqCst);
-                    firmware.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+                if growth.is_none() {
+                    let notify = queue.begin_growth(&firmware.init, required)?;
+                    // Capture physical identity before any following fallible
+                    // operation. Close can remove the owner-keyed lookup.
+                    growth = queue.growth_token();
+                    if notify {
+                        fence(Ordering::SeqCst);
+                        firmware.primary.notify(crate::g17::MSG_CONTROL_NOTIFY)?;
+                    }
                 }
                 queue.finish_growth(&firmware.init, &mut pages, &mut alias, required).map(Some)
             })();
             deferred.finish();
             match result {
                 Ok(old) => { drop(old); return Ok(()); }
-                Err(error) if error == EAGAIN && lease.is_current()
-                    && now_ns().saturating_sub(started) < WORK_RING_WAIT_NS => {
+                Err(error) if error == EAGAIN && lease.is_current() => {
                         self.shared.queue_events();
                         fsleep(Delta::from_millis(1));
                     }
                 Err(error) => return Err(error),
             }
+        })();
+        if result.is_err() {
+            if let Some(token) = growth {
+                let mut retired = None;
+                let mut state = self.shared.state.lock();
+                if let Some(firmware) = state.as_deref_mut() {
+                    for index in 0..firmware.queues.compute.len() {
+                        let Some(entry) = firmware.queues.compute[index].as_mut() else { continue; };
+                        let Some(queue) = entry.queue.as_deref_mut() else { continue; };
+                        if queue.abort_growth(token)? == Some(true) {
+                            // Keep the empty entry and QID reserved until all
+                            // graph aliases have been destroyed outside the lock.
+                            retired = entry.queue.take().map(|queue| (entry.reservation, queue));
+                            break;
+                        }
+                    }
+                }
+                drop(state);
+                // Tentative replacement mappings also belong to this builder.
+                // Discard them before a fresh QID can acquire a successor.
+                drop(alias.take());
+                drop(pages.take());
+                self.finish_uninstalled_compute(retired)?;
+                self.shared.queue_events();
+            }
         }
+        result
     }
 
-    fn build_compute(&self, required: usize) -> Result {
+    fn build_compute(&self, required: usize, admission: &Admission<'_>) -> Result {
+        admission.check()?;
+        self.admission_open()?;
         loop {
-            match self.shared_compute() {
+            match self.shared_compute(admission) {
                 Err(error) if error == EAGAIN => continue,
                 result => {
                     result?;
@@ -607,10 +761,12 @@ impl Backend {
             }
         }
         loop {
-            let lease = self.shared.preparations.enter(false)?;
+            admission.check()?;
+            let lease = self.shared.preparations.enter_until(admission)?;
             let dev = self.shared.drm()?;
             let (uat, reservation) = {
                 let mut state = self.shared.state.lock();
+                admission.check()?;
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                 if self
                     .shared
@@ -619,12 +775,42 @@ impl Backend {
                 {
                     return Err(EIO);
                 }
-                match firmware.queues.rebind_compute(self.owner, &self.context, required)? {
+                self.admission_open()?;
+                let rebound = match firmware.queues.rebind_compute(self.owner, &self.context, required, admission) {
+                    Err(error) if error == ENOSPC => {
+                        drop(state);
+                        drop(lease);
+                        self.wait_compute_capacity(admission)?;
+                        continue;
+                    }
+                    result => result?,
+                };
+                match rebound {
                     Rebind::Done => return Ok(()),
-                    Rebind::Grow => { drop(state); return self.grow_compute(required); }
+                    Rebind::Grow => { drop(state); drop(lease); return self.grow_compute(required, admission); }
                     Rebind::Rearm(qid) => (firmware.uat.clone(), Err(qid)),
                     Rebind::Fresh => {
-                        let reservation = firmware.queues.reserve_compute(self.owner)?;
+                        let reservation = match firmware.queues.reserve_compute(self.owner) {
+                            Ok(reservation) => reservation,
+                            Err(error) if error == EAGAIN => {
+                                // The event worker owns release observation and
+                                // drops vacated aliases/backing off this mutex.
+                                drop(state);
+                                drop(lease);
+                                self.wait_compute_capacity(admission)?;
+                                continue;
+                            }
+                            Err(error) if error == ENOSPC => {
+                                let reclaimed = firmware.queues.reclaim_unused_render_spare(None, true)?;
+                                drop(state);
+                                if reclaimed.is_none() {
+                                    return Err(error);
+                                }
+                                drop(reclaimed);
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         (firmware.uat.clone(), Ok(reservation))
                     }
                 }
@@ -638,13 +824,32 @@ impl Backend {
                 Err(qid) => {
                     // Fresh zeroed backing is built without the device mutex; the
                     // queue may have been taken or re-armed by another owner since.
-                    let pages = crate::g17::freelist::Pages::compute_sized(&alloc, required)?;
-                    let ring = compute::DescriptorRing::new(&alloc)?;
+                    let built = (|| -> Result<_> {
+                        let pages = crate::g17::freelist::Pages::compute_sized(&alloc, required)?;
+                        Ok((pages, compute::DescriptorRing::new(&alloc)?))
+                    })();
+                    let (pages, ring) = match built {
+                        Err(error) if error == ENOSPC => {
+                            drop(lease);
+                            self.wait_compute_capacity(admission)?;
+                            continue;
+                        }
+                        result => result?,
+                    };
                     let mut state = self.shared.state.lock();
+                    admission.check()?;
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                     if !lease.is_current() {
                         continue;
                     }
+                    if let Err(error) = self.admission_open() { drop(state); return Err(error); }
+                    // A competing ready owner may have taken/rearmed it while
+                    // backing was built off-lock. Leave rejected backing local
+                    // so it is dropped after the device guard, not in rearm().
+                    let ready = firmware.queues.compute.iter().flatten()
+                        .filter_map(|entry| entry.queue.as_deref())
+                        .any(|queue| queue.qid() == qid && queue.can_rearm());
+                    if !ready { drop(state); continue; }
                     let (slot, page_list) = match firmware.queues.rearm_compute(qid, pages, ring) {
                         Err(error) if error == EAGAIN => continue,
                         result => result?,
@@ -660,10 +865,12 @@ impl Backend {
                 let pool = compute::PoolBacking::new(&alloc, reservation.id, required)?;
                 {
                     let mut state = self.shared.state.lock();
+                    admission.check()?;
                     let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                     if !lease.is_current() {
                         return Err(EAGAIN);
                     }
+                    self.admission_open()?;
                     firmware.queues.reserved(reservation)?;
                     let (slot, page_list) = pool.pool_descriptor()?;
                     firmware.init.initialize_compute_pool_blocks(slot, page_list, required)?;
@@ -671,8 +878,15 @@ impl Backend {
                 let backing = compute::Backing::new(&alloc, pool)?;
                 // The global scheduler is created after pool/kick backing and
                 // retained even if this queue's later descriptor graph fails.
-                self.compute_scheduler(&alloc, &lease)?;
-                let queue = compute::Queue::new(&alloc, backing, self.owner, self.context.clone())?;
+                self.compute_scheduler(&alloc, &lease, admission)?;
+                let queue = compute::Queue::new(
+                    &alloc,
+                    backing,
+                    self.owner,
+                    self.context.clone(),
+                    self.shared.variant.pointers,
+                    self.shared.operand_state,
+                )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
             let (mut built, build_error) = match built {
@@ -682,12 +896,14 @@ impl Backend {
             let result = {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                if !lease.is_current() {
+                if let Err(error) = admission.check() {
+                    Err(error)
+                } else if !lease.is_current() {
                     Err(EAGAIN)
                 } else if let Some(error) = build_error {
                     Err(error)
                 } else {
-                    firmware.queues.install_compute(reservation, &mut built)
+                    admission.check().and_then(|()| firmware.queues.install_compute(reservation, &mut built))
                 }
             };
             // The old aliases must disappear before a waiting constructor can
@@ -703,9 +919,11 @@ impl Backend {
                     .cancel_compute(reservation)?;
             }
             drop(lease);
-            if result != Err(EAGAIN) {
-                return result;
+            if result == Err(ENOSPC) {
+                self.wait_compute_capacity(admission)?;
+                continue;
             }
+            if result != Err(EAGAIN) { return result; }
         }
     }
 }
@@ -780,6 +998,9 @@ impl DeferredBatch {
             drop(release);
         }
     }
+    pub(super) fn vacated_room(&self) -> bool {
+        self.vacated.len() < self.vacated.capacity()
+    }
     pub(super) fn defer_vacated(&mut self, vacated: super::queue::compute::Vacated) {
         if let Err(vacated) = self.vacated.push_within_capacity(vacated) {
             drop(vacated);
@@ -847,7 +1068,7 @@ struct ComputeHost<'a> {
 }
 impl compute::Host for ComputeHost<'_> {
     fn next_compute_publication(&mut self) -> Result<u64> {
-        self.qids.next_compute_publication()
+        self.qids.next_publication()
     }
     fn epoch(&self) -> Result<(u64, u32)> {
         Ok((
@@ -918,6 +1139,15 @@ impl super::Firmware {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.owner() == Some(owner))
             .ok_or(EIO)?;
+        // The first command after an owner change waits while the scheduler
+        // the queue was bound to is being released: a live previous owner may
+        // have closed after giving up the queue.
+        if queue
+            .pending_switch_from()
+            .is_some_and(|previous| queues.teardown.releasing(previous))
+        {
+            return Err(EAGAIN);
+        }
         let mut host = ComputeHost {
             init: &self.init,
             primary: &mut self.primary,
@@ -1053,12 +1283,14 @@ impl super::Firmware {
 }
 
 impl Backend {
-    fn ensure_compute(&self, scs_pages: u16) -> Result {
+    fn ensure_compute(&self, scs_pages: u16, admission: &Admission<'_>) -> Result {
+        admission.check()?;
         let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scs_pages)?;
         use kernel::time::{delay::fsleep, Delta};
         const SPARED_WAIT_MS: usize = 200;
         let mut deferred = DeferredBatch::publication()?;
         for _ in 0..SPARED_WAIT_MS {
+            admission.check()?;
             let pending = (|| {
                 let mut state = self.shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
@@ -1070,7 +1302,10 @@ impl Backend {
             deferred.finish();
             let pending = pending?;
             if !pending {
-                return self.build_compute(required);
+                match self.build_compute(required, admission) {
+                    Err(error) if error == EAGAIN => continue,
+                    result => return result,
+                }
             }
             // Other owners continue submitting while this owner gives its
             // queue-local drain witness time to arrive.
@@ -1078,6 +1313,7 @@ impl Backend {
         }
         // No new command has been accepted. Keep the spared queue and its
         // retained work intact until a later admission observes its witness.
+        admission.check()?;
         Err(EBUSY)
     }
 
@@ -1089,23 +1325,48 @@ impl Backend {
         deferred: &mut DeferredBatch,
     ) -> Result {
         packet.check_dependencies()?;
+        let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
         let mut recovery_polls = 0;
-        let mut outer_wait = None;
+        let mut state_delay = 20i64;
+        let deadline = now_ns().saturating_add(WORK_RING_WAIT_NS);
+        let check = || {
+            if packet.cancel_requested() { return Err(ECANCELED); }
+            self.admission_open()?;
+            if packet.completion.status().get() != 0 { return Err(EIO); }
+            Ok(())
+        };
+        let admission = Admission::new(deadline, &check);
         loop {
-            if packet.completion.status().get() != 0 {
-                return Err(EIO);
+            admission.check()?;
+            // All DRM dependencies were satisfied before this scheduler callback.
+            // Recheck on every retry: pressure may yield an idle binding between
+            // admission and publication without changing this logical queue.
+            Backend::ensure_compute(self, scratch.pages(), &admission)?;
+            admission.check()?;
+            let lease = self.shared.preparations.enter_until(&admission)?;
+            // Work states free as this context's earlier commands retire.
+            // Wait for one under the packet's admission deadline, as render
+            // publication does, instead of failing the packet.
+            match packet.completion.work_state()?.acquire() {
+                Err(error) if error == EBUSY => {
+                    drop(lease);
+                    admission.check()?;
+                    self.shared.queue_events();
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_micros(state_delay));
+                    state_delay = (state_delay * 2).min(1000);
+                    continue;
+                }
+                result => {
+                    result?;
+                }
             }
-            let lease = self.shared.preparations.enter(false)?;
-            packet.completion.work_state()?.acquire()?;
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {
                 drop(state);
                 continue;
             }
-            if packet.cancel_requested() {
-                return Err(ECANCELED);
-            }
+            admission.check()?;
             if self
                 .shared
                 .crashed
@@ -1126,7 +1387,13 @@ impl Backend {
                 continue;
             }
             firmware.replay_compute(deferred)?;
+            if firmware.queues.compute(self.owner).is_none() {
+                drop(state);
+                drop(lease);
+                continue;
+            }
             let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
+            admission.check()?;
             let result = firmware.publish_compute(
                 self.owner,
                 packet.clone(),
@@ -1149,11 +1416,6 @@ impl Backend {
                 continue;
             }
             if matches!(result, Err(EAGAIN)) && !packet.is_published() {
-                let now = now_ns();
-                let since = *outer_wait.get_or_insert(now);
-                if now.saturating_sub(since) >= WORK_RING_WAIT_NS {
-                    return Err(EBUSY);
-                }
                 // Backpressure owns no firmware-visible attempt. Other queues
                 // can submit and the event worker can retire while we sleep.
                 drop(state);
@@ -1199,6 +1461,40 @@ impl super::Firmware {
 }
 
 impl super::Shared {
+    /// Charge only real watchdog expirations, after the per-job allowance. A
+    /// changing client or recovery generation cannot mint a fresh storm budget.
+    pub(super) fn watchdog_timeout(self: &Arc<Self>) -> bool {
+        if self.crashed.load(Ordering::Acquire) { return true; }
+        let stop = {
+            let mut state = self.state.lock();
+            state.as_deref_mut().is_none_or(|firmware| firmware.recovery.timeout_limit(now_ns()))
+        };
+        if stop { self.lose_device_quietly(); }
+        stop
+    }
+
+    /// Workload-triggered stop: halt producers first, then join only for a
+    /// bounded interval. A stalled borrower leaves stopped firmware and all its
+    /// mappings owned in state. Only a later joined stop may detach/free them.
+    pub(super) fn stop_runtime(&self) {
+        let Some(_stopping) = self.stop.try_lock() else { return; };
+        {
+            let mut state = self.state.lock();
+            if let Some(firmware) = state.as_deref_mut() {
+                if let Some(secondary) = firmware.secondary.as_mut() {
+                    secondary.stop();
+                }
+                firmware.primary.stop();
+            }
+        }
+        if self.preparations.wait_drained_until(now_ns().saturating_add(WORK_RING_WAIT_NS)).is_err() {
+            dev_warn!(self.dev.as_ref(), "Stopped GPU retains outstanding preparation owners\n");
+            return;
+        }
+        let firmware = self.state.lock().take();
+        if let Some(mut firmware) = firmware { firmware.finish_stopped_queues(); }
+    }
+
     /// Joins construction and complete host teardown, including RTKit drops.
     /// The stop-only mutex outlives detached firmware destruction, so unbind
     /// cannot return while another stop caller still owns mailbox clients.
@@ -1211,7 +1507,9 @@ impl super::Shared {
         let firmware = {
             let mut state = self.state.lock();
             if let Some(firmware) = (*state).as_deref_mut() {
-                firmware.secondary.stop();
+                if let Some(secondary) = firmware.secondary.as_mut() {
+                    secondary.stop();
+                }
                 firmware.primary.stop();
             }
             state.take()
@@ -1259,12 +1557,23 @@ impl super::Firmware {
             }
         }
         self.queues.observe_pool_releases(&self.init, deferred)?;
+        if self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.pool_release_stalled(now)) {
+            return Err(ETIMEDOUT);
+        }
         if self.render_control_backpressured() {
             return Ok(None);
         }
+        // While the shared lower window refuses free-list backing, no idle
+        // retained compute pool stays warm: render and new compute need it more.
+        let cap = if super::freelist::lower_pressure() {
+            0
+        } else {
+            COMPUTE_WARM_CAP
+        };
         let (published, next) = self.queues.vacate_idle_pools(
             &self.init,
-            COMPUTE_WARM_CAP,
+            cap,
             now,
             COMPUTE_WARM_EXPIRY_NS,
         )?;
@@ -1276,3 +1585,163 @@ impl super::Firmware {
     }
 }
 
+
+impl Registry {
+    pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.qids.write_capacity(f)?;
+        self.admission.write_capacity(f)?;
+        self.buffers.write_capacity(f)?;
+        writeln!(f, "qos_ids used={} total=126", self.qos_ids.used())?;
+        writeln!(f, "metrics_ids used={} total={}", self.metrics.used(), super::fw::buffer::METRICS_SLOTS)?;
+        self.render.write_capacity(f)?;
+        writeln!(f, "compute_slots used={} total={} reusable={} building={}",
+                 self.compute.iter().flatten().count(), self.compute.len(),
+                 self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).filter(|queue| queue.reusable()).count(),
+                 self.compute.iter().flatten().filter(|entry| entry.queue.is_none()).count())?;
+        writeln!(f, "compute_channels used={} total={}",
+                 self.compute.iter().flatten().count(), super::kick::COMPUTE_CHANNELS)?;
+        writeln!(f, "scheduler_teardown pending={}", self.teardown.len())?;
+        for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
+            queue.write_capacity(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl Backend {
+    pub(super) fn wait_capacity(&self, started: u64) -> Result {
+        let check = || self.admission_open();
+        let admission = Admission::new(started.saturating_add(WORK_RING_WAIT_NS), &check);
+        self.wait_compute_capacity(&admission)
+    }
+
+    fn wait_compute_capacity(&self, admission: &Admission<'_>) -> Result {
+        admission.check()?;
+        let mut deferred = DeferredBatch::publication()?;
+        let result: Result = (|| {
+            // A short reclaim transaction obeys the same session/epoch gate as
+            // publication. Never keep this lease while sleeping for capacity.
+            let lease = self.shared.preparations.try_enter()?;
+            let mut state = self.shared.state.lock();
+            let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+            if !lease.is_current() || self.shared.crashed.load(Ordering::Acquire) {
+                return Err(EAGAIN);
+            }
+            if firmware.recovery.pending() || super::recovery::Memory::recovery_state(&firmware.init)? != 0 {
+                return Ok(());
+            }
+            for queue in firmware.queues.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
+                admission.check()?;
+                queue.share_idle()?;
+            }
+            // Consumption, not publication or an elapsed timeout, frees backing.
+            firmware.queues.observe_pool_releases(&firmware.init, &mut deferred)?;
+            firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            if !firmware.render_control_backpressured() {
+                let (published, _) = firmware.queues.vacate_idle_pools(&firmware.init, 0, now_ns(), 0)?;
+                if published != 0 { firmware.primary.notify(super::MSG_CONTROL_NOTIFY)?; }
+            }
+            Ok(())
+        })();
+        deferred.finish();
+        self.shared.queue_events();
+        match result {
+            Err(error) if error == EAGAIN => {}
+            result => result?,
+        }
+        admission.check()?;
+        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+        admission.check()
+    }
+}
+
+#[kunit_tests(asahi_g17_shared_capacity)]
+mod shared_capacity_tests {
+    use super::*;
+    use crate::g17::fw::render::Deflake;
+    use crate::g17::fw::variant::V26A428;
+
+    #[test]
+    fn all_logical_render_owners_fit_beside_shared_compute() {
+        let mut registry = KBox::init(
+            Registry::new(1, Deflake::ONE_CLUSTER, [0; 2], &V26A428),
+            GFP_KERNEL,
+        )
+        .unwrap();
+        let mut leases = KVec::with_capacity(crate::mmu::MAX_EXECUTION_CONTEXTS as usize, GFP_KERNEL).unwrap();
+        // Physical compute channels are device-owned and bounded independently
+        // of how many logical clients have queued unsignalled work.
+        for owner in 1..=super::super::kick::COMPUTE_CHANNELS as u64 {
+            registry.reserve_compute(owner).unwrap();
+        }
+        assert!(matches!(registry.reserve_compute(1000), Err(EAGAIN)));
+        for owner in 1..=u64::from(crate::mmu::MAX_EXECUTION_CONTEXTS) {
+            let lease = registry.admission.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+            registry.ensure_render_ids(lease.slot(), owner).unwrap();
+            leases.push(lease, GFP_KERNEL).unwrap();
+        }
+        assert_eq!(leases.len(), crate::mmu::MAX_EXECUTION_CONTEXTS as usize);
+        // Every accepted logical render owner now has its physical pair; no
+        // published identity was cancelled or retyped to achieve the fit.
+    }
+
+    #[test]
+    fn a_qid_floor_admits_only_the_render_pairs_it_leaves() {
+        use crate::g17::fw::variant::V25G83;
+        let limit = super::super::kick::queue_limit(V25G83.qid_floor);
+        assert_eq!(limit, 42);
+        let mut registry = KBox::init(
+            Registry::new(2, Deflake::TWO_CLUSTERS, [0; 2], &V25G83),
+            GFP_KERNEL,
+        )
+        .unwrap();
+        for owner in 1..=super::super::kick::COMPUTE_CHANNELS as u64 {
+            registry.reserve_compute(owner).unwrap();
+        }
+        let mut slots = KVec::with_capacity(limit as usize, GFP_KERNEL).unwrap();
+        let mut leases = KVec::with_capacity(limit as usize, GFP_KERNEL).unwrap();
+        for owner in 1..=u64::from(limit) {
+            slots.push(registry.admission.reserve_queue().unwrap(), GFP_KERNEL).unwrap();
+            let lease = registry.admission.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+            registry.ensure_render_ids(lease.slot(), owner).unwrap();
+            leases.push(lease, GFP_KERNEL).unwrap();
+        }
+        // The next logical queue is refused when it is created, not left waiting for a pair.
+        assert!(matches!(registry.admission.reserve_queue(), Err(ENOSPC)));
+    }
+
+    #[test]
+    fn four_clients_have_capacity_before_any_owner_closes() {
+        let mut registry = KBox::init(
+            Registry::new(1, Deflake::ONE_CLUSTER, [0; 2], &V26A428),
+            GFP_KERNEL,
+        )
+        .unwrap();
+        let mut leases = KVec::with_capacity(36, GFP_KERNEL).unwrap();
+        for client in 0..4u64 {
+            for queue in 0..9u64 {
+                let owner = 1 + client * 9 + queue;
+                let lease = registry.admission.acquire_render(owner, None, u64::MAX, || Ok(())).unwrap();
+                registry.ensure_render_ids(lease.slot(), owner).unwrap();
+                leases.push(lease, GFP_KERNEL).unwrap();
+            }
+        }
+        for owner in 1..=super::super::kick::COMPUTE_CHANNELS as u64 {
+            registry.reserve_compute(owner).unwrap();
+        }
+        assert_eq!(leases.len(), 36);
+    }
+}
+
+impl Backend {
+    /// Logical close is independent of whether an off-lock builder has already
+    /// installed a physical graph. No constructor can resurrect a closed owner.
+    fn admission_open(&self) -> Result {
+        if self.closed.load(Ordering::Acquire) { return Err(ECANCELED); }
+        if self.context.status().get() != 0 || self.shared.crashed.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
+        if !self.context.is_current() { return Err(EFAULT); }
+        Ok(())
+    }
+}

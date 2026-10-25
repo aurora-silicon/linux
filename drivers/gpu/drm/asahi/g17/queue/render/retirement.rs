@@ -203,8 +203,12 @@ pub(crate) fn poll_observed(
     memory: &mut impl Memory,
     snapshot: Snapshot,
 ) -> Result<Poll> {
-    let observation = observe(ticket, snapshot)?;
-    complete_poll(ticket, memory, snapshot, observation)
+    match observe(ticket, snapshot) {
+        Ok(observation) => complete_poll(ticket, memory, snapshot, observation),
+        // The borrowed snapshot can straddle a firmware cursor update like any other sample:
+        // take the ordinary poll's fresh snapshot and reread instead of failing the client.
+        Err(_) => poll(ticket, memory),
+    }
 }
 
 fn complete_poll(
