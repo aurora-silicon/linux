@@ -18,6 +18,7 @@
 //! -> VM exec lock -> GEM reservation. `RoleState::ack` nests inside nothing.
 
 mod buffer;
+mod calibration;
 mod channel;
 mod command;
 pub(crate) use command::Attachments;
@@ -1002,8 +1003,19 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::G17Resources,
     ) -> Result<Arc<Gpu>> {
+        let calibration = if cfg.chip_id == crate::hw::t6040::CHIP_ID {
+            Some(calibration::Calibration::read(dev).inspect_err(|_| {
+                dev_err!(dev.as_ref(), "Missing or invalid T6040 GPU calibration handoff\n");
+            })?)
+        } else {
+            None
+        };
         let variant = Self::firmware_variant(dev, &cfg.firmware)?;
         let id = regs.get_g17_id()?;
+        if let Some(calibration) = calibration {
+            calibration.check_cores(&id.core_masks)?;
+            calibration.check_opps(&initdata::InitData::opps(dev, cfg.opps, id.num_clusters)?)?;
+        }
         if id.family != cfg.identity.family
             || id.variant != cfg.identity.variant
             || id.num_dies != cfg.identity.num_dies
