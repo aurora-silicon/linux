@@ -13,6 +13,7 @@
 #include <linux/spinlock.h>
 #include <linux/kconfig.h>
 #include <linux/math.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 
 #include "dcp.h"
@@ -71,6 +72,12 @@ struct apple_epic_service {
 	bool pending_open;
 	const char *pending_name, *pending_class;
 	s64 pending_unit;
+
+	/* Compact EPIC (desktop 26.x): the announced identity and OPEN state. */
+	char name[33];
+	s64 unit;
+	bool defer_start;
+	bool started;
 
     struct {
         struct dentry *entry;
@@ -379,6 +386,35 @@ struct epic_sub_hdr_h17p {
 
 #define EPIC_SUBTYPE_ANNOUNCE_H17P 0x11
 
+/*
+ * Compact EPIC, as the desktop 26.x firmware (T6041) speaks it on its
+ * auxiliary endpoints: an 8-byte transport header, the 8-byte timestamp,
+ * an 8-byte sub-header and, for commands and replies, a status/length
+ * descriptor.  Ring entries carry channel and type 0.
+ */
+struct epic_compact_hdr {
+	u8 seq;
+	u8 flags;
+	__le16 intf_id;
+	__le32 length;
+	__le64 timestamp;
+} __packed;
+
+struct epic_compact_sub_hdr {
+	u8 type;
+	u8 category;
+	u8 unk;
+	u8 flags;
+	__le32 reserved;
+} __packed;
+
+struct epic_compact_desc {
+	__le32 status;
+	__le32 length;
+} __packed;
+
+#include "afk-fragment.h"
+
 struct epic_cmd {
 	__le32 retcode;
 	__le64 rxbuf;
@@ -460,6 +496,18 @@ struct apple_dcp_afkep {
 	u16 qe_seq;
 	bool stopping; /* lock: no new receive work after shutdown. */
 
+	/* Compact EPIC, detected from the first compact message (desktop 26.x). */
+	bool compact;
+	struct list_head compact_cmds;	/* lock */
+	bool compact_shutting_down;	/* lock */
+	/* A message went out in part; no further sends (lock). */
+	bool compact_tx_desync;
+	/* Replies to firmware calls, see afk_compact_reply_worker(). */
+	struct workqueue_struct *tx_wq;
+	struct mutex compact_tx_lock;
+	struct afk_fragment_state compact_rx;
+	void *compact_rx_data;
+
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
 	u32 num_channels;
@@ -474,6 +522,8 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
+int afk_start_service(struct apple_epic_service *service);
+void afk_cancel_commands(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
