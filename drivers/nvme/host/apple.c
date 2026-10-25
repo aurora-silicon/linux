@@ -220,6 +220,8 @@ struct apple_nvme_hw {
 	/* No reset provider yet; only an adopted live session can come up. */
 	bool optional_reset;
 	bool secure_reg_layout;
+	/* Also send the NVMe shutdown notification (CC.SHN) on removal. */
+	bool shutdown_notify;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -1376,10 +1378,13 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 	 * The final system shutdown is the exception for SHN: without it the
 	 * controller counts every Linux shutdown as unsafe (SMART
 	 * unsafe_shutdowns) and recovers on the next start, which slows the
-	 * loader and the first seconds of I/O. A failed SHN changes nothing:
-	 * the CC.EN clear below still runs.
+	 * loader and the first seconds of I/O. Where the firmware handles it,
+	 * removal sends it too. A failed SHN changes nothing: the CC.EN clear
+	 * below still runs.
 	 */
-	if (READ_ONCE(anv->final_shutdown) && !apple_rtkit_is_crashed(anv->rtk)) {
+	if ((READ_ONCE(anv->final_shutdown) ||
+	     (shutdown && anv->hw->shutdown_notify && READ_ONCE(anv->removing))) &&
+	    !apple_rtkit_is_crashed(anv->rtk)) {
 		ret = nvme_disable_ctrl(&anv->ctrl, true);
 		if (ret)
 			dev_warn(anv->dev, "shutdown notification failed: %d\n", ret);
@@ -2793,6 +2798,7 @@ static const struct apple_nvme_hw apple_nvme_t8152_hw = {
 	.needs_ioq_registers = true,
 	.optional_reset = true,
 	.secure_reg_layout = true,
+	.shutdown_notify = true,
 	.max_queue_depth = 64,
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
