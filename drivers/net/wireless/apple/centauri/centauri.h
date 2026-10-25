@@ -72,7 +72,7 @@ static inline const struct centauri_board *centauri_board(void)
 		{ "apple,j813", "apple/centauri/j813-ftab.bin", 0x00248142,
 		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c, false,
 		  385, false },
-		{ "apple,j873", "apple/centauri/j873-ftab.bin", 0x00248152,
+		{ "apple,j873g", "apple/centauri/j873-ftab.bin", 0x00248152,
 		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true,
 		  386, true },
 	};
