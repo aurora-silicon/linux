@@ -28,6 +28,12 @@ properties:
         const: apple,t8152-smc-mailbox
 
       - description:
+          T8152 ASC wrapper (v8) mailbox of the AOP, with the counted
+          FIFOs of the SMC mailbox, described with its send-empty and
+          recv-not-empty interrupts.
+        const: apple,t8152-ascwrap-v8-mailbox
+
+      - description:
           ASC mailboxes are the most common variant found on the M1 used
           for example for the display controller, the system management
           controller and the NVMe coprocessor.
@@ -142,7 +148,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8152-smc-mailbox
+            enum:
+              - apple,t8152-ascwrap-v8-mailbox
+              - apple,t8152-smc-mailbox
     then:
       properties:
         interrupts:
@@ -215,6 +223,8 @@ allOf:
                 - apple,t6021-ane-mailbox
                 - apple,t8112-ane-mailbox
                 - apple,t8140-aop-setup-mailbox
+                - apple,t8152-ans-mailbox
+                - apple,t8152-ascwrap-v8-mailbox
                 - apple,t8152-smc-mailbox
     then:
       properties:
