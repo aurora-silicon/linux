@@ -125,6 +125,13 @@ struct macaudio_platform_cfg {
 	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
 	 */
 	int jack_max_vol;
+	/* The speaker links' DAI format, if not dai_fmt */
+	unsigned int spk_dai_fmt;
+	/*
+	 * The speakers can only be fed from the secondary front-end: each
+	 * front-end owns the DMA channel of one serializer (AOP-fed models).
+	 */
+	bool spk_secondary_only;
 };
 
 static const char *volume_control_names[] = {
@@ -979,6 +986,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 
 			link_props->is_speakers = speakers;
 			link_props->is_headphones = !speakers;
+			if (speakers && ma->cfg->spk_dai_fmt)
+				link->dai_fmt = ma->cfg->spk_dai_fmt;
 
 			link_props->codecs = devm_kcalloc(dev, ncodecs_per_cpu,
 							  sizeof(struct ma_codec_idle), GFP_KERNEL);
@@ -1768,6 +1777,9 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 	if (!ma->has_speakers)
 		return 0;
 
+	if (ma->cfg->spk_secondary_only)
+		CHECK(snd_soc_set_enum_kctl, "Speaker Playback Mux", "Secondary", 1);
+
 	/*
 	 * This needs some care to avoid matches against cs42l84's
 	 * "Jack HPF Corner Frequency".
@@ -2069,6 +2081,39 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.primary_bclk_ratio = 125,
 };
 
+/*
+ * J873 (T8152, Mac mini M6): as on J700, the AOP firmware owns the audio
+ * fabric and the CPU component is the T8152 AOP audio driver. The jack is a
+ * CS42L84 on the AOP's "cout" back-end, the speaker one SN012776 on "spkr";
+ * both serializers run on the firmware's clocks. The speaker frame is 250
+ * BCLKs of 12 MHz (the amp is told so by its ti,bclk-ratio), with the data
+ * sampled on the rising edge, as macOS programs the amp.
+ */
+struct macaudio_platform_cfg macaudio_j873_cfg = {
+	/*
+	 * No qualified speaker protection exists for J873 yet (no verified
+	 * sense path, thermal model or power budget), so the speaker stays off
+	 * unless please_blow_up_my_speakers is set; the jack is unaffected.
+	 */
+	.enable_speakers = false,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	/*
+	 * With the speaker opted in, as macOS runs it: ADT speaker-config
+	 * amp_gain 15, and no volume lock (safe_vol 0), since there is no
+	 * sense stream for a protection daemon to unlock it from.
+	 */
+	.amp_gain = 15,
+	.safe_vol = 0,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	/* jack: a one-BCLK sync pulse, data launched on the rising edge */
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -2207,6 +2252,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j616-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
+	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
+	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
