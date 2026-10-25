@@ -224,6 +224,12 @@ struct hw_info {
 	 * lane PIPE reset status, then release PORT_T8152_PIPE_RST.
 	 */
 	bool pipe_rst;
+	/*
+	 * Keep endpoints at their reset Max_Read_Request_Size (512 bytes).
+	 * On T8152 an RTL8127 at MRRS 4096 (what r8169 asks for) transmits
+	 * 9000-byte frames at 7.0 Gbit/s; at 512 it reaches 9.93.
+	 */
+	bool no_inc_mrrs;
 };
 
 static const struct hw_info t8103_hw = {
@@ -279,6 +285,7 @@ static const struct hw_info t8152_hw = {
 	.max_rid2sid		= 512,
 	.refbuf_off		= true,
 	.pipe_rst		= true,
+	.no_inc_mrrs		= true,
 };
 
 static const struct hw_info t8103_pciec_hw = {
@@ -3116,6 +3123,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	bridge->no_inc_mrrs = hw->no_inc_mrrs;
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
 		u32 ids[15];
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
