@@ -914,7 +914,7 @@ static int cen_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct hci_dev *hdev;
 	int ret;
 
-	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j873")) ||
+	if (!(of_machine_is_compatible("apple,j813") || of_machine_is_compatible("apple,j873g")) ||
 	    PCI_FUNC(pdev->devfn) != 2)
 		return -ENODEV;
 	bt = devm_kzalloc(&pdev->dev, sizeof(*bt), GFP_KERNEL);
