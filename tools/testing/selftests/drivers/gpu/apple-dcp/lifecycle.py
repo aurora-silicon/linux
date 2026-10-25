@@ -193,13 +193,30 @@ struct cd321x_status { u32 status, data_status, status_changed, data_status_chan
  struct usb_pd_identity partner_identity;
  bool dp_sid_event,dp_sid_hpd_low,dp_sid_irq;
  struct { u32 status_rx,configure; } dp_sid_status; };
-struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; enum usb_role *role_sw; };
-struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
+struct tipd_data { bool port_sleep; };
+static const struct tipd_data no_port_sleep;
+enum cd321x_port_power { CD321X_PORT_UNKNOWN, CD321X_PORT_AWAKE, CD321X_PORT_ASLEEP };
+struct tps6598x { const struct tipd_data *data; void *partner, *dev, *port, *psy; int lock; u32 data_status; enum usb_role *role_sw; };
+struct cd321x { struct tps6598x tps; enum cd321x_port_power port_power; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
  bool dp_irq_hpd, dp_sink_reported,dp_sid_valid;
  u32 dp_status,dp_conf; void *port_altmode_dp;
  struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
+/* Power commands are leaves here; port_power.py extracts their real bodies. */
+static int port_wakes, port_sleeps;
+static void cd321x_port_wake(struct cd321x *c)
+{
+ if (!c->tps.data->port_sleep) return;
+ port_wakes++; c->port_power = CD321X_PORT_AWAKE;
+}
+static void cd321x_port_sleep(struct cd321x *c)
+{
+ if (!c->tps.data->port_sleep) return;
+ /* A controller must not sleep while the old display or partner is owned. */
+ assert(!c->display_route_active && !c->tps.partner);
+ port_sleeps++; c->port_power = CD321X_PORT_ASLEEP;
+}
 /* The disconnect/transaction fixtures use the native H17 machine. */
 #define device_is_compatible(dev, name) (!strcmp((name), "apple,sn201202x"))
 #define of_machine_is_compatible(name) (!strcmp((name), "apple,t8140"))
@@ -259,6 +276,7 @@ static void init(void)
  display.dptxport[0].connected = display.pipe_enabled_h17p = true;
  display.external_generation = display.external_rx_generation = display.external_crtc_generation = 7;
  display.typec_generation = 4;
+ port.tps.data = &no_port_sleep; port_wakes = port_sleeps = 0;
  port.tps.partner = (void *)1; port.tps.role_sw = &role; role = USB_ROLE_HOST;
  port.pm.phase = CD321X_PM_RUNNING; port.state_valid = true; port.state.mode = 2;
  port.display_route_active = true; port.connector_fwnode = (void *)1;

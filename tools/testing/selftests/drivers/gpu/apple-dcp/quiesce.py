@@ -87,11 +87,15 @@ static int dcp_dptx_connect(struct apple_dcp *d,unsigned n) { (void)d;(void)n;re
 static bool dcp_typec_route_available(struct apple_dcp_typec_route *r) { return !r->selected; }
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *r,void *x) { (void)x;r->selected=true;return 0; }
 struct tps6598x;
-struct tipd_data { REMOVE_RETURN (*remove)(struct tps6598x *); void (*unregister_port)(struct tps6598x *); int (*reset)(struct tps6598x *); };
+struct tipd_data { bool port_sleep; REMOVE_RETURN (*remove)(struct tps6598x *); void (*unregister_port)(struct tps6598x *); int (*reset)(struct tps6598x *); };
 struct typec_port { struct typec_mux *mux; };
-struct tps6598x { bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; };
-struct cd321x { struct tps6598x tps; struct typec_mux *mux; void *tbt_switch; };
+struct tps6598x { struct mutex lock; bool remove_safe_prepared; struct typec_mux *mux; void *partner,*dev,*psy,*role_sw,*reset; int irq,wq_poll; struct typec_port *port; struct tipd_data *data; };
+enum cd321x_port_power { CD321X_PORT_UNKNOWN, CD321X_PORT_AWAKE, CD321X_PORT_ASLEEP };
+struct cd321x { struct tps6598x tps; enum cd321x_port_power port_power; struct typec_mux *mux; void *tbt_switch; };
 struct typec_thunderbolt_switch_data { int state; };
+/* No sleep commands for the SN201202x/ordinary fixtures. */
+static void cd321x_port_wake(struct cd321x *c)
+{ assert(!c->tps.data->port_sleep); }
 static void cd321x_stop_work(struct cd321x *c) { (void)c;event('W'); }
 static int typec_thunderbolt_switch_set(void *p,void *s) { (void)p;(void)s;event('B');return tbt_error; }
 static int usb_role_switch_set_role(void *p,int r) { (void)p;assert(r==USB_ROLE_NONE);if(ordinary_port&&!role_error){int ret=ordinary_power_off();if(ret)return ret;controller_active=false;phy_off=true;}event('R');role_calls++;return role_error; }
