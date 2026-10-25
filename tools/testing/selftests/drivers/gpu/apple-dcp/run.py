@@ -29,6 +29,7 @@ import idle
 import rate
 import boot
 import m4
+import port_power
 
 
 def parking_unit(root):
@@ -85,6 +86,10 @@ def main():
         ('phy', 'pipe', phy.pipe, tuple((c,) for c in ('backend', 'host', 'mux', 'same', 'park', 'requested', 'scope')), ()),
         ('phy', 'unwind', phy.unwind, ((),), ()),
         ('phy', 'aux', phy.aux, ((),), ()),
+        ('lifecycle', 'cd321x-power-commands', port_power.commands, ((),), ('-pthread',)),
+        ('lifecycle', 'cd321x-power-cable-order', port_power.cable_order, ((),),
+         ('-Wno-unused-variable', '-Wno-unused-function', '-Wno-unused-but-set-variable')),
+        ('lifecycle', 'cd321x-power-removal-order', port_power.removal_order, ((),), ('-pthread',)),
         ('lifecycle', 'physical-disconnect', lifecycle.disconnect, ((),),
          ('-Wno-unused-variable', '-Wno-unused-function', '-Wno-unused-but-set-variable')),
         ('lifecycle', 'fast-replug-bounce', lifecycle.bounce, ((),),
