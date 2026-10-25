@@ -191,14 +191,21 @@ static int late_finish_error(struct typec_mux_dev *m,struct typec_mux_state *s) 
     # A second handle can reference the same providers (class/altmode/CD handles
     # are separately acquired in the real framework).
     concurrent=actual.replace(block(actual,'int main('),block(actual,'int main(').replace('int main(','int __attribute__((unused)) route_controls_main(',1),1)
+    concurrent=concurrent.replace('static void initial(struct cd321x *c) {', 'static void initial(struct cd321x *c) {\n controller_lock_key=&c->tps.lock;',1)
     concurrent=concurrent.replace('#define guard(k) (void)','')
     concurrent=concurrent.replace('#define scoped_guard(k,l) for(int once=((void)(l),1);once;once=0)','')
     locks=r'''
     #include <pthread.h>
-    static pthread_mutex_t fabric_mutex=PTHREAD_MUTEX_INITIALIZER,external_mutex=PTHREAD_MUTEX_INITIALIZER,tb_mutex=PTHREAD_MUTEX_INITIALIZER,modes_mutex=PTHREAD_MUTEX_INITIALIZER;
+    static pthread_mutex_t fabric_mutex=PTHREAD_MUTEX_INITIALIZER,external_mutex=PTHREAD_MUTEX_INITIALIZER,tb_mutex=PTHREAD_MUTEX_INITIALIZER,modes_mutex=PTHREAD_MUTEX_INITIALIZER,controller_mutex=PTHREAD_MUTEX_INITIALIZER;
+    static const void *controller_lock_key;
     struct real_guard { pthread_mutex_t *mutex; bool held; };
-    static struct real_guard take_lock(int *key) {
-     pthread_mutex_t *m=key==&dcp_typec_fabric_lock?&fabric_mutex:key==&display.external_lock?&external_mutex:key==&display.modes_lock?&modes_mutex:&tb_mutex;
+    static struct real_guard take_lock(const void *key) {
+     pthread_mutex_t *m;
+     if(key==&dcp_typec_fabric_lock)m=&fabric_mutex;
+     else if(key==&display.external_lock)m=&external_mutex;
+     else if(key==&display.modes_lock)m=&modes_mutex;
+     else if(key==controller_lock_key)m=&controller_mutex;
+     else {assert(key==&display.tb_lock);m=&tb_mutex;}
      assert(pthread_mutex_lock(m)==0);return (struct real_guard){m,true};
     }
     static void drop_lock(struct real_guard *g) { if(g->held){g->held=false;assert(pthread_mutex_unlock(g->mutex)==0);} }
