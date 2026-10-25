@@ -11,10 +11,13 @@ maintainers:
 
 description: >
   The Type-C PHY of the Apple T6040 (M4 Pro) SoC, as used for USB2 and USB3
-  host operation. USB3 is brought up by a PHY coprocessor running RTKit
-  firmware, reached through an ASC mailbox. The PHY also provides the reset
-  line of the attached DWC3 controller and acts as the Type-C orientation
-  switch.
+  host operation and for DisplayPort. USB3 is brought up by a PHY coprocessor
+  running RTKit firmware, reached through an ASC mailbox. The PHY also
+  provides the reset line of the attached DWC3 controller and acts as the
+  Type-C orientation switch and, where the port carries DisplayPort alt mode,
+  as its mode switch. The same PHY drives the fixed DisplayPort link of an
+  HDMI converter; that instance has no USB controller behind it and therefore
+  no PIPE interface.
 
 $defs:
   apple,tunable:
@@ -35,6 +38,7 @@ properties:
     const: apple,t6040-atcphy
 
   reg:
+    minItems: 10
     items:
       - description: USB2 PHY controls
       - description: USB2 event counter controls
@@ -49,21 +53,37 @@ properties:
       - description: ATC common configuration controls
 
   reg-names:
-    items:
-      - const: bank0
-      - const: bank1
-      - const: pipehandler
-      - const: core
-      - const: cfg
-      - const: cpu
-      - const: cpu-data
-      - const: axi2af
-      - const: axi2af-lioa
-      - const: fabric
-      - const: common-cfg
+    oneOf:
+      - items:
+          - const: bank0
+          - const: bank1
+          - const: pipehandler
+          - const: core
+          - const: cfg
+          - const: cpu
+          - const: cpu-data
+          - const: axi2af
+          - const: axi2af-lioa
+          - const: fabric
+          - const: common-cfg
+      - description: A fixed DisplayPort PHY without a USB controller
+        items:
+          - const: bank0
+          - const: bank1
+          - const: core
+          - const: cfg
+          - const: cpu
+          - const: cpu-data
+          - const: axi2af
+          - const: axi2af-lioa
+          - const: fabric
+          - const: common-cfg
 
   "#phy-cells":
     const: 1
+    description: >
+      The PHY type (dt-bindings/phy/phy.h): PHY_TYPE_USB2, PHY_TYPE_USB3 or
+      PHY_TYPE_DP.
 
   "#reset-cells":
     const: 0
@@ -81,9 +101,13 @@ properties:
 
   orientation-switch: true
 
+  mode-switch: true
+
   port:
     $ref: /schemas/graph.yaml#/properties/port
-    description: Link to the SuperSpeed lanes of the Type-C connector.
+    description: >
+      Link to the SuperSpeed lanes of the Type-C connector. Absent on a fixed
+      DisplayPort PHY.
 
   apple,tunable-axi2af:
     $ref: "#/$defs/apple,tunable"
@@ -134,8 +158,23 @@ required:
   - reg
   - reg-names
   - "#phy-cells"
-  - "#reset-cells"
   - power-domains
+
+allOf:
+  - if:
+      properties:
+        reg-names:
+          contains:
+            const: pipehandler
+    then:
+      required:
+        - "#reset-cells"
+    else:
+      properties:
+        "#reset-cells": false
+        orientation-switch: false
+        mode-switch: false
+        port: false
 
 additionalProperties: false
 
@@ -168,6 +207,32 @@ examples:
             mbox-names = "phy-cpu";
             nonposted-mmio;
             orientation-switch;
+        };
+    };
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        phy@39aa90000 {
+            compatible = "apple,t6040-atcphy";
+            reg = <0x3 0x9aa90000 0x0 0x4000>,
+                  <0x3 0x9a800000 0x0 0x4000>,
+                  <0x3 0x9b000000 0x0 0x30000>,
+                  <0x3 0x9b200000 0x0 0x4000>,
+                  <0x3 0x9b140000 0x0 0x4000>,
+                  <0x3 0x9b0c0000 0x0 0x10000>,
+                  <0x3 0x98000000 0x0 0x8000>,
+                  <0x3 0x98020000 0x0 0x4000>,
+                  <0x3 0x9b244000 0x0 0x4000>,
+                  <0x3 0x9b250000 0x0 0x4000>;
+            reg-names = "bank0", "bank1", "core", "cfg", "cpu", "cpu-data",
+                        "axi2af", "axi2af-lioa", "fabric", "common-cfg";
+            #phy-cells = <1>;
+            power-domains = <&ps_atc3_common_dp>;
+            mboxes = <&atcphy3_mbox>;
+            mbox-names = "phy-cpu";
+            nonposted-mmio;
         };
     };
 ...
