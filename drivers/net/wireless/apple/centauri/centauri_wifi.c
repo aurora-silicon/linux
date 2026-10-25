@@ -1297,11 +1297,81 @@ static void wifi_regulatory(struct wiphy *wiphy, struct regulatory_request *requ
 	mutex_unlock(&wifi->lock);
 }
 
+/*
+ * The joined BSS as cfg80211 knows it from the last scan. No firmware query
+ * for live link statistics is known yet, so its signal is the scan's.
+ */
+static struct cfg80211_bss *wifi_joined_bss(struct centauri_wifi *wifi)
+{
+	if (!wifi->connected)
+		return NULL;
+	return cfg80211_get_bss(wifi->wiphy, NULL, wifi->bssid, NULL, 0,
+				IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ANY);
+}
+
+static int wifi_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
+			    const u8 *mac, struct station_info *sinfo)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+	struct net_device_stats *stats = &wifi->netdev->stats;
+	struct cfg80211_bss *bss;
+	int ret = 0;
+
+	mutex_lock(&wifi->lock);
+	if (!wifi->connected || !ether_addr_equal(mac, wifi->bssid)) {
+		ret = -ENOENT;
+		goto out;
+	}
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
+			 BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
+			 BIT_ULL(NL80211_STA_INFO_RX_BYTES64) |
+			 BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
+			 BIT_ULL(NL80211_STA_INFO_TX_FAILED) |
+			 BIT_ULL(NL80211_STA_INFO_RX_DROP_MISC);
+	sinfo->rx_packets = stats->rx_packets;
+	sinfo->tx_packets = stats->tx_packets;
+	sinfo->rx_bytes = stats->rx_bytes;
+	sinfo->tx_bytes = stats->tx_bytes;
+	sinfo->tx_failed = stats->tx_errors;
+	sinfo->rx_dropped_misc = stats->rx_dropped;
+
+	bss = wifi_joined_bss(wifi);
+	if (bss) {
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+		sinfo->signal = bss->signal / 100;	/* mBm */
+		cfg80211_put_bss(wiphy, bss);
+	}
+out:
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
+static int wifi_get_channel(struct wiphy *wiphy, struct wireless_dev *wdev,
+			    unsigned int link_id, struct cfg80211_chan_def *chandef)
+{
+	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);
+	struct cfg80211_bss *bss;
+	int ret = -ENODATA;
+
+	mutex_lock(&wifi->lock);
+	bss = wifi_joined_bss(wifi);
+	if (bss) {
+		/* The join asks the firmware for a 20 MHz channel. */
+		cfg80211_chandef_create(chandef, bss->channel, NL80211_CHAN_NO_HT);
+		cfg80211_put_bss(wiphy, bss);
+		ret = 0;
+	}
+	mutex_unlock(&wifi->lock);
+	return ret;
+}
+
 static const struct cfg80211_ops wifi_ops = {
 	.scan = wifi_scan,
 	.connect = wifi_connect,
 	.disconnect = wifi_disconnect,
 	.set_power_mgmt = wifi_power_mgmt,
+	.get_station = wifi_get_station,
+	.get_channel = wifi_get_channel,
 };
 
 static int net_open(struct net_device *netdev)
