@@ -1810,8 +1810,13 @@ static netdev_features_t rtl8169_fix_features(struct net_device *dev,
 		features &= ~NETIF_F_ALL_TSO;
 
 	if (dev->mtu > ETH_DATA_LEN &&
-	    tp->mac_version > RTL_GIGA_MAC_VER_06)
-		features &= ~(NETIF_F_CSUM_MASK | NETIF_F_ALL_TSO);
+	    tp->mac_version > RTL_GIGA_MAC_VER_06) {
+		/* RTL8125CP: Tx checksum offload keeps working with jumbo frames. */
+		if (tp->mac_version == RTL_GIGA_MAC_VER_65)
+			features &= ~NETIF_F_ALL_TSO;
+		else
+			features &= ~(NETIF_F_CSUM_MASK | NETIF_F_ALL_TSO);
+	}
 
 	return features;
 }
