@@ -205,6 +205,15 @@
 			opp-level = <3>;
 		};
 	};
+
+	/* The 24 MHz timebase (ADT timebase-frequency), as on T8103. */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
@@ -241,6 +250,14 @@
 			#performance-domain-cells = <0>;
 		};
 
+		/* ADT /arm-io/wdt (wdt,t8152): restart fallback and /dev/watchdog. */
+		wdt: watchdog@3082b0000 {
+			compatible = "apple,t8152-wdt", "apple,t8103-wdt";
+			reg = <3 0x082b0000 0 0x4000>;
+			clocks = <&clkref>;
+			interrupts = <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
 		smc_mbox: mailbox@30c710080 {
 			compatible = "apple,t8152-smc-mailbox";
 			reg = <3 0x0c710080 0 0x80>;
@@ -256,6 +273,15 @@
 			      <3 0x0de00000 0 0x120000>;
 			reg-names = "smc", "sram";
 			mboxes = <&smc_mbox>;
+
+			/*
+			 * Power off (MBSE = off1) and restart (MBSE = phra). The
+			 * PMU NVMEM boot flags are not described yet; the driver
+			 * treats them as optional.
+			 */
+			smc_reboot: reboot {
+				compatible = "apple,smc-reboot";
+			};
 
 			hwmon {
 				compatible = "apple,smc-hwmon";
