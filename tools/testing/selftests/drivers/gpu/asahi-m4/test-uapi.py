@@ -27,7 +27,7 @@ def main():
     if args.mesa:
         mesa = args.mesa.resolve() / 'include/drm-uapi/asahi_drm.h'
         errors += differences(kernel, c_layout(mesa, bindings, out, 'mesa-layout'))
-    report = {'passed': not errors, 'scope': 'Compiled public UAPI structures, field offsets and constants; no kernel parser or feature-semantic coverage',
+    report = {'passed': not errors, 'scope': 'Compiled public UAPI structures, field offsets and constants; frozen params prefix plus exact known capacity-tail assertions; no parser or feature-semantic coverage',
               'kernel': str(header), 'bindings': str(bindings), 'comparisons': len(kernel),
               'mesa': str(mesa) if mesa else None,
               'mesa_comparison': 'performed' if mesa else 'not requested; set ASAHI_M4_MESA or --mesa',

@@ -39,6 +39,11 @@ queue/context/notifier records and TTBAT generation words. Comparisons include
 are compared against the actual kernel header by compiling complete C and Rust
 definitions and measuring sizes, alignments, member offsets and constants.
 Comments and documentation can change without invalidating that ABI check.
+The current global-parameters reply has a documented additive capacity tail.
+The frozen 600-byte prefix is compared unchanged; independent C assertions
+require the full reply to be exactly 616 bytes, with two eight-byte fields at
+600 and 608. Older Mesa headers can still match the shared prefix. Firmware
+encoder golden data and its fixture manifest are never regenerated.
 No Mesa headers are vendored. Set ASAHI_M4_MESA=/path/to/mesa, or run
 `test-uapi.py --mesa /path/to/mesa`, for a compatibility check against the real
 userspace source; a default host run reports that Mesa comparison was omitted.
