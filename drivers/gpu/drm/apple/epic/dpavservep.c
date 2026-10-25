@@ -209,6 +209,9 @@ static int dcpdpserv_prepare(struct apple_epic_service *service, const char *nam
 static void dcpdpserv_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
+	/* Compact EPIC (desktop 26.x): the firmware's own client never opens it. */
+	if (READ_ONCE(service->ep->compact))
+		service->defer_start = true;
 }
 
 static void dcpdpserv_teardown(struct apple_epic_service *service)
@@ -310,36 +313,45 @@ static int dcpdpserv_report(struct apple_epic_service *service,
 	return parse_report(service, type, data, data_size);
 }
 
+/*
+ * A compact EPIC call goes inline through the endpoint's ring, which a
+ * 32 KiB EDID request can never fit: ask for 2 KiB there, enough for 15
+ * extension blocks.
+ */
+#define EDID_COMPACT_BUF_SIZE (EDID_LEADING_DATA_SIZE + SZ_2K)
+
 static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *service)
 {
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
-	size_t resp_size = sizeof(*resp) + EDID_BUF_SIZE;
+	size_t edid_buf_size = READ_ONCE(service->ep->compact) ? EDID_COMPACT_BUF_SIZE :
+						      EDID_BUF_SIZE;
+	size_t resp_size = sizeof(*resp) + edid_buf_size;
 	size_t reply_size;
 	int num_blocks;
 	u64 data_size;
 	int ret;
 
 	memset(&cmd, 0, sizeof(cmd));
-	cmd.max_size = cpu_to_le64(EDID_BUF_SIZE);
+	cmd.max_size = cpu_to_le64(edid_buf_size);
 	resp = kzalloc(resp_size, GFP_KERNEL);
 	if (!resp)
 		return ERR_PTR(-ENOMEM);
 
 	ret = afk_service_call_with_reply_len(service, 1, 7, &cmd, sizeof(cmd),
-					      EDID_BUF_SIZE, resp, resp_size, 0,
+					      edid_buf_size, resp, resp_size, 0,
 					      &reply_size);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
 	if (reply_size < sizeof(*resp) ||
-	    le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
+	    le64_to_cpu(resp->max_size) != edid_buf_size)
 		return ERR_PTR(-EIO);
 
 	/* Only complete EDID blocks within the received reply may be copied. */
 	data_size = le64_to_cpu(resp->used_size);
 	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE ||
-	    data_size > EDID_BUF_SIZE || data_size > reply_size - sizeof(*resp))
+	    data_size > edid_buf_size || data_size > reply_size - sizeof(*resp))
 		return ERR_PTR(-EIO);
 
 	/*

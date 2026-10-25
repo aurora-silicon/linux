@@ -220,6 +220,15 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 					   &received);
 	if (ret)
 		return ret;
+	/* Compact EPIC returns an IOReturn status in the first word instead. */
+	if (READ_ONCE(service->ep->compact)) {
+		u32 status = get_unaligned_le32(resp._pad0);
+
+		if (status)
+			dev_warn(service->ep->dcp->dev,
+				 "set_hpd(%d): firmware status %#x\n", hpd, status);
+		return status ? -EIO : 0;
+	}
 	/* Past the end of a short reply there is only zero fill, not an echo. */
 	if (received < sizeof(resp)) {
 		dev_warn(service->ep->dcp->dev,
@@ -469,6 +478,24 @@ static int dptxport_call_get_link_rate(struct apple_epic_service *service,
 	return 0;
 }
 
+/*
+ * Compact DPTX (T6041): the direct DP PHY's pixel clock is the crossbar's
+ * PCLK1.  Take the crossbar link down before a link configuration change
+ * and bring it up after it, the PHY rate having been set in between.
+ */
+static int dptxport_compact_xbar_link(struct apple_epic_service *service, bool up)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	int ret;
+
+	if (!READ_ONCE(service->ep->compact) || !dcp->xbar)
+		return 0;
+	ret = up ? apple_dpxbar_link_up(dcp->xbar) :
+		   apple_dpxbar_link_down(dcp->xbar);
+	dev_dbg(dcp->dev, "DPTXPort: crossbar link %s: %d\n", up ? "up" : "down", ret);
+	return ret;
+}
+
 static int
 dptxport_call_will_change_link_config(struct apple_epic_service *service)
 {
@@ -479,6 +506,7 @@ dptxport_call_will_change_link_config(struct apple_epic_service *service)
 	dptx->phy_ops.dp.set_rate = 0;
 	dptx->phy_ops.dp.set_voltages = 0;
 
+	dptxport_compact_xbar_link(service, false);
 	return 0;
 }
 
@@ -493,6 +521,7 @@ dptxport_call_did_change_link_config(struct apple_epic_service *service)
 	/* assume the link config did change and wait a little bit */
 	mdelay(10);
 
+	dptxport_compact_xbar_link(service, true);
 	return 0;
 }
 
@@ -600,7 +629,8 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 	 * that path instead of waiting for a PHY start.
 	 */
 	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp) &&
-				       !dcp_ext_dptx_607(dcp) ? 1 : 0);
+				       !dcp_ext_dptx_607(dcp) &&
+				       !READ_ONCE(service->ep->compact) ? 1 : 0);
 	dev_dbg(dcp->dev, "DPTXPort: GET_SUPPORTS_HPD %u usb4=%d\n",
 		le32_to_cpu(reply->supported), dcp_is_usb4_output(dcp));
 	return 0;
@@ -912,6 +942,19 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	 * T6030 14.7 also announces the low-power port service, and may leave
 	 * its class empty.
 	 */
+	/*
+	 * Desktop 26.x announces dcpdptx-port-epic:0 and :1 in compact EPIC,
+	 * without a class.  Unit 0 is opened last, see dptxep_init_desktop().
+	 */
+	if (READ_ONCE(service->ep->compact)) {
+		if (unit != 0 && unit != 1)
+			return -EINVAL;
+		if (!unit)
+			service->defer_start = true;
+		trace_dptxport_init(dcp, unit);
+		return dptx_service_bind(service, &dcp->dptxport[unit], unit);
+	}
+
 	if (dcp_fw_is_14_7(dcp) && name &&
 	    (!strcmp(name, "dcpdptx-port-epic") ||
 	     !strcmp(name, "dcp-lpdptx-port-epic")) &&
@@ -1070,6 +1113,98 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 	},
 	{}
 };
+
+/*
+ * Group 1 calls 3 and 4 of compact DPTX carry an 80-byte record: keep the
+ * first 32 bytes, clear the result word (at 0 for 3, at 16 for 4) and never
+ * echo the pointer-bearing tail.
+ */
+static int dptxport_compact_group1(u32 command, const void *data, size_t size,
+				   void *reply, size_t room)
+{
+	size_t preserved = min_t(size_t, 32, min(size, room));
+	size_t result = command == 3 ? 0 : 16;
+
+	if (command != 3 && command != 4)
+		return -EOPNOTSUPP;
+	memcpy(reply, data, preserved);
+	if (room > preserved)
+		memset(reply + preserved, 0, room - preserved);
+	if (room < result + sizeof(__le32))
+		return -EINVAL;
+	memset(reply + result, 0, sizeof(__le32));
+	return 0;
+}
+
+static int dptxport_compact_call(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t size,
+				 void *reply, size_t room)
+{
+	if (group == 1)
+		return dptxport_compact_group1(command, data, size, reply, room);
+	if (group)
+		return -EOPNOTSUPP;
+	/* Asked on every connect; no virtual device is supported. */
+	if (command == DPTX_APCALL_GET_VIRTUAL_DEVICE_MODE) {
+		if (room < sizeof(struct dptxport_apcall_get_support))
+			return -EINVAL;
+		memset(reply, 0, room);
+		return 0;
+	}
+	return dptxport_call(service, command, data, size, reply, room);
+}
+
+static const struct apple_epic_service_ops dptxep_compact_ops[] = {
+	{
+		.name = "dcpdptx-port-epic",
+		.prepare = dptxport_prepare,
+		.teardown = dptxport_teardown,
+		.init = dptxport_init,
+		.call_v2 = dptxport_compact_call,
+	},
+	{}
+};
+
+/*
+ * The DPTX port services of a desktop 26.x external processor (T6041
+ * dcpext), on EPIC2C (0x2c): wait for both ports, then open port 0.
+ */
+int dptxep_init_desktop(struct apple_dcp *dcp, u32 endpoint)
+{
+	struct apple_dcp_afkep *ep;
+	unsigned long timeout = msecs_to_jiffies(1000);
+	u32 port;
+	int ret;
+
+	init_completion(&dcp->dptxport[0].enable_completion);
+	init_completion(&dcp->dptxport[1].enable_completion);
+	init_completion(&dcp->dptxport[0].linkcfg_completion);
+	init_completion(&dcp->dptxport[1].linkcfg_completion);
+
+	ep = afk_init(dcp, endpoint, dptxep_compact_ops);
+	if (IS_ERR(ep))
+		return PTR_ERR(ep);
+	/* Routed by its endpoint number: set before the start replies arrive. */
+	dcp->dptxep = ep;
+
+	ret = afk_start(ep);
+	if (ret)
+		return ret;
+
+	for (port = 0; port < dcp->hw.num_dptx_ports; port++) {
+		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
+						  timeout);
+		if (!ret) {
+			dev_warn(dcp->dev, "DPTX port %u service not announced\n", port);
+			return -ETIMEDOUT;
+		}
+		timeout = ret;
+	}
+
+	if (READ_ONCE(ep->compact) && dcp->dptxport[0].service)
+		return afk_start_service(dcp->dptxport[0].service);
+	return 0;
+}
 
 static void dptx_controller_service_init(struct apple_epic_service *service,
 					 const char *name, const char *class, s64 unit)
