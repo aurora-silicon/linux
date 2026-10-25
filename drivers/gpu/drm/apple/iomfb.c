@@ -1983,6 +1983,153 @@ modes_done:
 	return published;
 }
 
+/* The pixel clock of the J616s boot loader's panel mode. */
+#define DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ	521065
+#define DCP_DESKTOP_TRIAL_MAX_CAND		2
+
+/* Reuses the mode the takeover trial set, once; see dcp_takeover_trial(). */
+static int dcp_desktop_modeset(struct apple_dcp *dcp,
+			       struct drm_crtc_state *crtc_state)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct dcp_display_mode matched;
+
+	if (d->trial_modeset_ok) {
+		d->trial_modeset_ok = false;
+		if (d->mode_live && lookup_mode(dcp, &crtc_state->mode, &matched) &&
+		    matched.timing_mode_id == d->trial_timing_mode_id &&
+		    matched.color_mode_id == d->trial_color_mode_id) {
+			dev_dbg(dcp->dev, "keeping the takeover mode " DRM_MODE_FMT "\n",
+				DRM_MODE_ARG(&crtc_state->mode));
+			return 0;
+		}
+	}
+	return iomfb_modeset_v26_6_desktop(dcp, crtc_state);
+}
+
+/*
+ * Takeover gate of a desktop 26.x panel, called after the DCP started and
+ * before the boot framebuffer is evicted.  Everything that can still be
+ * refused is tried while the boot framebuffer owns the screen: DCP ready,
+ * modes known, panel connected, power on, one mode set.  Returns 0 when it
+ * is safe to evict, otherwise a negative errno and a short reason.  A
+ * failure leaves the DCP running: its shutdown sequence can crash it.
+ */
+int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct drm_display_mode cand[DCP_DESKTOP_TRIAL_MAX_CAND];
+	unsigned int i, k, n = 0, pref = UINT_MAX, boot = UINT_MAX;
+	u32 best = U32_MAX;
+	struct dcp_desktop_state *d;
+	struct drm_crtc_state *st;
+	int win = -1, ret = -EIO;
+
+	*reason = "none";
+	if (!dcp || dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
+	    !dcp_has_panel(dcp))
+		return 0;
+	d = dcp->desktop;
+	if (dcp->crashed) {
+		*reason = "dcp-crashed";
+		return -ENODEV;
+	}
+	if (!dcp->active) {
+		*reason = "dcp-not-ready";
+		return -ETIMEDOUT;
+	}
+	if (!READ_ONCE(dcp->nr_modes)) {
+		*reason = "no-modes";
+		return -ENODEV;
+	}
+	if (!dcp->connector || !dcp->connector->connected) {
+		*reason = "not-connected";
+		return -ENODEV;
+	}
+	/* The boot-like mode first, then the preferred one. */
+	mutex_lock(&dcp->modes_lock);
+	for (i = 0; i < dcp->nr_modes; i++) {
+		const struct dcp_display_mode *m = &dcp->modes[i];
+
+		if ((m->mode.type & DRM_MODE_TYPE_PREFERRED) && pref == UINT_MAX)
+			pref = i;
+		if (!m->vrr) {
+			u32 delta = abs((int)m->mode.clock -
+					DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ);
+
+			if (delta < best) {
+				best = delta;
+				boot = i;
+			}
+		}
+	}
+	if (pref == UINT_MAX)
+		pref = 0;
+	/* Only a mode within 1% of the boot loader's clock counts as boot-like. */
+	if (boot != UINT_MAX && best <= DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ / 100)
+		cand[n++] = dcp->modes[boot].mode;
+	else
+		boot = UINT_MAX;
+	if (pref != boot)
+		cand[n++] = dcp->modes[pref].mode;
+	mutex_unlock(&dcp->modes_lock);
+
+	st = kzalloc_obj(*st);
+	if (!st) {
+		*reason = "no-memory";
+		return -ENOMEM;
+	}
+
+	dcp_poweron(pdev);
+	if (dcp->crashed || d->poweron_result) {
+		*reason = dcp->crashed ? "dcp-crashed-in-poweron" : "poweron-failed";
+		goto out;
+	}
+
+	for (k = 0; k < n; k++) {
+		int r;
+
+		st->mode = cand[k];
+		dev_dbg(dcp->dev, "takeover trial mode set " DRM_MODE_FMT "\n",
+			DRM_MODE_ARG(&st->mode));
+		r = iomfb_modeset_v26_6_desktop(dcp, st);
+		if (!r && d->mode_live) {
+			win = k;
+			break;
+		}
+		if (dcp->crashed)
+			break;
+	}
+	if (win < 0) {
+		*reason = dcp->crashed ? "dcp-crashed-in-modeset" : "modeset-failed";
+		goto out;
+	}
+
+	d->trial_timing_mode_id = dcp->mode.timing_mode_id;
+	d->trial_color_mode_id = dcp->mode.color_mode_id;
+	d->trial_powered = true;
+	d->trial_modeset_ok = true;
+
+	/* Make the mode that worked the one the console client picks. */
+	mutex_lock(&dcp->modes_lock);
+	for (i = 0; i < dcp->nr_modes; i++) {
+		struct dcp_display_mode *m = &dcp->modes[i];
+
+		if (m->timing_mode_id == d->trial_timing_mode_id &&
+		    m->color_mode_id == d->trial_color_mode_id)
+			m->mode.type |= DRM_MODE_TYPE_PREFERRED;
+		else
+			m->mode.type &= ~DRM_MODE_TYPE_PREFERRED;
+	}
+	mutex_unlock(&dcp->modes_lock);
+	dev_info(dcp->dev, "takeover trial mode " DRM_MODE_FMT " accepted\n",
+		 DRM_MODE_ARG(&cand[win]));
+	ret = 0;
+out:
+	kfree(st);
+	return ret;
+}
+
 /* The user may own drm_display_mode, so we need to search for our copy */
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out)
@@ -2130,7 +2277,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_V_26_6_DESKTOP:
-		ret = iomfb_modeset_v26_6_desktop(dcp, crtc_state);
+		ret = dcp_desktop_modeset(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		ret = iomfb_v26_6_modeset(dcp, crtc_state);
@@ -2803,9 +2950,12 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 		if (ret)
 			return ret;
 	}
-	ret = apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
-	if (ret)
-		return ret;
+	/* Desktop 26.x started the transport with its auxiliary endpoints. */
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP) {
+		ret = apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+		if (ret)
+			return ret;
+	}
 
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
 					GFP_KERNEL);

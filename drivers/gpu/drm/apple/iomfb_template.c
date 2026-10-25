@@ -2031,6 +2031,9 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	}
 #endif
 	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(10000));
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+	dcp->desktop->poweron_result = ret > 0 ? 0 : ret == 0 ? 1 : 2;
+#endif
 
 	if (ret == 0) {
 		dev_warn(dcp->dev, "wait for power timed out, connector will be broken\n");
@@ -3383,15 +3386,11 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	}
 
 	dcp->active = true;
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/*
-	 * The firmware publishes no initial panel level that would register
-	 * the backlight (see iomfb_cb_pr_publish()); register it now.
+	 * Desktop 26.x publishes no initial panel level that would register
+	 * the backlight (see iomfb_cb_pr_publish()): the DRM master registers
+	 * it once its device is, see dcp_backlight_takeover_registered().
 	 */
-	if (dcp_has_panel(dcp) && !dcp->brightness.bl_dev &&
-	    dcp->brightness.maximum > 0)
-		schedule_work(&dcp->bl_register_wq);
-#endif
 	complete(&dcp->start_done);
 }
 

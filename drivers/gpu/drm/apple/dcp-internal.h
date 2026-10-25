@@ -87,6 +87,11 @@ enum {
 	 * publishes the port service used by DPTX 0x2a.
 	 */
 	DPAV_CTRL_ENDPOINT = 0x24,
+	/* Desktop 26.x (T6041) auxiliary endpoints, see dcp_start_desktop(). */
+	EPIC25_ENDPOINT = 0x25,
+	DPSAC_ENDPOINT = 0x26,
+	DPDEV_ENDPOINT = 0x27,
+	EPIC2C_ENDPOINT = 0x2c,
 	DPAVSERV_ENDPOINT = 0x28,
 	DPAVSERV_ENDPOINT_V2 = 0x2a,
 	AV_ENDPOINT = 0x29,
@@ -240,6 +245,26 @@ struct dcp_desktop_state {
 	struct iomfb_gamma_table_req *gamma_fw, *gamma_out;
 	struct drm_color_lut gamma_lut[IOMFB_GAMMA_ENTRIES];
 	bool gamma_fw_read, gamma_user, gamma_pending, gamma_unusable;
+	/*
+	 * Endpoints 0x20..0x3f this processor's start brought up beside the
+	 * system endpoint (bit = endpoint - 0x20), and those it skipped.
+	 */
+	struct apple_dcp_afkep *graph[0x20];
+	u32 graph_started, graph_skipped;
+	/* DPAVCTRL (0x24): its two AV controllers and the deferred service. */
+	struct apple_epic_service *dpavctrl_av_controller[2];
+	struct apple_epic_service *dpavctrl_late_service;
+	struct completion dpavctrl_ready;
+	/*
+	 * Takeover trial: power-on and a mode set ran before the boot
+	 * framebuffer was evicted; the first atomic enable reuses them.
+	 */
+	bool trial_powered, trial_modeset_ok;
+	u32 trial_timing_mode_id, trial_color_mode_id;
+	/* Result of the last power-on: 0 ok, 1 timeout, 2 failed. */
+	u8 poweron_result;
+	/* The takeover was refused: leave the DCP alone until the reboot. */
+	bool takeover_aborted;
 };
 
 /* TODO: move IOMFB members to its own struct */

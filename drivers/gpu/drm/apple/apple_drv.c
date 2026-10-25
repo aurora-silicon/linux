@@ -54,6 +54,11 @@
 
 struct apple_drm_private {
 	struct drm_device drm;
+	/*
+	 * A T6041 panel refused the takeover trial: the boot framebuffer keeps
+	 * the screen, the DRM device stays unregistered and its DCPs running.
+	 */
+	bool aborted;
 };
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
@@ -898,7 +903,10 @@ static bool apple_dcp_usable(struct device_node *np)
 	       (!of_device_is_compatible(np, "apple,t6030-dcpext") ||
 		dcp_t6030_ext_native(np)) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
-		dcp_h17p_external_supported(np));
+		dcp_h17p_external_supported(np)) &&
+	       /* Not driven yet; never let it hold up the panel's device. */
+	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
+		dcp_t6041_ext_enabled());
 }
 
 static void apple_drm_quiesce_connectors(struct drm_device *drm)
@@ -998,9 +1006,14 @@ static int apple_drm_init_dcp(struct device *dev)
 	}
 
 	/*
-	 * Starting DPTX might take some time.
+	 * Starting DPTX might take some time.  The T6041 panel runs its
+	 * client-open, main-display and power chain inside the start: give it
+	 * as long as that takes.
 	 */
 	timeout = get_jiffies_64() + msecs_to_jiffies(3000);
+	for (i = 0; i < num_dcp; i++)
+		if (of_device_is_compatible(dcp[i]->dev.of_node, "apple,t6041-dcp"))
+			timeout = get_jiffies_64() + msecs_to_jiffies(10000);
 
 	for (i = 0; i < num_dcp; ++i) {
 		u64 jiffies = get_jiffies_64();
@@ -1119,6 +1132,34 @@ static int apple_drm_init(struct device *dev)
 	 * swap. Hold the modeset locks across activation so an early userspace
 	 * commit cannot race the retained startup surface.
 	 */
+	/*
+	 * T6041 panel: everything that can still be refused is tried while
+	 * the boot framebuffer owns the screen; past the eviction there is no
+	 * way back.  On refusal leave the DCP running (its shutdown sequence
+	 * can crash it and blank the panel), pin the module and keep the boot
+	 * framebuffer.
+	 */
+	drm_for_each_crtc(crtc, &apple->drm) {
+		const char *reason = "none";
+
+		ret = dcp_takeover_trial(to_apple_crtc(crtc)->dcp, &reason);
+		if (!ret)
+			continue;
+		dev_err(dev, "display takeover refused (%s: %d); the boot framebuffer keeps the screen\n",
+			reason, ret);
+		/*
+		 * The DCPs keep running and keep their pipelines: pin the
+		 * module and the DRM device their CRTCs and connectors live
+		 * in, and keep them out of shutdown and sleep.
+		 */
+		__module_get(THIS_MODULE);
+		drm_dev_get(&apple->drm);
+		drm_for_each_crtc(crtc, &apple->drm)
+			dcp_takeover_aborted(to_apple_crtc(crtc)->dcp);
+		apple->aborted = true;
+		return 0;
+	}
+
 	if (retained_modeset)
 		drm_modeset_lock_all(&apple->drm);
 	fb_size = fb_r.end - fb_r.start + 1;
@@ -1148,6 +1189,10 @@ static int apple_drm_init(struct device *dev)
 	/* the fabric keeps order only once registered: catch up on probe */
 	dcp_typec_reorder();
 
+	/* A panel that publishes no level registers its backlight now. */
+	drm_for_each_crtc(crtc, &apple->drm)
+		dcp_backlight_takeover_registered(to_apple_crtc(crtc)->dcp);
+
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
 	return 0;
@@ -1165,6 +1210,10 @@ err_unbind:
 static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	/* An aborted takeover leaves its DCPs running until the reboot. */
+	if (apple->aborted)
+		return;
 
 	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);
@@ -1275,7 +1324,7 @@ static int apple_platform_suspend(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple)
+	if (apple && !apple->aborted)
 		return drm_mode_config_helper_suspend(&apple->drm);
 
 	return 0;
@@ -1303,7 +1352,7 @@ static int apple_platform_resume(struct device *dev)
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 	u32 dropped = 0;
 
-	if (apple) {
+	if (apple && !apple->aborted) {
 		if (apple->drm.mode_config.suspend_state)
 			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
 		/* Have userspace set the mode of a CRTC resumed disabled again. */

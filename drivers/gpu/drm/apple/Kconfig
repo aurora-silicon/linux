@@ -14,6 +14,8 @@ config DRM_APPLE
 	select DRM_GEM_SHMEM_HELPER
 	select DRM_GEM_DMA_HELPER
 	select VIDEOMODE_HELPERS
+	# write-combined maps of firmware-placed carveouts (desktop 26.x)
+	select VMAP_PFN
 	depends on BACKLIGHT_CLASS_DEVICE
 	select MULTIPLEXER
 	select DRM_APPLE_FABRIC_CORE
