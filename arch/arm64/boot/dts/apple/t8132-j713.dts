@@ -236,6 +236,8 @@
 
 &aop_mbox {
 	status = "okay";
+	/* A periodic report need not wake the system. */
+	apple,hold-rx-in-sleep;
 };
 
 &admac0 {
