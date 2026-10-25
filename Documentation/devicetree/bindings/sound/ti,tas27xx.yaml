@@ -74,6 +74,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: TDM TX voltage sense time slot.
 
+  ti,bclk-ratio:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [250]
+    description:
+      Fixed BCLK/FS ratio of the TDM frame, for a frame the amplifier's ratio
+      auto-detection does not accept (250 BCLKs on the Mac mini (M6, J873)
+      speaker).
+
   '#sound-dai-cells':
     # The codec has a single DAI, the #sound-dai-cells=<1>; case is left in for backward
     # compatibility but is deprecated.
