@@ -10,6 +10,7 @@
 
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
@@ -250,6 +251,54 @@
 			#performance-domain-cells = <0>;
 		};
 
+		/*
+		 * ADT /arm-io/nub-spmi0 (gen 4) and its primary PMU, pmu-main
+		 * ("woodcote", slave 0xe). The boot flags live in the legacy
+		 * scratchpad (info-leg_scrpad = 0xf800), laid out as on T8103
+		 * and T8140; boot_stage read 0x30 (kernel started) here.
+		 */
+		nub_spmi0: spmi@308714000 {
+			/*
+			 * Gen 4: FIFO registers at 0x200 (the block is 0x4000
+			 * long); polled, so no interrupts are described yet.
+			 */
+			compatible = "apple,t8152-spmi", "apple,t8142-spmi";
+			reg = <0x3 0x08714000 0x0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			pmic@e {
+				compatible = "apple,woodcote-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					boot_stage: boot-stage@f801 {
+						reg = <0xf801 0x1>;
+					};
+
+					boot_error_count: boot-error-count@f802,0 {
+						reg = <0xf802 0x1>;
+						bits = <0 4>;
+					};
+
+					panic_count: panic-count@f802,4 {
+						reg = <0xf802 0x1>;
+						bits = <4 4>;
+					};
+
+					/* Set before off1, or the machine powers back on. */
+					shutdown_flag: shutdown-flag@f80f,3 {
+						reg = <0xf80f 0x1>;
+						bits = <3 1>;
+					};
+				};
+			};
+		};
+
 		/* ADT /arm-io/wdt (wdt,t8152): restart fallback and /dev/watchdog. */
 		wdt: watchdog@3082b0000 {
 			compatible = "apple,t8152-wdt", "apple,t8103-wdt";
@@ -274,13 +323,13 @@
 			reg-names = "smc", "sram";
 			mboxes = <&smc_mbox>;
 
-			/*
-			 * Power off (MBSE = off1) and restart (MBSE = phra). The
-			 * PMU NVMEM boot flags are not described yet; the driver
-			 * treats them as optional.
-			 */
+			/* Power off (MBSE = off1) and restart (MBSE = phra). */
 			smc_reboot: reboot {
 				compatible = "apple,smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					      <&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+						   "boot_error_count", "panic_count";
 			};
 
 			hwmon {
