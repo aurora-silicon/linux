@@ -136,6 +136,13 @@ properties:
       domain is powered down.
     type: boolean
 
+  apple,no-auto-pm:
+    description:
+      Never enables automatic power management on this domain. Used for a
+      coprocessor CPU domain whose firmware must not be clock or power gated
+      behind its back, such as the external display controllers.
+    type: boolean
+
 required:
   - compatible
   - reg
