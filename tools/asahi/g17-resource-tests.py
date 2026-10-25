@@ -150,14 +150,17 @@ def queue_tests(root, source):
     #[derive(Clone,Copy)] struct Identity {id:Id,published:bool}
     '''+constants+'\n'+item(s,'pub(crate) struct QueueIds')+'\nimpl QueueIds {\n'+''.join(item(s,'pub(crate) fn '+name+'(')+'\n' for name in ['reserve_initial_render','reserve','publish','can_cancel_unpublished','cancel_unpublished'])+'}\n'
     test='''
-    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],compute_publication:0,leased:0}}
+    fn fresh()->QueueIds {QueueIds {entries:[None;QID_COUNT],initial_render:[None;2],publication:0,leased:0,floor:0}}
     fn main(){
-     for render in [0,2,16,32,112,126] {
-      let mut q=fresh();
+     for floor in [0,32] {
+     for render in [0,2,16,32,80,96,112,126].into_iter().filter(|render|*render<=QID_COUNT-floor) {
+      let mut q=fresh();q.floor=floor;
       for i in 0..render {q.reserve(i as u64+1,if i%2==0 {DataMaster::Tiling}else{DataMaster::Fragment},None).unwrap();}
       let mut compute=0;
       while q.reserve(1000+compute,DataMaster::Compute,None).is_ok(){compute+=1;}
-      assert_eq!(compute as usize,QID_COUNT-render.max(COMPUTE_RENDER_RESERVE));
+      assert_eq!(compute as usize,QID_COUNT-floor-render.max(COMPUTE_RENDER_RESERVE-floor));
+      assert!(q.entries[..floor].iter().all(Option::is_none));
+     }
      }
      let mut q=fresh();let first=q.reserve(1,DataMaster::Tiling,None).unwrap();
      assert!(q.can_cancel_unpublished(first));q.publish(first).unwrap();
@@ -165,7 +168,7 @@ def queue_tests(root, source):
      let unused=q.reserve(2,DataMaster::Fragment,None).unwrap();q.cancel_unpublished(unused).unwrap();assert_eq!(q.leased,1);
      let next=q.reserve(3,DataMaster::Fragment,None).unwrap();assert_eq!(next.qid,unused.qid);
      assert!(!q.can_cancel_unpublished(unused));assert_eq!(q.cancel_unpublished(unused),Err(EINVAL));
-     println!("queue IDs: six render/compute capacity boundaries; compute-only render reserve retained; published and stale identities protected");
+     println!("queue IDs: render/compute capacity boundaries at zero and reserved floors; compute-only render reserve retained; published and stale identities protected");
      // Reproduce the hardware snapshot: 124 installed render identities, two
      // installed compute identities, and two initial reservations fill128 IDs.
      let mut q=fresh();q.reserve_initial_render().unwrap();
