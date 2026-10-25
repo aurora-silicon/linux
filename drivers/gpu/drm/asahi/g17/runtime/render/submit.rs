@@ -59,7 +59,8 @@ impl Backend {
             (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
         };
         let started = super::super::now_ns();
-        let mut deadline_ns = started.saturating_add(u64::from(crate::g17::job::TIMEOUT_MS) * 1_000_000);
+        let mut deadline_ns =
+            started.saturating_add(u64::from(crate::g17::job::TIMEOUT_MS) * 1_000_000);
         let recovery_deadline_ns = started.saturating_add(recovery_wait_ns());
         let mut capacity = WaitClock::default();
         loop {

@@ -318,12 +318,11 @@ enum drm_asahi_feature {
 
 	/**
 	 * @DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS: Every hardware command of
-	 * a submission waits for all of the submission's input syncs, so
-	 * independent commands need no extra dependency on the first command.
-	 * An input that signalled with an error is waited for, not inherited: as
-	 * with drm_sched, the command still runs, and its inputs' contents are
-	 * undefined. Userspace that splits a batch across several submissions
-	 * and relies on this must pass its input syncs to each of them.
+	 * a submission waits for all of the submission's input syncs, including
+	 * their errors, so independent commands need no extra dependency on the
+	 * first command. Userspace that splits a batch across several
+	 * submissions and relies on this must pass its input syncs to each of
+	 * them.
 	 */
 	DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS = (1UL) << 10,
 

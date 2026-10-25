@@ -18,11 +18,11 @@ pub(crate) fn inherited_error(error: Error) -> Error {
 }
 
 /// A replay's original host inputs must still be signalled. Treat an unmet
-/// input as a failed replay, never as a wait under the device mutex. A failed
-/// input does not fail the replay, as it did not fail the first publication
-/// (`Packet::check_dependencies`).
+/// input as a failed replay, never as a wait under the device mutex.
 pub(crate) fn replay_status(status: i32) -> Result {
-    if status == 0 { Err(EBUSY) } else { Ok(()) }
+    if status == 0 { Err(EBUSY) }
+    else if status < 0 { Err(inherited_error(Error::from_errno(status))) }
+    else { Ok(()) }
 }
 
 pub(crate) struct Frontier {
@@ -67,8 +67,8 @@ impl Frontier {
         Ok(())
     }
 
-    /// The caller has matched the logical owner and VM. Order this command after
-    /// every covered predecessor still pending on the firmware.
+    /// The caller has matched the logical owner and VM. Check every covered
+    /// predecessor for failure, including one a newer kick would subsume.
     pub(crate) fn include(
         &mut self,
         prefix: Option<u64>,
@@ -79,9 +79,10 @@ impl Frontier {
         if !Order::contains(prefix, sequence) {
             return Ok(());
         }
-        // A failed predecessor will never run: there is nothing to wait for. Like a failed
-        // input (Packet::check_dependencies), it does not cancel this command.
-        if status != 0 {
+        if status < 0 {
+            return Err(ECANCELED);
+        }
+        if status > 0 {
             return Ok(());
         }
         let dependency = KickDependency::from_word(word).ok_or(EIO)?;
@@ -94,10 +95,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_predecessor_is_no_dependency() {
+    fn failed_predecessor_cannot_be_bypassed() {
         let mut frontier = Frontier::new();
-        assert_eq!(frontier.include(Some(5), 5, ECANCELED.to_errno(), 0), Ok(()));
-        assert_eq!(frontier.include(Some(5), 4, EIO.to_errno(), 0), Ok(()));
+        for error in [ECANCELED, EIO, ETIMEDOUT] {
+            assert_eq!(frontier.include(Some(5), 5, error.to_errno(), 0), Err(ECANCELED));
+        }
+        assert_eq!(frontier.include(Some(5), 5, 1, 0), Ok(()));
+        assert_eq!(frontier.include(Some(5), 6, EIO.to_errno(), 0), Ok(()));
         assert_eq!(frontier.count, 0);
     }
 }
