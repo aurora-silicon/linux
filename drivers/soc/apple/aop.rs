@@ -2604,6 +2604,20 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     fw_regions: false,
     halt_on_failed_start: false,
 };
+/// T8152: like T8140, but the setup port (mailbox 1 of the AOP bank, and the
+/// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
+const HW_CFG_T8152: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    aopt: 0,
+    alig: 0,
+    patch_bootargs: false,
+    epic_v4: true,
+    setup_port: false,
+    quiesce_on_unbind: true,
+    required_endpoints: &[],
+    fw_regions: false,
+    halt_on_failed_start: false,
+};
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -2615,6 +2629,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
+        (of::DeviceId::new(c_str!("apple,t8152-aop")), &HW_CFG_T8152),
     ]
 );
 
