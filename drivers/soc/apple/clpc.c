@@ -136,6 +136,7 @@ struct apple_clpc {
 	u32 saved_floor;
 	unsigned long samples;
 	unsigned long update_errors;
+	unsigned long gpu_read_errors;
 	struct dentry *debugfs;
 	struct regmap *gpu_pmgr;
 	struct apple_clpc_gpu *gpu;
@@ -422,6 +423,12 @@ static bool apple_clpc_gpu_streaming(struct apple_clpc *clpc, unsigned long now)
 
 	clpc->gpu_sampled = now;
 	err = regmap_read(clpc->gpu_pmgr, clpc->gpu_offset, &status);
+	if (err) {
+		clpc->gpu_read_errors++;
+		dev_warn_once(clpc->dev,
+			      "graphics power state read failed (%d); holding the GPU floor\n",
+			      err);
+	}
 	if (!err && (status & GENMASK(7, 4)) != GENMASK(7, 4)) {
 		clpc->gpu_on = false;
 		return false;
@@ -647,6 +654,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 			   clpc->gpu_floor_releases, clpc->gpu_floor_returns);
 		seq_printf(s, "gpu floor samples: streaming %lu dense %lu\n",
 			   clpc->gpu_streaming_samples, clpc->gpu_dense_samples);
+		seq_printf(s, "gpu read errors: %lu\n", clpc->gpu_read_errors);
 	}
 	for (i = 0; i < clpc->nr_clusters; i++)
 		seq_printf(s, "cluster cpu%u: busy %u%% level %u%% -> dcs %u soc %u\n",
