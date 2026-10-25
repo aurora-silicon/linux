@@ -69,6 +69,14 @@ pub(crate) const fn stamp_seed(seed: u32, n: u64) -> u32 {
     seed.wrapping_add((n as u32).wrapping_mul(0x100))
 }
 
+/// Ordinals after which [`stamp_seed`] repeats: 2^32 / 0x100.
+pub(crate) const STAMP_PERIOD: u64 = 1 << 24;
+
+/// Effective render ordinal at which the TA stamp wraps (0xffffff00 -> 0): 0x860000 with the TA
+/// seed. A wrap that skipped zero stopped the firmware ("DAG: Non Sequential Stamp Updates");
+/// the renumbering keeps the stamps away from it. The FS stamp wraps later (0xc30000).
+pub(crate) const RENDER_WRAP: u64 = 0xffffff - (hw::engine::TA_SEED / 0x100) as u64 + 1;
+
 /// Compute stamp of ordinal `n`.
 pub(crate) const fn stamp(n: u64) -> u32 {
     stamp_seed(hw::engine::COMPUTE_SEED, n)

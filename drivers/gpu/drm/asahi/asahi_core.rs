@@ -189,6 +189,14 @@ module! {
             default: 1024,
             description: "G15: PB blocks posted above which an idle engine reclaims the PB",
         },
+        g15_stamp_base: u32 {
+            default: 0,
+            description: "G15 (testing): render ordinal the TA/FS stamps start from; 0 = unchanged",
+        },
+        g15_stamp_reseed_margin: u32 {
+            default: 0,
+            description: "G15: renders before the TA stamp wrap within which TA/FS are renumbered while idle; 0 = off",
+        },
         g15_early_tiling: u32 {
             default: 0,
             description: "G15: advertise FRAGMENT_BARRIERS, mapped to early tiling (slower on 2419)",

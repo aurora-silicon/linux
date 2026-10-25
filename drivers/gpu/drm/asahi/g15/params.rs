@@ -18,6 +18,18 @@ use crate::module_parameters;
 /// updates); this bounds the kernel's staging allocation.
 pub(crate) const MAX_BINDS: u32 = 1 << 20;
 
+/// Render ordinal the TA/FS stamps start from. Only for testing the stamp wrap without hours of
+/// drawing; 0 keeps the stamps exactly as before.
+pub(crate) fn stamp_base() -> u64 {
+    (module_parameters::g15_stamp_base.value() as u64) % super::encode::STAMP_PERIOD
+}
+
+/// Renders before the TA stamp wrap within which the TA/FS stamps are renumbered from their seeds,
+/// at the first moment with nothing in flight (0: never).
+pub(crate) fn stamp_reseed_margin() -> u64 {
+    module_parameters::g15_stamp_reseed_margin.value() as u64
+}
+
 /// Host deadline of a published prefix without progress, ms (at least 100).
 pub(crate) fn deadline_ms() -> u32 {
     module_parameters::g15_deadline_ms.value().max(100)
