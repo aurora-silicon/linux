@@ -17,7 +17,7 @@ const struct apple_dpin_policy apple_dpin_m1 = {
 
 const struct apple_dpin_policy apple_dpin_m2 = {
 	.flow = APPLE_DPIN_PRE_POST,
-	/* Capacity retry remains disabled pending M2 hardware qualification. */
+	.capacity_retry = true,
 	.t602x_handshake = true,
 	.host_policy = TB_HOST_DP_HPD_ON_ACTIVATE |
 		       TB_HOST_DP_ACTIVE_BEFORE_DPRX |
@@ -111,6 +111,12 @@ bool apple_dpin_awaits_display(const struct apple_dpin_state *s,
 			       const struct apple_dpin_policy *p)
 {
 	return s->alive && (s->waiting || (p->defer_new_bringup && s->deferred_first));
+}
+
+/* Retries pause across system sleep wherever a tunnel can wait or be deferred. */
+bool apple_dpin_pm_gated(const struct apple_dpin_policy *p)
+{
+	return p->capacity_retry || p->defer_new_bringup;
 }
 
 enum apple_dpin_event apple_dpin_request_event(const struct apple_dpin_state *s,
