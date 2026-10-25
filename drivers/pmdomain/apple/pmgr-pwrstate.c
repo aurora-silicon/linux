@@ -513,10 +513,22 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
 	}
 
-	/* Turn on auto-PM if the domain is already on, unless it must stay off */
-	if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable)
+	/*
+	 * An explicit no-auto-pm policy also clears a bootloader's auto-PM bit.
+	 * Skipping the enable below would otherwise leave an active coprocessor
+	 * exposed until the first genpd transition. Never change firmware-owned
+	 * or inherited-on domains, whose state Linux does not own.
+	 */
+	if (active && !ps->firmware_owned && !ps->inherited_on &&
+	    of_property_read_bool(node, "apple,no-auto-pm")) {
+		ret = regmap_update_bits(regmap, ps->offset,
+					 APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE, 0);
+		if (ret)
+			return dev_err_probe(dev, ret, "cannot disable auto-PM\n");
+	} else if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable) {
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
+	}
 
 	ret = pm_genpd_init(&ps->genpd, NULL, !active);
 	if (ret < 0) {
