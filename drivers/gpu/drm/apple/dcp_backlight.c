@@ -22,6 +22,9 @@
 #define MIN_BRIGHTNESS_PART2	103U
 #define MAX_BRIGHTNESS_PART2	510U
 
+/* Initial level of a desktop 26.x panel, which reports none. */
+#define DCP_DESKTOP_DEFAULT_NITS	250U
+
 /*
  * lookup for display brightness 2 to 99 nits
  * */
@@ -507,11 +510,24 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		return ret;
 	}
 
+	/*
+	 * Desktop 26.x swaps carry nits.  A level of 0 must not turn the
+	 * panel off (DPMS does that); only a blanked panel still gets 0.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !brightness &&
+	    !bd->props.brightness)
+		brightness = min(bd->props.max_brightness, 2);
+
 	ret = drm_modeset_lock_single_interruptible(&dcp->crtc->base.mutex);
 	if (ret)
 		return ret;
 
-	dcp->brightness.dac = calculate_dac(dcp, brightness);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		dcp->brightness.nits = brightness;
+		dcp->brightness.requested = true;
+	} else {
+		dcp->brightness.dac = calculate_dac(dcp, brightness);
+	}
 	dcp->brightness.update = true;
 
 	drm_modeset_unlock(&dcp->crtc->base.mutex);
@@ -564,13 +580,28 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	}
 
+	/*
+	 * Desktop 26.x takes nits directly and publishes no initial level:
+	 * start from a default, which is not sent until userspace writes one.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		if (!dcp->brightness.maximum || dcp->brightness.maximum > INT_MAX)
+			return -ERANGE;
+		props.max_brightness = dcp->brightness.maximum;
+		if (!props.brightness)
+			props.brightness = min_t(u32, DCP_DESKTOP_DEFAULT_NITS,
+						 props.max_brightness);
+		dcp->brightness.nits = props.brightness;
+	}
+
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);
 	if (IS_ERR(bl_dev))
 		return PTR_ERR(bl_dev);
 
 	dcp->brightness.bl_dev = bl_dev;
-	if (!dcp_backlight_active(dcp))
+	if (!dcp_backlight_active(dcp) &&
+	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
 		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
 
 	return 0;

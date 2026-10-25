@@ -91,6 +91,17 @@ static inline u64 dcpep_ack(enum dcp_context_id id)
 }
 
 /*
+ * Adaptive sync through IOMFBParameter 14 black-screens the J616s panel on
+ * the desktop 26.6 firmware: the firmware accepts the VRR mode, then no swap
+ * completes.  Do not offer it there.
+ */
+static bool dcp_mode_vrr_supported(struct apple_dcp *dcp,
+				   const struct dcp_display_mode *mode)
+{
+	return dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !mode->vrr;
+}
+
+/*
  * A channel is busy if we have sent a message that has yet to be
  * acked. The driver must not sent a message to a busy channel.
  */
@@ -1934,6 +1945,8 @@ edid_done:
 			continue;
 		published_180hz |= modes[i].automatic_rgb8_quirk;
 		published++;
+		if (!dcp_mode_vrr_supported(dcp, &modes[i]))
+			continue;
 		if (modes[i].vrr) {
 			u16 lo = modes[i].min_vrr >> 16;
 			u16 hi = modes[i].max_vrr >> 16;
@@ -2115,6 +2128,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
+		break;
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		ret = iomfb_modeset_v26_6_desktop(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		ret = iomfb_v26_6_modeset(dcp, crtc_state);
@@ -2676,6 +2692,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_flush_v14_7_0(dcp, crtc, commit);
 		break;
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		iomfb_flush_v26_6_desktop(dcp, crtc, commit);
+		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_flush_h17p(dcp, crtc, commit);
 		break;
@@ -2696,6 +2715,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_start_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		iomfb_start_v26_6_desktop(dcp);
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_start_h17p(dcp);
@@ -2810,6 +2832,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_shutdown_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		iomfb_shutdown_v26_6_desktop(dcp);
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_shutdown_h17p(dcp);

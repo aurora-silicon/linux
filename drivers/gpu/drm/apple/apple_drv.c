@@ -23,6 +23,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_blend.h>
 #include <drm/clients/drm_client_setup.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
@@ -657,8 +658,13 @@ static int apple_probe_per_dcp(struct device *dev,
 
 	drm_crtc_helper_add(&crtc->base, &apple_crtc_helper_funcs);
 	/* T8132 has no qualified CTM transaction. */
-	if (!iomfb_is_m4(dcp_data))
-		drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
+	if (!iomfb_is_m4(dcp_data)) {
+		unsigned int gamma_size = dcp_gamma_lut_size(dcp);
+
+		drm_crtc_enable_color_mgmt(&crtc->base, 0, true, gamma_size);
+		if (gamma_size)
+			drm_mode_crtc_set_gamma_size(&crtc->base, gamma_size);
+	}
 
 	crtc->dcp = dcp;
 	*crtc_mask = drm_crtc_mask(&crtc->base);

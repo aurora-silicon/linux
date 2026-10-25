@@ -406,4 +406,88 @@ struct dcpep_get_tiling_state_resp {
 	u32 ret;
 } __packed;
 
+/*
+ * Records of the desktop 26.6 IOMFB (T6041, DCP_FIRMWARE_V_26_6_DESKTOP)
+ * that differ from the shared ones above.
+ */
+
+/* A364 get_mode_info: fills the mode record A413 then selects. */
+struct dcp_get_mode_info_req_v26_6 {
+	u8 mode[0x64];
+	u8 mode_null;
+	u8 padding0[3];
+	u64 opaque;
+	u32 timing_mode_id;
+	u32 color_mode_id;
+	u8 result_null;
+	u8 padding1[3];
+} __packed;
+
+struct dcp_get_mode_info_resp_v26_6 {
+	u8 opaque[0x74];
+} __packed;
+
+/* A469 abort_swaps_dcp takes the bare client identity. */
+struct iomfb_abort_swaps_dcp_req_v26_6 {
+	u64 client;
+} __packed;
+
+struct iomfb_abort_swaps_dcp_resp_v26_6 {
+	u32 ret;
+} __packed;
+
+/* D592 swap_complete_intent_gated, padded to 0x14. */
+struct dcp_swap_complete_intent_gated_v26_6 {
+	u32 swap_id;
+	u8 unkBool;
+	u32 unkInt;
+	u32 width;
+	u32 height;
+	u8 padding[3];
+} __packed;
+
+/* D125 read_edt_data reply, padded to 0x24. */
+struct dcp_read_edt_data_resp_v26_6 {
+	u32 value[8];
+	u8 ret;
+	u8 padding[3];
+} __packed;
+
+/*
+ * D575 hotplug_gated: the connection state and a tiled-display record in,
+ * a 0x4c-byte record out.
+ */
+struct dcp_hotplug_req_v26_6 {
+	u64 connected;
+	u8 opaque[0x50];
+} __packed;
+
+struct dcp_hotplug_resp_v26_6 {
+	u8 opaque[0x4c];
+} __packed;
+
+/* A boolean argument, padded to four bytes. */
+struct dcp_bool_arg {
+	u8 value;
+	u8 padding[3];
+} __packed;
+
+/*
+ * A420 get_gamma_table / A421 set_gamma_table: three channels (red, green,
+ * blue) of 257 u32 entries followed by a null flag, 3088 bytes in and out.
+ */
+#define IOMFB_GAMMA_ENTRIES 257
+
+struct iomfb_gamma_table_req {
+	__le32 table[3][IOMFB_GAMMA_ENTRIES];
+	u8 table_null;
+	u8 padding[3];
+} __packed;
+
+struct iomfb_gamma_table_resp {
+	__le32 table[3][IOMFB_GAMMA_ENTRIES];
+	u8 table_null;
+	u8 padding[3];
+} __packed;
+
 #endif

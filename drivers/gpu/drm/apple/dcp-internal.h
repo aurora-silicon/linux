@@ -4,6 +4,7 @@
 #ifndef __APPLE_DCP_INTERNAL_H__
 #define __APPLE_DCP_INTERNAL_H__
 
+#include <drm/drm_mode.h>
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
@@ -33,6 +34,7 @@
 #include "iomfb_v14_7.h"
 #include "iomfb_v14_7_tpl.h"
 #include "iomfb_v26_6.h"
+#include "iomfb_v26_6_desktop.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -164,6 +166,8 @@ struct dcp_brightness {
 	int nits;
 	int scale;
 	bool update;
+	/* A level was written through the backlight device (desktop 26.x). */
+	bool requested;
 };
 
 struct audiosrv_data;
@@ -212,6 +216,30 @@ enum dcp_test_point {
 	DCP_TEST_ANNOUNCE_TIMER_DONE,		/* past hpd_mutex in the timeout work */
 	DCP_TEST_UNBIND_ANNOUNCE_STOPPED,	/* unbind drained the timeout work */
 	DCP_TEST_HOTPLUG_EVENT,			/* the hotplug worker sends its event */
+};
+
+/*
+ * DCP_FIRMWARE_V_26_6_DESKTOP state, see iomfb_v26_6_desktop.c; allocated
+ * for such a DCP only.
+ */
+struct dcp_desktop_state {
+	/* Queued swap; too large for the shared swap union. */
+	struct dcp_swap_submit_req_v26_6_desktop swap;
+	/* Opaque client identity the firmware's IOMFB calls carry. */
+	u64 client;
+	/*
+	 * A mode was set since the display last went away.  Until then the
+	 * firmware's generic pipe is bootstrapped through a virtual color
+	 * element before the real one is selected.
+	 */
+	bool mode_live;
+	/*
+	 * GAMMA_LUT: the firmware's own table, read before the first change;
+	 * the table being sent; the LUT it is composed from, if any.
+	 */
+	struct iomfb_gamma_table_req *gamma_fw, *gamma_out;
+	struct drm_color_lut gamma_lut[IOMFB_GAMMA_ENTRIES];
+	bool gamma_fw_read, gamma_user, gamma_pending, gamma_unusable;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -638,6 +666,9 @@ struct apple_dcp {
 	struct delayed_work hdmi_recheck_wq;
 	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
 	struct dcp_hdmi *hdmi;
+
+	/* Kept last: the template instances share the layout above. */
+	struct dcp_desktop_state *desktop;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */

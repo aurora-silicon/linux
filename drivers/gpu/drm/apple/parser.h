@@ -106,9 +106,16 @@ struct dcp_display_mode {
 	bool preferred;
 	bool metadata_timing_valid;
 	bool automatic_rgb8_quirk;
+	/*
+	 * The best virtual color element of the timing, which the desktop
+	 * 26.x firmware selects first to bootstrap its generic pipe (valid if
+	 * has_bootstrap).  Both sit in what was padding.
+	 */
+	u32 bootstrap_color_id;
 	u64 automatic_connection_sequence;
 	u64 automatic_catalog_sequence;
 	bool automatic_service_pending;
+	bool has_bootstrap;
 	/* Immutable receipt provenance; never retag a cached exception. */
 	struct dcp_metadata_ticket unsafe_rgb8_ticket;
 	u64 unsafe_rgb8_service_epoch;

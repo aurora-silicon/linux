@@ -558,12 +558,14 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			     struct dcp_color_mode *unsafe_rgb8)
 {
 	struct iterator outer_it;
+	struct dcp_color_mode bootstrap = { .score = -1 };
 	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
 	out->sdr.score = -1;
 	out->best.score = -1;
+	out->has_bootstrap = false;
 
 	ret = iterator_begin(handle, &outer_it, false);
 	if (ret)
@@ -627,7 +629,16 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				return ret;
 		}
 
-		/* Skip virtual or partial entries */
+		/*
+		 * Skip virtual or partial entries.  Remember the best virtual
+		 * one: the desktop 26.x firmware bootstraps its generic pipe
+		 * through it.
+		 */
+		if (is_virtual && cmode.score >= 0 && cmode.id >= 0 &&
+		    !fill_color_mode(&bootstrap, &cmode) && bootstrap.score >= 0) {
+			out->has_bootstrap = true;
+			out->bootstrap_color_id = bootstrap.id;
+		}
 		if (is_virtual || cmode.score < 0 || cmode.id < 0 ||
 		    cmode.id > U32_MAX)
 			continue;

@@ -28,12 +28,13 @@
 	 ((ver) & ~DCP_FW_DESKTOP) >= DCP_FW_VERSION(26, 0, 0))
 
 /*
- * The swap record layout introduced with the 14.7 firmware.  The
- * H17-generation firmware (26.0 and later) keeps the earlier layout and
- * extends it with its own fields.
+ * The swap record layout introduced with the 14.7 firmware.  The desktop
+ * 26.x firmware keeps it and appends to it.  The H17-generation firmware
+ * (26.0 and later) keeps the earlier layout and extends it with its own
+ * fields.
  */
 #define DCP_FW_LAYOUT_14_7(ver) \
-	((ver) >= DCP_FW_VERSION(14, 7, 0) && (ver) < DCP_FW_VERSION(26, 0, 0))
+	((ver) >= DCP_FW_VERSION(14, 7, 0) && !DCP_FW_H17(ver))
 
 enum dcp_firmware_version {
 	DCP_FIRMWARE_UNKNOWN,
@@ -55,6 +56,11 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_26_6,
 	/* T8132/J713 retained EP37 session. */
 	DCP_FIRMWARE_M4,
+	/*
+	 * T6041 (M4 Pro/Max) desktop 26.6 IOMFB through the classic template
+	 * (iomfb_v26_6_desktop.c); not the J613 DCPLink DCP_FIRMWARE_V_26_6.
+	 */
+	DCP_FIRMWARE_V_26_6_DESKTOP,
 };
 
 #endif /*__APPLE_VERSION_UTILS_H__*/

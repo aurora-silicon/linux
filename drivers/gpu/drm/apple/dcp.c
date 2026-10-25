@@ -26,6 +26,7 @@
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/property.h>
+#include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
@@ -35,6 +36,7 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/workqueue.h>
 
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_file.h>
@@ -999,6 +1001,11 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    crtc_state->vrr_enabled)
+		return -EINVAL;
+
+	/* DRM core only caps the blob size; the gamma update copies a full table. */
+	if (crtc_state->color_mgmt_changed && crtc_state->gamma_lut &&
+	    drm_color_lut_size(crtc_state->gamma_lut) != dcp_gamma_lut_size(pdev))
 		return -EINVAL;
 
 	/*
@@ -2481,6 +2488,15 @@ bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 	       dcp->fw_compat == DCP_FIRMWARE_V_26_6;
 }
 
+/* GAMMA_LUT entries, 0 where the driver cannot program the gamma table */
+unsigned int dcp_gamma_lut_size(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ?
+	       IOMFB_GAMMA_ENTRIES : 0;
+}
+
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -2627,6 +2643,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_poweroff_v14_7_0(dcp);
 		break;
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		iomfb_poweroff_v26_6_desktop(dcp);
+		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
 		break;
@@ -2720,6 +2739,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_sleep_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		iomfb_sleep_v26_6_desktop(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -2877,6 +2899,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_poweron_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6_DESKTOP:
+		iomfb_poweron_v26_6_desktop(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweron(dcp);
@@ -4284,6 +4309,18 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
+	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
+		if (!dcp->desktop)
+			return -ENOMEM;
+		/*
+		 * The opaque client identity of the IOMFB calls.  The firmware's
+		 * own client passes a kernel pointer there; pass a random value
+		 * of the same shape instead.
+		 */
+		dcp->desktop->client = GENMASK_ULL(63, 48) |
+				       (get_random_u64() & GENMASK_ULL(47, 4));
+	}
 	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
