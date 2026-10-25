@@ -7,6 +7,7 @@
 #include <linux/gfp.h>
 #include <linux/cache.h>
 #include <linux/dma-map-ops.h>
+#include <linux/property.h>
 #include <xen/xen.h>
 
 #include <asm/cacheflush.h>
@@ -42,7 +43,12 @@ void arch_setup_dma_ops(struct device *dev, bool coherent)
 {
 	int cls = cache_line_size_of_cpu();
 
-	if (!coherent && !CLIDR_LOC(read_sysreg(clidr_el1))) {
+	/*
+	 * A device explicitly marked "dma-noncoherent" keeps non-coherent DMA:
+	 * its driver may depend on the non-cacheable attributes of that path.
+	 */
+	if (!coherent && !CLIDR_LOC(read_sysreg(clidr_el1)) &&
+	    !device_property_present(dev, "dma-noncoherent")) {
 		dev_warn(dev, "CLIDR_EL1.LoC == 0, treating as coherent\n");
 		coherent = true;
 	}
