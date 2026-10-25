@@ -265,6 +265,22 @@ struct dcp_desktop_state {
 	u8 poweron_result;
 	/* The takeover was refused: leave the DCP alone until the reboot. */
 	bool takeover_aborted;
+	/*
+	 * External processors: the firmware powered the pipe off with the
+	 * display (unplug); the next swap needs a power-on and a mode set.
+	 */
+	bool ext_pipe_off;
+	/*
+	 * Dynamic Type-C DP route (T6041 dcpext1): the DP PHYs and crossbars
+	 * of every Type-C port, the one in use (or -1), the DPTX target PHY
+	 * of each and the crossbar state selecting this processor.
+	 */
+	unsigned int ndyn;
+	int dyn_active;
+	struct phy *dyn_phy[3];
+	struct mux_control *dyn_xbar[3];
+	u32 dyn_dptx_phy[3];
+	u32 dyn_mux_index;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -759,6 +775,7 @@ void dcp_announce_arm(struct apple_dcp *dcp);
 void dcp_announce_work(struct work_struct *work);
 void dcp_external_crtc_released(struct apple_dcp *dcp);
 void dcp_external_link_fault(struct apple_dcp *dcp);
+irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp);
 
 /* A KUnit test can wait here for the work it races with. */
 static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point point)

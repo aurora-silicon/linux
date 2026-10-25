@@ -683,7 +683,9 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * and no encoder either, because the port's encoder spans every
 	 * pipeline that can drive it.
 	 */
-	if (connector_type == DRM_MODE_CONNECTOR_USB) {
+	/* Desktop 26.x drives its Type-C route itself, as a pipeline output. */
+	if (connector_type == DRM_MODE_CONNECTOR_USB &&
+	    !dcp_fw_compat_is_desktop(dcp)) {
 		dcp_link(dcp, crtc, NULL);
 		*encoder = NULL;
 		return 0;
@@ -904,7 +906,7 @@ static bool apple_dcp_usable(struct device_node *np)
 		dcp_t6030_ext_native(np)) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		dcp_h17p_external_supported(np)) &&
-	       /* Not driven yet; never let it hold up the panel's device. */
+	       /* t6041_dcpext=0 keeps the T6041 external processors out. */
 	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
 		dcp_t6041_ext_enabled());
 }

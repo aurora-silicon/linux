@@ -57,7 +57,14 @@ int apple_atc_dp_tunnel_open(struct phy *phy);
  * appledrm can route a DCP that lists several Type-C DP PHYs to the one that
  * has a DisplayPort sink plugged.
  */
+#if IS_ENABLED(CONFIG_PHY_APPLE_T6040_USB2)
 bool apple_t6040_phy_dp_alt(struct phy *phy);
+#else
+static inline bool apple_t6040_phy_dp_alt(struct phy *phy)
+{
+	return false;
+}
+#endif
 
 /*
  * Display crossbar: take the connection of an already selected output down or

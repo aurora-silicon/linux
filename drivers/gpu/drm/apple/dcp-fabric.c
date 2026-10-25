@@ -102,6 +102,9 @@ static bool dcp_hdmi_borrowed(void *ctx);
 
 bool dcp_is_typec_output(struct apple_dcp *dcp)
 {
+	/* Desktop 26.x keeps its own Type-C route, outside this fabric. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		return false;
 	return dcp->active_typec_route ||
 	       dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB;
 }
@@ -3655,6 +3658,9 @@ irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data)
 {
 	struct apple_dcp *dcp = data;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		return IRQ_WAKE_THREAD;
+
 	WRITE_ONCE(dcp->hdmi_edge_jiffies, jiffies);
 	WRITE_ONCE(dcp->hdmi_edge_seen, true);
 	dcp_hdmi_hpd_edge(data);
@@ -3975,6 +3981,9 @@ static void dcp_hdmi_update_locked(struct apple_dcp *dcp)
 irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 {
 	struct apple_dcp *dcp = data;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		return dcp_desktop_dp2hdmi_hpd(dcp);
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 	dcp_hdmi_update_locked(dcp);

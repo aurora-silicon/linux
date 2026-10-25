@@ -2788,6 +2788,25 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		iomfb_v26_6_flush(dcp, crtc, commit);
 		return;
 	}
+
+	/*
+	 * Desktop 26.x external display replugged while the compositor kept
+	 * its CRTC active: no atomic enable follows, and the firmware, which
+	 * powered the pipe off with the unplug, swallows every swap.  Run the
+	 * power-on and mode set the enable would have run, once.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	    dcp->desktop->ext_pipe_off && !dcp->main_display &&
+	    !READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected)) {
+		struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(commit, crtc);
+
+		if (cs && cs->active && cs->mode.hdisplay) {
+			dev_dbg(dcp->dev, "re-powering the external pipe of an active CRTC\n");
+			dcp_poweron(pdev);
+			dcp_crtc_atomic_modeset(crtc, commit);
+		}
+	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		iomfb_v14_7_flush(dcp, crtc, commit);
 		return;

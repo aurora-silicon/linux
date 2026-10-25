@@ -2391,6 +2391,9 @@ dcpep_cb_hotplug_v26_6(struct apple_dcp *dcp, struct dcp_hotplug_req_v26_6 *req)
 	    (!connected || (dcp->connector &&
 			    READ_ONCE(dcp->connector->connected) != !!connected)))
 		dcp->desktop->mode_live = false;
+	/* The firmware shuts an external pipe down with its display. */
+	if (!dcp->main_display && !connected)
+		dcp->desktop->ext_pipe_off = true;
 
 	dcpep_cb_hotplug(dcp, &connected);
 

@@ -216,14 +216,14 @@ module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
 
 /*
- * T6041 (M4 Pro/Max) external display processors are not driven yet.  They
- * stay out of the display's DRM device unless asked for; see
- * dcp_t6041_ext_enabled().
+ * T6041 (M4 Pro/Max) external display processors, whose nodes the boot
+ * environment enables before the module loads.  t6041_dcpext=0 keeps them
+ * out of the display's DRM device and off the hardware.
  */
-static bool t6041_dcpext;
+static bool t6041_dcpext = true;
 module_param(t6041_dcpext, bool, 0444);
 MODULE_PARM_DESC(t6041_dcpext,
-		 "T6041: let the external display processors join the DRM device (default 0; not driven yet, development only)");
+		 "T6041: drive the external display processors (default 1; 0 leaves them alone)");
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -1891,10 +1891,222 @@ static int dcp_dptx_connect_tile(struct apple_dcp *dcp)
 	return ret;
 }
 
+/*
+ * Desktop 26.x external processors (T6041 dcpext0 HDMI, dcpext1 USB-C).
+ * They keep the classic external model of the driver this was ported from:
+ * no Type-C display fabric, the DPTX link set up on HPD (HDMI) or on the
+ * DP alt mode hotplug of the port (USB-C), and the Type-C port chosen
+ * dynamically from the PHY that entered DP alt mode.
+ */
+/* The caller holds hpd_mutex, which also orders dcp->phy against a connect. */
+static int dcp_desktop_dyn_route_select_locked(struct apple_dcp *dcp)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	unsigned int i;
+	int ret;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (!d->ndyn || d->dyn_active >= 0)
+		return 0;
+	for (i = 0; i < d->ndyn; i++)
+		if (apple_t6040_phy_dp_alt(d->dyn_phy[i]))
+			break;
+	if (i == d->ndyn) {
+		dev_dbg(dcp->dev, "no Type-C port in DP alt mode\n");
+		return -ENODEV;
+	}
+	ret = mux_control_select(d->dyn_xbar[i], d->dyn_mux_index);
+	if (ret) {
+		dev_warn(dcp->dev, "Type-C port %u: crossbar select: %d\n", i, ret);
+		return ret;
+	}
+	ret = phy_init(d->dyn_phy[i]);
+	if (!ret) {
+		ret = phy_power_on(d->dyn_phy[i]);
+		if (ret)
+			phy_exit(d->dyn_phy[i]);
+	}
+	if (ret) {
+		dev_warn(dcp->dev, "Type-C port %u: DP PHY init/power: %d\n", i, ret);
+		mux_control_deselect(d->dyn_xbar[i]);
+		return ret;
+	}
+	msleep(25);
+	dcp->phy = d->dyn_phy[i];
+	dcp->xbar = d->dyn_xbar[i];
+	dcp->dptx_phy = d->dyn_dptx_phy[i];
+	d->dyn_active = i;
+	dev_dbg(dcp->dev, "Type-C port %u selected (DPTX target PHY %u, crossbar state %u)\n",
+		i, dcp->dptx_phy, d->dyn_mux_index);
+	return 0;
+}
+
+static void dcp_desktop_dyn_route_release_locked(struct apple_dcp *dcp)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	int i = d->dyn_active;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (!d->ndyn || i < 0)
+		return;
+	d->dyn_active = -1;
+	dcp->phy = NULL;
+	dcp->xbar = NULL;
+	phy_power_off(d->dyn_phy[i]);
+	phy_exit(d->dyn_phy[i]);
+	mux_control_deselect(d->dyn_xbar[i]);
+	dev_dbg(dcp->dev, "Type-C port %u released\n", i);
+}
+
+/* Unbind: a selected route holds its crossbar and its powered PHY. */
+static void dcp_desktop_dyn_route_release(struct apple_dcp *dcp)
+{
+	if (!dcp->desktop)
+		return;
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_desktop_dyn_route_release_locked(dcp);
+}
+
+static int dcp_desktop_dptx_connect(struct apple_dcp *dcp, u32 port)
+{
+	struct dptx_port *dptx = &dcp->dptxport[port];
+	unsigned long left;
+	bool selected;
+	int ret = 0;
+
+	mutex_lock(&dcp->hpd_mutex);
+	/* A route selected here is released again if the connect fails. */
+	selected = !dcp->phy && dcp->desktop->ndyn;
+	if (selected) {
+		ret = dcp_desktop_dyn_route_select_locked(dcp);
+		if (ret)
+			goto out_unlock;
+	}
+	if (!dcp->phy) {
+		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	if (!dptx_service_available(dptx)) {
+		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %u not enabled\n",
+			 port);
+		ret = -ENODEV;
+		goto out_release;
+	}
+	if (dptx->connected)
+		goto out_unlock;
+
+	reinit_completion(&dptx->linkcfg_completion);
+	dptx->atcphy = dcp->phy;
+	ret = dptxport_connect(dptx->service, 0, dcp->dptx_phy, dcp->dptx_die, true);
+	if (ret) {
+		dev_warn(dcp->dev, "DPTX port %u: connect failed: %d\n", port, ret);
+		goto out_release;
+	}
+	ret = dptxport_request_display(dptx->service);
+	if (ret) {
+		dev_warn(dcp->dev, "DPTX port %u: display request failed: %d\n",
+			 port, ret);
+		goto out_release;
+	}
+	dptx->connected = true;
+
+	/*
+	 * The firmware does not take HPD from the DP2HDMI converter on its
+	 * own ("HPD not present, skipping mode export"): assert it right
+	 * after the display request.
+	 */
+	if (READ_ONCE(dptx->service->ep->compact)) {
+		ret = dptxport_set_hpd(dptx->service, true);
+		if (ret)
+			dev_warn(dcp->dev, "DPTX port %u: set_hpd(1): %d\n", port, ret);
+		ret = 0;
+	}
+	mutex_unlock(&dcp->hpd_mutex);
+
+	/* Without a sink the link is configured once one arrives. */
+	left = wait_for_completion_timeout(&dptx->linkcfg_completion,
+					   DPTX_CONNECT_TIMEOUT);
+	if (!left)
+		dev_dbg(dcp->dev, "DPTX port %u: no link configuration yet\n", port);
+
+	usleep_range(5, 10);
+
+	if (dcp->avep)
+		av_service_connect(dcp);
+	return 0;
+
+out_release:
+	if (selected)
+		dcp_desktop_dyn_route_release_locked(dcp);
+out_unlock:
+	mutex_unlock(&dcp->hpd_mutex);
+	return ret;
+}
+
+static int dcp_desktop_dptx_disconnect_oob(struct apple_dcp *dcp, u32 port)
+{
+	int ret;
+
+	disconnected_hpd_event(dcp->connector);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (dptx_service_available(&dcp->dptxport[port]))
+			dptxport_set_hpd(dcp->dptxport[port].service, false);
+	}
+	ret = dcp_dptx_disconnect(dcp, port);
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp_desktop_dyn_route_release_locked(dcp);
+	if (!dcp->main_display)
+		dcp->desktop->ext_pipe_off = true;
+	return ret;
+}
+
+/*
+ * HDMI HPD of a desktop 26.x external processor.  A disconnect is left to
+ * the firmware, which detects it itself.  A cold plug after boot finds the
+ * port connected without a sink: the firmware never saw this HPD, so pulse
+ * the AP-asserted HPD to make it export the modes now.
+ */
+irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
+{
+	struct dptx_port *dptx = &dcp->dptxport[0];
+	bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+	int ret;
+
+	if (connected) {
+		msleep(500);
+		connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+	}
+	dev_dbg(dcp->dev, "DP2HDMI HPD irq, connected:%d after 500 ms\n", connected);
+	if (!connected)
+		return IRQ_HANDLED;
+
+	mutex_lock(&dcp->hpd_mutex);
+	if (dptx_service_available(dptx) && dptx->connected &&
+	    READ_ONCE(dptx->service->ep->compact)) {
+		ret = dptxport_set_hpd(dptx->service, false);
+		msleep(100);
+		ret = dptxport_set_hpd(dptx->service, true) ?: ret;
+		mutex_unlock(&dcp->hpd_mutex);
+		dev_dbg(dcp->dev, "HDMI cold plug: HPD pulse on the connected port: %d\n",
+			ret);
+		return IRQ_HANDLED;
+	}
+	mutex_unlock(&dcp->hpd_mutex);
+
+	dcp_dptx_connect(dcp, 0);
+	return IRQ_HANDLED;
+}
+
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	struct dcp_fabric_session session = {};
 	int ret;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		return dcp_desktop_dptx_connect(dcp, port);
 
 	if (!dcp_is_external_h17p(dcp)) {
 		if (dcp_typec_sessionless(dcp)) {
@@ -2480,6 +2692,9 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		return dcp_desktop_dptx_connect(dcp, port);
+
 	if (dcp_is_external_h17p(dcp)) {
 		bool new_cable;
 
@@ -2520,6 +2735,9 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		return dcp_desktop_dptx_disconnect_oob(dcp, port);
 
 	if (dcp_is_external_h17p(dcp))
 		return dcp_external_disconnect(dcp, true);
@@ -2678,6 +2896,13 @@ bool dcp_ext_unusable(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	return !dcp || READ_ONCE(dcp->ext_dead);
+}
+
+bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 }
 
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
@@ -2850,14 +3075,101 @@ static void dcp_desktop_graph_skip(struct apple_dcp *dcp, u32 endpoint,
 			endpoint, name, reason);
 }
 
+/*
+ * The external processors (T6041 dcpext): DPDEV, DPAVCTRL (all four
+ * controller interfaces), DPSAC, AV and REMOTEALLOC as advertised, then
+ * with a DP PHY or a Type-C route iBoot, the DPTX port services on EPIC2C,
+ * DPAVSERV for the EDID, EXPERT and EPIC25, and the DPTX connect of port 0.
+ * A failure fails this processor's start; the panel is not affected.
+ */
+static int dcp_desktop_start_ext_ep(struct apple_dcp *dcp, u32 map, u32 endpoint,
+				    const char *name)
+{
+	int ret;
+
+	if (!(map & BIT(endpoint - 0x20))) {
+		dcp_desktop_graph_skip(dcp, endpoint, name, "not advertised", 0);
+		return 0;
+	}
+	ret = dcp_desktop_start_ep(dcp, endpoint, dcp_compact_aux_ops);
+	if (ret)
+		return dev_err_probe(dcp->dev, ret, "Failed to start %s endpoint\n",
+				     name);
+	dcp->desktop->graph_started |= BIT(endpoint - 0x20);
+	return 0;
+}
+
+static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	int ret, dptx_ret;
+
+	ret = dcp_desktop_start_ext_ep(dcp, map, DPDEV_ENDPOINT, "DPDEV");
+	if (ret)
+		return ret;
+	ret = dcp_desktop_start_dpavctrl(dcp);
+	if (ret)
+		return dev_err_probe(dcp->dev, ret,
+				     "Failed to initialize DPAVCTRL endpoint\n");
+	d->graph_started |= BIT(DPAV_CTRL_ENDPOINT - 0x20);
+	ret = dcp_desktop_start_ext_ep(dcp, map, DPSAC_ENDPOINT, "DPSAC");
+	if (ret)
+		return ret;
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	if (hdmi_audio)
+		ret = avep_init(dcp);
+	else
+#endif
+		ret = dcp_desktop_start_ext_ep(dcp, map, AV_ENDPOINT, "AV");
+	if (ret)
+		return ret;
+	ret = dcp_desktop_start_ext_ep(dcp, map, REMOTE_ALLOC_ENDPOINT,
+				       "REMOTEALLOC");
+	if (ret)
+		return ret;
+
+	if (!dcp->phy && !d->ndyn) {
+		dev_warn(dcp->dev, "no DP PHY and no Type-C route: no display link\n");
+		return 0;
+	}
+
+	ret = ibootep_init(dcp);
+	if (ret)
+		dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n", ret);
+
+	/* The DPTX port services live on EPIC2C here. */
+	dptx_ret = dptxep_init_desktop(dcp, EPIC2C_ENDPOINT);
+	if (dptx_ret)
+		dev_warn(dcp->dev, "Failed to start DPTX port services: %d\n",
+			 dptx_ret);
+
+	if (unstable_edid) {
+		ret = dpavservep_init(dcp);
+		if (ret)
+			return dev_err_probe(dcp->dev, ret,
+					     "Failed to start DPAVSERV endpoint\n");
+	}
+	ret = dcp_desktop_start_ext_ep(dcp, map, DCP_EXPERT_ENDPOINT, "EXPERT");
+	if (ret)
+		return ret;
+	ret = dcp_desktop_start_ext_ep(dcp, map, EPIC25_ENDPOINT, "EPIC25");
+	if (ret)
+		return ret;
+
+	if (!dptx_ret && dptx_service_available(&dcp->dptxport[0])) {
+		ret = dcp_dptx_connect(dcp, 0);
+		if (ret)
+			dev_info(dcp->dev, "no DPTX link at startup: %d\n", ret);
+	}
+	return 0;
+}
+
 static int dcp_start_desktop(struct apple_dcp *dcp)
 {
 	struct dcp_desktop_state *d = dcp->desktop;
 	u32 map = 0;
 	int i, ep, ret;
 
-	if (dcp_desktop_external(dcp))
-		return -EOPNOTSUPP;
 	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -ENODEV;
 
@@ -2884,6 +3196,13 @@ static int dcp_start_desktop(struct apple_dcp *dcp)
 		return dev_err_probe(dcp->dev, ret,
 				     "Failed to start IOMFB transport endpoint\n");
 
+	if (dcp_desktop_external(dcp)) {
+		ret = dcp_start_desktop_external(dcp, map);
+		if (ret)
+			return ret;
+		goto start_iomfb;
+	}
+
 	for (i = 0; i < ARRAY_SIZE(dcp_desktop_panel_eps); i++) {
 		u32 endpoint = dcp_desktop_panel_eps[i].endpoint;
 		const char *name = dcp_desktop_panel_eps[i].name;
@@ -2908,6 +3227,7 @@ static int dcp_start_desktop(struct apple_dcp *dcp)
 		}
 		d->graph_started |= BIT(endpoint - 0x20);
 	}
+start_iomfb:
 	dev_info(dcp->dev, "endpoints started %#010x, skipped %#010x\n",
 		 d->graph_started, d->graph_skipped);
 
@@ -3209,6 +3529,8 @@ void dcp_poweron(struct platform_device *pdev)
 		dcp->desktop->trial_powered = false;
 		return;
 	}
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		dcp->desktop->ext_pipe_off = false;
 
 	if (iomfb_is_m4(dcp)) {
 		ret = dcp_backlight_dpms(dcp, true);
@@ -4232,16 +4554,6 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (dcp->external_prepared)
 		return 0;
 
-	/*
-	 * The T6041 external processors' start is not implemented yet.  The
-	 * failsafe keeps such a processor out of the DRM device without
-	 * touching it.
-	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	    dcp_desktop_external(dcp))
-		return dev_err_probe(dev, -EOPNOTSUPP,
-				     "T6041 external display processor start is not implemented\n");
-
 	/* A timed-out prior session may still scan these mappings. */
 	mutex_lock(&dcp->swapped_out_fbs_lock);
 	ret = list_empty(&dcp->swapped_out_fbs) ? 0 : -EBUSY;
@@ -4261,6 +4573,12 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		if (IS_ERR(dcp->coproc_reg))
 			return PTR_ERR(dcp->coproc_reg);
 	}
+
+	/* Record the state the boot loader handed the coprocessor over in. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		dev_info(dev, "coprocessor handoff: CPU_CONTROL %#x CPU_STATUS %#x\n",
+			 readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
+			 readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
 
 	/*
 	 * Display coprocessors running H17-generation firmware are left running
@@ -4643,6 +4961,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		dcp->systemep = NULL;
 	}
 
+	dcp_desktop_dyn_route_release(dcp);
+
 	/*
 	 * The auxiliary endpoints a desktop 26.x start brought up, still
 	 * routed while their shutdown is acknowledged.
@@ -4741,6 +5061,74 @@ static int dcp_native_routes_error(struct apple_dcp *dcp, int err)
 	dev_err(dcp->dev, "Type-C display routes unusable: %d; USB-C ports go on without this processor\n",
 		err);
 	dcp_typec_routes_disable(dcp);
+	return 0;
+}
+
+static void dcp_desktop_phy_off(void *data)
+{
+	struct phy *phy = data;
+
+	phy_power_off(phy);
+	phy_exit(phy);
+}
+
+/*
+ * The outputs of a desktop 26.x external processor (T6041 dcpext): the
+ * fixed HDMI route's DP PHY is powered here, as the boot loader's working
+ * sequence does; a dynamic Type-C route lists the DP PHY and crossbar of
+ * every port (dp-phyN, dp-xbarN, apple,dptx-phys, apple,dptx-mux-index),
+ * and the one in DP alt mode is claimed at connect.
+ */
+static int dcp_desktop_probe_routes(struct apple_dcp *dcp)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct device *dev = dcp->dev;
+	unsigned int i;
+	int nd, ret;
+
+	d->dyn_active = -1;
+	if (!dcp_desktop_external(dcp))
+		return 0;
+
+	if (dcp->phy) {
+		ret = phy_init(dcp->phy);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to initialize dp-phy\n");
+		ret = phy_power_on(dcp->phy);
+		if (ret) {
+			phy_exit(dcp->phy);
+			return dev_err_probe(dev, ret, "Failed to power on dp-phy\n");
+		}
+		ret = devm_add_action_or_reset(dev, dcp_desktop_phy_off, dcp->phy);
+		if (ret)
+			return ret;
+		msleep(25);
+	}
+
+	nd = of_property_count_u32_elems(dev->of_node, "apple,dptx-phys");
+	if (nd <= 0)
+		return 0;
+	if (nd > ARRAY_SIZE(d->dyn_phy))
+		return dev_err_probe(dev, -EINVAL, "too many Type-C routes: %d\n", nd);
+
+	for (i = 0; i < nd; i++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "dp-phy%u", i);
+		d->dyn_phy[i] = devm_phy_get(dev, name);
+		if (IS_ERR(d->dyn_phy[i]))
+			return dev_err_probe(dev, PTR_ERR(d->dyn_phy[i]), "%s\n", name);
+		snprintf(name, sizeof(name), "dp-xbar%u", i);
+		d->dyn_xbar[i] = devm_mux_control_get(dev, name);
+		if (IS_ERR(d->dyn_xbar[i]))
+			return dev_err_probe(dev, PTR_ERR(d->dyn_xbar[i]), "%s\n", name);
+		of_property_read_u32_index(dev->of_node, "apple,dptx-phys", i,
+					   &d->dyn_dptx_phy[i]);
+	}
+	of_property_read_u32(dev->of_node, "apple,dptx-mux-index", &d->dyn_mux_index);
+	d->ndyn = nd;
+	dev_info(dev, "%u Type-C DP routes, crossbar state %u\n", d->ndyn,
+		 d->dyn_mux_index);
 	return 0;
 }
 
@@ -4928,6 +5316,12 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	}
 	dcp->fixed_phy = dcp->phy;
 
+	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		ret = dcp_desktop_probe_routes(dcp);
+		if (ret)
+			return ret;
+	}
+
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
 		num_surfs = 0;
@@ -5038,6 +5432,10 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		}
 		if (IS_ERR(dcp->dp2hdmi_pwren))
 			return PTR_ERR(dcp->dp2hdmi_pwren);
+		/* The converter rails must be stable before DCP requests the link. */
+		if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+		    (dcp->hdmi_pwren || dcp->dp2hdmi_pwren))
+			msleep(100);
 
 		/*
 		 * A DCP may have both a fixed HDMI/DP route and allocatable Type-C
@@ -5211,10 +5609,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	void *group;
 	int ret;
 
-	/* Not driven yet: stay off the hardware unless asked for. */
+	/* t6041_dcpext=0: stay off the external processors' hardware. */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") &&
 	    !t6041_dcpext) {
-		dev_info(dev, "T6041 external display processor left alone (appledrm.t6041_dcpext=0)\n");
+		dev_info(dev, "T6041 external display processor left alone (t6041_dcpext=0)\n");
 		return -ENODEV;
 	}
 
