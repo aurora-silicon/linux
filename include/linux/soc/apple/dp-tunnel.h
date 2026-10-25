@@ -52,6 +52,14 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
 int apple_atc_dp_tunnel_open(struct phy *phy);
 
 /*
+ * T6040 Type-C PHY: true while the Type-C controller holds the PHY's port in
+ * DisplayPort alt mode with pin assignment C or E (DP on all four lanes), so
+ * appledrm can route a DCP that lists several Type-C DP PHYs to the one that
+ * has a DisplayPort sink plugged.
+ */
+bool apple_t6040_phy_dp_alt(struct phy *phy);
+
+/*
  * Display crossbar: take the connection of an already selected output down or
  * bring it back up (clock gates and enables) around a link reconfiguration.
  * The mux selection is left alone; link_down() also leaves the ATC output

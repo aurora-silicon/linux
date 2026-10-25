@@ -43,9 +43,12 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset-controller.h>
+#include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/usb/typec_altmode.h>
+#include <linux/usb/typec_dp.h>
 
 #define T6040_USB2_USBCTL		0x00
 #define T6040_USB2_USBCTL_MODE		GENMASK(2, 0)
@@ -101,6 +104,16 @@
 #define T6040_PIPEHANDLER_NONSELECTED_MODE	GENMASK(3, 0)
 #define T6040_PIPEHANDLER_NONSELECTED_BUSY	BIT(12)
 #define T6040_PIPEHANDLER_DUMMY_PHY_READY	BIT(15)
+
+/*
+ * DisplayPort (PHY mode 3). Offsets are into the "core" and "cfg" windows
+ * the USB3 path uses; names follow the paired AppleT6040TypeCPhy driver.
+ */
+#define T6040_CORE_AUX_CTRL		0x28000	/* ACIOPHY_AUX_TOP_BLK_AUX_CTRL */
+#define T6040_CORE_AUX_PWR		0x28400	/* ACIOPHY_AUX_SHM_BLK_AUX_PWR_REG */
+
+#define T6040_CFG_DP_CLKSWITCH_CTRL	0x14	/* ATCPHY_DP_CLKSWITCH_CONTROL_REGS */
+#define T6040_CFG_DP_CLKSWITCH_STAT	0x18	/* ATCPHY_DP_CLKSWITCH_STATUS_REGS */
 
 /* PHY core ("core"), atc-phy reg[2] and the blocks behind it */
 #define T6040_CORE_CMN_OVRD		0x0c	/* CFG0_TOP */
@@ -214,6 +227,7 @@ struct t6040_usb2_phy {
 	struct phy *usb3;
 	bool usb3_ok;
 	void __iomem *regs[T6040_USB3_NR_REGIONS];
+	struct resource *res[T6040_USB3_NR_REGIONS];
 	struct resource *cpu_data;
 	struct apple_tunable *tunables[T6040_USB3_NR_TUNABLES];
 	struct apple_tunable *tunable_pipehandler;
@@ -224,6 +238,15 @@ struct t6040_usb2_phy {
 	enum typec_orientation orientation;
 	bool usb3_up;		/* tuned by the coprocessor this power cycle */
 	bool pipe_switched;	/* the controller's PIPE runs on this PHY */
+
+	/* DisplayPort (PHY mode 3); dp_ok is false when the DT lacks a DP route */
+	struct phy *dp;
+	struct typec_mux_dev *mux;
+	bool dp_ok;
+	bool dp_up;		/* DP mode is programmed on the PHY */
+	bool dp_alt;		/* the Type-C port is in DP alt mode, pin assignment C/E */
+	bool dp_flip;		/* plug orientation reversed for the DP lanes */
+	int dp_rate;		/* link rate index of the running link sequence, -1 = off */
 };
 
 static inline void t6040_usb2_mask32(void __iomem *reg, u32 mask, u32 set)
@@ -906,16 +929,13 @@ sleep:
 	return 0;
 }
 
-static int t6040_usb3_power_off(struct phy *phy)
+/* aciophy_phy_shutdown with the lock held: lanes, coprocessor, then the CFG block. */
+static void t6040_usb3_down_locked(struct t6040_usb2_phy *tphy)
 {
-	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
-
-	guard(mutex)(&tphy->lock);
 	if (tphy->pipe_switched) {
 		t6040_usb3_pipe_park(tphy);
 		tphy->pipe_switched = false;
 	}
-	/* aciophy_phy_shutdown: lanes, coprocessor, then the CFG block */
 	if (tphy->usb3_up) {
 		u32 uc = readl(t6040_core(tphy) + T6040_CORE_UC_CTRL);
 
@@ -928,6 +948,14 @@ static int t6040_usb3_power_off(struct phy *phy)
 			 readl(t6040_cfg(tphy) + T6040_CFG_STATUS));
 		tphy->usb3_up = false;
 	}
+}
+
+static int t6040_usb3_power_off(struct phy *phy)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+
+	guard(mutex)(&tphy->lock);
+	t6040_usb3_down_locked(tphy);
 	return 0;
 }
 
@@ -972,6 +1000,591 @@ static int t6040_usb3_sw_set(struct typec_switch_dev *sw, enum typec_orientation
 static void t6040_usb3_switch_unregister(void *sw)
 {
 	typec_switch_unregister(sw);
+}
+
+/* ---- DisplayPort (PHY mode 3: DP on all four lanes) ----
+ *
+ * The fixed DP PHY of an HDMI converter (no USB controller, no pipehandler)
+ * and a Type-C PHY whose port the Type-C controller has put into DP alt mode
+ * with pin assignment C or E are brought up the same way, as the paired
+ * AppleT6040TypeCPhy driver does for its mode 3: wake the CFG block, apply the
+ * generic ADT tunables and the DPTX tunables, set the lane crossbar to DP on
+ * all lanes, hold the common block and both TX lanes on (the PHY coprocessor
+ * does not run in this mode) and release the PHY reset. The DCP then sets the
+ * link rate through phy_configure(): the per-rate link sequence is the T6050
+ * fixed-DP table (atc-t6050-dp-data.h; the T6050 ADT names its PHY
+ * "atc-phy,t6050", "atc-phy,t6040"), followed by the T6040 DP clock switch in
+ * the "cfg" window. Pin assignment D (two DP lanes next to USB3) is not
+ * supported.
+ */
+
+/* The fixed DPTX tunable writes (apply_dptx_tunables, shared with USB3). */
+static void t6040_dp_fixed_tunables(void __iomem *core)
+{
+	static const struct { u32 off, clear, set; } dptx[] = {
+		{ 0x00800, 0x000003f0, 0x000001c0 },	/* AUS40CMN_DIG RCAL0 */
+		{ 0x00818, 0x0000f000, 0x00003000 },	/* AUS40CMN_DIG RCAL5 */
+		{ 0x03888, 0x000000ff, 0x00000027 },	/* CIO4PLL FREQDESCRIPTOR_0_C */
+		{ 0x28004, 0x00000038, 0x00000008 },	/* AUX_LDO_CTRL */
+		{ 0x03adc, 0x00003ff0, 0x00001760 },	/* CIO4PLL CFG_FRACN_FUNC */
+		{ 0x0e0cc, 0x01f80000, 0x00380000 },	/* LANE0 TX_EQ_CTRL_REG11 */
+		{ 0x1e0cc, 0x01f80000, 0x00380000 },	/* LANE1 TX_EQ_CTRL_REG11 */
+		{ 0x0d090, 0x01f80000, 0x00380000 },	/* LANE0 RX_CFG TX_EQ_CTRL_REG11 */
+		{ 0x1d090, 0x01f80000, 0x00380000 },	/* LANE1 RX_CFG TX_EQ_CTRL_REG11 */
+	};
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(dptx); i++)
+		t6040_usb2_mask32(core + dptx[i].off, dptx[i].clear, dptx[i].set);
+}
+
+/* aciophy_xbar_config for PHY mode 3 (DP on all four lanes). */
+static void t6040_dp_xbar_config(struct t6040_usb2_phy *tphy, bool flip)
+{
+	void __iomem *core = t6040_core(tphy);
+
+	/* core+0x6c, orientation-independent for DP */
+	t6040_usb2_mask32(core + T6040_CORE_XBAR, ~0xfc3fff03u, 0x48);
+	/* core+0x78: lanes[4:0] = 0x14, then [17:5] by orientation */
+	t6040_usb2_mask32(core + T6040_CORE_XBAR_LANES, 0x1f, 0x14);
+	t6040_usb2_mask32(core + T6040_CORE_XBAR_LANES, 0x3ffe0, flip ? 0x100 : 0x22000);
+	/* core+0x6c[1:0] = 2 (common to every mode) */
+	t6040_usb2_mask32(core + T6040_CORE_XBAR, 0x3, 0x2);
+}
+
+/*
+ * aciophy_dptx_adjust_lane_mode: the core+0x6c lane fields [4:2] and [7:5]
+ * are 7 for every DP 1.x link rate (UHBR rates would use 2).
+ */
+static void t6040_dp_adjust_lane_mode(struct t6040_usb2_phy *tphy)
+{
+	t6040_usb2_set32(t6040_core(tphy) + T6040_CORE_XBAR, 0x1c | 0xe0);
+}
+
+/* aciophy_aux_init: the DP AUX block. */
+static void t6040_dp_aux_init(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *core = t6040_core(tphy);
+
+	t6040_usb2_set32(core + T6040_CORE_AUX_PWR, 0x3);
+	t6040_usb2_set32(core + T6040_CORE_AUX_PWR, 0xc);
+	t6040_usb2_mask32(core + T6040_CORE_AUX_PWR, 0x300, 0x100);
+	t6040_usb2_clear32(core + T6040_CORE_AUX_CTRL, 0x1);
+}
+
+/*
+ * aciophy_configure_dp_clks: the two DP clock switches of the "cfg" window
+ * (control at 0x14, status at 0x18). Each switch enables its pixel clock,
+ * requests the two PMGR DP clocks and releases the requests one by one once
+ * they are acknowledged. On the J616s the pixel-clock enable is acknowledged
+ * with the enable bit alone and the PMGR acknowledgements arrive with the
+ * 0x400 (SWITCH1) / 0x800 (SWITCH2) bit set next to the requests; the
+ * requests are retried without that bit should the acknowledgment not come.
+ */
+static int t6040_dp_configure_clks(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *cfg = t6040_cfg(tphy);
+	u32 s;
+	int ret;
+
+#define DP_CLK_POLL(bit, set) \
+	readl_poll_timeout(cfg + T6040_CFG_DP_CLKSWITCH_STAT, s, \
+			   !!(s & BIT(bit)) == (set), 10, 200000)
+
+	/* SWITCH1: pixel clock, then the PMGR DP0/DP1 requests */
+	t6040_usb2_mask32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x473, 0x10);
+	ret = DP_CLK_POLL(0, true);
+	if (ret)
+		goto timeout;
+	t6040_usb2_set32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x60 | 0x400);
+	ret = DP_CLK_POLL(2, true) ?: DP_CLK_POLL(1, true);
+	if (ret) {
+		dev_dbg(tphy->dev, "DP clock switch 1: no PMGR ack with 0x400 (status %#x)\n", s);
+		t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x400);
+		ret = DP_CLK_POLL(2, true) ?: DP_CLK_POLL(1, true);
+		if (ret)
+			goto timeout;
+	}
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x20);
+	ret = DP_CLK_POLL(1, false);
+	if (ret)
+		goto timeout;
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x40);
+	ret = DP_CLK_POLL(2, false);
+	if (ret)
+		goto timeout;
+
+	/* SWITCH2, the same way */
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x403);
+	t6040_usb2_mask32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0xb8c, 0x80);
+	ret = DP_CLK_POLL(3, true);
+	if (ret)
+		goto timeout;
+	t6040_usb2_set32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x300 | 0x800);
+	ret = DP_CLK_POLL(5, true) ?: DP_CLK_POLL(4, true);
+	if (ret) {
+		dev_dbg(tphy->dev, "DP clock switch 2: no PMGR ack with 0x800 (status %#x)\n", s);
+		t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x800);
+		ret = DP_CLK_POLL(5, true) ?: DP_CLK_POLL(4, true);
+		if (ret)
+			goto timeout;
+	}
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x100);
+	ret = DP_CLK_POLL(4, false);
+	if (ret)
+		goto timeout;
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x200);
+	ret = DP_CLK_POLL(5, false);
+	if (ret)
+		goto timeout;
+	t6040_usb2_clear32(cfg + T6040_CFG_DP_CLKSWITCH_CTRL, 0x80c);
+	dev_dbg(tphy->dev, "DP clock switches on (ctrl %#x status %#x)\n",
+		readl(cfg + T6040_CFG_DP_CLKSWITCH_CTRL),
+		readl(cfg + T6040_CFG_DP_CLKSWITCH_STAT));
+	return 0;
+
+timeout:
+	dev_err(tphy->dev, "DP clock switch timed out (ctrl %#x status %#x)\n",
+		readl(cfg + T6040_CFG_DP_CLKSWITCH_CTRL),
+		readl(cfg + T6040_CFG_DP_CLKSWITCH_STAT));
+	return ret;
+#undef DP_CLK_POLL
+}
+
+/* A PHY without the USB3 pieces (the HDMI converter's) only ever does DP. */
+static bool t6040_dp_only(struct t6040_usb2_phy *tphy)
+{
+	return !tphy->usb3_ok;
+}
+
+/* apply_tunables' generic tables: the first six of t6040_usb3_tunable_list. */
+#define T6040_DP_NR_GENERIC_TUNABLES	6
+
+/*
+ * slpctrl_init for DP on both lanes: the cmn_rm_ovrd/txrx_rm_ovrd releases of
+ * t6040_usb3_lanes for lane 0 and lane 1 (USB3 releases only the plug's lane).
+ * Without the PHY coprocessor nothing powers the common block and the TX lanes
+ * once their overrides are released, so they are held on by override: the
+ * reverse of aciophy_cmn_shutdown / aciophy_tx_powerdown, with the override
+ * enables (0x2a; 0x4/0x40/0x400 per lane) set.
+ */
+static void t6040_dp_slpctrl(struct t6040_usb2_phy *tphy)
+{
+	void __iomem *core = t6040_core(tphy);
+	unsigned int lane;
+
+	t6040_usb2_set32(core + T6040_CORE_CMN_BIAS, T6040_CORE_CMN_BIAS_BGBIAS_EN_OV);
+	udelay(1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, T6040_CORE_CMN_OVRD_SLEEP_B_SML | 0x2a);
+	udelay(1);
+	t6040_usb2_set32(core + T6040_CORE_CMN_OVRD, T6040_CORE_CMN_OVRD_SLEEP_B_BIG);
+	udelay(1);
+	t6040_usb2_clear32(core + T6040_CORE_CMN_OVRD, T6040_CORE_CMN_OVRD_CLAMP);
+	udelay(1);
+	for (lane = 0; lane < 2; lane++) {
+		t6040_usb2_set32(core + T6040_CORE_SLP_CTRL, (0x4 | 0x40 | 0x400) << lane);
+		t6040_usb2_set32(core + T6040_CORE_SLP_CTRL, 0x10 << lane);
+		udelay(1);
+		t6040_usb2_set32(core + T6040_CORE_SLP_CTRL, 0x1 << lane);
+		udelay(1);
+		t6040_usb2_clear32(core + T6040_CORE_SLP_CTRL, 0x100 << lane);
+		udelay(1);
+	}
+	dev_dbg(tphy->dev, "DP lanes held on: cmn_ovrd %#x slp_ctrl %#x bias %#x\n",
+		readl(core + T6040_CORE_CMN_OVRD), readl(core + T6040_CORE_SLP_CTRL),
+		readl(core + T6040_CORE_CMN_BIAS));
+}
+
+/*
+ * aciophy_phy_init for mode 3: wake the CFG block (shared with USB3), apply
+ * the generic ADT tables and the DPTX tunables, xbar_config, slpctrl_init and
+ * the reset deassert of partC (no coprocessor firmware in this mode).
+ */
+static int t6040_dp_phy_init(struct t6040_usb2_phy *tphy, bool flip)
+{
+	void __iomem *cfg = t6040_cfg(tphy);
+	size_t i;
+	int ret;
+
+	ret = t6040_usb3_wake(tphy);
+	if (ret)
+		return ret;
+	for (i = 0; i < T6040_DP_NR_GENERIC_TUNABLES; i++)
+		apple_tunable_apply(tphy->regs[t6040_usb3_tunable_list[i].region],
+				    tphy->tunables[i]);
+	t6040_dp_fixed_tunables(t6040_core(tphy));
+	t6040_dp_xbar_config(tphy, flip);
+	t6040_dp_slpctrl(tphy);
+	t6040_usb2_set32(cfg + T6040_CFG_CTRL, T6040_CFG_CTRL_PHY_RESET_N);
+	fsleep(100);
+	dev_dbg(tphy->dev, "DP PHY init (mode 3): cfg %#x/%#x\n",
+		readl(cfg + T6040_CFG_CTRL), readl(cfg + T6040_CFG_STATUS));
+	return 0;
+}
+
+/* aciophy_dptx_main_init up to the link rate, which .configure sets. */
+static void t6040_dp_mode_setup(struct t6040_usb2_phy *tphy, bool flip)
+{
+	t6040_dp_fixed_tunables(t6040_core(tphy));
+	t6040_dp_xbar_config(tphy, flip);
+	t6040_dp_adjust_lane_mode(tphy);
+	t6040_dp_aux_init(tphy);
+}
+
+/*
+ * The per-rate link sequences of the T6050 fixed DP PHY, which shares the
+ * ATC PHY core with the T6040. Bank numbers are the atc-phy "reg" indices of
+ * the T6050/T6040 ADT; banks 2..34 are offsets into "core". Bank 39 is the
+ * T6050 clock shim; on the T6040 the DP clock switch of the "cfg" window
+ * stands in for it and runs after the lane program, as AppleT6040TypeCPhy
+ * does. The sequences hold no power-domain or tunable steps that apply here.
+ */
+enum atc_operation { ATC_MASK, ATC_TUNABLE, ATC_DELAY, ATC_POLL, ATC_POWER };
+struct atc_op {
+	u8 op, bank;
+	u16 offset;
+	u32 mask, value, timeout;
+};
+
+struct atc_rate_op {
+	struct atc_op op;
+	u8 rates;
+	u32 values[4];
+};
+
+#include "atc-t6050-dp-data.h"
+
+static const struct { u8 bank; u32 offset; } t6040_dp_core_banks[] = {
+	{2, 0}, {3, 0x400}, {4, 0x800}, {5, 0xa00}, {6, 0x1000},
+	{7, 0x3000}, {8, 0x3200}, {9, 0x3800}, {10, 0x3a00},
+	{14, 0x7000}, {16, 0x9000}, {18, 0xb000}, {19, 0xc000},
+	{20, 0xd000}, {21, 0xe000}, {22, 0xf000}, {25, 0x19000},
+	{27, 0x1b000}, {28, 0x1c000}, {29, 0x1d000}, {30, 0x1e000},
+	{31, 0x1f000}, {33, 0x28000}, {34, 0x28400},
+};
+
+static void __iomem *t6040_dp_bank(struct t6040_usb2_phy *tphy, u8 bank)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(t6040_dp_core_banks); i++)
+		if (t6040_dp_core_banks[i].bank == bank)
+			return t6040_core(tphy) + t6040_dp_core_banks[i].offset;
+	return NULL;
+}
+
+static int t6040_dp_seq_step(struct t6040_usb2_phy *tphy, const struct atc_op *s)
+{
+	void __iomem *reg;
+	u32 v;
+	int ret;
+
+	if (s->op == ATC_DELAY) {
+		udelay(s->value);
+		return 0;
+	}
+	if (s->op == ATC_POWER || s->op == ATC_TUNABLE || s->bank == 39)
+		return 0;
+	reg = t6040_dp_bank(tphy, s->bank);
+	if (!reg) {
+		dev_err(tphy->dev, "DP link sequence: no bank %u\n", s->bank);
+		return -EINVAL;
+	}
+	reg += s->offset;
+	if (s->op == ATC_MASK) {
+		writel((readl(reg) & ~s->mask) | s->value, reg);
+		return 0;
+	}
+	ret = readl_poll_timeout(reg, v, (v & s->mask) == s->value,
+				 s->timeout > 1000 ? 1000 : 1, s->timeout);
+	if (ret)
+		dev_err(tphy->dev, "DP link sequence: bank %u+%#x timed out: %#x & %#x != %#x\n",
+			s->bank, s->offset, v, s->mask, s->value);
+	return ret;
+}
+
+/* Take the link down if it is up, then bring it up at rate index @idx (-1: off). */
+static int t6040_dp_set_rate(struct t6040_usb2_phy *tphy, int idx)
+{
+	size_t i;
+	int ret;
+
+	if (tphy->dp_rate >= 0) {
+		for (i = 0; i < ARRAY_SIZE(dp_link_off); i++) {
+			ret = t6040_dp_seq_step(tphy, &dp_link_off[i]);
+			if (ret)
+				return ret;
+		}
+		tphy->dp_rate = -1;
+	}
+	if (idx < 0)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(dp_link_on); i++) {
+		struct atc_op op = dp_link_on[i].op;
+
+		if (!(dp_link_on[i].rates & BIT(idx)))
+			continue;
+		op.value = dp_link_on[i].values[idx];
+		ret = t6040_dp_seq_step(tphy, &op);
+		if (ret)
+			return ret;
+	}
+	ret = t6040_dp_configure_clks(tphy);
+	if (ret)
+		return ret;
+	tphy->dp_rate = idx;
+	dev_dbg(tphy->dev, "DP link on, rate index %d\n", idx);
+	return 0;
+}
+
+/* Drive settings of the T6050 sequence: lanes 0/1 on PMA group 1, 2/3 on group 0. */
+static void t6040_dp_drive(struct t6040_usb2_phy *tphy, unsigned int lane, u32 preset)
+{
+	unsigned int group = lane < 2 ? 1 : 0;
+	bool tx = lane & 1;
+	void __iomem *base = t6040_dp_bank(tphy, (tx ? 21 : 20) + 9 * group);
+	u32 ctrl = ((preset >> 2) & 0xf) | ((preset & 3) << 14);
+	u32 eq = ((preset >> 5) & 0x7fffe) | 1;
+
+	if (tx)
+		t6040_usb2_mask32(base + 0x100, BIT(20), BIT(20));
+	t6040_usb2_mask32(base + (tx ? 0x58 : 0x68), 0xc00f, ctrl);
+	t6040_usb2_mask32(base + (tx ? 0x104 : 0xac), BIT(29), BIT(29));
+	t6040_usb2_mask32(base + (tx ? 0x100 : 0xa8), 0x7ffff, eq);
+}
+
+/* ---- DP phy_ops ---- */
+
+static int t6040_dp_power_on(struct phy *phy)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+	int ret;
+
+	guard(mutex)(&tphy->lock);
+	if (!tphy->dp_ok || tphy->dp_up)
+		return 0;
+	/*
+	 * A Type-C PHY in DP alt mode (pin assignment C/E) hands all four
+	 * lanes to DP: aciophy_phy_shutdown of the USB3 side first, then the
+	 * same mode-3 init as the fixed DP PHY.
+	 */
+	if (!t6040_dp_only(tphy))
+		t6040_usb3_down_locked(tphy);
+	ret = t6040_dp_phy_init(tphy, tphy->dp_flip);
+	if (ret) {
+		dev_err(tphy->dev, "DP PHY init failed: %d\n", ret);
+		return ret;
+	}
+	t6040_dp_mode_setup(tphy, tphy->dp_flip);
+	tphy->dp_rate = -1;
+	tphy->dp_up = true;
+	dev_dbg(tphy->dev, "DP PHY mode set, lane map %s\n",
+		tphy->dp_flip ? "reversed" : "normal");
+	return 0;
+}
+
+static int t6040_dp_power_off(struct phy *phy)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+
+	guard(mutex)(&tphy->lock);
+	tphy->dp_up = false;
+	return 0;
+}
+
+/* GET_MAX_LANE_COUNT: DP on all four lanes in mode 3. */
+static int t6040_dp_validate(struct phy *phy, enum phy_mode mode, int submode,
+			     union phy_configure_opts *opts_)
+{
+	struct phy_configure_opts_dp *opts = &opts_->dp;
+
+	if (mode != PHY_MODE_DP)
+		return -EINVAL;
+	opts->lanes = 4;
+	return 0;
+}
+
+static int t6040_dp_configure(struct phy *phy, union phy_configure_opts *opts_)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+	struct phy_configure_opts_dp *opts = &opts_->dp;
+	int idx = -1;
+	int ret;
+
+	guard(mutex)(&tphy->lock);
+	if (!tphy->dp_up)
+		return -EINVAL;
+
+	if (opts->set_rate) {
+		switch (opts->link_rate) {
+		case 1620:
+			idx = 0;
+			break;
+		case 2700:
+			idx = 1;
+			break;
+		case 5400:
+			idx = 2;
+			break;
+		case 8100:
+			idx = 3;
+			break;
+		case 0:
+			idx = -1;
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (idx != tphy->dp_rate) {
+			ret = t6040_dp_set_rate(tphy, idx);
+			if (ret)
+				return ret;
+		}
+	}
+	if (opts->set_voltages && tphy->dp_rate >= 0) {
+		unsigned int i;
+
+		for (i = 0; i < opts->lanes && i < 4; i++) {
+			unsigned int v = min_t(unsigned int, opts->voltage[i], 3);
+			unsigned int pe = min_t(unsigned int, opts->pre[i], 3);
+
+			t6040_dp_drive(tphy, i, dp_training_default[4 * v + pe]);
+		}
+	}
+	return 0;
+}
+
+/* ACTIVATE/DEACTIVATE: PHY_MODE_DP, submode = the DCP's DPTX port index. */
+static int t6040_dp_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	if (mode == PHY_MODE_DP || mode == PHY_MODE_INVALID)
+		return 0;
+	return -EOPNOTSUPP;
+}
+
+static const struct phy_ops t6040_dp_phy_ops = {
+	.owner = THIS_MODULE,
+	.power_on = t6040_dp_power_on,
+	.power_off = t6040_dp_power_off,
+	.configure = t6040_dp_configure,
+	.validate = t6040_dp_validate,
+	.set_mode = t6040_dp_set_mode,
+};
+
+/* ---- Type-C mode switch: the Type-C controller asks for DP on a USB-C port ---- */
+
+static int t6040_dp_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+	struct t6040_usb2_phy *tphy = typec_mux_get_drvdata(mux);
+	bool dp = state->alt && state->alt->svid == USB_TYPEC_DP_SID;
+	bool alt = false;
+
+	guard(mutex)(&tphy->lock);
+	tphy->dp_flip = (tphy->orientation == TYPEC_ORIENTATION_REVERSE);
+	/*
+	 * Latch the DP alt mode state for the DCP's Type-C route. Pin
+	 * assignments C and E put DP on all four lanes (PHY mode 3, as the
+	 * fixed DP route); D (two DP lanes next to USB3, PHY mode 4 with the
+	 * coprocessor) is not supported. The DP lanes themselves are brought
+	 * up by the DCP through phy_power_on()/phy_configure() on the DP phy.
+	 */
+	if (dp) {
+		switch (state->mode) {
+		case TYPEC_DP_STATE_C:
+		case TYPEC_DP_STATE_E:
+			alt = true;
+			break;
+		case TYPEC_DP_STATE_D:
+			dev_warn_once(tphy->dev, "Type-C mux: DP pin assignment D (two lanes next to USB3) not supported\n");
+			break;
+		default:
+			break;
+		}
+	}
+	tphy->dp_alt = alt;
+	dev_dbg(tphy->dev, "Type-C mux: %s state %lu -> DP alt mode %d, lane map %s\n",
+		dp ? "DP" : "non-DP", state->mode, alt, tphy->dp_flip ? "reversed" : "normal");
+	if (alt && tphy->dp_up)
+		t6040_dp_xbar_config(tphy, tphy->dp_flip);
+	return 0;
+}
+
+/* For the DCP's Type-C route: is this PHY's port in DP alt mode (C/E)? */
+bool apple_t6040_phy_dp_alt(struct phy *phy)
+{
+	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
+
+	return tphy && tphy->dp_alt;
+}
+EXPORT_SYMBOL_GPL(apple_t6040_phy_dp_alt);
+
+static void t6040_dp_mux_unregister(void *mux)
+{
+	typec_mux_unregister(mux);
+}
+
+/*
+ * Everything the DP route needs from the device tree; a node without it gets
+ * no DP phy. A USB-C PHY offers DP through a Type-C mode switch; a fixed DP
+ * route (an HDMI converter's PHY) is driven straight by the DCP with no mux
+ * and uses the normal lane map.
+ */
+static int t6040_dp_probe(struct t6040_usb2_phy *tphy)
+{
+	struct device *dev = tphy->dev;
+	unsigned int i;
+
+	tphy->dp_rate = -1;
+
+	/*
+	 * DP mode needs the "core" and "cfg" windows. A USB-C PHY has them
+	 * alongside its USB regions; a fixed DP PHY has them without any
+	 * pipehandler or USB3 coprocessor. A node with neither is USB2 only.
+	 */
+	if (!tphy->regs[T6040_USB3_CORE] || !tphy->regs[T6040_USB3_CFG])
+		return 0;
+
+	tphy->dp = devm_phy_create(dev, NULL, &t6040_dp_phy_ops);
+	if (IS_ERR(tphy->dp))
+		return PTR_ERR(tphy->dp);
+	phy_set_drvdata(tphy->dp, tphy);
+
+	/* DP-only node: the generic apply_tunables tables (absent = not applied). */
+	if (t6040_dp_only(tphy)) {
+		for (i = 0; i < T6040_DP_NR_GENERIC_TUNABLES; i++) {
+			const char *prop = t6040_usb3_tunable_list[i].prop;
+
+			if (!of_property_present(dev->of_node, prop) ||
+			    !tphy->res[t6040_usb3_tunable_list[i].region]) {
+				dev_warn(dev, "DP: no %s\n", prop);
+				continue;
+			}
+			struct resource *res = tphy->res[t6040_usb3_tunable_list[i].region];
+
+			tphy->tunables[i] = devm_apple_tunable_parse(dev, dev->of_node, prop, res);
+			if (IS_ERR(tphy->tunables[i])) {
+				dev_warn(dev, "DP: %s: %pe\n", prop, tphy->tunables[i]);
+				tphy->tunables[i] = NULL;
+			}
+		}
+	}
+
+	if (of_property_present(dev->of_node, "mode-switch")) {
+		struct typec_mux_desc mux_desc = {
+			.drvdata = tphy,
+			.fwnode = dev_fwnode(dev),
+			.set = t6040_dp_mux_set,
+		};
+
+		tphy->mux = typec_mux_register(dev, &mux_desc);
+		if (IS_ERR(tphy->mux))
+			return PTR_ERR(tphy->mux);
+		if (devm_add_action_or_reset(dev, t6040_dp_mux_unregister, tphy->mux))
+			return -ENOMEM;
+	}
+
+	tphy->dp_ok = true;
+	return 0;
 }
 
 /* ---- the coprocessor's RTKit ---- */
@@ -1028,6 +1641,33 @@ static const struct apple_rtkit_ops t6040_cpu_rtkit_ops = {
 };
 
 /*
+ * Map the PHY register windows shared by the USB3 and DisplayPort paths. Each
+ * is optional: a USB-C PHY has the full set, the fixed HDMI DP PHY (atcphy3)
+ * lacks none of core/cfg but has no pipehandler. Returns true once at least
+ * "core" and "cfg" are mapped, which is all DP mode needs.
+ */
+static bool t6040_map_regions(struct t6040_usb2_phy *tphy, struct platform_device *pdev)
+{
+	struct device *dev = tphy->dev;
+	size_t i;
+
+	for (i = 0; i < T6040_USB3_NR_REGIONS; i++) {
+		tphy->res[i] = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							    t6040_usb3_region_names[i]);
+		if (!tphy->res[i])
+			continue;
+		tphy->regs[i] = devm_ioremap_resource(dev, tphy->res[i]);
+		if (IS_ERR(tphy->regs[i])) {
+			dev_warn(dev, "\"%s\" region: %pe\n",
+				 t6040_usb3_region_names[i], tphy->regs[i]);
+			tphy->regs[i] = NULL;
+			tphy->res[i] = NULL;
+		}
+	}
+	return tphy->regs[T6040_USB3_CORE] && tphy->regs[T6040_USB3_CFG];
+}
+
+/*
  * Everything USB3 needs from the device tree. A missing piece leaves the
  * port at USB2; only a mailbox that has not probed yet defers.
  */
@@ -1040,7 +1680,6 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 		.set = t6040_usb3_sw_set,
 	};
 	struct typec_switch_dev *sw;
-	struct resource *res[T6040_USB3_NR_REGIONS];
 	struct resource *ph;
 	size_t i;
 	int ret;
@@ -1066,17 +1705,9 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 		return ret;
 
 	for (i = 0; i < T6040_USB3_NR_REGIONS; i++) {
-		res[i] = platform_get_resource_byname(pdev, IORESOURCE_MEM,
-						      t6040_usb3_region_names[i]);
-		if (!res[i]) {
+		if (!tphy->regs[i]) {
 			dev_warn(dev, "USB3: no \"%s\" region, USB2 only\n",
 				 t6040_usb3_region_names[i]);
-			return 0;
-		}
-		tphy->regs[i] = devm_ioremap_resource(dev, res[i]);
-		if (IS_ERR(tphy->regs[i])) {
-			dev_warn(dev, "USB3: \"%s\" region: %pe, USB2 only\n",
-				 t6040_usb3_region_names[i], tphy->regs[i]);
 			return 0;
 		}
 	}
@@ -1090,7 +1721,7 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 	for (i = 0; i < T6040_USB3_NR_TUNABLES; i++) {
 		tphy->tunables[i] =
 			devm_apple_tunable_parse(dev, dev->of_node, t6040_usb3_tunable_list[i].prop,
-						 res[t6040_usb3_tunable_list[i].region]);
+						 tphy->res[t6040_usb3_tunable_list[i].region]);
 		if (IS_ERR(tphy->tunables[i])) {
 			dev_warn(dev, "USB3: %s: %pe, USB2 only\n",
 				 t6040_usb3_tunable_list[i].prop, tphy->tunables[i]);
@@ -1206,6 +1837,8 @@ static struct phy *t6040_usb2_xlate(struct device *dev,
 		return tphy->phy;
 	case PHY_TYPE_USB3:
 		return tphy->usb3;
+	case PHY_TYPE_DP:
+		return tphy->dp;
 	default:
 		return ERR_PTR(-ENODEV);
 	}
@@ -1267,22 +1900,37 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 		return PTR_ERR(tphy->phy);
 	phy_set_drvdata(tphy->phy, tphy);
 
-	tphy->pipehandler = devm_platform_ioremap_resource_byname(pdev, "pipehandler");
-	if (IS_ERR(tphy->pipehandler))
-		return dev_err_probe(dev, PTR_ERR(tphy->pipehandler),
-				     "failed to map pipehandler bank\n");
+	/*
+	 * The USB-C PHYs have a pipehandler and drive a dwc3 (reset provider);
+	 * the fixed HDMI DP PHY (atcphy3) has neither. Map it and register the
+	 * reset controller only when present, so a DP-only node still probes.
+	 */
+	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "pipehandler")) {
+		tphy->pipehandler = devm_platform_ioremap_resource_byname(pdev,
+									  "pipehandler");
+		if (IS_ERR(tphy->pipehandler))
+			return dev_err_probe(dev, PTR_ERR(tphy->pipehandler),
+					     "failed to map pipehandler bank\n");
 
-	tphy->rcdev.owner = THIS_MODULE;
-	tphy->rcdev.nr_resets = 1;
-	tphy->rcdev.ops = &t6040_usb2_reset_ops;
-	tphy->rcdev.of_node = dev->of_node;
-	tphy->rcdev.of_reset_n_cells = 0;
-	tphy->rcdev.of_xlate = t6040_usb2_reset_xlate;
-	ret = devm_reset_controller_register(dev, &tphy->rcdev);
+		tphy->rcdev.owner = THIS_MODULE;
+		tphy->rcdev.nr_resets = 1;
+		tphy->rcdev.ops = &t6040_usb2_reset_ops;
+		tphy->rcdev.of_node = dev->of_node;
+		tphy->rcdev.of_reset_n_cells = 0;
+		tphy->rcdev.of_xlate = t6040_usb2_reset_xlate;
+		ret = devm_reset_controller_register(dev, &tphy->rcdev);
+		if (ret)
+			return ret;
+	}
+
+	/* Map the core/cfg (and USB3) windows once; both sub-probes share them. */
+	t6040_map_regions(tphy, pdev);
+
+	ret = t6040_usb3_probe(tphy, pdev);
 	if (ret)
 		return ret;
 
-	ret = t6040_usb3_probe(tphy, pdev);
+	ret = t6040_dp_probe(tphy);
 	if (ret)
 		return ret;
 
@@ -1306,5 +1954,5 @@ static struct platform_driver t6040_usb2_driver = {
 module_platform_driver(t6040_usb2_driver);
 
 MODULE_AUTHOR("The Asahi Linux Contributors");
-MODULE_DESCRIPTION("Apple T6040 Type-C PHY, USB2 and USB3 host");
+MODULE_DESCRIPTION("Apple T6040 Type-C PHY, USB2/USB3 host and DisplayPort");
 MODULE_LICENSE("Dual BSD/GPL");

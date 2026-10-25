@@ -32,23 +32,26 @@ config PHY_APPLE_ATC_KUNIT_TEST
 	  If unsure, say N.
 
 config PHY_APPLE_T6040_USB2
-	tristate "Apple T6040 Type-C PHY (USB2 and USB3 host)"
+	tristate "Apple T6040 Type-C PHY (USB2/USB3 host, DisplayPort)"
 	depends on ARM64 && ARCH_APPLE
 	depends on TYPEC
 	depends on APPLE_RTKIT
 	select GENERIC_PHY
 	select APPLE_TUNABLE
 	help
-	  Build the PHY provider for the T6040 generation's Type-C ports. It
-	  implements the USB2 host sequence and the USB3 host attach decoded
-	  from the paired AppleT6040TypeCPhy driver, including the start of
-	  the PHY coprocessor, and provides no device mode, DisplayPort,
-	  USB4/Thunderbolt or retimer support.
+	  Build the PHY provider for the T6040 generation's Type-C ports and
+	  fixed DisplayPort PHYs. It implements the USB2 host sequence and the
+	  USB3 host attach decoded from the paired AppleT6040TypeCPhy driver,
+	  including the start of the PHY coprocessor, and the DisplayPort mode
+	  (all four lanes, RBR to HBR3) a Type-C controller selects through the
+	  PHY's mode switch or that an HDMI converter's PHY runs permanently.
+	  It provides no device mode, DisplayPort pin assignment D, USB4,
+	  Thunderbolt or retimer support.
 
 	  This driver performs no ATC-register writes at probe time. Enabling a
-	  matching device-tree node causes MMIO writes when a USB2 consumer
-	  powers on the PHY and therefore requires platform-specific safety
-	  review.
+	  matching device-tree node causes MMIO writes when a USB2, USB3 or
+	  DisplayPort consumer powers on the PHY and therefore requires
+	  platform-specific safety review.
 
 config PHY_APPLE_DPTX
 	tristate "Apple DPTX PHY"
