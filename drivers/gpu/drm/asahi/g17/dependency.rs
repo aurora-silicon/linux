@@ -89,3 +89,19 @@ impl Frontier {
         self.insert(sequence, dependency)
     }
 }
+
+#[kunit_tests(asahi_g17_dependency)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_predecessor_cannot_be_bypassed() {
+        let mut frontier = Frontier::new();
+        for error in [ECANCELED, EIO, ETIMEDOUT] {
+            assert_eq!(frontier.include(Some(5), 5, error.to_errno(), 0), Err(ECANCELED));
+        }
+        assert_eq!(frontier.include(Some(5), 5, 1, 0), Ok(()));
+        assert_eq!(frontier.include(Some(5), 6, EIO.to_errno(), 0), Ok(()));
+        assert_eq!(frontier.count, 0);
+    }
+}

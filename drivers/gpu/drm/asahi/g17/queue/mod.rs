@@ -255,8 +255,9 @@ impl<B: Backend> Queue<B> {
             })
         });
         let failure_count = failures.iter().flatten().count();
-        let mut dependencies =
-            KVec::with_capacity(inputs.len() + count + timestamp_count + failure_count, GFP_KERNEL)?;
+        let mut dependencies = KVec::with_capacity(
+            inputs.len() + count + timestamp_count + failure_count, GFP_KERNEL,
+        )?;
         let mut checked_inputs =
             KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
