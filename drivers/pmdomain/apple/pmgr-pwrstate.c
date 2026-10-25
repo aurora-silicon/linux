@@ -522,7 +522,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (active && !ps->firmware_owned && !ps->inherited_on &&
 	    of_property_read_bool(node, "apple,no-auto-pm")) {
 		ret = regmap_update_bits(regmap, ps->offset,
-					 APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE, 0);
+					 APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE |
+					 APPLE_PMGR_BUSY, 0);
 		if (ret)
 			return dev_err_probe(dev, ret, "cannot disable auto-PM\n");
 	} else if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable) {
