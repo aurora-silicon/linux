@@ -66,6 +66,8 @@ struct tas2764_priv {
 
 	int v_sense_slot;
 	int i_sense_slot;
+	/* TAS2764_CLK_CFG value for a fixed BCLK/FS ratio, or -1 to auto-detect */
+	int bclk_ratio_code;
 
 	bool dac_powered;
 	bool unmuted;
@@ -1067,6 +1069,26 @@ static const struct hwmon_chip_info tas2764_hwmon_chip_info = {
 	.info	= tas2764_hwmon_info,
 };
 
+/*
+ * Program the fixed BCLK/FS ratio from ti,bclk-ratio (tas2764_parse_bclk_ratio()).
+ * Without one nothing is written: the amplifier auto-detects the ratio.
+ */
+static int tas2764_apply_bclk_ratio(struct tas2764_priv *tas2764)
+{
+	int ret;
+
+	if (tas2764->bclk_ratio_code < 0)
+		return 0;
+
+	ret = regmap_write(tas2764->regmap, TAS2764_CLK_CFG, tas2764->bclk_ratio_code);
+	if (ret < 0)
+		return ret;
+
+	return regmap_update_bits(tas2764->regmap, TAS2764_TDM_CFG0,
+				  TAS2764_TDM_CFG0_FIXED_RATIO,
+				  TAS2764_TDM_CFG0_FIXED_RATIO);
+}
+
 static int tas2764_codec_probe(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
@@ -1180,6 +1202,10 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 	default:
 		break;
 	}
+
+	ret = tas2764_apply_bclk_ratio(tas2764);
+	if (ret < 0)
+		goto err_sdz;
 
 	/*
 	 * Last, so that no failure leaves the handler behind. The component owns the IRQ and
@@ -1499,6 +1525,41 @@ static int tas2764_parse_tx_zd_config(struct device *dev, struct tas2764_priv *t
 	return 0;
 }
 
+/*
+ * BCLK/FS ratios and the TAS2764_CLK_CFG value that makes the amplifier
+ * accept them. Only the J873 speaker frame (250 BCLKs, which the ratio
+ * auto-detection rejects with "bad TDM clock") is verified on hardware;
+ * other ratios are left to the auto-detection.
+ */
+static const struct {
+	u16 ratio;
+	u8 code;
+} tas2764_bclk_ratio_codes[] = {
+	{ 250, 0x30 },
+};
+
+/*
+ * ti,bclk-ratio: a fixed BCLK/FS ratio, as its TAS2764_CLK_CFG code in
+ * bclk_ratio_code. Without the property bclk_ratio_code stays -1, set before
+ * the device tree is read, and the ratio is auto-detected.
+ */
+static int tas2764_parse_bclk_ratio(struct device *dev, struct tas2764_priv *tas2764)
+{
+	u32 ratio;
+	int i;
+
+	if (device_property_read_u32(dev, "ti,bclk-ratio", &ratio))
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(tas2764_bclk_ratio_codes); i++)
+		if (tas2764_bclk_ratio_codes[i].ratio == ratio)
+			tas2764->bclk_ratio_code = tas2764_bclk_ratio_codes[i].code;
+	if (tas2764->bclk_ratio_code < 0)
+		return dev_err_probe(dev, -EINVAL, "unsupported ti,bclk-ratio %u\n", ratio);
+
+	return 0;
+}
+
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
 	int ret = 0;
@@ -1559,6 +1620,10 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 	if (ret)
 		return ret;
 
+	ret = tas2764_parse_bclk_ratio(dev, tas2764);
+	if (ret)
+		return ret;
+
 	return tas2764_group_join(dev, tas2764);
 }
 
@@ -1580,6 +1645,8 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 	result = devm_mutex_init(&client->dev, &tas2764->fault_lock);
 	if (result)
 		return result;
+	/* Auto-detect the ratio unless the firmware node sets one. */
+	tas2764->bclk_ratio_code = -1;
 	i2c_set_clientdata(client, tas2764);
 	dev_set_drvdata(&client->dev, tas2764);
 
