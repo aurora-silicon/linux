@@ -3,7 +3,6 @@
  * G16 (T8132, M4) helpers that have no Rust bindings: static inlines,
  * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G16.
  */
-#include <crypto/sha2.h>
 #include <linux/device.h>
 #include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
@@ -23,7 +22,6 @@
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/thermal.h>
 
-void asahi_g16_sha256(const u8 *data, size_t len, u8 *out);
 bool asahi_g16_board(void);
 int asahi_g16_hold_power(struct device *dev);
 void asahi_g16_module_get(void);
@@ -143,12 +141,6 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
 	apple_pmp_cooling_observe(&cooling->policy, now, *governor);
 	*backstop = apple_pmp_cooling_level(&cooling->policy);
 	return ret;
-}
-
-/* SHA-256 of the firmware TEXT and the board templates. */
-void asahi_g16_sha256(const u8 *data, size_t len, u8 *out)
-{
-	sha256(data, len, out);
 }
 
 /* Whether this is a qualified J713/T8132 board. */

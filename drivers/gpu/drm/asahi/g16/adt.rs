@@ -191,7 +191,7 @@ pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
         "M4 original ADT performance source PA={:#x} bytes={:#x} sha256={} states={}\n",
         source_pa,
         copy.len(),
-        super::identity::Hex(&glue::sha256(&copy)),
+        crate::fwid::Hex(&crate::fwid::sha256(&copy)),
         performance.count
     );
     let [ttbs, tables, handoff, shared_l2, text, data] = regions;

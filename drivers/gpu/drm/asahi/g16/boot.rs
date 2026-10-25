@@ -30,7 +30,7 @@ use super::fw::initdata::control;
 use super::hw;
 use super::initdata::{self, InitData};
 use super::object::Objects;
-use super::{identity, regs, uat, Config, Shared};
+use super::{regs, uat, Config, Shared};
 use crate::driver::AsahiDrmDevice;
 use crate::{mmu, regs as shared_regs};
 use kernel::io::Io;
@@ -41,7 +41,6 @@ pub(crate) mod glue {
     use kernel::{device, prelude::*};
 
     extern "C" {
-        fn asahi_g16_sha256(data: *const u8, len: usize, out: *mut u8);
         fn asahi_g16_board() -> bool;
         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         fn asahi_g16_module_get();
@@ -59,14 +58,6 @@ pub(crate) mod glue {
             start: *mut u64,
             size: *mut u64,
         ) -> core::ffi::c_int;
-    }
-
-    /// SHA-256 (`sha256()`).
-    pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        // SAFETY: `data` is valid for its length and `out` holds the 32-byte digest.
-        unsafe { asahi_g16_sha256(data.as_ptr(), data.len(), out.as_mut_ptr()) };
-        out
     }
 
     /// A qualified J713/T8132 board.
@@ -445,7 +436,7 @@ pub(crate) fn admit(
     }
     let adt =
         adt::read(dev).inspect_err(|e| dev_err!(dev, "ADT GPU regions not admitted: {:?}\n", e))?;
-    identity::firmware(dev, &adt, cfg.firmware)
+    crate::fwid::identify(dev, adt.text.clone(), adt.data.end - adt.data.start, cfg.firmware)
         .inspect_err(|e| dev_err!(dev, "loaded GFX TEXT identity mismatch: {:?}\n", e))?;
     dev_info!(dev, "M4: firmware identity accepted\n");
     // Firmware objects are cleaned to the point of coherency by their DMA mapping: that needs

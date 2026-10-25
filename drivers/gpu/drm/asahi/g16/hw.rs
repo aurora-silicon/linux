@@ -18,15 +18,7 @@ pub(crate) struct HwId {
     pub(crate) counts: u32,
 }
 
-/// A qualified GPU firmware build, identified by its loaded TEXT.
-pub(crate) struct FirmwareBuild {
-    pub(crate) name: &'static str,
-    pub(crate) text_size: u64,
-    pub(crate) data_size: u64,
-    /// Offset of the GKTS marker in TEXT; the 8 entropy bytes after it are zeroed before hashing.
-    pub(crate) marker: u32,
-    pub(crate) text_sha256: [u8; 32],
-}
+pub(crate) use crate::fwid::FirmwareBuild;
 
 /// The J713/T8132 configuration. Hardware admission also checks the exact TEXT image.
 pub(crate) mod t8132 {
@@ -49,7 +41,7 @@ pub(crate) mod t8132 {
             name: "Apple GFX 25G83 (normalized loaded image)",
             text_size: 0x60000,
             data_size: 0x13c000,
-            marker: 0x5c8df,
+            entropy: [0x5c8df, 0x5c9c2],
             text_sha256: [
                 0x5f, 0x65, 0xf6, 0x14, 0x58, 0x72, 0x54, 0x70, 0xb4, 0xb0, 0xc0, 0x20, 0x28, 0x47,
                 0x7b, 0xf2, 0xea, 0x57, 0x3a, 0xfb, 0x4e, 0x0c, 0x49, 0x6e, 0xf9, 0x95, 0xe9, 0x6a,

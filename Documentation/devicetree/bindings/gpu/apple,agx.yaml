@@ -58,7 +58,9 @@ properties:
       - description:
           GPU calibration blob, preserved firmware text or firmware
           kernel-window page tables
-      - description: Shared global variables or preserved firmware data
+      - description:
+          Shared global variables, preserved firmware data or text segment of
+          the loaded GPU firmware
 
   memory-region-names:
     minItems: 3
@@ -68,7 +70,7 @@ properties:
       - const: handoff
       - enum: [hw-cal-a, shared-l2, fw-data]
       - enum: [hw-cal-b, fw-text, l2-pagetables]
-      - enum: [globals, fw-data]
+      - enum: [globals, fw-data, fw-text]
 
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -212,6 +214,9 @@ allOf:
             - description:
                 Region in which the GPU firmware builds the page tables of
                 its kernel window
+            - description:
+                Text segment of the loaded GPU firmware, which identifies the
+                firmware build
         memory-region-names:
           items:
             - const: ttbs
@@ -219,6 +224,7 @@ allOf:
             - const: handoff
             - const: fw-data
             - const: l2-pagetables
+            - const: fw-text
       required:
         - power-domains
         - operating-points-v2
