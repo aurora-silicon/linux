@@ -25,9 +25,17 @@ pub(crate) fn stamp_base() -> u64 {
 }
 
 /// Renders before the TA stamp wrap within which the TA/FS stamps are renumbered from their seeds,
-/// at the first moment with nothing in flight (0: never).
+/// at the first moment with nothing in flight (0: never). At least one prefix of renders, so
+/// that the last prefix published outside the margin cannot cross the wrap; at most half the
+/// stamp range.
 pub(crate) fn stamp_reseed_margin() -> u64 {
-    module_parameters::g15_stamp_reseed_margin.value() as u64
+    match module_parameters::g15_stamp_reseed_margin.value() as u64 {
+        0 => 0,
+        m => m.clamp(
+            hw::tuning::PREFIX_RENDERS as u64,
+            super::encode::RENDER_WRAP / 2,
+        ),
+    }
 }
 
 /// Host deadline of a published prefix without progress, ms (at least 100).

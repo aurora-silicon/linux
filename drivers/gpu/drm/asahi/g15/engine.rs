@@ -564,12 +564,17 @@ impl Firmware {
                 break;
             };
             let job = self.engine.pending[index].clone();
+            // Inside the renumbering margin nothing is published behind a flight: the flights
+            // drain and the next publication renumbers the stamps while idle (once every ~8.7M
+            // renders with a margin of 100000).
+            let renumber_due = self.renumber_due();
             if let Some(tail) = self.engine.flights.last() {
                 if self.engine.flights.len() >= max_inflight
                     || !Arc::ptr_eq(&job.vm, &tail.job.vm)
                     || self.recovery.reinit
                     || self.recovery.fs_resync
                     || self.engine.rebuild_live
+                    || renumber_due
                 {
                     self.engine.stats.hold[0] += (self.engine.flights.len() >= max_inflight) as u64;
                     break;
@@ -712,16 +717,22 @@ impl Firmware {
         result
     }
 
+    /// The TA stamp is inside its renumbering margin.
+    fn renumber_due(&self) -> bool {
+        let margin = params::stamp_reseed_margin();
+        let ordinal = (self.engine.draw + self.engine.stamp_base) % encode::STAMP_PERIOD;
+        margin != 0 && ordinal + margin >= encode::RENDER_WRAP
+    }
+
     /// Renumbers the TA/FS stamps from their seeds before the TA stamp wraps, after 0x860000
     /// renders (about six hours of desktop), where the firmware may stop. Only called with
     /// nothing in flight: the last flight retired with every stamp equal to its target, so both
     /// queues are idle and the next render waits on exactly the seeds written here.
     fn renumber_render_stamps(&mut self) -> Result {
-        let margin = params::stamp_reseed_margin();
-        let ordinal = (self.engine.draw + self.engine.stamp_base) % encode::STAMP_PERIOD;
-        if margin == 0 || ordinal + margin < encode::RENDER_WRAP {
+        if !self.renumber_due() {
             return Ok(());
         }
+        let ordinal = (self.engine.draw + self.engine.stamp_base) % encode::STAMP_PERIOD;
         let r = &self.graph.render;
         for (e, seed) in [ids::TA_SEED, ids::FS_SEED].into_iter().enumerate() {
             r.user_stamp[e].w32(0, seed)?;
