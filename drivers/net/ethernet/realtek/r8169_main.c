@@ -4706,8 +4706,8 @@ static void rtl8169_pcierr_interrupt(struct net_device *dev)
 	rtl_schedule_task(tp, RTL_FLAG_TASK_RESET_PENDING);
 }
 
-static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
-		   int budget)
+static unsigned int rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
+			   int budget)
 {
 	unsigned int dirty_tx, bytes_compl = 0, pkts_compl = 0;
 	struct sk_buff *skb;
@@ -4751,6 +4751,8 @@ static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 		if (READ_ONCE(tp->cur_tx) != dirty_tx && skb)
 			rtl8169_doorbell(tp);
 	}
+
+	return pkts_compl;
 }
 
 static inline int rtl8169_fragmented_frame(u32 status)
@@ -4916,13 +4918,18 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
 {
 	struct rtl8169_private *tp = container_of(napi, struct rtl8169_private, napi);
 	struct net_device *dev = tp->dev;
+	unsigned int tx_done;
 	int work_done;
 
-	rtl_tx(dev, tp, budget);
+	tx_done = rtl_tx(dev, tp, budget);
 
 	work_done = rtl_rx(dev, tp, budget);
 
-	if (work_done < budget && napi_complete_done(napi, work_done))
+	/* napi_defer_hard_irqs only applies when work was done; count Tx
+	 * completions too, so a Tx-only flow is not one IRQ per few packets.
+	 */
+	if (work_done < budget &&
+	    napi_complete_done(napi, work_done ?: min_t(unsigned int, tx_done, 1)))
 		rtl_irq_enable(tp);
 
 	return work_done;
