@@ -20,6 +20,8 @@
 #include <linux/seq_file.h>
 #include <linux/crc32.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
+#include <linux/minmax.h>
 #include <linux/workqueue.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_modes.h>
@@ -70,6 +72,9 @@ struct iomfb_m4 {
 	int error;
 	bool started, init_sent, ready, startup_started;
 	bool powered_off; /* setPowerState(0) for system sleep */
+	bool display_off; /* setPowerState(0) while blanked, until the next frame */
+	u64 display_off_cycles;
+	s64 display_off_us, display_off_us_max, display_on_us, display_on_us_max;
 	/* Exact completed successor or blank is the only framebuffer retirement. */
 	struct drm_framebuffer *active_fb;
 	struct drm_framebuffer *uncertain_fb;
@@ -78,6 +83,7 @@ struct iomfb_m4 {
 };
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp);
+static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on);
 static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word);
 
 static int dcp_m4_dart_check(struct device *dev)
@@ -1298,6 +1304,18 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 		ret = -EAGAIN;
 	if (!ret)
 		ret = iomfb_m4_check_frame(&frame);
+	/* The first frame after a blank powers the display back up. */
+	if (!ret && dcp->display_off) {
+		ktime_t start = ktime_get();
+
+		ret = dcp_m4_set_power_state(dcp, true);
+		if (!ret) {
+			dcp->display_off = false;
+			dcp->display_on_us = ktime_us_delta(ktime_get(), start);
+			dcp->display_on_us_max = max(dcp->display_on_us,
+						     dcp->display_on_us_max);
+		}
+	}
 	if (ret)
 		goto out;
 	/* Keep the source before the first work descriptor can become visible. */
@@ -1339,6 +1357,21 @@ int iomfb_m4_blank(struct apple_dcp *owner)
 		dcp->active_fb = NULL;
 		memset(&dcp->active_frame, 0, sizeof(dcp->active_frame));
 		dcp->blanks++;
+		/*
+		 * Nothing is scanned out until the next frame: power the display
+		 * down as system sleep does. A refusal fails the session, as there.
+		 */
+		if (!dcp->display_off) {
+			ktime_t start = ktime_get();
+
+			if (!dcp_m4_set_power_state(dcp, false)) {
+				dcp->display_off = true;
+				dcp->display_off_cycles++;
+				dcp->display_off_us = ktime_us_delta(ktime_get(), start);
+				dcp->display_off_us_max = max(dcp->display_off_us,
+							      dcp->display_off_us_max);
+			}
+		}
 	}
 	mutex_unlock(&dcp->lock);
 	if (retire)
@@ -1393,11 +1426,14 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 	if (dcp->active_fb) {
 		dev_warn(dcp->dev, "panel still scanning out: refusing system sleep\n");
 		ret = -EBUSY;
+	} else if (dcp->display_off) {
+		/* Already powered down by the blank; the next frame powers it up. */
+		ret = 0;
 	} else {
 		ret = dcp_m4_set_power_state(dcp, false);
+		if (!ret)
+			dcp->powered_off = true;
 	}
-	if (!ret)
-		dcp->powered_off = true;
 	mutex_unlock(&dcp->lock);
 	return ret;
 }
@@ -1499,6 +1535,10 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
 	seq_printf(s, "flips=%llu blanks=%llu backlight_swaps=%llu active=%u uncertain=%u\n",
 		   dcp->flips, dcp->blanks, dcp->brightness_swaps,
 		   !!dcp->active_fb, !!dcp->uncertain_fb);
+	seq_printf(s, "display_off=%u off_cycles=%llu off_us=%lld/%lld on_us=%lld/%lld\n",
+		   dcp->display_off, dcp->display_off_cycles,
+		   dcp->display_off_us, dcp->display_off_us_max,
+		   dcp->display_on_us, dcp->display_on_us_max);
 	mutex_unlock(&dcp->lock);
 	return 0;
 }
