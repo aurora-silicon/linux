@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/cpufreq/apple,cluster-cpufreq.yaml#
@@ -83,6 +83,16 @@ required:
   - compatible
   - reg
   - '#performance-domain-cells'
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-cluster-cpufreq
+    then:
+      required:
+        - apple,firmware-managed-thermal
 
 additionalProperties: false
 
