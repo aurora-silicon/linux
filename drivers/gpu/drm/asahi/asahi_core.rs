@@ -126,6 +126,10 @@ module! {
             // permissions: 0o644,
             description: "Initial TVB size in blocks",
         },
+        diag_quarantine_gpuro: u32 {
+            default: 0,
+            description: "Diagnostic: quarantine retired GPU-RO commands in a bounded FIFO",
+        },
         robust_isolation: u32 {
             default: 0,
             // permissions: 0o644,

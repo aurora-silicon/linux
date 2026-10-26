@@ -232,6 +232,8 @@ pub(crate) trait Allocator {
     }
     /// Collect garbage for this allocator, up to the given object count. Optional.
     fn collect_garbage(&mut self, _count: usize) {}
+    /// Collect the oldest garbage until at most `max_bytes` remain. Optional.
+    fn collect_garbage_excess(&mut self, _max_bytes: usize) {}
 
     /// Allocate a new GpuStruct object. See [`GpuObject::new`].
     #[inline(never)]
@@ -675,7 +677,7 @@ struct HeapAllocatorInner {
     dev: AsahiDevRef,
     allocated: usize,
     backing_objects: KVec<(crate::gem::ObjectRef, mmu::KernelMapping, u64)>,
-    garbage: Option<KVec<mm::Node<HeapAllocatorInner, HeapAllocationInner>>>,
+    garbage: Option<KVVec<mm::Node<HeapAllocatorInner, HeapAllocationInner>>>,
     total_garbage: usize,
     name: CString,
 }
@@ -730,7 +732,7 @@ impl HeapAllocator {
             // TODO: This clearly needs a try_clone() or similar
             name: CString::try_from_fmt(fmt!("{}", &*name))?,
             garbage: if keep_garbage {
-                Some(KVec::new())
+                Some(KVVec::new())
             } else {
                 None
             },
@@ -1079,6 +1081,28 @@ impl Allocator for HeapAllocator {
                 garbage.clear();
             }
         }
+    }
+
+    fn collect_garbage_excess(&mut self, max_bytes: usize) {
+        let count = self.mm.with_inner(|inner| {
+            let Some(garbage) = inner.garbage.as_ref() else {
+                return 0;
+            };
+            let mut bytes = inner.total_garbage;
+            let mut count = 0;
+
+            for node in garbage.iter() {
+                if bytes <= max_bytes {
+                    break;
+                }
+                bytes -= node.size() as usize;
+                count += 1;
+            }
+
+            count
+        });
+
+        self.collect_garbage(count);
     }
 }
 

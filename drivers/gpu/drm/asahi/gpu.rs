@@ -81,6 +81,7 @@ use crate::{
     initdata,
     mem,
     mmu,
+    module_parameters,
     queue,
     regs,
     stats,
@@ -148,6 +149,12 @@ const MAX_FW_ALLOC_GARBAGE_BYTES: usize = 16 * 1024 * 1024;
 /// This works out to 16K of memory in the garbage list (8 bytes each), which keeps us
 /// within the safe range for kmalloc (on 16K page systems).
 const MAX_FW_ALLOC_GARBAGE_OBJECTS: usize = 2048;
+
+// Diagnostic-only bound on the newest retired GPU-RO command ranges. This is intentionally
+// larger than the normal garbage threshold, but small enough for the 1 GiB experiment gate.
+// The lower target provides hysteresis so cache flushes are no more frequent than normal.
+const DIAG_GPU_RO_QUARANTINE_BYTES: usize = 64 * 1024 * 1024;
+const DIAG_GPU_RO_QUARANTINE_TARGET_BYTES: usize = 48 * 1024 * 1024;
 
 /// Global allocators used for kernel-half structures.
 pub(crate) struct KernelAllocators {
@@ -508,6 +515,14 @@ impl GpuManager::ver {
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
+
+        if module_parameters::diag_quarantine_gpuro.value() != 0 {
+            dev_warn!(
+                dev.as_ref(),
+                "DIAGNOSTIC: quarantining up to {} MiB of retired GPU-RO command ranges\n",
+                DIAG_GPU_RO_QUARANTINE_BYTES / (1024 * 1024)
+            );
+        }
 
         let mut alloc = KernelAllocators {
             private: alloc::DefaultAllocator::new(
@@ -1318,7 +1333,13 @@ impl GpuManager::ver {
 
         // The invalidation does a cache flush, so it is okay to collect garbage
         guard.private.collect_garbage(garbage_count);
-        guard.gpu_ro.collect_garbage(garbage_count_gpuro);
+        if module_parameters::diag_quarantine_gpuro.value() != 0 {
+            guard
+                .gpu_ro
+                .collect_garbage_excess(DIAG_GPU_RO_QUARANTINE_BYTES);
+        } else {
+            guard.gpu_ro.collect_garbage(garbage_count_gpuro);
+        }
 
         Ok(())
     }
@@ -1485,11 +1506,16 @@ impl GpuManager for GpuManager::ver {
         let mut guard = self.alloc.lock();
         let (garbage_count, garbage_bytes) = guard.private.garbage();
         let (ro_garbage_count, ro_garbage_bytes) = guard.gpu_ro.garbage();
+        let quarantine_gpuro = module_parameters::diag_quarantine_gpuro.value() != 0;
 
         if garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
-            || ro_garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
             || garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
-            || ro_garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
+            || if quarantine_gpuro {
+                ro_garbage_bytes > DIAG_GPU_RO_QUARANTINE_BYTES
+            } else {
+                ro_garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
+                    || ro_garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
+            }
         {
             mod_dev_dbg!(
                 self.dev,
@@ -1503,7 +1529,13 @@ impl GpuManager for GpuManager::ver {
                 dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
             } else {
                 guard.private.collect_garbage(garbage_count);
-                guard.gpu_ro.collect_garbage(ro_garbage_count);
+                if quarantine_gpuro {
+                    guard
+                        .gpu_ro
+                        .collect_garbage_excess(DIAG_GPU_RO_QUARANTINE_TARGET_BYTES);
+                } else {
+                    guard.gpu_ro.collect_garbage(ro_garbage_count);
+                }
             }
         }
 
