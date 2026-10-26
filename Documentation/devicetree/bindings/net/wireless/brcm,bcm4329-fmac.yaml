@@ -46,6 +46,7 @@ properties:
               - cypress,cyw4373-fmac
               - cypress,cyw43012-fmac
               - infineon,cyw43439-fmac
+              - pci14e4,4434  # BCM4388
           - const: brcm,bcm4329-fmac
       - enum:
           - brcm,bcm4329-fmac

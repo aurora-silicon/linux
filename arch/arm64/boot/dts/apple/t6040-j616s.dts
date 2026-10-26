@@ -569,7 +569,6 @@
 		device_type = "pci";
 
 		port00: pci@0,0 {
-			compatible = "pciclass,0604";
 			reg = <0 0 0 0 0>;
 			ranges;
 			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
@@ -592,7 +591,7 @@
 			};
 
 			wifi@0,0 {
-				compatible = "brcm,bcm4329-fmac";
+				compatible = "pci14e4,4434", "brcm,bcm4329-fmac";
 				reg = <0 0 0 0 0>;
 				brcm,ccode-map-trivial;
 				brcm,board-type = "apple,hostomel";
