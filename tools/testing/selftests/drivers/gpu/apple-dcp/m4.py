@@ -196,6 +196,20 @@ static void routes(void)
         assert(!dcp_m4_callback_ack(&packet, &ack));
         assert(ack == (0x342U | (stream << 10)));
     }
+    /* Out of band: stream 1 for the AP packet, its reply and its callbacks. */
+    assert(dcp_m4_decode_word(0x402 | (12ULL << 32), &packet) == -EPROTO);
+    assert(!dcp_m4_decode_word_oob(0x402 | (64ULL << 16) | (36ULL << 32), &packet));
+    assert(packet.stream == 1 && packet.offset == 64 && !packet.reply);
+    assert(dcp_m4_packet_offset(&packet, false) == 0x8040);
+    assert(dcp_m4_packet_offset(&packet, true) == 0x68040);
+    assert(!dcp_m4_callback_ack(&packet, &ack) && ack == 0x442);
+    assert(!dcp_m4_nested_offset(&packet, false, 12, &offset) && offset == 128);
+    assert(!dcp_m4_decode_word_oob(0x442, &packet) && packet.reply && packet.stream == 1);
+    assert(!dcp_m4_decode_word_oob(2 | (12ULL << 32), &packet) && !packet.stream);
+    assert(dcp_m4_decode_word_oob(0x802 | (12ULL << 32), &packet) == -EPROTO);
+    assert(dcp_m4_decode_word_oob(0xc02 | (12ULL << 32), &packet) == -EPROTO);
+    packet = (struct dcp_m4_packet){.stream = 2, .length = 12};
+    assert(dcp_m4_packet_offset(&packet, false) == -EINVAL);
     puts("PASS READY identity, bounded packet parsing, nested offset and callback routing");
 }
 
