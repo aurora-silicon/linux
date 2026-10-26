@@ -7,12 +7,13 @@ if WLAN_VENDOR_APPLE
 config APPLE_CENTAURI
 	tristate "Apple N1 Centauri firmware and IPC transport"
 	depends on ARCH_APPLE || COMPILE_TEST
-	depends on PCI && CFG80211 && PCIE_APPLE_APIF
+	depends on PCI && CFG80211 && PCIE_APPLE
 	select FW_LOADER
 	help
 	  Boot the shared N1 firmware and establish its PCI DMA contexts.
-	  Requires a preinitialized APIF host with the supported reset layout
-	  and DT-supplied personalized firmware name and platform identifier.
+	  Requires the T6050 PCIe host's root-port reset on a bootloader-trained
+	  port, to retrain the link after the ROM boot, and a DT-supplied
+	  personalized firmware name and platform identifier.
 	  The endpoint must start in the stopped ROM personality. Firmware
 	  and per-device calibration are external inputs and are not included.
 
