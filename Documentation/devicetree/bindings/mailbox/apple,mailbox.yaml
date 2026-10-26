@@ -114,6 +114,13 @@ properties:
   resets:
     maxItems: 1
 
+  apple,hold-rx-in-sleep:
+    description:
+      Messages from this coprocessor need not wake the system. The OS may
+      leave them in the receive FIFO while the system sleeps and handle
+      them at resume.
+    type: boolean
+
   power-domains:
     minItems: 1
     maxItems: 2
