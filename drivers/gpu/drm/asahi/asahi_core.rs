@@ -130,6 +130,10 @@ module! {
             default: 1,
             description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
         },
+        g17_tvb_min_blocks: usize {
+            default: 0,
+            description: "G17: floor on a render target's initial TVB blocks (0: use the computed tile-count size). 25G83 is always floored to at least 256, because its firmware's mid-render TVB growth trips a forward-progress watchdog (reason 0); this parameter overrides the floor on any G17 part",
+        },
         g16_deadline_ms: u32 {
             default: 5000,
             description: "G16: administrative completion-stamp deadline, ms (0 disables; long running work can exceed it)",

@@ -105,6 +105,13 @@ impl Layout {
             );
         }
         tvb_blocks = tvb_blocks.max(cfg::TVB_INITIAL_PAGES.len());
+        // 25G83 firmware hangs if asked to grow the TVB mid-render (reason-0 watchdog), so
+        // pre-size it past ordinary overflow. Other G17 parts grow reliably and keep their
+        // computed size; the module parameter overrides the floor on any part.
+        let min_blocks = crate::module_parameters::g17_tvb_min_blocks
+            .value()
+            .max(if programs == RegisterPrograms::V25G83 { 256 } else { 0 });
+        tvb_blocks = tvb_blocks.max(min_blocks.min(cfg::TVB_MAX_BLOCKS));
         let mut gtp = [None; 8];
         let mut tpc_end = tpc_size;
         if programs == RegisterPrograms::V25G83 {
