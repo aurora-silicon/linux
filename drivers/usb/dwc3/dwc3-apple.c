@@ -132,6 +132,9 @@ struct dwc3_apple {
 	struct device *dev;
 	struct resource *mmio_resource;
 	void __iomem *apple_regs;
+	bool t6050;
+	void __iomem *native_regs[3];
+	struct apple_tunable *native_tunables[8];
 
 	struct reset_control *reset;
 	struct phy *usb2_phy;
@@ -215,6 +218,82 @@ static void dwc3_apple_setup_cio(struct dwc3_apple *appledwc)
 	dwc3_apple_mask(appledwc, APPLE_DWC3_CIO_LINK_TIMER, APPLE_DWC3_CIO_PM_ENTRY_TIMER,
 			FIELD_PREP(APPLE_DWC3_CIO_PM_ENTRY_TIMER,
 				   APPLE_DWC3_CIO_PM_ENTRY_TIMER_VALUE));
+	if (appledwc->t6050) {
+		/* Saved native applyAllTunables uses reg0+c100 for GBL,
+		 * reg0+cd20 for CIO, reg0+d800 for DBG and reg7 for LINK.
+		 * The board's CIO table overrides the older fixed timer values.
+		 * PIPE belongs to the PHY owner and is applied there.
+		 */
+		void __iomem *bases[] = {
+			appledwc->native_regs[1],
+			appledwc->dwc.regs, appledwc->dwc.regs,
+			appledwc->apple_regs + 0x20,
+			appledwc->apple_regs + 0xb00,
+			appledwc->native_regs[0],
+			appledwc->apple_regs + 0x300,
+			appledwc->native_regs[2],
+		};
+		for (unsigned int i = 0; i < ARRAY_SIZE(bases); i++)
+			apple_tunable_apply(bases[i], appledwc->native_tunables[i]);
+		/* The native T8142 xHCI reset replaces
+		 * GCTL[31:19] with 13 before applying these board tunables.
+		 * Use the native host value instead of the inherited device value.
+		 */
+		u32 gctl = dwc3_readl(&appledwc->dwc, DWC3_GCTL);
+		gctl = (gctl & GENMASK(18, 0)) | (13U << 19);
+		dwc3_writel(&appledwc->dwc, DWC3_GCTL, gctl);
+		/* Native applyAllTunables clears reg0+c680 bit13 last. */
+		u32 value = readl(appledwc->dwc.regs + 0x580);
+		writel(value & ~BIT(13), appledwc->dwc.regs + 0x580);
+	}
+}
+
+static int dwc3_apple_t6050_tunables(struct platform_device *pdev,
+				   struct dwc3_apple *appledwc)
+{
+	static const char * const names[] = {"drd-cfg", "drd-bulk", "drd-ausbc"};
+	static const struct {
+		const char *property;
+		int resource; /* -1 = globals in core, -2 = Apple vendor aperture */
+		u32 offset, minimum;
+	} tables[] = {
+		{"apple,tunable-bulk-default", 1, 0, 0x24},
+		{"apple,tunable-gbl-default", -1, 0, 0x68},
+		{"apple,tunable-gbl-host", -1, 0, 0x588},
+		{"apple,tunable-cio-default", -2, 0x20, 0x24},
+		{"apple,tunable-debug-default", -2, 0xb00, 4},
+		{"apple,tunable-cfg-host", 0, 0, 0x24},
+		{"apple,tunable-link-default", -2, 0x300, 0x64},
+		{"apple,tunable-ausbc-default", 2, 0, 0x10},
+	};
+	struct resource *resources[3], *vendor;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
+		resources[i] = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
+		if (!resources[i])
+			return -EINVAL;
+		appledwc->native_regs[i] = devm_ioremap_resource(&pdev->dev, resources[i]);
+		if (IS_ERR(appledwc->native_regs[i]))
+			return PTR_ERR(appledwc->native_regs[i]);
+	}
+	vendor = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dwc3-apple");
+	if (!vendor)
+		return -EINVAL;
+	for (unsigned int i = 0; i < ARRAY_SIZE(tables); i++) {
+		struct resource res = tables[i].resource == -1 ? *appledwc->mmio_resource :
+			tables[i].resource == -2 ? *vendor : *resources[tables[i].resource];
+		res.start += tables[i].offset;
+		if (tables[i].resource == -1)
+			res.start += DWC3_GLOBALS_REGS_START;
+		if (res.start > res.end || resource_size(&res) < tables[i].minimum)
+			return -EINVAL;
+		appledwc->native_tunables[i] = devm_apple_tunable_parse(&pdev->dev,
+			pdev->dev.of_node, tables[i].property, &res);
+		if (IS_ERR(appledwc->native_tunables[i]))
+			return dev_err_probe(&pdev->dev, PTR_ERR(appledwc->native_tunables[i]),
+					     "invalid %s\n", tables[i].property);
+	}
+	return 0;
 }
 
 /*
@@ -505,6 +584,8 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	 * Both PHYs were looked up at probe, so device mode is also selected on the first
 	 * bring-up, before dwc3_core_probe() has looked them up itself.
 	 */
+	if (appledwc->t6050 && state != DWC3_APPLE_HOST)
+		return -EOPNOTSUPP;
 	ret = dwc3_apple_usb2_mode_before_reset(state, &mode);
 	if (ret) {
 		/* Unreachable unless there's a bug in this driver */
@@ -607,7 +688,8 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
 	if (ret) {
 		/* A failed T8132 BIST or PIPE handoff must not start xHCI. */
-		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
+		if (appledwc->t6050 ||
+		    of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
 			return ret;
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 	} else if (appledwc->usb3_phy &&
@@ -660,6 +742,15 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize host, ret=%d\n", ret);
 			goto core_exit;
+		}
+		/* The native T6050 USB2 reset belongs after host initialization. */
+		if (appledwc->t6050) {
+			ret = phy_reset(appledwc->usb2_phy);
+			if (ret) {
+				dev_err(appledwc->dev, "Native USB2 PHY reset failed, ret=%d\n", ret);
+				dwc3_host_exit(&appledwc->dwc);
+				goto core_exit;
+			}
 		}
 		break;
 	case DWC3_APPLE_DEVICE:
@@ -837,6 +928,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
+	appledwc->t6050 = of_device_is_compatible(dev->of_node, "apple,t6050-dwc3");
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	appledwc->host_only = dwc3_apple_host_only(dev);
 	/* Tested on T6040 only, where the PHY driver and the DARTs follow runtime PM. */
@@ -886,6 +978,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(appledwc->apple_regs),
 				     "Failed to map Apple-specific MMIO\n");
 
+	if (appledwc->t6050) {
+		ret = dwc3_apple_t6050_tunables(pdev, appledwc);
+		if (ret)
+			return ret;
+	}
 	ret = dwc3_apple_parse_tunables(appledwc, pdev);
 	if (ret)
 		return ret;
@@ -971,6 +1068,7 @@ static void dwc3_apple_shutdown(struct platform_device *pdev)
 
 static const struct of_device_id dwc3_apple_of_match[] = {
 	{ .compatible = "apple,t8132-dwc3" },
+	{ .compatible = "apple,t6050-dwc3" },
 	{ .compatible = "apple,t8103-dwc3" },
 	{}
 };
