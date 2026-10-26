@@ -2183,14 +2183,15 @@ impl SepData {
         self.sensor_trace(c"SENSOR_NONCE");
 
         if !self.sensor_key_loaded.load(Relaxed) {
-            let firmware = match kernel::firmware::Firmware::request(
-                c"apple/msrk-j700.bin", &self.dev,
-            ) {
+            // Per-device data, so the board names it; J700 predates that.
+            let name = sensor::root_key_firmware_name().unwrap_or(ROOT_KEY_FIRMWARE);
+            let firmware = match kernel::firmware::Firmware::request(name, &self.dev) {
                 Ok(firmware) => firmware,
                 Err(error) => {
                     dev_err!(
                         self.dev,
-                        "sensor: signed root-key container unavailable: {:?}\n",
+                        "sensor: signed root-key container {} unavailable: {:?}\n",
+                        name,
                         error
                     );
                     return false;

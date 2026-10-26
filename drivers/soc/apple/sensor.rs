@@ -25,15 +25,26 @@ extern "C" {
     fn sep_sensor_irq_available() -> c_int;
     fn sep_sensor_irq_arm();
     fn sep_sensor_irq_wait(timeout_ms: c_uint) -> c_int;
-    fn sep_sensor_firmware_name() -> *const c_char;
+    fn sep_sensor_firmware_name(index: c_uint) -> *const c_char;
 }
 
 /// The calibration blob's name from the board description, or `None` when the
 /// sensor node has no `firmware-name` property (the caller then uses a default).
 pub(crate) fn firmware_name() -> Option<&'static CStr> {
+    firmware_name_at(0)
+}
+
+/// The signed root-key container's name from the board description: the
+/// second `firmware-name` entry, or `None` when the board gives only the
+/// calibration (the caller then uses a default).
+pub(crate) fn root_key_firmware_name() -> Option<&'static CStr> {
+    firmware_name_at(1)
+}
+
+fn firmware_name_at(index: c_uint) -> Option<&'static CStr> {
     // SAFETY: the shim returns NULL or a pointer to a NUL-terminated string
     // owned by the device property and valid for the device's lifetime.
-    let ptr = unsafe { sep_sensor_firmware_name() };
+    let ptr = unsafe { sep_sensor_firmware_name(index) };
     if ptr.is_null() {
         return None;
     }

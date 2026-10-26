@@ -568,19 +568,23 @@ static int sep_sensor_power_line_locked(void)
 }
 
 /*
- * The per-device calibration blob name, as the board description gives it in
- * the sensor node's "firmware-name" property. NULL when absent, so the caller
- * can fall back to a default.
+ * A per-device blob name, as the board description gives it in the sensor
+ * node's "firmware-name" list: index 0 is the calibration, index 1 the signed
+ * root key. NULL when that entry is absent, so the caller can fall back to a
+ * default.
  */
-static const char *sep_sensor_firmware_name_locked(void)
+static const char *sep_sensor_firmware_name_locked(unsigned int index)
 {
-	const char *name = NULL;
+	const char *names[2] = { NULL, NULL };
+	int count;
 
-	if (!sep_spi)
+	if (!sep_spi || index >= ARRAY_SIZE(names))
 		return NULL;
-	if (device_property_read_string(&sep_spi->dev, "firmware-name", &name))
+	count = device_property_read_string_array(&sep_spi->dev, "firmware-name",
+						  names, ARRAY_SIZE(names));
+	if (count <= (int)index)
 		return NULL;
-	return name;
+	return names[index];
 }
 
 /* Powers the sensor on/off, holding the hardware settling delay. */
@@ -871,14 +875,14 @@ int sep_sensor_power_line(void)
 	return result;
 }
 
-const char *sep_sensor_firmware_name(void)
+const char *sep_sensor_firmware_name(unsigned int index)
 {
 	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
 	const char *result;
 
 	if (!sensor)
 		return NULL;
-	result = sep_sensor_firmware_name_locked();
+	result = sep_sensor_firmware_name_locked(index);
 	mutex_unlock(&sensor->lock);
 	return result;
 }

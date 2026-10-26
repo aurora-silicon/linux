@@ -449,6 +449,9 @@ const PATCH_POLL_MS: u32 = 20;
 const PATCH_POLL_ATTEMPTS: u32 = 250;
 
 const CALIBRATION_FIRMWARE: &CStr = c"apple/mesa_calibration.bin";
+/// The signed root-key container on boards whose sensor node names only the
+/// calibration (J700).
+const ROOT_KEY_FIRMWARE: &CStr = c"apple/msrk-j700.bin";
 
 const SBIO_PROBE_USER_ID: i32 = 1000;
 static_assert!(SBIO_PROBE_USER_ID >= crate::sks::SKS_DESIGNATE_USER_MIN);
