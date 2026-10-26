@@ -633,6 +633,9 @@ int tas2770_playback_state(struct snd_soc_component *component,
 	ret = regmap_read(amp->regmap, TAS2770_TDM_CFG_REG2, &source);
 	if (ret)
 		return ret;
+	/* PB_SRC selects a PDM path which is outside the PCM grant. */
+	if (gain & BIT(5) || !(hpf & 7))
+		return -EOPNOTSUPP;
 	gain &= 0x1f;
 	if (gain > 0x14 || (hpf & 7) > 6)
 		return -EINVAL;

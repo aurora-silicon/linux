@@ -586,7 +586,7 @@ int tas2764_playback_state(struct snd_soc_component *component,
 			  struct tas27xx_playback_state *state)
 {
 	struct tas2764_priv *amp = snd_soc_component_get_drvdata(component);
-	unsigned int gain, hpf, slots, source;
+	unsigned int gain, hpf, slots, source, mode;
 	int ret;
 
 	memset(state, 0, sizeof(*state));
@@ -604,6 +604,12 @@ int tas2764_playback_state(struct snd_soc_component *component,
 	ret = regmap_read(amp->regmap, TAS2764_TDM_CFG2, &source);
 	if (ret)
 		return ret;
+	ret = regmap_read(amp->regmap, TAS2764_MODE_CTRL, &mode);
+	if (ret)
+		return ret;
+	/* Diagnostic generators and a bypassed HPF are not a PCM certificate. */
+	if ((mode & 7) > 2 || !(hpf & 7))
+		return -EOPNOTSUPP;
 	gain = (gain >> 1) & 0x1f;
 	if (gain > 0x14 || (hpf & 7) > 6)
 		return -EINVAL;
