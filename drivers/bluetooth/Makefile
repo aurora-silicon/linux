@@ -59,3 +59,4 @@ obj-$(CONFIG_BT_CENTAURI)		+= btcentauri.o
 obj-$(CONFIG_BT_MTK7932_PCIE) += mt7932_bt_pcie.o
 
 CONTEXT_ANALYSIS := y
+obj-$(CONFIG_BT_HCICENTAURI) += btcentauri_t6050.o
