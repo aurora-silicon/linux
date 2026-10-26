@@ -106,5 +106,7 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox);
+int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
+				     u32 *control, u32 *status);
 
 #endif
