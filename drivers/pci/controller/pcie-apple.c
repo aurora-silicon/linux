@@ -3588,8 +3588,12 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
+	/*
+	 * The managed radio has no suspend boundary of its own; suspend-to-idle
+	 * leaves it in place like any other internal port (no power domain).
+	 */
 	if (pcie->managed_sids)
-		return -EBUSY;
+		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ? 0 : -EBUSY;
 	if (!pcie->hw->tunneled)
 		return 0;
 	pcie->reset_on_resume = false;
