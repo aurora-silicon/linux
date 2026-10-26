@@ -10,6 +10,7 @@
 mod attribution;
 mod slot;
 mod safety;
+pub(crate) use safety::{note_retired, since_retired};
 pub(crate) use attribution::Sources;
 use attribution::Attribution;
 
@@ -24,20 +25,34 @@ const QIDS: u8 = 128;
 const GUILTY: u8 = 1 << 1;
 const CANCELLED: u8 = 1 << 2;
 const MAX_GUILTY_VMS: usize = 8;
-const RECOVERY_POLLS: usize = 500;
+/// One-millisecond ticks per handshake phase. The firmware finishes a restart only after the
+/// work it interrupted has drained; with several clients running long ray-traversal jobs that
+/// takes seconds, and giving up loses every client's device. Ten seconds matches the longest
+/// execution allowance (`timeout::POLL_MS` plus renewals).
+const RECOVERY_POLLS: usize = 10_000;
 
-/// Per-QID classifications from the complete firmware recovery table.
+/// Records in the firmware recovery table.
+pub(super) const RECOVERY_RECORDS: usize = 256;
+
+/// Per-QID classifications from the firmware recovery table.
 /// Multiple records for a queue contribute all of their classification bits.
 #[derive(Default)]
 pub(super) struct Entries {
     guilty: u128,
     cancelled: u128,
+    /// Valid records, each naming one command that was in flight at the restart.
+    pub(super) listed: u32,
+    /// Listed commands found by their exact stamp, and by the oldest-work fallback.
+    pub(super) exact: u32,
+    pub(super) fallback: u32,
 }
 
 impl Entries {
-    pub(super) fn include(&mut self, flags: u32) {
+    /// Returns false at the first invalid record: the table is a packed list and
+    /// records after it are left over from an earlier restart.
+    pub(super) fn include(&mut self, flags: u32) -> bool {
         if flags & 1 == 0 {
-            return;
+            return false;
         }
         let qid = (flags >> 4) & 0x7f;
         let bit = 1u128 << qid;
@@ -47,7 +62,20 @@ impl Entries {
         if flags & u32::from(CANCELLED) != 0 {
             self.cancelled |= bit;
         }
+        self.listed += 1;
+        true
     }
+}
+
+/// How a listed recovery record was matched to retained work.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Interrupted {
+    /// No retained command of the queue.
+    None,
+    /// The command whose completion stamp equals the record's.
+    Exact,
+    /// No stamp matched; the queue's oldest unretired command was marked instead.
+    Oldest,
 }
 
 /// How an error completion affects its VM's sticky status and other jobs.
@@ -71,10 +99,17 @@ pub(super) trait Queues {
     fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>));
     /// Classify every in-flight completion; return QIDs of render slots with spared work.
     fn classify_work(&mut self, class: &dyn Fn(&Arc<VmStatus>) -> Class) -> u128;
+    /// Mark the command a recovery record lists as interrupted. It may have
+    /// partly executed, so it must never report success; see
+    /// `Completion::note_interrupted`.
+    fn note_interrupted(&mut self, qid: u8, stamp: u32) -> Interrupted;
     fn settle_blamed_render(&mut self, qid: u8, error: Error);
     fn settle_cancelled_renders(&mut self, qids: u128);
     fn rescan_compute(&mut self) -> Result;
     fn release_retired_compute(&mut self);
+    /// Ring every compute doorbell still withheld: a restart is a departure from ordinary
+    /// retirement, after which the firmware must see every published command.
+    fn announce_withheld(&mut self);
 }
 
 /// Live shared-memory operations. The handshake word uses aligned 32-bit accesses; transitions
@@ -85,7 +120,9 @@ pub(super) trait Memory {
     fn fault_sources(&self) -> Result<Sources>;
     fn transition(&self, expected: u32, next: u32) -> Result;
     fn clear_timestamps(&self) -> Result;
-    fn entries(&self) -> Result<Entries>;
+    /// One recovery record's flags and completion stamp, read while firmware
+    /// is halted in state 3.
+    fn entry(&self, index: usize) -> Result<(u32, u32)>;
     /// One millisecond wait; this is polled because the firmware sends no state-3 notification.
     fn wait_tick(&self);
 }
@@ -119,7 +156,9 @@ impl State {
             restarts: safety::Storm::new(),
         }
     }
-    pub(super) fn timeout_limit(&mut self, now: u64) -> bool { self.timeouts.note(now) }
+    pub(super) fn timeout_limit(&mut self, now: u64) -> bool {
+        self.timeouts.note_unless_progress(now, safety::retired())
+    }
     pub(super) fn restart_limit(&mut self, now: u64) -> bool { self.restarts.note(now) }
     pub(super) fn generation(&self) -> u64 {
         self.accepted
@@ -192,6 +231,8 @@ pub(super) fn service<H: Host>(
         }
     }
     if !ready {
+        pr_warn!("G17: recovery gen {} did not reach state 1 (state {:?})\n",
+            request.generation, host.recovery_state());
         return Err(ETIMEDOUT);
     }
     // Recheck ownership after the off-CPU waits, before any handshake mutation.
@@ -217,17 +258,31 @@ pub(super) fn service<H: Host>(
         host.wait_tick();
     }
     if !recovered {
+        pr_warn!("G17: recovery gen {} did not reach state 3 (state {:?})\n",
+            request.generation, host.recovery_state());
         return Err(ETIMEDOUT);
     }
     // A failed table read leaves only the explicit blamed QID as evidence of guilt.
-    let entries = host.entries().unwrap_or_default();
+    // Every listed command was in flight when firmware stopped. Firmware may
+    // still retire it with stamps and records that look like success, so it is
+    // marked before firmware resumes and never reports success.
+    let entries = read_entries(host);
     host.transition(3, 0)?;
     if host.recovery_state()? != 0 {
         return Err(EIO);
     }
     host.recovery_mut().pending = None;
 
+    let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
     let (cancelled, blame) = classify(host, entries, request.blamed, &mut sources);
+    if listed != 0 {
+        pr_warn!(
+            "G17: GPU recovery: {} commands were in flight ({} matched by stamp, {} by queue); they fail instead of completing\n",
+            listed,
+            exact,
+            fallback
+        );
+    }
     if let Some(qid) = request.blamed {
         pr_warn!(
             "G17: GPU recovery (reason {:?}): firmware blamed queue {}, {}\n",
@@ -244,7 +299,28 @@ pub(super) fn service<H: Host>(
     }
     let scan_error = host.rescan_compute().err();
     host.release_retired_compute();
+    host.announce_withheld();
     Ok(ServiceResult { scan_error, target_error })
+}
+
+/// Walks the packed recovery table up to its first invalid record and marks
+/// every listed command interrupted. A failed read keeps what was read so far.
+fn read_entries<H: Host>(host: &mut H) -> Entries {
+    let mut entries = Entries::default();
+    for index in 0..RECOVERY_RECORDS {
+        let Ok((flags, stamp)) = host.entry(index) else {
+            break;
+        };
+        if !entries.include(flags) {
+            break;
+        }
+        match host.note_interrupted(((flags >> 4) & 0x7f) as u8, stamp) {
+            Interrupted::Exact => entries.exact += 1,
+            Interrupted::Oldest => entries.fallback += 1,
+            Interrupted::None => {}
+        }
+    }
+    entries
 }
 
 /// Resolves guilty QIDs before changing any completion's classification. Unknown ownership or

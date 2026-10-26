@@ -1201,12 +1201,67 @@ pub(crate) struct KernelMappingInner {
     mapped_size: usize,
 }
 
-/// Prepared CPU timestamp access; destruction happens after completion signalling.
+/// A kernel CPU mapping of a timestamp buffer's GEM backing. Dropping it takes the object's
+/// reservation lock, so it must not be dropped where fence producers run.
+pub(crate) struct TimestampVmap(kernel::drm::gem::shmem::VMapOwned<gem::AsahiObject>);
+
+impl TimestampVmap {
+    pub(crate) fn new(gem: &gem::Object) -> Result<Self> {
+        Ok(Self(gem.owned_vmap::<0>()?))
+    }
+
+    fn size(&self) -> usize {
+        use kernel::drm::gem::BaseObject;
+        self.0.owner().size()
+    }
+
+    /// Writes a timestamp at byte `offset` of the GEM object. Aligned results use a complete
+    /// atomic store; byte stores support unaligned destinations without creating mutable
+    /// aliases. An unaligned complete timestamp is not atomic. Out-of-range offsets are refused
+    /// when the destination is prepared, and ignored here.
+    pub(crate) fn write(&self, offset: usize, value: u64) {
+        if offset.checked_add(size_of::<u64>()).is_none_or(|end| end > self.size()) {
+            return;
+        }
+        // Completion runs in task context. Bindings of the same BO share this lock,
+        // so aligned u64 and overlapping unaligned byte stores never race in Rust.
+        let _guard = self.0.owner().timestamp_lock.lock();
+        // SAFETY: The complete extent was checked above, inside this pinned vmap.
+        let base = self.0.addr.cast::<u8>();
+        let pointer = unsafe { base.add(offset) };
+        if pointer as usize % core::mem::align_of::<AtomicU64>() == 0 {
+            // SAFETY: All eight bytes were checked above; the vmap pins the backing.
+            // A naturally aligned query result becomes available in one complete store.
+            let destination = unsafe { &*pointer.cast::<AtomicU64>() };
+            destination.store(value.to_le(), Ordering::Relaxed);
+        } else {
+            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                // SAFETY: The complete eight-byte extent was checked above. The owned
+                // vmap pins its backing; byte atomics permit unaligned and overlapping
+                // timestamp destinations without mutable slice aliases.
+                let destination = unsafe { &*base.add(offset + index).cast::<AtomicU8>() };
+                destination.store(byte, Ordering::Relaxed);
+            }
+        }
+        // A CPU-retired query can be consumed by a later GPU command. WRITEBACK
+        // objects use a cacheable vmap, while GPU mappings need not snoop that cache.
+        // Publish the bytes before signalling the completion fence or queue frontier.
+        if self.0.owner().is_writeback() {
+            crate::pgtable::clean_poc(pointer, size_of::<u64>());
+        }
+        crate::pgtable::poc_barrier();
+    }
+}
+
+/// Prepared CPU timestamp access with its own vmap; destruction happens after completion
+/// signalling.
+#[cfg(CONFIG_DRM_ASAHI_G16)]
 pub(crate) struct TimestampMapping {
-    mapping: kernel::drm::gem::shmem::VMapOwned<gem::AsahiObject>,
+    mapping: TimestampVmap,
     offset: usize,
 }
 
+#[cfg(CONFIG_DRM_ASAHI_G16)]
 impl TimestampMapping {
     /// Prepare one bounded CPU timestamp destination on retained GEM backing.
     pub(crate) fn new(gem: &gem::Object, offset: usize) -> Result<Self> {
@@ -1215,39 +1270,13 @@ impl TimestampMapping {
             return Err(ERANGE);
         }
         Ok(Self {
-            mapping: gem.owned_vmap::<0>()?,
+            mapping: TimestampVmap::new(gem)?,
             offset,
         })
     }
 
     pub(crate) fn write(&self, value: u64) {
-        // Completion runs in task context. Bindings of the same BO share this lock,
-        // so aligned u64 and overlapping unaligned byte stores never race in Rust.
-        let _guard = self.mapping.owner().timestamp_lock.lock();
-        // SAFETY: timestamp_mapping checked the complete extent inside this pinned vmap.
-        let base = self.mapping.addr.cast::<u8>();
-        let pointer = unsafe { base.add(self.offset) };
-        if pointer as usize % core::mem::align_of::<AtomicU64>() == 0 {
-            // SAFETY: timestamp_mapping checked all eight bytes; the vmap pins the backing.
-            // A naturally aligned query result becomes available in one complete store.
-            let destination = unsafe { &*pointer.cast::<AtomicU64>() };
-            destination.store(value.to_le(), Ordering::Relaxed);
-        } else {
-            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-                // SAFETY: timestamp_mapping checked the complete eight-byte extent.
-                // The owned vmap pins its backing; byte atomics permit unaligned and
-                // overlapping timestamp destinations without mutable slice aliases.
-                let destination = unsafe { &*base.add(self.offset + index).cast::<AtomicU8>() };
-                destination.store(byte, Ordering::Relaxed);
-            }
-        }
-        // A CPU-retired query can be consumed by a later GPU command. WRITEBACK
-        // objects use a cacheable vmap, while GPU mappings need not snoop that cache.
-        // Publish the bytes before signalling the completion fence or queue frontier.
-        if self.mapping.owner().is_writeback() {
-            crate::pgtable::clean_poc(pointer, size_of::<u64>());
-        }
-        crate::pgtable::poc_barrier();
+        self.mapping.write(self.offset, value);
     }
 }
 
@@ -1285,7 +1314,15 @@ impl KernelMapping {
     /// use a complete atomic store; byte stores support unaligned destinations without
     /// creating mutable aliases. An unaligned complete timestamp is not atomic.
     /// Retain CPU access before this destination's completion fence is published.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<TimestampMapping> {
+        let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
+        TimestampMapping::new(gem, self.timestamp_offset(offset)?)
+    }
+
+    /// The GEM object offset of the timestamp at `offset` in this mapping, whose complete
+    /// extent lies inside both the mapping and the object.
+    pub(crate) fn timestamp_offset(&self, offset: usize) -> Result<usize> {
         use kernel::drm::gem::BaseObject;
         let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
         if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > self.size() {
@@ -1296,7 +1333,12 @@ impl KernelMapping {
         if end > gem.size() {
             return Err(ERANGE);
         }
-        TimestampMapping::new(gem, start)
+        Ok(start)
+    }
+
+    /// A kernel CPU mapping of this mapping's GEM backing, for timestamp writes.
+    pub(crate) fn timestamp_vmap(&self) -> Result<TimestampVmap> {
+        TimestampVmap::new(self.0._gem.as_ref().ok_or(EINVAL)?)
     }
 
     /// Gives a fresh kernel mapping a firmware-cached prefix, preserving its tail.

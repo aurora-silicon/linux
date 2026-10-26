@@ -55,18 +55,35 @@ pub(super) struct Gate {
     wait: Mutex<()>,
     #[pin]
     changed: CondVar,
+    /// Scheduler admission waiting for publication to reopen.
+    available: Option<Arc<super::availability::Availability>>,
 }
 
 impl Gate {
+    #[cfg(CONFIG_KUNIT)]
     pub(super) fn new() -> Result<Arc<Self>> {
+        Self::with_waiters(None)
+    }
+
+    /// A gate whose reopening, failure and removal also wake `available`.
+    pub(super) fn with_waiters(
+        available: Option<Arc<super::availability::Availability>>,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 state: AtomicU64::new(EPOCH),
                 wait <- new_mutex!((), "g17::Gate::wait"),
                 changed <- new_condvar!("g17::Gate::changed"),
+                available,
             }),
             GFP_KERNEL,
         )
+    }
+
+    fn wake_waiters(&self) {
+        if let Some(available) = &self.available {
+            available.notify();
+        }
     }
 
     pub(super) fn try_enter(self: &Arc<Self>) -> Result<Lease> {
@@ -162,20 +179,55 @@ impl Gate {
         }
     }
 
+    /// Also wakes publishers in wait_closure(); they then block in enter().
     pub(super) fn close(&self) {
         self.invalidate(0);
+        let _wait = self.wait.lock();
+        self.changed.notify_all();
+    }
+
+    /// Opaque snapshot for wait_closure(), taken where recovery was observed.
+    pub(super) fn snapshot(&self) -> u64 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    /// A publisher that observed recovery (host pending, or the firmware's state
+    /// ahead of the event worker, which always follows with a restart and the
+    /// closure) sleeps until this gate has closed since `seen`. enter() then
+    /// blocks until recovery reopens it. The deadline is only a failure bound.
+    pub(super) fn wait_closure(&self, seen: u64, deadline: u64) -> Result {
+        let mut wait = self.wait.lock();
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (REMOVED | FAILED) != 0 {
+                return Err(ENODEV);
+            }
+            if state & CLOSED != 0 || state & !COUNT_MASK != seen & !COUNT_MASK {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_sub(super::now_ns());
+            if remaining == 0 {
+                return Err(ETIMEDOUT);
+            }
+            let ms = u32::try_from(remaining.div_ceil(1_000_000)).unwrap_or(u32::MAX);
+            let _ = self.changed.wait_timeout(&mut wait, kernel::time::msecs_to_jiffies(ms));
+        }
     }
 
     pub(super) fn remove(&self) {
         self.invalidate(REMOVED);
-        let _wait = self.wait.lock();
+        let wait = self.wait.lock();
         self.changed.notify_all();
+        drop(wait);
+        self.wake_waiters();
     }
 
     pub(super) fn fail(&self) {
         self.invalidate(FAILED);
-        let _wait = self.wait.lock();
+        let wait = self.wait.lock();
         self.changed.notify_all();
+        drop(wait);
+        self.wake_waiters();
     }
 
     /// Runtime failure/recovery must not join an indefinitely stalled builder.
@@ -199,7 +251,7 @@ impl Gate {
 
     /// Reopen only an empty, temporary closure. Failed or removed devices remain closed.
     pub(super) fn reopen(&self) -> bool {
-        let _wait = self.wait.lock();
+        let wait = self.wait.lock();
         let mut previous = self.state.load(Ordering::Acquire);
         loop {
             if previous & (REMOVED | FAILED | COUNT_MASK) != 0 {
@@ -213,6 +265,8 @@ impl Gate {
             ) {
                 Ok(_) => {
                     self.changed.notify_all();
+                    drop(wait);
+                    self.wake_waiters();
                     return true;
                 }
                 Err(current) => previous = current,
@@ -307,9 +361,9 @@ mod compute_deadline_tests {
     #[test]
     fn recovery_and_binding_retry_churn_cannot_renew_budget() {
         let gate = Gate::new().unwrap();
-        let start = super::super::now_ns();
+        let deadline = super::super::now_ns() + 20_000_000;
         let check = || Ok(());
-        let admission = Admission::new(start + 20_000_000, &check);
+        let admission = Admission::new(deadline, &check);
         loop {
             // Re-entry models a channel taken between admission/publication.
             // Recovery joins each dropped lease, then wakes the same budget.
@@ -317,12 +371,17 @@ mod compute_deadline_tests {
             gate.changed.notify_all();
             gate.wait_drained();
             assert!(gate.reopen());
+            // However often the gate reopened, an attempt that starts at the deadline
+            // is refused. Timing the whole loop would also count time descheduled.
+            let attempted = super::super::now_ns();
             match gate.enter_until(&admission) {
-                Ok(lease) => drop(lease),
+                Ok(lease) => {
+                    assert!(attempted < deadline);
+                    drop(lease);
+                }
                 Err(error) => { assert_eq!(error, EBUSY); break; }
             }
         }
-        assert!(super::super::now_ns() - start < 500_000_000);
         assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
     }
 
