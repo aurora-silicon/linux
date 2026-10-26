@@ -137,10 +137,12 @@ fn main() {
         OWNER_CALLS.set(0); let bytes = fixture(kind);
         assert!(parse(&dev, &Adt { data: &bytes }).is_err()); assert_eq!(OWNER_CALLS.get(), 0);
     }
-    assert_eq!(BUILDS.len(), 2, "maintained B0 firmware row must not require an absent profile symbol");
-    assert_eq!(BUILDS[1].machine.unwrap().to_bytes(), b"apple,j516s");
-    assert_eq!((BUILDS[1].text_size, BUILDS[1].data_size, BUILDS[1].marker), (0x5c000, 0x114000, 0x58e88));
-    assert_eq!(BUILDS[1].text_sha256, [0xda,0x26,0xec,0xca,0xb1,0xf8,0x59,0x8d,0xa8,0x0c,0x85,0x5e,0xca,0x91,0x65,0x20,0x40,0x6d,0x1d,0x06,0x70,0xf1,0xd4,0x70,0xe7,0x9b,0xb9,0xb0,0x22,0x09,0xdb,0x53]);
+    assert_eq!(BUILDS.len(), 3, "maintained B0 firmware row must not require an absent profile symbol");
+    for (row, machine) in [(1, &b"apple,j516s"[..]), (2, &b"apple,j514s"[..])] {
+        assert_eq!(BUILDS[row].machine.unwrap().to_bytes(), machine);
+        assert_eq!((BUILDS[row].text_size, BUILDS[row].data_size, BUILDS[row].marker), (0x5c000, 0x114000, 0x58e88));
+        assert_eq!(BUILDS[row].text_sha256, [0xda,0x26,0xec,0xca,0xb1,0xf8,0x59,0x8d,0xa8,0x0c,0x85,0x5e,0xca,0x91,0x65,0x20,0x40,0x6d,0x1d,0x06,0x70,0xf1,0xd4,0x70,0xe7,0x9b,0xb9,0xb0,0x22,0x09,0xdb,0x53]);
+    }
     for error in [0, -517, -12] {
         INIT_ERROR.set(error); let shared = Arc::new(Shared); let result = Rtkit::new(&dev, &shared);
         assert_eq!(result.is_ok(), error == 0);

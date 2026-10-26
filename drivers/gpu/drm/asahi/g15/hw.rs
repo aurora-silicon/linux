@@ -160,6 +160,21 @@ pub(crate) mod t6030 {
                 0xe7, 0x9b, 0xb9, 0xb0, 0x22, 0x09, 0xdb, 0x53,
             ],
           },
+          // The J514S (14-inch) boot chain loads the same B0 image: its
+          // measured TEXT digest, sizes and marker match the J516S row above.
+          FirmwareBuild {
+            name: "J514S B0 RTKit-2419.140.12 (maintained 14.x handoff)",
+            machine: Some(kernel::c_str!("apple,j514s")),
+            text_size: 0x5c000,
+            data_size: 0x114000,
+            marker: 0x58e88,
+            text_sha256: [
+                0xda, 0x26, 0xec, 0xca, 0xb1, 0xf8, 0x59, 0x8d,
+                0xa8, 0x0c, 0x85, 0x5e, 0xca, 0x91, 0x65, 0x20,
+                0x40, 0x6d, 0x1d, 0x06, 0x70, 0xf1, 0xd4, 0x70,
+                0xe7, 0x9b, 0xb9, 0xb0, 0x22, 0x09, 0xdb, 0x53,
+            ],
+          },
         ],
         machine: kernel::c_str!("apple,t6030"),
         platform: super::Platform::AdtWithPmp,
