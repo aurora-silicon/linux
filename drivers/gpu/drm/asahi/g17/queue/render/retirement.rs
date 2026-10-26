@@ -122,6 +122,11 @@ impl Snapshot {
     fn executed(self) -> bool {
         self.pass[0] != 0 && self.pass[1] != 0
     }
+
+    /// Neither the tiler start nor the fragment end was written: nothing ran.
+    pub(crate) fn untouched(self) -> bool {
+        self.pass == [0, 0]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

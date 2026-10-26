@@ -27,9 +27,9 @@ mod publication;
 pub(crate) use publication::{Prepared as PreparedPublication, Publication};
 
 struct Destination {
-    // Keep the existing GPU alias alive along with its prepared CPU view.
-    _mapping: Arc<crate::timestamp::Buffer>,
-    cpu: mmu::TimestampMapping,
+    // The buffer keeps its GPU alias and its CPU mapping alive.
+    buffer: Arc<crate::timestamp::Buffer>,
+    offset: usize,
 }
 
 impl Destination {
@@ -45,13 +45,13 @@ impl Destination {
             .get(timestamp.handle.try_into()?)
             .ok_or(ENOENT)?
             .clone();
-        let file::Object::TimestampBuffer(mapping) = object;
+        let file::Object::TimestampBuffer(buffer) = object;
         let offset: usize = timestamp.offset.try_into()?;
-        if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > mapping.size() {
+        if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > buffer.size() {
             return Err(ERANGE);
         }
-        let cpu = mapping.timestamp_mapping(offset)?;
-        Ok(Some(Self { _mapping: mapping, cpu }))
+        let offset = buffer.timestamp_offset(offset)?;
+        Ok(Some(Self { buffer, offset }))
     }
 
     fn write(&self, ticks: u64) {
@@ -61,13 +61,14 @@ impl Destination {
             .wrapping_add(
                 ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ,
             );
-        self.cpu.write(ns);
+        self.buffer.write_timestamp(self.offset, ns);
         barrier(Ordering::Release);
     }
 }
 
-/// Timestamp mappings resolved and retained before any command is enqueued.
-pub(crate) struct Destinations(Option<crate::cleanup::Deferred<[Option<Destination>; 4]>>);
+/// Timestamp destinations resolved and retained before any command is enqueued. Dropping
+/// one releases only a buffer reference; the buffer defers its own mapping release.
+pub(crate) struct Destinations([Option<Destination>; 4]);
 
 impl Destinations {
     pub(crate) fn resolve(
@@ -82,20 +83,13 @@ impl Destinations {
             destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
             destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
         }
-        // Empty submissions need no cleanup allocation. Timestamped commands
-        // prepare the unique work item before any output fence is published.
-        let retained = if destinations.iter().any(Option::is_some) {
-            Some(crate::cleanup::Deferred::new(destinations)?)
-        } else {
-            None
-        };
-        Ok(Self(retained))
+        Ok(Self(destinations))
     }
 
+    pub(crate) fn has_outputs(&self) -> bool { self.0.iter().any(Option::is_some) }
+
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
-        let destinations: &[Option<Destination>] =
-            self.0.as_deref().map_or(&[], |destinations| destinations.as_slice());
-        destinations.iter()
+        self.0.iter()
     }
 }
 
@@ -254,6 +248,7 @@ pub(crate) struct Completion {
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<PooledTimestamps>,
     feed: Option<Arc<super::feed::Feed>>,
+    sources: Option<Arc<super::sync_input::Sources>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
     #[pin]
@@ -267,6 +262,9 @@ pub(crate) struct Completion {
     /// A recovery blamed this command. Unlike `class`, which a later
     /// classification can change, this never clears.
     blamed: AtomicBool,
+    /// A firmware restart listed this command as in flight. Until a replay
+    /// republishes it from the start, it never reports success.
+    interrupted: AtomicBool,
     firmware_consumer: AtomicBool,
     class: AtomicU8,
 }
@@ -286,6 +284,7 @@ impl Completion {
         compute: bool,
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
+        sources: Option<Arc<super::sync_input::Sources>>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
         let ordered = !compute
@@ -313,6 +312,7 @@ impl Completion {
                 terminal,
                 compute,
                 feed,
+                sources,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
                 signalled: AtomicBool::new(false),
@@ -322,6 +322,7 @@ impl Completion {
                 replays: AtomicU8::new(0),
                 replay_timeout: AtomicBool::new(false),
                 blamed: AtomicBool::new(false),
+                interrupted: AtomicBool::new(false),
                 firmware_consumer: AtomicBool::new(false),
                 class: AtomicU8::new(0),
             }),
@@ -357,6 +358,38 @@ impl Completion {
     pub(crate) fn status(&self) -> &Arc<VmStatus> {
         &self.status
     }
+    pub(super) fn sources(&self) -> Option<&Arc<super::sync_input::Sources>> {
+        self.sources.as_ref()
+    }
+    pub(super) fn is_input_source(&self, source: &Arc<super::fence::Submission>) -> bool {
+        self.output.output().member.is_source(source)
+    }
+    pub(super) fn set_source_ready(&self, ready: Fence) {
+        self.output.output().member.set_source_ready(ready);
+    }
+    pub(super) fn needs_source_ready(&self) -> bool {
+        self.output.output().member.needs_source_ready()
+    }
+    pub(super) fn note_input_error(&self, error: Error) -> bool {
+        self.output.output().member.note_error(error)
+    }
+    /// Called under the device mutex as a successful retirement is queued.
+    pub(super) fn note_source_retired(&self) {
+        if self.interrupted() {
+            // complete() fails it; consumers must not take its output as valid.
+            self.note_input_error(ECANCELED);
+            return;
+        }
+        match self.check_source_inputs() {
+            Ok(()) => self.output.output().member.note_retired(),
+            Err(error) => { self.note_input_error(error); }
+        }
+    }
+    pub(super) fn check_source_inputs(&self) -> Result {
+        if let Some(sources) = &self.sources { sources.check()?; }
+        Ok(())
+    }
+
     pub(crate) fn work_state(&self) -> Result<Arc<WorkStateLease>> {
         self.output.output().member.work_state()
     }
@@ -397,6 +430,9 @@ impl Completion {
             .is_ok();
         if accepted {
             self.replay_timeout.store(true, Ordering::Release);
+            // Callers replay only work proven not to have started; the new
+            // publication runs from the beginning and reports its own result.
+            self.interrupted.store(false, Ordering::Release);
         }
         accepted
     }
@@ -485,6 +521,35 @@ impl Completion {
         self.blamed.load(Ordering::Acquire)
     }
 
+    /// A firmware restart listed this command in its recovery table: it was in
+    /// flight, so it may have run partly. Its stamps and completion record may
+    /// still look like success. Unless a replay republishes it from the start,
+    /// it fails and the failure is always reported to the client.
+    pub(crate) fn note_interrupted(&self) {
+        self.interrupted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+
+    /// Whether this failure makes the VM unusable. Spared work, and interrupted
+    /// work no recovery found guilty, fail without poisoning it.
+    pub(crate) fn poisons(&self, error: Error) -> bool {
+        let interrupted = self.interrupted();
+        (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
+    }
+
+    /// ECANCELED stays silent only for work that was never interrupted (closed
+    /// or cancelled by its owner); every other failure reaches the client.
+    fn report(&self, error: Error) {
+        if self.poisons(error) {
+            self.status.record(error);
+        } else if error != ECANCELED || self.interrupted() {
+            self.status.report_failure(error);
+        }
+    }
+
     /// Installed before the first firmware-visible prefix. Cancellation takes
     /// the same lock after claiming the signal, so it cannot miss a late lease.
     pub(crate) fn attach_render_lease(
@@ -515,6 +580,13 @@ impl Completion {
             .map(super::queue::admission::RenderLease::slot)
     }
 
+    /// Called under the device mutex once the render's kicks are committed.
+    pub(crate) fn note_render_publication(&self, fragment: super::fw::kick::KickDependency) {
+        if let Some(lease) = self.render.lock().as_ref() {
+            lease.note_publication(fragment);
+        }
+    }
+
     /// Called under the device mutex before deferring the error signal.
     pub(crate) fn quarantine_render(&self) {
         if let Some(lease) = self.render.lock().as_ref() {
@@ -525,6 +597,7 @@ impl Completion {
     /// An exact whole-pair drain or processor stop allows rehabilitation. The
     /// VM pin goes first; the still-held lease excludes reuse until both settle.
     pub(crate) fn release_after_retirement(&self) {
+        if let Some(sources) = &self.sources { sources.release(); }
         drop(self.vm_job.lock().take());
         let lease = self.render.lock().take();
         if let Some(lease) = lease.as_ref() {
@@ -534,6 +607,7 @@ impl Completion {
     }
 
     fn release_healthy(&self) {
+        if let Some(sources) = &self.sources { sources.release(); }
         drop(self.render.lock().take());
         drop(self.vm_job.lock().take());
     }
@@ -541,22 +615,28 @@ impl Completion {
     /// Exact retirement permits the physical lease and VM pin to be released
     /// before waking userspace. A failure fence alone never establishes this.
     #[track_caller]
-    pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
+    pub(crate) fn complete(&self, mut result: Result<[u64; 4]>) {
+        if result.is_ok() {
+            if let Err(error) = self.check_source_inputs() { result = Err(error); }
+        }
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
         }
+        if result.is_ok() && self.interrupted() {
+            result = Err(ECANCELED);
+        }
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
-            feed.note_render_pass(ticks[2], ticks[3]);
+            // Compute reports its dispatch envelope in the first pair, a
+            // render its fragment pass in the second.
+            if self.compute.is_some() {
+                feed.note_pass(ticks[0], ticks[1]);
+            } else {
+                feed.note_pass(ticks[2], ticks[3]);
+            }
         }
         if let Err(error) = result {
             // Spared work cancelled after another VM's recovery is not this client's device loss.
-            if self.spared() {
-                if error != ECANCELED {
-                    self.status.report_failure(error);
-                }
-            } else if error != ECANCELED {
-                self.status.record(error);
-            }
+            self.report(error);
         }
         self.release_healthy();
         self.signal_terminal(result);
@@ -590,8 +670,8 @@ impl Completion {
         }
         if self.spared() {
             self.status.report_failure(error);
-        } else if error != ECANCELED {
-            self.status.record(error);
+        } else {
+            self.report(error);
         }
         self.signal_terminal(Err(error));
         self.output.finish(Err(error));

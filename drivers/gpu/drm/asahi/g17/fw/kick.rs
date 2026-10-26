@@ -278,6 +278,20 @@ impl RegisterArray {
         self.size = (size_of_val(writes) as u32) << 16 | count as u32;
         Ok(())
     }
+
+    /// Stores `writes` without the entry at `skip`, exactly as [`Self::set`] stores the
+    /// remaining writes, without first copying them elsewhere.
+    pub(crate) fn set_without(&mut self, self_va: u64, writes: &[RegisterWrite], skip: usize) -> Result {
+        let count = writes.len().checked_sub(1).ok_or(EINVAL)?;
+        if skip > count || count > REGISTER_ARRAY_ENTRIES {
+            return Err(EINVAL);
+        }
+        self.entries[..skip].copy_from_slice(&writes[..skip]);
+        self.entries[skip..count].copy_from_slice(&writes[skip + 1..]);
+        self.self_va = self_va;
+        self.size = ((count * size_of::<RegisterWrite>()) as u32) << 16 | count as u32;
+        Ok(())
+    }
 }
 
 /// Binding of one [`RegisterArray`] to a kick entry.

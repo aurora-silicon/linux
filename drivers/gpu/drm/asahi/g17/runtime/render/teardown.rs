@@ -46,6 +46,14 @@ impl RenderState {
         Ok(true)
     }
 
+    /// Some render pair runs another context's commands.
+    pub(in crate::g17::runtime) fn foreign_in_flight(&self, context: &Arc<Context>) -> bool {
+        self.entries.iter().flatten().any(|entry| {
+            !entry.context.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, context))
+                && entry.pair.as_ref().is_some_and(|pair| pair.in_flight())
+        })
+    }
+
     pub(in crate::g17::runtime) fn teardown_pools_released(&self, context: &Arc<Context>) -> bool {
         context.render_pools_released(|id, control| self.pools.released(id, control))
             && self

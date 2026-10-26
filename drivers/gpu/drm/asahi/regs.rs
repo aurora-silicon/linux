@@ -709,6 +709,11 @@ impl G17Resources {
         self.sgx_read32::<G17_CORE_POWER>() & 0xf != 0
     }
 
+    /// Raw core power state, for tracing only.
+    pub(crate) fn g17_core_power(&self) -> u32 {
+        self.sgx_read32::<G17_CORE_POWER>()
+    }
+
     /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
     /// initialized.
     pub(crate) fn enable_g17_gating(&self) -> Result {

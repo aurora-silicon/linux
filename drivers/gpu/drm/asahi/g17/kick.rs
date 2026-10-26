@@ -24,22 +24,38 @@ use crate::{hw::t8140, mem, mmu};
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
-/// Minimum render-channel capacity protected from compute-only allocation.
-// Protect one tiling/fragment pair for each logical execution context, plus
-// the two unpublished bootstrap reservations. The remaining ten compute
-// channels are shared after exact retirement, rather than pinned per client.
-const COMPUTE_RENDER_RESERVE: usize = 2 * crate::mmu::MAX_EXECUTION_CONTEXTS as usize + 2;
-pub(super) const COMPUTE_CHANNELS: usize = QID_COUNT - COMPUTE_RENDER_RESERVE;
-/// Logical queues that can each hold a render pair: what the render reserve leaves beside the
-/// two bootstrap reservations once the QIDs below `floor`, which the firmware keeps, are gone
-/// (every execution context with no floor).
+/// Render identities that must stay reachable for `queues` logical queues:
+/// one tiling/fragment pair each, plus the two bootstrap reservations.
+///
+/// Installed identities never change engine before processor stop, so a
+/// compute channel permanently narrows what render can still install. Compute
+/// may take a free QID only while every open logical queue, and
+/// [`RENDER_HEADROOM`] queues opened later, can still install a dedicated
+/// pair; logical-queue admission refuses a queue whose pair no longer fits.
+pub(super) const fn render_reserve(queues: usize) -> usize {
+    let queues = queues + RENDER_HEADROOM;
+    let max = crate::mmu::MAX_EXECUTION_CONTEXTS as usize;
+    2 * if queues < max { queues } else { max } + 2
+}
+/// Logical queues that may still open after compute growth without losing a
+/// dedicated render pair.
+const RENDER_HEADROOM: usize = 24;
+/// The render reserve with every execution context open.
+const FULL_RENDER_RESERVE: usize = render_reserve(crate::mmu::MAX_EXECUTION_CONTEXTS as usize);
+/// Compute channels that stay reachable with every execution context open.
+#[cfg(CONFIG_KUNIT)]
+pub(super) const COMPUTE_FLOOR: usize = QID_COUNT - FULL_RENDER_RESERVE;
+/// Upper bound on distinct physical compute channels named by one kick.
+pub(super) const COMPUTE_CHANNELS: usize = QID_COUNT;
+/// Maximum logical queues after firmware-owned QIDs are excluded.
 pub(super) const fn queue_limit(floor: usize) -> u32 {
-    ((COMPUTE_RENDER_RESERVE - 2 - floor) / 2) as u32
+    ((FULL_RENDER_RESERVE - 2 - floor) / 2) as u32
 }
 
 const _: () = {
     assert!(queue_limit(0) == crate::mmu::MAX_EXECUTION_CONTEXTS);
-    assert!(COMPUTE_CHANNELS >= 4);
+    // Compute keeps this many channels even with every execution context open.
+    assert!(QID_COUNT - FULL_RENDER_RESERVE >= 4);
     assert!(crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER == 1);
 };
 
@@ -71,7 +87,6 @@ struct Identity {
 pub(crate) struct QueueIds {
     entries: [Option<Identity>; QID_COUNT],
     initial_render: [Option<Id>; 2],
-    publication: u64,
     leased: usize,
     /// First QID the host may use ([`crate::g17::fw::Variant::qid_floor`]).
     floor: usize,
@@ -82,10 +97,9 @@ impl QueueIds {
         kernel::try_init!(Self {
             entries <- pin_init::init_array_from_fn(|_| None),
             initial_render: [None; 2],
-            publication: 0,
             leased: 0,
             // The reserve must keep render capacity above the floor.
-            floor: if floor < COMPUTE_RENDER_RESERVE { floor } else { return Err(EINVAL) },
+            floor: if floor < FULL_RENDER_RESERVE { floor } else { return Err(EINVAL) },
         })
     }
 
@@ -114,6 +128,53 @@ impl QueueIds {
         engine: DataMaster,
         preferred: Option<u8>,
     ) -> Result<Id> {
+        self.reserve_for(owner, engine, preferred, crate::mmu::MAX_EXECUTION_CONTEXTS as usize)
+    }
+
+    fn render_ids(&self) -> usize {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| matches!(entry.id.engine, DataMaster::Tiling | DataMaster::Fragment))
+            .count()
+    }
+
+    /// Whether `queues` open logical queues can each still install a dedicated
+    /// render pair, beside the bootstrap reservations and installed compute.
+    pub(crate) fn render_fits(&self, queues: usize) -> bool {
+        self.render_ids() + (QID_COUNT - self.floor - self.leased) >= 2 * queues + 2
+    }
+
+    /// Whether a fresh compute identity fits beside the render reserve of
+    /// `queues` open logical queues, without reserving it.
+    pub(crate) fn compute_fits(&self, queues: usize) -> bool {
+        let initial = self.leased == QID_COUNT - self.floor
+            && self.initial_render.iter().flatten().any(|id| self.can_cancel_unpublished(*id));
+        self.compute_room(queues, usize::from(initial))
+    }
+
+    fn compute_room(&self, queues: usize, replacement: usize) -> bool {
+        // Existing render identities already satisfy this reservation. Counting
+        // them twice can refuse compute even while physical QIDs remain free.
+        // Replacing an initial reservation consumes one render identity.
+        // Include that transition when protecting render's minimum, and
+        // count the replacement as available compute capacity.
+        let render = self.render_ids();
+        QID_COUNT - self.floor - self.leased + replacement
+            > render_reserve(queues)
+                .min(FULL_RENDER_RESERVE - self.floor)
+                .saturating_sub(render - replacement)
+    }
+
+    /// As [`Self::reserve`], with the compute reserve sized for `queues` open
+    /// logical queues instead of every possible execution context.
+    pub(crate) fn reserve_for(
+        &mut self,
+        owner: u64,
+        engine: DataMaster,
+        preferred: Option<u8>,
+        queues: usize,
+    ) -> Result<Id> {
         if owner == 0 {
             return Err(EINVAL);
         }
@@ -129,10 +190,8 @@ impl QueueIds {
                 Err(EINVAL)
             };
         }
-        // The QIDs below the floor are never the host's; the reserve shrinks
-        // with them, so the compute channel count stays the same.
+        // The QIDs below the floor are never available to the host.
         let total = QID_COUNT - self.floor;
-        let reserve = COMPUTE_RENDER_RESERVE - self.floor;
         let initial = if engine == DataMaster::Compute && self.leased == total {
             self.initial_render
                 .iter()
@@ -145,27 +204,9 @@ impl QueueIds {
         } else {
             None
         };
-        // Existing render identities already satisfy this reservation. Counting
-        // them twice can refuse compute even while physical QIDs remain free.
         // Published identities always retain their original lifetime rules.
-        if engine == DataMaster::Compute {
-            let render = self
-                .entries
-                .iter()
-                .flatten()
-                .filter(|entry| {
-                    matches!(entry.id.engine, DataMaster::Tiling | DataMaster::Fragment)
-                })
-                .count();
-            // Replacing an initial reservation consumes one render identity.
-            // Include that transition when protecting render's minimum, and
-            // count the replacement as available compute capacity.
-            let replacement = usize::from(initial.is_some());
-            if total - self.leased + replacement
-                <= reserve.saturating_sub(render - replacement)
-            {
-                return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeReserve));
-            }
+        if engine == DataMaster::Compute && !self.compute_room(queues, usize::from(initial.is_some())) {
+            return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeReserve));
         }
         let index = preferred
             .map(|index| usize::from(index) + self.floor)
@@ -194,13 +235,6 @@ impl QueueIds {
             self.leased += 1;
         }
         Ok(id)
-    }
-
-    /// Ordered under the device mutex; no atomic operation on the submission path. Compute and
-    /// render publications share it, so a watchdog can order work across both engines.
-    pub(crate) fn next_publication(&mut self) -> Result<u64> {
-        self.publication = self.publication.checked_add(1).ok_or(EOVERFLOW)?;
-        Ok(self.publication)
     }
 
     /// Call after preflighting the complete installation, before any address
@@ -249,10 +283,10 @@ mod accounting_tests {
     #[test]
     fn render_identities_satisfy_the_compute_reserve() {
         let mut ids = table();
-        for owner in 1..=COMPUTE_RENDER_RESERVE as u64 {
+        for owner in 1..=FULL_RENDER_RESERVE as u64 {
             ids.reserve(owner, DataMaster::Tiling, None).unwrap();
         }
-        for owner in COMPUTE_RENDER_RESERVE as u64 + 1..=QID_COUNT as u64 {
+        for owner in FULL_RENDER_RESERVE as u64 + 1..=QID_COUNT as u64 {
             ids.reserve(owner, DataMaster::Compute, None).unwrap();
         }
         assert_eq!(ids.leased, QID_COUNT);
@@ -263,14 +297,49 @@ mod accounting_tests {
     #[test]
     fn compute_cannot_consume_the_render_minimum() {
         let mut ids = table();
-        for owner in 1..=(QID_COUNT - COMPUTE_RENDER_RESERVE) as u64 {
+        for owner in 1..=(QID_COUNT - FULL_RENDER_RESERVE) as u64 {
             ids.reserve(owner, DataMaster::Compute, None).unwrap();
         }
         assert_eq!(ids.reserve(1000, DataMaster::Compute, None), Err(ENOSPC));
         let tiling = ids.reserve(1001, DataMaster::Tiling, None).unwrap();
         assert_eq!(ids.reserve(1000, DataMaster::Compute, None), Err(ENOSPC));
         ids.cancel_unpublished(tiling).unwrap();
-        assert_eq!(ids.leased, QID_COUNT - COMPUTE_RENDER_RESERVE);
+        assert_eq!(ids.leased, QID_COUNT - FULL_RENDER_RESERVE);
+    }
+
+    #[test]
+    fn dynamic_compute_growth_preserves_render_headroom_above_firmware_floor() {
+        for floor in [0, 4] {
+            let mut ids = KBox::init(QueueIds::new(floor), GFP_KERNEL).unwrap();
+            let queues = 2;
+            let mut owner = 1;
+            while ids.compute_fits(queues) {
+                let id = ids.reserve_for(owner, DataMaster::Compute, None, queues).unwrap();
+                assert!(usize::from(id.qid()) >= floor);
+                ids.publish(id).unwrap();
+                owner += 1;
+            }
+            assert_eq!(ids.leased, QID_COUNT - floor - render_reserve(queues));
+            assert_eq!(ids.reserve_for(owner, DataMaster::Compute, None, queues), Err(ENOSPC));
+            assert!(ids.render_fits(queues + RENDER_HEADROOM));
+            assert!(!ids.render_fits(queues + RENDER_HEADROOM + 1));
+        }
+    }
+
+    #[test]
+    fn full_logical_queue_budget_keeps_compute_floor_and_excludes_firmware_ids() {
+        for floor in [0, 4] {
+            let mut ids = KBox::init(QueueIds::new(floor), GFP_KERNEL).unwrap();
+            let queues = queue_limit(floor) as usize;
+            for owner in 1..=COMPUTE_FLOOR as u64 {
+                let id = ids.reserve_for(owner, DataMaster::Compute, None, queues).unwrap();
+                assert!(usize::from(id.qid()) >= floor);
+                ids.publish(id).unwrap();
+            }
+            assert!(!ids.compute_fits(queues));
+            assert!(ids.render_fits(queues));
+            assert!(!ids.render_fits(queues + 1));
+        }
     }
 
     #[test]

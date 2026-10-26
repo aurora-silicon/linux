@@ -252,6 +252,7 @@ impl ParkedPair {
             context_update: true,
             executed: self.executed,
             switch: None,
+            published_completions: None,
         }))
     }
 }

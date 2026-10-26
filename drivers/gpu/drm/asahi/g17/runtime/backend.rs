@@ -13,7 +13,14 @@ use kernel::{dma_fence::Fence, drm::sched, prelude::*, sync::Arc};
 impl Backend {
     pub(super) fn release_backlog(&self, packet: &Packet) {
         if packet.take_backlog() {
-            self.backlog.fetch_sub(1, Ordering::AcqRel);
+            self.backlog_of(packet).fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    pub(super) fn backlog_of(&self, packet: &Packet) -> &core::sync::atomic::AtomicU32 {
+        match packet.engine() {
+            Engine::Render => &self.backlog,
+            Engine::Compute => &self.compute_backlog,
         }
     }
 
@@ -48,6 +55,7 @@ impl Backend {
         drop(state);
         drop(binding);
         self.finish_uninstalled_compute(retired)?;
+        self.shared.channels.notify();
         self.shared.queue_events();
         return Ok(());
         }
@@ -85,6 +93,7 @@ impl Backend {
         // A builder may own only an off-lock reservation when close arrives.
         // Record intent before scanning queues; every later install/rearm checks it.
         self.closed.store(true, Ordering::Release);
+        self.hold_claim(None);
         let mut state = self.shared.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
@@ -99,12 +108,63 @@ impl Backend {
         firmware.queues.release_render(self.owner)?;
         firmware.queues.admission.release_owner(self.owner);
         drop(state);
+        // Its idle channel, or its slot and never-published QID, is free.
+        self.shared.channels.notify();
         self.shared.queue_events();
         Ok(())
     }
 }
 
 impl job::Backend for Backend {
+    fn input_sources(&self, inputs: &[crate::file::SyncItem])
+        -> Option<Arc<crate::g17::sync_input::Sources>>
+    {
+        use crate::g17::{fence, sync_input};
+        let mut heads = KVec::new();
+        let mut sources: KVec<sync_input::Source> = KVec::new();
+        let mut publication_waits = KVec::new();
+        for input in inputs.iter().filter_map(|input| input.fence.as_ref()) {
+            let status = job::fence_status(input);
+            if status > 0 { continue; }
+            if status < 0 { return None; }
+            let leaves = sync_input::collect(input)?;
+            for leaf in &leaves {
+                if leaf.status > 0 { continue; }
+                if leaf.status < 0 { return None; }
+                // SAFETY: Collection owns each leaf until this lookup finishes.
+                let submission = unsafe { fence::exported_source_raw(leaf.fence) }?;
+                if submission.source_status().ok()? { continue; }
+                if !submission.same_vm(self.context.status()) { return None; }
+                if sources.iter().any(|known| Arc::ptr_eq(&known.submission, &submission)) {
+                    continue;
+                }
+                if sources.len() == crate::g17::fw::kick::KICK_BARRIERS_MAX { return None; }
+                let published = {
+                    let state = self.shared.state.lock();
+                    let firmware = state.as_deref()?;
+                    if self.shared.crashed.load(Ordering::Acquire) || firmware.recovery.pending()
+                        || crate::g17::recovery::Memory::recovery_state(&firmware.init).ok()? != 0
+                    { return None; }
+                    firmware.queues.compute.iter().flatten()
+                        .filter_map(|entry| entry.queue.as_deref())
+                        .any(|queue| queue.has_input_source(&submission, self.context.status(),
+                            firmware.recovery.generation()))
+                };
+                if !published {
+                    if submission.source_status().ok()? { continue; }
+                    // The existing scheduler fence becomes ready after actual
+                    // publication, not GPU completion. No binding loan or
+                    // consumer hardware capacity is acquired while waiting.
+                    publication_waits.push(submission.ready()?, GFP_KERNEL).ok()?;
+                }
+                sources.push(sync_input::Source { submission }, GFP_KERNEL).ok()?;
+            }
+            heads.push(input.clone(), GFP_KERNEL).ok()?;
+        }
+        if sources.is_empty() { return None; }
+        sync_input::Sources::new(heads, sources, publication_waits).ok()
+    }
+
     fn feed(&self) -> Option<Arc<crate::g17::feed::Feed>> {
         Some(self.shared.feed.clone())
     }
@@ -156,8 +216,13 @@ impl job::Backend for Backend {
 
     /// Firmware kick parents order the same engine. Explicit cross-engine and
     /// input dependencies were already attached to the DRM scheduled job.
-    fn prepare(&self, _packet: &Packet) -> Option<Fence> {
-        None
+    /// Compute and render admission wait for their shared capacity here, as a
+    /// fence.
+    fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence> {
+        match packet.engine() {
+            Engine::Compute => self.prepare_compute(packet),
+            Engine::Render => self.admit_render(packet),
+        }
     }
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {
@@ -185,6 +250,9 @@ impl job::Backend for Backend {
                 Engine::Render => self.render_packet(&packet, &mut deferred),
             }
         };
+        if packet.engine() == Engine::Compute {
+            self.hold_claim(None);
+        }
         self.release_backlog(&packet);
         self.finish_publication(&packet, result, &mut deferred)
     }
@@ -213,6 +281,9 @@ impl job::Backend for Backend {
 
     fn cancel(&self, packet: Arc<Packet>) {
         self.release_backlog(&packet);
+        if packet.engine() == Engine::Compute {
+            self.hold_claim(None);
+        }
         if packet.request_cancel() {
             Deferred::Unpublished(packet.completion.clone(), ECANCELED).finish();
             return;
@@ -274,11 +345,14 @@ impl job::Backend for Backend {
     }
 
     fn try_early(&self, packet: &Arc<Packet>) -> bool {
-        self.try_render_early(packet)
+        match packet.engine() {
+            Engine::Render => self.try_render_early(packet),
+            Engine::Compute => self.try_compute_early(packet),
+        }
     }
 
     fn count_backlog(&self, packet: &Packet) {
         packet.count_backlog();
-        self.backlog.fetch_add(1, Ordering::AcqRel);
+        self.backlog_of(packet).fetch_add(1, Ordering::AcqRel);
     }
 }

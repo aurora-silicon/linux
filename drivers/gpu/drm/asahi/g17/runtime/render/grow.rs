@@ -280,7 +280,7 @@ impl crate::g17::Shared {
                 return Err(EIO);
             }
             firmware.queues.render.grow.active = None;
-            self.changed.notify_all();
+            self.note_changed();
             if !lease.is_current() || request.halt_count != firmware.recovery.generation() {
                 continue;
             }
