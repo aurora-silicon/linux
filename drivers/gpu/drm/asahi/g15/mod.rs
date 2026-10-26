@@ -45,6 +45,7 @@
 mod adt;
 mod board;
 mod boot;
+mod retain;
 
 // One admission rule for the generation mappings and shared adopted UAT.
 pub(crate) use boot::glue::memory_mode;
@@ -456,17 +457,18 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
-        gpu.retain();
+        gpu.retain()?;
         Ok(gpu)
     }
 
     /// Keeps the firmware session and this module alive until reboot.
     ///
-    /// Takes the module reference once. Nothing firmware-reachable is freed on any path: the
+    /// Takes the module reference once; `boot::start` already took it before touching the
+    /// firmware, so this only confirms it. Nothing firmware-reachable is freed on any path: the
     /// RTKit callbacks hold [`Shared`], which holds the [`Firmware`] (or the [`boot::Orphan`] of a
     /// failed start) until reboot.
-    pub(crate) fn retain(&self) {
-        boot::glue::retain_module();
+    pub(crate) fn retain(&self) -> Result {
+        boot::glue::retain_module()
     }
 }
 

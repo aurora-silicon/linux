@@ -61,7 +61,8 @@ pub(crate) mod glue {
         fn asahi_g15_machine(compatible: *const core::ffi::c_char) -> bool;
         fn asahi_g15_hold_power(dev: *mut core::ffi::c_void);
         fn asahi_g15_release_power(dev: *mut core::ffi::c_void);
-        fn asahi_g15_module_get();
+        fn asahi_g15_module_try_get() -> bool;
+        fn asahi_g15_module_put();
         pub(crate) fn asahi_g15_reprobe();
         pub(crate) fn asahi_g15_report_loader_gpu();
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
@@ -121,12 +122,17 @@ pub(crate) mod glue {
         RETAINED.load(Ordering::Acquire)
     }
 
-    /// Pins this module until reboot, once (`__module_get(THIS_MODULE)`).
-    pub(crate) fn retain_module() {
-        if !RETAINED.swap(true, Ordering::AcqRel) {
-            // SAFETY: The module is live while its code runs; the reference is never put.
-            unsafe { asahi_g15_module_get() };
-        }
+    /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`, see `retain.rs`).
+    /// ENODEV, with nothing pinned or marked, once the module's removal has begun.
+    pub(crate) fn retain_module() -> Result {
+        crate::g15::retain::retain(
+            &RETAINED,
+            // SAFETY: Takes a reference to this module unless its removal has begun.
+            || unsafe { asahi_g15_module_try_get() },
+            // SAFETY: Drops only the reference this call took; the winner's is never put.
+            || unsafe { asahi_g15_module_put() },
+        )
+        .map_err(|_| ENODEV)
     }
 
     /// The phram "adt" export: start and size.
@@ -675,8 +681,16 @@ pub(crate) fn start(
         return Err(e);
     }
 
+    // Pin the module before anything firmware-visible. Once its removal has begun this fails
+    // and the firmware is left untouched, cleaned up as for a failed self-check: the vote is
+    // released and the session stays unretained.
+    if let Err(e) = glue::retain_module() {
+        dev_err!(d, "G15: the module is being removed; the firmware is not started\n");
+        // Mapped with cached firmware classes: never unmapped.
+        core::mem::forget(objects);
+        return Err(e);
+    }
     // From here on the firmware is touched: nothing it can reach is freed, the vote included.
-    glue::retain_module();
     vote.keep();
     let rtkit = match Rtkit::new(&d, shared) {
         Ok(rtkit) => rtkit,
