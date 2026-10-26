@@ -25,10 +25,10 @@ locked dependency graph is used, with at most two build jobs. ``--archive`` can
 supply an already downloaded source archive; its digest is still checked. The
 script builds and runs compile-only valid-input checks, then prints the exact
 ``BINDGEN=/absolute/path/to/bindgen`` make argument. It installs nothing globally.
-The kernel build passes ``--no-layout-tests`` to bindgen unless
-``BINDGEN_LAYOUT_TESTS=1`` is given, so add that variable to check layouts
-with the private tool, and build the complete kernel Image and matching
-modules with the same tool.
+The kernel always retains layout assertions. Pass the printed ``BINDGEN=``
+argument on the make command line; an exported environment variable is
+overridden by the top-level Makefile. Build the complete kernel Image and
+matching modules with the same tool.
 Both scripts reject optimized Python (``-O``, ``-OO`` or ``PYTHONOPTIMIZE``)
 before creating output, since their validation assertions must remain enabled.
 
@@ -70,14 +70,14 @@ generator, and its changes and both tool digests belong in the build record.
 Repository guard and supported tool versions
 --------------------------------------------
 
-By default the kernel passes ``--no-layout-tests``, as upstream, so stock
-bindgen builds it; ``make BINDGEN_LAYOUT_TESTS=1`` keeps the layout checks
-(see ``Documentation/rust/bindgen-layout-checks.rst``). Its minimum bindgen is
+Every kernel build keeps the layout checks (see
+``Documentation/rust/bindgen-layout-checks.rst``). Stock bindgen can fail these
+checks for valid configurations; use the corrected generator rather than
+disabling the assertions or changing configuration to hide a layout bug. Its minimum bindgen is
 0.71.1, and its fixed ``--rust-target 1.85`` enables the ``offset_of`` feature
 (available from Rust 1.77). In both official 0.71.1 and the pinned 0.73.2
 generator, that feature selects unconditional const size/alignment/offset
-assertions rather than ``#[test]`` functions. A bindings crate compile with
-``BINDGEN_LAYOUT_TESTS=1`` therefore checks layouts without requiring a Rust
+assertions rather than ``#[test]`` functions. A bindings crate compile therefore checks layouts without requiring a Rust
 unit-test configuration. This is source-backed for the accepted minimum and
 pinned tool; future generator changes must retain that capability.
 
@@ -87,6 +87,6 @@ Primary sources:
 * https://github.com/rust-lang/rust-bindgen/blob/v0.71.1/bindgen/codegen/mod.rs
 * https://github.com/rust-lang/rust-bindgen/tree/v0.73.2
 
-A complete kernel build with ``BINDGEN_LAYOUT_TESTS=1`` remains the
+A complete kernel build remains the
 configuration-specific layout check; these small generator fixtures do not
 replace it or establish runtime GPU stability.

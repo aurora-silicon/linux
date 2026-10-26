@@ -513,23 +513,16 @@ endif
 # architecture instead of generating `usize`.
 bindgen_c_flags_final = $(bindgen_c_flags_lto) -fno-builtin -D__BINDGEN__
 
-# Layout assertions are off by default, as upstream: stock bindgen 0.73
-# computes a different total size for a few kernel types, so the bindings
-# would not build with it. `make BINDGEN_LAYOUT_TESTS=1` keeps them, for
-# checking a bindings generator; see
-# Documentation/rust/bindgen-layout-checks.rst.
-ifeq ($(BINDGEN_LAYOUT_TESTS),1)
-bindgen_layout_flags :=
-else
-bindgen_layout_flags := --no-layout-tests
-endif
+# Keep bindgen's unconditional layout assertions in every build. An empty,
+# cacheline-aligned sched_statistics (CONFIG_SCHEDSTATS=n) exposes a generator
+# bug that shifts task_struct.mm, so even pointer field access can be unsafe.
+# See Documentation/rust/bindgen-layout-checks.rst for the corrected generator.
 
 # `--rust-target` points to our minimum supported Rust version.
 quiet_cmd_bindgen = BINDGEN $@
       cmd_bindgen = \
 	$(BINDGEN) $< $(bindgen_target_flags) --rust-target 1.85 \
 		--use-core --with-derive-default --ctypes-prefix ffi \
-		$(bindgen_layout_flags) \
 		--no-debug '.*' --enable-function-attribute-detection \
 		-o $@ -- $(bindgen_c_flags_final) -DMODULE \
 		$(bindgen_target_cflags) $(bindgen_target_extra)
