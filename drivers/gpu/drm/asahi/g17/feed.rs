@@ -410,7 +410,7 @@ impl Feed {
         Monotonic::ktime_get() as u64
     }
 
-    pub(crate) fn note_render_pass(&self, start: u64, end: u64) {
+    pub(crate) fn note_pass(&self, start: u64, end: u64) {
         if cfg!(CONFIG_CPU_FREQ) {
             self.detector.note(start, end, Self::now());
         }

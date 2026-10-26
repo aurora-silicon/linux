@@ -164,7 +164,7 @@ impl crate::g17::Shared {
                 return Err(error);
             }
             let firmware = (*state).as_deref_mut().ok_or(EIO)?;
-            self.changed.notify_all();
+            self.note_changed();
             if firmware.render_grow_pending() || firmware.queues.render.take_missed_event(slot as u8) {
                 self.queue_events();
             }

@@ -1110,9 +1110,7 @@ impl TaDescriptor {
         } else if scs_register {
             self.registers.set(array_va, &registers)?;
         } else {
-            let mut trimmed = [registers[0]; TA_REGISTERS];
-            trimmed[TA_SCS_ENABLE_INDEX..].copy_from_slice(&registers[TA_SCS_ENABLE_INDEX + 1..]);
-            self.registers.set(array_va, &trimmed)?;
+            self.registers.set_without(array_va, &registers, TA_SCS_ENABLE_INDEX)?;
         }
         self.tpc_va = resources.tpc_va;
         self.tpc_size = resources.tpc_size;
@@ -1456,10 +1454,7 @@ impl FragmentSlot {
         } else if scs_register {
             desc.arrays[0].set(arrays[0], &registers)?;
         } else {
-            let mut trimmed = [registers[0]; FRAGMENT_REGISTERS];
-            trimmed[FRAGMENT_SCS_ENABLE_INDEX..]
-                .copy_from_slice(&registers[FRAGMENT_SCS_ENABLE_INDEX + 1..]);
-            desc.arrays[0].set(arrays[0], &trimmed)?;
+            desc.arrays[0].set_without(arrays[0], &registers, FRAGMENT_SCS_ENABLE_INDEX)?;
         }
         desc.arrays[1].set(arrays[1], &partial_store_registers(pass, &words))?;
         desc.arrays[2].set(arrays[2], &partial_resume_registers(pass, &words))?;

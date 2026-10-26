@@ -53,6 +53,32 @@ pub(crate) fn renew_execution(published: bool, enabled: bool, renewals: &mut u8)
     true
 }
 
+/// Polls a published job may be renewed while the GPU keeps retiring work. A job
+/// shares the GPU's cores with every other runnable queue, so its wall time grows
+/// with the other clients' work: beside four other clients a 1.5 s dispatch took up
+/// to 5 s, and lower-priority work waits behind higher-priority work. It has not
+/// hung while the GPU keeps completing commands. Fourteen renewals bound the wait at
+/// thirty seconds, after which a job that still has not finished fails as before.
+const SHARED_RENEWALS: u8 = 14;
+
+/// The GPU counts as live while some command retired this recently. Under heavy
+/// sharing the longest gap between retirements measured 1.2 s; a GPU that retires
+/// nothing for this long has stopped.
+pub(crate) const LIVENESS_NS: u64 = 5_000_000_000;
+
+/// Renews a published job's deadline while some command retired within
+/// [`LIVENESS_NS`] (`since_retired`), at most [`SHARED_RENEWALS`] times.
+pub(crate) fn renew_shared(published: bool, since_retired: Option<u64>, renewals: &mut u8) -> bool {
+    if !published
+        || !since_retired.is_some_and(|since| since < LIVENESS_NS)
+        || *renewals >= SHARED_RENEWALS
+    {
+        return false;
+    }
+    *renewals += 1;
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Head {
     /// The owning VM's [`crate::mmu::Vm::id`], one per VM status; the watchdog lines print it.
@@ -213,6 +239,24 @@ mod tests {
         }
         assert_eq!(classify(own, MAX_RENEWALS, [head(7, 100, false)].into_iter()), Decision::Spare);
         assert_eq!(POLL_MS * (1 + u32::from(ray) + u32::from(MAX_RENEWALS)), 26_000);
+    }
+    #[test]
+    fn a_live_gpu_renews_a_published_job_for_thirty_seconds() {
+        let mut renewals = 0;
+        for poll in 1..=14u8 {
+            assert!(renew_shared(true, Some(4_900_000_000), &mut renewals));
+            assert_eq!(renewals, poll);
+        }
+        assert!(!renew_shared(true, Some(0), &mut renewals));
+        assert_eq!(POLL_MS * (u32::from(renewals) + 1), 30_000);
+    }
+    #[test]
+    fn a_stopped_gpu_or_unpublished_job_keeps_the_deadline() {
+        let mut renewals = 0;
+        assert!(!renew_shared(true, Some(LIVENESS_NS), &mut renewals));
+        assert!(!renew_shared(true, None, &mut renewals));
+        assert!(!renew_shared(false, Some(0), &mut renewals));
+        assert_eq!(renewals, 0);
     }
     #[test]
     fn exhausted_or_invalid_credit_never_wraps() {

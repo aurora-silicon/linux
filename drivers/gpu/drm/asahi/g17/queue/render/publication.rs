@@ -19,7 +19,7 @@ fn identity(mut config: QueueConfig) -> QueueConfig {
     config.qos_update = 0;
     config
 }
-pub(super) fn required(previous: Option<QueueConfig>, config: QueueConfig) -> bool {
+pub(in crate::g17::queue) fn required(previous: Option<QueueConfig>, config: QueueConfig) -> bool {
     config.install != 0
         || config.context_update != 0
         || config.completion_seed_valid != 0

@@ -537,6 +537,34 @@ const _: () = {
 };
 
 impl Memory {
+    /// Requests the tiling descriptor slot and both queue configuration records of
+    /// `ordinal` for writing. The firmware accessed them for the command that used them
+    /// last, so the host no longer holds their lines; requesting them before the rest of
+    /// the preparation overlaps those transfers with it instead of stalling the writes one
+    /// line at a time.
+    pub(super) fn prefetch_descriptors(&self, ordinal: u64) {
+        let record = ordinal as usize % RECORDS;
+        let config = size_of::<queue::QueueConfig>();
+        let ranges = [
+            (&self.graph.descriptors, Graph::offset(0, ordinal), size_of::<abi::TaDescriptor>()),
+            (&self.graph.config, CONFIG[0] + record * CONFIG_STRIDE, config),
+            (&self.graph.config, CONFIG[1] + record * CONFIG_STRIDE, config),
+        ];
+        for (object, offset, size) in ranges {
+            let Ok(base) = object.pointer(offset, size) else {
+                continue;
+            };
+            for line in (0..size).step_by(64) {
+                // SAFETY: A prefetch hint inside the retained mapping; it has no
+                // architectural effect on memory.
+                unsafe {
+                    core::arch::asm!("prfm pstl1keep, [{0}]", in(reg) base.add(line),
+                        options(nostack, preserves_flags, readonly));
+                }
+            }
+        }
+    }
+
     pub(super) fn write_descriptors(
         &mut self,
         args: &abi::RenderArgs<'_>,
@@ -571,21 +599,10 @@ impl Memory {
             (&mut *tiling).write(args)?;
             let fragment = &mut *fragment;
             fragment.write(args)?;
-            self.registers.bytes_mut().fill(0);
-            for (index, array) in fragment.descriptor.arrays.iter().enumerate() {
-                for (entry, value) in array
-                    .entries
-                    .get(..(array.size & 0xffff) as usize)
-                    .ok_or(EINVAL)?
-                    .iter()
-                    .enumerate()
-                {
-                    self.registers.write(
-                        index * size_of::<fw::kick::RegisterArray>()
-                            + entry * size_of::<fw::kick::RegisterWrite>(),
-                        *value,
-                    )?;
-                }
+            // Kick entries bind the arrays embedded in this descriptor
+            // (register_bindings); the client register page is never read.
+            for array in &fragment.descriptor.arrays {
+                array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
             }
             fragment.set_mcache(
                 args.fragment.descriptor_va,

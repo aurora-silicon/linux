@@ -6,7 +6,7 @@
 use core::sync::atomic::AtomicU32;
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
-const IDLE_HOLD_NS: u64 = 16_000_000;
+pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
 
 /// The firmware's idle power-off delay as measured on T6040/25G83: the cores power off 2 ms after
 /// the last job. Not measured on other firmware; at or below it the hold stays off.
