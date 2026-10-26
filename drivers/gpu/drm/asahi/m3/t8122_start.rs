@@ -252,7 +252,7 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
             if raw.values_given() {
                 dev_info!(
                     dev,
-                    "M3 G15G start: asahi.t8122_* values given without asahi.t8122_start=1; ignored\n"
+                    "M3 G15G start: disabled by asahi.t8122_start=0; other asahi.t8122_* values ignored\n"
                 );
             }
             return Ok(None);

@@ -272,10 +272,9 @@ pub(crate) fn by_chip(chip_id: u32) -> Option<&'static Soc> {
 /// the one the T8122 identity gate admits (`t8122_admission`: family 7, variant 2, revision 0x20,
 /// core slots in the first core-mask word only), with the die count of the AGX3 identification
 /// table (`hw::agx3::T8122`). The hardware configuration is `hw::t8122`; power configuration
-/// comes from the boot loader. The rest of the runtime configuration is complete, but until the
-/// runtime has passed on an M3 MacBook Air the SoC is refused, before the GPU is accessed, unless
-/// `asahi.t8122_start=1` arms the start (`t8122_start`), which uses this table's values and adds a
-/// performance-state cap.
+/// comes from the boot loader. Startup uses the guarded `t8122_start` path, which selects this
+/// table's values by default on admitted Air boards and adds a performance-state cap. Explicit
+/// `asahi.t8122_start=0` disables startup; firmware, board and resource admission still apply.
 pub(crate) static T8122: Soc = Soc {
     name: "T8122",
     gpu_name: "G15G",
@@ -326,7 +325,7 @@ pub(crate) static T8122: Soc = Soc {
     },
     power_from_boot_loader: true,
     unported: &[
-        "a pass on an M3 MacBook Air: until then the GPU starts only with asahi.t8122_start=1",
+        "M3 Air startup requires the guarded t8122_start path and its performance-state cap",
     ],
     // The performance state only. On the single-cluster G15G, reading the engine-busy or the
     // fault-bank registers after every job hangs the SoC within seconds at about 1000 jobs/s;
