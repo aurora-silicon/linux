@@ -61,6 +61,7 @@ enum dcp_firmware_version {
 	 * (iomfb_v26_6_desktop.c); not the J613 DCPLink DCP_FIRMWARE_V_26_6.
 	 */
 	DCP_FIRMWARE_V_26_6_DESKTOP,
+	DCP_FIRMWARE_V_27_0,
 };
 
 #endif /*__APPLE_VERSION_UTILS_H__*/
