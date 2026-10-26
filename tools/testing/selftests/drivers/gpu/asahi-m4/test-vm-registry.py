@@ -20,7 +20,7 @@ struct KVec<T>(Vec<T>);impl<T>KVec<T>{fn push(&mut self,v:T,_f:u32)->Result{self
 impl<T>std::ops::Deref for KVec<T>{type Target=Vec<T>;fn deref(&self)->&Vec<T>{&self.0}}
 impl<T>std::ops::DerefMut for KVec<T>{fn deref_mut(&mut self)->&mut Vec<T>{&mut self.0}}
 mod hw{pub mod sizes{pub const MAX_VMS:u32=63;}}
-mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->&u32{&0}}pub static robust_isolation:Param=Param;}
+mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->u32{0}}pub static robust_isolation:Param=Param;}
 mod types{pub struct ScopeGuard<F:FnOnce()>(Option<F>);impl<F:FnOnce()>ScopeGuard<F>{pub fn new(f:F)->Self{Self(Some(f))}pub fn dismiss(mut self){self.0.take();}}impl<F:FnOnce()>Drop for ScopeGuard<F>{fn drop(&mut self){if let Some(f)=self.0.take(){f()}}}}
 struct Handle;impl Handle{fn is_closed(&self)->bool{false}}
 struct VmState{id:u64,vm:Handle,drops:Arc<AtomicU32>}impl Drop for VmState{fn drop(&mut self){self.drops.fetch_add(1,Ordering::AcqRel);}}

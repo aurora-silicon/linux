@@ -19,7 +19,7 @@ def body(source,marker):
 mm=(ROOT/'drivers/gpu/drm/asahi/mmu.rs').read_text();pt=(ROOT/'drivers/gpu/drm/asahi/pgtable.rs').read_text()
 pre=r'''
 #![allow(dead_code,unused_variables)]
-use std::{cell::RefCell,rc::Rc,mem::ManuallyDrop,ops::{Deref,DerefMut,Range},num::NonZeroUsize,sync::{Mutex as StdMutex,atomic::{AtomicBool as StdAtomicBool,AtomicU8,AtomicU32,AtomicU64,AtomicUsize,Ordering,fence}}};
+use std::{cell::RefCell,rc::Rc,mem::{ManuallyDrop,size_of},ops::{Deref,DerefMut,Range},num::NonZeroUsize,sync::{Mutex as StdMutex,atomic::{AtomicBool as StdAtomicBool,AtomicU8,AtomicU32,AtomicU64,AtomicUsize,Ordering,fence}}};
 type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i32=110;const EOVERFLOW:i32=75;
 static TRIP_LOAD:AtomicUsize=AtomicUsize::new(0);
 struct AtomicBool(StdAtomicBool);impl AtomicBool{fn new(v:bool)->Self{Self(StdAtomicBool::new(v))}fn store(&self,v:bool,o:Ordering){self.0.store(v,o);}fn load(&self,o:Ordering)->bool{let n=TRIP_LOAD.load(Ordering::Relaxed);if n!=0&&TRIP_LOAD.fetch_sub(1,Ordering::Relaxed)==1{self.0.store(true,Ordering::Release);}self.0.load(o)}}
@@ -29,6 +29,7 @@ macro_rules! pr_err{($($t:tt)*)=>{()};}macro_rules! mod_pr_debug{($($t:tt)*)=>{(
 struct MutexBackend;struct Mutex<T>(StdMutex<T>);impl<T>Mutex<T>{fn new(v:T)->Self{Self(StdMutex::new(v))}fn lock(&self)->Guard<'_,T,MutexBackend>{Guard(self.0.lock().unwrap(),std::marker::PhantomData)}}
 struct Guard<'a,T,M>(std::sync::MutexGuard<'a,T>,std::marker::PhantomData<M>);impl<T,M>Deref for Guard<'_,T,M>{type Target=T;fn deref(&self)->&T{&self.0}}impl<T,M>DerefMut for Guard<'_,T,M>{fn deref_mut(&mut self)->&mut T{&mut self.0}}
 struct Monotonic;struct Delta;impl Delta{fn from_millis(n:u64)->u64{n}}struct Instant<T>{n:std::cell::Cell<u64>,p:std::marker::PhantomData<T>}impl<T>Instant<T>{fn now()->Self{Self{n:std::cell::Cell::new(0),p:std::marker::PhantomData}}fn elapsed(&self)->u64{let n=self.n.get();self.n.set(n+1);n}}
+mod pgtable{pub fn clean_poc(_p:*const u8,_n:usize){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub fn poc_barrier(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}}
 mod mem{pub fn sync(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub fn tlbi_asid(_:u8){}}
 #[derive(Clone,Copy,PartialEq,Eq)]enum UatFirmware{Handoff,PublishedRoots}
 struct Handoff{lock_ap:AtomicU8,lock_fw:AtomicU8,turn:AtomicU32,cur_slot:AtomicU32}impl Handoff{fn new()->Self{Self{lock_ap:AtomicU8::new(0),lock_fw:AtomicU8::new(0),turn:AtomicU32::new(0),cur_slot:AtomicU32::new(0xffff)}}
@@ -36,17 +37,19 @@ struct Handoff{lock_ap:AtomicU8,lock_fw:AtomicU8,turn:AtomicU32,cur_slot:AtomicU
 handoff='\n'.join(body(mm,m) for m in ['fn lock(&self) {\n        self.lock_ap', 'fn unlock(&self) {\n        self.turn', 'fn current_slot('])
 mid=r'''
 }
-struct SlotTTBS{ttb0:AtomicU64,ttb1:AtomicU64}struct UatShared{handoff:Handoff,ttbs:[SlotTTBS;64],map_kernel_to_user:bool,kernel_ttb1:u64,binding_generations:[u64;64],binding_published:[bool;64],owned_user_roots:[u64;64]}
+struct Quirks{handoff_lock:bool,clean_tables:bool}
+struct SlotTTBS{ttb0:AtomicU64,ttb1:AtomicU64}struct UatShared{handoff:Handoff,ttbs:[SlotTTBS;64],map_kernel_to_user:bool,kernel_ttb1:u64,binding_generations:[u64;64],binding_published:[bool;64],owned_user_roots:[u64;64],quirks:Quirks}
 impl UatShared{fn handoff(&self)->&Handoff{&self.handoff}fn ttbs(&self)->&[SlotTTBS;64]{&self.ttbs}}
 struct UatInner{firmware:UatFirmware,m4_adopted:bool,failed:AtomicBool,shared:Mutex<UatShared>}
 '''
+mid=mid.replace('impl UatShared{','impl UatShared{'+''.join(body(mm,m) for m in ['fn handoff_lock(', 'fn handoff_unlock(', 'fn publish_slot(']))
 raii='#[path="'+str(ROOT/'drivers/gpu/drm/asahi/mmu/ppl.rs')+'"]mod ppl;\n'+'\n'.join(body(mm,m) for m in [
  'struct M4Transport<', 'impl ppl::Memory for M4Transport', 'enum HandoffGuard<',
  'impl HandoffGuard<', 'impl Drop for HandoffGuard<'
 ])
 inner='impl UatInner{\n'+'\n'.join(body(mm,m) for m in ['fn lock(&self) -> Guard', 'fn check_m4(', 'fn lock_handoff(', 'fn lock_m4_upper('])+'\n}\n'
 models=r'''
-fn uat(m4:bool,firmware:UatFirmware)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64]})})}
+fn uat(m4:bool,firmware:UatFirmware)->Rc<UatInner>{Rc::new(UatInner{firmware,m4_adopted:m4,failed:AtomicBool::new(false),shared:Mutex::new(UatShared{handoff:Handoff::new(),ttbs:std::array::from_fn(|_|SlotTTBS{ttb0:AtomicU64::new(0),ttb1:AtomicU64::new(0)}),map_kernel_to_user:!m4,kernel_ttb1:0x800000000,binding_generations:[0;64],binding_published:[false;64],owned_user_roots:[0;64],quirks:Quirks{handoff_lock:true,clean_tables:false}})})}
 #[derive(Clone,Copy)]struct Prot{cached:bool}impl Prot{fn is_cached_noncoherent(&self)->bool{self.cached}}
 struct Mutation;impl Drop for Mutation{fn drop(&mut self){MUTATIONS.fetch_sub(1,Ordering::Relaxed);}}
 struct MapTable{fail:bool}impl MapTable{fn unmap_pages(&mut self,_r:Range<u64>)->Result{LEAF_CLEARS.fetch_add(1,Ordering::Relaxed);if self.fail{Err(EIO)}else{Ok(())}}}
@@ -72,7 +75,7 @@ struct VmBinding{active_users:usize,bind_token:Option<Token>,binding:Option<Slot
 #[derive(Clone)]struct Vm{id:u64,binding:Rc<Mutex<VmBinding>>}
 struct VmBind(Vm,u32);
 struct Uat{inner:Rc<UatInner>,slots:Allocator}
-mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->&u32{&0}}pub static robust_isolation:Param=Param;}
+mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->u32{0}}pub static robust_isolation:Param=Param;}
 '''
 helpers='\n'.join(body(mm,m) for m in ['const fn binding_wire_generation(', 'const fn application_ttb1('])
 bind='impl Uat{'+body(mm,'pub(crate) fn bind(&self, vm: &Vm)')+'}\n'

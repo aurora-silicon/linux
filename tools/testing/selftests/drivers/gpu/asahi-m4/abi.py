@@ -61,12 +61,16 @@ def run_measurements(command, source, binary):
 
 def c_layout(header, bindings, output, tag):
     keys, _ = expressions(bindings)
+    capacity_tail = 'client_memory_limit;' in header.read_text()
     # Linux 7.2 folds the historical extension structs into the base payloads.
     # Compare the same wire prefixes and offsets while keeping the C oracle frozen.
     if 'struct drm_asahi_cmd_render_with_prior {' not in header.read_text():
         translated = []
         for key, expr in keys:
             kind, _, field = key.partition(':')
+            if capacity_tail and key == 'drm_asahi_params_global:size':
+                # Compare the frozen reply prefix; validate the entire known additive tail below.
+                expr = 'offsetof(struct drm_asahi_params_global, memory_limit)'
             if key == "drm_asahi_vm_create:pad":
                 expr = "offsetof(struct drm_asahi_vm_create, flags)"
             base = None
@@ -89,6 +93,14 @@ def c_layout(header, bindings, output, tag):
     source = output / (tag + '.c')
     lines = ['#include <stdio.h>', '#include <stddef.h>',
              '#include ' + json.dumps(str(header)), 'int main(void) {']
+    if capacity_tail:
+        lines[3:3] = [
+            '_Static_assert(sizeof(struct drm_asahi_params_global) == 616, "capacity reply size");',
+            '_Static_assert(offsetof(struct drm_asahi_params_global, memory_limit) == 600, "capacity prefix");',
+            '_Static_assert(offsetof(struct drm_asahi_params_global, client_memory_limit) == 608, "client capacity offset");',
+            '_Static_assert(sizeof(((struct drm_asahi_params_global *)0)->memory_limit) == 8, "capacity width");',
+            '_Static_assert(sizeof(((struct drm_asahi_params_global *)0)->client_memory_limit) == 8, "client capacity width");',
+        ]
     lines += [f'printf("{key}=%llu\\n", (unsigned long long)({expr}));' for key, expr in keys]
     source.write_text('\n'.join(lines + ['return 0;', '}']) + '\n')
     return run_measurements(shlex.split(os.environ.get('CC', 'cc')) +

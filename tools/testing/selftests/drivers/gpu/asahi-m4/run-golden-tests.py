@@ -15,10 +15,14 @@ def main():
     manifest = unpack_fixtures(golden)
     (out / 'public-uapi.rs').write_bytes(frozen_bindings().read_bytes())
     backend = root / 'drivers/gpu/drm/asahi/g16'
+    identity = (root / 'drivers/gpu/drm/asahi/fwid.rs').read_text()
+    first = identity.index('pub(crate) struct FirmwareBuild {')
+    build_type = identity[first:identity.index('\n}', first) + 2]
     logs = []
     for name in ['initdata', 'compute', 'render', 'channels', 'initdata-bounds']:
         source = (HERE / f'check-{name}.rs').read_text()
         source = source.replace('@KERNEL@', str(root)).replace('@OUTPUT@', str(out))
+        source = source.replace('@FWID_BUILD@', build_type)
         test = out / f'check-{name}.rs'
         test.write_text(source)
         binary = out / f'check-{name}'
