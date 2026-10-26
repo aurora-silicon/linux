@@ -17,6 +17,16 @@
 			dma-channels = <8>;
 		};
 
+		sio-probe-test-t6030-missing {
+			compatible = "apple,t6030-sio", "apple,sio";
+			dma-channels = <8>;
+		};
+
+		sio-probe-test-unknown {
+			compatible = "apple,sio-probe-test-unknown";
+			dma-channels = <8>;
+		};
+
 		v10_w: v10-w {
 			iommu-addresses = <&v10 0x0 0x30000 0x0 0x4000>, <&v10 0x0 0x34000 0x0 0x20000>,
 					  <&v10 0x0 0x54000 0x0 0x4000>, <&v10 0x0 0x58000 0x0 0x4000>;

@@ -108,7 +108,14 @@ struct sio_chan {
 
 typedef void (*sio_ack_callback)(struct sio_chan *, void *, bool);
 
+struct sio_hw_data {
+	u32 fifo_threshold;
+	bool clear_period_desc;
+	int (*check_boot_tables)(struct device *dev);
+};
+
 struct sio_data {
+	const struct sio_hw_data *hw;
 	void __iomem *base;
 	struct dma_device dma;
 	struct device *dev;
@@ -130,9 +137,6 @@ struct sio_data {
 	} tags;
 
 	int nchannels;
-#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
-	bool t6030;
-#endif
 	struct sio_chan channels[];
 };
 
@@ -155,16 +159,6 @@ static int sio_send_siomsg_atomic(struct sio_data *sio, u64 msg,
 				  void *cookie);
 static int sio_call(struct sio_data *sio, u64 msg);
 
-static inline bool sio_is_t6030(struct sio_data *sio)
-{
-#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
-	return sio->t6030;
-#else
-	return false;
-#endif
-}
-
-#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
 /*
  * Boot tables of the T6030 SIO firmware, protocol 10. The boot loader builds them from the ADT
  * and passes each one as two apple,sio-firmware-params: the table's IOVA page under its key and
@@ -320,7 +314,23 @@ static int sio_t6030_check_boot_tables(struct device *dev)
 	}
 	return 0;
 }
-#endif
+
+static const struct sio_hw_data sio_hw_generic = {
+	.fifo_threshold = 0x800,
+};
+
+static const struct sio_hw_data sio_hw_t6030 = {
+	.fifo_threshold = 0x600,
+	.clear_period_desc = true,
+	.check_boot_tables = sio_t6030_check_boot_tables,
+};
+
+static const struct of_device_id sio_of_match[] = {
+	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
+	{ .compatible = "apple,sio", .data = &sio_hw_generic },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, sio_of_match);
 
 static struct sio_chan *to_sio_chan(struct dma_chan *chan)
 {
@@ -459,7 +469,7 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 		 * T6030: publish the whole descriptor, its other fields zero;
 		 * a slot may come back from an earlier transfer.
 		 */
-		if (sio_is_t6030(siochan->host))
+		if (siochan->host->hw->clear_period_desc)
 			memset(d, 0, sizeof(*d));
 		d->flag = 1; /* not sure what's up with this */
 		d->iova = buf_addr + period_len * i;
@@ -839,7 +849,7 @@ static int sio_device_config(struct dma_chan *chan,
 	 * dp-audioN dma-channels: channel, data shape, timeout, FIFO size,
 	 * threshold). T6030's DisplayPort audio channels refill at 0x600.
 	 */
-	cfg.threshold = sio_is_t6030(sio) ? 0x600 : 0x800;
+	cfg.threshold = sio->hw->fifo_threshold;
 
 	/*
 	 * Dmaengine prescribes we ought to apply the new configuration only
@@ -967,20 +977,23 @@ badprop:
 static int sio_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
+	const struct of_device_id *match;
+	const struct sio_hw_data *hw;
 	struct sio_data *sio;
 	struct dma_device *dma;
 	int nchannels;
 	int err, i;
 
-	/*
-	 * Only APPLE_SIO_T6030 checks a T6030's boot tables and configures its
-	 * channels: without it, leave the SIO stopped rather than start it as
-	 * the generic one.
-	 */
-	if (!IS_ENABLED(CONFIG_APPLE_SIO_T6030) &&
-	    of_device_is_compatible(np, "apple,t6030-sio"))
-		return dev_err_probe(&pdev->dev, -ENODEV,
-				     "T6030 SIO support (APPLE_SIO_T6030) not built; leaving the SIO stopped\n");
+	match = of_match_node(sio_of_match, np);
+	if (!match)
+		return -ENODEV;
+	hw = match->data;
+	/* Refuse incompatible firmware tables before DMA or hardware setup. */
+	if (hw->check_boot_tables) {
+		err = hw->check_boot_tables(&pdev->dev);
+		if (err)
+			return err;
+	}
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
 	if (err)
@@ -998,15 +1011,7 @@ static int sio_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, sio);
 	sio->dev = &pdev->dev;
 	sio->nchannels = nchannels;
-#if IS_ENABLED(CONFIG_APPLE_SIO_T6030)
-	sio->t6030 = of_device_is_compatible(np, "apple,t6030-sio");
-	/* Before any register, power or firmware access */
-	if (sio->t6030) {
-		err = sio_t6030_check_boot_tables(&pdev->dev);
-		if (err)
-			return err;
-	}
-#endif
+	sio->hw = hw;
 
 	sio->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sio->base))
@@ -1106,12 +1111,6 @@ static void sio_remove(struct platform_device *pdev)
 	of_dma_controller_free(pdev->dev.of_node);
 	dma_async_device_unregister(&sio->dma);
 }
-
-static const struct of_device_id sio_of_match[] = {
-	{ .compatible = "apple,sio", },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, sio_of_match);
 
 static __maybe_unused int sio_suspend(struct device *dev)
 {
