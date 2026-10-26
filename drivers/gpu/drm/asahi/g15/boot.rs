@@ -306,10 +306,12 @@ unsafe extern "C" fn rtkit_shmem_destroy(
 /// The GPU's RTKit callbacks.
 static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     flags: 0,
+    protocol_version: 0,
     crashed: Some(rtkit_crashed),
     recv_message: Some(rtkit_recv),
     recv_message_early: Some(rtkit_recv_early),
     shmem_setup: Some(rtkit_shmem_setup),
+    shmem_setup_ep: None,
     shmem_destroy: Some(rtkit_shmem_destroy),
     syslog_is_debug: None,
 };
