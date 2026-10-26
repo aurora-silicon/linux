@@ -132,6 +132,17 @@ pub(crate) fn start(raw: &Raw) -> Start {
     }
 }
 
+/// The shipped board policy changes only an omitted start parameter. Explicit recovery-off,
+/// explicit experimental start, and malformed values retain their original meanings.
+/// Hardware resources and firmware identity are admitted separately by the caller.
+pub(crate) fn start_for_board(raw: &Raw, admitted_board: bool) -> Start {
+    if raw.start == UNSET && admitted_board {
+        Start::On
+    } else {
+        start(raw)
+    }
+}
+
 /// The GPU clock-generator IO mapping.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClockGen {
@@ -230,6 +241,19 @@ mod tests {
         assert!(!with(|_| {}).values_given());
         assert!(with(|r| r.pstate_cap = 3).values_given());
         assert!(with(|r| r.fender = INVALID).values_given());
+    }
+
+    #[test]
+    fn automatic_start_is_board_scoped_and_explicit_values_win() {
+        assert_eq!(start_for_board(&Raw::NONE, true), Start::On);
+        assert_eq!(start_for_board(&Raw::NONE, false), Start::Off);
+        for admitted_board in [false, true] {
+            assert_eq!(start_for_board(&with(|r| r.start = 0), admitted_board), Start::Off);
+            assert_eq!(start_for_board(&with(|_| {}), admitted_board), Start::On);
+            assert_eq!(start_for_board(&with(|r| r.start = 2), admitted_board), Start::Invalid);
+            assert_eq!(start_for_board(&with(|r| r.start = INVALID), admitted_board), Start::Invalid);
+            assert_eq!(start_for_board(&with(|r| r.start = parse_number("bogus")), admitted_board), Start::Invalid);
+        }
     }
 
     #[test]

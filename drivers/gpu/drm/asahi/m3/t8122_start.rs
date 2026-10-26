@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! The T8122 (M3, G15G) start, `asahi.t8122_start=1`.
+//! T8122 (M3, G15G) board-default startup and bounded experiment values.
 //!
-//! The T8122 table (`m3_soc::T8122`) is complete, but the runtime has not passed on an M3
-//! MacBook Air yet, so the SoC is refused unless `asahi.t8122_start=1` arms the start. On a T8122
-//! whose GPU the boot loader handed over (resource admission passed), an armed start uses the
-//! table's values, with a performance-state cap. Each value can be overridden for a lab A/B by
+//! The T8122 table (`m3_soc::T8122`) is complete. An omitted start parameter starts
+//! automatically only on its listed Air boards; explicit `asahi.t8122_start=0`
+//! remains the recovery opt-out. Resource and known-firmware admission still run.
+//! The same table values can be changed for a controlled experiment by
 //! rebooting with a parameter:
 //!
 //! | Parameter | Default | Others |
@@ -19,7 +19,7 @@
 //! | `asahi.t8122_pstate_cap` | `2` | 1 to 5 |
 //!
 //! The defaults are the T8122 table's values. A parameter given with a value it does not accept
-//! refuses the start. Without `asahi.t8122_start=1` nothing here runs, and T8122 is refused.
+//! refuses the start. Unlisted boards remain refused by the existing backend admission.
 //! Nothing here applies to any other SoC.
 
 use core::mem::offset_of;
@@ -237,16 +237,16 @@ pub(crate) fn mmio_prot(read_only: u32, slot: usize) -> Prot {
 
 /// Decide, after resource admission, whether `soc` starts with the experiment values.
 ///
-/// Any SoC but T8122: Ok(None), silently. T8122 without `asahi.t8122_start=1`: Ok(None), so the
-/// caller refuses it as before (one extra line when experiment parameters were given). T8122
-/// with `asahi.t8122_start=1`: the experiment, after logging every value, or a refusal for a
-/// parameter value it does not accept.
+/// Any SoC but T8122: Ok(None). On its listed Air boards, an omitted parameter
+/// selects the table values; explicit 0 disables startup, and invalid values fail
+/// closed. Existing backend admission still refuses an unlisted board, even
+/// with an explicit start request.
 pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>> {
     if !is_t8122(soc) {
         return Ok(None);
     }
     let raw = crate::m3::m3_params::t8122_params();
-    match knobs::start(&raw) {
+    match knobs::start_for_board(&raw, crate::m3::m3_board::runtime_validated_board(soc)) {
         Start::On => {}
         Start::Off => {
             if raw.values_given() {
@@ -283,7 +283,7 @@ pub(crate) fn arm(dev: &device::Device, soc: &Soc) -> Result<Option<Experiment>>
     let e = Experiment(v);
     dev_warn!(
         dev,
-        "M3 G15G start: armed (asahi.t8122_start=1, boot loader handoff admitted): initdata_version={:#018x} fender={:#x} clkgen={} sgx_setup={} unit_mask_a={:#x} unit_mask_b={:#x} pstate_cap={}\n",
+        "M3 G15G start: armed (board default or asahi.t8122_start=1, boot loader handoff admitted): initdata_version={:#018x} fender={:#x} clkgen={} sgx_setup={} unit_mask_a={:#x} unit_mask_b={:#x} pstate_cap={}\n",
         v.initdata_version,
         v.fender,
         clkgen_label(v.clock_gen, v.fender),
@@ -352,9 +352,12 @@ pub(crate) fn refused(dev: &device::Device, experiment: Option<&Experiment>, sta
     }
 }
 
-/// Log, on a T8122 armed with `asahi.t8122_start=1`, that resource admission refused it.
+/// Log that resource admission refused a T8122 start selected by board default or flag.
 pub(crate) fn not_admitted(dev: &device::Device, soc: &Soc) {
-    if is_t8122(soc) && knobs::start(&crate::m3::m3_params::t8122_params()) == Start::On {
+    if is_t8122(soc) && knobs::start_for_board(
+        &crate::m3::m3_params::t8122_params(),
+        crate::m3::m3_board::runtime_validated_board(soc),
+    ) == Start::On {
         dev_err!(
             dev,
             "M3 G15G start: not armed: resource admission refused the GPU (see the lines above); the boot loader did not hand it over completely\n"

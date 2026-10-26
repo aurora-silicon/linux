@@ -56,10 +56,11 @@ config DRM_ASAHI_M3_T8122
 	help
 	  Build the M3 runtime that starts the GPU of the M3 MacBook Air
 	  (J613, J615) on the 14.8.3 GPU firmware the boot loader leaves
-	  loaded. It starts only with asahi.t8122_start=1 on the kernel
-	  command line, after the boot loader handed the GPU over; without
-	  it the T8122 probe is refused as before. Other GPUs are not
-	  affected.
+	  loaded. On the listed Air boards it starts after the boot loader
+	  handed the GPU over and resource/firmware identity checks pass.
+	  asahi.t8122_start=0 keeps startup disabled for recovery. Unknown
+	  boards and firmware do not gain automatic admission. Other GPUs
+	  are not affected.
 
 config DRM_ASAHI_G15
 	bool "Native G15 firmware backend (M3 Pro/Max)"
