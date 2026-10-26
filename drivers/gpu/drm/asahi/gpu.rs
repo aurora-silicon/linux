@@ -81,6 +81,7 @@ use crate::{
     initdata,
     mem,
     mmu,
+    module_parameters,
     queue,
     regs,
     stats,
@@ -508,6 +509,13 @@ impl GpuManager::ver {
     ) -> Result<Arc<GpuManager::ver>> {
         let uat = Self::make_uat(dev, cfg)?;
         let dyncfg = Self::make_dyncfg(dev, res, cfg, &uat)?;
+
+        if module_parameters::diag_keep_gpuro.value() != 0 {
+            dev_warn!(
+                dev.as_ref(),
+                "DIAGNOSTIC: retaining retired GPU-RO command objects until driver removal\n"
+            );
+        }
 
         let mut alloc = KernelAllocators {
             private: alloc::DefaultAllocator::new(
@@ -1318,7 +1326,13 @@ impl GpuManager::ver {
 
         // The invalidation does a cache flush, so it is okay to collect garbage
         guard.private.collect_garbage(garbage_count);
-        guard.gpu_ro.collect_garbage(garbage_count_gpuro);
+        // Diagnostic only: a malformed crash FAR observed on G13 rotates to the GPU-RO command
+        // heap. Keep retired command objects mapped and unreused to test whether firmware reads
+        // one after the host's normal retirement point. The bounded experiment must monitor
+        // kernel-resident memory; this intentionally retains these objects until driver removal.
+        if module_parameters::diag_keep_gpuro.value() == 0 {
+            guard.gpu_ro.collect_garbage(garbage_count_gpuro);
+        }
 
         Ok(())
     }
@@ -1486,10 +1500,12 @@ impl GpuManager for GpuManager::ver {
         let (garbage_count, garbage_bytes) = guard.private.garbage();
         let (ro_garbage_count, ro_garbage_bytes) = guard.gpu_ro.garbage();
 
+        let keep_gpuro = module_parameters::diag_keep_gpuro.value() != 0;
         if garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
-            || ro_garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
             || garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
-            || ro_garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS
+            || (!keep_gpuro
+                && (ro_garbage_bytes > MAX_FW_ALLOC_GARBAGE_BYTES
+                    || ro_garbage_count > MAX_FW_ALLOC_GARBAGE_OBJECTS))
         {
             mod_dev_dbg!(
                 self.dev,
@@ -1503,7 +1519,9 @@ impl GpuManager for GpuManager::ver {
                 dev_err!(self.dev.as_ref(), "Failed to flush FW cache\n");
             } else {
                 guard.private.collect_garbage(garbage_count);
-                guard.gpu_ro.collect_garbage(ro_garbage_count);
+                if !keep_gpuro {
+                    guard.gpu_ro.collect_garbage(ro_garbage_count);
+                }
             }
         }
 

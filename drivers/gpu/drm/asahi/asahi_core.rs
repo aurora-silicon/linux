@@ -126,6 +126,10 @@ module! {
             // permissions: 0o644,
             description: "Initial TVB size in blocks",
         },
+        diag_keep_gpuro: u32 {
+            default: 0,
+            description: "Diagnostic: retain retired G13/G14 GPU-RO command objects",
+        },
         robust_isolation: u32 {
             default: 0,
             // permissions: 0o644,
