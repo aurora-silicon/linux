@@ -259,7 +259,7 @@ static void integer_boundary_and_saturation(struct kunit *test)
 	grant(test, gate, U64_MAX, U64_MAX);
 	KUNIT_ASSERT_EQ(
 		test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), 0);
-	KUNIT_EXPECT_EQ(test, samples[0], -65536);
+	KUNIT_EXPECT_EQ(test, samples[0], -(1 << (31 - APPLE_ENERGY_UNIT_SHIFT / 2)));
 	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
 	apple_energy_snapshot(gate, &snapshot);
 	KUNIT_EXPECT_EQ(test, snapshot.submitted[0], U64_MAX);
