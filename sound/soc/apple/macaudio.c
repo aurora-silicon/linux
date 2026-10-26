@@ -1909,6 +1909,29 @@ static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_com
 	return ret;
 }
 
+/* INACTIVE is a UI hint, not write exclusion. Fixed speaker transforms
+ * must also be read-only to userspace before a transfer can be certified.
+ */
+static void macaudio_energy_fixed_controls(struct snd_soc_card *card, const char *prefix)
+{
+	static const char * const names[] = {
+		"ASI1 Sel", "HPF Corner Frequency", "OCE Handling",
+	};
+	struct snd_kcontrol *control;
+	unsigned int k, i;
+	char name[sizeof(control->id.name)];
+
+	for (k = 0; k < ARRAY_SIZE(names); k++) {
+		snprintf(name, sizeof(name), "%s%s%s", prefix ?: "", prefix ? " " : "", names[k]);
+		list_for_each_entry(control, &card->snd_card->controls, list) {
+			if (strcmp(control->id.name, name))
+				continue;
+			for (i = 0; i < control->count; i++)
+				control->vd[i].access &= ~SNDRV_CTL_ELEM_ACCESS_WRITE;
+		}
+	}
+}
+
 static int macaudio_late_probe(struct snd_soc_card *card)
 {
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
@@ -1931,6 +1954,8 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		}
 
 		for_each_rtd_codec_dais(rtd, i, dai) {
+			if (ma->has_energy && props->is_speakers)
+				macaudio_energy_fixed_controls(card, dai->component->name_prefix);
 			ret = macaudio_add_pin_routes(card, dai->component,
 						      props->is_speakers);
 
@@ -2470,7 +2495,11 @@ static int macaudio_energy_put(struct snd_kcontrol *control,
 	}
 	deadline = le64_to_cpu(in->deadline_ns);
 	now = ktime_get_boottime_ns();
-	if (deadline <= now || deadline - now > (u64)SPEAKER_LOCK_TIMEOUT * NSEC_PER_MSEC)
+	if (deadline <= now) {
+		ret = -ETIMEDOUT;
+		goto fail;
+	}
+	if (deadline - now > (u64)SPEAKER_LOCK_TIMEOUT * NSEC_PER_MSEC)
 		goto fail;
 	for (k = 0; k < APPLE_ENERGY_SPEAKERS; k++) {
 		if (le32_to_cpu(in->slot[k]) != k)

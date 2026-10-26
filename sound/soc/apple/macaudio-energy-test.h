@@ -22,11 +22,14 @@ static void macaudio_energy_test_cancel(void *context)
 
 static struct macaudio_energy_test *macaudio_energy_test_new(struct kunit *test)
 {
-	static const char * const names[] = {
-		"Speaker Energy Grant", "Left Speaker Volume", "Right Speaker Volume",
+	static const char *const names[] = {
+		"Speaker Energy Grant",
+		"Left Speaker Volume",
+		"Right Speaker Volume",
 		"Left Amp Gain Volume",
 	};
-	struct macaudio_energy_test *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	struct macaudio_energy_test *t =
+		kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
 	u8 slots[] = { 0, 1 };
 	unsigned int k;
 
@@ -46,16 +49,22 @@ static struct macaudio_energy_test *macaudio_energy_test_new(struct kunit *test)
 	t->ma.speaker_lock_owner = &t->owner[0];
 	mutex_init(&t->ma.volume_lock_mutex);
 	apple_energy_init(&t->ma.energy);
-	KUNIT_ASSERT_EQ(test, apple_energy_configure(&t->ma.energy, 48000, 2, 2, slots), 0);
+	KUNIT_ASSERT_EQ(
+		test, apple_energy_configure(&t->ma.energy, 48000, 2, 2, slots),
+		0);
 	apple_energy_fallback(&t->ma.energy, 21474);
-	KUNIT_ASSERT_EQ(test, apple_energy_hardware_safe(&t->ma.energy, true), 0);
-	INIT_DELAYED_WORK(&t->ma.lock_timeout_work, macaudio_vlimit_timeout_work);
+	KUNIT_ASSERT_EQ(test, apple_energy_hardware_safe(&t->ma.energy, true),
+			0);
+	INIT_DELAYED_WORK(&t->ma.lock_timeout_work,
+			  macaudio_vlimit_timeout_work);
 	INIT_WORK(&t->ma.lock_fail_work, macaudio_lock_fail_work);
-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
-					 macaudio_energy_test_cancel, &t->ma), 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, macaudio_energy_test_cancel, &t->ma),
+			0);
 	for (k = 0; k < ARRAY_SIZE(t->control); k++) {
-		struct snd_kcontrol *control =
-			kunit_kzalloc(test, struct_size(control, vd, 1), GFP_KERNEL);
+		struct snd_kcontrol *control = kunit_kzalloc(
+			test, struct_size(control, vd, 1), GFP_KERNEL);
 
 		KUNIT_ASSERT_NOT_NULL(test, control);
 		control->count = 1;
@@ -66,7 +75,8 @@ static struct macaudio_energy_test *macaudio_energy_test_new(struct kunit *test)
 		t->control[k] = control;
 	}
 	t->ma.energy_kctl = t->control[0];
-	t->ma.link_props = kunit_kzalloc(test, sizeof(*t->ma.link_props), GFP_KERNEL);
+	t->ma.link_props =
+		kunit_kzalloc(test, sizeof(*t->ma.link_props), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, t->ma.link_props);
 	t->runtime.card = &t->ma.card;
 	t->runtime.dai_link = &t->link;
@@ -93,13 +103,16 @@ static void macaudio_energy_owner_must_match_every_control(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, macaudio_energy_owner(&t->ma));
 		t->control[k]->vd[0].owner = &t->owner[0];
 	}
-	KUNIT_EXPECT_EQ(test, macaudio_energy_lock(t->control[0], &t->owner[1]), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_energy_lock(t->control[0], &t->owner[1]),
+			-EPERM);
 }
 
-static void macaudio_energy_control_replay_and_corruption_revoke(struct kunit *test)
+static void
+macaudio_energy_control_replay_and_corruption_revoke(struct kunit *test)
 {
 	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
-	struct snd_ctl_elem_value *value = kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
+	struct snd_ctl_elem_value *value =
+		kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
 	struct macaudio_energy_ctl *packet;
 	struct apple_energy_snapshot state;
 	unsigned int k;
@@ -108,20 +121,43 @@ static void macaudio_energy_control_replay_and_corruption_revoke(struct kunit *t
 	packet = (void *)value->value.bytes.data;
 	KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
 	packet->flags = 0;
-	packet->deadline_ns = cpu_to_le64(le64_to_cpu(packet->clock_ns) + 100 * NSEC_PER_MSEC);
+	packet->deadline_ns = cpu_to_le64(le64_to_cpu(packet->clock_ns) +
+					  100 * NSEC_PER_MSEC);
 	for (k = 0; k < 2; k++) {
 		packet->ceiling[k] = cpu_to_le64(1ULL << 30);
 		packet->gain_q31[k] = cpu_to_le32(APPLE_ENERGY_UNITY);
 	}
 	KUNIT_ASSERT_EQ(test, macaudio_energy_put(t->control[0], value), 0);
-	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value), -ESTALE);
+	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value),
+			-ESTALE);
 	apple_energy_snapshot(&t->ma.energy, &state);
 	KUNIT_EXPECT_FALSE(test, state.enabled);
 	KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
 	packet->flags = 0;
 	packet->reserved[0] = cpu_to_le32(1);
-	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value), -EINVAL);
+	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value),
+			-EINVAL);
 	macaudio_energy_unlock(t->control[0]);
+	apple_energy_snapshot(&t->ma.energy, &state);
+	KUNIT_EXPECT_FALSE(test, state.enabled);
+}
+
+static void
+macaudio_energy_expired_write_is_a_retryable_timeout(struct kunit *test)
+{
+	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
+	struct snd_ctl_elem_value *value =
+		kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
+	struct macaudio_energy_ctl *packet;
+	struct apple_energy_snapshot state;
+
+	KUNIT_ASSERT_NOT_NULL(test, value);
+	packet = (void *)value->value.bytes.data;
+	KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
+	packet->flags = 0;
+	packet->deadline_ns = packet->clock_ns;
+	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value),
+			-ETIMEDOUT);
 	apple_energy_snapshot(&t->ma.energy, &state);
 	KUNIT_EXPECT_FALSE(test, state.enabled);
 }
@@ -132,14 +168,24 @@ static void macaudio_energy_normal_stop_is_not_a_gate_fault(struct kunit *test)
 	s32 samples[] = { 1000000, -1000000 };
 	u64 ticket;
 
-	KUNIT_ASSERT_EQ(test, macaudio_fe_trigger(&t->substream, SNDRV_PCM_TRIGGER_STOP), 0);
+	KUNIT_ASSERT_EQ(
+		test,
+		macaudio_fe_trigger(&t->substream, SNDRV_PCM_TRIGGER_STOP), 0);
 	KUNIT_EXPECT_FALSE(test, t->ma.speaker_lock_failed);
 	KUNIT_EXPECT_TRUE(test, t->ma.energy_stream[0].needs_prepare);
 	/* A refill racing normal STOP remains a safe copy, not a hard fault. */
-	KUNIT_ASSERT_EQ(test, macaudio_energy_process(&t->ma.energy_stream[0], samples,
-						   sizeof(samples), &ticket), 0);
-	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&t->substream, SNDRV_PCM_TRIGGER_START), -EPIPE);
-	KUNIT_ASSERT_EQ(test, macaudio_energy_retire(&t->ma.energy_stream[0], ticket), 0);
+	KUNIT_ASSERT_EQ(test,
+			macaudio_energy_process(&t->ma.energy_stream[0],
+						samples, sizeof(samples),
+						&ticket),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			macaudio_fe_trigger(&t->substream,
+					    SNDRV_PCM_TRIGGER_START),
+			-EPIPE);
+	KUNIT_ASSERT_EQ(test,
+			macaudio_energy_retire(&t->ma.energy_stream[0], ticket),
+			0);
 }
 
 static int macaudio_energy_test_stop_without_proof(struct dma_chan *chan)
@@ -159,9 +205,11 @@ static void macaudio_energy_test_fault_work(struct work_struct *work)
 static void macaudio_energy_raw_fe_needs_a_proven_stop(struct kunit *test)
 {
 	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
-	struct dma_device *device = kunit_kzalloc(test, sizeof(*device), GFP_KERNEL);
+	struct dma_device *device =
+		kunit_kzalloc(test, sizeof(*device), GFP_KERNEL);
 	struct dma_chan *chan = kunit_kzalloc(test, sizeof(*chan), GFP_KERNEL);
-	struct snd_ctl_elem_value *value = kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
+	struct snd_ctl_elem_value *value =
+		kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_NULL(test, device);
 	KUNIT_ASSERT_NOT_NULL(test, chan);
@@ -180,7 +228,34 @@ static void macaudio_energy_raw_fe_needs_a_proven_stop(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, t->ma.speaker_lock_failed);
 	KUNIT_EXPECT_EQ(test, atomic_read(&t->ma.energy_open), 1);
 	KUNIT_EXPECT_TRUE(test, t->ma.energy_stream[0].opened);
-	KUNIT_EXPECT_EQ(test, macaudio_energy_pin_put(t->control[0], value), -EIO);
+	KUNIT_EXPECT_EQ(test, macaudio_energy_pin_put(t->control[0], value),
+			-EIO);
+}
+
+static void macaudio_energy_fixed_transforms_are_read_only(struct kunit *test)
+{
+	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
+
+	strscpy(t->control[0]->id.name, "Left HPF Corner Frequency",
+		sizeof(t->control[0]->id.name));
+	strscpy(t->control[1]->id.name, "Left ASI1 Sel",
+		sizeof(t->control[1]->id.name));
+	strscpy(t->control[2]->id.name, "Jack HPF Corner Frequency",
+		sizeof(t->control[2]->id.name));
+	t->control[0]->vd[0].access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
+				      SNDRV_CTL_ELEM_ACCESS_INACTIVE;
+	t->control[1]->vd[0].access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
+				      SNDRV_CTL_ELEM_ACCESS_INACTIVE;
+	t->control[2]->vd[0].access = SNDRV_CTL_ELEM_ACCESS_READWRITE;
+	macaudio_energy_fixed_controls(&t->ma.card, "Left");
+	KUNIT_EXPECT_FALSE(test, t->control[0]->vd[0].access &
+					 SNDRV_CTL_ELEM_ACCESS_WRITE);
+	KUNIT_EXPECT_FALSE(test, t->control[1]->vd[0].access &
+					 SNDRV_CTL_ELEM_ACCESS_WRITE);
+	KUNIT_EXPECT_TRUE(test, t->control[2]->vd[0].access &
+					SNDRV_CTL_ELEM_ACCESS_WRITE);
+	KUNIT_EXPECT_TRUE(test, t->control[0]->vd[0].access &
+					SNDRV_CTL_ELEM_ACCESS_READ);
 }
 
 static struct kunit_case macaudio_energy_cases[] = {
@@ -188,6 +263,8 @@ static struct kunit_case macaudio_energy_cases[] = {
 	KUNIT_CASE(macaudio_energy_control_replay_and_corruption_revoke),
 	KUNIT_CASE(macaudio_energy_normal_stop_is_not_a_gate_fault),
 	KUNIT_CASE(macaudio_energy_raw_fe_needs_a_proven_stop),
+	KUNIT_CASE(macaudio_energy_expired_write_is_a_retryable_timeout),
+	KUNIT_CASE(macaudio_energy_fixed_transforms_are_read_only),
 	{}
 };
 

@@ -127,7 +127,6 @@ void ag_free(void *opaque)
 {
 	struct host_gate *g = opaque;
 	if (g) {
-
 		pthread_mutex_destroy(&g->gate.lock);
 		free(g->payload.area);
 		free(g->source);
@@ -226,7 +225,11 @@ int ag_write(void *opaque, const void *input, u64 now)
 	    v->safe_reduction_millidb != g->safe ||
 	    strncmp((const char *)v->card_id, g->card, 32))
 		goto fail;
-	if (v->deadline_ns <= now || v->deadline_ns - now > 250000000ULL)
+	if (v->deadline_ns <= now) {
+		ret = -ETIMEDOUT;
+		goto fail;
+	}
+	if (v->deadline_ns - now > 250000000ULL)
 		goto fail;
 	for (k = 0; k < 6; k++) {
 		if (v->slot[k] != k)

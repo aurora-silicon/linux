@@ -83,6 +83,10 @@ to new samples. An IRQ or daemon stall can emit only already reserved immutable
 descriptors, whose full energy and downstream tail must remain reserved by the
 model. Raising an amp range never repairs or rewrites a submitted DMA buffer.
 
+Fixed speaker ASI selection, HPF and over-current retry controls are read-only
+to userspace. ALSA INACTIVE alone is a UI hint, so it cannot enforce a transfer
+certificate. This does not freeze the headphone codec's controls.
+
 Route changes require all playback front ends closed. FE shutdown proves DMA
 quiescence before releasing that exclusion. Speaker/headphone muxes and pin
 switches cannot attach an already running raw front end to a speaker route.
