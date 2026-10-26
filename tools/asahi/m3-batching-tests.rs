@@ -190,3 +190,24 @@ fn failed_pending_packets_quarantine_only_what_the_firmware_may_have_seen() {
     assert!(pending[0].guard,"a partly published packet keeps its guard");
     assert!(!pending[1].guard,"a never-published packet releases its guard");
 }
+
+#[test]
+fn the_start_pins_the_module_before_claiming_and_fails_closed() {
+    use std::cell::Cell;
+    let latch=StartLatch::new();
+    let refs=Cell::new(1i32); // the module's base reference
+    let pin_ok=||{refs.set(refs.get()+1);true};
+    let unpin=||refs.set(refs.get()-1);
+    // rmmod has begun: no pin, no claim, no start, and the reference count is untouched.
+    assert_eq!(claim_start(&latch,||false,unpin),Err(StartRefusal::Removing));
+    assert_eq!(refs.get(),1);
+    // The first live start wins and keeps its pin.
+    assert_eq!(claim_start(&latch,pin_ok,unpin),Ok(()));
+    assert_eq!(refs.get(),2);
+    // A later start (rebind, retry) loses the claim and drops only its own pin.
+    assert_eq!(claim_start(&latch,pin_ok,unpin),Err(StartRefusal::AlreadyStarted));
+    assert_eq!(refs.get(),2);
+    // A later start racing rmmod still claims nothing.
+    assert_eq!(claim_start(&latch,||false,||panic!("nothing to unpin")),Err(StartRefusal::Removing));
+    assert_eq!(refs.get(),2);
+}

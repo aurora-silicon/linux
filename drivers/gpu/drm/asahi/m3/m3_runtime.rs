@@ -986,6 +986,24 @@ impl Inner {
 pub(crate) struct Runtime { inner: ManuallyDrop<KBox<Inner>> }
 /// Claimed before this boot's first ASC start.
 static FIRMWARE_START: policy::StartLatch = policy::StartLatch::new();
+/// Takes a module reference, unless the module is already being removed.
+#[cfg(CONFIG_MODULE_UNLOAD)]
+fn pin_module() -> bool {
+    // SAFETY: THIS_MODULE is this module, whose code is running; try_module_get fails once
+    // removal has begun instead of reviving the reference count.
+    unsafe { kernel::bindings::try_module_get(crate::THIS_MODULE.as_ptr()) }
+}
+/// Without module unloading there is no removal to race.
+#[cfg(not(CONFIG_MODULE_UNLOAD))]
+fn pin_module() -> bool { true }
+/// Drops a reference [`pin_module`] took.
+#[cfg(CONFIG_MODULE_UNLOAD)]
+fn unpin_module() {
+    // SAFETY: called only to drop a reference pin_module took.
+    unsafe { kernel::bindings::module_put(crate::THIS_MODULE.as_ptr()) };
+}
+#[cfg(not(CONFIG_MODULE_UNLOAD))]
+fn unpin_module() {}
 impl Runtime {
     #[inline(never)]
     pub(crate) fn new(pdev: &platform::Device<Core<'_>>, drm: &driver::AsahiDrmDevice, device: Device, contents: crate::m3::m3_adt_config::Contents) -> Result<Self> {
@@ -1008,14 +1026,21 @@ impl Runtime {
             return Err(ENODEV);
         }
         // A second start (unbind and rebind, a module reload, a retry after a failed start)
-        // would set RUN while TTBAT context 0 still names the freed root of this one. Unloading
-        // is blocked once the latch is claimed, so a reload can't forget it.
-        if !FIRMWARE_START.claim() {
-            dev_err!(pdev.as_ref(), "M3: the GPU firmware already started once this boot and can't start again; reboot to start the GPU\n");
-            return Err(EBUSY);
+        // would set RUN while TTBAT context 0 still names the freed root of this one. An ordinary
+        // (not forced) unload is blocked once the latch is claimed, so a reload can't forget it.
+        // The pin comes first: a later probe can race an ordinary rmmod, and once removal has
+        // begun nothing starts.
+        match policy::claim_start(&FIRMWARE_START, pin_module, unpin_module) {
+            Ok(()) => {}
+            Err(policy::StartRefusal::Removing) => {
+                dev_err!(pdev.as_ref(), "M3: the module is being removed; GPU not started\n");
+                return Err(ENODEV);
+            }
+            Err(policy::StartRefusal::AlreadyStarted) => {
+                dev_err!(pdev.as_ref(), "M3: the GPU firmware already started once this boot and can't start again; reboot to start the GPU\n");
+                return Err(EBUSY);
+            }
         }
-        // SAFETY: never released: the latch must outlive this instance of the module.
-        unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
         // Whether the coprocessor runs and offers its endpoints, for the T8122 verdict.
         let mut started=false;
         // The adopted UAT and its window live outside the closure: once TTBAT context 0 names

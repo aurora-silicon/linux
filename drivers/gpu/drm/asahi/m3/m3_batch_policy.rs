@@ -104,6 +104,31 @@ impl StartLatch {
     pub(crate) fn claim(&self) -> bool { !self.0.swap(true, core::sync::atomic::Ordering::AcqRel) }
 }
 
+/// Why a start was refused before ASC.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartRefusal {
+    /// The module is being removed: nothing is claimed or started.
+    Removing,
+    /// This boot's start already happened: the extra module reference is dropped again.
+    AlreadyStarted,
+}
+
+/// Pins the module, then claims `latch`. The pin comes first, so a probe racing an ordinary
+/// rmmod fails closed instead of reviving the module's reference count. A start that loses the
+/// claim drops only its own pin; the winner keeps its pin for good, so a reload can't forget the
+/// latch.
+pub(crate) fn claim_start(latch: &StartLatch, pin: impl FnOnce() -> bool, unpin: impl FnOnce())
+    -> Result<(), StartRefusal> {
+    if !pin() {
+        return Err(StartRefusal::Removing);
+    }
+    if !latch.claim() {
+        unpin();
+        return Err(StartRefusal::AlreadyStarted);
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub(crate) struct PassCosts { recent: [Option<(u64, u64)>; 8] }
 impl PassCosts {
