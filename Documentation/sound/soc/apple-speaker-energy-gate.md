@@ -127,3 +127,50 @@ exactly 0 dB on J616 at 30%/60%. No old test is waived or its limit raised.
 
 No hardware, speaker playback, recording or deployment is part of this work.
 The orchestrator files the independent review after implementation and evidence.
+
+## Current validation and blocking work
+
+The runtime draft includes the ADMAC descriptor adapter, version 2 grant ABI,
+TAS2764/TAS2770 state read-back, macaudio owner/lease integration and production
+thermal-model grant issuance. Qualified reference paths use the exact shared C
+ledger and immutable payload helper. Actual TAS helpers still return transfer
+NONE, so new-kernel speaker paths retain safe hardware caps. No real transfer
+has been qualified and no new device is authorized for louder output.
+
+Buildbox validation, using normal resource admission and no devices:
+
+* **30/30 KUnit tests pass** (18 ledger, 4 payload ownership, 8 actual macaudio
+  control/trigger tests). The stale Q30 integer-boundary expectation in an
+  earlier run is retained and corrected for Q20; no safety assertion is removed.
+* **ARM64 C object compilation passes** for ADMAC, macaudio, the energy ledger
+  and both TAS codecs. This is not a complete bootable-kernel or AOP Rust build.
+* The **30,144-case continuous campaign passes all 221,844 thermal rows** with
+  the version 2 gate/model. **14,251 cases use the declared reference gate;
+  15,893 exercise conservative fallback.** All 865 retained counterexamples
+  pass too (189 reference-gated / 676 fallback). Input identities, thermal
+  limits and continuous assertion oracles are unchanged. Reference certificates
+  do not establish physical transfer bounds.
+* The full standard suite reports **321 passed, 1 failed, 1 ignored**. The
+  separately run 30,144-case campaign is the ignored extended test. Twenty of
+  the original 21 failures now pass, using explicit reference-contract fixtures
+  where the test requires grant authority and independent gain/word oracles for
+  missing time. The remaining ordinary-listening assertion is still failing.
+* Queue/restart, owner-death/crash, stalls, expiry, failed-stop, readiness and
+  source-fallback simulations pass. These do not establish hardware behaviour.
+
+The unchanged 1 dB quiet-programme assertion now includes actual native-word
+RMS attenuation in the C gate as well as analogue controls. With the same
+bounded-current reference certificate as the thermal campaign, the largest
+simulated mean losses are **41.708 dB on J316 at 60%**, **79.794 dB on J413 at
+60%**, and **1.544 dB on J413 tweeters at 30%**. The failure is retained, not
+waived. A different certificate cannot be selected only for listening.
+
+A complete approved downstream gain/filter-state/clock-tail bound and a
+justified pre-DAC input mapping are missing. Post-amplifier V/I records do not
+uniquely determine queued PCM through an unknown HPF or clipping path. Therefore
+no valid gate-in-loop 63-replay acceptance or J616 zero-loss result is claimed.
+The useful daemon flags remain; unqualified profiles are not promoted.
+
+The safe-and-loud objective remains incomplete. Both PRs stay draft. Independent
+review is for the orchestrator to file. **Do not merge or deploy.** No hardware,
+playback (including silence), microphone recording or deployment occurred.
