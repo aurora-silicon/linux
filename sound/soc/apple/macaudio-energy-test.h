@@ -142,6 +142,60 @@ macaudio_energy_control_replay_and_corruption_revoke(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, state.enabled);
 }
 
+/* ALSA close can release the two owned controls in either order. */
+static void macaudio_energy_close_revokes_a_live_grant(struct kunit *test)
+{
+	unsigned int order, k;
+
+	for (order = 0; order < 2; order++) {
+		struct macaudio_energy_test *t = macaudio_energy_test_new(test);
+		struct snd_ctl_elem_value *value =
+			kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
+		struct macaudio_energy_ctl *packet;
+		struct apple_energy_snapshot before, after;
+		s32 samples[] = { S32_MIN, S32_MIN };
+		u64 ticket;
+
+		KUNIT_ASSERT_NOT_NULL(test, value);
+		packet = (void *)value->value.bytes.data;
+		KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
+		packet->flags = 0;
+		packet->deadline_ns = cpu_to_le64(le64_to_cpu(packet->clock_ns) +
+						100 * NSEC_PER_MSEC);
+		for (k = 0; k < 2; k++) {
+			packet->ceiling[k] = cpu_to_le64(16 * APPLE_ENERGY_UNIT_SCALE);
+			packet->gain_q31[k] = cpu_to_le32(APPLE_ENERGY_UNITY);
+		}
+		KUNIT_ASSERT_EQ(test, macaudio_energy_put(t->control[0], value), 0);
+		KUNIT_ASSERT_EQ(test,
+			apple_energy_filter_pcm(&t->ma.energy, samples, 1, 2,
+				SNDRV_PCM_FORMAT_S32_LE, ktime_get_boottime_ns(), &ticket),
+			0);
+		apple_energy_snapshot(&t->ma.energy, &before);
+		KUNIT_ASSERT_TRUE(test, before.enabled);
+		KUNIT_ASSERT_GT(test, before.submitted[0], 0ULL);
+		KUNIT_ASSERT_EQ(test, before.pending, 1U);
+
+		if (order == 0) {
+			macaudio_energy_unlock(t->control[0]);
+			macaudio_slk_unlock(t->control[0]);
+		} else {
+			macaudio_slk_unlock(t->control[0]);
+			macaudio_energy_unlock(t->control[0]);
+		}
+		apple_energy_snapshot(&t->ma.energy, &after);
+		KUNIT_EXPECT_FALSE(test, after.enabled);
+		KUNIT_EXPECT_PTR_EQ(test, t->ma.speaker_lock_owner, NULL);
+		KUNIT_EXPECT_EQ(test, t->ma.speaker_lock_remain, 0LL);
+		KUNIT_EXPECT_EQ(test, after.pending, before.pending);
+		KUNIT_EXPECT_EQ(test, after.submitted[0], before.submitted[0]);
+		KUNIT_EXPECT_EQ(test, after.completed[0], before.completed[0]);
+		KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value),
+				-EPERM);
+		KUNIT_ASSERT_EQ(test, apple_energy_complete(&t->ma.energy, ticket), 0);
+	}
+}
+
 static void
 macaudio_energy_expired_write_is_a_retryable_timeout(struct kunit *test)
 {
@@ -330,6 +384,7 @@ static struct kunit_case macaudio_energy_cases[] = {
 	KUNIT_CASE(macaudio_energy_normal_stop_is_not_a_gate_fault),
 	KUNIT_CASE(macaudio_energy_raw_fe_needs_a_proven_stop),
 	KUNIT_CASE(macaudio_energy_expired_write_is_a_retryable_timeout),
+	KUNIT_CASE(macaudio_energy_close_revokes_a_live_grant),
 	KUNIT_CASE(macaudio_energy_fixed_transforms_are_read_only),
 	KUNIT_CASE(macaudio_energy_raw_routes_cannot_acquire_a_grant),
 	KUNIT_CASE(macaudio_energy_tail_bound_is_immutable),
