@@ -5,9 +5,10 @@
 #include <linux/types.h>
 
 /* 512-byte ALSA BYTES control: "Speaker Energy Grant", little endian. */
-#define MACAUDIO_ENERGY_VERSION 1
+#define MACAUDIO_ENERGY_VERSION 2
 #define MACAUDIO_ENERGY_SPEAKERS 6
 #define MACAUDIO_ENERGY_UNIT_RATE 48000
+#define MACAUDIO_ENERGY_UNIT_SHIFT 20
 #define MACAUDIO_ENERGY_AVAILABLE (1U << 0)
 #define MACAUDIO_ENERGY_CONFIGURED (1U << 1)
 #define MACAUDIO_ENERGY_TRANSFER_VALID (1U << 2)
@@ -20,7 +21,7 @@
 
 /* A transfer identifier is a versioned bound, not an amplifier model name. */
 #define MACAUDIO_ENERGY_TRANSFER_NONE 0
-#define MACAUDIO_ENERGY_TRANSFER_IDENTITY 1
+#define MACAUDIO_ENERGY_TRANSFER_ENERGY_NORM 1
 #define MACAUDIO_ENERGY_TRANSFER_BOUNDED_CURRENT 2
 
 struct macaudio_energy_ctl {
@@ -48,7 +49,8 @@ struct macaudio_energy_ctl {
 	__le64 ceiling[MACAUDIO_ENERGY_SPEAKERS];
 	__le32 gain_q31[MACAUDIO_ENERGY_SPEAKERS];
 	__u8 card_id[32];
-	__le32 reserved[6];
+	/* Full-input-power-equivalent microseconds of residual downstream energy. */
+	__le32 tail_us[MACAUDIO_ENERGY_SPEAKERS];
 };
 
 #endif

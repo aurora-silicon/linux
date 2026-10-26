@@ -16,6 +16,8 @@ struct tas27xx_playback_state {
 	u32 right_slot;
 	u32 source;
 	u32 transfer;
+	/* A qualified bound for arbitrary prior full-scale input and epochs. */
+	u32 tail_us;
 };
 
 #if IS_REACHABLE(CONFIG_SND_SOC_TAS2764)

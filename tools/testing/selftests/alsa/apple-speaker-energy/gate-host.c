@@ -17,7 +17,7 @@ struct host_gate {
 	struct apple_energy_gate gate;
 	struct admac_payload payload;
 	u8 *source;
-	u32 rate, channels, frames, format, transfer, amp, safe;
+	u32 rate, channels, frames, format, transfer, amp, safe, tail_us;
 	char card[32];
 	bool owner, unlocked, notice, playing, failed;
 };
@@ -66,7 +66,7 @@ static void host_expire(struct host_gate *g, u64 now)
 }
 
 void *ag_new(u32 rate, u32 channels, u32 frames, u32 format, u32 transfer,
-	     u32 amp, u32 safe, const char *card)
+	     u32 amp, u32 safe, u32 tail_us, const char *card)
 {
 	struct host_gate *g;
 	u8 slots[APPLE_ENERGY_SPEAKERS];
@@ -86,6 +86,7 @@ void *ag_new(u32 rate, u32 channels, u32 frames, u32 format, u32 transfer,
 	g->transfer = transfer;
 	g->amp = amp;
 	g->safe = safe;
+	g->tail_us = tail_us;
 	snprintf(g->card, sizeof(g->card), "%s", card);
 	apple_energy_init(&g->gate);
 	for (k = 0; k < channels; k++)
@@ -157,7 +158,7 @@ int ag_snapshot(void *opaque, u64 now, void *output)
 	host_expire(g, now);
 	apple_energy_snapshot(&g->gate, &s);
 	memset(v, 0, sizeof(*v));
-	v->version = 1;
+	v->version = MACAUDIO_ENERGY_VERSION;
 	v->flags = MACAUDIO_ENERGY_AVAILABLE | MACAUDIO_ENERGY_CONFIGURED |
 		   MACAUDIO_ENERGY_TRANSFER_VALID | MACAUDIO_ENERGY_REQUIRED;
 	if (g->owner)
@@ -191,6 +192,7 @@ int ag_snapshot(void *opaque, u64 now, void *output)
 		v->unbudgeted[k] = s.unbudgeted[k];
 		v->ceiling[k] = s.ceiling[k];
 		v->gain_q31[k] = s.gain_q31[k];
+		v->tail_us[k] = k < g->channels ? g->tail_us : 0;
 	}
 	return 0;
 }
@@ -209,10 +211,10 @@ int ag_write(void *opaque, const void *input, u64 now)
 		ret = -EPERM;
 		goto fail;
 	}
-	if (v->version != 1)
+	if (v->version != MACAUDIO_ENERGY_VERSION)
 		goto fail;
 	for (k = 0; k < 6; k++)
-		if (v->reserved[k])
+		if (v->tail_us[k] != (k < g->channels ? g->tail_us : 0))
 			goto fail;
 	if (v->flags == MACAUDIO_ENERGY_REVOKE) {
 		apple_energy_revoke(&g->gate);

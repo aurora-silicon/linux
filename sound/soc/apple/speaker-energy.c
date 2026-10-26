@@ -17,9 +17,10 @@ u64 apple_energy_cost(s32 sample)
 {
 	u64 magnitude = sample < 0 ? -(s64)sample : sample;
 	u64 square = magnitude * magnitude;
+	const unsigned int shift = 62 - APPLE_ENERGY_UNIT_SHIFT;
 
-	/* Q31 squared -> Q30, rounding up, without overflowing square + mask. */
-	return (square >> 32) + !!(square & U32_MAX);
+	/* Round normalized energy upward without overflowing square + mask. */
+	return (square >> shift) + !!(square & ((1ULL << shift) - 1));
 }
 EXPORT_SYMBOL_GPL(apple_energy_cost);
 
@@ -118,9 +119,9 @@ void apple_energy_snapshot(struct apple_energy_gate *gate,
 EXPORT_SYMBOL_GPL(apple_energy_snapshot);
 
 int apple_energy_grant_gains(struct apple_energy_gate *gate,
-		       const struct apple_energy_snapshot *snapshot,
-		       const u64 *ceiling, const u32 *gains,
-		       u64 now_ns, u64 deadline_ns)
+			     const struct apple_energy_snapshot *snapshot,
+			     const u64 *ceiling, const u32 *gains, u64 now_ns,
+			     u64 deadline_ns)
 {
 	unsigned long flags;
 	unsigned int k;
@@ -155,8 +156,7 @@ int apple_energy_grant_gains(struct apple_energy_gate *gate,
 		ret = -EOVERFLOW;
 		goto out;
 	}
-	memcpy(gate->ceiling, ceiling,
-	       gate->state.speakers * sizeof(*ceiling));
+	memcpy(gate->ceiling, ceiling, gate->state.speakers * sizeof(*ceiling));
 	gate->deadline_ns = deadline_ns;
 	for (k = 0; k < gate->state.speakers; k++)
 		gate->gain_q31[k] = gains ? gains[k] : APPLE_ENERGY_UNITY;
@@ -164,7 +164,8 @@ int apple_energy_grant_gains(struct apple_energy_gate *gate,
 	/* Nothing newly submitted may enter a higher-gain epoch uncharged. */
 	gate->cache_raw = false;
 	for (k = 0; k < gate->state.speakers; k++) {
-		if (gate->state.unbudgeted[k] > ceiling[k] - gate->state.submitted[k]) {
+		if (gate->state.unbudgeted[k] >
+		    ceiling[k] - gate->state.submitted[k]) {
 			ret = -EAGAIN;
 			goto out;
 		}
@@ -178,7 +179,8 @@ int apple_energy_grant_gains(struct apple_energy_gate *gate,
 			continue;
 		for (speaker = 0; speaker < gate->state.speakers; speaker++) {
 			entry->energy[speaker] = entry->raw_cost[speaker];
-			gate->state.submitted[speaker] += entry->raw_cost[speaker];
+			gate->state.submitted[speaker] +=
+				entry->raw_cost[speaker];
 		}
 		entry->raw = false;
 	}
@@ -198,7 +200,8 @@ int apple_energy_grant(struct apple_energy_gate *gate,
 		       const struct apple_energy_snapshot *snapshot,
 		       const u64 *ceiling, u64 now_ns, u64 deadline_ns)
 {
-	return apple_energy_grant_gains(gate, snapshot, ceiling, NULL, now_ns, deadline_ns);
+	return apple_energy_grant_gains(gate, snapshot, ceiling, NULL, now_ns,
+					deadline_ns);
 }
 EXPORT_SYMBOL_GPL(apple_energy_grant);
 
@@ -260,13 +263,17 @@ EXPORT_SYMBOL_GPL(apple_energy_hardware_safe);
 
 static u64 apple_energy_rate_cost(s32 sample, u32 rate)
 {
-	return DIV_ROUND_UP_ULL(apple_energy_cost(sample) * APPLE_ENERGY_UNIT_RATE, rate);
+	return DIV_ROUND_UP_ULL(
+		apple_energy_cost(sample) * APPLE_ENERGY_UNIT_RATE, rate);
 }
 
 static u64 apple_energy_meter(s32 sample, u32 rate, u32 metric)
 {
-	u64 raw = metric == APPLE_ENERGY_ABSOLUTE ? DIV_ROUND_UP_ULL(abs((s64)sample), 2) :
-		apple_energy_cost(sample);
+	u64 raw = metric == APPLE_ENERGY_ABSOLUTE ?
+			  DIV_ROUND_UP_ULL(
+				  abs((s64)sample),
+				  1ULL << (31 - APPLE_ENERGY_UNIT_SHIFT)) :
+			  apple_energy_cost(sample);
 
 	return DIV_ROUND_UP_ULL(raw * APPLE_ENERGY_UNIT_RATE, rate);
 }
@@ -284,7 +291,8 @@ int apple_energy_metric(struct apple_energy_gate *gate, u32 metric)
 	else {
 		for (k = 0; k < APPLE_ENERGY_SPEAKERS; k++)
 			if (metric != gate->metric &&
-			    (gate->state.submitted[k] || gate->state.source_submitted[k]))
+			    (gate->state.submitted[k] ||
+			     gate->state.source_submitted[k]))
 				ret = -EINVAL;
 		if (!ret)
 			gate->metric = metric;
@@ -301,9 +309,11 @@ static s32 apple_energy_clamp(s32 sample, u64 remaining, u32 rate, u32 metric)
 
 	if (apple_energy_meter(sample, rate, metric) <= remaining)
 		return sample;
-	/* Here remaining * rate < 2^30 * 48000: neither product can wrap. */
+	/* Here remaining * rate < UNIT_SCALE * 48000: neither product can wrap. */
 	bound = div_u64(remaining * rate, APPLE_ENERGY_UNIT_RATE);
-	bound = metric == APPLE_ENERGY_ABSOLUTE ? 2 * bound : int_sqrt64(bound << 32);
+	bound = metric == APPLE_ENERGY_ABSOLUTE ?
+			bound << (31 - APPLE_ENERGY_UNIT_SHIFT) :
+			int_sqrt64(bound << (62 - APPLE_ENERGY_UNIT_SHIFT));
 	return sample < 0 ? (s32)-(s64)bound : (s32)bound;
 }
 
@@ -337,7 +347,8 @@ static s32 apple_energy_get(const void *sample, int format)
 static s32 apple_energy_put(void *sample, s32 value, int format)
 {
 	if (format == SNDRV_PCM_FORMAT_S16_LE) {
-		value /= 65536; /* toward zero, never more energy than was authorized */
+		value /=
+			65536; /* toward zero, never more energy than was authorized */
 		put_unaligned_le16(value, sample);
 		return value * 65536;
 	}
@@ -351,8 +362,8 @@ static s32 apple_energy_put(void *sample, s32 value, int format)
 }
 
 int apple_energy_filter_pcm(struct apple_energy_gate *gate, void *samples,
-			unsigned int frames, unsigned int channels, int format,
-			u64 now_ns, u64 *ticket)
+			    unsigned int frames, unsigned int channels,
+			    int format, u64 now_ns, u64 *ticket)
 {
 	struct apple_energy_ticket *entry;
 	unsigned int f, ch, k;
@@ -398,7 +409,8 @@ int apple_energy_filter_pcm(struct apple_energy_gate *gate, void *samples,
 			void *word = samples + (f * channels + ch) * width;
 			s32 input = apple_energy_get(word, format);
 			s32 sample = input;
-			s32 fallback = apple_energy_scale(input, gate->fallback_q31);
+			s32 fallback =
+				apple_energy_scale(input, gate->fallback_q31);
 			s32 floor;
 			u32 gain = APPLE_ENERGY_UNITY;
 			bool mapped = false;
@@ -411,7 +423,9 @@ int apple_energy_filter_pcm(struct apple_energy_gate *gate, void *samples,
 				gain = min(gain, gate->gain_q31[k]);
 			}
 			sample = apple_energy_scale(sample, gain);
-			floor = abs((s64)sample) < abs((s64)fallback) ? sample : fallback;
+			floor = abs((s64)sample) < abs((s64)fallback) ?
+					sample :
+					fallback;
 			if (entry->raw) {
 				sample = input;
 			} else if (!mapped || !gate->enabled) {
@@ -422,33 +436,41 @@ int apple_energy_filter_pcm(struct apple_energy_gate *gate, void *samples,
 
 					if (gate->slot[k] != ch)
 						continue;
-					remaining = gate->ceiling[k] - gate->state.submitted[k];
-					sample = apple_energy_clamp(sample, remaining,
-							    gate->state.rate, gate->metric);
+					remaining = gate->ceiling[k] -
+						    gate->state.submitted[k];
+					sample = apple_energy_clamp(
+						sample, remaining,
+						gate->state.rate, gate->metric);
 				}
 				if (abs((s64)sample) < abs((s64)floor))
 					sample = floor;
 			}
 			sample = apple_energy_put(word, sample, format);
 			/* The independently reserved full-scale safe tail covers this. */
-			cost = entry->raw || abs((s64)sample) <= abs((s64)fallback) ? 0 :
-				apple_energy_meter(sample, gate->state.rate, gate->metric);
+			cost = entry->raw || abs((s64)sample) <=
+						       abs((s64)fallback) ?
+				       0 :
+				       apple_energy_meter(sample,
+							  gate->state.rate,
+							  gate->metric);
 			for (k = 0; k < gate->state.speakers; k++) {
 				u64 source;
-				u64 raw = apple_energy_rate_cost(input, gate->state.rate);
+				u64 raw = apple_energy_rate_cost(
+					input, gate->state.rate);
 
 				if (gate->slot[k] != ch)
 					continue;
-				if (check_add_overflow(gate->state.source_submitted[k],
-						       raw, &source)) {
+				if (check_add_overflow(
+					    gate->state.source_submitted[k],
+					    raw, &source)) {
 					gate->failed = true;
 					ret = -EOVERFLOW;
 					goto fail;
 				}
 				gate->state.source_submitted[k] = source;
 				entry->source[k] += raw;
-				entry->raw_cost[k] += apple_energy_meter(input, gate->state.rate,
-								       gate->metric);
+				entry->raw_cost[k] += apple_energy_meter(
+					input, gate->state.rate, gate->metric);
 				/* cost <= remaining: cumulative counters cannot wrap. */
 				gate->state.submitted[k] += cost;
 				entry->energy[k] += cost;
@@ -471,8 +493,8 @@ out:
 EXPORT_SYMBOL_GPL(apple_energy_filter_pcm);
 
 int apple_energy_filter(struct apple_energy_gate *gate, s32 *samples,
-			unsigned int frames, unsigned int channels,
-			u64 now_ns, u64 *ticket)
+			unsigned int frames, unsigned int channels, u64 now_ns,
+			u64 *ticket)
 {
 	return apple_energy_filter_pcm(gate, samples, frames, channels,
 				       SNDRV_PCM_FORMAT_S32_LE, now_ns, ticket);

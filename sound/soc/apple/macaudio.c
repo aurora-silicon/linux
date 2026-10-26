@@ -249,6 +249,7 @@ struct macaudio_snd_data {
 	bool has_energy;
 	bool energy_enforced;
 	u32 energy_transfer;
+	u32 energy_tail_us[APPLE_ENERGY_SPEAKERS];
 	u32 energy_channels;
 	int energy_format;
 	/* -1 while a mux change owns the closed front ends, else open count. */
@@ -302,6 +303,7 @@ static int macaudio_energy_transfer(struct macaudio_snd_data *ma)
 	int i, ret;
 
 	ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+	memset(ma->energy_tail_us, 0, sizeof(ma->energy_tail_us));
 	if (!ma->has_energy || please_blow_up_my_speakers ||
 	    ma->max_channels > APPLE_ENERGY_SPEAKERS)
 		return -EOPNOTSUPP;
@@ -332,6 +334,7 @@ static int macaudio_energy_transfer(struct macaudio_snd_data *ma)
 			    !state.transfer || (transfer && state.transfer != transfer))
 				return -EOPNOTSUPP;
 			transfer = state.transfer;
+			ma->energy_tail_us[slot] = state.tail_us;
 			mask |= BIT(slot);
 			count++;
 		}
@@ -2470,6 +2473,7 @@ static int macaudio_energy_get(struct snd_kcontrol *control,
 		out->unbudgeted[k] = cpu_to_le64(state.unbudgeted[k]);
 		out->ceiling[k] = cpu_to_le64(state.ceiling[k]);
 		out->gain_q31[k] = cpu_to_le32(state.gain_q31[k]);
+		out->tail_us[k] = cpu_to_le32(ma->energy_tail_us[k]);
 	}
 	mutex_unlock(&ma->volume_lock_mutex);
 	return 0;
@@ -2516,9 +2520,13 @@ static int macaudio_energy_put(struct snd_kcontrol *control,
 		ret = -EPERM;
 		goto fail;
 	}
-	if (le32_to_cpu(in->version) != MACAUDIO_ENERGY_VERSION ||
-	    memchr_inv(in->reserved, 0, sizeof(in->reserved)))
+	if (le32_to_cpu(in->version) != MACAUDIO_ENERGY_VERSION)
 		goto fail;
+	for (k = 0; k < APPLE_ENERGY_SPEAKERS; k++)
+		if (le32_to_cpu(in->tail_us[k]) != ma->energy_tail_us[k]) {
+			ret = -ESTALE;
+			goto fail;
+		}
 	if (le32_to_cpu(in->flags) == MACAUDIO_ENERGY_REVOKE) {
 		apple_energy_revoke(&ma->energy);
 		ma->speaker_lock_remain = 0;

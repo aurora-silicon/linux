@@ -5,11 +5,13 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
-/* Internal ledger. Wire units are fixed at Q30 squared frames at 48 kHz. */
+/* Internal ledger. Wire units are fixed at Q20 normalized frames at 48 kHz. */
 #define APPLE_ENERGY_SPEAKERS 6
 #define APPLE_ENERGY_QUEUE 8
 #define APPLE_ENERGY_MAX_FRAMES 4096
 #define APPLE_ENERGY_UNIT_RATE 48000
+#define APPLE_ENERGY_UNIT_SHIFT 20
+#define APPLE_ENERGY_UNIT_SCALE (1ULL << APPLE_ENERGY_UNIT_SHIFT)
 #define APPLE_ENERGY_UNITY 0x80000000U
 #define APPLE_ENERGY_SQUARED 0
 #define APPLE_ENERGY_ABSOLUTE 1

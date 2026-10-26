@@ -45,7 +45,7 @@ static struct macaudio_energy_test *macaudio_energy_test_new(struct kunit *test)
 	t->ma.has_energy = true;
 	t->ma.energy_enforced = true;
 	/* Scalar reference certificate; this does not qualify a real TAS HPF. */
-	t->ma.energy_transfer = MACAUDIO_ENERGY_TRANSFER_IDENTITY;
+	t->ma.energy_transfer = MACAUDIO_ENERGY_TRANSFER_ENERGY_NORM;
 	t->ma.speaker_lock_owner = &t->owner[0];
 	mutex_init(&t->ma.volume_lock_mutex);
 	apple_energy_init(&t->ma.energy);
@@ -134,7 +134,7 @@ macaudio_energy_control_replay_and_corruption_revoke(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, state.enabled);
 	KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
 	packet->flags = 0;
-	packet->reserved[0] = cpu_to_le32(1);
+	packet->version = cpu_to_le32(MACAUDIO_ENERGY_VERSION + 1);
 	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value),
 			-EINVAL);
 	macaudio_energy_unlock(t->control[0]);
@@ -299,6 +299,31 @@ macaudio_energy_raw_routes_cannot_acquire_a_grant(struct kunit *test)
 			  macaudio_energy_frontends_ready(&t->ma, state.epoch));
 }
 
+static void macaudio_energy_tail_bound_is_immutable(struct kunit *test)
+{
+	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
+	struct snd_ctl_elem_value *value =
+		kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
+	struct macaudio_energy_ctl *packet;
+	struct apple_energy_snapshot state;
+
+	KUNIT_ASSERT_NOT_NULL(test, value);
+	t->ma.energy_tail_us[0] = 1001;
+	t->ma.energy_tail_us[1] = 2002;
+	KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
+	packet = (void *)value->value.bytes.data;
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(packet->tail_us[0]), 1001);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(packet->tail_us[1]), 2002);
+	packet->flags = 0;
+	packet->deadline_ns = cpu_to_le64(le64_to_cpu(packet->clock_ns) +
+					  100 * NSEC_PER_MSEC);
+	packet->tail_us[1] = 0;
+	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value),
+			-ESTALE);
+	apple_energy_snapshot(&t->ma.energy, &state);
+	KUNIT_EXPECT_FALSE(test, state.enabled);
+}
+
 static struct kunit_case macaudio_energy_cases[] = {
 	KUNIT_CASE(macaudio_energy_owner_must_match_every_control),
 	KUNIT_CASE(macaudio_energy_control_replay_and_corruption_revoke),
@@ -307,6 +332,7 @@ static struct kunit_case macaudio_energy_cases[] = {
 	KUNIT_CASE(macaudio_energy_expired_write_is_a_retryable_timeout),
 	KUNIT_CASE(macaudio_energy_fixed_transforms_are_read_only),
 	KUNIT_CASE(macaudio_energy_raw_routes_cannot_acquire_a_grant),
+	KUNIT_CASE(macaudio_energy_tail_bound_is_immutable),
 	{}
 };
 

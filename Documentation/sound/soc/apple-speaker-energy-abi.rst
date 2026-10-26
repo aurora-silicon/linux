@@ -24,13 +24,15 @@ HPF certificate; they do not authorize higher output on that basis.
 Units and receipts
 ------------------
 
-Energy counters use Q30 normalized frames at the fixed reference rate of
+Energy counters use Q20 normalized frames at the fixed reference rate of
 48000 Hz. Transfer 1 meters squared amplitude and requires a certified
 sample-energy-to-heat bound. Transfer 2 meters absolute amplitude; with a
 certified voltage path and current ceiling it bounds arbitrary V/I phase by
 ``|V| * Imax``. It is more conservative than a resistive power estimate.
 Source counters always meter squared amplitude for the source power budgets.
-Each submitted hardware sample is rounded upward in its declared units;
+Version 2 uses Q20 units so ten years of continuous full-scale input fits in
+u64 lifetime counters (v1's Q30 prototype could saturate in days). Each
+submitted hardware sample is rounded upward in its declared units;
 rate changes never reinterpret lifetime counters. Source counters describe
 the immutable data before attenuation. Submitted/completed counters describe
 reserved output energy. Refunded energy is a subset of completed energy that
@@ -76,7 +78,8 @@ Writes and expiry
 For a grant write, clear the read flags, retain the immutable identity fields,
 and supply the read epoch/sequence, a ceiling per speaker, Q31 gains no greater
 than unity (``0x80000000``), and an absolute boottime deadline. The deadline must
-be future and no more than 250 ms away. All reserved bytes must be zero.
+be future and no more than 250 ms away. The per-speaker ``tail_us`` fields are immutable qualified bounds, in
+full-input-power-equivalent microseconds, and must match the receipt.
 ``MACAUDIO_ENERGY_REVOKE`` requests revocation without issuing a new grant.
 
 A successful grant renews the same existing volume-unlock lease, capped by its
@@ -106,3 +109,15 @@ protected path prepared for the current epoch before higher caps are allowed.
 An open raw headphone FE therefore keeps speaker caps safe even if an automatic
 jack/DAPM pin update could attach it to speakers. Unknown live source history
 keeps the conservative full-scale programme-budget assumption.
+
+Residual state
+--------------
+
+``tail_us`` bounds residual downstream energy for arbitrary prior full-scale
+input, including raw data received while DVC was held safe and every allowed
+route/rate/gain transition. It is not inferred from a cutoff or from silence.
+The model reserves ``full_input_power * tail_us / 1000000`` in every grant and
+power window, and includes it in temperature projections. Safe-ticket refunds
+do not forgive stored DSP state before DVC. A producer lacking a complete
+qualified norm/state/clock-loss bound must advertise no transfer; zero is not
+a substitute for unknown. The real TAS helpers still supply no certificate.
