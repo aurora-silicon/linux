@@ -322,6 +322,8 @@ static int macaudio_energy_transfer(struct macaudio_snd_data *ma)
 			if (!slots)
 				return -EINVAL;
 			slot = __ffs(slots);
+			if (slot >= APPLE_ENERGY_SPEAKERS || (mask & BIT(slot)))
+				return -EOPNOTSUPP;
 			slots &= ~BIT(slot);
 			if (ma->cfg->amp == AMP_SN012776)
 				ret = tas2764_playback_state(dai->component, &state);
