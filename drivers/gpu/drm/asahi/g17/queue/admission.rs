@@ -406,7 +406,7 @@ pub(crate) struct Pool {
     renders: Option<Arc<crate::g17::availability::Availability>>,
 }
 impl Pool {
-    #[cfg(CONFIG_KUNIT)]
+    #[cfg(CONFIG_KUNIT = "y")]
     pub(crate) fn new(max_queues: u32) -> Result<Arc<Self>> {
         Self::with_waiters(max_queues, None, None)
     }

@@ -43,7 +43,7 @@ const RENDER_HEADROOM: usize = 24;
 /// The render reserve with every execution context open.
 const FULL_RENDER_RESERVE: usize = render_reserve(crate::mmu::MAX_EXECUTION_CONTEXTS as usize);
 /// Compute channels that stay reachable with every execution context open.
-#[cfg(CONFIG_KUNIT)]
+#[cfg(CONFIG_KUNIT = "y")]
 pub(super) const COMPUTE_FLOOR: usize = QID_COUNT - FULL_RENDER_RESERVE;
 /// Upper bound on distinct physical compute channels named by one kick.
 pub(super) const COMPUTE_CHANNELS: usize = QID_COUNT;
