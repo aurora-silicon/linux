@@ -57,11 +57,17 @@ properties:
     description: Rail selector words, in power-on order.
 
   firmware-name:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description:
+          Calibration blob for this sensor.
+      - description:
+          Signed root-key container, for sensors whose enclave session needs
+          one.
     description:
-      Calibration blob for this sensor.  It is per-device factory data written
-      at manufacture, so it is neither redistributable nor derivable from the
-      compatible; the board description has to name it.
+      Per-device factory data written at manufacture, so neither
+      redistributable nor derivable from the compatible; the board
+      description has to name it.
 
   spi-cpha: true
 
