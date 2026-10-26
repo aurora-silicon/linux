@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 #ifndef __APPLE_ADMAC_PAYLOAD_H
 #define __APPLE_ADMAC_PAYLOAD_H
 

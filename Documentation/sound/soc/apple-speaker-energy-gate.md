@@ -1,154 +1,115 @@
-# Playback energy gate design — review draft
+# Playback energy gate design — integrated review draft
 
-Status: implementation foundations only. No capability is advertised and no
-production protection is relaxed by this series. The runtime wiring and the
-acceptance campaign below remain required before this can satisfy t-3188.
+The sense PCM reports past output. This design limits future output by spending
+finite per-speaker energy on private PCM copies at the ADMAC descriptor boundary.
+The daemon issues grants from both thermal models and retains the V/I guard.
+Unqualified routes and kernels without the contract keep conservative protection.
+This is a draft, with qualification and acceptance work still outstanding.
 
-The daemon's capture stream describes past output. It cannot certify the next
-playback period. The replacement contract spends finite per-speaker energy on
-immutable samples at the hardware descriptor boundary. Thermal feed-forward
-drives the grants; V/I may tighten them. Existing kernels and every unsupported
-route retain the current conservative policy.
+## Descriptor boundary and ownership
 
-## Submission boundary
+ADMAC copies each submitted period into coherent storage, runs the gate, orders
+those writes, then publishes the finite hardware descriptor. The writable mmap
+ring is never its source after publication. Every cyclic repeat spends again.
+Eight private slots cover the four-entry FIFO, an active descriptor and report
+lag. A slot is retained until its FIFO completion token retires exactly once.
+Pool, report and accounting errors stop submission. A failed stop quarantines
+the storage and channel rather than recycling DMA memory.
 
-MCA playback uses ADMAC, not SIO. `admac_cyclic_write_one_desc()` supplies a
-finite descriptor; `admac_cyclic_write_desc()` refills a four-entry FIFO. A
-hardware-active descriptor can exist outside that FIFO. Source PCM can be
-mmap writable and the software cyclic transaction may repeat a period. Thus
-neither an ALSA copy callback nor a period callback after playback is the gate.
+Macaudio prepares both playback front ends through the DMAengine adapter. Live
+speaker/headphone mux and pin changes are excluded while any playback FE is
+open. Shutdown must prove ADMAC quiescence even for an unfiltered headphone FE;
+a failed or unsupported proof retains route exclusion and faults protection.
+Restart requires prepare. Suspend revokes the grant before userspace freezes.
+The AOP speaker path can use its existing DMAengine runtime, but firmware and
+codec transforms require their own qualification; none is inferred from MCA.
 
-The intended ADMAC integration copies each submitted period to a private DMA
-buffer, applies the gate there, then publishes its descriptor with the normal
-DMA ordering. A private buffer is not reused until that descriptor's completion
-report. A finite pool must cover the FIFO, the active descriptor and completion
-lag; pool exhaustion emits no unaccounted descriptor. Every repeat spends again.
-Allocation, mapping and format validation happen before trigger, never in IRQ.
-An IRQ stall can drain only already charged descriptors, never replay a raw
-userspace ring. DMA/report failures retain outstanding energy as debt.
+## Existing lock, grant ABI and epochs
 
-The same boundary is needed on J616s's `aop_spkr.rs` speaker ADMAC channel. The
-firmware service's buffering and downstream sample transforms must be bounded
-before that route advertises support. T8140's software-gain/float conversion is
-a separate route and cannot inherit a TAS qualification.
+The optional `Speaker Energy Grant` ALSA BYTES control has a fixed, versioned
+512-byte little-endian layout. The same control file must own all volume and
+amp-gain controls, `Speaker Volume Unlock`, and the grant control. No independent
+unlock mechanism, module parameter or boot flag is added. DT supplies topology;
+packaged profiles supply card identity, model constants and physical slot order.
+J616's playback order differs from its profile order and is explicitly mapped.
 
-## Owner and epoch
+A receipt contains the boottime epoch, grant sequence, format/rate/map, transfer
+identifier, lifetime submitted/completed and source counters, safe refunds,
+unbudgeted raw-prefix debt, absolute ceilings and per-speaker Q31 gains.
+Owner/route/format changes cannot reuse permission. Ordinary DMA traffic does
+not change the grant sequence: concurrent spending against the same absolute
+ceiling cannot add credit. Grants and revocations change the nonce, so replay
+fails. Invalid requests revoke; no arithmetic overflow becomes fresh credit.
 
-The existing `Speaker Volume Unlock` lock remains the authority. The future
-grant control must be locked by the identical `snd_ctl_file`, as must every
-existing speaker volume control. It does not independently unlock an amplifier.
-Existing lease expiry, failed volume writes, suspend and owner close still lock
-the amplifiers. Grant expiry uses absolute boottime, including idle and suspend;
-it cannot extend the playing-time lease.
+A grant renews the existing volume lease/work, capped at an absolute deadline
+no more than 250 ms away. Idle and suspend do not pause an energy deadline.
+The old magic ping cannot extend it. Absent, expired or exhausted credit yields
+the safe-level envelope. Already submitted copies retain their full heat debt;
+completion or a proven stop retires them conservatively as possibly played.
 
-One monotonic identity binds owner, route, format, sample rate, all physical
-speaker mappings and all downstream gain/processing bounds. Changes revoke
-unspent credit before they become audible. Stopped, paused, drained, prepared,
-restarted and suspended streams cannot reuse an old grant. Live route changes
-must either synchronously quiesce and reprepare all affected streams, or refuse
-the change. Unsupported and ambiguous mappings stay conservative. All possible
-routes, including direct ALSA and both front ends, must be covered before the
-card advertises the capability. No module parameter or command-line kernel
-switch participates in this decision.
+While all hardware caps are proved safe, private copies may retain raw PCM.
+Before raising any cap a grant must pay all still-pending raw copies atomically.
+If unaffordable, admission installs protected-copy mode and returns `EAGAIN`
+without unlocking; new protected copies replace the raw prefix as it drains.
+A safe-epoch marker refunds a charged copy only if its entire lifetime was
+provably below the safe hardware cap. Possible partial playback is never refunded.
 
-## Units, counters and transactions
+## Energy and thermal proof
 
-For signed PCM normalized to Q31, a sample costs
-`ceil(abs(sample)^2 / 2^32)` units, i.e. Q30 full-scale-squared frames.
-Quantization rounds energy upward, including the most negative word. A rate
-epoch converts units to normalized seconds; the profile's worst amplifier
-voltage squared over the smallest valid load converts that to joules. The
-normalizer must validate S16_LE, S24_LE-in-32 and S32_LE separately.
+Counters use Q30 normalized frames at a fixed reference rate of 48000 Hz;
+rate epochs never reinterpret lifetime totals. S16_LE, S24_LE-in-32 and S32_LE
+are normalized separately; output quantization goes toward zero before billing.
+Transfer 1 meters squared amplitude and needs a complete certified energy norm.
+Transfer 2 meters absolute amplitude and needs certified voltage/current bounds;
+`|V| Imax` then covers arbitrary V/I phase. Source counters always meter squared
+raw PCM for the existing source power budgets. These transfer identifiers are
+contracts, not assertions that a particular amplifier has been qualified.
 
-Each physical speaker has its own counter, even when speakers share one PCM
-slot. The most restrictive of all speakers using a slot limits that sample.
-The kernel clamps before publication. Exhaustion never permits a negative
-balance. Internal arithmetic overflow revokes credit. The standalone prototype
-uses zero output on exhaustion; this is deliberately stricter than a nonzero
-safe-level tail, and is not the final fallback policy.
+The production model charges integer differences `completed - refunded` once,
+placing each uncertain increment at the latest possible time. Submitted but
+uncompleted energy remains future heat debt. V/I has a separate observer that
+may tighten the projection and retains the existing fault and ramp checks;
+it cannot forgive queued energy or add the same output heat twice. Existing
+state restore and clean-save gates remain in force; an active contract cannot
+be silently dropped in favour of a less informed model.
 
-Renewal supplies an absolute cumulative ceiling based on an atomic snapshot,
-not an amount to add. The snapshot sequence changes on every submission,
-renewal and revocation. A stale transaction or replay fails without adding
-credit. A new epoch never resets the lifetime submitted/completed counters or
-forgives queued energy. A completion token is single use, FIFO ordered and tied
-to the exact immutable submission; it cannot acknowledge another epoch's debt.
-Read failure or counter saturation cannot be interpreted as zero debt.
+For each positive two-node model, set `b = Rm/taum` and
+`k = max(Rc/tauc,b)`. Any nonnegative dose E has a future magnet increment at
+most bE and a future coil increment at most kE. With indefinite safe power Ps,
+use `M = max(Tm,Ta+Ps*Rm)` and `C = max(Tc,M+Ps*Rc)`. Both `M+bE` and `C+kE`
+must remain below their working ceilings with numerical margin. Pending energy,
+remaining credit and every downstream residual tail must fit inside that dose.
+The daemon replaces absolute ceilings and rounds additional credit downward.
+It checks both nodes/models and delivered-energy windows before issuing credit.
+This sufficient envelope is conservative; it does not establish a loudness pass.
 
-An accepted grant cannot revoke bytes already committed to hardware. Their
-entire energy remains reserved until completion proves consumption or a
-verified stop proves discard. Expiry prevents further high-level submissions;
-the existing amplifier lock additionally restores the safe hardware level.
-The model must remain safe even when the amplifier write is delayed and all
-reserved descriptors finish. A restart must recover the ledger and a safe
-thermal upper state, or stay latched. It cannot treat queued energy as cooled.
+## Transfer qualification and fallback
 
-## Thermal grant and exhaustion tail
+TAS2764/TAS2770 helpers read back output gain, channel source, slots and HPF state.
+They deliberately return no transfer certificate. The public TI datasheets give
+gain equations and cutoff selectors, but do not specify the complete transient
+energy norm and residual filter-state bound needed here:
+[TAS2764, section 8.4.2](https://www.ti.com/lit/ds/symlink/tas2764.pdf) and
+[TAS2770, section 8.4.3](https://www.ti.com/lit/ds/symlink/tas2770.pdf).
+A cutoff alone is insufficient. No coefficients, firmware gains or speaker
+constants are invented. Consequently this draft cannot authorize louder real
+TAS output until an approved, complete bound is supplied and implemented.
+Unknown profiles retain the existing conservative daemon/kernel behaviour.
 
-The solver considers every active thermal model and both nodes. For the
-existing positive cascade model, let `a = Rc/tauc`, `b = Rm/taum`, and
-`k = max(a,b)`. An arbitrary nonnegative energy burst E raises the future
-magnet by at most bE and the future coil by at most kE. This follows from the
-positive impulse response: the coil is a lag of the magnet plus its direct
-input. The envelope `(kE,bE)` is nonincreasing under zero added power.
+Implementation uses public Linux sources and newly authored code. The shared
+ledger/payload helpers and host adapter are dual GPL-2.0-only OR MIT; no existing
+Linux driver or test was relicensed. No Apple implementation or tuning file,
+recording, credential or private lab record is copied into public source.
 
-For an indefinite safe tail of power Ps, a sufficient state envelope is
-`M = max(Tm, Ta + Ps*Rm)` and `C = max(Tc, M + Ps*Rc)`.
-Reserve all unresolved queued joules, all still spendable old credit and all
-downstream/filter residual energy before issuing any new credit. Both
-`C + kE` and `M + bE` must remain below the applicable ceiling, with numerical
-margin. This envelope includes interior extrema and an infinite tail; it does
-not assume that a quiet observed prefix predicts quiet upcoming audio.
+## Required acceptance
 
-The initial solver is sufficient but potentially conservative. No listening
-claim follows from its proof alone. A tighter solver may use the existing
-closed-form model and immutable queue schedule, but must preserve the entire
-tail and outstanding debt, including completions that arrive late.
+KUnit exercises the ledger, payload ownership and actual macaudio control/trigger
+handlers. A host wrapper of the same C core and payload helper supports immutable
+queue simulations; it has no device access and cannot qualify a real transfer.
+The 30,144 retained continuous cases, historical rows, 63 unchanged listening
+replays and crash/stall/expiry tests must pass on the integrated source. Listening
+metrics must include sample attenuation as well as control gain: <=1 dB and
+exactly 0 dB on J616 at 30%/60%. No old test is waived or its limit raised.
 
-Only completed, authenticated output may advance the model's accounted
-boundary. Measured V/I is feedback over matching intervals and may tighten the
-upper state; it cannot erase reserved future heat or count it twice. Partial
-control writes, stale snapshots and lost telemetry issue no new grant.
-
-## Per-device facts and clean room
-
-DT fixes physical topology and slot selection; packaged daemon profiles fix
-thermal models, voltage ceilings and valid loads. Codec maximum analog/digital
-gain, downmix, HPF and any firmware/EQ gain and residual tail are part of the
-qualification, not guessed from recent sense data. TAS2764/TAS2770 volume locks
-and maximum-gain restrictions continue to apply. A bounded PCM energy before
-an unbounded downstream transform is not a physical energy bound.
-
-Implementation sources are public GPL Linux and MIT speakerguardd. Only
-architectural facts from the private macOS facts document inform this design;
-no Apple implementation or tuning file is copied or published.
-
-TI's [TAS2764 datasheet](https://www.ti.com/lit/ds/symlink/tas2764.pdf)
-(section 8.4.2) and [TAS2770 datasheet](https://www.ti.com/lit/ds/symlink/tas2770.pdf)
-(section 8.4.3) describe a playback HPF and separate digital volume and amplifier
-output-level controls. This supports including those stages in the contract;
-a listed cutoff frequency by itself is insufficient to specify a transient
-energy/tail bound. The prototype deliberately supplies no guessed filter
-coefficients or firmware gain. This is a qualification requirement, not a
-claim that those filters amplify energy or that the completed gate is infeasible.
-
-## Required acceptance on the integrated source
-
-* KUnit: rounding, extremes, shared slots, exhausted/absent/expired grants,
-  replayed/stale renewals, epoch changes, overflow and queued debt.
-* DMA boundary tests: mutable mmap source, repeated cyclic period, active plus
-  queued descriptors, pool exhaustion, delayed completions, missing reports,
-  partial submission, failed stop and unbind. Prove no private buffer reuse
-  while hardware can still read it.
-* The exact 30,144 continuous cases, 865 retained failures, 17 crossings,
-  historical 72 shared rows and every-profile strict/onset matrices, with the
-  actual gate model interposed at submission. Both nodes and all models stay
-  within limits; existing assertion oracles remain intact.
-* All 63 retained replays and quiet schedules, same normalization and reference:
-  at most 1 dB extra attenuation; exactly 0 dB on J616 at 30% and 60%. Include
-  the kernel's sample attenuation, not only daemon volume-control writes.
-* Daemon crash before/after renewal, stalls spanning many periods and expiry,
-  owner replacement, gain/rate/route changes, restarts and suspend.
-
-No deployment or speaker playback is authorized. The orchestrator files an
-independent review after the implementation and its evidence are available.
+No hardware, speaker playback, recording or deployment is part of this work.
+The orchestrator files the independent review after implementation and evidence.

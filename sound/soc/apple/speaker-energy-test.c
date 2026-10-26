@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
 #include <linux/limits.h>
+#include <sound/pcm.h>
 
 #include "speaker-energy.h"
 
@@ -113,7 +114,11 @@ static void stale_grant_and_replay(struct kunit *test)
 	samples[0] = 65536;
 	samples[1] = 65536;
 	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), 0);
-	KUNIT_EXPECT_EQ(test, apple_energy_grant(gate, &snapshot, ceiling, 2, 100), -ESTALE);
+	/* Traffic can spend the absolute ceiling while the daemon computes. */
+	KUNIT_EXPECT_EQ(test, apple_energy_grant(gate, &snapshot, ceiling, 2, 100), 0);
+	apple_energy_snapshot(gate, &snapshot);
+	KUNIT_EXPECT_EQ(test, snapshot.ceiling[0], ceiling[0]);
+	KUNIT_EXPECT_EQ(test, snapshot.submitted[0], 1ULL);
 }
 
 static void revoke_preserves_queue_debt(struct kunit *test)
@@ -269,6 +274,146 @@ static void invalid_route_cannot_reenable_old_mapping(struct kunit *test)
 	grant(test, gate, 100, 100);
 }
 
+static void exhausted_and_expired_use_reserved_safe_tail(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot snapshot;
+	s32 samples[] = { S32_MIN, S32_MAX };
+	u64 ticket;
+
+	apple_energy_fallback(gate, 1U << 27); /* independently reserved -24 dB */
+	grant(test, gate, 0, 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, samples[0], -(1 << 27));
+	KUNIT_EXPECT_EQ(test, samples[1], (1 << 27) - 1);
+	apple_energy_snapshot(gate, &snapshot);
+	KUNIT_EXPECT_EQ(test, snapshot.submitted[0], 0ULL);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	grant(test, gate, 1ULL << 30, 1ULL << 30);
+	samples[0] = S32_MIN;
+	samples[1] = S32_MAX;
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 100, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, samples[0], -(1 << 27));
+	apple_energy_snapshot(gate, &snapshot);
+	KUNIT_EXPECT_EQ(test, snapshot.submitted[0], 0ULL);
+}
+
+static void pcm_formats_round_toward_zero_before_spending(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot snapshot;
+	u64 ticket;
+	s16 narrow[] = { S16_MIN, S16_MAX };
+	u32 wide[] = { 0xde800000, 0xab7fffff }; /* S24 upper byte is ignored */
+
+	grant(test, gate, 1ULL << 28, 1ULL << 28);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter_pcm(gate, narrow, 1, 2,
+			SNDRV_PCM_FORMAT_S16_LE, 2, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, narrow[0], (s16)-16384);
+	KUNIT_EXPECT_EQ(test, narrow[1], (s16)16384);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	grant(test, gate, 2ULL << 28, 2ULL << 28);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter_pcm(gate, wide, 1, 2,
+			SNDRV_PCM_FORMAT_S24_LE, 2, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, wide[0], 0xffc00000U);
+	KUNIT_EXPECT_EQ(test, wide[1], 0x00400000U);
+	apple_energy_snapshot(gate, &snapshot);
+	KUNIT_EXPECT_EQ(test, snapshot.submitted[0], 2ULL << 28);
+	KUNIT_EXPECT_EQ(test, snapshot.submitted[1], 2ULL << 28);
+}
+
+static void rate_changes_do_not_reinterpret_lifetime_units(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot snapshot;
+	u8 slots[] = { 0, 1 };
+	s32 samples[] = { S32_MIN, S32_MIN };
+	u64 ticket;
+
+	KUNIT_ASSERT_EQ(test, apple_energy_configure(gate, 96000, 2, 2, slots), 0);
+	grant(test, gate, 1ULL << 29, 1ULL << 29);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, samples[0], S32_MIN);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_configure(gate, 48000, 2, 2, slots), 0);
+	grant(test, gate, 3ULL << 29, 3ULL << 29);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	apple_energy_snapshot(gate, &snapshot);
+	KUNIT_EXPECT_EQ(test, snapshot.completed[0], 3ULL << 29);
+}
+
+static void safe_raw_prefix_is_charged_before_gain_can_rise(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot state;
+	u64 ceiling[] = { 2ULL << 30, 2ULL << 30 };
+	s32 samples[] = { S32_MIN, S32_MIN };
+	u64 ticket;
+
+	apple_energy_fallback(gate, 21474);
+	KUNIT_ASSERT_EQ(test, apple_energy_hardware_safe(gate, true), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, samples[0], S32_MIN); /* hardware is still -100 dB */
+	apple_energy_snapshot(gate, &state);
+	KUNIT_EXPECT_EQ(test, state.submitted[0], 0ULL);
+	KUNIT_EXPECT_EQ(test, state.unbudgeted[0], 1ULL << 30);
+	KUNIT_EXPECT_EQ(test, apple_energy_hardware_safe(gate, false), -EAGAIN);
+	KUNIT_ASSERT_EQ(test, apple_energy_grant(gate, &state, ceiling, 2, 100), 0);
+	apple_energy_snapshot(gate, &state);
+	KUNIT_EXPECT_EQ(test, state.submitted[0], 1ULL << 30);
+	KUNIT_EXPECT_EQ(test, state.unbudgeted[0], 0ULL);
+	KUNIT_ASSERT_EQ(test, apple_energy_hardware_safe(gate, false), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	apple_energy_snapshot(gate, &state);
+	KUNIT_EXPECT_EQ(test, state.completed[0], 1ULL << 30);
+	KUNIT_EXPECT_EQ(test, state.refunded[0], 0ULL);
+}
+
+static void unaffordable_raw_prefix_drains_under_the_hardware_lock(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot state;
+	u64 ceiling[] = { 1ULL << 29, 1ULL << 29 };
+	s32 samples[] = { S32_MIN, S32_MIN };
+	u64 raw, protected;
+
+	apple_energy_fallback(gate, 21474);
+	KUNIT_ASSERT_EQ(test, apple_energy_hardware_safe(gate, true), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &raw), 0);
+	apple_energy_snapshot(gate, &state);
+	KUNIT_EXPECT_EQ(test, apple_energy_grant(gate, &state, ceiling, 2, 100), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, apple_energy_hardware_safe(gate, false), -EAGAIN);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &protected), 0);
+	KUNIT_EXPECT_LT(test, apple_energy_cost(samples[0]), 1ULL << 30);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, raw), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, protected), 0);
+	apple_energy_snapshot(gate, &state);
+	KUNIT_EXPECT_EQ(test, state.completed[0], state.refunded[0]);
+	KUNIT_EXPECT_GT(test, state.completed[0], 0ULL);
+	KUNIT_EXPECT_EQ(test, state.unbudgeted[0], 0ULL);
+}
+
+static void bounded_current_metric_covers_arbitrary_voltage_current_phase(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot state;
+	s32 samples[] = { 1 << 30, -(1 << 30) };
+	u64 ticket;
+
+	KUNIT_ASSERT_EQ(test, apple_energy_metric(gate, APPLE_ENERGY_ABSOLUTE), 0);
+	grant(test, gate, 1ULL << 28, 1ULL << 28);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, samples[0], 1 << 29);
+	KUNIT_EXPECT_EQ(test, samples[1], -(1 << 29));
+	apple_energy_snapshot(gate, &state);
+	KUNIT_EXPECT_EQ(test, state.submitted[0], 1ULL << 28);
+	KUNIT_EXPECT_EQ(test, state.source_submitted[0], 1ULL << 28);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	/* A different power law may not reinterpret already-issued counters. */
+	KUNIT_EXPECT_EQ(test, apple_energy_metric(gate, APPLE_ENERGY_SQUARED), -EINVAL);
+}
+
 static struct kunit_case apple_energy_cases[] = {
 	KUNIT_CASE(energy_rounding),
 	KUNIT_CASE(absent_and_expired),
@@ -282,6 +427,12 @@ static struct kunit_case apple_energy_cases[] = {
 	KUNIT_CASE(integer_boundary_and_saturation),
 	KUNIT_CASE(every_small_budget_bounds_sample),
 	KUNIT_CASE(invalid_route_cannot_reenable_old_mapping),
+	KUNIT_CASE(exhausted_and_expired_use_reserved_safe_tail),
+	KUNIT_CASE(pcm_formats_round_toward_zero_before_spending),
+	KUNIT_CASE(rate_changes_do_not_reinterpret_lifetime_units),
+	KUNIT_CASE(safe_raw_prefix_is_charged_before_gain_can_rise),
+	KUNIT_CASE(unaffordable_raw_prefix_drains_under_the_hardware_lock),
+	KUNIT_CASE(bounded_current_metric_covers_arbitrary_voltage_current_phase),
 	{}
 };
 

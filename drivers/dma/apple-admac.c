@@ -141,6 +141,7 @@ struct admac_chan {
 	struct list_head to_free;
 	struct admac_payload *payload;
 	bool quarantined;
+	bool quiesced;
 };
 
 struct admac_sram {
@@ -346,6 +347,24 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 
 	return &adtx->tx;
 }
+
+int apple_admac_playback_quiesced(struct dma_chan *chan)
+{
+	struct admac_chan *adchan;
+	unsigned long flags;
+	int ret;
+
+	if (!chan || chan->device->device_prep_dma_cyclic != admac_prep_dma_cyclic)
+		return -EOPNOTSUPP;
+	adchan = to_admac_chan(chan);
+	spin_lock_irqsave(&adchan->lock, flags);
+	ret = adchan->quiesced && !adchan->quarantined && !adchan->current_tx &&
+		list_empty(&adchan->submitted) && list_empty(&adchan->issued) &&
+		list_empty(&adchan->to_free) ? 0 : -EIO;
+	spin_unlock_irqrestore(&adchan->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_admac_playback_quiesced);
 
 static void admac_payload_free(struct admac_chan *chan, struct admac_payload *p)
 {
@@ -570,6 +589,7 @@ static void admac_start_chan(struct admac_chan *adchan)
 	struct admac_data *ad = adchan->host;
 	u32 startbit = 1 << (adchan->no / 2);
 
+	adchan->quiesced = false;
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
 		       ad->base + REG_CHAN_INTSTATUS(ad, adchan->no, ad->irq_index));
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
@@ -776,6 +796,10 @@ static void admac_synchronize(struct dma_chan *chan)
 			admac_payload_quarantine(p);
 		}
 	}
+	/* A raw headphone channel is equally unsafe to route after a failed stop. */
+	if (!stopped)
+		adchan->quarantined = true;
+	adchan->quiesced = stopped && !adchan->quarantined;
 	spin_unlock_irqrestore(&adchan->lock, flags);
 
 	list_for_each_entry_safe(adtx, _adtx, &head, node) {
