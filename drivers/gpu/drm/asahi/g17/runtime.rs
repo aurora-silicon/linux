@@ -186,7 +186,7 @@ pub(super) struct Registry {
 impl Registry {
     /// Initialize inside the firmware allocation instead of staging the whole
     /// registry on the probe stack. No additional allocation is required.
-    #[cfg(CONFIG_KUNIT)]
+    #[cfg(CONFIG_KUNIT = "y")]
     pub(super) fn new(
         clusters: u32,
         deflake: crate::g17::fw::render::Deflake,
