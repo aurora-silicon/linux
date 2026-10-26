@@ -1559,3 +1559,10 @@ module_exit(appledrm_unregister);
 MODULE_AUTHOR("Asahi Linux contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("Dual MIT/GPL");
+/*
+ * The DCPs take their HDMI and Type-C route mux controls from the display
+ * crossbar. Without this, initramfs generators leave it out, it loads only
+ * from the root filesystem, and a DCP probe that waits past the deferred
+ * probe timeout (an encrypted root's passphrase prompt) gives up its routes.
+ */
+MODULE_SOFTDEP("pre: mux-apple-display-crossbar");
