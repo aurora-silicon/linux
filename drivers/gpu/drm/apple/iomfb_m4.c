@@ -650,10 +650,10 @@ failed:
 	return ret;
 }
 
-static int dcp_m4_runtime_call(void *cookie, unsigned int method, bool remote,
-				const void *input, u32 input_size, void *output, u32 output_size)
+static int dcp_m4_runtime_call_stream(struct dcp_m4_runtime *r, unsigned int method,
+				      u8 stream, bool remote, const void *input,
+				      u32 input_size, void *output, u32 output_size)
 {
-	struct dcp_m4_runtime *r = cookie;
 	struct iomfb_m4 *dcp = r->dcp;
 	unsigned long previous = r->deadline;
 	struct dcp_m4_packet message;
@@ -671,8 +671,9 @@ static int dcp_m4_runtime_call(void *cookie, unsigned int method, bool remote,
 	}
 	tag = 'A' | (('0' + method / 100) << 8) |
 		(('0' + method / 10 % 10) << 16) | (('0' + method % 10) << 24);
-	ret = dcp_m4_call_begin(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE,
-			      tag, remote, input, input_size, output_size, &word);
+	ret = dcp_m4_call_begin_stream(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE,
+				       tag, stream, remote, input, input_size, output_size,
+				       &word);
 	if (!ret)
 		ret = dcp_m4_runtime_send(r, word);
 	while (!ret) {
@@ -680,7 +681,7 @@ static int dcp_m4_runtime_call(void *cookie, unsigned int method, bool remote,
 		if (ret)
 			break;
 		dma_rmb();
-		ret = dcp_m4_decode_word(word, &message);
+		ret = dcp_m4_transaction_decode(&dcp->transaction, word, &message);
 		if (ret) {
 			dcp_m4_runtime_bad_word(r, word, ret);
 			break;
@@ -700,6 +701,13 @@ finished:
 		dev_err(dcp->dev, "DCP A%03u failed: %d; retained session\n", method, ret);
 	}
 	return ret;
+}
+
+static int dcp_m4_runtime_call(void *cookie, unsigned int method, bool remote,
+			       const void *input, u32 input_size, void *output, u32 output_size)
+{
+	return dcp_m4_runtime_call_stream(cookie, method, 0, remote, input, input_size,
+					  output, output_size);
 }
 
 /* One bounded drain; a positive return asks the idle worker to reschedule. */
