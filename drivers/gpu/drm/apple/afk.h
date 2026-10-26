@@ -105,6 +105,9 @@ struct apple_epic_service_ops {
 			  const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
+	/* Consumed synchronously before init publishes service readiness. */
+	void (*init_props)(struct apple_epic_service *service, s64 unit,
+			   const void *props, size_t size);
 	int (*call)(struct apple_epic_service *service, u32 idx,
 		    const void *data, size_t data_size, void *reply,
 		    size_t reply_size);

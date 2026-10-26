@@ -86,6 +86,8 @@ struct dptxport_apcall_set_tiled {
 	__le32 retcode;
 };
 
+#include "dptx-drive-v27.inc"
+
 /*
  * SetTiledDisplayHints payload, as DCP sends it for an LG UltraFine 5K
  * (offsets in bytes): tile location (column, row) at 0x08/0x0c, tiles
@@ -279,6 +281,11 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 
 	reply->max_drive_settings[0] = cpu_to_le32(0x3);
 	reply->max_drive_settings[1] = cpu_to_le32(0x3);
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		/* Protocol-27 drive settings: type, voltage, pre-emphasis. */
+		reply->max_drive_settings[0] = cpu_to_le32(0);
+		memcpy(reply->_unk1, &reply->max_drive_settings[1], sizeof(__le32));
+	}
 
 	return 0;
 }
@@ -708,8 +715,11 @@ dptxport_call_activate(struct apple_epic_service *service,
 	 * (DPTX_INACTIVE=0) from here; waking it earlier hangs the machine.
 	 * Activate always replies success to DCP.
 	 */
-	if (dptx->atcphy && !dcp->phy_managed_by_typec)
-		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+	if (dptx->atcphy && !dcp->phy_managed_by_typec) {
+		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+		if (ret)
+			return ret;
+	}
 	if (dcp->dptx_tunnel) {
 		ret = dcp_tunnel_dpin_activate(dcp, dptx->unit, true);
 		/* T6030 14.7: report a failed tunnel activation to DCP. */
@@ -878,6 +888,9 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
 		int ret;
 
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dcp_peer_hints_v27(service->ep->dcp, dptx, data,
+						  data_size, reply, reply_size);
 		memcpy(reply, data, min(reply_size, data_size));
 		ret = dptxport_call_set_tiled_display_hint(service, data,
 							   data_size, reply,
@@ -888,9 +901,15 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		return ret;
 	}
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dptxport_call_drive_v27(service, false, data, data_size,
+						     reply, reply_size);
 		return dptxport_call_get_drive_settings(service, data, data_size,
 							reply, reply_size);
 	case DPTX_APCALL_SET_DRIVE_SETTINGS:
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dptxport_call_drive_v27(service, true, data, data_size,
+						     reply, reply_size);
 		return dptxport_call_set_drive_settings(service, data, data_size,
 							reply, reply_size);
         case DPTX_APCALL_ACTIVATE:
@@ -971,6 +990,21 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 		return port;
 	trace_dptxport_init(dcp, unit);
 	return dptx_service_bind(service, &dcp->dptxport[port], unit);
+}
+
+static void dptxport_init_props(struct apple_epic_service *service, s64 unit,
+			       const void *props, size_t size)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct dcp_parse_ctx ctx;
+	struct dcp_dptx_caps caps;
+
+	if (unit < 0 || unit >= ARRAY_SIZE(dcp->dptxport) ||
+	    parse(props, size, &ctx) || parse_dptx_caps(&ctx, &caps))
+		return;
+	dcp->dptxport[unit].caps = caps;
+	dev_info(dcp->dev, "DPTX%lld caps: width=%u total=%u active=%u\n",
+		 unit, caps.width, caps.total_rate, caps.active_rate);
 }
 
 static void dptxport_init(struct apple_epic_service *service, const char *name,
@@ -1105,6 +1139,7 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 		.prepare = dptxport_prepare,
 		.teardown = dptxport_teardown,
 		.init = dptxport_init,
+		.init_props = dptxport_init_props,
 		.call = dptxport_call,
 	},
 	{
@@ -1250,7 +1285,8 @@ int dptx_controller_init(struct apple_dcp *dcp)
 int dptxep_init(struct apple_dcp *dcp)
 {
 	struct apple_dcp_afkep *ep;
-	bool wire_v2 = dcp->hw.iomfb_method_profile ==
+	bool wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+		dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	int ret;
 	u32 port;
