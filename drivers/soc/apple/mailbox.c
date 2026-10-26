@@ -780,6 +780,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mbox->dev = &pdev->dev;
+	mbox->hold_rx_in_sleep = of_property_read_bool(dev->of_node, "apple,hold-rx-in-sleep");
 	mbox->hw = of_device_get_match_data(dev);
 	if (!mbox->hw)
 		return -EINVAL;
@@ -1133,10 +1134,39 @@ static const struct of_device_id apple_mbox_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_mbox_of_match);
 
+/*
+ * The receive IRQ is IRQF_NO_SUSPEND, so each message wakes a CPU out of
+ * suspend-to-idle. A coprocessor whose messages need not wake the system
+ * keeps them in the FIFO until resume. The mailbox is a supplier of its
+ * consumer, so this runs after the consumer suspended and before it resumes.
+ */
+static int apple_mbox_suspend_noirq(struct device *dev)
+{
+	struct apple_mbox *mbox = dev_get_drvdata(dev);
+
+	if (mbox && mbox->hold_rx_in_sleep)
+		apple_mbox_hold_rx(mbox);
+	return 0;
+}
+
+static int apple_mbox_resume_noirq(struct device *dev)
+{
+	struct apple_mbox *mbox = dev_get_drvdata(dev);
+
+	if (mbox && mbox->hold_rx_in_sleep)
+		apple_mbox_release_rx(mbox);
+	return 0;
+}
+
+static const struct dev_pm_ops apple_mbox_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_mbox_suspend_noirq, apple_mbox_resume_noirq)
+};
+
 static struct platform_driver apple_mbox_driver = {
 	.driver = {
 		.name = "apple-mailbox",
 		.of_match_table = apple_mbox_of_match,
+		.pm = pm_sleep_ptr(&apple_mbox_pm_ops),
 	},
 	.probe = apple_mbox_probe,
 	.remove = apple_mbox_remove,
