@@ -132,6 +132,15 @@ properties:
       unlike apple,firmware-owned, their registers remain writable.
     type: boolean
 
+  apple,preserve-active-control:
+    description:
+      Firmware hands off this domain with an active control word that must be
+      retained until an actual power transition is requested. Do not enable
+      auto-PM at probe or rewrite a reset-free, non-busy control word whose
+      target and actual state already satisfy an active request. Power-down
+      and requests that require a state change retain the normal sequence.
+    type: boolean
+
   apple,min-state:
     description:
       Specifies the minimum power state for auto-PM.
