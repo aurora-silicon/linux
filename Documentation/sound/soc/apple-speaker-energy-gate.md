@@ -139,9 +139,10 @@ has been qualified and no new device is authorized for louder output.
 
 Buildbox validation, using normal resource admission and no devices:
 
-* **30/30 KUnit tests pass** (18 ledger, 4 payload ownership, 8 actual macaudio
+* **31/31 KUnit tests pass** (18 ledger, 4 payload ownership, 9 actual macaudio
   control/trigger tests). The stale Q30 integer-boundary expectation in an
   earlier run is retained and corrected for Q20; no safety assertion is removed.
+  Live owner close is tested in both ALSA control-release orders with queued debt.
 * **ARM64 C object compilation passes** for ADMAC, macaudio, the energy ledger
   and both TAS codecs. This is not a complete bootable-kernel or AOP Rust build.
 * The **30,144-case continuous campaign passes all 221,844 thermal rows** with
@@ -150,6 +151,12 @@ Buildbox validation, using normal resource admission and no devices:
   pass too (189 reference-gated / 676 fallback). Input identities, thermal
   limits and continuous assertion oracles are unchanged. Reference certificates
   do not establish physical transfer bounds.
+* The separately retained **72 shared historical rows pass** under conservative
+  fallback, with **140 total integrated peak rows and zero over-limit rows**.
+  These reporting-only fixtures use the current daemon plus frozen diagnostic
+  exporters and the retained independent thermal integrator; they are not a
+  gate-qualified transfer run. The two different-source packaged-Neo archive
+  rows remain explicitly unmatched and are not counted as reruns.
 * The full standard suite reports **321 passed, 1 failed, 1 ignored**. The
   separately run 30,144-case campaign is the ignored extended test. Twenty of
   the original 21 failures now pass, using explicit reference-contract fixtures
