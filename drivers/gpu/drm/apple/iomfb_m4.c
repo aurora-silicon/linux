@@ -69,6 +69,7 @@ struct iomfb_m4 {
 	size_t allocated;
 	int error;
 	bool started, init_sent, ready, startup_started;
+	bool powered_off; /* setPowerState(0) for system sleep */
 	/* Exact completed successor or blank is the only framebuffer retirement. */
 	struct drm_framebuffer *active_fb;
 	struct drm_framebuffer *uncertain_fb;
@@ -1293,6 +1294,8 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 		return ret;
 	mutex_lock(&dcp->lock);
 	ret = dcp_m4_runtime_live(dcp->runtime);
+	if (!ret && dcp->powered_off)
+		ret = -EAGAIN;
 	if (!ret)
 		ret = iomfb_m4_check_frame(&frame);
 	if (ret)
@@ -1340,6 +1343,83 @@ int iomfb_m4_blank(struct apple_dcp *owner)
 	mutex_unlock(&dcp->lock);
 	if (retire)
 		drm_framebuffer_put(retire);
+	return ret;
+}
+
+/* setPowerState (A473), on the out-of-band stream on IOMFB 26.x. */
+struct dcp_m4_power_state_req {
+	__le64 state;
+	u8 flags[4];
+	u8 result_null;
+	u8 padding[3];
+} __packed;
+static_assert(sizeof(struct dcp_m4_power_state_req) == 16);
+
+struct dcp_m4_power_state_reply {
+	__le32 value;
+	__le32 status;
+} __packed;
+static_assert(sizeof(struct dcp_m4_power_state_reply) == 8);
+
+static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on)
+{
+	struct dcp_m4_power_state_req req = { .state = cpu_to_le64(on) };
+	struct dcp_m4_power_state_reply reply = {};
+	int ret;
+
+	lockdep_assert_held(&dcp->lock);
+	ret = dcp_m4_runtime_live(dcp->runtime);
+	if (!ret)
+		ret = dcp_m4_runtime_call_stream(dcp->runtime, 473, 1, false, &req,
+						 sizeof(req), &reply, sizeof(reply));
+	if (!ret && reply.status) {
+		dev_err(dcp->dev, "display power %s refused: status %#x\n",
+			on ? "on" : "off", le32_to_cpu(reply.status));
+		ret = -EIO;
+		dcp_m4_failed(dcp, ret);
+	}
+	return ret;
+}
+
+/* apple-drm, a consumer of this device, has blanked the panel before this. */
+int iomfb_m4_suspend(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	int ret;
+
+	if (!dcp || !dcp->runtime)
+		return -ENODEV;
+	mutex_lock(&dcp->lock);
+	if (dcp->active_fb) {
+		dev_warn(dcp->dev, "panel still scanning out: refusing system sleep\n");
+		ret = -EBUSY;
+	} else {
+		ret = dcp_m4_set_power_state(dcp, false);
+	}
+	if (!ret)
+		dcp->powered_off = true;
+	mutex_unlock(&dcp->lock);
+	return ret;
+}
+
+int iomfb_m4_resume(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	int ret;
+
+	if (!dcp || !dcp->runtime)
+		return -ENODEV;
+	mutex_lock(&dcp->lock);
+	if (dcp->powered_off) {
+		ret = dcp_m4_set_power_state(dcp, true);
+		if (!ret)
+			dcp->powered_off = false;
+	} else {
+		ret = dcp_m4_runtime_health(dcp->runtime);
+		if (ret)
+			dcp_m4_failed(dcp, ret);
+	}
+	mutex_unlock(&dcp->lock);
 	return ret;
 }
 

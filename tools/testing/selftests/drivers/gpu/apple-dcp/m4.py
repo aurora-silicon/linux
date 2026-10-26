@@ -532,6 +532,7 @@ struct iomfb_m4 {
     struct drm_framebuffer *active_fb,*uncertain_fb;
     struct dcp_m4_frame active_frame;
     u64 flips,blanks;
+    bool powered_off;
 };
 static void mutex_lock(int *lock) { assert(!*lock); *lock=1; }
 static void mutex_unlock(int *lock) { assert(*lock==1); *lock=0; }
@@ -591,6 +592,11 @@ int main(void)
         assert(!iomfb_m4_blank(&owner));
         assert(carried_brightness && carried_nits==0 && owner.backlight.state.actual==0);
         assert(fb.refs==1 && !dcp.active_fb && !dcp.active_frame.dva && dcp.blanks==1);
+        /* Powered down for system sleep: refused, no reference, session intact. */
+        dcp.powered_off=true;
+        assert(iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000)==-EAGAIN);
+        assert(fb.refs==1 && !dcp.active_fb && !dcp.error);
+        dcp.powered_off=false;
         assert(!dcp_backlight_dpms(&owner,true));
         assert(deferred_kicks==kicks_before+2); /* This second kick is still deferred. */
         assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
@@ -605,6 +611,7 @@ int main(void)
     }
     puts("PASS DPMS-off blank carries zero before delayed work and completes only after both exact receipts");
     puts("PASS actual present/blank retain active+uncertain DMA framebuffer references across a missing receipt");
+    puts("PASS a present while the display is powered off for sleep is refused without a reference");
     return 0;
 }
 '''
