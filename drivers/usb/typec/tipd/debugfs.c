@@ -21,6 +21,7 @@
  * whoever set it up before Linux (e.g. a boot loader arming Debug USB).
  */
 
+#include <linux/soc/apple/display-event-debugfs.h>
 #include <linux/debugfs.h>
 #include <linux/fs.h>
 #include <linux/mutex.h>
@@ -270,6 +271,10 @@ void tipd_debugfs_register(struct tps6598x *tps)
 
 	dbg->dentry = debugfs_create_dir(dev_name(tps->dev), tipd_debugfs_root);
 	tps->debugfs = dbg;
+	if (tps->event_log && IS_ERR_OR_NULL(debugfs_create_file("dptx_events", 0400,
+			dbg->dentry, tps->event_log, &apple_display_events_fops)))
+		dev_warn(tps->dev, "PD event recorder file unavailable\n");
+
 	if (IS_ENABLED(CONFIG_TYPEC_TPS6598X_DEBUG_COMMANDS))
 		debugfs_create_file("command", 0600, dbg->dentry, tps,
 				    &tipd_debugfs_command_fops);

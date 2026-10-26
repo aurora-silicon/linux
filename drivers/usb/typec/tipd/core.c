@@ -519,6 +519,10 @@ static bool tps6598x_read_data_status(struct tps6598x *tps)
 	return true;
 }
 
+bool tipd_event_trace;
+module_param_named(dptx_event_trace, tipd_event_trace, bool, 0400);
+MODULE_PARM_DESC(dptx_event_trace, "Record existing PD/display events in bounded RAM; default off");
+
 static bool cd321x_read_data_status(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
@@ -526,7 +530,7 @@ static bool cd321x_read_data_status(struct tps6598x *tps)
 
 	ret = tps6598x_read_data_status(tps);
 	if (!ret)
-		return false;
+		{ TIPD_EVENT(tps, TIPD_EVENT_DATA, ret, 0, tps->status, tps->pwr_status, tps->data_status, le32_to_cpu(cd321x->dp_sid_status.status_rx), le32_to_cpu(cd321x->dp_sid_status.status_tx), le32_to_cpu(cd321x->dp_sid_status.configure), le32_to_cpu(cd321x->dp_sid_status.mode_data), 0, 0); return false; }
 
 	if (tps->data_status & TPS_DATA_STATUS_DP_CONNECTION) {
 		ret = tps6598x_block_read(tps, TPS_REG_DP_SID_STATUS,
@@ -534,7 +538,7 @@ static bool cd321x_read_data_status(struct tps6598x *tps)
 		if (ret) {
 			dev_err(tps->dev, "Failed to read DP SID Status: %d\n",
 				ret);
-			return false;
+			{ TIPD_EVENT(tps, TIPD_EVENT_DATA, ret, 0, tps->status, tps->pwr_status, tps->data_status, le32_to_cpu(cd321x->dp_sid_status.status_rx), le32_to_cpu(cd321x->dp_sid_status.status_tx), le32_to_cpu(cd321x->dp_sid_status.configure), le32_to_cpu(cd321x->dp_sid_status.mode_data), 0, 0); return false; }
 		}
 	}
 
@@ -543,7 +547,7 @@ static bool cd321x_read_data_status(struct tps6598x *tps)
 				&cd321x->intel_vid_status, sizeof(cd321x->intel_vid_status));
 		if (ret) {
 			dev_err(tps->dev, "Failed to read Intel VID Status: %d\n", ret);
-			return false;
+			{ TIPD_EVENT(tps, TIPD_EVENT_DATA, ret, 0, tps->status, tps->pwr_status, tps->data_status, le32_to_cpu(cd321x->dp_sid_status.status_rx), le32_to_cpu(cd321x->dp_sid_status.status_tx), le32_to_cpu(cd321x->dp_sid_status.configure), le32_to_cpu(cd321x->dp_sid_status.mode_data), 0, 0); return false; }
 		}
 	}
 
@@ -553,10 +557,11 @@ static bool cd321x_read_data_status(struct tps6598x *tps)
 		if (ret) {
 			dev_err(tps->dev,
 				"Failed to read USB4 Status: %d\n", ret);
-			return false;
+			{ TIPD_EVENT(tps, TIPD_EVENT_DATA, ret, 0, tps->status, tps->pwr_status, tps->data_status, le32_to_cpu(cd321x->dp_sid_status.status_rx), le32_to_cpu(cd321x->dp_sid_status.status_tx), le32_to_cpu(cd321x->dp_sid_status.configure), le32_to_cpu(cd321x->dp_sid_status.mode_data), 0, 0); return false; }
 		}
 	}
 
+	TIPD_EVENT(tps, TIPD_EVENT_DATA, 0, 1 | ((tps->data_status & TPS_DATA_STATUS_DP_CONNECTION) ? 2 : 0), tps->status, tps->pwr_status, tps->data_status, le32_to_cpu(cd321x->dp_sid_status.status_rx), le32_to_cpu(cd321x->dp_sid_status.status_tx), le32_to_cpu(cd321x->dp_sid_status.configure), le32_to_cpu(cd321x->dp_sid_status.mode_data), 0, 0);
 	return true;
 }
 
@@ -710,20 +715,21 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 	*held = false;
 	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
 		if (cd321x->state_valid && cd321x->state.mode == TYPEC_STATE_SAFE)
-			return 0;
+			{ TIPD_EVENT(tps, TIPD_EVENT_MUX_DUPLICATE, 0, 0, st->status, st->data_status, cd321x->state.mode, cd321x->dp_status, cd321x->dp_conf, cd321x->state_valid, 0, 0, 0); return 0; }
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
+		TIPD_EVENT(tps, TIPD_EVENT_MUX, 0, 0, st->status, st->data_status, cd321x->state.mode, le32_to_cpu(st->dp_sid_status.status_rx), le32_to_cpu(st->dp_sid_status.configure), cd321x->state_valid, 0, 0, 0);
 		ret = cd321x_mux_set(cd321x, held);
 	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
 		struct enter_usb_data eusb_data;
 
 		if (cd321x->state_valid && !cd321x->state.alt &&
 		    cd321x->state.mode == TYPEC_MODE_USB4)
-			return 0;
+			{ TIPD_EVENT(tps, TIPD_EVENT_MUX_DUPLICATE, 0, 0, st->status, st->data_status, cd321x->state.mode, cd321x->dp_status, cd321x->dp_conf, cd321x->state_valid, 0, 0, 0); return 0; }
 
 		eusb_data.eudo = le32_to_cpu(st->usb4_status.eudo);
 		eusb_data.active_link_training =
@@ -732,6 +738,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		cd321x->state.alt = NULL;
 		cd321x->state.data = &eusb_data;
 		cd321x->state.mode = TYPEC_MODE_USB4;
+		TIPD_EVENT(tps, TIPD_EVENT_MUX, 0, 0, st->status, st->data_status, cd321x->state.mode, le32_to_cpu(st->dp_sid_status.status_rx), le32_to_cpu(st->dp_sid_status.configure), cd321x->state_valid, 0, 0, 0);
 		ret = cd321x_mux_set(cd321x, held);
 		if (ret)
 			goto out;
@@ -747,7 +754,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 
 		if (cd321x->state_valid && cd321x->state.alt == cd321x->port_altmode_tbt &&
 		    cd321x->state.mode == TYPEC_TBT_MODE)
-			return 0;
+			{ TIPD_EVENT(tps, TIPD_EVENT_MUX_DUPLICATE, 0, 0, st->status, st->data_status, cd321x->state.mode, cd321x->dp_status, cd321x->dp_conf, cd321x->state_valid, 0, 0, 0); return 0; }
 
 		tbt_data.cable_mode = TBT_MODE |
 			TBT_SET_CABLE_SPEED(TPS_DATA_STATUS_TBT_CABLE_SPEED(st->data_status)) |
@@ -765,6 +772,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		cd321x->state.alt = cd321x->port_altmode_tbt;
 		cd321x->state.mode = TYPEC_TBT_MODE;
 		cd321x->state.data = &tbt_data;
+		TIPD_EVENT(tps, TIPD_EVENT_MUX, 0, 0, st->status, st->data_status, cd321x->state.mode, le32_to_cpu(st->dp_sid_status.status_rx), le32_to_cpu(st->dp_sid_status.configure), cd321x->state_valid, 0, 0, 0);
 		ret = cd321x_mux_set(cd321x, held);
 		if (ret)
 			goto out;
@@ -802,7 +810,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 			break;
 		default:
 			dev_err(tps->dev, "Invalid DP pin assignment\n");
-			return -EINVAL;
+			{ TIPD_EVENT(tps, TIPD_EVENT_MUX, -EINVAL, 0, st->data_status, 0, 0, 0, 0, 0, 0, 0, 0); return -EINVAL; }
 		}
 
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
@@ -842,6 +850,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
+		TIPD_EVENT(tps, TIPD_EVENT_MUX, 0, 0, st->status, st->data_status, cd321x->state.mode, le32_to_cpu(st->dp_sid_status.status_rx), le32_to_cpu(st->dp_sid_status.configure), cd321x->state_valid, 0, 0, 0);
 		if (send == CD321X_DP_SEND_EDGE) {
 			struct typec_displayport_data edge = {
 				.status = dp_data.status & ~DP_STATUS_IRQ_HPD,
@@ -866,13 +875,14 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 	} else {
 		if (cd321x->state_valid && !cd321x->state.alt &&
 		    cd321x->state.mode == TYPEC_STATE_USB)
-			return 0;
+			{ TIPD_EVENT(tps, TIPD_EVENT_MUX_DUPLICATE, 0, 0, st->status, st->data_status, cd321x->state.mode, cd321x->dp_status, cd321x->dp_conf, cd321x->state_valid, 0, 0, 0); return 0; }
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_USB;
 		cd321x->state.data = NULL;
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
+		TIPD_EVENT(tps, TIPD_EVENT_MUX, 0, 0, st->status, st->data_status, cd321x->state.mode, le32_to_cpu(st->dp_sid_status.status_rx), le32_to_cpu(st->dp_sid_status.configure), cd321x->state_valid, 0, 0, 0);
 		ret = cd321x_mux_set(cd321x, held);
 	}
 
@@ -895,6 +905,7 @@ out:
 		cd321x->dp_conf = 0;
 	}
 
+	TIPD_EVENT(tps, TIPD_EVENT_APPLY, ret, 0, cd321x->state.mode, cd321x->state_valid, cd321x->dp_status, cd321x->dp_conf, *display_busy, 0, 0, 0, 0);
 	return ret;
 }
 
@@ -1034,10 +1045,13 @@ static void cd321x_update_work(struct work_struct *work)
 	int ret;
 
 	guard(mutex)(&tps->lock);
-	if (!cd321x_pm_can_update(&cd321x->pm))
+	if (!cd321x_pm_can_update(&cd321x->pm)) {
+		TIPD_EVENT(tps, TIPD_EVENT_CONSUME, 0, 0, cd321x->pm.phase, 0, 0, 0, 0, 0, 0, 0, 0);
 		return;
+	}
 
 	st = cd321x->update_status;
+	TIPD_EVENT(tps, TIPD_EVENT_CONSUME, 0, 1, st.status, st.data_status, st.status_changed, st.data_status_changed, st.pwr_status, le32_to_cpu(st.dp_sid_status.status_rx), le32_to_cpu(st.dp_sid_status.configure), cd321x->pm.phase, 0);
 	cd321x->update_status.status_changed = 0;
 	cd321x->update_status.data_status_changed = 0;
 	cd321x->update_status.dp_sid_event = false;
@@ -1253,6 +1267,7 @@ static void cd321x_update_work(struct work_struct *work)
 			goto retry;
 	}
 	ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
+	TIPD_EVENT(tps, TIPD_EVENT_APPLY, ret, 2, st.status, st.data_status, display_busy, cd321x->display_route_active, 0, 0, 0, 0, 0);
 	if (ret && !display_busy)
 		goto retry;
 	/* A shared display route can be busy while the dock's USB path is usable. */
@@ -1296,6 +1311,7 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
+	TIPD_EVENT(tps, TIPD_EVENT_RETRY, 0, 0, cd321x->pm.phase, cd321x->state_valid, cd321x->display_route_active, 0, 0, 0, 0, 0, 0);
 	/*
 	 * The Thunderbolt provider disabled the port for good after a failed
 	 * resume recovery (see apple_cio_tbt_switch_set()). Other errors,
@@ -1365,6 +1381,7 @@ static void cd321x_queue_status(struct cd321x *cd321x)
 	cd321x->update_status.dp_sid_status = cd321x->dp_sid_status;
 	cd321x->update_status.intel_vid_status = cd321x->intel_vid_status;
 	cd321x->update_status.usb4_status = cd321x->usb4_status;
+	TIPD_EVENT(&cd321x->tps, TIPD_EVENT_QUEUE, 0, 0, cd321x->update_status.status, cd321x->update_status.data_status, cd321x->update_status.status_changed, cd321x->update_status.data_status_changed, cd321x->update_status.pwr_status, le32_to_cpu(cd321x->update_status.dp_sid_status.status_rx), le32_to_cpu(cd321x->update_status.dp_sid_status.configure), cd321x->pm.phase, cd321x->display_route_active);
 }
 
 static int cd321x_connect(struct tps6598x *tps, u32 status)
@@ -1599,15 +1616,18 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	u64 event = 0;
 	u32 status;
+	u32 diag_valid = 0;
 	int ret;
 
 	mutex_lock(&tps->lock);
 
 	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
+	TIPD_EVENT(tps, TIPD_EVENT_IRQ, ret, !ret, event, 0, 0, 0, 0, 0, 0, 0, 0);
 	if (ret) {
 		dev_err(tps->dev, "%s: failed to read events\n", __func__);
 		goto err_lost;
 	}
+	diag_valid |= BIT(0);
 	trace_cd321x_irq(event);
 
 	if (!event)
@@ -1624,9 +1644,11 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	if (!tps6598x_read_status(tps, &status))
 		goto err_lost;
 
+	diag_valid |= BIT(1);
 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE) {
 		if (!tps->data->read_power_status(tps))
 			goto err_lost;
+		diag_valid |= BIT(2);
 		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
 			if (tps6598x_read_partner_identity(tps)) {
 				dev_err(tps->dev, "failed to read partner identity\n");
@@ -1641,6 +1663,7 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 			goto err_lost;
 	if (event & cd321x_irq_mask(tps) & SN201202X_INT_DP_SID_UPDATE)
 		cd321x_dp_sid_event(container_of(tps, struct cd321x, tps));
+	diag_valid |= BIT(3);
 
 	/* Can be called uncondtionally since it will check for any changes itself */
 	cd321x_connect(tps, status);
@@ -1649,6 +1672,7 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 err_lost:
 	cd321x_event_lost(cd321x);
 err_unlock:
+	TIPD_EVENT(tps, TIPD_EVENT_IRQ_EXIT, ret, diag_valid, event, diag_valid & BIT(1) ? status : 0, tps->status, tps->pwr_status, tps->data_status, 0, 0, 0, 0);
 	mutex_unlock(&tps->lock);
 
 	if (event)
@@ -2111,10 +2135,19 @@ EXPORT_SYMBOL_IF_KUNIT(cd321x_init_work);
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
+	struct fwnode_handle *connector_fwnode;
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	int ret;
 
 	cd321x_init_work(cd321x);
+	if (tipd_event_trace) {
+		tps->event_log = devm_kzalloc(tps->dev, sizeof(*tps->event_log), GFP_KERNEL);
+		if (tps->event_log)
+			apple_display_event_log_init(tps->event_log, dev_name(tps->dev));
+		else
+			dev_warn(tps->dev, "PD event recorder allocation failed\n");
+	}
+
 
 	ret = tps6598x_register_port(tps, fwnode);
 	if (ret)
@@ -2130,9 +2163,13 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_unregister_altmodes;
 	}
 
-	cd321x->connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
-	if (IS_ERR(cd321x->connector_fwnode))
-		cd321x->connector_fwnode = NULL;
+	if (fwnode_property_present(fwnode, "displayport"))
+		connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	else
+		/* Graph-described DRM ports use the physical connector identity. */
+		connector_fwnode = fwnode_handle_get(fwnode);
+	if (!IS_ERR_OR_NULL(connector_fwnode))
+		cd321x->connector_fwnode = connector_fwnode;
 
 	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode);
 	if (IS_ERR(cd321x->tbt_switch)) {
