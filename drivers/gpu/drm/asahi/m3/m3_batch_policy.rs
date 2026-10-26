@@ -87,6 +87,17 @@ pub(crate) const fn retain_runtime(stop_failed: bool, gpu_pending: bool) -> bool
     stop_failed || gpu_pending
 }
 
+/// One firmware start per boot. `stop_asc` only clears RUN: it doesn't reset the firmware or
+/// give back a reusable RTKit or InitData state, and TTBAT context 0 still names the lower root
+/// the first start adopted, which is freed once ASC has stopped. Claimed just before the first
+/// ASC start and never released.
+pub(crate) struct StartLatch(core::sync::atomic::AtomicBool);
+impl StartLatch {
+    pub(crate) const fn new() -> Self { Self(core::sync::atomic::AtomicBool::new(false)) }
+    /// True for the first claim only.
+    pub(crate) fn claim(&self) -> bool { !self.0.swap(true, core::sync::atomic::Ordering::AcqRel) }
+}
+
 #[derive(Default)]
 pub(crate) struct PassCosts { recent: [Option<(u64, u64)>; 8] }
 impl PassCosts {

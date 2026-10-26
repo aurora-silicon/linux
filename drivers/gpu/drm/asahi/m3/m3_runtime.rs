@@ -974,6 +974,8 @@ impl Inner {
 // Registration and Mutex initialization otherwise duplicates it on the bounded
 // kernel stack. ManuallyDrop retains the whole allocation on failed ASC stop.
 pub(crate) struct Runtime { inner: ManuallyDrop<KBox<Inner>> }
+/// Claimed before this boot's first ASC start.
+static FIRMWARE_START: policy::StartLatch = policy::StartLatch::new();
 impl Runtime {
     #[inline(never)]
     pub(crate) fn new(pdev: &platform::Device<Core<'_>>, drm: &driver::AsahiDrmDevice, device: Device, contents: crate::m3::m3_adt_config::Contents) -> Result<Self> {
@@ -995,6 +997,15 @@ impl Runtime {
         if crate::m3::m3_adt_config::stop_before_asc(pdev.as_ref()) {
             return Err(ENODEV);
         }
+        // A second start (unbind and rebind, a module reload, a retry after a failed start)
+        // would set RUN while TTBAT context 0 still names the freed root of this one. Unloading
+        // is blocked once the latch is claimed, so a reload can't forget it.
+        if !FIRMWARE_START.claim() {
+            dev_err!(pdev.as_ref(), "M3: the GPU firmware already started once this boot and can't start again; reboot to start the GPU\n");
+            return Err(EBUSY);
+        }
+        // SAFETY: never released: the latch must outlive this instance of the module.
+        unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
         // Whether the coprocessor runs and offers its endpoints, for the T8122 verdict.
         let mut started=false;
         // The adopted UAT and its window live outside the closure: once TTBAT context 0 names

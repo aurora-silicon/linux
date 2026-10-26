@@ -163,3 +163,16 @@ fn experimental_air_is_active_while_pro_retains_serial_default() {
     assert!(default_depth(true)<=SLOTS);
     assert_eq!(MAX_PACKETS,8);
 }
+
+#[test]
+fn firmware_starts_once_per_boot() {
+    let latch=StartLatch::new();
+    assert!(latch.claim());
+    // Unbind and rebind, a reload or a retry: every later start is refused.
+    for _ in 0..3 {assert!(!latch.claim());}
+    // Concurrent probes: exactly one claims it.
+    let latch=std::sync::Arc::new(StartLatch::new());
+    let claims:usize=(0..8).map(|_|{let l=latch.clone();std::thread::spawn(move||l.claim())})
+        .collect::<Vec<_>>().into_iter().map(|t|usize::from(t.join().unwrap())).sum();
+    assert_eq!(claims,1);
+}
