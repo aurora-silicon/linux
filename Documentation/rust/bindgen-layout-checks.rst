@@ -46,11 +46,17 @@ Corrected generator
 -------------------
 
 ``tools/aurora-bindgen/`` contains pinned patches for bindgen 0.73.2 that
-repair both cases, a private build recipe and compile-only tests; see
-``tools/aurora-bindgen/README.rst``. It installs nothing system-wide. To check
-the layouts with it::
+repair both cases, a local build recipe and compile-only tests; see
+``tools/aurora-bindgen/README.rst``. Prepare it once before configuration::
 
-    make LLVM=1 BINDGEN=/path/to/bindgen ...
+    python3 tools/aurora-bindgen/build.py
+    make LLVM=1 ...
+
+The top-level Makefile automatically selects
+``tools/aurora-bindgen/build/bin/bindgen`` from the source tree, also for ``O=``
+builds. Packagers prepare this entry point in their build roots. Make does not
+fetch tools or install anything system-wide. If the entry point is absent,
+Kbuild uses ``bindgen`` from PATH and the same mandatory assertions apply.
 
 The generated bindings are consumed by the Rust kernel crate and by several
 drivers. After changing the bindings generator, rebuild the kernel Image and
@@ -61,7 +67,9 @@ the configured ``--rust-target 1.85``: that selects unconditional constant
 assertions rather than ``#[test]`` functions. They are checked without a
 Rust test configuration.
 
-Pass ``BINDGEN=/absolute/path/to/bindgen`` as a make command-line argument.
-Exporting it in the environment is insufficient: the top-level Makefile's
-``BINDGEN = bindgen`` assignment takes precedence over an environment value.
 Check the recorded bindings command, not just the toolchain version banner.
+Command-line overrides remain available for generator regression tests.
+The defect can affect any generated aligned empty record and containing types
+under other configurations; all emitted size/alignment/offset checks remain
+mandatory. They do not cover C-only types or opaque internal fields. See the
+generator README for the upstream status and related empty-struct issues.
