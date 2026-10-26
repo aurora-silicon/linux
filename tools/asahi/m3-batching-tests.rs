@@ -176,3 +176,17 @@ fn firmware_starts_once_per_boot() {
         .collect::<Vec<_>>().into_iter().map(|t|usize::from(t.join().unwrap())).sum();
     assert_eq!(claims,1);
 }
+
+#[test]
+fn failed_pending_packets_quarantine_only_what_the_firmware_may_have_seen() {
+    // (in a batch fail_active drained, partly published and still pending, never in a batch)
+    struct Packet {published:bool,guard:bool}
+    let mut active=vec![Packet{published:true,guard:true}];
+    let mut pending=vec![Packet{published:true,guard:true},Packet{published:false,guard:true}];
+    // fail_active drains active before fail_pending: a check against active can't see these.
+    let drained:Vec<_>=active.drain(..).collect();
+    for p in pending.iter_mut() {if release_unpublished(p.published) {p.guard=false;}}
+    assert!(drained[0].guard);
+    assert!(pending[0].guard,"a partly published packet keeps its guard");
+    assert!(!pending[1].guard,"a never-published packet releases its guard");
+}

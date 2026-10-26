@@ -83,6 +83,12 @@ pub(crate) const fn packet_retired(pending: bool, active: bool) -> bool {
     !pending && !active
 }
 
+/// A failed packet that no batch ever included can drop its VM job guard: the firmware never saw
+/// it. Any other keeps the guard, and its VM stays quarantined, until the runtime drops it.
+pub(crate) const fn release_unpublished(may_be_published: bool) -> bool {
+    !may_be_published
+}
+
 pub(crate) const fn retain_runtime(stop_failed: bool, gpu_pending: bool) -> bool {
     stop_failed || gpu_pending
 }

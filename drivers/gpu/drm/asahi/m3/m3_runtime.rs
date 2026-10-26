@@ -169,9 +169,15 @@ impl Inner {
     }
 }
 impl Inner {
-    /// Fail every packet that was never published. Their fences signal with the error.
+    /// Fail every packet not yet fully published. Their fences signal with the error. One that no
+    /// batch ever included releases its VM job guard first, so its VM isn't quarantined for work
+    /// the firmware never saw. One that may have been published keeps it: a partly published
+    /// packet, or one whose batch `fail_active` has already drained from `active`.
     fn fail_pending(&mut self, error: Error) {
-        for (packet,_) in self.pending.drain_all() {packet.finish(Err(error));}
+        for (packet,_) in self.pending.drain_all() {
+            if policy::release_unpublished(packet.may_be_published()) {packet.release_guard();}
+            packet.finish(Err(error));
+        }
     }
     /// A published batch failed or never retired: latch the fault, log it, and fail its
     /// packets. The packets stay retained (with their VM job guards) until teardown, because
@@ -374,6 +380,9 @@ impl Inner {
         for (p,_) in entries {
             if !self.packets.iter().any(|q| Arc::ptr_eq(q,p)) {self.packets.push(p.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;}
         }
+        // Before any producer state changes: an append the overlapping firmware consumes, or a
+        // partial publication, makes these packets visible to it.
+        for (p,_) in entries {p.mark_published();}
         let found=self.jobs.iter().position(|job| matches!((job,control),
             (NativeJob::Compute(_),crate::m3::m3_submit::Command::Compute(_)) |
             (NativeJob::Render(_),crate::m3::m3_submit::Command::Render{..})));
@@ -519,6 +528,7 @@ impl Inner {
         // Keep the packet before any producer mutation. No other batch is live.
         self.packets.clear();
         self.packets.push(packet.clone(),GFP_KERNEL).map_err(|_|early(ENOMEM))?;
+        packet.mark_published();
         let mut render_prepared=false;
         let mut compute_prepared=false;
         let prepared=(||->Result<usize> {

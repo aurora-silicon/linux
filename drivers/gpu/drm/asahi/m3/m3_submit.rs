@@ -43,6 +43,9 @@ pub(crate) struct Packet {
     pub(crate) wide_visibility:KVec<bool>,
     completion:UserFence<Completion>,
     finish_claimed: AtomicBool,
+    /// Set before a batch with any of this packet's commands can change firmware-visible state,
+    /// and never cleared.
+    published: AtomicBool,
     /// Queue urgency (3 = UAPI realtime .. 0 = UAPI low): more urgent packets are published first.
     pub(crate) urgency:u8,
     /// Who submitted the packet, for the failure log only.
@@ -78,6 +81,10 @@ impl Packet {
     }
     /// Called only after all published commands retired or before any publication.
     pub(crate) fn release_guard(&self) {drop(self.vm_job.lock().take());}
+    /// Called before the first firmware-visible change of a batch that includes this packet.
+    pub(crate) fn mark_published(&self) {self.published.store(true,Ordering::Relaxed);}
+    /// Whether the firmware may have seen any of this packet's commands.
+    pub(crate) fn may_be_published(&self)->bool {self.published.load(Ordering::Relaxed)}
     pub(crate) fn retired(&self) {self.release_guard();self.finish(Ok(()));}
     pub(crate) fn finish(&self,result:Result) {
         // Retirement, cancellation and a queued scheduler timeout can race.
@@ -232,7 +239,7 @@ impl queue::Queue for Queue {
         parser.finish().map_err(|_|EINVAL)?;
         let packet=Arc::new(Packet{vm:self.vm.clone(),commands,timestamps,attachments:flushes,wide_visibility:visibility,
             completion:self.fences.new_fence(0,Completion)?.into(),
-            finish_claimed:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
+            finish_claimed:AtomicBool::new(false),published:AtomicBool::new(false),urgency:self.urgency,owner:Owner::current(),
             vm_job:KBox::pin_init(new_mutex!(Some(vm_job)),GFP_KERNEL)?},GFP_KERNEL)?;
         let mut job=self.entity.new_job(1,Job{shared:self.shared.clone(),packet})?;
         for sync in syncs.drain(0..in_sync_count) {if let Some(f)=sync.fence {job.add_dependency(f)?;}}
