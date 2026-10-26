@@ -198,15 +198,6 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
-static bool dcpext_probe;
-module_param(dcpext_probe, bool, 0444);
-MODULE_PARM_DESC(dcpext_probe, "Opt into experimental T6030 external DCP probe (may hang)");
-
-static bool t6030_show_notch;
-module_param(t6030_show_notch, bool, 0444);
-MODULE_PARM_DESC(t6030_show_notch,
-		 "M3 internal display (14.x and 26.6 IOMFB): use the full height and show the notch");
-
 bool hdmi_audio;
 module_param(hdmi_audio, bool, 0644);
 MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
@@ -4511,20 +4502,6 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
 }
 
 /*
- * The M3 internal displays (14.x and 26.6 IOMFB) also accept
- * appledrm.t6030_show_notch=1, the switch existing J613/T6030 installs pass,
- * so the panel comes up at its full height (2560x1664 on the J613) instead
- * of the module refusing an unknown parameter.
- */
-static bool dcp_show_notch(struct apple_dcp *dcp)
-{
-	if (dcp->fw_compat != DCP_FIRMWARE_V_14_7 &&
-	    dcp->fw_compat != DCP_FIRMWARE_V_26_6)
-		return show_notch;
-	return show_notch || t6030_show_notch;
-}
-
-/*
  * T8122 dcpext (DCP_FIRMWARE_V_14_7_TEMPLATE): if the PMP runs, the display
  * gate added its DISPEXT request and pointed the dcpext at it
  * (apple,pmp-report). As on T6030, run the processor only once the PMP has
@@ -4670,7 +4647,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
 
-	if (!dcp_show_notch(dcp))
+	if (!show_notch)
 		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
 					   &dcp->notch_height);
 

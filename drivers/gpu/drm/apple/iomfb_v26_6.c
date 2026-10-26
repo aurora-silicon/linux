@@ -28,7 +28,7 @@
  * Scanout is one plane, XRGB8888 or ARGB8888, linear, exactly the mode size.
  * Each flush is one swap, completed when the firmware reports that swap id,
  * and then the page-flip event is sent. The notch rows (apple,notch-height,
- * unless appledrm.t6030_show_notch=1) are outside the mode and stay black.
+ * unless appledrm.show_notch=1) are outside the mode and stay black.
  */
 
 #include <linux/backlight.h>
