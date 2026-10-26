@@ -83,9 +83,9 @@ properties:
     minItems: 3
     maxItems: 3
     description:
-      macOS version (major, minor, patch) whose boot firmware loaded the GPU
-      firmware, which identifies the firmware build. Filled in by the boot
-      loader.
+      Reported macOS version (major, minor, patch) whose boot firmware loaded
+      the GPU firmware. Filled in by the boot loader. This is a selection
+      hint; the T6040 driver requires the exact loaded image identity.
 
   apple,cs-opp:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -98,6 +98,75 @@ properties:
     description:
       Operating-point table of the GPU's AFR clock domain, one voltage cell
       per state.
+
+  apple,t6040-handoff-version:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 2
+    description:
+      Written last by the boot loader after it has filled the T6040 operating
+      points, memory regions and per-chip calibration. Absent in the source DT.
+
+  apple,core-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Enabled cores in the two ten-core T6040 clusters, low cluster first
+
+  apple,max-power-mw:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Per-chip maximum GPU power in milliwatts, calculated by the loader
+
+  apple,perf-base-pstate:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Logical base state of the frequency-relative performance table. T6040
+      supports the first active state, also used when its ADT omits the property.
+
+  apple,perf-map-a:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      All 16 A selector register fields, indexing raw ADT operating points.
+      Eleven populated entries, including off, followed by five zeros.
+
+  apple,perf-map-b:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      All 16 B selector register fields, indexing raw ADT operating points.
+      Eleven populated entries, including off, followed by five zeros.
+
+  apple,perf-relative-a:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Per-chip relative power of each populated A selector, in percent,
+      followed by zeros for the five unused selectors.
+
+  apple,perf-relative-b:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Relative frequency of the populated A ladder above the base state,
+      in percent, followed by zeros for the five unused selectors.
+
+  apple,core-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      GPU core leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
+  apple,sram-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      GPU SRAM leakage, one coefficient per cluster. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
+  apple,cs-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      CS leakage. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
+
+  apple,afr-leak-coef:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      AFR leakage. Per-chip efuse values decoded by the boot loader,
+      stored as IEEE-754 binary32 bit patterns in big-endian cells.
 
   apple,firmware-abi:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -190,6 +259,38 @@ allOf:
             const: apple,agx-t6040
     then:
       properties:
+        apple,core-mask:
+          minimum: 1
+          maximum: 1048575
+        apple,max-power-mw:
+          minimum: 1
+          maximum: 200000
+        apple,perf-base-pstate:
+          const: 1
+        apple,perf-map-a:
+          minItems: 16
+          maxItems: 16
+        apple,perf-map-b:
+          minItems: 16
+          maxItems: 16
+        apple,perf-relative-a:
+          minItems: 16
+          maxItems: 16
+        apple,perf-relative-b:
+          minItems: 16
+          maxItems: 16
+        apple,core-leak-coef:
+          minItems: 2
+          maxItems: 2
+        apple,sram-leak-coef:
+          minItems: 2
+          maxItems: 2
+        apple,cs-leak-coef:
+          minItems: 1
+          maxItems: 1
+        apple,afr-leak-coef:
+          minItems: 1
+          maxItems: 1
         reg:
           items:
             - description: GFX coprocessor control registers

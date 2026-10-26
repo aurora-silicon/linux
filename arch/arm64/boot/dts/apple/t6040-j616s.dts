@@ -79,8 +79,9 @@
 		 * Text segment of the loaded GPU firmware (ADT gfx-asc
 		 * segment-ranges[0]); the driver identifies the build from it.
 		 */
-		gpu_fw_text: gpu-fw-text@10000be4000 {
-			reg = <0x100 0x00be4000 0x0 0x60000>;
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			status = "disabled";
 			no-map;
 		};
 
@@ -88,8 +89,9 @@
 		 * Data segment of the loaded GPU firmware (ADT sgx gfx-data-*); it
 		 * places its crash log here.
 		 */
-		gpu_fw_data: gpu-fw-data@10001d44000 {
-			reg = <0x100 0x01d44000 0x0 0x138000>;
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			status = "disabled";
 			no-map;
 		};
 
@@ -98,23 +100,27 @@
 		 * gfx-shared-l2-region-*, gfx-handoff-*). They stay no-map until
 		 * the boot loader adds them to /memory.
 		 */
-		uat_ttbs: uat-ttbs@10bfffb8000 {
-			reg = <0x10b 0xfffb8000 0x0 0x4000>;
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			status = "disabled";
 			no-map;
 		};
 
-		uat_pagetables: uat-pagetables@10bfff78000 {
-			reg = <0x10b 0xfff78000 0x0 0x40000>;
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
 			no-map;
 		};
 
-		uat_l2_pagetables: uat-l2-pagetables@10bfff74000 {
-			reg = <0x10b 0xfff74000 0x0 0x4000>;
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
 			no-map;
 		};
 
-		uat_handoff: uat-handoff@10bfff70000 {
-			reg = <0x10b 0xfff70000 0x0 0x4000>;
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			status = "disabled";
 			no-map;
 		};
 	};
@@ -139,76 +145,76 @@
 	/*
 	 * GPU performance states, one opp-microvolt cell per cluster (ADT
 	 * /arm-io/sgx perf-states and perf-states1). The operating points are
-	 * binned per device: these are this unit's values until the boot
-	 * loader fills them in. Entries keep the order of the GPU performance
-	 * states, which is not sorted by frequency.
+	 * binned per device: the loader fills these placeholders.
+	 * The driver requires a completed calibration handoff. Entries keep the
+	 * order of the GPU performance states, which is not sorted by frequency.
 	 */
 	gpu_opp: opp-table-gpu {
 		compatible = "operating-points-v2";
 
 		opp00 {
 			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <125000 125000>;
+			opp-microvolt = <0 0>;
 		};
 		opp01 {
-			opp-hz = /bits/ 64 <338000000>;
-			opp-microvolt = <605000 585000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp02 {
-			opp-hz = /bits/ 64 <618000000>;
-			opp-microvolt = <655000 640000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp03 {
-			opp-hz = /bits/ 64 <796000000>;
-			opp-microvolt = <690000 690000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp04 {
-			opp-hz = /bits/ 64 <924000000>;
-			opp-microvolt = <715000 725000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp05 {
-			opp-hz = /bits/ 64 <952000000>;
-			opp-microvolt = <755000 770000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp06 {
-			opp-hz = /bits/ 64 <1056000000>;
-			opp-microvolt = <755000 770000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp07 {
-			opp-hz = /bits/ 64 <1062000000>;
-			opp-microvolt = <795000 810000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp08 {
-			opp-hz = /bits/ 64 <1182000000>;
-			opp-microvolt = <795000 810000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp09 {
-			opp-hz = /bits/ 64 <1182000000>;
-			opp-microvolt = <845000 860000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp10 {
-			opp-hz = /bits/ 64 <1312000000>;
-			opp-microvolt = <845000 860000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp11 {
-			opp-hz = /bits/ 64 <1242000000>;
-			opp-microvolt = <900000 915000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp12 {
-			opp-hz = /bits/ 64 <1380000000>;
-			opp-microvolt = <900000 915000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp13 {
-			opp-hz = /bits/ 64 <1326000000>;
-			opp-microvolt = <945000 960000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp14 {
-			opp-hz = /bits/ 64 <1470000000>;
-			opp-microvolt = <945000 960000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 		opp15 {
-			opp-hz = /bits/ 64 <1578000000>;
-			opp-microvolt = <1030000 1045000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
 		};
 	};
 
@@ -217,36 +223,36 @@
 		compatible = "operating-points-v2";
 
 		opp00 {
-			opp-hz = /bits/ 64 <24000000>;
-			opp-microvolt = <555000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp01 {
-			opp-hz = /bits/ 64 <338000000>;
-			opp-microvolt = <555000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp02 {
-			opp-hz = /bits/ 64 <618000000>;
-			opp-microvolt = <620000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp03 {
-			opp-hz = /bits/ 64 <796000000>;
-			opp-microvolt = <660000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp04 {
-			opp-hz = /bits/ 64 <992000000>;
-			opp-microvolt = <715000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp05 {
-			opp-hz = /bits/ 64 <1188000000>;
-			opp-microvolt = <780000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp06 {
-			opp-hz = /bits/ 64 <1380000000>;
-			opp-microvolt = <870000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp07 {
-			opp-hz = /bits/ 64 <1470000000>;
-			opp-microvolt = <910000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 	};
 
@@ -255,36 +261,36 @@
 		compatible = "operating-points-v2";
 
 		opp00 {
-			opp-hz = /bits/ 64 <24000000>;
-			opp-microvolt = <555000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp01 {
-			opp-hz = /bits/ 64 <338000000>;
-			opp-microvolt = <555000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp02 {
-			opp-hz = /bits/ 64 <618000000>;
-			opp-microvolt = <620000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp03 {
-			opp-hz = /bits/ 64 <796000000>;
-			opp-microvolt = <660000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp04 {
-			opp-hz = /bits/ 64 <992000000>;
-			opp-microvolt = <715000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp05 {
-			opp-hz = /bits/ 64 <1188000000>;
-			opp-microvolt = <780000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp06 {
-			opp-hz = /bits/ 64 <1380000000>;
-			opp-microvolt = <870000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 		opp07 {
-			opp-hz = /bits/ 64 <1470000000>;
-			opp-microvolt = <910000>;
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
 		};
 	};
 
@@ -821,12 +827,23 @@
 };
 
 /*
- * The GPU stays disabled until a boot loader fills in this unit's operating
- * points, leakage and regions from the ADT; the values here are one unit's.
- * Enabling it also takes gfx_mbox, keeps ps_afr and ps_gfx always on and
- * claims pmp_gfx always-on, so that the PMP sees the GPU on exactly while it
- * is powered.
+ * The loaded GPU firmware keeps running across system sleep. Like the Neo's
+ * GFX domain, these domains must not be switched off while that image lives.
+ * The PMP report vote is still owned by the GPU consumer.
  */
+&ps_afr {
+	apple,always-on;
+};
+
+&ps_gfx {
+	apple,always-on;
+};
+
+/* The loader fills the operating points, calibration and all six memory regions. */
+&gfx_mbox {
+	status = "okay";
+};
+
 &gpu {
 	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
 			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
@@ -835,7 +852,7 @@
 	operating-points-v2 = <&gpu_opp>;
 	apple,cs-opp = <&gpu_cs_opp>;
 	apple,afr-opp = <&gpu_afr_opp>;
-	status = "disabled";
+	status = "okay";
 };
 
 /*
