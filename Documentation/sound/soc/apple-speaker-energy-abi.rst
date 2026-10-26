@@ -11,7 +11,11 @@ then ``Speaker Volume Unlock``, then this control, through the same control
 file. Closing either authority revokes credit and the existing volume lease.
 
 Read flags distinguish an available interface from a configured, qualified
-transfer. Unknown transfer identifiers, absent certificates, mismatched card
+transfer. REQUIRED means that this kernel requires a grant even while a stream
+is unprepared or the transfer is unqualified: do not fall back to the old magic
+unlock in that state. New gate-capable TAS paths hold the existing hardware safe
+caps until qualification and a complete grant. Kernels without this interface
+retain the daemon's conservative policy. Unknown transfer identifiers, absent certificates, mismatched card
 identities, formats or maps must keep conservative protection. Codec register
 read-back of a gain or HPF selector is not itself a transient energy bound.
 The TAS state queries currently provide read-back facts without inventing an
@@ -91,3 +95,14 @@ Route changes require all playback front ends closed. FE shutdown proves DMA
 quiescence before releasing that exclusion. Speaker/headphone muxes and pin
 switches cannot attach an already running raw front end to a speaker route.
 Stop and suspend revoke credit; restart must prepare under the current epoch.
+
+Readiness notifications
+-----------------------
+
+Prepare notifies the grant control after the protected descriptor path is
+ready. Userspace must distinguish this wake-up from a sample-rate edge: the
+rate notification can arrive before prepare. Every open FE must have the
+protected path prepared for the current epoch before higher caps are allowed.
+An open raw headphone FE therefore keeps speaker caps safe even if an automatic
+jack/DAPM pin update could attach it to speakers. Unknown live source history
+keeps the conservative full-scale programme-budget assumption.

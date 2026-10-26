@@ -15,6 +15,7 @@
 #define MACAUDIO_ENERGY_OWNED (1U << 4)
 #define MACAUDIO_ENERGY_LIVE (1U << 5)
 #define MACAUDIO_ENERGY_PLAYING (1U << 6)
+#define MACAUDIO_ENERGY_REQUIRED (1U << 7)
 #define MACAUDIO_ENERGY_REVOKE (1U << 31)
 
 /* A transfer identifier is a versioned bound, not an amplifier model name. */

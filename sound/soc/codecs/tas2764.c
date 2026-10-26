@@ -604,7 +604,7 @@ int tas2764_playback_state(struct snd_soc_component *component,
 	ret = regmap_read(amp->regmap, TAS2764_TDM_CFG2, &source);
 	if (ret)
 		return ret;
-	ret = regmap_read(amp->regmap, TAS2764_MODE_CTRL, &mode);
+	ret = regmap_read(amp->regmap, TAS2764_PWR_CTRL, &mode);
 	if (ret)
 		return ret;
 	/* Diagnostic generators and a bypassed HPF are not a PCM certificate. */

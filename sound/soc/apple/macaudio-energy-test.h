@@ -258,6 +258,47 @@ static void macaudio_energy_fixed_transforms_are_read_only(struct kunit *test)
 					SNDRV_CTL_ELEM_ACCESS_READ);
 }
 
+static void
+macaudio_energy_raw_routes_cannot_acquire_a_grant(struct kunit *test)
+{
+	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
+	struct snd_ctl_elem_value *value =
+		kunit_kzalloc(test, sizeof(*value), GFP_KERNEL);
+	struct macaudio_energy_ctl *packet;
+	struct apple_energy_snapshot state;
+	unsigned int k;
+
+	KUNIT_ASSERT_NOT_NULL(test, value);
+	packet = (void *)value->value.bytes.data;
+	KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
+	packet->flags = 0;
+	packet->deadline_ns = cpu_to_le64(le64_to_cpu(packet->clock_ns) +
+					  100 * NSEC_PER_MSEC);
+	for (k = 0; k < 2; k++) {
+		packet->ceiling[k] = cpu_to_le64(1ULL << 30);
+		packet->gain_q31[k] = cpu_to_le32(APPLE_ENERGY_UNITY);
+	}
+	/* A headphone FE may become a speaker route through automatic DAPM. */
+	t->ma.energy_stream[1].opened = true;
+	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value),
+			-EAGAIN);
+	apple_energy_snapshot(&t->ma.energy, &state);
+	KUNIT_EXPECT_FALSE(test, state.enabled);
+	KUNIT_EXPECT_FALSE(test, macaudio_energy_permitted(&t->ma));
+	KUNIT_ASSERT_EQ(test, macaudio_energy_get(t->control[0], value), 0);
+	KUNIT_EXPECT_FALSE(test, le32_to_cpu(packet->flags) &
+					 MACAUDIO_ENERGY_CONFIGURED);
+	/* Neither an unprepared nor an older epoch's protected FE qualifies. */
+	t->ma.energy_stream[1] = t->ma.energy_stream[0];
+	t->ma.energy_stream[1].opened = true;
+	t->ma.energy_stream[1].epoch--;
+	KUNIT_EXPECT_FALSE(test, macaudio_energy_frontends_ready(&t->ma,
+								 state.epoch));
+	t->ma.energy_stream[1].epoch = state.epoch;
+	KUNIT_EXPECT_TRUE(test,
+			  macaudio_energy_frontends_ready(&t->ma, state.epoch));
+}
+
 static struct kunit_case macaudio_energy_cases[] = {
 	KUNIT_CASE(macaudio_energy_owner_must_match_every_control),
 	KUNIT_CASE(macaudio_energy_control_replay_and_corruption_revoke),
@@ -265,6 +306,7 @@ static struct kunit_case macaudio_energy_cases[] = {
 	KUNIT_CASE(macaudio_energy_raw_fe_needs_a_proven_stop),
 	KUNIT_CASE(macaudio_energy_expired_write_is_a_retryable_timeout),
 	KUNIT_CASE(macaudio_energy_fixed_transforms_are_read_only),
+	KUNIT_CASE(macaudio_energy_raw_routes_cannot_acquire_a_grant),
 	{}
 };
 

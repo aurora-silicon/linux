@@ -159,7 +159,7 @@ int ag_snapshot(void *opaque, u64 now, void *output)
 	memset(v, 0, sizeof(*v));
 	v->version = 1;
 	v->flags = MACAUDIO_ENERGY_AVAILABLE | MACAUDIO_ENERGY_CONFIGURED |
-		   MACAUDIO_ENERGY_TRANSFER_VALID;
+		   MACAUDIO_ENERGY_TRANSFER_VALID | MACAUDIO_ENERGY_REQUIRED;
 	if (g->owner)
 		v->flags |= MACAUDIO_ENERGY_OWNED;
 	if (g->failed || s.failed)

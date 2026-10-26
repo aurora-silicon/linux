@@ -363,6 +363,27 @@ static bool macaudio_energy_owner(struct macaudio_snd_data *ma)
 	return true;
 }
 
+/* Jack/DAPM pin changes need not pass through a userspace control. Any
+ * open raw FE must therefore keep the existing hardware caps down, even
+ * when its current route is headphones. Startup revokes before it can run.
+ */
+static bool macaudio_energy_frontends_ready(struct macaudio_snd_data *ma, u64 epoch)
+{
+	unsigned int k;
+
+	for (k = 0; k < ARRAY_SIZE(ma->energy_stream); k++) {
+		struct macaudio_energy_stream *stream = &ma->energy_stream[k];
+
+		if (!READ_ONCE(stream->opened))
+			continue;
+		if (!READ_ONCE(stream->prepared) || READ_ONCE(stream->needs_prepare) ||
+		    !READ_ONCE(stream->attached) || !READ_ONCE(stream->speakers) ||
+		    READ_ONCE(stream->epoch) != epoch)
+			return false;
+	}
+	return true;
+}
+
 static bool macaudio_energy_permitted(struct macaudio_snd_data *ma)
 {
 	struct apple_energy_snapshot state;
@@ -373,6 +394,7 @@ static bool macaudio_energy_permitted(struct macaudio_snd_data *ma)
 		if (state.unbudgeted[k])
 			return false;
 	return ma->energy_transfer && state.configured && state.enabled &&
+		macaudio_energy_frontends_ready(ma, state.epoch) &&
 		!state.failed && ktime_get_boottime_ns() < state.deadline_ns &&
 		macaudio_energy_owner(ma);
 }
@@ -429,6 +451,18 @@ static int macaudio_energy_prepare(struct snd_pcm_substream *substream)
 		mutex_unlock(&ma->volume_lock_mutex);
 		return -EIO;
 	}
+	if (runtime->format != SNDRV_PCM_FORMAT_S16_LE &&
+	    runtime->format != SNDRV_PCM_FORMAT_S24_LE &&
+	    runtime->format != SNDRV_PCM_FORMAT_S32_LE) {
+		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+		mutex_unlock(&ma->volume_lock_mutex);
+		return -EINVAL;
+	}
+	if (runtime->period_size > APPLE_ENERGY_MAX_FRAMES) {
+		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+		mutex_unlock(&ma->volume_lock_mutex);
+		return -EINVAL;
+	}
 	if (runtime->channels != ma->max_channels)
 		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
 	stream->channels = runtime->channels;
@@ -471,6 +505,8 @@ static int macaudio_energy_prepare(struct snd_pcm_substream *substream)
 	stream->attached = true;
 	stream->needs_prepare = false;
 	WRITE_ONCE(stream->prepared, true);
+	/* Rate notification can precede prepare: wake userspace when ready too. */
+	snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &ma->energy_kctl->id);
 	return 0;
 }
 
@@ -1478,6 +1514,20 @@ static int macaudio_fe_startup(struct snd_pcm_substream *substream)
 				return -EBUSY;
 		} while (!atomic_try_cmpxchg(&ma->energy_open, &count, count + 1));
 		ma->energy_stream[rtd->dai_link->id].opened = true;
+		if (ma->energy_enforced) {
+			/* Before DMA can start or an automatic jack event can route it. */
+			mutex_lock(&ma->volume_lock_mutex);
+			apple_energy_revoke(&ma->energy);
+			ma->speaker_lock_remain = 0;
+			macaudio_vlimit_update(ma);
+			ret = READ_ONCE(ma->speaker_lock_failed) ? -EIO : 0;
+			mutex_unlock(&ma->volume_lock_mutex);
+			if (ret) {
+				ma->energy_stream[rtd->dai_link->id].opened = false;
+				atomic_dec(&ma->energy_open);
+				return ret;
+			}
+		}
 	}
 	return 0;
 }
@@ -2379,7 +2429,8 @@ static int macaudio_energy_get(struct snd_kcontrol *control,
 
 	mutex_lock(&ma->volume_lock_mutex);
 	apple_energy_snapshot(&ma->energy, &state);
-	if (state.configured && ma->energy_channels == ma->max_channels)
+	if (state.configured && ma->energy_channels == ma->max_channels &&
+	    macaudio_energy_frontends_ready(ma, state.epoch))
 		flags |= MACAUDIO_ENERGY_CONFIGURED;
 	if (ma->energy_transfer)
 		flags |= MACAUDIO_ENERGY_TRANSFER_VALID;
@@ -2387,6 +2438,8 @@ static int macaudio_energy_get(struct snd_kcontrol *control,
 		flags |= MACAUDIO_ENERGY_FAILED;
 	if (macaudio_energy_owner(ma))
 		flags |= MACAUDIO_ENERGY_OWNED;
+	if (ma->energy_enforced)
+		flags |= MACAUDIO_ENERGY_REQUIRED;
 	if (state.enabled && state.clock_ns < state.deadline_ns)
 		flags |= MACAUDIO_ENERGY_LIVE;
 	if (READ_ONCE(ma->bes_active))
@@ -2481,6 +2534,10 @@ static int macaudio_energy_put(struct snd_kcontrol *control,
 		goto fail;
 	}
 	apple_energy_snapshot(&ma->energy, &expected);
+	if (!macaudio_energy_frontends_ready(ma, expected.epoch)) {
+		ret = -EAGAIN;
+		goto fail;
+	}
 	if (le32_to_cpu(in->rate) != expected.rate ||
 	    le32_to_cpu(in->channels) != ma->energy_channels ||
 	    ma->energy_channels != ma->max_channels ||
@@ -2866,6 +2923,8 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	data->has_energy = data->has_safety &&
 		(data->cfg->amp == AMP_TAS5770 || data->cfg->amp == AMP_SN012776) &&
 		(!data->cfg->fe_cpu_is_platform || data->cfg->energy_dmaengine);
+	/* A gate-capable kernel holds the old safe caps until a qualified grant. */
+	data->energy_enforced = data->has_energy;
 	/* The optional bytes control is last, after the two older controls. */
 	if (data->has_safety && !data->has_energy)
 		card->num_controls--;
