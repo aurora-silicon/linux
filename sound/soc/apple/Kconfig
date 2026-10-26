@@ -1,6 +1,16 @@
 # SPDX-License-Identifier: GPL-2.0-only
 menu "Apple"
 
+config SND_SOC_APPLE_SPEAKER_ENERGY_KUNIT_TEST
+	tristate "KUnit tests for the Apple speaker energy ledger" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test finite playback energy credit, integer sample clamping and queued
+	  completion debt without hardware. This does not enable a playback gate
+	  or change the existing speaker volume interlock.
+	  The test suite runs without physical audio devices.
+
 config SND_SOC_APPLE_AOP_AUDIO
 	tristate "AOP audio driver"
 	depends on ARCH_APPLE || COMPILE_TEST
