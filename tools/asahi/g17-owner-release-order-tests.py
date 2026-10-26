@@ -118,7 +118,7 @@ PENDING
 struct Ticket { ordinal: u64 }
 struct Active { ticket: Ticket }
 struct Packet { context: Arc<Context> }
-struct Pair { executed: u64, switch: Option<(u64, u64)>, replay: Option<()>, active: Vec<Active>, idle: bool }
+struct Pair { executed: u64, switch: Option<(u64, u64)>, replay: Vec<()>, active: Vec<Active>, idle: bool }
 impl Pair {
 SWITCH
     /// Host stand-in for a successful publication of `ordinal` (stand-in, not production).
@@ -177,7 +177,7 @@ fn main() {
     assert!(!table.releasing(&quiet));
 
     // Switch tracking across an owner change of one pair.
-    let mut pair = Pair { executed: 0, switch: None, replay: None, active: Vec::new(), idle: true };
+    let mut pair = Pair { executed: 0, switch: None, replay: Vec::new(), active: Vec::new(), idle: true };
     assert_eq!(pair.owner_switch_from(&c), None, "a fresh graph has no previous scheduler");
     pair.publish(&Packet { context: d.clone() }, 0);
     pair.active.clear();

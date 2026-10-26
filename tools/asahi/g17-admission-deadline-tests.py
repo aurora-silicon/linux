@@ -40,7 +40,7 @@ mod hazard {pub const WAIT_MS:u32=1000;}
 const QUARANTINE_WAIT_MS:u32=1000;
 #[derive(Clone,Copy,PartialEq)] enum Plan {Any,Conflict}
 #[derive(Clone,Copy)] struct Request<'a>(&'a ());
-struct State {owners:[u64;2],quarantined:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
+struct State {owners:[u64;2],quarantined:u64,spared:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
 impl State {
  fn exhausted(&self)->bool {false}
  fn refusal(&self,_:u64)->Result {Ok(())}
@@ -69,7 +69,7 @@ struct RenderLease {pool:Arc<Pool>,slot:u8,record:Option<usize>}
 ''' + item(source, 'fn wait_slice_ms(') + '\nimpl Pool {\n' + item(source, 'pub(crate) fn acquire_render(') + r'''
 }
 fn new_pool(conflict:bool,quarantined:u64)->Arc<Pool> {
- Arc::new(Pool{state:Lock(Mutex::new(State{owners:[0,1],quarantined,next_ticket:1,waiters:0,conflict,ready:false})),released:CondVar})
+ Arc::new(Pool{state:Lock(Mutex::new(State{owners:[0,1],quarantined,spared:0,next_ticket:1,waiters:0,conflict,ready:false})),released:CondVar})
 }
 fn reset(mode:usize){NOW.store(0,Ordering::SeqCst);WAITS.store(0,Ordering::SeqCst);MODE.store(mode,Ordering::SeqCst);}
 fn main(){
@@ -89,6 +89,9 @@ fn main(){
   reset(mode);let pool=new_pool(false,2);
   assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EIO)));
   assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"quarantine budget extended");
+  reset(mode);let pool=new_pool(false,2);pool.state.lock().spared=2;
+  assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EBUSY)));
+  assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"spared quarantine budget extended");
  }
  reset(2);let pool=new_pool(true,0);
  assert!(matches!(pool.acquire_render(1,Some(Request(&())),2_000_000_000,||Ok(())),Err(ERESTARTSYS)));
