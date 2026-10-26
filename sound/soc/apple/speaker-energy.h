@@ -36,6 +36,7 @@ struct apple_energy_gate {
 	u8 slot[APPLE_ENERGY_SPEAKERS];
 	u8 channels;
 	u8 head;
+	bool configured;
 	bool enabled;
 	bool failed;
 };

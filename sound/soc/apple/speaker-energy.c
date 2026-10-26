@@ -52,6 +52,7 @@ int apple_energy_configure(struct apple_energy_gate *gate, unsigned int rate,
 	spin_lock_irqsave(&gate->lock, flags);
 	/* Even a refused reconfiguration cannot leave stale credit enabled. */
 	apple_energy_disable(gate);
+	gate->configured = false;
 	if (!apple_energy_next(gate)) {
 		ret = -EOVERFLOW;
 		goto out;
@@ -83,6 +84,7 @@ int apple_energy_configure(struct apple_energy_gate *gate, unsigned int rate,
 	gate->state.speakers = speakers;
 	gate->channels = channels;
 	memcpy(gate->slot, slots, speakers);
+	gate->configured = true;
 out:
 	spin_unlock_irqrestore(&gate->lock, flags);
 	return ret;
@@ -111,7 +113,7 @@ int apple_energy_grant(struct apple_energy_gate *gate,
 		ret = -EOVERFLOW;
 		goto out;
 	}
-	if (!snapshot || !ceiling || !gate->state.rate ||
+	if (!snapshot || !ceiling || !gate->configured ||
 	    deadline_ns <= now_ns) {
 		ret = -EINVAL;
 		goto out;
@@ -183,7 +185,7 @@ int apple_energy_filter(struct apple_energy_gate *gate, s32 *samples,
 	bytes = (size_t)frames * channels * sizeof(*samples);
 	*ticket = 0;
 	spin_lock_irqsave(&gate->lock, flags);
-	if (channels != gate->channels || !gate->state.rate) {
+	if (channels != gate->channels || !gate->configured) {
 		ret = -EINVAL;
 		goto fail;
 	}

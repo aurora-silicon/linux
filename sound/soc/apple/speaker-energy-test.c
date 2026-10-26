@@ -248,6 +248,27 @@ static void every_small_budget_bounds_sample(struct kunit *test)
 	}
 }
 
+static void invalid_route_cannot_reenable_old_mapping(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot snapshot;
+	u64 ceiling[] = { 100, 100 };
+	u8 slots[] = { 0, 2 };
+	s32 samples[] = { S32_MIN, S32_MIN };
+	u64 ticket;
+
+	grant(test, gate, 100, 100);
+	KUNIT_EXPECT_EQ(test, apple_energy_configure(gate, 48000, 2, 2, slots), -EINVAL);
+	apple_energy_snapshot(gate, &snapshot);
+	KUNIT_EXPECT_EQ(test, apple_energy_grant(gate, &snapshot, ceiling, 1, 100), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_energy_filter(gate, samples, 1, 2, 2, &ticket), -EINVAL);
+	KUNIT_EXPECT_EQ(test, samples[0], 0);
+	KUNIT_EXPECT_EQ(test, ticket, 0ULL);
+	slots[1] = 1;
+	KUNIT_ASSERT_EQ(test, apple_energy_configure(gate, 48000, 2, 2, slots), 0);
+	grant(test, gate, 100, 100);
+}
+
 static struct kunit_case apple_energy_cases[] = {
 	KUNIT_CASE(energy_rounding),
 	KUNIT_CASE(absent_and_expired),
@@ -260,6 +281,7 @@ static struct kunit_case apple_energy_cases[] = {
 	KUNIT_CASE(absolute_ceiling_not_topup),
 	KUNIT_CASE(integer_boundary_and_saturation),
 	KUNIT_CASE(every_small_budget_bounds_sample),
+	KUNIT_CASE(invalid_route_cannot_reenable_old_mapping),
 	{}
 };
 
