@@ -157,7 +157,7 @@ Buildbox validation, using normal resource admission and no devices:
   exporters and the retained independent thermal integrator; they are not a
   gate-qualified transfer run. The two different-source packaged-Neo archive
   rows remain explicitly unmatched and are not counted as reruns.
-* The full standard suite reports **321 passed, 1 failed, 1 ignored**. The
+* The v22 standard suite reported **321 passed, 1 failed, 1 ignored**. The
   separately run 30,144-case campaign is the ignored extended test. Twenty of
   the original 21 failures now pass, using explicit reference-contract fixtures
   where the test requires grant authority and independent gain/word oracles for
@@ -181,3 +181,62 @@ The useful daemon flags remain; unqualified profiles are not promoted.
 The safe-and-loud objective remains incomplete. Both PRs stay draft. Independent
 review is for the orchestrator to file. **Do not merge or deploy.** No hardware,
 playback (including silence), microphone recording or deployment occurred.
+
+## J616 coverage and reference-envelope feasibility
+
+The latest standard suite, v29, reports **321 passed, 2 failed, 1 ignored**.
+It adds `j616_ordinary_quiet_programme_has_zero_extra_attenuation` using the same
+600-second programme, cubic UI scaling, 477 measured active seconds and native
+queued-word RMS meter as the existing J316/J413 check. J616 requires exactly
+zero additional attenuation at both 30% and 60%. No runtime policy, input level,
+thermal limit or existing assertion changed. The extended continuous test was
+executed separately in v21; it is not a skipped acceptance waiver.
+
+The synthetic J616 30% check returns exactly 0 dB for every speaker. At 60%,
+woofers lose 16.521 dB on average; the tweeter metric is infinite because some
+active 10 ms cells contain zero delivered native words. This is a failed
+synthetic test, not a successful 63-recording replay or a physical measurement.
+The existing J316/J413 assertion fails too. All other 321 standard checks pass.
+
+A necessary energy bound explains why tuning the limiter alone cannot make the
+current **linear reference accounting envelope** meet these budgets. In one
+constant-input metric cell let `u` be digital gain in [0,1], `c >= 0` analogue
+dB attenuation, `q = mean(u^2)`, `d = -10 log10(q)` and `k = ln(10)/20`.
+Weighted Jensen and `1-exp(-x) <= x` give
+
+```
+mean(u exp(-k c)) >= q exp(-k mean(c)/q)
+                 >= 1 - 2 k (d + mean(c)).
+```
+
+This permits arbitrary clipping/pulsing and correlation between digital and
+analogue attenuation inside a metric cell. Summing cells gives an optimistic
+minimum linear billed dose for any result within the measured mean dB budget.
+Native input quantization is allowed for by rounding the input dose downward.
+No queue debt, residual tail, numerical margin or safe-baseline heat is added.
+
+Independently, integrating the two-node model over `H` seconds and eliminating
+the magnet-temperature integral gives
+
+```
+(Rc+Rm) integral(P) = tauc Delta(Tc) + taum Delta(Tm) + integral(Tc-Ta)
+                  <= (tauc+taum+H) (L-Ta).
+```
+
+The upper bound assumes both nodes start at least at ambient and remain below
+hard limit `L`; it even grants a completely cold start after the excluded first
+minute. It uses the hard 150 C limit rather than the stricter working ceiling.
+For the measured 540-second span of the unchanged programme:
+
+| Profile at 60% | Budget | Minimum linear-envelope dose | Maximum model dose | Necessary mean loss |
+| --- | ---: | ---: | ---: | ---: |
+| J413 tweeter, V/I model | 1 dB | 370.481 J | 200.672 J | at least 1.541 dB |
+| J616 tweeter, V/I model | 0 dB | 795.768 J | 646.905 J | at least 0.408 dB |
+
+These are deliberately loose necessary bounds on the reference envelope, not
+predictions of actual loudspeaker dissipation. A squared/other tighter transfer
+may be justified by complete public path/load facts, but must then be validated
+consistently across thermal and listening campaigns. Neither these inequalities
+nor a selector on a related TI part qualifies TAS2764/TAS2770/AOP. Real transfer
+helpers continue to return NONE. The missing physical contract and pre-DAC
+replay inputs remain blockers; both PRs remain draft.
