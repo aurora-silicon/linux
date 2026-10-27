@@ -311,11 +311,15 @@
 	 * failure of that loop; they never act in normal use.
 	 *
 	 * The GPU has no cooling device of its own: its firmware sets the GPU
-	 * performance state. The seven hottest GPU die sensors (Tg05, Tg0S,
-	 * Tg0Y, Tg0k, Tg0z, Tg1V, Tg1l) shed package power through the CPU
-	 * clusters from 105 C, above the 103.8 C peak measured during
-	 * conformance runs, and shut down at 118 C. While the GPU is powered
-	 * off its sensors report placeholder values from -4 to 4 C.
+	 * performance state and starts limiting at 101 C. The SMC runs the
+	 * fans in its own mode (3), only at their minimum speed in every load
+	 * measured under Linux, and refuses manual fan modes from the OS. So
+	 * when a GPU die sensor reaches the GPU firmware's limit, the seven
+	 * hottest ones (Tg05, Tg0S, Tg0Y, Tg0k, Tg0z, Tg1V, Tg1l) also shed
+	 * CPU power through the CPU clusters, from the same 101 C, leaving the
+	 * shared heat budget to the GPU. They shut down at 118 C. While the
+	 * GPU is powered off its sensors report placeholder values from -4 to
+	 * 4 C.
 	 */
 	thermal-zones {
 		cpu-die-thermal {
@@ -884,7 +888,7 @@
 
 			trips {
 				gpu0_passive: trip-passive {
-					temperature = <105000>;
+					temperature = <101000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -935,7 +939,7 @@
 
 			trips {
 				gpu1_passive: trip-passive {
-					temperature = <105000>;
+					temperature = <101000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -986,7 +990,7 @@
 
 			trips {
 				gpu2_passive: trip-passive {
-					temperature = <105000>;
+					temperature = <101000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -1037,7 +1041,7 @@
 
 			trips {
 				gpu3_passive: trip-passive {
-					temperature = <105000>;
+					temperature = <101000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -1088,7 +1092,7 @@
 
 			trips {
 				gpu4_passive: trip-passive {
-					temperature = <105000>;
+					temperature = <101000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -1139,7 +1143,7 @@
 
 			trips {
 				gpu5_passive: trip-passive {
-					temperature = <105000>;
+					temperature = <101000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -1190,7 +1194,7 @@
 
 			trips {
 				gpu6_passive: trip-passive {
-					temperature = <105000>;
+					temperature = <101000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
