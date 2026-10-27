@@ -2381,7 +2381,7 @@ impl Vm {
 
         let size = object_range.range();
         let mut vm_exec = unsafe {
-            self.gpuvm.exec_lock(/*Some(gem)*/ None, false)?
+            self.gpuvm.exec_lock_vm(/*Some(gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
 
@@ -2461,7 +2461,7 @@ impl Vm {
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
             self.gpuvm
-                .exec_lock(/*Some(&gem)*/ None, false)
+                .exec_lock_vm(/*Some(&gem)*/ None, false)
                 .inspect_err(|_| {
                     dev_err!(self.dev, "map_at(): Failed to exec_lock gpuvm\n");
                 })?
@@ -2549,7 +2549,7 @@ impl Vm {
         let mut ctx = StepContext::new(Some(device.as_ref().as_ref()), prot, &mut resources)?;
 
         let mut vm_exec = unsafe {
-            self.gpuvm.exec_lock(/*Some(&gem)*/ None, false)?
+            self.gpuvm.exec_lock_vm(/*Some(&gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
 
@@ -2620,7 +2620,7 @@ impl Vm {
         size: usize,
         prot: Prot,
     ) -> Result<KernelMapping> {
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
 
         if (iova as usize | phys | size) & UAT_PGMSK != 0 {
             dev_err!(
@@ -2724,7 +2724,7 @@ impl Vm {
         let mut resources = VmOpResources::for_unmap()?;
         let mut ctx = StepContext::new(dev, Prot::default(), &mut resources)?;
 
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
 
         mod_dev_dbg!(self.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
         let _commit = if user {
@@ -2755,7 +2755,7 @@ impl Vm {
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
         // SAFETY: See `lock_vm()`.
-        let mut vm_exec = match unsafe { self.gpuvm.exec_lock(None, false) } {
+        let mut vm_exec = match unsafe { self.gpuvm.exec_lock_vm(None, false) } {
             Err(error) if error == ENOMEM => return self.drop_mappings_low_memory(gem),
             result => result?,
         };
