@@ -148,8 +148,8 @@ int asahi_g15_pmp_prepare(struct device *dev)
 
 /*
  * T6031 has no PMP vote, but its first firmware start follows the native
- * display as T6030's does: defer until that display is up. Its display is
- * opt-in (apple_t6031_display.enable=1), so say once why the GPU waits.
+ * display as T6030's does: defer until that display is up. The display can
+ * be off for this boot (no handoff, or not requested), so say once why.
  */
 int asahi_g15_display_prepare(struct device *dev)
 {
@@ -163,7 +163,7 @@ int asahi_g15_display_prepare(struct device *dev)
 		return ret;
 	np = of_find_compatible_node(NULL, NULL, "apple,t6031-display-subsystem");
 	if (!np || !of_device_is_available(np))
-		dev_info_once(dev, "G15: waiting for the T6031 native display, which this boot did not enable (apple_t6031_display.enable=1 and the boot loader's display handoff)\n");
+		dev_info_once(dev, "G15: waiting for the T6031 native display, which this boot did not enable (it needs the boot loader's display handoff, and apple_t6031_display.enable=1 except on the J516C)\n");
 	of_node_put(np);
 	return ret;
 }
