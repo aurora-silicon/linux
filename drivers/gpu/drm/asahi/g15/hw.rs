@@ -46,15 +46,11 @@ pub(crate) enum Platform {
 pub(crate) enum Board {
     /// The hash-checked T6030 templates ([`super::board`]).
     Templates,
-    /// The three images built from the device tree ([`super::board::record`],
-    /// [`super::board::device_tree`]) and cross-checked against a firmware file holding the
-    /// machine's own ([`super::board::blob`], pinned by its SHA-256), which also supplies the
-    /// record's words the device tree does not carry ([`super::board::record::FROM_FILE`]); a
-    /// difference refuses admission, before any firmware is touched.
-    Blob {
-        name: &'static kernel::str::CStr,
-        sha256: [u8; 32],
-    },
+    /// The three images built from the device tree and the ADT's sensor rows
+    /// ([`super::board::record`], [`super::board::device_tree`]), with the SoC's reference
+    /// words for what neither carries ([`super::board::record::Reference`]). A value the
+    /// builder refuses stops admission, before any firmware is touched.
+    DeviceTree(&'static super::board::record::Reference),
     /// No board data: admission refuses the SoC before anything firmware-visible.
     None,
 }

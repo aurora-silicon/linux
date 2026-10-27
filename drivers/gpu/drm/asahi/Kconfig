@@ -60,7 +60,6 @@ config DRM_ASAHI_G15
 	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
 	select APPLE_T6030_GPU_PMP_LINK
 	select CRYPTO_LIB_SHA256
-	select RUST_FW_LOADER_ABSTRACTIONS
 	default n
 	help
 	  Enable the native G15 backend for explicitly admitted M3 Pro/Max
