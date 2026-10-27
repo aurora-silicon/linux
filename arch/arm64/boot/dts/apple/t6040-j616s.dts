@@ -1409,7 +1409,7 @@
 	 * fixed limit (TVMx, TVmS, TVms, PHPB, PHPM) are left out; rails that
 	 * read 0 W while idle are kept. GPU (Tg*), P-cluster (Tp*) and
 	 * E-cluster (Te*) labels follow load tests: Tg* only read live while
-	 * the GPU is powered and rise with GPU load, Tp*/Te* rise with CPU
+	 * the GPU is powered and rise with GPU load, Tp* and Te* rise with CPU
 	 * load. Other names follow the SMC key groups and are not otherwise
 	 * verified. SBA1-3 are the three cells of the 3S battery.
 	 */
