@@ -39,6 +39,8 @@ struct apple_dcp_typec_route {
 	u32 dptx_phy;
 	u32 mux_index;
 	bool selected;
+	/* Desktop T6041 powers a direct DP PHY while this route owns it. */
+	bool desktop_phy_up;
 	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
 	unsigned int tunnel_dpin;
 	u64 tunnel_generation;

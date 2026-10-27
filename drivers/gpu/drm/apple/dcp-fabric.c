@@ -9,6 +9,7 @@
 #include <linux/mux/driver.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
+#include <linux/phy/phy.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/usb/typec_altmode.h>
@@ -102,9 +103,9 @@ static bool dcp_hdmi_borrowed(void *ctx);
 
 bool dcp_is_typec_output(struct apple_dcp *dcp)
 {
-	/* Desktop 26.x keeps its own Type-C route, outside this fabric. */
+	/* Desktop 26.x only has a Type-C output while a route owns a port. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
-		return false;
+		return !!dcp->active_typec_route;
 	return dcp->active_typec_route ||
 	       dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB;
 }
@@ -367,6 +368,21 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		return ret;
 	}
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	    xbar == route->xbar) {
+		ret = phy_init(route->phy);
+		if (!ret) {
+			ret = phy_power_on(route->phy);
+			if (ret)
+				phy_exit(route->phy);
+		}
+		if (ret) {
+			mux_control_deselect(route->xbar);
+			return ret;
+		}
+		route->desktop_phy_up = true;
+	}
+
 	dcp_modes_begin_attachment(dcp);
 	apple_connector_edid_set_live(dcp->connector, false);
 	dcp->phy = route->phy;
@@ -484,6 +500,11 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	}
 	if (dcp_is_external_h17p(dcp))
 		dpavservep_detach(dcp);
+	if (route->desktop_phy_up) {
+		phy_power_off(route->phy);
+		phy_exit(route->phy);
+		route->desktop_phy_up = false;
+	}
 	route->selected = false;
 	ended_attachment = dcp_modes_end_typec(dcp, route);
 	if (dcp->active_typec_route == route)
@@ -545,6 +566,9 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			dcp->phy = dcp->typec_routes[0].phy;
 			dcp->dptx_phy = dcp->typec_routes[0].dptx_phy;
 		}
+	} else if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		dcp->phy = NULL;
+		dcp->connector_type = DRM_MODE_CONNECTOR_USB;
 	} else {
 		/* Keep DPTX endpoint discovery working before a cable is attached. */
 		dcp->phy = dcp->typec_routes[0].phy;
@@ -3593,7 +3617,7 @@ static int dcp_register_typec_routes_present(void *data)
 		if (ret)
 			return ret;
 
-		if (!dcp->phy)
+		if (!dcp->phy && dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
 			dcp->phy = route->phy;
 		dcp->nr_typec_routes++;
 	}

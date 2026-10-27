@@ -247,15 +247,16 @@ static bool dcp_desktop_external(struct apple_dcp *dcp)
 }
 
 /*
- * The register map of the T6041 internal DCP, from the macOS ADT capture
- * (/arm-io/dcp reg[0], /arm-io/disp0 reg[0..3]).  The firmware maps these
- * windows by index, so the device tree must describe exactly these.
+ * The T6041 display processors map these windows by index. Check each
+ * processor against its own register map before touching the coprocessor.
  */
-static const struct {
+struct t6041_dcp_reg {
 	const char *name;
 	u64 start;
 	u64 size;
-} t6041_dcp_regs[] = {
+};
+
+static const struct t6041_dcp_reg t6041_dcp_regs[] = {
 	{ "coproc", 0x402e00000ULL, 0x4000 },
 	{ "disp-0", 0x400000000ULL, 0x4000000 },
 	{ "disp-1", 0x402240000ULL, 0x10000 },
@@ -263,16 +264,57 @@ static const struct {
 	{ "disp-3", 0x402800000ULL, 0x800000 },
 };
 
+static const struct t6041_dcp_reg t6041_dcpext0_regs[] = {
+	{ "coproc", 0x3a2e00000ULL, 0x4000 },
+	{ "disp-0", 0x3a0000000ULL, 0x4000000 },
+	{ "disp-1", 0x3a2240000ULL, 0x10000 },
+	{ "disp-2", 0x3a23a8000ULL, 0x4000 },
+	{ "disp-3", 0x3a2800000ULL, 0x800000 },
+};
+
+static const struct t6041_dcp_reg t6041_dcpext1_regs[] = {
+	{ "coproc", 0x602e00000ULL, 0x4000 },
+	{ "disp-0", 0x600000000ULL, 0x4000000 },
+	{ "disp-1", 0x602240000ULL, 0x10000 },
+	{ "disp-2", 0x6023a8000ULL, 0x4000 },
+	{ "disp-3", 0x602800000ULL, 0x800000 },
+};
+
 /* Refuse to touch the coprocessor on any mismatch with the captured ADT. */
 static int dcp_validate_t6041_dt(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct device_node *piodma __free(device_node) =
-		of_get_child_by_name(dev->of_node, "piodma");
+			of_get_child_by_name(dev->of_node, "piodma");
+	const struct t6041_dcp_reg *regs = t6041_dcp_regs;
+	struct resource *coproc;
+	u32 handoff;
 	int i;
 
-	if (!of_device_is_compatible(dev->of_node, "apple,t6041-dcp"))
+	if (!of_device_is_compatible(dev->of_node, "apple,t6041-dcp") &&
+	    !of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
 		return 0;
+
+	coproc = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!coproc)
+		return -ENODEV;
+	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
+		/* Only the loader may grant the external firmware/DART handoff. */
+		if (of_property_read_u32(dev->of_node, "apple,t6041-ext-handoff",
+					 &handoff) || handoff != 1)
+			return dev_err_probe(dev, -ENODEV,
+					     "T6041 external DCP has no validated handoff\n");
+		if (coproc->start == t6041_dcpext0_regs[0].start)
+			regs = t6041_dcpext0_regs;
+		else if (coproc->start == t6041_dcpext1_regs[0].start)
+			regs = t6041_dcpext1_regs;
+		else
+			return dev_err_probe(dev, -ENODEV,
+					     "Unknown T6041 external DCP register map\n");
+	} else if (coproc->start != t6041_dcp_regs[0].start) {
+		return dev_err_probe(dev, -ENODEV,
+				     "Unknown T6041 internal DCP register map\n");
+	}
 
 	if (pdev->num_resources != ARRAY_SIZE(t6041_dcp_regs))
 		return dev_err_probe(dev, -ENODEV,
@@ -282,13 +324,13 @@ static int dcp_validate_t6041_dt(struct device *dev)
 	for (i = 0; i < ARRAY_SIZE(t6041_dcp_regs); i++) {
 		struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, i);
 
-		if (!r || r->start != t6041_dcp_regs[i].start ||
-		    resource_size(r) != t6041_dcp_regs[i].size ||
+		if (!r || r->start != regs[i].start ||
+		    resource_size(r) != regs[i].size ||
 		    of_property_match_string(dev->of_node, "reg-names",
-					     t6041_dcp_regs[i].name) != i)
+					     regs[i].name) != i)
 			return dev_err_probe(dev, -ENODEV,
 					     "T6041 DCP: register window %d (%s) differs from the ADT\n",
-					     i, t6041_dcp_regs[i].name);
+					     i, regs[i].name);
 	}
 
 	if (!of_property_present(dev->of_node, "iommus") ||
