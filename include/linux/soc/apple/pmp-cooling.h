@@ -27,6 +27,10 @@
  */
 #define APPLE_PMP_GATED_HOLD_NS 2000000000ULL
 #define APPLE_PMP_GATED_HOLD_MC 90000
+/* Below this hotspot, with no fault, recovery or cooling in force, nothing
+ * acts until prediction starts at 105 C, so the slow cadence is enough.
+ */
+#define APPLE_PMP_FAST_POLL_MC 95000
 
 struct apple_pmp_cooling {
 	unsigned long long last_ns, good_ns, anchor_ns, release_ns;
@@ -45,6 +49,13 @@ static inline void apple_pmp_cooling_init(struct apple_pmp_cooling *s)
 static inline unsigned int apple_pmp_cooling_level(const struct apple_pmp_cooling *s)
 {
 	return s->level;
+}
+
+/* Sample at the fast cadence whenever a decision could depend on it. */
+static inline bool apple_pmp_cooling_fast(const struct apple_pmp_cooling *s,
+					  long mc, int error)
+{
+	return error || s->hard || s->level || mc >= APPLE_PMP_FAST_POLL_MC;
 }
 
 /* Retain a governor restriction in the release envelope. Otherwise a trip
