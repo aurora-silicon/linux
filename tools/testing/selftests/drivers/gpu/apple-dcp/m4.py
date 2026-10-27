@@ -553,6 +553,8 @@ static void dcp_backlight_kick(struct apple_dcp *dcp) { assert(dcp->v26_6); defe
 static void drm_framebuffer_get(struct drm_framebuffer *fb) { fb->refs++; }
 static void drm_framebuffer_put(struct drm_framebuffer *fb) { assert(fb->refs); fb->refs--; }
 static void dcp_m4_failed(struct iomfb_m4 *dcp,int error) { if(!dcp->error) dcp->error=error; }
+static unsigned cache_kicks;
+static void iomfb_m4_idle_cache_kick(struct iomfb_m4 *dcp) { assert(dcp->lock==1); cache_kicks++; }
 static unsigned power_offs,power_ons;
 static int dcp_m4_set_power_state(struct iomfb_m4 *dcp,bool on)
 { assert(dcp->lock==1); if(on) power_ons++; else power_offs++; return 0; }
@@ -618,6 +620,8 @@ int main(void)
         assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
         /* The first frame after the blank powered it back up. */
         assert(!dcp.display_off && power_ons==ons_before+1);
+        /* Every shown frame restarts the idle-cache countdown. */
+        assert(cache_kicks==2*order+2);
         assert(carried_brightness && carried_nits==120 && owner.backlight.state.actual==120);
         assert(fb.refs==2 && dcp.active_fb==&fb);
         failure=1;
