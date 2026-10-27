@@ -156,13 +156,16 @@ def main():
     p = argparse.ArgumentParser(description=__doc__); p.add_argument('--output', type=Path); p.add_argument('--mutations', action='store_true'); a=p.parse_args()
     out=(a.output or Path(tempfile.mkdtemp(prefix='g15-maintained-handoff-'))).resolve(); out.mkdir(parents=True, exist_ok=True)
     adt=(G15/'adt.rs').read_text(); boot=(G15/'boot.rs').read_text(); hw=(G15/'hw.rs').read_text()
+    record=(G15/'board/record.rs').read_text()
     helpers='\n'.join(item(adt,m) for m in ["pub(crate) struct GpuAdt", "struct Adt<'a>", 'fn le32(', 'fn le64(', 'fn strncmp_eq(', "impl Adt<'_>", 'fn collect_perf(', 'fn parse(', 'fn admit_regions('])
     constants='\n'.join(re.search(r'pub\(crate\) const '+n+r':[^;]+;', hw).group(0) for n in ['PAGE','PA_MASK','TTBS_SIZE','TABLES_SIZE','HANDOFF_SIZE','SHARED_L2_SIZE','UPPER'])
+    # GpuAdt carries the T6031 sensor rows, sized by the record builder's production constant.
+    record_constants=re.search(r'pub\(crate\) const SENSOR_ROW_COUNT:[^;]+;', record).group(0)
     start=hw.index('        firmware: &['); start=hw.index('[',start); end=start+1; depth=1
     while depth: depth+=(hw[end]=='[')-(hw[end]==']'); end+=1
     firmware='static BUILDS: &[FirmwareBuild] = &'+hw[start:end]+';\n'+item(hw,'pub(crate) struct FirmwareBuild')
     constructor=item(boot,'    fn new(dev: &device::Device, shared: &Arc<Shared>)')
-    source=PREFIX+'\nmod hw {\n'+constants+'\n}\n'+helpers+'\n'+firmware+'\nimpl Rtkit {\n'+constructor+'\n}\n'+CASES
+    source=PREFIX+'\nmod hw {\n'+constants+'\n}\nmod record {\n'+record_constants+'\n}\n'+helpers+'\n'+firmware+'\nimpl Rtkit {\n'+constructor+'\n}\n'+CASES
     variants={'actual':source}
     if a.mutations:
         variants['skip-owner-check']=source.replace('if !glue::reserved_uat(i as u32, r.start, r.end - r.start) {','if false {')
@@ -170,7 +173,7 @@ def main():
         variants['drop-reserved-ram']=source.replace('Some(dram_base..dram_base + dram_size), true)?;', 'Some(dram_base..dram_base + dram_size), false)?;')
         variants['require-obsolete-b0-profile']=source.replace('          FirmwareBuild {\n            name: "J516S B0', '          #[cfg(CONFIG_SILICONFOREST_NATIVE_GPU)]\n          FirmwareBuild {\n            name: "J516S B0')
         variants['named-mailbox']=source.replace('cookie, core::ptr::null(), 0, &RTKIT_OPS', 'cookie, c"mbox".as_ptr(), 0, &RTKIT_OPS')
-    receipt={'scope':__doc__,'sources':{p:hashlib.sha256(t.encode()).hexdigest() for p,t in [('adt.rs',adt),('boot.rs',boot),('hw.rs',hw)]},'variants':{}}
+    receipt={'scope':__doc__,'sources':{p:hashlib.sha256(t.encode()).hexdigest() for p,t in [('adt.rs',adt),('boot.rs',boot),('hw.rs',hw),('board/record.rs',record)]},'variants':{}}
     for name,text in variants.items():
         if name!='actual' and text==source: raise SystemExit('NOT_APPLIED '+name)
         src=out/(name+'.rs');src.write_text(text); binary=out/name
