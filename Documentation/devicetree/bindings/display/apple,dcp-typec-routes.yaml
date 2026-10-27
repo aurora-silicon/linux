@@ -37,6 +37,7 @@ select:
         enum:
           - apple,dcp
           - apple,dcpext
+          - apple,t6041-dcpext
     typec-routes: true
   required:
     - compatible
@@ -144,8 +145,14 @@ examples:
   - |
     #include <dt-bindings/phy/phy.h>
 
-    dcp {
+    dcp@10000000 {
         compatible = "apple,t6020-dcpext", "apple,dcpext";
+        reg = <0x10000000 0x4000>, <0x11000000 0x4000>;
+        reg-names = "coproc", "disp-0";
+        mboxes = <&mbox>;
+        mbox-names = "mbox";
+        iommus = <&dart 0>;
+        apple,bw-scratch = <&pmgr 0 0 0>;
         phys = <&atcphy0 PHY_TYPE_DP>;
         phy-names = "typec0";
         mux-controls = <&atcphy0_xbar 0>, <&atcphy0_xbar 1>,

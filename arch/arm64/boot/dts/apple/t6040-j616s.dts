@@ -25,6 +25,8 @@
 		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
 		/* used by the loader to hand over the display */
 		dcp = &dcp;
+		dcpext0 = &dcpext0;
+		dcpext1 = &dcpext1;
 		disp0 = &display;
 		disp0-piodma = &disp0_piodma;
 		/* the boot loader finds the GPU node through this alias */
@@ -4150,6 +4152,14 @@
 						remote-endpoint = <&atcphy0_ss>;
 					};
 				};
+
+				port@3 {
+					reg = <3>;
+					status = "disabled";
+					typec0_display: endpoint {
+						remote-endpoint = <&dcpext1_typec0>;
+					};
+				};
 			};
 		};
 	};
@@ -4184,6 +4194,14 @@
 					reg = <1>;
 					typec1_con_ss: endpoint {
 						remote-endpoint = <&atcphy1_ss>;
+					};
+				};
+
+				port@3 {
+					reg = <3>;
+					status = "disabled";
+					typec1_display: endpoint {
+						remote-endpoint = <&dcpext1_typec1>;
 					};
 				};
 			};
@@ -4235,6 +4253,14 @@
 					reg = <1>;
 					typec2_con_ss: endpoint {
 						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
+
+				port@3 {
+					reg = <3>;
+					status = "disabled";
+					typec2_display: endpoint {
+						remote-endpoint = <&dcpext1_typec2>;
 					};
 				};
 			};
@@ -4391,6 +4417,58 @@
 	port {
 		atcphy3_dp: endpoint {
 			remote-endpoint = <&dcpext0_dpout>;
+		};
+	};
+};
+
+/*
+ * ADT routes dcpext1 (UFP endpoint 1) to the three Type-C DPPHY outputs.
+ * The graph remains disabled until the loader hands the external firmware and
+ * display DARTs over and the Type-C DP mode switches can be activated.
+ */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+	       <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+		       <&atcphy2_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2";
+	apple,typec-mux-indices = <2 2 2>;
+	apple,typec-dptx-phys = <0 1 2>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_display>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_display>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_display>;
+				};
+			};
 		};
 	};
 };

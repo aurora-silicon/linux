@@ -222,6 +222,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Die containing the DisplayPort transmitter.
 
+  apple,t6041-ext-handoff:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+    description: >
+      Set by the boot loader only after validating and reserving a T6041
+      external DCP's firmware and display DART mappings. The driver refuses
+      the external processor without this handoff.
+
   apple,notch-height:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Height in pixels reserved for the display notch.
@@ -362,7 +370,10 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t6030-dcpext
+            enum:
+              - apple,t6020-dcpext
+              - apple,t6030-dcpext
+              - apple,t6041-dcpext
       required:
         - compatible
     else:
@@ -391,6 +402,24 @@ allOf:
     then:
       required:
         - apple,bw-scratch
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6041-dcpext
+      required:
+        - compatible
+    then:
+      if:
+        properties:
+          status:
+            const: disabled
+        required:
+          - status
+      else:
+        required:
+          - apple,t6041-ext-handoff
+          - memory-region
   - if:
       not:
         properties:
