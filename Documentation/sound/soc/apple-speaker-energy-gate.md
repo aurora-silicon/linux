@@ -293,3 +293,12 @@ all 63 original matrix rows, <=1 dB general cost and exactly zero J616 cost at
 hardware protection. A finite transfer probe alone cannot close any of these
 acceptance gates. Keep the PRs draft until all required evidence passes and the
 orchestrator's independent review is complete.
+
+## Residual and epoch proof obligations
+
+The [transfer certificate argument](apple-speaker-transfer-certificate.md) gives the storage-energy
+inequality required to cover future input and arbitrary downstream state,
+including their cross term. It also specifies paid or nonincreasing epoch
+transitions and a set-valued alternative to a unique pre-DAC replay inverse.
+The exact synthetic examples do not qualify any physical route or change
+production protection.
