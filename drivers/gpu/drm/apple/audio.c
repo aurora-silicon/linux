@@ -639,25 +639,29 @@ static int dcp_pcm_native_close(struct snd_pcm_substream *substream)
 }
 
 /*
- * Stop and complete the link held, on the open audio service (@live), or
- * drop both unsent with a service that went away.
+ * A PCM disconnect does not end its firmware service. Complete the link on
+ * that instance while it is published; a removed instance took it along.
+ * The service can disappear after the check, so -ENODEV during teardown is normal.
  */
-static void dcpaud_link_teardown(struct dcp_audio *dcpaud, bool live)
+static void dcpaud_link_teardown(struct dcp_audio *dcpaud)
 {
+	bool live;
 	int ret;
 
 	lockdep_assert_held(&dcpaud->link_lock);
+	live = (dcpaud->link_prepared || dcpaud->link_started) &&
+	       dcp_audiosrv_link_live(dcpaud->dcp_dev);
 	if (dcpaud->link_started && live) {
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
 					&dcpaud->selected_cookie);
-		if (ret)
+		if (ret && ret != -ENODEV)
 			dev_err(dcpaud->dev, "audio link stop failed: %d\n", ret);
 	}
 	dcpaud->link_started = false;
 	if (dcpaud->link_prepared && live) {
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_COMPLETE,
 					&dcpaud->selected_cookie);
-		if (ret)
+		if (ret && ret != -ENODEV)
 			dev_err(dcpaud->dev, "audio link complete failed: %d\n", ret);
 	}
 	dcpaud->link_prepared = false;
@@ -670,7 +674,7 @@ static int dcp_pcm_native_hw_params(struct snd_pcm_substream *substream,
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 
 	scoped_guard(mutex, &dcpaud->link_lock)
-		dcpaud_link_teardown(dcpaud, dcpaud_connection_up(dcpaud));
+		dcpaud_link_teardown(dcpaud);
 
 	return dcp_pcm_hw_params(substream, params);
 }
@@ -680,7 +684,7 @@ static int dcp_pcm_native_hw_free(struct snd_pcm_substream *substream)
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 
 	guard(mutex)(&dcpaud->link_lock);
-	dcpaud_link_teardown(dcpaud, dcpaud_connection_up(dcpaud));
+	dcpaud_link_teardown(dcpaud);
 
 	return 0;
 }
@@ -781,7 +785,7 @@ static int dcp_pcm_native_sync_stop(struct snd_pcm_substream *substream)
 	ret = snd_dmaengine_pcm_sync_stop(substream);
 
 	guard(mutex)(&dcpaud->link_lock);
-	dcpaud_link_teardown(dcpaud, dcpaud_connection_up(dcpaud));
+	dcpaud_link_teardown(dcpaud);
 
 	return ret;
 }
@@ -810,7 +814,7 @@ void dcpaud_release_link(struct platform_device *pdev, const u64 *gen)
 		return;
 	if (dcpaud->chan)
 		dmaengine_synchronize(dcpaud->chan);
-	dcpaud_link_teardown(dcpaud, true);
+	dcpaud_link_teardown(dcpaud);
 }
 
 static const struct snd_pcm_ops dcp_native_playback_ops = {

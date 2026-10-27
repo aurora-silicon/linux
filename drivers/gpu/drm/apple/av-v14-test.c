@@ -308,7 +308,9 @@ static void av_v14_link_instance(struct kunit *test)
 	old = t->asrv->gen;
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, old));
+	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_live(t->dcp->dev));
 	av_v14_replace(t);
+	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_live(t->dcp->dev));
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
 	KUNIT_ASSERT_EQ(test, t->ncalls, 3U);
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_STOP, &cookie), -ENODEV);
@@ -319,6 +321,7 @@ static void av_v14_link_instance(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
+	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_live(t->dcp->dev));
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE, &cookie), 0);
 	KUNIT_EXPECT_EQ(test, t->ncalls, 5U);
 }

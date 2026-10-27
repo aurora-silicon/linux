@@ -397,6 +397,20 @@ static bool av_audiosrv_open_published(struct audiosrv_data *asrv)
 	       asrv->gen == asrv->open_gen;
 }
 
+bool dcp_audiosrv_link_live(struct device *dev)
+{
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link_live, dev);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
+	if (!asrv)
+		return false;
+	guard(mutex)(&asrv->open_lock);
+	return asrv->link_gen == asrv->open_gen && av_audiosrv_open_published(asrv);
+}
+
 /*
  * The link commands of the 14.7 external role's audio service, the native
  * audio driver's: prepare, start, stop and complete all take the selected
