@@ -14,7 +14,9 @@
 #include <kunit/static_stub.h>
 #include <linux/component.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/dma-mapping.h>
 #include <linux/of_dma.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
@@ -43,6 +45,13 @@
  */
 #define DCPAUD_PERIODS_MAX		16
 
+/*
+ * The silence a held link plays between streams. SIO keeps up to four
+ * periods of a transfer in flight, so it gets more than that.
+ */
+#define DCPAUD_SILENCE_PERIOD		SZ_16K
+#define DCPAUD_SILENCE_BYTES		(8 * DCPAUD_SILENCE_PERIOD)
+
 struct dcp_audio {
 	struct device *dev;
 	struct device *dcp_dev;
@@ -59,6 +68,8 @@ struct dcp_audio {
 	bool dcp_connected; /// dcp status keep for delayed initialization
 	bool connected;
 	unsigned int connection_cookie;
+	/* When the sink was last connected */
+	ktime_t connected_at;
 
 	struct snd_pcm_chmap_elem selected_chmap;
 	struct dcp_sound_cookie selected_cookie;
@@ -81,6 +92,18 @@ struct dcp_audio {
 	struct mutex link_lock;
 	bool link_prepared;
 	bool link_started;
+	/* The element the link was prepared with */
+	struct dcp_sound_cookie link_cookie;
+	/* START issued the stream's DMA */
+	bool stream_dma;
+	/* STOP left the DMA playing the cleared buffer, see dcp_pcm_native_sync_stop() */
+	bool dma_cleared;
+	/* Drops a held link whose service went, see dcpaud_disconnect() */
+	struct work_struct stale_work;
+	/* The held link's silence, see dcpaud_silence_start() */
+	void *silence;
+	dma_addr_t silence_addr;
+	bool silence_running;
 #endif
 };
 
@@ -291,7 +314,7 @@ static int dcpaud_init_dma(struct dcp_audio *dcpaud)
 {
 	struct dma_chan *chan;
 	if (dcpaud->chan)
-		return 0;
+		goto silence;
 
 	chan = of_dma_request_slave_channel(dcpaud->dev->of_node, "tx");
 	/* squelch dma channel request errors, the driver will try again alter */
@@ -311,6 +334,14 @@ static int dcpaud_init_dma(struct dcp_audio *dcpaud)
 				   dcpaud->chan->device->dev, 1024 * 1024,
 				   SIZE_MAX);
 
+silence:
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* Without it a stopped link is not held, see dcpaud_silence_start(). */
+	if (dcpaud_native_link(dcpaud) && !dcpaud->silence)
+		dcpaud->silence = dma_alloc_coherent(dcpaud->chan->device->dev,
+						     DCPAUD_SILENCE_BYTES,
+						     &dcpaud->silence_addr, GFP_KERNEL);
+#endif
 	return 0;
 }
 
@@ -599,14 +630,114 @@ struct snd_pcm_ops dcp_playback_ops = {
  *
  *   prepare:   the DMA channel configured, then the link prepared, once;
  *   START:     the cyclic DMA issued, then the link started;
- *   STOP:      the DMA terminated;
- *   sync_stop: the DMA drained, then the link stopped and completed;
+ *   STOP:      the DMA terminated, or for a held link (below) left playing
+ *              the cleared buffer;
+ *   sync_stop: the DMA drained, then the link stopped and completed, or the
+ *              held link's silence queued in place of the DMA;
  *   hw_free:   a link prepared but never started, completed.
  *
- * Every link method carries the selected element's link data. A link of an
- * earlier connection went with its service: its state is dropped unsent.
- * The audio service itself is open only while the PCM is.
+ * Every link method carries its element's link data. A link of an earlier
+ * connection went with its service: its state is dropped unsent. The audio
+ * service itself is open while the PCM is, or while its link is held.
  */
+/*
+ * The sink behind the J514S HDMI port (PS190 converter and TV) mutes the
+ * audio of a link that stops and starts again with an unchanged format,
+ * until the DP link trains again: only a different channel layout brings
+ * it back. So a stereo link, once started, is held between streams, as
+ * macOS holds it: the stopped stream's DMA is swapped for silence and the
+ * link keeps running until the format changes or the display goes off
+ * (dcpaud_release_link()). The DMA alone restarts without that loss.
+ */
+/*
+ * Read-only at runtime: a stream opened while it was lower keeps periods
+ * longer than a held link's synchronize allows for.
+ */
+static int hold_link = 1;
+module_param(hold_link, int, 0444);
+MODULE_PARM_DESC(hold_link,
+		 "Hold started audio links between streams (silence): 0 never, 1 on the HDMI port (default), 2 also on USB-C");
+
+/*
+ * The mute was measured behind the HDMI port. USB-C sinks keep one link per
+ * stream unless hold_link=2, until they have been qualified with this.
+ */
+static bool dcpaud_holds(struct dcp_audio *dcpaud)
+{
+	int hold = READ_ONCE(hold_link);
+
+	return hold >= 2 || (hold == 1 && !dcp_audiosrv_typec(dcpaud->dcp_dev));
+}
+
+/*
+ * Seen once, at boot: a link started about 0.2 s after the display came on
+ * was not heard, and holding it kept it silent; the next connection's first
+ * link, started later, was heard. While links are held, the first link of a
+ * connection starts once the sink has been up this long, a margin rather
+ * than a measured bound. One link per stream needs no wait: the next stream
+ * starts a new link.
+ */
+#define DCPAUD_SINK_SETTLE_MS		1500
+
+/* Queue the held link's silence; it carries the PM reference of the stream. */
+static int dcpaud_silence_start(struct dcp_audio *dcpaud)
+{
+	struct dma_async_tx_descriptor *desc;
+
+	lockdep_assert_held(&dcpaud->link_lock);
+	if (!dcpaud->silence)
+		return -ENOMEM;
+	desc = dmaengine_prep_dma_cyclic(dcpaud->chan, dcpaud->silence_addr,
+					 DCPAUD_SILENCE_BYTES, DCPAUD_SILENCE_PERIOD,
+					 DMA_MEM_TO_DEV, 0);
+	if (!desc)
+		return -ENOMEM;
+	if (dma_submit_error(dmaengine_submit(desc)))
+		return -EIO;
+	dma_async_issue_pending(dcpaud->chan);
+	dcpaud->silence_running = true;
+	dev_dbg(dcpaud->dev, "link held, playing silence\n");
+	return 0;
+}
+
+static void dcpaud_silence_stop(struct dcp_audio *dcpaud)
+{
+	lockdep_assert_held(&dcpaud->link_lock);
+	if (!dcpaud->silence_running)
+		return;
+	dmaengine_terminate_sync(dcpaud->chan);
+	dcpaud->silence_running = false;
+	pm_runtime_mark_last_busy(dcpaud->dev);
+	pm_runtime_put_autosuspend(dcpaud->dev);
+	dev_dbg(dcpaud->dev, "held link's silence stopped\n");
+}
+
+static void dcpaud_link_teardown(struct dcp_audio *dcpaud);
+
+/*
+ * A held link went with its audio service (sink change, unplug): its silence
+ * stops and its state is dropped unsent, so that a new service's stream
+ * prepares and starts its own link.
+ */
+static void dcpaud_drop_stale(struct dcp_audio *dcpaud)
+{
+	lockdep_assert_held(&dcpaud->link_lock);
+	if ((dcpaud->silence_running || dcpaud->link_prepared || dcpaud->link_started) &&
+	    !dcp_audiosrv_link_live(dcpaud->dcp_dev)) {
+		dev_dbg(dcpaud->dev, "held link went with its service\n");
+		dcpaud_link_teardown(dcpaud);
+	}
+}
+
+static void dcpaud_stale_work(struct work_struct *work)
+{
+	struct dcp_audio *dcpaud = container_of(work, struct dcp_audio, stale_work);
+
+	guard(mutex)(&dcpaud->link_lock);
+	if (!dcpaud->dma_cleared)
+		dcpaud_drop_stale(dcpaud);
+}
+
 static int dcp_pcm_native_open(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
@@ -622,8 +753,15 @@ static int dcp_pcm_native_open(struct snd_pcm_substream *substream)
 	}
 
 	ret = dcp_pcm_open(substream);
-	if (ret && live)
-		dcp_audiosrv_close(dcpaud->dcp_dev);
+	if (ret && live) {
+		bool held;
+
+		/* A held link keeps its service open. */
+		scoped_guard(mutex, &dcpaud->link_lock)
+			held = dcpaud->silence_running;
+		if (!held)
+			dcp_audiosrv_close(dcpaud->dcp_dev);
+	}
 
 	return ret;
 }
@@ -632,8 +770,27 @@ static int dcp_pcm_native_close(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	int ret = dcp_pcm_close(substream);
+	bool held;
 
-	dcp_audiosrv_close(dcpaud->dcp_dev);
+	/*
+	 * A held link keeps its service open. Closing the PCM terminated its
+	 * channel, the silence with it: that is queued again.
+	 */
+	scoped_guard(mutex, &dcpaud->link_lock) {
+		dcpaud_drop_stale(dcpaud);
+		held = dcpaud->silence_running;
+		if (held) {
+			dcpaud->silence_running = false;
+			if (dcpaud_silence_start(dcpaud)) {
+				held = false;
+				dcpaud_link_teardown(dcpaud);
+				pm_runtime_mark_last_busy(dcpaud->dev);
+				pm_runtime_put_autosuspend(dcpaud->dev);
+			}
+		}
+	}
+	if (!held)
+		dcp_audiosrv_close(dcpaud->dcp_dev);
 
 	return ret;
 }
@@ -649,32 +806,46 @@ static void dcpaud_link_teardown(struct dcp_audio *dcpaud)
 	int ret;
 
 	lockdep_assert_held(&dcpaud->link_lock);
+	/* A held link's silence ends with it. */
+	dcpaud_silence_stop(dcpaud);
 	live = (dcpaud->link_prepared || dcpaud->link_started) &&
 	       dcp_audiosrv_link_live(dcpaud->dcp_dev);
 	if (dcpaud->link_started && live) {
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
-					&dcpaud->selected_cookie);
+					&dcpaud->link_cookie);
 		if (ret && ret != -ENODEV)
 			dev_err(dcpaud->dev, "audio link stop failed: %d\n", ret);
 	}
 	dcpaud->link_started = false;
 	if (dcpaud->link_prepared && live) {
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_COMPLETE,
-					&dcpaud->selected_cookie);
+					&dcpaud->link_cookie);
 		if (ret && ret != -ENODEV)
 			dev_err(dcpaud->dev, "audio link complete failed: %d\n", ret);
 	}
 	dcpaud->link_prepared = false;
 }
 
-/* New parameters select a new element: the link of the old one ends first. */
+/*
+ * New parameters select a new element: the link of the old one ends first.
+ * A held link stays until a stream of another element starts (it may be
+ * userspace probing), and its channel stays configured.
+ */
 static int dcp_pcm_native_hw_params(struct snd_pcm_substream *substream,
 				    struct snd_pcm_hw_params *params)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	bool up = !dcpaud->open_unplugged && dcpaud_connection_up(dcpaud);
+	int ret;
 
-	scoped_guard(mutex, &dcpaud->link_lock)
+	scoped_guard(mutex, &dcpaud->link_lock) {
+		dcpaud_drop_stale(dcpaud);
+		if (up && dcpaud->silence_running) {
+			ret = dcpaud_select_cookie(dcpaud, params);
+			return ret < 0 ? ret : ret ? 0 : -EINVAL;
+		}
 		dcpaud_link_teardown(dcpaud);
+	}
 
 	return dcp_pcm_hw_params(substream, params);
 }
@@ -684,20 +855,38 @@ static int dcp_pcm_native_hw_free(struct snd_pcm_substream *substream)
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 
 	guard(mutex)(&dcpaud->link_lock);
-	dcpaud_link_teardown(dcpaud);
+	if (!dcpaud->silence_running)
+		dcpaud_link_teardown(dcpaud);
 
 	return 0;
 }
 
-static int dcp_pcm_native_prepare(struct snd_pcm_substream *substream)
+/* The SIO channel is configured again before every link prepare. */
+static int dcpaud_link_prepare(struct dcp_audio *dcpaud, struct snd_pcm_substream *substream)
 {
-	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	struct dma_slave_config slave_config = {
 		.direction = DMA_MEM_TO_DEV,
 		/* One 32-bit DPA entry per sample word, as in hw_params. */
 		.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
 	};
 	int ret;
+
+	lockdep_assert_held(&dcpaud->link_lock);
+	ret = dmaengine_slave_config(snd_dmaengine_pcm_get_chan(substream), &slave_config);
+	if (ret)
+		return ret;
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_PREPARE,
+				&dcpaud->selected_cookie);
+	if (ret)
+		return ret;
+	dcpaud->link_prepared = true;
+	dcpaud->link_cookie = dcpaud->selected_cookie;
+	return 0;
+}
+
+static int dcp_pcm_native_prepare(struct snd_pcm_substream *substream)
+{
+	struct dcp_audio *dcpaud = substream->pcm->private_data;
 
 	if (dcpaud->open_unplugged)
 		return 0;
@@ -706,44 +895,72 @@ static int dcp_pcm_native_prepare(struct snd_pcm_substream *substream)
 		return -ENXIO;
 
 	guard(mutex)(&dcpaud->link_lock);
+	dcpaud_drop_stale(dcpaud);
 	if (dcpaud->link_prepared)
 		return 0;
-
-	/* The SIO channel is configured again before every link prepare. */
-	ret = dmaengine_slave_config(snd_dmaengine_pcm_get_chan(substream),
-				     &slave_config);
-	if (ret)
-		return ret;
-
-	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_PREPARE,
-				&dcpaud->selected_cookie);
-	if (ret)
-		return ret;
-
-	dcpaud->link_prepared = true;
-	return 0;
+	return dcpaud_link_prepare(dcpaud, substream);
 }
 
 static int dcp_pcm_native_start(struct snd_pcm_substream *substream, int cmd)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	s64 up_ms;
+	bool held;
 	int ret;
 
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
 
+	/* The first link of the connection waits for the sink to settle. */
+	scoped_guard(mutex, &dcpaud->data_lock)
+		up_ms = ktime_ms_delta(ktime_get(), dcpaud->connected_at);
+	if (dcpaud_holds(dcpaud) && !READ_ONCE(dcpaud->link_started) &&
+	    up_ms >= 0 && up_ms < DCPAUD_SINK_SETTLE_MS) {
+		dev_dbg(dcpaud->dev, "sink up %lld ms, link waits\n", up_ms);
+		msleep(DCPAUD_SINK_SETTLE_MS - up_ms);
+	}
+
+	guard(mutex)(&dcpaud->link_lock);
+	dcpaud_drop_stale(dcpaud);
+	/* The stream's DMA follows the held link's silence. */
+	held = dcpaud->silence_running;
+	if (held) {
+		dmaengine_terminate_async(dcpaud->chan);
+		dcpaud->silence_running = false;
+		pm_runtime_mark_last_busy(dcpaud->dev);
+		pm_runtime_put_autosuspend(dcpaud->dev);
+	}
+
+	/*
+	 * A held link of another element ends, and the stream's is prepared;
+	 * so is a stream's whose prepare found a link that has gone since.
+	 */
+	if (!dcpaud->link_prepared ||
+	    memcmp(&dcpaud->link_cookie, &dcpaud->selected_cookie, sizeof(dcpaud->link_cookie))) {
+		if (dcpaud->link_prepared) {
+			dmaengine_synchronize(dcpaud->chan);
+			dcpaud_link_teardown(dcpaud);
+		}
+		ret = dcpaud_link_prepare(dcpaud, substream);
+		if (ret)
+			return ret;
+		dev_dbg(dcpaud->dev, "link prepared at START\n");
+	} else if (held) {
+		dev_dbg(dcpaud->dev, "stream follows the held link's silence\n");
+	}
+
 	/* The first period descriptor is issued before the link starts. */
 	ret = snd_dmaengine_pcm_trigger(substream, cmd);
 	if (ret)
 		return ret;
+	WRITE_ONCE(dcpaud->stream_dma, true);
 
-	guard(mutex)(&dcpaud->link_lock);
 	if (!dcpaud->link_prepared)
 		return -EBADFD;
 	if (dcpaud->link_started)
 		return 0;
 	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
-				&dcpaud->selected_cookie);
+				&dcpaud->link_cookie);
 	dcpaud->link_started = !ret;
 	return ret;
 }
@@ -765,8 +982,21 @@ static int dcp_pcm_native_trigger(struct snd_pcm_substream *substream, int cmd)
 		return dcp_pcm_native_start(substream, cmd);
 
 	case SNDRV_PCM_TRIGGER_STOP:
+		/*
+		 * The DMA plays the cleared buffer on, with the stream's PM
+		 * reference, until sync_stop swaps it for the held link's
+		 * silence: the link must not run dry meanwhile.
+		 */
+		if (dcpaud_holds(dcpaud) && READ_ONCE(dcpaud->stream_dma) &&
+		    substream->runtime->channels == 2 && substream->runtime->dma_area) {
+			memset(substream->runtime->dma_area, 0, substream->runtime->dma_bytes);
+			WRITE_ONCE(dcpaud->dma_cleared, true);
+			return 0;
+		}
+		fallthrough;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		ret = snd_dmaengine_pcm_trigger(substream, cmd);
+		/* A START that issued no DMA leaves a held link's silence alone. */
+		ret = READ_ONCE(dcpaud->stream_dma) ? snd_dmaengine_pcm_trigger(substream, cmd) : 0;
 		pm_runtime_mark_last_busy(dcpaud->dev);
 		__pm_runtime_put_autosuspend(dcpaud->dev);
 		return ret;
@@ -780,6 +1010,24 @@ static int dcp_pcm_native_sync_stop(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	int ret;
+
+	WRITE_ONCE(dcpaud->stream_dma, false);
+	if (READ_ONCE(dcpaud->dma_cleared)) {
+		guard(mutex)(&dcpaud->link_lock);
+		WRITE_ONCE(dcpaud->dma_cleared, false);
+		dmaengine_terminate_async(dcpaud->chan);
+		/* Queued first, the silence follows the stream without a gap. */
+		if (dcpaud->silence_running || !dcpaud->link_started ||
+		    !dcp_audiosrv_link_live(dcpaud->dcp_dev) || dcpaud_silence_start(dcpaud)) {
+			dmaengine_synchronize(dcpaud->chan);
+			dcpaud_link_teardown(dcpaud);
+			pm_runtime_mark_last_busy(dcpaud->dev);
+			pm_runtime_put_autosuspend(dcpaud->dev);
+			return 0;
+		}
+		dmaengine_synchronize(dcpaud->chan);
+		return 0;
+	}
 
 	/* SIO TERMINATE acknowledged and the issued periods reported back. */
 	ret = snd_dmaengine_pcm_sync_stop(substream);
@@ -812,6 +1060,10 @@ void dcpaud_release_link(struct platform_device *pdev, const u64 *gen)
 	/* Only that instance's link: a later instance's PCM keeps its own. */
 	if (gen && !dcp_audiosrv_link_on(dcpaud->dcp_dev, *gen))
 		return;
+	dcpaud_silence_stop(dcpaud);
+	/* A stopped stream still playing its cleared buffer: sync_stop finishes it. */
+	if (dcpaud->chan && READ_ONCE(dcpaud->dma_cleared))
+		dmaengine_terminate_async(dcpaud->chan);
 	if (dcpaud->chan)
 		dmaengine_synchronize(dcpaud->chan);
 	dcpaud_link_teardown(dcpaud);
@@ -905,8 +1157,10 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 	}
 
 	dcpaud->connected = connected;
-	if (connected)
+	if (connected) {
 		dcpaud->connection_cookie++;
+		dcpaud->connected_at = ktime_get();
+	}
 	mutex_unlock(&dcpaud->data_lock);
 
 	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
@@ -1010,6 +1264,11 @@ void dcpaud_disconnect(struct platform_device *pdev)
 	mutex_lock(&dcpaud->data_lock);
 
 	dcpaud_report_hotplug(dcpaud, false);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* The service may go without a release, and a held link with it. */
+	if (dcpaud->native_link)
+		schedule_work(&dcpaud->stale_work);
+#endif
 }
 
 static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
@@ -1112,6 +1371,27 @@ static void dcpaud_comp_unbind(struct device *dev, struct device *main,
 	/* snd_card_free_when_closed() checks for NULL */
 	snd_card_free_when_closed(dcpaud->card);
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	if (dcpaud->native_link) {
+		bool held;
+
+		cancel_work_sync(&dcpaud->stale_work);
+		/* A held link ends with the card; an open PCM's close finds it gone. */
+		scoped_guard(mutex, &dcpaud->link_lock) {
+			held = dcpaud->silence_running;
+			if (held)
+				dcpaud_link_teardown(dcpaud);
+			if (dcpaud->silence) {
+				dma_free_coherent(dcpaud->chan->device->dev, DCPAUD_SILENCE_BYTES,
+						  dcpaud->silence, dcpaud->silence_addr);
+				dcpaud->silence = NULL;
+			}
+		}
+		if (held)
+			dcp_audiosrv_close(dcpaud->dcp_dev);
+	}
+#endif
+
 	if (dcpaud->dma_link)
 		device_link_del(dcpaud->dma_link);
 }
@@ -1143,6 +1423,7 @@ static int dcpaud_probe(struct platform_device *pdev)
 	mutex_init(&dcpaud->data_lock);
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	mutex_init(&dcpaud->link_lock);
+	INIT_WORK(&dcpaud->stale_work, dcpaud_stale_work);
 #endif
 	INIT_DELAYED_WORK(&dcpaud->void_work, dcpaud_void_work);
 	platform_set_drvdata(pdev, dcpaud);
