@@ -48,6 +48,22 @@
 #include "dcp-m4-property.h"
 #include "dcp-m4-frame.h"
 
+static unsigned int idle_cache_ms = 1000;
+
+static int idle_cache_ms_set(const char *val, const struct kernel_param *kp)
+{
+	return param_set_uint_minmax(val, kp, 0, 60000);
+}
+
+static const struct kernel_param_ops idle_cache_ms_ops = {
+	.set = idle_cache_ms_set,
+	.get = param_get_uint,
+};
+
+module_param_cb(idle_cache_ms, &idle_cache_ms_ops, &idle_cache_ms, 0644);
+MODULE_PARM_DESC(idle_cache_ms,
+		 "J713: cache a static frame after this many ms without a flip (0: never, at most 60000; applies from the next swap)");
+
 struct iomfb_m4 {
 	struct apple_dcp *owner;
 	struct device *dev;
@@ -80,6 +96,7 @@ struct iomfb_m4 {
 	struct drm_framebuffer *uncertain_fb;
 	struct dcp_m4_frame active_frame;
 	u64 flips, blanks, brightness_swaps;
+	struct delayed_work idle_cache;
 };
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp);
@@ -435,6 +452,16 @@ struct dcp_m4_runtime {
 	bool qualified; /* KMS startup qualification passed; see dcp_m4_runtime_live() */
 	void *scanout_cpu;
 	struct dcp_m4_frame scanout_frame;
+	/*
+	 * Idle caching: one cache surface, allocated at startup, retained like
+	 * all DCP-visible DMA and never written by the host.
+	 */
+	void *idle_cpu;
+	struct dcp_m4_frame idle_frame;
+	u32 idle_state, idle_fences;
+	bool idle_registered;	/* from its first intent swap until D580 */
+	bool idle_unavailable;
+	u64 idle_entries;
 };
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp)
@@ -571,12 +598,54 @@ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
 	return dcp_m4_swap_record_done(&r->swap, id);
 }
 
+static int dcp_m4_runtime_idle_cache(void *cookie, unsigned int method,
+				     const void *input, void *output)
+{
+	struct dcp_m4_runtime *r = cookie;
+	struct iomfb_m4 *dcp = r->dcp;
+	unsigned int ms = READ_ONCE(idle_cache_ms);
+	bool grant;
+
+	switch (method) {
+	case 117: /* set_idle_caching_state_ap(state, size, flag) */
+		r->idle_state = get_unaligned_le32(input);
+		if (r->idle_state)
+			return 0;
+		/* Leaving the cache completes every fence first. */
+		r->idle_fences = 0;
+		/* Retry after a rollback without a flip, backing off. */
+		if (ms && !READ_ONCE(dcp->owner->quiescing))
+			queue_delayed_work(r->wq, &dcp->idle_cache, msecs_to_jiffies(10 * ms));
+		return 0;
+	case 578: /* idle_fence_create(state) */
+		/*
+		 * The host never writes the cache surface, so a fence has no
+		 * host-side writer to wait for. Entry (state 1) and each cache
+		 * refresh (state 6) ask for one; grant them only for the surface
+		 * this host registered.
+		 */
+		grant = r->idle_registered && !dcp->display_off && !dcp->powered_off;
+		r->idle_fences += grant;
+		put_unaligned_le32(grant, output);
+		return 0;
+	case 579: /* idle_fence_complete */
+		if (r->idle_fences)
+			r->idle_fences--;
+		return 0;
+	case 580: /* idle_surface_release */
+		r->idle_registered = false;
+		return 0;
+	}
+	return -EOPNOTSUPP;
+}
+
 static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
 	.call = dcp_m4_runtime_call,
 	.property = dcp_m4_runtime_property,
 	.memory = dcp_m4_runtime_memory,
 	.event = dcp_m4_runtime_event,
 	.swap_done = dcp_m4_runtime_swap_done,
+	.idle = dcp_m4_runtime_idle_cache,
 };
 
 static void dcp_m4_runtime_bad_word(struct dcp_m4_runtime *r, u64 word, int error)
@@ -765,11 +834,12 @@ static void dcp_m4_runtime_idle(struct work_struct *work)
 
 /*
  * Serialized owner only; both the A407 reply and its D590 fence must complete.
- * primary/frame/upper/keep as dcp_m4_swap_encode_full().
+ * primary/frame/upper/keep as dcp_m4_swap_encode_full(); a nonzero intent
+ * retargets the swap as dcp_m4_swap_set_intent() describes.
  */
 static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 		const struct dcp_m4_frame *frame, const struct dcp_m4_upper *upper, u32 keep,
-		bool brightness_change, u32 nits)
+		bool brightness_change, u32 nits, u32 intent, u32 surface_id)
 {
 	struct iomfb_m4 *dcp = r->dcp;
 	u8 start[16] = {0}, started[8], submitted[12];
@@ -798,6 +868,8 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 	if (!ret)
 		ret = dcp_m4_swap_encode_full(input, DCP_M4_SWAP_SIZE, id, primary, frame, upper,
 					      keep, brightness_change, nits, dcp_m4_frame_check);
+	if (!ret && intent)
+		dcp_m4_swap_set_intent(input, intent, surface_id);
 	if (!ret)
 		ret = dcp_m4_runtime_call(r, 407, false, input, DCP_M4_SWAP_SIZE,
 					 submitted, sizeof(submitted));
@@ -828,7 +900,7 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
 static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
 		const struct dcp_m4_frame *frame, bool brightness_change, u32 nits)
 {
-	return dcp_m4_runtime_swap_full(r, true, frame, NULL, 0, brightness_change, nits);
+	return dcp_m4_runtime_swap_full(r, true, frame, NULL, 0, brightness_change, nits, 0, 0);
 }
 
 static int dcp_m4_runtime_swap(struct dcp_m4_runtime *r, const struct dcp_m4_frame *frame)
@@ -980,6 +1052,17 @@ static int dcp_m4_prepare_scanout(struct iomfb_m4 *dcp)
 	/* Prepare backing while simpledrm still owns the inherited surface. */
 	memset(r->scanout_cpu, 0, r->scanout_frame.backing_size);
 	dma_wmb();
+	/* The idle cache is optional: without its (zeroed) surface it stays off. */
+	r->idle_cpu = apple_dart_dcp_scanout_alloc(dcp->scanout, r->scanout_frame.backing_size,
+						   &dva);
+	if (IS_ERR(r->idle_cpu)) {
+		dev_warn(dcp->dev, "no idle-cache surface: %ld\n", PTR_ERR(r->idle_cpu));
+		r->idle_cpu = NULL;
+		r->idle_unavailable = true;
+	} else {
+		r->idle_frame = r->scanout_frame;
+		r->idle_frame.dva = dva;
+	}
 	return dcp_m4_runtime_health(r);
 }
 
@@ -1017,6 +1100,7 @@ static int iomfb_m4_check_frame(const struct dcp_m4_frame *frame)
 }
 
 static void iomfb_m4_backlight_work(struct work_struct *work);
+static void iomfb_m4_idle_cache_work(struct work_struct *work);
 
 /* Once adopted, even driver unbind must preserve the callback cookie and DMA. */
 static void iomfb_m4_release(void *cookie)
@@ -1082,6 +1166,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	spin_lock_init(&dcp->state_lock);
 	init_completion(&dcp->reply);
 	INIT_WORK(&dcp->backlight_work, iomfb_m4_backlight_work);
+	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
 	if (!request_mem_region(res->start, resource_size(res), dev_name(dev))) {
 		ret = -EBUSY;
 		goto release;
@@ -1263,6 +1348,71 @@ int iomfb_m4_health(struct apple_dcp *owner)
 	return ret;
 }
 
+/* Any surface ID other than the primary's 1 names a distinct surface object. */
+#define DCP_M4_IDLE_SURFACE_ID	2
+
+/*
+ * Register the idle cache behind the frame on screen: IdleCachingMethod 2,
+ * then a swap with intent 8 whose sole surface is the cache surface. The
+ * DCP keeps presenting the frame, steps through idle states 1, 2 and 4
+ * (D117), asking for a fence (D578) in state 1 and whenever it refreshes the
+ * cache (4, 6, 2, 4), and leaves the cache at the next swap.
+ * The surface stays registered across exits, so later entries resubmit it.
+ */
+static int dcp_m4_idle_cache_enter(struct iomfb_m4 *dcp)
+{
+	struct dcp_m4_runtime *r = dcp->runtime;
+	struct { __le32 id, value; } method = { cpu_to_le32(126), cpu_to_le32(2) };
+	__le32 out = 0;
+	int ret;
+
+	lockdep_assert_held(&dcp->lock);
+	if (r->idle_unavailable || dcp->powered_off || dcp->display_off || !dcp->active_fb ||
+	    r->idle_state || r->idle_fences)
+		return 0;
+	ret = dcp_m4_runtime_live(r);
+	if (ret)
+		return ret;
+	ret = dcp_m4_runtime_call_stream(r, 467, 0, false, &method, sizeof(method),
+					 &out, sizeof(out));
+	if (ret)
+		return ret;
+	/* applyProperty status: a refused method stays refused. */
+	if (out) {
+		dev_warn(dcp->dev, "idle caching refused: %#x\n", le32_to_cpu(out));
+		r->idle_unavailable = true;
+		return 0;
+	}
+	/* D578 can arrive before the swap completes. */
+	r->idle_registered = true;
+	/* Like any primary present, this drops upper surfaces; none are in use yet. */
+	ret = dcp_m4_runtime_swap_full(r, true, &r->idle_frame, NULL, 0, false, 0,
+				       DCP_M4_SWAP_INTENT_IDLE_CACHE, DCP_M4_IDLE_SURFACE_ID);
+	if (!ret)
+		r->idle_entries++;
+	return ret;
+}
+
+/* Called with dcp->lock after a swap: enter the cache once no flip follows. */
+static void iomfb_m4_idle_cache_kick(struct iomfb_m4 *dcp)
+{
+	unsigned int ms = READ_ONCE(idle_cache_ms);
+
+	if (ms && !READ_ONCE(dcp->owner->quiescing))
+		mod_delayed_work(dcp->runtime->wq, &dcp->idle_cache, msecs_to_jiffies(ms));
+}
+
+static void iomfb_m4_idle_cache_work(struct work_struct *work)
+{
+	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4, idle_cache);
+
+	mutex_lock(&dcp->lock);
+	/* An RPC failure has already failed the session. */
+	if (!READ_ONCE(dcp->owner->quiescing) && dcp->runtime && READ_ONCE(idle_cache_ms))
+		dcp_m4_idle_cache_enter(dcp);
+	mutex_unlock(&dcp->lock);
+}
+
 /* dcp->lock is the single owner of swaps, active descriptors and brightness. */
 static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
 {
@@ -1331,6 +1481,7 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
 	dcp->active_fb = fb;
 	dcp->active_frame = frame;
 	dcp->flips++;
+	iomfb_m4_idle_cache_kick(dcp);
 out:
 	mutex_unlock(&dcp->lock);
 	if (retire)
@@ -1411,6 +1562,11 @@ static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on)
 		ret = -EIO;
 		dcp_m4_failed(dcp, ret);
 	}
+	/* A display powered back up starts outside the idle cache. */
+	if (!ret && on) {
+		dcp->runtime->idle_state = 0;
+		dcp->runtime->idle_fences = 0;
+	}
 	return ret;
 }
 
@@ -1471,10 +1627,12 @@ static void iomfb_m4_backlight_work(struct work_struct *work)
 	ret = dcp_m4_runtime_live(dcp->runtime);
 	if (!ret)
 		ret = iomfb_m4_swap(dcp, &dcp->active_frame);
-	if (ret)
+	if (ret) {
 		dcp_m4_failed(dcp, ret);
-	else
+	} else {
 		dcp->brightness_swaps++;
+		iomfb_m4_idle_cache_kick(dcp);
+	}
 out:
 	mutex_unlock(&dcp->lock);
 }
@@ -1510,6 +1668,8 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
 	cancel_work_sync(&dcp->backlight_work);
 	if (dcp->runtime)
 		flush_workqueue(dcp->runtime->wq);
+	/* After the flush, as drained callbacks can queue it. */
+	cancel_delayed_work_sync(&dcp->idle_cache);
 }
 
 static int iomfb_m4_status_show(struct seq_file *s, void *unused)
@@ -1539,6 +1699,10 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
 		   dcp->display_off, dcp->display_off_cycles,
 		   dcp->display_off_us, dcp->display_off_us_max,
 		   dcp->display_on_us, dcp->display_on_us_max);
+	if (r)
+		seq_printf(s, "idle_cache=%u state=%u fences=%u registered=%u entries=%llu\n",
+			   !r->idle_unavailable && READ_ONCE(idle_cache_ms), r->idle_state,
+			   r->idle_fences, r->idle_registered, r->idle_entries);
 	mutex_unlock(&dcp->lock);
 	return 0;
 }
