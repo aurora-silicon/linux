@@ -17,25 +17,52 @@ function `V_e(z)` in joules for all downstream state z in epoch e. A sufficient
 certificate is
 
 ```
-w[n] + V_e(z[n+1]) - V_e(z[n]) <= (P0 + F * |x[n]|^p) / fs
+w[n] + V_e(z[n+1]) - V_e(z[n]) <= (P0 + F_certificate * |x[n]|^p) / fs
 V_e(z_at_admission) <= B
 ```
 
-Here `p=2` corresponds to transfer 1, `p=1` to transfer 2, and F is **no larger
+Here `p=2` corresponds to transfer 1, `p=1` to transfer 2, and F_certificate is **no larger
 than** the full-input power the daemon actually charges for that speaker.
 If a derived transfer norm needs a larger F, it does not fit this contract:
 neither the `tail_us` field nor an unchanged amplifier gain can hide an
 input-proportional deficit. The certificate must cover both thermal-model
 inputs and the actual allowed load, temperature, supply and gain range.
-The nonnegative continuous background P0, including idle noise, must not
-exceed the safe power the daemon already integrates indefinitely. A larger
-background cannot be charged to a finite residual tail. The exact checker
-uses P0=0 only for its noiseless mathematical examples.
+The nonnegative continuous background P0, including idle noise, shares the
+single safe-power reservation Ps with all unbilled signal energy. Let
+`g_fallback` bound the actual free-PCM gain (including safe raw copies and
+hardware gain). At every permitted rate/gain/route/clock epoch require the
+**joint** bound
+
+```
+P0 + F_certificate * g_fallback^p <= Ps
+```
+
+For a stateless plant this is necessary as well as sufficient for that
+baseline. Separate premises `P0 <= Ps` and
+`F_certificate * g_fallback^p <= Ps` spend Ps twice and are invalid.
+For stateful paths use the same joint bound in the time-local storage
+inequality, with a uniform B across every reachable boundary and epoch.
+Free PCM includes clamped/exhausted and hardware-safe refunded descriptors;
+raw copies must use their actual downstream gain, not a guessed sample scale.
+Paid PCM is charged in full (not just its amount above fallback); its signal
+supply is billed and P0 fits inside the same Ps reservation. No grant, expiry,
+owner death or stopped-clock interval creates additional free background.
+Every continuous/unclocked contribution needs this wall-time bound or a
+separately charged reserve. A deficit cannot be charged to a finite tail.
+
+F_certificate may be smaller than the daemon's charged full-input power F,
+but that gap must come from a proved tighter physical norm. The existing
+ABI has no independent background field and cannot negotiate extra Ps.
+If the joint bound cannot be proved for every applicable model and transition,
+the helper must return NONE. For example P0=Ps is incompatible with any
+nonzero unbilled signal unless its certified coefficient is zero. The exact
+checker exercises nonzero background, both p values, positive-headroom
+examples and the old double-spend counterexample. It qualifies no hardware.
 
 Summing the inequality over any finite continuation gives
 
 ```
-sum(w) <= P0 * N/fs + F/fs * sum(|x|^p) + V_e(z_start)
+sum(w) <= P0 * N/fs + F_certificate/fs * sum(|x|^p) + V_e(z_start)
 ```
 
 after dropping the nonnegative final storage. It also covers an infinite
@@ -62,7 +89,7 @@ bound** `0 <= V[n] <= B` at every physical boundary. Bounding storage just at
 the first admission is insufficient. The requirement at every possible suffix
 implies this uniform bound, including the safe-cached prefix and exhaustion.
 
-Let `u[n]` be billed energy plus the independently safe background for frame n,
+Let `u[n]` be billed energy plus the single joint Ps baseline for frame n,
 and let `h[n] >= 0` be any finite forward-time weights. Multiplication of
 `w[n]-u[n] <= V[n]-V[n+1]` and summation by parts gives
 

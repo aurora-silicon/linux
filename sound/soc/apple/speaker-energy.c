@@ -446,7 +446,11 @@ int apple_energy_filter_pcm(struct apple_energy_gate *gate, void *samples,
 					sample = floor;
 			}
 			sample = apple_energy_put(word, sample, format);
-			/* The independently reserved full-scale safe tail covers this. */
+			/*
+			 * One safe baseline covers ALL unbilled output: a certificate
+			 * must prove P0 + F_cert * fallback_gain^p <= Ps. Background
+			 * cannot spend that allowance again; residual B is separate.
+			 */
 			cost = entry->raw || abs((s64)sample) <=
 						       abs((s64)fallback) ?
 				       0 :
