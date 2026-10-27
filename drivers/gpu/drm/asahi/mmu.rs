@@ -1305,9 +1305,7 @@ impl KernelMapping {
             return Err(EINVAL);
         }
         let address = self.iova().checked_add(offset as u64).ok_or(EOVERFLOW)?;
-        lock_vm(&self.0.owner, None, false)?
-            .page_table
-            .translate_iova(address)
+        self.0.owner.lock_inner().page_table.translate_iova(address)
     }
 
     /// Writes a userspace timestamp through the retained GEM mapping. Aligned results
@@ -2250,9 +2248,7 @@ impl Vm {
     }
 
     pub(crate) fn covers_range(&self, address: u64, size: u64, read: bool, write: bool) -> bool {
-        let Ok(mut inner) = lock_vm(&self.gpuvm, None, false) else {
-            return false;
-        };
+        let mut inner = self.gpuvm.lock_inner();
         Self::covers_range_locked(&mut inner, address, size, read, write)
     }
 
@@ -2267,9 +2263,7 @@ impl Vm {
         if stride <= block_size {
             return false;
         }
-        let Ok(mut inner) = lock_vm(&self.gpuvm, None, false) else {
-            return false;
-        };
+        let mut inner = self.gpuvm.lock_inner();
         addresses.iter().all(|&address| {
             let Some(guard) = address.checked_add(block_size) else {
                 return false;
@@ -2279,12 +2273,12 @@ impl Vm {
         })
     }
 
-    /// Checks all exact request tuples under one GPUVM exec lock. Access bit0
+    /// Checks all exact request tuples under one hold of the VM reservation. Access bit0
     /// requests reading and bit1 writing. The epoch names this same snapshot.
     pub(crate) fn covers_ranges_batch(&self, ranges: &[(u64, u64, u8)]) -> (bool, Option<u64>) {
-        let Ok(mut inner) = lock_vm(&self.gpuvm, None, false) else {
-            return (false, None);
-        };
+        // Every mapping change holds the VM reservation, so readers need only that one. The full
+        // exec lock would also lock every external BO, making each submit O(external BOs).
+        let mut inner = self.gpuvm.lock_inner();
         let epoch = inner.epoch;
         let covered = ranges.iter().all(|&(address, size, access)| {
             Self::covers_range_locked(&mut inner, address, size, access & 1 != 0, access & 2 != 0)
@@ -3136,7 +3130,7 @@ impl Uat {
             return Err(EINVAL);
         }
         let root = {
-            let owner = lock_vm(&vm.gpuvm, None, false)?;
+            let owner = vm.gpuvm.lock_inner();
             if owner.is_kernel || !Arc::ptr_eq(&owner.uat_inner, &self.inner) {
                 return Err(EINVAL);
             }
@@ -3281,7 +3275,7 @@ impl Uat {
             return Err(EINVAL);
         }
         {
-            let owner = lock_vm(&vm.gpuvm, None, false)?;
+            let owner = vm.gpuvm.lock_inner();
             if owner.is_kernel
                 || !core::ptr::eq(Arc::as_ptr(&owner.uat_inner), Arc::as_ptr(&self.inner))
             {
@@ -3663,7 +3657,7 @@ impl Vm {
     /// Diagnostic reservation occupancy (including guards), not a placement promise.
     /// Removal can progress between queries; allocations are excluded by the VM lock.
     pub(crate) fn capacity(&self, range: Range<u64>) -> Result<(u64, u64)> {
-        let inner = lock_vm(&self.gpuvm, None, false)?;
+        let inner = self.gpuvm.lock_inner();
         let mut next = range.start;
         let mut used = 0;
         let mut largest = 0;
