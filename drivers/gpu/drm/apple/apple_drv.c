@@ -64,28 +64,44 @@ struct apple_drm_private {
 };
 
 /* Component readiness is later than platform probe/bind. */
-static DEFINE_MUTEX(apple_t6030_display_lock);
+static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
+static struct device *apple_t6031_display;
 
-static int apple_t6030_display_publish(struct device *dev)
+/* The publication slot of a G15 SoC's internal display subsystem, or NULL. */
+static struct device **apple_g15_display_slot(struct device *dev)
 {
-	if (!of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
+	if (of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
+		return &apple_t6030_display;
+	if (of_device_is_compatible(dev->of_node, "apple,t6031-display-subsystem"))
+		return &apple_t6031_display;
+	return NULL;
+}
+
+static int apple_g15_display_publish(struct device *dev)
+{
+	struct device **slot = apple_g15_display_slot(dev);
+
+	if (!slot)
 		return 0;
-	guard(mutex)(&apple_t6030_display_lock);
-	if (apple_t6030_display)
-		return apple_t6030_display == dev ? 0 : -EBUSY;
-	apple_t6030_display = get_device(dev);
+	guard(mutex)(&apple_g15_display_lock);
+	if (*slot)
+		return *slot == dev ? 0 : -EBUSY;
+	*slot = get_device(dev);
 	return 0;
 }
 
-static void apple_t6030_display_withdraw(struct device *dev)
+static void apple_g15_display_withdraw(struct device *dev)
 {
+	struct device **slot = apple_g15_display_slot(dev);
 	struct device *old = NULL;
 
-	scoped_guard(mutex, &apple_t6030_display_lock) {
-		if (apple_t6030_display == dev) {
-			old = apple_t6030_display;
-			apple_t6030_display = NULL;
+	if (!slot)
+		return;
+	scoped_guard(mutex, &apple_g15_display_lock) {
+		if (*slot == dev) {
+			old = *slot;
+			*slot = NULL;
 		}
 	}
 	put_device(old);
@@ -96,21 +112,34 @@ static void apple_t6030_display_withdraw(struct device *dev)
  * publish separately. This lock protects only publication and a device link;
  * no display calls or firmware RPC run while it is held.
  */
-int apple_drm_t6030_link_device(struct device *consumer)
+static int apple_g15_link_device(struct device *consumer, const char *machine,
+				 const char *gpu, struct device **display)
 {
 	struct device_link *link;
 
-	if (!of_machine_is_compatible("apple,t6030") || !consumer->of_node ||
-	    !of_device_is_compatible(consumer->of_node, "apple,agx-t6030"))
+	if (!of_machine_is_compatible(machine) || !consumer->of_node ||
+	    !of_device_is_compatible(consumer->of_node, gpu))
 		return -ENODEV;
-	guard(mutex)(&apple_t6030_display_lock);
-	if (!apple_t6030_display)
+	guard(mutex)(&apple_g15_display_lock);
+	if (!*display)
 		return -EPROBE_DEFER;
-	link = device_link_add(consumer, apple_t6030_display,
-			       DL_FLAG_AUTOREMOVE_CONSUMER);
+	link = device_link_add(consumer, *display, DL_FLAG_AUTOREMOVE_CONSUMER);
 	return link ? 0 : -EINVAL;
 }
+
+int apple_drm_t6030_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t6030", "apple,agx-t6030",
+				     &apple_t6030_display);
+}
 EXPORT_SYMBOL_GPL(apple_drm_t6030_link_device);
+
+int apple_drm_t6031_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t6031", "apple,agx-t6031",
+				     &apple_t6031_display);
+}
+EXPORT_SYMBOL_GPL(apple_drm_t6031_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
@@ -1316,7 +1345,7 @@ static int apple_drm_init(struct device *dev)
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
 	/* A subsequent successful platform probe retries deferred GPU probes. */
-	ret = apple_t6030_display_publish(dev);
+	ret = apple_g15_display_publish(dev);
 	if (ret) {
 		drm_dev_unregister(&apple->drm);
 		goto err_unbind;
@@ -1338,7 +1367,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	apple_t6030_display_withdraw(dev);
+	apple_g15_display_withdraw(dev);
 
 	/* An aborted takeover leaves its DCPs running until the reboot. */
 	if (apple->aborted)

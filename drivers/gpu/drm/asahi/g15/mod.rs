@@ -14,9 +14,9 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] is a separate platform driver. T6030 has a module alias; its probe must wait
-//!   for the native display and PMP supplier before booting firmware. T6031 retains explicit
-//!   module loading. It calls [`crate::driver::AsahiPlatformDriver::probe_g15`].
+//! - [`Driver`] is a separate platform driver with a module alias. Its probe must wait for
+//!   the native display (T6030 and T6031) and the PMP supplier (T6030) before booting
+//!   firmware. It calls [`crate::driver::AsahiPlatformDriver::probe_g15`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
 //! - User VMs are shared-layer [`mmu::Vm`]s on a [`mmu::Uat::new_adopted`] UAT with tracked
@@ -152,13 +152,15 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
         ),
     ]);
 
-// T6030 probe admission requires the native display and PMP supplier before
-// firmware starts. T6031 retains explicit loading until it has an equivalent
-// display-order admission gate.
+// Probe admission requires the native display before firmware starts (T6030
+// also its PMP supplier), so both may be loaded at device creation.
 kernel::of_device_table!(
     AUTOLOAD_OF_TABLE,
     @none,
-    [of::DeviceId::new(c_str!("apple,agx-t6030"))]
+    [
+        of::DeviceId::new(c_str!("apple,agx-t6030")),
+        of::DeviceId::new(c_str!("apple,agx-t6031")),
+    ]
 );
 
 /// The G15 platform adapter: the shared DRM registration probed through

@@ -72,6 +72,7 @@ pub(crate) mod glue {
         fn asahi_g15_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
         fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool;
         pub(crate) fn asahi_g15_pmp_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        pub(crate) fn asahi_g15_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         pub(crate) fn asahi_g15_pmp_get(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         pub(crate) fn asahi_g15_pmp_ready() -> core::ffi::c_int;
         pub(crate) fn asahi_g15_pmp_put(dev: *mut core::ffi::c_void);
@@ -486,6 +487,17 @@ pub(crate) fn admit(
     } else if !glue::machine(cfg.machine) {
         dev_err!(dev, "G15: not a {} machine\n", cfg.name);
         return Err(ENODEV);
+    } else {
+        // No PMP vote here, but the first start follows the native display all the same.
+        // SAFETY: `dev` is the bound GPU device.
+        let ret = unsafe { glue::asahi_g15_display_prepare(dev.as_raw().cast()) };
+        if ret != 0 {
+            let err = Error::from_errno(ret);
+            if err != EPROBE_DEFER {
+                dev_err!(dev, "native display not admitted: {:?}\n", err);
+            }
+            return Err(err);
+        }
     }
     let adt = adt::read(dev, cfg)
         .inspect_err(|e| dev_err!(dev, "GPU regions not admitted: {:?}\n", e))?;
