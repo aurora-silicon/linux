@@ -222,7 +222,7 @@ struct macaudio_snd_data {
 
 static int please_blow_up_my_speakers;
 module_param(please_blow_up_my_speakers, int, 0644);
-MODULE_PARM_DESC(please_blow_up_my_speakers, "Allow unsafe or untested operating configurations");
+MODULE_PARM_DESC(please_blow_up_my_speakers, "Deprecated: cannot bypass speaker admission or protection");
 
 SND_SOC_DAILINK_DEFS(primary,
 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
@@ -686,6 +686,16 @@ static int macaudio_copy_link(struct device *dev, struct snd_soc_dai_link *targe
 	return 0;
 }
 
+/* A Speaker DT link alone does not establish a protected backend. */
+static bool macaudio_speakers_allowed(const struct macaudio_platform_cfg *cfg)
+{
+	/* Every admitted backend must have a configured, enforced safe level. */
+	return cfg->enable_speakers && cfg->safe_vol < 0 &&
+		cfg->speakers != SPKR_NONE &&
+		(cfg->amp == AMP_TAS5770 || cfg->amp == AMP_SN012776 ||
+		 cfg->amp == AMP_MAX98360A);
+}
+
 static int macaudio_parse_of_component(struct device_node *node, int index,
 				struct snd_soc_dai_link_component *comp)
 {
@@ -882,7 +892,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		speakers = !strcmp(link_name, "Speaker")
 			   || !strcmp(link_name, "Speakers");
 		if (speakers) {
-			if (!ma->cfg->enable_speakers  && !please_blow_up_my_speakers) {
+			if (!macaudio_speakers_allowed(ma->cfg)) {
 				dev_err(card->dev, "driver can't assure safety on this model, disabling speakers\n");
 				continue;
 			}
@@ -1596,6 +1606,33 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 	return 0;
 }
 
+/* Called during control fixup, before the card is exposed to userspace. */
+static int macaudio_set_fixed_enum(struct snd_soc_card *card, const char *name,
+				   const char *value)
+{
+	struct snd_kcontrol *kctl;
+	unsigned int i;
+	int ret;
+
+	ret = snd_soc_set_enum_kctl(card, name, value);
+	if (ret < 0)
+		return ret;
+
+	ret = snd_soc_deactivate_kctl(card, name, 0);
+	if (ret < 0)
+		return ret;
+
+	/* INACTIVE only hides controls; direct ALSA writes require WRITE. */
+	list_for_each_entry(kctl, &card->snd_card->controls, list) {
+		if (!snd_soc_control_matches(kctl, name))
+			continue;
+		for (i = 0; i < kctl->count; i++)
+			kctl->vd[i].access &= ~SNDRV_CTL_ELEM_ACCESS_WRITE;
+	}
+
+	return ret;
+}
+
 #define CHECK(call, pattern, value, min)                                       \
 	{                                                                      \
 		int ret = call(card, pattern, value);                          \
@@ -1603,8 +1640,7 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 		if (err < 0) {                                                 \
 			dev_err(card->dev, "%s on '%s': %d\n", #call, pattern, \
 				ret);                                          \
-			if (please_blow_up_my_speakers < 2)                    \
-				return err;                                    \
+			return err;                                    \
 		} else {                                                       \
 			dev_dbg(card->dev, "%s on '%s': %d hits\n", #call,     \
 				pattern, ret);                                 \
@@ -1627,35 +1663,24 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 
 	switch (ma->cfg->amp) {
 	case AMP_TAS5770:
-		if (ma->cfg->stereo) {
-			CHECK_CONCAT(snd_soc_set_enum_kctl, "ASI1 Sel", "Left");
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "ASI1 Sel", 0);
-		}
+		if (ma->cfg->stereo)
+			CHECK_CONCAT(macaudio_set_fixed_enum, "ASI1 Sel", "Left");
 
 		CHECK_CONCAT(snd_soc_limit_volume, "Amp Gain Volume", ma->cfg->amp_gain);
 		break;
 	case AMP_SN012776:
-		if (ma->cfg->stereo) {
-			CHECK_CONCAT(snd_soc_set_enum_kctl, "ASI1 Sel", "Left");
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "ASI1 Sel", 0);
-		}
+		if (ma->cfg->stereo)
+			CHECK_CONCAT(macaudio_set_fixed_enum, "ASI1 Sel", "Left");
 
 		CHECK_CONCAT(snd_soc_limit_volume, "Amp Gain Volume", ma->cfg->amp_gain);
-		CHECK_CONCAT(snd_soc_set_enum_kctl, "HPF Corner Frequency",
+		CHECK_CONCAT(macaudio_set_fixed_enum, "HPF Corner Frequency",
 			     tweeter ? "800 Hz" : "2 Hz");
 
-		if (please_blow_up_my_speakers < 2)
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "HPF Corner Frequency", 0);
-
-		CHECK_CONCAT(snd_soc_set_enum_kctl, "OCE Handling", "Retry");
-		CHECK_CONCAT(snd_soc_deactivate_kctl, "OCE Handling", 0);
+		CHECK_CONCAT(macaudio_set_fixed_enum, "OCE Handling", "Retry");
 		break;
 	case AMP_SSM3515:
 		/* TODO: check */
-		CHECK_CONCAT(snd_soc_set_enum_kctl, "DAC Analog Gain Select", "8.4 V Span");
-
-		if (please_blow_up_my_speakers < 2)
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
+		CHECK_CONCAT(macaudio_set_fixed_enum, "DAC Analog Gain Select", "8.4 V Span");
 
 		/* TODO: HPF, needs new call to set */
 		break;
@@ -1695,8 +1720,7 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 	 */
 	switch(ma->cfg->speakers) {
 	case SPKR_NONE:
-		WARN_ON(please_blow_up_my_speakers < 2);
-		return please_blow_up_my_speakers >= 2 ? 0 : -EINVAL;
+		return -EINVAL;
 	case SPKR_1W:
 		/* only 1W stereo system (J313) is uses cs42l83 */
 		if (ma->cfg->stereo) {
@@ -2251,3 +2275,7 @@ module_platform_driver(macaudio_snd_driver);
 MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
 MODULE_DESCRIPTION("Apple Silicon Macs machine-level sound driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include "macaudio-admission-test.h"
+#endif
