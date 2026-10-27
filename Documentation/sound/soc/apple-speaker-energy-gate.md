@@ -302,3 +302,15 @@ including their cross term. It also specifies paid or nonincreasing epoch
 transitions and a set-valued alternative to a unique pre-DAC replay inverse.
 The exact synthetic examples do not qualify any physical route or change
 production protection.
+
+
+## Speaker admission is independent of the legacy unsafe parameter
+
+A DT Speaker/Speakers link is admitted only for an enabled, supported amplifier
+and speaker layout with a negative configured safe volume. Generic fallback
+and unsupported SSM3515 backends remain disabled even if the legacy unsafe
+parameter is set. Protection setup failures abort registration and fixed
+transform controls remain read-only. SPKR_NONE is always refused when a speaker
+backend reaches control fixup. No unsafe parameter value can skip those gates.
+The small admission hardening change is also published against aurora-wip so
+it can be reviewed and merged independently of the energy-gate draft.
