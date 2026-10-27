@@ -125,7 +125,9 @@ replays and crash/stall/expiry tests must pass on the integrated source. Listeni
 metrics must include sample attenuation as well as control gain: <=1 dB and
 exactly 0 dB on J616 at 30%/60%. No old test is waived or its limit raised.
 
-No hardware, speaker playback, recording or deployment is part of this work.
+The software validation described here used no hardware, speaker playback,
+recording or deployment. Physical qualification requires its own approved
+measurement procedure; no physical certificate is claimed by these results.
 The orchestrator files the independent review after implementation and evidence.
 
 ## Current validation and blocking work
