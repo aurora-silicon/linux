@@ -258,7 +258,7 @@ struct macaudio_snd_data {
 
 static int please_blow_up_my_speakers;
 module_param(please_blow_up_my_speakers, int, 0644);
-MODULE_PARM_DESC(please_blow_up_my_speakers, "Allow unsafe or untested operating configurations");
+MODULE_PARM_DESC(please_blow_up_my_speakers, "Deprecated: cannot bypass speaker admission or protection");
 
 static void macaudio_vlimit_update(struct macaudio_snd_data *ma);
 static bool macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock);
@@ -1134,6 +1134,16 @@ static int macaudio_get_codec_idle_props(struct device_node *np,
 	return 0;
 }
 
+/* A Speaker DT link alone does not establish a protected backend. */
+static bool macaudio_speakers_allowed(const struct macaudio_platform_cfg *cfg)
+{
+	/* Every admitted backend must have a configured, enforced safe level. */
+	return cfg->enable_speakers && cfg->safe_vol < 0 &&
+		cfg->speakers != SPKR_NONE &&
+		(cfg->amp == AMP_TAS5770 || cfg->amp == AMP_SN012776 ||
+		 cfg->amp == AMP_MAX98360A);
+}
+
 static int macaudio_parse_of(struct macaudio_snd_data *ma)
 {
 	struct device_node *codec = NULL;
@@ -1239,7 +1249,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		speakers = !strcmp(link_name, "Speaker")
 			   || !strcmp(link_name, "Speakers");
 		if (speakers) {
-			if (!ma->cfg->enable_speakers  && !please_blow_up_my_speakers) {
+			if (!macaudio_speakers_allowed(ma->cfg)) {
 				dev_err(card->dev, "driver can't assure safety on this model, disabling speakers\n");
 				continue;
 			}
@@ -2057,8 +2067,7 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 		if (err < 0) {                                                 \
 			dev_err(card->dev, "%s on '%s': %d\n", #call, pattern, \
 				ret);                                          \
-			if (please_blow_up_my_speakers < 2)                    \
-				return err;                                    \
+			return err;                                            \
 		} else {                                                       \
 			dev_dbg(card->dev, "%s on '%s': %d hits\n", #call,     \
 				pattern, ret);                                 \
@@ -2098,8 +2107,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 		CHECK_CONCAT(snd_soc_set_enum_kctl, "HPF Corner Frequency",
 			     tweeter ? "800 Hz" : "2 Hz");
 
-		if (please_blow_up_my_speakers < 2)
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "HPF Corner Frequency", 0);
+		CHECK_CONCAT(snd_soc_deactivate_kctl, "HPF Corner Frequency", 0);
 
 		CHECK_CONCAT(snd_soc_set_enum_kctl, "OCE Handling", "Retry");
 		CHECK_CONCAT(snd_soc_deactivate_kctl, "OCE Handling", 0);
@@ -2108,8 +2116,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 		/* TODO: check */
 		CHECK_CONCAT(snd_soc_set_enum_kctl, "DAC Analog Gain Select", "8.4 V Span");
 
-		if (please_blow_up_my_speakers < 2)
-			CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
+		CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
 
 		/* TODO: HPF, needs new call to set */
 		break;
@@ -2149,8 +2156,7 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 	 */
 	switch(ma->cfg->speakers) {
 	case SPKR_NONE:
-		WARN_ON(please_blow_up_my_speakers < 2);
-		return please_blow_up_my_speakers >= 2 ? 0 : -EINVAL;
+		return -EINVAL;
 	case SPKR_1W:
 		/* only 1W stereo system (J313) is uses cs42l83 */
 		if (ma->cfg->stereo) {
@@ -2994,4 +3000,8 @@ MODULE_LICENSE("GPL");
 
 #if IS_REACHABLE(CONFIG_KUNIT) && IS_ENABLED(CONFIG_SND_SOC_APPLE_SPEAKER_ENERGY_KUNIT_TEST)
 #include "macaudio-energy-test.h"
+#endif
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include "macaudio-admission-test.h"
 #endif
