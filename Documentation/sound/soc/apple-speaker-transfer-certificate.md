@@ -53,6 +53,71 @@ universal residual reservation on every projection; preserve already-issued
 energy debt separately. Do not repeatedly integrate the same fixed residual
 as measured heat, or subtract it from lifetime counters as a refund.
 
+## From storage to thermal state and rolling windows
+
+A whole-recording energy norm is insufficient for a thermal model: energy
+stored while the input model cools can be released later. The certificate
+needs the time-local supply inequality above and a **uniform reachable-state
+bound** `0 <= V[n] <= B` at every physical boundary. Bounding storage just at
+the first admission is insufficient. The requirement at every possible suffix
+implies this uniform bound, including the safe-cached prefix and exhaustion.
+
+Let `u[n]` be billed energy plus the independently safe background for frame n,
+and let `h[n] >= 0` be any finite forward-time weights. Multiplication of
+`w[n]-u[n] <= V[n]-V[n+1]` and summation by parts gives
+
+```
+sum(h[n]*(w[n]-u[n]))
+ <= h[0]*V[0] + sum((h[n]-h[n-1])*V[n]) - h[N-1]*V[N]
+ <= B * (h[0] + sum(max(0, h[n]-h[n-1])))
+```
+
+The interior sums start at n=1. This inequality allows signed differences
+`w-u`; neither physical energy is negative. It explains what one persistent
+residual reservation covers, without repeatedly integrating B as new heat.
+For arbitrary weighting kernels the positive variation factor must be kept;
+a peak-only factor is not universally valid.
+
+For the two-node thermal model, write `a=Rc/tauc`, `b=Rm/taum`. The magnet
+impulse kernel is `b*exp(-t/taum)`. The coil kernel starts at a and solves
+`hc'=(hm-hc)/tauc`. It is nonnegative, bounded by `k=max(a,b)` and either
+monotonically decreases or rises to one maximum then decreases. For unequal
+time constants it is a sum of two decaying exponentials and its derivative
+has at most one zero; a nonnegative kernel tending to zero cannot have a
+strict interior minimum. For equal time constants it is
+`(a+b*t/tauc)*exp(-t/tauc)`, with the same property. Thus their time-reversed
+weights have positive variation factors at most b and k respectively.
+The continuous integration-by-parts version gives the same result for
+energy measures, including impulses.
+
+Consequently, compared with the same thermal model driven by billed energy
+and safe background, all historic storage delay/release adds at most `b*B`
+to the magnet and `k*B` to the coil at **any** evaluation time. Reserving B in
+every thermal projection covers that excess even after a prior residual has
+been released. Queued charged energy remains separate debt; retirement,
+refunds and a new grant do not reset storage. An impulse envelope that already
+bounds billed energy can retain this additive residual bound.
+
+For a rolling energy window use weights equal to one inside the window and
+zero outside. There is one positive jump, so actual window energy exceeds
+billed-plus-safe window energy by at most B, not one B per grant. Reserve B
+in each independently enforced power window. This statement does not permit
+dropping the billed energy already in that window, including pre-takeover
+history. Source-power windows still need their own authenticated raw history.
+
+All epochs must share this uniform storage interpretation. Nonincreasing
+storage jumps preserve the proof; each positive jump must instead be paid
+as energy before it can occur. Unbounded unpaid jumps, a new owner nonce or
+reinitializing the model break the argument. Changed thermal parameters,
+per-speaker slot identities or joule conversion need a fresh composition
+proof; the current lifetime ledger cannot silently reinterpret them.
+
+The exact checker verifies the summation identity using its attainable
+extremal storage assignment, 450 finite positive two-node kernel examples
+(including repeated poles and both pole orderings), 152 rolling windows and
+16 paid store/release cycles. These finite examples accompany the analytic
+argument; they do not identify or qualify any physical filter or load.
+
 ## The cross term cannot be discarded
 
 Separately proving a zero-state induced norm and a zero-input residual norm
@@ -138,6 +203,21 @@ minimum-energy inverse, removing DC, imposing zero initial state, filling a
 loss with silence or aligning to a convenient gain is an additional assumption
 unless independently justified. If the resulting interval for the listening
 metric straddles the limit, the result is unresolved rather than a pass.
+
+For the exact, noiseless illustrative high-pass above, a complete inverse
+class can be written explicitly: `x[n]=s0+y[n]+(1-a)*sum(y[:n])`. Intersect
+`-1 <= x[n] <= 1` with the independently justified initial-state interval.
+An empty intersection rejects the mapping. The queued squared dose is a
+convex quadratic in s0: its minimum is at the clipped vertex and maximum
+at an interval endpoint. The checker validates that entire example class,
+including legal endpoint trajectories and an infeasible observation.
+This illustrates a set-valued mapping without selecting a convenient input.
+Actual quantization, clipping, missing periods, gain/calibration uncertainty
+and mode changes require additional variables and constraints; these exact
+example intervals cannot be applied to the original recordings. Dose bounds
+alone also do not determine the dynamic listening metric: the counterfactual
+gate, grants and analogue controls must be evaluated for all admitted
+trajectories with the original timing and measurement windows.
 
 Alternatively retain native pre-DAC payloads, exact valid-bit/container format,
 frame order, descriptor boundaries and repeat semantics, the physical speaker
