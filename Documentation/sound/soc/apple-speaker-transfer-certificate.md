@@ -8,14 +8,16 @@ those devices. Keep the existing safe caps until all obligations are met.
 ## A bound that composes with the ledger
 
 Let `x[n]` be the **delivered private-copy words**, normalized by their actual
-PCM format. Include channel selection, duplication, rate conversion and every
+PCM format. For each speaker, x must be its actually billed slot; a norm on
+all channels combined does not justify independent per-slot charging. Include
+channel selection, duplication, cross-coupling, rate conversion and every
 transform after that boundary. Let `w[n] >= 0` upper-bound the energy supplied
 to each active thermal model during frame n. Define a nonnegative storage
 function `V_e(z)` in joules for all downstream state z in epoch e. A sufficient
 certificate is
 
 ```
-w[n] + V_e(z[n+1]) - V_e(z[n]) <= F * |x[n]|^p / fs
+w[n] + V_e(z[n+1]) - V_e(z[n]) <= (P0 + F * |x[n]|^p) / fs
 V_e(z_at_admission) <= B
 ```
 
@@ -25,11 +27,15 @@ If a derived transfer norm needs a larger F, it does not fit this contract:
 neither the `tail_us` field nor an unchanged amplifier gain can hide an
 input-proportional deficit. The certificate must cover both thermal-model
 inputs and the actual allowed load, temperature, supply and gain range.
+The nonnegative continuous background P0, including idle noise, must not
+exceed the safe power the daemon already integrates indefinitely. A larger
+background cannot be charged to a finite residual tail. The exact checker
+uses P0=0 only for its noiseless mathematical examples.
 
 Summing the inequality over any finite continuation gives
 
 ```
-sum(w) <= F/fs * sum(|x|^p) + V_e(z_start)
+sum(w) <= P0 * N/fs + F/fs * sum(|x|^p) + V_e(z_start)
 ```
 
 after dropping the nonnegative final storage. It also covers an infinite
