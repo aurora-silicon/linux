@@ -179,8 +179,9 @@ no valid gate-in-loop 63-replay acceptance or J616 zero-loss result is claimed.
 The useful daemon flags remain; unqualified profiles are not promoted.
 
 The safe-and-loud objective remains incomplete. Both PRs stay draft. Independent
-review is for the orchestrator to file. **Do not merge or deploy.** No hardware,
-playback (including silence), microphone recording or deployment occurred.
+review is for the orchestrator to file. **Do not merge or deploy.** Those
+software checks used no hardware, playback (including silence), microphone
+recording or deployment.
 
 ## J616 coverage and reference-envelope feasibility
 
@@ -240,3 +241,53 @@ consistently across thermal and listening campaigns. Neither these inequalities
 nor a selector on a related TI part qualifies TAS2764/TAS2770/AOP. Real transfer
 helpers continue to return NONE. The missing physical contract and pre-DAC
 replay inputs remain blockers; both PRs remain draft.
+
+## Physical transfer qualification
+
+For each actual route and speaker, establish a bound of the form
+
+```
+E_output(x, initial_state, epochs)
+    <= K * sum(native_normalized_PCM^2) / sample_rate + B(initial_state, epochs)
+```
+
+or a justified alternative norm supported by the grant accounting. Units,
+per-speaker transforms and the relation to both thermal power inputs must be
+explicit. Account for sense scale/quantization/error, gain calibration, channel
+cross-coupling, rate/format conversion, speaker/load variation, clipping and all
+supported fixed DSP modes. A small-signal fit at one gain is not that bound.
+Keep reference experiments distinct from physical certificates.
+
+The residual term must cover arbitrary prior full-scale input and every allowed
+gain/reset/clock transition. An observed decay below the sense noise floor
+does not establish zero remaining energy. Obtain a justified stable-state norm
+and decay/tail bound, or enforce a proven reset/quiescence sequence before
+authority can rise. That sequence itself needs an independent safe envelope.
+Neither descriptor retirement nor a refunded safe copy proves DSP quiescence.
+Do not disable the HPF or inject clock/reset faults into a live speaker test to
+replace the missing argument. Keep the independently reserved exhaustion tail.
+
+Topology must be checked first. In the pinned public DT, both J316 and J413
+speaker links use SN012776/TAS2764-class codecs over MCA. Their AOP microphone
+device is not evidence for an AOP speaker transform. A result from these machines
+cannot qualify TAS2770, another chassis, or the AOP speaker route. Unsupported
+routes must retain transfer NONE and conservative protection.
+
+## Replay provenance and acceptance
+
+Sense-only recorder formats contain post-amplifier V/I. Format 4's receipts and
+grants also do not contain native queued playback words. Retain corresponding
+pre-DAC payloads with format, frame/descriptor boundaries, per-speaker slot map,
+clock/gain/route epochs, applied controls and a synchronized electrical trace.
+Alternatively justify a bounded inverse, including initial state, lost/clipped
+samples, quantization and filtering. Evaluate every admissible inverse input;
+choosing a convenient representative does not prove a listening guarantee.
+
+Once a physical bound and replay mapping exist, use the same certificate for
+the full continuous, counterexample, historical, listening and fault campaigns.
+Include queued-word and analogue attenuation in the unchanged metric. Retain
+all 63 original matrix rows, <=1 dB general cost and exactly zero J616 cost at
+30%/60%. Repeat crash/stall/expired-grant tests in simulation without stopping
+hardware protection. A finite transfer probe alone cannot close any of these
+acceptance gates. Keep the PRs draft until all required evidence passes and the
+orchestrator's independent review is complete.
