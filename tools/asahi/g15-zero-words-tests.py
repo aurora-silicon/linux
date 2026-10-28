@@ -10,7 +10,9 @@ and again when the initial PB posting became a module parameter (the tuning
 constant PB_BLOCKS removed), and when the T6031 board source became the
 device tree with reference words instead of a board file (the Board enum;
 the T6030 tables are unchanged), and for publication-bound slots (removal of
-MAX_VMS and its lifetime-slot comment only). Its T6030 configuration module is
+MAX_VMS and its lifetime-slot comment only), and when Board::DeviceTree was
+gated on CONFIG_DRM_ASAHI_G15 for the T8122 runtime without the G15 backend
+(one #[cfg] line; the tables are unchanged). Its T6030 configuration module is
 independently pinned to the original bytes. prepare_board() is pinned too;
 it was refreshed for the same Board change (its T6030 arm is unchanged).
 """
@@ -28,7 +30,7 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "105395216669292954334e2bd0ecd8cd2dcb6c6faf3fc0ab95d7b5a36436b6c2",
+    "hw.rs": "1e15a6882971d9888677b4862d0e77a461cb9adf3d948fb1ab11c1f20b6df459",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {
