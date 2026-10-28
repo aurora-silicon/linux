@@ -240,20 +240,17 @@ static void dcp_metadata_cta(u8 *cta, const struct dcp_display_metadata *metadat
 	cta[EDID_LENGTH - 1] = -checksum;
 }
 
-const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
-					 const struct drm_display_mode *mode)
+/* A base block, followed by the HDR capability when the firmware reports PQ. */
+static const struct drm_edid *dcp_metadata_edid_alloc(const struct edid *base,
+						      const struct dcp_display_metadata *metadata)
 {
 	struct {
 		struct edid base;
 		u8 cta[EDID_LENGTH];
-	} block;
+	} block = { .base = *base };
 	const struct drm_edid *edid;
 	size_t size = sizeof(block.base);
-	int ret = dcp_metadata_block(&block.base, metadata, mode);
 
-	if (ret)
-		return ERR_PTR(ret);
-	/* The sink's HDR capability, when the firmware reports a PQ one. */
 	if (metadata->pq) {
 		block.base.extensions = 1;
 		block.base.checksum -= 1;
@@ -268,6 +265,17 @@ const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *meta
 		return ERR_PTR(-EINVAL);
 	}
 	return edid;
+}
+
+const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
+					 const struct drm_display_mode *mode)
+{
+	struct edid block;
+	int ret = dcp_metadata_block(&block, metadata, mode);
+
+	if (ret)
+		return ERR_PTR(ret);
+	return dcp_metadata_edid_alloc(&block, metadata);
 }
 
 /*
@@ -317,7 +325,6 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	struct dcp_display_metadata dimensions = *metadata;
 	struct detailed_non_pixel *limits = &block.detailed_timings[3].data.other_data;
 	struct detailed_data_monitor_range *range = &limits->data.range;
-	const struct drm_edid *edid;
 	char serial[14], name[14];
 	u32 min_v = U32_MAX, max_v = 0, min_h = U32_MAX, max_h = 0, clock = 0;
 	u16 manufacturer = 0;
@@ -426,12 +433,5 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	for (unsigned int i = 0; i < sizeof(block) - 1; i++)
 		sum += ((const u8 *)&block)[i];
 	block.checksum = -sum;
-	edid = drm_edid_alloc(&block, sizeof(block));
-	if (!edid)
-		return ERR_PTR(-ENOMEM);
-	if (!drm_edid_valid(edid)) {
-		drm_edid_free(edid);
-		return ERR_PTR(-EINVAL);
-	}
-	return edid;
+	return dcp_metadata_edid_alloc(&block, metadata);
 }

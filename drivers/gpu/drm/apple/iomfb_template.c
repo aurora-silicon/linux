@@ -123,6 +123,64 @@ static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits
 	put_unaligned_le64(bits, &swap->bl_nits);
 }
 
+/* The binary64 nearest @num / @den, for small positive integers. */
+static u64 dcp_binary64_ratio(u64 num, u64 den)
+{
+	u64 mantissa = 0;
+	int exponent = 0;
+
+	while (num >= 2 * den) {
+		den <<= 1;
+		exponent++;
+	}
+	while (num < den) {
+		num <<= 1;
+		exponent--;
+	}
+	/* den <= num < 2 den: 53 quotient bits, then round to nearest */
+	for (unsigned int i = 0; i < 53; i++) {
+		mantissa <<= 1;
+		if (num >= den) {
+			mantissa |= 1;
+			num -= den;
+		}
+		num <<= 1;
+	}
+	if (num >= den && ++mantissa == 1ULL << 53) {
+		mantissa >>= 1;
+		exponent++;
+	}
+	return (u64)(exponent + 1023) << 52 | (mantissa & GENMASK_ULL(51, 0));
+}
+
+/*
+ * EDR: SDR white stays at @sdr nits while highlights reach @peak.  The swap
+ * carries the display EDR scale, SDR white over the peak, and the headroom
+ * the frame uses, the peak over SDR white; equal values end EDR.
+ */
+static void dcp_swap_set_edr(struct DCP_FW_NAME(dcp_swap) *swap, u32 sdr, u32 peak)
+{
+	swap->bl_flags[2] = 1;
+	put_unaligned_le64(dcp_binary64_ratio(sdr, peak), &swap->edr_scale);
+	swap->bl_flags[4] = 1;
+	put_unaligned_le64(dcp_binary64_ratio(peak, sdr), &swap->edr_headroom);
+}
+
+/* An EDR panel swap carries the headroom over the current panel level. */
+static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) *swap)
+{
+	u32 peak = READ_ONCE(dcp->panel.peak_nits);
+	u32 sdr = dcp->output_edr ? dcp_backlight_desktop_nits(dcp) : 0;
+
+	if (sdr && peak > sdr) {
+		dcp_swap_set_edr(swap, sdr, peak);
+		dcp->edr_sent = true;
+	} else if (dcp->edr_sent) {
+		dcp_swap_set_edr(swap, 1, 1);
+		dcp->edr_sent = false;
+	}
+}
+
 /*
  * The firmware's own client passes its IOUserClient pointer as an opaque
  * client identity; this one passes a cookie chosen at probe.
@@ -169,11 +227,19 @@ static const struct dcp_method_entry dcp_set_gamma_table_method = {
 	.tag = { 'A', '4', '2', '1' },
 };
 
+/* The peak luminance of the panel, in 16.16 nits. */
+static const struct dcp_method_entry dcp_max_panel_brightness_method = {
+	.name = "iomfbep_max_panel_brightness",
+	.tag = { 'A', '1', '2', '8' },
+};
+
 static_assert(sizeof(struct DCP_FW_NAME(dcp_swap)) == 0x588);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), swap_id) == 0x98);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), bl_update) == 0x354);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), bl_flags) == 0x358);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), bl_nits) == 0x35e);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), edr_scale) == 0x37e);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), edr_headroom) == 0x3e6);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), presents_surface) == 0x51e);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), has_completion) == 0x570);
 static_assert(sizeof(struct DCP_FW_NAME(dcp_surface)) == 0x22c);
@@ -2737,6 +2803,7 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 		if (dcp_backlight_desktop_prepare(dcp, resp->swap_id,
 						  have_surface, &nits))
 			dcp_swap_set_brightness(&DCP_FW_SWAP(dcp).swap, nits);
+		dcp_edr_prepare(dcp, &DCP_FW_SWAP(dcp).swap);
 	}
 #endif
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
@@ -3485,8 +3552,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		/*
 		 * On a PQ output the compositor has already encoded RGB
 		 * surfaces for the sink: BT.2020 primaries, PQ code values.
+		 * An EDR panel takes the same and maps them into its headroom.
 		 */
-		if (dcp->output_pq && !new_state->fb->format->is_yuv) {
+		if ((dcp->output_pq || dcp->output_edr) &&
+		    !new_state->fb->format->is_yuv) {
 			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
 			req->surf[l].base.xfer_func = DCP_XFER_FUNC_HDR;
 		}
@@ -3635,8 +3704,32 @@ static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 	complete(&dcp->start_done);
 }
 
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+static void res_max_panel_brightness(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	u32 peak = out ? get_unaligned_le32(out) >> 16 : 0;
+
+	/* Only a peak above the SDR range gives EDR headroom. */
+	if (peak > dcp->brightness.maximum && peak <= 10000) {
+		dev_info(dcp->dev, "panel peak luminance %u nits\n", peak);
+		WRITE_ONCE(dcp->panel.peak_nits, peak);
+	}
+	if (out)
+		dcp_is_main_display(dcp, false, res_is_main_display, NULL);
+	else
+		res_is_main_display(dcp, NULL, NULL);
+}
+#endif
+
 static void init_3(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+	if (dcp_has_panel(dcp)) {
+		dcp_push(dcp, false, &dcp_max_panel_brightness_method, 0,
+			 sizeof(u32), NULL, res_max_panel_brightness, NULL);
+		return;
+	}
+#endif
 	dcp_is_main_display(dcp, false, res_is_main_display, NULL);
 }
 

@@ -1020,6 +1020,15 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 		dcp->desktop->panel_metadata : dcp->desktop->panel_adt_identity;
 	*generation = dcp->desktop->panel_metadata_generation;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	/* PQ content is shown as EDR up to the peak (see dcp_edr_prepare()). */
+	if (READ_ONCE(dcp->panel.peak_nits)) {
+		metadata.pq = true;
+		metadata.static_metadata_type1 = true;
+		metadata.bt2020_rgb = true;
+		metadata.max_luminance = dcp->panel.peak_nits << 16;
+		metadata.max_fall = metadata.max_luminance;
+		metadata.min_luminance = 0;
+	}
 	/* The caller supplies the same retained catalog it is publishing. */
 	edid = size ? drm_edid_alloc(raw, size) :
 		dcp_panel_edid(&metadata, modes, count,

@@ -580,14 +580,20 @@ static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 
 /*
  * External displays can take a PQ BT.2020 signal where the firmware
- * offers one; dcp_crtc_atomic_check() refuses it elsewhere.
+ * offers one, and a desktop 26.x panel PQ content it shows as EDR;
+ * dcp_crtc_atomic_check() refuses it elsewhere.
  */
-static int apple_connector_attach_hdr(struct drm_connector *connector)
+static int apple_connector_attach_hdr(struct drm_connector *connector,
+				      bool panel_edr)
 {
 	const u32 colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
 	int ret;
 
 	switch (connector->connector_type) {
+	case DRM_MODE_CONNECTOR_eDP:
+		if (!panel_edr)
+			return 0;
+		fallthrough;
 	/* A desktop 26.x Type-C route is a pipeline output carrying DisplayPort. */
 	case DRM_MODE_CONNECTOR_USB:
 	case DRM_MODE_CONNECTOR_DisplayPort:
@@ -647,7 +653,8 @@ static int apple_connector_create(struct drm_device *drm,
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base);
+	ret = apple_connector_attach_hdr(&connector->base,
+					 dcp_fw_compat_is_desktop(dcp));
 	if (ret)
 		goto err_cleanup;
 
@@ -863,7 +870,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		ret = drm_connector_attach_vrr_capable_property(&connector->base);
 		if (ret)
 			return ret;
-		ret = apple_connector_attach_hdr(&connector->base);
+		ret = apple_connector_attach_hdr(&connector->base, false);
 		if (ret)
 			return ret;
 
