@@ -416,6 +416,7 @@ pub(crate) struct VmReadGuard(VmExecGuard);
 
 #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
 impl VmReadGuard {
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn covers_range(&mut self, address: u64, size: u64, read: bool, write: bool) -> bool {
         Vm::covers_range_locked(&mut self.0, address, size, read, write)
     }
