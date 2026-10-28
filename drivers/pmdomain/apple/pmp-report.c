@@ -1392,6 +1392,47 @@ static int apple_pmp_report_entry_power_off(struct generic_pm_domain *genpd)
 	return apple_pmp_report_entry_set_state(genpd, false);
 }
 
+static bool apple_pmp_report_entry_is_parent(struct device_node *np,
+					     struct device_node *parent)
+{
+	struct of_phandle_iterator it;
+	int err;
+
+	of_for_each_phandle(&it, err, np, "power-domains", "#power-domain-cells", -1) {
+		if (it.node == parent) {
+			of_node_put(it.node);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * True if the boot loader left a PMGR power state under @node on. That device
+ * is running, so its request stands from the start, and genpd only takes an
+ * active domain under an active parent.
+ */
+static bool apple_pmp_report_entry_child_on(struct device_node *node)
+{
+	struct device_node *np;
+	struct regmap *regmap;
+	u32 offset, val;
+
+	for_each_compatible_node(np, NULL, "apple,t8103-pmgr-pwrstate") {
+		if (!of_device_is_available(np) || !apple_pmp_report_entry_is_parent(np, node) ||
+		    of_property_read_u32(np, "reg", &offset))
+			continue;
+		regmap = syscon_node_to_regmap(np->parent);
+		if (IS_ERR(regmap) || regmap_read(regmap, offset, &val))
+			continue;
+		if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) == APPLE_PMGR_PS_ACTIVE) {
+			of_node_put(np);
+			return true;
+		}
+	}
+	return false;
+}
+
 static void apple_pmp_report_entry_free(struct apple_pmp_report_entry *ent)
 {
 	of_node_put(ent->report_node);
@@ -1424,6 +1465,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	int ret;
 	const char *name;
 	struct of_phandle_iterator it;
+	bool on;
 
 	ent = kzalloc_obj(*ent);
 	if (!ent)
@@ -1471,6 +1513,10 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 		apple_pmp_report_entry_set_state(&ent->genpd, true);
 	}
 
+	on = apple_pmp_report_entry_child_on(node);
+	if (on)
+		apple_pmp_report_entry_set_state(&ent->genpd, true);
+
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;
 	ent->genpd.power_off = apple_pmp_report_entry_power_off;
 	/*
@@ -1481,7 +1527,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,irq-safe"))
 		ent->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 
-	ret = pm_genpd_init(&ent->genpd, NULL, true);
+	ret = pm_genpd_init(&ent->genpd, NULL, !on);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "pm_genpd_init failed\n");
 		goto err_free;
