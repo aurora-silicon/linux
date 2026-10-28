@@ -51,6 +51,7 @@ pub(crate) const CONFIG: Config = Config {
         native_gpu_permissions: true,
     },
     region_c: &REGION_C,
+    chip: None,
     adopt_root_entries: false,
     fabric_bridge: false,
     // The firmware's per-slot recovery keys are not known for this build; recovery relies on
@@ -104,6 +105,7 @@ pub(crate) const CONFIG: Config = Config {
         cores: Some((2, 20)),
         operand_state: fw::compute::OperandState::TWO_BY_TEN,
         deflake: fw::render::Deflake::TWO_CLUSTERS,
+        compute_blocks: fw::freelist::COMPUTE_BLOCKS,
     },
 };
 

@@ -11,7 +11,7 @@ use crate::g17::{
     context::Context,
     fw::{
         channels::ControlRecord,
-        compute::{OperandState, COMPUTE_DESCRIPTOR_SIZE},
+        compute::{ComputeProgram, OperandState, COMPUTE_DESCRIPTOR_SIZE},
         queue::*,
         variant::PointerLayout,
     },
@@ -144,6 +144,7 @@ struct Graph {
     pointers: PointerLayout,
     /// Layout of the operand-state buffer for the GPU's cores.
     operand_state: &'static OperandState,
+    program: ComputeProgram,
 }
 
 impl Graph {
@@ -153,6 +154,7 @@ impl Graph {
         context: &Context,
         pointers: PointerLayout,
         operand_state: &'static OperandState,
+        program: ComputeProgram,
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
@@ -219,6 +221,7 @@ impl Graph {
             reclaimed: 0,
             pointers,
             operand_state,
+            program,
         })
     }
 
@@ -608,9 +611,10 @@ impl Queue {
         context: Arc<Context>,
         pointers: PointerLayout,
         operand_state: &'static OperandState,
+        program: ComputeProgram,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
-        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state)?;
+        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, program)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
@@ -1957,8 +1961,12 @@ pub(crate) trait Host {
     ) -> Result<qos::Publication>;
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
-    fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot)
-        -> Result;
+    fn register_queue(&mut self, queue: &crate::g17::fw::kick::KsmQueue) -> Result;
+    fn publish_outer(
+        &mut self,
+        priority: u8,
+        slot: &crate::g17::fw::channels::WorkSlot,
+    ) -> Result;
     fn notify(&mut self, message: u64) -> Result;
     fn note_submission(&mut self) -> Result;
 }
@@ -2042,6 +2050,7 @@ impl Queue {
             self.graph.ensure_record_slot(slot)?;
         }
         let args = ComputeArgs {
+            program: self.graph.program,
             intersection: *intersection,
             scratch: *scratch,
             usc_base: *usc_base,
@@ -2099,7 +2108,7 @@ impl Queue {
             },
             mcache: None,
             event_mask: COMPUTE_KICK_EVENT_MASK,
-            register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch)?,
+            register_arrays: ComputeDescriptor::register_bindings(descriptor_low, *scratch, self.graph.program)?,
             scs_enabled: scratch.enabled(),
             priority: policy.priority(),
         };
@@ -2161,9 +2170,16 @@ impl Queue {
                     NATIVE_WAIT_STRIDE, record)?;
                 wait_vas.push(address, GFP_KERNEL)?;
             }
+            let kick_ring_va = self.kick.low_va();
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;
             if first {
+                host.register_queue(&crate::g17::fw::kick::KsmQueue::new(
+                    qid,
+                    kick_ring_va,
+                    DataMaster::Compute,
+                    policy.priority(),
+                )?)?;
                 producer = self.graph.first_descriptor(descriptor_high)?;
                 host.prepare_compute_shared()?;
                 packet.mark_published();
