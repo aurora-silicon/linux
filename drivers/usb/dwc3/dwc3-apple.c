@@ -125,6 +125,7 @@
  * @idle_rpm: Let the controller runtime-suspend while the core is down
  * @rpm_held: The glue holds a runtime PM reference for the running core
  * @pre_core_rpm: Runtime PM is the glue's own until the first core bring-up
+ * @dt_dis_u3_susphy: The device tree keeps USB3 PHY suspend off itself
  * @drd_cfg: The controller's configuration block (optional, for its tunable)
  * @tunables: Controller tunables from the device tree, see dwc3_apple_tunable_list
  */
@@ -154,6 +155,7 @@ struct dwc3_apple {
 	bool idle_rpm;
 	bool rpm_held;
 	bool pre_core_rpm;
+	bool dt_dis_u3_susphy;
 
 	void __iomem *drd_cfg;
 	struct apple_tunable *tunables[DWC3_APPLE_NR_TUNABLES];
@@ -435,6 +437,8 @@ static int dwc3_apple_core_stop(struct dwc3_apple *appledwc)
 	lockdep_assert_held(&appledwc->lock);
 	if (appledwc->core_active) {
 		if (!appledwc->core_exit_pending) {
+			/* The PHY hands the PIPE back in P3, as it took it over */
+			dwc->dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
 			dwc3_enable_susphy(dwc, true);
 			dwc3_event_buffers_cleanup(dwc);
 			appledwc->core_exit_pending = true;
@@ -619,6 +623,7 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 	 * device mode and the T8132 host role were selected in dwc3_apple_core_start();
 	 * other host roles are selected by the xHCI root hub as it starts.
 	 */
+	appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
 	dwc3_enable_susphy(&appledwc->dwc, true);
 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
 	if (ret) {
@@ -626,6 +631,14 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
 			return ret;
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
+	} else if (host && appledwc->usb3_phy &&
+		   of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3")) {
+		/*
+		 * The T8132 PHY does not bring a SuperSpeed link back from U3 once
+		 * the core has suspended it: keep it out of P3 from here on.
+		 */
+		appledwc->dwc.dis_u3_susphy_quirk = true;
+		dwc3_enable_susphy(&appledwc->dwc, true);
 	} else if (appledwc->usb3_phy &&
 		   of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3")) {
 		dwc3_apple_usb3_pipe_reset(appledwc);
@@ -728,6 +741,8 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		appledwc->state = DWC3_APPLE_NO_CABLE;
 		break;
 	case DWC3_APPLE_HOST:
+		/* dwc3_host_exit() lets the USB3 PHY into P3 for the PIPE handback */
+		appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
 		dwc3_host_exit(&appledwc->dwc);
 		appledwc->state = DWC3_APPLE_NO_CABLE;
 		break;
@@ -855,6 +870,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
 	appledwc->host_only = dwc3_apple_host_only(dev);
+	appledwc->dt_dis_u3_susphy = device_property_read_bool(dev, "snps,dis_u3_susphy_quirk");
 	/* The PHY driver and the DARTs follow runtime PM on these SoCs. */
 	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
 			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
