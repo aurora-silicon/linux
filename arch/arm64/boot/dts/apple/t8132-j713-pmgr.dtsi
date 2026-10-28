@@ -385,7 +385,7 @@
 	status = "disabled";
 };
 
-/* No camera driver yet; genpd powers the ISP down as an unused domain. */
+/* The camera powers the ISP from its first stream until it is unbound. */
 &ps_isp_sys {
 	status = "okay";
 };
