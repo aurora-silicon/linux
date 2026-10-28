@@ -120,6 +120,24 @@
 		label = "pmgr_soc_ocla";
 	};
 
+	ps_ispsens0: power-controller@188 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x188 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens0";
+		status = "disabled";
+	};
+
+	ps_ispsens1: power-controller@190 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x190 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens1";
+		status = "disabled";
+	};
+
 	ps_ap_tmm: power-controller@1b8 {
 		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x1b8 4>;
@@ -883,6 +901,137 @@
 		#reset-cells = <0>;
 		label = "sep";
 		apple,always-on;
+	};
+
+	/* The ISP's own power states, children of ISP_SYS */
+	ps_isp_cpu: power-controller@4000 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+		power-domains = <&ps_isp_sys>;
+		status = "disabled";
+	};
+
+	ps_isp_cpu_core0: power-controller@4008 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core0";
+		power-domains = <&ps_isp_cpu>;
+		status = "disabled";
+	};
+
+	ps_isp_cpu_core1: power-controller@4010 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core1";
+		power-domains = <&ps_isp_cpu>;
+		status = "disabled";
+	};
+
+	ps_isp_fe: power-controller@4018 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+		power-domains = <&ps_isp_sys>;
+		status = "disabled";
+	};
+
+	ps_isp_dprx: power-controller@4020 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
+		status = "disabled";
+	};
+
+	ps_isp_secure: power-controller@4028 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_secure";
+		power-domains = <&ps_isp_fe>;
+		status = "disabled";
+	};
+
+	ps_isp_sts0: power-controller@4030 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts0";
+		power-domains = <&ps_isp_fe>;
+		status = "disabled";
+	};
+
+	ps_isp_sts1: power-controller@4038 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts1";
+		power-domains = <&ps_isp_fe>;
+		status = "disabled";
+	};
+
+	ps_isp_pearl: power-controller@4040 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4040 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_pearl";
+		power-domains = <&ps_isp_fe>;
+		status = "disabled";
+	};
+
+	ps_isp_be: power-controller@4048 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
+		status = "disabled";
+	};
+
+	ps_isp_clr: power-controller@4050 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
+		status = "disabled";
+	};
+
+	ps_isp_cvd: power-controller@4058 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4058 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvd";
+		power-domains = <&ps_isp_be>;
+		status = "disabled";
+	};
+
+	ps_isp_cvm: power-controller@4060 {
+		compatible = "apple,t8132-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4060 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cvm";
+		power-domains = <&ps_isp_cvd>;
+		status = "disabled";
 	};
 
 	ps_venc_dma: power-controller@8000 {
