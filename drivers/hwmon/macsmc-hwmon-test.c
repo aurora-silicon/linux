@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * KUnit tests for the Apple SMC hwmon driver: channel numbering of the
- * temperature sensors, which thermal zones depend on, and manual fan control.
+ * temperature sensors, which thermal zones depend on, and manual fan control
+ * by userspace and by the thermal framework.
  *
  * Included by macsmc-hwmon.c.
  */
@@ -217,6 +218,9 @@ static int macsmc_fan_test_init(struct kunit *test)
 	t->hwmon.fan.count = 2;
 	t->hwmon.fan.unlock_key = SMC_KEY(Ftst);
 	mutex_init(&t->hwmon.fan.lock);
+	INIT_WORK(&t->hwmon.fan.cool_work, macsmc_hwmon_fans_cool_work);
+	for (i = 0; i < 2; i++)
+		t->fans[i].hwmon = &t->hwmon;
 	test->priv = t;
 	fan_control = true;
 	kunit_activate_static_stub(test, apple_smc_read, fan_test_read);
@@ -326,6 +330,99 @@ static void macsmc_fan_test_legacy(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->refused, 0);
 }
 
+/* Cooling states spread over [min, max]; 0 asks for nothing. */
+static void macsmc_fan_test_state_rpm(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777, 0), 0);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777, 1), 1350);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777, 4), 3247);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777,
+							 MACSMC_FAN_COOLING_STATES), 5777);
+	/* Never past the maximum, whatever the state. */
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fan_state_rpm(1350, 5777,
+							 MACSMC_FAN_COOLING_STATES + 5), 5777);
+}
+
+/* Cooling needs no fan_control: unlock for a state, release at state 0. */
+static void macsmc_fan_test_cooling(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+
+	fan_control = false;
+	t->fans[0].cool_state = 1;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	KUNIT_EXPECT_EQ(test, t->ftst, 1);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
+	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F1350);
+	/* The other fan asks for nothing and stays with the firmware. */
+	KUNIT_EXPECT_EQ(test, t->mode[1], MACSMC_FAN_MODE_AUTO);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].manual);
+
+	t->fans[0].cool_state = MACSMC_FAN_COOLING_STATES;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
+	KUNIT_EXPECT_EQ(test, t->ftst_writes, 1);
+
+	t->fans[0].cool_state = 0;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	fan_test_released(test, t);
+}
+
+/* A fan runs at the higher of the userspace target and the cooling state. */
+static void macsmc_fan_test_cooling_and_user(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
+	t->fans[0].cool_state = 1;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F2500);
+
+	t->fans[0].cool_state = MACSMC_FAN_COOLING_STATES;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
+	/* Userspace cannot take the fan below what cooling asks for. */
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 1350), 0);
+	KUNIT_EXPECT_EQ(test, t->target[0], FAN_TEST_F5777);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
+
+	t->fans[0].cool_state = 0;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	fan_test_released(test, t);
+}
+
+/* Once stopped (suspend, shutdown, removal), no state takes a fan back. */
+static void macsmc_fan_test_cooling_stopped(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+
+	t->fans[0].cool_state = 4;
+	t->fans[1].cool_state = 4;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 2);
+
+	macsmc_hwmon_fans_stop(&t->hwmon);
+	fan_test_released(test, t);
+
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	fan_test_released(test, t);
+	KUNIT_EXPECT_EQ(test, t->ftst_writes, 2);
+}
+
+/* A failed unlock leaves the fan with the firmware. */
+static void macsmc_fan_test_cooling_unlock_fails(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+
+	t->fail_key = SMC_KEY(Ftst);
+	t->fans[0].cool_state = MACSMC_FAN_COOLING_STATES;
+	macsmc_hwmon_fans_apply(&t->hwmon);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_SYSTEM);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+	KUNIT_EXPECT_FALSE(test, t->hwmon.fan.unlocked);
+}
+
 static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_unlock_and_release),
 	KUNIT_CASE(macsmc_fan_test_clamp),
@@ -333,6 +430,11 @@ static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_two_fans),
 	KUNIT_CASE(macsmc_fan_test_no_unlock_key),
 	KUNIT_CASE(macsmc_fan_test_legacy),
+	KUNIT_CASE(macsmc_fan_test_state_rpm),
+	KUNIT_CASE(macsmc_fan_test_cooling),
+	KUNIT_CASE(macsmc_fan_test_cooling_and_user),
+	KUNIT_CASE(macsmc_fan_test_cooling_stopped),
+	KUNIT_CASE(macsmc_fan_test_cooling_unlock_fails),
 	{}
 };
 
