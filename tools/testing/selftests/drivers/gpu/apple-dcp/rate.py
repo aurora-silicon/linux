@@ -8,7 +8,7 @@ from common import block, source_defines, apple_function, internal_inline, firmw
 def parser_fixture(root):
 
     base = root / 'drivers/gpu/drm/apple'
-    fixture = {'MaxHorizontalImageSize': 60, 'MaxVerticalImageSize': 33, 'Chromaticity': {'Red': {'X': 44608, 'Y': 20288}, 'Green': {'X': 16960, 'Y': 40448}, 'Blue': {'X': 9344, 'Y': 5184}}, 'DefaultWhitePoint': {'X': 20544, 'Y': 21568, 'Gamma': 144179}, 'WhitePoints': [{'X': 20544, 'Y': 21568, 'Gamma': 144179}], 'DefaultColorSpaceIsSRGB': True, 'SupportsPQEOTF': True, 'ProductAttributes': {'LegacyManufacturerID': 1138, 'ProductID': 2895, 'SerialNumber': 305419896, 'WeekOfManufacture': 7, 'YearOfManufacture': 2013, 'AlphanumericSerialNumber': 'ANON000000001', 'ProductName': 'QG270 S3', 'ManufacturerID': 'ACR'}}
+    fixture = {'MaxHorizontalImageSize': 60, 'MaxVerticalImageSize': 33, 'Chromaticity': {'Red': {'X': 44608, 'Y': 20288}, 'Green': {'X': 16960, 'Y': 40448}, 'Blue': {'X': 9344, 'Y': 5184}}, 'DefaultWhitePoint': {'X': 20544, 'Y': 21568, 'Gamma': 144179}, 'WhitePoints': [{'X': 20544, 'Y': 21568, 'Gamma': 144179}], 'DefaultColorSpaceIsSRGB': True, 'SupportsPQEOTF': True, 'SupportsHLGEOTF': False, 'SupportsHDRStaticMetadataType1': True, 'SupportsBT2020RGB': 512, 'Luminance': {'Max': 27375011, 'MaxFrameAverage': 25652679, 'Min': 5154}, 'ProductAttributes': {'LegacyManufacturerID': 1138, 'ProductID': 2895, 'SerialNumber': 305419896, 'WeekOfManufacture': 7, 'YearOfManufacture': 2013, 'AlphanumericSerialNumber': 'ANON000000001', 'ProductName': 'QG270 S3', 'ManufacturerID': 'ACR'}}
 
 
     class ObjectPairs(list):
@@ -69,6 +69,26 @@ def parser_fixture(root):
     timing_raw = bytearray(struct.pack('<I', 0xd3))
     wire(timing_fixture, timing_raw)
     timing_source = 'static const unsigned char timing_blob[] = {' + ','.join(map(str,timing_raw)) + '};\n'
+    # A desktop timing with PQ elements: 10-bit preferred, unsafe ones skipped.
+    def color(i, score, depth, eotf, colorimetry, encoding=0, dynamic=0):
+        return {"ID": i, "Score": score, "IsVirtual": False, "PixelEncoding": encoding,
+                "Colorimetry": colorimetry, "Depth": depth, "DynamicRange": dynamic, "EOTF": eotf}
+    pq_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(85, 1, 10, 0, 10), color(90, 5, 10, 2, 9), color(91, 9, 12, 2, 9),
+        color(92, 20, 10, 2, 9), color(93, 30, 10, 2, 9, dynamic=1), color(94, 40, 10, 2, 7, encoding=3),
+        color(95, 50, 12, 2, 7, encoding=2)],
+        UnsafeColorElementIDs=[92])]
+    pq_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(pq_fixture, pq_raw)
+    timing_source += 'static const unsigned char pq_blob[] = {' + ','.join(map(str,pq_raw)) + '};\n'
+    # Without link bandwidth for PQ RGB: YCbCr 4:4:4 BT.2020, never 4:2:2.
+    ycc_fixture = [dict(timing_fixture[0], ColorModes=[
+        color(85, 1, 10, 0, 10), color(95, 5, 12, 2, 7, encoding=2), color(96, 9, 10, 2, 7, encoding=2),
+        color(97, 20, 12, 2, 7, encoding=3), color(98, 30, 10, 2, 9)],
+        UnsafeColorElementIDs=[96, 98])]
+    ycc_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(ycc_fixture, ycc_raw)
+    timing_source += 'static const unsigned char ycc_blob[] = {' + ','.join(map(str,ycc_raw)) + '};\n'
     proof_checks = []
     for path, value, count in [
         (("IsPreferred",), None, 1), (("IsPreferred",), False, 1),
@@ -153,6 +173,23 @@ typedef u32 __le32;
 #define max_t(t,a,b) max((t)(a),(t)(b))
 #define div_u64(n,d) ((n)/(d))
 #define DIV_ROUND_UP_ULL(n,d) (((u64)(n)+(d)-1)/(d))
+/* lib/math: log2 in 8.24 fixed point and the integer square root */
+static __attribute__((unused)) unsigned int intlog2(u32 value)
+{
+    unsigned int whole = 31 - __builtin_clz(value), fraction = 0;
+    u64 y = ((u64)value << 31) >> whole;
+    for (int bit = 23; bit >= 0; bit--) {
+        y = (y * y) >> 31;
+        if (y >= 1ULL << 32) { y >>= 1; fraction |= 1U << bit; }
+    }
+    return whole << 24 | fraction;
+}
+static __attribute__((unused)) unsigned long int_sqrt(unsigned long x)
+{
+    unsigned long r = 0;
+    while ((r + 1) * (r + 1) <= x) r++;
+    return r;
+}
 #define trace_iomfb_color_mode(...) ((void)0)
 #define trace_iomfb_parse_mode_fail(...) ((void)0)
 #define trace_iomfb_parse_mode_success(...) ((void)0)
@@ -174,21 +211,25 @@ struct drm_display_mode {
 static void drm_mode_set_name(struct drm_display_mode *mode) { (void)mode; }
 '''
     stubs = r'''
-struct drm_edid { struct edid raw; };
+struct drm_edid { struct edid raw; u8 cta[128]; size_t size; };
 static const struct drm_edid *drm_edid_alloc(const void *data, size_t size)
 {
-    assert(size == 128);
-    struct drm_edid *result = malloc(sizeof(*result));
+    assert(size == 128 || size == 256);
+    struct drm_edid *result = calloc(1, sizeof(*result));
     memcpy(&result->raw, data, size);
+    result->size = size;
     return result;
 }
 static void drm_edid_free(const struct drm_edid *edid) { free((void *)edid); }
 static bool drm_edid_valid(const struct drm_edid *edid)
 {
     const u8 *raw = (const u8 *)&edid->raw;
-    unsigned int sum = 0;
-    for (unsigned int i = 0; i < 128; i++) sum += raw[i];
-    return !(sum & 255) && !raw[126] && !memcmp(raw, "\0\xff\xff\xff\xff\xff\xff\0", 8);
+    for (size_t block = 0; block < edid->size; block += 128) {
+        unsigned int sum = 0;
+        for (unsigned int i = 0; i < 128; i++) sum += raw[block + i];
+        if (sum & 255) return false;
+    }
+    return raw[126] == edid->size / 128 - 1 && !memcmp(raw, "\0\xff\xff\xff\xff\xff\xff\0", 8);
 }
 '''
     suffix = r'''
@@ -234,6 +275,25 @@ int main(int argc, char **argv)
     assert(!dcp_property_complete(NULL,0,0));
     epochs();
     timing_proof();
+    {
+        struct dcp_parse_ctx c; unsigned int n = 0;
+        assert(!parse(pq_blob, sizeof(pq_blob), &c));
+        struct dcp_display_mode *m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+        assert(!IS_ERR(m) && n == 1);
+        assert(m[0].pq.score == 5 && m[0].pq.id == 90 && m[0].pq.depth == 10);
+        assert(m[0].color_mode_id == 85);
+        free(m);
+        assert(!parse(ycc_blob, sizeof(ycc_blob), &c));
+        m = enumerate_modes(&c, &n, 600, 330, 0, false, false);
+        assert(!IS_ERR(m) && n == 1 && m[0].pq.id == 95 && m[0].pq.depth == 12);
+        assert(m[0].color_mode_id == 85);
+        free(m);
+        /* The external SDR path collects no PQ element. */
+        assert(!parse(pq_blob, sizeof(pq_blob), &c));
+        m = enumerate_modes(&c, &n, 600, 330, 0, false, true);
+        assert(!IS_ERR(m) && n == 1 && m[0].pq.score < 0);
+        free(m);
+    }
     FILE *f = fopen(argv[1], "rb");
     assert(f && !fseek(f, 0, SEEK_END));
     long length = ftell(f);
@@ -271,11 +331,29 @@ int main(int argc, char **argv)
     assert(mode.flags == (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC));
     assert(mode.clock == 148500 && mode.hdisplay == 1920 && mode.vdisplay == 1080);
     free(timings);
+    /* The sink's HDR capability, as the firmware reports it. */
+    assert(metadata.pq && metadata.static_metadata_type1 && metadata.bt2020_rgb);
+    assert(metadata.max_luminance == 27375011 && metadata.max_fall == 25652679 &&
+           metadata.min_luminance == 5154);
     const struct drm_edid *edid = dcp_metadata_edid(&metadata, &mode);
-    assert(!IS_ERR(edid));
+    assert(!IS_ERR(edid) && edid->size == 256);
     f = fopen(argv[3], "wb"); assert(f);
-    assert(fwrite(&edid->raw, 128, 1, f) == 1); fclose(f);
+    assert(fwrite(&edid->raw, edid->size, 1, f) == 1); fclose(f);
     drm_edid_free(edid);
+    {
+        struct dcp_display_metadata sdr = metadata;
+        sdr.pq = false;
+        edid = dcp_metadata_edid(&sdr, &mode);
+        assert(!IS_ERR(edid) && edid->size == 128 && !((const u8 *)&edid->raw)[126]);
+        drm_edid_free(edid);
+        /* No luminance range: the HDR block stops after its descriptors. */
+        sdr = metadata;
+        sdr.max_luminance = 0; sdr.bt2020_rgb = false;
+        edid = dcp_metadata_edid(&sdr, &mode);
+        assert(!IS_ERR(edid) && edid->size == 256);
+        assert(!memcmp(edid->cta, "\x02\x03\x08\x00\xe3\x06\x05\x01", 8));
+        drm_edid_free(edid);
+    }
     mode.flags = 0;
     assert(IS_ERR(dcp_metadata_edid(&metadata, &mode)));
     mode.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC;
@@ -1136,7 +1214,14 @@ def metadata(root, output):
 
 def check_metadata(output):
     raw = (output / 'metadata-inputs/edid').read_bytes()
-    assert len(raw) == 128 and sum(raw) % 256 == 0 and raw[126] == 0
+    assert len(raw) == 256 and sum(raw[:128]) % 256 == 0 and raw[126] == 1
+    # CTA-861: colorimetry BT.2020 RGB; HDR static metadata SDR+PQ, type 1,
+    # 417.7/391.4 cd/m2 (codes 98/95) and 0.0786 cd/m2 (code 35)
+    cta = raw[128:]
+    assert sum(cta) % 256 == 0 and cta[:4] == bytes([2, 3, 15, 0])
+    assert cta[4:15] == bytes([0xe3, 0x05, 0x80, 0x00, 0xe6, 0x06, 0x05, 0x01, 98, 95, 35])
+    assert cta[15:127] == bytes(112)
+    raw = raw[:128]
     assert raw[:8] == bytes.fromhex('00ffffffffffff00')
     assert raw[8:10] == struct.pack('>H', 1138)
     assert raw[21:24] == bytes([60, 33, 120])

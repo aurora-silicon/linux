@@ -131,6 +131,8 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr_444;
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
+	/* The timing's PQ BT.2020 element, usable without DSC (score -1 if none) */
+	struct dcp_color_mode pq;
 	bool vrr;
 	/* ProMotion fixed timings still need presentation deadlines. */
 	bool needs_timestamps;

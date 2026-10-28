@@ -553,19 +553,61 @@ static int parse_timing_color_restrictions(struct dcp_parse_ctx *handle,
 	return 0;
 }
 
+/*
+ * An HDR output scans out through a PQ BT.2020 element.  Prefer RGB, which
+ * needs no conversion, then 10 bits per component, which is what an HDR
+ * framebuffer carries; a timing without link bandwidth for PQ RGB may still
+ * offer YCbCr 4:4:4, which the processor converts the RGB surfaces to.
+ */
+static unsigned int pq_mode_rank(const struct color_mode *cmode)
+{
+	unsigned int rank;
+
+	if (cmode->eotf != DCP_EOTF_ST_2084)
+		return 0;
+	if (cmode->pixel_encoding == DCP_COLOR_FORMAT_RGB &&
+	    cmode->colorimetry == DCP_COLORIMETRY_BT2020_RGB &&
+	    cmode->dynamic_range == DCP_COLOR_YCBCR_RANGE_FULL)
+		rank = 3;
+	else if (cmode->pixel_encoding == DCP_COLOR_FORMAT_YCBCR444 &&
+		 cmode->colorimetry == DCP_COLORIMETRY_BT2020_YCC)
+		rank = 1;
+	else
+		return 0;
+	return rank + (cmode->depth == 10);
+}
+
+static void collect_pq_mode(struct dcp_color_mode *pq, unsigned int *best_rank,
+			    struct color_mode *cmode,
+			    const struct timing_color_restrictions *limits)
+{
+	unsigned int rank = pq_mode_rank(cmode);
+
+	if (!rank || rank < *best_rank ||
+	    timing_color_contains(&limits->unsafe, cmode->id) ||
+	    timing_color_contains(&limits->dsc_required, cmode->id))
+		return;
+	if (rank > *best_rank)
+		pq->score = -1;
+	fill_color_mode(pq, cmode);
+	*best_rank = rank;
+}
+
 static int parse_color_modes(struct dcp_parse_ctx *handle,
 			     struct dcp_display_mode *out, bool external_sdr,
 			     const struct timing_color_restrictions *limits,
+			     bool limits_known,
 			     struct dcp_color_mode *unsafe_rgb8)
 {
 	struct iterator outer_it;
 	struct dcp_color_mode bootstrap = { .score = -1 };
-	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0;
+	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0, best_pq_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
 	out->sdr.score = -1;
 	out->best.score = -1;
+	out->pq.score = -1;
 	out->has_bootstrap = false;
 
 	ret = iterator_begin(handle, &outer_it, false);
@@ -648,6 +690,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.depth, cmode.colorimetry,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
+
+		if (limits_known && !external_sdr)
+			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits);
 
 		if (external_sdr) {
 			unsigned int rank;
@@ -735,6 +780,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	bool have_preferred = false, have_interlaced = false;
 	bool is_preferred = false;
 	bool timing_keys = external_sdr || handle->metadata_timing;
+	bool limits_known;
 	struct drm_display_mode *mode = &out->mode;
 
 	*out = (struct dcp_display_mode) {
@@ -742,17 +788,21 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		.sdr_444.score = -1,
 		.sdr.score = -1,
 		.best.score = -1,
+		.pq.score = -1,
 	};
 	*score = -1;
 	handle->ambiguous_180hz = false;
 
-	if (external_sdr) {
+	/* ColorModes can precede either list: collect restrictions first. */
+	{
 		struct dcp_parse_ctx scan = *handle;
 
-		/* ColorModes can precede either list: collect restrictions first. */
 		ret = parse_timing_color_restrictions(&scan, &limits);
-		if (ret)
+		if (external_sdr && ret)
 			return ret;
+		/* Elsewhere only the PQ element needs them: none without. */
+		limits_known = !ret;
+		ret = 0;
 	}
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
@@ -791,6 +841,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			ret = parse_int_bound(it.handle, &max_vrr, 0, U32_MAX);
 		} else if (!strcmp(key, "ColorModes"))
 			ret = parse_color_modes(it.handle, out, external_sdr, &limits,
+					limits_known,
 					handle->automatic_1080p180_rgb8 ?
 					&unsafe_rgb8 : NULL);
 		else if (!strcmp(key, "ID"))
@@ -1444,6 +1495,62 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle,
 	return 0;
 }
 
+/* The sink's luminance range, in 16.16 cd/m2; a malformed one reads as unknown. */
+static int parse_metadata_luminance(struct dcp_parse_ctx *handle,
+				    struct dcp_display_metadata *out)
+{
+	struct dcp_parse_ctx at = *handle;
+	u32 values[3] = {};
+	struct iterator it;
+	unsigned int seen = 0;
+	int ret = iterator_begin(handle, &it, true);
+
+	for (; !ret && it.idx < it.len; it.idx++) {
+		static const char * const keys[] = { "Max", "MaxFrameAverage", "Min" };
+		char key[64];
+		unsigned int i;
+
+		ret = parse_metadata_string(handle, key, sizeof(key));
+		if (ret)
+			break;
+		for (i = 0; i < ARRAY_SIZE(keys); i++)
+			if (!strcmp(key, keys[i]))
+				break;
+		if (i == ARRAY_SIZE(keys)) {
+			ret = skip(handle);
+		} else if (seen & (1U << i)) {
+			ret = -EINVAL;
+		} else {
+			seen |= 1U << i;
+			ret = parse_metadata_number(handle, &values[i], 0, U32_MAX);
+		}
+	}
+	if (!ret && seen == 7 && values[0] && values[1] <= values[0] &&
+	    values[2] < values[0]) {
+		out->max_luminance = values[0];
+		out->max_fall = values[1];
+		out->min_luminance = values[2];
+		return 0;
+	}
+	*handle = at;
+	return skip(handle);
+}
+
+/* A nonzero BT.2020 capability; its value is a firmware bit, not a CTA one. */
+static int parse_metadata_capability(struct dcp_parse_ctx *handle, bool *out)
+{
+	struct dcp_parse_ctx at = *handle;
+	s64 value;
+
+	if (!parse_int(handle, &value)) {
+		*out = value > 0;
+		return 0;
+	}
+	*handle = at;
+	*out = false;
+	return skip(handle);
+}
+
 int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out)
 {
 	struct dcp_display_metadata parsed = {};
@@ -1484,6 +1591,14 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 				return -EINVAL;
 			seen |= 16;
 			ret = parse_metadata_product(handle, &parsed, false);
+		} else if (!strcmp(key, "SupportsPQEOTF")) {
+			ret = parse_bool_or_skip(handle, &parsed.pq);
+		} else if (!strcmp(key, "SupportsHDRStaticMetadataType1")) {
+			ret = parse_bool_or_skip(handle, &parsed.static_metadata_type1);
+		} else if (!strcmp(key, "SupportsBT2020RGB")) {
+			ret = parse_metadata_capability(handle, &parsed.bt2020_rgb);
+		} else if (!strcmp(key, "Luminance")) {
+			ret = parse_metadata_luminance(handle, &parsed);
 		} else {
 			ret = skip(handle);
 		}

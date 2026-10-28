@@ -3073,11 +3073,17 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	}
 
+	/* An HDR commit scans out through the timing's PQ element. */
+	if (dcp->pq_requested && mode->pq.score >= 0)
+		mode->color_mode_id = mode->pq.id;
+
 	dev_dbg(dcp->dev,
 		"set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		mode->color_mode_id, mode->timing_mode_id,
 		DRM_MODE_ARG(&crtc_state->mode));
-	if (mode->color_mode_id == mode->sdr_rgb.id)
+	if (mode->color_mode_id == mode->pq.id && mode->pq.score >= 0)
+		cmode = &mode->pq;
+	else if (mode->color_mode_id == mode->sdr_rgb.id)
 		cmode = &mode->sdr_rgb;
 	else if (mode->color_mode_id == mode->sdr_444.id)
 		cmode = &mode->sdr_444;
@@ -3095,6 +3101,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.color_mode_id = mode->color_mode_id,
 		.timing_mode_id = mode->timing_mode_id
 	};
+	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* VRR modes need swap timestamps, see iomfb_flush(); ProMotion fixed 120 too. */
 	dcp->use_timestamps = mode->needs_timestamps;
@@ -3280,11 +3287,17 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -EIO;
 	}
 
+	/* An HDR commit scans out through the timing's PQ element. */
+	if (dcp->pq_requested && mode->pq.score >= 0)
+		mode->color_mode_id = mode->pq.id;
+
 	dev_info(dcp->dev,
 		 "set_digital_out_mode(color:%d timing:%d) " DRM_MODE_FMT "\n",
 		 mode->color_mode_id, mode->timing_mode_id,
 		 DRM_MODE_ARG(&crtc_state->mode));
-	if (mode->color_mode_id == mode->sdr_rgb.id)
+	if (mode->color_mode_id == mode->pq.id && mode->pq.score >= 0)
+		cmode = &mode->pq;
+	else if (mode->color_mode_id == mode->sdr_rgb.id)
 		cmode = &mode->sdr_rgb;
 	else if (mode->color_mode_id == mode->sdr_444.id)
 		cmode = &mode->sdr_444;
@@ -3303,6 +3316,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.color_mode_id = mode->color_mode_id,
 		.timing_mode_id = mode->timing_mode_id
 	};
+	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->vrr && dcp->main_display;
@@ -3467,6 +3481,15 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
+
+		/*
+		 * On a PQ output the compositor has already encoded RGB
+		 * surfaces for the sink: BT.2020 primaries, PQ code values.
+		 */
+		if (dcp->output_pq && !new_state->fb->format->is_yuv) {
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
+			req->surf[l].base.xfer_func = DCP_XFER_FUNC_HDR;
+		}
 
 #if DCP_FW_H17(DCP_FW_VER)
 		/* H17P external SDR RGB needs an sRGB source tag. Native

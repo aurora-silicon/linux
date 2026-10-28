@@ -539,6 +539,9 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	/* The mode set asks for a PQ signal; output_pq: the one set carries it. */
+	bool pq_requested;
+	bool output_pq;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */

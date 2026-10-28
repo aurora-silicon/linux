@@ -1449,6 +1449,9 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	struct drm_crtc_state *crtc_state;
 	bool needs_modeset;
 
+	if (dcp_crtc_check_hdr(dcp, crtc, commit))
+		return -EINVAL;
+
 	if (iomfb_is_m4(dcp)) {
 		struct drm_display_mode mode;
 		int ret = iomfb_m4_error(dcp);

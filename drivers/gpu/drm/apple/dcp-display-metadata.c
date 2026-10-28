@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <linux/err.h>
+#include <linux/int_log.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/string.h>
@@ -186,16 +187,80 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 	return 0;
 }
 
+/* CTA-861.3 luminance code value: 50 * 2^(cv / 32) cd/m2. */
+static u8 dcp_metadata_luminance_code(u32 luminance)
+{
+	s64 log;
+
+	if (luminance <= 50U << 16)
+		return 0;
+	log = (s64)intlog2(luminance) - intlog2(50U << 16);
+	return min(DIV_ROUND_CLOSEST_ULL(32 * log, 1U << 24), 255ULL);
+}
+
+/*
+ * A CTA-861 extension carrying what an HDR compositor looks for: the
+ * colorimetry and HDR static metadata data blocks.  It describes only what
+ * the driver can output, an SDR or a PQ BT.2020 signal, and the sink's
+ * own luminance range.
+ */
+static void dcp_metadata_cta(u8 *cta, const struct dcp_display_metadata *metadata)
+{
+	u8 *db = cta + 4, checksum = 0;
+
+	memset(cta, 0, EDID_LENGTH);
+	cta[0] = 0x02;		/* CTA extension tag */
+	cta[1] = 0x03;		/* revision 3 */
+	if (metadata->bt2020_rgb) {
+		*db++ = 7 << 5 | 3;	/* extended tag, three bytes */
+		*db++ = 0x05;		/* colorimetry data block */
+		*db++ = 0x80;		/* BT.2020 RGB */
+		*db++ = 0;
+	}
+	*db++ = 7 << 5 | (metadata->max_luminance ? 6 : 3);
+	*db++ = 0x06;			/* HDR static metadata data block */
+	*db++ = 0x05;		/* traditional SDR and SMPTE ST 2084 */
+	*db++ = metadata->static_metadata_type1;	/* static metadata type 1 */
+	if (metadata->max_luminance) {
+		unsigned long square, code;
+
+		*db++ = dcp_metadata_luminance_code(metadata->max_luminance);
+		*db++ = dcp_metadata_luminance_code(metadata->max_fall);
+		/* min = max * (cv / 255)^2 / 100, cv rounded to the nearest */
+		square = div_u64((u64)metadata->min_luminance * 100 * 255 * 255,
+				 metadata->max_luminance);
+		code = int_sqrt(square);
+		if (square - code * code > code)
+			code++;
+		*db++ = min(code, 255UL);
+	}
+	cta[2] = db - cta;	/* no detailed timings follow */
+	for (unsigned int i = 0; i < EDID_LENGTH - 1; i++)
+		checksum += cta[i];
+	cta[EDID_LENGTH - 1] = -checksum;
+}
+
 const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
 					 const struct drm_display_mode *mode)
 {
-	struct edid block;
+	struct {
+		struct edid base;
+		u8 cta[EDID_LENGTH];
+	} block;
 	const struct drm_edid *edid;
-	int ret = dcp_metadata_block(&block, metadata, mode);
+	size_t size = sizeof(block.base);
+	int ret = dcp_metadata_block(&block.base, metadata, mode);
 
 	if (ret)
 		return ERR_PTR(ret);
-	edid = drm_edid_alloc(&block, sizeof(block));
+	/* The sink's HDR capability, when the firmware reports a PQ one. */
+	if (metadata->pq) {
+		block.base.extensions = 1;
+		block.base.checksum -= 1;
+		dcp_metadata_cta(block.cta, metadata);
+		size = sizeof(block);
+	}
+	edid = drm_edid_alloc(&block, size);
 	if (!edid)
 		return ERR_PTR(-ENOMEM);
 	if (!drm_edid_valid(edid)) {
