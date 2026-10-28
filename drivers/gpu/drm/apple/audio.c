@@ -670,6 +670,75 @@ static bool dcpaud_holds(struct dcp_audio *dcpaud)
 }
 
 /*
+ * A change of sample rate or sample size with an unchanged channel layout
+ * replaces the link with a new one, which this sink mutes just as it does a
+ * same-format restart. PipeWire changes the rate to follow its streams
+ * (44.1 kHz music, 48 kHz video). macOS runs the link at one nominal rate
+ * and format and converts the streams to it; so does this driver while it
+ * holds links: the PCM offers one rate (48 kHz, else 44.1 or 32 kHz) and one
+ * sample size (24 bits, else 16), both of one element that takes them in
+ * stereo, and userspace resamples. Channel layouts stay free: a layout
+ * change is heard.
+ *
+ * The pair covers every layout, not only the stereo that links are held in:
+ * userspace commonly sets the sample format before the channel count, and a
+ * pair applied only once a stream is stereo let it set a format that then
+ * ruled stereo out (PipeWire built no HDMI sink).
+ */
+static int dcpaud_pin_rate_format(struct dcp_audio *dcpaud,
+				  struct snd_pcm_runtime *runtime)
+{
+	static const unsigned int rates[] = { 48000, 44100, 32000 };
+	static const snd_pcm_format_t formats[] = {
+		SNDRV_PCM_FORMAT_S24_LE, SNDRV_PCM_FORMAT_S16_LE,
+	};
+	struct dcp_sound_format_mask sieve = {
+		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE,
+		.rates = GENMASK(snd_pcm_known_rates.count - 1, 0),
+		.nchans = BIT(2),
+	};
+	struct dcp_sound_format_mask hits = { 0, 0, 0 };
+	struct dcp_parse_ctx elements = {
+		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
+		.blob = dcpaud->elements + 4,
+		.len = dcpaud_elements_size(dcpaud) - 4,
+		.pos = 0,
+		.v14_7_audio = dcpaud->native_link,
+	};
+	unsigned int rate = 0, rate_bit = 0, i, j;
+	int ret;
+
+	parse_sound_constraints(&elements, &sieve, &hits);
+	for (i = 0; i < ARRAY_SIZE(rates) && !rate; i++)
+		for (j = 0; j < snd_pcm_known_rates.count; j++)
+			if (snd_pcm_known_rates.list[j] == rates[i] && (hits.rates & BIT(j))) {
+				rate = rates[i];
+				rate_bit = j;
+			}
+	if (!rate)
+		return 0;	/* no stereo LPCM element: the sink decides */
+
+	/* The sample size of an element that takes that rate in stereo */
+	sieve.rates = BIT(rate_bit);
+	elements.pos = 0;
+	parse_sound_constraints(&elements, &sieve, &hits);
+	for (i = 0; i < ARRAY_SIZE(formats); i++)
+		if (hits.formats & pcm_format_to_bits(formats[i]))
+			break;
+	if (i == ARRAY_SIZE(formats))
+		return 0;
+
+	dev_dbg(dcpaud->dev, "held links run at %u Hz, format %d\n", rate,
+		(__force int)formats[i]);
+	ret = snd_pcm_hw_constraint_single(runtime, SNDRV_PCM_HW_PARAM_RATE, rate);
+	if (ret < 0)
+		return ret;
+	ret = snd_pcm_hw_constraint_mask64(runtime, SNDRV_PCM_HW_PARAM_FORMAT,
+					   pcm_format_to_bits(formats[i]));
+	return ret < 0 ? ret : 0;
+}
+
+/*
  * Seen once, at boot: a link started about 0.2 s after the display came on
  * was not heard, and holding it kept it silent; the next connection's first
  * link, started later, was heard. While links are held, the first link of a
@@ -753,6 +822,11 @@ static int dcp_pcm_native_open(struct snd_pcm_substream *substream)
 	}
 
 	ret = dcp_pcm_open(substream);
+	if (!ret && live && !dcpaud->open_unplugged && dcpaud_holds(dcpaud)) {
+		ret = dcpaud_pin_rate_format(dcpaud, substream->runtime);
+		if (ret)
+			dcp_pcm_close(substream);
+	}
 	if (ret && live) {
 		bool held;
 
