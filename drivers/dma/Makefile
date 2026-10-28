@@ -17,6 +17,7 @@ obj-$(CONFIG_ALTERA_MSGDMA) += altera-msgdma.o
 obj-$(CONFIG_AMBA_PL08X) += amba-pl08x.o
 obj-$(CONFIG_AMCC_PPC440SPE_ADMA) += ppc4xx/
 obj-$(CONFIG_APPLE_ADMAC) += apple-admac.o
+obj-$(CONFIG_APPLE_ADMAC_KUNIT_TEST) += apple-admac-test.o
 obj-$(CONFIG_APPLE_SIO) += apple-sio.o
 obj-$(CONFIG_APPLE_SIO_KUNIT_TEST) += apple-sio-probe-test.dtbo.o
 obj-$(CONFIG_APPLE_SIO_T6030_KUNIT_TEST) += apple-sio-t6030-test.dtbo.o
