@@ -342,6 +342,14 @@ struct apple_dart {
 	 * rather than the DART's.
 	 */
 	u64 locked_window[DART_MAX_STREAMS];
+	/*
+	 * First error of a TLB invalidate that failed while retiring a locked
+	 * root, per stream. The hardware may still cache translations through
+	 * the retired page tables, so apple_dart_domain_free() keeps the page
+	 * tables of every domain on such a stream. It is never cleared: only
+	 * the hardware could show that the TLB no longer holds those entries.
+	 */
+	int locked_retire_err[DART_MAX_STREAMS];
 };
 
 #ifndef MODULE
@@ -1110,17 +1118,24 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 	return 0;
 }
 
+/*
+ * Retire the locked roots @idx of @stream_map's streams. Returns the first
+ * error of the TLB invalidate that retiring needs, which is also remembered
+ * per stream for apple_dart_domain_free(): a consumer release or an attach
+ * rollback can retire the root before the domain is freed.
+ */
 static int
 apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 {
 	struct apple_dart *dart = stream_map->dart;
-	int sid;
+	int sid, ret = 0;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u64 *live = dart->locked_ttbr[sid][idx];
 		u64 *owned = dart->locked_owned[sid][idx];
 		struct apple_dart_fw_root *fw;
 		unsigned long flags;
+		int err = 0;
 
 		if (!live)
 			continue;
@@ -1130,9 +1145,12 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 			struct apple_dart_stream_map stream = { .dart = dart };
 
 			__set_bit(sid, stream.sidmap);
-			(void)apple_dart_fw_invalidate(&stream, 0, U64_MAX);
+			err = apple_dart_fw_invalidate(&stream, 0, U64_MAX);
+			ret = ret ?: err;
 		}
 		spin_lock_irqsave(&dart->lock, flags);
+		if (err && !dart->locked_retire_err[sid])
+			dart->locked_retire_err[sid] = err;
 		fw = dart->locked_fw[sid][idx];
 		dart->locked_fw[sid][idx] = NULL;
 		dart->locked_ttbr[sid][idx] = NULL;
@@ -1142,7 +1160,24 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 		devm_kfree(dart->dev, owned);
 		dart->locked_owned[sid][idx] = NULL;
 	}
-	return 0;
+	return ret;
+}
+
+/* The remembered retire-time invalidate error of @stream_map's streams, or 0. */
+static int apple_dart_retire_error(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	unsigned long flags;
+	int sid, ret = 0;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		ret = dart->locked_retire_err[sid];
+		if (ret)
+			break;
+	}
+	spin_unlock_irqrestore(&dart->lock, flags);
+	return ret;
 }
 
 static int
@@ -2097,7 +2132,7 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 					continue;
 				/*
 				 * All pages of an inherited slot remain firmware's;
-				 * only a page its snapshotted leaf already maps the
+				 * only a page its firmware leaf already maps the
 				 * same way may be repeated.
 				 */
 				fw = dart->locked_fw[sid][idx];
@@ -2715,7 +2750,7 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct apple_dart_atomic_stream_map *map;
 	struct apple_dart_stream_map stream;
-	int i, j, idx;
+	int i, j, idx, ret;
 
 	if (dart_domain->dcp) {
 		/* Registration rollback: no consumer could publish host DMA yet. */
@@ -2743,14 +2778,22 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 				"retaining page tables after power failure: %d\n", j);
 			return;
 		}
-		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++)
-			apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+		ret = 0;
+		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++) {
+			j = apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+			ret = ret ?: j;
+		}
 		j = stream.dart->hw->invalidate_tlb(&stream);
+		ret = ret ?: j;
 		pm_runtime_put(stream.dart->dev);
-		/* Do not free page tables that hardware may still cache. */
-		if (j) {
+		/*
+		 * Do not free page tables that hardware may still cache, also
+		 * when a consumer release or an attach rollback retired the root.
+		 */
+		ret = ret ?: apple_dart_retire_error(&stream);
+		if (ret) {
 			dev_err_ratelimited(stream.dart->dev,
-				"retaining page tables after TLB invalidation failure: %d\n", j);
+				"retaining page tables after TLB invalidation failure: %d\n", ret);
 			return;
 		}
 	}
