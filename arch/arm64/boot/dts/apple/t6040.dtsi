@@ -7,6 +7,18 @@
 
 #include "t604x.dtsi"
 
+/* The M4 Pro has five cores in each P cluster. */
+/delete-node/ &cpu_p05;
+/delete-node/ &cpu_p15;
+
+&{/cpus/cpu-map/cluster1} {
+	/delete-node/ core5;
+};
+
+&{/cpus/cpu-map/cluster2} {
+	/delete-node/ core5;
+};
+
 /*
  * DRAM interface class: width and maximum rate are inferred from topology
  * and the published bandwidth class. Lower-state rates remain unqualified.

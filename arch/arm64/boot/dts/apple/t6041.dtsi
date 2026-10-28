@@ -314,37 +314,6 @@
 /delete-node/ &opp_p1;
 
 / {
-	cpus {
-		cpu-map {
-			cluster1 { core5 { cpu = <&cpu_p05>; }; };
-			cluster2 { core5 { cpu = <&cpu_p15>; }; };
-		};
-		cpu_p05: cpu@10105 {
-			compatible = "apple,brava-p";
-			device_type = "cpu";
-			reg = <0x0 0x10105>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>;
-			next-level-cache = <&l2_cache_p0>;
-			operating-points-v2 = <&opp_p0>;
-			capacity-dmips-mhz = <1024>;
-			performance-domains = <&cpufreq_p0>;
-			#cooling-cells = <2>;
-		};
-		cpu_p15: cpu@10205 {
-			compatible = "apple,brava-p";
-			device_type = "cpu";
-			reg = <0x0 0x10205>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>;
-			next-level-cache = <&l2_cache_p1>;
-			operating-points-v2 = <&opp_p1>;
-			capacity-dmips-mhz = <1024>;
-			performance-domains = <&cpufreq_p1>;
-			#cooling-cells = <2>;
-		};
-	};
-
 	opp_p0: opp-table-p0 {
 		compatible = "operating-points-v2";
 		opp-shared;

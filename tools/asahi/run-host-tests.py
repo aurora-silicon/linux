@@ -158,6 +158,7 @@ ASAHI_TESTS = {
     't6030-wiring-tests.py': [(out(), PASS), (out() + ['--old-classifier', 'tb'], PASS),
                               (out() + ['--old-classifier', 'dcp'], PASS)],
     't6040-calibration-tests.py': [([], PASS)],
+    't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-dp-repair-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'tbnet-refill-tests.py': [(out(), PASS)]
         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
