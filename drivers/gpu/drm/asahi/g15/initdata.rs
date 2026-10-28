@@ -180,6 +180,7 @@ fn device_tree_board(
         max_power_mw,
         max_mhz
     );
+    dev_info!(dev, "board data sha256 {}\n", Hex(&glue::sha256(&hw_img)));
     let max_khz = max_mhz.checked_mul(1000).ok_or_else(|| {
         dev_err!(dev, "board data: top operating point {} MHz does not fit in kHz\n", max_mhz);
         EINVAL
@@ -190,8 +191,9 @@ fn device_tree_board(
 /// Verified board bytes, prepared before any GPU firmware is started.
 pub(crate) type BoardImages = (KVVec<u8>, KVVec<u8>, KVVec<u8>, u32);
 
-/// Check availability, digest, layout and machine-derived tables before firmware start.
-/// Keep the verified bytes so a later firmware request cannot change the admitted data.
+/// Build and check the board images before any GPU firmware is started: the templates against
+/// their digests and layout, or the device-tree record from the GPU node, the ADT and the SoC's
+/// reference words.
 pub(crate) fn prepare_board(
     dev: &device::Device,
     cfg: &Config,
