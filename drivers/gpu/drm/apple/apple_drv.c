@@ -588,6 +588,8 @@ static int apple_connector_attach_hdr(struct drm_connector *connector)
 	int ret;
 
 	switch (connector->connector_type) {
+	/* A desktop 26.x Type-C route is a pipeline output carrying DisplayPort. */
+	case DRM_MODE_CONNECTOR_USB:
 	case DRM_MODE_CONNECTOR_DisplayPort:
 		ret = drm_mode_create_dp_colorspace_property(connector, colorspaces);
 		break;
