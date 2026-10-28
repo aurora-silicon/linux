@@ -61,7 +61,18 @@ properties:
       error-mask policy rather than changing it for these streams.
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: DART registers
+      - description:
+          Address filter (DAPF) registers, which restrict the physical
+          addresses the DART lets its masters reach
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: dart
+      - const: dapf
 
   interrupts:
     maxItems: 1
@@ -140,6 +151,17 @@ required:
   - '#iommu-cells'
   - interrupts
 
+allOf:
+  - if:
+      properties:
+        reg:
+          minItems: 2
+      required:
+        - reg
+    then:
+      required:
+        - reg-names
+
 additionalProperties: false
 
 examples:
@@ -171,4 +193,13 @@ examples:
 
     master2 {
       iommus = <&dart2a 0>, <&dart2b 1>;
+    };
+
+  - |+
+    dart3: iommu@8e8c0000 {
+      compatible = "apple,t8132-dart", "apple,t8110-dart";
+      reg = <0x8e8c0000 0xc000>, <0x8e8d0000 0x4000>;
+      reg-names = "dart", "dapf";
+      interrupts = <1 387 4>;
+      #iommu-cells = <1>;
     };
