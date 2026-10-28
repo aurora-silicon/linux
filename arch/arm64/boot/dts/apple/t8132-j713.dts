@@ -54,6 +54,74 @@
 			default-state = "keep";
 		};
 	};
+
+	reserved-memory {
+		/*
+		 * iBoot (mBoot-18000.161.10) loads the ISP firmware outside the
+		 * kernel's memory. Its segments are the ADT's isp
+		 * segment-ranges, mapped where the firmware runs them:
+		 * 0x100_0000_0000 onwards, its 20 MiB main memory. The driver
+		 * checks that the coprocessor's reset vector is this text before
+		 * it starts the firmware.
+		 */
+		isp_fw_text: isp-firmware-text@10000d30000 {
+			reg = <0x100 0x00d30000 0x0 0xca4000>;
+			iommu-addresses = <&isp 0x100 0x0 0x0 0xca4000>;
+			no-map;
+		};
+
+		isp_fw_data: isp-firmware-data@10001f40000 {
+			reg = <0x100 0x01f40000 0x0 0x748000>;
+			iommu-addresses = <&isp 0x100 0xca4000 0x0 0x748000>;
+			no-map;
+		};
+
+		/* the firmware's main memory, the driver allocates above it */
+		isp_heap: isp-heap {
+			iommu-addresses = <&isp 0x100 0x0 0x0 0x1400000>;
+		};
+	};
+};
+
+&isp {
+	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+	memory-region-names = "text", "data", "heap";
+	/*
+	 * The boot descriptor's platform ID is the ADT isp node's sensor-type.
+	 * The J713 ADT has no cam-connections-scheme.
+	 */
+	apple,platform-id = <0x17>;
+	status = "okay";
+
+	/* The front camera, an IMX958: configuration 5, as on the J616s. */
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <0 0 1920 1080>;
+		};
+		/* 1280x720 */
+		preset1 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 0 1280 720>;
+		};
+	};
+};
+
+&isp_dart0 {
+	status = "okay";
+};
+
+&isp_dart1 {
+	status = "okay";
+};
+
+&isp_dart2 {
+	status = "okay";
 };
 
 /* Enable DVFS only with the J713 board thermal owner. */
