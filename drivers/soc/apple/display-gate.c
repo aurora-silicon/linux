@@ -55,7 +55,10 @@
  * On T6031 (M3 Max) the gate serves the same handoff, marked
  * apple,t6031-handoff. Its default is scoped to the J516C: there the native
  * display is on unless apple_t6031_display.enable=0; the other T6031 boards
- * need apple_t6031_display.enable=1. The default changes no check of the
+ * need apple_t6031_display.enable=1. The T6031 GPU starts its firmware only
+ * after this native display is up, so enable=0 (or a display that never
+ * comes up) keeps the GPU off for that boot too: it is not a display-only
+ * switch. The default changes no check of the
  * handoff or the PMP below. The PMP values must come from the boot loader, in
  * /chosen/asahi,t6031-pmp; there is no fallback. Its PMP topology is
  * reused from the device tree, as on T8122. The T6031 display power
@@ -274,7 +277,8 @@ static const struct gate_soc gate_t8122 __initconst = {
 /*
  * T6031 (M3 Max): the T6030 handoff at the T6031 addresses, on by default on
  * the J516C and off unless apple_t6031_display.enable=1 on the other boards;
- * apple_t6031_display.enable=0 keeps it off everywhere. The PMP values must come from the boot
+ * apple_t6031_display.enable=0 keeps it, and with it the GPU, off everywhere.
+ * The PMP values must come from the boot
  * loader: there is no built-in fallback. The PMP image is T6031's own;
  * any other, the T6030 image included, is refused. The report driver checks
  * the image's SRAM layout before it starts the PMP. The internal display's

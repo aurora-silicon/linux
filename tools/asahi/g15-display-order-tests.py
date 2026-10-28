@@ -165,8 +165,10 @@ int main(int argc, char **argv)
 		nodes[1] = NULL;
 		CHECK(prepare(&g31) == -EPROBE_DEFER && infos == 1 && links_made == 0);
 	} else if (!strcmp(scenario, "pending")) {
+		/* Enabled but not published: no start, no success, said once. */
 		disp31.available = true;
-		CHECK(prepare(&g31) == -EPROBE_DEFER && infos == 0 && links_made == 0);
+		CHECK(prepare(&g31) == -EPROBE_DEFER && infos == 1 && links_made == 0);
+		CHECK(prepare(&g31) == -EPROBE_DEFER && infos == 1 && links_made == 0);
 	} else if (!strcmp(scenario, "ready")) {
 		disp31.available = true;
 		CHECK(publish(&d31) == 0 && d31.refs == 1);
@@ -216,6 +218,7 @@ C_SCENARIOS = ["disabled", "absent", "pending", "ready", "isolation", "foreign",
 C_MUTANTS = {
     "unpublished-succeeds": ("if (!*display)\n\t\treturn -EPROBE_DEFER;", "if (!*display)\n\t\treturn 0;"),
     "disabled-display-skipped": (re.compile(r"\t\tdev_info_once\(dev,[^;]*;\n"), "\t\t{ of_node_put(np); return 0; }\n"),
+    "pending-display-silent": (re.compile(r"\telse\n\t\tdev_info_once\(dev,[^;]*;\n"), ""),
     "t6031-reads-t6030-slot": ("&apple_t6031_display);", "&apple_t6030_display);"),
     "t6031-published-as-t6030": ("return &apple_t6031_display;", "return &apple_t6030_display;"),
     "no-machine-check": ("!of_machine_is_compatible(machine) ||", ""),
