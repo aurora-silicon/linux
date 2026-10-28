@@ -13,6 +13,8 @@ struct dcpaud_link_test {
 	bool link_on;
 	bool link_live;
 	bool typec;
+	/* The error removing the idle transfer returns */
+	int idle_remove_err;
 	u64 asked;
 	unsigned int completes;
 	unsigned int stops;
@@ -38,10 +40,30 @@ static bool dcpaud_link_test_live(struct device *dev)
 	return dcpaud_link_current->link_live;
 }
 
+static bool dcpaud_link_test_typec(struct device *dev)
+{
+	return dcpaud_link_current->typec;
+}
+
 static int dcpaud_link_test_terminate(struct dma_chan *chan)
 {
 	dcpaud_link_record('X');
 	return 0;
+}
+
+/* G the channel configured; the silence as its idle transfer: I set, i removed */
+static int dcpaud_link_test_config(struct dma_chan *chan, struct dma_slave_config *config)
+{
+	const struct apple_sio_idle *idle = config->peripheral_config;
+
+	if (!idle) {
+		dcpaud_link_record('G');
+		return 0;
+	}
+	if (config->peripheral_size != sizeof(*idle))
+		return -EINVAL;
+	dcpaud_link_record(idle->len ? 'I' : 'i');
+	return idle->len ? 0 : dcpaud_link_current->idle_remove_err;
 }
 
 static dma_cookie_t dcpaud_link_test_submit(struct dma_async_tx_descriptor *tx)
@@ -59,18 +81,6 @@ dcpaud_link_test_prep(struct dma_chan *chan, dma_addr_t buf, size_t len, size_t 
 	t->desc.chan = chan;
 	t->desc.tx_submit = dcpaud_link_test_submit;
 	return &t->desc;
-}
-
-/* G the channel configured */
-static int dcpaud_link_test_config(struct dma_chan *chan, struct dma_slave_config *config)
-{
-	dcpaud_link_record('G');
-	return 0;
-}
-
-static bool dcpaud_link_test_typec(struct device *dev)
-{
-	return dcpaud_link_current->typec;
 }
 
 static void dcpaud_link_test_issue(struct dma_chan *chan)
@@ -250,10 +260,11 @@ static void dcpaud_stop_holds_link(struct kunit *test)
 	struct snd_pcm_substream *sub = dcpaud_link_test_open(test, audio);
 
 	dcpaud_link_test_held_stop(test, audio);
-	/* The stream's DMA ends, the silence follows it; no link call */
+	/* The silence set first, the stream's DMA ends into it; no link call */
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_sync_stop(sub), 0);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XQD");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "IXD");
 	KUNIT_EXPECT_TRUE(test, audio->silence_running);
+	KUNIT_EXPECT_TRUE(test, audio->idle_set);
 	KUNIT_EXPECT_TRUE(test, audio->link_started);
 
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_hw_free(sub), 0);
@@ -262,10 +273,40 @@ static void dcpaud_stop_holds_link(struct kunit *test)
 
 	/* The display goes off: the silence ends, then the link */
 	dcpaud_release_link(pdev, NULL);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XQDXDDSC");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "IXDiDSC");
 	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
 	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
 	/* The stream's reference went with the silence */
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
+}
+
+static void dcpaud_stuck_silence_keeps_pm(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	struct snd_pcm_substream *sub = dcpaud_link_test_open(test, audio);
+
+	dcpaud_link_test_held_stop(test, audio);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_native_sync_stop(sub), 0);
+	KUNIT_ASSERT_EQ(test, dcp_pcm_native_hw_free(sub), 0);
+
+	/* The channel cannot be confirmed stopped: it may still read the silence */
+	dcpaud_link_current->idle_remove_err = -EIO;
+	dcpaud_release_link(pdev, NULL);
+	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
+	KUNIT_EXPECT_TRUE(test, audio->idle_set);
+	KUNIT_EXPECT_TRUE(test, audio->idle_pm);
+	/* The stream's reference stays with the silence */
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 1);
+
+	/* Removed later, it gives the reference back */
+	dcpaud_link_current->idle_remove_err = 0;
+	scoped_guard(mutex, &audio->link_lock)
+		KUNIT_EXPECT_EQ(test, dcpaud_idle(audio, false), 0);
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
+	KUNIT_EXPECT_FALSE(test, audio->idle_pm);
 	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
 }
 
@@ -297,6 +338,7 @@ static struct snd_pcm_substream *dcpaud_link_test_held(struct kunit *test, struc
 	audio->link_prepared = true;
 	audio->link_started = true;
 	audio->silence_running = true;
+	audio->idle_set = true;
 	/* The held link's PM reference, then the stream's from its START */
 	pm_runtime_get_noresume(audio->dev);
 	pm_runtime_get_noresume(audio->dev);
@@ -312,10 +354,11 @@ static void dcpaud_start_on_held_link(struct kunit *test)
 	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
 	struct snd_pcm_substream *sub = dcpaud_link_test_held(test, audio);
 
-	/* Its element: the stream's DMA replaces the silence, no link call */
+	/* Its element: the stream's DMA follows the silence, no link call */
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_start(sub, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XQ");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "Q");
 	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_TRUE(test, audio->idle_set);
 	KUNIT_EXPECT_TRUE(test, audio->link_started);
 	pm_runtime_put_noidle(audio->dev);
 }
@@ -330,7 +373,8 @@ static void dcpaud_start_replaces_held_link(struct kunit *test)
 	memset(&audio->link_cookie, 1, sizeof(audio->link_cookie));
 	memset(&audio->selected_cookie, 2, sizeof(audio->selected_cookie));
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_start(sub, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XDSCGPQT");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "iSCGPQT");
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
 	KUNIT_EXPECT_EQ(test, memcmp(&audio->link_cookie, &audio->selected_cookie,
 				     sizeof(audio->link_cookie)), 0);
 	KUNIT_EXPECT_TRUE(test, audio->link_started);
@@ -346,7 +390,7 @@ static void dcpaud_start_after_held_link_went(struct kunit *test)
 	/* The held link's service went (unplug): the stream gets a link of its own */
 	dcpaud_link_current->link_live = false;
 	KUNIT_ASSERT_EQ(test, dcp_pcm_native_start(sub, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XDGPQT");
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "iGPQT");
 	KUNIT_EXPECT_FALSE(test, audio->silence_running);
 	KUNIT_EXPECT_TRUE(test, audio->link_started);
 	pm_runtime_put_noidle(audio->dev);
@@ -370,6 +414,39 @@ static void dcpaud_failed_start_keeps_held_link(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, audio->dma_cleared);
 	KUNIT_EXPECT_TRUE(test, audio->silence_running);
 	/* Only the held silence's reference is left */
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 1);
+	pm_runtime_put_noidle(audio->dev);
+}
+
+static void dcpaud_close_keeps_held_silence(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	struct snd_pcm_substream *sub = kunit_kzalloc(test, sizeof(*sub), GFP_KERNEL);
+	struct snd_pcm_runtime *runtime = kunit_kzalloc(test, sizeof(*runtime), GFP_KERNEL);
+	struct snd_pcm *pcm = kunit_kzalloc(test, sizeof(*pcm), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, sub);
+	KUNIT_ASSERT_NOT_NULL(test, runtime);
+	KUNIT_ASSERT_NOT_NULL(test, pcm);
+	pcm->private_data = audio;
+	pcm->nonatomic = true;
+	sub->pcm = pcm;
+	sub->runtime = runtime;
+	KUNIT_ASSERT_EQ(test, snd_dmaengine_pcm_open(sub, &dcpaud_link_current->channel), 0);
+	audio->chan = &dcpaud_link_current->channel;
+	audio->link_prepared = true;
+	audio->link_started = true;
+	audio->silence_running = true;
+	audio->idle_set = true;
+	pm_runtime_get_noresume(audio->dev);
+
+	/* The PCM's terminate leaves the idle silence: nothing queued, no link call */
+	KUNIT_ASSERT_EQ(test, dcp_pcm_native_close(sub), 0);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XD");
+	KUNIT_EXPECT_TRUE(test, audio->silence_running);
+	KUNIT_EXPECT_TRUE(test, audio->idle_set);
+	KUNIT_EXPECT_TRUE(test, audio->link_started);
 	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 1);
 	pm_runtime_put_noidle(audio->dev);
 }
@@ -415,11 +492,13 @@ static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_disconnect_sync_completes_live_owner),
 	KUNIT_CASE(dcpaud_gone_service_drops_link),
 	KUNIT_CASE(dcpaud_stop_holds_link),
+	KUNIT_CASE(dcpaud_stuck_silence_keeps_pm),
 	KUNIT_CASE(dcpaud_held_stop_without_service),
 	KUNIT_CASE(dcpaud_start_on_held_link),
 	KUNIT_CASE(dcpaud_start_replaces_held_link),
 	KUNIT_CASE(dcpaud_start_after_held_link_went),
 	KUNIT_CASE(dcpaud_failed_start_keeps_held_link),
+	KUNIT_CASE(dcpaud_close_keeps_held_silence),
 	KUNIT_CASE(dcpaud_typec_stop_ends_stream),
 	{}
 };
