@@ -691,7 +691,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
 
-		if (limits_known && !external_sdr)
+		if (limits_known)
 			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits);
 
 		if (external_sdr) {

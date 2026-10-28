@@ -288,10 +288,10 @@ int main(int argc, char **argv)
         assert(!IS_ERR(m) && n == 1 && m[0].pq.id == 95 && m[0].pq.depth == 12);
         assert(m[0].color_mode_id == 85);
         free(m);
-        /* The external SDR path collects no PQ element. */
+        /* The external SDR path keeps its SDR element and the same PQ one. */
         assert(!parse(pq_blob, sizeof(pq_blob), &c));
         m = enumerate_modes(&c, &n, 600, 330, 0, false, true);
-        assert(!IS_ERR(m) && n == 1 && m[0].pq.score < 0);
+        assert(!IS_ERR(m) && n == 1 && m[0].color_mode_id == 85 && m[0].pq.id == 90);
         free(m);
     }
     FILE *f = fopen(argv[1], "rb");

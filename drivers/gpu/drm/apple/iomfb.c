@@ -2281,12 +2281,15 @@ out:
 
 /*
  * PQ output goes through the IOMFB template's mode set, which picks the
- * timing's PQ element (see dcp_display_mode.pq).  It has been brought up on
- * the desktop 26.x firmware; the other processors keep SDR.
+ * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware
+ * and the external H17P processor.  The other processors keep SDR.
  */
 static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !iomfb_is_m4(dcp);
+	if (iomfb_is_m4(dcp))
+		return false;
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
 
 /* The EOTF the compositor asks of the display on @crtc, an HDMI_EOTF_* value. */
