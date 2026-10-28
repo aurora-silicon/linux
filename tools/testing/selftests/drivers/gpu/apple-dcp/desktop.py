@@ -398,10 +398,13 @@ def panel_identity(root, output=None):
 #define kmalloc_objs(t,n,f) malloc(sizeof(t)*(n))
 #define spin_lock_irqsave(p,f) do {assert(!*(p));*(p)=true;(f)=0;} while(0)
 #define spin_unlock_irqrestore(p,f) do {assert(*(p));*(p)=false;(void)(f);} while(0)
+#ifndef READ_ONCE
+#define READ_ONCE(x) (x)
+#endif
 struct apple_dcp {
     int fw_compat;bool has_panel;struct {bool lock;} metadata;
     struct {struct dcp_display_metadata panel_metadata, panel_adt_identity;u64 panel_metadata_generation;bool panel_metadata_valid;u8 panel_raw_edid[4096];size_t panel_raw_edid_size;} *desktop;
-    struct {u32 width_mm,height_mm;} panel;void *connector;
+    struct {u32 width_mm,height_mm,peak_nits;} panel;void *connector;
 };
 static unsigned notifications;
 static bool dcp_has_panel(struct apple_dcp *d) {return d->has_panel;}
@@ -426,8 +429,15 @@ int main(int argc, char **argv)
     modes[0].vrr=true;modes[0].min_vrr=24U<<16;modes[0].max_vrr=120U<<16;
     u64 generation=99;
     desktop.panel_adt_identity=(struct dcp_display_metadata){.manufacturer="APP",.product=0x616};
+    /* A peak above the SDR range adds the HDR block: 1600 cd/m2 is code 160. */
+    d.panel.peak_nits=1600;
+    const struct drm_edid *hdr=dcp_panel_edid_snapshot(&d,modes,3,&generation);
+    assert(!IS_ERR(hdr) && drm_edid_valid(hdr) && hdr->size==256);
+    assert(!memcmp(hdr->cta,"\x02\x03\x0f\x00\xe3\x05\x80\x00\xe6\x06\x05\x01\xa0\xa0\x00",15));
+    drm_edid_free(hdr);
+    d.panel.peak_nits=0;
     const struct drm_edid *fallback=dcp_panel_edid_snapshot(&d,modes,3,&generation);
-    assert(!IS_ERR(fallback) && drm_edid_valid(fallback));
+    assert(!IS_ERR(fallback) && drm_edid_valid(fallback) && fallback->size==128);
     if(argc==2) {
         char path[4096];snprintf(path,sizeof(path),"%s.adt-fallback",argv[1]);
         FILE *file=fopen(path,"wb");assert(file);assert(fwrite(&fallback->raw,128,1,file)==1);fclose(file);

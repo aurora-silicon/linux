@@ -2279,6 +2279,77 @@ out:
 	return ret;
 }
 
+/*
+ * PQ output goes through the IOMFB template's mode set, which picks the
+ * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware
+ * and the external H17P processor.  The other processors keep SDR.
+ */
+static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
+{
+	if (iomfb_is_m4(dcp))
+		return false;
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+}
+
+/*
+ * A desktop 26.x panel keeps its SDR link and shows PQ content as EDR, with
+ * the peak the firmware reports for it (see res_max_panel_brightness()).
+ */
+static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       dcp_has_panel(dcp) && READ_ONCE(dcp->panel.peak_nits);
+}
+
+/* The EOTF the compositor asks of the display on @crtc, an HDMI_EOTF_* value. */
+u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		 struct drm_atomic_commit *commit)
+{
+	const struct drm_connector_state *conn_state = NULL;
+	struct drm_connector_state *state;
+	struct drm_connector *connector;
+	const struct hdr_output_metadata *hdr;
+	int i;
+
+	for_each_new_connector_in_state(commit, connector, state, i)
+		if (state->crtc == crtc)
+			conn_state = state;
+	/* A mode set the driver starts itself keeps the connector's state. */
+	if (!conn_state && dcp->connector && dcp->connector->base.state &&
+	    dcp->connector->base.state->crtc == crtc)
+		conn_state = dcp->connector->base.state;
+	if (!conn_state || !conn_state->hdr_output_metadata)
+		return HDMI_EOTF_TRADITIONAL_GAMMA_SDR;
+	hdr = conn_state->hdr_output_metadata->data;
+	return hdr->hdmi_metadata_type1.eotf;
+}
+
+/* Only an SDR or a PQ signal, and PQ only where the timing has an element. */
+int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		       struct drm_atomic_commit *commit)
+{
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	struct dcp_display_mode mode;
+
+	if (!crtc_state || !crtc_state->enable ||
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		return 0;
+	switch (dcp_crtc_eotf(dcp, crtc, commit)) {
+	case HDMI_EOTF_TRADITIONAL_GAMMA_SDR:
+		return 0;
+	case HDMI_EOTF_SMPTE_ST2084:
+		if (dcp_panel_edr_supported(dcp))
+			return 0;
+		if (dcp_hdr_output_supported(dcp) &&
+		    lookup_mode(dcp, &crtc_state->mode, &mode) && mode.pq.score >= 0)
+			return 0;
+		fallthrough;
+	default:
+		return -EINVAL;
+	}
+}
+
 /* The user may own drm_display_mode, so we need to search for our copy */
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out)
@@ -2414,6 +2485,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
+	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp);
+	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:

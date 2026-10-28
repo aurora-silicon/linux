@@ -364,6 +364,7 @@ static inline bool dcp_bl_swap_finish(struct dcp_backlight_state *state,
 struct apple_dcp;
 
 void dcp_backlight_desktop_power(struct apple_dcp *dcp, bool on);
+u32 dcp_backlight_desktop_nits(struct apple_dcp *dcp);
 bool dcp_backlight_desktop_prepare(struct apple_dcp *dcp, u32 id,
 				   bool have_surface, u32 *nits);
 void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,

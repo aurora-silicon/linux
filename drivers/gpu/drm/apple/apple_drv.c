@@ -553,11 +553,66 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 	return NULL;
 }
 
+/* The output color element follows the HDR metadata: a change is a modeset. */
+static int apple_connector_atomic_check(struct drm_connector *conn,
+					struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, conn);
+	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
+	struct drm_crtc_state *crtc_state;
+
+	if (!new->crtc || (old->colorspace == new->colorspace &&
+			   drm_connector_atomic_hdr_metadata_equal(old, new)))
+		return 0;
+	crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
+	if (IS_ERR(crtc_state))
+		return PTR_ERR(crtc_state);
+	crtc_state->mode_changed = true;
+	return 0;
+}
+
 static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 	.get_modes		= dcp_get_modes,
 	.mode_valid		= dcp_mode_valid,
 	.atomic_best_encoder	= apple_connector_atomic_best_encoder,
+	.atomic_check		= apple_connector_atomic_check,
 };
+
+/*
+ * External displays can take a PQ BT.2020 signal where the firmware
+ * offers one, and a desktop 26.x panel PQ content it shows as EDR;
+ * dcp_crtc_atomic_check() refuses it elsewhere.
+ */
+static int apple_connector_attach_hdr(struct drm_connector *connector,
+				      bool panel_edr)
+{
+	const u32 colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
+	int ret;
+
+	switch (connector->connector_type) {
+	case DRM_MODE_CONNECTOR_eDP:
+		if (!panel_edr)
+			return 0;
+		fallthrough;
+	/* A desktop 26.x Type-C route is a pipeline output carrying DisplayPort. */
+	case DRM_MODE_CONNECTOR_USB:
+	case DRM_MODE_CONNECTOR_DisplayPort:
+		ret = drm_mode_create_dp_colorspace_property(connector, colorspaces);
+		break;
+	case DRM_MODE_CONNECTOR_HDMIA:
+		ret = drm_mode_create_hdmi_colorspace_property(connector, colorspaces);
+		break;
+	default:
+		return 0;
+	}
+	if (ret)
+		return ret;
+	ret = drm_connector_attach_colorspace_property(connector);
+	if (ret)
+		return ret;
+	drm_connector_attach_hdr_output_metadata_property(connector);
+	return 0;
+}
 
 static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
 	.atomic_begin		= apple_crtc_atomic_begin,
@@ -596,6 +651,10 @@ static int apple_connector_create(struct drm_device *drm,
 	if (ret)
 		goto err_free;
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
+	if (ret)
+		goto err_cleanup;
+	ret = apple_connector_attach_hdr(&connector->base,
+					 dcp_fw_compat_is_desktop(dcp));
 	if (ret)
 		goto err_cleanup;
 
@@ -809,6 +868,9 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		}
 
 		ret = drm_connector_attach_vrr_capable_property(&connector->base);
+		if (ret)
+			return ret;
+		ret = apple_connector_attach_hdr(&connector->base, false);
 		if (ret)
 			return ret;
 
