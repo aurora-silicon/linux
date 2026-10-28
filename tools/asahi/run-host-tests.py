@@ -125,6 +125,7 @@ ASAHI_TESTS = {
     'g17-pool-release-tests.py': [([], PASS)],
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
+    'g17-t6041-initdata-tests.py': [([], PASS)],
     'g17-uninstalled-cleanup-tests.py': [([], PASS)],
     'g17-unpublished-tests.py': [([], PASS)],
     'mt7932-association-events-tests.py': [(out(), PASS)],
