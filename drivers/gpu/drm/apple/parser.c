@@ -732,6 +732,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	bool preferred = false, interlaced = false;
 	bool have_preferred = false, have_interlaced = false;
 	bool is_preferred = false;
+	bool timing_keys = external_sdr || handle->metadata_timing;
 	struct drm_display_mode *mode = &out->mode;
 
 	*out = (struct dcp_display_mode) {
@@ -773,11 +774,11 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (!strcmp(key, "HorizontalAttributes")) {
 			duplicate_scope |= have_horiz;
 			have_horiz = true;
-			ret = parse_dimension(it.handle, &horiz, external_sdr);
+			ret = parse_dimension(it.handle, &horiz, timing_keys);
 		} else if (!strcmp(key, "VerticalAttributes")) {
 			duplicate_scope |= have_vert;
 			have_vert = true;
-			ret = parse_dimension(it.handle, &vert, external_sdr);
+			ret = parse_dimension(it.handle, &vert, timing_keys);
 		} else if (!strcmp(key, "MinimumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &min_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "MaximumVariableRefreshRate"))
@@ -792,13 +793,16 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			duplicate_scope |= have_virtual;
 			have_virtual = true;
 			ret = parse_bool(it.handle, &is_virtual);
-		} else if (external_sdr && !strcmp(key, "IsPreferred")) {
+		} else if (timing_keys && !strcmp(key, "IsPreferred")) {
 			if (have_preferred)
 				ret = -EINVAL;
 			else
 				ret = parse_bool(it.handle, &preferred);
 			have_preferred = true;
-		} else if (external_sdr && !strcmp(key, "IsInterlaced")) {
+			/* Outside the external SDR path it also ranks the timing. */
+			if (!external_sdr)
+				is_preferred = preferred;
+		} else if (timing_keys && !strcmp(key, "IsInterlaced")) {
 			if (have_interlaced)
 				ret = -EINVAL;
 			else
@@ -918,10 +922,14 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		.height_mm = height_mm,
 	};
 
-	if (external_sdr && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0)
-		mode->flags = (horiz.sync_polarity ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
-			      (vert.sync_polarity ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
-	out->metadata_timing_valid = external_sdr && !out->automatic_rgb8_quirk &&
+	if (timing_keys && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0)
+		out->metadata_sync_flags =
+			(horiz.sync_polarity ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
+			(vert.sync_polarity ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
+	/* Only the external SDR path publishes the polarity with its modes. */
+	if (external_sdr)
+		mode->flags = out->metadata_sync_flags;
+	out->metadata_timing_valid = timing_keys && !out->automatic_rgb8_quirk &&
 		have_preferred && preferred &&
 		have_interlaced && !interlaced && horiz.pixel_repetition == 0 &&
 		vert.pixel_repetition == 0 && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0;

@@ -6,6 +6,7 @@
 #include <drm/drm_atomic_state_helper.h>
 
 #include "dcp.h"
+#include <drm/drm_edid.h>
 #include <linux/unaligned.h>
 
 #include "connector.h"
@@ -1243,6 +1244,108 @@ static void parser_route_prepare_scope(struct kunit *test)
 	mutex_destroy(&dcp->modes_lock);
 }
 
+static void blob_timing_dimension(struct parser_blob *blob, const char *key,
+				  s64 active, s64 total, s64 porch, s64 sync, s64 rate)
+{
+	blob_key(blob, key);
+	blob_tag(blob, 1, 7);
+	blob_int(blob, "Active", active);
+	blob_int(blob, "Total", total);
+	blob_int(blob, "FrontPorch", porch);
+	blob_int(blob, "SyncWidth", sync);
+	blob_int(blob, "PreciseSyncRate", rate);
+	blob_int(blob, "SyncPolarity", 1);
+	blob_int(blob, "PixelRepetition", 0);
+}
+
+/* A desktop 26.x sink timing: the keys the firmware-derived EDID needs. */
+static struct parser_blob *make_timing_blob(struct kunit *test)
+{
+	struct parser_blob *blob = kunit_kzalloc(test, sizeof(*blob), GFP_KERNEL);
+
+	if (!blob)
+		return NULL;
+	put_unaligned_le32(0xd3, blob->data);
+	blob->size = 4;
+	blob_tag(blob, 2, 1);
+	blob_tag(blob, 1, 8);
+	blob_bool(blob, "IsVirtual", false);
+	blob_int(blob, "ID", 7);
+	blob_int(blob, "Score", 10);
+	blob_timing_dimension(blob, "HorizontalAttributes", 1920, 2200, 88, 44,
+			      (675U << 16) / 10);
+	blob_timing_dimension(blob, "VerticalAttributes", 1080, 1125, 4, 5, 60 << 16);
+	blob_key(blob, "ColorModes");
+	blob_tag(blob, 2, 1);
+	blob_color(blob, 100, 10, 0, DCP_COLOR_FORMAT_RGB);
+	blob_bool(blob, "IsPreferred", true);
+	blob_bool(blob, "IsInterlaced", false);
+	return blob;
+}
+
+static void parser_desktop_metadata_timing(struct kunit *test)
+{
+	const struct dcp_display_metadata metadata = {
+		.width_cm = 60, .height_cm = 33,
+		.chromaticity = { { 44608, 20288 }, { 16960, 40448 }, { 9344, 5184 } },
+		.white = { 20544, 21568 }, .gamma = 144179,
+		.product = 2895, .serial = 305419896, .week = 7, .year = 2013,
+		.manufacturer = "ACR", .name = "QG270 S3", .serial_text = "ANON000000001",
+	};
+	struct parser_blob *blob = make_timing_blob(test);
+	struct drm_display_mode preferred;
+	struct dcp_display_mode *modes;
+	const struct drm_edid *edid;
+	const struct edid *raw;
+	struct dcp_parse_ctx ctx;
+	unsigned int count;
+
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+
+	/* Other DCPs keep their modes and give no metadata timing. */
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	modes = enumerate_modes(&ctx, &count, 600, 330, 0, false, false);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_TRUE(test, modes[0].preferred);
+	KUNIT_EXPECT_FALSE(test, modes[0].metadata_timing_valid);
+	KUNIT_EXPECT_EQ(test, modes[0].metadata_sync_flags, 0U);
+	KUNIT_EXPECT_EQ(test, modes[0].mode.flags, 0U);
+	kfree(modes);
+
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	ctx.metadata_timing = true;
+	modes = enumerate_modes(&ctx, &count, 600, 330, 0, false, false);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_TRUE(test, modes[0].preferred);
+	KUNIT_EXPECT_TRUE(test, modes[0].mode.type & DRM_MODE_TYPE_PREFERRED);
+	KUNIT_EXPECT_TRUE(test, modes[0].metadata_timing_valid);
+	KUNIT_EXPECT_EQ(test, modes[0].metadata_sync_flags,
+			(u32)(DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC));
+	/* The published mode is unchanged: only the EDID timing takes the polarity. */
+	KUNIT_EXPECT_EQ(test, modes[0].mode.flags, 0U);
+	KUNIT_EXPECT_EQ(test, modes[0].mode.clock, 148500);
+
+	preferred = modes[0].mode;
+	preferred.flags |= modes[0].metadata_sync_flags;
+	kfree(modes);
+	edid = dcp_metadata_edid(&metadata, &preferred);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, edid);
+	raw = drm_edid_raw(edid);
+	KUNIT_EXPECT_EQ(test, be16_to_cpu(raw->product_id.manufacturer_name),
+			(u16)(('A' - '@') << 10 | ('C' - '@') << 5 | ('R' - '@')));
+	KUNIT_EXPECT_EQ(test, le16_to_cpu(raw->product_id.product_code), 2895);
+	KUNIT_EXPECT_EQ(test, raw->detailed_timings[1].data.other_data.type,
+			EDID_DETAIL_MONITOR_NAME);
+	KUNIT_EXPECT_MEMEQ(test, raw->detailed_timings[1].data.other_data.data.str.str,
+			   "QG270 S3\n", 9);
+	KUNIT_EXPECT_EQ(test, le16_to_cpu(raw->detailed_timings[0].pixel_clock), 14850);
+	drm_edid_free(edid);
+}
+
 static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_score_presence),
 	KUNIT_CASE(parser_legacy_ties),
@@ -1271,6 +1374,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_dimensions_lifetime),
 	KUNIT_CASE(parser_catalog_release),
 	KUNIT_CASE(parser_property_bounds),
+	KUNIT_CASE(parser_desktop_metadata_timing),
 	{}
 };
 

@@ -21,6 +21,12 @@ struct dcp_parse_ctx {
 	/* External H17P candidates require separate publication/lookup proof. */
 	bool automatic_1080p180_rgb8;
 	bool ambiguous_180hz;
+	/*
+	 * A desktop 26.x external processor: read the sink timing keys that
+	 * describe the preferred timing for the firmware-derived EDID, without
+	 * the H17P external color policy.
+	 */
+	bool metadata_timing;
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/*
 	 * T6030 external processor audio elements (DCP firmware 14.7, external
@@ -124,6 +130,8 @@ struct dcp_display_mode {
 	bool preferred;
 	bool metadata_timing_valid;
 	bool automatic_rgb8_quirk;
+	/* The sync polarity flags of the timing, if it reports them */
+	u32 metadata_sync_flags;
 	/*
 	 * The best virtual color element of the timing, which the desktop
 	 * 26.x firmware selects first to bootstrap its generic pipe (valid if

@@ -360,7 +360,10 @@ def policy(root):
     callback_types = '\n'.join(block(dptx, marker)+' __packed;' for marker in ('struct dptxport_apcall_link_rate {', 'struct dptxport_apcall_set_active_lane_count {'))
     callback = block(dptx, 'static int dptxport_call_link_config(')
     dcp = (base/'dcp.c').read_text()
-    connection = '\n'.join(block(dcp, marker) for marker in (
+    # The modelled DCP is the H17P external one, never a desktop 26.x processor.
+    connection = 'static bool dcp_sink_metadata(struct apple_dcp *d) { (void)d; return false; }\n' + \
+        'static void dcp_desktop_metadata_new_sink(struct apple_dcp *d) { (void)d; assert(0); }\n' + \
+        '\n'.join(block(dcp, marker) for marker in (
         'void dcp_firmware_metadata_connection(', 'static void dcp_firmware_metadata_present_locked(',
         'static void dcp_announce_kick(', 'void dcp_firmware_metadata_announced(',
         'void dcp_firmware_metadata_hotplug('))

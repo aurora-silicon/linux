@@ -552,9 +552,39 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
 }
 
-static bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
+/*
+ * A desktop 26.x external processor has no dcpav-service-epic to read the
+ * sink's EDID through, but exports the TimingElements and DisplayAttributes
+ * of every sink it drives, on HDMI and Type-C alike.
+ */
+static bool dcp_sink_metadata(struct apple_dcp *dcp)
 {
-	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+	return dcp->hw.sink_metadata_edid;
+}
+
+bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+	       dcp_sink_metadata(dcp);
+}
+
+/*
+ * Such metadata belongs to the sink the firmware reports, as these
+ * processors have no cable generation of their own: each sink change starts
+ * a new connection, which the metadata of an earlier sink can never match.
+ */
+static void dcp_desktop_metadata_new_sink(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	dcp->metadata.attributes_valid = false;
+	dcp->metadata.timing_valid = false;
+	dcp->metadata.epoch = (struct dcp_metadata_epoch) {
+		.generation = dcp->metadata.epoch.generation + 1,
+		.connected = true,
+	};
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected)
@@ -563,6 +593,10 @@ void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, boo
 
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return;
+	if (dcp_sink_metadata(dcp)) {
+		dcp_desktop_metadata_new_sink(dcp);
+		return;
+	}
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	if (generation != dcp->metadata.epoch.generation || !connected) {
 		dcp->rate_proof.connection_sequence++;
@@ -634,6 +668,12 @@ void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 	unsigned long flags;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	/*
+	 * A desktop 26.x link can bounce without the firmware describing its
+	 * sink again: the cable and HDMI HPD paths report a sink change.
+	 */
+	if (dcp_sink_metadata(dcp))
 		return;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	if (connected) {
@@ -725,6 +765,8 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 		    !dcp->modes[i].metadata_timing_valid)
 			continue;
 		dcp->metadata.preferred = dcp->modes[i].mode;
+		/* Desktop 26.x publishes its modes without their polarity. */
+		dcp->metadata.preferred.flags |= dcp->modes[i].metadata_sync_flags;
 		dcp->metadata.timing_ticket = dcp->chunks.metadata_ticket;
 		dcp->metadata.timing_valid = true;
 		break;
@@ -2653,6 +2695,9 @@ static void disconnected_hpd_event(struct apple_connector *con)
 		struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 		WRITE_ONCE(dcp->ext_backlight, false);
+		/* Nothing else reports an HDMI unplug to the firmware metadata. */
+		if (dcp_sink_metadata(dcp))
+			dcp_desktop_metadata_new_sink(dcp);
 	}
 
 	/* May run with DRM modeset locks held; defer property/cache cleanup. */
@@ -5302,6 +5347,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/* The display such a processor finds at boot is its first sink. */
+	if (dcp_sink_metadata(dcp))
+		dcp_desktop_metadata_new_sink(dcp);
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		if (!dcp->hw.firmware_clock ||
@@ -6201,6 +6249,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6041 = {
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6041_dcpext = {
 	.num_dptx_ports = 2,
+	.sink_metadata_edid = true,
 };
 
 static const struct of_device_id of_match[] = {

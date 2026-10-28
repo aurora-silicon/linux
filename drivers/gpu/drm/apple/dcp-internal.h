@@ -216,6 +216,12 @@ struct apple_dcp_hw_data {
 	 * (the T8122 dcpext), see dcp_fw_is_14_7().
 	 */
 	bool fw_14_7_endpoints;
+	/*
+	 * An external processor with no DCPAV service to read the EDID
+	 * through, whose sinks' EDID is built from their firmware metadata
+	 * (desktop 26.x), see dcp_sink_metadata().
+	 */
+	bool sink_metadata_edid;
 };
 
 enum dcp_test_point {
@@ -777,6 +783,7 @@ static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
 	       iomfb_is_m4(dcp);
 }
 
+bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp);
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
 void dcp_firmware_metadata_announced(struct apple_dcp *dcp);
