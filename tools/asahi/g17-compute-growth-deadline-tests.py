@@ -27,15 +27,17 @@ def fixture():
     runtime = (ROOT / 'runtime.rs').read_text()
     prep = (ROOT / 'preparation.rs').read_text()
     admission = (item(prep, "pub(super) struct Admission<'a>") + '\n' +
-                 item(prep, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()')
+                 item(prep, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
     methods = '\n'.join(item(runtime, sig) for sig in ['    fn grow_compute(', '    fn finish_uninstalled_compute('])
     methods = methods.replace('super::object::Allocator', 'Allocator').replace('super::freelist::Pages', 'Pages')
     return r'''
 #![allow(dead_code)]
+use std::cell::Cell;
 use std::sync::{Mutex,MutexGuard,atomic::{AtomicBool,AtomicU64,Ordering,fence}};
 type Result<T=()> = std::result::Result<T,i32>;
 type KBox<T> = Box<T>;
 const EIO:i32=-5;const EAGAIN:i32=-11;const ENODEV:i32=-19;const EBUSY:i32=-16;const ECANCELED:i32=-125;
+const RECOVERY_WAIT_MS:u32=26_000;
 static NOW:AtomicU64=AtomicU64::new(0);static ALIAS:AtomicBool=AtomicBool::new(false);static PAGES:AtomicBool=AtomicBool::new(false);
 static RESERVED:AtomicBool=AtomicBool::new(false);static ABORTED:AtomicBool=AtomicBool::new(false);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
@@ -112,7 +114,7 @@ fn main(){
 def main():
     source = fixture()
     mutants = [('fixed', source, ''),
-               ('ignore-shared-deadline', source.replace('if now_ns() >= self.deadline', 'if false').replace('if remaining == 0 { return Err(EBUSY); }', ''), 'growth admission exceeded'),
+               ('ignore-shared-deadline', source.replace('if now_ns() >= self.deadline.get()', 'if false').replace('if remaining == 0 { return Err(EBUSY); }', ''), 'growth admission exceeded'),
                ('keep-growth-alias', source.replace('                drop(alias.take());', ''), 'growth aliases must precede')]
     with tempfile.TemporaryDirectory(prefix='g17-compute-growth-') as tmp:
         for name, code, expected in mutants:
