@@ -14,7 +14,8 @@
 //!   published (`Firmware::map_pb`) and, for the VM of the flights, when a chunk is backed
 //!   ([`VmState::map_heap`], [`VmState::map_chunk`]);
 //! - leave it unbound until a runnable job needs a TTBAT slot. Each published job holds
-//!   its binding through completion; failed published jobs retain theirs until reboot.
+//!   its binding through completion; failed published jobs retain theirs until their last
+//!   reference drops (until reboot for jobs retained after a fail-stop).
 //!
 //! The registry keeps a VM's state while its client handle is open. Queues and jobs retain
 //! closed VMs until their last reference drops.

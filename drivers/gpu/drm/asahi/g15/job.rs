@@ -21,7 +21,7 @@
 //! The engine owns an `Arc<Job>` from [`super::Firmware::enqueue`] on. It completes the job
 //! exactly once with [`Job::complete`] (later calls are ignored), through [`Completions`]
 //! collected under the device lock and [`complete_all`] after it is dropped. A job whose storage
-//! the firmware may still reference stays in `Engine::retained` (failed jobs until reboot): its
+//! the firmware may still reference after a fail-stop stays in `Engine::retained` until reboot: its
 //! [`mmu::VmJobGuard`] keeps the VM's mappings and its binding keeps the VM's TTBAT slot until
 //! the last `Arc<Job>` drops.
 

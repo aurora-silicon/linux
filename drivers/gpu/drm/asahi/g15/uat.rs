@@ -26,7 +26,8 @@
 //! redundant but harmless.)
 //!
 //! Jobs acquire exclusive TTBAT slots without waiting at publication (`mmu::Uat::try_bind`)
-//! and return them after successful retirement; failed published jobs retain their slots.
+//! and return them after successful retirement. Failed published jobs retain their slots until
+//! their last reference drops (until reboot for jobs retained after a fail-stop).
 //! The shared layer writes TTBAT `(root | 1 | slot << 48, TABLES | 1 |
 //! slot << 48)` under the PPL lock and invalidates the slot's ASID.
 

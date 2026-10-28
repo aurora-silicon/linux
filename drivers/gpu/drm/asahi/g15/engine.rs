@@ -920,7 +920,9 @@ impl Firmware {
                 let encoded = (|| {
                     for k in 0..n2 {
                         match command(&j2, k).ok_or(EINVAL)? {
-                            Command::Compute(c) => self.prefix_compute(&j2, c, &mut pf, f, false)?,
+                            Command::Compute(c) => {
+                                self.prefix_compute(&j2, c, &mut pf, f, false)?
+                            }
                             Command::Render(_) => return Err(EINVAL),
                         }
                     }
