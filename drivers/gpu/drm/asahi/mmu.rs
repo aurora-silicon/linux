@@ -3252,6 +3252,7 @@ impl Uat {
     }
 
     /// Binds a VM without waiting for another slot owner to retire.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn try_bind(&self, vm: &Vm) -> Result<VmBind> {
         self.bind_inner(vm, false)
     }
