@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        8%{?dist}
+Release:        9%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -24,6 +24,7 @@ Source7:        fprintd-no-timeout.conf.in
 Source8:        logind-aurora-sep.conf
 Source9:        aurora-sep-greeter-fingerprint
 Source10:       aurora-sep-greeter-fingerprint.service
+Source14:       aurora-sep-greeter-refresh.service
 Source11:       aurora_sep.te
 Source12:       aurora_sep.fc
 Source13:       OS-IDENTITY.md
@@ -84,6 +85,8 @@ unit() {
 unit %{SOURCE0} %{SOURCE1} aurora-sep-load
 unit %{SOURCE5} %{SOURCE6} aurora-sep-ready
 unit %{SOURCE9} %{SOURCE10} aurora-sep-greeter-fingerprint
+install -Dpm 0644 %{SOURCE14} %{buildroot}%{_unitdir}/aurora-sep-greeter-refresh.service
+sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/aurora-sep-greeter-fingerprint|\1%{_libexecdir}/aurora-sep-greeter-fingerprint|" %{buildroot}%{_unitdir}/aurora-sep-greeter-refresh.service
 install -Dpm 0644 %{SOURCE2} \
     %{buildroot}%{_unitdir}/fprintd.service.d/aurora-sep.conf
 grep -qx 'ExecStart=%{_libexecdir}/fprintd' %{_unitdir}/fprintd.service
@@ -98,14 +101,14 @@ install -Dpm 0644 %{modulename}.pp.bz2 \
     %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{modulename}.pp.bz2
 
 %post
-%systemd_post aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
+%systemd_post aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
 
 %preun
-%systemd_preun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
+%systemd_preun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
 
 %postun
 # Never restart them: the driver attaches to the enclave once per boot.
-%systemd_postun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
+%systemd_postun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service
 
 %pre selinux
 %selinux_relabel_pre -s %{selinuxtype}
@@ -134,6 +137,7 @@ fi
 %{_unitdir}/aurora-sep.service
 %{_unitdir}/aurora-sep-ready.service
 %{_unitdir}/aurora-sep-greeter-fingerprint.service
+%{_unitdir}/aurora-sep-greeter-refresh.service
 %dir %{_unitdir}/fprintd.service.d
 %{_unitdir}/fprintd.service.d/aurora-sep.conf
 %{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
@@ -145,6 +149,10 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Wed Oct 28 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-9
+- Start the login screen without waiting for Touch ID, and show it again
+  once Touch ID is ready if nobody has logged in yet
+
 * Mon Oct 19 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-7
 - XART-SAFETY.md: what the xART guard allows for restore, use, setup and
   recovery, per platform, and what a rollback does to its list
