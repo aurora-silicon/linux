@@ -2095,6 +2095,7 @@ F:	Documentation/PCI/controller/apple-t8140.rst
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
+F:	Documentation/devicetree/bindings/media/apple,t8132-isp.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
 F:	Documentation/devicetree/bindings/mux/apple,display-crossbar.yaml
 F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
