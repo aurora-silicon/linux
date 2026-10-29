@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        8%{?dist}
+Release:        9%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -61,7 +61,8 @@ Requires(post): selinux-policy-%{selinuxtype}
 %description selinux
 Labels /dev/sep-bio, the Apple SEP driver's Touch ID device, and lets fprintd
 open it. The targeted policy otherwise leaves the device as device_t, which
-fprintd may not open, so fprintd lists no fingerprint reader.
+fprintd may not open, so fprintd lists no fingerprint reader. It also lets
+fprintd read input event devices, for libfprint's lid switch follower.
 
 %prep
 %setup -q -c -T
@@ -145,6 +146,11 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Thu Oct 29 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-9
+- aurora-sep-selinux: name the device type aurora_sep_device_t, as the
+  distribution packages do, let fprintd read input devices for the lid
+  follower and let the readiness helpers open the device as init_t
+
 * Mon Oct 19 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-7
 - XART-SAFETY.md: what the xART guard allows for restore, use, setup and
   recovery, per platform, and what a rollback does to its list
