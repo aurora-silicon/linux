@@ -81,6 +81,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/errno.h>
+#include <linux/fwnode.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kstrtox.h>
@@ -2397,6 +2398,92 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
 	return ret;
 }
 
+/*
+ * The Type-C core passes over a mode switch inside a disabled node, so a port
+ * controller that probes before dcpext1 is enabled only takes the USB muxes.
+ * Taking the display ones afterwards meant probing it again, and that tears
+ * its USB host down while the devices behind it are being enumerated. Instead,
+ * each port controller wired to a route waits for the processor that registers
+ * the route: a supplier link from the controller to that processor makes it
+ * probe once, when it can take every mux it is wired to.
+ */
+static struct fwnode_handle *staged_port_ctrls[ARRAY_SIZE(t6041_usbc_nodes)];
+static unsigned int staged_nr_port_ctrls;
+
+/* The port controller wired to a route (the parent of the connector at its far end). */
+static struct device_node *staged_route_port_ctrl(struct device_node *route)
+{
+	struct device_node *ep, *connector, *ctrl;
+
+	ep = of_graph_get_next_endpoint(route, NULL);
+	connector = ep ? of_graph_get_remote_port_parent(ep) : NULL;
+	ctrl = connector ? of_get_parent(connector) : NULL;
+	of_node_put(connector);
+	of_node_put(ep);
+	return ctrl;
+}
+
+static void __init staged_hold_port_controllers(void)
+{
+	struct device_node *route, *routes, *dcp, *ctrl;
+	unsigned int i, k;
+
+	for (i = 0; i < ARRAY_SIZE(t6041_usbc_nodes); i++) {
+		if (!staged_is_route(t6041_usbc_nodes[i]))
+			continue;
+		route = of_find_node_by_path(t6041_usbc_nodes[i]);
+		if (!route)
+			continue;
+		routes = of_get_parent(route);
+		dcp = routes ? of_get_parent(routes) : NULL;
+		ctrl = staged_route_port_ctrl(route);
+		of_node_put(routes);
+		of_node_put(route);
+		for (k = 0; ctrl && k < staged_nr_port_ctrls; k++)
+			if (staged_port_ctrls[k] == of_fwnode_handle(ctrl))
+				break;
+		/*
+		 * A disabled port controller never gets a device: a link from it
+		 * would land on its bound bus controller as a sync-state-only
+		 * link, which the device core refuses.
+		 */
+		if (ctrl && dcp && k == staged_nr_port_ctrls && of_device_is_available(ctrl) &&
+		    !fwnode_link_add(of_fwnode_handle(ctrl), of_fwnode_handle(dcp), 0))
+			staged_port_ctrls[staged_nr_port_ctrls++] =
+				fwnode_handle_get(of_fwnode_handle(ctrl));
+		of_node_put(dcp);
+		of_node_put(ctrl);
+	}
+}
+
+/*
+ * The processors stay off: drop the wait, so that the port controllers probe
+ * now, with the USB muxes only. By this time the controllers' other suppliers
+ * are device links; what is left are links to nodes without a device.
+ */
+static void staged_release_port_controllers(void)
+{
+	struct device *dev;
+
+	while (staged_nr_port_ctrls) {
+		struct fwnode_handle *fwnode = staged_port_ctrls[--staged_nr_port_ctrls];
+
+		fwnode_links_purge(fwnode);
+		dev = get_device(READ_ONCE(fwnode->dev));
+		if (dev && !READ_ONCE(dev->driver) && device_attach(dev) < 0)
+			dev_err(dev, "probe without the display routes failed\n");
+		put_device(dev);
+		fwnode_handle_put(fwnode);
+	}
+}
+
+/* The processors are bound: the port controllers probe through their supplier links. */
+static void staged_forget_port_controllers(void)
+{
+	while (staged_nr_port_ctrls)
+		fwnode_handle_put(staged_port_ctrls[--staged_nr_port_ctrls]);
+}
+
 static struct device_node *staged_display;
 static struct device_node *staged_pmp;
 static atomic_t staged_started = ATOMIC_INIT(0);
@@ -2407,63 +2494,7 @@ static void staged_fallback(const char *why)
 	int ret = staged_set(staged_display, false, NULL, true, "disabled", "okay");
 
 	staged_err("%s: external displays stay off, internal panel only (%d)\n", why, ret);
-}
-
-/*
- * The Type-C core treats a mode switch below a disabled node as absent, so the
- * port controllers, which probe before dcpext1 is enabled, only took the USB
- * muxes. Once dcpext1 is bound (its route mode switches are registered), let
- * each controller wired to a route probe again, so that it takes them too.
- */
-static void staged_reprobe_port_controllers(void)
-{
-	struct device *done[ARRAY_SIZE(t6041_usbc_nodes)] = {};
-	struct device_node *dcp, *np, *ep, *connector, *ctrl;
-	struct device *dev = NULL;
-	unsigned int i, n = 0, tries;
-
-	dcp = of_find_node_by_path("/dcp@602e00000");
-	for (tries = 0; dcp && tries < 150; tries++) {
-		dev = dcp->fwnode.dev;
-		if (dev && READ_ONCE(dev->driver))
-			break;
-		msleep(200);
-	}
-	of_node_put(dcp);
-	if (!dev || !READ_ONCE(dev->driver)) {
-		staged_err("dcpext1 not bound, port controllers left as they are\n");
-		return;
-	}
-	for (i = 0; i < ARRAY_SIZE(t6041_usbc_nodes); i++) {
-		unsigned int k;
-
-		if (!staged_is_route(t6041_usbc_nodes[i]))
-			continue;
-		np = of_find_node_by_path(t6041_usbc_nodes[i]);
-		ep = np ? of_graph_get_next_endpoint(np, NULL) : NULL;
-		connector = ep ? of_graph_get_remote_port_parent(ep) : NULL;
-		ctrl = connector ? of_get_parent(connector) : NULL;
-		dev = ctrl ? get_device(ctrl->fwnode.dev) : NULL;
-		of_node_put(ctrl);
-		of_node_put(connector);
-		of_node_put(ep);
-		of_node_put(np);
-		if (!dev)
-			continue;
-		for (k = 0; k < n && done[k] != dev; k++)
-			;
-		if (k < n || !READ_ONCE(dev->driver)) {
-			put_device(dev);
-			continue;
-		}
-		done[n++] = dev;
-		if (device_reprobe(dev))
-			dev_err(dev, "probe again failed\n");
-		else
-			dev_info(dev, "probed again for the display routes\n");
-	}
-	while (n)
-		put_device(done[--n]);
+	staged_release_port_controllers();
 }
 
 /*
@@ -2533,7 +2564,7 @@ static void staged_power_up(struct work_struct *work)
 		return;
 	}
 	staged_info("processors and display subsystem enabled\n");
-	staged_reprobe_port_controllers();
+	staged_forget_port_controllers();
 }
 static DECLARE_WORK(staged_power_up_work, staged_power_up);
 
@@ -2582,6 +2613,7 @@ static void __init gate_t6041_staged(void)
 		staged_err("could not prepare the tree: %d, nothing enabled\n", ret);
 		return;
 	}
+	staged_hold_port_controllers();
 	ret = bus_register_notifier(&platform_bus_type, &staged_pmp_nb);
 	if (ret) {
 		staged_fallback("no bus notifier");
