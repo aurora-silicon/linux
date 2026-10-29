@@ -24,6 +24,32 @@ allOf:
     then:
       required:
         - power-domains
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-dwc3
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 5
+        reg-names:
+          items:
+            - const: dwc3-core
+            - const: dwc3-apple
+            - const: drd-cfg
+            - const: drd-bulk
+            - const: drd-ausbc
+      required:
+        - apple,tunable-bulk-default
+        - apple,tunable-gbl-default
+        - apple,tunable-gbl-host
+        - apple,tunable-cio-default
+        - apple,tunable-debug-default
+        - apple,tunable-cfg-host
+        - apple,tunable-link-default
+        - apple,tunable-ausbc-default
 
 $defs:
   apple,tunable:
@@ -51,22 +77,17 @@ properties:
               - apple,t8140-dwc3
               - apple,t8142-dwc3
           - const: apple,t8103-dwc3
+      - const: apple,t6050-dwc3
       - const: apple,t8103-dwc3
       - const: apple,t8132-dwc3
 
   reg:
     minItems: 2
-    items:
-      - description: Core DWC3 region
-      - description: Apple-specific DWC3 region
-      - description: Controller configuration block (T6040)
+    maxItems: 5
 
   reg-names:
     minItems: 2
-    items:
-      - const: dwc3-core
-      - const: dwc3-apple
-      - const: drd-cfg
+    maxItems: 5
 
   interrupts:
     maxItems: 1
@@ -99,6 +120,29 @@ properties:
   apple,tunable-link:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the link registers of the Apple region.
+
+  apple,tunable-bulk-default:
+    $ref: "#/$defs/apple,tunable"
+    description: Producer-supplied offset, mask and value register tuples
+
+
+
+  apple,tunable-cio-default:
+    $ref: "#/$defs/apple,tunable"
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-debug-default:
+    $ref: "#/$defs/apple,tunable"
+    description: Producer-supplied offset, mask and value register tuples
+
+
+  apple,tunable-link-default:
+    $ref: "#/$defs/apple,tunable"
+    description: Producer-supplied offset, mask and value register tuples
+
+  apple,tunable-ausbc-default:
+    $ref: "#/$defs/apple,tunable"
+    description: Producer-supplied offset, mask and value register tuples
 
 required:
   - compatible
