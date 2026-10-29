@@ -201,7 +201,7 @@ bool dcp_h17p_external_ready(struct device_node *np)
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
-MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
+MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
 
 bool hdmi_audio;
 module_param(hdmi_audio, bool, 0644);
@@ -4923,6 +4923,19 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
 }
 
 /*
+ * The boot loader keeps the notch rows in its framebuffer when the OS is to
+ * drive the full panel (aura: chosen.asahi,show-notch=1). Follow it, so the
+ * mode covers the same rows as the boot framebuffer did.
+ */
+static bool boot_show_notch(void)
+{
+	const char *val;
+
+	return !of_property_read_string(of_chosen, "asahi,show-notch", &val) &&
+	       !strcmp(val, "1");
+}
+
+/*
  * T8122 dcpext (DCP_FIRMWARE_V_14_7_TEMPLATE): if the PMP runs, the display
  * gate added its DISPEXT request and pointed the dcpext at it
  * (apple,pmp-report). As on T6030, run the processor only once the PMP has
@@ -5068,7 +5081,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
 
-	if (!show_notch)
+	if (!show_notch && !boot_show_notch())
 		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
 					   &dcp->notch_height);
 
