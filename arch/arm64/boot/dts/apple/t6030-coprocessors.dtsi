@@ -2,12 +2,21 @@
 /* Disabled coprocessor interfaces; firmware handoff remains a loader job. */
 
 &soc {
+	/*
+	 * iBoot hands over a running SEP (ADT sepfw-load-at-boot). Keep Linux
+	 * off its DART at boot; apple_sep enables it when the driver binds. The
+	 * SEP only accepts IOVAs in the window iBoot programmed (ADT vm-base
+	 * 0x10000004000, vm-size 0xffff0000), which carries the BIT(40) alias
+	 * the DART translates.
+	 */
 	sep_dart: iommu@29cac0000 {
 		compatible = "apple,t6030-dart", "apple,t8110-dart";
 		reg = <0x2 0x9cac0000 0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 372 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+		apple,dma-offset = /bits/ 64 <0x0>;
 		status = "disabled";
 	};
 
