@@ -1513,10 +1513,11 @@ static void cd321x_resume_work(struct work_struct *work)
 
 	if (!tps6598x_read_status(tps, &status))
 		goto retry;
+	/* Without a plug too, or a power supply removed in sleep stays online */
+	if (!tps6598x_read_power_status(tps))
+		goto retry;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
-		if (!tps6598x_read_power_status(tps))
-			goto retry;
 		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD &&
 		    tps6598x_read_partner_identity(tps))
 			goto retry;
