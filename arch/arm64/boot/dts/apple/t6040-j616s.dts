@@ -329,6 +329,13 @@
 	 * highest state any zone asks for and goes back to the SMC once no
 	 * zone asks for anything. States 1-8 of a fan run it from its minimum
 	 * (1350 rpm) to its maximum (5777 rpm) in even steps.
+	 *
+	 * The CPU die ladder follows macOS 26.6.2 on this machine under 300 s
+	 * of all-core load at full clocks (P 3852, E 2592 MHz, never
+	 * throttled): the fans stay off up to TCMz ~100 C, start at their
+	 * minimum, leave it near 104.5 C, and hold the die at a steady 106.5 C
+	 * with 3450/3730 rpm (60-65% of maximum), after a 110.9 C peak. Full
+	 * speed is kept for 111 C, just under the 113 C passive trip.
 	 */
 #define J616S_FAN_TRIP(label, node, temp, hyst)	\
 	label: node {					\
@@ -344,6 +351,13 @@
 	J616S_FAN_TRIP(zone##_fan4, trip-fan4, 90000, 5000)	\
 	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 95000, 5000)
 
+#define J616S_CPU_FAN_TRIPS(zone)				\
+	J616S_FAN_TRIP(zone##_fan1, trip-fan1, 100000, 5000)	\
+	J616S_FAN_TRIP(zone##_fan2, trip-fan2, 104000, 3000)	\
+	J616S_FAN_TRIP(zone##_fan3, trip-fan3, 106000, 3000)	\
+	J616S_FAN_TRIP(zone##_fan4, trip-fan4, 108000, 2000)	\
+	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 111000, 2000)
+
 #define J616S_FAN_MAP(trip_label, node, state)			\
 	node {							\
 		trip = <&trip_label>;				\
@@ -358,6 +372,13 @@
 	J616S_FAN_MAP(zone##_fan4, map-fan4, 5)		\
 	J616S_FAN_MAP(zone##_fan5, map-fan5, 8)
 
+#define J616S_CPU_FAN_MAPS(zone)			\
+	J616S_FAN_MAP(zone##_fan1, map-fan1, 1)		\
+	J616S_FAN_MAP(zone##_fan2, map-fan2, 2)		\
+	J616S_FAN_MAP(zone##_fan3, map-fan3, 4)		\
+	J616S_FAN_MAP(zone##_fan4, map-fan4, 5)		\
+	J616S_FAN_MAP(zone##_fan5, map-fan5, 8)
+
 	thermal-zones {
 		cpu-die-thermal {
 			polling-delay-passive = <1000>;
@@ -365,7 +386,7 @@
 			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
 			trips {
-				J616S_FAN_TRIPS(cpu_die)
+				J616S_CPU_FAN_TRIPS(cpu_die)
 
 				cpu_die_passive: cpu-die-passive {
 					temperature = <113000>;
@@ -381,7 +402,7 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(cpu_die)
+				J616S_CPU_FAN_MAPS(cpu_die)
 
 				map-e {
 					trip = <&cpu_die_passive>;
