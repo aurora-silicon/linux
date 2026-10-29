@@ -201,7 +201,7 @@ bool dcp_h17p_external_ready(struct device_node *np)
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
-MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
+MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
 
 static bool dcpext_probe;
 module_param(dcpext_probe, bool, 0444);
@@ -4840,6 +4840,19 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
 }
 
 /*
+ * The boot loader keeps the notch rows in its framebuffer when the OS is to
+ * drive the full panel (aura: chosen.asahi,show-notch=1). Follow it, so the
+ * mode covers the same rows as the boot framebuffer did.
+ */
+static bool boot_show_notch(void)
+{
+	const char *val;
+
+	return !of_property_read_string(of_chosen, "asahi,show-notch", &val) &&
+	       !strcmp(val, "1");
+}
+
+/*
  * The M3 internal displays (14.x and 26.6 IOMFB) also accept
  * appledrm.t6030_show_notch=1, the switch existing J613/T6030 installs pass,
  * so the panel comes up at its full height (2560x1664 on the J613) instead
@@ -4847,10 +4860,12 @@ static bool dcp_external_is_idle(struct apple_dcp *dcp)
  */
 static bool dcp_show_notch(struct apple_dcp *dcp)
 {
+	bool show = show_notch || boot_show_notch();
+
 	if (dcp->fw_compat != DCP_FIRMWARE_V_14_7 &&
 	    dcp->fw_compat != DCP_FIRMWARE_V_26_6)
-		return show_notch;
-	return show_notch || t6030_show_notch;
+		return show;
+	return show || t6030_show_notch;
 }
 
 /*
