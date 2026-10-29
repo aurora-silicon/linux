@@ -170,6 +170,7 @@ struct dchid_iface {
 	bool deferred;
 	bool starting;
 	bool open;
+	bool reports_enabled;
 	struct completion ready;
 
 	void *hid_desc;
@@ -802,6 +803,28 @@ static int dchid_open(struct hid_device *hdev)
 
 	if (READ_ONCE(iface->dchid->stopping))
 		return -ESHUTDOWN;
+
+	/*
+	 * Announcing MTP firmware can send keyboard READY during enumeration
+	 * without streaming input. Enable it when the first HID consumer opens,
+	 * after interface creation, and require a fresh readiness notification.
+	 * A live bootloader handoff already has keyboard reporting enabled.
+	 */
+	if (!strcmp(iface->name, "keyboard") && !iface->reports_enabled &&
+	    of_property_read_bool(iface->dchid->dev->of_node, "apple,no-stm") &&
+	    of_property_match_string(iface->dchid->helper_link->supplier->of_node,
+				    "apple,rtkit-handoff", "mtp-live-v1") < 0) {
+		reinit_completion(&iface->ready);
+		ret = dchid_enable_interface(iface);
+		if (ret < 0)
+			return ret;
+		if (!wait_for_completion_timeout(&iface->ready,
+						msecs_to_jiffies(START_TIMEOUT_MS))) {
+			dev_err(iface->dchid->dev, "keyboard input enable timed out\n");
+			return -ETIMEDOUT;
+		}
+		iface->reports_enabled = true;
+	}
 
 	if (!completion_done(&iface->ready)) {
 		ret = dchid_start_interface(iface);
