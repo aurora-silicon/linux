@@ -6572,30 +6572,37 @@ static s32 brcmf_get_assoc_ies(struct brcmf_cfg80211_info *cfg,
 	s32 err;
 
 	brcmf_clear_assoc_ies(cfg);
-	err = brcmf_fil_iovar_data_get_len(ifp, "assoc_info", &assoc_info,
-					   sizeof(assoc_info), &received);
+	buffer = kzalloc(WL_EXTRA_BUF_MAX, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+	/*
+	 * The firmware fails the query with a buffer shorter than its whole
+	 * association record, so ask with WL_ASSOC_INFO_MAX bytes and take
+	 * the two lengths that lead the reply.
+	 */
+	err = brcmf_fil_iovar_data_get_len(ifp, "assoc_info", buffer,
+					   WL_ASSOC_INFO_MAX, &received);
 	if (err) {
 		bphy_err(drvr, "could not get assoc info (%d)\n", err);
-		return err;
+		goto done;
 	}
 	if (received < sizeof(assoc_info)) {
 		bphy_err(drvr, "short assoc info: received %u required %zu\n",
 			 received, sizeof(assoc_info));
-		return -EBADMSG;
+		err = -EBADMSG;
+		goto done;
 	}
+	memcpy(&assoc_info, buffer, sizeof(assoc_info));
 	req_len = le32_to_cpu(assoc_info.req_len);
 	resp_len = le32_to_cpu(assoc_info.resp_len);
 	if (req_len > WL_EXTRA_BUF_MAX || resp_len > WL_EXTRA_BUF_MAX) {
 		bphy_err(drvr, "invalid lengths in assoc info: req %u resp %u\n",
 			 req_len, resp_len);
-		return -EINVAL;
-	}
-	if (req_len || resp_len) {
-		buffer = kzalloc(WL_EXTRA_BUF_MAX, GFP_KERNEL);
-		if (!buffer)
-			return -ENOMEM;
+		err = -EINVAL;
+		goto done;
 	}
 	if (req_len) {
+		memset(buffer, 0, WL_EXTRA_BUF_MAX);
 		err = brcmf_fil_iovar_data_get_len(ifp, "assoc_req_ies", buffer,
 						   max_t(u32, req_len, WL_ASSOC_INFO_MAX),
 						   &received);
