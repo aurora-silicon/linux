@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <kunit/visibility.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/of_device.h>
@@ -8,11 +9,15 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/spmi.h>
+#include <linux/suspend.h>
 #include <linux/usb/role.h>
 
 #include "tps6598x.h"
 
 #define tps_to_sn(tps) container_of_const((tps), struct sn201202x, cd.tps)
+
+/* A sleeping controller does not answer a select; give up on it sooner. */
+#define SN201202X_ATOMIC_SELECT_MS	10
 
 static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 {
@@ -35,9 +40,15 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	if (sn->polled || sn->select_polled) {
 		int poll_err;
 
-		poll_err = read_poll_timeout(spmi_register_read, err,
-					     err || val == reg, 100, 100000,
-					     false, sdev, 0, &val);
+		if (sn->atomic)
+			poll_err = read_poll_timeout_atomic(spmi_register_read, err,
+							    err || val == reg, 100,
+							    SN201202X_ATOMIC_SELECT_MS * 1000,
+							    false, sdev, 0, &val);
+		else
+			poll_err = read_poll_timeout(spmi_register_read, err,
+						     err || val == reg, 100, 100000,
+						     false, sdev, 0, &val);
 		return err ?: poll_err;
 	}
 
@@ -190,8 +201,15 @@ static const struct of_device_id sn201202x_of_match[] = {
 	{}
 };
 
-static int sn201202x_wake(struct sn201202x *sn)
+/*
+ * In system sleep the wake interrupt is suspended, so the controller is
+ * polled as without interrupts.
+ */
+static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 {
+	/* Busy-waiting has no clock to go by: each step is charged instead */
+	int budget_ms = 500;
+	unsigned int tries = 0;
 	unsigned long deadline;
 	u8 size;
 	int ret;
@@ -200,16 +218,24 @@ static int sn201202x_wake(struct sn201202x *sn)
 	ret = spmi_command_wakeup(sn->sdev);
 	if (ret)
 		return ret;
-	if (!sn->polled)
-		return wait_for_completion_timeout(&sn->wake_completion,
-						   msecs_to_jiffies(100)) ? 0 : -ETIMEDOUT;
+	/* A WAKEUP sent while it was still going to sleep may go unanswered */
+	if (!poll && wait_for_completion_timeout(&sn->wake_completion,
+						 msecs_to_jiffies(100)))
+		return 0;
 
 	/* A sleeping ACE3 ACKs commands but returns zeros until it is awake. */
 	deadline = jiffies + msecs_to_jiffies(500);
 	do {
+		if (++tries % 20 == 0) {
+			ret = spmi_command_wakeup(sn->sdev);
+			if (ret)
+				return ret;
+		}
 		ret = regmap_sn201202x_select_reg(sn->sdev, TPS_REG_MODE);
-		if (ret == -ETIMEDOUT)
+		if (ret == -ETIMEDOUT) {
+			budget_ms -= SN201202X_ATOMIC_SELECT_MS;
 			continue;
+		}
 		if (ret)
 			return ret;
 		ret = spmi_register_read(sn->sdev, 0x1f, &size);
@@ -217,10 +243,75 @@ static int sn201202x_wake(struct sn201202x *sn)
 			return ret;
 		if (size)
 			return 0;
-		usleep_range(1000, 2000);
-	} while (time_before(jiffies, deadline));
+		if (sn->atomic)
+			mdelay(1);
+		else
+			usleep_range(1000, 2000);
+		budget_ms--;
+	} while (sn->atomic ? budget_ms > 0 : time_before(jiffies, deadline));
 
 	return -ETIMEDOUT;
+}
+
+static int sn201202x_wake(struct sn201202x *sn)
+{
+	return sn201202x_wake_poll(sn, sn->polled);
+}
+
+/*
+ * The links that wake the system when they appear in system sleep. A port
+ * attaches as a USB device before any data role swap, as it does to a
+ * charger, and a charger may still show a USB link for a moment after one:
+ * a USB link counts only with this port as the host, and from a power source
+ * only if the source is capable of USB communication.
+ */
+VISIBLE_IF_KUNIT u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st)
+{
+	u32 links = st->data_status & (TPS_DATA_STATUS_DP_CONNECTION |
+				       TPS_DATA_STATUS_TBT_CONNECTION |
+				       CD321X_DATA_STATUS_USB4_CONNECTION);
+
+	if (st->data_status & TPS_DATA_STATUS_USB_DATA_ROLE)
+		return links;
+	if (!(st->status & TPS_STATUS_PORTROLE) && !st->usb_comm)
+		return links;
+	return links | (st->data_status & (TPS_DATA_STATUS_USB2_CONNECTION |
+					   TPS_DATA_STATUS_USB3_CONNECTION));
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_sleep_links);
+
+/*
+ * The event interrupt stays live in system sleep (IRQF_NO_SUSPEND). Wake the
+ * controller to acknowledge the event, and wake the system only for a new
+ * data connection, or if the controller cannot be read. It goes back to sleep
+ * either way, as the resume expects.
+ */
+static bool sn201202x_sleep_event(struct tps6598x *tps)
+{
+	struct sn201202x *sn = tps_to_sn(tps);
+	struct cd321x_sleep_state st;
+	u32 links = 0;
+	bool wake;
+	int ret;
+
+	guard(mutex)(&tps->lock);
+	if (!READ_ONCE(sn->sleep_watch))
+		return false;
+
+	sn->atomic = true;
+	ret = sn201202x_wake_poll(sn, true);
+	if (!ret)
+		ret = cd321x_sleep_events(tps, &st);
+	if (!ret)
+		links = sn201202x_sleep_links(&st);
+	wake = ret || (links & ~sn->sleep_links);
+	if (!ret)
+		sn->sleep_links = links;
+	spmi_command_sleep(sn->sdev);
+	sn->atomic = false;
+	if (wake)
+		pm_wakeup_dev_event(tps->dev, 0, true);
+	return true;
 }
 
 static int sn201202x_probe(struct spmi_device *device)
@@ -308,6 +399,13 @@ static int sn201202x_probe(struct spmi_device *device)
 			return ret;
 	}
 
+	/*
+	 * In system sleep only the event interrupt stays live. Register access
+	 * then has to poll, which a select notification would not.
+	 */
+	if (!sn->polled && sn->select_polled)
+		tps->sleep_event = sn201202x_sleep_event;
+
 	spmi_device_set_drvdata(device, tps);
 	tps->regmap = devm_regmap_init_sn201202x(device, &tps6598x_regmap_config);
 	if (IS_ERR(tps->regmap))
@@ -343,6 +441,11 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 	struct sn201202x *sn = tps_to_sn(tps);
 	int err;
 
+	if (READ_ONCE(sn->sleep_watch)) {
+		/* Waits for a running sleep_event() */
+		disable_irq(tps->irq);
+		WRITE_ONCE(sn->sleep_watch, false);
+	}
 	err = sn201202x_wake(sn);
 	if (!err)
 		err = tipd_resume(tps);
@@ -357,6 +460,7 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 	struct sn201202x *sn = tps_to_sn(tps);
+	bool watch;
 	int err, ret;
 
 	/*
@@ -369,6 +473,19 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	err = tipd_suspend(tps);
 	if (err)
 		goto out_enable;
+	watch = tps->sleep_event && device_may_wakeup(dev) &&
+		pm_suspend_target_state == PM_SUSPEND_TO_IDLE;
+	if (watch) {
+		struct cd321x_sleep_state st;
+
+		guard(mutex)(&tps->lock);
+		/* Without a baseline, a plug-in in sleep cannot be told from a charger */
+		watch = !cd321x_sleep_events(tps, &st);
+		if (watch)
+			sn->sleep_links = sn201202x_sleep_links(&st);
+		else
+			dev_warn(dev, "port state unreadable, no wakeup for an attach\n");
+	}
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (err)
@@ -377,6 +494,10 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	    !wait_for_completion_timeout(&sn->sleep_completion, msecs_to_jiffies(100))) {
 		err = -ETIMEDOUT;
 		goto out_wake;
+	}
+	if (watch) {
+		WRITE_ONCE(sn->sleep_watch, true);
+		enable_irq(tps->irq);
 	}
 	return 0;
 

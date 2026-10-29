@@ -75,5 +75,6 @@ config TYPEC_SN201202X_KUNIT_TEST
 	help
 	  Test that the SN201202x events are not handled while the controller
 	  sleeps, and that a system suspend that fails leaves the controller
-	  awake. These tests run on a simulated SPMI bus, without accessing a
+	  awake. Also test which data status and status count as a link
+	  that wakes the system from suspend-to-idle. These tests run on a simulated SPMI bus, without accessing a
 	  physical Type-C controller.
