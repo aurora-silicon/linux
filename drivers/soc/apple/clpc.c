@@ -226,6 +226,7 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	if (!np)
 		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
 	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
+	    !of_device_is_compatible(np, "apple,t8132-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8140-clpc")) {
 		of_node_put(np);
 		return -EINVAL;
@@ -724,9 +725,11 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->hw = of_device_get_match_data(dev);
 	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
 	 * host publication/idle input, not that supplier state, drives demand.
-	 * On T8140 the same input counts submissions for dense light work.
+	 * On T8140 the same input counts submissions for dense light work. The
+	 * T8132 GPU driver reports its work through it as well.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-clpc") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8132-clpc") ||
 	    clpc->hw->gpu_dense) {
 		clpc->gpu = kzalloc_obj(*clpc->gpu);
 		if (!clpc->gpu)
