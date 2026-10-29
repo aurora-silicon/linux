@@ -36,6 +36,7 @@ mod queue;
 mod regs;
 mod slotalloc;
 mod stats;
+mod stats_raw;
 mod sysfs_exports;
 mod timestamp;
 mod usage;
