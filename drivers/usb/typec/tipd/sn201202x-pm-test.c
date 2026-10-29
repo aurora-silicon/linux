@@ -220,12 +220,55 @@ static void sn201202x_unconfirmed_sleep_failed_wakeup_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, sn201202x_test_irq_enabled(t));
 }
 
+/* As read on a J713, the dock aside */
+static const struct cd321x_sleep_state sn201202x_test_charger_attach = {
+	/* Attached as a USB3 device, before the data role swap */
+	.data_status = 0x800000e1, .status = 0x1000600d,
+};
+
+static const struct cd321x_sleep_state sn201202x_test_charger_swapped = {
+	/* A USB3 link as host for a moment after it, then none */
+	.data_status = 0x80000061, .status = 0x1000904d,
+};
+
+static const struct cd321x_sleep_state sn201202x_test_charger = {
+	.data_status = 0x80000001, .status = 0x100c90cd,
+};
+
+static const struct cd321x_sleep_state sn201202x_test_keyboard = {
+	/* Powered by this port, as are hubs */
+	.data_status = 0x00000073, .status = 0x100000fd,
+};
+
+static const struct cd321x_sleep_state sn201202x_test_dock = {
+	/* Powers this port and passes USB: a USB capable source */
+	.data_status = 0x80000073, .status = 0x100c90cd, .usb_comm = true,
+};
+
+/* In system sleep a charger is no link; a USB device, dock or display is. */
+static void sn201202x_sleep_links_test(struct kunit *test)
+{
+	struct cd321x_sleep_state dp = {
+		.data_status = TPS_DATA_STATUS_DATA_CONNECTION |
+			       TPS_DATA_STATUS_DP_CONNECTION,
+		.status = 0x100c90cd,
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_sleep_links(&sn201202x_test_charger_attach), 0);
+	KUNIT_EXPECT_EQ(test, sn201202x_sleep_links(&sn201202x_test_charger_swapped), 0);
+	KUNIT_EXPECT_EQ(test, sn201202x_sleep_links(&sn201202x_test_charger), 0);
+	KUNIT_EXPECT_NE(test, sn201202x_sleep_links(&sn201202x_test_keyboard), 0);
+	KUNIT_EXPECT_NE(test, sn201202x_sleep_links(&sn201202x_test_dock), 0);
+	KUNIT_EXPECT_EQ(test, sn201202x_sleep_links(&dp), TPS_DATA_STATUS_DP_CONNECTION);
+}
+
 static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_sleep_cycle_test),
 	KUNIT_CASE(sn201202x_failed_wakeup_test),
 	KUNIT_CASE(sn201202x_rejected_sleep_test),
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_test),
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_failed_wakeup_test),
+	KUNIT_CASE(sn201202x_sleep_links_test),
 	{}
 };
 
