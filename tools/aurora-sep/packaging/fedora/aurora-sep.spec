@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        9%{?dist}
+Release:        10%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -63,7 +63,8 @@ Requires(post): selinux-policy-%{selinuxtype}
 %description selinux
 Labels /dev/sep-bio, the Apple SEP driver's Touch ID device, and lets fprintd
 open it. The targeted policy otherwise leaves the device as device_t, which
-fprintd may not open, so fprintd lists no fingerprint reader.
+fprintd may not open, so fprintd lists no fingerprint reader. It also lets
+fprintd read input event devices, for libfprint's lid switch follower.
 
 %prep
 %setup -q -c -T
@@ -152,6 +153,11 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Fri Oct 30 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-10
+- aurora-sep-selinux: name the device type aurora_sep_device_t, as the
+  distribution packages do, let fprintd read input devices for the lid
+  follower and let the readiness helpers open the device as init_t
+
 * Wed Oct 28 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-9
 - Start the login screen without waiting for Touch ID, and show it again
   once Touch ID is ready if nobody has logged in yet

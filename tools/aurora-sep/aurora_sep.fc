@@ -1,1 +1,1 @@
-/dev/sep-bio	-c	gen_context(system_u:object_r:sep_bio_device_t,s0)
+/dev/sep-bio	-c	gen_context(system_u:object_r:aurora_sep_device_t,s0)
