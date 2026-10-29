@@ -39,6 +39,11 @@
 #define APPLE_PMGR_RESET_TIME 1
 #define APPLE_PMGR_T8132_RESET_TIME 10
 
+/* Opt-in investigation: normal power transitions do not log. */
+static bool diagnostic_trace;
+module_param(diagnostic_trace, bool, 0444);
+MODULE_PARM_DESC(diagnostic_trace, "Trace native power handoff and register writes (diagnostic)");
+
 struct apple_pmgr_ps {
 	struct device *dev;
 	struct generic_pm_domain genpd;
@@ -58,6 +63,7 @@ struct apple_pmgr_ps {
 	bool needs_reset_idle_wait;
 	bool strict_state;
 	u32 reset_time_us;
+	bool preserve_active_control;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -70,9 +76,26 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	u32 reg, cur;
 	u32 timeout = ps->strict_state ? 10000 : APPLE_PMGR_PS_SET_TIMEOUT;
 
+	if (diagnostic_trace)
+		dev_info(ps->dev, "PMGR begin %s offset=%#x requested=%#x auto=%u\n",
+			 genpd->name, ps->offset, pstate, auto_enable);
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (ret < 0)
 		return ret;
+
+	if (diagnostic_trace)
+		dev_info(ps->dev, "PMGR read %s offset=%#x value=%#x\n",
+			 genpd->name, ps->offset, reg);
+
+	/* Preserve the explicit firmware handoff when the requested active state
+	 * is already satisfied. Real transitions retain the ordinary sequence.
+	 */
+	if (ps->preserve_active_control && pstate == APPLE_PMGR_PS_ACTIVE &&
+	    FIELD_GET(APPLE_PMGR_PS_TARGET, reg) == pstate &&
+	    FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == pstate &&
+	    !(reg & (APPLE_PMGR_RESET | APPLE_PMGR_PS_RESET |
+		     APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_BUSY)))
+		return 0;
 
 	/* Resets are synchronous, and only work if the device is powered and clocked. */
 	if (reg & APPLE_PMGR_RESET && pstate != APPLE_PMGR_PS_ACTIVE)
@@ -88,7 +111,13 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		if (ps->force_reset)
 			reg_pre |= APPLE_PMGR_PS_RESET;
 
+		if (diagnostic_trace)
+			dev_info(ps->dev, "PMGR pre-write %s offset=%#x value=%#x begin\n",
+				 genpd->name, ps->offset, reg_pre);
 		regmap_write(ps->regmap, ps->offset, reg_pre);
+		if (diagnostic_trace)
+			dev_info(ps->dev, "PMGR pre-write %s offset=%#x completed\n",
+				 genpd->name, ps->offset);
 
 		ret = regmap_read_poll_timeout_atomic(
 			ps->regmap, ps->offset, cur,
@@ -110,10 +139,16 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 
 	dev_dbg(ps->dev, "PS %s: pwrstate = 0x%x: 0x%x\n", genpd->name, pstate, reg);
 
+	if (diagnostic_trace)
+		dev_info(ps->dev, "PMGR write %s offset=%#x value=%#x begin\n",
+			 genpd->name, ps->offset, reg);
 	ret = regmap_write(ps->regmap, ps->offset, reg);
 	if (ret && ps->strict_state)
 		return ret;
 	cur = reg;
+	if (diagnostic_trace)
+		dev_info(ps->dev, "PMGR write %s offset=%#x completed\n",
+			 genpd->name, ps->offset);
 
 	if (ps->externally_clocked && pstate == APPLE_PMGR_PS_ACTIVE) {
 		/*
@@ -147,7 +182,13 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		reg |= APPLE_PMGR_AUTO_ENABLE;
 		if (ps->strict_state)
 			return regmap_write(ps->regmap, ps->offset, reg);
+		if (diagnostic_trace)
+			dev_info(ps->dev, "PMGR auto-write %s offset=%#x value=%#x begin\n",
+				 genpd->name, ps->offset, reg);
 		regmap_write(ps->regmap, ps->offset, reg);
+		if (diagnostic_trace)
+			dev_info(ps->dev, "PMGR auto-write %s offset=%#x completed\n",
+				 genpd->name, ps->offset);
 	}
 
 	return ret;
@@ -465,6 +506,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,externally-clocked"))
 		ps->externally_clocked = true;
 
+	ps->preserve_active_control =
+		of_property_read_bool(node, "apple,preserve-active-control");
+
 	/* A cold-started coprocessor CPU must not be gated behind its firmware. */
 	ps->no_auto_pm = of_property_read_bool(node, "apple,no-auto-pm");
 
@@ -512,7 +556,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on, unless it must stay off */
-	if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable)
+	if (active && !ps->firmware_owned && !ps->inherited_on && !ps->no_auto_enable &&
+	    !ps->preserve_active_control)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   ps->no_auto_pm ? 0 : APPLE_PMGR_AUTO_ENABLE);
 
