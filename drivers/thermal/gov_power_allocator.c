@@ -793,12 +793,68 @@ static void power_allocator_unbind(struct thermal_zone_device *tz)
 	tz->governor_data = NULL;
 }
 
+/*
+ * Cooling devices that are not power actors, such as fans, have no power to
+ * allocate, so the governor runs those on active trip points the way the
+ * bang-bang governor does: an instance asks for its upper state once the zone
+ * reaches the trip and for nothing once it drops below the trip's hysteresis.
+ * A cooling device bound to several trips takes the deepest state asked for,
+ * so a ladder of active trips gives a stepped fan curve.
+ */
+static void power_allocator_set_active(struct thermal_instance *instance,
+				       bool on)
+{
+	instance->target = on ? instance->upper : THERMAL_NO_TARGET;
+	instance->initialized = true;
+	thermal_cdev_update_nocheck(instance->cdev);
+}
+
+static void power_allocator_trip_crossed(struct thermal_zone_device *tz,
+					 const struct thermal_trip *trip,
+					 bool upward)
+{
+	const struct thermal_trip_desc *td = trip_to_trip_desc(trip);
+	struct thermal_instance *instance;
+
+	lockdep_assert_held(&tz->lock);
+
+	if (trip->type != THERMAL_TRIP_ACTIVE)
+		return;
+
+	list_for_each_entry(instance, &td->thermal_instances, trip_node)
+		if (!power_actor_is_valid(instance))
+			power_allocator_set_active(instance, upward);
+}
+
+/*
+ * Set up the active trip instances that have no target yet: after a cooling
+ * device binds to a trip the zone already sits above, and after resume.
+ */
+static void power_allocator_init_active(struct thermal_zone_device *tz)
+{
+	const struct thermal_trip_desc *td;
+	struct thermal_instance *instance;
+
+	for_each_trip_desc(tz, td) {
+		if (td->trip.type != THERMAL_TRIP_ACTIVE ||
+		    td->trip.temperature == THERMAL_TEMP_INVALID)
+			continue;
+
+		list_for_each_entry(instance, &td->thermal_instances, trip_node)
+			if (!instance->initialized && !power_actor_is_valid(instance))
+				power_allocator_set_active(instance,
+							   tz->temperature >= td->threshold);
+	}
+}
+
 static void power_allocator_manage(struct thermal_zone_device *tz)
 {
 	struct power_allocator_params *params = tz->governor_data;
 	const struct thermal_trip *trip = params->trip_switch_on;
 
 	lockdep_assert_held(&tz->lock);
+
+	power_allocator_init_active(tz);
 
 	if (trip && tz->temperature < trip->temperature) {
 		reset_pid_controller(params);
@@ -818,6 +874,7 @@ static struct thermal_governor thermal_gov_power_allocator = {
 	.name		= "power_allocator",
 	.bind_to_tz	= power_allocator_bind,
 	.unbind_from_tz	= power_allocator_unbind,
+	.trip_crossed	= power_allocator_trip_crossed,
 	.manage		= power_allocator_manage,
 	.update_tz	= power_allocator_update_tz,
 };
