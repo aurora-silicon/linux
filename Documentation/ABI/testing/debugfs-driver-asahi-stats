@@ -1,6 +1,6 @@
 What:		/sys/kernel/debug/dri/<N>/asahi_stats
 Date:		October 2026
-Contact:	Asahi Linux GPU driver maintainers
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
 Description:
 		Read-only, root-only dump of the raw AGX firmware statistics
 		that the drm/asahi driver receives on its statistics channel.
@@ -39,7 +39,7 @@ Description:
 		- pstate: ps_min, unk1, ps_max, unk2
 		- temp_sensor: sensor_id, raw_value, scale, tmin, tmax
 
-		All counts are cumulative since boot. A rate needs two reads.
+		All counts are cumulative since the driver bound the device. A rate needs two reads.
 		The values are the raw firmware values. Their units and the
 		meaning of the util*, unk* fields are not established. A kind
 		that was never received prints count=0 and no payload. Keys
