@@ -424,6 +424,9 @@ pub(crate) fn register(drm: &AsahiDrmDevice, stats: &Arc<SpinLock<RawStatsSnapsh
     let raw = (drm as *const AsahiDrmDevice)
         .cast_mut()
         .cast::<bindings::drm_device>();
+    // `drm_debugfs_add_file()` is a static inline stub without CONFIG_DEBUG_FS, so
+    // bindgen has no binding for it and there is no file to create.
+    #[cfg(CONFIG_DEBUG_FS)]
     // SAFETY: `raw` is the live DRM device. It is registered at this point,
     // so its debugfs directory exists and the file is created in it.
     unsafe {
@@ -434,6 +437,8 @@ pub(crate) fn register(drm: &AsahiDrmDevice, stats: &Arc<SpinLock<RawStatsSnapsh
             Arc::as_ptr(stats).cast_mut().cast::<core::ffi::c_void>(),
         );
     }
+    #[cfg(not(CONFIG_DEBUG_FS))]
+    let _ = (raw, stats);
 }
 
 /// `drm_debugfs_add_file()` show callback.
@@ -443,6 +448,7 @@ pub(crate) fn register(drm: &AsahiDrmDevice, stats: &Arc<SpinLock<RawStatsSnapsh
 /// per-device payload is in `entry->file.data` (see `drm_debugfs_entry_open()`
 /// in `drivers/gpu/drm/drm_debugfs.c`). The `data` argument of the callback is
 /// the seq file start token, not the payload.
+#[cfg_attr(not(CONFIG_DEBUG_FS), allow(dead_code))]
 unsafe extern "C" fn show(
     m: *mut bindings::seq_file,
     _data: *mut core::ffi::c_void,
