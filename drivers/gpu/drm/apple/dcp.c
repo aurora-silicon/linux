@@ -754,7 +754,7 @@ void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
 void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 {
 	unsigned long flags;
-	unsigned int i;
+	unsigned int i, best = UINT_MAX;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return;
@@ -764,16 +764,30 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 	dcp->metadata.timing_valid = false;
 	if (!dcp_firmware_metadata_complete(dcp))
 		goto unlock;
+	/*
+	 * The EDID's detailed timing: the preferred mode when the firmware
+	 * describes it fully, otherwise the highest-scored timing it marks
+	 * IsPreferred, the one the sink's own EDID lists first.  An external
+	 * display's preferred mode need not be one of those.
+	 */
 	for (i = 0; i < dcp->nr_modes; i++) {
-		if (!(dcp->modes[i].mode.type & DRM_MODE_TYPE_PREFERRED) ||
-		    !dcp->modes[i].metadata_timing_valid)
+		const struct dcp_display_mode *m = &dcp->modes[i];
+
+		if (!m->metadata_timing_valid)
 			continue;
-		dcp->metadata.preferred = dcp->modes[i].mode;
+		if (best == UINT_MAX || (m->mode.type & DRM_MODE_TYPE_PREFERRED) ||
+		    (!(dcp->modes[best].mode.type & DRM_MODE_TYPE_PREFERRED) &&
+		     m->score > dcp->modes[best].score))
+			best = i;
+		if (m->mode.type & DRM_MODE_TYPE_PREFERRED)
+			break;
+	}
+	if (best != UINT_MAX) {
+		dcp->metadata.preferred = dcp->modes[best].mode;
 		/* Desktop 26.x publishes its modes without their polarity. */
-		dcp->metadata.preferred.flags |= dcp->modes[i].metadata_sync_flags;
+		dcp->metadata.preferred.flags |= dcp->modes[best].metadata_sync_flags;
 		dcp->metadata.timing_ticket = dcp->chunks.metadata_ticket;
 		dcp->metadata.timing_valid = true;
-		break;
 	}
 unlock:
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);

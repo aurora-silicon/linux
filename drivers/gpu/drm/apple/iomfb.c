@@ -2222,7 +2222,11 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 		*reason = "not-connected";
 		return -ENODEV;
 	}
-	/* The boot-like mode first, then the preferred one. */
+	/*
+	 * The preferred mode first, the one the firmware ranks highest (the
+	 * panel's native refresh), then the boot-like one: the mode that works
+	 * stays the preferred one, which is also what a desktop picks.
+	 */
 	mutex_lock(&dcp->modes_lock);
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
@@ -2241,13 +2245,11 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 	}
 	if (pref == UINT_MAX)
 		pref = 0;
+	cand[n++] = dcp->modes[pref].mode;
 	/* Only a mode within 1% of the boot loader's clock counts as boot-like. */
-	if (boot != UINT_MAX && best <= DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ / 100)
+	if (boot != UINT_MAX && best <= DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ / 100 &&
+	    boot != pref)
 		cand[n++] = dcp->modes[boot].mode;
-	else
-		boot = UINT_MAX;
-	if (pref != boot)
-		cand[n++] = dcp->modes[pref].mode;
 	mutex_unlock(&dcp->modes_lock);
 
 	st = kzalloc_obj(*st);
