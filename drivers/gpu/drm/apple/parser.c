@@ -1340,7 +1340,11 @@ static int parse_metadata_point(struct dcp_parse_ctx *handle, u32 point[2], u32 
 		if (ret)
 			return ret;
 	}
-	if (seen != (gamma ? 7 : 3) || point[0] + point[1] > 65536)
+	/*
+	 * A white point is a chromaticity.  A primary is passed on as the
+	 * sink reports it: real EDIDs carry primaries with x + y above 1.
+	 */
+	if (seen != (gamma ? 7 : 3) || (gamma && point[0] + point[1] > 65536))
 		return -EINVAL;
 	return 0;
 }
@@ -1525,7 +1529,10 @@ static int parse_metadata_luminance(struct dcp_parse_ctx *handle,
 			ret = parse_metadata_number(handle, &values[i], 0, U32_MAX);
 		}
 	}
-	if (!ret && seen == 7 && values[0] && values[1] <= values[0] &&
+	/* A sink may leave out its frame-average or minimum luminance. */
+	if (!(seen & 2))
+		values[1] = values[0];
+	if (!ret && (seen & 1) && values[0] && values[1] <= values[0] &&
 	    values[2] < values[0]) {
 		out->max_luminance = values[0];
 		out->max_fall = values[1];

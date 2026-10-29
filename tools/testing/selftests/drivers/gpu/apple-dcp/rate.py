@@ -66,9 +66,15 @@ def parser_fixture(root):
                         "Colorimetry": 10, "Depth": 10, "DynamicRange": 0, "EOTF": 0}],
         "ID": 62, "Score": 16224, "IsPreferred": True, "IsInterlaced": False, "IsVirtual": False,
     }]
+    sink = copy.deepcopy(fixture)
+    sink['Chromaticity']['Red'] = {'X': 45248, 'Y': 20992}
+    del sink['Luminance']['Min']
+    sink_raw = bytearray(struct.pack('<I', 0xd3))
+    wire(sink, sink_raw)
     timing_raw = bytearray(struct.pack('<I', 0xd3))
     wire(timing_fixture, timing_raw)
     timing_source = 'static const unsigned char timing_blob[] = {' + ','.join(map(str,timing_raw)) + '};\n'
+    timing_source += 'static const unsigned char sink_blob[] = {' + ','.join(map(str,sink_raw)) + '};\n'
     # A desktop timing with PQ elements: 10-bit preferred, unsafe ones skipped.
     def color(i, score, depth, eotf, colorimetry, encoding=0, dynamic=0):
         return {"ID": i, "Score": score, "IsVirtual": False, "PixelEncoding": encoding,
@@ -335,6 +341,19 @@ int main(int argc, char **argv)
     assert(metadata.pq && metadata.static_metadata_type1 && metadata.bt2020_rgb);
     assert(metadata.max_luminance == 27375011 && metadata.max_fall == 25652679 &&
            metadata.min_luminance == 5154);
+    {
+        /* Primaries pass as reported; a missing Min is 0, a missing frame average the Max. */
+        struct dcp_parse_ctx c;
+        struct dcp_display_metadata s;
+        assert(!parse(sink_blob, sizeof(sink_blob), &c) && !parse_display_metadata(&c, &s));
+        assert(s.chromaticity[0][0] == 45248 && s.chromaticity[0][1] == 20992);
+        assert(s.max_luminance == 27375011 && s.max_fall == 25652679 && s.min_luminance == 0);
+        const struct drm_edid *e = dcp_metadata_edid(&s, &mode);
+        assert(!IS_ERR(e));
+        const u8 *r = (const u8 *)&e->raw;
+        assert((r[27] << 2 | (r[25] >> 6 & 3)) == 707 && (r[28] << 2 | (r[25] >> 4 & 3)) == 328);
+        drm_edid_free(e);
+    }
     const struct drm_edid *edid = dcp_metadata_edid(&metadata, &mode);
     assert(!IS_ERR(edid) && edid->size == 256);
     f = fopen(argv[3], "wb"); assert(f);
@@ -1172,7 +1191,7 @@ def metadata(root, output):
     for path, value in [
         (('MaxHorizontalImageSize',), 256), (('MaxVerticalImageSize',), '33'),
         (('Chromaticity', 'Red', 'X'), True), (('Chromaticity', 'Blue', 'Y'), 65536),
-        (('Chromaticity', 'Green', 'Y'), 64000), (('DefaultWhitePoint', 'Gamma'), 65535),
+        (('DefaultWhitePoint', 'Y'), 64000), (('DefaultWhitePoint', 'Gamma'), 65535),
         (('DefaultWhitePoint', 'Gamma'), 240000), (('ProductAttributes', 'ManufacturerID'), 'AC'),
         (('ProductAttributes', 'ManufacturerID'), 'A\0R'), (('ProductAttributes', 'LegacyManufacturerID'), 1),
         (('ProductAttributes', 'ProductName'), 'x' * 14), (('ProductAttributes', 'ProductID'), 65536),
