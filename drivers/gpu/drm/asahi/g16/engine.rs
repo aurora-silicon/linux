@@ -855,6 +855,9 @@ impl Firmware {
         if !self.engine.chan_wait {
             self.recovery.publication_wait_deadline = None;
         }
+        // Polling retires before it publishes, so this sees work start and
+        // drain; a fail-stop reports from fail_flights().
+        self.power.report_work(!self.engine.flights.is_empty());
         result
     }
 
