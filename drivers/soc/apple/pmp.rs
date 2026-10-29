@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only
 #![recursion_limit = "2048"]
 
 //! Apple PMP driver
@@ -8,7 +8,6 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
-use core::mem;
 use core::sync::atomic::{fence, AtomicI32, AtomicPtr, Ordering};
 
 mod pmp_bootargs;
@@ -23,9 +22,9 @@ use kernel::{
     },
     dma::{
         Coherent,
-        CoherentBox,
+        CoherentBox, //
         Device as _,
-        DmaMask, //
+        DmaMask,
     },
     error::to_result,
     io::{
@@ -66,6 +65,8 @@ use kernel::{
 
 const PMP_MIN_MMIO_SIZE: usize = 0x80000;
 const ASC_MMIO_SIZE: usize = 0x4000;
+const CPU_CONTROL: usize = 0x44;
+const CPU_RUN: u32 = 1 << 4;
 const BOOTARGS_UUID: usize = 0x204;
 const BOOTARGS_UUID_MAGIC: u32 = 0x6469_7575; // "uuid"
 const BOOTARGS_UUID_VERSION: u32 = 5;
@@ -109,6 +110,38 @@ struct PmpAllocation {
     alloc: Coherent<[u8]>,
 }
 
+struct RegistryDescriptor {
+    name: [u8; 48],
+    size: u32,
+    id: u16,
+}
+
+impl RegistryDescriptor {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        // M5 firmware sends name[48], format[8], unit[8], then three u64s:
+        // value length, firmware-assigned ID, and flags. IDs are low16 on wire.
+        if bytes.len() < 88 {
+            return Err(EINVAL);
+        }
+        let size = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+        let id = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
+        let name: [u8; 48] = bytes[..48].try_into().unwrap();
+        if size > u32::MAX as u64 || id > u16::MAX as u64 || !name.contains(&0) {
+            return Err(EINVAL);
+        }
+        Ok(Self {
+            name,
+            size: size as u32,
+            id: id as u16,
+        })
+    }
+}
+
+struct RegistryEntry {
+    id: u16,
+    value: KVec<u8>,
+}
+
 struct IovaTableEntry {
     _host_addr: u64,
     _pio_base: u64,
@@ -124,16 +157,20 @@ struct PmpState {
     iova_table: Option<Coherent<[IovaTableEntry]>>,
     allocs: KVec<PmpAllocation>,
     value_buf: Option<u64>,
+    host_value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    registry_entries: KVec<RegistryEntry>,
 }
 
 impl PmpState {
-    fn new() -> Result<PmpState> {
+    fn new(registry_v2: bool) -> Result<PmpState> {
         Ok(PmpState {
             iova_table: None,
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
             value_buf: None,
-            ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            host_value_buf: None,
+            ioreg_entries: KVec::with_capacity(if registry_v2 { 0 } else { 340 }, GFP_KERNEL)?,
+            registry_entries: KVec::with_capacity(if registry_v2 { 340 } else { 0 }, GFP_KERNEL)?,
         })
     }
     fn find_alloc(&self, addr: u64) -> Option<usize> {
@@ -155,10 +192,17 @@ impl PmpState {
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
+    registry_v2: bool,
     pmp_mmio: DevresIoMem<PMP_MIN_MMIO_SIZE>,
     asc_mmio: DevresIoMem<ASC_MMIO_SIZE>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
+    // The registry-v2 RtKit is owned by PmpDriver, avoiding the context's Arc cycle.
+    // It drains callbacks before releasing the context and its DMA buffers.
+    #[pin]
+    registry_rtkit: Mutex<Option<usize>>,
+    #[pin]
+    stopped: Mutex<bool>,
     #[pin]
     state: Mutex<PmpState>,
     #[pin]
@@ -172,7 +216,7 @@ struct PmpData {
 }
 
 impl PmpData {
-    fn new(dev: &platform::Device<Core<'_>>) -> Result<Arc<PmpData>> {
+    fn new(dev: &platform::Device<Core<'_>>, registry_v2: bool) -> Result<Arc<PmpData>> {
         let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
         let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
@@ -182,23 +226,98 @@ impl PmpData {
                 PmpData {
                     dev: dev.as_ref().into(),
                     rtkit <- new_mutex!(None),
-                    state <- new_mutex!(PmpState::new()?),
+                    state <- new_mutex!(PmpState::new(registry_v2)?),
                     power_command <- new_mutex!(Command::Idle),
                     power_reply <- new_condvar!(),
                     pmp_mmio,
                     asc_mmio,
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
+                    registry_v2,
+                    registry_rtkit <- new_mutex!(None),
+                    stopped <- new_mutex!(false),
                 }
             ),
             GFP_KERNEL,
         )
     }
+    fn start_cpu(&self, dev: &platform::Device<Core<'_>>) -> Result<()> {
+        self.asc_mmio.access(dev.as_ref())?.as_view().relaxed()
+            .update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
+        Ok(())
+    }
     fn start(&self) -> Result<()> {
+        if self.registry_v2 {
+            let raw = self.context_handle()?;
+            // SAFETY: Probe owns RtKit and firmware has no application
+            // endpoint yet; C serializes system messages and power waits.
+            unsafe {
+                kernel::error::to_result(bindings::apple_rtkit_wake(raw))?;
+                return kernel::error::to_result(bindings::apple_rtkit_start_ep(raw, PMP_ENDPOINT));
+            }
+        }
         let mut guard = self.rtkit.lock();
         let mut rtk = guard.as_mut().as_pin_mut().unwrap();
         rtk.as_mut().wake()?;
         rtk.start_endpoint(PMP_ENDPOINT)
+    }
+    fn context_handle(&self) -> Result<*mut bindings::apple_rtkit> {
+        self.registry_rtkit
+            .lock()
+            .map(|p| p as *mut bindings::apple_rtkit)
+            .ok_or(ENODEV)
+    }
+    fn cold_preflight(&self, dev: &platform::Device<Core<'_>>) -> Result {
+        let io = self.pmp_mmio.access(dev.as_ref())?;
+        let asc = self.asc_mmio.access(dev.as_ref())?;
+        // Captured T6050 cold marker. Retained contexts carry live DMA
+        // addresses and cannot be cold-reprobed after their buffers retire.
+        if asc.read32(CPU_CONTROL) & CPU_RUN != 0
+            || io.try_read64(0x7bcd8)? != 0xfeed1b00
+            || io.try_read64(0x7bce0)? != 0
+            || io.try_read64(0x7bcc8)? != 0
+            || io.try_read64(0x7bcd0)? != 0
+            || io.read32(0x7bcc4) != 0
+            || io.read32(0x7bcc0) != 0
+        {
+            return Err(EBUSY);
+        }
+        Ok(())
+    }
+    fn stop_context(&self) -> Result {
+        let mut stopped = self.stopped.lock();
+        if *stopped {
+            return Ok(());
+        }
+        // SAFETY: Only probe, core unbind, and the registered reboot callback
+        // call this method. PmpDriver owns these resources through each call;
+        // its first dropped field unregisters and drains the callback.
+        let dev = unsafe { self.dev.as_bound() };
+        let io = self.pmp_mmio.access(dev)?;
+        let saves = io.read32(0x7bcc4);
+        let wakes = io.read32(0x7bcc0);
+        let raw = self.context_handle()?;
+        // Do not hold the reply mutex while waiting: RX callbacks need it
+        // to finish outstanding registry exchanges. Ownership remains with
+        // the driver, and the stop mutex serializes unbind/reboot.
+        unsafe { kernel::error::to_result(bindings::apple_rtkit_idle(raw))? };
+        let delta = io.read32(0x7bcc4).wrapping_sub(saves);
+        if io.try_read64(0x7bcd8)? != 0xcafe4b0b
+            || io.try_read64(0x7bce0)? != 0x10024a8
+            || io.try_read64(0x7bcc8)? == 0
+            || delta == 0
+            || delta >= 1u32 << 31
+            || io.read32(0x7bcc0) != wakes
+        {
+            return Err(Error::from_errno(-(bindings::EPROTO as i32)));
+        }
+        let asc = self.asc_mmio.access(dev)?;
+        asc.write32(asc.read32(CPU_CONTROL) & !CPU_RUN, CPU_CONTROL);
+        if asc.read32(CPU_CONTROL) & CPU_RUN != 0 {
+            return Err(EIO);
+        }
+        *stopped = true;
+        Ok(())
     }
     fn patch_bootargs(
         &self,
@@ -305,6 +424,12 @@ impl PmpData {
     fn free(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
         if let Some(idx) = state.find_alloc(addr) {
+            if state.value_buf == Some(addr) {
+                state.value_buf = None;
+            }
+            if state.host_value_buf == Some(addr) {
+                state.host_value_buf = None;
+            }
             state.allocs.swap_remove(idx);
         } else {
             dev_err!(
@@ -329,11 +454,21 @@ impl PmpData {
             dev_err!(self.dev, "Unable to find buffer");
             return Err(EIO);
         };
-        if ptr_buf.size() < mem::size_of::<u64>() {
+        let pointers_size = if self.registry_v2 { 16 } else { 8 };
+        if ptr_buf.size() < pointers_size {
             dev_err!(self.dev, "Buffer too small");
             return Err(EIO);
         }
-        let ptr = unsafe { *(ptr_buf.as_ptr() as *const u64) };
+        // Firmware relinquishes the request buffer until the reply is sent.
+        let pointers = unsafe { ptr_buf.as_ref() };
+        let ptr = u64::from_le_bytes(pointers[..8].try_into().unwrap());
+        if self.registry_v2 {
+            let host_ptr = u64::from_le_bytes(pointers[8..16].try_into().unwrap());
+            if state.get_buf(ptr).is_none() || state.get_buf(host_ptr).is_none() {
+                return Err(EINVAL);
+            }
+            state.host_value_buf = Some(host_ptr);
+        }
         state.value_buf = Some(ptr);
         let msg = (OPC_SET_BUF | OPC_ACK_MASK) << OPC_SHIFT;
         Ok(msg)
@@ -438,6 +573,88 @@ impl PmpData {
             )
         };
     }
+    fn register_ioreg_v2(&self, addr: u64) -> Result<u64> {
+        let mut state = self.state.lock();
+        let request = state.get_buf(addr).ok_or(EINVAL)?;
+        // SAFETY: The firmware has transferred this allocation for the request
+        // and waits for our response before reusing it.
+        let descriptor = RegistryDescriptor::parse(unsafe { request.as_ref() })?;
+        if state.registry_entries.iter().any(|e| e.id == descriptor.id) {
+            return Err(EINVAL);
+        }
+        let value_addr = state.value_buf.ok_or(EINVAL)?;
+        let value_buf = state.get_buf(value_addr).ok_or(EINVAL)?;
+        let value = if descriptor.size == 0 {
+            let name = CStr::from_bytes_until_nul(&descriptor.name).map_err(|_| EINVAL)?;
+            let property = CString::try_from_fmt(fmt!("apple,tunable-{name}"))?;
+            let node = self.dev.fwnode().ok_or(EIO)?;
+            if !node.property_present(&property) {
+                return Ok((OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT);
+            }
+            let len = node.property_count_elem::<u8>(&property)?;
+            if len > value_buf.size() || len > u32::MAX as usize {
+                return Err(EINVAL);
+            }
+            let value = node
+                .property_read_array_vec::<u8>(&property, len)?
+                .required_by(&self.dev)?;
+            // SAFETY: This is the negotiated shared value buffer; firmware
+            // consumes the supplied bytes only after our acknowledgement.
+            unsafe { value_buf.as_mut()[..len].copy_from_slice(&value) };
+            value
+        } else {
+            let len = descriptor.size as usize;
+            if len > value_buf.size() {
+                return Err(EINVAL);
+            }
+            // SAFETY: As above, firmware waits for the acknowledgement before
+            // reusing the shared value buffer.
+            let mut value = KVec::with_capacity(len, GFP_KERNEL)?;
+            value.extend_from_slice(unsafe { &value_buf.as_ref()[..len] }, GFP_KERNEL)?;
+            value
+        };
+        let size = value.len() as u64;
+        if size != 0 {
+            state.registry_entries.push(
+                RegistryEntry {
+                    id: descriptor.id,
+                    value,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+        // The ID came from the firmware descriptor; the reply carries length.
+        Ok((OPC_REGISTER_IOREG | OPC_ACK_MASK) << OPC_SHIFT | size)
+    }
+    fn change_ioreg_v2(&self, id: u16, remove: bool) -> Result<u64> {
+        let mut state = self.state.lock();
+        let opcode = if remove { 0x35 } else { 0x37 };
+        let Some(index) = state.registry_entries.iter().position(|e| e.id == id) else {
+            return Ok(opcode << OPC_SHIFT);
+        };
+        let size = state.registry_entries[index].value.len();
+        if remove {
+            state.registry_entries.swap_remove(index);
+        } else {
+            let addr = state.value_buf.ok_or(EINVAL)?;
+            let alloc_index = state.find_alloc(addr).ok_or(EINVAL)?;
+            let PmpState {
+                allocs,
+                registry_entries,
+                ..
+            } = &mut *state;
+            let buffer = &allocs[alloc_index].alloc;
+            if size > buffer.size() {
+                return Err(EINVAL);
+            }
+            // SAFETY: Firmware waits for this update's reply before reusing
+            // the shared buffer, and the stored length is bounds-checked.
+            registry_entries[index]
+                .value
+                .copy_from_slice(unsafe { &buffer.as_ref()[..size] });
+        }
+        Ok(opcode << OPC_SHIFT | size as u64)
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
@@ -462,8 +679,13 @@ impl PmpData {
             OPC_MALLOC => self.malloc(msg & MALLOC_SIZE_MASK)?,
             OPC_FREE => self.free(msg & MSG_IOVA_MASK)?,
             OPC_SET_BUF => self.set_buf(msg & MSG_IOVA_MASK)?,
+            OPC_REGISTER_IOREG if self.registry_v2 => {
+                self.register_ioreg_v2(msg & MSG_IOVA_MASK)?
+            }
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
+            OPC_SET_IOREG if self.registry_v2 => self.change_ioreg_v2(msg as u16, true)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
+            OPC_UPDATE_IOREG if self.registry_v2 => self.change_ioreg_v2(msg as u16, false)?,
             // Firmware waits for this confirmation before publishing reports.
             // Do not echo the registry index/payload or add a generic ACK bit.
             OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
@@ -472,6 +694,21 @@ impl PmpData {
                 return Err(EIO);
             }
         };
+        if self.registry_v2 {
+            let guard = self.registry_rtkit.lock();
+            let raw = guard.ok_or(ENODEV)? as *mut bindings::apple_rtkit;
+            // SAFETY: The driver's owner drains C RX before releasing this
+            // context; C mailbox TX is internally serialized.
+            return unsafe {
+                kernel::error::to_result(bindings::apple_rtkit_send_message(
+                    raw,
+                    PMP_ENDPOINT,
+                    reply,
+                    core::ptr::null_mut(),
+                    false,
+                ))
+            };
+        }
         let mut rtk_guard = self.rtkit.lock();
         let rtk = rtk_guard.as_mut().as_pin_mut().unwrap();
         rtk.send_message(PMP_ENDPOINT, reply)?;
@@ -509,7 +746,7 @@ unsafe extern "C" fn apple_pmp_display_bound_owner(
     // SAFETY: the checked PMP driver stored this pinned PmpDriver, and the
     // device lock excludes unbind for the entire read-only borrow.
     let driver = unsafe { &*ptr };
-    let data = &driver.0;
+    let data = &driver.data;
     let existing = data.display.load(Ordering::Acquire);
     if !existing.is_null() {
         return existing;
@@ -643,8 +880,71 @@ impl rtkit::Operations for PmpData {
     }
 }
 
+struct PmpReboot {
+    block: bindings::notifier_block,
+    data: Arc<PmpData>,
+}
+
+unsafe impl Send for PmpReboot {}
+
+unsafe extern "C" fn pmp_reboot(
+    block: *mut bindings::notifier_block,
+    _event: usize,
+    _arg: *mut core::ffi::c_void,
+) -> core::ffi::c_int {
+    // SAFETY: This exact stable KBox block is registered while its driver
+    // owns RtKit. Unregister drains callbacks before that owner is dropped.
+    let state = unsafe { &*kernel::container_of!(block, PmpReboot, block) };
+    match state.data.stop_context() {
+        Ok(()) => bindings::NOTIFY_OK as i32,
+        Err(e) => {
+            dev_err!(state.data.dev, "PMP reboot stop failed: {:?}", e);
+            bindings::NOTIFY_BAD as i32
+        }
+    }
+}
+
 #[allow(dead_code)]
-struct PmpDriver(Arc<PmpData>);
+struct PmpDriver {
+    reboot: Option<PmpRebootRegistration>,
+    // Field order drains RX before releasing the context's final Arc.
+    registry_rtkit: Option<rtkit::RtKit<PmpData>>,
+    data: Arc<PmpData>,
+}
+
+impl Drop for PmpDriver {
+    fn drop(&mut self) {
+        // SAFETY: Unregister joins callers before the retained owner is dropped.
+        unsafe { bindings::apple_pmp_unregister(Arc::as_ptr(&self.data).cast()) };
+        if self.registry_rtkit.is_some() {
+            // Also covers failure to allocate the core's driver-data box
+            // after probe constructed this owner and started firmware.
+            if let Err(e) = self.data.stop_context() {
+                dev_err!(
+                    self.data.dev,
+                    "PMP stop failed; retaining DMA until platform reset: {:?}",
+                    e
+                );
+                self.registry_rtkit
+                    .as_mut()
+                    .unwrap()
+                    .retain_shared_buffers_on_drop();
+                core::mem::forget(self.data.clone());
+            }
+        }
+    }
+}
+
+struct PmpRebootRegistration(KBox<PmpReboot>);
+
+impl Drop for PmpRebootRegistration {
+    fn drop(&mut self) {
+        // Unregister holds no stop/reply mutex. The chain joins callbacks
+        // before the boxed block and its context reference are freed.
+        let ret = unsafe { bindings::unregister_reboot_notifier(&mut self.0.block) };
+        assert_eq!(ret, 0, "PMP notifier could not be drained");
+    }
+}
 
 /// Per-SoC configuration.
 struct PmpHwConfig {
@@ -657,6 +957,7 @@ struct PmpHwConfig {
     /// When the firmware needs system endpoint 7 (CoreAnalytics) started
     /// and given its buffer before it acknowledges the IOP power state.
     coreanalytics: Ep7,
+    registry_v2: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -674,6 +975,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
+    registry_v2: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -681,6 +983,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
+    registry_v2: false,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -690,20 +993,23 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
+    registry_v2: false,
 };
 
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
     coreanalytics: Ep7::RetainedBoard,
+    registry_v2: false,
 };
 
-impl Drop for PmpDriver {
-    fn drop(&mut self) {
-        // SAFETY: The Arc remains live until unregister has joined any caller.
-        unsafe { bindings::apple_pmp_unregister(Arc::as_ptr(&self.0).cast()) };
-    }
-}
+const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<48>()),
+    check_bootargs_uuid: false,
+    coreanalytics: Ep7::No,
+    registry_v2: true,
+};
+
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -713,6 +1019,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
+        (of::DeviceId::new(c"apple,t6050-pmp-v2"), &HW_CFG_T6050),
     ]
 );
 
@@ -734,12 +1041,31 @@ impl platform::Driver for PmpDriver {
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: ARef<device::Device> = pdev.as_ref().into();
         let cfg = info.ok_or(ENODEV)?;
+        let registry_v2 = cfg.registry_v2;
         if let Some(mask) = cfg.dma_mask {
-            // SAFETY: No DMA allocations or mappings exist for this device
-            // yet.
+            // SAFETY: No allocations, mappings or firmware execution exist yet.
             unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
-        let data = PmpData::new(pdev)?;
+        if registry_v2 {
+            // Deferred-probe timeout can otherwise allow DMA to fall back to
+            // physical addresses when the required DART provider failed.
+            // SAFETY: The platform device is live throughout probe.
+            if unsafe { bindings::iommu_get_domain_for_dev(dev.as_raw()) }.is_null() {
+                dev_err!(
+                    dev,
+                    "PMP requires an attached IOMMU domain before CPU start"
+                );
+                return Err(EPROBE_DEFER);
+            }
+            // PMP messages carry a 48-bit DMA address. The inherited DART
+            // aperture starts above 32 bits; the IOMMU constrains this mask to
+            // that aperture. Configure before starting any RTKit allocations.
+            // SAFETY: Probe has not published data or started firmware/DMA.
+        }
+        let data = PmpData::new(pdev, registry_v2)?;
+        if registry_v2 {
+            data.cold_preflight(pdev)?;
+        }
         let pmp_mmio = data.pmp_mmio.access(pdev.as_ref())?.as_view();
         let asc_mmio = data.asc_mmio.access(pdev.as_ref())?.as_view();
         let node = dev.fwnode().ok_or(EIO)?;
@@ -774,6 +1100,35 @@ impl platform::Driver for PmpDriver {
         } else {
             rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?
         };
+        if registry_v2 {
+            *data.registry_rtkit.lock() = Some(rtkit.as_raw() as usize);
+            let mut owner = PmpDriver {
+                reboot: None,
+                registry_rtkit: Some(rtkit),
+                data,
+            };
+            owner.data.start_cpu(pdev)?;
+            owner.data.start()?;
+            let mut reboot = KBox::new(
+                PmpReboot {
+                    block: bindings::notifier_block {
+                        notifier_call: Some(pmp_reboot),
+                        next: core::ptr::null_mut(),
+                        priority: -10,
+                    },
+                    data: owner.data.clone(),
+                },
+                GFP_KERNEL,
+            )?;
+            // SAFETY: The boxed notifier has a stable address until its
+            // registration guard unregisters and drains the callback chain.
+            let ret = unsafe { bindings::register_reboot_notifier(&mut reboot.block) };
+            if ret != 0 {
+                return Err(Error::from_errno(ret));
+            }
+            owner.reboot = Some(PmpRebootRegistration(reboot));
+            return Ok(owner);
+        }
         data.rtkit.lock().as_mut().set(Some(rtkit));
         asc_mmio
             .relaxed()
@@ -800,11 +1155,16 @@ impl platform::Driver for PmpDriver {
         if ret != 0 {
             return Err(Error::from_errno(ret));
         }
-        Ok(PmpDriver(data))
+        Ok(PmpDriver { reboot: None, registry_rtkit: None, data })
     }
 
     fn unbind<'bound>(_dev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
-        this.0.fail_display(ENODEV);
+        this.data.fail_display(ENODEV);
+        if this.data.registry_v2 {
+            if let Err(e) = this.data.stop_context() {
+                dev_err!(this.data.dev, "PMP unbind stop failed: {:?}", e);
+            }
+        }
     }
 }
 
@@ -812,5 +1172,5 @@ module_platform_driver! {
     type: PmpDriver,
     name: "apple_pmp",
     description: "Apple Power Management Processor",
-    license: "Dual MIT/GPL",
+    license: "GPL",
 }

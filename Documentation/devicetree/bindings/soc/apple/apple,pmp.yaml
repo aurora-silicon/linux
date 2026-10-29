@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) AND GPL-2.0-only
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/soc/apple/apple,pmp.yaml#
@@ -19,6 +19,7 @@ properties:
   compatible:
     oneOf:
       - const: apple,t6000-pmp-v2
+      - const: apple,t6050-pmp-v2
       - items:
           - enum:
               - apple,t6041-pmp-v2
@@ -103,6 +104,17 @@ required:
   - mboxes
   - mbox-names
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-pmp-v2
+    then:
+      required:
+        - apple,board-id
+        - apple,dram-vendor-id
 
 additionalProperties: false
 
