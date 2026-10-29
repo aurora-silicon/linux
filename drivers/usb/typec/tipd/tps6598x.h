@@ -363,6 +363,8 @@ struct tps6598x {
 	enum power_supply_usb_type usb_type;
 
 	int wakeup;
+	/* Handles events while the system sleeps, if the variant can filter them */
+	bool (*sleep_event)(struct tps6598x *tps);
 	u32 status; /* status reg */
 	u32 data_status;
 	u16 pwr_status;
@@ -459,6 +461,11 @@ struct sn201202x {
 	struct completion sleep_completion;
 	struct completion wake_completion;
 	struct spmi_device *sdev;
+	/* Links that wake the system, while the controller's events are filtered */
+	u32 sleep_links;
+	bool sleep_watch;
+	/* Busy-wait: in suspend-to-idle a sleeping wait outlasts the timers */
+	bool atomic;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -473,6 +480,15 @@ int tipd_resume(struct tps6598x *tps);
 
 /* Internal to tps6598x-core */
 int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);
+/* What the system-sleep event filter of a port reads */
+struct cd321x_sleep_state {
+	u32 data_status;
+	u32 status;
+	/* A power source this port sinks from is capable of USB communication */
+	bool usb_comm;
+};
+
+int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st);
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 			  size_t in_len, const u8 *in_data,
 			  size_t out_len, u8 *out_data,
@@ -495,6 +511,7 @@ struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode);
 int sn201202x_suspend(struct device *dev);
 int sn201202x_resume(struct device *dev);
+u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st);
 #endif
 
 #endif /* __TPS6598X_H__ */
