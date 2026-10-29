@@ -227,6 +227,7 @@ struct apple_nvme {
 	bool abort_reset;
 	bool recover_to_live;
 	bool suspended;
+	bool final_shutdown;
 	unsigned long recovery_flags;
 
 	void __iomem *mmio_coproc;
@@ -1314,7 +1315,18 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 	 * CFS and firmware crashes are not DMA fences. Post-M4 does not use
 	 * Delete SQ/CQ, SHN or RTKit sleep; only a completed CC.EN clear makes
 	 * the queue and request mappings eligible for release.
+	 *
+	 * The final system shutdown is the exception for SHN: without it the
+	 * controller counts every Linux shutdown as unsafe (SMART
+	 * unsafe_shutdowns) and recovers on the next start, which slows the
+	 * loader and the first seconds of I/O. A failed SHN changes nothing:
+	 * the CC.EN clear below still runs.
 	 */
+	if (READ_ONCE(anv->final_shutdown) && !apple_rtkit_is_crashed(anv->rtk)) {
+		ret = nvme_disable_ctrl(&anv->ctrl, true);
+		if (ret)
+			dev_warn(anv->dev, "shutdown notification failed: %d\n", ret);
+	}
 	ret = nvme_disable_ctrl(&anv->ctrl, false);
 	if (ret) {
 		apple_nvme_quarantine(anv, ret);
@@ -2544,6 +2556,7 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	struct apple_nvme *anv = platform_get_drvdata(pdev);
 
 	WRITE_ONCE(anv->removing, true);
+	WRITE_ONCE(anv->final_shutdown, true);
 	apple_nvme_set_reset_ready(anv, false);
 	flush_delayed_work(&anv->flush_dwork);
 	if (apple_nvme_disable(anv, true))
