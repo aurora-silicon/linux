@@ -16,4 +16,12 @@ config APPLE_CENTAURI
 	  The endpoint must start in the stopped ROM personality. Firmware
 	  and per-device calibration are external inputs and are not included.
 
+config APPLE_CENTAURI_WIFI
+	bool "N1 Centauri cfg80211 station interface"
+	depends on APPLE_CENTAURI
+	default y
+	help
+	  Add Alpha command/data rings, scanning and WPA2-PSK/CCMP station
+	  connections for the explicitly matched firmware protocol profile.
+	  Radio firmware and calibration remain external inputs.
 endif
