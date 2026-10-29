@@ -15,7 +15,7 @@ use super::{
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
 use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use identity::{RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
+use identity::{Order, RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
 use super::job::Engine;
 use kernel::{
     new_mutex,
@@ -128,6 +128,11 @@ pub(crate) struct Context {
     states: WorkStates,
     /// Signalled when a work state returns; publishers that found none wait on it.
     state_returns: Arc<super::availability::Availability>,
+    /// The domain refused compute publishers wait on; signalled with `state_returns` when the
+    /// admission turn moves on.
+    compute_returns: Arc<super::availability::Availability>,
+    /// The order in which this context's ioctls take work-state nodes.
+    order: Arc<Mutex<Order>>,
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
@@ -139,6 +144,10 @@ pub(crate) struct Context {
     policy: Policy,
 }
 impl Context {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A context takes its allocators, identities and both admission domains."
+    )]
     pub(crate) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
@@ -147,6 +156,7 @@ impl Context {
         owner_pid: u32,
         policy: Policy,
         state_returns: Arc<super::availability::Availability>,
+        compute_returns: Arc<super::availability::Availability>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let qos = qos.acquire()?;
@@ -195,6 +205,8 @@ impl Context {
             GFP_KERNEL,
         )?;
         let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
+        let order =
+            Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
         Ok(Self {
             execution,
             status,
@@ -208,6 +220,8 @@ impl Context {
             owner_pid,
             states: WorkStates::new(),
             state_returns,
+            compute_returns,
+            order,
             work,
             work_base,
             render,
@@ -399,18 +413,23 @@ pub(crate) struct WorkStateLease {
     word: AtomicU32,
     /// Index of the engine whose admission took the node, valid once `word` is set.
     engine: AtomicU8,
+    /// The ioctl's place in its context's submission order.
+    ordinal: u64,
 }
 impl WorkStateLease {
     pub(super) fn status(&self) -> &Arc<VmStatus> { self.context.status() }
     pub(crate) fn deferred(context: Arc<Context>) -> Self {
+        let ordinal = context.order.lock().assign();
         Self {
             context,
             word: AtomicU32::new(FREE),
             engine: AtomicU8::new(0),
+            ordinal,
         }
     }
-    /// The ioctl's node, taking one for `engine`'s admission if it has none yet. EBUSY: none
-    /// may be taken now (see `identity::may_take`); a later return makes one available.
+    /// The ioctl's node, taking one for `engine`'s admission if it has none yet. EBUSY: too many
+    /// older ioctls still wait for theirs (see `identity::Order`), or no node may be taken now
+    /// (see `identity::may_take`); an older ioctl's admission or a return lets it try again.
     pub(crate) fn acquire(&self, engine: Engine) -> Result<u32> {
         let current = self.word();
         if current != FREE {
@@ -423,6 +442,10 @@ impl WorkStateLease {
         if current != FREE {
             return Ok(current);
         }
+        let mut order = self.context.order.lock();
+        if !order.admits(self.ordinal) {
+            return Err(EBUSY);
+        }
         let engine = engine.index();
         let candidate = self.context.states.allocate(engine).ok_or(EBUSY)?;
         if let Err(error) = work.initialize(candidate) {
@@ -431,6 +454,12 @@ impl WorkStateLease {
         }
         self.engine.store(engine as u8, Ordering::Relaxed);
         self.word.store(candidate, Ordering::Release);
+        let wake = order.admit(self.ordinal);
+        drop(order);
+        drop(work);
+        if wake {
+            self.context.pass_turn();
+        }
         Ok(candidate)
     }
     /// The domain a publisher samples before acquire() and waits on after EBUSY.
@@ -478,6 +507,8 @@ impl Drop for WorkStateLease {
         let word = self.word();
         if word != FREE {
             self.context.release_state(word, usize::from(self.engine.load(Ordering::Relaxed)));
+        } else if self.context.order.lock().leave(self.ordinal) {
+            self.context.pass_turn();
         }
     }
 }
@@ -489,6 +520,12 @@ impl Context {
         if self.states.release(word, engine) {
             self.state_returns.notify();
         }
+    }
+    /// A refused publisher waits on its engine's domain. Bumping both once the turn moved past a
+    /// refusal means one that sampled before its refused acquire() never sleeps through it.
+    fn pass_turn(&self) {
+        self.state_returns.notify();
+        self.compute_returns.notify();
     }
 }
 
