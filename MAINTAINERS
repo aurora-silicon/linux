@@ -4510,6 +4510,46 @@ F:	rust/helpers/auxiliary.c
 F:	rust/kernel/auxiliary.rs
 F:	samples/rust/rust_driver_auxiliary.rs
 
+AURORA APPLE SPMI PMU RTC
+M:	Dj <hey@djdev.me>
+L:	linux-rtc@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/rtc/apple,abbey-pmu-rtc.yaml
+F:	drivers/rtc/rtc-apple-spmi-pmu.c
+
+AURORA N1 CENTAURI TRANSPORT
+M:	Dj <hey@djdev.me>
+L:	linux-wireless@vger.kernel.org
+S:	Maintained
+F:	Documentation/arch/arm64/aurora-apif-centauri.rst
+F:	Documentation/devicetree/bindings/net/wireless/apple,centauri.yaml
+F:	Documentation/devicetree/bindings/net/bluetooth/apple,centauri.yaml
+F:	drivers/bluetooth/btcentauri.c
+F:	include/linux/apple-centauri.h
+F:	drivers/net/wireless/apple/
+
+AURORA PLATFORM MMIO INTERFACE
+M:	Dj <hey@djdev.me>
+S:	Maintained
+F:	Documentation/devicetree/bindings/firmware/aurora,apif-mmio.yaml
+F:	Documentation/devicetree/bindings/iommu/apple,dart-apif.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,sart-apif.yaml
+F:	Documentation/driver-api/firmware/aurora-apif*.rst
+F:	Documentation/devicetree/bindings/nvme/apple,nvme-apif.yaml
+F:	Documentation/devicetree/bindings/pci/apple,apif-pcie.yaml
+F:	arch/arm64/configs/aurora-apif.config
+F:	drivers/nvme/host/apple-apif.h
+F:	drivers/pci/controller/apple-apif/
+F:	include/linux/pci-apple-apif.h
+F:	tools/aurora-apif/
+F:	drivers/firmware/aurora-apif-mmio.c
+F:	drivers/iommu/apple-dart-apif.c
+F:	drivers/soc/apple/apple-sart-apif.c
+F:	drivers/soc/apple/sart-backend.h
+F:	include/linux/apple-dart-apif.h
+F:	include/linux/soc/aurora/apif-mmio.h
+F:	tools/testing/selftests/aurora-apif/
+
 AUXILIARY DISPLAY DRIVERS
 M:	Andy Shevchenko <andy@kernel.org>
 R:	Geert Uytterhoeven <geert@linux-m68k.org>
