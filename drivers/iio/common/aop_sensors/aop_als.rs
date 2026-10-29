@@ -72,15 +72,18 @@ fn enable_als(
     offset: usize,
 ) -> Result<()> {
     if offset != LUX_OFFSET_CT817 {
-        // The calibration blob comes from macOS and is not installed on every
-        // system. Without it the sensor still reports, uncalibrated.
-        match Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
+        // The installer collects the calibration blob from macOS, so it is
+        // not present on every system. Without it the VD6286 of the M4 Pro
+        // never reports and its channel reads ENODATA. The warning below
+        // reports the missing file once, so the firmware loader is asked not
+        // to report it too.
+        match Firmware::request_nowarn(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
             Ok(fw) => {
                 set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
             }
             Err(e) => dev_warn!(
                 dev.as_ref(),
-                "no calibration ({:?}); readings are uncalibrated\n",
+                "no apple/aop-als-cal.bin ({:?}); the sensor may not report\n",
                 e
             ),
         }
