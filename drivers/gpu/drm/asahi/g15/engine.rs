@@ -740,6 +740,18 @@ impl Firmware {
         self.render_renumber_due() || self.compute_renumber_due()
     }
 
+    /// Computes and renders the current numbering has left before its compute and TA stamps
+    /// wrap (0 once wrapped), for `asahi-g15/stats`.
+    pub(crate) fn stamps_left(&self) -> (u64, u64) {
+        let period = encode::STAMP_PERIOD;
+        let c = (self.engine.ordinal + self.engine.compute_stamp_base) % period;
+        let r = (self.engine.draw + self.engine.stamp_base) % period;
+        (
+            encode::COMPUTE_WRAP.saturating_sub(c),
+            encode::RENDER_WRAP.saturating_sub(r),
+        )
+    }
+
     /// Renumbers the TA/FS stamps from their seeds before the TA stamp wraps, after 0x860000
     /// renders (about six hours of desktop), where the firmware may stop. Only called with
     /// nothing in flight: the last flight retired with every stamp equal to its target, so both
