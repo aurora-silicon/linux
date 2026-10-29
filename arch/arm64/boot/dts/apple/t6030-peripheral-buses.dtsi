@@ -2,6 +2,11 @@
 /* Unclaimed T6030 peripheral buses. */
 
 &soc {
+	/*
+	 * Touch ID (J514s ADT /arm-io/spi2). iBoot leaves the pads muxed and
+	 * the controller uses its native chip select, so there is no pinctrl
+	 * here.
+	 */
 	spi2: spi@289108000 {
 		compatible = "apple,t6030-spi", "apple,t8103-spi";
 		reg = <0x2 0x89108000 0 0x4000>;
@@ -12,6 +17,14 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 		status = "disabled";
+
+		mesa: fingerprint@0 {
+			compatible = "apple,mesa-fingerprint";
+			reg = <0>;
+			spi-max-frequency = <8000000>;
+			spi-cpha;
+			status = "disabled";
+		};
 	};
 
 	spi4: spi@289110000 {
