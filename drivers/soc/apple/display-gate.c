@@ -2442,7 +2442,12 @@ static void __init staged_hold_port_controllers(void)
 		for (k = 0; ctrl && k < staged_nr_port_ctrls; k++)
 			if (staged_port_ctrls[k] == of_fwnode_handle(ctrl))
 				break;
-		if (ctrl && dcp && k == staged_nr_port_ctrls &&
+		/*
+		 * A disabled port controller never gets a device: a link from it
+		 * would land on its bound bus controller as a sync-state-only
+		 * link, which the device core refuses.
+		 */
+		if (ctrl && dcp && k == staged_nr_port_ctrls && of_device_is_available(ctrl) &&
 		    !fwnode_link_add(of_fwnode_handle(ctrl), of_fwnode_handle(dcp), 0))
 			staged_port_ctrls[staged_nr_port_ctrls++] =
 				fwnode_handle_get(of_fwnode_handle(ctrl));
