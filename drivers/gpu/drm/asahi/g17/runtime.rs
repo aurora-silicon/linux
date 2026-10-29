@@ -1804,7 +1804,7 @@ impl Backend {
         if !port.note_submission() {
             return None;
         }
-        match packet.completion.work_state().ok()?.acquire() {
+        match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Compute) {
             Ok(_) => {}
             Err(error) if error == EBUSY => return None,
             Err(error) => return Some(Err(error)),
@@ -1863,7 +1863,7 @@ impl Backend {
     }
 
     fn compute_readiness(&self, packet: &Arc<super::job::Packet>, required: usize) -> Readiness {
-        match packet.completion.work_state().and_then(|work| work.acquire()) {
+        match packet.completion.work_state().and_then(|work| work.acquire(crate::g17::job::Engine::Compute)) {
             Err(error) if error == EBUSY => return Readiness::Progress,
             Err(_) => return Readiness::Ready,
             Ok(_) => {}
@@ -2007,7 +2007,7 @@ impl Backend {
             return Err(render::FALLBACK);
         }
         let lease = self.enter_preparation(false)?;
-        match packet.completion.work_state()?.acquire() {
+        match packet.completion.work_state()?.acquire(crate::g17::job::Engine::Compute) {
             Err(error) if error == EBUSY => return Err(render::FALLBACK),
             result => {
                 result?;
@@ -2117,7 +2117,7 @@ impl Backend {
             }
             let lease = self.shared.preparations.enter_until(&admission)?;
             // Work states free as this context's earlier commands retire.
-            match packet.completion.work_state()?.acquire() {
+            match packet.completion.work_state()?.acquire(crate::g17::job::Engine::Compute) {
                 Err(error) if error == EBUSY => {
                     drop(lease);
                     self.shared.queue_events();

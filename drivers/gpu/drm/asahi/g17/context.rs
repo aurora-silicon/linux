@@ -14,8 +14,9 @@ use super::{
     status::VmStatus,
 };
 use crate::mmu::{self, ExecutionContext, Vm, UAT_PGSZ};
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use identity::{RenderSlots, WorkStates, FREE, NODE_STRIDE, STATE_COUNT};
+use super::job::Engine;
 use kernel::{
     new_mutex,
     prelude::*,
@@ -396,6 +397,8 @@ impl Context {
 pub(crate) struct WorkStateLease {
     context: Arc<Context>,
     word: AtomicU32,
+    /// Index of the engine whose admission took the node, valid once `word` is set.
+    engine: AtomicU8,
 }
 impl WorkStateLease {
     pub(super) fn status(&self) -> &Arc<VmStatus> { self.context.status() }
@@ -403,36 +406,32 @@ impl WorkStateLease {
         Self {
             context,
             word: AtomicU32::new(FREE),
+            engine: AtomicU8::new(0),
         }
     }
-    pub(crate) fn acquire(&self) -> Result<u32> {
+    /// The ioctl's node, taking one for `engine`'s admission if it has none yet. EBUSY: none
+    /// may be taken now (see `identity::may_take`); a later return makes one available.
+    pub(crate) fn acquire(&self, engine: Engine) -> Result<u32> {
         let current = self.word();
         if current != FREE {
             return Ok(current);
         }
-        let Some(candidate) = self.context.states.allocate() else {
-            let current = self.word();
-            return if current != FREE {
-                Ok(current)
-            } else {
-                Err(EBUSY)
-            };
-        };
-        let initialized = self.context.work.lock().initialize(candidate);
-        if let Err(error) = initialized {
-            self.context.release_state(candidate);
+        // The work-storage lock serializes the decision with this context's other
+        // admissions, and with the other engine of this ioctl taking its node.
+        let mut work = self.context.work.lock();
+        let current = self.word();
+        if current != FREE {
+            return Ok(current);
+        }
+        let engine = engine.index();
+        let candidate = self.context.states.allocate(engine).ok_or(EBUSY)?;
+        if let Err(error) = work.initialize(candidate) {
+            self.context.release_state(candidate, engine);
             return Err(error);
         }
-        match self
-            .word
-            .compare_exchange(FREE, candidate, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => Ok(candidate),
-            Err(installed) => {
-                self.context.release_state(candidate);
-                Ok(installed)
-            }
-        }
+        self.engine.store(engine as u8, Ordering::Relaxed);
+        self.word.store(candidate, Ordering::Release);
+        Ok(candidate)
     }
     /// The domain a publisher samples before acquire() and waits on after EBUSY.
     pub(crate) fn returns(&self) -> &Arc<super::availability::Availability> {
@@ -478,7 +477,7 @@ impl Drop for WorkStateLease {
     fn drop(&mut self) {
         let word = self.word();
         if word != FREE {
-            self.context.release_state(word);
+            self.context.release_state(word, usize::from(self.engine.load(Ordering::Relaxed)));
         }
     }
 }
@@ -486,8 +485,8 @@ impl Drop for WorkStateLease {
 impl Context {
     /// Every return bumps the domain: a publisher that sampled it before its
     /// failed acquire() then never sleeps through this node.
-    fn release_state(&self, word: u32) {
-        if self.states.release(word) {
+    fn release_state(&self, word: u32, engine: usize) {
+        if self.states.release(word, engine) {
             self.state_returns.notify();
         }
     }
