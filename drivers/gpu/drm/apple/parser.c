@@ -14,6 +14,7 @@
 #endif
 
 #include "parser.h"
+#include "dcp-peer-v27.h"
 #include "trace.h"
 
 #define DCP_PARSE_HEADER 0xd3
@@ -1449,12 +1450,57 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 	return 0;
 }
 
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps)
+{
+	struct iterator it;
+	struct dcp_dptx_caps parsed = {};
+	int ret = 0;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		u32 *field = NULL;
+		char *key = parse_string(it.handle);
+		s64 value;
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "MaxPixelWidth"))
+			field = &parsed.width;
+		else if (!strcmp(key, "MaxTotalPixelRate"))
+			field = &parsed.total_rate;
+		else if (!strcmp(key, "MaxActivePixelRate"))
+			field = &parsed.active_rate;
+		kfree(key);
+		if (!field) {
+			ret = skip(it.handle);
+			if (ret)
+				return ret;
+			if (it.handle->pos > it.handle->len)
+				return -EINVAL;
+			continue;
+		}
+		if (*field)
+			return -EINVAL;
+		ret = parse_int_bound(it.handle, &value, 1, U32_MAX);
+		if (ret)
+			return ret;
+		*field = value;
+	}
+	if (!parsed.width || !parsed.total_rate || !parsed.active_rate)
+		return -ENOENT;
+	*caps = parsed;
+	return 0;
+}
+
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			    const char **class, s64 *unit, bool h17p_keys)
 {
 	int ret = 0;
 	struct iterator it;
 	bool parsed_unit = false;
+	bool explicit_unit = false;
 	bool parsed_name = false;
 	bool parsed_class = false;
 
@@ -1502,10 +1548,12 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			else
 				parsed_class = true;
 		} else if (!strcmp(key, "EPICUnit") ||
-			   (h17p_keys && !strcmp(key, "interface-id"))) {
+			   (h17p_keys && !explicit_unit && !strcmp(key, "interface-id"))) {
 			ret = parse_int(it.handle, unit);
-			if (!ret)
+			if (!ret) {
 				parsed_unit = true;
+				explicit_unit |= !strcmp(key, "EPICUnit");
+			}
 		} else {
 			ret = skip(it.handle);
 		}

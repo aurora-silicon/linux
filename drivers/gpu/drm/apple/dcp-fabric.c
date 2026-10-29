@@ -1761,12 +1761,51 @@ int dcp_tunnel_crossbar_down(struct apple_dcp *dcp, u32 unit)
  * The output is the borrowed Type-C route's, or the fixed route's. Other
  * SoCs clock it at select. Runs inside a DCP apcall: only tb_lock.
  */
+static int dcp_direct_crossbar_link_t6050(struct apple_dcp *dcp, bool up)
+{
+	typeof(&apple_dp_phy_link_config) get_config;
+	typeof(&apple_dpxbar_link_configure) configure;
+	struct mux_control *xbar;
+	unsigned int pclk;
+	bool uhbr;
+	int ret;
+
+	guard(mutex)(&dcp->tb_lock);
+	/* A borrowed Type-C route has its own mux; xbar remains the fixed
+	 * output's mux (or NULL on a Type-C-only pipeline). */
+	xbar = dcp->active_typec_route ?
+		dcp->active_typec_route->active_xbar : dcp->xbar;
+	if (dcp->dptx_tunnel || !dcp->phy || !xbar)
+		return 0;
+	get_config = symbol_get(apple_dp_phy_link_config);
+	if (!get_config)
+		return dcp->fw_compat == DCP_FIRMWARE_V_27_0 ? -ENODEV : 0;
+	ret = get_config(dcp->phy, &pclk, &uhbr);
+	symbol_put(apple_dp_phy_link_config);
+	if (ret == -EOPNOTSUPP)
+		return 0;
+	if (!up && ret == -ENOLINK)
+		ret = 0;
+	if (ret)
+		return ret;
+	if (!up)
+		return dcp_dpxbar_link(xbar, false);
+	configure = symbol_get(apple_dpxbar_link_configure);
+	if (!configure)
+		return -ENODEV;
+	ret = configure(xbar, pclk, uhbr);
+	symbol_put(apple_dpxbar_link_configure);
+	return ret ? ret : dcp_dpxbar_link(xbar, true);
+}
+
 int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 {
 	struct apple_dcp_typec_route *route;
 	struct mux_control *xbar = NULL;
 	int ret;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		return dcp_direct_crossbar_link_t6050(dcp, up);
 	if (!of_machine_is_compatible("apple,t6030"))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
@@ -4113,4 +4152,11 @@ void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp)
 			}
 		}
 	}
+}
+
+int dcp_typec_test_link(struct platform_device *pdev, bool enabled)
+{
+	guard(mutex)(&dcp_typec_fabric_lock);
+	return enabled ? dcp_dptx_connect_oob(pdev, 0) :
+			 dcp_dptx_disconnect_oob(pdev, 0);
 }
