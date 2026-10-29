@@ -608,6 +608,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->sdr.score = -1;
 	out->best.score = -1;
 	out->pq.score = -1;
+	out->sdr_usable = false;
 	out->has_bootstrap = false;
 
 	ret = iterator_begin(handle, &outer_it, false);
@@ -693,6 +694,11 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 
 		if (limits_known)
 			collect_pq_mode(&out->pq, &best_pq_rank, &cmode, limits);
+		if (cmode.eotf == DCP_EOTF_SDR_GAMMA &&
+		    (!limits_known ||
+		     (!timing_color_contains(&limits->unsafe, cmode.id) &&
+		      !timing_color_contains(&limits->dsc_required, cmode.id))))
+			out->sdr_usable = true;
 
 		if (external_sdr) {
 			unsigned int rank;
@@ -987,6 +993,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	out->timing_mode_id = id;
 	out->color_mode_id = best_color_mode;
 	out->preferred = is_preferred;
+	out->firmware_preferred = external_sdr ? preferred : is_preferred;
 
 	trace_iomfb_timing_mode(handle->dcp, id, *score, horiz.active,
 				vert.active, vert.precise_sync_rate,
@@ -1097,6 +1104,66 @@ static bool dcp_180hz_ids_current(struct dcp_parse_ctx handle,
  * A timing mode that the firmware marks as preferred ranks above every mode
  * that it does not mark; the firmware score orders the modes of each group.
  */
+/*
+ * An external display defaults to its native resolution at the highest
+ * refresh rate it can take, as other systems pick it, rather than to the
+ * timing its EDID lists first.  Among the timings of that resolution with a
+ * usable SDR element, the higher refresh rate ranks first, then IsPreferred,
+ * then the firmware score.
+ */
+VISIBLE_IF_KUNIT bool dcp_mode_default_above(const struct dcp_display_mode *mode,
+					     s64 score,
+					     const struct dcp_display_mode *best,
+					     s64 best_score)
+{
+	/* clock / (htotal * vtotal), compared without dividing */
+	u64 refresh = (u64)mode->mode.clock * best->mode.htotal * best->mode.vtotal;
+	u64 best_refresh = (u64)best->mode.clock * mode->mode.htotal * mode->mode.vtotal;
+
+	if (refresh != best_refresh)
+		return refresh > best_refresh;
+	if (mode->firmware_preferred != best->firmware_preferred)
+		return mode->firmware_preferred;
+	return score > best_score;
+}
+
+/*
+ * The native resolution: the largest the firmware marks IsPreferred, or the
+ * largest of all when it marks none.
+ */
+static struct dcp_display_mode *dcp_external_default(struct dcp_display_mode *modes,
+						     unsigned int count)
+{
+	struct dcp_display_mode *native = NULL, *best = NULL;
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		const struct dcp_display_mode *m = &modes[i];
+		u64 area = (u64)m->mode.hdisplay * m->mode.vdisplay;
+
+		if (m->automatic_rgb8_quirk || !m->sdr_usable)
+			continue;
+		if (!native ||
+		    (m->firmware_preferred && !native->firmware_preferred) ||
+		    (m->firmware_preferred == native->firmware_preferred &&
+		     area > (u64)native->mode.hdisplay * native->mode.vdisplay))
+			native = &modes[i];
+	}
+	if (!native)
+		return NULL;
+	for (i = 0; i < count; i++) {
+		struct dcp_display_mode *m = &modes[i];
+
+		if (m->automatic_rgb8_quirk || !m->sdr_usable ||
+		    m->mode.hdisplay != native->mode.hdisplay ||
+		    m->mode.vdisplay != native->mode.vdisplay)
+			continue;
+		if (!best || dcp_mode_default_above(m, m->score, best, best->score))
+			best = m;
+	}
+	return best;
+}
+
 VISIBLE_IF_KUNIT bool dcp_mode_ranks_above(bool preferred, s64 score,
 					   bool best_preferred, s64 best_score)
 {
@@ -1162,6 +1229,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 
 		/* Process a successful mode */
 		(*count)++;
+		mode->score = score;
 
 		if (!mode->automatic_rgb8_quirk &&
 		    dcp_mode_ranks_above(mode->preferred, score, best_preferred,
@@ -1172,6 +1240,13 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		}
 	}
 
+	/* A panel keeps the timing its firmware prefers. */
+	if (!internal) {
+		struct dcp_display_mode *def = dcp_external_default(modes, *count);
+
+		if (def)
+			best_mode = def;
+	}
 	if (best_mode != NULL)
 		best_mode->mode.type |= DRM_MODE_TYPE_PREFERRED;
 

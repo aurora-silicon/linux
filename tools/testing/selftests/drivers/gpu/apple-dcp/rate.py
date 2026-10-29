@@ -89,6 +89,31 @@ def parser_fixture(root):
     ycc_raw = bytearray(struct.pack('<I', 0xd3))
     wire(ycc_fixture, ycc_raw)
     timing_source += 'static const unsigned char ycc_blob[] = {' + ','.join(map(str,ycc_raw)) + '};\n'
+    # Default mode: an external display's native resolution at its highest
+    # usable refresh rate; a panel keeps the timing its firmware prefers.
+    def timing(i, w, h, hz, pref, score, unsafe=False):
+        base = timing_fixture[0]
+        return dict(base, ID=i, Score=score, IsPreferred=pref,
+                    HorizontalAttributes=dict(base['HorizontalAttributes'], Active=w, Total=w + 160),
+                    VerticalAttributes=dict(base['VerticalAttributes'], Active=h, Total=h + 45,
+                                            PreciseSyncRate=hz << 16),
+                    ColorModes=[color(200 + i, 1, 10, 0, 10)],
+                    UnsafeColorElementIDs=[200 + i] if unsafe else [])
+    defaults = {
+        # EDID-preferred 1080p60, native 1920x1080 up to 180 Hz
+        'acer': [timing(1, 1920, 1080, 60, True, 16224), timing(2, 1920, 1080, 180, False, 15553),
+                 timing(3, 1920, 1080, 144, False, 15443), timing(4, 1280, 720, 60, False, 16155)],
+        # IsPreferred on 1080p240 and 1440p60; 1440p300 only with an unsafe element
+        'msi': [timing(1, 1920, 1080, 240, True, 20000), timing(2, 2560, 1440, 60, True, 16000),
+                timing(3, 2560, 1440, 280, False, 15000), timing(4, 2560, 1440, 144, False, 15100),
+                timing(5, 2560, 1440, 300, False, 15200, unsafe=True)],
+        # a panel whose firmware prefers 60 Hz keeps it
+        'panel': [timing(1, 3456, 2234, 60, True, 16000), timing(2, 3456, 2234, 120, False, 17000)],
+    }
+    for name, catalog in defaults.items():
+        raw = bytearray(struct.pack('<I', 0xd3))
+        wire(catalog, raw)
+        timing_source += f'static const unsigned char default_{name}[] = {{' + ','.join(map(str, raw)) + '};\n'
     proof_checks = []
     for path, value, count in [
         (("IsPreferred",), None, 1), (("IsPreferred",), False, 1),
@@ -288,6 +313,25 @@ int main(int argc, char **argv)
         assert(!IS_ERR(m) && n == 1 && m[0].pq.id == 95 && m[0].pq.depth == 12);
         assert(m[0].color_mode_id == 85);
         free(m);
+        /* The default modes; the timing ID that carries DRM_MODE_TYPE_PREFERRED. */
+        static const struct { const unsigned char *blob; size_t size; bool internal; u32 id; } d[] = {
+            { default_acer, sizeof(default_acer), false, 2 },
+            { default_msi, sizeof(default_msi), false, 3 },
+            { default_panel, sizeof(default_panel), true, 1 },
+        };
+        for (unsigned int k = 0; k < ARRAY_SIZE(d); k++) {
+            unsigned int found = 0;
+            assert(!parse(d[k].blob, d[k].size, &c));
+            m = enumerate_modes(&c, &n, 600, 330, 0, d[k].internal, false);
+            assert(!IS_ERR(m) && n);
+            for (unsigned int j = 0; j < n; j++)
+                if (m[j].mode.type & DRM_MODE_TYPE_PREFERRED) {
+                    assert(m[j].timing_mode_id == d[k].id);
+                    found++;
+                }
+            assert(found == 1);
+            free(m);
+        }
         /* The external SDR path keeps its SDR element and the same PQ one. */
         assert(!parse(pq_blob, sizeof(pq_blob), &c));
         m = enumerate_modes(&c, &n, 600, 330, 0, false, true);
