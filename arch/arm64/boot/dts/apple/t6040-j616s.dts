@@ -335,7 +335,11 @@
 	 * throttled): the fans stay off up to TCMz ~100 C, start at their
 	 * minimum, leave it near 104.5 C, and hold the die at a steady 106.5 C
 	 * with 3450/3730 rpm (60-65% of maximum), after a 110.9 C peak. Full
-	 * speed is kept for 111 C, just under the 113 C passive trip.
+	 * speed is kept for 111 C, just under the 113 C passive trip. TCMz, the
+	 * hottest of the die sensors, swings by up to 8 C between samples
+	 * under load, so the hysteresis spans that swing; a fan stays on its
+	 * speed until the die is clearly cooler, as the SMC's slow ramp does
+	 * under macOS.
 	 */
 #define J616S_FAN_TRIP(label, node, temp, hyst)	\
 	label: node {					\
@@ -352,11 +356,11 @@
 	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 95000, 5000)
 
 #define J616S_CPU_FAN_TRIPS(zone)				\
-	J616S_FAN_TRIP(zone##_fan1, trip-fan1, 100000, 5000)	\
-	J616S_FAN_TRIP(zone##_fan2, trip-fan2, 104000, 3000)	\
-	J616S_FAN_TRIP(zone##_fan3, trip-fan3, 106000, 3000)	\
-	J616S_FAN_TRIP(zone##_fan4, trip-fan4, 108000, 2000)	\
-	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 111000, 2000)
+	J616S_FAN_TRIP(zone##_fan1, trip-fan1, 100000, 10000)	\
+	J616S_FAN_TRIP(zone##_fan2, trip-fan2, 104000, 8000)	\
+	J616S_FAN_TRIP(zone##_fan3, trip-fan3, 106000, 7000)	\
+	J616S_FAN_TRIP(zone##_fan4, trip-fan4, 108000, 5000)	\
+	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 111000, 3000)
 
 #define J616S_FAN_MAP(trip_label, node, state)			\
 	node {							\
