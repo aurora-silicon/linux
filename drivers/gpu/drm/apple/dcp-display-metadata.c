@@ -117,7 +117,7 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 		coordinate[i] = DIV_ROUND_CLOSEST(value, 64);
 		if (!coordinate[i] || coordinate[i] > 1023)
 			return -EINVAL;
-		if ((i & 1) && coordinate[i - 1] + coordinate[i] > 1024)
+		if (i == 7 && coordinate[6] + coordinate[7] > 1024)
 			return -EINVAL;
 	}
 	/* Degenerate primaries or a white point outside their triangle are not usable. */
