@@ -754,7 +754,16 @@ impl Backend {
         let owner_pid =
             u32::try_from(kernel::current!().group_leader().pid()).map_err(|_| EOVERFLOW)?;
         let context = Arc::new(
-            Context::new(&alloc, &pool, &qos, execution, owner_pid, policy, shared.renders.clone())?,
+            Context::new(
+                &alloc,
+                &pool,
+                &qos,
+                execution,
+                owner_pid,
+                policy,
+                shared.renders.clone(),
+                shared.progress.clone(),
+            )?,
             GFP_KERNEL,
         )?;
         let state = shared.state.lock();
