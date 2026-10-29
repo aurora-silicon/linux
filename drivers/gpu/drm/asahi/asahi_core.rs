@@ -197,6 +197,14 @@ module! {
             default: 0,
             description: "G15: renders before the TA stamp wrap within which TA/FS are renumbered while idle; 0 = off",
         },
+        g15_compute_stamp_base: u32 {
+            default: 0,
+            description: "G15 (testing): compute ordinal the compute stamp starts from; 0 = unchanged",
+        },
+        g15_compute_reseed_margin: u32 {
+            default: 0,
+            description: "G15: computes before the compute stamp wrap within which it is renumbered while idle; 0 = off",
+        },
         g15_early_tiling: u32 {
             default: 0,
             description: "G15: advertise FRAGMENT_BARRIERS, mapped to early tiling (slower on 2419)",

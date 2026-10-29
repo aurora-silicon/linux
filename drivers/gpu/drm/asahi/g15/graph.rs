@@ -251,7 +251,8 @@ impl ComputeGraph {
         q.w64(qinfo::UNK_AC, 4)?;
         self.qstate.w32(qstate::CAP, sizes::QUEUE_CAP)?;
 
-        self.user_stamp.w32(0, engine::COMPUTE_SEED)?;
+        let start = super::encode::stamp(super::params::compute_stamp_base());
+        self.user_stamp.w32(0, start)?;
         self.fw_stamp.w32(0, 0)
     }
 }
