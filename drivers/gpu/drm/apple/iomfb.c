@@ -871,6 +871,19 @@ bool dcp_crtc_can_retrain(struct drm_crtc *crtc, struct apple_connector *connect
 	return to_apple_crtc(crtc)->dcp == pdev;
 }
 
+/*
+ * A Type-C port whose pipelines do not follow their CRTC is driven by the
+ * pipeline its route is on; @crtc belonging to another one has lost it.
+ */
+static bool dcp_crtc_lost_route(struct drm_crtc *crtc, struct apple_connector *connector)
+{
+	struct platform_device *pdev = READ_ONCE(connector->dcp);
+
+	return connector->port_encoder && pdev &&
+	       !dcp_typec_follows_crtc(platform_get_drvdata(pdev)) &&
+	       to_apple_crtc(crtc)->dcp != pdev;
+}
+
 static int dcp_retrain_active_crtc(struct apple_connector *connector)
 {
 	struct drm_device *dev = connector->base.dev;
@@ -882,10 +895,24 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector)
 
 	crtc = connector->base.state ? connector->base.state->crtc : NULL;
 	if (crtc && crtc->state && crtc->state->active &&
-	    dcp_crtc_can_retrain(crtc, connector))
+	    dcp_crtc_lost_route(crtc, connector)) {
+		/*
+		 * The port's route moved to another pipeline (an HDMI display
+		 * took the hybrid): this CRTC cannot drive the display any
+		 * more, and a reset would only be refused.  Release it, so the
+		 * hotplug that follows lets the compositor pair the display
+		 * with the pipeline that now drives it, and this pipeline's
+		 * own display with this CRTC.
+		 */
+		struct drm_mode_set set = { .crtc = crtc };
+
+		ret = drm_atomic_helper_set_config(&set, &ctx);
+	} else if (crtc && crtc->state && crtc->state->active &&
+		   dcp_crtc_can_retrain(crtc, connector)) {
 		ret = drm_atomic_helper_reset_crtc(crtc, &ctx);
-	else
+	} else {
 		ret = 0;
+	}
 
 	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
 
