@@ -206,6 +206,7 @@ struct apple_soc_cpufreq_info {
 	/* Fail closed when the DT describes no fast die-temperature limit. */
 	bool needs_thermal_policy;
 	bool needs_thermal_owner;
+	bool needs_firmware_thermal_control;
 	u32 transition_timeout_us;
 	/* Highest P-state allowed without a thermal policy; 0 if not capped. */
 	u32 max_unmanaged_pstate;
@@ -340,6 +341,16 @@ static const struct apple_soc_cpufreq_info soc_t8132_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+/* Command-state readback, not a measurement of the clock frequency. */
+static const struct apple_soc_cpufreq_info soc_t6050_info = {
+	.verify_transition = true,
+	.needs_firmware_thermal_control = true,
+	.transition_timeout_us = 2000,
+	.max_pstate = 31,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct apple_soc_cpufreq_info soc_default_info = {
 	.has_ps2 = false,
 	.max_pstate = 15,
@@ -372,6 +383,10 @@ static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
 	{
 		.compatible = "apple,t8140-cluster-cpufreq",
 		.data = &soc_t8140_info,
+	},
+	{
+		.compatible = "apple,t6050-cluster-cpufreq",
+		.data = &soc_t6050_info,
 	},
 	{
 		.compatible = "apple,t8142-cluster-cpufreq",
@@ -1317,6 +1332,14 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	if (ret) {
 		dev_err(cpu_dev, "%s: failed to get cluster info: %d\n", __func__, ret);
 		goto out_free_priv;
+	}
+
+	/* The boot producer must retain and qualify firmware thermal control. */
+	if (info->needs_firmware_thermal_control &&
+	    !of_property_read_bool(cluster, "apple,firmware-managed-thermal")) {
+		dev_err(cpu_dev, "firmware thermal ownership is not declared\n");
+		ret = -ENODEV;
+		goto out_iounmap;
 	}
 
 	ret = dev_pm_opp_of_cpumask_add_table(policy->cpus);
