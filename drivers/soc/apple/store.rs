@@ -131,9 +131,42 @@ impl StoreIo for shim::StoreFile {
     }
 }
 
+/// Where a [`Store`] reaches its backing file. Every operation opens it and
+/// closes it again before returning.
+pub(crate) trait StoreSource {
+    type Io: StoreIo;
+    fn open(&self) -> Result<Self::Io>;
+}
+
+/// A file that is already open is its own source, as the tests' in-memory
+/// files are.
+impl<T: StoreIo + Copy> StoreSource for T {
+    type Io = T;
+
+    fn open(&self) -> Result<T> {
+        Ok(*self)
+    }
+}
+
+/// The host-state file at [`STORE_PATH`].
+pub(crate) struct HostFile;
+
+impl StoreSource for HostFile {
+    type Io = shim::StoreFile;
+
+    fn open(&self) -> Result<shim::StoreFile> {
+        shim::StoreFile::open_host(STORE_PATH).map(|(file, _)| file)
+    }
+}
+
 // Not internally locked; the caller holds a mutex around all access.
-pub(crate) struct Store<F = shim::StoreFile> {
-    file: F,
+//
+// The store keeps its table in memory and holds no open file between
+// operations. The driver opens the file from the kernel, so no task owns it:
+// held open for writing, it would pin its file system until power-off, which
+// could then be neither unmounted nor remounted read-only.
+pub(crate) struct Store<S: StoreSource = HostFile> {
+    source: S,
     slots: [Slot; SLOT_COUNT],
     generation: u64,
 }
@@ -242,14 +275,21 @@ fn decode(sb: &[u8], slots: &mut [Slot; SLOT_COUNT]) -> Result<(), Damage> {
 impl Store {
     pub(crate) fn open() -> Result<Self> {
         let (file, created) = shim::StoreFile::open_host(STORE_PATH)?;
-        Self::from_file(file, created)
+        Self::load(HostFile, &file, created)
     }
 }
 
-impl<F: StoreIo> Store<F> {
-    fn from_file(file: F, created: bool) -> Result<Self> {
+impl<S: StoreSource> Store<S> {
+    #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+    fn from_file(source: S, created: bool) -> Result<Self> {
+        let file = source.open()?;
+        Self::load(source, &file, created)
+    }
+
+    /// Loads the store from `file`, the open backing file of `source`.
+    fn load(source: S, file: &S::Io, created: bool) -> Result<Self> {
         let mut store = Store {
-            file,
+            source,
             slots: [Slot::FREE; SLOT_COUNT],
             generation: 0,
         };
@@ -257,9 +297,9 @@ impl<F: StoreIo> Store<F> {
         // New files and interrupted empty or all-zero creations hold no state.
         // Any other existing file may hold the only copy of the host state,
         // so one that does not validate is refused and left as it is.
-        let size = store.file.size()?;
+        let size = file.size()?;
         if created && size == 0 {
-            store.create()?;
+            store.create(file)?;
             pr_info!("created a new host-state store\n");
             return Ok(store);
         }
@@ -267,19 +307,19 @@ impl<F: StoreIo> Store<F> {
         let mut sb = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
         sb.resize(BLOCK_SIZE, 0, GFP_KERNEL)?;
         let decoded = if size == STORE_SIZE as u64 {
-            store.file.read_exact(0, &mut sb)?;
+            file.read_exact(0, &mut sb)?;
             decode(&sb, &mut store.slots)
         } else {
             Err(Damage::Size)
         };
         if let Err(damage) = decoded {
             if matches!(damage, Damage::Size | Damage::Header) {
-                if let Some(what) = describe(&store.file, size) {
+                if let Some(what) = describe(file, size) {
                     pr_warn!(
                         "host-state store file is {} and holds no state; initialising it\n",
                         what
                     );
-                    store.create()?;
+                    store.create(file)?;
                     return Ok(store);
                 }
             }
@@ -303,26 +343,26 @@ impl<F: StoreIo> Store<F> {
         EIO
     }
 
-    fn create(&mut self) -> Result<()> {
+    fn create(&mut self, file: &S::Io) -> Result<()> {
         self.slots = [Slot::FREE; SLOT_COUNT];
         self.generation = 1;
 
         let mut zero = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
         zero.resize(BLOCK_SIZE, 0, GFP_KERNEL)?;
         for b in 0..BLOCK_COUNT {
-            self.file.write_all((b * BLOCK_SIZE) as u64, &zero)?;
+            file.write_all((b * BLOCK_SIZE) as u64, &zero)?;
         }
 
-        self.commit()?;
+        self.commit(file)?;
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<()> {
-        self.write_superblock(Intent::None)?;
-        self.file.sync()
+    fn commit(&mut self, file: &S::Io) -> Result<()> {
+        self.write_superblock(file, Intent::None)?;
+        file.sync()
     }
 
-    fn write_superblock(&mut self, intent: Intent) -> Result<()> {
+    fn write_superblock(&mut self, file: &S::Io, intent: Intent) -> Result<()> {
         let mut sb = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
         sb.resize(BLOCK_SIZE, 0, GFP_KERNEL)?;
 
@@ -348,7 +388,7 @@ impl<F: StoreIo> Store<F> {
             sb[off + 18..off + 22].copy_from_slice(&slot.len.to_le_bytes());
         }
 
-        self.file.write_all(0, &sb)
+        file.write_all(0, &sb)
     }
 
     fn find(&self, key: &Key) -> Option<usize> {
@@ -374,7 +414,7 @@ impl<F: StoreIo> Store<F> {
         let mut value = KVec::with_capacity(len, GFP_KERNEL)?;
         value.resize(len, 0, GFP_KERNEL)?;
         if len > 0 {
-            self.file.read_exact(Self::block_offset(idx), &mut value)?;
+            self.source.open()?.read_exact(Self::block_offset(idx), &mut value)?;
         }
         Ok(Some(value))
     }
@@ -389,19 +429,23 @@ impl<F: StoreIo> Store<F> {
 
         let old = self.find(key);
         let fresh = self.find_free().ok_or(ENOSPC)?;
+        let file = self.source.open()?;
 
         // 1. Record the intent, durably, before touching any data block.
-        self.write_superblock(Intent::Write {
-            slot: fresh as u16,
-            kind: key.kind,
-        })?;
-        self.file.sync()?;
+        self.write_superblock(
+            &file,
+            Intent::Write {
+                slot: fresh as u16,
+                kind: key.kind,
+            },
+        )?;
+        file.sync()?;
 
         // 2. Fill the new block and make it durable.
         if !value.is_empty() {
-            self.file.write_all(Self::block_offset(fresh), value)?;
+            file.write_all(Self::block_offset(fresh), value)?;
         }
-        self.file.sync()?;
+        file.sync()?;
 
         // 3. Switch the slot table, release the old block, clear the intent.
         self.slots[fresh] = Slot {
@@ -414,7 +458,7 @@ impl<F: StoreIo> Store<F> {
             self.slots[old] = Slot::FREE;
         }
         self.generation = self.generation.wrapping_add(1);
-        self.commit()
+        self.commit(&file)
     }
 }
 
