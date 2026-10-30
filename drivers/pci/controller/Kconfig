@@ -35,6 +35,32 @@ config PCIE_ALTERA_MSI
 	  Say Y here if you want PCIe MSI support for the Altera FPGA.
 	  This MSI driver supports Altera MSI to GIC controller IP.
 
+config PCIE_APPLE_T8140_BOOTSTRAP
+	bool "Apple T8140 radio PCIe bootstrap"
+	depends on PCIE_APPLE=y && ARCH_APPLE && IOMMU_DMA
+	depends on PCIEASPM
+	help
+	  Enable the radio PCIe bootstrap on Apple T8140 systems. A reciprocal
+	  device tree link between the host and engine selects this provider.
+	  One fixed SID17 config read primes native ECAM; typed reads and host
+	  resource validation admit only the expected Wi-Fi and Bluetooth pair.
+
+	  Build the host and supplier in. Published DMA memory remains owned
+	  until full hardware reset because engine teardown is not qualified.
+	  Suspend-to-idle retains the arena and restores configuration without
+	  issuing another request. Hibernation, deeper sleep and kexec remain
+	  blocked after activation, as do removal and arbitrary downstream use.
+
+config PCIE_APPLE_T8140_BOOTSTRAP_KUNIT_TEST
+	tristate "Apple T8140 PCIe bootstrap tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test bootstrap ownership transitions, sleep admission, DMA address
+	  bounds and IRQ validation without accessing hardware. The tests cover
+	  successful admission, pre-publication unwind and irreversible failure
+	  ownership. They do not qualify engine reset or hardware teardown.
+
 config PCIE_APPLE_MSI_DOORBELL_ADDR
 	hex
 	default 0xfffff000
@@ -56,22 +82,6 @@ config PCIE_APPLE
 	  type-A ports, Ethernet, Wi-Fi, and Bluetooth.
 
 	  If unsure, say Y if you have an Apple Silicon system.
-
-config PCIE_APPLE_PIODMA_DIAG
-	bool "J700 PIODMA diagnostic (requires full reset after use)"
-	depends on PCIE_APPLE=y && ARCH_APPLE && IOMMU_DMA
-	depends on PCIEASPM
-	help
-	  Build the experimental SID17 retained bootstrap provider. It submits
-	  one fixed request, validates typed ECAM and then enumerates the two
-	  Neo radio functions when the board device tree links the PCIe host
-	  to this engine. The enumerate=0 parameter keeps the host on its
-	  root-port-only path instead.
-	  The host and supplier must both be built in: supplier removal cannot
-	  release a published DMA arena safely. Suspend-to-idle sleep retains that
-	  arena and restores the configuration without repeating a request.
-	  Hibernation and deeper suspend are rejected after activation.
-	  This does not qualify memory reuse or arbitrary downstream devices.
 
 config PCI_VERSATILE
 	bool "ARM Versatile PB PCI controller"

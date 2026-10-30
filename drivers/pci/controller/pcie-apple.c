@@ -44,7 +44,7 @@
 
 #include "../pci.h"
 #include "pci-host-common.h"
-#include "pcie-apple-piodma-diag.h"
+#include "pcie-apple-t8140-bootstrap.h"
 
 static ATOMIC_NOTIFIER_HEAD(apple_pcie_tunnel_notifiers);
 
@@ -1813,10 +1813,10 @@ rid2sid_ready:
 	if (pcie->hw->tunneled)
 		WRITE_ONCE(port->started, true);
 	if (pcie->hw->root_bus_only)
-		dev_info(pcie->dev, "port %pOF RUN=%#x link=%#x; downstream config %s\n",
-			 np, apple_pcie_port_readl(port, PORT_STATUS),
-			 apple_pcie_port_readl(port, PORT_LINKSTS),
-			 pcie->piodma_supplier ? "waits for the bootstrap" : "blocked");
+		dev_dbg(pcie->dev, "port %pOF RUN=%#x link=%#x; downstream config %s\n",
+			np, apple_pcie_port_readl(port, PORT_STATUS),
+			apple_pcie_port_readl(port, PORT_LINKSTS),
+			pcie->piodma_supplier ? "waits for the bootstrap" : "blocked");
 
 	return 0;
 
@@ -2296,7 +2296,7 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 }
 
 /*
- * The T8140 experiment starts with all downstream accesses blocked.
+ * The T8140 host starts with all downstream accesses blocked.
  * Only a successful owned bootstrap and typed ECAM checks open functions0/1.
  * Generic config callbacks retain their normal native widths and locking.
  */
@@ -2651,9 +2651,9 @@ static int apple_pcie_neo_typed_ids(struct apple_pcie *pcie, struct pci_dev *roo
 		low = readb(cfg + PCI_VENDOR_ID);
 		high = readb(cfg + PCI_VENDOR_ID + 1);
 		header = readb(cfg + PCI_HEADER_TYPE);
-		dev_info(pcie->dev,
-			 "typed ECAM function=%d id=%#x vendor=%#x device=%#x bytes=%02x:%02x header=%#x\n",
-			 function, id, vendor, device, low, high, header);
+		dev_dbg(pcie->dev,
+			"typed ECAM function=%d id=%#x vendor=%#x device=%#x bytes=%02x:%02x header=%#x\n",
+			function, id, vendor, device, low, high, header);
 		if (id != ids[function] || vendor != (ids[function] & 0xffff) ||
 		    device != ids[function] >> 16 || low != 0xc3 || high != 0x14 ||
 		    (header & PCI_HEADER_TYPE_MASK) != PCI_HEADER_TYPE_NORMAL ||
@@ -2676,8 +2676,8 @@ static int apple_pcie_neo_check_memory(struct pci_dev *root)
 	ret = pci_read_config_word(root, PCI_COMMAND, &command);
 	if (!ret)
 		ret = pci_read_config_dword(root, PCI_MEMORY_BASE, &window);
-	pci_info(root, "NEO_ROOT_MEMORY_READBACK status=%d command=%#x window=%#x\n",
-		 ret, command, window);
+	pci_dbg(root, "NEO_ROOT_MEMORY_READBACK status=%d command=%#x window=%#x\n",
+		ret, command, window);
 	if (ret || command == U16_MAX || !(command & PCI_COMMAND_MEMORY) || window == U32_MAX)
 		return -EIO;
 	/* Each packed register field is12 bits; PCI_MEMORY_RANGE_MASK is unsigned long. */
@@ -2706,8 +2706,8 @@ static int apple_pcie_neo_check_memory(struct pci_dev *root)
 		if (ret)
 			return ret;
 	}
-	pci_info(root, "NEO_ROOT_MEMORY_ENABLED command=%#x window=%#x bus=%#llx-%#llx\n",
-		 command, window, base, limit);
+	pci_dbg(root, "NEO_ROOT_MEMORY_ENABLED command=%#x window=%#x bus=%#llx-%#llx\n",
+		command, window, base, limit);
 	return 0;
 }
 
@@ -2731,8 +2731,8 @@ static int apple_pcie_neo_check_cold(struct apple_pcie *pcie, struct pci_dev *ro
 		if (pci_read_config_word(endpoint, PCI_COMMAND, &command)) {
 			ret = ret ?: -EIO;
 		} else {
-			dev_info(pcie->dev, "enumerated %s id=%04x:%04x command=%#x\n",
-				 pci_name(endpoint), endpoint->vendor, endpoint->device, command);
+			dev_dbg(pcie->dev, "enumerated %s id=%04x:%04x command=%#x\n",
+				pci_name(endpoint), endpoint->vendor, endpoint->device, command);
 			if (command & PCI_COMMAND_MASTER) {
 				pci_clear_master(endpoint);
 				ret = ret ?: -EIO;
@@ -2803,7 +2803,7 @@ close_config:
 	}
 	pci_unlock_rescan_remove();
 	if (!ret)
-		dev_info(pcie->dev, "NEO_RADIO_READY; functions0/1 admitted with link power states disabled\n");
+		dev_info(pcie->dev, "radio PCIe bootstrap complete; Wi-Fi and Bluetooth admitted\n");
 out:
 	pci_dev_put(root);
 	return ret;
@@ -2842,7 +2842,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	}
 
 	/* Only a host that the board links to a bootstrap engine opens bus 1. */
-	if (hw->root_bus_only && apple_piodma_bootstrap_enabled() &&
+	if (hw->root_bus_only && IS_ENABLED(CONFIG_PCIE_APPLE_T8140_BOOTSTRAP) &&
 	    of_property_present(dev->of_node, "apple,piodma")) {
 		ret = apple_piodma_bootstrap_get(dev, &piodma_supplier);
 		if (ret)
@@ -2880,7 +2880,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		bridge->native_shpc_hotplug = false;
 		bridge->native_aer = false;
 		bridge->native_dpc = false;
-		dev_info_once(dev, "radio host: automatic AER/DPC recovery disabled for retained DMA\n");
+		dev_dbg(dev, "radio host: automatic AER/DPC recovery disabled for retained DMA\n");
 	}
 	if (hw->root_bus_only && !piodma_supplier)
 		dev_info(dev, "root-port probe only; downstream config is blocked\n");
@@ -2991,7 +2991,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, ret, "Neo bootstrap preflight failed\n");
 		}
 		if (ret)
-			dev_err(dev, "enumeration experiment failed=%d; host/supplier retained, no retry\n",
+			dev_err(dev, "radio admission failed=%d; host/supplier retained, no retry\n",
 				ret);
 		return 0;
 	}
