@@ -254,6 +254,8 @@ impl Firmware {
     /// flights are retained whole, never released to the free slot lists.
     pub(crate) fn fail_flights(&mut self, error: Error, done: &mut Completions) {
         let flights = core::mem::take(&mut self.engine.flights);
+        // A failed device never publishes again: release the memory floor now.
+        self.power.report_work(false);
         for flight in flights.iter() {
             for job in Iterator::chain(core::iter::once(&flight.job), flight.group.iter()) {
                 push_completion(done, job, Err(error));
