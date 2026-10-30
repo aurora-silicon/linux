@@ -57,12 +57,8 @@
 
 /*
  * The board DT opts in by pointing the host's "apple,piodma" at this engine;
- * a host without that property stays root-port-only. enumerate=0 keeps every
- * host on its root-port-only path for diagnosis.
+ * a host without that property stays root-port-only.
  */
-static bool enumerate = true;
-module_param(enumerate, bool, 0400);
-MODULE_PARM_DESC(enumerate, "Prime once, validate native ECAM, and enumerate the two Neo functions (default: on)");
 
 struct apple_piodma_request {
 	u16 offset;
@@ -290,11 +286,11 @@ static int apple_piodma_diag_arena(struct apple_piodma_diag *diag)
 
 		memset(slot + PIODMA_DATA_OFFSET, 0xa5, PAGE_SIZE);
 		*(__le32 *)(slot + PIODMA_DATA_OFFSET) = cpu_to_le32(U32_MAX);
-		dev_info(diag->dev,
-			 "owned SID17 slot=%d dma=%#llx descriptor=%#llx completion=%#llx data=%#llx\n",
-			 i, dma, dma + diag->pointer_prefix,
-			 dma + diag->pointer_prefix + PIODMA_COMPLETION_OFFSET,
-			 dma + PIODMA_DATA_OFFSET);
+		dev_dbg(diag->dev,
+			"owned SID17 slot=%d dma=%#llx descriptor=%#llx completion=%#llx data=%#llx\n",
+			i, dma, dma + diag->pointer_prefix,
+			dma + diag->pointer_prefix + PIODMA_COMPLETION_OFFSET,
+			dma + PIODMA_DATA_OFFSET);
 	}
 	dma_wmb();
 	return 0;
@@ -389,8 +385,8 @@ static irqreturn_t apple_piodma_diag_irq(int irq, void *data)
 	count = atomic_inc_return(&diag->irq_count);
 	WRITE_ONCE(diag->last_irq_status, status);
 	WRITE_ONCE(diag->last_irq_tag, tag);
-	dev_info(diag->dev, "irq=%d fabric=%#x status=%#x tag=%#x active=%#x\n",
-		 count, fabric, status, tag, active);
+	dev_dbg(diag->dev, "irq=%d fabric=%#x status=%#x tag=%#x active=%#x\n",
+		count, fabric, status, tag, active);
 	if (count >= PIODMA_IRQ_LIMIT || status & ~PIODMA_IRQ_COMPLETE ||
 	    (status && (!tag || tag > active))) {
 		WRITE_ONCE(diag->irq_fault, true);
@@ -526,11 +522,11 @@ static int apple_piodma_diag_submit(struct apple_piodma_diag *diag, unsigned int
 		return ret ?: -EIO;
 	slot->submitted = true;
 	WRITE_ONCE(diag->active_tag, tag);
-	dev_info(diag->dev,
-		 "request=%u function=%u offset=%#x source=%#llx packet=%08x:%08x:%08x:%08x tag=%u\n",
-		 index, request->function, request->offset, source,
-		 le32_to_cpu(packet[0]), le32_to_cpu(packet[1]),
-		 le32_to_cpu(packet[2]), le32_to_cpu(packet[3]), tag);
+	dev_dbg(diag->dev,
+		"request=%u function=%u offset=%#x source=%#llx packet=%08x:%08x:%08x:%08x tag=%u\n",
+		index, request->function, request->offset, source,
+		le32_to_cpu(packet[0]), le32_to_cpu(packet[1]),
+		le32_to_cpu(packet[2]), le32_to_cpu(packet[3]), tag);
 	writel(tag, diag->engine + 0xd8);
 	writel(upper_32_bits(descriptor) & 0x3ff, diag->engine + 0x50);
 	writel(lower_32_bits(descriptor), diag->engine + 0x4c);
@@ -543,11 +539,11 @@ static int apple_piodma_diag_submit(struct apple_piodma_diag *diag, unsigned int
 	for (i = 0; i < ARRAY_SIZE(slot->completion); i++)
 		slot->completion[i] = READ_ONCE(completion[i]);
 	slot->observed = true;
-	dev_info(diag->dev,
-		 "response=%u waited=%lu matched_status=%#x word=%#x completion=%08x:%08x:%08x:%08x\n",
-		 index, waited, READ_ONCE(slot->matched_status), slot->result,
-		 le32_to_cpu(slot->completion[0]), le32_to_cpu(slot->completion[1]),
-		 le32_to_cpu(slot->completion[2]), le32_to_cpu(slot->completion[3]));
+	dev_dbg(diag->dev,
+		"response=%u waited=%lu matched_status=%#x word=%#x completion=%08x:%08x:%08x:%08x\n",
+		index, waited, READ_ONCE(slot->matched_status), slot->result,
+		le32_to_cpu(slot->completion[0]), le32_to_cpu(slot->completion[1]),
+		le32_to_cpu(slot->completion[2]), le32_to_cpu(slot->completion[3]));
 	if (!waited)
 		return -ETIMEDOUT;
 	if (READ_ONCE(diag->irq_fault) || !READ_ONCE(slot->matched_status) ||
@@ -569,15 +565,15 @@ static int apple_piodma_diag_submit(struct apple_piodma_diag *diag, unsigned int
 		if (ret || READ_ONCE(diag->irq_fault))
 			return ret ?: -EIO;
 	}
-	dev_info(diag->dev,
-		 "READ_VALIDATED request=%u word=%#x FIFO=%#x command=%#x; retained slots stable\n",
-		 index, slot->result, fifo, command);
+	dev_dbg(diag->dev,
+		"READ_VALIDATED request=%u word=%#x FIFO=%#x command=%#x; retained slots stable\n",
+		index, slot->result, fifo, command);
 	return 0;
 }
 
 bool apple_piodma_bootstrap_enabled(void)
 {
-	return enumerate && of_machine_is_compatible("apple,j700") &&
+	return of_machine_is_compatible("apple,j700") &&
 		of_machine_is_compatible("apple,t8140");
 }
 EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_enabled);
@@ -844,7 +840,7 @@ static int apple_piodma_diag_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, diag);
 	/* Publish the CPU-owned arena and permanent device reference together. */
 	smp_store_release(&active_diag, diag);
-	dev_info(dev, "bootstrap supplier ready; no command submitted during probe\n");
+	dev_dbg(dev, "bootstrap supplier ready; no command submitted during probe\n");
 	return 0;
 
 err_arena:

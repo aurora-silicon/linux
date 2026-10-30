@@ -65,8 +65,7 @@ config PCIE_APPLE_PIODMA_DIAG
 	  Build the experimental SID17 retained bootstrap provider. It submits
 	  one fixed request, validates typed ECAM and then enumerates the two
 	  Neo radio functions when the board device tree links the PCIe host
-	  to this engine. The enumerate=0 parameter keeps the host on its
-	  root-port-only path instead.
+	  to this engine. A host without that link stays root-port-only.
 	  The host and supplier must both be built in: supplier removal cannot
 	  release a published DMA arena safely. Suspend-to-idle sleep retains that
 	  arena and restores the configuration without repeating a request.
