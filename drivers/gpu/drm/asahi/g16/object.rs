@@ -175,7 +175,7 @@ impl FwObject {
         let p = self.ptr(offset, 4)?;
         if p as usize % 4 == 0 {
             // SAFETY: `p` is valid and aligned for a u32.
-            unsafe { (p as *mut u32).write_volatile(value.to_le()) };
+            unsafe { p.cast::<u32>().write_volatile(value.to_le()) };
             Ok(())
         } else {
             self.write(offset, &value.to_le_bytes())
@@ -187,7 +187,7 @@ impl FwObject {
         let p = self.ptr(offset, 8)?;
         if p as usize % 8 == 0 {
             // SAFETY: `p` is valid and aligned for a u64.
-            unsafe { (p as *mut u64).write_volatile(value.to_le()) };
+            unsafe { p.cast::<u64>().write_volatile(value.to_le()) };
             Ok(())
         } else {
             self.write(offset, &value.to_le_bytes())
@@ -624,8 +624,8 @@ impl Objects {
         let bound = unsafe { self.dev.as_ref().as_ref().as_bound() };
         let sgt = gem::held_sg_table(&backing.gem, bound)?;
         for range in sgt.iter() {
-            let pa = range.dma_address() as u64;
-            let len = range.dma_len() as u64;
+            let pa = range.dma_address();
+            let len = range.dma_len();
             // EPERM for a page the UAT cannot name.
             if pa == 0
                 || (pa | len) & (hw::PAGE - 1) != 0

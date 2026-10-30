@@ -294,7 +294,7 @@ impl Window {
                 let address = va | ((index as u64) << shift);
                 let off = address.checked_sub(hw::UPPER).ok_or(EINVAL)?;
                 let expected = if off < 0x60000 {
-                    self.text_pa + off
+                    (self.text_pa + off)
                         | if (0x50000..0x58000).contains(&off) {
                             0x483
                         } else {
@@ -302,7 +302,7 @@ impl Window {
                         }
                 } else if off < 0x19c000 {
                     let data_offset = off - 0x60000;
-                    self.data_pa + data_offset
+                    (self.data_pa + data_offset)
                         | if data_offset < 0xc000 {
                             0x00200000000004c3
                         } else {
@@ -407,9 +407,9 @@ impl Window {
                 continue;
             }
             let expected = if index == 0 {
-                self.root.phys() + hw::PAGE | 0x403
+                (self.root.phys() + hw::PAGE) | 0x403
             } else {
-                self.root.phys() + 0x10000 | 0x00200000000004cb
+                (self.root.phys() + 0x10000) | 0x00200000000004cb
             };
             if self.firmware_root[index] != 0 || observed != expected {
                 return Err(EIO);
@@ -460,7 +460,7 @@ impl Window {
         let handoff = uat.lock_m4_handoff()?;
         let result = self
             .verify_root()
-            .and_then(|_| self.sync_inner(shadow_l2, Some(range.clone())));
+            .and_then(|()| self.sync_inner(shadow_l2, Some(range.clone())));
         drop(handoff);
         result?;
         // This includes global final-level entries. Never replace this with ASID-only TLBI:

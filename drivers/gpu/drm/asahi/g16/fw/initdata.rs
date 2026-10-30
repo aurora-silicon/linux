@@ -272,7 +272,11 @@ pub(crate) fn loader_span(slot: usize, bank: usize) -> Result<(u64, u32, u32), (
         return Err(());
     }
     let offset = e.pa & (PAGE - 1);
-    let bytes = if slot == 3 { 0x18000 } else { e.length as u64 };
+    let bytes = if slot == 3 {
+        0x18000
+    } else {
+        u64::from(e.length)
+    };
     let size = (offset + bytes + PAGE - 1) & !(PAGE - 1);
     Ok((
         (e.pa & PA_MASK) + if bank != 0 { 0x2000000 } else { 0 },
@@ -305,9 +309,8 @@ pub(crate) fn loader_encode(slot: usize, va: u64, record: &mut [u8]) -> Result<(
         return Ok(());
     }
     let offset = e.pa & (PAGE - 1);
-    let span = (offset + e.length as u64 + PAGE - 1) & !(PAGE - 1);
-    if va < HOST_START
-        || va >= HOST_END
+    let span = (offset + u64::from(e.length) + PAGE - 1) & !(PAGE - 1);
+    if !(HOST_START..HOST_END).contains(&va)
         || va & (PAGE - 1) != offset
         || span > HOST_END - (va - offset)
     {
@@ -318,7 +321,7 @@ pub(crate) fn loader_encode(slot: usize, va: u64, record: &mut [u8]) -> Result<(
     put32(out, 0x10, e.length)?;
     put32(out, 0x14, e.requested)?;
     put64(out, 0x18, e.tag)?;
-    put64(out, 0x20, e.mode as u64)
+    put64(out, 0x20, u64::from(e.mode))
 }
 
 pub(crate) const PERF_STATES: usize = 10;
@@ -371,10 +374,11 @@ pub(crate) struct Input {
 }
 
 pub(crate) fn object_va(va: u64, size: usize) -> bool {
-    va >= HOST_START && va < HOST_END && va & 7 == 0 && size != 0 && size as u64 <= HOST_END - va
+    (HOST_START..HOST_END).contains(&va) && va & 7 == 0 && size != 0 && size as u64 <= HOST_END - va
 }
 fn bootstrap_alias(va: u64) -> bool {
-    va >= BOOTSTRAP_START && va <= BOOTSTRAP_START + BOOTSTRAP_SIZE - 0x8000 && va & (PAGE - 1) == 0
+    (BOOTSTRAP_START..=BOOTSTRAP_START + BOOTSTRAP_SIZE - 0x8000).contains(&va)
+        && va & (PAGE - 1) == 0
 }
 
 pub(crate) fn encode_root(out: &mut [u8], va: &[u64; OBJECT_COUNT]) -> Result<(), ()> {
@@ -410,7 +414,7 @@ pub(crate) fn encode_root(out: &mut [u8], va: &[u64; OBJECT_COUNT]) -> Result<()
         out[at..at + 8].copy_from_slice(&[8, 14, 14, *shift, c[0], c[1], 0, 0x40]);
         put64(out, at + 8, 1)?;
         put64(out, at + 0x10, PA_MASK)?;
-        put64(out, at + 0x18, (*count as u64 - 1) << shift)?;
+        put64(out, at + 0x18, (u64::from(*count) - 1) << shift)?;
     }
     Ok(())
 }

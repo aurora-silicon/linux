@@ -1096,7 +1096,7 @@ impl Firmware {
                     kind: channel as u32,
                     head: head as u16,
                     event,
-                    new_queue: fresh as u8,
+                    new_queue: u8::from(fresh),
                 };
                 self.channels.post(channel, &record)?;
                 self.session.ring(channel)?;

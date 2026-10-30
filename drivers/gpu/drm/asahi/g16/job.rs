@@ -121,6 +121,10 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The job owns independently prepared command, mapping and fence resources."
+    )]
     pub(crate) fn new(
         id: u64,
         queue: Arc<QueueState>,

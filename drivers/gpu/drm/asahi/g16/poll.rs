@@ -172,7 +172,7 @@ impl Shared {
             // Dropping the previous handle cancels a still pending expiry before the timer
             // is started again.
             drop(handle.take());
-            *handle = Some(self.clone().start(Delta::from_micros(us as i64)));
+            *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
         }
         self.mod_poll(1);
     }
@@ -572,8 +572,8 @@ impl Firmware {
         let s = &mut self.engine.stats;
         if result.is_ok() {
             s.jobs += 1;
-            s.job_cmds += p.count() as u64;
-            s.job_max = s.job_max.max(p.count() as u64);
+            s.job_cmds += u64::from(p.count());
+            s.job_max = s.job_max.max(u64::from(p.count()));
         }
         complete(done, &job, Ok(()));
         // The rest of a compute horizon, after the first job (fence order).
@@ -584,8 +584,8 @@ impl Firmware {
                 Err(error) => complete(done, j2, Err(error)),
                 Ok(()) => {
                     s.jobs += 1;
-                    s.job_cmds += p2.count() as u64;
-                    s.job_max = s.job_max.max(p2.count() as u64);
+                    s.job_cmds += u64::from(p2.count());
+                    s.job_max = s.job_max.max(u64::from(p2.count()));
                 }
             }
             complete(done, j2, Ok(()));
@@ -761,8 +761,8 @@ impl Firmware {
             s.first_ns[kind] += first - f.published_ns;
             s.last_ns[kind] += last - f.published_ns;
         }
-        s.count[0] += f.computes as u64;
-        s.count[1] += f.renders as u64;
+        s.count[0] += u64::from(f.computes);
+        s.count[1] += u64::from(f.renders);
         if kind == 2 {
             s.count[2] += f.count as u64;
         }

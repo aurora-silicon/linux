@@ -4,6 +4,7 @@
 from pathlib import Path
 import importlib.util
 import os
+import re
 import subprocess
 import tempfile
 ROOT=Path(__file__).resolve().parents[2]/'drivers/gpu/drm/asahi/g17'
@@ -93,9 +94,11 @@ def main():
     assert compute.count('visible = true;\n                self.unpublished_binding = false;')==2
     backend=(ROOT/'runtime/backend.rs').read_text()
     assert 'if !lease.is_current() { drop(state); drop(lease); continue; }' in backend
+    no_kill, count = re.subn(r'\|\|\s*self\.exit\.is_some\(\)\s*(?=\|\|\s*self\.active\.len\s*!=\s*0)', '', source)
+    assert count == 1, count
     cases=[('fixed',source),('omit-first-failure-rollback',source.replace('self.rollback_unpublished_compute().is_err()','false')),
            ('rollback-published-binding',source.replace('|| !self.unpublished_binding','')),
-           ('rollback-issued-kill',source.replace('|| self.exit.is_some() || self.active.len != 0','|| self.active.len != 0'))]
+           ('rollback-issued-kill',no_kill)]
     with tempfile.TemporaryDirectory(prefix='g17-unpublished-') as tmp:
         for name,code in cases:
             path=Path(tmp)/(name+'.rs');path.write_text(code);binary=path.with_suffix('')
