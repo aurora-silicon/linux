@@ -127,15 +127,12 @@ static int ave_suspend(struct device *dev)
 	v4l2_m2m_suspend(ave->m2m_dev);
 
 	/*
-	 * An open session cannot survive the power going down: it is ended
-	 * here (its next job fails) and the firmware halted, so the next
-	 * session restarts it from the saved DATA copy.
+	 * The firmware does not survive the power going down. Drain and close
+	 * every open session and halt the firmware, as at the end of a stream;
+	 * each session reopens in a cold-started firmware on its next frame.
 	 */
 	mutex_lock(&ave->hw_lock);
-	if (ave->active) {
-		ave->active->sess->dead = true;
-		ave->active = NULL;
-	}
+	ave_v4l2_suspend(ave);
 	if (ave_fw_shutdown(ave))
 		dev_warn(dev, "firmware not answering, it cannot be stopped for sleep\n");
 	mutex_unlock(&ave->hw_lock);
@@ -175,11 +172,11 @@ static struct platform_driver ave_driver = {
 };
 module_platform_driver(ave_driver);
 
-/* Constant parts of Start and Process for AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
-MODULE_FIRMWARE("apple/ave-t8140-69c54454-h264-start.bin");
-MODULE_FIRMWARE("apple/ave-t8140-69c54454-h264-process.bin");
-MODULE_FIRMWARE("apple/ave-t8140-69c54454-hevc-start.bin");
-MODULE_FIRMWARE("apple/ave-t8140-69c54454-hevc-process.bin");
+/* Session images, extracted from the user's macOS installation */
+MODULE_FIRMWARE("apple/ave-j700-h264-start.bin");
+MODULE_FIRMWARE("apple/ave-j700-h264-process.bin");
+MODULE_FIRMWARE("apple/ave-j700-hevc-start.bin");
+MODULE_FIRMWARE("apple/ave-j700-hevc-process.bin");
 
 MODULE_DESCRIPTION("Apple AVE video encoder");
 MODULE_LICENSE("GPL");

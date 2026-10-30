@@ -23,8 +23,10 @@ struct dev_pm_domain_list;
 struct firmware;
 struct iommu_domain;
 
-/* Frames the firmware can hold at once (Process "slots"). */
+/* Frames the firmware can hold at once per session (Process "slots"). */
 #define AVE_MAX_SLOTS		5
+/* Sessions one firmware boot serves at once (macOS was seen running two). */
+#define AVE_MAX_SESSIONS	2
 
 /*
  * Coprocessor memory every firmware boot uses, all inside one allocation.
@@ -44,13 +46,14 @@ struct iommu_domain;
 #define AVE_IPC_SCALAR_BUFS	16
 #define AVE_IPC_PROC_OFF	0x60000
 #define AVE_IPC_PROC_BYTES	0x10000
-#define AVE_IPC_END		(AVE_IPC_PROC_OFF + AVE_MAX_SLOTS * AVE_IPC_PROC_BYTES)
+#define AVE_IPC_PROC_BUFS	(AVE_MAX_SESSIONS * AVE_MAX_SLOTS)
+#define AVE_IPC_END		(AVE_IPC_PROC_OFF + AVE_IPC_PROC_BUFS * AVE_IPC_PROC_BYTES)
 
 /* Command buffer ids, one bit each in ave_dev.unacked. */
 #define AVE_BUF_CMD		0
 #define AVE_BUF_SCALAR(i)	(1 + (i))
 #define AVE_BUF_PROC(s)		(1 + AVE_IPC_SCALAR_BUFS + (s))
-#define AVE_BUF_COUNT		AVE_BUF_PROC(AVE_MAX_SLOTS)
+#define AVE_BUF_COUNT		AVE_BUF_PROC(AVE_IPC_PROC_BUFS)
 
 #define AVE_MSG_MAX		SZ_4K
 
@@ -110,6 +113,7 @@ struct ave_dev {
 	struct ave_fw_segment text;
 	struct ave_fw_segment data;
 	u32 text_crc;
+	char board[16];			/* from the root compatible, e.g. "j700" */
 	void *data_pristine;
 	bool data_dirty;
 
@@ -127,19 +131,19 @@ struct ave_dev {
 	u64 ipc_fw_base;
 	u32 channel_bytes;
 	struct ave_ring ring[2];
-	u64 next_token;
 	u32 next_client;
 	u32 unacked;
 	u8 want[16];
 	int reply_err;
 	unsigned int scalar_next;
-	struct ave_ctx *active;
+	struct ave_ctx *sessions[AVE_MAX_SESSIONS];
 	u8 msg[AVE_MSG_MAX];
 	u32 msg_len;
 
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
 	struct v4l2_m2m_dev *m2m_dev;
+	/* The video device's ioctl and queue lock. */
 	struct mutex vdev_lock;
 	struct workqueue_struct *wq;
 };
@@ -174,6 +178,7 @@ struct ave_slot {
 	struct ave_buf coded;
 	struct ave_buf meta;
 	struct ave_buf aux;		/* H.264 per-frame buffer, HEVC slice headers */
+	struct ave_buf bounce;		/* input copied to the encoder's stride */
 	struct vb2_v4l2_buffer *src;
 	u32 status;
 	bool busy;			/* Process sent, reply pending */
@@ -202,8 +207,11 @@ struct ave_session {
 	unsigned int busy;
 	u32 frames;			/* Process commands sent */
 	u32 client;
+	u64 token;			/* command order token, per session */
+	unsigned int index;		/* in ave_dev.sessions[] */
 	bool fw_open;			/* Open sent, Close not yet */
-	bool dead;			/* firmware gone; buffers only */
+	bool resume;			/* closed for system sleep, reopen on next frame */
+	bool copy_noted;
 	bool warned;
 	bool checked[2];		/* Start/Process images checked for stale addresses */
 	bool handed;			/* Start sent: the firmware knows the buffers */
@@ -281,7 +289,7 @@ int ave_cmd_halt(struct ave_dev *ave);
 int ave_cmd_open(struct ave_ctx *ctx);
 int ave_cmd_start(struct ave_ctx *ctx);
 int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
-		    u32 bitrate, bool force_key);
+		    dma_addr_t input, u32 bitrate, bool force_key);
 int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count);
 int ave_cmd_close(struct ave_ctx *ctx);
 
@@ -289,7 +297,9 @@ int ave_cmd_close(struct ave_ctx *ctx);
 struct ave_session *ave_sess_create(struct ave_ctx *ctx);
 void ave_sess_destroy(struct ave_ctx *ctx);
 int ave_sess_free_slot(struct ave_session *sess);
-void ave_sess_reply(struct ave_ctx *ctx, const u8 *msg, u32 len);
+void ave_sess_reply(struct ave_dev *ave, const u8 *msg, u32 len);
+int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
+		   dma_addr_t *input);
 int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *dst,
 		    bool *keyframe);
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);
@@ -299,6 +309,7 @@ bool ave_sess_stalled(struct ave_session *sess);
 bool ave_sess_starved(struct ave_session *sess);
 
 /* ave-v4l2.c */
+void ave_v4l2_suspend(struct ave_dev *ave);
 int ave_v4l2_register(struct ave_dev *ave);
 void ave_v4l2_unregister(struct ave_dev *ave);
 enum ave_codec ave_ctx_codec(struct ave_ctx *ctx);

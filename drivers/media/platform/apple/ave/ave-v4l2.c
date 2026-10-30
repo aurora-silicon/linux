@@ -594,14 +594,35 @@ static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
 
 /* Sessions */
 
-/* Caller holds hw_lock. */
+static int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx)
+{
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i] == ctx)
+			return i;
+	return -1;
+}
+
+static unsigned int ave_session_count(struct ave_dev *ave)
+{
+	unsigned int n = 0;
+
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		n += !!ave->sessions[i];
+	return n;
+}
+
+/*
+ * Drain (with @flush), stop and close the session in the firmware. The
+ * last session to go halts the firmware. Caller holds hw_lock.
+ */
 static void ave_session_close(struct ave_ctx *ctx, bool flush)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
+	int idx = ave_session_index(ave, ctx);
 
 	lockdep_assert_held(&ave->hw_lock);
-	if (!sess || ave->active != ctx)
+	if (!sess || idx < 0)
 		return;
 	if (sess->fw_open && ave->fw_state == AVE_FW_RUNNING) {
 		/* Complete is a barrier: answered after every frame before it. */
@@ -611,8 +632,81 @@ static void ave_session_close(struct ave_ctx *ctx, bool flush)
 			ave_cmd_close(ctx);
 	}
 	sess->fw_open = false;
-	ave->active = NULL;
-	ave_fw_halt(ave);
+	ave->sessions[idx] = NULL;
+	if (!ave_session_count(ave))
+		ave_fw_halt(ave);
+}
+
+/*
+ * Open and Start the session in the firmware, booting the firmware first
+ * if no other session runs. Returns -EAGAIN when a halted coprocessor has
+ * not lost power yet. Caller holds hw_lock.
+ */
+static int ave_session_attach(struct ave_ctx *ctx)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+	int idx = -1, ret;
+
+	lockdep_assert_held(&ave->hw_lock);
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS && idx < 0; i++)
+		if (!ave->sessions[i])
+			idx = i;
+	if (idx < 0) {
+		dev_err(ave->dev, "already encoding %u streams\n", AVE_MAX_SESSIONS);
+		return -EBUSY;
+	}
+	if (!ave_session_count(ave)) {
+		ret = ave_fw_ensure_running(ave);
+		if (ret)
+			return ret;
+	} else if (ave->fw_state != AVE_FW_RUNNING) {
+		dev_err(ave->dev, "firmware state %d, cannot add a session\n", ave->fw_state);
+		return -EIO;
+	}
+
+	sess->index = idx;
+	sess->frames = 0;
+	sess->nudged = false;
+	ave->sessions[idx] = ctx;
+	ret = ave_cmd_open(ctx);
+	if (!ret)
+		ret = ave_cmd_start(ctx);
+	if (ret)
+		ave_session_close(ctx, false);
+	return ret;
+}
+
+/*
+ * Attach with the device runtime active and one PM reference held by the
+ * caller. A halted coprocessor restarts only from reset, and its power can
+ * take a moment to go (the DARTs suspend a little later), so drop the
+ * reference and cycle the power a few times before giving up. On return
+ * the reference is still held, unless *pm_lost says otherwise.
+ */
+static int ave_session_attach_cycled(struct ave_ctx *ctx, bool *pm_lost)
+{
+	struct ave_dev *ave = ctx->ave;
+	int ret = -EAGAIN;
+
+	*pm_lost = false;
+	for (unsigned int i = 0; i < AVE_RESTART_TRIES && ret == -EAGAIN; i++) {
+		if (i) {
+			pm_runtime_put_sync_suspend(ave->dev);
+			msleep(AVE_RESTART_WAIT_MS);
+			ret = pm_runtime_resume_and_get(ave->dev);
+			if (ret) {
+				*pm_lost = true;
+				return ret;
+			}
+		}
+		mutex_lock(&ave->hw_lock);
+		ret = ave_session_attach(ctx);
+		mutex_unlock(&ave->hw_lock);
+	}
+	if (ret == -EAGAIN)
+		dev_err(ave->dev, "coprocessor did not power down; cannot restart it\n");
+	return ret;
 }
 
 /* Return frames the firmware never answered; then drop the session. */
@@ -641,21 +735,24 @@ static int ave_session_begin(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess;
+	bool pm_lost;
 	int ret;
 
 	if (ctx->sess)
 		return 0;
-	/* A halted firmware restarts only from reset: let the power go first. */
-	if (READ_ONCE(ave->fw_state) == AVE_FW_HALTED)
-		pm_runtime_suspend(ave->dev);
 	ret = ave_fw_templates(ave, ave_ctx_codec(ctx));
 	if (ret)
 		return ret;
-	if (READ_ONCE(ave->active))
+	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
 		return -EBUSY;
+	/* A halted firmware restarts only from reset: let the power go first. */
+	if (READ_ONCE(ave->fw_state) == AVE_FW_HALTED)
+		pm_runtime_suspend(ave->dev);
 	sess = ave_sess_create(ctx);
-	if (IS_ERR(sess))
+	if (IS_ERR(sess)) {
+		dev_err(ave->dev, "cannot set up a session: %ld\n", PTR_ERR(sess));
 		return PTR_ERR(sess);
+	}
 
 	ctx->sess = sess;
 	ret = pm_runtime_resume_and_get(ave->dev);
@@ -663,48 +760,57 @@ static int ave_session_begin(struct ave_ctx *ctx)
 		ave_sess_destroy(ctx);
 		return ret;
 	}
-
-	mutex_lock(&ave->hw_lock);
-	if (ave->active) {
-		ret = -EBUSY;
-		goto out;
-	}
-	/*
-	 * A halted coprocessor restarts only from reset. Its power can take
-	 * a moment to go after a suspend (the DARTs follow later), so cycle
-	 * it again a few times before giving up.
-	 */
-	for (unsigned int i = 0; i < AVE_RESTART_TRIES; i++) {
-		ret = ave_fw_ensure_running(ave);
-		if (ret != -EAGAIN)
-			break;
-		mutex_unlock(&ave->hw_lock);
-		pm_runtime_put_sync_suspend(ave->dev);
-		msleep(AVE_RESTART_WAIT_MS);
-		ret = pm_runtime_resume_and_get(ave->dev);
-		mutex_lock(&ave->hw_lock);
-		if (ret) {
-			mutex_unlock(&ave->hw_lock);
-			ave_sess_destroy(ctx);
-			return ret;
-		}
-		ret = -EAGAIN;
-	}
-	if (ret)
-		goto out;
-	ave->active = ctx;
-	ret = ave_cmd_open(ctx);
-	if (!ret)
-		ret = ave_cmd_start(ctx);
-	if (ret)
-		ave_session_close(ctx, false);
-out:
-	mutex_unlock(&ave->hw_lock);
+	ret = ave_session_attach_cycled(ctx, &pm_lost);
 	if (ret) {
 		dev_err(ave->dev, "cannot start an encoding session: %d\n", ret);
-		ave_session_free(ctx);
+		if (pm_lost)
+			ave_sess_destroy(ctx);
+		else
+			ave_session_free(ctx);
 	}
 	return ret;
+}
+
+/*
+ * After system sleep: the session was closed when the firmware went down.
+ * Open and Start it again with the same parameters; its next frame is an
+ * IDR with fresh parameter sets, so the stream stays decodable.
+ */
+static int ave_session_reopen(struct ave_ctx *ctx)
+{
+	bool pm_lost;
+	int ret;
+
+	ret = ave_session_attach_cycled(ctx, &pm_lost);
+	if (ret) {
+		if (pm_lost) {
+			/* The session's PM reference is gone; do not drop it again. */
+			pm_runtime_get_noresume(ctx->ave->dev);
+		}
+		return ret;
+	}
+	ctx->sess->resume = false;
+	dev_dbg(ctx->ave->dev, "session reopened after system sleep\n");
+	return 0;
+}
+
+/*
+ * System sleep: drain every open session, close it and halt the firmware,
+ * as at the end of a stream. Sessions reopen on their next frame.
+ * Caller holds hw_lock.
+ */
+void ave_v4l2_suspend(struct ave_dev *ave)
+{
+	lockdep_assert_held(&ave->hw_lock);
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++) {
+		struct ave_ctx *ctx = ave->sessions[i];
+
+		if (!ctx)
+			continue;
+		cancel_delayed_work(&ctx->poll_work);
+		ave_session_close(ctx, true);
+		ctx->sess->resume = true;
+	}
 }
 
 static void ave_session_end(struct ave_ctx *ctx)
@@ -878,30 +984,6 @@ static bool ave_frame_answered(struct ave_dev *ave, void *arg)
 	return !s->busy;
 }
 
-/*
- * The encoder reads NV12 with the 64-byte aligned stride S_FMT reported.
- * ffmpeg's v4l2m2m encoder copies frames with its own line size instead,
- * which differs when the width is not a multiple of 64; the result is a
- * sheared picture. Spot that from the payload size and refuse it.
- */
-static int ave_check_src_layout(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src)
-{
-	const struct ave_params *p = &ctx->sess->p;
-	u32 used = vb2_get_plane_payload(&src->vb2_buf, 0);
-	u32 rows = p->height + DIV_ROUND_UP(p->height, 2);
-	u32 stride;
-
-	if (!used || used % rows)
-		return 0;
-	stride = used / rows;
-	if (stride >= p->stride || stride < p->width)
-		return 0;
-	dev_err(ctx->ave->dev,
-		"OUTPUT frame laid out with a %u byte stride, not the %u reported by S_FMT\n",
-		stride, p->stride);
-	return -EINVAL;
-}
-
 /* Send the next OUTPUT frame. Caller holds hw_lock. */
 static int ave_encode_one(struct ave_ctx *ctx)
 {
@@ -909,6 +991,7 @@ static int ave_encode_one(struct ave_ctx *ctx)
 	struct ave_session *sess = ctx->sess;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	struct vb2_v4l2_buffer *src;
+	dma_addr_t input;
 	bool last;
 	int slot, ret;
 
@@ -930,14 +1013,10 @@ static int ave_encode_one(struct ave_ctx *ctx)
 	last = src == ctx->drain_src;
 	src->sequence = ctx->src_sequence++;
 
-	ret = ave_check_src_layout(ctx, src);
-	if (ret) {
-		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
-		return ret;
-	}
-
-	ret = ave_cmd_process(ctx, slot, src, READ_ONCE(ctx->bitrate),
-			      xchg(&ctx->force_key_frame, false));
+	ret = ave_sess_input(ctx, slot, src, &input);
+	if (!ret)
+		ret = ave_cmd_process(ctx, slot, src, input, READ_ONCE(ctx->bitrate),
+				      xchg(&ctx->force_key_frame, false));
 	if (ret) {
 		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
 		return ret;
@@ -1031,19 +1110,23 @@ static void ave_run_work(struct work_struct *work)
 	bool eos = false, poll = false;
 	int ret = 0;
 
-	/* After a drain, the next frame starts a new session. */
-	if (!ctx->sess && !READ_ONCE(ctx->flush_pending) && v4l2_m2m_num_src_bufs_ready(m2m))
-		ret = ave_session_begin(ctx);
+	/*
+	 * After a drain the next frame starts a new session; after system
+	 * sleep it reopens the old one in the restarted firmware.
+	 */
+	if (!READ_ONCE(ctx->flush_pending) && v4l2_m2m_num_src_bufs_ready(m2m)) {
+		if (!ctx->sess)
+			ret = ave_session_begin(ctx);
+		else if (ctx->sess->resume)
+			ret = ave_session_reopen(ctx);
+	}
 
 	mutex_lock(&ave->hw_lock);
 	/*
-	 * A closed session (after a drain) may still hold frames for CAPTURE
-	 * buffers; only an open one must still own the firmware.
+	 * A closed session (after a drain or for sleep) may still hold frames
+	 * for CAPTURE buffers; only an open one must still own the firmware.
 	 */
-	if (!ret && ctx->sess && ctx->sess->dead) {
-		dev_err(ave->dev, "session ended by system sleep\n");
-		ret = -EIO;
-	} else if (!ret && ctx->sess && ctx->sess->fw_open && ave->active != ctx) {
+	if (!ret && ctx->sess && ctx->sess->fw_open && ave_session_index(ave, ctx) < 0) {
 		dev_err(ave->dev, "session lost the firmware\n");
 		ret = -EIO;
 	}
@@ -1090,7 +1173,7 @@ static void ave_poll_work(struct work_struct *work)
 	bool again = false, fail = false;
 
 	mutex_lock(&ave->hw_lock);
-	if (ctx->sess && ave->active == ctx && !ctx->sess->dead) {
+	if (ctx->sess && ave_session_index(ave, ctx) >= 0) {
 		fail = ave_ipc_pump(ave, 0, NULL, NULL) != 0;
 		if (!fail && ave_sess_starved(ctx->sess) &&
 		    !v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx)) {
@@ -1147,7 +1230,7 @@ static int ave_open(struct file *file)
 	struct ave_ctx *ctx;
 	int ret;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kzalloc_obj(*ctx);
 	if (!ctx)
 		return -ENOMEM;
 	ctx->ave = ave;

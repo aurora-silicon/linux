@@ -107,6 +107,21 @@ static u32 ave_fw_crc(const struct ave_fw_segment *seg, void **copy)
 }
 
 /*
+ * The session images are per machine: "j700" from "apple,j700", the first
+ * root compatible.
+ */
+static void ave_fw_board_name(struct ave_dev *ave)
+{
+	const char *compat = NULL, *comma;
+
+	of_property_read_string_index(of_root, "compatible", 0, &compat);
+	if (!compat)
+		compat = "unknown";
+	comma = strchr(compat, ',');
+	strscpy(ave->board, comma ? comma + 1 : compat, sizeof(ave->board));
+}
+
+/*
  * Find the firmware, check that it is a build we speak to and that DATA is
  * still as the bootloader left it, and keep a copy of DATA for restarts.
  */
@@ -137,6 +152,7 @@ int ave_fw_probe(struct ave_dev *ave)
 				     text_crc);
 	ave->text_crc = text_crc;
 	mutex_init(&ave->tmpl_lock);
+	ave_fw_board_name(ave);
 
 	ave->data_pristine = vmalloc(ave->data.size);
 	if (!ave->data_pristine)
@@ -169,6 +185,7 @@ static void ave_fw_restore_data(struct ave_dev *ave)
 	if (WARN_ON(!va))
 		return;
 	memcpy(va, ave->data_pristine, ave->data.size);
+	/* The restored image must be in memory before the coprocessor starts. */
 	wmb();
 	memunmap(va);
 	ave->data_dirty = false;
@@ -209,9 +226,10 @@ int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long
 }
 
 /*
- * Start and Process are mostly constant for a firmware build. Those
- * constant words come from per-build image files named after the TEXT
- * checksum; the driver fills in every session and frame field itself.
+ * Start and Process are mostly constant for a machine and its firmware.
+ * Those constant words come from image files named after the machine,
+ * which the user extracts from their own macOS installation; the driver
+ * fills in every session and frame field itself.
  */
 static const char * const ave_codec_name[] = { "h264", "hevc" };
 static const char * const ave_tmpl_name[AVE_TMPL_COUNT] = { "start", "process" };
@@ -234,18 +252,24 @@ int ave_fw_templates(struct ave_dev *ave, enum ave_codec codec)
 
 		if (ave->tmpl[c][t])
 			continue;
-		snprintf(name, sizeof(name), "apple/ave-t8140-%08x-%s-%s.bin", ave->text_crc,
+		snprintf(name, sizeof(name), "apple/ave-%s-%s-%s.bin", ave->board,
 			 ave_codec_name[c], ave_tmpl_name[t]);
 		ret = request_firmware(&fw, name, ave->dev);
 		if (ret) {
-			dev_err(ave->dev, "cannot load %s: %d\n", name, ret);
+			dev_err(ave->dev, "cannot load %s (%d); extract it from macOS first\n",
+				name, ret);
 			break;
 		}
-		if (fw->size != ave_tmpl_size[c][t] ||
-		    (t == AVE_TMPL_START &&
-		     get_unaligned_le32(fw->data + AVE_TMPL_CODEC) != codec)) {
-			dev_err(ave->dev, "%s does not fit this driver (%zu bytes)\n", name,
-				fw->size);
+		if (fw->size != ave_tmpl_size[c][t]) {
+			dev_err(ave->dev, "%s is %zu bytes, expected %zu\n", name, fw->size,
+				ave_tmpl_size[c][t]);
+			release_firmware(fw);
+			ret = -EINVAL;
+			break;
+		}
+		if (t == AVE_TMPL_START && get_unaligned_le32(fw->data + AVE_TMPL_CODEC) != codec) {
+			dev_err(ave->dev, "%s is not a %s session image\n", name,
+				ave_codec_name[c]);
 			release_firmware(fw);
 			ret = -EINVAL;
 			break;
@@ -355,7 +379,6 @@ static int ave_fw_boot(struct ave_dev *ave)
 	memset(ave->want, 0, sizeof(ave->want));
 	ave->reply_err = 0;
 	ave->scalar_next = 0;
-	ave->next_token = AVE_TOKEN_BASE;
 
 	ave_fw_restore_data(ave);
 

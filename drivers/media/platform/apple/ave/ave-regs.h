@@ -126,6 +126,7 @@ enum ave_opcode {
 #define AVE_SESSION_ARG0		0xc8
 #define AVE_SESSION_ARG1		0x36
 #define AVE_SESSION_ARG2_SETUP		0x1e0	/* Open and Start */
+#define AVE_SESSION_ARG2_SETUP_SHARED	0x140	/* the same, another session open */
 #define AVE_SESSION_ARG2_H264		0x40	/* every other session command */
 #define AVE_SESSION_ARG2_HEVC		0x20
 #define AVE_TOKEN_STEP			100

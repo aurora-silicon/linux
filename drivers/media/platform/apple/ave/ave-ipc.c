@@ -39,6 +39,7 @@ static void ave_mbox_send(struct ave_dev *ave, u32 a, u32 b, u32 c, u32 d)
 	writel(b, ave->mbox + AVE_MBOX_SCRATCH(1));
 	writel(c, ave->mbox + AVE_MBOX_SCRATCH(2));
 	writel(d, ave->mbox + AVE_MBOX_SCRATCH(3));
+	/* All four words must land before the doorbell. */
 	wmb();
 	writel(1, ave->mbox + AVE_MBOX_DOORBELL);
 }
@@ -393,10 +394,7 @@ static void ave_ipc_dispatch(struct ave_dev *ave)
 	status = get_unaligned_le32(ave->msg + AVE_REPLY_STATUS);
 
 	if (id == AVE_OP_PROCESS) {
-		if (ave->active)
-			ave_sess_reply(ave->active, ave->msg, ave->msg_len);
-		else
-			dev_warn(ave->dev, "frame reply without a session\n");
+		ave_sess_reply(ave, ave->msg, ave->msg_len);
 		return;
 	}
 	if (id < ARRAY_SIZE(ave->want) && ave->want[id]) {
@@ -465,11 +463,19 @@ static int ave_ipc_poll_once(struct ave_dev *ave)
  * Handle acks and messages until @cond holds, for at most @wait_ms. With no
  * @cond, handle whatever is pending and return. Running out of time means
  * the firmware is stuck: it is marked broken. Caller holds hw_lock.
+ *
+ * Which interrupt line signals the rings is not known, so this polls. It
+ * sleeps between polls: briefly at first (commands are acknowledged within
+ * microseconds), then for up to a millisecond, so a long wait for a frame
+ * costs next to no CPU time.
  */
+#define AVE_POLL_FAST_ROUNDS	20
+
 int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		 bool (*cond)(struct ave_dev *ave, void *arg), void *arg)
 {
 	ktime_t deadline = ktime_add_ms(ktime_get(), wait_ms);
+	unsigned int idle = 0;
 	int ret;
 
 	lockdep_assert_held(&ave->hw_lock);
@@ -486,15 +492,20 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 			ave_ipc_mark_broken(ave, ret, "ring error");
 			return ret;
 		}
-		if (ret)
+		if (ret) {
+			idle = 0;
 			continue;
+		}
 		if (!cond)
 			return 0;
 		if (ktime_after(ktime_get(), deadline)) {
 			ave_ipc_mark_broken(ave, -ETIMEDOUT, "no answer");
 			return -ETIMEDOUT;
 		}
-		usleep_range(50, 150);
+		if (idle++ < AVE_POLL_FAST_ROUNDS)
+			usleep_range(50, 100);
+		else
+			usleep_range(500, 1000);
 	}
 }
 

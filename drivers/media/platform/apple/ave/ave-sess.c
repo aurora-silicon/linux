@@ -18,6 +18,7 @@
 #include <linux/unaligned.h>
 
 #include <media/v4l2-ctrls.h>
+#include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 
 #include "ave.h"
@@ -276,7 +277,65 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);
 		ave_free(ave, &sess->slot[s].aux);
+		ave_free(ave, &sess->slot[s].bounce);
 	}
+}
+
+/*
+ * The input picture for @slot, as a DART address. The encoder reads NV12
+ * with the 64-byte aligned stride S_FMT reported and chroma right after
+ * height luma lines. Some clients (ffmpeg's v4l2m2m encoder) fill the
+ * buffer with their own, smaller line size instead, which shows in the
+ * payload size; such frames are copied to a per-slot buffer in the
+ * encoder's layout.
+ */
+int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
+		   dma_addr_t *input)
+{
+	struct ave_session *sess = ctx->sess;
+	const struct ave_params *p = &sess->p;
+	struct vb2_buffer *vb = &src->vb2_buf;
+	u32 off = vb->planes[0].data_offset;
+	u32 used = vb2_get_plane_payload(vb, 0) - min(off, vb2_get_plane_payload(vb, 0));
+	u32 crows = DIV_ROUND_UP(p->height, 2), rows = p->height + crows;
+	u32 width = ALIGN(p->width, 2), stride;
+	struct ave_buf *b = &sess->slot[slot].bounce;
+	const u8 *from;
+	u8 *to;
+	int ret;
+
+	*input = vb2_dma_contig_plane_dma_addr(vb, 0) + off;
+	if (!used || used >= p->stride * rows || used % rows || used / rows < width) {
+		if (IS_ALIGNED(*input, 64))
+			return 0;
+		dev_err(ctx->ave->dev, "OUTPUT plane at %pad is not 64-byte aligned\n", input);
+		return -EINVAL;
+	}
+	stride = used / rows;
+
+	from = vb2_plane_vaddr(vb, 0);
+	if (!from) {
+		dev_err(ctx->ave->dev, "cannot map an OUTPUT buffer to copy its %u byte stride\n",
+			stride);
+		return -EFAULT;
+	}
+	from += off;
+	ret = ave_alloc(ctx->ave, b, p->stride * rows, 0);
+	if (ret) {
+		dev_err(ctx->ave->dev, "no room to copy %u byte stride input\n", stride);
+		return ret;
+	}
+	if (!sess->copy_noted) {
+		sess->copy_noted = true;
+		dev_info(ctx->ave->dev, "input has a %u byte stride; copying to %u\n", stride,
+			 p->stride);
+	}
+
+	to = b->cpu;
+	for (u32 y = 0; y < rows; y++)
+		memcpy(to + y * p->stride, from + y * stride, width);
+	*input = b->dma;
+	return 0;
 }
 
 /* Debug map of the session buffers, to match DART faults to a buffer. */
@@ -362,6 +421,20 @@ static void ave_sess_check_tails(struct ave_dev *ave, struct ave_session *sess)
 		ave_check_tail(ave, "meta", i, &sess->slot[i].meta);
 		ave_check_tail(ave, "aux", i, &sess->slot[i].aux);
 	}
+
+	/*
+	 * The size of the H.264 per-frame buffer is not known; it is
+	 * allocated generously. Report how much of it the firmware used.
+	 */
+	if (sess->p.codec == AVE_CODEC_H264 && sess->slot[0].aux.cpu) {
+		const struct ave_buf *b = &sess->slot[0].aux;
+		const u64 *w = b->cpu;
+		size_t n = b->size / 8;
+
+		while (n && !w[n - 1])
+			n--;
+		dev_dbg(ave->dev, "per-frame buffer: %#zx of %#zx bytes used\n", n * 8, b->size);
+	}
 }
 
 /* Work out the parameters and allocate the buffers; no firmware access. */
@@ -370,7 +443,7 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	struct ave_session *sess;
 	int ret;
 
-	sess = kzalloc(sizeof(*sess), GFP_KERNEL);
+	sess = kzalloc_obj(*sess);
 	if (!sess)
 		return ERR_PTR(-ENOMEM);
 	ret = ave_sess_params(ctx, &sess->p);
@@ -437,18 +510,27 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
 }
 
-/* A frame reply: +0x10 our client, +0x20 the slot's subtype, +0x40 status. */
-void ave_sess_reply(struct ave_ctx *ctx, const u8 *msg, u32 len)
+/*
+ * A frame reply: +0x10 the session's client token, +0x20 the slot's
+ * subtype, +0x40 status. Caller holds hw_lock.
+ */
+void ave_sess_reply(struct ave_dev *ave, const u8 *msg, u32 len)
 {
-	struct ave_session *sess = ctx->sess;
 	u64 client = get_unaligned_le64(msg + AVE_REPLY_CLIENT);
 	u32 subtype = get_unaligned_le32(msg + AVE_REPLY_SUBTYPE);
 	u32 slot = subtype - AVE_PROC_SUBTYPE;
+	struct ave_session *sess = NULL;
+	struct ave_ctx *ctx = NULL;
 	struct ave_slot *s;
 
-	if (!sess || len < AVE_REPLY_PROCESS_BYTES || client != sess->client ||
-	    slot >= sess->p.slots || !sess->slot[slot].busy) {
-		dev_warn(ctx->ave->dev, "stray frame reply (client %llu subtype %#x len %u)\n",
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i] && ave->sessions[i]->sess->client == client)
+			ctx = ave->sessions[i];
+	if (ctx)
+		sess = ctx->sess;
+	if (!sess || len < AVE_REPLY_PROCESS_BYTES || slot >= sess->p.slots ||
+	    !sess->slot[slot].busy) {
+		dev_warn(ave->dev, "stray frame reply (client %llu subtype %#x len %u)\n",
 			 client, subtype, len);
 		return;
 	}

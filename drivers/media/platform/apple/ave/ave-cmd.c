@@ -16,7 +16,6 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
-#include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 
 #include "ave.h"
@@ -79,19 +78,41 @@ static void ave_put_buf(u8 *cmd, u32 off, const struct ave_buf *b, u32 size)
 	ave_put_surface(cmd, off, b->dma, size);
 }
 
-static u32 ave_session_arg2(enum ave_codec codec)
+/* Is another session open in the firmware besides @ctx's? */
+static bool ave_cmd_others_open(struct ave_ctx *ctx)
 {
-	return codec == AVE_CODEC_HEVC ? AVE_SESSION_ARG2_HEVC : AVE_SESSION_ARG2_H264;
+	struct ave_dev *ave = ctx->ave;
+
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i] && ave->sessions[i] != ctx && ave->sessions[i]->sess->fw_open)
+			return true;
+	return false;
+}
+
+/*
+ * Header word +0x2c depends on the set of open sessions: 0x1e0 on Open and
+ * Start (0x140 when another session is open), the codec value on every
+ * other command of a lone session, and 0 while another one is open.
+ */
+static u32 ave_session_arg2(struct ave_ctx *ctx)
+{
+	if (ave_cmd_others_open(ctx))
+		return 0;
+	return ctx->sess->p.codec == AVE_CODEC_HEVC ? AVE_SESSION_ARG2_HEVC :
+						      AVE_SESSION_ARG2_H264;
+}
+
+static u32 ave_session_setup_arg2(struct ave_ctx *ctx)
+{
+	return ave_cmd_others_open(ctx) ? AVE_SESSION_ARG2_SETUP_SHARED : AVE_SESSION_ARG2_SETUP;
 }
 
 static void ave_cmd_header(struct ave_ctx *ctx, u8 *cmd, enum ave_opcode op, u32 echo,
 			   u32 arg0, u32 arg2)
 {
-	struct ave_dev *ave = ctx->ave;
-
-	ave->next_token += AVE_TOKEN_STEP;
+	ctx->sess->token += AVE_TOKEN_STEP;
 	ave_put32(cmd, AVE_CMD_OPCODE, op);
-	ave_put64(cmd, AVE_CMD_TOKEN, ave->next_token);
+	ave_put64(cmd, AVE_CMD_TOKEN, ctx->sess->token);
 	ave_put64(cmd, AVE_CMD_CLIENT, ctx->sess->client);
 	ave_put32(cmd, AVE_CMD_UNIT, AVE_SESSION_UNIT);
 	ave_put32(cmd, AVE_CMD_CODEC, ctx->sess->p.codec);
@@ -157,7 +178,8 @@ int ave_cmd_open(struct ave_ctx *ctx)
 
 	ave->next_client += AVE_CLIENT_STEP;
 	ctx->sess->client = ave->next_client;
-	ret = ave_cmd_scalar(ctx, AVE_OP_OPEN, AVE_SESSION_ARG0, AVE_SESSION_ARG2_SETUP);
+	ctx->sess->token = AVE_TOKEN_BASE;
+	ret = ave_cmd_scalar(ctx, AVE_OP_OPEN, AVE_SESSION_ARG0, ave_session_setup_arg2(ctx));
 	if (!ret)
 		ctx->sess->fw_open = true;
 	return ret ?: ave_ipc_settle(ave, AVE_CMD_WAIT_MS);
@@ -169,14 +191,14 @@ int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count)
 	int ret = 0;
 
 	for (unsigned int i = 0; i < count && !ret; i++)
-		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, 0, ave_session_arg2(ctx->sess->p.codec));
+		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, 0, ave_session_arg2(ctx));
 	return ret;
 }
 
 /* Priority and Stop go out together, Close after Stop is answered. */
 int ave_cmd_close(struct ave_ctx *ctx)
 {
-	u32 arg2 = ave_session_arg2(ctx->sess->p.codec);
+	u32 arg2 = ave_session_arg2(ctx);
 	int ret, err;
 
 	ret = ave_cmd_scalar(ctx, AVE_OP_PRIORITY, AVE_SESSION_ARG0, arg2);
@@ -467,7 +489,7 @@ int ave_cmd_start(struct ave_ctx *ctx)
 		return -EBUSY;
 	memcpy(cmd, tmpl->data, tmpl->size);
 	ave_cmd_header(ctx, cmd, AVE_OP_START, AVE_OP_START, AVE_SESSION_ARG0,
-		       AVE_SESSION_ARG2_SETUP);
+		       ave_session_setup_arg2(ctx));
 	ave_start_surfaces(sess, cmd);
 	ave_start_config(&sess->p, cmd);
 	ave_sess_check_addrs(ctx, cmd, tmpl->size, AVE_TMPL_START, 0);
@@ -542,7 +564,7 @@ static const struct ave_proc_layout ave_proc_hevc = {
 #define AVE_PROC_FORCED_TYPE		2
 
 int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
-		    u32 bitrate, bool force_key)
+		    dma_addr_t input, u32 bitrate, bool force_key)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -551,15 +573,11 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 								       &ave_proc_h264;
 	const struct firmware *tmpl = ave->tmpl[p->codec - 1][AVE_TMPL_PROCESS];
 	struct ave_slot *s = &sess->slot[slot];
-	unsigned int buf = AVE_BUF_PROC(slot);
-	dma_addr_t y;
+	unsigned int buf = AVE_BUF_PROC(sess->index * AVE_MAX_SLOTS + slot);
+	dma_addr_t y = input;
 	u64 pts;
 	u8 *cmd;
 	int ret;
-
-	y = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0) + src->vb2_buf.planes[0].data_offset;
-	if (!IS_ALIGNED(y, 64))
-		return -EINVAL;
 
 	ret = ave_ipc_wait_ack(ave, buf);
 	if (ret)
@@ -569,7 +587,7 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 		return -EBUSY;
 	memcpy(cmd, tmpl->data, tmpl->size);
 	ave_cmd_header(ctx, cmd, AVE_OP_PROCESS, AVE_PROC_SUBTYPE + slot, 0,
-		       ave_session_arg2(p->codec));
+		       ave_session_arg2(ctx));
 
 	/* Input picture: NV12, chroma right after p->height luma lines. */
 	ave_put64(cmd, l->y, y);
