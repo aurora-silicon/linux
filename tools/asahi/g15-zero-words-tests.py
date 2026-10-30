@@ -13,7 +13,10 @@ the T6030 tables are unchanged), and for publication-bound slots (removal of
 MAX_VMS and its lifetime-slot comment only), and when Board::DeviceTree was
 gated on CONFIG_DRM_ASAHI_G15 for the T8122 runtime without the G15 backend
 (one #[cfg] line; the tables are unchanged). Its T6030 configuration module is
-independently pinned to the original bytes. prepare_board() is pinned too;
+independently pinned to the original bytes,
+except for the J514S B0 FirmwareBuild row added to its firmware table: the
+module is the original pinned bytes (0079ae08) plus that one 15-line row, and
+the whole hw.rs pin was refreshed with it. prepare_board() is pinned too;
 it was refreshed for the same Board change (its T6030 arm is unchanged).
 """
 
@@ -30,11 +33,11 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "1e15a6882971d9888677b4862d0e77a461cb9adf3d948fb1ab11c1f20b6df459",
+    "hw.rs": "9bd94ec8654736e1295061925f3c47264be8d338ad4dcb38b8d66b3dfcef2fa7",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {
-    ("hw.rs", "pub(crate) mod t6030 {"): "0079ae08fbe0e51cbf14e48711981a81048d1a1d3fc5495ab8d5c376283a760c",
+    ("hw.rs", "pub(crate) mod t6030 {"): "cab592b5d776be9ede93b96b1b0526c1d838ef2948a5e4a86caa4ec71f71c2ca",
     ("initdata.rs", "fn templates("): "c3115c9926d3d7d93317cb8510e93b04f30b0c256811d7137568e822dd93b8ee",
     ("initdata.rs", "pub(crate) fn prepare_board("): "ebef64ab87ef7b1f994eb7fa2a2424d05bc4fc9e88cbfbf18e51570bdfc4222d",
     ("board.rs", "pub(crate) fn from_adt("): "cecd0b28db5bd94d3b75c1bbb5f35204e8bf0699f74e5b3d08228c59025f6ac2",
