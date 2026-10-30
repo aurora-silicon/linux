@@ -5,6 +5,7 @@
  */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/list.h>
@@ -36,6 +37,7 @@ struct centauri_ipc {
 	struct cen_buffer *secondary, *window, *cchi_rx, *cchi_tx, *debug_rx;
 	struct cen_buffer *alpha_log;
 	struct cen_buffer *msi[3];
+	unsigned int vectors[3];
 	u16 cchi_head, cchi_tail;
 };
 
@@ -338,6 +340,46 @@ static int memswap_handoff(struct centauri *c, unsigned int function, const char
 	return 0;
 }
 
+static irqreturn_t function_irq(int irq, void *data)
+{
+	centauri_wifi_kick(data);
+	return IRQ_HANDLED;
+}
+
+/* Real MSIs need an MSI controller on the port (pcie-apple, pcie-apple-msi). The port has 32
+ * vectors; Control and Alpha get up to 16 each. Without a controller the function keeps the
+ * DMA mailbox below and the Wi-Fi data path is polled.
+ */
+static int request_vectors(struct centauri *c, unsigned int function)
+{
+	struct pci_dev *pdev = c->ipc->function[function];
+	int count, i, ret;
+
+	count = pci_alloc_irq_vectors(pdev, 1, 16, PCI_IRQ_MSI);
+	if (count < 0)
+		return count;
+	for (i = 0; i < count; i++) {
+		ret = request_irq(pci_irq_vector(pdev, i), function_irq, 0, "centauri", c);
+		if (ret) {
+			while (i--)
+				free_irq(pci_irq_vector(pdev, i), c);
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+	}
+	c->ipc->vectors[function] = count;
+	return 0;
+}
+
+static void free_vectors(struct centauri *c, unsigned int function)
+{
+	struct pci_dev *pdev = c->ipc->function[function];
+
+	while (c->ipc->vectors[function])
+		free_irq(pci_irq_vector(pdev, --c->ipc->vectors[function]), c);
+	pci_free_irq_vectors(pdev);
+}
+
 static int enumerate_functions(struct centauri *c)
 {
 	struct centauri_ipc *ipc = c->ipc;
@@ -367,6 +409,11 @@ static int enumerate_functions(struct centauri *c)
 		pci_read_config_word(ipc->function[i], cap + PCI_MSI_FLAGS, &control);
 		if (!(control & PCI_MSI_FLAGS_64BIT))
 			return -EOPNOTSUPP;
+		if (i < 2 && !request_vectors(c, i)) {
+			dev_info(&c->pdev->dev, "function %d: %u MSIs\n", i, ipc->vectors[i]);
+			pci_set_master(ipc->function[i]);
+			continue;
+		}
 		if (i) {
 			ipc->msi[i] = buffer_alloc(c, i, SZ_16K);
 			if (!ipc->msi[i])
@@ -472,6 +519,9 @@ void centauri_free_ipc(struct centauri *c)
 
 	if (!ipc)
 		return;
+	for (i = 0; i < 3; i++)
+		if (ipc->vectors[i])
+			free_vectors(c, i);
 	centauri_wifi_unregister(c);
 	for (i = 0; i < 3; i++) {
 		if (!ipc->function[i])
