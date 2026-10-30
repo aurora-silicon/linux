@@ -290,9 +290,11 @@ impl Firmware {
             self.queues.admission.release_exit_kill_hold(hold);
             return if error == EAGAIN { Ok(()) } else { Err(error) };
         }
-        // Publication is irrevocable even if its doorbell fails. Keep the killed
-        // graph until processor stop, and the held render identities until this
-        // context's scheduler release is consumed or processors stop.
+        // Publication is irrevocable even if its doorbell fails, so mark the context
+        // killed before anything below can fail. Keep the killed graph until processor
+        // stop, and the held render identities until this context's scheduler release
+        // is consumed or processors stop.
+        context.note_kill_published();
         let mut queue = self.queues.compute[index]
             .as_mut()
             .and_then(|entry| entry.queue.as_deref_mut())
@@ -306,7 +308,6 @@ impl Firmware {
             PRESSED_KILL_NS.store(now.max(1), Ordering::Relaxed);
         }
         queue.record_exit(cookie, now);
-        context.note_kill_published();
         crate::g17::trace::teardown(3, cookie, u64::from(context.id()), hold | u64::from(beside));
         fence(Ordering::SeqCst);
         if let Err(error) = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY)) {
@@ -403,10 +404,11 @@ impl Firmware {
             self.queues.admission.release_exit_kill_hold(hold);
             return if error == EAGAIN { Ok(()) } else { Err(error) };
         }
-        // Publication is irrevocable. The held pairs stay held until this context's
-        // scheduler release is consumed (`release_killed_slots` at detach).
-        self.queues.teardown.record_render_kill(index, cookie, now)?;
+        // Publication is irrevocable, so mark the context killed before anything below
+        // can fail. The held pairs stay held until this context's scheduler release is
+        // consumed (`release_killed_slots` at detach).
         context.note_kill_published();
+        self.queues.teardown.record_render_kill(index, cookie, now)?;
         record_kill_wait(self.queues.teardown.take_kill_wait(index, now));
         if beside {
             *pressed = false;

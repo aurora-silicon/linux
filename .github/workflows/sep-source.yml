@@ -53,7 +53,10 @@ jobs:
           sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
             flex bison bc pkg-config make perl
           rustup component add rust-src
-          cargo install bindgen-cli --version 0.71.1 --locked
+      - name: Prepare the layout-corrected bindgen
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: python3 tools/aurora-bindgen/build.py
       - name: Compile Apple SEP module for arm64
         env:
           LIBCLANG_PATH: /usr/lib/llvm-18/lib

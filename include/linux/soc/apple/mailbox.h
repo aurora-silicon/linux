@@ -78,6 +78,14 @@ struct apple_mbox {
 	void *cookie;
 
 	/*
+	 * Minimum utilization (uclamp_min) a consumer asked the threaded receive
+	 * handler to run with, and the value it last applied to itself; -1 is the
+	 * scheduler's default. See apple_mbox_set_rx_util_min().
+	 */
+	int rx_util_min;
+	int rx_util_min_applied;
+
+	/*
 	 * Protected by tx_lock: set while irq_send_empty is unmasked, so that
 	 * the IRQ handler, a failed send and provider removal mask it exactly
 	 * once between them.
@@ -97,6 +105,12 @@ int apple_mbox_poll(struct apple_mbox *mbox);
  */
 void apple_mbox_hold_rx(struct apple_mbox *mbox);
 void apple_mbox_release_rx(struct apple_mbox *mbox);
+/*
+ * Set the minimum utilization (0..1024) the threaded receive handler runs with,
+ * or -1 to restore the scheduler's default; the handler applies it to itself
+ * when it next runs. Only mailboxes with a threaded receive handler support it.
+ */
+int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min);
 int apple_mbox_send(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 		    bool atomic);
 
@@ -106,5 +120,7 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox);
+int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
+				     u32 *control, u32 *status);
 
 #endif

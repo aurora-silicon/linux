@@ -498,6 +498,20 @@ bool dcp_backlight_desktop_prepare(struct apple_dcp *dcp, u32 id,
 	return !ret;
 }
 
+/* The panel level in nits, 0 while it is unknown. */
+u32 dcp_backlight_desktop_nits(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	int nits;
+
+	if (!dcp_backlight_desktop(dcp))
+		return 0;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	nits = dcp_bl_actual(&dcp->backlight.state);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return nits > 0 ? nits : 0;
+}
+
 void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
 				  bool reply, bool accepted)
 {

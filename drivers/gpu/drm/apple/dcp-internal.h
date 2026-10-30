@@ -187,6 +187,8 @@ struct dcp_panel {
 	int height_mm;
 	/// panel has a mini-LED backlight
 	bool has_mini_led;
+	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
+	u32 peak_nits;
 };
 
 enum dcp_iomfb_method_profile {
@@ -539,6 +541,15 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	/*
+	 * The mode set asks for a PQ signal; output_pq: the one set carries it;
+	 * output_edr: a panel shows the PQ content as EDR, edr_sent: swaps
+	 * still carry EDR state the firmware must be told to drop.
+	 */
+	bool pq_requested;
+	bool output_pq;
+	bool output_edr;
+	bool edr_sent;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */

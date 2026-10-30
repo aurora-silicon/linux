@@ -22,10 +22,19 @@ use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel::{
     new_mutex, new_spinlock,
     prelude::*,
+    soc::apple::rtkit,
     sync::{Arc, Mutex, MutexGuard, SetOnce, SpinLock},
 };
 
 const PRIORITIES: usize = Policy::PRIORITIES as usize;
+
+/// Minimum utilization of the primary coprocessor's receive thread, which handles every
+/// completion, while the GPU itself is the bottleneck (see `Feed::gpu_bound`). Otherwise the
+/// thread keeps the scheduler's RT default, which takes its CPU cluster to the top frequency for
+/// each completion: the completion may be on the critical path, of a waiter, of an idle GPU or of
+/// work bound by host refills. While the GPU is the bottleneck the burst gains nothing, and at the
+/// SoC's thermal limit the power it takes comes out of the GPU's clock.
+const RX_UTIL_MIN_GPU_BOUND: u32 = 256;
 
 /// One priority class's compute work ring: its slot array and the cursors of its two firmware
 /// consumers and of the host producer.
@@ -89,6 +98,12 @@ pub(super) struct Port {
     rings: SpinLock<[u32; PRIORITIES]>,
     #[pin]
     qos: SpinLock<qos::Accounting>,
+    /// Sets the completion receive thread's minimum utilization, from `feed`'s view of the GPU.
+    rx: SetOnce<rtkit::RxUtilMin>,
+    feed: Arc<super::feed::Feed>,
+    /// The request last made, `None` before the first.
+    #[pin]
+    rx_applied: SpinLock<Option<Option<u32>>>,
     /// Serializes every render publication, with or without the device mutex: the tiling
     /// and fragment work rings have one host producer at a time, and same-VM attachment
     /// overlaps are ordered by publication order (see hazard.rs).
@@ -98,11 +113,6 @@ pub(super) struct Port {
     generation: AtomicU64,
     /// Device publication order shared by compute and render commands.
     publications: AtomicU64,
-    /// Compute work slots written per priority class.
-    compute_written: [AtomicU64; PRIORITIES],
-    /// `compute_written` as read before the latest compute doorbell of each class: every slot
-    /// counted there was in its ring when the firmware handled that doorbell.
-    compute_announced: [AtomicU64; PRIORITIES],
     /// Full firmware effort is applied; cleared before an idle clear rechecks `submissions`.
     effort_full: AtomicBool,
     demand: super::power::Demand,
@@ -144,18 +154,22 @@ impl Drop for OuterClaim<'_> {
 }
 
 impl Port {
-    pub(super) fn new(demand: super::power::Demand) -> Result<Arc<Self>> {
+    pub(super) fn new(
+        demand: super::power::Demand,
+        feed: Arc<super::feed::Feed>,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 views: SetOnce::new(),
                 regs: SetOnce::new(),
                 rings <- new_spinlock!([0; PRIORITIES], "g17::Port::rings"),
                 qos <- new_spinlock!(qos::Accounting::new(), "g17::Port::qos"),
+                rx: SetOnce::new(),
+                feed,
+                rx_applied <- new_spinlock!(None, "g17::Port::rx_applied"),
                 render <- new_mutex!((), "g17::Port::render"),
                 generation: AtomicU64::new(0),
                 publications: AtomicU64::new(0),
-                compute_written: [const { AtomicU64::new(0) }; PRIORITIES],
-                compute_announced: [const { AtomicU64::new(0) }; PRIORITIES],
                 effort_full: AtomicBool::new(false),
                 demand,
                 last_submission_ns: AtomicU64::new(0),
@@ -167,7 +181,10 @@ impl Port {
 
     /// Called once while the session is built, before any publisher can see the port.
     pub(super) fn attach(&self, views: Views, regs: crate::regs::G17Resources) -> Result {
-        if self.views.populate(views) && self.regs.populate(regs) {
+        // SAFETY: The session's primary coprocessor owns the mailbox and outlives the port, and
+        // with it every use of the handle.
+        let rx = unsafe { (*views.mailbox).rx_util_min_handle() };
+        if self.views.populate(views) && self.regs.populate(regs) && self.rx.populate(rx) {
             Ok(())
         } else {
             Err(EBUSY)
@@ -234,33 +251,8 @@ impl Port {
         unsafe { (*ring.producer).store(next, Ordering::Relaxed) };
         fence(Ordering::SeqCst);
         reserved[claim.priority] = reserved[claim.priority].saturating_sub(1);
-        self.compute_written[claim.priority].fetch_add(1, Ordering::AcqRel);
         claim.armed = false;
         Ok(next)
-    }
-
-    /// Compute work slots written at `priority` so far.
-    pub(super) fn compute_written(&self, priority: u8) -> u64 {
-        self.compute_written
-            .get(usize::from(priority))
-            .map_or(u64::MAX, |written| written.load(Ordering::Acquire))
-    }
-
-    /// Compute work slots at `priority` that a doorbell has announced.
-    pub(super) fn compute_announced(&self, priority: u8) -> u64 {
-        self.compute_announced
-            .get(usize::from(priority))
-            .map_or(0, |announced| announced.load(Ordering::Acquire))
-    }
-
-    /// Rings the compute doorbell `message` of `priority`, after noting which slots it
-    /// announces.
-    pub(super) fn notify_compute(&self, priority: u8, message: u64) -> Result {
-        let index = usize::from(priority);
-        let written = self.compute_written.get(index).ok_or(EINVAL)?.load(Ordering::Acquire);
-        self.notify(message)?;
-        self.compute_announced[index].fetch_max(written, Ordering::AcqRel);
-        Ok(())
     }
 
     /// Taken around every render publication; see `render`.
@@ -393,7 +385,9 @@ impl Port {
         policy: Policy,
     ) -> Result<qos::Publication> {
         let view = self.qos_view()?;
-        self.qos.lock().publish(&view, owner, scheduler, policy, qos::clock)
+        let publication = self.qos.lock().publish(&view, owner, scheduler, policy, qos::clock)?;
+        self.rx_update();
+        Ok(publication)
     }
 
     /// Publishes the two owners of a render command, fragment then tiling.
@@ -404,7 +398,10 @@ impl Port {
         policy: Policy,
     ) -> Result<[qos::Publication; 2]> {
         let view = self.qos_view()?;
-        self.qos.lock().publish_owners(&view, owners, scheduler, policy, qos::clock)
+        let publications =
+            self.qos.lock().publish_owners(&view, owners, scheduler, policy, qos::clock)?;
+        self.rx_update();
+        Ok(publications)
     }
 
     pub(super) fn qos_cancel(&self, publication: qos::Publication) -> Result {
@@ -414,7 +411,24 @@ impl Port {
 
     pub(super) fn qos_complete(&self, owners: &[qos::Owner]) -> Result {
         let view = self.qos_view()?;
-        self.qos.lock().complete(&view, owners)
+        self.qos.lock().complete(&view, owners)?;
+        self.rx_update();
+        Ok(())
+    }
+
+    /// Requests the receive thread's minimum utilization for the feed's current view of the GPU.
+    /// Called at every publication and completion: the feed's state lingers for a few
+    /// milliseconds, so after a pause the publication that ends it restores the default before
+    /// its completion arrives.
+    fn rx_update(&self) {
+        let Some(rx) = self.rx.as_ref() else {
+            return;
+        };
+        let want = self.feed.gpu_bound().then_some(RX_UTIL_MIN_GPU_BOUND);
+        let mut applied = self.rx_applied.lock();
+        if *applied != Some(want) && rx.set(want).is_ok() {
+            *applied = Some(want);
+        }
     }
 
     /// Rings the primary coprocessor's doorbell.

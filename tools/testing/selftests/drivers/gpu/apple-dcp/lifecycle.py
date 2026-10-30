@@ -1726,6 +1726,10 @@ static int __attribute__((unused)) iomfb_v14_7_atomic_check(struct apple_dcp *d,
 static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
     struct drm_crtc *c, struct drm_atomic_commit *s)
 { (void)d; (void)c; (void)s; assert(!"26.6 backend on a non-26.6 DCP"); return -EINVAL; }
+/* These commits carry no HDR metadata: an SDR signal is always accepted. */
+static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
+    struct drm_atomic_commit *s)
+{ (void)d; (void)c; (void)s; return 0; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
 static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return -ENODEV; }
 static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
