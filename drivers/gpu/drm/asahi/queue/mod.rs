@@ -525,6 +525,15 @@ impl Queue::ver {
 
         let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
 
+        let gpu_context = Arc::new(
+            workqueue::GpuContext::new(dev.clone(), alloc, buffer.any_ref())?,
+            GFP_KERNEL,
+        )?;
+        // Every command of this queue points the firmware at the notifier, and the notifier links
+        // into the notifier list of the work queues. Keep it as long as they are kept, until the
+        // context is invalidated, instead of freeing it with the last command.
+        gpu_context.retain(KBox::new(notifier.clone(), GFP_KERNEL)?)?;
+
         let mut ret = Queue::ver {
             dev: dev.clone(),
             _sched: sched,
@@ -538,11 +547,7 @@ impl Queue::ver {
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
-                gpu_context: Arc::new(
-                    workqueue::GpuContext::new(dev.clone(), alloc, buffer.any_ref())?,
-                    GFP_KERNEL,
-                )?,
-
+                gpu_context,
                 buffer,
                 notifier_list: Arc::new(notifier_list, GFP_KERNEL)?,
                 notifier,

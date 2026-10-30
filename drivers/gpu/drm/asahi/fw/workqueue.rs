@@ -152,7 +152,7 @@ pub(crate) mod raw {
         pub(crate) unk_94: u32,
         pub(crate) pending: AtomicU32,
         pub(crate) unk_9c: u32,
-        pub(crate) gpu_context: GpuPointer<'a, super::GpuContextData>,
+        pub(crate) gpu_context: GpuWeakPointer<super::GpuContextData>,
         pub(crate) unk_a8: U64,
         #[ver(V >= V13_2 && G < G14X)]
         pub(crate) unk_b0: u32,
@@ -171,6 +171,10 @@ impl GpuStruct for GpuContextData {
     type Raw<'a> = raw::GpuContextData;
 }
 
+/// The firmware structures of a work queue.
+///
+/// The raw structure points to the queue's GPU context weakly. The `GpuContext` keeps these
+/// structures until it has been invalidated, and only then frees its own data.
 #[versions(AGX)]
 #[derive(Debug)]
 pub(crate) struct QueueInfo {
@@ -178,7 +182,6 @@ pub(crate) struct QueueInfo {
     pub(crate) ring: GpuArray<u64>,
     pub(crate) gpu_buf: GpuArray<u8>,
     pub(crate) notifier_list: Arc<GpuObject<event::NotifierList>>,
-    pub(crate) gpu_context: Arc<crate::workqueue::GpuContext>,
 }
 
 #[versions(AGX)]
