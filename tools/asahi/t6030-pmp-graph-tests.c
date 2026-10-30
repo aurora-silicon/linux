@@ -433,9 +433,10 @@ static bool of_device_is_compatible(const struct device_node *n, const char *s)
 {
 	return n && n->compatible && !strcmp(n->compatible, s);
 }
+static const char *machine_compatible = "apple,t6030";
 static bool of_machine_is_compatible(const char *s)
 {
-	return !strcmp(s, "apple,t6030");
+	return !strcmp(s, machine_compatible);
 }
 static bool of_property_read_bool(const struct device_node *n, const char *p)
 {
@@ -664,7 +665,7 @@ static const struct apple_pmp_start_timing apple_pmp_start_timing = { 2, 0, 2,
 static int devm_device_add_group(struct device *dev, const struct attribute_group *group)
 {
 	assert(dev == &report_dev.dev && group == &apple_pmp_dram_group);
-	assert(dram_parse_calls == 1 && !dram_parse_error);
+	assert(dram_parse_calls == 1 && (!dram_parse_error || dram_parse_error == -ENODATA));
 	assert(++dram_group_calls == 1 && !registered_group);
 	if (!dram_group_error)
 		registered_group = group;
@@ -737,6 +738,7 @@ static void cleanup(void)
 }
 static struct apple_pmp_report *setup(void)
 {
+	machine_compatible = "apple,t6030";
 	INIT_LIST_HEAD(&apple_pmp_starts);
 	INIT_LIST_HEAD(&apple_pmp_reports);
 	memset(regs, 0, sizeof(regs));
@@ -959,6 +961,70 @@ int main(void)
 	assert(g15_vote() == 0 && enables == 1 && commands == 1);
 	cases++;
 	cleanup();
+
+#if HOST_HAS_DRAM_LEGACY
+	/* Old Stage 2 DTs: static classes require BOTH exact SoC identities. */
+	static const struct {
+		const char *soc, *report;
+		u32 width, states;
+		u64 rate, peak, bandwidth;
+	} classes[] = {
+		{ "apple,t6000", "apple,t6000-pmp-v2-report", 256, 4,
+		  6400000000ULL, 204800000000ULL, 200000000000ULL },
+		{ "apple,t8112", "apple,t8112-pmp-v2-report", 128, 5,
+		  6400000000ULL, 102400000000ULL, 100000000000ULL },
+		{ "apple,t6040", "apple,t6041-pmp-v2-report", 256, 6,
+		  8533333333ULL, 273066666656ULL, 273000000000ULL },
+		{ "apple,t8140", "apple,t8140-pmp-v2-report", 64, 5,
+		  7500000000ULL, 60000000000ULL, 60000000000ULL },
+	};
+	for (unsigned int i = 0; i < ARRAY_SIZE(classes); i++) {
+		setup();
+		machine_compatible = classes[i].soc;
+		report_node.compatible = classes[i].report;
+		assert(apple_pmp_report_probe(&report_dev) == 0);
+		struct apple_pmp_report *rep = report_dev.dev.data;
+		assert(dram_parse_calls == 1 && dram_group_calls == 1 && registered_group);
+		assert(!strcmp(rep->dram.type, "lpddr5"));
+		assert(rep->dram.width == classes[i].width && rep->dram.state_count == classes[i].states);
+		assert(rep->dram.max_rate == classes[i].rate && rep->dram.peak_bandwidth == classes[i].peak);
+		assert(rep->dram.bandwidth_class == classes[i].bandwidth);
+		assert(rep->dram.max_rate * rep->dram.width / 8 == rep->dram.peak_bandwidth);
+		char buf[4096], expected[64];
+		snprintf(expected, sizeof(expected), "%llu\n", classes[i].rate);
+		assert(max_data_rate_show(&report_dev.dev, NULL, buf) == (ssize_t)strlen(expected));
+		assert(!strcmp(buf, expected) && !enables && !commands);
+		cases++;
+		cleanup();
+	}
+	for (unsigned int i = 0; i < 2; i++) {
+		setup();
+		machine_compatible = i ? "apple,t8140" : "apple,t6001";
+		report_node.compatible = "apple,t6000-pmp-v2-report";
+		assert(apple_pmp_report_probe(&report_dev) == 0);
+		assert(dram_parse_calls == 1 && !dram_group_calls && !registered_group);
+		cases++;
+		cleanup();
+	}
+	/* A complete DT always wins over the static class. */
+	setup();
+	machine_compatible = "apple,t8140";
+	report_node.compatible = "apple,t8140-pmp-v2-report";
+	dram_parse_error = 0;
+	assert(apple_pmp_report_probe(&report_dev) == 0);
+	check_dram_attributes();
+	cases++;
+	cleanup();
+	/* A known compatible must not mask partial/invalid DT metadata. */
+	setup();
+	machine_compatible = "apple,t8140";
+	report_node.compatible = "apple,t8140-pmp-v2-report";
+	dram_parse_error = -EINVAL;
+	assert(apple_pmp_report_probe(&report_dev) == -EINVAL);
+	assert(dram_parse_calls == 1 && !dram_group_calls && !action_count);
+	cases++;
+	cleanup();
+#endif
 
 	/* Errors must propagate before child seeding or startup ownership. */
 	const int errors[] = { -EINVAL, -EPROBE_DEFER, -EIO };
