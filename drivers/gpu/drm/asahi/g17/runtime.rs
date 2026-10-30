@@ -1535,7 +1535,7 @@ impl compute::Host for ComputeHost<'_> {
         scheduler: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<qos::Publication> {
-        self.port.qos_publish(owner, scheduler, policy, self.now)
+        self.port.qos_publish(owner, scheduler, policy, now_ns())
     }
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result {
         self.port.qos_cancel(publication)
@@ -1587,7 +1587,7 @@ impl compute::Host for DirectHost<'_> {
         scheduler: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<qos::Publication> {
-        self.port.qos_publish(owner, scheduler, policy, now_ns())
+        self.port.qos_publish(owner, scheduler, policy, self.now)
     }
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result {
         self.port.qos_cancel(publication)
