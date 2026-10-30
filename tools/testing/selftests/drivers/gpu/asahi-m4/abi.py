@@ -104,7 +104,9 @@ def c_layout(header, bindings, output, tag):
     lines += [f'printf("{key}=%llu\\n", (unsigned long long)({expr}));' for key, expr in keys]
     source.write_text('\n'.join(lines + ['return 0;', '}']) + '\n')
     return run_measurements(shlex.split(os.environ.get('CC', 'cc')) +
-                            ['-std=gnu11', '-Wall', '-Werror', '-D__user='],
+                            ['-std=gnu11', '-Wall', '-Werror', '-D__user=',
+                             # Fall back to the tree for UAPI headers the host lacks.
+                             '-idirafter', str(header.parents[1])],
                             source, output / tag)
 
 

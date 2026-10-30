@@ -97,15 +97,28 @@ def main():
     }
     pieces = {name: take(current, pattern) for name, pattern in patterns.items()}
     old_pieces = {name: take(old, pattern) for name, pattern in patterns.items()}
+    # The old gate is compiled against the current tables. Later commits added
+    # hardware fields and variant settings, so the struct and table may differ,
+    # but the old gate must still see the same chip IDs, PCI table and probe code.
     for name in patterns:
-        if name != 'gate':
+        if name not in ('gate', 'hw_struct', 'variants'):
             assert pieces[name] == old_pieces[name], name
+    for src in (pieces, old_pieces):
+        assert re.search(r'^\tunsigned int id;$', src['hw_struct'], re.M), src['hw_struct']
+    variant_ids = r'^\t\[(BCM\d+)\] = \{\n\t\t\.id = (0x[0-9a-f]+),'
+    current_ids = re.findall(variant_ids, pieces['variants'], re.M)
+    assert len(current_ids) == 4, current_ids
+    assert current_ids == re.findall(variant_ids, old_pieces['variants'], re.M), 'variant ids'
     defs = '\n'.join(re.findall(r'^#define BCM\d+_DEVICE_ID [^\n]+', current, re.M))
     assert defs == '\n'.join(re.findall(r'^#define BCM\d+_DEVICE_ID [^\n]+', old, re.M))
     ids = (root / 'include/linux/pci_ids.h').read_text()
     pci_defs = '\n'.join(re.findall(r'^#define (?:PCI_VENDOR_ID_BROADCOM|PCI_CLASS_NETWORK_OTHER)\s+[^\n]+', ids, re.M))
     any_id = take((root / 'include/linux/device-id/pci.h').read_text(), r'^#define PCI_ANY_ID[^\n]+')
-    source_prefix = PREFIX + defs + '\n' + pci_defs + '\n' + any_id + '\n' + '\n'.join(pieces[n] for n in ('enum', 'hw_struct', 'variants', 'pci_macro_table'))
+    # Register offsets the variant table names by macro, as defined in the driver.
+    table_macros = sorted(set(re.findall(r'\b[A-Z][A-Z0-9_]+\b', pieces['variants'])))
+    hw_defs = '\n'.join(m.group() for name in table_macros for m in [re.search(r'^#define ' + name + r'\b[^\n]*', current, re.M)] if m)
+    assert 'BAR2_CONTEXT_ADDR_HI' in hw_defs, hw_defs
+    source_prefix = PREFIX + defs + '\n' + hw_defs + '\n' + pci_defs + '\n' + any_id + '\n' + '\n'.join(pieces[n] for n in ('enum', 'hw_struct', 'variants', 'pci_macro_table'))
     suffix = SUFFIX.replace('@SELECTION@', pieces['selection']).replace('@REGISTRATION@', pieces['registration'])
     gates = {'positive': pieces['gate'], 'published-original': old_pieces['gate']}
     assert pieces['gate'].count('0x4378') == 1
@@ -124,7 +137,7 @@ def main():
         (args.out / f'{name}.log').write_text(run.stdout + run.stderr)
         assert run.returncode == (0 if name == 'positive' else -6), (name, run.returncode)
         results[name] = {'exit': run.returncode, 'source_sha256': sha(source.read_text()), 'stdout': run.stdout.strip()}
-    receipt = {'source_sha256': sha(current), 'old_source_sha256': sha(old), 'old_ref': args.old_ref, 'actual_inputs': {name: sha(value) for name, value in pieces.items()}, 'device_ids_sha256': sha(defs), 'pci_defs_sha256': sha(pci_defs + any_id), 'results': results, 'scope': 'Actual variant/PCI tables, hardware struct, probe selection statement, reset registration block and admission function. PCI enumeration, OF board matching and unrelated probe operations are controlled; no full probe or hardware execution.'}
+    receipt = {'source_sha256': sha(current), 'old_source_sha256': sha(old), 'old_ref': args.old_ref, 'actual_inputs': {name: sha(value) for name, value in pieces.items()}, 'device_ids_sha256': sha(defs), 'table_macros_sha256': sha(hw_defs), 'variant_ids': current_ids, 'pci_defs_sha256': sha(pci_defs + any_id), 'results': results, 'scope': 'Actual variant/PCI tables, hardware struct, probe selection statement, reset registration block and admission function. PCI enumeration, OF board matching and unrelated probe operations are controlled; no full probe or hardware execution.'}
     (args.out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(json.dumps(receipt, indent=2))
 
