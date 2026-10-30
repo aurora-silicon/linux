@@ -1,3 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
-obj-$(CONFIG_VIDEO_APPLE_AVE_EXPERIMENTAL) += apple-ave.o
+obj-$(CONFIG_VIDEO_APPLE_AVE) += apple-ave.o
+apple-ave-y := ave-drv.o ave-fw.o ave-ipc.o ave-cmd.o ave-v4l2.o
