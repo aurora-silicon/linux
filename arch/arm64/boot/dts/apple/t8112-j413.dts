@@ -251,6 +251,7 @@
 	};
 
 	actuator {
+		apple,click-strength = <0xc0 0x6e>;
 	};
 
 	tp_accel {
