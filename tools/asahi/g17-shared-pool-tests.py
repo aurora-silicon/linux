@@ -7,6 +7,7 @@ exclude every borrower and defer mapping destruction until outside the lock.
 """
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 
@@ -114,12 +115,21 @@ fn main(){
 '''
 
 
+
+def mutate_once(source, old, new):
+    """Match Rust tokens across rustfmt whitespace and reject a no-op mutant."""
+    tokens = re.findall(r"[A-Za-z_]\w*|[0-9]+|[^\w\s]", old)
+    pattern = r"(?<!\w)" + r"\s*".join(re.escape(token) for token in tokens)
+    changed, count = re.subn(pattern, lambda _: new, source)
+    assert count == 1, f"mutation matched {count} sites: {old}"
+    return changed
+
 def main():
     source = fixture()
     mutations = [('fixed', source),
-                 ('ignore-release-consumption', source.replace('!render.pools.released(u32::from(pool.id()), pool.control_va())', 'false')),
-                 ('ignore-admission-borrower', source.replace('self.admission.owner_active(entry.reservation.owner)', 'false')),
-                 ('ignore-constructor', source.replace('other.constructing', 'false'))]
+                 ('ignore-release-consumption', mutate_once(source, '!render.pools.released(u32::from(pool.id()), pool.control_va())', 'false')),
+                 ('ignore-admission-borrower', mutate_once(source, 'self.admission.owner_active(entry.reservation.owner)', 'false')),
+                 ('ignore-constructor', mutate_once(source, 'other.constructing', 'false'))]
     with tempfile.TemporaryDirectory(prefix='g17-shared-pools-') as tmp:
         for name, code in mutations:
             path = Path(tmp) / (name + '.rs')
