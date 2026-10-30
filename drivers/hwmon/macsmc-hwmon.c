@@ -49,10 +49,15 @@
 #define FLT_MANT_MASK	GENMASK(22, 0)
 #define FLT_SIGN_MASK	BIT(31)
 
+/*
+ * Fans whose device tree node has apple,fan-manual-control take a target speed
+ * from userspace. This parameter, kept for compatibility, allows it for every
+ * fan with a mode key, whatever the device tree says.
+ */
 static bool fan_control;
 module_param_unsafe(fan_control, bool, 0644);
 MODULE_PARM_DESC(fan_control,
-		 "Override the SMC to set your own fan speeds on supported machines");
+		 "Allow manual fan speeds on every fan with a mode key, also where the device tree does not (default: the device tree decides)");
 
 /*
  * SoC die temperature keys: temperature channels labelled "SoC die <key>"
@@ -185,6 +190,8 @@ struct macsmc_hwmon_fan {
 	char label[MAX_LABEL_LENGTH];
 	u32 attrs;
 	bool manual;
+	/* The device tree allows a manual speed from userspace. */
+	bool manual_control;
 	/* Index of the fan node among the fan-* nodes: its cooling device id. */
 	u32 index;
 	struct macsmc_hwmon *hwmon;
@@ -689,12 +696,18 @@ static int macsmc_hwmon_fan_apply(struct macsmc_hwmon *hwmon,
 	return 0;
 }
 
+/* Whether userspace may set this fan's speed. */
+static bool macsmc_hwmon_fan_user_control(const struct macsmc_hwmon_fan *fan)
+{
+	return fan->mode.macsmc_key && (fan->manual_control || fan_control);
+}
+
 static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
 {
 	struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[channel];
 	int ret;
 
-	if (!fan_control || fan->mode.macsmc_key == 0)
+	if (!macsmc_hwmon_fan_user_control(fan))
 		return -EOPNOTSUPP;
 	if (val < 0)
 		return -EINVAL;
@@ -899,7 +912,7 @@ static umode_t macsmc_hwmon_fan_is_visible(const struct macsmc_hwmon_fan *fan,
 					   u32 attr)
 {
 	if (fan->attrs & BIT(attr)) {
-		if (attr == hwmon_fan_target && fan_control && fan->mode.macsmc_key)
+		if (attr == hwmon_fan_target && macsmc_hwmon_fan_user_control(fan))
 			return 0644;
 
 		return 0444;
@@ -1235,6 +1248,14 @@ static int macsmc_hwmon_create_fan(struct device *dev, struct apple_smc *smc,
 		ret = macsmc_hwmon_parse_key(dev, smc, &fan->mode, mode);
 		if (ret)
 			return ret;
+	}
+
+	if (of_property_read_bool(fan_node, "apple,fan-manual-control")) {
+		if (fan->mode.macsmc_key && (fan->attrs & HWMON_F_TARGET))
+			fan->manual_control = true;
+		else
+			dev_warn(dev, "%s: apple,fan-manual-control needs apple,fan-target and apple,fan-mode\n",
+				 fan->label);
 	}
 
 	/* Initialise fan control mode to automatic */
