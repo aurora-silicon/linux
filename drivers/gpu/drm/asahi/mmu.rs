@@ -541,7 +541,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: OpMap<'op, Self>,
         ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpMapped<'op, Self>, Error> {
-        let _mutation = self.mapping_mutation();
+        let _mutation = self.mapping_addition();
         let (map_addr, map_length) = (op.addr(), op.length() as usize);
         let mut iova = op.addr();
         let mut left = op.length() as usize;
@@ -787,6 +787,19 @@ impl VmInner {
             }
         }
         self.tlbi_contexts_naming_root(addr, size);
+    }
+
+    /// A mutation that only maps addresses nothing maps yet: GPUVM runs the unmap and remap
+    /// steps for any overlap first, and those are full mutations. Every range a cached proof
+    /// covers stays mapped, so the epoch keeps its value and the proofs stay valid; cached
+    /// validation still pauses until the leaf writes finish.
+    fn mapping_addition(&mut self) -> MappingMutation {
+        let state = self.mapping_epoch.clone();
+        if let Some(state) = state.as_ref() {
+            state.writers.fetch_add(1, Ordering::Relaxed);
+            state.visible.swap(u64::MAX, Ordering::AcqRel);
+        }
+        MappingMutation(state)
     }
 
     fn mapping_mutation(&mut self) -> MappingMutation {
