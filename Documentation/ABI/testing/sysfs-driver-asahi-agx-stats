@@ -107,8 +107,12 @@ Description:
 		remains valid until a replacement or an epoch boundary; its
 		host receive time is retained in diagnostics, not used to invent
 		a periodic-report deadline.
-		Suspend/resume, restart, statistics-ring quarantine, observed
-		core gating and teardown end validity. After an epoch boundary,
+		Core gating ends logical pstate validity, but does not discard
+		a completed utilisation interval. Such reports may arrive after
+		the cores have gated; their original age/window limit still
+		applies. Pstate requires a new baseline after core power returns.
+		Suspend/resume, restart, statistics-ring quarantine and teardown
+		end both capabilities' validity. After a firmware epoch boundary,
 		each ring's already queued records are discarded before new
 		baselines are accepted. A quarantined statistics ring disables
 		both roles' exports until reprobe; a trace-ring error does not.

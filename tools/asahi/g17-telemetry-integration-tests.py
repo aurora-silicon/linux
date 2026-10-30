@@ -137,7 +137,7 @@ RUST_TESTS = r'''
         assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
     }
     #[test]
-    fn suspend_gating_and_restart_discard_queued_epoch_records() {
+    fn suspend_and_restart_discard_queued_epoch_records() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
@@ -146,12 +146,10 @@ RUST_TESTS = r'''
         init.push(Primary,words);
         rings.drain_statistics(&dev,&init,Primary);
         assert_eq!(rings.read_statistics(1).util_status,telemetry::VALID);
-        for boundary in 0..4 {
+        for boundary in 0..2 {
             init.push(Primary,words); // Unread at the epoch boundary.
             match boundary {
                 0=> { rings.suspend_statistics(true); rings.drain_statistics(&dev,&init,Primary); rings.suspend_statistics(false); init.push(Primary,words); }
-                1=>rings.observe_statistics_power(false,0),
-                2=>rings.observe_statistics_power(true,1), // Wake observed by a fast publisher.
                 _=>rings.invalidate_statistics(), // Restart handshake.
             }
             assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
@@ -163,11 +161,79 @@ RUST_TESTS = r'''
         }
     }
     #[test]
+    fn completed_bursts_survive_core_gating_on_both_graphs() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let dev=crate::device::Device;
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(graph).unwrap();
+            rings.observe_statistics_power(true,0);
+            let busy=[0x13,0,0,25,75,0,50,0,0,0,0,0,0,0,0,0,0,0];
+            let pstate=[0x10,0x1000,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0];
+            init.push(Primary,busy);
+            init.push(Primary,pstate);
+            rings.drain_statistics(&dev,&init,Primary);
+            assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+            for epoch in 1..5 {
+                // The firmware publishes the completed interval, then gates
+                // before its host receive thread runs. The packet is useful
+                // even though the cores are already idle at receive time.
+                init.push(Primary,busy);
+                init.push(Primary,pstate);
+                rings.observe_statistics_power(false,epoch);
+                rings.drain_statistics(&dev,&init,Primary);
+                rings.observe_statistics_power(false,epoch);
+                let view=rings.read_statistics(1);
+                assert_eq!(view.util_status,telemetry::VALID);
+                assert_eq!((view.tiler,view.renderer,view.device),(25,75,50));
+                assert_eq!(view.util_samples,epoch+1);
+                assert_eq!(view.pstate_status,telemetry::STALE);
+                rings.observe_statistics_power(true,epoch);
+                // A queued pstate is not accepted on wake; a later batch is.
+                init.push(Primary,pstate);
+                rings.drain_statistics(&dev,&init,Primary);
+                assert_eq!(rings.read_statistics(1).pstate_status,telemetry::STALE);
+                init.push(Primary,pstate);
+                rings.drain_statistics(&dev,&init,Primary);
+                assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+            }
+            let age=stats::max_age_ns(graph);
+            assert_eq!(rings.read_statistics(age+1).util_status,telemetry::STALE);
+            // Suspend/restart still end the entire firmware sample epoch.
+            rings.invalidate_statistics();
+            assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+            init.push(Primary,busy);
+            rings.drain_statistics(&dev,&init,Primary);
+            assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+        }
+    }
+    #[test]
+    fn gated_work_is_not_replaced_by_a_fresh_false_zero() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let dev=crate::device::Device;
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(graph).unwrap();
+            rings.observe_statistics_power(true,0);
+            init.push(Primary,[0x13,0,0,20,80,0,50,0,0,0,0,0,0,0,0,0,0,0]);
+            rings.observe_statistics_power(false,1);
+            rings.drain_statistics(&dev,&init,Primary);
+            rings.observe_statistics_power(true,1);
+            init.push(Primary,[0x13,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+            rings.drain_statistics(&dev,&init,Primary);
+            let view=rings.read_statistics(1);
+            assert_eq!(view.util_status,telemetry::VALID);
+            assert_eq!((view.tiler,view.renderer,view.device),(10,40,25));
+            assert_eq!(view.util_samples,2);
+        }
+    }
+    #[test]
     fn pstate_uses_drain_order_without_role_deduplication() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
         let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        rings.observe_statistics_power(true,0);
         init.push(Primary,[0x10,0x1000,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0]);
         init.push(Secondary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
         rings.drain_statistics(&dev,&init,Primary);
@@ -301,7 +367,7 @@ def main():
     ap.add_argument('--baseline', default='ebcf9cb777a434867e9d880892ee2b46887728bb',
                     help='revision containing the legacy formatter')
     ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age',
-                                           'quarantine', 'epoch', 'legacy-format'])
+                                           'quarantine', 'epoch', 'gate', 'pstate-gate', 'legacy-format'])
     args = ap.parse_args()
     work = args.out or Path(tempfile.mkdtemp(prefix='asahi-g17-telemetry-'))
     work.mkdir(parents=True, exist_ok=True)
@@ -320,10 +386,13 @@ def main():
         'age': ('now_ns - received >= max_age_ns', 'now_ns - received > max_age_ns'),
         'quarantine': ('.any(|rings| rings[ReportRing::Statistics as usize])', '.any(|_| false)'),
         'epoch': ('self.discard_statistics = [true; 2]', 'self.discard_statistics = [false; 2]'),
+        'gate': ('self.telemetry.invalidate_pstate();', 'self.invalidate_statistics();'),
+        'pstate-gate': ('let accept_pstate = self.statistics_powered && !self.discard_pstate[role as usize];',
+                        'let accept_pstate = true;'),
     }
     if args.mutation in changes:
         before, after = changes[args.mutation]
-        if args.mutation in ('quarantine', 'epoch'):
+        if args.mutation in ('quarantine', 'epoch', 'gate', 'pstate-gate'):
             assert before in channel
             channel = channel.replace(before, after, 1)
             (work / 'channel.rs').write_text(channel)

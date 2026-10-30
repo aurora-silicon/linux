@@ -50,6 +50,8 @@ pub(crate) struct Rings {
     max_age_ns: u64,
     suspended: bool,
     discard_statistics: [bool; 2],
+    discard_pstate: [bool; 2],
+    statistics_powered: bool,
     statistics_epoch: u64,
 }
 
@@ -62,6 +64,8 @@ impl Rings {
             max_age_ns: super::stats::max_age_ns(graph),
             suspended: false,
             discard_statistics: [false; 2],
+            discard_pstate: [false; 2],
+            statistics_powered: false,
             statistics_epoch: 0,
         })
     }
@@ -71,6 +75,7 @@ impl Rings {
         // The packets have no epoch marker. Discard each role's already
         // queued records before accepting a new baseline after the boundary.
         self.discard_statistics = [true; 2];
+        self.discard_pstate = [true; 2];
     }
 
     pub(super) fn suspend_statistics(&mut self, suspended: bool) {
@@ -84,8 +89,14 @@ impl Rings {
 
     pub(super) fn observe_statistics_power(&mut self, powered: bool, epoch: u64) {
         if !powered || epoch != self.statistics_epoch {
-            self.invalidate_statistics();
+            // Core gating does not restart the firmware statistics producer.
+            // In particular, V25G83 can finish a burst and gate before the
+            // host drains its utilisation report. Keep that bounded interval
+            // sample; only logical pstate needs a post-gate baseline.
+            self.telemetry.invalidate_pstate();
+            self.discard_pstate = [true; 2];
         }
+        self.statistics_powered = powered;
         self.statistics_epoch = epoch;
     }
 
@@ -120,6 +131,11 @@ impl Rings {
                 .quarantined
                 .iter()
                 .any(|rings| rings[ReportRing::Statistics as usize]);
+        let accept_pstate = self.statistics_powered && !self.discard_pstate[role as usize];
+        let mut accepted_types = if accept { STATISTICS_TYPES } else { 0 };
+        if !accept_pstate {
+            accepted_types &= !(1 << 0x10);
+        }
         if let Err(error) = Self::consume_report(
             init,
             role,
@@ -127,7 +143,7 @@ impl Rings {
             &mut self.reports,
             &mut self.telemetry,
             self.max_age_ns,
-            accept,
+            accepted_types,
         ) {
             self.quarantined[role as usize][ring as usize] = true;
             if statistics {
@@ -142,6 +158,9 @@ impl Rings {
             );
         } else if statistics && !self.suspended {
             self.discard_statistics[role as usize] = false;
+            if self.statistics_powered {
+                self.discard_pstate[role as usize] = false;
+            }
         }
     }
 
@@ -152,7 +171,7 @@ impl Rings {
         reports: &mut super::reports::Reports,
         telemetry: &mut super::telemetry::Telemetry,
         max_age_ns: u64,
-        accept_statistics: bool,
+        accepted_types: u32,
     ) -> Result {
         let (state, entries, capacity, allowed_types) = ring.geometry();
         let consumer_word = init.status_word(role, state)?;
@@ -178,7 +197,7 @@ impl Rings {
             if matches!(ring, ReportRing::Statistics) {
                 let host_ns = super::now_ns();
                 reports.record(role, words, host_ns);
-                if accept_statistics {
+                if accepted_types & (1 << tag) != 0 {
                     telemetry.record(&words, host_ns, max_age_ns);
                 }
             }
