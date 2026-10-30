@@ -85,7 +85,7 @@ struct mt7932 {
  bool connecting,connected,disconnecting,disconnect_seen,disconnect_event_received;
  bool disconnect_local,connect_open,assoc_request_seen,peer_valid,link_failed,stopping,rf_ready;
  u8 connect_channel,connect_center,peer_wtbl,smart_version,waiting;
- enum nl80211_band connect_band; u8 six_assoc_power[2][1020];
+ enum nl80211_band connect_band; u8 six_assoc_power[2][1020]; bool six_legacy_assoc;
  int waiting_eid;
  struct cfg80211_chan_def connect_chandef;
  struct test_band band2,band5;

@@ -112,12 +112,15 @@ struct mt7932 {
 	struct ieee80211_channel channels6[MT7932_CHANNELS_6G];
 	struct ieee80211_sband_iftype_data he6;
 	u8 six_assoc_power[2][1020];
-	bool six_power_valid;
+	bool six_power_valid, six_legacy_assoc, six_ap_valid, six_class_dirty;
+	u64 six_legacy_channels;
+	struct mt7932_6g_ap six_ap;
 	u8 scan_band, scan_batch;
 	unsigned int scan_cursor;
 	enum nl80211_band connect_band, scan_home_band;
 	u32 connect_akm;
 	enum nl80211_mfp connect_mfp;
+	bool connect_pmf; /* admitted request, never firmware readback */
 	enum nl80211_sae_pwe_mechanism connect_sae_pwe;
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
@@ -222,6 +225,7 @@ struct mt7932 {
 
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
+int mt_6g_connect_policy(struct mt7932 *m, const struct mt7932_6g_ap *ap);
 void mt_reg_apply_deferred_locked(struct mt7932 *m);
 void mt_policy_debugfs_init(struct mt7932 *m);
 int mt_net_open(struct net_device *netdev);

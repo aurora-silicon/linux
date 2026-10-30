@@ -2111,6 +2111,7 @@ F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/gpu/apple-dcp-backlight.rst
 F:	Documentation/hid/apple-j700-multitouch.rst
+F:	Documentation/networking/device_drivers/wifi/mt7932-j700-antenna.rst
 F:	Documentation/networking/device_drivers/wifi/mt7932-neo.rst
 F:	arch/arm64/boot/dts/apple/t8140*
 F:	arch/arm64/configs/j700*.config
