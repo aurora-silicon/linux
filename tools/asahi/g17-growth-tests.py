@@ -157,12 +157,12 @@ fn main(){
 
 
 
-def mutate_once(source, old, new):
-    """Match Rust tokens across rustfmt whitespace and reject a no-op mutant."""
+def mutate_sites(source, old, new, expected=1):
+    """Match Rust tokens across whitespace and check the intended site count."""
     tokens = re.findall(r"[A-Za-z_]\w*|[0-9]+|[^\w\s]", old)
     pattern = r"(?<!\w)" + r"\s*".join(re.escape(token) for token in tokens)
     changed, count = re.subn(pattern, lambda _: new, source)
-    assert count == 1, f"mutation matched {count} sites: {old}"
+    assert count == expected, f"mutation matched {count}, expected {expected} sites: {old}"
     return changed
 
 def main():
@@ -170,9 +170,9 @@ def main():
     runtime = (ROOT / 'runtime.rs').read_text()
     assert 'growth = queue.growth_token();' in runtime and 'queue.abort_growth(token)' in runtime
     cases = [('fixed', source),
-             ('missing-abort-transfer', mutate_once(source, 'self.growing = false;\n        self.growth_blocks = 0;\n        self.release_owner().map(Some)', 'self.release_owner().map(Some)')),
-             ('ignore-consumption', mutate_once(source, 'if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {', 'if false {')),
-             ('ignore-collector-pressure', mutate_once(source, 'if !deferred.vacated_room() { break; }', ''))]
+             ('missing-abort-transfer', mutate_sites(source, 'self.growing = false;\n        self.growth_blocks = 0;\n        self.release_owner().map(Some)', 'self.release_owner().map(Some)')),
+             ('ignore-consumption', mutate_sites(source, 'if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {', 'if false {', expected=2)),
+             ('ignore-collector-pressure', mutate_sites(source, 'if !deferred.vacated_room() { break; }', ''))]
     with tempfile.TemporaryDirectory(prefix='g17-growth-') as tmp:
         for name, code in cases:
             path=Path(tmp)/(name+'.rs');path.write_text(code);binary=path.with_suffix('')

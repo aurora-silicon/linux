@@ -116,20 +116,20 @@ fn main(){
 
 
 
-def mutate_once(source, old, new):
-    """Match Rust tokens across rustfmt whitespace and reject a no-op mutant."""
+def mutate_sites(source, old, new, expected=1):
+    """Match Rust tokens across whitespace and check the intended site count."""
     tokens = re.findall(r"[A-Za-z_]\w*|[0-9]+|[^\w\s]", old)
     pattern = r"(?<!\w)" + r"\s*".join(re.escape(token) for token in tokens)
     changed, count = re.subn(pattern, lambda _: new, source)
-    assert count == 1, f"mutation matched {count} sites: {old}"
+    assert count == expected, f"mutation matched {count}, expected {expected} sites: {old}"
     return changed
 
 def main():
     source = fixture()
     mutations = [('fixed', source),
-                 ('ignore-release-consumption', mutate_once(source, '!render.pools.released(u32::from(pool.id()), pool.control_va())', 'false')),
-                 ('ignore-admission-borrower', mutate_once(source, 'self.admission.owner_active(entry.reservation.owner)', 'false')),
-                 ('ignore-constructor', mutate_once(source, 'other.constructing', 'false'))]
+                 ('ignore-release-consumption', mutate_sites(source, '!render.pools.released(u32::from(pool.id()), pool.control_va())', 'false')),
+                 ('ignore-admission-borrower', mutate_sites(source, 'self.admission.owner_active(entry.reservation.owner)', 'false')),
+                 ('ignore-constructor', mutate_sites(source, 'other.constructing', 'false'))]
     with tempfile.TemporaryDirectory(prefix='g17-shared-pools-') as tmp:
         for name, code in mutations:
             path = Path(tmp) / (name + '.rs')
