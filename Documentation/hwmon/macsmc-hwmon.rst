@@ -31,6 +31,20 @@ as unsafe, allows manual speeds on every fan with a mode key whatever the
 Devicetree says. It cannot be proven that the system will fail safe if it
 overheats under a manual fan speed.
 
+SoC die temperatures are described by the ``apple,soc-die-keys`` string list
+on the hwmon device node. The driver appends these temperature channels after
+the ``temperature-*`` children, in list order, with labels ``SoC die <key>``.
+Only readable four-byte floating-point keys are used. When thermal support is
+enabled, their hottest reading supplies the ``macsmc_soc_die`` thermal zone.
+A failed or implausible reading fails the zone read rather than reporting a
+partial result. Keys absent from the firmware are skipped.
+
+The optional ``apple,thermal-pressure-key`` on the same node describes a
+readable signed 32-bit firmware thermal pressure level. Neither feature needs
+a module parameter. Kernels using these properties need an updated device
+tree; the former downstream per-board fallback and its ``soc_die_keys`` and
+``board_keys`` parameters have been removed.
+
 sysfs interface
 ---------------
 
@@ -73,3 +87,7 @@ tempX_input
 tempX_label
     Temperature sensor label
 
+thermal_pressure_level
+    Firmware thermal pressure level, exposed read-only when the device tree
+    supplies a valid key. The integer is firmware-defined and is not a
+    temperature or a percentage.
