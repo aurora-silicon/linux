@@ -1007,6 +1007,17 @@ config I2C_APPLE
 	  This driver can also be built as a module. If so, the module
 	  will be called i2c-apple.
 
+config I2C_PASEMI_KUNIT_TEST
+	bool "KUnit tests for PA Semi/Apple I2C runtime PM" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PM && I2C_APPLE
+	default KUNIT_ALL_TESTS
+	help
+	  Test runtime PM reference handling on resume and transfer failures.
+	  Exercise both I2C and SMBus transfer entry points with a fake PM
+	  domain and register storage. Failed resumes must not touch MMIO,
+	  and transfer errors must release their power references.
+	  No controller hardware is needed. These tests are for developers.
+
 config I2C_PCA_PLATFORM
 	tristate "PCA9564/PCA9665 as platform device"
 	select I2C_ALGOPCA
