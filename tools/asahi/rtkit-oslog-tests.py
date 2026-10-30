@@ -45,14 +45,14 @@ struct apple_rtkit {
  void *dev, *wq;
  struct mailbox *mbox;
  struct apple_rtkit_shmem oslog_buffer, syslog_buffer, ioreport_buffer, crashlog_buffer;
- struct apple_rtkit_shmem kdebug_buffer0, kdebug_buffer1, coreanalytics_buffer;
+ struct apple_rtkit_shmem kdebug_buffer0, kdebug_buffer1;
  int sync_ack_fifo;
  bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
  unsigned iop_power_state, ap_power_state;
  unsigned long endpoints[4];
  char *syslog_msg_buffer;
  size_t syslog_n_entries, syslog_msg_size;
- int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion, coreanalytics_completion;
+ int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion;
 };
 static unsigned sent, warnings, errors, requests, detachments, flushes, freed, checks;
 static int send_error, setup_error, start_error;
@@ -125,7 +125,7 @@ int main(void)
   detachments=flushes=freed=0;start_error=fail?-5:0;
   assert(apple_rtkit_reinit(&r)==start_error);
   assert(!r.oslog_inherited && !r.syslog_inherited && !r.crashlog_inherited);
-  assert(!r.oslog_buffer.size && !r.crashed && !r.syslog_msg_size && freed==7);
+  assert(!r.oslog_buffer.size && !r.crashed && !r.syslog_msg_size && freed==6);
   assert(r.endpoints[0]==(1UL<<APPLE_RTKIT_EP_MGMT));
   assert(detachments==(fail?2U:1U) && flushes==(fail?2U:1U));
   event(&r,type|1,false);++checks;

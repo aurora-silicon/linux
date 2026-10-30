@@ -136,19 +136,8 @@
       "sha256_before_spdx_notice": "e3ba6fa572ed16636c9b6d7428e921cf1d81930429e4610738f5a86e906bc7fe"
     },
     "public-uapi.rs": {
-      "sha256": "33eb92306ec7b088f14847c2cd974eebad88e5b75ac37fcc18a523c171edd0c6",
-      "sha256_before_spdx_notice": "e9f1ebf957d800bd1ed6fb372a4f8890fb1f1d8ff30e2fd436134de8c998cc76",
-      "abi_tail_extension": {
-        "reference_kernel_commit": "a1b269f79e35844660892b9779adb2f68abc38b7",
-        "reference_header_blob": "66396f89cc33393b774b99ace0945794215e2131",
-        "reference_header_sha256": "697f494b0e4c4719959bc73b4b4731c540b9b058b694ec8ccd7abd24b1b3dd21",
-        "previous_bindings_sha256": "1cb62b5c57600855b38ffff960d59b35cd5f306d35cfe77a47ed3d60ee29e601",
-        "fields": [
-          "memory_limit",
-          "client_memory_limit"
-        ],
-        "reference": "Public MIT C UAPI declarations; checked by compiled C/Rust layout comparison. Encoder byte fixtures are unchanged."
-      }
+      "sha256": "1cb62b5c57600855b38ffff960d59b35cd5f306d35cfe77a47ed3d60ee29e601",
+      "sha256_before_spdx_notice": "e9f1ebf957d800bd1ed6fb372a4f8890fb1f1d8ff30e2fd436134de8c998cc76"
     },
     "vm-case-0.bin.gz": {
       "sha256": "2758f69e5813fa2f7f08f2008217de05c2482af4ff706125025d39b42c40be36",

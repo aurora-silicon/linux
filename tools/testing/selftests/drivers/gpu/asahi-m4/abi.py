@@ -62,15 +62,13 @@ def run_measurements(command, source, binary):
 def c_layout(header, bindings, output, tag):
     keys, _ = expressions(bindings)
     capacity_tail = 'client_memory_limit;' in header.read_text()
-    # Bindings frozen after the capacity tail landed already describe all of it.
-    frozen_tail = 'client_memory_limit' in bindings.read_text()
     # Linux 7.2 folds the historical extension structs into the base payloads.
     # Compare the same wire prefixes and offsets while keeping the C oracle frozen.
     if 'struct drm_asahi_cmd_render_with_prior {' not in header.read_text():
         translated = []
         for key, expr in keys:
             kind, _, field = key.partition(':')
-            if capacity_tail and not frozen_tail and key == 'drm_asahi_params_global:size':
+            if capacity_tail and key == 'drm_asahi_params_global:size':
                 # Compare the frozen reply prefix; validate the entire known additive tail below.
                 expr = 'offsetof(struct drm_asahi_params_global, memory_limit)'
             if key == "drm_asahi_vm_create:pad":
