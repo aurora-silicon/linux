@@ -711,6 +711,7 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		if (m->connected && !m->disconnecting && !m->stopping &&
 		    frame.channel == m->connect_channel &&
 		    ether_addr_equal(frame.data + 16, m->connect_bssid)) {
+			m->home_beacons++;
 			mt_cqm_signal(m, mt7932_rx_signal(&frame, m->antenna_mask));
 			if (tim && tim->datalen >= 4 && !m->power_tim) {
 				m->power_tim = true;

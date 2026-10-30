@@ -26,6 +26,7 @@ def extract(text, marker):
 
 CODE = r'''
 #![allow(dead_code)]
+__USAGE__
 use std::{sync::{Arc as StdArc,Mutex,Barrier,OnceLock,atomic::{AtomicBool,AtomicI32,AtomicU32,AtomicU64,Ordering}},ops::Deref,cell::Cell};
 #[derive(Copy,Clone,Debug,PartialEq,Eq)]struct Error(i32);
 type Result<T=()> = std::result::Result<T,Error>;
@@ -70,7 +71,7 @@ fn setup()->Gpu{
  Gpu{shared:Arc::wrap(Shared{logical_queues:counter,crashed:AtomicBool::new(false),dev:Device{trace}})}
 }
 fn vm(gpu:&Gpu,status:i32)->mmu::Vm{mmu::Vm{state:Arc::wrap(VmState{status:Status(AtomicI32::new(status)),trace:gpu.shared.dev.trace.clone()})}}
-fn new(gpu:&Gpu,status:i32,priority:u32,base:u64)->Result<KBox<Queue>>{KBox::new(Queue::new(gpu,vm(gpu,status),priority,base)?,GFP_KERNEL)}
+fn new(gpu:&Gpu,status:i32,priority:u32,base:u64)->Result<KBox<Queue>>{KBox::new(Queue::new(gpu,vm(gpu,status),priority,base,Arc::wrap(usage::Client::new()))?,GFP_KERNEL)}
 fn count(gpu:&Gpu)->u32{gpu.shared.logical_queues.load(Ordering::SeqCst)}
 fn main(){
  // One device shared across different VM objects/files: exactly58 live queues.
@@ -115,12 +116,14 @@ def main():
     parser.add_argument("--mutations", action="store_true")
     args = parser.parse_args(); args.output.mkdir(parents=True, exist_ok=True)
     queue = (ROOT / "drivers/gpu/drm/asahi/g15/queue.rs").read_text()
+    usage = (ROOT / "drivers/gpu/drm/asahi/usage.rs").read_text()
     hardware = (ROOT / "drivers/gpu/drm/asahi/g15/hw.rs").read_text()
     limit = next(line.strip() for line in hardware.splitlines() if "const MAX_QUEUES:" in line)
-    replacements = {"__LIMIT__": limit, "__STATE__": extract(queue, "pub(crate) struct QueueState {"),
+    replacements = {"__USAGE__": "mod usage {\n" + usage + "\n}",
+        "__LIMIT__": limit, "__STATE__": extract(queue, "pub(crate) struct QueueState {"),
         "__CREDIT__": extract(queue, "struct QueueCredit {"), "__CREDIT_IMPL__": extract(queue, "impl QueueCredit {"),
         "__CREDIT_DROP__": extract(queue, "impl Drop for QueueCredit {"), "__QUEUE__": extract(queue, "pub(crate) struct Queue {"),
-        "__QUEUE_DROP__": extract(queue, "impl Drop for Queue {"), "__NEW__": extract(queue, "    pub(crate) fn new(gpu: &Gpu,")}
+        "__QUEUE_DROP__": extract(queue, "impl Drop for Queue {"), "__NEW__": extract(queue, "    pub(crate) fn new(")}
     code = CODE
     for old, new in replacements.items(): code = code.replace(old, new)
     variants = {"control": code}; expected = {}
@@ -143,6 +146,7 @@ def main():
             variants[name] = variant; expected[name] = message
     variants["control-after"] = code
     receipt = {"scope": __doc__, "sources": {"queue.rs": hashlib.sha256(queue.encode()).hexdigest(),
+        "usage.rs": hashlib.sha256(usage.encode()).hexdigest(),
         "hw.rs": hashlib.sha256(hardware.encode()).hexdigest()}, "variants": {}}
     for name, source in variants.items():
         path=args.output/(name+".rs");path.write_text(source);binary=args.output/name

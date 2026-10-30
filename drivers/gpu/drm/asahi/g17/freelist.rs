@@ -8,7 +8,9 @@
 //! reference and are released only after the owner's teardown is acknowledged.
 
 use super::fw::freelist::*;
-use super::fw::initdata::{FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_PAGES, FREE_LIST_BLOCK_SIZE};
+use super::fw::initdata::{
+    FreeListArgs, FreeListClass, FreeListControl, FREE_LIST_BLOCK_PAGES, FREE_LIST_BLOCK_SIZE,
+};
 use super::object::{Allocator, CpuMap, KernelObject};
 use crate::mmu;
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
@@ -59,7 +61,9 @@ impl RenderId {
                 }
             }
         }
-        Err(super::capacity::refused(super::capacity::Site::RenderPoolIds))
+        Err(super::capacity::refused(
+            super::capacity::Site::RenderPoolIds,
+        ))
     }
 }
 impl Drop for RenderId {
@@ -97,7 +101,12 @@ fn place_lower<T>(size: usize, place: impl FnOnce() -> Result<T>) -> Result<T> {
         let at = LOWER_PROBE_AT.load(Ordering::Relaxed);
         if now < at
             || LOWER_PROBE_AT
-                .compare_exchange(at, now + LOWER_PROBE_NS, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(
+                    at,
+                    now + LOWER_PROBE_NS,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_err()
         {
             return Err(ENOSPC);
@@ -157,13 +166,15 @@ impl Pages {
     }
     /// Fresh compute backing at the admitted capacity, built off-lock.
     pub(crate) fn compute_sized(alloc: &Allocator<'_>, blocks: usize) -> Result<Self> {
-        if blocks < COMPUTE_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
+        if blocks < COMPUTE_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8)
+        {
             return Err(EINVAL);
         }
         Self::new(alloc, blocks, RunLayout::Compute)
     }
     pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
-        self.backing.map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
+        self.backing
+            .map_alias(vm, self.page_list_va(), mmu::PROT_GPU_SHARED_RW)
     }
     pub(crate) fn page_list_va(&self) -> u64 {
         self.backing.gpu_va()
@@ -206,7 +217,8 @@ impl RenderBacking {
         client: &mmu::Vm,
         blocks: usize,
     ) -> Result<Self> {
-        if blocks < RENDER_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8) {
+        if blocks < RENDER_BLOCKS || blocks > PAGE_LIST_SIZE / (FREE_LIST_BLOCK_PAGES as usize * 8)
+        {
             return Err(EINVAL);
         }
         let size = TABLE_SIZE + blocks * FREE_LIST_BLOCK_SIZE;
@@ -289,8 +301,11 @@ impl RenderPool {
         )?;
         fence(Ordering::SeqCst);
         let serial = RENDER_POOL_SERIAL
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
-            .map_err(|_| EOVERFLOW)? + 1;
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| EOVERFLOW)?
+            + 1;
         let backing = Arc::pin_init(
             new_mutex!(Some(backing), "G17 render pool backing"),
             GFP_KERNEL,
@@ -315,7 +330,9 @@ impl RenderPool {
     }
     /// Pressure reclaim evicted the client VM, which is idle.
     pub(crate) fn client_evicted(&self) -> bool {
-        self.client_residency.as_ref().is_some_and(|gate| gate.evicted())
+        self.client_residency
+            .as_ref()
+            .is_some_and(|gate| gate.evicted())
     }
     /// Removes the backing. The caller holds the device mutex and observed this
     /// pool's free-list release consumed, so no firmware reference remains; the
@@ -354,7 +371,12 @@ impl RenderPool {
         if !self.vacant() {
             return Ok(());
         }
-        self.rearm(RenderBacking::new(alloc, render_global, client, self.blocks)?)
+        self.rearm(RenderBacking::new(
+            alloc,
+            render_global,
+            client,
+            self.blocks,
+        )?)
     }
 
     pub(crate) fn serial(&self) -> u64 {
@@ -519,7 +541,9 @@ pub(crate) struct ComputePool {
 }
 impl ComputePool {
     pub(crate) fn fits(&self, blocks: usize) -> bool {
-        self.pages.as_ref().is_some_and(|pages| pages.blocks >= blocks)
+        self.pages
+            .as_ref()
+            .is_some_and(|pages| pages.blocks >= blocks)
     }
 
     pub(crate) fn new(alloc: &Allocator<'_>, qid: u8, blocks: usize) -> Result<Self> {
@@ -862,21 +886,32 @@ mod observation_tests {
 
     fn owner() -> Owner {
         Owner {
-            serial: 1, epoch: 1, buffer_slot: 129,
-            control_va: 0x1000, ring_va: 0x2000, cookie: 0x3000,
+            serial: 1,
+            epoch: 1,
+            buffer_slot: 129,
+            control_va: 0x1000,
+            ring_va: 0x2000,
+            cookie: 0x3000,
         }
     }
 
     #[test]
     fn warm_and_lingering_owners_need_no_control_snapshot() {
         let mut lease = Lease::acquire(None, owner()).unwrap();
-        lease.observe_pending_release(|| panic!("fresh owner has no witness")).unwrap();
+        lease
+            .observe_pending_release(|| panic!("fresh owner has no witness"))
+            .unwrap();
         lease.retire_prepare().unwrap();
-        lease.observe_pending_release(|| panic!("warm owner has no witness")).unwrap();
+        lease
+            .observe_pending_release(|| panic!("warm owner has no witness"))
+            .unwrap();
         lease.complete_render(true).unwrap();
-        lease.observe_pending_release(|| panic!("linger has no witness")).unwrap();
+        lease
+            .observe_pending_release(|| panic!("linger has no witness"))
+            .unwrap();
         let mut next = Lease::acquire(Some(&lease), owner()).unwrap();
-        next.observe_pending_release(|| panic!("overlap has no witness")).unwrap();
+        next.observe_pending_release(|| panic!("overlap has no witness"))
+            .unwrap();
     }
 
     #[test]
@@ -891,7 +926,8 @@ mod observation_tests {
         assert_eq!(next.release_witness(), Some(3));
         next.observe_pending_release(|| Ok((3, 3))).unwrap();
         assert_eq!(next.release_witness(), None);
-        next.observe_pending_release(|| panic!("witness was already consumed")).unwrap();
+        next.observe_pending_release(|| panic!("witness was already consumed"))
+            .unwrap();
     }
 
     #[test]
@@ -902,7 +938,10 @@ mod observation_tests {
         lease.mark_release_sent(3).unwrap();
         assert_eq!(lease.observe_pending_release(|| Err(EIO)), Err(EIO));
         assert_eq!(lease.release_witness(), Some(3));
-        assert_eq!(lease.observe_pending_release(|| Ok((u32::MAX, 3))), Err(EIO));
+        assert_eq!(
+            lease.observe_pending_release(|| Ok((u32::MAX, 3))),
+            Err(EIO)
+        );
         assert!(!lease.released());
         lease.observe_pending_release(|| Ok((3, 3))).unwrap();
         assert!(lease.released());
@@ -938,7 +977,9 @@ mod capacity_tests {
         for _ in 0..8 {
             let mut pools = KVec::with_capacity(127, GFP_KERNEL).unwrap();
             for _ in 0..127 {
-                pools.push(RenderId::new(&ids).unwrap(), GFP_KERNEL).unwrap();
+                pools
+                    .push(RenderId::new(&ids).unwrap(), GFP_KERNEL)
+                    .unwrap();
             }
             assert_eq!(ids.used(), 127);
             assert!(matches!(RenderId::new(&ids), Err(ENOSPC)));

@@ -180,8 +180,12 @@ mod tests {
     fn a_prefix_only_covers_its_own_owner_and_ordinals() {
         let footprint = footprint(1, 0x1000);
         let live = |sequence| Live {
-            owner: 1, sequence, slot: Some(2), ticket: 0,
-            footprint: &footprint, quarantined: false,
+            owner: 1,
+            sequence,
+            slot: Some(2),
+            ticket: 0,
+            footprint: &footprint,
+            quarantined: false,
         };
         assert!(plan(1, Some(7), None, &footprint, [live(7)]) == Plan::Any);
         assert!(plan(1, Some(7), None, &footprint, [live(8)]) == Plan::Pair(2));
@@ -194,21 +198,27 @@ mod tests {
     fn covered_commands_do_not_hide_an_unordered_sibling() {
         let footprint = footprint(1, 0x1000);
         let live = |sequence, slot| Live {
-            owner: 1, sequence, slot: Some(slot), ticket: 0,
-            footprint: &footprint, quarantined: false,
+            owner: 1,
+            sequence,
+            slot: Some(slot),
+            ticket: 0,
+            footprint: &footprint,
+            quarantined: false,
         };
-        assert!(plan(1, Some(7), None, &footprint, [live(7, 2), live(8, 3)])
-            == Plan::Pair(3));
-        assert!(plan(1, Some(6), None, &footprint, [live(7, 2), live(8, 3)])
-            == Plan::Wait);
+        assert!(plan(1, Some(7), None, &footprint, [live(7, 2), live(8, 3)]) == Plan::Pair(3));
+        assert!(plan(1, Some(6), None, &footprint, [live(7, 2), live(8, 3)]) == Plan::Wait);
     }
 
     #[test]
     fn another_owners_same_vm_renders_still_count_toward_capacity() {
         let footprint = footprint(1, 0x1000);
         let live = (1..=PUBLICATION_BARRIERS + 1).map(|slot| Live {
-            owner: 2, sequence: 1, slot: Some(slot as u8), ticket: 0,
-            footprint: &footprint, quarantined: false,
+            owner: 2,
+            sequence: 1,
+            slot: Some(slot as u8),
+            ticket: 0,
+            footprint: &footprint,
+            quarantined: false,
         });
         assert!(plan(1, Some(u64::MAX), None, &footprint, live) == Plan::Wait);
     }
@@ -220,8 +230,12 @@ mod tests {
         first.push_object(0x100, 0, 0x1000);
         second.push_object(0x100, 0, 0x1000);
         let live = Live {
-            owner: 2, sequence: 1, slot: Some(2), ticket: 0,
-            footprint: &second, quarantined: false,
+            owner: 2,
+            sequence: 1,
+            slot: Some(2),
+            ticket: 0,
+            footprint: &second,
+            quarantined: false,
         };
         assert!(plan(1, Some(u64::MAX), None, &first, [live]) == Plan::Wait);
     }

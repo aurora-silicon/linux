@@ -4,9 +4,9 @@
 //! The device mutex protects identities and publication. A preparation gate
 //! lease permits graph construction outside that mutex without session teardown.
 
-mod exit;
 mod dependencies;
 mod direct;
+mod exit;
 mod grow;
 mod observe;
 mod pools;
@@ -17,11 +17,11 @@ mod settle;
 mod submit;
 pub(super) mod teardown;
 
-pub(super) use submit::FALLBACK;
 use super::{DeferredBatch, Registry};
 use crate::g17::{context::Context, fw::queue::DataMaster, job::Packet, kick, queue::render::Pair};
 use crate::hw::t8140::queues::RENDER_SLOTS;
 use kernel::{prelude::*, sync::Arc};
+pub(super) use submit::FALLBACK;
 
 #[derive(Copy, Clone)]
 struct Config {
@@ -335,7 +335,12 @@ impl Registry {
     /// The installed pair in `slot` belongs to `owner` and its context, is
     /// neither borrowed nor settling a failure, and its pool has backing: the
     /// state in which building the pair would do nothing.
-    pub(super) fn render_ready(&self, slot: u8, owner: u64, context: &Arc<Context>) -> Result<bool> {
+    pub(super) fn render_ready(
+        &self,
+        slot: u8,
+        owner: u64,
+        context: &Arc<Context>,
+    ) -> Result<bool> {
         let Ok(entry) = self.render.entry(slot) else {
             return Ok(false);
         };
@@ -426,7 +431,11 @@ impl Registry {
     fn prepare_render_ids(&mut self, slot: u8, owner: u64, optional: bool) -> Result<bool> {
         // A full queue table refuses a sibling without scanning it on every preparation.
         if optional
-            && self.render.entries.get(usize::from(slot)).is_some_and(Option::is_none)
+            && self
+                .render
+                .entries
+                .get(usize::from(slot))
+                .is_some_and(Option::is_none)
             && !self.qids.render_pair_fits()
         {
             return Ok(false);
@@ -563,7 +572,9 @@ impl crate::g17::queue::render::Host for Host<'_> {
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
     ) -> Result<[crate::g17::qos::Publication; 2]> {
-        self.firmware.port.qos_publish_pair(owners, scheduler, policy, super::now_ns())
+        self.firmware
+            .port
+            .qos_publish_pair(owners, scheduler, policy, super::now_ns())
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
         self.firmware.port.qos_cancel(publication)
@@ -668,7 +679,10 @@ impl crate::g17::queue::render::Host for Host<'_> {
         // reusing a registration that went idle, so it is sent at once.
         // The pair retiring here is lent out of its entry meanwhile.
         let linger = queues.render.entries.iter().flatten().any(|entry| {
-            entry.pair.as_ref().is_some_and(|pair| pair.published_in_flight())
+            entry
+                .pair
+                .as_ref()
+                .is_some_and(|pair| pair.published_in_flight())
         });
         let next = queues.render.pools.completed(pool_id, generation, linger)?;
         queues.buffers.can_release(buffer_id)?;
@@ -805,8 +819,12 @@ impl crate::g17::Firmware {
             {
                 let qids = pair.qids();
                 let stamps = [
-                    self.init.stamp(qids[0])?.load(core::sync::atomic::Ordering::Relaxed),
-                    self.init.stamp(qids[1])?.load(core::sync::atomic::Ordering::Relaxed),
+                    self.init
+                        .stamp(qids[0])?
+                        .load(core::sync::atomic::Ordering::Relaxed),
+                    self.init
+                        .stamp(qids[1])?
+                        .load(core::sync::atomic::Ordering::Relaxed),
                 ];
                 core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 pair.note_stamp_wait(stamps, state, crate::g17::now_ns())?;
@@ -1062,13 +1080,10 @@ impl Registry {
     }
     pub(in crate::g17) fn render_needs_rescan(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
-            let active = entry
-                .pair
-                .as_ref()
-                .map_or(
-                    (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
-                    |pair| pair.published_in_flight(),
-                );
+            let active = entry.pair.as_ref().map_or(
+                (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
+                |pair| pair.published_in_flight(),
+            );
             active
                 && (crate::g17::queue::render::completion_noted(
                     entry.reservation.ids.map(kick::Id::qid),
@@ -1157,9 +1172,18 @@ impl Registry {
 
 impl RenderState {
     pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
-        writeln!(f, "firmware_linked_render_graphs kept={} leaked={}", self.kept_graphs.len(),
-                 teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed))?;
+        writeln!(
+            f,
+            "retired_render_bindings used={} total={}",
+            self.retired.len(),
+            self.retired.capacity()
+        )?;
+        writeln!(
+            f,
+            "firmware_linked_render_graphs kept={} leaked={}",
+            self.kept_graphs.len(),
+            teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed)
+        )?;
         self.pools.write_capacity(f)?;
         for (slot, entry) in self.entries.iter().enumerate() {
             if let Some(context) = entry.as_ref().and_then(|entry| entry.context.as_ref()) {
@@ -1175,35 +1199,59 @@ impl Registry {
     /// Keep graph/QID/context ownership; the next use rearms the same pool after
     /// its consumed release, exactly as eviction-driven reclaim does.
     pub(super) fn reclaim_idle_render_pools(
-        &mut self, init: &crate::g17::initdata::InitData, deferred: &mut DeferredBatch,
+        &mut self,
+        init: &crate::g17::initdata::InitData,
+        deferred: &mut DeferredBatch,
     ) -> Result {
         let render = &mut self.render;
         render.pools.observe(init)?;
         for entry in render.entries.iter().flatten() {
-            if !deferred.render_backing_room() { break; }
-            let Some(pool) = entry.pool.as_ref() else { continue; };
+            if !deferred.render_backing_room() {
+                break;
+            }
+            let Some(pool) = entry.pool.as_ref() else {
+                continue;
+            };
             // None means this pool never acquired a firmware registration;
             // otherwise require its exact final release to have been consumed.
-            if pool.vacant() || !render.pools.released(u32::from(pool.id()), pool.control_va())
-                || self.admission.owner_active(entry.reservation.owner) { continue; }
+            if pool.vacant()
+                || !render
+                    .pools
+                    .released(u32::from(pool.id()), pool.control_va())
+                || self.admission.owner_active(entry.reservation.owner)
+            {
+                continue;
+            }
             // A sibling or replacement may be building off-lock before it has
             // installed its pool reference. Its logical owner also excludes us.
             let mut idle = true;
             for other in render.entries.iter().flatten().filter(|other| {
                 other.reservation.owner == entry.reservation.owner
-                    || other.pool.as_ref().is_some_and(|bound| Arc::ptr_eq(bound, pool))
+                    || other
+                        .pool
+                        .as_ref()
+                        .is_some_and(|bound| Arc::ptr_eq(bound, pool))
             }) {
-                if other.constructing || other.growing || other.preparing.is_some()
-                    || other.pending_error.is_some() || other.pending_timeout {
+                if other.constructing
+                    || other.growing
+                    || other.preparing.is_some()
+                    || other.pending_error.is_some()
+                    || other.pending_timeout
+                {
                     idle = false;
                     break;
                 }
                 if let Some(pair) = other.pair.as_ref() {
-                    if !pair.idle_for_context(pair.context())? { idle = false; break; }
+                    if !pair.idle_for_context(pair.context())? {
+                        idle = false;
+                        break;
+                    }
                 }
             }
             if idle {
-                if let Some(backing) = pool.vacate() { deferred.defer_render_backing(backing); }
+                if let Some(backing) = pool.vacate() {
+                    deferred.defer_render_backing(backing);
+                }
             }
         }
         Ok(())

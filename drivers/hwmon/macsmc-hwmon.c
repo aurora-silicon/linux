@@ -49,68 +49,15 @@
 #define FLT_MANT_MASK	GENMASK(22, 0)
 #define FLT_SIGN_MASK	BIT(31)
 
+/*
+ * Fans whose device tree node has apple,fan-manual-control take a target speed
+ * from userspace. This parameter, kept for compatibility, allows it for every
+ * fan with a mode key, whatever the device tree says.
+ */
 static bool fan_control;
 module_param_unsafe(fan_control, bool, 0644);
 MODULE_PARM_DESC(fan_control,
-		 "Override the SMC to set your own fan speeds on supported machines");
-
-/*
- * SoC die temperature keys: temperature channels labelled "SoC die <key>"
- * whose hottest reading is the SoC die thermal zone (see
- * macsmc_hwmon_die_get_temp()). They come from this parameter or, without it,
- * from the machine's entry in macsmc_hwmon_boards[]. Keys the SMC does not
- * have are skipped.
- */
-static char *soc_die_keys;
-module_param(soc_die_keys, charp, 0444);
-MODULE_PARM_DESC(soc_die_keys,
-		 "Comma-separated SMC temperature keys whose hottest reading is the SoC die thermal zone, \"none\" for no zone (default: the machine's list)");
-
-/*
- * Keys a machine's device tree does not list yet. The device tree comes from
- * the boot loader, so these let a kernel use keys before its device tree
- * catches up. board_keys=0 turns them off: the device tree alone then decides
- * (soc_die_keys still applies).
- */
-static bool board_keys = true;
-module_param(board_keys, bool, 0444);
-MODULE_PARM_DESC(board_keys,
-		 "Use the built-in per-machine SoC die and thermal pressure keys the device tree does not list (default: on)");
-
-static const struct macsmc_hwmon_board {
-	const char *compatible;
-	const char *die_keys;
-	const char *pressure_key;
-} macsmc_hwmon_boards[] = {
-	/*
-	 * MacBook Pro (16-inch, M3 Pro): key names used for the CPU
-	 * performance-core and GPU die sensors of M3-family machines. They
-	 * are not confirmed on this machine: the debugfs key list shows which
-	 * temperature keys it has.
-	 */
-	{
-		.compatible = "apple,j516s",
-		.die_keys = "Tf04,Tf09,Tf0A,Tf0B,Tf0D,Tf0E,Tf14,Tf18,Tf19,Tf1A,Tf24,Tf25,Tf2A,Tf2B",
-		.pressure_key = "mTPL",
-	},
-	/*
-	 * MacBook Pro (14-inch and 16-inch, M3 Max): the same key family in
-	 * five groups. On a J516C every one of these keys read a die
-	 * temperature (47-62 C at idle); the keys ending in D and E repeated
-	 * the one ending in 4 and are left out. The J514C list is assumed to
-	 * be the same; keys the SMC does not have are skipped.
-	 */
-	{
-		.compatible = "apple,j516c",
-		.die_keys = "Tf04,Tf06,Tf09,Tf0A,Tf0B,Tf14,Tf16,Tf19,Tf1A,Tf1B,Tf24,Tf26,Tf29,Tf2A,Tf2B,"
-			    "Tf34,Tf36,Tf39,Tf3A,Tf3B,Tf44,Tf46,Tf49,Tf4A,Tf4B",
-	},
-	{
-		.compatible = "apple,j514c",
-		.die_keys = "Tf04,Tf06,Tf09,Tf0A,Tf0B,Tf14,Tf16,Tf19,Tf1A,Tf1B,Tf24,Tf26,Tf29,Tf2A,Tf2B,"
-			    "Tf34,Tf36,Tf39,Tf3A,Tf3B,Tf44,Tf46,Tf49,Tf4A,Tf4B",
-	},
-};
+		 "Allow manual fan speeds on every fan with a mode key, also where the device tree does not (default: the device tree decides)");
 
 static bool macsmc_hwmon_is_m3(void)
 {
@@ -119,52 +66,6 @@ static bool macsmc_hwmon_is_m3(void)
 	       of_machine_is_compatible("apple,t6032") ||
 	       of_machine_is_compatible("apple,t6034") ||
 	       of_machine_is_compatible("apple,t8122");
-}
-
-static const struct macsmc_hwmon_board *macsmc_hwmon_board(void)
-{
-	unsigned int i;
-
-	if (!board_keys)
-		return NULL;
-	for (i = 0; i < ARRAY_SIZE(macsmc_hwmon_boards); i++)
-		if (of_machine_is_compatible(macsmc_hwmon_boards[i].compatible))
-			return &macsmc_hwmon_boards[i];
-	return NULL;
-}
-
-/* The list of SoC die temperature keys, or NULL for none. */
-static const char *macsmc_hwmon_die_key_list(void)
-{
-	const struct macsmc_hwmon_board *board;
-
-	if (!macsmc_hwmon_is_m3())
-		return NULL;
-	if (soc_die_keys)
-		return strcmp(soc_die_keys, "none") ? soc_die_keys : NULL;
-	board = macsmc_hwmon_board();
-	return board ? board->die_keys : NULL;
-}
-
-/*
- * The next key of a comma-separated list: returns 1 and the key, 0 at the end
- * of the list, or -EINVAL for an entry that is not four characters long.
- */
-static int macsmc_hwmon_next_key(const char **list, char key[5])
-{
-	const char *p = *list, *end;
-
-	while (*p == ',' || *p == ' ')
-		p++;
-	if (!*p)
-		return 0;
-	end = strchrnul(p, ',');
-	*list = end;
-	if (end - p != 4)
-		return -EINVAL;
-	memcpy(key, p, 4);
-	key[4] = '\0';
-	return 1;
 }
 
 struct macsmc_hwmon_sensor {
@@ -185,6 +86,8 @@ struct macsmc_hwmon_fan {
 	char label[MAX_LABEL_LENGTH];
 	u32 attrs;
 	bool manual;
+	/* The device tree allows a manual speed from userspace. */
+	bool manual_control;
 	/* Index of the fan node among the fan-* nodes: its cooling device id. */
 	u32 index;
 	struct macsmc_hwmon *hwmon;
@@ -689,12 +592,18 @@ static int macsmc_hwmon_fan_apply(struct macsmc_hwmon *hwmon,
 	return 0;
 }
 
+/* Whether userspace may set this fan's speed. */
+static bool macsmc_hwmon_fan_user_control(const struct macsmc_hwmon_fan *fan)
+{
+	return fan->mode.macsmc_key && (fan->manual_control || fan_control);
+}
+
 static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long val)
 {
 	struct macsmc_hwmon_fan *fan = &hwmon->fan.fans[channel];
 	int ret;
 
-	if (!fan_control || fan->mode.macsmc_key == 0)
+	if (!macsmc_hwmon_fan_user_control(fan))
 		return -EOPNOTSUPP;
 	if (val < 0)
 		return -EINVAL;
@@ -899,7 +808,7 @@ static umode_t macsmc_hwmon_fan_is_visible(const struct macsmc_hwmon_fan *fan,
 					   u32 attr)
 {
 	if (fan->attrs & BIT(attr)) {
-		if (attr == hwmon_fan_target && fan_control && fan->mode.macsmc_key)
+		if (attr == hwmon_fan_target && macsmc_hwmon_fan_user_control(fan))
 			return 0644;
 
 		return 0444;
@@ -1055,15 +964,10 @@ static int macsmc_hwmon_create_pressure(struct macsmc_hwmon *hwmon,
 
 	ret = of_property_read_string(hwmon_node, "apple,thermal-pressure-key",
 				      &key);
-	if (ret == -EINVAL) {
-		const struct macsmc_hwmon_board *board = macsmc_hwmon_board();
-
-		if (!board || !board->pressure_key)
-			return 0;
-		key = board->pressure_key;
-	} else if (ret) {
+	if (ret == -EINVAL)
+		return 0;
+	if (ret)
 		return ret;
-	}
 
 	ret = macsmc_hwmon_parse_key(hwmon->dev, hwmon->smc, &pressure, key);
 	if (ret)
@@ -1237,6 +1141,14 @@ static int macsmc_hwmon_create_fan(struct device *dev, struct apple_smc *smc,
 			return ret;
 	}
 
+	if (of_property_read_bool(fan_node, "apple,fan-manual-control")) {
+		if (fan->mode.macsmc_key && (fan->attrs & HWMON_F_TARGET))
+			fan->manual_control = true;
+		else
+			dev_warn(dev, "%s: apple,fan-manual-control needs apple,fan-target and apple,fan-mode\n",
+				 fan->label);
+	}
+
 	/* Initialise fan control mode to automatic */
 	fan->manual = false;
 
@@ -1249,10 +1161,15 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 	struct device_node *key_node __maybe_unused;
 	struct macsmc_hwmon_sensor *sensor;
 	u32 n_current = 0, n_fan = 0, n_power = 0, n_temperature = 0, n_voltage = 0;
-	const char *die_keys = macsmc_hwmon_die_key_list(), *list;
-	char key[5];
+	const char *key;
 	bool indexed;
-	int ret;
+	int n_die_keys, i, ret;
+
+	n_die_keys = of_property_count_strings(hwmon_node, "apple,soc-die-keys");
+	if (n_die_keys == -EINVAL)
+		n_die_keys = 0;
+	else if (n_die_keys < 0)
+		return n_die_keys;
 
 	for_each_child_of_node_with_prefix(hwmon_node, key_node, "current-") {
 		n_current++;
@@ -1324,8 +1241,7 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 	for_each_child_of_node_with_prefix(hwmon_node, key_node, "temperature-") {
 		n_temperature++;
 	}
-	for (list = die_keys; list && (ret = macsmc_hwmon_next_key(&list, key));)
-		n_temperature++;
+	n_temperature += n_die_keys;
 
 	if (n_temperature) {
 		hwmon->temp.sensors = devm_kcalloc(hwmon->dev, n_temperature,
@@ -1351,10 +1267,13 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 			macsmc_hwmon_add_temp_channel(&hwmon->temp, ret);
 		}
 
-		for (list = die_keys; list && (ret = macsmc_hwmon_next_key(&list, key));) {
-			if (ret < 0) {
-				dev_warn(hwmon->dev, "ignoring an entry of the SoC die key list \"%s\"\n",
-					 die_keys);
+		for (i = 0; i < n_die_keys; i++) {
+			ret = of_property_read_string_index(hwmon_node, "apple,soc-die-keys",
+							    i, &key);
+			if (ret)
+				return ret;
+			if (strlen(key) != 4) {
+				dev_warn(hwmon->dev, "Ignoring invalid SoC die key %s\n", key);
 				continue;
 			}
 			hwmon->die_listed++;
@@ -1692,11 +1611,9 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	if (macsmc_hwmon_is_m3()) {
-		ret = macsmc_hwmon_create_pressure(hwmon, hwmon->dev->of_node);
-		if (ret)
-			return ret;
-	}
+	ret = macsmc_hwmon_create_pressure(hwmon, hwmon->dev->of_node);
+	if (ret)
+		return ret;
 
 	ret = macsmc_hwmon_discover_temperatures(hwmon);
 	if (ret)
@@ -1736,17 +1653,17 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 	hwmon->hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
 								"macsmc_hwmon", hwmon,
 								&hwmon->chip_info,
-								macsmc_hwmon_is_m3() ? macsmc_hwmon_extra_groups : NULL);
+								macsmc_hwmon_extra_groups);
 	if (IS_ERR(hwmon->hwmon_dev))
 		return dev_err_probe(hwmon->dev, PTR_ERR(hwmon->hwmon_dev),
 				     "Probing SMC hwmon device failed\n");
 
-	if (macsmc_hwmon_is_m3()) {
+	if (macsmc_hwmon_is_m3())
 		macsmc_hwmon_debugfs_init(hwmon);
-		ret = macsmc_hwmon_die_register(hwmon);
-		if (ret)
-			return ret;
-	}
+
+	ret = macsmc_hwmon_die_register(hwmon);
+	if (ret)
+		return ret;
 
 	/*
 	 * Released before the restore action above, which stops the cooling

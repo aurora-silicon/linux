@@ -210,7 +210,6 @@ impl platform::Driver for Driver<'_> {
             },
         })
     }
-
 }
 
 /// Firmware starts only after every fallible module/driver registration has succeeded.
@@ -644,9 +643,10 @@ impl gpu::Gpu for Gpu {
         _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn crate::queue::Queue>> {
         Ok(KBox::new(
-            queue::Queue::new(self, vm, priority, usc_exec_base)?,
+            queue::Queue::new(self, vm, priority, usc_exec_base, usage)?,
             GFP_KERNEL,
         )?)
     }
