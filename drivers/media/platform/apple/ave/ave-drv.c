@@ -170,6 +170,7 @@ static int ave_runtime_resume(struct device *dev)
 static int ave_suspend(struct device *dev)
 {
 	struct ave_dev *ave = dev_get_drvdata(dev);
+	int ret;
 
 	/* Let a running job finish; the m2m core holds back new ones. */
 	v4l2_m2m_suspend(ave->m2m_dev);
@@ -181,10 +182,18 @@ static int ave_suspend(struct device *dev)
 	 */
 	mutex_lock(&ave->hw_lock);
 	ave_v4l2_suspend(ave);
-	if (ave_fw_shutdown(ave))
-		dev_warn(dev, "firmware not answering, it cannot be stopped for sleep\n");
+	ret = ave_fw_shutdown(ave);
 	mutex_unlock(&ave->hw_lock);
-	return 0;
+	if (ret) {
+		/*
+		 * genpd may gate the encoder and its DARTs after this callback.
+		 * A stuck firmware may still DMA, so abort before that happens.
+		 * PM does not resume a device whose suspend callback failed.
+		 */
+		dev_err(dev, "firmware cannot be stopped for sleep: %d\n", ret);
+		v4l2_m2m_resume(ave->m2m_dev);
+	}
+	return ret;
 }
 
 static int ave_resume(struct device *dev)
