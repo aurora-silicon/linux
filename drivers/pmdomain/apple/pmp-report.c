@@ -32,6 +32,7 @@
 #include <linux/workqueue.h>
 
 #include "pmp-report-validation.h"
+#include "pmp-dram.h"
 
 #define PMP_REPORT_READY 0x1
 
@@ -81,6 +82,7 @@ struct apple_pmp_start;
 
 struct apple_pmp_report {
 	struct device *dev;
+	struct apple_pmp_dram dram;
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
 	/* Protects the request word, @shadow, @known and @defer. */
@@ -104,6 +106,43 @@ static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
 
 	return rep->offsets->running_any ? status : status & PMP_REPORT_READY;
 }
+
+static ssize_t type_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", rep->dram.type);
+}
+static DEVICE_ATTR_RO(type);
+
+#define APPLE_PMP_DRAM_ATTR(_name, _field, _format) \
+static ssize_t _name##_show(struct device *dev, struct device_attribute *attr, char *buf) \
+{ \
+	struct apple_pmp_report *rep = dev_get_drvdata(dev); \
+	return sysfs_emit(buf, _format "\n", rep->dram._field); \
+} \
+static DEVICE_ATTR_RO(_name)
+
+APPLE_PMP_DRAM_ATTR(data_bus_width, width, "%u");
+APPLE_PMP_DRAM_ATTR(state_count, state_count, "%u");
+APPLE_PMP_DRAM_ATTR(max_data_rate, max_rate, "%llu");
+APPLE_PMP_DRAM_ATTR(peak_bandwidth, peak_bandwidth, "%llu");
+APPLE_PMP_DRAM_ATTR(bandwidth_class, bandwidth_class, "%llu");
+
+static struct attribute *apple_pmp_dram_attrs[] = {
+	&dev_attr_type.attr,
+	&dev_attr_data_bus_width.attr,
+	&dev_attr_state_count.attr,
+	&dev_attr_max_data_rate.attr,
+	&dev_attr_peak_bandwidth.attr,
+	&dev_attr_bandwidth_class.attr,
+	NULL,
+};
+
+static const struct attribute_group apple_pmp_dram_group = {
+	.name = "dram",
+	.attrs = apple_pmp_dram_attrs,
+};
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
 
@@ -1146,6 +1185,15 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	rep->defer = rep->offsets->defer_requests;
 	INIT_DELAYED_WORK(&rep->ready_work, apple_pmp_report_ready_work);
 	platform_set_drvdata(pdev, rep);
+
+	ret = apple_pmp_dram_parse(dev_fwnode(dev), &rep->dram);
+	if (ret && ret != -ENODATA)
+		return dev_err_probe(dev, ret, "invalid DRAM description\n");
+	if (!ret) {
+		ret = devm_device_add_group(dev, &apple_pmp_dram_group);
+		if (ret)
+			return ret;
+	}
 
 	INIT_LIST_HEAD(&rep->list);
 	ret = devm_add_action_or_reset(dev, apple_pmp_report_release, rep);
