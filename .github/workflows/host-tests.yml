@@ -50,19 +50,23 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+          # Tests that would pick their own rustup toolchain use this one.
+          echo "HOSTRUSTC=rustc" >> "$GITHUB_ENV"
           need=
           for p in clang-$CLANG_VERSION gcc-$GCC_VERSION flex bison bc; do
             command -v "$p" >/dev/null || need="$need $p"
           done
+          command -v "ld.lld-$CLANG_VERSION" >/dev/null || need="$need lld-$CLANG_VERSION"
           dpkg -s "libclang-rt-$CLANG_VERSION-dev" >/dev/null 2>&1 || need="$need libclang-rt-$CLANG_VERSION-dev"
           if [ -n "$need" ]; then
             sudo apt-get update -q
             sudo apt-get install -y -q $need
           fi
-          # The tests call clang, cc, gcc and rustc by name.
+          # The tests call clang, ld.lld, cc and gcc by name.
           bin="$RUNNER_TEMP/toolchain"
           mkdir -p "$bin"
           ln -sf "$(command -v clang-$CLANG_VERSION)" "$bin/clang"
+          ln -sf "$(command -v ld.lld-$CLANG_VERSION)" "$bin/ld.lld"
           ln -sf "$(command -v gcc-$GCC_VERSION)" "$bin/gcc"
           ln -sf "$(command -v gcc-$GCC_VERSION)" "$bin/cc"
           echo "$bin" >> "$GITHUB_PATH"
@@ -72,6 +76,7 @@ jobs:
           python3 --version
           rustc --version
           clang --version | head -1
+          ld.lld --version
           cc --version | head -1
           git --version
 
