@@ -6,7 +6,7 @@ if not __debug__:
 
 import argparse,hashlib,json,subprocess,tarfile,urllib.request,shutil,os,sys
 from pathlib import Path
-P=Path(__file__).resolve().parent;ap=argparse.ArgumentParser();ap.add_argument('--output-dir',required=True,type=Path);ap.add_argument('--archive',type=Path);ap.add_argument('--jobs',type=int,default=2);a=ap.parse_args();assert 1<=a.jobs<=2
+P=Path(__file__).resolve().parent;ap=argparse.ArgumentParser();ap.add_argument('--output-dir',default=P/'build',type=Path);ap.add_argument('--archive',type=Path);ap.add_argument('--jobs',type=int,default=2);a=ap.parse_args();assert 1<=a.jobs<=2
 O=a.output_dir.resolve();assert not O.exists(),'refusing to overwrite an existing source or tool';O.mkdir(parents=True)
 m=json.loads((P/'sources.json').read_text());sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest();archive=O/'source.tar.gz'
 if a.archive:shutil.copyfile(a.archive,archive)
@@ -22,4 +22,7 @@ for f,h in m['patched_files'].items():assert sha(S/f)==h,f
 cmd=['cargo','build','--locked','--release','-p','bindgen-cli','-j'+str(a.jobs)]
 with (O/'build.log').open('w') as log:subprocess.run(cmd,cwd=S,stdout=log,stderr=subprocess.STDOUT,check=True)
 binary=S/'target/release/bindgen';subprocess.run([sys.executable,str(P/'test.py'),'--bindgen',str(binary),'--output-dir',str(O/'tests')],check=True)
-r={'status':'BUILT_AND_COMPILE_TESTED','binary':str(binary),'binary_sha256':sha(binary),'source_manifest_sha256':sha(P/'sources.json'),'build_command':cmd,'rustc_version':subprocess.check_output(['rustc','-vV'],text=True),'cargo_version':subprocess.check_output(['cargo','-vV'],text=True),'tests_manifest_sha256':sha(O/'tests/result.json'),'installed_globally':False};(O/'result.json').write_text(json.dumps(r,indent=2)+'\n');print(json.dumps(r,indent=2));print('Use make BINDGEN='+str(binary)+' BINDGEN_LAYOUT_TESTS=1 ... to build the kernel with layout assertions.')
+r={'status':'BUILT_AND_COMPILE_TESTED','binary':str(binary),'binary_sha256':sha(binary),'source_manifest_sha256':sha(P/'sources.json'),'build_command':cmd,'rustc_version':subprocess.check_output(['rustc','-vV'],text=True),'cargo_version':subprocess.check_output(['cargo','-vV'],text=True),'tests_manifest_sha256':sha(O/'tests/result.json'),'installed_globally':False};(O/'result.json').write_text(json.dumps(r,indent=2)+'\n')
+# Publish the stable entry point only after every compile-only check passed.
+(O/'bin').mkdir();(O/'bin/bindgen').symlink_to(binary.relative_to(O/'bin',walk_up=True))
+print(json.dumps(r,indent=2));print('Prepared '+str(O/'bin/bindgen')+'. The default output is selected automatically by Kbuild.')

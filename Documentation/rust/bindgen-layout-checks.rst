@@ -3,22 +3,21 @@
 Checking generated binding layouts
 ==================================
 
-bindgen can emit compile-time assertions that compare the size, alignment and
-field offsets of every generated Rust type with the values Clang computes for
-the C type. As upstream, the kernel build passes ``--no-layout-tests`` to
-bindgen, so the generated bindings do not contain these assertions and any
-supported bindgen version can build the kernel.
+Every Rust build retains bindgen's unconditional compile-time assertions for
+size, alignment and field offsets. A mismatch stops the bindings crate build
+with an ``E0080`` error naming the C type and property. These assertions are
+required even when KUnit is disabled; ``BINDGEN_LAYOUT_TESTS=0`` cannot disable
+them. Build the complete Image and all modules with the same generator.
 
-To check the layouts of a configuration, build with ``BINDGEN_LAYOUT_TESTS=1``::
-
-    make LLVM=1 BINDGEN_LAYOUT_TESTS=1 prepare
-
-The bindings are then generated with the assertions, which are checked while
-the ``bindings`` and ``uapi`` crates are compiled; nothing is executed. A
-mismatch stops the build with an ``E0080`` error naming the type and the
-property (``Size of``, ``Alignment of`` or ``Offset of``). Changing the
-variable regenerates the bindings. The check covers only the configuration
-being built.
+A successful C build does not validate Rust field offsets. In particular,
+``CONFIG_SCHEDSTATS=n`` leaves a zero-sized, cacheline-aligned
+``sched_statistics`` in ``task_struct``. Stock bindgen 0.73.2 loses its alignment
+and can shift subsequent fields, including ``mm``. The ARM64 defconfig +
+Asahi configuration exposed a 40-byte difference: Rust read a scheduler list
+pointer as the current mm and Asahi's RSS charge faulted in
+``percpu_counter_add_batch``. The C RSS helpers and allocator agreed on the
+counter layout; the pointer supplied to them was wrong. Enabling SCHEDSTATS
+only masks the generator defect and is not a requirement of the driver.
 
 Known generator limitations
 ---------------------------
@@ -37,26 +36,27 @@ Unmodified bindgen 0.73 does not reproduce every C layout used by the kernel:
 * It can drop the explicit alignment of a defined zero-sized C struct, such
   as ``struct empty {} __attribute__((aligned(64)));``.
 
-With the assertions enabled and stock bindgen 0.73.2, an arm64 Apple
-silicon configuration of this tree fails on the size of ``ns_common`` and of
-the namespace structures that embed it; bindgen 0.73.1 also fails on
-``task_struct``, ``zone`` and ``pglist_data``. In those builds every offset
-and alignment assertion passes: bindgen pads each field to the offset Clang
-reports, so only the end of the Rust type is short. Rust code that reaches
-such a type through a pointer and reads its fields gets the right data, but
-must not rely on ``size_of`` for it, copy it by value or index an array of
-it. The affected types depend on the bindgen version and the configuration,
-which is what the check is for.
+The earlier Fedora configuration exposed only trailing size differences for
+some namespace types. That observation does not extend to defconfig: an
+aligned empty member can also shift field offsets. Neither size nor offset
+mismatches are safe to ignore. The affected types depend on the generator
+version and the resolved kernel configuration, so validate each build.
 
 Corrected generator
 -------------------
 
 ``tools/aurora-bindgen/`` contains pinned patches for bindgen 0.73.2 that
-repair both cases, a private build recipe and compile-only tests; see
-``tools/aurora-bindgen/README.rst``. It installs nothing system-wide. To check
-the layouts with it::
+repair both cases, a local build recipe and compile-only tests; see
+``tools/aurora-bindgen/README.rst``. Prepare it once before configuration::
 
-    make LLVM=1 BINDGEN=/path/to/bindgen BINDGEN_LAYOUT_TESTS=1 ...
+    python3 tools/aurora-bindgen/build.py
+    make LLVM=1 ...
+
+The top-level Makefile automatically selects
+``tools/aurora-bindgen/build/bin/bindgen`` from the source tree, also for ``O=``
+builds. Packagers prepare this entry point in their build roots. Make does not
+fetch tools or install anything system-wide. If the entry point is absent,
+Kbuild uses ``bindgen`` from PATH and the same mandatory assertions apply.
 
 The generated bindings are consumed by the Rust kernel crate and by several
 drivers. After changing the bindings generator, rebuild the kernel Image and
@@ -64,5 +64,12 @@ all modules together.
 
 The assertions need bindgen 0.71.1 or later (the kernel minimum) together with
 the configured ``--rust-target 1.85``: that selects unconditional constant
-assertions rather than ``#[test]`` functions, so a build with
-``BINDGEN_LAYOUT_TESTS=1`` checks them without a Rust test configuration.
+assertions rather than ``#[test]`` functions. They are checked without a
+Rust test configuration.
+
+Check the recorded bindings command, not just the toolchain version banner.
+Command-line overrides remain available for generator regression tests.
+The defect can affect any generated aligned empty record and containing types
+under other configurations; all emitted size/alignment/offset checks remain
+mandatory. They do not cover C-only types or opaque internal fields. See the
+generator README for the upstream status and related empty-struct issues.
