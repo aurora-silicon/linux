@@ -175,6 +175,24 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	return 0;
 }
 
+/*
+ * The firmware writes past the sizes it is given. The first 1080p run
+ * wrote 0x7800..0x8a00 bytes (and maybe more; DART faults are rate
+ * limited) beyond the end of the first +0x390 buffer, so the sizes stay as
+ * macOS reports them but the mappings get room behind them: that group is
+ * mapped at 1.5 times its size, every other working buffer with an eighth
+ * (at least 64 KiB) more.
+ */
+static size_t ave_pad(size_t size)
+{
+	return size + max_t(size_t, SZ_64K, ALIGN(size / 8, SZ_16K));
+}
+
+static int ave_work_buf(struct ave_dev *ave, struct ave_buf *b, size_t size)
+{
+	return ave_alloc_padded(ave, b, size, ave_pad(size), DMA_ATTR_NO_KERNEL_MAPPING);
+}
+
 /* Working buffer sizes, all from the requested picture size. */
 static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 {
@@ -193,34 +211,39 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
 
-	ret |= ave_alloc(ave, &sess->hdr, AVE_HDR_BYTES, nomap);
+	ret |= ave_work_buf(ave, &sess->hdr, AVE_HDR_BYTES);
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ret |= ave_alloc(ave, &sess->ref_a[i], ref_a, nomap);
-		ret |= ave_alloc(ave, &sess->ref_b[i], ref_b, nomap);
-		ret |= ave_alloc(ave, &sess->ref_c[i], ref_c, nomap);
-		ret |= ave_alloc(ave, &sess->ref_d[i], ref_d, nomap);
+		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a,
+					max(ref_a * 3 / 2, ave_pad(ref_a)), nomap);
+		ret |= ave_work_buf(ave, &sess->ref_b[i], ref_b);
+		ret |= ave_work_buf(ave, &sess->ref_c[i], ref_c);
+		ret |= ave_work_buf(ave, &sess->ref_d[i], ref_d);
 	}
-	ret |= ave_alloc(ave, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), nomap);
-	ret |= ave_alloc(ave, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), nomap);
-	ret |= ave_alloc(ave, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), nomap);
-	ret |= ave_alloc(ave, &sess->fixed, SZ_16K, nomap);
+	ret |= ave_work_buf(ave, &sess->mb, ALIGN(82 * p->mbs, SZ_16K));
+	ret |= ave_work_buf(ave, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K));
+	ret |= ave_work_buf(ave, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K));
+	ret |= ave_work_buf(ave, &sess->fixed, SZ_16K);
 	for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
-		ret |= ave_alloc(ave, &sess->tile[i], tile, nomap);
-		ret |= ave_alloc(ave, &sess->tile_aux[i], ALIGN(h, 128), nomap);
+		ret |= ave_work_buf(ave, &sess->tile[i], tile);
+		ret |= ave_work_buf(ave, &sess->tile_aux[i], ALIGN(h, 128));
 	}
 	if (hevc)
 		for (unsigned int i = 0; i < 2; i++)
-			ret |= ave_alloc(ave, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), nomap);
+			ret |= ave_work_buf(ave, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K));
 
 	/* Per-slot output; the size of the H.264 frame buffer is not known. */
 	frame_buf = ALIGN(DIV_ROUND_UP_ULL((u64)AVE_H264_FRAME_BUF_1080P * p->mbs, AVE_MBS_1080P),
 			  SZ_16K);
 	frame_buf = max_t(size_t, frame_buf, AVE_H264_FRAME_BUF_1080P);
 	for (unsigned int s = 0; s < p->slots; s++) {
-		ret |= ave_alloc(ave, &sess->slot[s].coded, p->coded_cap, 0);
-		ret |= ave_alloc(ave, &sess->slot[s].meta, AVE_META_BYTES, 0);
-		ret |= ave_alloc(ave, &sess->slot[s].aux, hevc ? AVE_SHDR_BYTES : frame_buf,
-				 hevc ? 0 : nomap);
+		ret |= ave_alloc_padded(ave, &sess->slot[s].coded, p->coded_cap,
+					ave_pad(p->coded_cap), 0);
+		ret |= ave_alloc_padded(ave, &sess->slot[s].meta, AVE_META_BYTES,
+					ave_pad(AVE_META_BYTES), 0);
+		if (hevc)
+			ret |= ave_alloc(ave, &sess->slot[s].aux, AVE_SHDR_BYTES, 0);
+		else
+			ret |= ave_work_buf(ave, &sess->slot[s].aux, frame_buf);
 	}
 	return ret ? -ENOMEM : 0;
 }
@@ -255,7 +278,8 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 static void ave_log_buf(struct ave_dev *ave, const char *name, int i, const struct ave_buf *b)
 {
 	if (b->cpu)
-		dev_dbg(ave->dev, "buf %s%d %pad +%#zx\n", name, i, &b->dma, b->size);
+		dev_dbg(ave->dev, "buf %s%d %pad +%#zx (mapped %#zx)\n", name, i, &b->dma,
+			b->size, b->alloc);
 }
 
 static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
@@ -550,7 +574,7 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
  */
 static bool ave_buf_has(const struct ave_buf *b, u64 addr)
 {
-	return b->cpu && addr >= b->dma && addr < b->dma + PAGE_ALIGN(b->size);
+	return b->cpu && addr >= b->dma && addr < b->dma + b->alloc;
 }
 
 static bool ave_sess_owns(struct ave_session *sess, u64 addr)
@@ -596,6 +620,9 @@ void ave_sess_check_addrs(struct ave_ctx *ctx, const u8 *cmd, size_t len, unsign
 			continue;
 		if (ave_sess_owns(sess, v) || (input && v >= input && v < input + SZ_32M) ||
 		    (v >= ave->ipc.dma && v < ave->ipc.dma + ave->ipc.size))
+			continue;
+		/* Pointers into the firmware image are the same as on macOS. */
+		if (v >= ave->text.iova && v < ave->data.iova + ave->data.size)
 			continue;
 		if (bad++ < 16)
 			dev_warn(ave->dev, "%s +%#zx holds %#llx, not a buffer of this session\n",

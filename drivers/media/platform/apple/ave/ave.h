@@ -62,7 +62,8 @@ enum ave_codec {
 struct ave_buf {
 	void *cpu;
 	dma_addr_t dma;
-	size_t size;
+	size_t size;			/* what the firmware is told */
+	size_t alloc;			/* what is mapped, page rounded */
 	unsigned long attrs;
 };
 
@@ -255,6 +256,8 @@ int ave_fw_shutdown(struct ave_dev *ave);
 void ave_fw_lost(struct ave_dev *ave);
 int ave_fw_templates(struct ave_dev *ave, enum ave_codec codec);
 int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long attrs);
+int ave_alloc_padded(struct ave_dev *ave, struct ave_buf *b, size_t size, size_t alloc,
+		     unsigned long attrs);
 void ave_free(struct ave_dev *ave, struct ave_buf *b);
 
 /* ave-ipc.c */

@@ -146,6 +146,7 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 		return -EPROTO;
 	if (!ave->heap.cpu) {
 		ave->heap.size = PAGE_ALIGN(hello[3]);
+		ave->heap.alloc = ave->heap.size;
 		ave->heap.cpu = dma_alloc_coherent(ave->dev, ave->heap.size,
 						   &ave->heap.dma, GFP_KERNEL);
 		if (!ave->heap.cpu)

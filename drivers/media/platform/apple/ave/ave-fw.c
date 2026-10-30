@@ -177,21 +177,23 @@ static void ave_fw_restore_data(struct ave_dev *ave)
 void ave_free(struct ave_dev *ave, struct ave_buf *b)
 {
 	if (b->cpu)
-		dma_free_attrs(ave->dev, PAGE_ALIGN(b->size), b->cpu, b->dma, b->attrs);
+		dma_free_attrs(ave->dev, b->alloc, b->cpu, b->dma, b->attrs);
 	b->cpu = NULL;
 }
 
 /*
  * Firmware-visible memory, zeroed and 16 KiB aligned in the encoder's DART.
- * @size is what the firmware is told; the allocation is page rounded.
+ * @size is what the firmware is told; @alloc (at least @size) is mapped.
  */
-int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long attrs)
+int ave_alloc_padded(struct ave_dev *ave, struct ave_buf *b, size_t size, size_t alloc,
+		     unsigned long attrs)
 {
 	if (b->cpu)
 		return 0;
 	b->size = size;
+	b->alloc = PAGE_ALIGN(max(size, alloc));
 	b->attrs = attrs;
-	b->cpu = dma_alloc_attrs(ave->dev, PAGE_ALIGN(size), &b->dma, GFP_KERNEL, attrs);
+	b->cpu = dma_alloc_attrs(ave->dev, b->alloc, &b->dma, GFP_KERNEL, attrs);
 	if (!b->cpu)
 		return -ENOMEM;
 	if (!IS_ALIGNED(b->dma, SZ_16K)) {
@@ -199,6 +201,11 @@ int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long
 		return -EINVAL;
 	}
 	return 0;
+}
+
+int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long attrs)
+{
+	return ave_alloc_padded(ave, b, size, size, attrs);
 }
 
 /*
