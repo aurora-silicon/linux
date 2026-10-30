@@ -672,3 +672,35 @@ Limitations
   are described under Station security.
 * SCO/headset microphone, LE Audio/ISO and simultaneous headset audio are
   unqualified.
+
+Station power cache and coexistence
+----------------------------------
+
+Each join submits CID05 awake before EA/40. That pre-join submission is
+not the power policy of the subsequent associated firmware session. The
+host invalidates its applied-mode cache after pre-join initialization so
+that the existing post-association worker submits the desired policy,
+including awake when station power save is disabled. Successful repeated
+requests within that association still coalesce. Sleep remains gated by
+TIM discovery and the normal RF, peer and termination checks. A successful
+submission is not firmware readback or a measured coexistence improvement.
+
+The association builder retains its twenty-beacon listen interval on all
+bands. The earlier proposal to reduce it to one on every 2.4 GHz association
+is omitted: there is no BT activity notification connecting these drivers,
+and a band-only policy would also affect BT-off associations. Twenty to one
+permits twenty times as many listen opportunities, or nineteen additional
+opportunities per twenty beacons. At a 100 TU beacon interval (102.4 ms),
+the advertised span would fall from 2048 ms to 102.4 ms. These values do not
+quantify radio wake duty cycle, milliwatts or battery life; those depend on
+firmware, TIM/DTIM and actual traffic. No new module parameter, guessed PTA
+command or Bluetooth link-policy override is introduced.
+
+Qualify with paired control/fix boots, BT off/on on 2.4 GHz, local wired
+iperf3 in each direction and ten-minute gateway pings. Interleave off/on/off
+and on/off/on blocks to expose drift in a busy channel. Compare each
+module's BT-on penalty against its adjacent BT-off cells, retaining loss
+and tail latency separately. Include a 5 GHz control, functioning BT HID,
+and a twenty-second rtc1 suspend/resume followed by a fresh association.
+Keep failed cells and independent rollback evidence; host tests alone do
+not establish latency, throughput or Bluetooth functionality.
