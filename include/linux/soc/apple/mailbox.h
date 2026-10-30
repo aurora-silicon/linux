@@ -87,8 +87,8 @@ struct apple_mbox {
 
 	/*
 	 * Protected by tx_lock: set while irq_send_empty is unmasked, so that
-	 * the IRQ handler, a failed send and provider removal mask it exactly
-	 * once between them.
+	 * the IRQ handler and provider removal mask it exactly once between
+	 * them.
 	 */
 	bool tx_irq_unmasked;
 };
