@@ -1698,7 +1698,11 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		if (!dchid->ring)
 			return -ENOMEM;
 	}
-	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", 0);
+	/*
+	 * Freezable, so that no HID device is added or dropped between the
+	 * system sleep callbacks: the resume callback walks them.
+	 */
+	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", WQ_FREEZABLE);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 
@@ -1763,8 +1767,20 @@ static int dockchannel_hid_suspend(struct device *dev)
 static int dockchannel_hid_resume(struct device *dev)
 {
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	int i;
 
 	WRITE_ONCE(dchid->suspended, false);
+
+	/*
+	 * The coprocessor ran through the sleep, so the HID drivers get a
+	 * resume, not a reset_resume. Requests work again from here on.
+	 */
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (iface && iface->hid)
+			hid_driver_resume(iface->hid);
+	}
 	return 0;
 }
 
