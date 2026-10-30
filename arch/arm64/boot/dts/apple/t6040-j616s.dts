@@ -9,10 +9,21 @@
 
 /dts-v1/;
 
-#include "t6040.dtsi"
+#include "t604x.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/thermal/thermal.h>
+
+/delete-node/ &cpu_p05;
+/delete-node/ &cpu_p15;
+
+&{/cpus/cpu-map/cluster1} {
+	/delete-node/ core5;
+};
+
+&{/cpus/cpu-map/cluster2} {
+	/delete-node/ core5;
+};
 
 / {
 	compatible = "apple,j616s", "apple,t6040", "apple,arm-platform";

@@ -17,6 +17,7 @@ pub(super) struct Source {
 
 pub(crate) struct Sources {
     pub(crate) reason: Option<u32>,
+    pub(crate) spare_reason_zero: bool,
     mask: u32,
     records: [Source; SLOTS],
     count: usize,
@@ -52,6 +53,7 @@ impl Sources {
     pub(crate) fn sample(mask: u32, mut read: impl FnMut(usize) -> Option<(u64, u32)>) -> Self {
         let mut sources = Self {
             reason: None,
+            spare_reason_zero: false,
             mask,
             records: [Source::default(); SLOTS],
             count: 0,

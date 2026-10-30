@@ -282,7 +282,8 @@ pub(super) fn service<H: Host>(
     host.recovery_mut().pending = None;
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
-    let (cancelled, blame) = classify(host, entries, request.blamed, attribution);
+    let lenient = sources.spare_reason_zero && sources.reason == Some(0);
+    let (cancelled, blame) = classify(host, entries, request.blamed, attribution, lenient);
     if listed != 0 {
         pr_warn!(
             "G17: GPU recovery: {} commands were in flight ({} matched by stamp, {} by queue); they fail instead of completing\n",
@@ -336,7 +337,7 @@ fn read_entries<H: Host>(host: &mut H) -> Entries {
 /// Also returns whether the firmware's blamed QID is still guilty after attribution: a blamed
 /// render that had not started while others had (or with no culprit at all) is innocent, and its
 /// work is spared like that of every other innocent VM instead of failing with EIO.
-fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, attribution: Attribution) -> (u128, bool) {
+fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, attribution: Attribution, lenient: bool) -> (u128, bool) {
     let mut guilty_qids = entries.guilty | blamed.map_or(0, |qid| 1u128 << qid);
     let cancelled = entries.cancelled;
     match attribution {
@@ -385,6 +386,9 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
     if unresolved || (count == 0 && collateral == 0 && !no_culprit) {
         return (0, blame);
     }
+    if lenient && count != 0 {
+        pr_warn!("G17: GPU recovery reason 0 is not a decoded fault; a first-time blamed VM stays usable\n");
+    }
     let spared = queues.classify_work(&|status| {
         guilty[..count]
             .iter()
@@ -392,7 +396,13 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
                 known
                     .as_ref()
                     .filter(|known| Arc::ptr_eq(known, status))
-                    .map(|_| Class::Guilty)
+                    .map(|_| {
+                        if lenient && status.reported_error() == 0 {
+                            Class::Spared
+                        } else {
+                            Class::Guilty
+                        }
+                    })
             })
             .unwrap_or(Class::Spared)
     });

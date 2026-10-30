@@ -11,6 +11,7 @@ use crate::g17::fw::{
 };
 use crate::g17::{Config, CoreLayout, CrashBuffers, FixedBuffer, Identity};
 use crate::hw::{GpuGen, GpuVariant};
+use super::t604x::{instances, window};
 use crate::mmu::UatQuirks;
 
 /// Static configuration of the T6040 GPU.
@@ -51,6 +52,7 @@ pub(crate) const CONFIG: Config = Config {
         native_gpu_permissions: true,
     },
     region_c: &REGION_C,
+    chip: None,
     adopt_root_entries: false,
     fabric_bridge: false,
     // The firmware's per-slot recovery keys are not known for this build; recovery relies on
@@ -104,43 +106,12 @@ pub(crate) const CONFIG: Config = Config {
         cores: Some((2, 20)),
         operand_state: fw::compute::OperandState::TWO_BY_TEN,
         deflake: fw::render::Deflake::TWO_CLUSTERS,
+        compute_blocks: fw::freelist::COMPUTE_BLOCKS,
     },
 };
 
 /// Chip identifier written to the hardware data.
 pub(crate) const CHIP_ID: u32 = 0x6040;
-
-/// Base of the firmware MMIO aperture in the kernel window.
-const MMIO_APERTURE: u64 = 0xffff_fc21_8000_0000;
-
-const fn window(
-    slot: usize,
-    phys: u64,
-    offset: u64,
-    size: u32,
-    unk_18: u64,
-    unk_20: u32,
-) -> RegisterWindow {
-    RegisterWindow {
-        slot,
-        phys,
-        va: MMIO_APERTURE + offset,
-        size,
-        unk_18,
-        unk_20,
-        instances: 1,
-        phys_stride: 0,
-    }
-}
-
-/// `window` repeated `instances` times, `phys_stride` apart in physical memory.
-const fn instances(window: RegisterWindow, instances: u32, phys_stride: u64) -> RegisterWindow {
-    RegisterWindow {
-        instances,
-        phys_stride,
-        ..window
-    }
-}
 
 /// Register windows the firmware maps, by register-map slot. Slot 3 holds the four memory
 /// controllers (ADT /arm-io/mcc), slot 20 the four AFR blocks.

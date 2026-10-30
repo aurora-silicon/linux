@@ -512,6 +512,9 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 			atomic_inc(&ma->sw_gain_lock_epoch);
 			schedule_work(&ma->sw_gain_stop_work);
 		}
+		if (!unlock && !ma->pm_quiesced && ma->cfg->fe_cpu_is_platform &&
+		    ma->cfg->amp == AMP_SN012776)
+			schedule_work(&ma->sw_gain_stop_work);
 		ma->speaker_volume_unlocked = unlock;
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 			       &ma->speaker_lock_kctl->id);
@@ -665,7 +668,7 @@ static void macaudio_sw_gain_stop_work(struct work_struct *work)
 	struct macaudio_snd_data *ma = container_of(work, struct macaudio_snd_data,
 						  sw_gain_stop_work);
 
-	macaudio_stop_playback(ma, true);
+	macaudio_stop_playback(ma, ma->cfg->amp == AMP_MAX98360A);
 }
 
 static int macaudio_copy_link(struct device *dev, struct snd_soc_dai_link *target,

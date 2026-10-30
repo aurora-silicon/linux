@@ -213,7 +213,14 @@ impl Registry {
             buffers <- BufferIds::new(),
             metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
-            admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues, renders)?,
+            admission: {
+                let admission = admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues, renders)?;
+                if variant.is_25f84() && crate::module_parameters::t6041_serial_render.value() != 0 {
+                    admission.serialize_render();
+                    pr_warn!("T6041 25F84: serial render admission enabled (one outstanding render lease)\n");
+                }
+                admission
+            },
             render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
             identities: queue::Identities::new(),
             compute: {
@@ -1399,6 +1406,9 @@ impl compute::Host for ComputeHost<'_> {
     fn publish_qid(&mut self, id: kick::Id) -> Result {
         self.qids.publish(id)
     }
+    fn register_queue(&mut self, queue: &super::fw::kick::KsmQueue) -> Result {
+        self.port.register_queues(core::slice::from_ref(queue))
+    }
     fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())
     }
@@ -1442,6 +1452,9 @@ impl compute::Host for DirectHost<'_> {
     fn publish_qid(&mut self, _id: kick::Id) -> Result {
         // An installed queue published its identity with its first command.
         Ok(())
+    }
+    fn register_queue(&mut self, _queue: &super::fw::kick::KsmQueue) -> Result {
+        Err(EAGAIN)
     }
     fn publish_outer(&mut self, _priority: u8, slot: &super::fw::channels::WorkSlot) -> Result {
         self.port.publish_compute(self.outer.take().ok_or(EIO)?, slot).map(|_| ())

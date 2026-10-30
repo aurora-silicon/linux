@@ -229,6 +229,11 @@ bool dcp_t6041_ext_enabled(void)
 #include "iomfb_v26_6_swap.h"
 #include "dcp-peer-v26_6.inc"
 
+static bool t6041_fw_26_5;
+module_param(t6041_fw_26_5, bool, 0444);
+MODULE_PARM_DESC(t6041_fw_26_5,
+		 "T6041: drive DCP firmware 26.5.2 with the desktop 26.6 interface (unqualified)");
+
 /*
  * The backlight maximum of a desktop 26.x panel whose node has no
  * apple,max-brightness: the J616s panel's user-accessible SDR maximum (ADT
@@ -4640,6 +4645,15 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		if (ret >= 0 && compat_ret >= 0 && !strcmp(fw_str, "26.6.2") &&
 		    !strcmp(compat_str, "26.6.2"))
 			return DCP_FIRMWARE_V_26_6_DESKTOP;
+		if (ret >= 0 && compat_ret >= 0 && !strcmp(fw_str, "26.5.2") &&
+		    !strcmp(compat_str, "26.5.2")) {
+			if (t6041_fw_26_5) {
+				dev_warn(dev, "T6041 DCP firmware 26.5.2 is unqualified; trying the desktop 26.6 interface\n");
+				return DCP_FIRMWARE_V_26_6_DESKTOP;
+			}
+			dev_err(dev, "T6041 display not started: DCP firmware 26.5.2 is unqualified (appledrm.t6041_fw_26_5=1 tries it)\n");
+			return DCP_FIRMWARE_UNKNOWN;
+		}
 		dev_err(dev, "T6041 display not started: DCP firmware %s (compat %s) is not 26.6.2\n",
 			ret >= 0 ? fw_str : "missing",
 			compat_ret >= 0 ? compat_str : "missing");

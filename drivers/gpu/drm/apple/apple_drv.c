@@ -470,7 +470,14 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 		dcp_retain_framebuffer(to_apple_crtc(old->crtc)->dcp, entry);
 	}
 
-	drm_atomic_helper_commit_tail_rpm(state);
+	drm_atomic_helper_commit_modeset_disables(state->dev, state);
+	drm_atomic_helper_commit_modeset_enables(state->dev, state);
+	drm_atomic_helper_commit_planes(state->dev, state,
+					DRM_PLANE_COMMIT_ACTIVE_ONLY);
+	drm_atomic_helper_fake_vblank(state);
+	drm_atomic_helper_commit_hw_done(state);
+	drm_atomic_helper_wait_for_flip_done(state->dev, state);
+	drm_atomic_helper_cleanup_planes(state->dev, state);
 }
 
 static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {
