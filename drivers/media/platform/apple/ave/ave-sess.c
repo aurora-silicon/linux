@@ -232,7 +232,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
-	u32 h32 = DIV_ROUND_UP(h, 32), w64 = DIV_ROUND_UP(w, 64), h64 = DIV_ROUND_UP(h, 64);
+	u32 h32 = DIV_ROUND_UP(h, 32), h64 = DIV_ROUND_UP(h, 64);
 	const unsigned long nomap = DMA_ATTR_NO_KERNEL_MAPPING;
 	size_t ref_a, ref_b, ref_c, ref_d, tile, mapped = 0;
 	struct ave_buf_req *r;
@@ -245,7 +245,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 
 	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
 	ref_b = roundup_pow_of_two(w) * roundup_pow_of_two(h) / 32;
-	ref_c = hevc ? 512 * w64 * h64 : ALIGN(w, 64) * (ALIGN(h, 16) / 2 + 24);
+	ref_c = ave_lfs_ref_size(w, h, hevc, ave->variant->lfs_ref_scale);
 	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
 

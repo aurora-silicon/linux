@@ -2808,6 +2808,7 @@ L:	linux-media@vger.kernel.org
 S:	Maintained
 W:	https://aurora-silicon.github.io
 F:	Documentation/admin-guide/media/apple-ave.rst
+F:	Documentation/devicetree/bindings/media/apple,t8140-ave.yaml
 F:	drivers/media/platform/apple/ave/
 
 ARM/APPLE QSPIMC DRIVER

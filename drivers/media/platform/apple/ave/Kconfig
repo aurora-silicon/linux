@@ -10,9 +10,21 @@ config VIDEO_APPLE_AVE
 	help
 	  V4L2 memory-to-memory driver for the AVE H.264/HEVC encoder in
 	  Apple T8140 (A18 Pro) SoCs, as in the MacBook Neo.
+	  T6000 (M1 Pro) and T8112 (M2) have probe-only support; encoding
+	  requires qualified firmware command constants.
 
 	  The encoder firmware is loaded by the bootloader; the driver builds
 	  every command itself. See Documentation/admin-guide/media/apple-ave.rst.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-ave.
+
+config VIDEO_APPLE_AVE_KUNIT_TEST
+	tristate "KUnit tests for Apple AVE buffer sizing" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the exact LFS reference descriptor sizes for pre-M4 and T8140
+	  encoders, including picture alignment boundaries and the reference
+	  1920x1080 AVC and HEVC sizes. The tests do not need an encoder or
+	  any firmware and can run independently of the AVE driver.

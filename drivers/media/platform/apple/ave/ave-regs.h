@@ -36,7 +36,6 @@
 #define AVE_BOOT_MAGIC			0x08042006
 #define AVE_BOOT_CFG_BYTES		0x40
 #define AVE_BOOT_CFG_DEVICE		1	/* word index */
-#define AVE_BOOT_CFG_DEVICE_T8140	29
 #define AVE_BOOT_CFG_UNITS		2
 #define AVE_BOOT_CFG_GROUPS		3
 #define AVE_BOOT_CFG_SUBID_MASK		4
@@ -64,8 +63,7 @@
 #define AVE_HS_SHARED_BYTES		0x18
 #define AVE_HS_HEAP			0x1c
 #define AVE_HS_HEAP_BYTES		0x24
-#define AVE_HS_MAGIC			0x28
-#define AVE_HS_MAGIC_VALUE		27
+#define AVE_HS_DEVICE_TYPE		0x28
 
 /* Channel descriptors the firmware writes into the channel area */
 #define AVE_CHAN_DESC_STRIDE		0x100
