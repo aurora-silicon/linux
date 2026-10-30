@@ -156,6 +156,9 @@ def main():
                     prefix += ('#define APPLE_RTKIT_EP_COREANALYTICS ' + endpoint + '\n'
                                '#define apple_rtkit_coreanalytics_rx(...) '
                                'assert(!"CoreAnalytics is outside this ordered-display fixture")\n')
+                    # The T6050 PMP registry-v2 buffer shares endpoint 7.
+                    prefix += ('#define apple_rtkit_pmp_aux_rx(...) '
+                               'assert(!"The PMP auxiliary buffer is outside this ordered-display fixture")\n')
                 unit = prefix + unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)
