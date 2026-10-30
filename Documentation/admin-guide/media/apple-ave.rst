@@ -45,6 +45,20 @@ build the device binds, but starting a stream fails with ``ENOTSUPP`` and a
 message naming the checksum, until that build's command layout has been
 checked.
 
+T6000 (M1 Pro) and T8112 (M2) have probe-only support in this driver. Their
+device tree nodes and both encoder DARTs remain disabled. The firmware
+handoff must reserve their preloaded TEXT (0xd0000 bytes) and DATA
+(0x128000 bytes), preserve the ADT remap addresses and export both CRCs.
+An enabled node with a valid handoff may bind, but encoding is refused with
+an informational message until per-SoC command constants, MCC DSID and the
+firmware CRCs have been qualified. The T8140 command constants are never a
+fallback for these devices. Enabling a node alone does not enable encoding.
+
+The shared Start layout uses a smaller LFS reference surface on both
+pre-M4 devices: at 1920x1080 its exact descriptor size is 0x85200 for AVC
+and 0x1fe00 for HEVC, before the DMA allocation is page rounded. The
+``apple-ave-sizes`` KUnit suite checks these sizes and alignment boundaries.
+
 With debugfs mounted, ``apple-ave/last_start_h264``,
 ``last_start_hevc``, ``last_process0_h264`` and ``last_process0_hevc`` hold the
 last Start command built and the first Process command of the last session,

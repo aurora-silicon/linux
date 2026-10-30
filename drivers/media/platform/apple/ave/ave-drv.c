@@ -14,13 +14,54 @@
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 
 #include "ave.h"
+#include "ave-regs.h"
 
 #define AVE_AUTOSUSPEND_MS	2000
+
+static const struct ave_coproc_regs ave_coproc_v40 = {
+	.vcbar = AVE_COPROC_VCBAR,
+	.timebase_freq = AVE_COPROC_TIMEBASE_FREQ,
+	.timebase = AVE_COPROC_TIMEBASE,
+	.ctrl = AVE_COPROC_CTRL,
+	.status = AVE_COPROC_STATUS,
+	.boot_arg = AVE_COPROC_BOOT_ARG,
+	.keep_mappings = AVE_COPROC_KEEP_MAPPINGS,
+};
+
+/* Pre-M4 wire layouts are shared; their command constants still need traces. */
+static const struct ave_variant ave_t6000 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0xd0000,
+	.fw_data_size = 0x128000,
+	.boot_device_id = 11,
+	.device_type = 9,
+	.lfs_ref_scale = 1,
+};
+
+static const struct ave_variant ave_t8112 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0xd0000,
+	.fw_data_size = 0x128000,
+	.boot_device_id = 15,
+	.device_type = 13,
+	.lfs_ref_scale = 1,
+};
+
+static const struct ave_variant ave_t8140 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0x14c000,
+	.fw_data_size = 0x130000,
+	.boot_device_id = 29,
+	.device_type = 27,
+	.lfs_ref_scale = 2,
+	.encoding_text_crc = AVE_FW_TEXT_CRC_9003_78_0,
+};
 
 /*
  * debugfs: apple-ave/last_start_{h264,hevc} hold the last Start built and
@@ -84,6 +125,9 @@ static int ave_probe(struct platform_device *pdev)
 	if (!ave)
 		return -ENOMEM;
 	ave->dev = dev;
+	ave->variant = of_device_get_match_data(dev);
+	if (!ave->variant)
+		return -ENODEV;
 	mutex_init(&ave->hw_lock);
 	platform_set_drvdata(pdev, ave);
 
@@ -211,7 +255,9 @@ static const struct dev_pm_ops ave_pm_ops = {
 };
 
 static const struct of_device_id ave_of_match[] = {
-	{ .compatible = "apple,t8140-ave" },
+	{ .compatible = "apple,t6000-ave", .data = &ave_t6000 },
+	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
+	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ave_of_match);

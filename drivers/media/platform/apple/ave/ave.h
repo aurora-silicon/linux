@@ -19,6 +19,8 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-v4l2.h>
 
+#include "ave-sizes.h"
+
 struct debugfs_blob_wrapper;
 struct dentry;
 struct dev_pm_domain_list;
@@ -111,8 +113,31 @@ enum ave_image {
 
 struct ave_ctx;
 
+/* Register offsets for the shared 0x40 coprocessor architecture. */
+struct ave_coproc_regs {
+	u32 vcbar;
+	u32 timebase_freq;
+	u32 timebase;
+	u32 ctrl;
+	u32 status;
+	u32 boot_arg;
+	u32 keep_mappings;
+};
+
+struct ave_variant {
+	const struct ave_coproc_regs *regs;
+	u32 fw_text_size;
+	u32 fw_data_size;
+	u32 boot_device_id;
+	u32 device_type;
+	u32 lfs_ref_scale;
+	/* Zero means no command constants or MCC DSID have been qualified. */
+	u32 encoding_text_crc;
+};
+
 struct ave_dev {
 	struct device *dev;
+	const struct ave_variant *variant;
 	void __iomem *codec;
 	void __iomem *mbox;
 	void __iomem *coproc;
@@ -122,6 +147,7 @@ struct ave_dev {
 	struct ave_fw_segment text;
 	struct ave_fw_segment data;
 	u32 text_crc;
+	u32 data_crc;
 	void *data_pristine;
 	bool data_dirty;
 

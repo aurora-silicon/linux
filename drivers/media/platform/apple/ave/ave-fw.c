@@ -16,6 +16,7 @@
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/limits.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/pm_runtime.h>
@@ -60,6 +61,12 @@ static int ave_fw_segment(struct ave_dev *ave, unsigned int index,
 	np = of_parse_phandle(ave->dev->of_node, "memory-region", index);
 	if (!np)
 		return -ENOENT;
+	if (!of_node_name_eq(np->parent, "reserved-memory") ||
+	    !of_device_is_compatible(np, "apple,asc-mem") ||
+	    !of_property_read_bool(np, "no-map")) {
+		ret = -EINVAL;
+		goto out;
+	}
 	ret = of_address_to_resource(np, 0, &res);
 	if (ret)
 		goto out;
@@ -74,7 +81,9 @@ static int ave_fw_segment(struct ave_dev *ave, unsigned int index,
 	seg->phys = res.start;
 	seg->size = resource_size(&res);
 	seg->iova = of_read_number(prop + 1, 2);
-	if (of_read_number(prop + 3, 2) != seg->size ||
+	if (!seg->size || seg->phys > PHYS_ADDR_MAX - seg->size ||
+	    seg->iova > U64_MAX - seg->size ||
+	    of_read_number(prop + 3, 2) != seg->size ||
 	    !IS_ALIGNED(seg->phys, SZ_16K) || !IS_ALIGNED(seg->iova, SZ_16K))
 		ret = -EINVAL;
 out:
@@ -90,18 +99,17 @@ static int ave_fw_check_mapping(struct ave_dev *ave, const struct ave_fw_segment
 	return 0;
 }
 
-static u32 ave_fw_crc(const struct ave_fw_segment *seg, void **copy)
+static int ave_fw_crc(const struct ave_fw_segment *seg, u32 *crc, void *copy)
 {
 	void *va = memremap(seg->phys, seg->size, MEMREMAP_WB);
-	u32 crc;
 
 	if (!va)
-		return 0;
-	crc = crc32_le(~0U, va, seg->size) ^ ~0U;
+		return -ENOMEM;
+	*crc = crc32_le(~0U, va, seg->size) ^ ~0U;
 	if (copy)
-		memcpy(*copy, va, seg->size);
+		memcpy(copy, va, seg->size);
 	memunmap(va);
-	return crc;
+	return 0;
 }
 
 /*
@@ -112,7 +120,7 @@ int ave_fw_probe(struct ave_dev *ave)
 {
 	struct device *dev = ave->dev;
 	u32 text_crc, data_crc, want;
-	bool known = false;
+	bool known = !ave->variant->encoding_text_crc;
 	int ret;
 
 	if (of_count_phandle_with_args(dev->of_node, "memory-region", NULL) != 2)
@@ -124,10 +132,24 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret)
 		return dev_err_probe(dev, ret, "bad firmware reservation\n");
 
+	if (ave->text.size != ave->variant->fw_text_size ||
+	    ave->data.size != ave->variant->fw_data_size)
+		return dev_err_probe(dev, -EINVAL, "unexpected firmware segment sizes\n");
+	if ((ave->text.phys < ave->data.phys + ave->data.size &&
+	     ave->data.phys < ave->text.phys + ave->text.size) ||
+	    (ave->text.iova < ave->data.iova + ave->data.size &&
+	     ave->data.iova < ave->text.iova + ave->text.size))
+		return dev_err_probe(dev, -EINVAL, "overlapping firmware segments\n");
+
 	if (ave_fw_check_mapping(ave, &ave->text) || ave_fw_check_mapping(ave, &ave->data))
 		return dev_err_probe(dev, -EIO, "firmware is not mapped where it was loaded\n");
 
-	text_crc = ave_fw_crc(&ave->text, NULL);
+	ret = ave_fw_crc(&ave->text, &text_crc, NULL);
+	if (ret)
+		return ret;
+	ret = ave_fw_chosen_crc(ave, "aurora,ave-text-crc32", &want);
+	if (ret || text_crc != want)
+		return dev_err_probe(dev, -ENODEV, "firmware text differs from loader CRC\n");
 	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
 		known |= text_crc == ave_known_text_crc[i];
 	if (!known)
@@ -138,7 +160,9 @@ int ave_fw_probe(struct ave_dev *ave)
 	ave->data_pristine = vmalloc(ave->data.size);
 	if (!ave->data_pristine)
 		return -ENOMEM;
-	data_crc = ave_fw_crc(&ave->data, &ave->data_pristine);
+	ret = ave_fw_crc(&ave->data, &data_crc, ave->data_pristine);
+	if (ret)
+		goto free_data;
 
 	/*
 	 * The loader records the DATA checksum before anything runs. If it
@@ -146,14 +170,21 @@ int ave_fw_probe(struct ave_dev *ave)
 	 */
 	ret = ave_fw_chosen_crc(ave, "aurora,ave-data-crc32", &want);
 	if (ret || data_crc != want) {
-		vfree(ave->data_pristine);
-		ave->data_pristine = NULL;
-		return dev_err_probe(dev, -ENODEV,
-				     "firmware data is not in its boot state\n");
+		ret = dev_err_probe(dev, -ENODEV, "firmware data is not in its boot state\n");
+		goto free_data;
 	}
 
+	ave->data_crc = data_crc;
 	ave->fw_state = AVE_FW_OFF;
+	if (!ave->variant->encoding_text_crc)
+		dev_info(dev, "probe only: device type %u firmware TEXT %08x DATA %08x needs qualification\n",
+			 ave->variant->device_type, text_crc, data_crc);
 	return 0;
+
+free_data:
+	vfree(ave->data_pristine);
+	ave->data_pristine = NULL;
+	return ret;
 }
 
 static void ave_fw_restore_data(struct ave_dev *ave)
@@ -212,10 +243,11 @@ int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long
  */
 int ave_fw_check_build(struct ave_dev *ave)
 {
-	if (ave->text_crc == AVE_FW_TEXT_CRC_9003_78_0)
+	if (ave->variant->encoding_text_crc &&
+	    ave->text_crc == ave->variant->encoding_text_crc)
 		return 0;
-	dev_err(ave->dev, "encoder firmware %08x is not validated for encoding (only %08x is)\n",
-		ave->text_crc, AVE_FW_TEXT_CRC_9003_78_0);
+	dev_info(ave->dev, "encoding refused: device type %u firmware TEXT %08x DATA %08x has no qualified command constants/MCC DSID\n",
+		 ave->variant->device_type, ave->text_crc, ave->data_crc);
 	return -ENOTSUPP;
 }
 
@@ -231,9 +263,10 @@ void ave_fw_remove(struct ave_dev *ave)
 
 static bool ave_fw_idle(struct ave_dev *ave)
 {
-	if (readq(ave->coproc + AVE_COPROC_VCBAR) != (ave->text.iova | AVE_COPROC_VCBAR_VALID))
+	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
+	    (ave->text.iova | AVE_COPROC_VCBAR_VALID))
 		return false;
-	if (readl(ave->coproc + AVE_COPROC_CTRL) || readl(ave->mbox + AVE_MBOX_STATUS))
+	if (readl(ave->coproc + ave->variant->regs->ctrl) || readl(ave->mbox + AVE_MBOX_STATUS))
 		return false;
 	for (unsigned int i = 0; i < AVE_MBOX_SCRATCH_COUNT; i++)
 		if (readl(ave->mbox + AVE_MBOX_SCRATCH(i)))
@@ -253,15 +286,16 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 {
 	u32 status;
 
-	if (readq(ave->coproc + AVE_COPROC_VCBAR) != (ave->text.iova | AVE_COPROC_VCBAR_VALID)) {
+	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
+	    (ave->text.iova | AVE_COPROC_VCBAR_VALID)) {
 		dev_err(ave->dev, "coprocessor lost its code base (vcbar %#llx)\n",
-			readq(ave->coproc + AVE_COPROC_VCBAR));
+			readq(ave->coproc + ave->variant->regs->vcbar));
 		return -EIO;
 	}
 	if (ave->fw_state != AVE_FW_HALTED)
 		return 0;
 
-	if (readl(ave->coproc + AVE_COPROC_CTRL)) {
+	if (readl(ave->coproc + ave->variant->regs->ctrl)) {
 		dev_dbg(ave->dev, "coprocessor kept power after its halt; retry once it suspends\n");
 		return -EAGAIN;
 	}
@@ -303,8 +337,8 @@ static int ave_fw_boot(struct ave_dev *ave)
 	 */
 	if (!ave_fw_idle(ave)) {
 		dev_err(ave->dev, "coprocessor is not in its reset state (vcbar %#llx ctrl %#x)\n",
-			readq(ave->coproc + AVE_COPROC_VCBAR),
-			readl(ave->coproc + AVE_COPROC_CTRL));
+			readq(ave->coproc + ave->variant->regs->vcbar),
+			readl(ave->coproc + ave->variant->regs->ctrl));
 		return -EIO;
 	}
 
@@ -320,7 +354,7 @@ static int ave_fw_boot(struct ave_dev *ave)
 	log = ave->log.cpu;
 	memset(cfg, 0, AVE_BOOT_CFG_BYTES);
 	memset(log, 0, ave->log.size);
-	cfg[AVE_BOOT_CFG_DEVICE] = cpu_to_le32(AVE_BOOT_CFG_DEVICE_T8140);
+	cfg[AVE_BOOT_CFG_DEVICE] = cpu_to_le32(ave->variant->boot_device_id);
 	cfg[AVE_BOOT_CFG_UNITS] = cpu_to_le32(1);
 	cfg[AVE_BOOT_CFG_GROUPS] = cpu_to_le32(1);
 	cfg[AVE_BOOT_CFG_SUBID_MASK] = cpu_to_le32(1);
@@ -338,16 +372,16 @@ static int ave_fw_boot(struct ave_dev *ave)
 	writel(upper_32_bits(ave->boot_cfg.dma), ave->mbox + AVE_MBOX_SCRATCH(2));
 
 	ave->data_dirty = true;
-	writel(1, ave->coproc + AVE_COPROC_KEEP_MAPPINGS);
-	writel(0, ave->coproc + AVE_COPROC_CTRL);
-	writel(AVE_COPROC_BOOT_ARG_VALUE, ave->coproc + AVE_COPROC_BOOT_ARG);
-	writel(AVE_COPROC_CTRL_RUN, ave->coproc + AVE_COPROC_CTRL);
+	writel(1, ave->coproc + ave->variant->regs->keep_mappings);
+	writel(0, ave->coproc + ave->variant->regs->ctrl);
+	writel(AVE_COPROC_BOOT_ARG_VALUE, ave->coproc + ave->variant->regs->boot_arg);
+	writel(AVE_COPROC_CTRL_RUN, ave->coproc + ave->variant->regs->ctrl);
 
 	ret = readl_poll_timeout(ave->mbox + AVE_MBOX_STATUS, status,
 				 status & AVE_MBOX_STATUS_PENDING, 50, AVE_MBOX_TIMEOUT_US);
 	if (ret) {
 		dev_err(ave->dev, "firmware did not answer (status %#x)\n",
-			readl(ave->coproc + AVE_COPROC_STATUS));
+			readl(ave->coproc + ave->variant->regs->status));
 		return ret;
 	}
 	for (unsigned int i = 0; i < 4; i++)
@@ -377,6 +411,9 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 	int ret;
 
 	lockdep_assert_held(&ave->hw_lock);
+	ret = ave_fw_check_build(ave);
+	if (ret)
+		return ret;
 	switch (ave->fw_state) {
 	case AVE_FW_RUNNING:
 		return 0;
@@ -396,7 +433,8 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 	prev = ave->fw_state;
 	ret = ave_fw_boot(ave);
 	if (ret) {
-		ave->fw_state = readl(ave->coproc + AVE_COPROC_CTRL) ? AVE_FW_HALTED : prev;
+		ave->fw_state = readl(ave->coproc + ave->variant->regs->ctrl) ?
+				AVE_FW_HALTED : prev;
 		memset(ave->ring, 0, sizeof(ave->ring));
 		ave->ipc_fw_base = 0;
 	}

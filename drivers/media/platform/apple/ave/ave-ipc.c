@@ -157,8 +157,8 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 	writel(AVE_MBOX_STATUS_PENDING, ave->mbox + AVE_MBOX_STATUS);
 
 	/* Tell the firmware how far its timebase is from the host's. */
-	ticks = readq(ave->coproc + AVE_COPROC_TIMEBASE);
-	freq = readl(ave->coproc + AVE_COPROC_TIMEBASE_FREQ);
+	ticks = readq(ave->coproc + ave->variant->regs->timebase);
+	freq = readl(ave->coproc + ave->variant->regs->timebase_freq);
 	if (freq && freq < 1000000)
 		return -EPROTO;
 	ticks = div64_u64(ticks, freq ? freq / 1000000 : 24);
@@ -184,7 +184,7 @@ int ave_ipc_negotiate(struct ave_dev *ave, const u32 hello[4])
 	put_unaligned_le32(AVE_IPC_SHARED_BYTES, hs + AVE_HS_SHARED_BYTES);
 	put_unaligned_le64(ave->heap.dma, hs + AVE_HS_HEAP);
 	put_unaligned_le32(hello[3], hs + AVE_HS_HEAP_BYTES);
-	put_unaligned_le32(AVE_HS_MAGIC_VALUE, hs + AVE_HS_MAGIC);
+	put_unaligned_le32(ave->variant->device_type, hs + AVE_HS_DEVICE_TYPE);
 	dma_wmb();
 
 	ave_mbox_send(ave, lower_32_bits(ave->ipc_fw_base + AVE_IPC_HANDSHAKE_OFF),
