@@ -1812,6 +1812,20 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
 
+/*
+ * The J700 SMC has no keys for these shared laptop sensors. On T8140 the
+ * temperature channels are indexed for the thermal zones, so a missing
+ * temperature key keeps an empty, hidden channel and is reported at every
+ * boot. The NAND temperature is described above as Storage (NAND).
+ */
+&smc_hwmon {
+	/delete-node/ power-PMVR;
+	/delete-node/ power-PHPC;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+};
+
 &pcie0 {
 	/* The PIODMA guard stays closed until the retained bootstrap succeeds. */
 	apple,piodma = <&pcie0_piodma_diag>;
