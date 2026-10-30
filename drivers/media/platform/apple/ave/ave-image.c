@@ -88,6 +88,8 @@ static const struct ave_word ave_h264_start[] = {
 	W(0x2d68, 1),
 	RUN(0x2d6c, 3, 2),
 	W(0x2dc8, 1),
+	/* Picture parameters: byte +0x3020 is 1; +0x3023 (8x8 transform) is computed */
+	W(0x3020, 1),
 	/* Two runs of -13 */
 	RUN(0x3004, 7, 0xfffffff3),
 	RUN(0x302c, 7, 0xfffffff3),
@@ -123,6 +125,8 @@ static const struct ave_word ave_hevc_start[] = {
 	W(0x292c, 1),
 	W(0x2934, 1),
 	W(0x295c, 0x1010001),
+	/* Constraint flag bytes; +0x2962 (max 8 bit) is computed */
+	W(0x2960, 0x01000101),
 	W(0x2964, 1),
 	RUN(0x2a8c, 7, 0x1010101),
 	W(0x2aa8, 0x101),
@@ -136,6 +140,8 @@ static const struct ave_word ave_hevc_start[] = {
 	W(0x58f8, 1),
 	W(0x5900, 1),
 	W(0x5928, 0x1010001),
+	/* Constraint flag bytes, second copy; +0x592e (max 8 bit) is computed */
+	W(0x592c, 0x01000000),
 	W(0x5930, 1),
 	W(0x5aac, 1),
 	W(0x5ae0, 7),		/* log2_max_pic_order_cnt_lsb_minus4: 11-bit POC */

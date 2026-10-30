@@ -40,8 +40,8 @@
  * window next to a session: each queue may use this much, counting every
  * buffer at the power-of-two size the DMA layer maps it with.
  */
-#define AVE_OUTPUT_BUDGET	(48 * SZ_1M)
-#define AVE_CAPTURE_BUDGET	(24 * SZ_1M)
+#define AVE_OUTPUT_BUDGET	(80 * SZ_1M)
+#define AVE_CAPTURE_BUDGET	(40 * SZ_1M)
 #define AVE_MAX_QUEUE_BUFS	16
 #define AVE_RESTART_TRIES	10
 #define AVE_RESTART_WAIT_MS	100
@@ -545,8 +545,14 @@ static int ave_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned i
 	if (V4L2_TYPE_IS_OUTPUT(vq->type) && have + *nbufs < AVE_MAX_SLOTS + 1)
 		*nbufs = AVE_MAX_SLOTS + 1 - have;
 	/* A full set of both queues must fit the encoder's 256 MiB DART window. */
-	if (have >= max)
+	if (have >= max) {
+		dev_dbg(ctx->ave->dev, "%s queue already has its %u buffers\n",
+			V4L2_TYPE_IS_OUTPUT(vq->type) ? "OUTPUT" : "CAPTURE", max);
 		return -ENOMEM;
+	}
+	if (*nbufs > max - have)
+		dev_dbg(ctx->ave->dev, "%s queue: %u buffers asked, %u given\n",
+			V4L2_TYPE_IS_OUTPUT(vq->type) ? "OUTPUT" : "CAPTURE", *nbufs, max - have);
 	*nbufs = min(*nbufs, max - have);
 	if (*nplanes)
 		return (*nplanes != 1 || sizes[0] < f->plane_fmt[0].sizeimage) ? -EINVAL : 0;

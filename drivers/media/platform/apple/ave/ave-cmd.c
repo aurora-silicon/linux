@@ -292,6 +292,9 @@ static const u16 ave_start_tile_off[AVE_TILE_BUFS] = {
 
 /* HEVC parameter-set words; most appear twice */
 #define AVE_START_HEVC_PAD		0x26e0
+#define AVE_START_HEVC_RC_270C		0x270c	/* 2 in bit-rate modes, 5 in CQ */
+#define AVE_START_HEVC_RC_9604		0x9604	/* 0 in bit-rate modes, 2 in CQ */
+#define AVE_START_HEVC_RC_9608		0x9608	/* 0x10000 in bit-rate modes, 0 in CQ */
 #define AVE_START_HEVC_PROFILE_A	0x2938
 #define AVE_START_HEVC_COMPAT_A		0x293d	/* two bytes */
 #define AVE_START_HEVC_8BIT_A		0x2962	/* byte */
@@ -450,6 +453,10 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd)
 	cmd[AVE_START_HEVC_COMPAT_B + 1] = 1;
 	cmd[AVE_START_HEVC_8BIT_A] = 1;
 	cmd[AVE_START_HEVC_8BIT_B] = 1;
+	/* Rate-control words that only change in constant-quality mode */
+	ave_put32(cmd, AVE_START_HEVC_RC_270C, 2);
+	ave_put32(cmd, AVE_START_HEVC_RC_9604, 0);
+	ave_put32(cmd, AVE_START_HEVC_RC_9608, 0x10000);
 	ave_put32(cmd, AVE_START_HEVC_LEVEL_A, p->level);
 	ave_put32(cmd, AVE_START_HEVC_LEVEL_B, p->level);
 	ave_put32(cmd, AVE_START_HEVC_WIDTH, p->cw);
