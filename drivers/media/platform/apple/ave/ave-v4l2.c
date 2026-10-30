@@ -156,7 +156,8 @@ static int ave_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *
 static int ave_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
 {
 	if (fs->index ||
-	    !ave_fmt_listed(ave_coded_fmts, ARRAY_SIZE(ave_coded_fmts), fs->pixel_format))
+	    (!ave_fmt_listed(ave_coded_fmts, ARRAY_SIZE(ave_coded_fmts), fs->pixel_format) &&
+	     !ave_fmt_listed(ave_raw_fmts, ARRAY_SIZE(ave_raw_fmts), fs->pixel_format)))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){
@@ -732,6 +733,8 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src->lock = &ctx->ave->vdev_lock;
 	src->dev = ctx->ave->dev;
+	/* A full set of both queues must fit the encoder's 256 MiB DART window. */
+	src->max_num_buffers = 16;
 	ret = vb2_queue_init(src);
 	if (ret)
 		return ret;
@@ -745,6 +748,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	dst->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst->lock = &ctx->ave->vdev_lock;
 	dst->dev = ctx->ave->dev;
+	dst->max_num_buffers = 8;
 	return vb2_queue_init(dst);
 }
 
