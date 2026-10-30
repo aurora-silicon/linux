@@ -95,6 +95,16 @@ patternProperties:
         pattern: "^[A-Za-z0-9]{4}$"
         description: Writeable key to enable/disable manual fan control
 
+      apple,fan-manual-control:
+        type: boolean
+        description:
+          The SMC firmware of this machine accepts a manual speed for this
+          fan from the host and returns it to firmware control when asked,
+          so the fan's target speed can be set from the OS. Requires
+          apple,fan-target and apple,fan-mode. Without it the fan is only
+          monitored, and driven by the thermal framework where the SMC
+          node is a cooling device.
+
   "^power-[A-Za-z0-9]{4}$":
     $ref: "#/$defs/sensor"
     unevaluatedProperties: false
