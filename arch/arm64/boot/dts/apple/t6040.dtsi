@@ -1913,6 +1913,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -1923,6 +1924,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -1933,6 +1935,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -2141,7 +2144,8 @@
 		reg-names = "engine";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1054 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
+		iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>,
+			 <&ane0_dart0 11>, <&ane0_dart1 11>, <&ane0_dart2 11>;
 		power-domains = <&ps_ane_cpu>;
 		status = "disabled";
 	};
