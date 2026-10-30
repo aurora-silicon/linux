@@ -77,6 +77,7 @@ thread_local! {
     static FAIL_REGISTRATION: Cell<u8> = const { Cell::new(0) };
     static COMPLETED_REGISTRATION: Cell<u8> = const { Cell::new(0) };
     static ACTIVATED: Cell<bool> = const { Cell::new(false) };
+    static BINDING_READY: Cell<bool> = const { Cell::new(false) };
     static ATTACH_ERROR: Cell<bool> = const { Cell::new(false) };
     static PROBE_ERROR: Cell<i32> = const { Cell::new(0) };
 }
@@ -140,6 +141,11 @@ pub trait ModuleMetadata { const NAME: &'static std::ffi::CStr; }
 pub trait InPlaceModule: Sized {
     fn init(module: &'static ThisModule) -> impl PinInit<Self, Error>;
 }
+// Registry synchronization is covered by binding-lifetime-tests; this adapter
+// verifies that the actual module initializer orders it before registration.
+mod binding {
+    pub unsafe fn init() { crate::BINDING_READY.set(true); }
+}
 mod cleanup {
     pub struct QueueOwner;
     impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
@@ -150,6 +156,7 @@ mod driver {
     pub struct Registration<T> { stage: u8, marker: PhantomData<T> }
     impl<T: 'static> Registration<T> {
         pub fn new(name: &'static std::ffi::CStr, _module: &'static ThisModule) -> impl PinInit<Self, Error> {
+            assert!(BINDING_READY.get(), "adapter registered before binding registry init");
             try_pin_init!(Self {
                 stage: {
                     let stage = match name.to_bytes() {
@@ -198,6 +205,7 @@ fn callback<'bound, T: platform::Driver>(
 }
 fn reset(fail_alloc: bool, touch: bool, error: i32) {
     MODULE_READY.store(true, Ordering::Release);
+    BINDING_READY.set(false);
     FAIL_ALLOC.set(fail_alloc); TOUCH.set(touch); PROBE_ERROR.set(error);
     RETAINED.set(false); ALLOCS.set(0); PROBES.set(0);
 }

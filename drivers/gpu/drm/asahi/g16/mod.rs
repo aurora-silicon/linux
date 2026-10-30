@@ -171,6 +171,7 @@ impl platform::Driver for Driver {
             if let Some(gpu) = &driver.g16 {
                 gpu.retain();
             }
+            driver.close_binding();
         }
     }
 }

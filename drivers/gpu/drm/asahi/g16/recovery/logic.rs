@@ -142,7 +142,7 @@ fn host_deadline(now: u64, milliseconds: u32) -> u64 {
     if milliseconds == 0 {
         u64::MAX
     } else {
-        now.saturating_add(milliseconds.max(100) as u64 * 1_000_000)
+        now.saturating_add(u64::from(milliseconds.max(100)) * 1_000_000)
     }
 }
 
