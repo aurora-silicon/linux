@@ -598,6 +598,20 @@ out:
 	return ret ?: READ_ONCE(m->connect_error);
 }
 
+/*
+ * Once the request has gone to the AP, a timeout, a refusal or a reset while
+ * the firmware is still healthy is how the AP answered, not a driver or
+ * firmware fault. cfg80211 hands it to the supplicant, which retries, and
+ * mac80211 reports the same outcomes at info level. Keep the error level for
+ * failures that need recovery or point at the firmware.
+ */
+static bool mt_connect_failed_at_peer(struct mt7932 *m, bool auth_submitted,
+				      int ret)
+{
+	return auth_submitted && !READ_ONCE(m->link_failed) &&
+		(ret == -ETIMEDOUT || ret == -ECONNREFUSED || ret == -ECONNRESET);
+}
+
 void mt_connect_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
@@ -760,6 +774,9 @@ report:
 			READ_ONCE(m->data_ready));
 	else if (cancelled)
 		dev_dbg(&m->pdev->dev, "CONNECT_CANCELLED: %d\n", ret);
+	else if (mt_connect_failed_at_peer(m, auth_submitted, ret))
+		dev_info(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=0\n",
+			 ret);
 	else
 		dev_err(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=%u\n",
 			ret, READ_ONCE(m->link_failed));
