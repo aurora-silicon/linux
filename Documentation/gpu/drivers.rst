@@ -7,6 +7,7 @@ GPU Driver Documentation
 
    amdgpu/index
    apple-dcp-backlight
+   apple-drm-parameters
    asahi-reclaim
    asahi-m4-bringup
    apple-dcp-m4
