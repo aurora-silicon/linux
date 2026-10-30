@@ -6280,9 +6280,17 @@ static int dcp_platform_suspend(struct device *dev)
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
 
-	/* The retained T8132 session has no qualified system-sleep handshake. */
-	if (iomfb_is_m4(dcp))
-		return -EBUSY;
+	/*
+	 * T8132: setPowerState powers the display down; the coprocessor keeps
+	 * running and its power domains stay on, as below.
+	 */
+	if (iomfb_is_m4(dcp)) {
+		int ret = iomfb_m4_suspend(dcp);
+
+		if (!ret)
+			device_set_wakeup_path(dev);
+		return ret;
+	}
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 
@@ -6362,7 +6370,7 @@ static int dcp_platform_resume(struct device *dev)
 		return 0;
 
 	if (iomfb_is_m4(dcp))
-		return iomfb_m4_health(dcp);
+		return iomfb_m4_resume(dcp);
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 

@@ -22,6 +22,7 @@ allOf:
     then:
       properties:
         apple,firmware-owned: false
+        apple,sleep-retained: false
         apple,always-on: false
         apple,min-state: false
         apple,force-disable: false
@@ -104,6 +105,13 @@ properties:
       firmware is started cold by Linux and must not be clock or power
       gated behind its back, such as the T6030 external display
       coprocessors' CPU domains.
+    type: boolean
+
+  apple,sleep-retained:
+    description:
+      A coprocessor keeps running in this domain across system sleep with no
+      system-sleep callbacks of its own. The OS keeps the domain on during
+      system sleep. Runtime power management is unaffected.
     type: boolean
 
   apple,firmware-owned:

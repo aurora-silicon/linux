@@ -27,6 +27,8 @@ int iomfb_m4_error(struct apple_dcp *dcp);
 int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 		     dma_addr_t dva, size_t mapped);
 int iomfb_m4_blank(struct apple_dcp *dcp);
+int iomfb_m4_suspend(struct apple_dcp *dcp);
+int iomfb_m4_resume(struct apple_dcp *dcp);
 void iomfb_m4_configure_backlight(struct apple_dcp *dcp);
 void iomfb_m4_quiesce(struct apple_dcp *dcp);
 void iomfb_m4_debugfs_init(struct apple_dcp *dcp, struct dentry *root);
@@ -50,6 +52,8 @@ static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer
 	return -ENODEV;
 }
 static inline int iomfb_m4_blank(struct apple_dcp *dcp) { return -ENODEV; }
+static inline int iomfb_m4_suspend(struct apple_dcp *dcp) { return -ENODEV; }
+static inline int iomfb_m4_resume(struct apple_dcp *dcp) { return -ENODEV; }
 static inline void iomfb_m4_configure_backlight(struct apple_dcp *dcp) { }
 static inline void iomfb_m4_quiesce(struct apple_dcp *dcp) { }
 static inline void iomfb_m4_debugfs_init(struct apple_dcp *dcp, struct dentry *root) { }
