@@ -2023,6 +2023,7 @@
 
 			apciec0: pcie@3b0000000 {
 				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				apple,pciec-kernel-init;
 				device_type = "pci";
 
 				reg = <0x3 0xb0000000 0x0 0x10000000>,
@@ -2243,6 +2244,7 @@
 
 			apciec1: pcie@530000000 {
 				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				apple,pciec-kernel-init;
 				device_type = "pci";
 
 				reg = <0x5 0x30000000 0x0 0x10000000>,
