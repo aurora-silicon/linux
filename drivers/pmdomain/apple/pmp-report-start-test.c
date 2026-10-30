@@ -343,6 +343,32 @@ static void pmp_start_entry_teardown_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&ent->genpd), -ENODEV);
 }
 
+/*
+ * An entry starts from its request bit: one left set in the request word is
+ * on and is kept for the hand-over of deferred requests; one an entry has
+ * made since reads back from memory, whatever the request word holds.
+ */
+static void pmp_report_requested_test(struct kunit *test)
+{
+	struct pst *t = pst_new(test);
+
+	pst_write(t, pst_offsets.tgt_read, BIT_ULL(18));
+	t->rep.defer = true;
+
+	KUNIT_EXPECT_TRUE(test, apple_pmp_report_requested(&t->rep, 18));
+	KUNIT_EXPECT_EQ(test, t->rep.shadow, BIT_ULL(18));
+	KUNIT_EXPECT_EQ(test, t->rep.known, BIT_ULL(18));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_requested(&t->rep, 17));
+	KUNIT_EXPECT_EQ(test, t->rep.known, BIT_ULL(18));
+
+	/* A deferred request lives in memory only. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_set_state(&t->rep, 17, true, false), 0);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_report_requested(&t->rep, 17));
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_set_state(&t->rep, 18, false, false), 0);
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_requested(&t->rep, 18));
+	pst_drain(t);
+}
+
 /* T6030's real overlay: DISP (7), deferred external requests (8/9),
  * and storage (16), which has no acknowledgement. Only DISP gates startup.
  */
@@ -399,6 +425,7 @@ static struct kunit_case pmp_start_cases[] = {
 	KUNIT_CASE(pmp_start_teardown_while_waiting_test),
 	KUNIT_CASE(pmp_start_teardown_idle_test),
 	KUNIT_CASE(pmp_start_entry_teardown_test),
+	KUNIT_CASE(pmp_report_requested_test),
 	{}
 };
 

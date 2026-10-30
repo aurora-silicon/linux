@@ -1362,6 +1362,32 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		50000);
 }
 
+/*
+ * Whether request bit @id is set: in memory once an entry made the request
+ * while requests are deferred, else in the request word. A request found in
+ * the request word (left by the bootloader, or by an earlier binding) is kept
+ * in memory too, so a deferred report hands it over when the PMP runs.
+ */
+static bool apple_pmp_report_requested(struct apple_pmp_report *rep, u32 id)
+{
+	u64 bit_val = BIT_ULL(id);
+	unsigned long flags;
+	bool on;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	if (rep->known & bit_val) {
+		on = rep->shadow & bit_val;
+	} else {
+		on = readq(rep->base + rep->offsets->tgt_read) & bit_val;
+		if (on) {
+			rep->known |= bit_val;
+			rep->shadow |= bit_val;
+		}
+	}
+	spin_unlock_irqrestore(&rep->lock, flags);
+	return on;
+}
+
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
@@ -1419,8 +1445,9 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct apple_pmp_report_entry *ent;
-	const struct apple_pmp_report *rep;
+	struct apple_pmp_report *rep;
 	struct apple_pmp_start *start;
+	bool is_off;
 	int ret;
 	const char *name;
 	struct of_phandle_iterator it;
@@ -1467,8 +1494,24 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	}
 
 	if (of_property_read_bool(node, "apple,always-on")) {
-		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		/* Requested from here on: genpd must not drop it as unused. */
+		ent->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP | GENPD_FLAG_ALWAYS_ON;
 		apple_pmp_report_entry_set_state(&ent->genpd, true);
+	}
+
+	/*
+	 * Start from the request bit. A PMGR power state that is already on
+	 * (left on by the bootloader) can only be added below a domain that
+	 * is on too, and the request stays set until genpd turns it off.
+	 */
+	if (!rep) {
+		ret = -ENODEV;
+		goto err_free;
+	}
+	is_off = !apple_pmp_report_requested(rep, ent->id);
+	if (is_off && (ent->genpd.flags & GENPD_FLAG_ALWAYS_ON)) {
+		ret = dev_err_probe(dev, -EIO, "always-on request %u is not set\n", ent->id);
+		goto err_free;
 	}
 
 	ent->genpd.power_on = apple_pmp_report_entry_power_on;
@@ -1481,7 +1524,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "apple,irq-safe"))
 		ent->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 
-	ret = pm_genpd_init(&ent->genpd, NULL, true);
+	ret = pm_genpd_init(&ent->genpd, NULL, is_off);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "pm_genpd_init failed\n");
 		goto err_free;
