@@ -29,28 +29,37 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install build tools
         run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUNNER_TEMP/llvm-key.asc"
+          sudo install -m 644 "$RUNNER_TEMP/llvm-key.asc" /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo 'deb https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update -q
-          sudo apt-get install -y -q clang-18 lld-18 llvm-18 libclang-18-dev flex bison bc libelf-dev libssl-dev
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src --no-self-update
+          sudo apt-get install -y -q clang-22 lld-22 llvm-22 libclang-22-dev flex bison bc libelf-dev libssl-dev
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src --component rustfmt --no-self-update
           cargo install bindgen-cli --version 0.73.2 --locked
           bin="$RUNNER_TEMP/llvm"
           mkdir -p "$bin"
           for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
-            ln -s "$(command -v "$tool-18")" "$bin/$tool"
+            ln -s "$(command -v "$tool-22")" "$bin/$tool"
           done
           echo "$bin" >> "$GITHUB_PATH"
-          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-22/lib" >> "$GITHUB_ENV"
       - name: Configure the Asahi drivers as built-ins
         run: |
           make O=out defconfig
           scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/asahi.config
-          scripts/config --file out/.config -e RUST -e DRM_ASAHI -e APPLE_PMP_REPORT
+          # Distribution configs enable SCHEDSTATS. Keep its aligned structure
+          # nonempty: bindgen cannot model the empty aligned form faithfully.
+          scripts/config --file out/.config -e RUST -e DRM_ASAHI -e APPLE_PMP_REPORT -e SCHEDSTATS
           make O=out olddefconfig
           grep -qx CONFIG_RUST=y out/.config
           grep -qx CONFIG_DRM_ASAHI=y out/.config
           grep -qx CONFIG_APPLE_PMP_REPORT=y out/.config
+          grep -qx CONFIG_SCHEDSTATS=y out/.config
           cp out/.config "$RUNNER_TEMP/asahi-stats.config"
           make O=out rustavailable
+          clang --version
+          rustc --version
+          bindgen --version
       - name: Build and link the ARM64 kernel
         run: |
           set -o pipefail
