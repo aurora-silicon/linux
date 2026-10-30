@@ -19,8 +19,9 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-v4l2.h>
 
+struct debugfs_blob_wrapper;
+struct dentry;
 struct dev_pm_domain_list;
-struct firmware;
 struct iommu_domain;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
@@ -93,12 +94,20 @@ enum ave_fw_state {
 	AVE_FW_BROKEN,
 };
 
-/* Session command images that only differ from the listed fields. */
-enum ave_tmpl {
-	AVE_TMPL_START,
-	AVE_TMPL_PROCESS,
-	AVE_TMPL_COUNT,
+/* The two large session commands, and their sizes per codec */
+enum ave_image {
+	AVE_IMAGE_START,
+	AVE_IMAGE_PROCESS,
+	AVE_IMAGE_COUNT,
 };
+
+#define AVE_START_H264_BYTES		0x3180
+#define AVE_START_HEVC_BYTES		0x13f28
+#define AVE_PROCESS_H264_BYTES		0x63d8
+#define AVE_PROCESS_HEVC_BYTES		0xb1c0
+
+/* The firmware build whose command layouts the driver generates */
+#define AVE_FW_TEXT_CRC_9003_78_0	0x69c54454
 
 struct ave_ctx;
 
@@ -113,13 +122,12 @@ struct ave_dev {
 	struct ave_fw_segment text;
 	struct ave_fw_segment data;
 	u32 text_crc;
-	char board[16];			/* from the root compatible, e.g. "j700" */
 	void *data_pristine;
 	bool data_dirty;
 
-	/* Protects tmpl[]; the images stay loaded until the driver goes. */
-	struct mutex tmpl_lock;
-	const struct firmware *tmpl[2][AVE_TMPL_COUNT];
+	/* debugfs: the last Start and first Process built, per codec */
+	struct dentry *debugfs;
+	void *dump[2][AVE_IMAGE_COUNT];
 
 	/* Serialises every firmware and ring access. */
 	struct mutex hw_lock;
@@ -161,7 +169,7 @@ struct ave_params {
 	u32 refs;			/* max_num_ref_frames + 1 */
 	bool bframes;
 	bool intra_only;
-	bool low_delay;			/* Complete after every frame */
+	bool reorder_off;		/* the client asked for no B-frames */
 	u32 gop;
 	u32 rc_mode;
 	u32 bitrate;
@@ -212,6 +220,10 @@ struct ave_session {
 	bool fw_open;			/* Open sent, Close not yet */
 	bool resume;			/* closed for system sleep, reopen on next frame */
 	bool copy_noted;
+	/* CBR: bytes under budget so far, and who pads (see ave_sess_cbr_fill()) */
+	s64 cbr_surplus;
+	bool fw_fills;
+	bool host_fill_noted;
 	bool warned;
 	bool checked[2];		/* Start/Process images checked for stale addresses */
 	bool handed;			/* Start sent: the firmware knows the buffers */
@@ -266,7 +278,7 @@ int ave_fw_ensure_running(struct ave_dev *ave);
 void ave_fw_halt(struct ave_dev *ave);
 int ave_fw_shutdown(struct ave_dev *ave);
 void ave_fw_lost(struct ave_dev *ave);
-int ave_fw_templates(struct ave_dev *ave, enum ave_codec codec);
+int ave_fw_check_build(struct ave_dev *ave);
 int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long attrs);
 int ave_alloc_padded(struct ave_dev *ave, struct ave_buf *b, size_t size, size_t alloc,
 		     unsigned long attrs);
@@ -303,10 +315,17 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *dst,
 		    bool *keyframe);
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);
-void ave_sess_check_addrs(struct ave_ctx *ctx, const u8 *cmd, size_t len, unsigned int kind,
-			  dma_addr_t input);
 bool ave_sess_stalled(struct ave_session *sess);
 bool ave_sess_starved(struct ave_session *sess);
+
+/* ave-image.c */
+void ave_image_start(u8 *cmd, size_t len, enum ave_codec codec, bool reorder_off,
+		     bool hevc_low_delay);
+void ave_image_process(u8 *cmd, size_t len, enum ave_codec codec);
+
+/* ave-drv.c */
+void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image kind,
+		      const void *cmd, size_t len);
 
 /* ave-v4l2.c */
 void ave_v4l2_suspend(struct ave_dev *ave);

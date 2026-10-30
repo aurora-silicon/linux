@@ -9,6 +9,7 @@
  *
  * Copyright The Aurora Silicon Contributors
  */
+#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
@@ -20,6 +21,51 @@
 #include "ave.h"
 
 #define AVE_AUTOSUSPEND_MS	2000
+
+/*
+ * debugfs: apple-ave/last_start_{h264,hevc} hold the last Start built and
+ * last_process0_{h264,hevc} the first Process of the last session, so the
+ * generated commands can be compared with reference captures.
+ */
+static const size_t ave_image_bytes[2][AVE_IMAGE_COUNT] = {
+	{ AVE_START_H264_BYTES, AVE_PROCESS_H264_BYTES },
+	{ AVE_START_HEVC_BYTES, AVE_PROCESS_HEVC_BYTES },
+};
+
+void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image kind,
+		      const void *cmd, size_t len)
+{
+	void *dst = ave->dump[codec - 1][kind];
+
+	if (dst && len == ave_image_bytes[codec - 1][kind])
+		memcpy(dst, cmd, len);
+}
+
+static void ave_debugfs_init(struct ave_dev *ave)
+{
+	static const char * const names[2][AVE_IMAGE_COUNT] = {
+		{ "last_start_h264", "last_process0_h264" },
+		{ "last_start_hevc", "last_process0_hevc" },
+	};
+
+	if (!IS_ENABLED(CONFIG_DEBUG_FS))
+		return;
+	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
+	for (unsigned int c = 0; c < 2; c++)
+		for (unsigned int k = 0; k < AVE_IMAGE_COUNT; k++) {
+			struct debugfs_blob_wrapper *blob;
+
+			blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
+			ave->dump[c][k] = devm_kzalloc(ave->dev, ave_image_bytes[c][k], GFP_KERNEL);
+			if (!blob || !ave->dump[c][k]) {
+				ave->dump[c][k] = NULL;
+				continue;
+			}
+			blob->data = ave->dump[c][k];
+			blob->size = ave_image_bytes[c][k];
+			debugfs_create_blob(names[c][k], 0400, ave->debugfs, blob);
+		}
+}
 
 static const char * const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0", "me1" };
 
@@ -78,6 +124,7 @@ static int ave_probe(struct platform_device *pdev)
 		ave_fw_remove(ave);
 		return ret;
 	}
+	ave_debugfs_init(ave);
 	return 0;
 }
 
@@ -85,6 +132,7 @@ static void ave_remove(struct platform_device *pdev)
 {
 	struct ave_dev *ave = platform_get_drvdata(pdev);
 
+	debugfs_remove_recursive(ave->debugfs);
 	ave_v4l2_unregister(ave);
 
 	/*
@@ -171,12 +219,6 @@ static struct platform_driver ave_driver = {
 	},
 };
 module_platform_driver(ave_driver);
-
-/* Session images, extracted from the user's macOS installation */
-MODULE_FIRMWARE("apple/ave-j700-h264-start.bin");
-MODULE_FIRMWARE("apple/ave-j700-h264-process.bin");
-MODULE_FIRMWARE("apple/ave-j700-hevc-start.bin");
-MODULE_FIRMWARE("apple/ave-j700-hevc-process.bin");
 
 MODULE_DESCRIPTION("Apple AVE video encoder");
 MODULE_LICENSE("GPL");

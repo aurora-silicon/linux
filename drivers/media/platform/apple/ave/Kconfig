@@ -5,17 +5,14 @@ config VIDEO_APPLE_AVE
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on VIDEO_DEV && IOMMU_DMA && PM_GENERIC_DOMAINS
 	select CRC32
-	select FW_LOADER
 	select V4L2_MEM2MEM_DEV
 	select VIDEOBUF2_DMA_CONTIG
 	help
 	  V4L2 memory-to-memory driver for the AVE H.264/HEVC encoder in
 	  Apple T8140 (A18 Pro) SoCs, as in the MacBook Neo.
 
-	  The encoder firmware is loaded by the bootloader. The constant
-	  parts of its session commands are read from apple/ave-<machine>-*.bin
-	  in the firmware search path, extracted from the user's own macOS
-	  installation. See Documentation/admin-guide/media/apple-ave.rst.
+	  The encoder firmware is loaded by the bootloader; the driver builds
+	  every command itself. See Documentation/admin-guide/media/apple-ave.rst.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-ave.

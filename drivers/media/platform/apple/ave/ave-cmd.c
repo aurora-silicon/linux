@@ -2,15 +2,13 @@
 /*
  * Apple AVE video encoder: firmware commands
  *
- * Start and Process are large command images. Most of their words never
- * change between sessions of a firmware build; the driver takes those from
- * a per-build image file (see ave_fw_templates()) and writes every field
- * that depends on the session or the frame itself.
+ * Start and Process are large command images. Each is built in a zeroed
+ * buffer: the header, the constant words (ave-image.c), then every field
+ * that depends on the session or the frame.
  *
  * Copyright The Aurora Silicon Contributors
  */
 #include <linux/device.h>
-#include <linux/firmware.h>
 #include <linux/math64.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
@@ -217,9 +215,6 @@ int ave_cmd_close(struct ave_ctx *ctx)
 
 /* Start (id 6) */
 
-#define AVE_START_H264_BYTES		0x3180
-#define AVE_START_HEVC_BYTES		0x13f28
-
 #define AVE_START_SURFACE		0x48	/* and an unused second one at 0x58 */
 #define AVE_START_SURFACE_BYTES		0x12c000
 #define AVE_START_SURFACE2		0x58
@@ -277,7 +272,7 @@ static const u16 ave_start_tile_off[AVE_TILE_BUFS] = {
 #define AVE_START_CODEC_FLAGS		0x370
 #define AVE_START_H264_380		0x380
 #define AVE_START_H264_384		0x384
-#define AVE_START_H264_HIGH		0x2588
+#define AVE_START_CODEC_2588		0x2588	/* 2 for H.264 High and HEVC */
 #define AVE_START_BIT_DEPTH		0x2598
 #define AVE_START_CODED_H2		0x25dc
 
@@ -428,7 +423,7 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd)
 
 	if (!hevc) {
 		ave_put32(cmd, AVE_START_H264_384, p->width * p->height <= 320 * 240 ? 0x40 : 0x10);
-		ave_put32(cmd, AVE_START_H264_HIGH, p->high ? 2 : 0);
+		ave_put32(cmd, AVE_START_CODEC_2588, p->high ? 2 : 0);
 		ave_put32(cmd, AVE_START_H264_PROFILE, p->profile);
 		ave_put32(cmd, AVE_START_H264_LEVEL, p->level);
 		ave_put32(cmd, AVE_START_H264_MAX_REFS, p->refs - 1);
@@ -468,33 +463,35 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd)
 	ave_put32(cmd, AVE_START_HEVC_CONF_BOTTOM, crop_b);
 	ave_put32(cmd, AVE_START_HEVC_DEPTH_LUMA, 0);
 	ave_put32(cmd, AVE_START_HEVC_DEPTH_CHROMA, 0);
-	/* Only the B-frame structure is described for HEVC (see ave-sess.c). */
-	ave_put32(cmd, AVE_START_HEVC_REFS, 4);
+	/* Reference structure: B-frame pyramid or low-delay P (ave-image.c) */
+	ave_put32(cmd, AVE_START_HEVC_REFS, p->bframes ? 4 : 1);
 	ave_put32(cmd, AVE_START_HEVC_DPB_MINUS1, 4);
-	ave_put32(cmd, AVE_START_HEVC_REORDER, 2);
-	ave_put32(cmd, AVE_START_HEVC_REORDER_COPY, 2);
-	ave_put32(cmd, AVE_START_HEVC_REORDER_ON, 1);
+	ave_put32(cmd, AVE_START_HEVC_REORDER, p->bframes ? 2 : 0);
+	ave_put32(cmd, AVE_START_HEVC_REORDER_COPY, p->bframes ? 2 : 0);
+	ave_put32(cmd, AVE_START_HEVC_REORDER_ON, p->bframes);
 }
 
 int ave_cmd_start(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
-	const struct firmware *tmpl = ave->tmpl[sess->p.codec - 1][AVE_TMPL_START];
+	const struct ave_params *p = &sess->p;
+	size_t len = p->codec == AVE_CODEC_HEVC ? AVE_START_HEVC_BYTES : AVE_START_H264_BYTES;
 	u8 *cmd;
 	int ret;
 
-	cmd = ave_ipc_cmd(ave, AVE_BUF_CMD, tmpl->size);
+	cmd = ave_ipc_cmd(ave, AVE_BUF_CMD, len);
 	if (!cmd)
 		return -EBUSY;
-	memcpy(cmd, tmpl->data, tmpl->size);
+	ave_image_start(cmd, len, p->codec, p->reorder_off,
+			p->codec == AVE_CODEC_HEVC && !p->bframes);
 	ave_cmd_header(ctx, cmd, AVE_OP_START, AVE_OP_START, AVE_SESSION_ARG0,
 		       ave_session_setup_arg2(ctx));
 	ave_start_surfaces(sess, cmd);
 	ave_start_config(&sess->p, cmd);
-	ave_sess_check_addrs(ctx, cmd, tmpl->size, AVE_TMPL_START, 0);
+	ave_debugfs_save(ave, p->codec, AVE_IMAGE_START, cmd, len);
 
-	ret = ave_ipc_submit(ave, AVE_BUF_CMD, tmpl->size, AVE_CMD_SESSION_TIMEOUT_US, true);
+	ret = ave_ipc_submit(ave, AVE_BUF_CMD, len, AVE_CMD_SESSION_TIMEOUT_US, true);
 	if (ret)
 		return ret;
 	sess->handed = true;
@@ -523,6 +520,7 @@ struct ave_proc_layout {
 	u32 frame_buf;		/* H.264 only */
 	u32 shdr_table;		/* HEVC only */
 	u32 crop;		/* HEVC only */
+	u32 low_delay;		/* HEVC only: 3 with reordering off */
 };
 
 static const struct ave_proc_layout ave_proc_h264 = {
@@ -556,12 +554,14 @@ static const struct ave_proc_layout ave_proc_hevc = {
 	.force_key = 0x6128, .force_type = 0x74c8,
 	.shdr_table = 0xd88,
 	.crop = 0x74dc,
+	.low_delay = 0xcf8,
 };
 
 #define AVE_PROC_TIMESCALE		14400000ULL
 #define AVE_PROC_SHDR_ENTRIES		256
 #define AVE_PROC_SHDR_STRIDE		0x400
 #define AVE_PROC_FORCED_TYPE		2
+#define AVE_PROC_LOW_DELAY		3
 
 int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
 		    dma_addr_t input, u32 bitrate, bool force_key)
@@ -571,7 +571,7 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	const struct ave_params *p = &sess->p;
 	const struct ave_proc_layout *l = p->codec == AVE_CODEC_HEVC ? &ave_proc_hevc :
 								       &ave_proc_h264;
-	const struct firmware *tmpl = ave->tmpl[p->codec - 1][AVE_TMPL_PROCESS];
+	size_t len = p->codec == AVE_CODEC_HEVC ? AVE_PROCESS_HEVC_BYTES : AVE_PROCESS_H264_BYTES;
 	struct ave_slot *s = &sess->slot[slot];
 	unsigned int buf = AVE_BUF_PROC(sess->index * AVE_MAX_SLOTS + slot);
 	dma_addr_t y = input;
@@ -582,10 +582,10 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	ret = ave_ipc_wait_ack(ave, buf);
 	if (ret)
 		return ret;
-	cmd = ave_ipc_cmd(ave, buf, tmpl->size);
+	cmd = ave_ipc_cmd(ave, buf, len);
 	if (!cmd)
 		return -EBUSY;
-	memcpy(cmd, tmpl->data, tmpl->size);
+	ave_image_process(cmd, len, p->codec);
 	ave_cmd_header(ctx, cmd, AVE_OP_PROCESS, AVE_PROC_SUBTYPE + slot, 0,
 		       ave_session_arg2(ctx));
 
@@ -631,9 +631,12 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	ave_put64(cmd, l->pts, pts);
 	ave_put32(cmd, l->force_key, force_key);
 	ave_put32(cmd, l->force_type, force_key ? AVE_PROC_FORCED_TYPE : 0);
-	ave_sess_check_addrs(ctx, cmd, tmpl->size, AVE_TMPL_PROCESS, y);
+	if (l->low_delay)
+		ave_put32(cmd, l->low_delay, p->bframes ? 0 : AVE_PROC_LOW_DELAY);
+	if (!sess->frames)
+		ave_debugfs_save(ave, p->codec, AVE_IMAGE_PROCESS, cmd, len);
 
-	ret = ave_ipc_submit(ave, buf, tmpl->size, AVE_CMD_SESSION_TIMEOUT_US, false);
+	ret = ave_ipc_submit(ave, buf, len, AVE_CMD_SESSION_TIMEOUT_US, false);
 	if (ret)
 		return ret;
 	s->src = src;

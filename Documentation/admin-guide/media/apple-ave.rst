@@ -34,30 +34,21 @@ two reserved, DART-mapped segments (TEXT and DATA) but does not start it. The
 Aurora Stage 2 loader passes both regions in the device's ``memory-region``
 property and records their CRC32 under ``/chosen`` as
 ``aurora,ave-text-crc32`` and ``aurora,ave-data-crc32``. The driver only binds
-to firmware builds whose command formats it knows, identified by the TEXT
-checksum, and only while DATA still matches the recorded checksum. It keeps
-a copy of DATA and restores it before every firmware boot.
+while DATA still matches the recorded checksum, and keeps a copy of DATA that
+it restores before every firmware boot.
 
-Session images
---------------
+No firmware files are needed. The driver builds every command itself,
+including the two large session commands (Start and Process), from the
+session settings and a set of constant fields known for one firmware build:
+AppleAVE2FW 9003.78.0, TEXT checksum ``69c54454``. With any other firmware
+build the device binds, but starting a stream fails with ``ENOTSUPP`` and a
+message naming the checksum, until that build's command layout has been
+checked.
 
-Most words of the two large session commands, Start and Process, are
-constant for a machine and its firmware. They are not part of the kernel.
-The driver loads them from four files named after the machine (the first
-root compatible without its vendor prefix, ``j700`` on the MacBook Neo)::
-
-  apple/ave-j700-h264-start.bin     (0x3180 bytes)
-  apple/ave-j700-h264-process.bin   (0x63d8 bytes)
-  apple/ave-j700-hevc-start.bin     (0x13f28 bytes)
-  apple/ave-j700-hevc-process.bin   (0xb1c0 bytes)
-
-The files are extracted from the user's own macOS installation by the
-Aurora firmware extractor, in the same way as other firmware the machine
-needs, and installed under the firmware search path (usually
-``/lib/firmware``). No Apple data is shipped with the kernel. The driver
-writes every field that depends on the session or the frame itself, so the
-same files serve every size, profile and rate. A missing or wrong-sized
-file makes ``VIDIOC_STREAMON`` fail with a message naming it.
+With debugfs mounted, ``apple-ave/last_start_h264``,
+``last_start_hevc``, ``last_process0_h264`` and ``last_process0_hevc`` hold the
+last Start command built and the first Process command of the last session,
+for comparison with reference captures.
 
 Sessions and power management
 -----------------------------
@@ -89,12 +80,13 @@ Limits
   size (ffmpeg does, for widths that are not a multiple of 64) are detected
   from the payload size and their frames copied to the encoder's layout.
 - Rate control is VBR, with ``BITRATE_PEAK`` as a one-second data-rate cap
-  (twice the average when left at 0), or CBR. Constant quality is not
-  offered. ``BITRATE`` may change while streaming and applies from the next
+  (twice the average when left at 0), or CBR. In CBR mode, frames are padded
+  with filler data once more than half a second of bit rate has gone unused,
+  as macOS does; the driver adds the filler itself if the firmware does not.
+  Constant quality is not offered. ``BITRATE`` may change while streaming and applies from the next
   frame; ``FORCE_KEY_FRAME`` makes the next frame an IDR.
-- H.264 uses either three B-frames or none (Baseline and a GOP size of 1 never
-  use them). HEVC always uses them; with ``B_FRAMES`` set to 0 every frame is
-  flushed through at once instead.
+- Either three B-frames or none (``B_FRAMES`` 3 or 0). H.264 Baseline and a
+  GOP size of 1 never use them.
 - The level control is a minimum: the driver raises it to what the size,
   frame rate and bit rate need.
 - Buffers are mapped through the encoder's 256 MiB DMA window, so both queues

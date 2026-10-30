@@ -13,7 +13,6 @@
 #include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
-#include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
@@ -21,7 +20,6 @@
 #include <linux/of_address.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
-#include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
 #include "ave.h"
@@ -107,21 +105,6 @@ static u32 ave_fw_crc(const struct ave_fw_segment *seg, void **copy)
 }
 
 /*
- * The session images are per machine: "j700" from "apple,j700", the first
- * root compatible.
- */
-static void ave_fw_board_name(struct ave_dev *ave)
-{
-	const char *compat = NULL, *comma;
-
-	of_property_read_string_index(of_root, "compatible", 0, &compat);
-	if (!compat)
-		compat = "unknown";
-	comma = strchr(compat, ',');
-	strscpy(ave->board, comma ? comma + 1 : compat, sizeof(ave->board));
-}
-
-/*
  * Find the firmware, check that it is a build we speak to and that DATA is
  * still as the bootloader left it, and keep a copy of DATA for restarts.
  */
@@ -151,8 +134,6 @@ int ave_fw_probe(struct ave_dev *ave)
 		return dev_err_probe(dev, -ENODEV, "unsupported firmware (text CRC %08x)\n",
 				     text_crc);
 	ave->text_crc = text_crc;
-	mutex_init(&ave->tmpl_lock);
-	ave_fw_board_name(ave);
 
 	ave->data_pristine = vmalloc(ave->data.size);
 	if (!ave->data_pristine)
@@ -226,67 +207,20 @@ int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long
 }
 
 /*
- * Start and Process are mostly constant for a machine and its firmware.
- * Those constant words come from image files named after the machine,
- * which the user extracts from their own macOS installation; the driver
- * fills in every session and frame field itself.
+ * The driver generates Start and Process for one firmware build; other
+ * builds may lay them out differently, so they are not driven.
  */
-static const char * const ave_codec_name[] = { "h264", "hevc" };
-static const char * const ave_tmpl_name[AVE_TMPL_COUNT] = { "start", "process" };
-static const size_t ave_tmpl_size[2][AVE_TMPL_COUNT] = {
-	{ 0x3180, 0x63d8 },	/* H.264 */
-	{ 0x13f28, 0xb1c0 },	/* HEVC */
-};
-
-#define AVE_TMPL_CODEC		0xc0	/* Start: codec word of the session image */
-
-int ave_fw_templates(struct ave_dev *ave, enum ave_codec codec)
+int ave_fw_check_build(struct ave_dev *ave)
 {
-	unsigned int c = codec - 1;
-	char name[64];
-	int ret = 0;
-
-	mutex_lock(&ave->tmpl_lock);
-	for (unsigned int t = 0; t < AVE_TMPL_COUNT && !ret; t++) {
-		const struct firmware *fw;
-
-		if (ave->tmpl[c][t])
-			continue;
-		snprintf(name, sizeof(name), "apple/ave-%s-%s-%s.bin", ave->board,
-			 ave_codec_name[c], ave_tmpl_name[t]);
-		ret = request_firmware(&fw, name, ave->dev);
-		if (ret) {
-			dev_err(ave->dev, "cannot load %s (%d); extract it from macOS first\n",
-				name, ret);
-			break;
-		}
-		if (fw->size != ave_tmpl_size[c][t]) {
-			dev_err(ave->dev, "%s is %zu bytes, expected %zu\n", name, fw->size,
-				ave_tmpl_size[c][t]);
-			release_firmware(fw);
-			ret = -EINVAL;
-			break;
-		}
-		if (t == AVE_TMPL_START && get_unaligned_le32(fw->data + AVE_TMPL_CODEC) != codec) {
-			dev_err(ave->dev, "%s is not a %s session image\n", name,
-				ave_codec_name[c]);
-			release_firmware(fw);
-			ret = -EINVAL;
-			break;
-		}
-		ave->tmpl[c][t] = fw;
-	}
-	mutex_unlock(&ave->tmpl_lock);
-	return ret;
+	if (ave->text_crc == AVE_FW_TEXT_CRC_9003_78_0)
+		return 0;
+	dev_err(ave->dev, "encoder firmware %08x is not validated for encoding (only %08x is)\n",
+		ave->text_crc, AVE_FW_TEXT_CRC_9003_78_0);
+	return -ENOTSUPP;
 }
 
 void ave_fw_remove(struct ave_dev *ave)
 {
-	for (unsigned int c = 0; c < 2; c++)
-		for (unsigned int t = 0; t < AVE_TMPL_COUNT; t++) {
-			release_firmware(ave->tmpl[c][t]);
-			ave->tmpl[c][t] = NULL;
-		}
 	ave_free(ave, &ave->heap);
 	ave_free(ave, &ave->log);
 	ave_free(ave, &ave->boot_cfg);

@@ -478,8 +478,7 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
 	/*
 	 * The firmware either uses up to three B-frames (reordering them
-	 * itself) or none. Baseline and intra-only H.264 never have any;
-	 * HEVC always has them for now.
+	 * itself) or none. Baseline and intra-only H.264 never have any.
 	 */
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 3, 3, 3);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
@@ -740,7 +739,7 @@ static int ave_session_begin(struct ave_ctx *ctx)
 
 	if (ctx->sess)
 		return 0;
-	ret = ave_fw_templates(ave, ave_ctx_codec(ctx));
+	ret = ave_fw_check_build(ave);
 	if (ret)
 		return ret;
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
@@ -1029,14 +1028,6 @@ static int ave_encode_one(struct ave_ctx *ctx)
 			ret = ave_cmd_complete(ctx, 1);
 		if (!ret)
 			ret = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
-		if (ret)
-			return ret;
-	} else if (sess->p.low_delay) {
-		/* Make the firmware code this frame now, without lookahead. */
-		ret = ave_cmd_complete(ctx, 1);
-		sess->nudged = true;
-		if (!ret)
-			ret = ave_ipc_pump(ave, 0, NULL, NULL);
 		if (ret)
 			return ret;
 	} else {

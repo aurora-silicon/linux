@@ -27,6 +27,10 @@
 #define AVE_RC_VBR			4
 #define AVE_RC_CBR			2
 
+/* Filler-data NAL unit types */
+#define AVE_H264_NAL_FILLER		12
+#define AVE_HEVC_NAL_FILLER		38
+
 #define AVE_H264_BASELINE		2
 #define AVE_H264_MAIN			4
 #define AVE_H264_HIGH			6
@@ -141,18 +145,14 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		p->min_qp = p->max_qp;
 
 	/*
-	 * Reference structures as macOS sets them up. H.264 has all three
-	 * (B-frames, P only, intra only). HEVC without B-frames needs a
-	 * reference-set table whose contents are not known yet, so HEVC
-	 * always uses B-frames.
+	 * Reference structures as macOS sets them up: a B-frame pyramid,
+	 * P frames only (low delay), or (H.264) intra only.
 	 */
 	p->intra_only = p->codec == AVE_CODEC_H264 && ctx->gop_size == 1;
-	p->bframes = p->codec == AVE_CODEC_HEVC ||
-		     (!baseline && !p->intra_only && ctx->b_frames);
+	p->bframes = !baseline && !p->intra_only && ctx->b_frames;
+	p->reorder_off = !ctx->b_frames;
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;
-	/* HEVC asked to go without B-frames: flush every frame instead. */
-	p->low_delay = p->codec == AVE_CODEC_HEVC && !ctx->b_frames;
 	p->gop = ctx->gop_size ?: 120;
 
 	p->bitrate = ctx->bitrate;
@@ -584,8 +584,9 @@ static bool ave_starts_annexb(const u8 *p, size_t len)
 	       (len >= 4 && !p[0] && !p[1] && !p[2] && p[3] == 1);
 }
 
-/* NAL unit types in an Annex B buffer: is there a key frame / parameter set? */
-static void ave_scan_nals(const u8 *p, size_t len, bool hevc, bool *key, bool *params)
+/* NAL unit types in an Annex B buffer: key frame, parameter sets, filler? */
+static void ave_scan_nals(const u8 *p, size_t len, bool hevc, bool *key, bool *params,
+			  bool *filler)
 {
 	for (size_t i = 0; i + 3 < len; i++) {
 		u32 type;
@@ -596,9 +597,11 @@ static void ave_scan_nals(const u8 *p, size_t len, bool hevc, bool *key, bool *p
 		if (hevc) {
 			*key |= type >= 16 && type <= 21;
 			*params |= type >= 32 && type <= 34;
+			*filler |= type == AVE_HEVC_NAL_FILLER;
 		} else {
 			*key |= type == 5;
 			*params |= type == 7;
+			*filler |= type == AVE_H264_NAL_FILLER;
 		}
 		i += 2;
 	}
@@ -650,6 +653,65 @@ static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *w
 }
 
 /*
+ * CBR padding. macOS streams in CBR mode follow a buffer model: each frame
+ * has a budget of bitrate / (8 x fps) bytes, and once the bytes left unused
+ * add up to more than 0.5 s of bit rate (the 0.5 s VBV buffer of Start
+ * +0x290), every frame is padded with a filler-data NAL unit so the surplus
+ * stays there. Whether the firmware or macOS user space writes that filler
+ * is not known; if the firmware's output never carries filler, the driver
+ * adds it here.
+ */
+#define AVE_FILLER_OVERHEAD	7	/* start code, NAL header, trailing bits */
+
+static size_t ave_sess_cbr_fill(struct ave_ctx *ctx, u8 *out, size_t len, size_t room,
+				bool fw_filler)
+{
+	struct ave_session *sess = ctx->sess;
+	const struct ave_params *p = &sess->p;
+	bool hevc = p->codec == AVE_CODEC_HEVC;
+	s64 budget = div_u64((u64)p->bitrate * p->fps_den, 8ULL * p->fps_num);
+	s64 vbv = p->bitrate / 16;	/* 0.5 s of bit rate, in bytes */
+	s64 excess, pad;
+	u8 *f;
+
+	if (p->rc_mode != AVE_RC_CBR)
+		return len;
+	if (fw_filler && !sess->fw_fills) {
+		sess->fw_fills = true;
+		dev_dbg(ctx->ave->dev, "CBR: the firmware writes filler data\n");
+	}
+	excess = sess->cbr_surplus + budget - (s64)len - vbv;
+	if (!sess->fw_fills && excess > AVE_FILLER_OVERHEAD) {
+		pad = min_t(s64, excess, room - len);
+		if (pad > AVE_FILLER_OVERHEAD) {
+			f = out + len;
+			f[0] = 0;
+			f[1] = 0;
+			f[2] = 0;
+			f[3] = 1;
+			if (hevc) {
+				/* nal_unit_type 38, layer 0, temporal id 0 + 1 */
+				f[4] = AVE_HEVC_NAL_FILLER << 1;
+				f[5] = 1;
+				memset(f + 6, 0xff, pad - AVE_FILLER_OVERHEAD);
+			} else {
+				f[4] = AVE_H264_NAL_FILLER;
+				memset(f + 5, 0xff, pad - AVE_FILLER_OVERHEAD + 1);
+			}
+			f[pad - 1] = 0x80;	/* rbsp_stop_one_bit */
+			len += pad;
+			if (!sess->host_fill_noted) {
+				sess->host_fill_noted = true;
+				dev_dbg(ctx->ave->dev,
+					"CBR: no filler from the firmware, the driver adds it\n");
+			}
+		}
+	}
+	sess->cbr_surplus += budget - (s64)len;
+	return len;
+}
+
+/*
  * Assemble the access unit of @slot into @dst: the parameter sets the
  * firmware leaves in the metadata buffer (when it emits them), for HEVC the
  * slice header from the first slice-header entry, then the coded data.
@@ -666,7 +728,7 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	size_t room = vb2_plane_size(&dst->vb2_buf, 0);
 	const u8 *meta = s->meta.cpu;
 	u32 data, data2, shdr = 0;
-	bool params = false;
+	bool params = false, filler = false;
 	ssize_t ps = 0;
 	size_t len;
 	int at;
@@ -707,78 +769,12 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 
 	if (!ave_starts_annexb(out, len))
 		ave_sess_dump(ctx, s, "not Annex B");
-	ave_scan_nals(out, len, hevc, keyframe, &params);
+	ave_scan_nals(out, len, hevc, keyframe, &params, &filler);
 	if (!ctx->dst_sequence && !params)
 		ave_sess_dump(ctx, s, "first frame has no parameter sets");
+	len = ave_sess_cbr_fill(ctx, out, len, room, filler);
 	vb2_set_plane_payload(&dst->vb2_buf, 0, len);
 	return 0;
-}
-
-/*
- * Every 64-bit word in a command that looks like an encoder DART address
- * should be one of ours. One that is not came from the session image (a
- * stale macOS address) and makes the firmware write to an unmapped page.
- * Reported once per session and command kind.
- */
-static bool ave_buf_has(const struct ave_buf *b, u64 addr)
-{
-	return b->cpu && addr >= b->dma && addr < b->dma + b->alloc;
-}
-
-static bool ave_sess_owns(struct ave_session *sess, u64 addr)
-{
-	const struct ave_buf *fixed[] = {
-		&sess->hdr, &sess->mb, &sess->row_a, &sess->row_b, &sess->fixed,
-		&sess->hevc_extra[0], &sess->hevc_extra[1],
-	};
-
-	for (unsigned int i = 0; i < ARRAY_SIZE(fixed); i++)
-		if (ave_buf_has(fixed[i], addr))
-			return true;
-	for (unsigned int i = 0; i < AVE_MAX_REFS; i++)
-		if (ave_buf_has(&sess->ref_a[i], addr) || ave_buf_has(&sess->ref_b[i], addr) ||
-		    ave_buf_has(&sess->ref_c[i], addr) || ave_buf_has(&sess->ref_d[i], addr))
-			return true;
-	for (unsigned int i = 0; i < AVE_TILE_BUFS; i++)
-		if (ave_buf_has(&sess->tile[i], addr) || ave_buf_has(&sess->tile_aux[i], addr))
-			return true;
-	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++)
-		if (ave_buf_has(&sess->slot[s].coded, addr) ||
-		    ave_buf_has(&sess->slot[s].meta, addr) ||
-		    ave_buf_has(&sess->slot[s].aux, addr))
-			return true;
-	return false;
-}
-
-void ave_sess_check_addrs(struct ave_ctx *ctx, const u8 *cmd, size_t len, unsigned int kind,
-			  dma_addr_t input)
-{
-	struct ave_session *sess = ctx->sess;
-	struct ave_dev *ave = ctx->ave;
-	unsigned int bad = 0;
-
-	if (sess->checked[kind])
-		return;
-	sess->checked[kind] = true;
-	for (size_t off = AVE_CMD_HDR_BYTES; off + 8 <= len; off += 4) {
-		u64 v = get_unaligned_le64(cmd + off);
-
-		/* The encoder's DART window: 0x100_0000_0000 + 256 MiB. */
-		if ((v >> 28) != 0x1000)
-			continue;
-		if (ave_sess_owns(sess, v) || (input && v >= input && v < input + SZ_32M) ||
-		    (v >= ave->ipc.dma && v < ave->ipc.dma + ave->ipc.size))
-			continue;
-		/* Pointers into the firmware image are the same as on macOS. */
-		if (v >= ave->text.iova && v < ave->data.iova + ave->data.size)
-			continue;
-		if (bad++ < 16)
-			dev_warn(ave->dev, "%s +%#zx holds %#llx, not a buffer of this session\n",
-				 kind == AVE_TMPL_START ? "Start" : "Process", off, v);
-	}
-	if (bad)
-		dev_warn(ave->dev, "%u stale addresses in the %s image\n", bad,
-			 kind == AVE_TMPL_START ? "Start" : "Process");
 }
 
 /*
