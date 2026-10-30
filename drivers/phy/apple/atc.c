@@ -4326,9 +4326,6 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	    mode == PHY_MODE_USB_DEVICE)
 		return -EOPNOTSUPP;
 
-	if (atcphy->usb_off_pending)
-		return -EBUSY;
-
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
 		atcphy->host_active = true;
