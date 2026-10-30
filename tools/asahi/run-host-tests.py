@@ -134,7 +134,8 @@ ASAHI_TESTS = {
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
-ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs']
+ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
+              'usage-tests.rs']
 ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
 
 # Python that runs on the host but imports its neighbours, so it keeps the

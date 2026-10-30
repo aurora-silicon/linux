@@ -9,6 +9,7 @@ GPU Driver Documentation
    apple-dcp-backlight
    apple-drm-parameters
    asahi-reclaim
+   asahi-usage-stats
    asahi-m4-bringup
    apple-dcp-m4
    i915
