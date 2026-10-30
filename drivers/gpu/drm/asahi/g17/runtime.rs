@@ -1431,7 +1431,7 @@ impl compute::Host for ComputeHost<'_> {
         scheduler: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<qos::Publication> {
-        self.port.qos_publish(owner, scheduler, policy)
+        self.port.qos_publish(owner, scheduler, policy, now_ns())
     }
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result {
         self.port.qos_cancel(publication)
@@ -1457,6 +1457,8 @@ struct DirectHost<'a> {
     port: &'a super::port::Port,
     outer: Option<super::port::OuterClaim<'a>>,
     generation: u64,
+    /// When the publication started (see `Port::note_submission`).
+    now: u64,
 }
 impl compute::Host for DirectHost<'_> {
     fn next_compute_publication(&mut self) -> Result<u64> {
@@ -1474,7 +1476,7 @@ impl compute::Host for DirectHost<'_> {
         scheduler: u64,
         policy: super::fw::queue::Policy,
     ) -> Result<qos::Publication> {
-        self.port.qos_publish(owner, scheduler, policy)
+        self.port.qos_publish(owner, scheduler, policy, self.now)
     }
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result {
         self.port.qos_cancel(publication)
@@ -1827,8 +1829,10 @@ impl Backend {
         if self.shared.crashed.load(Ordering::Acquire) || port.recovery_state().ok()? != 0 {
             return None;
         }
-        // Full effort is applied by the device-mutex path when it is not already.
-        if !port.note_submission() {
+        // Full effort is applied by the device-mutex path when it is not already. The clock
+        // is read once for the whole publication.
+        let now = now_ns();
+        if !port.note_submission(now) {
             return None;
         }
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Compute) {
@@ -1851,6 +1855,7 @@ impl Backend {
             port,
             outer: Some(outer),
             generation: port.generation(),
+            now,
         };
         match queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)) {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
