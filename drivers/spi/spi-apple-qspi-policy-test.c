@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * KUnit tests for the T8140 boot NOR write window of the Apple QSPIMC driver.
+ * KUnit tests for the Apple QSPIMC NVRAM mutation policy, at the J700 and
+ * J613/J713 nvram partitions.
  */
 
 #include <kunit/test.h>
@@ -14,59 +15,57 @@
 static int nv(unsigned int opcode, unsigned int addr_bytes,
 	      unsigned long long addr, unsigned int len, int data_out)
 {
-	return apple_qspi_window_allowed(opcode, addr_bytes, addr, len,
-					 data_out, NV_START, NV_END);
+	return apple_qspi_mutation_allowed(opcode, addr_bytes, addr, len,
+					   data_out, NV_START, NV_END);
 }
 
-static void qspi_window_write_enable(struct kunit *test)
+static void qspi_policy_write_enable(struct kunit *test)
 {
 	KUNIT_EXPECT_TRUE(test, nv(0x06, 0, 0, 0, 0));
 	KUNIT_EXPECT_TRUE(test, nv(0x04, 0, 0, 0, 0));
 	KUNIT_EXPECT_FALSE(test, nv(0x06, 3, NV_START, 0, 0));
 	KUNIT_EXPECT_FALSE(test, nv(0x06, 0, 0, 1, 1));
-	/* Write-enable control needs no window. */
-	KUNIT_EXPECT_TRUE(test, apple_qspi_window_allowed(0x06, 0, 0, 0, 0, 0, 0));
+	/* Write-enable control is virtual and needs no window. */
+	KUNIT_EXPECT_TRUE(test, apple_qspi_mutation_allowed(0x06, 0, 0, 0, 0, 0, 0));
 }
 
-static void qspi_window_program(struct kunit *test)
+static void qspi_policy_program(struct kunit *test)
 {
 	KUNIT_EXPECT_TRUE(test, nv(0x02, 3, NV_START, 256, 1));
 	KUNIT_EXPECT_TRUE(test, nv(0x02, 3, NV_START + 0x1234, 1, 1));
 	KUNIT_EXPECT_TRUE(test, nv(0x02, 3, NV_END - 256, 256, 1));
-	KUNIT_EXPECT_TRUE(test, nv(0x12, 4, NV_START, 256, 1));
-	/* Any byte outside, or a wrap within a page outside, is refused. */
+	/* Any byte outside the partition is refused. */
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_START - 256, 256, 1));
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_START - 1, 2, 1));
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_END, 1, 1));
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_END - 1, 2, 1));
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, 0, 256, 1));
-	/* A program needs data out, and at most one 4 KiB block's worth. */
+	/* A program stays within one page and needs data out. */
+	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_START + 0xff, 2, 1));
+	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_START, 257, 1));
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_START, 0, 1));
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_START, 256, 0));
-	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, NV_START, 4097, 1));
+	/* Four-byte programs are not admitted. */
+	KUNIT_EXPECT_FALSE(test, nv(0x12, 4, NV_START, 256, 1));
 }
 
-static void qspi_window_erase(struct kunit *test)
+static void qspi_policy_erase(struct kunit *test)
 {
 	KUNIT_EXPECT_TRUE(test, nv(0x20, 3, NV_START, 0, 0));
-	KUNIT_EXPECT_TRUE(test, nv(0x20, 3, NV_START + 0x123, 0, 0));
-	KUNIT_EXPECT_TRUE(test, nv(0x20, 3, NV_END - 1, 0, 0));
-	KUNIT_EXPECT_TRUE(test, nv(0x21, 4, NV_START, 0, 0));
-	KUNIT_EXPECT_FALSE(test, nv(0x20, 3, NV_START - 1, 0, 0));
+	KUNIT_EXPECT_TRUE(test, nv(0x20, 3, NV_END - 0x1000, 0, 0));
+	/* Only aligned 4 KiB sector erases inside the partition. */
+	KUNIT_EXPECT_FALSE(test, nv(0x20, 3, NV_START + 0x123, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv(0x20, 3, NV_START - 0x1000, 0, 0));
 	KUNIT_EXPECT_FALSE(test, nv(0x20, 3, NV_END, 0, 0));
-	/* 32 and 64 KiB erases cover the whole aligned block. */
-	KUNIT_EXPECT_TRUE(test, nv(0x52, 3, 0x28000, 0, 0));
-	KUNIT_EXPECT_FALSE(test, nv(0x52, 3, NV_START, 0, 0));
-	KUNIT_EXPECT_TRUE(test, nv(0xd8, 3, 0x30000, 0, 0));
-	KUNIT_EXPECT_TRUE(test, nv(0xdc, 4, 0x1e0000, 0, 0));
-	KUNIT_EXPECT_FALSE(test, nv(0xd8, 3, NV_START, 0, 0));
-	KUNIT_EXPECT_FALSE(test, nv(0xd8, 3, 0x1f0000, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv(0x21, 4, NV_START, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv(0x52, 3, 0x28000, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv(0xd8, 3, 0x30000, 0, 0));
 	/* An erase carries no data. */
 	KUNIT_EXPECT_FALSE(test, nv(0x20, 3, NV_START, 1, 0));
 	KUNIT_EXPECT_FALSE(test, nv(0x20, 3, NV_START, 0, 1));
 }
 
-static void qspi_window_refused_commands(struct kunit *test)
+static void qspi_policy_refused_commands(struct kunit *test)
 {
 	static const u8 refused[] = {
 		0x01, 0x31, 0x11,	/* status register writes */
@@ -86,48 +85,67 @@ static void qspi_window_refused_commands(struct kunit *test)
 	}
 }
 
-static void qspi_window_address_width(struct kunit *test)
+static void qspi_policy_address_width(struct kunit *test)
 {
-	/* Three address bytes cannot carry an address above 16 MiB. */
+	KUNIT_EXPECT_FALSE(test, nv(0x02, 2, NV_START, 1, 1));
+	KUNIT_EXPECT_FALSE(test, nv(0x02, 4, NV_START, 1, 1));
+	KUNIT_EXPECT_FALSE(test, nv(0x20, 0, NV_START, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv(0x20, 4, NV_START, 0, 0));
+	/* Addresses are not truncated to the wire width before the check. */
 	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, (1ULL << 24) + NV_START, 1, 1));
 	KUNIT_EXPECT_FALSE(test, nv(0x20, 3, (1ULL << 24) + NV_START, 0, 0));
-	KUNIT_EXPECT_FALSE(test, nv(0x12, 4, (1ULL << 32) + NV_START, 1, 1));
-	KUNIT_EXPECT_FALSE(test, nv(0x02, 2, NV_START, 1, 1));
-	KUNIT_EXPECT_FALSE(test, nv(0x20, 0, NV_START, 0, 0));
-	KUNIT_EXPECT_FALSE(test, nv(0x20, 5, NV_START, 0, 0));
-	/* A window that reaches the top of 24-bit addressing. */
-	KUNIT_EXPECT_TRUE(test, apple_qspi_window_allowed(0x20, 3, 0xfff000, 0, 0,
-							  0xff0000, 1ULL << 24));
-	/* A program that crosses 16 MiB cannot use three address bytes. */
-	KUNIT_EXPECT_FALSE(test, apple_qspi_window_allowed(0x02, 3, 0xffffff, 2, 1,
-							   0xff0000, 1ULL << 25));
-	KUNIT_EXPECT_TRUE(test, apple_qspi_window_allowed(0x12, 4, 0xffffff, 2, 1,
-							  0xff0000, 1ULL << 25));
+	KUNIT_EXPECT_FALSE(test, nv(0x02, 3, ~0ULL, 1, 1));
 }
 
-static void qspi_window_empty(struct kunit *test)
+static void qspi_policy_empty(struct kunit *test)
 {
-	KUNIT_EXPECT_FALSE(test, apple_qspi_window_allowed(0x02, 3, 0, 1, 1, 0, 0));
-	KUNIT_EXPECT_FALSE(test, apple_qspi_window_allowed(0x20, 3, 0, 0, 0, 0, 0));
-	KUNIT_EXPECT_FALSE(test, apple_qspi_window_allowed(0x20, 3, NV_START, 0, 0,
-							   NV_START, NV_START));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mutation_allowed(0x02, 3, 0, 1, 1, 0, 0));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mutation_allowed(0x20, 3, 0, 0, 0, 0, 0));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mutation_allowed(0x20, 3, NV_START, 0, 0,
+							     NV_START, NV_START));
 }
 
-static struct kunit_case apple_qspi_window_cases[] = {
-	KUNIT_CASE(qspi_window_write_enable),
-	KUNIT_CASE(qspi_window_program),
-	KUNIT_CASE(qspi_window_erase),
-	KUNIT_CASE(qspi_window_refused_commands),
-	KUNIT_CASE(qspi_window_address_width),
-	KUNIT_CASE(qspi_window_empty),
+static void qspi_policy_j613(struct kunit *test)
+{
+	unsigned long long s = APPLE_QSPI_NVRAM_START, e = APPLE_QSPI_NVRAM_END;
+
+	KUNIT_EXPECT_TRUE(test, apple_qspi_mutation_allowed(0x02, 3, s, 256, 1, s, e));
+	KUNIT_EXPECT_TRUE(test, apple_qspi_mutation_allowed(0x20, 3, e - 0x1000, 0, 0, s, e));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mutation_allowed(0x02, 3, s - 1, 1, 1, s, e));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mutation_allowed(0x20, 3, e, 0, 0, s, e));
+}
+
+static void qspi_policy_status(struct kunit *test)
+{
+	/* BUSY and WEL are never admitted. */
+	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0x01, 0, 0, 0x1c));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0x02, 0, 0, 0x1c));
+	/* Block protect only where the board allows it. */
+	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0x04, 0, 0, 0));
+	KUNIT_EXPECT_TRUE(test, apple_qspi_status_allows_write(0x04, 0x02, 0, 0x1c));
+	/* CMP, SUS and WPS are refused everywhere. */
+	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0x40, 0, 0x1c));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0x80, 0, 0x1c));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0, 0x04, 0x1c));
+}
+
+static struct kunit_case apple_qspi_policy_cases[] = {
+	KUNIT_CASE(qspi_policy_write_enable),
+	KUNIT_CASE(qspi_policy_program),
+	KUNIT_CASE(qspi_policy_erase),
+	KUNIT_CASE(qspi_policy_refused_commands),
+	KUNIT_CASE(qspi_policy_address_width),
+	KUNIT_CASE(qspi_policy_empty),
+	KUNIT_CASE(qspi_policy_j613),
+	KUNIT_CASE(qspi_policy_status),
 	{}
 };
 
-static struct kunit_suite apple_qspi_window_suite = {
-	.name = "apple-qspi-nvram-window",
-	.test_cases = apple_qspi_window_cases,
+static struct kunit_suite apple_qspi_policy_suite = {
+	.name = "apple-qspi-nvram-policy",
+	.test_cases = apple_qspi_policy_cases,
 };
-kunit_test_suite(apple_qspi_window_suite);
+kunit_test_suite(apple_qspi_policy_suite);
 
-MODULE_DESCRIPTION("KUnit tests for the Apple QSPIMC boot NOR write window");
+MODULE_DESCRIPTION("KUnit tests for the Apple QSPIMC NVRAM mutation policy");
 MODULE_LICENSE("GPL");
