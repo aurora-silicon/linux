@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,t8132-isp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8132 Image Signal Processor
+
+maintainers:
+  - Erik Bourget <erik@ebourget.net>
+
+description:
+  The T8132 ISP controls the attached camera sensor and processes its frames
+  through firmware the bootloader loads. The firmware segments are described
+  as reserved memory mapped at the addresses the firmware runs them at. The
+  host exchanges commands and image buffers through three DART instances; the
+  first one also has the address filter registers.
+
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,t8132-isp
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - const: apple,t8132-isp
+      - const: apple,isp
+
+  reg:
+    items:
+      - description: Coprocessor registers up to its control block
+      - description: Mailbox interrupt registers
+      - description: Firmware handshake registers
+      - description: Mailbox doorbell registers
+
+  reg-names:
+    items:
+      - const: coproc
+      - const: mbox
+      - const: gpio
+      - const: mbox2
+
+  interrupts:
+    maxItems: 1
+
+  iommus:
+    items:
+      - description: First ISP DART stream; this DART has the address filter bank
+      - description: Second ISP DART stream
+      - description: Third ISP DART stream
+
+  power-domains:
+    items:
+      - description: ISP system domain
+      - description: ISP CPU domain
+      - description: ISP CPU core 0 domain
+      - description: ISP CPU core 1 domain
+      - description: ISP FE domain
+      - description: ISP DPRX domain
+      - description: ISP secure domain
+      - description: ISP STS0 domain
+      - description: ISP STS1 domain
+      - description: ISP Pearl domain
+      - description: ISP BE domain
+      - description: ISP CLR domain
+      - description: ISP CVD domain
+      - description: ISP CVM domain
+      - description: First camera sensor domain
+      - description: Second camera sensor domain
+
+  memory-region:
+    items:
+      - description: Firmware text loaded by the bootloader
+      - description: Firmware data loaded by the bootloader
+      - description: Firmware main memory window; host allocations follow it
+
+  memory-region-names:
+    items:
+      - const: text
+      - const: data
+      - const: heap
+
+  apple,dart-vm-size:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Size in bytes of the host allocation aperture used by the ISP driver.
+
+  apple,platform-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Platform identifier passed in the firmware boot descriptor.
+
+  apple,cam-connections-scheme:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Camera connection layout of the board passed in the firmware boot
+      descriptor.
+
+  apple,temporal-filter:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Firmware temporal-filter strength selected for the attached sensor.
+
+  sensor-presets:
+    type: object
+    description:
+      Sensor firmware presets and the host output geometry associated with them.
+    patternProperties:
+      "^preset[0-9]+$":
+        type: object
+        properties:
+          apple,config-index:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            description: Sensor configuration index understood by the firmware
+          apple,input-size:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Input width in pixels
+              - description: Input height in pixels
+            description: Sensor input dimensions
+          apple,output-size:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Output width in pixels
+              - description: Output height in pixels
+            description: Delivered frame dimensions
+          apple,crop:
+            $ref: /schemas/types.yaml#/definitions/uint32-array
+            items:
+              - description: Horizontal crop origin in pixels
+              - description: Vertical crop origin in pixels
+              - description: Crop width in pixels
+              - description: Crop height in pixels
+            description: Cropped sensor rectangle
+        required:
+          - apple,config-index
+          - apple,input-size
+          - apple,output-size
+          - apple,crop
+        additionalProperties: false
+    additionalProperties: false
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - iommus
+  - power-domains
+  - memory-region
+  - memory-region-names
+  - apple,dart-vm-size
+  - apple,platform-id
+  - sensor-presets
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        isp@48c000000 {
+            compatible = "apple,t8132-isp", "apple,isp";
+            reg = <0x4 0x8c000000 0x0 0x1604000>,
+                  <0x4 0x8e924000 0x0 0x40>,
+                  <0x4 0x8e9241d0 0x0 0x20>,
+                  <0x4 0x8e924464 0x0 0x10>;
+            reg-names = "coproc", "mbox", "gpio", "mbox2";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 369 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+            power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
+                            <&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>,
+                            <&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
+                            <&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
+                            <&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
+                            <&ps_isp_cvm>, <&ps_ispsens0>, <&ps_ispsens1>;
+            memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+            memory-region-names = "text", "data", "heap";
+            apple,dart-vm-size = /bits/ 64 <0xdec00000>;
+            apple,platform-id = <0x17>;
+
+            sensor-presets {
+                preset0 {
+                    apple,config-index = <5>;
+                    apple,input-size = <1920 2160>;
+                    apple,output-size = <1920 1080>;
+                    apple,crop = <0 0 1920 1080>;
+                };
+            };
+        };
+    };
