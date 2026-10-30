@@ -101,3 +101,15 @@ config APPLE_PMP_REPORT_KUNIT_TEST
 	  argument validation without accessing hardware.
 	  Includes malformed tables, address arithmetic and device ordering.
 	  The PMP report driver does not need to be enabled to run this suite.
+
+config APPLE_PMP_DRAM_KUNIT_TEST
+	tristate "Apple PMP DRAM description parsing tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PM
+	select PM_GENERIC_DOMAINS
+	default KUNIT_ALL_TESTS
+	help
+	  Parse synthetic firmware properties including unordered state IDs,
+	  missing and duplicate states, incomplete descriptions and overflow.
+	  Software-node fixtures exercise the parser without a DT boot image.
+	  These tests access no hardware and do not need the PMP driver. They
+	  are only useful for kernel developers.

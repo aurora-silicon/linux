@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,pmp-dram.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple PMP DRAM reporting properties
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Static description of the firmware-managed DRAM interface. These properties
+  reside on the existing PMP report provider, which is available independently
+  of a Linux PMP firmware start. No extra MMIO resource or ownership change is
+  implied. The bus width and maximum data rate are inferred physical classes.
+
+  The observed LPDDR5 family string does not distinguish LPDDR5X. Do not
+  report an inferred X suffix as an observed memory type. Bandwidth is in
+  decimal bytes per second; usable data width excludes ECC/check bits.
+
+  The OPP table must contain exactly apple,dcs-state-count available entries,
+  with unique opp-level values covering zero through count minus one. Only
+  the highest state must have a rate. Peak bandwidth must equal that state's
+  apple,data-rate multiplied by apple,data-bus-width divided by eight.
+  The published bandwidth class may be rounded (for example 200 GB/s for
+  an inferred physical peak of 204.8 GB/s).
+
+  This description does not identify an achieved-state register. PMGR desired
+  states and PMC floor/ceiling votes are not achieved memory states. The
+  T6000/T8112 PMP DRAM State/FxS reporter has bucket 3*S+M, where S is DCS
+  state and M is self-refresh (0), power-down (1), or active (2). That encoding
+  alone does not specify a transport or a readable register resource. No
+  current clock may be claimed from a low-power bucket or unknown state.
+
+select: false
+
+properties:
+  operating-points-v2:
+    description: Reference to an operating-points-v2-apple-dram table.
+    maxItems: 1
+
+  apple,dram-type:
+    $ref: /schemas/types.yaml#/definitions/string
+    const: lpddr5
+    description: Observed DRAM family, without an inferred LPDDR5X suffix.
+
+  apple,data-bus-width:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 8
+    multipleOf: 8
+    description: Usable data bits, excluding ECC/check bits.
+
+  apple,dcs-state-count:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 32
+    description: Number of firmware DCS states.
+
+  apple,peak-bandwidth-bytes-per-second:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    minimum: 1
+    description: Physical maximum bandwidth calculated from the highest OPP and data width.
+
+  apple,bandwidth-class-bytes-per-second:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    minimum: 1
+    description: Published, potentially rounded, maximum bandwidth class.
+
+dependencies:
+  operating-points-v2:
+    - apple,dram-type
+  apple,data-bus-width:
+    - apple,dram-type
+  apple,dcs-state-count:
+    - apple,dram-type
+  apple,peak-bandwidth-bytes-per-second:
+    - apple,dram-type
+  apple,bandwidth-class-bytes-per-second:
+    - apple,dram-type
+
+allOf:
+  - if:
+      required:
+        - apple,dram-type
+    then:
+      required:
+        - operating-points-v2
+        - apple,data-bus-width
+        - apple,dcs-state-count
+        - apple,peak-bandwidth-bytes-per-second
+        - apple,bandwidth-class-bytes-per-second
+
+additionalProperties: true
