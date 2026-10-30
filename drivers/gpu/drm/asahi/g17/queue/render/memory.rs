@@ -367,6 +367,53 @@ impl Generation {
     }
 }
 
+/// Host-only images of one command's two descriptors. [`Memory::write_descriptors`] builds
+/// them here, where every byte is cached and owned by the host, and then stores into the shared
+/// slots only the words that differ from what the slots hold. Cache-line aligned, so both
+/// images are too.
+#[repr(C, align(64))]
+struct Staging {
+    tiling: abi::TaDescriptor,
+    fragment: abi::FragmentSlot,
+}
+
+// SAFETY: Both descriptors consist of integers and arrays of integers only.
+unsafe impl Zeroable for Staging {}
+
+const _: () = {
+    // `store_changed` copies whole 64-bit words of both images.
+    assert!(size_of::<abi::TaDescriptor>() % 8 == 0);
+    assert!(size_of::<abi::FragmentDescriptor>() % 8 == 0);
+    assert!(core::mem::offset_of!(Staging, fragment) % 8 == 0);
+    assert!(core::mem::offset_of!(abi::FragmentSlot, descriptor) == 0);
+};
+
+/// Stores the `words` 64-bit words at `source` over those at `destination`, skipping each word
+/// that already holds its value: afterwards `destination` holds exactly what a plain copy would
+/// have left there, whatever it held before.
+///
+/// A command slot is rewritten 32 commands after its last use, and from one command to the
+/// next only a few words of a descriptor change (ordinals, stamps, rotating per-command
+/// addresses). The firmware read the slot for its previous command, so a store to a line
+/// that holds the same values only takes the line back from the firmware's cache.
+///
+/// # Safety
+///
+/// `source` must be valid for reads and `destination` for reads and writes of `words` aligned
+/// 64-bit words, and nothing else may access `destination` meanwhile.
+unsafe fn store_changed(destination: *mut u64, source: *const u64, words: usize) {
+    for index in 0..words {
+        // SAFETY: Both words are in range and aligned, as the caller guarantees.
+        unsafe {
+            let value = source.add(index).read();
+            let target = destination.add(index);
+            if target.read() != value {
+                target.write(value);
+            }
+        }
+    }
+}
+
 pub(super) struct Memory {
     _fragment_view: mmu::KernelMapping,
     pub(super) graph: Graph,
@@ -381,6 +428,7 @@ pub(super) struct Memory {
     // The extra client views retain their allocation positions even though
     // kick entries consume the register arrays embedded in the descriptors.
     registers: KernelObject,
+    staging: KBox<Staging>,
     pub(super) context: Arc<Context>,
     pub(super) installed_pool: Option<u8>,
 }
@@ -464,6 +512,7 @@ impl Memory {
             mmu::PROT_GPU_SHARED_RO,
             CpuMap::WriteCombined,
         )?;
+        let staging = KBox::init(pin_init::init_zeroed(), GFP_KERNEL)?;
         let fragment_view = graph.descriptors.map_range(
             vm,
             TA_BYTES..TA_BYTES + mmu::UAT_PGSZ,
@@ -485,6 +534,7 @@ impl Memory {
                 lifecycle: [tiling, fragment],
                 _fragment_view: fragment_view,
                 registers: registers,
+                staging,
                 context,
                 installed_pool: None,
             }))?,
@@ -546,12 +596,16 @@ impl Memory {
     pub(super) fn prefetch_descriptors(&self, ordinal: u64) {
         let record = ordinal as usize % RECORDS;
         let config = size_of::<queue::QueueConfig>();
+        // The descriptor is compared before the few words that changed are stored
+        // (`write_descriptors`), so it is requested for reading: a request for writing would
+        // take every line from the firmware's cache. The configuration records are rewritten.
+        let descriptor = size_of::<abi::TaDescriptor>();
         let ranges = [
-            (&self.graph.descriptors, Graph::offset(0, ordinal), size_of::<abi::TaDescriptor>()),
-            (&self.graph.config, CONFIG[0] + record * CONFIG_STRIDE, config),
-            (&self.graph.config, CONFIG[1] + record * CONFIG_STRIDE, config),
+            (&self.graph.descriptors, Graph::offset(0, ordinal), descriptor, false),
+            (&self.graph.config, CONFIG[0] + record * CONFIG_STRIDE, config, true),
+            (&self.graph.config, CONFIG[1] + record * CONFIG_STRIDE, config, true),
         ];
-        for (object, offset, size) in ranges {
+        for (object, offset, size, store) in ranges {
             let Ok(base) = object.pointer(offset, size) else {
                 continue;
             };
@@ -559,8 +613,13 @@ impl Memory {
                 // SAFETY: A prefetch hint inside the retained mapping; it has no
                 // architectural effect on memory.
                 unsafe {
-                    core::arch::asm!("prfm pstl1keep, [{0}]", in(reg) base.add(line),
-                        options(nostack, preserves_flags, readonly));
+                    if store {
+                        core::arch::asm!("prfm pstl1keep, [{0}]", in(reg) base.add(line),
+                            options(nostack, preserves_flags, readonly));
+                    } else {
+                        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) base.add(line),
+                            options(nostack, preserves_flags, readonly));
+                    }
                 }
             }
         }
@@ -588,23 +647,38 @@ impl Memory {
                 size_of::<abi::FragmentSlot>(),
             )?
             .cast::<abi::FragmentSlot>();
-        if tiling.align_offset(align_of::<abi::TaDescriptor>()) != 0
+        if tiling.align_offset(align_of::<u64>()) != 0
             || fragment.align_offset(align_of::<abi::FragmentSlot>()) != 0
+            || fragment.align_offset(align_of::<u64>()) != 0
         {
             return Err(EINVAL);
         }
+        let staging = &mut *self.staging;
+        staging.tiling.write(args)?;
+        staging.fragment.write(args)?;
+        // Kick entries bind the arrays embedded in this descriptor
+        // (register_bindings); the client register page is never read.
+        for array in &staging.fragment.descriptor.arrays {
+            array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
+        }
         // SAFETY: Both complete integer-only views lie in the retained mapping,
         // are aligned and disjoint. The full ordinal has an exclusive slot
-        // claim and no producer refers to this command yet.
+        // claim and no producer refers to this command yet. The images are
+        // host-owned and 8-byte aligned (see `Staging`). The fragment slot's
+        // MCache spill table after its descriptor is left as `FragmentSlot::write`
+        // leaves it.
         unsafe {
-            (&mut *tiling).write(args)?;
+            store_changed(
+                tiling.cast::<u64>(),
+                core::ptr::from_ref(&staging.tiling).cast::<u64>(),
+                size_of::<abi::TaDescriptor>() / 8,
+            );
+            store_changed(
+                fragment.cast::<u64>(),
+                core::ptr::from_ref(&staging.fragment.descriptor).cast::<u64>(),
+                size_of::<abi::FragmentDescriptor>() / 8,
+            );
             let fragment = &mut *fragment;
-            fragment.write(args)?;
-            // Kick entries bind the arrays embedded in this descriptor
-            // (register_bindings); the client register page is never read.
-            for array in &fragment.descriptor.arrays {
-                array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
-            }
             fragment.set_mcache(
                 args.fragment.descriptor_va,
                 args.resources.aux_fb_va,
