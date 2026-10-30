@@ -3479,6 +3479,93 @@ static void usb_unlock_port(struct usb_port *port_dev)
 	__release(&port_dev->status_lock);
 }
 
+/**
+ * usb_hub_port_retrain - restart an unconnected SuperSpeed root port
+ * @hdev: SuperSpeed root hub
+ * @port1: port number
+ *
+ * Called immediately after usb_hub_port_power_on(), under the same hub lock,
+ * once the caller has finished bringing up the lanes behind the port. Consume
+ * the queued warm reset here while keeping the port runtime-active. If that
+ * reset finds no receiver, restart detection once through Disabled/RxDetect.
+ * Each operation has a bounded wait; no further recovery work is scheduled.
+ * Connected links and ports with a child, an owner or a power hold are left
+ * alone. Only the caller's newly restored port is eligible.
+ *
+ * Return: 0 for a usable link, 1 for a port left alone, or a negative error.
+ * A failure does not reclaim the power hold released by power_on().
+ */
+int usb_hub_port_retrain(struct usb_device *hdev, int port1)
+{
+	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
+	struct usb_interface *intf;
+	struct usb_port *port_dev;
+	u16 status, change;
+	int ret;
+
+	device_lock_assert(&hdev->dev);
+	if (!hub || hub->disconnected || hub->quiescing)
+		return -ENODEV;
+	if (hdev->parent || !hub_is_superspeed(hdev))
+		return -EOPNOTSUPP;
+	if (port1 < 1 || port1 > hdev->maxchild)
+		return -EINVAL;
+	port_dev = hub->ports[port1 - 1];
+	if (port_dev->disabled || port_dev->held_off || port_dev->port_owner ||
+	    port_dev->child || port_dev->ignore_event || port_dev->early_stop ||
+	    !test_bit(port1, hub->warm_reset_bits))
+		return 1;
+
+	intf = to_usb_interface(hub->intfdev);
+	ret = usb_autopm_get_interface(intf);
+	if (ret < 0)
+		return ret;
+	ret = pm_runtime_resume_and_get(&port_dev->dev);
+	if (ret < 0)
+		goto put_intf;
+	usb_lock_port(port_dev);
+	ret = usb_hub_port_status(hub, port1, &status, &change);
+	if (ret)
+		goto unlock;
+	if (!usb_port_is_power_on(hub, status)) {
+		ret = 1;
+		goto unlock;
+	}
+	/* The caller still holds the hub lock from power_on(): this is its reset. */
+	clear_bit(port1, hub->warm_reset_bits);
+	if ((status & (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE)) ==
+	    (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE) &&
+	    (status & USB_PORT_STAT_LINK_STATE) <= USB_SS_PORT_LS_U3) {
+		ret = 0;
+		goto unlock;
+	}
+
+	dev_dbg(&port_dev->dev, "SS handover: warm reset after lane readiness\n");
+	ret = set_port_feature(hdev, port1, USB_PORT_FEAT_BH_PORT_RESET);
+	if (!ret)
+		ret = hub_port_wait_reset(hub, port1, NULL, HUB_BH_RESET_TIME, true);
+	if (ret != -ENOTCONN)
+		goto rescan;
+
+	dev_dbg(&port_dev->dev, "SS handover: restarting receiver detection\n");
+	ret = hub_set_port_link_state(hub, port1, USB_SS_PORT_LS_SS_DISABLED);
+	if (!ret)
+		ret = hub_set_port_link_state(hub, port1, USB_SS_PORT_LS_RX_DETECT);
+	if (!ret)
+		ret = hub_port_wait_reset(hub, port1, NULL, HUB_BH_RESET_TIME, true);
+rescan:
+	dev_dbg(&port_dev->dev, "SS handover: retrain result %d\n", ret);
+	set_bit(port1, hub->change_bits);
+	kick_hub_wq(hub);
+unlock:
+	usb_unlock_port(port_dev);
+	pm_runtime_put(&port_dev->dev);
+put_intf:
+	usb_autopm_put_interface(intf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usb_hub_port_retrain);
+
 #ifdef	CONFIG_PM
 
 /* Check if a port is suspended(USB2.0 port) or in U3 state(USB3.0 port) */

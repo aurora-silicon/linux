@@ -214,6 +214,13 @@ static int usb_hub_port_power_on(struct usb_device *u, int port)
  usb3_port_down=false;
  return 0;
 }
+static int usb_hub_port_retrain(struct usb_device *u, int port)
+{
+ assert(u==&roots[3]&&port==1&&root_locked&&pm_refs==1&&!pm_phy->lock);
+ assert(!usb3_port_down&&pm_phy->host_active&&!pm_phy->mode_dirty&&!pm_phy->pipe_pending);
+ assert(pm_phy->pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+ return 0;
+}
 #endif
 '''
     suffix=ns['suffix'].replace('int main(', 'int __attribute__((unused)) fixture_main(',1)

@@ -31,6 +31,11 @@ struct port_power_test_hc {
 	u16 change;
 	unsigned int power_ons;
 	bool fail_power_off;
+	unsigned int warm_resets;
+	unsigned int detect_restarts;
+	bool connect_on_warm;
+	bool connect_on_detect;
+	bool fail_warm_reset;
 };
 
 struct port_power_test {
@@ -171,8 +176,31 @@ static int port_power_test_hub_control(struct usb_hcd *hcd, u16 type_req, u16 va
 			port_power_test_set_power(hcd, true);
 		else if (value == USB_PORT_FEAT_RESET)
 			hc->change |= USB_PORT_STAT_C_RESET;
-		else if (value == USB_PORT_FEAT_BH_PORT_RESET)
+		else if (value == USB_PORT_FEAT_BH_PORT_RESET) {
+			hc->warm_resets++;
+			if (hc->fail_warm_reset)
+				return -EIO;
 			hc->change |= USB_PORT_STAT_C_RESET | USB_PORT_STAT_C_BH_RESET;
+			if (hc->connect_on_warm) {
+				hc->status &= ~USB_PORT_STAT_LINK_STATE;
+				hc->status |= USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE;
+			}
+		} else if (value == USB_PORT_FEAT_LINK_STATE) {
+			u16 state = (index >> 3) & USB_PORT_STAT_LINK_STATE;
+
+			hc->status &= ~USB_PORT_STAT_LINK_STATE;
+			hc->status |= state;
+			if (state == USB_SS_PORT_LS_SS_DISABLED)
+				hc->status &= ~(USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE);
+			if (state == USB_SS_PORT_LS_RX_DETECT) {
+				hc->detect_restarts++;
+				if (hc->connect_on_detect) {
+					hc->status &= ~USB_PORT_STAT_LINK_STATE;
+					hc->status |= USB_PORT_STAT_CONNECTION |
+						      USB_PORT_STAT_ENABLE;
+				}
+			}
+		}
 		return 0;
 	case ClearPortFeature:
 		if (value == USB_PORT_FEAT_POWER && hc->fail_power_off) {
@@ -928,7 +956,127 @@ static void port_power_test_connector_graph_legacy(struct kunit *test)
 }
 #endif
 
+/* Keep the root locked from power-on through retraining, as the PHY does. */
+static struct port_power_test_hc *
+port_power_test_retrain_begin(struct kunit *test, bool warm, bool detect)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
+
+	usb_lock_device(t->ss_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 0);
+	scoped_guard(spinlock_irqsave, &hc->lock) {
+		hc->warm_resets = 0;
+		hc->detect_restarts = 0;
+		hc->connect_on_warm = warm;
+		hc->connect_on_detect = detect;
+	}
+	return hc;
+}
+
+static void port_power_test_retrain_end(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
+
+	/* The synthetic controller has no device to enumerate after the check. */
+	scoped_guard(spinlock_irqsave, &hc->lock) {
+		hc->status &= ~(USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE |
+				USB_PORT_STAT_LINK_STATE);
+		hc->status |= USB_SS_PORT_LS_RX_DETECT;
+	}
+	usb_unlock_device(t->ss_root);
+}
+
+static void port_power_test_retrain_warm(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, true, false);
+	int usage = port_power_test_usage(t->ss_port);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_detect(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, true);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 1U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_bounded(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), -ENOTCONN);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 1U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_healthy(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	scoped_guard(spinlock_irqsave, &hc->lock) {
+		hc->status &= ~USB_PORT_STAT_LINK_STATE;
+		hc->status |= USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE;
+	}
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 0U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_error(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	hc->fail_warm_reset = true;
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), -EIO);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_owner(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_claim_port(t->ss_root, 1, (void *)t), 0);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
+	KUNIT_EXPECT_EQ(test, usb_hub_release_port(t->ss_root, 1, (void *)t), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 0U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	port_power_test_retrain_end(test);
+	usb_lock_device(t->hs_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->hs_root, 1), -EOPNOTSUPP);
+	usb_unlock_device(t->hs_root);
+}
+
 static struct kunit_case port_power_test_cases[] = {
+	KUNIT_CASE(port_power_test_retrain_warm),
+	KUNIT_CASE(port_power_test_retrain_detect),
+	KUNIT_CASE(port_power_test_retrain_bounded),
+	KUNIT_CASE(port_power_test_retrain_healthy),
+	KUNIT_CASE(port_power_test_retrain_error),
+	KUNIT_CASE(port_power_test_retrain_owner),
 #if IS_ENABLED(CONFIG_OF_DYNAMIC)
 	KUNIT_CASE(port_power_test_connector_graph),
 	KUNIT_CASE(port_power_test_connector_graph_legacy),

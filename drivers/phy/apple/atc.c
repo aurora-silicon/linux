@@ -5087,6 +5087,13 @@ static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_p
 	ret = usb_hub_port_power_on(pm->root, 1);
 	if (ret < 0)
 		dev_warn(atcphy->dev, "Failed to power the SuperSpeed port on: %d\n", ret);
+	else if (!ret && atcphy->fixed_usb2 && atcphy->hw->has_t8140_dp) {
+		int retrain = usb_hub_port_retrain(pm->root, 1);
+
+		if (retrain < 0)
+			dev_warn(atcphy->dev, "SuperSpeed handover retrain failed: %d\n", retrain);
+		/* Power was restored even if no receiver answered the bounded retrain. */
+	}
 #endif
 	return ret;
 }
