@@ -2110,7 +2110,6 @@ F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/gpu/apple-dcp-backlight.rst
 F:	Documentation/hid/apple-j700-multitouch.rst
-F:	Documentation/soc/apple/t8140-pmp-dvfs.rst
 F:	Documentation/networking/device_drivers/wifi/mt7932-neo.rst
 F:	arch/arm64/boot/dts/apple/t8140*
 F:	arch/arm64/configs/j700*.config
@@ -2801,13 +2800,6 @@ F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
 F:	tools/testing/selftests/drivers/apple/
-
-ARM/APPLE QSPIMC DRIVER
-M:	Ryan Murray <ryan@aurorasilicon.org>
-W:	https://aurora-silicon.github.io
-S:	Maintained
-F:	Documentation/devicetree/bindings/spi/apple,qspi.yaml
-F:	drivers/spi/spi-apple-qspi.c
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>

@@ -15,21 +15,14 @@ def main():
     manifest = unpack_fixtures(golden)
     (out / 'public-uapi.rs').write_bytes(frozen_bindings().read_bytes())
     backend = root / 'drivers/gpu/drm/asahi/g16'
-    # The hardware catalog now imports its data-only declaration from shared
-    # fwid. Compile that exact production declaration; firmware measurement is
-    # outside this wire-encoder harness. Independent byte fixtures stay frozen.
-    fwid = root / 'drivers/gpu/drm/asahi/fwid.rs'
-    declaration = ''
-    if fwid.exists():
-        identity = fwid.read_text()
-        begin = identity.index('pub(crate) struct FirmwareBuild {')
-        end = identity.index('\n}', begin) + 2
-        declaration = identity[begin:end]
+    identity = (root / 'drivers/gpu/drm/asahi/fwid.rs').read_text()
+    first = identity.index('pub(crate) struct FirmwareBuild {')
+    build_type = identity[first:identity.index('\n}', first) + 2]
     logs = []
     for name in ['initdata', 'compute', 'render', 'channels', 'initdata-bounds']:
         source = (HERE / f'check-{name}.rs').read_text()
         source = source.replace('@KERNEL@', str(root)).replace('@OUTPUT@', str(out))
-        source = source.replace('@FIRMWARE_BUILD@', declaration)
+        source = source.replace('@FWID_BUILD@', build_type)
         test = out / f'check-{name}.rs'
         test.write_text(source)
         binary = out / f'check-{name}'
@@ -44,9 +37,7 @@ def main():
     report = {'passed': True, 'scope': 'Production Rust encoder output versus frozen independent C fixtures; CPU-only, no hardware acceptance.',
               'reference_kernel_commit': manifest['reference_kernel_commit'], 'fixture_manifest_sha256': sha(HERE / 'fixtures/manifest.json'),
               'seconds': round(time.monotonic()-start, 3), 'compared_encoder_bytes': 3736988,
-              'source_sha256': {str(p.relative_to(root)): sha(p) for p in sorted(backend.rglob('*.rs'))},
-              'firmware_declaration_source_sha256': sha(fwid) if fwid.exists() else None,
-              'firmware_declaration_scope': 'Shared FirmwareBuild data declaration only; identity measurement is not executed by this harness.'}
+              'source_sha256': {str(p.relative_to(root)): sha(p) for p in sorted(backend.rglob('*.rs'))}}
     (out / 'golden-tests.json').write_text(json.dumps(report, indent=2)+'\n')
     return 0
 
