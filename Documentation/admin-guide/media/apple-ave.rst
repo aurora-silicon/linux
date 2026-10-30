@@ -1,63 +1,94 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
-Experimental T8140 video encoding
-================================
+Apple AVE video encoder
+=======================
 
-The J700 AVE driver exposes a root-only debugfs firmware transport for
-hardware encoding experiments. It is not a V4L2 encoder, has no stable
-userspace ABI, and does not make an FFmpeg encoder available. The initial
-scope is the existing fixed 320x240 NV12 H.264/HEVC protocol experiment.
+The AVE block in Apple T8140 (A18 Pro) SoCs, as used in the MacBook Neo,
+encodes H.264 and HEVC. ``CONFIG_VIDEO_APPLE_AVE`` builds the ``apple-ave``
+driver, a V4L2 memory-to-memory stateful encoder following
+Documentation/userspace-api/media/v4l/dev-encoder.rst. The OUTPUT queue
+takes NV12 frames, the CAPTURE queue returns H.264 (Baseline, Main, High) or
+HEVC (Main) as Annex B.
 
-Build ``CONFIG_VIDEO_APPLE_AVE_EXPERIMENTAL=m`` on a 16 KiB-page Apple kernel
-with debugfs and translated DMA. Suspend, hibernation and kexec must be off.
-Load with ``modprobe apple-ave enable=1``; probing is disabled otherwise.
+Usage
+-----
 
-Firmware and boot requirements
-------------------------------
+The encoder shows up as a ``/dev/videoN`` node named "Apple AVE video
+encoder". GStreamer's ``v4l2h264enc`` and ``v4l2h265enc`` and ffmpeg's
+``h264_v4l2m2m`` and ``hevc_v4l2m2m`` work with it, for example::
 
-Use the public Aurora m1n1 J700 AVE handoff. It reserves the firmware already
-loaded by iBoot, fills the device's ``memory-region`` references and exports
-``aurora,ave-text-crc32`` and ``aurora,ave-data-crc32`` strings under
-``/chosen``. No firmware file is included or requested by this driver.
-The current transport requires the qualified 25G76 two-segment layout:
-0x14c000 text bytes and 0x130000 data bytes, mapped starting at IOVA
-0x10000000000. Every mapping and both content CRCs are checked before use.
-Text CRCs are restricted to the two inspected 9003.78.0 images (0x2ce7359e
-and 0x69c54454). These checks detect build drift, not firmware authenticity.
-Different firmware is unsupported, even if the device has the same SoC.
+  gst-launch-1.0 -e videotestsrc num-buffers=300 ! \
+    video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+    v4l2h264enc extra-controls="controls,video_bitrate=8000000" ! \
+    h264parse ! filesink location=out.h264
 
-The driver holds the DMA, pipe4, pipe5, me0 and me1 power domains and owns
-the IPC, queue, log and firmware-requested heap allocations. Debugfs lives
-under ``/sys/kernel/debug/285100000.video-codec``:
+  ffmpeg -i in.mkv -pix_fmt nv12 -c:v h264_v4l2m2m -b:v 8M -g 30 out.h264
 
-* ``ave-status`` reports mappings, protocol phase and reply counters.
-* ``ave-start-once`` accepts one explicit firmware start per boot.
-* ``ave-command`` accepts one bounded packet and returns a framed reply.
-* ``ave-arena`` stages image/reference/output surfaces within owned memory.
-* ``ave-poll`` drains later firmware replies without another submission.
+Up to two streams can be encoded at the same time.
 
-Writes require ``CAP_SYS_RAWIO``. Command packets must come from a trusted,
-matching local protocol experiment with all embedded surface addresses
-relocated into this boot's owned arena. Root access does not make arbitrary
-firmware packets valid. Binary command captures are supplied separately and
-are not included in this contribution.
+Firmware
+--------
 
-Lifecycle and verification
---------------------------
+The encoder runs firmware on its own coprocessor. The bootloader loads it into
+two reserved, DART-mapped segments (TEXT and DATA) but does not start it. The
+Aurora Stage 2 loader passes both regions in the device's ``memory-region``
+property and records their CRC32 under ``/chosen`` as
+``aurora,ave-text-crc32`` and ``aurora,ave-data-crc32``. The driver only binds
+while DATA still matches the recorded checksum, and keeps a copy of DATA that
+it restores before every firmware boot.
 
-After the start attempt, the module, DMA buffers and power references remain
-pinned until an external hardware reset, including after failure. Do not
-force-unload, unbind the DARTs, reuse uncertain buffers or retry a failed
-command. Firmware quiescence and normal production teardown are unfinished.
+No firmware files are needed. The driver builds every command itself,
+including the two large session commands (Start and Process), from the
+session settings and a set of constant fields known for one firmware build:
+AppleAVE2FW 9003.78.0, TEXT checksum ``69c54454``. With any other firmware
+build the device binds, but starting a stream fails with ``ENOTSUPP`` and a
+message naming the checksum, until that build's command layout has been
+checked.
 
-A transport acknowledgement is not an encoded frame. For physical tests,
-record the exact kernel/module, DT and firmware hashes; submit changing
-images; validate each codec reply; independently decode the current DMA
-output; check every frame's dimensions and quality; then verify Stop/Close,
-kernel health and the existing desktop/radio stack. Keep the generated
-inputs, bitstreams, decoded pixels, logs and hashes as a repeatable artifact.
+With debugfs mounted, ``apple-ave/last_start_h264``,
+``last_start_hevc``, ``last_process0_h264`` and ``last_process0_hevc`` hold the
+last Start command built and the first Process command of the last session,
+for comparison with reference captures.
 
-The prior implementation was authored by Ace (Acelogic). This contribution
-ports that existing GPL work. Arbitrary resolutions, standard media APIs,
-throughput, concurrent clients and other codecs or SoCs are outside this
-experiment.
+Sessions and power management
+-----------------------------
+
+The firmware boots when the first stream starts and is halted when the last
+one ends, as macOS does; the next stream starts it from reset. Runtime PM
+powers the encoder down two seconds after the last stream.
+
+Up to five frames per stream are inside the firmware at once (three without
+B-frames). The firmware reorders B-frames itself, so CAPTURE buffers come
+back in bitstream order, each with the timestamp of the frame it codes.
+
+Across system sleep, open streams are drained, closed and the firmware is
+halted. On resume each stream reopens on its next frame, which starts with
+an IDR and fresh parameter sets; clients see no error.
+
+Every wait for the firmware is bounded. A command or frame that gets no
+answer within 5 seconds (Start: 10 seconds) fails the stream with ``EIO``;
+a firmware that stops answering keeps the encoder powered and is not used
+again until reboot. The driver polls the firmware rings with sleeping waits.
+
+Limits
+------
+
+- Picture sizes from 320x240 to 2560x1600 in steps of two, up to 240 frames
+  per second.
+- The encoder reads NV12 with a 64-byte aligned line stride, which
+  ``VIDIOC_S_FMT`` reports. Clients that fill buffers with a smaller line
+  size (ffmpeg does, for widths that are not a multiple of 64) are detected
+  from the payload size and their frames copied to the encoder's layout.
+- Rate control is VBR, with ``BITRATE_PEAK`` as a one-second data-rate cap
+  (twice the average when left at 0), or CBR. In CBR mode, frames are padded
+  with filler data once more than half a second of bit rate has gone unused,
+  as macOS does; the driver adds the filler itself if the firmware does not.
+  Constant quality is not offered. ``BITRATE`` may change while streaming and applies from the next
+  frame; ``FORCE_KEY_FRAME`` makes the next frame an IDR.
+- Either three B-frames or none (``B_FRAMES`` 3 or 0). H.264 Baseline and a
+  GOP size of 1 never use them.
+- The level control is a minimum: the driver raises it to what the size,
+  frame rate and bit rate need.
+- Buffers are mapped through the encoder's 256 MiB DMA window, so both queues
+  are limited to what fits next to the encoder's working memory (fewer
+  buffers at larger sizes).

@@ -2801,6 +2801,14 @@ F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
 F:	tools/testing/selftests/drivers/apple/
 
+ARM/APPLE AVE VIDEO ENCODER DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+W:	https://aurora-silicon.github.io
+F:	Documentation/admin-guide/media/apple-ave.rst
+F:	drivers/media/platform/apple/ave/
+
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
 W:	https://aurora-silicon.github.io

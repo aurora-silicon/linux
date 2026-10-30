@@ -69,7 +69,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "venc0_sys";
-		status = "disabled";
 	};
 
 	ps_apcie_gp: power-controller@258 {
@@ -408,7 +407,6 @@
 		#reset-cells = <0>;
 		label = "venc0_dma";
 		power-domains = <&ps_venc0_sys>;
-		status = "disabled";
 	};
 
 	ps_venc0_pipe4: power-controller@8008 {
@@ -418,7 +416,6 @@
 		#reset-cells = <0>;
 		label = "venc0_pipe4";
 		power-domains = <&ps_venc0_dma>;
-		status = "disabled";
 	};
 
 	ps_venc0_pipe5: power-controller@8010 {
@@ -428,7 +425,6 @@
 		#reset-cells = <0>;
 		label = "venc0_pipe5";
 		power-domains = <&ps_venc0_dma>;
-		status = "disabled";
 	};
 
 	ps_venc0_me0: power-controller@8018 {
@@ -438,7 +434,6 @@
 		#reset-cells = <0>;
 		label = "venc0_me0";
 		power-domains = <&ps_venc0_dma>;
-		status = "disabled";
 	};
 
 	ps_venc0_me1: power-controller@8020 {
@@ -448,7 +443,6 @@
 		#reset-cells = <0>;
 		label = "venc0_me1";
 		power-domains = <&ps_venc0_me0>;
-		status = "disabled";
 	};
 };
 
