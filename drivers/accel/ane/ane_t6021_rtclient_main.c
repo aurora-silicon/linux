@@ -483,7 +483,6 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 {
 	struct ane_t6021 *a = ane->fw;
 	u64 *io, *malloc_ring, header;
-	u64 *t2h_buf, *t2h_ioq;
 	void __iomem *ipi = ane->engine + ANE_IPI_OFF;
 	unsigned int cursor = ane->legacy_malloc_cursor;
 	unsigned long deadline;
@@ -501,8 +500,6 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 	io = a->boot_ipc + ane_t6021_chman_layout[channel].off +
 	     (size_t)ane->legacy_cmd_cursor[channel] * 64;
 	malloc_ring = a->boot_ipc + ane_t6021_chman_layout[5].off;
-	t2h_buf = a->boot_ipc + ane_t6021_chman_layout[4].off;
-	t2h_ioq = a->boot_ipc + ane_t6021_chman_layout[6].off;
 
 	if (!(READ_ONCE(io[0]) & 1)) {
 		result = -EBUSY;
