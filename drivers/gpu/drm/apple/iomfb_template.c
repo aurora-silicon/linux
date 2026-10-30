@@ -166,17 +166,41 @@ static void dcp_swap_set_edr(struct DCP_FW_NAME(dcp_swap) *swap, u32 sdr, u32 pe
 	put_unaligned_le64(dcp_binary64_ratio(peak, sdr), &swap->edr_headroom);
 }
 
-/* An EDR panel swap carries the headroom over the current panel level. */
-static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) *swap)
+/*
+ * An EDR panel swap carries the headroom over the panel level: @nits when
+ * the swap itself carries a level (@carries), else the current one.
+ *
+ * The firmware shows a PQ surface at (PQ nits / 100) x the EDR scale x the
+ * panel level the swap asks for.  Left at SDR white, that level squeezes the
+ * whole PQ range below SDR white, so EDR swaps also ask for the panel at its
+ * peak; the scale (SDR white over the peak) keeps PQ 100 at the user's level.
+ * The panel goes back to that level when EDR ends, and a swap that turns it
+ * off keeps its zero.
+ */
+static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) *swap,
+			    bool carries, u32 nits)
 {
 	u32 peak = READ_ONCE(dcp->panel.peak_nits);
-	u32 sdr = dcp->output_edr ? dcp_backlight_desktop_nits(dcp) : 0;
+	u32 sdr = 0;
 
+	if (dcp->output_edr)
+		sdr = carries ? nits : dcp_backlight_desktop_nits(dcp);
 	if (sdr && peak > sdr) {
 		dcp_swap_set_edr(swap, sdr, peak);
+		/* A level of the swap's own would replace the peak. */
+		if (carries || !dcp->edr_boosted)
+			dcp_swap_set_brightness(swap, peak);
+		dcp->edr_boosted = true;
 		dcp->edr_sent = true;
 	} else if (dcp->edr_sent) {
 		dcp_swap_set_edr(swap, 1, 1);
+		if (dcp->edr_boosted && !carries) {
+			u32 level = dcp_backlight_desktop_nits(dcp);
+
+			if (level)
+				dcp_swap_set_brightness(swap, level);
+		}
+		dcp->edr_boosted = false;
 		dcp->edr_sent = false;
 	}
 }
@@ -2795,15 +2819,16 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	if (dcp_has_panel(dcp)) {
-		u32 nits;
-		bool have_surface = false;
+		u32 nits = 0;
+		bool have_surface = false, carries;
 
 		for (unsigned int i = 0; i < SWAP_SURFACES; i++)
 			have_surface |= !DCP_FW_SWAP(dcp).surf_null[i];
-		if (dcp_backlight_desktop_prepare(dcp, resp->swap_id,
-						  have_surface, &nits))
+		carries = dcp_backlight_desktop_prepare(dcp, resp->swap_id,
+							have_surface, &nits);
+		if (carries)
 			dcp_swap_set_brightness(&DCP_FW_SWAP(dcp).swap, nits);
-		dcp_edr_prepare(dcp, &DCP_FW_SWAP(dcp).swap);
+		dcp_edr_prepare(dcp, &DCP_FW_SWAP(dcp).swap, carries, nits);
 	}
 #endif
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
