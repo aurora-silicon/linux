@@ -334,12 +334,13 @@
 	 * of all-core load at full clocks (P 3852, E 2592 MHz, never
 	 * throttled): the fans stay off up to TCMz ~100 C, start at their
 	 * minimum, leave it near 104.5 C, and hold the die at a steady 106.5 C
-	 * with 3450/3730 rpm (60-65% of maximum), after a 110.9 C peak. Full
-	 * speed is kept for 111 C, just under the 113 C passive trip. TCMz, the
-	 * hottest of the die sensors, swings by up to 8 C between samples
-	 * under load, so the hysteresis spans that swing; a fan stays on its
-	 * speed until the die is clearly cooler, as the SMC's slow ramp does
-	 * under macOS.
+	 * with 3450/3730 rpm (60-65% of maximum), after a 110.9 C peak, never
+	 * faster than 3730 rpm. So 111 C asks for state 6 (4510 rpm), and full
+	 * speed waits for the 113 C passive trip, where the CPUs also shed
+	 * clocks. TCMz, the hottest of the die sensors, swings by up to 8 C
+	 * between samples under load, so the hysteresis spans that swing; a
+	 * fan stays on its speed until the die is clearly cooler, as the
+	 * SMC's slow ramp does under macOS.
 	 */
 #define J616S_FAN_TRIP(label, node, temp, hyst)	\
 	label: node {					\
@@ -381,7 +382,8 @@
 	J616S_FAN_MAP(zone##_fan2, map-fan2, 2)		\
 	J616S_FAN_MAP(zone##_fan3, map-fan3, 4)		\
 	J616S_FAN_MAP(zone##_fan4, map-fan4, 5)		\
-	J616S_FAN_MAP(zone##_fan5, map-fan5, 8)
+	J616S_FAN_MAP(zone##_fan5, map-fan5, 6)		\
+	J616S_FAN_MAP(zone##_passive, map-fan6, 8)
 
 	thermal-zones {
 		cpu-die-thermal {
