@@ -7,10 +7,10 @@
  * command FIFO. This driver intentionally implements the PIO spi-mem path
  * only; that is sufficient for SPI NOR discovery and access.
  *
- * On T8140 reads reach the whole boot NOR, but programs and erases are
- * admitted only inside its unique, aligned nvram partition. Without that
- * partition the NOR is read-only.
- *
+ * The boot NOR starts read-only. On the qualified boards (J613, J713 and
+ * the J700) root may opt in at runtime to bounded, verified programs and
+ * 4 KiB erases inside the nvram partition; everything else stays
+ * read-only. On T8140 data reads reach the whole NOR.
  */
 
 #include <linux/bitfield.h>
@@ -88,6 +88,10 @@
 #define APPLE_QSPI_MAX_HZ		40000000
 #define APPLE_QSPI_TIMEOUT_MS		1000
 
+/* Winbond W25Q64 (J613/J713) and W25Q16 (J700) boot NOR JEDEC IDs. */
+static const u8 apple_qspi_jedec_w25q64[3] = { 0xef, 0x65, 0x17 };
+static const u8 apple_qspi_jedec_w25q16[3] = { 0xef, 0x65, 0x15 };
+
 static DEFINE_MUTEX(apple_qspi_policy_lock);
 static bool read_only = true;
 static bool runtime_ready;
@@ -125,7 +129,7 @@ static const struct kernel_param_ops apple_qspi_read_only_ops = {
 	.get = apple_qspi_get_read_only,
 };
 module_param_cb(read_only, &apple_qspi_read_only_ops, &read_only, 0644);
-MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded J613/J713 NVRAM writes");
+MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded J613/J713/J700 NVRAM writes");
 
 static bool apple_qspi_opcode_is_read(u8 opcode)
 {
@@ -149,12 +153,16 @@ static bool apple_qspi_opcode_is_read(u8 opcode)
 }
 
 struct apple_qspi {
-	/* T8122/T8132 use the serialized, verified NVRAM policy. */
+	/* Every write-path request goes through the verified NVRAM policy. */
 	bool nvram_policy;
-	/* T8140 admits programs and erases only inside nvram. */
+	/* T8140: data reads of any shape pass straight to the controller. */
 	bool nvram_window;
+	/* The nvram partition [window_start, window_end). */
 	u64 window_start;
 	u64 window_end;
+	/* Expected JEDEC ID and the SR1 block-protect bits left by firmware. */
+	u8 jedec[3];
+	u8 bp_ok;
 	bool nvram_write_candidate;
 	bool write_fault;
 	void __iomem *base;
@@ -652,7 +660,7 @@ static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op 
 	ret = apple_qspi_read_register(mem, 0x9f, id, sizeof(id));
 	if (ret)
 		goto out;
-	if (id[0] != 0xef || id[1] != 0x65 || id[2] != 0x17) {
+	if (memcmp(id, qspi->jedec, sizeof(id))) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -660,7 +668,8 @@ static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op 
 	if (ret)
 		goto out;
 	/* No unlocking. Conservatively refuse BP/CMP/WPS, BUSY/WEL or suspend. */
-	if (!apple_qspi_status_allows_write(before[0], before[1], before[2])) {
+	if (!apple_qspi_status_allows_write(before[0], before[1], before[2],
+					    qspi->bp_ok)) {
 		ret = -EACCES;
 		goto out;
 	}
@@ -780,7 +789,8 @@ static int apple_qspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	}
 	if (!apple_qspi_mutation_allowed(op->cmd.opcode, op->addr.nbytes,
 					op->addr.val, op->data.nbytes,
-					op->data.dir == SPI_MEM_DATA_OUT)) {
+					op->data.dir == SPI_MEM_DATA_OUT,
+					qspi->window_start, qspi->window_end)) {
 		denial = "mutation-policy";
 		goto out;
 	}
@@ -802,36 +812,14 @@ out:
 	return ret;
 }
 
-/* T8140: data reads pass; anything else must stay inside the nvram window. */
-static int apple_qspi_window_exec_op(struct spi_mem *mem,
-				     const struct spi_mem_op *op)
-{
-	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
-
-	if (op->data.dir == SPI_MEM_DATA_IN && op->data.nbytes)
-		return apple_qspi_transfer_op(mem, op);
-	if (!op->dummy.nbytes &&
-	    apple_qspi_window_allowed(op->cmd.opcode, op->addr.nbytes,
-				      op->addr.val, op->data.nbytes,
-				      op->data.dir == SPI_MEM_DATA_OUT,
-				      qspi->window_start, qspi->window_end))
-		return apple_qspi_transfer_op(mem, op);
-
-	dev_warn_ratelimited(&mem->spi->dev,
-		"boot NOR request denied: opcode=%02x addr=%#llx addr_bytes=%u len=%u dir=%u nvram=[%#llx, %#llx)\n",
-		op->cmd.opcode, (unsigned long long)op->addr.val,
-		op->addr.nbytes, op->data.nbytes, op->data.dir,
-		(unsigned long long)qspi->window_start,
-		(unsigned long long)qspi->window_end);
-	return -EACCES;
-}
-
 static int apple_qspi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 {
 	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
 
-	if (qspi->nvram_window)
-		return apple_qspi_window_exec_op(mem, op);
+	/* T8140 keeps its multi-line data reads; spi-mem serializes them. */
+	if (qspi->nvram_window && op->data.dir == SPI_MEM_DATA_IN &&
+	    op->data.nbytes)
+		return apple_qspi_transfer_op(mem, op);
 	if (!qspi->nvram_policy)
 		return apple_qspi_transfer_op(mem, op);
 	return apple_qspi_exec_op(mem, op);
@@ -853,6 +841,9 @@ static bool apple_qspi_nvram_write_board(struct device_node *node,
 	if (of_device_is_compatible(node, "apple,t8132-qspi"))
 		return of_machine_is_compatible("apple,j713") &&
 			base == 0x3ad118000ULL;
+	if (of_device_is_compatible(node, "apple,t8140-qspi"))
+		return of_machine_is_compatible("apple,j700") &&
+			base == 0x385110000ULL;
 	return false;
 }
 
@@ -894,7 +885,8 @@ static bool apple_qspi_nvram_layout(struct device_node *node)
 
 /*
  * The one "nvram" partition of the flash on CS0, 4 KiB aligned and within
- * 32-bit addressing. Without it, no program or erase is admitted.
+ * three-byte addressing, since the policy only admits three-byte programs
+ * and erases. Without it, no program or erase is admitted.
  */
 static void apple_qspi_nvram_window(struct device *dev, struct apple_qspi *qspi)
 {
@@ -933,7 +925,7 @@ static void apple_qspi_nvram_window(struct device *dev, struct apple_qspi *qspi)
 		}
 	}
 	of_node_put(parts);
-	if (found != 1 || start >= end || end > 1ULL << 32 ||
+	if (found != 1 || start >= end || end > 1ULL << 24 ||
 	    !IS_ALIGNED(start, APPLE_QSPI_ERASE_SIZE) ||
 	    !IS_ALIGNED(end, APPLE_QSPI_ERASE_SIZE))
 		start = end = 0;
@@ -941,8 +933,7 @@ out:
 	qspi->window_start = start;
 	qspi->window_end = end;
 	if (start < end)
-		dev_dbg(dev, "boot NOR read-only outside nvram [%#llx, %#llx)\n",
-			start, end);
+		dev_dbg(dev, "nvram partition [%#llx, %#llx)\n", start, end);
 	else
 		dev_dbg(dev, "boot NOR read-only: no usable nvram partition\n");
 }
@@ -961,11 +952,19 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qspi = spi_controller_get_devdata(ctlr);
+	qspi->nvram_policy = true;
 	qspi->nvram_window = of_device_is_compatible(dev->of_node, "apple,t8140-qspi");
-	if (qspi->nvram_window)
+	if (qspi->nvram_window) {
+		/* J700: W25Q16JV; iBoot leaves BP0 set over the top 64 KiB. */
 		apple_qspi_nvram_window(dev, qspi);
-	qspi->nvram_policy = of_device_is_compatible(dev->of_node, "apple,t8122-qspi") ||
-			     of_device_is_compatible(dev->of_node, "apple,t8132-qspi");
+		memcpy(qspi->jedec, apple_qspi_jedec_w25q16, sizeof(qspi->jedec));
+		qspi->bp_ok = 0x1c;
+	} else {
+		qspi->window_start = APPLE_QSPI_NVRAM_START;
+		qspi->window_end = APPLE_QSPI_NVRAM_END;
+		memcpy(qspi->jedec, apple_qspi_jedec_w25q64, sizeof(qspi->jedec));
+		qspi->bp_ok = 0;
+	}
 	if (of_device_is_compatible(dev->of_node, "apple,t8122-qspi") &&
 	    !of_machine_is_compatible("apple,j613"))
 		return -ENODEV;
@@ -979,7 +978,8 @@ static int apple_qspi_probe(struct platform_device *pdev)
 
 	qspi->nvram_write_candidate = apple_qspi_nvram_write_board(dev->of_node,
 								   res->start) &&
-		apple_qspi_nvram_layout(dev->of_node);
+		(qspi->nvram_window ? qspi->window_start < qspi->window_end :
+				      apple_qspi_nvram_layout(dev->of_node));
 	qspi->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(qspi->base))
 		return PTR_ERR(qspi->base);
@@ -1016,7 +1016,7 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	ctlr->num_chipselect = 1;
 	ctlr->max_native_cs = 1;
 	ctlr->mode_bits = SPI_CPHA | SPI_CPOL;
-	if (!qspi->nvram_policy)
+	if (qspi->nvram_window)
 		ctlr->mode_bits |= SPI_RX_DUAL | SPI_RX_QUAD |
 				   SPI_TX_DUAL | SPI_TX_QUAD;
 	ctlr->bits_per_word_mask = SPI_BPW_MASK(8);

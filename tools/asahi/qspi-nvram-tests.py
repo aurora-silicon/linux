@@ -68,6 +68,7 @@ static int param_get_bool(char*b,const struct kernel_param*p){b[0]=*(bool*)p->ar
 struct apple_qspi {
  bool nvram_policy, nvram_write_candidate, write_fault, nvram_window;
  u64 window_start, window_end;
+ u8 jedec[3]; u8 bp_ok;
 };
 struct spi_controller { struct apple_qspi *q; };
 struct spi_device { struct spi_controller *controller; unsigned int cs; int dev; };
@@ -103,7 +104,7 @@ static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
   memcpy(o->data.buf.in,flash+o->addr.val,o->data.nbytes);
   if(corrupt_readback&&programmed)((u8*)o->data.buf.in)[0]^=1;
   break;
- case 0x06:assert(!sr[0]);sr[0]|=2;break;
+ case 0x06:assert(!(sr[0]&3));sr[0]|=2;break;
  case 0x04:sr[0]&=~2;break;
  case 0x02:
   assert(sr[0]&2);assert(o->addr.val>=0x700000&&o->addr.val+o->data.nbytes<=0x800000);
@@ -123,7 +124,7 @@ static struct spi_device spi={&ctl};
 static struct spi_mem mem={&spi};
 static struct kernel_param parameter={&read_only};
 static void reset(void){
- memset(flash,0xff,sizeof(flash));memset(sr,0,sizeof(sr));q=(struct apple_qspi){.nvram_policy=true,.nvram_write_candidate=true};
+ memset(flash,0xff,sizeof(flash));memset(sr,0,sizeof(sr));q=(struct apple_qspi){.nvram_policy=true,.nvram_write_candidate=true,.window_start=0x700000,.window_end=0x800000,.jedec={0xef,0x65,0x17}};
  read_only=true;runtime_ready=false;write_fault_latched=false;wire_count=0;fail_opcode=0;spi.cs=0;
  corrupt_readback=false;stuck_busy=false;programmed=false;deny_alloc=false;jiffies=0;
  jedec[0]=0xef;jedec[1]=0x65;jedec[2]=0x17;
@@ -136,7 +137,7 @@ static void arm(void){runtime_ready=true;assert(!apple_qspi_set_read_only("N",&p
 static bool sent(unsigned int o){for(unsigned int i=0;i<wire_count;i++)if(wire[i]==o)return true;return false;}
 static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&mem,&o)<0);assert(!wire_count);}
 int main(void){
- const char *boards[]={"apple,j613","apple,j713","apple,j714"};
+ const char *boards[]={"apple,j613","apple,j713","apple,j700","apple,j714"};
  const char *controllers[]={"apple,t8122-qspi","apple,t8132-qspi","apple,t8140-qspi"};
  const u64 bases[]={0x2a1118000ULL,0x3ad118000ULL,0x385110000ULL,0xad118000ULL,0x3ad118004ULL};
  for(unsigned int b=0;b<ARRAY_SIZE(boards);b++){
@@ -144,33 +145,33 @@ int main(void){
   for(unsigned int c=0;c<ARRAY_SIZE(controllers);c++){
    struct device_node node={controllers[c]};
    for(unsigned int a=0;a<ARRAY_SIZE(bases);a++)
-    assert(apple_qspi_nvram_write_board(&node,bases[a])==((b==0&&c==0&&a==0)||(b==1&&c==1&&a==1)));
+    assert(apple_qspi_nvram_write_board(&node,bases[a])==((b==0&&c==0&&a==0)||(b==1&&c==1&&a==1)||(b==2&&c==2&&a==2)));
   }
  }
- puts("PASS J613/J713 board, controller and full-width aperture qualification (45 combinations)");
+ puts("PASS J613/J713/J700 board, controller and full-width aperture qualification (60 combinations)");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
- /* T8140 uses a separate nvram window while the J613 gate stays read-only.
-  * This synthetic window shares the flash model's range; KUnit also covers
-  * the J700 partition's exact bounds. */
- q.nvram_policy=false;q.nvram_window=true;
- q.window_start=0x700000;q.window_end=0x800000;
- assert(!apple_qspi_mem_exec_op(&mem,&wren) && wire_count==1 && sr[0]==2);
+ /* T8140 (J700) shares the verified policy at its DT nvram window; its data
+  * reads pass without the opt-in. This synthetic window shares the flash
+  * model's range; KUnit covers the J700 partition's exact bounds. */
+ q.nvram_window=true;q.bp_ok=0x1c;
+ u8 rdbuf[4];struct spi_mem_op t8140_read=SPI_MEM_OP(SPI_MEM_OP_CMD(0x03,1),SPI_MEM_OP_ADDR(3,0x10,1),SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_DATA_IN(4,rdbuf,1));
+ assert(!apple_qspi_mem_exec_op(&mem,&t8140_read) && wire_count==1);
+ wire_count=0;assert(apple_qspi_mem_exec_op(&mem,&wren)==-EACCES && !wire_count);
  struct spi_mem_op window_program=program(0x700000,256,data);
- assert(!apple_qspi_mem_exec_op(&mem,&window_program) && wire_count==2);
- assert(!memcmp(flash+0x700000,data,256) && read_only);
+ assert(apple_qspi_mem_exec_op(&mem,&window_program)==-EACCES && !wire_count);
+ arm();sr[0]=4;
+ assert(!apple_qspi_mem_exec_op(&mem,&wren) && !wire_count);
+ assert(!apple_qspi_mem_exec_op(&mem,&window_program) && sent(0x02) && sr[0]==4);
+ assert(!memcmp(flash+0x700000,data,256));
  const u64 outside_window[]={0,0x6fffff,0x800000,0x100700000ULL};
- for(unsigned int i=0;i<ARRAY_SIZE(outside_window);i++){
-  struct spi_mem_op bad_window=program(outside_window[i],1,data);
-  assert(apple_qspi_mem_exec_op(&mem,&bad_window)==-EACCES && wire_count==2);
- }
- window_program=program(0x7fffff,2,data);
- assert(apple_qspi_mem_exec_op(&mem,&window_program)==-EACCES && wire_count==2);
- struct spi_mem_op status_write=wren;status_write.cmd.opcode=0x01;
- assert(apple_qspi_mem_exec_op(&mem,&status_write)==-EACCES && wire_count==2);
- q.window_start=q.window_end=0;window_program=program(0x700000,1,data);
- assert(apple_qspi_mem_exec_op(&mem,&window_program)==-EACCES && wire_count==2);
- puts("PASS T8140 window dispatch, bounded programs, rejected control writes and empty partition");
+ for(unsigned int i=0;i<ARRAY_SIZE(outside_window);i++)denied(program(outside_window[i],1,data));
+ struct spi_mem_op status_write=wren;status_write.cmd.opcode=0x01;denied(status_write);
+ q.window_start=q.window_end=0;denied(program(0x700000,1,data));
+ q.window_start=0x700000;q.window_end=0x800000;q.bp_ok=0;wire_count=0;
+ window_program=program(0x700100,1,data);
+ assert(apple_qspi_exec_op(&mem,&window_program)==-EACCES&&!sent(0x06));
+ puts("PASS T8140 read pass-through, opt-in, verified programs, tolerated BP bits, rejected control writes and empty partition");
  reset();
  assert(apple_qspi_mem_exec_op(&mem,&wren)==-EACCES && !wire_count);
  arm();
@@ -251,7 +252,6 @@ def main():
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
                   'static int apple_qspi_read_array(', 'static int apple_qspi_status(',
                   'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(',
-                  'static int apple_qspi_window_exec_op(',
                   'static int apple_qspi_mem_exec_op(']
     code = PREFIX + policy + '\n'.join(function(source, s) for s in signatures) + CONTROLS
     output = contextlib.nullcontext(str(args.output)) if args.output else tempfile.TemporaryDirectory(prefix='qspi-nvram-')
@@ -263,8 +263,9 @@ def main():
         for name, old, new in [
             ('j713-board', 'of_machine_is_compatible("apple,j713")', 'true'),
             ('j713-aperture', 'base == 0x3ad118000ULL', 'base != 0'),
-            ('t8140-window', 'start <= first && last <= end', 'start <= first'),
-            ('range', 'addr >= APPLE_QSPI_NVRAM_START', 'addr >= 1'),
+            ('j700-board', 'of_machine_is_compatible("apple,j700")', 'true'),
+            ('range', 'addr >= start &&', 'addr >= 1 &&'),
+            ('bp-ok', '!(sr1 & 0x1c & ~bp_ok)', '1'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;')]:
