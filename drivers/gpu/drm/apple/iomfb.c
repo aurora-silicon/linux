@@ -871,6 +871,19 @@ bool dcp_crtc_can_retrain(struct drm_crtc *crtc, struct apple_connector *connect
 	return to_apple_crtc(crtc)->dcp == pdev;
 }
 
+/*
+ * A Type-C port whose pipelines do not follow their CRTC is driven by the
+ * pipeline its route is on; @crtc belonging to another one has lost it.
+ */
+static bool dcp_crtc_lost_route(struct drm_crtc *crtc, struct apple_connector *connector)
+{
+	struct platform_device *pdev = READ_ONCE(connector->dcp);
+
+	return connector->port_encoder && pdev &&
+	       !dcp_typec_follows_crtc(platform_get_drvdata(pdev)) &&
+	       to_apple_crtc(crtc)->dcp != pdev;
+}
+
 static int dcp_retrain_active_crtc(struct apple_connector *connector)
 {
 	struct drm_device *dev = connector->base.dev;
@@ -882,10 +895,24 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector)
 
 	crtc = connector->base.state ? connector->base.state->crtc : NULL;
 	if (crtc && crtc->state && crtc->state->active &&
-	    dcp_crtc_can_retrain(crtc, connector))
+	    dcp_crtc_lost_route(crtc, connector)) {
+		/*
+		 * The port's route moved to another pipeline (an HDMI display
+		 * took the hybrid): this CRTC cannot drive the display any
+		 * more, and a reset would only be refused.  Release it, so the
+		 * hotplug that follows lets the compositor pair the display
+		 * with the pipeline that now drives it, and this pipeline's
+		 * own display with this CRTC.
+		 */
+		struct drm_mode_set set = { .crtc = crtc };
+
+		ret = drm_atomic_helper_set_config(&set, &ctx);
+	} else if (crtc && crtc->state && crtc->state->active &&
+		   dcp_crtc_can_retrain(crtc, connector)) {
 		ret = drm_atomic_helper_reset_crtc(crtc, &ctx);
-	else
+	} else {
 		ret = 0;
+	}
 
 	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
 
@@ -2195,7 +2222,11 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 		*reason = "not-connected";
 		return -ENODEV;
 	}
-	/* The boot-like mode first, then the preferred one. */
+	/*
+	 * The preferred mode first, the one the firmware ranks highest (the
+	 * panel's native refresh), then the boot-like one: the mode that works
+	 * stays the preferred one, which is also what a desktop picks.
+	 */
 	mutex_lock(&dcp->modes_lock);
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
@@ -2214,13 +2245,11 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 	}
 	if (pref == UINT_MAX)
 		pref = 0;
+	cand[n++] = dcp->modes[pref].mode;
 	/* Only a mode within 1% of the boot loader's clock counts as boot-like. */
-	if (boot != UINT_MAX && best <= DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ / 100)
+	if (boot != UINT_MAX && best <= DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ / 100 &&
+	    boot != pref)
 		cand[n++] = dcp->modes[boot].mode;
-	else
-		boot = UINT_MAX;
-	if (pref != boot)
-		cand[n++] = dcp->modes[pref].mode;
 	mutex_unlock(&dcp->modes_lock);
 
 	st = kzalloc_obj(*st);
@@ -2277,6 +2306,77 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 out:
 	kfree(st);
 	return ret;
+}
+
+/*
+ * PQ output goes through the IOMFB template's mode set, which picks the
+ * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware
+ * and the external H17P processor.  The other processors keep SDR.
+ */
+static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
+{
+	if (iomfb_is_m4(dcp))
+		return false;
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+}
+
+/*
+ * A desktop 26.x panel keeps its SDR link and shows PQ content as EDR, with
+ * the peak the firmware reports for it (see res_max_panel_brightness()).
+ */
+static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       dcp_has_panel(dcp) && READ_ONCE(dcp->panel.peak_nits);
+}
+
+/* The EOTF the compositor asks of the display on @crtc, an HDMI_EOTF_* value. */
+u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		 struct drm_atomic_commit *commit)
+{
+	const struct drm_connector_state *conn_state = NULL;
+	struct drm_connector_state *state;
+	struct drm_connector *connector;
+	const struct hdr_output_metadata *hdr;
+	int i;
+
+	for_each_new_connector_in_state(commit, connector, state, i)
+		if (state->crtc == crtc)
+			conn_state = state;
+	/* A mode set the driver starts itself keeps the connector's state. */
+	if (!conn_state && dcp->connector && dcp->connector->base.state &&
+	    dcp->connector->base.state->crtc == crtc)
+		conn_state = dcp->connector->base.state;
+	if (!conn_state || !conn_state->hdr_output_metadata)
+		return HDMI_EOTF_TRADITIONAL_GAMMA_SDR;
+	hdr = conn_state->hdr_output_metadata->data;
+	return hdr->hdmi_metadata_type1.eotf;
+}
+
+/* Only an SDR or a PQ signal, and PQ only where the timing has an element. */
+int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		       struct drm_atomic_commit *commit)
+{
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	struct dcp_display_mode mode;
+
+	if (!crtc_state || !crtc_state->enable ||
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		return 0;
+	switch (dcp_crtc_eotf(dcp, crtc, commit)) {
+	case HDMI_EOTF_TRADITIONAL_GAMMA_SDR:
+		return 0;
+	case HDMI_EOTF_SMPTE_ST2084:
+		if (dcp_panel_edr_supported(dcp))
+			return 0;
+		if (dcp_hdr_output_supported(dcp) &&
+		    lookup_mode(dcp, &crtc_state->mode, &mode) && mode.pq.score >= 0)
+			return 0;
+		fallthrough;
+	default:
+		return -EINVAL;
+	}
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
@@ -2414,6 +2514,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
+	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp);
+	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:

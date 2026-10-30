@@ -745,7 +745,7 @@ void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
 void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 {
 	unsigned long flags;
-	unsigned int i;
+	unsigned int i, best = UINT_MAX;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return;
@@ -755,16 +755,30 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 	dcp->metadata.timing_valid = false;
 	if (!dcp_firmware_metadata_complete(dcp))
 		goto unlock;
+	/*
+	 * The EDID's detailed timing: the preferred mode when the firmware
+	 * describes it fully, otherwise the highest-scored timing it marks
+	 * IsPreferred, the one the sink's own EDID lists first.  An external
+	 * display's preferred mode need not be one of those.
+	 */
 	for (i = 0; i < dcp->nr_modes; i++) {
-		if (!(dcp->modes[i].mode.type & DRM_MODE_TYPE_PREFERRED) ||
-		    !dcp->modes[i].metadata_timing_valid)
+		const struct dcp_display_mode *m = &dcp->modes[i];
+
+		if (!m->metadata_timing_valid)
 			continue;
-		dcp->metadata.preferred = dcp->modes[i].mode;
+		if (best == UINT_MAX || (m->mode.type & DRM_MODE_TYPE_PREFERRED) ||
+		    (!(dcp->modes[best].mode.type & DRM_MODE_TYPE_PREFERRED) &&
+		     m->score > dcp->modes[best].score))
+			best = i;
+		if (m->mode.type & DRM_MODE_TYPE_PREFERRED)
+			break;
+	}
+	if (best != UINT_MAX) {
+		dcp->metadata.preferred = dcp->modes[best].mode;
 		/* Desktop 26.x publishes its modes without their polarity. */
-		dcp->metadata.preferred.flags |= dcp->modes[i].metadata_sync_flags;
+		dcp->metadata.preferred.flags |= dcp->modes[best].metadata_sync_flags;
 		dcp->metadata.timing_ticket = dcp->chunks.metadata_ticket;
 		dcp->metadata.timing_valid = true;
-		break;
 	}
 unlock:
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
@@ -1011,6 +1025,15 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 		dcp->desktop->panel_metadata : dcp->desktop->panel_adt_identity;
 	*generation = dcp->desktop->panel_metadata_generation;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	/* PQ content is shown as EDR up to the peak (see dcp_edr_prepare()). */
+	if (READ_ONCE(dcp->panel.peak_nits)) {
+		metadata.pq = true;
+		metadata.static_metadata_type1 = true;
+		metadata.bt2020_rgb = true;
+		metadata.max_luminance = dcp->panel.peak_nits << 16;
+		metadata.max_fall = metadata.max_luminance;
+		metadata.min_luminance = 0;
+	}
 	/* The caller supplies the same retained catalog it is publishing. */
 	edid = size ? drm_edid_alloc(raw, size) :
 		dcp_panel_edid(&metadata, modes, count,
@@ -1439,6 +1462,9 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	struct drm_crtc_state *crtc_state;
 	bool needs_modeset;
+
+	if (dcp_crtc_check_hdr(dcp, crtc, commit))
+		return -EINVAL;
 
 	if (iomfb_is_m4(dcp)) {
 		struct drm_display_mode mode;
