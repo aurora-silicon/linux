@@ -378,10 +378,13 @@ impl crate::g17::Shared {
             .housekeeping
             .swap(false, core::sync::atomic::Ordering::AcqRel);
         let (recover, masks) = {
+            let _settled;
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
                 return Ok(());
             };
+            // Pairs that direct publications returned meanwhile are retired by this pass.
+            _settled = self.settle_direct_returns(firmware);
             let (pending, masks) = firmware.service_runtime_events(deferred)?;
             let recover = pending.recovery || firmware.recovery.pending();
             if recover {
@@ -396,10 +399,14 @@ impl crate::g17::Shared {
         if recover {
             self.preparations.wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }
+        let _settled;
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
         };
+        // After the drain no publisher holds a lease, so every direct loan is back or in the
+        // return box: recovery and housekeeping see no pair lent by a finished publication.
+        _settled = self.settle_direct_returns(firmware);
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }

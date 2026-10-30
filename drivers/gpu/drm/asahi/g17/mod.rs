@@ -81,14 +81,15 @@ use kernel::{
         Region, //
     },
     impl_has_delayed_work, impl_has_work,
-    new_condvar, new_delayed_work, new_mutex, new_work, platform,
+    new_condvar, new_delayed_work, new_mutex, new_spinlock, new_work, platform,
     prelude::*,
     soc::apple::rtkit,
     sync::{
         aref::ARef,
         Arc,
         CondVar,
-        Mutex, //
+        Mutex,
+        SpinLock, //
     },
     time::{
         delay::fsleep,
@@ -895,6 +896,10 @@ struct Shared {
     /// The device lock. `None` before boot completes and after detachment.
     #[pin]
     state: Mutex<Option<KBox<Firmware>>>,
+    /// Pairs that direct render publications returned while the device mutex was busy.
+    /// Settled by the next device-mutex holder that needs them (see `runtime::render::direct`).
+    #[pin]
+    direct_returns: SpinLock<runtime::DirectReturns>,
     #[pin]
     changed: CondVar,
     /// The port of the session in `state`; null before boot and once detachment begins.
@@ -1183,6 +1188,7 @@ impl Gpu {
         let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
         let renders = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
+        let direct_returns = runtime::DirectReturns::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         if cfg
@@ -1227,6 +1233,7 @@ impl Gpu {
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
+                direct_returns <- new_spinlock!(direct_returns, "g17::Shared::direct_returns"),
                 changed <- new_condvar!("g17::Shared::changed"),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),

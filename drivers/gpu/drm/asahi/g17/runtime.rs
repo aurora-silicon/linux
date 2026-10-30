@@ -18,6 +18,7 @@ mod render;
 pub(super) mod teardown;
 
 pub(super) use super::now_ns;
+pub(in crate::g17) use render::DirectReturns;
 use super::{
     buffer::{BufferIds, MetricsIds},
     context::{Context, QosIds},
@@ -2239,7 +2240,14 @@ impl super::Shared {
             return;
         }
         self.forget_port();
-        let firmware = self.state.lock().take();
+        let firmware = {
+            let mut state = self.state.lock();
+            // Drained: every direct loan is back or in the return box.
+            if let Some(firmware) = (*state).as_deref_mut() {
+                self.settle_stopped_returns(firmware);
+            }
+            state.take()
+        };
         if let Some(mut firmware) = firmware { firmware.finish_stopped_queues(); }
     }
 
@@ -2260,6 +2268,8 @@ impl super::Shared {
                     secondary.stop();
                 }
                 firmware.primary.stop();
+                // Drained: every direct loan is back or in the return box.
+                self.settle_stopped_returns(firmware);
             }
             state.take()
         };

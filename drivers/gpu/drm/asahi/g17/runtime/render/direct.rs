@@ -9,6 +9,16 @@
 //! the publication order of attachment hazards), QoS accounting, the stamps
 //! and the doorbell. While the pair is lent, the event worker skips it, so no
 //! retirement can complete its commands or their free-list references.
+//!
+//! A publication that succeeded returns its pair without waiting for the
+//! device mutex: when the mutex is busy, the loan goes to the shared return
+//! box instead ([`DirectReturns`]) and the next holder of the device mutex
+//! that needs the pair settles it, exactly as the publisher would have. Every
+//! such holder settles the box first: the next lend, the event pass, and the
+//! stop paths once the preparation leases are drained. The publisher queues an
+//! event pass after filling the box, so a returned loan never waits for more
+//! than that pass. A contended publication then waits for the device mutex
+//! once, for its lend, instead of twice.
 
 use super::super::{Backend, DeferredBatch};
 use crate::g17::{
@@ -17,6 +27,7 @@ use crate::g17::{
     port::{Port, RenderRoom},
     queue::render::{Pair, PublicationLease, RenderAddresses},
 };
+use crate::hw::t8140::queues::RENDER_SLOTS;
 use core::sync::atomic::Ordering;
 use kernel::{
     prelude::*,
@@ -31,6 +42,122 @@ pub(in crate::g17::runtime) struct Loan {
     lease: PublicationLease,
     addresses: RenderAddresses,
     uat: Arc<crate::mmu::Uat>,
+}
+
+/// A published loan waiting in [`DirectReturns`] for the device mutex.
+struct Returned {
+    loan: Loan,
+    activation: Option<(u16, u64)>,
+    packet: Arc<Packet>,
+}
+
+/// Loans of successful direct publications, returned without the device
+/// mutex, by slot. A slot holds at most one: its pair stays lent (its entry
+/// keeps `preparing`) until the loan is settled, so it cannot be lent again
+/// meanwhile. The lock nests inside the device mutex and is only held to move
+/// one loan in or out.
+pub(in crate::g17) struct DirectReturns {
+    slots: KBox<[Option<Returned>; RENDER_SLOTS]>,
+    pending: u64,
+}
+
+const _: () = assert!(RENDER_SLOTS <= u64::BITS as usize);
+
+impl DirectReturns {
+    pub(in crate::g17) fn new() -> Result<Self> {
+        Ok(Self {
+            slots: KBox::new([const { None }; RENDER_SLOTS], GFP_KERNEL)?,
+            pending: 0,
+        })
+    }
+
+    /// Puts `returned` in the cell of `slot`, or gives it back if the cell is not free.
+    fn put(&mut self, slot: u8, returned: Returned) -> Option<Returned> {
+        let index = usize::from(slot);
+        match self.slots.get_mut(index) {
+            Some(cell @ None) => {
+                *cell = Some(returned);
+                self.pending |= 1 << index;
+                None
+            }
+            _ => Some(returned),
+        }
+    }
+
+    fn take_next(&mut self) -> Option<(u8, Returned)> {
+        if self.pending == 0 {
+            return None;
+        }
+        let index = self.pending.trailing_zeros() as usize;
+        self.pending &= !(1 << index);
+        let returned = self.slots[index].take()?;
+        Some((index as u8, returned))
+    }
+}
+
+/// What settling the return box leaves for after the device mutex is dropped: dropping
+/// this queues the growth the returned pairs unblocked and wakes their waiters, as the
+/// publisher does after its own return. Declare it before the device-mutex guard, or drop
+/// the guard first, so that this runs unlocked.
+pub(in crate::g17) struct Settled {
+    shared: Arc<crate::g17::Shared>,
+    returned: bool,
+    grow: bool,
+}
+
+impl Drop for Settled {
+    fn drop(&mut self) {
+        if self.grow {
+            self.shared.queue_grow();
+        }
+        if self.returned {
+            self.shared.note_changed();
+        }
+    }
+}
+
+impl crate::g17::Shared {
+    /// Returns every loan in the return box to `firmware`, the device-mutex state of this
+    /// device, as its publishers would have. Returns whether any came back and whether a
+    /// return failed. The packets dropped here are never the last references: each was
+    /// published, so its pair keeps it among its active commands, and a lent pair is never
+    /// retired.
+    fn return_boxed(&self, firmware: &mut crate::g17::Firmware) -> (bool, bool) {
+        let (mut returned, mut failed) = (false, false);
+        loop {
+            let next = self.direct_returns.lock().take_next();
+            let Some((slot, mut boxed)) = next else {
+                return (returned, failed);
+            };
+            returned = true;
+            failed |= firmware
+                .return_render(slot, &mut boxed.loan, boxed.activation, &boxed.packet)
+                .is_err();
+        }
+    }
+
+    /// Settles the return box under the device mutex. A failed return loses the device, as
+    /// on the publisher's own return.
+    pub(in crate::g17) fn settle_direct_returns(
+        self: &Arc<Self>,
+        firmware: &mut crate::g17::Firmware,
+    ) -> Settled {
+        let (returned, failed) = self.return_boxed(firmware);
+        if failed {
+            self.lose_device_quietly();
+        }
+        Settled {
+            shared: self.clone(),
+            returned,
+            grow: returned && firmware.render_grow_ready(),
+        }
+    }
+
+    /// Settles the return box of stopped firmware before it is detached, so that its pairs
+    /// are torn down with the rest of its state. Nothing waits for them any more.
+    pub(in crate::g17) fn settle_stopped_returns(&self, firmware: &mut crate::g17::Firmware) {
+        let _ = self.return_boxed(firmware);
+    }
 }
 
 /// Publication host of a lent pair. Registration, first-publication and
@@ -290,12 +417,18 @@ impl Backend {
         let generation = port.generation();
         let dev = self.shared.drm().ok()?;
         let mut loan = {
+            let _settled;
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut()?;
-            if !lease.is_current() {
-                return None;
-            }
-            match firmware.lend_render(slot, self.owner, packet, priority, generation) {
+            // This owner's previous publication may have left its pair in the return box.
+            _settled = self.shared.settle_direct_returns(firmware);
+            let lent = if lease.is_current() {
+                firmware.lend_render(slot, self.owner, packet, priority, generation)
+            } else {
+                Ok(None)
+            };
+            drop(state);
+            match lent {
                 Ok(Some(loan)) => loan,
                 Ok(None) => return None,
                 Err(error) => return Some(Err(error)),
@@ -345,21 +478,50 @@ impl Backend {
             }
             Ok(())
         })();
-        let returned = {
-            let mut state = self.shared.state.lock();
-            match (*state).as_deref_mut() {
-                Some(firmware) => {
-                    let returned = firmware.return_render(slot, &mut loan, activation, packet);
-                    let grow_ready = firmware.render_grow_ready();
-                    drop(state);
-                    if grow_ready {
-                        self.shared.queue_grow();
+        // A published loan does not wait for a busy device mutex: it goes to the return box,
+        // whose next device-mutex holder that needs the pair settles it, and the queued event
+        // pass bounds how long it waits there. It goes in before the preparation lease is
+        // dropped, so a stop path that has drained the leases finds it there. A failed
+        // publication is returned here, since the device-mutex path may retry it at once.
+        let mut state = match self.shared.state.try_lock() {
+            Some(state) => state,
+            None if result.is_ok() => {
+                let boxed = Returned {
+                    loan,
+                    activation,
+                    packet: packet.clone(),
+                };
+                let stored = self.shared.direct_returns.lock().put(slot, boxed);
+                match stored {
+                    None => {
+                        drop(lease);
+                        self.shared.queue_event_records();
+                        self.direct_slot.store(u32::from(slot), Ordering::Relaxed);
+                        return Some(Ok(()));
                     }
-                    returned
+                    // A slot's pair is lent once at a time, so its cell is always empty; if
+                    // not, return the loan here.
+                    Some(boxed) => loan = boxed.loan,
                 }
-                // Shutdown joins every preparation lease before detaching the
-                // session, so this cannot happen while `lease` is held.
-                None => Err(ENODEV),
+                self.shared.state.lock()
+            }
+            None => self.shared.state.lock(),
+        };
+        let returned = match (*state).as_deref_mut() {
+            Some(firmware) => {
+                let returned = firmware.return_render(slot, &mut loan, activation, packet);
+                let grow_ready = firmware.render_grow_ready();
+                drop(state);
+                if grow_ready {
+                    self.shared.queue_grow();
+                }
+                returned
+            }
+            // Shutdown joins every preparation lease before detaching the
+            // session, so this cannot happen while `lease` is held.
+            None => {
+                drop(state);
+                Err(ENODEV)
             }
         };
         self.shared.note_changed();

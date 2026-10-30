@@ -17,6 +17,7 @@ mod settle;
 mod submit;
 pub(super) mod teardown;
 
+pub(in crate::g17) use direct::DirectReturns;
 pub(super) use submit::FALLBACK;
 use super::{DeferredBatch, Registry};
 use crate::g17::{context::Context, fw::queue::DataMaster, job::Packet, kick, queue::render::Pair};
