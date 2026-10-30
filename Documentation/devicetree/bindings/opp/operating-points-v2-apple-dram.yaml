@@ -56,8 +56,10 @@ patternProperties:
       - opp-level
 
     dependencies:
-      apple,data-rate: [opp-hz]
-      opp-hz: [apple,data-rate]
+      apple,data-rate:
+        - opp-hz
+      opp-hz:
+        - apple,data-rate
 
 required:
   - compatible

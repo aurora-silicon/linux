@@ -68,15 +68,21 @@ properties:
     description: Published, potentially rounded, maximum bandwidth class.
 
 dependencies:
-  operating-points-v2: [apple,dram-type]
-  apple,data-bus-width: [apple,dram-type]
-  apple,dcs-state-count: [apple,dram-type]
-  apple,peak-bandwidth-bytes-per-second: [apple,dram-type]
-  apple,bandwidth-class-bytes-per-second: [apple,dram-type]
+  operating-points-v2:
+    - apple,dram-type
+  apple,data-bus-width:
+    - apple,dram-type
+  apple,dcs-state-count:
+    - apple,dram-type
+  apple,peak-bandwidth-bytes-per-second:
+    - apple,dram-type
+  apple,bandwidth-class-bytes-per-second:
+    - apple,dram-type
 
 allOf:
   - if:
-      required: [apple,dram-type]
+      required:
+        - apple,dram-type
     then:
       required:
         - operating-points-v2
