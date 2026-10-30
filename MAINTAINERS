@@ -8188,6 +8188,7 @@ F:	Documentation/accel/apple-ane.rst
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	drivers/accel/ane/
 F:	include/uapi/drm/ane_accel.h
+F:	tools/testing/selftests/drivers/ane/
 
 DRM ACCEL DRIVERS FOR INTEL VPU
 M:	Karol Wachowski <karol.wachowski@linux.intel.com>

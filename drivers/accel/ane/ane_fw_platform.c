@@ -157,11 +157,11 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	/* The 27.x CONFIG_GET capability reply and preload runtime-patch
-	 * allow-list have not been specified. The H14 check (+8 != 0) does
-	 * not establish the address width, target or resource limits. Do not
-	 * start firmware or expose PROG_LOAD using that weaker predicate.
+	/* SPEC-r2 defines CONFIG_GET and dynamic channels. Opening this gate
+	 * additionally needs a pinned immutable-image comparison reference and
+	 * the exact custom HWX descriptor/aperture layouts. Neither may be
+	 * replaced by a broad preload-diff rule or a section-only LOAD ioctl.
 	 */
-	dev_info(dev, "H16 ANE: 27.x CONFIG_GET contract unavailable; refusing before power access\n");
+	dev_info(dev, "H16 ANE: pinned preload reference and HWX layout unavailable; refusing before power access\n");
 	return -EOPNOTSUPP;
 }

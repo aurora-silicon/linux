@@ -2,7 +2,8 @@
 
 obj-$(CONFIG_DRM_ACCEL_ANE) += ane.o ane_t6021.o
 obj-$(CONFIG_DRM_ACCEL_ANE_KUNIT_TEST) += ane_drv_test.o
-obj-$(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST) += ane_fw_platform_test.o
+obj-$(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST) += ane_fw_platform_test.o \
+	ane_fw_protocol_test.o ane_h16_tasks_test.o
 
 ane-y := \
 	ane_drv.o \

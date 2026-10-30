@@ -34,8 +34,9 @@ H16 preflight checks resource geometry, firmware identity and these ranges
 without MMIO or power access. No disk firmware is requested. Missing
 reservations fail with ``-ENODATA``. Malformed reservations fail with
 ``-EINVAL``. Even a valid handoff currently fails with ``-EOPNOTSUPP``:
-the 27.x CONFIG_GET capability reply and runtime-patch allow-list are not
-defined sufficiently to implement the required validation gate. No accel
+the pinned immutable-image comparison reference and the byte layouts of the
+custom HWX descriptors/aperture records are not supplied. The section-only
+load ABI is explicitly refused for H16. No accel
 node or program-loading interface is published.
 
 The H16 DT nodes stay disabled. The five real PMGR providers already encode
@@ -44,20 +45,48 @@ represent the virtual no-state gates, so no fictitious register-backed
 domains are created for them. SID 0 and SID 11 on all three DARTs use the
 shared DMA domain; no untested stream remapping is added.
 
+Implemented SPEC-r2 components
+------------------------------
+
+The shared transport has an eight-descriptor dynamic channel parser with
+unique names, bounded counts, owned-surface bounds and overlap checks. The
+runtime uses copied descriptor geometry, verifies the descriptor snapshot,
+and checks the complete IO reply envelope. Zero acknowledgment is success;
+a nonzero acknowledgment is a firmware refusal, never a retry or success.
+Malformed replies, guard changes and timeouts quarantine the instance. A
+quarantined queue cannot allocate another BO, and no reset is attempted.
+
+The version-12 RTKit management state machine validates HELLO, endpoint maps,
+system endpoint start, IOP/AP power acknowledgments and application endpoint
+start ordering. It does not invent responses for unknown message types or
+unimplemented system endpoint buffer requests. Its caller must provide one
+absolute session deadline and a bounded 64-bit mailbox transport.
+
+H16 validation helpers walk nine fixed task-header words, the documented
+conditional extra word, dense/scatter records and the nine allowed register
+blocks. A separate helper checks the eight-byte Mach-O relocation entries,
+unique aligned offsets, the actual kernel-section ordinal and addend bounds.
+These helpers do not substitute for complete container/tensor/program and
+16-byte task-aperture metadata validation.
+
+The device-free selftest in ``tools/testing/selftests/drivers/ane`` generates
+the SPEC-r2 fp16 add-128 inputs and CPU oracle and verifies all three pinned
+buffer hashes. It can also check a supplied HWX against the pinned size/hash.
+It never opens an accel device or claims a Linux inference result.
+
 Remaining implementation gates
 ------------------------------
 
-A later change needs a sanitized, versioned 27.x CONFIG_GET reply contract
-covering address width, configuration size, resource limits and supported
-targets. It also needs the live channel-table schema (including slot-size
-semantics), a decoded allow-list of iBoot runtime patches before programming
-an unlatched RVBAR, and a complete HWX target/section/relocation validation
-contract. The current section-only ABI does not carry the original HWX
-container identity. A caller assertion of subtype is insufficient.
+SPEC-r2 defines the 27.x channel and CONFIG_GET contract, including the exact
+24 MHz reply requirement. It does not give the byte offsets and widths of
+the custom kind-3 tensor/kind-4 program descriptors or 16-byte task-aperture
+records, nor an available pristine-image comparison reference/manifest.
+The 43 patchbay record widths/order and original immutable bytes must be
+proved against the SHA-pinned payload, not inferred from mutable live bytes.
+A SHA-256 digest alone cannot reconstruct that reference.
 
-Only after these contracts are implemented and validated may H16 expose
-PROG_LOAD, PROC_CREATE and EXEC. Completion must be the matching finished
-event, and any uncertain DMA state must remain quarantined until reboot
-unless a reset has been proved. H17 additionally requires an ownership
-backend before any direct-engine access. There are no module parameters to
-bypass these gates.
+Until those exact layouts and the validated comparison reference are
+available, H16 remains refused before power access.
+No physical RTKit boot or complete HWX load path is enabled. H17 additionally
+requires a Linux ownership backend before any direct-engine access. There
+are no module parameters to bypass these gates.
