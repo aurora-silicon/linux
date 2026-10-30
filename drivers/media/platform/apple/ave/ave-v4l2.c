@@ -33,6 +33,8 @@
 #define AVE_STRIDE_ALIGN	64
 #define AVE_DEFAULT_W		1920
 #define AVE_DEFAULT_H		1080
+#define AVE_MAX_OUTPUT_BUFS	16
+#define AVE_MAX_CAPTURE_BUFS	8
 
 static const u32 ave_coded_fmts[] = {
 	V4L2_PIX_FMT_H264,
@@ -518,11 +520,17 @@ static int ave_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned i
 	struct ave_ctx *ctx = vb2_get_drv_priv(vq);
 	const struct v4l2_pix_format_mplane *f =
 		V4L2_TYPE_IS_OUTPUT(vq->type) ? &ctx->src_fmt : &ctx->dst_fmt;
+	unsigned int have = vb2_get_num_buffers(vq);
+	unsigned int max = V4L2_TYPE_IS_OUTPUT(vq->type) ? AVE_MAX_OUTPUT_BUFS :
+							    AVE_MAX_CAPTURE_BUFS;
 
 	/* Frames stay with the firmware until encoded; keep one spare. */
-	if (V4L2_TYPE_IS_OUTPUT(vq->type) &&
-	    vb2_get_num_buffers(vq) + *nbufs < AVE_MAX_SLOTS + 1)
-		*nbufs = AVE_MAX_SLOTS + 1 - vb2_get_num_buffers(vq);
+	if (V4L2_TYPE_IS_OUTPUT(vq->type) && have + *nbufs < AVE_MAX_SLOTS + 1)
+		*nbufs = AVE_MAX_SLOTS + 1 - have;
+	/* A full set of both queues must fit the encoder's 256 MiB DART window. */
+	if (have >= max)
+		return -ENOMEM;
+	*nbufs = min(*nbufs, max - have);
 	if (*nplanes)
 		return (*nplanes != 1 || sizes[0] < f->plane_fmt[0].sizeimage) ? -EINVAL : 0;
 	*nplanes = 1;
@@ -733,8 +741,6 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src->lock = &ctx->ave->vdev_lock;
 	src->dev = ctx->ave->dev;
-	/* A full set of both queues must fit the encoder's 256 MiB DART window. */
-	src->max_num_buffers = 16;
 	ret = vb2_queue_init(src);
 	if (ret)
 		return ret;
@@ -748,7 +754,6 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	dst->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	dst->lock = &ctx->ave->vdev_lock;
 	dst->dev = ctx->ave->dev;
-	dst->max_num_buffers = 8;
 	return vb2_queue_init(dst);
 }
 
