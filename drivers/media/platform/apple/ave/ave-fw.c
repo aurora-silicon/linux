@@ -262,7 +262,7 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 		return 0;
 
 	if (readl(ave->coproc + AVE_COPROC_CTRL)) {
-		dev_warn(ave->dev, "coprocessor kept power after its halt; retry once it suspends\n");
+		dev_dbg(ave->dev, "coprocessor kept power after its halt; retry once it suspends\n");
 		return -EAGAIN;
 	}
 	status = readl(ave->mbox + AVE_MBOX_STATUS);

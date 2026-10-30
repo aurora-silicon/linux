@@ -193,17 +193,12 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
  * mapping is only rounded up to whole pages.
  */
 
-/*
- * Working buffers keep a kernel mapping so that, when a session ends, the
- * driver can see how far past each reported size the firmware wrote (into
- * the page rounding, or the room the two groups above get).
- */
-
 /* One buffer to allocate: what the firmware is told and what is mapped. */
 struct ave_buf_req {
 	struct ave_buf *b;
 	size_t size;
 	size_t alloc;
+	unsigned long attrs;
 };
 
 #define AVE_MAX_BUF_REQS	(1 + 4 * AVE_MAX_REFS + 4 + 2 * AVE_TILE_BUFS + 2 + \
@@ -217,9 +212,11 @@ static int ave_buf_req_cmp(const void *a, const void *b)
 }
 
 static void ave_req(struct ave_buf_req *r, unsigned int *n, struct ave_buf *b, size_t size,
-		    size_t alloc)
+		    size_t alloc, unsigned long attrs)
 {
-	r[*n] = (struct ave_buf_req){ .b = b, .size = size, .alloc = max(size, alloc) };
+	r[*n] = (struct ave_buf_req){
+		.b = b, .size = size, .alloc = max(size, alloc), .attrs = attrs,
+	};
 	(*n)++;
 }
 
@@ -236,6 +233,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
 	u32 h32 = DIV_ROUND_UP(h, 32), w64 = DIV_ROUND_UP(w, 64), h64 = DIV_ROUND_UP(h, 64);
+	const unsigned long nomap = DMA_ATTR_NO_KERNEL_MAPPING;
 	size_t ref_a, ref_b, ref_c, ref_d, tile, mapped = 0;
 	struct ave_buf_req *r;
 	unsigned int n = 0;
@@ -251,38 +249,39 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
 
-	ave_req(r, &n, &sess->hdr, AVE_HDR_BYTES, 0);
+	ave_req(r, &n, &sess->hdr, AVE_HDR_BYTES, 0, nomap);
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2);
-		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4);
-		ave_req(r, &n, &sess->ref_c[i], ref_c, 0);
-		ave_req(r, &n, &sess->ref_d[i], ref_d, 0);
+		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2, nomap);
+		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
+		ave_req(r, &n, &sess->ref_c[i], ref_c, 0, nomap);
+		ave_req(r, &n, &sess->ref_d[i], ref_d, 0, nomap);
 	}
-	ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0);
-	ave_req(r, &n, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), 0);
-	ave_req(r, &n, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0);
-	ave_req(r, &n, &sess->fixed, SZ_16K, 0);
+	ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
+	ave_req(r, &n, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), 0, nomap);
+	ave_req(r, &n, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0, nomap);
+	ave_req(r, &n, &sess->fixed, SZ_16K, 0, nomap);
 	for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
-		ave_req(r, &n, &sess->tile[i], tile, 0);
-		ave_req(r, &n, &sess->tile_aux[i], ALIGN(h, 128), 0);
+		ave_req(r, &n, &sess->tile[i], tile, 0, nomap);
+		ave_req(r, &n, &sess->tile_aux[i], ALIGN(h, 128), 0, nomap);
 	}
 	if (hevc)
 		for (unsigned int i = 0; i < 2; i++)
-			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0);
+			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0, nomap);
 	for (unsigned int s = 0; s < p->slots; s++) {
-		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0);
-		ave_req(r, &n, &sess->slot[s].meta, AVE_META_BYTES, 0);
+		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0, 0);
+		ave_req(r, &n, &sess->slot[s].meta, AVE_META_BYTES, 0, 0);
 		/*
 		 * HEVC: slice headers. H.264: the per-frame buffer of Process
 		 * +0x58c8, which the firmware never wrote in any bit-rate
 		 * mode on hardware; one page.
 		 */
-		ave_req(r, &n, &sess->slot[s].aux, hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0);
+		ave_req(r, &n, &sess->slot[s].aux, hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0,
+			hevc ? 0 : nomap);
 	}
 
 	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
 	for (unsigned int i = 0; i < n && !ret; i++) {
-		ret = ave_alloc_padded(ave, r[i].b, r[i].size, r[i].alloc, 0);
+		ret = ave_alloc_padded(ave, r[i].b, r[i].size, r[i].alloc, r[i].attrs);
 		mapped += r[i].b->alloc;
 	}
 	kfree(r);
@@ -327,8 +326,8 @@ static void ave_note_copy(struct ave_ctx *ctx, u32 stride, const char *how)
 	if (ctx->sess->copy_noted)
 		return;
 	ctx->sess->copy_noted = true;
-	dev_info(ctx->ave->dev, "input has a %u byte stride; moving lines to %u %s\n", stride,
-		 ctx->sess->p.stride, how);
+	dev_dbg(ctx->ave->dev, "input has a %u byte stride; moving lines to %u %s\n", stride,
+		ctx->sess->p.stride, how);
 }
 
 /*
@@ -433,71 +432,6 @@ static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 	}
 }
 
-/*
- * How far did the firmware write past the size it was given? The margin
- * behind each buffer was zero when allocated. A write reaching the end of
- * the mapping may have gone on into the next buffer.
- */
-static void ave_check_tail(struct ave_dev *ave, const char *name, int i,
-			   const struct ave_buf *b)
-{
-	const u8 *p = b->cpu;
-	size_t end;
-
-	if (!p || b->attrs & DMA_ATTR_NO_KERNEL_MAPPING || b->alloc <= b->size)
-		return;
-	for (end = b->alloc; end > b->size && !p[end - 1]; end--)
-		;
-	if (end == b->size)
-		return;
-	if (end == b->alloc)
-		dev_warn(ave->dev, "buf %s%d: firmware wrote to the end of its mapping (+%#zx, size %#zx)\n",
-			 name, i, b->alloc, b->size);
-	else
-		dev_info(ave->dev, "buf %s%d: firmware wrote %#zx bytes past its size %#zx\n",
-			 name, i, end - b->size, b->size);
-}
-
-static void ave_sess_check_tails(struct ave_dev *ave, struct ave_session *sess)
-{
-	ave_check_tail(ave, "hdr", 0, &sess->hdr);
-	ave_check_tail(ave, "mb", 0, &sess->mb);
-	ave_check_tail(ave, "row_a", 0, &sess->row_a);
-	ave_check_tail(ave, "row_b", 0, &sess->row_b);
-	ave_check_tail(ave, "fixed", 0, &sess->fixed);
-	for (int i = 0; i < 2; i++)
-		ave_check_tail(ave, "hevc_extra", i, &sess->hevc_extra[i]);
-	for (int i = 0; i < AVE_MAX_REFS; i++) {
-		ave_check_tail(ave, "ref_a", i, &sess->ref_a[i]);
-		ave_check_tail(ave, "ref_b", i, &sess->ref_b[i]);
-		ave_check_tail(ave, "ref_c", i, &sess->ref_c[i]);
-		ave_check_tail(ave, "ref_d", i, &sess->ref_d[i]);
-	}
-	for (int i = 0; i < AVE_TILE_BUFS; i++) {
-		ave_check_tail(ave, "tile", i, &sess->tile[i]);
-		ave_check_tail(ave, "tile_aux", i, &sess->tile_aux[i]);
-	}
-	for (int i = 0; i < AVE_MAX_SLOTS; i++) {
-		ave_check_tail(ave, "coded", i, &sess->slot[i].coded);
-		ave_check_tail(ave, "meta", i, &sess->slot[i].meta);
-		ave_check_tail(ave, "aux", i, &sess->slot[i].aux);
-	}
-
-	/*
-	 * The size of the H.264 per-frame buffer is not known; it is
-	 * allocated generously. Report how much of it the firmware used.
-	 */
-	if (sess->p.codec == AVE_CODEC_H264 && sess->slot[0].aux.cpu) {
-		const struct ave_buf *b = &sess->slot[0].aux;
-		const u64 *w = b->cpu;
-		size_t n = b->size / 8;
-
-		while (n && !w[n - 1])
-			n--;
-		dev_dbg(ave->dev, "per-frame buffer: %#zx of %#zx bytes used\n", n * 8, b->size);
-	}
-}
-
 /* Work out the parameters and allocate the buffers; no firmware access. */
 struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 {
@@ -539,13 +473,10 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 
 	if (!sess)
 		return;
-	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN) {
+	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN)
 		dev_warn(ctx->ave->dev, "keeping the buffers of a failed session\n");
-	} else {
-		if (sess->handed)
-			ave_sess_check_tails(ctx->ave, sess);
+	else
 		ave_sess_free_bufs(ctx->ave, sess);
-	}
 	kfree(sess);
 	ctx->sess = NULL;
 }
