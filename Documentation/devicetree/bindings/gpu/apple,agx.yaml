@@ -40,6 +40,8 @@ properties:
   power-domains:
     maxItems: 1
 
+  dma-noncoherent: true
+
   mboxes:
     minItems: 1
     maxItems: 2

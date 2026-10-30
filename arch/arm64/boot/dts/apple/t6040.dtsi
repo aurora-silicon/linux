@@ -522,7 +522,6 @@
 	display: display-subsystem {
 		compatible = "apple,display-subsystem";
 		iommus = <&disp0_dart 0>;
-		dma-noncoherent;
 		status = "disabled";
 	};
 
