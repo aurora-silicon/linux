@@ -10,14 +10,16 @@ maintainers:
   - Miguel Cruz <7362641+Acelogic@users.noreply.github.com>
 
 description: |
-  The T6041 and T8140 AVE coprocessors encode video using firmware preloaded by the
-  bootloader. Its two DART instances translate the same stream. The
+  The T6000, T6041, T8112 and T8140 AVE coprocessors encode video using firmware
+  preloaded by the bootloader. Its two DART instances translate the same stream. The
   bootloader supplies two reserved firmware regions and their IOVA mappings.
 
 properties:
   compatible:
     enum:
+      - apple,t6000-ave
       - apple,t6041-ave
+      - apple,t8112-ave
       - apple,t8140-ave
 
   reg:
