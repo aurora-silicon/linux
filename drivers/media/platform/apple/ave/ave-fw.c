@@ -284,11 +284,11 @@ static bool ave_fw_idle(struct ave_dev *ave)
 }
 
 /*
- * After a Halt the firmware no longer runs, but the coprocessor is still
- * set going if its power stayed on. A restart uses the normal boot path
- * (macOS restarts the firmware for every session the same way): clear the
- * run bit, as the boot sequence does first anyway, and the mailbox words
- * left from the previous run, so the reset-state checks hold again. The
+ * After a Halt the firmware is restarted from a power cycle, as macOS does
+ * for every session: the encoder must have been runtime suspended in
+ * between, which puts the coprocessor back in reset. Hardware runs showed
+ * that a restart while it kept power gets no answer, so that is refused
+ * (-EAGAIN) and the state stays halted until the power really went. The
  * code base register must still be set: the driver never writes it.
  */
 static int ave_fw_prepare_restart(struct ave_dev *ave)
@@ -304,8 +304,8 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 		return 0;
 
 	if (readl(ave->coproc + AVE_COPROC_CTRL)) {
-		writel(0, ave->coproc + AVE_COPROC_CTRL);
-		usleep_range(1000, 2000);
+		dev_warn(ave->dev, "coprocessor kept power after its halt; retry once it suspends\n");
+		return -EAGAIN;
 	}
 	status = readl(ave->mbox + AVE_MBOX_STATUS);
 	if (status)
@@ -416,6 +416,7 @@ static int ave_fw_boot(struct ave_dev *ave)
 /* Caller holds hw_lock. */
 int ave_fw_ensure_running(struct ave_dev *ave)
 {
+	enum ave_fw_state prev;
 	int ret;
 
 	lockdep_assert_held(&ave->hw_lock);
@@ -429,9 +430,18 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 		break;
 	}
 
+	/*
+	 * A failed boot has no session buffers in the firmware's hands. If the
+	 * coprocessor was set going, treat it as halted: the next attempt
+	 * then waits for a power cycle. Otherwise nothing changed.
+	 */
+	prev = ave->fw_state;
 	ret = ave_fw_boot(ave);
-	if (ret)
-		ave->fw_state = AVE_FW_BROKEN;
+	if (ret) {
+		ave->fw_state = readl(ave->coproc + AVE_COPROC_CTRL) ? AVE_FW_HALTED : prev;
+		memset(ave->ring, 0, sizeof(ave->ring));
+		ave->ipc_fw_base = 0;
+	}
 	return ret;
 }
 

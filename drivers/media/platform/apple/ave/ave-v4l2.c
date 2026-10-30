@@ -617,6 +617,9 @@ static int ave_session_begin(struct ave_ctx *ctx)
 
 	if (ctx->sess)
 		return 0;
+	/* A halted firmware restarts only from reset: let the power go first. */
+	if (READ_ONCE(ave->fw_state) == AVE_FW_HALTED)
+		pm_runtime_suspend(ave->dev);
 	ret = ave_fw_templates(ave, ave_ctx_codec(ctx));
 	if (ret)
 		return ret;
@@ -992,6 +995,13 @@ static void ave_poll_work(struct work_struct *work)
 	mutex_lock(&ave->hw_lock);
 	if (ctx->sess && ave->active == ctx && !ctx->sess->dead) {
 		fail = ave_ipc_pump(ave, 0, NULL, NULL) != 0;
+		if (!fail && ave_sess_starved(ctx->sess) &&
+		    !v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx)) {
+			dev_dbg(ave->dev, "no input, flushing %u held frames\n", ctx->sess->busy);
+			ctx->sess->nudged = true;
+			ctx->sess->progress = jiffies;
+			fail = ave_cmd_complete(ctx, 1) != 0;
+		}
 		if (!fail && ave_sess_stalled(ctx->sess)) {
 			/*
 			 * The firmware holds frames it should have answered.

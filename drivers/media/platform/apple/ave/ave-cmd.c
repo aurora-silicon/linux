@@ -473,7 +473,10 @@ int ave_cmd_start(struct ave_ctx *ctx)
 	ave_sess_check_addrs(ctx, cmd, tmpl->size, AVE_TMPL_START, 0);
 
 	ret = ave_ipc_submit(ave, AVE_BUF_CMD, tmpl->size, AVE_CMD_SESSION_TIMEOUT_US, true);
-	return ret ?: ave_ipc_settle(ave, AVE_START_WAIT_MS);
+	if (ret)
+		return ret;
+	sess->handed = true;
+	return ave_ipc_settle(ave, AVE_START_WAIT_MS);
 }
 
 /* Process (id 8) */
@@ -619,6 +622,8 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	s->busy = true;
 	s->status = 0;
 	sess->progress = jiffies;
+	sess->last_sent = jiffies;
+	sess->nudged = false;
 	sess->busy++;
 	sess->frames++;
 	return 0;

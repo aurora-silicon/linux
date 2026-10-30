@@ -205,7 +205,10 @@ struct ave_session {
 	bool dead;			/* firmware gone; buffers only */
 	bool warned;
 	bool checked[2];		/* Start/Process images checked for stale addresses */
+	bool handed;			/* Start sent: the firmware knows the buffers */
+	bool nudged;			/* Complete sent because input stopped */
 	unsigned long progress;		/* jiffies of the last frame sent or answered */
+	unsigned long last_sent;	/* jiffies of the last frame sent */
 };
 
 struct ave_ctx {
@@ -292,6 +295,7 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);
 void ave_sess_check_addrs(struct ave_ctx *ctx, const u8 *cmd, size_t len, unsigned int kind,
 			  dma_addr_t input);
 bool ave_sess_stalled(struct ave_session *sess);
+bool ave_sess_starved(struct ave_session *sess);
 
 /* ave-v4l2.c */
 int ave_v4l2_register(struct ave_dev *ave);

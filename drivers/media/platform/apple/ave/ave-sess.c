@@ -335,9 +335,10 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 }
 
 /*
- * Free the buffers. A firmware that stopped answering may still write to
- * them, and a freed DART range is soon handed out again, so in that case
- * they stay allocated (until reboot, like the firmware itself).
+ * Free the buffers. A firmware that stopped answering in the middle of a
+ * session may still write to them, and a freed DART range is soon handed
+ * out again, so those stay allocated (until reboot, like the firmware
+ * itself). Buffers the firmware never saw (no Start sent) always go.
  */
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
@@ -345,7 +346,7 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 
 	if (!sess)
 		return;
-	if (ctx->ave->fw_state == AVE_FW_BROKEN)
+	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN)
 		dev_warn(ctx->ave->dev, "keeping the buffers of a failed session\n");
 	else
 		ave_sess_free_bufs(ctx->ave, sess);
@@ -643,6 +644,21 @@ bool ave_sess_stalled(struct ave_session *sess)
 {
 	unsigned int need = sess->p.bframes ? 4 : 1;
 
-	return sess->busy >= need &&
+	return sess->busy && (sess->busy >= need || sess->nudged) &&
 	       time_after(jiffies, sess->progress + msecs_to_jiffies(AVE_FRAME_WAIT_MS));
+}
+
+/*
+ * With B-frames the firmware keeps frames until later ones arrive. A client
+ * that waits for each coded frame before sending the next (ffmpeg's
+ * v4l2m2m encoder does) would wait forever. When frames are held and no
+ * input came for a while, a Complete makes the firmware code what it holds,
+ * as macOS does after the first frame.
+ */
+#define AVE_STARVE_MS		50
+
+bool ave_sess_starved(struct ave_session *sess)
+{
+	return sess->busy && !sess->nudged && sess->handed &&
+	       time_after(jiffies, sess->last_sent + msecs_to_jiffies(AVE_STARVE_MS));
 }
