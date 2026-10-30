@@ -28,6 +28,9 @@
 //!   bounded by elapsed time. Saturates at u64::MAX.
 //! - `jobs`: completed submissions since boot, counted at submission
 //!   completion (`JobFence::command_complete`).
+//! - `sampled_ns`: cumulative duration of the same windows. Windows can be
+//!   seconds long, so only `busy_ns / sampled_ns` over one interval is a
+//!   percentage; `busy_ns` over wall time is not.
 //!
 //! This module is read-only with respect to scheduling or power behaviour:
 //! the firmware already sends the messages, the channel already polls them,
@@ -58,6 +61,8 @@ pub(crate) struct StatsSnapshot {
     /// `JobFence::command_complete` when the last command of a submission
     /// completes.
     pub(crate) jobs: AtomicU64,
+    /// Cumulative duration of the windows behind `busy_ns`.
+    pub(crate) sampled_ns: AtomicU64,
 }
 
 // Keep the Rust half of the C sysfs layout contract checked as well.
@@ -65,7 +70,8 @@ const _: () = {
     assert!(core::mem::offset_of!(StatsSnapshot, pstate) == 16);
     assert!(core::mem::offset_of!(StatsSnapshot, busy_ns) == 40);
     assert!(core::mem::offset_of!(StatsSnapshot, jobs) == 48);
-    assert!(core::mem::size_of::<StatsSnapshot>() == 56);
+    assert!(core::mem::offset_of!(StatsSnapshot, sampled_ns) == 56);
+    assert!(core::mem::size_of::<StatsSnapshot>() == 64);
 };
 
 impl StatsSnapshot {
@@ -105,11 +111,15 @@ impl StatsSnapshot {
             let delta = timestamp - *last_ts;
             let whole_s = delta / ts_hz;
             let rem = delta % ts_hz;
-            let busy = whole_s
-                .saturating_mul(busiest)
-                .saturating_mul(10_000_000)
-                .saturating_add(rem * busiest * 1_000_000_000 / (100 * ts_hz));
-            self.busy_ns.fetch_add(busy, Ordering::Relaxed);
+            let scaled = |percent: u64| {
+                whole_s
+                    .saturating_mul(percent)
+                    .saturating_mul(10_000_000)
+                    .saturating_add(rem * percent * 1_000_000_000 / (100 * ts_hz))
+            };
+            // In this order a reader between the two never sees busy time ahead of sampled time.
+            self.sampled_ns.fetch_add(scaled(100), Ordering::Relaxed);
+            self.busy_ns.fetch_add(scaled(busiest), Ordering::Relaxed);
         }
         *last_ts = timestamp;
     }
@@ -125,12 +135,17 @@ mod tests {
         stats.busy_ns.load(Ordering::Relaxed)
     }
 
+    fn sampled(stats: &StatsSnapshot) -> u64 {
+        stats.sampled_ns.load(Ordering::Relaxed)
+    }
+
     #[test]
     fn first_record_only_opens_the_window() {
         let stats = StatsSnapshot::default();
         let mut last = 0;
         stats.note_utilization(&mut last, 5 * HZ, [100; 4], HZ);
         assert_eq!(busy(&stats), 0);
+        assert_eq!(sampled(&stats), 0);
         assert_eq!(last, 5 * HZ);
         assert_eq!(stats.util4.load(Ordering::Relaxed), 100);
     }
@@ -142,8 +157,10 @@ mod tests {
         // 1.5 s at 40%, then 250 ms at 100%.
         stats.note_utilization(&mut last, HZ + HZ * 3 / 2, [10, 40, 0, 40], HZ);
         assert_eq!(busy(&stats), 600_000_000);
+        assert_eq!(sampled(&stats), 1_500_000_000);
         stats.note_utilization(&mut last, HZ + HZ * 7 / 4, [100, 0, 0, 0], HZ);
         assert_eq!(busy(&stats), 850_000_000);
+        assert_eq!(sampled(&stats), 1_750_000_000);
     }
 
     #[test]
@@ -160,6 +177,7 @@ mod tests {
         let mut last = 3 * HZ;
         stats.note_utilization(&mut last, 2 * HZ, [100; 4], HZ);
         assert_eq!(busy(&stats), 0);
+        assert_eq!(sampled(&stats), 0);
         assert_eq!(last, 2 * HZ);
     }
 }

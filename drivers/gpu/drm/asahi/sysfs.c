@@ -30,6 +30,7 @@ struct asahi_stats_snapshot {
 	u32 temperature_tmax;
 	u64 busy_ns;
 	u64 jobs;
+	u64 sampled_ns;
 };
 
 /* Mirror of the repr(C) Rust `memacct::Ledger`, in bytes. */
@@ -80,6 +81,8 @@ static ssize_t agx_stats_show(struct device *dev,
 		       (u32)READ_ONCE(snap->temperature_raw));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "temperature_scale %u\n",
 		       (u32)READ_ONCE(snap->temperature_scale));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "sampled_ns %llu\n",
+		       (unsigned long long)READ_ONCE(snap->sampled_ns));
 
 	return n;
 }
@@ -133,7 +136,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, pstate) != 16);
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 40);
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, jobs) != 48);
-	BUILD_BUG_ON(sizeof(struct asahi_stats_snapshot) != 56);
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, sampled_ns) != 56);
+	BUILD_BUG_ON(sizeof(struct asahi_stats_snapshot) != 64);
 
 	stats = kzalloc_obj(*stats);
 	if (!stats)

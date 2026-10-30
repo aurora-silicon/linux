@@ -36,6 +36,16 @@ Description:
 		           (fw 13.5); the same idle-vs-matmul check must be run
 		           there before the magnitude claim is repeated.
 
+		sampled_ns cumulative u64; total duration of the windows behind
+		           busy_ns, on the same clock. Windows end when the
+		           firmware sends a record, so a percentage over an
+		           interval is the change in busy_ns over the change in
+		           sampled_ns, not over wall time. Neither changes while
+		           no record arrives, which can last seconds on a nearly
+		           idle GPU and indefinitely on an idle one: readers keep
+		           the last percentage until sampled_ns moves, or report
+		           idle once it has stood still for several seconds.
+
 		jobs       u64; cumulative completed submissions since boot.
 		           Counted on the host at submission completion (when
 		           the last command of a submission completes and its
