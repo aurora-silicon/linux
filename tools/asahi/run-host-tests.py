@@ -117,6 +117,7 @@ ASAHI_TESTS = {
     'mt7932-connect-result-tests.py': [(out('--output'), PASS)],
     'mt7932-owe-retry-tests.py': [(out(), PASS)],
     'mt7932-policy-6ghz-tests.py': [([], PASS)],
+    'mt7932-policy-classes-tests.py': [([], PASS)],
     'neo-auxiliary-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutation'], KILL),
                                (out('--output') + ['--old'], KILL)],
     'neo-stability-tests.py': [(out('--output'), PASS)]
