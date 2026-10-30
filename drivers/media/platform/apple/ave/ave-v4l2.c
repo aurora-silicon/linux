@@ -40,8 +40,8 @@
  * window next to a session: each queue may use this much, counting every
  * buffer at the power-of-two size the DMA layer maps it with.
  */
-#define AVE_OUTPUT_BUDGET	SZ_64M
-#define AVE_CAPTURE_BUDGET	SZ_32M
+#define AVE_OUTPUT_BUDGET	(48 * SZ_1M)
+#define AVE_CAPTURE_BUDGET	(24 * SZ_1M)
 #define AVE_MAX_QUEUE_BUFS	16
 #define AVE_RESTART_TRIES	10
 #define AVE_RESTART_WAIT_MS	100

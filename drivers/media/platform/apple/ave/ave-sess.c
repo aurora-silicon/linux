@@ -15,6 +15,7 @@
 #include <linux/log2.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/unaligned.h>
 
 #include <media/v4l2-ctrls.h>
@@ -48,9 +49,8 @@
 #define AVE_CODED_MIN			0x3c000
 #define AVE_HDR_BYTES			0x12c000
 
-/* Spacing of the H.264 per-frame buffer seen at 1080p; scaled with area. */
-#define AVE_H264_FRAME_BUF_1080P	0x364000
-#define AVE_MBS_1080P			(120 * 68)
+/* H.264 per-frame buffer (Process +0x58c8): unused in bit-rate modes */
+#define AVE_H264_FRAME_BUF		SZ_16K
 
 /* Level limits: max frame size, max rate, max bit rate (kbit/s, Main). */
 struct ave_level {
@@ -198,12 +198,37 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
  * driver can see how far past each reported size the firmware wrote (into
  * the page rounding, or the room the two groups above get).
  */
-static int ave_work_buf(struct ave_dev *ave, struct ave_buf *b, size_t size)
+
+/* One buffer to allocate: what the firmware is told and what is mapped. */
+struct ave_buf_req {
+	struct ave_buf *b;
+	size_t size;
+	size_t alloc;
+};
+
+#define AVE_MAX_BUF_REQS	(1 + 4 * AVE_MAX_REFS + 4 + 2 * AVE_TILE_BUFS + 2 + \
+				 3 * AVE_MAX_SLOTS)
+
+static int ave_buf_req_cmp(const void *a, const void *b)
 {
-	return ave_alloc(ave, b, size, 0);
+	const struct ave_buf_req *x = a, *y = b;
+
+	return x->alloc < y->alloc ? 1 : x->alloc > y->alloc ? -1 : 0;
 }
 
-/* Working buffer sizes, all from the requested picture size. */
+static void ave_req(struct ave_buf_req *r, unsigned int *n, struct ave_buf *b, size_t size,
+		    size_t alloc)
+{
+	r[*n] = (struct ave_buf_req){ .b = b, .size = size, .alloc = max(size, alloc) };
+	(*n)++;
+}
+
+/*
+ * Working buffer sizes, all from the requested picture size. The DMA layer
+ * aligns each mapping to a power of two in the encoder's 256 MiB window, so
+ * the buffers are mapped largest first: the smaller ones then fill the
+ * alignment gaps the large ones leave.
+ */
 static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 {
 	const struct ave_params *p = &sess->p;
@@ -211,8 +236,14 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
 	u32 h32 = DIV_ROUND_UP(h, 32), w64 = DIV_ROUND_UP(w, 64), h64 = DIV_ROUND_UP(h, 64);
-	size_t ref_a, ref_b, ref_c, ref_d, tile, frame_buf;
+	size_t ref_a, ref_b, ref_c, ref_d, tile, mapped = 0;
+	struct ave_buf_req *r;
+	unsigned int n = 0;
 	int ret = 0;
+
+	r = kcalloc(AVE_MAX_BUF_REQS, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
 
 	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
 	ref_b = roundup_pow_of_two(w) * roundup_pow_of_two(h) / 32;
@@ -220,38 +251,48 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
 
-	ret |= ave_work_buf(ave, &sess->hdr, AVE_HDR_BYTES);
+	ave_req(r, &n, &sess->hdr, AVE_HDR_BYTES, 0);
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ref_a * 3 / 2, 0);
-		ret |= ave_alloc_padded(ave, &sess->ref_b[i], ref_b, ref_b * 5 / 4, 0);
-		ret |= ave_work_buf(ave, &sess->ref_c[i], ref_c);
-		ret |= ave_work_buf(ave, &sess->ref_d[i], ref_d);
+		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2);
+		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4);
+		ave_req(r, &n, &sess->ref_c[i], ref_c, 0);
+		ave_req(r, &n, &sess->ref_d[i], ref_d, 0);
 	}
-	ret |= ave_work_buf(ave, &sess->mb, ALIGN(82 * p->mbs, SZ_16K));
-	ret |= ave_work_buf(ave, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K));
-	ret |= ave_work_buf(ave, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K));
-	ret |= ave_work_buf(ave, &sess->fixed, SZ_16K);
+	ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0);
+	ave_req(r, &n, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), 0);
+	ave_req(r, &n, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0);
+	ave_req(r, &n, &sess->fixed, SZ_16K, 0);
 	for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
-		ret |= ave_work_buf(ave, &sess->tile[i], tile);
-		ret |= ave_work_buf(ave, &sess->tile_aux[i], ALIGN(h, 128));
+		ave_req(r, &n, &sess->tile[i], tile, 0);
+		ave_req(r, &n, &sess->tile_aux[i], ALIGN(h, 128), 0);
 	}
 	if (hevc)
 		for (unsigned int i = 0; i < 2; i++)
-			ret |= ave_work_buf(ave, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K));
-
-	/* Per-slot output; the size of the H.264 frame buffer is not known. */
-	frame_buf = ALIGN(DIV_ROUND_UP_ULL((u64)AVE_H264_FRAME_BUF_1080P * p->mbs, AVE_MBS_1080P),
-			  SZ_16K);
-	frame_buf = max_t(size_t, frame_buf, AVE_H264_FRAME_BUF_1080P);
+			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0);
 	for (unsigned int s = 0; s < p->slots; s++) {
-		ret |= ave_alloc(ave, &sess->slot[s].coded, p->coded_cap, 0);
-		ret |= ave_alloc(ave, &sess->slot[s].meta, AVE_META_BYTES, 0);
-		if (hevc)
-			ret |= ave_alloc(ave, &sess->slot[s].aux, AVE_SHDR_BYTES, 0);
-		else
-			ret |= ave_work_buf(ave, &sess->slot[s].aux, frame_buf);
+		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0);
+		ave_req(r, &n, &sess->slot[s].meta, AVE_META_BYTES, 0);
+		/*
+		 * HEVC: slice headers. H.264: the per-frame buffer of Process
+		 * +0x58c8, which the firmware never wrote in any bit-rate
+		 * mode on hardware; one page.
+		 */
+		ave_req(r, &n, &sess->slot[s].aux, hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0);
 	}
-	return ret ? -ENOMEM : 0;
+
+	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
+	for (unsigned int i = 0; i < n && !ret; i++) {
+		ret = ave_alloc_padded(ave, r[i].b, r[i].size, r[i].alloc, 0);
+		mapped += r[i].b->alloc;
+	}
+	kfree(r);
+	if (ret) {
+		dev_err(ave->dev, "out of encoder DMA space after %zu MiB of session buffers\n",
+			mapped >> 20);
+		return -ENOMEM;
+	}
+	dev_dbg(ave->dev, "session buffers: %u, %zu KiB mapped\n", n, mapped >> 10);
+	return 0;
 }
 
 static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
@@ -279,6 +320,15 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->slot[s].aux);
 		ave_free(ave, &sess->slot[s].bounce);
 	}
+}
+
+static void ave_note_copy(struct ave_ctx *ctx, u32 stride, const char *how)
+{
+	if (ctx->sess->copy_noted)
+		return;
+	ctx->sess->copy_noted = true;
+	dev_info(ctx->ave->dev, "input has a %u byte stride; moving lines to %u %s\n", stride,
+		 ctx->sess->p.stride, how);
 }
 
 /*
@@ -320,20 +370,31 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 		return -EFAULT;
 	}
 	from += off;
+
+	/*
+	 * Buffers the driver allocated (MMAP) are large enough for the
+	 * encoder's layout: spread the lines out in place, last line first,
+	 * so no extra DMA space is needed. Imported buffers may be shared
+	 * with other users and get a copy instead.
+	 */
+	if (vb->memory == VB2_MEMORY_MMAP &&
+	    vb2_plane_size(vb, 0) >= off + (size_t)p->stride * rows) {
+		to = (u8 *)from;
+		for (u32 y = rows; y-- > 0;)
+			memmove(to + y * p->stride, from + y * stride, width);
+		ave_note_copy(ctx, stride, "in place");
+		return 0;
+	}
+
 	ret = ave_alloc(ctx->ave, b, p->stride * rows, 0);
 	if (ret) {
 		dev_err(ctx->ave->dev, "no room to copy %u byte stride input\n", stride);
 		return ret;
 	}
-	if (!sess->copy_noted) {
-		sess->copy_noted = true;
-		dev_info(ctx->ave->dev, "input has a %u byte stride; copying to %u\n", stride,
-			 p->stride);
-	}
-
 	to = b->cpu;
 	for (u32 y = 0; y < rows; y++)
 		memcpy(to + y * p->stride, from + y * stride, width);
+	ave_note_copy(ctx, stride, "to a copy");
 	*input = b->dma;
 	return 0;
 }
