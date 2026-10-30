@@ -22,10 +22,14 @@ the desktop Macs), sensors present on any given machine are described
 via Devicetree. The driver picks these up and registers them with
 hwmon when probed.
 
-Manual fan speed is supported via the fan_control module parameter. This
-is disabled by default and marked as unsafe, as it cannot be proven that
-the system will fail safe if overheating due to manual fan control being
-used.
+Manual fan speed is available on the fans whose Devicetree node has
+apple,fan-manual-control, which a machine's Devicetree sets once its SMC
+firmware is known to accept a manual speed and to take the fan back. On
+those fans fanX_target is writable; writing 0 hands the fan back to the
+firmware. The fan_control module parameter, disabled by default and marked
+as unsafe, allows manual speeds on every fan with a mode key whatever the
+Devicetree says. It cannot be proven that the system will fail safe if it
+overheats under a manual fan speed.
 
 sysfs interface
 ---------------
