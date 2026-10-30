@@ -465,7 +465,8 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             let firmware_source = pending.len() == 1
                 && matches!(&pending[0].0, Validated::Compute { .. })
                 && !pending[0].2.has_outputs();
-            let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
+            let aggregate =
+                outputs.publish(self.context.clone(), firmware_source, self.backend.stats())?;
             for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(

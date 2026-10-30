@@ -38,6 +38,10 @@ pub(crate) const RX_PRODUCER_OFFSET: usize = 0x20;
 pub(crate) const TRACE_TYPES: u32 = 1 << 5;
 /// Statistics record types accepted by the host.
 pub(crate) const STATISTICS_TYPES: u32 = 0x5fff_0000;
+/// Statistics record of the busy percentages since the previous one of its type.
+pub(crate) const STATISTICS_UTILIZATION: u32 = 0x13;
+/// Statistics record of the software performance state. T6040 firmware only.
+pub(crate) const STATISTICS_SOFTWARE_PSTATE: u32 = 0x1c;
 
 /// Completion stamp indices signalled by the firmware.
 #[repr(C, packed)]

@@ -851,6 +851,8 @@ struct Shared {
     deflake: fw::render::Deflake,
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
+    /// Outlives each firmware instance: `agx_stats` is cumulative across restarts.
+    stats: Arc<crate::stats::StatsSnapshot>,
     feed: Arc<feed::Feed>,
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
@@ -1184,6 +1186,7 @@ impl Gpu {
         let renders = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
+        let stats = Arc::new(crate::stats::StatsSnapshot::utilization_only(), GFP_KERNEL)?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         if cfg
             .core_layout
@@ -1209,6 +1212,7 @@ impl Gpu {
                 deflake: cfg.core_layout.deflake,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
+                stats,
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
@@ -1401,7 +1405,7 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new()?,
+                rings: channel::Rings::new(shared.stats.clone())?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -1562,7 +1566,7 @@ impl gpu::Gpu for Gpu {
     }
 
     fn stats_snapshot(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
-        None
+        Some(self.shared.stats.clone())
     }
 
     fn manager(&self) -> Option<&dyn gpu::GpuManager> {

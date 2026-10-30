@@ -9,7 +9,7 @@
 //! empty slot and orders the record, power tally and producer together.
 
 use core::sync::atomic::{fence, Ordering};
-use kernel::{device::Device, prelude::*};
+use kernel::{device::Device, prelude::*, sync::Arc};
 
 use super::fw::{channels::*, initdata::status};
 use super::initdata::InitData;
@@ -49,10 +49,10 @@ pub(crate) struct Rings {
 }
 
 impl Rings {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(stats: Arc<crate::stats::StatsSnapshot>) -> Result<Self> {
         Ok(Self {
             quarantined: [[false; 2]; 2],
-            reports: super::reports::Reports::new()?,
+            reports: super::reports::Reports::new(stats)?,
         })
     }
 

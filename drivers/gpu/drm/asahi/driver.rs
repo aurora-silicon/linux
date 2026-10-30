@@ -2,7 +2,6 @@
 
 //! Top-level GPU driver implementation.
 
-use crate::module_parameters;
 use kernel::bindings;
 use kernel::{
     device::{
@@ -302,12 +301,7 @@ impl platform::Driver for AsahiPlatformDriver {
         // Register the sysfs file on the platform device. Must happen after
         // the DRM device is registered so the device is fully bound.
         let raw_dev = pdev.as_ref().as_raw();
-        let snapshot = stats.as_ref().map_or(core::ptr::null(), Arc::as_ptr);
-        let raw_stats = crate::sysfs_exports::register(
-            raw_dev,
-            snapshot,
-            stats.is_some() && module_parameters::stats_export.value() != 0,
-        )?;
+        let raw_stats = crate::sysfs_exports::register(raw_dev, stats.as_ref())?;
 
         let driver = AsahiPlatformDriverData {
             _device: reg.device().into(),
@@ -365,6 +359,7 @@ impl AsahiPlatformDriver {
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
         let gpu = g17::Gpu::new(pdev, &drm, cfg, res)?;
         let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
+        let stats = data_gpu.stats_snapshot();
         let data = try_pin_init!(AsahiDrmRegistrationData {
             gpu: data_gpu,
             resources,
@@ -378,9 +373,8 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
-        // G17's firmware channel format has no supported stats decoder yet.
         let raw_dev = pdev.as_ref().as_raw();
-        let raw_stats = match crate::sysfs_exports::register(raw_dev, core::ptr::null(), false) {
+        let raw_stats = match crate::sysfs_exports::register(raw_dev, stats.as_ref()) {
             Ok(handle) => handle,
             Err(error) => {
                 gpu.shutdown();
@@ -400,7 +394,7 @@ impl AsahiPlatformDriver {
             g16: None,
             raw_dev,
             raw_stats,
-            stats: None,
+            stats,
         })
     }
 }
@@ -425,7 +419,7 @@ impl AsahiPlatformDriver {
         // SAFETY: registration is stored in bound platform data and never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
         let raw_dev = pdev.as_ref().as_raw();
-        let raw_stats = crate::sysfs_exports::register(raw_dev, core::ptr::null(), false)?;
+        let raw_stats = crate::sysfs_exports::register(raw_dev, None)?;
         Ok(AsahiPlatformDriverData {
             _device: reg.device().into(),
             _reg: reg,

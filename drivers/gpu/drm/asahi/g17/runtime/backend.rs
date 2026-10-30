@@ -169,6 +169,10 @@ impl job::Backend for Backend {
         Some(self.shared.feed.clone())
     }
 
+    fn stats(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
+        Some(self.shared.stats.clone())
+    }
+
     fn render_scs_blocks(&self, pages: [u16; 2]) -> Result<usize> {
         crate::g17::fw::render_rt::required_blocks(self.shared.active_cores, pages)
     }

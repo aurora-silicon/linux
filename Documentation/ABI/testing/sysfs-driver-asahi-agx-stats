@@ -76,5 +76,18 @@ Description:
 		must not assume binary layout of this file.
 
 		A key the firmware does not report is absent rather than zero.
-		G17 firmware has no supported decoder for this snapshot format;
-		its file reports unsupported rather than fabricated zero counters.
+		T6040 and T8140 (G17 driver path) report busy_ns, sampled_ns, jobs
+		and util1..util4. Their jobs counts only submissions that succeed.
+		Their util1..util4 are the percentages of the window
+		since the previous record that the tiler, the renderer, compute
+		and the device were busy; util4 is the union of the other three,
+		so busy_ns is device busy time. MEASURED on T6040 (25G83):
+		over 90 s of desktop use, busy_ns over sampled_ns gave 11.59% and
+		the union of the render pass timestamps 11.72%. The firmware's
+		figure is the one macOS reports as Device Utilization. It counts
+		each pass 40-50 us longer than the pass's GPU timestamps, which
+		shows with many short passes: 17.7% against 14.2% during mpv
+		playback at 820 passes per second.
+		T6040 also reports pstate, the software performance state, 0
+		while the GPU is off; it is a request, not an achieved frequency.
+		Reading the file never wakes the GPU.

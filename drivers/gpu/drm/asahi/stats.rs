@@ -4,7 +4,9 @@
 //!
 //! [`StatsSnapshot`] accumulates the values decoded by `StatsChannel::poll`
 //! (see `fw::channels.rs::StatsMsg`) and exposes them to the sysfs file
-//! `agx_stats` (registered from `sysfs.c`).
+//! `agx_stats` (registered from `sysfs.c`). G17 firmware has its own record
+//! format: there `g17/reports.rs` decodes the records and `g17/fence.rs` counts
+//! the jobs.
 //!
 //! The snapshot belongs to one GPU manager. The firmware-stat
 //! decoder that feeds it lives in `StatsChannel::poll` (`channel.rs`), inside
@@ -85,11 +87,25 @@ const _: () = {
 };
 
 impl StatsSnapshot {
+    /// A snapshot for firmware that may report no more than utilization.
+    pub(crate) fn utilization_only() -> Self {
+        Self {
+            absent: AtomicU32::new(ABSENT_PSTATE | ABSENT_POWER | ABSENT_TEMPERATURE),
+            ..Default::default()
+        }
+    }
+
     /// Bump the completed-submission counter (called from the queue
-    /// completion path in `JobFence::command_complete`, NOT from the stats
-    /// channel).
+    /// completion path in `JobFence::command_complete` or, on G17,
+    /// `Submission::member_done`, NOT from the stats channel).
     pub(crate) fn note_job(&self) {
         self.jobs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Keep the performance state of a firmware record.
+    pub(crate) fn note_pstate(&self, pstate: u32) {
+        self.pstate.store(pstate, Ordering::Relaxed);
+        self.absent.fetch_and(!ABSENT_PSTATE, Ordering::Relaxed);
     }
 
     /// Account one `Utilization` record, whose `timestamp` runs at `ts_hz`.
@@ -189,5 +205,19 @@ mod tests {
         assert_eq!(busy(&stats), 0);
         assert_eq!(sampled(&stats), 0);
         assert_eq!(last, 2 * HZ);
+    }
+
+    #[test]
+    fn utilization_only_hides_keys_until_a_record_reports_them() {
+        let stats = StatsSnapshot::utilization_only();
+        let absent = ABSENT_PSTATE | ABSENT_POWER | ABSENT_TEMPERATURE;
+        assert_eq!(stats.absent.load(Ordering::Relaxed), absent);
+        stats.note_pstate(10);
+        assert_eq!(stats.pstate.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            stats.absent.load(Ordering::Relaxed),
+            ABSENT_POWER | ABSENT_TEMPERATURE
+        );
+        assert_eq!(StatsSnapshot::default().absent.load(Ordering::Relaxed), 0);
     }
 }

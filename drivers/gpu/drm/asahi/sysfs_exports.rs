@@ -3,8 +3,9 @@
 //! Per-device sysfs registration. The caller retains the snapshot Arc until
 //! unregister has drained active readers and freed the C attribute wrapper.
 
-use crate::{memacct::Ledger, stats::StatsSnapshot};
+use crate::{memacct::Ledger, module_parameters, stats::StatsSnapshot};
 use core::ffi::{c_int, c_void};
+use kernel::sync::Arc;
 
 extern "C" {
     fn asahi_sysfs_register(
@@ -35,11 +36,13 @@ pub(crate) fn register_idle(
 /// Register only after initialization succeeds, keeping the snapshot Arc alive.
 ///
 /// Also registers `gpu_memory`, which shows the static GPU memory ledger.
+/// `agx_stats` reports unsupported without a snapshot or with `stats_export` off.
 pub(crate) fn register(
     dev: *mut kernel::bindings::device,
-    snapshot: *const StatsSnapshot,
-    export_enabled: bool,
+    stats: Option<&Arc<StatsSnapshot>>,
 ) -> kernel::error::Result<*mut c_void> {
+    let snapshot = stats.map_or(core::ptr::null(), Arc::as_ptr);
+    let export_enabled = stats.is_some() && module_parameters::stats_export.value() != 0;
     let mut handle = core::ptr::null_mut();
     // SAFETY: The bound driver keeps the device and optional snapshot alive until
     // unregister drains readers. `handle` is writable for the duration of the call.

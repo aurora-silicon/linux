@@ -274,6 +274,11 @@ pub(crate) trait Backend: Send + Sync {
         None
     }
 
+    /// Device statistics retained by submissions after queue teardown.
+    fn stats(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
+        None
+    }
+
     /// Validate compute sizing without reserving a physical channel. Queued
     /// commands may wait on a host signal submitted after this ioctl returns.
     fn ensure_compute(&self, scs_pages: u16) -> Result;

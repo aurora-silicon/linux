@@ -136,14 +136,24 @@ pub(crate) struct Submission {
     /// is queued, before its fence is signalled off-lock: a consumer published
     /// in between needs no wait on it.
     retired: AtomicBool,
+    /// Counts this submission as a job when its last member succeeds.
+    stats: Option<Arc<crate::stats::StatsSnapshot>>,
 }
 
 impl Submission {
-    fn new(context: Arc<Context>, firmware_source: bool) -> Result<Arc<Self>> {
+    fn new(
+        context: Arc<Context>,
+        firmware_source: bool,
+        stats: Option<Arc<crate::stats::StatsSnapshot>>,
+    ) -> Result<Arc<Self>> {
         let work = Arc::new(WorkStateLease::deferred(context), GFP_KERNEL)?;
-        Self::with_work(Some(work), firmware_source)
+        Self::with_work(Some(work), firmware_source, stats)
     }
-    fn with_work(work: Option<Arc<WorkStateLease>>, firmware_source: bool) -> Result<Arc<Self>> {
+    fn with_work(
+        work: Option<Arc<WorkStateLease>>,
+        firmware_source: bool,
+        stats: Option<Arc<crate::stats::StatsSnapshot>>,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(pin_init!(Self {
             state <- new_mutex!(State { work, ready: None }, "G17 submission work state"),
             remaining: AtomicU8::new(1),
@@ -151,6 +161,7 @@ impl Submission {
             owners: AtomicU8::new(1),
             firmware_source,
             retired: AtomicBool::new(false),
+            stats,
         }), GFP_KERNEL)
     }
     pub(super) fn source_status(&self) -> Result<bool> {
@@ -189,7 +200,10 @@ impl Submission {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             let error = self.error.load(Ordering::Acquire);
             if error != 0 { fence.set_error(Error::from_errno(error)); }
-            else { self.release_state(); }
+            else {
+                self.release_state();
+                if let Some(stats) = &self.stats { stats.note_job(); }
+            }
             if fence.scoped { signal_exported(fence); } else { fence.signal(); }
         }
     }
@@ -251,8 +265,40 @@ mod tests {
     }
     fn aggregate(contexts: &FenceContexts) -> Aggregate {
         let mut fence = export_fallback(contexts).unwrap();
-        fence.source = Some(Submission::with_work(None, true).unwrap());
+        fence.source = Some(Submission::with_work(None, true, None).unwrap());
         Aggregate(fence.into())
+    }
+    fn counted(contexts: &FenceContexts, stats: &Arc<crate::stats::StatsSnapshot>) -> Aggregate {
+        let mut fence = export_fallback(contexts).unwrap();
+        fence.source = Some(Submission::with_work(None, false, Some(stats.clone())).unwrap());
+        Aggregate(fence.into())
+    }
+    fn jobs(stats: &crate::stats::StatsSnapshot) -> u64 {
+        stats.jobs.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn one_job_when_the_last_member_of_a_submission_succeeds() {
+        let stats = Arc::new(crate::stats::StatsSnapshot::default(), GFP_KERNEL).unwrap();
+        let contexts = contexts();
+        let aggregate = counted(&contexts, &stats);
+        let (first, second) = (aggregate.member(), aggregate.member());
+        aggregate.finish_enqueue(Ok(()));
+        first.complete(Ok(()));
+        assert_eq!(jobs(&stats), 0);
+        second.complete(Ok(()));
+        assert_eq!(jobs(&stats), 1);
+    }
+
+    #[test]
+    fn failed_submission_is_not_a_job() {
+        let stats = Arc::new(crate::stats::StatsSnapshot::default(), GFP_KERNEL).unwrap();
+        let contexts = contexts();
+        let aggregate = counted(&contexts, &stats);
+        let member = aggregate.member();
+        aggregate.finish_enqueue(Ok(()));
+        member.complete(Err(EIO));
+        assert_eq!(jobs(&stats), 0);
     }
 
     #[test]
@@ -366,8 +412,13 @@ impl Outputs {
             submission: None, result: Err(ECANCELED), cumulative })
     }
     pub(crate) fn inputs(&self) -> &[SyncItem] { &self.syncs[..self.input_count] }
-    pub(crate) fn publish(&mut self, context: Arc<Context>, firmware_source: bool) -> Result<Aggregate> {
-        let source = Submission::new(context, firmware_source)?;
+    pub(crate) fn publish(
+        &mut self,
+        context: Arc<Context>,
+        firmware_source: bool,
+        stats: Option<Arc<crate::stats::StatsSnapshot>>,
+    ) -> Result<Aggregate> {
+        let source = Submission::new(context, firmware_source, stats)?;
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
         fence.source = Some(source);
         fence.scoped = self.cumulative.is_some();
