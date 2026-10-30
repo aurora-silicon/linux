@@ -210,7 +210,6 @@ impl platform::Driver for Driver<'_> {
             },
         })
     }
-
 }
 
 /// Firmware starts only after every fallible module/driver registration has succeeded.
