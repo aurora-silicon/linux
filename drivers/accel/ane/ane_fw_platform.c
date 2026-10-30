@@ -5,6 +5,7 @@
  */
 #include <linux/ioport.h>
 #include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 
@@ -141,7 +142,7 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 
 	if (of_property_count_strings(np, "reg-names") != soc->reg_count ||
 	    platform_get_resource(pdev, IORESOURCE_MEM, soc->reg_count) ||
-	    platform_irq_count(pdev) != soc->interrupt_count)
+	    of_irq_count(np) != soc->interrupt_count)
 		return dev_err_probe(dev, -EINVAL, "H16 resource count mismatch\n");
 
 	for (i = 0; i < soc->reg_count; i++) {
