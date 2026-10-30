@@ -325,11 +325,23 @@
 	 * shared heat budget to the GPU. They shut down at 118 C. While the
 	 * GPU is powered off its sensors report placeholder values from -4 to
 	 * 4 C.
+	 *
+	 * sustainable-power is what the CPUs dissipate with the die held at
+	 * its operating point: 720 s of all-core load (10 P, 4 E busy loops),
+	 * headless, SMC fans in their own mode. Over the last 600 s TCMz held
+	 * 112.0 to 113.8 C with the PMP limiting the P clusters to a mean of
+	 * about 3.7 GHz and the fans at 3450/3730 rpm (where macOS settles
+	 * too). The SMC core rails then read P0 25.3 W, P1 23.9 W and E 2.1 W
+	 * on average, the units of the energy model. Each zone gets the sum
+	 * over the clusters it throttles. Without it the power allocator
+	 * estimates a budget from the cooling devices' lowest states, which
+	 * throttles far below what this machine sustains.
 	 */
 	thermal-zones {
 		cpu-die-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
 			trips {
@@ -381,6 +393,7 @@
 		cpu-e0-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
 
 			trips {
@@ -412,6 +425,7 @@
 		cpu-e1-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
 
 			trips {
@@ -443,6 +457,7 @@
 		cpu-e2-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
 
 			trips {
@@ -474,6 +489,7 @@
 		cpu-e3-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
 
 			trips {
@@ -505,6 +521,7 @@
 		cpu-p00-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
 
 			trips {
@@ -537,6 +554,7 @@
 		cpu-p01-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
 
 			trips {
@@ -569,6 +587,7 @@
 		cpu-p02-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
 
 			trips {
@@ -601,6 +620,7 @@
 		cpu-p03-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
 
 			trips {
@@ -633,6 +653,7 @@
 		cpu-p04-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
 
 			trips {
@@ -665,6 +686,7 @@
 		cpu-p05-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
 
 			trips {
@@ -697,6 +719,7 @@
 		cpu-p10-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
 
 			trips {
@@ -729,6 +752,7 @@
 		cpu-p11-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
 
 			trips {
@@ -761,6 +785,7 @@
 		cpu-p12-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
 
 			trips {
@@ -793,6 +818,7 @@
 		cpu-p13-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
 
 			trips {
@@ -825,6 +851,7 @@
 		cpu-p14-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
 
 			trips {
@@ -857,6 +884,7 @@
 		cpu-p15-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
 
 			trips {
