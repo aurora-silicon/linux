@@ -682,9 +682,36 @@ pub(super) struct Backend {
     /// The render pair this owner last published to without the device mutex
     /// (zero for none): a hint, revalidated by every lend.
     direct_slot: core::sync::atomic::AtomicU32,
+    /// The publication batch this owner's last publication finished, kept for its next one
+    /// so that publishing allocates nothing (see [`Self::publication_batch`]).
+    #[pin]
+    spare_batch: kernel::sync::SpinLock<Option<DeferredBatch>>,
 }
 
 impl Backend {
+    /// A publication batch: the one this owner's previous publication finished, or a new
+    /// one. The ioctl and the scheduler publish one owner's commands in turn, so one spare
+    /// serves both; a publisher that finds it taken allocates its own.
+    pub(super) fn publication_batch(&self) -> Result<DeferredBatch> {
+        let spare = self.spare_batch.lock().take();
+        match spare {
+            Some(batch) => Ok(batch),
+            None => DeferredBatch::publication(),
+        }
+    }
+
+    /// Keeps `batch`, finished, for this owner's next publication. A batch that still holds
+    /// work, or another spare, is dropped as before.
+    pub(super) fn keep_publication_batch(&self, batch: DeferredBatch) {
+        if !batch.is_reusable() {
+            return;
+        }
+        let mut spare = self.spare_batch.lock();
+        if spare.is_none() {
+            *spare = Some(batch);
+        }
+    }
+
     pub(super) fn new(
         shared: &Arc<super::Shared>,
         vm: &crate::mmu::Vm,
@@ -786,6 +813,7 @@ impl Backend {
                     claimed <- kernel::new_mutex!(None, "g17::Backend::claimed"),
                     admission,
                     direct_slot: core::sync::atomic::AtomicU32::new(0),
+                    spare_batch <- kernel::new_spinlock!(None, "g17::Backend::spare_batch"),
                 }),
                 GFP_KERNEL,
             )?,
@@ -1235,6 +1263,17 @@ impl DeferredBatch {
     /// VM-wide settlement is a separate transaction before publishing its error.
     fn publication() -> Result<Self> {
         Self::with_capacity(2 * Self::DEPTH, 0)
+    }
+    /// Whether this is an empty publication batch, as [`Self::finish`] leaves one, with its
+    /// full capacity.
+    fn is_reusable(&self) -> bool {
+        !self.has_source_completions
+            && self.values.is_empty()
+            && self.values.capacity() >= 2 * Self::DEPTH
+            && self.bindings.is_empty()
+            && self.vacated.is_empty()
+            && self.render.is_empty()
+            && self.tvb.is_empty()
     }
     fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
         let render_slots = if detached != 0 {
@@ -1940,7 +1979,7 @@ impl Backend {
             packet.set_early_result(Err(ECANCELED));
             return true;
         }
-        let mut deferred = match DeferredBatch::publication() {
+        let mut deferred = match self.publication_batch() {
             Ok(deferred) => deferred,
             Err(error) => {
                 if packet.completion.status().get() != 0 {
@@ -1957,12 +1996,14 @@ impl Backend {
         };
         if matches!(result, Err(error) if error == render::FALLBACK) && !packet.is_published() {
             deferred.finish();
+            self.keep_publication_batch(deferred);
             packet.abandon_publication();
             return false;
         }
         let result = self
             .finish_publication(packet, result, &mut deferred)
             .map(|_| ());
+        self.keep_publication_batch(deferred);
         packet.set_early_result(result);
         true
     }

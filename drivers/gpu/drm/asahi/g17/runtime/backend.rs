@@ -229,7 +229,7 @@ impl job::Backend for Backend {
         if let Some(result) = packet.early_result() {
             return result.map(|()| packet.completion.scheduler_fence());
         }
-        let mut deferred = match DeferredBatch::publication() {
+        let mut deferred = match self.publication_batch() {
             Ok(batch) => batch,
             Err(error) => {
                 self.release_backlog(&packet);
@@ -254,7 +254,9 @@ impl job::Backend for Backend {
             self.hold_claim(None);
         }
         self.release_backlog(&packet);
-        self.finish_publication(&packet, result, &mut deferred)
+        let fence = self.finish_publication(&packet, result, &mut deferred);
+        self.keep_publication_batch(deferred);
+        fence
     }
 
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status {

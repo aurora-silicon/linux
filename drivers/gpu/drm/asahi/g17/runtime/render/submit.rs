@@ -484,7 +484,7 @@ impl Backend {
             packet.set_early_result(Err(ECANCELED));
             return true;
         }
-        let mut deferred = match DeferredBatch::publication() {
+        let mut deferred = match self.publication_batch() {
             Ok(deferred) => deferred,
             Err(error) => {
                 if packet.completion.status().get() != 0 {
@@ -503,12 +503,14 @@ impl Backend {
             let lease = packet.completion.detach_render_lease();
             deferred.finish();
             drop(lease);
+            self.keep_publication_batch(deferred);
             packet.abandon_publication();
             return false;
         }
         let result = self
             .finish_publication(packet, result, &mut deferred)
             .map(|_| ());
+        self.keep_publication_batch(deferred);
         packet.set_early_result(result);
         true
     }
