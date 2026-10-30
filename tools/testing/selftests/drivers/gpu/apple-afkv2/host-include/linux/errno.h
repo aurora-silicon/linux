@@ -8,3 +8,5 @@
 #define ENODEV 19
 #define ETIMEDOUT 110
 #define ENOMEM 12
+#define EOVERFLOW 75
+#define EOPNOTSUPP 95

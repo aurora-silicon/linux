@@ -22,6 +22,7 @@ typedef uint8_t u8;
 #define PMP_REPORT_READY 1
 #define GFP_KERNEL 0
 #define GENPD_FLAG_ACTIVE_WAKEUP 1
+#define GENPD_FLAG_IRQ_SAFE 2
 #define MAX_PHANDLE_ARGS 4
 #define EPROBE_DEFER 517
 #define SZ_4K 4096
@@ -44,7 +45,7 @@ static void host_log(const char *format, ...)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 struct device_node {
 	const char *name, *compatible;
-	bool available, always_on, no_ack, deferred, uuid, soc_record;
+	bool available, always_on, no_ack, deferred, irq_safe, uuid, soc_record;
 	u32 reg;
 	int refs;
 	struct device_node *parent, *child, *sibling, *pmp;
@@ -387,6 +388,8 @@ static bool of_property_read_bool(const struct device_node *n, const char *p)
 		return n->no_ack;
 	if (!strcmp(p, "apple,defer-startup-ack"))
 		return n->deferred;
+	if (!strcmp(p, "apple,irq-safe"))
+		return n->irq_safe;
 	if (!strcmp(p, "apple,soc-device-record"))
 		return n->soc_record;
 	return false;
@@ -620,7 +623,7 @@ static int of_platform_populate(struct device_node *n, void *a, void *b,
 }
 struct overlay_entry {
 	u32 reg;
-	bool always_on, no_ack, deferred;
+	bool always_on, no_ack, deferred, irq_safe;
 };
 #include "overlay.h"
 static void cleanup(void)
@@ -669,6 +672,7 @@ static struct apple_pmp_report *setup(void)
 			.always_on = o->always_on,
 			.no_ack = o->no_ack,
 			.deferred = o->deferred,
+			.irq_safe = o->irq_safe,
 			.parent = &report_node,
 			.sibling = i < 3 ? &entries[i + 1] : NULL
 		};
@@ -727,6 +731,14 @@ int main(void)
 	assert(regs[0x1180 / 8] == r->start->seed);
 	assert(((struct apple_pmp_report_entry *)entry_devs[3].dev.data)
 		       ->no_ack);
+	/* genpd flags follow the overlay: always-on wakes, irq-safe opts in. */
+	for (unsigned int i = 0; i < 4; i++) {
+		const struct apple_pmp_report_entry *e = entry_devs[i].dev.data;
+		assert(!!(e->genpd.flags & GENPD_FLAG_ACTIVE_WAKEUP) ==
+		       overlay_entries[i].always_on);
+		assert(!!(e->genpd.flags & GENPD_FLAG_IRQ_SAFE) ==
+		       overlay_entries[i].irq_safe);
+	}
 	assert(apple_pmp_report_wait_ready(&entries[0], 30000) == 0 &&
 	       enables == 1 && pmp_node.available);
 	assert(g15_vote() == 0 && commands == 1 && enables == 1);
@@ -745,6 +757,17 @@ int main(void)
 	cases++;
 	regs[0x11c0 / 8] &= ~BIT_ULL(7);
 	assert(g15_vote() == -EIO && commands == 1);
+	cases++;
+	cleanup();
+	/* Only an entry that carries apple,irq-safe becomes an IRQ-safe domain. */
+	setup();
+	entries[1].irq_safe = true;
+	assert(apple_pmp_report_probe(&report_dev) == 0);
+	for (unsigned int i = 0; i < 4; i++) {
+		const struct apple_pmp_report_entry *e = entry_devs[i].dev.data;
+		assert(!!(e->genpd.flags & GENPD_FLAG_IRQ_SAFE) ==
+		       (i == 1 || overlay_entries[i].irq_safe));
+	}
 	cases++;
 	cleanup();
 	/* Missing display acknowledgement cannot release G15, even if bound+READY. */
