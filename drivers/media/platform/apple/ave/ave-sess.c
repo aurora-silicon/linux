@@ -592,8 +592,11 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	*keyframe = false;
 	if (!out)
 		return -EFAULT;
-	if (s->status)
+	if (s->status) {
+		dev_warn_ratelimited(ctx->ave->dev, "frame %u: firmware status %#x\n",
+				     ctx->dst_sequence, s->status);
 		return -EIO;
+	}
 
 	data = get_unaligned_le32(meta + AVE_META_PAYLOAD);
 	data2 = get_unaligned_le32(meta + AVE_META_PAYLOAD2);

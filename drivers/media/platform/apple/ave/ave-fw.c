@@ -424,6 +424,7 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 	case AVE_FW_RUNNING:
 		return 0;
 	case AVE_FW_BROKEN:
+		dev_err(ave->dev, "firmware stopped answering earlier; reboot to use the encoder\n");
 		return -EIO;
 	case AVE_FW_OFF:
 	case AVE_FW_HALTED:
@@ -457,6 +458,7 @@ void ave_fw_halt(struct ave_dev *ave)
 	if (ave->fw_state != AVE_FW_RUNNING)
 		return;
 	if (ave_cmd_halt(ave)) {
+		dev_err(ave->dev, "cannot send Halt; firmware treated as stuck\n");
 		ave->fw_state = AVE_FW_BROKEN;
 		return;
 	}

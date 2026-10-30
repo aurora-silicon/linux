@@ -357,8 +357,11 @@ int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len, u64 timeou
 	int ret;
 
 	lockdep_assert_held(&ave->hw_lock);
-	if (ave->fw_state != AVE_FW_RUNNING)
+	if (ave->fw_state != AVE_FW_RUNNING) {
+		dev_err_ratelimited(ave->dev, "command %u not sent: firmware state %d\n", op,
+				    ave->fw_state);
 		return -EIO;
+	}
 	if (len < AVE_CMD_HDR_BYTES || len > max || !IS_ALIGNED(len, 4) ||
 	    (ave->unacked & BIT(buf)) || (reply && op >= ARRAY_SIZE(ave->want)))
 		return -EINVAL;
@@ -473,8 +476,11 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 	for (;;) {
 		if (cond && cond(ave, arg))
 			return 0;
-		if (ave->fw_state != AVE_FW_RUNNING)
+		if (ave->fw_state != AVE_FW_RUNNING) {
+			dev_err_ratelimited(ave->dev, "waiting on a firmware in state %d\n",
+					    ave->fw_state);
 			return -EIO;
+		}
 		ret = ave_ipc_poll_once(ave);
 		if (ret < 0) {
 			ave_ipc_mark_broken(ave, ret, "ring error");

@@ -1036,8 +1036,17 @@ static void ave_run_work(struct work_struct *work)
 		ret = ave_session_begin(ctx);
 
 	mutex_lock(&ave->hw_lock);
-	if (!ret && ctx->sess && (ctx->sess->dead || ave->active != ctx))
+	/*
+	 * A closed session (after a drain) may still hold frames for CAPTURE
+	 * buffers; only an open one must still own the firmware.
+	 */
+	if (!ret && ctx->sess && ctx->sess->dead) {
+		dev_err(ave->dev, "session ended by system sleep\n");
 		ret = -EIO;
+	} else if (!ret && ctx->sess && ctx->sess->fw_open && ave->active != ctx) {
+		dev_err(ave->dev, "session lost the firmware\n");
+		ret = -EIO;
+	}
 	if (!ret) {
 		eos = ave_deliver(ctx);
 		if (!eos && !READ_ONCE(ctx->flush_pending) && ctx->sess &&
@@ -1049,8 +1058,11 @@ static void ave_run_work(struct work_struct *work)
 		if (!eos && READ_ONCE(ctx->flush_pending))
 			eos = ave_finish_drain(ctx);
 		/* Frames outstanding need a running firmware. */
-		if (!eos && ctx->sess && ctx->sess->busy && ave->fw_state != AVE_FW_RUNNING)
+		if (!eos && ctx->sess && ctx->sess->busy && ave->fw_state != AVE_FW_RUNNING) {
+			dev_err(ave->dev, "%u frames outstanding, firmware state %d\n",
+				ctx->sess->busy, ave->fw_state);
 			ret = -EIO;
+		}
 		poll = !ret && !eos && ctx->sess && ctx->sess->busy;
 	}
 	mutex_unlock(&ave->hw_lock);
@@ -1100,6 +1112,8 @@ static void ave_poll_work(struct work_struct *work)
 		}
 		again = !fail && ctx->sess->busy;
 	} else if (ctx->sess && ctx->sess->busy) {
+		dev_err(ave->dev, "%u frames outstanding in a session that lost the firmware\n",
+			ctx->sess->busy);
 		fail = true;
 	}
 	mutex_unlock(&ave->hw_lock);
