@@ -184,14 +184,15 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 }
 
 /*
- * The firmware writes past the sizes it is given. A 1080p run wrote up to
- * about 0x8c00 bytes beyond the end of the first +0x390 buffer, so the
- * sizes stay as macOS reports them but the mappings get room behind them:
- * 256 KiB for that group, 64 KiB for every other working buffer. Larger
+ * The firmware writes past the sizes it is given, so the sizes stay as
+ * macOS reports them but the mappings get room behind them. The +0x390
+ * group holds a 4:2:0 picture whose size field covers luma only: macOS
+ * leaves 0x318000 bytes behind the 0x20d000 one at 1080p (1.5 times), and
+ * the firmware writes chroma there. Every other working buffer gets 64 KiB
+ * more (macOS leaves 0x28000 behind the 0x20000 +0x3a0 one). Larger
  * margins cost more than they look: the DMA layer aligns each mapping to a
  * power of two in the encoder's 256 MiB window.
  */
-#define AVE_REF_A_PAD		SZ_256K
 
 static size_t ave_pad(size_t size)
 {
@@ -223,7 +224,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 
 	ret |= ave_work_buf(ave, &sess->hdr, AVE_HDR_BYTES);
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ref_a + AVE_REF_A_PAD, nomap);
+		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ave_pad(ref_a * 3 / 2), nomap);
 		ret |= ave_work_buf(ave, &sess->ref_b[i], ref_b);
 		ret |= ave_work_buf(ave, &sess->ref_c[i], ref_c);
 		ret |= ave_work_buf(ave, &sess->ref_d[i], ref_d);
