@@ -698,6 +698,7 @@ static int apple_probe_per_dcp(struct device *dev,
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
 	struct apple_dcp *dcp_data = platform_get_drvdata(dcp);
 	bool supports_xrgb2101010;
+	bool supports_premultiplied;
 	enum drm_plane_type plane_type;
 	bool interchange;
 	bool supports_interchange;
@@ -709,6 +710,8 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * (T8140 and T8122): advertise linear framebuffers only there.
 	 */
 	supports_interchange = dcp_data->fw_compat != DCP_FIRMWARE_H17P;
+	/* The H17P swap surface has no is_premultiplied flag. */
+	supports_premultiplied = dcp_data->fw_compat != DCP_FIRMWARE_H17P;
 	if (bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
 		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
@@ -748,7 +751,8 @@ static int apple_probe_per_dcp(struct device *dev,
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
-							plane_type, interchange);
+							plane_type, interchange,
+							supports_premultiplied);
 		}
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
