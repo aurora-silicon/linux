@@ -5090,7 +5090,8 @@ static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_p
 	else if (!ret && atcphy->fixed_usb2 && atcphy->hw->has_t8140_dp) {
 		int retrain = usb_hub_port_retrain(pm->root, 1);
 
-		if (retrain < 0)
+		/* An absent SS receiver is normal for a USB2-only device or cable. */
+		if (retrain < 0 && retrain != -ENOTCONN)
 			dev_warn(atcphy->dev, "SuperSpeed handover retrain failed: %d\n", retrain);
 		/* Power was restored even if no receiver answered the bounded retrain. */
 	}
