@@ -3049,6 +3049,8 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					hdev);
 }
 
+static int bcm4377_resume(struct device *dev);
+
 static int bcm4377_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -3071,6 +3073,21 @@ static int bcm4377_suspend(struct device *dev)
 	}
 
 	if (device_may_wakeup(dev)) {
+		ret = enable_irq_wake(pdev->irq);
+		if (ret) {
+			int resume_ret;
+
+			dev_err(dev, "Failed to arm Bluetooth wake IRQ: %d\n", ret);
+			/* The PM core will not resume a device that failed suspend. */
+			bcm4377->resume_powered = false;
+			resume_ret = bcm4377_resume(dev);
+			if (resume_ret)
+				dev_err(dev, "Failed to undo Bluetooth suspend: %d\n",
+					resume_ret);
+			return ret;
+		}
+		bcm4377->wake_armed = true;
+
 		/*
 		 * Remote wakeup: leave the firmware running and the function
 		 * in D0, so a connection attempt from a wake-allowed device
@@ -3078,7 +3095,6 @@ static int bcm4377_suspend(struct device *dev)
 		 * core from putting the function into D3hot.
 		 */
 		pci_save_state(pdev);
-		bcm4377->wake_armed = !enable_irq_wake(pdev->irq);
 		return 0;
 	}
 
