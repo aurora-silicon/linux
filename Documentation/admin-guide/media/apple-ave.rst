@@ -52,7 +52,8 @@ runs at a time; a second one gets ``EBUSY``.
 Up to five frames are inside the firmware at once (three without B-frames).
 The firmware reorders B-frames itself, so CAPTURE buffers come back in
 bitstream order, each carrying the timestamp of the frame it codes. The driver
-asks for at least six OUTPUT buffers.
+asks for at least six OUTPUT buffers, and limits both queues so a full set fits
+the encoder's 256 MiB DMA window (fewer buffers at larger sizes).
 
 Runtime PM uses a two second autosuspend delay. A firmware that stops
 answering keeps the encoder powered and is not used again until reboot.
@@ -63,9 +64,10 @@ Limits
 
 Picture sizes from 320x240 to 2560x1600 (in steps of two), up to 240 frames
 per second. Rate control is VBR (with ``BITRATE_PEAK`` as a one-second data
-rate cap) or CBR; constant quality is not offered. ``BITRATE`` may change
+rate cap, twice the average when left at 0) or CBR; constant quality is not offered. ``BITRATE`` may change
 while streaming and applies from the next frame; ``FORCE_KEY_FRAME`` makes
 the next frame an IDR. H.264 uses either three B-frames or none (Baseline and
-a GOP size of 1 never use them); HEVC always uses them for now. The level
+a GOP size of 1 never use them). HEVC always uses them for now; with
+``B_FRAMES`` set to 0 every frame is flushed through at once instead. The level
 control is a minimum: the driver raises it to what the size, frame rate and
 bit rate need.

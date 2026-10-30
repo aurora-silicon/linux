@@ -157,6 +157,7 @@ struct ave_params {
 	u32 refs;			/* max_num_ref_frames + 1 */
 	bool bframes;
 	bool intra_only;
+	bool low_delay;			/* Complete after every frame */
 	u32 gop;
 	u32 rc_mode;
 	u32 bitrate;

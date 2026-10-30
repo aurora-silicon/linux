@@ -150,6 +150,8 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		     (!baseline && !p->intra_only && ctx->b_frames);
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;
+	/* HEVC asked to go without B-frames: flush every frame instead. */
+	p->low_delay = p->codec == AVE_CODEC_HEVC && !ctx->b_frames;
 	p->gop = ctx->gop_size ?: 120;
 
 	p->bitrate = ctx->bitrate;
@@ -157,8 +159,14 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 		p->rc_mode = AVE_RC_CBR;
 		p->limit_bytes = 0;
 	} else {
+		/*
+		 * The data-rate limit macOS sets is twice the average rate over
+		 * one second; a peak equal to the average starved the rate
+		 * control on hardware. A peak of 0 means that default.
+		 */
 		p->rc_mode = AVE_RC_VBR;
-		p->limit_bytes = max(ctx->bitrate_peak, ctx->bitrate) / 8;
+		p->limit_bytes = (ctx->bitrate_peak ? max(ctx->bitrate_peak, ctx->bitrate) :
+				  2ULL * ctx->bitrate) / 8;
 	}
 
 	level = ave_pick_level(p, p->codec == AVE_CODEC_H264 ? ctx->h264_level :
@@ -176,16 +184,18 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 }
 
 /*
- * The firmware writes past the sizes it is given. The first 1080p run
- * wrote 0x7800..0x8a00 bytes (and maybe more; DART faults are rate
- * limited) beyond the end of the first +0x390 buffer, so the sizes stay as
- * macOS reports them but the mappings get room behind them: that group is
- * mapped at 1.5 times its size, every other working buffer with an eighth
- * (at least 64 KiB) more.
+ * The firmware writes past the sizes it is given. A 1080p run wrote up to
+ * about 0x8c00 bytes beyond the end of the first +0x390 buffer, so the
+ * sizes stay as macOS reports them but the mappings get room behind them:
+ * 256 KiB for that group, 64 KiB for every other working buffer. Larger
+ * margins cost more than they look: the DMA layer aligns each mapping to a
+ * power of two in the encoder's 256 MiB window.
  */
+#define AVE_REF_A_PAD		SZ_256K
+
 static size_t ave_pad(size_t size)
 {
-	return size + max_t(size_t, SZ_64K, ALIGN(size / 8, SZ_16K));
+	return size + SZ_64K;
 }
 
 static int ave_work_buf(struct ave_dev *ave, struct ave_buf *b, size_t size)
@@ -213,8 +223,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 
 	ret |= ave_work_buf(ave, &sess->hdr, AVE_HDR_BYTES);
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a,
-					max(ref_a * 3 / 2, ave_pad(ref_a)), nomap);
+		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ref_a + AVE_REF_A_PAD, nomap);
 		ret |= ave_work_buf(ave, &sess->ref_b[i], ref_b);
 		ret |= ave_work_buf(ave, &sess->ref_c[i], ref_c);
 		ret |= ave_work_buf(ave, &sess->ref_d[i], ref_d);

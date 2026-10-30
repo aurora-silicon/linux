@@ -7,6 +7,8 @@
  *
  * Copyright The Aurora Silicon Contributors
  */
+#include <linux/delay.h>
+#include <linux/log2.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
@@ -33,8 +35,16 @@
 #define AVE_STRIDE_ALIGN	64
 #define AVE_DEFAULT_W		1920
 #define AVE_DEFAULT_H		1080
-#define AVE_MAX_OUTPUT_BUFS	16
-#define AVE_MAX_CAPTURE_BUFS	8
+/*
+ * Buffer counts are limited so a full set fits the encoder's 256 MiB DART
+ * window next to a session: each queue may use this much, counting every
+ * buffer at the power-of-two size the DMA layer maps it with.
+ */
+#define AVE_OUTPUT_BUDGET	SZ_64M
+#define AVE_CAPTURE_BUDGET	SZ_32M
+#define AVE_MAX_QUEUE_BUFS	16
+#define AVE_RESTART_TRIES	10
+#define AVE_RESTART_WAIT_MS	100
 
 static const u32 ave_coded_fmts[] = {
 	V4L2_PIX_FMT_H264,
@@ -76,7 +86,9 @@ static void ave_fill_raw(struct v4l2_pix_format_mplane *f)
 
 	f->pixelformat = V4L2_PIX_FMT_NV12;
 	ave_clamp_size(&f->width, &f->height);
-	stride = ALIGN(max_t(u32, f->width, f->plane_fmt[0].bytesperline), AVE_STRIDE_ALIGN);
+	/* Keep a client's stride, within reason, rounded to 64 bytes. */
+	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width, 2 * AVE_MAX_W),
+		       AVE_STRIDE_ALIGN);
 	height = ALIGN(f->height, AVE_STEP);
 	f->num_planes = 1;
 	f->plane_fmt[0].bytesperline = stride;
@@ -456,9 +468,11 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 			       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, 100000000, 1,
 			  4000000);
-	/* In VBR mode the peak caps the data rate over any one second. */
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, 100000, 200000000, 1,
-			  8000000);
+	/*
+	 * In VBR mode the peak caps the data rate over any one second;
+	 * 0 means twice the average, as macOS sets it.
+	 */
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, 0, 200000000, 1, 0);
 	/* 0 means no limit; the firmware then uses 120 frames. */
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE, 0, 65535, 1, 30);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
@@ -521,8 +535,12 @@ static int ave_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned i
 	const struct v4l2_pix_format_mplane *f =
 		V4L2_TYPE_IS_OUTPUT(vq->type) ? &ctx->src_fmt : &ctx->dst_fmt;
 	unsigned int have = vb2_get_num_buffers(vq);
-	unsigned int max = V4L2_TYPE_IS_OUTPUT(vq->type) ? AVE_MAX_OUTPUT_BUFS :
-							    AVE_MAX_CAPTURE_BUFS;
+	unsigned long slot = roundup_pow_of_two(PAGE_ALIGN(f->plane_fmt[0].sizeimage));
+	unsigned int max = (V4L2_TYPE_IS_OUTPUT(vq->type) ? AVE_OUTPUT_BUDGET :
+							    AVE_CAPTURE_BUDGET) / slot;
+
+	max = clamp(max, V4L2_TYPE_IS_OUTPUT(vq->type) ? AVE_MAX_SLOTS + 1U : 2U,
+		    AVE_MAX_QUEUE_BUFS);
 
 	/* Frames stay with the firmware until encoded; keep one spare. */
 	if (V4L2_TYPE_IS_OUTPUT(vq->type) && have + *nbufs < AVE_MAX_SLOTS + 1)
@@ -638,20 +656,39 @@ static int ave_session_begin(struct ave_ctx *ctx)
 	if (IS_ERR(sess))
 		return PTR_ERR(sess);
 
+	ctx->sess = sess;
 	ret = pm_runtime_resume_and_get(ave->dev);
 	if (ret) {
-		ctx->sess = sess;
 		ave_sess_destroy(ctx);
 		return ret;
 	}
 
 	mutex_lock(&ave->hw_lock);
-	ctx->sess = sess;
 	if (ave->active) {
 		ret = -EBUSY;
 		goto out;
 	}
-	ret = ave_fw_ensure_running(ave);
+	/*
+	 * A halted coprocessor restarts only from reset. Its power can take
+	 * a moment to go after a suspend (the DARTs follow later), so cycle
+	 * it again a few times before giving up.
+	 */
+	for (unsigned int i = 0; i < AVE_RESTART_TRIES; i++) {
+		ret = ave_fw_ensure_running(ave);
+		if (ret != -EAGAIN)
+			break;
+		mutex_unlock(&ave->hw_lock);
+		pm_runtime_put_sync_suspend(ave->dev);
+		msleep(AVE_RESTART_WAIT_MS);
+		ret = pm_runtime_resume_and_get(ave->dev);
+		mutex_lock(&ave->hw_lock);
+		if (ret) {
+			mutex_unlock(&ave->hw_lock);
+			ave_sess_destroy(ctx);
+			return ret;
+		}
+		ret = -EAGAIN;
+	}
 	if (ret)
 		goto out;
 	ave->active = ctx;
@@ -882,6 +919,14 @@ static int ave_encode_one(struct ave_ctx *ctx)
 			ret = ave_cmd_complete(ctx, 1);
 		if (!ret)
 			ret = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		if (ret)
+			return ret;
+	} else if (sess->p.low_delay) {
+		/* Make the firmware code this frame now, without lookahead. */
+		ret = ave_cmd_complete(ctx, 1);
+		sess->nudged = true;
+		if (!ret)
+			ret = ave_ipc_pump(ave, 0, NULL, NULL);
 		if (ret)
 			return ret;
 	} else {
