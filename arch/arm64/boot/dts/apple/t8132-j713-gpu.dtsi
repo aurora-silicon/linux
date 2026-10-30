@@ -80,6 +80,8 @@
 		/* ASCWrap v6 contains the same mailbox aperture used by ASC v4. */
 		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x3 0x02608000 0x0 0x4000>;
+		/* Idle ring-service kicks need not wake the system. */
+		apple,hold-rx-in-sleep;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
@@ -95,6 +97,8 @@
 &ps_gfx {
 	status = "okay";
 	power-domains = <&gfx_tvm>;
+	/* The G16 firmware stays live across suspend-to-idle. */
+	apple,sleep-retained;
 };
 
 /* The existing report provider owns readiness for shared PMP commands. */
