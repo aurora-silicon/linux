@@ -1755,17 +1755,50 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 static int dockchannel_hid_suspend(struct device *dev)
 {
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	int i, ret;
 
+	/* HID drivers may still need the transport while preparing for sleep. */
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (!iface || !iface->hid)
+			continue;
+		ret = hid_driver_suspend(iface->hid, PMSG_SUSPEND);
+		if (ret)
+			goto unwind;
+	}
 	WRITE_ONCE(dchid->suspended, true);
 	return 0;
+
+unwind:
+	/* PM does not call our resume when this callback fails. */
+	while (--i >= 0) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+
+		if (iface && iface->hid)
+			hid_driver_resume(iface->hid);
+	}
+	return ret;
 }
 
 static int dockchannel_hid_resume(struct device *dev)
 {
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
+	int i, ret = 0;
 
+	/* Allow feature requests again before notifying any HID driver. */
 	WRITE_ONCE(dchid->suspended, false);
-	return 0;
+	for (i = 0; i < MAX_INTERFACES; i++) {
+		struct dchid_iface *iface = dchid->ifaces[i];
+		int err;
+
+		if (!iface || !iface->hid)
+			continue;
+		err = hid_driver_resume(iface->hid);
+		if (!ret)
+			ret = err;
+	}
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_hid_pm_ops, dockchannel_hid_suspend,

@@ -50,6 +50,8 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'mtp-pm-tests.py': [(out(), PASS),
+                         (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
     'ave-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-ref', '4db3a5a22c43'], PASS)],
     'apple-dart-fw-tests.py': [(out(), PASS)],
