@@ -184,28 +184,22 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 }
 
 /*
- * The firmware writes past the sizes it is given, so the sizes stay as
- * macOS reports them but the mappings get room behind them. The +0x390
- * group holds a 4:2:0 picture whose size field covers luma only: macOS
- * leaves 0x318000 bytes behind the 0x20d000 one at 1080p (1.5 times), and
- * the firmware writes chroma there. Every other working buffer gets 64 KiB
- * more (macOS leaves 0x28000 behind the 0x20000 +0x3a0 one). Larger
- * margins cost more than they look: the DMA layer aligns each mapping to a
- * power of two in the encoder's 256 MiB window.
+ * Two groups hold more than their size fields say, measured on hardware
+ * at 1080p and 2408x1506: the +0x390 group is a 4:2:0 picture whose size
+ * covers luma only (the firmware writes up to 1.5 times it), and the
+ * +0x3a0 group is written up to 1.2 times its size (mapped at 1.25 times,
+ * as macOS spaces them). Every other buffer stays within its size; the
+ * mapping is only rounded up to whole pages.
  */
-
-static size_t ave_pad(size_t size)
-{
-	return size + SZ_64K;
-}
 
 /*
  * Working buffers keep a kernel mapping so that, when a session ends, the
- * driver can see how far past each reported size the firmware wrote.
+ * driver can see how far past each reported size the firmware wrote (into
+ * the page rounding, or the room the two groups above get).
  */
 static int ave_work_buf(struct ave_dev *ave, struct ave_buf *b, size_t size)
 {
-	return ave_alloc_padded(ave, b, size, ave_pad(size), 0);
+	return ave_alloc(ave, b, size, 0);
 }
 
 /* Working buffer sizes, all from the requested picture size. */
@@ -227,8 +221,8 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 
 	ret |= ave_work_buf(ave, &sess->hdr, AVE_HDR_BYTES);
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ave_pad(ref_a * 3 / 2), 0);
-		ret |= ave_work_buf(ave, &sess->ref_b[i], ref_b);
+		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ref_a * 3 / 2, 0);
+		ret |= ave_alloc_padded(ave, &sess->ref_b[i], ref_b, ref_b * 5 / 4, 0);
 		ret |= ave_work_buf(ave, &sess->ref_c[i], ref_c);
 		ret |= ave_work_buf(ave, &sess->ref_d[i], ref_d);
 	}
@@ -249,10 +243,8 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 			  SZ_16K);
 	frame_buf = max_t(size_t, frame_buf, AVE_H264_FRAME_BUF_1080P);
 	for (unsigned int s = 0; s < p->slots; s++) {
-		ret |= ave_alloc_padded(ave, &sess->slot[s].coded, p->coded_cap,
-					ave_pad(p->coded_cap), 0);
-		ret |= ave_alloc_padded(ave, &sess->slot[s].meta, AVE_META_BYTES,
-					ave_pad(AVE_META_BYTES), 0);
+		ret |= ave_alloc(ave, &sess->slot[s].coded, p->coded_cap, 0);
+		ret |= ave_alloc(ave, &sess->slot[s].meta, AVE_META_BYTES, 0);
 		if (hevc)
 			ret |= ave_alloc(ave, &sess->slot[s].aux, AVE_SHDR_BYTES, 0);
 		else
@@ -395,6 +387,9 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	dev_dbg(ctx->ave->dev, "session %ux%u codec %u profile %u level %u, %u slots, %u refs\n",
 		sess->p.width, sess->p.height, sess->p.codec, sess->p.profile, sess->p.level,
 		sess->p.slots, sess->p.refs);
+	dev_dbg(ctx->ave->dev, "rate control mode %u, %u bit/s, limit %u bytes/s, gop %u, %u/%u fps\n",
+		sess->p.rc_mode, sess->p.bitrate, sess->p.limit_bytes, sess->p.gop,
+		sess->p.fps_num, sess->p.fps_den);
 	return sess;
 }
 
