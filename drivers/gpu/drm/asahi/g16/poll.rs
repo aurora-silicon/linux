@@ -79,6 +79,12 @@ impl Shared {
                 let evented = self.evented.swap(false, Ordering::AcqRel);
                 match firmware.poll(evented, &mut done) {
                     Ok(true) => self.rearm(firmware.engine.chan_wait),
+                    // Idle: one more pass after a window gives the state back.
+                    Ok(false) if firmware.power.utilization.decaying() => {
+                        self.mod_poll(kernel::time::msecs_to_jiffies(
+                            (super::power::policy::WINDOW_NS / 1_000_000) as u32,
+                        ))
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         firmware.fail_stop(error, &mut done);
@@ -535,6 +541,7 @@ impl Firmware {
         if self.engine.flights.is_empty() {
             // Drained: a gap until the next publication.
             self.engine.stats.idle_from_ns = now_ns();
+            self.power.utilization.idle(self.engine.stats.idle_from_ns);
         }
         // The next prefix starts executing about now.
         self.renew_deadlines();
@@ -840,9 +847,13 @@ impl Firmware {
             super::recovery::logic::FIRMWARE_STAMP_PERIOD, self.engine.ordinal, self.engine.draw)?;
         writeln!(
             f,
-            "power: governor {} budget {} effective S{} temperature_mc {} updates {} sensor_errors {}",
-            self.power.governor, self.power.budget, self.power.effective,
-            self.power.temperature_mc, self.power.updates, self.power.sensor_errors
+            "power: governor {} budget {} demand S{} utilization {} effective S{} temperature_mc {} updates {} sensor_errors {}",
+            self.power.governor,
+            self.power.budget,
+            self.power.utilization.demand,
+            self.power.utilization.average,
+            self.power.effective, self.power.temperature_mc, self.power.updates,
+            self.power.sensor_errors
         )?;
         writeln!(
             f,

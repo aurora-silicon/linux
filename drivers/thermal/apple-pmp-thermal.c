@@ -174,10 +174,11 @@ static void apple_pmp_power_work(struct work_struct *work)
 	u64 epoch = apple_pmp_gpu_epoch(pmp_thermal.sensors);
 	u64 now;
 	int ret = apple_pmp_power_read_rails(mw);
-	/* The running CPUs/reader cannot plausibly consume <0.1 W in total.
-	 * A firmware reset/all-zero image must not refill the energy bucket.
+	/* The running reader cannot read zero on both CPU rails. A firmware
+	 * reset/all-zero image must not refill the energy bucket; an idle
+	 * system may still draw well under 0.1 W on all three rails.
 	 */
-	if (!ret && mw[0] + mw[1] + mw[2] < 100)
+	if (!ret && !mw[0] && !mw[1])
 		ret = -ENODATA;
 	/* Clock under the lock: a raw sample published while the SMC reads ran
 	 * must not make the unsigned age below wrap into a false -EAGAIN.
