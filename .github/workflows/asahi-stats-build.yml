@@ -1,0 +1,82 @@
+name: Asahi statistics kernel build
+
+on:
+  pull_request:
+    branches: [aurora-wip]
+    paths:
+      - drivers/gpu/drm/asahi/**
+      - drivers/pmdomain/apple/**
+      - .github/workflows/asahi-stats-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asahi-stats-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ARCH: arm64
+      LLVM: 1
+      RUSTUP_TOOLCHAIN: 1.97.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang-18 lld-18 llvm-18 libclang-18-dev flex bison bc libelf-dev libssl-dev
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src --no-self-update
+          cargo install bindgen-cli --version 0.73.2 --locked
+          bin="$RUNNER_TEMP/llvm"
+          mkdir -p "$bin"
+          for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+            ln -s "$(command -v "$tool-18")" "$bin/$tool"
+          done
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+      - name: Configure the Asahi drivers as built-ins
+        run: |
+          make O=out defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/asahi.config
+          scripts/config --file out/.config -e RUST -e DRM_ASAHI -e APPLE_PMP_REPORT
+          make O=out olddefconfig
+          grep -qx CONFIG_RUST=y out/.config
+          grep -qx CONFIG_DRM_ASAHI=y out/.config
+          grep -qx CONFIG_APPLE_PMP_REPORT=y out/.config
+          cp out/.config "$RUNNER_TEMP/asahi-stats.config"
+          make O=out rustavailable
+      - name: Build and link the ARM64 kernel
+        run: |
+          set -o pipefail
+          make O=out -j2 Image 2>&1 | tee "$RUNNER_TEMP/asahi-stats-build.log"
+          test -s out/drivers/gpu/drm/asahi/asahi_core.o
+          test -s out/drivers/pmdomain/apple/pmp-report.o
+          test -s out/arch/arm64/boot/Image
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: asahi-stats-build-evidence
+          path: |
+            ${{ runner.temp }}/asahi-stats.config
+            ${{ runner.temp }}/asahi-stats-build.log
+          retention-days: 14
+  dram-parser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install UML tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q flex bison bc libelf-dev libssl-dev
+      - name: Exercise the firmware-property parser under UML
+        run: |
+          cat > "$RUNNER_TEMP/dram.kunitconfig" <<'EOF'
+          CONFIG_KUNIT=y
+          CONFIG_PM=y
+          CONFIG_APPLE_PMP_DRAM_KUNIT_TEST=y
+          EOF
+          TMPDIR="$RUNNER_TEMP" python3 tools/testing/kunit/kunit.py run --timeout=120 --kunitconfig="$RUNNER_TEMP/dram.kunitconfig" --build_dir="$RUNNER_TEMP/kunit-dram" --jobs=2
