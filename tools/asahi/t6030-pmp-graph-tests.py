@@ -30,9 +30,10 @@ def main():
     entries = []
     for node in re.findall(r'report@[0-9a-f]+\s*\{(.*?)\n\s*\};', overlay, re.S):
         reg = int(re.search(r'reg = <(0x[0-9a-f]+|[0-9]+)>', node)[1], 0)
-        entries.append((reg, 'apple,always-on;' in node, 'apple,no-ack;' in node, 'apple,defer-startup-ack;' in node))
+        entries.append((reg, 'apple,always-on;' in node, 'apple,no-ack;' in node, 'apple,defer-startup-ack;' in node,
+                        'apple,irq-safe;' in node))
     assert len(entries) == 4
-    entry_data = ',\n'.join('{%d, %d, %d, %d}' % e for e in entries)
+    entry_data = ',\n'.join('{%d, %d, %d, %d, %d}' % e for e in entries)
     names = ['static int apple_pmp_report_bit(', 'static int apple_pmp_start_check_layout(',
              'static int apple_pmp_start_describe(', 'static void apple_pmp_start_finish(',
              'static bool apple_pmp_start_stopping(', 'static void apple_pmp_start_work(',
@@ -81,6 +82,8 @@ def main():
             ('ignore-startup-ack', '(ack & st->startup_ack) != st->startup_ack', 'false'),
             ('ignore-entry-ack', 'status == PMP_REPORT_READY && (ack & BIT_ULL(id))', '((void)ack, status == PMP_REPORT_READY)'),
             ('storage-ack-layout', 'st->ack & ~st->record_seed,', 'st->seed & ~st->record_seed,'),
+            ('ignore-irq-safe', 'ent->genpd.flags |= GENPD_FLAG_IRQ_SAFE;', '(void)0;'),
+            ('irq-safe-without-property', 'of_property_read_bool(node, "apple,irq-safe")', 'true'),
             ('skip-supplier-wait', 'apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms))', '((void)timeout_ms, 0)'),
         ]
         for name, old, new in controls:
