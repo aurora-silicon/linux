@@ -644,49 +644,12 @@ impl StatsChannel::ver {
                                 util3,
                                 util4,
                             } => {
-                                self.snap.util1.store(*util1, Ordering::Relaxed);
-                                self.snap.util2.store(*util2, Ordering::Relaxed);
-                                self.snap.util3.store(*util3, Ordering::Relaxed);
-                                self.snap.util4.store(*util4, Ordering::Relaxed);
-                                // busy_ns: utilization-weighted busy time in
-                                // nanoseconds. Each Utilization window
-                                // contributes its duration scaled by the
-                                // busiest subqueue's percentage. MEASURED on
-                                // T6021 (round-3 window): util1..4 read 100
-                                // across a saturated 30 s matmul and 0-2 on
-                                // an idle desktop, while FwBusy timestamp
-                                // deltas (the prior producer) covered 0.17%
-                                // of that matmul. The timestamps are base-
-                                // clock ticks (24 MHz), so convert to ns
-                                // once here. The kernel runtime has no
-                                // 128-bit division, so split whole seconds
-                                // from the tick remainder: whole seconds
-                                // contribute util * 1e7 ns each (1e9 / 100
-                                // exactly), the remainder contributes
-                                // rem * util * 1e9 / (100 * ts_hz), which
-                                // cannot overflow u64 (rem < ts_hz <= 24e6
-                                // on supported SoCs).
-                                let util = u64::from(
-                                    [*util1, *util2, *util3, *util4]
-                                        .into_iter()
-                                        .max()
-                                        .unwrap_or(0)
-                                        .min(100),
+                                self.snap.note_utilization(
+                                    &mut self.last_util_ts,
+                                    timestamp.0,
+                                    [*util1, *util2, *util3, *util4],
+                                    self.ts_hz,
                                 );
-                                let ts = timestamp.0;
-                                if self.last_util_ts != 0 && ts > self.last_util_ts {
-                                    let delta = ts - self.last_util_ts;
-                                    let whole_s = delta / self.ts_hz;
-                                    let rem = delta % self.ts_hz;
-                                    let busy = whole_s
-                                        .saturating_mul(util)
-                                        .saturating_mul(10_000_000)
-                                        .saturating_add(
-                                            rem * util * 1_000_000_000 / (100 * self.ts_hz),
-                                        );
-                                    self.snap.busy_ns.fetch_add(busy, Ordering::Relaxed);
-                                }
-                                self.last_util_ts = ts;
                             }
                             StatsMsg::ver::PowerState { pstate, .. } => {
                                 self.snap.pstate.store(*pstate, Ordering::Relaxed);
