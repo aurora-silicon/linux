@@ -346,16 +346,17 @@ static irqreturn_t function_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-/* Real MSIs need an MSI controller on the port (pcie-apple, pcie-apple-msi). The port has 32
- * vectors; Control and Alpha get up to 16 each. Without a controller the function keeps the
- * DMA mailbox below and the Wi-Fi data path is polled.
+/* Real MSIs need an MSI controller on the port (pcie-apple, pcie-apple-msi). The data rings
+ * name Alpha vectors 3 and 8, so a function gets all 16 vectors or none; one that gets none
+ * keeps the DMA mailbox below (polled). Alpha asks first: on the J873 the 10GbE NIC shares
+ * the controller's 32 vectors and only one block of 16 is left.
  */
 static int request_vectors(struct centauri *c, unsigned int function)
 {
 	struct pci_dev *pdev = c->ipc->function[function];
 	int count, i, ret;
 
-	count = pci_alloc_irq_vectors(pdev, 1, 16, PCI_IRQ_MSI);
+	count = pci_alloc_irq_vectors(pdev, 16, 16, PCI_IRQ_MSI);
 	if (count < 0)
 		return count;
 	for (i = 0; i < count; i++) {
@@ -392,7 +393,7 @@ static int enumerate_functions(struct centauri *c)
 	c->pdev->multifunction = 1;
 	pci_rescan_bus(c->pdev->bus);
 	pci_unlock_rescan_remove();
-	for (i = 0; i < 3; i++) {
+	for (i = 2; i >= 0; i--) {
 		ipc->function[i] = pci_get_domain_bus_and_slot(pci_domain_nr(c->pdev->bus),
 				c->pdev->bus->number, PCI_DEVFN(0, i));
 		if (!ipc->function[i] || ipc->function[i]->vendor != PCI_VENDOR_ID_APPLE ||
