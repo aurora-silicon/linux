@@ -31,12 +31,19 @@
 //! - `sampled_ns`: cumulative duration of the same windows. Windows can be
 //!   seconds long, so only `busy_ns / sampled_ns` over one interval is a
 //!   percentage; `busy_ns` over wall time is not.
+//! - `absent`: `ABSENT_*` keys the file leaves out. A key the firmware never
+//!   reports is missing rather than a permanent zero.
 //!
 //! This module is read-only with respect to scheduling or power behaviour:
 //! the firmware already sends the messages, the channel already polls them,
 //! we only retain the latest values.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// `agx_stats` keys left out by [`StatsSnapshot::absent`]. Mirrored in `sysfs.c`.
+pub(crate) const ABSENT_PSTATE: u32 = 1 << 0;
+pub(crate) const ABSENT_POWER: u32 = 1 << 1;
+pub(crate) const ABSENT_TEMPERATURE: u32 = 1 << 2;
 
 /// Per-device snapshot of AGX firmware stats.
 ///
@@ -63,6 +70,8 @@ pub(crate) struct StatsSnapshot {
     pub(crate) jobs: AtomicU64,
     /// Cumulative duration of the windows behind `busy_ns`.
     pub(crate) sampled_ns: AtomicU64,
+    /// `ABSENT_*` keys `agx_stats` leaves out.
+    pub(crate) absent: AtomicU32,
 }
 
 // Keep the Rust half of the C sysfs layout contract checked as well.
@@ -71,7 +80,8 @@ const _: () = {
     assert!(core::mem::offset_of!(StatsSnapshot, busy_ns) == 40);
     assert!(core::mem::offset_of!(StatsSnapshot, jobs) == 48);
     assert!(core::mem::offset_of!(StatsSnapshot, sampled_ns) == 56);
-    assert!(core::mem::size_of::<StatsSnapshot>() == 64);
+    assert!(core::mem::offset_of!(StatsSnapshot, absent) == 64);
+    assert!(core::mem::size_of::<StatsSnapshot>() == 72);
 };
 
 impl StatsSnapshot {

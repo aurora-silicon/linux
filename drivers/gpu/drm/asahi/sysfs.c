@@ -4,6 +4,7 @@
 // driver. The attribute wrapper is removed and its readers drained before
 // that Arc is dropped. Atomic fields may reflect different sample instants.
 
+#include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/export.h>
@@ -31,6 +32,7 @@ struct asahi_stats_snapshot {
 	u64 busy_ns;
 	u64 jobs;
 	u64 sampled_ns;
+	u32 absent;
 };
 
 /* Mirror of the repr(C) Rust `memacct::Ledger`, in bytes. */
@@ -42,6 +44,11 @@ struct asahi_gpu_memory {
 	u64 limit;
 	u64 client_limit;
 };
+
+/* Mirror of the Rust `stats::ABSENT_*` bits. */
+#define ASAHI_STATS_ABSENT_PSTATE	BIT(0)
+#define ASAHI_STATS_ABSENT_POWER	BIT(1)
+#define ASAHI_STATS_ABSENT_TEMPERATURE	BIT(2)
 
 struct asahi_stats_attribute {
 	struct device_attribute attr;
@@ -58,17 +65,21 @@ static ssize_t agx_stats_show(struct device *dev,
 		container_of(attr, struct asahi_stats_attribute, attr);
 	const struct asahi_stats_snapshot *snap = stats->snapshot;
 	ssize_t n = 0;
+	u32 absent;
 
 	if (!stats->export_enabled)
 		return sysfs_emit(buf, "unsupported\n");
+	absent = READ_ONCE(snap->absent);
 	n += scnprintf(buf + n, PAGE_SIZE - n, "busy_ns %llu\n",
 		       (unsigned long long)READ_ONCE(snap->busy_ns));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "jobs %llu\n",
 		       (unsigned long long)READ_ONCE(snap->jobs));
-	n += scnprintf(buf + n, PAGE_SIZE - n, "pstate %u\n",
-		       (u32)READ_ONCE(snap->pstate));
-	n += scnprintf(buf + n, PAGE_SIZE - n, "power_mw %u\n",
-		       (u32)READ_ONCE(snap->avg_power_mw));
+	if (!(absent & ASAHI_STATS_ABSENT_PSTATE))
+		n += scnprintf(buf + n, PAGE_SIZE - n, "pstate %u\n",
+			       (u32)READ_ONCE(snap->pstate));
+	if (!(absent & ASAHI_STATS_ABSENT_POWER))
+		n += scnprintf(buf + n, PAGE_SIZE - n, "power_mw %u\n",
+			       (u32)READ_ONCE(snap->avg_power_mw));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "util1 %u\n",
 		       (u32)READ_ONCE(snap->util1));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "util2 %u\n",
@@ -77,10 +88,12 @@ static ssize_t agx_stats_show(struct device *dev,
 		       (u32)READ_ONCE(snap->util3));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "util4 %u\n",
 		       (u32)READ_ONCE(snap->util4));
-	n += scnprintf(buf + n, PAGE_SIZE - n, "temperature_raw %u\n",
-		       (u32)READ_ONCE(snap->temperature_raw));
-	n += scnprintf(buf + n, PAGE_SIZE - n, "temperature_scale %u\n",
-		       (u32)READ_ONCE(snap->temperature_scale));
+	if (!(absent & ASAHI_STATS_ABSENT_TEMPERATURE)) {
+		n += scnprintf(buf + n, PAGE_SIZE - n, "temperature_raw %u\n",
+			       (u32)READ_ONCE(snap->temperature_raw));
+		n += scnprintf(buf + n, PAGE_SIZE - n, "temperature_scale %u\n",
+			       (u32)READ_ONCE(snap->temperature_scale));
+	}
 	n += scnprintf(buf + n, PAGE_SIZE - n, "sampled_ns %llu\n",
 		       (unsigned long long)READ_ONCE(snap->sampled_ns));
 
@@ -137,7 +150,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 40);
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, jobs) != 48);
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, sampled_ns) != 56);
-	BUILD_BUG_ON(sizeof(struct asahi_stats_snapshot) != 64);
+	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, absent) != 64);
+	BUILD_BUG_ON(sizeof(struct asahi_stats_snapshot) != 72);
 
 	stats = kzalloc_obj(*stats);
 	if (!stats)

@@ -74,5 +74,7 @@ Description:
 		`#[repr(C)]` on the Rust side and its offsets are asserted at
 		build time in `sysfs.c`; readers must parse `key value` lines and
 		must not assume binary layout of this file.
+
+		A key the firmware does not report is absent rather than zero.
 		G17 firmware has no supported decoder for this snapshot format;
 		its file reports unsupported rather than fabricated zero counters.
