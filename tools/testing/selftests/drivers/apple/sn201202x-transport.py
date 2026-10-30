@@ -92,7 +92,8 @@ static int spmi_ext_register_read(struct spmi_device *s,unsigned off,void *val,s
     } poll_ret; })
 #define SN201202X_ATOMIC_SELECT_MS 10
 #define read_poll_timeout_atomic read_poll_timeout
-''' + function(source, "regmap_sn201202x_select_reg") + function(source, "regmap_sn201202x_read") + r'''
+''' + function(source, "regmap_sn201202x_select_reg") + function(source, "__regmap_sn201202x_read") + r'''
+#define regmap_sn201202x_read __regmap_sn201202x_read
 static void clean(struct spmi_device *s)
 {
     memset(s,0,sizeof(*s)); s->dev.of_node=s; s->tps.dev=&s->dev;
