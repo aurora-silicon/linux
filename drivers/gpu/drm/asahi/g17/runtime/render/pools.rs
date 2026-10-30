@@ -82,8 +82,19 @@ impl Pools {
         if pool.vacant() {
             return Err(EAGAIN);
         }
-        self.observe(init)?;
         let slot = Self::slot(pool.id())?;
+        // Only the selected registration gates this acquisition. Other pools'
+        // releases are observed by the event worker's full collector. Most
+        // warm renders have no release witness, so read no control-ring memory.
+        if let Some(lease) = self.leases[slot].as_mut() {
+            lease.observe_pending_release(|| {
+                fence(Ordering::Acquire);
+                Ok((
+                    init.control_consumer()?.load(Ordering::Relaxed),
+                    init.control_producer()?.load(Ordering::Relaxed),
+                ))
+            })?;
+        }
         let owner = Self::owner(pool);
         let previous = self.leases[slot];
         if previous.is_some_and(|lease| lease.owner() != owner && !lease.released()) {

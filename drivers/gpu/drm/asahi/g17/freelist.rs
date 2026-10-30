@@ -840,6 +840,73 @@ impl Lease {
         }
         Ok(())
     }
+
+    /// Read control cursors only when this registration has a release to
+    /// observe. A warm overlapping or lingering owner with no older witness
+    /// cannot change state in `observe_releases`.
+    pub(crate) fn observe_pending_release(
+        &mut self,
+        cursors: impl FnOnce() -> Result<(u32, u32)>,
+    ) -> Result {
+        if self.release_witness().is_none() {
+            return Ok(());
+        }
+        let (consumer, producer) = cursors()?;
+        self.observe_releases(consumer, producer)
+    }
+}
+
+#[kunit_tests(asahi_g17_pool_observation)]
+mod observation_tests {
+    use super::*;
+
+    fn owner() -> Owner {
+        Owner {
+            serial: 1, epoch: 1, buffer_slot: 129,
+            control_va: 0x1000, ring_va: 0x2000, cookie: 0x3000,
+        }
+    }
+
+    #[test]
+    fn warm_and_lingering_owners_need_no_control_snapshot() {
+        let mut lease = Lease::acquire(None, owner()).unwrap();
+        lease.observe_pending_release(|| panic!("fresh owner has no witness")).unwrap();
+        lease.retire_prepare().unwrap();
+        lease.observe_pending_release(|| panic!("warm owner has no witness")).unwrap();
+        lease.complete_render(true).unwrap();
+        lease.observe_pending_release(|| panic!("linger has no witness")).unwrap();
+        let mut next = Lease::acquire(Some(&lease), owner()).unwrap();
+        next.observe_pending_release(|| panic!("overlap has no witness")).unwrap();
+    }
+
+    #[test]
+    fn reacquisition_keeps_the_unconsumed_release_witness() {
+        let mut lease = Lease::acquire(None, owner()).unwrap();
+        lease.retire_prepare().unwrap();
+        lease.complete_render(false).unwrap();
+        lease.mark_release_sent(3).unwrap();
+        let mut next = Lease::acquire(Some(&lease), owner()).unwrap();
+        assert_eq!(next.release_witness(), Some(3));
+        next.observe_pending_release(|| Ok((1, 3))).unwrap();
+        assert_eq!(next.release_witness(), Some(3));
+        next.observe_pending_release(|| Ok((3, 3))).unwrap();
+        assert_eq!(next.release_witness(), None);
+        next.observe_pending_release(|| panic!("witness was already consumed")).unwrap();
+    }
+
+    #[test]
+    fn pending_observation_preserves_errors_and_release_state() {
+        let mut lease = Lease::acquire(None, owner()).unwrap();
+        lease.retire_prepare().unwrap();
+        lease.complete_render(false).unwrap();
+        lease.mark_release_sent(3).unwrap();
+        assert_eq!(lease.observe_pending_release(|| Err(EIO)), Err(EIO));
+        assert_eq!(lease.release_witness(), Some(3));
+        assert_eq!(lease.observe_pending_release(|| Ok((u32::MAX, 3))), Err(EIO));
+        assert!(!lease.released());
+        lease.observe_pending_release(|| Ok((3, 3))).unwrap();
+        assert!(lease.released());
+    }
 }
 
 /// A publication is retired once its producer-after cursor leaves the
