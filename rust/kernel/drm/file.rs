@@ -147,7 +147,7 @@ impl<T: DriverFile> File<T> {
             unsafe {
                 bindings::drm_printf(
                     printer,
-                    c"drm-engine-%s:\t%llu ns\n".as_ptr(),
+                    c"drm-engine-%s:\t%llu ns\n".as_char_ptr(),
                     name.as_char_ptr(),
                     ns as core::ffi::c_ulonglong,
                 )
@@ -180,7 +180,9 @@ impl<T: DriverFile> File<T> {
 
         // SAFETY: `printer` is the printer `drm_show_fdinfo()` passes, valid for this call; `raw`
         // and the region name outlive the call.
-        unsafe { bindings::drm_print_memory_stats(printer, &raw, supported, c"system".as_ptr()) };
+        unsafe {
+            bindings::drm_print_memory_stats(printer, &raw, supported, c"system".as_char_ptr())
+        };
     }
 
     /// The postclose callback of a `struct drm_file`.
