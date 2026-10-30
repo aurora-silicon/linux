@@ -58,7 +58,11 @@ properties:
       - const: ane
 
   iommus:
-    maxItems: 3
+    description:
+      Stream 0 of each of the three DARTs, followed on T6041 by stream 11 of
+      each, which the ANE's MPM uses.
+    minItems: 3
+    maxItems: 6
 
   power-domains:
     description:
@@ -106,6 +110,12 @@ allOf:
       properties:
         interrupts:
           maxItems: 1
+        iommus:
+          minItems: 6
+    else:
+      properties:
+        iommus:
+          maxItems: 3
   - if:
       properties:
         compatible:
