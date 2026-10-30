@@ -2587,6 +2587,10 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     fw_regions: true,
     halt_on_failed_start: true,
 };
+/// T8132 (J713): as T6040. The bootloader hands the AOP over the same way, with
+/// the DART's DAPF programmed and its windows reserved alongside the firmware
+/// segments.
+const HW_CFG_T8132: AopHwConfig = HW_CFG_T6040;
 /// T8140: the firmware is started with the boot arguments the bootloader
 /// left, boots through the setup port and speaks EPIC version 4. Of the
 /// advertised AFK endpoints, the application map is 0x20 misc, 0x21
@@ -2615,6 +2619,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
+        (of::DeviceId::new(c_str!("apple,t8132-aop")), &HW_CFG_T8132),
     ]
 );
 
