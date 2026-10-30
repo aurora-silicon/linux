@@ -2082,6 +2082,7 @@ W:	https://aurora-silicon.github.io
 S:	Maintained
 F:	Documentation/devicetree/bindings/cpu/apple,t8140-cpuidle.yaml
 F:	Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
+F:	Documentation/devicetree/bindings/dma/apple,t8140-pcie-bootstrap.yaml
 F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
 F:	drivers/pmdomain/apple/pmp-report.c
