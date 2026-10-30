@@ -32,7 +32,7 @@ static struct pmp_dram_fixture *pmp_dram_fixture(struct kunit *test, u32 count,
 
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, f);
-	f->ref[0].node = &f->nodes[1];
+	f->ref[0] = SOFTWARE_NODE_REFERENCE(&f->nodes[1]);
 	f->props[0] = PROPERTY_ENTRY_STRING("apple,dram-type", "lpddr5");
 	f->props[1] = PROPERTY_ENTRY_U32("apple,data-bus-width", width);
 	f->props[2] = PROPERTY_ENTRY_U32("apple,dcs-state-count", count);
@@ -255,4 +255,5 @@ static struct kunit_suite pmp_dram_suite = {
 
 kunit_test_suite(pmp_dram_suite);
 
+MODULE_DESCRIPTION("KUnit tests for Apple PMP DRAM property parsing");
 MODULE_LICENSE("Dual MIT/GPL");
