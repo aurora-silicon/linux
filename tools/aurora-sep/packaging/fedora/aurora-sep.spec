@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        9%{?dist}
+Release:        10%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -155,6 +155,9 @@ fi
 %ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Fri Oct 30 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-10
+- Add the Linux-lane orphan identity list and delete tool
+
 * Wed Oct 28 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-9
 - Start the login screen without waiting for Touch ID, and show it again
   once Touch ID is ready if nobody has logged in yet
@@ -163,7 +166,6 @@ fi
   the record a boot policy change makes the enclave rewrite
 - aurora-sep-policy-change: back up the gigalocker and allow that one
   rewrite on the next boot, so Touch ID survives a boot policy change
-- Add the Linux-lane orphan identity list and delete tool
 
 * Mon Oct 19 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-7
 - XART-SAFETY.md: what the xART guard allows for restore, use, setup and
