@@ -68,57 +68,6 @@ static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
-static bool tunnel_kernel_init = true;
-module_param(tunnel_kernel_init, bool, 0444);
-MODULE_PARM_DESC(tunnel_kernel_init,
-		 "Cold-initialize T600x/T602x PCIe-C ports without an m1n1 handoff (default: on)");
-
-static const char *const apple_pcie_tunnel_cold_init_machines[] = {
-	"apple,t6000", "apple,t6001", "apple,t6020", "apple,t6021", NULL
-};
-
-/**
- * apple_pcie_tunnel_needs_cold_init() - whether the kernel brings up a port
- * @np: PCIe-C host node
- *
- * No m1n1 performs the PCIe-C preinit handoff on T600x/T602x, so the kernel
- * cold-initializes these ports instead; pcie_apple.tunnel_kernel_init=0 turns
- * that off. It is a parameter rather than a DT property because m1n1 hands
- * every installed kernel the same DT. The tunnel's DART cannot probe without
- * its tunables, which m1n1 does not provide, so ports whose DART lacks them
- * are refused.
- *
- * Unlike "apple,pciec-kernel-init" (t8103), this does not select the t8103
- * power and resume sequences.
- */
-bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
-{
-	struct of_phandle_args iommu_spec = {};
-	struct device_node *dart;
-	bool tunables;
-	u32 status;
-
-	if (!tunnel_kernel_init ||
-	    !of_device_is_compatible(np, "apple,t6000-pciec") ||
-	    !of_machine_compatible_match(apple_pcie_tunnel_cold_init_machines))
-		return false;
-
-	if (!of_property_read_u32(np, "apple,pciec-preinit-status", &status) &&
-	    status == 1)
-		return false;
-
-	if (of_map_iommu_id(np, 0, &iommu_spec) || !iommu_spec.np)
-		return false;
-	dart = iommu_spec.np;
-	tunables = of_property_present(dart, "apple,tunable");
-	if (!tunables)
-		pr_warn_once("%pOF: no PCIe-C DART tunables, not cold-initializing\n",
-			     dart);
-	of_node_put(dart);
-	return tunables;
-}
-EXPORT_SYMBOL_GPL(apple_pcie_tunnel_needs_cold_init);
-
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
 #define   CORE_RC_PHYIF_CTL_RUN		BIT(0)
@@ -250,6 +199,7 @@ struct hw_info {
 	bool retain_clocks;
 	bool root_bus_only;
 	bool tunneled;
+	bool tunnel_intr2axi;
 };
 
 static const struct hw_info t8103_hw = {
@@ -301,6 +251,16 @@ static const struct hw_info t8103_pciec_hw = {
 	.tunneled		= true,
 };
 
+/* T600x and T8112 use Intr2AXI instead of the T8103 oe-fabric. */
+static const struct hw_info t8112_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.max_rid2sid		= 64,
+	.tunneled		= true,
+	.tunnel_intr2axi		= true,
+};
+
 /*
  * t8122 PCIe-C keeps the t8103 doorbell and RID2SID registers, but MSI
  * delivery uses the t602x map. The map is indexed by the MSI data, and
@@ -314,6 +274,46 @@ static const struct hw_info t8122_pciec_hw = {
 	.max_rid2sid		= 64,
 	.tunneled		= true,
 };
+
+static const struct of_device_id apple_pcie_of_match[];
+
+/**
+ * apple_pcie_tunnel_needs_cold_init() - whether the kernel brings up a port
+ * @np: PCIe-C host node
+ *
+ * DT selects kernel initialization; match data selects the hardware sequence.
+ * Never reset a qualified firmware handoff. Intr2AXI controllers also need
+ * DART tunables before ACIO may populate their cable-powered children.
+ */
+bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
+{
+	const struct of_device_id *match = of_match_node(apple_pcie_of_match, np);
+	struct of_phandle_args iommu_spec = {};
+	const struct hw_info *hw;
+	bool tunables;
+	u32 status;
+
+	if (!match || !of_property_read_bool(np, "apple,pciec-kernel-init"))
+		return false;
+	hw = match->data;
+	if (!hw->tunneled)
+		return false;
+	if (!of_property_read_u32(np, "apple,pciec-preinit-status", &status) &&
+	    status == 1)
+		return false;
+	if (!hw->tunnel_intr2axi)
+		return true;
+
+	if (of_map_iommu_id(np, 0, &iommu_spec) || !iommu_spec.np)
+		return false;
+	tunables = of_property_present(iommu_spec.np, "apple,tunable");
+	if (!tunables)
+		pr_warn_once("%pOF: no PCIe-C DART tunables, not cold-initializing\n",
+			     iommu_spec.np);
+	of_node_put(iommu_spec.np);
+	return tunables;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_tunnel_needs_cold_init);
 
 struct apple_pcie {
 	struct mutex		lock;
@@ -991,9 +991,9 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 }
 
 /*
- * Bring up a port that no firmware handoff left running (t8103, or
- * T600x/T602x with pcie_apple.tunnel_kernel_init): tunables and the reset
- * table, then PERST and APPCLK, and only then the root-port config-space
+ * Bring up a port selected by apple,pciec-kernel-init that no firmware
+ * handoff left running: tunables and the reset table, then PERST and APPCLK,
+ * and only then the root-port config-space
  * tunables. Stop before releasing the tunnel reset or starting link
  * training.
  */
@@ -1668,8 +1668,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		 * m1n1 owns PCIe-C cold initialization on T6020. Replaying the
 		 * port reset against that live handoff raises an asynchronous
 		 * SError. t8103 boots with ATC_PCIE off and no handoff, so
-		 * apple,pciec-kernel-init selects the in-kernel sequence, as
-		 * pcie_apple.tunnel_kernel_init does on T600x/T602x.
+		 * apple,pciec-kernel-init selects the in-kernel sequence on each
+		 * supported generation.
 		 */
 		ret = of_property_read_u32(pcie->dev->of_node,
 					   "apple,pciec-preinit-status",
@@ -1688,7 +1688,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			}
 		} else if (!preinit_ok) {
 			dev_err(pcie->dev,
-				"PCIe-C requires an m1n1 preinit handoff or pcie_apple.tunnel_kernel_init=1\n");
+				"PCIe-C requires a firmware handoff or apple,pciec-kernel-init\n");
 			ret = -ENODEV;
 			goto err_teardown;
 		} else {
@@ -2889,9 +2889,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		return PTR_ERR(pcie->base);
 	if (pcie->hw->tunneled) {
 		pcie->kernel_init =
-			of_device_is_compatible(dev->of_node, "apple,t8103-pciec") &&
+			!hw->tunnel_intr2axi &&
 			of_property_read_bool(dev->of_node, "apple,pciec-kernel-init");
-		pcie->tunnel_cold_init =
+		pcie->tunnel_cold_init = hw->tunnel_intr2axi &&
 			apple_pcie_tunnel_needs_cold_init(dev->of_node);
 		ret = apple_pcie_tunnel_init_resources(pdev, pcie);
 		if (ret)
@@ -3288,12 +3288,11 @@ static struct apple_tunable *apple_pcie_tunable_once(struct device_node *np,
  * probes immediately and its invalidate command never completes while
  * APPCLK is still gated.
  */
-static const struct of_device_id apple_pcie_of_match[];
-
 int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 {
 	struct device_node *np, *port_np = NULL;
 	const struct of_device_id *match;
+	const struct hw_info *hw;
 	struct apple_pcie *pcie;
 	struct apple_pcie_port *port;
 	struct apple_pcie_map config = {}, debug = {}, fabric = {}, portmap = {};
@@ -3304,9 +3303,7 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 
 	np = NULL;
 	for_each_available_child_of_node(tunnel, np) {
-		kernel_init = of_device_is_compatible(np, "apple,t8103-pciec") &&
-			      of_property_read_bool(np, "apple,pciec-kernel-init");
-		if (kernel_init || apple_pcie_tunnel_needs_cold_init(np))
+		if (apple_pcie_tunnel_needs_cold_init(np))
 			break;
 	}
 	if (!np)
@@ -3324,6 +3321,8 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 		ret = -ENODEV;
 		goto out_np;
 	}
+	hw = match->data;
+	kernel_init = !hw->tunnel_intr2axi;
 
 	ret = apple_pcie_map_named(np, "port0", &portmap);
 	if (ret)
@@ -3720,8 +3719,9 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 
 static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
+	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
-	{ .compatible = "apple,t6000-pciec",	.data = &t8103_pciec_hw },
+	{ .compatible = "apple,t6000-pciec",	.data = &t8112_pciec_hw },
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },

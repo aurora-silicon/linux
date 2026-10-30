@@ -114,6 +114,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy',
                                    'usb-rpm', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
+    'pciec-policy-tests.py': [(out(), PASS)],
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
