@@ -105,6 +105,7 @@
 			     <43 IRQ_TYPE_EDGE_RISING>,
 			     <45 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "sleep", "wake";
+		wakeup-source;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -139,6 +140,7 @@
 			     <17 IRQ_TYPE_EDGE_RISING>,
 			     <19 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "sleep", "wake";
+		wakeup-source;
 
 		typec0: connector {
 			compatible = "usb-c-connector";

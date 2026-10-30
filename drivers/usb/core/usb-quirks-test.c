@@ -53,6 +53,19 @@ static void usb_quirks_vl122_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, usb_hub_id_quirks(&t->intf) & HUB_QUIRK_DISABLE_AUTOSUSPEND);
 }
 
+/*
+ * The VIA Labs VL822 USB 2.0 hub passes on no remote wakeup from below while it
+ * is suspended. It is kept awake in suspend-to-idle and keeps its autosuspend.
+ */
+static void usb_quirks_vl822_test(struct kunit *test)
+{
+	struct usb_quirks_test *t = usb_quirks_test_hub(test, 0x2109, 0x2822);
+
+	KUNIT_EXPECT_EQ(test, usb_detect_device_list_quirks(&t->udev),
+			USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP);
+	KUNIT_EXPECT_EQ(test, usb_hub_id_quirks(&t->intf), 0UL);
+}
+
 /* Another VIA Labs hub keeps its own device quirk and no hub quirk. */
 static void usb_quirks_other_via_hub_test(struct kunit *test)
 {
@@ -73,6 +86,7 @@ static void usb_quirks_generic_hub_test(struct kunit *test)
 
 static struct kunit_case usb_quirks_test_cases[] = {
 	KUNIT_CASE(usb_quirks_vl122_test),
+	KUNIT_CASE(usb_quirks_vl822_test),
 	KUNIT_CASE(usb_quirks_other_via_hub_test),
 	KUNIT_CASE(usb_quirks_generic_hub_test),
 	{}

@@ -43,7 +43,7 @@ typedef uint8_t u8;
 struct completion { int unused; };
 struct device { void *of_node; };
 struct tps6598x { struct device *dev; };
-struct sn201202x { bool polled, select_polled; struct completion select_completion; };
+struct sn201202x { bool polled, select_polled, atomic; struct completion select_completion; };
 struct spmi_device { struct device dev; struct tps6598x tps; };
 static struct sn201202x sn;
 static u8 selected, advertised;
@@ -90,7 +90,10 @@ static int spmi_ext_register_read(struct spmi_device *s,unsigned off,void *val,s
     for(unsigned attempt=0;attempt<8;attempt++) { \
         (ret)=op(__VA_ARGS__); if(condition) { poll_ret=0; break; } \
     } poll_ret; })
-''' + function(source, "regmap_sn201202x_select_reg") + function(source, "regmap_sn201202x_read") + r'''
+#define SN201202X_ATOMIC_SELECT_MS 10
+#define read_poll_timeout_atomic read_poll_timeout
+''' + function(source, "regmap_sn201202x_select_reg") + function(source, "__regmap_sn201202x_read") + r'''
+#define regmap_sn201202x_read __regmap_sn201202x_read
 static void clean(struct spmi_device *s)
 {
     memset(s,0,sizeof(*s)); s->dev.of_node=s; s->tps.dev=&s->dev;
@@ -105,6 +108,10 @@ int main(void)
     struct spmi_device s;
     u8 reg=0x5f, out[64];
     clean(&s); memset(out,0xa5,sizeof(out));
+    assert(!regmap_sn201202x_read(&s,&reg,1,out,4));
+    assert(writes==1 && polls==3 && completed && length_reads==1 && payload_reads==1);
+    assert(bytes==4 && out[0]==0 && out[3]==3 && out[4]==0xa5);
+    clean(&s); sn.atomic=true; memset(out,0xa5,sizeof(out));
     assert(!regmap_sn201202x_read(&s,&reg,1,out,4));
     assert(writes==1 && polls==3 && completed && length_reads==1 && payload_reads==1);
     assert(bytes==4 && out[0]==0 && out[3]==3 && out[4]==0xa5);
@@ -147,7 +154,7 @@ int main(void)
     return 0;
 }
 '''
-    busy = program.replace("err || val == reg", "err || (val & 0x7f) == reg", 1)
+    busy = program.replace("err || val == reg", "err || (val & 0x7f) == reg")
     unchecked = program.replace(
         'if (of_device_is_compatible(sdev->dev.of_node, "apple,t8132-sn201202x"))',
         'if (false)', 1)

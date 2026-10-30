@@ -40,6 +40,7 @@
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
@@ -6139,8 +6140,16 @@ static int atcphy_suspend(struct device *dev)
 		return 0;
 
 	guard(mutex)(&atcphy->lock);
-	/* Active and incomplete common epochs have no qualified sleep handoff. */
-	if (atcphy->t8132_common_owned || atcphy->mode_dirty)
+	/* An incomplete common epoch has no qualified sleep handoff. */
+	if (atcphy->mode_dirty)
+		return -EBUSY;
+	/*
+	 * An active one survives suspend-to-idle while a host runs on it: DWC3
+	 * then keeps the power domain on across system sleep, so the link stays
+	 * as it is. Without a host, or in a deeper sleep state, it is lost.
+	 */
+	if (atcphy->t8132_common_owned &&
+	    (!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE))
 		return -EBUSY;
 	/* Do not admit a new epoch after this check and before resume. */
 	atcphy->t8132_suspended = true;
@@ -6159,6 +6168,9 @@ static int atcphy_resume(struct device *dev)
 
 	guard(mutex)(&atcphy->lock);
 	atcphy->t8132_suspended = false;
+	if (atcphy->t8132_common_owned && atcphy->host_active &&
+	    READ_ONCE(atcphy->pd_was_off))
+		dev_warn(dev, "power domain went off under an active USB3 link\n");
 	/*
 	 * A suspended PHY holds nothing, and its domain may drop again once system
 	 * resume completes: leave the restore to its next operation.

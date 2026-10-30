@@ -22,6 +22,7 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/export.h>
 #include <linux/fs.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -33,11 +34,18 @@
 
 #define TPS_REG_MAX	0x7f
 
-struct tipd_debugfs {
-	struct dentry *dentry;
-	/* Open "command" files that entered "DBMa"; protected by tps->lock */
-	unsigned int dbma_holders;
-};
+/*
+ * Whether an open "command" file holds the controller in "DBMa". Read
+ * without tps->lock, by runtime suspend: remove unregisters only once the
+ * bus has woken the controller, so no runtime suspend runs then.
+ */
+bool tipd_debugfs_dbma_held(struct tps6598x *tps)
+{
+	struct tipd_debugfs *debugfs = READ_ONCE(tps->debugfs);
+
+	return debugfs && READ_ONCE(debugfs->dbma_holders);
+}
+EXPORT_SYMBOL_GPL(tipd_debugfs_dbma_held);
 
 struct tipd_debugfs_cmd {
 	char cmd[4];
