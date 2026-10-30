@@ -199,9 +199,13 @@ static size_t ave_pad(size_t size)
 	return size + SZ_64K;
 }
 
+/*
+ * Working buffers keep a kernel mapping so that, when a session ends, the
+ * driver can see how far past each reported size the firmware wrote.
+ */
 static int ave_work_buf(struct ave_dev *ave, struct ave_buf *b, size_t size)
 {
-	return ave_alloc_padded(ave, b, size, ave_pad(size), DMA_ATTR_NO_KERNEL_MAPPING);
+	return ave_alloc_padded(ave, b, size, ave_pad(size), 0);
 }
 
 /* Working buffer sizes, all from the requested picture size. */
@@ -212,7 +216,6 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
 	u32 h32 = DIV_ROUND_UP(h, 32), w64 = DIV_ROUND_UP(w, 64), h64 = DIV_ROUND_UP(h, 64);
-	const unsigned long nomap = DMA_ATTR_NO_KERNEL_MAPPING;
 	size_t ref_a, ref_b, ref_c, ref_d, tile, frame_buf;
 	int ret = 0;
 
@@ -224,7 +227,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 
 	ret |= ave_work_buf(ave, &sess->hdr, AVE_HDR_BYTES);
 	for (unsigned int i = 0; i < p->refs; i++) {
-		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ave_pad(ref_a * 3 / 2), nomap);
+		ret |= ave_alloc_padded(ave, &sess->ref_a[i], ref_a, ave_pad(ref_a * 3 / 2), 0);
 		ret |= ave_work_buf(ave, &sess->ref_b[i], ref_b);
 		ret |= ave_work_buf(ave, &sess->ref_c[i], ref_c);
 		ret |= ave_work_buf(ave, &sess->ref_d[i], ref_d);
@@ -318,6 +321,57 @@ static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 	}
 }
 
+/*
+ * How far did the firmware write past the size it was given? The margin
+ * behind each buffer was zero when allocated. A write reaching the end of
+ * the mapping may have gone on into the next buffer.
+ */
+static void ave_check_tail(struct ave_dev *ave, const char *name, int i,
+			   const struct ave_buf *b)
+{
+	const u8 *p = b->cpu;
+	size_t end;
+
+	if (!p || b->attrs & DMA_ATTR_NO_KERNEL_MAPPING || b->alloc <= b->size)
+		return;
+	for (end = b->alloc; end > b->size && !p[end - 1]; end--)
+		;
+	if (end == b->size)
+		return;
+	if (end == b->alloc)
+		dev_warn(ave->dev, "buf %s%d: firmware wrote to the end of its mapping (+%#zx, size %#zx)\n",
+			 name, i, b->alloc, b->size);
+	else
+		dev_info(ave->dev, "buf %s%d: firmware wrote %#zx bytes past its size %#zx\n",
+			 name, i, end - b->size, b->size);
+}
+
+static void ave_sess_check_tails(struct ave_dev *ave, struct ave_session *sess)
+{
+	ave_check_tail(ave, "hdr", 0, &sess->hdr);
+	ave_check_tail(ave, "mb", 0, &sess->mb);
+	ave_check_tail(ave, "row_a", 0, &sess->row_a);
+	ave_check_tail(ave, "row_b", 0, &sess->row_b);
+	ave_check_tail(ave, "fixed", 0, &sess->fixed);
+	for (int i = 0; i < 2; i++)
+		ave_check_tail(ave, "hevc_extra", i, &sess->hevc_extra[i]);
+	for (int i = 0; i < AVE_MAX_REFS; i++) {
+		ave_check_tail(ave, "ref_a", i, &sess->ref_a[i]);
+		ave_check_tail(ave, "ref_b", i, &sess->ref_b[i]);
+		ave_check_tail(ave, "ref_c", i, &sess->ref_c[i]);
+		ave_check_tail(ave, "ref_d", i, &sess->ref_d[i]);
+	}
+	for (int i = 0; i < AVE_TILE_BUFS; i++) {
+		ave_check_tail(ave, "tile", i, &sess->tile[i]);
+		ave_check_tail(ave, "tile_aux", i, &sess->tile_aux[i]);
+	}
+	for (int i = 0; i < AVE_MAX_SLOTS; i++) {
+		ave_check_tail(ave, "coded", i, &sess->slot[i].coded);
+		ave_check_tail(ave, "meta", i, &sess->slot[i].meta);
+		ave_check_tail(ave, "aux", i, &sess->slot[i].aux);
+	}
+}
+
 /* Work out the parameters and allocate the buffers; no firmware access. */
 struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 {
@@ -356,10 +410,13 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 
 	if (!sess)
 		return;
-	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN)
+	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN) {
 		dev_warn(ctx->ave->dev, "keeping the buffers of a failed session\n");
-	else
+	} else {
+		if (sess->handed)
+			ave_sess_check_tails(ctx->ave, sess);
 		ave_sess_free_bufs(ctx->ave, sess);
+	}
 	kfree(sess);
 	ctx->sess = NULL;
 }

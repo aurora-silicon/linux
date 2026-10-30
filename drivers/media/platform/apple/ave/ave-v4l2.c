@@ -564,7 +564,8 @@ static int ave_buf_prepare(struct vb2_buffer *vb)
 
 	if (vb2_plane_size(vb, 0) < f->plane_fmt[0].sizeimage)
 		return -EINVAL;
-	if (V4L2_TYPE_IS_OUTPUT(vb->type))
+	/* Keep what the client filled in, so its layout can be checked. */
+	if (V4L2_TYPE_IS_OUTPUT(vb->type) && !vb2_get_plane_payload(vb, 0))
 		vb2_set_plane_payload(vb, 0, f->plane_fmt[0].sizeimage);
 	return 0;
 }
@@ -877,6 +878,30 @@ static bool ave_frame_answered(struct ave_dev *ave, void *arg)
 	return !s->busy;
 }
 
+/*
+ * The encoder reads NV12 with the 64-byte aligned stride S_FMT reported.
+ * ffmpeg's v4l2m2m encoder copies frames with its own line size instead,
+ * which differs when the width is not a multiple of 64; the result is a
+ * sheared picture. Spot that from the payload size and refuse it.
+ */
+static int ave_check_src_layout(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src)
+{
+	const struct ave_params *p = &ctx->sess->p;
+	u32 used = vb2_get_plane_payload(&src->vb2_buf, 0);
+	u32 rows = p->height + DIV_ROUND_UP(p->height, 2);
+	u32 stride;
+
+	if (!used || used % rows)
+		return 0;
+	stride = used / rows;
+	if (stride >= p->stride || stride < p->width)
+		return 0;
+	dev_err(ctx->ave->dev,
+		"OUTPUT frame laid out with a %u byte stride, not the %u reported by S_FMT\n",
+		stride, p->stride);
+	return -EINVAL;
+}
+
 /* Send the next OUTPUT frame. Caller holds hw_lock. */
 static int ave_encode_one(struct ave_ctx *ctx)
 {
@@ -904,6 +929,12 @@ static int ave_encode_one(struct ave_ctx *ctx)
 		return 0;
 	last = src == ctx->drain_src;
 	src->sequence = ctx->src_sequence++;
+
+	ret = ave_check_src_layout(ctx, src);
+	if (ret) {
+		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
+		return ret;
+	}
 
 	ret = ave_cmd_process(ctx, slot, src, READ_ONCE(ctx->bitrate),
 			      xchg(&ctx->force_key_frame, false));
