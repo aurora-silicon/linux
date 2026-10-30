@@ -14,10 +14,11 @@ Co-authored by DJ (DjDeveloperr), Ace (Acelogic), and Ryan Murray.
 Platform and configuration
 --------------------------
 
-Use the separately reviewed T8140 PCIe bootstrap described in
-``Documentation/PCI/controller/apple-t8140.rst``. It runs during boot when
-``CONFIG_PCIE_APPLE_PIODMA_DIAG=y``. Public m1n1 must populate the J700
-``wifi0`` endpoint's own ``local-mac-address``; a zero placeholder is rejected.
+Use the T8140 PCIe bootstrap described in
+``Documentation/PCI/controller/apple-t8140.rst``. Build the provider with
+``CONFIG_PCIE_APPLE_T8140_BOOTSTRAP=y`` and select it through reciprocal
+host/engine DT links. Public m1n1 must populate the J700 ``wifi0`` endpoint's
+own ``local-mac-address``; a zero placeholder is rejected.
 
 The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
 ``CONFIG_CFG80211=m``, ``CONFIG_BT_MTK7932_PCIE=m``, ``CONFIG_BT_BREDR=y``,

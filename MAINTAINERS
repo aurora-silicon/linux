@@ -2119,12 +2119,12 @@ F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-parser-test.c
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
+F:	drivers/pci/controller/pcie-apple-t8140-bootstrap*
 F:	drivers/phy/apple/atc-j700-dp.h
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
 F:	drivers/tty/serial/apple_dockchannel*
-F:	drivers/pci/controller/pcie-apple-piodma*
 F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
@@ -2132,6 +2132,7 @@ F:	sound/soc/apple/aop_t8140.rs
 F:	tools/asahi/mt7932*
 F:	tools/testing/apple/
 F:	tools/testing/kunit/configs/apple_firmware.config
+F:	tools/testing/kunit/configs/apple_t8140_bootstrap.config
 F:	tools/testing/kunit/configs/mt7932.config
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 

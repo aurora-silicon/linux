@@ -7,7 +7,7 @@
 
 struct pci_dev;
 
-#if IS_ENABLED(CONFIG_PCIE_APPLE_PIODMA_DIAG)
+#if IS_ENABLED(CONFIG_PCIE_APPLE_T8140_BOOTSTRAP)
 /* Require completed Neo admission and permanent retained-DMA protection. */
 int apple_piodma_radio_check(struct pci_dev *pdev);
 #else
