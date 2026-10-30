@@ -992,6 +992,17 @@ static void ave_poll_work(struct work_struct *work)
 	mutex_lock(&ave->hw_lock);
 	if (ctx->sess && ave->active == ctx && !ctx->sess->dead) {
 		fail = ave_ipc_pump(ave, 0, NULL, NULL) != 0;
+		if (!fail && ave_sess_stalled(ctx->sess)) {
+			/*
+			 * The firmware holds frames it should have answered.
+			 * Treat it as stuck, so the session fails now instead
+			 * of leaving the client waiting.
+			 */
+			dev_err(ave->dev, "%u frames unanswered for %u ms; firmware is stuck\n",
+				ctx->sess->busy, AVE_FRAME_WAIT_MS);
+			ave->fw_state = AVE_FW_BROKEN;
+			fail = true;
+		}
 		again = !fail && ctx->sess->busy;
 	} else if (ctx->sess && ctx->sess->busy) {
 		fail = true;

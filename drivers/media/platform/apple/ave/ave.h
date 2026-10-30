@@ -173,7 +173,6 @@ struct ave_slot {
 	struct ave_buf meta;
 	struct ave_buf aux;		/* H.264 per-frame buffer, HEVC slice headers */
 	struct vb2_v4l2_buffer *src;
-	size_t coded_dirty;
 	u32 status;
 	bool busy;			/* Process sent, reply pending */
 	bool done;			/* reply in, output not delivered yet */
@@ -204,6 +203,8 @@ struct ave_session {
 	bool fw_open;			/* Open sent, Close not yet */
 	bool dead;			/* firmware gone; buffers only */
 	bool warned;
+	bool checked[2];		/* Start/Process images checked for stale addresses */
+	unsigned long progress;		/* jiffies of the last frame sent or answered */
 };
 
 struct ave_ctx {
@@ -285,6 +286,9 @@ void ave_sess_reply(struct ave_ctx *ctx, const u8 *msg, u32 len);
 int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *dst,
 		    bool *keyframe);
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);
+void ave_sess_check_addrs(struct ave_ctx *ctx, const u8 *cmd, size_t len, unsigned int kind,
+			  dma_addr_t input);
+bool ave_sess_stalled(struct ave_session *sess);
 
 /* ave-v4l2.c */
 int ave_v4l2_register(struct ave_dev *ave);

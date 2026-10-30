@@ -470,6 +470,7 @@ int ave_cmd_start(struct ave_ctx *ctx)
 		       AVE_SESSION_ARG2_SETUP);
 	ave_start_surfaces(sess, cmd);
 	ave_start_config(&sess->p, cmd);
+	ave_sess_check_addrs(ctx, cmd, tmpl->size, AVE_TMPL_START, 0);
 
 	ret = ave_ipc_submit(ave, AVE_BUF_CMD, tmpl->size, AVE_CMD_SESSION_TIMEOUT_US, true);
 	return ret ?: ave_ipc_settle(ave, AVE_START_WAIT_MS);
@@ -609,6 +610,7 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	ave_put64(cmd, l->pts, pts);
 	ave_put32(cmd, l->force_key, force_key);
 	ave_put32(cmd, l->force_type, force_key ? AVE_PROC_FORCED_TYPE : 0);
+	ave_sess_check_addrs(ctx, cmd, tmpl->size, AVE_TMPL_PROCESS, y);
 
 	ret = ave_ipc_submit(ave, buf, tmpl->size, AVE_CMD_SESSION_TIMEOUT_US, false);
 	if (ret)
@@ -616,6 +618,7 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	s->src = src;
 	s->busy = true;
 	s->status = 0;
+	sess->progress = jiffies;
 	sess->busy++;
 	sess->frames++;
 	return 0;

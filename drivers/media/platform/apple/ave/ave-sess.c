@@ -10,6 +10,7 @@
  * Copyright The Aurora Silicon Contributors
  */
 #include <linux/device.h>
+#include <linux/jiffies.h>
 #include <linux/dma-mapping.h>
 #include <linux/log2.h>
 #include <linux/printk.h>
@@ -31,10 +32,12 @@
 #define AVE_HEVC_MAIN			1
 
 #define AVE_META_BYTES			0xc000
-#define AVE_META_HEVC_PAYLOAD		0x120
+/* Metadata words: coded bytes (twice), HEVC slice-header bytes, parameter sets */
+#define AVE_META_PAYLOAD		0x120
 #define AVE_META_HEVC_SHDR		0x128
-#define AVE_META_HEVC_PAYLOAD2		0x12c
-#define AVE_META_HEVC_PARAMS		0xb2a4
+#define AVE_META_PAYLOAD2		0x12c
+#define AVE_META_PARAMS			0xb2a4
+#define AVE_META_SCAN_FROM		0x200
 #define AVE_SHDR_BYTES			(256 * 0x400)
 #define AVE_SHDR_ENTRY_BYTES		0x400
 #define AVE_CODED_MIN			0x3c000
@@ -248,6 +251,39 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 	}
 }
 
+/* Debug map of the session buffers, to match DART faults to a buffer. */
+static void ave_log_buf(struct ave_dev *ave, const char *name, int i, const struct ave_buf *b)
+{
+	if (b->cpu)
+		dev_dbg(ave->dev, "buf %s%d %pad +%#zx\n", name, i, &b->dma, b->size);
+}
+
+static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
+{
+	ave_log_buf(ave, "hdr", 0, &sess->hdr);
+	ave_log_buf(ave, "mb", 0, &sess->mb);
+	ave_log_buf(ave, "row_a", 0, &sess->row_a);
+	ave_log_buf(ave, "row_b", 0, &sess->row_b);
+	ave_log_buf(ave, "fixed", 0, &sess->fixed);
+	for (int i = 0; i < 2; i++)
+		ave_log_buf(ave, "hevc_extra", i, &sess->hevc_extra[i]);
+	for (int i = 0; i < AVE_MAX_REFS; i++) {
+		ave_log_buf(ave, "ref_a", i, &sess->ref_a[i]);
+		ave_log_buf(ave, "ref_b", i, &sess->ref_b[i]);
+		ave_log_buf(ave, "ref_c", i, &sess->ref_c[i]);
+		ave_log_buf(ave, "ref_d", i, &sess->ref_d[i]);
+	}
+	for (int i = 0; i < AVE_TILE_BUFS; i++) {
+		ave_log_buf(ave, "tile", i, &sess->tile[i]);
+		ave_log_buf(ave, "tile_aux", i, &sess->tile_aux[i]);
+	}
+	for (int i = 0; i < AVE_MAX_SLOTS; i++) {
+		ave_log_buf(ave, "coded", i, &sess->slot[i].coded);
+		ave_log_buf(ave, "meta", i, &sess->slot[i].meta);
+		ave_log_buf(ave, "aux", i, &sess->slot[i].aux);
+	}
+}
+
 /* Work out the parameters and allocate the buffers; no firmware access. */
 struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 {
@@ -267,6 +303,7 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	}
 	for (unsigned int s = 0; s < sess->p.slots; s++)
 		ave_sess_prepare_slot(sess, s);
+	ave_sess_log_map(ctx->ave, sess);
 	dev_dbg(ctx->ave->dev, "session %ux%u codec %u profile %u level %u, %u slots, %u refs\n",
 		sess->p.width, sess->p.height, sess->p.codec, sess->p.profile, sess->p.level,
 		sess->p.slots, sess->p.refs);
@@ -301,21 +338,16 @@ int ave_sess_free_slot(struct ave_session *sess)
 }
 
 /*
- * Clear what the firmware writes, so the output can be measured: the whole
- * metadata buffer, the first slice header and (H.264) the part of the coded
- * buffer the previous frame used.
+ * Clear what the firmware reports through, so a stale value is never taken
+ * for a new one: the whole metadata buffer and the first slice header.
  */
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 {
 	struct ave_slot *s = &sess->slot[slot];
 
 	memset(s->meta.cpu, 0, s->meta.size);
-	if (sess->p.codec == AVE_CODEC_HEVC) {
+	if (sess->p.codec == AVE_CODEC_HEVC)
 		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
-	} else if (s->coded_dirty) {
-		memset(s->coded.cpu, 0, min(s->coded_dirty, s->coded.size));
-		s->coded_dirty = 0;
-	}
 }
 
 /* A frame reply: +0x10 our client, +0x20 the slot's subtype, +0x40 status. */
@@ -334,6 +366,7 @@ void ave_sess_reply(struct ave_ctx *ctx, const u8 *msg, u32 len)
 		return;
 	}
 	s = &sess->slot[slot];
+	sess->progress = jiffies;
 	s->status = get_unaligned_le32(msg + AVE_REPLY_STATUS);
 	if (s->status)
 		dev_dbg(ctx->ave->dev, "frame in slot %u: status %#x\n", slot, s->status);
@@ -402,9 +435,29 @@ static void ave_scan_nals(const u8 *p, size_t len, bool hevc, bool *key, bool *p
 	}
 }
 
+/* Where in the metadata buffer do the parameter sets start, if anywhere? */
+static int ave_find_params(const u8 *meta, bool hevc)
+{
+	if (ave_starts_annexb(meta + AVE_META_PARAMS, AVE_META_BYTES - AVE_META_PARAMS))
+		return AVE_META_PARAMS;
+	/* Not at the HEVC offset: look for an SPS (H.264) or VPS (HEVC). */
+	for (int i = AVE_META_SCAN_FROM; i + 4 < AVE_META_BYTES; i++) {
+		u8 type;
+
+		if (meta[i] || meta[i + 1] || meta[i + 2] != 1)
+			continue;
+		type = hevc ? (meta[i + 3] >> 1) & 0x3f : meta[i + 3] & 0x1f;
+		if (type == (hevc ? 32 : 7))
+			return i > AVE_META_SCAN_FROM && !meta[i - 1] ? i - 1 : i;
+	}
+	return -ENOENT;
+}
+
 static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *why)
 {
 	struct ave_session *sess = ctx->sess;
+	const u8 *meta = s->meta.cpu;
+	int ps;
 
 	if (sess->warned)
 		return;
@@ -412,21 +465,27 @@ static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *w
 	dev_warn(ctx->ave->dev, "frame %u output: %s (enable dynamic debug for a dump)\n",
 		 ctx->dst_sequence, why);
 	print_hex_dump_debug("ave coded: ", DUMP_PREFIX_OFFSET, 16, 1, s->coded.cpu, 128, false);
-	print_hex_dump_debug("ave meta: ", DUMP_PREFIX_OFFSET, 16, 4, s->meta.cpu, 0x200, false);
-	if (sess->p.codec == AVE_CODEC_HEVC)
-		print_hex_dump_debug("ave meta params: ", DUMP_PREFIX_OFFSET, 16, 1,
-				     s->meta.cpu + AVE_META_HEVC_PARAMS, 128, false);
+	print_hex_dump_debug("ave meta: ", DUMP_PREFIX_OFFSET, 16, 4, meta, 0x200, false);
+	print_hex_dump_debug("ave meta b200: ", DUMP_PREFIX_OFFSET, 16, 1, meta + 0xb200,
+			     0x200, false);
+	ps = ave_find_params(meta, sess->p.codec == AVE_CODEC_HEVC);
+	if (ps >= 0) {
+		dev_dbg(ctx->ave->dev, "parameter sets at metadata +%#x\n", ps);
+		print_hex_dump_debug("ave meta params: ", DUMP_PREFIX_OFFSET, 16, 1, meta + ps,
+				     min(128, AVE_META_BYTES - ps), false);
+	}
+	/* Anything else the firmware wrote past the header words. */
+	for (int i = AVE_META_SCAN_FROM; i < AVE_META_BYTES; i += 16)
+		if (memchr_inv(meta + i, 0, 16))
+			dev_dbg(ctx->ave->dev, "metadata +%#x: %16ph\n", i, meta + i);
 }
 
 /*
- * Assemble the access unit of @slot into @dst.
- *
- * HEVC: the firmware puts the parameter sets in the metadata buffer, the
- * slice header in the first slice-header entry and the slice data in the
- * coded buffer; metadata words give the two lengths.
- *
- * H.264: where the length is reported is not known yet, so the coded buffer
- * is read as Annex B until the data ends.
+ * Assemble the access unit of @slot into @dst: the parameter sets the
+ * firmware leaves in the metadata buffer (when it emits them), for HEVC the
+ * slice header from the first slice-header entry, then the coded data.
+ * Metadata +0x120 (repeated at +0x12c) holds the coded length for both
+ * codecs, +0x128 the HEVC slice-header length.
  */
 int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *dst,
 		    bool *keyframe)
@@ -436,8 +495,12 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	bool hevc = sess->p.codec == AVE_CODEC_HEVC;
 	u8 *out = vb2_plane_vaddr(&dst->vb2_buf, 0);
 	size_t room = vb2_plane_size(&dst->vb2_buf, 0);
+	const u8 *meta = s->meta.cpu;
+	u32 data, data2, shdr = 0;
 	bool params = false;
-	ssize_t len = 0;
+	ssize_t ps = 0;
+	size_t len;
+	int at;
 
 	*keyframe = false;
 	if (!out)
@@ -445,44 +508,31 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 	if (s->status)
 		return -EIO;
 
-	if (hevc) {
-		const u8 *meta = s->meta.cpu;
-		u32 shdr = get_unaligned_le32(meta + AVE_META_HEVC_SHDR);
-		u32 data = get_unaligned_le32(meta + AVE_META_HEVC_PAYLOAD);
-		ssize_t ps = 0;
+	data = get_unaligned_le32(meta + AVE_META_PAYLOAD);
+	data2 = get_unaligned_le32(meta + AVE_META_PAYLOAD2);
+	if (hevc)
+		shdr = get_unaligned_le32(meta + AVE_META_HEVC_SHDR);
+	if (data != data2)
+		dev_dbg(ctx->ave->dev, "coded length words differ: %u/%u\n", data, data2);
 
-		if (ave_starts_annexb(meta + AVE_META_HEVC_PARAMS,
-				      AVE_META_BYTES - AVE_META_HEVC_PARAMS)) {
-			ps = ave_copy_annexb(out, room, meta + AVE_META_HEVC_PARAMS,
-					     AVE_META_BYTES - AVE_META_HEVC_PARAMS, 16);
-			if (ps < 0)
-				return ps;
-		}
-		if (shdr > AVE_SHDR_ENTRY_BYTES || data > sess->p.coded_cap ||
-		    ps + shdr + data > room) {
-			dev_err(ctx->ave->dev, "bad HEVC output sizes %u/%u\n", shdr, data);
-			ave_sess_dump(ctx, s, "bad sizes");
-			return -EPROTO;
-		}
-		if (get_unaligned_le32(meta + AVE_META_HEVC_PAYLOAD2) != data)
-			dev_dbg(ctx->ave->dev, "HEVC payload words differ: %u/%u\n", data,
-				get_unaligned_le32(meta + AVE_META_HEVC_PAYLOAD2));
+	at = ave_find_params(meta, hevc);
+	if (at >= 0) {
+		ps = ave_copy_annexb(out, room, meta + at, AVE_META_BYTES - at, 16);
+		if (ps < 0)
+			return ps;
+	}
+	if (!data || data > sess->p.coded_cap || shdr > AVE_SHDR_ENTRY_BYTES ||
+	    ps + shdr + data > room) {
+		dev_err(ctx->ave->dev, "bad output sizes %u/%u (capacity %u, room %zu)\n",
+			shdr, data, sess->p.coded_cap, room);
+		ave_sess_dump(ctx, s, "bad sizes");
+		return -EPROTO;
+	}
+	if (hevc)
 		memcpy(out + ps, s->aux.cpu, shdr);
-		memcpy(out + ps + shdr, s->coded.cpu, data);
-		len = ps + shdr + data;
-	} else {
-		len = ave_copy_annexb(out, room, s->coded.cpu, s->coded.size, 256);
-		if (len < 0) {
-			dev_err(ctx->ave->dev, "coded frame larger than the CAPTURE buffer\n");
-			return len;
-		}
-		s->coded_dirty = len + 256;
-	}
+	memcpy(out + ps + shdr, s->coded.cpu, data);
+	len = ps + shdr + data;
 
-	if (!len) {
-		ave_sess_dump(ctx, s, "empty");
-		return -ENODATA;
-	}
 	if (!ave_starts_annexb(out, len))
 		ave_sess_dump(ctx, s, "not Annex B");
 	ave_scan_nals(out, len, hevc, keyframe, &params);
@@ -490,4 +540,82 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buff
 		ave_sess_dump(ctx, s, "first frame has no parameter sets");
 	vb2_set_plane_payload(&dst->vb2_buf, 0, len);
 	return 0;
+}
+
+/*
+ * Every 64-bit word in a command that looks like an encoder DART address
+ * should be one of ours. One that is not came from the session image (a
+ * stale macOS address) and makes the firmware write to an unmapped page.
+ * Reported once per session and command kind.
+ */
+static bool ave_buf_has(const struct ave_buf *b, u64 addr)
+{
+	return b->cpu && addr >= b->dma && addr < b->dma + PAGE_ALIGN(b->size);
+}
+
+static bool ave_sess_owns(struct ave_session *sess, u64 addr)
+{
+	const struct ave_buf *fixed[] = {
+		&sess->hdr, &sess->mb, &sess->row_a, &sess->row_b, &sess->fixed,
+		&sess->hevc_extra[0], &sess->hevc_extra[1],
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(fixed); i++)
+		if (ave_buf_has(fixed[i], addr))
+			return true;
+	for (unsigned int i = 0; i < AVE_MAX_REFS; i++)
+		if (ave_buf_has(&sess->ref_a[i], addr) || ave_buf_has(&sess->ref_b[i], addr) ||
+		    ave_buf_has(&sess->ref_c[i], addr) || ave_buf_has(&sess->ref_d[i], addr))
+			return true;
+	for (unsigned int i = 0; i < AVE_TILE_BUFS; i++)
+		if (ave_buf_has(&sess->tile[i], addr) || ave_buf_has(&sess->tile_aux[i], addr))
+			return true;
+	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++)
+		if (ave_buf_has(&sess->slot[s].coded, addr) ||
+		    ave_buf_has(&sess->slot[s].meta, addr) ||
+		    ave_buf_has(&sess->slot[s].aux, addr))
+			return true;
+	return false;
+}
+
+void ave_sess_check_addrs(struct ave_ctx *ctx, const u8 *cmd, size_t len, unsigned int kind,
+			  dma_addr_t input)
+{
+	struct ave_session *sess = ctx->sess;
+	struct ave_dev *ave = ctx->ave;
+	unsigned int bad = 0;
+
+	if (sess->checked[kind])
+		return;
+	sess->checked[kind] = true;
+	for (size_t off = AVE_CMD_HDR_BYTES; off + 8 <= len; off += 4) {
+		u64 v = get_unaligned_le64(cmd + off);
+
+		/* The encoder's DART window: 0x100_0000_0000 + 256 MiB. */
+		if ((v >> 28) != 0x1000)
+			continue;
+		if (ave_sess_owns(sess, v) || (input && v >= input && v < input + SZ_32M) ||
+		    (v >= ave->ipc.dma && v < ave->ipc.dma + ave->ipc.size))
+			continue;
+		if (bad++ < 16)
+			dev_warn(ave->dev, "%s +%#zx holds %#llx, not a buffer of this session\n",
+				 kind == AVE_TMPL_START ? "Start" : "Process", off, v);
+	}
+	if (bad)
+		dev_warn(ave->dev, "%u stale addresses in the %s image\n", bad,
+			 kind == AVE_TMPL_START ? "Start" : "Process");
+}
+
+/*
+ * Frames are outstanding, nothing came back for a while, and the firmware
+ * has enough frames that it should have answered: without B-frames every
+ * frame is answered on its own; with B-frames, once four are inside (one
+ * reference plus three B) one of them must come out.
+ */
+bool ave_sess_stalled(struct ave_session *sess)
+{
+	unsigned int need = sess->p.bframes ? 4 : 1;
+
+	return sess->busy >= need &&
+	       time_after(jiffies, sess->progress + msecs_to_jiffies(AVE_FRAME_WAIT_MS));
 }
