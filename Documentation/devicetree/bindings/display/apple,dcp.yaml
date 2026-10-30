@@ -35,7 +35,6 @@ properties:
               - apple,t6020-dcpext
               - apple,t6041-dcpext
           - const: apple,dcpext
-      - const: apple,t6041-dcpext
       - items:
           - const: apple,t8140-dcpext
           - const: apple,dcp
@@ -295,8 +294,6 @@ properties:
   '#size-cells':
     const: 2
 
-  ranges: true
-
   piodma:
     type: object
     properties:
@@ -393,19 +390,10 @@ allOf:
             pattern: '^(dp-xbar|typec[0-9]+)$'
   - if:
       not:
-        anyOf:
-          - properties:
-              compatible:
-                contains:
-                  const: apple,t8132-dcp
-          - properties:
-              compatible:
-                contains:
-                  const: apple,t6041-dcpext
-              status:
-                const: disabled
-            required:
-              - status
+        properties:
+          compatible:
+            contains:
+              const: apple,t8132-dcp
     then:
       required:
         - apple,bw-scratch
