@@ -88,19 +88,19 @@ static void ave_remove(struct platform_device *pdev)
 	ave_v4l2_unregister(ave);
 
 	/*
-	 * Make sure the coprocessor really loses power before its memory is
-	 * freed: drop to runtime suspend synchronously and check.
+	 * The coprocessor memory can only go once the firmware never ran or
+	 * was reset by a power cycle. A halted coprocessor may keep power
+	 * (its domain is shared with the DARTs), so its memory stays.
 	 */
 	pm_runtime_dont_use_autosuspend(ave->dev);
-	if (pm_runtime_suspended(ave->dev) || pm_runtime_status_suspended(ave->dev)) {
-		mutex_lock(&ave->hw_lock);
-		ave_fw_lost(ave);
+	mutex_lock(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_OFF) {
 		mutex_unlock(&ave->hw_lock);
-		ave_fw_remove(ave);
-	} else {
-		/* The firmware still owns its buffers; leave them allocated. */
-		dev_warn(ave->dev, "firmware still running, keeping its memory\n");
+		dev_warn(ave->dev, "firmware was started, keeping its memory\n");
+		return;
 	}
+	mutex_unlock(&ave->hw_lock);
+	ave_fw_remove(ave);
 }
 
 static int ave_runtime_suspend(struct device *dev)
@@ -123,12 +123,21 @@ static int ave_suspend(struct device *dev)
 {
 	struct ave_dev *ave = dev_get_drvdata(dev);
 
-	/* Let a running frame finish; the m2m core holds back new jobs. */
+	/* Let a running job finish; the m2m core holds back new ones. */
 	v4l2_m2m_suspend(ave->m2m_dev);
 
+	/*
+	 * An open session cannot survive the power going down: it is ended
+	 * here (its next job fails) and the firmware halted, so the next
+	 * session restarts it from the saved DATA copy.
+	 */
 	mutex_lock(&ave->hw_lock);
-	if (ave->fw_state != AVE_FW_OFF && ave_fw_shutdown(ave))
-		dev_dbg(dev, "firmware will restart after resume\n");
+	if (ave->active) {
+		ave->active->sess->dead = true;
+		ave->active = NULL;
+	}
+	if (ave_fw_shutdown(ave))
+		dev_warn(dev, "firmware not answering, it cannot be stopped for sleep\n");
 	mutex_unlock(&ave->hw_lock);
 	return 0;
 }
@@ -137,15 +146,7 @@ static int ave_resume(struct device *dev)
 {
 	struct ave_dev *ave = dev_get_drvdata(dev);
 
-	/*
-	 * If the power domains went down with the system, the coprocessor is
-	 * back in reset: open sessions fail their next frame and a new session
-	 * boots the firmware again from its saved state.
-	 */
-	mutex_lock(&ave->hw_lock);
-	ave_fw_resume(ave);
-	mutex_unlock(&ave->hw_lock);
-
+	/* The next boot checks the coprocessor state itself. */
 	v4l2_m2m_resume(ave->m2m_dev);
 	return 0;
 }
@@ -168,11 +169,17 @@ static struct platform_driver ave_driver = {
 		.name = "apple-ave",
 		.of_match_table = ave_of_match,
 		.pm = pm_ptr(&ave_pm_ops),
-		/* The firmware cannot be stopped yet, so neither can the driver. */
+		/* A started coprocessor keeps its memory; do not unbind at will. */
 		.suppress_bind_attrs = true,
 	},
 };
 module_platform_driver(ave_driver);
+
+/* Constant parts of Start and Process for AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
+MODULE_FIRMWARE("apple/ave-t8140-69c54454-h264-start.bin");
+MODULE_FIRMWARE("apple/ave-t8140-69c54454-h264-process.bin");
+MODULE_FIRMWARE("apple/ave-t8140-69c54454-hevc-start.bin");
+MODULE_FIRMWARE("apple/ave-t8140-69c54454-hevc-process.bin");
 
 MODULE_DESCRIPTION("Apple AVE video encoder");
 MODULE_LICENSE("GPL");

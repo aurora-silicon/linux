@@ -89,8 +89,15 @@
 #define AVE_CMD_TIMEOUT			0x30
 #define AVE_CMD_CREATED			0x38
 #define AVE_CMD_HDR_BYTES		0x48
-#define AVE_CMD_TIMEOUT_US		3000000
+
+/* Timeouts the firmware is given, and how long the host waits */
+#define AVE_CMD_GLOBAL_TIMEOUT_US	3000000ULL
+#define AVE_CMD_SESSION_TIMEOUT_US	94400000ULL
 #define AVE_CMD_WAIT_MS			5000
+#define AVE_START_WAIT_MS		10000
+#define AVE_FRAME_WAIT_MS		5000
+/* Halt is never answered; give the firmware this long before power-off. */
+#define AVE_HALT_SETTLE_MS		20
 
 enum ave_opcode {
 	AVE_OP_CONFIG = 1,
@@ -110,19 +117,31 @@ enum ave_opcode {
 #define AVE_REPLY_SUBTYPE		0x20
 #define AVE_REPLY_STATUS		0x40
 #define AVE_REPLY_MIN_BYTES		0x48
+#define AVE_REPLY_PROCESS_BYTES		0x50
 
 #define AVE_HALT_ALL			0xffffffff
 
-/* Session command arguments, as the firmware expects them */
+/* Session command header values */
+#define AVE_SESSION_UNIT		1
 #define AVE_SESSION_ARG0		0xc8
 #define AVE_SESSION_ARG1		0x36
-#define AVE_OPEN_ARG2			0x1e0
-#define AVE_FINISH_ARG2_H264		0x140
-#define AVE_FINISH_ARG2_HEVC		0x20
+#define AVE_SESSION_ARG2_SETUP		0x1e0	/* Open and Start */
+#define AVE_SESSION_ARG2_H264		0x40	/* every other session command */
+#define AVE_SESSION_ARG2_HEVC		0x20
+#define AVE_TOKEN_STEP			100
+#define AVE_TOKEN_BASE			300	/* the first Open carries 400 */
+#define AVE_CLIENT_STEP			10
+
+/* Process slots: the command subtype is this plus the slot index */
+#define AVE_PROC_SUBTYPE		0x15
+/* Completes sent to drain a session */
+#define AVE_DRAIN_COMPLETES		4
 
 #define AVE_CONFIG_BYTES		0x78
 #define AVE_CONFIG_ALL_UNITS		0x20
 #define AVE_CONFIG_OPT_A		0x49
 #define AVE_CONFIG_OPT_B		0x4a
+#define AVE_CONFIG_MCC_DSID		0x60
+#define AVE_CONFIG_MCC_DSID_T8140	0x12
 
 #endif

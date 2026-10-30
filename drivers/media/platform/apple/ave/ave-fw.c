@@ -13,6 +13,7 @@
 #include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
@@ -20,6 +21,7 @@
 #include <linux/of_address.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
+#include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
 #include "ave.h"
@@ -133,6 +135,8 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (!known)
 		return dev_err_probe(dev, -ENODEV, "unsupported firmware (text CRC %08x)\n",
 				     text_crc);
+	ave->text_crc = text_crc;
+	mutex_init(&ave->tmpl_lock);
 
 	ave->data_pristine = vmalloc(ave->data.size);
 	if (!ave->data_pristine)
@@ -170,19 +174,24 @@ static void ave_fw_restore_data(struct ave_dev *ave)
 	ave->data_dirty = false;
 }
 
-static void ave_free(struct ave_dev *ave, struct ave_buf *b)
+void ave_free(struct ave_dev *ave, struct ave_buf *b)
 {
 	if (b->cpu)
-		dma_free_coherent(ave->dev, b->size, b->cpu, b->dma);
+		dma_free_attrs(ave->dev, PAGE_ALIGN(b->size), b->cpu, b->dma, b->attrs);
 	b->cpu = NULL;
 }
 
-static int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size)
+/*
+ * Firmware-visible memory, zeroed and 16 KiB aligned in the encoder's DART.
+ * @size is what the firmware is told; the allocation is page rounded.
+ */
+int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long attrs)
 {
 	if (b->cpu)
 		return 0;
 	b->size = size;
-	b->cpu = dma_alloc_coherent(ave->dev, size, &b->dma, GFP_KERNEL);
+	b->attrs = attrs;
+	b->cpu = dma_alloc_attrs(ave->dev, PAGE_ALIGN(size), &b->dma, GFP_KERNEL, attrs);
 	if (!b->cpu)
 		return -ENOMEM;
 	if (!IS_ALIGNED(b->dma, SZ_16K)) {
@@ -192,8 +201,61 @@ static int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size)
 	return 0;
 }
 
+/*
+ * Start and Process are mostly constant for a firmware build. Those
+ * constant words come from per-build image files named after the TEXT
+ * checksum; the driver fills in every session and frame field itself.
+ */
+static const char * const ave_codec_name[] = { "h264", "hevc" };
+static const char * const ave_tmpl_name[AVE_TMPL_COUNT] = { "start", "process" };
+static const size_t ave_tmpl_size[2][AVE_TMPL_COUNT] = {
+	{ 0x3180, 0x63d8 },	/* H.264 */
+	{ 0x13f28, 0xb1c0 },	/* HEVC */
+};
+
+#define AVE_TMPL_CODEC		0xc0	/* Start: codec word of the session image */
+
+int ave_fw_templates(struct ave_dev *ave, enum ave_codec codec)
+{
+	unsigned int c = codec - 1;
+	char name[64];
+	int ret = 0;
+
+	mutex_lock(&ave->tmpl_lock);
+	for (unsigned int t = 0; t < AVE_TMPL_COUNT && !ret; t++) {
+		const struct firmware *fw;
+
+		if (ave->tmpl[c][t])
+			continue;
+		snprintf(name, sizeof(name), "apple/ave-t8140-%08x-%s-%s.bin", ave->text_crc,
+			 ave_codec_name[c], ave_tmpl_name[t]);
+		ret = request_firmware(&fw, name, ave->dev);
+		if (ret) {
+			dev_err(ave->dev, "cannot load %s: %d\n", name, ret);
+			break;
+		}
+		if (fw->size != ave_tmpl_size[c][t] ||
+		    (t == AVE_TMPL_START &&
+		     get_unaligned_le32(fw->data + AVE_TMPL_CODEC) != codec)) {
+			dev_err(ave->dev, "%s does not fit this driver (%zu bytes)\n", name,
+				fw->size);
+			release_firmware(fw);
+			ret = -EINVAL;
+			break;
+		}
+		ave->tmpl[c][t] = fw;
+	}
+	mutex_unlock(&ave->tmpl_lock);
+	return ret;
+}
+
 void ave_fw_remove(struct ave_dev *ave)
 {
+	for (unsigned int c = 0; c < 2; c++)
+		for (unsigned int t = 0; t < AVE_TMPL_COUNT; t++) {
+			release_firmware(ave->tmpl[c][t]);
+			ave->tmpl[c][t] = NULL;
+		}
 	ave_free(ave, &ave->heap);
 	ave_free(ave, &ave->log);
 	ave_free(ave, &ave->boot_cfg);
@@ -214,6 +276,38 @@ static bool ave_fw_idle(struct ave_dev *ave)
 	return true;
 }
 
+/*
+ * After a Halt the firmware no longer runs, but the coprocessor is still
+ * set going if its power stayed on. A restart uses the normal boot path
+ * (macOS restarts the firmware for every session the same way): clear the
+ * run bit, as the boot sequence does first anyway, and the mailbox words
+ * left from the previous run, so the reset-state checks hold again. The
+ * code base register must still be set: the driver never writes it.
+ */
+static int ave_fw_prepare_restart(struct ave_dev *ave)
+{
+	u32 status;
+
+	if (readq(ave->coproc + AVE_COPROC_VCBAR) != (ave->text.iova | AVE_COPROC_VCBAR_VALID)) {
+		dev_err(ave->dev, "coprocessor lost its code base (vcbar %#llx)\n",
+			readq(ave->coproc + AVE_COPROC_VCBAR));
+		return -EIO;
+	}
+	if (ave->fw_state != AVE_FW_HALTED)
+		return 0;
+
+	if (readl(ave->coproc + AVE_COPROC_CTRL)) {
+		writel(0, ave->coproc + AVE_COPROC_CTRL);
+		usleep_range(1000, 2000);
+	}
+	status = readl(ave->mbox + AVE_MBOX_STATUS);
+	if (status)
+		writel(status, ave->mbox + AVE_MBOX_STATUS);
+	for (unsigned int i = 0; i < AVE_MBOX_SCRATCH_COUNT; i++)
+		writel(0, ave->mbox + AVE_MBOX_SCRATCH(i));
+	return 0;
+}
+
 /* Boot the coprocessor and bring up its command rings. Caller holds hw_lock. */
 static int ave_fw_boot(struct ave_dev *ave)
 {
@@ -221,11 +315,20 @@ static int ave_fw_boot(struct ave_dev *ave)
 	u32 status, hello[4];
 	int ret;
 
-	ret = ave_alloc(ave, &ave->ipc, AVE_IPC_BYTES);
+	ret = ave_alloc(ave, &ave->ipc, AVE_IPC_BYTES, 0);
 	if (!ret)
-		ret = ave_alloc(ave, &ave->boot_cfg, SZ_16K);
+		ret = ave_alloc(ave, &ave->boot_cfg, SZ_16K, 0);
 	if (!ret)
-		ret = ave_alloc(ave, &ave->log, AVE_LOG_BYTES);
+		ret = ave_alloc(ave, &ave->log, AVE_LOG_BYTES, 0);
+	if (ret)
+		return ret;
+
+	if (ave_fw_check_mapping(ave, &ave->text) || ave_fw_check_mapping(ave, &ave->data)) {
+		dev_err(ave->dev, "firmware segments are no longer mapped\n");
+		return -EIO;
+	}
+
+	ret = ave_fw_prepare_restart(ave);
 	if (ret)
 		return ret;
 
@@ -239,6 +342,13 @@ static int ave_fw_boot(struct ave_dev *ave)
 			readl(ave->coproc + AVE_COPROC_CTRL));
 		return -EIO;
 	}
+
+	memset(ave->ring, 0, sizeof(ave->ring));
+	ave->unacked = 0;
+	memset(ave->want, 0, sizeof(ave->want));
+	ave->reply_err = 0;
+	ave->scalar_next = 0;
+	ave->next_token = AVE_TOKEN_BASE;
 
 	ave_fw_restore_data(ave);
 
@@ -306,9 +416,9 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 	case AVE_FW_RUNNING:
 		return 0;
 	case AVE_FW_BROKEN:
-		/* Only a power cycle gets the coprocessor back; see runtime PM. */
 		return -EIO;
 	case AVE_FW_OFF:
+	case AVE_FW_HALTED:
 		break;
 	}
 
@@ -319,21 +429,46 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 }
 
 /*
+ * Tell the firmware to stop, once every session is closed. Halt gets no
+ * ack and no answer; after a short wait the coprocessor is treated as
+ * stopped and the next session restarts it through the boot path.
+ * Caller holds hw_lock.
+ */
+void ave_fw_halt(struct ave_dev *ave)
+{
+	lockdep_assert_held(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_RUNNING)
+		return;
+	if (ave_cmd_halt(ave)) {
+		ave->fw_state = AVE_FW_BROKEN;
+		return;
+	}
+	msleep(AVE_HALT_SETTLE_MS);
+	ave->fw_state = AVE_FW_HALTED;
+	memset(ave->ring, 0, sizeof(ave->ring));
+	ave->ipc_fw_base = 0;
+}
+
+/*
  * Stop the firmware before its power goes away. Caller holds hw_lock.
  *
- * The firmware is told to halt once every session is closed. Stopping the
- * coprocessor core itself and checking that the fabric is idle are not
- * described yet, so until then a running firmware keeps its power (runtime
- * suspend fails with -EBUSY). Across system sleep the domains go down anyway;
- * ave_fw_resume() notices and the next session boots the firmware again from
- * the saved DATA copy.
+ * Sessions keep the device runtime active, so the firmware has normally
+ * been halted already. A firmware that stopped answering keeps its power:
+ * whether it still has transfers in flight cannot be checked, and only a
+ * reboot brings it back.
  */
 int ave_fw_shutdown(struct ave_dev *ave)
 {
 	lockdep_assert_held(&ave->hw_lock);
-	if (ave->fw_state == AVE_FW_OFF)
+	switch (ave->fw_state) {
+	case AVE_FW_RUNNING:
+		ave_fw_halt(ave);
+		return ave->fw_state == AVE_FW_HALTED ? 0 : -EBUSY;
+	case AVE_FW_BROKEN:
+		return -EBUSY;
+	default:
 		return 0;
-	return -EBUSY;
+	}
 }
 
 /* The coprocessor lost power behind the firmware's back. Caller holds hw_lock. */
@@ -343,17 +478,4 @@ void ave_fw_lost(struct ave_dev *ave)
 	ave->fw_state = AVE_FW_OFF;
 	memset(ave->ring, 0, sizeof(ave->ring));
 	ave->ipc_fw_base = 0;
-}
-
-/* After system resume: did the coprocessor keep running? Caller holds hw_lock. */
-void ave_fw_resume(struct ave_dev *ave)
-{
-	lockdep_assert_held(&ave->hw_lock);
-	if (ave->fw_state == AVE_FW_OFF)
-		return;
-	/* A running firmware keeps the device runtime active, so this is powered. */
-	if (readl(ave->coproc + AVE_COPROC_CTRL) & AVE_COPROC_CTRL_RUN)
-		return;
-	dev_dbg(ave->dev, "coprocessor lost power during sleep\n");
-	ave_fw_lost(ave);
 }

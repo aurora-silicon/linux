@@ -16,18 +16,19 @@
 #include <media/videobuf2-dma-contig.h>
 
 #include "ave.h"
+#include "ave-regs.h"
 
 #define AVE_NAME		"apple-ave"
 
 /*
- * Frame size limits and input stride alignment. Provisional: conservative
- * values the hardware is known to cover (up to the 2408x1506 panel and 1080p
- * and 4K class streams); refined once the firmware limits are described.
+ * Frame size limits and input stride alignment: the range the encoder was
+ * seen working at (320x240 up to the 2408x1506 panel), with a little room.
+ * Larger sizes need buffer sizes nobody has checked yet.
  */
-#define AVE_MIN_W		64
-#define AVE_MIN_H		64
-#define AVE_MAX_W		4096
-#define AVE_MAX_H		4096
+#define AVE_MIN_W		320
+#define AVE_MIN_H		240
+#define AVE_MAX_W		2560
+#define AVE_MAX_H		1600
 #define AVE_STEP		16
 #define AVE_STRIDE_ALIGN	64
 #define AVE_DEFAULT_W		1920
@@ -90,8 +91,8 @@ static void ave_fill_coded(struct v4l2_pix_format_mplane *f)
 	if (!ave_fmt_listed(ave_coded_fmts, ARRAY_SIZE(ave_coded_fmts), f->pixelformat))
 		f->pixelformat = ave_coded_fmts[0];
 	ave_clamp_size(&f->width, &f->height);
-	/* Room for an intra frame at low compression plus headers. */
-	min = max_t(u32, f->width * f->height * 3 / 4, SZ_256K);
+	/* The firmware's coded-data capacity plus parameter sets and headers. */
+	min = ALIGN(3 * ALIGN(f->width, 32) * ALIGN(f->height, 16) / 2, SZ_16K) + SZ_64K;
 	f->num_planes = 1;
 	f->plane_fmt[0].bytesperline = 0;
 	f->plane_fmt[0].sizeimage = clamp_t(u32, f->plane_fmt[0].sizeimage, min, SZ_32M);
@@ -298,25 +299,39 @@ static int ave_s_parm(struct file *file, void *priv, struct v4l2_streamparm *a)
 	return 0;
 }
 
+/*
+ * Drain: frames still inside the firmware (B-frames) only come out after a
+ * flush, so the driver tracks the drain point itself instead of using the
+ * m2m helpers, which would mark the next CAPTURE buffer last right away.
+ */
 static int ave_encoder_cmd(struct file *file, void *priv, struct v4l2_encoder_cmd *ec)
 {
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	int ret;
 
 	ret = v4l2_m2m_ioctl_try_encoder_cmd(file, priv, ec);
 	if (ret)
 		return ret;
-	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
-	    !vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(m2m)) ||
+	    !vb2_is_streaming(v4l2_m2m_get_dst_vq(m2m)))
 		return 0;
 
-	ret = v4l2_m2m_ioctl_encoder_cmd(file, priv, ec);
-	if (ret)
-		return ret;
-	if (ec->cmd == V4L2_ENC_CMD_STOP && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
-		v4l2_event_queue_fh(&ctx->fh, &ave_eos_event);
-	if (ec->cmd == V4L2_ENC_CMD_START && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
-		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+	if (ec->cmd == V4L2_ENC_CMD_STOP) {
+		if (ctx->draining || ctx->stopped)
+			return 0;
+		ctx->drain_src = v4l2_m2m_last_src_buf(m2m);
+		ctx->draining = true;
+		if (!ctx->drain_src)
+			WRITE_ONCE(ctx->flush_pending, true);
+	} else {
+		if (ctx->draining && !ctx->stopped)
+			return -EBUSY;
+		ctx->draining = false;
+		ctx->stopped = false;
+		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m2m));
+	}
+	v4l2_m2m_try_schedule(m2m);
 	return 0;
 }
 
@@ -374,7 +389,7 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 		ctx->bitrate_mode = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_BITRATE:
-		ctx->bitrate = ctrl->val;
+		WRITE_ONCE(ctx->bitrate, ctrl->val);
 		break;
 	case V4L2_CID_MPEG_VIDEO_BITRATE_PEAK:
 		ctx->bitrate_peak = ctrl->val;
@@ -383,7 +398,10 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 		ctx->gop_size = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
-		ctx->force_key_frame = true;
+		WRITE_ONCE(ctx->force_key_frame, true);
+		break;
+	case V4L2_CID_MPEG_VIDEO_B_FRAMES:
+		ctx->b_frames = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_H264_PROFILE:
 		ctx->h264_profile = ctrl->val;
@@ -391,17 +409,11 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_H264_LEVEL:
 		ctx->h264_level = ctrl->val;
 		break;
-	case V4L2_CID_MPEG_VIDEO_H264_I_PERIOD:
-		ctx->h264_i_period = ctrl->val;
-		break;
 	case V4L2_CID_MPEG_VIDEO_H264_MIN_QP:
 		ctx->h264_min_qp = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_H264_MAX_QP:
 		ctx->h264_max_qp = ctrl->val;
-		break;
-	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
-		ctx->hevc_profile = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_LEVEL:
 		ctx->hevc_level = ctrl->val;
@@ -413,7 +425,7 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 		ctx->hevc_max_qp = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
-	case V4L2_CID_MPEG_VIDEO_B_FRAMES:
+	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
 	default:
@@ -432,19 +444,27 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	const struct v4l2_ctrl_ops *ops = &ave_ctrl_ops;
 	struct v4l2_ctrl *c;
 
-	v4l2_ctrl_handler_init(hdl, 18);
+	v4l2_ctrl_handler_init(hdl, 17);
 
+	/* Constant quality needs a quality-to-QP mapping that is not known yet. */
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
-			       0, V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, 200000000, 1,
+			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+			       BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
+			       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, 100000000, 1,
+			  4000000);
+	/* In VBR mode the peak caps the data rate over any one second. */
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, 100000, 200000000, 1,
 			  8000000);
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, 100000, 400000000, 1,
-			  16000000);
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE, 0, 65535, 1, 60);
+	/* 0 means no limit; the firmware then uses 120 frames. */
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE, 0, 65535, 1, 30);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
-	/* No frame reordering until reference handling is described. */
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 0, 1, 0);
+	/*
+	 * The firmware either uses up to three B-frames (reordering them
+	 * itself) or none. Baseline and intra-only H.264 never have any;
+	 * HEVC always has them for now.
+	 */
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, 3, 3, 3);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEADER_MODE,
 			       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
 			       BIT(V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE),
@@ -456,24 +476,26 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 				 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
 				 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_MAIN) |
 				 BIT(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)),
-			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
+			       V4L2_MPEG_VIDEO_H264_PROFILE_MAIN);
+	/* A minimum: the driver raises it to what size, rate and bit rate need. */
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_LEVEL,
 			       V4L2_MPEG_VIDEO_H264_LEVEL_5_2, 0,
-			       V4L2_MPEG_VIDEO_H264_LEVEL_4_1);
-	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, 0, 65535, 1, 0);
+			       V4L2_MPEG_VIDEO_H264_LEVEL_1_0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 0, 51, 1, 51);
 
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10, 0,
+			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, 0,
 			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1, 0,
-			       V4L2_MPEG_VIDEO_HEVC_LEVEL_4_1);
+			       V4L2_MPEG_VIDEO_HEVC_LEVEL_1);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP, 0, 51, 1, 51);
 
-	c = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1, 1);
+	/* The firmware holds up to five frames; one more keeps it fed. */
+	c = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1,
+			      AVE_MAX_SLOTS + 1);
 	if (c)
 		c->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
@@ -496,6 +518,10 @@ static int ave_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned i
 	const struct v4l2_pix_format_mplane *f =
 		V4L2_TYPE_IS_OUTPUT(vq->type) ? &ctx->src_fmt : &ctx->dst_fmt;
 
+	/* Frames stay with the firmware until encoded; keep one spare. */
+	if (V4L2_TYPE_IS_OUTPUT(vq->type) &&
+	    vb2_get_num_buffers(vq) + *nbufs < AVE_MAX_SLOTS + 1)
+		*nbufs = AVE_MAX_SLOTS + 1 - vb2_get_num_buffers(vq);
 	if (*nplanes)
 		return (*nplanes != 1 || sizes[0] < f->plane_fmt[0].sizeimage) ? -EINVAL : 0;
 	*nplanes = 1;
@@ -519,17 +545,8 @@ static int ave_buf_prepare(struct vb2_buffer *vb)
 static void ave_buf_queue(struct vb2_buffer *vb)
 {
 	struct ave_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
-	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 
-	if (V4L2_TYPE_IS_CAPTURE(vb->type) && vb2_is_streaming(vb->vb2_queue) &&
-	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
-		vb2_set_plane_payload(vb, 0, 0);
-		vbuf->sequence = ctx->dst_sequence++;
-		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
-		v4l2_event_queue_fh(&ctx->fh, &ave_eos_event);
-		return;
-	}
-	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
+	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
 }
 
 static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
@@ -547,30 +564,95 @@ static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
 	}
 }
 
+/* Sessions */
+
+/* Caller holds hw_lock. */
+static void ave_session_close(struct ave_ctx *ctx, bool flush)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+
+	lockdep_assert_held(&ave->hw_lock);
+	if (!sess || ave->active != ctx)
+		return;
+	if (sess->fw_open && ave->fw_state == AVE_FW_RUNNING) {
+		/* Complete is a barrier: answered after every frame before it. */
+		if (flush && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
+			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		if (ave->fw_state == AVE_FW_RUNNING)
+			ave_cmd_close(ctx);
+	}
+	sess->fw_open = false;
+	ave->active = NULL;
+	ave_fw_halt(ave);
+}
+
+/* Return frames the firmware never answered; then drop the session. */
+static void ave_session_free(struct ave_ctx *ctx)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+
+	if (!sess)
+		return;
+	for (unsigned int i = 0; i < sess->p.slots; i++) {
+		struct ave_slot *s = &sess->slot[i];
+
+		if (s->src)
+			v4l2_m2m_buf_done(s->src, VB2_BUF_STATE_ERROR);
+		s->src = NULL;
+	}
+	atomic_set(&ctx->ready, 0);
+	ave_sess_destroy(ctx);
+	pm_runtime_mark_last_busy(ave->dev);
+	pm_runtime_put_autosuspend(ave->dev);
+}
+
+/* Boot the firmware if needed, then Open and Start a session. */
 static int ave_session_begin(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
-	enum ave_codec codec = ave_ctx_codec(ctx);
+	struct ave_session *sess;
 	int ret;
 
-	ret = pm_runtime_resume_and_get(ave->dev);
+	if (ctx->sess)
+		return 0;
+	ret = ave_fw_templates(ave, ave_ctx_codec(ctx));
 	if (ret)
 		return ret;
+	if (READ_ONCE(ave->active))
+		return -EBUSY;
+	sess = ave_sess_create(ctx);
+	if (IS_ERR(sess))
+		return PTR_ERR(sess);
+
+	ret = pm_runtime_resume_and_get(ave->dev);
+	if (ret) {
+		ctx->sess = sess;
+		ave_sess_destroy(ctx);
+		return ret;
+	}
 
 	mutex_lock(&ave->hw_lock);
+	ctx->sess = sess;
+	if (ave->active) {
+		ret = -EBUSY;
+		goto out;
+	}
 	ret = ave_fw_ensure_running(ave);
+	if (ret)
+		goto out;
+	ave->active = ctx;
+	ret = ave_cmd_open(ctx);
 	if (!ret)
-		ret = ave_cmd_open(ctx, codec);
-	if (!ret)
-		ret = ave_cmd_start(ctx, codec);
-	if (ret && ctx->session_open)
-		ave_cmd_finish(ctx, codec);
+		ret = ave_cmd_start(ctx);
+	if (ret)
+		ave_session_close(ctx, false);
+out:
 	mutex_unlock(&ave->hw_lock);
-
 	if (ret) {
-		dev_dbg(ave->dev, "session start failed: %d\n", ret);
-		pm_runtime_mark_last_busy(ave->dev);
-		pm_runtime_put_autosuspend(ave->dev);
+		dev_err(ave->dev, "cannot start an encoding session: %d\n", ret);
+		ave_session_free(ctx);
 	}
 	return ret;
 }
@@ -579,14 +661,19 @@ static void ave_session_end(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
 
-	cancel_work_sync(&ctx->run_work);
+	cancel_delayed_work_sync(&ctx->poll_work);
 	mutex_lock(&ave->hw_lock);
-	if (ave->fw_state == AVE_FW_RUNNING)
-		ave_cmd_finish(ctx, ave_ctx_codec(ctx));
-	ctx->session_open = false;
+	ave_session_close(ctx, true);
 	mutex_unlock(&ave->hw_lock);
-	pm_runtime_mark_last_busy(ave->dev);
-	pm_runtime_put_autosuspend(ave->dev);
+	ave_session_free(ctx);
+}
+
+static void ave_reset_drain(struct ave_ctx *ctx)
+{
+	ctx->draining = false;
+	WRITE_ONCE(ctx->flush_pending, false);
+	ctx->stopped = false;
+	ctx->drain_src = NULL;
 }
 
 static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -597,14 +684,14 @@ static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
 		v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
 	int ret = 0;
 
-	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
 	if (V4L2_TYPE_IS_OUTPUT(q->type))
 		ctx->src_sequence = 0;
 	else
 		ctx->dst_sequence = 0;
+	ave_reset_drain(ctx);
 
-	/* The session starts once both queues stream. */
-	if (vb2_is_streaming(other) && !ctx->session_open)
+	/* The session starts once both queues stream; errors show up here. */
+	if (vb2_is_streaming(other))
 		ret = ave_session_begin(ctx);
 	if (ret)
 		ave_return_bufs(ctx, q, VB2_BUF_STATE_QUEUED);
@@ -615,12 +702,9 @@ static void ave_stop_streaming(struct vb2_queue *q)
 {
 	struct ave_ctx *ctx = vb2_get_drv_priv(q);
 
-	if (ctx->session_open)
-		ave_session_end(ctx);
+	ave_session_end(ctx);
+	ave_reset_drain(ctx);
 	ave_return_bufs(ctx, q, VB2_BUF_STATE_ERROR);
-	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
-	if (V4L2_TYPE_IS_OUTPUT(q->type) && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
-		v4l2_event_queue_fh(&ctx->fh, &ave_eos_event);
 }
 
 static const struct vb2_ops ave_qops = {
@@ -661,50 +745,266 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	return vb2_queue_init(dst);
 }
 
-/* Jobs: one raw frame in, one coded frame out. */
+/*
+ * Jobs. A job delivers finished frames to CAPTURE buffers and sends at most
+ * one new frame. Up to five frames are inside the firmware at once; their
+ * answers are collected by the job and, while frames are outstanding, by a
+ * short poller, since the firmware interrupt is not wired up.
+ */
+
+#define AVE_POLL_MS		2
+
+static int ave_job_ready(void *priv)
+{
+	struct ave_ctx *ctx = priv;
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+
+	if (atomic_read(&ctx->ready) || READ_ONCE(ctx->flush_pending))
+		return 1;
+	if (ctx->stopped || (ctx->draining && !ctx->drain_src))
+		return 0;
+	return v4l2_m2m_num_src_bufs_ready(m2m) > 0;
+}
+
+/*
+ * Hand finished frames, in bitstream order, to CAPTURE buffers. Returns
+ * true when the frame that ends a drain went out (with the LAST flag).
+ */
+static bool ave_deliver(struct ave_ctx *ctx)
+{
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct ave_session *sess = ctx->sess;
+	bool last = false;
+
+	while (sess && sess->done_count) {
+		unsigned int slot = sess->done_fifo[sess->done_head];
+		struct ave_slot *s = &sess->slot[slot];
+		struct vb2_v4l2_buffer *dst;
+		enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
+		bool key = false;
+
+		dst = v4l2_m2m_dst_buf_remove(m2m);
+		if (!dst)
+			break;
+		if (ave_sess_output(ctx, slot, dst, &key)) {
+			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
+			state = VB2_BUF_STATE_ERROR;
+		}
+		v4l2_m2m_buf_copy_metadata(s->src, dst);
+		dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME |
+				V4L2_BUF_FLAG_BFRAME | V4L2_BUF_FLAG_LAST);
+		dst->flags |= key ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
+		dst->sequence = ctx->dst_sequence++;
+
+		sess->done_head = (sess->done_head + 1) % AVE_MAX_SLOTS;
+		sess->done_count--;
+		atomic_dec(&ctx->ready);
+		s->done = false;
+		ave_sess_prepare_slot(sess, slot);
+
+		/* The last frame of a drain carries the LAST flag. */
+		if (READ_ONCE(ctx->flush_pending) && !sess->fw_open && !sess->done_count) {
+			dst->flags |= V4L2_BUF_FLAG_LAST;
+			last = true;
+		}
+		v4l2_m2m_buf_done(s->src, state);
+		s->src = NULL;
+		v4l2_m2m_buf_done(dst, state);
+	}
+	return last;
+}
+
+static bool ave_slot_answered(struct ave_dev *ave, void *arg)
+{
+	struct ave_session *sess = arg;
+
+	return sess->busy < sess->p.slots || sess->done_count;
+}
+
+static bool ave_frame_answered(struct ave_dev *ave, void *arg)
+{
+	struct ave_slot *s = arg;
+
+	return !s->busy;
+}
+
+/* Send the next OUTPUT frame. Caller holds hw_lock. */
+static int ave_encode_one(struct ave_ctx *ctx)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	struct vb2_v4l2_buffer *src;
+	bool last;
+	int slot, ret;
+
+	slot = ave_sess_free_slot(sess);
+	if (slot < 0 && sess->busy == sess->p.slots) {
+		/* Every slot is inside the firmware: wait for one to come back. */
+		ret = ave_ipc_pump(ave, AVE_FRAME_WAIT_MS, ave_slot_answered, sess);
+		if (ret)
+			return ret;
+		ave_deliver(ctx);
+		slot = ave_sess_free_slot(sess);
+	}
+	if (slot < 0)
+		return 0;	/* waiting for CAPTURE buffers */
+
+	src = v4l2_m2m_src_buf_remove(m2m);
+	if (!src)
+		return 0;
+	last = src == ctx->drain_src;
+	src->sequence = ctx->src_sequence++;
+
+	ret = ave_cmd_process(ctx, slot, src, READ_ONCE(ctx->bitrate),
+			      xchg(&ctx->force_key_frame, false));
+	if (ret) {
+		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
+		return ret;
+	}
+
+	/* Like macOS: the first frame goes alone, then a Complete. */
+	if (sess->frames == 1) {
+		ret = ave_ipc_pump(ave, AVE_FRAME_WAIT_MS, ave_frame_answered, &sess->slot[slot]);
+		if (!ret)
+			ret = ave_cmd_complete(ctx, 1);
+		if (!ret)
+			ret = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		if (ret)
+			return ret;
+	} else {
+		ret = ave_ipc_pump(ave, 0, NULL, NULL);
+		if (ret)
+			return ret;
+	}
+
+	if (last) {
+		ctx->drain_src = NULL;
+		WRITE_ONCE(ctx->flush_pending, true);
+	}
+	return 0;
+}
+
+/*
+ * End of a drain: flush and close the session, deliver what is left and
+ * finish with a LAST buffer. Caller holds hw_lock; returns true once the
+ * LAST buffer is out.
+ */
+static bool ave_finish_drain(struct ave_ctx *ctx)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+	struct vb2_v4l2_buffer *dst;
+
+	if (sess && sess->fw_open)
+		ave_session_close(ctx, true);
+	if (sess && sess->busy) {
+		/* The run job fails the session. */
+		dev_err(ave->dev, "%u frames never came back from the firmware\n", sess->busy);
+		return false;
+	}
+	if (sess && sess->done_count)
+		return ave_deliver(ctx);	/* false: waiting for CAPTURE buffers */
+
+	/* Nothing left to deliver: an empty buffer carries the LAST flag. */
+	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+	if (!dst)
+		return false;
+	vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
+	dst->flags |= V4L2_BUF_FLAG_LAST;
+	dst->sequence = ctx->dst_sequence++;
+	v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
+	return true;
+}
+
+/* The firmware or the session failed: return everything, fail the queues. */
+static void ave_job_fail(struct ave_ctx *ctx, int err)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+
+	dev_err(ave->dev, "encoding failed: %d\n", err);
+	mutex_lock(&ave->hw_lock);
+	ave_session_close(ctx, false);
+	mutex_unlock(&ave->hw_lock);
+	ave_session_free(ctx);
+	ave_return_bufs(ctx, v4l2_m2m_get_src_vq(m2m), VB2_BUF_STATE_ERROR);
+	ave_return_bufs(ctx, v4l2_m2m_get_dst_vq(m2m), VB2_BUF_STATE_ERROR);
+	vb2_queue_error(v4l2_m2m_get_src_vq(m2m));
+	vb2_queue_error(v4l2_m2m_get_dst_vq(m2m));
+	ave_reset_drain(ctx);
+}
 
 static void ave_run_work(struct work_struct *work)
 {
 	struct ave_ctx *ctx = container_of(work, struct ave_ctx, run_work);
 	struct ave_dev *ave = ctx->ave;
-	struct vb2_v4l2_buffer *src, *dst;
-	enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
-	bool keyframe = false;
-	u32 bytes = 0;
-	int ret;
+	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	bool eos = false, poll = false;
+	int ret = 0;
 
-	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	/* After a drain, the next frame starts a new session. */
+	if (!ctx->sess && !READ_ONCE(ctx->flush_pending) && v4l2_m2m_num_src_bufs_ready(m2m))
+		ret = ave_session_begin(ctx);
 
 	mutex_lock(&ave->hw_lock);
-	ret = ave_cmd_process(ctx, ave_ctx_codec(ctx), src, dst, &bytes, &keyframe);
-	ctx->force_key_frame = false;
+	if (!ret && ctx->sess && (ctx->sess->dead || ave->active != ctx))
+		ret = -EIO;
+	if (!ret) {
+		eos = ave_deliver(ctx);
+		if (!eos && !READ_ONCE(ctx->flush_pending) && ctx->sess &&
+		    v4l2_m2m_num_src_bufs_ready(m2m) && v4l2_m2m_num_dst_bufs_ready(m2m))
+			ret = ave_encode_one(ctx);
+	}
+	if (!ret && !eos) {
+		eos = ave_deliver(ctx);
+		if (!eos && READ_ONCE(ctx->flush_pending))
+			eos = ave_finish_drain(ctx);
+		/* Frames outstanding need a running firmware. */
+		if (!eos && ctx->sess && ctx->sess->busy && ave->fw_state != AVE_FW_RUNNING)
+			ret = -EIO;
+		poll = !ret && !eos && ctx->sess && ctx->sess->busy;
+	}
 	mutex_unlock(&ave->hw_lock);
+
 	if (ret) {
-		dev_dbg(ave->dev, "frame %u failed: %d\n", ctx->src_sequence, ret);
-		state = VB2_BUF_STATE_ERROR;
-		bytes = 0;
-	}
-
-	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
-	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-	src->sequence = ctx->src_sequence++;
-	dst->sequence = ctx->dst_sequence++;
-	v4l2_m2m_buf_copy_metadata(src, dst);
-	dst->flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME | V4L2_BUF_FLAG_LAST);
-	dst->flags |= keyframe ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
-	vb2_set_plane_payload(&dst->vb2_buf, 0, bytes);
-
-	if (v4l2_m2m_is_last_draining_src_buf(ctx->fh.m2m_ctx, src)) {
-		dst->flags |= V4L2_BUF_FLAG_LAST;
+		ave_job_fail(ctx, ret);
+	} else if (eos) {
+		ave_session_free(ctx);
+		ctx->draining = false;
+		WRITE_ONCE(ctx->flush_pending, false);
+		ctx->stopped = true;
 		v4l2_event_queue_fh(&ctx->fh, &ave_eos_event);
-		v4l2_m2m_mark_stopped(ctx->fh.m2m_ctx);
+	} else if (poll) {
+		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
 	}
-
-	v4l2_m2m_buf_done(src, state);
-	v4l2_m2m_buf_done(dst, state);
 	pm_runtime_mark_last_busy(ave->dev);
-	v4l2_m2m_job_finish(ave->m2m_dev, ctx->fh.m2m_ctx);
+	v4l2_m2m_job_finish(ave->m2m_dev, m2m);
+}
+
+/* Collect frame answers while frames are outstanding and no job runs. */
+static void ave_poll_work(struct work_struct *work)
+{
+	struct ave_ctx *ctx = container_of(to_delayed_work(work), struct ave_ctx, poll_work);
+	struct ave_dev *ave = ctx->ave;
+	bool again = false, fail = false;
+
+	mutex_lock(&ave->hw_lock);
+	if (ctx->sess && ave->active == ctx && !ctx->sess->dead) {
+		fail = ave_ipc_pump(ave, 0, NULL, NULL) != 0;
+		again = !fail && ctx->sess->busy;
+	} else if (ctx->sess && ctx->sess->busy) {
+		fail = true;
+	}
+	mutex_unlock(&ave->hw_lock);
+
+	/* Jobs run on the same ordered queue, so none runs right now. */
+	if (fail)
+		ave_job_fail(ctx, -EIO);
+	else if (atomic_read(&ctx->ready))
+		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
+	if (again)
+		queue_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
 }
 
 static void ave_device_run(void *priv)
@@ -716,6 +1016,7 @@ static void ave_device_run(void *priv)
 
 static const struct v4l2_m2m_ops ave_m2m_ops = {
 	.device_run = ave_device_run,
+	.job_ready = ave_job_ready,
 };
 
 /* File operations */
@@ -731,6 +1032,8 @@ static int ave_open(struct file *file)
 		return -ENOMEM;
 	ctx->ave = ave;
 	INIT_WORK(&ctx->run_work, ave_run_work);
+	INIT_DELAYED_WORK(&ctx->poll_work, ave_poll_work);
+	atomic_set(&ctx->ready, 0);
 	ave_reset_fmts(ctx);
 
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
@@ -743,6 +1046,8 @@ static int ave_open(struct file *file)
 		ret = PTR_ERR(ctx->fh.m2m_ctx);
 		goto err_ctrls;
 	}
+	/* Finished frames can be delivered with no new OUTPUT buffer queued. */
+	v4l2_m2m_set_src_buffered(ctx->fh.m2m_ctx, true);
 	v4l2_fh_add(&ctx->fh, file);
 	return 0;
 
@@ -762,6 +1067,8 @@ static int ave_release(struct file *file)
 	mutex_lock(&ave->vdev_lock);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	mutex_unlock(&ave->vdev_lock);
+	cancel_delayed_work_sync(&ctx->poll_work);
+	cancel_work_sync(&ctx->run_work);
 	v4l2_ctrl_handler_free(&ctx->hdl);
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);

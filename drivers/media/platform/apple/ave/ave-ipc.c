@@ -250,16 +250,172 @@ static int ave_ring_recv(struct ave_dev *ave, struct ave_ring *r, u64 *addr, u32
 	return 0;
 }
 
+static int ave_ipc_buf_offset(unsigned int buf, size_t *max)
+{
+	if (buf == AVE_BUF_CMD) {
+		*max = AVE_IPC_CMD_BYTES;
+		return AVE_IPC_CMD_OFF;
+	}
+	if (buf < AVE_BUF_PROC(0)) {
+		*max = AVE_IPC_SCALAR_BYTES;
+		return AVE_IPC_SCALAR_OFF + (buf - AVE_BUF_SCALAR(0)) * AVE_IPC_SCALAR_BYTES;
+	}
+	*max = AVE_IPC_PROC_BYTES;
+	return AVE_IPC_PROC_OFF + (buf - AVE_BUF_PROC(0)) * AVE_IPC_PROC_BYTES;
+}
+
+/* Which command buffer does a transport ack refer to? */
+static int ave_ipc_buf_of(struct ave_dev *ave, u64 addr)
+{
+	u64 off = addr - ave->ipc_fw_base;
+	size_t max;
+
+	if (addr < ave->ipc_fw_base || off < AVE_IPC_CMD_OFF || off >= AVE_IPC_END)
+		return -EPROTO;
+	for (unsigned int buf = 0; buf < AVE_BUF_COUNT; buf++)
+		if (ave_ipc_buf_offset(buf, &max) == off)
+			return buf;
+	return -EPROTO;
+}
+
 /*
- * Poll both rings once. Returns 1 when the command at @cmd_addr was
- * acknowledged, 2 when a firmware message was copied to ave->msg (and its
- * buffer handed back), 0 when nothing was pending.
+ * Get command buffer @buf, cleared for @len bytes, or NULL while the
+ * firmware still owns it. Caller holds hw_lock.
  */
-static int ave_ipc_poll_once(struct ave_dev *ave, u64 cmd_addr)
+void *ave_ipc_cmd(struct ave_dev *ave, unsigned int buf, size_t len)
+{
+	size_t max;
+	int off;
+
+	if (buf >= AVE_BUF_COUNT || (ave->unacked & BIT(buf)))
+		return NULL;
+	off = ave_ipc_buf_offset(buf, &max);
+	if (len > max)
+		return NULL;
+	memset(ave->ipc.cpu + off, 0, len);
+	return ave->ipc.cpu + off;
+}
+
+static bool ave_ipc_acked(struct ave_dev *ave, void *arg)
+{
+	return !(ave->unacked & BIT(*(unsigned int *)arg));
+}
+
+/* Wait until the firmware has taken command buffer @buf. Caller holds hw_lock. */
+int ave_ipc_wait_ack(struct ave_dev *ave, unsigned int buf)
+{
+	return ave_ipc_pump(ave, AVE_CMD_WAIT_MS, ave_ipc_acked, &buf);
+}
+
+static bool ave_ipc_scalar_free(struct ave_dev *ave, void *arg)
+{
+	return (ave->unacked & GENMASK(AVE_BUF_PROC(0) - 1, AVE_BUF_SCALAR(0))) !=
+		GENMASK(AVE_BUF_PROC(0) - 1, AVE_BUF_SCALAR(0));
+}
+
+/* Pick a free buffer for a scalar command. Caller holds hw_lock. */
+int ave_ipc_scalar_buf(struct ave_dev *ave)
+{
+	int ret;
+
+	ret = ave_ipc_pump(ave, AVE_CMD_WAIT_MS, ave_ipc_scalar_free, NULL);
+	if (ret)
+		return ret;
+	for (unsigned int i = 0; i < AVE_IPC_SCALAR_BUFS; i++) {
+		unsigned int buf = AVE_BUF_SCALAR((ave->scalar_next + i) % AVE_IPC_SCALAR_BUFS);
+
+		if (!(ave->unacked & BIT(buf))) {
+			ave->scalar_next = (buf - AVE_BUF_SCALAR(0) + 1) % AVE_IPC_SCALAR_BUFS;
+			return buf;
+		}
+	}
+	return -EBUSY;
+}
+
+static void ave_ipc_mark_broken(struct ave_dev *ave, int err, const char *what)
+{
+	if (ave->fw_state == AVE_FW_RUNNING)
+		dev_err(ave->dev, "firmware stopped answering (%s: %d); it restarts after the next power cycle\n",
+			what, err);
+	ave->fw_state = AVE_FW_BROKEN;
+}
+
+/*
+ * Hand the command in buffer @buf to the firmware. The timeout words are
+ * {duration, creation} in the host clock the firmware was synced to at boot.
+ * With @reply, the firmware's answer is counted as expected; Halt and
+ * Process are answered differently. Caller holds hw_lock.
+ */
+int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len, u64 timeout_us,
+		   bool reply)
+{
+	size_t max;
+	int off = ave_ipc_buf_offset(buf, &max);
+	u8 *cmd = ave->ipc.cpu + off;
+	u32 op = get_unaligned_le32(cmd + AVE_CMD_OPCODE);
+	int ret;
+
+	lockdep_assert_held(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_RUNNING)
+		return -EIO;
+	if (len < AVE_CMD_HDR_BYTES || len > max || !IS_ALIGNED(len, 4) ||
+	    (ave->unacked & BIT(buf)) || (reply && op >= ARRAY_SIZE(ave->want)))
+		return -EINVAL;
+
+	put_unaligned_le64(timeout_us, cmd + AVE_CMD_TIMEOUT);
+	put_unaligned_le64(div_u64(ktime_get_ns(), NSEC_PER_USEC), cmd + AVE_CMD_CREATED);
+
+	ret = ave_ring_send(ave, &ave->ring[0], ave->ipc_fw_base + off, len);
+	if (ret) {
+		ave_ipc_mark_broken(ave, ret, "command ring full");
+		return ret;
+	}
+	ave->unacked |= BIT(buf);
+	if (reply)
+		ave->want[op]++;
+	return 0;
+}
+
+static void ave_ipc_dispatch(struct ave_dev *ave)
+{
+	u32 id, status;
+
+	if (ave->msg_len < AVE_REPLY_MIN_BYTES) {
+		dev_warn(ave->dev, "short firmware message (%u bytes)\n", ave->msg_len);
+		ave->reply_err = -EPROTO;
+		return;
+	}
+	id = get_unaligned_le16(ave->msg + AVE_REPLY_ID);
+	status = get_unaligned_le32(ave->msg + AVE_REPLY_STATUS);
+
+	if (id == AVE_OP_PROCESS) {
+		if (ave->active)
+			ave_sess_reply(ave->active, ave->msg, ave->msg_len);
+		else
+			dev_warn(ave->dev, "frame reply without a session\n");
+		return;
+	}
+	if (id < ARRAY_SIZE(ave->want) && ave->want[id]) {
+		ave->want[id]--;
+		if (status) {
+			dev_err(ave->dev, "command %u refused: status %#x\n", id, status);
+			ave->reply_err = -EIO;
+		}
+		return;
+	}
+	dev_warn_ratelimited(ave->dev, "unexpected firmware message %u (status %#x)\n",
+			     id, status);
+}
+
+/*
+ * Poll both rings once. Returns 1 when an event (ack or message) was
+ * handled, 0 when nothing was pending.
+ */
+static int ave_ipc_poll_once(struct ave_dev *ave)
 {
 	u32 pending, len, off;
 	u64 addr;
-	int ret;
+	int ret, buf;
 
 	pending = readl(ave->mbox + AVE_MBOX_STATUS);
 	if (pending)
@@ -268,8 +424,12 @@ static int ave_ipc_poll_once(struct ave_dev *ave, u64 cmd_addr)
 	ret = ave_ring_recv(ave, &ave->ring[0], &addr, &len);
 	if (!ret) {
 		/* Transport acks return the command address with no payload. */
-		if (len || addr != cmd_addr)
+		buf = ave_ipc_buf_of(ave, addr);
+		if (len || buf < 0 || !(ave->unacked & BIT(buf))) {
+			dev_err(ave->dev, "bad command ack %#llx/%u\n", addr, len);
 			return -EPROTO;
+		}
+		ave->unacked &= ~BIT(buf);
 		return 1;
 	}
 	if (ret != -EAGAIN)
@@ -282,103 +442,80 @@ static int ave_ipc_poll_once(struct ave_dev *ave, u64 cmd_addr)
 		return ret;
 	if (len > sizeof(ave->msg) || ave_fw_offset(ave, addr, len, &off))
 		return -EPROTO;
+	/* Messages must not land in the buffers the host writes commands to. */
+	if (off < AVE_IPC_END && off + len > AVE_IPC_CMD_OFF) {
+		dev_err(ave->dev, "firmware message at %#x overlaps the command area\n", off);
+		return -EPROTO;
+	}
 	memcpy(ave->msg, ave->ipc.cpu + off, len);
 	ave->msg_len = len;
 	/* Return the message buffer to the firmware. */
 	ret = ave_ring_send(ave, &ave->ring[1], addr, len);
-	return ret ?: 2;
+	if (ret)
+		return ret;
+	ave_ipc_dispatch(ave);
+	return 1;
 }
 
 /*
- * Send one command and wait for its transport ack and the firmware's reply
- * message. The reply is left in ave->msg. Caller holds hw_lock.
+ * Handle acks and messages until @cond holds, for at most @wait_ms. With no
+ * @cond, handle whatever is pending and return. Running out of time means
+ * the firmware is stuck: it is marked broken. Caller holds hw_lock.
  */
-int ave_ipc_call(struct ave_dev *ave, const void *cmd, size_t len)
+int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
+		 bool (*cond)(struct ave_dev *ave, void *arg), void *arg)
 {
-	u64 cmd_addr = ave->ipc_fw_base + AVE_IPC_CMD_OFF;
-	u8 *buf = ave->ipc.cpu + AVE_IPC_CMD_OFF;
-	bool acked = false, replied = false;
-	ktime_t deadline;
-	u32 status;
+	ktime_t deadline = ktime_add_ms(ktime_get(), wait_ms);
 	int ret;
 
 	lockdep_assert_held(&ave->hw_lock);
-	if (ave->fw_state != AVE_FW_RUNNING)
-		return -EIO;
-	if (len < AVE_CMD_HDR_BYTES || len > AVE_IPC_CMD_BYTES || !IS_ALIGNED(len, 4))
-		return -EINVAL;
-
-	memcpy(buf, cmd, len);
-	/* The timeout is {duration, creation} in the clock synced at boot. */
-	put_unaligned_le64(AVE_CMD_TIMEOUT_US, buf + AVE_CMD_TIMEOUT);
-	put_unaligned_le64(div_u64(ktime_get_ns(), NSEC_PER_USEC), buf + AVE_CMD_CREATED);
-	ave->msg_len = 0;
-
-	ret = ave_ring_send(ave, &ave->ring[0], cmd_addr, len);
-	if (ret)
-		goto broken;
-
-	deadline = ktime_add_ms(ktime_get(), AVE_CMD_WAIT_MS);
-	while (!acked || !replied) {
-		ret = ave_ipc_poll_once(ave, cmd_addr);
-		if (ret < 0)
-			goto broken;
-		if (ret == 1)
-			acked = true;
-		else if (ret == 2)
-			replied = true;
-		else if (ktime_after(ktime_get(), deadline))
-			goto timeout;
-		else
-			usleep_range(50, 150);
-	}
-
-	/* The firmware refused the command: the session fails, the firmware lives on. */
-	if (ave->msg_len < AVE_REPLY_MIN_BYTES)
-		goto broken_len;
-	status = get_unaligned_le32(ave->msg + AVE_REPLY_STATUS);
-	if (status) {
-		dev_err(ave->dev, "command %u refused: status %#x\n",
-			get_unaligned_le32(cmd), status);
-		return -EIO;
-	}
-	return 0;
-
-broken_len:
-	ret = -EPROTO;
-	goto broken;
-timeout:
-	ret = -ETIMEDOUT;
-broken:
-	dev_err(ave->dev, "command %u failed: %d (acked %d, replied %d)\n",
-		get_unaligned_le32(cmd), ret, acked, replied);
-	ave->fw_state = AVE_FW_BROKEN;
-	return ret;
-}
-
-/* Wait for one more firmware message (frame completions). */
-int ave_ipc_wait_msg(struct ave_dev *ave, unsigned int timeout_ms)
-{
-	ktime_t deadline = ktime_add_ms(ktime_get(), timeout_ms);
-	int ret;
-
-	lockdep_assert_held(&ave->hw_lock);
-	if (ave->fw_state != AVE_FW_RUNNING)
-		return -EIO;
-
 	for (;;) {
-		ret = ave_ipc_poll_once(ave, 0);
-		if (ret == 2)
+		if (cond && cond(ave, arg))
 			return 0;
-		if (ret < 0)
-			break;
+		if (ave->fw_state != AVE_FW_RUNNING)
+			return -EIO;
+		ret = ave_ipc_poll_once(ave);
+		if (ret < 0) {
+			ave_ipc_mark_broken(ave, ret, "ring error");
+			return ret;
+		}
+		if (ret)
+			continue;
+		if (!cond)
+			return 0;
 		if (ktime_after(ktime_get(), deadline)) {
-			ret = -ETIMEDOUT;
-			break;
+			ave_ipc_mark_broken(ave, -ETIMEDOUT, "no answer");
+			return -ETIMEDOUT;
 		}
 		usleep_range(50, 150);
 	}
-	dev_err(ave->dev, "no firmware message: %d\n", ret);
-	ave->fw_state = AVE_FW_BROKEN;
+}
+
+static bool ave_ipc_answered(struct ave_dev *ave, void *arg)
+{
+	u32 mask = *(u32 *)arg;
+
+	if (ave->unacked & mask)
+		return false;
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave->want); i++)
+		if (ave->want[i] && i != AVE_OP_HALT)
+			return false;
+	return true;
+}
+
+/*
+ * Wait until every command except Process has been acknowledged and
+ * answered. Returns the first refusal seen since the last call.
+ * Caller holds hw_lock.
+ */
+int ave_ipc_settle(struct ave_dev *ave, unsigned int wait_ms)
+{
+	u32 mask = GENMASK(AVE_BUF_PROC(0) - 1, 0);
+	int ret;
+
+	ret = ave_ipc_pump(ave, wait_ms, ave_ipc_answered, &mask);
+	if (!ret)
+		ret = ave->reply_err;
+	ave->reply_err = 0;
 	return ret;
 }
