@@ -1235,6 +1235,15 @@ static void link_worker(struct work_struct *work)
 	}
 }
 
+/* MSI from Control or Alpha: service the data rings now instead of at the next poll. */
+void centauri_wifi_kick(struct centauri *c)
+{
+	struct centauri_wifi *wifi = READ_ONCE(c->wifi);
+
+	if (wifi && READ_ONCE(wifi->connected) && !READ_ONCE(wifi->stopping))
+		mod_delayed_work(system_wq, &wifi->link_work, 0);
+}
+
 static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 {
 	struct centauri_wifi *wifi = *(struct centauri_wifi **)wiphy_priv(wiphy);

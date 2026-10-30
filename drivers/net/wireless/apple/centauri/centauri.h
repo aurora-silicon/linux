@@ -47,7 +47,8 @@ struct centauri {
  * keep_port_tables: the J813 sequence zeroes the 16 words at port+0x3000 and the 256 words at
  * port+0x3800. On the J873 those are the RID2SID and MSIMAP tables that pcie-apple programmed
  * (PORT_T602X_RID2SID, PORT_T602X_MSIMAP); the cycle then drops function 0's stream entry and
- * its DMA arrives as SID 0 (DART "BPF reject"). Such a board gets both tables written back.
+ * its DMA arrives as SID 0 (DART "BPF reject"). Such a board gets its RID2SID table written
+ * back; the MSI map and the MSI address/config are restored on every board.
  * link_tlv, scan_tlvs: the macOS 27.0 WLAN adapter differs from the 26.6.1 one the J813 recipe
  * came from. startInterface carries the three link addresses in TLV 386 (was 385), and the scan
  * request (command 0x1000f) carries a channel-list TLV 0x104 and an OCE TLV 0x165 after the fixed
@@ -91,4 +92,5 @@ int centauri_alpha_resources(struct centauri *c, struct cen_alpha_resources *res
 int centauri_alpha_log_buffer(struct centauri *c, void **cpu, dma_addr_t *dma, size_t *size);
 int centauri_wifi_register(struct centauri *c);
 void centauri_wifi_unregister(struct centauri *c);
+void centauri_wifi_kick(struct centauri *c);
 #endif
