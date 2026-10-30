@@ -121,6 +121,12 @@ pub(crate) fn plan<'a>(
     let mut count = 0;
     let mut crowded = false;
     for entry in live {
+        // The logical prefix already orders this owner's covered commands,
+        // whatever their attachments. They neither select a pair nor count
+        // toward the other owners' publication-barrier limit.
+        if entry.owner == owner && Order::contains(prefix, entry.sequence) {
+            continue;
+        }
         let foreign = entry.owner != owner && footprint.same_vm(entry.footprint);
         if let Some(slot) = entry.slot.filter(|_| foreign) {
             if !pairs[..count].contains(&slot) {
@@ -148,9 +154,6 @@ pub(crate) fn plan<'a>(
         if entry.owner != owner {
             return Plan::Wait;
         }
-        if Order::contains(prefix, entry.sequence) {
-            continue;
-        }
         match selected {
             None => selected = Some(slot),
             Some(prior) if prior == slot => {}
@@ -161,4 +164,79 @@ pub(crate) fn plan<'a>(
         return Plan::Wait;
     }
     selected.map_or(Plan::Any, Plan::Pair)
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_hazard_prefix)]
+mod tests {
+    use super::*;
+
+    fn footprint(vm: u64, start: u64) -> Footprint {
+        let mut footprint = Footprint::new(vm);
+        footprint.push_vm(start, start + 0x1000);
+        footprint
+    }
+
+    #[test]
+    fn a_prefix_only_covers_its_own_owner_and_ordinals() {
+        let footprint = footprint(1, 0x1000);
+        let live = |sequence| Live {
+            owner: 1,
+            sequence,
+            slot: Some(2),
+            ticket: 0,
+            footprint: &footprint,
+            quarantined: false,
+        };
+        assert!(plan(1, Some(7), None, &footprint, [live(7)]) == Plan::Any);
+        assert!(plan(1, Some(7), None, &footprint, [live(8)]) == Plan::Pair(2));
+        assert!(plan(1, None, None, &footprint, [live(7)]) == Plan::Pair(2));
+        // Sequence zero never belongs to a prefix.
+        assert!(plan(1, Some(7), None, &footprint, [live(0)]) == Plan::Pair(2));
+    }
+
+    #[test]
+    fn covered_commands_do_not_hide_an_unordered_sibling() {
+        let footprint = footprint(1, 0x1000);
+        let live = |sequence, slot| Live {
+            owner: 1,
+            sequence,
+            slot: Some(slot),
+            ticket: 0,
+            footprint: &footprint,
+            quarantined: false,
+        };
+        assert!(plan(1, Some(7), None, &footprint, [live(7, 2), live(8, 3)]) == Plan::Pair(3));
+        assert!(plan(1, Some(6), None, &footprint, [live(7, 2), live(8, 3)]) == Plan::Wait);
+    }
+
+    #[test]
+    fn another_owners_same_vm_renders_still_count_toward_capacity() {
+        let footprint = footprint(1, 0x1000);
+        let live = (1..=PUBLICATION_BARRIERS + 1).map(|slot| Live {
+            owner: 2,
+            sequence: 1,
+            slot: Some(slot as u8),
+            ticket: 0,
+            footprint: &footprint,
+            quarantined: false,
+        });
+        assert!(plan(1, Some(u64::MAX), None, &footprint, live) == Plan::Wait);
+    }
+
+    #[test]
+    fn cross_vm_shared_attachments_still_wait_for_retirement() {
+        let mut first = footprint(1, 0x1000);
+        let mut second = footprint(2, 0x2000);
+        first.push_object(0x100, 0, 0x1000);
+        second.push_object(0x100, 0, 0x1000);
+        let live = Live {
+            owner: 2,
+            sequence: 1,
+            slot: Some(2),
+            ticket: 0,
+            footprint: &second,
+            quarantined: false,
+        };
+        assert!(plan(1, Some(u64::MAX), None, &first, [live]) == Plan::Wait);
+    }
 }

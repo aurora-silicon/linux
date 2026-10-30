@@ -225,7 +225,11 @@ impl Port {
 
     /// Exposes `record` in its reserved slot. Inner queue records must be visible first. Returns
     /// the new producer, the retained consumer witness for this slot.
-    pub(super) fn publish_compute(&self, mut claim: OuterClaim<'_>, record: &WorkSlot) -> Result<u32> {
+    pub(super) fn publish_compute(
+        &self,
+        mut claim: OuterClaim<'_>,
+        record: &WorkSlot,
+    ) -> Result<u32> {
         if record.data_master != DataMaster::Compute as u32 || !core::ptr::eq(claim.port, self) {
             return Err(EINVAL);
         }
@@ -242,7 +246,8 @@ impl Port {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 core::ptr::from_ref(record).cast::<u8>(),
-                ring.slots.add(producer as usize * core::mem::size_of::<WorkSlot>()),
+                ring.slots
+                    .add(producer as usize * core::mem::size_of::<WorkSlot>()),
                 core::mem::size_of::<WorkSlot>(),
             );
         }
@@ -280,13 +285,16 @@ impl Port {
         let (fragment, tiling) = self.render_rings(priority)?;
         let cursors = [fragment.cursors()?, tiling.cursors()?];
         let room = |[first, second, producer]: [u32; 3]| {
-            let room = |consumer: u32| (consumer + WORK_RING_SLOTS - producer - 1) % WORK_RING_SLOTS;
+            let room =
+                |consumer: u32| (consumer + WORK_RING_SLOTS - producer - 1) % WORK_RING_SLOTS;
             room(first).min(room(second))
         };
-        Ok((room(cursors[0]) > 0 && room(cursors[1]) > 0).then_some(RenderRoom {
-            priority,
-            producers: [cursors[0][2], cursors[1][2]],
-        }))
+        Ok(
+            (room(cursors[0]) > 0 && room(cursors[1]) > 0).then_some(RenderRoom {
+                priority,
+                producers: [cursors[0][2], cursors[1][2]],
+            }),
+        )
     }
 
     /// Copies a render pair's fragment, then tiling record into the slots after the producers
@@ -312,7 +320,10 @@ impl Port {
                 return Err(EINVAL);
             }
             // SAFETY: The ring view spans WORK_RING_SLOTS records; `producer` is in range.
-            let slot = unsafe { ring.slots.add(producer as usize * core::mem::size_of::<WorkSlot>()) };
+            let slot = unsafe {
+                ring.slots
+                    .add(producer as usize * core::mem::size_of::<WorkSlot>())
+            };
             Ok((slot, (producer + 1) % WORK_RING_SLOTS))
         };
         let (fragment_slot, fragment_next) = slot(&fragment_ring, room.producers[0])?;
@@ -378,29 +389,39 @@ impl Port {
         unsafe { qos::View::from_raw(self.views()?.qos) }
     }
 
+    /// Publishes the owner of a compute command. `now` is the monotonic time of the
+    /// submission, which a direct publisher read once for all of its steps.
     pub(super) fn qos_publish(
         &self,
         owner: qos::Owner,
         scheduler: u64,
         policy: Policy,
+        now: u64,
     ) -> Result<qos::Publication> {
         let view = self.qos_view()?;
-        let publication = self.qos.lock().publish(&view, owner, scheduler, policy, qos::clock)?;
-        self.rx_update();
+        let publication = self
+            .qos
+            .lock()
+            .publish(&view, owner, scheduler, policy, qos::clock)?;
+        self.rx_update(now);
         Ok(publication)
     }
 
-    /// Publishes the two owners of a render command, fragment then tiling.
+    /// Publishes the two owners of a render command, fragment then tiling. `now` is as for
+    /// [`Self::qos_publish`].
     pub(super) fn qos_publish_pair(
         &self,
         owners: [qos::Owner; 2],
         scheduler: u64,
         policy: Policy,
+        now: u64,
     ) -> Result<[qos::Publication; 2]> {
         let view = self.qos_view()?;
         let publications =
-            self.qos.lock().publish_owners(&view, owners, scheduler, policy, qos::clock)?;
-        self.rx_update();
+            self.qos
+                .lock()
+                .publish_owners(&view, owners, scheduler, policy, qos::clock)?;
+        self.rx_update(now);
         Ok(publications)
     }
 
@@ -412,19 +433,20 @@ impl Port {
     pub(super) fn qos_complete(&self, owners: &[qos::Owner]) -> Result {
         let view = self.qos_view()?;
         self.qos.lock().complete(&view, owners)?;
-        self.rx_update();
+        self.rx_update(super::now_ns());
         Ok(())
     }
 
     /// Requests the receive thread's minimum utilization for the feed's current view of the GPU.
     /// Called at every publication and completion: the feed's state lingers for a few
     /// milliseconds, so after a pause the publication that ends it restores the default before
-    /// its completion arrives.
-    fn rx_update(&self) {
+    /// its completion arrives. A `now` a few microseconds old changes nothing against that
+    /// linger.
+    fn rx_update(&self, now: u64) {
         let Some(rx) = self.rx.as_ref() else {
             return;
         };
-        let want = self.feed.gpu_bound().then_some(RX_UTIL_MIN_GPU_BOUND);
+        let want = self.feed.gpu_bound(now).then_some(RX_UTIL_MIN_GPU_BOUND);
         let mut applied = self.rx_applied.lock();
         if *applied != Some(want) && rx.set(want).is_ok() {
             *applied = Some(want);
@@ -468,10 +490,11 @@ impl Port {
 
     /// A publisher without the device mutex counts itself before it checks that full effort is
     /// applied. The idle clear withdraws the flag before it rechecks the count, so either the
-    /// clear sees this submission or this submission sees the flag withdrawn.
-    pub(super) fn note_submission(&self) -> bool {
+    /// clear sees this submission or this submission sees the flag withdrawn. `now` is the
+    /// monotonic time of the submission.
+    pub(super) fn note_submission(&self, now: u64) -> bool {
         self.submissions.fetch_add(1, Ordering::SeqCst);
-        self.note_gpu_activity();
+        self.note_gpu_activity_at(now);
         self.effort_full.load(Ordering::SeqCst)
     }
 
@@ -485,13 +508,21 @@ impl Port {
     }
 
     pub(super) fn note_gpu_activity(&self) {
-        self.last_submission_ns.store(super::now_ns(), Ordering::Relaxed);
+        self.note_gpu_activity_at(super::now_ns());
+    }
+
+    fn note_gpu_activity_at(&self, now: u64) {
+        self.last_submission_ns.store(now, Ordering::Relaxed);
         self.demand.set_active(true);
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        writeln!(f, "effort_full={} direct_submissions={} last_submission_ns={}",
-            self.effort_full.load(Ordering::SeqCst), self.submissions(),
-            self.last_submission_ns.load(Ordering::Relaxed))
+        writeln!(
+            f,
+            "effort_full={} direct_submissions={} last_submission_ns={}",
+            self.effort_full.load(Ordering::SeqCst),
+            self.submissions(),
+            self.last_submission_ns.load(Ordering::Relaxed)
+        )
     }
 }

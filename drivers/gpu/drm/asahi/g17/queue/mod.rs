@@ -100,15 +100,19 @@ pub(crate) struct Queue<B: Backend> {
     /// can tear a whole completion down; that waits until the ioctl has published.
     finished: KVec<Fences>,
     failures: [Option<(u64, Fence)>; 2],
+    /// The command and VM-pin vectors of the last ioctl, empty, kept for the next one so that
+    /// a submission allocates neither (see [`Self::submit`]).
+    spare: Option<(KVec<PendingCommand>, KVec<mmu::VmJobGuard>)>,
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
 }
 
-type ValidatedBatch = (
-    KVec<(Validated, Order, Destinations)>,
-    KVec<mmu::VmJobGuard>,
-);
+type PendingCommand = (Validated, Order, Destinations);
+
+/// Commands of one ioctl whose vectors a queue keeps for its next ioctl: enough for the
+/// common submission of a few commands, without holding many validated commands' worth.
+const SPARE_COMMANDS: usize = 8;
 
 impl<B: Backend> Queue<B> {
     pub(crate) fn new(
@@ -144,6 +148,7 @@ impl<B: Backend> Queue<B> {
             frontiers: core::array::from_fn(|_| KVec::new()),
             finished: KVec::new(),
             failures: [None, None],
+            spare: None,
             _slot: slot,
         })
     }
@@ -412,54 +417,68 @@ impl<B: Backend> Queue<B> {
         &mut self,
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-    ) -> Result<ValidatedBatch> {
-        let parse_guard = self.context.vm().retain_first_job()?;
-        let mut parser = Parser::new(bytes);
-        // All historical ordinals use the same entry counters; publication
-        // starts only after the entire ioctl has been validated and pinned.
-        let base = self.sequence;
-        let mut preceding = [0; 2];
-        let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
-        while let Some(command) = parser.next()? {
-            let payload = self.proof.validate(
-                self.context.vm(),
-                self.range.clone(),
-                &self.window,
-                self.variant,
-                &command.payload,
-            )?;
-            let engine = match &payload {
-                Validated::Render { .. } => Engine::Render,
-                Validated::Compute { .. } => Engine::Compute,
-            };
-            let order = Order::new(
-                base,
-                preceding,
-                command.barriers,
-                command.payload.prior(),
-                engine,
-            )?;
-            preceding[engine.index()] += 1;
-            let destinations = match &payload {
-                Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps)?,
-                Validated::Compute { timestamps, .. } => {
-                    Destinations::resolve(objects, core::slice::from_ref(timestamps))?
-                }
-            };
-            pending.push((payload, order, destinations), GFP_KERNEL)?;
-        }
-        parser.finish()?;
-        // Every accepted command pins the VM before any command is enqueued.
-        let mut guards = KVec::with_capacity(pending.len(), GFP_KERNEL)?;
-        guards
-            .push_within_capacity(parse_guard)
-            .map_err(|_| ENOMEM)?;
-        while guards.len() < pending.len() {
+        pending: &mut KVec<PendingCommand>,
+        guards: &mut KVec<mmu::VmJobGuard>,
+    ) -> Result {
+        let mut parse_guard = Some(self.context.vm().retain_first_job()?);
+        let result = (|| {
+            let mut parser = Parser::new(bytes);
+            // All historical ordinals use the same entry counters; publication
+            // starts only after the entire ioctl has been validated and pinned.
+            let base = self.sequence;
+            let mut preceding = [0; 2];
+            pending.reserve(1, GFP_KERNEL)?;
+            while let Some(command) = parser.next()? {
+                let payload = self.proof.validate(
+                    self.context.vm(),
+                    self.range.clone(),
+                    &self.window,
+                    self.variant,
+                    &command.payload,
+                )?;
+                let engine = match &payload {
+                    Validated::Render { .. } => Engine::Render,
+                    Validated::Compute { .. } => Engine::Compute,
+                };
+                let order = Order::new(
+                    base,
+                    preceding,
+                    command.barriers,
+                    command.payload.prior(),
+                    engine,
+                )?;
+                preceding[engine.index()] += 1;
+                let destinations = match &payload {
+                    Validated::Render { timestamps, .. } => {
+                        Destinations::resolve(objects, timestamps)?
+                    }
+                    Validated::Compute { timestamps, .. } => {
+                        Destinations::resolve(objects, core::slice::from_ref(timestamps))?
+                    }
+                };
+                pending.push((payload, order, destinations), GFP_KERNEL)?;
+            }
+            parser.finish()?;
+            // Every accepted command pins the VM before any command is enqueued.
+            guards.reserve(pending.len(), GFP_KERNEL)?;
             guards
-                .push_within_capacity(self.context.vm().retain_job()?)
+                .push_within_capacity(parse_guard.take().ok_or(EIO)?)
                 .map_err(|_| ENOMEM)?;
+            while guards.len() < pending.len() {
+                guards
+                    .push_within_capacity(self.context.vm().retain_job()?)
+                    .map_err(|_| ENOMEM)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // Release in the order of the vectors this used to own: the pins, the commands,
+            // then a parse pin not yet moved.
+            guards.clear();
+            pending.clear();
         }
-        Ok((pending, guards))
+        drop(parse_guard);
+        result
     }
 }
 
@@ -483,11 +502,14 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
         let mut outputs = Outputs::new(&self.fences, syncs, input_count, &self.allocation_failure)?;
+        // Both vectors are empty on entry, and emptied before they are kept again, at the
+        // point where this ioctl's own vectors were dropped before.
+        let (mut pending, mut guards) = self.spare.take().unwrap_or((KVec::new(), KVec::new()));
         let result = (|| {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (mut pending, guards) = self.prepare_submission(bytes, objects)?;
+            self.prepare_submission(bytes, objects, &mut pending, &mut guards)?;
             if pending
                 .iter()
                 .any(|(command, _, _)| matches!(command, Validated::Render { .. }))
@@ -499,12 +521,15 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     command.allow_long_job();
                 }
             }
-            let mut guards = guards.into_iter();
+            // As before, failure to publish the aggregate drops the remaining
+            // pins before the validated commands. On enqueue failure the two
+            // drain iterators instead drop the remaining commands first.
+            let mut guards = guards.drain_all();
             let firmware_source = pending.len() == 1
                 && matches!(&pending[0].0, Validated::Compute { .. })
                 && !pending[0].2.has_outputs();
             let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
-            for (command, order, destinations) in pending {
+            for (command, order, destinations) in pending.drain_all() {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
                     id,
@@ -518,6 +543,12 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             }
             Ok(())
         })();
+        // What a failure left unenqueued is released here, as before.
+        pending.clear();
+        guards.clear();
+        if pending.capacity() <= SPARE_COMMANDS && guards.capacity() <= SPARE_COMMANDS {
+            self.spare = Some((pending, guards));
+        }
         // Everything this ioctl publishes is visible; release what it pruned.
         self.finished.clear();
         if let Err(error) = result {
