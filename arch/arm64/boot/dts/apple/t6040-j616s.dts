@@ -3868,6 +3868,19 @@
  */
 &smc_hwmon {
 	#cooling-cells = <3>;
+
+	/*
+	 * The SMC accepts a manual speed for both fans once its fan test
+	 * key unlocks them, and returns them to system mode when the
+	 * request is dropped.
+	 */
+	fan-F0Ac {
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-manual-control;
+	};
 };
 
 &pcie_dart {
