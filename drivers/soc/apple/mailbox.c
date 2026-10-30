@@ -115,6 +115,11 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 #define APPLE_MBOX_MSG1_MSG GENMASK(31, 0)
 
 #define APPLE_MBOX_TX_TIMEOUT 500
+/*
+ * The send-empty interrupt reports an empty FIFO, not free space. A sender
+ * that waits for it also checks the FIFO this often.
+ */
+#define APPLE_MBOX_TX_RECHECK_MS 2
 #define APPLE_G17_MBOX_RX_BUDGET 64
 #define APPLE_G17_MBOX_ATOMIC_TX_US 1000
 
@@ -359,18 +364,19 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		}
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
+		/*
+		 * The firmware can take messages without emptying the FIFO,
+		 * which raises no interrupt, so check it again after a short
+		 * wait; the deadline above ends the loop. Other senders may be
+		 * waiting on the same interrupt: a sender that gives up leaves
+		 * it unmasked for them. The handler masks it when it fires,
+		 * and removal masks it otherwise.
+		 */
 		t = wait_for_completion_interruptible_timeout(
-			&mbox->tx_empty, remaining);
-		if (t <= 0) {
-			/* A late IRQ may already have masked this under tx_lock. */
-			spin_lock_irqsave(&mbox->tx_lock, flags);
-			if (mbox->tx_irq_unmasked) {
-				disable_irq_nosync(mbox->irq_send_empty);
-				mbox->tx_irq_unmasked = false;
-			}
-			spin_unlock_irqrestore(&mbox->tx_lock, flags);
-			return t < 0 ? t : -ETIMEDOUT;
-		}
+			&mbox->tx_empty,
+			min(remaining, msecs_to_jiffies(APPLE_MBOX_TX_RECHECK_MS)));
+		if (t < 0)
+			return t;
 
 		spin_lock_irqsave(&mbox->tx_lock, flags);
 		if (unlikely(READ_ONCE(mbox->removing))) {
@@ -406,7 +412,13 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 		disable_irq_nosync(mbox->irq_send_empty);
 		mbox->tx_irq_unmasked = false;
 	}
-	complete(&mbox->tx_empty);
+	/*
+	 * Wake every waiting sender, not just one. The interrupt is now
+	 * masked, so a sender left asleep would only wake at its timeout,
+	 * with room in the FIFO. A woken sender that still finds the FIFO
+	 * full rearms the interrupt before it waits again.
+	 */
+	complete_all(&mbox->tx_empty);
 	spin_unlock(&mbox->tx_lock);
 
 	return IRQ_HANDLED;
