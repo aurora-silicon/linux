@@ -42,6 +42,8 @@ struct DirectHost<'a> {
     room: RenderRoom,
     generation: u64,
     activation: Option<(u16, u64)>,
+    /// When the publication started (see `Port::note_submission`).
+    now: u64,
 }
 
 impl crate::g17::queue::render::Host for DirectHost<'_> {
@@ -60,7 +62,7 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
     ) -> Result<[crate::g17::qos::Publication; 2]> {
-        self.port.qos_publish_pair(owners, scheduler, policy)
+        self.port.qos_publish_pair(owners, scheduler, policy, self.now)
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
         self.port.qos_cancel(publication)
@@ -277,8 +279,10 @@ impl Backend {
         if self.shared.crashed.load(Ordering::Acquire) || port.recovery_state().ok()? != 0 {
             return None;
         }
-        // Full effort is applied by the device-mutex path when it is not already.
-        if !port.note_submission() {
+        // Full effort is applied by the device-mutex path when it is not already. The clock
+        // is read once for the whole publication.
+        let now = crate::g17::now_ns();
+        if !port.note_submission(now) {
             return None;
         }
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Render) {
@@ -329,6 +333,7 @@ impl Backend {
                 room,
                 generation,
                 activation: None,
+                now,
             };
             let result = pair.publish(
                 packet.clone(),

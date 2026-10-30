@@ -563,7 +563,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
         scheduler: u64,
         policy: crate::g17::fw::queue::Policy,
     ) -> Result<[crate::g17::qos::Publication; 2]> {
-        self.firmware.port.qos_publish_pair(owners, scheduler, policy)
+        self.firmware.port.qos_publish_pair(owners, scheduler, policy, super::now_ns())
     }
     fn qos_cancel(&mut self, publication: crate::g17::qos::Publication) -> Result {
         self.firmware.port.qos_cancel(publication)
