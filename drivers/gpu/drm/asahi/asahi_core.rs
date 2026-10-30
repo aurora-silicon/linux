@@ -12,21 +12,21 @@ mod driver;
 mod event;
 mod file;
 mod float;
-mod fwid;
 mod fw;
-mod gem;
-mod g17;
+mod fwid;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 mod g15;
+mod g17;
+mod gem;
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 mod g16;
 mod gpu;
 mod hw;
 mod initdata;
+mod m3;
 mod mem;
 mod memacct;
-mod m3;
 mod microseq;
 mod mmu;
 mod object;
@@ -37,6 +37,7 @@ mod slotalloc;
 mod stats;
 mod sysfs_exports;
 mod timestamp;
+mod usage;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;

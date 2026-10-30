@@ -367,6 +367,7 @@ pub(crate) trait Gpu: Send + Sync {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>>;
     /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
     fn map_timestamp_buffer(
@@ -1411,6 +1412,7 @@ impl Gpu for GpuManager::ver {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>> {
         let mut kalloc = self.alloc();
         let id = self.ids.queue.next();
@@ -1428,6 +1430,7 @@ impl Gpu for GpuManager::ver {
                 id,
                 priority,
                 usc_exec_base,
+                usage,
             )?,
             GFP_KERNEL,
         )?)

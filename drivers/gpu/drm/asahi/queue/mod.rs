@@ -67,7 +67,9 @@ mod render;
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
-        if layouts != [0; 2] { return Err(EINVAL); }
+        if layouts != [0; 2] {
+            return Err(EINVAL);
+        }
         Ok(())
     }
 
@@ -151,6 +153,7 @@ pub(crate) struct QueueInner {
     notifier_list: Arc<GpuObject<fw::event::NotifierList>>,
     notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
     usc_exec_base: u64,
+    usage: Arc<crate::usage::Client>,
     id: u64,
     #[ver(V >= V13_0B4)]
     counter: AtomicU64,
@@ -266,7 +269,10 @@ impl sched::JobImpl for QueueJob::ver {
         Some(kernel::module::this_module::<crate::LocalModule>());
 
     fn timeout_data(&self) -> QueueTimeout {
-        QueueTimeout { dev: self.dev.clone(), id: self.id }
+        QueueTimeout {
+            dev: self.dev.clone(),
+            id: self.id,
+        }
     }
 
     fn prepare(job: &mut Self) -> Option<Fence> {
@@ -482,6 +488,7 @@ impl Queue::ver {
         id: u64,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<Queue::ver> {
         mod_dev_dbg!(dev, "[Queue {}] Creating queue\n", id);
 
@@ -552,6 +559,7 @@ impl Queue::ver {
                 notifier_list: Arc::new(notifier_list, GFP_KERNEL)?,
                 notifier,
                 usc_exec_base,
+                usage,
                 id,
                 #[ver(V >= V13_0B4)]
                 counter: AtomicU64::new(0),
@@ -764,13 +772,21 @@ impl Queue for Queue::ver {
             match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(payload_size)?;
-                    if render.ts_frag_end_copies.iter().any(|ts| ts.handle != 0 || ts.offset != 0) {
+                    if render
+                        .ts_frag_end_copies
+                        .iter()
+                        .any(|ts| ts.handle != 0 || ts.offset != 0)
+                    {
                         return Err(EINVAL);
                     }
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
                     let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(payload_size)?;
-                    if compute.ts_end_copies.iter().any(|ts| ts.handle != 0 || ts.offset != 0) {
+                    if compute
+                        .ts_end_copies
+                        .iter()
+                        .any(|ts| ts.handle != 0 || ts.offset != 0)
+                    {
                         return Err(EINVAL);
                     }
                 }
