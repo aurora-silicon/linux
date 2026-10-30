@@ -1084,33 +1084,41 @@ enum hub_activation_type {
 static void hub_reconnect_ss_peer(struct usb_hub *hub)
 {
 	struct usb_device *ss = hub->hdev;
+	struct usb_device *old_hs = NULL, *old_ss = NULL;
 	struct usb_hub *parent, *hs_hub;
 	struct usb_port *upstream, *peer;
 
 	if (!ss->parent || !hub_is_superspeed(ss))
 		return;
 
-	guard(mutex)(&usb_port_peer_mutex);
+	mutex_lock(&usb_port_peer_mutex);
 	parent = usb_hub_to_struct_hub(ss->parent);
 	if (!parent || ss->portnum > ss->parent->maxchild)
-		return;
+		goto unlock;
 	upstream = parent->ports[ss->portnum - 1];
 	peer = upstream->peer;
 	/* Only firmware-described, asymmetric paths need this handover. */
 	if (!upstream->connector_node || !peer)
-		return;
+		goto unlock;
 	hs_hub = usb_hub_to_struct_hub(to_usb_device(peer->dev.parent->parent));
 	if (!hs_hub || hs_hub->disconnected || hs_hub->hdev->level == ss->parent->level)
-		return;
+		goto unlock;
 
 	/* Disconnect publishes child = NULL under device_state_lock. */
 	scoped_guard(spinlock_irq, &device_state_lock) {
-		if (!peer->child || peer->reconnect_ss || peer->ss_reconnected)
-			return;
+		if (!usb_port_may_queue_ss_reconnect(peer, ss))
+			goto unlock;
+		/* A new SS attachment supersedes a request the USB2 worker has not read. */
+		old_hs = peer->reconnect_hs;
+		old_ss = peer->reconnect_ss;
 		peer->reconnect_hs = usb_get_dev(peer->child);
 		peer->reconnect_ss = usb_get_dev(ss);
 	}
 	kick_hub_wq(hs_hub);
+unlock:
+	mutex_unlock(&usb_port_peer_mutex);
+	usb_put_dev(old_hs);
+	usb_put_dev(old_ss);
 }
 
 static void hub_init_func2(struct work_struct *ws);
@@ -2254,6 +2262,10 @@ int usb_hub_port_power_off(struct usb_device *hdev, int port1)
 	dev_dbg(&port_dev->dev, "lane handover: power off\n");
 	/* The runtime PM reference is dropped once the hold ends. */
 	port_dev->held_off = !disabled;
+	if (port_dev->is_superspeed && !disabled) {
+		guard(mutex)(&usb_port_peer_mutex);
+		port_dev->ss_handover_generation++;
+	}
 	/* Nothing hub_wq still has queued for the port applies to it off. */
 	clear_bit(port1, hub->change_bits);
 	clear_bit(port1, hub->warm_reset_bits);
@@ -6226,6 +6238,7 @@ static void hub_port_reconnect_ss(struct usb_hub *hub, int port1)
 {
 	struct usb_port *port = hub->ports[port1 - 1];
 	struct usb_device *hs, *ss;
+	u32 handover = 0;
 	bool reconnect;
 	int ret;
 
@@ -6237,6 +6250,8 @@ static void hub_port_reconnect_ss(struct usb_hub *hub, int port1)
 		if (!ss)
 			return;
 		reconnect = usb_port_needs_ss_reconnect(port, hs, ss);
+		if (reconnect)
+			handover = port->peer->ss_handover_generation;
 	}
 	if (!reconnect)
 		goto out;
@@ -6248,6 +6263,8 @@ static void hub_port_reconnect_ss(struct usb_hub *hub, int port1)
 	/* Power loss can reconnect the SS half too; it must not start a loop. */
 	scoped_guard(mutex, &usb_port_peer_mutex) {
 		port->ss_reconnected = true;
+		/* An older in-flight cycle cannot consume a newer lane handover. */
+		port->ss_reconnect_generation = handover;
 		port->ss_reconnect_pending = true;
 	}
 
