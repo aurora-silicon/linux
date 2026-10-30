@@ -1876,8 +1876,18 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	long val = uvalue->value.integer.value[0];
 
-	if (uvalue->value.integer.value[0] != SPEAKER_MAGIC_VALUE)
+	/*
+	 * Reads return the lock state (0 or 1), so a saved mixer state holds
+	 * one of those. Writing it back changes nothing: only the lock owner's
+	 * magic value renews the lease. Accept it as a no-op so that restoring
+	 * a saved state before the daemon has taken the lock is not an error.
+	 */
+	if (val == 0 || val == 1)
+		return 0;
+
+	if (val != SPEAKER_MAGIC_VALUE)
 		return -EINVAL;
 
 	mutex_lock(&ma->volume_lock_mutex);
