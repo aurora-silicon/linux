@@ -998,10 +998,11 @@ static void cd321x_retry_held_mux(struct cd321x *cd321x)
 	if (!cd321x->pm.mux_retry_ms)
 		dev_info(cd321x->tps.dev, "Type-C mux held up, retrying\n");
 	delay = cd321x_pm_mux_held(&cd321x->pm, now_ms);
-	if (delay)
+	/* Probe records the hold, but ready() must enable the workers first. */
+	if (delay && cd321x->pm.phase != CD321X_PM_INITIALIZING)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(delay));
-	else
+	else if (!delay)
 		dev_warn(cd321x->tps.dev,
 			 "Type-C mux still held up after %u retries in %u s, waiting for the next event\n",
 			 retries, held_ms / 1000);
@@ -2080,6 +2081,8 @@ static void cd321x_ready(struct tps6598x *tps)
 	guard(mutex)(&tps->lock);
 	/* Include failures reported while the port was still being initialized. */
 	if (cd321x_pm_ready(&cd321x->pm)) {
+		dev_dbg(tps->dev, "Type-C probe ready: held=%u\n",
+			!!cd321x->pm.mux_retry_ms);
 		cd321x->state_valid = false;
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 	}
@@ -2142,6 +2145,27 @@ VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_init_work);
 
+/* Use the same handle as the worker: timeout provenance belongs to the handle. */
+VISIBLE_IF_KUNIT int cd321x_init_mux(struct cd321x *cd321x)
+{
+	bool held;
+	int ret;
+
+	guard(mutex)(&cd321x->tps.lock);
+	cd321x->state.alt = NULL;
+	cd321x->state.mode = TYPEC_STATE_SAFE;
+	cd321x->state.data = NULL;
+	ret = cd321x_mux_set(cd321x, &held);
+	cd321x->state_valid = !ret;
+	if (ret == -EAGAIN)
+		return -EPROBE_DEFER;
+	if (held)
+		cd321x_retry_held_mux(cd321x);
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_init_mux);
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
@@ -2178,20 +2202,14 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_put_mux;
 	}
 
-	cd321x->state.alt = NULL;
-	cd321x->state.mode = TYPEC_STATE_SAFE;
-	cd321x->state.data = NULL;
-	ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
-	cd321x->state_valid = !ret;
 	/*
 	 * A fixed host can register its SuperSpeed root after the mux provider.
 	 * Wait for that consumer at probe instead of exhausting the cable retry
 	 * budget before it exists. Host startup does not depend on this port.
 	 */
-	if (ret == -EAGAIN) {
-		ret = -EPROBE_DEFER;
+	ret = cd321x_init_mux(cd321x);
+	if (ret)
 		goto err_put_switch;
-	}
 
 	cd321x->tbt_notifier.notifier_call = cd321x_tbt_notify;
 	ret = typec_thunderbolt_switch_register_notifier(cd321x->tbt_switch,
@@ -2712,6 +2730,7 @@ int tipd_init(struct tps6598x *tps)
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
 
+	dev_dbg(tps->dev, "Type-C probe start\n");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(tps->reset))
 		return dev_err_probe(tps->dev, PTR_ERR(tps->reset),

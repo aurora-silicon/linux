@@ -1233,6 +1233,11 @@ static int atcphy_pipehandler_lock_timeout(struct apple_atcphy *atcphy, u32 time
 	dev_dbg(atcphy->dev, "PIPE request: req=%#x mode=%u pipe=%u host=%u dirty=%u\n",
 		requested, atcphy->mode, atcphy->pipe_state,
 		atcphy->host_active, atcphy->mode_dirty);
+	dev_dbg(atcphy->dev, "PIPE before lock: ack=%#x aon=%#x mux=%#x override=%#x\n",
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK),
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE));
 	if (requested & PIPEHANDLER_LOCK_EN) {
 		dev_dbg(atcphy->dev, "Pipehandler lock already requested\n");
 	} else {

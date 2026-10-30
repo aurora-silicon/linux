@@ -857,6 +857,33 @@ static void atcphy_test_election_held_usb(struct kunit *test)
 	atcphy_test_election_redrive(test, atcphy);
 }
 
+/* First pin-D handoff after probe: USB2 lanes and a parked PIPE. */
+static void atcphy_test_boot_pipe_retry(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_election(test);
+	struct atcphy_test_election *election = test->priv;
+
+	atcphy->mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	election->held = true;
+	KUNIT_ASSERT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3_DP);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	KUNIT_EXPECT_TRUE(test, atcphy->pipe_pending);
+	KUNIT_EXPECT_TRUE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&atcphy->usb3_port_work));
+
+	/* The same request must finish the handoff, not use the mode cache. */
+	election->held = false;
+	memset(election->steps.log, 0, sizeof(election->steps.log));
+	KUNIT_ASSERT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, election->steps.log, "g01");
+	KUNIT_EXPECT_TRUE(test, atcphy_usb3_port_ready(atcphy));
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_FALSE(test, atcphy->pipe_pending);
+}
+
 /*
  * Only the fixed-hub ports of a J700 have the Type-C driver retry a timeout
  * until it passes; every M1 and M2 port, and fixed-hub ports on other PHYs,
@@ -1210,6 +1237,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_host_start_without_usb3),
 	KUNIT_CASE(atcphy_test_election_held_safe),
 	KUNIT_CASE(atcphy_test_election_held_usb),
+	KUNIT_CASE(atcphy_test_boot_pipe_retry),
 	KUNIT_CASE(atcphy_test_transient_timeouts),
 #if IS_REACHABLE(CONFIG_USB)
 	KUNIT_CASE(atcphy_test_usb3_root),
