@@ -384,6 +384,17 @@
 			};
 		};
 	};
+
+	/*
+	 * The headphone codec runs from PMU rails that are on whenever the
+	 * SoC is and that no OS switches. The ADT gives the codec a reset
+	 * line and no supply or power function.
+	 */
+	jack_codec_supply: regulator-jack-codec {
+		compatible = "regulator-fixed";
+		regulator-name = "jack-codec";
+		regulator-always-on;
+	};
 };
 
 #include "isp-imx558.dtsi"
@@ -502,6 +513,11 @@
 	jack_codec: codec@48 {
 		compatible = "cirrus,cs42l83";
 		reg = <0x48>;
+		VA-supply = <&jack_codec_supply>;
+		VCP-supply = <&jack_codec_supply>;
+		VD_FILT-supply = <&jack_codec_supply>;
+		VL-supply = <&jack_codec_supply>;
+		VP-supply = <&jack_codec_supply>;
 		reset-gpios = <&pinctrl_ap 103 GPIO_ACTIVE_HIGH>;
 		interrupt-parent = <&pinctrl_ap>;
 		interrupts = <104 IRQ_TYPE_LEVEL_LOW>;
