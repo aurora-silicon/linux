@@ -65,6 +65,7 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -90,6 +91,7 @@
 #include <drm/drm_mm.h>
 #include <crypto/sha2.h>
 
+#include "ane_fw_platform.h"
 #include "ane_stats.h"
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
@@ -2483,8 +2485,15 @@ err_pm_or_hold:
 
 static int ane_rtclient_probe(struct platform_device *pdev)
 {
+	const struct ane_t602x_soc *soc = of_device_get_match_data(&pdev->dev);
 	bool hardware_touched = false;
 	int ret;
+
+	if (!soc)
+		return -ENODEV;
+	/* Later generations cannot enter H14 boot or parameter paths. */
+	if (soc->platform)
+		return ane_fw_platform_preflight(pdev, soc->platform);
 
 	mutex_lock(&ane_rtclient_probe_guard_lock);
 	if (ane_rtclient_probe_failed_dirty) {
@@ -2526,11 +2535,21 @@ static void ane_rtclient_remove(struct platform_device *pdev)
 			 "remove HELD: no teardown — reboot reclaims\n");
 }
 
+static const struct ane_t602x_soc ane_h16_soc = {
+	.platform = &ane_h16_platform,
+};
+
+static const struct ane_t602x_soc ane_h17_soc = {
+	.platform = &ane_h17_platform,
+};
+
 static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6020-ane", .data = &ane_t6020_soc },
 	{ .compatible = "apple,t6021-ane", .data = &ane_t6021_soc },
 	{ .compatible = "apple,t6022-ane", .data = &ane_t6022_soc },
 	{ .compatible = "apple,t8112-ane", .data = &ane_t8112_soc },
+	{ .compatible = "apple,t6041-ane", .data = &ane_h16_soc },
+	{ .compatible = "apple,t8140-ane", .data = &ane_h17_soc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ane_rtclient_of_match);
@@ -2588,7 +2607,37 @@ static struct platform_driver ane_rtclient_driver = {
 
 static int __init ane_rtclient_init(void)
 {
+	const struct of_device_id *match;
+	struct device_node *np;
 	int ret;
+
+	/* platform_probe() powers a single genpd, and DMA configuration
+	 * happens even earlier. Refuse later generations before registering
+	 * the driver, including disabled nodes, so these core paths cannot
+	 * precede the ownership and firmware preflight. These SoCs have one
+	 * ANE generation; refusing registration cannot hide an H14 engine.
+	 */
+	for_each_matching_node_and_match(np, ane_rtclient_of_match, &match) {
+		const struct ane_t602x_soc *soc = match->data;
+		struct platform_device *pdev;
+
+		if (!soc->platform)
+			continue;
+		if (soc->platform->owner == ANE_FW_OWNER_EXCLAVE) {
+			of_node_put(np);
+			pr_info("ane: H17 ANE: Linux exclave ownership handoff unavailable; refusing registration\n");
+			return -EOPNOTSUPP;
+		}
+		pdev = of_find_device_by_node(np);
+		of_node_put(np);
+		if (!pdev) {
+			pr_info("ane: H16 ANE: firmware transport unvalidated; keeping disabled\n");
+			return -EOPNOTSUPP;
+		}
+		ret = ane_fw_platform_preflight(pdev, soc->platform);
+		put_device(&pdev->dev);
+		return ret;
+	}
 
 	WRITE_ONCE(ane_rtclient_probe_failed_dirty, false);
 	ret = platform_driver_register(&ane_rtclient_driver);
@@ -2607,4 +2656,4 @@ static void __exit ane_rtclient_exit(void)
 module_exit(ane_rtclient_exit);
 
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_DESCRIPTION("Apple Neural Engine (T6021/M2) installed module");
+MODULE_DESCRIPTION("Apple Neural Engine firmware driver with H16/H17 preflight");
