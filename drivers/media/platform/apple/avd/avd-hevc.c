@@ -1282,8 +1282,37 @@ static int avd_hevc_compute_tiles(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	return 0;
 }
 
+/*
+ * stream_slices() expects each slice's bit_size to cover its whole NAL unit
+ * and data_byte_offset to be the slice header length within it (GStreamer).
+ * FFmpeg instead sets data_byte_offset to the absolute offset of the slice
+ * data in the buffer and bit_size to the slice data alone. Its slices still
+ * tile the buffer, so the last one ends at the payload end; convert those.
+ */
+static void avd_hevc_fixup_slices(struct v4l2_ctrl_hevc_slice_params *sl,
+				  int num_slices, u32 payload)
+{
+	const struct v4l2_ctrl_hevc_slice_params *last = &sl[num_slices - 1];
+	u32 start = 0, end, total = 0;
+	int i;
+
+	for (i = 0; i < num_slices; i++)
+		total += sl[i].bit_size / 8;
+	if (total == payload ||
+	    last->data_byte_offset + last->bit_size / 8 != payload)
+		return;
+
+	for (i = 0; i < num_slices; i++) {
+		end = sl[i].data_byte_offset + sl[i].bit_size / 8;
+		sl[i].data_byte_offset -= start;
+		sl[i].bit_size = (end - start) * 8;
+		start = end;
+	}
+}
+
 static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 {
+	struct v4l2_ctrl_hevc_slice_params *slices;
 	struct v4l2_ctrl *ctrl, *sl, *ep;
 	u32 dst_len, mv_color_len;
 
@@ -1322,7 +1351,8 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	 */
 	v4l2_ctrl_lock(sl);
 	run->num_slices = sl->elems;
-	run->sl = kmemdup(sl->p_cur.p, sl->elems * sl->elem_size, GFP_KERNEL);
+	slices = kmemdup(sl->p_cur.p, sl->elems * sl->elem_size, GFP_KERNEL);
+	run->sl = slices;
 	run->num_entry_point_offsets = ep->elems;
 	run->entry_point_offsets =
 		kmemdup(ep->p_cur.p, ep->elems * ep->elem_size, GFP_KERNEL);
@@ -1333,6 +1363,8 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
 		avd_run_postamble(ctx, &run->base);
 		return -ENOMEM;
 	}
+	avd_hevc_fixup_slices(slices, run->num_slices,
+			      vb2_get_plane_payload(&run->base.bufs.src->vb2_buf, 0));
 
 	dst_len = run->base.bufs.dst->vb2_buf.planes[0].length;
 
