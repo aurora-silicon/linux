@@ -196,6 +196,20 @@ static void routes(void)
         assert(!dcp_m4_callback_ack(&packet, &ack));
         assert(ack == (0x342U | (stream << 10)));
     }
+    /* Out of band: stream 1 for the AP packet, its reply and its callbacks. */
+    assert(dcp_m4_decode_word(0x402 | (12ULL << 32), &packet) == -EPROTO);
+    assert(!dcp_m4_decode_word_oob(0x402 | (64ULL << 16) | (36ULL << 32), &packet));
+    assert(packet.stream == 1 && packet.offset == 64 && !packet.reply);
+    assert(dcp_m4_packet_offset(&packet, false) == 0x8040);
+    assert(dcp_m4_packet_offset(&packet, true) == 0x68040);
+    assert(!dcp_m4_callback_ack(&packet, &ack) && ack == 0x442);
+    assert(!dcp_m4_nested_offset(&packet, false, 12, &offset) && offset == 128);
+    assert(!dcp_m4_decode_word_oob(0x442, &packet) && packet.reply && packet.stream == 1);
+    assert(!dcp_m4_decode_word_oob(2 | (12ULL << 32), &packet) && !packet.stream);
+    assert(dcp_m4_decode_word_oob(0x802 | (12ULL << 32), &packet) == -EPROTO);
+    assert(dcp_m4_decode_word_oob(0xc02 | (12ULL << 32), &packet) == -EPROTO);
+    packet = (struct dcp_m4_packet){.stream = 2, .length = 12};
+    assert(dcp_m4_packet_offset(&packet, false) == -EINVAL);
     puts("PASS READY identity, bounded packet parsing, nested offset and callback routing");
 }
 
@@ -518,6 +532,7 @@ struct iomfb_m4 {
     struct drm_framebuffer *active_fb,*uncertain_fb;
     struct dcp_m4_frame active_frame;
     u64 flips,blanks;
+    bool powered_off;
 };
 static void mutex_lock(int *lock) { assert(!*lock); *lock=1; }
 static void mutex_unlock(int *lock) { assert(*lock==1); *lock=0; }
@@ -577,6 +592,11 @@ int main(void)
         assert(!iomfb_m4_blank(&owner));
         assert(carried_brightness && carried_nits==0 && owner.backlight.state.actual==0);
         assert(fb.refs==1 && !dcp.active_fb && !dcp.active_frame.dva && dcp.blanks==1);
+        /* Powered down for system sleep: refused, no reference, session intact. */
+        dcp.powered_off=true;
+        assert(iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000)==-EAGAIN);
+        assert(fb.refs==1 && !dcp.active_fb && !dcp.error);
+        dcp.powered_off=false;
         assert(!dcp_backlight_dpms(&owner,true));
         assert(deferred_kicks==kicks_before+2); /* This second kick is still deferred. */
         assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
@@ -591,6 +611,7 @@ int main(void)
     }
     puts("PASS DPMS-off blank carries zero before delayed work and completes only after both exact receipts");
     puts("PASS actual present/blank retain active+uncertain DMA framebuffer references across a missing receipt");
+    puts("PASS a present while the display is powered off for sleep is refused without a reference");
     return 0;
 }
 '''

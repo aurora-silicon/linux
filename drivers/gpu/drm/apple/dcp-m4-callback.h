@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 #include "dcp-m4-profile.h"
@@ -18,6 +19,8 @@ struct dcp_m4_callback_ops {
 	int (*event)(void *cookie, const char *name, const void *dictionary, size_t size);
 	int (*property)(void *cookie, unsigned int method, const void *input, void *output);
 	int (*memory)(void *cookie, unsigned int method, const void *input, void *output);
+	/* Idle caching: D117 state, D578/D579 fence, D580 cache-surface release. */
+	int (*idle)(void *cookie, unsigned int method, const void *input, void *output);
 };
 
 struct dcp_m4_callback_shape {
@@ -33,16 +36,18 @@ static inline int dcp_m4_callback_result(int ret)
 
 /* Exact qualified J713 shapes. An absent behavior hook is failure, never an ACK. */
 static const struct dcp_m4_callback_shape dcp_m4_callbacks[] = {
-	{0, 0, 4}, {1, 0, 4}, {3, 4, 60}, {6, 84, 80},
-	{100, 0, 0}, {101, 0, 4}, {102, 68, 0}, {104, 68, 0}, {107, 64, 0},
+	{0, 0, 4}, {1, 0, 4}, {2, 0, 0}, {3, 4, 60}, {6, 84, 80}, {8, 4, 0},
+	{100, 0, 0}, {101, 0, 4}, {102, 68, 0}, {104, 68, 0}, {106, 0, 4}, {107, 64, 0},
 	{108, 0, 4}, {109, 0, 4}, {110, 0, 4}, {111, 0, 4}, {112, 0, 4}, {113, 0, 4},
-	{114, 4164, 4100}, {121, 0, 4}, {122, 0, 4}, {123, 0, 4},
+	{114, 4164, 4100}, {117, 12, 0}, {121, 0, 4}, {122, 0, 4}, {123, 0, 4},
 	{125, 100, 36}, {127, 4, 4}, {128, 4104, 4}, {129, 64, 4},
-	{201, 12, 16}, {206, 0, 4}, {207, 0, 4}, {300, 16, 0},
+	{201, 12, 16}, {203, 0, 4}, {206, 0, 4}, {207, 0, 4}, {209, 0, 8}, {300, 16, 0},
 	{400, 76, 3076}, {401, 80, 12}, {406, 72, 0}, {408, 8, 8},
 	{413, 4168, 4}, {414, 80, 4}, {415, 76, 4}, {451, 20, 28}, {454, 4, 4},
 	{552, 4164, 4}, {561, 4164, 4}, {563, 76, 4}, {565, 72, 4}, {567, 128, 4},
-	{575, 88, 76}, {576, 4, 0}, {582, 8, 4}, {588, 0, 0}, {590, 1840, 0}, {599, 0, 0},
+	{572, 4, 4}, {575, 88, 76}, {576, 4, 0}, {578, 4, 4}, {579, 0, 0}, {580, 0, 0},
+	{582, 8, 4}, {588, 0, 0}, {590, 1840, 0},
+	{592, 20, 0}, {594, 4, 0}, {599, 0, 0}, {700, 4, 4},
 };
 
 static inline int dcp_m4_callback_method(u32 tag)
@@ -135,6 +140,29 @@ static inline int dcp_m4_callback_dispatch(const struct dcp_m4_callback_ops *ops
 			memcpy(out, in + 8, 76);
 		return 0;
 	case 300: case 406: case 576: case 588:
+		return 0;
+	/*
+	 * will_power_off_signal, set_power_trace_enable, swap_complete_intent,
+	 * enable_backlight_message_ap_gated: notifications.
+	 */
+	case 2: case 8: case 592: case 594:
+		return 0;
+	/*
+	 * set_idle_caching_state_ap, idle_fence_create, idle_fence_complete,
+	 * idle_surface_release.
+	 */
+	case 117: case 578: case 579: case 580:
+		if (!ops->idle)
+			return -EOPNOTSUPP;
+		return dcp_m4_callback_result(ops->idle(cookie, method, input, output));
+	/*
+	 * acknowledgeSetPowerState, powerUpDART, set_kernel_power_assert: success;
+	 * aot_supported_peek: false.
+	 */
+	case 106: case 572: case 700: case 203:
+		return 0;
+	case 209: /* get_calendar_time_ms */
+		put_unaligned_le64(ktime_get_real_ns() / NSEC_PER_MSEC, out);
 		return 0;
 	case 122: case 123: case 582:
 		return 0; /* False, not an unimplemented service returning success. */
