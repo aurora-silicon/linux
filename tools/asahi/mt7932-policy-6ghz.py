@@ -3,12 +3,24 @@
 """Extend J7RP country files from authenticated IZUBA text data, without blobs."""
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
 import struct
+import sys
 
-import mt7932_power as power
+
+def _sibling(name):
+    """Load a module from this directory, also under python3 -I or by path."""
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+power = _sibling('mt7932_power')
 
 SIX_NAME = 'IZUBA_TxPwrLimit6G_MT79x1.dat'
 DB_NAME = 'IZUBA_db.dat'
