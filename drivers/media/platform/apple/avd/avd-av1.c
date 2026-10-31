@@ -353,6 +353,13 @@ static struct avd_av1_aux *avd_av1_aux_alloc(struct avd_ctx *ctx, size_t size,
 	return aux;
 }
 
+static int avd_av1_aux_ready(struct avd_av1_aux *aux, enum avd_frame_dep dep)
+{
+	if (smp_load_acquire(&aux->done))
+		return READ_ONCE(aux->status);
+	return dep == AVD_DEP_PREV_DONE ? 0 : -EAGAIN;
+}
+
 static struct avd_av1_ref *avd_av1_find_ref(struct avd_ctx *ctx,
 					 unsigned int index, u64 timestamp)
 {
@@ -1183,6 +1190,7 @@ static int avd_av1_set_aux(struct avd_ctx *ctx, struct avd_av1_run *run)
 	bool seg_enabled = frame->segmentation.flags &
 		V4L2_AV1_SEGMENTATION_FLAG_ENABLED;
 	u64 timestamp = 0;
+	int ret;
 
 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
 	if (!defaults) {
@@ -1193,7 +1201,7 @@ static int avd_av1_set_aux(struct avd_ctx *ctx, struct avd_av1_run *run)
 			return -EINVAL;
 		ref = avd_av1_find_ref(ctx, primary->base.vb.vb2_buf.index,
 				       timestamp);
-		if (!ref || READ_ONCE(ref->cdf->status))
+		if (!ref)
 			return -EINVAL;
 		run->cdf_in = avd_av1_aux_get(ref->cdf);
 	} else {
@@ -1210,8 +1218,9 @@ static int avd_av1_set_aux(struct avd_ctx *ctx, struct avd_av1_run *run)
 		AVD_DEP_PREV_DONE : AVD_DEP_NONE;
 	/* PREV_DONE drains earlier frames too, but do not invent a dependency
 	 * for a different, unfinished CDF producer. The queue must retry it. */
-	if (!READ_ONCE(run->cdf_in->done) && run->slot->dep == AVD_DEP_NONE)
-		return -EAGAIN;
+	ret = avd_av1_aux_ready(run->cdf_in, run->slot->dep);
+	if (ret)
+		return ret;
 
 	run->cdf_written = !(frame->flags &
 		V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF);
@@ -1225,13 +1234,12 @@ static int avd_av1_set_aux(struct avd_ctx *ctx, struct avd_av1_run *run)
 
 	if (ref && seg_enabled && ref->width == frame->frame_width_minus_1 &&
 	    ref->height == frame->frame_height_minus_1) {
-		if (READ_ONCE(ref->seg->status))
-			return -EINVAL;
 		run->seg_in = avd_av1_aux_get(ref->seg);
 		/* The two segmentation addresses let hardware read the previous
 		 * map directly. No speculative CPU copy of an unfinished map. */
-		if (!READ_ONCE(run->seg_in->done) && run->slot->dep == AVD_DEP_NONE)
-			return -EAGAIN;
+		ret = avd_av1_aux_ready(run->seg_in, run->slot->dep);
+		if (ret)
+			return ret;
 	} else {
 		run->seg_in = avd_av1_aux_alloc(ctx, dst->av1.seg_size, 0, true);
 		if (!run->seg_in)
@@ -1619,11 +1627,11 @@ static void avd_av1_retire(struct avd_ctx *ctx, struct avd_frame *f,
 		return;
 	if (run->cdf_written) {
 		WRITE_ONCE(run->cdf_out->status, status);
-		WRITE_ONCE(run->cdf_out->done, true);
+		smp_store_release(&run->cdf_out->done, true);
 	}
 	if (run->seg_written) {
 		WRITE_ONCE(run->seg_out->status, status);
-		WRITE_ONCE(run->seg_out->done, true);
+		smp_store_release(&run->seg_out->done, true);
 	}
 	avd_av1_release_run(ctx, run);
 	f->codec_priv = NULL;

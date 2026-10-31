@@ -134,6 +134,38 @@ static void cdf_chain(void)
 	assert(!allocations);
 }
 
+static void reference_reuse_and_segmentation(void)
+{
+	struct avd_ctx ctx;struct avd_buf prog[3]={0};struct avd_frame f[3];
+	init_params();init_ctx(&ctx);
+	for(int i=0;i<3;i++){assert(!avd_buf_alloc(&device,&prog[i],4096));f[i]=make_frame(i,i,&prog[i]);}
+	params.segmentation.flags=V4L2_AV1_SEGMENTATION_FLAG_ENABLED|V4L2_AV1_SEGMENTATION_FLAG_UPDATE_MAP;
+	assert(!avd_av1_prepare(&ctx,&f[0]));
+	struct avd_av1_run *a=f[0].codec_priv;
+	struct avd_av1_aux *cdf=a->cdf_out,*seg=a->seg_out;
+	params.frame_type=V4L2_AV1_INTER_FRAME;params.primary_ref_frame=0;
+	params.reference_frame_ts[0]=1000;
+	params.segmentation.flags=V4L2_AV1_SEGMENTATION_FLAG_ENABLED;
+	params.flags=V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF;
+	assert(!avd_av1_prepare(&ctx,&f[1]));
+	struct avd_av1_run *b=f[1].codec_priv;
+	assert(b->cdf_out==cdf&&b->seg_out==seg);
+	avd_av1_retire(&ctx,&f[0],VB2_BUF_STATE_DONE);
+	/* Reuse the original capture: inherited state belongs to buffer 1 too. */
+	params.primary_ref_frame=7;params.frame_type=V4L2_AV1_KEY_FRAME;
+	params.flags=0;params.segmentation.flags=0;
+	buffers[0].base.vb.vb2_buf.timestamp=2000;
+	f[2].dst=&buffers[0].base.vb;
+	assert(!avd_av1_prepare(&ctx,&f[2]));
+	assert(cdf->refs.n>=2&&seg->refs.n>=2);
+	assert(b->cdf_in==cdf&&b->seg_in==seg&&cdf->done&&seg->done);
+	avd_av1_retire(&ctx,&f[1],VB2_BUF_STATE_DONE);
+	avd_av1_retire(&ctx,&f[2],VB2_BUF_STATE_ERROR);
+	avd_av1_stop(&ctx);
+	for(int i=0;i<3;i++)avd_buf_free(&device,&prog[i]);
+	assert(!allocations);
+}
+
 static void allocation_failures(void)
 {
 	for(int fail=0;fail<16;fail++) {
@@ -188,10 +220,17 @@ static void bounds_and_fp(void)
 
 static void program_parity(void)
 {
-	for(int test=0;test<12;test++) {
+	for(int test=0;test<24;test++) {
 		struct avd_ctx ctx;struct avd_buf prog={0};
 		init_params();init_ctx(&ctx);
 		if(test&1)sequence.bit_depth=10;
+		if(test&16) {
+			params.frame_type=V4L2_AV1_INTER_FRAME;
+			sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT|V4L2_AV1_SEQUENCE_FLAG_ENABLE_REF_FRAME_MVS;
+			params.flags|=V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS;
+			params.order_hint=4;
+			for(int i=0;i<7;i++){params.ref_frame_idx[i]=i;params.reference_frame_ts[i]=1001+i;}
+		}
 		if(test&2) {
 			sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_ENABLE_CDEF;
 			params.cdef.bits=2;params.cdef.damping_minus_3=1;
@@ -232,12 +271,12 @@ static void program_parity(void)
 		avd_av1_retire(&ctx,&f,VB2_BUF_STATE_DONE);avd_av1_stop(&ctx);
 		avd_buf_free(&device,&prog);assert(!allocations);
 	}
-	puts("AV1 legacy program parity: 12 synthetic control vectors: PASS");
+	puts("AV1 legacy program parity: 24 synthetic control vectors: PASS");
 }
 
 int main(void)
 {
-	program_parity();dependency_table();sixteen_slots();cdf_chain();allocation_failures();bounds_and_fp();
+	program_parity();dependency_table();sixteen_slots();cdf_chain();reference_reuse_and_segmentation();allocation_failures();bounds_and_fp();
 	puts("AV1 host tests: dependency table, 16 slots, CDF inheritance, allocation failures, bounds, Apple refusal: PASS");
 	return 0;
 }

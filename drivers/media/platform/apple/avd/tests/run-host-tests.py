@@ -43,11 +43,13 @@ with tempfile.TemporaryDirectory(prefix='avd-av1-test-') as tmp:
     legacy = legacy.replace('run->bufs.probs.addr', 'run->addresses.probs_in')
     legacy = re.sub(r'av1_ctx->submit_num = .*?;', '', legacy)
     legacy = legacy.replace('push_comp(ctx, ', 'test_legacy_comp(ctx, ')
+    source += '#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored \"-Wpointer-sign\"\n'
     source += (HERE / 'legacy-emitter.h').read_text() + legacy
+    source += '#pragma GCC diagnostic pop\n'
     source += (HERE / 'host-test.c').read_text()
     (out / 'test.c').write_text(source)
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-g', '-O1',
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
-                    '-Werror=implicit-function-declaration', str(out / 'test.c'),
+                    '-Werror', str(out / 'test.c'),
                     '-o', str(out / 'test')], check=True)
     subprocess.run([str(out / 'test')], check=True)
