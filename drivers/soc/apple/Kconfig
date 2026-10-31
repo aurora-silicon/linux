@@ -61,7 +61,7 @@ config APPLE_PMGR_MISC
 
 config APPLE_PMGR_DCS_KUNIT_TEST
 	bool "KUnit tests for Apple PMGR DCS voting" if !KUNIT_ALL_TESTS
-	depends on KUNIT && APPLE_PMGR_MISC=y
+	depends on KUNIT=y && APPLE_PMGR_MISC=y
 	default KUNIT_ALL_TESTS
 	help
 	  Test bandwidth aggregation, explicit OPP selection, ownership gates,
