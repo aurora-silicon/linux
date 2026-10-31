@@ -146,6 +146,8 @@ const struct avd_backend_ops avd_open_backend = {
 	.max_inflight = avd_open_max_inflight,
 	.submit = avd_open_submit,
 	.irq = avd_open_irq,
+	.suspend = avd_pm_backend_suspend,
+	.resume = avd_pm_backend_resume,
 };
 
 static void avd_open_capabilities(struct avd_dev *avd)
@@ -198,14 +200,19 @@ int avd_backend_select(struct avd_dev *avd)
 
 int avd_backend_boot(struct avd_dev *avd)
 {
-	int ret = avd->backend->boot(avd);
+	int ret;
 
-	if (ret == -ENOENT && avd_backend_is_apple(avd)) {
+	if (!avd_backend_is_apple(avd))
+		avd_pm_prepare_piodma(avd);
+	ret = avd->backend->boot(avd);
+	/* Never switch command ABIs after frames have used this backend. */
+	if (ret == -ENOENT && !avd->fw_generation && avd_backend_is_apple(avd)) {
 		ret = request_firmware(&avd->fw, avd->variant->fw_name, avd->dev);
 		if (ret)
 			return ret;
 		avd->backend = &avd_open_backend;
 		avd_open_capabilities(avd);
+		avd_pm_prepare_piodma(avd);
 		ret = avd->backend->boot(avd);
 	}
 	if (!ret)
