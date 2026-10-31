@@ -2355,6 +2355,44 @@ peer_stopped:
 	dev_info(dcp->dev, "dcp_poweroff() done\n");
 }
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+/*
+ * H17G (M5) internal panel DPMS off.  A pipe stop does not come back:
+ * setPowerState(0) times out and the next setPowerState(1) is never
+ * answered.  Blank instead and keep the pipe running: a black,
+ * surface-free swap that also takes the backlight to 0 nits.  The next CRTC
+ * enable presents the scanout and the brightness again.
+ */
+void DCP_FW_NAME(iomfb_blank)(struct apple_dcp *dcp)
+{
+	struct DCP_FW_NAME(dcp_swap_start_req) swap_req = { 0 };
+	typeof(DCP_FW_UNION(dcp->swap)) *swap = &DCP_FW_UNION(dcp->swap);
+	struct dcp_swap_cookie *cookie;
+	unsigned long ret;
+
+	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+	if (!cookie)
+		return;
+	cookie->status = ~0U;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	dcp_prepare_clear_swap(dcp, swap);
+	if (dcp_has_panel(dcp))
+		iomfb_encode_backlight_swap_h17p((u8 *)&swap->swap, 0,
+						 dcp->brightness.maximum, true);
+
+	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
+	ret = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(500));
+	if (!ret || READ_ONCE(cookie->status))
+		dev_warn(dcp->dev, "%s: blank swap %s\n", __func__,
+			 ret ? "failed" : "timed out");
+	kref_put(&cookie->refcount, release_swap_cookie);
+}
+#endif
+
 static void last_client_closed_sleep(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
