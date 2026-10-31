@@ -25,7 +25,8 @@ struct ane_fw_channel {
 
 static inline bool ane_fw_contains(u64 base, u64 bytes, u64 addr, u64 size)
 {
-	return size <= bytes && addr >= base && addr - base <= bytes - size;
+	return bytes <= U64_MAX - base && size <= bytes && addr >= base &&
+	       addr - base <= bytes - size;
 }
 
 /* Parse a host-owned descriptor snapshot; output indices are logical names. */
@@ -42,7 +43,8 @@ ane_fw_channels_parse(const void *table, u64 ipc_dva, size_t ipc_size,
 	u32 seen = 0;
 	unsigned int i, j;
 
-	if (!table || !ane_fw_contains(ipc_dva, ipc_size, table_dva, ANE_FW_TABLE_SIZE))
+	if (!table || !channels ||
+	    !ane_fw_contains(ipc_dva, ipc_size, table_dva, ANE_FW_TABLE_SIZE))
 		return -EPROTO;
 	table_off = table_dva - ipc_dva;
 	for (i = 0; i < ANE_FW_CHANNELS; i++) {
@@ -76,7 +78,8 @@ ane_fw_channels_parse(const void *table, u64 ipc_dva, size_t ipc_size,
 			return -EPROTO;
 	}
 	if (seen != GENMASK(ANE_FW_CHANNELS - 1, 0) ||
-	    parsed[1].type != 0 || parsed[5].type != 1)
+	    parsed[1].type != 0 || parsed[5].type != 1 ||
+	    parsed[6].type != 1 || parsed[7].type != 0)
 		return -EPROTO;
 	for (i = 0; i < ANE_FW_CHANNELS; i++) {
 		u64 end = parsed[i].offset + parsed[i].slots * ANE_FW_SLOT_SIZE;
@@ -130,6 +133,8 @@ ane_fw_reply_status(u64 header, u64 slot_length, u64 slot_result,
 {
 	const u8 *p = command;
 
+	if (header & 2)
+		return -EPROTO;
 	if (!(header & 1))
 		return -EAGAIN;
 	if (!command || length < 8 || (command_dva & 1) || header != (command_dva | 1) ||

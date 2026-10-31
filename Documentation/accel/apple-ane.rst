@@ -117,7 +117,7 @@ EVENT_REPORT        0x0300  6        0x60 (firmware to host)
 These sizes bound the observed version, not future firmware. POWER_GATE has
 a u32 Boolean at +8. The execute-size increment of 0x18 counts custom BAR
 records. The channel numbers are observed table indices;
-their mapping to channel names remains unproved. The parser retains each
+the clean cold-boot facts identify their channel names. The parser retains each
 descriptor's original index rather than assuming name order is wire order.
 
 The transport prepares the H16 envelope and rejects unrecognized runtime
@@ -178,3 +178,72 @@ KUnit covers byte-exact synthetic execute fields, all 1..64 buffer counts,
 zero/one/two custom BAR lengths, wide DVAs/spans, reserved-zero output,
 boundary and overflow refusal, all event states, interleaved identities,
 ISP routing and malformed reports. No test packet is copied from a capture.
+
+Shared H16/H17 firmware transport
+--------------------------------
+
+``ane_fw_transport.h`` supplies device-independent ring operations over owned
+coherent surfaces and caller-provided memory, DMA-barrier, MMIO, clock and
+allocation accessors. Engine-relative doorbell and pending/acknowledge offsets
+come from ``ane_fw_platform`` match data. The caller must establish ownership,
+firmware identity, power and the private DMA domain before using it. This
+helper does not change probe or enable either generation.
+
+Initialization copies exactly eight 0x100-byte descriptors from the IPC
+surface and validates their names, types, bits, slot counts, alignment and
+non-overlapping ranges, including exclusion of the table itself. IO and
+DATA_CHAIN_H2T require type 0; SHAREDMALLOC and IO_T2H require type 1. Each
+operation checks the immutable table snapshot. Only type-0 slots are armed,
+in word-1, word-2, word-0 order, with values 0, 0, 1 and a DMA write barrier.
+Descriptor geometry and doorbell bits remain authoritative. Logical channel
+names are independent of their descriptor order.
+
+Publication copies a command into a 64-byte-aligned arena inside the pool,
+after the caller's reserved boot prefix. It publishes both length words,
+a DMA write barrier, the command DVA, another barrier and the descriptor's
+doorbell bit. There is one outstanding transaction per sending channel;
+heads advance modulo the descriptor slot count only after a successful
+reply. A reply requires the exact DVA with bit 0 set, unchanged length,
+zero result word, zero command prefix, unchanged u16 ID and zero u16 ack.
+Bit 1 is corruption even before ownership returns. Nonzero ack is returned
+as ``-EREMOTEIO`` and retained for diagnosis.
+
+IO_T2H is present when word 0 has bit 0 clear and either word 0 or word 1 is
+nonzero. Reports must be four-byte aligned and wholly inside one owned
+surface. The transport copies the report before setting word 0 bit 0 and
+ringing the descriptor doorbell, without changing the other slot words.
+Report dispatch and pending UUID lookup belong to the caller. In particular,
+consuming a stale UUID report cannot complete an unrelated request, and the
+DATA_CHAIN reply acknowledges submission rather than inference completion.
+
+The SHAREDMALLOC provider accepts allocation tuples only. Requests are
+rounded to 16 KiB, with a 1 MiB request ceiling, the exact 2 MiB allocation
+with tag 0x45585050 exception, 12 MiB in rounded allocations and 64 handles.
+The allocation callback supplies a zeroed, pinned private-domain mapping;
+the transport checks its size, DVA alignment, overflow and exclusion from
+all other owned surfaces before publishing it. Handles are nonzero ordinals.
+FREE and distinguishable control tuples return ``-EOPNOTSUPP`` through the
+mandatory refusal logger. An all-zero slot is empty and cannot distinguish
+a control request. No FREE/control reply is invented while that form is
+unspecified.
+
+IRQ service reads pending once, rejects bits above 7 and writes the exact
+nonzero snapshot to acknowledge. The wait helper services one allocation at
+a time and checks the original absolute monotonic deadline, including time
+spent inside the allocation callback. Servicing never starts a new timeout.
+
+The caller serializes all entry points. Initialize a fresh transport only
+before firmware starts or after a proved reset. The pool arena is monotonic
+and returns ``-ENOSPC`` when exhausted; command storage is not recycled.
+Successful reply bodies remain in the pool transaction span. A timeout,
+malformed firmware tuple, allocation failure or firmware refusal latches an
+error, retains the transaction and mappings and stops further publication.
+No surface is freed by these helpers, including a rejected allocation result.
+The backend must retain mappings, power and module references until reset.
+
+The field contract follows the clean H16/H17 cold-boot facts, sections 1,
+7 through 11, and the SPEC-r2 channel and deadline rules. Allocation limits
+are conservative host policy observed sufficient on H17, rather than
+firmware-advertised authority. The KUnit suite uses synthetic memory and
+accessor traces, with no MMIO or hardware access. Its configuration fragment
+is ``drivers/accel/ane/transport.kunitconfig`` and runs on x86_64 and arm64.
