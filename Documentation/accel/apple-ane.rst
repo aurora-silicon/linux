@@ -314,10 +314,11 @@ with tag 0x45585050 exception, 12 MiB in rounded allocations and 64 handles.
 The allocation callback supplies a zeroed, pinned private-domain mapping;
 the transport checks its size, DVA alignment, overflow and exclusion from
 all other owned surfaces before publishing it. Handles are nonzero ordinals.
-FREE and distinguishable control tuples return ``-EOPNOTSUPP`` through the
-mandatory refusal logger. An all-zero slot is empty and cannot distinguish
-a control request. No FREE/control reply is invented while that form is
-unspecified.
+By default, FREE and distinguishable control tuples return ``-EOPNOTSUPP``
+through the mandatory refusal logger. The pinned H16 build enables the
+proved native FREE reply described below. An all-zero slot is empty and
+cannot distinguish a control request; its lookup request layout remains
+unproved. No control reply is invented.
 
 IRQ service reads pending once, rejects bits above 7 and writes the exact
 nonzero snapshot to acknowledge. The wait helper services one allocation at
@@ -446,8 +447,8 @@ for its own live allocations with a zero tuple. Backing storage and quota
 stay pinned until reboot; retired allocations cannot authorize reports or
 a second FREE. Foreign frees and control forms without a proved request
 layout quarantine without an invented reply. Other firmware profiles retain
-the default refusal of FREE/control. Each command keeps one absolute deadline and requires
-a zero acknowledgment. The CONFIG_GET tick must be nonzero and is logged;
+the default refusal of FREE/control. Each command keeps one absolute
+deadline and requires a zero acknowledgment. The CONFIG_GET tick must be nonzero and is logged;
 24 MHz is a comparison value, not a refusal predicate. All 100 resource-info
 reply bytes are logged and do not grant allocation authority.
 
@@ -495,7 +496,8 @@ On a fresh boot run the boot rung::
 
   modprobe ane_t6021 h16_stage=boot
 
-Expect ``H16 READY 8042006 0``, request logs (the comparator values are
+Expect CE state/ack and ``H16 tunables applied`` (or locked-match) logs,
+then ``H16 READY 8042006 0``, request logs (the comparator values are
 channels 8, IPC-minus-one c440, heap f00000, mode 0), then
 ``H16 table validated 100003d0000 8``, ``H16 scratch 3 cleared 0 0`` and
 ``H16 stage 3 complete; held until reboot``. Comparator sizing values are

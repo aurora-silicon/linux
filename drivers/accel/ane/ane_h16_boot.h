@@ -312,6 +312,7 @@ static inline int ane_h16_ce(struct ane_h16_boot *b)
 	if (error & wanted)
 		return -EIO;
 	b->ops->write64(b->ctx, ANE_H16_ENGINE, f->ce + 8, wanted);
+	b->ops->log(b->ctx, "CE ack bits/delays", wanted, i);
 	return 0;
 }
 
@@ -336,9 +337,13 @@ static inline int ane_h16_prepare(struct ane_h16_boot *b)
 				u32 value = b->ops->read32(b->ctx, group->window,
 							group->base + v->offset);
 
-				if ((value & v->mask) != (v->value & v->mask))
+				if ((value & v->mask) != (v->value & v->mask)) {
+					b->ops->log(b->ctx, "locked tunable offset/value",
+						    group->base + v->offset, value);
 					return -EPERM;
+				}
 			}
+			b->ops->log(b->ctx, "tunables locked match", group->window, group->count);
 			continue;
 		}
 		for (j = 0; j < group->count; j++) {
@@ -349,6 +354,7 @@ static inline int ane_h16_prepare(struct ane_h16_boot *b)
 			b->ops->write32(b->ctx, group->window, off,
 					(old & ~v->mask) | (v->value & v->mask));
 		}
+		b->ops->log(b->ctx, "tunables applied", group->window, group->count);
 	}
 	return 0;
 }
@@ -506,10 +512,14 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		if (ret)
 			return ret;
 		ret = ane_fw_transport_wait(&b->transport, ANE_FW_IO);
-		if (ret)
-			return ret;
 		reply = (u8 *)b->pool.cpu +
 			(b->transport.pending[ANE_FW_IO].dva - b->pool.dva);
+		if (ret) {
+			if (ret == -EREMOTEIO)
+				b->ops->log(b->ctx, "startup refusal ID/ack",
+					    f->startup[i].id, get_unaligned_le16(reply + 6));
+			return ret;
+		}
 		b->ops->log(b->ctx, "startup ack", f->startup[i].id, get_unaligned_le16(reply + 6));
 		if (f->startup[i].id == 3) {
 			b->tick = get_unaligned_le32(reply + 8);
