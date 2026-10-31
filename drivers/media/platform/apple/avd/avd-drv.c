@@ -873,6 +873,7 @@ MODULE_DEVICE_TABLE(of, avd_of_match);
 static int avd_probe(struct platform_device *pdev)
 {
 	struct avd_dev *avd;
+	struct resource *res;
 	const struct of_device_id *match;
 	const char *codec_info = NULL;
 	int ret, irq;
@@ -902,6 +903,23 @@ static int avd_probe(struct platform_device *pdev)
 	avd->ctrl = devm_platform_ioremap_resource_byname(pdev, "ctrl");
 	if (IS_ERR(avd->ctrl))
 		return PTR_ERR(avd->ctrl);
+
+	/* Older device trees do not describe the PIODMA aperture. */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "piodma");
+	if (res) {
+		avd->piodma = devm_ioremap_resource(avd->dev, res);
+		if (IS_ERR(avd->piodma))
+			return PTR_ERR(avd->piodma);
+
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "sram");
+		if (!res)
+			return dev_err_probe(avd->dev, -EINVAL,
+					     "missing SRAM resource for PIODMA\n");
+		if (!IS_ALIGNED(res->start, 16) || (res->start >> 4) > U32_MAX)
+			return dev_err_probe(avd->dev, -EINVAL,
+					     "SRAM address cannot be encoded for PIODMA\n");
+		avd->sram_phys = res->start;
+	}
 
 	avd->domain = iommu_get_domain_for_dev(avd->dev);
 	if (avd->domain) {

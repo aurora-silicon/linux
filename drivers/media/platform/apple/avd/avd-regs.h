@@ -3,6 +3,9 @@
 #ifndef AVD_REGS_H_
 #define AVD_REGS_H_
 
+#define AVD_PIODMA_SRAM_BASE	0x24
+#define AVD_PIODMA_VERSION	0xb4
+
 #define AVD_REG_RUN_CTRL	0x08
 #define AVD_RUN_CTRL_UNK_RUN	BIT(0)
 #define AVD_RUN_CTRL_UNK_STOP	BIT(1) | BIT(2) | BIT(3)
