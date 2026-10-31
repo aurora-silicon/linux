@@ -26,6 +26,8 @@ config VIDEO_APPLE_AVD_KUNIT_TEST
 	  Build KUnit tests for the Apple video decoder. They exercise the
 	  checks that the H.264 path makes on the slices that userspace
 	  queues, such as finding the slice data after the slice header,
-	  at the limits and one past them.
+	  at the limits and one past them. Request ownership tests also cover
+	  submission-time IRQs, VP routing, duplicate completions and watchdog
+	  races, without accessing decoder hardware.
 
 	  If unsure, say N.

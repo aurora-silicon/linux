@@ -18,6 +18,10 @@
 #include <linux/firmware.h>
 #include <linux/iommu.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
+
+#include "avd-request.h"
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -194,14 +198,7 @@ struct avd_variant {
 	u32 submit_queue_max_offset;
 	u32 submit_queue_status_offset;
 	unsigned int quirks;
-};
-
-/* Lifecycle of the one m2m job the device runs at a time. */
-enum avd_job_state {
-	AVD_JOB_IDLE,
-	AVD_JOB_RUNNING,	/* inside avd_device_run() */
-	AVD_JOB_SUBMITTED,	/* handed to the hardware, watchdog armed */
-	AVD_JOB_FINISHING,	/* claimed by the IRQ handler or the watchdog */
+	unsigned int fw_caps_required;
 };
 
 struct avd_dev {
@@ -225,12 +222,11 @@ struct avd_dev {
 
 	/* The current job; see avd_device_run(). Protected by job_lock. */
 	spinlock_t job_lock;
-	enum avd_job_state job_state;
-	struct avd_ctx *job_ctx;
+	struct avd_ctx *job_ctx; /* Hardware owner, independent of m2m curr_ctx. */
 	u64 job_seq;
-	bool job_end_sent;
-	bool job_pending;
-	enum vb2_buffer_state job_pending_result;
+	wait_queue_head_t hw_wait;
+	int irq;
+	bool broken;
 
 	struct reset_control *rstc;
 
@@ -268,8 +264,16 @@ struct avd_ctx {
 	bool decomp;
 
 	struct delayed_work watchdog_work;
-	/* job_seq of the job watchdog_work was armed for */
+	struct work_struct finish_work;
+	wait_queue_head_t request_wait;
+	/* One request per context keeps codec scratch/reference state private. */
+	bool active;
+	bool scheduler_released;
+	bool pm_ref;
+	struct avd_request request;
 	u64 wd_seq;
+	struct vb2_v4l2_buffer *src_buf;
+	struct vb2_v4l2_buffer *dst_buf;
 
 	void *priv;
 
@@ -289,7 +293,8 @@ void avd_reset_coded_fmt(struct avd_ctx *ctx);
 void avd_reset_decoded_fmt(struct avd_ctx *ctx);
 int avd_init_ctrls(struct avd_ctx *ctx);
 
-void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result);
+void avd_finish_buffers(struct avd_ctx *ctx, enum vb2_buffer_state result);
+void avd_drain_context(struct avd_ctx *ctx);
 void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result);
 
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run);

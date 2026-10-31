@@ -942,6 +942,9 @@ static void avd_stop_streaming(struct vb2_queue *q)
 {
 	struct avd_ctx *ctx = vb2_get_drv_priv(q);
 
+	/* m2m cancellation alone cannot see a scheduler-released request. */
+	avd_drain_context(ctx);
+
 	if (V4L2_TYPE_IS_OUTPUT(q->type)) {
 		const struct avd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
 
@@ -970,37 +973,21 @@ const struct vb2_ops avd_queue_ops = {
 	.stop_streaming = avd_stop_streaming,
 };
 
-void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result)
+void avd_finish_buffers(struct avd_ctx *ctx, enum vb2_buffer_state result)
 {
-	struct avd_dev *avd = ctx->dev;
-	unsigned long flags;
+	if (ctx->coded_fmt_desc->ops->done)
+		ctx->coded_fmt_desc->ops->done(ctx, ctx->src_buf,
+					     ctx->dst_buf, result);
 
-	spin_lock_irqsave(&avd->job_lock, flags);
-	if (avd->job_ctx == ctx) {
-		avd->job_state = AVD_JOB_IDLE;
-		avd->job_ctx = NULL;
-		avd->job_pending = false;
+	if (ctx->scheduler_released) {
+		/* Return CAPTURE before OUTPUT signals the media request. */
+		v4l2_m2m_buf_done(ctx->dst_buf, result);
+		v4l2_m2m_buf_done(ctx->src_buf, result);
+	} else {
+		/* Includes H.264's held-capture and unsubmitted error paths. */
+		v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev,
+						 ctx->fh.m2m_ctx, result);
 	}
-	spin_unlock_irqrestore(&avd->job_lock, flags);
-
-	if (ctx->coded_fmt_desc->ops->done) {
-		struct vb2_v4l2_buffer *src_buf, *dst_buf;
-
-		src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-		dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-		ctx->coded_fmt_desc->ops->done(ctx, src_buf, dst_buf, result);
-	}
-
-	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
-					 result);
-}
-
-void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result)
-{
-	struct avd_dev *avd = ctx->dev;
-
-	pm_runtime_put_autosuspend(avd->dev);
-	avd_job_finish_no_pm(ctx, result);
 }
 
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
@@ -1010,8 +997,8 @@ void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 
 	memset(run, 0, sizeof(*run));
 
-	run->bufs.src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-	run->bufs.dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	run->bufs.src = ctx->src_buf;
+	run->bufs.dst = ctx->dst_buf;
 
 	run->coded_in =
 		vb2_dma_contig_plane_dma_addr(&run->bufs.src->vb2_buf, 0);

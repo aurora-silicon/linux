@@ -15,6 +15,7 @@
 #include <linux/iommu.h>
 #include <linux/reset.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
@@ -170,11 +171,27 @@ int avd_submit_job(struct avd_ctx *ctx)
 		AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
 		AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3);
 
+	/*
+	 * Another context may still own VP/PP while this context builds its
+	 * instructions. No MMIO or shared FIFO reuse until that owner retires.
+	 * m2m still owns this builder, so there can be only one waiter.
+	 */
+	wait_event(avd->hw_wait, !READ_ONCE(avd->job_ctx));
+	spin_lock_irqsave(&avd->job_lock, flags);
+	if (avd->broken) {
+		spin_unlock_irqrestore(&avd->job_lock, flags);
+		return -EIO;
+	}
+	avd->job_ctx = ctx;
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+
 	ctx->fifo_idx = 0;
 	for (i = 0; i < sub->codec; i++)
 		vp += avd->variant->vp_slots[i];
 	if (avd->variant->vp_slot_base[sub->codec])
 		vp = avd->variant->vp_slot_base[sub->codec];
+
+	ctx->request.vp = vp;
 
 	/*
 	 * avd_device_run() keeps this job from being finished (and the next one
@@ -204,11 +221,11 @@ int avd_submit_job(struct avd_ctx *ctx)
 		if ((!(avd->variant->quirks & AVD_QUIRK_V5_QUEUE_PACING) ||
 		     sub->codec == AVD_CODEC_HEVC) &&
 		    avd_wait_submission_queue(ctx, vp))
-			break;
+			return -EIO;
 		if (idx == num) {
 			/* A completion from here on belongs to this job. */
 			spin_lock_irqsave(&avd->job_lock, flags);
-			avd->job_end_sent = true;
+			ctx->request.end_sent = true;
 			spin_unlock_irqrestore(&avd->job_lock, flags);
 		}
 		writel(AVD_OP_EXEC | exec_mask |
@@ -224,218 +241,203 @@ int avd_submit_job(struct avd_ctx *ctx)
 
 static int avd_reset(struct avd_dev *avd)
 {
-	int ret = 0;
+	unsigned int i;
+	int ret;
 
-	ret = pm_runtime_resume_and_get(avd->dev);
-	if (ret < 0)
-		return ret;
-
+	/* Retain the failed request's PM reference until reset and IRQ drain. */
+	writel(0, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
+	synchronize_irq(avd->irq);
+	avd_shutdown(avd);
 	ret = reset_control_reset(avd->rstc);
 	if (ret)
-		dev_err(avd->dev, "reset: failed: %d", ret);
+		return ret;
 
 	if (avd->empty_domain) {
-		iommu_attach_device(avd->empty_domain, avd->dev);
+		ret = iommu_attach_device(avd->empty_domain, avd->dev);
+		if (ret)
+			return ret;
 		iommu_detach_device(avd->empty_domain, avd->dev);
 	}
 
-	ret = avd_boot(avd);
-	if (ret)
-		dev_err(avd->dev, "reset: failed to boot");
+	/* Do not route a pre-reset mailbox word to the next hardware owner. */
+	for (i = 0; i < 64; i++) {
+		if (readl(avd->mbox + AVD_REG_MBOX1_STATUS) & AVD_MBOX1_STATUS_EMPTY)
+			break;
+		readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
+	}
+	if (i == 64)
+		return -EIO;
+	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+	return avd_boot(avd);
+}
 
-	pm_runtime_put_autosuspend(avd->dev);
+static void avd_finish_work(struct work_struct *work)
+{
+	struct avd_ctx *ctx = container_of(work, struct avd_ctx, finish_work);
+	struct avd_dev *avd = ctx->dev;
+	unsigned long flags;
+	int ret;
 
-	return ret;
+	/* Reset also drains an IRQ that may still be kicking PP. */
+	cancel_delayed_work_sync(&ctx->watchdog_work);
+	if (ctx->request.reset_needed) {
+		ret = avd_reset(avd);
+		if (ret) {
+			dev_err(avd->dev, "failed to reset: %d\n", ret);
+			avd->broken = true;
+			writel(0, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
+		}
+	}
+
+	/* Failed pictures must not leave instructions referencing dropped buffers. */
+	if (ctx->request.failed) {
+		kvfree(ctx->job.segments);
+		ctx->job.segments = NULL;
+	}
+
+	avd_finish_buffers(ctx, ctx->request.failed ? VB2_BUF_STATE_ERROR :
+						  VB2_BUF_STATE_DONE);
+	if (ctx->pm_ref)
+		pm_runtime_put_autosuspend(avd->dev);
+
+	spin_lock_irqsave(&avd->job_lock, flags);
+	if (avd->job_ctx == ctx)
+		avd->job_ctx = NULL;
+	ctx->request.state = AVD_JOB_IDLE;
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+	wake_up_all(&avd->hw_wait);
+
+	/* Last state update: a subsequent run may now reuse this context. */
+	smp_store_release(&ctx->active, false);
+	wake_up_all(&ctx->request_wait);
+	v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
+}
+
+void avd_drain_context(struct avd_ctx *ctx)
+{
+	wait_event(ctx->request_wait, !READ_ONCE(ctx->active));
+	flush_work(&ctx->finish_work);
+	cancel_delayed_work_sync(&ctx->watchdog_work);
+}
+
+/* Held H.264 slices complete without a hardware submission. */
+void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ctx->dev->job_lock, flags);
+	ctx->request.pending = true;
+	ctx->request.failed = result == VB2_BUF_STATE_ERROR;
+	spin_unlock_irqrestore(&ctx->dev->job_lock, flags);
 }
 
 static void avd_watchdog_func(struct work_struct *work)
 {
-	struct avd_dev *avd;
-	struct avd_ctx *ctx;
+	struct avd_ctx *ctx = container_of(to_delayed_work(work),
+					 struct avd_ctx, watchdog_work);
+	struct avd_dev *avd = ctx->dev;
 	unsigned long flags;
 	bool claimed;
-	int ret;
-	ctx = container_of(to_delayed_work(work), struct avd_ctx,
-			   watchdog_work);
-	if (!ctx)
-		return;
 
-	avd = ctx->dev;
-
-	/*
-	 * Time out only the job this watchdog was armed for, and only while the
-	 * hardware still owns it. Otherwise that job already finished, and
-	 * resetting the hardware would break whichever job is running now.
-	 */
 	spin_lock_irqsave(&avd->job_lock, flags);
-	claimed = avd->job_ctx == ctx && avd->job_seq == ctx->wd_seq &&
-		  avd->job_state == AVD_JOB_SUBMITTED;
-	if (claimed)
-		avd->job_state = AVD_JOB_FINISHING;
+	claimed = avd->job_ctx == ctx &&
+		  avd_request_timeout(&ctx->request, ctx->wd_seq);
 	spin_unlock_irqrestore(&avd->job_lock, flags);
-	dev_dbg(avd->dev, "avd-job: watchdog seq %llu: %s\n", ctx->wd_seq,
-		claimed ? "timeout" : "stale, ignored");
-	if (!claimed)
-		return;
-
-	dev_err(avd->dev, "Frame processing timed out!");
-
-	writel(0, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
-	ret = avd_reset(avd);
-	if (ret)
-		dev_err(avd->dev, "failed to reset: %d", ret);
-
-	avd_job_finish(ctx, VB2_BUF_STATE_ERROR);
+	if (claimed) {
+		dev_err(avd->dev, "Frame processing timed out!\n");
+		schedule_work(&ctx->finish_work);
+	}
 }
 
 static irqreturn_t avd_irq_handler(int irq, void *data)
 {
 	struct avd_dev *avd = data;
-	struct avd_ctx *ctx = v4l2_m2m_get_curr_priv(avd->m2m_dev);
-
-	enum vb2_buffer_state state;
+	struct avd_ctx *ctx;
 	unsigned long flags;
-	bool finish = false, stale = false;
+	enum avd_request_event event = AVD_EVENT_NONE;
 	u32 status;
-	if (!ctx)
-		return IRQ_HANDLED;
-
-	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
-
-	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
-
-	if (status & 0x10000) { /* dbg */
-		dev_warn(avd->dev, "no handler for IRQ: %3d", status &~0x10000);
-		writel_relaxed(0, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
-		return IRQ_HANDLED;
-	}
-
-	if (status & 0x1000) {
-		/* pp is done ! we are done */
-		state = VB2_BUF_STATE_DONE;
-	} else if (status & 0x100) {
-		/* a vp is done, kick the pp and hope for the best */
-		if(ctx->coded_fmt_desc->ops->submit)
-			ctx->coded_fmt_desc->ops->submit(ctx);
-		goto done;
-	} else {
-		dev_err(avd->dev, "H%d error", status);
-		/*
-		 * avd-fw err(n): VP n raised its error interrupt and stopped,
-		 * and the PP only starts on a VP done, so the job cannot
-		 * complete any more. Run the watchdog now instead of after its
-		 * timeout: it resets the AVD and fails only this frame, and it
-		 * ignores a job the hardware does not own yet.
-		 */
-		mod_delayed_work(system_wq, &ctx->watchdog_work, 0);
-		goto done;
-	}
 
 	/*
-	 * Finish only a job the hardware owns. While avd_device_run() is still
-	 * setting up or submitting, a completion is left over from an older job
-	 * unless this job's END command already went out; then remember it and
-	 * let avd_device_run() finish the job when it returns.
+	 * An empty pop repeats the previous word, including PP done. Allow the
+	 * interrupt to precede its word briefly, then acknowledge a spurious IRQ.
 	 */
-	spin_lock_irqsave(&avd->job_lock, flags);
-	if (avd->job_ctx != ctx) {
-		stale = true;
-	} else if (avd->job_state == AVD_JOB_SUBMITTED) {
-		avd->job_state = AVD_JOB_FINISHING;
-		finish = true;
-	} else if (avd->job_state == AVD_JOB_RUNNING && avd->job_end_sent) {
-		avd->job_pending = true;
-		avd->job_pending_result = state;
-	} else {
-		stale = true;
-	}
-	spin_unlock_irqrestore(&avd->job_lock, flags);
-	dev_dbg(avd->dev, "avd-job: irq %#x: %s\n", status,
-		finish ? "finish" : stale ? "stale, ignored" : "pending");
-	if (stale)
-		dev_warn_ratelimited(avd->dev, "ignoring stale completion");
-	if (finish) {
-		cancel_delayed_work(&ctx->watchdog_work);
-		avd_job_finish(ctx, state);
-	}
+	if (readl(avd->mbox + AVD_REG_MBOX1_STATUS) & AVD_MBOX1_STATUS_EMPTY) {
+		u32 mb;
 
-done:
+		if (readl_poll_timeout_atomic(avd->mbox + AVD_REG_MBOX1_STATUS, mb,
+					      !(mb & AVD_MBOX1_STATUS_EMPTY), 1, 10)) {
+			writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+			return IRQ_HANDLED;
+		}
+	}
+	/* Always acknowledge, even when the m2m scheduler has no current job. */
+	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
+	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+
+	spin_lock_irqsave(&avd->job_lock, flags);
+	ctx = avd->job_ctx;
+	if (ctx)
+		event = avd_request_irq(&ctx->request, status);
+	spin_unlock_irqrestore(&avd->job_lock, flags);
+
+	if (event == AVD_EVENT_KICK_PP && ctx->coded_fmt_desc->ops->submit)
+		ctx->coded_fmt_desc->ops->submit(ctx);
+	else if (event == AVD_EVENT_FINISH)
+		schedule_work(&ctx->finish_work);
 	return IRQ_HANDLED;
+}
+
+static int avd_job_ready(void *priv)
+{
+	struct avd_ctx *ctx = priv;
+
+	/* Never overwrite state still used by this context's VP/PP or done(). */
+	return !smp_load_acquire(&ctx->active);
 }
 
 static void avd_device_run(void *priv)
 {
 	struct avd_ctx *ctx = priv;
 	struct avd_dev *avd = ctx->dev;
-	const struct avd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
-	enum vb2_buffer_state result = VB2_BUF_STATE_ERROR;
-	const char *outcome = "already finished";
 	unsigned long flags;
-	bool finish = false;
-	u64 seq;
+	bool finish;
 	int ret;
 
-	if (WARN_ON(!desc))
-		return;
-
-	/*
-	 * IRQ completion cannot wait for an already running watchdog. Drain it
-	 * here, before reusing wd_seq, so an old callback cannot time out this
-	 * context's next job. device_run is sleepable; hold no job_lock here.
-	 */
-	cancel_delayed_work_sync(&ctx->watchdog_work);
+	WRITE_ONCE(ctx->active, true);
+	ctx->src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	ctx->dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	ctx->scheduler_released = false;
+	avd_request_begin(&ctx->request, ++avd->job_seq);
 
 	ret = pm_runtime_resume_and_get(avd->dev);
-	if (ret < 0) {
-		avd_job_finish_no_pm(ctx, VB2_BUF_STATE_ERROR);
-		return;
-	}
+	ctx->pm_ref = ret >= 0;
+	if (ret >= 0)
+		ret = ctx->coded_fmt_desc->ops->run(ctx);
 
-	/*
-	 * While the job is RUNNING neither completion IRQs nor the watchdog may
-	 * finish it: v4l2-mem2mem would start the next job on a kworker while
-	 * this one still builds and submits ctx->job.
-	 */
 	spin_lock_irqsave(&avd->job_lock, flags);
-	seq = ++avd->job_seq;
-	avd->job_ctx = ctx;
-	avd->job_state = AVD_JOB_RUNNING;
-	avd->job_end_sent = false;
-	avd->job_pending = false;
-	spin_unlock_irqrestore(&avd->job_lock, flags);
-	dev_dbg(avd->dev, "avd-job: run seq %llu\n", seq);
-
-	ret = desc->ops->run(ctx);
-	if (ret) {
-		dev_dbg(avd->dev, "avd-job: run seq %llu failed: %d\n", seq, ret);
-		avd_job_finish(ctx, VB2_BUF_STATE_ERROR);
-		return;
-	}
-
-	/*
-	 * The run either finished the job itself (held capture buffer) or handed
-	 * it to the hardware: arm the watchdog, or finish right away if the
-	 * completion already arrived.
-	 */
-	spin_lock_irqsave(&avd->job_lock, flags);
-	if (avd->job_seq == seq && avd->job_state == AVD_JOB_RUNNING) {
-		if (avd->job_pending) {
-			avd->job_state = AVD_JOB_FINISHING;
-			result = avd->job_pending_result;
-			finish = true;
-			outcome = "completed during submission";
-		} else {
-			avd->job_state = AVD_JOB_SUBMITTED;
-			ctx->wd_seq = seq;
-			schedule_delayed_work(&ctx->watchdog_work, msecs_to_jiffies(2000));
-			outcome = "submitted";
+	finish = avd_request_submitted(&ctx->request, ret != 0,
+				       avd->job_ctx == ctx);
+	if (!finish) {
+		ctx->wd_seq = ctx->request.seq;
+		schedule_delayed_work(&ctx->watchdog_work, msecs_to_jiffies(2000));
+		/*
+		 * A non-held request can leave the scheduler while retaining both
+		 * buffers and all codec storage. The next independent context can
+		 * prepare on the CPU, but must wait in avd_submit_job() for PP.
+		 * H.264 keeps the core's held-capture scheduling contract.
+		 * job_ready does not take job_lock (m2m takes its own spinlock).
+		 */
+		if (!(ctx->fh.m2m_ctx->out_q_ctx.q.subsystem_flags &
+		      VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF)) {
+			v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+			v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+			ctx->scheduler_released = true;
+			v4l2_m2m_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx);
 		}
 	}
 	spin_unlock_irqrestore(&avd->job_lock, flags);
-	dev_dbg(avd->dev, "avd-job: run seq %llu: %s\n", seq, outcome);
-
 	if (finish)
-		avd_job_finish(ctx, result);
+		schedule_work(&ctx->finish_work);
 }
 
 /*
@@ -508,6 +510,8 @@ static int avd_open(struct file *filp)
 		goto err_free_ctx;
 
 	INIT_DELAYED_WORK(&ctx->watchdog_work, avd_watchdog_func);
+	INIT_WORK(&ctx->finish_work, avd_finish_work);
+	init_waitqueue_head(&ctx->request_wait);
 
 	avd_reset_coded_fmt(ctx);
 	avd_reset_decoded_fmt(ctx);
@@ -544,7 +548,7 @@ static int avd_release(struct file *filp)
 	v4l2_fh_del(&ctx->fh, filp);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	/* The job has finished; its watchdog must not run on the freed ctx. */
-	cancel_delayed_work_sync(&ctx->watchdog_work);
+	avd_drain_context(ctx);
 	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
 	v4l2_fh_exit(&ctx->fh);
 	avd_buf_free(ctx->dev, &ctx->inst);
@@ -565,6 +569,7 @@ static const struct v4l2_file_operations avd_fops = {
 
 static const struct v4l2_m2m_ops avd_m2m_ops = {
 	.device_run = avd_device_run,
+	.job_ready = avd_job_ready,
 };
 
 static const struct media_device_ops avd_media_ops = {
@@ -807,8 +812,8 @@ static const struct avd_variant avd_t8132_variant = {
  * T6040 (M4 Pro): the T8132 decoder. Its first HEVC job stalled the VP when
  * it was sent the pre-v5 header (no DMA configuration words, no reserved
  * scratch slot); T6040 runs the same v5 firmware generation as T8140, so it
- * gets the v5 header. HEVC stays hidden from V4L2 clients until that is
- * verified on the hardware.
+ * gets the v5 header. Advertise HEVC only when the loaded firmware also
+ * supplies a CODECS trailer containing h265.
  */
 static const struct avd_variant avd_t6040_variant = {
 	.vp_slots = {
@@ -819,7 +824,8 @@ static const struct avd_variant avd_t6040_variant = {
 	},
 	.fifo_slots = 15,
 	.configure_stream = t8122_configure_stream,
-	.capabilities = AVD_CAPABILITY_H264 |
+	.capabilities = AVD_CAPABILITY_HEVC |
+			AVD_CAPABILITY_H264 |
 			AVD_CAPABILITY_VP9 |
 			AVD_CAPABILITY_AV1,
 	.fw_name = "apple/avd-fw-v5-t1.bin",
@@ -829,6 +835,7 @@ static const struct avd_variant avd_t6040_variant = {
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
 	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
+	.fw_caps_required = AVD_CAPABILITY_HEVC,
 };
 
 /* can also be derived from a version register */
@@ -887,6 +894,7 @@ static int avd_probe(struct platform_device *pdev)
 
 	mutex_init(&avd->vdev_lock);
 	spin_lock_init(&avd->job_lock);
+	init_waitqueue_head(&avd->hw_wait);
 
 	match = of_match_node(avd_of_match, pdev->dev.of_node);
 	avd->variant = match->data;
@@ -940,7 +948,8 @@ static int avd_probe(struct platform_device *pdev)
 		avd->capabilities = caps;
 	} else {
 		/* Backward compatibility to old firmware, do not upstream. */
-		avd->capabilities = avd->variant->capabilities;
+		avd->capabilities = avd->variant->capabilities &
+			~avd->variant->fw_caps_required;
 	}
 
 	ret = dma_set_mask_and_coherent(avd->dev,
@@ -954,6 +963,7 @@ static int avd_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 1);
 	if (irq < 0)
 		return irq;
+	avd->irq = irq;
 	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 			avd_irq_handler, IRQF_ONESHOT,
 			dev_name(&pdev->dev), avd);
@@ -998,6 +1008,9 @@ static __maybe_unused int avd_runtime_resume(struct device *dev)
 	int ret;
 	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
 
+	if (READ_ONCE(avd->broken))
+		return -EIO;
+
 	ret = avd_boot(avd);
 	if (ret)
 		dev_err(dev, "failed to boot");
@@ -1012,9 +1025,33 @@ static __maybe_unused int avd_runtime_suspend(struct device *dev)
 	return 0;
 }
 
+static __maybe_unused int avd_suspend(struct device *dev)
+{
+	struct avd_dev *avd = dev_get_drvdata(dev);
+	int ret;
+
+	v4l2_m2m_suspend(avd->m2m_dev);
+	wait_event(avd->hw_wait, !READ_ONCE(avd->job_ctx));
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		v4l2_m2m_resume(avd->m2m_dev);
+	return ret;
+}
+
+static __maybe_unused int avd_resume(struct device *dev)
+{
+	struct avd_dev *avd = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (!ret)
+		v4l2_m2m_resume(avd->m2m_dev);
+	return ret;
+}
+
 static const struct dev_pm_ops avd_pm_ops = { SET_SYSTEM_SLEEP_PM_OPS(
-	pm_runtime_force_suspend,
-	pm_runtime_force_resume) SET_RUNTIME_PM_OPS(avd_runtime_suspend,
+	avd_suspend,
+	avd_resume) SET_RUNTIME_PM_OPS(avd_runtime_suspend,
 						    avd_runtime_resume, NULL) };
 
 static struct platform_driver avd_driver = {
