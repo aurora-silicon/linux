@@ -1179,6 +1179,7 @@ static int ane_platform_probe(struct platform_device *pdev)
 	drm->dev_private = ane;
 
 	atomic_set(&ane->wedged, 0);
+	ane->tm_retention = soc->tm_retention;
 
 	/* Producer-side stats: preallocate the ring at probe; the files
 	 * and the hot-path branch key off stats_slots.

@@ -466,6 +466,97 @@ static int ane_pd_cycle(struct ane_device *ane)
 	return err;
 }
 
+/*
+ * Drain the task-manager state a timed-out task leaves behind (from
+ * omarchy-ane ane_tm_drain_retained by Joshua Warren, MIT) when the
+ * tm/tq file survives the power cycle in retention (T6001; descriptor
+ * tm_retention). T8103 never runs this: its cycle is a full POR of the
+ * file, and the re-arm below starts it clean.
+ *
+ * Two things must go, or the retained TM never reads idle again:
+ *   - pending events on both IRQ lines. Each event pops by reading
+ *     INFO/UNK1/TMST/UNK2, exactly as ane_tm_collect_events pops them;
+ *     a stale backlog (or one over the 64-entry collect cap) would make
+ *     the next submit's completion poll miss or fail.
+ *   - the latched queue entry of the dead task. TQ_STATUS/NID1 get the
+ *     same clear the normal completion path gives a finished queue.
+ */
+static void ane_tm_drain_retained(struct ane_device *ane)
+{
+	int line, qid;
+
+	/* Stop the TM first: the cycle leaves the enable|halt latch set
+	 * (TQ_EN reads 0x3000). Clear both bits so the
+	 * re-arm below starts the TM from a defined stopped state.
+	 */
+	ane_rec_writel(ane, "TM_TQ_EN stop tm+0x0c",
+		       ane->engine + ANE_TM_BASE + TM_TQ_EN,
+		       tm_read32(ane, TM_TQ_EN) & ~0x3000U);
+
+	for (line = 0; line < 2; line++) {
+		u32 count = tm_read32(ane, TM_IRQ_EVTC(line));
+		u32 n;
+
+		if (count > 64)
+			count = 64;
+		for (n = 0; n < count; n++) {
+			tm_read32(ane, TM_IRQ_INFO(line));
+			tm_read32(ane, TM_IRQ_UNK1(line));
+			tm_read32(ane, TM_IRQ_TMST(line));
+			tm_read32(ane, TM_IRQ_UNK2(line));
+		}
+	}
+	tm_write32(ane, TM_IRQ_ACK, tm_read32(ane, TM_IRQ_ACK) | 3);
+
+	/* The dead task leaves per-queue error codes latched here (seen
+	 * 0x22222222 / 0x2222: four-bit code 2 per TQ slot). While any
+	 * latch is set the TM stays halted and TM_STATUS reads 0. Try the
+	 * W1C convention first (write the read value back), fall back to
+	 * plain zero-clear, and log what this silicon answered to.
+	 */
+	{
+		static const u16 err_reg[3] = { TM_ERROR1, TM_ERROR2,
+						TM_ERROR3 };
+		char reg[24];
+		int ei;
+
+		for (ei = 0; ei < 3; ei++) {
+			void __iomem *addr =
+				ane->engine + ANE_TM_BASE + err_reg[ei];
+			u32 val = readl(addr);
+
+			if (!val)
+				continue;
+			writel(val, addr);
+			if (readl(addr))
+				writel(0x0, addr);
+			snprintf(reg, sizeof(reg), "TM_ERROR%d clear tm+%#x",
+				 ei + 1, err_reg[ei]);
+			ane_rec_read32(ane, reg, addr);
+		}
+	}
+
+	for (qid = 0; qid < ANE_TQ_COUNT; qid++) {
+		u32 nid = tq_read32(ane, TQ_NID1(qid));
+
+		tq_write32(ane, TQ_STATUS(qid), 0x0);
+		if (nid & 1)
+			tq_write32(ane, TQ_NID1(qid), nid & ~1U);
+	}
+
+	/* Log the retained state: what the dead task left in the
+	 * committed counter and the error latches.
+	 */
+	ane_rec_read32(ane, "TM_COMMITTED tm+0x44 (drain)",
+		       ane->engine + ANE_TM_BASE + TM_COMMITTED);
+	ane_rec_read32(ane, "TM_ERROR1 tm+0x58 (drain)",
+		       ane->engine + ANE_TM_BASE + TM_ERROR1);
+	ane_rec_read32(ane, "TM_ERROR2 tm+0x5c (drain)",
+		       ane->engine + ANE_TM_BASE + TM_ERROR2);
+	ane_rec_read32(ane, "TM_ERROR3 tm+0x60 (drain)",
+		       ane->engine + ANE_TM_BASE + TM_ERROR3);
+}
+
 int ane_tm_recover(struct ane_device *ane)
 {
 	u32 status;
@@ -492,14 +583,15 @@ int ane_tm_recover(struct ane_device *ane)
 		return err;
 	}
 
-	/* A full, acknowledged power-off replaces the speculative retained-TM
-	 * drain. Never clear undocumented error registers or restart a queue
-	 * which still contains the old halted task.
+	/* On T600x the tm/tq file survives the acknowledged power-off in
+	 * retention (TQ_EN reads 0x3000 after every resume, healthy or not,
+	 * and PMGR reset pulses on the ANE domains do not clear it). Drain
+	 * the retained state there; this is what recovers a failed task
+	 * ("-5, finish lines=1"). Anything the drain cannot clear fails the
+	 * idle check below and stays wedged.
 	 */
-	if (tm_read32(ane, TM_TQ_EN) & 0x2000) {
-		dev_err(ane->dev, "recovery: task manager still halted after power-off\n");
-		return -EIO;
-	}
+	if (ane->tm_retention)
+		ane_tm_drain_retained(ane);
 
 	ane_tm_enable(ane, true);
 
