@@ -480,6 +480,10 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
 	if (fan->manual)
 		return 0;
 
+	/* Older firmware may expose a write-only mode key. */
+	if (!(fan->mode.info.flags & APPLE_SMC_READABLE))
+		goto set_manual;
+
 	/* Do not send a mode write the firmware is known to refuse. */
 	ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
 	if (ret)
@@ -514,6 +518,7 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
 			goto relock;
 	}
 
+set_manual:
 	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_MANUAL);
 	if (ret < 0)
 		goto relock;

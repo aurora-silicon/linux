@@ -109,6 +109,7 @@ struct macsmc_fan_test {
 	int writes;
 	int ftst_writes;
 	int refused;
+	int mode_reads;
 	smc_key fail_key;
 };
 
@@ -125,6 +126,7 @@ static int fan_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t s
 
 	switch (key & 0xff00ffff) {
 	case __SMC_KEY('F', 0, 'M', 'd'):
+		t->mode_reads++;
 		value = t->mode[i];
 		break;
 	case __SMC_KEY('F', 0, 'M', 'n'):
@@ -330,6 +332,22 @@ static void macsmc_fan_test_legacy(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->refused, 0);
 }
 
+/* A legacy write-only mode key keeps working without a new read requirement. */
+static void macsmc_fan_test_legacy_write_only(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+
+	t->legacy = true;
+	t->mode[0] = MACSMC_FAN_MODE_AUTO;
+	t->fans[0].mode.info.flags &= ~APPLE_SMC_READABLE;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 2500), 0);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_MANUAL);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_set_fan(&t->hwmon, 0, 0), 0);
+	KUNIT_EXPECT_EQ(test, t->mode[0], MACSMC_FAN_MODE_AUTO);
+	KUNIT_EXPECT_EQ(test, t->mode_reads, 0);
+	KUNIT_EXPECT_EQ(test, t->ftst_writes, 0);
+}
+
 /* Suspend, resume and shutdown do not write untouched fan keys. */
 static void macsmc_fan_test_untouched(struct kunit *test)
 {
@@ -384,6 +402,7 @@ static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_two_fans),
 	KUNIT_CASE(macsmc_fan_test_no_unlock_key),
 	KUNIT_CASE(macsmc_fan_test_legacy),
+	KUNIT_CASE(macsmc_fan_test_legacy_write_only),
 	KUNIT_CASE(macsmc_fan_test_untouched),
 	KUNIT_CASE(macsmc_fan_test_suspend_manual),
 	KUNIT_CASE(macsmc_fan_test_unlock_fails),
