@@ -77,5 +77,7 @@ SEP driver or change its identity to test this patch.
 Rust capture wait and contact gate against scripted status reads and IRQ/poll
 waits. It covers early reading/ready frames, a tainted frame followed by armed,
 clean placement, repeated enrolment discards, buffer disposal, status/read/arm
-faults, cancellation and the shared deadline. It does not emulate physical
-finger sensing or the enclave's encrypted sequence handling.
+faults, cancellation and the shared deadline. A second test executes the actual capture reader and buffer destructor to
+check wiping on success, checksum failure and a partially filled bus failure.
+These tests do not emulate physical finger sensing or the enclave's encrypted
+sequence handling.

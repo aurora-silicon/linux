@@ -188,12 +188,90 @@ fn repeated_stale_frames_do_not_extend_deadline() {
 '''
 
 
+BUFFER_HARNESS = r'''
+#![allow(dead_code)]
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+const MAX_CAPTURE: usize = 0x10000;
+const CRC_LEN: usize = 2;
+const CMD_LEN: usize = 7;
+const READ_CMD_LEN: usize = 11;
+const CMD_READ_PREFIX: [u8; CMD_LEN] = [0; CMD_LEN];
+const GFP_KERNEL: u32 = 0;
+static WIPED: AtomicU32 = AtomicU32::new(0);
+static MODE: AtomicU32 = AtomicU32::new(0);
+struct Error(i32);
+impl Error { fn from_errno(n: i32) -> Self { Self(n) } }
+struct KVec<T: Copy + Default + PartialEq>(Vec<T>);
+impl<T: Copy + Default + PartialEq> KVec<T> {
+    fn with_capacity(n: usize, _: u32) -> Result<Self, ()> { Ok(Self(Vec::with_capacity(n))) }
+    fn resize(&mut self, n: usize, value: T, _: u32) -> Result<(), ()> { self.0.resize(n, value); Ok(()) }
+}
+impl<T: Copy + Default + PartialEq> std::ops::Deref for KVec<T> {
+    type Target = [T]; fn deref(&self) -> &[T] { &self.0 }
+}
+impl<T: Copy + Default + PartialEq> std::ops::DerefMut for KVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] { &mut self.0 }
+}
+impl<T: Copy + Default + PartialEq> Drop for KVec<T> {
+    fn drop(&mut self) {
+        assert!(self.0.iter().all(|v| *v == T::default()), "capture buffer freed without wiping");
+        WIPED.fetch_add(1, Relaxed);
+    }
+}
+unsafe fn sep_sensor_xfer2(_: *const c_void, _: usize, rx: *mut c_void, len: usize) -> i32 {
+    let buf = unsafe { std::slice::from_raw_parts_mut(rx.cast::<u8>(), len) };
+    buf.fill(0xa5);
+    let split = len - CRC_LEN;
+    let crc = crc16_ansi(&buf[..split]);
+    buf[split..].copy_from_slice(&crc.to_le_bytes());
+    match MODE.load(Relaxed) {
+        1 => { buf[0] ^= 1; 0 },
+        2 => -5,
+        _ => 0,
+    }
+}
+@ITEMS@
+#[test]
+fn success_checksum_and_bus_error_all_wipe() {
+    for mode in 0..=2 {
+        MODE.store(mode, Relaxed);
+        match (mode, read_capture(32)) {
+            (0, Ok(capture)) => drop(capture),
+            (1, Err(CaptureError::Checksum { .. })) => {},
+            (2, Err(CaptureError::Bus(_))) => {},
+            _ => panic!("unexpected capture outcome"),
+        }
+        assert_eq!(WIPED.load(Relaxed), mode + 1);
+    }
+    for length in [0, 1, 2, MAX_CAPTURE as u32 + 1] {
+        assert!(matches!(read_capture(length), Err(CaptureError::Length(_))));
+    }
+    assert_eq!(WIPED.load(Relaxed), 3);
+}
+'''
+
 class FreshContactTest(unittest.TestCase):
     def test_real_capture_wait(self):
         sensor = (APPLE / 'sensor.rs').read_text()
         contact = item(sensor, 'pub(crate) struct CaptureContact {') + '\n' + item(sensor, 'impl CaptureContact {')
         wait = item((APPLE / 'sbio.rs').read_text(), '    fn await_capture(')
         program = PRELUDE.replace('@CONTACT@', contact).replace('@WAIT@', wait)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'test.rs').write_text(program)
+            subprocess.run(['rustc', '--edition=2021', '--test', str(root / 'test.rs'), '-o', str(root / 'test')], check=True)
+            subprocess.run([str(root / 'test')], check=True)
+
+
+    def test_real_capture_buffer_wiping(self):
+        sensor = (APPLE / 'sensor.rs').read_text()
+        declaration = sensor.index('pub(crate) struct Capture(')
+        items = [sensor[declaration:sensor.index(';', declaration) + 1]]
+        items.extend(item(sensor, prefix) for prefix in (
+            'fn crc16_ansi(', 'impl Capture {', 'impl Drop for Capture {',
+            'pub(crate) enum CaptureError {', 'pub(crate) fn read_capture('))
+        program = BUFFER_HARNESS.replace('@ITEMS@', '\n'.join(items))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'test.rs').write_text(program)

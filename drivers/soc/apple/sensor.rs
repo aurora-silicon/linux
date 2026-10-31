@@ -834,13 +834,17 @@ pub(crate) fn read_capture(length: u32) -> core::result::Result<Capture, Capture
     buf.resize(len, 0xff, GFP_KERNEL)
         .map_err(|_| CaptureError::NoMemory)?;
 
-    // SAFETY: `cmd` is `READ_CMD_LEN` bytes and `buf` is `len` bytes; both live
+    // Own the buffer through Capture before the bus can fill it, so failures
+    // wipe it too, including frames deliberately discarded for stale contact.
+    let mut capture = Capture(buf);
+
+    // SAFETY: `cmd` is `READ_CMD_LEN` bytes and `capture` holds `len` bytes; both live
     // across the call, and the shim writes only into the receive buffer.
     let rc = unsafe {
         sep_sensor_xfer2(
             cmd.as_ptr().cast(),
             READ_CMD_LEN,
-            buf.as_mut_ptr().cast(),
+            capture.0.as_mut_ptr().cast(),
             len,
         )
     };
@@ -849,9 +853,9 @@ pub(crate) fn read_capture(length: u32) -> core::result::Result<Capture, Capture
     }
 
     let split = len - CRC_LEN;
-    let advertised = u16::from_le_bytes([buf[split], buf[split + 1]]);
+    let advertised = u16::from_le_bytes([capture.0[split], capture.0[split + 1]]);
     // CRC-16/ANSI, not CCITT-FALSE.
-    let computed = crc16_ansi(&buf[..split]);
+    let computed = crc16_ansi(&capture.0[..split]);
     if advertised != computed {
         return Err(CaptureError::Checksum {
             advertised,
@@ -859,5 +863,5 @@ pub(crate) fn read_capture(length: u32) -> core::result::Result<Capture, Capture
         });
     }
 
-    Ok(Capture(buf))
+    Ok(capture)
 }
