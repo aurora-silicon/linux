@@ -56,6 +56,27 @@
 		/* The loader adds its own reservations */
 
 		/*
+		 * The loader must fill reg from ane0 segment-ranges, rename each
+		 * node to match its physical address and enable it. Leave these
+		 * disabled until then; allocating replacement memory would lose
+		 * the personalized preload. TEXT is 0xc0000 bytes and DATA is
+		 * 0x2ac000 bytes. Neither segment may be reclaimed before reboot.
+		 */
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		/*
 		 * iBoot loads the ISP firmware below the kernel's memory. Its
 		 * segments are the ADT's isp0 segment-ranges (macOS 26.6.2,
 		 * iBoot mBoot-18000.161.10), mapped where the firmware runs them:
@@ -4692,3 +4713,8 @@
 
 #undef J616S_DELETE_FAN_TRIPS
 #undef J616S_DELETE_FAN_MAPS
+
+&ane {
+	memory-region = <&ane_fw_text>, <&ane_fw_data>;
+	memory-region-names = "firmware-text", "firmware-data";
+};

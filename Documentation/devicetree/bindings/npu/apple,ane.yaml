@@ -119,7 +119,24 @@ properties:
     description:
       Device addresses of the preloaded TEXT and DATA segments. Their sizes
       are 0xc0000 and 0x2ac000 bytes respectively. The bootloader supplies
-      this property together with the physical reservations.
+      the physical reservations. The device addresses are fixed by the
+      firmware layout and may be described statically.
+
+  apple,dapf-ranges:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    minItems: 4
+    maxItems: 4
+    items:
+      items:
+        - description: Physical start address, inclusive
+        - description: Physical end address, inclusive
+    description:
+      Four DART address protection filter (DAPF) ranges, in hardware record
+      order. Each pair contains inclusive 64-bit physical bounds, not a
+      base and length. The same records apply to all three ANE DARTs.
+      Firmware accesses these registers through identity mappings of the
+      containing 16 KiB pages in its private domain. These are MMIO ranges,
+      not allocatable DMA memory or additional preload segments.
 
   apple,ane-type:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -253,6 +270,7 @@ allOf:
       required:
         - apple,ane-type
         - apple,firmware-preloaded
+        - apple,dapf-ranges
     else:
       properties:
         iommus:
@@ -293,6 +311,7 @@ allOf:
         apple,ane-type: false
         apple,firmware-preloaded: false
         apple,exclave-assigned: false
+        apple,dapf-ranges: false
       required:
         - interrupt-names
 
@@ -426,5 +445,43 @@ examples:
             resets = <&ps_ane_cpu>;
             mboxes = <&ane_mbox>;
             memory-region = <&ane_alias_iova>;
+        };
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        ane@484000000 {
+            compatible = "apple,t6041-ane";
+            reg = <0x4 0x84000000 0x0 0x2000000>,
+                  <0x5 0x02280000 0x0 0x18000>,
+                  <0x5 0x022a0000 0x0 0x4000>,
+                  <0x5 0x003c0000 0x0 0x30000>,
+                  <0x2 0x12000000 0x0 0xff4000>,
+                  <0x5 0x22000000 0x0 0x2000000>,
+                  <0x5 0x08374000 0x0 0x4000>;
+            reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2",
+                        "aux-3", "aux-4";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1054 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>,
+                     <&ane_dart0 11>, <&ane_dart1 11>, <&ane_dart2 11>;
+            power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+                            <&ps_ane_td>, <&ps_ane_base>;
+            apple,ane-type = <0x110>;
+            apple,firmware-preloaded;
+            apple,dapf-ranges = /bits/ 64 <0x5022803c0 0x5022803c3>,
+                                        <0x50228c000 0x50228c01b>,
+                                        <0x581668000 0x581668003>,
+                                        <0x28a668000 0x28a668003>;
+            memory-region = <&ane_fw_text>, <&ane_fw_data>;
+            memory-region-names = "firmware-text", "firmware-data";
+            apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+            status = "disabled";
         };
     };

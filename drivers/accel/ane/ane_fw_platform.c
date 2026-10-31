@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * H16/H17 facts from the 2026-10-31 H16/H17 specification, sections 3-7,
- * 12 and 15. This preflight performs no MMIO, DMA mapping or power access.
+ * 12 and 15, and the H16 cold-boot facts, round 5. Metadata preflight
+ * performs no MMIO, DMA mapping or power access.
  */
 #include <linux/ioport.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 
 #include "ane_fw_platform.h"
+#include "ane_h16_boot_data.h"
+
+static char *h16_stage;
+module_param(h16_stage, charp, 0444);
+MODULE_PARM_DESC(h16_stage, "H16 opt-in stage: preflight, map, boot, startup; unset refuses");
 
 static const char * const ane_h16_reg_names[] = {
 	"engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-3", "aux-4",
@@ -25,6 +32,7 @@ static const u32 ane_h16_power_words[] = {
 };
 
 const struct ane_fw_platform ane_h16_platform = {
+	.h16_boot = &ane_h16_build_26a428,
 	/* The DT compatible is t6041; the physical M4 Pro is T6040. */
 	.soc = 0x6040,
 	.chip_family = 16,
@@ -159,10 +167,28 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	/* Original HWX validation does not establish firmware ownership,
-	 * preload integrity, startup state or a decoded process resource map.
-	 * Keep the section-only ABI and incomplete boot backend refused.
-	 */
-	dev_info(dev, "H16 ANE: preload validation, HWX ABI and boot backend incomplete; refusing before power access\n");
-	return -EOPNOTSUPP;
+	ret = ane_h16_stage_parse(h16_stage);
+	if (ret < 0)
+		return ret;
+	if (!ret) {
+		dev_info(dev, "H16 ANE: staged backend requires h16_stage opt-in; refusing before power access\n");
+		return -EOPNOTSUPP;
+	}
+	if (!soc->h16_boot || of_property_count_u64_elems(np, "apple,dapf-ranges") != 8)
+		return -ENODATA;
+	return 0;
+}
+
+int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_platform *soc)
+{
+	int ret = ane_fw_platform_preflight(pdev, soc);
+
+	if (ret)
+		return ret;
+	return ane_h16_backend_probe(pdev, soc, ane_h16_stage_parse(h16_stage));
+}
+
+void ane_fw_platform_remove(struct platform_device *pdev)
+{
+	ane_h16_backend_remove(pdev);
 }
