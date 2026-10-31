@@ -159,7 +159,7 @@ def main():
         expected = surface([a + b for a, b in zip(*inputs)])
         for channel, values in zip((5, 6), inputs):
             good.buffers[channel][1][:] = surface(values)
-        bad.buffers[5][1][:] = bytes(len(bad.buffers[5][1]))
+        bad.buffers[5][1][:] = b"\x00\x3c" * (len(bad.buffers[5][1]) // 2)
         def check_good():
             good.execute()
             if good.buffers[4][1][:] != expected:
