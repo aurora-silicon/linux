@@ -629,9 +629,9 @@ validate_vp9_frame(struct v4l2_ctrl_vp9_frame *frame)
 
 	/*
 	 * According to the spec, tile_cols_log2 shall be less than or equal
-	 * to 6.
+	 * to 6, and tile_rows_log2 shall be less than or equal to 2.
 	 */
-	if (frame->tile_cols_log2 > 6)
+	if (frame->tile_cols_log2 > 6 || frame->tile_rows_log2 > 2)
 		return -EINVAL;
 
 	if (frame->reference_mode > V4L2_VP9_REFERENCE_MODE_SELECT)
@@ -804,7 +804,8 @@ static int validate_av1_tile_info(struct v4l2_av1_tile_info *t)
 	    t->tile_rows > V4L2_AV1_MAX_TILE_ROWS)
 		return -EINVAL;
 
-	if ((u32)t->tile_cols * t->tile_rows > V4L2_AV1_MAX_TILE_COUNT)
+	if ((u32)t->tile_cols * t->tile_rows > V4L2_AV1_MAX_TILE_COUNT ||
+	    t->context_update_tile_id >= (u32)t->tile_cols * t->tile_rows)
 		return -EINVAL;
 
 	return 0;
