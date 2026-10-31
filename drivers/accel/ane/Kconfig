@@ -12,8 +12,9 @@ config DRM_ACCEL_ANE
 	  Choose this option if you have an Apple SoC with a Neural Engine:
 	  M1 (T8103), M1 Pro, Max and Ultra (T6000, T6001, T6002), M2
 	  (T8112), or M2 Pro, Max and Ultra (T6020, T6021, T6022).
-	  H16 (M4 Pro) and H17 are recognized for firmware preflight and
-	  ownership refusal only; execution support is not available.
+	  H16 (M4 Pro) is recognized for firmware preflight. H17 has an
+	  experimental staged cold-boot backend requiring loader ownership
+	  evidence and reserved preload memory; its userspace load ABI is pending.
 
 	  The interface exposed to userspace is described in
 	  include/uapi/drm/ane_accel.h.

@@ -736,7 +736,7 @@ static void ane_transport_shared_rejections_test(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, ane_fw_shared_size(0, 0, 0, &size), -EOPNOTSUPP);
 	for (i = 0; i < ARRAY_SIZE(tuples); i++) {
-		int error = i < 2 ? -EOPNOTSUPP : -E2BIG;
+		int error = i == 0 ? -EPROTO : i == 1 ? -EOPNOTSUPP : -E2BIG;
 
 		KUNIT_ASSERT_EQ(test, ane_test_init_transport(f), 0);
 		KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
@@ -920,7 +920,72 @@ static void ane_transport_wait_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->now, TEST_DEADLINE);
 }
 
+static void ane_transport_deny_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	const u16 ids[] = { 0x27, 0x28, 0x30, 0x31, 0x34 };
+	u8 command[12] = {};
+	int ret;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	for (unsigned int i = 0; i < ARRAY_SIZE(ids); i++) {
+		put_unaligned_le16(ids[i], command + 4);
+		f->count = 0;
+		ret = ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+					       sizeof(command), TEST_DEADLINE);
+		KUNIT_EXPECT_EQ(test, ret, -EPERM);
+		KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+		KUNIT_EXPECT_FALSE(test, f->t.pending[ANE_FW_IO].active);
+		KUNIT_EXPECT_EQ(test, f->t.pool_used, (size_t)TEST_RESERVED);
+	}
+}
+
+static void ane_transport_free_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *slot;
+	u64 dva;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	dva = f->t.shared[0].dva;
+	f->t.allow_free = true;
+	ane_test_shared_request(f, dva, 0, 0);
+	slot = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot), dva | 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + 8), 0ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + 16), 0ULL);
+	KUNIT_EXPECT_EQ(test, f->t.free_count, 1U);
+	KUNIT_EXPECT_TRUE(test, f->t.retired[0]);
+	KUNIT_EXPECT_NOT_NULL(test, f->t.shared[0].cpu);
+	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_report(&f->t, dva, 8), NULL);
+	/* Duplicate FREE cannot acknowledge or retire a different mapping. */
+	ane_test_shared_request(f, dva, 0, 0);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+}
+
+static void ane_transport_free_refusal_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_16K, 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	ane_test_shared_request(f, f->t.shared[0].dva, 0, 0);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EPROTO);
+	KUNIT_EXPECT_FALSE(test, f->t.retired[0]);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_transport_deny_test),
+	KUNIT_CASE(ane_transport_free_test),
+	KUNIT_CASE(ane_transport_free_refusal_test),
 	KUNIT_CASE(ane_transport_table_test),
 	KUNIT_CASE(ane_transport_table_roles_test),
 	KUNIT_CASE(ane_transport_table_bounds_test),

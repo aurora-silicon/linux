@@ -15,6 +15,23 @@
 #define ANE_FW_SLOT_SIZE 64
 #define ANE_FW_TICK_RATE 24000000U
 
+/* H17 26.6.2: 0x2f is shared-event initialization. None of these
+ * secure/exclave transitions belongs to the cold AP-direct transport.
+ */
+static inline bool ane_fw_command_denied(u16 id)
+{
+	switch (id) {
+	case 0x27:
+	case 0x28:
+	case 0x30:
+	case 0x31:
+	case 0x34:
+		return true;
+	default:
+		return false;
+	}
+}
+
 struct ane_fw_channel {
 	u64 offset;
 	u32 slots;

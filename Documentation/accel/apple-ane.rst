@@ -247,3 +247,6 @@ are conservative host policy observed sufficient on H17, rather than
 firmware-advertised authority. The KUnit suite uses synthetic memory and
 accessor traces, with no MMIO or hardware access. Its configuration fragment
 is ``drivers/accel/ane/transport.kunitconfig`` and runs on x86_64 and arm64.
+
+For the experimental T8140 cold AP-direct stages and their ownership and
+loader requirements, see :doc:`apple-ane-cold`.

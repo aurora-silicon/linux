@@ -56,6 +56,9 @@ struct ane_fw_transport {
 	struct ane_fw_surface ipc;
 	struct ane_fw_surface pool;
 	struct ane_fw_surface shared[ANE_FW_SHARED_MAX];
+	bool retired[ANE_FW_SHARED_MAX];
+	bool allow_free;
+	u32 free_count;
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	struct ane_fw_transaction pending[ANE_FW_CHANNELS];
 	u32 head[ANE_FW_CHANNELS];
@@ -188,6 +191,8 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 	    !command || size < 8 || get_unaligned_le32(command) ||
 	    get_unaligned_le16((const u8 *)command + 6))
 		return -EINVAL;
+	if (ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
+		return -EPERM;
 	tx = &t->pending[ch];
 	if (tx->active)
 		return -EBUSY;
@@ -272,6 +277,8 @@ ane_fw_transport_report(struct ane_fw_transport *t, u64 dva, u64 size)
 	unsigned int i;
 
 	for (i = 0; i < t->shared_count + 2; i++) {
+		if (i >= 2 && t->retired[i - 2])
+			continue;
 		s = i == 0 ? &t->ipc : i == 1 ? &t->pool : &t->shared[i - 2];
 		if (ane_fw_contains(s->dva, s->size, dva, size))
 			return (u8 *)s->cpu + (dva - s->dva);
@@ -356,6 +363,30 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 	word2 = t->ops->load64(t->ctx, p + 16);
 	if (!word0 && !word1 && !word2)
 		return -EAGAIN;
+	if (word0) {
+		/* The observed H17 FREE acknowledgment is DVA|1, zero length
+		 * and handle. Retain backing until reboot; never recycle it.
+		 * Only teardown may admit FREE, never an active inference.
+		 */
+		ret = -EPROTO;
+		if (!t->allow_free || word1 || word2 || !IS_ALIGNED(word0, SZ_16K))
+			goto refused;
+		for (i = 0; i < t->shared_count; i++)
+			if (t->shared[i].dva == word0 && !t->retired[i])
+				break;
+		if (i == t->shared_count)
+			goto refused;
+		t->retired[i] = true;
+		t->free_count++;
+		t->ops->store64(t->ctx, p + 8, 0);
+		t->ops->store64(t->ctx, p + 16, 0);
+		t->ops->write_barrier(t->ctx);
+		t->ops->store64(t->ctx, p, word0 | 1);
+		t->ops->write_barrier(t->ctx);
+		ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
+		ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
+		return 0;
+	}
 	ret = ane_fw_shared_size(word0, word1, word2, &size);
 	if (ret)
 		goto refused;
