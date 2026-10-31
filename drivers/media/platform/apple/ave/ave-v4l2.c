@@ -36,12 +36,13 @@
 #define AVE_DEFAULT_W		1920
 #define AVE_DEFAULT_H		1080
 /*
- * Buffer counts are limited so a full set fits the encoder's 256 MiB DART
- * window next to a session: each queue may use this much, counting every
- * buffer at the power-of-two size the DMA layer maps it with.
+ * Buffer counts are limited so the queues of a few concurrent sessions fit
+ * the encoder's 4 GiB DART window next to their session buffers: each queue
+ * may use this much, counting every buffer at the power-of-two size the DMA
+ * layer maps it with. That is 16 OUTPUT frames at 3840x2160.
  */
-#define AVE_OUTPUT_BUDGET	(80 * SZ_1M)
-#define AVE_CAPTURE_BUDGET	(40 * SZ_1M)
+#define AVE_OUTPUT_BUDGET	(256 * SZ_1M)
+#define AVE_CAPTURE_BUDGET	(128 * SZ_1M)
 #define AVE_MAX_QUEUE_BUFS	16
 #define AVE_RESTART_TRIES	10
 #define AVE_RESTART_WAIT_MS	100
@@ -544,7 +545,7 @@ static int ave_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned i
 	/* Frames stay with the firmware until encoded; keep one spare. */
 	if (V4L2_TYPE_IS_OUTPUT(vq->type) && have + *nbufs < AVE_MAX_SLOTS + 1)
 		*nbufs = AVE_MAX_SLOTS + 1 - have;
-	/* A full set of both queues must fit the encoder's 256 MiB DART window. */
+	/* A full set of both queues must fit the budget for the DART window. */
 	if (have >= max) {
 		dev_dbg(ctx->ave->dev, "%s queue already has its %u buffers\n",
 			V4L2_TYPE_IS_OUTPUT(vq->type) ? "OUTPUT" : "CAPTURE", max);
