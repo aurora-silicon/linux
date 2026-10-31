@@ -20,7 +20,7 @@ static int feed(void *cookie, struct avdq_frame *f)
 {
 	struct transport *t = cookie;
 
-	t->vp[f->desc.fifo] = f->vp;
+	t->vp[f->work.fifo] = f->vp;
 	f->pushed = f->desc.program_words;
 	return 1;
 }
