@@ -41,6 +41,12 @@ pub trait MessageProcessor: Send + Sync {
     /// Returns the reading carried by `message` in micro-units of the channel (millionths of a
     /// lux, of a degree, ...), or `None` when the message carries no reading.
     fn process(&self, message: &[u8]) -> Option<u64>;
+
+    /// Returns the fixed scale of a raw channel as an integer and a fractional part in
+    /// billionths, or `None` for a channel without a scale attribute.
+    fn scale(&self) -> Option<(i32, i32)> {
+        None
+    }
 }
 
 /// The state shared between a sensor's report listener and its IIO device: the latest reading.
@@ -98,6 +104,18 @@ unsafe extern "C" fn aop_read_raw<T: MessageProcessor + 'static>(
     let ty = unsafe { (*chan).type_ };
     if data.ty != ty {
         return EINVAL.to_errno();
+    }
+    // A fixed scale is available even before the first sensor report.
+    if mask == bindings::BINDINGS_IIO_CHAN_INFO_SCALE as isize {
+        let Some((int, frac)) = data.msg_proc.scale() else {
+            return EINVAL.to_errno();
+        };
+        // SAFETY: `val` and `val2` point to the caller's result variables.
+        unsafe {
+            *val = int;
+            *val2 = frac;
+        }
+        return bindings::IIO_VAL_INT_PLUS_NANO as i32;
     }
     // A sensor that has not reported yet, for instance because it lacks its
     // calibration, has no reading rather than a reading of zero.
