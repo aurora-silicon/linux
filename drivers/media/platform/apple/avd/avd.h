@@ -18,6 +18,8 @@
 #include <linux/firmware.h>
 #include <linux/iommu.h>
 #include <linux/spinlock.h>
+
+#include "avd-pm.h"
 #include <linux/workqueue.h>
 
 #include "avd-queue.h"
@@ -193,6 +195,8 @@ struct avd_variant {
 	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
 	unsigned int capabilities;
+	/* Codecs advertised only when the firmware CODECS trailer lists them. */
+	unsigned int fw_caps_required;
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,
 			u8 fifo_idx, u32 vp_slot);
 	const char* fw_name;
@@ -207,6 +211,7 @@ struct avd_variant {
 
 struct avd_dev {
 	struct device *dev;
+	struct avd_pm pm;
 	struct v4l2_device v4l2_dev;
 	struct media_device mdev;
 	struct video_device vdev;
@@ -270,6 +275,7 @@ struct avd_buf {
 	void *cpu;
 	dma_addr_t addr;
 	size_t size;
+	struct avd_dma_release *release;
 };
 
 struct avd_ctx {
@@ -361,6 +367,7 @@ void avd_queue_add_ctx(struct avd_ctx *ctx);
 void avd_queue_del_ctx(struct avd_ctx *ctx);
 int avd_open_build_program(struct avd_ctx *ctx);
 int avd_open_queue_probe(struct avd_dev *avd);
+void avd_open_queue_cleanup(struct avd_dev *avd);
 int avd_open_queue_boot(struct avd_dev *avd);
 bool avd_open_is_queued(struct avd_dev *avd);
 unsigned int avd_open_queue_max(struct avd_dev *avd);

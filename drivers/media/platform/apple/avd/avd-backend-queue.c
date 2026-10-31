@@ -16,30 +16,35 @@
 
 struct avd_open_queue {
 	void __iomem *sram;
-	void __iomem *piodma;
-	resource_size_t sram_phys, sram_size;
+	resource_size_t sram_size;
 	bool enabled;
 	u32 ring, header;
 	struct avd_buf packets[AVD_MAX_FRAMES];
 	struct avd_buf fifo[AVD_MAX_FRAMES];
 };
 
-static void avd_open_queue_release(void *data)
+void avd_open_queue_cleanup(struct avd_dev *avd)
 {
-	struct avd_dev *avd = data;
 	struct avd_open_queue *q = avd->open_priv;
 	unsigned int i;
 
+	if (!q)
+		return;
 	for (i = 0; i < AVD_MAX_FRAMES; i++) {
 		avd_buf_free(avd, &q->packets[i]);
 		avd_buf_free(avd, &q->fifo[i]);
 	}
 }
 
+static void avd_open_queue_release(void *data)
+{
+	avd_open_queue_cleanup(data);
+}
+
 int avd_open_queue_probe(struct avd_dev *avd)
 {
 	struct avd_open_queue *q;
-	struct resource *sram, *piodma;
+	struct resource *sram;
 
 	if (avd->open_priv)
 		return 0;
@@ -48,15 +53,10 @@ int avd_open_queue_probe(struct avd_dev *avd)
 		return -ENOMEM;
 	avd->open_priv = q;
 	sram = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "sram");
-	piodma = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "piodma");
-	if (sram && piodma) {
+	if (sram) {
 		q->sram = devm_ioremap_resource(avd->dev, sram);
 		if (IS_ERR(q->sram))
 			return PTR_ERR(q->sram);
-		q->piodma = devm_ioremap_resource(avd->dev, piodma);
-		if (IS_ERR(q->piodma))
-			return PTR_ERR(q->piodma);
-		q->sram_phys = sram->start;
 		q->sram_size = resource_size(sram);
 	}
 	return devm_add_action_or_reset(avd->dev, avd_open_queue_release, avd);
@@ -85,8 +85,6 @@ int avd_open_queue_boot(struct avd_dev *avd)
 		readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
 		writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
 	}
-	if (q->piodma)
-		writel(q->sram_phys >> 4, q->piodma + 0x24);
 	ret = avd_boot(avd);
 	if (ret)
 		return ret;
@@ -111,7 +109,7 @@ int avd_open_queue_boot(struct avd_dev *avd)
 		goto shutdown;
 	}
 	/* Both DART stream IDs must be attached to the device's DMA domain. */
-	if (!avd->domain ||
+	if (!avd->pm.piodma || !avd->domain ||
 	    of_count_phandle_with_args(avd->dev->of_node, "iommus", "#iommu-cells") < 2) {
 		ret = -ENODEV;
 		goto shutdown;

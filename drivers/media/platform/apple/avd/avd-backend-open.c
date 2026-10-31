@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Legacy transport split from avd-drv.c; Copyright The Asahi Linux Contributors. */
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
@@ -109,10 +110,18 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 				return 0;
 			}
 			if (cur >= max / 2) {
-				if (avd->variant->quirks & AVD_QUIRK_V5_QUEUE_PACING)
-					usleep_range(100, 150);
-				else
-					usleep_range(500, 650);
+				/*
+				 * Wait for the VP to drain below half full, but
+				 * only as long as it takes. The old fixed sleep
+				 * (100-150 us on v5 pacing parts, 500-650 us
+				 * elsewhere) stays the upper bound.
+				 */
+				u32 wait_us = avd->variant->quirks &
+					      AVD_QUIRK_V5_QUEUE_PACING ? 150 : 650;
+
+				readl_relaxed_poll_timeout(avd->ctrl +
+					avd->variant->submit_queue_status_offset + vp * 4,
+					cur, cur < max / 2, 10, wait_us);
 			}
 		}
 		writel(words[i], reg);
@@ -154,6 +163,8 @@ const struct avd_backend_ops avd_open_backend = {
 	.max_inflight = avd_open_max_inflight,
 	.submit = avd_open_submit,
 	.irq = avd_open_irq,
+	.suspend = avd_pm_backend_suspend,
+	.resume = avd_pm_backend_resume,
 };
 
 static void avd_open_capabilities(struct avd_dev *avd)
@@ -170,7 +181,9 @@ static void avd_open_capabilities(struct avd_dev *avd)
 	const char *info;
 	unsigned int i;
 
-	avd->capabilities = avd->variant->capabilities;
+	/* Without a CODECS trailer, keep codecs that need a newer firmware hidden. */
+	avd->capabilities = avd->variant->capabilities &
+			    ~avd->variant->fw_caps_required;
 	if (!avd->fw || avd->fw->size < 0x40)
 		return;
 	info = (const char *)avd->fw->data + avd->fw->size - 0x40;
@@ -209,9 +222,13 @@ int avd_backend_select(struct avd_dev *avd)
 
 int avd_backend_boot(struct avd_dev *avd)
 {
-	int ret = avd->backend->boot(avd);
+	int ret;
 
-	if (ret == -ENOENT && avd_backend_is_apple(avd)) {
+	if (!avd_backend_is_apple(avd))
+		avd_pm_prepare_piodma(avd);
+	ret = avd->backend->boot(avd);
+	/* Never switch command ABIs after frames have used this backend. */
+	if (ret == -ENOENT && !avd->fw_generation && avd_backend_is_apple(avd)) {
 		ret = request_firmware(&avd->fw, avd->variant->fw_name, avd->dev);
 		if (ret)
 			return ret;
@@ -220,6 +237,7 @@ int avd_backend_boot(struct avd_dev *avd)
 		if (ret)
 			return ret;
 		avd_open_capabilities(avd);
+		avd_pm_prepare_piodma(avd);
 		ret = avd->backend->boot(avd);
 	}
 	if (!ret)

@@ -134,6 +134,9 @@ static int avd_apple_boot(struct avd_dev *avd)
 		ret = avd_apple_load(avd);
 		if (ret)
 			return ret;
+	} else {
+		/* Suspend stopped the MCPU without clearing the retained image. */
+		writel(hw->itcm_enable_value, apple->regs + hw->itcm_enable);
 	}
 	dev_info(avd->dev, "Apple MCPU firmware %u.%u.%u (%08x)\n",
 		 apple->version >> 8, (apple->version >> 4) & 0xf,
@@ -165,7 +168,12 @@ static void avd_apple_shutdown(struct avd_dev *avd)
 
 static unsigned int avd_apple_max_inflight(struct avd_dev *avd)
 {
-	return AVD_MAX_FRAMES;
+	/*
+	 * Every frame in VP->PP flight owns one hardware instruction FIFO
+	 * (EXEC bits 7:4), so the FIFO count bounds the frames in flight:
+	 * 15 on v3+ tier 1 parts, 7 on T8103 and T8140.
+	 */
+	return min_t(unsigned int, AVD_MAX_FRAMES, avd->variant->fifo_slots ?: 1);
 }
 
 static int avd_apple_send(struct avd_dev *avd, const u32 cmd[24])
@@ -304,4 +312,6 @@ const struct avd_backend_ops avd_apple_backend = {
 	.abort = avd_apple_abort,
 	.set_property = avd_apple_set_property,
 	.irq = avd_apple_irq,
+	.suspend = avd_pm_backend_suspend,
+	.resume = avd_pm_backend_resume,
 };

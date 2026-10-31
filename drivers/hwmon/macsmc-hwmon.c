@@ -506,16 +506,24 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
 		timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
 		for (;;) {
 			ret = macsmc_hwmon_fan_read_mode(hwmon, fan, &mode);
-			if (ret || mode != MACSMC_FAN_MODE_SYSTEM)
-				break;
+			if (ret)
+				goto relock;
+			if (mode != MACSMC_FAN_MODE_SYSTEM) {
+				/* Leaving system mode need not mean writes are ready. */
+				ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode,
+							     MACSMC_FAN_MODE_MANUAL);
+				if (ret >= 0)
+					goto manual;
+				if (ret != -EIO && ret != -EBUSY)
+					goto relock;
+			}
 			if (time_after(jiffies, timeout)) {
-				ret = -ETIMEDOUT;
-				break;
+				if (mode == MACSMC_FAN_MODE_SYSTEM)
+					ret = -ETIMEDOUT;
+				goto relock;
 			}
 			msleep(MACSMC_FAN_MODE_POLL_MS);
 		}
-		if (ret)
-			goto relock;
 	}
 
 set_manual:
@@ -523,6 +531,7 @@ set_manual:
 	if (ret < 0)
 		goto relock;
 
+manual:
 	fan->manual = true;
 	hwmon->fan.manual++;
 	return 0;
