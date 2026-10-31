@@ -80,12 +80,10 @@ properties:
 
   "#cooling-cells":
     const: 3
+    deprecated: true
     description:
-      Makes the fans cooling devices for thermal zones. The first cell is the
-      zero-based index of a fan, counting the fan-* child nodes in order; the
-      other two are the lower and upper cooling state. State 0 leaves the fan
-      to the SMC; states 1 to 8 run it at speeds spread evenly from its
-      minimum to its maximum. A fan needs all four of its speed and mode keys.
+      Former fan cooling-device specifier. Fan policy is handled by the SMC
+      firmware; the driver no longer registers fan cooling devices.
 
 patternProperties:
   "^current-[A-Za-z0-9]{4}$":

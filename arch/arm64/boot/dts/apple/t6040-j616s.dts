@@ -3880,23 +3880,13 @@
 	};
 };
 
-/*
- * Fan speeds, limits, targets and modes, and the common SMC sensors; every
- * key exists on this machine's SMC. Both fans list their target (F0Tg,
- * F1Tg) and mode (F0Md, F1Md) keys, so with the driver's fan_control
- * parameter fanN_target becomes writable; by default the attributes are
- * read-only, and the thermal zones above drive the fans.
- */
+/* Fan monitoring and explicit userspace manual control. */
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
 
-/*
- * Both fans are cooling devices of the CPU die and GPU zones, as
- * <&smc_hwmon fan-index lower upper>.
- */
 &smc_hwmon {
-	#cooling-cells = <3>;
+	apple,thermal-pressure-key = "mTPL";
 
 	/*
 	 * The SMC accepts a manual speed for both fans once its fan test
@@ -4552,3 +4542,113 @@
 		status = "disabled";
 	};
 };
+
+/*
+ * The SMC owns automatic fan policy. Drop the host fan trip/map instances
+ * after the board's thermal descriptions, retaining all passive and critical
+ * protection. Keep this final policy separate from ladder descriptions so
+ * independent ladder updates cannot restore autonomous SMC writes.
+ */
+
+#define J616S_DELETE_FAN_TRIPS \
+	/delete-node/ trip-fan1; \
+	/delete-node/ trip-fan2; \
+	/delete-node/ trip-fan3; \
+	/delete-node/ trip-fan4; \
+	/delete-node/ trip-fan5;
+
+/* Some CPU ladders also map full fan speed to the passive trip. */
+#define J616S_DELETE_FAN_MAPS \
+	/delete-node/ map-fan1; \
+	/delete-node/ map-fan2; \
+	/delete-node/ map-fan3; \
+	/delete-node/ map-fan4; \
+	/delete-node/ map-fan5; \
+	/delete-node/ map-fan6;
+
+/ {
+	thermal-zones {
+		cpu-die-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu0-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu1-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu2-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu3-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu4-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu5-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu6-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+	};
+};
+
+#undef J616S_DELETE_FAN_TRIPS
+#undef J616S_DELETE_FAN_MAPS
