@@ -891,11 +891,19 @@ static bool stage2_unmap_defer_tlb_flush(struct kvm_pgtable *pgt)
 	return system_supports_tlb_range() && cpus_have_final_cap(ARM64_HAS_STAGE2_FWB);
 }
 
+struct stage2_unmap_data {
+	struct kvm_pgtable		*pgt;
+
+	/* IPA span of the leaves whose TLB invalidation was deferred */
+	u64				flush_start;
+	u64				flush_end;
+};
+
 static void stage2_unmap_put_pte(const struct kvm_pgtable_visit_ctx *ctx,
 				struct kvm_s2_mmu *mmu,
 				struct kvm_pgtable_mm_ops *mm_ops)
 {
-	struct kvm_pgtable *pgt = ctx->arg;
+	struct stage2_unmap_data *data = ctx->arg;
 
 	/*
 	 * Clear the existing PTE, and perform break-before-make if it was
@@ -908,9 +916,15 @@ static void stage2_unmap_put_pte(const struct kvm_pgtable_visit_ctx *ctx,
 		if (kvm_pte_table(ctx->old, ctx->level)) {
 			kvm_call_hyp(__kvm_tlb_flush_vmid_ipa, mmu, ctx->addr,
 				     TLBI_TTL_UNKNOWN);
-		} else if (!stage2_unmap_defer_tlb_flush(pgt)) {
+		} else if (!stage2_unmap_defer_tlb_flush(data->pgt)) {
 			kvm_call_hyp(__kvm_tlb_flush_vmid_ipa, mmu, ctx->addr,
 				     ctx->level);
+		} else {
+			u64 granule = kvm_granule_size(ctx->level);
+			u64 start = ALIGN_DOWN(ctx->addr, granule);
+
+			data->flush_start = min(data->flush_start, start);
+			data->flush_end = max(data->flush_end, start + granule);
 		}
 	}
 
@@ -1155,7 +1169,8 @@ int kvm_pgtable_stage2_annotate(struct kvm_pgtable *pgt, u64 addr, u64 size,
 static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
 			       enum kvm_pgtable_walk_flags visit)
 {
-	struct kvm_pgtable *pgt = ctx->arg;
+	struct stage2_unmap_data *data = ctx->arg;
+	struct kvm_pgtable *pgt = data->pgt;
 	struct kvm_s2_mmu *mmu = pgt->mmu;
 	struct kvm_pgtable_mm_ops *mm_ops = ctx->mm_ops;
 	kvm_pte_t *childp = NULL;
@@ -1198,16 +1213,27 @@ static int stage2_unmap_walker(const struct kvm_pgtable_visit_ctx *ctx,
 int kvm_pgtable_stage2_unmap(struct kvm_pgtable *pgt, u64 addr, u64 size)
 {
 	int ret;
+	struct stage2_unmap_data data = {
+		.pgt		= pgt,
+		.flush_start	= U64_MAX,
+	};
 	struct kvm_pgtable_walker walker = {
 		.cb	= stage2_unmap_walker,
-		.arg	= pgt,
+		.arg	= &data,
 		.flags	= KVM_PGTABLE_WALK_LEAF | KVM_PGTABLE_WALK_TABLE_POST,
 	};
 
 	ret = kvm_pgtable_walk(pgt, addr, size, &walker);
-	if (stage2_unmap_defer_tlb_flush(pgt))
-		/* Perform the deferred TLB invalidations */
-		kvm_tlb_flush_vmid_range(pgt->mmu, addr, size);
+
+	/*
+	 * Perform the deferred TLB invalidations, for the leaves the walk
+	 * actually cleared: a walk over an unmapped range, such as the
+	 * whole-IPA-space unmap of a sparse nested stage 2 on every MMU
+	 * notifier event, needs none.
+	 */
+	if (data.flush_end > data.flush_start)
+		kvm_tlb_flush_vmid_range(pgt->mmu, data.flush_start,
+					 data.flush_end - data.flush_start);
 
 	return ret;
 }
