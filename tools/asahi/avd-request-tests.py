@@ -20,7 +20,7 @@ AVD = ROOT / "drivers/media/platform/apple/avd"
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?(?:void|int|irqreturn_t) " + name +
+    match = re.search(r"^(?:static )?(?:__maybe_unused )?(?:void|int|irqreturn_t) " + name +
                       r"\([^;]*?\)\n\{", source, re.M)
     if not match:
         raise ValueError(f"missing production function: {name}")
@@ -65,7 +65,7 @@ c->run(&t); printf("PASS: %s/%s\n", (s).name, c->name); } return 0; }
     v4l2 = (AVD / "avd-v4l2.c").read_text()
     names = ("avd_submit_job", "avd_reset", "avd_finish_work", "avd_drain_context",
              "avd_job_finish", "avd_watchdog_func", "avd_irq_handler",
-             "avd_job_ready", "avd_device_run")
+             "avd_job_ready", "avd_device_run", "avd_runtime_resume")
     body = function(v4l2, "avd_finish_buffers") + "\n".join(
         function(driver, name) for name in names)
     fixture = (ROOT / "tools/asahi/avd-request/host.c").read_text()

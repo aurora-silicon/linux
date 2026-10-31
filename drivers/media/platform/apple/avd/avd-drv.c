@@ -1002,6 +1002,9 @@ static __maybe_unused int avd_runtime_resume(struct device *dev)
 	int ret;
 	struct avd_dev *avd = platform_get_drvdata(to_platform_device(dev));
 
+	if (READ_ONCE(avd->broken))
+		return -EIO;
+
 	ret = avd_boot(avd);
 	if (ret)
 		dev_err(dev, "failed to boot");

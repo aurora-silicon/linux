@@ -9,6 +9,7 @@
 #include <string.h>
 #include "avd-request.h"
 
+#define __maybe_unused
 #define __iomem
 #define BIT(n) (1U << (n))
 #define READ_ONCE(v) (v)
@@ -91,6 +92,11 @@ struct avd_dev {
 	unsigned char *ctrl, *mbox;
 	const struct avd_variant *variant;
 };
+struct device {
+	struct avd_dev *data;
+};
+#define to_platform_device(d) (d)
+#define platform_get_drvdata(d) ((d)->data)
 struct avd_coded_fmt_ops {
 	int (*run)(struct avd_ctx *ctx);
 	void (*submit)(struct avd_ctx *ctx);
@@ -131,7 +137,7 @@ struct avd_ctx {
 };
 static struct avd_ctx *current, *waiting_owner, *draining;
 static int pm_refs, pm_error, resets, reset_error, writes, configures;
-static int queue_full, early_irq, seq_log[16], nlog, wait_calls;
+static int queue_full, early_irq, seq_log[16], nlog, wait_calls, boots;
 static u32 irq_status;
 static unsigned char *mmio_base;
 static int mailbox_words, pops;
@@ -215,6 +221,7 @@ static void avd_shutdown(struct avd_dev *d)
 static int avd_boot(struct avd_dev *d)
 {
 	(void)d;
+	boots++;
 	return 0;
 }
 static int pm_runtime_resume_and_get(void *d)
@@ -514,6 +521,12 @@ int main(void)
 	pump(&a);
 	assert(configures == before && ba[0].result == VB2_BUF_STATE_ERROR &&
 	       pm_refs == 0);
-	puts("PASS: partial submission resets; failed reset prevents FIFO reuse");
+	struct device device = { .data = &dev };
+	int before_boots = boots;
+
+	assert(avd_runtime_resume(&device) == -EIO && boots == before_boots);
+	dev.broken = false;
+	assert(avd_runtime_resume(&device) == 0 && boots == before_boots + 1);
+	puts("PASS: partial submission resets; failed reset prevents FIFO reuse and firmware resume");
 	return 0;
 }
