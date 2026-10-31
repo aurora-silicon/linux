@@ -208,3 +208,10 @@ ensure the machine's serial cannot override the panel's. Panel EDID tests cover
 a missing firmware identity, real EDID priority and invalid replacement retention.
 Desktop backlight notification tests exercise accepted, rejected, duplicate and
 out-of-order completions and preserve the requested target during notification.
+
+The audio group executes the native AV call and OSObject reply boundaries with
+synthetic transport replies, including truncated bodies, inconsistent used
+sizes and transport errors. It retains the legacy reply behavior. KUnit's
+apple-av-native-audio suite separately runs service replacement, Terminate and
+link lifecycle checks for both external 14.7 and desktop 26.x firmware roles.
+These fixtures do not establish the desktop audio firmware ABI or SIO support.

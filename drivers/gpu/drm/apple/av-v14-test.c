@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Included by av.c: which instance the 14.7 external role's audio client
+ * Included by av.c: which instance a native external role's audio client
  * opens and closes. One reusable service slot is published, torn down and
  * published again by the production init and teardown; the production open,
  * close, Terminate report and Terminate work run on it, with only the
@@ -27,6 +27,8 @@ struct av_v14_test {
 	u64 release_gen;
 	/* Within a link release: the old PCM closes, a successor is published and opened */
 	bool successor_during_release;
+	u32 link_status;
+	u8 link_body[64];
 };
 
 static struct av_v14_test *av_v14_current;
@@ -45,6 +47,10 @@ static int av_v14_call(struct apple_epic_service *srv, u32 command, const void *
 	/* Open: status 0 at +0, opened at +16 */
 	if (command == t->asrv->cmds.open && reply_len >= 24)
 		put_unaligned_le64(1, reply + 16);
+	if (body_len == sizeof(t->link_body)) {
+		memcpy(t->link_body, body, body_len);
+		put_unaligned_le32(t->link_status, reply + 48);
+	}
 	return 0;
 }
 
@@ -114,7 +120,8 @@ static struct av_v14_test *av_v14_setup(struct kunit *test)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
 	dev_set_drvdata(dev, t->dcp);
 	t->dcp->dev = dev;
-	t->dcp->fw_compat = DCP_FIRMWARE_V_14_7;
+	t->dcp->fw_compat = test->param_value && *(const bool *)test->param_value ?
+		DCP_FIRMWARE_V_26_6_DESKTOP : DCP_FIRMWARE_V_14_7;
 	t->dcp->external = true;
 	t->dcp->external_native = true;
 
@@ -130,6 +137,8 @@ static struct av_v14_test *av_v14_setup(struct kunit *test)
 	t->dcp->audiosrv = asrv;
 
 	t->ep.dcp = t->dcp;
+	t->ep.endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
+	t->ep.compact = t->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	spin_lock_init(&t->svc.lock);
 	t->svc.ep = &t->ep;
 	spin_lock_init(&t->other.lock);
@@ -324,21 +333,84 @@ static void av_v14_terminate_unpublished(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->ncalls, 2U);
 }
 
+/* Rejected prepares must not create a link which Stop/Complete can act on. */
+static void av_native_link_payload_status(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	struct dcp_sound_cookie cookie;
+
+	memset(&cookie, 0xa5, sizeof(cookie));
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	t->link_status = 1;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE,
+					      &cookie), -EIO);
+	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_START,
+					      &cookie), -ENODEV);
+	t->link_status = 0;
+	for (enum dcp_audio_link op = DCP_AUDIO_LINK_PREPARE;
+	     op <= DCP_AUDIO_LINK_COMPLETE; op++) {
+		KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, op, &cookie), 0);
+		KUNIT_EXPECT_MEMEQ(test, t->link_body, &cookie, sizeof(cookie));
+		for (size_t i = sizeof(cookie); i < sizeof(t->link_body); i++)
+			KUNIT_EXPECT_EQ(test, t->link_body[i], 0);
+	}
+	KUNIT_EXPECT_EQ(test, t->calls[2], t->asrv->cmds.prepare);
+	KUNIT_EXPECT_EQ(test, t->calls[3], t->asrv->cmds.start_link);
+	KUNIT_EXPECT_EQ(test, t->calls[4], t->asrv->cmds.stop_link);
+	KUNIT_EXPECT_EQ(test, t->calls[5], t->asrv->cmds.unprepare);
+	dcp_audiosrv_close(t->dcp->dev);
+}
+
+static void av_desktop_service_admission(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	const char *name = "dcpav-audio-epic";
+	bool desktop = t->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+
+	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_native_link(t->dcp->dev));
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0),
+			desktop ? 0 : -EINVAL);
+	t->dcp->fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+	t->ep.endpoint = AV_ENDPOINT;
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
+	t->ep.endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-device-epic", name, 0),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, NULL, name, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 1), -EINVAL);
+	t->dcp->external = false;
+	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_native_link(t->dcp->dev));
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
+	dcp_audiosrv_close(t->dcp->dev);
+}
+
+static const bool av_native_desktop[] = { false, true };
+
+static void av_native_desc(const bool *desktop, char *desc)
+{
+	scnprintf(desc, KUNIT_PARAM_DESC_SIZE, "%s", *desktop ? "desktop-26" : "external-14.7");
+}
+
+KUNIT_ARRAY_PARAM(av_native, av_native_desktop, av_native_desc);
+
 static struct kunit_case av_v14_cases[] = {
-	KUNIT_CASE(av_v14_open_close),
-	KUNIT_CASE(av_v14_successor_opened),
-	KUNIT_CASE(av_v14_old_close_not_to_successor),
-	KUNIT_CASE(av_v14_old_terminate_vs_successor),
-	KUNIT_CASE(av_v14_republished),
-	KUNIT_CASE(av_v14_successor_during_release),
-	KUNIT_CASE(av_v14_terminate_after_successor),
-	KUNIT_CASE(av_v14_link_instance),
-	KUNIT_CASE(av_v14_terminate_unpublished),
+	KUNIT_CASE_PARAM(av_v14_open_close, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_successor_opened, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_old_close_not_to_successor, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_old_terminate_vs_successor, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_republished, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_successor_during_release, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_terminate_after_successor, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_link_instance, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_terminate_unpublished, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_native_link_payload_status, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_desktop_service_admission, av_native_gen_params),
 	{}
 };
 
 static struct kunit_suite av_v14_suite = {
-	.name = "apple-av-v14-audio",
+	.name = "apple-av-native-audio",
 	.test_cases = av_v14_cases,
 };
 
