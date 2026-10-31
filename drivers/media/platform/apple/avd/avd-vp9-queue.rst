@@ -77,9 +77,9 @@ They cover 16 prepared slots, probability isolation, backward-refresh producer
 and consumer dependencies, map lifetime, malformed-input rollback, capacity,
 DMA carry, EXEC framing, Profile 2 and all compatibility callback dispatches.
 A checksum keeps the entire stock builder identical to d826cca0 (export rename
-only). A second test compiles both complete C builders and compares 360 valid
-1080p/4K programs across V3/V4, 8/10-bit, key/inter, tiles and segmentation,
-normalizing scratch DVAs. These tests also run with address/undefined sanitizers.
+only). A second test compiles both complete C builders and compares 480 valid
+1080p/4K programs across the V3, M1 Pro, M2 and V4 instruction variants, 8/10-bit, key/inter,
+tiles and segmentation, using FIFO 0 and normalizing scratch DVAs. These tests also run with address/undefined sanitizers.
 
 DMA, V4L2 lookup and transport are simulated. These tests do not establish
 libvpx-to-stateless-control parsing, show-existing display behavior, hardware

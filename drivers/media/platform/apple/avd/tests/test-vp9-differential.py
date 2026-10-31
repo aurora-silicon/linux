@@ -70,15 +70,16 @@ int main(void)
     local.bufs.pipe_state.addr = 0x140000; local.bufs.ip_above.addr = 0x150000;
     local.bufs.lf_above.addr = 0x160000; local.bufs.lf_left.addr = 0x170000;
     local.bufs.lf_left_info.addr = 0x180000; local.bufs.az_left.addr = 0x190000;
-    for (unsigned int gen = 0; gen < 3; gen++)
+    for (unsigned int gen = 0; gen < 4; gen++)
     for (unsigned int res = 0; res < 2; res++)
     for (unsigned int depth = 0; depth < 2; depth++)
     for (unsigned int intra = 0; intra < 2; intra++)
     for (unsigned int rows = 0; rows <= 2; rows++)
     for (unsigned int cols = 0; cols <= 4; cols++) {
         unsigned int tiles = (1U << rows) * (1U << cols), off = 8;
-        variant.revision = gen == 2 ? 4 : 3;
-        variant.quirks = gen == 0 ? AVD_QUIRK_LSR | AVD_QUIRK_NO_PIPE_STATE : 0;
+        variant.revision = gen ? 4 : 3;
+        variant.quirks = gen < 2 ? AVD_QUIRK_LSR | AVD_QUIRK_NO_PIPE_STATE :
+                         gen == 2 ? AVD_QUIRK_LSR : 0;
         dst.vp9.width = res ? 3840 : 1920; dst.vp9.height = res ? 2160 : 1080;
         ctx.decomp = rows & 1;
         ctx.image_fmt = depth ? AVD_IMG_FMT_420_10BIT : AVD_IMG_FMT_420_8BIT;
@@ -155,11 +156,11 @@ with tempfile.TemporaryDirectory(prefix='avd-vp9-diff-') as tmp:
         results.append(subprocess.check_output([str(exe)]))
     if results[0] != results[1]:
         offsets = [0, 0]
-        for case in range(360):
+        for case in range(480):
             counts = [struct.unpack_from('<I', result, offsets[i])[0] for i, result in enumerate(results)]
             programs = [struct.unpack_from('<' + 'I' * counts[i], result, offsets[i] + 4) for i, result in enumerate(results)]
             if programs[0] != programs[1]:
                 differences = [(i, hex(a), hex(b)) for i, (a, b) in enumerate(zip(*programs)) if a != b]
                 raise AssertionError(f'case {case}, lengths {counts}, stock/native differences {differences[:8]}')
             offsets = [offsets[i] + 4 * (counts[i] + 1) for i in range(2)]
-print('VP9 differential: 360 complete 1080p/4K programs match stock across V3/V4, 8/10-bit, key/inter, tiles and segmentation PASS')
+print('VP9 differential: 480 complete 1080p/4K programs match stock at FIFO 0 across V3, M1 Pro, M2 and V4, 8/10-bit, key/inter, tiles and segmentation PASS')
