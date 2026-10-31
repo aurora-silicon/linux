@@ -103,6 +103,13 @@ struct ane_device {
 	bool tm_status_known;
 
 	/*
+	 * SoC descriptor fact: on T600x the tm/tq register file survives a
+	 * genpd power cycle in retention, so recovery must drain retained
+	 * task-manager state itself. False on T8103.
+	 */
+	bool tm_retention;
+
+	/*
 	 * Engine-busy CPU cluster boost (ane_boost.c): min-frequency QoS on
 	 * every cpufreq policy while a submit runs and until boost_idle_ms
 	 * after the last one completes: on T8103 bandwidth-bound programs

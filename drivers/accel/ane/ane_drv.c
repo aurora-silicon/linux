@@ -1122,6 +1122,10 @@ static int ane_attach_genpd(struct ane_device *ane)
  */
 struct ane_soc {
 	phys_addr_t ps_base;
+	/* True when the tm/tq register file survives a genpd cycle in
+	 * retention and recovery must drain it (see ane_tm_drain_retained).
+	 */
+	bool tm_retention;
 };
 
 static const struct ane_soc ane_soc_t8103 = {
@@ -1136,6 +1140,7 @@ static const struct ane_soc ane_soc_t6000 = {
 	 * (verified on T6001); M1 Pro and M1 Ultra are untested.
 	 */
 	.ps_base = 0x28e08c000ULL,
+	.tm_retention = true,
 };
 
 static const struct of_device_id ane_of_match[] = {
@@ -1165,6 +1170,7 @@ static int ane_platform_probe(struct platform_device *pdev)
 	drm->dev_private = ane;
 
 	atomic_set(&ane->wedged, 0);
+	ane->tm_retention = soc->tm_retention;
 
 	/* Producer-side stats: preallocate the ring at probe; the files
 	 * and the hot-path branch key off stats_slots.
