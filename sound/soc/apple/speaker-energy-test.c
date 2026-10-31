@@ -631,7 +631,35 @@ static void neo_float_death_keeps_queued_dose_and_mutes_refills(struct kunit *te
 	KUNIT_EXPECT_EQ(test, after.refunded[0], 0ULL);
 }
 
+
+static void neo_float_cannot_cache_or_refund_a_copy_time_cap(struct kunit *test)
+{
+	struct apple_energy_gate *gate = new_gate(test);
+	struct apple_energy_snapshot state;
+	__le32 words[] = { cpu_to_le32(0xbf000000), cpu_to_le32(0xbf000000) };
+	u64 ticket;
+
+	/* Deliberately assert a cap the Neo does not actually have. The
+	 * payload format itself must exclude raw caching and safe refunds.
+	 */
+	KUNIT_ASSERT_EQ(test, apple_energy_hardware_safe(gate, true), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter_pcm(gate, words, 1, 2,
+		APPLE_ENERGY_FORMAT_NEO_F32, 1, &ticket), 0);
+	KUNIT_EXPECT_EQ(test, words[0], (__le32)0);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	grant(test, gate, APPLE_ENERGY_UNIT_SCALE, APPLE_ENERGY_UNIT_SCALE);
+	words[0] = words[1] = cpu_to_le32(0xbf000000);
+	KUNIT_ASSERT_EQ(test, apple_energy_filter_pcm(gate, words, 1, 2,
+		APPLE_ENERGY_FORMAT_NEO_F32, 2, &ticket), 0);
+	KUNIT_ASSERT_EQ(test, apple_energy_complete(gate, ticket), 0);
+	apple_energy_snapshot(gate, &state);
+	KUNIT_EXPECT_EQ(test, state.completed[0], APPLE_ENERGY_UNIT_SCALE);
+	KUNIT_EXPECT_EQ(test, state.refunded[0], 0ULL);
+	KUNIT_EXPECT_EQ(test, state.unbudgeted[0], 0ULL);
+}
+
 static struct kunit_case apple_energy_cases[] = {
+	KUNIT_CASE(neo_float_cannot_cache_or_refund_a_copy_time_cap),
 	KUNIT_CASE(neo_float_full_scale_is_half_not_one),
 	KUNIT_CASE(neo_float_malformed_payload_never_reaches_dma),
 	KUNIT_CASE(neo_float_rounding_never_spends_more_than_the_grant),

@@ -397,7 +397,50 @@ static void macaudio_neo_requires_a_complete_transfer_certificate(struct kunit *
 	KUNIT_EXPECT_EQ(test, macaudio_energy_put(t->control[0], value), -EOPNOTSUPP);
 }
 
+
+static void macaudio_neo_payload_is_only_the_stereo_48k_software_gain_fe(struct kunit *test)
+{
+	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
+	struct snd_pcm_runtime *runtime = kunit_kzalloc(test, sizeof(*runtime), GFP_KERNEL);
+	__le32 words[] = { cpu_to_le32(0xbf000000), cpu_to_le32(0x3e800000) };
+	struct apple_energy_snapshot state;
+	u64 cap[] = { APPLE_ENERGY_UNIT_SCALE, APPLE_ENERGY_UNIT_SCALE }, ticket;
+
+	KUNIT_ASSERT_NOT_NULL(test, runtime);
+	t->ma.cfg = &macaudio_j700_cfg;
+	runtime->format = SNDRV_PCM_FORMAT_S32_LE;
+	runtime->channels = 2;
+	runtime->rate = 48000;
+	KUNIT_EXPECT_EQ(test, macaudio_energy_payload_format(&t->ma, runtime, true),
+		APPLE_ENERGY_FORMAT_NEO_F32);
+	KUNIT_EXPECT_EQ(test, macaudio_energy_payload_format(&t->ma, runtime, false), -EINVAL);
+	runtime->rate = 44100;
+	KUNIT_EXPECT_EQ(test, macaudio_energy_payload_format(&t->ma, runtime, true), -EINVAL);
+	runtime->rate = 48000;
+	runtime->format = SNDRV_PCM_FORMAT_S16_LE;
+	KUNIT_EXPECT_EQ(test, macaudio_energy_payload_format(&t->ma, runtime, true), -EINVAL);
+	runtime->format = SNDRV_PCM_FORMAT_S32_LE;
+	runtime->channels = 1;
+	KUNIT_EXPECT_EQ(test, macaudio_energy_payload_format(&t->ma, runtime, true), -EINVAL);
+	/* Direct scalar-reference grant exercises the real callback only;
+	 * it does not make the production transfer helper return a certificate.
+	 */
+	apple_energy_snapshot(&t->ma.energy, &state);
+	KUNIT_ASSERT_EQ(test, apple_energy_grant(&t->ma.energy, &state, cap, 1, U64_MAX), 0);
+	t->ma.energy_stream[0].format = APPLE_ENERGY_FORMAT_NEO_F32;
+	KUNIT_ASSERT_EQ(test, macaudio_energy_process(&t->ma.energy_stream[0], words,
+		sizeof(words), &ticket), 0);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[0]), 0xbf000000U);
+	apple_energy_snapshot(&t->ma.energy, &state);
+	KUNIT_EXPECT_EQ(test, state.submitted[0], APPLE_ENERGY_UNIT_SCALE);
+	KUNIT_EXPECT_EQ(test, state.submitted[1], APPLE_ENERGY_UNIT_SCALE / 4);
+	KUNIT_ASSERT_EQ(test, macaudio_energy_retire(&t->ma.energy_stream[0], ticket), 0);
+	apple_energy_snapshot(&t->ma.energy, &state);
+	KUNIT_EXPECT_EQ(test, state.refunded[0], 0ULL);
+}
+
 static struct kunit_case macaudio_energy_cases[] = {
+	KUNIT_CASE(macaudio_neo_payload_is_only_the_stereo_48k_software_gain_fe),
 	KUNIT_CASE(macaudio_neo_requires_a_complete_transfer_certificate),
 	KUNIT_CASE(macaudio_energy_owner_must_match_every_control),
 	KUNIT_CASE(macaudio_energy_control_replay_and_corruption_revoke),

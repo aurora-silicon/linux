@@ -421,6 +421,25 @@ static bool macaudio_energy_permitted(struct macaudio_snd_data *ma)
 		macaudio_energy_owner(ma);
 }
 
+/* The ABI describes submitted payloads, which may differ from user PCM. */
+static int macaudio_energy_payload_format(struct macaudio_snd_data *ma,
+					 struct snd_pcm_runtime *runtime,
+					 bool sw_gain)
+{
+	if (ma->cfg->sw_gain_dai) {
+		if (!sw_gain || ma->cfg->amp != AMP_MAX98360A ||
+		    runtime->format != SNDRV_PCM_FORMAT_S32_LE ||
+		    runtime->channels != 2 || runtime->rate != 48000)
+			return -EINVAL;
+		return APPLE_ENERGY_FORMAT_NEO_F32;
+	}
+	if (runtime->format != SNDRV_PCM_FORMAT_S16_LE &&
+	    runtime->format != SNDRV_PCM_FORMAT_S24_LE &&
+	    runtime->format != SNDRV_PCM_FORMAT_S32_LE)
+		return -EINVAL;
+	return runtime->format;
+}
+
 static int macaudio_energy_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
@@ -483,9 +502,9 @@ static int macaudio_energy_prepare(struct snd_pcm_substream *substream)
 		mutex_unlock(&ma->volume_lock_mutex);
 		return -EIO;
 	}
-	if (runtime->format != SNDRV_PCM_FORMAT_S16_LE &&
-	    runtime->format != SNDRV_PCM_FORMAT_S24_LE &&
-	    runtime->format != SNDRV_PCM_FORMAT_S32_LE) {
+	ret = macaudio_energy_payload_format(ma, runtime,
+			ma->link_props[rtd->dai_link->id].sw_gain);
+	if (ret < 0) {
 		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
 		mutex_unlock(&ma->volume_lock_mutex);
 		return -EINVAL;
@@ -498,8 +517,7 @@ static int macaudio_energy_prepare(struct snd_pcm_substream *substream)
 	if (runtime->channels != ma->max_channels)
 		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
 	stream->channels = runtime->channels;
-	stream->format = ma->cfg->sw_gain_dai ? APPLE_ENERGY_FORMAT_NEO_F32 :
-						 runtime->format;
+	stream->format = ret;
 	ma->energy_channels = runtime->channels;
 	ma->energy_format = stream->format;
 	for (k = 0; k < min_t(unsigned int, runtime->channels, ARRAY_SIZE(slots)); k++)
@@ -1173,16 +1191,6 @@ static int macaudio_get_codec_idle_props(struct device_node *np,
 	of_property_read_u32(np, propname, &idle->idle_mask);
 
 	return 0;
-}
-
-/* A Speaker DT link alone does not establish a protected backend. */
-static bool macaudio_speakers_allowed(const struct macaudio_platform_cfg *cfg)
-{
-	/* Every admitted backend must have a configured, enforced safe level. */
-	return cfg->enable_speakers && cfg->safe_vol < 0 &&
-		cfg->speakers != SPKR_NONE &&
-		(cfg->amp == AMP_TAS5770 || cfg->amp == AMP_SN012776 ||
-		 cfg->amp == AMP_MAX98360A);
 }
 
 static int macaudio_parse_of(struct macaudio_snd_data *ma)

@@ -815,13 +815,13 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 	struct admac_data *ad = adchan->host;
 	int ret;
 
+	if (adchan->quarantined)
+		return -EIO;
+
 	/* Keep MMIO accessible for config, status and the atomic DMA callbacks. */
 	ret = pm_runtime_resume_and_get(ad->dev);
 	if (ret < 0)
 		return ret;
-
-	if (adchan->quarantined)
-		return -EIO;
 
 	dma_cookie_init(&adchan->chan);
 

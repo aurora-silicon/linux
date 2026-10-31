@@ -455,9 +455,13 @@ int apple_energy_filter_pcm(struct apple_energy_gate *gate, void *samples,
 			     APPLE_ENERGY_QUEUE];
 	memset(entry, 0, sizeof(*entry));
 	entry->id = ++gate->next_ticket;
-	entry->born_safe = gate->hardware_safe;
+	/* A Neo volume limit only affects future producer copies. Even a
+	 * mistaken caller's hardware-safe assertion cannot forgive old words.
+	 */
+	entry->born_safe = gate->hardware_safe &&
+		format != APPLE_ENERGY_FORMAT_NEO_F32;
 	entry->safe_epoch = gate->safe_epoch;
-	entry->raw = gate->hardware_safe && gate->cache_raw;
+	entry->raw = entry->born_safe && gate->cache_raw;
 	for (f = 0; f < frames; f++) {
 		for (ch = 0; ch < channels; ch++) {
 			void *word = samples + (f * channels + ch) * width;
