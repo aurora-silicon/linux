@@ -10,6 +10,7 @@ use super::{
     command::{Parser, UscWindow, Validated},
     completion::{Completion, Destinations, PreparedPublication},
     context::Context,
+    dependency::FailureRecord,
     fence::Outputs,
     job::{self, Backend, Engine, Fences, Order, Packet, Scheduler},
     validation::Proof,
@@ -99,7 +100,7 @@ pub(crate) struct Queue<B: Backend> {
     /// Finished frontier entries pruned during this ioctl. Their last references
     /// can tear a whole completion down; that waits until the ioctl has published.
     finished: KVec<Fences>,
-    failures: [Option<(u64, Fence)>; 2],
+    failures: [FailureRecord<Fences>; 2],
     // Closing the userspace queue releases admission even if firmware still
     // retains one of its execution contexts or installed physical graphs.
     _slot: admission::QueueSlot,
@@ -143,7 +144,7 @@ impl<B: Backend> Queue<B> {
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
             finished: KVec::new(),
-            failures: [None, None],
+            failures: [FailureRecord::new(), FailureRecord::new()],
             _slot: slot,
         })
     }
@@ -182,11 +183,7 @@ impl<B: Backend> Queue<B> {
             if let Some(finished) = finished.as_mut() {
                 let _ = finished.push_within_capacity(fences.clone());
             }
-            // One earliest failed ordinal covers every later prefix without
-            // retaining its packet, mappings, or every failed fence.
-            if status < 0 && failure.as_ref().is_none_or(|(first, _)| *sequence < *first) {
-                *failure = Some((*sequence, fences.completed.clone()));
-            }
+            failure.note(*sequence, status, fences);
             false
         });
     }
@@ -242,9 +239,9 @@ impl<B: Backend> Queue<B> {
                     || fences.ready.raw() != fences.completed.raw()
                     || fences.status() > 0
             })
-            && self.failures.iter().enumerate().all(|(index, failure)| {
-                failure.as_ref().is_none_or(|(sequence, _)| {
-                    !Order::contains(order.wait_through[index], *sequence)
+            && self.failures.iter_mut().enumerate().all(|(index, failure)| {
+                failure.earliest().is_none_or(|(sequence, _)| {
+                    !Order::contains(order.wait_through[index], sequence)
                 })
             }) {
             self.backend.input_sources(inputs)
@@ -314,11 +311,12 @@ impl<B: Backend> Queue<B> {
             .iter()
             .filter(|(_, fences)| fences.ready.raw() == fences.completed.raw())
             .count();
-        let failures: [Option<&Fence>; 2] = core::array::from_fn(|index| {
-            self.failures[index].as_ref().and_then(|(sequence, fence)| {
-                Order::contains(order.wait_through[index], *sequence).then_some(fence)
-            })
-        });
+        let mut failures: [Option<Fence>; 2] = [None, None];
+        for (index, failure) in self.failures.iter_mut().enumerate() {
+            failures[index] = failure.earliest().and_then(|(sequence, fences)| {
+                Order::contains(order.wait_through[index], sequence).then(|| fences.completed.clone())
+            });
+        }
         let failure_count = failures.iter().flatten().count();
         let mut dependencies = KVec::with_capacity(
             inputs.len() + count + timestamp_count + failure_count,
