@@ -982,7 +982,7 @@
 			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_sys>;
 			#iommu-cells = <1>;
-			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
 			status = "disabled";
 		};
 
@@ -993,7 +993,7 @@
 			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_sys>;
 			#iommu-cells = <1>;
-			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
 			status = "disabled";
 		};
 
