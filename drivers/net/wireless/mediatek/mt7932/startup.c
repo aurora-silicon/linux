@@ -929,6 +929,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 			m->band6.iftype_data = &m->he6;
 			m->band6.n_iftype_data = 1;
 			m->wiphy->bands[NL80211_BAND_6GHZ] = &m->band6;
+			m->wiphy->flags |= WIPHY_FLAG_SPLIT_SCAN_6GHZ;
 		}
 	}
 	ret = wiphy_register(m->wiphy);
