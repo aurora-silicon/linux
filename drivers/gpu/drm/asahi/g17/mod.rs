@@ -1420,6 +1420,7 @@ impl Gpu {
                     board, board.clusters(), board.gpu_cores(), id.num_clusters, id.num_cores);
                 return Err(ENODEV);
             }
+            fw::m5::pool::select_render_pool(board);
         }
 
         let geometry = mmu::UatGeometry {
