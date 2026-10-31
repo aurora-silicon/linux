@@ -53,11 +53,19 @@ static const struct ave_variant ave_t8112 = {
 	.lfs_ref_scale = 1,
 };
 
-/* CRC, boot-config words and coprocessor start registers remain unqualified. */
+/*
+ * The M4 Pro (T6040 in the ADT, apple,t6041 in the DT) starts its encoder
+ * like the A18 Pro: same coprocessor registers and boot sequence, its own
+ * device ID and type.
+ */
 static const struct ave_variant ave_t6041 = {
+	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
 	.fw_data_size = 0x12c000,
+	.boot_device_id = 27,
+	.device_type = 25,
 	.lfs_ref_scale = 2,
+	.boot_qualified = true,
 };
 
 static const struct ave_variant ave_t8140 = {

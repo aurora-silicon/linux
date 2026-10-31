@@ -33,6 +33,7 @@
 static const u32 ave_known_text_crc[] = {
 	0x2ce7359e,	/* AppleAVE2FW 9003.78.0 */
 	0x69c54454,	/* AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
+	AVE_FW_TEXT_CRC_T6040_25G83,
 };
 
 static int ave_fw_chosen_crc(struct ave_dev *ave, const char *name, u32 *crc)

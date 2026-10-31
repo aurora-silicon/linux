@@ -487,7 +487,11 @@ const struct ave_fw_layout ave_layout_26a428 = {
 
 const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 {
-	if (crc == AVE_FW_TEXT_CRC_9003_78_0)
+	/*
+	 * The M4 Pro gets the same 25G83 firmware build as the A18 Pro, built
+	 * for its own chip, and speaks the same command layout.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83)
 		return &ave_layout_9003_78_0;
 	/* 26A428 has no verified loader TEXT CRC: no placeholder or fallback. */
 	return NULL;
