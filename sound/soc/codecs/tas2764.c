@@ -27,6 +27,7 @@
 #include <sound/tlv.h>
 
 #include "tas2764.h"
+#include <sound/tas27xx-energy.h>
 
 enum tas2764_devid {
 	DEVID_TAS2764  = 0,
@@ -583,6 +584,47 @@ static int tas2764_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 
 	return 0;
 }
+
+int tas2764_playback_state(struct snd_soc_component *component,
+			  struct tas27xx_playback_state *state)
+{
+	struct tas2764_priv *amp = snd_soc_component_get_drvdata(component);
+	unsigned int gain, hpf, slots, source, mode;
+	int ret;
+
+	memset(state, 0, sizeof(*state));
+	if (tas2764_group_failed(amp))
+		return -EIO;
+	ret = regmap_read(amp->regmap, TAS2764_CHNL_0, &gain);
+	if (ret)
+		return ret;
+	ret = regmap_read(amp->regmap, TAS2764_DC_BLK0, &hpf);
+	if (ret)
+		return ret;
+	ret = regmap_read(amp->regmap, TAS2764_TDM_CFG3, &slots);
+	if (ret)
+		return ret;
+	ret = regmap_read(amp->regmap, TAS2764_TDM_CFG2, &source);
+	if (ret)
+		return ret;
+	ret = regmap_read(amp->regmap, TAS2764_PWR_CTRL, &mode);
+	if (ret)
+		return ret;
+	/* Diagnostic generators and a bypassed HPF are not a PCM certificate. */
+	if ((mode & 7) > 2 || !(hpf & 7))
+		return -EOPNOTSUPP;
+	gain = (gain >> 1) & 0x1f;
+	if (gain > 0x14 || (hpf & 7) > 6)
+		return -EINVAL;
+	state->gain_millidbv = 11000 + gain * 500;
+	state->hpf = hpf & 7;
+	state->left_slot = slots & 0xf;
+	state->right_slot = slots >> 4;
+	state->source = (source >> 4) & 3;
+	/* No published transient bound is inferred from an HPF cutoff. */
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tas2764_playback_state);
 
 static int tas2764_set_dai_tdm_slot(struct snd_soc_dai *dai,
 				unsigned int tx_mask,
