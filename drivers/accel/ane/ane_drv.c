@@ -1297,6 +1297,7 @@ static void ane_platform_remove(struct platform_device *pdev)
 {
 	struct ane_device *ane = platform_get_drvdata(pdev);
 	struct ane_bo *bo, *tmp;
+	int err;
 
 	/* Powered and pinned for the teardown: the unmaps below flush the
 	 * DART TLBs, and no autosuspend may race the genpd detach.
@@ -1314,12 +1315,19 @@ static void ane_platform_remove(struct platform_device *pdev)
 		return;
 	}
 
+	err = ane_perf_exit(ane);
+	if (err) {
+		dev_err(ane->dev,
+			"retaining power-domain attachments after failed performance release; reboot required\n");
+		mutex_unlock(&ane->engine_lock);
+		return;
+	}
+
 	list_for_each_entry_safe(bo, tmp, &ane->bo_list, node)
 		ane_iommu_unmap_pages(ane, bo);
 	ane_reclaim_preserved(ane);
 	drm_mm_takedown(&ane->mm);
 
-	ane_perf_exit(ane);
 	ane_detach_genpd(ane);
 
 	pm_runtime_disable(ane->dev);

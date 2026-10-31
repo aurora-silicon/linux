@@ -205,12 +205,13 @@ int ane_perf_init(struct ane_device *ane, unsigned int high_level)
 	return devm_device_add_group(ane->dev, &ane_perf_group);
 }
 
-void ane_perf_exit(struct ane_device *ane)
+int ane_perf_exit(struct ane_device *ane)
 {
 	struct ane_perf *p = &ane->perf;
+	int ret;
 
 	if (!p->initialized)
-		return;
+		return 0;
 	cancel_delayed_work_sync(&p->idle);
 	mutex_lock(&p->lock);
 	p->error = ane_perf_drop(ane);
@@ -221,9 +222,13 @@ void ane_perf_exit(struct ane_device *ane)
 		pm_runtime_put_noidle(ane->dev);
 		p->pinned = false;
 	}
+	ret = p->error;
 	mutex_unlock(&p->lock);
+	if (ret)
+		return ret;
 	of_node_put(p->report);
 	p->report = NULL;
+	return 0;
 }
 
 int ane_perf_suspend(struct ane_device *ane)

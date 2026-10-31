@@ -161,7 +161,7 @@ int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
 void ane_reclaim_preserved(struct ane_device *ane);
 
 int ane_perf_init(struct ane_device *ane, unsigned int high_level);
-void ane_perf_exit(struct ane_device *ane);
+int ane_perf_exit(struct ane_device *ane);
 int ane_perf_begin(struct ane_device *ane);
 void ane_perf_end(struct ane_device *ane);
 int ane_perf_suspend(struct ane_device *ane);
