@@ -2783,6 +2783,7 @@ F:	drivers/pmdomain/apple/
 F:	drivers/power/reset/macsmc-reboot.c
 F:	drivers/power/supply/macsmc-power*.c
 F:	drivers/pwm/pwm-apple.c
+F:	tools/asahi/apple-pwm-pm-tests.py
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
