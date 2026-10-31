@@ -424,7 +424,8 @@ impl G18FirmwareMemory {
         let pool = self.uma_pool.prepare_binding()?;
         self.uma_pool.load_hardware_descriptor(dev, &mut self.uma, pool, j873_sma_device_words(2, 6)?)?;
         job.parameter_buffer().load_row(&mut self.pbdesc)?;
-        job.encode_h1(dev)?;
+        // Without a capture (stage 10 only) the first application frame encodes.
+        if !job.layout_only_payload() { job.encode_h1(dev)?; }
         Ok(pool)
     }
 

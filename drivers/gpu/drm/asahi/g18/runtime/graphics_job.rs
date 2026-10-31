@@ -136,6 +136,7 @@ impl G18GraphicsJob {
     }
 
     pub(crate) fn vm(&self) -> &mmu::Vm { self.program.vm() }
+    pub(crate) fn layout_only_payload(&self) -> bool { self.program.layout_only_payload() }
     pub(crate) fn context_id(&self) -> u8 { self.program.context_id() }
     pub(crate) fn scheduler_record(&self) -> Result<u64> { Ok(self.scheduler.binding(0)?.record) }
     pub(crate) fn queues(&mut self) -> &mut G18GraphicsQueues { &mut self.queues }
