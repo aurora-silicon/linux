@@ -28,6 +28,7 @@ properties:
           - apple,t8103-usb4-dart
           - apple,t8110-dart
           - apple,t6000-dart
+          - apple,t8152-dart-gen3
       - items:
           - const: apple,t8140-ane-dart
           - const: apple,t8140-dart
@@ -66,7 +67,19 @@ properties:
       error-mask policy rather than changing it for these streams.
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: DART registers
+      - description:
+          Gen3 only. The SoC's TLB invalidation aperture window for this
+          DART (ADT dart-tlbi-aperture plus tlbi-aperture-offset), shared
+          by all Gen3 DARTs. A stream is invalidated by writing a payload
+          there and broadcasting a TLBI.
+
+  reg-names:
+    items:
+      - const: dart
+      - const: tlbi
 
   interrupts:
     maxItems: 1
@@ -157,6 +170,28 @@ required:
   - reg
   - '#iommu-cells'
   - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-dart-gen3
+    then:
+      description:
+        T8152 Gen3 DARTs are owned by the SPTM. The bootloader hands them
+        over locked; the operating system only adds page table entries in
+        root slots that are empty at handoff.
+      properties:
+        reg:
+          minItems: 2
+      required:
+        - reg-names
+    else:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names: false
 
 additionalProperties: false
 
