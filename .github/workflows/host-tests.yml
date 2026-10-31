@@ -11,11 +11,6 @@ on:
   pull_request:
     branches: [integration/aurora, aurora-wip]
   workflow_dispatch:
-    inputs:
-      statistics_build:
-        description: Also build the Asahi statistics kernel and run the DRAM parser
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -30,9 +25,6 @@ env:
   GCC_VERSION: '13'
 
 jobs:
-  statistics-build:
-    if: github.event_name == 'workflow_dispatch' && inputs.statistics_build
-    uses: ./.github/workflows/asahi-stats-build.yml
   host-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

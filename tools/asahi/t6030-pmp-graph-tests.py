@@ -56,11 +56,8 @@ def main():
     dram_type = re.search(r'struct apple_pmp_dram \{.*?\n\};',
                           (ROOT / 'drivers/pmdomain/apple/pmp-dram.h').read_text(), re.S)[0]
     has_dram = 'ret = apple_pmp_dram_parse(' in source
-    has_legacy_dram = 'static int apple_pmp_dram_read(' in source
-    if has_legacy_dram:
-        functions = extract.function(source, 'static int apple_pmp_dram_read(') + '\n' + functions
     assert has_dram or args.ref, 'DRAM probe hook missing from production source'
-    (args.output / 'dram-type.h').write_text(f'#define HOST_HAS_DRAM {int(has_dram)}\n#define HOST_HAS_DRAM_LEGACY {int(has_legacy_dram)}\n' + dram_type + '\n')
+    (args.output / 'dram-type.h').write_text(f'#define HOST_HAS_DRAM {int(has_dram)}\n' + dram_type + '\n')
     # Keep the real readers, modes and group wired into the extracted probe.
     dram_attrs = source[source.index('static ssize_t type_show('):
                         source.index('static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;')] if has_dram else ''
@@ -89,8 +86,8 @@ def main():
     mutations = []
     if args.mutations:
         dram_controls = [
-            ('no-dram-parse', 'ret = apple_pmp_dram_read(dev, &rep->dram);' if has_legacy_dram else 'ret = apple_pmp_dram_parse(dev_fwnode(dev), &rep->dram);',
-             'ret = -ENODATA; (void)apple_pmp_dram_read;' if has_legacy_dram else 'ret = -ENODATA; (void)apple_pmp_dram_parse; (void)dev_fwnode;'),
+            ('no-dram-parse', 'ret = apple_pmp_dram_parse(dev_fwnode(dev), &rep->dram);',
+             'ret = -ENODATA; (void)apple_pmp_dram_parse; (void)dev_fwnode;'),
             ('reject-absent-dram', 'ret && ret != -ENODATA', 'ret'),
             ('ignore-invalid-dram', 'ret && ret != -ENODATA', 'false'),
             ('no-dram-group', 'ret = devm_device_add_group(dev, &apple_pmp_dram_group);',
@@ -102,15 +99,6 @@ def main():
             ('dram-wrong-rate-reader', 'APPLE_PMP_DRAM_ATTR(max_data_rate, max_rate,',
              'APPLE_PMP_DRAM_ATTR(max_data_rate, peak_bandwidth,'),
         ]
-        if has_legacy_dram:
-            dram_controls += [
-                ('no-legacy-dram', 'if (ret != -ENODATA)', 'if (true)'),
-                ('dram-ignore-root-soc', 'of_machine_is_compatible(legacy[i].soc) &&', 'true &&'),
-                ('dram-ignore-report-soc', 'of_device_is_compatible(dev->of_node, legacy[i].report)', 'true'),
-                ('dram-override-valid-dt', 'if (ret != -ENODATA)', 'if (ret && ret != -ENODATA)'),
-                ('dram-hide-invalid-dt', 'if (ret != -ENODATA)', 'if (!ret)'),
-                ('dram-wrong-legacy-rate', '.max_rate = 7500000000ULL', '.max_rate = 6400000000ULL'),
-            ]
         controls = (dram_controls if has_dram else []) + [
             ('no-managed-owner', '.starts_pmp = IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK)', '.starts_pmp = false'),
             ('no-managed-probe', 'ret = apple_pmp_start_init(rep);', 'ret = 0; (void)apple_pmp_start_init;'),

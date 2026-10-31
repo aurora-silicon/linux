@@ -2,32 +2,18 @@ What:           /sys/bus/platform/devices/.../dram/type
 Date:           October 2026
 Contact:        Ryan Murray <ryan@aurorasilicon.org>
 Description:
-                Read-only DRAM family, currently "lpddr5". This family
+                Read-only DRAM family from DT, currently "lpddr5". This family
                 includes LPDDR5X; the attribute does not assert the X suffix.
                 The dram group is present on an apple-pmp-report device only
-                when DT supplies a complete, consistent memory description,
-                or on T6000, T8112, T6040 and T8140 with an older boot DT.
-                The latter uses the same static interface class as the DTS,
-                selected by both root SoC and PMP report compatibles. Other
-                SoCs do not inherit a class from a shared PMP layout. Complete
-                DT metadata takes precedence; invalid metadata is rejected.
+                when DT supplies a complete, consistent memory description.
                 Static attributes remain valid when firmware is stopped.
-                Typical paths are:
-                /sys/bus/platform/devices/3003c0000.pmp-report/dram/ (T8140)
-                /sys/bus/platform/devices/5003c0000.pmp-report/dram/ (T6040).
-                There is no dram devfreq class device. These files require
-                CONFIG_APPLE_PMP_REPORT and its bound pmp_report driver, not
-                CONFIG_APPLE_PMP_DRAM_KUNIT_TEST (which only enables tests).
-                Installing kernel DTBs alone does not refresh a live DT
-                supplied by an older Stage 2 bootloader.
 
 What:           /sys/bus/platform/devices/.../dram/max_data_rate
 Date:           October 2026
 Contact:        Ryan Murray <ryan@aurorasilicon.org>
 Description:
                 Read-only maximum interface transfers per second per data pin
-                (divide by 1000000 for MT/s), from the highest DT OPP or the
-                compatible-selected static interface class on an older DT. This is
+                (divide by 1000000 for MT/s), from the highest DT OPP. This is
                 an inferred interface class, not a measured current rate or
                 a literal LPDDR5 command clock/WCK. The maximum state ID is
                 state_count minus one, independent of DT child order.
@@ -57,8 +43,7 @@ What:           /sys/bus/platform/devices/.../dram/state_count
 Date:           October 2026
 Contact:        Ryan Murray <ryan@aurorasilicon.org>
 Description:
-                Read-only number of firmware DCS states, from DT or the
-                compatible-selected static interface class on an older DT. State IDs
+                Read-only number of firmware DCS states, from DT. State IDs
                 are not frequencies. No current-state, current-rate, residency,
                 or transition-statistics attribute is provided without an
                 independently specified achieved-state transport.

@@ -107,59 +107,6 @@ static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
 	return rep->offsets->running_any ? status : status & PMP_REPORT_READY;
 }
 
-/*
- * Stage 2 supplies the live DT on Apple machines, independently of the kernel
- * DTBs. Preserve static reporting with an older Stage 2 on the four qualified
- * SoCs. These are the same inferred interface classes as the DTS descriptions,
- * not per-machine calibration or measured current rates. Require both the root
- * SoC and report compatible: a shared PMP layout alone does not identify DRAM.
- */
-static int apple_pmp_dram_read(struct device *dev, struct apple_pmp_dram *dram)
-{
-	static const struct {
-		const char *soc;
-		const char *report;
-		struct apple_pmp_dram dram;
-	} legacy[] = {
-		{ "apple,t6000", "apple,t6000-pmp-v2-report", {
-			.type = "lpddr5", .width = 256, .state_count = 4,
-			.max_rate = 6400000000ULL, .peak_bandwidth = 204800000000ULL,
-			.bandwidth_class = 200000000000ULL,
-		} },
-		{ "apple,t8112", "apple,t8112-pmp-v2-report", {
-			.type = "lpddr5", .width = 128, .state_count = 5,
-			.max_rate = 6400000000ULL, .peak_bandwidth = 102400000000ULL,
-			.bandwidth_class = 100000000000ULL,
-		} },
-		{ "apple,t6040", "apple,t6041-pmp-v2-report", {
-			.type = "lpddr5", .width = 256, .state_count = 6,
-			.max_rate = 8533333333ULL, .peak_bandwidth = 273066666656ULL,
-			.bandwidth_class = 273000000000ULL,
-		} },
-		{ "apple,t8140", "apple,t8140-pmp-v2-report", {
-			.type = "lpddr5", .width = 64, .state_count = 5,
-			.max_rate = 7500000000ULL, .peak_bandwidth = 60000000000ULL,
-			.bandwidth_class = 60000000000ULL,
-		} },
-	};
-	int ret;
-
-	ret = apple_pmp_dram_parse(dev_fwnode(dev), dram);
-	/* Complete DT descriptions win; never hide partial/invalid metadata. */
-	if (ret != -ENODATA)
-		return ret;
-
-	for (unsigned int i = 0; i < ARRAY_SIZE(legacy); i++) {
-		if (of_machine_is_compatible(legacy[i].soc) &&
-		    of_device_is_compatible(dev->of_node, legacy[i].report)) {
-			*dram = legacy[i].dram;
-			dev_info(dev, "DRAM interface class from SoC compatible (old DT)\n");
-			return 0;
-		}
-	}
-	return -ENODATA;
-}
-
 static ssize_t type_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct apple_pmp_report *rep = dev_get_drvdata(dev);
@@ -1239,7 +1186,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&rep->ready_work, apple_pmp_report_ready_work);
 	platform_set_drvdata(pdev, rep);
 
-	ret = apple_pmp_dram_read(dev, &rep->dram);
+	ret = apple_pmp_dram_parse(dev_fwnode(dev), &rep->dram);
 	if (ret && ret != -ENODATA)
 		return dev_err_probe(dev, ret, "invalid DRAM description\n");
 	if (!ret) {
