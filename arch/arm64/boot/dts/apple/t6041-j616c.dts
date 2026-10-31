@@ -22,6 +22,7 @@
 		disp0 = &display;
 		disp0-piodma = &disp0_piodma;
 		gpu = &gpu;
+		sep = &sep;
 	};
 
 	chosen {
@@ -886,4 +887,22 @@
 &aop {
 	dma-noncoherent;
 	memory-region = <&aop_mmio_pmgr>;
+};
+
+&sep_mbox {
+	status = "okay";
+};
+
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_nub 53 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl>;
+	interrupts = <116 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
 };
