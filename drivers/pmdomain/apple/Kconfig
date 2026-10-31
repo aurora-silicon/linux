@@ -55,7 +55,8 @@ config APPLE_PMP_REPORT
 
 config APPLE_PMP_ANE_KUNIT_TEST
 	tristate "KUnit tests for T600x ANE performance requests" if !KUNIT_ALL_TESTS
-	depends on KUNIT
+	depends on KUNIT && PM
+	select PM_GENERIC_DOMAINS
 	default KUNIT_ALL_TESTS
 	help
 	  Exercise ANE level transitions, ownership refusal and ACK-timeout
