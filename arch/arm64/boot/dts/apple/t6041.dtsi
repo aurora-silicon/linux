@@ -17,8 +17,6 @@
 /delete-node/ &apciec1_dart;
 /delete-node/ &usb4_2_dart;
 /delete-node/ &apciec2_dart;
-/delete-node/ &dispext0_dart;
-/delete-node/ &dcpext0_dart;
 /delete-node/ &sep_dart;
 /delete-node/ &apcie1_dart;
 /delete-node/ &sio_dart;
@@ -28,15 +26,12 @@
 /delete-node/ &jpeg0_dart;
 /delete-node/ &jpeg1_dart;
 /delete-node/ &scaler0_dart;
-/delete-node/ &dispext1_dart;
-/delete-node/ &dcpext1_dart;
 /delete-node/ &usb4_0_mbox;
 /delete-node/ &usb4_1_mbox;
 /delete-node/ &usb4_2_mbox;
 /delete-node/ &sep_mbox;
 /delete-node/ &sio_mbox;
 /delete-node/ &pinctrl_smc;
-/delete-node/ &pinctrl_aop;
 /delete-node/ &ps_gpx;
 /delete-node/ &ps_apcie_gp;
 /delete-node/ &ps_fab4_soc;
@@ -155,7 +150,6 @@
 /delete-node/ &ps_atc2_cio_pcie;
 /delete-node/ &ps_pcpu0_4;
 /delete-node/ &ps_atc2_cio_usb;
-/delete-node/ &ps_atc3_common;
 /delete-node/ &ps_atc3_cio;
 /delete-node/ &ps_atc3_pcie;
 /delete-node/ &ps_atc3_cio_pcie;
@@ -187,17 +181,13 @@
 /delete-node/ &ps_nub_fabric;
 /delete-node/ &ps_nub_sram;
 /delete-node/ &ps_debug_switch;
-/delete-node/ &ps_atc3_usb;
-/delete-node/ &ps_atc3_phymxwrap;
 /delete-node/ &ps_nub_spmi_ahb;
 /delete-node/ &ps_nub_spmi0;
 /delete-node/ &ps_nub_spmi_a2;
 /delete-node/ &ps_nub_spi0;
 /delete-node/ &ps_nub_aon;
 /delete-node/ &ps_nub_ocla;
-/delete-node/ &ps_atc3_common_dp;
 /delete-node/ &ps_nub_spmi1;
-/delete-node/ &ps_atc3_usb_aon;
 /delete-node/ &ps_nub_spmi2;
 /delete-node/ &ps_nub_spmi3;
 /delete-node/ &ps_nub_spmi4;
@@ -226,6 +216,10 @@
 };
 
 &ps_atc2_common {
+	/delete-property/ power-domains;
+};
+
+&ps_atc3_common {
 	/delete-property/ power-domains;
 };
 
