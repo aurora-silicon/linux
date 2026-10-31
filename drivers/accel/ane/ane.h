@@ -63,6 +63,8 @@ struct ane_device {
 	 * and protects bo_list, preserved_list and removed.
 	 */
 	struct mutex engine_lock;
+	/* Serializes runtime-PM references across a recovery cycle. */
+	struct mutex pm_lock;
 	struct list_head bo_list;
 
 	/*
