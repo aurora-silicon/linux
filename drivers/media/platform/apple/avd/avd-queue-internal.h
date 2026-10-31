@@ -43,6 +43,7 @@ static inline int avd_slot_reserve(struct avd_frame *f, struct avd_ctx *ctx,
 	f->dep = AVD_DEP_PREV_DONE;
 	f->status = 0;
 	f->prog_words = 0;
+	f->fifo_iova = 0;
 	f->codec_priv = NULL;
 	return 0;
 }

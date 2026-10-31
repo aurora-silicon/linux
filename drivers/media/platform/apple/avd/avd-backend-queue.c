@@ -1,264 +1,434 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* Tagged open-firmware queue. VP/FIFO setup and PP chaining run on the CM3. */
-#include <linux/dma-mapping.h>
-#include <linux/of.h>
-#include <linux/overflow.h>
+/*
+ * Queued transport for the open AVD firmware (avd-fw queue ABI 2).
+ *
+ * The codec's CPU builder still produces the per-frame instruction program.
+ * Instead of writing it word by word into the VP FIFO register and kicking
+ * the PP from the VP-done interrupt, the host streams the program into a word
+ * ring in CM3 SRAM and posts one descriptor per frame. The firmware feeds the
+ * VP FIFO from SRAM, starts PP itself when the VP is done, and posts a tagged
+ * completion. No PIODMA (and so no second DART stream) is involved.
+ */
+#include <linux/delay.h>
+#include <linux/io.h>
+#include <linux/jiffies.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 
 #include "avd.h"
 #include "avd-inst.h"
-#include "avd-open-protocol.h"
 #include "avd-regs.h"
+#include "avd-open-protocol.h"
 
-#define OPEN_MBOX0_STATUS 0x50
-#define OPEN_MBOX0_TX 0x54
-#define OPEN_MBOX0_EMPTY BIT(0)
+#define AVDQ_MAGIC		0x41565131	/* "AVQ1" */
+#define AVDQ_VERSION		2
+#define AVDQ_COUNT		16
+#define AVDQ_DESC_BYTES		64
+#define AVDQ_RING_OFFSET	0x8000
+#define AVDQ_INFO		0x7fc0
+/* Firmware private state starts here; the SRAM ring must end before it. */
+#define AVDQ_RING_LIMIT		0x6000
+#define AVDQ_INFO_RP		(AVDQ_INFO + 0x38)
+#define AVDQ_INFO_WP		(AVDQ_INFO + 0x3c)
+#define AVDQ_FEAT_SRAM_RING	BIT(0)
+#define AVDQ_FEAT_MULTI_KICK	BIT(1)
+#define AVDQ_FLAG_SRAM		BIT(0)
+#define AVDQ_MAX_PP_EXTRA	255
+#define AVDQ_STATE_SUBMITTED	1
+#define AVDQ_STATE_COMPLETE	2
+#define AVDQ_NOTIFY_MASK	0xffff0000
+#define AVDQ_NOTIFY		0x54530000
+/* SRAM addresses as the CM3 doorbell sees them: 0x01000000 + offset from AVD base. */
+#define AVDQ_CM3_APERTURE(off)	(0x01000000 + (off))
+#define AVD_REG_MBOX0_STATUS	0x50
+#define AVD_REG_MBOX0_SEND	0x54
+#define AVDQ_MBOX0_EMPTY BIT(0)
 
-struct avd_open_queue {
-	void __iomem *sram;
-	resource_size_t sram_size;
-	bool enabled;
-	u32 ring, header;
-	struct avd_buf packets[AVD_MAX_FRAMES];
-	struct avd_buf fifo[AVD_MAX_FRAMES];
+/* Descriptor word offsets (bytes), avd-fw docs/queue.md. */
+enum {
+	D_MAGIC = 0x00, D_TAG = 0x04, D_CODEC = 0x08, D_VP = 0x0c,
+	D_PROG_LO = 0x10, D_PROG_HI = 0x14, D_WORDS = 0x18, D_KICK = 0x1c,
+	D_STATE = 0x20, D_STATUS = 0x24, D_CTAG = 0x28, D_FLAGS = 0x2c,
+	D_PP_EXTRA = 0x30, D_PP_CONT = 0x34, D_RSVD0 = 0x38, D_RSVD1 = 0x3c,
 };
 
-void avd_open_queue_cleanup(struct avd_dev *avd)
+struct avd_qfw {
+	void __iomem *sram;
+	resource_size_t sram_size;
+	u32 aperture;		/* expected CM3 address of SRAM byte 0 */
+	u32 ring_off;
+	u32 ring_words;
+	u32 wp;			/* host write count, free-running */
+	u32 fifo_slots;
+	u32 codec_mask;		/* info+0x24, bit n = codec n */
+	bool usable;		/* last boot found a matching ABI 2 image */
+	bool multi;
+	struct avd_frame *stream;
+	u32 stream_sent;
+	struct avd_buf fallback_fifo[AVD_MAX_FRAMES];
+};
+
+static void __iomem *avd_qfw_desc(struct avd_qfw *q, unsigned int idx)
 {
-	struct avd_open_queue *q = avd->open_priv;
-	unsigned int i;
+	return q->sram + AVDQ_RING_OFFSET + idx * AVDQ_DESC_BYTES;
+}
+
+void avd_qfw_cleanup(struct avd_dev *avd)
+{
+	struct avd_qfw *q = avd->qfw;
 
 	if (!q)
 		return;
-	for (i = 0; i < AVD_MAX_FRAMES; i++) {
-		avd_buf_free(avd, &q->packets[i]);
-		avd_buf_free(avd, &q->fifo[i]);
-	}
+	q->stream = NULL;
+	for (unsigned int i = 0; i < AVD_MAX_FRAMES; i++)
+		avd_buf_free(avd, &q->fallback_fifo[i]);
 }
 
-static void avd_open_queue_release(void *data)
+int avd_qfw_probe(struct avd_dev *avd)
 {
-	avd_open_queue_cleanup(data);
-}
+	struct resource *code, *sram;
+	struct avd_qfw *q;
 
-int avd_open_queue_probe(struct avd_dev *avd)
-{
-	struct avd_open_queue *q;
-	struct resource *sram;
-
-	if (avd->open_priv)
-		return 0;
+	code = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "code");
+	sram = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "sram");
+	if (!code || !sram || sram->start < code->start ||
+	    resource_size(sram) < AVDQ_RING_OFFSET + AVDQ_COUNT * AVDQ_DESC_BYTES)
+		return 0;	/* no queue mode on this node: legacy transport only */
 	q = devm_kzalloc(avd->dev, sizeof(*q), GFP_KERNEL);
 	if (!q)
 		return -ENOMEM;
-	avd->open_priv = q;
-	sram = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "sram");
-	if (sram) {
-		q->sram = devm_ioremap_resource(avd->dev, sram);
-		if (IS_ERR(q->sram))
-			return PTR_ERR(q->sram);
-		q->sram_size = resource_size(sram);
-	}
-	return devm_add_action_or_reset(avd->dev, avd_open_queue_release, avd);
+	q->sram = devm_ioremap_resource(avd->dev, sram);
+	if (IS_ERR(q->sram))
+		return PTR_ERR(q->sram);
+	q->sram_size = resource_size(sram);
+	/* The code window sits at +0x80000 from the decoder base on every SoC. */
+	q->aperture = AVDQ_CM3_APERTURE(0x80000 + (u32)(sram->start - code->start));
+	avd->qfw = q;
+	return 0;
 }
 
-bool avd_open_is_queued(struct avd_dev *avd)
+/* Read the firmware's info block after boot; true when ABI 2 queue mode fits. */
+static bool avd_qfw_check(struct avd_dev *avd)
 {
-	struct avd_open_queue *q = avd->open_priv;
-
-	return q && READ_ONCE(q->enabled);
-}
-
-int avd_open_queue_boot(struct avd_dev *avd)
-{
-	struct avd_open_queue *q = avd->open_priv;
-	u32 info[16], multi[7], dst, header;
+	struct avd_qfw *q = avd->qfw;
+	u32 info[16], multi[7];
 	unsigned int i;
-	int ret;
 
-	WRITE_ONCE(q->enabled, false);
-	/* Stop old DMA/IRQs and drain stale notifications before a new generation. */
-	avd_shutdown(avd);
-	for (i = 0; i < AVD_MAX_FRAMES + 1; i++) {
-		if (readl(avd->mbox + AVD_REG_MBOX1_STATUS) & AVD_MBOX1_EMPTY)
-			break;
-		readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
-		writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+	if (!q)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(info); i++)
+		info[i] = readl(q->sram + AVDQ_INFO + 4 * i);
+	q->usable = false;
+	if (info[0] != AVDQ_MAGIC)
+		return false;
+	if (info[1] != AVDQ_VERSION || info[2] != AVDQ_COUNT ||
+	    info[3] != AVDQ_DESC_BYTES || info[5] != AVDQ_RING_OFFSET ||
+	    !(info[11] & AVDQ_FEAT_SRAM_RING) ||
+	    !(info[11] & AVDQ_FEAT_MULTI_KICK)) {
+		dev_info_once(avd->dev, "open firmware queue ABI %u not supported, using legacy transport\n",
+			      info[1]);
+		return false;
 	}
-	ret = avd_boot(avd);
+	if (info[4] != q->aperture) {
+		dev_warn_once(avd->dev, "firmware SRAM aperture %#x, node needs %#x: wrong image tier, using legacy transport\n",
+			      info[4], q->aperture);
+		return false;
+	}
+	if (info[13] < 1024 || (info[13] & (info[13] - 1)) || info[12] % 4 ||
+	    (u64)info[12] + 4ULL * info[13] > AVDQ_RING_LIMIT ||
+	    !info[10] || info[10] > AVDQ_COUNT || info[14] || info[15]) {
+		dev_warn_once(avd->dev, "firmware SRAM ring geometry invalid, using legacy transport\n");
+		return false;
+	}
+	q->multi = false;
+	if (info[9] & AVD_OPEN_CAP_MULTI_VP) {
+		for (i = 0; i < ARRAY_SIZE(multi); i++)
+			multi[i] = readl(q->sram + AVD_OPEN_MULTI_INFO + i * 4);
+		if (!avd_open_has_multi(info[9], multi))
+			return false;
+		for (i = 0; i < 4; i++) {
+			if (!avd->variant->vp_slots[i])
+				continue;
+			if ((multi[2 + i] & 0xff) != avd->variant->vp_slot_base[i] ||
+			    (multi[2 + i] >> 8) != avd->variant->vp_slots[i])
+				return false;
+		}
+		q->multi = true;
+	}
+	q->ring_off = info[12];
+	q->ring_words = info[13];
+	q->fifo_slots = min_t(u32, info[10], avd->variant->fifo_slots ?: 1);
+	q->codec_mask = info[9] & GENMASK(3, 0);
+	q->wp = 0;
+	q->usable = true;
+	return true;
+}
+
+static int avd_qfw_boot(struct avd_dev *avd)
+{
+	int ret = avd_boot(avd);
+
 	if (ret)
 		return ret;
-	/* Old DT/firmware retains the serial compatibility transport. */
-	if (!q->sram || q->sram_size < 0x9400)
-		return 0;
-	for (i = 0; i < ARRAY_SIZE(info); i++)
-		info[i] = readl(q->sram + AVD_OPEN_INFO + i * 4);
-	if (info[0] != AVD_OPEN_MAGIC)
-		return 0;
-	if (info[1] != AVD_OPEN_VERSION || info[2] != AVD_MAX_FRAMES ||
-	    info[3] != sizeof(struct avd_open_desc) || info[5] != AVD_OPEN_RING ||
-	    info[6] != AVD_OPEN_PACKET_WORDS || info[10] != avd->variant->fifo_slots ||
-	    info[4] > U32_MAX - AVD_OPEN_RING - AVD_MAX_FRAMES * AVD_OPEN_DESC_BYTES) {
-		ret = -EPROTO;
-		goto shutdown;
-	}
-	dst = info[4] + 0x9000;
-	header = (dst & 0xfffeU) | ((dst & 0x10000U) << 1) | 1U;
-	if (info[7] != header) {
-		ret = -EPROTO;
-		goto shutdown;
-	}
-	for (i = 0; i < ARRAY_SIZE(multi); i++)
-		multi[i] = readl(q->sram + AVD_OPEN_MULTI_INFO + i * 4);
-	if (!avd_open_has_multi(info[9], multi)) {
-		dev_info_once(avd->dev, "firmware uses the open compatibility transport\n");
-		return 0;
-	}
-	/* Both DART stream IDs must be attached to the device's DMA domain. */
-	if (!avd->pm.piodma || !avd->domain ||
-	    of_count_phandle_with_args(avd->dev->of_node, "iommus", "#iommu-cells") < 2) {
-		dev_info_once(avd->dev, "queued PIODMA unavailable; using the open compatibility transport\n");
-		return 0;
-	}
-	for (i = 0; i < 4; i++) {
-		u32 base = avd->variant->vp_slot_base[i];
-
-		if (!avd->variant->vp_slots[i])
-			continue;
-		if ((multi[2 + i] & 0xff) != base ||
-		    (multi[2 + i] >> 8) != avd->variant->vp_slots[i] ||
-		    base + avd->variant->vp_slots[i] > info[8]) {
-			ret = -EPROTO;
-			goto shutdown;
-		}
-	}
-	avd->capabilities &= info[9];
-	q->ring = info[4] + AVD_OPEN_RING;
-	q->header = info[7];
-	WRITE_ONCE(q->enabled, true);
-	writel(AVD_MBOX_ENABLE, avd->mbox + OPEN_MBOX0_STATUS);
-	return 0;
-shutdown:
-	avd_shutdown(avd);
-	return ret;
-}
-
-unsigned int avd_open_queue_max(struct avd_dev *avd)
-{
-	return avd_open_is_queued(avd) ? avd->variant->fifo_slots : 1;
-}
-
-int avd_open_queue_submit(struct avd_dev *avd, struct avd_frame *f)
-{
-	struct avd_open_queue *q = avd->open_priv;
-	struct avd_buf *packet = &q->packets[f->idx], *fifo = &q->fifo[f->idx];
-	struct avd_open_desc desc = {};
-	u32 *src = f->prog->cpu, *dst;
-	size_t packets, bytes, p, n;
-	unsigned int codec = f->cmd[0];
-	void __iomem *record;
-	int ret;
-
-	static_assert(sizeof(desc) == AVD_OPEN_DESC_BYTES);
-	if (f->idx >= avd->variant->fifo_slots || codec > AVD_CODEC_AV1 ||
-	    !(avd->capabilities & BIT(codec)) || !src || !f->prog_words ||
-	    f->prog_words > 0x100000 || f->prog_words > f->prog->size / sizeof(u32) ||
-	    !f->cmd[1] || f->cmd[1] > f->prog_words ||
-	    f->ctx->client_id > AVD_OPEN_CONTEXT_MASK || f->dep > AVD_DEP_PREV_DONE)
-		return -EINVAL;
-	if (!(readl(avd->mbox + OPEN_MBOX0_STATUS) & OPEN_MBOX0_EMPTY))
-		return -EBUSY;
-	packets = DIV_ROUND_UP(f->prog_words, AVD_OPEN_PACKET_WORDS);
-	if (check_mul_overflow(packets, (size_t)AVD_OPEN_PACKET_BYTES, &bytes))
-		return -EOVERFLOW;
-	if (packet->size < bytes) {
-		ret = avd_buf_alloc(avd, packet, bytes);
-		if (ret)
-			return ret;
-	}
-	if (!fifo->cpu) {
-		ret = avd_buf_alloc(avd, fifo, fifo_size());
-		if (ret)
-			return ret;
-	}
-	dst = packet->cpu;
-	memset(dst, 0, bytes);
-	for (p = 0; p < packets; p++) {
-		size_t words = min_t(size_t, AVD_OPEN_PACKET_WORDS,
-				    f->prog_words - p * AVD_OPEN_PACKET_WORDS);
-
-		*dst++ = cpu_to_le32(q->header);
-		for (n = 0; n < words; n++)
-			dst[n] = cpu_to_le32(src[p * AVD_OPEN_PACKET_WORDS + n]);
-		dst += AVD_OPEN_PACKET_WORDS;
-	}
-	desc.magic = cpu_to_le32(AVD_OPEN_MAGIC);
-	desc.tag = cpu_to_le32(f->tag);
-	desc.codec = cpu_to_le32(codec);
-	desc.vp_slot = cpu_to_le32(avd->variant->vp_slot_base[codec]);
-	desc.pp_kick = cpu_to_le32(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(f->idx) |
-		AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots) |
-		AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
-		AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3) |
-		(codec == AVD_CODEC_VP9 && avd->variant->revision == 3 ?
-		 AVD_OP_EXEC_REV3_VP9_MASK : 0));
-	desc.program_lo = cpu_to_le32(lower_32_bits(packet->addr));
-	desc.program_hi = cpu_to_le32(upper_32_bits(packet->addr));
-	desc.program_words = cpu_to_le32(f->prog_words);
-	desc.state = cpu_to_le32(1);
-	desc.reserved[0] = cpu_to_le32(AVD_OPEN_FLAG_MULTI_VP);
-	desc.reserved[1] = cpu_to_le32(f->ctx->client_id |
-		(f->dep == AVD_DEP_PREV_DONE ? AVD_OPEN_CONTEXT_DEP : 0));
-	desc.reserved[2] = cpu_to_le32(lower_32_bits(fifo->addr));
-	desc.reserved[3] = cpu_to_le32(upper_32_bits(fifo->addr));
-	desc.reserved[4] = cpu_to_le32(f->cmd[1]);
-	record = q->sram + AVD_OPEN_RING + f->idx * sizeof(desc);
-	dma_wmb();
-	memcpy_toio(record, &desc, sizeof(desc));
-	/* Flush the descriptor aperture before ringing its doorbell. */
-	wmb();
-	readl(record + 0x20);
-	writel(q->ring + f->idx * sizeof(desc), avd->mbox + OPEN_MBOX0_TX);
+	/* AP -> CM3 doorbells use mailbox 0; completions stay on mailbox 1. */
+	writel_relaxed(AVD_MBOX_ENABLE, avd->mbox + AVD_REG_MBOX0_STATUS);
 	return 0;
 }
 
-static void avd_open_queue_fault(struct avd_dev *avd)
+static unsigned int avd_qfw_max_inflight(struct avd_dev *avd)
 {
-	/* Reuse the core's whole-device reset, before any mappings can retire. */
+	/* Each frame in flight owns one hardware instruction FIFO (EXEC 7:4). */
+	return min_t(unsigned int, AVD_MAX_FRAMES, avd->qfw->fifo_slots);
+}
+
+static void avd_qfw_fail_all(struct avd_dev *avd)
+{
+	unsigned int i;
+
+	/* ABI: any fatal word or I/O status needs a whole-queue reset. */
+	avd->qfw->stream = NULL;
 	avd->queue_error = -EIO;
+	for (i = 0; i < AVD_MAX_FRAMES; i++)
+		if (avd->frames[i].state == AVD_FRAME_SUBMITTED)
+			avd->frames[i].deadline = jiffies;
 	mod_delayed_work(system_wq, &avd->queue_work, 0);
 }
 
-irqreturn_t avd_open_queue_irq(struct avd_dev *avd)
+/* One bounded producer chunk. The core retries while firmware consumes it. */
+static int avd_qfw_pump(struct avd_dev *avd)
 {
-	struct avd_open_queue *q = avd->open_priv;
-	unsigned int budget = AVD_MAX_FRAMES + 1;
+	struct avd_qfw *q = avd->qfw;
+	struct avd_frame *f = q->stream;
+	u32 rp, pos, chunk;
+	int ret;
 
-	while (budget-- && !(readl(avd->mbox + AVD_REG_MBOX1_STATUS) & AVD_MBOX1_EMPTY)) {
-		u32 word = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
-		struct avd_frame *f = &avd->frames[word & 15];
-		void __iomem *record = q->sram + AVD_OPEN_RING + f->idx * AVD_OPEN_DESC_BYTES;
-		u32 state, status, tag;
-
-		writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
-		if ((word & 0xffff0000U) != AVD_OPEN_NOTIFY) {
-			avd_open_queue_fault(avd);
-			break;
-		}
-		state = readl(record + 0x20);
-		status = readl(record + 0x24);
-		tag = readl(record + 0x28);
-		if (state != 2 || !avd_open_completion(word, tag) || tag != f->tag ||
-		    f->state != AVD_FRAME_SUBMITTED || status > 2) {
-			avd_open_queue_fault(avd);
-			break;
-		}
-		/* Fatal completions do not establish hardware/DMA quiescence. */
-		if (status == 2) {
-			avd_open_queue_fault(avd);
-			break;
-		}
-		avd_frame_complete(avd, tag, status ? -EINVAL : 0);
+	if (!f)
+		return 0;
+	if (avd->faulted || f->state != AVD_FRAME_SUBMITTED) {
+		q->stream = NULL;
+		return 0;
 	}
+	rp = readl(q->sram + AVDQ_INFO_RP);
+	ret = avd_open_ring_chunk(q->wp, rp, q->ring_words,
+				  f->prog_words - q->stream_sent, &chunk);
+	if (ret)
+		return ret;
+	if (!chunk)
+		return 1;
+	pos = q->wp & (q->ring_words - 1);
+	memcpy_toio(q->sram + q->ring_off + 4 * pos,
+		    (u32 *)f->prog->cpu + q->stream_sent, 4 * chunk);
+	q->wp += chunk;
+	q->stream_sent += chunk;
+	/* Words before the count that publishes them. */
+	wmb();
+	writel(q->wp, q->sram + AVDQ_INFO_WP);
+	if (q->stream_sent == f->prog_words) {
+		q->stream = NULL;
+		return 0;
+	}
+	return 1;
+}
+
+static int avd_qfw_submit(struct avd_dev *avd, struct avd_frame *f)
+{
+	struct avd_qfw *q = avd->qfw;
+	struct avd_ctx *ctx = f->ctx;
+	const struct avd_coded_fmt_ops *ops = ctx->coded_fmt_desc->ops;
+	u32 codec = f->cmd[0], vp = 0, kick, cont, mask, count, extra;
+	dma_addr_t fifo;
+	u32 *words = f->prog->cpu;
+	void __iomem *d = avd_qfw_desc(q, f->idx);
+	unsigned int i;
+	int ret;
+
+	if (q->stream) {
+		ret = avd_qfw_pump(avd);
+		if (ret < 0) {
+			avd_qfw_fail_all(avd);
+			return -EBUSY;
+		}
+		if (ret)
+			return -EBUSY;
+	}
+	if (!(readl(avd->mbox + AVD_REG_MBOX0_STATUS) & AVDQ_MBOX0_EMPTY))
+		return -EBUSY;
+	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
+	    f->prog_words > f->prog->size / sizeof(u32) || f->prog_words > 0x100000)
+		return -EINVAL;
+	if (!(avd->capabilities & BIT(codec)))
+		return -EOPNOTSUPP;
+	/* The program's EXEC words name FIFO f->idx; it must be a real FIFO. */
+	if (f->idx >= q->fifo_slots ||
+	    (!ctx->coded_fmt_desc->frame_ops && ctx->fifo_idx != f->idx))
+		return -EINVAL;
+	for (i = 0; i < codec; i++)
+		vp += avd->variant->vp_slots[i];
+	if (avd->variant->vp_slot_base[codec])
+		vp = avd->variant->vp_slot_base[codec];
+	count = f->cmd[1] ?: (ops && ops->pp_kicks ? ops->pp_kicks(ctx) : 1);
+	if (!count || count > f->prog_words ||
+	    (q->multi && (ctx->client_id > AVD_OPEN_CONTEXT_MASK || f->dep > AVD_DEP_PREV_DONE)))
+		return -EINVAL;
+	extra = count - 1;
+	if (!q->multi && extra > AVDQ_MAX_PP_EXTRA)
+		return -E2BIG;
+	fifo = f->fifo_iova;
+	if (!fifo) {
+		if (!q->fallback_fifo[f->idx].cpu) {
+			ret = avd_buf_alloc(avd, &q->fallback_fifo[f->idx], fifo_size());
+			if (ret)
+				return ret;
+		}
+		fifo = q->fallback_fifo[f->idx].addr;
+	}
+
+	mask = codec == AVD_CODEC_VP9 && avd->variant->revision == 3 ?
+		AVD_OP_EXEC_REV3_VP9_MASK : 0;
+	cont = AVD_OP_EXEC | mask | AVD_OP_EXEC_FIFO_IDX(f->idx) |
+	       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots);
+	kick = cont | AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
+	       AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3 &&
+					   codec != AVD_CODEC_AV1);
+
+	/* FIFO registers of other live frames are never touched. */
+	if (!q->multi)
+		avd->variant->configure_stream(avd, fifo, f->idx, vp);
+
+	writel(AVDQ_MAGIC, d + D_MAGIC);
+	writel(f->tag, d + D_TAG);
+	writel(codec, d + D_CODEC);
+	writel(vp, d + D_VP);
+	writel(q->wp, d + D_PROG_LO);
+	writel(0, d + D_PROG_HI);
+	writel(f->prog_words, d + D_WORDS);
+	writel(kick, d + D_KICK);
+	writel(0, d + D_STATUS);
+	writel(0, d + D_CTAG);
+	writel(AVDQ_FLAG_SRAM | (q->multi ? AVD_OPEN_FLAG_MULTI_VP : 0), d + D_FLAGS);
+	if (q->multi) {
+		writel(ctx->client_id | (f->dep == AVD_DEP_PREV_DONE ? AVD_OPEN_CONTEXT_DEP : 0),
+		       d + D_PP_EXTRA);
+		writel(lower_32_bits(fifo), d + D_PP_CONT);
+		writel(upper_32_bits(fifo), d + D_RSVD0);
+		writel(count, d + D_RSVD1);
+	} else {
+		writel(extra, d + D_PP_EXTRA);
+		writel(extra ? cont : 0, d + D_PP_CONT);
+		writel(0, d + D_RSVD0);
+		writel(0, d + D_RSVD1);
+	}
+	writel(AVDQ_STATE_SUBMITTED, d + D_STATE);
+	/* Descriptor before the doorbell that hands it to the firmware. */
+	wmb();
+	(void)readl(d + D_STATE);	/* flush posted aperture writes */
+	writel(q->aperture + AVDQ_RING_OFFSET + f->idx * AVDQ_DESC_BYTES,
+	       avd->mbox + AVD_REG_MBOX0_SEND);
+
+	/* Retain ownership while a bounded pump streams any remaining words. */
+	q->stream = f;
+	q->stream_sent = 0;
+	ret = avd_qfw_pump(avd);
+	if (ret < 0)
+		avd_qfw_fail_all(avd);
+	return 0;
+}
+
+static irqreturn_t avd_qfw_irq(struct avd_dev *avd)
+{
+	struct avd_qfw *q = avd->qfw;
+	struct avd_frame *f;
+	void __iomem *d;
+	u32 word, state, status, ctag;
+	unsigned int idx;
+
+	if (!avd_mbox_pop(avd, &word))
+		return IRQ_HANDLED;
+	if ((word & AVDQ_NOTIFY_MASK) != AVDQ_NOTIFY) {
+		dev_err_ratelimited(avd->dev, "queue: firmware reported %#x, resetting\n", word);
+		avd_qfw_fail_all(avd);
+		return IRQ_HANDLED;
+	}
+	idx = word & 15;
+	d = avd_qfw_desc(q, idx);
+	state = readl(d + D_STATE);
+	status = readl(d + D_STATUS);
+	ctag = readl(d + D_CTAG);
+	f = &avd->frames[idx];
+	if (state != AVDQ_STATE_COMPLETE || ((ctag ^ word) & 0xfff0) ||
+	    f->state != AVD_FRAME_SUBMITTED || ctag != f->tag) {
+		dev_warn_ratelimited(avd->dev, "queue: stale completion %#x (state %u tag %#x)\n",
+				     word, state, ctag);
+		avd_qfw_fail_all(avd);
+		return IRQ_HANDLED;
+	}
+	if (status || (q->stream == f && q->stream_sent != f->prog_words)) {
+		/* Rejected SRAM entries leave the ring position unresolved as well. */
+		avd_qfw_fail_all(avd);
+		return IRQ_HANDLED;
+	}
+	writel(0, d + D_STATE);
+	avd_frame_complete(avd, ctag, 0);
 	return IRQ_HANDLED;
+}
+
+const struct avd_backend_ops avd_qfw_backend = {
+	.name = "open-queue",
+	.boot = avd_qfw_boot,
+	.shutdown = avd_shutdown,
+	.max_inflight = avd_qfw_max_inflight,
+	.submit = avd_qfw_submit,
+	.pump = avd_qfw_pump,
+	.irq = avd_qfw_irq,
+	.suspend = avd_pm_backend_suspend,
+	.resume = avd_pm_backend_resume,
+};
+
+bool avd_backend_is_qfw(const struct avd_dev *avd)
+{
+	return avd->backend == &avd_qfw_backend;
+}
+
+/*
+ * SRAM survives a CM3 reload, so a stale info block from an earlier ABI 2
+ * image could make a legacy image look queue capable. Clear the magic before
+ * every open-firmware boot; only an image that publishes it again qualifies.
+ */
+void avd_qfw_prepare_boot(struct avd_dev *avd)
+{
+	if (avd->qfw) {
+		avd->qfw->stream = NULL;
+		avd->qfw->usable = false;
+		writel(0, avd->qfw->sram + AVDQ_INFO);
+	}
+}
+
+/*
+ * Called after every successful open-firmware boot (probe, resume, reset),
+ * with no frame owned by the firmware. Picks the queued transport when the
+ * loaded image speaks ABI 2 for this node, else the legacy one.
+ */
+void avd_qfw_select(struct avd_dev *avd)
+{
+	const struct avd_backend_ops *old = avd->backend;
+
+	if (old != &avd_open_backend && old != &avd_qfw_backend)
+		return;
+	if (avd_qfw_check(avd)) {
+		/* Legacy boot left mailbox 0 disabled. */
+		writel_relaxed(AVD_MBOX_ENABLE, avd->mbox + AVD_REG_MBOX0_STATUS);
+		avd->backend = &avd_qfw_backend;
+		/*
+		 * Codecs held back for a newer firmware (T6040 HEVC) are
+		 * enabled by a queue image that lists them in its codec mask.
+		 */
+		avd->capabilities = avd->fw_capabilities |
+			(avd->variant->capabilities & avd->qfw->codec_mask);
+	} else {
+		avd->backend = &avd_open_backend;
+		avd->capabilities = avd->fw_capabilities;
+	}
+	if (avd->backend != old)
+		dev_info(avd->dev, "using %s transport (%u frames in flight)\n",
+			 avd->backend->name, avd->backend->max_inflight(avd));
 }

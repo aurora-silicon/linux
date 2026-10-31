@@ -3,16 +3,16 @@
 Open firmware multi-VP queue
 ===========================
 
-The open backend discovers avd-fw ABI 1 with multi-VP metadata after CM3 boot. Match data describes
+The open backend discovers avd-fw ABI 2 with multi-VP metadata after CM3 boot. Match data describes
 both the base register index and engine count for each codec pool. Firmware
-selects a free VP from that pool; the host submits a tagged DMA program and
+selects a free VP from that pool; the host submits a tagged instruction program and
 receives a tagged PP completion. The host never handles a queued VP-to-PP kick.
 
 The total admitted slot count is the minimum of AVD_MAX_FRAMES, match-data
 fifo_slots and the backend limit. Slots are allocated only from this range,
 so frame index equals hardware FIFO index. There are at most 7 independent
 FIFOs on T8103/T8140 and 15 on other supported parts. Each open slot gets its
-own instruction FIFO storage and packet buffer, retained until retirement.
+own instruction FIFO storage and program buffer, retained until retirement.
 These buffers are allocated lazily; FIFO storage uses the existing 12-MiB size.
 
 The firmware image names select both register addressing and engine pools.
@@ -25,19 +25,25 @@ ABI and dependency contract
 ---------------------------
 
 The wire layout is in avd-open-protocol.h and in avd-fw src/queue.h.
-The original ABI 1 fields are unchanged. Bit 31 of root codec capabilities
-and a separate AVM1 block at SRAM +0x7f80 negotiate the multi-VP extension.
-Descriptor reserved[0] bit 31 enables context/dependency, FIFO IOVA and PP-count
-metadata; low bits remain available to transport flags. Legacy ABI 1 entries
-remain valid, and images without the extension use the compatibility transport.
-Firmware without queue discovery, or DT without SRAM/PIODMA resources,
-retains the one-frame compatibility transport. Missing PIODMA mappings or a
-second DART stream also select that compatibility path. A queued PIODMA image requires both
-DART stream IDs on the AVD device so its coherent packet addresses are valid
-in the PIODMA domain. The DT resource/IOMMU update is a separate dependency. VP dispatch itself uses
-a transport feed callback; a future SRAM-direct entry can use the same scheduler
-without issuing PIODMA. The SRAM-direct wire extension must be negotiated before
-using that path; this driver currently submits extended ABI 1 PIODMA entries only.
+ABI 2 preserves the original 64-byte prefix and adds SRAM-ring flags and
+legacy PP continuations. Bit 31 of root codec capabilities and an AVM1 block at
+SRAM +0x7f80 negotiate multi-VP metadata. Descriptor flag bit 31 reinterprets
+continuation/tail words as context/dependency, FIFO IOVA and full PP count.
+Original ABI 2 callers retain their first/continuation PP words and FIFO setup.
+Images without a matching ABI/aperture/geometry retain the legacy transport.
+
+The native queue streams words through the advertised power-of-two SRAM ring;
+no PIODMA mapping or second DART stream is required for program delivery.
+The decoder's ordinary DMA domain and buffer lifetime rules remain mandatory.
+A bounded producer pump runs from queue work until long programs are fully
+published. Invalid ring counts, rejected entries or fatal notifications reset
+the whole device before mappings can retire. Geometry and u32-wrap tests cover
+the 4096-word ring, which streams programs longer than its capacity.
+
+Firmware dispatch only sees normalized work and a source-readiness callback.
+PIODMA tests can bypass unrelated blocked entries, while the SRAM source preserves
+global word order before reserving a VP. Both sources share VP pools, context
+dependencies, serialized PP and completion handling.
 
 Codec prepare defaults to AVD_DEP_PREV_DONE. H.264 and HEVC keep this policy:
 VP-stage reference independence and mutable scratch safety are not proven.
@@ -81,8 +87,7 @@ Device commands for the lead
 ---------------------------
 
 Run these command bodies only through controller-approved requests naming the
-specific device. First install the matching kernel, DT with PIODMA/DART stream
-1, and matching multi-VP image through the normal reversible packaging workflow. Preserve
+specific device. First install the matching kernel, DT SRAM resources and a matching multi-VP image through the normal reversible packaging workflow. Preserve
 the previous package and bootguard fallback. Use a licensed local input clip.
 
 Identify the video/media pair belonging to the same AVD instance::

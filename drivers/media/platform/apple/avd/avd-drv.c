@@ -114,11 +114,12 @@ int avd_submit_job(struct avd_ctx *ctx)
 static irqreturn_t avd_irq_handler(int irq, void *data)
 {
 	struct avd_dev *avd = data;
-
+	/* An interrupt raised before a reset or power-off belongs to that instance. */
+	unsigned int gen = READ_ONCE(avd->pm.irq_gen);
 	irqreturn_t ret;
 
 	mutex_lock(&avd->queue_mutex);
-	ret = avd->backend->irq(avd);
+	ret = avd_pm_irq(avd, gen);
 	mutex_unlock(&avd->queue_mutex);
 	return ret;
 }
@@ -518,7 +519,11 @@ static const struct avd_variant avd_t6040_variant = {
 			AVD_CAPABILITY_AV1,
 	/* HEVC only with firmware whose CODECS trailer lists h265. */
 	.fw_caps_required = AVD_CAPABILITY_HEVC,
+
+	/* v5-t2 matches T6040's SRAM aperture, which the queued transport needs. */
 	.fw_name = "apple/avd-fw-v5-t2.bin",
+	.fw_name_fallback = "apple/avd-fw-v5-t1.bin",
+
 	.revision = 4,
 	.vp_slot_offset = 0xc,
 	.submit_offset = 0x40,
@@ -651,6 +656,17 @@ static int avd_probe(struct platform_device *pdev)
 	}
 
 	avd_pm_enable(avd);
+
+	/*
+	 * Boot the firmware once now: the transport and the codec list depend
+	 * on what the loaded image reports, and clients enumerate formats and
+	 * size their contexts before the first decode would power it up.
+	 */
+	ret = pm_runtime_resume_and_get(avd->dev);
+	if (ret < 0)
+		dev_warn(avd->dev, "firmware probe boot failed: %d\n", ret);
+	else
+		pm_runtime_put_autosuspend(avd->dev);
 
 	ret = avd_v4l2_init(avd);
 	if (ret)

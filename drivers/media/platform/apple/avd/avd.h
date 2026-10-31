@@ -128,6 +128,8 @@ struct avd_decoded_buffer {
 	/* Pending CPU fill, retained with the buffer until dequeue. */
 	size_t grey_chroma_offset;
 	bool grey_chroma_10bit;
+	/* H.264/HEVC: scratch bank + 1 of the picture decoded into this buffer */
+	u8 bank;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
@@ -149,6 +151,8 @@ struct avd_coded_fmt_ops {
 	void (*adjust_decoded_fmt)(struct avd_ctx *ctx,
 			struct v4l2_pix_format_mplane *pix_mp);
 	void (*submit)(struct avd_ctx *ctx);
+	/* PP EXEC commands the last built frame needs (submit's count), >= 1. */
+	unsigned int (*pp_kicks)(struct avd_ctx *ctx);
 	int (*start)(struct avd_ctx *ctx);
 	void (*stop)(struct avd_ctx *ctx);
 	int (*run)(struct avd_ctx *ctx);
@@ -200,6 +204,8 @@ struct avd_variant {
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,
 			u8 fifo_idx, u32 vp_slot);
 	const char* fw_name;
+	/* Older image tried when fw_name is not installed (legacy transport). */
+	const char *fw_name_fallback;
 	unsigned char revision; /* the same as the device tree */
 	/* just for convenience */
 	u32 vp_slot_offset;
@@ -242,7 +248,6 @@ struct avd_dev {
 	u64 frame_seq;
 	unsigned int inflight;
 	int queue_error;
-	void *open_priv;
 	bool stopping;
 	bool faulted;
 	u64 fw_generation;
@@ -250,13 +255,19 @@ struct avd_dev {
 	void *backend_priv;
 	/* Only the open-firmware compatibility path uses these. */
 	struct avd_frame *building;
+	/* Open firmware queue ABI 2 state, NULL when the node has no SRAM. */
+	struct avd_qfw *qfw;
 	struct avd_frame *compat_active;
+	/* Context of the last legacy submission, for VP DONE without a frame. */
+	struct avd_ctx *compat_ctx;
 	bool compat_held;
 
 	struct reset_control *rstc;
 
 	const struct avd_variant *variant;
 	unsigned int capabilities;
+	/* What the loaded image's CODECS trailer (or its absence) allows. */
+	unsigned int fw_capabilities;
 };
 
 struct avd_segment {
@@ -302,6 +313,10 @@ struct avd_ctx {
 
 	struct avd_comp comp;
 	int fifo_idx;
+	/* Pictures of this context the queue may hold at once (0 or 1: one). */
+	unsigned int max_frames;
+	/* VP to PP FIFO for the job being built; 0 means ctx->inst. */
+	dma_addr_t job_fifo;
 	struct avd_job job;
 	struct avd_buf inst;
 };
@@ -366,16 +381,17 @@ void avd_queue_drain(struct avd_ctx *ctx);
 void avd_queue_add_ctx(struct avd_ctx *ctx);
 void avd_queue_del_ctx(struct avd_ctx *ctx);
 int avd_open_build_program(struct avd_ctx *ctx);
-int avd_open_queue_probe(struct avd_dev *avd);
-void avd_open_queue_cleanup(struct avd_dev *avd);
-int avd_open_queue_boot(struct avd_dev *avd);
-bool avd_open_is_queued(struct avd_dev *avd);
-unsigned int avd_open_queue_max(struct avd_dev *avd);
-int avd_open_queue_submit(struct avd_dev *avd, struct avd_frame *f);
-irqreturn_t avd_open_queue_irq(struct avd_dev *avd);
 extern const struct avd_backend_ops avd_open_backend;
 extern const struct avd_backend_ops avd_apple_backend;
+extern const struct avd_backend_ops avd_qfw_backend;
+struct avd_qfw;
+int avd_qfw_probe(struct avd_dev *avd);
+void avd_qfw_cleanup(struct avd_dev *avd);
+void avd_qfw_select(struct avd_dev *avd);
+void avd_qfw_prepare_boot(struct avd_dev *avd);
+bool avd_backend_is_qfw(const struct avd_dev *avd);
 int avd_backend_select(struct avd_dev *avd);
+bool avd_mbox_pop(struct avd_dev *avd, u32 *msg);
 int avd_backend_boot(struct avd_dev *avd);
 void avd_shutdown(struct avd_dev *avd);
 

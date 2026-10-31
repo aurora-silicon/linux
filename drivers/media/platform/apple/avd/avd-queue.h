@@ -52,6 +52,8 @@ struct avd_frame {
 	unsigned long deadline;		/* jiffies, per-frame watchdog */
 	/* Legacy m2m HOLD_CAPTURE API retains scheduler ownership until retire. */
 	bool scheduler_held;
+	/* VP to PP instruction FIFO for this frame (open backends). */
+	dma_addr_t fifo_iova;
 };
 
 struct avd_backend_ops {
@@ -64,6 +66,8 @@ struct avd_backend_ops {
 	void (*session_stop)(struct avd_ctx *ctx);	/* apple: cmd 2 */
 	/* Non-blocking. -EBUSY means inbox full: core retries on next completion. */
 	int  (*submit)(struct avd_dev *avd, struct avd_frame *f);
+	/* Bounded producer work: >0 retry shortly, <0 reset before retirement. */
+	int  (*pump)(struct avd_dev *avd);
 	void (*abort)(struct avd_ctx *ctx);		/* apple: cmd 5 */
 	irqreturn_t (*irq)(struct avd_dev *avd);	/* calls avd_frame_complete() */
 	int  (*suspend)(struct avd_dev *avd);

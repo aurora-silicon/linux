@@ -45,7 +45,10 @@ int avd_open_build_program(struct avd_ctx *ctx)
 		AVD_OP_EXEC_REV3_VP9_MASK : 0;
 	start = AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
 		AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3);
-	ctx->fifo_idx = avd_open_is_queued(avd) ? f->idx : 0;
+	/* The queued transport gives every frame in flight its own FIFO. */
+	ctx->fifo_idx = avd_backend_is_qfw(avd) ? f->idx : 0;
+	f->fifo_iova = ctx->job_fifo ?: ctx->inst.addr;
+	ctx->job_fifo = 0;
 	words = f->prog->cpu;
 	words[pos++] = AVD_OP_EXEC | mask | start | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx);
 	for (i = 0; i <= job->num; i++) {
@@ -65,7 +68,7 @@ int avd_open_build_program(struct avd_ctx *ctx)
 
 static unsigned int avd_open_max_inflight(struct avd_dev *avd)
 {
-	return avd_open_queue_max(avd);
+	return 1;
 }
 
 static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
@@ -76,8 +79,6 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	unsigned int i;
 	void __iomem *reg;
 
-	if (avd_open_is_queued(avd))
-		return avd_open_queue_submit(avd, f);
 	if (avd->compat_active)
 		return -EBUSY;
 	/* Native frame_ops require firmware-side PP chaining and tagged replies. */
@@ -95,6 +96,7 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	avd->variant->configure_stream(avd, ctx->inst.addr, ctx->fifo_idx, vp);
 	reg = avd->ctrl + avd->variant->vp_slot_offset + vp * 4;
 	avd->compat_active = f;
+	avd->compat_ctx = ctx;
 	for (i = 0; i < f->prog_words; i++) {
 		/* Preserve the old firmware's segment FIFO pacing in this shim. */
 		if (i && (words[i] & GENMASK(31, 24)) == AVD_OP_EXEC &&
@@ -134,13 +136,20 @@ static irqreturn_t avd_open_irq(struct avd_dev *avd)
 	struct avd_frame *f = avd->compat_active;
 	u32 status;
 
-	if (avd_open_is_queued(avd))
-		return avd_open_queue_irq(avd);
-	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
-
-	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
-	if (!f)
+	if (!avd_mbox_pop(avd, &status))
 		return IRQ_HANDLED;
+	if (!f) {
+		/*
+		 * The old driver kicked PP for every VP DONE. A VP DONE with no
+		 * frame in flight (its frame already completed on a surplus PP
+		 * DONE of a multi-kick picture) still needs that kick, or the
+		 * next picture's PP is never started and it times out.
+		 */
+		if ((status & 0x11000) == 0 && (status & 0x100) && avd->compat_ctx &&
+		    avd->compat_ctx->coded_fmt_desc->ops->submit)
+			avd->compat_ctx->coded_fmt_desc->ops->submit(avd->compat_ctx);
+		return IRQ_HANDLED;
+	}
 	if (status & 0x1000) {
 		avd->compat_active = NULL;
 		avd_frame_complete(avd, f->tag, 0);
@@ -157,8 +166,8 @@ static irqreturn_t avd_open_irq(struct avd_dev *avd)
 }
 
 const struct avd_backend_ops avd_open_backend = {
-	.name = "open",
-	.boot = avd_open_queue_boot,
+	.name = "open-compat",
+	.boot = avd_boot,
 	.shutdown = avd_shutdown,
 	.max_inflight = avd_open_max_inflight,
 	.submit = avd_open_submit,
@@ -184,15 +193,31 @@ static void avd_open_capabilities(struct avd_dev *avd)
 	/* Without a CODECS trailer, keep codecs that need a newer firmware hidden. */
 	avd->capabilities = avd->variant->capabilities &
 			    ~avd->variant->fw_caps_required;
+	avd->fw_capabilities = avd->capabilities;
 	if (!avd->fw || avd->fw->size < 0x40)
 		return;
 	info = (const char *)avd->fw->data + avd->fw->size - 0x40;
 	if (memcmp(info, "CODECS:", 7))
-		return;
+		return;	/* fw_capabilities already set above */
 	avd->capabilities = 0;
 	for (i = 0; i < ARRAY_SIZE(codecs); i++)
 		if (strnstr(info, codecs[i].name, 0x40))
 			avd->capabilities |= avd->variant->capabilities & codecs[i].bit;
+	avd->fw_capabilities = avd->capabilities;
+}
+
+static int avd_open_request_firmware(struct avd_dev *avd)
+{
+	int ret;
+
+	if (!avd->variant->fw_name_fallback)
+		return request_firmware(&avd->fw, avd->variant->fw_name, avd->dev);
+	ret = firmware_request_nowarn(&avd->fw, avd->variant->fw_name, avd->dev);
+	if (ret != -ENOENT)
+		return ret;
+	dev_info(avd->dev, "%s not installed, using %s\n",
+		 avd->variant->fw_name, avd->variant->fw_name_fallback);
+	return request_firmware(&avd->fw, avd->variant->fw_name_fallback, avd->dev);
 }
 
 int avd_backend_select(struct avd_dev *avd)
@@ -211,12 +236,11 @@ int avd_backend_select(struct avd_dev *avd)
 			return ret;
 	}
 	avd->backend = &avd_open_backend;
-	ret = avd_open_queue_probe(avd);
-	if (ret)
-		return ret;
-	ret = request_firmware(&avd->fw, avd->variant->fw_name, avd->dev);
+	ret = avd_open_request_firmware(avd);
 	if (!ret)
 		avd_open_capabilities(avd);
+	if (!ret)
+		ret = avd_qfw_probe(avd);
 	return ret;
 }
 
@@ -224,22 +248,26 @@ int avd_backend_boot(struct avd_dev *avd)
 {
 	int ret;
 
-	if (!avd_backend_is_apple(avd))
+	if (!avd_backend_is_apple(avd)) {
 		avd_pm_prepare_piodma(avd);
+		avd_qfw_prepare_boot(avd);
+	}
 	ret = avd->backend->boot(avd);
 	/* Never switch command ABIs after frames have used this backend. */
 	if (ret == -ENOENT && !avd->fw_generation && avd_backend_is_apple(avd)) {
-		ret = request_firmware(&avd->fw, avd->variant->fw_name, avd->dev);
+		ret = avd_open_request_firmware(avd);
+		if (!ret)
+			ret = avd_qfw_probe(avd);
 		if (ret)
 			return ret;
 		avd->backend = &avd_open_backend;
-		ret = avd_open_queue_probe(avd);
-		if (ret)
-			return ret;
 		avd_open_capabilities(avd);
 		avd_pm_prepare_piodma(avd);
+		avd_qfw_prepare_boot(avd);
 		ret = avd->backend->boot(avd);
 	}
+	if (!ret)
+		avd_qfw_select(avd);
 	if (!ret)
 		avd->fw_generation++;
 	return ret;

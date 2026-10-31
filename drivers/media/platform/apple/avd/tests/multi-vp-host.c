@@ -40,7 +40,7 @@ static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 	t->tags[t->completed++] = f->desc.tag;
 	return 1;
 }
-static const struct avdq_ops ops = { feed, kick, complete };
+static const struct avdq_ops ops = { .feed = feed, .kick = kick, .complete = complete };
 static void submit(struct avdq *q, struct transport *t, unsigned int idx,
 		   struct avd_ctx *ctx, u64 seq, unsigned int context, bool independent)
 {
@@ -76,8 +76,15 @@ int main(void)
 	struct avdq q;
 	int context[2];
 	unsigned int i;
+	u32 chunk;
 	u32 info[7] = { AVD_OPEN_MULTI_MAGIC, AVD_OPEN_MULTI_VERSION };
 
+	assert(!avd_open_ring_chunk(4090, 4080, 4096, 20, &chunk) && chunk == 6);
+	assert(!avd_open_ring_chunk(0xfffffff0U, 0xffffffe0U, 4096, 100, &chunk) && chunk == 16);
+	assert(!avd_open_ring_chunk(0, 0xfffffff0U, 4096, 100, &chunk) && chunk == 100);
+	assert(!avd_open_ring_chunk(4096, 0, 4096, 1, &chunk) && !chunk);
+	assert(avd_open_ring_chunk(4097, 0, 4096, 1, &chunk) == -EIO);
+	assert(avd_open_ring_chunk(0, 0, 6144, 1, &chunk) == -EIO);
 	info[6] = AVD_OPEN_FLAG_MULTI_VP;
 	assert(!avd_open_has_multi(15, info)); /* Old image, stale extension SRAM. */
 	assert(avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));

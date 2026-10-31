@@ -276,6 +276,21 @@ static void avd_open_metadata_capability(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));
 }
 
+static void avd_sram_ring_wrap(struct kunit *test)
+{
+	u32 chunk;
+
+	KUNIT_ASSERT_EQ(test, avd_open_ring_chunk(2, U32_MAX - 1, 4096, 4096, &chunk), 0);
+	KUNIT_EXPECT_EQ(test, chunk, 4092U);
+	KUNIT_ASSERT_EQ(test, avd_open_ring_chunk(U32_MAX - 1, U32_MAX - 1,
+						4096, 10, &chunk), 0);
+	KUNIT_EXPECT_EQ(test, chunk, 2U);
+	KUNIT_ASSERT_EQ(test, avd_open_ring_chunk(4096, 0, 4096, 1, &chunk), 0);
+	KUNIT_EXPECT_EQ(test, chunk, 0U);
+	KUNIT_EXPECT_EQ(test, avd_open_ring_chunk(4097, 0, 4096, 1, &chunk), -EIO);
+	KUNIT_EXPECT_EQ(test, avd_open_ring_chunk(0, 0, 6144, 1, &chunk), -EIO);
+}
+
 static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_slots_and_tags),
 	KUNIT_CASE(avd_retirement_order),
@@ -286,6 +301,7 @@ static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_fifo_limits),
 	KUNIT_CASE(avd_pp_work_count),
 	KUNIT_CASE(avd_open_metadata_capability),
+	KUNIT_CASE(avd_sram_ring_wrap),
 	{}
 };
 
