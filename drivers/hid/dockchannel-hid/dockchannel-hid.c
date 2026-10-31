@@ -1698,7 +1698,11 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		if (!dchid->ring)
 			return -ENOMEM;
 	}
-	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", 0);
+	/*
+	 * Freeze interface creation across system sleep so the HID devices
+	 * stay stable while the suspend and resume callbacks walk them.
+	 */
+	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", WQ_FREEZABLE);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 

@@ -533,11 +533,20 @@ int ane_t6021_fwload_check(struct device *dev)
 
 	if (!fw_load)
 		return 0;
-	ret = request_firmware(&fw, img->name, dev);
+	/*
+	 * The image is installed on the machine itself from Apple's files, so
+	 * a missing file is the normal state of a system that has not fetched
+	 * it yet: say so once and leave the ANE off. Other errors are errors.
+	 */
+	ret = firmware_request_nowarn(&fw, img->name, dev);
+	if (ret == -ENOENT) {
+		dev_info(dev,
+			 "firmware %s is not installed, so the ANE stays off; install it with omarchy-ane-firmware-fetch\n",
+			 img->name);
+		return -ENODEV;
+	}
 	if (ret) {
-		dev_err(dev,
-			"cannot load firmware %s: %d; install it with omarchy-ane-firmware-fetch (or equivalent for your distribution)\n",
-			img->name, ret);
+		dev_err(dev, "cannot load firmware %s: %d\n", img->name, ret);
 		return ret;
 	}
 

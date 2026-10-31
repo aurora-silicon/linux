@@ -909,6 +909,12 @@ void dcp_panel_metadata_replace(struct apple_dcp *dcp,
 			merged.serial = old->serial;
 		if (same_serial && !merged.serial_text[0])
 			memcpy(merged.serial_text, old->serial_text, sizeof(merged.serial_text));
+		/* Standalone ProductAttributes setters omit the colour description. */
+		if (same_serial && !merged.chromaticity[0][0] && !merged.white[0]) {
+			memcpy(merged.chromaticity, old->chromaticity, sizeof(merged.chromaticity));
+			memcpy(merged.white, old->white, sizeof(merged.white));
+			merged.gamma = old->gamma;
+		}
 		if (!merged.year)
 			merged.year = old->year;
 		if (!merged.week)

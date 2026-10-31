@@ -32,6 +32,7 @@ import rate
 import boot
 import m4
 import display
+import colorimetry
 
 
 def parking_unit(root):
@@ -54,6 +55,7 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),

@@ -375,6 +375,34 @@ static void mt_6g_legacy_vlp_finite_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ap.mode, MT7932_6G_LPI);
 }
 
+static void mt_6g_tpe_golden_test(struct kunit *test)
+{
+	/* Default-client EIRP: 20/40/80 MHz caps, including a signed cap and
+	 * the no-limit sentinel. The unrelated subordinate envelope is ignored.
+	 */
+	static const u8 eirp[] = { 18, 40, 0xf6, 127 };
+	static const u8 subordinate[] = { 82, 0x80, 0x80, 0x80 };
+	static const u8 expected[60] = {
+		[1] = 2, [2] = 60, [4] = 1, 3, 1, 3,
+		[44] = 1, 3, 5, 3,
+		[48] = 24, 0xe6, 127, 127,
+		24, 0xe6, 127, 127, 30, 0xec, 127, 127,
+	};
+	struct mt7932_6g_ap ap = {
+		.mode = MT7932_6G_LPI, .primary = 5,
+		.limit = { 127, 127, 127, 127 },
+	};
+	s8 gain[3][4];
+	u8 body[60];
+
+	KUNIT_ASSERT_EQ(test, mt7932_6g_tpe(&ap, eirp, sizeof(eirp)), 0);
+	KUNIT_ASSERT_EQ(test,
+			mt7932_6g_tpe(&ap, subordinate, sizeof(subordinate)), 0);
+	KUNIT_ASSERT_EQ(test, mt7932_j700_6g_gains(&ap, gain), 0);
+	KUNIT_ASSERT_EQ(test, mt7932_6g_tpe_body(body, 60, &ap, gain), 60);
+	KUNIT_EXPECT_MEMEQ(test, body, expected, sizeof(expected));
+}
+
 static struct kunit_case mt_pmf_lpi_cases[] = {
 	KUNIT_CASE(mt_pmf_admission_test),
 	KUNIT_CASE(mt_pmf_body_test),
@@ -383,6 +411,7 @@ static struct kunit_case mt_pmf_lpi_cases[] = {
 	KUNIT_CASE(mt_6g_j700_gain_test),
 	KUNIT_CASE(mt_6g_finite_projection_test),
 	KUNIT_CASE(mt_6g_legacy_vlp_finite_test),
+	KUNIT_CASE(mt_6g_tpe_golden_test),
 	{}
 };
 
