@@ -35,7 +35,7 @@ Use ``drivers/gpu/drm/apple/tests/hdr.kunitconfig`` with the KUnit runner.
 
 Hardware qualification should use an HDR-capable external monitor and a
 controller-approved candidate boot. On J616s with the MSI monitor, use kmshdr
-or mpv with DRM HDR metadata passthrough and an HDR10 sample carrying known
+or mpv with audio disabled and DRM HDR metadata passthrough and an HDR10 sample carrying known
 mastering primaries, luminance, MaxCLL and MaxFALL. Check the monitor's OSD for
 HDR metadata, change the metadata without changing the timing, and check the
 new values. An HDR indicator alone establishes PQ reception, not the metadata
