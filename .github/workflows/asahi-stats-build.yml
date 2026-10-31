@@ -26,7 +26,16 @@ jobs:
       LLVM: 1
       RUSTUP_TOOLCHAIN: 1.97.1
     steps:
-      - uses: actions/checkout@v4
+      - name: Fetch the exact public source snapshot
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/asahi-stats-source.tar.gz"
+          gh api --allow-escape-sequences "repos/$GITHUB_REPOSITORY/tarball/$GITHUB_SHA" > "$archive"
+          sha256sum "$archive" > "$RUNNER_TEMP/asahi-stats-source.sha256"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/asahi-stats-source.commit"
+          tar -xzf "$archive" --strip-components=1 -C "$GITHUB_WORKSPACE"
       - name: Install build tools
         run: |
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUNNER_TEMP/llvm-key.asc"
@@ -63,7 +72,7 @@ jobs:
       - name: Build and link the ARM64 kernel
         run: |
           set -o pipefail
-          make O=out -j2 Image 2>&1 | tee "$RUNNER_TEMP/asahi-stats-build.log"
+          make O=out -j"$(nproc)" Image 2>&1 | tee "$RUNNER_TEMP/asahi-stats-build.log"
           test -s out/drivers/gpu/drm/asahi/asahi_core.o
           test -s out/drivers/pmdomain/apple/pmp-report.o
           test -s out/arch/arm64/boot/Image
@@ -74,6 +83,8 @@ jobs:
           path: |
             ${{ runner.temp }}/asahi-stats.config
             ${{ runner.temp }}/asahi-stats-build.log
+            ${{ runner.temp }}/asahi-stats-source.sha256
+            ${{ runner.temp }}/asahi-stats-source.commit
           retention-days: 14
   dram-parser:
     runs-on: ubuntu-24.04
