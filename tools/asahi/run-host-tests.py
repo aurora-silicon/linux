@@ -53,6 +53,7 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'test-m3-power.py': [([], PASS)],
     'test-m3-uapi.py': [([], PASS)],
     'test-m3-mailbox.py': [([], PASS)],
     'test-j613-dcp-power.py': [([], PASS)],
