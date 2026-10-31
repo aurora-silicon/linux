@@ -160,8 +160,8 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
 	/* The identity checker requires stable, owned live-page snapshots.
-	 * No backend has acquired those pages or proved startup state and a
-	 * decoded process resource map. Keep this refusal before power access.
+	 * No backend has acquired those pages, proved startup state or resolved
+	 * program resource bindings. Keep this refusal before power access.
 	 */
 	dev_info(dev, "H16 ANE: live preload ownership, HWX ABI and boot backend incomplete; refusing before power access\n");
 	return -EOPNOTSUPP;

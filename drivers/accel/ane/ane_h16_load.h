@@ -20,7 +20,9 @@ struct ane_h16_load_mapping {
 	u32 permissions;
 };
 
-/* Only the reviewed firmware process decoder may produce these bindings. */
+/* Only the backend may resolve these bindings from the validated program
+ * contract. CREATE_PROCESS reply IDs do not describe resource bindings.
+ */
 struct ane_h16_process_binding {
 	u64 hwx_vm;
 	u32 index;
@@ -29,7 +31,7 @@ struct ane_h16_process_binding {
 
 /* Geometry helpers do not prove DMA ownership or install a process. All
  * mappings must be backend-owned and private, with the stated permissions.
- * There is no LOAD/CREATE_PROCESS serializer until their bodies are reviewed.
+ * Wire serialization and process installation are separate backend operations.
  */
 int ane_h16_load_plan_create(const struct ane_h16_hwx_snapshot *snapshot,
 			     struct ane_h16_load_plan *plan);

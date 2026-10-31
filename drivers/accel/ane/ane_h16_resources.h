@@ -5,9 +5,10 @@
 #include "ane_h16_execute.h"
 #include "ane_h16_hwx.h"
 
-/* Created only from a validated HWX and a decoded firmware process resource
- * map. No userspace field may supply this authority. Each mapping is private,
- * coherent DMA memory with no userspace alias, retained for process lifetime.
+/* Created only by the backend matching a validated HWX with reviewed program
+ * resource bindings. No userspace field may supply this authority. Each
+ * mapping is private, coherent DMA memory with no userspace alias, retained
+ * for process lifetime.
  */
 struct ane_h16_resource {
 	u64 hwx_vm;

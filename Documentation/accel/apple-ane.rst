@@ -35,7 +35,7 @@ without MMIO or power access. No disk firmware is requested or staged.
 Missing reservations fail with ``-ENODATA``. Malformed reservations fail
 with ``-EINVAL``. Even a valid handoff currently fails with ``-EOPNOTSUPP``:
 live-page ownership and snapshot acquisition, the original-container
-userspace load ABI, firmware process-resource decoder and cold boot backend
+userspace load ABI, process installation and cold boot backend
 are incomplete. The section-only
 load ABI is explicitly refused for H16. No accel node or program-loading interface is published.
 
@@ -79,7 +79,7 @@ Remaining implementation gates
 
 The preload validator can authenticate owned snapshots of the normalized
 resident image with 42 ordered patchbay records. Live snapshot acquisition,
-the original-container userspace load ABI, process-resource decoder and
+the original-container userspace load ABI, resolved program bindings and
 physical boot backend still need implementation. Off-list preload mutations
 remain refused.
 
@@ -129,20 +129,23 @@ original instead of trusting cached metadata, rounds allocations to 16 KiB
 and applies a 512 MiB aggregate host ceiling before any DMA allocation.
 
 The resource geometry helper requires one backend-owned mapping per planned
-segment and one decoded process binding per external surface. It checks
-exact sizes, permissions, alignment, full-width DVA overflow and overlap
-against every other mapping and the resident firmware aperture. Binding VMs,
-classes and unique indices must match the validated surface requirements.
+segment and one binding per external surface, resolved by the backend from
+the validated program contract. It checks exact sizes, permissions,
+alignment, full-width DVA overflow and overlap against every other mapping
+and the resident firmware aperture. Binding VMs, classes and unique indices
+must match the validated surface requirements.
 Failure publishes no partial resource map. The helper checks geometry;
 the backend must separately prove mapping ownership and lifetime.
 
-There is no H16 LOAD_PROGRAM or CREATE_PROCESS body serializer or firmware
-process-resource decoder here. Packet lengths and an inferred returned ID
-do not establish these bodies. No user ID or surface ordinal substitutes for
-a firmware binding, and no load plan installs an executable process. The
-original-HWX userspace ABI remains deferred until it can return a genuine
-backend-created program capability. Channel-5 allocation replies, boot
-publication and H17 direct ownership remain refused.
+There is no H16 LOAD_PROGRAM or CREATE_PROCESS body serializer or backend
+that resolves resources and installs a process here. CREATE_PROCESS reply
+IDs do not supply resource bindings. The backend must resolve them from the
+validated program contract and verify mapping ownership. No user ID or
+surface ordinal substitutes for that authority, and no load plan installs
+an executable process. The original-HWX userspace ABI remains deferred until
+the backend can return a program capability backed by validated resources.
+Channel-5 allocation replies, boot publication and H17 direct ownership
+remain refused.
 
 H16 macOS 27.0 runtime contract
 ------------------------------
@@ -248,8 +251,9 @@ barriers order output reads after completion. Streaming DMA sync APIs must
 not be applied to these coherent allocations. There is no userspace alias
 to code, scratch or live firmware buffers.
 
-The resource map must come from the original HWX and a decoded firmware
-process reply. A userspace index, numeric class or program/process ID cannot
+The backend must resolve the resource map from the original HWX and the
+reviewed program contract, rather than decode it from CREATE_PROCESS reply
+IDs. A userspace index, numeric class or program/process ID cannot
 create that map or confer ownership. Only established input/output classes
 are admitted; custom BAR requests require a validated selector map and
 remain unavailable. The legacy 0x28-byte completion predicate remains
@@ -257,7 +261,7 @@ H14-only. Channel-5 allocation/control/free operations require a validated
 H16 reply provider and remain unavailable; H14 allocation replies are never
 reused for H16.
 
-No original-container load ABI or H16 process-resource decoder is supplied
+No original-container load ABI or H16 process installer is supplied
 by this change. Consequently no H16 process can yet be installed, inference
 remains refused and no accel node is registered. The submission integration
 is preparatory and does not open the boot, preload, ownership, firmware
