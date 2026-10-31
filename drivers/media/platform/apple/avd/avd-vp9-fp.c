@@ -64,7 +64,7 @@ static int pack_v3(struct avd_frame *f, const struct v4l2_ctrl_vp9_frame *frame,
 		   dma_addr_t probs_addr)
 {
 	u8 *fp = f->fp->cpu;
-	const u8 *prog = f->prog->cpu;
+	const u8 *prog;
 	bool intra = frame->flags & (V4L2_VP9_FRAME_FLAG_KEY_FRAME |
 				    V4L2_VP9_FRAME_FLAG_INTRA_ONLY);
 	u32 tiles;
@@ -73,6 +73,7 @@ static int pack_v3(struct avd_frame *f, const struct v4l2_ctrl_vp9_frame *frame,
 	if (frame->tile_cols_log2 > 4 || frame->tile_rows_log2 > 2 ||
 	    !f->prog || !f->prog->cpu)
 		return -EINVAL;
+	prog = f->prog->cpu;
 	tiles = (1U << frame->tile_cols_log2) * (1U << frame->tile_rows_log2);
 	if (f->prog_words < header_words + tiles * 5 || probs_addr >> 40)
 		return -EINVAL;

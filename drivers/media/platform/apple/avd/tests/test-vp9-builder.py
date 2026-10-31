@@ -6,6 +6,7 @@ No kernel or target is needed. This deliberately exercises real C, including
 truncated tile headers, overflows, output bounds and the 4 GiB address carry.
 """
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -212,5 +213,5 @@ with tempfile.TemporaryDirectory(prefix='avd-vp9-host-') as tmp:
     c.write_text(prefix + function('vp9_push') + '\n' + function('set_tiles') + '\n' + function('vp9_finish_program') + '\n' + function('vp9_get_maps') + '\n' + function('vp9_put_maps') + '\n' + function('vp9_publish_map') + tests)
     exe = Path(tmp) / 'test'
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
-                    '-Werror', '-Wno-unused-parameter', str(c), '-o', str(exe)], check=True)
+                    '-Werror', '-Wno-unused-parameter', *shlex.split(os.environ.get('CFLAGS', '')), str(c), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

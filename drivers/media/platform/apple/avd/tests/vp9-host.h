@@ -17,9 +17,9 @@ typedef uint64_t dma_addr_t;
 #define U32_MAX UINT32_MAX
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define V4L2_VP9_FRAME_FLAG_KEY_FRAME 1
-#define V4L2_VP9_FRAME_FLAG_INTRA_ONLY 4
-#define V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX 0x100
-#define V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE 0x200
+#define V4L2_VP9_FRAME_FLAG_INTRA_ONLY 8
+#define V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX 0x020
+#define V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE 0x040
 #define AVD_MAX_FRAMES 16
 #define AVD_VP9_PROBS_SIZE 0x774
 /* Kept in the same order as the public production enum. */
