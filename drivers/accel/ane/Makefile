@@ -10,7 +10,8 @@ ane-y := \
 	ane_drv.o \
 	ane_tm.o \
 	ane_dart.o \
-	ane_perf.o
+	ane_perf.o \
+	ane_boost.o
 
 ane_t6021-y := \
 	ane_fw_platform.o \
