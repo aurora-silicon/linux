@@ -73,6 +73,7 @@ static int devm_pm_domain_attach_list(struct device *d,
 static int pm_runtime_set_suspended(struct device *d)
 {
     assert(!d->enabled);
+    assert(fw_probes == 1 && !fw_error);
     state_updates++;
     if (state_error) return state_error;
     d->suspended = true;
@@ -82,6 +83,7 @@ static int pm_runtime_set_suspended(struct device *d)
 static void pm_runtime_set_autosuspend_delay(struct device *d, unsigned delay)
 { (void)d; assert(delay == 2000); }
 static void pm_runtime_use_autosuspend(struct device *d) { (void)d; }
+static void pm_runtime_dont_use_autosuspend(struct device *d) { (void)d; }
 static int devm_pm_runtime_enable(struct device *d)
 {
     assert(!d->enabled);
@@ -89,7 +91,12 @@ static int devm_pm_runtime_enable(struct device *d)
     d->enabled = true;
     return 0;
 }
-static int ave_fw_probe(struct ave_dev *a) { (void)a; fw_probes++; return fw_error; }
+static int ave_fw_probe(struct ave_dev *a)
+{
+    assert(!a->dev->enabled && a->dev->supplier_refs == 7);
+    fw_probes++;
+    return fw_error;
+}
 static void ave_fw_remove(struct ave_dev *a) { (void)a; fw_removes++; }
 static int ave_v4l2_register(struct ave_dev *a)
 {
@@ -132,15 +139,15 @@ int main(void)
     reset(&p);
     state_error = -EBUSY;
     assert(ave_probe(&p) == -EBUSY);
-    assert(!p.dev.enabled && !fw_probes && !registrations);
+    assert(!p.dev.enabled && fw_probes == 1 && fw_removes == 1 && !registrations);
     reset(&p);
     enable_error = -ENOMEM;
     assert(ave_probe(&p) == -ENOMEM);
-    assert(!p.dev.supplier_refs && !fw_probes && !registrations);
+    assert(!p.dev.supplier_refs && fw_probes == 1 && fw_removes == 1 && !registrations);
     reset(&p);
     fw_error = -EINVAL;
     assert(ave_probe(&p) == -EINVAL);
-    assert(!p.dev.supplier_refs && !registrations);
+    assert(p.dev.supplier_refs == 7 && !state_updates && !p.dev.enabled && !registrations);
     reset(&p);
     register_error = -EIO;
     assert(ave_probe(&p) == -EIO);
@@ -161,10 +168,10 @@ def main():
     start = source.index('static int ave_probe(')
     probe = source[start:source.index('\n}', start) + 2]
     if args.negative_control:
-        old = '\tret = pm_runtime_set_suspended(dev);\n\tif (ret)\n\t\treturn ret;\n'
+        old = '\tret = pm_runtime_set_suspended(dev);'
         if probe.count(old) != 1:
             raise SystemExit('cannot locate the production fix for the negative control')
-        probe = probe.replace(old, '')
+        probe = probe.replace(old, '\tret = 0;')
     with tempfile.TemporaryDirectory(prefix='ave-probe-pm-') as tmp:
         out = args.out or Path(tmp)
         out.mkdir(parents=True, exist_ok=True)
