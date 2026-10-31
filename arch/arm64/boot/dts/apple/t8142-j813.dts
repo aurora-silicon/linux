@@ -14,6 +14,7 @@
 / {
 	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M5, 2026)";
+	chassis-type = "laptop";
 
 	#address-cells = <2>;
 	#size-cells = <2>;

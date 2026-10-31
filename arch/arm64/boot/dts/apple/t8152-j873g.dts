@@ -14,6 +14,7 @@
 / {
 	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
 	model = "Apple Mac mini (M6)";
+	chassis-type = "desktop";
 
 	#address-cells = <2>;
 	#size-cells = <2>;

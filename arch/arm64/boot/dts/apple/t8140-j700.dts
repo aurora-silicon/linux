@@ -15,6 +15,7 @@
 / {
 	compatible = "apple,j700", "apple,t8140", "apple,arm-platform";
 	model = "Apple MacBook Neo";
+	chassis-type = "laptop";
 
 	aliases {
 		nvram = &nvram;
