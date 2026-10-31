@@ -72,7 +72,7 @@ bool avd_open_is_queued(struct avd_dev *avd)
 int avd_open_queue_boot(struct avd_dev *avd)
 {
 	struct avd_open_queue *q = avd->open_priv;
-	u32 info[16], dst, header;
+	u32 info[16], multi[7], dst, header;
 	unsigned int i;
 	int ret;
 
@@ -95,11 +95,6 @@ int avd_open_queue_boot(struct avd_dev *avd)
 		info[i] = readl(q->sram + AVD_OPEN_INFO + i * 4);
 	if (info[0] != AVD_OPEN_MAGIC)
 		return 0;
-	/* ABI 1 images retain the same legacy IRQ path until a queue doorbell. */
-	if (info[1] == 1) {
-		dev_info_once(avd->dev, "queue ABI 1 image uses the open compatibility transport\n");
-		return 0;
-	}
 	if (info[1] != AVD_OPEN_VERSION || info[2] != AVD_MAX_FRAMES ||
 	    info[3] != sizeof(struct avd_open_desc) || info[5] != AVD_OPEN_RING ||
 	    info[6] != AVD_OPEN_PACKET_WORDS || info[10] != avd->variant->fifo_slots ||
@@ -113,6 +108,12 @@ int avd_open_queue_boot(struct avd_dev *avd)
 		ret = -EPROTO;
 		goto shutdown;
 	}
+	for (i = 0; i < ARRAY_SIZE(multi); i++)
+		multi[i] = readl(q->sram + AVD_OPEN_MULTI_INFO + i * 4);
+	if (!avd_open_has_multi(info[9], multi)) {
+		dev_info_once(avd->dev, "firmware uses the open compatibility transport\n");
+		return 0;
+	}
 	/* Both DART stream IDs must be attached to the device's DMA domain. */
 	if (!avd->pm.piodma || !avd->domain ||
 	    of_count_phandle_with_args(avd->dev->of_node, "iommus", "#iommu-cells") < 2) {
@@ -124,8 +125,8 @@ int avd_open_queue_boot(struct avd_dev *avd)
 
 		if (!avd->variant->vp_slots[i])
 			continue;
-		if ((info[11 + i] & 0xff) != base ||
-		    (info[11 + i] >> 8) != avd->variant->vp_slots[i] ||
+		if ((multi[2 + i] & 0xff) != base ||
+		    (multi[2 + i] >> 8) != avd->variant->vp_slots[i] ||
 		    base + avd->variant->vp_slots[i] > info[8]) {
 			ret = -EPROTO;
 			goto shutdown;
@@ -162,7 +163,8 @@ int avd_open_queue_submit(struct avd_dev *avd, struct avd_frame *f)
 	if (f->idx >= avd->variant->fifo_slots || codec > AVD_CODEC_AV1 ||
 	    !(avd->capabilities & BIT(codec)) || !src || !f->prog_words ||
 	    f->prog_words > 0x100000 || f->prog_words > f->prog->size / sizeof(u32) ||
-	    !f->cmd[1] || f->cmd[1] > f->prog_words)
+	    !f->cmd[1] || f->cmd[1] > f->prog_words ||
+	    f->ctx->client_id > AVD_OPEN_CONTEXT_MASK || f->dep > AVD_DEP_PREV_DONE)
 		return -EINVAL;
 	if (!(readl(avd->mbox + OPEN_MBOX0_STATUS) & OPEN_MBOX0_EMPTY))
 		return -EBUSY;
@@ -193,16 +195,23 @@ int avd_open_queue_submit(struct avd_dev *avd, struct avd_frame *f)
 	desc.magic = cpu_to_le32(AVD_OPEN_MAGIC);
 	desc.tag = cpu_to_le32(f->tag);
 	desc.codec = cpu_to_le32(codec);
-	desc.fifo = cpu_to_le32(f->idx);
+	desc.vp_slot = cpu_to_le32(avd->variant->vp_slot_base[codec]);
+	desc.pp_kick = cpu_to_le32(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(f->idx) |
+		AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots) |
+		AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
+		AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3) |
+		(codec == AVD_CODEC_VP9 && avd->variant->revision == 3 ?
+		 AVD_OP_EXEC_REV3_VP9_MASK : 0));
 	desc.program_lo = cpu_to_le32(lower_32_bits(packet->addr));
 	desc.program_hi = cpu_to_le32(upper_32_bits(packet->addr));
 	desc.program_words = cpu_to_le32(f->prog_words);
-	desc.num_segments = cpu_to_le32(f->cmd[1]);
 	desc.state = cpu_to_le32(1);
-	desc.context = cpu_to_le32(f->ctx->client_id);
-	desc.dependency = cpu_to_le32(f->dep);
-	desc.fifo_lo = cpu_to_le32(lower_32_bits(fifo->addr));
-	desc.fifo_hi = cpu_to_le32(upper_32_bits(fifo->addr));
+	desc.reserved[0] = cpu_to_le32(AVD_OPEN_FLAG_MULTI_VP);
+	desc.reserved[1] = cpu_to_le32(f->ctx->client_id |
+		(f->dep == AVD_DEP_PREV_DONE ? AVD_OPEN_CONTEXT_DEP : 0));
+	desc.reserved[2] = cpu_to_le32(lower_32_bits(fifo->addr));
+	desc.reserved[3] = cpu_to_le32(upper_32_bits(fifo->addr));
+	desc.reserved[4] = cpu_to_le32(f->cmd[1]);
 	record = q->sram + AVD_OPEN_RING + f->idx * sizeof(desc);
 	dma_wmb();
 	memcpy_toio(record, &desc, sizeof(desc));

@@ -6,6 +6,7 @@
 #include "avd.h"
 #include "avd-apple-protocol.h"
 #include "avd-queue-internal.h"
+#include "avd-open-protocol.h"
 
 static void avd_slots_and_tags(struct kunit *test)
 {
@@ -249,6 +250,17 @@ static void avd_pp_work_count(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, ctx->job.segments, NULL);
 }
 
+static void avd_open_metadata_capability(struct kunit *test)
+{
+	u32 info[7] = { AVD_OPEN_MULTI_MAGIC, AVD_OPEN_MULTI_VERSION };
+
+	info[6] = AVD_OPEN_FLAG_MULTI_VP;
+	KUNIT_EXPECT_FALSE(test, avd_open_has_multi(15, info));
+	KUNIT_EXPECT_TRUE(test, avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));
+	info[1]++;
+	KUNIT_EXPECT_FALSE(test, avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));
+}
+
 static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_slots_and_tags),
 	KUNIT_CASE(avd_retirement_order),
@@ -258,6 +270,7 @@ static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_dispatch_reservation),
 	KUNIT_CASE(avd_fifo_limits),
 	KUNIT_CASE(avd_pp_work_count),
+	KUNIT_CASE(avd_open_metadata_capability),
 	{}
 };
 

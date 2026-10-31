@@ -75,7 +75,7 @@ struct avd_backend_ops {
 struct avd_codec_frame_ops {
 	/* Read the request's controls, set f->dep, fill f->prog (open backend)
 	 * or f->fp (apple backend), allocate f->codec_priv if needed. */
-	/* Open ABI 2: cmd[0] = codec, cmd[1] = codec PP EXEC count.
+	/* Open multi-VP extension: cmd[0] = codec, cmd[1] = codec PP EXEC count.
 	 * All VP EXECs use FIFO index f->idx. Core defaults to PREV_DONE;
 	 * use NONE only when reference and codec-state independence is proven.
 	 */

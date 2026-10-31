@@ -56,12 +56,15 @@ static void submit(struct avdq *q, struct transport *t, unsigned int idx,
 	wire.magic = AVD_OPEN_MAGIC;
 	wire.tag = h->tag;
 	wire.codec = AVDQ_HEVC;
-	wire.fifo = idx;
+	wire.vp_slot = 0;
+	wire.pp_kick = AVDQ_EXEC | (idx << 4);
 	wire.program_lo = 0x4000;
-	wire.program_words = wire.num_segments = wire.state = 1;
-	wire.context = context;
-	wire.dependency = h->dep;
-	wire.fifo_lo = 0x1000000 + idx * 0x1000000;
+	wire.program_words = wire.state = 1;
+	wire.reserved[0] = AVD_OPEN_FLAG_MULTI_VP;
+	wire.reserved[4] = 1;
+	wire.reserved[1] = context |
+		(h->dep == AVD_DEP_PREV_DONE ? AVD_OPEN_CONTEXT_DEP : 0);
+	wire.reserved[2] = 0x1000000 + idx * 0x1000000;
 	_Static_assert(sizeof(wire) == sizeof(desc), "host/firmware ABI mismatch");
 	memcpy(&desc, &wire, sizeof(desc));
 	h->state = AVD_FRAME_SUBMITTED;
@@ -73,6 +76,13 @@ int main(void)
 	struct avdq q;
 	int context[2];
 	unsigned int i;
+	u32 info[7] = { AVD_OPEN_MULTI_MAGIC, AVD_OPEN_MULTI_VERSION };
+
+	info[6] = AVD_OPEN_FLAG_MULTI_VP;
+	assert(!avd_open_has_multi(15, info)); /* Old image, stale extension SRAM. */
+	assert(avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));
+	info[1]++;
+	assert(!avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));
 
 	assert(avd_inflight_limit(7, 16) == 7);
 	assert(avd_inflight_limit(15, 16) == 15);
