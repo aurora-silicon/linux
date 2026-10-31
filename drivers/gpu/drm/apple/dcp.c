@@ -1651,6 +1651,14 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 {
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
+	/*
+	 * A DP2HDMI output asserts its own HPD, in dcp_enable_dp2hdmi_hpd(), and
+	 * that firmware never sends the link-configuration notification the wait
+	 * below looks for, so on this path the wait can only time out. Treat it as
+	 * non-fatal, as the late-HPD and compact cases do, instead of withdrawing
+	 * the display.
+	 */
+	bool dp2hdmi = dcp->hdmi_hpd && !dcp_is_typec_output(dcp);
 	bool compact;
 	unsigned long timeout;
 	u64 generation;
@@ -1794,7 +1802,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u yet\n", port);
 		ret = 0;
-	} else if (!ret && late_hpd) {
+	} else if (!ret && (late_hpd || dp2hdmi)) {
 		/* Without HPD this firmware does not train: assert it now. */
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u yet, asserting HPD\n",
