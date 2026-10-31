@@ -1002,6 +1002,7 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 									     4;
 
 	av1_ctx->submit_num = tile_info->tile_cols * tile_info->tile_rows;
+	ctx->job.pp_execs = av1_ctx->submit_num;
 
 	for (row = 0; row < tile_info->tile_rows; row++) {
 		for (col = 0; col < tile_info->tile_cols; col++) {

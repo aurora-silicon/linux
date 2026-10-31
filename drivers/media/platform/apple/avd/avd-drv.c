@@ -122,6 +122,7 @@ int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 
 	job->codec = codec;
 	job->num = 0;
+	job->pp_execs = 0;
 	/* A table that was built but never submitted still belongs to us. */
 	kvfree(job->segments);
 	job->segments = kvcalloc(segments, sizeof(*job->segments), GFP_KERNEL);
@@ -367,6 +368,7 @@ static const struct avd_variant avd_t8103_variant = {
 		[AVD_CODEC_H264] = 1,
 		[AVD_CODEC_VP9] = 1,
 	},
+	.vp_slot_base = { 0, 2, 3, 0 },
 	.fifo_slots = 7,
 	.capabilities = AVD_CAPABILITY_HEVC |
 			AVD_CAPABILITY_H264 |
@@ -387,6 +389,7 @@ static const struct avd_variant avd_t6000_variant = {
 		[AVD_CODEC_H264] = 4,
 		[AVD_CODEC_VP9] = 1,
 	},
+	.vp_slot_base = { 0, 4, 8, 9 },
 	.fifo_slots = 15,
 	.capabilities = AVD_CAPABILITY_HEVC |
 			AVD_CAPABILITY_H264 |
@@ -407,6 +410,7 @@ static const struct avd_variant avd_t8112_variant = {
 		[AVD_CODEC_H264] = 4,
 		[AVD_CODEC_VP9] = 1,
 	},
+	.vp_slot_base = { 0, 4, 8, 9 },
 	.fifo_slots = 15,
 	.capabilities = AVD_CAPABILITY_HEVC |
 			AVD_CAPABILITY_H264 |
@@ -427,12 +431,13 @@ static const struct avd_variant avd_t6020_variant = {
 		[AVD_CODEC_H264] = 4,
 		[AVD_CODEC_VP9] = 1,
 	},
+	.vp_slot_base = { 0, 4, 8, 9 },
 	.fifo_slots = 15,
 	.capabilities = AVD_CAPABILITY_HEVC |
 			AVD_CAPABILITY_H264 |
 			AVD_CAPABILITY_VP9,
 	.configure_stream = t8112_configure_stream,
-	.fw_name = "apple/avd-fw-v3-t1.bin",
+	.fw_name = "apple/avd-fw-v3-t2.bin",
 	.revision = 4,
 	.vp_slot_offset = 0xc,
 	.submit_offset = 0x30,
@@ -447,6 +452,7 @@ static const struct avd_variant avd_t8122_variant = {
 		[AVD_CODEC_VP9] = 1,
 		[AVD_CODEC_AV1] = 2,
 	},
+	.vp_slot_base = { 0, 4, 8, 9 },
 	.fifo_slots = 15,
 	.configure_stream = t8122_configure_stream,
 	.capabilities = AVD_CAPABILITY_HEVC |
@@ -497,6 +503,7 @@ static const struct avd_variant avd_t8132_variant = {
 		[AVD_CODEC_VP9] = 1,
 		[AVD_CODEC_AV1] = 3,
 	},
+	.vp_slot_base = { 0, 4, 8, 9 },
 	.fifo_slots = 15,
 	.configure_stream = t8122_configure_stream,
 	.capabilities = AVD_CAPABILITY_HEVC |
@@ -527,12 +534,13 @@ static const struct avd_variant avd_t6040_variant = {
 		[AVD_CODEC_VP9] = 1,
 		[AVD_CODEC_AV1] = 3,
 	},
+	.vp_slot_base = { 0, 4, 8, 9 },
 	.fifo_slots = 15,
 	.configure_stream = t8122_configure_stream,
 	.capabilities = AVD_CAPABILITY_H264 |
 			AVD_CAPABILITY_VP9 |
 			AVD_CAPABILITY_AV1,
-	.fw_name = "apple/avd-fw-v5-t1.bin",
+	.fw_name = "apple/avd-fw-v5-t2.bin",
 	.revision = 4,
 	.vp_slot_offset = 0xc,
 	.submit_offset = 0x40,

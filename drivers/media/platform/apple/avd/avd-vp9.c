@@ -801,6 +801,7 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 	set_tiles(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
 
+	ctx->job.pp_execs = vp9_ctx->submit_num;
 	return avd_submit_job(ctx);
 }
 

@@ -940,6 +940,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		return 0;
 	}
 
+	ctx->job.pp_execs = 1;
 	return avd_submit_job(ctx);
 
 err_free_jobs:

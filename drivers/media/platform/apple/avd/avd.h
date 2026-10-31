@@ -188,6 +188,7 @@ struct avd_apple_hw;
 struct avd_variant {
 	const struct avd_apple_hw *apple;
 	size_t fp_size;
+	/* Number of engines in each codec pool; bases include tier-0 holes. */
 	unsigned int vp_slots[4];
 	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
@@ -235,6 +236,8 @@ struct avd_dev {
 	struct avd_buf *frame_fp[AVD_MAX_FRAMES];
 	u64 frame_seq;
 	unsigned int inflight;
+	int queue_error;
+	void *open_priv;
 	bool stopping;
 	bool faulted;
 	u64 fw_generation;
@@ -258,6 +261,7 @@ struct avd_segment {
 
 struct avd_job {
 	enum avd_codec codec;
+	u32 pp_execs; /* Codec PP work count, distinct from VP program segments. */
 	size_t num;
 	struct avd_segment *segments;
 };
@@ -356,6 +360,12 @@ void avd_queue_drain(struct avd_ctx *ctx);
 void avd_queue_add_ctx(struct avd_ctx *ctx);
 void avd_queue_del_ctx(struct avd_ctx *ctx);
 int avd_open_build_program(struct avd_ctx *ctx);
+int avd_open_queue_probe(struct avd_dev *avd);
+int avd_open_queue_boot(struct avd_dev *avd);
+bool avd_open_is_queued(struct avd_dev *avd);
+unsigned int avd_open_queue_max(struct avd_dev *avd);
+int avd_open_queue_submit(struct avd_dev *avd, struct avd_frame *f);
+irqreturn_t avd_open_queue_irq(struct avd_dev *avd);
 extern const struct avd_backend_ops avd_open_backend;
 extern const struct avd_backend_ops avd_apple_backend;
 int avd_backend_select(struct avd_dev *avd);

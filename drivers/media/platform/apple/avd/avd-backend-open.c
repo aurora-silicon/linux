@@ -44,17 +44,19 @@ int avd_open_build_program(struct avd_ctx *ctx)
 		AVD_OP_EXEC_REV3_VP9_MASK : 0;
 	start = AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
 		AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3);
-	ctx->fifo_idx = 0;
+	ctx->fifo_idx = avd_open_is_queued(avd) ? f->idx : 0;
 	words = f->prog->cpu;
 	words[pos++] = AVD_OP_EXEC | mask | start | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx);
 	for (i = 0; i <= job->num; i++) {
 		for (j = 0; j < job->segments[i].num; j++)
 			words[pos++] = job->segments[i].instructions[j];
 		if (i)
-			words[pos++] = AVD_OP_EXEC | mask | AVD_OP_EXEC_FLAG_END(i == job->num);
+			words[pos++] = AVD_OP_EXEC | mask | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+				AVD_OP_EXEC_FLAG_END(i == job->num);
 	}
 	f->prog_words = pos;
 	f->cmd[0] = job->codec;
+	f->cmd[1] = job->pp_execs;
 	kvfree(job->segments);
 	job->segments = NULL;
 	return 0;
@@ -62,7 +64,7 @@ int avd_open_build_program(struct avd_ctx *ctx)
 
 static unsigned int avd_open_max_inflight(struct avd_dev *avd)
 {
-	return 1;
+	return avd_open_queue_max(avd);
 }
 
 static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
@@ -73,6 +75,8 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	unsigned int i;
 	void __iomem *reg;
 
+	if (avd_open_is_queued(avd))
+		return avd_open_queue_submit(avd, f);
 	if (avd->compat_active)
 		return -EBUSY;
 	/* Native frame_ops require firmware-side PP chaining and tagged replies. */
@@ -119,7 +123,11 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 static irqreturn_t avd_open_irq(struct avd_dev *avd)
 {
 	struct avd_frame *f = avd->compat_active;
-	u32 status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
+	u32 status;
+
+	if (avd_open_is_queued(avd))
+		return avd_open_queue_irq(avd);
+	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
 
 	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
 	if (!f)
@@ -140,8 +148,8 @@ static irqreturn_t avd_open_irq(struct avd_dev *avd)
 }
 
 const struct avd_backend_ops avd_open_backend = {
-	.name = "open-compat",
-	.boot = avd_boot,
+	.name = "open",
+	.boot = avd_open_queue_boot,
 	.shutdown = avd_shutdown,
 	.max_inflight = avd_open_max_inflight,
 	.submit = avd_open_submit,
@@ -190,6 +198,9 @@ int avd_backend_select(struct avd_dev *avd)
 			return ret;
 	}
 	avd->backend = &avd_open_backend;
+	ret = avd_open_queue_probe(avd);
+	if (ret)
+		return ret;
 	ret = request_firmware(&avd->fw, avd->variant->fw_name, avd->dev);
 	if (!ret)
 		avd_open_capabilities(avd);
@@ -205,6 +216,9 @@ int avd_backend_boot(struct avd_dev *avd)
 		if (ret)
 			return ret;
 		avd->backend = &avd_open_backend;
+		ret = avd_open_queue_probe(avd);
+		if (ret)
+			return ret;
 		avd_open_capabilities(avd);
 		ret = avd->backend->boot(avd);
 	}

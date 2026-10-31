@@ -88,6 +88,7 @@ static void avd_reset_queue(struct avd_dev *avd, int status)
 	if (ret)
 		dev_err(avd->dev, "queue reset failed: %d\n", ret);
 	avd->compat_active = NULL;
+	avd->queue_error = 0;
 	list_for_each_entry(ctx, &avd->contexts, queue_node)
 		ctx->session_started = false;
 	spin_lock_irqsave(&avd->queue_lock, flags);
@@ -141,6 +142,8 @@ static void avd_queue_worker(struct work_struct *work)
 	mutex_lock(&avd->queue_mutex);
 	if (avd->stopping)
 		goto unlock;
+	if (avd->queue_error)
+		avd_reset_queue(avd, avd->queue_error);
 	for (i = 0; i < AVD_MAX_FRAMES; i++) {
 		bool expired;
 
@@ -217,7 +220,8 @@ int avd_queue_ready(void *priv)
 	ready = !avd->queued_ctx && !READ_ONCE(ctx->draining) &&
 		!READ_ONCE(avd->stopping) &&
 		!READ_ONCE(avd->faulted) &&
-		avd->inflight < avd->backend->max_inflight(avd);
+		avd->inflight < avd_inflight_limit(avd->variant->fifo_slots,
+						    avd->backend->max_inflight(avd));
 	for (i = 0; ready && i < AVD_MAX_FRAMES; i++)
 		if (ctx->next_dep == AVD_DEP_PREV_DONE &&
 		    avd->frames[i].state != AVD_FRAME_FREE && avd->frames[i].ctx == ctx)
@@ -236,7 +240,6 @@ static void avd_queue_submit_work(struct work_struct *work)
 	const struct avd_codec_frame_ops *ops = ctx->coded_fmt_desc->frame_ops;
 	struct avd_frame *f = NULL;
 	unsigned long flags;
-	unsigned int i;
 	int ret;
 
 	mutex_lock(&avd->queue_mutex);
@@ -249,12 +252,9 @@ static void avd_queue_submit_work(struct work_struct *work)
 						 VB2_BUF_STATE_ERROR);
 		goto unlock;
 	}
-	for (i = 0; i < AVD_MAX_FRAMES; i++) {
-		if (avd->frames[i].state == AVD_FRAME_FREE) {
-			f = &avd->frames[i];
-			break;
-		}
-	}
+	f = avd_slot_available(avd->frames,
+		avd_inflight_limit(avd->variant->fifo_slots,
+				   avd->backend->max_inflight(avd)));
 	ret = f ? avd_slot_reserve(f, ctx, ++avd->frame_seq) : -EBUSY;
 	if (!ret)
 		avd->inflight++;
@@ -333,6 +333,10 @@ static void avd_queue_submit_work(struct work_struct *work)
 						 VB2_BUF_STATE_DONE);
 		goto unlock;
 	}
+	/* A complete picture owns its buffers independently of the m2m job.
+	 * Earlier HOLD_CAPTURE_BUF requests took the immediate-retire path.
+	 */
+	f->scheduler_held = false;
 	v4l2_m2m_buf_copy_metadata(f->src, f->dst);
 	if (!f->scheduler_held) {
 		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
