@@ -89,6 +89,14 @@ struct sio_shmem_chan_config {
 	u32 limit;
 } __packed;
 
+/* T6041's native configure record adds one zero/reserved word. */
+struct sio_t6041_chan_config {
+	struct sio_shmem_chan_config legacy;
+	u32 reserved;
+} __packed;
+static_assert(sizeof(struct sio_shmem_chan_config) == 20);
+static_assert(sizeof(struct sio_t6041_chan_config) == 24);
+
 struct sio_data;
 struct sio_tx;
 
@@ -99,7 +107,7 @@ struct sio_chan {
 	struct work_struct terminate_wq;
 
 	bool configured;
-	struct sio_shmem_chan_config cfg;
+	struct sio_t6041_chan_config cfg;
 
 	struct sio_tx *current_tx;
 };
@@ -110,6 +118,8 @@ typedef void (*sio_ack_callback)(struct sio_chan *, void *, bool);
 
 struct sio_hw_data {
 	u32 fifo_threshold;
+	u32 config_size;
+	u32 protocol;
 	bool clear_period_desc;
 	int (*check_boot_tables)(struct device *dev);
 };
@@ -160,30 +170,31 @@ static int sio_send_siomsg_atomic(struct sio_data *sio, u64 msg,
 static int sio_call(struct sio_data *sio, u64 msg);
 
 /*
- * Boot tables of the T6030 SIO firmware, protocol 10. The boot loader builds them from the ADT
- * and passes each one as two apple,sio-firmware-params: the table's IOVA page under its key and
- * its size in bytes under key + 1. Protocol 10 takes six 36-byte DMA shim records and nine device
- * types. A loader without protocol-10 support builds five 32-byte records and eight types, which
- * this firmware cannot use, so the SIO is not started with them.
+ * T6030/T6041 protocol-10 boot tables. The loader builds these from ADT records
+ * and publishes (key, IOVA page), (key + 1, size) pairs. Protocol 10 requires six
+ * 36-byte DMA shim records and nine device types. An older loader builds five
+ * 32-byte records and eight types; refuse those tables before starting SIO.
  */
-#define SIO_T6030_PARAMS_MAX	64	/* key and value pairs */
-#define SIO_T6030_WINDOWS_MAX	8
-#define SIO_T6030_IOVA_LIMIT	BIT_ULL(42)
+#define SIO_V10_PARAMS_MAX	64	/* key and value pairs */
+#define SIO_V10_WINDOWS_MAX	8
+#define SIO_V10_IOVA_LIMIT	BIT_ULL(42)
 /*
  * A parameter goes to the firmware as an endpoint byte (key >> 8) and a
  * parameter byte (key & 0xff), so a wider key would alias another one.
  */
-#define SIO_T6030_KEY_MAX	0xffff
+#define SIO_V10_KEY_MAX	0xffff
 
-struct sio_t6030_window {
+struct sio_v10_window {
 	u64 start;
 	u64 size;
 };
 
-static const struct {
+struct sio_boot_table {
 	u32 key;
 	u32 size;
-} sio_t6030_tables[] = {
+};
+
+static const struct sio_boot_table sio_v10_tables[] = {
 	{ 0x1a, 4 * 16 },	/* map ranges */
 	{ 0x1c, 9 * 8 },	/* device types */
 	{ 0x22, 6 * 36 },	/* DMA shims */
@@ -193,37 +204,39 @@ static const struct {
  * 0 when the parameters hold each protocol-10 table once, at its exact size, entirely inside one
  * of the windows the boot loader mapped for the SIO; -EINVAL otherwise.
  */
-static int sio_t6030_check_params(const u32 *params, unsigned int nparams,
-				  const struct sio_t6030_window *windows, unsigned int nwindows)
+static int sio_check_params(const u32 *params, unsigned int nparams,
+			    const struct sio_v10_window *windows, unsigned int nwindows,
+			    const struct sio_boot_table *tables, unsigned int ntables)
 {
 	unsigned int i, j, t;
 
-	if (!nparams || nparams % 2 || nparams > 2 * SIO_T6030_PARAMS_MAX)
+	if (!nparams || nparams % 2 || nparams > 2 * SIO_V10_PARAMS_MAX)
 		return -EINVAL;
 	for (i = 0; i < nparams; i += 2)
-		if (params[i] > SIO_T6030_KEY_MAX)
+		if (params[i] > SIO_V10_KEY_MAX)
 			return -EINVAL;
 	for (i = 0; i < nparams; i += 2)
 		for (j = i + 2; j < nparams; j += 2)
 			if (params[i] == params[j])
 				return -EINVAL;
 
-	for (t = 0; t < ARRAY_SIZE(sio_t6030_tables); t++) {
+	for (t = 0; t < ntables; t++) {
 		bool have_page = false, have_size = false, inside = false;
 		u64 start = 0, size = 0, end;
 
 		for (i = 0; i < nparams; i += 2) {
-			if (params[i] == sio_t6030_tables[t].key) {
+			if (params[i] == tables[t].key) {
 				start = (u64)params[i + 1] << 12;
 				have_page = true;
-			} else if (params[i] == sio_t6030_tables[t].key + 1) {
+			} else if (params[i] == tables[t].key + 1) {
 				size = params[i + 1];
 				have_size = true;
 			}
 		}
-		if (!have_page || !have_size || size != sio_t6030_tables[t].size)
+		if (!have_page || !have_size || !size ||
+		    (tables[t].size && size != tables[t].size))
 			return -EINVAL;
-		if (check_add_overflow(start, size, &end) || end > SIO_T6030_IOVA_LIMIT)
+		if (check_add_overflow(start, size, &end) || end > SIO_V10_IOVA_LIMIT)
 			return -EINVAL;
 		for (j = 0; j < nwindows && !inside; j++) {
 			u64 window_end;
@@ -238,8 +251,23 @@ static int sio_t6030_check_params(const u32 *params, unsigned int nparams,
 	return 0;
 }
 
+static int sio_v10_check_params(const u32 *params, unsigned int nparams,
+				const struct sio_v10_window *windows, unsigned int nwindows)
+{
+	return sio_check_params(params, nparams, windows, nwindows, sio_v10_tables,
+				ARRAY_SIZE(sio_v10_tables));
+}
+
+/* T6041 also requires all auxiliary buffers before any firmware is started. */
+static const struct sio_boot_table sio_t6041_aux_tables[] = {
+	{ 0x0b, 0x1b80 },
+	{ 0x0f, 0x1e000 },
+	{ 0x1e, 0 }, /* nonempty ADT tunables, variable length */
+	{ 0x30d, 0x4000 },
+};
+
 /* The IOVA windows of this device's memory regions, from their iommu-addresses */
-static int sio_t6030_windows(struct device_node *np, struct sio_t6030_window *windows,
+static int sio_v10_windows(struct device_node *np, struct sio_v10_window *windows,
 			     unsigned int max)
 {
 	struct of_phandle_iterator it;
@@ -290,25 +318,44 @@ static int sio_t6030_windows(struct device_node *np, struct sio_t6030_window *wi
 }
 
 /* 0 when the node's boot tables are protocol-10 tables inside its mapped windows */
-static int sio_t6030_check_node(struct device_node *np)
+static int sio_check_node(struct device_node *np, bool t6041)
 {
-	struct sio_t6030_window windows[SIO_T6030_WINDOWS_MAX];
-	u32 params[2 * SIO_T6030_PARAMS_MAX];
+	struct sio_v10_window windows[SIO_V10_WINDOWS_MAX];
+	u32 params[2 * SIO_V10_PARAMS_MAX];
 	int nparams, nwindows;
 
 	nparams = of_property_count_u32_elems(np, "apple,sio-firmware-params");
 	if (nparams <= 0 || nparams > ARRAY_SIZE(params) ||
 	    of_property_read_u32_array(np, "apple,sio-firmware-params", params, nparams))
 		return -EINVAL;
-	nwindows = sio_t6030_windows(np, windows, ARRAY_SIZE(windows));
+	nwindows = sio_v10_windows(np, windows, ARRAY_SIZE(windows));
 	if (nwindows < 0)
 		return nwindows;
-	return sio_t6030_check_params(params, nparams, windows, nwindows);
+	if (sio_v10_check_params(params, nparams, windows, nwindows))
+		return -EINVAL;
+	if (t6041)
+		return sio_check_params(params, nparams, windows, nwindows, sio_t6041_aux_tables,
+					ARRAY_SIZE(sio_t6041_aux_tables));
+	return 0;
 }
 
-static int sio_t6030_check_boot_tables(struct device *dev)
+static int sio_v10_check_node(struct device_node *np)
 {
-	if (sio_t6030_check_node(dev->of_node)) {
+	return sio_check_node(np, false);
+}
+
+static int sio_t6041_check_boot_tables(struct device *dev)
+{
+	if (sio_check_node(dev->of_node, true)) {
+		dev_err(dev, "missing or invalid protocol-10 SIO handoff; leaving SIO stopped\n");
+		return -ENODEV;
+	}
+	return 0;
+}
+
+static int sio_v10_check_boot_tables(struct device *dev)
+{
+	if (sio_v10_check_node(dev->of_node)) {
 		dev_err(dev, "boot tables are not for SIO protocol 10; leaving the SIO stopped\n");
 		return -ENODEV;
 	}
@@ -316,16 +363,42 @@ static int sio_t6030_check_boot_tables(struct device *dev)
 }
 
 static const struct sio_hw_data sio_hw_generic = {
+	.config_size = sizeof(struct sio_shmem_chan_config),
 	.fifo_threshold = 0x800,
 };
 
 static const struct sio_hw_data sio_hw_t6030 = {
+	.config_size = sizeof(struct sio_shmem_chan_config),
 	.fifo_threshold = 0x600,
 	.clear_period_desc = true,
-	.check_boot_tables = sio_t6030_check_boot_tables,
+	.check_boot_tables = sio_v10_check_boot_tables,
 };
 
+static const struct sio_hw_data sio_hw_t6041 = {
+	.fifo_threshold = 0x600,
+	.config_size = sizeof(struct sio_t6041_chan_config),
+	.protocol = 10,
+	.clear_period_desc = true,
+	.check_boot_tables = sio_t6041_check_boot_tables,
+};
+
+static bool sio_protocol_supported(const struct sio_hw_data *hw, u32 protocol)
+{
+	return !hw->protocol || hw->protocol == protocol;
+}
+
+static void sio_build_chan_config(const struct sio_hw_data *hw, u32 datashape,
+				 struct sio_t6041_chan_config *cfg)
+{
+	memset(cfg, 0, sizeof(*cfg));
+	cfg->legacy.datashape = datashape;
+	cfg->legacy.fifo = 0x800;
+	cfg->legacy.threshold = hw->fifo_threshold;
+	cfg->legacy.limit = 0x800;
+}
+
 static const struct of_device_id sio_of_match[] = {
+	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
 	{ .compatible = "apple,sio", .data = &sio_hw_generic },
 	{ }
@@ -713,7 +786,7 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 	switch (type) {
 	case MSG_STARTED:
 		dev_info(sio->dev, "SIO protocol v%u\n", data);
-		type = MSG_ACK; /* Pretend this is an ACK */
+		type = sio_protocol_supported(sio->hw, data) ? MSG_ACK : MSG_NACK;
 		fallthrough;
 	case MSG_ACK:
 	case MSG_NACK:
@@ -823,33 +896,26 @@ static int sio_device_config(struct dma_chan *chan,
 	struct sio_chan *siochan = to_sio_chan(chan);
 	struct sio_data *sio = siochan->host;
 	bool is_tx = sio_chan_direction(siochan->no) == DMA_MEM_TO_DEV;
-	struct sio_shmem_chan_config *cfg_shmem = sio->shmem;
-	struct sio_shmem_chan_config cfg;
+	void *cfg_shmem = sio->shmem;
+	struct sio_t6041_chan_config cfg;
+	u32 datashape;
 	int ret;
 
 	switch (is_tx ? config->dst_addr_width : config->src_addr_width) {
 	case DMA_SLAVE_BUSWIDTH_1_BYTE:
-		cfg.datashape = 0;
+		datashape = 0;
 		break;
 	case DMA_SLAVE_BUSWIDTH_2_BYTES:
-		cfg.datashape = 1;
+		datashape = 1;
 		break;
 	case DMA_SLAVE_BUSWIDTH_4_BYTES:
-		cfg.datashape = 2;
+		datashape = 2;
 		break;
 	default:
 		return -EINVAL;
 	}
 
-	cfg.timeout = 0;
-	cfg.fifo = 0x800;
-	cfg.limit = 0x800;
-	/*
-	 * The ADT records each client's channel configuration with it (the
-	 * dp-audioN dma-channels: channel, data shape, timeout, FIFO size,
-	 * threshold). T6030's DisplayPort audio channels refill at 0x600.
-	 */
-	cfg.threshold = sio->hw->fifo_threshold;
+	sio_build_chan_config(sio->hw, datashape, &cfg);
 
 	/*
 	 * Dmaengine prescribes we ought to apply the new configuration only
@@ -878,7 +944,7 @@ static int sio_device_config(struct dma_chan *chan,
 	if (siochan->configured && memcmp(&siochan->cfg, &cfg, sizeof(cfg)))
 		return -EBUSY;
 
-	*cfg_shmem = cfg;
+	memcpy(cfg_shmem, &cfg, sio->hw->config_size);
 	dma_wmb();
 
 	ret = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_CONFIGURE) |
