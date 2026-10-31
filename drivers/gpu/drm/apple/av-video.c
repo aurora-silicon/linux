@@ -154,8 +154,8 @@ void av_video_atomic_modeset(struct apple_dcp *dcp, struct apple_connector *conn
 		goto out;
 
 	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
-					     message, sizeof(message), reply, sizeof(reply),
-					     &retcode, &received);
+					      message, sizeof(message), reply, sizeof(reply),
+					      &retcode, &received);
 	ret = dcp_hdr_reply(ret, retcode, reply, received);
 	if (ret) {
 		dev_warn_ratelimited(dcp->dev, "HDR static metadata failed: %d\n", ret);

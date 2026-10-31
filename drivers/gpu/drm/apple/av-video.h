@@ -61,7 +61,7 @@ static inline int dcp_hdr_message(u8 message[DCP_HDR_MESSAGE_SIZE],
 }
 
 static inline int dcp_hdr_reply(int transport, u32 retcode,
-				 const u8 *reply, size_t length)
+				const u8 *reply, size_t length)
 {
 	if (transport)
 		return transport;

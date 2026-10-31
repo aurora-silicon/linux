@@ -630,6 +630,7 @@ struct apple_dcp {
 
 	struct apple_dcp_afkep *avep;
 	struct audiosrv_data *audiosrv;
+	/* Protects the pinned video service and its publication generation. */
 	spinlock_t av_video_lock;
 	struct apple_epic_service *av_video;
 	u64 av_video_generation;

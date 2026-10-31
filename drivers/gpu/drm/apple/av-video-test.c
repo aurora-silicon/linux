@@ -93,5 +93,6 @@ static struct kunit_suite av_video_suite = {
 	.name = "apple-dcp-hdr",
 	.test_cases = av_video_cases,
 };
+
 kunit_test_suite(av_video_suite);
 MODULE_LICENSE("Dual MIT/GPL");

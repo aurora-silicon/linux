@@ -21,3 +21,5 @@ config DRM_APPLE_HDR_KUNIT_TEST
 	help
 	  Test the HDR10 static metadata object encoder, DCPAV message envelope
 	  and reply status validation without Apple display hardware.
+	  Cover unsupported metadata types, CTA primary order, little-endian
+	  luminance fields and malformed replies. No DRM device is required.
