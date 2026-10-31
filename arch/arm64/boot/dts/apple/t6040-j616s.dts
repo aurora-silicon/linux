@@ -322,41 +322,9 @@
 	 * GPU is powered off its sensors report placeholder values from -4 to
 	 * 4 C.
 	 *
-	 * The fans: left to themselves (SMC mode 3, with no OS asking for
-	 * cooling) they stay off, or switch on late and ramp slowly, while the
-	 * dies heat up under load. So the CPU die zone and the GPU zones also
-	 * run both fans through a ladder of active trips; a fan takes the
-	 * highest state any zone asks for and goes back to the SMC once no
-	 * zone asks for anything. States 1-8 of a fan run it from its minimum
-	 * (1350 rpm) to its maximum (5777 rpm) in even steps.
+	 * Fan speeds are governed by the SMC firmware. Manual speeds are
+	 * available only through an explicit userspace fan target request.
 	 */
-#define J616S_FAN_TRIP(label, node, temp, hyst)	\
-	label: node {					\
-		temperature = <temp>;			\
-		hysteresis = <hyst>;			\
-		type = "active";			\
-	};
-
-#define J616S_FAN_TRIPS(zone)					\
-	J616S_FAN_TRIP(zone##_fan1, trip-fan1, 75000, 10000)	\
-	J616S_FAN_TRIP(zone##_fan2, trip-fan2, 80000, 5000)	\
-	J616S_FAN_TRIP(zone##_fan3, trip-fan3, 85000, 5000)	\
-	J616S_FAN_TRIP(zone##_fan4, trip-fan4, 90000, 5000)	\
-	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 95000, 5000)
-
-#define J616S_FAN_MAP(trip_label, node, state)			\
-	node {							\
-		trip = <&trip_label>;				\
-		cooling-device = <&smc_hwmon 0 state state>,	\
-				 <&smc_hwmon 1 state state>;	\
-	};
-
-#define J616S_FAN_MAPS(zone)				\
-	J616S_FAN_MAP(zone##_fan1, map-fan1, 1)		\
-	J616S_FAN_MAP(zone##_fan2, map-fan2, 2)		\
-	J616S_FAN_MAP(zone##_fan3, map-fan3, 3)		\
-	J616S_FAN_MAP(zone##_fan4, map-fan4, 5)		\
-	J616S_FAN_MAP(zone##_fan5, map-fan5, 8)
 
 	thermal-zones {
 		cpu-die-thermal {
@@ -365,7 +333,6 @@
 			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
 			trips {
-				J616S_FAN_TRIPS(cpu_die)
 
 				cpu_die_passive: cpu-die-passive {
 					temperature = <113000>;
@@ -381,7 +348,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(cpu_die)
 
 				map-e {
 					trip = <&cpu_die_passive>;
@@ -928,7 +894,6 @@
 			thermal-sensors = <&smc_hwmon 17>;	/* Tg05 */
 
 			trips {
-				J616S_FAN_TRIPS(gpu0)
 
 				gpu0_passive: trip-passive {
 					temperature = <101000>;
@@ -944,7 +909,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu0)
 
 				map-e {
 					trip = <&gpu0_passive>;
@@ -983,7 +947,6 @@
 			thermal-sensors = <&smc_hwmon 18>;	/* Tg0S */
 
 			trips {
-				J616S_FAN_TRIPS(gpu1)
 
 				gpu1_passive: trip-passive {
 					temperature = <101000>;
@@ -999,7 +962,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu1)
 
 				map-e {
 					trip = <&gpu1_passive>;
@@ -1038,7 +1000,6 @@
 			thermal-sensors = <&smc_hwmon 19>;	/* Tg0Y */
 
 			trips {
-				J616S_FAN_TRIPS(gpu2)
 
 				gpu2_passive: trip-passive {
 					temperature = <101000>;
@@ -1054,7 +1015,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu2)
 
 				map-e {
 					trip = <&gpu2_passive>;
@@ -1093,7 +1053,6 @@
 			thermal-sensors = <&smc_hwmon 20>;	/* Tg0k */
 
 			trips {
-				J616S_FAN_TRIPS(gpu3)
 
 				gpu3_passive: trip-passive {
 					temperature = <101000>;
@@ -1109,7 +1068,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu3)
 
 				map-e {
 					trip = <&gpu3_passive>;
@@ -1148,7 +1106,6 @@
 			thermal-sensors = <&smc_hwmon 21>;	/* Tg0z */
 
 			trips {
-				J616S_FAN_TRIPS(gpu4)
 
 				gpu4_passive: trip-passive {
 					temperature = <101000>;
@@ -1164,7 +1121,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu4)
 
 				map-e {
 					trip = <&gpu4_passive>;
@@ -1203,7 +1159,6 @@
 			thermal-sensors = <&smc_hwmon 22>;	/* Tg1V */
 
 			trips {
-				J616S_FAN_TRIPS(gpu5)
 
 				gpu5_passive: trip-passive {
 					temperature = <101000>;
@@ -1219,7 +1174,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu5)
 
 				map-e {
 					trip = <&gpu5_passive>;
@@ -1258,7 +1212,6 @@
 			thermal-sensors = <&smc_hwmon 23>;	/* Tg1l */
 
 			trips {
-				J616S_FAN_TRIPS(gpu6)
 
 				gpu6_passive: trip-passive {
 					temperature = <101000>;
@@ -1274,7 +1227,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu6)
 
 				map-e {
 					trip = <&gpu6_passive>;
@@ -3851,23 +3803,13 @@
 	};
 };
 
-/*
- * Fan speeds, limits, targets and modes, and the common SMC sensors; every
- * key exists on this machine's SMC. Both fans list their target (F0Tg,
- * F1Tg) and mode (F0Md, F1Md) keys, so with the driver's fan_control
- * parameter fanN_target becomes writable; by default the attributes are
- * read-only, and the thermal zones above drive the fans.
- */
+/* Fan monitoring and explicit userspace manual control. */
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
 
-/*
- * Both fans are cooling devices of the CPU die and GPU zones, as
- * <&smc_hwmon fan-index lower upper>.
- */
 &smc_hwmon {
-	#cooling-cells = <3>;
+	apple,thermal-pressure-key = "mTPL";
 
 	/*
 	 * The SMC accepts a manual speed for both fans once its fan test

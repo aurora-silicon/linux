@@ -625,6 +625,8 @@
 };
 
 &smc_hwmon {
+	apple,thermal-pressure-key = "mTPL";
+
 	/*
 	 * Further channels, reported to userspace. They follow the six CPU
 	 * die temperatures in t8140.dtsi, which the thermal zones above
