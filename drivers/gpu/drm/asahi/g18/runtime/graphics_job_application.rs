@@ -93,10 +93,10 @@ impl ApplicationJob {
         self.guard=Some(guard);self.generation=frame.generation;self.retired=false;
         self.client_frames=if new_client {1} else {self.client_frames.saturating_add(1)};
         if remap {
-            dev_info!(dev.as_ref(),"G18_APP_VM frame={} vm={} context={} target={}x{} aliases={}\n",
+            crate::g18_kick_info!(dev.as_ref(),"G18_APP_VM frame={} vm={} context={} target={}x{} aliases={}\n",
                 frame.generation,vm.id(),self.job.context_id(),render.target.width,render.target.height,self.user_aliases.len());
             for (target,name) in self.job.targets.iter().zip(assembly::TARGET_NAMES) {
-                dev_info!(dev.as_ref(),"G18_APP_TARGET name={} va={:#x} bytes={:#x} context={}\n",
+                crate::g18_kick_info!(dev.as_ref(),"G18_APP_TARGET name={} va={:#x} bytes={:#x} context={}\n",
                     name,target.iova(),target.logical_size,self.job.context_id());
             }
         }
