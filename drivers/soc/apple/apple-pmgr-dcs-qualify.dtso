@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/* LAB ONLY: synthetic tokens, NOT measured bandwidth capacities.
+ * Built into this test kernel. No persistent DTB or m1n1 update required.
+ */
+/dts-v1/;
+/plugin/;
+/ {
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+		 dcs_qualify_opps: dcs-qualification-selector-table {
+		compatible = "operating-points-v2-apple-dcs";
+		opp-7 { opp-level = <7>; opp-peak-kBps = <1>; };
+		opp-8 { opp-level = <8>; opp-peak-kBps = <2>; };
+		opp-9 { opp-level = <9>; opp-peak-kBps = <3>; };
+		opp-10 { opp-level = <10>; opp-peak-kBps = <4>; };
+		opp-11 { opp-level = <11>; opp-peak-kBps = <5>; };
+		opp-12 { opp-level = <12>; opp-peak-kBps = <6>; };
+		opp-13 { opp-level = <13>; opp-peak-kBps = <7>; };
+		opp-14 { opp-level = <14>; opp-peak-kBps = <8>; };
+		opp-15 { opp-level = <15>; opp-peak-kBps = <9>; };
+		 };
+		};
+	};
+	fragment@1 {
+		target-path = "/soc/power-management@28e20c000";
+		__overlay__ {
+			#interconnect-cells = <1>;
+			operating-points-v2 = <&dcs_qualify_opps>;
+			aurora,dcs-qualify;
+		};
+	};
+};

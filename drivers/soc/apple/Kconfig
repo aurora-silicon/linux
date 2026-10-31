@@ -311,6 +311,15 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 	  and nothing changed when the handoff or the device tree's own PMP
 	  topology does not check out.
 
+config APPLE_PMGR_DCS_QUALIFY
+	bool "T600x DCS qualification interface (LAB ONLY)"
+	depends on APPLE_PMGR_MISC=y && INTERCONNECT && DEBUG_FS && OF_OVERLAY
+	default n
+	help
+	  Exposes two root-only ICC votes and register snapshots only when
+	  aurora,dcs-qualify is present in a lab DT. Synthetic selector tokens
+	  in that DT are not bandwidth capacities. Never ship this table.
+
 endmenu
 
 endif

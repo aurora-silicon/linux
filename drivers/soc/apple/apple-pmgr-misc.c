@@ -8,6 +8,10 @@
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/cpufreq.h>
+#include <linux/debugfs.h>
+#include <linux/interconnect.h>
+#include <linux/of_address.h>
+#include <linux/seq_file.h>
 #include <linux/err.h>
 #include <linux/interconnect-provider.h>
 #include <linux/io.h>
@@ -67,6 +71,12 @@ struct apple_pmgr_dcs_opp {
 };
 
 struct apple_pmgr_misc {
+#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_QUALIFY)
+	struct dentry *qualify_dir;
+	struct icc_path *qualify_path[2];
+	u32 qualify_vote[2];
+	struct mutex qualify_lock;
+#endif
 	struct device *dev;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
 
@@ -588,6 +598,8 @@ static bool apple_pmgr_pmp_running(void)
 	return bound;
 }
 
+#include "apple-pmgr-dcs-qualify.c"
+
 /* Raise before any device suspends; noirq then applies the suspend p-state. */
 static int __maybe_unused apple_pmgr_misc_prepare(struct device *dev)
 {
@@ -644,6 +656,7 @@ static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 	}
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
+	dcs_qualify_snapshot(misc, "suspend-noirq-after");
 
 	return 0;
 }
@@ -671,6 +684,7 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	}
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
+	dcs_qualify_snapshot(misc, "resume-noirq-after");
 
 	return 0;
 }
@@ -746,6 +760,9 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
 		apple_pmgr_find_voters(misc);
 		ret = apple_pmgr_dcs_init(misc);
+		if (ret)
+			return ret;
+		ret = dcs_qualify_init(misc);
 		if (ret)
 			return ret;
 		/* Publish only a set-up instance; pairs with the readers' acquire. */
