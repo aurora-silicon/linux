@@ -29,6 +29,10 @@ properties:
           - apple,t8110-dart
           - apple,t6000-dart
       - items:
+          - const: apple,t8140-ane-dart
+          - const: apple,t8140-dart
+          - const: apple,t8110-dart
+      - items:
           - enum:
               - apple,t6000-dart
               - apple,t8112-dart

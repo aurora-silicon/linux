@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* One-shot lead test only. Loader reservations and cold evidence are required.
+ * This DTB deliberately does not manufacture either assertion.
+ */
+#include "t8140-j700.dts"
+
+&ane {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
