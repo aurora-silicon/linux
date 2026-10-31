@@ -292,7 +292,7 @@ Destructive recovery selftest
 
 ``tools/testing/selftests/drivers/ane/recovery.py`` is an explicitly invoked
 hardware test, excluded from the default device-free selftests. It requires
-exclusive ownership of an M1-family ANE, libane, the packaged H13 add fixture,
+exclusive ownership of an M1-family ANE, Python 3, the packaged H13 add fixture,
 and a deliberately invalid convolution program. Run it through the hardware
 controller with a watchdog and kernel-log capture::
 
@@ -321,7 +321,9 @@ stride-2 1x1 128-to-256 convolution at 56-to-28 spatial size, the refused family
 reported to hang the M1 Pro. The compiler checkout is unchanged. No Apple
 binary or private program capture is used. The generator writes a hash receipt;
 the hardware test must fail if this particular instance does not actually
-produce a timeout.
+produce a timeout. The loader pins both fixture hashes and uses ABI 1 ioctls directly, so no
+shared libane library is needed. ``--check-fixtures`` validates the two containers without
+opening a device.
 
 H14 recovery lifecycle
 ----------------------
