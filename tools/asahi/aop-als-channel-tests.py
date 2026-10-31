@@ -46,7 +46,9 @@ trait FakehidListener { fn process_fakehid_report(&self, data:&[u8])->Result<()>
 mod bindings {
  pub const BINDINGS_IIO_CHAN_INFO_PROCESSED:u32=2;
  pub const BINDINGS_IIO_CHAN_INFO_RAW:u32=1;
+ pub const BINDINGS_IIO_CHAN_INFO_SCALE:u32=3;
  pub const IIO_VAL_INT_PLUS_MICRO:u32=2;
+ pub const IIO_VAL_INT_PLUS_NANO:u32=3;
  pub const IIO_VAL_INT:u32=1;
  pub struct iio_dev { pub priv_:*mut std::ffi::c_void }
  pub struct iio_chan_spec { pub type_:u32, pub address:u64 }
