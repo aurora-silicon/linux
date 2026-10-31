@@ -38,6 +38,7 @@ static void avd_retire(struct avd_dev *avd)
 		progress = false;
 		for (i = 0; i < AVD_MAX_FRAMES; i++) {
 			struct avd_ctx *ctx;
+			const struct avd_codec_frame_ops *ops;
 			enum vb2_buffer_state state;
 
 			f = &avd->frames[i];
@@ -49,6 +50,7 @@ static void avd_retire(struct avd_dev *avd)
 			}
 			spin_unlock_irqrestore(&avd->queue_lock, flags);
 			ctx = f->ctx;
+			ops = avd->frame_codec_ops[i];
 			state = f->status ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
 			if (!f->status) {
 				ctx->hw_errors = 0;
@@ -57,13 +59,13 @@ static void avd_retire(struct avd_dev *avd)
 				dev_err(avd->dev, "stream stopped after %u failed frames; restart streaming to retry\n",
 					ctx->hw_errors);
 			}
-			if (ctx->coded_fmt_desc->frame_ops) {
-				if (ctx->coded_fmt_desc->frame_ops->retire)
-					ctx->coded_fmt_desc->frame_ops->retire(ctx, f, state);
+			if (ops) {
+				if (ops->retire)
+					ops->retire(ctx, f, state);
 			} else if (ctx->coded_fmt_desc->ops->done) {
 				ctx->coded_fmt_desc->ops->done(ctx, f->src, f->dst, state);
 			}
-			if (ctx->coded_fmt_desc->frame_ops && f->src->vb2_buf.req_obj.req)
+			if (ops && f->src->vb2_buf.req_obj.req)
 				v4l2_ctrl_request_complete(f->src->vb2_buf.req_obj.req,
 							   &ctx->ctrl_hdl);
 			/* CAPTURE first: OUTPUT completion signals the media request. */
@@ -277,7 +279,7 @@ int avd_queue_ready(void *priv)
 	ready = !READ_ONCE(ctx->draining) && !READ_ONCE(avd->stopping);
 	if (ready && ctx->next_dep == AVD_DEP_PREV_DONE) {
 		/* Legacy codecs may hold several pictures in separate banks. */
-		unsigned int limit = ctx->coded_fmt_desc && !ctx->coded_fmt_desc->frame_ops ?
+		unsigned int limit = ctx->coded_fmt_desc && !avd_get_frame_ops(ctx) ?
 				     max(ctx->max_frames, 1U) : 1, held = 0;
 
 		for (i = 0; i < AVD_MAX_FRAMES; i++)
@@ -294,7 +296,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 {
 	struct avd_ctx *ctx = container_of(work, struct avd_ctx, submit_work);
 	struct avd_dev *avd = ctx->dev;
-	const struct avd_codec_frame_ops *ops = ctx->coded_fmt_desc->frame_ops;
+	const struct avd_codec_frame_ops *ops;
 	struct avd_frame *f = NULL;
 	unsigned long flags;
 	unsigned int i;
@@ -343,6 +345,8 @@ static void avd_queue_submit_work(struct work_struct *work)
 	ret = pm_runtime_resume_and_get(avd->dev);
 	if (ret < 0)
 		goto fail_no_pm;
+	ops = avd_get_frame_ops(ctx);
+	avd->frame_codec_ops[f->idx] = ops;
 	f->src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	f->dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 	/*

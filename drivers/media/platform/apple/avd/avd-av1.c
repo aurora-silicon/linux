@@ -273,6 +273,8 @@ struct avd_av1_run {
 	const struct v4l2_ctrl_av1_tile_group_entry *tile_group;
 	const struct v4l2_ctrl_av1_film_grain *grain;
 	unsigned int num_tiles;
+	/* Ends exclude EXEC words; used only by the legacy transport adapter. */
+	size_t segment_end[V4L2_AV1_MAX_TILE_COUNT + 1];
 };
 
 struct avd_av1_ctx {
@@ -282,6 +284,8 @@ struct avd_av1_ctx {
 	bool prev_updates_cdf;
 	bool have_prev;
 	unsigned long active_slots;
+	struct avd_frame legacy_frame;
+	struct avd_buf legacy_prog;
 };
 
 static void avd_av1_push(struct avd_av1_run *run, u32 inst)
@@ -1170,6 +1174,7 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 					     tile_info->width_in_sbs_minus_1
 						     [tile_group->tile_col]),
 			     "tile_op_end");
+			run->segment_end[tile_id + 1] = run->slot->prog_words;
 			push(AVD_OP_EXEC | AVD_OP_EXEC_FLAG_END(
 				tile_id + 1 == run->num_tiles), "tile_exec");
 		}
@@ -1232,8 +1237,11 @@ static int avd_av1_set_aux(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (!run->cdf_out)
 		return -ENOMEM;
 
-	if (ref && seg_enabled && ref->width == frame->frame_width_minus_1 &&
-	    ref->height == frame->frame_height_minus_1) {
+	if (ref && seg_enabled &&
+	    DIV_ROUND_UP(ref->width + 1, 8) ==
+		DIV_ROUND_UP(frame->frame_width_minus_1 + 1, 8) &&
+	    DIV_ROUND_UP(ref->height + 1, 8) ==
+		DIV_ROUND_UP(frame->frame_height_minus_1 + 1, 8)) {
 		run->seg_in = avd_av1_aux_get(ref->seg);
 		/* The two segmentation addresses let hardware read the previous
 		 * map directly. No speculative CPU copy of an unfinished map. */
@@ -1513,7 +1521,8 @@ static int avd_av1_publish_ref(struct avd_ctx *ctx, struct avd_av1_run *run)
 	avd_av1_aux_put(ctx, ref->seg);
 	ref->cdf = avd_av1_aux_get(run->cdf_out);
 	ref->seg = avd_av1_aux_get(run->seg_out);
-	ref->timestamp = run->base.bufs.dst->vb2_buf.timestamp;
+	/* Core copies source metadata to CAPTURE after prepare returns. */
+	ref->timestamp = run->base.bufs.src->vb2_buf.timestamp;
 	ref->width = run->frame->frame_width_minus_1;
 	ref->height = run->frame->frame_height_minus_1;
 	av1->prev_timestamp = ref->timestamp;
@@ -1563,11 +1572,7 @@ static int avd_av1_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 	/* The control is a fixed-capacity array; only the tile grid is work. */
 	run->num_tiles = run->frame->tile_info.tile_cols *
 		run->frame->tile_info.tile_rows;
-	/* The old builder has no film grain synthesis program. */
-	if (run->grain->flags & V4L2_AV1_FILM_GRAIN_FLAG_APPLY_GRAIN) {
-		ret = -EOPNOTSUPP;
-		goto fail;
-	}
+	/* Preserve the existing open decoder's grain-less output fallback. */
 	for (i = 0; i < V4L2_AV1_REFS_PER_FRAME; i++) {
 		if (run->frame->ref_frame_idx[i] < 0 ||
 		    run->frame->ref_frame_idx[i] >= V4L2_AV1_TOTAL_REFS_PER_FRAME) {
@@ -1597,6 +1602,7 @@ static int avd_av1_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 	avd_av1_push(run, AVD_OP_EXEC |
 		AVD_OP_EXEC_FLAG_START_REV4(ctx->dev->variant->revision == 4));
 	set_header(ctx, run);
+	run->segment_end[0] = f->prog_words;
 	set_tiles(ctx, run);
 	if (run->error) {
 		ret = run->error;
@@ -1641,6 +1647,88 @@ static void avd_av1_retire(struct avd_ctx *ctx, struct avd_frame *f,
 	clear_bit(f->idx, &av1->active_slots);
 }
 
+/*
+ * The open transports still consume legacy segments and PP kick counts. Keep
+ * that interface until they accept native frame_ops. All packing and auxiliary
+ * ownership stay in prepare/retire; only this adapter accesses the legacy job.
+ */
+static int avd_av1_run(struct avd_ctx *ctx)
+{
+	struct avd_av1_ctx *av1 = ctx->priv;
+	struct avd_frame *f = &av1->legacy_frame;
+	struct avd_av1_run *run;
+	struct avd_run base;
+	const __le32 *words;
+	size_t pos = 1, end, i, j;
+	int ret;
+
+	avd_run_preamble(ctx, &base);
+	if (!av1->legacy_prog.cpu) {
+		ret = avd_buf_alloc(ctx->dev, &av1->legacy_prog,
+			(AVD_MAX_INST + 1) * (V4L2_AV1_MAX_TILE_COUNT + 1) * sizeof(u32));
+		if (ret)
+			goto complete_controls;
+	}
+	f->src = base.bufs.src;
+	f->dst = base.bufs.dst;
+	f->prog = &av1->legacy_prog;
+	f->seq++;
+	ret = avd_av1_prepare(ctx, f);
+	if (ret)
+		goto complete_controls;
+	run = f->codec_priv;
+	ret = avd_init_job(ctx, AVD_CODEC_AV1, run->num_tiles + 1);
+	if (ret)
+		goto retire;
+	words = f->prog->cpu;
+	for (i = 0; i <= run->num_tiles; i++) {
+		struct avd_segment *seg = &ctx->job.segments[i];
+
+		end = run->segment_end[i];
+		if (end < pos || end - pos > AVD_MAX_INST) {
+			ret = -EOVERFLOW;
+			goto retire;
+		}
+		seg->num = end - pos;
+		for (j = 0; j < seg->num; j++)
+			seg->instructions[j] = le32_to_cpu(words[pos + j]);
+		pos = end + !!i;
+	}
+	ctx->job.num = run->num_tiles;
+	avd_run_postamble(ctx, &base);
+	ret = avd_submit_job(ctx);
+	if (!ret)
+		return 0;
+	avd_av1_retire(ctx, f, VB2_BUF_STATE_ERROR);
+	return ret;
+retire:
+	avd_av1_retire(ctx, f, VB2_BUF_STATE_ERROR);
+complete_controls:
+	avd_run_postamble(ctx, &base);
+	return ret;
+}
+
+static void avd_av1_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src,
+			 struct vb2_v4l2_buffer *dst, enum vb2_buffer_state state)
+{
+	struct avd_av1_ctx *av1 = ctx->priv;
+
+	avd_av1_retire(ctx, &av1->legacy_frame, state);
+}
+
+static unsigned int avd_av1_pp_kicks(struct avd_ctx *ctx)
+{
+	struct avd_av1_ctx *av1 = ctx->priv;
+	struct avd_av1_run *run = av1->legacy_frame.codec_priv;
+
+	return run ? run->num_tiles : 1;
+}
+
+static void avd_av1_submit(struct avd_ctx *ctx)
+{
+	avd_open_av1_submit(ctx, avd_av1_pp_kicks(ctx));
+}
+
 static void avd_av1_stop(struct avd_ctx *ctx)
 {
 	struct avd_av1_ctx *av1 = ctx->priv;
@@ -1655,6 +1743,7 @@ static void avd_av1_stop(struct avd_ctx *ctx)
 		list_del(&ref->node);
 		kfree(ref);
 	}
+	avd_buf_free(ctx->dev, &av1->legacy_prog);
 	kfree(av1);
 	ctx->priv = NULL;
 }
@@ -1667,6 +1756,8 @@ static int avd_av1_start(struct avd_ctx *ctx)
 	if (!av1)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&av1->refs);
+	/* The embedded legacy frame must retire before this ctx runs again. */
+	ctx->max_frames = 1;
 	ctx->priv = av1;
 	return 0;
 }
@@ -1729,6 +1820,10 @@ const struct avd_coded_fmt_ops avd_av1_fmt_ops = {
 	.adjust_decoded_fmt = avd_av1_adjust_decoded_fmt,
 	.start = avd_av1_start,
 	.stop = avd_av1_stop,
+	.run = avd_av1_run,
+	.done = avd_av1_done,
+	.submit = avd_av1_submit,
+	.pp_kicks = avd_av1_pp_kicks,
 	.try_ctrl = avd_av1_try_ctrl,
 	.get_image_fmt = avd_av1_get_image_fmt,
 };

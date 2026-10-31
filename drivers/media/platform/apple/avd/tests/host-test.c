@@ -1,4 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+static int avd_submit_job(struct avd_ctx *c)
+{
+ legacy_sent_words=0;
+ legacy_sent[legacy_sent_words++]=AVD_OP_EXEC|AVD_OP_EXEC_FLAG_START_REV4(c->dev->variant->revision==4);
+ for(size_t i=0;i<=c->job.num;i++) {
+  for(size_t j=0;j<c->job.segments[i].num;j++)legacy_sent[legacy_sent_words++]=c->job.segments[i].instructions[j];
+  if(i)legacy_sent[legacy_sent_words++]=AVD_OP_EXEC|AVD_OP_EXEC_FLAG_END(i==c->job.num);
+ }
+ free(c->job.segments);c->job.segments=NULL;
+ return legacy_submit_error;
+}
+
 static struct v4l2_ctrl_av1_sequence sequence;
 static struct v4l2_ctrl_av1_frame params;
 static struct v4l2_ctrl_av1_tile_group_entry tiles[512];
@@ -24,6 +36,7 @@ static void init_ctx(struct avd_ctx *ctx)
 	ctx->ctrl_hdl[2]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY,.p_cur.p=tiles,.elems=V4L2_AV1_MAX_TILE_COUNT};
 	ctx->ctrl_hdl[3]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_FILM_GRAIN,.p_cur.p=&grain};
 	assert(avd_av1_start(ctx)==0);
+	assert(ctx->max_frames==1);
 }
 
 static void init_params(void)
@@ -49,6 +62,7 @@ static void init_params(void)
 	tiles[0].tile_size=128;
 	for(int i=0;i<64;i++) {
 		buffers[i].base.vb.vb2_buf=(struct vb2_buffer){.index=i,.timestamp=1000+i,.planes={{.length=1048576}},.dma=0x200000000ULL+i*0x200000,.payload=4096};
+		sources[i].vb2_buf=(struct vb2_buffer){.index=i,.timestamp=1000+i,.planes={{.length=4096}},.dma=0x10000000ULL+i*0x200000,.payload=4096};
 		buffers[i].av1.width=127;
 		buffers[i].av1.height=127;
 		buffers[i].av1.upscaled_width=128;
@@ -58,7 +72,7 @@ static void init_params(void)
 static struct avd_frame make_frame(unsigned int idx,unsigned int dst,struct avd_buf *prog)
 {
 	return (struct avd_frame){.idx=idx,.seq=dst+1,.frame_num=dst+1,
-		.src=&buffers[63].base.vb,.dst=&buffers[dst].base.vb,.prog=prog};
+		.src=&sources[dst],.dst=&buffers[dst].base.vb,.prog=prog};
 }
 
 static void dependency_table(void)
@@ -156,6 +170,7 @@ static void reference_reuse_and_segmentation(void)
 	params.flags=0;params.segmentation.flags=0;
 	buffers[0].base.vb.vb2_buf.timestamp=2000;
 	f[2].dst=&buffers[0].base.vb;
+	f[2].src->vb2_buf.timestamp=2000;
 	assert(!avd_av1_prepare(&ctx,&f[2]));
 	assert(cdf->refs.n>=2&&seg->refs.n>=2);
 	assert(b->cdf_in==cdf&&b->seg_in==seg&&cdf->done&&seg->done);
@@ -212,7 +227,8 @@ static void bounds_and_fp(void)
 	assert(avd_av1_pack_cmd(&ctx,&f)==-EOPNOTSUPP);
 	variant.av1_fp_layout=AVD_AV1_FP_UNKNOWN;
 	f.fp=NULL;grain.flags=V4L2_AV1_FILM_GRAIN_FLAG_APPLY_GRAIN;
-	assert(avd_av1_prepare(&ctx,&f)==-EOPNOTSUPP);
+	assert(!avd_av1_prepare(&ctx,&f));
+	avd_av1_retire(&ctx,&f,VB2_BUF_STATE_DONE);
 	grain.flags=0;prog.size=4;
 	assert(avd_av1_prepare(&ctx,&f)==-ENOSPC);
 	avd_av1_stop(&ctx);avd_buf_free(&device,&fp);avd_buf_free(&device,&prog);
@@ -221,10 +237,11 @@ static void bounds_and_fp(void)
 
 static void program_parity(void)
 {
-	for(int test=0;test<24;test++) {
+	for(int test=0;test<64;test++) {
 		struct avd_ctx ctx;struct avd_buf prog={0};
 		init_params();init_ctx(&ctx);
 		if(test&1)sequence.bit_depth=10;
+		if(test&32)grain.flags=V4L2_AV1_FILM_GRAIN_FLAG_APPLY_GRAIN;
 		if(test&16) {
 			params.frame_type=V4L2_AV1_INTER_FRAME;
 			sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT|V4L2_AV1_SEQUENCE_FLAG_ENABLE_REF_FRAME_MVS;
@@ -272,12 +289,126 @@ static void program_parity(void)
 		avd_av1_retire(&ctx,&f,VB2_BUF_STATE_DONE);avd_av1_stop(&ctx);
 		avd_buf_free(&device,&prog);assert(!allocations);
 	}
-	puts("AV1 legacy program parity: 24 synthetic control vectors: PASS");
+	puts("AV1 legacy program parity: 64 synthetic control vectors (including grain-less fallback): PASS");
+}
+
+static void legacy_transport(void)
+{
+ for(int error=0;error<2;error++) {
+  struct avd_ctx ctx;
+  init_params();init_ctx(&ctx);
+  params.tile_info.tile_cols=2;params.tile_info.tile_rows=2;
+  for(int i=0;i<2;i++) {
+   params.tile_info.width_in_sbs_minus_1[i]=0;
+   params.tile_info.height_in_sbs_minus_1[i]=0;
+  }
+  for(int i=0;i<4;i++)tiles[i]=(struct v4l2_ctrl_av1_tile_group_entry){.tile_offset=i*128,.tile_size=128,.tile_col=i%2,.tile_row=i/2};
+  grain.flags=V4L2_AV1_FILM_GRAIN_FLAG_APPLY_GRAIN;
+  ctx.next_src=&sources[0];ctx.next_dst=&buffers[0].base.vb;
+  legacy_controls_setup=legacy_controls_complete=0;
+  legacy_submit_error=error?-EIO:0;
+  assert(avd_av1_fmt_ops.run&&avd_av1_fmt_ops.done&&avd_av1_fmt_ops.submit);
+  assert(avd_av1_fmt_ops.run(&ctx)==legacy_submit_error);
+  assert(legacy_controls_setup==1&&legacy_controls_complete==1);
+  struct avd_av1_ctx *av1=ctx.priv;
+  assert(legacy_sent_words==av1->legacy_frame.prog_words);
+  assert(!memcmp(legacy_sent,av1->legacy_prog.cpu,legacy_sent_words*sizeof(u32)));
+  if(!error) {
+   assert(av1->legacy_frame.codec_priv&&av1->active_slots==1);
+   assert(avd_av1_fmt_ops.pp_kicks(&ctx)==4);
+   avd_av1_fmt_ops.submit(&ctx);assert(legacy_kicks==4);
+  }
+  avd_av1_fmt_ops.done(&ctx,ctx.next_src,ctx.next_dst,error?VB2_BUF_STATE_ERROR:VB2_BUF_STATE_DONE);
+  assert(!av1->legacy_frame.codec_priv&&!av1->active_slots);
+  /* Serial decode keeps reference auxiliary state through completion. */
+  if(!error) {
+   params.frame_type=V4L2_AV1_INTER_FRAME;params.primary_ref_frame=0;
+   params.reference_frame_ts[0]=1000;ctx.next_src=&sources[1];ctx.next_dst=&buffers[1].base.vb;
+   assert(!avd_av1_fmt_ops.run(&ctx));
+   assert(av1->legacy_frame.dep==AVD_DEP_PREV_DONE);
+   avd_av1_fmt_ops.done(&ctx,ctx.next_src,ctx.next_dst,VB2_BUF_STATE_DONE);
+  }
+  avd_av1_stop(&ctx);assert(!allocations);
+ }
+ legacy_submit_error=0;
+ puts("AV1 legacy transport: multi-tile grain-less decode, PP kicks, CDF reuse, submit failure cleanup: PASS");
+}
+
+static void source_timestamp_and_failed_producer(void)
+{
+ for(int failed=0;failed<2;failed++) {
+  struct avd_ctx ctx;struct avd_frame f[2];struct avd_buf prog[2]={0};
+  init_params();init_ctx(&ctx);
+  for(int i=0;i<2;i++){assert(!avd_buf_alloc(&device,&prog[i],4096));f[i]=make_frame(i,i,&prog[i]);}
+  buffers[0].base.vb.vb2_buf.timestamp=0;
+  assert(!avd_av1_prepare(&ctx,&f[0]));
+  struct avd_av1_ctx *av1=ctx.priv;
+  assert(av1->prev_timestamp==1000);
+  assert(avd_av1_find_ref(&ctx,0,1000));
+  /* Model core's metadata copy after prepare, before the next request. */
+  buffers[0].base.vb.vb2_buf.timestamp=1000;
+  params.frame_type=V4L2_AV1_INTER_FRAME;params.primary_ref_frame=0;
+  params.reference_frame_ts[0]=1000;
+  if(failed)avd_av1_retire(&ctx,&f[0],VB2_BUF_STATE_ERROR);
+  int rc=avd_av1_prepare(&ctx,&f[1]);
+  assert(rc==(failed?-EIO:0));
+  if(!failed) {
+   assert(f[1].dep==AVD_DEP_PREV_DONE);
+   avd_av1_retire(&ctx,&f[0],VB2_BUF_STATE_DONE);
+   avd_av1_retire(&ctx,&f[1],VB2_BUF_STATE_DONE);
+  }
+  avd_av1_stop(&ctx);
+  for(int i=0;i<2;i++)avd_buf_free(&device,&prog[i]);
+  assert(!allocations);
+ }
+ puts("AV1 reference publication: source timestamp and failed producer: PASS");
+}
+
+static void backend_selection(void)
+{
+ struct avd_ctx ctx={.dev=&device};
+ struct avd_coded_fmt_ops ops=avd_av1_fmt_ops;
+ struct avd_coded_fmt_desc desc={.ops=&ops,.frame_ops=&avd_av1_frame_ops};
+ ctx.coded_fmt_desc=&desc;
+ for(int apple=0;apple<2;apple++)for(int legacy=0;legacy<2;legacy++) {
+  device.apple=apple;ops.run=legacy?avd_av1_run:NULL;
+  assert(avd_get_frame_ops(&ctx)==((apple||!legacy)?&avd_av1_frame_ops:NULL));
+  assert(desc.frame_ops==&avd_av1_frame_ops);
+ }
+ device.apple=false;
+ puts("AV1 backend selection: Apple frame_ops and open legacy fallback: PASS");
+}
+
+static void segmentation_mi_size(void)
+{
+ const unsigned int widths[]={126,120,119};
+ for(unsigned int w=0;w<3;w++) {
+  struct avd_ctx ctx;struct avd_frame f[2];struct avd_buf prog[2]={0};
+  init_params();init_ctx(&ctx);
+  for(int i=0;i<2;i++){assert(!avd_buf_alloc(&device,&prog[i],4096));f[i]=make_frame(i,i,&prog[i]);}
+  params.segmentation.flags=V4L2_AV1_SEGMENTATION_FLAG_ENABLED|V4L2_AV1_SEGMENTATION_FLAG_UPDATE_MAP;
+  assert(!avd_av1_prepare(&ctx,&f[0]));
+  struct avd_av1_run *a=f[0].codec_priv;
+  params.frame_type=V4L2_AV1_INTER_FRAME;params.primary_ref_frame=0;
+  params.reference_frame_ts[0]=1000;
+  params.flags=V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF;
+  params.segmentation.flags=V4L2_AV1_SEGMENTATION_FLAG_ENABLED;
+  params.frame_width_minus_1=widths[w];params.upscaled_width=widths[w]+1;
+  assert(!avd_av1_prepare(&ctx,&f[1]));
+  struct avd_av1_run *b=f[1].codec_priv;
+  assert((b->seg_in==a->seg_out)==(widths[w]>=120));
+  avd_av1_retire(&ctx,&f[0],VB2_BUF_STATE_DONE);
+  avd_av1_retire(&ctx,&f[1],VB2_BUF_STATE_DONE);
+  avd_av1_stop(&ctx);
+  for(int i=0;i<2;i++)avd_buf_free(&device,&prog[i]);
+  assert(!allocations);
+ }
+ puts("AV1 segmentation: inherit only for equal MiCols/MiRows: PASS");
 }
 
 int main(void)
 {
-	program_parity();dependency_table();sixteen_slots();cdf_chain();reference_reuse_and_segmentation();allocation_failures();bounds_and_fp();
+	segmentation_mi_size();backend_selection();source_timestamp_and_failed_producer();legacy_transport();program_parity();dependency_table();sixteen_slots();cdf_chain();reference_reuse_and_segmentation();allocation_failures();bounds_and_fp();
 	puts("AV1 host tests: dependency table, 16 slots, CDF inheritance, allocation failures, bounds, Apple refusal: PASS");
 	return 0;
 }

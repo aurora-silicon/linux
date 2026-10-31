@@ -249,6 +249,7 @@ struct avd_dev {
 	 */
 	struct avd_ctx *deferred_ctx;
 	struct avd_frame frames[AVD_MAX_FRAMES];
+	const struct avd_codec_frame_ops *frame_codec_ops[AVD_MAX_FRAMES];
 	struct avd_buf *frame_fp[AVD_MAX_FRAMES];
 	u64 frame_seq;
 	unsigned int inflight;
@@ -403,6 +404,18 @@ int avd_qfw_probe(struct avd_dev *avd);
 void avd_qfw_select(struct avd_dev *avd);
 void avd_qfw_prepare_boot(struct avd_dev *avd);
 bool avd_backend_is_qfw(const struct avd_dev *avd);
+
+/* Open transports still need legacy segments and codec-specific PP kicks. */
+static inline const struct avd_codec_frame_ops *
+avd_get_frame_ops(const struct avd_ctx *ctx)
+{
+	if (ctx->coded_fmt_desc->ops->run && !avd_backend_is_apple(ctx->dev))
+		return NULL;
+	return ctx->coded_fmt_desc->frame_ops;
+}
+
+void avd_open_av1_submit(struct avd_ctx *ctx, unsigned int kicks);
+
 int avd_backend_select(struct avd_dev *avd);
 bool avd_mbox_pop(struct avd_dev *avd, u32 *msg);
 int avd_backend_boot(struct avd_dev *avd);

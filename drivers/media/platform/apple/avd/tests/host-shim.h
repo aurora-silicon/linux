@@ -31,6 +31,7 @@ typedef int irqreturn_t;
 #define lower_32_bits(x) ((u32)(x))
 #define upper_32_bits(x) ((u32)((u64)(x)>>32))
 #define cpu_to_le32(x) (x)
+#define le32_to_cpu(x) (x)
 #define smp_load_acquire(p) (*(p))
 #define smp_store_release(p,v) (*(p)=(v))
 #define READ_ONCE(x) (x)

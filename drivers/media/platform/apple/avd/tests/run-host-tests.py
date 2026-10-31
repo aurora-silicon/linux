@@ -24,6 +24,11 @@ with tempfile.TemporaryDirectory(prefix='avd-av1-test-') as tmp:
     source += without_includes((DRIVER / 'avd-av1-fp.h').read_text())
     source += (HERE / 'host-driver.h').read_text()
     source += without_includes((DRIVER / 'avd-queue.h').read_text())
+    # Compile the production transport selector, not a duplicate test rule.
+    header = (DRIVER / 'avd.h').read_text()
+    source += re.search(r'static inline const struct avd_codec_frame_ops \*\n'
+                        r'avd_get_frame_ops.*?\n}', header, re.S).group(0) + '\n'
+
     inst = without_includes((DRIVER / 'avd-inst.h').read_text())
     inst = inst[:inst.index('static inline void push(')] + '\n#endif\n'
     source += inst

@@ -203,7 +203,7 @@ static int avd_qfw_submit(struct avd_dev *avd, struct avd_frame *f)
 	unsigned int i;
 	int ret;
 
-	if (ctx->coded_fmt_desc->frame_ops)
+	if (avd_get_frame_ops(ctx))
 		return -EOPNOTSUPP;
 	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
 	    f->prog_words > f->prog->size / sizeof(u32))

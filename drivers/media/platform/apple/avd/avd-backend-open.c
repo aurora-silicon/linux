@@ -80,7 +80,7 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	if (avd->compat_active)
 		return -EBUSY;
 	/* Native frame_ops require firmware-side PP chaining and tagged replies. */
-	if (ctx->coded_fmt_desc->frame_ops)
+	if (avd_get_frame_ops(ctx))
 		return -EOPNOTSUPP;
 	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
 	    f->prog_words > f->prog->size / sizeof(u32))
@@ -127,6 +127,20 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 		writel(words[i], reg);
 	}
 	return 0;
+}
+
+/* Legacy AV1: one PP kick for every tile, matching the original transport. */
+void avd_open_av1_submit(struct avd_ctx *ctx, unsigned int kicks)
+{
+	struct avd_dev *avd = ctx->dev;
+	u32 cmd = AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+		  AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots);
+	unsigned int i;
+
+	writel(cmd | AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4),
+	       avd->ctrl + avd->variant->submit_offset);
+	for (i = 1; i < kicks; i++)
+		writel(cmd, avd->ctrl + avd->variant->submit_offset);
 }
 
 static irqreturn_t avd_open_irq(struct avd_dev *avd)
