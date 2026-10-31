@@ -15,6 +15,7 @@
 #include <linux/iommu.h>
 #include <linux/reset.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
@@ -299,6 +300,25 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 	u32 status;
 	if (!ctx)
 		return IRQ_HANDLED;
+
+	/*
+	 * Only pop a message the mailbox holds: popping an empty mailbox returns
+	 * the previous message again. A stale post-processing "done" read that
+	 * way finishes the frame early, the next frame starts while the PP is
+	 * still busy, and its PP never completes, so the watchdog resets the
+	 * decoder and the stream fails. The interrupt can also arrive just before
+	 * its message is readable, so give the message a moment first.
+	 */
+	if (readl(avd->mbox + AVD_REG_MBOX1_STATUS) & AVD_MBOX1_STATUS_EMPTY) {
+		u32 mb;
+
+		if (readl_poll_timeout_atomic(avd->mbox + AVD_REG_MBOX1_STATUS, mb,
+					      !(mb & AVD_MBOX1_STATUS_EMPTY), 1, 10)) {
+			dev_dbg(avd->dev, "spurious interrupt, mailbox empty\n");
+			writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+			return IRQ_HANDLED;
+		}
+	}
 
 	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
 
