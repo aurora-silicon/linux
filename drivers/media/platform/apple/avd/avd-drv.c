@@ -674,6 +674,7 @@ static const struct avd_variant avd_t8103_variant = {
 };
 
 static const struct avd_variant avd_t6000_variant = {
+	.h264_fp_layout = AVD_H264_FP_V3,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -694,6 +695,7 @@ static const struct avd_variant avd_t6000_variant = {
 };
 
 static const struct avd_variant avd_t8112_variant = {
+	.h264_fp_layout = AVD_H264_FP_T8112_TODO,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -754,6 +756,7 @@ static const struct avd_variant avd_t8122_variant = {
 };
 
 static const struct avd_variant avd_t8140_variant = {
+	.h264_fp_layout = AVD_H264_FP_T8140_TODO,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2,
 		[AVD_CODEC_H264] = 1,
@@ -811,6 +814,7 @@ static const struct avd_variant avd_t8132_variant = {
  * verified on the hardware.
  */
 static const struct avd_variant avd_t6040_variant = {
+	.h264_fp_layout = AVD_H264_FP_BORAGE,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,

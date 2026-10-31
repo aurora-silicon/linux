@@ -416,6 +416,7 @@ static const struct avd_coded_fmt_desc avd_coded_fmts[] = {
 		},
 		.ctrls = &avd_h264_ctrls,
 		.ops = &avd_h264_fmt_ops,
+		.frame_ops = &avd_h264_frame_ops,
 		.num_decoded_fmts = ARRAY_SIZE(avd_h264_decoded_fmts),
 		.decoded_fmts = avd_h264_decoded_fmts,
 		.subsystem_flags = VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF,
