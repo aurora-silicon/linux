@@ -115,7 +115,6 @@ int main(void)
 	assert(avd_slot_first(t.host, &t.host[0]));
 	t.host[0].state = AVD_FRAME_FREE;
 	assert(avd_slot_first(t.host, &t.host[1]));
-	puts("PASS: two host contexts concurrently on VP0/VP1, all eight images, "
-	     "FIFO caps and ordered tagged completion");
+	puts("PASS: two contexts on VP0/VP1, eight images, FIFO caps and ordered tags");
 	return 0;
 }

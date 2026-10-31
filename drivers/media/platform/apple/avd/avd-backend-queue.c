@@ -100,15 +100,22 @@ int avd_open_queue_boot(struct avd_dev *avd)
 	if (info[1] != AVD_OPEN_VERSION || info[2] != AVD_MAX_FRAMES ||
 	    info[3] != sizeof(struct avd_open_desc) || info[5] != AVD_OPEN_RING ||
 	    info[6] != AVD_OPEN_PACKET_WORDS || info[10] != avd->variant->fifo_slots ||
-	    info[4] > U32_MAX - AVD_OPEN_RING - AVD_MAX_FRAMES * AVD_OPEN_DESC_BYTES)
-		return -EPROTO;
+	    info[4] > U32_MAX - AVD_OPEN_RING - AVD_MAX_FRAMES * AVD_OPEN_DESC_BYTES) {
+		ret = -EPROTO;
+		goto shutdown;
+	}
 	dst = info[4] + 0x9000;
 	header = (dst & 0xfffeU) | ((dst & 0x10000U) << 1) | 1U;
-	if (info[7] != header)
-		return -EPROTO;
+	if (info[7] != header) {
+		ret = -EPROTO;
+		goto shutdown;
+	}
 	/* Both DART stream IDs must be attached to the device's DMA domain. */
-	if (of_count_phandle_with_args(avd->dev->of_node, "iommus", "#iommu-cells") < 2)
-		return -ENODEV;
+	if (!avd->domain ||
+	    of_count_phandle_with_args(avd->dev->of_node, "iommus", "#iommu-cells") < 2) {
+		ret = -ENODEV;
+		goto shutdown;
+	}
 	for (i = 0; i < 4; i++) {
 		u32 base = avd->variant->vp_slot_base[i];
 
@@ -116,8 +123,10 @@ int avd_open_queue_boot(struct avd_dev *avd)
 			continue;
 		if ((info[11 + i] & 0xff) != base ||
 		    (info[11 + i] >> 8) != avd->variant->vp_slots[i] ||
-		    base + avd->variant->vp_slots[i] > info[8])
-			return -EPROTO;
+		    base + avd->variant->vp_slots[i] > info[8]) {
+			ret = -EPROTO;
+			goto shutdown;
+		}
 	}
 	avd->capabilities &= info[9];
 	q->ring = info[4] + AVD_OPEN_RING;
@@ -125,6 +134,9 @@ int avd_open_queue_boot(struct avd_dev *avd)
 	WRITE_ONCE(q->enabled, true);
 	writel(AVD_MBOX_ENABLE, avd->mbox + OPEN_MBOX0_STATUS);
 	return 0;
+shutdown:
+	avd_shutdown(avd);
+	return ret;
 }
 
 unsigned int avd_open_queue_max(struct avd_dev *avd)
