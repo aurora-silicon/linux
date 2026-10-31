@@ -29,8 +29,8 @@
  */
 #define AVE_MIN_W		320
 #define AVE_MIN_H		240
-#define AVE_MAX_W		2560
-#define AVE_MAX_H		1600
+#define AVE_MAX_W		4096
+#define AVE_MAX_H		2304
 #define AVE_STEP		16
 #define AVE_STRIDE_ALIGN	64
 #define AVE_DEFAULT_W		1920
