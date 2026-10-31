@@ -189,7 +189,10 @@ partial. The task's GEM lookup references are released when the ioctl returns.
 
 Recovery holds the engine and PM-entry locks, drops the current consumer
 runtime-PM reference, synchronously suspends its power-domain suppliers, and
-checks the PMGR ACTUAL fields for power-off. It then restores the consumer
+checks both the PMGR ACTUAL fields and every attached genpd for power-off.
+The SET window omits the shared SYS_CPU parent, whose DART consumers can
+suspend asynchronously; it must also turn off before the consumer resumes.
+Recovery then restores the consumer
 reference, checks power-on before engine MMIO, and runs the probe task-manager
 enable sequence. BO handles and mappings remain valid for resubmission.
 The system-sleep force helpers are unsuitable here: a forced, in-use supplier
