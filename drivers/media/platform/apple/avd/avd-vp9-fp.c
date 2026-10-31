@@ -23,7 +23,7 @@ struct avd_vp9_fp_layout {
 };
 
 static const struct avd_vp9_fp_layout vp9_layouts[] = {
-	[AVD_VP9_FP_V3] = { .size = 0x24aa4, .tiles = 0xab4 },
+	[AVD_VP9_FP_V3] = { .size = 0x24aa4, .tiles = 0xab8 },
 	[AVD_VP9_FP_BORAGE] = {
 		.size = 0x1130d0, .cols = 0x218, .rows = 0x21a,
 	},
@@ -87,6 +87,7 @@ static int pack_v3(struct avd_frame *f, const struct v4l2_ctrl_vp9_frame *frame,
 	put_unaligned_le32(0x240, fp + 0xe0);
 	put_unaligned_le32(0x764099, fp + 0x210);
 	put_unaligned_le32(0x124111, fp + 0x28c);
+	put_unaligned_le32(0x40005, fp + 0xab0);
 	if (!intra) {
 		for (unsigned int ref = 0; ref < 3; ref++) {
 			const u8 *r = prog + (52 + ref * 7) * 4;
@@ -101,7 +102,9 @@ static int pack_v3(struct avd_frame *f, const struct v4l2_ctrl_vp9_frame *frame,
 	}
 	for (unsigned int tile = 0; tile < tiles; tile++) {
 		const u8 *t = prog + (header_words + tile * 5) * 4;
-		u8 *out = fp + 0xab4 + tile * 0x24;
+		/* fp.py has an explicit zero word before til_ab4_tiles.
+		 * Its Construct offset is 0xab8 despite the field label. */
+		u8 *out = fp + vp9_layouts[AVD_VP9_FP_V3].tiles + tile * 0x24;
 
 		/* V3 public tile records contain only a low 32-bit address. */
 		if (get_unaligned_le32(t) & 0x1fff)

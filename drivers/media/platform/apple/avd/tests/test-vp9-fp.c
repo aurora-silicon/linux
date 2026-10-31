@@ -74,8 +74,10 @@ static void test_v3(void)
 	assert(get_unaligned_le32(bytes + 0x4c) == 0x10203019);
 	assert(get_unaligned_le32(bytes + 0x104) == 0x1200);
 	assert(get_unaligned_le32(bytes + 0x168) == 0x1020302b);
-	assert(get_unaligned_le32(bytes + 0xab4) == 0x123400);
-	assert(get_unaligned_le32(bytes + 0xab8) == 17);
+	assert(get_unaligned_le32(bytes + 0xab8) == 0x123400);
+	assert(get_unaligned_le32(bytes + 0xabc) == 17);
+	assert(get_unaligned_le32(bytes + 0xab4) == 0);
+	assert(get_unaligned_le32(bytes + 0xab0) == 0x40005);
 	assert(get_unaligned_le32(bytes + 0xe0) == 0x240);
 	f.prog_words = 53;
 	assert(pack_v3(&f, &ctrl, 0) == -EINVAL);

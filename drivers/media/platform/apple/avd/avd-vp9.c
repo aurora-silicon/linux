@@ -215,6 +215,39 @@ struct avd_vp9_ctx {
 	bool failed;
 };
 
+static int vp9_get_maps(struct avd_vp9_ctx *stream, struct avd_vp9_slot *slot)
+{
+	unsigned int idx;
+
+	for (idx = 0; idx < ARRAY_SIZE(stream->segmaps); idx++)
+		if (!stream->segmaps[idx].users)
+			break;
+	if (idx == ARRAY_SIZE(stream->segmaps))
+		return -EAGAIN;
+	slot->seg_out = &stream->segmaps[idx];
+	slot->seg_in = stream->last_segmap ? stream->last_segmap : slot->seg_out;
+	slot->seg_out->users++;
+	slot->seg_in->users++;
+	return 0;
+}
+
+static void vp9_put_maps(struct avd_vp9_slot *slot)
+{
+	slot->seg_in->users--;
+	slot->seg_out->users--;
+	slot->seg_in = NULL;
+	slot->seg_out = NULL;
+}
+
+static void vp9_publish_map(struct avd_vp9_ctx *stream,
+			    struct avd_vp9_slot *slot)
+{
+	if (stream->last_segmap)
+		stream->last_segmap->users--;
+	stream->last_segmap = slot->seg_out;
+	stream->last_segmap->users++;
+}
+
 /* Build the same instruction words as the legacy builder, in DMA memory. */
 #undef push
 #undef pusha
@@ -963,11 +996,7 @@ static void avd_vp9_retire(struct avd_ctx *ctx, struct avd_frame *f,
 out_update_last:
 	if (stream->pending == f)
 		stream->pending = NULL;
-	if (vp9_ctx->seg_in)
-		vp9_ctx->seg_in->users--;
-	vp9_ctx->seg_out->users--;
-	vp9_ctx->seg_in = NULL;
-	vp9_ctx->seg_out = NULL;
+	vp9_put_maps(vp9_ctx);
 	f->codec_priv = NULL;
 }
 
@@ -1104,23 +1133,16 @@ static int avd_vp9_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 		avd_init_v4l2_vp9_count_tbl(slot);
 		stream->slots[f->idx] = slot;
 	}
-	for (idx = 0; idx < ARRAY_SIZE(stream->segmaps); idx++)
-		if (!stream->segmaps[idx].users)
-			break;
-	if (idx == ARRAY_SIZE(stream->segmaps))
-		return -EAGAIN;
-	slot->seg_out = &stream->segmaps[idx];
+	ret = vp9_get_maps(stream, slot);
+	if (ret)
+		return ret;
 	if (!slot->seg_out->buf.cpu) {
 		ret = avd_buf_alloc(ctx->dev, &slot->seg_out->buf,
 			DIV_ROUND_UP(fmt_width(ctx), 16) *
 			DIV_ROUND_UP(fmt_height(ctx), 64) * 144);
 		if (ret)
-			return ret;
+			goto err_put_maps;
 	}
-	/* The previous map may still be read by other submitted frames. */
-	slot->seg_in = stream->last_segmap ? stream->last_segmap : slot->seg_out;
-	slot->seg_out->users++;
-	slot->seg_in->users++;
 	run.slot = slot;
 	run.base.bufs.src = f->src;
 	run.base.bufs.dst = f->dst;
@@ -1172,17 +1194,11 @@ static int avd_vp9_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 			stream->frame_context[idx] = slot->probability_tables;
 	}
 	stream->last = slot->cur;
-	if (stream->last_segmap)
-		stream->last_segmap->users--;
-	stream->last_segmap = slot->seg_out;
-	stream->last_segmap->users++;
+	vp9_publish_map(stream, slot);
 	return 0;
 
 err_put_maps:
-	slot->seg_in->users--;
-	slot->seg_out->users--;
-	slot->seg_in = NULL;
-	slot->seg_out = NULL;
+	vp9_put_maps(slot);
 	return ret;
 }
 

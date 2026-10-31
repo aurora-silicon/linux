@@ -66,7 +66,7 @@ Tests and remaining validation
 Run ``sh drivers/media/platform/apple/avd/tests/run-vp9.sh`` on a host. The tests
 compile the production tile writer, compare 15 tile geometries against the
 legacy word sequence, reject malformed/truncated tiles, check output capacity
-and a 4-GiB DMA carry, check the full dependency flag table, and verify known
+a 4-GiB DMA carry, EXEC boundaries and segmentation map pins, check the full dependency flag table, and verify known
 V3/Borage offsets and isolation of 16 frame buffers. They are not a substitute
 for libvpx streams through the full stateless request/control and adaptation path.
 That differential suite, queue-core retry/drain integration, physical-FIFO
