@@ -31,14 +31,16 @@ def read(path, ref):
 
 def build_source(body, defines):
     return r'''
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define BIT(n) (1u << (n))
 #define dev_info(...) ((void)0)
+#define strnstr host_strnstr
 ''' + defines + r'''
 struct firmware { const unsigned char *data; size_t size; };
-struct variant { unsigned int capabilities; };
+struct variant { unsigned int capabilities; unsigned int fw_caps_required; };
 struct avd_dev {
     struct firmware *fw;
     const struct variant *variant;
@@ -60,14 +62,14 @@ static unsigned int probe_tail(struct avd_dev *avd)
 }
 int main(int argc, char **argv)
 {
-    if (argc != 5)
+    if (argc != 6)
         return 2;
     size_t size = strtoul(argv[1], NULL, 0);
     unsigned char *data = calloc(size ? size : 1, 1);
     if (!data)
         return 2;
     struct firmware fw = {data, size};
-    struct variant variant = {strtoul(argv[3], NULL, 0)};
+    struct variant variant = {strtoul(argv[3], NULL, 0), strtoul(argv[5], NULL, 0)};
     struct avd_dev avd = {&fw, &variant, 0};
     size_t len = strlen(argv[2]);
     if (size >= AVD_CODEC_INFO_MAX_SIZE && len <= AVD_CODEC_INFO_MAX_SIZE)
@@ -97,14 +99,15 @@ def run_variant(out, name, body, defines, cases):
     (dest / "build.log").write_text(build.stdout + build.stderr)
     rows = []
     if build.returncode == 0:
-        for index, (size, tail, mask, expected) in enumerate(cases):
+        for index, (size, tail, mask, expected, require_info) in enumerate(cases):
             result = subprocess.run(
-                [str(dest / "actual-tail"), str(size), tail, str(mask), str(expected)],
+                [str(dest / "actual-tail"), str(size), tail, str(mask), str(expected), str(int(require_info))],
                 capture_output=True, text=True,
             )
             (dest / f"case-{index:02d}.log").write_text(result.stdout + result.stderr)
             rows.append({"size": size, "tail": tail, "variant": mask,
-                         "expected": expected, "returncode": result.returncode,
+                         "expected": expected, "fw_caps_required": int(require_info),
+                         "returncode": result.returncode,
                          "sanitizer_diagnostic": bool(re.search(
                              r"AddressSanitizer|runtime error:", result.stderr))})
     return {"name": name, "build_command": cmd,
@@ -146,6 +149,17 @@ def main():
               (64, "CODECS:" + "x" * 57, 15, 0),
               (64, "CODECSx:av1", 5, 5), (128, "legacy", 0, 0),
               (128, "legacy", 5, 5)]
+    cases = [(*case, False) for case in cases]
+    if "fw_caps_required" in body:
+        cases += [(n, "legacy", 15, 14, True) for n in (0, 1, 63, 64, 128)]
+        cases += [(64, "CODECS:h264 vp9 av1", 15, 14, True),
+                  (64, "CODECS:h265", 15, 1, True),
+                  (64, all_codecs, 15, 15, True),
+                  (64, "CODECS:h265", 14, 0, True)]
+    legacy_fallback = ("avd->capabilities = avd->variant->capabilities &\n"
+                       "\t\t\t~avd->variant->fw_caps_required;")
+    if legacy_fallback not in body:
+        legacy_fallback = "avd->capabilities = avd->variant->capabilities;"
     variants = [("control-before", body)]
     if args.mutations:
         anchor = "\tif (avd->fw->size >= AVD_CODEC_INFO_MAX_SIZE)\n"
@@ -156,8 +170,7 @@ def main():
                          "\t\tunsigned int variant_caps = avd->variant->capabilities;\n", ""
                      ).replace("caps |= variant_caps & ", "caps |= ")),
                      ("no-legacy-fallback", body.replace(
-                         "avd->capabilities = avd->variant->capabilities;",
-                         "avd->capabilities = 0;"))]
+                         legacy_fallback, "avd->capabilities = 0;"))]
         variants.append(("control-after", body))
     results = [run_variant(args.output, name, text, defines, cases)
                for name, text in variants]
