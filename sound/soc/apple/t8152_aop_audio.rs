@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Apple T8152 (J873, Mac mini M6) AOP audio
+//! Apple T8152 (J873, Mac mini M6) and T8142 (J813, MacBook Air M5) AOP audio
 //!
 //! The AOP firmware owns the audio fabric, as on T8140. The ADT
 //! (/arm-io/iop-audio-controller) names its services; all of them run on the
@@ -220,6 +220,9 @@ struct T8152AopAudio {
     cin: Service,
     spkr: Service,
     mca: KVec<PowerDomain>,
+    cfg: &'static HwConfig,
+    /// The open sense capture front-end, if any.
+    sense: Atomic<*mut bindings::snd_pcm_substream>,
 }
 
 impl T8152AopAudio {
@@ -353,14 +356,66 @@ impl T8152AopAudio {
         Ok(())
     }
 
+    /// The sense capture's back-end. Its front-end requests the ADMAC
+    /// channel next, and the ADMAC only answers while the firmware holds
+    /// the audio fabric up, which it does while a service is in `pw0 ` or
+    /// `pwrd`. Opening the sense before any other stream since boot (as
+    /// speakersafetyd does) otherwise faults the bus (SError). Shutdown
+    /// leaves the service in `pw0 `, as the other streams do.
+    fn sense_startup(&self) -> Result<()> {
+        self.attach(&self.spkr)?;
+        if !self.spkr.running.load(Relaxed) {
+            self.set_power(&self.spkr, POWER_STATE_PW0)?;
+        }
+        Ok(())
+    }
+
     /// `pwrd`: the firmware starts the serializer clocks and the stream.
     fn run(&self, svc: &Service) -> Result<()> {
         if svc.running.load(Relaxed) {
             return Ok(());
         }
+        if ptr::eq(svc, &self.spkr) && self.cfg.realign_sense {
+            self.realign_sense();
+        }
         self.set_power(svc, POWER_STATE_PWRD)?;
         svc.running.store(true, Relaxed);
         Ok(())
+    }
+
+    /// Before the speaker's serializer starts, restart a running sense
+    /// capture at a frame boundary. The sense words are the serializer's RX,
+    /// which the firmware stops anywhere in a frame; a capture that stays
+    /// open across speaker streams (speakersafetyd keeps it) would carry
+    /// the partial frame forward and attribute one amplifier's voltage and
+    /// current to another. Nothing flows while the serializer is stopped,
+    /// so this loses no data; the partial frame reads as zeros.
+    fn realign_sense(&self) {
+        let ss = self.sense.load(Relaxed);
+        if ss.is_null() {
+            return;
+        }
+        // SAFETY: the sense front-end's open and close and this back-end's
+        // prepare all run under the card's DPCM mutex, so `ss` is live; its
+        // stream lock orders this against the front-end's trigger.
+        unsafe {
+            bindings::snd_pcm_stream_lock_irq(ss);
+            let rt = (*ss).runtime;
+            if !rt.is_null() && (*rt).state == SNDRV_PCM_STATE_RUNNING {
+                let chan = bindings::snd_dmaengine_pcm_get_chan(ss);
+                let ops = &*(*chan).device;
+                if let (Some(pause), Some(resume)) = (ops.device_pause, ops.device_resume) {
+                    pause(chan);
+                    let frame = ((*rt).frame_bits / 8) as usize;
+                    let pos = bindings::snd_dmaengine_pcm_pointer(ss) as usize;
+                    if frame != 0 && pos < (*rt).buffer_size as usize && !(*rt).dma_area.is_null() {
+                        ptr::write_bytes((*rt).dma_area.add(pos * frame), 0, frame);
+                    }
+                    resume(chan);
+                }
+            }
+            bindings::snd_pcm_stream_unlock_irq(ss);
+        }
     }
 
     /// The clocks run from prepare on: the codecs see a bit clock as soon
@@ -407,6 +462,42 @@ const PCM_PERIOD_BYTES_MAX: usize = 0x10000;
 
 /// The AOP-run serializers take 24-bit samples in 32-bit words.
 const FORMATS: u64 = bindings::BINDINGS_SNDRV_PCM_FMTBIT_S24_LE;
+/// SNDRV_PCM_FMTBIT_S16_LE (1 << SNDRV_PCM_FORMAT_S16_LE), which the
+/// bindings do not export.
+const FMTBIT_S16_LE: u64 = 1 << 2;
+/// SNDRV_PCM_STATE_RUNNING, likewise.
+const SNDRV_PCM_STATE_RUNNING: bindings::snd_pcm_state_t = 3;
+
+/// What differs between the machines: the shape of the firmware's `spkr`
+/// stream (ADT iop-audio-controller/audio-speaker).
+struct HwConfig {
+    /// Speaker slots (one per amplifier).
+    spkr_channels: u32,
+    /// Words the amplifiers send back on the stream's RX side (V/I sense).
+    sense_channels: u32,
+    sense_formats: u64,
+    /// The sense capture is the speaker stream's RX: restart it at a frame
+    /// boundary whenever the speaker starts (see `realign_sense`).
+    realign_sense: bool,
+}
+
+/// J873: one amplifier in one 32-bit slot, nothing sent back.
+static HW_CFG_T8152: HwConfig = HwConfig {
+    spkr_channels: 1,
+    sense_channels: 2,
+    sense_formats: FORMATS,
+    realign_sense: false,
+};
+
+/// J813: four amplifiers (left woofer, left tweeter, right woofer, right
+/// tweeter) in 32-bit slots 0-3, their voltage and current sense back as
+/// eight 16-bit slots (V, I per amplifier) on the stream's RX (base-ns RX0).
+static HW_CFG_T8142: HwConfig = HwConfig {
+    spkr_channels: 4,
+    sense_channels: 8,
+    sense_formats: FMTBIT_S16_LE,
+    realign_sense: true,
+};
 
 /// # Safety
 ///
@@ -543,7 +634,7 @@ unsafe extern "C" fn asoc_pcm_open(
             );
         }
         if ret == 0 {
-            hw.formats &= FORMATS;
+            hw.formats &= if fe == 2 { data.cfg.sense_formats } else { FORMATS };
             (*(*substream).runtime).hw = hw;
             ret = bindings::snd_dmaengine_pcm_open(substream, chan);
         }
@@ -552,6 +643,8 @@ unsafe extern "C" fn asoc_pcm_open(
     if ret < 0 {
         // SAFETY: the open failed, so the channel is still ours.
         unsafe { bindings::dma_release_channel(chan) };
+    } else if fe == 2 && !playback {
+        data.sense.store(substream, Relaxed);
     }
     ret
 }
@@ -560,12 +653,17 @@ unsafe extern "C" fn asoc_pcm_open(
 ///
 /// Called by ASoC on this driver's component with live arguments.
 unsafe extern "C" fn asoc_pcm_close(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
 ) -> i32 {
     // SAFETY: by the caller's contract.
     if unsafe { rtd_is_be(substream_rtd(substream)) } {
         return 0;
+    }
+    // SAFETY: as above.
+    let data = unsafe { component_data(component) };
+    if data.sense.load(Relaxed) == substream {
+        data.sense.store(ptr::null_mut(), Relaxed);
     }
     // SAFETY: the dmaengine runtime was set up in `asoc_pcm_open`.
     unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) }
@@ -575,7 +673,7 @@ unsafe extern "C" fn asoc_pcm_close(
 ///
 /// Called by ASoC on this driver's component with live arguments.
 unsafe extern "C" fn asoc_pcm_hw_params(
-    _component: *mut bindings::snd_soc_component,
+    component: *mut bindings::snd_soc_component,
     substream: *mut bindings::snd_pcm_substream,
     params: *mut bindings::snd_pcm_hw_params,
 ) -> i32 {
@@ -604,6 +702,15 @@ unsafe extern "C" fn asoc_pcm_hw_params(
         cfg.dst_port_window_size = window;
     } else {
         cfg.src_port_window_size = window;
+    }
+    // The sense capture: the frame size its channel restarts aligned to
+    // (apple-admac reads a u32 here; see `realign_sense`).
+    // SAFETY: by the caller's contract.
+    let data = unsafe { component_data(component) };
+    let mut frame_bytes = channels * cfg.src_addr_width as u32;
+    if ptr::eq(substream, data.sense.load(Relaxed)) && data.cfg.realign_sense {
+        cfg.peripheral_config = ptr::from_mut(&mut frame_bytes).cast();
+        cfg.peripheral_size = mem::size_of::<u32>();
     }
     // SAFETY: `chan` is the live channel behind the substream.
     unsafe {
@@ -715,6 +822,14 @@ unsafe extern "C" fn be_startup(
 ) -> i32 {
     // SAFETY: by the caller's contract.
     let Some((data, svc)) = (unsafe { be_service(dai, substream) }) else {
+        // SAFETY: as above.
+        let (data, id) = unsafe { (dai_data(dai), (*dai).id as u32) };
+        if id == BE_DAI_ID_SPKR {
+            return match data.sense_startup() {
+                Ok(()) => 0,
+                Err(e) => e.to_errno(),
+            };
+        }
         return 0;
     };
     match data.startup(svc) {
@@ -780,9 +895,17 @@ impl DaiOps {
 }
 
 fn pcm_stream(name: &'static CStr, channels: u32) -> bindings::snd_soc_pcm_stream {
+    pcm_stream_fmt(name, channels, FORMATS)
+}
+
+fn pcm_stream_fmt(
+    name: &'static CStr,
+    channels: u32,
+    formats: u64,
+) -> bindings::snd_soc_pcm_stream {
     bindings::snd_soc_pcm_stream {
         stream_name: name.as_char_ptr(),
-        formats: FORMATS,
+        formats,
         rates: bindings::SNDRV_PCM_RATE_48000,
         rate_min: 48000,
         rate_max: 48000,
@@ -797,7 +920,7 @@ fn pcm_stream(name: &'static CStr, channels: u32) -> bindings::snd_soc_pcm_strea
 /// back-end), 4 the sense front-end.
 const DAI_COUNT: usize = 2 + FE_COUNT;
 
-fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
+fn dai_drivers(ops: &DaiOps, cfg: &HwConfig) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
     [
         bindings::snd_soc_dai_driver {
             name: c"cout".as_char_ptr(),
@@ -815,28 +938,27 @@ fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
             capture: pcm_stream(c"PCM0 RX", 1),
             ..Default::default()
         },
-        // The speaker: one 32-bit slot per frame (the firmware's spkr
-        // serializer runs a single channel).
+        // The speaker: one 32-bit slot per amplifier.
         bindings::snd_soc_dai_driver {
             name: c"j873-pcm-1".as_char_ptr(),
             id: FE_DAI_ID_BASE + 1,
             ops: &ops.fe,
-            playback: pcm_stream(c"PCM1 TX", 1),
+            playback: pcm_stream(c"PCM1 TX", cfg.spkr_channels),
             ..Default::default()
         },
         bindings::snd_soc_dai_driver {
             name: c"spkr".as_char_ptr(),
             id: BE_DAI_ID_SPKR,
             ops: &ops.be,
-            playback: pcm_stream(c"SPKR TX", 1),
-            capture: pcm_stream(c"SPKR RX", 2),
+            playback: pcm_stream(c"SPKR TX", cfg.spkr_channels),
+            capture: pcm_stream_fmt(c"SPKR RX", cfg.sense_channels, cfg.sense_formats),
             ..Default::default()
         },
         bindings::snd_soc_dai_driver {
             name: c"j873-pcm-2".as_char_ptr(),
             id: FE_DAI_ID_BASE + 2,
             ops: &ops.fe,
-            capture: pcm_stream(c"PCM2 RX", 2),
+            capture: pcm_stream_fmt(c"PCM2 RX", cfg.sense_channels, cfg.sense_formats),
             ..Default::default()
         },
     ]
@@ -845,7 +967,7 @@ fn dai_drivers(ops: &DaiOps) -> [bindings::snd_soc_dai_driver; DAI_COUNT] {
 impl AsocContext {
     fn new(data: Arc<T8152AopAudio>) -> Result<KBox<Self>> {
         let ops = KBox::new(DaiOps::new(), GFP_KERNEL)?;
-        let dais = KBox::new(Opaque::new(dai_drivers(&ops)), GFP_KERNEL)?;
+        let dais = KBox::new(Opaque::new(dai_drivers(&ops, data.cfg)), GFP_KERNEL)?;
         let component = bindings::snd_soc_component_driver {
             name: c"t8152-aop-audio".as_char_ptr(),
             open: Some(asoc_pcm_open),
@@ -899,20 +1021,24 @@ impl T8152AopAudioDriver {
 kernel::of_device_table!(
     OF_TABLE,
     <T8152AopAudioDriver as platform::Driver>::IdInfo,
-    [(of::DeviceId::new(c_str!("apple,t8152-aop-audio")), ())]
+    [
+        (of::DeviceId::new(c_str!("apple,t8142-aop-audio")), &HW_CFG_T8142),
+        (of::DeviceId::new(c_str!("apple,t8152-aop-audio")), &HW_CFG_T8152),
+    ]
 );
 
 impl platform::Driver for T8152AopAudioDriver {
-    type IdInfo = ();
+    type IdInfo = &'static HwConfig;
     type Data<'bound> = Self;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
+        info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev = ARef::<device::Device>::from(pdev.as_ref());
+        let cfg: &'static HwConfig = info.copied().unwrap_or(&HW_CFG_T8152);
         // SAFETY: this is a service device the AOP core registered.
         let adata = unsafe { <dyn AOP>::from_child(pdev.as_ref()) }?;
         // SAFETY: the AOP core sets the child's platform data to its EPIC service.
@@ -953,6 +1079,8 @@ impl platform::Driver for T8152AopAudioDriver {
                 cin: Service::new(from_fourcc(b"cin "), "cin", true),
                 spkr: Service::new(from_fourcc(b"spkr"), "spkr", false),
                 mca,
+                cfg,
+                sense: Atomic::new(ptr::null_mut()),
             }),
             GFP_KERNEL,
         )?;
