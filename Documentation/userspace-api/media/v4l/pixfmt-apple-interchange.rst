@@ -119,3 +119,6 @@ alone do not prove decoded pixel correctness, DMA-BUF import, DCP scanout,
 compositor direct scanout, or a power saving. Validate each codec and bit
 depth, reference reuse, stream restart, and linear fallback before enabling
 this output in a distribution's default userspace pipeline.
+
+The proposed package and browser integration is described in
+:doc:`apple-avd-userspace`.
