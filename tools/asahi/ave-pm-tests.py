@@ -29,10 +29,13 @@ PREFIX = r'''
 #include <stdbool.h>
 #include <stdio.h>
 struct scheduler { bool stopped; unsigned pauses, restarts; };
-struct ave_dev { struct scheduler *m2m_dev; int hw_lock; };
+struct ave_transport { bool scratch_halt; };
+struct ave_abi { const struct ave_transport *transport; };
+struct ave_layout { const struct ave_abi *abi; };
+struct ave_dev { struct scheduler *m2m_dev; int hw_lock; const struct ave_layout *layout; };
 struct device { struct ave_dev *data; };
 static int shutdown_error;
-static unsigned closes, halts;
+static unsigned closes, halts, releases, wakes;
 static void *dev_get_drvdata(struct device *d) { return d->data; }
 static void mutex_lock(int *l) { assert(!*l); *l = 1; }
 static void mutex_unlock(int *l) { assert(*l == 1); *l = 0; }
@@ -49,6 +52,11 @@ static int ave_fw_shutdown(struct ave_dev *a) {
     assert(a->hw_lock && a->m2m_dev->stopped && closes > halts);
     halts++; return shutdown_error;
 }
+/* A scratch-halt firmware (6070) gives its boot buffers back after a halt. */
+static __attribute__((unused)) void ave_fw_release_boot(struct ave_dev *a) {
+    assert(a->hw_lock && halts > releases); releases++;
+}
+static __attribute__((unused)) int ave_runtime_resume(struct device *d) { (void)d; wakes++; return 0; }
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
 '''
@@ -78,7 +86,18 @@ int main(void) {
     assert(ave_resume(&d) == 0);
     assert(!s.stopped && !a.hw_lock);
     assert(s.pauses == 6 && s.restarts == 6 && closes == 6 && halts == 6);
-    puts("AVE PM: normal/repeated sleep, halt refusal, error propagation, rollback and retry passed");
+    assert(releases == 0 && wakes == 4);
+    /* A scratch-halt firmware releases its boot buffers only after a clean halt. */
+    static const struct ave_transport scratch = { .scratch_halt = true };
+    static const struct ave_abi abi = { .transport = &scratch };
+    static const struct ave_layout layout = { .abi = &abi };
+    a.layout = &layout;
+    shutdown_error = -EBUSY;
+    assert(ave_suspend(&d) == -EBUSY && releases == 0);
+    shutdown_error = 0;
+    assert(ave_suspend(&d) == 0 && releases == 1);
+    assert(ave_resume(&d) == 0 && wakes == 5);
+    puts("AVE PM: normal/repeated sleep, halt refusal, error propagation, rollback, retry and boot-buffer release passed");
 }
 '''
 
