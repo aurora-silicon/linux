@@ -2014,6 +2014,17 @@
 		status = "disabled";
 	};
 
+	jpeg0: jpeg@487000000 {
+		compatible = "apple,t6041-jpeg";
+		reg = <0x4 0x87000000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1538 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg0_dart 0>;
+		power-domains = <&ps_jpg>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+		status = "disabled";
+	};
+
 	jpeg0_dart: iommu@487020000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x4 0x87020000 0x0 0xc000>;
@@ -2022,6 +2033,17 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1539 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	jpeg1: jpeg@487060000 {
+		compatible = "apple,t6041-jpeg";
+		reg = <0x4 0x87060000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1543 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg1_dart 0>;
+		power-domains = <&ps_jpg>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
 		status = "disabled";
 	};
 
