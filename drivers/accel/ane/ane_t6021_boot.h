@@ -300,6 +300,8 @@ ane_t6021_init_struct_fill(u8 *buf, const struct ane_t6021_init_sources *s,
  * heap requests and over-budget IPC sizes are refused BEFORE any
  * allocation.
  */
+#define ANE_T6021_BOOT_POOL_SIZE 0x40000
+
 struct ane_t6021_boot_allocs {
 	u64 pool_dva, ipc_dva, heap_dva;
 	u64 ipc_size, heap_size;
@@ -347,7 +349,7 @@ ane_t6021_boot_prepare_publish(const struct ane_t6021_init_sources *s,
 		a->heap_size = (u64)heap;
 	}
 
-	a->pool = alloc(alloc_ctx, 0x40000, &a->pool_dva);
+	a->pool = alloc(alloc_ctx, ANE_T6021_BOOT_POOL_SIZE, &a->pool_dva);
 	if (!a->pool)
 		return -ENOMEM;
 	a->ipc = alloc(alloc_ctx, a->ipc_size, &a->ipc_dva);
