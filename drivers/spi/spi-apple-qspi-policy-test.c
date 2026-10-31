@@ -105,14 +105,42 @@ static void qspi_policy_empty(struct kunit *test)
 							     NV_START, NV_START));
 }
 
-static void qspi_policy_j613(struct kunit *test)
-{
-	unsigned long long s = APPLE_QSPI_NVRAM_START, e = APPLE_QSPI_NVRAM_END;
+/* The J613 and J713 nvram partition: 0x700000, 1 MiB. */
+#define NV7_START	0x700000ULL
+#define NV7_END		0x800000ULL
 
-	KUNIT_EXPECT_TRUE(test, apple_qspi_mutation_allowed(0x02, 3, s, 256, 1, s, e));
-	KUNIT_EXPECT_TRUE(test, apple_qspi_mutation_allowed(0x20, 3, e - 0x1000, 0, 0, s, e));
-	KUNIT_EXPECT_FALSE(test, apple_qspi_mutation_allowed(0x02, 3, s - 1, 1, 1, s, e));
-	KUNIT_EXPECT_FALSE(test, apple_qspi_mutation_allowed(0x20, 3, e, 0, 0, s, e));
+static int nv7(unsigned int opcode, unsigned int addr_bytes,
+	       unsigned long long addr, unsigned int len, int data_out)
+{
+	return apple_qspi_mutation_allowed(opcode, addr_bytes, addr, len,
+					   data_out, NV7_START, NV7_END);
+}
+
+static void qspi_policy_nvram_700000(struct kunit *test)
+{
+	/* First and last page and sector of the partition. */
+	KUNIT_EXPECT_TRUE(test, nv7(0x02, 3, NV7_START, 256, 1));
+	KUNIT_EXPECT_TRUE(test, nv7(0x02, 3, NV7_END - 256, 256, 1));
+	KUNIT_EXPECT_TRUE(test, nv7(0x20, 3, NV7_START, 0, 0));
+	KUNIT_EXPECT_TRUE(test, nv7(0x20, 3, NV7_END - 0x1000, 0, 0));
+	/* syscfg ends at 0x700000 and the NOR is 8 MiB: both stay out. */
+	KUNIT_EXPECT_FALSE(test, nv7(0x02, 3, NV7_START - 1, 1, 1));
+	KUNIT_EXPECT_FALSE(test, nv7(0x02, 3, NV7_START - 256, 256, 1));
+	KUNIT_EXPECT_FALSE(test, nv7(0x20, 3, NV7_START - 0x1000, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv7(0x02, 3, NV7_END, 1, 1));
+	KUNIT_EXPECT_FALSE(test, nv7(0x02, 3, NV7_END - 1, 2, 1));
+	KUNIT_EXPECT_FALSE(test, nv7(0x20, 3, NV7_END, 0, 0));
+	/* iBoot at 0 and the J700 window are outside this partition. */
+	KUNIT_EXPECT_FALSE(test, nv7(0x02, 3, 0, 256, 1));
+	KUNIT_EXPECT_FALSE(test, nv7(0x20, 3, NV_START, 0, 0));
+	/* Larger erases and four-byte forms are still refused here. */
+	KUNIT_EXPECT_FALSE(test, nv7(0x52, 3, NV7_START, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv7(0xd8, 3, NV7_START, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv7(0x21, 4, NV7_START, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nv7(0x12, 4, NV7_START, 256, 1));
+	/* An address above 16 MiB is not aliased onto the partition. */
+	KUNIT_EXPECT_FALSE(test, nv7(0x02, 3, (1ULL << 24) + NV7_START, 1, 1));
+	KUNIT_EXPECT_FALSE(test, nv7(0x20, 3, (1ULL << 24) + NV7_START, 0, 0));
 }
 
 static void qspi_policy_status(struct kunit *test)
@@ -136,7 +164,7 @@ static struct kunit_case apple_qspi_policy_cases[] = {
 	KUNIT_CASE(qspi_policy_refused_commands),
 	KUNIT_CASE(qspi_policy_address_width),
 	KUNIT_CASE(qspi_policy_empty),
-	KUNIT_CASE(qspi_policy_j613),
+	KUNIT_CASE(qspi_policy_nvram_700000),
 	KUNIT_CASE(qspi_policy_status),
 	{}
 };

@@ -5,6 +5,7 @@ from pathlib import Path
 import argparse
 import contextlib
 import json
+import re
 import subprocess
 import tempfile
 
@@ -145,9 +146,15 @@ int main(void){
   for(unsigned int c=0;c<ARRAY_SIZE(controllers);c++){
    struct device_node node={controllers[c]};
    for(unsigned int a=0;a<ARRAY_SIZE(bases);a++)
-    assert(apple_qspi_nvram_write_board(&node,bases[a])==((b==0&&c==0&&a==0)||(b==1&&c==1&&a==1)||(b==2&&c==2&&a==2)));
+    assert(!!apple_qspi_nvram_write_board(&node,bases[a])==(b<3&&b==c&&c==a));
   }
  }
+ const struct apple_qspi_board *qb;
+ struct device_node t8132={"apple,t8132-qspi"},t8140={"apple,t8140-qspi"};
+ machine="apple,j713";qb=apple_qspi_nvram_write_board(&t8132,0x3ad118000ULL);
+ assert(qb&&qb->nvram_start==0x700000&&qb->nvram_size==0x100000&&!memcmp(qb->jedec,jedec,3)&&!qb->bp_ok);
+ machine="apple,j700";qb=apple_qspi_nvram_write_board(&t8140,0x385110000ULL);
+ assert(qb&&qb->nvram_start==0x24000&&qb->nvram_size==0x1d0000&&qb->jedec[2]==0x15&&qb->bp_ok==0x1c);
  puts("PASS J613/J713/J700 board, controller and full-width aperture qualification (60 combinations)");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
@@ -245,15 +252,18 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
     source = (ROOT / 'drivers/spi/spi-apple-qspi.c').read_text()
     policy = (ROOT / 'drivers/spi/spi-apple-qspi-policy.h').read_text()
+    boards = (''.join(m.group(0) + '\n' for m in re.finditer(r'#define APPLE_QSPI_JEDEC_\w+.*', source)) +
+              function(source, 'struct apple_qspi_board {').rstrip() + ';\n' +
+              function(source, 'static const struct apple_qspi_board apple_qspi_boards[]').rstrip() + ';\n')
     signatures = ['static int apple_qspi_set_read_only(', 'static int apple_qspi_get_read_only(',
-                  'static bool apple_qspi_nvram_write_board(',
+                  'static const struct apple_qspi_board *\napple_qspi_nvram_write_board(',
                   'static bool apple_qspi_opcode_is_read(', 'static int apple_qspi_width_mode(',
                   'static int apple_qspi_shape_op(', 'static bool apple_qspi_supports_op(',
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
                   'static int apple_qspi_read_array(', 'static int apple_qspi_status(',
                   'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(',
                   'static int apple_qspi_mem_exec_op(']
-    code = PREFIX + policy + '\n'.join(function(source, s) for s in signatures) + CONTROLS
+    code = PREFIX + policy + boards + '\n'.join(function(source, s) for s in signatures) + CONTROLS
     output = contextlib.nullcontext(str(args.output)) if args.output else tempfile.TemporaryDirectory(prefix='qspi-nvram-')
     with output as directory:
         current = run(code, Path(directory) / 'current.c')
@@ -261,9 +271,10 @@ def main():
         if current.returncode:
             raise SystemExit(current.stderr)
         for name, old, new in [
-            ('j713-board', 'of_machine_is_compatible("apple,j713")', 'true'),
-            ('j713-aperture', 'base == 0x3ad118000ULL', 'base != 0'),
-            ('j700-board', 'of_machine_is_compatible("apple,j700")', 'true'),
+            ('controller', 'of_device_is_compatible(node, board->controller) &&', ''),
+            ('board', 'of_machine_is_compatible(board->machine) &&', ''),
+            ('aperture', 'base == board->base', 'base != 0'),
+            ('j713-partition', '"apple,j713", 0x3ad118000ULL,\n\t  0x700000', '"apple,j713", 0x3ad118000ULL,\n\t  0x680000'),
             ('range', 'addr >= start &&', 'addr >= 1 &&'),
             ('bp-ok', '!(sr1 & 0x1c & ~bp_ok)', '1'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
