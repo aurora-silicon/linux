@@ -23,6 +23,7 @@
 #include <linux/workqueue.h>
 
 #include "avd-queue.h"
+#include "avd-h264-fp.h"
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -193,6 +194,7 @@ struct avd_apple_hw;
 
 struct avd_variant {
 	const struct avd_apple_hw *apple;
+	enum avd_h264_fp_layout h264_fp_layout;
 	size_t fp_size;
 	unsigned int vp_slots[4];
 	unsigned int vp_slot_base[4];
@@ -248,6 +250,8 @@ struct avd_dev {
 	struct avd_ctx *deferred_ctx;
 	struct avd_frame frames[AVD_MAX_FRAMES];
 	struct avd_buf *frame_fp[AVD_MAX_FRAMES];
+	/* Earlier OUTPUTs in each submitted multi-slice picture. */
+	struct list_head frame_sources[AVD_MAX_FRAMES];
 	u64 frame_seq;
 	unsigned int inflight;
 	bool stopping;
@@ -310,6 +314,9 @@ struct avd_ctx {
 
 	struct list_head queue_node;
 	struct work_struct submit_work;
+	/* Unsubmitted picture: OUTPUTs stay ACTIVE through final completion. */
+	struct list_head slice_sources;
+	struct avd_frame partial;
 	bool draining;
 	/* Consecutive frames that failed in hardware; reset by a good frame. */
 	unsigned int hw_errors;
@@ -355,6 +362,7 @@ bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
 			 size_t held_bytes, u32 len, size_t decoded_size);
 #endif
 
+extern const struct avd_codec_frame_ops avd_h264_frame_ops;
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_hevc_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_vp9_fmt_ops;
@@ -391,8 +399,17 @@ void avd_queue_abort(void *priv);
 void avd_queue_drain(struct avd_ctx *ctx);
 void avd_queue_add_ctx(struct avd_ctx *ctx);
 void avd_queue_del_ctx(struct avd_ctx *ctx);
-int avd_open_build_program(struct avd_ctx *ctx);
 extern const struct avd_backend_ops avd_open_backend;
+
+/* Old open firmware needs the legacy callbacks; native queued transport does not. */
+static inline const struct avd_codec_frame_ops *avd_codec_frame_ops(struct avd_ctx *ctx)
+{
+	if (ctx->dev->backend == &avd_open_backend)
+		return NULL;
+	return ctx->coded_fmt_desc->frame_ops;
+}
+
+int avd_open_build_program(struct avd_ctx *ctx);
 extern const struct avd_backend_ops avd_apple_backend;
 extern const struct avd_backend_ops avd_qfw_backend;
 struct avd_qfw;

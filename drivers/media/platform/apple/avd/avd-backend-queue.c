@@ -203,7 +203,8 @@ static int avd_qfw_submit(struct avd_dev *avd, struct avd_frame *f)
 	unsigned int i;
 	int ret;
 
-	if (ctx->coded_fmt_desc->frame_ops)
+	/* H.264 native programs use the same SRAM ring descriptor. */
+	if (avd_codec_frame_ops(ctx) && codec != AVD_CODEC_H264)
 		return -EOPNOTSUPP;
 	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
 	    f->prog_words > f->prog->size / sizeof(u32))
@@ -211,7 +212,8 @@ static int avd_qfw_submit(struct avd_dev *avd, struct avd_frame *f)
 	if (!(avd->capabilities & BIT(codec)))
 		return -EOPNOTSUPP;
 	/* The program's EXEC words name FIFO f->idx; it must be a real FIFO. */
-	if (f->idx >= q->fifo_slots || ctx->fifo_idx != f->idx)
+	if (f->idx >= q->fifo_slots ||
+	    (!avd_codec_frame_ops(ctx) && ctx->fifo_idx != f->idx))
 		return -EINVAL;
 	for (i = 0; i < codec; i++)
 		vp += avd->variant->vp_slots[i];

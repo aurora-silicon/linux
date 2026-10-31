@@ -26,6 +26,62 @@ bool avd_backend_is_apple(const struct avd_dev *avd)
 	return avd->backend == &avd_apple_backend;
 }
 
+/* Reuse the m2m list node after removing an OUTPUT from its ready queue. */
+static void avd_sources_done(struct avd_ctx *ctx, struct list_head *sources,
+			     enum vb2_buffer_state state)
+{
+	struct v4l2_m2m_buffer *buf, *next;
+
+	list_for_each_entry_safe(buf, next, sources, list) {
+		list_del_init(&buf->list);
+		if (avd_codec_frame_ops(ctx) && buf->vb.vb2_buf.req_obj.req)
+			v4l2_ctrl_request_complete(buf->vb.vb2_buf.req_obj.req,
+						   &ctx->ctrl_hdl);
+		v4l2_m2m_buf_done(&buf->vb, state);
+	}
+}
+
+static void avd_partial_abort(struct avd_ctx *ctx)
+{
+	const struct avd_codec_frame_ops *ops = avd_codec_frame_ops(ctx);
+
+	if (list_empty(&ctx->slice_sources))
+		return;
+	if (ops && ops->retire)
+		ops->retire(ctx, &ctx->partial, VB2_BUF_STATE_ERROR);
+	else if (!ops && ctx->coded_fmt_desc->ops->done)
+		ctx->coded_fmt_desc->ops->done(ctx, ctx->partial.src,
+					     ctx->partial.dst, VB2_BUF_STATE_ERROR);
+	if (ctx->partial.dst)
+		ctx->partial.dst->is_held = false;
+	avd_sources_done(ctx, &ctx->slice_sources, VB2_BUF_STATE_ERROR);
+	memset(&ctx->partial, 0, sizeof(ctx->partial));
+}
+
+static void avd_source_hold(struct avd_ctx *ctx, struct avd_frame *f)
+{
+	struct v4l2_m2m_buffer *source;
+
+	/* Returning this OUTPUT now would let userspace overwrite DMA data. */
+	v4l2_m2m_buf_copy_metadata(f->src, f->dst);
+	v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+	source = container_of(f->src, struct v4l2_m2m_buffer, vb);
+	list_add_tail(&source->list, &ctx->slice_sources);
+	ctx->partial = *f;
+	/* Core retains CAPTURE on the ready queue. Avoid m2m timestamp-based
+	 * auto-completion of a partially collected picture.
+	 */
+	f->dst->is_held = false;
+	f->codec_priv = NULL;
+}
+
+/* Transfer partial-picture source ownership even on prepare failure. */
+static void avd_sources_attach(struct avd_ctx *ctx, struct avd_frame *f)
+{
+	list_splice_tail_init(&ctx->slice_sources, &ctx->dev->frame_sources[f->idx]);
+	memset(&ctx->partial, 0, sizeof(ctx->partial));
+}
+
 /* queue_mutex excludes callbacks and context destruction from retirement. */
 static void avd_retire(struct avd_dev *avd)
 {
@@ -57,13 +113,13 @@ static void avd_retire(struct avd_dev *avd)
 				dev_err(avd->dev, "stream stopped after %u failed frames; restart streaming to retry\n",
 					ctx->hw_errors);
 			}
-			if (ctx->coded_fmt_desc->frame_ops) {
-				if (ctx->coded_fmt_desc->frame_ops->retire)
-					ctx->coded_fmt_desc->frame_ops->retire(ctx, f, state);
+			if (avd_codec_frame_ops(ctx)) {
+				if (avd_codec_frame_ops(ctx)->retire)
+					avd_codec_frame_ops(ctx)->retire(ctx, f, state);
 			} else if (ctx->coded_fmt_desc->ops->done) {
 				ctx->coded_fmt_desc->ops->done(ctx, f->src, f->dst, state);
 			}
-			if (ctx->coded_fmt_desc->frame_ops && f->src->vb2_buf.req_obj.req)
+			if (avd_codec_frame_ops(ctx) && f->src->vb2_buf.req_obj.req)
 				v4l2_ctrl_request_complete(f->src->vb2_buf.req_obj.req,
 							   &ctx->ctrl_hdl);
 			/* CAPTURE first: OUTPUT completion signals the media request. */
@@ -72,6 +128,7 @@ static void avd_retire(struct avd_dev *avd)
 								 ctx->fh.m2m_ctx, state);
 			} else {
 				v4l2_m2m_buf_done(f->dst, state);
+				avd_sources_done(ctx, &avd->frame_sources[f->idx], state);
 				v4l2_m2m_buf_done(f->src, state);
 			}
 			spin_lock_irqsave(&avd->queue_lock, flags);
@@ -277,7 +334,7 @@ int avd_queue_ready(void *priv)
 	ready = !READ_ONCE(ctx->draining) && !READ_ONCE(avd->stopping);
 	if (ready && ctx->next_dep == AVD_DEP_PREV_DONE) {
 		/* Legacy codecs may hold several pictures in separate banks. */
-		unsigned int limit = ctx->coded_fmt_desc && !ctx->coded_fmt_desc->frame_ops ?
+		unsigned int limit = ctx->coded_fmt_desc && !avd_codec_frame_ops(ctx) ?
 				     max(ctx->max_frames, 1U) : 1, held = 0;
 
 		for (i = 0; i < AVD_MAX_FRAMES; i++)
@@ -294,7 +351,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 {
 	struct avd_ctx *ctx = container_of(work, struct avd_ctx, submit_work);
 	struct avd_dev *avd = ctx->dev;
-	const struct avd_codec_frame_ops *ops = ctx->coded_fmt_desc->frame_ops;
+	const struct avd_codec_frame_ops *ops = avd_codec_frame_ops(ctx);
 	struct avd_frame *f = NULL;
 	unsigned long flags;
 	unsigned int i;
@@ -309,6 +366,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 		struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 
 		spin_unlock_irqrestore(&avd->queue_lock, flags);
+		avd_partial_abort(ctx);
 		/* Complete the request's controls too, or its fd never signals. */
 		if (src && src->vb2_buf.req_obj.req)
 			v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
@@ -399,12 +457,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 	ctx->next_dep = ops ? f->dep : AVD_DEP_PREV_DONE;
 	if ((ops && (f->src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)) ||
 	    (!ops && avd->compat_held)) {
-		if (ops && ops->retire)
-			ops->retire(ctx, f, VB2_BUF_STATE_DONE);
-		else if (!ops && ctx->coded_fmt_desc->ops->done)
-			ctx->coded_fmt_desc->ops->done(ctx, f->src, f->dst, VB2_BUF_STATE_DONE);
-		if (ops && f->src->vb2_buf.req_obj.req)
-			v4l2_ctrl_request_complete(f->src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+		avd_source_hold(ctx, f);
 		spin_lock_irqsave(&avd->queue_lock, flags);
 		f->state = AVD_FRAME_FREE;
 		f->ctx = NULL;
@@ -413,10 +466,10 @@ static void avd_queue_submit_work(struct work_struct *work)
 		avd_pm_queue_changed(avd);
 		pm_runtime_mark_last_busy(avd->dev);
 		pm_runtime_put_autosuspend(avd->dev);
-		v4l2_m2m_buf_done_and_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx,
-						 VB2_BUF_STATE_DONE);
+		v4l2_m2m_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx);
 		goto unlock;
 	}
+	avd_sources_attach(ctx, f);
 	v4l2_m2m_buf_copy_metadata(f->src, f->dst);
 	if (!f->scheduler_held) {
 		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
@@ -436,6 +489,11 @@ static void avd_queue_submit_work(struct work_struct *work)
 	mod_delayed_work(system_wq, &avd->queue_work, 0);
 	goto unlock;
  fail:
+	avd_sources_attach(ctx, f);
+	/* Failure ends a held picture as well as its final request. */
+	f->scheduler_held = false;
+	if (f->dst)
+		f->dst->is_held = false;
 	/* Detach before retirement, including partially prepared codec state. */
 	if (!f->scheduler_held) {
 		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
@@ -450,6 +508,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 	mod_delayed_work(system_wq, &avd->queue_work, 0);
 	goto unlock;
  fail_no_pm:
+	avd_partial_abort(ctx);
 	spin_lock_irqsave(&avd->queue_lock, flags);
 	f->state = AVD_FRAME_FREE;
 	f->ctx = NULL;
@@ -502,6 +561,7 @@ void avd_queue_drain(struct avd_ctx *ctx)
 		}
 	}
 	avd_retire(avd);
+	avd_partial_abort(ctx);
 	if (ret >= 0 && ctx->session_started && avd->backend->session_stop &&
 	    ctx->session_generation == avd->fw_generation)
 		avd->backend->session_stop(ctx);
@@ -527,6 +587,7 @@ void avd_queue_add_ctx(struct avd_ctx *ctx)
 	u32 id;
 
 	INIT_WORK(&ctx->submit_work, avd_queue_submit_work);
+	INIT_LIST_HEAD(&ctx->slice_sources);
 	mutex_lock(&ctx->dev->queue_mutex);
 	/* Borage decode prefix has ten client bits. */
 	for (id = 0; id < 1024; id++) {
@@ -564,6 +625,7 @@ int avd_queue_init(struct avd_dev *avd)
 		struct avd_frame *f = &avd->frames[i];
 
 		f->idx = i;
+		INIT_LIST_HEAD(&avd->frame_sources[i]);
 		f->prog = devm_kzalloc(avd->dev, sizeof(*f->prog), GFP_KERNEL);
 		if (!f->prog)
 			return -ENOMEM;
@@ -573,6 +635,7 @@ int avd_queue_init(struct avd_dev *avd)
 
 void avd_queue_cleanup(struct avd_dev *avd)
 {
+	struct avd_ctx *ctx;
 	unsigned int i;
 
 	mutex_lock(&avd->queue_mutex);
@@ -581,6 +644,8 @@ void avd_queue_cleanup(struct avd_dev *avd)
 		avd_reset_queue(avd, -ESHUTDOWN);
 		avd_retire(avd);
 	}
+	list_for_each_entry(ctx, &avd->contexts, queue_node)
+		avd_partial_abort(ctx);
 	mutex_unlock(&avd->queue_mutex);
 	cancel_delayed_work_sync(&avd->queue_work);
 	for (i = 0; i < AVD_MAX_FRAMES; i++) {

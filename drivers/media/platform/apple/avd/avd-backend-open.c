@@ -80,7 +80,7 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	if (avd->compat_active)
 		return -EBUSY;
 	/* Native frame_ops require firmware-side PP chaining and tagged replies. */
-	if (ctx->coded_fmt_desc->frame_ops)
+	if (avd_codec_frame_ops(ctx))
 		return -EOPNOTSUPP;
 	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
 	    f->prog_words > f->prog->size / sizeof(u32))
@@ -91,7 +91,7 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 		vp += avd->variant->vp_slots[i];
 	if (avd->variant->vp_slot_base[codec])
 		vp = avd->variant->vp_slot_base[codec];
-	avd->variant->configure_stream(avd, ctx->inst.addr, ctx->fifo_idx, vp);
+	avd->variant->configure_stream(avd, f->fifo_iova ?: ctx->inst.addr, ctx->fifo_idx, vp);
 	reg = avd->ctrl + avd->variant->vp_slot_offset + vp * 4;
 	avd->compat_active = f;
 	avd->compat_ctx = ctx;
