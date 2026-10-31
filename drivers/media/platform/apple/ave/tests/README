@@ -32,3 +32,61 @@ MAINTAINERS already covers the entire AVE directory (FILE_PATH_CHANGES).
 The ABI refactor also has in-kernel arm64 KUnit tests selected by
 VIDEO_APPLE_AVE_CMD_KUNIT_TEST. The host runner understands both the older
 single-builder sources and the per-ABI writer split for baseline comparison.
+
+Recovery and PM checks
+----------------------
+
+Run python3 run-recovery.py for ASan/UBSan checks of the production recovery,
+firmware shutdown, suspend/resume, failed-session cleanup, queue and IPC pump
+callbacks. It covers two owners (one idle), both ready queues plus an owned
+OUTPUT buffer, racing QBUF, PM reference balance, DMA quarantine/reclamation,
+retained power, failed control stop, the recovery limit, pristine DATA restore
+failure, suspend refusal/rollback and a busy IPC stream reaching its deadline.
+MMIO, DMA allocation and PM are simulated: this cannot establish hardware reset
+values or that a VENC domain actually powered down.
+
+The apple-ave-recovery KUnit suite tests the actual sliding-window helper at
+expiry boundaries, with staggered attempts and across jiffies wrap. Run with
+../.kunitconfig using tools/testing/kunit/kunit.py. The existing
+tools/asahi/ave-pm-tests.py also checks the #651 sleep rollback contract.
+
+Hardware procedure (requires a qualified firmware/SoC and an approved lane)
+-------------------------------------------------------------------------
+
+1. Record the kernel revision, firmware CRCs and boot ID. Mount debugfs and
+   enable the normal PM/genpd tracing available in the test kernel. Confirm a
+   fresh AVC and HEVC encode can each complete and decode correctly.
+2. Start a long encode with several OUTPUT and CAPTURE buffers queued. While
+   it runs, as root write 1 to /sys/kernel/debug/apple-ave/inject_wedge.
+   This software fault marks the current firmware broken and suppresses the
+   recovery Halt attempt, modelling a command timeout without malformed DMA
+   commands. It does not reproduce a real DART overrun or a firmware deadlock.
+3. Check that the client promptly sees POLLERR/EIO and every buffer still owned
+   by the driver completes with ERROR, including OUTPUT slots already handed
+   to firmware. A V4L2 queue exerciser should count completions; ffmpeg alone
+   only checks the client-visible exit. QBUF after failure must fail or return
+   the buffer with ERROR. STREAMOFF both queues before restarting that context.
+4. Immediately start a new encode without rebooting. Allow the existing bounded
+   PM retry loop for DARTs sharing VENC power. Require the recovery stop log,
+   a real domain power-off/on in PM tracing, the power-cycle-confirmed log,
+   fresh firmware Config and valid encoded output. The driver re-arms BOOT_ARG
+   with control off and requires it to read zero after resume; qualify that
+   reset witness on each target. A retained nonzero witness must cause EAGAIN,
+   with no DATA restore, allocation reuse or new firmware start.
+5. Repeat with two concurrent clients, including an idle open session with no
+   outstanding frames. Both must fail, all PM references must drop, and a new
+   client must encode. Check there are no stale replies, DART faults or DMA
+   allocation growth over repeated recoveries.
+6. Inject three faults inside ten minutes. A fourth must report the recovery
+   limit and return queue errors without starting another firmware boot. After
+   the oldest attempt expires, a new session must recover successfully.
+7. In a separate approved sleep test, check normal encode/sleep/resume and a
+   halt-failure suspend refusal. A failed suspend must restart the m2m scheduler
+   (#651); system sleep must never treat the forced runtime stop as a successful
+   firmware Halt. Preserve logs from failed sleep attempts as well as retries.
+
+Run this procedure on each target requiring qualification, including both
+J616s and Neo. Repeat the recovery with a genuine firmware timeout/DART fault
+when a safe reproducer is available. Keep captures and machine records outside
+the public source tree. Rollback is a normal revert of the recovery commits;
+use the lane's existing boot fallback when testing candidate kernels.

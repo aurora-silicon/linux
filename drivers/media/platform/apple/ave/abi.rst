@@ -59,3 +59,7 @@ exact hello, ring dimensions, Config/Open/Close completion IDs and status, Halt
 scratch confirmation, actual power gating and a second cold boot. Encoding on
 9003 requires the existing hardware regression lane; these software tests do not
 establish hardware equivalence.
+
+The 9003 runtime recovery path retains its upstream quarantine and reset-witness
+checks. It is deliberately unavailable for 6070: a broken lifecycle must keep
+its mappings and power until scratch-confirmed Halt can establish quiescence.

@@ -137,6 +137,26 @@ static const struct file_operations ave_lifecycle_fops = {
 	.write = ave_lifecycle_write,
 };
 
+/* Root-only software timeout injection; does not send malformed firmware commands. */
+static int ave_inject_wedge(void *data, u64 value)
+{
+	struct ave_dev *ave = data;
+	int ret = 0;
+
+	if (value != 1)
+		return -EINVAL;
+	mutex_lock(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_RUNNING) {
+		ret = -EBUSY;
+	} else {
+		ave->inject_wedge = true;
+		ave_fw_mark_broken(ave, -ETIMEDOUT, "debugfs injection");
+	}
+	mutex_unlock(&ave->hw_lock);
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(ave_inject_wedge_fops, NULL, ave_inject_wedge, "%llu\n");
+
 static void ave_debugfs_init(struct ave_dev *ave)
 {
 	static const char *const names[2][AVE_IMAGE_COUNT] = {
@@ -152,6 +172,8 @@ static void ave_debugfs_init(struct ave_dev *ave)
 				    &ave_lifecycle_fops);
 		return;
 	}
+	debugfs_create_file("inject_wedge", 0200, ave->debugfs, ave,
+			    &ave_inject_wedge_fops);
 	for (unsigned int c = 0; c < 2; c++)
 		for (unsigned int k = 0; k < AVE_IMAGE_COUNT; k++) {
 			struct debugfs_blob_wrapper *blob;
@@ -281,7 +303,7 @@ static int ave_runtime_suspend(struct device *dev)
 	int ret;
 
 	mutex_lock(&ave->hw_lock);
-	ret = ave_fw_shutdown(ave);
+	ret = ave_fw_runtime_suspend(ave);
 	if (!ret && ave->layout && ave->layout->abi->transport->scratch_halt)
 		ave_fw_release_boot(ave);
 	mutex_unlock(&ave->hw_lock);

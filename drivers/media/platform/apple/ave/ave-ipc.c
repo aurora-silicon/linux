@@ -401,14 +401,6 @@ int ave_ipc_scalar_buf(struct ave_dev *ave)
 	return -EBUSY;
 }
 
-static void ave_ipc_mark_broken(struct ave_dev *ave, int err, const char *what)
-{
-	if (ave->fw_state == AVE_FW_RUNNING)
-		dev_err(ave->dev, "firmware stopped answering (%s: %d); it restarts after the next power cycle\n",
-			what, err);
-	ave->fw_state = AVE_FW_BROKEN;
-}
-
 /*
  * Hand the command in buffer @buf to the firmware. The timeout words are
  * {duration, creation}, using the host clock for 9003 and the IOP clock
@@ -470,7 +462,7 @@ int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len,
 
 	ret = ave_ring_send(ave, &ave->ring[0], ave->ipc_fw_base + off, len);
 	if (ret) {
-		ave_ipc_mark_broken(ave, ret, "command ring full");
+		ave_fw_mark_broken(ave, ret, "command ring full");
 		return ret;
 	}
 	ave->unacked |= BIT(buf);
@@ -605,6 +597,10 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 	for (;;) {
 		if (cond && cond(ave, arg))
 			return 0;
+		if (cond && ktime_after(ktime_get(), deadline)) {
+			ave_fw_mark_broken(ave, -ETIMEDOUT, "no answer");
+			return -ETIMEDOUT;
+		}
 		if (ave->fw_state != AVE_FW_RUNNING) {
 			dev_err_ratelimited(ave->dev, "waiting on a firmware in state %d\n",
 					    ave->fw_state);
@@ -612,7 +608,7 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		}
 		ret = ave_ipc_poll_once(ave);
 		if (ret < 0) {
-			ave_ipc_mark_broken(ave, ret, "ring error");
+			ave_fw_mark_broken(ave, ret, "ring error");
 			return ret;
 		}
 		if (ret) {
@@ -621,10 +617,6 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		}
 		if (!cond)
 			return 0;
-		if (ktime_after(ktime_get(), deadline)) {
-			ave_ipc_mark_broken(ave, -ETIMEDOUT, "no answer");
-			return -ETIMEDOUT;
-		}
 		if (idle++ < AVE_POLL_FAST_ROUNDS)
 			usleep_range(50, 100);
 		else

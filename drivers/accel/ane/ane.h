@@ -7,6 +7,7 @@
 #include <linux/atomic.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/pm_qos.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_device.h>
@@ -63,6 +64,8 @@ struct ane_device {
 	 * and protects bo_list, preserved_list and removed.
 	 */
 	struct mutex engine_lock;
+	/* Serializes runtime-PM references across a recovery cycle. */
+	struct mutex pm_lock;
 	struct list_head bo_list;
 
 	/*
@@ -126,7 +129,26 @@ struct ane_device {
 		bool voted;
 		bool clock_held;
 		bool pinned;
+		bool cpu_boost;
 	} perf;
+
+	/*
+	 * Engine-busy CPU cluster boost (ane_boost.c): min-frequency QoS on
+	 * every cpufreq policy while a submit runs and until boost_idle_ms
+	 * after the last one completes. Used only when the DT binds no
+	 * performance controller, so the engine keeps the boost it had
+	 * until it gets a clock level instead.
+	 */
+	struct ane_boost {
+		struct mutex lock;	/* protects the fields below */
+		struct delayed_work off;
+		struct freq_qos_request *legs;
+		int nlegs;
+		int held;
+		unsigned long last_end;
+		bool busy;
+		bool on;
+	} boost;
 
 	/*
 	 * Producer-side stats (sysfs ane_stats, debugfs ane_timeline;
@@ -165,6 +187,11 @@ int ane_perf_exit(struct ane_device *ane);
 int ane_perf_begin(struct ane_device *ane);
 void ane_perf_end(struct ane_device *ane);
 int ane_perf_suspend(struct ane_device *ane);
+
+int ane_boost_init(struct ane_device *ane);
+void ane_boost_exit(struct ane_device *ane);
+void ane_boost_begin(struct ane_device *ane);
+void ane_boost_end(struct ane_device *ane);
 
 int ane_dart_init(struct ane_device *ane);
 void ane_dart_mask(struct ane_device *ane);
