@@ -27,7 +27,7 @@ struct dev_pm_domain_list;
 struct iommu_domain;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
-#define AVE_MAX_SLOTS		5
+#define AVE_MAX_SLOTS		7
 /* Sessions one firmware boot serves at once (macOS was seen running two). */
 #define AVE_MAX_SESSIONS	2
 
@@ -103,10 +103,7 @@ enum ave_image {
 	AVE_IMAGE_COUNT,
 };
 
-#define AVE_START_H264_BYTES		0x3180
-#define AVE_START_HEVC_BYTES		0x13f28
-#define AVE_PROCESS_H264_BYTES		0x63d8
-#define AVE_PROCESS_HEVC_BYTES		0xb1c0
+#include "ave-layout.h"
 
 /* The firmware build whose command layouts the driver generates */
 #define AVE_FW_TEXT_CRC_9003_78_0	0x69c54454
@@ -131,13 +128,14 @@ struct ave_variant {
 	u32 boot_device_id;
 	u32 device_type;
 	u32 lfs_ref_scale;
-	/* Zero means no command constants or MCC DSID have been qualified. */
-	u32 encoding_text_crc;
+	/* Register sequence and boot/hello configuration have been qualified. */
+	bool boot_qualified;
 };
 
 struct ave_dev {
 	struct device *dev;
 	const struct ave_variant *variant;
+	const struct ave_fw_layout *layout;
 	void __iomem *codec;
 	void __iomem *mbox;
 	void __iomem *coproc;
@@ -206,12 +204,15 @@ struct ave_params {
 	u32 level;			/* firmware level enum, 1-based */
 	bool high;
 	u32 coded_cap;
+	u32 bit_depth;		/* zero also means the existing 8-bit API */
+	u32 initial_qp;		/* CQ only; bit-rate modes use 26 */
 };
 
 struct ave_slot {
 	struct ave_buf coded;
 	struct ave_buf meta;
 	struct ave_buf aux;		/* H.264 per-frame buffer, HEVC slice headers */
+	struct ave_buf extra;		/* counted layout: per-slot 16 KiB buffer */
 	struct ave_buf bounce;		/* input copied to the encoder's stride */
 	struct vb2_v4l2_buffer *src;
 	u32 status;
@@ -229,7 +230,10 @@ struct ave_session {
 	struct ave_buf ref_b[AVE_MAX_REFS];
 	struct ave_buf ref_c[AVE_MAX_REFS];
 	struct ave_buf ref_d[AVE_MAX_REFS];
+	struct ave_buf ref_e[AVE_MAX_REFS];
+	struct ave_buf ref_f[AVE_MAX_REFS];
 	struct ave_buf mb;
+	struct ave_buf mb_extra[2];
 	struct ave_buf row_a, row_b, fixed;
 	struct ave_buf tile[AVE_TILE_BUFS];
 	struct ave_buf tile_aux[AVE_TILE_BUFS];
@@ -345,9 +349,11 @@ bool ave_sess_stalled(struct ave_session *sess);
 bool ave_sess_starved(struct ave_session *sess);
 
 /* ave-image.c */
-void ave_image_start(u8 *cmd, size_t len, enum ave_codec codec, bool reorder_off,
+void ave_image_start(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
+		     enum ave_codec codec, bool reorder_off,
 		     bool hevc_low_delay);
-void ave_image_process(u8 *cmd, size_t len, enum ave_codec codec);
+void ave_image_process(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
+		       enum ave_codec codec);
 
 /* ave-drv.c */
 void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image kind,

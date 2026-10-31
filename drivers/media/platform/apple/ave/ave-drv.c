@@ -53,6 +53,13 @@ static const struct ave_variant ave_t8112 = {
 	.lfs_ref_scale = 1,
 };
 
+/* CRC, boot-config words and coprocessor start registers remain unqualified. */
+static const struct ave_variant ave_t6041 = {
+	.fw_text_size = 0x14c000,
+	.fw_data_size = 0x12c000,
+	.lfs_ref_scale = 2,
+};
+
 static const struct ave_variant ave_t8140 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
@@ -60,7 +67,7 @@ static const struct ave_variant ave_t8140 = {
 	.boot_device_id = 29,
 	.device_type = 27,
 	.lfs_ref_scale = 2,
-	.encoding_text_crc = AVE_FW_TEXT_CRC_9003_78_0,
+	.boot_qualified = true,
 };
 
 /*
@@ -68,17 +75,12 @@ static const struct ave_variant ave_t8140 = {
  * last_process0_{h264,hevc} the first Process of the last session, so the
  * generated commands can be compared with reference captures.
  */
-static const size_t ave_image_bytes[2][AVE_IMAGE_COUNT] = {
-	{ AVE_START_H264_BYTES, AVE_PROCESS_H264_BYTES },
-	{ AVE_START_HEVC_BYTES, AVE_PROCESS_HEVC_BYTES },
-};
-
 void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image kind,
 		      const void *cmd, size_t len)
 {
 	void *dst = ave->dump[codec - 1][kind];
 
-	if (dst && len == ave_image_bytes[codec - 1][kind])
+	if (ave->layout && dst && len == ave->layout->bytes[codec - 1][kind])
 		memcpy(dst, cmd, len);
 }
 
@@ -89,21 +91,22 @@ static void ave_debugfs_init(struct ave_dev *ave)
 		{ "last_start_hevc", "last_process0_hevc" },
 	};
 
-	if (!IS_ENABLED(CONFIG_DEBUG_FS))
+	if (!IS_ENABLED(CONFIG_DEBUG_FS) || !ave->layout)
 		return;
 	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
 	for (unsigned int c = 0; c < 2; c++)
 		for (unsigned int k = 0; k < AVE_IMAGE_COUNT; k++) {
 			struct debugfs_blob_wrapper *blob;
+			size_t size = ave->layout->bytes[c][k];
 
 			blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
-			ave->dump[c][k] = devm_kzalloc(ave->dev, ave_image_bytes[c][k], GFP_KERNEL);
+			ave->dump[c][k] = devm_kzalloc(ave->dev, size, GFP_KERNEL);
 			if (!blob || !ave->dump[c][k]) {
 				ave->dump[c][k] = NULL;
 				continue;
 			}
 			blob->data = ave->dump[c][k];
-			blob->size = ave_image_bytes[c][k];
+			blob->size = ave->layout->bytes[c][k];
 			debugfs_create_blob(names[c][k], 0400, ave->debugfs, blob);
 		}
 }
@@ -256,6 +259,7 @@ static const struct dev_pm_ops ave_pm_ops = {
 
 static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6000-ave", .data = &ave_t6000 },
+	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ }
