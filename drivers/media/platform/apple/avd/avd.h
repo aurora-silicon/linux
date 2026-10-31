@@ -248,6 +248,8 @@ struct avd_dev {
 	/* Only the open-firmware compatibility path uses these. */
 	struct avd_frame *building;
 	struct avd_frame *compat_active;
+	/* Context of the last legacy submission, for VP DONE without a frame. */
+	struct avd_ctx *compat_ctx;
 	bool compat_held;
 
 	struct reset_control *rstc;
