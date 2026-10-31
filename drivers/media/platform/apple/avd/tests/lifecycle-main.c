@@ -52,7 +52,7 @@ int main(void)
   int count = n & 1 ? 1 : 4;
   decode.frame_num = n;
   for (int i = 0; i < count; i++) {
-   sl.first_mb_in_slice = i * 4;
+   sl.first_mb_in_slice = !n && i == 1 ? 8 : !n && i == 2 ? 4 : i * 4;
    f[n].src = &src[n][i];
    src[n][i].flags = i + 1 < count ? V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF : 0;
    /* Intermediate slots and programs may be reused by unrelated contexts. */

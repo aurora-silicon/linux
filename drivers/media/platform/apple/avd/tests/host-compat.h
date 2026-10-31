@@ -48,7 +48,7 @@ struct v4l2_ctrl_handler { struct v4l2_ctrl ctrls[6]; };
 struct avd_ctx {
  struct v4l2_ctrl_handler ctrl_hdl; unsigned int max_frames, image_fmt; struct avd_dev *dev; void *priv; bool decomp; struct avd_comp comp; struct avd_job job;
  struct { struct { struct { int q; } cap_q_ctx; } *m2m_ctx; } fh;
- struct { struct { struct { u32 width,height; struct { u32 bytesperline, sizeimage; } plane_fmt[1]; } pix_mp; } fmt; } decoded_fmt;
+ struct v4l2_format decoded_fmt;
 };
 struct avd_run {
  struct { struct vb2_v4l2_buffer *src, *dst; } bufs;
@@ -62,7 +62,7 @@ enum { AVD_CODEC_H264 = 1 };
 static struct avd_decoded_buffer refs[16];
 #define vb2_to_avd_decoded_buf(vb) ((struct avd_decoded_buffer *)(vb))
 #define vb2_dma_contig_plane_dma_addr(vb, p) ((vb)->dma)
-#define avd_get_ref_buf(ctx,dst,ts) (&refs[(ts)])
+#define avd_get_ref_buf(ctx,dst,ts) ((void)(ctx), (void)(dst), &refs[(ts)])
 #define vb2_find_buffer(q,ts) (&refs[(ts)].base.vb.vb2_buf)
 #define fmt_width(ctx) ((ctx)->decoded_fmt.fmt.pix_mp.width)
 #define fmt_height(ctx) ((ctx)->decoded_fmt.fmt.pix_mp.height)

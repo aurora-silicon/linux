@@ -168,7 +168,9 @@ static void avd_h264_emit_addr(struct avd_ctx *ctx, struct avd_h264_run *run,
 		avd_h264_emit(ctx, run, upper_32_bits(addr), AVD_H264_FP_NONE);
 	}
 	if (run->fp_cursor.buf && !run->error)
-		run->error = avd_h264_fp_address(&run->fp_cursor, field, index, addr);
+		/* V3 stores the same shifted word as the LSR instruction. */
+		run->error = avd_h264_fp_address(&run->fp_cursor, field, index,
+					 addr & ~(dma_addr_t)0xff);
 }
 
 static void avd_h264_emit_comp(struct avd_ctx *ctx, struct avd_h264_run *run,
@@ -963,8 +965,6 @@ static int avd_h264_collect(struct avd_ctx *ctx, struct avd_h264_run *run)
 		vb2_to_avd_decoded_buf(&picture->dst->vb2_buf)->bank = i + 1;
 	} else if (!picture || picture->dst != run->base.bufs.dst ||
 		   !picture->slice_num ||
-		   sl->first_mb_in_slice <=
-			picture->slices[picture->slice_num - 1].params.first_mb_in_slice ||
 		   run->decode_params->frame_num != picture->decode.frame_num ||
 		   run->decode_params->top_field_order_cnt != picture->decode.top_field_order_cnt ||
 		   run->decode_params->bottom_field_order_cnt !=

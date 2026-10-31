@@ -16,6 +16,7 @@
  * V3: https://github.com/eiln/avd/blob/main/avid/h264/fp.py (MIT), with
  *     avid/h264/halv3.py for the address shifts and instruction fields.
  * Borage: clean-room protocol SPEC (2026-10-31), sections 4.1, 6.1, 6.2.
+ * T6000 selects LilyD: V3 is comparison evidence, not its selected Apple ABI.
  * TODO rows: Daybreak per-SoC ledger task t-3862; no V3/Borage fallback.
  */
 struct avd_h264_fp_layout_info {
@@ -25,7 +26,7 @@ struct avd_h264_fp_layout_info {
 };
 
 static const struct avd_h264_fp_layout_info avd_h264_fp_layouts[] = {
-	{ AVD_H264_FP_V3, 0x8b4e0, "MIT eiln/avd avid/h264/fp.py: V3, T6000" },
+	{ AVD_H264_FP_V3, 0x8b4e0, "MIT eiln/avd avid/h264/fp.py: Viola/V3 comparison" },
 	{ AVD_H264_FP_BORAGE, 0x1130d0, "SPEC 6.2: T6040/Borage" },
 	{ AVD_H264_FP_T8112_TODO, 0, "TODO t-3862: T8112 per-SoC ledger" },
 	{ AVD_H264_FP_T8140_TODO, 0, "TODO t-3862: T8140 per-SoC ledger" },
