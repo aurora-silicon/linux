@@ -1295,6 +1295,15 @@
 		aop_las: las {
 			compatible = "apple,t6041-aop-las", "apple,aop-las";
 		};
+
+		/* The calibration properties come from the bootloader. */
+		aop_accel: accel {
+			compatible = "apple,t6041-aop-accel", "apple,aop-accel";
+		};
+
+		aop_gyro: gyro {
+			compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
+		};
 	};
 
 	/* ADT lists the interrupts as 1, 0, 3, 2 of the block: send-empty is the lowest. */
