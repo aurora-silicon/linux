@@ -329,6 +329,32 @@ produce a timeout. The loader pins both fixture hashes and uses ABI 1 ioctls dir
 shared libane library is needed. ``--check-fixtures`` validates the two containers without
 opening a device.
 
+H14 program lifetime
+--------------------
+
+Byte-identical sections share one firmware program and one process. Every
+file holds a reference on each program it loaded, and ``PROC_CREATE`` and
+``EXEC`` refuse a program the file holds no reference on with ``-ENOENT``.
+When the last file holding a program closes, the driver sends
+TERMINATE_PROCESS (0x203) for its process and then DESTROY_PROGRAM (0x201).
+Only after both are acknowledged does it drop its references on the section
+buffers, which are then freed or pooled like any other BO. A failed unload
+keeps the program and its buffers until a verified firmware restart.
+
+The firmware asks for memory on the SHAREDMALLOC ring and gives it back with
+a FREE request, which carries the returned IOVA in the slot header and an
+empty body. It waits for the answer with its shared-memory lock held, and a
+FREE caused by a command can arrive after that command's acknowledgment. The
+driver serves the ring before each command, while a command or call is
+pending, and for 10 ms of quiet after each unload command. A FREE releases the
+buffer and its table slot, so the table and its byte count follow the live
+allocations rather than every allocation since boot.
+
+``fw_memory`` in the device's accel debugfs directory reports the live
+firmware allocations, their bytes, the table high-water mark, and the loaded
+and held programs. A command timeout also logs the allocation ring and the
+target-to-host rings at the host cursors.
+
 H14 recovery lifecycle
 ----------------------
 

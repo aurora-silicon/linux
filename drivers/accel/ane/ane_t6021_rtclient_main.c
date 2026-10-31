@@ -72,6 +72,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
+#include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
@@ -102,6 +103,7 @@
 #include "ane_fw_ids.h"
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
+#include "ane_t6021_lifetime.h"
 
 #include <drm/ane_accel.h>
 
@@ -191,14 +193,11 @@ module_param(stats, bool, 0444);
 MODULE_PARM_DESC(stats,
 		 "Expose ane_stats sysfs and ane_timeline debugfs (default 1; 0 = no files and the hot path skips the counters)");
 
+/* Caps on the live firmware allocations (SHAREDMALLOC) and the command
+ * buffer. A FREE from the firmware releases its slot and bytes.
+ */
 #define ANE_LEGACY_ALLOCS 8192
 #define ANE_LEGACY_BYTES SZ_512M
-
-struct ane_legacy_buffer {
-	void *cpu;
-	dma_addr_t dma;
-	size_t size;
-};
 
 struct ane_t6021_fd;
 
@@ -264,7 +263,8 @@ struct ane_rtclient {
 	struct ane_h16_pending *waiting;
 	struct list_head h16_processes;
 	struct ane_legacy_buffer *legacy_buffers;
-	u32 legacy_allocated;
+	u32 legacy_allocated;	/* high-water mark of the table */
+	u32 legacy_live;	/* slots in use now */
 	size_t legacy_bytes;
 	u32 legacy_malloc_cursor;
 	u32 legacy_cmd_cursor[ANE_T6021_CHMAN_COUNT];
@@ -296,6 +296,8 @@ struct ane_rtclient {
 struct ane_t6021_fd {
 	struct list_head bos;
 	struct list_head h16_processes;
+	/* H14 programs this file loaded; under ane_t6021_fw_lock. */
+	struct ane_t6021_fdprogs progs;
 };
 
 /* Per-file handle counter and every per-fd list against same-fd concurrent
@@ -329,8 +331,10 @@ struct ane_t6021_bo {
 	dma_addr_t dma;
 	size_t size;
 	u64 fw_epoch;
+	u32 prog_refs;			/* program sections using this BO */
 	bool fw_ref;			/* the firmware received this IOVA */
 	bool fw_program;		/* a loaded program keeps this IOVA */
+	bool fw_io;			/* published as a CALL buffer */
 	struct device *dev;
 };
 
@@ -434,11 +438,16 @@ static void ane_t6021_bo_new_epoch(void)
 /* bo_lock and a live handle protect the BO while its IOVA is published. */
 static void ane_t6021_bo_publish(struct ane_t6021_bo *bo, bool program)
 {
-	if (bo->fw_epoch != ane_t6021_bo_epoch)
+	if (bo->fw_epoch != ane_t6021_bo_epoch) {
 		bo->fw_program = false;
+		bo->fw_io = false;
+	}
 	bo->fw_epoch = ane_t6021_bo_epoch;
 	bo->fw_ref = true;
-	bo->fw_program |= program;
+	if (program)
+		bo->fw_program = true;
+	else
+		bo->fw_io = true;
 }
 
 /* A parked io BO of SIZE's page-aligned size, or NULL. */
@@ -500,15 +509,25 @@ static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
 
 /* ---- boot helpers (shared with boot.c / fwload.c) ---- */
 
+/* Allocate a firmware-visible buffer in the first free table slot. Returns
+ * the slot index or a negative errno. legacy_allocated is the high-water
+ * mark; legacy_live and legacy_bytes count what is allocated now.
+ */
 static int ane_rtclient_legacy_alloc(struct ane_rtclient *ane, u64 size)
 {
 	struct ane_legacy_buffer *buffer;
+	u32 cap = ANE_LEGACY_ALLOCS - min_t(u32, ane->retired_allocated,
+					    ANE_LEGACY_ALLOCS);
+	int slot;
 
 	if (!size || !IS_ALIGNED(size, SZ_16K) || size > SZ_2M ||
-	    ane->legacy_allocated + ane->retired_allocated >= ANE_LEGACY_ALLOCS ||
 	    size > ANE_LEGACY_BYTES - ane->legacy_bytes - ane->retired_bytes)
 		return -E2BIG;
-	buffer = &ane->legacy_buffers[ane->legacy_allocated];
+	slot = ane_t6021_legtab_pick(ane->legacy_buffers, ane->legacy_allocated,
+				     cap);
+	if (slot < 0)
+		return -E2BIG;
+	buffer = &ane->legacy_buffers[slot];
 	buffer->cpu = dma_alloc_coherent(ane->dev, size, &buffer->dma,
 					 GFP_KERNEL);
 	if (!buffer->cpu)
@@ -516,14 +535,16 @@ static int ane_rtclient_legacy_alloc(struct ane_rtclient *ane, u64 size)
 	if (!IS_ALIGNED(buffer->dma, SZ_16K) ||
 	    (ane->fw && !ane_t6021_fw_alias_iova_ok(ane->fw, buffer->dma, size))) {
 		dma_free_coherent(ane->dev, size, buffer->cpu, buffer->dma);
-		buffer->cpu = NULL;
+		memset(buffer, 0, sizeof(*buffer));
 		return -ERANGE;
 	}
 	memset(buffer->cpu, 0, size);
 	buffer->size = size;
 	ane->legacy_bytes += size;
-	ane->legacy_allocated++;
-	return 0;
+	ane->legacy_live++;
+	if ((u32)slot == ane->legacy_allocated)
+		ane->legacy_allocated++;
+	return slot;
 }
 
 /* Validate the chman table the fw published in the 'IPC ' surface. */
@@ -619,6 +640,163 @@ static void __iomem *ane_rtclient_doorbell(struct ane_rtclient *ane)
 		ane->soc->platform->doorbell : ANE_IPI_OFF);
 }
 
+/*
+ * Answer the SHAREDMALLOC slot at *cursor if the firmware posted a request
+ * there (see ane_t6021_lifetime.h). Returns 1 when a request was answered
+ * and the cursor moved, 0 when the slot holds none, or a negative errno for
+ * a slot no request has the shape of or an allocation that failed.
+ */
+static int ane_rtclient_malloc_service(struct ane_rtclient *ane,
+				       unsigned int *cursor)
+{
+	const struct ane_fw_channel *c = &ane->channels[5];
+	u64 *slot = ane->fw->boot_ipc + c->offset + (size_t)*cursor * 64;
+	void __iomem *ipi = ane_rtclient_doorbell(ane);
+	u64 hdr = READ_ONCE(slot[0]), size, mode;
+	struct ane_legacy_buffer *buf;
+	int idx;
+
+	if (hdr & 1)
+		return 0;
+	/* H16 needs its own validated allocation/reply provider. Never answer
+	 * it with the legacy H14 allocation index.
+	 */
+	if (ane->soc->platform)
+		return -EOPNOTSUPP;
+	dma_rmb();
+	size = READ_ONCE(slot[1]);
+	mode = READ_ONCE(slot[2]);
+	switch (ane_t6021_mring_classify(hdr, size, mode)) {
+	case ANE_T6021_MRING_IDLE:
+		return 0;
+	case ANE_T6021_MRING_MALLOC:
+		idx = ane_rtclient_legacy_alloc(ane, size);
+		if (idx < 0) {
+			dev_err(ane->dev,
+				"fw malloc of %#llx bytes (mode %#llx) refused %d (live %u, %zu bytes)\n",
+				size, mode, idx, ane->legacy_live, ane->legacy_bytes);
+			return -ENOMEM;
+		}
+		buf = &ane->legacy_buffers[idx];
+		WRITE_ONCE(slot[1], 0);
+		WRITE_ONCE(slot[2], idx + 1);
+		dma_wmb();
+		WRITE_ONCE(slot[0], buf->dma | 1);
+		dev_dbg(ane->dev,
+			"fw malloc slot %u: %#llx bytes mode %#llx -> %pad index %d (live %u, %zu bytes)\n",
+			*cursor, size, mode, &buf->dma, idx + 1, ane->legacy_live,
+			ane->legacy_bytes);
+		break;
+	case ANE_T6021_MRING_FREE:
+		/* The firmware dropped its mapping before it asked and waits
+		 * for this answer holding its shared-memory lock. Answer first,
+		 * then give the buffer back. The command buffer never matches.
+		 */
+		WRITE_ONCE(slot[1], 0);
+		WRITE_ONCE(slot[2], 0);
+		dma_wmb();
+		WRITE_ONCE(slot[0], 1);
+		idx = ane_t6021_legtab_find(ane->legacy_buffers,
+					    ane->legacy_allocated, hdr,
+					    ane->cmd_buf);
+		if (idx >= 0) {
+			buf = &ane->legacy_buffers[idx];
+			dma_free_coherent(ane->dev, buf->size, buf->cpu, buf->dma);
+			ane->legacy_bytes -= buf->size;
+			ane->legacy_live--;
+			memset(buf, 0, sizeof(*buf));
+		}
+		if (idx >= 0)
+			dev_dbg(ane->dev,
+				"fw free slot %u: iova %#llx released (live %u, %zu bytes)\n",
+				*cursor, hdr, ane->legacy_live, ane->legacy_bytes);
+		else
+			dev_info_ratelimited(ane->dev,
+					     "fw free slot %u: iova %#llx is not a firmware allocation; answered, nothing released\n",
+					     *cursor, hdr);
+		break;
+	default:
+		dev_err(ane->dev,
+			"fw malloc ring slot %u is not a request: %#llx %#llx %#llx\n",
+			*cursor, hdr, size, mode);
+		return -EPROTO;
+	}
+	dma_wmb();
+	writel(BIT(c->bit), ipi);
+	*cursor = (*cursor + 1) % c->slots;
+	return 1;
+}
+
+/* Answer every request already posted, at most one ring's worth. */
+static int ane_rtclient_malloc_drain(struct ane_rtclient *ane)
+{
+	unsigned int n;
+	int ret = 0;
+
+	for (n = 0; n < ane->channels[5].slots; n++) {
+		ret = ane_rtclient_malloc_service(ane, &ane->legacy_malloc_cursor);
+		if (ret <= 0)
+			break;
+	}
+	return ret < 0 ? ret : 0;
+}
+
+/*
+ * A FREE caused by a command can land after its acknowledgment. Keep
+ * answering until the ring was quiet for quiet_ms, at most 64 answers.
+ */
+static int ane_rtclient_malloc_settle(struct ane_rtclient *ane,
+				      unsigned int quiet_ms)
+{
+	unsigned long until = jiffies + msecs_to_jiffies(quiet_ms);
+	unsigned int answered = 0;
+	int ret;
+
+	while (time_before(jiffies, until)) {
+		ret = ane_rtclient_malloc_service(ane, &ane->legacy_malloc_cursor);
+		if (ret < 0)
+			return ret;
+		if (ret) {
+			if (++answered > 64)
+				return -EBUSY;
+			until = jiffies + msecs_to_jiffies(quiet_ms);
+		} else {
+			usleep_range(200, 400);
+		}
+	}
+	return 0;
+}
+
+/* What the rings held when a command timed out, for the log. */
+static void ane_rtclient_dump_rings(struct ane_rtclient *ane)
+{
+	static const unsigned int chans[] = { 4, 5, 6 };
+	unsigned int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(chans); i++) {
+		const struct ane_fw_channel *c = &ane->channels[chans[i]];
+		unsigned int cur = chans[i] == 5 ? ane->legacy_malloc_cursor :
+				   ane->legacy_cmd_cursor[chans[i]];
+		unsigned int n = min_t(unsigned int, c->slots, 8);
+
+		if (!c->slots)
+			continue;
+		/* The whole allocation ring; T2H rings from the host cursor. */
+		for (j = 0; j < n; j++) {
+			unsigned int k = chans[i] == 5 ? j : (cur + j) % c->slots;
+			u64 *slot = ane->fw->boot_ipc + c->offset + (size_t)k * 64;
+
+			dev_info(ane->dev,
+				 "ring ch%u slot %u: %016llx %016llx %016llx%s\n",
+				 chans[i], k, READ_ONCE(slot[0]),
+				 READ_ONCE(slot[1]), READ_ONCE(slot[2]),
+				 k == cur ? " <- host cursor" : "");
+		}
+	}
+	dev_info(ane->dev, "fw allocations: live %u, high water %u, %zu bytes\n",
+		 ane->legacy_live, ane->legacy_allocated, ane->legacy_bytes);
+}
+
 /* Legacy ChMan exchange (post-DONE 13.5 transport). Resends to the same
  * 64-byte IO slot would wedge the ring; cursor advances after each
  * completed command (the fw treats bit0 as host-owned).
@@ -630,9 +808,8 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				       unsigned long deadline)
 {
 	struct ane_t6021 *a = ane->fw;
-	u64 *io, *malloc_ring, header;
+	u64 *io, header;
 	void __iomem *ipi = ane_rtclient_doorbell(ane);
-	unsigned int cursor = ane->legacy_malloc_cursor;
 	int result = -ETIMEDOUT;
 
 	if (!ane->held || !ane_rtclient_channels_unchanged(ane))
@@ -644,7 +821,6 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 	}
 	io = a->boot_ipc + ane->channels[channel].offset +
 	     (size_t)ane->legacy_cmd_cursor[channel] * 64;
-	malloc_ring = a->boot_ipc + ane->channels[5].offset;
 
 	if (!(READ_ONCE(io[0]) & 1)) {
 		result = -EBUSY;
@@ -652,6 +828,15 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 	}
 	if (time_after_eq(jiffies, deadline))
 		goto out;
+	/* A FREE posted since the last command (an idle pool shrink) is
+	 * answered before this command goes out.
+	 */
+	if (!ane->soc->platform) {
+		result = ane_rtclient_malloc_drain(ane);
+		if (result)
+			goto out;
+		result = -ETIMEDOUT;
+	}
 	if (ane->soc->platform) {
 		result = ane_h16_command_prepare(command->cpu, length, opcode,
 						 ane->channels[channel].index);
@@ -698,47 +883,14 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 		header = READ_ONCE(io[0]);
 		if (!(header & 1)) {
 			/* malloc-ring service: the fw may ask for an
-			 * allocation while we wait; service those until
-			 * the command slot flips back.
+			 * allocation, or give one back, while we wait.
 			 */
-			u64 *slot = malloc_ring + cursor * 8;
-			u64 alloc_hdr = READ_ONCE(slot[0]);
+			int served = ane_rtclient_malloc_service(ane,
+								 &ane->legacy_malloc_cursor);
 
-			if (!(alloc_hdr & 1)) {
-				u64 size, tag;
-				struct ane_legacy_buffer *buf;
-
-				/* H16 needs its own validated allocation/reply provider.
-				 * Never answer it with the legacy H14 allocation index.
-				 */
-				if (ane->soc->platform) {
-					result = -EOPNOTSUPP;
-					goto out;
-				}
-				dma_rmb();
-				size = READ_ONCE(slot[1]);
-				tag = READ_ONCE(slot[2]);
-				/* A valid MALLOC slot carries
-				 * header 0 and a u32 tag; anything else
-				 * is a malformed ring and we stop.
-				 */
-				if (alloc_hdr || tag > U32_MAX) {
-					result = -EPROTO;
-					goto out;
-				}
-				if (ane_rtclient_legacy_alloc(ane, size)) {
-					result = -ENOMEM;
-					goto out;
-				}
-				buf = &ane->legacy_buffers[ane->legacy_allocated - 1];
-				WRITE_ONCE(slot[1], 0);
-				WRITE_ONCE(slot[2], ane->legacy_allocated);
-				dma_wmb();
-				WRITE_ONCE(slot[0], buf->dma | 1);
-				dma_wmb();
-				writel(BIT(ane->channels[5].bit), ipi);
-				cursor = (cursor + 1) %
-					ane->channels[5].slots;
+			if (served < 0) {
+				result = served;
+				goto out;
 			}
 		}
 		/* Allocation service cannot extend the command deadline. */
@@ -773,10 +925,10 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 		 */
 		udelay(50);
 	}
-	dev_info(ane->dev, "LEGACY timeout ch=%u io=%016llx\n",
-		 channel, READ_ONCE(io[0]));
+	dev_info(ane->dev, "LEGACY timeout ch=%u op=%#x io=%016llx\n",
+		 channel, opcode, READ_ONCE(io[0]));
+	ane_rtclient_dump_rings(ane);
 out:
-	ane->legacy_malloc_cursor = cursor;
 	return result;
 }
 
@@ -1143,6 +1295,11 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 				return ane->waiting->status;
 		} else if (ane_rtclient_drain_t2h(ane, 6)) {
 			return 0;
+		} else if (ane_rtclient_malloc_drain(ane)) {
+			/* A program waiting on an unanswered request never
+			 * finishes; a malformed ring ends the call now.
+			 */
+			return -EPROTO;
 		}
 		if (poll_us && ktime_before(ktime_get(), tight_end))
 			usleep_range(1, 2);
@@ -1267,48 +1424,124 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 
 /* ---- LOAD / CREATE / CALL wrappers ---- */
 
-/* The firmware never frees a program or a process, and its program table
- * holds 256 entries: the 257th LOAD_PROGRAM after a boot is answered
- * with a protocol error, which quarantines the device. Two
- * loads of byte-identical sections therefore share one firmware program
- * and one process. The key is SHA-256 over every section's id, size and
- * bytes, so a client can only reach a program whose bytes it also
- * supplied. Protected by ane_t6021_fw_lock.
+/* The firmware program table holds 256 entries: the 257th LOAD_PROGRAM
+ * after a boot is answered with a protocol error. Two loads of
+ * byte-identical sections share one firmware program and one process. The
+ * key is SHA-256 over every section's id, size and bytes, so a client can
+ * only reach a program whose bytes it also supplied, and every file holds
+ * a reference on each program it loaded (ane_t6021_lifetime.h). The last
+ * file to close unloads the program from the firmware: TERMINATE_PROCESS,
+ * then DESTROY_PROGRAM, then its section buffers go back. Without that,
+ * every program and process stayed in the firmware until reboot and the
+ * firmware stopped answering after about ten MobileNet-sized loads.
+ * Protected by ane_t6021_fw_lock.
  */
-#define ANE_T6021_MAX_PROGRAMS 250
-
-struct ane_t6021_prog {
-	u8 digest[SHA256_DIGEST_SIZE];
-	u32 prog_id;
-	u32 proc_id;		/* U32_MAX until a process exists */
-	u32 fw_prog_id;
-	u32 fw_proc_id;
-};
-
-static struct ane_t6021_prog ane_t6021_progs[ANE_T6021_MAX_PROGRAMS];
-static unsigned int ane_t6021_nprogs;
+static struct ane_t6021_progtab ane_t6021_progtab;
 static struct ane_fw_ids ane_t6021_ids;
+
+static_assert(sizeof(ane_t6021_progtab.progs[0].digest) == SHA256_DIGEST_SIZE);
 
 static struct ane_t6021_prog *ane_t6021_prog_find(const u8 *digest)
 {
-	unsigned int i;
-
-	for (i = 0; i < ane_t6021_nprogs; i++)
-		if (!memcmp(ane_t6021_progs[i].digest, digest,
-			    SHA256_DIGEST_SIZE))
-			return &ane_t6021_progs[i];
-	return NULL;
+	return ane_t6021_progtab_find(&ane_t6021_progtab, digest);
 }
 
 static struct ane_t6021_prog *ane_t6021_prog_by_id(u32 prog_id)
 {
+	return ane_t6021_progtab_by_id(&ane_t6021_progtab, prog_id);
+}
+
+/* The LIVE program PROG_ID if this file holds a reference on it. */
+static struct ane_t6021_prog *ane_t6021_prog_owned(struct ane_t6021_fd *fd,
+						   u32 prog_id, int *err)
+{
+	struct ane_t6021_prog *p;
+
+	if (!fd || !ane_t6021_fdprogs_has(&fd->progs, prog_id)) {
+		*err = -ENOENT;
+		return NULL;
+	}
+	p = ane_t6021_prog_by_id(prog_id);
+	/* A reference the file still holds on a program that is gone means
+	 * a firmware restart dropped it: reload and create the process again.
+	 */
+	*err = p ? 0 : -ESTALE;
+	return p;
+}
+
+static int ane_t6021_unload_cmd(void *ctx, u16 opcode, u32 fw_prog, u32 fw_proc)
+{
+	struct ane_rtclient *ane = ctx;
+	struct ane_legacy_buffer *command = ane->cmd_buf;
+	size_t length = opcode == ANE_T6021_CMD_TERMINATE_PROCESS ? 0x10 : 0x0c;
+	int ret;
+
+	if (!command || atomic_read(&ane_t6021_quarantined))
+		return -ENODEV;
+	memset(command->cpu, 0, SZ_16K);
+	*(u32 *)((u8 *)command->cpu + 0x08) = cpu_to_le32(fw_prog);
+	if (opcode == ANE_T6021_CMD_TERMINATE_PROCESS)
+		*(u32 *)((u8 *)command->cpu + 0x0c) = cpu_to_le32(fw_proc);
+	/* A failed command has already quarantined and tried a restart. */
+	ret = ane_rtclient_command(ane, command, length, opcode, 1, 3000);
+	if (ret)
+		return ret;
+	/* Terminating a process frees its spill buffers; their FREE requests
+	 * can land after the acknowledgment and must be answered before the
+	 * next command or the firmware stays locked.
+	 */
+	ret = ane_rtclient_malloc_settle(ane, 10);
+	if (ret) {
+		atomic_set(&ane_t6021_quarantined, 1);
+		if (!ane->recovering)
+			ane_rtclient_recover(ane);
+	}
+	return ret;
+}
+
+/* Firmware side of an unload. Zero only when both commands were acked. */
+static int ane_t6021_prog_unload_op(void *ctx, struct ane_t6021_prog *p)
+{
+	struct ane_rtclient *ane = ctx;
+	int ret;
+
+	if (!ane)
+		return -ENODEV;
+	ret = ane_t6021_prog_unload_cmds(p, ane_t6021_unload_cmd, ane);
+	dev_dbg(ane->dev, "unload program %u (fw %u/%d): %d (fw allocations live %u, %zu bytes)\n",
+		p->prog_id, p->fw_prog_id, (int)p->fw_proc_id, ret,
+		ane->legacy_live, ane->legacy_bytes);
+	return ret;
+}
+
+/* The firmware no longer reads the sections: drop the program's references.
+ * A BO no other program uses stops being a program BO, and is freed or
+ * pooled by the usual rule at its last put.
+ */
+static void ane_t6021_prog_release_op(void *ctx, struct ane_t6021_prog *p)
+{
 	unsigned int i;
 
-	for (i = 0; i < ane_t6021_nprogs; i++)
-		if (ane_t6021_progs[i].prog_id == prog_id)
-			return &ane_t6021_progs[i];
-	return NULL;
+	mutex_lock(&ane_t6021_bo_lock);
+	for (i = 0; i < ANE_T6021_PROG_SECS; i++) {
+		struct ane_t6021_bo *bo = p->sec[i];
+
+		if (!bo)
+			continue;
+		p->sec[i] = NULL;
+		if (!WARN_ON(!bo->prog_refs) && !--bo->prog_refs) {
+			bo->fw_program = false;
+			bo->fw_ref = bo->fw_io;
+		}
+		kref_put(&bo->refcount, ane_t6021_bo_release);
+	}
+	mutex_unlock(&ane_t6021_bo_lock);
 }
+
+static const struct ane_t6021_progtab_ops ane_t6021_progtab_ops = {
+	.unload = ane_t6021_prog_unload_op,
+	.release = ane_t6021_prog_release_op,
+};
 
 /* Build a LOAD_PROGRAM (0x200) message in a kernel-owned buffer. The
  * section bytes live in the BOs the user supplied (section_ptr), the
@@ -1325,8 +1558,9 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	struct drm_ane_generic_bind *binds;
 	struct ane_legacy_buffer *command;
 	struct ane_t6021_fd *fd = file->driver_priv;
-	struct ane_t6021_prog *cached;
-	u32 key;
+	struct ane_t6021_prog *cached, *prog = NULL;
+	bool sent = false;
+	u32 key, gen;
 	u8 digest[SHA256_DIGEST_SIZE];
 	size_t binds_size;
 	int ret, i, j;
@@ -1442,24 +1676,34 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	}
 	cached = ane_t6021_prog_find(digest);
 	if (cached) {
-		*prog_id = cached->prog_id;
-		ret = 0;
+		ret = ane_t6021_fdprogs_ref(&ane_t6021_progtab, &fd->progs,
+					    cached);
+		if (!ret)
+			*prog_id = cached->prog_id;
 		goto out;
 	}
-	if (ane_t6021_nprogs == ANE_T6021_MAX_PROGRAMS) {
+	/* Check the file can hold the reference before the firmware loads a
+	 * program nobody could then unload.
+	 */
+	if (!ane_t6021_fdprogs_room(&ane_t6021_progtab, &fd->progs)) {
 		ret = -ENOSPC;
+		goto out;
+	}
+	command = ane->cmd_buf;
+	if (!command) {
+		ret = -ENODEV;
 		goto out;
 	}
 
 	ret = ane_fw_id_alloc(&ane_t6021_ids, &key);
 	if (ret)
 		goto out;
-
-	command = ane->cmd_buf;
-	if (!command) {
-		ret = -ENODEV;
+	prog = ane_t6021_progtab_reserve(&ane_t6021_progtab, digest);
+	if (!prog) {
+		ret = -ENOSPC;
 		goto out;
 	}
+	gen = ane_t6021_progtab.gen;
 	memset(command->cpu, 0, SZ_16K);
 	/* One 0x30-byte section record per supplied section, placed at
 	 * its IDENTITY slot: slot = id - 1 (tdprop id 7 lands at slot
@@ -1487,9 +1731,14 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 			 * the fw may read the section any time after the
 			 * doorbell rings, including during a timeout.
 			 * Under bo_lock the handle reference cannot go
-			 * away, so no kref is needed here.
+			 * away. The program takes its own reference, which
+			 * it keeps until the firmware dropped the program
+			 * (or forever if that is uncertain).
 			 */
 			ane_t6021_bo_publish(bo, true);
+			kref_get(&bo->refcount);
+			bo->prog_refs++;
+			prog->sec[sections[i].id - 1] = bo;
 			iova = bo->dma + sections[i].offset;
 		} else {
 			bo = NULL;
@@ -1528,6 +1777,7 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	 * 0x1b8, so the length is pinned here.
 	 */
 	BUILD_BUG_ON(sizeof(struct ane_csne_cmd_load_program) != 0x1b8);
+	sent = true;
 	ret = ane_rtclient_command(ane, command,
 				   0x1c0,
 						       CSNE_CMD_LOAD_PROGRAM,
@@ -1535,38 +1785,49 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	if (!ret) {
 		u8 *cmd = command->cpu;
 
-		*prog_id = le32_to_cpu(*(u32 *)(cmd + 0x1b8));
-		if (*prog_id == U32_MAX) {
+		u32 fw_prog = le32_to_cpu(*(u32 *)(cmd + 0x1b8));
+
+		/* A LOAD acked without an id leaves the program HELD. */
+		if (fw_prog == U32_MAX) {
 			ret = -EPROTO;
 			goto out;
 		}
-		memcpy(ane_t6021_progs[ane_t6021_nprogs].digest, digest,
-		       SHA256_DIGEST_SIZE);
-		ane_t6021_progs[ane_t6021_nprogs].fw_prog_id = *prog_id;
+		ane_t6021_progtab_commit(prog, key, fw_prog);
+		/* Room was checked under the same lock. */
+		ret = ane_t6021_fdprogs_ref(&ane_t6021_progtab, &fd->progs, prog);
+		if (WARN_ON(ret))
+			goto out;
 		*prog_id = key;
-		ane_t6021_progs[ane_t6021_nprogs].prog_id = key;
-		ane_t6021_progs[ane_t6021_nprogs].proc_id = U32_MAX;
-		ane_t6021_nprogs++;
+		dev_dbg(ane->dev, "loaded program %u (fw %u) (fw allocations live %u, %zu bytes)\n",
+			key, fw_prog, ane->legacy_live, ane->legacy_bytes);
+	} else if (ane_t6021_progtab.gen != gen) {
+		/* A firmware restart already released the reservation. */
+		prog = NULL;
 	}
 
 out:
+	/* The firmware never saw these IOVAs: give the reservation back. */
+	if (prog && !sent)
+		ane_t6021_progtab_cancel(prog, &ane_t6021_progtab_ops, ane);
 	kfree(sections);
 	kfree(binds);
 	return ret;
 }
 
 static int ane_rtclient_create_process(struct ane_rtclient *ane,
+				       struct drm_file *file,
 				       __u32 prog_id, __u32 *proc_id)
 {
 	struct ane_legacy_buffer *command;
-	struct ane_t6021_prog *prog = ane_t6021_prog_by_id(prog_id);
+	struct ane_t6021_prog *prog;
 	int ret;
 
 	/* H16 uses 0x258 bytes; its body is not the H14 0x10-byte body. */
 	if (ane->soc->platform)
 		return -EOPNOTSUPP;
+	prog = ane_t6021_prog_owned(file->driver_priv, prog_id, &ret);
 	if (!prog)
-		return -ENOENT;
+		return ret;
 	if (prog->proc_id != U32_MAX) {
 		*proc_id = prog->proc_id;
 		return 0;
@@ -1785,9 +2046,10 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 		ret = -ETIMEDOUT;
 		goto unlock;
 	}
-	program = ane_t6021_prog_by_id(user->prog_id);
-	if (!program || program->proc_id == U32_MAX ||
-	    program->proc_id != user->proc_id) {
+	program = ane_t6021_prog_owned(fd, user->prog_id, &ret);
+	if (!program)
+		goto unlock;
+	if (program->proc_id == U32_MAX || program->proc_id != user->proc_id) {
 		ret = -ESTALE;
 		goto unlock;
 	}
@@ -2071,6 +2333,13 @@ static void ane_t6021_postclose(struct drm_device *drm, struct drm_file *file)
 	/* Revoke per-file authority, retaining device-owned DMA allocations. */
 	list_for_each_entry_safe(process, next, &fd->h16_processes, owner_node)
 		list_del_init(&process->owner_node);
+	/* Unload every program this file was the last user of. A failed
+	 * unload holds the program and its sections until a verified restart.
+	 */
+	if (ane_t6021_progtab_fd_close(&ane_t6021_progtab, &fd->progs,
+				       &ane_t6021_progtab_ops,
+				       to_ane_t6021_drm(drm)->ane))
+		dev_warn(drm->dev, "program unload failed; sections held until the firmware restarts\n");
 	mutex_lock(&ane_t6021_bo_lock);
 	list_for_each_entry_safe(bo, tmp, &fd->bos, node)
 		ane_t6021_bo_drop(bo);
@@ -2133,6 +2402,26 @@ static int ane_t6021_prog_load_ioctl(struct drm_device *drm, void *data,
 static struct ane_rtclient *ane_t6021_perf_ane;
 static bool fw_perf_mode;
 
+/* debugfs fw_memory: what the firmware holds now. */
+static int ane_t6021_fw_memory_show(struct seq_file *m, void *v)
+{
+	struct drm_debugfs_entry *entry = m->private;
+	struct ane_rtclient *ane = entry->file.data;
+	unsigned int live, held;
+	int ret;
+
+	ret = mutex_lock_interruptible(&ane_t6021_fw_lock);
+	if (ret)
+		return ret;
+	ane_t6021_progtab_count(&ane_t6021_progtab, &live, &held);
+	seq_printf(m, "allocations: %u\nbytes: %zu\nhigh_water: %u\n",
+		   ane->legacy_live, ane->legacy_bytes, ane->legacy_allocated);
+	seq_printf(m, "programs: %u\nheld: %u\nquarantined: %d\n", live, held,
+		   atomic_read(&ane_t6021_quarantined));
+	mutex_unlock(&ane_t6021_fw_lock);
+	return 0;
+}
+
 static int ane_t6021_perf_mode_set(const char *val,
 				   const struct kernel_param *kp)
 {
@@ -2193,7 +2482,7 @@ static int ane_t6021_proc_create_ioctl(struct drm_device *drm, void *data,
 		return -ETIMEDOUT;
 	}
 	args->proc_id_out = 0;
-	ret = ane_rtclient_create_process(adrm->ane, args->prog_id,
+	ret = ane_rtclient_create_process(adrm->ane, file, args->prog_id,
 					  &args->proc_id_out);
 	mutex_unlock(&ane_t6021_fw_lock);
 	return ret;
@@ -2781,6 +3070,7 @@ static int ane_rtclient_recover(struct ane_rtclient *ane)
 	a->boot_heap_size = 0;
 	ane->legacy_buffers = fresh;
 	ane->legacy_allocated = 0;
+	ane->legacy_live = 0;
 	ane->legacy_bytes = 0;
 	ane->legacy_malloc_cursor = 0;
 	memset(ane->legacy_cmd_cursor, 0, sizeof(ane->legacy_cmd_cursor));
@@ -2810,9 +3100,9 @@ static int ane_rtclient_recover(struct ane_rtclient *ane)
 	dma_wmb();
 	writel(ANE_T6021_BOOT_ACK, ane->engine + ANE_MBI_SCRATCH0 + 4 * 3);
 	ret = ane_rtclient_legacy_alloc(ane, SZ_16K);
-	if (ret)
+	if (ret < 0)
 		goto failed;
-	ane->cmd_buf = &ane->legacy_buffers[ane->legacy_allocated - 1];
+	ane->cmd_buf = &ane->legacy_buffers[ret];
 	memset(ane->cmd_buf->cpu, 0, SZ_16K);
 	/* The firmware lock still fences commands; BO_INIT also checks recovering.
 	 * Clearing the old latch lets transport validation detect a new error.
@@ -2843,8 +3133,8 @@ static int ane_rtclient_recover(struct ane_rtclient *ane)
 	/* Opaque IDs never alias a new firmware instance. Clients reload programs.
 	 * Advance the BO epoch only after old DMA and the new boot are verified.
 	 */
-	ane_t6021_nprogs = 0;
 	ane_t6021_bo_new_epoch();
+	ane_t6021_progtab_reset(&ane_t6021_progtab, &ane_t6021_progtab_ops, ane);
 	ane_rtclient_reap_retired(ane);
 	WRITE_ONCE(ane->recovering, false);
 	dev_info(ane->dev, "firmware recovered; old program IDs invalid, reload and resubmit\n");
@@ -3154,12 +3444,13 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			/* One reusable command buffer for the transport
 			 * (CONFIG_GET + every ioctl); reuse is legal
 			 * because each exchange completes with the slot
-			 * host-owned again. The 128-entry table stays
+			 * host-owned again. The rest of the table is
 			 * for fw MALLOC replies only.
 			 */
-			if (ane_rtclient_legacy_alloc(ane, SZ_16K) == 0)
-				ane->cmd_buf =
-					&ane->legacy_buffers[ane->legacy_allocated - 1];
+			int slot = ane_rtclient_legacy_alloc(ane, SZ_16K);
+
+			if (slot >= 0)
+				ane->cmd_buf = &ane->legacy_buffers[slot];
 			else
 				cfg_err = -ENOMEM;
 		}
@@ -3287,6 +3578,9 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			drm_debugfs_add_file(&adrm->drm, "ane_timeline",
 					     ane_timeline_show,
 					     &ane->stats_ring);
+		if (!ane->soc->platform)
+			drm_debugfs_add_file(&adrm->drm, "fw_memory",
+					     ane_t6021_fw_memory_show, ane);
 		drmret = drm_dev_register(&adrm->drm, 0);
 		if (!drmret)
 			ane->registered = true;

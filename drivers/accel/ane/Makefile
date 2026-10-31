@@ -5,7 +5,8 @@ obj-$(CONFIG_DRM_ACCEL_ANE_PM_KUNIT_TEST) += ane_pm_test.o ane_fw_ids_test.o
 obj-$(CONFIG_DRM_ACCEL_ANE_H16_VALIDATION) += ane_h16_hwx.o
 obj-$(CONFIG_DRM_ACCEL_ANE_KUNIT_TEST) += ane_drv_test.o
 obj-$(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST) += ane_fw_platform_test.o \
-	ane_fw_protocol_test.o ane_h16_tasks_test.o ane_h16_execute_test.o ane_h16_pending_test.o ane_h16_hwx_test.o
+	ane_fw_protocol_test.o ane_h16_tasks_test.o ane_h16_execute_test.o ane_h16_pending_test.o ane_h16_hwx_test.o \
+	ane_t6021_lifetime_test.o
 
 ane-y := \
 	ane_drv.o \
