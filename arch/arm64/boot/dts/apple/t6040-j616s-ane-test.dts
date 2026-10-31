@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /* Tether-loaded ANE test tree. The loader must complete the preload handoff. */
 
-#include "t6040-j616s.dts"
+#include "t6040-j616s-tether.dts"
 
 &ane {
 	status = "okay";
