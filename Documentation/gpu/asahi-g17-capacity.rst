@@ -1,7 +1,7 @@
 G17 capacity diagnostics
 =======================
 
-The read-only ``/sys/kernel/debug/asahi-g17/capacity`` file samples the live
+The read-only ``/sys/kernel/debug/aurora-g17/capacity`` file samples the live
 firmware session. It does not wake firmware or reclaim resources. An absent
 session reports ``online=0``. The format is diagnostic, not a stable ABI.
 Counts exclude reserved identities. Sub-pool locks and atomic snapshots mean
