@@ -915,9 +915,6 @@ static int avd_probe(struct platform_device *pdev)
 		if (!res)
 			return dev_err_probe(avd->dev, -EINVAL,
 					     "missing SRAM resource for PIODMA\n");
-		if (!IS_ALIGNED(res->start, 16) || (res->start >> 4) > U32_MAX)
-			return dev_err_probe(avd->dev, -EINVAL,
-					     "SRAM address cannot be encoded for PIODMA\n");
 		avd->sram_phys = res->start;
 	}
 
