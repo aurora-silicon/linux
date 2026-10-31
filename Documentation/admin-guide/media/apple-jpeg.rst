@@ -44,10 +44,10 @@ shared power-domain accounting, and return DMA buffers only after quiescing
 hardware. Encode/decode controls, JPEG header validation, media-controller
 topology and actual job programming belong to the subsequent codec work.
 
-The HWREV register offset comes from the MIT-licensed Asahi Linux m1n1 register
+The HWREV register offset comes from the MIT-licensed m1n1 register
 description at commit ``f3ac615eb1376d3bbba24cd84c414b9e41892adb``:
 
-https://github.com/AsahiLinux/m1n1/blob/f3ac615eb1376d3bbba24cd84c414b9e41892adb/proxyclient/m1n1/hw/jpeg.py
+https://github.com/aurora-silicon/m1n1/blob/f3ac615eb1376d3bbba24cd84c414b9e41892adb/proxyclient/m1n1/hw/jpeg.py
 
 The scaffold deliberately does not translate the experiment's unqualified
 reset or interrupt writes. ``VIDEO_APPLE_JPEG_KUNIT_TEST`` tests empty target
