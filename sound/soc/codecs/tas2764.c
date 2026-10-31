@@ -20,6 +20,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <sound/soc.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -72,12 +73,27 @@ struct tas2764_priv {
 		int tx_mode;
 		unsigned int tx_mask;
 	} idle_slot_config;
+
+	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
+	bool deferred_shutdown;
+	/* Muted at a stream's end, until the next one: the bus clock may stop */
+	bool stream_stopped;
+	struct delayed_work shutdown_work;
 };
 
 #include "tas2764-quirks.h"
 
 /* LTCH0 faults that shut the whole SDZ group down: over temperature, over current */
 #define TAS2764_INT_LTCH0_GROUP_FAULTS	(BIT(0) | BIT(1))
+#define TAS2764_INT_LTCH0_TDM_CLOCK	BIT(2)
+
+/*
+ * With apple,deferred-shutdown, how long after a stream's end the muted amp
+ * goes to software shutdown.  On the J713 the AOP's speaker bus ran on for
+ * up to 3520 frames (73 ms at 48 kHz) after a stream's end; this leaves
+ * margin over that.
+ */
+#define TAS2764_DEFERRED_SHUTDOWN_MS	150
 
 static bool tas2764_group_failed(struct tas2764_priv *tas2764)
 {
@@ -204,6 +220,17 @@ static irqreturn_t tas2764_irq(int irq, void *data)
 		latched[i] = val;
 	}
 
+	/*
+	 * An amp muted at a stream's end with its shutdown deferred, or shut
+	 * down since, sees the bus clock stop: that is expected, not a fault.
+	 */
+	if (latched[0] == TAS2764_INT_LTCH0_TDM_CLOCK && READ_ONCE(tas2764->stream_stopped)) {
+		snd_soc_component_update_bits(tas2764->component, TAS2764_INT_CLK_CFG,
+					      TAS2764_INT_CLK_CFG_IRQZ_CLR,
+					      TAS2764_INT_CLK_CFG_IRQZ_CLR);
+		return IRQ_HANDLED;
+	}
+
 	for (i = 0; i < 8; i++) {
 		if (latched[0] & BIT(i)) {
 			dev_crit_ratelimited(tas2764->dev, "%s\n",
@@ -267,6 +294,8 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 	return 0;
 }
 
+static void tas2764_flush_shutdown(struct tas2764_priv *tas2764);
+
 #ifdef CONFIG_PM
 /*
  * Members of an SDZ group keep the shared SDZ line high across system sleep: the amp waits in
@@ -283,6 +312,8 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
+
+	tas2764_flush_shutdown(tas2764);
 
 	ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
 					    TAS2764_PWR_CTRL_MASK,
@@ -387,6 +418,26 @@ static int tas2764_startup(struct snd_pcm_substream *substream, struct snd_soc_d
 	return 0;
 }
 
+static void tas2764_shutdown_work(struct work_struct *work)
+{
+	struct tas2764_priv *tas2764 = container_of(to_delayed_work(work),
+						    struct tas2764_priv, shutdown_work);
+	int ret;
+
+	tas2764->dac_powered = false;
+	ret = tas2764_update_pwr_ctrl(tas2764);
+	/* a failed group has its SDZ supply forced off already */
+	if (ret && !tas2764_group_failed(tas2764))
+		dev_err(tas2764->dev, "deferred shutdown failed: %d\n", ret);
+}
+
+/* A deferred shutdown happens now (suspend, removal) */
+static void tas2764_flush_shutdown(struct tas2764_priv *tas2764)
+{
+	if (cancel_delayed_work_sync(&tas2764->shutdown_work))
+		tas2764_shutdown_work(&tas2764->shutdown_work.work);
+}
+
 static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
 	struct tas2764_priv *tas2764 =
@@ -394,6 +445,11 @@ static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 	int ret;
 
 	if (!mute) {
+		if (tas2764->deferred_shutdown) {
+			/* still muted from the last stream: no shutdown in between */
+			cancel_delayed_work_sync(&tas2764->shutdown_work);
+			WRITE_ONCE(tas2764->stream_stopped, false);
+		}
 		tas2764->dac_powered = true;
 		ret = tas2764_update_pwr_ctrl(tas2764);
 		if (ret)
@@ -408,6 +464,14 @@ static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 	if (mute) {
 		/* Wait for ramp-down */
 		usleep_range(6000, 7000);
+
+		if (tas2764->deferred_shutdown) {
+			/* the bus still runs: shut down once its clock has stopped */
+			WRITE_ONCE(tas2764->stream_stopped, true);
+			schedule_delayed_work(&tas2764->shutdown_work,
+					      msecs_to_jiffies(TAS2764_DEFERRED_SHUTDOWN_MS));
+			return 0;
+		}
 
 		tas2764->dac_powered = false;
 		ret = tas2764_update_pwr_ctrl(tas2764);
@@ -1007,6 +1071,8 @@ static void tas2764_codec_remove(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 
+	tas2764_flush_shutdown(tas2764);
+
 	/* A failed group's supply was forced off: there is no enable left to balance. */
 	if (tas2764_group_failed(tas2764))
 		return;
@@ -1148,6 +1214,9 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 	if (ret)
 		tas2764->v_sense_slot = -1;
 
+	tas2764->deferred_shutdown = of_property_read_bool(dev->of_node,
+							   "apple,deferred-shutdown");
+
 	return tas2764_group_join(dev, tas2764);
 }
 
@@ -1165,6 +1234,7 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 
 	tas2764->dev = &client->dev;
 	tas2764->irq = client->irq;
+	INIT_DELAYED_WORK(&tas2764->shutdown_work, tas2764_shutdown_work);
 	i2c_set_clientdata(client, tas2764);
 	dev_set_drvdata(&client->dev, tas2764);
 
