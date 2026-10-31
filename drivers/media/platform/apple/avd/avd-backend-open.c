@@ -81,7 +81,7 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	if (avd->compat_active)
 		return -EBUSY;
 	/* Native frame_ops require firmware-side PP chaining and tagged replies. */
-	if (ctx->coded_fmt_desc->frame_ops)
+	if (ctx->frame_ops)
 		return -EOPNOTSUPP;
 	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
 	    f->prog_words > f->prog->size / sizeof(u32))

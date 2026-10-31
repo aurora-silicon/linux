@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
-REPO = ROOT.parents[4]
+REPO = Path(os.environ.get('AVD_TEST_KERNEL_SRC', ROOT.parents[4]))
 
 def kernel_file(path):
     file = REPO / path
@@ -90,6 +90,7 @@ typedef uint64_t u64, __u64, dma_addr_t;
 '''
 shim = r'''
 struct avd_ctx;
+struct avd_codec_frame_ops;
 struct avd_frame;
 enum avd_image_fmt { AVD_IMG_FMT_ANY, AVD_IMG_FMT_420_8BIT, AVD_IMG_FMT_420_10BIT,
                     AVD_IMG_FMT_422_8BIT, AVD_IMG_FMT_422_10BIT };
@@ -103,6 +104,8 @@ struct avd_frame {
     unsigned int idx;
     enum avd_frame_dep dep;
     struct avd_buf *prog, *fp;
+    dma_addr_t fifo_iova;
+    u32 cmd[24];
     size_t prog_words;
     void *codec_priv;
     struct vb2_v4l2_buffer *src, *dst;
@@ -127,6 +130,7 @@ struct v4l2_ctrl {
 struct v4l2_ctrl_handler { struct v4l2_ctrl ctrl[2]; };
 struct avd_ctx {
     struct avd_dev *dev;
+    const struct avd_codec_frame_ops *frame_ops;
     struct v4l2_ctrl_handler ctrl_hdl;
     void *priv;
     enum avd_image_fmt image_fmt;
@@ -143,6 +147,9 @@ struct avd_codec_frame_ops {
 struct avd_coded_fmt_ops {
     int (*start)(struct avd_ctx *);
     void (*stop)(struct avd_ctx *);
+    void (*done)(struct avd_ctx *, struct vb2_v4l2_buffer *, struct vb2_v4l2_buffer *, enum vb2_buffer_state);
+    void (*submit)(struct avd_ctx *);
+    unsigned int (*pp_kicks)(struct avd_ctx *);
     int (*run)(struct avd_ctx *);
     enum avd_image_fmt (*get_image_fmt)(struct avd_ctx *, struct v4l2_ctrl *);
 };
@@ -168,6 +175,21 @@ static int avd_buf_alloc(struct avd_dev *d, struct avd_buf *b, size_t n)
 }
 static void avd_buf_free(struct avd_dev *d, struct avd_buf *b)
 { free(b->cpu); memset(b, 0, sizeof(*b)); }
+extern const struct avd_codec_frame_ops avd_vp9_frame_ops;
+static unsigned int legacy_calls;
+static int legacy_start(struct avd_ctx *c) { legacy_calls |= 1; return 0; }
+static void legacy_stop(struct avd_ctx *c) { legacy_calls |= 2; }
+static int legacy_run(struct avd_ctx *c) { legacy_calls |= 4; return 0; }
+static void legacy_done(struct avd_ctx *c, struct vb2_v4l2_buffer *s,
+    struct vb2_v4l2_buffer *d, enum vb2_buffer_state state) { legacy_calls |= 8; }
+static void legacy_submit(struct avd_ctx *c) { legacy_calls |= 16; }
+static unsigned int legacy_kicks(struct avd_ctx *c) { legacy_calls |= 32; return 2; }
+static const struct avd_coded_fmt_ops avd_vp9_legacy_fmt_ops = {
+    .start = legacy_start, .stop = legacy_stop, .run = legacy_run,
+    .done = legacy_done, .submit = legacy_submit, .pp_kicks = legacy_kicks,
+};
+static bool avd_backend_is_qfw(const struct avd_dev *d) { return true; }
+static u32 fifo_size(void) { return 0xc00000; }
 static bool avd_backend_is_apple(const struct avd_dev *d) { return false; }
 static int avd_vp9_pack_cmd(struct avd_ctx *c, struct avd_frame *f) { return -EOPNOTSUPP; }
 static int avd_vp9_pack_fp(struct avd_ctx *c, struct avd_frame *f,
@@ -181,7 +203,7 @@ int main(void)
 {
     struct avd_variant variant = { .revision = 3, .quirks = 3, .fifo_slots = 7 };
     struct avd_dev dev = { .variant = &variant };
-    struct avd_ctx ctx = { .dev = &dev, .image_fmt = AVD_IMG_FMT_420_8BIT };
+    struct avd_ctx ctx = { .dev = &dev, .frame_ops = &avd_vp9_frame_ops, .image_fmt = AVD_IMG_FMT_420_8BIT };
     struct v4l2_ctrl_vp9_frame control = { .bit_depth = 8,
         .frame_width_minus_1 = 63, .frame_height_minus_1 = 63,
         .compressed_header_size = 4, .uncompressed_header_size = 4 };
@@ -222,12 +244,16 @@ int main(void)
         v4l2_vp9_fw_update_probs(&contexts[idx], &hdr, &control);
         assert(avd_vp9_prepare(&ctx, &frames[i]) == 0);
         assert(frames[i].dep == AVD_DEP_NONE);
+        assert(avd_vp9_frame_pp_kicks(&frames[i]) == 1);
+        assert(frames[i].fifo_iova);
+        assert(frames[i].cmd[0] == AVD_CODEC_VP9);
         struct avd_vp9_slot *slot = frames[i].codec_priv;
         struct avd_vp9_probs *packed = slot->bufs.probs.cpu;
         assert(packed->seg.tree_probs[0] == i + 30);
         assert(packed->seg.pred_probs[0] == i + 50);
         assert(memcmp(&slot->probability_tables, &contexts[idx], sizeof(contexts[idx])) == 0);
         for (unsigned int j = 0; j < i; j++) {
+            assert(frames[j].fifo_iova != frames[i].fifo_iova);
             struct avd_vp9_slot *prior = frames[j].codec_priv;
             assert(prior->bufs.probs.cpu != slot->bufs.probs.cpu);
             assert(prior->bufs.counts.cpu != slot->bufs.counts.cpu);
@@ -252,6 +278,7 @@ int main(void)
     control.flags &= ~(V4L2_VP9_FRAME_FLAG_KEY_FRAME | V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE);
     control.frame_context_idx = 0; hdr.skip[0] = 9;
     assert(avd_vp9_prepare(&ctx, &frames[0]) == 0);
+    assert(frames[0].dep == AVD_DEP_PREV_DONE);
     struct avd_vp9_slot *producer = frames[0].codec_priv;
     struct v4l2_vp9_frame_context expected = producer->initial_probs;
     struct avd_vp9_frame_symbol_counts *native = producer->bufs.counts.cpu;
@@ -283,17 +310,27 @@ int main(void)
     control.bit_depth = 12;
     assert(avd_vp9_prepare(&ctx, &frames[1]) == -EINVAL);
     avd_vp9_stop(&ctx);
+    /* Stock transport dispatch must reach every original callback. */
+    ctx.frame_ops = NULL;
+    assert(avd_vp9_fmt_ops.start(&ctx) == 0);
+    assert(avd_vp9_fmt_ops.run(&ctx) == 0);
+    avd_vp9_fmt_ops.done(&ctx, &sources[0], &outputs[0].base.vb, VB2_BUF_STATE_DONE);
+    avd_vp9_fmt_ops.submit(&ctx);
+    assert(avd_vp9_fmt_ops.pp_kicks(&ctx) == 2);
+    avd_vp9_fmt_ops.stop(&ctx);
+    assert(legacy_calls == 63);
     for (unsigned int i = 0; i < 16; i++) free(programs[i].cpu);
     puts("VP9 codec: real V4L2 entropy helpers, 16 prepared frames, segmentation, count-producer retry, error retirement, Profile 2 PASS");
     return 0;
 }
 '''
-with tempfile.TemporaryDirectory(prefix='avd-vp9-codec-') as tmp:
-    c = Path(tmp) / 'codec.c'
-    c.write_text(prefix + uapi_defines + '\n' + uapi_types + '\n' + vp9_header + '\n' +
-                 shim + '\n' + inst + '\n' + helpers + '\n' + codec + '\n' + tests)
-    exe = Path(tmp) / 'codec'
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-                    '-Wno-unused-parameter', '-Wno-sign-compare', '-Wno-unused-function',
-                    '-Wno-missing-field-initializers', *shlex.split(os.environ.get('CFLAGS', '')), str(c), '-o', str(exe)], check=True)
-    subprocess.run([str(exe)], check=True)
+if __name__ == '__main__':
+    with tempfile.TemporaryDirectory(prefix='avd-vp9-codec-') as tmp:
+        c = Path(tmp) / 'codec.c'
+        c.write_text(prefix + uapi_defines + '\n' + uapi_types + '\n' + vp9_header + '\n' +
+                     shim + '\n' + inst + '\n' + helpers + '\n' + codec + '\n' + tests)
+        exe = Path(tmp) / 'codec'
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                        '-Wno-unused-parameter', '-Wno-sign-compare', '-Wno-unused-function',
+                        '-Wno-missing-field-initializers', *shlex.split(os.environ.get('CFLAGS', '')), str(c), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)

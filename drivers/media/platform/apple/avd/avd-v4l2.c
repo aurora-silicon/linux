@@ -907,6 +907,14 @@ static int avd_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto err_return_buffers;
 	}
 
+	/* Keep stock firmware on the byte-identical VP9 compatibility builder.
+	 * Queued open firmware and Apple firmware use frame-owned state. */
+	ctx->frame_ops = desc->frame_ops;
+	if (ctx->frame_ops == &avd_vp9_frame_ops &&
+	    !avd_backend_is_qfw(ctx->dev) && !avd_backend_is_apple(ctx->dev))
+		ctx->frame_ops = NULL;
+	ctx->next_dep = AVD_DEP_PREV_DONE;
+
 	if (desc->ops->start) {
 		ret = desc->ops->start(ctx);
 		if (ret)

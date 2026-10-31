@@ -62,13 +62,13 @@ static void avd_retire(struct avd_dev *avd)
 				dev_err(avd->dev, "stream stopped after %u failed frames; restart streaming to retry\n",
 					ctx->hw_errors);
 			}
-			if (ctx->coded_fmt_desc->frame_ops) {
-				if (ctx->coded_fmt_desc->frame_ops->retire)
-					ctx->coded_fmt_desc->frame_ops->retire(ctx, f, state);
+			if (ctx->frame_ops) {
+				if (ctx->frame_ops->retire)
+					ctx->frame_ops->retire(ctx, f, state);
 			} else if (ctx->coded_fmt_desc->ops->done) {
 				ctx->coded_fmt_desc->ops->done(ctx, f->src, f->dst, state);
 			}
-			if (ctx->coded_fmt_desc->frame_ops && f->src->vb2_buf.req_obj.req)
+			if (ctx->frame_ops && f->src->vb2_buf.req_obj.req)
 				v4l2_ctrl_request_complete(f->src->vb2_buf.req_obj.req,
 							   &ctx->ctrl_hdl);
 			/* CAPTURE first: OUTPUT completion signals the media request. */
@@ -289,7 +289,7 @@ int avd_queue_ready(void *priv)
 	ready = !READ_ONCE(ctx->draining) && !READ_ONCE(avd->stopping);
 	if (ready && ctx->next_dep == AVD_DEP_PREV_DONE) {
 		/* Legacy codecs may hold several pictures in separate banks. */
-		unsigned int limit = ctx->coded_fmt_desc && !ctx->coded_fmt_desc->frame_ops ?
+		unsigned int limit = ctx->coded_fmt_desc && !ctx->frame_ops ?
 				     max(ctx->max_frames, 1U) : 1, held = 0;
 
 		for (i = 0; i < AVD_MAX_FRAMES; i++)
@@ -306,7 +306,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 {
 	struct avd_ctx *ctx = container_of(work, struct avd_ctx, submit_work);
 	struct avd_dev *avd = ctx->dev;
-	const struct avd_codec_frame_ops *ops = ctx->coded_fmt_desc->frame_ops;
+	const struct avd_codec_frame_ops *ops = ctx->frame_ops;
 	struct avd_frame *f = NULL;
 	unsigned long flags;
 	unsigned int i;
@@ -328,7 +328,8 @@ static void avd_queue_submit_work(struct work_struct *work)
 		goto unlock;
 	}
 	if (avd->inflight < avd_max_inflight(avd)) {
-		for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		/* Slot indices name physical FIFOs in the queued transport. */
+		for (i = 0; i < avd_max_inflight(avd); i++) {
 			if (avd->frames[i].state == AVD_FRAME_FREE) {
 				f = &avd->frames[i];
 				break;

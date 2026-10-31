@@ -235,7 +235,7 @@ static int avd_apple_set_property(struct avd_ctx *ctx, u32 property, u32 value)
 
 static int avd_apple_submit(struct avd_dev *avd, struct avd_frame *f)
 {
-	const struct avd_codec_frame_ops *ops = f->ctx->coded_fmt_desc->frame_ops;
+	const struct avd_codec_frame_ops *ops = f->ctx->frame_ops;
 	u32 selector;
 	int ret;
 

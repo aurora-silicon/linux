@@ -307,6 +307,8 @@ struct avd_ctx {
 	struct v4l2_format decoded_fmt;
 
 	const struct avd_coded_fmt_desc *coded_fmt_desc;
+	/* Selected at STREAMON; stable until this stream has drained. */
+	const struct avd_codec_frame_ops *frame_ops;
 	struct v4l2_ctrl_handler ctrl_hdl;
 	enum avd_image_fmt image_fmt;
 	bool decomp;
@@ -361,6 +363,8 @@ bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_hevc_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_vp9_fmt_ops;
+extern const struct avd_coded_fmt_ops avd_vp9_legacy_fmt_ops;
+unsigned int avd_vp9_frame_pp_kicks(const struct avd_frame *f);
 extern const struct avd_codec_frame_ops avd_vp9_frame_ops;
 extern const struct avd_coded_fmt_ops avd_av1_fmt_ops;
 

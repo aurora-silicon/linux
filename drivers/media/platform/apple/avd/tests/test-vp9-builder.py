@@ -67,6 +67,7 @@ struct vb2_v4l2_buffer { struct vb2_buffer vb2_buf; };
 struct avd_variant { unsigned int quirks, revision, fifo_slots; };
 struct avd_dev { const struct avd_variant *variant; };
 struct avd_ctx { struct avd_dev *dev; };
+static bool avd_backend_is_qfw(const struct avd_dev *d) { return true; }
 struct avd_vp9_segmap { unsigned int users; };
 struct avd_vp9_slot { struct avd_vp9_segmap *seg_in, *seg_out; };
 struct avd_vp9_ctx {
@@ -169,16 +170,16 @@ int main(void)
             memmove(words + 49, words, pos * 4);
             for (unsigned int h = 0; h < 49; h++) words[h] = 0x12340000 + h;
             f.prog_words = 49 + pos;
-            variant.revision = 3; variant.fifo_slots = 7; f.idx = 15;
+            variant.revision = 3; variant.fifo_slots = 7; f.idx = 6;
             assert(vp9_finish_program(&ctx, &f, 49, tiles) == 0);
             assert(f.prog_words == 50 + tiles * 6);
-            assert(words[0] == 0x2bfff170);
+            assert(words[0] == 0x2bfff160);
             for (unsigned int h = 0; h < 49; h++)
                 assert(words[h + 1] == 0x12340000 + h);
             for (unsigned int t = 0; t < tiles; t++) {
                 assert(memcmp(words + 50 + t * 6, expected + t * 5, 20) == 0);
                 assert(words[55 + t * 6] ==
-                    (0x2bfff070U | (t + 1 == tiles ? 0x400U : 0)));
+                    (0x2bfff060U | (t + 1 == tiles ? 0x400U : 0)));
             }
             prog.size = 4;
             f.prog_words = 0; run.error = 0;

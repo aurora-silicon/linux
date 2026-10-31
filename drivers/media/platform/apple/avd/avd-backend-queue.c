@@ -203,7 +203,7 @@ static int avd_qfw_submit(struct avd_dev *avd, struct avd_frame *f)
 	unsigned int i;
 	int ret;
 
-	if (ctx->coded_fmt_desc->frame_ops)
+	if (ctx->frame_ops && ctx->frame_ops != &avd_vp9_frame_ops)
 		return -EOPNOTSUPP;
 	if (codec > AVD_CODEC_AV1 || !words || !f->prog_words ||
 	    f->prog_words > f->prog->size / sizeof(u32))
@@ -211,14 +211,22 @@ static int avd_qfw_submit(struct avd_dev *avd, struct avd_frame *f)
 	if (!(avd->capabilities & BIT(codec)))
 		return -EOPNOTSUPP;
 	/* The program's EXEC words name FIFO f->idx; it must be a real FIFO. */
-	if (f->idx >= q->fifo_slots || ctx->fifo_idx != f->idx)
+	if (f->idx >= q->fifo_slots ||
+	    (!ctx->frame_ops && ctx->fifo_idx != f->idx))
 		return -EINVAL;
 	for (i = 0; i < codec; i++)
 		vp += avd->variant->vp_slots[i];
 	if (avd->variant->vp_slot_base[codec])
 		vp = avd->variant->vp_slot_base[codec];
-	if (ops->pp_kicks)
+	if (ctx->frame_ops == &avd_vp9_frame_ops) {
+		unsigned int kicks = avd_vp9_frame_pp_kicks(f);
+
+		if (!kicks)
+			return -EINVAL;
+		extra = kicks - 1;
+	} else if (ops->pp_kicks) {
 		extra = ops->pp_kicks(ctx) - 1;
+	}
 	if (extra > AVDQ_MAX_PP_EXTRA)
 		return -E2BIG;
 

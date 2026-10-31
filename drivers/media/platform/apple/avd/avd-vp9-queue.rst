@@ -1,78 +1,85 @@
 VP9 frame queue integration (draft)
 ==================================
 
-This branch targets the avd_codec_frame_ops queue contract. It is not ready to
-merge independently of the queue core. The original queue header is unchanged.
-The legacy .run callback returns -EOPNOTSUPP: it must not feed frame-owned DMA
-programs to the old, context-wide job path.
+The codec builds frame-owned programs through avd_codec_frame_ops on queued
+open firmware. Stock firmware keeps its original compatibility builder. The
+stream selects its callbacks at STREAMON and retains that selection through
+drain and stop, including error recovery. avd-queue.h is the integration core's
+extended contract without codec changes.
 
-The core applies request controls before prepare, owns the source and destination
-buffers, and serializes prepare and in-order retire for a context. In particular,
-a prepare result of -EAGAIN leaves both buffers and request controls pending:
-retry it after retiring the earlier frame. Do not mark the buffers erroneous or
-submit the partially built program. Waiting only at backend submit is too late,
-because prepare itself consumes probability state produced by retire.
+Compatibility and FIFO ownership
+--------------------------------
+
+avd-vp9-legacy.c is avd-vp9.c from integration commit d826cca0dff6, with only
+its exported ops symbol renamed. Its run, adaptation, PP kicks and program
+construction remain unchanged. The compatibility transport sees no native
+frame_ops and continues to call those original callbacks.
+
+Queued open firmware accepts native VP9 programs. Each frame owns its VP-to-PP
+FIFO storage and snapshots its tile count, which supplies that frame's PP kick
+count. Backend submission does not consult a later frame's mutable tile count.
+The slot pool has 16 entries; actual in-flight capacity is capped by the
+backend's physical FIFO count (15 or 7). Reservation uses only those indices,
+so a slot can never alias another active frame's physical FIFO.
 
 Probability and segmentation ownership
 -------------------------------------
 
-Each of the 16 slots has independent probability, count, scratch, current-header,
-previous-header and entropy-context snapshots. Saved contexts are initialized to
-the V4L2 defaults. Forward-only refreshes are committed during prepare; backward
-refreshes are committed at retire. A pending backward refresh prevents another
-CPU probability preparation until its counts have been consumed. Error retirement
-poisons this stream until streamoff rather than saving corrupted contexts.
+Each slot has independent probabilities, counts, scratch, current/previous
+headers and entropy-context snapshots. Saved contexts start from the V4L2
+defaults. Reset and forward updates are staged and committed only after all
+program and Apple parameter validation succeeds. The Apple packer sees the
+current frame's initialized probabilities.
 
-The dependency belongs to the consumer: PREV_DONE while an earlier backward
-refresh is pending, NONE otherwise. The predicate for the producer is
-refresh_frame_context && !frame_parallel_decoding_mode. Merely setting the
-consumer's dep after preparing stale probabilities would be incorrect.
+Forward-only refreshes publish during prepare. A backward-refresh producer sets
+PREV_DONE when refresh_frame_context && !frame_parallel_decoding_mode. The core
+uses that producer's dependency to block the next CPU prepare until in-order
+retirement consumes its counts. Other frames set NONE and may overlap. A
+pending-count guard also rejects premature direct callers with -EAGAIN; normal
+queue operation must satisfy the dependency before calling prepare. Error
+retirement poisons native stream probability state until streamoff.
 
-Segmentation state uses a pool of 17 maps: each prepared frame pins its input and
-output and the stream retains the latest output. A completed slot's map remains
+Segmentation uses a pool of 17 maps: each prepared frame pins its input and
+output, and the stream retains the latest output. A completed slot's map stays
 pinned while a later frame reads it. Reusing a slot does not reuse a live map.
-The line scratch buffer remains per-slot. Stop requires all frames drained.
-
-The open program is the legacy header/tile word sequence with EXEC boundaries
-materialized in little-endian DMA memory. The firmware backend owns FIFO pacing,
-VP-to-PP chaining, and physical FIFO reuse. It must not activate two frames which
-alias the same physical FIFO index (slot & fifo mask).
+Line scratch is per slot. Stop requires the core to drain this stream's frames.
 
 Apple payload status
 --------------------
 
 The V3 table derives from Eileen Yoon's MIT-licensed avid/vp9/fp.py and probs.py
 in https://github.com/eiln/avd. It materializes the known header and tile fields.
-The Borage table materializes tile columns/rows at 0x218/0x21a and the proved
-command words from protocol section 6.4. Their product is capped at 256.
+Borage materializes tile columns/rows at 0x218/0x21a and the proved command words
+from protocol section 6.4. Their product is capped at 256.
 
-Both Apple packers deliberately return -EOPNOTSUPP. V3 still needs FIFO/PIO work
-record patching; Borage still needs syntax/surface mappings, the first-work
-source and packed address words at command 0x2c/0x34. No partially filled payload
-may reach firmware. T8112 and T8140 have explicit empty rows pending the Daybreak
-per-SoC ledger task t-3862; they never fall back to V3 or Borage. The T6040 match
-selects Borage. Command packing preserves only the proved prefix bits and rejects
-addresses which cannot fit the proved direct u32 fields.
+Both Apple packers still return -EOPNOTSUPP for incomplete payloads. V3 needs
+FIFO/PIO work-record patching; Borage needs syntax/surface mappings, the first
+work source and packed address words at command 0x2c/0x34. No partial payload
+may reach firmware. T8112 and T8140 have explicit empty rows pending Daybreak
+ledger task t-3862; neither aliases V3 or Borage. Apple's backend remains
+inactive in the integration core, so these incomplete layouts do not replace
+the working stock path.
 
-The open path accepts Profile 0/8-bit and Profile 2/10-bit 4:2:0. This is syntax
-support, not new per-SoC hardware qualification. Apple Profile 2 cannot be enabled
-until its bit-depth fields are proved. The existing four-bit tile-column
-instruction field limits the open path to 16 columns. Extending to 64 needs a
-proved instruction encoding, independently of the Borage limit of 256 tiles.
+Native open preparation accepts Profile 0/8-bit and Profile 2/10-bit 4:2:0. This
+is syntax support, without new hardware qualification or format advertising.
+Apple Profile 2 requires proved bit-depth fields. The existing four-bit tile
+column instruction field limits the open path to 16 columns, independently of
+Borage's 256-tile validation limit.
 
-Tests and remaining validation
-------------------------------
+Validation
+----------
 
-Run ``sh drivers/media/platform/apple/avd/tests/run-vp9.sh`` on a host. The tests
-compile the production tile writer, compare 15 tile geometries against the
-legacy word sequence, reject malformed/truncated tiles, check output capacity
-a 4-GiB DMA carry, EXEC boundaries and segmentation map pins, check the full dependency flag table, and verify known
-V3/Borage offsets and isolation of 16 frame buffers. A full codec host test uses
-the real kernel V4L2 entropy helpers and simulated DMA/control lookup to exercise
-16 prepares, segmentation controls, malformed-input rollback, count-producer
-retries, adaptation, error retirement and Profile 2 bit-depth fields. The host
-suite also passes with AddressSanitizer. These
-tests are not a substitute
-for libvpx streams through the full stateless request/control and adaptation path.
-That differential suite, queue-core retry/drain integration, physical-FIFO
-ownership tests, and hardware decode/CRC qualification remain outstanding.
+Run ``sh drivers/media/platform/apple/avd/tests/run-vp9.sh``. Host tests compile
+production packing/tile code and the full codec with real V4L2 entropy helpers.
+They cover 16 prepared slots, probability isolation, backward-refresh producer
+and consumer dependencies, map lifetime, malformed-input rollback, capacity,
+DMA carry, EXEC framing, Profile 2 and all compatibility callback dispatches.
+A checksum keeps the entire stock builder identical to d826cca0 (export rename
+only). A second test compiles both complete C builders and compares 360 valid
+1080p/4K programs across V3/V4, 8/10-bit, key/inter, tiles and segmentation,
+normalizing scratch DVAs. These tests also run with address/undefined sanitizers.
+
+DMA, V4L2 lookup and transport are simulated. These tests do not establish
+libvpx-to-stateless-control parsing, show-existing display behavior, hardware
+CRCs, FIFO timing or throughput. Those require the separate decoder qualification
+suite. Apple payload completion remains a prerequisite for Apple-backend use.

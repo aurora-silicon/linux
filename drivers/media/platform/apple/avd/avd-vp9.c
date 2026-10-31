@@ -183,11 +183,13 @@ struct avd_vp9_segmap {
 };
 
 struct avd_vp9_slot {
+	unsigned int tiles;
 	struct avd_vp9_segmap *seg_in, *seg_out;
 	struct v4l2_vp9_frame_symbol_counts cnts;
 	struct v4l2_vp9_frame_context probability_tables;
 	struct v4l2_vp9_frame_context initial_probs;
 	struct avd_vp9_bufs {
+		struct avd_buf inst;
 		struct avd_buf az_left;
 		struct avd_buf above_info;
 		struct avd_buf ip_above;
@@ -204,6 +206,8 @@ struct avd_vp9_slot {
 };
 
 struct avd_vp9_ctx {
+	/* Transactional reset/forward updates, committed only after packing. */
+	struct v4l2_vp9_frame_context working_context[4];
 	struct v4l2_vp9_frame_context frame_context[4];
 	struct avd_vp9_slot *slots[AVD_MAX_FRAMES];
 	/* One output per active frame, plus the previous retired map. */
@@ -214,6 +218,11 @@ struct avd_vp9_ctx {
 	struct avd_frame *pending;
 	bool failed;
 };
+
+static bool avd_vp9_use_frame_ops(const struct avd_ctx *ctx)
+{
+	return ctx->frame_ops == &avd_vp9_frame_ops;
+}
 
 static int vp9_get_maps(struct avd_vp9_ctx *stream, struct avd_vp9_slot *slot)
 {
@@ -297,7 +306,8 @@ static int vp9_finish_program(struct avd_ctx *ctx, struct avd_frame *f,
 	__le32 *words = f->prog->cpu;
 	u32 mask = ctx->dev->variant->revision == 3 ?
 		AVD_OP_EXEC_REV3_VP9_MASK : 0;
-	u32 fifo = AVD_OP_EXEC_FIFO_IDX(f->idx & ctx->dev->variant->fifo_slots);
+	u32 fifo = AVD_OP_EXEC_FIFO_IDX(avd_backend_is_qfw(ctx->dev) ?
+				     f->idx : 0);
 	size_t total = f->prog_words + tiles + 1;
 
 	if (total > f->prog->size / sizeof(*words))
@@ -470,7 +480,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	bool intra_only = !!(frame->flags & (V4L2_VP9_FRAME_FLAG_KEY_FRAME |
 					     V4L2_VP9_FRAME_FLAG_INTRA_ONLY));
 
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(true) |
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_INTRA(intra_only) | AVD_OP_HDR_CONST |
 		     AVD_OP_HDR_FLAG_PIPE_STATE(
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
@@ -791,11 +801,22 @@ static int validate_dec_params(struct avd_ctx *ctx,
 	return 0;
 }
 
+/* The open transports need one PP kick per tile, from this frame's snapshot. */
+unsigned int avd_vp9_frame_pp_kicks(const struct avd_frame *f)
+{
+	const struct avd_vp9_slot *slot = f->codec_priv;
+
+	return slot ? slot->tiles : 0;
+}
+
 static int avd_vp9_alloc_bufs(struct avd_ctx *ctx,
 			      struct avd_vp9_slot *vp9_ctx)
 {
 	struct avd_dev *avd = ctx->dev;
 	int ret, w, h, bit_depth;
+	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.inst, fifo_size());
+	if (ret)
+		return ret;
 	w = fmt_width(ctx);
 	h = fmt_height(ctx);
 	bit_depth = (ctx->image_fmt == AVD_IMG_FMT_420_10BIT ||
@@ -1046,6 +1067,7 @@ avd_init_v4l2_vp9_count_tbl(struct avd_vp9_slot *vp9_ctx)
 
 static void avd_vp9_free_slot(struct avd_ctx *ctx, struct avd_vp9_slot *slot)
 {
+	avd_buf_free(ctx->dev, &slot->bufs.inst);
 	avd_buf_free(ctx->dev, &slot->bufs.az_left);
 	avd_buf_free(ctx->dev, &slot->bufs.above_info);
 	avd_buf_free(ctx->dev, &slot->bufs.ip_above);
@@ -1063,6 +1085,11 @@ static void avd_vp9_stop(struct avd_ctx *ctx)
 {
 	struct avd_vp9_ctx *stream = ctx->priv;
 
+	if (!avd_vp9_use_frame_ops(ctx)) {
+		avd_vp9_legacy_fmt_ops.stop(ctx);
+		return;
+	}
+
 	for (unsigned int i = 0; i < AVD_MAX_FRAMES; i++)
 		if (stream->slots[i])
 			avd_vp9_free_slot(ctx, stream->slots[i]);
@@ -1076,6 +1103,8 @@ static int avd_vp9_start(struct avd_ctx *ctx)
 {
 	struct avd_vp9_ctx *stream;
 
+	if (!avd_vp9_use_frame_ops(ctx))
+		return avd_vp9_legacy_fmt_ops.start(ctx);
 	stream = kvzalloc(sizeof(*stream), GFP_KERNEL);
 	if (!stream)
 		return -ENOMEM;
@@ -1099,11 +1128,13 @@ static int avd_vp9_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 	if (f->idx >= AVD_MAX_FRAMES || !f->src || !f->dst ||
 	    !f->prog || !f->prog->cpu)
 		return -EINVAL;
-	/* A submission dependency alone cannot protect CPU probability reads.
-	 * The core must retry prepare after retiring the count producer. */
-	f->dep = stream->pending ? AVD_DEP_PREV_DONE : AVD_DEP_NONE;
-	if (stream->pending)
+	/* The core blocks the next prepare after a count-producing frame.
+	 * Keep this guard for callers which do not use its readiness check. */
+	f->dep = AVD_DEP_NONE;
+	if (stream->pending) {
+		f->dep = AVD_DEP_PREV_DONE;
 		return -EAGAIN;
+	}
 	if (stream->failed)
 		return -EIO;
 
@@ -1166,6 +1197,16 @@ static int avd_vp9_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 	ret = set_tiles(ctx, &run);
 	if (ret)
 		goto err_put_maps;
+	memcpy(stream->working_context, stream->frame_context,
+	       sizeof(stream->working_context));
+	idx = v4l2_vp9_reset_frame_ctx(run.decode_params, stream->working_context);
+	slot->cur.frame_context_idx = idx;
+	slot->initial_probs = stream->working_context[idx];
+	slot->probability_tables = slot->initial_probs;
+	v4l2_vp9_fw_update_probs(&slot->probability_tables,
+				 run.prob_updates, run.decode_params);
+	memset(slot->bufs.counts.cpu, 0, slot->bufs.counts.size);
+	init_probs(ctx, &run);
 	if (avd_backend_is_apple(ctx->dev)) {
 		ret = avd_vp9_pack_fp(ctx, f, run.decode_params, run.prob_updates,
 				      slot->bufs.probs.cpu, slot->bufs.probs.addr);
@@ -1177,16 +1218,16 @@ static int avd_vp9_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 	ret = vp9_finish_program(ctx, f, header_words, tiles);
 	if (ret)
 		goto err_put_maps;
-	idx = v4l2_vp9_reset_frame_ctx(run.decode_params, stream->frame_context);
-	slot->cur.frame_context_idx = idx;
-	slot->initial_probs = stream->frame_context[idx];
-	slot->probability_tables = slot->initial_probs;
-	v4l2_vp9_fw_update_probs(&slot->probability_tables,
-				 run.prob_updates, run.decode_params);
-	memset(slot->bufs.counts.cpu, 0, slot->bufs.counts.size);
-	init_probs(ctx, &run);
+	memcpy(stream->frame_context, stream->working_context,
+	       sizeof(stream->frame_context));
+	slot->tiles = tiles;
+	f->fifo_iova = slot->bufs.inst.addr;
+	if (!avd_backend_is_apple(ctx->dev))
+		f->cmd[0] = AVD_CODEC_VP9;
 
 	f->codec_priv = slot;
+	f->dep = avd_vp9_needs_counts(slot->cur.flags) ?
+		 AVD_DEP_PREV_DONE : AVD_DEP_NONE;
 	if (slot->cur.flags & V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX) {
 		if (avd_vp9_needs_counts(slot->cur.flags))
 			stream->pending = f;
@@ -1225,11 +1266,28 @@ static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
 #undef BIT_DEPTH
 }
 
-/* The old core cannot run a frame_ops codec. Keep failure explicit until
- * the queue core is integrated, rather than dereferencing a NULL .run. */
+/* Stock firmware keeps the original builder and adaptation path verbatim. */
 static int avd_vp9_legacy_run(struct avd_ctx *ctx)
 {
-	return -EOPNOTSUPP;
+	return avd_vp9_legacy_fmt_ops.run(ctx);
+}
+
+static void avd_vp9_legacy_done(struct avd_ctx *ctx,
+			      struct vb2_v4l2_buffer *src,
+			      struct vb2_v4l2_buffer *dst,
+			      enum vb2_buffer_state state)
+{
+	avd_vp9_legacy_fmt_ops.done(ctx, src, dst, state);
+}
+
+static void avd_vp9_legacy_submit(struct avd_ctx *ctx)
+{
+	avd_vp9_legacy_fmt_ops.submit(ctx);
+}
+
+static unsigned int avd_vp9_legacy_pp_kicks(struct avd_ctx *ctx)
+{
+	return avd_vp9_legacy_fmt_ops.pp_kicks(ctx);
 }
 
 const struct avd_codec_frame_ops avd_vp9_frame_ops = {
@@ -1242,5 +1300,8 @@ const struct avd_coded_fmt_ops avd_vp9_fmt_ops = {
 	.start = avd_vp9_start,
 	.stop = avd_vp9_stop,
 	.run = avd_vp9_legacy_run,
+	.done = avd_vp9_legacy_done,
+	.submit = avd_vp9_legacy_submit,
+	.pp_kicks = avd_vp9_legacy_pp_kicks,
 	.get_image_fmt = avd_vp9_get_image_fmt,
 };

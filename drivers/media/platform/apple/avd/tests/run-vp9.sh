@@ -11,3 +11,5 @@ trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
 "$test_dir/test-vp9-fp"
 python3 "$src_dir/test-vp9-builder.py"
 python3 "$src_dir/test-vp9-codec.py"
+python3 "$src_dir/test-vp9-legacy.py"
+python3 "$src_dir/test-vp9-differential.py"
