@@ -1,0 +1,656 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+#include <linux/delay.h>
+#include <linux/dma-mapping.h>
+#include <linux/pm_runtime.h>
+#include <linux/reset.h>
+#include <linux/slab.h>
+#include <linux/sizes.h>
+
+#include "avd.h"
+#include "avd-queue-internal.h"
+
+#define AVD_FRAME_TIMEOUT msecs_to_jiffies(2000)
+/* A stream that fails this many frames in a row in hardware is stopped. */
+#define AVD_CTX_MAX_HW_ERRORS 3
+/* Never reset the decoder more often than this. */
+#define AVD_RECOVER_GAP_MS 20
+/* More than AVD_STORM_MAX recoveries within AVD_STORM_WINDOW: cool down. */
+#define AVD_STORM_MAX 8
+#define AVD_STORM_WINDOW msecs_to_jiffies(10000)
+#define AVD_COOLDOWN msecs_to_jiffies(10000)
+#define AVD_RETRY_DELAY msecs_to_jiffies(1)
+#define AVD_PROGRAM_SIZE SZ_2M
+
+bool avd_backend_is_apple(const struct avd_dev *avd)
+{
+	return avd->backend == &avd_apple_backend;
+}
+
+/* Reuse the m2m list node after removing an OUTPUT from its ready queue. */
+static void avd_sources_done(struct avd_ctx *ctx, struct list_head *sources,
+			     enum vb2_buffer_state state)
+{
+	struct v4l2_m2m_buffer *buf, *next;
+
+	list_for_each_entry_safe(buf, next, sources, list) {
+		list_del_init(&buf->list);
+		if (avd_codec_frame_ops(ctx) && buf->vb.vb2_buf.req_obj.req)
+			v4l2_ctrl_request_complete(buf->vb.vb2_buf.req_obj.req,
+						   &ctx->ctrl_hdl);
+		v4l2_m2m_buf_done(&buf->vb, state);
+	}
+}
+
+static void avd_partial_abort(struct avd_ctx *ctx)
+{
+	const struct avd_codec_frame_ops *ops = avd_codec_frame_ops(ctx);
+
+	if (list_empty(&ctx->slice_sources))
+		return;
+	if (ops && ops->retire)
+		ops->retire(ctx, &ctx->partial, VB2_BUF_STATE_ERROR);
+	else if (!ops && ctx->coded_fmt_desc->ops->done)
+		ctx->coded_fmt_desc->ops->done(ctx, ctx->partial.src,
+					     ctx->partial.dst, VB2_BUF_STATE_ERROR);
+	if (ctx->partial.dst)
+		ctx->partial.dst->is_held = false;
+	avd_sources_done(ctx, &ctx->slice_sources, VB2_BUF_STATE_ERROR);
+	memset(&ctx->partial, 0, sizeof(ctx->partial));
+}
+
+static void avd_source_hold(struct avd_ctx *ctx, struct avd_frame *f)
+{
+	struct v4l2_m2m_buffer *source;
+
+	/* Returning this OUTPUT now would let userspace overwrite DMA data. */
+	v4l2_m2m_buf_copy_metadata(f->src, f->dst);
+	v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+	source = container_of(f->src, struct v4l2_m2m_buffer, vb);
+	list_add_tail(&source->list, &ctx->slice_sources);
+	ctx->partial = *f;
+	/* Core retains CAPTURE on the ready queue. Avoid m2m timestamp-based
+	 * auto-completion of a partially collected picture.
+	 */
+	f->dst->is_held = false;
+	f->codec_priv = NULL;
+}
+
+/* Transfer partial-picture source ownership even on prepare failure. */
+static void avd_sources_attach(struct avd_ctx *ctx, struct avd_frame *f)
+{
+	list_splice_tail_init(&ctx->slice_sources, &ctx->dev->frame_sources[f->idx]);
+	memset(&ctx->partial, 0, sizeof(ctx->partial));
+}
+
+/* queue_mutex excludes callbacks and context destruction from retirement. */
+static void avd_retire(struct avd_dev *avd)
+{
+	struct avd_frame *f;
+	unsigned long flags;
+	unsigned int i;
+	bool progress;
+
+	do {
+		progress = false;
+		for (i = 0; i < AVD_MAX_FRAMES; i++) {
+			struct avd_ctx *ctx;
+			enum vb2_buffer_state state;
+
+			f = &avd->frames[i];
+			spin_lock_irqsave(&avd->queue_lock, flags);
+			if (f->state != AVD_FRAME_DONE ||
+			    !avd_slot_first(avd->frames, f)) {
+				spin_unlock_irqrestore(&avd->queue_lock, flags);
+				continue;
+			}
+			spin_unlock_irqrestore(&avd->queue_lock, flags);
+			ctx = f->ctx;
+			state = f->status ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
+			if (!f->status) {
+				ctx->hw_errors = 0;
+			} else if (++ctx->hw_errors >= AVD_CTX_MAX_HW_ERRORS && !ctx->broken) {
+				ctx->broken = true;
+				dev_err(avd->dev, "stream stopped after %u failed frames; restart streaming to retry\n",
+					ctx->hw_errors);
+			}
+			if (avd_codec_frame_ops(ctx)) {
+				if (avd_codec_frame_ops(ctx)->retire)
+					avd_codec_frame_ops(ctx)->retire(ctx, f, state);
+			} else if (ctx->coded_fmt_desc->ops->done) {
+				ctx->coded_fmt_desc->ops->done(ctx, f->src, f->dst, state);
+			}
+			if (avd_codec_frame_ops(ctx) && f->src->vb2_buf.req_obj.req)
+				v4l2_ctrl_request_complete(f->src->vb2_buf.req_obj.req,
+							   &ctx->ctrl_hdl);
+			/* CAPTURE first: OUTPUT completion signals the media request. */
+			if (f->scheduler_held) {
+				v4l2_m2m_buf_done_and_job_finish(avd->m2m_dev,
+								 ctx->fh.m2m_ctx, state);
+			} else {
+				v4l2_m2m_buf_done(f->dst, state);
+				avd_sources_done(ctx, &avd->frame_sources[f->idx], state);
+				v4l2_m2m_buf_done(f->src, state);
+			}
+			spin_lock_irqsave(&avd->queue_lock, flags);
+			f->ctx = NULL;
+			f->src = NULL;
+			f->dst = NULL;
+			f->state = AVD_FRAME_FREE;
+			avd->inflight--;
+			spin_unlock_irqrestore(&avd->queue_lock, flags);
+			avd_pm_queue_changed(avd);
+			pm_runtime_mark_last_busy(avd->dev);
+			pm_runtime_put_autosuspend(avd->dev);
+			progress = true;
+		}
+	} while (progress);
+}
+
+/* A reset invalidates every firmware-owned slot, including other clients. */
+static void avd_reset_queue(struct avd_dev *avd, int status)
+{
+	struct avd_ctx *ctx;
+	unsigned long flags;
+	unsigned int i;
+	int ret;
+
+	/*
+	 * A stream whose every frame faults (an H0 error storm) used to reset
+	 * the decoder back to back, about once per millisecond, until the
+	 * machine hung. Space recoveries out, and after a storm stop taking
+	 * new frames for a while instead of resetting again.
+	 */
+	if (avd->last_recover &&
+	    time_before(jiffies, avd->last_recover + msecs_to_jiffies(AVD_RECOVER_GAP_MS)))
+		msleep(AVD_RECOVER_GAP_MS);
+	if (!avd->storm_count || time_after(jiffies, avd->storm_start + AVD_STORM_WINDOW)) {
+		avd->storm_start = jiffies;
+		avd->storm_count = 0;
+	}
+	if (++avd->storm_count > AVD_STORM_MAX) {
+		dev_err(avd->dev, "%u decoder recoveries in %u s: failing new frames for %u s\n",
+			avd->storm_count, jiffies_to_msecs(AVD_STORM_WINDOW) / 1000,
+			jiffies_to_msecs(AVD_COOLDOWN) / 1000);
+		WRITE_ONCE(avd->cooldown_until, jiffies + AVD_COOLDOWN);
+		avd->storm_count = 0;
+	}
+	ret = avd_pm_recover(avd);
+	avd->last_recover = jiffies ?: 1;
+	WRITE_ONCE(avd->faulted, !!ret);
+	if (ret)
+		dev_err(avd->dev, "queue reset failed: %d\n", ret);
+	avd->compat_active = NULL;
+	list_for_each_entry(ctx, &avd->contexts, queue_node)
+		ctx->session_started = false;
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		if (avd->frames[i].state == AVD_FRAME_FREE)
+			continue;
+		avd->frames[i].status = status;
+		avd->frames[i].state = AVD_FRAME_DONE;
+	}
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	if (!ret)
+		avd_pm_enable_irq(avd);
+}
+
+static int avd_send_frame(struct avd_dev *avd, struct avd_frame *f)
+{
+	unsigned long flags;
+	int ret;
+
+	if (f->dep == AVD_DEP_PREV_DONE && !avd_slot_first(avd->frames, f))
+		return -EBUSY;
+	if ((!f->ctx->session_started ||
+	     f->ctx->session_generation != avd->fw_generation) &&
+	    avd->backend->session_start) {
+		ret = avd->backend->session_start(f->ctx);
+		if (ret)
+			return ret;
+		f->ctx->session_started = true;
+		f->ctx->session_generation = avd->fw_generation;
+	}
+	/* Publish ownership before the doorbell; IRQs may arrive in submit(). */
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	f->state = AVD_FRAME_SUBMITTED;
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	dma_wmb();
+	ret = avd->backend->submit(avd, f);
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	avd_slot_submit_result(f, ret);
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	return ret;
+}
+
+static void avd_queue_worker(struct work_struct *work)
+{
+	struct avd_dev *avd = container_of(to_delayed_work(work),
+					 struct avd_dev, queue_work);
+	struct avd_ctx *ctx;
+	unsigned long flags;
+	unsigned int i;
+	bool pending;
+	unsigned long delay = AVD_FRAME_TIMEOUT;
+
+	mutex_lock(&avd->queue_mutex);
+	if (avd->stopping)
+		goto unlock;
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		bool expired;
+
+		spin_lock_irqsave(&avd->queue_lock, flags);
+		expired = avd_slot_expired(&avd->frames[i], jiffies);
+		spin_unlock_irqrestore(&avd->queue_lock, flags);
+		if (expired) {
+			struct avd_frame *t = &avd->frames[i];
+
+			dev_err(avd->dev, "frame tag %#x timed out (%p4cc, state %d, %u in flight, %s)\n",
+				t->tag, t->ctx ? &t->ctx->coded_fmt_desc->fourcc : &(u32){0},
+				t->state, avd->inflight, avd->backend->name);
+			avd_reset_queue(avd, -ETIMEDOUT);
+			break;
+		}
+	}
+	avd_retire(avd);
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		struct avd_frame *f = &avd->frames[i];
+		int ret;
+
+		if (f->state != AVD_FRAME_RESERVED)
+			continue;
+		ret = avd_send_frame(avd, f);
+		if (ret && ret != -EBUSY) {
+			spin_lock_irqsave(&avd->queue_lock, flags);
+			f->status = ret;
+			f->state = AVD_FRAME_DONE;
+			spin_unlock_irqrestore(&avd->queue_lock, flags);
+		}
+	}
+	avd_retire(avd);
+	/* Restart a job that found no free slot. */
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	ctx = avd->inflight < avd->backend->max_inflight(avd) ? avd->deferred_ctx : NULL;
+	if (ctx)
+		avd->deferred_ctx = NULL;
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	if (ctx)
+		schedule_work(&ctx->submit_work);
+	/* Freed slots/dependencies must wake contexts whose job_ready was false. */
+	list_for_each_entry(ctx, &avd->contexts, queue_node)
+		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	pending = avd->inflight != 0;
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		struct avd_frame *f = &avd->frames[i];
+		unsigned long remaining;
+
+		if (f->state == AVD_FRAME_FREE)
+			continue;
+		remaining = time_after(f->deadline, jiffies) ? f->deadline - jiffies : 0;
+		if (f->state == AVD_FRAME_RESERVED)
+			remaining = min(remaining, AVD_RETRY_DELAY);
+		delay = min(delay, remaining);
+	}
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	if (pending)
+		mod_delayed_work(system_wq, &avd->queue_work, delay);
+ unlock:
+	mutex_unlock(&avd->queue_mutex);
+}
+
+void avd_frame_complete(struct avd_dev *avd, u32 tag, int status)
+{
+	struct avd_frame *f = &avd->frames[tag & (AVD_MAX_FRAMES - 1)];
+	unsigned long flags;
+	bool accepted;
+
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	accepted = avd_slot_complete(f, tag, status);
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	if (accepted)
+		mod_delayed_work(system_wq, &avd->queue_work, 0);
+}
+
+int avd_queue_ready(void *priv)
+{
+	struct avd_ctx *ctx = priv;
+	struct avd_dev *avd = ctx->dev;
+	unsigned long flags;
+	unsigned int i;
+	bool ready;
+
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	/*
+	 * A faulted or cooling-down decoder still schedules: submission fails
+	 * those frames at once, so clients see errors instead of waiting.
+	 */
+	/*
+	 * Slot capacity is not a readiness condition: every context with work
+	 * enters the m2m job queue, which runs them in order, and a job that
+	 * finds no free slot is deferred until one retires. Gating readiness on
+	 * one reserved context let the first context in the list win every
+	 * time and starved the others (multi-stream decodes timing out).
+	 */
+	ready = !READ_ONCE(ctx->draining) && !READ_ONCE(avd->stopping);
+	if (ready && ctx->next_dep == AVD_DEP_PREV_DONE) {
+		/* Legacy codecs may hold several pictures in separate banks. */
+		unsigned int limit = ctx->coded_fmt_desc && !avd_codec_frame_ops(ctx) ?
+				     max(ctx->max_frames, 1U) : 1, held = 0;
+
+		for (i = 0; i < AVD_MAX_FRAMES; i++)
+			if (avd->frames[i].state != AVD_FRAME_FREE &&
+			    avd->frames[i].ctx == ctx)
+				held++;
+		ready = held < limit;
+	}
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	return ready;
+}
+
+static void avd_queue_submit_work(struct work_struct *work)
+{
+	struct avd_ctx *ctx = container_of(work, struct avd_ctx, submit_work);
+	struct avd_dev *avd = ctx->dev;
+	const struct avd_codec_frame_ops *ops = avd_codec_frame_ops(ctx);
+	struct avd_frame *f = NULL;
+	unsigned long flags;
+	unsigned int i;
+	int ret;
+
+	mutex_lock(&avd->queue_mutex);
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	if (avd->deferred_ctx == ctx)
+		avd->deferred_ctx = NULL;
+	if (avd->stopping || ctx->draining || avd->faulted || ctx->broken ||
+	    time_before(jiffies, READ_ONCE(avd->cooldown_until))) {
+		struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+
+		spin_unlock_irqrestore(&avd->queue_lock, flags);
+		avd_partial_abort(ctx);
+		/* Complete the request's controls too, or its fd never signals. */
+		if (src && src->vb2_buf.req_obj.req)
+			v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+		v4l2_m2m_buf_done_and_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx,
+						 VB2_BUF_STATE_ERROR);
+		goto unlock;
+	}
+	if (avd->inflight < avd->backend->max_inflight(avd)) {
+		for (i = 0; i < AVD_MAX_FRAMES; i++) {
+			if (avd->frames[i].state == AVD_FRAME_FREE) {
+				f = &avd->frames[i];
+				break;
+			}
+		}
+	}
+	if (!f) {
+		/* Keep the m2m job; the worker restarts it when a slot frees. */
+		avd->deferred_ctx = ctx;
+		spin_unlock_irqrestore(&avd->queue_lock, flags);
+		mod_delayed_work(system_wq, &avd->queue_work, 0);
+		goto unlock;
+	}
+	ret = avd_slot_reserve(f, ctx, ++avd->frame_seq);
+	if (!ret)
+		avd->inflight++;
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	if (WARN_ON(ret)) {
+		v4l2_m2m_buf_done_and_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx,
+						 VB2_BUF_STATE_ERROR);
+		goto unlock;
+	}
+	ret = pm_runtime_resume_and_get(avd->dev);
+	if (ret < 0)
+		goto fail_no_pm;
+	f->src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	f->dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	/*
+	 * Only a slice that holds its CAPTURE buffer needs the m2m scheduler
+	 * until retirement. The last slice of a picture releases both buffers
+	 * to the slot, so the next picture can be prepared while it decodes.
+	 */
+	f->scheduler_held = (ctx->fh.m2m_ctx->out_q_ctx.q.subsystem_flags &
+			     VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF) &&
+			    (f->src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF);
+	f->frame_num = f->tag;
+	f->deadline = jiffies + AVD_FRAME_TIMEOUT;
+	memset(f->cmd, 0, sizeof(f->cmd));
+	if (ops) {
+		if (!f->prog->cpu) {
+			ret = avd_buf_alloc(avd, f->prog, AVD_PROGRAM_SIZE);
+			if (ret)
+				goto fail;
+		}
+		/* NULL fp is also the codec-facing indication of an open program. */
+		f->fp = NULL;
+		if (avd_backend_is_apple(avd)) {
+			struct avd_buf *fp = avd->frame_fp[f->idx];
+
+			if (!fp) {
+				fp = devm_kzalloc(avd->dev, sizeof(*fp), GFP_KERNEL);
+				avd->frame_fp[f->idx] = fp;
+			}
+			f->fp = fp;
+			if (!f->fp) {
+				ret = -ENOMEM;
+				goto fail;
+			}
+			if (!f->fp->cpu) {
+				ret = avd_buf_alloc(avd, f->fp, avd->variant->fp_size);
+				if (ret)
+					goto fail;
+			}
+		}
+		if (f->src->vb2_buf.req_obj.req) {
+			ret = v4l2_ctrl_request_setup(f->src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+			if (ret)
+				goto fail;
+		}
+		ret = ops->prepare(ctx, f);
+	} else {
+		avd->building = f;
+		avd->compat_held = false;
+		ret = ctx->coded_fmt_desc->ops->run(ctx);
+		avd->building = NULL;
+	}
+	if (ret)
+		goto fail;
+	ctx->next_dep = ops ? f->dep : AVD_DEP_PREV_DONE;
+	if ((ops && (f->src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)) ||
+	    (!ops && avd->compat_held)) {
+		avd_source_hold(ctx, f);
+		spin_lock_irqsave(&avd->queue_lock, flags);
+		f->state = AVD_FRAME_FREE;
+		f->ctx = NULL;
+		avd->inflight--;
+		spin_unlock_irqrestore(&avd->queue_lock, flags);
+		avd_pm_queue_changed(avd);
+		pm_runtime_mark_last_busy(avd->dev);
+		pm_runtime_put_autosuspend(avd->dev);
+		v4l2_m2m_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx);
+		goto unlock;
+	}
+	avd_sources_attach(ctx, f);
+	v4l2_m2m_buf_copy_metadata(f->src, f->dst);
+	if (!f->scheduler_held) {
+		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+		v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+	}
+	f->dst->is_held = false;
+	ret = avd_send_frame(avd, f);
+	if (ret && ret != -EBUSY) {
+		spin_lock_irqsave(&avd->queue_lock, flags);
+		f->status = ret;
+		f->state = AVD_FRAME_DONE;
+		spin_unlock_irqrestore(&avd->queue_lock, flags);
+	}
+	/* Buffers now belong to the slot, not to the m2m scheduler. */
+	if (!f->scheduler_held)
+		v4l2_m2m_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx);
+	mod_delayed_work(system_wq, &avd->queue_work, 0);
+	goto unlock;
+ fail:
+	avd_sources_attach(ctx, f);
+	/* Failure ends a held picture as well as its final request. */
+	f->scheduler_held = false;
+	if (f->dst)
+		f->dst->is_held = false;
+	/* Detach before retirement, including partially prepared codec state. */
+	if (!f->scheduler_held) {
+		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+		v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+	}
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	f->status = ret;
+	f->state = AVD_FRAME_DONE;
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	if (!f->scheduler_held)
+		v4l2_m2m_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx);
+	mod_delayed_work(system_wq, &avd->queue_work, 0);
+	goto unlock;
+ fail_no_pm:
+	avd_partial_abort(ctx);
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	f->state = AVD_FRAME_FREE;
+	f->ctx = NULL;
+	avd->inflight--;
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	avd_pm_queue_changed(avd);
+	v4l2_m2m_buf_done_and_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx,
+					 VB2_BUF_STATE_ERROR);
+ unlock:
+	mutex_unlock(&avd->queue_mutex);
+}
+
+void avd_queue_run(void *priv)
+{
+	struct avd_ctx *ctx = priv;
+
+	/* try_schedule() may invoke device_run synchronously under queue_mutex. */
+	schedule_work(&ctx->submit_work);
+}
+
+void avd_queue_drain(struct avd_ctx *ctx)
+{
+	struct avd_dev *avd = ctx->dev;
+	unsigned long flags;
+	unsigned int i;
+	bool finish_deferred = false;
+	int ret;
+
+	/* Session stop/reset accesses registers even when there are no frames. */
+	ret = pm_runtime_resume_and_get(avd->dev);
+	avd_pm_drain_begin(avd);
+	mutex_lock(&avd->queue_mutex);
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	WRITE_ONCE(ctx->draining, true);
+	if (avd->deferred_ctx == ctx) {
+		avd->deferred_ctx = NULL;
+		finish_deferred = true;
+	}
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	/* A deferred job is still m2m's running job: end it so abort can wait. */
+	if (finish_deferred)
+		v4l2_m2m_buf_done_and_job_finish(avd->m2m_dev, ctx->fh.m2m_ctx,
+						 VB2_BUF_STATE_ERROR);
+	for (i = 0; ret >= 0 && i < AVD_MAX_FRAMES; i++) {
+		if (avd->frames[i].state != AVD_FRAME_FREE && avd->frames[i].ctx == ctx) {
+			if (avd->backend->abort)
+				avd->backend->abort(ctx);
+			avd_reset_queue(avd, -ECANCELED);
+			break;
+		}
+	}
+	avd_retire(avd);
+	avd_partial_abort(ctx);
+	if (ret >= 0 && ctx->session_started && avd->backend->session_stop &&
+	    ctx->session_generation == avd->fw_generation)
+		avd->backend->session_stop(ctx);
+	ctx->session_started = false;
+	if (!avd->stopping)
+		mod_delayed_work(system_wq, &avd->queue_work, 0);
+	mutex_unlock(&avd->queue_mutex);
+	avd_pm_drain_end(avd);
+	if (ret >= 0) {
+		pm_runtime_mark_last_busy(avd->dev);
+		pm_runtime_put_autosuspend(avd->dev);
+	}
+}
+
+void avd_queue_abort(void *priv)
+{
+	avd_queue_drain(priv);
+}
+
+void avd_queue_add_ctx(struct avd_ctx *ctx)
+{
+	struct avd_ctx *other;
+	u32 id;
+
+	INIT_WORK(&ctx->submit_work, avd_queue_submit_work);
+	INIT_LIST_HEAD(&ctx->slice_sources);
+	mutex_lock(&ctx->dev->queue_mutex);
+	/* Borage decode prefix has ten client bits. */
+	for (id = 0; id < 1024; id++) {
+		bool used = false;
+
+		list_for_each_entry(other, &ctx->dev->contexts, queue_node)
+			used |= other->client_id == id;
+		if (!used)
+			break;
+	}
+	ctx->client_id = id;
+	list_add_tail(&ctx->queue_node, &ctx->dev->contexts);
+	mutex_unlock(&ctx->dev->queue_mutex);
+}
+
+void avd_queue_del_ctx(struct avd_ctx *ctx)
+{
+	avd_queue_drain(ctx);
+	mutex_lock(&ctx->dev->queue_mutex);
+	if (ctx->dev->compat_ctx == ctx)
+		ctx->dev->compat_ctx = NULL;
+	list_del_init(&ctx->queue_node);
+	mutex_unlock(&ctx->dev->queue_mutex);
+}
+
+int avd_queue_init(struct avd_dev *avd)
+{
+	unsigned int i;
+
+	spin_lock_init(&avd->queue_lock);
+	mutex_init(&avd->queue_mutex);
+	INIT_LIST_HEAD(&avd->contexts);
+	INIT_DELAYED_WORK(&avd->queue_work, avd_queue_worker);
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		struct avd_frame *f = &avd->frames[i];
+
+		f->idx = i;
+		INIT_LIST_HEAD(&avd->frame_sources[i]);
+		f->prog = devm_kzalloc(avd->dev, sizeof(*f->prog), GFP_KERNEL);
+		if (!f->prog)
+			return -ENOMEM;
+	}
+	return 0;
+}
+
+void avd_queue_cleanup(struct avd_dev *avd)
+{
+	struct avd_ctx *ctx;
+	unsigned int i;
+
+	mutex_lock(&avd->queue_mutex);
+	WRITE_ONCE(avd->stopping, true);
+	if (avd->inflight) {
+		avd_reset_queue(avd, -ESHUTDOWN);
+		avd_retire(avd);
+	}
+	list_for_each_entry(ctx, &avd->contexts, queue_node)
+		avd_partial_abort(ctx);
+	mutex_unlock(&avd->queue_mutex);
+	cancel_delayed_work_sync(&avd->queue_work);
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		avd_buf_free(avd, avd->frames[i].prog);
+		if (avd->frame_fp[i])
+			avd_buf_free(avd, avd->frame_fp[i]);
+	}
+}
