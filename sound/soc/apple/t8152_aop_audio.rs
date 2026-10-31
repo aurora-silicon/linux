@@ -10,6 +10,9 @@
 //!   channels 10 and 11).
 //! * `spkr`: the SN012776 speaker amplifier, base-ns TX1 (channel 2), its
 //!   sense data on RX1.
+//! * `hpai` (J813): the microphone array, three PDM microphones the firmware
+//!   delivers as float32 on leap-s ADMAC RX0. It has no codec, so it is the
+//!   capture PCM of a small card of its own.
 //!
 //! Each service is an ASoC back-end DAI: startup attaches it and requests
 //! `pw0 ` (which also brings up the audio fabric), prepare requests `pwrd`
@@ -31,12 +34,14 @@ use kernel::{
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{from_fourcc, EPICService, AOP},
+    str::CString,
     sync::{
         aref::ARef,
         atomic::{Atomic, AtomicFlag, Relaxed},
-        Arc,
+        Arc, ArcBorrow,
     },
-    types::Opaque,
+    types::{ForeignOwnable, Opaque},
+    workqueue::{self, impl_has_work, new_work, Work, WorkItem},
 };
 
 const EPIC_SUBTYPE_WRAPPED_CALL: u16 = 0x20;
@@ -57,6 +62,15 @@ const PD_GET_RETRY_MS: i64 = 10;
 /// The MCA serializer leaves (audio_mca0_m .. audio_mca5_m).
 const MCA_COUNT: usize = 6;
 const MCA_NAMES: [&CStr; MCA_COUNT] = [c"mca0", c"mca1", c"mca2", c"mca3", c"mca4", c"mca5"];
+/// The microphone array's LEAP leaves: the leap-s ADMAC, its RX0 channel and
+/// the LEAP serializer. A LEAP ADMAC's channel registers only answer with
+/// these powered (an access without them faults the bus).
+const LEAP_NAMES: [&CStr; 3] = [c"leap_s_a", c"leap_rx0", c"leap_mca"];
+/// The microphone array's stream (ADT audio-hp-mic-proxy physical
+/// description): 48 kHz, three float32 channels.
+const HPAI_RATE: u32 = 48000;
+const HPAI_CHANNELS: u32 = 3;
+const HPAI_START_WORK: u64 = 1;
 
 fn aop_timestamp() -> u64 {
     // SAFETY: both helpers read the architected timer and take no arguments.
@@ -223,6 +237,30 @@ struct T8152AopAudio {
     cfg: &'static HwConfig,
     /// The open sense capture front-end, if any.
     sense: Atomic<*mut bindings::snd_pcm_substream>,
+    hpai: Service,
+    /// The microphone array's leaves (`LEAP_NAMES`); empty without one.
+    leap: KVec<PowerDomain>,
+    /// The microphone capture is triggered.
+    hpai_want_run: AtomicFlag,
+    #[pin]
+    hpai_start_work: Work<Self, HPAI_START_WORK>,
+}
+
+impl_has_work! {
+    impl HasWork<Self, HPAI_START_WORK> for T8152AopAudio { self.hpai_start_work }
+}
+
+/// The microphone array's `pwrd`, queued by the capture trigger (a sleeping
+/// firmware call). The ADMAC is running by then: started before it, the LEAP
+/// produces into a channel nobody services and the capture stays noise.
+impl WorkItem<HPAI_START_WORK> for T8152AopAudio {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        if let Err(e) = this.hpai_go() {
+            dev_err!(this.dev, "hpai: start failed: {:?}\n", e);
+        }
+    }
 }
 
 impl T8152AopAudio {
@@ -324,11 +362,11 @@ impl T8152AopAudio {
         Ok(())
     }
 
-    fn mca_up(&self) -> Result<()> {
-        for (i, pd) in self.mca.iter().enumerate() {
+    fn leaves_up(&self, pds: &[PowerDomain], what: &str) -> Result<()> {
+        for (i, pd) in pds.iter().enumerate() {
             if let Err(e) = pd.get() {
-                dev_err!(self.dev, "MCA leaf {} did not power up: {:?}\n", i, e);
-                for pd in self.mca[..i].iter().rev() {
+                dev_err!(self.dev, "{} leaf {} did not power up: {:?}\n", what, i, e);
+                for pd in pds[..i].iter().rev() {
                     pd.put();
                 }
                 return Err(e);
@@ -337,10 +375,18 @@ impl T8152AopAudio {
         Ok(())
     }
 
-    fn mca_down(&self) {
-        for pd in self.mca.iter().rev() {
+    fn leaves_down(pds: &[PowerDomain]) {
+        for pd in pds.iter().rev() {
             pd.put();
         }
+    }
+
+    fn mca_up(&self) -> Result<()> {
+        self.leaves_up(&self.mca, "MCA")
+    }
+
+    fn mca_down(&self) {
+        Self::leaves_down(&self.mca)
     }
 
     /// Back-end startup: attach, `pw0 ` (which raises the fabric), then the
@@ -438,6 +484,39 @@ impl T8152AopAudio {
             svc.running.store(false, Relaxed);
         }
         self.mca_down();
+    }
+
+    /// Microphone open: attach, `pw0 ` (which raises the fabric), then the
+    /// LEAP leaves, before the capture requests its ADMAC channel.
+    fn hpai_startup(&self) -> Result<()> {
+        self.attach(&self.hpai)?;
+        self.set_power(&self.hpai, POWER_STATE_PW0)?;
+        self.leaves_up(&self.leap, "LEAP")?;
+        self.hpai.running.store(false, Relaxed);
+        Ok(())
+    }
+
+    fn hpai_go(&self) -> Result<()> {
+        if !self.hpai_want_run.load(Relaxed) {
+            return Ok(());
+        }
+        self.run(&self.hpai)
+    }
+
+    /// Microphone close, after the channel is released: a queued start
+    /// finishes first, then `pw0 ` and the leaves.
+    fn hpai_shutdown(&self) {
+        self.hpai_want_run.store(false, Relaxed);
+        // SAFETY: the work item lives in `self`; flushing waits for a queued
+        // `hpai_go`.
+        unsafe { bindings::flush_work(Work::raw_get(&self.hpai_start_work)) };
+        if self.hpai.running.load(Relaxed) {
+            if let Err(e) = self.set_power(&self.hpai, POWER_STATE_PW0) {
+                dev_err!(self.dev, "hpai: pw0 failed: {:?}\n", e);
+            }
+            self.hpai.running.store(false, Relaxed);
+        }
+        Self::leaves_down(&self.leap);
     }
 }
 
@@ -566,6 +645,68 @@ unsafe fn dai_data<'a>(dai: *mut bindings::snd_soc_dai) -> &'a T8152AopAudio {
     unsafe { component_data((*dai).component) }
 }
 
+/// The dmaengine PCMs' common description: mmap-able, interleaved, periods
+/// from 256 bytes to the ADMAC's segment size. Rates, channels and formats
+/// are left to the caller (for a front-end, ASoC fills them in from the DAI).
+fn pcm_hw() -> bindings::snd_pcm_hardware {
+    bindings::snd_pcm_hardware {
+        info: bindings::SNDRV_PCM_INFO_MMAP
+            | bindings::SNDRV_PCM_INFO_MMAP_VALID
+            | bindings::SNDRV_PCM_INFO_INTERLEAVED,
+        buffer_bytes_max: PCM_BUFFER_MAX,
+        period_bytes_min: PCM_PERIOD_BYTES_MIN,
+        period_bytes_max: PCM_PERIOD_BYTES_MAX,
+        periods_min: 2,
+        periods_max: (PCM_BUFFER_MAX / PCM_PERIOD_BYTES_MIN) as u32,
+        fifo_size: 16,
+        ..Default::default()
+    }
+}
+
+/// Sets up a dmaengine substream on `chan`: a managed buffer on the DMA
+/// device (once per substream), `hw` refined by the channel and narrowed to
+/// `formats`, then the dmaengine runtime. On failure the channel is still
+/// the caller's.
+///
+/// # Safety
+///
+/// `substream` must be live and `chan` a channel the caller requested.
+unsafe fn dmaengine_open(
+    substream: *mut bindings::snd_pcm_substream,
+    chan: *mut bindings::dma_chan,
+    mut hw: bindings::snd_pcm_hardware,
+    formats: u64,
+) -> i32 {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        let mut ret = 0;
+        if (*substream).dma_buffer.dev.type_ == bindings::SNDRV_DMA_TYPE_UNKNOWN as i32 {
+            ret = bindings::snd_pcm_set_managed_buffer(
+                substream,
+                bindings::SNDRV_DMA_TYPE_DEV as i32,
+                (*(*chan).device).dev,
+                0,
+                0,
+            );
+        }
+        if ret == 0 {
+            let mut dma_data = bindings::snd_dmaengine_dai_dma_data::default();
+            ret = bindings::snd_dmaengine_pcm_refine_runtime_hwparams(
+                substream,
+                &mut dma_data,
+                &mut hw,
+                chan,
+            );
+        }
+        if ret == 0 {
+            hw.formats &= formats;
+            (*(*substream).runtime).hw = hw;
+            ret = bindings::snd_dmaengine_pcm_open(substream, chan);
+        }
+        ret
+    }
+}
+
 /// # Safety
 ///
 /// Called by ASoC on this driver's component with live arguments.
@@ -600,46 +741,9 @@ unsafe extern "C" fn asoc_pcm_open(
             return e.to_errno();
         }
     };
-    let mut hw = bindings::snd_pcm_hardware {
-        info: bindings::SNDRV_PCM_INFO_MMAP
-            | bindings::SNDRV_PCM_INFO_MMAP_VALID
-            | bindings::SNDRV_PCM_INFO_INTERLEAVED,
-        buffer_bytes_max: PCM_BUFFER_MAX,
-        period_bytes_min: PCM_PERIOD_BYTES_MIN,
-        period_bytes_max: PCM_PERIOD_BYTES_MAX,
-        periods_min: 2,
-        periods_max: (PCM_BUFFER_MAX / PCM_PERIOD_BYTES_MIN) as u32,
-        fifo_size: 16,
-        ..Default::default()
-    };
-    // SAFETY: the substream and the channel are live.
-    let ret = unsafe {
-        let mut ret = 0;
-        if (*substream).dma_buffer.dev.type_ == bindings::SNDRV_DMA_TYPE_UNKNOWN as i32 {
-            ret = bindings::snd_pcm_set_managed_buffer(
-                substream,
-                bindings::SNDRV_DMA_TYPE_DEV as i32,
-                (*(*chan).device).dev,
-                0,
-                0,
-            );
-        }
-        if ret == 0 {
-            let mut dma_data = bindings::snd_dmaengine_dai_dma_data::default();
-            ret = bindings::snd_dmaengine_pcm_refine_runtime_hwparams(
-                substream,
-                &mut dma_data,
-                &mut hw,
-                chan,
-            );
-        }
-        if ret == 0 {
-            hw.formats &= if fe == 2 { data.cfg.sense_formats } else { FORMATS };
-            (*(*substream).runtime).hw = hw;
-            ret = bindings::snd_dmaengine_pcm_open(substream, chan);
-        }
-        ret
-    };
+    let formats = if fe == 2 { data.cfg.sense_formats } else { FORMATS };
+    // SAFETY: the substream is live and the channel was requested above.
+    let ret = unsafe { dmaengine_open(substream, chan, pcm_hw(), formats) };
     if ret < 0 {
         // SAFETY: the open failed, so the channel is still ours.
         unsafe { bindings::dma_release_channel(chan) };
@@ -989,14 +1093,256 @@ impl AsocContext {
     }
 }
 
+// ---- the microphone array's card ----
+
+/// # Safety
+///
+/// `substream` must be a live substream of the microphone PCM, whose private
+/// data is the `Arc` leaked into it by `MicCard::new` (released in
+/// `mic_pcm_free` after the last op).
+unsafe fn mic_data<'a>(substream: *mut bindings::snd_pcm_substream) -> ArcBorrow<'a, T8152AopAudio> {
+    // SAFETY: by the caller's contract.
+    unsafe { Arc::<T8152AopAudio>::borrow((*(*substream).pcm).private_data.cast()) }
+}
+
+/// The LEAP produces float32 into the channel requested here; the channel's
+/// registers only answer with the LEAP leaves up, so the service (and with
+/// it the leaves) comes up before the request and goes down after the
+/// release.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of the microphone PCM.
+unsafe extern "C" fn mic_pcm_open(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: by the caller's contract.
+    let data = unsafe { mic_data(substream) };
+    // A failed startup has undone its leaves; the service stays in `pw0 `.
+    if let Err(e) = data.hpai_startup() {
+        return e.to_errno();
+    }
+    // SAFETY: the device is live and the name is NUL-terminated.
+    let chan = match from_err_ptr(unsafe {
+        bindings::dma_request_chan(data.dev.as_raw(), c"hpai".as_char_ptr())
+    }) {
+        Ok(chan) => chan,
+        Err(e) => {
+            dev_err!(data.dev, "hpai: DMA channel unavailable: {:?}\n", e);
+            data.hpai_shutdown();
+            return e.to_errno();
+        }
+    };
+    let hw = bindings::snd_pcm_hardware {
+        rates: bindings::SNDRV_PCM_RATE_48000,
+        rate_min: HPAI_RATE,
+        rate_max: HPAI_RATE,
+        channels_min: HPAI_CHANNELS,
+        channels_max: HPAI_CHANNELS,
+        ..pcm_hw()
+    };
+    // SAFETY: the substream is live and the channel was requested above.
+    let ret = unsafe {
+        dmaengine_open(substream, chan, hw, bindings::BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE)
+    };
+    if ret < 0 {
+        // SAFETY: the open failed, so the channel is still ours.
+        unsafe { bindings::dma_release_channel(chan) };
+        data.hpai_shutdown();
+    }
+    ret
+}
+
+/// # Safety
+///
+/// Called by ALSA with a live substream of the microphone PCM.
+unsafe extern "C" fn mic_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: by the caller's contract.
+    let data = unsafe { mic_data(substream) };
+    // SAFETY: the dmaengine runtime was set up in `mic_pcm_open`.
+    let ret = unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
+    data.hpai_shutdown();
+    ret
+}
+
+/// # Safety
+///
+/// Called by ALSA with a live substream of the microphone PCM and live
+/// parameters.
+unsafe extern "C" fn mic_pcm_hw_params(
+    substream: *mut bindings::snd_pcm_substream,
+    params: *mut bindings::snd_pcm_hw_params,
+) -> i32 {
+    // SAFETY: the dmaengine runtime was set up in `mic_pcm_open`.
+    let chan = unsafe { bindings::snd_dmaengine_pcm_get_chan(substream) };
+    let mut cfg = bindings::dma_slave_config::default();
+    // SAFETY: the substream and the parameters are live for the op.
+    let rc = unsafe { bindings::snd_hwparams_to_dma_slave_config(substream, params, &mut cfg) };
+    if rc < 0 {
+        return rc;
+    }
+    // Three words per frame, which the ADMAC cannot mark (it frames 2 or 4):
+    // a plain word stream.
+    // SAFETY: `chan` is the live channel behind the substream.
+    unsafe {
+        match (*(*chan).device).device_config {
+            Some(f) => f(chan, &mut cfg),
+            None => ENOSYS.to_errno(),
+        }
+    }
+}
+
+/// ALSA calls prepare unconditionally. Nothing to arm: the DMA start and
+/// the queued firmware run belong to trigger.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of the microphone PCM.
+unsafe extern "C" fn mic_pcm_prepare(_substream: *mut bindings::snd_pcm_substream) -> i32 {
+    0
+}
+
+/// With the stream lock held: the DMA first, then the firmware's `pwrd`
+/// queued behind it.
+///
+/// # Safety
+///
+/// Called by ALSA with a live substream of the microphone PCM.
+unsafe extern "C" fn mic_pcm_trigger(substream: *mut bindings::snd_pcm_substream, cmd: i32) -> i32 {
+    // SAFETY: by the caller's contract.
+    let data = unsafe { mic_data(substream) };
+    // SAFETY: the dmaengine runtime was set up in `mic_pcm_open`.
+    let ret = unsafe { bindings::snd_dmaengine_pcm_trigger(substream, cmd) };
+    if ret < 0 {
+        return ret;
+    }
+    match cmd as u32 {
+        bindings::SNDRV_PCM_TRIGGER_START
+        | bindings::SNDRV_PCM_TRIGGER_RESUME
+        | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
+            data.hpai_want_run.store(true, Relaxed);
+            // Err: already queued, and that run sees `hpai_want_run`.
+            let _ = workqueue::system().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
+        }
+        _ => data.hpai_want_run.store(false, Relaxed),
+    }
+    0
+}
+
+/// # Safety
+///
+/// Called once by ALSA when the PCM goes away.
+unsafe extern "C" fn mic_pcm_free(pcm: *mut bindings::snd_pcm) {
+    // SAFETY: the `Arc` leaked into the private data by `MicCard::new`.
+    drop(unsafe { Arc::<T8152AopAudio>::from_foreign((*pcm).private_data.cast()) });
+}
+
+static MIC_PCM_OPS: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
+    open: Some(mic_pcm_open),
+    close: Some(mic_pcm_close),
+    ioctl: None,
+    hw_params: Some(mic_pcm_hw_params),
+    hw_free: None,
+    prepare: Some(mic_pcm_prepare),
+    trigger: Some(mic_pcm_trigger),
+    sync_stop: None,
+    pointer: Some(bindings::snd_dmaengine_pcm_pointer),
+    get_time_info: None,
+    fill_silence: None,
+    copy: None,
+    page: None,
+    mmap: None,
+    ack: None,
+};
+
+/// Copies a NUL-terminated string into a fixed-size field, truncated to fit.
+fn copy_str(target: &mut [u8], source: &CStr) {
+    let b = source.to_bytes();
+    let n = b.len().min(target.len() - 1);
+    target[..n].copy_from_slice(&b[..n]);
+    target[n] = 0;
+}
+
+/// The microphone array's card: one capture PCM, named like the other AOP
+/// microphone cards (AppleJxxxHPAI) so that the UCM and DSP configurations
+/// for those find it.
+struct MicCard(*mut bindings::snd_card);
+
+impl MicCard {
+    fn new(data: &Arc<T8152AopAudio>) -> Result<Self> {
+        let fwnode = data.dev.fwnode().ok_or(ENODEV)?;
+        let chassis = fwnode
+            .property_read::<CString>(c_str!("apple,chassis-name"))
+            .required_by(&data.dev)?;
+        let kind = fwnode
+            .property_read::<CString>(c_str!("apple,machine-kind"))
+            .required_by(&data.dev)?;
+        let id = CString::try_from_fmt(fmt!("Apple{}HPAI", *chassis))?;
+        let shortname = CString::try_from_fmt(fmt!("{} {} HPAI", *kind, *chassis))?;
+        let longname =
+            CString::try_from_fmt(fmt!("{} {} High-Power Audio Interface", *kind, *chassis))?;
+        let mut card = ptr::null_mut();
+        // SAFETY: the device and the module are live; `card` receives the card.
+        let ret = unsafe {
+            bindings::snd_card_new(
+                data.dev.as_raw(),
+                -1,
+                ptr::null(),
+                kernel::module::this_module::<crate::LocalModule>().as_ptr(),
+                0,
+                &mut card,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        // From here on, dropping `this` frees the card.
+        let this = MicCard(card);
+        // SAFETY: the card is new and unregistered.
+        unsafe {
+            copy_str(&mut (*card).driver, c"aop_audio");
+            copy_str(&mut (*card).id, &id);
+            copy_str(&mut (*card).shortname, &shortname);
+            copy_str(&mut (*card).longname, &longname);
+        }
+        let mut pcm = ptr::null_mut();
+        // SAFETY: the card is live; `pcm` receives the PCM.
+        let ret = unsafe { bindings::snd_pcm_new(card, c"hpai".as_char_ptr(), 0, 0, 1, &mut pcm) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        // SAFETY: `pcm` is live; the ops are static and the private data is
+        // an `Arc` that `mic_pcm_free` releases.
+        unsafe {
+            bindings::snd_pcm_set_ops(pcm, bindings::SNDRV_PCM_STREAM_CAPTURE as i32, &MIC_PCM_OPS);
+            (*pcm).private_data = data.clone().into_foreign().cast();
+            (*pcm).private_free = Some(mic_pcm_free);
+            copy_str(&mut (*pcm).name, c"Microphone Array");
+        }
+        // SAFETY: the card is live and complete.
+        let ret = unsafe { bindings::snd_card_register(card) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        Ok(this)
+    }
+}
+
+impl Drop for MicCard {
+    fn drop(&mut self) {
+        // SAFETY: created by `snd_card_new`; this waits for open files.
+        unsafe { bindings::snd_card_free(self.0) };
+    }
+}
+
 struct T8152AopAudioDriver {
     dev: ARef<device::Device>,
     asoc: KBox<AsocContext>,
     registered: AtomicFlag,
+    /// Held for its drop, which frees the card after unbind.
+    _mic: Option<MicCard>,
 }
 
-// SAFETY: the ASoC context is only touched by ASoC callbacks and by probe and
-// remove, which the driver core serializes.
+// SAFETY: the ASoC context and the card are only touched by ALSA/ASoC
+// callbacks and by probe and remove, which the driver core serializes.
 unsafe impl Send for T8152AopAudioDriver {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for T8152AopAudioDriver {}
@@ -1069,6 +1415,21 @@ impl platform::Driver for T8152AopAudioDriver {
             }
         }
 
+        // The microphone array, where the DT describes it: all of its leaves
+        // or none.
+        let mut leap = KVec::new();
+        for name in LEAP_NAMES {
+            match PowerDomain::attach(&dev, name) {
+                Ok(Some(pd)) => leap.push(pd, GFP_KERNEL)?,
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !leap.is_empty() && leap.len() != LEAP_NAMES.len() {
+            dev_err!(dev, "incomplete microphone power domains\n");
+            return Err(ENODEV);
+        }
+
         let data_dev = dev.clone();
         let data = Arc::pin_init(
             pin_init!(T8152AopAudio {
@@ -1081,12 +1442,30 @@ impl platform::Driver for T8152AopAudioDriver {
                 mca,
                 cfg,
                 sense: Atomic::new(ptr::null_mut()),
+                hpai: Service::new(from_fourcc(b"hpai"), "hpai", false),
+                leap,
+                hpai_want_run: AtomicFlag::new(false),
+                hpai_start_work <- new_work!("T8152AopAudio::hpai_start_work"),
             }),
             GFP_KERNEL,
         )?;
         for svc in [&data.cout, &data.cin, &data.spkr] {
             data.attach(svc)?;
         }
+
+        // The microphones are optional: the speakers and the jack stay
+        // usable without them.
+        let mic = if data.leap.is_empty() {
+            None
+        } else {
+            match MicCard::new(&data) {
+                Ok(card) => Some(card),
+                Err(e) => {
+                    dev_err!(dev, "microphone card: {:?}\n", e);
+                    None
+                }
+            }
+        };
 
         let asoc = AsocContext::new(data)?;
         // SAFETY: the descriptor and the DAI table are heap allocations owned
@@ -1107,6 +1486,7 @@ impl platform::Driver for T8152AopAudioDriver {
             dev,
             asoc,
             registered: AtomicFlag::new(true),
+            _mic: mic,
         })
     }
 
