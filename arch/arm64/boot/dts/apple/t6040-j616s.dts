@@ -1459,6 +1459,11 @@
 	};
 };
 
+/* The QSPI controller cannot probe while its power state is disabled. */
+&ps_qspi {
+	status = "okay";
+};
+
 /*
  * Touch ID sensor (Mesa 0x3356). Its power is NUB GPIO 53 and its
  * data-ready line is AP GPIO 116, as the J616s ADT describes them.
