@@ -399,6 +399,7 @@ static const struct avd_coded_fmt_desc avd_coded_fmts[] = {
 		},
 		.ctrls = &avd_hevc_ctrls,
 		.ops = &avd_hevc_fmt_ops,
+		.frame_ops = &avd_hevc_frame_ops,
 		.num_decoded_fmts = ARRAY_SIZE(avd_hevc_decoded_fmts),
 		.subsystem_flags = VB2_V4L2_FL_SUPPORTS_M2M_HOLD_CAPTURE_BUF,
 		.decoded_fmts = avd_hevc_decoded_fmts,
@@ -1040,6 +1041,35 @@ void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run)
 
 	if (src_req)
 		v4l2_ctrl_request_complete(src_req, &ctx->ctrl_hdl);
+}
+
+/*
+ * One-job compatibility bridge while the frame-queue core is integrated.
+ * Queue access, request lifetime and submission stay in the core; the HEVC
+ * prepare callback is identical for this bridge and for queued backends.
+ */
+int avd_hevc_legacy_run(struct avd_ctx *ctx)
+{
+	struct avd_run base;
+	struct avd_buf prog = { .size = 0x100000 };
+	struct avd_frame f = { .ctx = ctx, .prog = &prog };
+	int ret;
+
+	prog.cpu = kvzalloc(prog.size, GFP_KERNEL);
+	if (!prog.cpu)
+		return -ENOMEM;
+	avd_run_preamble(ctx, &base);
+	f.src = base.bufs.src;
+	f.dst = base.bufs.dst;
+	ret = avd_hevc_frame_ops.prepare(ctx, &f);
+	if (!ret)
+		ret = avd_hevc_legacy_job(ctx, &f);
+	avd_run_postamble(ctx, &base);
+	avd_hevc_frame_ops.retire(ctx, &f, ret ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
+	kvfree(prog.cpu);
+	if (!ret)
+		ret = avd_submit_job(ctx);
+	return ret;
 }
 
 static int avd_add_ctrls(struct avd_ctx *ctx, const struct avd_ctrls *ctrls)
