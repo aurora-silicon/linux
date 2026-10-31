@@ -115,24 +115,66 @@ EVENT_REPORT        0x0300  6        0x60 (firmware to host)
 ==================  ======  =======  ==================
 
 These sizes bound the observed version, not future firmware. POWER_GATE has
-a u32 Boolean at +8. The execute-size increment of 0x18 does not establish
-buffer-record semantics. The channel numbers are observed table indices;
+a u32 Boolean at +8. The execute-size increment of 0x18 counts custom BAR
+records. The channel numbers are observed table indices;
 their mapping to channel names remains unproved. The parser retains each
 descriptor's original index rather than assuming name order is wire order.
 
 The transport prepares the H16 envelope and rejects unrecognized runtime
 IDs, wrong sizes, channels and power-gate values before publication.
 H14's 0x0204 procedure packet and short CREATE_PROCESS body remain H14-only;
-H16's body serializers and completion correlation are not implemented.
+H16's standalone serializer and event classifier are described below;
+they are not connected to inference submission.
 The H16 runtime command table does not authorize startup commands.
 
-The event report starts with u32 0x0000fe00 through 0x0000fe03, then u16
-0x0300 and zero u16 at +6. Its body is undecoded. Valid reports are consumed
-as diagnostics and never complete an inference or release its buffers.
-The legacy 0x28-byte state-1 completion predicate must not be used for H16.
-Unknown short channel-6 messages fail closed. A timeout retains mappings
-and quarantines the instance; it does not trigger a retry or reset.
+H16 execute and event fields
+---------------------------
 
-KUnit covers all seven runtime IDs and their sizes/directions/channels,
-the u16 envelope and refusal semantics, and report validation without
-inventing completion fields. All test packets are synthetic.
+The macOS 27.0 field contract has a fixed 0xca8-byte execute body followed
+by zero, one or two observed 0x18-byte custom BAR records. The 64-slot
+ordinary buffer array starts at +0x60 with a 0x30-byte stride; the valid
+count is at +0x28. A descriptor carries flags at +0, resource index at +4,
+numeric class at +8, the fixed value 3 at +0x10, a u64 DVA at +0x18 and a
+u64 byte span at +0x20. Other descriptor bytes are zero. The UUID at
+execute +0x20 is independent of program/process/procedure IDs at +8/+0xc/+0x10.
+The observed priority is 5 at +0x18; request flags and reserved bytes are zero.
+
+The custom BAR count is at +0xca0 and records start at +0xca8. Each carries
+u32 configuration/value-type/BAR selectors, u8 bit offset/width, u16 flags
+and a u64 value. ``ane_h16_execute_encode()`` accepts kernel-owned resource
+metadata, checks nonempty counts up to 64 and overflow-free mapping spans,
+and zeroes unused slots and reserved space. The caller must first match
+indices, numeric classes, permissions, selectors and values to immutable
+validated process metadata and keep mappings pinned. The helper does not
+establish that authority. Its two-BAR ceiling, 64-bit field bound and
+same-configuration/BAR overlap refusal are conservative draft restrictions,
+not established firmware-wide limits. Unknown class and selector semantics
+are not guessed. There is no userspace interface for these structures.
+
+Channel 7 acknowledges submission only. Channel 6 carries 0x60-byte 0x0300
+events, with UUID at +8, program/process/procedure at +0x10/+0x14/+0x18 and
+state at +0x1c. State 0 is start, 3 hardware-start, 1 successful terminal
+completion and 2 terminal failure. Failure was established from field use;
+it was not present in the runtime sample. The first word selects report
+slots or rolls independently; 0xfe00..0xfe03 is not a universal prefix or a
+completion key. CPU-load and timestamp fields are diagnostic.
+
+``ane_h16_event_decode()`` validates the channel, exact size, command and
+zero u16 acknowledgment before returning fields. The result helper requires
+all four identity fields to match an outstanding request. Destination 1 is
+routed away from the general scheduler; unknown states/destinations refuse.
+A caller must register a unique pending UUID before publication, consume it
+atomically once on a terminal report, synchronize DMA, and apply quarantine
+rules before considering any mapping release. A classifier result alone
+cannot prove safe release or reject duplicate events without pending state.
+
+The live H16 path still consumes reports as diagnostics. It has no pending
+UUID table, serializer call or inference interface. The legacy 0x28-byte
+completion predicate remains H14-only. Short channel-6 CPU-load reports and
+channel-5 allocation operations are outside these helpers and remain gated.
+Timeouts still retain mappings and quarantine without retry or reset.
+
+KUnit covers byte-exact synthetic execute fields, all 1..64 buffer counts,
+zero/one/two custom BAR lengths, wide DVAs/spans, reserved-zero output,
+boundary and overflow refusal, all event states, interleaved identities,
+ISP routing and malformed reports. No test packet is copied from a capture.

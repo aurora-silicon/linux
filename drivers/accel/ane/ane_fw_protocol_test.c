@@ -104,7 +104,7 @@ static void ane_h16_report_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, 0xc, 6), -EPROTO);
 	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(NULL, 0x60, 6), -EPROTO);
 	put_unaligned_le32(0xfe04, event);
-	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 6), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 6), 0);
 	put_unaligned_le32(0xfe00, event);
 	put_unaligned_le16(0x301, event + 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 6), -EPROTO);

@@ -909,7 +909,7 @@ static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
 				atomic_set(&ane_t6021_quarantined, 1);
 				return false;
 			}
-			/* The captured H16 report has no decoded completion field.
+			/* H16 submission and pending-UUID tracking are not wired up.
 			 * Consume diagnostics without retiring an execution or its BOs.
 			 */
 		} else if (channel == 6 && len >= ANE_T2H_CALL_STATE_OFF + 4) {
@@ -1450,7 +1450,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	size_t cmd_size;
 	int ret, i, pinned = 0;
 
-	/* H16 EXECUTE is 0x020c on channel 7 with an undecoded body. */
+	/* H16 EXECUTE needs validated resources and pending-UUID tracking. */
 	if (ane->soc->platform)
 		return -EOPNOTSUPP;
 	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
