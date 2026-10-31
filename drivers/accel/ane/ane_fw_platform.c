@@ -159,10 +159,10 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	/* Original HWX validation does not establish firmware ownership,
-	 * preload integrity, startup state or a decoded process resource map.
-	 * Keep the section-only ABI and incomplete boot backend refused.
+	/* The identity checker requires stable, owned live-page snapshots.
+	 * No backend has acquired those pages or proved startup state and a
+	 * decoded process resource map. Keep this refusal before power access.
 	 */
-	dev_info(dev, "H16 ANE: preload validation, HWX ABI and boot backend incomplete; refusing before power access\n");
+	dev_info(dev, "H16 ANE: live preload ownership, HWX ABI and boot backend incomplete; refusing before power access\n");
 	return -EOPNOTSUPP;
 }

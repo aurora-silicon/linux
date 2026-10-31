@@ -8,6 +8,7 @@
 
 #define ANE_H16_SURFACES 4
 #define ANE_H16_SECTIONS 8
+#define ANE_H16_REGIONS 7
 #define ANE_H16_HWX_MAX (SZ_256M + SZ_1M)
 
 struct ane_h16_hwx_section {
@@ -28,12 +29,31 @@ struct ane_h16_hwx_surface {
 	char name[8];
 };
 
+enum ane_h16_region_kind {
+	ANE_H16_REGION_SURFACE,
+	ANE_H16_REGION_TEXT,
+	ANE_H16_REGION_KERNEL,
+	ANE_H16_REGION_SCRATCH,
+};
+
+/* Original segment geometry, not firmware section IDs or resource indices. */
+struct ane_h16_hwx_region {
+	u64 vm;
+	u64 size;
+	u64 file_offset;
+	u64 file_size;
+	u32 permissions;
+	enum ane_h16_region_kind kind;
+};
+
 struct ane_h16_hwx {
 	struct ane_h16_hwx_section text, constants, kernel, scratch;
 	struct ane_h16_hwx_surface surfaces[ANE_H16_SURFACES];
 	u32 surface_count;
 	u32 tasks;
 	u32 program_offset;
+	struct ane_h16_hwx_region regions[ANE_H16_REGIONS];
+	u32 region_count;
 };
 
 /* Input must be one immutable kernel-owned snapshot of the original file. */
@@ -49,6 +69,8 @@ struct ane_h16_hwx_snapshot {
 /* Snapshot before validation; callers never publish or mutate snapshot bytes. */
 int ane_h16_hwx_snapshot_create(const void *bytes, size_t size,
 				struct ane_h16_hwx_snapshot *snapshot);
+int ane_h16_hwx_snapshot_from_user(const void __user *bytes, u64 size,
+				   struct ane_h16_hwx_snapshot *snapshot);
 int ane_h16_hwx_snapshot_check(const struct ane_h16_hwx_snapshot *snapshot);
 void ane_h16_hwx_snapshot_destroy(struct ane_h16_hwx_snapshot *snapshot);
 
