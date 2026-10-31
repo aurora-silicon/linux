@@ -1,0 +1,77 @@
+HEVC frame preparation and Apple payload development
+===================================================
+
+The HEVC frame_ops callbacks are CPU-only. prepare() consumes the controls
+already applied by the core, snapshots all fixed and dynamic controls under the
+handler lock, writes a bounded little-endian instruction program, and retains
+its private state until retire(). Every global frame index has an independent
+scratch-buffer set. dep is NONE. The core must drain before stop().
+
+The legacy core bridge applies/completes controls and translates the same
+program back to avd_job segments. Its old PP kick lives in avd-drv.c, not in
+prepare(). This retains the existing single-job path until rewrite-core replaces
+that dispatch. It is not evidence of queued firmware execution.
+
+Slice layout selection checks two complete descriptions:
+
+* Per-NAL bit_size values tile bytesused minus the VB2 plane data_offset. The
+  entropy range begins at the NAL prefix sum plus data_byte_offset.
+* Absolute data_byte_offset values delimit disjoint entropy ranges; bit_size
+  describes entropy data only. Gaps for NAL headers are allowed; the last
+  entropy range must end at bytesused.
+
+Invalid descriptions, overflow, overlapping absolute ranges and ambiguous
+unequal ranges fail before instruction generation. No bitstream copy or CPU
+mapping of OUTPUT is needed. Both modes use the same tile/entry-point builder.
+
+Apple readiness (deliberately incomplete)
+----------------------------------------
+
+avd-hevc-fp.c records the licensed V3 offsets from:
+https://github.com/eiln/avd/blob/main/avid/h265/fp.py
+https://github.com/eiln/avd/blob/main/avid/h265/halv3.py
+https://github.com/eiln/avd/blob/main/avid/h265/decoder.py
+MIT, Copyright 2023 Eileen Yoon <eyn@gmx.com>.
+
+The writer mirrors known header/scaling/reference/first-slice instruction
+fields into the V3 slot. Array capacities are bounded by the public structure.
+It does not invent a second-slice stride, input-descriptor layout for multiple
+slices, or PIO control words. Main10 candidate offsets remain table entries;
+Linux instruction bit-depth bits are not copied into the Apple slot as facts.
+
+The Borage table records the 0x1130d0 slot and section 6.3 command constants.
+The common frame number and slice count can be written. Its syntax, work-array
+assignment, and packed cmd+0x3c/+0x44 address masks remain unresolved. The command
+helper validates four available count fields against active_vps (1..4), the
+slice count (<0x258), monotonically increasing aligned in-slot work offsets and
+per-VP work <=0x1000/active_vps. The actual firmware traversal count and the work
+unit/extent are still unproved. pack_cmd() never succeeds for an incomplete
+Apple payload; known command-field tests do not establish firmware acceptance.
+
+T8112 and T8140 have explicit TODO rows tied to the per-SoC ledger task t-3862.
+T8103 selects the public M1 V3 comparison layout. T6000 still needs the
+ledger's runtime class confirmation and stays UNKNOWN. T6040 selects Borage. Other matches stay UNKNOWN,
+without falling back to a different generation. HEVC capability and Apple
+payload readiness are separate. All existing HEVC-capable matches advertise
+S265/Main/Main10, including T6040; Main10 output is the existing P010 format.
+
+Host checks (run in an approved buildbox slot)
+--------------------------------------------
+
+python3 drivers/media/platform/apple/avd/tests/test-hevc-program.py \
+  --baseline-ref fbc4e7934ca7325f3483b72a51d24c74aa8536a4
+
+cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -DAVD_HEVC_HOST_TEST -Idrivers/media/platform/apple/avd \
+  drivers/media/platform/apple/avd/tests/hevc-fp-test.c \
+  drivers/media/platform/apple/avd/avd-hevc-fp.c \
+  drivers/media/platform/apple/avd/avd-hevc-slices.c -o /tmp/hevc-fp-test
+/tmp/hevc-fp-test
+
+The first test compiles the actual old/new builder bodies with a minimal host
+shim. It compares every instruction word for 96 combinations of bit depth 8/10,
+CTU 32/64, tiles 1x1/2x2, I/P/B and four instruction-header/address generations,
+with both slice layouts (192 comparisons). These are synthetic V4L2 controls;
+they are not controls captured from libx265 or an output-pixel decode test.
+The second exercises normalization failures, V3 field offsets/capacities,
+Main10 candidate rejection and Borage command/work validation boundaries.

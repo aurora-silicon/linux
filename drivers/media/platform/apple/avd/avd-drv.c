@@ -222,6 +222,24 @@ int avd_submit_job(struct avd_ctx *ctx)
 	return 0;
 }
 
+/* Legacy HEVC PP kick; queued backends own VP-to-PP chaining themselves. */
+void avd_hevc_legacy_submit(struct avd_ctx *ctx)
+{
+	struct avd_dev *avd = ctx->dev;
+	unsigned int i;
+
+	writel(AVD_OP_EXEC |
+	       AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision == 4) |
+	       AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision == 3) |
+	       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+	       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
+	       avd->ctrl + avd->variant->submit_offset);
+	for (i = 1; i < ctx->hevc_legacy_submit_num; i++)
+		writel(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
+		       avd->ctrl + avd->variant->submit_offset);
+}
+
 static int avd_reset(struct avd_dev *avd)
 {
 	int ret = 0;
@@ -654,6 +672,7 @@ static void avd_v4l2_cleanup(struct avd_dev *avd)
 }
 
 static const struct avd_variant avd_t8103_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_V3,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2, /* no sure */
 		[AVD_CODEC_H264] = 1,
@@ -674,6 +693,7 @@ static const struct avd_variant avd_t8103_variant = {
 };
 
 static const struct avd_variant avd_t6000_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_UNKNOWN,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -694,6 +714,7 @@ static const struct avd_variant avd_t6000_variant = {
 };
 
 static const struct avd_variant avd_t8112_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_T8112_TODO,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -714,6 +735,7 @@ static const struct avd_variant avd_t8112_variant = {
 };
 
 static const struct avd_variant avd_t6020_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_UNKNOWN,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -733,6 +755,7 @@ static const struct avd_variant avd_t6020_variant = {
 };
 
 static const struct avd_variant avd_t8122_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_UNKNOWN,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -754,6 +777,7 @@ static const struct avd_variant avd_t8122_variant = {
 };
 
 static const struct avd_variant avd_t8140_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_T8140_TODO,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2,
 		[AVD_CODEC_H264] = 1,
@@ -783,6 +807,7 @@ static const struct avd_variant avd_t8140_variant = {
 };
 
 static const struct avd_variant avd_t8132_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_UNKNOWN,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -807,10 +832,11 @@ static const struct avd_variant avd_t8132_variant = {
  * T6040 (M4 Pro): the T8132 decoder. Its first HEVC job stalled the VP when
  * it was sent the pre-v5 header (no DMA configuration words, no reserved
  * scratch slot); T6040 runs the same v5 firmware generation as T8140, so it
- * gets the v5 header. HEVC stays hidden from V4L2 clients until that is
- * verified on the hardware.
+ * gets the v5 header. HEVC Main/Main10 are hardware capabilities; Apple
+ * payload readiness is checked separately by the codec packer.
  */
 static const struct avd_variant avd_t6040_variant = {
+	.hevc_fp_layout = AVD_HEVC_FP_BORAGE,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -819,7 +845,8 @@ static const struct avd_variant avd_t6040_variant = {
 	},
 	.fifo_slots = 15,
 	.configure_stream = t8122_configure_stream,
-	.capabilities = AVD_CAPABILITY_H264 |
+	.capabilities = AVD_CAPABILITY_HEVC |
+			AVD_CAPABILITY_H264 |
 			AVD_CAPABILITY_VP9 |
 			AVD_CAPABILITY_AV1,
 	.fw_name = "apple/avd-fw-v5-t1.bin",
