@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
+#include <linux/errno.h>
 #include "avd-hevc-fp.h"
 
 /*
