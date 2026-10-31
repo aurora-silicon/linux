@@ -21,6 +21,7 @@ ane-y := \
 ane_t6021-y := \
 	ane_fw_platform.o \
 	ane_h16_backend.o \
+	ane_h16_accel.o \
 	ane_t6021_rtclient_main.o \
 	ane_t6021_fwload.o \
 	ane_t6021_boot.o

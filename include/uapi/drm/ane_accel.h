@@ -21,6 +21,9 @@ extern "C" {
  * - ane_t6021 (H14 family: T6020, T6021, T6022, T8112) implements ABI
  *   version %DRM_ANE_ABI_V2: GET_CAPS, BO_INIT, BO_FREE, PROG_LOAD,
  *   PROC_CREATE and EXEC.
+ * - ane_t6021 on H16 (T6041) implements ABI version %DRM_ANE_ABI_V3:
+ *   GET_CAPS, H16_LOAD and H16_EXEC. The node exists only after the staged
+ *   H16 opt-in reached its program stage.
  *
  * The DRM_IOCTL_VERSION major and &drm_ane_get_caps.abi_version both give
  * the ABI version. The two versions share the ioctl numbers and the
@@ -33,9 +36,11 @@ extern "C" {
  */
 #define DRM_ANE_ABI_V1		1
 #define DRM_ANE_ABI_V2		2
+#define DRM_ANE_ABI_V3		3
 
 #define DRM_ANE_CHIP_H13	13
 #define DRM_ANE_CHIP_H14	14
+#define DRM_ANE_CHIP_H16	16
 
 /* ABI version 1: entries of &drm_ane_submit.handles */
 #define DRM_ANE_TILE_COUNT	0x20
@@ -56,13 +61,41 @@ extern "C" {
 #define DRM_ANE_PROG_LOAD	0x04
 #define DRM_ANE_PROC_CREATE	0x05
 #define DRM_ANE_EXEC		0x06
+#define DRM_ANE_H16_LOAD	0x07
+#define DRM_ANE_H16_EXEC	0x08
+
+/* ABI version 3: host-built program sections that H16_LOAD places */
+#define DRM_ANE_H16_SECTION_GENERIC		1
+#define DRM_ANE_H16_SECTION_OPERATION		2
+#define DRM_ANE_H16_SECTION_PROCEDURE		3
+#define DRM_ANE_H16_SECTION_TEXT_PROPERTIES	4
+#define DRM_ANE_H16_SECTIONS			4
+/* ABI version 3: smallest and largest host-built section, in bytes */
+#define DRM_ANE_H16_SECTION_MIN			0x28
+#define DRM_ANE_H16_SECTION_MAX			0x10000
+
+/*
+ * ABI version 3: firmware resource indices that the kernel gives the LOAD
+ * slots. A host-built section that names a slot uses these values. In
+ * particular, a program with a kernel section tags its operation record with
+ * %DRM_ANE_H16_RESOURCE_KERNEL.
+ */
+#define DRM_ANE_H16_RESOURCE_GENERIC		1002
+#define DRM_ANE_H16_RESOURCE_OPERATION		1003
+#define DRM_ANE_H16_RESOURCE_PROCEDURE		1004
+#define DRM_ANE_H16_RESOURCE_TEXT_PROPERTIES	1005
+#define DRM_ANE_H16_RESOURCE_TEXT		1006
+#define DRM_ANE_H16_RESOURCE_KERNEL		1007
+/* ABI version 3: most surfaces of one program */
+#define DRM_ANE_H16_SURFACES			4
 
 /**
  * struct drm_ane_get_caps - DRM_IOCTL_ANE_GET_CAPS argument
  * @flags: In. No flags are defined: must be zero.
  * @size: Out. Bytes of this structure that the driver filled in.
- * @abi_version: Out. %DRM_ANE_ABI_V1 or %DRM_ANE_ABI_V2.
- * @chip_family: Out. %DRM_ANE_CHIP_H13 or %DRM_ANE_CHIP_H14.
+ * @abi_version: Out. %DRM_ANE_ABI_V1, %DRM_ANE_ABI_V2 or %DRM_ANE_ABI_V3.
+ * @chip_family: Out. %DRM_ANE_CHIP_H13, %DRM_ANE_CHIP_H14 or
+ *	%DRM_ANE_CHIP_H16.
  * @section_size: Out. Size of the &drm_ane_section entries that PROG_LOAD
  *	reads, or 0 if the driver has no PROG_LOAD.
  * @bind_size: Out. Size of the &drm_ane_generic_bind entries that PROG_LOAD
@@ -237,6 +270,79 @@ struct drm_ane_exec {
 	__u64 io_ptr;
 };
 
+/**
+ * struct drm_ane_h16_section - one host-built program section (ABI version 3)
+ * @kind: %DRM_ANE_H16_SECTION_GENERIC to
+ *	%DRM_ANE_H16_SECTION_TEXT_PROPERTIES, each exactly once.
+ * @size: Bytes at @data_ptr, %DRM_ANE_H16_SECTION_MIN to
+ *	%DRM_ANE_H16_SECTION_MAX and a multiple of 4.
+ * @data_ptr: Pointer to the section bytes. The kernel copies them.
+ */
+struct drm_ane_h16_section {
+	__u32 kind;
+	__u32 size;
+	__u64 data_ptr;
+};
+
+/**
+ * struct drm_ane_h16_load - DRM_IOCTL_ANE_H16_LOAD argument (ABI version 3)
+ * @hwx_ptr: In. Pointer to the original HWX file.
+ * @hwx_size: In. Size of the HWX file in bytes.
+ * @sections_ptr: In. Pointer to struct drm_ane_h16_section[@section_count].
+ * @section_count: In. Exactly %DRM_ANE_H16_SECTIONS.
+ * @flags: In. No flags are defined: must be zero.
+ * @surface_count: Out. Surfaces of the program, inputs and the one output in
+ *	the HWX segment order that H16_EXEC uses.
+ * @pad: Must be zero.
+ * @surface_size: Out. Bytes of each surface, for @surface_count entries.
+ * @surface_direction: Out. 1 for an input, 2 for the output.
+ *
+ * The kernel validates the HWX, places every section in its own private
+ * mapping, then loads the program and creates its process. The program
+ * belongs to this file and is unloaded when the file closes. Each firmware
+ * boot accepts one program: a second H16_LOAD fails with -EBUSY, also after
+ * the first program closed. A reboot starts a new firmware boot.
+ */
+struct drm_ane_h16_load {
+	__u64 hwx_ptr;
+	__u64 hwx_size;
+	__u64 sections_ptr;
+	__u32 section_count;
+	__u32 flags;
+	__u32 surface_count;
+	__u32 pad;
+	__u64 surface_size[DRM_ANE_H16_SURFACES];
+	__u32 surface_direction[DRM_ANE_H16_SURFACES];
+};
+
+/**
+ * struct drm_ane_h16_buffer - one surface of an H16_EXEC (ABI version 3)
+ * @ptr: In. Pointer to the bytes: read for an input, written for the output.
+ * @size: In. Must equal the surface size that H16_LOAD reported.
+ */
+struct drm_ane_h16_buffer {
+	__u64 ptr;
+	__u64 size;
+};
+
+/**
+ * struct drm_ane_h16_exec - DRM_IOCTL_ANE_H16_EXEC argument (ABI version 3)
+ * @buffers_ptr: In. Pointer to struct drm_ane_h16_buffer[@count], one entry
+ *	per surface in the order that H16_LOAD reported.
+ * @count: In. The surface count of the loaded program.
+ * @flags: In. No flags are defined: must be zero.
+ *
+ * A successful H16_EXEC returns after the firmware reported the end of the
+ * request, with the output copied to its buffer. The driver keeps all
+ * firmware-visible memory private: inputs are copied in before the request
+ * and the output is copied out after it.
+ */
+struct drm_ane_h16_exec {
+	__u64 buffers_ptr;
+	__u32 count;
+	__u32 flags;
+};
+
 #define DRM_IOCTL_ANE_GET_CAPS \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_ANE_GET_CAPS, struct drm_ane_get_caps)
 #define DRM_IOCTL_ANE_BO_INIT \
@@ -251,6 +357,10 @@ struct drm_ane_exec {
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_ANE_PROC_CREATE, struct drm_ane_proc_create)
 #define DRM_IOCTL_ANE_EXEC \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_ANE_EXEC, struct drm_ane_exec)
+#define DRM_IOCTL_ANE_H16_LOAD \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_ANE_H16_LOAD, struct drm_ane_h16_load)
+#define DRM_IOCTL_ANE_H16_EXEC \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_ANE_H16_EXEC, struct drm_ane_h16_exec)
 
 #if defined(__cplusplus)
 }

@@ -18,10 +18,13 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
+#include "ane_h16_accel.h"
 #include "ane_h16_boot.h"
 #include "ane_h16_preload.h"
 
 #define ANE_H16_TX_WORDS 272
+/* Private program window above the SHAREDMALLOC range; host policy. */
+#define ANE_H16_PROGRAM_WINDOW SZ_1G
 
 struct ane_h16_mapping {
 	struct list_head node;
@@ -58,6 +61,10 @@ struct ane_h16_device {
 	u32 tx_write;
 	bool rtk_failed;
 	u64 shared_next;
+	u64 program_next;
+	u64 program_end;
+	unsigned int stage;
+	struct ane_h16_session session;
 };
 
 static DEFINE_MUTEX(ane_h16_lock);
@@ -248,6 +255,8 @@ static int ane_h16_map(void *ctx)
 	}
 	if (h->domain->geometry.aperture_end < b->build->shared_dva + ANE_FW_SHARED_TOTAL)
 		return -ERANGE;
+	if (h->stage == ANE_H16_PROGRAM && h->domain->geometry.aperture_end < h->program_end - 1)
+		return -ERANGE;
 	ret = iommu_attach_device(h->domain, h->dev);
 	if (ret)
 		return ret;
@@ -273,9 +282,9 @@ static int ane_h16_map(void *ctx)
 	return 0;
 }
 
-static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surface *out)
+static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, int prot,
+			      struct ane_fw_surface *out)
 {
-	struct ane_h16_device *h = ctx;
 	struct ane_h16_mapping *m;
 	u32 i, j, pages_per_block = SZ_16K / PAGE_SIZE;
 	unsigned int order = get_order(SZ_16K);
@@ -314,13 +323,37 @@ static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surfa
 	for (i = 0; i < m->blocks; i++) {
 		ret = iommu_map(h->domain, dva + i * SZ_16K,
 				page_to_phys(m->pages[i * pages_per_block]), SZ_16K,
-				IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, GFP_KERNEL);
+				prot, GFP_KERNEL);
 		if (ret)
 			return ret;
 		m->mapped += SZ_16K;
 	}
 	*out = (struct ane_fw_surface) { .cpu = m->cpu, .dva = dva, .size = size };
 	return 0;
+}
+
+static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surface *out)
+{
+	return ane_h16_alloc_prot(ctx, dva, size, IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, out);
+}
+
+/* Program sections and surfaces. Only outputs and scratch are device-writable. */
+static int ane_h16_program_map(void *ctx, size_t size, bool write, struct ane_fw_surface *out)
+{
+	struct ane_h16_device *h = ctx;
+	u64 dva = h->program_next;
+	int ret;
+
+	if (!size || size > h->program_end - dva)
+		return -ENOSPC;
+	/* A failed mapping keeps its range; DVAs are never reused before reset. */
+	h->program_next += size;
+	ret = ane_h16_alloc_prot(h, dva, size,
+				 IOMMU_READ | IOMMU_CACHE | (write ? IOMMU_WRITE : 0), out);
+	if (!ret)
+		dev_info(h->dev, "H16 program mapping %llx bytes %zx%s\n", dva, size,
+			 write ? " writable" : "");
+	return ret;
 }
 
 static u64 ane_h16_load64(void *ctx, const void *p)
@@ -409,6 +442,11 @@ static const struct ane_h16_boot_ops ane_h16_ops = {
 	.mailbox = ane_h16_mailbox,
 	.log = ane_h16_log,
 	.quarantine = ane_h16_quarantine,
+};
+
+static const struct ane_h16_session_ops ane_h16_session_ops = {
+	.map = ane_h16_program_map,
+	.log = ane_h16_log,
 };
 
 static const struct ane_fw_transport_ops ane_h16_transport_ops = {
@@ -603,6 +641,23 @@ out:
 	return ret;
 }
 
+/* After startup: one program session and the ABI 3 accel node. */
+static void ane_h16_program_stage(struct ane_h16_device *h)
+{
+	int ret;
+
+	ret = ane_h16_session_init(&h->session, &h->boot.transport, &ane_h16_session_ops, h,
+				   h->boot.build->command_timeout_ns);
+	if (!ret)
+		ret = ane_h16_accel_register(h->dev, &h->session);
+	if (ret)
+		dev_err(h->dev, "H16 program stage unavailable, error %d; held until reboot\n",
+			ret);
+	else
+		dev_info(h->dev, "H16 stage 5 program window %llx..%llx\n", h->program_next,
+			 h->program_end - 1);
+}
+
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc,
 			  unsigned int stage)
 {
@@ -629,6 +684,9 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->boot.ops = &ane_h16_ops;
 	h->boot.transport_ops = &ane_h16_transport_ops;
 	h->shared_next = soc->h16_boot->shared_dva;
+	h->program_next = soc->h16_boot->shared_dva + ANE_FW_SHARED_TOTAL;
+	h->program_end = h->program_next + ANE_H16_PROGRAM_WINDOW;
+	h->stage = stage;
 	ret = of_property_read_u64_array(h->dev->of_node, "apple,dapf-ranges",
 					 &h->boot.ranges[0][0], 8);
 	if (ret)
@@ -660,10 +718,12 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	if (!ret) {
 		dev_info(h->dev, "H16 stage %u complete%s\n", stage,
 			 h->boot.ran ? "; held until reboot" : "");
-		if (stage == ANE_H16_STARTUP)
+		if (stage >= ANE_H16_STARTUP)
 			print_hex_dump(KERN_INFO, "H16 RESOURCE_INFO ", DUMP_PREFIX_OFFSET,
 				       16, 1, h->boot.resource_info,
 				       sizeof(h->boot.resource_info), false);
+		if (stage == ANE_H16_PROGRAM)
+			ane_h16_program_stage(h);
 	}
 	ret = 0;
 	goto unlock;

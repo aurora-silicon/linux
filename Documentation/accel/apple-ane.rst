@@ -628,3 +628,75 @@ missing READY, wrong/stale table publication, oversized IPC/heap requests,
 channel bounds, locked DAPF differences, nonzero acks, scratch-3 timeout,
 zero tick, default refusal and quarantine after RUN. It also covers matching
 locked DAPF, heap/shared overlap, native FREE, foreign FREE and control refusal.
+
+H16 program stage
+-----------------
+
+``h16_stage=program`` runs every startup step, then registers an accel node
+with ABI version 3 (``DRM_ANE_CHIP_H16``). GET_CAPS, H16_LOAD and H16_EXEC
+are its only ioctls. The node is absent at every other stage, so the default
+refusal and the H17 refusal are unchanged.
+
+H16_LOAD takes the original HWX and four host-built sections: generic,
+operation, procedure and text properties. The kernel imports the HWX once,
+validates it with the HWX and task-stream checks, and plans whole-segment
+mappings. Each region and each host-built section gets its own private
+mapping in a program window above the SHAREDMALLOC range. Only the output
+surface and scratch are device-writable. Userspace never supplies a DVA,
+firmware ID, resource index or command. The LOAD_PROGRAM slots come from one
+table:
+
+====  ==========================  ========  =====
+Slot  Source                      Index     Class
+====  ==========================  ========  =====
+0     generic (host-built)        1002      4
+1     HWX kernel section, if any  1007      3
+2     HWX task stream             1006      4
+3     operation (host-built)      1003      4
+4     procedure (host-built)      1004      4
+5     empty
+6     text properties             1005      4
+7, 8  empty
+====  ==========================  ========  =====
+
+Every populated slot has +0x10 = 1 and a full 64-bit DVA and size. The
+request carries 0xffffffff at +0x1b8. The reply must echo every slot, keep a
+zero acknowledgment and replace that word with the program ID. Zero is a
+valid ID. CREATE_PROCESS (0x258 bytes) sends the program ID with a zero body.
+Its reply must keep the body zero and returns the process ID, where zero is
+also valid. A program with a kernel section must tag its operation record
+with the kernel slot index 1007. The uapi header names these indices.
+
+EXECUTE resources come from a kernel-owned map. The class follows the
+resource usage mapping (inputs 0, the output 1) and the index is local to
+its class in surface order. The mcache tuple in the linear program
+descriptor (BAR ID, bit offset and width) adds one custom-BAR record with
+selector 1, value type 0 and the first pool DSID, 36. The scratch form sends
+none.
+
+Each H16_EXEC copies inputs into the private input mappings and poisons the
+output mapping. It then sends 0x002d with 0, keeps the request UUID pending
+before publishing EXECUTE on channel 7, and treats the channel-7 reply as
+transport acknowledgment only. Completion is a state-1 0x0300 report whose
+UUID, program, process and procedure IDs all match. Then 0x002d with 1 and
+a DMA read barrier precede the output copy. A state-2 report, a mismatched
+ID, a malformed report or a timeout quarantines the session. Reports with
+an unknown UUID never complete a request. Closing the file sends TERMINATE
+then UNLOAD. Mappings stay until reboot.
+
+One program lifetime per firmware boot is mandatory. On this firmware
+family the first EXECUTE of a newly loaded program can write into the
+previous program's output buffer when the buffer counts match, and a larger
+output overruns that mapping. A second H16_LOAD therefore fails with -EBUSY
+and the log line ``H16 one program per firmware boot; reboot required``,
+also after the first program closed. The transport never publishes the
+secure-mode commands 0x27, 0x28 and 0x34 or the exclave commands 0x30 and
+0x31.
+
+The ``ane-h16-program`` KUnit suite covers add-128 and synthetic slot
+packing, LOAD/CREATE/TERMINATE/UNLOAD bodies and replies, the deny list,
+the custom-BAR record, a fake-firmware session with two executions and
+teardown, the second-LOAD refusal, bad LOAD/CREATE replies, mismatched
+UUIDs and IDs, and state-2 quarantine.
+``tools/testing/selftests/drivers/ane/h16-run.py`` loads the pinned add-128
+HWX, runs it twice with poisoned output and compares with ``expected.bin``.

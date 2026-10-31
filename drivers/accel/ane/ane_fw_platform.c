@@ -16,7 +16,7 @@
 
 static char *h16_stage;
 module_param(h16_stage, charp, 0444);
-MODULE_PARM_DESC(h16_stage, "H16 opt-in stage: preflight, map, boot, startup; unset refuses");
+MODULE_PARM_DESC(h16_stage, "H16 opt-in stage: preflight, map, boot, startup, program; unset refuses");
 
 static const char * const ane_h16_reg_names[] = {
 	"engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-3", "aux-4",

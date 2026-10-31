@@ -10,6 +10,7 @@ enum ane_h16_stage {
 	ANE_H16_MAP,
 	ANE_H16_BOOT,
 	ANE_H16_STARTUP,
+	ANE_H16_PROGRAM,
 };
 
 enum ane_h16_window {
@@ -136,6 +137,8 @@ static inline int ane_h16_stage_parse(const char *name)
 		return ANE_H16_BOOT;
 	if (!strcmp(name, "startup"))
 		return ANE_H16_STARTUP;
+	if (!strcmp(name, "program"))
+		return ANE_H16_PROGRAM;
 	return -EINVAL;
 }
 
@@ -542,7 +545,7 @@ static inline int ane_h16_run(struct ane_h16_boot *b, enum ane_h16_stage stage)
 
 	if (stage == ANE_H16_REFUSE)
 		return -EOPNOTSUPP;
-	if (stage < ANE_H16_PREFLIGHT || stage > ANE_H16_STARTUP)
+	if (stage < ANE_H16_PREFLIGHT || stage > ANE_H16_PROGRAM)
 		return -EINVAL;
 	if (b->attempted || b->quarantined)
 		return -EBUSY;
@@ -559,7 +562,7 @@ static inline int ane_h16_run(struct ane_h16_boot *b, enum ane_h16_stage stage)
 	}
 	if (!ret && stage >= ANE_H16_BOOT)
 		ret = ane_h16_scratch_boot(b);
-	if (!ret && stage == ANE_H16_STARTUP)
+	if (!ret && stage >= ANE_H16_STARTUP)
 		ret = ane_h16_startup(b);
 	return ret ? ane_h16_fail(b, ret) : 0;
 }
