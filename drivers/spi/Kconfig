@@ -146,10 +146,11 @@ config SPI_APPLE_QSPI
 	help
 	  This enables support for Apple's command-FIFO QSPIMC controller.
 	  Unlike the ordinary Apple SPIMC block, QSPIMC accepts packed SPI
-	  memory descriptors and is used for the boot NOR on T8140 systems.
+	  memory descriptors and is used for the boot NOR on M3 and later
+	  systems.
 
-	  The boot NOR defaults to read-only access. On the J613, J713 and
-	  J700 a runtime opt-in admits bounded, verified page programs and
+	  The boot NOR defaults to read-only access. On the J613, J713, J616s
+	  and J700 a runtime opt-in admits bounded, verified page programs and
 	  4 KiB erases inside the nvram partition only; the rest of the boot
 	  NOR stays read-only.
 

@@ -138,24 +138,24 @@ static void arm(void){runtime_ready=true;assert(!apple_qspi_set_read_only("N",&p
 static bool sent(unsigned int o){for(unsigned int i=0;i<wire_count;i++)if(wire[i]==o)return true;return false;}
 static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&mem,&o)<0);assert(!wire_count);}
 int main(void){
- const char *boards[]={"apple,j613","apple,j713","apple,j700","apple,j714"};
- const char *controllers[]={"apple,t8122-qspi","apple,t8132-qspi","apple,t8140-qspi"};
- const u64 bases[]={0x2a1118000ULL,0x3ad118000ULL,0x385110000ULL,0xad118000ULL,0x3ad118004ULL};
+ const char *boards[]={"apple,j613","apple,j713","apple,j700","apple,j616s","apple,j714"};
+ const char *controllers[]={"apple,t8122-qspi","apple,t8132-qspi","apple,t8140-qspi","apple,t6041-qspi"};
+ const u64 bases[]={0x2a1118000ULL,0x3ad118000ULL,0x385110000ULL,0x429118000ULL,0xad118000ULL,0x3ad118004ULL,0x429118800ULL};
  for(unsigned int b=0;b<ARRAY_SIZE(boards);b++){
   machine=boards[b];
   for(unsigned int c=0;c<ARRAY_SIZE(controllers);c++){
    struct device_node node={controllers[c]};
    for(unsigned int a=0;a<ARRAY_SIZE(bases);a++)
-    assert(!!apple_qspi_nvram_write_board(&node,bases[a])==(b<3&&b==c&&c==a));
+    assert(!!apple_qspi_nvram_write_board(&node,bases[a])==(b<4&&b==c&&c==a));
   }
  }
  const struct apple_qspi_board *qb;
- struct device_node t8132={"apple,t8132-qspi"},t8140={"apple,t8140-qspi"};
- machine="apple,j713";qb=apple_qspi_nvram_write_board(&t8132,0x3ad118000ULL);
+ struct device_node t6041={"apple,t6041-qspi"},t8140={"apple,t8140-qspi"};
+ machine="apple,j616s";qb=apple_qspi_nvram_write_board(&t6041,0x429118000ULL);
  assert(qb&&qb->nvram_start==0x700000&&qb->nvram_size==0x100000&&!memcmp(qb->jedec,jedec,3)&&!qb->bp_ok);
  machine="apple,j700";qb=apple_qspi_nvram_write_board(&t8140,0x385110000ULL);
  assert(qb&&qb->nvram_start==0x24000&&qb->nvram_size==0x1d0000&&qb->jedec[2]==0x15&&qb->bp_ok==0x1c);
- puts("PASS J613/J713/J700 board, controller and full-width aperture qualification (60 combinations)");
+ puts("PASS J613/J713/J700/J616s board, controller and full-width aperture qualification (140 combinations)");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
  /* T8140 (J700) shares the verified policy at its DT nvram window; its data
@@ -274,7 +274,8 @@ def main():
             ('controller', 'of_device_is_compatible(node, board->controller) &&', ''),
             ('board', 'of_machine_is_compatible(board->machine) &&', ''),
             ('aperture', 'base == board->base', 'base != 0'),
-            ('j713-partition', '"apple,j713", 0x3ad118000ULL,\n\t  0x700000', '"apple,j713", 0x3ad118000ULL,\n\t  0x680000'),
+            ('j616s-aperture', '"apple,j616s", 0x429118000ULL', '"apple,j616s", 0x429118800ULL'),
+            ('j616s-partition', '"apple,j616s", 0x429118000ULL,\n\t  0x700000', '"apple,j616s", 0x429118000ULL,\n\t  0x680000'),
             ('range', 'addr >= start &&', 'addr >= 1 &&'),
             ('bp-ok', '!(sr1 & 0x1c & ~bp_ok)', '1'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
