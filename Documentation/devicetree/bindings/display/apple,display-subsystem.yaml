@@ -22,6 +22,9 @@ properties:
       - const: apple,t8132-display-diagnostics
         deprecated: true
       - items:
+          - const: apple,t8140-display-subsystem
+          - const: apple,display-subsystem
+      - items:
           - const: apple,t8132-display-subsystem
           - const: apple,t8132-display-diagnostics
         description: Compatibility with kernels predating the common M4 display backend.

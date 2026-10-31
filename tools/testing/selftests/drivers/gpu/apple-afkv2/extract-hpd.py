@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Exercise the production DPTX HPD request with mocked service-call replies."""
+"""Exercise the production DPTX HPD request with mocked service-call replies.
+
+Covers the legacy, AFK-v2 and compact EPIC replies and the 14.7 AV client close.
+"""
 import pathlib
 import re
 import sys
@@ -44,12 +47,19 @@ typedef u32 __le32;
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 #define dev_warn(...) do {} while (0)
 #define dev_dbg(...) do {} while (0)
+#define READ_ONCE(x) (x)
+static u32 get_unaligned_le32(const void *p)
+{
+ const u8 *b = p;
+
+ return b[0] | b[1] << 8 | b[2] << 16 | (u32)b[3] << 24;
+}
 struct epic_service_call {
  u8 pad0[2]; u16 group; u32 command, data_len, magic; u8 pad1[48];
 };
 struct dcp { void *dev; };
 struct ops { const char *name; };
-struct ep { struct dcp *dcp; int endpoint; bool inline_v2; };
+struct ep { struct dcp *dcp; int endpoint; bool inline_v2; bool compact; };
 struct apple_epic_service { struct ep *ep; struct ops *ops; u32 channel; };
 int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
  u32 command, const void *data, size_t data_len, size_t data_pad, void *output,
@@ -67,7 +77,16 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
  */
 static bool wire_v2;
 static size_t declared, arrived;
-static u32 echo_flip;
+static u32 echo_flip, compact_status;
+/* An HPD low closes the 14.7 external AV client first; the stub counts it. */
+static struct dcp *expected_dcp;
+static unsigned int v14_closes, closes_at_send;
+/* Kept even if a mutant drops the call, so the count check is what fails. */
+__attribute__((unused)) static void dcpavserv_v14_close(struct dcp *dcp)
+{
+ assert(dcp == expected_dcp);
+ v14_closes++;
+}
 static int afk_send_command_timeout_len(struct apple_epic_service *s, u8 type,
  const void *payload, size_t payload_len, void *output, size_t output_len,
  u32 *retcode, unsigned int timeout_ms, size_t *received)
@@ -76,15 +95,21 @@ static int afk_send_command_timeout_len(struct apple_epic_service *s, u8 type,
  u8 *body = (u8 *)output + sizeof(*call);
  u32 echo;
 
- (void)s; (void)payload; (void)timeout_ms;
+ (void)payload; (void)timeout_ms;
  assert(type == EPIC_SUBTYPE_STD_SERVICE && payload_len == output_len);
  assert(output_len == sizeof(*call) + 32 && call->data_len == 32);
  assert(call->group == 8 && call->command == 8);
+ closes_at_send = v14_closes;
  if (wire_v2 && !received && arrived < output_len - sizeof(*call))
   return -EMSGSIZE;
  memcpy(&echo, body + 16, sizeof(echo));
  echo ^= echo_flip;
  memcpy(body + 16, &echo, sizeof(echo));
+ /* Compact EPIC answers with an IOReturn status in the first word. */
+ if (s->ep->compact) {
+  for (int i = 0; i < 4; i++)
+   body[i] = compact_status >> (8 * i);
+ }
  call->data_len = declared;
  *retcode = 0;
  if (received)
@@ -94,11 +119,23 @@ static int afk_send_command_timeout_len(struct apple_epic_service *s, u8 type,
 '''
 suffix = r'''
 static int failures;
+static struct ep *the_ep;
 static void expect(bool ok, const char *what, bool hpd, int ret)
 {
- printf("%s %s: %s hpd=%d declared=%zu arrived=%zu ret=%d\n", ok ? "ok" : "FAIL",
-        wire_v2 ? "afk-v2" : "legacy", what, hpd, declared, arrived, ret);
+ printf("%s %s%s: %s hpd=%d declared=%zu arrived=%zu ret=%d\n", ok ? "ok" : "FAIL",
+        wire_v2 ? "afk-v2" : "legacy", the_ep->compact ? " compact" : "", what, hpd,
+        declared, arrived, ret);
  failures += !ok;
+}
+/* Every request closes the AV client exactly when it lowers HPD, and before it is sent. */
+static int set_hpd(struct apple_epic_service *service, int hpd)
+{
+ unsigned int before = v14_closes;
+ int ret = dptxport_set_hpd_timeout(service, hpd, 1000);
+
+ expect(v14_closes == before + !hpd && closes_at_send == before + !hpd,
+        "AV client closed before an HPD low only", hpd, ret);
+ return ret;
 }
 int main(void)
 {
@@ -108,6 +145,9 @@ int main(void)
  struct ep ep = { .dcp = &dcp };
  struct apple_epic_service service = { .ep = &ep, .ops = &ops, .channel = 1 };
 
+ the_ep = &ep;
+ expected_dcp = &dcp;
+
  for (int v2 = 0; v2 < 2; v2++) {
   wire_v2 = v2;
   for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
@@ -115,7 +155,7 @@ int main(void)
     int ret;
 
     declared = lengths[i]; arrived = 32; echo_flip = 0;
-    ret = dptxport_set_hpd_timeout(&service, hpd, 1000);
+    ret = set_hpd(&service, hpd);
     if (declared < sizeof(struct dcpdptx_hotplug_cmd))
      expect(ret < 0, "short reply refused", hpd, ret);
     else if (declared > 32)
@@ -128,19 +168,38 @@ int main(void)
    int ret;
 
    declared = 20; arrived = 32; echo_flip = 1;
-   ret = dptxport_set_hpd_timeout(&service, hpd, 1000);
+   ret = set_hpd(&service, hpd);
    expect(ret == -EINVAL, "wrong echo refused", hpd, ret);
    if (!wire_v2)
     continue;
    declared = 20; arrived = 16; echo_flip = 0;
-   ret = dptxport_set_hpd_timeout(&service, hpd, 1000);
+   ret = set_hpd(&service, hpd);
    expect(ret < 0, "reply cut short in transit refused", hpd, ret);
   }
+  /* Compact EPIC: the status word decides, there is no echo to compare. */
+  ep.compact = true;
+  for (int hpd = 0; hpd < 2; hpd++) {
+   int ret;
+
+   declared = 20; arrived = 32; echo_flip = 0; compact_status = 0;
+   ret = set_hpd(&service, hpd);
+   expect(ret == 0, "zero status accepted", hpd, ret);
+   echo_flip = 1;
+   ret = set_hpd(&service, hpd);
+   expect(ret == 0, "echo word ignored", hpd, ret);
+   echo_flip = 0; compact_status = 0xe00002c2;
+   ret = set_hpd(&service, hpd);
+   expect(ret == -EIO, "firmware error status refused", hpd, ret);
+   compact_status = 0x00000100;
+   ret = set_hpd(&service, hpd);
+   expect(ret == -EIO, "any nonzero status byte refused", hpd, ret);
+  }
+  ep.compact = false; compact_status = 0;
  }
  printf("%d HPD reply checks failed\n", failures);
  if (failures)
   return 1;
- puts("PASS: extracted production DPTX HPD request: short, oversized, wrong-echo and complete replies, legacy and AFK-v2");
+ puts("PASS: extracted production DPTX HPD request: short, oversized, wrong-echo and complete replies, legacy, AFK-v2 and compact status, AV client close on HPD low");
  return 0;
 }
 '''

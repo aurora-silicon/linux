@@ -505,6 +505,45 @@
 		/* Required to get >32-bit DMA via DARTs */
 		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
 
+		ave_dart0: iommu@67030000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0 0x67030000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc_sys>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		ave_dart1: iommu@67040000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0 0x67040000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc_sys>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		ave: video-codec@67100000 {
+			compatible = "apple,t8112-ave";
+			reg = <0 0x67100000 0 0x45c000>,
+			      <0 0x67050000 0 0x8000>,
+			      <0 0x67800000 0 0x800000>;
+			reg-names = "codec", "mailbox", "coproc";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 692 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 686 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 685 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 688 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 687 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+					<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+			status = "disabled";
+		};
+
 		gpu: gpu@206400000 {
 			compatible = "apple,agx-t8112", "apple,agx-g14g";
 			reg = <0x2 0x6400000 0 0x40000>,
@@ -1749,7 +1788,6 @@
 			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "recv-not-empty";
 			#mbox-cells = <0>;
-			status = "disabled";
 		};
 
 		ane_dart0: iommu@26b800000 {
@@ -1759,7 +1797,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane_dart1: iommu@26b810000 {
@@ -1769,7 +1806,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane_dart2: iommu@26b820000 {
@@ -1779,7 +1815,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane: ane@26a000000 {
@@ -1797,7 +1832,6 @@
 				<&ps_ane_base>, <&ps_ane_set1>, <&ps_ane_set2>,
 				<&ps_ane_set3>, <&ps_ane_set4>;
 			mboxes = <&ane_mbox>;
-			status = "disabled";
 		};
 
 		dispext0_dart: iommu@271304000 {
@@ -2023,6 +2057,7 @@
 
 			apciec0: pcie@3b0000000 {
 				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				apple,pciec-kernel-init;
 				device_type = "pci";
 
 				reg = <0x3 0xb0000000 0x0 0x10000000>,
@@ -2243,6 +2278,7 @@
 
 			apciec1: pcie@530000000 {
 				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				apple,pciec-kernel-init;
 				device_type = "pci";
 
 				reg = <0x5 0x30000000 0x0 0x10000000>,
@@ -2522,3 +2558,46 @@
 
 #include "t8112-pmgr.dtsi"
 #include "hwmon-common.dtsi"
+
+/*
+ * DRAM interface class: width and maximum rate are inferred from topology
+ * and the published bandwidth class. Lower-state rates remain unqualified.
+ * State IDs below describe firmware DCS states, not PMGR codes.
+ */
+/ {
+	dram_opp: opp-table-dram {
+		compatible = "operating-points-v2-apple-dram";
+		opp-shared;
+
+		opp-0 {
+			opp-level = <0>;
+		};
+
+		opp-1 {
+			opp-level = <1>;
+		};
+
+		opp-2 {
+			opp-level = <2>;
+		};
+
+		opp-3 {
+			opp-level = <3>;
+		};
+
+		opp-4 {
+			opp-level = <4>;
+			opp-hz = /bits/ 64 <3200000000>;
+			apple,data-rate = /bits/ 64 <6400000000>;
+		};
+	};
+};
+
+&pmp_report {
+	operating-points-v2 = <&dram_opp>;
+	apple,dram-type = "lpddr5";
+	apple,data-bus-width = <128>;
+	apple,dcs-state-count = <5>;
+	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <102400000000>;
+	apple,bandwidth-class-bytes-per-second = /bits/ 64 <100000000000>;
+};

@@ -448,11 +448,44 @@
 		nonposted-mmio;
 		ranges;
 
+		jpeg0: jpeg@28d000000 {
+			compatible = "apple,t8140-jpeg";
+			reg = <0x2 0x8d000000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1040 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg_dart 0>;
+			power-domains = <&ps_jpg>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+			status = "disabled";
+		};
+
 		jpeg_dart: iommu@28d020000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x2 0x8d020000 0x0 0xc000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1041 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		jpeg1: jpeg@28d060000 {
+			compatible = "apple,t8140-jpeg";
+			reg = <0x2 0x8d060000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1043 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg1_dart 0>;
+			power-domains = <&ps_jpg>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+			status = "disabled";
+		};
+
+		jpeg1_dart: iommu@28d080000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x8d080000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1044 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
 			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
 			power-domains = <&ps_jpg>;
@@ -1778,3 +1811,46 @@
 };
 
 #include "t8140-pmgr.dtsi"
+
+/*
+ * DRAM interface class: width and maximum rate are inferred from topology
+ * and the published bandwidth class. Lower-state rates remain unqualified.
+ * State IDs below describe firmware DCS states, not PMGR codes.
+ */
+/ {
+	dram_opp: opp-table-dram {
+		compatible = "operating-points-v2-apple-dram";
+		opp-shared;
+
+		opp-0 {
+			opp-level = <0>;
+		};
+
+		opp-1 {
+			opp-level = <1>;
+		};
+
+		opp-2 {
+			opp-level = <2>;
+		};
+
+		opp-3 {
+			opp-level = <3>;
+		};
+
+		opp-4 {
+			opp-level = <4>;
+			opp-hz = /bits/ 64 <3750000000>;
+			apple,data-rate = /bits/ 64 <7500000000>;
+		};
+	};
+};
+
+&pmp_report {
+	operating-points-v2 = <&dram_opp>;
+	apple,dram-type = "lpddr5";
+	apple,data-bus-width = <64>;
+	apple,dcs-state-count = <5>;
+	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <60000000000>;
+	apple,bandwidth-class-bytes-per-second = /bits/ 64 <60000000000>;
+};

@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/opp/operating-points-v2-apple-dram.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple firmware-managed DRAM performance states
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  DCS firmware state IDs are not clock rates. Describe every state with an
+  explicit opp-level, independent of node order. Rates are optional except
+  for the highest state. The maximum interface rate and data width are
+  inferred from the interface topology and published bandwidth class.
+
+  Lower-state rates derived from firmware bandwidth policy thresholds are
+  inferences, not measured clocks. Those thresholds use Q16.16 decimal GB/s;
+  they are not a frequency table. Leave lower-state rates absent until the
+  inference is accepted or independently confirmed by a public decoder.
+
+  opp-hz is CK-equivalent Hz, rounded upwards to the nearest integer, one
+  half of the interface transfer rate. It does not claim a literal command
+  clock or LPDDR5 WCK. These OPPs describe firmware states for reporting;
+  they do not authorize Linux to change clocks, voltages, or firmware votes.
+
+allOf:
+  - $ref: opp-v2-base.yaml#
+
+properties:
+  compatible:
+    const: operating-points-v2-apple-dram
+
+  opp-shared: true
+
+patternProperties:
+  '^opp(-?[0-9]+)*$':
+    type: object
+    additionalProperties: false
+
+    properties:
+      opp-level:
+        minimum: 0
+        maximum: 31
+
+      opp-hz:
+        maxItems: 1
+
+      apple,data-rate:
+        $ref: /schemas/types.yaml#/definitions/uint64
+        minimum: 1
+        description: Interface transfers per second per data pin, rounded to an integer.
+
+    required:
+      - opp-level
+
+    dependencies:
+      apple,data-rate:
+        - opp-hz
+      opp-hz:
+        - apple,data-rate
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    opp-table-dram {
+        compatible = "operating-points-v2-apple-dram";
+        opp-shared;
+        opp-0 {
+            opp-level = <0>;
+        };
+        opp-1 {
+            opp-level = <1>;
+            opp-hz = /bits/ 64 <3200000000>;
+            apple,data-rate = /bits/ 64 <6400000000>;
+        };
+    };

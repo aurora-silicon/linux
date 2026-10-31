@@ -13,6 +13,7 @@
 #include <kunit/test.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/limits.h>
 #include <linux/mount.h>
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
@@ -31,6 +32,11 @@ struct port_power_test_hc {
 	u16 change;
 	unsigned int power_ons;
 	bool fail_power_off;
+	unsigned int warm_resets;
+	unsigned int detect_restarts;
+	bool connect_on_warm;
+	bool connect_on_detect;
+	bool fail_warm_reset;
 };
 
 struct port_power_test {
@@ -171,8 +177,31 @@ static int port_power_test_hub_control(struct usb_hcd *hcd, u16 type_req, u16 va
 			port_power_test_set_power(hcd, true);
 		else if (value == USB_PORT_FEAT_RESET)
 			hc->change |= USB_PORT_STAT_C_RESET;
-		else if (value == USB_PORT_FEAT_BH_PORT_RESET)
+		else if (value == USB_PORT_FEAT_BH_PORT_RESET) {
+			hc->warm_resets++;
+			if (hc->fail_warm_reset)
+				return -EIO;
 			hc->change |= USB_PORT_STAT_C_RESET | USB_PORT_STAT_C_BH_RESET;
+			if (hc->connect_on_warm) {
+				hc->status &= ~USB_PORT_STAT_LINK_STATE;
+				hc->status |= USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE;
+			}
+		} else if (value == USB_PORT_FEAT_LINK_STATE) {
+			u16 state = (index >> 3) & USB_PORT_STAT_LINK_STATE;
+
+			hc->status &= ~USB_PORT_STAT_LINK_STATE;
+			hc->status |= state;
+			if (state == USB_SS_PORT_LS_SS_DISABLED)
+				hc->status &= ~(USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE);
+			if (state == USB_SS_PORT_LS_RX_DETECT) {
+				hc->detect_restarts++;
+				if (hc->connect_on_detect) {
+					hc->status &= ~USB_PORT_STAT_LINK_STATE;
+					hc->status |= USB_PORT_STAT_CONNECTION |
+						      USB_PORT_STAT_ENABLE;
+				}
+			}
+		}
 		return 0;
 	case ClearPortFeature:
 		if (value == USB_PORT_FEAT_POWER && hc->fail_power_off) {
@@ -409,14 +438,18 @@ static void port_power_test_hold(struct kunit *test)
 {
 	struct port_power_test *t = test->priv;
 	unsigned int hs_power_ons = port_power_test_power_ons(t->hcd);
+	struct usb_port *ss = to_usb_port(t->ss_port);
+	u32 handover = ss->ss_handover_generation;
 	int usage = port_power_test_usage(t->ss_port);
 
 	usb_lock_device(t->ss_root);
 	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, ss->ss_handover_generation, handover + 1);
 	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
 
 	/* A second change of the lanes finds the port held for it */
 	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, ss->ss_handover_generation, handover + 1);
 	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
 
 	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 0);
@@ -425,6 +458,10 @@ static void port_power_test_hold(struct kunit *test)
 
 	/* Nothing is held any more */
 	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 1);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, ss->ss_handover_generation, handover + 2);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage);
 	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 2), -EINVAL);
 	usb_unlock_device(t->ss_root);
 
@@ -700,6 +737,10 @@ static void port_power_test_late_ss_decision(struct kunit *test)
 
 	port->ss_reconnected = true;
 	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	peer->ss_handover_generation++;
+	KUNIT_EXPECT_TRUE(test, usb_port_needs_ss_reconnect(port, hs, ss));
+	port->ss_reconnect_generation = peer->ss_handover_generation;
+	KUNIT_EXPECT_FALSE(test, usb_port_needs_ss_reconnect(port, hs, ss));
 	port->ss_reconnected = false;
 
 	port->disabled = true;
@@ -928,7 +969,176 @@ static void port_power_test_connector_graph_legacy(struct kunit *test)
 }
 #endif
 
+/* Keep the root locked from power-on through retraining, as the PHY does. */
+static struct port_power_test_hc *
+port_power_test_retrain_begin(struct kunit *test, bool warm, bool detect)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
+
+	usb_lock_device(t->ss_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 0);
+	scoped_guard(spinlock_irqsave, &hc->lock) {
+		hc->warm_resets = 0;
+		hc->detect_restarts = 0;
+		hc->connect_on_warm = warm;
+		hc->connect_on_detect = detect;
+	}
+	return hc;
+}
+
+static void port_power_test_retrain_end(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
+
+	/* The synthetic controller has no device to enumerate after the check. */
+	scoped_guard(spinlock_irqsave, &hc->lock) {
+		hc->status &= ~(USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE |
+				USB_PORT_STAT_LINK_STATE);
+		hc->status |= USB_SS_PORT_LS_RX_DETECT;
+	}
+	usb_unlock_device(t->ss_root);
+}
+
+static void port_power_test_retrain_warm(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, true, false);
+	int usage = port_power_test_usage(t->ss_port);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_detect(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, true);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 1U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_bounded(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), -ENOTCONN);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 1U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_healthy(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	scoped_guard(spinlock_irqsave, &hc->lock) {
+		hc->status &= ~USB_PORT_STAT_LINK_STATE;
+		hc->status |= USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE;
+	}
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 0U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_error(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	hc->fail_warm_reset = true;
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), -EIO);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	port_power_test_retrain_end(test);
+}
+
+static void port_power_test_retrain_owner(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
+
+	KUNIT_EXPECT_EQ(test, usb_hub_claim_port(t->ss_root, 1, (void *)t), 0);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
+	KUNIT_EXPECT_EQ(test, usb_hub_release_port(t->ss_root, 1, (void *)t), 0);
+	KUNIT_EXPECT_EQ(test, hc->warm_resets, 0U);
+	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
+	port_power_test_retrain_end(test);
+	usb_lock_device(t->hs_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->hs_root, 1), -EOPNOTSUPP);
+	usb_unlock_device(t->hs_root);
+}
+
+/* A new PHY handover rearms USB2 recovery; its own power cycle never does. */
+static void port_power_test_late_ss_handover(struct kunit *test)
+{
+	struct usb_port *port = kunit_kzalloc(test, sizeof(*port), GFP_KERNEL);
+	struct usb_port *peer = kunit_kzalloc(test, sizeof(*peer), GFP_KERNEL);
+	struct usb_device *hs = kunit_kzalloc(test, sizeof(*hs), GFP_KERNEL);
+	struct usb_device *ss = kunit_kzalloc(test, sizeof(*ss), GFP_KERNEL);
+	struct usb_device *next = kunit_kzalloc(test, sizeof(*next), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, port);
+	KUNIT_ASSERT_NOT_NULL(test, peer);
+	KUNIT_ASSERT_NOT_NULL(test, hs);
+	KUNIT_ASSERT_NOT_NULL(test, ss);
+	KUNIT_ASSERT_NOT_NULL(test, next);
+	port->child = hs;
+	port->peer = peer;
+	port->ss_reconnected = true;
+	peer->is_superspeed = true;
+	peer->child = ss;
+	port->ss_reconnect_generation = 7;
+	peer->ss_handover_generation = 7;
+	KUNIT_EXPECT_FALSE(test, usb_port_may_queue_ss_reconnect(port, ss));
+
+	/* A tipd rebind changes SS even while the USB2 hub remains attached. */
+	peer->ss_handover_generation++;
+	KUNIT_EXPECT_TRUE(test, usb_port_may_queue_ss_reconnect(port, ss));
+	port->reconnect_hs = hs;
+	port->reconnect_ss = ss;
+	KUNIT_EXPECT_FALSE(test, usb_port_may_queue_ss_reconnect(port, ss));
+	KUNIT_EXPECT_TRUE(test, usb_port_may_queue_ss_reconnect(port, next));
+
+	/* Completion of the older request must not consume the newer handover. */
+	port->ss_reconnect_generation = 7;
+	KUNIT_EXPECT_TRUE(test, usb_port_may_queue_ss_reconnect(port, next));
+	port->ss_reconnect_generation = peer->ss_handover_generation;
+	port->ss_reconnect_pending = true;
+	usb_port_ss_reconnect_event(port, USB_PORT_STAT_CONNECTION, USB_PORT_STAT_C_CONNECTION);
+	KUNIT_EXPECT_FALSE(test, usb_port_may_queue_ss_reconnect(port, next));
+	peer->ss_handover_generation++;
+	KUNIT_EXPECT_TRUE(test, usb_port_may_queue_ss_reconnect(port, next));
+
+	peer->ss_handover_generation = U32_MAX;
+	port->ss_reconnect_generation = U32_MAX;
+	KUNIT_EXPECT_FALSE(test, usb_port_may_queue_ss_reconnect(port, next));
+	peer->ss_handover_generation++;
+	KUNIT_EXPECT_TRUE(test, usb_port_may_queue_ss_reconnect(port, next));
+}
+
 static struct kunit_case port_power_test_cases[] = {
+	KUNIT_CASE(port_power_test_late_ss_handover),
+	KUNIT_CASE(port_power_test_retrain_warm),
+	KUNIT_CASE(port_power_test_retrain_detect),
+	KUNIT_CASE(port_power_test_retrain_bounded),
+	KUNIT_CASE(port_power_test_retrain_healthy),
+	KUNIT_CASE(port_power_test_retrain_error),
+	KUNIT_CASE(port_power_test_retrain_owner),
 #if IS_ENABLED(CONFIG_OF_DYNAMIC)
 	KUNIT_CASE(port_power_test_connector_graph),
 	KUNIT_CASE(port_power_test_connector_graph_legacy),

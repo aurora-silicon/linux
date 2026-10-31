@@ -70,6 +70,8 @@ struct mt7932 {
 	/* Hardware-free calibration transport seam; production builds omit it. */
 	int (*cal_test_send)(struct mt7932 *m, const void *body, size_t length);
 	void *cal_test_context;
+	int (*power_test_send)(struct mt7932 *m, const void *body, size_t length);
+	void *power_test_context;
 #endif
 	u8 cal_requests[32][16];
 	u8 cal_request_seq[32];
@@ -110,12 +112,15 @@ struct mt7932 {
 	struct ieee80211_channel channels6[MT7932_CHANNELS_6G];
 	struct ieee80211_sband_iftype_data he6;
 	u8 six_assoc_power[2][1020];
-	bool six_power_valid;
+	bool six_power_valid, six_legacy_assoc, six_ap_valid, six_class_dirty;
+	u64 six_legacy_channels;
+	struct mt7932_6g_ap six_ap;
 	u8 scan_band, scan_batch;
 	unsigned int scan_cursor;
 	enum nl80211_band connect_band, scan_home_band;
 	u32 connect_akm;
 	enum nl80211_mfp connect_mfp;
+	bool connect_pmf; /* admitted request, never firmware readback */
 	enum nl80211_sae_pwe_mechanism connect_sae_pwe;
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
@@ -199,6 +204,15 @@ struct mt7932 {
 	u64 rx_integrity, rx_malformed, rx_unsupported;
 	u64 rx_wrong_peer, rx_unprotected, rx_duplicate, rx_no_memory;
 	u64 rx_retry, rx_amsdu;
+	/* Lifetime transport observations for ethtool. The ring and cause
+	 * counters are written only by the interrupt thread; the BSS presence
+	 * counters are under response_lock, the data counters under data_lock.
+	 */
+	u64 irq_passes, irq_unmasked_passes, rx_ring_records[9];
+	u32 irq_unmasked;
+	u64 tx_free_events, bss_absent_events, bss_absent_ms;
+	unsigned long bss_absent_since;
+	u64 home_beacons, rx_band_records[3];
 	/* TX0 descriptors published since the last doorbell; data_lock. */
 	unsigned int data_unkicked;
 	bool data_ready;
@@ -211,6 +225,7 @@ struct mt7932 {
 
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
+int mt_6g_connect_policy(struct mt7932 *m, const struct mt7932_6g_ap *ap);
 void mt_reg_apply_deferred_locked(struct mt7932 *m);
 void mt_policy_debugfs_init(struct mt7932 *m);
 int mt_net_open(struct net_device *netdev);

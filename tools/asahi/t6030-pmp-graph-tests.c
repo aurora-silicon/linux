@@ -7,10 +7,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-typedef uint64_t u64;
+typedef unsigned long long u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
@@ -22,9 +23,14 @@ typedef uint8_t u8;
 #define PMP_REPORT_READY 1
 #define GFP_KERNEL 0
 #define GENPD_FLAG_ACTIVE_WAKEUP 1
+#define GENPD_FLAG_IRQ_SAFE 2
 #define MAX_PHANDLE_ARGS 4
 #define EPROBE_DEFER 517
 #define SZ_4K 4096
+#define SZ_16K 16384
+#define SZ_128K 131072
+#define IORESOURCE_MEM 0x200
+#define PMP_ANE_ID 10
 #define __iomem
 #define __force
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
@@ -44,7 +50,7 @@ static void host_log(const char *format, ...)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 struct device_node {
 	const char *name, *compatible;
-	bool available, always_on, no_ack, deferred, uuid, soc_record;
+	bool available, always_on, no_ack, deferred, irq_safe, uuid, soc_record;
 	u32 reg;
 	int refs;
 	struct device_node *parent, *child, *sibling, *pmp;
@@ -54,6 +60,34 @@ struct device {
 	struct device *parent;
 	void *data;
 };
+#include "dram-type.h"
+#if HOST_HAS_DRAM
+struct fwnode_handle { int unused; };
+struct attribute {
+	const char *name;
+	unsigned int mode;
+};
+struct device_attribute {
+	struct attribute attr;
+	ssize_t (*show)(struct device *, struct device_attribute *, char *);
+};
+struct attribute_group {
+	const char *name;
+	struct attribute **attrs;
+};
+#define DEVICE_ATTR_RO(n) struct device_attribute dev_attr_##n = { { #n, 0444 }, n##_show }
+static int sysfs_emit(char *buf, const char *format, ...)
+	__attribute__((format(printf, 2, 3)));
+static int sysfs_emit(char *buf, const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	int ret = vsnprintf(buf, 4096, format, args);
+	va_end(args);
+	return ret;
+}
+static int devm_device_add_group(struct device *, const struct attribute_group *);
+#endif
 struct platform_device {
 	struct device dev;
 };
@@ -103,8 +137,18 @@ struct work_struct {
 struct delayed_work {
 	struct work_struct work;
 };
+/* The T600x ANE window; T6030 reports never name one. */
+struct apple_pmp_ane {
+	void __iomem *dvfs;
+	void __iomem *report;
+	unsigned int level;
+	unsigned int timeouts;
+	bool owned;
+	bool reserved;
+};
 struct apple_pmp_report {
 	struct device *dev;
+	struct apple_pmp_dram dram;
 	const struct apple_pmp_report_offsets *offsets;
 	void *base;
 	int lock;
@@ -116,6 +160,7 @@ struct apple_pmp_report {
 	bool defer;
 	unsigned int polls;
 	struct delayed_work ready_work;
+	struct apple_pmp_ane ane;
 };
 struct completion {
 	bool done;
@@ -249,6 +294,33 @@ static void rcu_read_unlock(void)
 static struct list_head apple_pmp_starts, apple_pmp_reports;
 static struct device_node report_node, pmp_node, entries[4];
 static struct platform_device report_dev, entry_devs[4];
+#if HOST_HAS_DRAM
+/* Typed parser boundary: the real property parser is tested by pmp-dram KUnit. */
+static struct fwnode_handle report_fwnode;
+static int dram_parse_error, dram_group_error;
+static unsigned int dram_parse_calls, dram_group_calls;
+static const struct attribute_group *registered_group;
+static const struct apple_pmp_dram parsed_dram = {
+	.type = "lpddr5", .width = 256, .state_count = 4,
+	.max_rate = 6400000000ULL, .peak_bandwidth = 204800000000ULL,
+	.bandwidth_class = 200000000000ULL,
+};
+static struct fwnode_handle *dev_fwnode(struct device *dev)
+{
+	assert(dev == &report_dev.dev);
+	return &report_fwnode;
+}
+static int apple_pmp_dram_parse(const struct fwnode_handle *node,
+				struct apple_pmp_dram *dram)
+{
+	struct apple_pmp_report *rep = report_dev.dev.data;
+	assert(node == &report_fwnode && rep && dram == &rep->dram);
+	assert(++dram_parse_calls == 1);
+	if (!dram_parse_error)
+		*dram = parsed_dram;
+	return dram_parse_error;
+}
+#endif
 static u64 regs[0x14000 / 8];
 static u8 ranges[64], devices[17 * 0x7c];
 static struct work_struct *pending;
@@ -387,6 +459,8 @@ static bool of_property_read_bool(const struct device_node *n, const char *p)
 		return n->no_ack;
 	if (!strcmp(p, "apple,defer-startup-ack"))
 		return n->deferred;
+	if (!strcmp(p, "apple,irq-safe"))
+		return n->irq_safe;
 	if (!strcmp(p, "apple,soc-device-record"))
 		return n->soc_record;
 	return false;
@@ -536,6 +610,40 @@ static int devm_add_action_or_reset(struct device *d, void (*f)(void *),
 	actions[action_count++] = (struct action){ f, p };
 	return 0;
 }
+struct resource {
+	u64 start, end;
+};
+static int of_property_match_string(const struct device_node *n,
+				    const char *p, const char *s)
+{
+	(void)n; (void)p; (void)s;
+	return -EINVAL;
+}
+static struct resource *platform_get_resource(struct platform_device *p,
+					      unsigned int t, unsigned int i)
+{
+	(void)p; (void)t; (void)i;
+	assert(!"T6030 reports have no ANE window");
+	return NULL;
+}
+static struct resource *platform_get_resource_byname(struct platform_device *p,
+						     unsigned int t,
+						     const char *n)
+{
+	(void)p; (void)t; (void)n;
+	assert(!"T6030 reports have no ANE window");
+	return NULL;
+}
+static u64 resource_size(const struct resource *r)
+{
+	return r->end - r->start + 1;
+}
+static void *devm_ioremap_resource(struct device *d, struct resource *r)
+{
+	(void)d; (void)r;
+	assert(!"T6030 reports have no ANE window");
+	return NULL;
+}
 static void *devm_platform_ioremap_resource(struct platform_device *p, int i)
 {
 	assert(p == &report_dev && !i);
@@ -600,6 +708,38 @@ static const struct apple_pmp_start_ops apple_pmp_start_hw_ops = { hw_check,
 static const struct apple_pmp_start_timing apple_pmp_start_timing = { 2, 0, 2,
 								      2 };
 #include "production.h"
+#if HOST_HAS_DRAM
+static int devm_device_add_group(struct device *dev, const struct attribute_group *group)
+{
+	assert(dev == &report_dev.dev && group == &apple_pmp_dram_group);
+	assert(dram_parse_calls == 1 && !dram_parse_error);
+	assert(++dram_group_calls == 1 && !registered_group);
+	if (!dram_group_error)
+		registered_group = group;
+	return dram_group_error;
+}
+static void check_dram_attributes(void)
+{
+	static const char * const names[] = {
+		"type", "data_bus_width", "state_count", "max_data_rate",
+		"peak_bandwidth", "bandwidth_class",
+	};
+	static const char * const values[] = {
+		"lpddr5\n", "256\n", "4\n", "6400000000\n",
+		"204800000000\n", "200000000000\n",
+	};
+	assert(registered_group && !strcmp(registered_group->name, "dram"));
+	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
+		struct attribute *attr = registered_group->attrs[i];
+		assert(attr && !strcmp(attr->name, names[i]) && attr->mode == 0444);
+		struct device_attribute *da = container_of(attr, struct device_attribute, attr);
+		char buf[4096];
+		assert(da->show(&report_dev.dev, da, buf) == (ssize_t)strlen(values[i]));
+		assert(!strcmp(buf, values[i]));
+	}
+	assert(!registered_group->attrs[ARRAY_SIZE(names)]);
+}
+#endif
 static const struct apple_pmp_report_offsets *
 of_device_get_match_data(struct device *d)
 {
@@ -620,7 +760,7 @@ static int of_platform_populate(struct device_node *n, void *a, void *b,
 }
 struct overlay_entry {
 	u32 reg;
-	bool always_on, no_ack, deferred;
+	bool always_on, no_ack, deferred, irq_safe;
 };
 #include "overlay.h"
 static void cleanup(void)
@@ -669,6 +809,7 @@ static struct apple_pmp_report *setup(void)
 			.always_on = o->always_on,
 			.no_ack = o->no_ack,
 			.deferred = o->deferred,
+			.irq_safe = o->irq_safe,
 			.parent = &report_node,
 			.sibling = i < 3 ? &entries[i + 1] : NULL
 		};
@@ -695,6 +836,12 @@ static struct apple_pmp_report *setup(void)
 	hw_binds = hw_ready = true;
 	hw_ack = BIT_ULL(7);
 	enables = commands = 0;
+#if HOST_HAS_DRAM
+	dram_parse_error = -ENODATA;
+	dram_group_error = 0;
+	dram_parse_calls = dram_group_calls = 0;
+	registered_group = NULL;
+#endif
 	return NULL;
 }
 static int g15_vote(void)
@@ -715,6 +862,9 @@ int main(void)
 	setup();
 	assert(apple_pmp_report_probe(&report_dev) == 0);
 	struct apple_pmp_report *r = report_dev.dev.data;
+#if HOST_HAS_DRAM
+	assert(dram_parse_calls == 1 && !dram_group_calls && !registered_group);
+#endif
 	/* The old passive descriptor fails the real DCP entry waiter here. */
 	if (!r->start)
 		assert(apple_pmp_report_wait_ready(&entries[0], 30000) == 0);
@@ -727,6 +877,14 @@ int main(void)
 	assert(regs[0x1180 / 8] == r->start->seed);
 	assert(((struct apple_pmp_report_entry *)entry_devs[3].dev.data)
 		       ->no_ack);
+	/* genpd flags follow the overlay: always-on wakes, irq-safe opts in. */
+	for (unsigned int i = 0; i < 4; i++) {
+		const struct apple_pmp_report_entry *e = entry_devs[i].dev.data;
+		assert(!!(e->genpd.flags & GENPD_FLAG_ACTIVE_WAKEUP) ==
+		       overlay_entries[i].always_on);
+		assert(!!(e->genpd.flags & GENPD_FLAG_IRQ_SAFE) ==
+		       overlay_entries[i].irq_safe);
+	}
 	assert(apple_pmp_report_wait_ready(&entries[0], 30000) == 0 &&
 	       enables == 1 && pmp_node.available);
 	assert(g15_vote() == 0 && commands == 1 && enables == 1);
@@ -745,6 +903,17 @@ int main(void)
 	cases++;
 	regs[0x11c0 / 8] &= ~BIT_ULL(7);
 	assert(g15_vote() == -EIO && commands == 1);
+	cases++;
+	cleanup();
+	/* Only an entry that carries apple,irq-safe becomes an IRQ-safe domain. */
+	setup();
+	entries[1].irq_safe = true;
+	assert(apple_pmp_report_probe(&report_dev) == 0);
+	for (unsigned int i = 0; i < 4; i++) {
+		const struct apple_pmp_report_entry *e = entry_devs[i].dev.data;
+		assert(!!(e->genpd.flags & GENPD_FLAG_IRQ_SAFE) ==
+		       (i == 1 || overlay_entries[i].irq_safe));
+	}
 	cases++;
 	cleanup();
 	/* Missing display acknowledgement cannot release G15, even if bound+READY. */
@@ -823,6 +992,44 @@ int main(void)
 	assert(g15_vote() == -EINVAL && commands == 0 && !enables);
 	cases++;
 	cleanup();
+
+#if HOST_HAS_DRAM
+	/* Metadata registration leaves the original managed-start graph intact. */
+	setup();
+	dram_parse_error = 0;
+	assert(apple_pmp_report_probe(&report_dev) == 0);
+	assert(dram_parse_calls == 1 && dram_group_calls == 1);
+	/* Reads use cached values, even if a subsequent parse would fail. */
+	dram_parse_error = -EIO;
+	check_dram_attributes();
+	assert(dram_parse_calls == 1 && dram_group_calls == 1);
+	assert(!enables && !pmp_node.available);
+	assert(g15_vote() == 0 && enables == 1 && commands == 1);
+	cases++;
+	cleanup();
+
+	/* Errors must propagate before child seeding or startup ownership. */
+	const int errors[] = { -EINVAL, -EPROBE_DEFER, -EIO };
+	for (unsigned int i = 0; i < ARRAY_SIZE(errors); i++) {
+		setup();
+		dram_parse_error = errors[i];
+		assert(apple_pmp_report_probe(&report_dev) == errors[i]);
+		assert(dram_parse_calls == 1 && !dram_group_calls && !registered_group);
+		assert(!action_count && !enables && !commands && !pending);
+		assert(!regs[0x1180 / 8] && !pmp_node.available);
+		cases++;
+		cleanup();
+	}
+	setup();
+	dram_parse_error = 0;
+	dram_group_error = -ENOMEM;
+	assert(apple_pmp_report_probe(&report_dev) == -ENOMEM);
+	assert(dram_parse_calls == 1 && dram_group_calls == 1 && !registered_group);
+	assert(!action_count && !enables && !commands && !pending);
+	assert(!regs[0x1180 / 8] && !pmp_node.available);
+	cases++;
+	cleanup();
+#endif
 	printf("PASS: %u actual overlay/probe/entry/DCP7/managed-start/supplier graph cases\n",
 	       cases);
 	return 0;

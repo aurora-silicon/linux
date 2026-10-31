@@ -361,6 +361,7 @@ impl Timestamps<'_> {
             .ok_or(ENOENT)?
             .clone();
         let file::Object::TimestampBuffer(mapping) = object;
+        let mapping = mapping.firmware_mapping()?;
         let offset = timestamp.offset as usize;
         if offset % 8 != 0 || offset >= mapping.size() || mapping.size() - offset < 8 {
             return Err(EINVAL);

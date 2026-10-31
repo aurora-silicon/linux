@@ -908,7 +908,92 @@ static void cd321x_mux_held_then_other_error_test(struct kunit *test)
 	cd321x_mux_test_expect_usb(test, t);
 }
 
+/* A dock already attached when probe's first SAFE request times out. */
+static struct cd321x_mux_test *cd321x_mux_test_boot(struct kunit *test, bool transient)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_port(test, transient);
+
+	cd321x_pm_init(&t->cd.pm);
+	t->status = TPS_STATUS_PLUG_PRESENT;
+	t->data_status = TPS_DATA_STATUS_DATA_CONNECTION | TPS_DATA_STATUS_USB2_CONNECTION |
+			 TPS_DATA_STATUS_USB3_CONNECTION;
+	t->phy.held = true;
+	KUNIT_ASSERT_EQ(test, cd321x_init_mux(&t->cd), 0);
+	KUNIT_EXPECT_STREQ(test, t->phy.log, "S");
+	KUNIT_EXPECT_EQ(test, t->cd.pm.phase, CD321X_PM_INITIALIZING);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.update_work));
+	KUNIT_EXPECT_FALSE(test, t->cd.state_valid);
+
+	return t;
+}
+
+static void cd321x_mux_boot_retries_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_boot(test, true);
+
+	KUNIT_ASSERT_NE(test, t->cd.pm.mux_retry_ms, 0U);
+	t->cd.tps.data->ready(&t->cd.tps);
+	cd321x_mux_test_expect_read_now(test, t);
+	while (t->now_ms < TEST_ELECTIONS_MS)
+		KUNIT_ASSERT_TRUE(test, cd321x_mux_test_next(t));
+	KUNIT_EXPECT_NE(test, cd321x_mux_test_phase(t), CD321X_PM_STALE);
+	/* No interrupt or physical replug is needed after the lock is released. */
+	t->phy.held = false;
+	memset(t->phy.log, 0, sizeof(t->phy.log));
+	cd321x_mux_test_settle(test, t);
+	KUNIT_EXPECT_STREQ(test, t->phy.log, "su");
+	cd321x_mux_test_expect_usb(test, t);
+}
+
+static void cd321x_mux_boot_ceiling_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_boot(test, true);
+	unsigned int i;
+
+	t->cd.tps.data->ready(&t->cd.tps);
+	cd321x_mux_test_expect_read_now(test, t);
+	for (i = 0; i < 4 * CD321X_MUX_RETRIES && cd321x_mux_test_next(t); i++)
+		;
+	KUNIT_EXPECT_GE(test, t->now_ms, CD321X_MUX_HELD_MS);
+	KUNIT_EXPECT_EQ(test, cd321x_mux_test_phase(t), CD321X_PM_STALE);
+	KUNIT_EXPECT_EQ(test, t->cd.pm.mux_retry_ms, 0U);
+	KUNIT_EXPECT_FALSE(test, t->cd.state_valid);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.update_work));
+}
+
+/* M1/M2 providers retain their ordinary three-attempt recovery budget. */
+static void cd321x_mux_boot_nontransient_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_boot(test, false);
+
+	KUNIT_EXPECT_EQ(test, t->cd.pm.mux_retry_ms, 0U);
+	t->cd.tps.data->ready(&t->cd.tps);
+	cd321x_mux_test_expect_read_now(test, t);
+	cd321x_mux_test_settle(test, t);
+	KUNIT_EXPECT_EQ(test, cd321x_mux_test_phase(t), CD321X_PM_STALE);
+	KUNIT_EXPECT_LT(test, t->now_ms, TEST_ELECTIONS_MS);
+	KUNIT_EXPECT_EQ(test, t->cd.pm.mux_retry_ms, 0U);
+}
+
+static void cd321x_mux_boot_defer_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_port(test, true);
+
+	cd321x_pm_init(&t->cd.pm);
+	t->phy.held = true;
+	t->phy.held_ret = -EAGAIN;
+	KUNIT_EXPECT_EQ(test, cd321x_init_mux(&t->cd), -EPROBE_DEFER);
+	KUNIT_EXPECT_EQ(test, t->cd.pm.mux_retry_ms, 0U);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+}
+
 static struct kunit_case cd321x_mux_cases[] = {
+	KUNIT_CASE(cd321x_mux_boot_retries_test),
+	KUNIT_CASE(cd321x_mux_boot_ceiling_test),
+	KUNIT_CASE(cd321x_mux_boot_nontransient_test),
+	KUNIT_CASE(cd321x_mux_boot_defer_test),
 	KUNIT_CASE(cd321x_mux_held_past_budget_test),
 	KUNIT_CASE(cd321x_mux_held_backs_off_test),
 	KUNIT_CASE(cd321x_mux_held_event_takes_over_test),

@@ -2082,6 +2082,7 @@ W:	https://aurora-silicon.github.io
 S:	Maintained
 F:	Documentation/devicetree/bindings/cpu/apple,t8140-cpuidle.yaml
 F:	Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
+F:	Documentation/devicetree/bindings/dma/apple,t8140-pcie-bootstrap.yaml
 F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
 F:	drivers/pmdomain/apple/pmp-report.c
@@ -2092,6 +2093,7 @@ F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	Documentation/PCI/controller/apple-t8140.rst
+F:	Documentation/devicetree/bindings/iio/imu/apple,aop-motion.yaml
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
@@ -2110,6 +2112,8 @@ F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/gpu/apple-dcp-backlight.rst
 F:	Documentation/hid/apple-j700-multitouch.rst
+F:	Documentation/iio/aop-sensors.rst
+F:	Documentation/networking/device_drivers/wifi/mt7932-j700-antenna.rst
 F:	Documentation/networking/device_drivers/wifi/mt7932-neo.rst
 F:	arch/arm64/boot/dts/apple/t8140*
 F:	arch/arm64/configs/j700*.config
@@ -2118,12 +2122,13 @@ F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-parser-test.c
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
+F:	drivers/net/wireless/mediatek/mt7932/
+F:	drivers/pci/controller/pcie-apple-t8140-bootstrap*
 F:	drivers/phy/apple/atc-j700-dp.h
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
 F:	drivers/tty/serial/apple_dockchannel*
-F:	drivers/pci/controller/pcie-apple-piodma*
 F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
@@ -2131,7 +2136,9 @@ F:	sound/soc/apple/aop_t8140.rs
 F:	tools/asahi/mt7932*
 F:	tools/testing/apple/
 F:	tools/testing/kunit/configs/apple_firmware.config
+F:	tools/testing/kunit/configs/apple_t8140_bootstrap.config
 F:	tools/testing/kunit/configs/mt7932.config
+F:	tools/testing/selftests/drivers/apple/aop-las.py
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 
 APPLETALK NETWORK LAYER
@@ -2705,6 +2712,7 @@ B:	https://github.com/AsahiLinux/linux/issues
 C:	irc://irc.oftc.net/asahi-dev
 T:	git https://github.com/AsahiLinux/linux.git
 F:	Documentation/ABI/testing/sysfs-driver-apple-dart
+F:	Documentation/ABI/testing/sysfs-driver-apple-pmp-dram
 F:	Documentation/devicetree/bindings/arm/apple.yaml
 F:	Documentation/devicetree/bindings/arm/apple/*
 F:	Documentation/devicetree/bindings/clock/apple,nco.yaml
@@ -2727,6 +2735,7 @@ F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	Documentation/devicetree/bindings/nvme/apple,nvme-ans.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,efuses.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
+F:	Documentation/devicetree/bindings/opp/operating-points-v2-apple-dram.yaml
 F:	Documentation/devicetree/bindings/pci/apple,pcie.yaml
 F:	Documentation/devicetree/bindings/phy/apple,atcphy.yaml
 F:	Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml
@@ -2745,6 +2754,7 @@ F:	Documentation/devicetree/bindings/usb/apple,dwc3.yaml
 F:	Documentation/devicetree/bindings/usb/apple,sn201202x.yaml
 F:	Documentation/devicetree/bindings/watchdog/apple,wdt.yaml
 F:	Documentation/hwmon/macsmc-hwmon.rst
+F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
 F:	drivers/clk/clk-apple-nco.c
@@ -2773,6 +2783,7 @@ F:	drivers/pmdomain/apple/
 F:	drivers/power/reset/macsmc-reboot.c
 F:	drivers/power/supply/macsmc-power*.c
 F:	drivers/pwm/pwm-apple.c
+F:	tools/asahi/apple-pwm-pm-tests.py
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
@@ -2799,6 +2810,16 @@ F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
 F:	tools/testing/selftests/drivers/apple/
+
+ARM/APPLE AVE VIDEO ENCODER DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+W:	https://aurora-silicon.github.io
+F:	Documentation/admin-guide/media/apple-ave.rst
+F:	Documentation/devicetree/bindings/media/apple,t8140-ave.yaml
+F:	drivers/media/platform/apple/ave/
+F:	tools/asahi/ave*-tests.py
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
@@ -8168,9 +8189,13 @@ L:	asahi@lists.linux.dev
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 F:	Documentation/ABI/testing/sysfs-class-accel-ane
+F:	Documentation/ABI/testing/sysfs-driver-ane-performance
+F:	Documentation/accel/apple-ane.rst
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	drivers/accel/ane/
 F:	include/uapi/drm/ane_accel.h
+F:	tools/accel/ane-bench.py
+F:	tools/testing/selftests/drivers/ane/
 
 DRM ACCEL DRIVERS FOR INTEL VPU
 M:	Karol Wachowski <karol.wachowski@linux.intel.com>

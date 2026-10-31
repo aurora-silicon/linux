@@ -70,6 +70,16 @@
 	};
 
 	/*
+	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
+	 * and that no OS switches. The ADT gives the flash no supply.
+	 */
+	nor_flash_vcc: regulator-nor-flash-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nor-flash-vcc";
+		regulator-always-on;
+	};
+
+	/*
 	 * The J700 is fanless: the CPUs are the only cooling devices.  Every
 	 * die sensor gets a zone that throttles both clusters, since they share
 	 * one die and one heat spreader.  The power allocator splits the budget
@@ -384,9 +394,32 @@
 			};
 		};
 	};
+
+	/*
+	 * The headphone codec runs from PMU rails that are on whenever the
+	 * SoC is and that no OS switches. The ADT gives the codec a reset
+	 * line and no supply or power function.
+	 */
+	jack_codec_supply: regulator-jack-codec {
+		compatible = "regulator-fixed";
+		regulator-name = "jack-codec";
+		regulator-always-on;
+	};
 };
 
 #include "isp-imx558.dtsi"
+
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
 
 &serial0 {
 	status = "okay";
@@ -448,6 +481,7 @@
 		compatible = "jedec,spi-nor";
 		reg = <0>;
 		spi-max-frequency = <25000000>;
+		vcc-supply = <&nor_flash_vcc>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -490,6 +524,11 @@
 	jack_codec: codec@48 {
 		compatible = "cirrus,cs42l83";
 		reg = <0x48>;
+		VA-supply = <&jack_codec_supply>;
+		VCP-supply = <&jack_codec_supply>;
+		VD_FILT-supply = <&jack_codec_supply>;
+		VL-supply = <&jack_codec_supply>;
+		VP-supply = <&jack_codec_supply>;
 		reset-gpios = <&pinctrl_ap 103 GPIO_ACTIVE_HIGH>;
 		interrupt-parent = <&pinctrl_ap>;
 		interrupts = <104 IRQ_TYPE_LEVEL_LOW>;
@@ -613,6 +652,8 @@
 };
 
 &smc_hwmon {
+	apple,thermal-pressure-key = "mTPL";
+
 	/*
 	 * Further channels, reported to userspace. They follow the six CPU
 	 * die temperatures in t8140.dtsi, which the thermal zones above
@@ -1812,9 +1853,23 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
 
+/*
+ * The J700 SMC has no keys for these shared laptop sensors. On T8140 the
+ * temperature channels are indexed for the thermal zones, so a missing
+ * temperature key keeps an empty, hidden channel and is reported at every
+ * boot. The NAND temperature is described above as Storage (NAND).
+ */
+&smc_hwmon {
+	/delete-node/ power-PMVR;
+	/delete-node/ power-PHPC;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+};
+
 &pcie0 {
 	/* The PIODMA guard stays closed until the retained bootstrap succeeds. */
-	apple,piodma = <&pcie0_piodma_diag>;
+	apple,piodma = <&pcie0_bootstrap>;
 	iommu-map = <0x100 &pcie0_dart 1 2>;
 	iommu-map-mask = <0xffff>;
 	pinctrl-0 = <&pcie0_clkreq>;
@@ -1842,8 +1897,9 @@
 };
 
 / {
-	pcie0_piodma_diag: piodma@390030000 {
-		compatible = "apple,t8140-piodma-diagnostic";
+	pcie0_bootstrap: piodma@390030000 {
+		compatible = "apple,t8140-pcie-bootstrap",
+			     "apple,t8140-piodma-diagnostic";
 		reg = <0x3 0x90030000 0x0 0x4000>,
 		      <0x3 0x90034000 0x0 0x4000>,
 		      <0x3 0x90038000 0x0 0x4000>;

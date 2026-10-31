@@ -601,6 +601,8 @@ struct bcm4377_data {
 	const char *board_type;
 
 	bool needs_reset;
+	/* Set while bcm4377_pci_reset() resets the function itself. */
+	bool own_reset;
 	bool cal_needed;
 	bool cal_loaded;
 	bool setup_retry_used;
@@ -1422,7 +1424,9 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	if (bcm4377->hw->disable_aspm)
 		bcm4377_disable_aspm(bcm4377);
 
+	WRITE_ONCE(bcm4377->own_reset, true);
 	ret = pci_reset_function(bcm4377->pdev);
+	WRITE_ONCE(bcm4377->own_reset, false);
 	if (ret) {
 		dev_err(&bcm4377->pdev->dev,
 			"function level reset failed: %d\n", ret);
@@ -2783,14 +2787,12 @@ static void bcm4377_reset_work(struct work_struct *work)
  * every later command times out until the module is reloaded. Recover the
  * same way, by rebinding the driver.
  */
-static void bcm4377_hci_reset(struct hci_dev *hdev)
+static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
+				 const char *why)
 {
-	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+	struct hci_dev *hdev = bcm4377->hdev;
 	struct bcm4377_reset_work *rw;
 
-	/* A timeout while still setting up would only loop probe failures. */
-	if (hci_dev_test_flag(hdev, HCI_SETUP))
-		return;
 	if (test_and_set_bit(0, &bcm4377->reset_pending))
 		return;
 	/*
@@ -2808,11 +2810,58 @@ static void bcm4377_hci_reset(struct hci_dev *hdev)
 		return;
 	}
 
-	bt_dev_err(hdev, "controller not responding, rebinding the driver");
+	bt_dev_err(hdev, "%s, rebinding the driver", why);
 	rw->pdev = pci_dev_get(bcm4377->pdev);
 	INIT_WORK(&rw->work, bcm4377_reset_work);
 	queue_work(bcm4377_reset_wq, &rw->work);
 }
+
+static void bcm4377_hci_reset(struct hci_dev *hdev)
+{
+	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+
+	/* A timeout while still setting up would only loop probe failures. */
+	if (hci_dev_test_flag(hdev, HCI_SETUP))
+		return;
+	bcm4377_queue_rebind(bcm4377, "controller not responding");
+}
+
+/*
+ * A function reset requested by the PCI core or by userspace. Probe resets the
+ * function before it sets the driver data, and bcm4377_pci_reset() quiesces
+ * and restarts the controller around its own reset, so neither needs more.
+ * Any other reset loses the firmware and the rings under a running driver:
+ * keep the interrupt off across it, then rebind, as for a command timeout.
+ */
+static void bcm4377_reset_prepare(struct pci_dev *pdev)
+{
+	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+	int irq;
+
+	if (!bcm4377 || READ_ONCE(bcm4377->own_reset))
+		return;
+	irq = pci_irq_vector(pdev, 0);
+	if (irq > 0)
+		disable_irq(irq);
+}
+
+static void bcm4377_reset_done(struct pci_dev *pdev)
+{
+	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+	int irq;
+
+	if (!bcm4377 || READ_ONCE(bcm4377->own_reset))
+		return;
+	irq = pci_irq_vector(pdev, 0);
+	if (irq > 0)
+		enable_irq(irq);
+	bcm4377_queue_rebind(bcm4377, "function reset");
+}
+
+static const struct pci_error_handlers bcm4377_err_handler = {
+	.reset_prepare = bcm4377_reset_prepare,
+	.reset_done = bcm4377_reset_done,
+};
 
 static void bcm4377_hci_unregister_dev(void *data)
 {
@@ -3049,6 +3098,8 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					hdev);
 }
 
+static int bcm4377_resume(struct device *dev);
+
 static int bcm4377_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -3071,6 +3122,21 @@ static int bcm4377_suspend(struct device *dev)
 	}
 
 	if (device_may_wakeup(dev)) {
+		ret = enable_irq_wake(pdev->irq);
+		if (ret) {
+			int resume_ret;
+
+			dev_err(dev, "Failed to arm Bluetooth wake IRQ: %d\n", ret);
+			/* The PM core will not resume a device that failed suspend. */
+			bcm4377->resume_powered = false;
+			resume_ret = bcm4377_resume(dev);
+			if (resume_ret)
+				dev_err(dev, "Failed to undo Bluetooth suspend: %d\n",
+					resume_ret);
+			return ret;
+		}
+		bcm4377->wake_armed = true;
+
 		/*
 		 * Remote wakeup: leave the firmware running and the function
 		 * in D0, so a connection attempt from a wake-allowed device
@@ -3078,7 +3144,6 @@ static int bcm4377_suspend(struct device *dev)
 		 * core from putting the function into D3hot.
 		 */
 		pci_save_state(pdev);
-		bcm4377->wake_armed = !enable_irq_wake(pdev->irq);
 		return 0;
 	}
 
@@ -3234,6 +3299,7 @@ static struct pci_driver bcm4377_pci_driver = {
 	.name = "hci_bcm4377",
 	.id_table = bcm4377_devid_table,
 	.probe = bcm4377_probe,
+	.err_handler = &bcm4377_err_handler,
 	.driver.pm = &bcm4377_ops,
 };
 

@@ -54,6 +54,16 @@
 			default-state = "keep";
 		};
 	};
+
+	/*
+	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
+	 * and that no OS switches. The ADT gives the flash no supply.
+	 */
+	nor_flash_vcc: regulator-nor-flash-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nor-flash-vcc";
+		regulator-always-on;
+	};
 };
 
 /* Enable DVFS only with the J713 board thermal owner. */
@@ -72,6 +82,7 @@
 		compatible = "jedec,spi-nor";
 		reg = <0>;
 		spi-max-frequency = <10000000>;
+		vcc-supply = <&nor_flash_vcc>;
 		spi-rx-bus-width = <1>;
 		spi-tx-bus-width = <1>;
 

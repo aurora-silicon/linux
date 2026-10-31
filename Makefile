@@ -550,7 +550,10 @@ RUSTC		= rustc
 RUSTDOC		= rustdoc
 RUSTFMT		= rustfmt
 CLIPPY_DRIVER	= clippy-driver
-BINDGEN		= bindgen
+# Prefer the locally prepared, layout-corrected generator, including O= builds.
+# Keep command-line overrides for toolchain testing; layouts are always checked.
+aurora_bindgen := $(abs_srctree)/tools/aurora-bindgen/build/bin/bindgen
+BINDGEN		= $(if $(wildcard $(aurora_bindgen)),$(aurora_bindgen),bindgen)
 PAHOLE		= pahole
 RESOLVE_BTFIDS	= $(objtree)/tools/bpf/resolve_btfids/resolve_btfids
 LEX		= flex

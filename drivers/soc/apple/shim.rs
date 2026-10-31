@@ -9,6 +9,7 @@ extern "C" {
     fn sep_store_open(path: *const c_char) -> *mut c_void;
     fn sep_store_open_host(path: *const c_char, created: *mut bool) -> *mut c_void;
     fn sep_store_open_trunc(path: *const c_char) -> *mut c_void;
+    fn sep_store_open_writable_existing(path: *const c_char) -> *mut c_void;
     fn sep_store_open_ro(path: *const c_char) -> *mut c_void;
     fn sep_store_open_block(path: *const c_char, writable: c_int) -> *mut c_void;
     fn sep_store_close(handle: *mut c_void);
@@ -76,6 +77,15 @@ impl StoreFile {
         let handle = unsafe { sep_store_open_trunc(path.as_char_ptr()) };
         if handle.is_null() {
             return Err(ENOENT);
+        }
+        Ok(StoreFile { handle })
+    }
+
+    pub(crate) fn open_writable_existing(path: &CStr) -> Result<StoreFile> {
+        // SAFETY: `path` is NUL-terminated; this open cannot create or truncate.
+        let handle = unsafe { sep_store_open_writable_existing(path.as_char_ptr()) };
+        if handle.is_null() {
+            return Err(EROFS);
         }
         Ok(StoreFile { handle })
     }

@@ -9,7 +9,9 @@ title: Apple SIO Coprocessor
 description:
   SIO is a coprocessor on Apple M1 and later chips (and maybe also on earlier
   chips). Its role is to offload SPI, UART and DisplayPort audio transfers,
-  being a pretend DMA controller.
+  being a pretend DMA controller. The SoC-specific compatible selects the
+  firmware protocol and channel configuration. In particular, apple,t6030-sio
+  requires protocol-10 boot tables before the coprocessor can be started.
 
 maintainers:
   - Martin Povišer <povik+lin@cutebit.org>

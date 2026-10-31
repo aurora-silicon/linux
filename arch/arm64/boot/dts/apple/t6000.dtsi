@@ -39,3 +39,54 @@
 &gpu {
 	compatible = "apple,agx-t6000", "apple,agx-g13x";
 };
+
+/*
+ * DRAM interface class: width and maximum rate are inferred from topology
+ * and the published bandwidth class. Lower-state rates remain unqualified.
+ * State IDs below describe firmware DCS states, not PMGR codes.
+ */
+/ {
+	dram_opp: opp-table-dram {
+		compatible = "operating-points-v2-apple-dram";
+		opp-shared;
+
+		opp-0 {
+			opp-level = <0>;
+		};
+
+		opp-1 {
+			opp-level = <1>;
+		};
+
+		opp-2 {
+			opp-level = <2>;
+		};
+
+		opp-3 {
+			opp-level = <3>;
+			opp-hz = /bits/ 64 <3200000000>;
+			apple,data-rate = /bits/ 64 <6400000000>;
+		};
+	};
+};
+
+&pmp_report {
+	operating-points-v2 = <&dram_opp>;
+	apple,dram-type = "lpddr5";
+	apple,data-bus-width = <256>;
+	apple,dcs-state-count = <4>;
+	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <204800000000>;
+	apple,bandwidth-class-bytes-per-second = /bits/ 64 <200000000000>;
+};
+
+&pmp_report {
+	reg = <0x2 0x8e3c0000 0x0 0x20000>,
+	      <0x2 0x85868000 0x0 0x4000>;
+	reg-names = "report", "ane-dvfs";
+};
+
+&ane {
+	apple,performance-controller = <&pmp_report>;
+	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
+		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
+};

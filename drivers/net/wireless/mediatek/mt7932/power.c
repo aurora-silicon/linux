@@ -10,7 +10,12 @@ static int mt_power_submit(struct mt7932 *m, u8 mode)
 	u8 body[4] = { 0, mode, 0, 0 }; /* owned BSS0, not a station/WTBL ID */
 	int ret;
 
-	ret = mt_request(m, 5, true, true, false, body, sizeof(body));
+#if IS_ENABLED(CONFIG_MT7932_RF_KUNIT_TEST)
+	if (m->power_test_send)
+		ret = m->power_test_send(m, body, sizeof(body));
+	else
+#endif
+		ret = mt_request(m, 5, true, true, false, body, sizeof(body));
 	m->power_applied_valid = !ret;
 	if (!ret)
 		m->power_applied = mode;
@@ -22,11 +27,19 @@ static int mt_power_submit(struct mt7932 *m, u8 mode)
 int mt_power_init(struct mt7932 *m)
 {
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&m->response_lock, flags);
 	m->power_tim = false;
 	spin_unlock_irqrestore(&m->response_lock, flags);
-	return mt_power_submit(m, 0);
+	ret = mt_power_submit(m, 0);
+	/* This SET precedes EA/40. It cannot attest to the power policy of the
+	 * associated BSS, whose authentication and scheduling firmware owns.
+	 * Invalidate even on success so power_work submits the desired mode
+	 * after association, including mode 0 when userspace disabled PS.
+	 */
+	m->power_applied_valid = false;
+	return ret;
 }
 
 /* command_mutex fences BSS reuse/retirement while the SET is submitted. */

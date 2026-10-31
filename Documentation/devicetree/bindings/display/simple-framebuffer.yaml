@@ -118,6 +118,8 @@ properties:
       - x8r8g8b8
       - x8b8g8r8
 
+  post-init-providers: true
+
   display:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: Primary display hardware node

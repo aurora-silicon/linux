@@ -7,7 +7,7 @@
 
 pkgname=aurora-sep
 pkgver=1
-pkgrel=14
+pkgrel=15
 pkgdesc="Loader and desktop integration for the Apple SEP (Touch ID) driver"
 url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
 arch=(any)
@@ -33,8 +33,9 @@ source=(load-driver
         aurora-sep-policy-change
         README.md
         XART-SAFETY.md
-        OS-IDENTITY.md)
-sha256sums=('5f0193851b017ac59ba7ae15663f2481588b83a04a3f0b9743c327d83cdcd607'
+        OS-IDENTITY.md
+        sep-bio-identities)
+sha256sums=('129225c2602290221fc38f754c486e1cba8f0b160e56c5aee2446100aa4e8a04'
             '2f401629733d280a1b8a5a74f5b668d42307f9885f916abf9e377a811e358b9a'
             'f8d0c4b9385e6716d5ac5dd9941a57459fbc551a8238383bcde36cd929d0523f'
             '40f0d21446a85bab3e3800b31342e94e553af0fcde2c985503147519737e011d'
@@ -45,9 +46,10 @@ sha256sums=('5f0193851b017ac59ba7ae15663f2481588b83a04a3f0b9743c327d83cdcd607'
             '3d1c9c0cab1b090bd6b7d3c4bacaec8719e264afba6b565ada80b1e7914f203a'
             'fb58f07738b7654b15173fe0ffce2dff2f14b588d8edd24545e6c2c739605026'
             '6d96cdd20bc993c00eb0b2d7f77d52f81531c72e9d7141455822690ddec348bb'
-            'fdde42bf67667746e9bb5e435746808de49866a0d24b8d59f08f0568fa130a37'
-            '6f7b828fb42ebbae011a4d4ee041bf37fc6d68fea1f7c3a643a8259b7fb8705a'
-            '52020e636e62b60f0c3e6251c3b67b8a8c409bff0486bc3463f356fd3073384b')
+            '9094a2bac557d18b43f0ad23182ee8df65099f6d961f7b38befd56147fe3a975'
+            '5c799f27a424162200071b4e19aba6fae6bc9d2152a0b5a518512ae12d62104a'
+            '52020e636e62b60f0c3e6251c3b67b8a8c409bff0486bc3463f356fd3073384b'
+            '6209d874a8d2950e5c6a68e2a9c19ffd4ba6e86a27bde3351f37e69290830349')
 
 # A unit and the helper it runs ($1, installed as $3), pointed at the
 # packaged helper.
@@ -80,5 +82,6 @@ package() {
     >"$pkgdir/usr/lib/systemd/system/fprintd.service.d/50-aurora-sep-no-timeout.conf"
   install -Dm644 logind-aurora-sep.conf \
     "$pkgdir/usr/lib/systemd/logind.conf.d/50-aurora-sep.conf"
+  install -Dm755 sep-bio-identities "$pkgdir/usr/bin/sep-bio-identities"
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md XART-SAFETY.md OS-IDENTITY.md
 }

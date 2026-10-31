@@ -70,7 +70,9 @@ impl Gate{
 struct Scratch;impl Scratch{fn pages(&self)->u16{0}}
 enum Validated{Compute{scratch:Scratch}}
 struct Status;impl Status{fn get(&self)->i32{if now_ns()>=STATUS.load(Ordering::SeqCst){-5}else{0}}}
-struct Work;impl Work{fn acquire(&self)->Result{if MODE.load(Ordering::SeqCst)==4{Err(EBUSY)}else{Ok(())}}}
+mod g17{pub mod job{#[derive(Clone,Copy,Debug,PartialEq)]pub enum Engine{Render,Compute}}}
+// A work-state node is taken per engine: compute admission must ask for a compute one.
+struct Work;impl Work{fn acquire(&self,engine:g17::job::Engine)->Result<u32>{assert_eq!(engine,g17::job::Engine::Compute,"compute admission takes a compute work state");if MODE.load(Ordering::SeqCst)==4{Err(EBUSY)}else{Ok(1)}}}
 struct Completion;impl Completion{fn status(&self)->Status{Status}fn work_state(&self)->Result<Work>{Ok(Work)}}
 struct Packet{command:Validated,completion:Completion}
 impl Packet{fn check_dependencies(&self)->Result{Ok(())}fn cancel_requested(&self)->bool{now_ns()>=CANCEL.load(Ordering::SeqCst)}fn is_published(&self)->bool{false}}
@@ -159,6 +161,7 @@ def main():
         ('fixed', source, ''),
         ('renew-on-binding-loss', source.replace('let admission = Admission::new(deadline, &check);\n        let progress = &self.shared.progress;\n        loop {', 'let progress = &self.shared.progress;\n        loop {\n            let admission = Admission::new(now_ns().saturating_add(WORK_RING_WAIT_NS), &check);'), 'admission budget exceeded'),
         ('ignore-deadline', source.replace('if now_ns() >= self.deadline', 'if false'), 'admission budget exceeded'),
+        ('render-work-state', source.replace('acquire(crate::g17::job::Engine::Compute)', 'acquire(crate::g17::job::Engine::Render)'), 'compute admission takes a compute work state'),
         ('omit-gate-check', source.replace('            admission.check()?;\n            match self.try_enter()', '            match self.try_enter()').replace('admission.slice_ms()?', '10'), 'gate wake storm'),
     ]
     # Bind the old unbounded mutant with the review's eventual cancellation.

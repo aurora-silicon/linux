@@ -58,6 +58,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import re
 import resource
@@ -1362,13 +1363,20 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('--output', type=Path, help='Work directory (default: a temporary one)')
     p.add_argument('--rustc', default=os.environ.get('HOSTRUSTC'),
-                   help='Host compiler executable (default: rustup run 1.93.1 rustc)')
+                   help='Host compiler executable (default: rustup run 1.93.1 rustc, '
+                        'or $RUSTC/rustc where rustup is not installed)')
     p.add_argument('--ref', help='Read the tested bodies at this git revision')
     p.add_argument('--mutation', choices=sorted(MUTATIONS) + sorted(CONTROLS))
     p.add_argument('--mutations', action='store_true',
                    help='Also require every mutation to fail and every control to pass')
     a = p.parse_args()
-    compiler = [a.rustc] if a.rustc else ['rustup', 'run', '1.93.1', 'rustc']
+    # The receipt records whichever compiler version ran.
+    if a.rustc:
+        compiler = [a.rustc]
+    elif shutil.which('rustup'):
+        compiler = ['rustup', 'run', '1.93.1', 'rustc']
+    else:
+        compiler = [os.environ.get('RUSTC', 'rustc')]
     rustc_version = subprocess.check_output(compiler + ['--version'], text=True).strip()
     import tempfile
     out = (a.output or Path(tempfile.mkdtemp(prefix='g15-pb-growth-'))).resolve()

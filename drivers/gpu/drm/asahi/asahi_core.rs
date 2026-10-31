@@ -4,6 +4,7 @@
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
 
 mod alloc;
+mod binding;
 mod buffer;
 mod channel;
 mod cleanup;
@@ -12,21 +13,21 @@ mod driver;
 mod event;
 mod file;
 mod float;
-mod fwid;
 mod fw;
-mod gem;
-mod g17;
+mod fwid;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 mod g15;
+mod g17;
+mod gem;
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 mod g16;
 mod gpu;
 mod hw;
 mod initdata;
+mod m3;
 mod mem;
 mod memacct;
-mod m3;
 mod microseq;
 mod mmu;
 mod object;
@@ -37,6 +38,7 @@ mod slotalloc;
 mod stats;
 mod sysfs_exports;
 mod timestamp;
+mod usage;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
@@ -84,11 +86,13 @@ struct DriverModule {
 
 impl kernel::InPlaceModule for DriverModule {
     fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { binding::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
             #[cfg(CONFIG_DRM_ASAHI_G15)]
-            _g15 <- kernel::driver::Registration::new(c"asahi-g15", module),
+            _g15 <- kernel::driver::Registration::new(c"aurora-g15", module),
             _driver <- kernel::driver::Registration::new(
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
@@ -103,9 +107,10 @@ impl kernel::InPlaceModule for DriverModule {
 
 module! {
     type: DriverModule,
-    name: "asahi",
+    name: "aurora",
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
+    alias: ["asahi"],
     params: {
         debug_flags: u64 {
             default: 0,

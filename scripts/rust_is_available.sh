@@ -222,6 +222,32 @@ if [ "$bindgen_libclang_cversion" -ge 2200000 ] &&
 	fi
 fi
 
+# Check the behavior, not the version: distributions can backport the repair.
+# Warn rather than making CONFIG_RUST unavailable, since that would silently
+# remove Rust drivers from a configuration. The kernel's layout assertions
+# remain the final check for every generated type.
+bindgen_alignment_output=$( \
+	LC_ALL=C "$BINDGEN" $(dirname $0)/rust_is_available_bindgen_alignment.h \
+		--rust-target 1.85 2>/dev/null
+) || bindgen_alignment_code=$?
+if [ -n "$bindgen_alignment_code" ] ||
+	! echo "$bindgen_alignment_output" | grep -Eq '#\[repr\(.*align\(64\)'; then
+	echo >&2 "***"
+	if [ -n "$bindgen_alignment_code" ]; then
+		echo >&2 "*** Could not check empty struct alignment with '$BINDGEN'."
+		echo >&2 "***   Exit code: $bindgen_alignment_code"
+	else
+		echo >&2 "*** Rust bindings generator '$BINDGEN'"
+		echo >&2 "*** does not preserve empty struct alignment."
+	fi
+	echo >&2 "*** Default Asahi builds can fail the sched_statistics layout assertion."
+	echo >&2 "*** Prepare the corrected generator before configuring the kernel:"
+	echo >&2 "***   python3 tools/aurora-bindgen/build.py"
+	echo >&2 "*** See Documentation/rust/bindgen-layout-checks.rst for details."
+	echo >&2 "***"
+	warning=1
+fi
+
 # If the C compiler is Clang, then we can also check whether its version
 # matches the `libclang` version used by the Rust bindings generator.
 #

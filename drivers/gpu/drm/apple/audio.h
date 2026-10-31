@@ -18,7 +18,7 @@ void dcpaud_connect(struct platform_device *pdev, bool connected);
 void dcpaud_disconnect(struct platform_device *pdev);
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-/* The native link methods of the DCP firmware 14.7 external role. */
+/* Native link methods for 14.7 and desktop 26.x external roles. */
 enum dcp_audio_link {
 	DCP_AUDIO_LINK_PREPARE,
 	DCP_AUDIO_LINK_START,

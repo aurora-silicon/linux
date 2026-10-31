@@ -45,6 +45,7 @@ typedef uint64_t u64;
 #define PAGE_ALIGN(x) (((x)+PAGE_SIZE-1)&~(uint64_t)(PAGE_SIZE-1))
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #define max(a,b) ((a)>(b)?(a):(b))
+#define max3(a,b,c) max(max(a,b),c)
 #define IOC_IN (_IOC_WRITE << _IOC_DIRSHIFT)
 #define IOC_OUT (_IOC_READ << _IOC_DIRSHIFT)
 #define array_index_nospec(x,n) (x)

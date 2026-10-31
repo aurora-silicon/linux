@@ -48,6 +48,7 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	if (error >= 0)
 		error = -EIO;
 	WRITE_ONCE(m->rf_ready, false);
+	m->six_ap_valid = false;
 	WRITE_ONCE(m->link_failed, true);
 	if (!m->cal_state.error)
 		m->cal_state.error = error;
@@ -296,6 +297,16 @@ static void mt_peer_release(struct mt7932 *m)
 	m->peer_valid = false;
 	m->peer_wtbl = 0;
 	m->event_cipher = 0;
+	m->six_ap_valid = false;
+	m->connect_pmf = false;
+	/* Restore the installed VLP policy after a class/TPE connection. This
+	 * runs only after peer/DMA retirement; scans and joins stay fenced.
+	 */
+	if (m->six_class_dirty && !m->reg_pending && !m->stopping) {
+		m->reg_generation++;
+		WRITE_ONCE(m->reg_pending, true);
+		schedule_work(&m->startup_work);
+	}
 }
 
 /* No lifecycle/command lock held on entry. RX/IRQ and TX-free processing stay
@@ -430,6 +441,20 @@ static int mt_connect_prepare(struct mt7932 *m, bool *peer_owned)
 					 m->connect_mfp, m->connect_sae_pwe) ||
 	    (m->connect_bss->channel->band == NL80211_BAND_6GHZ && !m->six_power_valid))
 		return -EOPNOTSUPP;
+	if (m->connect_akm == WLAN_AKM_SUITE_PSK ||
+	    m->connect_akm == WLAN_AKM_SUITE_PSK_SHA256) {
+		const struct cfg80211_bss_ies *ies;
+
+		rcu_read_lock();
+		ies = rcu_dereference(m->connect_bss->ies);
+		ret = ies ? mt7932_connect_admit(ies->data, ies->len,
+						 m->connect_akm, m->connect_mfp,
+						 &m->connect_pmf) :
+			    -EINVAL;
+		rcu_read_unlock();
+		if (ret)
+			return ret;
+	}
 	if (m->connect_bss->channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR |
 					    IEEE80211_CHAN_NO_20MHZ | IEEE80211_CHAN_RADAR)) {
 		return -EINVAL;
@@ -527,6 +552,40 @@ static int mt_connect_attempt(struct mt7932 *m, bool *submitted,
 		m->connect_sae_pwd_length, m->connect_owe);
 	if (ret < 0)
 		goto free;
+	if (m->connect_akm == WLAN_AKM_SUITE_PSK ||
+	    m->connect_akm == WLAN_AKM_SUITE_PSK_SHA256) {
+		ret = mt7932_connect_psk_akm(body, 856, m->connect_akm);
+		if (ret)
+			goto free;
+	}
+	if (m->connect_band == NL80211_BAND_6GHZ) {
+		const struct cfg80211_bss_ies *ies;
+		struct mt7932_6g_ap ap;
+
+		rcu_read_lock();
+		ies = rcu_dereference(m->connect_bss->ies);
+		ret = ies ? mt7932_6g_connect_ap(&ap, ies->data, ies->len,
+						 m->connect_channel,
+						 m->connect_bss->channel->flags,
+						 m->six_legacy_channels) :
+			    -EINVAL;
+		rcu_read_unlock();
+		if (ret < 0)
+			goto free;
+		if (ret == 1) {
+			m->six_legacy_assoc = true;
+			ret = 0;
+			goto identity;
+		}
+		ret = mt_6g_connect_policy(m, &ap);
+		if (ret)
+			goto free;
+		spin_lock_irq(&m->response_lock);
+		m->six_ap = ap;
+		m->six_ap_valid = true;
+		spin_unlock_irq(&m->response_lock);
+	}
+identity:
 	/* Reprogram the same on-air station identity for either attempt. */
 	memcpy(mac + 2, m->mac, ETH_ALEN);
 	*submitted = true;
@@ -547,8 +606,10 @@ free:
 	m->connect_pmk_valid = false;
 	if (ret)
 		goto out;
-	dev_dbg(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n",
-		m->connect_bssid, m->connect_channel);
+	dev_dbg(&m->pdev->dev,
+		"CONNECT_SUBMITTED: channel=%u AKM=%08x MFP=%u admitted-PMF=%u\n",
+		m->connect_channel, m->connect_akm, m->connect_mfp,
+		m->connect_pmf);
 	*auth_submitted = true;
 	deadline = jiffies + msecs_to_jiffies(10000);
 	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
@@ -575,7 +636,8 @@ free:
 	}
 	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
 	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
-	if (!ret && m->connect_band == NL80211_BAND_6GHZ) {
+	if (!ret && m->connect_band == NL80211_BAND_6GHZ &&
+	    m->six_legacy_assoc) {
 		unsigned int i;
 
 		for (i = 0; !ret && i < 2; i++)
@@ -596,6 +658,20 @@ free:
 	mutex_lock(&m->command_mutex);
 out:
 	return ret ?: READ_ONCE(m->connect_error);
+}
+
+/*
+ * Once the request has gone to the AP, a timeout, a refusal or a reset while
+ * the firmware is still healthy is how the AP answered, not a driver or
+ * firmware fault. cfg80211 hands it to the supplicant, which retries, and
+ * mac80211 reports the same outcomes at info level. Keep the error level for
+ * failures that need recovery or point at the firmware.
+ */
+static bool mt_connect_failed_at_peer(struct mt7932 *m, bool auth_submitted,
+				      int ret)
+{
+	return auth_submitted && !READ_ONCE(m->link_failed) &&
+		(ret == -ETIMEDOUT || ret == -ECONNREFUSED || ret == -ECONNRESET);
 }
 
 void mt_connect_work(struct work_struct *work)
@@ -760,6 +836,9 @@ report:
 			READ_ONCE(m->data_ready));
 	else if (cancelled)
 		dev_dbg(&m->pdev->dev, "CONNECT_CANCELLED: %d\n", ret);
+	else if (mt_connect_failed_at_peer(m, auth_submitted, ret))
+		dev_info(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=0\n",
+			 ret);
 	else
 		dev_err(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=%u\n",
 			ret, READ_ONCE(m->link_failed));
@@ -837,6 +916,9 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_owe = auth == WLAN_AKM_SUITE_OWE;
 	m->connect_akm = auth;
 	m->connect_mfp = params->mfp;
+	m->connect_pmf = false;
+	m->six_ap_valid = false;
+	m->six_legacy_assoc = false;
 	m->connect_sae_pwe = params->crypto.sae_pwe;
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
 	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));

@@ -35,6 +35,11 @@ hw_struct=re.search(r'^struct bcm4377_hw \{.*?^\};',s,re.M|re.S).group()
 hw_enum=re.search(r'^enum bcm4377_chip \{.*?^\};',s,re.M|re.S).group()
 hw_table=re.search(r'^static const struct bcm4377_hw bcm4377_hw_variants\[\] = \{.*?^\};',s,re.M|re.S).group()
 fixture=re.sub(r'^struct bcm4377_hw \{.*?\};', 'typedef uint32_t u32;\n'+hw_struct,fixture,count=1,flags=re.M)
+# The variant table names register offsets by macro; take their definitions from the driver.
+hw_macros='\n'+''.join(m.group()+'\n' for name in sorted(set(re.findall(r'\b[A-Z][A-Z0-9_]+\b',hw_table))) for m in [re.search(r'^#define '+name+r'\b.*$',s,re.M)] if m)
+assert 'BAR2_CONTEXT_ADDR_HI' in hw_macros,hw_macros
+# bcm4377_suspend() undoes a failed wake arming through bcm4377_resume(), declared ahead of it.
+resume_decl=re.search(r'^static int bcm4377_resume\(struct device \*dev\);$',s,re.M).group()+'\n'
 fixture=fixture.replace('struct bcm4377_hw *hw;', 'const struct bcm4377_hw *hw;')
 table_callbacks='''
 static int send_cal(struct bcm4377_data *);
@@ -45,7 +50,7 @@ static int send_ptb(struct bcm4377_data *,const struct firmware *);
 #define bcm4377_send_ptb send_ptb
 #define bcm4378_send_ptb send_ptb
 '''
-code=fixture+hw_enum+table_callbacks+hw_table+'\n'.join(bodies.values())+'\n'.join(core_bodies.values())+extract(core,'hci_reset_dev_sync')+(r/'tools/asahi/bcm4377-resume/controls.c').read_text()
+code=fixture+hw_enum+hw_macros+table_callbacks+hw_table+resume_decl+'\n'.join(bodies.values())+'\n'.join(core_bodies.values())+extract(core,'hci_reset_dev_sync')+(r/'tools/asahi/bcm4377-resume/controls.c').read_text()
 (o/'production.c').write_text(code);env=dict(os.environ,TMPDIR=str(o/'tmp'))
 c=subprocess.run(['cc','-std=gnu11','-pthread','-Wall','-Wextra','-Wno-unused-function','-Wno-unused-parameter','-fsanitize=address,undefined','-fno-pie','-no-pie',str(o/'production.c'),'-o',str(o/'controls')],env=env,capture_output=True,text=True)
 (o/'compile.log').write_text(c.stdout+c.stderr);assert not c.returncode,c.stderr

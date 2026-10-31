@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/opp/operating-points-v2-apple-dcs.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T600x measured DCS bandwidth operating points
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+allOf:
+  - $ref: opp-v2-base.yaml#
+
+description: |
+  Each OPP maps a verified raw PMGR desired performance state to measured
+  sustainable bandwidth. Values are decimal kB/s, not DRAM clock frequencies,
+  theoretical peak bandwidth or firmware policy thresholds. State codes and
+  bandwidths must strictly increase together. The highest OPP must match the
+  boot firmware's desired state. Unmeasured intermediate states may be omitted.
+
+properties:
+  compatible:
+    const: operating-points-v2-apple-dcs
+
+patternProperties:
+  '^opp(-?[0-9]+)*$':
+    type: object
+    properties:
+      opp-supported-hw: false
+      turbo-mode: false
+      opp-level:
+        description: Verified raw PMGR desired state, without a state-index bias
+        minimum: 7
+        maximum: 15
+      opp-peak-kBps:
+        description: Measured sustainable bandwidth at this raw state
+        items:
+          - minimum: 1
+    required:
+      - opp-level
+      - opp-peak-kBps
+    unevaluatedProperties: false
+
+required:
+  - compatible
+
+unevaluatedProperties: false

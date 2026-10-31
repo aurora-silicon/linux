@@ -12,6 +12,7 @@ use kernel::{
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
+    sync::Arc,
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
@@ -39,7 +40,12 @@ const ALS_VERBOSITY: u32 = 6;
 /// The reporting interval in microseconds.
 const ALS_INTERVAL_US: u32 = 200000;
 const LUX_OFFSET_CT720: usize = 0x1d;
+// These offsets address the fake-HID EPIC payload, not a host HID event.
 const LUX_OFFSET_VD6286: usize = 0x28;
+// The documented 122-byte Redbird report carries firmware-computed Kelvin.
+// Other report layouts must be decoded separately, even for the same sensor.
+const VD6286_COLOR_REPORT_LEN: usize = 122;
+const CCT_OFFSET_VD6286: usize = 0x45;
 /*
  * The CT817 sends a 32-byte report: two raw channel floats at +0x08 and
  * +0x0c and the lux float at +0x1c, one byte below the CT720's, so the two
@@ -72,15 +78,18 @@ fn enable_als(
     offset: usize,
 ) -> Result<()> {
     if offset != LUX_OFFSET_CT817 {
-        // The calibration blob comes from macOS and is not installed on every
-        // system. Without it the sensor still reports, uncalibrated.
-        match Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
+        // The installer collects the calibration blob from macOS, so it is
+        // not present on every system. Without it the VD6286 of the M4 Pro
+        // never reports and its channel reads ENODATA. The warning below
+        // reports the missing file once, so the firmware loader is asked not
+        // to report it too.
+        match Firmware::request_nowarn(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
             Ok(fw) => {
                 set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
             }
             Err(e) => dev_warn!(
                 dev.as_ref(),
-                "no calibration ({:?}); readings are uncalibrated\n",
+                "no apple/aop-als-cal.bin ({:?}); the sensor may not report\n",
                 e
             ),
         }
@@ -165,17 +174,62 @@ fn f32_to_micro(f: u32) -> Option<u64> {
 
 struct MsgProc(usize);
 
+fn report_float(message: &[u8], offset: usize) -> Option<u64> {
+    let raw = message.get(offset..offset + 4)?;
+    f32_to_micro(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
 impl MessageProcessor for MsgProc {
     fn process(&self, message: &[u8]) -> Option<u64> {
-        let raw = message.get(self.0..self.0 + 4)?;
-        f32_to_micro(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        report_float(message, self.0)
     }
+
+    fn process_channel(&self, message: &[u8], channel: usize) -> Option<u64> {
+        match channel {
+            0 => self.process(message),
+            1 if self.0 == LUX_OFFSET_VD6286 && message.len() == VD6286_COLOR_REPORT_LEN => {
+                // Zero and negative CCT do not describe a colour temperature.
+                report_float(message, CCT_OFFSET_VD6286).filter(|value| *value != 0)
+            }
+            _ => None,
+        }
+    }
+}
+
+enum AlsIio {
+    Light {
+        _registration: IIORegistration<MsgProc>,
+    },
+    Color {
+        _registration: IIORegistration<MsgProc, 2>,
+    },
 }
 
 struct IIOAopAlsDriver {
     /// Declared first: the subscription ends before the IIO device goes.
     listener: FakehidRegistration,
-    _iio: IIORegistration<MsgProc>,
+    _iio: AlsIio,
+}
+
+fn register_channels<const N: usize>(
+    pdev: &platform::Device,
+    aop: &Arc<dyn AOP>,
+    service: EPICService,
+    offset: usize,
+    types: [u32; N],
+) -> Result<(FakehidRegistration, IIORegistration<MsgProc, N>)> {
+    let data = AopSensorData::new_channels(pdev.as_ref().into(), types, MsgProc(offset))?;
+    let listener = FakehidRegistration::new(aop.clone(), service, data.clone())?;
+    enable_als(aop.as_ref(), pdev, &service, offset)?;
+    let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
+    let iio = IIORegistration::new_channels(
+        data,
+        c"aop-sensors-als",
+        types,
+        info_mask,
+        kernel::module::this_module::<crate::LocalModule>(),
+    )?;
+    Ok((listener, iio))
 }
 
 kernel::of_device_table!(
@@ -208,12 +262,29 @@ impl platform::Driver for IIOAopAlsDriver {
         let service = unsafe { *service };
         let ty = bindings::BINDINGS_IIO_LIGHT;
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
-        let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
-        let listener = FakehidRegistration::new(adata.clone(), service, data.clone())?;
-        enable_als(adata.as_ref(), pdev, &service, offset)?;
-        let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
-        let iio =
-            IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, kernel::module::this_module::<crate::LocalModule>())?;
+        let (listener, iio) = if offset == LUX_OFFSET_VD6286 {
+            let (listener, registration) = register_channels(
+                pdev,
+                &adata,
+                service,
+                offset,
+                [ty, bindings::BINDINGS_IIO_CCT],
+            )?;
+            (
+                listener,
+                AlsIio::Color {
+                    _registration: registration,
+                },
+            )
+        } else {
+            let (listener, registration) = register_channels(pdev, &adata, service, offset, [ty])?;
+            (
+                listener,
+                AlsIio::Light {
+                    _registration: registration,
+                },
+            )
+        };
         Ok(IIOAopAlsDriver {
             listener,
             _iio: iio,

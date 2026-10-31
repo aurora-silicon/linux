@@ -121,6 +121,10 @@ const EPIC_CATEGORY_NOTIFY: u8 = 0x10;
 const EPIC_CATEGORY_REPLY: u8 = 0x20;
 const EPIC_SUBTYPE_STD_SERVICE: u16 = 0xc0;
 const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
+/// The T8132 firmware sends its gyroscope and accelerometer samples with
+/// these report subtypes; they carry the same payload as a fake-HID report.
+const EPIC_SUBTYPE_GYRO_REPORT: u16 = 0xc1;
+const EPIC_SUBTYPE_ACCEL_REPORT: u16 = 0xc2;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
 const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
@@ -756,7 +760,10 @@ impl AFKEndpoint {
                 let name = &name[..name.iter().position(|x| *x == 0).unwrap_or(name.len())];
                 let chan = le_u32(data, EPIC_ANNOUNCE_CHANNEL_OFFSET);
                 return Into::<Arc<_>>::into(client).register_service(self, chan, name);
-            } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
+            } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT
+                || subtype == EPIC_SUBTYPE_GYRO_REPORT
+                || subtype == EPIC_SUBTYPE_ACCEL_REPORT
+            {
                 return client.process_fakehid_report(self, qhdr.channel, data);
             } else if client.process_report(self, qhdr.channel, subtype, data)? {
                 return Ok(());
@@ -1471,6 +1478,8 @@ impl AopData {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
             b"als" => c_str!("als"),
+            b"accel" => c_str!("accel"),
+            b"gyro" => c_str!("gyro"),
             _ => {
                 return Ok(());
             }

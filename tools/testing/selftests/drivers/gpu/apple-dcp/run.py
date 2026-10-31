@@ -27,11 +27,13 @@ import transaction
 import accounting
 import idle
 import desktop
+import audio
 import j616s
 import rate
 import boot
 import m4
 import display
+import colorimetry
 
 
 def parking_unit(root):
@@ -43,7 +45,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[6])
     parser.add_argument('--output', type=Path, help='retain generated C, commands and results here')
-    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot', 'quiesce', 'm4', 'display'), default='all')
+    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot', 'quiesce', 'm4', 'display', 'audio'), default='all')
     args = parser.parse_args()
     root = args.source.resolve()
     output = args.output or Path(tempfile.mkdtemp(prefix='apple-dcp-selftest-'))
@@ -54,6 +56,9 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
+        ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
+        ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),
         ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
@@ -156,6 +161,9 @@ def main():
                     prefix += ('#define APPLE_RTKIT_EP_COREANALYTICS ' + endpoint + '\n'
                                '#define apple_rtkit_coreanalytics_rx(...) '
                                'assert(!"CoreAnalytics is outside this ordered-display fixture")\n')
+                    # The T6050 PMP registry-v2 buffer shares endpoint 7.
+                    prefix += ('#define apple_rtkit_pmp_aux_rx(...) '
+                               'assert(!"The PMP auxiliary buffer is outside this ordered-display fixture")\n')
                 unit = prefix + unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)

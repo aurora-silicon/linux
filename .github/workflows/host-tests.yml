@@ -1,0 +1,92 @@
+name: Host tests
+
+# Every host-side test of the Aurora drivers: tools/asahi (with their mutation
+# and old-code controls) and the apple-dcp, apple-afkv2, asahi-g15 and asahi-m4
+# selftests. They extract production code from this tree and build it on the
+# host, so a driver change can break them while the kernel build stays green.
+
+on:
+  push:
+    branches: [integration/aurora, aurora-wip]
+  pull_request:
+    branches: [integration/aurora, aurora-wip]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: '1.96.0'
+  CLANG_VERSION: '18'
+  GCC_VERSION: '13'
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Negative controls read older revisions with `git show`, so keep the
+      # whole history. Trees and blobs of old commits load on demand.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Cache the Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.rustup/toolchains/${{ env.RUST_VERSION }}-x86_64-unknown-linux-gnu
+          key: rustup-${{ runner.os }}-${{ env.RUST_VERSION }}
+
+      - name: Pin the host toolchains
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+          # Tests that would pick their own rustup toolchain use this one.
+          echo "HOSTRUSTC=rustc" >> "$GITHUB_ENV"
+          need=
+          for p in clang-$CLANG_VERSION gcc-$GCC_VERSION flex bison bc; do
+            command -v "$p" >/dev/null || need="$need $p"
+          done
+          command -v "ld.lld-$CLANG_VERSION" >/dev/null || need="$need lld-$CLANG_VERSION"
+          dpkg -s "libclang-rt-$CLANG_VERSION-dev" >/dev/null 2>&1 || need="$need libclang-rt-$CLANG_VERSION-dev"
+          if [ -n "$need" ]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q $need
+          fi
+          # The tests call clang, ld.lld, cc and gcc by name.
+          bin="$RUNNER_TEMP/toolchain"
+          mkdir -p "$bin"
+          ln -sf "$(command -v clang-$CLANG_VERSION)" "$bin/clang"
+          ln -sf "$(command -v ld.lld-$CLANG_VERSION)" "$bin/ld.lld"
+          ln -sf "$(command -v gcc-$GCC_VERSION)" "$bin/gcc"
+          ln -sf "$(command -v gcc-$GCC_VERSION)" "$bin/cc"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Show the toolchains
+        run: |
+          python3 --version
+          rustc --version
+          clang --version | head -1
+          ld.lld --version
+          cc --version | head -1
+          git --version
+
+      - name: Run the host tests
+        run: python3 -I tools/asahi/run-host-tests.py --jobs "$(nproc)" --work "$RUNNER_TEMP/host-tests"
+
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-test-logs
+          path: ${{ runner.temp }}/host-tests/**/log
+          retention-days: 14

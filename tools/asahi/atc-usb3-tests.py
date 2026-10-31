@@ -74,7 +74,7 @@ typedef uint32_t u32;
 
 STUBS = r'''
 struct atcphy_hw { enum atcphy_generation gen;
-    bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy; };
+    bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy, usb2_only; };
 struct device_node { const char *const *compatible; unsigned int count; };
 static bool of_device_is_compatible(const struct device_node *root, const char *compatible) {
     if (!root) return false;
@@ -95,6 +95,9 @@ struct apple_atcphy {
     enum atcphy_mode typec_mode;
     bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
+    /* T8132 state: the modeled machines never select that generation. */
+    bool t8132_ss, t8132_common_owned, t8132_failed;
+    struct { void *usb3_dp; } tunables;
 };
 struct phy { struct apple_atcphy *data; };
 struct typec_mux_dev { struct apple_atcphy *data; };
@@ -168,6 +171,16 @@ static struct apple_atcphy *typec_mux_get_drvdata(struct typec_mux_dev *m) { ret
 static void atcphy_restore_after_pd_off(struct apple_atcphy *a) { (void)a; restore_calls++; }
 static int atcphy_usb2_power_off(struct apple_atcphy *a) {
     (void)a; usb2_power_off_calls++; return 0;
+}
+/* T8132 back ends: out of scope, and never reached by the modeled generations. */
+static int atcphy_configure_t8132(struct apple_atcphy *a, enum atcphy_mode mode) {
+    (void)a; (void)mode; assert(!"T8132 lane setup reached"); return -EINVAL;
+}
+static int atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *a) {
+    (void)a; assert(!"T8132 PIPE setup reached"); return -EINVAL;
+}
+static void atcphy_usb2_power_on(struct apple_atcphy *a) {
+    (void)a; assert(!"USB2-only power restore reached");
 }
 static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode) {
     /* ACTUAL_CONFIGURE_ENTRY */
@@ -619,6 +632,7 @@ def harness(source):
     end = source.index("\n};", source.index("} atcphy_modes[] = {", start)) + 3
     table = source[start:end]
     function_specs = [
+        ("int", "atcphy_pipehandler_lock_timeout"),
         ("int", "atcphy_pipehandler_lock"),
         ("int", "atcphy_pipehandler_lock_live"),
         ("int", "atcphy_configure_pipehandler_usb3"),
@@ -662,7 +676,7 @@ def harness(source):
 MUTATIONS = {'no-live-retry': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 1 : 1;'),
  'retry-later-generations': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 10 : 10;'),
  'sleep-after-last': ('atcphy_pipehandler_lock_live', 'if (attempt + 1 < attempts)', 'if (true)'),
- 'missing-ack-check': ('atcphy_pipehandler_lock',
+ 'missing-ack-check': ('atcphy_pipehandler_lock_timeout',
                        'if (requested & PIPEHANDLER_LOCK_EN) {',
                        'if (requested & PIPEHANDLER_LOCK_EN) return 0;\n'
                        '\tif (requested & PIPEHANDLER_LOCK_EN) {'),

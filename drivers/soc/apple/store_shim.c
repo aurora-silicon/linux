@@ -83,6 +83,14 @@ void *sep_store_open_trunc(const char *path)
 	return IS_ERR(f) ? NULL : f;
 }
 
+/* Admission check only: never create or truncate an existing record. */
+void *sep_store_open_writable_existing(const char *path)
+{
+	struct file *f = open_as_kernel(path, O_WRONLY | O_LARGEFILE, 0);
+
+	return IS_ERR(f) ? NULL : f;
+}
+
 /*
  * Opens an existing file read-only, NULL if absent. O_RDONLY and no O_CREAT so
  * the seed cannot be created, truncated or written by mistake.

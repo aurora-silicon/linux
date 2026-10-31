@@ -1,0 +1,72 @@
+name: SEP source checks
+
+on:
+  pull_request:
+    paths:
+      - 'drivers/soc/apple/**'
+      - 'include/uapi/linux/apple-sep.h'
+      - 'tools/aurora-sep/**'
+      - '.github/workflows/sep-source.yml'
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            drivers/soc/apple/**
+            include/uapi/linux/apple-sep.h
+            tools/aurora-sep/**
+      - name: Check biometric ioctl ABI sizes
+        run: |
+          cat > /tmp/sep-abi.c <<'EOF'
+          #include <linux/apple-sep.h>
+          _Static_assert(sizeof(struct sep_bio_enrol_start) == 144, "enrol ABI");
+          _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
+          _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
+          int main(void) { return 0; }
+          EOF
+          cc -Wall -Werror -Iinclude/uapi /tmp/sep-abi.c -o /tmp/sep-abi
+          /tmp/sep-abi
+      - name: Test recovery utility and package sources
+        run: |
+          python3 -m unittest tools/aurora-sep/tests/test_sep_bio_identities.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_orphan_delete.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_enrol_admission.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_owner_preparation.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
+
+  rust-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl
+          rustup component add rust-src
+      - name: Prepare the layout-corrected bindgen
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: python3 tools/aurora-bindgen/build.py
+      - name: Compile Apple SEP module for arm64
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: |
+          make LLVM=1 ARCH=arm64 rustavailable
+          make LLVM=1 ARCH=arm64 defconfig
+          scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/asahi.config
+          scripts/config -e KUNIT -e APPLE_SEP_KUNIT_TEST
+          make LLVM=1 ARCH=arm64 olddefconfig
+          grep -qx 'CONFIG_APPLE_SEP=m' .config
+          grep -qx 'CONFIG_APPLE_SEP_KUNIT_TEST=y' .config
+          make -j2 LLVM=1 ARCH=arm64 modules_prepare
+          make -j2 LLVM=1 ARCH=arm64 drivers/soc/apple/apple-sep.o

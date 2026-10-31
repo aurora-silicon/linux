@@ -94,7 +94,7 @@ fn performance_source(regions: &[Range<u64>]) -> Result<(KVVec<u8>, u64)> {
     let (start, size) = source.ok_or(ENODEV)?;
     // SAFETY: The sole accepted DT source above is the bounded reserved original ADT export.
     // WB matches its System RAM mapping; no writes are made through this temporary mapping.
-    let mapping = unsafe { bindings::memremap(start, size, bindings::MEMREMAP_WB as _) };
+    let mapping = unsafe { bindings::memremap(start, size, bindings::MEMREMAP_WB as usize) };
     if mapping.is_null() {
         return Err(ENOMEM);
     }

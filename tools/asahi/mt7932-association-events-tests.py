@@ -52,6 +52,8 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define NL80211_CHAN_WIDTH_40 1
 #define NL80211_CHAN_WIDTH_80 2
 #define WLAN_REASON_UNSPECIFIED 1
+#define WLAN_EID_HT_CAPABILITY 45
+struct element {u8 id,datalen,data[];};
 #define WLAN_EID_EXTENSION 255
 #define WLAN_EID_EXT_HE_CAPABILITY 35
 #define dev_info(...) ((void)0)
@@ -74,7 +76,6 @@ static void complete(struct completion*c){if(c->done!=UINT_MAX)c->done++;}
 static void complete_all(struct completion*c){c->done=UINT_MAX;}
 struct ieee80211_channel {int center_freq;};
 struct cfg80211_chan_def {struct ieee80211_channel *chan;int width,center_freq1;};
-struct element {u8 data[32];};
 struct test_band {struct {bool ht_supported;}ht_cap;};
 struct test_wiphy {struct test_band *bands[NUM_NL80211_BANDS];};
 static struct test_wiphy wiphy;
@@ -84,7 +85,7 @@ struct mt7932 {
  bool connecting,connected,disconnecting,disconnect_seen,disconnect_event_received;
  bool disconnect_local,connect_open,assoc_request_seen,peer_valid,link_failed,stopping,rf_ready;
  u8 connect_channel,connect_center,peer_wtbl,smart_version,waiting;
- enum nl80211_band connect_band; u8 six_assoc_power[2][1020];
+ enum nl80211_band connect_band; u8 six_assoc_power[2][1020]; bool six_legacy_assoc;
  int waiting_eid;
  struct cfg80211_chan_def connect_chandef;
  struct test_band band2,band5;
@@ -108,6 +109,13 @@ static bool cfg80211_chandef_valid(const struct cfg80211_chan_def*d){return true
 static bool cfg80211_chandef_usable(void*w,const struct cfg80211_chan_def*d,int flags){return usable;}
 static bool mt7932_assoc_phy_valid(const void*b,const void*p,size_t n){return true;}
 static const struct element *cfg80211_find_ext_elem(int id,const void*p,size_t n){return NULL;}
+/* The HT lookup feeds a debug log; it walks only the exported request IEs. */
+static unsigned ht_lookups;static const void *ht_found;
+static const struct element *cfg80211_find_elem(int id,const void*p,size_t n){
+ const u8*b=p;size_t o=0;assert(id==WLAN_EID_HT_CAPABILITY&&p&&n<=512);ht_lookups++;ht_found=NULL;
+ while(n-o>=2&&b[o+1]<=n-o-2){if(b[o]==id)return ht_found=b+o;o+=2+b[o+1];}
+ return NULL;
+}
 static void netif_carrier_off(void*n){}
 static void netif_stop_queue(void*n){}
 static void schedule_work(void*w){scheduled++;}
@@ -209,6 +217,12 @@ int main(void){struct mt7932 m;unsigned cases=0;
  reset(&m,SUCCESS);u8 rejected[52]={};put_unaligned_le16(1,rejected);
  receive(&m,0xee,0,rejected,sizeof(rejected),0x40);
  assert(m.connect_error==-ECONNREFUSED&&m.assoc_start.done&&m.assoc_done.done&&!m.peer_valid);cases++;
+ // The generated request IEs are exported once; the HT log reads the copy.
+ reset(&m,SUCCESS);u8 ies[32]={};put_unaligned_le32(28,ies);ies[4]=WLAN_EID_HT_CAPABILITY;ies[5]=26;for(unsigned i=0;i<26;i++)ies[6+i]=i+1;ht_lookups=0;
+ receive(&m,0xee,0,ies,sizeof(ies),0x5e);
+ assert(!m.connect_error&&m.assoc_request_seen&&m.assoc_request_ie_len==28&&!memcmp(m.assoc_request_ies,ies+4,28)&&ht_lookups==1&&ht_found==m.assoc_request_ies);cases++;
+ reset(&m,SUCCESS);ies[5]=25;ht_lookups=0;receive(&m,0xee,0,ies,sizeof(ies),0x5e);
+ assert(m.connect_error==-EPROTO&&!m.assoc_request_seen&&!ht_lookups&&m.assoc_start.done&&m.assoc_done.done);cases++;
  printf("PASS %u association event/wait/calibration ownership controls\n",cases);
 }
 '''

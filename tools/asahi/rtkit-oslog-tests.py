@@ -45,14 +45,14 @@ struct apple_rtkit {
  void *dev, *wq;
  struct mailbox *mbox;
  struct apple_rtkit_shmem oslog_buffer, syslog_buffer, ioreport_buffer, crashlog_buffer;
- struct apple_rtkit_shmem kdebug_buffer0, kdebug_buffer1;
+ struct apple_rtkit_shmem kdebug_buffer0, kdebug_buffer1, coreanalytics_buffer, pmp_aux_buffer;
  int sync_ack_fifo;
  bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
  unsigned iop_power_state, ap_power_state;
  unsigned long endpoints[4];
  char *syslog_msg_buffer;
  size_t syslog_n_entries, syslog_msg_size;
- int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion;
+ int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion, coreanalytics_completion;
 };
 static unsigned sent, warnings, errors, requests, detachments, flushes, freed, checks;
 static int send_error, setup_error, start_error;
@@ -121,11 +121,16 @@ int main(void)
  for (unsigned fail=0;fail<2;fail++) {
   memset(&r,0,sizeof(r));r.mbox=&m;apple_rtkit_mark_running(&r);
   assert(r.oslog_inherited && (r.endpoints[0]&(1UL<<APPLE_RTKIT_EP_OSLOG)));
-  r.oslog_buffer.size=4096;r.crashed=true;r.syslog_msg_size=128;
+  struct apple_rtkit_shmem *buffers[]={&r.oslog_buffer,&r.syslog_buffer,&r.ioreport_buffer,
+   &r.crashlog_buffer,&r.kdebug_buffer0,&r.kdebug_buffer1,&r.coreanalytics_buffer,&r.pmp_aux_buffer};
+  for (unsigned i=0;i<ARRAY_SIZE(buffers);i++) buffers[i]->size=4096;
+  r.crashed=true;r.syslog_msg_size=128;
   detachments=flushes=freed=0;start_error=fail?-5:0;
   assert(apple_rtkit_reinit(&r)==start_error);
   assert(!r.oslog_inherited && !r.syslog_inherited && !r.crashlog_inherited);
-  assert(!r.oslog_buffer.size && !r.crashed && !r.syslog_msg_size && freed==6);
+  assert(!r.crashed && !r.syslog_msg_size && freed==ARRAY_SIZE(buffers));
+  // Every buffer of the old firmware session goes, the OSLog one included.
+  for (unsigned i=0;i<ARRAY_SIZE(buffers);i++) assert(!buffers[i]->size);
   assert(r.endpoints[0]==(1UL<<APPLE_RTKIT_EP_MGMT));
   assert(detachments==(fail?2U:1U) && flushes==(fail?2U:1U));
   event(&r,type|1,false);++checks;
@@ -145,7 +150,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ref', help='Git source revision to exercise')
     parser.add_argument('--out', type=Path)
-    parser.add_argument('--mutate', choices=['admission', 'channel', 'counter', 'reset'])
+    parser.add_argument('--mutate', choices=['admission', 'channel', 'counter', 'reset', 'buffer'])
     args = parser.parse_args()
     source = subprocess.check_output(['git', 'show', args.ref + ':' + DRIVER], cwd=ROOT, text=True) if args.ref else (ROOT / DRIVER).read_text()
     constants = '\n'.join(re.findall(r'^#define APPLE_RTKIT_OSLOG_.*$', source, re.M))
@@ -162,6 +167,12 @@ def main():
         bodies = bodies.replace('msg, NULL, false);', '(msg & ~0xffffffffULL) | ((u32)msg % 4096), NULL, false);')
     elif args.mutate == 'reset':
         bodies = bodies.replace('rtk->oslog_inherited = false;', 'rtk->oslog_inherited = true;')
+    elif args.mutate == 'buffer':
+        bodies = bodies.replace('apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);', '')
+    # A mutation that no longer matches the driver would test nothing.
+    assert not args.mutate or bodies != '\n'.join(
+        function(source, name) for name in ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running', 'apple_rtkit_reinit']), \
+        'stale mutation: ' + args.mutate
     code = PREFIX.replace('struct apple_rtkit_shmem', constants + '\nstruct apple_rtkit_shmem', 1) + bodies + MAIN
 
     def run(out):

@@ -14,7 +14,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define SEP_BIO_IFACE_VERSION  4
+#define SEP_BIO_IFACE_VERSION  5
 
 #define SEP_BIO_UUID_LEN       16
 #define SEP_BIO_LABEL_LEN      128
@@ -64,8 +64,20 @@ struct sep_bio_list {
 
 struct sep_bio_enrol_start {
 	__u32 flags;
+	__u32 account_uid; /* resolved passwd uid; UINT32_MAX is invalid */
+	__u32 finger;      /* FP_FINGER_LEFT_THUMB..FP_FINGER_RIGHT_LITTLE (1..10) */
 	__u32 reserved;
 	__u8  label[SEP_BIO_LABEL_LEN];
+};
+
+/* Linux's built-in SEP user context only. This does not enumerate other SEP
+ * users or OS lanes. DELETE_ORPHAN uses an exact UUID; the kernel index may
+ * still hold it when fprintd has already lost its own record.
+ */
+struct sep_bio_enclave_list {
+	__u32 count;
+	__u32 reserved;
+	__u8 uuid[SEP_BIO_MAX_IDENTITIES][SEP_BIO_UUID_LEN];
 };
 
 #define SEP_BIO_GUIDANCE_NONE          0
@@ -129,5 +141,11 @@ struct sep_bio_attest {
 #define SEP_BIO_DELETE       _IOW(SEP_BIO_IOC_MAGIC, 0x08, struct sep_bio_delete)
 #define SEP_BIO_DELETE_ALL   _IO(SEP_BIO_IOC_MAGIC, 0x09)
 #define SEP_BIO_ATTEST       _IOWR(SEP_BIO_IOC_MAGIC, 0x0a, struct sep_bio_attest)
+#define SEP_BIO_LIST_ENCLAVE _IOR(SEP_BIO_IOC_MAGIC, 0x0b, struct sep_bio_enclave_list)
+#define SEP_BIO_DELETE_ORPHAN _IOW(SEP_BIO_IOC_MAGIC, 0x0c, struct sep_bio_delete)
+/* Creates the empty Linux owner context only when SEP lists zero Linux
+ * identities. ENROL_START itself never repairs a missing persistence binding.
+ */
+#define SEP_BIO_PREPARE_ENROL _IOW(SEP_BIO_IOC_MAGIC, 0x0d, struct sep_bio_enrol_start)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

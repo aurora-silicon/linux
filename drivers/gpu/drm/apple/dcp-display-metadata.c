@@ -89,26 +89,14 @@ static s64 dcp_metadata_side(const u32 *a, const u32 *b, const u32 *point)
 	       ((s64)b[1] - a[1]) * ((s64)point[0] - a[0]);
 }
 
-/* Build only a base block: the authoritative firmware mode list stays separate. */
-static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metadata *metadata,
-			      const struct drm_display_mode *mode)
+/* Validate the complete colour description before changing any EDID bytes. */
+static int dcp_metadata_color(struct edid *edid, const struct dcp_display_metadata *metadata)
 {
-	u32 coordinate[8], manufacturer = 0, gamma;
-	u8 checksum = 0;
-	int ret;
+	u32 coordinate[8], gamma;
 
-	if (!metadata->width_cm || metadata->width_cm > 255 ||
-	    !metadata->height_cm || metadata->height_cm > 255 ||
-	    metadata->product > U16_MAX || metadata->week > 53 ||
-	    metadata->year < 1990 || metadata->year > 2245 ||
-	    metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100 ||
-	    strnlen(metadata->manufacturer, 4) != 3)
+	if (metadata->gamma &&
+	    (metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100))
 		return -EINVAL;
-	for (unsigned int i = 0; i < 3; i++) {
-		if (metadata->manufacturer[i] < 'A' || metadata->manufacturer[i] > 'Z')
-			return -EINVAL;
-		manufacturer = manufacturer << 5 | (metadata->manufacturer[i] - '@');
-	}
 	for (unsigned int i = 0; i < 8; i++) {
 		u32 value = i < 6 ? metadata->chromaticity[i / 2][i % 2] : metadata->white[i - 6];
 
@@ -134,9 +122,47 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 				return -EINVAL;
 		}
 	}
-	gamma = DIV_ROUND_CLOSEST(metadata->gamma * 100, 65536) - 100;
-	if (gamma > 254)
+	gamma = metadata->gamma ?
+		DIV_ROUND_CLOSEST(metadata->gamma * 100, 65536) - 100 : 255;
+	if (metadata->gamma && gamma > 254)
 		return -EINVAL;
+
+	edid->gamma = gamma;
+	edid->red_green_lo = (coordinate[0] & 3) << 6 | (coordinate[1] & 3) << 4 |
+			     (coordinate[2] & 3) << 2 | (coordinate[3] & 3);
+	edid->blue_white_lo = (coordinate[4] & 3) << 6 | (coordinate[5] & 3) << 4 |
+			      (coordinate[6] & 3) << 2 | (coordinate[7] & 3);
+	edid->red_x = coordinate[0] >> 2;
+	edid->red_y = coordinate[1] >> 2;
+	edid->green_x = coordinate[2] >> 2;
+	edid->green_y = coordinate[3] >> 2;
+	edid->blue_x = coordinate[4] >> 2;
+	edid->blue_y = coordinate[5] >> 2;
+	edid->white_x = coordinate[6] >> 2;
+	edid->white_y = coordinate[7] >> 2;
+	return 0;
+}
+
+/* Build only a base block: the authoritative firmware mode list stays separate. */
+static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metadata *metadata,
+			      const struct drm_display_mode *mode)
+{
+	u32 manufacturer = 0;
+	u8 checksum = 0;
+	int ret;
+
+	if (!metadata->width_cm || metadata->width_cm > 255 ||
+	    !metadata->height_cm || metadata->height_cm > 255 ||
+	    metadata->product > U16_MAX || metadata->week > 53 ||
+	    metadata->year < 1990 || metadata->year > 2245 ||
+	    metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100 ||
+	    strnlen(metadata->manufacturer, 4) != 3)
+		return -EINVAL;
+	for (unsigned int i = 0; i < 3; i++) {
+		if (metadata->manufacturer[i] < 'A' || metadata->manufacturer[i] > 'Z')
+			return -EINVAL;
+		manufacturer = manufacturer << 5 | (metadata->manufacturer[i] - '@');
+	}
 
 	memset(edid, 0, sizeof(*edid));
 	memcpy(edid->header, "\x00\xff\xff\xff\xff\xff\xff\x00", 8);
@@ -151,20 +177,10 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 	edid->input = DRM_EDID_INPUT_DIGITAL;
 	edid->width_cm = metadata->width_cm;
 	edid->height_cm = metadata->height_cm;
-	edid->gamma = gamma;
+	ret = dcp_metadata_color(edid, metadata);
+	if (ret)
+		return ret;
 	edid->features = DRM_EDID_FEATURE_PREFERRED_TIMING | DRM_EDID_FEATURE_RGB;
-	edid->red_green_lo = (coordinate[0] & 3) << 6 | (coordinate[1] & 3) << 4 |
-			     (coordinate[2] & 3) << 2 | (coordinate[3] & 3);
-	edid->blue_white_lo = (coordinate[4] & 3) << 6 | (coordinate[5] & 3) << 4 |
-			      (coordinate[6] & 3) << 2 | (coordinate[7] & 3);
-	edid->red_x = coordinate[0] >> 2;
-	edid->red_y = coordinate[1] >> 2;
-	edid->green_x = coordinate[2] >> 2;
-	edid->green_y = coordinate[3] >> 2;
-	edid->blue_x = coordinate[4] >> 2;
-	edid->blue_y = coordinate[5] >> 2;
-	edid->white_x = coordinate[6] >> 2;
-	edid->white_y = coordinate[7] >> 2;
 	memset(edid->standard_timings, 1, sizeof(edid->standard_timings));
 	ret = dcp_metadata_timing(&edid->detailed_timings[0], mode, metadata);
 	if (!ret)
@@ -400,6 +416,8 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	block.white_x = 320 >> 2;
 	block.white_y = 337 >> 2;
 	block.blue_white_lo = (320 & 3) << 2 | (337 & 3);
+	/* Missing or malformed optional colour data leaves the identity usable. */
+	dcp_metadata_color(&block, metadata);
 	block.features = DRM_EDID_FEATURE_PREFERRED_TIMING;
 	memset(block.standard_timings, 1, sizeof(block.standard_timings));
 	snprintf(name, sizeof(name), "%.3s %04x", metadata->manufacturer, metadata->product);

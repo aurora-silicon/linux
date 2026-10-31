@@ -490,6 +490,7 @@ static inline void tipd_debugfs_exit(void) { }
 
 #if IS_ENABLED(CONFIG_KUNIT)
 void cd321x_init_work(struct cd321x *cd321x);
+int cd321x_init_mux(struct cd321x *cd321x);
 bool cd321x_tbt_switch_keep_waiting(struct device *dev);
 struct typec_thunderbolt_switch *
 cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode);

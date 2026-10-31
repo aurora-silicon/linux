@@ -243,7 +243,7 @@ impl Scheduler {
             hw::sizes::HORIZON_JOBS,
             0,
             hw::tuning::SCHED_TIMEOUT_MS,
-            c_str!("asahi_g15"),
+            c_str!("aurora_g15"),
         )?;
         // With one run queue, only the kernel priority is valid.
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;

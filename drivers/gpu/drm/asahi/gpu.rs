@@ -260,9 +260,8 @@ pub(crate) struct GpuManager {
     stats: Arc<stats::StatsSnapshot>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
-    #[allow(clippy::vec_box)]
     #[pin]
-    garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
+    garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
 }
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
@@ -312,7 +311,7 @@ pub(crate) trait Gpu: Send + Sync {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
         if self.soft_faults() && self.supports_soft_faults() {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
         }
         flags
     }
@@ -368,6 +367,7 @@ pub(crate) trait Gpu: Send + Sync {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>>;
     /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
     fn map_timestamp_buffer(
@@ -416,8 +416,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn get_cfg(&self) -> &'static hw::HwConfig;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
-    /// Register an unused context as garbage
-    fn free_context(&self, data: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>);
+    /// Register an unused context, with the objects it retains, for invalidation.
+    fn free_context(&self, ctx: workqueue::RetiredContext);
 }
 
 /// Private generic trait for functions that don't need to escape this module.
@@ -1100,7 +1100,7 @@ impl GpuManager::ver {
                     virt_addr: U64(iova + off as u64),
                     total_size: (map.size * map.count * dies) as u32,
                     element_size: map.size as u32,
-                    readwrite: U64(map.writable as u64),
+                    readwrite: U64(u64::from(map.writable)),
                 };
             });
 
@@ -1150,20 +1150,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(fault) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
             }
             info
         })
@@ -1412,6 +1406,7 @@ impl Gpu for GpuManager::ver {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>> {
         let mut kalloc = self.alloc();
         let id = self.ids.queue.next();
@@ -1429,6 +1424,7 @@ impl Gpu for GpuManager::ver {
                 id,
                 priority,
                 usc_exec_base,
+                usage,
             )?,
             GFP_KERNEL,
         )?)
@@ -1471,7 +1467,7 @@ impl GpuManager for GpuManager::ver {
         core::mem::swap(&mut *self.garbage_contexts.lock(), &mut garbage_ctx);
 
         for ctx in garbage_ctx {
-            if self.invalidate_context(&ctx).is_err() {
+            if self.invalidate_context(&ctx.data).is_err() {
                 dev_err!(
                     self.dev.as_ref(),
                     "GpuContext: Failed to invalidate GPU context!\n"
@@ -1480,6 +1476,9 @@ impl GpuManager for GpuManager::ver {
                     panic!("GPU firmware timed out");
                 }
             }
+            // The firmware no longer knows the context's queues, so their structures may go now,
+            // ahead of the context data they point to.
+            core::mem::drop(ctx.retained);
         }
 
         let mut guard = self.alloc.lock();
@@ -1748,7 +1747,7 @@ impl GpuManager for GpuManager::ver {
         &self.dyncfg
     }
 
-    fn free_context(&self, ctx: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>) {
+    fn free_context(&self, ctx: workqueue::RetiredContext) {
         let mut garbage = self.garbage_contexts.lock();
 
         if garbage.push(ctx, GFP_KERNEL).is_err() {

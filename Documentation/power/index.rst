@@ -8,6 +8,7 @@ Power Management
     :maxdepth: 1
 
     apm-acpi
+    apple-s2idle
     basic-pm-debugging
     charger-manager
     drivers-testing
