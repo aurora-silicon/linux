@@ -19,6 +19,7 @@ struct transport {
 static int feed(void *cookie, struct avdq_frame *f)
 {
 	struct transport *t = cookie;
+
 	t->vp[f->desc.fifo] = f->vp;
 	f->pushed = f->desc.program_words;
 	return 1;
@@ -26,12 +27,14 @@ static int feed(void *cookie, struct avdq_frame *f)
 static void kick(void *cookie, uint32_t word)
 {
 	struct transport *t = cookie;
+
 	assert((word & 0xff000000U) == AVDQ_EXEC);
 	t->kicks++;
 }
 static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
 {
 	struct transport *t = cookie;
+
 	assert(avd_open_completion(avdq_notification(f->desc.tag, idx), f->desc.tag));
 	assert(avd_slot_complete(&t->host[idx], f->desc.tag, f->status ? -EIO : 0));
 	t->tags[t->completed++] = f->desc.tag;
@@ -44,6 +47,7 @@ static void submit(struct avdq *q, struct transport *t, unsigned int idx,
 	struct avd_frame *h = &t->host[idx];
 	struct avd_open_desc wire = {0};
 	struct avdq_desc desc;
+
 	h->idx = idx;
 	assert(!avd_slot_reserve(h, ctx, seq));
 	assert(h->dep == AVD_DEP_PREV_DONE);
@@ -111,6 +115,7 @@ int main(void)
 	assert(avd_slot_first(t.host, &t.host[0]));
 	t.host[0].state = AVD_FRAME_FREE;
 	assert(avd_slot_first(t.host, &t.host[1]));
-	puts("PASS: two host contexts concurrently on VP0/VP1, all eight images, FIFO caps and ordered tagged completion");
+	puts("PASS: two host contexts concurrently on VP0/VP1, all eight images, "
+	     "FIFO caps and ordered tagged completion");
 	return 0;
 }
