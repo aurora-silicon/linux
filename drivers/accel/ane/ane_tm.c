@@ -4,6 +4,7 @@
 #include <linux/device.h>
 #include <linux/iopoll.h>
 #include <linux/pm_runtime.h>
+#include <linux/pm_domain.h>
 #include <linux/module.h>
 #include "ane_tm.h"
 
@@ -266,6 +267,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	struct ane_dart_scratch *scratch = ane->scratch;
 	bool faulted = false;
 	int err, status;
+	ktime_t deadline = ktime_add_ms(ktime_get(), 1000);
 
 	lockdep_assert_held(&ane->engine_lock);
 	ane_dart_mask(ane);
@@ -280,6 +282,10 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	ane_tm_push_tq(ane, req);
 
 	for (;;) {
+		if (ktime_compare(ktime_get(), deadline) >= 0) {
+			err = -ETIMEDOUT;
+			break;
+		}
 		/* Latch-first completion poll. Engine register reads hang
 		 * the SoC (T8103) once a DART fault has landed, inside the
 		 * 1-microsecond completion poll and before any fault
@@ -289,10 +295,13 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		 * iteration's latch read and engine read.
 		 */
 		err = read_poll_timeout(ane_tm_poll_step, status,
-					status != 0, 1, 1000000, false,
+					status != 0 || ktime_compare(ktime_get(), deadline) >= 0,
+					1, 1000000, false,
 					ane, req, &finished);
 		if (!err && status < 0)
 			err = status;
+		if (!err && !status)
+			err = -ETIMEDOUT;
 		if (ane_dart_faulted(ane, &fault_iova, &fault_status)) {
 			faulted = true;
 			if (ane->scratch_pages >= ANE_DART_SCRATCH_MAX)
@@ -366,38 +375,18 @@ wedge:
 	 * and return to accepting work. Only a failed reset preserves
 	 * resources until reboot.
 	 */
-	if (ane_tm_recover(ane) < 0) {
-		if (ane->tm_retention)
-			dev_err(ane->dev,
-				"recovery failed; preserving resources until module reload or reboot (tm/tq file retained through the cycle: the latched task error parks the TM in place; rmmod+insmod restores service)\n");
-		else
-			dev_err(ane->dev,
-				"recovery failed; preserving resources until reboot\n");
-	}
+	if (ane_tm_recover(ane) < 0)
+		dev_err(ane->dev,
+			"recovery failed; submissions disabled, resources retained while DMA may be active; retry reset or reboot\n");
 	return err;
 }
 
 /*
- * Bounded recovery after a failed task. The only reset this driver knows
- * is the partition power cycle system sleep already performs on this
- * hardware. With the several ANE power partitions attached as genpd
- * devices (T8103 five, T6001 similar), gating happens on those devices;
- * with a single domain attached directly to the device, on the device
- * itself. Gating the partitions stops any DMA still fetching the dead
- * task and clears the tm register file; ungating brings the engine back
- * through the probe resume path (ane_tm_enable), then the task manager
- * must report idle. BO mappings deliberately stay in place: they remain
- * coherent through the cycle and valid for the next submit, and once the
- * wedge clears, BO_FREE unmaps them through the normal path again.
- * Callers hold engine_lock.
- *
- * T6001 note: its set0/base islands are
- * firmware-locked (direct pmgr writes external-abort; see the SET block
- * comment above) and hold the tm/tq file in retention through any
- * genpd cycle - TQ_EN still reads 0x3000 after a 20 ms and a 2 s gate,
- * and tasks dispatched afterwards complete but compute nondeterministic
- * garbage. The idle-or-fresh poll below therefore fails on T6001 and
- * recovery preserves until reboot instead of serving wrong data.
+ * Recovery runs with engine_lock and pm_lock held and one consumer PM
+ * reference. Suspend through runtime PM, just as autosuspend does, so the
+ * supplier references and the domain hierarchy are released together.
+ * Never use the system-sleep force helpers here: an in-use forced supplier
+ * retains RPM_ACTIVE, which prevents its parent domain from powering off.
  */
 
 /* No engine MMIO unless the owning partitions read powered on (ACTUAL
@@ -428,151 +417,54 @@ static int ane_ps_verify_on(struct ane_device *ane)
 
 static int ane_pd_cycle(struct ane_device *ane)
 {
-	int err = 0;
+	int err, resume_err;
+	u32 act;
 
+	lockdep_assert_held(&ane->pm_lock);
 	ane->recovering = true;
 	if (ane->pd_count > 1) {
-		int gated = 0;
-
-		for (int i = 0; i < ane->pd_count; i++) {
-			pm_runtime_get_noresume(ane->pd_dev[i]);
-			gated = i + 1;
-			dev_dbg(ane->dev,
-				"ANERD pd[%d] %s force_suspend begin (ps act %#x)\n",
-				i, dev_name(ane->pd_dev[i]), ane_ps_act(ane));
-			err = pm_runtime_force_suspend(ane->pd_dev[i]);
-			dev_dbg(ane->dev,
-				"ANERD pd[%d] force_suspend -> %d (ps act %#x)\n",
-				i, err, ane_ps_act(ane));
-			if (err)
-				break;
-		}
-		if (!err)
-			for (int i = 0; i < ane->pd_count; i++) {
-				dev_dbg(ane->dev,
-					"ANERD pd[%d] %s force_resume begin (ps act %#x)\n",
-					i, dev_name(ane->pd_dev[i]),
-					ane_ps_act(ane));
-				err = pm_runtime_force_resume(ane->pd_dev[i]);
-				dev_dbg(ane->dev,
-					"ANERD pd[%d] force_resume -> %d (ps act %#x)\n",
-					i, err, ane_ps_act(ane));
-				if (err)
-					break;
-			}
-		while (gated--)
-			pm_runtime_put_noidle(ane->pd_dev[gated]);
+		for (int i = 0; i < ane->pd_count; i++)
+			dev_pm_genpd_synced_poweroff(ane->pd_dev[i]);
 	} else {
-		/* Pin a second usage ref for the cycle: force_suspend only
-		 * marks needs_force_resume when a ref beyond the caller's
-		 * one (submit ioctl or reset write) is held, and without
-		 * that mark force_resume would leave the partition gated.
-		 */
-		pm_runtime_get_noresume(ane->dev);
-		dev_dbg(ane->dev, "ANERD dev force_suspend begin\n");
-		err = pm_runtime_force_suspend(ane->dev);
-		dev_dbg(ane->dev, "ANERD dev force_suspend -> %d\n", err);
-		if (!err) {
-			dev_dbg(ane->dev, "ANERD dev force_resume begin\n");
-			err = pm_runtime_force_resume(ane->dev);
-			dev_dbg(ane->dev, "ANERD dev force_resume -> %d\n",
-				err);
-		}
-		pm_runtime_put_noidle(ane->dev);
+		dev_pm_genpd_synced_poweroff(ane->dev);
 	}
+
+	/* Drop exactly the reference owned by the calling ioctl/close/reset.
+	 * pm_lock keeps another driver entry from resuming us mid-cycle.
+	 */
+	err = pm_runtime_put_sync_suspend(ane->dev);
+	if (err < 0)
+		goto resume;
+
+	/* Supplier idle requests are asynchronous. Finish them, then suspend
+	 * leaves before parents using ordinary runtime PM (still enabled).
+	 * genpd owns all PMGR writes and the parent-domain ordering.
+	 */
+	for (int i = ane->pd_count - 1; i >= 0 && ane->pd_count > 1; i--) {
+		pm_runtime_barrier(ane->pd_dev[i]);
+		err = pm_runtime_suspend(ane->pd_dev[i]);
+		if (err < 0)
+			goto resume;
+	}
+
+	/* A successful runtime suspend alone is not proof of power-off:
+	 * genpd may retain a shared or busy parent. Only PMGR is safe to read
+	 * here; do not access the engine aperture until it is powered again.
+	 */
+	if (!ane->ps) {
+		err = -EOPNOTSUPP;
+		goto resume;
+	}
+	err = read_poll_timeout(ane_ps_act, act, act == 0,
+				100, 100000, false, ane);
+	dev_info(ane->dev, "recovery: engine power-off actual=%#x rc=%d\n",
+		 act, err);
+
+resume:
+	/* get_sync restores the caller's usage reference even on failure. */
+	resume_err = pm_runtime_get_sync(ane->dev);
 	ane->recovering = false;
-
-	return err;
-}
-
-/*
- * Drain the task-manager state a timed-out task leaves behind when the
- * tm/tq file survives the power cycle in retention (T6001; descriptor
- * tm_retention). T8103 never runs this: its cycle is a full POR of the
- * file, and the re-arm below starts it clean.
- *
- * Two things must go, or the retained TM never reads idle again:
- *   - pending events on both IRQ lines. Each event pops by reading
- *     INFO/UNK1/TMST/UNK2, exactly as ane_tm_collect_events pops them;
- *     a stale backlog (or one over the 64-entry collect cap) would make
- *     the next submit's completion poll miss or fail.
- *   - the latched queue entry of the dead task. TQ_STATUS/NID1 get the
- *     same clear the normal completion path gives a finished queue.
- */
-static void ane_tm_drain_retained(struct ane_device *ane)
-{
-	int line, qid;
-
-	/* Stop the TM first: the cycle leaves the enable|halt latch set
-	 * (TQ_EN reads 0x3000). Clear both bits so the
-	 * re-arm below starts the TM from a defined stopped state.
-	 */
-	ane_rec_writel(ane, "TM_TQ_EN stop tm+0x0c",
-		       ane->engine + ANE_TM_BASE + TM_TQ_EN,
-		       tm_read32(ane, TM_TQ_EN) & ~0x3000U);
-
-	for (line = 0; line < 2; line++) {
-		u32 count = tm_read32(ane, TM_IRQ_EVTC(line));
-		u32 n;
-
-		if (count > 64)
-			count = 64;
-		for (n = 0; n < count; n++) {
-			tm_read32(ane, TM_IRQ_INFO(line));
-			tm_read32(ane, TM_IRQ_UNK1(line));
-			tm_read32(ane, TM_IRQ_TMST(line));
-			tm_read32(ane, TM_IRQ_UNK2(line));
-		}
-	}
-	tm_write32(ane, TM_IRQ_ACK, tm_read32(ane, TM_IRQ_ACK) | 3);
-
-	/* The dead task leaves per-queue error codes latched here (seen
-	 * 0x22222222 / 0x2222: four-bit code 2 per TQ slot). While any
-	 * latch is set the TM stays halted and TM_STATUS reads 0. Try the
-	 * W1C convention first (write the read value back), fall back to
-	 * plain zero-clear, and log what this silicon answered to.
-	 */
-	{
-		static const u16 err_reg[3] = { TM_ERROR1, TM_ERROR2,
-						TM_ERROR3 };
-		char reg[24];
-		int ei;
-
-		for (ei = 0; ei < 3; ei++) {
-			void __iomem *addr =
-				ane->engine + ANE_TM_BASE + err_reg[ei];
-			u32 val = readl(addr);
-
-			if (!val)
-				continue;
-			writel(val, addr);
-			if (readl(addr))
-				writel(0x0, addr);
-			snprintf(reg, sizeof(reg), "TM_ERROR%d clear tm+%#x",
-				 ei + 1, err_reg[ei]);
-			ane_rec_read32(ane, reg, addr);
-		}
-	}
-
-	for (qid = 0; qid < ANE_TQ_COUNT; qid++) {
-		u32 nid = tq_read32(ane, TQ_NID1(qid));
-
-		tq_write32(ane, TQ_STATUS(qid), 0x0);
-		if (nid & 1)
-			tq_write32(ane, TQ_NID1(qid), nid & ~1U);
-	}
-
-	/* Log the retained state: what the dead task left in the
-	 * committed counter and the error latches.
-	 */
-	ane_rec_read32(ane, "TM_COMMITTED tm+0x44 (drain)",
-		       ane->engine + ANE_TM_BASE + TM_COMMITTED);
-	ane_rec_read32(ane, "TM_ERROR1 tm+0x58 (drain)",
-		       ane->engine + ANE_TM_BASE + TM_ERROR1);
-	ane_rec_read32(ane, "TM_ERROR2 tm+0x5c (drain)",
-		       ane->engine + ANE_TM_BASE + TM_ERROR2);
-	ane_rec_read32(ane, "TM_ERROR3 tm+0x60 (drain)",
-		       ane->engine + ANE_TM_BASE + TM_ERROR3);
+	return err < 0 ? err : (resume_err < 0 ? resume_err : 0);
 }
 
 int ane_tm_recover(struct ane_device *ane)
@@ -601,23 +493,22 @@ int ane_tm_recover(struct ane_device *ane)
 		return err;
 	}
 
-	/* T6001 (tm_retention): the cycle did NOT clear the tm/tq file —
-	 * the timed-out task's events and queue entry are still latched.
-	 * Drain them, or the TM below never reads idle and recovery
-	 * degrades to preserve-until-reboot.
+	/* A full, acknowledged power-off replaces the speculative retained-TM
+	 * drain. Never clear undocumented error registers or restart a queue
+	 * which still contains the old halted task.
 	 */
-	if (ane->tm_retention)
-		ane_tm_drain_retained(ane);
+	if (tm_read32(ane, TM_TQ_EN) & 0x2000) {
+		dev_err(ane->dev, "recovery: task manager still halted after power-off\n");
+		return -EIO;
+	}
 
-	/* Power-on reset cleared the tm register file; re-arm it exactly
-	 * like the probe resume path does.
-	 */
 	ane_tm_enable(ane, true);
 
 	err = readl_poll_timeout(ane->engine + ANE_TM_BASE + TM_STATUS,
 				 status,
 				 (status & TM_IS_IDLE) ||
-				 status == ane->tm_status_fresh,
+				 (ane->tm_status_known &&
+				  status == ane->tm_status_fresh),
 				 100, 1000000);
 	status = ane_rec_read32(ane, "TM_STATUS tm+0x54",
 				ane->engine + ANE_TM_BASE + TM_STATUS);
@@ -628,7 +519,7 @@ int ane_tm_recover(struct ane_device *ane)
 	}
 
 	if (atomic_xchg(&ane->wedged, 0)) {
-		module_put(THIS_MODULE); /* drop the wedge pin */
+		module_put(THIS_MODULE); /* verified reset releases the wedge pin */
 		/* The power cycle above quiesced every transaction, so the
 		 * wedge-preserved mappings (dead BOs kept alive only to
 		 * stop IOVA teardown under active DMA) can now be unmapped
