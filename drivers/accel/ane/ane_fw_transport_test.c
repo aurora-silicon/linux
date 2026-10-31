@@ -988,25 +988,28 @@ static void ane_transport_second_load_test(struct kunit *test)
 	struct ane_transport_test *f = test->priv;
 	u8 command[0x1c0] = {};
 	size_t used;
+	int ret;
 
 	f->soc.chip_family = 17;
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
 	put_unaligned_le16(0x200, command + 4);
-	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
-						     sizeof(command), TEST_DEADLINE), 0);
+	ret = ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+				       sizeof(command), TEST_DEADLINE);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	ane_test_reply(f, ANE_FW_IO);
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_poll(&f->t, ANE_FW_IO), 0);
 	/* A successful UNLOAD does not invalidate the stale firmware BARs. */
 	put_unaligned_le16(0x201, command + 4);
-	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
-						     12, TEST_DEADLINE), 0);
+	ret = ane_fw_transport_publish(&f->t, ANE_FW_IO, command, 12, TEST_DEADLINE);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	ane_test_reply(f, ANE_FW_IO);
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_poll(&f->t, ANE_FW_IO), 0);
 	used = f->t.pool_used;
 	put_unaligned_le16(0x200, command + 4);
 	f->count = 0;
-	KUNIT_EXPECT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
-						     sizeof(command), TEST_DEADLINE), -EBUSY);
+	ret = ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+				       sizeof(command), TEST_DEADLINE);
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
 	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
 	KUNIT_EXPECT_EQ(test, f->t.pool_used, used);
 	KUNIT_EXPECT_FALSE(test, f->t.pending[ANE_FW_IO].active);
