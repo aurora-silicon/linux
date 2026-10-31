@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Staged H16 backend, using the accepted H16 cold-boot facts, round 5. */
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-map-ops.h>
 #include <linux/interrupt.h>
@@ -11,13 +12,13 @@
 #include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
-#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
+#include "ane_fw_platform.h"
 #include "ane_h16_accel.h"
 #include "ane_h16_boot.h"
 #include "ane_h16_preload.h"
@@ -63,12 +64,18 @@ struct ane_h16_device {
 	u64 shared_next;
 	u64 program_next;
 	u64 program_end;
-	unsigned int stage;
+	struct dentry *debugfs;
+	bool acquired;
+	bool refused;
+	bool program_ready;
 	struct ane_h16_session session;
 };
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
+/* <debugfs>/ane-h16, shared by bound devices; protected by ane_h16_lock. */
+static struct dentry *ane_h16_debugfs;
+static unsigned int ane_h16_debugfs_users;
 
 static u32 ane_h16_mmio_read32(void *ctx, enum ane_h16_window w, u32 off)
 {
@@ -255,7 +262,7 @@ static int ane_h16_map(void *ctx)
 	}
 	if (h->domain->geometry.aperture_end < b->build->shared_dva + ANE_FW_SHARED_TOTAL)
 		return -ERANGE;
-	if (h->stage == ANE_H16_PROGRAM && h->domain->geometry.aperture_end < h->program_end - 1)
+	if (h->domain->geometry.aperture_end < h->program_end - 1)
 		return -ERANGE;
 	ret = iommu_attach_device(h->domain, h->dev);
 	if (ret)
@@ -462,12 +469,13 @@ static const struct ane_fw_transport_ops ane_h16_transport_ops = {
 	.refused = ane_h16_refused,
 };
 
-static void ane_h16_cleanup(struct ane_h16_device *h)
+/* Pre-RUN rollback of everything a stage acquired. h itself stays. */
+static void ane_h16_release(struct ane_h16_device *h)
 {
 	struct ane_h16_mapping *m, *next;
 	unsigned int i, pages_per_block = SZ_16K / PAGE_SIZE;
 
-	if (h->boot.ran || h->pinned)
+	if (h->boot.ran || h->pinned || !h->acquired)
 		return;
 	list_for_each_entry_safe_reverse(m, next, &h->mappings, node) {
 		if (m->mapped)
@@ -482,30 +490,39 @@ static void ane_h16_cleanup(struct ane_h16_device *h)
 	}
 	if (h->attached)
 		iommu_detach_device(h->domain, h->dev);
+	h->attached = false;
 	if (h->domain)
 		iommu_domain_free(h->domain);
+	h->domain = NULL;
 	if (h->claimed)
 		iommu_device_release_dma_owner(h->dev);
+	h->claimed = false;
 	if (h->group)
 		iommu_group_put(h->group);
+	h->group = NULL;
 	if (h->irq >= 0)
 		free_irq(h->irq, h);
-	for (i = ANE_H16_WINDOWS; i-- > 0; )
+	h->irq = -1;
+	for (i = ANE_H16_WINDOWS; i-- > 0; ) {
 		if (h->window[i])
 			iounmap(h->window[i]);
+		h->window[i] = NULL;
+	}
 	while (h->darts_powered)
 		pm_runtime_put_sync(h->dart[--h->darts_powered]);
-	for (i = 0; i < 3; i++)
+	for (i = 0; i < 3; i++) {
 		if (h->dart[i])
 			put_device(h->dart[i]);
+		h->dart[i] = NULL;
+	}
 	while (h->powered) {
 		struct device *pd = h->power[--h->powered];
 
 		pm_runtime_put_sync(pd);
 		dev_pm_domain_detach(pd, true);
 	}
+	h->acquired = false;
 	dev_info(h->dev, "H16 pre-RUN rollback complete; no CPU release\n");
-	kfree(h);
 }
 
 static irqreturn_t ane_h16_masked_irq(int irq, void *data)
@@ -596,34 +613,29 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 	int ret = -ENOMEM;
 
 	for (i = 0; i < 2; i++) {
-		struct device_node *np = of_parse_phandle(h->dev->of_node, "memory-region", i);
-		struct reserved_mem *rmem;
+		u64 base, size;
 		void *live;
 
-		if (!np) {
-			ret = -ENODATA;
-			goto out;
-		}
-		rmem = of_reserved_mem_lookup(np);
-		of_node_put(np);
-		if (!rmem || rmem->size != b->soc->preload_size[i]) {
+		ret = ane_fw_preload_range(h->dev->of_node, i, &base, &size);
+		if (!ret && size != b->soc->preload_size[i])
 			ret = -EINVAL;
+		if (ret)
 			goto out;
-		}
-		h->preload_phys[i] = rmem->base;
-		snap[i] = vzalloc(rmem->size);
-		second = vzalloc(rmem->size);
+		ret = -ENOMEM;
+		h->preload_phys[i] = base;
+		snap[i] = vzalloc(size);
+		second = vzalloc(size);
 		if (!snap[i] || !second)
 			goto out;
-		live = memremap(rmem->base, rmem->size, MEMREMAP_WB);
+		live = memremap(base, size, MEMREMAP_WB);
 		if (!live)
 			goto out;
-		memcpy(snap[i], live, rmem->size);
+		memcpy(snap[i], live, size);
 		/* Separate the two observations used to reject an unstable preload. */
 		rmb();
-		memcpy(second, live, rmem->size);
+		memcpy(second, live, size);
 		memunmap(live);
-		if (memcmp(snap[i], second, rmem->size)) {
+		if (memcmp(snap[i], second, size)) {
 			ret = -EBUSY;
 			goto out;
 		}
@@ -642,7 +654,7 @@ out:
 }
 
 /* After startup: one program session and the ABI 3 accel node. */
-static void ane_h16_program_stage(struct ane_h16_device *h)
+static int ane_h16_program_stage(struct ane_h16_device *h)
 {
 	int ret;
 
@@ -650,16 +662,122 @@ static void ane_h16_program_stage(struct ane_h16_device *h)
 				   h->boot.build->command_timeout_ns);
 	if (!ret)
 		ret = ane_h16_accel_register(h->dev, &h->session);
-	if (ret)
+	if (ret) {
 		dev_err(h->dev, "H16 program stage unavailable, error %d; held until reboot\n",
 			ret);
-	else
-		dev_info(h->dev, "H16 stage 5 program window %llx..%llx\n", h->program_next,
-			 h->program_end - 1);
+		return ret;
+	}
+	h->program_ready = true;
+	dev_info(h->dev, "H16 stage 5 program window %llx..%llx\n", h->program_next,
+		 h->program_end - 1);
+	return 0;
 }
 
-int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc,
-			  unsigned int stage)
+/*
+ * Advance the staged bring-up to @stage. Caller holds ane_h16_lock. Before
+ * RUN any failure rolls back power and mappings and refuses further stages
+ * until the module is reloaded. From RUN on, everything stays held.
+ */
+static int ane_h16_advance(struct ane_h16_device *h, enum ane_h16_stage stage)
+{
+	enum ane_h16_stage target = stage > ANE_H16_STARTUP ? ANE_H16_STARTUP : stage;
+	int ret;
+
+	if (h->refused || h->boot.failed || h->boot.quarantined)
+		return -EBUSY;
+	if (h->program_ready || (stage != ANE_H16_PROGRAM && stage <= h->boot.stage))
+		return -EALREADY;
+	if (!h->acquired) {
+		h->acquired = true;
+		ret = ane_h16_preload_identity(h);
+		if (!ret)
+			ret = ane_h16_acquire(to_platform_device(h->dev), h);
+		if (ret)
+			goto refuse;
+	}
+	if (target > h->boot.stage) {
+		ret = ane_h16_run(&h->boot, target);
+		if (ret && !h->boot.ran)
+			goto refuse;
+		if (ret) {
+			dev_err(h->dev, "H16 stage %s failed after RUN, error %d; held until reboot\n",
+				ane_h16_stage_name(stage), ret);
+			return ret;
+		}
+		if (h->boot.stage == ANE_H16_STARTUP)
+			print_hex_dump(KERN_INFO, "H16 RESOURCE_INFO ", DUMP_PREFIX_OFFSET, 16, 1,
+				       h->boot.resource_info, sizeof(h->boot.resource_info),
+				       false);
+	}
+	if (stage == ANE_H16_PROGRAM) {
+		ret = ane_h16_program_stage(h);
+		if (ret) {
+			h->refused = true;
+			return ret;
+		}
+	}
+	dev_info(h->dev, "H16 stage %s complete%s\n", ane_h16_stage_name(stage),
+		 h->boot.ran ? "; held until reboot" : "");
+	return 0;
+refuse:
+	dev_err(h->dev, "H16 stage %s refused before RUN, error %d\n",
+		ane_h16_stage_name(stage), ret);
+	h->refused = true;
+	ane_h16_release(h);
+	return ret;
+}
+
+/*
+ * Bring-up control in debugfs: write a stage name to <debugfs>/ane-h16/<dev>/stage
+ * to run every stage up to it. Without a write nothing touches the hardware.
+ */
+static ssize_t ane_h16_stage_write(struct file *file, const char __user *ubuf,
+				   size_t count, loff_t *ppos)
+{
+	struct ane_h16_device *h = file->private_data;
+	char buf[16];
+	int stage, ret;
+
+	if (!count || count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = 0;
+	strim(buf);
+	stage = ane_h16_stage_parse(buf);
+	if (stage <= ANE_H16_REFUSE)
+		return -EINVAL;
+	mutex_lock(&ane_h16_lock);
+	ret = ane_h16_advance(h, stage);
+	mutex_unlock(&ane_h16_lock);
+	return ret ? ret : count;
+}
+
+static ssize_t ane_h16_stage_read(struct file *file, char __user *ubuf, size_t count,
+				  loff_t *ppos)
+{
+	struct ane_h16_device *h = file->private_data;
+	char buf[96];
+	int len;
+
+	mutex_lock(&ane_h16_lock);
+	len = scnprintf(buf, sizeof(buf), "%s ran=%d refused=%d quarantined=%d error=%d\n",
+			h->program_ready ? "program" : ane_h16_stage_name(h->boot.stage),
+			h->boot.ran, h->refused || h->boot.failed, h->boot.quarantined,
+			h->boot.error);
+	mutex_unlock(&ane_h16_lock);
+	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+}
+
+static const struct file_operations ane_h16_stage_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = ane_h16_stage_read,
+	.write = ane_h16_stage_write,
+	.llseek = default_llseek,
+};
+
+int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
 	struct ane_h16_device *h;
 	unsigned int i, j;
@@ -686,50 +804,32 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->shared_next = soc->h16_boot->shared_dva;
 	h->program_next = soc->h16_boot->shared_dva + ANE_FW_SHARED_TOTAL;
 	h->program_end = h->program_next + ANE_H16_PROGRAM_WINDOW;
-	h->stage = stage;
 	ret = of_property_read_u64_array(h->dev->of_node, "apple,dapf-ranges",
 					 &h->boot.ranges[0][0], 8);
 	if (ret)
-		goto cleanup;
+		goto free;
 	for (i = 0; i < 4; i++) {
 		u64 start = h->boot.ranges[i][0], end = h->boot.ranges[i][1];
 
-		if (!start || end < start || round_down(start, SZ_16K) != round_down(end, SZ_16K)) {
-			ret = -EINVAL;
-			goto cleanup;
-		}
+		ret = -EINVAL;
+		if (!start || end < start || round_down(start, SZ_16K) != round_down(end, SZ_16K))
+			goto free;
 		for (j = 0; j < i; j++)
-			if (round_down(start, SZ_16K) == round_down(h->boot.ranges[j][0], SZ_16K)) {
-				ret = -EINVAL;
-				goto cleanup;
-			}
+			if (round_down(start, SZ_16K) == round_down(h->boot.ranges[j][0], SZ_16K))
+				goto free;
 	}
-	ret = ane_h16_preload_identity(h);
-	if (ret)
-		goto cleanup;
-	ret = ane_h16_acquire(pdev, h);
-	if (ret)
-		goto cleanup;
-	ret = ane_h16_run(&h->boot, stage);
-	if (ret && !h->boot.ran)
-		goto cleanup;
-	/* Bind even on a post-RUN error. devres teardown must never reclaim DMA. */
+	if (!ane_h16_debugfs_users++)
+		ane_h16_debugfs = debugfs_create_dir("ane-h16", NULL);
+	h->debugfs = debugfs_create_dir(dev_name(h->dev), ane_h16_debugfs);
+	debugfs_create_file("stage", 0600, h->debugfs, h, &ane_h16_stage_fops);
 	platform_set_drvdata(pdev, h);
-	if (!ret) {
-		dev_info(h->dev, "H16 stage %u complete%s\n", stage,
-			 h->boot.ran ? "; held until reboot" : "");
-		if (stage >= ANE_H16_STARTUP)
-			print_hex_dump(KERN_INFO, "H16 RESOURCE_INFO ", DUMP_PREFIX_OFFSET,
-				       16, 1, h->boot.resource_info,
-				       sizeof(h->boot.resource_info), false);
-		if (stage == ANE_H16_PROGRAM)
-			ane_h16_program_stage(h);
-	}
+	dev_info(h->dev, "H16 staged backend idle; no hardware access until a stage is written to debugfs ane-h16/%s/stage\n",
+		 dev_name(h->dev));
 	ret = 0;
 	goto unlock;
-cleanup:
-	dev_err(h->dev, "H16 stage %u refused before RUN, error %d\n", stage, ret);
-	ane_h16_cleanup(h);
+free:
+	dev_err(h->dev, "H16 DT description refused, error %d\n", ret);
+	kfree(h);
 unlock:
 	mutex_unlock(&ane_h16_lock);
 	return ret;
@@ -739,12 +839,21 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 {
 	struct ane_h16_device *h = platform_get_drvdata(pdev);
 
+	if (!h)
+		return;
+	/* Waits for any stage write in progress before the lock is taken. */
+	debugfs_remove_recursive(h->debugfs);
 	mutex_lock(&ane_h16_lock);
-	if (h) {
-		if (h->boot.ran)
-			dev_warn(h->dev, "H16 remove held; reboot reclaims firmware DMA\n");
-		else
-			ane_h16_cleanup(h);
+	if (!--ane_h16_debugfs_users) {
+		debugfs_remove_recursive(ane_h16_debugfs);
+		ane_h16_debugfs = NULL;
+	}
+	if (h->boot.ran || h->pinned) {
+		/* The module reference taken before RUN makes this unreachable by rmmod. */
+		dev_warn(h->dev, "H16 remove held; reboot reclaims firmware DMA\n");
+	} else {
+		ane_h16_release(h);
+		kfree(h);
 	}
 	mutex_unlock(&ane_h16_lock);
 }

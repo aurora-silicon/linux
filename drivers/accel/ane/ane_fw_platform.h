@@ -9,6 +9,7 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 
+struct device_node;
 struct platform_device;
 struct ane_h16_build;
 
@@ -76,8 +77,8 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 int ane_fw_platform_probe(struct platform_device *pdev,
 			  const struct ane_fw_platform *soc);
 void ane_fw_platform_remove(struct platform_device *pdev);
-int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc,
-			  unsigned int stage);
+int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
+int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc);
 void ane_h16_backend_remove(struct platform_device *pdev);
 
 #endif /* __ANE_FW_PLATFORM_H__ */

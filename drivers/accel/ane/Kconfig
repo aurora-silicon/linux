@@ -16,10 +16,10 @@ config DRM_ACCEL_ANE
 	  M1 (T8103), M1 Pro, Max and Ultra (T6000, T6001, T6002), M2
 	  (T8112), or M2 Pro, Max and Ultra (T6020, T6021, T6022).
 	  H16 (M4 Pro) and H17 are recognized for firmware preflight and
-	  ownership refusal by default. An explicit h16_stage module parameter
-	  enables H16 cold-boot diagnostics. Its last stage, program, adds an
-	  ABI 3 accel node that loads one original HWX program per firmware
-	  boot. H17 inference is not available.
+	  ownership refusal by default. A bound H16 device stays idle until
+	  a bring-up stage is written to its debugfs control file. The last
+	  stage, program, adds an ABI 3 accel node that loads one original
+	  HWX program per firmware boot. H17 inference is not available.
 
 	  The interface exposed to userspace is described in
 	  include/uapi/drm/ane_accel.h.

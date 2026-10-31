@@ -22,21 +22,23 @@ H16 preload handoff
 ------------------
 
 The bootloader must reserve the personalized TEXT and DATA preload segments
-as separate, non-reusable ``no-map`` reserved-memory nodes, attach them in
+as separate, non-reusable ``no-map`` children of ``/reserved-memory``, attach them in
 that order through ``memory-region`` and name them ``firmware-text`` and
 ``firmware-data``. It must also supply ``apple,firmware-iovas`` as two 64-bit
 values: ``0x10000000000`` and ``0x100000c0000``. Their sizes must be
 ``0xc0000`` and ``0x2ac000``. Physical placement is boot-dependent; board DT
 sources must not contain captured physical addresses. The reservations must
-remain intact until reboot, including after driver failure.
+remain intact until reboot, including after driver failure. The driver
+reads each range from its node and refuses it when any part is Linux
+System RAM, so a loader may either reserve the range at boot or leave it
+outside the memory map and describe it with a node.
 
 Metadata preflight checks resource geometry and these ranges without MMIO
 or power access. Missing reservations fail with ``-ENODATA`` and malformed
-reservations with ``-EINVAL``. Without ``h16_stage`` the module still refuses
-registration before power access. An explicit stage enables the diagnostic
-backend described below. The original-container userspace load ABI and
-process installation remain unavailable. No accel node or program-loading
-interface is published for these stages.
+reservations with ``-EINVAL``. A device that passes binds idle, without
+power or MMIO access, and only a stage written to its debugfs control file
+starts the diagnostic backend described below. No accel node or
+program-loading interface exists before the program stage.
 
 The H16 DT nodes stay disabled. The five real PMGR providers already encode
 the system/CPU/MPM/task/base dependency graph. The PMGR binding does not
@@ -485,9 +487,12 @@ Quarantine must not be cleared solely because a power transition returned zero.
 Staged H16 cold boot
 -------------------
 
-The read-only module parameter ``h16_stage`` accepts ``preflight``, ``map``,
-``boot`` or ``startup``. Each includes the preceding stages. No H14 boot
-parameter changes the H16 path. H17 still refuses ownership and registration.
+Bring-up is driven from ``<debugfs>/ane-h16/<device>/stage`` (root only).
+Writing ``preflight``, ``map``, ``boot``, ``startup`` or ``program`` runs
+every stage that has not run yet, up to the one written; reading the file
+reports the last completed stage and the run, refusal and quarantine state.
+A stage at or below the completed one is refused with ``-EALREADY``. There
+is no module parameter and no H14 boot parameter changes the H16 path. H17 still refuses ownership and registration.
 All build-dependent boot values and ordered masked updates belong to the
 H16 27.0 (26A428) match-data profile. The existing preload validator must
 accept the resident image before that profile can run. Live mutable patchbay
@@ -576,51 +581,45 @@ Further attempts are refused until reboot. There is no writable stage knob.
 Hardware test plan
 ------------------
 
-Use a matching kernel/module set and the tether-loaded J616s ANE test DTB.
-The test DT needs the SID-0-only adjustment above, the two loader-provided
-reserved preload ranges and an aperture covering the identity pages. Keep
-shipping DT nodes disabled and persistent boot storage untouched. Boot with
-``user4k=on modprobe.blacklist=ane,ane_t6021`` and the tether console args.
-Each command below is a separate stage attempt. Preserve full dmesg at the
-first unexpected value.
+Use a matching kernel/module set and a DT that enables the ANE and its three
+DARTs with SID 0 only, the two preload ranges and an aperture covering the
+identity pages (``t6040-j616s-ane-test.dts``). Keep shipping DT nodes
+disabled. Each write below is one stage; stop and preserve full dmesg at the
+first unexpected value::
 
-Before RUN the module can be removed between rungs::
+  echo preflight > /sys/kernel/debug/ane-h16/<device>/stage
+  echo map > /sys/kernel/debug/ane-h16/<device>/stage
 
-  modprobe ane_t6021 h16_stage=preflight
-  rmmod ane_t6021
-  modprobe ane_t6021 h16_stage=map
-  rmmod ane_t6021
-
+Before RUN a failed stage rolls back and the module can be reloaded.
 Expected preflight messages include ``H16 preload identity H16 27.0 26A428
 accepted``, ``H16 power ACTUAL`` twice for each of the five words with low
 byte ff, ``H16 CPU control/RVBAR 0 10000000001``, DART status/address and
-DAPF comparisons, then ``H16 stage 1 complete``. Map adds TEXT/DATA mapping
-messages and four ``H16 identity MMIO`` messages, clean fault words and
-``H16 stage 2 complete``. An unchanged six-stream test tree instead logs
-``H16 map requires only SID 0 on three DARTs; refusing extra streams``.
+DAPF comparisons, then ``H16 stage preflight complete``. Map adds TEXT/DATA
+mapping messages and four ``H16 identity MMIO`` messages, clean fault words
+and ``H16 stage map complete``. A six-stream tree instead logs ``H16 map
+requires only SID 0 on three DARTs; refusing extra streams``.
 
-On a fresh boot run the boot rung::
+The boot rung releases the firmware CPU::
 
-  modprobe ane_t6021 h16_stage=boot
+  echo boot > /sys/kernel/debug/ane-h16/<device>/stage
 
 Expect CE state/ack and ``H16 tunables applied`` (or locked-match) logs,
 then ``H16 READY 8042006 0``, request logs (the comparator values are
 channels 8, IPC-minus-one c440, heap f00000, mode 0), then
 ``H16 table validated 100003d0000 8``, ``H16 scratch 3 cleared 0 0`` and
-``H16 stage 3 complete; held until reboot``. Comparator sizing values are
-not additional admission checks. Never unload after this command.
+``H16 stage boot complete; held until reboot``. Comparator sizing values are
+not additional admission checks. From here the module stays loaded.
 
-Reboot through the tether route before testing startup::
+In the same boot::
 
-  modprobe ane_t6021 h16_stage=startup
+  echo startup > /sys/kernel/debug/ane-h16/<device>/stage
 
-Expect the boot messages, SHAREDMALLOC allocation messages as offered,
-``H16 startup ack`` for IDs 4, 0, 3 and 22 with zero status,
-``H16 CONFIG_GET tick`` with a nonzero value, ``H16 stage 4 complete; held
-until reboot`` and exactly 100 bytes under ``H16 RESOURCE_INFO``. A failure
-after RUN must instead show the scratch/fault dump and ``H16 quarantine``.
-Do not retry or unload; collect logs and reboot. No inference result is
-claimed by these diagnostic rungs.
+Expect SHAREDMALLOC allocation messages as offered, ``H16 startup ack`` for
+IDs 4, 0, 3 and 22 with zero status, ``H16 CONFIG_GET tick`` with a nonzero
+value, exactly 100 bytes under ``H16 RESOURCE_INFO`` and ``H16 stage startup
+complete; held until reboot``. A failure after RUN must instead show the
+scratch/fault dump and ``H16 quarantine``. Do not retry; collect logs and
+reboot. No inference result is claimed by these diagnostic rungs.
 
 The ``ane-h16-boot`` KUnit suite uses a simulated engine, scratch cells,
 mailbox polling and rings. It covers startup including allocation service,
@@ -632,7 +631,7 @@ locked DAPF, heap/shared overlap, native FREE, foreign FREE and control refusal.
 H16 program stage
 -----------------
 
-``h16_stage=program`` runs every startup step, then registers an accel node
+The ``program`` stage runs every startup step, then registers an accel node
 with ABI version 3 (``DRM_ANE_CHIP_H16``). GET_CAPS, H16_LOAD and H16_EXEC
 are its only ioctls. The node is absent at every other stage, so the default
 refusal and the H17 refusal are unchanged.
@@ -650,7 +649,7 @@ table:
 Slot  Source                      Index     Class
 ====  ==========================  ========  =====
 0     generic (host-built)        1002      4
-1     HWX kernel section, if any  1007      3
+1     kernel section, else const  1007      3
 2     HWX task stream             1006      4
 3     operation (host-built)      1003      4
 4     procedure (host-built)      1004      4
@@ -667,9 +666,16 @@ Its reply must keep the body zero and returns the process ID, where zero is
 also valid. A program with a kernel section must tag its operation record
 with the kernel slot index 1007. The uapi header names these indices.
 
+Slot 1 carries the ``__KERN_0`` kernel section when the program has one and
+otherwise the ``__TEXT,__const`` constants, which macOS loads in every
+program.
+
 EXECUTE resources come from a kernel-owned map. The class follows the
-resource usage mapping (inputs 0, the output 1) and the index is local to
-its class in surface order. The mcache tuple in the linear program
+resource usage mapping (inputs 0, the output 1). Each descriptor names its
+buffer by the ID of the generic section that LOAD installs: generic entry
+k describes surface k in HWX surface order, and the kernel refuses a generic
+section whose count, direction, type or size disagrees with the program,
+that repeats an ID or that uses the reserved IDs 2 and 3. The mcache tuple in the linear program
 descriptor (BAR ID, bit offset and width) adds one custom-BAR record with
 selector 1, value type 0 and the first pool DSID, 36. The scratch form sends
 none.

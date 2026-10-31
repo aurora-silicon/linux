@@ -576,6 +576,33 @@ static void ane_h16_scratch3_timeout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->command_count, 0U);
 }
 
+/* Stages advance one write at a time, each at most once, in one firmware session. */
+static void ane_h16_incremental_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), 0);
+	KUNIT_EXPECT_EQ(test, s->maps, 0U);
+	KUNIT_EXPECT_EQ(test, s->scratch_writes, 0U);
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), -EBUSY);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
+	KUNIT_EXPECT_EQ(test, s->maps, 1U);
+	KUNIT_EXPECT_EQ(test, s->scratch_writes, 0U);
+	KUNIT_EXPECT_FALSE(test, s->boot.ran);
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	KUNIT_EXPECT_TRUE(test, s->boot.ran);
+	KUNIT_EXPECT_EQ(test, s->boot.stage, ANE_H16_BOOT);
+	KUNIT_EXPECT_EQ(test, s->command_count, 0U);
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EBUSY);
+	/* The program stage belongs to the backend; here it means startup. */
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PROGRAM), 0);
+	KUNIT_EXPECT_EQ(test, s->boot.stage, ANE_H16_STARTUP);
+	KUNIT_EXPECT_EQ(test, s->command_count, 4U);
+	KUNIT_EXPECT_EQ(test, s->maps, 1U);
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
+	KUNIT_EXPECT_STREQ(test, ane_h16_stage_name(s->boot.stage), "startup");
+}
+
 static void ane_h16_mailbox_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
@@ -711,6 +738,7 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_control_refusal_test),
 	KUNIT_CASE(ane_h16_foreign_free_test),
 	KUNIT_CASE(ane_h16_mailbox_test),
+	KUNIT_CASE(ane_h16_incremental_test),
 	KUNIT_CASE(ane_h16_no_heap_test),
 	KUNIT_CASE(ane_h16_power_actual_test),
 	KUNIT_CASE(ane_h16_rvbar_test),

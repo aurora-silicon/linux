@@ -104,7 +104,10 @@ struct ane_h16_boot_ops {
 	void (*quarantine)(void *ctx, int error);
 };
 
-/* One caller, one attempt. No mapping is released here, even on success. */
+/*
+ * One caller. Stages advance in order, each at most once, and a failure ends
+ * the attempt. No mapping is released here, even on success.
+ */
 struct ane_h16_boot {
 	const struct ane_fw_platform *soc;
 	const struct ane_h16_build *build;
@@ -120,7 +123,9 @@ struct ane_h16_boot {
 	u32 tick;
 	u8 resource_info[100];
 	int error;
+	enum ane_h16_stage stage;
 	bool attempted;
+	bool failed;
 	bool ran;
 	bool quarantined;
 };
@@ -539,32 +544,63 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 	return 0;
 }
 
+/*
+ * Advance from the last completed stage to @stage. The program stage belongs
+ * to the caller; here it runs startup. A stage at or below the completed one,
+ * or any call after a failure, is refused.
+ */
 static inline int ane_h16_run(struct ane_h16_boot *b, enum ane_h16_stage stage)
 {
-	int ret;
+	int ret = 0;
 
 	if (stage == ANE_H16_REFUSE)
 		return -EOPNOTSUPP;
 	if (stage < ANE_H16_PREFLIGHT || stage > ANE_H16_PROGRAM)
 		return -EINVAL;
-	if (b->attempted || b->quarantined)
+	if (stage > ANE_H16_STARTUP)
+		stage = ANE_H16_STARTUP;
+	if (b->failed || b->quarantined || stage <= b->stage)
 		return -EBUSY;
 	b->attempted = true;
-	ret = ane_h16_preflight(b);
-	if (!ret)
-		ret = ane_h16_dapf(b, false);
-	if (!ret && stage >= ANE_H16_MAP) {
+	if (b->stage < ANE_H16_PREFLIGHT) {
+		ret = ane_h16_preflight(b);
+		if (!ret)
+			ret = ane_h16_dapf(b, false);
+		if (!ret)
+			b->stage = ANE_H16_PREFLIGHT;
+	}
+	if (!ret && stage >= ANE_H16_MAP && b->stage < ANE_H16_MAP) {
 		ret = b->ops->map(b->ctx);
 		if (!ret)
 			ret = ane_h16_dapf(b, true);
 		if (!ret)
 			ret = ane_h16_faults(b, true);
+		if (!ret)
+			b->stage = ANE_H16_MAP;
 	}
-	if (!ret && stage >= ANE_H16_BOOT)
+	if (!ret && stage >= ANE_H16_BOOT && b->stage < ANE_H16_BOOT) {
 		ret = ane_h16_scratch_boot(b);
-	if (!ret && stage >= ANE_H16_STARTUP)
+		if (!ret)
+			b->stage = ANE_H16_BOOT;
+	}
+	if (!ret && stage >= ANE_H16_STARTUP && b->stage < ANE_H16_STARTUP) {
 		ret = ane_h16_startup(b);
-	return ret ? ane_h16_fail(b, ret) : 0;
+		if (!ret)
+			b->stage = ANE_H16_STARTUP;
+	}
+	if (!ret)
+		return 0;
+	b->failed = true;
+	return ane_h16_fail(b, ret);
+}
+
+static inline const char *ane_h16_stage_name(enum ane_h16_stage stage)
+{
+	static const char * const names[] = {
+		"none", "preflight", "map", "boot", "startup", "program",
+	};
+
+	return stage <= ANE_H16_PROGRAM ? names[stage] : "invalid";
 }
 
 #endif /* __ANE_H16_BOOT_H__ */

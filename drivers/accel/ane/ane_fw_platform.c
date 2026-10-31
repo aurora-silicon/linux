@@ -5,18 +5,14 @@
  * performs no MMIO, DMA mapping or power access.
  */
 #include <linux/ioport.h>
-#include <linux/moduleparam.h>
+#include <linux/mm.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_irq.h>
-#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 
 #include "ane_fw_platform.h"
 #include "ane_h16_boot_data.h"
-
-static char *h16_stage;
-module_param(h16_stage, charp, 0444);
-MODULE_PARM_DESC(h16_stage, "H16 opt-in stage: preflight, map, boot, startup, program; unset refuses");
 
 static const char * const ane_h16_reg_names[] = {
 	"engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-3", "aux-4",
@@ -77,47 +73,60 @@ const struct ane_fw_platform ane_h17_platform = {
 	/* No H16 register-map inference is executable on H17. */
 };
 
+/*
+ * The iBoot preload is firmware memory. Accept it only as a no-map child of
+ * /reserved-memory that Linux does not manage as System RAM, whether the
+ * loader reserved it at boot or left it outside the memory map. The physical
+ * range comes from the node itself, so the check does not depend on when the
+ * node was added.
+ */
+int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size)
+{
+	struct device_node *reserved __free(device_node) =
+		of_find_node_by_path("/reserved-memory");
+	struct device_node *mem __free(device_node) =
+		of_parse_phandle(np, "memory-region", index);
+	struct resource r;
+
+	if (!reserved || !mem || mem->parent != reserved ||
+	    !of_device_is_available(mem) ||
+	    !of_property_read_bool(mem, "no-map") ||
+	    of_property_read_bool(mem, "reusable") ||
+	    of_address_to_resource(mem, 0, &r) || !resource_size(&r))
+		return -EINVAL;
+	if (region_intersects(r.start, resource_size(&r), IORESOURCE_SYSTEM_RAM,
+			      IORES_DESC_NONE) != REGION_DISJOINT)
+		return -EBUSY;
+	*phys = r.start;
+	*size = resource_size(&r);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_fw_preload_range);
+
 static int ane_fw_preload_check(struct device *dev,
 				const struct ane_fw_platform *soc)
 {
 	struct device_node *np = dev->of_node;
-	struct device_node *reserved __free(device_node) =
-		of_find_node_by_path("/reserved-memory");
 	u64 phys[2], size[2], dva[2];
 	unsigned int i;
+	int ret;
 
-	if (!reserved ||
-	    of_property_count_u32_elems(np, "memory-region") != 2 ||
+	if (of_property_count_u32_elems(np, "memory-region") != 2 ||
 	    of_property_count_strings(np, "memory-region-names") != 2 ||
 	    of_property_count_u64_elems(np, "apple,firmware-iovas") != 2 ||
 	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2))
 		return -ENODATA;
 
 	for (i = 0; i < 2; i++) {
-		struct device_node *mem;
-		struct reserved_mem *rmem;
 		const char *name;
-		bool valid;
 
 		if (of_property_read_string_index(np, "memory-region-names", i,
 						  &name) ||
 		    strcmp(name, i ? "firmware-data" : "firmware-text"))
 			return -EINVAL;
-		mem = of_parse_phandle(np, "memory-region", i);
-		if (!mem)
-			return -EINVAL;
-		rmem = of_reserved_mem_lookup(mem);
-		valid = rmem && mem->parent == reserved &&
-			of_device_is_available(mem) &&
-			of_property_read_bool(mem, "no-map") &&
-			!of_property_read_bool(mem, "reusable");
-		if (valid) {
-			phys[i] = rmem->base;
-			size[i] = rmem->size;
-		}
-		of_node_put(mem);
-		if (!valid)
-			return -EINVAL;
+		ret = ane_fw_preload_range(np, i, &phys[i], &size[i]);
+		if (ret)
+			return ret;
 	}
 
 	return ane_fw_preload_ranges_valid(soc, phys, size, dva) ? 0 : -EINVAL;
@@ -167,13 +176,6 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	ret = ane_h16_stage_parse(h16_stage);
-	if (ret < 0)
-		return ret;
-	if (!ret) {
-		dev_info(dev, "H16 ANE: staged backend requires h16_stage opt-in; refusing before power access\n");
-		return -EOPNOTSUPP;
-	}
 	if (!soc->h16_boot || of_property_count_u64_elems(np, "apple,dapf-ranges") != 8)
 		return -ENODATA;
 	return 0;
@@ -185,7 +187,7 @@ int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_plat
 
 	if (ret)
 		return ret;
-	return ane_h16_backend_probe(pdev, soc, ane_h16_stage_parse(h16_stage));
+	return ane_h16_backend_probe(pdev, soc);
 }
 
 void ane_fw_platform_remove(struct platform_device *pdev)
