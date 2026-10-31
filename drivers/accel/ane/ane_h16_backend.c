@@ -213,10 +213,6 @@ static int ane_h16_map(void *ctx)
 	unsigned int count = 0, i;
 	int ret;
 
-	if (!dev_is_dma_coherent(h->dev)) {
-		dev_err(h->dev, "H16 private surfaces require a coherent client\n");
-		return -EOPNOTSUPP;
-	}
 	if (of_count_phandle_with_args(h->dev->of_node, "iommus", "#iommu-cells") != 3) {
 		dev_err(h->dev, "H16 map requires only SID 0 on three DARTs; refusing extra streams\n");
 		return -EOPNOTSUPP;
@@ -285,6 +281,10 @@ static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surfa
 	unsigned int order = get_order(SZ_16K);
 	int ret;
 
+	if (!dev_is_dma_coherent(h->dev)) {
+		dev_err(h->dev, "H16 private surfaces require a coherent client\n");
+		return -EOPNOTSUPP;
+	}
 	if (!size || !IS_ALIGNED(size, SZ_16K) || !IS_ALIGNED(dva, SZ_16K) ||
 	    PAGE_SIZE > SZ_16K)
 		return -EINVAL;
@@ -350,7 +350,13 @@ static u32 ane_h16_engine_read(void *ctx, u32 offset)
 
 static void ane_h16_engine_write(void *ctx, u32 offset, u32 value)
 {
+	struct ane_h16_device *h = ctx;
+
 	ane_h16_mmio_write32(ctx, ANE_H16_ENGINE, offset, value);
+	if (offset == h->boot.soc->irq_ack) {
+		/* Complete the snapshot acknowledgment before ring reads (r5). */
+		mb();
+	}
 }
 
 static u64 ane_h16_now(void *ctx)

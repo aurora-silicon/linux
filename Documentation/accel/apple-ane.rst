@@ -394,7 +394,7 @@ writes no engine, DART or DAPF register at this rung. Genpd owns power writes.
 
 ``map`` claims an exclusive, singleton IOMMU group and an unmanaged domain
 covering the three SID-0 DART instances. Private surfaces currently require
-a DMA-coherent client; noncoherent clients refuse before mapping. No
+a DMA-coherent client; noncoherent clients refuse pool allocation before RUN. No
 unexported architecture cache helper is called from the module. It checks
 the finalized aperture
 rather than widening geometry in the client. TEXT is read-only, DATA is
@@ -441,8 +441,13 @@ Only then does the host write READY to scratch 3 and wait for zero.
 ``startup`` sends only PRINT_ENABLE (0x4, 12 bytes), START (0x0, 12),
 CONFIG_GET (0x3, 16) and RESOURCE_INFO_GET (0x22, 100) on IO. SHAREDMALLOC
 allocation requests are serviced under the shared transport's bounded host
-policy while waiting. Each command keeps one absolute deadline and requires
-a zero acknowledgement. The CONFIG_GET tick must be nonzero and is logged;
+policy while waiting. The pinned H16 profile also acknowledges native FREE
+for its own live allocations with a zero tuple. Backing storage and quota
+stay pinned until reboot; retired allocations cannot authorize reports or
+a second FREE. Foreign frees and control forms without a proved request
+layout quarantine without an invented reply. Other firmware profiles retain
+the default refusal of FREE/control. Each command keeps one absolute deadline and requires
+a zero acknowledgment. The CONFIG_GET tick must be nonzero and is logged;
 24 MHz is a comparison value, not a refusal predicate. All 100 resource-info
 reply bytes are logged and do not grant allocation authority.
 
@@ -512,4 +517,5 @@ The ``ane-h16-boot`` KUnit suite uses a simulated engine, scratch cells,
 mailbox polling and rings. It covers startup including allocation service,
 missing READY, wrong/stale table publication, oversized IPC/heap requests,
 channel bounds, locked DAPF differences, nonzero acks, scratch-3 timeout,
-zero tick, default refusal and quarantine after RUN.
+zero tick, default refusal and quarantine after RUN. It also covers matching
+locked DAPF, heap/shared overlap, native FREE, foreign FREE and control refusal.

@@ -66,6 +66,8 @@ struct ane_fw_transport {
 	u32 shared_count;
 	int error;
 	bool armed;
+	bool native_free;
+	bool shared_retired[ANE_FW_SHARED_MAX];
 };
 
 static inline bool ane_fw_surface_valid(const struct ane_fw_surface *s)
@@ -272,6 +274,8 @@ ane_fw_transport_report(struct ane_fw_transport *t, u64 dva, u64 size)
 	unsigned int i;
 
 	for (i = 0; i < t->shared_count + 2; i++) {
+		if (i >= 2 && t->shared_retired[i - 2])
+			continue;
 		s = i == 0 ? &t->ipc : i == 1 ? &t->pool : &t->shared[i - 2];
 		if (ane_fw_contains(s->dva, s->size, dva, size))
 			return (u8 *)s->cpu + (dva - s->dva);
@@ -319,7 +323,7 @@ ane_fw_transport_consume(struct ane_fw_transport *t, void *report, size_t capaci
 	return 0;
 }
 
-/* Obs-Neo-25G83 ceilings. G12 FREE/control replies remain Open. */
+/* Conservative default allocation policy. Native FREE requires build opt-in. */
 static inline int ane_fw_shared_size(u64 word0, u64 bytes, u64 tag, size_t *size)
 {
 	if (word0 || !bytes)
@@ -330,6 +334,30 @@ static inline int ane_fw_shared_size(u64 word0, u64 bytes, u64 tag, size_t *size
 	    (bytes != SZ_2M || tag != ANE_FW_SHARED_EXPP))
 		return -E2BIG;
 	*size = ALIGN(bytes, SZ_16K);
+	return 0;
+}
+
+/* H16 26A428 native FREE, r5 section 6. Reply before revoking authority.
+ * The backend retains backing storage, mappings and quota until reset.
+ */
+static inline int
+ane_fw_transport_native_free(struct ane_fw_transport *t, void *slot, u64 dva)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->shared_count; i++)
+		if (!t->shared_retired[i] && dva == t->shared[i].dva)
+			break;
+	if (i == t->shared_count)
+		return -ENOENT;
+	t->ops->store64(t->ctx, (u8 *)slot + 8, 0);
+	t->ops->store64(t->ctx, (u8 *)slot + 16, 0);
+	t->ops->write_barrier(t->ctx);
+	t->ops->store64(t->ctx, slot, 1);
+	t->ops->write_barrier(t->ctx);
+	ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
+	t->shared_retired[i] = true;
+	ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
 	return 0;
 }
 
@@ -356,6 +384,12 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 	word2 = t->ops->load64(t->ctx, p + 16);
 	if (!word0 && !word1 && !word2)
 		return -EAGAIN;
+	if (t->native_free && word0) {
+		ret = ane_fw_transport_native_free(t, p, word0);
+		if (ret)
+			goto refused;
+		return 0;
+	}
 	ret = ane_fw_shared_size(word0, word1, word2, &size);
 	if (ret)
 		goto refused;

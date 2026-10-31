@@ -77,6 +77,7 @@ struct ane_h16_build {
 	u32 dapf_lock;
 	u32 dapf_records;
 	u32 dapf_stride;
+	bool native_free;
 	bool dapf_layout_known;
 	bool c1ppt;
 	const struct ane_h16_tunables *tunables;
@@ -476,6 +477,7 @@ static inline int ane_h16_scratch_boot(struct ane_h16_boot *b)
 				    f->ipc_dva, ANE_FW_TABLE_SIZE);
 	if (ret)
 		return ret;
+	b->transport.native_free = f->native_free;
 	b->ops->log(b->ctx, "table validated", f->ipc_dva, ANE_FW_CHANNELS);
 	ret = ane_fw_transport_arm(&b->transport);
 	if (ret)

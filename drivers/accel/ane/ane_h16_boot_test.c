@@ -33,6 +33,8 @@ struct ane_h16_sim {
 	u32 mailbox_tx;
 	bool offered_mailbox;
 	bool fault_after_run;
+	u32 lifecycle_mode;
+	bool lifecycle_requested;
 	u16 refuse_id;
 	bool no_ready;
 	bool wrong_table;
@@ -162,7 +164,18 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 			if (s->command_count < 4)
 				KUNIT_EXPECT_EQ(s->test, tx->id, f->startup[s->command_count].id);
 			s->command_count++;
-			if (!tx->id) {
+			if (tx->id == 3 && s->lifecycle_mode) {
+				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
+				u64 dva = s->lifecycle_mode == 2 ? 0 : s->build.shared_dva;
+
+				if (s->lifecycle_mode == 3)
+					dva += SZ_16K;
+
+				put_unaligned_le64(dva, slot);
+				put_unaligned_le64(0, slot + 8);
+				put_unaligned_le64(s->lifecycle_mode == 2 ? 1 : 0, slot + 16);
+				s->lifecycle_requested = true;
+			} else if (!tx->id) {
 				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 
 				put_unaligned_le64(0, slot);
@@ -175,6 +188,14 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 		}
 		if (value == BIT(5)) {
 			s->shared_replied = true;
+			if (s->lifecycle_requested) {
+				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
+
+				KUNIT_EXPECT_EQ(s->test, s->lifecycle_mode, 1U);
+				KUNIT_EXPECT_EQ(s->test, get_unaligned_le64(slot), 1ULL);
+				KUNIT_EXPECT_EQ(s->test, get_unaligned_le64(slot + 8), 0ULL);
+				KUNIT_EXPECT_EQ(s->test, get_unaligned_le64(slot + 16), 0ULL);
+			}
 			sim_reply(s);
 		}
 		return;
@@ -620,8 +641,75 @@ static void ane_h16_map_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->pins, 0U);
 }
 
+static void ane_h16_locked_matching_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int dart, i;
+
+	s->lock = BIT(2);
+	for (dart = 0; dart < 3; dart++) {
+		for (i = 0; i < 4; i++) {
+			u32 *p = &s->dapf[dart][(s->build.dapf_records + i * 0x40) / 4];
+
+			p[0] = 0x80000031;
+			p[2] = lower_32_bits(s->boot.ranges[i][0]);
+			p[3] = upper_32_bits(s->boot.ranges[i][0]);
+			p[4] = lower_32_bits(s->boot.ranges[i][1]);
+			p[5] = upper_32_bits(s->boot.ranges[i][1]);
+			p[8] = 0xabcd0001;
+		}
+	}
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
+}
+
+static void ane_h16_heap_overlap_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->heap_request = SZ_16M;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), -E2BIG);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+}
+
+static void ane_h16_native_free_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->lifecycle_mode = 1;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_TRUE(test, s->lifecycle_requested);
+	KUNIT_EXPECT_TRUE(test, s->boot.transport.shared_retired[0]);
+	KUNIT_EXPECT_TRUE(test, s->boot.transport.shared[0].cpu);
+}
+
+static void ane_h16_control_refusal_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->lifecycle_mode = 2;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EOPNOTSUPP);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_FALSE(test, s->boot.transport.shared_retired[0]);
+}
+
+static void ane_h16_foreign_free_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->lifecycle_mode = 3;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ENOENT);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_FALSE(test, s->boot.transport.shared_retired[0]);
+}
+
 static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_happy_test),
+	KUNIT_CASE(ane_h16_locked_matching_test),
+	KUNIT_CASE(ane_h16_heap_overlap_test),
+	KUNIT_CASE(ane_h16_native_free_test),
+	KUNIT_CASE(ane_h16_control_refusal_test),
+	KUNIT_CASE(ane_h16_foreign_free_test),
 	KUNIT_CASE(ane_h16_mailbox_test),
 	KUNIT_CASE(ane_h16_no_heap_test),
 	KUNIT_CASE(ane_h16_power_actual_test),

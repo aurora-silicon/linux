@@ -165,6 +165,7 @@ static const struct ane_h16_build ane_h16_build_26a428 = {
 	/* Version/protect/lock are DART registers; DAPF records are separate. */
 	.dapf_records = 0,
 	.dapf_layout_known = true,
+	.native_free = true,
 	.c1ppt = true,
 	.tunables = ane_h16_tunables_26a428,
 	.tunable_count = ARRAY_SIZE(ane_h16_tunables_26a428),
