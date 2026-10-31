@@ -66,6 +66,8 @@ struct avd_backend_ops {
 	void (*session_stop)(struct avd_ctx *ctx);	/* apple: cmd 2 */
 	/* Non-blocking. -EBUSY means inbox full: core retries on next completion. */
 	int  (*submit)(struct avd_dev *avd, struct avd_frame *f);
+	/* Bounded producer work: >0 retry shortly, <0 reset before retirement. */
+	int  (*pump)(struct avd_dev *avd);
 	void (*abort)(struct avd_ctx *ctx);		/* apple: cmd 5 */
 	irqreturn_t (*irq)(struct avd_dev *avd);	/* calls avd_frame_complete() */
 	int  (*suspend)(struct avd_dev *avd);
@@ -77,6 +79,10 @@ struct avd_backend_ops {
 struct avd_codec_frame_ops {
 	/* Read the request's controls, set f->dep, fill f->prog (open backend)
 	 * or f->fp (apple backend), allocate f->codec_priv if needed. */
+	/* Open multi-VP extension: cmd[0] = codec, cmd[1] = codec PP EXEC count.
+	 * All VP EXECs use FIFO index f->idx. Core defaults to PREV_DONE;
+	 * use NONE only when reference and codec-state independence is proven.
+	 */
 	int  (*prepare)(struct avd_ctx *ctx, struct avd_frame *f);
 	/* Apple backend: fill the codec part of f->cmd (SPEC 6.x). */
 	int  (*pack_cmd)(struct avd_ctx *ctx, struct avd_frame *f);

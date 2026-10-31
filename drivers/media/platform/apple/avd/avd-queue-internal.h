@@ -8,6 +8,25 @@
 
 #include "avd-queue.h"
 
+static inline unsigned int avd_inflight_limit(unsigned int fifo_slots,
+					       unsigned int backend_limit)
+{
+	unsigned int limit = fifo_slots < backend_limit ? fifo_slots : backend_limit;
+
+	return limit < AVD_MAX_FRAMES ? limit : AVD_MAX_FRAMES;
+}
+
+static inline struct avd_frame *avd_slot_available(struct avd_frame *pool,
+						 unsigned int limit)
+{
+	unsigned int i;
+
+	for (i = 0; i < limit && i < AVD_MAX_FRAMES; i++)
+		if (pool[i].state == AVD_FRAME_FREE)
+			return &pool[i];
+	return NULL;
+}
+
 /* Caller serializes the pool; tags are never recycled during device lifetime. */
 static inline int avd_slot_reserve(struct avd_frame *f, struct avd_ctx *ctx,
 				   u64 seq)
@@ -20,9 +39,11 @@ static inline int avd_slot_reserve(struct avd_frame *f, struct avd_ctx *ctx,
 	f->tag = (seq << 4) | f->idx;
 	f->ctx = ctx;
 	f->state = AVD_FRAME_RESERVED;
-	f->dep = AVD_DEP_NONE;
+	/* H.264/HEVC VP independence is unproven; codecs must opt in. */
+	f->dep = AVD_DEP_PREV_DONE;
 	f->status = 0;
 	f->prog_words = 0;
+	f->fifo_iova = 0;
 	f->codec_priv = NULL;
 	return 0;
 }

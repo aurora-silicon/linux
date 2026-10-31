@@ -1002,6 +1002,7 @@ static int stream_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	}
 
 	hevc_ctx->submit_num = pos;
+	ctx->job.pp_execs = pos;
 
 	return 0;
 }

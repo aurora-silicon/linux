@@ -225,7 +225,7 @@ struct avd_av1_run {
 };
 
 struct avd_av1_ctx {
-	u8 submit_num;
+	u32 submit_num;
 	struct {
 		struct avd_buf inst;
 		struct avd_buf pipe_state;
@@ -1002,6 +1002,7 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
 									     4;
 
 	av1_ctx->submit_num = tile_info->tile_cols * tile_info->tile_rows;
+	ctx->job.pp_execs = av1_ctx->submit_num;
 
 	for (row = 0; row < tile_info->tile_rows; row++) {
 		for (col = 0; col < tile_info->tile_cols; col++) {
@@ -1533,7 +1534,7 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 	       avd->ctrl + avd->variant->submit_offset);
-	for (int i = 0; i < av1_ctx->submit_num - 1; i++) {
+	for (u32 i = 1; i < av1_ctx->submit_num; i++) {
 		writel(AVD_OP_EXEC | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 		       avd->ctrl + avd->variant->submit_offset);

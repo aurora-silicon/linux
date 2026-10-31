@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/unaligned.h>
+#include <linux/slab.h>
 
 #include "avd.h"
 #include "avd-apple-protocol.h"
 #include "avd-queue-internal.h"
+#include "avd-open-protocol.h"
 
 static void avd_slots_and_tags(struct kunit *test)
 {
@@ -163,6 +165,7 @@ static void avd_dispatch_reservation(struct kunit *test)
 	static const struct avd_backend_ops backend = {
 		.max_inflight = avd_test_max_inflight,
 	};
+	static const struct avd_variant variant = { .fifo_slots = 7 };
 	struct avd_dev *avd = kunit_kzalloc(test, sizeof(*avd), GFP_KERNEL);
 	struct avd_ctx *ctx = kunit_kcalloc(test, 2, sizeof(*ctx), GFP_KERNEL);
 
@@ -170,11 +173,17 @@ static void avd_dispatch_reservation(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, ctx);
 	spin_lock_init(&avd->queue_lock);
 	avd->backend = &backend;
+	avd->variant = &variant;
 	ctx[0].dev = avd;
 	ctx[1].dev = avd;
 	KUNIT_EXPECT_EQ(test, avd_queue_ready(&ctx[0]), 1);
 	/* The second context must not reserve the same observed capacity. */
 	KUNIT_EXPECT_EQ(test, avd_queue_ready(&ctx[1]), 0);
+	avd->queued_ctx = NULL;
+	avd->inflight = 7;
+	KUNIT_EXPECT_EQ(test, avd_queue_ready(&ctx[1]), 0);
+	avd->inflight = 6;
+	KUNIT_EXPECT_EQ(test, avd_queue_ready(&ctx[1]), 1);
 	avd->queued_ctx = NULL;
 	avd->inflight = AVD_MAX_FRAMES;
 	KUNIT_EXPECT_EQ(test, avd_queue_ready(&ctx[1]), 0);
@@ -187,6 +196,101 @@ static void avd_dispatch_reservation(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, avd_queue_ready(&ctx[1]), 1);
 }
 
+static void avd_fifo_limits(struct kunit *test)
+{
+	struct avd_frame *pool;
+	unsigned int i;
+
+	pool = kunit_kcalloc(test, AVD_MAX_FRAMES, sizeof(*pool), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, pool);
+	for (i = 0; i < 7; i++)
+		pool[i].state = AVD_FRAME_SUBMITTED;
+	KUNIT_EXPECT_PTR_EQ(test,
+		avd_slot_available(pool, avd_inflight_limit(7, 16)), NULL);
+	KUNIT_EXPECT_PTR_EQ(test,
+		avd_slot_available(pool, avd_inflight_limit(15, 16)), &pool[7]);
+	for (; i < 15; i++)
+		pool[i].state = AVD_FRAME_SUBMITTED;
+	KUNIT_EXPECT_PTR_EQ(test,
+		avd_slot_available(pool, avd_inflight_limit(15, 16)), NULL);
+	KUNIT_EXPECT_EQ(test, avd_inflight_limit(7, 16), 7U);
+	KUNIT_EXPECT_EQ(test, avd_inflight_limit(15, 16), 15U);
+	KUNIT_EXPECT_EQ(test, avd_inflight_limit(15, 1), 1U);
+	KUNIT_EXPECT_EQ(test, avd_inflight_limit(32, 32), 16U);
+	KUNIT_EXPECT_EQ(test, avd_inflight_limit(0, 16), 0U);
+}
+
+static void avd_pp_work_count(struct kunit *test)
+{
+	static const struct avd_variant variant = { .revision = 4 };
+	struct avd_dev *avd = kunit_kzalloc(test, sizeof(*avd), GFP_KERNEL);
+	struct avd_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct avd_buf prog = {};
+	struct avd_frame f = { .prog = &prog };
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, avd);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	prog.cpu = kunit_kcalloc(test, 16, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, prog.cpu);
+	prog.size = 16 * sizeof(u32);
+	avd->variant = &variant;
+	avd->building = &f;
+	ctx->dev = avd;
+	ctx->job.codec = AVD_CODEC_H264;
+	ctx->job.num = 3;
+	ctx->job.pp_execs = 1; /* Three slices, one PP picture. */
+	ctx->job.segments = kvcalloc(4, sizeof(*ctx->job.segments), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->job.segments);
+	for (i = 0; i < 4; i++)
+		ctx->job.segments[i].num = 1;
+	KUNIT_ASSERT_EQ(test, avd_open_build_program(ctx), 0);
+	KUNIT_EXPECT_EQ(test, f.cmd[1], 1U);
+	KUNIT_EXPECT_EQ(test, f.prog_words, (size_t)8);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->job.segments, NULL);
+	/* A valid 256-tile frame must not truncate its PP work count to u8. */
+	prog.cpu = kunit_kcalloc(test, 1024, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, prog.cpu);
+	prog.size = 1024 * sizeof(u32);
+	ctx->job.codec = AVD_CODEC_VP9;
+	ctx->job.num = 256;
+	ctx->job.pp_execs = 256;
+	ctx->job.segments = kvcalloc(257, sizeof(*ctx->job.segments), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->job.segments);
+	for (i = 0; i < 257; i++)
+		ctx->job.segments[i].num = 1;
+	KUNIT_ASSERT_EQ(test, avd_open_build_program(ctx), 0);
+	KUNIT_EXPECT_EQ(test, f.cmd[1], 256U);
+	KUNIT_EXPECT_EQ(test, f.prog_words, (size_t)514);
+
+}
+
+static void avd_open_metadata_capability(struct kunit *test)
+{
+	u32 info[7] = { AVD_OPEN_MULTI_MAGIC, AVD_OPEN_MULTI_VERSION };
+
+	info[6] = AVD_OPEN_FLAG_MULTI_VP;
+	KUNIT_EXPECT_FALSE(test, avd_open_has_multi(15, info));
+	KUNIT_EXPECT_TRUE(test, avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));
+	info[1]++;
+	KUNIT_EXPECT_FALSE(test, avd_open_has_multi(15 | AVD_OPEN_CAP_MULTI_VP, info));
+}
+
+static void avd_sram_ring_wrap(struct kunit *test)
+{
+	u32 chunk;
+
+	KUNIT_ASSERT_EQ(test, avd_open_ring_chunk(2, U32_MAX - 1, 4096, 4096, &chunk), 0);
+	KUNIT_EXPECT_EQ(test, chunk, 4092U);
+	KUNIT_ASSERT_EQ(test, avd_open_ring_chunk(U32_MAX - 1, U32_MAX - 1,
+						4096, 10, &chunk), 0);
+	KUNIT_EXPECT_EQ(test, chunk, 2U);
+	KUNIT_ASSERT_EQ(test, avd_open_ring_chunk(4096, 0, 4096, 1, &chunk), 0);
+	KUNIT_EXPECT_EQ(test, chunk, 0U);
+	KUNIT_EXPECT_EQ(test, avd_open_ring_chunk(4097, 0, 4096, 1, &chunk), -EIO);
+	KUNIT_EXPECT_EQ(test, avd_open_ring_chunk(0, 0, 6144, 1, &chunk), -EIO);
+}
+
 static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_slots_and_tags),
 	KUNIT_CASE(avd_retirement_order),
@@ -194,6 +298,10 @@ static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_completion_parser),
 	KUNIT_CASE(avd_command_builders),
 	KUNIT_CASE(avd_dispatch_reservation),
+	KUNIT_CASE(avd_fifo_limits),
+	KUNIT_CASE(avd_pp_work_count),
+	KUNIT_CASE(avd_open_metadata_capability),
+	KUNIT_CASE(avd_sram_ring_wrap),
 	{}
 };
 

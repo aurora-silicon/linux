@@ -1011,6 +1011,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		return 0;
 	}
 
+	ctx->job.pp_execs = 1;
 	ctx->job_fifo = h264_ctx->b->bufs.inst.addr;
 	h264_ctx->b->submitted = true;
 	return avd_submit_job(ctx);

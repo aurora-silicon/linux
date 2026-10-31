@@ -55,10 +55,12 @@ int avd_open_build_program(struct avd_ctx *ctx)
 		for (j = 0; j < job->segments[i].num; j++)
 			words[pos++] = job->segments[i].instructions[j];
 		if (i)
-			words[pos++] = AVD_OP_EXEC | mask | AVD_OP_EXEC_FLAG_END(i == job->num);
+			words[pos++] = AVD_OP_EXEC | mask | AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
+				AVD_OP_EXEC_FLAG_END(i == job->num);
 	}
 	f->prog_words = pos;
 	f->cmd[0] = job->codec;
+	f->cmd[1] = job->pp_execs;
 	kvfree(job->segments);
 	job->segments = NULL;
 	return 0;

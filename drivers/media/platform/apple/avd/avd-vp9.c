@@ -191,7 +191,7 @@ struct avd_vp9_ctx {
 	} bufs;
 	struct avd_vp9_frame_info cur;
 	struct avd_vp9_frame_info last;
-	u8 submit_num;
+	u32 submit_num;
 };
 
 static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
@@ -801,6 +801,7 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 	set_tiles(ctx, &run);
 	avd_run_postamble(ctx, &run.base);
 
+	ctx->job.pp_execs = vp9_ctx->submit_num;
 	return avd_submit_job(ctx);
 }
 
@@ -1072,7 +1073,7 @@ static void avd_vp9_submit(struct avd_ctx *ctx)
 		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
 	       avd->ctrl + avd->variant->submit_offset);
-	for (int i = 0; i < vp9_ctx->submit_num - 1; i++)
+	for (u32 i = 1; i < vp9_ctx->submit_num; i++)
 		writel(AVD_OP_EXEC | submit_mask |
 			       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
 			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),

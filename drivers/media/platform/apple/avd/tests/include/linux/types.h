@@ -3,9 +3,11 @@
 #define AVD_HOST_TYPES_H_
 #include <stdbool.h>
 #include <stddef.h>
-#include_next <linux/types.h>
-typedef __u8 u8;
-typedef __u32 u32;
-typedef __u64 u64;
-typedef __u64 dma_addr_t;
+#include <stdint.h>
+typedef uint8_t u8;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef uint64_t dma_addr_t;
+/* Host transport test runs on little-endian build hosts. */
+typedef uint32_t __le32;
 #endif

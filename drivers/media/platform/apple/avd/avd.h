@@ -194,6 +194,7 @@ struct avd_apple_hw;
 struct avd_variant {
 	const struct avd_apple_hw *apple;
 	size_t fp_size;
+	/* Number of engines in each codec pool; bases include tier-0 holes. */
 	unsigned int vp_slots[4];
 	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
@@ -246,6 +247,7 @@ struct avd_dev {
 	struct avd_buf *frame_fp[AVD_MAX_FRAMES];
 	u64 frame_seq;
 	unsigned int inflight;
+	int queue_error;
 	bool stopping;
 	bool faulted;
 	/* Recovery pacing: when the last one ran, and a sliding storm count. */
@@ -281,6 +283,7 @@ struct avd_segment {
 
 struct avd_job {
 	enum avd_codec codec;
+	u32 pp_execs; /* Codec PP work count, distinct from VP program segments. */
 	size_t num;
 	struct avd_segment *segments;
 };
@@ -393,6 +396,7 @@ extern const struct avd_backend_ops avd_apple_backend;
 extern const struct avd_backend_ops avd_qfw_backend;
 struct avd_qfw;
 int avd_qfw_probe(struct avd_dev *avd);
+void avd_qfw_cleanup(struct avd_dev *avd);
 void avd_qfw_select(struct avd_dev *avd);
 void avd_qfw_prepare_boot(struct avd_dev *avd);
 bool avd_backend_is_qfw(const struct avd_dev *avd);

@@ -123,6 +123,7 @@ static void avd_reset_queue(struct avd_dev *avd, int status)
 	if (ret)
 		dev_err(avd->dev, "queue reset failed: %d\n", ret);
 	avd->compat_active = NULL;
+	avd->queue_error = 0;
 	list_for_each_entry(ctx, &avd->contexts, queue_node)
 		ctx->session_started = false;
 	spin_lock_irqsave(&avd->queue_lock, flags);
@@ -172,12 +173,22 @@ static void avd_queue_worker(struct work_struct *work)
 	struct avd_ctx *ctx;
 	unsigned long flags;
 	unsigned int i;
-	bool pending;
+	bool pending, producer_pending = false;
 	unsigned long delay = AVD_FRAME_TIMEOUT;
 
 	mutex_lock(&avd->queue_mutex);
 	if (avd->stopping)
 		goto unlock;
+	if (avd->queue_error)
+		avd_reset_queue(avd, avd->queue_error);
+	if (avd->backend->pump) {
+		int ret = avd->backend->pump(avd);
+
+		if (ret < 0)
+			avd_reset_queue(avd, ret);
+		else
+			producer_pending = ret > 0;
+	}
 	for (i = 0; i < AVD_MAX_FRAMES; i++) {
 		bool expired;
 
@@ -209,6 +220,17 @@ static void avd_queue_worker(struct work_struct *work)
 			spin_unlock_irqrestore(&avd->queue_lock, flags);
 		}
 	}
+	/* A RESERVED retry can have installed a new producer after the first pump. */
+	if (avd->backend->pump) {
+		int ret = avd->backend->pump(avd);
+
+		if (ret < 0) {
+			avd_reset_queue(avd, ret);
+			producer_pending = false;
+		} else {
+			producer_pending = ret > 0;
+		}
+	}
 	avd_retire(avd);
 	/* Freed slots/dependencies must wake contexts whose job_ready was false. */
 	list_for_each_entry(ctx, &avd->contexts, queue_node)
@@ -227,6 +249,8 @@ static void avd_queue_worker(struct work_struct *work)
 		delay = min(delay, remaining);
 	}
 	spin_unlock_irqrestore(&avd->queue_lock, flags);
+	if (producer_pending)
+		delay = min(delay, AVD_RETRY_DELAY);
 	if (pending)
 		mod_delayed_work(system_wq, &avd->queue_work, delay);
  unlock:
@@ -261,18 +285,13 @@ int avd_queue_ready(void *priv)
 	 */
 	ready = !avd->queued_ctx && !READ_ONCE(ctx->draining) &&
 		!READ_ONCE(avd->stopping) &&
-		avd->inflight < avd->backend->max_inflight(avd);
-	if (ready && ctx->next_dep == AVD_DEP_PREV_DONE) {
-		/* Legacy codecs may hold several pictures in separate banks. */
-		unsigned int limit = ctx->coded_fmt_desc && !ctx->coded_fmt_desc->frame_ops ?
-				     max(ctx->max_frames, 1U) : 1, held = 0;
+		avd->inflight < avd_inflight_limit(avd->variant->fifo_slots,
+						    avd->backend->max_inflight(avd));
+	for (i = 0; ready && i < AVD_MAX_FRAMES; i++)
+		if (ctx->next_dep == AVD_DEP_PREV_DONE &&
+		    avd->frames[i].state != AVD_FRAME_FREE && avd->frames[i].ctx == ctx)
+			ready = false;
 
-		for (i = 0; i < AVD_MAX_FRAMES; i++)
-			if (avd->frames[i].state != AVD_FRAME_FREE &&
-			    avd->frames[i].ctx == ctx)
-				held++;
-		ready = held < limit;
-	}
 	/* Prevent several queued m2m contexts from observing the same free slot. */
 	if (ready)
 		avd->queued_ctx = ctx;
@@ -287,7 +306,6 @@ static void avd_queue_submit_work(struct work_struct *work)
 	const struct avd_codec_frame_ops *ops = ctx->coded_fmt_desc->frame_ops;
 	struct avd_frame *f = NULL;
 	unsigned long flags;
-	unsigned int i;
 	int ret;
 
 	mutex_lock(&avd->queue_mutex);
@@ -306,12 +324,9 @@ static void avd_queue_submit_work(struct work_struct *work)
 						 VB2_BUF_STATE_ERROR);
 		goto unlock;
 	}
-	for (i = 0; i < AVD_MAX_FRAMES; i++) {
-		if (avd->frames[i].state == AVD_FRAME_FREE) {
-			f = &avd->frames[i];
-			break;
-		}
-	}
+	f = avd_slot_available(avd->frames,
+		avd_inflight_limit(avd->variant->fifo_slots,
+				   avd->backend->max_inflight(avd)));
 	ret = f ? avd_slot_reserve(f, ctx, ++avd->frame_seq) : -EBUSY;
 	if (!ret)
 		avd->inflight++;
@@ -398,6 +413,10 @@ static void avd_queue_submit_work(struct work_struct *work)
 						 VB2_BUF_STATE_DONE);
 		goto unlock;
 	}
+	/* A complete picture owns its buffers independently of the m2m job.
+	 * Earlier HOLD_CAPTURE_BUF requests took the immediate-retire path.
+	 */
+	f->scheduler_held = false;
 	v4l2_m2m_buf_copy_metadata(f->src, f->dst);
 	if (!f->scheduler_held) {
 		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
@@ -562,4 +581,6 @@ void avd_queue_cleanup(struct avd_dev *avd)
 		if (avd->frame_fp[i])
 			avd_buf_free(avd, avd->frame_fp[i]);
 	}
+	/* Queue DMA storage joins the PM deferred-unmap list before final off. */
+	avd_qfw_cleanup(avd);
 }
