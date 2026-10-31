@@ -49,7 +49,7 @@ config DRM_ACCEL_ANE_FW_KUNIT_TEST
 
 config DRM_ACCEL_ANE_PM_KUNIT_TEST
 	tristate "KUnit tests for ANE runtime-PM recovery" if !KUNIT_ALL_TESTS
-	depends on KUNIT && PM
+	depends on DRM_ACCEL && KUNIT && PM
 	default KUNIT_ALL_TESTS
 	help
 	  Exercise supplier suspension, power-off verification failure and
