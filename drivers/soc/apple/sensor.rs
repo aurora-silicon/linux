@@ -689,6 +689,33 @@ pub(crate) fn send_patch(blob: &[u8]) -> Result<()> {
     check(unsafe { sep_sensor_xfer_tx(blob.as_ptr().cast(), blob.len()) })
 }
 
+/// A capture must start while the sensor is waiting for a new contact. An
+/// already-reading or already-ready sensor has not observed that boundary.
+/// Once tainted, even an armed status cannot make that same frame fresh.
+/// Construct a new gate only after discarding the frame and rearming.
+pub(crate) struct CaptureContact {
+    waiting: bool,
+    stale: bool,
+}
+
+impl CaptureContact {
+    pub(crate) fn new() -> Self {
+        Self { waiting: false, stale: false }
+    }
+
+    pub(crate) fn observe(&mut self, state: u8) {
+        match state {
+            STATE_ARMED if !self.stale => self.waiting = true,
+            STATE_READING | STATE_DATA_READY if !self.waiting => self.stale = true,
+            _ => {}
+        }
+    }
+
+    pub(crate) fn needs_lift(&self) -> bool {
+        self.stale
+    }
+}
+
 pub(crate) struct Status {
     pub(crate) state: u8,
     offset12: u32,
@@ -807,13 +834,17 @@ pub(crate) fn read_capture(length: u32) -> core::result::Result<Capture, Capture
     buf.resize(len, 0xff, GFP_KERNEL)
         .map_err(|_| CaptureError::NoMemory)?;
 
-    // SAFETY: `cmd` is `READ_CMD_LEN` bytes and `buf` is `len` bytes; both live
+    // Own the buffer through Capture before the bus can fill it, so failures
+    // wipe it too, including frames deliberately discarded for stale contact.
+    let mut capture = Capture(buf);
+
+    // SAFETY: `cmd` is `READ_CMD_LEN` bytes and `capture` holds `len` bytes; both live
     // across the call, and the shim writes only into the receive buffer.
     let rc = unsafe {
         sep_sensor_xfer2(
             cmd.as_ptr().cast(),
             READ_CMD_LEN,
-            buf.as_mut_ptr().cast(),
+            capture.0.as_mut_ptr().cast(),
             len,
         )
     };
@@ -822,9 +853,9 @@ pub(crate) fn read_capture(length: u32) -> core::result::Result<Capture, Capture
     }
 
     let split = len - CRC_LEN;
-    let advertised = u16::from_le_bytes([buf[split], buf[split + 1]]);
+    let advertised = u16::from_le_bytes([capture.0[split], capture.0[split + 1]]);
     // CRC-16/ANSI, not CCITT-FALSE.
-    let computed = crc16_ansi(&buf[..split]);
+    let computed = crc16_ansi(&capture.0[..split]);
     if advertised != computed {
         return Err(CaptureError::Checksum {
             advertised,
@@ -832,5 +863,5 @@ pub(crate) fn read_capture(length: u32) -> core::result::Result<Capture, Capture
         });
     }
 
-    Ok(Capture(buf))
+    Ok(capture)
 }
