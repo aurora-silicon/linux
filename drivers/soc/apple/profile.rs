@@ -450,6 +450,13 @@ pub(crate) const T6040: PlatformProfile = PlatformProfile {
     ..T8140
 };
 
+/// MacBook Pro 16" M4 Max (J616c). Its ADT describes the SEP and the sensor as
+/// J616s's does.
+pub(crate) const T6041: PlatformProfile = PlatformProfile {
+    name: "T6041/J616c",
+    ..T6040
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -617,6 +624,9 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     // the SoC but their sensor wiring is unchecked.
     if machine_has(b"apple,t6040") && machine_has(b"apple,j616s") {
         return Ok(&T6040);
+    }
+    if machine_has(b"apple,t6041") && machine_has(b"apple,j616c") {
+        return Ok(&T6041);
     }
     Err(ENODEV)
 }
