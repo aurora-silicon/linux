@@ -9,7 +9,7 @@ config RUST_DRM_GPUVM
 	select DRM_GPUVM
 
 config DRM_ASAHI
-	tristate "Asahi (DRM support for Apple AGX GPUs)"
+	tristate "Aurora (DRM support for Apple AGX GPUs)"
 	depends on RUST
 	depends on DRM=y
 	depends on (ARM64 && ARCH_APPLE) || (COMPILE_TEST && !GENERIC_ATOMIC64)
@@ -23,7 +23,10 @@ config DRM_ASAHI
 	select RUST_APPLE_RTKIT
 	select CRYPTO_LIB_SHA256
 	help
-	  DRM driver for Apple AGX GPUs (G13x, found in the M1 SoC family)
+	  DRM driver for Apple AGX GPUs, from the M1 family onwards.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called aurora. It keeps "asahi" as a module alias.
 
 config DRM_ASAHI_G16
 	bool "Apple M4 (G16G) support (experimental)"
@@ -31,8 +34,8 @@ config DRM_ASAHI_G16
 	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
 	depends on THERMAL_OF
 	help
-	  Rust Asahi backend for the qualified J713/T8132 GPU firmware.
-	  Load asahi explicitly after the native display and GFX TVM supplier
+	  Rust backend for the qualified J713/T8132 GPU firmware.
+	  Load aurora explicitly after the native display and GFX TVM supplier
 	  are ready. Firmware-visible storage remains retained until a verified
 	  retirement or reboot. Keep the working kernel available during bring-up.
 	  A rendering VM pins about 0.7 GiB; memory-cgroup limits are advisable.

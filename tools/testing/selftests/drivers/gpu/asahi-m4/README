@@ -64,7 +64,7 @@ paired native Mesa installation:
 
   make hardware MESA=/path/to/installed/mesa RENDER_NODE=/dev/dri/renderD128 ROUNDS=32
 
-This builds native-gl46.c, verifies asahi-g16 owns the render node, selects the
+This builds native-gl46.c, verifies aurora-g16 (asahi-g16 on older kernels) owns the render node, selects the
 requested Mesa libraries, clears software/translation/API-version overrides,
 and runs native OpenGL 4.6 triangle readback, compute and geometry-feedback
 checks. Results include kernel/boot identity and Mesa/binary hashes. Ordinary

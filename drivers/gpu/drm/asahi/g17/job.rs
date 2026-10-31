@@ -418,8 +418,8 @@ impl Fences {
 impl<B: Backend> Scheduler<B> {
     pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
         let (credits, name) = match engine {
-            Engine::Render => (RENDER_CREDITS, c_str!("asahi_g17_render")),
-            Engine::Compute => (COMPUTE_CREDITS, c_str!("asahi_g17_compute")),
+            Engine::Render => (RENDER_CREDITS, c_str!("aurora_g17_render")),
+            Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
         let scheduler = sched::Scheduler::new(dev.as_ref().as_ref(), 1, credits, 0, TIMEOUT_MS, name)?;
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
