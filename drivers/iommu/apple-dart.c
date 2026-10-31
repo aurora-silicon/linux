@@ -2543,18 +2543,69 @@ static int apple_dart_domain_add_streams(struct apple_dart_domain *domain,
 				      true);
 }
 
+static void apple_dart_domain_remove_device(struct iommu_domain *domain,
+					    struct apple_dart_master_cfg *cfg)
+{
+	if (domain && (domain->type & __IOMMU_DOMAIN_PAGING))
+		apple_dart_mod_streams(to_dart_domain(domain)->stream_maps,
+				       cfg->stream_maps, false);
+}
+
+/* The IOMMU core does not roll back the device whose attach failed. */
+static void apple_dart_restore_domain(struct iommu_domain *old,
+				      struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	int ret;
+
+	/* Firmware-owned roots and managed SIDs have their own unwind paths. */
+	if (dart->locked || dart->managed_sids || apple_dart_has_borrowed(dart) ||
+	    dart->fw_mirror || dart->fw_handoff)
+		return;
+	apple_dart_hw_disable_dma(stream_map);
+	if (old && (old->type & __IOMMU_DOMAIN_PAGING)) {
+		ret = apple_dart_setup_translation(to_dart_domain(old), stream_map);
+	} else {
+		apple_dart_hw_clear_all_ttbrs(stream_map);
+		ret = dart->hw->invalidate_tlb(stream_map);
+		if (!ret && old && old->type == IOMMU_DOMAIN_IDENTITY)
+			apple_dart_hw_enable_bypass(stream_map);
+	}
+	if (ret) {
+		/* Do not leave DMA pointing at a domain the caller may now free. */
+		apple_dart_hw_disable_dma(stream_map);
+		apple_dart_hw_clear_all_ttbrs(stream_map);
+		dev_err(dart->dev, "failed to restore translation after attach error: %d\n", ret);
+	}
+}
+
 static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 					struct device *dev,
 					struct iommu_domain *old)
 {
-	int ret, i;
+	int ret, i, powered = 0;
 	struct apple_dart_stream_map *stream_map;
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	bool streams_added = false;
 
-	for_each_stream_map(i, cfg, stream_map)
-		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
+	/* Only ordinary paging domains may be replaced during live recovery. */
+	if (old && old != domain && (old->type & __IOMMU_DOMAIN_PAGING)) {
+		for_each_stream_map(i, cfg, stream_map) {
+			struct apple_dart *dart = stream_map->dart;
+
+			if (dart->locked || dart->managed_sids || apple_dart_has_borrowed(dart) ||
+			    dart->fw_mirror || dart->fw_handoff)
+				return -EOPNOTSUPP;
+		}
+	}
+
+	for_each_stream_map(i, cfg, stream_map) {
+		ret = pm_runtime_resume_and_get(stream_map->dart->dev);
+		if (ret < 0)
+			goto err_pm;
+		powered++;
+	}
 
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
 	if (ret)
@@ -2584,20 +2635,35 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 			spin_unlock_irqrestore(&dart->managed_lock, flags);
 			if (ret)
 				goto err;
-		} else if (!stream_map->dart->locked)
-			apple_dart_setup_translation(dart_domain, stream_map);
-		else {
+		} else if (!stream_map->dart->locked) {
+			/* Stop translation before replacing a live domain's TTBRs. */
+			apple_dart_hw_disable_dma(stream_map);
+			ret = apple_dart_setup_translation(dart_domain, stream_map);
+			if (ret)
+				goto err;
+		} else {
 			ret = apple_dart_setup_translation_locked(dart_domain, stream_map);
 			if (ret)
 				goto err;
 		}
 	}
+	/* The old domain must no longer flush or free this device's streams. */
+	if (old != domain)
+		apple_dart_domain_remove_device(old, cfg);
 
 err:
-	if (ret && streams_added && cfg->stream_maps[0].dart->managed_sids)
-		apple_dart_mod_streams(dart_domain->stream_maps, cfg->stream_maps, false);
-	for_each_stream_map(i, cfg, stream_map)
+	if (ret && streams_added) {
+		for_each_stream_map(i, cfg, stream_map)
+			apple_dart_restore_domain(old, stream_map);
+		if (old != domain)
+			apple_dart_mod_streams(dart_domain->stream_maps, cfg->stream_maps, false);
+	}
+err_pm:
+	for_each_stream_map(i, cfg, stream_map) {
+		if (i == powered)
+			break;
 		pm_runtime_put(stream_map->dart->dev);
+	}
 	return ret;
 }
 
@@ -4850,8 +4916,40 @@ static void apple_dart_fw_leaf_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, matched);
 }
 
+static void apple_dart_domain_switch_test(struct kunit *test)
+{
+	struct apple_dart *dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	struct apple_dart_master_cfg *cfg = kunit_kzalloc(test, sizeof(*cfg), GFP_KERNEL);
+	struct apple_dart_domain *dma = kunit_kzalloc(test, sizeof(*dma), GFP_KERNEL);
+	struct apple_dart_domain *empty = kunit_kzalloc(test, sizeof(*empty), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	KUNIT_ASSERT_NOT_NULL(test, cfg);
+	KUNIT_ASSERT_NOT_NULL(test, dma);
+	KUNIT_ASSERT_NOT_NULL(test, empty);
+	dart->num_streams = 16;
+	cfg->stream_maps[0].dart = dart;
+	set_bit(0, cfg->stream_maps[0].sidmap);
+	set_bit(1, cfg->stream_maps[0].sidmap);
+	dma->stream_maps[0].dart = dart;
+	empty->stream_maps[0].dart = dart;
+	dma->domain.type = IOMMU_DOMAIN_DMA;
+	empty->domain.type = IOMMU_DOMAIN_UNMANAGED;
+	/* A second client in the DMA domain must survive the switch. */
+	atomic_long_set(&dma->stream_maps[0].sidmap[0], BIT(0) | BIT(1) | BIT(2));
+	KUNIT_ASSERT_EQ(test, apple_dart_domain_add_streams(empty, cfg), 0);
+	apple_dart_domain_remove_device(&dma->domain, cfg);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&dma->stream_maps[0].sidmap[0]), (long)BIT(2));
+	KUNIT_ASSERT_EQ(test, apple_dart_domain_add_streams(dma, cfg), 0);
+	apple_dart_domain_remove_device(&empty->domain, cfg);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&empty->stream_maps[0].sidmap[0]), 0L);
+	KUNIT_EXPECT_EQ(test, atomic_long_read(&dma->stream_maps[0].sidmap[0]),
+			(long)(BIT(0) | BIT(1) | BIT(2)));
+}
+
 static struct kunit_case apple_dart_fw_cases[] = {
 	KUNIT_CASE(apple_dart_fw_leaf_test),
+	KUNIT_CASE(apple_dart_domain_switch_test),
 	{}
 };
 
