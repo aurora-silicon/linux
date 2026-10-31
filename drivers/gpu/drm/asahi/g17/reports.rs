@@ -4,15 +4,14 @@
 //! treating another firmware's pstate report as an achieved GPU frequency.
 //! Writers and readers hold the device mutex; reads never power the GPU up.
 
-use super::{
-    fw::channels::{EVENT_WORDS, STATISTICS_TYPES},
-    Role,
-};
+use super::{fw::channels::EVENT_WORDS, Role};
 use kernel::prelude::*;
 
 #[derive(Clone, Copy, Default)]
 struct Sample {
     count: u64,
+    admitted: u64,
+    last_admitted: bool,
     host_ns: u64,
     words: [u32; EVENT_WORDS],
 }
@@ -24,20 +23,32 @@ pub(super) struct Reports {
 impl Reports {
     pub(super) fn new() -> Result<Self> {
         // Allocate before firmware starts; receive and debugfs paths allocate nothing.
-        let mut samples = KVec::with_capacity(64, GFP_KERNEL)?;
-        for _ in 0..64 {
+        // Each role has one slot per small tag and one for the last larger tag.
+        // Unknown records must remain inspectable when they stop the ring.
+        let mut samples = KVec::with_capacity(66, GFP_KERNEL)?;
+        for _ in 0..66 {
             samples.push(Sample::default(), GFP_KERNEL)?;
         }
         Ok(Self { samples })
     }
 
-    pub(super) fn record(&mut self, role: Role, words: [u32; EVENT_WORDS], host_ns: u64) {
+    pub(super) fn record(
+        &mut self,
+        role: Role,
+        words: [u32; EVENT_WORDS],
+        host_ns: u64,
+        admitted: bool,
+    ) {
         let tag = words[0];
-        if tag >= u32::BITS || STATISTICS_TYPES & (1 << tag) == 0 {
-            return;
-        }
-        let sample = &mut self.samples[role as usize * 32 + tag as usize];
+        let index = if tag < u32::BITS {
+            role as usize * 32 + tag as usize
+        } else {
+            64 + role as usize
+        };
+        let sample = &mut self.samples[index];
         sample.count = sample.count.saturating_add(1);
+        sample.admitted = sample.admitted.saturating_add(u64::from(admitted));
+        sample.last_admitted = admitted;
         sample.host_ns = host_ns;
         sample.words = words;
     }
@@ -45,7 +56,7 @@ impl Reports {
     pub(super) fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         writeln!(
             f,
-            "format=1 units=raw host_time=monotonic_ns achieved_frequency=unqualified"
+            "format=2 units=raw host_time=monotonic_ns achieved_frequency=unqualified admission=transport"
         )?;
         for (index, sample) in self
             .samples
@@ -55,10 +66,12 @@ impl Reports {
         {
             writeln!(
                 f,
-                "role={} tag={:#x} count={} host_ns={} words={:08x?}",
-                index / 32,
-                index % 32,
+                "role={} tag={:#x} count={} admitted={} last_admitted={} host_ns={} words={:08x?}",
+                if index < 64 { index / 32 } else { index - 64 },
+                sample.words[0],
                 sample.count,
+                sample.admitted,
+                sample.last_admitted,
                 sample.host_ns,
                 sample.words
             )?;
@@ -77,13 +90,18 @@ impl kernel::debugfs::Writer for View {
             return writeln!(f, "online=0");
         };
         firmware.observe_statistics_power();
+        let dev: &kernel::device::Device = &self.0.dev;
         writeln!(
             f,
-            "online=1 graph={:?} sampled_ns={}",
+            "online=1 device={} graph={:?} sampled_ns={}",
+            dev.name(),
             self.0.variant.graph,
             super::now_ns()
         )?;
         write_power(firmware, f)?;
+        firmware
+            .rings
+            .write_statistics_transport(&firmware.init, firmware.roles(), f)?;
         firmware.rings.write_reports(f)
     }
 }
@@ -115,7 +133,8 @@ impl kernel::debugfs::Writer for PowerView {
     }
 }
 
-#[kernel::macros::kunit_tests(asahi_g17_reports)]
+#[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_reports))]
+#[cfg(any(test, CONFIG_KUNIT))]
 mod tests {
     use super::*;
 
@@ -125,27 +144,34 @@ mod tests {
         let mut words = [0; EVENT_WORDS];
         words[0] = 16;
         words[17] = 0xdeadbeef;
-        reports.record(Role::Primary, words, 100);
-        reports.record(Role::Primary, words, 101);
-        reports.record(Role::Secondary, words, 102);
+        reports.record(Role::Primary, words, 100, true);
+        reports.record(Role::Primary, words, 101, false);
+        reports.record(Role::Secondary, words, 102, true);
         assert_eq!(reports.samples[16].count, 2);
+        assert_eq!(reports.samples[16].admitted, 1);
+        assert!(!reports.samples[16].last_admitted);
         assert_eq!(reports.samples[16].host_ns, 101);
         assert_eq!(reports.samples[16].words, words);
         assert_eq!(reports.samples[48].count, 1);
         words[0] = 17;
-        reports.record(Role::Primary, words, 103);
+        reports.record(Role::Primary, words, 103, true);
         assert_eq!(reports.samples[17].count, 1);
         assert_eq!(reports.samples[16].count, 2);
     }
 
     #[test]
-    fn rejects_invalid_tags_before_indexing() {
+    fn retains_unknown_tags_without_indexing_outside_storage() {
         let mut reports = Reports::new().unwrap();
         for tag in [0, 15, 29, 31, 32, u32::MAX] {
             let mut words = [0; EVENT_WORDS];
             words[0] = tag;
-            reports.record(Role::Primary, words, 1);
+            reports.record(Role::Primary, words, 1, false);
         }
-        assert!(reports.samples.iter().all(|s| s.count == 0));
+        assert_eq!(reports.samples[0].count, 1);
+        assert_eq!(reports.samples[31].count, 1);
+        assert_eq!(reports.samples[64].count, 2);
+        assert_eq!(reports.samples[64].words[0], u32::MAX);
+        assert!(reports.samples.iter().all(|s| s.admitted == 0));
+        assert!(reports.samples[32..64].iter().all(|s| s.count == 0));
     }
 }

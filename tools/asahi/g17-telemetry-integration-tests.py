@@ -27,6 +27,19 @@ mod prelude {
     pub type Result<T = ()> = std::result::Result<T, i32>;
     pub const EIO: i32 = -5;
     pub const EAGAIN: i32 = -11;
+    pub const GFP_KERNEL: () = ();
+    pub struct KVec<T>(Vec<T>);
+    impl<T> KVec<T> {
+        pub fn with_capacity(n:usize,_:())->Result<Self> { Ok(Self(Vec::with_capacity(n))) }
+        pub fn push(&mut self,v:T,_:())->Result { self.0.push(v);Ok(()) }
+    }
+    impl<T> std::ops::Deref for KVec<T> {
+        type Target=Vec<T>;
+        fn deref(&self)->&Vec<T> { &self.0 }
+    }
+    impl<T> std::ops::DerefMut for KVec<T> {
+        fn deref_mut(&mut self)->&mut Vec<T> { &mut self.0 }
+    }
 }
 mod device {
     pub struct Device;
@@ -101,17 +114,55 @@ mod g17 {
             pub fn publish_control(&self,_:u32,_:&[u8],_:bool,_:u32)->Result { Ok(()) }
         }
     }
-    mod reports {
-        use super::Role;
-        pub struct Reports;
-        impl Reports {
-            pub fn new()->crate::prelude::Result<Self> { Ok(Self) }
-            pub fn record(&mut self,_:Role,_:[u32;18],_:u64) {}
-            pub fn write(&self,_:&mut crate::fmt::Formatter<'_>)->crate::fmt::Result { Ok(()) }
-        }
-    }
+    mod reports;
 '''
 RUST_TESTS = r'''
+    struct Dump<'a>(&'a channel::Rings, &'a initdata::InitData, &'a [Role]);
+    impl std::fmt::Display for Dump<'_> {
+        fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+            self.0.write_statistics_transport(self.1,self.2,f)?;
+            self.0.write_reports(f)
+        }
+    }
+    #[test]
+    fn diagnostic_distinguishes_admission_and_retains_quarantine_record() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let busy=[0x13,0,0,25,75,0xdeadbeef,50,0,0,0,0,0,0,0,0,0,0,0];
+        let pstate=[0x10,1,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0];
+        // A zero power observation only prevents pstate admission.
+        rings.observe_statistics_power(false,0);
+        init.push(Primary,busy);
+        init.push(Primary,pstate);
+        rings.drain_statistics(&dev,&init,Primary);
+        let text=format!("{}",Dump(&rings,&init,&[Primary]));
+        assert!(text.contains("role=0 cursors=Ok((2, 2)) quarantined=false"));
+        assert!(!text.contains("statistics role=1"));
+        assert!(text.contains("tag=0x13 count=1 admitted=1 last_admitted=true"));
+        assert!(text.contains("tag=0x10 count=1 admitted=0 last_admitted=false"));
+        assert!(text.contains("deadbeef"));
+        assert!(text.contains("tiler=25 renderer=75 device=50"));
+        assert_eq!(rings.read_statistics(1).pstate_status,telemetry::UNAVAILABLE);
+        rings.invalidate_statistics();
+        init.push(Primary,busy);
+        rings.drain_statistics(&dev,&init,Primary);
+        let text=format!("{}",Dump(&rings,&init,&[Primary]));
+        assert!(text.contains("tag=0x13 count=2 admitted=1 last_admitted=false"));
+        for tag in [0x1d,u32::MAX] {
+            // Unknown types stop the ring without making a valid sample.
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(InitGraph::G17P).unwrap();
+            let mut unknown=busy;unknown[0]=tag;
+            init.push(Secondary,unknown);
+            rings.drain_statistics(&dev,&init,Secondary);
+            let text=format!("{}",Dump(&rings,&init,&[Primary,Secondary]));
+            assert!(text.contains("role=1 cursors=Ok((0, 1)) quarantined=true"));
+            assert!(text.contains(&format!("tag={tag:#x} count=1 admitted=0 last_admitted=false")));
+            assert_eq!(rings.read_statistics(1).util_status,telemetry::UNAVAILABLE);
+        }
+    }
     #[test]
     fn roles_merge_and_any_statistics_quarantine_disables_both() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
@@ -399,13 +450,18 @@ def main():
         else:
             assert before in telemetry
             telemetry = telemetry.replace(before, after, 1)
+    reports = (DRIVER / 'g17/reports.rs').read_text()
+    reports = (reports.split('/// The view owns')[0]
+               + reports[reports.index('#[cfg_attr(not(test), kernel::macros::kunit_tests'):])
+    reports = '\n'.join(line for line in reports.splitlines() if not line.startswith('//!'))
+    (work / 'reports.rs').write_text(reports)
     (work / 'telemetry.rs').write_text(telemetry)
     policy = item((DRIVER / 'g17/stats.rs').read_text(), 'pub(super) const fn max_age_ns')
     (work / 'rings.rs').write_text(RUST_HEADER + 'mod stats { use super::fw::variant::InitGraph;\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.
     (work / 'g17').mkdir(exist_ok=True)
-    for name in ['channel.rs', 'telemetry.rs']:
+    for name in ['channel.rs', 'telemetry.rs', 'reports.rs']:
         (work / 'g17' / name).write_text((work / name).read_text())
     subprocess.run(['rustc', '--edition=2021', '--test', str(work / 'rings.rs'), '-o', str(work / 'rings')], check=True)
     subprocess.run([str(work / 'rings')], check=True)

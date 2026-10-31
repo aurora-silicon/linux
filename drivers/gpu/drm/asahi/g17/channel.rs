@@ -104,12 +104,40 @@ impl Rings {
         self.telemetry.read(now_ns, self.max_age_ns)
     }
 
+    /// Observe producer progress without draining or waking the GPU. Only the
+    /// firmware instances in the selected graph have meaningful status areas.
+    pub(super) fn write_statistics_transport(
+        &self,
+        init: &InitData,
+        roles: &[Role],
+        f: &mut kernel::fmt::Formatter<'_>,
+    ) -> kernel::fmt::Result {
+        for &role in roles {
+            let cursors = (|| -> Result<(u32, u32)> {
+                let consumer = init.status_word(role, status::STATS_STATE as usize)?;
+                let producer =
+                    init.status_word(role, status::STATS_STATE as usize + RX_PRODUCER_OFFSET)?;
+                fence(Ordering::Acquire);
+                Ok((
+                    consumer.load(Ordering::Relaxed),
+                    producer.load(Ordering::Relaxed),
+                ))
+            })();
+            writeln!(f, "statistics role={} cursors={:?} quarantined={} suspended={} discard_statistics={} discard_pstate={} powered={} epoch={}",
+                role as usize, cursors, self.quarantined[role as usize][ReportRing::Statistics as usize],
+                self.suspended, self.discard_statistics[role as usize], self.discard_pstate[role as usize],
+                self.statistics_powered, self.statistics_epoch)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn write_reports(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         self.reports.write(f)?;
         let view = self.read_statistics(super::now_ns());
-        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?}",
+        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={}",
             self.max_age_ns, view.util_status, view.util_host_ns, view.util_samples,
-            view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks)
+            view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks,
+            view.tiler, view.renderer, view.device)
     }
 
     pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
@@ -191,15 +219,18 @@ impl Rings {
             let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
             super::trace::report(role as u8, ring as u8, &words);
             let tag = words[0];
+            let admitted = tag < u32::BITS && accepted_types & (1 << tag) != 0;
+            let host_ns = super::now_ns();
+            // Retain the offending complete copy even if validation below
+            // quarantines the ring. Raw capture never changes admission.
+            if matches!(ring, ReportRing::Statistics) {
+                reports.record(role, words, host_ns, admitted);
+            }
             if tag >= u32::BITS || allowed_types & (1 << tag) == 0 {
                 return Err(EIO);
             }
-            if matches!(ring, ReportRing::Statistics) {
-                let host_ns = super::now_ns();
-                reports.record(role, words, host_ns);
-                if accepted_types & (1 << tag) != 0 {
-                    telemetry.record(&words, host_ns, max_age_ns);
-                }
+            if matches!(ring, ReportRing::Statistics) && admitted {
+                telemetry.record(&words, host_ns, max_age_ns);
             }
             consumer = (consumer + 1) & (capacity - 1);
             fence(Ordering::SeqCst);

@@ -123,3 +123,19 @@ Description:
 		policy, timestamp and diagnostic tick deltas. Tick deltas are
 		never accumulated as GPU busy time. Firmware role streams are
 		merged in drain order without deduplication.
+
+		The shared backend's diagnostic file is
+		/sys/kernel/debug/asahi-g17/firmware_reports, independently of
+		the DRM minor number. Its device name identifies the sysfs owner;
+		the selected firmware graph determines which role cursors exist.
+		Format 2 adds per-role live consumer/producer snapshots and the
+		quarantine, suspend, queued-record discard and core-power state.
+		Cursor snapshots can race firmware publication and are diagnostic
+		only; reading them does not consume records or enable a channel.
+		Per-tag admitted counts and last_admitted describe transport
+		admission, before field validation by the telemetry decoder.
+		The raw record is retained even when an unknown tag quarantines
+		the ring. Tags >=32 share one last-record slot per role; their
+		count is combined, while the printed tag belongs to the last
+		record. Qualified values remain subject to their printed status.
+		Debugfs is not a stable userspace ABI.
