@@ -661,6 +661,13 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 #endif
 
 static const struct apple_epic_service_ops avep_ops[] = {
+	/* The desktop 26.x compact name for AV video/device control. */
+	{
+		.name = "dcpav-device-epic",
+		.reusable = true,
+		.init = av_interface_init,
+		.teardown = av_interface_teardown,
+	},
 	{
 		.name = "DCPAVSimpleVideoInterface",
 		.reusable = true,
