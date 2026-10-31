@@ -1141,10 +1141,20 @@ static struct kunit_suite apple_clpc_suite = {
 kunit_test_suite(apple_clpc_suite);
 #endif
 
+/* T8152: DCS states 0-7 and fabric states 0-4. */
+static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 2, 4, 6, 7 },
+		[APPLE_CLPC_SOC] = { 1, 2, 3, 4 },
+	},
+};
+
 static const struct of_device_id apple_clpc_of_match[] = {
 	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
 	{ .compatible = "apple,t8142-clpc", .data = &apple_clpc_hw_t8142 },
+	{ .compatible = "apple,t8152-clpc", .data = &apple_clpc_hw_t8152 },
 	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
 	{}
 };
