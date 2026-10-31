@@ -61,7 +61,7 @@ ane_h16_command_prepare(void *command, size_t length, u16 id, unsigned int chann
 	return 0;
 }
 
-/* Reports are diagnostics only: cookie, state and completion are undecoded. */
+/* The first word selects report slots; rolling words are also valid. */
 static inline int
 ane_h16_event_report_status(const void *event, size_t length, unsigned int channel)
 {
@@ -70,7 +70,6 @@ ane_h16_event_report_status(const void *event, size_t length, unsigned int chann
 		ane_h16_command_info(ANE_H16_EVENT_REPORT);
 
 	if (!p || channel != info->channel || length != info->min_size ||
-	    (get_unaligned_le32(p) & ~3U) != 0xfe00 ||
 	    get_unaligned_le16(p + 4) != info->id || get_unaligned_le16(p + 6))
 		return -EPROTO;
 	return 0;
