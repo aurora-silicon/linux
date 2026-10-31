@@ -742,6 +742,7 @@ bool ane_t6021_fwload_options_ok(void);
 bool ane_t6021_fwload_placement_ok(struct device *dev);
 bool ane_t6021_fwload_requested(void);
 
+struct ane_fw_platform;
 struct ane_fw_image;
 struct ane_asc_tunables;
 
@@ -762,6 +763,7 @@ struct ane_asc_tunables;
  *    trace_td; 0 = trace_td unsupported.
  */
 struct ane_t602x_soc {
+	const struct ane_fw_platform *platform;
 	u32 soc;
 	u32 soc_revision;
 	bool revision_fuse;
