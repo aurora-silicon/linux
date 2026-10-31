@@ -4,9 +4,9 @@
 #include <linux/device.h>
 #include <linux/iopoll.h>
 #include <linux/pm_runtime.h>
-#include <linux/pm_domain.h>
 #include <linux/module.h>
 #include "ane_tm.h"
+#include "ane_pm.h"
 
 #define ANE_TQ_COUNT 8
 static const int TQ_PRTY_TABLE[ANE_TQ_COUNT] = { 0x1, 0x2, 0x3,	 0x4,
@@ -415,61 +415,37 @@ static int ane_ps_verify_on(struct ane_device *ane)
 	return err;
 }
 
-static int ane_pd_cycle(struct ane_device *ane)
+static int ane_verify_off(void *ctx)
 {
-	int err, resume_err;
+	struct ane_device *ane = ctx;
 	u32 act;
+	int err;
 
-	lockdep_assert_held(&ane->pm_lock);
-	ane->recovering = true;
-	err = ane_perf_suspend(ane);
-	if (err) {
-		ane->recovering = false;
-		return err;
-	}
-	if (ane->pd_count > 1) {
-		for (int i = 0; i < ane->pd_count; i++)
-			dev_pm_genpd_synced_poweroff(ane->pd_dev[i]);
-	} else {
-		dev_pm_genpd_synced_poweroff(ane->dev);
-	}
-
-	/* Drop exactly the reference owned by the calling ioctl/close/reset.
-	 * pm_lock keeps another driver entry from resuming us mid-cycle.
+	/* genpd may retain a shared or busy parent even after suspend succeeds.
+	 * Only PMGR is safe to read until the engine has power again.
 	 */
-	err = pm_runtime_put_sync_suspend(ane->dev);
-	if (err < 0)
-		goto resume;
-
-	/* Supplier idle requests are asynchronous. Finish them, then suspend
-	 * leaves before parents using ordinary runtime PM (still enabled).
-	 * genpd owns all PMGR writes and the parent-domain ordering.
-	 */
-	for (int i = ane->pd_count - 1; i >= 0 && ane->pd_count > 1; i--) {
-		pm_runtime_barrier(ane->pd_dev[i]);
-		err = pm_runtime_suspend(ane->pd_dev[i]);
-		if (err < 0)
-			goto resume;
-	}
-
-	/* A successful runtime suspend alone is not proof of power-off:
-	 * genpd may retain a shared or busy parent. Only PMGR is safe to read
-	 * here; do not access the engine aperture until it is powered again.
-	 */
-	if (!ane->ps) {
-		err = -EOPNOTSUPP;
-		goto resume;
-	}
+	if (!ane->ps)
+		return -EOPNOTSUPP;
 	err = read_poll_timeout(ane_ps_act, act, act == 0,
 				100, 100000, false, ane);
 	dev_info(ane->dev, "recovery: engine power-off actual=%#x rc=%d\n",
 		 act, err);
+	return err;
+}
 
-resume:
-	/* get_sync restores the caller's usage reference even on failure. */
-	resume_err = pm_runtime_get_sync(ane->dev);
+static int ane_pd_cycle(struct ane_device *ane)
+{
+	int err;
+
+	lockdep_assert_held(&ane->pm_lock);
+	ane->recovering = true;
+	/* Release the performance request before the domains go down. */
+	err = ane_perf_suspend(ane);
+	if (!err)
+		err = ane_pm_cycle(ane->dev, ane->pd_dev, ane->pd_count,
+				   ane_verify_off, ane);
 	ane->recovering = false;
-	return err < 0 ? err : (resume_err < 0 ? resume_err : 0);
+	return err;
 }
 
 int ane_tm_recover(struct ane_device *ane)

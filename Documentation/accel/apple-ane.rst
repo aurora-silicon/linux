@@ -280,6 +280,13 @@ uncertain. The ``reset`` sysfs write retries recovery. Module reload cannot
 recover a device while that pin is held. Direct PMGR SET writes and speculative
 writes to undocumented task-error registers are not part of this reset path.
 
+The ``ane-pm-recovery`` KUnit suite exercises the shared PM transaction against
+real runtime-PM device links, including repeated cycles, single-domain devices,
+consumer/supplier suspend errors, a missing power-off acknowledgment and a
+failed resume. It checks that every exit restores the caller's PM reference.
+The minimal config is
+``tools/testing/selftests/drivers/ane/pm.kunitconfig``.
+
 Destructive recovery selftest
 ----------------------------
 
