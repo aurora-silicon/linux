@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * KUnit tests for the Apple QSPIMC NVRAM mutation policy, at the J700 and
- * J613/J713 nvram partitions.
+ * J613/J713/J616s nvram partitions.
  */
 
 #include <kunit/test.h>
@@ -105,7 +105,7 @@ static void qspi_policy_empty(struct kunit *test)
 							     NV_START, NV_START));
 }
 
-/* The J613 and J713 nvram partition: 0x700000, 1 MiB. */
+/* The J613, J713 and J616s nvram partition: 0x700000, 1 MiB. */
 #define NV7_START	0x700000ULL
 #define NV7_END		0x800000ULL
 

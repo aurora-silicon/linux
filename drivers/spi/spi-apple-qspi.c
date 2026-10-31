@@ -7,10 +7,10 @@
  * command FIFO. This driver intentionally implements the PIO spi-mem path
  * only; that is sufficient for SPI NOR discovery and access.
  *
- * The boot NOR starts read-only. On the qualified boards (J613, J713 and
- * the J700) root may opt in at runtime to bounded, verified programs and
- * 4 KiB erases inside the nvram partition; everything else stays
- * read-only. On T8140 data reads reach the whole NOR.
+ * The boot NOR starts read-only. On the qualified boards (J613, J713,
+ * J616s and the J700) root may opt in at runtime to bounded, verified
+ * programs and 4 KiB erases inside the nvram partition; everything else
+ * stays read-only. On T8140 data reads reach the whole NOR.
  */
 
 #include <linux/bitfield.h>
@@ -117,6 +117,8 @@ static const struct apple_qspi_board apple_qspi_boards[] = {
 	{ "apple,t8122-qspi", "apple,j613", 0x2a1118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	{ "apple,t8132-qspi", "apple,j713", 0x3ad118000ULL,
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	{ "apple,t6041-qspi", "apple,j616s", 0x429118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	/* iBoot leaves BP0 set on the J700, over the top 64 KiB. */
 	{ "apple,t8140-qspi", "apple,j700", 0x385110000ULL,
@@ -1130,6 +1132,7 @@ static const struct apple_qspi_soc apple_qspi_t8140 = {
 static const struct of_device_id apple_qspi_of_match[] = {
 	{ .compatible = "apple,t8122-qspi", .data = &apple_qspi_single_io },
 	{ .compatible = "apple,t8132-qspi", .data = &apple_qspi_single_io },
+	{ .compatible = "apple,t6041-qspi", .data = &apple_qspi_single_io },
 	{ .compatible = "apple,t8140-qspi", .data = &apple_qspi_t8140 },
 	{}
 };
