@@ -283,3 +283,5 @@
 
 #include "t8152-j873-gpu.dtsi"
 #include "t8152-j873-n1.dtsi"
+
+#include "t8152-j873-pmc.dtsi"
