@@ -8186,6 +8186,7 @@ L:	asahi@lists.linux.dev
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 F:	Documentation/ABI/testing/sysfs-class-accel-ane
+F:	Documentation/ABI/testing/sysfs-driver-ane-performance
 F:	Documentation/accel/apple-ane.rst
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	drivers/accel/ane/

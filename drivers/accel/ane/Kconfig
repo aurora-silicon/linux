@@ -7,6 +7,8 @@ config DRM_ACCEL_ANE
 	depends on APPLE_RTKIT
 	depends on APPLE_DART || COMPILE_TEST
 	depends on MMU
+	select INTERCONNECT
+	select PM_OPP
 	select CRYPTO_LIB_SHA256
 	help
 	  Choose this option if you have an Apple SoC with a Neural Engine:
