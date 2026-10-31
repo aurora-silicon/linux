@@ -1008,6 +1008,34 @@ static void cen_remove(struct pci_dev *pdev)
 	cen_stop(bt);
 }
 
+/*
+ * As for the Wi-Fi functions (centauri_pci.c): the firmware keeps running, so
+ * keep the function enabled and in D0 (the PCI core's default suspend turns
+ * bus mastering off, and the next poll stopped the transport for good) and
+ * the PCIe host powered. Polling pauses across the sleep.
+ */
+static int cen_suspend(struct device *dev)
+{
+	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+
+	cancel_delayed_work_sync(&bt->poll);
+	device_set_awake_path(dev);
+	return pci_save_state(to_pci_dev(dev));
+}
+
+static int cen_resume(struct device *dev)
+{
+	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+
+	mutex_lock(&bt->lock);
+	if (bt->running)
+		schedule_delayed_work(&bt->poll, 0);
+	mutex_unlock(&bt->lock);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(cen_pm_ops, cen_suspend, cen_resume);
+
 static const struct pci_device_id cen_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x1903) },
 	{ }
@@ -1019,6 +1047,7 @@ static struct pci_driver cen_driver = {
 	.id_table = cen_ids,
 	.probe = cen_probe,
 	.remove = cen_remove,
+	.driver.pm = pm_sleep_ptr(&cen_pm_ops),
 };
 module_pci_driver(cen_driver);
 MODULE_LICENSE("GPL");
