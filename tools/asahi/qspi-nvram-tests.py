@@ -70,8 +70,11 @@ struct apple_qspi {
  bool nvram_policy, nvram_write_candidate, write_fault, nvram_window;
  u64 window_start, window_end;
  u8 jedec[3]; u8 bp_ok;
+ int irq;
 };
-struct spi_controller { struct apple_qspi *q; };
+struct spi_controller;
+struct device { struct device *parent; struct spi_controller *controller; };
+struct spi_controller { struct apple_qspi *q; bool auto_runtime_pm; struct device dev; };
 struct spi_device { struct spi_controller *controller; unsigned int cs; int dev; };
 struct spi_mem { struct spi_device *spi; };
 struct spi_mem_op {
@@ -92,7 +95,12 @@ static void *kmalloc(size_t n,int flags){return deny_alloc?NULL:malloc(n);}
 static u8 flash[0x800000], sr[3], jedec[3]={0xef,0x65,0x17};
 static unsigned int wire[4096],wire_count,fail_opcode;
 static bool corrupt_readback,stuck_busy,programmed;
+static unsigned int pm_refs,busy_calls,busy_wire;
+static void pm_runtime_mark_last_busy(struct device*d){
+ assert(d&&pm_refs);busy_calls++;busy_wire=wire_count;
+}
 static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
+ if(m->spi->controller->auto_runtime_pm)assert(pm_refs);
  assert(wire_count<ARRAY_SIZE(wire));wire[wire_count++]=o->cmd.opcode;
  if(o->cmd.opcode==fail_opcode)return -EIO;
  switch(o->cmd.opcode){
@@ -121,6 +129,7 @@ static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
 CONTROLS = r'''
 static struct apple_qspi q;
 static struct spi_controller ctl={&q};
+static struct device parent;
 static struct spi_device spi={&ctl};
 static struct spi_mem mem={&spi};
 static struct kernel_param parameter={&read_only};
@@ -129,6 +138,8 @@ static void reset(void){
  read_only=true;runtime_ready=false;write_fault_latched=false;wire_count=0;fail_opcode=0;spi.cs=0;
  corrupt_readback=false;stuck_busy=false;programmed=false;deny_alloc=false;jiffies=0;
  jedec[0]=0xef;jedec[1]=0x65;jedec[2]=0x17;
+ ctl.auto_runtime_pm=false;ctl.dev.parent=&parent;
+ pm_refs=busy_calls=busy_wire=0;
 }
 static struct spi_mem_op program(u64 addr,unsigned int n,const u8*b){
  struct spi_mem_op o=SPI_MEM_OP(SPI_MEM_OP_CMD(0x02,1),SPI_MEM_OP_ADDR(3,addr,1),SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
@@ -236,6 +247,26 @@ int main(void){
  reset();memcpy(q.jedec,(u8[]){0xc2,0x2b,0x27},3);arm();wire_count=0;o=program(0x700000,1,data);
  assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
  puts("PASS Macronix J616s part: no 35h on the wire, SR/CR checks, BP0-BP3 refusal and JEDEC mismatch");
+ /* Model spi-mem's outer reference. Every private JEDEC/status/WREN,
+  * completion poll, WRDI and readback must finish before the idle stamp.
+  * Hardware tests must still prove genpd and the actual suspend timer. */
+ reset();q.nvram_window=true;ctl.auto_runtime_pm=true;pm_refs=1;
+ assert(!apple_qspi_mem_exec_op(&mem,&t8140_read));
+ assert(busy_calls==1&&busy_wire==wire_count&&wire_count==1);
+ wire_count=0;assert(apple_qspi_mem_exec_op(&mem,&wren)==-EACCES);
+ assert(busy_calls==2&&!wire_count);
+ arm();o=program(0x700000,256,data);stuck_busy=false;
+ assert(!apple_qspi_mem_exec_op(&mem,&o));
+ assert(busy_calls==3&&busy_wire==wire_count&&wire[wire_count-1]==0x03);
+ wire_count=0;fail_opcode=0x03;
+ assert(apple_qspi_mem_exec_op(&mem,&t8140_read)==-EIO);
+ assert(busy_calls==4&&busy_wire==wire_count);
+ fail_opcode=0x02;o.addr.val=0x700100;
+ assert(apple_qspi_mem_exec_op(&mem,&o)==-EIO&&q.write_fault&&read_only);
+ assert(busy_calls==5&&busy_wire==wire_count&&wire[wire_count-1]==0x04);
+ pm_refs=0;
+ reset();assert(!apple_qspi_mem_exec_op(&mem,&t8140_read));assert(!busy_calls);
+ puts("PASS runtime-PM idle stamp after read, denied write, full verified program and transfer error; other SoCs unchanged");
  return 0;
 }
 '''
@@ -296,7 +327,8 @@ def main():
             ('mx-eqio-read', 'qspi->jedec[0] == APPLE_QSPI_MFR_MACRONIX) {', '0) {'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
-            ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;')]:
+            ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;'),
+            ('pm-last-busy', 'pm_runtime_mark_last_busy(ctlr->dev.parent);', '(void)ctlr;')]:
             assert old in code
             mutant = run(code.replace(old, new), Path(directory) / (name + '.c'))
             if not mutant.returncode:
