@@ -698,6 +698,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	struct device_node *np = pdev->dev.of_node;
 	struct ane_fw_backend *b;
 	unsigned int i;
+	u32 dart_phandles[ANE_FW_DARTS];
 	int ret = -EINVAL;
 
 	if (ane_backend || soc->soc != 0x8140)
@@ -751,6 +752,14 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 			ret = -EINVAL;
 			goto fail;
 		}
+		for (unsigned int j = 0; j < i; j++) {
+			if (dart_phandles[j] == args.np->phandle) {
+				of_node_put(args.np);
+				ret = -EINVAL;
+				goto fail;
+			}
+		}
+		dart_phandles[i] = args.np->phandle;
 		b->dart[i] = of_iomap(args.np, 0);
 		of_node_put(args.np);
 		if (!b->dart[i]) {
@@ -888,8 +897,11 @@ static int ane_fw_program_wait(struct ane_fw_backend *b,
 	while (ktime_get_ns() < deadline) {
 		ret = ane_fw_transport_consume(&b->transport, report, sizeof(report), &size);
 		if (!ret) {
-			if (size == 12 && get_unaligned_le16(report + 4) == 0x107)
+			if (size == 12 && get_unaligned_le16(report + 4) == 0x107) {
+				if (get_unaligned_le16(report + 6))
+					return -EPROTO;
 				continue;
+			}
 			ret = ane_h16_event_result(report, size, ANE_FW_IO_T2H, key);
 			if (ret == ANE_H16_EVENT_COMPLETE)
 				return 0;
@@ -916,7 +928,7 @@ int ane_fw_program_run(struct ane_fw_program *program,
 	struct ane_h16_execute call;
 	u8 *command;
 	u64 deadline;
-	u32 freed;
+	u32 expp = ANE_FW_SHARED_MAX;
 	int ret;
 
 	if (!b || !expected)
@@ -963,6 +975,20 @@ int ane_fw_program_run(struct ane_fw_program *program,
 		goto failed;
 	}
 	call.key.process = get_unaligned_le32(command + 0xc);
+	for (unsigned int i = 0; i < b->transport.shared_count; i++) {
+		if (b->transport.shared_tags[i] == ANE_FW_SHARED_EXPP &&
+		    b->transport.shared[i].size == SZ_2M && !b->transport.retired[i]) {
+			if (expp != ANE_FW_SHARED_MAX) {
+				ret = -EPROTO;
+				goto failed;
+			}
+			expp = i;
+		}
+	}
+	if (expp == ANE_FW_SHARED_MAX) {
+		ret = -EPROTO;
+		goto failed;
+	}
 	call.key.uuid = ++b->uuid;
 	for (size_t i = 0; i < output->size; i++)
 		((u8 *)output->cpu)[i] = ((const u8 *)expected)[i] ^ 0xff;
@@ -1001,12 +1027,11 @@ int ane_fw_program_run(struct ane_fw_program *program,
 	put_unaligned_le16(ANE_H16_UNLOAD_PROGRAM, command + 4);
 	put_unaligned_le32(call.key.program, command + 8);
 	b->transport.allow_free = true;
-	freed = b->transport.free_count;
 	deadline = ktime_get_ns() + ANE_FW_TIMEOUT_NS;
 	ret = ane_fw_command(b, ANE_FW_IO, command, 12, deadline);
 	if (ret)
 		goto failed;
-	while (b->transport.free_count == freed) {
+	while (!b->transport.retired[expp]) {
 		if (ktime_get_ns() >= deadline) {
 			ret = -ETIMEDOUT;
 			goto failed;

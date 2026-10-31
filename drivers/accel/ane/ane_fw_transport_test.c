@@ -950,6 +950,7 @@ static void ane_transport_free_test(struct kunit *test)
 	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
 	dva = f->t.shared[0].dva;
+	KUNIT_EXPECT_EQ(test, f->t.shared_tags[0], ANE_FW_SHARED_EXPP);
 	f->t.allow_free = true;
 	ane_test_shared_request(f, dva, 0, 0);
 	slot = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
@@ -982,7 +983,37 @@ static void ane_transport_free_refusal_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
 }
 
+static void ane_transport_second_load_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 command[0x1c0] = {};
+	size_t used;
+
+	f->soc.chip_family = 17;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	put_unaligned_le16(0x200, command + 4);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+						     sizeof(command), TEST_DEADLINE), 0);
+	ane_test_reply(f, ANE_FW_IO);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_poll(&f->t, ANE_FW_IO), 0);
+	/* A successful UNLOAD does not invalidate the stale firmware BARs. */
+	put_unaligned_le16(0x201, command + 4);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+						     12, TEST_DEADLINE), 0);
+	ane_test_reply(f, ANE_FW_IO);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_poll(&f->t, ANE_FW_IO), 0);
+	used = f->t.pool_used;
+	put_unaligned_le16(0x200, command + 4);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+						     sizeof(command), TEST_DEADLINE), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+	KUNIT_EXPECT_EQ(test, f->t.pool_used, used);
+	KUNIT_EXPECT_FALSE(test, f->t.pending[ANE_FW_IO].active);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_transport_second_load_test),
 	KUNIT_CASE(ane_transport_deny_test),
 	KUNIT_CASE(ane_transport_free_test),
 	KUNIT_CASE(ane_transport_free_refusal_test),

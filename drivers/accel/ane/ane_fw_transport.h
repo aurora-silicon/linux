@@ -57,8 +57,10 @@ struct ane_fw_transport {
 	struct ane_fw_surface pool;
 	struct ane_fw_surface shared[ANE_FW_SHARED_MAX];
 	bool retired[ANE_FW_SHARED_MAX];
+	u32 shared_tags[ANE_FW_SHARED_MAX];
 	bool allow_free;
 	u32 free_count;
+	bool program_loaded;
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	struct ane_fw_transaction pending[ANE_FW_CHANNELS];
 	u32 head[ANE_FW_CHANNELS];
@@ -193,6 +195,9 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		return -EINVAL;
 	if (ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
 		return -EPERM;
+	if (t->soc->chip_family == 17 && t->program_loaded &&
+	    get_unaligned_le16((const u8 *)command + 4) == 0x200)
+		return -EBUSY;
 	tx = &t->pending[ch];
 	if (tx->active)
 		return -EBUSY;
@@ -218,6 +223,11 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		.active = true,
 	};
 	t->pool_used = offset + size;
+	/* H17 can retain stale output BARs across LOADs. UNLOAD, FREE and
+	 * successful jobs never clear this firmware-session restriction.
+	 */
+	if (t->soc->chip_family == 17 && tx->id == 0x200)
+		t->program_loaded = true;
 	t->ops->store64(t->ctx, p + 8, size);
 	t->ops->store64(t->ctx, p + 16, size);
 	t->ops->write_barrier(t->ctx);
@@ -410,6 +420,7 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 			goto refused;
 		}
 	}
+	t->shared_tags[t->shared_count] = word2;
 	t->shared[t->shared_count++] = s;
 	t->shared_bytes += size;
 	t->ops->store64(t->ctx, p + 8, 0);
