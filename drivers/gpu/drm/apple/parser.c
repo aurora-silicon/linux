@@ -2356,3 +2356,39 @@ int parse_panel_edid_data(const void *blob, size_t len, const u8 **edid, size_t 
 	ret = parse(blob, len, &ctx);
 	return ret ?: parse_panel_edid_value(&ctx, 0, &budget, true, edid, size);
 }
+int parse_system_log_mnits_pairs(const void *blob, size_t size,
+				 struct dcp_system_ev_mnits *entry)
+{
+	struct dcp_parse_ctx ctx = { .blob = blob, .len = size, .pos = 0 };
+	s64 mnits = -1, idac = -1, timestamp = 0;
+	int ret = 0;
+
+	if (size > U32_MAX)
+		return -EINVAL;
+
+	while (round_up(ctx.pos, 4) + sizeof(u32) <= size) {
+		char *key = parse_string(&ctx);
+
+		if (IS_ERR(key))
+			break;
+		if (!strcmp(key, "mNits"))
+			ret = parse_int(&ctx, &mnits);
+		else if (!strcmp(key, "iDAC"))
+			ret = parse_int(&ctx, &idac);
+		else if (!strcmp(key, "timestamp"))
+			ret = parse_int(&ctx, &timestamp);
+		else
+			ret = skip(&ctx);
+		kfree(key);
+		if (ret)
+			break;
+	}
+
+	if (mnits < 0 || mnits > U32_MAX)
+		return -EINVAL;
+
+	entry->millinits = mnits;
+	entry->idac = idac < 0 ? 0 : idac;
+	entry->timestamp = timestamp;
+	return 0;
+}

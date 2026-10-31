@@ -1,20 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! Initialization data of the 25G83 firmware build (macOS 26.6, `mBoot-18000.161.10`).
-//!
-//! The M4 Pro (T6040) runs this build. It has the interface version of the A18 Pro's
-//! 26A428 build and the same objects, with these differences:
-//!
-//! - [`HwData25G83`]: the A18 Pro's hardware data up to `0x2554`, eight bytes inserted before
-//!   `0x2570` and four more before `0x2614`, and the CS and AFR performance tables;
-//! - [`PowerConfig25G83`]: the power configuration with two blocks removed (`0xa8` and `0xa0`
-//!   bytes), at bundle `+0x5380`, followed by the auxiliary data;
-//! - region C and the power state ([`POWER_STATE_WORDS`]) with other values;
-//! - one firmware instance carrying both roles, with a larger status B ([`private`]), five
-//!   separately allocated views and a firmware area ([`kernel_window`]).
-//!
-//! The constant contents were derived from the G16 encoders of Gravity Linux, which run this
-//! firmware on the M4 Pro, by evaluating them for this SoC; see the commit that added them.
 
 use super::{
     fill_words, perf_states, CompletionRingDescriptor, HwDataArgs, Opp, PerfGroup,
@@ -107,6 +92,7 @@ pub(crate) struct HwDataArgs25G83<'a> {
     pub(crate) cs_opps: &'a [Opp],
     /// Operating points of the AFR clock domain.
     pub(crate) afr_opps: &'a [Opp],
+    pub(crate) chip: Option<&'a Chip>,
 }
 
 /// The hardware data of the 25G83 build, at the base of the bundle.
@@ -300,8 +286,12 @@ impl HwData25G83 {
             }
             self.register_map[window.slot] = RegisterMapEntry::window(window);
         }
-        if !args.reserved_slots.is_empty() {
-            return Err(EINVAL);
+        for &slot in args.reserved_slots {
+            match used.get_mut(slot) {
+                Some(used) if !*used => *used = true,
+                _ => return Err(EINVAL),
+            }
+            self.register_map[slot] = RegisterMapEntry::reserved();
         }
 
         self.chip_id = args.chip_id;
@@ -336,6 +326,9 @@ impl HwData25G83 {
         }
         self.perf_a.fill(&states_a, 1);
         self.perf_b.fill(&states_b, 1);
+        if ext.chip.is_some_and(|chip| chip.perf_a_replicate_lanes) {
+            self.perf_a.replicate_first_lane(states_a[0].cells);
+        }
         for (index, state) in states_b.iter().enumerate() {
             self.perf_b_freq_mhz[index] = state.freq_mhz;
             self.perf_a_states[index] = perf.states_a[index].into();
@@ -344,7 +337,9 @@ impl HwData25G83 {
         self.perf_a_relative = perf.relative_a;
         self.perf_b_relative = perf.relative_b;
         self.unk_1848 = [0x3f82_8f5c; 11];
-        self.cs_perf.fill(ext.cs_opps, perf.sram_min_mv)?;
+        if ext.chip.is_none_or(|chip| chip.cs_perf_table) {
+            self.cs_perf.fill(ext.cs_opps, perf.sram_min_mv)?;
+        }
         self.afr_perf.fill(ext.afr_opps, perf.sram_min_mv)?;
 
         self.unk_2544 = 5;
@@ -375,8 +370,29 @@ impl HwData25G83 {
         self.unk_26c0 = 1;
         self.unk_26c4 = 1;
         self.unk_26f4 = 1;
+        // SAFETY: `HwData25G83` consists of integers only and has no padding, so any bytes are a
+        // valid value.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut((self as *mut Self).cast::<u8>(), size_of::<Self>())
+        };
+        if let Some(chip) = ext.chip {
+            overlay_words(bytes, chip.hw_data_words)?;
+        }
         Ok(())
     }
+}
+
+fn overlay_words(bytes: &mut [u8], words: Words) -> Result {
+    for &(offset, value, repeat) in words {
+        for index in 0..repeat {
+            let at = offset + 4 * index;
+            bytes
+                .get_mut(at..at + 4)
+                .ok_or(EINVAL)?
+                .copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// Power configuration control period, in 24 MHz clocks (8 ms).
@@ -384,7 +400,16 @@ const PERIOD_CLOCKS: u32 = 200_000;
 /// Temperature sensors read by the die and MTR temperature limiters.
 const TEMP_SENSOR_MASK: u32 = 0x2a22_2aa2;
 
-/// Offset of the per-chip leakage coefficients in the power configuration.
+pub(crate) struct Chip {
+    pub(crate) max_power_mw: u32,
+    pub(crate) leakage: [u32; 56],
+    pub(crate) aon_table: &'static [u32],
+    pub(crate) hw_data_words: Words,
+    pub(crate) power_config_words: Words,
+    pub(crate) perf_a_replicate_lanes: bool,
+    pub(crate) cs_perf_table: bool,
+}
+
 const LEAKAGE_OFFSET: usize = 0x642c;
 /// Offset in the power configuration of the GPU address of the configuration's status (the
 /// configuration named by the root, `+0x80`).
@@ -597,10 +622,12 @@ impl PowerConfig25G83 {
         self.0[AON_POINTER..AON_POINTER + 8].copy_from_slice(&aon_va.to_le_bytes());
         self.0[ENTROPY..ENTROPY + 4].copy_from_slice(&entropy.to_le_bytes());
     }
+
+    pub(crate) fn apply_chip(&mut self, chip: &Chip) -> Result {
+        overlay_words(&mut self.0, chip.power_config_words)
+    }
 }
 
-/// The AON temperature-source rows the power configuration names: the GPU cluster 0, GPU
-/// cluster 1 and SoC sensors.
 pub(crate) const AON_TABLE: [u32; 9] = [
     u32::from_be_bytes(*b"g0TR"),
     0x006b_0001,

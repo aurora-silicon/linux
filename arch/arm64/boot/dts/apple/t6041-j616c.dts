@@ -1,0 +1,908 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+// Copyright The Asahi Linux Contributors
+
+/dts-v1/;
+
+#include "t6041.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/thermal/thermal.h>
+
+/ {
+	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M4 Max, Nov 2024)";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &serial0;
+		keyboard = &keyboard;
+		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
+		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
+		mtp = &mtp;
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		gpu = &gpu;
+		sep = &sep;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:115200n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>;
+	};
+
+	serial0: serial@429200000 {
+		compatible = "apple,s5l-uart";
+		reg = <0x4 0x29200000 0x0 0x1000>;
+		reg-io-width = <4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1559 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>, <&clkref>;
+		clock-names = "uart", "clk_uart_baud0";
+	};
+
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "disp0";
+	};
+
+	thermal-zones {
+		cpu-die-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 0>;
+
+			trips {
+				cpu_die_passive: cpu-die-passive {
+					temperature = <113000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				cpu-die-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p05 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p15 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};
+
+&cpufreq_e {
+	/delete-property/ apple,fast-die-effort;
+};
+
+&cpufreq_p0 {
+	/delete-property/ apple,fast-die-effort;
+};
+
+&cpufreq_p1 {
+	/delete-property/ apple,fast-die-effort;
+};
+
+&wdt {
+	timeout-sec = <140>;
+};
+
+&smc {
+	status = "okay";
+
+	smc_gpio_low: gpio-low {
+		compatible = "apple,smc-low-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&nub_spmi0 {
+	status = "okay";
+};
+
+&smc_hwmon {
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "CPU Die Max";
+	};
+	temperature-TCMb { apple,key-id = "TCMb"; label = "CPU TCMb"; };
+	temperature-Tpx0 { apple,key-id = "Tpx0"; label = "CPU Tpx0"; };
+	temperature-Tpx1 { apple,key-id = "Tpx1"; label = "CPU Tpx1"; };
+	temperature-Tpx2 { apple,key-id = "Tpx2"; label = "CPU Tpx2"; };
+	temperature-Tpx3 { apple,key-id = "Tpx3"; label = "CPU Tpx3"; };
+	temperature-Tpx4 { apple,key-id = "Tpx4"; label = "CPU Tpx4"; };
+	temperature-Tpx5 { apple,key-id = "Tpx5"; label = "CPU Tpx5"; };
+	temperature-Tpx8 { apple,key-id = "Tpx8"; label = "CPU Tpx8"; };
+	temperature-Tpx9 { apple,key-id = "Tpx9"; label = "CPU Tpx9"; };
+	temperature-TpxA { apple,key-id = "TpxA"; label = "CPU TpxA"; };
+	temperature-TpxB { apple,key-id = "TpxB"; label = "CPU TpxB"; };
+	temperature-TpxC { apple,key-id = "TpxC"; label = "CPU TpxC"; };
+	temperature-TpxD { apple,key-id = "TpxD"; label = "CPU TpxD"; };
+	temperature-Tex0 { apple,key-id = "Tex0"; label = "CPU Tex0"; };
+	temperature-Tex1 { apple,key-id = "Tex1"; label = "CPU Tex1"; };
+	temperature-Tex2 { apple,key-id = "Tex2"; label = "CPU Tex2"; };
+	temperature-Tex3 { apple,key-id = "Tex3"; label = "CPU Tex3"; };
+	temperature-TH0x { apple,key-id = "TH0x"; label = "NAND Flash Temperature"; };
+	temperature-TB0T { apple,key-id = "TB0T"; label = "Battery Hotspot"; };
+	temperature-TCHP { apple,key-id = "TCHP"; label = "Charge Regulator Temp"; };
+	temperature-TW0P { apple,key-id = "TW0P"; label = "WiFi/BT Module Temp"; };
+	power-PSTR { apple,key-id = "PSTR"; label = "Total System Power"; };
+	power-PHPC { apple,key-id = "PHPC"; label = "Heatpipe Power"; };
+	power-PDTR { apple,key-id = "PDTR"; label = "AC Input Power"; };
+	voltage-VD0R { apple,key-id = "VD0R"; label = "AC Input Voltage"; };
+	voltage-SBAV { apple,key-id = "SBAV"; label = "Battery Voltage"; };
+	current-ID0R { apple,key-id = "ID0R"; label = "AC Input Current"; };
+};
+
+&pinctrl {
+	status = "okay";
+
+	wifi_clkreq_pins: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(0, 1)>;
+	};
+};
+
+&pinctrl_nub {
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	compatible = "apple,dockchannel-hid";
+	apple,afe-reset-gpios = <&smc_gpio_low 25 GPIO_ACTIVE_LOW>;
+	apple,stm-reset-gpios = <&smc_gpio_low 26 GPIO_ACTIVE_LOW>;
+
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j616c.bin";
+		apple,power-method = <2>;
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+
+	stm {
+	};
+
+	actuator {
+	};
+
+	tp-accel {
+	};
+
+	mtp {
+	};
+};
+
+&pcie_dart {
+	status = "okay";
+};
+
+/ {
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6041-pcie", "apple,t6020-pcie";
+		reg = <0x1c 0xb0000000 0x0 0x1000000>,
+		      <0x4 0x14000000 0x0 0x4000>,
+		      <0x4 0x10028000 0x0 0x4000>,
+		      <0x4 0x11028000 0x0 0x4000>,
+		      <0x4 0x12028000 0x0 0x4000>,
+		      <0x4 0x13028000 0x0 0x4000>,
+		      <0x4 0x17020000 0x0 0x4000>,
+		      <0x4 0x17024000 0x0 0x4000>,
+		      <0x4 0x17028000 0x0 0x4000>,
+		      <0x4 0x1702c000 0x0 0x4000>;
+		reg-names = "config", "rc",
+			    "port0", "port1", "port2", "port3",
+			    "phy0", "phy1", "phy2", "phy3";
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_clkreq_pins>;
+		#size-cells = <2>;
+		#address-cells = <3>;
+		bus-range = <0 1>;
+		iommu-map-mask = <0xffff>;
+		iommu-map = <0x100 &pcie_dart 1 2>;
+		msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
+		msi-parent = <&pcie0>;
+		msi-controller;
+		interrupts = <0 0x6bb 4>;
+		interrupt-parent = <&aic>;
+		device_type = "pci";
+
+		port00: pci@0,0 {
+			compatible = "pciclass,0604";
+			reg = <0 0 0 0 0>;
+			ranges;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map-mask = <0 0 0 7>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			#size-cells = <2>;
+			#address-cells = <3>;
+			pwren-gpios = <&smc_gpio 0x13 0>;
+			reset-gpios = <&pinctrl 4 1>;
+			device_type = "pci";
+
+			bluetooth@0,1 {
+				compatible = "pci14e4,5f72";
+				reg = <0x100 0 0 0 0>;
+				local-bd-address = [00 00 00 00 00 00];
+				brcm,board-type = "apple,hostomel";
+				status = "okay";
+			};
+
+			wifi@0,0 {
+				compatible = "brcm,bcm4329-fmac";
+				reg = <0 0 0 0 0>;
+				brcm,ccode-map-trivial;
+				brcm,board-type = "apple,hostomel";
+			};
+		};
+	};
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&ans_sart {
+	status = "okay";
+};
+
+&nvme {
+	status = "okay";
+};
+
+&display {
+	phandle = <&display>;
+	status = "okay";
+};
+
+&dcp {
+	clocks = <&clk_disp0>;
+	phandle = <&dcp>;
+
+	panel {
+		compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
+		width-mm = <346>;
+		height-mm = <223>;
+		adj-height-mm = <216>;
+		apple,max-brightness = <500>;
+	};
+};
+
+&disp0_piodma {
+	phandle = <&disp0_piodma>;
+};
+
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <39 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_con_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&nub_spmi_a1 {
+	status = "okay";
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec2_con_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
+
+&usb_drd1 {
+	maximum-speed = "high-speed";
+	phys = <&atcphy1 PHY_TYPE_USB2>;
+	phy-names = "usb2-phy";
+	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
+		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
+		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
+		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
+		<0x580 0xffffffff 0x6f000006>;
+	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd1_hs: endpoint {
+				remote-endpoint = <&typec1_con_hs>;
+			};
+		};
+	};
+};
+
+&atcphy2 {
+	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+&usb_drd2 {
+	maximum-speed = "high-speed";
+	phys = <&atcphy2 PHY_TYPE_USB2>;
+	phy-names = "usb2-phy";
+	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
+		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
+		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
+		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
+		<0x580 0xffffffff 0x6f000006>;
+	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd2_hs: endpoint {
+				remote-endpoint = <&typec2_con_hs>;
+			};
+		};
+	};
+};
+
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		gpu_uat_ttbs: uat-ttbs {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_uat_pagetables: uat-pagetables {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_uat_l2_pagetables: uat-l2-pagetables {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_uat_handoff: uat-handoff {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_text: gpu-fw-text {
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			no-map;
+			status = "disabled";
+		};
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <125000 125000 125000 125000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <600000 600000 600000 600000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <665000 665000 660000 660000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <705000 705000 700000 705000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <924000000>;
+			opp-microvolt = <725000 725000 715000 730000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <952000000>;
+			opp-microvolt = <770000 770000 770000 780000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <1056000000>;
+			opp-microvolt = <770000 770000 770000 780000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1062000000>;
+			opp-microvolt = <810000 810000 805000 810000>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <1182000000>;
+			opp-microvolt = <810000 810000 805000 810000>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <1182000000>;
+			opp-microvolt = <860000 860000 860000 860000>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <1312000000>;
+			opp-microvolt = <860000 860000 860000 860000>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <1242000000>;
+			opp-microvolt = <900000 895000 900000 900000>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <1380000000>;
+			opp-microvolt = <900000 895000 900000 900000>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <1326000000>;
+			opp-microvolt = <940000 925000 940000 940000>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <940000 925000 940000 940000>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <1578000000>;
+			opp-microvolt = <1020000 1020000 1020000 1020000>;
+		};
+	};
+
+	gpu_cs_opp: opp-table-gpucs {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <24000000>;
+			opp-microvolt = <585000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <585000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <635000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <685000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <992000000>;
+			opp-microvolt = <720000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <1188000000>;
+			opp-microvolt = <770000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <1380000000>;
+			opp-microvolt = <855000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <885000>;
+		};
+	};
+
+	gpu_afr_opp: opp-table-gpuafr {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <24000000>;
+			opp-microvolt = <585000>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <338000000>;
+			opp-microvolt = <585000>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <618000000>;
+			opp-microvolt = <635000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <796000000>;
+			opp-microvolt = <685000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <992000000>;
+			opp-microvolt = <720000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <1188000000>;
+			opp-microvolt = <770000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <1380000000>;
+			opp-microvolt = <855000>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <1470000000>;
+			opp-microvolt = <885000>;
+		};
+	};
+};
+
+&gpu {
+		memory-region = <&gpu_uat_ttbs>, <&gpu_uat_pagetables>,
+				<&gpu_uat_handoff>, <&gpu_fw_data>,
+				<&gpu_uat_l2_pagetables>, <&gpu_fw_text>;
+		memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+				      "l2-pagetables", "fw-text";
+		operating-points-v2 = <&gpu_opp>;
+		apple,cs-opp = <&gpu_cs_opp>;
+		apple,afr-opp = <&gpu_afr_opp>;
+		apple,firmware-version = <26 5 2>;
+};
+
+/ {
+	aliases {
+		aop = &aop;
+	};
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl 54 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	sound: sound {
+		compatible = "apple,j616-macaudio", "apple,macaudio";
+		model = "MacBook Pro J616";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
+
+	sound_jack: sound-jack {
+		compatible = "apple,j616-macaudio-jack", "apple,macaudio";
+		model = "MacBook Pro J616 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J616";
+	apple,machine-kind = "MacBook Pro";
+};
+
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 58 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl 106 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&aop { nonposted-mmio; };
+
+&aop_als { status = "disabled"; };
+&aop_las { status = "disabled"; };
+
+&admac1 { dma-channels = <26>; nonposted-mmio; };
+&admac0 { nonposted-mmio; };
+&aop_dart { nonposted-mmio; };
+&i2c1 { nonposted-mmio; };
+&i2c2 { nonposted-mmio; };
+&i2c3 { nonposted-mmio; };
+
+/ {
+	reserved-memory {
+		aop_mmio_pmgr: aop-mmio-pmgr@508304000 {
+			reg = <0x5 0x08304000 0x0 0x4000>;
+			iommu-addresses = <&aop 0x5 0x08304000 0x0 0x4000>;
+			no-map;
+		};
+	};
+};
+
+&aop {
+	dma-noncoherent;
+	memory-region = <&aop_mmio_pmgr>;
+};
+
+&sep_mbox {
+	status = "okay";
+};
+
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_nub 53 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl>;
+	interrupts = <116 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
+};

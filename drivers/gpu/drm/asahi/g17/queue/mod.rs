@@ -158,6 +158,7 @@ impl<B: Backend> Queue<B> {
 
     fn prune_frontier(&mut self, index: usize) {
         let failure = &mut self.failures[index];
+        let transient_ok = self.variant.is_25f84();
         // Without room the entries are released here, as they always could be.
         let mut finished = if self.finished.reserve(self.frontiers[index].len(), GFP_KERNEL).is_ok() {
             Some(&mut self.finished)
@@ -174,7 +175,14 @@ impl<B: Backend> Queue<B> {
             }
             // One earliest failed ordinal covers every later prefix without
             // retaining its packet, mappings, or every failed fence.
-            if status < 0 && failure.as_ref().is_none_or(|(first, _)| *sequence < *first) {
+            let transient = transient_ok
+                && [ECANCELED, ENODATA, EBUSY]
+                    .iter()
+                    .any(|error| error.to_errno() == status);
+            if status < 0
+                && !transient
+                && failure.as_ref().is_none_or(|(first, _)| *sequence < *first)
+            {
                 *failure = Some((*sequence, fences.completed.clone()));
             }
             false

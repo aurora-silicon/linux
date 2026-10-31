@@ -18,6 +18,7 @@ properties:
           - apple,agx-g14g
           - apple,agx-g14s
           - apple,agx-t6040
+          - apple,agx-t6041
           - apple,agx-t8132
           - apple,agx-t8140
       - items:
@@ -307,6 +308,15 @@ allOf:
         apple,afr-leak-coef:
           minItems: 1
           maxItems: 1
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,agx-t6040
+              - apple,agx-t6041
+    then:
+      properties:
         reg:
           items:
             - description: GFX coprocessor control registers
@@ -354,6 +364,7 @@ allOf:
             contains:
               enum:
                 - apple,agx-t6040
+                - apple,agx-t6041
                 - apple,agx-t8132
                 - apple,agx-t8140
     then:

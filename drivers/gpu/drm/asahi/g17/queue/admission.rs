@@ -62,6 +62,7 @@ fn wait_slice_ms(deadline_ns: u64, now_ns: u64) -> Result<u32> {
 }
 
 struct State {
+    serial_render: bool,
     active: u64,
     refs: [u8; cfg::RENDER_SLOTS],
     owners: [u64; cfg::RENDER_SLOTS],
@@ -88,6 +89,7 @@ impl State {
     const MASK: u64 = (u64::MAX >> (64 - cfg::RENDER_SLOTS)) & !1;
     const fn new() -> Self {
         Self {
+            serial_render: false,
             active: 0,
             refs: [0; cfg::RENDER_SLOTS],
             owners: [0; cfg::RENDER_SLOTS],
@@ -334,8 +336,15 @@ impl State {
         )
     }
 
+    fn serial_busy(&self) -> bool {
+        self.serial_render && self.refs.iter().any(|&count| count != 0)
+    }
+
     /// Whether `pick` would return a slot, without taking it.
     fn can_pick(&self, owner: u64, plan: Plan) -> bool {
+        if self.serial_busy() {
+            return false;
+        }
         let usable = |slot: usize| {
             self.owners[slot] == owner
                 && (self.quarantined | self.kill_hold) & (1u64 << slot) == 0
@@ -357,6 +366,9 @@ impl State {
     }
 
     fn pick(&mut self, owner: u64, plan: Plan) -> Option<u8> {
+        if self.serial_busy() {
+            return None;
+        }
         match plan {
             Plan::Any => self.acquire(owner),
             Plan::Wait => None,
@@ -466,6 +478,10 @@ impl Pool {
             GFP_KERNEL,
         )
     }
+    pub(crate) fn serialize_render(&self) {
+        self.state.lock().serial_render = true;
+    }
+
     /// Every pair or lease return, owner close and quarantine change.
     fn returned(&self) {
         self.released.notify_all();

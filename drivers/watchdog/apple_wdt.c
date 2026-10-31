@@ -53,6 +53,11 @@
 
 #define APPLE_WDT_TIMEOUT_DEFAULT	30
 
+static bool nowayout = WATCHDOG_NOWAYOUT;
+module_param(nowayout, bool, 0);
+MODULE_PARM_DESC(nowayout, "Watchdog cannot be stopped once started (default="
+		 __MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
+
 struct apple_wdt {
 	struct watchdog_device wdd;
 	void __iomem *regs;
@@ -178,6 +183,7 @@ static int apple_wdt_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, wdt);
 
+	wdt->wdd.parent = dev;
 	wdt->wdd.ops = &apple_wdt_ops;
 	wdt->wdd.info = &apple_wdt_info;
 	wdt->wdd.max_hw_heartbeat_ms = U32_MAX / wdt->clk_rate * 1000;
@@ -187,6 +193,7 @@ static int apple_wdt_probe(struct platform_device *pdev)
 	if (wdt_ctrl & APPLE_WDT_CTRL_RESET_EN)
 		set_bit(WDOG_HW_RUNNING, &wdt->wdd.status);
 
+	watchdog_set_nowayout(&wdt->wdd, nowayout);
 	watchdog_init_timeout(&wdt->wdd, 0, dev);
 	apple_wdt_set_timeout(&wdt->wdd, wdt->wdd.timeout);
 	watchdog_stop_on_unregister(&wdt->wdd);

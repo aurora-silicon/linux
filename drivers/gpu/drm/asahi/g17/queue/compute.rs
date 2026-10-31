@@ -1957,6 +1957,7 @@ pub(crate) trait Host {
     ) -> Result<qos::Publication>;
     fn qos_cancel(&mut self, publication: qos::Publication) -> Result;
     fn publish_qid(&mut self, id: kick::Id) -> Result;
+    fn register_queue(&mut self, queue: &crate::g17::fw::kick::KsmQueue) -> Result;
     fn publish_outer(&mut self, priority: u8, slot: &crate::g17::fw::channels::WorkSlot)
         -> Result;
     fn notify(&mut self, message: u64) -> Result;
@@ -2161,9 +2162,16 @@ impl Queue {
                     NATIVE_WAIT_STRIDE, record)?;
                 wait_vas.push(address, GFP_KERNEL)?;
             }
+            let kick_ring_va = self.kick.low_va();
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;
             if first {
+                host.register_queue(&crate::g17::fw::kick::KsmQueue::new(
+                    qid,
+                    kick_ring_va,
+                    DataMaster::Compute,
+                    policy.priority(),
+                )?)?;
                 producer = self.graph.first_descriptor(descriptor_high)?;
                 host.prepare_compute_shared()?;
                 packet.mark_published();

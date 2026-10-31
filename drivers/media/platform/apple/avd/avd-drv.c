@@ -11,6 +11,7 @@
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
  */
 
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/iommu.h>
 #include <linux/reset.h>
@@ -870,8 +871,17 @@ static const struct of_device_id avd_of_match[] = {
 
 MODULE_DEVICE_TABLE(of, avd_of_match);
 
+static bool avd_t6041_hevc_supported(struct avd_dev *avd)
+{
+	return of_machine_is_compatible("apple,j616c") &&
+		avd->variant == &avd_t6040_variant &&
+		(avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER) &&
+		avd->fw->size == 0x12000;
+}
+
 static int avd_probe(struct platform_device *pdev)
 {
+	unsigned int variant_caps;
 	struct avd_dev *avd;
 	const struct of_device_id *match;
 	const char *codec_info = NULL;
@@ -919,12 +929,15 @@ static int avd_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	variant_caps = avd->variant->capabilities;
+	if (avd_t6041_hevc_supported(avd))
+		variant_caps |= AVD_CAPABILITY_HEVC;
+
 	/* Determine firmware and HW variant capabilities */
 	if (avd->fw->size >= AVD_CODEC_INFO_MAX_SIZE)
 		codec_info = avd->fw->data + avd->fw->size - AVD_CODEC_INFO_MAX_SIZE;
 	if (codec_info && strncmp(codec_info, "CODECS:", 7) == 0) {
 		unsigned int caps = 0;
-		unsigned int variant_caps = avd->variant->capabilities;
 
 		if (strnstr(codec_info, "av1", AVD_CODEC_INFO_MAX_SIZE))
 			caps |= variant_caps & AVD_CAPABILITY_AV1;
@@ -940,7 +953,7 @@ static int avd_probe(struct platform_device *pdev)
 		avd->capabilities = caps;
 	} else {
 		/* Backward compatibility to old firmware, do not upstream. */
-		avd->capabilities = avd->variant->capabilities;
+		avd->capabilities = variant_caps;
 	}
 
 	ret = dma_set_mask_and_coherent(avd->dev,
