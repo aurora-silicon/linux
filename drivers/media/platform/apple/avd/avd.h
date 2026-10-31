@@ -21,6 +21,7 @@
 #include <linux/workqueue.h>
 
 #include "avd-queue.h"
+#include "avd-layout.h"
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -110,13 +111,6 @@ struct avd_hevc_decoded_buffer_info {
 	bool is_intra;
 };
 
-struct avd_comp {
-	u32 size;
-	/* offset to start of compressed data */
-	size_t start_offset;
-	/* relative offsets to start */
-	u32 offsets[4];
-};
 
 struct avd_decoded_buffer {
 	/* Must be the first field in this struct. */

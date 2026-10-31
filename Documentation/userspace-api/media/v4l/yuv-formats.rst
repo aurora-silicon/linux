@@ -267,6 +267,7 @@ image.
 
     pixfmt-packed-yuv
     pixfmt-yuv-planar
+    pixfmt-apple-interchange
     pixfmt-yuv-luma
     pixfmt-y8i
     pixfmt-y12i

@@ -24,52 +24,27 @@
 #include "avd-regs.h"
 #include "avd-apple-protocol.h"
 
-static void calc_tile_meta(u32 w, u32 h, u32 bpb, u32 tile_dim,
-			   u32 meta_hdr_bytes, u32 *tile, u32 *meta)
-{
-	u32 tiles_width, tiles_height, meta_tile_w, meta_tile_h, tile_bytes;
-	tiles_width = DIV_ROUND_UP(w, tile_dim);
-	tiles_height = DIV_ROUND_UP(h, tile_dim);
-	tile_bytes = tile_dim * tile_dim * DIV_ROUND_UP(bpb, 8);
-	*tile = ALIGN(tiles_width * tiles_height * tile_bytes, 16);
-
-	meta_tile_w = roundup_pow_of_two(tiles_width);
-	meta_tile_h = roundup_pow_of_two(tiles_height);
-
-	*meta = ALIGN(meta_tile_w * meta_tile_h * meta_hdr_bytes, 16);
-}
-
 void fill_comp(struct avd_comp *comp, enum avd_image_fmt image_fmt, u32 width,
 	       u32 height)
 {
-	u32 y_meta, y, uv_meta, uv;
-	int bit_depth;
+	u32 depth = 8, vdiv = 2;
 
 	switch (image_fmt) {
-	case AVD_IMG_FMT_420_10BIT:
 	case AVD_IMG_FMT_422_10BIT:
-		bit_depth = 10;
+		depth = 10;
+		vdiv = 1;
+		break;
+	case AVD_IMG_FMT_420_10BIT:
+		depth = 10;
+		break;
+	case AVD_IMG_FMT_422_8BIT:
+		vdiv = 1;
 		break;
 	default:
-		bit_depth = 8;
 		break;
 	}
 
-	/* y has 32x32 tiles and 32 bytes of metadata per tile */
-	calc_tile_meta(width, height, bit_depth, 32, 32, &y, &y_meta);
-	/* uv has 16x16 tiles and 8 bytes of metadata per tile; 4:2:2 chroma is full height */
-	calc_tile_meta(width / 2,
-		       (image_fmt == AVD_IMG_FMT_422_8BIT ||
-			image_fmt == AVD_IMG_FMT_422_10BIT) ? height : height / 2,
-		       bit_depth * 2, 16, 8, &uv, &uv_meta);
-
-	/* output like DCP driver expects */
-	comp->offsets[0] = y;
-	comp->offsets[1] = 0;
-	comp->offsets[2] = y + y_meta + uv;
-	comp->offsets[3] = y + y_meta;
-
-	comp->size = y_meta + y + uv_meta + uv;
+	avd_interchange_layout(comp, width, height, depth, 2, vdiv);
 }
 
 int avd_buf_alloc(struct avd_dev *avd, struct avd_buf *buf, size_t size)

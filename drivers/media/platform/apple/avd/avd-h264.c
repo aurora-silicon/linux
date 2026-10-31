@@ -866,6 +866,11 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	u32 payload_len = vb2_get_plane_payload(&src->vb2_buf, 0);
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
 
+	if (!run.sps->chroma_format_idc && !ctx->decomp) {
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
+
 	if (!data || !avd_h264_find_slice_data(data, payload_len,
 					       avd_h264_header_len(&run),
 					       &run.slice_data_off)) {
