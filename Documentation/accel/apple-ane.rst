@@ -178,3 +178,124 @@ KUnit covers byte-exact synthetic execute fields, all 1..64 buffer counts,
 zero/one/two custom BAR lengths, wide DVAs/spans, reserved-zero output,
 boundary and overflow refusal, all event states, interleaved identities,
 ISP routing and malformed reports. No test packet is copied from a capture.
+
+H13 timeout and engine recovery
+==============================
+
+The host task-manager path (``ane.ko``) gives each submission one second,
+including DART fault-drain retries. An expired submission returns
+``-ETIMEDOUT``; recovery never silently retries a program whose output may be
+partial. The task's GEM lookup references are released when the ioctl returns.
+
+Recovery holds the engine and PM-entry locks, drops the current consumer
+runtime-PM reference, synchronously suspends its power-domain suppliers, and
+checks both the PMGR ACTUAL fields and every attached genpd for power-off.
+The SET window omits the shared SYS_CPU parent, whose DART consumers can
+suspend asynchronously; it must also turn off before the consumer resumes.
+Recovery then restores the consumer
+reference, checks power-on before engine MMIO, and runs the probe task-manager
+enable sequence. BO handles and mappings remain valid for resubmission.
+The system-sleep force helpers are unsuitable here: a forced, in-use supplier
+can retain its active runtime status and keep its parent domains powered.
+
+A power-off acknowledgment is required before reinitializing the engine.
+Only after power-on and task-manager readiness are also verified does recovery
+release the exceptional module pin and reclaim preserved BOs. If any step
+fails, mappings, backing pages and the pin remain held; new submissions fail.
+This also covers a partially resumed engine whose retained queue state is
+uncertain. The ``reset`` sysfs write retries recovery. Module reload cannot
+recover a device while that pin is held. Direct PMGR SET writes and speculative
+writes to undocumented task-error registers are not part of this reset path.
+
+The ``ane-pm-recovery`` KUnit suite exercises the shared PM transaction against
+real runtime-PM device links, including repeated cycles, single-domain devices,
+consumer/supplier suspend errors, a missing power-off acknowledgment and a
+failed resume. It checks that every exit restores the caller's PM reference.
+The minimal config is
+``tools/testing/selftests/drivers/ane/pm.kunitconfig``.
+
+Destructive recovery selftest
+----------------------------
+
+``tools/testing/selftests/drivers/ane/recovery.py`` is an explicitly invoked
+hardware test, excluded from the default device-free selftests. It requires
+exclusive ownership of an M1-family ANE, Python 3, the packaged H13 add fixture,
+and a deliberately invalid convolution program. Run it through the hardware
+controller with a watchdog and kernel-log capture::
+
+  python3 recovery.py /usr/share/omarchy-ane/fixtures/h13-anec/add/program-0.anec hang.anec
+
+The test keeps both clients open, submits the invalid program three times,
+requires a bounded ``ETIMEDOUT`` and ``wedged=0`` each time, and runs twenty
+bit-exact add jobs on the surviving client's original fd and mappings after
+each reset. Every call changes its inputs and poisons the valid output lanes,
+so stale output cannot pass. Its oracle uses exact fp16 quarter values and checks the complete
+output, including padding. Closing both clients must return the module
+reference count to its initial value; the boot identity must remain unchanged.
+An operator should also verify three power-off acknowledgments in the kernel
+log and a normal module unload/reload after all clients close. A failed reset
+is a test failure, not permission to force unload the module.
+
+Generate ``hang.anec`` on a build host with ``make-hang-fixture.py`` and a clean
+checkout of the MIT-licensed public compiler at commit
+``ef2dbceefedff38ecce4f3dc593e148c5e7a6d54`` from
+https://github.com/aurora-silicon/mil-hwx-compiler/pull/2::
+
+  python3 make-hang-fixture.py /path/to/mil-hwx-compiler hang.anec --cxx clang++
+
+This first checks that the normal encoder refuses the shape. It bypasses only
+that refusal in a temporary translation unit to generate a deterministic
+stride-2 1x1 128-to-256 convolution at 56-to-28 spatial size, the refused family
+reported to hang the M1 Pro. The compiler checkout is unchanged. No Apple
+binary or private program capture is used. The generator writes a hash receipt;
+the hardware test must fail if this particular instance does not actually
+produce a timeout. The loader pins both fixture hashes and uses ABI 1 ioctls directly, so no
+shared libane library is needed. ``--check-fixtures`` validates the two containers without
+opening a device.
+
+H14 recovery lifecycle
+----------------------
+
+The firmware path (``ane_t6021.ko``) gives the command acknowledgment and
+finish event one bounded deadline. A failed exchange quarantines submissions
+and attempts one reset under the firmware lock. Operator retry uses the same
+``wedged`` and ``reset`` attributes as H13.
+
+The supported reset profile is the Linux-owned 13.5 legacy firmware path:
+the complete SoC power-domain binding, an owned staged image, and the fenced
+boot sequence. Borrowed firmware, RTKit mode, later generations and incomplete
+initial boots remain fenced. A second H14 binding is refused because the
+firmware cache and BO pool have one owner.
+
+Recovery clears only the owned ASC CPU's RUN bit and waits for STOPPED before
+suspending the consumer and suppliers through the shared PM transaction. This
+prevents firmware power-state writes from racing provider shutdown. It then
+verifies every domain and the CPU ACTUAL field off, resumes, repeats the probe
+power/PWGATE gates, and requires the CPU to be stopped before changing its
+image or boot state. It restores a cached, validated pristine image into the
+existing mappings; recovery does not fetch a replacement file or rebuild the
+entry aliases. The existing boot helper performs the READY/DONE handshake,
+then recovery validates ChMan, writes the host acknowledgment and requires a
+valid CONFIG_GET response. An enabled firmware performance property is
+restored through its existing command.
+
+Old boot pools, firmware MALLOC buffers and closed firmware-visible BOs keep
+their metadata and backing until the new boot is validated. Failed resets
+retain those records and any CPU lifetime pin needed by a running or uncertain
+CPU. Retired MALLOC arenas remain charged against the existing byte and record
+limits; at most two failed-boot arenas can accumulate. A successful restart
+reclaims retired arenas and closed BOs. Live old BO handles and mappings remain
+client-owned memory and can be reused for loading a program again.
+
+Program and process IDs are opaque kernel identifiers. The allocator survives
+firmware restarts and refuses exhaustion instead of wrapping. Reset invalidates
+the program cache, so an old ID cannot alias a reused firmware wire ID. Clients
+must reload their program and create its process before retrying. The
+``ane-fw-ids`` KUnit suite checks non-reuse and exhaustion boundaries.
+
+H14 keeps its existing domain-link lifetime reference and a reference for the
+currently running firmware CPU. Recovery releases the old CPU reference only
+after verified quiescence and acquires a new one before the first boot write;
+it does not accumulate one reference per failure. This change does not provide
+normal H14 module unload while firmware is active. H14 restart still requires
+silicon qualification; the H13 hang fixture must not be submitted through ABI 2.

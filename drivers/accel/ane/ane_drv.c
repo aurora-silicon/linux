@@ -746,18 +746,19 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 	/* Recovery power-cycles the partitions and then writes the engine:
 	 * hold a reference so that autosuspend cannot gate it in between.
 	 */
+	mutex_lock(&ane->pm_lock);
 	err = pm_runtime_resume_and_get(dev);
 	if (err < 0)
-		return err;
+		goto out_pm;
 
 	mutex_lock(&ane->engine_lock);
 	if (!ane->removed)
 		err = ane_tm_recover(ane);
 	mutex_unlock(&ane->engine_lock);
 	pm_runtime_put_autosuspend(dev);
-	if (err)
-		return err;
-	return count;
+out_pm:
+	mutex_unlock(&ane->pm_lock);
+	return err < 0 ? err : count;
 }
 static DEVICE_ATTR_WO(reset);
 
@@ -811,12 +812,13 @@ static int ane_drm_open(struct drm_device *drm, struct drm_file *file)
 	/* Bring up power while the file context is created. A failed
 	 * resume propagates; nothing is released that was not acquired.
 	 */
+	mutex_lock(&ane->pm_lock);
 	err = pm_runtime_resume_and_get(ane->dev);
-	if (err < 0)
-		return err;
+	if (err >= 0)
+		pm_runtime_put_autosuspend(ane->dev);
 
-	pm_runtime_put_autosuspend(ane->dev);
-	return 0;
+	mutex_unlock(&ane->pm_lock);
+	return err < 0 ? err : 0;
 }
 
 /* Retry recovery on close, retaining quarantine if DMA cannot be quiesced. */
@@ -872,14 +874,17 @@ static long ane_drm_ioctl(struct file *file, unsigned int cmd,
 	    _IOC_NR(cmd) >= DRM_COMMAND_END)
 		return -ENOTTY;
 
+	mutex_lock(&ane->pm_lock);
 	err = pm_runtime_resume_and_get(ane->dev);
 	if (err < 0)
-		return err;
+		goto unlock_pm;
 
 	err = dispatch(file, cmd, arg);
 
 	pm_runtime_put_autosuspend(ane->dev);
 
+unlock_pm:
+	mutex_unlock(&ane->pm_lock);
 	return err;
 }
 
@@ -911,11 +916,19 @@ static int ane_drm_release(struct inode *inode, struct file *file)
 {
 	struct drm_file *priv = file->private_data;
 	struct device *dev = get_device(priv->minor->dev->dev);
+	struct ane_device *ane = priv->minor->dev->dev_private;
 	int err;
 
+	/* drm_release may drop the last drm reference; keep ane alive until
+	 * pm_lock is unlocked.
+	 */
+	drm_dev_get(&ane->drm);
+	mutex_lock(&ane->pm_lock);
 	pm_runtime_get_sync(dev);
 	err = drm_release(inode, file);
 	pm_runtime_put_autosuspend(dev);
+	mutex_unlock(&ane->pm_lock);
+	drm_dev_put(&ane->drm);
 	put_device(dev);
 	return err;
 }
@@ -1109,10 +1122,6 @@ static int ane_attach_genpd(struct ane_device *ane)
  */
 struct ane_soc {
 	phys_addr_t ps_base;
-	/* True when the tm/tq register file survives a genpd cycle in
-	 * retention and recovery must drain it (see ane_tm_drain_retained).
-	 */
-	bool tm_retention;
 };
 
 static const struct ane_soc ane_soc_t8103 = {
@@ -1127,7 +1136,6 @@ static const struct ane_soc ane_soc_t6000 = {
 	 * (verified on T6001); M1 Pro and M1 Ultra are untested.
 	 */
 	.ps_base = 0x28e08c000ULL,
-	.tm_retention = true,
 };
 
 static const struct of_device_id ane_of_match[] = {
@@ -1157,7 +1165,6 @@ static int ane_platform_probe(struct platform_device *pdev)
 	drm->dev_private = ane;
 
 	atomic_set(&ane->wedged, 0);
-	ane->tm_retention = soc->tm_retention;
 
 	/* Producer-side stats: preallocate the ring at probe; the files
 	 * and the hot-path branch key off stats_slots.
@@ -1217,6 +1224,7 @@ static int ane_platform_probe(struct platform_device *pdev)
 
 	mutex_init(&ane->iommu_lock);
 	mutex_init(&ane->engine_lock);
+	mutex_init(&ane->pm_lock);
 	INIT_LIST_HEAD(&ane->bo_list);
 	INIT_LIST_HEAD(&ane->preserved_list);
 	err = ane_boost_init(ane);
@@ -1292,6 +1300,7 @@ static void ane_platform_remove(struct platform_device *pdev)
 	/* Powered and pinned for the teardown: the unmaps below flush the
 	 * DART TLBs, and no autosuspend may race the genpd detach.
 	 */
+	mutex_lock(&ane->pm_lock);
 	pm_runtime_get_sync(ane->dev);
 
 	mutex_lock(&ane->engine_lock);
@@ -1302,6 +1311,7 @@ static void ane_platform_remove(struct platform_device *pdev)
 		dev_err(ane->dev,
 			"forced removal of a wedged device is unsafe; reboot required\n");
 		mutex_unlock(&ane->engine_lock);
+		mutex_unlock(&ane->pm_lock);
 		return;
 	}
 
@@ -1317,6 +1327,7 @@ static void ane_platform_remove(struct platform_device *pdev)
 	pm_runtime_dont_use_autosuspend(ane->dev);
 	pm_runtime_put_noidle(ane->dev);
 	mutex_unlock(&ane->engine_lock);
+	mutex_unlock(&ane->pm_lock);
 }
 
 static int __maybe_unused ane_runtime_suspend(struct device *dev)
@@ -1364,6 +1375,10 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 			"ANE-resume: SET window probed; first engine access next (TM_TQ_EN tm+0x0c @ engine %pr + 0x2000c)\n",
 			eng);
 	}
+
+	/* Recovery verifies the power-on ACK before its first engine access. */
+	if (ane->recovering)
+		return 0;
 
 	ane_tm_enable(ane, first);
 

@@ -64,6 +64,8 @@ struct ane_device {
 	 * and protects bo_list, preserved_list and removed.
 	 */
 	struct mutex engine_lock;
+	/* Serializes runtime-PM references across a recovery cycle. */
+	struct mutex pm_lock;
 	struct list_head bo_list;
 
 	/*
@@ -99,16 +101,6 @@ struct ane_device {
 	 */
 	u32 tm_status_fresh;
 	bool tm_status_known;
-
-	/*
-	 * SoC descriptor fact: the set0/base islands hold the tm/tq
-	 * register file in retention through any genpd power cycle
-	 * (on T6001 TQ_EN still reads 0x3000 after a 2 s gate), so
-	 * recovery must drain retained task-manager state itself
-	 * instead of expecting a power-on reset to clear it.
-	 * False on T8103, where the cycle is a full POR of the file.
-	 */
-	bool tm_retention;
 
 	/*
 	 * Engine-busy CPU cluster boost (ane_boost.c): min-frequency QoS on
