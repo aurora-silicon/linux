@@ -579,7 +579,10 @@ static void ave_buf_queue(struct vb2_buffer *vb)
 {
 	struct ave_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 
-	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
+	if (READ_ONCE(ctx->failed))
+		v4l2_m2m_buf_done(to_vb2_v4l2_buffer(vb), VB2_BUF_STATE_ERROR);
+	else
+		v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
 }
 
 static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
@@ -751,7 +754,9 @@ static int ave_session_begin(struct ave_ctx *ctx)
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
 		return -EBUSY;
 	/* A halted firmware restarts only from reset: let the power go first. */
-	if (READ_ONCE(ave->fw_state) == AVE_FW_HALTED)
+	if (READ_ONCE(ave->fw_state) == AVE_FW_HALTED ||
+	    READ_ONCE(ave->fw_state) == AVE_FW_BROKEN ||
+	    READ_ONCE(ave->fw_state) == AVE_FW_RECOVERING)
 		pm_runtime_suspend(ave->dev);
 	sess = ave_sess_create(ctx);
 	if (IS_ERR(sess)) {
@@ -845,6 +850,8 @@ static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
 		v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
 	int ret = 0;
 
+	if (!vb2_is_streaming(other))
+		WRITE_ONCE(ctx->failed, false);
 	if (V4L2_TYPE_IS_OUTPUT(q->type))
 		ctx->src_sequence = 0;
 	else
@@ -920,6 +927,8 @@ static int ave_job_ready(void *priv)
 	struct ave_ctx *ctx = priv;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 
+	if (READ_ONCE(ctx->failed))
+		return 0;
 	if (atomic_read(&ctx->ready) || READ_ONCE(ctx->flush_pending))
 		return 1;
 	if (ctx->stopped || (ctx->draining && !ctx->drain_src))
@@ -1087,6 +1096,11 @@ static void ave_job_fail(struct ave_ctx *ctx, int err)
 	struct ave_dev *ave = ctx->ave;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 
+	/* Publish the fatal error before any teardown that can wait on PM/IPC. */
+	WRITE_ONCE(ctx->failed, true);
+	cancel_delayed_work(&ctx->poll_work);
+	vb2_queue_error(v4l2_m2m_get_src_vq(m2m));
+	vb2_queue_error(v4l2_m2m_get_dst_vq(m2m));
 	dev_err(ave->dev, "encoding failed: %d\n", err);
 	mutex_lock(&ave->hw_lock);
 	ave_session_close(ctx, false);
@@ -1094,8 +1108,6 @@ static void ave_job_fail(struct ave_ctx *ctx, int err)
 	ave_session_free(ctx);
 	ave_return_bufs(ctx, v4l2_m2m_get_src_vq(m2m), VB2_BUF_STATE_ERROR);
 	ave_return_bufs(ctx, v4l2_m2m_get_dst_vq(m2m), VB2_BUF_STATE_ERROR);
-	vb2_queue_error(v4l2_m2m_get_src_vq(m2m));
-	vb2_queue_error(v4l2_m2m_get_dst_vq(m2m));
 	ave_reset_drain(ctx);
 }
 
@@ -1106,6 +1118,9 @@ static void ave_run_work(struct work_struct *work)
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	bool eos = false, poll = false;
 	int ret = 0;
+
+	if (READ_ONCE(ctx->failed))
+		goto finish;
 
 	/*
 	 * After a drain the next frame starts a new session; after system
@@ -1158,6 +1173,7 @@ static void ave_run_work(struct work_struct *work)
 	} else if (poll) {
 		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
 	}
+finish:
 	pm_runtime_mark_last_busy(ave->dev);
 	v4l2_m2m_job_finish(ave->m2m_dev, m2m);
 }
@@ -1170,7 +1186,9 @@ static void ave_poll_work(struct work_struct *work)
 	bool again = false, fail = false;
 
 	mutex_lock(&ave->hw_lock);
-	if (ctx->sess && ave_session_index(ave, ctx) >= 0) {
+	if (ctx->sess && ave->fw_state == AVE_FW_BROKEN) {
+		fail = true;
+	} else if (ctx->sess && ave_session_index(ave, ctx) >= 0) {
 		fail = ave_ipc_pump(ave, 0, NULL, NULL) != 0;
 		if (!fail && ave_sess_starved(ctx->sess) &&
 		    !v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx)) {
@@ -1187,7 +1205,7 @@ static void ave_poll_work(struct work_struct *work)
 			 */
 			dev_err(ave->dev, "%u frames unanswered for %u ms; firmware is stuck\n",
 				ctx->sess->busy, AVE_FRAME_WAIT_MS);
-			ave->fw_state = AVE_FW_BROKEN;
+			ave_fw_mark_broken(ave, -ETIMEDOUT, "frame timeout");
 			fail = true;
 		}
 		again = !fail && ctx->sess->busy;
