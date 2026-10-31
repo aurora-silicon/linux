@@ -24,6 +24,8 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/v4l2-ioctl.h>
 
+#include "avd-queue.h"
+
 #define AVD_CAPABILITY_HEVC	BIT(0)
 #define AVD_CAPABILITY_H264	BIT(1)
 #define AVD_CAPABILITY_VP9	BIT(2)
@@ -173,6 +175,7 @@ struct avd_coded_fmt_desc {
 	struct v4l2_frmsize_stepwise frmsize;
 	const struct avd_ctrls *ctrls;
 	const struct avd_coded_fmt_ops *ops;
+	const struct avd_codec_frame_ops *frame_ops;
 	unsigned int num_decoded_fmts;
 	const struct avd_decoded_fmt_desc *decoded_fmts;
 	u32 subsystem_flags;
@@ -180,6 +183,8 @@ struct avd_coded_fmt_desc {
 };
 
 struct avd_variant {
+	/* enum avd_vp9_fp_generation, selected by OF match data. */
+	unsigned int vp9_fp_generation;
 	unsigned int vp_slots[4];
 	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
@@ -305,6 +310,7 @@ bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_hevc_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_vp9_fmt_ops;
+extern const struct avd_codec_frame_ops avd_vp9_frame_ops;
 extern const struct avd_coded_fmt_ops avd_av1_fmt_ops;
 
 extern const struct v4l2_ctrl_ops avd_ctrl_ops;

@@ -21,6 +21,7 @@
 
 #include "avd.h"
 #include "avd-inst.h"
+#include "avd-vp9-fp.h"
 
 #define VP9_Q_IDX(v)	FIELD_PREP(GENMASK(31, 15), v)
 #define VP9_Q_DC_Y(v)	FIELD_PREP(GENMASK(14, 10), v)
@@ -164,26 +165,35 @@ struct avd_vp9_frame_info {
 	struct v4l2_vp9_loop_filter lf;
 };
 
+struct avd_vp9_slot;
+
 struct avd_vp9_run {
+	struct avd_frame *frame;
+	struct avd_vp9_slot *slot;
+	int error;
 	struct avd_run base;
 
 	const struct v4l2_ctrl_vp9_frame *decode_params;
 	const struct v4l2_ctrl_vp9_compressed_hdr *prob_updates;
 };
 
-struct avd_vp9_ctx {
+struct avd_vp9_segmap {
+	struct avd_buf buf;
+	unsigned int users;
+};
+
+struct avd_vp9_slot {
+	struct avd_vp9_segmap *seg_in, *seg_out;
 	struct v4l2_vp9_frame_symbol_counts cnts;
 	struct v4l2_vp9_frame_context probability_tables;
-	struct v4l2_vp9_frame_context frame_context[4];
+	struct v4l2_vp9_frame_context initial_probs;
 	struct avd_vp9_bufs {
-		struct avd_buf inst;
 		struct avd_buf az_left;
 		struct avd_buf above_info;
 		struct avd_buf ip_above;
 		struct avd_buf lf_above;
 		struct avd_buf lf_left_info;
 		struct avd_buf lf_left;
-		struct avd_buf color;
 		struct avd_buf seg;
 		struct avd_buf pipe_state;
 		struct avd_buf counts;
@@ -191,8 +201,89 @@ struct avd_vp9_ctx {
 	} bufs;
 	struct avd_vp9_frame_info cur;
 	struct avd_vp9_frame_info last;
-	u8 submit_num;
 };
+
+struct avd_vp9_ctx {
+	struct v4l2_vp9_frame_context frame_context[4];
+	struct avd_vp9_slot *slots[AVD_MAX_FRAMES];
+	/* One output per active frame, plus the previous retired map. */
+	struct avd_vp9_segmap segmaps[AVD_MAX_FRAMES + 1];
+	struct avd_vp9_segmap *last_segmap;
+	struct avd_vp9_frame_info last;
+	/* CPU probability preparation must wait for this frame's counts. */
+	struct avd_frame *pending;
+	bool failed;
+};
+
+/* Build the same instruction words as the legacy builder, in DMA memory. */
+#undef push
+#undef pusha
+static void vp9_push(struct avd_vp9_run *run, u32 word)
+{
+	struct avd_frame *f = run->frame;
+
+	if (f->prog_words >= f->prog->size / sizeof(__le32)) {
+		run->error = -ENOSPC;
+		return;
+	}
+	((__le32 *)f->prog->cpu)[f->prog_words++] = cpu_to_le32(word);
+}
+
+static void vp9_push_address(struct avd_ctx *ctx, struct avd_vp9_run *run,
+			     dma_addr_t addr)
+{
+	if (ctx->dev->variant->quirks & AVD_QUIRK_LSR) {
+		vp9_push(run, addr >> 8);
+	} else {
+		vp9_push(run, lower_32_bits(addr));
+		vp9_push(run, upper_32_bits(addr));
+	}
+}
+
+static void vp9_push_comp(struct avd_ctx *ctx, struct avd_vp9_run *run,
+			  dma_addr_t addr, const u32 offsets[4])
+{
+	for (int i = 0; i < 4; i++) {
+		if (ctx->dev->variant->quirks & AVD_QUIRK_LSR)
+			vp9_push(run, (addr + offsets[i]) >> 7);
+		else
+			vp9_push_address(ctx, run, addr + offsets[i]);
+	}
+}
+
+#define push(word, name) vp9_push(run, word)
+#define pusha(addr, name, i) vp9_push_address(ctx, run, addr)
+
+
+/* Flatten the legacy avd_submit_job() EXEC boundaries into the DMA stream.
+ * Firmware owns FIFO/VP pacing and PP submission; the codec never touches MMIO.
+ */
+static int vp9_finish_program(struct avd_ctx *ctx, struct avd_frame *f,
+			      size_t header_words, unsigned int tiles)
+{
+	__le32 *words = f->prog->cpu;
+	u32 mask = ctx->dev->variant->revision == 3 ?
+		AVD_OP_EXEC_REV3_VP9_MASK : 0;
+	u32 fifo = AVD_OP_EXEC_FIFO_IDX(f->idx & ctx->dev->variant->fifo_slots);
+	size_t total = f->prog_words + tiles + 1;
+
+	if (total > f->prog->size / sizeof(*words))
+		return -ENOSPC;
+	for (unsigned int i = tiles; i > 0; i--) {
+		size_t src = header_words + (i - 1) * 5;
+		size_t dst = header_words + 1 + (i - 1) * 6;
+
+		memmove(words + dst, words + src, 5 * sizeof(*words));
+		words[dst + 5] = cpu_to_le32(AVD_OP_EXEC | mask | fifo |
+			AVD_OP_EXEC_FLAG_END(i == tiles));
+	}
+	memmove(words + 1, words, header_words * sizeof(*words));
+	words[0] = cpu_to_le32(AVD_OP_EXEC | mask | fifo |
+		AVD_OP_EXEC_FLAG_START_REV3(ctx->dev->variant->revision == 3) |
+		AVD_OP_EXEC_FLAG_START_REV4(ctx->dev->variant->revision == 4));
+	f->prog_words = total;
+	return 0;
+}
 
 static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
@@ -229,13 +320,13 @@ static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		push(AVD_HDR_HEIGHT(xscale) | AVD_HDR_WIDTH(yscale),
 		     "ref_scale");
 
-		push_comp(ctx, addr, ref_buf[i]->comp.offsets);
+		vp9_push_comp(ctx, run, addr, ref_buf[i]->comp.offsets);
 	}
 }
 
 static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
+	struct avd_vp9_slot *vp9_ctx = run->slot;
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
 	struct avd_decoded_buffer *dst, *last, *golden, *alt;
 
@@ -306,7 +397,7 @@ static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
 static u32 seg_features(struct avd_ctx *ctx, struct avd_vp9_run *run,
 			unsigned int segid)
 {
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
+	struct avd_vp9_slot *vp9_ctx = run->slot;
 	const struct v4l2_vp9_segmentation *seg = &vp9_ctx->cur.seg;
 	u32 feature_val = 0;
 	int feature_id = 0;
@@ -336,7 +427,7 @@ static u32 seg_features(struct avd_ctx *ctx, struct avd_vp9_run *run,
 
 static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
+	struct avd_vp9_slot *vp9_ctx = run->slot;
 	const struct v4l2_ctrl_vp9_compressed_hdr *prob_updates =
 		run->prob_updates;
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
@@ -346,7 +437,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	bool intra_only = !!(frame->flags & (V4L2_VP9_FRAME_FLAG_KEY_FRAME |
 					     V4L2_VP9_FRAME_FLAG_INTRA_ONLY));
 
-	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(true) |
 		     AVD_OP_HDR_FLAG_INTRA(intra_only) | AVD_OP_HDR_CONST |
 		     AVD_OP_HDR_FLAG_PIPE_STATE(
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
@@ -386,8 +477,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	pusha(vp9_ctx->bufs.above_info.addr, "above_info", 0);
 	pusha(vp9_ctx->bufs.seg.addr, "seg", 1);
 	pusha(vp9_ctx->bufs.seg.addr, "seg", 2);
-	pusha(vp9_ctx->bufs.color.addr, "color", 3);
-	pusha(vp9_ctx->bufs.color.addr, "color", 4);
+	pusha(vp9_ctx->seg_in->buf.addr, "color", 3);
+	pusha(vp9_ctx->seg_out->buf.addr, "color", 4);
 
 	push(VP9_Q_IDX(frame->quant.base_q_idx) |
 		     VP9_Q_DC_Y(frame->quant.delta_q_y_dc) |
@@ -431,7 +522,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 	push(0, "");
 
-	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
+	vp9_push_comp(ctx, run, run->base.comp_out, ctx->comp.offsets);
 
 	pusha((u64)0, "packed_fmt_scratch", 0);
 
@@ -452,16 +543,16 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		set_refs(ctx, run);
 }
 
-static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
+static int set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *frame = run->decode_params;
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
-	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	struct vb2_v4l2_buffer *src = run->base.bufs.src;
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
 
 	u32 offset =
 		frame->uncompressed_header_size + frame->compressed_header_size;
-	u32 size = vb2_get_plane_payload(&src->vb2_buf, 0) - offset;
+	size_t payload = vb2_get_plane_payload(&src->vb2_buf, 0);
+	u32 size;
 	u32 num_tile_rows = 1 << frame->tile_rows_log2;
 	u32 num_tile_cols = 1 << frame->tile_cols_log2;
 	u32 tile_size;
@@ -470,23 +561,29 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	u32 sb_64_cols = (((frame->frame_width_minus_1 + 8) >> 3) + 7) >> 3;
 	u32 sb_64_rows = (((frame->frame_height_minus_1 + 8) >> 3) + 7) >> 3;
 
-	for (int row = 0; row < num_tile_rows; row++)
-		for (int col = 0; col < num_tile_cols; col++) {
-			ctx->job.num++;
+	if (!data || offset >= payload || payload > U32_MAX)
+		return -EINVAL;
+	size = payload - offset;
+
+	for (u32 row = 0; row < num_tile_rows; row++)
+		for (u32 col = 0; col < num_tile_cols; col++) {
 			if (row == num_tile_rows - 1 &&
 			    col == num_tile_cols - 1) {
 				tile_size = size;
 			} else {
+				if (size < 4)
+					return -EINVAL;
 				tile_size = get_unaligned_be32(&data[offset]);
-				/* i have crashed my computer because of this */
-				if (tile_size > size - 4)
-					return;
+				if (!tile_size || tile_size > size - 4)
+					return -EINVAL;
 				offset += 4;
 				size -= 4;
 			}
+			if (!tile_size)
+				return -EINVAL;
 			push(AVD_OP_CODED_DATA |
 				     AVD_OP_CODED_DATA_ADDR(
-					     run->base.coded_in >> 32),
+					     (run->base.coded_in + offset) >> 32),
 			     "cm3_cmd_set_slice_data");
 			push((u32)((run->base.coded_in + offset) & 0xffffffff),
 			     "til_ab4_tile_addr_low");
@@ -507,8 +604,8 @@ static void set_tiles(struct avd_ctx *ctx, struct avd_vp9_run *run)
 
 			offset += tile_size;
 			size -= tile_size;
-			vp9_ctx->submit_num++;
 		}
+	return run->error;
 }
 
 static void update_dec_buf_info(struct avd_decoded_buffer *buf,
@@ -519,7 +616,7 @@ static void update_dec_buf_info(struct avd_decoded_buffer *buf,
 	buf->vp9.bit_depth = dec_params->bit_depth;
 }
 
-static void update_ctx_cur_info(struct avd_vp9_ctx *vp9_ctx,
+static void update_ctx_cur_info(struct avd_vp9_slot *vp9_ctx,
 				struct avd_decoded_buffer *buf,
 				const struct v4l2_ctrl_vp9_frame *dec_params)
 {
@@ -530,11 +627,6 @@ static void update_ctx_cur_info(struct avd_vp9_ctx *vp9_ctx,
 	vp9_ctx->cur.timestamp = buf->base.vb.vb2_buf.timestamp;
 	vp9_ctx->cur.seg = dec_params->seg;
 	vp9_ctx->cur.lf = dec_params->lf;
-}
-
-static void update_ctx_last_info(struct avd_vp9_ctx *vp9_ctx)
-{
-	vp9_ctx->last = vp9_ctx->cur;
 }
 
 static void copy_vp9_frame_mv(struct avd_vp9_probs *avd_probs,
@@ -562,7 +654,7 @@ static void copy_vp9_frame_mv(struct avd_vp9_probs *avd_probs,
 static void init_probs(struct avd_ctx *ctx, const struct avd_vp9_run *run)
 {
 	const struct v4l2_ctrl_vp9_frame *dec_params;
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
+	struct avd_vp9_slot *vp9_ctx = run->slot;
 	struct avd_vp9_probs *avd_probs = vp9_ctx->bufs.probs.cpu;
 	const struct v4l2_vp9_segmentation *seg;
 	const struct v4l2_vp9_frame_context *probs;
@@ -629,6 +721,21 @@ static int validate_dec_params(struct avd_ctx *ctx,
 {
 	unsigned int aligned_width, aligned_height;
 
+	if ((dec_params->profile != 0 || dec_params->bit_depth != 8) &&
+	    (dec_params->profile != 2 || dec_params->bit_depth != 10))
+		return -EINVAL;
+	if (!(dec_params->flags & V4L2_VP9_FRAME_FLAG_X_SUBSAMPLING) ||
+	    !(dec_params->flags & V4L2_VP9_FRAME_FLAG_Y_SUBSAMPLING))
+		return -EINVAL;
+	/* The current instruction's column field is four bits. */
+	if (dec_params->tile_cols_log2 > 4 || dec_params->tile_rows_log2 > 2)
+		return -EINVAL;
+	if ((1U << dec_params->tile_cols_log2) >
+	    DIV_ROUND_UP(dec_params->frame_width_minus_1 + 1, 64) ||
+	    (1U << dec_params->tile_rows_log2) >
+	    DIV_ROUND_UP(dec_params->frame_height_minus_1 + 1, 64))
+		return -EINVAL;
+
 	if (dec_params->frame_height_minus_1 + 1 < 64 ||
 	    dec_params->frame_width_minus_1 + 1 < 64)
 		return -EINVAL;
@@ -651,10 +758,10 @@ static int validate_dec_params(struct avd_ctx *ctx,
 	return 0;
 }
 
-static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
+static int avd_vp9_alloc_bufs(struct avd_ctx *ctx,
+			      struct avd_vp9_slot *vp9_ctx)
 {
 	struct avd_dev *avd = ctx->dev;
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	int ret, w, h, bit_depth;
 	w = fmt_width(ctx);
 	h = fmt_height(ctx);
@@ -663,10 +770,6 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
 			    10 :
 			    8;
 
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.inst, fifo_size());
-	if (ret)
-		return ret;
-
 	if (!(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)) {
 		ret = avd_buf_alloc(avd, &vp9_ctx->bufs.pipe_state, 0x200);
 		if (ret)
@@ -674,17 +777,12 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
 	}
 
 	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.probs,
-			    sizeof(struct avd_vp9_probs));
+			    AVD_VP9_PROBS_SIZE);
 	if (ret)
 		return ret;
 
 	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.counts,
 			    sizeof(struct avd_vp9_frame_symbol_counts));
-	if (ret)
-		return ret;
-
-	ret = avd_buf_alloc(avd, &vp9_ctx->bufs.color,
-			    DIV_ROUND_UP(w, 16) * DIV_ROUND_UP(h, 64) * 144);
 	if (ret)
 		return ret;
 
@@ -727,83 +825,6 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx)
 	return 0;
 }
 
-static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
-{
-	struct v4l2_ctrl *ctrl;
-	const struct v4l2_ctrl_vp9_frame *dec_params;
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
-	unsigned int fctx_idx;
-	int ret;
-
-	avd_run_preamble(ctx, &run->base);
-
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
-			      V4L2_CID_STATELESS_VP9_COMPRESSED_HDR);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	run->prob_updates = ctrl->p_cur.p;
-
-	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_VP9_FRAME);
-	if (WARN_ON(!ctrl))
-		return -EINVAL;
-	dec_params = ctrl->p_cur.p;
-
-	ret = validate_dec_params(ctx, dec_params);
-	if (ret)
-		return ret;
-
-	run->decode_params = dec_params;
-
-	vp9_ctx->cur.tx_mode = run->prob_updates->tx_mode;
-
-	fctx_idx = v4l2_vp9_reset_frame_ctx(dec_params, vp9_ctx->frame_context);
-	vp9_ctx->cur.frame_context_idx = fctx_idx;
-
-	vp9_ctx->probability_tables = vp9_ctx->frame_context[fctx_idx];
-	v4l2_vp9_fw_update_probs(&vp9_ctx->probability_tables,
-				 run->prob_updates, dec_params);
-
-	return 0;
-}
-
-static int avd_vp9_run(struct avd_ctx *ctx)
-{
-	struct avd_vp9_run run;
-	struct avd_vp9_ctx *vp9_ctx;
-	struct avd_decoded_buffer *dst;
-	int ret;
-
-	ret = avd_vp9_run_preamble(ctx, &run);
-	if (ret) {
-		avd_run_postamble(ctx, &run.base);
-		return ret;
-	}
-
-	ret = avd_init_job(
-		ctx, AVD_CODEC_VP9,
-		(1 << run.decode_params->tile_rows_log2) *
-				(1 << run.decode_params->tile_cols_log2) +
-			1);
-	if (ret) {
-		avd_run_postamble(ctx, &run.base);
-		return ret;
-	}
-
-	init_probs(ctx, &run);
-
-	vp9_ctx = ctx->priv;
-	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
-	update_dec_buf_info(dst, run.decode_params);
-	update_ctx_cur_info(vp9_ctx, dst, run.decode_params);
-
-	set_header(ctx, &run);
-	vp9_ctx->submit_num = 0;
-	set_tiles(ctx, &run);
-	avd_run_postamble(ctx, &run.base);
-
-	return avd_submit_job(ctx);
-}
-
 #define copy_tx_and_skip(p1, p2)                                    \
 	do {                                                        \
 		memcpy((p1)->tx8, (p2)->tx8, sizeof((p1)->tx8));    \
@@ -812,16 +833,21 @@ static int avd_vp9_run(struct avd_ctx *ctx)
 		memcpy((p1)->skip, (p2)->skip, sizeof((p1)->skip)); \
 	} while (0)
 
-static void avd_vp9_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
-			 struct vb2_v4l2_buffer *dst_buf,
-			 enum vb2_buffer_state result)
+static void avd_vp9_retire(struct avd_ctx *ctx, struct avd_frame *f,
+			   enum vb2_buffer_state result)
 {
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
+	struct avd_vp9_ctx *stream = ctx->priv;
+	struct avd_vp9_slot *vp9_ctx = f->codec_priv;
 	unsigned int fctx_idx;
 
+	if (!vp9_ctx)
+		return;
+
 	/* v4l2-specific stuff */
-	if (result == VB2_BUF_STATE_ERROR)
+	if (result == VB2_BUF_STATE_ERROR) {
+		stream->failed = true;
 		goto out_update_last;
+	}
 
 	/*
 	 * vp9 stuff
@@ -860,7 +886,7 @@ static void avd_vp9_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 			copy_tx_and_skip(tx_skip, probs);
 
 		/* 6.1.2 refresh_probs(): load_probs() and load_probs2() */
-		*probs = vp9_ctx->frame_context[fctx_idx];
+		*probs = vp9_ctx->initial_probs;
 
 		/* if FrameIsIntra then undo the effect of load_probs2() */
 		if (frame_is_intra)
@@ -877,7 +903,7 @@ static void avd_vp9_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 		if (!frame_is_intra) {
 			const struct avd_vp9_frame_symbol_counts *cnts;
 			int i;
-			u32 tx16p[2][4];
+			u32 tx16p[2][4] = {};
 			u32 sign[2][2];
 			u32 classes[2][11];
 			u32 class0[2][2];
@@ -891,7 +917,7 @@ static void avd_vp9_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 
 			for (i = 0; i < ARRAY_SIZE(cnts->tx16p); ++i)
 				memcpy(tx16p[i], cnts->tx16p[i],
-				       sizeof(tx16p[0]));
+				       sizeof(cnts->tx16p[0]));
 
 			for (i = 0; i < 2; i++) {
 				memcpy(sign[i], cnts->mv_comp[i].sign,
@@ -930,16 +956,24 @@ static void avd_vp9_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 	}
 
 	/* 6.1.2 refresh_probs(): save_probs(fctx_idx) */
-	vp9_ctx->frame_context[fctx_idx] = vp9_ctx->probability_tables;
+	if (!(vp9_ctx->cur.flags & V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE) &&
+	    !stream->failed)
+		stream->frame_context[fctx_idx] = vp9_ctx->probability_tables;
 
 out_update_last:
-	update_ctx_last_info(vp9_ctx);
+	if (stream->pending == f)
+		stream->pending = NULL;
+	if (vp9_ctx->seg_in)
+		vp9_ctx->seg_in->users--;
+	vp9_ctx->seg_out->users--;
+	vp9_ctx->seg_in = NULL;
+	vp9_ctx->seg_out = NULL;
+	f->codec_priv = NULL;
 }
 
 static noinline_for_stack void
-avd_init_v4l2_vp9_count_tbl(struct avd_ctx *ctx)
+avd_init_v4l2_vp9_count_tbl(struct avd_vp9_slot *vp9_ctx)
 {
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
 	struct avd_vp9_frame_symbol_counts *cnts = vp9_ctx->bufs.counts.cpu;
 	int coeff_cnts = 0, eob_cnts = 0;
 
@@ -981,48 +1015,174 @@ avd_init_v4l2_vp9_count_tbl(struct avd_ctx *ctx)
 				}
 }
 
+static void avd_vp9_free_slot(struct avd_ctx *ctx, struct avd_vp9_slot *slot)
+{
+	avd_buf_free(ctx->dev, &slot->bufs.az_left);
+	avd_buf_free(ctx->dev, &slot->bufs.above_info);
+	avd_buf_free(ctx->dev, &slot->bufs.ip_above);
+	avd_buf_free(ctx->dev, &slot->bufs.lf_above);
+	avd_buf_free(ctx->dev, &slot->bufs.lf_left_info);
+	avd_buf_free(ctx->dev, &slot->bufs.lf_left);
+	avd_buf_free(ctx->dev, &slot->bufs.seg);
+	avd_buf_free(ctx->dev, &slot->bufs.pipe_state);
+	avd_buf_free(ctx->dev, &slot->bufs.counts);
+	avd_buf_free(ctx->dev, &slot->bufs.probs);
+	kvfree(slot);
+}
+
 static void avd_vp9_stop(struct avd_ctx *ctx)
 {
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
-	struct avd_dev *avd = ctx->dev;
+	struct avd_vp9_ctx *stream = ctx->priv;
 
-	avd_buf_free(avd, &vp9_ctx->bufs.pipe_state);
-	avd_buf_free(avd, &vp9_ctx->bufs.inst);
-	avd_buf_free(avd, &vp9_ctx->bufs.probs);
-	avd_buf_free(avd, &vp9_ctx->bufs.counts);
-	avd_buf_free(avd, &vp9_ctx->bufs.seg);
-	avd_buf_free(avd, &vp9_ctx->bufs.color);
-	avd_buf_free(avd, &vp9_ctx->bufs.ip_above);
-	avd_buf_free(avd, &vp9_ctx->bufs.lf_above);
-	avd_buf_free(avd, &vp9_ctx->bufs.above_info);
-	avd_buf_free(avd, &vp9_ctx->bufs.az_left);
-	avd_buf_free(avd, &vp9_ctx->bufs.lf_left_info);
-	avd_buf_free(avd, &vp9_ctx->bufs.lf_left);
-
-	kfree(vp9_ctx);
+	for (unsigned int i = 0; i < AVD_MAX_FRAMES; i++)
+		if (stream->slots[i])
+			avd_vp9_free_slot(ctx, stream->slots[i]);
+	for (unsigned int i = 0; i < ARRAY_SIZE(stream->segmaps); i++)
+		avd_buf_free(ctx->dev, &stream->segmaps[i].buf);
+	kvfree(stream);
 	ctx->priv = NULL;
 }
 
 static int avd_vp9_start(struct avd_ctx *ctx)
 {
-	struct avd_vp9_ctx *vp9_ctx;
+	struct avd_vp9_ctx *stream;
+
+	stream = kvzalloc(sizeof(*stream), GFP_KERNEL);
+	if (!stream)
+		return -ENOMEM;
+	for (unsigned int i = 0; i < ARRAY_SIZE(stream->frame_context); i++)
+		stream->frame_context[i] = v4l2_vp9_default_probs;
+	ctx->priv = stream;
+	return 0;
+}
+
+static int avd_vp9_prepare(struct avd_ctx *ctx, struct avd_frame *f)
+{
+	struct avd_vp9_ctx *stream = ctx->priv;
+	struct avd_vp9_run run = { .frame = f };
+	struct avd_vp9_slot *slot;
+	struct avd_decoded_buffer *dst;
+	struct v4l2_ctrl *ctrl;
+	unsigned int idx, tiles;
+	size_t header_words;
 	int ret;
 
-	vp9_ctx = kzalloc(sizeof(*vp9_ctx), GFP_KERNEL);
-	if (!vp9_ctx)
-		return -ENOMEM;
+	if (f->idx >= AVD_MAX_FRAMES || !f->src || !f->dst ||
+	    !f->prog || !f->prog->cpu)
+		return -EINVAL;
+	/* A submission dependency alone cannot protect CPU probability reads.
+	 * The core must retry prepare after retiring the count producer. */
+	f->dep = stream->pending ? AVD_DEP_PREV_DONE : AVD_DEP_NONE;
+	if (stream->pending)
+		return -EAGAIN;
+	if (stream->failed)
+		return -EIO;
 
-	ctx->priv = vp9_ctx;
-	ret = avd_vp9_alloc_bufs(ctx);
+	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_VP9_FRAME);
+	if (!ctrl)
+		return -EINVAL;
+	run.decode_params = ctrl->p_cur.p;
+	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl,
+			      V4L2_CID_STATELESS_VP9_COMPRESSED_HDR);
+	if (!ctrl)
+		return -EINVAL;
+	run.prob_updates = ctrl->p_cur.p;
+	ret = validate_dec_params(ctx, run.decode_params);
 	if (ret)
-		goto err_free_ctx;
+		return ret;
 
-	avd_init_v4l2_vp9_count_tbl(ctx);
+	slot = stream->slots[f->idx];
+	if (!slot) {
+		slot = kvzalloc(sizeof(*slot), GFP_KERNEL);
+		if (!slot)
+			return -ENOMEM;
+		ret = avd_vp9_alloc_bufs(ctx, slot);
+		if (ret) {
+			avd_vp9_free_slot(ctx, slot);
+			return ret;
+		}
+		avd_init_v4l2_vp9_count_tbl(slot);
+		stream->slots[f->idx] = slot;
+	}
+	for (idx = 0; idx < ARRAY_SIZE(stream->segmaps); idx++)
+		if (!stream->segmaps[idx].users)
+			break;
+	if (idx == ARRAY_SIZE(stream->segmaps))
+		return -EAGAIN;
+	slot->seg_out = &stream->segmaps[idx];
+	if (!slot->seg_out->buf.cpu) {
+		ret = avd_buf_alloc(ctx->dev, &slot->seg_out->buf,
+			DIV_ROUND_UP(fmt_width(ctx), 16) *
+			DIV_ROUND_UP(fmt_height(ctx), 64) * 144);
+		if (ret)
+			return ret;
+	}
+	/* The previous map may still be read by other submitted frames. */
+	slot->seg_in = stream->last_segmap ? stream->last_segmap : slot->seg_out;
+	slot->seg_out->users++;
+	slot->seg_in->users++;
+	run.slot = slot;
+	run.base.bufs.src = f->src;
+	run.base.bufs.dst = f->dst;
+	run.base.coded_in = vb2_dma_contig_plane_dma_addr(&f->src->vb2_buf, 0);
+	run.base.y_out = vb2_dma_contig_plane_dma_addr(&f->dst->vb2_buf, 0);
+	run.base.uv_out = run.base.y_out +
+		ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline *
+		ctx->decoded_fmt.fmt.pix_mp.height;
+	run.base.comp_out = run.base.y_out + ctx->comp.start_offset;
+	dst = vb2_to_avd_decoded_buf(&f->dst->vb2_buf);
+	dst->comp = ctx->comp;
+	update_dec_buf_info(dst, run.decode_params);
+	slot->last = stream->last;
+	update_ctx_cur_info(slot, dst, run.decode_params);
+	slot->cur.tx_mode = run.prob_updates->tx_mode;
 
+	/* Validate the complete bitstream before committing saved contexts. */
+	f->prog_words = 0;
+	set_header(ctx, &run);
+	header_words = f->prog_words;
+	ret = set_tiles(ctx, &run);
+	if (ret)
+		goto err_put_maps;
+	if (avd_backend_is_apple(ctx->dev)) {
+		ret = avd_vp9_pack_fp(ctx, f, run.decode_params, run.prob_updates,
+				      slot->bufs.probs.cpu, slot->bufs.probs.addr);
+		if (ret)
+			goto err_put_maps;
+	}
+	tiles = (1U << run.decode_params->tile_cols_log2) *
+		(1U << run.decode_params->tile_rows_log2);
+	ret = vp9_finish_program(ctx, f, header_words, tiles);
+	if (ret)
+		goto err_put_maps;
+	idx = v4l2_vp9_reset_frame_ctx(run.decode_params, stream->frame_context);
+	slot->cur.frame_context_idx = idx;
+	slot->initial_probs = stream->frame_context[idx];
+	slot->probability_tables = slot->initial_probs;
+	v4l2_vp9_fw_update_probs(&slot->probability_tables,
+				 run.prob_updates, run.decode_params);
+	memset(slot->bufs.counts.cpu, 0, slot->bufs.counts.size);
+	init_probs(ctx, &run);
+
+	f->codec_priv = slot;
+	if (slot->cur.flags & V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX) {
+		if (avd_vp9_needs_counts(slot->cur.flags))
+			stream->pending = f;
+		else
+			stream->frame_context[idx] = slot->probability_tables;
+	}
+	stream->last = slot->cur;
+	if (stream->last_segmap)
+		stream->last_segmap->users--;
+	stream->last_segmap = slot->seg_out;
+	stream->last_segmap->users++;
 	return 0;
 
-err_free_ctx:
-	avd_vp9_stop(ctx);
+err_put_maps:
+	slot->seg_in->users--;
+	slot->seg_out->users--;
+	slot->seg_in = NULL;
+	slot->seg_out = NULL;
 	return ret;
 }
 
@@ -1049,34 +1209,22 @@ static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
 #undef BIT_DEPTH
 }
 
-static void avd_vp9_submit(struct avd_ctx *ctx)
+/* The old core cannot run a frame_ops codec. Keep failure explicit until
+ * the queue core is integrated, rather than dereferencing a NULL .run. */
+static int avd_vp9_legacy_run(struct avd_ctx *ctx)
 {
-	struct avd_vp9_ctx *vp9_ctx = ctx->priv;
-	struct avd_dev *avd = ctx->dev;
-	u32 submit_mask = ctx->dev->variant->revision == 3 ?
-				  AVD_OP_EXEC_REV3_VP9_MASK :
-				  0;
-
-	writel(AVD_OP_EXEC | submit_mask |
-		       AVD_OP_EXEC_FLAG_START_REV4(avd->variant->revision ==
-						   4) |
-		       AVD_OP_EXEC_FLAG_START_REV3(avd->variant->revision ==
-						   3) |
-		       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
-		       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
-	       avd->ctrl + avd->variant->submit_offset);
-	for (int i = 0; i < vp9_ctx->submit_num - 1; i++)
-		writel(AVD_OP_EXEC | submit_mask |
-			       AVD_OP_EXEC_FIFO_IDX(ctx->fifo_idx) |
-			       AVD_OP_EXEC_FIFO_MASK(avd->variant->fifo_slots),
-		       avd->ctrl + avd->variant->submit_offset);
+	return -EOPNOTSUPP;
 }
+
+const struct avd_codec_frame_ops avd_vp9_frame_ops = {
+	.prepare = avd_vp9_prepare,
+	.pack_cmd = avd_vp9_pack_cmd,
+	.retire = avd_vp9_retire,
+};
 
 const struct avd_coded_fmt_ops avd_vp9_fmt_ops = {
 	.start = avd_vp9_start,
 	.stop = avd_vp9_stop,
-	.run = avd_vp9_run,
-	.done = avd_vp9_done,
-	.submit = avd_vp9_submit,
+	.run = avd_vp9_legacy_run,
 	.get_image_fmt = avd_vp9_get_image_fmt,
 };
