@@ -6,8 +6,9 @@ Apple AOP sensors
 
 The AOP firmware announces sensor services over EPIC. The AOP core matches
 each service to a child node in the device tree and forwards its fake-HID
-reports to the corresponding IIO driver. Ambient light (``als``) and lid
-angle (``las``) use this same transport; no HID bus device is created.
+reports to the corresponding IIO driver. Ambient light (``als``), lid
+angle (``las``), acceleration (``accel``) and angular rate (``gyro``) use
+this same transport; no HID bus device is created.
 
 Lid angle
 =========
@@ -30,12 +31,35 @@ Report 1 carries a 9-bit little-endian value following the report ID.
 The remaining bits in the last byte are padding. Reads return the cached
 unsolicited report, rather than issuing a synchronous HID feature request.
 
-Verification
-============
+Accelerometer and gyroscope
+===========================
+
+Enable ``CONFIG_IIO_AOP_SENSOR_MOTION``. The AOP must have ``accel`` and
+``gyro`` children with a SoC-specific compatible followed by
+``apple,aop-accel`` or ``apple,aop-gyro``. Each service reports only after
+it has been sent the machine's three calibration packets, which the
+bootloader copies from the Apple device tree into the child's
+``apple,range-intrinsic-cal``, ``apple,nominal-extrinsic-cal`` and
+``apple,range-extrinsic-cal`` properties. Without them the driver leaves
+the sensor off and does not bind. The packets are sent unchanged, then the
+50 Hz report interval.
+
+The devices are named ``aop-sensors-accel`` and ``aop-sensors-gyro``. Each
+has ``in_accel_{x,y,z}_raw`` or ``in_anglvel_{x,y,z}_raw``, a shared scale
+(acceleration in m/s^2 including gravity, angular rate in rad/s) and
+``sampling_frequency``. The axes are the sensor's, in the order it reports
+them; the mapping to the machine's axes is not established yet. A raw read
+before the first sample returns ``ENODATA``.
+
+Both devices have a buffer that takes X, Y and Z together, with an optional
+timestamp taken when the report arrives. The reports stop when the system
+goes to sleep and start again, with the calibration resent, when it wakes.
+
 
 Host regression tests require Python 3 and a Rust compiler::
 
   tools/testing/selftests/drivers/apple/aop-las.py
+  tools/testing/selftests/drivers/apple/aop-motion.py
 
 The tests compile the production decoder and shared IIO read callback
 against host mocks. They cover all 16-bit payloads (including padding),

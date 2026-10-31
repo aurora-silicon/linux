@@ -39,6 +39,7 @@ Industrial I/O Kernel Drivers
    adxl380
    adxl345
    aop-sensors
+   apple-aop-als
    bno055
    ep93xx_adc
    opt4060

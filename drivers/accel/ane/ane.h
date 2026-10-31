@@ -7,7 +7,6 @@
 #include <linux/atomic.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
-#include <linux/pm_qos.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_device.h>
@@ -110,22 +109,24 @@ struct ane_device {
 	 */
 	bool tm_retention;
 
-	/*
-	 * Engine-busy CPU cluster boost (ane_boost.c): min-frequency QoS on
-	 * every cpufreq policy while a submit runs and until boost_idle_ms
-	 * after the last one completes: on T8103 bandwidth-bound programs
-	 * run ~2x slower while schedutil parks the idle clusters low.
-	 */
-	struct ane_boost {
-		struct mutex lock;	/* protects the fields below */
-		struct delayed_work off;
-		struct freq_qos_request *legs;
-		int nlegs;
-		int held;
-		unsigned long last_end;
+	/* Protected independently of engine_lock so idle work can release votes. */
+	struct ane_perf {
+		struct mutex lock; /* protects votes, idle work and status */
+		struct delayed_work idle;
+		struct device_node *report;
+		struct icc_path *memory;
+		unsigned int high_level;
+		unsigned int level;
+		u32 avg_bw;
+		u32 peak_bw;
+		int error;
+		unsigned int release_retries;
+		bool initialized;
 		bool busy;
-		bool on;
-	} boost;
+		bool voted;
+		bool clock_held;
+		bool pinned;
+	} perf;
 
 	/*
 	 * Producer-side stats (sysfs ane_stats, debugfs ane_timeline;
@@ -159,10 +160,11 @@ int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
  */
 void ane_reclaim_preserved(struct ane_device *ane);
 
-int ane_boost_init(struct ane_device *ane);
-void ane_boost_exit(struct ane_device *ane);
-void ane_boost_begin(struct ane_device *ane);
-void ane_boost_end(struct ane_device *ane);
+int ane_perf_init(struct ane_device *ane, unsigned int high_level);
+int ane_perf_exit(struct ane_device *ane);
+int ane_perf_begin(struct ane_device *ane);
+void ane_perf_end(struct ane_device *ane);
+int ane_perf_suspend(struct ane_device *ane);
 
 int ane_dart_init(struct ane_device *ane);
 void ane_dart_mask(struct ane_device *ane);

@@ -165,18 +165,10 @@ static int mt_scan_submit_next(struct mt7932 *m)
 	u8 body[0x4d4], channels[MT7932_SCAN_CHANNELS];
 	unsigned int count = 0, i;
 	unsigned long flags;
-	bool passive = false, directed = false;
+	bool passive = false;
 	int ret;
 
-	/* Hidden SSIDs retain directed probing on the legacy VLP channels. */
-	for (i = 0; i < request->n_ssids; i++)
-		directed |= !!request->ssids[i].ssid_len;
-
-	/* Retain directed discovery on the installed legacy VLP channels.
-	 * New class-only channels need an AP class/TPE before transmission.
-	 */
-
-	/* 2GHz active/passive, then 5GHz active/passive. Never put a NO_IR
+	/* 2/5/6 GHz active/passive pairs. Never put a NO_IR
 	 * channel in a firmware request which can emit probe requests.
 	 */
 	while (!count && m->scan_batch <= 6) {
@@ -187,13 +179,8 @@ static int mt_scan_submit_next(struct mt7932 *m)
 		for (i = m->scan_cursor; i < request->n_channels; i++) {
 			struct ieee80211_channel *channel = request->channels[i];
 			bool radar = channel->flags & IEEE80211_CHAN_RADAR;
-			bool listen =
-				!request->n_ssids || radar ||
-				(channel->band == NL80211_BAND_6GHZ &&
-				 (!directed ||
-				  !(m->six_legacy_channels &
-				    BIT_ULL((channel->hw_value - 1) / 4)))) ||
-				(channel->flags & IEEE80211_CHAN_NO_IR);
+			bool listen = mt7932_scan_listen(request, channel,
+						     m->six_legacy_channels);
 
 			/* Radar channels are never joined; while associated,
 			 * a passive dwell there only delays the home channel.
@@ -321,7 +308,7 @@ int mt_connect_discover(struct mt7932 *m)
 			m->scan_seq, band, count, passive, ret);
 		mutex_unlock(&m->command_mutex);
 		if (!ret && !wait_for_completion_timeout(&m->discovery_done,
-							 msecs_to_jiffies(5000)))
+				msecs_to_jiffies(mt7932_scan_discovery_timeout(body))))
 			ret = -ETIMEDOUT;
 		mutex_lock(&m->command_mutex);
 		/* Cancellation wakes the waiter, but is not a firmware completion.

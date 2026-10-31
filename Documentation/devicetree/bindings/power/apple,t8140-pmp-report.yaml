@@ -19,6 +19,27 @@ description: |
   contiguous readable array of registers.
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t6000-pmp-v2-report
+    then:
+      properties:
+        reg:
+          maxItems: 2
+    else:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names: false
+  - if:
+      properties:
+        reg:
+          minItems: 2
+    then:
+      required:
+        - reg-names
+
   - $ref: apple,pmp-dram.yaml#
 
 properties:
@@ -30,7 +51,13 @@ properties:
       - apple,t8140-pmp-v2-report
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: report
+      - const: ane-dvfs
 
   nonposted-mmio: true
 

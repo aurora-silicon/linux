@@ -431,6 +431,11 @@ static int ane_pd_cycle(struct ane_device *ane)
 	int err = 0;
 
 	ane->recovering = true;
+	err = ane_perf_suspend(ane);
+	if (err) {
+		ane->recovering = false;
+		return err;
+	}
 	if (ane->pd_count > 1) {
 		int gated = 0;
 

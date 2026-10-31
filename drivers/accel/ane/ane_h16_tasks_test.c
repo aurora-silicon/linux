@@ -8,6 +8,7 @@ static void ane_h16_dense_task_test(struct kunit *test)
 {
 	u8 text[64] = {};
 
+	put_unaligned_le32(1, text);
 	/* Nine header words, one dense record and its one-word payload. */
 	put_unaligned_le32(11 << 16, text + 16);
 	put_unaligned_le32(0x4100 / 4, text + 16 + 9 * 4);
@@ -26,6 +27,7 @@ static void ane_h16_scatter_task_test(struct kunit *test)
 {
 	u8 text[64] = {};
 
+	put_unaligned_le32(1, text);
 	put_unaligned_le32(12 << 16, text + 16);
 	put_unaligned_le32(BIT(31) | BIT(15) | 21, text + 16 + 9 * 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), 0);
@@ -38,6 +40,7 @@ static void ane_h16_extra_header_test(struct kunit *test)
 {
 	u8 text[64] = {};
 
+	put_unaligned_le32(1, text);
 	put_unaligned_le32(10 << 16, text + 16);
 	put_unaligned_le32(3, text + 16 + 8 * 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), 0);
@@ -46,6 +49,33 @@ static void ane_h16_extra_header_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_h16_register_valid(0x44d4 / 4));
 	KUNIT_EXPECT_TRUE(test, ane_h16_register_valid(0x44d0 / 4));
 	KUNIT_EXPECT_FALSE(test, ane_h16_register_valid(0x5930 / 4));
+}
+
+static void ane_h16_prologue_test(struct kunit *test)
+{
+	u8 text[64] = {};
+	unsigned int i;
+
+	put_unaligned_le32(11 << 16, text + 16);
+	put_unaligned_le32(0x4100 / 4, text + 16 + 9 * 4);
+	/* A zero prologue is not the H16 stream marker. */
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
+	put_unaligned_le32(1, text);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), 0);
+	put_unaligned_le32(2, text);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
+	put_unaligned_le32(0x01000000, text);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
+	put_unaligned_le32(1, text);
+	for (i = 4; i < 16; i++) {
+		text[i] = 1;
+		KUNIT_EXPECT_EQ(test,
+				ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
+		text[i] = 0;
+	}
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, 15, 1), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, 16, 1), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(NULL, sizeof(text), 1), -ENOEXEC);
 }
 
 static void ane_h16_relocation_test(struct kunit *test)
@@ -86,6 +116,7 @@ static void ane_h16_relocation_test(struct kunit *test)
 }
 
 static struct kunit_case ane_h16_task_cases[] = {
+	KUNIT_CASE(ane_h16_prologue_test),
 	KUNIT_CASE(ane_h16_dense_task_test),
 	KUNIT_CASE(ane_h16_scatter_task_test),
 	KUNIT_CASE(ane_h16_extra_header_test),

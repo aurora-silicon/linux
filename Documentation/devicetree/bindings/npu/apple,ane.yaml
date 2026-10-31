@@ -49,6 +49,22 @@ properties:
     minItems: 1
     maxItems: 7
 
+  apple,performance-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP report provider that owns the ANE clock-level request interface.
+      Only supported on T6000. The ANE and report SRAM must remain powered
+      while the driver holds a request.
+
+  interconnects:
+    maxItems: 1
+
+  interconnect-names:
+    const: memory
+    description: DRAM/fabric path; bandwidth requests come from the level OPP.
+
+  operating-points-v2: true
+
   interrupts:
     minItems: 1
     maxItems: 2
@@ -66,7 +82,8 @@ properties:
 
   power-domains:
     description:
-      The power states the engine needs, five on T8103 and T6000, eight on
+      The power states the engine needs, five on T8103, six on T6000 with
+      ANE level control (including PMP report SRAM), eight on
       T602x, seven on T8112 and one system domain on T8140.
     minItems: 1
     maxItems: 8
@@ -131,6 +148,24 @@ required:
   - power-domains
 
 allOf:
+  - if:
+      required:
+        - interconnects
+    then:
+      required:
+        - interconnect-names
+        - operating-points-v2
+  - if:
+      required:
+        - apple,performance-controller
+    then:
+      properties:
+        compatible:
+          const: apple,t6000-ane
+        power-domains:
+          minItems: 6
+          maxItems: 6
+
   - if:
       properties:
         compatible:
@@ -275,7 +310,7 @@ allOf:
         reg-names:
           maxItems: 1
         power-domains:
-          maxItems: 5
+          maxItems: 6
         resets: false
         mboxes: false
         memory-region: false

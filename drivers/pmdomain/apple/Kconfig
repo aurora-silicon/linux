@@ -53,6 +53,15 @@ config APPLE_PMP_REPORT
 	  apple_t6031_display.enable=1. The start's state is in debugfs, in
 	  apple-pmp-report/<report device>.
 
+config APPLE_PMP_ANE_KUNIT_TEST
+	tristate "KUnit tests for T600x ANE performance requests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PM
+	select PM_GENERIC_DOMAINS
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise ANE level transitions, ownership refusal and ACK-timeout
+	  rollback against memory-backed registers without Apple hardware.
+
 config APPLE_PMC
 	bool "Apple PMC voter interface"
 	depends on OF

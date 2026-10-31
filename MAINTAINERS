@@ -2093,6 +2093,7 @@ F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	Documentation/PCI/controller/apple-t8140.rst
+F:	Documentation/devicetree/bindings/iio/imu/apple,aop-motion.yaml
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
@@ -2782,6 +2783,7 @@ F:	drivers/pmdomain/apple/
 F:	drivers/power/reset/macsmc-reboot.c
 F:	drivers/power/supply/macsmc-power*.c
 F:	drivers/pwm/pwm-apple.c
+F:	tools/asahi/apple-pwm-pm-tests.py
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
@@ -2817,6 +2819,7 @@ W:	https://aurora-silicon.github.io
 F:	Documentation/admin-guide/media/apple-ave.rst
 F:	Documentation/devicetree/bindings/media/apple,t8140-ave.yaml
 F:	drivers/media/platform/apple/ave/
+F:	tools/asahi/ave*-tests.py
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
@@ -8186,10 +8189,12 @@ L:	asahi@lists.linux.dev
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 F:	Documentation/ABI/testing/sysfs-class-accel-ane
+F:	Documentation/ABI/testing/sysfs-driver-ane-performance
 F:	Documentation/accel/apple-ane.rst
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	drivers/accel/ane/
 F:	include/uapi/drm/ane_accel.h
+F:	tools/accel/ane-bench.py
 F:	tools/testing/selftests/drivers/ane/
 
 DRM ACCEL DRIVERS FOR INTEL VPU

@@ -159,10 +159,9 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	/* SPEC-r3 supplies the preload manifest and HWX layouts. Their full
-	 * validators, original-container ABI and cold boot backend are not yet
-	 * implemented. The runtime capture did not observe firmware startup.
-	 * Neither a broad preload-diff rule nor a section-only LOAD opens this.
+	/* Original HWX validation does not establish firmware ownership,
+	 * preload integrity, startup state or a decoded process resource map.
+	 * Keep the section-only ABI and incomplete boot backend refused.
 	 */
 	dev_info(dev, "H16 ANE: preload validation, HWX ABI and boot backend incomplete; refusing before power access\n");
 	return -EOPNOTSUPP;

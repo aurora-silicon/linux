@@ -65,6 +65,7 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
@@ -93,6 +94,8 @@
 
 #include "ane_fw_platform.h"
 #include "ane_h16_protocol.h"
+#include "ane_h16_pending.h"
+#include "ane_h16_resources.h"
 #include "ane_fw_protocol.h"
 #include "ane_stats.h"
 #include "ane_t6021.h"
@@ -195,6 +198,22 @@ struct ane_legacy_buffer {
 	size_t size;
 };
 
+struct ane_t6021_fd;
+
+/* Populated only by an original-container loader and decoded process reply.
+ * Those interfaces remain refused until their complete wire contract exists.
+ * The firmware mutex protects this list and every pending UUID operation.
+ */
+struct ane_h16_process {
+	struct list_head node;
+	struct list_head owner_node;
+	struct ane_h16_hwx_snapshot original;
+	struct ane_h16_request_key key;
+	struct ane_h16_resource resources[ANE_H16_SURFACES];
+	struct ane_legacy_buffer mappings[ANE_H16_SURFACES];
+	u32 resource_count;
+};
+
 struct ane_rtclient {
 	struct device *dev;
 	void __iomem *engine;
@@ -220,9 +239,9 @@ struct ane_rtclient {
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	u8 channel_snapshot[ANE_FW_TABLE_SIZE];
 	u64 channel_table_offset;
-	u64 call_cookie;
-	u32 call_program;
-	u32 call_process;
+	struct ane_h16_pending_table pending;
+	struct ane_h16_pending *waiting;
+	struct list_head h16_processes;
 	struct ane_legacy_buffer *legacy_buffers;
 	u32 legacy_allocated;
 	size_t legacy_bytes;
@@ -255,6 +274,7 @@ struct ane_rtclient {
  */
 struct ane_t6021_fd {
 	struct list_head bos;
+	struct list_head h16_processes;
 };
 
 /* Per-file handle counter and every per-fd list against same-fd concurrent
@@ -411,6 +431,9 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				       size_t length, u16 opcode,
 				       unsigned int channel,
 				       unsigned long deadline);
+
+static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
+				   unsigned int channel);
 
 /* ---- boot helpers (shared with boot.c / fwload.c) ---- */
 
@@ -593,6 +616,13 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 			result = -EPROTO;
 			goto out;
 		}
+		if (ane->soc->platform && opcode == ANE_H16_EXECUTE) {
+			ane_rtclient_drain_t2h(ane, 6);
+			if (ane->pending.quarantined) {
+				result = ane->pending.error ?: -EIO;
+				goto out;
+			}
+		}
 		pending = readl(ipi + 0x8000);
 
 		if (pending) {
@@ -615,6 +645,13 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				u64 size, tag;
 				struct ane_legacy_buffer *buf;
 
+				/* H16 needs its own validated allocation/reply provider.
+				 * Never answer it with the legacy H14 allocation index.
+				 */
+				if (ane->soc->platform) {
+					result = -EOPNOTSUPP;
+					goto out;
+				}
 				dma_rmb();
 				size = READ_ONCE(slot[1]);
 				tag = READ_ONCE(slot[2]);
@@ -857,18 +894,24 @@ static void ane_t6021_trace_free(void)
 static const void *ane_rtclient_fw_cpu(struct ane_rtclient *ane, u64 iova,
 				       size_t len)
 {
+	const void *found = NULL;
 	u32 i;
 
 	for (i = 0; i < ane->legacy_allocated; i++) {
 		const struct ane_legacy_buffer *b = &ane->legacy_buffers[i];
 
-		if (ane_fw_contains(b->dma, b->size, iova, len))
-			return b->cpu + (iova - b->dma);
+		if (ane_fw_contains(b->dma, b->size, iova, len)) {
+			if (!ane->soc->platform)
+				return b->cpu + (iova - b->dma);
+			if (found)
+				return NULL;
+			found = b->cpu + (iova - b->dma);
+		}
 	}
 	if (ane_fw_contains(ane->fw->boot_ipc_iova, ane->fw->boot_ipc_size,
 			    iova, len))
-		return ane->fw->boot_ipc + (iova - ane->fw->boot_ipc_iova);
-	return NULL;
+		return found ? NULL : ane->fw->boot_ipc + (iova - ane->fw->boot_ipc_iova);
+	return found;
 }
 
 /* Return every firmware-owned slot on a target-to-host ring to the fw:
@@ -888,30 +931,54 @@ static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
 
 	if (!ane_rtclient_channels_unchanged(ane)) {
 		atomic_set(&ane_t6021_quarantined, 1);
+		if (ane->soc->platform) {
+			ane->pending.error = -EPROTO;
+			ane->pending.quarantined = true;
+		}
 		return false;
 	}
 	if (c->type != 1)
 		return false;
 	while (n < c->slots) {
 		u64 *slot = ane->fw->boot_ipc + c->offset + (size_t)slot_i * 64;
-		u64 hdr = READ_ONCE(slot[0]), len = READ_ONCE(slot[1]);
+		u64 hdr = READ_ONCE(slot[0]), len;
 
 		if (hdr & 1)
 			break;
 		dma_rmb();
+		len = READ_ONCE(slot[1]);
 		dev_dbg(ane->dev, "T2H ch=%u slot=%u len=%#llx\n",
 			channel, slot_i, len);
 		if (ane->soc->platform) {
-			const void *ev = ane_rtclient_fw_cpu(ane, hdr, len);
-			int status = ane_h16_event_report_status(ev, len, c->index);
+			u8 snapshot[0x60];
+			const void *ev;
+			int status;
 
-			if (status < 0) {
+			/* Other channels have different message types; never apply
+			 * the event predicate to logs or allocation traffic.
+			 */
+			if (c->index != 6 || (len != sizeof(snapshot) && len != 0xc)) {
+				atomic_set(&ane_t6021_quarantined, 1);
+				ane->pending.error = -EPROTO;
+				ane->pending.quarantined = true;
+				return false;
+			}
+			ev = ane_rtclient_fw_cpu(ane, hdr, len);
+			if (!ev) {
+				atomic_set(&ane_t6021_quarantined, 1);
+				ane->pending.error = -EPROTO;
+				ane->pending.quarantined = true;
+				return false;
+			}
+			memcpy(snapshot, ev, len);
+			status = ane_h16_pending_dispatch(&ane->pending, snapshot,
+							  len, c->index, jiffies);
+			if (ane->pending.quarantined) {
 				atomic_set(&ane_t6021_quarantined, 1);
 				return false;
 			}
-			/* H16 submission and pending-UUID tracking are not wired up.
-			 * Consume diagnostics without retiring an execution or its BOs.
-			 */
+			if (status == ANE_H16_EVENT_COMPLETE)
+				finished = true;
 		} else if (channel == 6 && len >= ANE_T2H_CALL_STATE_OFF + 4) {
 			const u8 *ev = ane_rtclient_fw_cpu(ane, hdr,
 							   ANE_T2H_CALL_STATE_OFF + 4);
@@ -993,7 +1060,7 @@ static int ane_rtclient_call_wait_traced(struct ane_rtclient *ane,
 static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 				  unsigned long deadline)
 {
-	unsigned int poll_us = READ_ONCE(call_poll_us);
+	unsigned int poll_us = ane->soc->platform ? 0 : READ_ONCE(call_poll_us);
 	ktime_t tight_end = ktime_add_ns(ktime_get(),
 					 (u64)poll_us * NSEC_PER_USEC);
 
@@ -1005,8 +1072,15 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 	do {
 		if (atomic_read(&ane_t6021_quarantined))
 			return -EIO;
-		if (ane_rtclient_drain_t2h(ane, 6))
+		if (ane->soc->platform) {
+			ane_rtclient_drain_t2h(ane, 6);
+			if (atomic_read(&ane_t6021_quarantined))
+				return ane->pending.error ?: -EIO;
+			if (ane->waiting && ane->waiting->terminal)
+				return ane->waiting->status;
+		} else if (ane_rtclient_drain_t2h(ane, 6)) {
 			return 0;
+		}
 		if (poll_us && ktime_before(ktime_get(), tight_end))
 			usleep_range(1, 2);
 		else
@@ -1025,7 +1099,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						     unsigned int channel,
 						     unsigned int timeout_ms)
 {
-	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	unsigned long deadline = ane->soc->platform && ane->waiting ?
+		ane->waiting->deadline : jiffies + msecs_to_jiffies(timeout_ms);
 	int ret;
 	u64 stats_ticket = 0;
 	u64 stats_submit_ns = 0;
@@ -1054,6 +1129,10 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	 * stats_slots NULL, and the hooks must not run on a NULL ring.
 	 */
 	bool stats_call = ane->stats_slots && execute;
+
+	if (ane->soc->platform && execute &&
+	    (!ane->waiting || !ane->waiting->active || ane->pending.quarantined))
+		return -EIO;
 
 	if (stats_call) {
 		stats_submit_ns = ktime_get_ns();
@@ -1093,7 +1172,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						   ktime_get_ns(),
 						   (u32)ret, 0);
 			dev_err(ane->dev,
-				"call completion wait failed %d: no finish event in %u ms\n",
+				"call completion failed %d within %u ms\n",
 				ret, timeout_ms);
 			atomic_set(&ane_t6021_quarantined, 1);
 			return ret;
@@ -1106,7 +1185,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	 * hand those slots back so the rings never fill (channels 4
 	 * and 6).
 	 */
-	ane_rtclient_drain_t2h(ane, 4);
+	if (!ane->soc->platform)
+		ane_rtclient_drain_t2h(ane, 4);
 	ane_rtclient_drain_t2h(ane, 6);
 	if (atomic_read(&ane_t6021_quarantined))
 		return -EIO;
@@ -1438,6 +1518,140 @@ static int ane_rtclient_create_process(struct ane_rtclient *ane,
 	return ret;
 }
 
+/* H16 consumes only backend-owned process resources. The ABI-2 section
+ * loader and short process packet cannot create an entry in h16_processes.
+ */
+static int ane_rtclient_h16_call(struct ane_rtclient *ane, struct drm_file *file,
+				 const struct drm_ane_exec *user)
+{
+	struct ane_t6021_fd *fd = file->driver_priv;
+	struct ane_h16_process *process = NULL, *p;
+	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES];
+	struct ane_t6021_bo *bos[ANE_H16_SURFACES] = {};
+	struct drm_ane_exec_io *ios;
+	struct ane_h16_pending request = {};
+	struct ane_h16_execute call = {};
+	unsigned int i, j, pinned = 0;
+	int ret = -EOPNOTSUPP;
+
+	if (!fd || user->pad || user->priority != 5 || user->count < 2 ||
+	    user->count > ANE_H16_SURFACES || user->timeout_ms > 30000)
+		return -EINVAL;
+	ios = memdup_user(u64_to_user_ptr(user->io_ptr),
+			  array_size(user->count, sizeof(*ios)));
+	if (IS_ERR(ios))
+		return PTR_ERR(ios);
+	mutex_lock(&ane_t6021_fw_lock);
+	if (atomic_read(&ane_t6021_quarantined) || ane->pending.quarantined) {
+		ret = -EIO;
+		goto out;
+	}
+	list_for_each_entry(p, &fd->h16_processes, owner_node) {
+		if (p->key.program == user->prog_id &&
+		    p->key.process == user->proc_id) {
+			process = p;
+			break;
+		}
+	}
+	if (!process)
+		goto out;
+	ret = ane_h16_hwx_snapshot_check(&process->original);
+	if (!ret)
+		ret = ane_h16_resources_validate(&process->original.info,
+						 process->resources, process->resource_count);
+	if (ret)
+		goto out;
+	if (user->count != process->resource_count || !ane->cmd_buf ||
+	    process->key.program == U32_MAX || process->key.process == U32_MAX ||
+	    process->key.procedure == U32_MAX) {
+		ret = -EINVAL;
+		goto out;
+	}
+	for (i = 0; i < user->count; i++) {
+		struct ane_t6021_bo *b;
+		const struct ane_h16_resource *r = &process->resources[i];
+		const struct ane_legacy_buffer *m = &process->mappings[i];
+
+		if (ios[i].flags || ios[i].reserved ||
+		    ios[i].buffer_id != r->buffer.index || ios[i].type != r->buffer.class ||
+		    ios[i].size != r->buffer.size || !m->cpu ||
+		    m->dma != r->buffer.mapping_dva || m->size != r->buffer.mapping_size) {
+			ret = -EINVAL;
+			goto out;
+		}
+		for (j = 0; j < i; j++) {
+			if (ios[j].bo_handle == ios[i].bo_handle) {
+				ret = -EINVAL;
+				goto out;
+			}
+		}
+		mutex_lock(&ane_t6021_bo_lock);
+		list_for_each_entry(b, &fd->bos, node) {
+			if (b->handle == ios[i].bo_handle && b->owner == fd &&
+			    b->size >= ios[i].size) {
+				kref_get(&b->refcount);
+				bos[pinned++] = b;
+				break;
+			}
+		}
+		mutex_unlock(&ane_t6021_bo_lock);
+		if (pinned != i + 1) {
+			ret = -ENOENT;
+			goto out;
+		}
+		buffers[i] = r->buffer;
+	}
+	/* All user-facing BOs are staging only. Concurrent mmap writes cannot
+	 * change code, input snapshots or firmware-visible output allocations.
+	 */
+	for (i = 0; i < user->count; i++) {
+		if (process->resources[i].permissions == 1)
+			memcpy(process->mappings[i].cpu, bos[i]->cpu, buffers[i].size);
+		else
+			memset(process->mappings[i].cpu, 0xff, buffers[i].size);
+	}
+	request.key = process->key;
+	request.deadline = jiffies + msecs_to_jiffies(user->timeout_ms ?: 5000);
+	ret = ane_h16_pending_insert(&ane->pending, &request, jiffies);
+	if (ret)
+		goto out;
+	call.key = request.key;
+	call.buffers = buffers;
+	call.buffer_count = user->count;
+	/* Custom BAR selectors/values have no validated process map yet. */
+	ret = ane_h16_execute_encode(ane->cmd_buf->cpu, ANE_H16_EXECUTE_BASE_SIZE, &call);
+	if (ret) {
+		ane_h16_pending_remove(&ane->pending, &request);
+		goto out;
+	}
+	ane->waiting = &request;
+	/* Coherent allocations require ordering, not streaming-map sync calls. */
+	wmb();
+	dma_wmb();
+	ret = ane_rtclient_command(ane, ane->cmd_buf, ANE_H16_EXECUTE_BASE_SIZE,
+				   ANE_H16_EXECUTE, 7, user->timeout_ms ?: 5000);
+	ane->waiting = NULL;
+	if (ret || !request.terminal || request.status) {
+		ret = ret ?: -EIO;
+		ane_h16_pending_abort(&ane->pending, &request, ret);
+		atomic_set(&ane_t6021_quarantined, 1);
+		goto out;
+	}
+	dma_rmb();
+	for (i = 0; i < user->count; i++)
+		if (process->resources[i].permissions == 2)
+			memcpy(bos[i]->cpu, process->mappings[i].cpu, buffers[i].size);
+	/* Private DMA mappings remain resident for the entire process lifetime,
+	 * including after terminal failure or an uncertain transport outcome.
+	 */
+out:
+	while (pinned)
+		kref_put(&bos[--pinned]->refcount, ane_t6021_bo_release);
+	mutex_unlock(&ane_t6021_fw_lock);
+	kfree(ios);
+	return ret;
+}
+
 static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 				       struct drm_file *file,
 				       const struct drm_ane_exec *user)
@@ -1450,9 +1664,8 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	size_t cmd_size;
 	int ret, i, pinned = 0;
 
-	/* H16 EXECUTE needs validated resources and pending-UUID tracking. */
 	if (ane->soc->platform)
-		return -EOPNOTSUPP;
+		return ane_rtclient_h16_call(ane, file, user);
 	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
 	    user->priority < 2 || user->priority > 7 || !fd)
 		return -EINVAL;
@@ -1503,17 +1716,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 		*(u32 *)(cmd + 0x0c) = cpu_to_le32(user->proc_id);
 		*(u64 *)(cmd + 0x10) = cpu_to_le64(0);
 		*(u32 *)(cmd + 0x18) = cpu_to_le32(user->priority);
-		if (ane->soc->platform) {
-			if (ane->call_cookie == U64_MAX) {
-				ret = -EOVERFLOW;
-				goto unlock;
-			}
-			ane->call_cookie++;
-			ane->call_program = user->prog_id;
-			ane->call_process = user->proc_id;
-		}
-		*(u64 *)(cmd + 0x20) = cpu_to_le64(ane->soc->platform ?
-						    ane->call_cookie : ANE_CALL_COOKIE);
+		*(u64 *)(cmd + 0x20) = cpu_to_le64(ANE_CALL_COOKIE);
 		*(u32 *)(cmd + 0x28) = cpu_to_le32(user->count);
 		for (i = 0; i < user->count; i++) {
 			struct ane_t6021_bo *bo = NULL, *b;
@@ -1753,6 +1956,7 @@ static int ane_t6021_open(struct drm_device *drm, struct drm_file *file)
 	if (!fd)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&fd->bos);
+	INIT_LIST_HEAD(&fd->h16_processes);
 	file->driver_priv = fd;
 	return 0;
 }
@@ -1761,13 +1965,19 @@ static void ane_t6021_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	struct ane_t6021_fd *fd = file->driver_priv;
 	struct ane_t6021_bo *bo, *tmp;
+	struct ane_h16_process *process, *next;
 
 	if (!fd)
 		return;
+	mutex_lock(&ane_t6021_fw_lock);
+	/* Revoke per-file authority, retaining device-owned DMA allocations. */
+	list_for_each_entry_safe(process, next, &fd->h16_processes, owner_node)
+		list_del_init(&process->owner_node);
 	mutex_lock(&ane_t6021_bo_lock);
 	list_for_each_entry_safe(bo, tmp, &fd->bos, node)
 		ane_t6021_bo_drop(bo);
 	mutex_unlock(&ane_t6021_bo_lock);
+	mutex_unlock(&ane_t6021_fw_lock);
 	kfree(fd);
 	file->driver_priv = NULL;
 }
@@ -2063,6 +2273,13 @@ struct ane_rtclient_pd {
 	struct device **pd_dev;
 	struct device_link **pd_link;
 	int count;
+
+	/* T8112 power gate, kept in step with power-domains[0]. */
+	struct notifier_block pwgate_nb;
+	void __iomem *pwgate_base;
+	void __iomem *pwgate;
+	bool pwgate_nb_added;
+	bool pwgate_opened;
 };
 
 static LIST_HEAD(ane_rtclient_pd_list);
@@ -2074,9 +2291,101 @@ static DEFINE_MUTEX(ane_rtclient_probe_guard_lock);
 static void ane_rtclient_pd_free(struct ane_rtclient_pd *pd)
 {
 	list_del(&pd->list);
+	if (pd->pwgate_base)
+		iounmap(pd->pwgate_base);
 	kfree(pd->pd_dev);
 	kfree(pd->pd_link);
 	kfree(pd);
+}
+
+/*
+ * T8112 power gate. A word in the "set" window gates the ANE: bits 29:28
+ * set (the word reads 0x30000000) is closed, both clear is open. It must be
+ * open before the ANE CPU power state (ane_sys_cpu) turns on and is closed
+ * again after that state turns off, with ane_sys, the parent, on both
+ * times. power-domains[0] is ane_sys_cpu, and genpd calls this notifier
+ * after ane_sys is on and before ane_sys_cpu is written (PRE_ON), and
+ * after ane_sys_cpu is off and before ane_sys goes off (OFF), which is that
+ * order. Only the two known values are written. Any other word fails the
+ * power-up without a write.
+ */
+#define ANE_PWGATE_CLOSED	GENMASK(29, 28)
+#define ANE_PWGATE_POLL_US	10
+#define ANE_PWGATE_TIMEOUT_US	100000
+
+static int ane_rtclient_pwgate_notify(struct notifier_block *nb,
+				      unsigned long action, void *data)
+{
+	struct ane_rtclient_pd *pd =
+		container_of(nb, struct ane_rtclient_pd, pwgate_nb);
+	u32 gate;
+	int ret;
+
+	switch (action) {
+	case GENPD_NOTIFY_PRE_ON:
+		gate = readl(pd->pwgate);
+		if (!(gate & ANE_PWGATE_CLOSED))
+			return NOTIFY_OK;
+		if (gate != ANE_PWGATE_CLOSED) {
+			dev_err(pd->dev, "power gate word %#x is not a known state\n",
+				gate);
+			return notifier_from_errno(-EIO);
+		}
+		writel(0, pd->pwgate);
+		ret = readl_poll_timeout_atomic(pd->pwgate, gate,
+						!(gate & ANE_PWGATE_CLOSED),
+						ANE_PWGATE_POLL_US,
+						ANE_PWGATE_TIMEOUT_US);
+		if (ret) {
+			writel(ANE_PWGATE_CLOSED, pd->pwgate);
+			dev_err(pd->dev, "power gate did not open (word %#x)\n",
+				gate);
+			return notifier_from_errno(ret);
+		}
+		pd->pwgate_opened = true;
+		return NOTIFY_OK;
+	case GENPD_NOTIFY_OFF:
+		if (!pd->pwgate_opened)
+			return NOTIFY_OK;
+		pd->pwgate_opened = false;
+		writel(ANE_PWGATE_CLOSED, pd->pwgate);
+		ret = readl_poll_timeout_atomic(pd->pwgate, gate,
+						(gate & ANE_PWGATE_CLOSED) ==
+						ANE_PWGATE_CLOSED,
+						ANE_PWGATE_POLL_US,
+						ANE_PWGATE_TIMEOUT_US);
+		if (ret)
+			dev_warn(pd->dev, "power gate did not close (word %#x)\n",
+				 gate);
+		return NOTIFY_OK;
+	default:
+		return NOTIFY_DONE;
+	}
+}
+
+/*
+ * Register the power gate notifier on power-domains[0] before its device
+ * link is created: the link resumes the domain at once.
+ */
+static int ane_rtclient_pwgate_add(struct ane_rtclient *ane,
+				   struct ane_rtclient_pd *pd)
+{
+	int ret;
+
+	if (!ane->soc->pwgate_off || pd->pwgate_nb_added)
+		return 0;
+	if (!pd->pwgate_base) {
+		pd->pwgate_base = of_iomap(ane->dev->of_node, 2);
+		if (!pd->pwgate_base)
+			return -ENOMEM;
+		pd->pwgate = pd->pwgate_base + ane->soc->pwgate_off;
+	}
+	pd->pwgate_nb.notifier_call = ane_rtclient_pwgate_notify;
+	ret = dev_pm_genpd_add_notifier(pd->pd_dev[0], &pd->pwgate_nb);
+	if (ret)
+		return ret;
+	pd->pwgate_nb_added = true;
+	return 0;
 }
 
 static int ane_rtclient_attach_genpd(struct ane_rtclient *ane)
@@ -2127,6 +2436,11 @@ found:
 				goto out;
 			}
 		}
+		if (i == 0) {
+			err = ane_rtclient_pwgate_add(ane, pd);
+			if (err)
+				goto out;
+		}
 		if (!pd->pd_link[i]) {
 			if (!ane_rtclient_pinned) {
 				if (!try_module_get(THIS_MODULE)) {
@@ -2171,6 +2485,15 @@ static void ane_rtclient_detach_genpd(struct device *dev)
 		for (i = count - 1; i >= 0; i--) {
 			if (pd->pd_link[i])
 				device_link_del(pd->pd_link[i]);
+			/*
+			 * genpd keeps a notifier past detach, so drop it first.
+			 * The domain may then go off with the gate open, the
+			 * state between the two power-up steps.
+			 */
+			if (i == 0 && pd->pwgate_nb_added) {
+				dev_pm_genpd_remove_notifier(pd->pd_dev[0]);
+				pd->pwgate_nb_added = false;
+			}
 			if (pd->pd_dev[i])
 				dev_pm_domain_detach(pd->pd_dev[i], true);
 		}
@@ -2235,6 +2558,7 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 	if (!ane->legacy_buffers)
 		return -ENOMEM;
 	ane->dev = dev;
+	INIT_LIST_HEAD(&ane->h16_processes);
 	ane->soc = of_device_get_match_data(dev);
 	platform_set_drvdata(pdev, ane);
 	INIT_DELAYED_WORK(&ane->poll_work, ane_rtclient_post_boot);
@@ -2282,9 +2606,10 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		pm_runtime_disable(dev);
 		return -EPROBE_DEFER;
 	}
-	/* T8112: macOS (type 0x70) opens PWGATE (bits 29:28 = 0) before
-	 * the ps words. This driver only reads it: an engine read behind a
-	 * closed gate is untested, so it refuses first.
+	/* T8112: the power gate notifier opened the gate before ane_sys_cpu
+	 * turned on. A gate that still reads closed means the state was
+	 * already on without it (no power-up ran), so refuse before any
+	 * engine read.
 	 */
 	if (ane->soc->pwgate_off) {
 		void __iomem *set = devm_of_iomap(dev, dev->of_node, 2, NULL);

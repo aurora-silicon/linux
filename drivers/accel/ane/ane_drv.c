@@ -690,17 +690,24 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 		goto unlock;
 	}
 
-	err = ane_tm_enqueue(ane, &req);
-	if (err < 0)
+	err = ane_perf_begin(ane);
+	if (err) {
+		dev_err_ratelimited(ane->dev, "performance request failed: %d\n", err);
+		ane_perf_end(ane);
 		goto unlock;
+	}
+	err = ane_tm_enqueue(ane, &req);
+	if (err < 0) {
+		ane_perf_end(ane);
+		goto unlock;
+	}
 
 	if (ane->stats_slots)
 		stats_idx = ane_stats_begin(&ane->stats_ctrs, &ane->stats_ring,
 					    ktime_get_ns(), req.td_count);
 
-	ane_boost_begin(ane);
 	err = ane_tm_execute(ane, &req);
-	ane_boost_end(ane);
+	ane_perf_end(ane);
 
 	if (ane->stats_slots)
 		ane_stats_complete(&ane->stats_ctrs, &ane->stats_ring,
@@ -1113,6 +1120,7 @@ struct ane_soc {
 	 * retention and recovery must drain it (see ane_tm_drain_retained).
 	 */
 	bool tm_retention;
+	unsigned int high_level;
 };
 
 static const struct ane_soc ane_soc_t8103 = {
@@ -1128,6 +1136,7 @@ static const struct ane_soc ane_soc_t6000 = {
 	 */
 	.ps_base = 0x28e08c000ULL,
 	.tm_retention = true,
+	.high_level = 5,
 };
 
 static const struct of_device_id ane_of_match[] = {
@@ -1219,7 +1228,7 @@ static int ane_platform_probe(struct platform_device *pdev)
 	mutex_init(&ane->engine_lock);
 	INIT_LIST_HEAD(&ane->bo_list);
 	INIT_LIST_HEAD(&ane->preserved_list);
-	err = ane_boost_init(ane);
+	err = ane_perf_init(ane, soc->high_level);
 	if (err < 0)
 		goto detach_genpd;
 
@@ -1279,7 +1288,7 @@ disable_pm:
 	pm_runtime_dont_use_autosuspend(dev);
 	drm_mm_takedown(&ane->mm);
 detach_genpd:
-	ane_boost_exit(ane);
+	ane_perf_exit(ane);
 	ane_detach_genpd(ane);
 	return err;
 }
@@ -1288,6 +1297,7 @@ static void ane_platform_remove(struct platform_device *pdev)
 {
 	struct ane_device *ane = platform_get_drvdata(pdev);
 	struct ane_bo *bo, *tmp;
+	int err;
 
 	/* Powered and pinned for the teardown: the unmaps below flush the
 	 * DART TLBs, and no autosuspend may race the genpd detach.
@@ -1305,12 +1315,19 @@ static void ane_platform_remove(struct platform_device *pdev)
 		return;
 	}
 
+	err = ane_perf_exit(ane);
+	if (err) {
+		dev_err(ane->dev,
+			"retaining power-domain attachments after failed performance release; reboot required\n");
+		mutex_unlock(&ane->engine_lock);
+		return;
+	}
+
 	list_for_each_entry_safe(bo, tmp, &ane->bo_list, node)
 		ane_iommu_unmap_pages(ane, bo);
 	ane_reclaim_preserved(ane);
 	drm_mm_takedown(&ane->mm);
 
-	ane_boost_exit(ane);
 	ane_detach_genpd(ane);
 
 	pm_runtime_disable(ane->dev);
@@ -1331,7 +1348,7 @@ static int __maybe_unused ane_runtime_suspend(struct device *dev)
 	if (atomic_read(&ane->wedged) && !ane->recovering)
 		return -EBUSY;
 
-	return 0;
+	return ane_perf_suspend(ane);
 }
 
 static int __maybe_unused ane_runtime_resume(struct device *dev)
