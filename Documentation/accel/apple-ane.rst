@@ -332,24 +332,46 @@ opening a device.
 H14 recovery lifecycle
 ----------------------
 
-The firmware path (``ane_t6021.ko``) uses one bounded deadline for the command
-acknowledgment and its finish event. H14 engine reset is not enabled by this
-change. Reusing only the H13 task-manager re-arm would leave the firmware and
-its program cache invalid. The corresponding recovery implementation needs to:
+The firmware path (``ane_t6021.ko``) gives the command acknowledgment and
+finish event one bounded deadline. A failed exchange quarantines submissions
+and attempts one reset under the firmware lock. Operator retry uses the same
+``wedged`` and ``reset`` attributes as H13.
 
-* Serialize firmware commands and stop the RX worker before releasing the
-  consumer's runtime-PM reference and synchronously suspending its suppliers.
-* Verify power-off for the CPU and engine partitions through their providers
-  before dropping boot pins or reclaiming firmware-visible allocations.
-* Retain metadata for every firmware-owned BO and boot allocation, including
-  objects whose last userspace reference disappeared. The current release
-  path discards some of this metadata while retaining the backing memory.
-* Restore the validated firmware image and run the existing fenced probe boot
-  sequence, including channel-table validation, host acknowledgment and
-  CONFIG_GET. A failed boot remains quarantined with its DMA backing held.
-* Invalidate the cached program/process IDs across the restart and prevent a
-  stale userspace ID from aliasing a newly allocated firmware ID. Clients must
-  reload their programs before resubmitting.
+The supported reset profile is the Linux-owned 13.5 legacy firmware path:
+the complete SoC power-domain binding, an owned staged image, and the fenced
+boot sequence. Borrowed firmware, RTKit mode, later generations and incomplete
+initial boots remain fenced. A second H14 binding is refused because the
+firmware cache and BO pool have one owner.
 
-Those ownership and identifier changes require their own H14 reset test.
-Quarantine must not be cleared solely because a power transition returned zero.
+Recovery clears only the owned ASC CPU's RUN bit and waits for STOPPED before
+suspending the consumer and suppliers through the shared PM transaction. This
+prevents firmware power-state writes from racing provider shutdown. It then
+verifies every domain and the CPU ACTUAL field off, resumes, repeats the probe
+power/PWGATE gates, and requires the CPU to be stopped before changing its
+image or boot state. It restores a cached, validated pristine image into the
+existing mappings; recovery does not fetch a replacement file or rebuild the
+entry aliases. The existing boot helper performs the READY/DONE handshake,
+then recovery validates ChMan, writes the host acknowledgment and requires a
+valid CONFIG_GET response. An enabled firmware performance property is
+restored through its existing command.
+
+Old boot pools, firmware MALLOC buffers and closed firmware-visible BOs keep
+their metadata and backing until the new boot is validated. Failed resets
+retain those records and any CPU lifetime pin needed by a running or uncertain
+CPU. Retired MALLOC arenas remain charged against the existing byte and record
+limits; at most two failed-boot arenas can accumulate. A successful restart
+reclaims retired arenas and closed BOs. Live old BO handles and mappings remain
+client-owned memory and can be reused for loading a program again.
+
+Program and process IDs are opaque kernel identifiers. The allocator survives
+firmware restarts and refuses exhaustion instead of wrapping. Reset invalidates
+the program cache, so an old ID cannot alias a reused firmware wire ID. Clients
+must reload their program and create its process before retrying. The
+``ane-fw-ids`` KUnit suite checks non-reuse and exhaustion boundaries.
+
+H14 keeps its existing domain-link lifetime reference and a reference for the
+currently running firmware CPU. Recovery releases the old CPU reference only
+after verified quiescence and acquires a new one before the first boot write;
+it does not accumulate one reference per failure. This change does not provide
+normal H14 module unload while firmware is active. H14 restart still requires
+silicon qualification; the H13 hang fixture must not be submitted through ABI 2.

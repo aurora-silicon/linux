@@ -414,14 +414,16 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 	/* Wedged-pin module lifetime: the ref is acquired
 	 * BEFORE the first write — a started CPU can never
 	 * outlive the pin, and a dying module refuses the boot before
-	 * any write happens. Retained on CPU start (never released:
-	 * intentional); released only if no CPU start occurred.
+	 * any write happens. Retained on CPU start; released only if no CPU start occurred or
+	 * recovery proves a complete power-off cycle and a stopped CPU.
 	 */
 	if (!try_module_get(THIS_MODULE)) {
 		dev_err(ane->dev,
 			"boot: REFUSED before any write — module ref unavailable (dying); no CPU start possible from a dying module\n");
 		return -EBUSY;
 	}
+
+	ane->boot_pin = true;
 
 	dev_dbg(ane->dev,
 		"BOOT-PHASE dispatch (stop_after=%d%s)\n", stop_after,
@@ -443,6 +445,7 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 
 	if (!cs) {
 		/* no CPU start: full release path, normal ownership */
+		ane->boot_pin = false;
 		module_put(THIS_MODULE);
 		dev_info(ane->dev,
 			 "BOOT-PHASE done r=%d cpu_started=0 (no CPU release: state clean, module unpinned)\n",
@@ -456,13 +459,13 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 	 * DMA surfaces are wedge-held, never freed.
 	 */
 	dev_warn(ane->dev,
-		 "boot: module PINNED until reboot (started CPU; wedged-pin)\n");
+		 "boot: module pinned while firmware CPU may run\n");
 
 	if (r == -ENODATA)
 		return r;	/* unreachable: the caller gated */
 	if (r && cs) {
 		dev_err(ane->dev,
-			"boot: sequence error %d AFTER CPU start (cpu_started=%u fw_alive=%u booted=%u scratch_result=%016llx) — WEDGED-PIN HOLD: all surfaces/rings/IRQ/links preserved; reboot is the only reclamation; no retry. HANDSHAKE state only: the result word has NO sourced success semantics\n",
+			"boot: sequence error %d AFTER CPU start (cpu_started=%u fw_alive=%u booted=%u scratch_result=%016llx) — WEDGED-PIN HOLD: all surfaces/rings/IRQ/links preserved; verified recovery or reboot required. HANDSHAKE state only: the result word has NO sourced success semantics\n",
 			r, cs, fa, bo, sres);
 		return 0;	/* bind fenced, state held */
 	}
@@ -474,4 +477,16 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 			 "rc 0 WITHOUT DONE (rtb_mode: HELLO-gated; DONE not part of this mode)",
 			 sres);
 	return r;
+}
+
+/* Caller has verified a complete domain-off cycle and a stopped CPU. */
+void ane_t6021_boot_release_pin(struct ane_t6021 *ane)
+{
+	if (ane->boot_pin) {
+		ane->boot_pin = false;
+		module_put(THIS_MODULE);
+	}
+	ane->cpu_started = false;
+	ane->fw_alive = false;
+	ane->booted = false;
 }

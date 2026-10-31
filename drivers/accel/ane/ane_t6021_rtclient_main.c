@@ -98,6 +98,8 @@
 #include "ane_h16_resources.h"
 #include "ane_fw_protocol.h"
 #include "ane_stats.h"
+#include "ane_pm.h"
+#include "ane_fw_ids.h"
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
 
@@ -214,10 +216,29 @@ struct ane_h16_process {
 	u32 resource_count;
 };
 
+/* Retain every old arena until a fresh firmware boot is validated. */
+struct ane_rtclient_retired {
+	struct list_head node;
+	struct ane_legacy_buffer *buffers;
+	u32 allocated;
+	size_t bytes;
+	struct ane_t6021_boot_allocs boot;
+};
+
 struct ane_rtclient {
 	struct device *dev;
 	void __iomem *engine;
 	void __iomem *pmgr;
+	void __iomem *set;
+	bool recovering;
+	bool engine_ps_valid;
+	u32 engine_ps_off;
+	bool registered;
+	bool desired_perf;
+	struct list_head retired;
+	u32 retired_count;
+	u32 retired_allocated;
+	size_t retired_bytes;
 	const struct ane_t602x_soc *soc;
 	struct apple_rtkit *rtk;
 	struct reset_control *cpu_rst;
@@ -279,7 +300,7 @@ struct ane_t6021_fd {
 
 /* Per-file handle counter and every per-fd list against same-fd concurrent
  * ioctls. A BO whose IOVA reached the firmware (fw_ref) never goes back to
- * the kernel: a program section is held until reboot, an io BO is parked
+ * the kernel: a program section is held until a verified reset, an io BO is parked
  * for reuse (see ane_t6021_bo_release). Every other BO frees at its last
  * reference.
  *
@@ -289,7 +310,7 @@ struct ane_t6021_fd {
  * and any H14 softmax/reduction with an 8 MiB table. Total BO bytes
  * across all fds are capped separately (bo_total_max_mb) by an atomic
  * counter, enforced at alloc and released when the memory is really
- * freed. Program sections stay held until reboot, and one large model's
+ * freed. Program sections stay held until a verified reset, and one large model's
  * programs alone can hold gigabytes.
  * A cap of 0 refuses every BO_INIT with -ENOSPC; there is no unlimited
  * value. Every BO also needs IOVA below 4 GiB (32-bit DMA mask), so
@@ -307,6 +328,7 @@ struct ane_t6021_bo {
 	void *cpu;			/* coherent mapping */
 	dma_addr_t dma;
 	size_t size;
+	u64 fw_epoch;
 	bool fw_ref;			/* the firmware received this IOVA */
 	bool fw_program;		/* a loaded program keeps this IOVA */
 	struct device *dev;
@@ -343,7 +365,7 @@ MODULE_PARM_DESC(bo_total_bytes,
 
 /* Mark the device quarantined: a timed-out command left the firmware
  * queue state unknown. The only safe next step is to refuse further
- * ioctls until a reboot reclaims the surfaces (wedged-pin rule).
+ * ioctls until a verified firmware restart reclaims the old surfaces.
  */
 static atomic_t ane_t6021_quarantined = ATOMIC_INIT(0);
 
@@ -353,31 +375,70 @@ static atomic_t ane_t6021_quarantined = ATOMIC_INIT(0);
  * growing with every process until the BO cap refuses BO_INIT.
  */
 static LIST_HEAD(ane_t6021_bo_pool);
+static LIST_HEAD(ane_t6021_bo_held);
+static u64 ane_t6021_bo_epoch = 1;
 static DEFINE_SPINLOCK(ane_t6021_bo_pool_lock);
 
 /* Final put: the last handle or mapping is gone. The firmware must never
- * see a freed IOVA, so a fw_ref BO is never freed: a program
+ * see a freed IOVA, so a current-generation fw_ref BO is retained: a program
  * section stays held, because a cached firmware program keeps reading
  * it; an io BO goes to the pool, unless a quarantined firmware may still
  * write it. Every other BO frees here, so the BO cap bounds only the
  * memory the firmware may touch.
  */
+static void ane_t6021_bo_destroy(struct ane_t6021_bo *bo)
+{
+	atomic64_sub(PAGE_ALIGN(bo->size), &ane_t6021_bo_total_bytes);
+	dma_free_coherent(bo->dev, bo->size, bo->cpu, bo->dma);
+	kfree(bo);
+}
+
 static void ane_t6021_bo_release(struct kref *ref)
 {
 	struct ane_t6021_bo *bo = container_of(ref, struct ane_t6021_bo,
 					       refcount);
+	bool release;
 
-	if (!bo->fw_ref) {
-		atomic64_sub(PAGE_ALIGN(bo->size), &ane_t6021_bo_total_bytes);
-		dma_free_coherent(bo->dev, bo->size, bo->cpu, bo->dma);
-		kfree(bo);
-	} else if (bo->fw_program || atomic_read(&ane_t6021_quarantined)) {
-		kfree(bo);
-	} else {
-		spin_lock(&ane_t6021_bo_pool_lock);
-		list_add(&bo->node, &ane_t6021_bo_pool);
-		spin_unlock(&ane_t6021_bo_pool_lock);
+	spin_lock(&ane_t6021_bo_pool_lock);
+	release = !bo->fw_ref || bo->fw_epoch != ane_t6021_bo_epoch;
+	if (!release) {
+		if (bo->fw_program || atomic_read(&ane_t6021_quarantined))
+			list_add_tail(&bo->node, &ane_t6021_bo_held);
+		else
+			list_add_tail(&bo->node, &ane_t6021_bo_pool);
 	}
+	spin_unlock(&ane_t6021_bo_pool_lock);
+	if (release)
+		ane_t6021_bo_destroy(bo);
+}
+
+/* After verified restart, closed BOs are reclaimable and live old BOs
+ * become ordinary client-owned memory until published to firmware again.
+ */
+static void ane_t6021_bo_new_epoch(void)
+{
+	struct ane_t6021_bo *bo, *next;
+	LIST_HEAD(reap);
+
+	spin_lock(&ane_t6021_bo_pool_lock);
+	ane_t6021_bo_epoch++;
+	list_splice_init(&ane_t6021_bo_pool, &reap);
+	list_splice_init(&ane_t6021_bo_held, &reap);
+	spin_unlock(&ane_t6021_bo_pool_lock);
+	list_for_each_entry_safe(bo, next, &reap, node) {
+		list_del(&bo->node);
+		ane_t6021_bo_destroy(bo);
+	}
+}
+
+/* bo_lock and a live handle protect the BO while its IOVA is published. */
+static void ane_t6021_bo_publish(struct ane_t6021_bo *bo, bool program)
+{
+	if (bo->fw_epoch != ane_t6021_bo_epoch)
+		bo->fw_program = false;
+	bo->fw_epoch = ane_t6021_bo_epoch;
+	bo->fw_ref = true;
+	bo->fw_program |= program;
 }
 
 /* A parked io BO of SIZE's page-aligned size, or NULL. */
@@ -426,6 +487,8 @@ static const struct vm_operations_struct ane_t6021_vm_ops = {
 static DEFINE_MUTEX(ane_t6021_fw_lock);
 
 /* Forward declaration (defined below). */
+static int ane_rtclient_recover(struct ane_rtclient *ane);
+
 static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 					struct ane_legacy_buffer *command,
 				       size_t length, u16 opcode,
@@ -442,8 +505,8 @@ static int ane_rtclient_legacy_alloc(struct ane_rtclient *ane, u64 size)
 	struct ane_legacy_buffer *buffer;
 
 	if (!size || !IS_ALIGNED(size, SZ_16K) || size > SZ_2M ||
-	    ane->legacy_allocated == ANE_LEGACY_ALLOCS ||
-	    size > ANE_LEGACY_BYTES - ane->legacy_bytes)
+	    ane->legacy_allocated + ane->retired_allocated >= ANE_LEGACY_ALLOCS ||
+	    size > ANE_LEGACY_BYTES - ane->legacy_bytes - ane->retired_bytes)
 		return -E2BIG;
 	buffer = &ane->legacy_buffers[ane->legacy_allocated];
 	buffer->cpu = dma_alloc_coherent(ane->dev, size, &buffer->dma,
@@ -1155,6 +1218,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		dev_info(ane->dev, "EXCH op=%#x failed %d (fw allocs %u, %zu bytes)\n",
 			 opcode, ret, ane->legacy_allocated, ane->legacy_bytes);
 		atomic_set(&ane_t6021_quarantined, 1);
+		if (!ane->recovering)
+			ane_rtclient_recover(ane);
 		return ret;
 	}
 	if (execute) {
@@ -1177,6 +1242,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 				"call completion failed %d within %u ms\n",
 				ret, timeout_ms);
 			atomic_set(&ane_t6021_quarantined, 1);
+			if (!ane->recovering)
+				ane_rtclient_recover(ane);
 			return ret;
 		}
 	}
@@ -1214,10 +1281,13 @@ struct ane_t6021_prog {
 	u8 digest[SHA256_DIGEST_SIZE];
 	u32 prog_id;
 	u32 proc_id;		/* U32_MAX until a process exists */
+	u32 fw_prog_id;
+	u32 fw_proc_id;
 };
 
 static struct ane_t6021_prog ane_t6021_progs[ANE_T6021_MAX_PROGRAMS];
 static unsigned int ane_t6021_nprogs;
+static struct ane_fw_ids ane_t6021_ids;
 
 static struct ane_t6021_prog *ane_t6021_prog_find(const u8 *digest)
 {
@@ -1256,6 +1326,7 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	struct ane_legacy_buffer *command;
 	struct ane_t6021_fd *fd = file->driver_priv;
 	struct ane_t6021_prog *cached;
+	u32 key;
 	u8 digest[SHA256_DIGEST_SIZE];
 	size_t binds_size;
 	int ret, i, j;
@@ -1380,6 +1451,10 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		goto out;
 	}
 
+	ret = ane_fw_id_alloc(&ane_t6021_ids, &key);
+	if (ret)
+		goto out;
+
 	command = ane->cmd_buf;
 	if (!command) {
 		ret = -ENODEV;
@@ -1414,8 +1489,7 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 			 * Under bo_lock the handle reference cannot go
 			 * away, so no kref is needed here.
 			 */
-			bo->fw_ref = true;
-			bo->fw_program = true;
+			ane_t6021_bo_publish(bo, true);
 			iova = bo->dma + sections[i].offset;
 		} else {
 			bo = NULL;
@@ -1468,7 +1542,9 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		}
 		memcpy(ane_t6021_progs[ane_t6021_nprogs].digest, digest,
 		       SHA256_DIGEST_SIZE);
-		ane_t6021_progs[ane_t6021_nprogs].prog_id = *prog_id;
+		ane_t6021_progs[ane_t6021_nprogs].fw_prog_id = *prog_id;
+		*prog_id = key;
+		ane_t6021_progs[ane_t6021_nprogs].prog_id = key;
 		ane_t6021_progs[ane_t6021_nprogs].proc_id = U32_MAX;
 		ane_t6021_nprogs++;
 	}
@@ -1502,7 +1578,7 @@ static int ane_rtclient_create_process(struct ane_rtclient *ane,
 	{
 		u8 *cmd = command->cpu;
 
-		*(u32 *)(cmd + 0x08) = cpu_to_le32(prog_id);
+		*(u32 *)(cmd + 0x08) = cpu_to_le32(prog->fw_prog_id);
 		*(u32 *)(cmd + 0x0c) = cpu_to_le32(U32_MAX);
 	}
 	ret = ane_rtclient_command(ane, command, 0x10,
@@ -1512,10 +1588,13 @@ static int ane_rtclient_create_process(struct ane_rtclient *ane,
 		u8 *cmd = command->cpu;
 
 		*proc_id = le32_to_cpu(*(u32 *)(cmd + 0x0c));
-		if (*proc_id == U32_MAX)
+		if (*proc_id == U32_MAX) {
 			ret = -EPROTO;
-		else
-			prog->proc_id = *proc_id;
+		} else {
+			prog->fw_proc_id = *proc_id;
+			prog->proc_id = prog->prog_id;
+			*proc_id = prog->proc_id;
+		}
 	}
 	return ret;
 }
@@ -1661,6 +1740,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	struct drm_ane_exec_io *ios;
 	struct ane_t6021_bo **exec_bos;
 	struct ane_legacy_buffer *command;
+	struct ane_t6021_prog *program;
 	struct ane_t6021_fd *fd = file->driver_priv;
 	size_t ios_size;
 	size_t cmd_size;
@@ -1705,6 +1785,12 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 		ret = -ETIMEDOUT;
 		goto unlock;
 	}
+	program = ane_t6021_prog_by_id(user->prog_id);
+	if (!program || program->proc_id == U32_MAX ||
+	    program->proc_id != user->proc_id) {
+		ret = -ESTALE;
+		goto unlock;
+	}
 	command = ane->cmd_buf;
 	if (!command) {
 		ret = -ENODEV;
@@ -1714,8 +1800,8 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	{
 		u8 *cmd = command->cpu;
 
-		*(u32 *)(cmd + 0x08) = cpu_to_le32(user->prog_id);
-		*(u32 *)(cmd + 0x0c) = cpu_to_le32(user->proc_id);
+		*(u32 *)(cmd + 0x08) = cpu_to_le32(program->fw_prog_id);
+		*(u32 *)(cmd + 0x0c) = cpu_to_le32(program->fw_proc_id);
 		*(u64 *)(cmd + 0x10) = cpu_to_le64(0);
 		*(u32 *)(cmd + 0x18) = cpu_to_le32(user->priority);
 		*(u64 *)(cmd + 0x20) = cpu_to_le64(ANE_CALL_COOKIE);
@@ -1740,7 +1826,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 			/* Keep this IO element out of the reuse pool until completion. */
 			kref_get(&bo->refcount);
 			exec_bos[pinned++] = bo;
-			bo->fw_ref = true;
+			ane_t6021_bo_publish(bo, false);
 			iova = bo->dma;
 			mutex_unlock(&ane_t6021_bo_lock);
 			*(u32 *)(cmd + slot_base + 0x00) = cpu_to_le32(1);
@@ -1788,15 +1874,15 @@ static struct ane_t6021_drm *to_ane_t6021_drm(struct drm_device *drm)
 	return container_of(drm, struct ane_t6021_drm, drm);
 }
 
-static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
-				   struct drm_file *file)
+static int ane_t6021_bo_init_locked(struct drm_device *drm, void *data,
+				    struct drm_file *file)
 {
 	struct drm_ane_bo_init *args = data;
 	struct ane_t6021_fd *fd = file->driver_priv;
 	struct ane_t6021_bo *bo;
-	struct ane_rtclient *ane;
+	struct ane_rtclient *ane = to_ane_t6021_drm(drm)->ane;
 
-	if (atomic_read(&ane_t6021_quarantined))
+	if (atomic_read(&ane_t6021_quarantined) || READ_ONCE(ane->recovering))
 		return -EIO;
 	if (args->pad || args->size == 0 || args->size > ANE_T6021_BO_MAX ||
 	    !fd)
@@ -1819,7 +1905,6 @@ static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
 		atomic64_sub(PAGE_ALIGN(args->size), &ane_t6021_bo_total_bytes);
 		return -ENOSPC;
 	}
-	ane = to_ane_t6021_drm(drm)->ane;
 	bo = kzalloc_obj(*bo);
 	if (!bo) {
 		atomic64_sub(PAGE_ALIGN(args->size), &ane_t6021_bo_total_bytes);
@@ -1861,6 +1946,17 @@ publish:
 	 */
 	args->offset = (u64)bo->handle << PAGE_SHIFT;
 	return 0;
+}
+
+static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
+				   struct drm_file *file)
+{
+	int ret;
+
+	mutex_lock(&ane_t6021_fw_lock);
+	ret = ane_t6021_bo_init_locked(drm, data, file);
+	mutex_unlock(&ane_t6021_fw_lock);
+	return ret;
 }
 
 /* Drop one handle owned by this fd. The kref may keep the memory
@@ -2069,6 +2165,7 @@ static int ane_t6021_perf_mode_set(const char *val,
 	ret = ane_rtclient_command(ane, command, 0x14, 0x001f, 1, 3000);
 	if (!ret) {
 		fw_perf_mode = true;
+		ane->desired_perf = true;
 		dev_info(ane->dev, "fw perf mode set (property 0x10aa = 1)\n");
 	}
 	mutex_unlock(&ane_t6021_fw_lock);
@@ -2289,6 +2386,7 @@ static DEFINE_MUTEX(ane_rtclient_pd_lock);
 static bool ane_rtclient_pinned;
 static bool ane_rtclient_probe_failed_dirty;
 static DEFINE_MUTEX(ane_rtclient_probe_guard_lock);
+static struct ane_rtclient *ane_rtclient_active;
 
 static void ane_rtclient_pd_free(struct ane_rtclient_pd *pd)
 {
@@ -2509,6 +2607,261 @@ static void ane_rtclient_detach_genpd(struct device *dev)
 	mutex_unlock(&ane_rtclient_pd_lock);
 }
 
+struct ane_rtclient_cycle {
+	struct ane_rtclient *ane;
+	struct ane_rtclient_pd *pd;
+};
+
+static int ane_rtclient_engine_accessible(struct ane_rtclient *ane)
+{
+	if (FIELD_GET(ANE_PS_ACTUAL,
+		      readl(ane->pmgr + ane->soc->ps_cpu_off)) != ANE_PS_ON)
+		return -EIO;
+	if (ane->soc->pwgate_off &&
+	    (IS_ERR_OR_NULL(ane->set) ||
+	     readl(ane->set + ane->soc->pwgate_off) & GENMASK(29, 28)))
+		return -EACCES;
+	return 0;
+}
+
+static bool ane_rtclient_domains_off(struct ane_rtclient_cycle *cycle)
+{
+	struct ane_rtclient *ane = cycle->ane;
+
+	if (readl(ane->pmgr + ane->soc->ps_cpu_off) & ANE_PS_ACTUAL)
+		return false;
+	/* Firmware controls these seven PMGR words itself. Logical genpd
+	 * state alone cannot prove they stayed off during CPU shutdown.
+	 */
+	for (int i = 0; i < 7; i++)
+		if (readl(ane->pmgr + ane->engine_ps_off + i * 8) & ANE_PS_ACTUAL)
+			return false;
+	for (int i = 0; i < cycle->pd->count; i++)
+		if (dev_pm_genpd_is_on(cycle->pd->pd_dev[i]))
+			return false;
+	return true;
+}
+
+static int ane_rtclient_verify_off(void *ctx)
+{
+	struct ane_rtclient_cycle *cycle = ctx;
+	bool off;
+
+	return read_poll_timeout(ane_rtclient_domains_off, off, off,
+				100, 100000, false, cycle);
+}
+
+static void ane_rtclient_reap_retired(struct ane_rtclient *ane)
+{
+	struct ane_rtclient_retired *r, *next;
+
+	list_for_each_entry_safe(r, next, &ane->retired, node) {
+		for (u32 i = 0; i < r->allocated; i++)
+			if (r->buffers[i].cpu)
+				dma_free_coherent(ane->dev, r->buffers[i].size,
+						  r->buffers[i].cpu, r->buffers[i].dma);
+		devm_kfree(ane->dev, r->buffers);
+		if (r->boot.pool)
+			dma_free_coherent(ane->dev, ANE_T6021_BOOT_POOL_SIZE,
+					  r->boot.pool, r->boot.pool_dva);
+		if (r->boot.ipc)
+			dma_free_coherent(ane->dev, r->boot.ipc_size,
+					  r->boot.ipc, r->boot.ipc_dva);
+		if (r->boot.heap)
+			dma_free_coherent(ane->dev, r->boot.heap_size,
+					  r->boot.heap, r->boot.heap_dva);
+		list_del(&r->node);
+		kfree(r);
+	}
+	ane->retired_bytes = 0;
+	ane->retired_allocated = 0;
+	ane->retired_count = 0;
+}
+
+static int ane_rtclient_recover(struct ane_rtclient *ane)
+{
+	struct ane_t6021 *a = ane->fw;
+	struct ane_rtclient_cycle cycle = { .ane = ane };
+	struct ane_rtclient_pd *pd;
+	struct ane_rtclient_retired *retired;
+	struct ane_legacy_buffer *fresh;
+	u32 status, control;
+	unsigned int domains = ane->soc->soc == 0x8112 ? 7 : 8;
+	int ret;
+
+	lockdep_assert_held(&ane_t6021_fw_lock);
+	if (!ane->registered)
+		return -EOPNOTSUPP;
+	if (!atomic_read(&ane_t6021_quarantined))
+		return 0;
+	/* Only the qualified, Linux-owned legacy boot profile can restart.
+	 * Borrowed firmware, RTKit and later-generation ownership stay fenced.
+	 */
+	if (ane->soc->platform || !a || ane->rtk ||
+	    !legacy_only || !scratch3_ack || !legacy_query || fw_start_rtb_mode ||
+	    fw_start_table_mode != 2 || !ane_t6021_fwload_recoverable(a))
+		return -EOPNOTSUPP;
+	/* Keep failed-boot retention bounded and charged against existing caps. */
+	if (ane->retired_count >= 2 || ane_t6021_bo_epoch == U64_MAX)
+		return -ENOSPC;
+	mutex_lock(&ane_rtclient_pd_lock);
+	list_for_each_entry(pd, &ane_rtclient_pd_list, list)
+		if (pd->dev == ane->dev && pd->count == domains)
+			cycle.pd = pd;
+	mutex_unlock(&ane_rtclient_pd_lock);
+	if (!cycle.pd || !ane->engine_ps_valid)
+		return -EOPNOTSUPP;
+	retired = kzalloc_obj(*retired);
+	if (!retired)
+		return -ENOMEM;
+	fresh = devm_kcalloc(ane->dev, ANE_LEGACY_ALLOCS, sizeof(*fresh), GFP_KERNEL);
+	if (!fresh) {
+		kfree(retired);
+		return -ENOMEM;
+	}
+
+	WRITE_ONCE(ane->recovering, true);
+	cancel_delayed_work_sync(&ane->poll_work);
+	/* Stop only our owned ASC CPU before supplier shutdown. Clearing RUN
+	 * is the public m1n1 ASC shutdown operation (hw/asc.py, c4c2fed8f894).
+	 * The existing probe boot sequence also clears RUN before starting it.
+	 * Wait for STOPPED so firmware cannot race the PMGR power-off writes.
+	 */
+	ret = ane_rtclient_engine_accessible(ane);
+	if (ret)
+		goto unchanged;
+	control = readl(ane->engine + ANE_ASC_CPU_CONTROL);
+	writel(control & ~ANE_ASC_CPU_CONTROL_RUN,
+	       ane->engine + ANE_ASC_CPU_CONTROL);
+	ret = readl_poll_timeout(ane->engine + ANE_ASC_CPU_STATUS, status,
+				 (status & ANE_ASC_CPU_STATUS_STOPPED) &&
+				 !(status & ANE_ASC_CPU_STATUS_RUNNING),
+				 100, 100000);
+	if (ret)
+		goto unchanged;
+	/* Probe retains one consumer reference for this firmware lifetime. */
+	ret = ane_pm_cycle(ane->dev, cycle.pd->pd_dev, cycle.pd->count,
+			   ane_rtclient_verify_off, &cycle);
+	if (ret)
+		goto unchanged;
+	/* Repeat probe's gates before any engine-aperture read. */
+	ret = ane_rtclient_engine_accessible(ane);
+	if (ret)
+		goto unchanged;
+	status = readl(ane->engine + ANE_ASC_CPU_STATUS);
+	if ((status & ANE_ASC_CPU_STATUS_RUNNING) ||
+	    !(status & ANE_ASC_CPU_STATUS_STOPPED)) {
+		ret = -EBUSY;
+		goto unchanged;
+	}
+
+	/* No old allocation is discarded until the new boot is validated. */
+	retired->buffers = ane->legacy_buffers;
+	retired->allocated = ane->legacy_allocated;
+	retired->bytes = ane->legacy_bytes;
+	retired->boot = (struct ane_t6021_boot_allocs) {
+		.pool = a->boot_pool, .pool_dva = a->boot_pool_iova,
+		.ipc = a->boot_ipc, .ipc_dva = a->boot_ipc_iova,
+		.ipc_size = a->boot_ipc_size,
+		.heap = a->boot_heap, .heap_dva = a->boot_heap_iova,
+		.heap_size = a->boot_heap_size,
+	};
+	list_add_tail(&retired->node, &ane->retired);
+	ane->retired_count++;
+	ane->retired_bytes += retired->bytes;
+	ane->retired_allocated += retired->allocated;
+	ane_t6021_boot_release_pin(a);
+	a->boot_pool = NULL;
+	a->boot_ipc = NULL;
+	a->boot_heap = NULL;
+	a->boot_pool_iova = 0;
+	a->boot_ipc_iova = 0;
+	a->boot_heap_iova = 0;
+	a->boot_ipc_size = 0;
+	a->boot_heap_size = 0;
+	ane->legacy_buffers = fresh;
+	ane->legacy_allocated = 0;
+	ane->legacy_bytes = 0;
+	ane->legacy_malloc_cursor = 0;
+	memset(ane->legacy_cmd_cursor, 0, sizeof(ane->legacy_cmd_cursor));
+	memset(ane->channels, 0, sizeof(ane->channels));
+	memset(ane->channel_snapshot, 0, sizeof(ane->channel_snapshot));
+	ane->cmd_buf = NULL;
+	ane->chman_ok = false;
+	ane->held = false;
+	fw_perf_mode = false;
+
+	ret = ane_t6021_fwload_reload(a);
+	if (ret)
+		goto failed;
+	ret = ane_t6021_boot_start(a, 0, fw_start_table_mode, 0);
+	ane->held = a->cpu_started;
+	if (ret || !a->fw_alive || !a->booted) {
+		ret = ret ?: -ETIMEDOUT;
+		goto failed;
+	}
+	ane_rtclient_validate_chman(ane);
+	if (!ane->chman_ok ||
+	    !ane_t6021_chman_host_init(a->boot_ipc, a->boot_ipc_size,
+				       a->boot_ipc_iova)) {
+		ret = -EPROTO;
+		goto failed;
+	}
+	dma_wmb();
+	writel(ANE_T6021_BOOT_ACK, ane->engine + ANE_MBI_SCRATCH0 + 4 * 3);
+	ret = ane_rtclient_legacy_alloc(ane, SZ_16K);
+	if (ret)
+		goto failed;
+	ane->cmd_buf = &ane->legacy_buffers[ane->legacy_allocated - 1];
+	memset(ane->cmd_buf->cpu, 0, SZ_16K);
+	/* The firmware lock still fences commands; BO_INIT also checks recovering.
+	 * Clearing the old latch lets transport validation detect a new error.
+	 */
+	atomic_set(&ane_t6021_quarantined, 0);
+	ret = ane_rtclient_legacy_exchange(ane, ane->cmd_buf, 16, 0x03, 1,
+					   jiffies + msecs_to_jiffies(3000));
+	if (!ret && !READ_ONCE(((u32 *)ane->cmd_buf->cpu)[2]))
+		ret = -EPROTO;
+	if (ret)
+		goto failed;
+	if (ane->desired_perf) {
+		u8 *cmd = ane->cmd_buf->cpu;
+
+		memset(cmd, 0, SZ_16K);
+		*(u32 *)(cmd + 0x0c) = cpu_to_le32(0x10aa);
+		*(u32 *)(cmd + 0x10) = cpu_to_le32(1);
+		ret = ane_rtclient_legacy_exchange(ane, ane->cmd_buf, 0x14, 0x001f, 1,
+						   jiffies + msecs_to_jiffies(3000));
+		if (ret)
+			goto failed;
+		fw_perf_mode = true;
+	}
+	if (atomic_read(&ane_t6021_quarantined)) {
+		ret = -EIO;
+		goto failed;
+	}
+	/* Opaque IDs never alias a new firmware instance. Clients reload programs.
+	 * Advance the BO epoch only after old DMA and the new boot are verified.
+	 */
+	ane_t6021_nprogs = 0;
+	ane_t6021_bo_new_epoch();
+	ane_rtclient_reap_retired(ane);
+	WRITE_ONCE(ane->recovering, false);
+	dev_info(ane->dev, "firmware recovered; old program IDs invalid, reload and resubmit\n");
+	return 0;
+
+unchanged:
+	devm_kfree(ane->dev, fresh);
+	kfree(retired);
+failed:
+	atomic_set(&ane_t6021_quarantined, 1);
+	WRITE_ONCE(ane->recovering, false);
+	dev_err(ane->dev,
+		"firmware recovery failed: %d; DMA backing and any live-CPU pin retained\n",
+		ret);
+	return ret;
+}
+
 static int ane_rtclient_probe_inner(struct platform_device *pdev,
 				    bool *hardware_touched)
 {
@@ -2564,6 +2917,7 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 	ane->soc = of_device_get_match_data(dev);
 	platform_set_drvdata(pdev, ane);
 	INIT_DELAYED_WORK(&ane->poll_work, ane_rtclient_post_boot);
+	INIT_LIST_HEAD(&ane->retired);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
@@ -2601,6 +2955,16 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 				     "pmgr window map failed; G1 gate cannot run\n");
 	}
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (res) {
+		u64 first = ane->soc->pmu_pa + ane->soc->ps_off;
+
+		if (first >= res->start && first <= res->end &&
+		    res->end - first >= 6 * 8 + sizeof(u32) - 1) {
+			ane->engine_ps_off = first - res->start;
+			ane->engine_ps_valid = true;
+		}
+	}
 	ps_cpu = readl(ane->pmgr + ane->soc->ps_cpu_off);
 	dev_dbg(dev, "ane_cpu ACTUAL = 0x%x\n", ps_cpu);
 	if (FIELD_GET(ANE_PS_ACTUAL, ps_cpu) != ANE_PS_ON) {
@@ -2615,8 +2979,11 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 	 */
 	if (ane->soc->pwgate_off) {
 		void __iomem *set = devm_of_iomap(dev, dev->of_node, 2, NULL);
+
 		u32 gate = IS_ERR(set) ? U32_MAX :
 			   readl(set + ane->soc->pwgate_off);
+
+		ane->set = set;
 
 		dev_dbg(dev, "PWGATE = 0x%x\n", gate);
 		if (gate & GENMASK(29, 28)) {
@@ -2921,6 +3288,8 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 					     ane_timeline_show,
 					     &ane->stats_ring);
 		drmret = drm_dev_register(&adrm->drm, 0);
+		if (!drmret)
+			ane->registered = true;
 		if (drmret) {
 			dev_err_probe(dev, drmret, "drm_dev_register\n");
 			ret = drmret;
@@ -2962,14 +3331,16 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		return ane_fw_platform_preflight(pdev, soc->platform);
 
 	mutex_lock(&ane_rtclient_probe_guard_lock);
-	if (ane_rtclient_probe_failed_dirty) {
+	if (ane_rtclient_probe_failed_dirty || ane_rtclient_active) {
 		mutex_unlock(&ane_rtclient_probe_guard_lock);
 		dev_err(&pdev->dev,
-			"previous probe failed after touching the hardware: reboot required\n");
+			"ANE already owned or previous probe left hardware dirty; refusing another binding\n");
 		return -EBUSY;
 	}
 
 	ret = ane_rtclient_probe_inner(pdev, &hardware_touched);
+	if (!ret)
+		ane_rtclient_active = platform_get_drvdata(pdev);
 	if (ret) {
 		struct ane_rtclient *ane = platform_get_drvdata(pdev);
 
@@ -3034,8 +3405,33 @@ static ssize_t ane_stats_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(ane_stats);
 
+static ssize_t wedged_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct ane_rtclient *ane = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", atomic_read(&ane_t6021_quarantined) ||
+			  READ_ONCE(ane->recovering) || !READ_ONCE(ane->registered));
+}
+static DEVICE_ATTR_RO(wedged);
+
+static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct ane_rtclient *ane = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&ane_t6021_fw_lock);
+	ret = ane_rtclient_recover(ane);
+	mutex_unlock(&ane_t6021_fw_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(reset);
+
 static struct attribute *ane_t6021_stats_attrs[] = {
 	&dev_attr_ane_stats.attr,
+	&dev_attr_wedged.attr,
+	&dev_attr_reset.attr,
 	NULL,
 };
 
