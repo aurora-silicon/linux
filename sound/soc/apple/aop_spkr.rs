@@ -1604,9 +1604,9 @@ unsafe extern "C" fn jack_resume(component: *mut bindings::snd_soc_component) ->
     }
 }
 
-/// The speaker component, and the jack's where the audio node lists its DMA channels.
+/// The speaker and jack components, each where the audio node lists its DMA channels.
 pub(crate) struct SpeakerComponent {
-    _spkr: Registration,
+    _spkr: Option<Registration>,
     _jack: Option<Registration>,
 }
 
@@ -1641,19 +1641,29 @@ impl SpeakerComponent {
         } else {
             None
         };
-        let mut spkr_driver = component_driver(c_str!("t6040-aop-spkr"));
-        spkr_driver.suspend = Some(spkr_suspend);
-        spkr_driver.resume = Some(spkr_resume);
-        let spkr = Registration::new(&aop, services, spkr_driver, |ops| {
-            to_kvec(speaker_dais(ops))
-        })
-        .inspect_err(|e| {
-            dev_err!(
-                aop.dev,
-                "Unable to register the speaker ASoC component: {}\n",
-                e.to_errno()
+        let has_spkr = aop
+            .fwnode
+            .property_match_string(c_str!("dma-names"), c_str!("spkr"))
+            .is_ok();
+        let spkr = if has_spkr {
+            let mut spkr_driver = component_driver(c_str!("t6040-aop-spkr"));
+            spkr_driver.suspend = Some(spkr_suspend);
+            spkr_driver.resume = Some(spkr_resume);
+            Some(
+                Registration::new(&aop, services, spkr_driver, |ops| {
+                    to_kvec(speaker_dais(ops))
+                })
+                .inspect_err(|e| {
+                    dev_err!(
+                        aop.dev,
+                        "Unable to register the speaker ASoC component: {}\n",
+                        e.to_errno()
+                    )
+                })?,
             )
-        })?;
+        } else {
+            None
+        };
         Ok(Self {
             _spkr: spkr,
             _jack: jack,
