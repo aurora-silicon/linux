@@ -256,10 +256,13 @@ int dcp_audiosrv_unprepare(struct device *dev)
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-/* The audio service of the 14.7 external role, known before it starts. */
+/* Native audio links are selected from the firmware role, before service start. */
 bool dcp_audiosrv_native_link(struct device *dev)
 {
-	return dcp_is_v14_7_external(dev_get_drvdata(dev));
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	return dcp_is_v14_7_external(dcp) ||
+	       (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->external);
 }
 
 /* The 14.7 external role's audio service calls; KUnit stubs them. */
@@ -268,6 +271,14 @@ static int av_audiosrv_call(struct apple_epic_service *srv, u32 command, const v
 {
 	KUNIT_STATIC_STUB_REDIRECT(av_audiosrv_call, srv, command, body, body_len, body_pad,
 				   reply, reply_len);
+	if (READ_ONCE(srv->ep->compact)) {
+		size_t received;
+		int ret;
+
+		ret = afk_service_call_with_reply_len(srv, 0, command, body, body_len,
+						    body_pad, reply, reply_len, 0, &received);
+		return ret ?: (received == reply_len ? 0 : -EMSGSIZE);
+	}
 	return afk_service_call(srv, 0, command, body, body_len, body_pad, reply, reply_len, 0);
 }
 
@@ -397,6 +408,10 @@ int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link, dev, op, cookie);
 	dcp = dev_get_drvdata(dev);
 	asrv = dcp->audiosrv;
+	if (!asrv)
+		return -ENODEV;
+	if (!cookie)
+		return -EINVAL;
 
 	switch (op) {
 	case DCP_AUDIO_LINK_PREPARE:
@@ -425,15 +440,15 @@ int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 			return -ENODEV;
 		ret = av_audiosrv_call(asrv->open_srv, command, body, sizeof(body), 0,
 				       reply, sizeof(reply));
-		if (!ret && op == DCP_AUDIO_LINK_PREPARE)
+		if (ret)
+			return ret;
+		status = get_unaligned_le32(reply + 48);
+		if (status) {
+			dev_err(dev, "audiosrv: link method %u answered %#x\n", command, status);
+			return -EIO;
+		}
+		if (op == DCP_AUDIO_LINK_PREPARE)
 			asrv->link_gen = asrv->open_gen;
-	}
-	if (ret)
-		return ret;
-	status = get_unaligned_le32(reply + 48);
-	if (status) {
-		dev_err(dev, "audiosrv: link method %u answered %#x\n", command, status);
-		return -EIO;
 	}
 	return 0;
 }
@@ -451,6 +466,7 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 		u8 _pad2[8];
 	} __attribute__((packed)) *hdr;
 	static_assert(sizeof(*hdr) == 48);
+	size_t received = 0, used;
 	size_t bfr_len = output_maxsize + sizeof(*hdr);
 	void *bfr __free(kfree) = NULL;
 	int ret;
@@ -461,16 +477,30 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 
 	hdr = bfr;
 	hdr->max_size = cpu_to_le64(output_maxsize);
-	ret = afk_service_call(service, group, command, hdr, sizeof(*hdr), output_maxsize,
-			       bfr, sizeof(*hdr) + output_maxsize, 0);
+	if (READ_ONCE(service->ep->compact))
+		ret = afk_service_call_with_reply_len(service, group, command, hdr,
+						    sizeof(*hdr), output_maxsize, bfr,
+						    bfr_len, 0, &received);
+	else
+		ret = afk_service_call(service, group, command, hdr, sizeof(*hdr),
+				       output_maxsize, bfr, bfr_len, 0);
 	if (ret)
 		return ret;
 
-	if (output)
+	used = le64_to_cpu(hdr->used_size);
+	if (READ_ONCE(service->ep->compact)) {
+		if (used > output_maxsize || received < sizeof(*hdr) ||
+		    used > received - sizeof(*hdr))
+			return -EMSGSIZE;
+		if (output) {
+			memset(output, 0, output_maxsize);
+			memcpy(output, bfr + sizeof(*hdr), used);
+		}
+	} else if (output) {
 		memcpy(output, bfr + sizeof(*hdr), output_maxsize);
-
+	}
 	if (output_size)
-		*output_size = le64_to_cpu(hdr->used_size);
+		*output_size = used;
 
 	return 0;
 }
@@ -479,13 +509,19 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *srv;
 	size_t size;
 	int ret;
 
-	down_write(&asrv->srv_rwsem);
-	ret = dcp_audiosrv_osobject_call(asrv->srv, 1, asrv->cmds.get_elements,
+	if (!asrv)
+		return -ENODEV;
+	scoped_guard(rwsem_read, &asrv->srv_rwsem)
+		srv = afk_service_get(asrv->srv);
+	if (!srv)
+		return -ENODEV;
+	ret = dcp_audiosrv_osobject_call(srv, 1, asrv->cmds.get_elements,
 					 elements, maxsize, &size);
-	up_write(&asrv->srv_rwsem);
+	afk_service_put(srv);
 
 	if (ret && !asrv->warned_get_elements) {
 		dev_err(dev, "audiosrv: error getting elements: %d\n", ret);
@@ -501,14 +537,20 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *srv;
 	size_t size;
 	int ret;
 
-	down_write(&asrv->srv_rwsem);
-	ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
+	if (!asrv)
+		return -ENODEV;
+	scoped_guard(rwsem_read, &asrv->srv_rwsem)
+		srv = afk_service_get(asrv->srv);
+	if (!srv)
+		return -ENODEV;
+	ret = dcp_audiosrv_osobject_call(srv, 1,
 					 asrv->cmds.get_product_attrs, attrs,
 					 maxsize, &size);
-	up_write(&asrv->srv_rwsem);
+	afk_service_put(srv);
 
 	if (ret && !asrv->warned_get_product_attrs) {
 		dev_err(dev, "audiosrv: error getting product attributes: %d\n", ret);
@@ -544,7 +586,7 @@ static int av_audiosrv_report(struct apple_epic_service *service, u32 idx,
 	 * 10 s for that before it removes the interface, and the sink's link
 	 * with it. A later publication brings the new instance.
 	 */
-	if (dcp_is_v14_7_external(dcp) && av_report_terminate(data, data_size)) {
+	if (dcp_audiosrv_native_link(dcp->dev) && av_report_terminate(data, data_size)) {
 		struct audiosrv_data *asrv = dcp->audiosrv;
 		bool published;
 
@@ -590,6 +632,32 @@ static void av_cec_teardown(struct apple_epic_service *service)
 {
 	afk_service_disable(service);
 }
+#endif
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+static int av_desktop_audio_prepare(struct apple_epic_service *service, const char *name,
+				    const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp->external ||
+	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP ||
+	    !name || strcmp(name, "dcpav-audio-epic") || unit != 0)
+		return -EINVAL;
+	return 0;
+}
+
+static const struct apple_epic_service_ops av_desktop_ops[] = {
+	{
+		.name = "dcpav-audio-epic",
+		.reusable = true,
+		.prepare = av_desktop_audio_prepare,
+		.init = av_audiosrv_init,
+		.report = av_audiosrv_report,
+		.teardown = av_audiosrv_teardown,
+	},
+	{}
+};
 #endif
 
 static const struct apple_epic_service_ops avep_ops[] = {
@@ -643,8 +711,8 @@ void av_service_connect(struct apple_dcp *dcp)
 	 * the display's power (A472 on): the CRTC enable connects before the
 	 * mode is set, and the modeset connects again once the display is on.
 	 */
-	if (dcp_is_v14_7_external(dcp)) {
-		if (!iomfb_v14_7_external_powered(dcp))
+	if (dcp_audiosrv_native_link(dcp->dev)) {
+		if (dcp_is_v14_7_external(dcp) && !iomfb_v14_7_external_powered(dcp))
 			goto out;
 		scoped_guard(mutex, &asrv->plug_lock) {
 			if (asrv->audio_dev)
@@ -691,7 +759,7 @@ static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 	dev_info(dcp->dev, "%s: stopping audio service\n", __func__);
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/* The 14.7 external role's card goes with the display, and an open PCM's service. */
-	if (dcp_is_v14_7_external(dcp)) {
+	if (dcp_audiosrv_native_link(dcp->dev)) {
 		struct platform_device *audio_dev = NULL;
 		bool published = true;
 
@@ -868,6 +936,10 @@ static void av_audiosrv_cleanup(void *data)
 		av_audiosrv_drain_owner(asrv);
 	}
 	afk_quiesce(cleanup->ep);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	    !IS_ERR_OR_NULL(cleanup->ep) &&
+	    READ_ONCE(dcp->desktop->graph[cleanup->ep->endpoint - 0x20]) == cleanup->ep)
+		WRITE_ONCE(dcp->desktop->graph[cleanup->ep->endpoint - 0x20], NULL);
 	/* An old devres group must not unpublish a later session. */
 	if (dcp->audiosrv == asrv) {
 		if (dcp->avep == cleanup->ep)
@@ -925,7 +997,20 @@ int avep_init(struct apple_dcp *dcp)
 	struct platform_device *audio_pdev;
 	struct device *dev = dcp->dev;
 	struct device_node *endpoint, *audio_node = NULL;
+	const struct apple_epic_service_ops *ops = avep_ops;
+	u32 av_endpoint = AV_ENDPOINT;
 	int ret;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+		if (!dcp->external)
+			return -EOPNOTSUPP;
+		ops = av_desktop_ops;
+		av_endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
+#else
+		return -EOPNOTSUPP;
+#endif
+	}
 
 	audiosrv_data = devm_kzalloc(dcp->dev, sizeof(*audiosrv_data), GFP_KERNEL);
 	if (!audiosrv_data)
@@ -974,7 +1059,8 @@ int avep_init(struct apple_dcp *dcp)
 	if (!audio_node || !of_device_is_available(audio_node)) {
 		of_node_put(audio_node);
 		dev_info(dev, "No audio support\n");
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+		    av_endpoint == AV_ENDPOINT)
 			goto start_endpoint;
 		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
 	}
@@ -983,7 +1069,8 @@ int avep_init(struct apple_dcp *dcp)
 	of_node_put(audio_node);
 	if (!audio_pdev) {
 		dev_info(dev, "No DP/HDMI audio device not ready\n");
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+		    av_endpoint == AV_ENDPOINT)
 			goto start_endpoint;
 		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
 	}
@@ -993,7 +1080,7 @@ int avep_init(struct apple_dcp *dcp)
 			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 
 start_endpoint:
-	dcp->avep = afk_init(dcp, AV_ENDPOINT, avep_ops);
+	dcp->avep = afk_init(dcp, av_endpoint, ops);
 	if (IS_ERR(dcp->avep)) {
 		ret = PTR_ERR(dcp->avep);
 		if (!av_audiosrv_register_cleanup(dcp, audiosrv_data, dcp->avep))
@@ -1007,7 +1094,10 @@ start_endpoint:
 	ret = av_audiosrv_register_cleanup(dcp, audiosrv_data, dcp->avep);
 	if (ret)
 		return ret;
-	dcp->avep->debugfs_entry = dcp->ep_debugfs[AV_ENDPOINT - 0x20];
+	dcp->avep->debugfs_entry = dcp->ep_debugfs[av_endpoint - 0x20];
+	/* afk_start waits for RX: publish the desktop route before starting. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		WRITE_ONCE(dcp->desktop->graph[av_endpoint - 0x20], dcp->avep);
 	ret = afk_start(dcp->avep);
 	if (ret)
 		av_audiosrv_cleanup(&audiosrv_data->cleanup);
