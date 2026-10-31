@@ -29,10 +29,22 @@ PREFIX = r'''
 #include <stdbool.h>
 #include <stdio.h>
 struct scheduler { bool stopped; unsigned pauses, restarts; };
-struct ave_dev { struct scheduler *m2m_dev; int hw_lock; };
+struct transport { bool scratch_halt; };
+struct abi { const struct transport *transport; };
+struct layout { const struct abi *abi; };
+struct ave_dev {
+    struct scheduler *m2m_dev;
+    int hw_lock;
+    const struct layout *layout;
+};
 struct device { struct ave_dev *data; };
 static int shutdown_error;
 static unsigned closes, halts;
+/* Later lifecycle support adds these calls; sleep still uses strict shutdown. */
+static inline void ave_fw_release_boot(struct ave_dev *a) { assert(a->hw_lock); }
+static inline int ave_runtime_resume(struct device *d) {
+    assert(!d->data->hw_lock); return 0;
+}
 static void *dev_get_drvdata(struct device *d) { return d->data; }
 static void mutex_lock(int *l) { assert(!*l); *l = 1; }
 static void mutex_unlock(int *l) { assert(*l == 1); *l = 0; }
