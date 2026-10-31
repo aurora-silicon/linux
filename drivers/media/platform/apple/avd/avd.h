@@ -367,6 +367,7 @@ int avd_open_build_program(struct avd_ctx *ctx);
 extern const struct avd_backend_ops avd_open_backend;
 extern const struct avd_backend_ops avd_apple_backend;
 int avd_backend_select(struct avd_dev *avd);
+bool avd_mbox_pop(struct avd_dev *avd, u32 *msg);
 int avd_backend_boot(struct avd_dev *avd);
 void avd_shutdown(struct avd_dev *avd);
 
