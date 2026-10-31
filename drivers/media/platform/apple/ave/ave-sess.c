@@ -48,9 +48,6 @@
 #define AVE_SHDR_ENTRY_BYTES 0x400
 #define AVE_CODED_MIN 0x3c000
 
-/* H.264 per-frame buffer (Process +0x58c8): unused in bit-rate modes */
-#define AVE_H264_FRAME_BUF SZ_16K
-
 /* Level limits: max frame size, max rate, max bit rate (kbit/s, Main). */
 struct ave_level {
 	u32 max_fs;
@@ -300,7 +297,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 					ALIGN(432 * p->mbs, SZ_16K), 0, nomap);
 		} else {
 			ave_req(r, &n, &sess->slot[s].aux,
-				hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0,
+				hevc ? AVE_SHDR_BYTES : ALIGN(432 * p->mbs, SZ_16K), 0,
 				hevc ? 0 : nomap);
 		}
 	}
