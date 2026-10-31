@@ -9,6 +9,7 @@
 
 #include <linux/atomic.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -20,6 +21,7 @@
 #include <media/videobuf2-v4l2.h>
 
 #include "ave-sizes.h"
+#include "ave-recovery.h"
 
 struct debugfs_blob_wrapper;
 struct dentry;
@@ -94,6 +96,7 @@ enum ave_fw_state {
 	AVE_FW_RUNNING,
 	AVE_FW_HALTED,		/* told to halt; restarts through the boot path */
 	AVE_FW_BROKEN,
+	AVE_FW_RECOVERING,	/* control off; awaiting a runtime power cycle */
 };
 
 /* The two large session commands, and their sizes per codec */
@@ -148,6 +151,12 @@ struct ave_dev {
 	u32 data_crc;
 	void *data_pristine;
 	bool data_dirty;
+
+	/* hw_lock protects recovery history and quarantined DMA allocations. */
+	struct ave_recovery_history recovery;
+	unsigned int recovery_count;
+	struct ave_session *failed_sessions;
+	bool inject_wedge;
 
 	/* debugfs: the last Start and first Process built, per codec */
 	struct dentry *debugfs;
@@ -224,6 +233,7 @@ struct ave_slot {
 #define AVE_TILE_BUFS		8
 
 struct ave_session {
+	struct ave_session *failed_next;
 	struct ave_params p;
 	struct ave_buf hdr;
 	struct ave_buf ref_a[AVE_MAX_REFS];
@@ -291,6 +301,9 @@ struct ave_ctx {
 	bool draining;
 	bool flush_pending;
 	bool stopped;
+	/* Serialises QBUF with fatal-error publication and ready-queue draining. */
+	spinlock_t queue_lock;
+	bool failed;
 	struct vb2_v4l2_buffer *drain_src;
 	u32 src_sequence;
 	u32 dst_sequence;
@@ -307,6 +320,8 @@ void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 void ave_fw_halt(struct ave_dev *ave);
 int ave_fw_shutdown(struct ave_dev *ave);
+int ave_fw_runtime_suspend(struct ave_dev *ave);
+void ave_fw_mark_broken(struct ave_dev *ave, int err, const char *what);
 void ave_fw_lost(struct ave_dev *ave);
 int ave_fw_check_build(struct ave_dev *ave);
 int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long attrs);
@@ -338,6 +353,7 @@ int ave_cmd_close(struct ave_ctx *ctx);
 /* ave-sess.c */
 struct ave_session *ave_sess_create(struct ave_ctx *ctx);
 void ave_sess_destroy(struct ave_ctx *ctx);
+void ave_sess_reap(struct ave_dev *ave);
 int ave_sess_free_slot(struct ave_session *sess);
 void ave_sess_reply(struct ave_dev *ave, const u8 *msg, u32 len);
 int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
