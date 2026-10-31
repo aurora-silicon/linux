@@ -15,6 +15,7 @@
 #include <linux/iommu.h>
 #include <linux/reset.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
@@ -222,29 +223,88 @@ int avd_submit_job(struct avd_ctx *ctx)
 	return 0;
 }
 
+/* Recover at most twice a minute, never twice within this gap. */
+#define AVD_RECOVER_MAX		2
+#define AVD_RECOVER_WINDOW	msecs_to_jiffies(60000)
+#define AVD_RECOVER_GAP_MS	20
+
+/*
+ * Reset the decoder after a timeout or a VP error. Every reset is a risk
+ * to the whole machine (the J616s hung hard after timeouts and resets
+ * three times in one night, and the Neo after a burst of one reset per
+ * frame), so: stop the interrupt handler and the CM3 first, block the
+ * decoder's DMA at its DART so a transfer still in flight faults instead
+ * of reaching memory that may already be reused, give such transfers time
+ * to drain, and only then assert the pmgr reset. Recover sparingly, and
+ * retire the decoder after a failed or a third recovery within a minute.
+ */
 static int avd_reset(struct avd_dev *avd)
 {
 	int ret = 0;
 
+	if (avd->retired)
+		return -ENODEV;
+	if (!avd->recoveries ||
+	    time_after(jiffies, avd->recover_window_start + AVD_RECOVER_WINDOW)) {
+		avd->recover_window_start = jiffies;
+		avd->recoveries = 0;
+	}
+	if (++avd->recoveries > AVD_RECOVER_MAX) {
+		ret = -EBUSY;
+		goto retire;
+	}
+	if (avd->last_recover &&
+	    time_before(jiffies, avd->last_recover + msecs_to_jiffies(AVD_RECOVER_GAP_MS)))
+		msleep(AVD_RECOVER_GAP_MS);
+
 	ret = pm_runtime_resume_and_get(avd->dev);
 	if (ret < 0)
-		return ret;
+		goto retire;
 
+	/* No handler may touch the mailbox while the block is in reset. */
+	disable_irq(avd->irq);
+	dev_warn(avd->dev, "recover: stop firmware\n");
+	avd_shutdown(avd);
+	if (avd->empty_domain) {
+		dev_warn(avd->dev, "recover: block DMA\n");
+		ret = iommu_attach_device(avd->empty_domain, avd->dev);
+		if (ret) {
+			dev_err(avd->dev, "recover: DART empty attach failed: %d\n", ret);
+			goto put;
+		}
+		usleep_range(5000, 6000);
+	}
+	dev_warn(avd->dev, "recover: reset\n");
 	ret = reset_control_reset(avd->rstc);
 	if (ret)
-		dev_err(avd->dev, "reset: failed: %d", ret);
-
+		dev_err(avd->dev, "recover: reset failed: %d\n", ret);
 	if (avd->empty_domain) {
-		iommu_attach_device(avd->empty_domain, avd->dev);
+		dev_warn(avd->dev, "recover: restore DMA\n");
 		iommu_detach_device(avd->empty_domain, avd->dev);
+		if (avd->domain && iommu_get_domain_for_dev(avd->dev) != avd->domain) {
+			dev_err(avd->dev, "recover: DART domain not restored\n");
+			ret = -EIO;
+		}
 	}
-
-	ret = avd_boot(avd);
-	if (ret)
-		dev_err(avd->dev, "reset: failed to boot");
-
+	if (!ret) {
+		dev_warn(avd->dev, "recover: boot firmware\n");
+		ret = avd_boot(avd);
+		if (ret)
+			dev_err(avd->dev, "recover: boot failed: %d\n", ret);
+	}
+put:
+	avd->last_recover = jiffies ?: 1;
+	if (!ret) {
+		enable_irq(avd->irq);
+		dev_warn(avd->dev, "recover: done\n");
+	}
 	pm_runtime_put_autosuspend(avd->dev);
-
+	if (!ret)
+		return 0;
+retire:
+	avd->retired = true;
+	dev_err(avd->dev, "decoder retired after %s (%d): reload the module to use it again\n",
+		ret == -EBUSY ? "repeated resets" : "a failed reset", ret);
 	return ret;
 }
 
@@ -284,6 +344,12 @@ static void avd_watchdog_func(struct work_struct *work)
 	ret = avd_reset(avd);
 	if (ret)
 		dev_err(avd->dev, "failed to reset: %d", ret);
+	/*
+	 * A stream whose frame failed in hardware usually fails the next one
+	 * too (a reset per frame took the Neo down), so stop it here.
+	 */
+	ctx->broken = true;
+	dev_err(avd->dev, "stream stopped after a failed frame; restart streaming to retry\n");
 
 	avd_job_finish(ctx, VB2_BUF_STATE_ERROR);
 }
@@ -300,6 +366,19 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 	if (!ctx)
 		return IRQ_HANDLED;
 
+	/*
+	 * Reading RETRIEVE on an empty mailbox returns the previous message
+	 * again. A repeated PP DONE finishes the next frame before its PP has
+	 * run: userspace gets a wrong picture, the frame's own PP DONE never
+	 * comes, and the watchdog resets the decoder. Give a late message
+	 * 10 us, otherwise acknowledge and ignore the interrupt.
+	 */
+	if (readl_poll_timeout_atomic(avd->mbox + AVD_REG_MBOX1_STATUS, status,
+				      !(status & AVD_MBOX1_STATUS_EMPTY), 1, 10)) {
+		writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+		dev_dbg_ratelimited(avd->dev, "spurious interrupt, mailbox empty\n");
+		return IRQ_HANDLED;
+	}
 	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
 
 	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
@@ -317,6 +396,10 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 		/* a vp is done, kick the pp and hope for the best */
 		if(ctx->coded_fmt_desc->ops->submit)
 			ctx->coded_fmt_desc->ops->submit(ctx);
+		spin_lock_irqsave(&avd->job_lock, flags);
+		if (avd->job_ctx == ctx)
+			avd->job_vp_done = true;
+		spin_unlock_irqrestore(&avd->job_lock, flags);
 		goto done;
 	} else {
 		dev_err(avd->dev, "H%d error", status);
@@ -338,7 +421,13 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 	 * let avd_device_run() finish the job when it returns.
 	 */
 	spin_lock_irqsave(&avd->job_lock, flags);
-	if (avd->job_ctx != ctx) {
+	if (avd->job_ctx != ctx || !avd->job_vp_done) {
+		/*
+		 * Only the PP kicked for this job's VP can finish it. A surplus
+		 * PP DONE of a multi-kick picture used to finish the next job
+		 * early, so userspace reused its buffers while the decoder was
+		 * still writing them.
+		 */
 		stale = true;
 	} else if (avd->job_state == AVD_JOB_SUBMITTED) {
 		avd->job_state = AVD_JOB_FINISHING;
@@ -378,6 +467,16 @@ static void avd_device_run(void *priv)
 	if (WARN_ON(!desc))
 		return;
 
+	if (READ_ONCE(avd->retired) || ctx->broken) {
+		struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+
+		/* Complete the request's controls too, or its fd never signals. */
+		if (src && src->vb2_buf.req_obj.req)
+			v4l2_ctrl_request_complete(src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+		avd_job_finish_no_pm(ctx, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
 	/*
 	 * IRQ completion cannot wait for an already running watchdog. Drain it
 	 * here, before reusing wd_seq, so an old callback cannot time out this
@@ -401,6 +500,7 @@ static void avd_device_run(void *priv)
 	avd->job_ctx = ctx;
 	avd->job_state = AVD_JOB_RUNNING;
 	avd->job_end_sent = false;
+	avd->job_vp_done = false;
 	avd->job_pending = false;
 	spin_unlock_irqrestore(&avd->job_lock, flags);
 	dev_dbg(avd->dev, "avd-job: run seq %llu\n", seq);
@@ -954,6 +1054,7 @@ static int avd_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 1);
 	if (irq < 0)
 		return irq;
+	avd->irq = irq;
 	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 			avd_irq_handler, IRQF_ONESHOT,
 			dev_name(&pdev->dev), avd);
