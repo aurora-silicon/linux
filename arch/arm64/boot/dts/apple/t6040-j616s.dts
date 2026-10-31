@@ -299,16 +299,18 @@
 
 	/*
 	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
-	 * smc_hwmon. The PMP's fast die-temperature limit regulates (TCMz
-	 * settles near 111 C); this zone is the backstop above it: passive at
-	 * 113 C, critical (orderly shutdown) at 118 C, polled once a second as
-	 * the SMC refreshes TCMz. The cpufreq cooling device sits on a
+	 * smc_hwmon. The PMP's fast die-temperature limit regulates: its loop
+	 * holds its own hot-spot sensors at 110 C (ADT fast-die-ctrl-loop),
+	 * and under a sustained all-core load TCMz then settles at 113.4 to
+	 * 114.7 C with the fans running. This zone is the backstop above that:
+	 * passive at 116 C, critical (orderly shutdown) at 118 C, polled once a
+	 * second as the SMC refreshes TCMz. The cpufreq cooling device sits on a
 	 * cluster's policy CPU, so each map lists every CPU of its cluster.
 	 *
 	 * Per-cluster and GPU zones follow, one per SMC die-maximum sensor
 	 * (smc_hwmon channels 1-23, in the order of the temperature nodes
 	 * below): Tex0-3 throttle the E cluster, Tpx0-5 the first P cluster
-	 * and Tpx8-D the second, with the same 113/118 C backstop as TCMz.
+	 * and Tpx8-D the second, with the same 116/118 C backstop as TCMz.
 	 * Unlike the fanless J700, this machine has two SMC-driven fans and
 	 * the PMP regulates the dies itself, so these zones only catch a
 	 * failure of that loop; they never act in normal use.
@@ -368,7 +370,7 @@
 				J616S_FAN_TRIPS(cpu_die)
 
 				cpu_die_passive: cpu-die-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -421,7 +423,7 @@
 
 			trips {
 				cpu_e0_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -452,7 +454,7 @@
 
 			trips {
 				cpu_e1_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -483,7 +485,7 @@
 
 			trips {
 				cpu_e2_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -514,7 +516,7 @@
 
 			trips {
 				cpu_e3_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -545,7 +547,7 @@
 
 			trips {
 				cpu_p00_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -577,7 +579,7 @@
 
 			trips {
 				cpu_p01_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -609,7 +611,7 @@
 
 			trips {
 				cpu_p02_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -641,7 +643,7 @@
 
 			trips {
 				cpu_p03_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -673,7 +675,7 @@
 
 			trips {
 				cpu_p04_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -705,7 +707,7 @@
 
 			trips {
 				cpu_p05_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -737,7 +739,7 @@
 
 			trips {
 				cpu_p10_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -769,7 +771,7 @@
 
 			trips {
 				cpu_p11_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -801,7 +803,7 @@
 
 			trips {
 				cpu_p12_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -833,7 +835,7 @@
 
 			trips {
 				cpu_p13_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -865,7 +867,7 @@
 
 			trips {
 				cpu_p14_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -897,7 +899,7 @@
 
 			trips {
 				cpu_p15_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
