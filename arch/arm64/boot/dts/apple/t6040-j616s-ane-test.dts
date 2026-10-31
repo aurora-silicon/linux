@@ -4,6 +4,8 @@
 #include "t6040-j616s-tether.dts"
 
 &ane {
+	/* The staged backend maps SID 0 only; SID 11 stays unattached. */
+	iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
 	status = "okay";
 };
 

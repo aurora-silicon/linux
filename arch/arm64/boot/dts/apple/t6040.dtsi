@@ -2242,9 +2242,9 @@
 		apple,firmware-preloaded;
 		/* Inclusive DAPF bounds, in hardware record order. */
 		apple,dapf-ranges = /bits/ 64 <0x5022803c0 0x5022803c3>,
-					    <0x50228c000 0x50228c01b>,
-					    <0x581668000 0x581668003>,
-					    <0x28a668000 0x28a668003>;
+				    /bits/ 64 <0x50228c000 0x50228c01b>,
+				    /bits/ 64 <0x581668000 0x581668003>,
+				    /bits/ 64 <0x28a668000 0x28a668003>;
 		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
 		/* The bootloader supplies the physical TEXT/DATA reservations. */
 		status = "disabled";
