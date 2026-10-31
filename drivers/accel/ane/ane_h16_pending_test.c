@@ -246,27 +246,30 @@ static void pending_deadline_wrap_test(struct kunit *test)
 
 static void resources_test(struct kunit *test)
 {
-	struct ane_h16_hwx hwx = { .surface_count = 2 };
-	struct ane_h16_resource resources[2] = {};
+	/* add-128 shape: input, output, input with class-local indices 0, 0, 1. */
+	static const u32 direction[3] = { 1, 2, 1 }, index[3] = { 0, 0, 1 };
+	struct ane_h16_hwx hwx = { .surface_count = 3 };
+	struct ane_h16_resource resources[3] = {};
 	unsigned int i, variant;
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < 3; i++) {
 		hwx.surfaces[i].section.vm = 0x30000000 + i * SZ_16K;
 		hwx.surfaces[i].section.size = SZ_16K;
 		hwx.surfaces[i].allocation = SZ_16K;
 		hwx.surfaces[i].span = 256;
-		hwx.surfaces[i].direction = i + 1;
+		hwx.surfaces[i].direction = direction[i];
 		resources[i].hwx_vm = hwx.surfaces[i].section.vm;
-		resources[i].permissions = i + 1;
+		resources[i].permissions = direction[i];
 		resources[i].buffer = (struct ane_h16_execute_buffer) {
-			.index = i, .class = i, .mapping_dva = 0x100000000ULL + i * SZ_16K,
+			.index = index[i], .class = direction[i] - 1,
+			.mapping_dva = 0x100000000ULL + i * SZ_16K,
 			.mapping_size = SZ_16K, .size = 256,
 		};
 	}
-	KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, resources, 2), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, resources, 3), 0);
 	KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, resources, 1), -EINVAL);
 	for (variant = 0; variant < 9; variant++) {
-		struct ane_h16_resource bad[2];
+		struct ane_h16_resource bad[3];
 
 		memcpy(bad, resources, sizeof(bad));
 		switch (variant) {
@@ -289,7 +292,8 @@ static void resources_test(struct kunit *test)
 			bad[0].buffer.mapping_dva = U64_MAX - SZ_16K + 1;
 			break;
 		case 6:
-			bad[1].buffer.index = bad[0].buffer.index;
+			/* Same class and index: two inputs cannot share index 0. */
+			bad[2].buffer.index = bad[0].buffer.index;
 			break;
 		case 7:
 			bad[1].buffer.mapping_dva = bad[0].buffer.mapping_dva;
@@ -298,7 +302,7 @@ static void resources_test(struct kunit *test)
 			bad[0].buffer.mapping_size--;
 			break;
 		}
-		KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, bad, 2), -EINVAL);
+		KUNIT_EXPECT_EQ(test, ane_h16_resources_validate(&hwx, bad, 3), -EINVAL);
 	}
 }
 

@@ -344,10 +344,11 @@ static void hwx_load_resources_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, resources[0].buffer.index, 0x1234);
 		mappings[1] = saved;
 	}
+	/* Indices are class-local, so input 0 and output 0 may coexist. */
 	bindings[1].index = bindings[0].index;
 	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
 					    bindings, 2, resources);
-	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
 	bindings[1].index++;
 	bindings[1].class = 8;
 	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
