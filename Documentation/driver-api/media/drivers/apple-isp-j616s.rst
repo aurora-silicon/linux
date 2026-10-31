@@ -41,6 +41,45 @@ firmware-derived output modes still need capture validation on 26.6.2.
 Only our source and synthetic protocol tests are included; no Apple binary,
 setfile contents, calibration table or firmware image is added.
 
+Sensor tuning and noise reduction
+---------------------------------
+
+NV12 setup loads model-wide sensor tuning using ``CH_SET_FILE_LOAD``
+(0x0111). T8140/IMX558 selects ``apple/isp_1925_03XX.dat``; T6040/IMX958
+selects ``apple/isp_2224_01XX.dat``. The T6040 lens-shading fixup is applied
+only to the copied firmware buffer. A missing file allows streaming with a
+warning. An invalid file, interrupted read or failed firmware upload fails
+stream setup instead of silently continuing. A debug message identifies a
+successful upload without dumping its contents.
+
+The NV12 command sequence already sends ``CH_CNR_START`` (0x0a2f),
+``CH_MBNR_ENABLE`` (0x0a3a, use case 0, mode 1, chroma enabled),
+``APPLE_CH_TEMPORAL_FILTER_START`` (0xc100),
+``APPLE_CH_MOTION_HISTORY_START`` (0xc102) and
+``APPLE_CH_TEMPORAL_FILTER_ENABLE`` (0xc113). The temporal-start record has
+one fixed argument of 1 and another supplied by ``apple,temporal-filter``
+(default 0; J700 supplies 1). The latter's meaning is not established here;
+it must not be treated as a boolean enable or an output-pool count.
+Command submission alone does not establish equivalence to a host-side
+motion-compensated filter or measure the firmware's resulting noise reduction.
+
+The P010 preview still uses its qualified minimal sequence, which skips
+these explicit NR commands and setfile upload. An earlier NV12 stream may
+have left tuning in the resident firmware. Compare cold-boot P010 with
+NV12-to-P010 transitions when assessing image quality.
+
+Sensor setfiles are distinct from individual camera-module factory
+calibration (iCCl). The driver has no iCCl parser, serial binding or upload
+command. The installer preserves raw factory records in the local fallback
+archive; this does not mean the ISP consumes them. No factory record or
+vendor payload belongs in the kernel source or a distributed firmware package.
+
+The separate ANE video denoiser is not implemented. The board parameter facts
+are auto mode 2, total-gain entry/exit thresholds 2304/1792 on J700 and
+3584/2816 on J616s, an FPS threshold of 30 and a 30-frame ramp-down. The FPS
+comparison direction, gain units and ANE/ISP interchange need a confirmed
+interface before implementation.
+
 Public source audit
 -------------------
 
