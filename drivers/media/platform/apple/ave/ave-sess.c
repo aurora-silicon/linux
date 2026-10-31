@@ -48,9 +48,6 @@
 #define AVE_SHDR_ENTRY_BYTES 0x400
 #define AVE_CODED_MIN 0x3c000
 
-/* H.264 per-frame buffer (Process +0x58c8): unused in bit-rate modes */
-#define AVE_H264_FRAME_BUF SZ_16K
-
 /* Level limits: max frame size, max rate, max bit rate (kbit/s, Main). */
 struct ave_level {
 	u32 max_fs;
@@ -276,7 +273,10 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	if (fw->counted && p->rc_mode == 3)
 		for (unsigned int i = 0; i < 2; i++)
 			ave_req(r, &n, &sess->mb_extra[i], ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
-	ave_req(r, &n, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), 0, nomap);
+	/* HEVC: one 0x180-byte neighbour record per 64 pixels, at least 16 KiB. */
+	ave_req(r, &n, &sess->row_a,
+		ALIGN(hevc ? max_t(u32, 0x180 * DIV_ROUND_UP(w, 64), SZ_16K) : 256 * w16, SZ_16K),
+		0, nomap);
 	ave_req(r, &n, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0, nomap);
 	ave_req(r, &n, &sess->fixed, SZ_16K, 0, nomap);
 	for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
@@ -297,7 +297,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 					ALIGN(432 * p->mbs, SZ_16K), 0, nomap);
 		} else {
 			ave_req(r, &n, &sess->slot[s].aux,
-				hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0,
+				hevc ? AVE_SHDR_BYTES : ALIGN(432 * p->mbs, SZ_16K), 0,
 				hevc ? 0 : nomap);
 		}
 	}
