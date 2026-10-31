@@ -1,0 +1,371 @@
+{
+  "schema_version": 1,
+  "score_source": "https://lore.kernel.org/linux-media/20261020-avd-v3-0-85cbaa2125d8@icloud.com/",
+  "catalogue_revision": "5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0",
+  "notes": [
+    "Public upstream scores, not measurements of this driver.",
+    "Marks annotate raw results; no marked vector is skipped or removed from a denominator.",
+    "The hardware-unsupported list is incomplete. Unmarked means unclassified, not supported.",
+    "4:4:4, 12-bit, monochrome AV1 and P210 capture are implementation limits, not claims about physical hardware."
+  ],
+  "suites": {
+    "JVT-AVC_V1": {
+      "passed": 77,
+      "total": 135,
+      "catalogue_sha256": "602cb6495b77514d11812c9a957682dc583172b24524ea29bc83bfa1d5803bb0"
+    },
+    "JVT-FR-EXT": {
+      "passed": 42,
+      "total": 69,
+      "catalogue_sha256": "4adeeb82abbc258c7f7247f1bcf7e9d70788bf0ea28ee209e498ab9c31746a51"
+    },
+    "VP9-TEST-VECTORS": {
+      "passed": 216,
+      "total": 305,
+      "catalogue_sha256": "37f79fb4b3c529f54f8f54b0e36040b410d75a2bf71d022f9726e5545bd129b0"
+    },
+    "VP9-TEST-VECTORS-HIGH": {
+      "passed": 1,
+      "total": 6,
+      "catalogue_sha256": "0f0bbd89d3001522d8aa7b86f3a0c1b5ed3d323767a22ed4d504e1b67c4d2df5"
+    },
+    "JCT-VC-HEVC_V1": {
+      "passed": 145,
+      "total": 147,
+      "catalogue_sha256": "778c3cf8724b7f3a9f9ad59d4633531f110e3d660d27f47721b96e148224d04f"
+    },
+    "AV1-TEST-VECTORS": {
+      "passed": 238,
+      "total": 242,
+      "catalogue_sha256": "4ed6a2dcd63b1abaac88636a66df8bc1f062e325cb72dbc853c82175196286d9"
+    }
+  },
+  "vector_marks": {
+    "JVT-FR-EXT/Hi422FR13_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FR14_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FR15_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FR6_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FR7_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FR8_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FR9_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FREXT16_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FREXT17_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FREXT18_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "JVT-FR-EXT/Hi422FREXT19_SONY_A": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/h.264/JVT-FR-EXT.json"
+      }
+    },
+    "VP9-TEST-VECTORS/vp91-2-04-yuv444.webm": {
+      "marks": [
+        "driver-unsupported: 4:4:4"
+      ],
+      "evidence": {
+        "output_format": "yuv444p",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/vp9/VP9-TEST-VECTORS.json"
+      }
+    },
+    "VP9-TEST-VECTORS-HIGH/vp92-2-20-12bit-yuv420.webm": {
+      "marks": [
+        "driver-unsupported: 12-bit"
+      ],
+      "evidence": {
+        "output_format": "yuv420p12le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/vp9/VP9-TEST-VECTORS-HIGH.json"
+      }
+    },
+    "VP9-TEST-VECTORS-HIGH/vp93-2-20-10bit-yuv422.webm": {
+      "marks": [
+        "driver-unsupported: P210 capture format is not exposed"
+      ],
+      "evidence": {
+        "output_format": "yuv422p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/vp9/VP9-TEST-VECTORS-HIGH.json"
+      }
+    },
+    "VP9-TEST-VECTORS-HIGH/vp93-2-20-12bit-yuv422.webm": {
+      "marks": [
+        "driver-unsupported: 12-bit"
+      ],
+      "evidence": {
+        "output_format": "yuv422p12le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/vp9/VP9-TEST-VECTORS-HIGH.json"
+      }
+    },
+    "VP9-TEST-VECTORS-HIGH/vp93-2-20-10bit-yuv444.webm": {
+      "marks": [
+        "driver-unsupported: 4:4:4"
+      ],
+      "evidence": {
+        "output_format": "yuv444p10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/vp9/VP9-TEST-VECTORS-HIGH.json"
+      }
+    },
+    "VP9-TEST-VECTORS-HIGH/vp93-2-20-12bit-yuv444.webm": {
+      "marks": [
+        "driver-unsupported: 4:4:4",
+        "driver-unsupported: 12-bit"
+      ],
+      "evidence": {
+        "output_format": "yuv444p12le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/vp9/VP9-TEST-VECTORS-HIGH.json"
+      }
+    },
+    "AV1-TEST-VECTORS/av1-1-b10-24-monochrome": {
+      "marks": [
+        "driver-unsupported: AV1 monochrome"
+      ],
+      "evidence": {
+        "output_format": "gray10le",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/av1/AV1-TEST-VECTORS.json"
+      }
+    },
+    "AV1-TEST-VECTORS/av1-1-b8-24-monochrome": {
+      "marks": [
+        "driver-unsupported: AV1 monochrome"
+      ],
+      "evidence": {
+        "output_format": "gray",
+        "source": "https://github.com/fluendo/fluster/blob/5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0/test_suites/av1/AV1-TEST-VECTORS.json"
+      }
+    },
+    "JVT-AVC_V1/cabac_mot_fld0_full": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/cabac_mot_fld0_full.zip",
+        "archive_md5": "14fc0427e00bfeb617b9ce9213833a55",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/cabac_mot_mbaff0_full": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/cabac_mot_mbaff0_full.zip",
+        "archive_md5": "c2abf195c9a792757643f52bb2ddc220",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 1
+      }
+    },
+    "JVT-AVC_V1/cabac_mot_picaff0_full": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/cabac_mot_picaff0_full.zip",
+        "archive_md5": "c003d30c0f2313349b2723d482cb3831",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/CAMP_MOT_MBAFF_L30": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/CAMP_MOT_MBAFF_L30.zip",
+        "archive_md5": "6f03e6e0fbb4e89ce8c6ddb62804f58b",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 1
+      }
+    },
+    "JVT-AVC_V1/CAMP_MOT_MBAFF_L31": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/CAMP_MOT_MBAFF_L31.zip",
+        "archive_md5": "58875831f97a414bde478a15cac5c595",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 1
+      }
+    },
+    "JVT-AVC_V1/cavlc_mot_fld0_full_B": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/cavlc_mot_fld0_full_B.zip",
+        "archive_md5": "3991b434ca939b8c4b638724dd8af77b",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/cavlc_mot_mbaff0_full_B": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/cavlc_mot_mbaff0_full_B.zip",
+        "archive_md5": "ce6a2e2ed9d0ab5d3094ad7cf8f41b4f",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 1
+      }
+    },
+    "JVT-AVC_V1/cavlc_mot_picaff0_full_B": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/cavlc_mot_picaff0_full_B.zip",
+        "archive_md5": "4373f1bdde46f56ca1a35a837a000923",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/CVMP_MOT_FLD_L30_B": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/CVMP_MOT_FLD_L30_B.zip",
+        "archive_md5": "b77be505335f504b854a0c6b8e3e1974",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/Sharp_MP_Field_1_B": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/Sharp_MP_Field_1_B.zip",
+        "archive_md5": "b1095ff29ad6a3feeef73e20757c3f76",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/Sharp_MP_Field_2_B": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/Sharp_MP_Field_2_B.zip",
+        "archive_md5": "b992383697fd0e34de9f374dc661443e",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/Sharp_MP_Field_3_B": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/Sharp_MP_Field_3_B.zip",
+        "archive_md5": "3f26557fda6e85e7e0f04f4b926ed800",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/Sharp_MP_PAFF_1r2": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/Sharp_MP_PAFF_1r2.zip",
+        "archive_md5": "1422bbedf0c98ceb703d6ca514260783",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    },
+    "JVT-AVC_V1/Sharp_MP_PAFF_2r": {
+      "marks": [
+        "hw-unsupported: H.264 interlace"
+      ],
+      "evidence": {
+        "source": "https://www.itu.int/wftp3/av-arch/jvt-site/draft_conformance/AVCv1/Sharp_MP_PAFF_2r.zip",
+        "archive_md5": "b9a2f52d0fc6c45e8040dc5bf654826f",
+        "frame_mbs_only_flag": 0,
+        "mb_adaptive_frame_field_flag": 0
+      }
+    }
+  }
+}

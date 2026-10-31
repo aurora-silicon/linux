@@ -18,6 +18,7 @@
 #include <media/videobuf2-dma-contig.h>
 
 #include "avd.h"
+#include "avd-validate.h"
 
 static bool avd_image_fmt_match(enum avd_image_fmt fmt1,
 				enum avd_image_fmt fmt2)
@@ -111,12 +112,74 @@ void avd_reset_decoded_fmt(struct avd_ctx *ctx)
 	avd_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp);
 }
 
+static const char *avd_ctrl_unsupported(struct v4l2_ctrl *ctrl, bool current)
+{
+	union v4l2_ctrl_ptr p = current ? ctrl->p_cur : ctrl->p_new;
+
+	switch (ctrl->id) {
+	case V4L2_CID_STATELESS_H264_SPS:
+		return avd_validate_h264_sps(p.p_h264_sps);
+	case V4L2_CID_STATELESS_H264_PPS:
+		return avd_validate_h264_pps(p.p_h264_pps);
+	case V4L2_CID_STATELESS_H264_DECODE_PARAMS:
+		return avd_validate_h264_decode(p.p_h264_decode_params);
+	case V4L2_CID_STATELESS_HEVC_SPS:
+		return avd_validate_hevc_sps(p.p_hevc_sps);
+	case V4L2_CID_STATELESS_VP9_FRAME:
+		return avd_validate_vp9(p.p_vp9_frame);
+	case V4L2_CID_STATELESS_AV1_SEQUENCE:
+		return avd_validate_av1_sequence(p.p_av1_sequence);
+	default:
+		return NULL;
+	}
+}
+
+/* Check the effective request, including controls inherited from earlier jobs. */
+int avd_validate_request(struct avd_ctx *ctx)
+{
+	const struct avd_ctrls *ctrls = ctx->coded_fmt_desc->ctrls;
+	unsigned int i;
+
+	for (i = 0; i < ctrls->num_ctrls; i++) {
+		struct v4l2_ctrl *ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, ctrls->ctrls[i].cfg.id);
+		const char *reason;
+
+		if (!ctrl)
+			return -EINVAL;
+		reason = avd_ctrl_unsupported(ctrl, true);
+		if (!reason && ctrl->id == V4L2_CID_STATELESS_AV1_FRAME) {
+			const struct v4l2_ctrl_av1_frame *frame = ctrl->p_cur.p_av1_frame;
+			u32 payload;
+			struct v4l2_ctrl *tiles = v4l2_ctrl_find(&ctx->ctrl_hdl,
+						V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY);
+			struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+
+			if (!tiles || !src)
+				return -EINVAL;
+			payload = vb2_get_plane_payload(&src->vb2_buf, 0);
+			reason = avd_validate_av1_tiles(&frame->tile_info,
+							tiles->p_cur.p_av1_tile_group_entry,
+							tiles->elems, payload);
+		}
+		if (reason) {
+			dev_err_ratelimited(ctx->dev->dev, "%s\n", reason);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 static int avd_try_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct avd_ctx *ctx =
 		container_of(ctrl->handler, struct avd_ctx, ctrl_hdl);
 	const struct avd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
+	const char *reason = avd_ctrl_unsupported(ctrl, false);
 
+	if (reason) {
+		dev_err_ratelimited(ctx->dev->dev, "%s\n", reason);
+		return -EINVAL;
+	}
 	if (desc->ops->try_ctrl)
 		return desc->ops->try_ctrl(ctx, ctrl);
 
@@ -233,6 +296,7 @@ static const struct avd_decoded_fmt_desc avd_hevc_decoded_fmts[] = {
 static const struct avd_ctrl_desc avd_h264_ctrl_descs[] = {
 	{
 		.cfg.id = V4L2_CID_STATELESS_H264_DECODE_PARAMS,
+		.cfg.ops = &avd_ctrl_ops,
 	},
 	{
 		.cfg.id = V4L2_CID_STATELESS_H264_SPS,
@@ -988,7 +1052,6 @@ void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result)
 
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 {
-	struct media_request *src_req;
 	struct avd_decoded_buffer *dst;
 
 	memset(run, 0, sizeof(*run));
@@ -1009,20 +1072,12 @@ void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 	dst = vb2_to_avd_decoded_buf(&run->bufs.dst->vb2_buf);
 	memcpy(&dst->comp, &ctx->comp, sizeof(ctx->comp));
 
-	/* Apply request(s) controls if needed. */
-	src_req = run->bufs.src->vb2_buf.req_obj.req;
-	if (src_req)
-		v4l2_ctrl_request_setup(src_req, &ctx->ctrl_hdl);
-
 	v4l2_m2m_buf_copy_metadata(run->bufs.src, run->bufs.dst);
 }
 
 void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run)
 {
-	struct media_request *src_req = run->bufs.src->vb2_buf.req_obj.req;
-
-	if (src_req)
-		v4l2_ctrl_request_complete(src_req, &ctx->ctrl_hdl);
+	/* Request controls remain owned by the frame until core retirement. */
 }
 
 static int avd_add_ctrls(struct avd_ctx *ctx, const struct avd_ctrls *ctrls)

@@ -15,6 +15,24 @@ int main(void)
 	u32 rng = 0x3851, old_tag[AVD_MAX_FRAMES] = {};
 	unsigned int i, step, completed = 0;
 
+	/* Mixed clients: recovery preserves DONE results and unsubmitted work. */
+	for (i = AVD_FRAME_FREE; i <= AVD_FRAME_DONE; i++) {
+		struct avd_frame f = { .state = i, .tag = 0x123, .status = 0 };
+
+		avd_slot_reset(&f, -ETIMEDOUT, false, 100);
+		assert(f.tag == 0x123);
+		if (i == AVD_FRAME_SUBMITTED) {
+			assert(f.state == AVD_FRAME_DONE && f.status == -ETIMEDOUT);
+			assert(!avd_slot_complete(&f, f.tag, 0));
+		} else {
+			assert(f.state == i && !f.status);
+		}
+		if (i == AVD_FRAME_RESERVED) {
+			assert(f.deadline == 100);
+			avd_slot_reset(&f, -EIO, true, 0);
+			assert(f.state == AVD_FRAME_DONE && f.status == -EIO);
+		}
+	}
 	for (i = 0; i < AVD_MAX_FRAMES; i++)
 		pool[i].idx = i;
 	for (step = 0; step < 100000; step++) {
