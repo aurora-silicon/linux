@@ -550,6 +550,8 @@ struct apple_dcp {
 	bool output_pq;
 	bool output_edr;
 	bool edr_sent;
+	/* EDR swaps have asked for the panel at its peak (see dcp_edr_prepare()) */
+	bool edr_boosted;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
