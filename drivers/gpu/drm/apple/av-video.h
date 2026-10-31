@@ -10,14 +10,16 @@
 
 /* One fixed dictionary: Type string and the 24-byte CTA Type 1 body. */
 #define DCP_HDR_DATA_SIZE 24
-#define DCP_HDR_OBJECT_SIZE 68
+#define DCP_HDR_TYPE "CEA-861:Type1"
+#define DCP_HDR_DATA_OFFSET 48
+#define DCP_HDR_OBJECT_SIZE (DCP_HDR_DATA_OFFSET + DCP_HDR_DATA_SIZE)
 #define DCP_HDR_MESSAGE_SIZE (0x60 + DCP_HDR_OBJECT_SIZE)
 
 static inline int dcp_hdr_encode(u8 object[DCP_HDR_OBJECT_SIZE],
 				 const struct hdr_output_metadata *metadata)
 {
 	const struct hdr_metadata_infoframe *hdr = &metadata->hdmi_metadata_type1;
-	u8 *data = object + 44;
+	u8 *data = object + DCP_HDR_DATA_OFFSET;
 	unsigned int i;
 
 	if (metadata->metadata_type || hdr->metadata_type)
@@ -29,12 +31,13 @@ static inline int dcp_hdr_encode(u8 object[DCP_HDR_OBJECT_SIZE],
 	put_unaligned_le32(0x81000002, object + 4);
 	put_unaligned_le32(0x09000004, object + 8);
 	memcpy(object + 12, "Type", 4);
-	put_unaligned_le32(0x0900000c, object + 16);
-	memcpy(object + 20, "CEA-861:Type1", 12);
-	put_unaligned_le32(0x09000004, object + 32);
-	memcpy(object + 36, "Data", 4);
+	put_unaligned_le32(0x09000000 | (sizeof(DCP_HDR_TYPE) - 1), object + 16);
+	memcpy(object + 20, DCP_HDR_TYPE, sizeof(DCP_HDR_TYPE) - 1);
+	/* The 13-byte Type string is padded to the next 32-bit tag. */
+	put_unaligned_le32(0x09000004, object + 36);
+	memcpy(object + 40, "Data", 4);
 	/* The blob is the dictionary's last value. */
-	put_unaligned_le32(0x8a000018, object + 40);
+	put_unaligned_le32(0x8a000018, object + 44);
 	for (i = 0; i < 3; i++) {
 		put_unaligned_le16(hdr->display_primaries[i].x, data + i * 4);
 		put_unaligned_le16(hdr->display_primaries[i].y, data + i * 4 + 2);

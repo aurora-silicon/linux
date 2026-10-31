@@ -20,7 +20,8 @@ static void av_hdr_object_test(struct kunit *test)
 	static const u8 expected[] = {
 		0xd3, 0, 0, 0, 2, 0, 0, 0x81,
 		4, 0, 0, 9, 'T', 'y', 'p', 'e',
-		12, 0, 0, 9, 'C', 'E', 'A', '-', '8', '6', '1', ':', 'T', 'y', 'p', '1',
+		13, 0, 0, 9, 'C', 'E', 'A', '-', '8', '6', '1', ':', 'T', 'y', 'p', 'e', '1',
+		0, 0, 0,
 		4, 0, 0, 9, 'D', 'a', 't', 'a',
 		24, 0, 0, 0x8a,
 		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
@@ -53,15 +54,15 @@ static void av_hdr_envelope_test(struct kunit *test)
 	/* Independent golden envelope, including every reserved byte. */
 	expected[2] = 1;
 	expected[4] = 0x15;
-	expected[8] = 0x64;
+	expected[8] = 0x68;
 	expected[12] = 0x78;
 	expected[13] = 0x63;
 	expected[14] = 0x70;
 	expected[15] = 0x69;
-	expected[0x50] = 68;
+	expected[0x50] = 72;
 	KUNIT_ASSERT_EQ(test, dcp_hdr_message(message, &metadata), 0);
 	KUNIT_EXPECT_MEMEQ(test, message, expected, 0x60);
-	KUNIT_EXPECT_EQ(test, sizeof(message), (size_t)164);
+	KUNIT_EXPECT_EQ(test, sizeof(message), (size_t)168);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(message + 0x60), (u32)0xd3);
 	KUNIT_EXPECT_EQ(test, message[sizeof(message) - 1], (u8)24);
 }
