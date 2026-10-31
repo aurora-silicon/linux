@@ -364,12 +364,16 @@ static netdev_tx_t brcmf_netdev_start_xmit(struct sk_buff *skb,
 	int head_delta;
 	unsigned int hdrlen = drvr->hdrlen;
 	unsigned int tx_bytes = skb->len;
+	enum brcmf_bus_state bus_state = READ_ONCE(drvr->bus_if->state);
 
 	brcmf_dbg(DATA, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
 
 	/* Can the device send data? */
-	if (drvr->bus_if->state != BRCMF_BUS_UP) {
-		bphy_err(drvr, "xmit rejected state=%d\n", drvr->bus_if->state);
+	if (bus_state != BRCMF_BUS_UP) {
+		if (bus_state == BRCMF_BUS_SLEEP)
+			brcmf_dbg(DATA, "xmit rejected during suspend\n");
+		else
+			bphy_err(drvr, "xmit rejected state=%d\n", bus_state);
 		netif_stop_queue(ndev);
 		dev_kfree_skb(skb);
 		ret = -ENODEV;
@@ -1779,4 +1783,3 @@ void __exit brcmf_core_exit(void)
 	brcmf_usb_exit();
 	brcmf_pcie_exit();
 }
-

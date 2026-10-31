@@ -44,7 +44,8 @@ enum brcmf_fwvendor {
 /* The level of bus communication with the dongle */
 enum brcmf_bus_state {
 	BRCMF_BUS_DOWN,		/* Not ready for frame transfers */
-	BRCMF_BUS_UP		/* Ready for frame transfers */
+	BRCMF_BUS_UP,		/* Ready for frame transfers */
+	BRCMF_BUS_SLEEP		/* System suspend, no frame transfers */
 };
 
 /* The level of bus communication with the dongle */
