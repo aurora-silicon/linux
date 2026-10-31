@@ -900,7 +900,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	src->drv_priv = ctx;
 	src->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	src->ops = &ave_qops;
-	src->mem_ops = &vb2_dma_contig_memops;
+	src->mem_ops = &ave_vb2_memops;
 	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src->lock = &ctx->ave->vdev_lock;
 	src->dev = ctx->ave->dev;
@@ -984,6 +984,8 @@ static bool ave_deliver(struct ave_ctx *ctx)
 			dst->flags |= V4L2_BUF_FLAG_LAST;
 			last = true;
 		}
+		ave_vb2_put(s->input_mem);
+		s->input_mem = NULL;
 		v4l2_m2m_buf_done(s->src, state);
 		s->src = NULL;
 		v4l2_m2m_buf_done(dst, state);
