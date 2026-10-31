@@ -24,6 +24,22 @@ Compressed Formats
     * - Identifier
       - Code
       - Details
+    * .. _V4L2-PIX-FMT-PRORES:
+
+      - ``V4L2_PIX_FMT_PRORES``
+      - 'PRES'
+      - One complete ProRes frame per data-bearing buffer, including the
+        four-byte big-endian frame length, 'icpf' signature, frame header and
+        all picture and slice data. The frame length includes the initial
+        eight bytes and equals the payload length. An interlaced frame
+        contains both field pictures. Container headers and private hardware
+        descriptors are not included. ProRes RAW is not covered.
+        The multi-planar API uses one memory plane; its payload begins at
+        ``data_offset`` and has length ``bytesused - data_offset``.
+        Empty end-of-stream buffers follow the normal codec-interface rules.
+        The encoder profile is selected using
+        ``V4L2_CID_MPEG_VIDEO_PRORES_PROFILE``. This format requires complete
+        frames and must not use ``V4L2_FMT_FLAG_CONTINUOUS_BYTESTREAM``.
     * .. _V4L2-PIX-FMT-JPEG:
 
       - ``V4L2_PIX_FMT_JPEG``
