@@ -112,14 +112,16 @@ struct apple_qspi_board {
 
 #define APPLE_QSPI_JEDEC_W25Q64		{ 0xef, 0x65, 0x17 }
 #define APPLE_QSPI_JEDEC_W25Q16		{ 0xef, 0x65, 0x15 }
+#define APPLE_QSPI_JEDEC_MX_2B27	{ 0xc2, 0x2b, 0x27 }
 
 static const struct apple_qspi_board apple_qspi_boards[] = {
 	{ "apple,t8122-qspi", "apple,j613", 0x2a1118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	{ "apple,t8132-qspi", "apple,j713", 0x3ad118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	/* Macronix; the ID macOS reports for the J616s boot NOR. */
 	{ "apple,t6041-qspi", "apple,j616s", 0x429118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_MX_2B27, 0 },
 	/* iBoot leaves BP0 set on the J700, over the top 64 KiB. */
 	{ "apple,t8140-qspi", "apple,j700", 0x385110000ULL,
 	  0x24000, 0x1d0000, APPLE_QSPI_JEDEC_W25Q16, 0x1c },
@@ -664,12 +666,24 @@ static int apple_qspi_read_array(struct spi_mem *mem, u64 addr, u8 *buf, u32 len
 	return apple_qspi_transfer_op(mem, &op);
 }
 
-static int apple_qspi_status(struct spi_mem *mem, u8 sr[3])
+/*
+ * Winbond parts have three status registers (05h, 35h, 15h). On Macronix
+ * parts 35h is EQIO, which switches the flash to QPI mode, so only the
+ * status (05h) and configuration (15h) registers are read there.
+ */
+static int apple_qspi_status(struct spi_mem *mem, u8 mfr, u8 sr[3])
 {
-	static const u8 opcode[] = { 0x05, 0x35, 0x15 };
-	int i, ret;
+	static const u8 winbond[] = { 0x05, 0x35, 0x15 };
+	static const u8 macronix[] = { 0x05, 0x15 };
+	const u8 *opcode = winbond;
+	int i, n = ARRAY_SIZE(winbond), ret;
 
-	for (i = 0; i < 3; i++) {
+	if (mfr == APPLE_QSPI_MFR_MACRONIX) {
+		opcode = macronix;
+		n = ARRAY_SIZE(macronix);
+	}
+	sr[2] = 0;
+	for (i = 0; i < n; i++) {
 		ret = apple_qspi_read_register(mem, opcode[i], &sr[i], 1);
 		if (ret)
 			return ret;
@@ -697,11 +711,13 @@ static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op 
 		ret = -ENODEV;
 		goto out;
 	}
-	ret = apple_qspi_status(mem, before);
+	ret = apple_qspi_status(mem, id[0], before);
 	if (ret)
 		goto out;
 	/* No unlocking. Conservatively refuse BP/CMP/WPS, BUSY/WEL or suspend. */
-	if (!apple_qspi_status_allows_write(before[0], before[1], before[2],
+	if (id[0] == APPLE_QSPI_MFR_MACRONIX ?
+	    !apple_qspi_mx_status_allows_write(before[0], qspi->bp_ok) :
+	    !apple_qspi_status_allows_write(before[0], before[1], before[2],
 					    qspi->bp_ok)) {
 		ret = -EACCES;
 		goto out;
@@ -755,7 +771,7 @@ static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op 
 	ret = apple_qspi_command(mem, 0x04);
 	if (ret)
 		goto fault;
-	ret = apple_qspi_status(mem, after);
+	ret = apple_qspi_status(mem, id[0], after);
 	if (ret)
 		goto fault;
 	if (memcmp(before, after, sizeof(before))) {
@@ -804,6 +820,12 @@ static int apple_qspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	if (!apple_qspi_supports_op(mem, op) || apple_qspi_shape_op(op, &shape))
 		return -EOPNOTSUPP;
 	mutex_lock(&apple_qspi_policy_lock);
+	/* 35h is EQIO, not a register read, on Macronix parts. */
+	if (op->cmd.opcode == 0x35 &&
+	    qspi->jedec[0] == APPLE_QSPI_MFR_MACRONIX) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	if (op->data.dir == SPI_MEM_DATA_IN && op->data.nbytes &&
 	    apple_qspi_opcode_is_read(op->cmd.opcode)) {
 		ret = apple_qspi_transfer_op(mem, op);
@@ -1043,15 +1065,24 @@ static int apple_qspi_match_cs0(struct device *dev, const void *unused)
 		!spi_get_chipselect(to_spi_device(dev), 0);
 }
 
+static int apple_qspi_flash_read_reg(struct spi_mem *mem, u8 opcode,
+				     u8 *buf, unsigned int len)
+{
+	struct spi_mem_op op = SPI_MEM_OP(SPI_MEM_OP_CMD(opcode, 1),
+		SPI_MEM_OP_NO_ADDR, SPI_MEM_OP_NO_DUMMY,
+		SPI_MEM_OP_DATA_IN(len, buf, 1));
+
+	return spi_mem_exec_op(mem, &op);
+}
+
 static ssize_t flash_status_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	static const u8 opcodes[] = { 0x9f, 0x05, 0x35, 0x15 };
 	struct spi_controller *ctlr = dev_get_drvdata(dev);
 	struct spi_mem mem = { };
 	struct device *child;
 	u8 *data;
-	int i, ret;
+	int ret;
 
 	child = device_find_child(&ctlr->dev, NULL, apple_qspi_match_cs0);
 	if (!child)
@@ -1065,18 +1096,34 @@ static ssize_t flash_status_show(struct device *dev,
 
 	/* spi-mem supplies queue, bus and I/O serialization for each read.
 	 * These are sequential samples, not an atomic protection snapshot.
+	 * The JEDEC ID decides which registers exist: 35h is SR2 on Winbond
+	 * parts but EQIO on Macronix ones, so it is sent to Winbond only.
 	 */
-	for (i = 0; i < ARRAY_SIZE(opcodes); i++) {
-		struct spi_mem_op op = SPI_MEM_OP(SPI_MEM_OP_CMD(opcodes[i], 1),
-			SPI_MEM_OP_NO_ADDR, SPI_MEM_OP_NO_DUMMY,
-			SPI_MEM_OP_DATA_IN(i ? 1 : 3, data + (i ? i + 2 : 0), 1));
-
-		ret = spi_mem_exec_op(&mem, &op);
-		if (ret)
-			goto out_free;
+	ret = apple_qspi_flash_read_reg(&mem, 0x9f, data, 3) ?:
+	      apple_qspi_flash_read_reg(&mem, 0x05, data + 3, 1);
+	if (ret)
+		goto out_free;
+	switch (data[0]) {
+	case 0xef:
+		ret = apple_qspi_flash_read_reg(&mem, 0x35, data + 4, 1) ?:
+		      apple_qspi_flash_read_reg(&mem, 0x15, data + 5, 1);
+		if (!ret)
+			ret = sysfs_emit(buf, "jedec=%02x%02x%02x sr1=%02x sr2=%02x sr3=%02x\n",
+					 data[0], data[1], data[2], data[3],
+					 data[4], data[5]);
+		break;
+	case APPLE_QSPI_MFR_MACRONIX:
+		ret = apple_qspi_flash_read_reg(&mem, 0x15, data + 4, 1);
+		if (!ret)
+			ret = sysfs_emit(buf, "jedec=%02x%02x%02x sr=%02x cr=%02x\n",
+					 data[0], data[1], data[2], data[3],
+					 data[4]);
+		break;
+	default:
+		ret = sysfs_emit(buf, "jedec=%02x%02x%02x sr1=%02x\n",
+				 data[0], data[1], data[2], data[3]);
+		break;
 	}
-	ret = sysfs_emit(buf, "jedec=%02x%02x%02x sr1=%02x sr2=%02x sr3=%02x\n",
-			 data[0], data[1], data[2], data[3], data[4], data[5]);
 out_free:
 	kfree(data);
 out_put:

@@ -157,6 +157,24 @@ static void qspi_policy_status(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_qspi_status_allows_write(0, 0, 0x04, 0x1c));
 }
 
+static void qspi_policy_mx_status(struct kunit *test)
+{
+	/* The J616s Macronix part: no block protection is tolerated. */
+	KUNIT_EXPECT_TRUE(test, apple_qspi_mx_status_allows_write(0x00, 0));
+	/* QE and SRWD stay as found and do not block a write. */
+	KUNIT_EXPECT_TRUE(test, apple_qspi_mx_status_allows_write(0x40, 0));
+	KUNIT_EXPECT_TRUE(test, apple_qspi_mx_status_allows_write(0x80, 0));
+	/* WIP and WEL are never admitted. */
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mx_status_allows_write(0x01, 0x3c));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mx_status_allows_write(0x02, 0x3c));
+	/* Each of BP0 to BP3, including BP3 at bit 5, which Winbond calls TB. */
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mx_status_allows_write(0x04, 0));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mx_status_allows_write(0x08, 0));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mx_status_allows_write(0x10, 0));
+	KUNIT_EXPECT_FALSE(test, apple_qspi_mx_status_allows_write(0x20, 0));
+	KUNIT_EXPECT_TRUE(test, apple_qspi_mx_status_allows_write(0x3c, 0x3c));
+}
+
 static struct kunit_case apple_qspi_policy_cases[] = {
 	KUNIT_CASE(qspi_policy_write_enable),
 	KUNIT_CASE(qspi_policy_program),
@@ -166,6 +184,7 @@ static struct kunit_case apple_qspi_policy_cases[] = {
 	KUNIT_CASE(qspi_policy_empty),
 	KUNIT_CASE(qspi_policy_nvram_700000),
 	KUNIT_CASE(qspi_policy_status),
+	KUNIT_CASE(qspi_policy_mx_status),
 	{}
 };
 

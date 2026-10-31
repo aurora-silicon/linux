@@ -98,7 +98,7 @@ static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
  switch(o->cmd.opcode){
  case 0x9f:memcpy(o->data.buf.in,jedec,o->data.nbytes);break;
  case 0x05:*(u8*)o->data.buf.in=sr[0]|(stuck_busy&&programmed?1:0);break;
- case 0x35:*(u8*)o->data.buf.in=sr[1];break;
+ case 0x35:assert(jedec[0]!=0xc2);*(u8*)o->data.buf.in=sr[1];break;
  case 0x15:*(u8*)o->data.buf.in=sr[2];break;
  case 0x03:
   assert(o->addr.val+o->data.nbytes<=sizeof(flash));
@@ -152,7 +152,7 @@ int main(void){
  const struct apple_qspi_board *qb;
  struct device_node t6041={"apple,t6041-qspi"},t8140={"apple,t8140-qspi"};
  machine="apple,j616s";qb=apple_qspi_nvram_write_board(&t6041,0x429118000ULL);
- assert(qb&&qb->nvram_start==0x700000&&qb->nvram_size==0x100000&&!memcmp(qb->jedec,jedec,3)&&!qb->bp_ok);
+ assert(qb&&qb->nvram_start==0x700000&&qb->nvram_size==0x100000&&qb->jedec[0]==0xc2&&qb->jedec[1]==0x2b&&qb->jedec[2]==0x27&&!qb->bp_ok);
  machine="apple,j700";qb=apple_qspi_nvram_write_board(&t8140,0x385110000ULL);
  assert(qb&&qb->nvram_start==0x24000&&qb->nvram_size==0x1d0000&&qb->jedec[2]==0x15&&qb->bp_ok==0x1c);
  puts("PASS J613/J713/J700/J616s board, controller and full-width aperture qualification (140 combinations)");
@@ -223,6 +223,19 @@ int main(void){
   assert(sent(0x04)&&apple_qspi_set_read_only("N",&parameter)==-EPERM);denied(o);
  }
  puts("PASS read-only startup, exact opcode/range/page/erase admission, WREN ordering, readback and fault latch");
+ /* J616s Macronix part: 35h (EQIO there) never reaches the wire. */
+ reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;memcpy(q.jedec,jedec,3);arm();memset(data,0x55,sizeof(data));
+ o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&!sent(0x35)&&sent(0x15));
+ assert(!memcmp(flash+0x700000,data,256)&&!sr[0]);
+ erase.addr.val=0x701000;
+ wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20)&&!sent(0x35));
+ struct spi_mem_op rdcr2=SPI_MEM_OP(SPI_MEM_OP_CMD(0x35,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_DATA_IN(1,id,1));
+ wire_count=0;assert(apple_qspi_exec_op(&mem,&rdcr2)<0&&!wire_count);
+ for(unsigned int bp=0x04;bp<=0x20;bp<<=1){reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;memcpy(q.jedec,jedec,3);arm();
+  sr[0]=bp;wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x35));}
+ reset();memcpy(q.jedec,(u8[]){0xc2,0x2b,0x27},3);arm();wire_count=0;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
+ puts("PASS Macronix J616s part: no 35h on the wire, SR/CR checks, BP0-BP3 refusal and JEDEC mismatch");
  return 0;
 }
 '''
@@ -278,6 +291,9 @@ def main():
             ('j616s-partition', '"apple,j616s", 0x429118000ULL,\n\t  0x700000', '"apple,j616s", 0x429118000ULL,\n\t  0x680000'),
             ('range', 'addr >= start &&', 'addr >= 1 &&'),
             ('bp-ok', '!(sr1 & 0x1c & ~bp_ok)', '1'),
+            ('mx-bp3', '!(sr & 0x3c & ~bp_ok)', '!(sr & 0x1c & ~bp_ok)'),
+            ('mx-eqio', 'opcode = macronix;', 'opcode = winbond;'),
+            ('mx-eqio-read', 'qspi->jedec[0] == APPLE_QSPI_MFR_MACRONIX) {', '0) {'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;')]:
