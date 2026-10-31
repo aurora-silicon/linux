@@ -148,7 +148,8 @@ void av_video_atomic_modeset(struct apple_dcp *dcp, struct apple_connector *conn
 		live = connector->hdr_generation == link_generation;
 		equal = connector->hdr_valid && connector->hdr_dcp == dcp &&
 			connector->hdr_service_generation == service_generation &&
-			!memcmp(connector->hdr_data, message + 0x60 + DCP_HDR_DATA_OFFSET, DCP_HDR_DATA_SIZE);
+			!memcmp(connector->hdr_data, message + 0x60 + DCP_HDR_DATA_OFFSET,
+				DCP_HDR_DATA_SIZE);
 	}
 	if (!live || equal)
 		goto out;
@@ -164,7 +165,8 @@ void av_video_atomic_modeset(struct apple_dcp *dcp, struct apple_connector *conn
 	/* A teardown during the command must not validate a successor's cache. */
 	scoped_guard(spinlock, &connector->hdr_lock) {
 		if (connector->hdr_generation == link_generation) {
-			memcpy(connector->hdr_data, message + 0x60 + DCP_HDR_DATA_OFFSET, DCP_HDR_DATA_SIZE);
+			memcpy(connector->hdr_data, message + 0x60 + DCP_HDR_DATA_OFFSET,
+			       DCP_HDR_DATA_SIZE);
 			connector->hdr_dcp = dcp;
 			connector->hdr_service_generation = service_generation;
 			connector->hdr_valid = true;
