@@ -21,7 +21,7 @@ static void init_ctx(struct avd_ctx *ctx)
 	ctx->decomp=true;
 	ctx->ctrl_hdl[0]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_SEQUENCE,.p_cur.p=&sequence};
 	ctx->ctrl_hdl[1]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_FRAME,.p_cur.p=&params};
-	ctx->ctrl_hdl[2]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY,.p_cur.p=tiles,.elems=1};
+	ctx->ctrl_hdl[2]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY,.p_cur.p=tiles,.elems=V4L2_AV1_MAX_TILE_COUNT};
 	ctx->ctrl_hdl[3]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_FILM_GRAIN,.p_cur.p=&grain};
 	assert(avd_av1_start(ctx)==0);
 }
@@ -188,6 +188,7 @@ static void bounds_and_fp(void)
 	struct avd_ctx ctx;struct avd_buf fp={0},prog={0};
 	init_params();init_ctx(&ctx);
 	assert(!avd_av1_validate_tiles(&params,tiles,1,128));
+	assert(!avd_av1_validate_tiles(&params,tiles,V4L2_AV1_MAX_TILE_COUNT,128));
 	assert(avd_av1_validate_tiles(&params,tiles,0,128)==-EINVAL);
 	tiles[0].tile_offset=UINT32_MAX;
 	assert(avd_av1_validate_tiles(&params,tiles,1,128)==-EINVAL);

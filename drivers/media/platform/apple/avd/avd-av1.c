@@ -1560,6 +1560,9 @@ static int avd_av1_prepare(struct avd_ctx *ctx, struct avd_frame *f)
 				     vb2_get_plane_payload(&f->src->vb2_buf, 0));
 	if (ret)
 		goto fail;
+	/* The control is a fixed-capacity array; only the tile grid is work. */
+	run->num_tiles = run->frame->tile_info.tile_cols *
+		run->frame->tile_info.tile_rows;
 	/* The old builder has no film grain synthesis program. */
 	if (run->grain->flags & V4L2_AV1_FILM_GRAIN_FLAG_APPLY_GRAIN) {
 		ret = -EOPNOTSUPP;

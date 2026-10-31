@@ -41,7 +41,8 @@ int avd_av1_validate_tiles(const struct v4l2_ctrl_av1_frame *frame,
 		return -EINVAL;
 	n = info->tile_cols * info->tile_rows;
 	if (n > V4L2_AV1_MAX_TILE_COUNT || n > BORAGE_WORK_CAP ||
-	    count != n || info->context_update_tile_id >= n)
+	    count < n || count > V4L2_AV1_MAX_TILE_COUNT ||
+	    info->context_update_tile_id >= n)
 		return -EINVAL;
 	for (i = 0; i < n; i++) {
 		if (tiles[i].tile_row != i / info->tile_cols ||
