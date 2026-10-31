@@ -14,6 +14,9 @@
 #ifndef AVD_H_
 #define AVD_H_
 
+#include "avd-queue.h"
+#include "avd-av1-fp.h"
+
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
 #include <linux/iommu.h>
@@ -173,6 +176,7 @@ struct avd_coded_fmt_desc {
 	struct v4l2_frmsize_stepwise frmsize;
 	const struct avd_ctrls *ctrls;
 	const struct avd_coded_fmt_ops *ops;
+	const struct avd_codec_frame_ops *frame_ops;
 	unsigned int num_decoded_fmts;
 	const struct avd_decoded_fmt_desc *decoded_fmts;
 	u32 subsystem_flags;
@@ -180,6 +184,7 @@ struct avd_coded_fmt_desc {
 };
 
 struct avd_variant {
+	enum avd_av1_fp_layout av1_fp_layout;
 	unsigned int vp_slots[4];
 	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
@@ -306,6 +311,7 @@ extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_hevc_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_vp9_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_av1_fmt_ops;
+extern const struct avd_codec_frame_ops avd_av1_frame_ops;
 
 extern const struct v4l2_ctrl_ops avd_ctrl_ops;
 extern const struct v4l2_ioctl_ops avd_ioctl_ops;

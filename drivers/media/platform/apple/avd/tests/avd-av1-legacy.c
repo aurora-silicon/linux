@@ -1,0 +1,1060 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * Apple AVD VPU codec driver
+ *
+ * Copyright The Asahi Linux Contributors
+ * Copyright 2023 Eileen Yoon <eyn@gmx.com>
+ *
+ * Copyright (c) 2023, Collabora
+ *	Benjamin Gaignard <benjamin.gaignard@collabora.com>
+ *
+ * Copyright (c) 2014 Rockchip Electronics Co., Ltd.
+ *	Hertz Wong <hertz.wong@rock-chips.com>
+ *	Herman Chen <herman.chen@rock-chips.com>
+ *
+ * Copyright (C) 2014 Google, Inc.
+ *	Tomasz Figa <tfiga@chromium.org>
+ */
+
+#include <media/videobuf2-dma-contig.h>
+
+#include "avd.h"
+#include "avd-av1-entropymode.h"
+#include "avd-inst.h"
+
+/*
+ * This comes from
+ * verisilicon/rockchip_vpu981_hw_av1_dec.c
+ *
+ * These 3 values aren't defined enum v4l2_av1_segment_feature because
+ * they are not part of the specification
+ */
+#define V4L2_AV1_SEG_LVL_ALT_LF_Y_H	2
+#define V4L2_AV1_SEG_LVL_ALT_LF_U	3
+#define V4L2_AV1_SEG_LVL_ALT_LF_V	4
+
+#define DIV_LUT_BITS		8
+#define DIV_LUT_PREC_BITS	14
+#define WARPEDMODEL_PREC_BITS	16
+#define WARP_PARAM_REDUCE_BITS	6
+
+#define DIV_LUT_NUM	BIT(DIV_LUT_BITS)
+
+#define AV1_DIV_ROUND_UP_POW2(value, n)			\
+({							\
+	typeof(n) _n  = n;				\
+	typeof(value) _value = value;			\
+	(_value + (BIT(_n) >> 1)) >> _n;		\
+})
+
+#define AV1_DIV_ROUND_UP_POW2_SIGNED(value, n)				\
+({									\
+	typeof(n) _n_  = n;						\
+	typeof(value) _value_ = value;					\
+	(((_value_) < 0) ? -AV1_DIV_ROUND_UP_POW2(-(_value_), (_n_))	\
+		: AV1_DIV_ROUND_UP_POW2((_value_), (_n_)));		\
+})
+
+#define AV1_REF_SCALE_SHIFT	14
+#define SUPERRES_SCALE_BITS	14
+#define SUPERRES_EXTRA_BITS	8
+#define SUPERRES_SCALE_MASK	((1 << 14) - 1)
+
+#define AV1_CODEC_MODE_INTRABC(v)	FIELD_PREP(BIT(28), !!(v))
+
+#define AV1_HDR_JNT_COMP(v)		FIELD_PREP(BIT(0), !!(v))
+#define AV1_HDR_ORDER_HINT_BITS(v)	FIELD_PREP(GENMASK(3, 1), v)
+#define AV1_HDR_ORDER_HINT(v)		FIELD_PREP(BIT(4), !!(v))
+#define AV1_HDR_DUAL_FILTER(v)		FIELD_PREP(BIT(5), !!(v))
+#define AV1_HDR_MASKED_COMPOUND(v)	FIELD_PREP(BIT(6), !!(v))
+#define AV1_HDR_INTERINTRA_COMPOUND(v)	FIELD_PREP(BIT(7), !!(v))
+#define AV1_HDR_INTRA_EDGE_FILTER(v)	FIELD_PREP(BIT(8), !!(v))
+#define AV1_HDR_FILTER_INTRA(v)		FIELD_PREP(BIT(9), !!(v))
+#define AV1_HDR_128X128_SUPERBLOCK(v)	FIELD_PREP(BIT(10), !!(v))
+#define AV1_HDR_SCREEN_CONTENT_TOOLS(v)	FIELD_PREP(BIT(11), !!(v))
+
+#define AV1_FLAGS_TX_MODE_LARGEST(v)		FIELD_PREP(BIT(0), !!(v))
+#define AV1_FLAGS_TX_MODE_SELECT(v)		FIELD_PREP(BIT(1), !!(v))
+#define AV1_FLAGS_TX_REDUCED_SET(v)		FIELD_PREP(BIT(2), !!(v))
+#define AV1_FLAGS_ALLOW_WARPED_MOTION(v)	FIELD_PREP(BIT(3), !!(v))
+#define AV1_FLAGS_SKIP_MODE(v)			FIELD_PREP(BIT(4), !!(v))
+#define AV1_FLAGS_MOTION_IS_SWITCHABLE(v)	FIELD_PREP(BIT(5), !!(v))
+#define AV1_FLAGS_INTRABC(v)			FIELD_PREP(BIT(6), !!(v))
+#define AV1_FLAGS_INTEGER_MV(v)			FIELD_PREP(BIT(7), !!(v))
+#define AV1_FLAGS_DISABLE_CDF_UPDATE(v)		FIELD_PREP(BIT(8), !!(v))
+#define AV1_FLAGS_TX_MODE_ONLY_4X4(v)		FIELD_PREP(BIT(9), !!(v))
+#define AV1_FLAGS_HIGH_PRECISION_MV(v)		FIELD_PREP(BIT(10), !!(v))
+#define AV1_FLAGS_REF_FRAME_MVS(v)		FIELD_PREP(BIT(12), !!(v))
+#define AV1_FLAGS_SEG_TEMPORAL_UPDATE(v)	FIELD_PREP(BIT(13), !!(v))
+#define AV1_FLAGS_SEG_UPDATE_MAP(v)		FIELD_PREP(BIT(14), !!(v))
+#define AV1_FLAGS_SEG_ENABLED(v)		FIELD_PREP(BIT(15), !!(v))
+#define AV1_FLAGS_SEG_UPDATE_DATA(v)		FIELD_PREP(BIT(16), !!(v))
+#define AV1_FLAGS_INTRA(v)			FIELD_PREP(BIT(31), !!(v))
+#define AV1_FLAGS_SKIP_MODE1(v)			FIELD_PREP(GENMASK(19, 17), v)
+#define AV1_FLAGS_SKIP_MODE0(v)			FIELD_PREP(GENMASK(22, 20), v)
+#define AV1_FLAGS_ORDER_HINT(v)			FIELD_PREP(GENMASK(30, 23), v)
+
+#define AV1_FLAGS_REFERENCE_SELECT(v)		FIELD_PREP(BIT(28), !!(v))
+#define AV1_FLAGS_INTERPOLATION_FILTER(v)	FIELD_PREP(GENMASK(31, 29), v)
+
+#define AV1_SIGN_BIAS(v, i)	(!!(v) << (i))
+#define AV1_REF_SLOT(v, i)	(((v) & 7) << (7 + ((i) * 3)))
+
+#define AV1_SEG_ALT_Q(v)	FIELD_PREP(GENMASK(8, 0), v)
+#define AV1_SEG_ALT_Q_EN(v)	FIELD_PREP(BIT(9), !!(v))
+#define AV1_SEG_REF_FRAME(v)	FIELD_PREP(GENMASK(12, 10), v)
+#define AV1_SEG_REF_FRAME_EN(v)	FIELD_PREP(BIT(13), !!(v))
+#define AV1_SEG_REF_SKIP_EN(v)	FIELD_PREP(BIT(14), !!(v))
+#define AV1_SEG_REF_GMV_EN(v)	FIELD_PREP(BIT(15), !!(v))
+
+#define AV1_SEG_LF_V(v)		FIELD_PREP(GENMASK(6, 0), v)
+#define AV1_SEG_LF_V_EN(v)	FIELD_PREP(BIT(7), !!(v))
+#define AV1_SEG_LF_U(v)		FIELD_PREP(GENMASK(14, 8), v)
+#define AV1_SEG_LF_U_EN(v)	FIELD_PREP(BIT(15), !!(v))
+#define AV1_SEG_LF_Y_H(v)	FIELD_PREP(GENMASK(22, 16), v)
+#define AV1_SEG_LF_Y_H_EN(v)	FIELD_PREP(BIT(23), !!(v))
+#define AV1_SEG_LF_Y_V(v)	FIELD_PREP(GENMASK(30, 24), v)
+#define AV1_SEG_LF_Y_V_EN(v)	FIELD_PREP(BIT(31), !!(v))
+
+#define AV1_SEG_UNK0(v)		FIELD_PREP(BIT(16), !!(v))
+
+#define AV1_QP_U_AC(v)		FIELD_PREP(GENMASK(6, 0), v)
+#define AV1_QP_U_DC(v)		FIELD_PREP(GENMASK(13, 7), v)
+#define AV1_QP_Y_DC(v)		FIELD_PREP(GENMASK(20, 14), v)
+#define AV1_QP_BASE_IDX(v)	FIELD_PREP(GENMASK(28, 21), v)
+#define AV1_QP_DELTA_RES(v)	FIELD_PREP(GENMASK(30, 29), v)
+#define AV1_QP_PRESENT(v)	FIELD_PREP(BIT(31), !!(v))
+#define AV1_QP_V_DC(v)		FIELD_PREP(GENMASK(26, 20), v)
+#define AV1_QP_V_AC(v)		FIELD_PREP(GENMASK(19, 13), v)
+#define AV1_QP_QMATRIX(v)	FIELD_PREP(BIT(12), !!(v))
+#define AV1_QP_QM_Y(v)		FIELD_PREP(GENMASK(11, 8), v)
+#define AV1_QP_QM_U(v)		FIELD_PREP(GENMASK(7, 4), v)
+#define AV1_QP_QM_V(v)		FIELD_PREP(GENMASK(3, 0), v)
+
+#define AV1_GM_VALID(v)		FIELD_PREP(BIT(30), !!(v))
+#define AV1_GM_TYPE(v)		FIELD_PREP(GENMASK(31, 30), v)
+#define AV1_GM_PARAM0(v)	FIELD_PREP(GENMASK(29, 15), v)
+#define AV1_GM_PARAM1(v)	FIELD_PREP(GENMASK(14, 0), v)
+
+#define AV1_GM_PARAM_SHEAR0(v)	FIELD_PREP(GENMASK(15, 0), v)
+#define AV1_GM_PARAM_SHEAR1(v)	FIELD_PREP(GENMASK(31, 16), v)
+
+#define AV1_ORDER_HINT0(v)	FIELD_PREP(GENMASK(7, 0), v)
+#define AV1_ORDER_HINT1(v)	FIELD_PREP(GENMASK(15, 8), v)
+#define AV1_ORDER_HINT2(v)	FIELD_PREP(GENMASK(23, 16), v)
+#define AV1_ORDER_HINT3(v)	FIELD_PREP(GENMASK(31, 24), v)
+#define AV1_ORDER_HINT_REF(v)	FIELD_PREP(GENMASK(31, 29), v)
+
+#define AV1_LF_DELTA_ENABLED(v)	FIELD_PREP(BIT(27), !!(v))
+#define AV1_LF_DELTA_MULTI(v)	FIELD_PREP(BIT(28), !!(v))
+#define AV1_LF_DELTA_PRESENT(v)	FIELD_PREP(BIT(31), !!(v))
+#define AV1_LF_DELTA_RES(v)	FIELD_PREP(GENMASK(30, 29), v)
+#define AV1_LF_LV3(v)		FIELD_PREP(GENMASK(5, 0), v)
+#define AV1_LF_LV2(v)		FIELD_PREP(GENMASK(11, 6), v)
+#define AV1_LF_LV1(v)		FIELD_PREP(GENMASK(17, 12), v)
+#define AV1_LF_LV0(v)		FIELD_PREP(GENMASK(23, 18), v)
+
+#define AV1_LF_SHARPNESS(v)	FIELD_PREP(GENMASK(31, 28), v)
+#define AV1_LF_REF0(v)		FIELD_PREP(GENMASK(27, 21), v)
+#define AV1_LF_REF1(v)		FIELD_PREP(GENMASK(20, 14), v)
+#define AV1_LF_REF2(v)		FIELD_PREP(GENMASK(13, 7), v)
+#define AV1_LF_REF3(v)		FIELD_PREP(GENMASK(6, 0), v)
+
+#define AV1_LF_MODE0(v)		FIELD_PREP(GENMASK(13, 7), v)
+#define AV1_LF_MODE1(v)		FIELD_PREP(GENMASK(6, 0), v)
+
+#define AV1_CDEF_EN(v)		FIELD_PREP(BIT(28), !!(v))
+#define AV1_CDEF_BITS(v)	FIELD_PREP(GENMASK(25, 24), v)
+#define AV1_CDEF_DAMPING(v)	FIELD_PREP(GENMASK(27, 26), v)
+
+#define AV1_CDEF_Y_PRI(v)	FIELD_PREP(GENMASK(11, 8), v)
+#define AV1_CDEF_Y_SEC(v)	FIELD_PREP(GENMASK(7, 6), v)
+#define AV1_CDEF_UV_PRI(v)	FIELD_PREP(GENMASK(5, 2), v)
+#define AV1_CDEF_UV_SEC(v)	FIELD_PREP(GENMASK(1, 0), v)
+
+#define AV1_CDEF_LO(v)	FIELD_PREP(GENMASK(11, 0), v)
+#define AV1_CDEF_HI(v)	FIELD_PREP(GENMASK(23, 12), v)
+
+#define AV1_LR_TYPE0(v)	FIELD_PREP(GENMASK(11, 10), v)
+#define AV1_LR_TYPE1(v)	FIELD_PREP(GENMASK(9, 8), v)
+#define AV1_LR_TYPE2(v)	FIELD_PREP(GENMASK(7, 6), v)
+
+#define AV1_LR_UNIT2(v)	FIELD_PREP(GENMASK(1, 0), v)
+#define AV1_LR_UNIT1(v)	FIELD_PREP(GENMASK(3, 2), v)
+#define AV1_LR_UNIT0(v)	FIELD_PREP(GENMASK(5, 4), v)
+
+#define AV1_REF_ORDER_HINT(v)	FIELD_PREP(GENMASK(23, 0), v)
+#define AV1_REF_SCALE_X(v)	FIELD_PREP(GENMASK(31, 16), v)
+#define AV1_REF_SCALE_Y(v)	FIELD_PREP(GENMASK(15, 0), v)
+
+#define AV1_SUPERRES_USE(v)	FIELD_PREP(BIT(31), !!(v))
+#define AV1_SUPERRES_DENOM(v)	FIELD_PREP(GENMASK(30, 28), v)
+/* im gonna asume 16 like the others */
+#define AV1_SUPERRES_UPSCALE(v)	FIELD_PREP(GENMASK(16, 0), v)
+
+#define AV1_UPSCALE_STEPX(v)	FIELD_PREP(GENMASK(13, 0), v)
+#define AV1_UPSCALE_UPSCX(v)	FIELD_PREP(GENMASK(31, 14), v)
+
+#define AVD_CDFS_SIZE	sizeof(struct avd_av1_cdfs)
+
+/* Imported planes can have an unaligned length; AVD aligns both tail addresses. */
+#define AVD_AV1_COLOR_OFFSET(dst, cl) \
+	(ALIGN_DOWN((dst), AVD_ALIGN) - ALIGN(cl, AVD_ALIGN))
+#define AVD_AV1_CDFS_OFFSET(dst, cl) \
+	(AVD_AV1_COLOR_OFFSET(dst, cl) - ALIGN(AVD_CDFS_SIZE, AVD_ALIGN))
+/* The frame's segmentation map, saved with it like the CDFs (AV1 7.20) */
+#define AVD_AV1_SEG_OFFSET(dst, cl, sl) \
+	(AVD_AV1_CDFS_OFFSET(dst, cl) - (sl))
+
+#define AV1_PRIMARY_REF_NONE	7
+
+struct avd_av1_run {
+	struct avd_run base;
+
+	struct {
+		dma_addr_t probs_out;
+		dma_addr_t color;
+		dma_addr_t seg;
+		dma_addr_t prev_seg;
+	} addresses;
+
+	const struct v4l2_ctrl_av1_sequence *seq;
+	const struct v4l2_ctrl_av1_frame *frame;
+	const struct v4l2_ctrl_av1_tile_group_entry *tile_group;
+	const struct v4l2_ctrl_av1_film_grain *grain;
+};
+
+struct avd_av1_ctx {
+	u8 submit_num;
+	struct {
+		struct avd_buf inst;
+		struct avd_buf pipe_state;
+		struct avd_buf probs;
+		struct avd_buf no_prev_seg;
+		struct avd_buf above_info;
+		struct avd_buf rf_above_info;
+		struct avd_buf az_above;
+		struct avd_buf ip_above;
+		struct avd_buf lf_above;
+		struct avd_buf lf_above_info;
+		struct avd_buf lf_left;
+		struct avd_buf lf_left_info;
+		struct avd_buf sr_left;
+		struct avd_buf rf_left;
+		struct avd_buf rf_left_info;
+		struct avd_buf mv_above_info;
+	} bufs;
+};
+
+/*
+ * from verisilicon/rockchip_vpu981_hw_av1_dec.c
+ */
+static const short div_lut[DIV_LUT_NUM + 1] = {
+	16384, 16320, 16257, 16194, 16132, 16070, 16009, 15948, 15888, 15828, 15768,
+	15709, 15650, 15592, 15534, 15477, 15420, 15364, 15308, 15252, 15197, 15142,
+	15087, 15033, 14980, 14926, 14873, 14821, 14769, 14717, 14665, 14614, 14564,
+	14513, 14463, 14413, 14364, 14315, 14266, 14218, 14170, 14122, 14075, 14028,
+	13981, 13935, 13888, 13843, 13797, 13752, 13707, 13662, 13618, 13574, 13530,
+	13487, 13443, 13400, 13358, 13315, 13273, 13231, 13190, 13148, 13107, 13066,
+	13026, 12985, 12945, 12906, 12866, 12827, 12788, 12749, 12710, 12672, 12633,
+	12596, 12558, 12520, 12483, 12446, 12409, 12373, 12336, 12300, 12264, 12228,
+	12193, 12157, 12122, 12087, 12053, 12018, 11984, 11950, 11916, 11882, 11848,
+	11815, 11782, 11749, 11716, 11683, 11651, 11619, 11586, 11555, 11523, 11491,
+	11460, 11429, 11398, 11367, 11336, 11305, 11275, 11245, 11215, 11185, 11155,
+	11125, 11096, 11067, 11038, 11009, 10980, 10951, 10923, 10894, 10866, 10838,
+	10810, 10782, 10755, 10727, 10700, 10673, 10645, 10618, 10592, 10565, 10538,
+	10512, 10486, 10460, 10434, 10408, 10382, 10356, 10331, 10305, 10280, 10255,
+	10230, 10205, 10180, 10156, 10131, 10107, 10082, 10058, 10034, 10010, 9986,
+	9963,  9939,  9916,  9892,  9869,  9846,  9823,  9800,  9777,  9754,  9732,
+	9709,  9687,  9664,  9642,  9620,  9598,  9576,  9554,  9533,  9511,  9489,
+	9468,  9447,  9425,  9404,  9383,  9362,  9341,  9321,  9300,  9279,  9259,
+	9239,  9218,  9198,  9178,  9158,  9138,  9118,  9098,  9079,  9059,  9039,
+	9020,  9001,  8981,  8962,  8943,  8924,  8905,  8886,  8867,  8849,  8830,
+	8812,  8793,  8775,  8756,  8738,  8720,  8702,  8684,  8666,  8648,  8630,
+	8613,  8595,  8577,  8560,  8542,  8525,  8508,  8490,  8473,  8456,  8439,
+	8422,  8405,  8389,  8372,  8355,  8339,  8322,  8306,  8289,  8273,  8257,
+	8240,  8224,  8208,  8192,
+};
+
+static inline int avd_av1_dec_get_msb(u32 n)
+{
+	if (n == 0)
+		return 0;
+	return 31 ^ __builtin_clz(n);
+}
+
+static short avd_av1_dec_resolve_divisor_32(u32 d, short *shift)
+{
+	int f;
+	u64 e;
+
+	*shift = avd_av1_dec_get_msb(d);
+	/* e is obtained from D after resetting the most significant 1 bit. */
+	e = d - ((u32)1 << *shift);
+	/* Get the most significant DIV_LUT_BITS (8) bits of e into f */
+	if (*shift > DIV_LUT_BITS)
+		f = AV1_DIV_ROUND_UP_POW2(e, *shift - DIV_LUT_BITS);
+	else
+		f = e << (DIV_LUT_BITS - *shift);
+	if (f > DIV_LUT_NUM)
+		return -1;
+	*shift += DIV_LUT_PREC_BITS;
+	/* Use f as lookup into the precomputed table of multipliers */
+	return div_lut[f];
+}
+
+static void
+avd_av1_dec_get_shear_params(const u32 *params, s64 *alpha,
+					 s64 *beta, s64 *gamma, s64 *delta)
+{
+	const int *mat = params;
+	short shift;
+	short y;
+	long long gv, dv;
+
+	if (mat[2] <= 0)
+		return;
+
+	*alpha = clamp_val(mat[2] - (1 << WARPEDMODEL_PREC_BITS), S16_MIN, S16_MAX);
+	*beta = clamp_val(mat[3], S16_MIN, S16_MAX);
+
+	y = avd_av1_dec_resolve_divisor_32(abs(mat[2]), &shift) * (mat[2] < 0 ? -1 : 1);
+
+	gv = ((long long)mat[4] * (1 << WARPEDMODEL_PREC_BITS)) * y;
+
+	*gamma = clamp_val((int)AV1_DIV_ROUND_UP_POW2_SIGNED(gv, shift), S16_MIN, S16_MAX);
+
+	dv = ((long long)mat[3] * mat[4]) * y;
+	*delta = clamp_val(mat[5] -
+		(int)AV1_DIV_ROUND_UP_POW2_SIGNED(dv, shift) - (1 << WARPEDMODEL_PREC_BITS),
+		S16_MIN, S16_MAX);
+
+	*alpha = AV1_DIV_ROUND_UP_POW2_SIGNED(*alpha, WARP_PARAM_REDUCE_BITS)
+		 * (1 << WARP_PARAM_REDUCE_BITS);
+	*beta = AV1_DIV_ROUND_UP_POW2_SIGNED(*beta, WARP_PARAM_REDUCE_BITS)
+		* (1 << WARP_PARAM_REDUCE_BITS);
+	*gamma = AV1_DIV_ROUND_UP_POW2_SIGNED(*gamma, WARP_PARAM_REDUCE_BITS)
+		 * (1 << WARP_PARAM_REDUCE_BITS);
+	*delta = AV1_DIV_ROUND_UP_POW2_SIGNED(*delta, WARP_PARAM_REDUCE_BITS)
+		* (1 << WARP_PARAM_REDUCE_BITS);
+}
+
+static void set_refs(struct avd_ctx *ctx, struct avd_av1_run *run)
+{
+	struct avd_av1_ctx *av1_ctx = ctx->priv;
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	const struct v4l2_av1_global_motion *gm = &frame->global_motion;
+	int i, ref_idx;
+	struct avd_decoded_buffer *dst, *ref;
+	bool intrabc = !!(frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC);
+	int height, width, x_scale, y_scale;
+	height = frame->frame_height_minus_1 + 1;
+	width = frame->frame_width_minus_1 + 1;
+	dma_addr_t addr;
+	s64 alpha = 0, beta = 0, gamma = 0, delta = 0;
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+
+	push(0, "ref_cnst0");
+	pusha(av1_ctx->bufs.mv_above_info.addr, "mv_above_info", 0);
+
+	for (i = 0; i < 4; i++)
+		push(0, "ref_cnst1");
+
+	for (i = 0; i < (intrabc ? 1 : V4L2_AV1_REFS_PER_FRAME); i++) {
+		if (intrabc) {
+			ref = dst;
+		} else {
+			ref_idx = i + V4L2_AV1_REF_LAST_FRAME;
+			ref = avd_get_ref_buf(
+				ctx, &dst->base.vb,
+				frame->reference_frame_ts
+					[frame->ref_frame_idx[i]]);
+		}
+		addr = vb2_dma_contig_plane_dma_addr(&ref->base.vb.vb2_buf, 0) +
+		       ref->comp.start_offset;
+
+		if (!intrabc) {
+			int shift =
+				(gm->flags[ref_idx] &
+				 V4L2_AV1_GLOBAL_MOTION_FLAG_IS_TRANSLATION) ?
+					(WARPEDMODEL_PREC_BITS -
+					 2) - (frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_HIGH_PRECISION_MV ?
+						       1 :
+						       0) :
+					10;
+			push(AV1_GM_TYPE(gm->type[ref_idx]) |
+				     AV1_GM_PARAM0(gm->params[ref_idx][0] >>
+						   shift) |
+				     AV1_GM_PARAM1(gm->params[ref_idx][1] >>
+						   shift),
+			     "ref_gm_mv");
+			push(AV1_GM_VALID(!(V4L2_AV1_GLOBAL_MOTION_IS_INVALID(
+						    ref_idx) &
+					    gm->invalid)) |
+				     AV1_GM_PARAM0(AV1_DIV_ROUND_UP_POW2_SIGNED(
+					     gm->params[ref_idx][2], 1)) |
+				     AV1_GM_PARAM1(AV1_DIV_ROUND_UP_POW2_SIGNED(
+					     gm->params[ref_idx][3], 1)),
+			     "ref_gm_param");
+			push(AV1_GM_PARAM1(gm->params[ref_idx][5] >> 1) |
+				     AV1_GM_PARAM0(gm->params[ref_idx][4] >> 1),
+			     "ref_gm_unk2");
+			avd_av1_dec_get_shear_params(&gm->params[ref_idx][0],
+						     &alpha, &beta, &gamma,
+						     &delta);
+			push(AV1_GM_PARAM_SHEAR0(beta) |
+				     AV1_GM_PARAM_SHEAR1(alpha),
+			     "ref_gm_beta_alpha");
+
+			push(AV1_GM_PARAM_SHEAR0(delta) |
+				     AV1_GM_PARAM_SHEAR1(gamma),
+			     "ref_gm_delta_gamma");
+		}
+		push(AVD_REF_FLAG_CONST |
+			     AV1_REF_ORDER_HINT(
+				     intrabc ? 0 : frame->order_hints[ref_idx]),
+		     "ref_flag");
+		push(AVD_HDR_HEIGHT(ref->av1.height) |
+			     AVD_HDR_WIDTH(ref->av1.width),
+		     "ref_height_width");
+
+		x_scale = ((ref->av1.upscaled_width << AV1_REF_SCALE_SHIFT) +
+			   (width / 2)) /
+			  width;
+		y_scale = (((ref->av1.height + 1) << AV1_REF_SCALE_SHIFT) +
+			   (height / 2)) /
+			  height;
+		push(AV1_REF_SCALE_X(x_scale) | AV1_REF_SCALE_Y(y_scale),
+		     "ref_scale");
+
+		push_comp(ctx, addr, ref->comp.offsets);
+	}
+}
+
+static int avd_av1_get_dist(struct avd_av1_run *run, int a, int b)
+{
+	const struct v4l2_ctrl_av1_sequence *seq = run->seq;
+	int bits = seq->order_hint_bits - 1;
+	int diff, m;
+
+	if (!seq->order_hint_bits)
+		return 0;
+
+	diff = a - b;
+	m = 1 << bits;
+	diff = (diff & (m - 1)) - (diff & m);
+
+	return diff;
+}
+
+static bool is_valid_ref_frame(struct avd_ctx *ctx, struct avd_av1_run *run,
+			       struct avd_decoded_buffer *dst, int mi_cols,
+			       int mi_rows,
+			       enum v4l2_av1_reference_frame ref_frame)
+{
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	struct avd_decoded_buffer *ref = avd_get_ref_buf(
+		ctx, &dst->base.vb,
+		frame->reference_frame_ts
+			[frame->ref_frame_idx[ref_frame -
+					      V4L2_AV1_REF_LAST_FRAME]]);
+	int ref_mi_cols = DIV_ROUND_UP(ref->av1.width + 1, 8);
+	int ref_mi_rows = DIV_ROUND_UP(ref->av1.height + 1, 8);
+	bool intra_only = ((ref->av1.frame_type == V4L2_AV1_KEY_FRAME) ||
+			   (ref->av1.frame_type == V4L2_AV1_INTRA_ONLY_FRAME));
+
+	return ref != dst && ref_mi_cols == mi_cols && ref_mi_rows == mi_rows &&
+	       !intra_only;
+}
+
+static int avd_select_refs(struct avd_ctx *ctx, struct avd_av1_run *run,
+			   u8 *selected_refs)
+{
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	const struct v4l2_ctrl_av1_sequence *seq = run->seq;
+	int ref_stamp = 2;
+	struct avd_decoded_buffer *dst, *ref;
+	bool use_last;
+	int ref_num = 0;
+	int order_hint = frame->order_hint;
+	int mi_cols = DIV_ROUND_UP(frame->frame_width_minus_1 + 1, 8);
+	int mi_rows = DIV_ROUND_UP(frame->frame_height_minus_1 + 1, 8);
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+
+	int last_ref_idx = frame->ref_frame_idx[V4L2_AV1_REF_INTRA_FRAME];
+	if (seq->flags & (V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT |
+			  V4L2_AV1_SEQUENCE_FLAG_ENABLE_REF_FRAME_MVS)) {
+		ref = avd_get_ref_buf(ctx, &dst->base.vb,
+				      frame->reference_frame_ts[last_ref_idx]);
+		if (dst != ref) {
+			use_last =
+				(ref->av1.order_hints[V4L2_AV1_REF_ALTREF_FRAME] !=
+				 frame->order_hints[V4L2_AV1_REF_GOLDEN_FRAME]);
+			if (use_last &&
+			    is_valid_ref_frame(ctx, run, dst, mi_cols, mi_rows,
+					       V4L2_AV1_REF_LAST_FRAME))
+				selected_refs[ref_num++] =
+					V4L2_AV1_REF_LAST_FRAME;
+			ref_stamp--;
+		}
+
+		if (avd_av1_get_dist(
+			    run, frame->order_hints[V4L2_AV1_REF_BWDREF_FRAME],
+			    order_hint) > 0 &&
+		    is_valid_ref_frame(ctx, run, dst, mi_cols, mi_rows,
+				       V4L2_AV1_REF_BWDREF_FRAME)) {
+			selected_refs[ref_num++] = V4L2_AV1_REF_BWDREF_FRAME;
+			ref_stamp--;
+		}
+
+		if (avd_av1_get_dist(
+			    run, frame->order_hints[V4L2_AV1_REF_ALTREF2_FRAME],
+			    order_hint) > 0 &&
+		    is_valid_ref_frame(ctx, run, dst, mi_cols, mi_rows,
+				       V4L2_AV1_REF_ALTREF2_FRAME)) {
+			selected_refs[ref_num++] = V4L2_AV1_REF_ALTREF2_FRAME;
+			ref_stamp--;
+		}
+
+		if (ref_stamp >= 0 &&
+		    avd_av1_get_dist(
+			    run, frame->order_hints[V4L2_AV1_REF_ALTREF_FRAME],
+			    order_hint) > 0 &&
+		    is_valid_ref_frame(ctx, run, dst, mi_cols, mi_rows,
+				       V4L2_AV1_REF_ALTREF_FRAME)) {
+			selected_refs[ref_num++] = V4L2_AV1_REF_ALTREF_FRAME;
+			ref_stamp--;
+		}
+
+		if (ref_stamp >= 0 &&
+		    is_valid_ref_frame(ctx, run, dst, mi_cols, mi_rows,
+				       V4L2_AV1_REF_LAST2_FRAME)) {
+			selected_refs[ref_num++] = V4L2_AV1_REF_LAST2_FRAME;
+			ref_stamp--;
+		}
+	}
+
+	return ref_num;
+}
+
+static void set_ref_hints(struct avd_ctx *ctx, struct avd_av1_run *run,
+			  u8 *selected_refs)
+{
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	int i, ref_idx;
+	struct avd_decoded_buffer *dst, *ref;
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+
+	for (i = 0; i < 3; i++) {
+		if (selected_refs[i] < V4L2_AV1_REF_LAST_FRAME) {
+			push(0, "");
+			push(0, "");
+		} else {
+			ref_idx = frame->ref_frame_idx[selected_refs[i] -
+						       V4L2_AV1_REF_LAST_FRAME];
+			ref = avd_get_ref_buf(
+				ctx, &dst->base.vb,
+				frame->reference_frame_ts[ref_idx]);
+
+			push(AV1_ORDER_HINT0(ref->av1.order_hints[3]) |
+				     AV1_ORDER_HINT1(ref->av1.order_hints[2]) |
+				     AV1_ORDER_HINT2(ref->av1.order_hints[1]) |
+				     AV1_ORDER_HINT_REF(
+					     (frame->flags &
+					      V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS) ?
+						     selected_refs[i] :
+						     0),
+			     "order_hints0");
+
+			push(AV1_ORDER_HINT0(ref->av1.order_hints[7]) |
+				     AV1_ORDER_HINT1(ref->av1.order_hints[6]) |
+				     AV1_ORDER_HINT2(ref->av1.order_hints[5]) |
+				     AV1_ORDER_HINT3(ref->av1.order_hints[4]),
+			     "order_hints1");
+		}
+	}
+}
+
+static void set_ref_hdr(struct avd_ctx *ctx, struct avd_av1_run *run)
+{
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	u8 ref_slots[7] = { 1, 2, 3, 4, 5, 6, 7 };
+	int sign_bias = 0;
+	int ref_slot = 0;
+	int i, j;
+	/* point to the first index where the frames equal */
+	for (i = 0; i < 6; i++) {
+		for (j = i + 1; j < 7; j++) {
+			if (frame->reference_frame_ts[frame->ref_frame_idx[i]] ==
+			    frame->reference_frame_ts[frame->ref_frame_idx[j]]) {
+				ref_slots[j] = ref_slots[i];
+				break;
+			}
+		}
+	}
+	for (i = 0; i < 7; i++) {
+		sign_bias |= AV1_SIGN_BIAS(
+			avd_av1_get_dist(
+				run,
+				frame->order_hints[i + V4L2_AV1_REF_LAST_FRAME],
+				frame->order_hint) > 0,
+			6 - i);
+
+		ref_slot |= AV1_REF_SLOT(ref_slots[i], 6 - i);
+	}
+	push(ref_slot | sign_bias |
+		     AV1_FLAGS_REFERENCE_SELECT(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_REFERENCE_SELECT) |
+		     AV1_FLAGS_INTERPOLATION_FILTER(
+			     frame->interpolation_filter),
+	     "reference_select");
+}
+
+/* 7.16. Upscaling process */
+static void calc_upscale(int frame_width, int upscaled_width, int sub_x,
+			 int *step_x, int *initial_subpel_x)
+{
+	int downscaled_plane_w, upscaled_plane_w, err;
+
+	downscaled_plane_w = AV1_DIV_ROUND_UP_POW2(frame_width, sub_x);
+	upscaled_plane_w = AV1_DIV_ROUND_UP_POW2(upscaled_width, sub_x);
+	*step_x = ((downscaled_plane_w << SUPERRES_SCALE_BITS) +
+		   (upscaled_plane_w / 2)) /
+		  upscaled_plane_w;
+	err = (upscaled_plane_w * *step_x) -
+	      (downscaled_plane_w << SUPERRES_SCALE_BITS);
+	*initial_subpel_x = (-((upscaled_plane_w - downscaled_plane_w)
+			       << (SUPERRES_SCALE_BITS - 1)) +
+			     upscaled_plane_w / 2) /
+				    upscaled_plane_w +
+			    (1 << (SUPERRES_EXTRA_BITS - 1)) - err / 2;
+	*initial_subpel_x &= SUPERRES_SCALE_MASK;
+}
+
+static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
+{
+	struct avd_av1_ctx *av1_ctx = ctx->priv;
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	const struct v4l2_ctrl_av1_sequence *seq = run->seq;
+	const struct v4l2_av1_loop_restoration *lr = &frame->loop_restoration;
+	const struct v4l2_av1_cdef *cdef = &frame->cdef;
+	const struct v4l2_av1_segmentation *seg = &frame->segmentation;
+	u32 bytesperline;
+	int i, segid, segval, ref_idx;
+	int step_x, initial_subpel_x;
+	u8 selected_refs[3] = { 0, 0, 0 };
+	bool coded_lossless = frame->tx_mode == V4L2_AV1_TX_MODE_ONLY_4X4;
+	bool intrabc = !!(frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC);
+	bool intra_only = !!((frame->frame_type == V4L2_AV1_KEY_FRAME ||
+			      frame->frame_type == V4L2_AV1_INTRA_ONLY_FRAME));
+	bool cdef_enabled =
+		!(!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_ENABLE_CDEF) ||
+		  frame->flags & V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC ||
+		  coded_lossless);
+
+	struct avd_decoded_buffer *dst, *ref;
+	dma_addr_t ref_addr;
+	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+
+	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
+		     AVD_OP_HDR_FLAG_INTRA(intra_only && !intrabc) |
+		     AVD_OP_HDR_CONST | AVD_OP_HDR_FLAG_PIPE_STATE(1),
+	     "op_hdr");
+
+	push(AVD_HDR_CODEC_MODE(AVD_CODEC_AV1) |
+		     AV1_CODEC_MODE_INTRABC(intrabc),
+	     "codec");
+
+	/*
+	 * TODO: height_width_* are kinda weird
+	 * on most samples this is true
+	 */
+	push(AVD_HDR_HEIGHT(frame->frame_height_minus_1) |
+		     AVD_HDR_WIDTH(frame->frame_width_minus_1),
+	     "height_width_1");
+	push(0, "");
+	push(AVD_HDR_HEIGHT(frame->frame_height_minus_1) |
+		     AVD_HDR_WIDTH(frame->frame_width_minus_1),
+	     "height_width_2");
+
+	push(AVD_HDR_COMMON_CHROMA_FORMAT(1) |
+		     AVD_HDR_COMMON_BIT_DEPTH_C(seq->bit_depth - 8) |
+		     AVD_HDR_COMMON_BIT_DEPTH_L(seq->bit_depth - 8) |
+		     AV1_HDR_JNT_COMP(seq->flags &
+				      V4L2_AV1_SEQUENCE_FLAG_ENABLE_JNT_COMP) |
+		     AV1_HDR_DUAL_FILTER(
+			     seq->flags &
+			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_DUAL_FILTER) |
+		     AV1_HDR_ORDER_HINT_BITS((seq->order_hint_bits - 1)) |
+		     AV1_HDR_ORDER_HINT(
+			     seq->flags &
+			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_ORDER_HINT) |
+		     AV1_HDR_MASKED_COMPOUND(
+			     seq->flags &
+			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_MASKED_COMPOUND) |
+		     AV1_HDR_INTERINTRA_COMPOUND(
+			     seq->flags &
+			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_INTERINTRA_COMPOUND) |
+		     AV1_HDR_INTRA_EDGE_FILTER(
+			     seq->flags &
+			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_INTRA_EDGE_FILTER) |
+		     AV1_HDR_FILTER_INTRA(
+			     seq->flags &
+			     V4L2_AV1_SEQUENCE_FLAG_ENABLE_FILTER_INTRA) |
+		     AV1_HDR_128X128_SUPERBLOCK(
+			     seq->flags &
+			     V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK) |
+		     AV1_HDR_SCREEN_CONTENT_TOOLS(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_ALLOW_SCREEN_CONTENT_TOOLS),
+	     "hdr_common");
+
+	push(AV1_FLAGS_TX_MODE_LARGEST(frame->tx_mode ==
+				       V4L2_AV1_TX_MODE_LARGEST) |
+		     AV1_FLAGS_TX_MODE_SELECT(frame->tx_mode ==
+					      V4L2_AV1_TX_MODE_SELECT) |
+		     AV1_FLAGS_TX_REDUCED_SET(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_REDUCED_TX_SET) |
+		     AV1_FLAGS_ALLOW_WARPED_MOTION(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_ALLOW_WARPED_MOTION) |
+		     AV1_FLAGS_SKIP_MODE(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_SKIP_MODE_PRESENT) |
+		     AV1_FLAGS_MOTION_IS_SWITCHABLE(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_IS_MOTION_MODE_SWITCHABLE) |
+		     AV1_FLAGS_INTRABC(frame->flags &
+				       V4L2_AV1_FRAME_FLAG_ALLOW_INTRABC) |
+		     AV1_FLAGS_INTEGER_MV(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_FORCE_INTEGER_MV) |
+		     AV1_FLAGS_DISABLE_CDF_UPDATE(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_DISABLE_CDF_UPDATE) |
+		     AV1_FLAGS_TX_MODE_ONLY_4X4(frame->tx_mode ==
+						V4L2_AV1_TX_MODE_ONLY_4X4) |
+		     AV1_FLAGS_HIGH_PRECISION_MV(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_ALLOW_HIGH_PRECISION_MV) |
+		     AV1_FLAGS_REF_FRAME_MVS(
+			     frame->flags &
+			     V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS) |
+		     AV1_FLAGS_SEG_TEMPORAL_UPDATE(
+			     frame->segmentation.flags &
+			     V4L2_AV1_SEGMENTATION_FLAG_TEMPORAL_UPDATE) |
+		     AV1_FLAGS_SEG_UPDATE_MAP(
+			     frame->segmentation.flags &
+			     V4L2_AV1_SEGMENTATION_FLAG_UPDATE_MAP) |
+		     AV1_FLAGS_SEG_ENABLED(frame->segmentation.flags &
+					   V4L2_AV1_SEGMENTATION_FLAG_ENABLED) |
+		     /* im not sure this is correct */
+		     AV1_FLAGS_SEG_UPDATE_DATA(
+			     frame->segmentation.flags &
+			     V4L2_AV1_SEGMENTATION_FLAG_UPDATE_DATA) |
+		     AV1_FLAGS_SKIP_MODE1(
+			     frame->flags & V4L2_AV1_FRAME_FLAG_SKIP_MODE_ALLOWED ?
+				     frame->skip_mode_frame[1] - 1 :
+				     7) |
+		     AV1_FLAGS_SKIP_MODE0(
+			     frame->flags & V4L2_AV1_FRAME_FLAG_SKIP_MODE_ALLOWED ?
+				     frame->skip_mode_frame[0] - 1 :
+				     7) |
+		     AV1_FLAGS_ORDER_HINT(frame->order_hint) |
+		     AV1_FLAGS_INTRA(intra_only),
+	     "av1_flags0");
+
+	set_ref_hdr(ctx, run);
+
+	for (segid = 0; segid < V4L2_AV1_MAX_SEGMENTS; segid++) {
+#define SEG_FEAT_EN(feat) \
+	(seg->feature_enabled[segid] & V4L2_AV1_SEGMENT_FEATURE_ENABLED(feat))
+		/* what? why? */
+		segval = AV1_SEG_UNK0(frame->tx_mode ==
+				      V4L2_AV1_TX_MODE_ONLY_4X4);
+
+		segval |= AV1_SEG_ALT_Q(
+			seg->feature_data[segid][V4L2_AV1_SEG_LVL_ALT_Q]);
+		segval |= AV1_SEG_ALT_Q_EN(SEG_FEAT_EN(V4L2_AV1_SEG_LVL_ALT_Q));
+		segval |= AV1_SEG_REF_FRAME(
+			seg->feature_data[segid][V4L2_AV1_SEG_LVL_REF_FRAME]);
+		segval |= AV1_SEG_REF_FRAME_EN(
+			SEG_FEAT_EN(V4L2_AV1_SEG_LVL_REF_FRAME));
+		segval |= AV1_SEG_REF_SKIP_EN(
+			SEG_FEAT_EN(V4L2_AV1_SEG_LVL_REF_SKIP));
+		segval |= AV1_SEG_REF_GMV_EN(
+			SEG_FEAT_EN(V4L2_AV1_SEG_LVL_REF_GLOBALMV));
+		push(segval, "seg_0");
+		segval = 0;
+		segval |= AV1_SEG_LF_V(
+			seg->feature_data[segid][V4L2_AV1_SEG_LVL_ALT_LF_V]);
+		segval |=
+			AV1_SEG_LF_V_EN(SEG_FEAT_EN(V4L2_AV1_SEG_LVL_ALT_LF_V));
+		segval |= AV1_SEG_LF_U(
+			seg->feature_data[segid][V4L2_AV1_SEG_LVL_ALT_LF_U]);
+		segval |=
+			AV1_SEG_LF_U_EN(SEG_FEAT_EN(V4L2_AV1_SEG_LVL_ALT_LF_U));
+		segval |= AV1_SEG_LF_Y_H(
+			seg->feature_data[segid][V4L2_AV1_SEG_LVL_ALT_LF_Y_H]);
+		segval |= AV1_SEG_LF_Y_H_EN(
+			SEG_FEAT_EN(V4L2_AV1_SEG_LVL_ALT_LF_Y_H));
+		segval |= AV1_SEG_LF_Y_V(
+			seg->feature_data[segid][V4L2_AV1_SEG_LVL_ALT_LF_Y_V]);
+		segval |= AV1_SEG_LF_Y_V_EN(
+			SEG_FEAT_EN(V4L2_AV1_SEG_LVL_ALT_LF_Y_V));
+		push(segval, "seg_1");
+#undef SEG_FEAT_EN
+	}
+
+	push(AVD_HDR_FEAT_VP9, "feat_en");
+
+	avd_select_refs(ctx, run, selected_refs);
+	set_ref_hints(ctx, run, selected_refs);
+
+	push(0, "");
+	push(0, "");
+
+	pusha(run->addresses.probs_out, "probs_out", 0);
+	pusha(av1_ctx->bufs.probs.addr, "probs", 1);
+	pusha(av1_ctx->bufs.above_info.addr, "col", 0);
+	pusha(run->addresses.seg, "seg", 0);
+	pusha(run->addresses.prev_seg, "prev_seg", 1);
+	pusha(run->addresses.color, "w_color", 0);
+
+	for (i = 0; i < 3; i++) {
+		if (selected_refs[i] < V4L2_AV1_REF_LAST_FRAME) {
+			pusha((dma_addr_t)0, "", 0);
+		} else {
+			ref_idx = frame->ref_frame_idx[selected_refs[i] -
+						       V4L2_AV1_REF_LAST_FRAME];
+			ref = avd_get_ref_buf(
+				ctx, &dst->base.vb,
+				frame->reference_frame_ts[ref_idx]);
+			ref_addr =
+				vb2_dma_contig_plane_dma_addr(
+					&ref->base.vb.vb2_buf, 0) +
+				AVD_AV1_COLOR_OFFSET(
+					ref->base.vb.vb2_buf.planes[0].length,
+					ref->av1.color_size);
+
+			pusha(ref_addr, "r_color", ref_idx);
+		}
+	}
+
+	push(AV1_QP_PRESENT(frame->quantization.flags &
+			    V4L2_AV1_QUANTIZATION_FLAG_DELTA_Q_PRESENT) |
+		     AV1_QP_DELTA_RES(frame->quantization.delta_q_res) |
+		     AV1_QP_BASE_IDX(frame->quantization.base_q_idx) |
+		     AV1_QP_Y_DC(frame->quantization.delta_q_y_dc) |
+		     AV1_QP_U_DC(frame->quantization.delta_q_u_dc) |
+		     AV1_QP_U_AC(frame->quantization.delta_q_u_ac),
+	     "qp_base_q_idx");
+
+	push(AV1_QP_V_DC(frame->quantization.delta_q_v_dc) |
+		     AV1_QP_V_AC(frame->quantization.delta_q_v_ac) |
+		     AV1_QP_QMATRIX(frame->quantization.flags &
+				    V4L2_AV1_QUANTIZATION_FLAG_USING_QMATRIX) |
+		     AV1_QP_QM_Y(frame->quantization.qm_y) |
+		     AV1_QP_QM_U(frame->quantization.qm_u) |
+		     AV1_QP_QM_V(frame->quantization.qm_v),
+	     "qp_qm");
+
+	push(AV1_LF_DELTA_ENABLED(frame->loop_filter.flags &
+				  V4L2_AV1_LOOP_FILTER_FLAG_DELTA_ENABLED) |
+		     AV1_LF_DELTA_PRESENT(
+			     frame->loop_filter.flags &
+			     V4L2_AV1_LOOP_FILTER_FLAG_DELTA_LF_PRESENT) |
+		     AV1_LF_DELTA_MULTI(
+			     frame->loop_filter.flags &
+			     V4L2_AV1_LOOP_FILTER_FLAG_DELTA_LF_MULTI) |
+		     AV1_LF_DELTA_RES(frame->loop_filter.delta_lf_res) |
+		     AV1_LF_SHARPNESS(frame->loop_filter.sharpness) |
+		     AV1_LF_LV0(frame->loop_filter.level[0]) |
+		     AV1_LF_LV1(frame->loop_filter.level[1]) |
+		     AV1_LF_LV2(frame->loop_filter.level[2]) |
+		     AV1_LF_LV3(frame->loop_filter.level[3]),
+	     "lf_update");
+
+	push(AV1_LF_REF0(frame->loop_filter.ref_deltas[0]) |
+		     AV1_LF_REF1(frame->loop_filter.ref_deltas[1]) |
+		     AV1_LF_REF2(frame->loop_filter.ref_deltas[2]) |
+		     AV1_LF_REF3(frame->loop_filter.ref_deltas[3]),
+	     "lf_sharp_ref_deltas");
+
+	push(AV1_LF_REF0(frame->loop_filter.ref_deltas[4]) |
+		     AV1_LF_REF1(frame->loop_filter.ref_deltas[5]) |
+		     AV1_LF_REF2(frame->loop_filter.ref_deltas[6]) |
+		     AV1_LF_REF3(frame->loop_filter.ref_deltas[7]),
+	     "lf_ref_deltas");
+
+	push(AV1_LF_MODE0(frame->loop_filter.mode_deltas[0]) |
+		     AV1_LF_MODE1(frame->loop_filter.mode_deltas[1]),
+	     "lf_mode");
+
+#define AVD_AV1_SEC_FIXUP(i) ((i) == 4 ? 3 : i)
+
+#define AV1_CDEF_PACK_ONE(i)                                          \
+	(AV1_CDEF_Y_PRI(cdef->y_pri_strength[i]) |                    \
+	 AV1_CDEF_Y_SEC(AVD_AV1_SEC_FIXUP(cdef->y_sec_strength[i])) | \
+	 AV1_CDEF_UV_PRI(cdef->uv_pri_strength[i]) |                  \
+	 AV1_CDEF_UV_SEC(AVD_AV1_SEC_FIXUP(cdef->uv_sec_strength[i])))
+
+#define AV1_CDEF_PACK(i)                            \
+	AV1_CDEF_HI(AV1_CDEF_PACK_ONE(((i) * 2))) | \
+		AV1_CDEF_LO(AV1_CDEF_PACK_ONE(((i) * 2) + 1))
+	push(AV1_CDEF_EN(cdef_enabled) | AV1_CDEF_BITS(frame->cdef.bits) |
+		     AV1_CDEF_DAMPING(frame->cdef.damping_minus_3) |
+		     AV1_CDEF_PACK(0),
+	     "cdef0");
+	push(AV1_CDEF_PACK(1), "cdef1");
+	push(AV1_CDEF_PACK(2), "cdef2");
+	push(AV1_CDEF_PACK(3), "cdef3");
+#undef AV1_CDEF_PACK_ONE
+#undef AV1_CDEF_PACK
+
+	push(AV1_SUPERRES_USE(frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES) |
+		     AV1_SUPERRES_DENOM(
+			     frame->flags & V4L2_AV1_FRAME_FLAG_USE_SUPERRES ?
+				     (frame->superres_denom - 1) :
+				     0) |
+		     AV1_SUPERRES_UPSCALE(frame->upscaled_width - 1),
+	     "superres");
+
+	calc_upscale(frame->frame_width_minus_1 + 1, frame->upscaled_width, 0,
+		     &step_x, &initial_subpel_x);
+	push(AV1_UPSCALE_UPSCX(initial_subpel_x) | AV1_UPSCALE_STEPX(step_x),
+	     "upscale_p0");
+	calc_upscale(frame->frame_width_minus_1 + 1, frame->upscaled_width,
+		     !!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X),
+		     &step_x, &initial_subpel_x);
+	push(AV1_UPSCALE_UPSCX(initial_subpel_x) | AV1_UPSCALE_STEPX(step_x),
+	     "upscale_p1");
+
+	u8 restoration_unit_size[V4L2_AV1_NUM_PLANES_MAX] = { 3, 3, 3 };
+
+	if (lr->flags & V4L2_AV1_LOOP_RESTORATION_FLAG_USES_LR) {
+		restoration_unit_size[0] = 1 + lr->lr_unit_shift;
+		restoration_unit_size[1] =
+			1 + lr->lr_unit_shift - lr->lr_uv_shift;
+		restoration_unit_size[2] =
+			1 + lr->lr_unit_shift - lr->lr_uv_shift;
+	}
+
+	push(AV1_LR_TYPE0(frame->loop_restoration.frame_restoration_type[0]) |
+		     AV1_LR_TYPE1(
+			     frame->loop_restoration.frame_restoration_type[1]) |
+		     AV1_LR_TYPE2(
+			     frame->loop_restoration.frame_restoration_type[2]) |
+		     AV1_LR_UNIT0(restoration_unit_size[0]) |
+		     AV1_LR_UNIT1(restoration_unit_size[1]) |
+		     AV1_LR_UNIT2(restoration_unit_size[2]),
+	     "lr");
+
+	push(0, "");
+	push(0, "");
+	pusha(av1_ctx->bufs.pipe_state.addr, "pipe_state", 0);
+	pusha(av1_ctx->bufs.ip_above.addr, "ip_above", 0);
+	pusha(av1_ctx->bufs.lf_above.addr, "lf_above", 2);
+	pusha(av1_ctx->bufs.lf_above_info.addr, "lf_above_info", 3);
+	pusha(av1_ctx->bufs.lf_left.addr, "lf_left", 0);
+	pusha(av1_ctx->bufs.lf_left_info.addr, "lf_left_info", 1);
+	/* make it obvious if its used */
+	pusha((dma_addr_t)0xa0a0a0a0a0a0, "", 0);
+	pusha(av1_ctx->bufs.rf_above_info.addr, "rf_above_info", 0);
+	pusha(av1_ctx->bufs.sr_left.addr, "sr_left", 2);
+	pusha(av1_ctx->bufs.rf_left_info.addr, "rf_left_info", 1);
+	pusha(av1_ctx->bufs.rf_left.addr, "rf_left", 3);
+
+	push(0, "mark_section");
+
+	push_comp(ctx, run->base.comp_out, ctx->comp.offsets);
+
+	pusha((u64)0, "packed_fmt_scratch", 0);
+
+	/* ignored if decomp is disabled */
+	bytesperline = ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+	pusha(run->base.y_out, "y", 0);
+	push(bytesperline, "bytesperline_y");
+	pusha(run->base.uv_out, "uv", 0);
+	push(bytesperline, "bytesperline_uv");
+
+	push(0, "mark_section");
+
+	push(AVD_HDR_HEIGHT(frame->render_height_minus_1 + 1) |
+		     AVD_HDR_WIDTH(frame->render_width_minus_1 + 1),
+	     "height_width_3");
+	if (!intra_only || intrabc)
+		set_refs(ctx, run);
+}
+
+static void set_tiles(struct avd_ctx *ctx, struct avd_av1_run *run)
+{
+	struct avd_av1_ctx *av1_ctx = ctx->priv;
+	const struct v4l2_ctrl_av1_frame *frame = run->frame;
+	const struct v4l2_ctrl_av1_sequence *seq = run->seq;
+	const struct v4l2_ctrl_av1_tile_group_entry *tile_group;
+	const struct v4l2_av1_tile_info *tile_info = &frame->tile_info;
+	int row, col, sb_row, sb_col, tile_id;
+	int sb_shift =
+		seq->flags & V4L2_AV1_SEQUENCE_FLAG_USE_128X128_SUPERBLOCK ? 5 :
+									     4;
+
+	av1_ctx->submit_num = tile_info->tile_cols * tile_info->tile_rows;
+
+	for (row = 0; row < tile_info->tile_rows; row++) {
+		for (col = 0; col < tile_info->tile_cols; col++) {
+			ctx->job.num++;
+			tile_id = row * tile_info->tile_cols + col;
+			tile_group = &run->tile_group[tile_id];
+
+			push(AVD_OP_CODED_DATA |
+				     AVD_OP_CODED_DATA_ADDR(
+					     (run->base.coded_in +
+					      tile_group->tile_offset) >>
+					     32),
+			     "tile_start");
+			push((u32)((run->base.coded_in +
+				    tile_group->tile_offset) &
+				   0xffffffff),
+			     "tile_addr");
+			push(tile_group->tile_size, "tile_size");
+
+			sb_row =
+				tile_info->mi_row_starts[tile_group->tile_row] >>
+				sb_shift;
+			sb_col =
+				tile_info->mi_col_starts[tile_group->tile_col] >>
+				sb_shift;
+			push(AVD_OP_SL_DIM_START |
+				     AVD_OP_SL_DIM_START_Y(sb_row) |
+				     AVD_OP_SL_DIM_START_X(sb_col),
+			     "tile_op_start");
+
+			push(AVD_SL_DIM_END_ROW(
+				     !(frame->flags &
+				       V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF) &&
+						     tile_id ==
+							     tile_info->context_update_tile_id ?
+					     8 :
+					     0) |
+				     AVD_SL_DIM_END_COL(col) |
+				     AVD_SL_DIM_END_Y(
+					     sb_row +
+					     tile_info->height_in_sbs_minus_1
+						     [tile_group->tile_row]) |
+				     AVD_SL_DIM_END_X(
+					     sb_col +
+					     tile_info->width_in_sbs_minus_1
+						     [tile_group->tile_col]),
+			     "tile_op_end");
+#ifdef DEBUG_INST
+			pr_info("\n");
+#endif
+		}
+	}
+}
+
+
+/* End of packing oracle, aurora-wip fbc4e7934ca7325f3483b72a51d24c74aa8536a4. */

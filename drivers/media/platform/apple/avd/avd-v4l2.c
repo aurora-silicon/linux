@@ -449,6 +449,7 @@ static const struct avd_coded_fmt_desc avd_coded_fmts[] = {
 		},
 		.ctrls = &avd_av1_ctrls,
 		.ops = &avd_av1_fmt_ops,
+		.frame_ops = &avd_av1_frame_ops,
 		.num_decoded_fmts = ARRAY_SIZE(avd_av1_decoded_fmts),
 		.decoded_fmts = avd_av1_decoded_fmts,
 		.capability = AVD_CAPABILITY_AV1,

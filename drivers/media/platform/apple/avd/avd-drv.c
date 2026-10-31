@@ -405,7 +405,7 @@ static void avd_device_run(void *priv)
 	spin_unlock_irqrestore(&avd->job_lock, flags);
 	dev_dbg(avd->dev, "avd-job: run seq %llu\n", seq);
 
-	ret = desc->ops->run(ctx);
+	ret = desc->ops->run ? desc->ops->run(ctx) : -EOPNOTSUPP;
 	if (ret) {
 		dev_dbg(avd->dev, "avd-job: run seq %llu failed: %d\n", seq, ret);
 		avd_job_finish(ctx, VB2_BUF_STATE_ERROR);
@@ -754,6 +754,7 @@ static const struct avd_variant avd_t8122_variant = {
 };
 
 static const struct avd_variant avd_t8140_variant = {
+	.av1_fp_layout = AVD_AV1_FP_T8140_TODO,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2,
 		[AVD_CODEC_H264] = 1,
@@ -811,6 +812,7 @@ static const struct avd_variant avd_t8132_variant = {
  * verified on the hardware.
  */
 static const struct avd_variant avd_t6040_variant = {
+	.av1_fp_layout = AVD_AV1_FP_BORAGE,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,

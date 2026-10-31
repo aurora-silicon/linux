@@ -1,0 +1,243 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+static struct v4l2_ctrl_av1_sequence sequence;
+static struct v4l2_ctrl_av1_frame params;
+static struct v4l2_ctrl_av1_tile_group_entry tiles[512];
+static struct v4l2_ctrl_av1_film_grain grain;
+static struct avd_variant variant = {.revision=4};
+static struct avd_dev device = {.variant=&variant};
+
+static void init_ctx(struct avd_ctx *ctx)
+{
+	memset(ctx,0,sizeof(*ctx));
+	ctx->dev=&device;
+	ctx->decoded_fmt.fmt.pix_mp.width=256;
+	ctx->decoded_fmt.fmt.pix_mp.height=256;
+	ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=256;
+	ctx->comp.start_offset=65536;
+	ctx->comp.offsets[0]=256;
+	ctx->comp.offsets[1]=512;
+	ctx->comp.offsets[2]=768;
+	ctx->comp.offsets[3]=1024;
+	ctx->decomp=true;
+	ctx->ctrl_hdl[0]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_SEQUENCE,.p_cur.p=&sequence};
+	ctx->ctrl_hdl[1]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_FRAME,.p_cur.p=&params};
+	ctx->ctrl_hdl[2]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY,.p_cur.p=tiles,.elems=1};
+	ctx->ctrl_hdl[3]=(struct v4l2_ctrl){.id=V4L2_CID_STATELESS_AV1_FILM_GRAIN,.p_cur.p=&grain};
+	assert(avd_av1_start(ctx)==0);
+}
+
+static void init_params(void)
+{
+	memset(&sequence,0,sizeof(sequence));
+	memset(&params,0,sizeof(params));
+	memset(&grain,0,sizeof(grain));
+	memset(tiles,0,sizeof(tiles));
+	sequence.bit_depth=8;
+	sequence.order_hint_bits=8;
+	sequence.flags=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X|V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+	params.frame_type=V4L2_AV1_KEY_FRAME;
+	params.primary_ref_frame=7;
+	params.frame_width_minus_1=127;
+	params.frame_height_minus_1=127;
+	params.upscaled_width=128;
+	params.superres_denom=8;
+	params.tx_mode=V4L2_AV1_TX_MODE_LARGEST;
+	params.tile_info.tile_cols=1;
+	params.tile_info.tile_rows=1;
+	params.tile_info.width_in_sbs_minus_1[0]=1;
+	params.tile_info.height_in_sbs_minus_1[0]=1;
+	tiles[0].tile_size=128;
+	for(int i=0;i<64;i++) {
+		buffers[i].base.vb.vb2_buf=(struct vb2_buffer){.index=i,.timestamp=1000+i,.planes={{.length=1048576}},.dma=0x200000000ULL+i*0x200000,.payload=4096};
+		buffers[i].av1.width=127;
+		buffers[i].av1.height=127;
+		buffers[i].av1.upscaled_width=128;
+	}
+}
+
+static struct avd_frame make_frame(unsigned int idx,unsigned int dst,struct avd_buf *prog)
+{
+	return (struct avd_frame){.idx=idx,.seq=dst+1,.frame_num=dst+1,
+		.src=&buffers[63].base.vb,.dst=&buffers[dst].base.vb,.prog=prog};
+}
+
+static void dependency_table(void)
+{
+	for(int uses=0;uses<2;uses++)for(int prev=0;prev<2;prev++)
+	for(int update=0;update<2;update++)for(int same=0;same<2;same++)
+		assert(avd_av1_cdf_dep(uses,123,prev,same?123:456,update)==
+			(uses&&prev&&update&&same));
+}
+
+static void sixteen_slots(void)
+{
+	struct avd_ctx ctx;
+	struct avd_frame f[17];
+	struct avd_buf prog[17]={0};
+	u8 snapshots[16][4096];
+	init_params();init_ctx(&ctx);
+	for(int i=0;i<17;i++) {
+		assert(!avd_buf_alloc(&device,&prog[i],4096));
+		f[i]=make_frame(i,i,&prog[i]);
+	}
+	for(int i=0;i<16;i++) {
+		assert(!avd_av1_prepare(&ctx,&f[i]));
+		assert(f[i].dep==AVD_DEP_NONE);
+		assert(f[i].prog_words>100);
+		memcpy(snapshots[i],prog[i].cpu,4096);
+		struct avd_av1_run *r=f[i].codec_priv;
+		assert(!r->seq&&!r->frame&&!r->tile_group&&!r->grain);
+		for(int j=0;j<i;j++) {
+			struct avd_av1_run *s=f[j].codec_priv;
+			assert(r->bufs.above_info.cpu!=s->bufs.above_info.cpu);
+			assert(r->bufs.pipe_state.cpu!=s->bufs.pipe_state.cpu);
+			assert(r->cdf_in!=s->cdf_in&&r->cdf_out!=s->cdf_out);
+			assert(r->seg_in!=s->seg_in);
+			assert(!memcmp(snapshots[j],prog[j].cpu,4096));
+		}
+	}
+	assert(avd_av1_prepare(&ctx,&f[16])==-EINVAL);
+	for(int i=0;i<16;i++)avd_av1_retire(&ctx,&f[i],VB2_BUF_STATE_DONE);
+	avd_av1_stop(&ctx);
+	for(int i=0;i<17;i++)avd_buf_free(&device,&prog[i]);
+	assert(!allocations);
+}
+
+static void cdf_chain(void)
+{
+	struct avd_ctx ctx;
+	struct avd_frame f[3];
+	struct avd_buf prog[3]={0};
+	init_params();init_ctx(&ctx);
+	for(int i=0;i<3;i++) {assert(!avd_buf_alloc(&device,&prog[i],4096));f[i]=make_frame(i,i,&prog[i]);}
+	assert(!avd_av1_prepare(&ctx,&f[0]));
+	params.frame_type=V4L2_AV1_INTER_FRAME;
+	params.primary_ref_frame=0;
+	params.reference_frame_ts[0]=1000;
+	params.flags=V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF;
+	assert(!avd_av1_prepare(&ctx,&f[1]));
+	assert(f[1].dep==AVD_DEP_PREV_DONE);
+	struct avd_av1_run *a=f[0].codec_priv,*b=f[1].codec_priv;
+	assert(b->cdf_in==a->cdf_out&&b->cdf_out==a->cdf_out);
+	params.reference_frame_ts[0]=1001;
+	int saved=allocations;
+	assert(avd_av1_prepare(&ctx,&f[2])==-EAGAIN);
+	assert(f[2].dep==AVD_DEP_NONE&&saved==allocations);
+	avd_av1_retire(&ctx,&f[0],VB2_BUF_STATE_DONE);
+	assert(!avd_av1_prepare(&ctx,&f[2]));
+	assert(f[2].dep==AVD_DEP_NONE);
+	assert(((struct avd_av1_run *)f[2].codec_priv)->cdf_in==b->cdf_out);
+	avd_av1_retire(&ctx,&f[1],VB2_BUF_STATE_DONE);
+	avd_av1_retire(&ctx,&f[2],VB2_BUF_STATE_ERROR);
+	avd_av1_stop(&ctx);
+	for(int i=0;i<3;i++)avd_buf_free(&device,&prog[i]);
+	assert(!allocations);
+}
+
+static void allocation_failures(void)
+{
+	for(int fail=0;fail<16;fail++) {
+		struct avd_ctx ctx;struct avd_buf prog={0};
+		init_params();init_ctx(&ctx);
+		assert(!avd_buf_alloc(&device,&prog,4096));
+		struct avd_frame f=make_frame(0,0,&prog);
+		fail_after=fail;
+		int rc=avd_av1_prepare(&ctx,&f);
+		fail_after=-1;
+		if(!rc)avd_av1_retire(&ctx,&f,VB2_BUF_STATE_ERROR);
+		else {assert(rc==-ENOMEM);assert(!f.codec_priv&&!f.prog_words);}
+		avd_av1_stop(&ctx);avd_buf_free(&device,&prog);
+		assert(!allocations);
+	}
+}
+
+static void bounds_and_fp(void)
+{
+	struct avd_ctx ctx;struct avd_buf fp={0},prog={0};
+	init_params();init_ctx(&ctx);
+	assert(!avd_av1_validate_tiles(&params,tiles,1,128));
+	assert(avd_av1_validate_tiles(&params,tiles,0,128)==-EINVAL);
+	tiles[0].tile_offset=UINT32_MAX;
+	assert(avd_av1_validate_tiles(&params,tiles,1,128)==-EINVAL);
+	tiles[0].tile_offset=0;
+	assert(!avd_buf_alloc(&device,&fp,0x1130d0));
+	assert(!avd_buf_alloc(&device,&prog,4096));
+	struct avd_frame f=make_frame(0,0,&prog);f.fp=&fp;
+	variant.av1_fp_layout=AVD_AV1_FP_BORAGE;
+	assert(avd_av1_prepare(&ctx,&f)==-EOPNOTSUPP);
+	assert(get_unaligned_le16((u8 *)fp.cpu+0x3e4)==1);
+	assert(get_unaligned_le16((u8 *)fp.cpu+0x3e6)==1);
+	put_unaligned_le16(0x1002,(u8 *)fp.cpu+0x1a);
+	put_unaligned_le32(0xdeadbeef,(u8 *)fp.cpu+0x4f8);
+	put_unaligned_le16(3,(u8 *)f.cmd+6);
+	assert(avd_av1_pack_cmd(&ctx,&f)==-EOPNOTSUPP);
+	assert(get_unaligned_le32((u8 *)f.cmd+0x4c)==0xdeadbeef);
+	assert(get_unaligned_le32((u8 *)f.cmd+0xc)==0x01483118+0x1814*3);
+	put_unaligned_le16(0x1003,(u8 *)fp.cpu+0x1a);
+	assert(avd_av1_pack_cmd(&ctx,&f)==-EINVAL);
+	variant.av1_fp_layout=AVD_AV1_FP_T8140_TODO;
+	assert(avd_av1_pack_cmd(&ctx,&f)==-EOPNOTSUPP);
+	variant.av1_fp_layout=AVD_AV1_FP_UNKNOWN;
+	f.fp=NULL;grain.flags=V4L2_AV1_FILM_GRAIN_FLAG_APPLY_GRAIN;
+	assert(avd_av1_prepare(&ctx,&f)==-EOPNOTSUPP);
+	grain.flags=0;prog.size=4;
+	assert(avd_av1_prepare(&ctx,&f)==-ENOSPC);
+	avd_av1_stop(&ctx);avd_buf_free(&device,&fp);avd_buf_free(&device,&prog);
+	assert(!allocations);
+}
+
+static void program_parity(void)
+{
+	for(int test=0;test<12;test++) {
+		struct avd_ctx ctx;struct avd_buf prog={0};
+		init_params();init_ctx(&ctx);
+		if(test&1)sequence.bit_depth=10;
+		if(test&2) {
+			sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_ENABLE_CDEF;
+			params.cdef.bits=2;params.cdef.damping_minus_3=1;
+			for(int i=0;i<4;i++){params.cdef.y_pri_strength[i]=i;params.cdef.uv_pri_strength[i]=3-i;}
+		}
+		if(test&4) {
+			params.upscaled_width=160;params.superres_denom=10;
+			params.loop_restoration.frame_restoration_type[0]=V4L2_AV1_FRAME_RESTORE_WIENER;
+			params.loop_restoration.loop_restoration_size[0]=64;
+		}
+		if(test&8) {
+			params.tile_info.tile_cols=2;params.tile_info.tile_rows=2;
+			for(int i=0;i<2;i++) {
+				params.tile_info.width_in_sbs_minus_1[i]=0;
+				params.tile_info.height_in_sbs_minus_1[i]=0;
+				params.tile_info.mi_col_starts[i]=i*16;
+				params.tile_info.mi_row_starts[i]=i*16;
+			}
+			for(int i=0;i<4;i++)tiles[i]=(struct v4l2_ctrl_av1_tile_group_entry){.tile_offset=i*128,.tile_size=128,.tile_col=i%2,.tile_row=i/2};
+			ctx.ctrl_hdl[2].elems=4;
+		}
+		assert(!avd_buf_alloc(&device,&prog,8192));
+		struct avd_frame f=make_frame(0,0,&prog);
+		assert(!avd_av1_prepare(&ctx,&f));
+		struct avd_av1_run *r=f.codec_priv;
+		r->seq=&sequence;r->frame=&params;r->tile_group=tiles;r->grain=&grain;
+		ctx.job.segments=calloc(r->num_tiles+1,sizeof(struct avd_segment));
+		legacy_set_header(&ctx,r);legacy_set_tiles(&ctx,r);
+		u32 expected[2048];unsigned int n=0;
+		expected[n++]=AVD_OP_EXEC|AVD_OP_EXEC_FLAG_START_REV4(1);
+		for(unsigned int i=0;i<=r->num_tiles;i++) {
+			struct avd_segment *seg=&ctx.job.segments[i];
+			for(unsigned int j=0;j<seg->num;j++)expected[n++]=seg->instructions[j];
+			if(i)expected[n++]=AVD_OP_EXEC|AVD_OP_EXEC_FLAG_END(i==r->num_tiles);
+		}
+		assert(n==f.prog_words&&!memcmp(expected,prog.cpu,n*sizeof(u32)));
+		free(ctx.job.segments);
+		avd_av1_retire(&ctx,&f,VB2_BUF_STATE_DONE);avd_av1_stop(&ctx);
+		avd_buf_free(&device,&prog);assert(!allocations);
+	}
+	puts("AV1 legacy program parity: 12 synthetic control vectors: PASS");
+}
+
+int main(void)
+{
+	program_parity();dependency_table();sixteen_slots();cdf_chain();allocation_failures();bounds_and_fp();
+	puts("AV1 host tests: dependency table, 16 slots, CDF inheritance, allocation failures, bounds, Apple refusal: PASS");
+	return 0;
+}
