@@ -1885,7 +1885,7 @@
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x2 0x83080000 0x0 0xc000>;
 		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1461 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
@@ -1896,7 +1896,7 @@
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x2 0x830a0000 0x0 0xc000>;
 		#iommu-cells = <1>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1461 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;

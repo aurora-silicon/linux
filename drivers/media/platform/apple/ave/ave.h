@@ -127,6 +127,8 @@ enum ave_opcode {
 
 /* The firmware build whose command layouts the driver generates */
 #define AVE_FW_TEXT_CRC_9003_78_0 0x69c54454
+/* The M4 Pro (T6040) build of the same 25G83 firmware. */
+#define AVE_FW_TEXT_CRC_T6040_25G83 0x68d5f9f6
 
 struct ave_ctx;
 
