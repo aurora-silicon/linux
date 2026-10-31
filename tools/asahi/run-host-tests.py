@@ -55,8 +55,10 @@ ASAHI_TESTS = {
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
     'ave-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-ref', '4db3a5a22c43'], PASS)],
+    'ave-probe-pm-tests.py': [(out(), PASS), (out() + ['--negative-control'], PASS)],
     'binding-lifetime-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-close', 'no-join'), out()),
+    'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'atc-usb3-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
@@ -119,6 +121,7 @@ ASAHI_TESTS = {
     'mt7932-owe-retry-tests.py': [(out(), PASS)],
     'mt7932-policy-6ghz-tests.py': [([], PASS)],
     'mt7932-policy-classes-tests.py': [([], PASS)],
+    'mt7932-scan-tests.py': [(out(), PASS)],
     'neo-auxiliary-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutation'], KILL),
                                (out('--output') + ['--old'], KILL)],
     'neo-stability-tests.py': [(out('--output'), PASS)]

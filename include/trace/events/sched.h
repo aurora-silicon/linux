@@ -11,6 +11,38 @@
 #include <linux/binfmts.h>
 
 /*
+ * A queued misfit rotation has result -EINPROGRESS and no destination.
+ * The completion reports migrate_swap()'s result, or a selection failure.
+ */
+TRACE_EVENT(sched_misfit_rotate,
+
+	TP_PROTO(struct task_struct *p, struct task_struct *t,
+		 int src_cpu, int dst_cpu, int result),
+
+	TP_ARGS(p, t, src_cpu, dst_cpu, result),
+
+	TP_STRUCT__entry(
+		__field(pid_t, src_pid)
+		__field(pid_t, dst_pid)
+		__field(int, src_cpu)
+		__field(int, dst_cpu)
+		__field(int, result)
+	),
+
+	TP_fast_assign(
+		__entry->src_pid = p->pid;
+		__entry->dst_pid = t ? t->pid : 0;
+		__entry->src_cpu = src_cpu;
+		__entry->dst_cpu = dst_cpu;
+		__entry->result = result;
+	),
+
+	TP_printk("src_pid=%d dst_pid=%d src_cpu=%d dst_cpu=%d result=%d",
+		  __entry->src_pid, __entry->dst_pid, __entry->src_cpu,
+		  __entry->dst_cpu, __entry->result)
+);
+
+/*
  * Tracepoint for calling kthread_stop, performed to end a kthread:
  */
 TRACE_EVENT(sched_kthread_stop,

@@ -4037,6 +4037,11 @@
 	status = "okay";
 };
 
+/* The sensor is on the logic board, in the base. */
+&aop_accel {
+	label = "accel-base";
+};
+
 &admac0 {
 	status = "okay";
 };
