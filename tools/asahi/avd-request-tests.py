@@ -78,6 +78,8 @@ c->run(&t); printf("PASS: %s/%s\n", (s).name, c->name); } return 0; }
                                     "v4l2_m2m_buf_done(v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx), result);"),
             "premature-buffer-return": ("ctx->scheduler_released = true;",
                                         "ctx->scheduler_released = true; v4l2_m2m_buf_done(ctx->dst_buf, VB2_BUF_STATE_DONE);"),
+            "retain-failed-table": ("kvfree(ctx->job.segments);\n\t\tctx->job.segments = NULL;",
+                                    "/* Retained stale instructions: must be detected. */"),
         }
         for name, (old, new) in mutations.items():
             if body.count(old) != 1:

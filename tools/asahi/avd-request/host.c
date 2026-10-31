@@ -340,9 +340,6 @@ static void pump(struct avd_ctx *ctx)
 	assert(ctx->finish_work.queued);
 	ctx->finish_work.queued = false;
 	avd_finish_work(&ctx->finish_work);
-	/* avd_submit_job retains its CPU table on partial submission error. */
-	free(ctx->job.segments);
-	ctx->job.segments = NULL;
 }
 static void inject(struct avd_dev *d, u32 status)
 {
@@ -458,6 +455,7 @@ int main(void)
 	pump(&a);
 	assert(resets == 1 && ba[0].result == VB2_BUF_STATE_ERROR &&
 	       pm_refs == 0);
+	assert(!a.job.segments);
 	init_ctx(&a, &dev, &ma, ba);
 	start(&a);
 	complete(&a);
@@ -466,10 +464,12 @@ int main(void)
 
 	init_ctx(&a, &dev, &ma, ba);
 	a.run_mode = 1;
+	a.job.segments = calloc(2, sizeof(*a.job.segments));
 	start(&a);
 	pump(&a);
 	assert(resets == 1 && ba[0].result == VB2_BUF_STATE_ERROR &&
 	       pm_refs == 0);
+	assert(!a.job.segments);
 	init_ctx(&a, &dev, &ma, ba);
 	pm_error = 1;
 	start(&a);
@@ -482,10 +482,14 @@ int main(void)
 	ma.out_q_ctx.q.subsystem_flags = 1;
 	ba[0].held = true;
 	a.run_mode = 2;
+	a.job.segments = calloc(2, sizeof(*a.job.segments));
 	start(&a);
 	pump(&a);
 	assert(ba[0].done == 1 && !ba[1].done && ma.nd == 2 &&
 	       !a.scheduler_released);
+	assert(a.job.segments);
+	free(a.job.segments);
+	a.job.segments = NULL;
 	init_ctx(&a, &dev, &ma, ba);
 	ma.out_q_ctx.q.subsystem_flags = 1;
 	start(&a);
@@ -509,6 +513,7 @@ int main(void)
 	pump(&a);
 	queue_full = 0;
 	assert(resets == 2 && ba[0].result == VB2_BUF_STATE_ERROR);
+	assert(!a.job.segments);
 	init_ctx(&a, &dev, &ma, ba);
 	reset_error = -EIO;
 	start(&a);

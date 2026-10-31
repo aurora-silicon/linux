@@ -17,7 +17,7 @@ submission, IRQ, watchdog, retirement and buffer-completion functions. The C
 fixture supplies deterministic MMIO, m2m, PM and workqueue mocks. It drives two
 contexts through CPU preparation and serialized hardware ownership, submission
 IRQs, duplicate/wrong-slot VP events, timeout recovery, PM/validation failures,
-held capture, streamoff drain and failed-reset admission. Four mutations must
+held capture, streamoff drain failed-reset admission and failed-table cleanup. Five mutations must
 compile and fail at runtime; a failed control or mutant build fails the runner.
 
 The capability runner executes the production firmware-tail parser, including

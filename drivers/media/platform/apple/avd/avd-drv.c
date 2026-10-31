@@ -289,6 +289,12 @@ static void avd_finish_work(struct work_struct *work)
 		}
 	}
 
+	/* Failed pictures must not leave instructions referencing dropped buffers. */
+	if (ctx->request.failed) {
+		kvfree(ctx->job.segments);
+		ctx->job.segments = NULL;
+	}
+
 	avd_finish_buffers(ctx, ctx->request.failed ? VB2_BUF_STATE_ERROR :
 						  VB2_BUF_STATE_DONE);
 	if (ctx->pm_ref)
