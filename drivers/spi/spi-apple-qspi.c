@@ -24,6 +24,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/spi/spi-mem.h>
@@ -87,11 +88,13 @@
 #define APPLE_QSPI_MAX_DATA		4096
 #define APPLE_QSPI_MAX_HZ		40000000
 #define APPLE_QSPI_TIMEOUT_MS		1000
+#define APPLE_QSPI_AUTOSUSPEND_MS		100
 
 /* Per-SoC controller differences, from the compatible. */
 struct apple_qspi_soc {
 	/* T8140: data reads of any shape pass straight to the controller. */
 	bool multi_io_reads;
+	bool runtime_pm;
 };
 
 /*
@@ -869,15 +872,21 @@ out:
 
 static int apple_qspi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 {
-	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+	struct spi_controller *ctlr = mem->spi->controller;
+	struct apple_qspi *qspi = spi_controller_get_devdata(ctlr);
+	int ret;
 
 	/* T8140 keeps its multi-line data reads; spi-mem serializes them. */
-	if (qspi->nvram_window && op->data.dir == SPI_MEM_DATA_IN &&
-	    op->data.nbytes)
-		return apple_qspi_transfer_op(mem, op);
-	if (!qspi->nvram_policy)
-		return apple_qspi_transfer_op(mem, op);
-	return apple_qspi_exec_op(mem, op);
+	if (!qspi->nvram_policy || (qspi->nvram_window &&
+				    op->data.dir == SPI_MEM_DATA_IN &&
+				    op->data.nbytes))
+		ret = apple_qspi_transfer_op(mem, op);
+	else
+		ret = apple_qspi_exec_op(mem, op);
+	/* spi-mem drops its runtime reference with pm_runtime_put(). */
+	if (ctlr->auto_runtime_pm)
+		pm_runtime_mark_last_busy(ctlr->dev.parent);
+	return ret;
 }
 
 static const struct spi_controller_mem_ops apple_qspi_mem_ops = {
@@ -1043,10 +1052,26 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	ctlr->mem_ops = &apple_qspi_mem_ops;
 
 	platform_set_drvdata(pdev, ctlr);
+	/* Keep probe and SPI NOR discovery powered until registration finishes. */
+	if (soc->runtime_pm && IS_ENABLED(CONFIG_PM)) {
+		pm_runtime_get_noresume(dev);
+		ret = devm_pm_runtime_set_active_enabled(dev);
+		if (ret) {
+			pm_runtime_put_noidle(dev);
+			return ret;
+		}
+		/* Coalesce NOR read chunks and userspace NVRAM access bursts. */
+		pm_runtime_set_autosuspend_delay(dev, APPLE_QSPI_AUTOSUSPEND_MS);
+		pm_runtime_use_autosuspend(dev);
+		ctlr->auto_runtime_pm = true;
+	}
 	ret = devm_spi_register_controller(dev, ctlr);
-	if (ret)
+	if (ret) {
+		if (ctlr->auto_runtime_pm)
+			pm_runtime_put_noidle(dev);
 		return dev_err_probe(dev, ret,
 				     "failed to register SPI controller\n");
+	}
 
 	mutex_lock(&apple_qspi_policy_lock);
 	runtime_ready = true;
@@ -1055,6 +1080,8 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	dev_dbg(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u\n",
 		version, clk_get_rate(qspi->clk), qspi->tx_depth,
 		qspi->rx_depth);
+	if (ctlr->auto_runtime_pm)
+		pm_runtime_put_autosuspend(dev);
 	return 0;
 }
 
@@ -1138,11 +1165,41 @@ static struct attribute *apple_qspi_attrs[] = {
 };
 ATTRIBUTE_GROUPS(apple_qspi);
 
+/* No IRQ handler may read the block while genpd has it powered off. */
+static int apple_qspi_runtime_suspend(struct device *dev)
+{
+	struct spi_controller *ctlr = dev_get_drvdata(dev);
+	struct apple_qspi *qspi = spi_controller_get_devdata(ctlr);
+
+	disable_irq(qspi->irq);
+	return 0;
+}
+
+static int apple_qspi_runtime_resume(struct device *dev)
+{
+	struct spi_controller *ctlr = dev_get_drvdata(dev);
+	struct apple_qspi *qspi = spi_controller_get_devdata(ctlr);
+	int ret;
+
+	ret = apple_qspi_hw_reset(qspi);
+	if (ret)
+		return ret;
+	enable_irq(qspi->irq);
+	return 0;
+}
+
 static int apple_qspi_suspend(struct device *dev)
 {
 	struct spi_controller *ctlr = dev_get_drvdata(dev);
+	int ret;
 
-	return spi_controller_suspend(ctlr);
+	ret = spi_controller_suspend(ctlr);
+	if (ret || !ctlr->auto_runtime_pm)
+		return ret;
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		spi_controller_resume(ctlr);
+	return ret;
 }
 
 /*
@@ -1157,23 +1214,29 @@ static int apple_qspi_resume(struct device *dev)
 
 	/*
 	 * Reopen the controller even if the reset failed. Left suspended, it
-	 * would fail every transfer until reboot; a transfer that times out
-	 * resets it again instead.
+	 * would fail every queued transfer until reboot. Runtime PM still
+	 * refuses MMIO if the controller could not be brought back up.
 	 */
-	ret = apple_qspi_hw_reset(qspi);
+	if (ctlr->auto_runtime_pm)
+		ret = pm_runtime_force_resume(dev);
+	else
+		ret = apple_qspi_hw_reset(qspi);
 	if (ret)
 		dev_err(dev, "controller reset failed on resume: %d\n", ret);
 
 	return spi_controller_resume(ctlr);
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_qspi_pm_ops, apple_qspi_suspend,
-				apple_qspi_resume);
+static const struct dev_pm_ops apple_qspi_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(apple_qspi_suspend, apple_qspi_resume)
+	RUNTIME_PM_OPS(apple_qspi_runtime_suspend, apple_qspi_runtime_resume, NULL)
+};
 
 static const struct apple_qspi_soc apple_qspi_single_io = { };
 
 static const struct apple_qspi_soc apple_qspi_t8140 = {
 	.multi_io_reads = true,
+	.runtime_pm = true,
 };
 
 static const struct of_device_id apple_qspi_of_match[] = {
@@ -1191,7 +1254,7 @@ static struct platform_driver apple_qspi_driver = {
 		.name = "apple-qspi",
 		.dev_groups = apple_qspi_groups,
 		.of_match_table = apple_qspi_of_match,
-		.pm = pm_sleep_ptr(&apple_qspi_pm_ops),
+		.pm = pm_ptr(&apple_qspi_pm_ops),
 	},
 };
 module_platform_driver(apple_qspi_driver);
