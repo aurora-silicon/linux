@@ -13,3 +13,11 @@ config DRM_APPLE_FABRIC_KUNIT_TEST
 	  output priority without DRM devices or Apple display hardware.
 	  The suite covers direct DisplayPort and USB4 tunnel combinations,
 	  immutable tunnel ownership and external display service readiness.
+
+config DRM_APPLE_HDR_KUNIT_TEST
+	tristate "KUnit tests for Apple DCPAV HDR metadata" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the HDR10 static metadata object encoder, DCPAV message envelope
+	  and reply status validation without Apple display hardware.

@@ -34,6 +34,7 @@
 #include <drm/drm_vblank.h>
 
 #include "dcp.h"
+#include "av-video.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
@@ -923,8 +924,11 @@ void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action)
 {
 	if (action & DCP_HOTPLUG_VBLANK)
 		schedule_work(&dcp->vblank_wq);
-	if ((action & DCP_HOTPLUG_NOTIFY) && dcp->connector)
+	if ((action & DCP_HOTPLUG_NOTIFY) && dcp->connector) {
+		if (!READ_ONCE(dcp->connector->connected))
+			apple_connector_hdr_invalidate(dcp->connector);
 		dcp_queue_hotplug(dcp->connector);
+	}
 }
 
 void dcp_retrain_oob(struct apple_connector *connector)
@@ -2468,6 +2472,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 	struct apple_dcp *dcp = platform_get_drvdata(apple_crtc->dcp);
 	struct drm_crtc_state *crtc_state;
+	struct apple_connector *hdr_connector;
+	u64 hdr_generation;
 	unsigned int action;
 	int ret = -EIO;
 	bool modeset;
@@ -2517,6 +2523,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp);
 	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
+	hdr_connector = READ_ONCE(dcp->connector);
+	hdr_generation = apple_connector_hdr_generation(hdr_connector);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -2557,6 +2565,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (ret && dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		action |= DCP_HOTPLUG_NOTIFY;
 	dcp_handle_hotplug_actions(dcp, action);
+	if (!ret)
+		av_video_atomic_modeset(dcp, hdr_connector, hdr_generation, crtc, commit);
 
 	return ret;
 }

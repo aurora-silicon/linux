@@ -17,8 +17,30 @@
 #include "dcp-internal.h"
 #include "iomfb_m4.h"
 
+u64 apple_connector_hdr_generation(struct apple_connector *connector)
+{
+	u64 generation = 0;
+
+	if (connector) {
+		scoped_guard(spinlock, &connector->hdr_lock)
+			generation = connector->hdr_generation;
+	}
+	return generation;
+}
+
+void apple_connector_hdr_invalidate(struct apple_connector *connector)
+{
+	if (!connector)
+		return;
+	scoped_guard(spinlock, &connector->hdr_lock) {
+		connector->hdr_generation++;
+		connector->hdr_valid = false;
+	}
+}
+
 void apple_connector_edid_init(struct apple_connector *connector)
 {
+	spin_lock_init(&connector->hdr_lock);
 	connector->edid_live = false;
 	connector->edid_invalidation_pending = false;
 }
@@ -37,6 +59,8 @@ void apple_connector_edid_set_live(struct apple_connector *connector, bool live)
 {
 	if (!connector)
 		return;
+	if (!live)
+		apple_connector_hdr_invalidate(connector);
 	if (!live || READ_ONCE(connector->edid_live) != live)
 		apple_connector_invalidate_edid(connector);
 	WRITE_ONCE(connector->edid_live, live);
@@ -45,6 +69,7 @@ void apple_connector_edid_set_live(struct apple_connector *connector, bool live)
 void apple_connector_set_pipeline(struct apple_connector *connector,
 				  struct platform_device *pdev)
 {
+	apple_connector_hdr_invalidate(connector);
 	apple_connector_invalidate_edid(connector);
 	WRITE_ONCE(connector->edid_live, !!pdev);
 	WRITE_ONCE(connector->dcp, pdev);

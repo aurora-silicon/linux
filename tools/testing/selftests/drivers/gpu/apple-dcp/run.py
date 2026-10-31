@@ -163,6 +163,10 @@ def main():
                     prefix += ('#define apple_rtkit_pmp_aux_rx(...) '
                                'assert(!"The PMP auxiliary buffer is outside this ordered-display fixture")\n')
                 unit = prefix + unit
+            if unit is not None and 'apple_connector_hdr_invalidate(' in unit:
+                # The reduced connector structs in these ownership fixtures have
+                # no HDR state; metadata layout has its own KUnit suite.
+                unit = '#define apple_connector_hdr_invalidate(...) ((void)0)\n' + unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)
             if name == 'service-rebind':

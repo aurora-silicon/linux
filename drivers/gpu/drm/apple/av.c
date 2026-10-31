@@ -18,6 +18,7 @@
 #include "audio.h"
 #include "afk.h"
 #include "av.h"
+#include "av-video.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 
@@ -114,6 +115,7 @@ struct audiosrv_data {
 static void av_interface_init(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit)
 {
+	av_video_init(service, name, class, unit);
 }
 
 static void av_interface_teardown(struct apple_epic_service *service)
@@ -121,7 +123,7 @@ static void av_interface_teardown(struct apple_epic_service *service)
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 
-	afk_service_disable(service);
+	av_video_teardown(service);
 
 	mutex_lock(&asrv->plug_lock);
 
@@ -972,6 +974,8 @@ int avep_init(struct apple_dcp *dcp)
 	if (!audio_node || !of_device_is_available(audio_node)) {
 		of_node_put(audio_node);
 		dev_info(dev, "No audio support\n");
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+			goto start_endpoint;
 		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
 	}
 
@@ -979,6 +983,8 @@ int avep_init(struct apple_dcp *dcp)
 	of_node_put(audio_node);
 	if (!audio_pdev) {
 		dev_info(dev, "No DP/HDMI audio device not ready\n");
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+			goto start_endpoint;
 		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
 	}
 	dcp->audiosrv->audio_dev = audio_pdev;
@@ -986,6 +992,7 @@ int avep_init(struct apple_dcp *dcp)
 	device_link_add(&audio_pdev->dev, dev,
 			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 
+start_endpoint:
 	dcp->avep = afk_init(dcp, AV_ENDPOINT, avep_ops);
 	if (IS_ERR(dcp->avep)) {
 		ret = PTR_ERR(dcp->avep);
@@ -993,6 +1000,9 @@ int avep_init(struct apple_dcp *dcp)
 			av_audiosrv_cleanup(&audiosrv_data->cleanup);
 		return ret;
 	}
+	ret = av_video_register_cleanup(dcp->avep);
+	if (ret)
+		return ret;
 	/* Newer than afk_release_context, so owner work drains before RX dies. */
 	ret = av_audiosrv_register_cleanup(dcp, audiosrv_data, dcp->avep);
 	if (ret)

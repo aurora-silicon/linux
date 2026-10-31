@@ -752,7 +752,14 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 				afk_service_retire(service);
 				if (service->ops->teardown)
 					service->ops->teardown(service);
-				return service;
+				/* A synchronous caller still owns the old identity. */
+				spin_lock_irqsave(&service->lock, flags);
+				free = !service->users &&
+				       bitmap_empty(service->cmd_map, MAX_PENDING_CMDS);
+				spin_unlock_irqrestore(&service->lock, flags);
+				if (free)
+					return service;
+				break;
 			}
 		}
 	}

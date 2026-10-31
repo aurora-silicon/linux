@@ -35,6 +35,14 @@ struct apple_connector {
 	struct drm_connector base;
 	bool connected;
 
+	/* Last successfully sent static metadata, invalidated with the link. */
+	spinlock_t hdr_lock;
+	u64 hdr_generation;
+	bool hdr_valid;
+	u8 hdr_data[24];
+	struct apple_dcp *hdr_dcp;
+	u64 hdr_service_generation;
+
 	/* The pipeline currently driving this connector, NULL if unrouted. */
 	struct platform_device *dcp;
 
@@ -89,6 +97,8 @@ struct apple_connector {
 
 #define to_apple_connector(x) container_of(x, struct apple_connector, base)
 
+u64 apple_connector_hdr_generation(struct apple_connector *connector);
+void apple_connector_hdr_invalidate(struct apple_connector *connector);
 void apple_connector_edid_init(struct apple_connector *connector);
 void apple_connector_invalidate_edid(struct apple_connector *connector);
 void apple_connector_edid_set_live(struct apple_connector *connector, bool live);

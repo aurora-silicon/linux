@@ -50,6 +50,7 @@
 
 #include "afk.h"
 #include "av.h"
+#include "av-video.h"
 #include "dcp.h"
 #include "dcp-panel-adt.h"
 #include <linux/io.h>
@@ -2961,6 +2962,7 @@ static void disconnected_hpd_event(struct apple_connector *con)
 	}
 
 	/* May run with DRM modeset locks held; defer property/cache cleanup. */
+	apple_connector_hdr_invalidate(con);
 	WRITE_ONCE(con->connected, false);
 	WRITE_ONCE(con->edid_invalidation_pending, true);
 	schedule_work(&con->hotplug_wq);
@@ -3346,9 +3348,16 @@ static int dcp_desktop_start_ep(struct apple_dcp *dcp, u32 endpoint,
 	struct apple_dcp_afkep *ep;
 	int ret;
 
+	if (endpoint == AV_ENDPOINT)
+		ops = av_video_service_ops();
 	ep = afk_init(dcp, endpoint, ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
+	if (endpoint == AV_ENDPOINT) {
+		ret = av_video_register_cleanup(ep);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Route its messages before the start: afk_start() waits for the
@@ -3757,6 +3766,7 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6_DESKTOP:
 		iomfb_poweroff_v26_6_desktop(dcp);
+		apple_connector_hdr_invalidate(dcp->connector);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -5587,6 +5597,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
+	spin_lock_init(&dcp->av_video_lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);

@@ -561,6 +561,14 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
 	struct drm_crtc_state *crtc_state;
 
+	if (new->hdr_output_metadata) {
+		const struct hdr_output_metadata *hdr = new->hdr_output_metadata->data;
+
+		if (new->hdr_output_metadata->length != sizeof(*hdr) ||
+		    hdr->metadata_type || hdr->hdmi_metadata_type1.metadata_type)
+			return -EINVAL;
+	}
+
 	if (!new->crtc || (old->colorspace == new->colorspace &&
 			   drm_connector_atomic_hdr_metadata_equal(old, new)))
 		return 0;

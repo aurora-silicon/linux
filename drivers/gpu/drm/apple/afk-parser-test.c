@@ -103,7 +103,32 @@ static void afk_serialized_report_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, afk_compact_report_dictionary(dictionary, sizeof(dictionary)));
 }
 
+static void afk_compact_pinned_slot_test(struct kunit *test)
+{
+	static const struct apple_epic_service_ops ops = {
+		.name = "DCPAVSimpleVideoInterface",
+		.reusable = true,
+	};
+	struct apple_dcp_afkep *ep = test->priv;
+	struct apple_epic_service *old = &ep->services[0];
+	struct apple_epic_service *next;
+
+	ep->endpoint = AV_ENDPOINT;
+	old->ops = &ops;
+	old->unit = 0;
+	strscpy(old->name, ops.name, sizeof(old->name));
+	old->users = 1;
+	next = afk_compact_slot(ep, &ops, ops.name, 0);
+	KUNIT_EXPECT_PTR_NE(test, next, old);
+	KUNIT_EXPECT_EQ(test, old->channel, 1U);
+	KUNIT_EXPECT_TRUE(test, old->torndown);
+	/* Once the caller releases it, a retired slot is reusable. */
+	old->users = 0;
+	KUNIT_EXPECT_PTR_EQ(test, afk_compact_slot(ep, &ops, ops.name, 0), old);
+}
+
 static struct kunit_case afk_parser_cases[] = {
+	KUNIT_CASE(afk_compact_pinned_slot_test),
 	KUNIT_CASE(afk_serialized_report_test),
 	KUNIT_CASE(afk_compact_header_test),
 	KUNIT_CASE(afk_short_epic_test),

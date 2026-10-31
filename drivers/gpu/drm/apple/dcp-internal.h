@@ -630,6 +630,9 @@ struct apple_dcp {
 
 	struct apple_dcp_afkep *avep;
 	struct audiosrv_data *audiosrv;
+	spinlock_t av_video_lock;
+	struct apple_epic_service *av_video;
+	u64 av_video_generation;
 
 	struct apple_dcp_afkep *dptxep;
 	struct apple_dcp_afkep *dptx_controller_ep;
