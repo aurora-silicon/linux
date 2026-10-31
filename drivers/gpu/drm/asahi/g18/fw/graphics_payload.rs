@@ -78,6 +78,13 @@ const WITNESS_RANGES: [(u64, usize, u32); 25] = [
     (0x100_002d_8000, 0xc0000, 4),
 ];
 
+/// Every colour-a page (address, captured usage) in file order, for the
+/// stage-10 layout that is mapped without a capture file.
+pub(crate) fn color_a_pages() -> impl Iterator<Item = (u64, u32)> {
+    RANGES.iter().flat_map(|&(base, length, usage)|
+        (0..length).step_by(PAGE_BYTES).map(move |offset| (base + offset as u64, usage)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Capture { ColorA = 1, ColorB = 2, GearsG1 = 3, FragmentWitness = 4 }
 
