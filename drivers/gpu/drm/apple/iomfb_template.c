@@ -3633,6 +3633,21 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 #endif
 	if (update_brightness) {
+#if DCP_FW_H17(DCP_FW_VER)
+		/*
+		 * H17G firmware ignores the DAC words and takes nits in the
+		 * same swap bytes as H17P. Without a requested or reported
+		 * level, send nothing rather than 0 nits.
+		 */
+		int nits = dcp->brightness.bl_dev ?
+			   dcp->brightness.bl_dev->props.brightness :
+			   dcp->brightness.nits;
+
+		if (nits > 0)
+			iomfb_encode_backlight_swap_h17p((u8 *)&req->swap, nits,
+							 dcp->brightness.maximum,
+							 true);
+#else
 #if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 		req->swap.bl_update = 1;
 #else
@@ -3640,6 +3655,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+#endif
 		dcp->brightness.update = false;
 	}
 #endif

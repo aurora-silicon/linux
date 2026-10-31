@@ -1380,13 +1380,23 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		}
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
 					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P);
-		if (ret) {
+		if (ret == -ENOENT &&
+		    ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
+			/*
+			 * M5 (H17G) announces powerlog-service with only
+			 * ep-has-desc-mgr and interface-id; match it by the
+			 * announced name, as for props-less announces.
+			 */
+			epic_name = NULL;
+			epic_class = NULL;
+		} else if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
 				ep->endpoint, ret);
 			return;
+		} else {
+			service_name = epic_class;
 		}
-		service_name = epic_class;
 	} else {
             service_name = name;
         }

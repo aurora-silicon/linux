@@ -112,6 +112,10 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	}
 
 	dcp->brightness.nits = mnits.millinits / 1000;
+	/* H17G publishes no NITS property; its first report registers the device. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
+	    dcp_has_panel(dcp) && !dcp->brightness.bl_dev && dcp->brightness.maximum > 0)
+		schedule_work(&dcp->bl_register_wq);
 
 	return 0;
 }
