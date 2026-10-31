@@ -29,6 +29,7 @@ static void test_ranges(void)
 	assert(!avd_hevc_slice_ranges(sl, 2, 300, ranges));
 	assert(ranges[0].offset == 10 && ranges[0].size == 90);
 	assert(ranges[1].offset == 120 && ranges[1].size == 180);
+	assert(avd_hevc_slice_ranges(sl, 2, 301, ranges) == -EINVAL);
 	sl[1].data_byte_offset = 99;
 	assert(avd_hevc_slice_ranges(sl, 2, 300, ranges) == -EINVAL);
 	sl[1].data_byte_offset = UINT32_MAX;

@@ -17,7 +17,8 @@ Slice layout selection checks two complete descriptions:
 * Per-NAL bit_size values tile bytesused minus the VB2 plane data_offset. The
   entropy range begins at the NAL prefix sum plus data_byte_offset.
 * Absolute data_byte_offset values delimit disjoint entropy ranges; bit_size
-  describes entropy data only. Gaps for NAL headers are allowed.
+  describes entropy data only. Gaps for NAL headers are allowed; the last
+  entropy range must end at bytesused.
 
 Invalid descriptions, overflow, overlapping absolute ranges and ambiguous
 unequal ranges fail before instruction generation. No bitstream copy or CPU

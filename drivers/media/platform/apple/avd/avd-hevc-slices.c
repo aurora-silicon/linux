@@ -30,6 +30,7 @@ int avd_hevc_slice_ranges(const struct v4l2_ctrl_hevc_slice_params *sl,
 	}
 	/* Whole-NAL bit_size values must account for the entire buffer. */
 	nal &= nal_end == payload;
+	absolute &= data_end == payload;
 	if (!nal && !absolute)
 		return -EINVAL;
 

@@ -183,6 +183,8 @@ void avd_hevc_fp_address(struct avd_hevc_fp_builder *fp,
 
 	if (!fp->cpu || fp->layout != AVD_HEVC_FP_V3)
 		return;
+	if (field == HEVC_FP_MV && fp->segment > 1)
+		return;
 	if (field == HEVC_FP_SCRATCH) {
 		if (index >= 10) {
 			fp->error = -EINVAL;
