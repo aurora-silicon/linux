@@ -453,17 +453,13 @@ static int macaudio_energy_prepare(struct snd_pcm_substream *substream)
 	unsigned int k;
 	int ret;
 
-	if (!ma->has_energy || substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
-		return 0;
-	/* An advertised but unqualified contract must not disturb legacy
-	 * prepare, its lease or its already bounded copy queue.
+	/* Qualification is established before exposing the card. An optional,
+	 * unqualified control must not probe sleeping codec I/O under the legacy
+	 * volume mutex: that could delay its time-based fallback. Once enforced,
+	 * immutable refills bound energy independently of that mutex/workqueue.
 	 */
-	mutex_lock(&ma->volume_lock_mutex);
-	if (!ma->energy_enforced && !macaudio_energy_transfer(ma))
-		ma->energy_enforced = true;
-	ret = ma->energy_enforced;
-	mutex_unlock(&ma->volume_lock_mutex);
-	if (!ret)
+	if (!ma->has_energy || !ma->energy_enforced ||
+	    substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
 		return 0;
 	if (rtd->dai_link->id >= ARRAY_SIZE(ma->energy_stream))
 		return -EINVAL;

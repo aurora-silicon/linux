@@ -15,8 +15,10 @@ are preserved from aurora-wip.
 transfer certificate is available in this source. Its transfer helper returns
 NONE, so the daemon retains its existing floor and onset reserve. There is no
 module parameter, profile option or userspace assertion that can manufacture a
-certificate. The same unqualified fallback applies to TAS paths. An enforced
-contract cannot revert to legacy mode within the device's lifetime.
+certificate. The same unqualified fallback applies to TAS paths. Qualification is checked before exposing the card. An unqualified PCM prepare
+cannot perform codec I/O or take the volume mutex on behalf of the optional
+contract, preserving the timing of the legacy fallback. An enforced contract
+cannot revert to legacy mode within the device's lifetime.
 
 The independent safety review and lead-owned measurements must precede any
 activation or deployment. The sound card's 250 ms volume lock, owner checks,

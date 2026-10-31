@@ -439,7 +439,29 @@ static void macaudio_neo_payload_is_only_the_stereo_48k_software_gain_fe(struct 
 	KUNIT_EXPECT_EQ(test, state.refunded[0], 0ULL);
 }
 
+
+static void macaudio_unqualified_prepare_leaves_the_legacy_lease_untouched(struct kunit *test)
+{
+	struct macaudio_energy_test *t = macaudio_energy_test_new(test);
+	struct apple_energy_snapshot before, after;
+
+	t->ma.energy_enforced = false;
+	t->ma.speaker_lock_remain = 123456;
+	t->ma.speaker_lock_timeout = 654321;
+	apple_energy_snapshot(&t->ma.energy, &before);
+	/* No PCM runtime/channel/codec I/O is available or needed. */
+	KUNIT_ASSERT_EQ(test, macaudio_energy_prepare(&t->substream), 0);
+	KUNIT_EXPECT_EQ(test, t->ma.speaker_lock_remain, 123456LL);
+	KUNIT_EXPECT_EQ(test, t->ma.speaker_lock_timeout, 654321LL);
+	KUNIT_EXPECT_EQ(test, t->ma.energy_transfer, MACAUDIO_ENERGY_TRANSFER_ENERGY_NORM);
+	KUNIT_EXPECT_PTR_EQ(test, t->ma.energy_stream[0].chan, NULL);
+	apple_energy_snapshot(&t->ma.energy, &after);
+	KUNIT_EXPECT_EQ(test, before.epoch, after.epoch);
+	KUNIT_EXPECT_EQ(test, before.sequence, after.sequence);
+}
+
 static struct kunit_case macaudio_energy_cases[] = {
+	KUNIT_CASE(macaudio_unqualified_prepare_leaves_the_legacy_lease_untouched),
 	KUNIT_CASE(macaudio_neo_payload_is_only_the_stereo_48k_software_gain_fe),
 	KUNIT_CASE(macaudio_neo_requires_a_complete_transfer_certificate),
 	KUNIT_CASE(macaudio_energy_owner_must_match_every_control),
