@@ -41,6 +41,7 @@ pub(crate) enum Guidance {
     Place = 1,
     LiftAndMove = 2,
     HoldStill = 3,
+    RemoveFinger = 4,
 }
 
 #[derive(Clone, Copy, Default)]

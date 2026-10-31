@@ -361,6 +361,7 @@ enum ImageOutcome {
 
 enum CaptureWait {
     Ready(u32),
+    RemoveFinger,
     Timeout,
     Fault(u8),
     Abandon,
@@ -417,6 +418,8 @@ static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_SENSOR);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TOO_MANY);
+
+const ENROL_STATUS_REMOVE_FINGER: u32 = 8;
 
 const ENROL_STATUS_RETRY: u32 = 5;
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_TIMEOUT);

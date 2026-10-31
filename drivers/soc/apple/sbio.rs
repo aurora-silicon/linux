@@ -1783,6 +1783,9 @@ impl SepData {
         }
         let advertised = match self.await_capture() {
             CaptureWait::Ready(n) => n,
+            CaptureWait::RemoveFinger => {
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_REMOVE_FINGER);
+            }
             CaptureWait::Timeout => {
                 dev_warn!(self.dev, "verify: the capture ended without a frame\n");
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_TIMEOUT);
@@ -2859,6 +2862,10 @@ impl SepData {
 
         let available = match self.await_capture() {
             CaptureWait::Ready(n) => n,
+            CaptureWait::RemoveFinger => {
+                // Only verifies leave await_capture with this outcome.
+                return ImageOutcome::Failed(ENROL_STATUS_REMOVE_FINGER);
+            }
             CaptureWait::Timeout => {
                 dev_warn!(self.dev, "enrol: capture {} ended without a frame\n", counter);
                 return ImageOutcome::NoFinger;
@@ -2993,7 +3000,7 @@ impl SepData {
 
     fn await_capture(&self) -> CaptureWait {
         let mut previous: Option<[u8; sensor::STATUS_LEN]> = None;
-        let mut armed_reported = false;
+        let mut contact = sensor::CaptureContact::new();
 
         // Interrupt-driven capture blocks on the data-ready line instead of
         // polling; the SPI status read below still gates every frame, so a
@@ -3034,10 +3041,15 @@ impl SepData {
                 return CaptureWait::Fault(st.state);
             }
 
-            let guide = match st.state {
-                sensor::STATE_ARMED => Some(bio::Guidance::Place),
-                sensor::STATE_READING => Some(bio::Guidance::HoldStill),
-                _ => None,
+            contact.observe(st.state);
+            let guide = if contact.needs_lift() {
+                Some(bio::Guidance::RemoveFinger)
+            } else {
+                match st.state {
+                    sensor::STATE_ARMED => Some(bio::Guidance::Place),
+                    sensor::STATE_READING => Some(bio::Guidance::HoldStill),
+                    _ => None,
+                }
             };
             if let Some(guide) = guide {
                 if bio::capture_guide(
@@ -3047,15 +3059,44 @@ impl SepData {
                 }
             }
 
-            if st.state == sensor::STATE_ARMED && !armed_reported {
-                armed_reported = true;
-            }
-
             if let sensor::Offset12::Available(count) = st.offset12() {
                 if count == 0 {
                     return CaptureWait::Timeout;
                 }
-                return CaptureWait::Ready(count);
+                if !contact.needs_lift() {
+                    return CaptureWait::Ready(count);
+                }
+
+                // A touch already under way when we armed must never reach
+                // IMAGE_PROCESSING_INIT/RELAY_CAPTURE or the match result.
+                // Verify's caller idles and powers off; fprintd restarts it
+                // after a REMOVE_FINGER retry. Enrolment keeps its accepted
+                // stages and drains this encrypted frame without processing it.
+                if bio::verify_is_live(
+                    &self.bio_session.lock(), self.capture_epoch.load(Relaxed),
+                ) {
+                    return CaptureWait::RemoveFinger;
+                }
+                match sensor::read_capture(count) {
+                    Ok(capture) => drop(capture),
+                    Err(sensor::CaptureError::Checksum { .. }
+                        | sensor::CaptureError::Length(_)) => {}
+                    Err(_) => return CaptureWait::Abandon,
+                }
+                if !bio::capture_is_live(
+                    &self.bio_session.lock(), self.capture_epoch.load(Relaxed),
+                ) {
+                    return CaptureWait::Abandon;
+                }
+                // Keep the original timeout across discarded frames. A held
+                // finger cannot renew the operation's deadline indefinitely.
+                if crate::shim::monotonic_ns() >= deadline_ns {
+                    return CaptureWait::Timeout;
+                }
+                if sensor::idle().is_err() || sensor::start_capture().is_err() {
+                    return CaptureWait::Abandon;
+                }
+                contact = sensor::CaptureContact::new();
             }
 
             if crate::shim::monotonic_ns() >= deadline_ns {

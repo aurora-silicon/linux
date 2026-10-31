@@ -689,6 +689,33 @@ pub(crate) fn send_patch(blob: &[u8]) -> Result<()> {
     check(unsafe { sep_sensor_xfer_tx(blob.as_ptr().cast(), blob.len()) })
 }
 
+/// A capture must start while the sensor is waiting for a new contact. An
+/// already-reading or already-ready sensor has not observed that boundary.
+/// Once tainted, even an armed status cannot make that same frame fresh.
+/// Construct a new gate only after discarding the frame and rearming.
+pub(crate) struct CaptureContact {
+    waiting: bool,
+    stale: bool,
+}
+
+impl CaptureContact {
+    pub(crate) fn new() -> Self {
+        Self { waiting: false, stale: false }
+    }
+
+    pub(crate) fn observe(&mut self, state: u8) {
+        match state {
+            STATE_ARMED if !self.stale => self.waiting = true,
+            STATE_READING | STATE_DATA_READY if !self.waiting => self.stale = true,
+            _ => {}
+        }
+    }
+
+    pub(crate) fn needs_lift(&self) -> bool {
+        self.stale
+    }
+}
+
 pub(crate) struct Status {
     pub(crate) state: u8,
     offset12: u32,
