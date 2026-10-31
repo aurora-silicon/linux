@@ -5,6 +5,7 @@ from pathlib import Path
 import argparse
 import contextlib
 import json
+import re
 import subprocess
 import tempfile
 
@@ -97,7 +98,7 @@ static int apple_qspi_transfer_op(struct spi_mem*m,const struct spi_mem_op*o){
  switch(o->cmd.opcode){
  case 0x9f:memcpy(o->data.buf.in,jedec,o->data.nbytes);break;
  case 0x05:*(u8*)o->data.buf.in=sr[0]|(stuck_busy&&programmed?1:0);break;
- case 0x35:*(u8*)o->data.buf.in=sr[1];break;
+ case 0x35:assert(jedec[0]!=0xc2);*(u8*)o->data.buf.in=sr[1];break;
  case 0x15:*(u8*)o->data.buf.in=sr[2];break;
  case 0x03:
   assert(o->addr.val+o->data.nbytes<=sizeof(flash));
@@ -137,18 +138,24 @@ static void arm(void){runtime_ready=true;assert(!apple_qspi_set_read_only("N",&p
 static bool sent(unsigned int o){for(unsigned int i=0;i<wire_count;i++)if(wire[i]==o)return true;return false;}
 static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&mem,&o)<0);assert(!wire_count);}
 int main(void){
- const char *boards[]={"apple,j613","apple,j713","apple,j700","apple,j714"};
- const char *controllers[]={"apple,t8122-qspi","apple,t8132-qspi","apple,t8140-qspi"};
- const u64 bases[]={0x2a1118000ULL,0x3ad118000ULL,0x385110000ULL,0xad118000ULL,0x3ad118004ULL};
+ const char *boards[]={"apple,j613","apple,j713","apple,j700","apple,j616s","apple,j714"};
+ const char *controllers[]={"apple,t8122-qspi","apple,t8132-qspi","apple,t8140-qspi","apple,t6041-qspi"};
+ const u64 bases[]={0x2a1118000ULL,0x3ad118000ULL,0x385110000ULL,0x429118000ULL,0xad118000ULL,0x3ad118004ULL,0x429118800ULL};
  for(unsigned int b=0;b<ARRAY_SIZE(boards);b++){
   machine=boards[b];
   for(unsigned int c=0;c<ARRAY_SIZE(controllers);c++){
    struct device_node node={controllers[c]};
    for(unsigned int a=0;a<ARRAY_SIZE(bases);a++)
-    assert(apple_qspi_nvram_write_board(&node,bases[a])==((b==0&&c==0&&a==0)||(b==1&&c==1&&a==1)||(b==2&&c==2&&a==2)));
+    assert(!!apple_qspi_nvram_write_board(&node,bases[a])==(b<4&&b==c&&c==a));
   }
  }
- puts("PASS J613/J713/J700 board, controller and full-width aperture qualification (60 combinations)");
+ const struct apple_qspi_board *qb;
+ struct device_node t6041={"apple,t6041-qspi"},t8140={"apple,t8140-qspi"};
+ machine="apple,j616s";qb=apple_qspi_nvram_write_board(&t6041,0x429118000ULL);
+ assert(qb&&qb->nvram_start==0x700000&&qb->nvram_size==0x100000&&qb->jedec[0]==0xc2&&qb->jedec[1]==0x2b&&qb->jedec[2]==0x27&&!qb->bp_ok);
+ machine="apple,j700";qb=apple_qspi_nvram_write_board(&t8140,0x385110000ULL);
+ assert(qb&&qb->nvram_start==0x24000&&qb->nvram_size==0x1d0000&&qb->jedec[2]==0x15&&qb->bp_ok==0x1c);
+ puts("PASS J613/J713/J700/J616s board, controller and full-width aperture qualification (140 combinations)");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
  /* T8140 (J700) shares the verified policy at its DT nvram window; its data
@@ -216,6 +223,19 @@ int main(void){
   assert(sent(0x04)&&apple_qspi_set_read_only("N",&parameter)==-EPERM);denied(o);
  }
  puts("PASS read-only startup, exact opcode/range/page/erase admission, WREN ordering, readback and fault latch");
+ /* J616s Macronix part: 35h (EQIO there) never reaches the wire. */
+ reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;memcpy(q.jedec,jedec,3);arm();memset(data,0x55,sizeof(data));
+ o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&!sent(0x35)&&sent(0x15));
+ assert(!memcmp(flash+0x700000,data,256)&&!sr[0]);
+ erase.addr.val=0x701000;
+ wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20)&&!sent(0x35));
+ struct spi_mem_op rdcr2=SPI_MEM_OP(SPI_MEM_OP_CMD(0x35,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_DATA_IN(1,id,1));
+ wire_count=0;assert(apple_qspi_exec_op(&mem,&rdcr2)<0&&!wire_count);
+ for(unsigned int bp=0x04;bp<=0x20;bp<<=1){reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;memcpy(q.jedec,jedec,3);arm();
+  sr[0]=bp;wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x35));}
+ reset();memcpy(q.jedec,(u8[]){0xc2,0x2b,0x27},3);arm();wire_count=0;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
+ puts("PASS Macronix J616s part: no 35h on the wire, SR/CR checks, BP0-BP3 refusal and JEDEC mismatch");
  return 0;
 }
 '''
@@ -245,15 +265,18 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
     source = (ROOT / 'drivers/spi/spi-apple-qspi.c').read_text()
     policy = (ROOT / 'drivers/spi/spi-apple-qspi-policy.h').read_text()
+    boards = (''.join(m.group(0) + '\n' for m in re.finditer(r'#define APPLE_QSPI_JEDEC_\w+.*', source)) +
+              function(source, 'struct apple_qspi_board {').rstrip() + ';\n' +
+              function(source, 'static const struct apple_qspi_board apple_qspi_boards[]').rstrip() + ';\n')
     signatures = ['static int apple_qspi_set_read_only(', 'static int apple_qspi_get_read_only(',
-                  'static bool apple_qspi_nvram_write_board(',
+                  'static const struct apple_qspi_board *\napple_qspi_nvram_write_board(',
                   'static bool apple_qspi_opcode_is_read(', 'static int apple_qspi_width_mode(',
                   'static int apple_qspi_shape_op(', 'static bool apple_qspi_supports_op(',
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
                   'static int apple_qspi_read_array(', 'static int apple_qspi_status(',
                   'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(',
                   'static int apple_qspi_mem_exec_op(']
-    code = PREFIX + policy + '\n'.join(function(source, s) for s in signatures) + CONTROLS
+    code = PREFIX + policy + boards + '\n'.join(function(source, s) for s in signatures) + CONTROLS
     output = contextlib.nullcontext(str(args.output)) if args.output else tempfile.TemporaryDirectory(prefix='qspi-nvram-')
     with output as directory:
         current = run(code, Path(directory) / 'current.c')
@@ -261,11 +284,16 @@ def main():
         if current.returncode:
             raise SystemExit(current.stderr)
         for name, old, new in [
-            ('j713-board', 'of_machine_is_compatible("apple,j713")', 'true'),
-            ('j713-aperture', 'base == 0x3ad118000ULL', 'base != 0'),
-            ('j700-board', 'of_machine_is_compatible("apple,j700")', 'true'),
+            ('controller', 'of_device_is_compatible(node, board->controller) &&', ''),
+            ('board', 'of_machine_is_compatible(board->machine) &&', ''),
+            ('aperture', 'base == board->base', 'base != 0'),
+            ('j616s-aperture', '"apple,j616s", 0x429118000ULL', '"apple,j616s", 0x429118800ULL'),
+            ('j616s-partition', '"apple,j616s", 0x429118000ULL,\n\t  0x700000', '"apple,j616s", 0x429118000ULL,\n\t  0x680000'),
             ('range', 'addr >= start &&', 'addr >= 1 &&'),
             ('bp-ok', '!(sr1 & 0x1c & ~bp_ok)', '1'),
+            ('mx-bp3', '!(sr & 0x3c & ~bp_ok)', '!(sr & 0x1c & ~bp_ok)'),
+            ('mx-eqio', 'opcode = macronix;', 'opcode = winbond;'),
+            ('mx-eqio-read', 'qspi->jedec[0] == APPLE_QSPI_MFR_MACRONIX) {', '0) {'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;')]:

@@ -2,9 +2,6 @@
 #ifndef APPLE_QSPI_POLICY_H
 #define APPLE_QSPI_POLICY_H
 
-/* The pinned J613/J713 nvram partition. */
-#define APPLE_QSPI_NVRAM_START 0x700000ULL
-#define APPLE_QSPI_NVRAM_END   0x800000ULL
 #define APPLE_QSPI_PAGE_SIZE   256U
 #define APPLE_QSPI_ERASE_SIZE  4096U
 
@@ -64,5 +61,19 @@ static inline int apple_qspi_status_allows_write(unsigned int sr1,
 {
 	return !(sr1 & 0x03) && !(sr1 & 0x1c & ~bp_ok) &&
 		!(sr2 & 0xc0) && !(sr3 & 0x04);
+}
+
+/* JEDEC manufacturer ID of Macronix parts. */
+#define APPLE_QSPI_MFR_MACRONIX	0xc2
+
+/*
+ * The Macronix status register holds WIP, WEL and four block-protect bits,
+ * BP[3:0] at bits 5:2. BUSY and WEL are always refused, and block-protect
+ * bits only where bp_ok allows them. QE and SRWD stay unchanged.
+ */
+static inline int apple_qspi_mx_status_allows_write(unsigned int sr,
+						    unsigned int bp_ok)
+{
+	return !(sr & 0x03) && !(sr & 0x3c & ~bp_ok);
 }
 #endif
