@@ -10,6 +10,7 @@
 #include <linux/types.h>
 
 struct platform_device;
+struct ane_h16_build;
 
 enum ane_fw_owner {
 	ANE_FW_OWNER_AP,
@@ -23,6 +24,7 @@ enum ane_fw_irq_role {
 
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
+	const struct ane_h16_build *h16_boot;
 	u32 soc;
 	u16 chip_family;
 	u16 ane_type;
@@ -70,5 +72,12 @@ ane_fw_preload_ranges_valid(const struct ane_fw_platform *soc, const u64 phys[2]
 extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
+
+int ane_fw_platform_probe(struct platform_device *pdev,
+			  const struct ane_fw_platform *soc);
+void ane_fw_platform_remove(struct platform_device *pdev);
+int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc,
+			  unsigned int stage);
+void ane_h16_backend_remove(struct platform_device *pdev);
 
 #endif /* __ANE_FW_PLATFORM_H__ */

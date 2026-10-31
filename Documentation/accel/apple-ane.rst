@@ -30,14 +30,13 @@ values: ``0x10000000000`` and ``0x100000c0000``. Their sizes must be
 sources must not contain captured physical addresses. The reservations must
 remain intact until reboot, including after driver failure.
 
-H16 preflight checks resource geometry, firmware identity and these ranges
-without MMIO or power access. No disk firmware is requested or staged.
-Missing reservations fail with ``-ENODATA``. Malformed reservations fail
-with ``-EINVAL``. Even a valid handoff currently fails with ``-EOPNOTSUPP``:
-live-page ownership and snapshot acquisition, the original-container
-userspace load ABI, process installation and cold boot backend
-are incomplete. The section-only
-load ABI is explicitly refused for H16. No accel node or program-loading interface is published.
+Metadata preflight checks resource geometry and these ranges without MMIO
+or power access. Missing reservations fail with ``-ENODATA`` and malformed
+reservations with ``-EINVAL``. Without ``h16_stage`` the module still refuses
+registration before power access. An explicit stage enables the diagnostic
+backend described below. The original-container userspace load ABI and
+process installation remain unavailable. No accel node or program-loading
+interface is published for these stages.
 
 The H16 DT nodes stay disabled. The five real PMGR providers already encode
 the system/CPU/MPM/task/base dependency graph. The PMGR binding does not
@@ -374,3 +373,140 @@ reports, routing, duplicates, timeouts, capacity and UUID exhaustion. HWX
 tests generate synthetic linear/scratch forms with optional kernel data,
 then exercise command, geometry, tensor, aperture, symbol, relocation and
 digest refusal paths. No hardware inference result is implied.
+
+Staged H16 cold boot
+-------------------
+
+The read-only module parameter ``h16_stage`` accepts ``preflight``, ``map``,
+``boot`` or ``startup``. Each includes the preceding stages. No H14 boot
+parameter changes the H16 path. H17 still refuses ownership and registration.
+All build-dependent boot values and ordered masked updates belong to the
+H16 27.0 (26A428) match-data profile. The existing preload validator must
+accept the resident image before that profile can run. Live mutable patchbay
+and firmware tunable values are preserved, with no disk firmware owner.
+
+``preflight`` raises the five real domains through genpd, in DT order, and
+checks every requested/ACTUAL low byte twice before reading the engine.
+CPU control must be zero and RVBAR must be ``0x10000000001``. It reads all
+three DART fault status/address words, version/protect/lock headers and four
+DAPF records per instance against ``apple,dapf-ranges``. The ANE backend
+writes no engine, DART or DAPF register at this rung. Genpd owns power writes.
+
+``map`` claims an exclusive, singleton IOMMU group and an unmanaged domain
+covering the three SID-0 DART instances. It checks the finalized aperture
+rather than widening geometry in the client. TEXT is read-only, DATA is
+read/write, and the four range-containing 16 KiB pages use identity addresses
+and MMIO attributes. Every DAPF lock is checked before any record changes;
+a locked mismatch refuses. Unlocked changes preserve unrelated flag bits
+and are read back. The backend does not change protect or lock registers.
+
+The DT must describe only SID 0 on these three instances for this backend.
+The generic IOMMU attachment API attaches every stream in ``iommus``; it
+cannot select a subset from the six-stream production description. Until
+the test DT supplies only SID 0, map and later stages explicitly refuse
+extra streams. The inherited test DTS currently enables the six-stream
+node and therefore needs this integration adjustment before rung 2. The
+production node stays disabled. The driver does not rewrite the live DT
+or access the DART driver's private stream configuration.
+
+``boot`` allocates the zeroed command pool at ``0x10000384000`` and completes
+the H16 CE request/ack protocol, bounded to 5001 delays of 10 us. Ordered
+ANEAXI2AF, ANEXLAXI2AF and selected C1PPT updates follow before any scratch
+write. A pre-existing C1PPT lock requires matching values. There is no H17
+PWGATE sequence. The host clears scratch 0 through 7 in order, prepares the
+polled management client, writes scratch 6 = 1 and 7 = 0, rechecks RVBAR,
+and writes CPU control 0 then 0x10. RVBAR is never rewritten.
+
+The host polls READY ``0x08042006`` every 1 ms, with at most 1000 polls and
+one absolute deadline. Scratch 0 is a channel count below 0x21. IPC bytes
+are scratch 1 plus one; heap bytes are scratch 3; scratch 4 is a Boolean.
+IPC and heap allocations are rounded to 16 KiB and bounded before use.
+The IPC allocation at ``0x100003d0000`` must fit below the fixed heap base
+``0x100003e4000``. The heap has a 16 MiB host-policy limit and must also fit
+below shared allocations. These limits are not firmware capability claims.
+
+The 0x174-byte init record at pool + 0x180 has a zero first qword, IPC DVA,
+0x380000 configured span, the corresponding 0xfc80000 remainder, requested
+heap DVA/bytes, unrounded IPC bytes and pool DVA/bytes. Reserved bytes and
+the cold-start retained value are zero. Template count is 64 and record
++0x12c is 4. A DMA write barrier precedes publication to scratch 0 low,
+scratch 1 high, then scratch 7 ``0xf7fbdff9``. The reply must contain both
+READY and the exact IPC base; unchanged init-record addresses time out.
+The shared transport validates the table before arming any type-0 ring.
+Only then does the host write READY to scratch 3 and wait for zero.
+
+``startup`` sends only PRINT_ENABLE (0x4, 12 bytes), START (0x0, 12),
+CONFIG_GET (0x3, 16) and RESOURCE_INFO_GET (0x22, 100) on IO. SHAREDMALLOC
+allocation requests are serviced under the shared transport's bounded host
+policy while waiting. Each command keeps one absolute deadline and requires
+a zero acknowledgement. The CONFIG_GET tick must be nonzero and is logged;
+24 MHz is a comparison value, not a refusal predicate. All 100 resource-info
+reply bytes are logged and do not grant allocation authority.
+
+Mailbox service uses 64-bit pop-on-read accesses and bounded, nonblocking
+receive/transmit batches. Offered HELLO, EPMAP and power messages use the
+shared version-12 parser. Unknown or incompatible messages are logged and
+receive no invented response. A missing or stalled RTKit session never
+blocks the scratch protocol. IRQ 1054 remains disabled through all stages.
+
+Before RUN, errors unwind mappings and genpd references with a rollback log.
+Immediately before the first RUN write the backend pins the module. Every
+later failure latches quarantine, dumps scratch 0 through 7 and DART fault
+words, and retains mappings, pages and power. Probe stays bound on such an
+error so automatic devres cleanup cannot reclaim firmware DMA. A successful
+boot also stays pinned because no safe in-place shutdown/reset is proved.
+Further attempts are refused until reboot. There is no writable stage knob.
+
+Hardware test plan
+------------------
+
+Use a matching kernel/module set and the tether-loaded J616s ANE test DTB.
+The test DT needs the SID-0-only adjustment above, the two loader-provided
+reserved preload ranges and an aperture covering the identity pages. Keep
+shipping DT nodes disabled and persistent boot storage untouched. Boot with
+``user4k=on modprobe.blacklist=ane,ane_t6021`` and the tether console args.
+Each command below is a separate stage attempt. Preserve full dmesg at the
+first unexpected value.
+
+Before RUN the module can be removed between rungs::
+
+  modprobe ane_t6021 h16_stage=preflight
+  rmmod ane_t6021
+  modprobe ane_t6021 h16_stage=map
+  rmmod ane_t6021
+
+Expected preflight messages include ``H16 preload identity H16 27.0 26A428
+accepted``, ``H16 power ACTUAL`` twice for each of the five words with low
+byte ff, ``H16 CPU control/RVBAR 0 10000000001``, DART status/address and
+DAPF comparisons, then ``H16 stage 1 complete``. Map adds TEXT/DATA mapping
+messages and four ``H16 identity MMIO`` messages, clean fault words and
+``H16 stage 2 complete``. An unchanged six-stream test tree instead logs
+``H16 map requires only SID 0 on three DARTs; refusing extra streams``.
+
+On a fresh boot run the boot rung::
+
+  modprobe ane_t6021 h16_stage=boot
+
+Expect ``H16 READY 8042006 0``, request logs (the comparator values are
+channels 8, IPC-minus-one c440, heap f00000, mode 0), then
+``H16 table validated 100003d0000 8``, ``H16 scratch 3 cleared 0 0`` and
+``H16 stage 3 complete; held until reboot``. Comparator sizing values are
+not additional admission checks. Never unload after this command.
+
+Reboot through the tether route before testing startup::
+
+  modprobe ane_t6021 h16_stage=startup
+
+Expect the boot messages, SHAREDMALLOC allocation messages as offered,
+``H16 startup ack`` for IDs 4, 0, 3 and 22 with zero status,
+``H16 CONFIG_GET tick`` with a nonzero value, ``H16 stage 4 complete; held
+until reboot`` and exactly 100 bytes under ``H16 RESOURCE_INFO``. A failure
+after RUN must instead show the scratch/fault dump and ``H16 quarantine``.
+Do not retry or unload; collect logs and reboot. No inference result is
+claimed by these diagnostic rungs.
+
+The ``ane-h16-boot`` KUnit suite uses a simulated engine, scratch cells,
+mailbox polling and rings. It covers startup including allocation service,
+missing READY, wrong/stale table publication, oversized IPC/heap requests,
+channel bounds, locked DAPF differences, nonzero acks, scratch-3 timeout,
+zero tick, default refusal and quarantine after RUN.
