@@ -415,21 +415,39 @@ static int ane_ps_verify_on(struct ane_device *ane)
 	return err;
 }
 
+static bool ane_partitions_off(struct ane_device *ane)
+{
+	if (ane_ps_act(ane))
+		return false;
+
+	/* The SET window does not include the shared SYS_CPU parent. Its
+	 * DART consumers suspend asynchronously after our references drop.
+	 * Wait for every attached domain as well, so resuming the consumer
+	 * cannot race that work and leave the TM register file powered.
+	 */
+	if (ane->pd_count == 1)
+		return !dev_pm_genpd_is_on(ane->dev);
+	for (int i = 0; i < ane->pd_count; i++)
+		if (dev_pm_genpd_is_on(ane->pd_dev[i]))
+			return false;
+	return true;
+}
+
 static int ane_verify_off(void *ctx)
 {
 	struct ane_device *ane = ctx;
-	u32 act;
+	bool off;
 	int err;
 
 	/* genpd may retain a shared or busy parent even after suspend succeeds.
-	 * Only PMGR is safe to read until the engine has power again.
+	 * Only PMGR and provider state are safe to read while the engine is off.
 	 */
 	if (!ane->ps)
 		return -EOPNOTSUPP;
-	err = read_poll_timeout(ane_ps_act, act, act == 0,
+	err = read_poll_timeout(ane_partitions_off, off, off,
 				100, 100000, false, ane);
 	dev_info(ane->dev, "recovery: engine power-off actual=%#x rc=%d\n",
-		 act, err);
+		 ane_ps_act(ane), err);
 	return err;
 }
 
