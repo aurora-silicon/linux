@@ -3,6 +3,7 @@
 obj-$(CONFIG_DRM_ACCEL_AMDXDNA)		+= amdxdna/
 obj-$(CONFIG_DRM_ACCEL_ANE)		+= ane/
 obj-$(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST)	+= ane/
+obj-$(CONFIG_DRM_ACCEL_ANE_PM_KUNIT_TEST)	+= ane/
 obj-$(CONFIG_DRM_ACCEL_ARM_ETHOSU)	+= ethosu/
 obj-$(CONFIG_DRM_ACCEL_HABANALABS)	+= habanalabs/
 obj-$(CONFIG_DRM_ACCEL_IVPU)		+= ivpu/

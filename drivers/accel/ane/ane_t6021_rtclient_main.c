@@ -65,6 +65,7 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
@@ -1065,7 +1066,7 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 
 	if (ane_t6021_tracing)
 		return ane_rtclient_call_wait_traced(ane, deadline);
-	if (ane->soc->platform && time_after_eq(jiffies, deadline))
+	if (time_after_eq(jiffies, deadline))
 		return -ETIMEDOUT;
 
 	do {
@@ -1098,8 +1099,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						     unsigned int channel,
 						     unsigned int timeout_ms)
 {
-	unsigned long deadline = ane->soc->platform && ane->waiting ?
-		ane->waiting->deadline : jiffies + msecs_to_jiffies(timeout_ms);
+	unsigned long deadline;
 	int ret;
 	u64 stats_ticket = 0;
 	u64 stats_submit_ns = 0;
@@ -1133,6 +1133,11 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	    (!ane->waiting || !ane->waiting->active || ane->pending.quarantined))
 		return -EIO;
 
+	/* One bounded budget covers both ACK and finish, including H14. */
+	timeout_ms = min(timeout_ms, 5000U);
+	deadline = ane->soc->platform && ane->waiting ?
+		ane->waiting->deadline : jiffies + msecs_to_jiffies(timeout_ms);
+
 	if (stats_call) {
 		stats_submit_ns = ktime_get_ns();
 		stats_ticket = ane_stats_begin(&ane->stats_ctrs,
@@ -1140,8 +1145,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 					       stats_submit_ns, 1);
 	}
 	ret = ane_rtclient_legacy_exchange(ane, command, length, opcode,
-					   channel, ane->soc->platform ? deadline :
-					   jiffies + msecs_to_jiffies(timeout_ms));
+					   channel, deadline);
 	if (ret) {
 		ane_t6021_tracing = false;
 		if (stats_call)
@@ -1156,8 +1160,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	if (execute) {
 		if (ane_t6021_tracing)
 			ane_t6021_trace_add(ANE_TR_ACK, 0);
-		ret = ane_rtclient_call_wait(ane, ane->soc->platform ? deadline :
-					    jiffies + msecs_to_jiffies(timeout_ms));
+		ret = ane_rtclient_call_wait(ane, deadline);
 		ane_t6021_tracing = false;
 		if (!ret)
 			dma_rmb();
@@ -2272,6 +2275,13 @@ struct ane_rtclient_pd {
 	struct device **pd_dev;
 	struct device_link **pd_link;
 	int count;
+
+	/* T8112 power gate, kept in step with power-domains[0]. */
+	struct notifier_block pwgate_nb;
+	void __iomem *pwgate_base;
+	void __iomem *pwgate;
+	bool pwgate_nb_added;
+	bool pwgate_opened;
 };
 
 static LIST_HEAD(ane_rtclient_pd_list);
@@ -2283,9 +2293,101 @@ static DEFINE_MUTEX(ane_rtclient_probe_guard_lock);
 static void ane_rtclient_pd_free(struct ane_rtclient_pd *pd)
 {
 	list_del(&pd->list);
+	if (pd->pwgate_base)
+		iounmap(pd->pwgate_base);
 	kfree(pd->pd_dev);
 	kfree(pd->pd_link);
 	kfree(pd);
+}
+
+/*
+ * T8112 power gate. A word in the "set" window gates the ANE: bits 29:28
+ * set (the word reads 0x30000000) is closed, both clear is open. It must be
+ * open before the ANE CPU power state (ane_sys_cpu) turns on and is closed
+ * again after that state turns off, with ane_sys, the parent, on both
+ * times. power-domains[0] is ane_sys_cpu, and genpd calls this notifier
+ * after ane_sys is on and before ane_sys_cpu is written (PRE_ON), and
+ * after ane_sys_cpu is off and before ane_sys goes off (OFF), which is that
+ * order. Only the two known values are written. Any other word fails the
+ * power-up without a write.
+ */
+#define ANE_PWGATE_CLOSED	GENMASK(29, 28)
+#define ANE_PWGATE_POLL_US	10
+#define ANE_PWGATE_TIMEOUT_US	100000
+
+static int ane_rtclient_pwgate_notify(struct notifier_block *nb,
+				      unsigned long action, void *data)
+{
+	struct ane_rtclient_pd *pd =
+		container_of(nb, struct ane_rtclient_pd, pwgate_nb);
+	u32 gate;
+	int ret;
+
+	switch (action) {
+	case GENPD_NOTIFY_PRE_ON:
+		gate = readl(pd->pwgate);
+		if (!(gate & ANE_PWGATE_CLOSED))
+			return NOTIFY_OK;
+		if (gate != ANE_PWGATE_CLOSED) {
+			dev_err(pd->dev, "power gate word %#x is not a known state\n",
+				gate);
+			return notifier_from_errno(-EIO);
+		}
+		writel(0, pd->pwgate);
+		ret = readl_poll_timeout_atomic(pd->pwgate, gate,
+						!(gate & ANE_PWGATE_CLOSED),
+						ANE_PWGATE_POLL_US,
+						ANE_PWGATE_TIMEOUT_US);
+		if (ret) {
+			writel(ANE_PWGATE_CLOSED, pd->pwgate);
+			dev_err(pd->dev, "power gate did not open (word %#x)\n",
+				gate);
+			return notifier_from_errno(ret);
+		}
+		pd->pwgate_opened = true;
+		return NOTIFY_OK;
+	case GENPD_NOTIFY_OFF:
+		if (!pd->pwgate_opened)
+			return NOTIFY_OK;
+		pd->pwgate_opened = false;
+		writel(ANE_PWGATE_CLOSED, pd->pwgate);
+		ret = readl_poll_timeout_atomic(pd->pwgate, gate,
+						(gate & ANE_PWGATE_CLOSED) ==
+						ANE_PWGATE_CLOSED,
+						ANE_PWGATE_POLL_US,
+						ANE_PWGATE_TIMEOUT_US);
+		if (ret)
+			dev_warn(pd->dev, "power gate did not close (word %#x)\n",
+				 gate);
+		return NOTIFY_OK;
+	default:
+		return NOTIFY_DONE;
+	}
+}
+
+/*
+ * Register the power gate notifier on power-domains[0] before its device
+ * link is created: the link resumes the domain at once.
+ */
+static int ane_rtclient_pwgate_add(struct ane_rtclient *ane,
+				   struct ane_rtclient_pd *pd)
+{
+	int ret;
+
+	if (!ane->soc->pwgate_off || pd->pwgate_nb_added)
+		return 0;
+	if (!pd->pwgate_base) {
+		pd->pwgate_base = of_iomap(ane->dev->of_node, 2);
+		if (!pd->pwgate_base)
+			return -ENOMEM;
+		pd->pwgate = pd->pwgate_base + ane->soc->pwgate_off;
+	}
+	pd->pwgate_nb.notifier_call = ane_rtclient_pwgate_notify;
+	ret = dev_pm_genpd_add_notifier(pd->pd_dev[0], &pd->pwgate_nb);
+	if (ret)
+		return ret;
+	pd->pwgate_nb_added = true;
+	return 0;
 }
 
 static int ane_rtclient_attach_genpd(struct ane_rtclient *ane)
@@ -2336,6 +2438,11 @@ found:
 				goto out;
 			}
 		}
+		if (i == 0) {
+			err = ane_rtclient_pwgate_add(ane, pd);
+			if (err)
+				goto out;
+		}
 		if (!pd->pd_link[i]) {
 			if (!ane_rtclient_pinned) {
 				if (!try_module_get(THIS_MODULE)) {
@@ -2380,6 +2487,15 @@ static void ane_rtclient_detach_genpd(struct device *dev)
 		for (i = count - 1; i >= 0; i--) {
 			if (pd->pd_link[i])
 				device_link_del(pd->pd_link[i]);
+			/*
+			 * genpd keeps a notifier past detach, so drop it first.
+			 * The domain may then go off with the gate open, the
+			 * state between the two power-up steps.
+			 */
+			if (i == 0 && pd->pwgate_nb_added) {
+				dev_pm_genpd_remove_notifier(pd->pd_dev[0]);
+				pd->pwgate_nb_added = false;
+			}
 			if (pd->pd_dev[i])
 				dev_pm_domain_detach(pd->pd_dev[i], true);
 		}
@@ -2492,9 +2608,10 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		pm_runtime_disable(dev);
 		return -EPROBE_DEFER;
 	}
-	/* T8112: macOS (type 0x70) opens PWGATE (bits 29:28 = 0) before
-	 * the ps words. This driver only reads it: an engine read behind a
-	 * closed gate is untested, so it refuses first.
+	/* T8112: the power gate notifier opened the gate before ane_sys_cpu
+	 * turned on. A gate that still reads closed means the state was
+	 * already on without it (no power-up ran), so refuse before any
+	 * engine read.
 	 */
 	if (ane->soc->pwgate_off) {
 		void __iomem *set = devm_of_iomap(dev, dev->of_node, 2, NULL);

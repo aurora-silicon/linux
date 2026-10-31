@@ -27,6 +27,10 @@ typedef uint8_t u8;
 #define MAX_PHANDLE_ARGS 4
 #define EPROBE_DEFER 517
 #define SZ_4K 4096
+#define SZ_16K 16384
+#define SZ_128K 131072
+#define IORESOURCE_MEM 0x200
+#define PMP_ANE_ID 10
 #define __iomem
 #define __force
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
@@ -133,6 +137,15 @@ struct work_struct {
 struct delayed_work {
 	struct work_struct work;
 };
+/* The T600x ANE window; T6030 reports never name one. */
+struct apple_pmp_ane {
+	void __iomem *dvfs;
+	void __iomem *report;
+	unsigned int level;
+	unsigned int timeouts;
+	bool owned;
+	bool reserved;
+};
 struct apple_pmp_report {
 	struct device *dev;
 	struct apple_pmp_dram dram;
@@ -147,6 +160,7 @@ struct apple_pmp_report {
 	bool defer;
 	unsigned int polls;
 	struct delayed_work ready_work;
+	struct apple_pmp_ane ane;
 };
 struct completion {
 	bool done;
@@ -595,6 +609,40 @@ static int devm_add_action_or_reset(struct device *d, void (*f)(void *),
 	assert(action_count < 8);
 	actions[action_count++] = (struct action){ f, p };
 	return 0;
+}
+struct resource {
+	u64 start, end;
+};
+static int of_property_match_string(const struct device_node *n,
+				    const char *p, const char *s)
+{
+	(void)n; (void)p; (void)s;
+	return -EINVAL;
+}
+static struct resource *platform_get_resource(struct platform_device *p,
+					      unsigned int t, unsigned int i)
+{
+	(void)p; (void)t; (void)i;
+	assert(!"T6030 reports have no ANE window");
+	return NULL;
+}
+static struct resource *platform_get_resource_byname(struct platform_device *p,
+						     unsigned int t,
+						     const char *n)
+{
+	(void)p; (void)t; (void)n;
+	assert(!"T6030 reports have no ANE window");
+	return NULL;
+}
+static u64 resource_size(const struct resource *r)
+{
+	return r->end - r->start + 1;
+}
+static void *devm_ioremap_resource(struct device *d, struct resource *r)
+{
+	(void)d; (void)r;
+	assert(!"T6030 reports have no ANE window");
+	return NULL;
 }
 static void *devm_platform_ioremap_resource(struct platform_device *p, int i)
 {

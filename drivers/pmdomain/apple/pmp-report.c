@@ -33,6 +33,7 @@
 
 #include "pmp-report-validation.h"
 #include "pmp-dram.h"
+#include "pmp-ane.h"
 
 #define PMP_REPORT_READY 0x1
 
@@ -83,6 +84,8 @@ struct apple_pmp_start;
 struct apple_pmp_report {
 	struct device *dev;
 	struct apple_pmp_dram dram;
+	struct apple_pmp_ane ane;
+	struct device *ane_owner;
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
 	/* Protects the request word, @shadow, @known and @defer. */
@@ -149,6 +152,141 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
 /* Bound report regions, protected by RCU until managed teardown drains readers. */
 static LIST_HEAD(apple_pmp_reports);
 static DEFINE_MUTEX(apple_pmp_reports_lock);
+
+/* The report lock also protects ANE_SYS against a genpd owner appearing. */
+static int apple_pmp_ane_request(void *ctx, bool enable)
+{
+	struct apple_pmp_report *rep = ctx;
+	struct apple_pmp_ane *ane = &rep->ane;
+	const u64 bit = BIT_ULL(PMP_ANE_ID);
+	unsigned long flags;
+	u64 val;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	val = readq(rep->base + rep->offsets->tgt_read);
+	if (enable) {
+		if ((rep->known | val) & bit) {
+			spin_unlock_irqrestore(&rep->lock, flags);
+			return -EBUSY;
+		}
+		ane->owned = true;
+		val |= bit;
+	} else {
+		val &= ~bit;
+	}
+	writeq(val, rep->base + rep->offsets->tgt_write);
+	spin_unlock_irqrestore(&rep->lock, flags);
+	if (!enable) {
+		int ret = readq_poll_timeout(rep->base + rep->offsets->actual, val,
+					    !(val & bit), 200, 50000);
+
+		if (!ret) {
+			spin_lock_irqsave(&rep->lock, flags);
+			ane->owned = false;
+			spin_unlock_irqrestore(&rep->lock, flags);
+		}
+		return ret;
+	}
+	return readq_poll_timeout(rep->base + rep->offsets->actual, val,
+				 val & bit, 200, 50000);
+}
+
+/* Probe-time availability check: deliberately no MMIO while the ANE is off. */
+int apple_pmp_report_ane_available(const struct device_node *np)
+{
+	struct apple_pmp_report *rep;
+	int ret = -EPROBE_DEFER;
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+		ret = !rep->ane.dvfs ? -EOPNOTSUPP :
+		      (rep->ane_owner || rep->ane.reserved) ? -EBUSY : 0;
+		break;
+	}
+	mutex_unlock(&apple_pmp_reports_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_ane_available);
+
+/**
+ * apple_pmp_report_ane_perf() - request a T600x ANE performance level
+ * @np: report provider node
+ * @owner: ANE device holding the request
+ * @level: 0 to release, 1 through 5 to request a level
+ * @held: whether the caller still owns a request, including failed rollback
+ *
+ * The caller must keep its engine and the report SRAM powered throughout
+ * the request, and link itself to the report supplier. Other generations
+ * and reports without an ANE DVFS resource are unsupported. The returned
+ * level is a firmware request, not a measured frequency.
+ *
+ * Context: Process context. May sleep.
+ * Return: 0 on success, or a negative errno. Ownership and ACK failures
+ * are returned to the submitter; no CPU frequency request is substituted.
+ */
+int apple_pmp_report_ane_perf(const struct device_node *np,
+			      struct device *owner, unsigned int level, bool *held)
+{
+	struct apple_pmp_report *rep;
+	int ret = -EPROBE_DEFER;
+
+	if (!np || !owner || !held)
+		return -EINVAL;
+	*held = false;
+	mutex_lock(&apple_pmp_reports_lock);
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+		if (!rep->ane.dvfs) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		if (rep->ane_owner && rep->ane_owner != owner) {
+			ret = -EBUSY;
+			break;
+		}
+		if (level && !apple_pmp_report_running(rep)) {
+			ret = -EAGAIN;
+			break;
+		}
+		/* Claim before touching DVFS, and exclude genpd for the whole cycle. */
+		if (level && !rep->ane.reserved) {
+			unsigned long flags;
+			u64 req;
+
+			spin_lock_irqsave(&rep->lock, flags);
+			req = readq(rep->base + rep->offsets->tgt_read);
+			if ((rep->known | req) & BIT_ULL(PMP_ANE_ID)) {
+				spin_unlock_irqrestore(&rep->lock, flags);
+				ret = -EBUSY;
+				break;
+			}
+			rep->ane.reserved = true;
+			spin_unlock_irqrestore(&rep->lock, flags);
+		}
+		ret = apple_pmp_ane_set(&rep->ane, level, apple_pmp_ane_request, rep);
+		if (!rep->ane.level && !rep->ane.owned) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&rep->lock, flags);
+			rep->ane.reserved = false;
+			spin_unlock_irqrestore(&rep->lock, flags);
+		}
+		/* Failed rollback retains ownership until a successful retry. */
+		if (rep->ane.level || rep->ane.owned)
+			rep->ane_owner = owner;
+		else
+			rep->ane_owner = NULL;
+		*held = rep->ane_owner == owner;
+		break;
+	}
+	mutex_unlock(&apple_pmp_reports_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_ane_perf);
+
 static struct dentry *apple_pmp_report_debugfs;
 
 /**
@@ -1182,6 +1320,23 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
+	if (of_property_match_string(np, "reg-names", "ane-dvfs") >= 0) {
+		struct resource *res;
+
+		if (!of_device_is_compatible(np, "apple,t6000-pmp-v2-report"))
+			return -EINVAL;
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!res || resource_size(res) != SZ_128K)
+			return -EINVAL;
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ane-dvfs");
+		if (!res || resource_size(res) != SZ_16K)
+			return -EINVAL;
+		rep->ane.dvfs = devm_ioremap_resource(dev, res);
+		if (IS_ERR(rep->ane.dvfs))
+			return PTR_ERR(rep->ane.dvfs);
+		rep->ane.report = rep->base;
+	}
+
 	rep->defer = rep->offsets->defer_requests;
 	INIT_DELAYED_WORK(&rep->ready_work, apple_pmp_report_ready_work);
 	platform_set_drvdata(pdev, rep);
@@ -1386,6 +1541,10 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 	bool ready;
 
 	spin_lock_irqsave(&rep->lock, flags);
+	if (id == PMP_ANE_ID && rep->ane.reserved) {
+		spin_unlock_irqrestore(&rep->lock, flags);
+		return -EBUSY;
+	}
 	rep->known |= bit_val;
 	if (enable)
 		rep->shadow |= bit_val;

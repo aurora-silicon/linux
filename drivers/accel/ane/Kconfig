@@ -7,6 +7,8 @@ config DRM_ACCEL_ANE
 	depends on APPLE_RTKIT
 	depends on APPLE_DART || COMPILE_TEST
 	depends on MMU
+	select INTERCONNECT
+	select PM_OPP
 	select CRYPTO_LIB_SHA256
 	select DRM_ACCEL_ANE_H16_VALIDATION
 	help
@@ -52,5 +54,17 @@ config DRM_ACCEL_ANE_FW_KUNIT_TEST
 	  H16 HWX/resource bounds, UUID retirement, shared transport and bounded
 	  allocation and staged H16 cold boot without hardware.
 	  These tests can run on architectures other than Apple arm64.
+
+	  If unsure, say N.
+
+config DRM_ACCEL_ANE_PM_KUNIT_TEST
+	tristate "KUnit tests for ANE runtime-PM recovery" if !KUNIT_ALL_TESTS
+	depends on DRM_ACCEL && KUNIT && PM
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise supplier suspension, power-off verification failure and
+	  runtime resume errors against the runtime-PM and device-link core.
+	  No ANE hardware is required. These tests can run independently of
+	  the ANE driver on non-Apple platforms.
 
 	  If unsure, say N.

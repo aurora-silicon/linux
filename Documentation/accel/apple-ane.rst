@@ -42,7 +42,8 @@ The H16 DT nodes stay disabled. The five real PMGR providers already encode
 the system/CPU/MPM/task/base dependency graph. The PMGR binding does not
 represent the virtual no-state gates, so no fictitious register-backed
 domains are created for them. SID 0 and SID 11 on all three DARTs use the
-shared DMA domain; no untested stream remapping is added.
+shared DMA description. The staged diagnostic backend requires the
+SID-0-only test description discussed below; no untested remapping is added.
 
 Implemented SPEC-r2 components
 ------------------------------
@@ -61,6 +62,14 @@ start ordering. It does not invent responses for unknown message types or
 unimplemented system endpoint buffer requests. Its caller must provide one
 absolute session deadline and a bounded 64-bit mailbox transport.
 
+H16 task streams begin with little-endian ``u32 1`` and twelve reserved zero
+bytes. This marker precedes the first aligned task; it is not a task count.
+The initial H16 gate rejects a zero marker, other values and nonzero reserved
+bytes. The public H16 encoder fixes this prologue at commit
+``927013f5480768b07c8e62a866e1514c41aba778`` of
+``joshuaswarren/mil-hwx-compiler``, in
+``plugins/H16G/Encoding/H16GALUEncoder.mm``.
+
 H16 validation helpers walk nine fixed task-header words, the documented
 conditional extra word, dense/scatter records and the nine allowed register
 blocks. A separate helper checks the eight-byte Mach-O relocation entries,
@@ -76,18 +85,19 @@ It never opens an accel device or claims a Linux inference result.
 Remaining implementation gates
 ------------------------------
 
-The preload validator can authenticate owned snapshots of the normalized
-resident image with 42 ordered patchbay records. Live snapshot acquisition,
-the original-container userspace load ABI, resolved program bindings and
-physical boot backend still need implementation. Off-list preload mutations
-remain refused.
+The preload validator authenticates stable, owned snapshots of the normalized
+resident image with 42 ordered patchbay records. The staged backend provides
+live snapshot acquisition and cold startup. The original-container userspace
+load ABI and resolved program bindings still need installation. Off-list
+preload mutations remain refused.
 
 The 2026-10-31 H16 runtime observation did not capture cold boot, scratch
-negotiation, RTKit management, CONFIG_GET or RESOURCE_INFO_GET. The version-12
-and 24 MHz predicates remain conservative proposed startup gates; runtime
-traffic does not prove them. Resource and allocation ceilings stay unchanged.
-H17 additionally requires a Linux ownership backend before direct access.
-There are no module parameters to bypass these gates.
+negotiation, RTKit management, CONFIG_GET or RESOURCE_INFO_GET. The round-5 H16 facts define the staged cold-start path below. RTKit
+version 12 is negotiated if offered, without waiting on management progress.
+The CONFIG_GET tick must be nonzero and is logged; it is not pinned to
+24 MHz. Resource ceilings remain conservative host policy. H17 additionally
+requires a Linux ownership backend before direct access; h16_stage does not
+bypass that refusal.
 
 Resident image identity
 -----------------------
@@ -341,6 +351,7 @@ firmware-advertised authority. The KUnit suite uses synthetic memory and
 accessor traces, with no MMIO or hardware access. Its configuration fragment
 is ``drivers/accel/ane/transport.kunitconfig`` and runs on x86_64 and arm64.
 
+
 Original HWX validation
 -----------------------
 
@@ -521,3 +532,102 @@ missing READY, wrong/stale table publication, oversized IPC/heap requests,
 channel bounds, locked DAPF differences, nonzero acks, scratch-3 timeout,
 zero tick, default refusal and quarantine after RUN. It also covers matching
 locked DAPF, heap/shared overlap, native FREE, foreign FREE and control refusal.
+
+H13 timeout and engine recovery
+==============================
+
+The host task-manager path (``ane.ko``) gives each submission one second,
+including DART fault-drain retries. An expired submission returns
+``-ETIMEDOUT``; recovery never silently retries a program whose output may be
+partial. The task's GEM lookup references are released when the ioctl returns.
+
+Recovery holds the engine and PM-entry locks, drops the current consumer
+runtime-PM reference, synchronously suspends its power-domain suppliers, and
+checks both the PMGR ACTUAL fields and every attached genpd for power-off.
+The SET window omits the shared SYS_CPU parent, whose DART consumers can
+suspend asynchronously; it must also turn off before the consumer resumes.
+Recovery then restores the consumer
+reference, checks power-on before engine MMIO, and runs the probe task-manager
+enable sequence. BO handles and mappings remain valid for resubmission.
+The system-sleep force helpers are unsuitable here: a forced, in-use supplier
+can retain its active runtime status and keep its parent domains powered.
+
+A power-off acknowledgment is required before reinitializing the engine.
+Only after power-on and task-manager readiness are also verified does recovery
+release the exceptional module pin and reclaim preserved BOs. If any step
+fails, mappings, backing pages and the pin remain held; new submissions fail.
+This also covers a partially resumed engine whose retained queue state is
+uncertain. The ``reset`` sysfs write retries recovery. Module reload cannot
+recover a device while that pin is held. Direct PMGR SET writes and speculative
+writes to undocumented task-error registers are not part of this reset path.
+
+The ``ane-pm-recovery`` KUnit suite exercises the shared PM transaction against
+real runtime-PM device links, including repeated cycles, single-domain devices,
+consumer/supplier suspend errors, a missing power-off acknowledgment and a
+failed resume. It checks that every exit restores the caller's PM reference.
+The minimal config is
+``tools/testing/selftests/drivers/ane/pm.kunitconfig``.
+
+Destructive recovery selftest
+----------------------------
+
+``tools/testing/selftests/drivers/ane/recovery.py`` is an explicitly invoked
+hardware test, excluded from the default device-free selftests. It requires
+exclusive ownership of an M1-family ANE, Python 3, the packaged H13 add fixture,
+and a deliberately invalid convolution program. Run it through the hardware
+controller with a watchdog and kernel-log capture::
+
+  python3 recovery.py /usr/share/omarchy-ane/fixtures/h13-anec/add/program-0.anec hang.anec
+
+The test keeps both clients open, submits the invalid program three times,
+requires a bounded ``ETIMEDOUT`` and ``wedged=0`` each time, and runs twenty
+bit-exact add jobs on the surviving client's original fd and mappings after
+each reset. Every call changes its inputs and poisons the valid output lanes,
+so stale output cannot pass. Its oracle uses exact fp16 quarter values and checks the complete
+output, including padding. Closing both clients must return the module
+reference count to its initial value; the boot identity must remain unchanged.
+An operator should also verify three power-off acknowledgments in the kernel
+log and a normal module unload/reload after all clients close. A failed reset
+is a test failure, not permission to force unload the module.
+
+Generate ``hang.anec`` on a build host with ``make-hang-fixture.py`` and a clean
+checkout of the MIT-licensed public compiler at commit
+``ef2dbceefedff38ecce4f3dc593e148c5e7a6d54`` from
+https://github.com/aurora-silicon/mil-hwx-compiler/pull/2::
+
+  python3 make-hang-fixture.py /path/to/mil-hwx-compiler hang.anec --cxx clang++
+
+This first checks that the normal encoder refuses the shape. It bypasses only
+that refusal in a temporary translation unit to generate a deterministic
+stride-2 1x1 128-to-256 convolution at 56-to-28 spatial size, the refused family
+reported to hang the M1 Pro. The compiler checkout is unchanged. No Apple
+binary or private program capture is used. The generator writes a hash receipt;
+the hardware test must fail if this particular instance does not actually
+produce a timeout. The loader pins both fixture hashes and uses ABI 1 ioctls directly, so no
+shared libane library is needed. ``--check-fixtures`` validates the two containers without
+opening a device.
+
+H14 recovery lifecycle
+----------------------
+
+The firmware path (``ane_t6021.ko``) uses one bounded deadline for the command
+acknowledgment and its finish event. H14 engine reset is not enabled by this
+change. Reusing only the H13 task-manager re-arm would leave the firmware and
+its program cache invalid. The corresponding recovery implementation needs to:
+
+* Serialize firmware commands and stop the RX worker before releasing the
+  consumer's runtime-PM reference and synchronously suspending its suppliers.
+* Verify power-off for the CPU and engine partitions through their providers
+  before dropping boot pins or reclaiming firmware-visible allocations.
+* Retain metadata for every firmware-owned BO and boot allocation, including
+  objects whose last userspace reference disappeared. The current release
+  path discards some of this metadata while retaining the backing memory.
+* Restore the validated firmware image and run the existing fenced probe boot
+  sequence, including channel-table validation, host acknowledgment and
+  CONFIG_GET. A failed boot remains quarantined with its DMA backing held.
+* Invalidate the cached program/process IDs across the restart and prevent a
+  stale userspace ID from aliasing a newly allocated firmware ID. Clients must
+  reload their programs before resubmitting.
+
+Those ownership and identifier changes require their own H14 reset test.
+Quarantine must not be cleared solely because a power transition returned zero.

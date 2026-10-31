@@ -672,6 +672,43 @@ static void mt7932_policy_v4_classes_test(struct kunit *test)
 	KUNIT_EXPECT_LT(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
 }
 
+/* The public producer's 32-byte 1SS channel pad is copied verbatim. It is
+ * independent of the primary permission mask and of rate-support accounting.
+ */
+static void mt7932_policy_6g_pad_test(struct kunit *test)
+{
+	static const u8 expected[44] = {
+		[1] = 0x1a, [2] = 0xfc, 3, 8, 3,
+		[8] = 'A', 'U',
+		[12] = 0x20, [16] = 0x20, [41] = 2,
+	};
+	struct mt7932_policy *policy =
+		kunit_kzalloc(test, sizeof(*policy), GFP_KERNEL);
+	size_t size;
+	u8 *data = pkg_build_v4(test, &size), *body, *pad;
+
+	KUNIT_ASSERT_NOT_NULL(test, policy);
+	body = kunit_kmalloc(test, 1020, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, body);
+	/* Directory plus VLP section, then LPI header and its channel pad. */
+	pad = data + size - 13476 + 24;
+	pad[0] = 0x20; /* channel 5 */
+	pad[4] = 0x20; /* channel 37, not rate index 37 */
+	pad[29] = 2; /* channel 233 */
+	KUNIT_ASSERT_EQ(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
+	KUNIT_EXPECT_EQ(test, policy->six_class[MT7932_6G_LPI].channels,
+			BIT_ULL(1));
+	KUNIT_ASSERT_EQ(test, mt7932_6g_class_page(body, 1020, policy,
+						   MT7932_6G_LPI, "AU", 0), 1020);
+	KUNIT_EXPECT_MEMEQ(test, body, expected, sizeof(expected));
+	KUNIT_ASSERT_EQ(test, mt7932_6g_class_page(body, 1020, policy,
+						   MT7932_6G_LPI, "AU", 104), 776);
+	KUNIT_EXPECT_MEMEQ(test, body + 12, pad, 32);
+	KUNIT_ASSERT_EQ(test, mt7932_6g_class_page(body, 1020, policy,
+						   MT7932_6G_VLP, "AU", 0), 1020);
+	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(body + 12, 0, 32), NULL);
+}
+
 #define FAKE_FILES 8
 #define FAKE_LOG 16
 
@@ -1157,6 +1194,7 @@ static struct kunit_case mt7932_policy_test_cases[] = {
 	KUNIT_CASE(mt7932_policy_corruption_test),
 	KUNIT_CASE(mt7932_policy_order_test),
 	KUNIT_CASE(mt7932_policy_v4_classes_test),
+	KUNIT_CASE(mt7932_policy_6g_pad_test),
 	KUNIT_CASE(mt7932_policy_v4_preferred_test),
 	KUNIT_CASE(mt7932_policy_v2_preferred_test),
 	KUNIT_CASE(mt7932_policy_version_test),

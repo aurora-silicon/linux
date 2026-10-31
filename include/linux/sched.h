@@ -939,6 +939,8 @@ struct task_struct {
 
 	unsigned int			policy;
 	unsigned long			max_allowed_capacity;
+	/* Runtime checkpoint for misfit rotation, protected by the rq lock. */
+	u64				misfit_runtime;
 	int				nr_cpus_allowed;
 	const cpumask_t			*cpus_ptr;
 	cpumask_t			*user_cpus_ptr;

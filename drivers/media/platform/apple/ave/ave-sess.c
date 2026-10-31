@@ -485,24 +485,38 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	return sess;
 }
 
-/*
- * Free the buffers. A firmware that stopped answering in the middle of a
- * session may still write to them, and a freed DART range is soon handed
- * out again, so those stay allocated (until reboot, like the firmware
- * itself). Buffers the firmware never saw (no Start sent) always go.
- */
+/* Keep every firmware-visible allocation mapped until a confirmed power cycle. */
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
+	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
 
 	if (!sess)
 		return;
-	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN)
-		dev_warn(ctx->ave->dev, "keeping the buffers of a failed session\n");
-	else
-		ave_sess_free_bufs(ctx->ave, sess);
-	kfree(sess);
+	mutex_lock(&ave->hw_lock);
+	if (sess->handed && (ave->fw_state == AVE_FW_BROKEN ||
+			     ave->fw_state == AVE_FW_RECOVERING)) {
+		sess->failed_next = ave->failed_sessions;
+		ave->failed_sessions = sess;
+	} else {
+		ave_sess_free_bufs(ave, sess);
+		kfree(sess);
+	}
 	ctx->sess = NULL;
+	mutex_unlock(&ave->hw_lock);
+}
+
+/* Caller holds hw_lock and has verified that the coprocessor lost power. */
+void ave_sess_reap(struct ave_dev *ave)
+{
+	struct ave_session *sess;
+
+	lockdep_assert_held(&ave->hw_lock);
+	while ((sess = ave->failed_sessions)) {
+		ave->failed_sessions = sess->failed_next;
+		ave_sess_free_bufs(ave, sess);
+		kfree(sess);
+	}
 }
 
 int ave_sess_free_slot(struct ave_session *sess)

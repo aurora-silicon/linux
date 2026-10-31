@@ -21,7 +21,7 @@ config VIDEO_APPLE_AVE
 	  will be called apple-ave.
 
 config VIDEO_APPLE_AVE_KUNIT_TEST
-	tristate "KUnit tests for Apple AVE buffer sizing" if !KUNIT_ALL_TESTS
+	tristate "KUnit tests for Apple AVE buffer sizing and recovery" if !KUNIT_ALL_TESTS
 	depends on KUNIT
 	default KUNIT_ALL_TESTS
 	help
@@ -29,3 +29,4 @@ config VIDEO_APPLE_AVE_KUNIT_TEST
 	  encoders, including picture alignment boundaries and the reference
 	  1920x1080 AVC and HEVC sizes. The tests do not need an encoder or
 	  any firmware and can run independently of the AVE driver.
+	  Also test the firmware recovery sliding window and jiffies wrap.

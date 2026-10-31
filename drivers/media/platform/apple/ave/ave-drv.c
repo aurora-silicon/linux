@@ -84,6 +84,26 @@ void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image 
 		memcpy(dst, cmd, len);
 }
 
+/* Root-only software timeout injection; does not send malformed firmware commands. */
+static int ave_inject_wedge(void *data, u64 value)
+{
+	struct ave_dev *ave = data;
+	int ret = 0;
+
+	if (value != 1)
+		return -EINVAL;
+	mutex_lock(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_RUNNING) {
+		ret = -EBUSY;
+	} else {
+		ave->inject_wedge = true;
+		ave_fw_mark_broken(ave, -ETIMEDOUT, "debugfs injection");
+	}
+	mutex_unlock(&ave->hw_lock);
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(ave_inject_wedge_fops, NULL, ave_inject_wedge, "%llu\n");
+
 static void ave_debugfs_init(struct ave_dev *ave)
 {
 	static const char * const names[2][AVE_IMAGE_COUNT] = {
@@ -94,6 +114,8 @@ static void ave_debugfs_init(struct ave_dev *ave)
 	if (!IS_ENABLED(CONFIG_DEBUG_FS) || !ave->layout)
 		return;
 	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
+	debugfs_create_file("inject_wedge", 0200, ave->debugfs, ave,
+			    &ave_inject_wedge_fops);
 	for (unsigned int c = 0; c < 2; c++)
 		for (unsigned int k = 0; k < AVE_IMAGE_COUNT; k++) {
 			struct debugfs_blob_wrapper *blob;
@@ -156,23 +178,37 @@ static int ave_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "cannot attach power domains\n");
 
-	pm_runtime_set_autosuspend_delay(dev, AVE_AUTOSUSPEND_MS);
-	pm_runtime_use_autosuspend(dev);
-	ret = devm_pm_runtime_enable(dev);
-	if (ret)
-		return ret;
-
 	ret = ave_fw_probe(ave);
 	if (ret)
 		return ret;
 
+	/*
+	 * Domain attachment took active supplier references, but the driver
+	 * starts firmware only on first use and begins suspended. Reconcile that
+	 * state before enabling runtime PM, otherwise those references survive
+	 * until the first session has resumed and suspended the encoder.
+	 */
+	ret = pm_runtime_set_suspended(dev);
+	if (ret)
+		goto err_fw;
+
+	pm_runtime_set_autosuspend_delay(dev, AVE_AUTOSUSPEND_MS);
+	pm_runtime_use_autosuspend(dev);
+	ret = devm_pm_runtime_enable(dev);
+	if (ret)
+		goto err_pm;
+
 	ret = ave_v4l2_register(ave);
-	if (ret) {
-		ave_fw_remove(ave);
-		return ret;
-	}
+	if (ret)
+		goto err_pm;
 	ave_debugfs_init(ave);
 	return 0;
+
+err_pm:
+	pm_runtime_dont_use_autosuspend(dev);
+err_fw:
+	ave_fw_remove(ave);
+	return ret;
 }
 
 static void ave_remove(struct platform_device *pdev)
@@ -204,7 +240,7 @@ static int ave_runtime_suspend(struct device *dev)
 	int ret;
 
 	mutex_lock(&ave->hw_lock);
-	ret = ave_fw_shutdown(ave);
+	ret = ave_fw_runtime_suspend(ave);
 	mutex_unlock(&ave->hw_lock);
 	return ret;
 }

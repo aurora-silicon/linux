@@ -754,8 +754,9 @@ struct ane_asc_tunables;
  *    for this SoC (T6021 only), so fw_alias_reserved=1 may map it; the
  *    other SoCs always run the firmware from driver-owned memory.
  *  ps_cpu_off: the ANE CPU ps word in the DT "pmgr" window (probe guard).
- *  pwgate_off: the PWGATE word in the DT "set" window, checked
- *    open before any engine read; 0 = not checked.
+ *  pwgate_off: the power gate word in the DT "set" window. The driver
+ *    opens it before ane_sys_cpu powers on, closes it after that state
+ *    powers off, and checks it open before any engine read; 0 = no gate.
  *  pmu_pa: the page of the seven ANE ps words; the firmware's power
  *    service writes them through its DART at IOVA == PA. ps_off: the
  *    first of the seven in that page.
