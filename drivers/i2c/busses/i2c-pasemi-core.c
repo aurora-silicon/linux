@@ -450,6 +450,14 @@ int pasemi_i2c_common_probe(struct pasemi_smbus *smbus)
 }
 EXPORT_SYMBOL_GPL(pasemi_i2c_common_probe);
 
+/* Reprogram the controller after its power domain was off */
+void pasemi_i2c_restore(struct pasemi_smbus *smbus)
+{
+	reg_write(smbus, REG_IMASK, 0);
+	pasemi_reset(smbus);
+}
+EXPORT_SYMBOL_GPL(pasemi_i2c_restore);
+
 irqreturn_t pasemi_irq_handler(int irq, void *dev_id)
 {
 	struct pasemi_smbus *smbus = dev_id;
