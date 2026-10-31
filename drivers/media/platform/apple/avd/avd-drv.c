@@ -20,6 +20,7 @@
 #include <media/videobuf2-v4l2.h>
 
 #include "avd.h"
+#include "avd-vp9-fp.h"
 #include "avd-inst.h"
 #include "avd-regs.h"
 
@@ -654,6 +655,7 @@ static void avd_v4l2_cleanup(struct avd_dev *avd)
 }
 
 static const struct avd_variant avd_t8103_variant = {
+	.vp9_fp_generation = AVD_VP9_FP_V3,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2, /* no sure */
 		[AVD_CODEC_H264] = 1,
@@ -694,6 +696,7 @@ static const struct avd_variant avd_t6000_variant = {
 };
 
 static const struct avd_variant avd_t8112_variant = {
+	.vp9_fp_generation = AVD_VP9_FP_T8112,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
@@ -754,6 +757,7 @@ static const struct avd_variant avd_t8122_variant = {
 };
 
 static const struct avd_variant avd_t8140_variant = {
+	.vp9_fp_generation = AVD_VP9_FP_T8140,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 2,
 		[AVD_CODEC_H264] = 1,
@@ -811,6 +815,7 @@ static const struct avd_variant avd_t8132_variant = {
  * verified on the hardware.
  */
 static const struct avd_variant avd_t6040_variant = {
+	.vp9_fp_generation = AVD_VP9_FP_BORAGE,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
