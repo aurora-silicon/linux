@@ -70,6 +70,16 @@
 	};
 
 	/*
+	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
+	 * and that no OS switches. The ADT gives the flash no supply.
+	 */
+	nor_flash_vcc: regulator-nor-flash-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nor-flash-vcc";
+		regulator-always-on;
+	};
+
+	/*
 	 * The J700 is fanless: the CPUs are the only cooling devices.  Every
 	 * die sensor gets a zone that throttles both clusters, since they share
 	 * one die and one heat spreader.  The power allocator splits the budget
@@ -384,6 +394,17 @@
 			};
 		};
 	};
+
+	/*
+	 * The headphone codec runs from PMU rails that are on whenever the
+	 * SoC is and that no OS switches. The ADT gives the codec a reset
+	 * line and no supply or power function.
+	 */
+	jack_codec_supply: regulator-jack-codec {
+		compatible = "regulator-fixed";
+		regulator-name = "jack-codec";
+		regulator-always-on;
+	};
 };
 
 #include "isp-imx558.dtsi"
@@ -460,6 +481,7 @@
 		compatible = "jedec,spi-nor";
 		reg = <0>;
 		spi-max-frequency = <25000000>;
+		vcc-supply = <&nor_flash_vcc>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -502,6 +524,11 @@
 	jack_codec: codec@48 {
 		compatible = "cirrus,cs42l83";
 		reg = <0x48>;
+		VA-supply = <&jack_codec_supply>;
+		VCP-supply = <&jack_codec_supply>;
+		VD_FILT-supply = <&jack_codec_supply>;
+		VL-supply = <&jack_codec_supply>;
+		VP-supply = <&jack_codec_supply>;
 		reset-gpios = <&pinctrl_ap 103 GPIO_ACTIVE_HIGH>;
 		interrupt-parent = <&pinctrl_ap>;
 		interrupts = <104 IRQ_TYPE_LEVEL_LOW>;
@@ -625,6 +652,8 @@
 };
 
 &smc_hwmon {
+	apple,thermal-pressure-key = "mTPL";
+
 	/*
 	 * Further channels, reported to userspace. They follow the six CPU
 	 * die temperatures in t8140.dtsi, which the thermal zones above

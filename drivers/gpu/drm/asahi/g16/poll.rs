@@ -56,7 +56,7 @@ impl HrTimerCallback for Shared {
     }
 }
 
-/// The `asahi-g16/stats` debugfs file contents.
+/// The `aurora-g16/stats` debugfs file contents.
 fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let state = shared.state.lock();
     match state.as_deref() {
@@ -177,9 +177,9 @@ impl Shared {
         self.mod_poll(1);
     }
 
-    /// Starts what the engine needs besides the firmware state: the `asahi-g16/stats` file.
+    /// Starts what the engine needs besides the firmware state: the `aurora-g16/stats` file.
     pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
-        let dir = debugfs::Dir::new(c_str!("asahi-g16"));
+        let dir = debugfs::Dir::new(c_str!("aurora-g16"));
         let file = KBox::pin_init(
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
@@ -834,7 +834,7 @@ impl Firmware {
         }
     }
 
-    /// The `asahi-g16/stats` contents. Scripts parse the keys: keep them stable.
+    /// The `aurora-g16/stats` contents. Scripts parse the keys: keep them stable.
     pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = &self.engine.stats;
         let slots = &self.slots.stats;

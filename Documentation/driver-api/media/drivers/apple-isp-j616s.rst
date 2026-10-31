@@ -41,6 +41,47 @@ firmware-derived output modes still need capture validation on 26.6.2.
 Only our source and synthetic protocol tests are included; no Apple binary,
 setfile contents, calibration table or firmware image is added.
 
+Sensor tuning and noise reduction
+---------------------------------
+
+NV12 setup loads model-wide sensor tuning using ``CH_SET_FILE_LOAD``
+(0x0111). T8140/IMX558 selects ``apple/isp_1925_03XX.dat``; T6040/IMX958
+selects ``apple/isp_2224_01XX.dat``. The T6040 lens-shading fixup is applied
+only to the copied firmware buffer. A missing file allows streaming with a
+warning. An invalid file, interrupted read or failed firmware upload fails
+stream setup instead of silently continuing. A debug message identifies a
+successful upload without dumping its contents.
+This confirms transport completion only: the NV12 path does not decode the
+setfile reply fields, so it does not prove that every coefficient was applied.
+
+The NV12 command sequence already sends ``CH_CNR_START`` (0x0a2f),
+``CH_MBNR_ENABLE`` (0x0a3a, use case 0, mode 1, chroma enabled),
+``APPLE_CH_TEMPORAL_FILTER_START`` (0xc100),
+``APPLE_CH_MOTION_HISTORY_START`` (0xc102) and
+``APPLE_CH_TEMPORAL_FILTER_ENABLE`` (0xc113). The temporal-start record has
+one fixed argument of 1 and another supplied by ``apple,temporal-filter``
+(default 0; J700 supplies 1). The latter's meaning is not established here;
+it must not be treated as a boolean enable or an output-pool count.
+Command submission alone does not establish equivalence to a host-side
+motion-compensated filter or measure the firmware's resulting noise reduction.
+
+The P010 preview still uses its qualified minimal sequence, which skips
+these explicit NR commands and setfile upload. An earlier NV12 stream may
+have left tuning in the resident firmware. Compare cold-boot P010 with
+NV12-to-P010 transitions when assessing image quality.
+
+Sensor setfiles are distinct from individual camera-module factory
+calibration (iCCl). The driver has no iCCl parser, serial binding or upload
+command. The installer preserves raw factory records in the local fallback
+archive; this does not mean the ISP consumes them. No factory record or
+vendor payload belongs in the kernel source or a distributed firmware package.
+
+The separate ANE video denoiser is not implemented. The board parameter facts
+are auto mode 2, total-gain entry/exit thresholds 2304/1792 on J700 and
+3584/2816 on J616s, an FPS threshold of 30 and a 30-frame ramp-down. The FPS
+comparison direction, gain units and ANE/ISP interchange need a confirmed
+interface before implementation.
+
 Public source audit
 -------------------
 
@@ -320,3 +361,54 @@ The T6040 device tree's current fixed TEXT/DATA reservations should eventually
 come from a bootloader handoff describing the loaded image and mapping lifetimes.
 They are firmware-build-specific. This change does not implement that handoff
 or replace those reservations with 25G76 addresses.
+
+Capture size enumeration
+------------------------
+
+The shared driver preserves the order of its device-tree presets and any
+validated firmware output modes. It then adds common video-call sizes that
+fit within those presets' processed crop extents. The added preset retains
+its source firmware configuration and pixel-format eligibility. Crops are
+centred on even coordinates, have the exact output aspect ratio and never
+require upscaling. Sensor input dimensions alone are not a processed output
+capability: input rows can contain stacked exposures.
+
+The common sizes include 640x480, 1280x720, 1920x1080, 1080x1920,
+1760x1328, 1328x1760, 1552x1552, 1280x960 and 960x1280. A sensor that
+cannot provide the larger square also gets the largest even square that
+fits its established crops. Existing sizes are not duplicated. This is a
+shared output policy, not a list indexed by board or sensor model.
+
+Neither the crop nor output-configuration command reports scaler limits
+or rotation support. The driver does not infer a larger processed image
+from raw input dimensions, rotate a portrait image into a landscape one,
+or advertise a size that requires enlargement. Consequently, an exact
+macOS size may remain unavailable even though a smaller size with the
+same aspect ratio can be offered.
+
+Read-only inspection on the running kernel::
+
+    v4l2-ctl -d /dev/video0 --list-formats-ext
+    v4l2-ctl -d /dev/video0 --log-status
+    dmesg | grep -A20 'sensor config'
+
+The status ioctl prints already cached firmware configuration replies;
+it does not start capture or send additional firmware queries. The cache
+is currently populated only on the existing supported P010 discovery path.
+A missing cache is not evidence that the sensor has no other modes.
+
+After booting a test kernel, enumerate again and qualify each added size
+that is actually offered. For example, for 640x480 NV12::
+
+    v4l2-ctl -d /dev/video0 \
+        --set-fmt-video=width=640,height=480,pixelformat=NV12 \
+        --get-fmt-video --stream-mmap=4 --stream-count=30 --stream-to=/dev/null
+    gst-launch-1.0 -v v4l2src device=/dev/video0 num-buffers=30 ! \
+        video/x-raw,format=NV12,width=640,height=480,framerate=30/1 ! \
+        fakesink sync=false
+
+Repeat with each added width and height and, when offered, P010. Check
+that the negotiated dimensions equal the requested dimensions: S_FMT may
+otherwise choose a nearby preset. Confirm 30 completed frames, correct
+aspect ratio and chroma, and no new ISP or DART errors. Enumeration and unit tests do not establish successful capture at a
+new size; capture qualification must be performed separately.

@@ -298,6 +298,14 @@
 	 * in kHz. opp-level is the hardware p-state. Each P cluster has its
 	 * own table even though the frequencies are the same: opp-shared
 	 * means one clock domain per table.
+	 *
+	 * opp-microwatt is the power of one busy core, measured on a J616s
+	 * from the SMC core-rail meters (P0 PR0b, P1 PP0b, E PP2b) with the
+	 * cluster pinned at each state. The P values follow a k * V^2 * f + c
+	 * fit to the sweep, because the PMP's die-temperature limit clips the
+	 * two top states within seconds. One busy E core does not register on
+	 * its meter below 2352 MHz, so the E values are the idle cluster plus
+	 * a quarter of the four-core increase.
 	 */
 	opp_e: opp-table-e {
 		compatible = "operating-points-v2";
@@ -306,30 +314,37 @@
 		opp01 {
 			opp-hz = /bits/ 64 <1020000000>;
 			opp-level = <1>;
+			opp-microwatt = <81900>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1404000000>;
 			opp-level = <2>;
+			opp-microwatt = <133100>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1788000000>;
 			opp-level = <3>;
+			opp-microwatt = <209400>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <2112000000>;
 			opp-level = <4>;
+			opp-microwatt = <301400>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2352000000>;
 			opp-level = <5>;
+			opp-microwatt = <383900>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2532000000>;
 			opp-level = <6>;
+			opp-microwatt = <478500>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2592000000>;
 			opp-level = <7>;
+			opp-microwatt = <531000>;
 		};
 	};
 
@@ -340,78 +355,97 @@
 		opp01 {
 			opp-hz = /bits/ 64 <1260000000>;
 			opp-level = <1>;
+			opp-microwatt = <513000>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1512000000>;
 			opp-level = <2>;
+			opp-microwatt = <715000>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1800000000>;
 			opp-level = <3>;
+			opp-microwatt = <907500>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <2088000000>;
 			opp-level = <4>;
+			opp-microwatt = <1158200>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2352000000>;
 			opp-level = <5>;
+			opp-microwatt = <1494500>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2616000000>;
 			opp-level = <6>;
+			opp-microwatt = <1782600>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2868000000>;
 			opp-level = <7>;
+			opp-microwatt = <2209600>;
 		};
 		opp08 {
 			opp-hz = /bits/ 64 <3096000000>;
 			opp-level = <8>;
+			opp-microwatt = <2636700>;
 		};
 		opp09 {
 			opp-hz = /bits/ 64 <3300000000>;
 			opp-level = <9>;
+			opp-microwatt = <3247200>;
 		};
 		opp10 {
 			opp-hz = /bits/ 64 <3468000000>;
 			opp-level = <10>;
+			opp-microwatt = <3668700>;
 		};
 		opp11 {
 			opp-hz = /bits/ 64 <3624000000>;
 			opp-level = <11>;
+			opp-microwatt = <4128200>;
 		};
 		opp12 {
 			opp-hz = /bits/ 64 <3756000000>;
 			opp-level = <12>;
+			opp-microwatt = <4819300>;
 		};
 		opp13 {
 			opp-hz = /bits/ 64 <3852000000>;
 			opp-level = <13>;
+			opp-microwatt = <4977700>;
 		};
 		opp14 {
 			opp-hz = /bits/ 64 <3924000000>;
 			opp-level = <14>;
+			opp-microwatt = <5315900>;
 		};
 		opp15 {
 			opp-hz = /bits/ 64 <3996000000>;
 			opp-level = <15>;
+			opp-microwatt = <5575900>;
 		};
 		opp16 {
 			opp-hz = /bits/ 64 <4044000000>;
 			opp-level = <16>;
+			opp-microwatt = <5773400>;
 		};
 		opp17 {
 			opp-hz = /bits/ 64 <4104000000>;
 			opp-level = <17>;
+			opp-microwatt = <5969200>;
 		};
 		opp18 {
 			opp-hz = /bits/ 64 <4416000000>;
 			opp-level = <18>;
+			opp-microwatt = <8274900>;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <4512000000>;
 			opp-level = <19>;
+			opp-microwatt = <9256900>;
 		};
 	};
 
@@ -422,78 +456,97 @@
 		opp01 {
 			opp-hz = /bits/ 64 <1260000000>;
 			opp-level = <1>;
+			opp-microwatt = <561800>;
 		};
 		opp02 {
 			opp-hz = /bits/ 64 <1512000000>;
 			opp-level = <2>;
+			opp-microwatt = <772500>;
 		};
 		opp03 {
 			opp-hz = /bits/ 64 <1800000000>;
 			opp-level = <3>;
+			opp-microwatt = <988900>;
 		};
 		opp04 {
 			opp-hz = /bits/ 64 <2088000000>;
 			opp-level = <4>;
+			opp-microwatt = <1302300>;
 		};
 		opp05 {
 			opp-hz = /bits/ 64 <2352000000>;
 			opp-level = <5>;
+			opp-microwatt = <1644100>;
 		};
 		opp06 {
 			opp-hz = /bits/ 64 <2616000000>;
 			opp-level = <6>;
+			opp-microwatt = <2003700>;
 		};
 		opp07 {
 			opp-hz = /bits/ 64 <2868000000>;
 			opp-level = <7>;
+			opp-microwatt = <2349000>;
 		};
 		opp08 {
 			opp-hz = /bits/ 64 <3096000000>;
 			opp-level = <8>;
+			opp-microwatt = <2723000>;
 		};
 		opp09 {
 			opp-hz = /bits/ 64 <3300000000>;
 			opp-level = <9>;
+			opp-microwatt = <3333200>;
 		};
 		opp10 {
 			opp-hz = /bits/ 64 <3468000000>;
 			opp-level = <10>;
+			opp-microwatt = <3711900>;
 		};
 		opp11 {
 			opp-hz = /bits/ 64 <3624000000>;
 			opp-level = <11>;
+			opp-microwatt = <4129900>;
 		};
 		opp12 {
 			opp-hz = /bits/ 64 <3756000000>;
 			opp-level = <12>;
+			opp-microwatt = <4666300>;
 		};
 		opp13 {
 			opp-hz = /bits/ 64 <3852000000>;
 			opp-level = <13>;
+			opp-microwatt = <4881000>;
 		};
 		opp14 {
 			opp-hz = /bits/ 64 <3924000000>;
 			opp-level = <14>;
+			opp-microwatt = <5176700>;
 		};
 		opp15 {
 			opp-hz = /bits/ 64 <3996000000>;
 			opp-level = <15>;
+			opp-microwatt = <5306500>;
 		};
 		opp16 {
 			opp-hz = /bits/ 64 <4044000000>;
 			opp-level = <16>;
+			opp-microwatt = <5618900>;
 		};
 		opp17 {
 			opp-hz = /bits/ 64 <4104000000>;
 			opp-level = <17>;
+			opp-microwatt = <5843100>;
 		};
 		opp18 {
 			opp-hz = /bits/ 64 <4416000000>;
 			opp-level = <18>;
+			opp-microwatt = <8075300>;
 		};
 		opp19 {
 			opp-hz = /bits/ 64 <4512000000>;
 			opp-level = <19>;
+			opp-microwatt = <8949200>;
 		};
 	};
 
@@ -1295,6 +1348,15 @@
 		aop_las: las {
 			compatible = "apple,t6041-aop-las", "apple,aop-las";
 		};
+
+		/* The calibration properties come from the bootloader. */
+		aop_accel: accel {
+			compatible = "apple,t6041-aop-accel", "apple,aop-accel";
+		};
+
+		aop_gyro: gyro {
+			compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
+		};
 	};
 
 	/* ADT lists the interrupts as 1, 0, 3, 2 of the block: send-empty is the lowest. */
@@ -1926,6 +1988,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -1936,6 +1999,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -1946,6 +2010,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 
@@ -2121,7 +2186,7 @@
 		power-domains = <&ps_qspi>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-		/* The firmware NOR needs a qualified partition/write policy. */
+		/* Boards enable it with their flash and its nvram partition. */
 		status = "disabled";
 	};
 
@@ -2155,12 +2220,24 @@
 	/* Firmware interface support is required before enabling the ANE. */
 	ane: ane@484000000 {
 		compatible = "apple,t6041-ane";
-		reg = <0x4 0x84000000 0x0 0x2000000>;
-		reg-names = "engine";
+		reg = <0x4 0x84000000 0x0 0x2000000>,
+		      <0x5 0x02280000 0x0 0x18000>,
+		      <0x5 0x022a0000 0x0 0x4000>,
+		      <0x5 0x003c0000 0x0 0x30000>,
+		      <0x2 0x12000000 0x0 0xff4000>,
+		      <0x5 0x22000000 0x0 0x2000000>,
+		      <0x5 0x08374000 0x0 0x4000>;
+		reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2",
+			    "aux-3", "aux-4";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1054 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
-		power-domains = <&ps_ane_cpu>;
+		iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>,
+			 <&ane0_dart0 11>, <&ane0_dart1 11>, <&ane0_dart2 11>;
+		power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+				<&ps_ane_td>, <&ps_ane_base>;
+		apple,ane-type = <0x110>;
+		apple,firmware-preloaded;
+		/* TEXT/DATA reservations and IOVAs must come from iBoot. */
 		status = "disabled";
 	};
 

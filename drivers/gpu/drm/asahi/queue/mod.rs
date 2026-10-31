@@ -194,7 +194,7 @@ impl JobFence::ver {
 #[vtable]
 impl dma_fence::FenceOps for JobFence::ver {
     fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
-        c_str!("asahi")
+        c_str!("aurora")
     }
     fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
         c_str!("queue")
@@ -468,7 +468,7 @@ impl Drop for QueueJob::ver {
     }
 }
 
-static QUEUE_NAME: &CStr = c_str!("asahi_fence");
+static QUEUE_NAME: &CStr = c_str!("aurora_fence");
 static QUEUE_CLASS_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
 #[versions(AGX)]
@@ -526,7 +526,7 @@ impl Queue::ver {
             WQ_SIZE,
             0,
             100000,
-            c_str!("asahi_sched"),
+            c_str!("aurora_sched"),
         )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 

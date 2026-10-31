@@ -140,8 +140,11 @@ programmed mode; the original DCP sync positions and mode IDs are unchanged.
 This also lets a 118-line porch and 82-line notch-expanded pulse publish an
 identity instead of failing the base EDID size check.
 The EDID records model year 2024 (not a manufacture date) and a nominal D65
-reference white point required by EDID parsing. No calibrated primaries, gamma,
-new mode or machine serial is claimed. The ADT reader,
+reference white point required by EDID parsing. When a complete valid optional
+firmware colour description is available, the shared encoder supplies its
+primaries, white and gamma instead; see :doc:`apple-dcp-panel-colorimetry`.
+Missing colour data does not imply calibrated primaries or gamma. No new mode
+or machine serial is claimed. The ADT reader,
 EDID fallback and real EDID setters are restricted to desktop 26.6; T8140
 continues to use its existing path.
 

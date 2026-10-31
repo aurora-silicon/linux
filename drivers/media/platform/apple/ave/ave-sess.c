@@ -47,7 +47,6 @@
 #define AVE_SHDR_BYTES			(256 * 0x400)
 #define AVE_SHDR_ENTRY_BYTES		0x400
 #define AVE_CODED_MIN			0x3c000
-#define AVE_HDR_BYTES			0x12c000
 
 /* H.264 per-frame buffer (Process +0x58c8): unused in bit-rate modes */
 #define AVE_H264_FRAME_BUF		SZ_16K
@@ -181,6 +180,10 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 							       ALIGN(p->width, 16)) *
 			     ALIGN(p->height, 16) / 2, SZ_16K);
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
+	if (ctx->ave->layout->counted &&
+	    (p->fps_num != 30ULL * p->fps_den ||
+	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
+		return -EOPNOTSUPP;
 	return 0;
 }
 
@@ -201,8 +204,8 @@ struct ave_buf_req {
 	unsigned long attrs;
 };
 
-#define AVE_MAX_BUF_REQS	(1 + 4 * AVE_MAX_REFS + 4 + 2 * AVE_TILE_BUFS + 2 + \
-				 3 * AVE_MAX_SLOTS)
+#define AVE_MAX_BUF_REQS	(1 + 6 * AVE_MAX_REFS + 6 + 2 * AVE_TILE_BUFS + 2 + \
+				 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
 {
@@ -229,6 +232,7 @@ static void ave_req(struct ave_buf_req *r, unsigned int *n, struct ave_buf *b, s
 static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 {
 	const struct ave_params *p = &sess->p;
+	const struct ave_fw_layout *fw = ave->layout;
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
@@ -244,19 +248,30 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		return -ENOMEM;
 
 	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
+	if (p->bit_depth == 10)
+		ref_a = ref_a * 5 / 4;
 	ref_b = roundup_pow_of_two(w) * roundup_pow_of_two(h) / 32;
 	ref_c = ave_lfs_ref_size(w, h, hevc, ave->variant->lfs_ref_scale);
 	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
+	if (p->bit_depth == 10)
+		tile *= 2;
 
-	ave_req(r, &n, &sess->hdr, AVE_HDR_BYTES, 0, nomap);
+	ave_req(r, &n, &sess->hdr, fw->hdr_bytes, 0, nomap);
 	for (unsigned int i = 0; i < p->refs; i++) {
 		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2, nomap);
 		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
 		ave_req(r, &n, &sess->ref_c[i], ref_c, 0, nomap);
 		ave_req(r, &n, &sess->ref_d[i], ref_d, 0, nomap);
+		if (fw->counted) {
+			ave_req(r, &n, &sess->ref_e[i], ref_a / 2, 0, nomap);
+			ave_req(r, &n, &sess->ref_f[i], ref_b / 4, 0, nomap);
+		}
 	}
 	ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
+	if (fw->counted && p->rc_mode == 3)
+		for (unsigned int i = 0; i < 2; i++)
+			ave_req(r, &n, &sess->mb_extra[i], ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
 	ave_req(r, &n, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), 0, nomap);
 	ave_req(r, &n, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0, nomap);
 	ave_req(r, &n, &sess->fixed, SZ_16K, 0, nomap);
@@ -269,14 +284,18 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0, nomap);
 	for (unsigned int s = 0; s < p->slots; s++) {
 		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0, 0);
-		ave_req(r, &n, &sess->slot[s].meta, AVE_META_BYTES, 0, 0);
-		/*
-		 * HEVC: slice headers. H.264: the per-frame buffer of Process
-		 * +0x58c8, which the firmware never wrote in any bit-rate
-		 * mode on hardware; one page.
-		 */
-		ave_req(r, &n, &sess->slot[s].aux, hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0,
-			hevc ? 0 : nomap);
+		ave_req(r, &n, &sess->slot[s].meta, fw->meta_bytes, 0, 0);
+		/* J700 has HEVC slice headers; 26A428 has a new small slot buffer. */
+		if (fw->counted) {
+			ave_req(r, &n, &sess->slot[s].extra, SZ_16K, 0, 0);
+			if (!hevc && p->rc_mode != 3)
+				ave_req(r, &n, &sess->slot[s].aux,
+					ALIGN(432 * p->mbs, SZ_16K), 0, nomap);
+		} else {
+			ave_req(r, &n, &sess->slot[s].aux,
+				hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0,
+				hevc ? 0 : nomap);
+		}
 	}
 
 	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
@@ -302,8 +321,12 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->ref_b[i]);
 		ave_free(ave, &sess->ref_c[i]);
 		ave_free(ave, &sess->ref_d[i]);
+		ave_free(ave, &sess->ref_e[i]);
+		ave_free(ave, &sess->ref_f[i]);
 	}
 	ave_free(ave, &sess->mb);
+	for (unsigned int i = 0; i < 2; i++)
+		ave_free(ave, &sess->mb_extra[i]);
 	ave_free(ave, &sess->row_a);
 	ave_free(ave, &sess->row_b);
 	ave_free(ave, &sess->fixed);
@@ -317,6 +340,7 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);
 		ave_free(ave, &sess->slot[s].aux);
+		ave_free(ave, &sess->slot[s].extra);
 		ave_free(ave, &sess->slot[s].bounce);
 	}
 }
@@ -461,24 +485,38 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	return sess;
 }
 
-/*
- * Free the buffers. A firmware that stopped answering in the middle of a
- * session may still write to them, and a freed DART range is soon handed
- * out again, so those stay allocated (until reboot, like the firmware
- * itself). Buffers the firmware never saw (no Start sent) always go.
- */
+/* Keep every firmware-visible allocation mapped until a confirmed power cycle. */
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
+	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
 
 	if (!sess)
 		return;
-	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN)
-		dev_warn(ctx->ave->dev, "keeping the buffers of a failed session\n");
-	else
-		ave_sess_free_bufs(ctx->ave, sess);
-	kfree(sess);
+	mutex_lock(&ave->hw_lock);
+	if (sess->handed && (ave->fw_state == AVE_FW_BROKEN ||
+			     ave->fw_state == AVE_FW_RECOVERING)) {
+		sess->failed_next = ave->failed_sessions;
+		ave->failed_sessions = sess;
+	} else {
+		ave_sess_free_bufs(ave, sess);
+		kfree(sess);
+	}
 	ctx->sess = NULL;
+	mutex_unlock(&ave->hw_lock);
+}
+
+/* Caller holds hw_lock and has verified that the coprocessor lost power. */
+void ave_sess_reap(struct ave_dev *ave)
+{
+	struct ave_session *sess;
+
+	lockdep_assert_held(&ave->hw_lock);
+	while ((sess = ave->failed_sessions)) {
+		ave->failed_sessions = sess->failed_next;
+		ave_sess_free_bufs(ave, sess);
+		kfree(sess);
+	}
 }
 
 int ave_sess_free_slot(struct ave_session *sess)
@@ -498,7 +536,7 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 	struct ave_slot *s = &sess->slot[slot];
 
 	memset(s->meta.cpu, 0, s->meta.size);
-	if (sess->p.codec == AVE_CODEC_HEVC)
+	if (sess->p.codec == AVE_CODEC_HEVC && s->aux.cpu)
 		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
 }
 
@@ -510,7 +548,7 @@ void ave_sess_reply(struct ave_dev *ave, const u8 *msg, u32 len)
 {
 	u64 client = get_unaligned_le64(msg + AVE_REPLY_CLIENT);
 	u32 subtype = get_unaligned_le32(msg + AVE_REPLY_SUBTYPE);
-	u32 slot = subtype - AVE_PROC_SUBTYPE;
+	u32 slot = subtype - ave->layout->process_subtype;
 	struct ave_session *sess = NULL;
 	struct ave_ctx *ctx = NULL;
 	struct ave_slot *s;

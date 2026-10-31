@@ -2,7 +2,9 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include <linux/firmware.h>
+#include <linux/gcd.h>
 #include <linux/unaligned.h>
+#include <kunit/static_stub.h>
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
@@ -331,6 +333,107 @@ free_configs:
 	return err;
 }
 
+/* Common call sizes, offered only when a known processed crop contains them. */
+static const struct coord isp_call_sizes[] = {
+	{ 640, 480 }, { 1280, 720 }, { 1920, 1080 }, { 1080, 1920 },
+	{ 1760, 1328 }, { 1328, 1760 }, { 1552, 1552 },
+	{ 1280, 960 }, { 960, 1280 },
+};
+
+/*
+ * CH_CROP[_SCL1]_SET takes x/y/width/height independently of the output
+ * dimensions in CH_OUTPUT_CONFIG[_SCL1]_SET. Stay within an established
+ * processed crop, rather than the sensor input (which may contain stacked
+ * rows). Use the largest exact-aspect crop, centred on the chroma grid,
+ * with no upscaling. Neither command reports a scaler limit or rotation.
+ */
+static bool isp_size_from_crop(const struct isp_preset *source,
+			       struct coord size, struct isp_preset *preset)
+{
+	u32 divisor, x, y, scale;
+
+	if (!size.x || !size.y || (size.x | size.y) & 1 ||
+	    !source->crop_size.x || !source->crop_size.y ||
+	    (source->crop_offset.x | source->crop_offset.y) & 1 ||
+	    source->crop_size.x > 16384 || source->crop_size.y > 16384 ||
+	    source->crop_offset.x > source->input_dim.x ||
+	    source->crop_size.x > source->input_dim.x - source->crop_offset.x ||
+	    source->crop_offset.y > source->input_dim.y ||
+	    source->crop_size.y > source->input_dim.y - source->crop_offset.y)
+		return false;
+
+	divisor = gcd(size.x, size.y);
+	x = size.x / divisor;
+	y = size.y / divisor;
+	scale = round_down(min(source->crop_size.x / x,
+			       source->crop_size.y / y), 2);
+	if (scale < divisor)
+		return false;
+
+	*preset = *source;
+	preset->output_dim = size;
+	preset->crop_size = (struct coord){ x * scale, y * scale };
+	preset->crop_offset.x += round_down((source->crop_size.x - x * scale) / 2, 2);
+	preset->crop_offset.y += round_down((source->crop_size.y - y * scale) / 2, 2);
+	return true;
+}
+
+static unsigned int isp_append_size(struct isp_preset *presets, unsigned int num,
+				    unsigned int sources, struct coord size)
+{
+	struct isp_preset candidate, best;
+	u32 area, best_area = 0;
+
+	for (unsigned int i = 0; i < num; i++)
+		if (presets[i].output_dim.x == size.x &&
+		    presets[i].output_dim.y == size.y)
+			return num;
+
+	/* Never use a generated size as evidence for another generated size. */
+	for (unsigned int i = 0; i < sources; i++) {
+		if (!isp_size_from_crop(&presets[i], size, &candidate))
+			continue;
+		area = candidate.crop_size.x * candidate.crop_size.y;
+		if (area > best_area) {
+			best = candidate;
+			best_area = area;
+		}
+	}
+	if (best_area)
+		presets[num++] = best;
+	return num;
+}
+
+static int isp_add_call_sizes(struct apple_isp *isp)
+{
+	unsigned int sources = isp->num_presets, num = sources;
+	struct isp_preset *presets;
+	struct isp_preset candidate;
+	u32 square = 0;
+
+	presets = devm_kcalloc(isp->dev, sources + ARRAY_SIZE(isp_call_sizes) + 1,
+			       sizeof(*presets), GFP_KERNEL);
+	if (!presets)
+		return -ENOMEM;
+	memcpy(presets, isp->presets, sources * sizeof(*presets));
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(isp_call_sizes); i++)
+		num = isp_append_size(presets, num, sources, isp_call_sizes[i]);
+
+	/* A smaller sensor can still offer a square without enlarging pixels. */
+	for (unsigned int i = 0; i < sources; i++) {
+		u32 side = round_down(min(presets[i].crop_size.x,
+					  presets[i].crop_size.y), 2);
+
+		if (isp_size_from_crop(&presets[i], (struct coord){ side, side }, &candidate))
+			square = max(square, side);
+	}
+	num = isp_append_size(presets, num, sources, (struct coord){ square, square });
+	isp->presets = presets;
+	isp->num_presets = num;
+	return 0;
+}
+
 static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 {
 	struct isp_format *fmt = isp_get_format(isp, ch);
@@ -380,6 +483,8 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 	err = isp_check_presets(isp, args->num_presets);
 	if (!err)
 		err = isp_ch_cache_sensor_configs(isp, ch, args->num_presets);
+	if (!err)
+		err = isp_add_call_sizes(isp);
 
 exit:
 	kfree(args);
@@ -512,14 +617,20 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	u32 magic;
 	int err;
 
+	KUNIT_STATIC_STUB_REDIRECT(isp_ch_load_setfile, isp, ch);
+
 	if (WARN_ON_ONCE(setfile->size > isp->data_surf->size))
 		return -ENOSPC;
 
 	err = firmware_request_nowarn(&fw, setfile->path, isp->dev);
 	if (err) {
-		dev_warn_once(isp->dev,
-			      "setfile '%s' not loaded (%d), streaming without calibration\n",
-			      setfile->path, err);
+		if (err == -ENOENT)
+			dev_warn_once(isp->dev,
+				      "setfile '%s' missing, streaming without sensor tuning\n",
+				      setfile->path);
+		else
+			dev_err(isp->dev, "failed to read setfile '%s': %d\n",
+				setfile->path, err);
 		return err;
 	}
 
@@ -545,8 +656,16 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	if (isp->hw->gen == ISP_GEN_T6040)
 		isp_setfile_fixup_h17(isp->data_surf->virt, len);
 
-	return isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
-					setfile->size);
+	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
+				       setfile->size);
+	if (err)
+		dev_err(isp->dev, "ch %u: setfile '%s' load failed: %d\n",
+			ch, setfile->path, err);
+	else
+		dev_dbg(isp->dev, "ch %u: loaded sensor tuning '%s' (0x%zx bytes)\n",
+			ch, setfile->path, setfile->size);
+
+	return err;
 }
 
 static int isp_ch_configure_frame_rate(struct apple_isp *isp, u32 ch)
@@ -613,11 +732,12 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
 		goto select_config;
 
 	/*
-	 * The setfile isn't requisite but then we don't get calibration. If
-	 * loading it was interrupted by a signal, give up on the stream.
+	 * Missing sensor tuning is optional. A present but invalid setfile or
+	 * a failed firmware upload must not silently select firmware defaults.
+	 * This model-wide tuning is separate from per-module factory data.
 	 */
 	err = isp_ch_load_setfile(isp, ch);
-	if (err == -EINTR)
+	if (err && err != -ENOENT)
 		return err;
 
 	if (isp->hw->lpdp) {

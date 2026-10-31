@@ -131,8 +131,6 @@ enum ave_opcode {
 #define AVE_TOKEN_BASE			300	/* the first Open carries 400 */
 #define AVE_CLIENT_STEP			10
 
-/* Process slots: the command subtype is this plus the slot index */
-#define AVE_PROC_SUBTYPE		0x15
 /* Completes sent to drain a session */
 #define AVE_DRAIN_COMPLETES		4
 

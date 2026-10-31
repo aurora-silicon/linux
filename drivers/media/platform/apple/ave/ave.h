@@ -9,6 +9,7 @@
 
 #include <linux/atomic.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -20,6 +21,7 @@
 #include <media/videobuf2-v4l2.h>
 
 #include "ave-sizes.h"
+#include "ave-recovery.h"
 
 struct debugfs_blob_wrapper;
 struct dentry;
@@ -27,7 +29,7 @@ struct dev_pm_domain_list;
 struct iommu_domain;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
-#define AVE_MAX_SLOTS		5
+#define AVE_MAX_SLOTS		7
 /* Sessions one firmware boot serves at once (macOS was seen running two). */
 #define AVE_MAX_SESSIONS	2
 
@@ -94,6 +96,7 @@ enum ave_fw_state {
 	AVE_FW_RUNNING,
 	AVE_FW_HALTED,		/* told to halt; restarts through the boot path */
 	AVE_FW_BROKEN,
+	AVE_FW_RECOVERING,	/* control off; awaiting a runtime power cycle */
 };
 
 /* The two large session commands, and their sizes per codec */
@@ -103,10 +106,7 @@ enum ave_image {
 	AVE_IMAGE_COUNT,
 };
 
-#define AVE_START_H264_BYTES		0x3180
-#define AVE_START_HEVC_BYTES		0x13f28
-#define AVE_PROCESS_H264_BYTES		0x63d8
-#define AVE_PROCESS_HEVC_BYTES		0xb1c0
+#include "ave-layout.h"
 
 /* The firmware build whose command layouts the driver generates */
 #define AVE_FW_TEXT_CRC_9003_78_0	0x69c54454
@@ -131,13 +131,14 @@ struct ave_variant {
 	u32 boot_device_id;
 	u32 device_type;
 	u32 lfs_ref_scale;
-	/* Zero means no command constants or MCC DSID have been qualified. */
-	u32 encoding_text_crc;
+	/* Register sequence and boot/hello configuration have been qualified. */
+	bool boot_qualified;
 };
 
 struct ave_dev {
 	struct device *dev;
 	const struct ave_variant *variant;
+	const struct ave_fw_layout *layout;
 	void __iomem *codec;
 	void __iomem *mbox;
 	void __iomem *coproc;
@@ -150,6 +151,12 @@ struct ave_dev {
 	u32 data_crc;
 	void *data_pristine;
 	bool data_dirty;
+
+	/* hw_lock protects recovery history and quarantined DMA allocations. */
+	struct ave_recovery_history recovery;
+	unsigned int recovery_count;
+	struct ave_session *failed_sessions;
+	bool inject_wedge;
 
 	/* debugfs: the last Start and first Process built, per codec */
 	struct dentry *debugfs;
@@ -206,12 +213,15 @@ struct ave_params {
 	u32 level;			/* firmware level enum, 1-based */
 	bool high;
 	u32 coded_cap;
+	u32 bit_depth;		/* zero also means the existing 8-bit API */
+	u32 initial_qp;		/* CQ only; bit-rate modes use 26 */
 };
 
 struct ave_slot {
 	struct ave_buf coded;
 	struct ave_buf meta;
 	struct ave_buf aux;		/* H.264 per-frame buffer, HEVC slice headers */
+	struct ave_buf extra;		/* counted layout: per-slot 16 KiB buffer */
 	struct ave_buf bounce;		/* input copied to the encoder's stride */
 	struct vb2_v4l2_buffer *src;
 	u32 status;
@@ -223,13 +233,17 @@ struct ave_slot {
 #define AVE_TILE_BUFS		8
 
 struct ave_session {
+	struct ave_session *failed_next;
 	struct ave_params p;
 	struct ave_buf hdr;
 	struct ave_buf ref_a[AVE_MAX_REFS];
 	struct ave_buf ref_b[AVE_MAX_REFS];
 	struct ave_buf ref_c[AVE_MAX_REFS];
 	struct ave_buf ref_d[AVE_MAX_REFS];
+	struct ave_buf ref_e[AVE_MAX_REFS];
+	struct ave_buf ref_f[AVE_MAX_REFS];
 	struct ave_buf mb;
+	struct ave_buf mb_extra[2];
 	struct ave_buf row_a, row_b, fixed;
 	struct ave_buf tile[AVE_TILE_BUFS];
 	struct ave_buf tile_aux[AVE_TILE_BUFS];
@@ -287,6 +301,9 @@ struct ave_ctx {
 	bool draining;
 	bool flush_pending;
 	bool stopped;
+	/* Serialises QBUF with fatal-error publication and ready-queue draining. */
+	spinlock_t queue_lock;
+	bool failed;
 	struct vb2_v4l2_buffer *drain_src;
 	u32 src_sequence;
 	u32 dst_sequence;
@@ -303,6 +320,8 @@ void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 void ave_fw_halt(struct ave_dev *ave);
 int ave_fw_shutdown(struct ave_dev *ave);
+int ave_fw_runtime_suspend(struct ave_dev *ave);
+void ave_fw_mark_broken(struct ave_dev *ave, int err, const char *what);
 void ave_fw_lost(struct ave_dev *ave);
 int ave_fw_check_build(struct ave_dev *ave);
 int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long attrs);
@@ -334,6 +353,7 @@ int ave_cmd_close(struct ave_ctx *ctx);
 /* ave-sess.c */
 struct ave_session *ave_sess_create(struct ave_ctx *ctx);
 void ave_sess_destroy(struct ave_ctx *ctx);
+void ave_sess_reap(struct ave_dev *ave);
 int ave_sess_free_slot(struct ave_session *sess);
 void ave_sess_reply(struct ave_dev *ave, const u8 *msg, u32 len);
 int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffer *src,
@@ -345,9 +365,11 @@ bool ave_sess_stalled(struct ave_session *sess);
 bool ave_sess_starved(struct ave_session *sess);
 
 /* ave-image.c */
-void ave_image_start(u8 *cmd, size_t len, enum ave_codec codec, bool reorder_off,
+void ave_image_start(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
+		     enum ave_codec codec, bool reorder_off,
 		     bool hevc_low_delay);
-void ave_image_process(u8 *cmd, size_t len, enum ave_codec codec);
+void ave_image_process(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
+		       enum ave_codec codec);
 
 /* ave-drv.c */
 void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image kind,

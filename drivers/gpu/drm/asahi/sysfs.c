@@ -316,4 +316,4 @@ EXPORT_SYMBOL_GPL(asahi_sysfs_unregister);
 
 MODULE_AUTHOR("AGX driver maintainer");
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_DESCRIPTION("Asahi AGX firmware stats sysfs shim");
+MODULE_DESCRIPTION("AGX firmware stats sysfs shim");

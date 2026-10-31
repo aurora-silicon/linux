@@ -7,6 +7,7 @@ GPU Driver Documentation
 
    amdgpu/index
    apple-dcp-backlight
+   apple-dcp-panel-colorimetry
    apple-drm-parameters
    asahi-reclaim
    asahi-usage-stats

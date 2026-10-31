@@ -53,6 +53,13 @@ static const struct ave_variant ave_t8112 = {
 	.lfs_ref_scale = 1,
 };
 
+/* CRC, boot-config words and coprocessor start registers remain unqualified. */
+static const struct ave_variant ave_t6041 = {
+	.fw_text_size = 0x14c000,
+	.fw_data_size = 0x12c000,
+	.lfs_ref_scale = 2,
+};
+
 static const struct ave_variant ave_t8140 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
@@ -60,7 +67,7 @@ static const struct ave_variant ave_t8140 = {
 	.boot_device_id = 29,
 	.device_type = 27,
 	.lfs_ref_scale = 2,
-	.encoding_text_crc = AVE_FW_TEXT_CRC_9003_78_0,
+	.boot_qualified = true,
 };
 
 /*
@@ -68,19 +75,34 @@ static const struct ave_variant ave_t8140 = {
  * last_process0_{h264,hevc} the first Process of the last session, so the
  * generated commands can be compared with reference captures.
  */
-static const size_t ave_image_bytes[2][AVE_IMAGE_COUNT] = {
-	{ AVE_START_H264_BYTES, AVE_PROCESS_H264_BYTES },
-	{ AVE_START_HEVC_BYTES, AVE_PROCESS_HEVC_BYTES },
-};
-
 void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image kind,
 		      const void *cmd, size_t len)
 {
 	void *dst = ave->dump[codec - 1][kind];
 
-	if (dst && len == ave_image_bytes[codec - 1][kind])
+	if (ave->layout && dst && len == ave->layout->bytes[codec - 1][kind])
 		memcpy(dst, cmd, len);
 }
+
+/* Root-only software timeout injection; does not send malformed firmware commands. */
+static int ave_inject_wedge(void *data, u64 value)
+{
+	struct ave_dev *ave = data;
+	int ret = 0;
+
+	if (value != 1)
+		return -EINVAL;
+	mutex_lock(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_RUNNING) {
+		ret = -EBUSY;
+	} else {
+		ave->inject_wedge = true;
+		ave_fw_mark_broken(ave, -ETIMEDOUT, "debugfs injection");
+	}
+	mutex_unlock(&ave->hw_lock);
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(ave_inject_wedge_fops, NULL, ave_inject_wedge, "%llu\n");
 
 static void ave_debugfs_init(struct ave_dev *ave)
 {
@@ -89,21 +111,24 @@ static void ave_debugfs_init(struct ave_dev *ave)
 		{ "last_start_hevc", "last_process0_hevc" },
 	};
 
-	if (!IS_ENABLED(CONFIG_DEBUG_FS))
+	if (!IS_ENABLED(CONFIG_DEBUG_FS) || !ave->layout)
 		return;
 	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
+	debugfs_create_file("inject_wedge", 0200, ave->debugfs, ave,
+			    &ave_inject_wedge_fops);
 	for (unsigned int c = 0; c < 2; c++)
 		for (unsigned int k = 0; k < AVE_IMAGE_COUNT; k++) {
 			struct debugfs_blob_wrapper *blob;
+			size_t size = ave->layout->bytes[c][k];
 
 			blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
-			ave->dump[c][k] = devm_kzalloc(ave->dev, ave_image_bytes[c][k], GFP_KERNEL);
+			ave->dump[c][k] = devm_kzalloc(ave->dev, size, GFP_KERNEL);
 			if (!blob || !ave->dump[c][k]) {
 				ave->dump[c][k] = NULL;
 				continue;
 			}
 			blob->data = ave->dump[c][k];
-			blob->size = ave_image_bytes[c][k];
+			blob->size = ave->layout->bytes[c][k];
 			debugfs_create_blob(names[c][k], 0400, ave->debugfs, blob);
 		}
 }
@@ -153,23 +178,37 @@ static int ave_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "cannot attach power domains\n");
 
-	pm_runtime_set_autosuspend_delay(dev, AVE_AUTOSUSPEND_MS);
-	pm_runtime_use_autosuspend(dev);
-	ret = devm_pm_runtime_enable(dev);
-	if (ret)
-		return ret;
-
 	ret = ave_fw_probe(ave);
 	if (ret)
 		return ret;
 
+	/*
+	 * Domain attachment took active supplier references, but the driver
+	 * starts firmware only on first use and begins suspended. Reconcile that
+	 * state before enabling runtime PM, otherwise those references survive
+	 * until the first session has resumed and suspended the encoder.
+	 */
+	ret = pm_runtime_set_suspended(dev);
+	if (ret)
+		goto err_fw;
+
+	pm_runtime_set_autosuspend_delay(dev, AVE_AUTOSUSPEND_MS);
+	pm_runtime_use_autosuspend(dev);
+	ret = devm_pm_runtime_enable(dev);
+	if (ret)
+		goto err_pm;
+
 	ret = ave_v4l2_register(ave);
-	if (ret) {
-		ave_fw_remove(ave);
-		return ret;
-	}
+	if (ret)
+		goto err_pm;
 	ave_debugfs_init(ave);
 	return 0;
+
+err_pm:
+	pm_runtime_dont_use_autosuspend(dev);
+err_fw:
+	ave_fw_remove(ave);
+	return ret;
 }
 
 static void ave_remove(struct platform_device *pdev)
@@ -201,7 +240,7 @@ static int ave_runtime_suspend(struct device *dev)
 	int ret;
 
 	mutex_lock(&ave->hw_lock);
-	ret = ave_fw_shutdown(ave);
+	ret = ave_fw_runtime_suspend(ave);
 	mutex_unlock(&ave->hw_lock);
 	return ret;
 }
@@ -256,6 +295,7 @@ static const struct dev_pm_ops ave_pm_ops = {
 
 static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6000-ave", .data = &ave_t6000 },
+	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
 	{ }

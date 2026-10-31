@@ -15,9 +15,11 @@ description:
   drives the engine through its register window. On T602x and T8112 a
   coprocessor runs the ANE firmware and the host talks to it through an ASC
   mailbox. T8140 has two interrupts and one system power domain; its
-  coprocessor uses a different firmware interface. T6041 likewise needs a
-  generation-specific firmware backend; it has one interrupt and its CPU
-  power state supplies the engine through the ANE system domain.
+  coprocessor is exclave-assigned and cannot be used directly without a
+  Linux ownership provider. T6041 has one interrupt and preloaded firmware;
+  its CPU, MPM and task domains depend on the ANE system domain, and its
+  base domain depends on the task domain. Interrupt roles on T6041 and
+  T8140 are not yet established.
 
 properties:
   compatible:
@@ -34,20 +36,34 @@ properties:
   reg:
     minItems: 1
     items:
-      - description: Engine registers. On T602x and T8112 this is the whole
-          ANE block, including the coprocessor.
+      - description: Engine registers, including the coprocessor on firmware
+          managed generations
       - description: Power manager (PMGR) registers of the ANE
-      - description: ANE power state registers in the PMGR
-      - description: eFuse words that give the SoC revision to the ANE
-          firmware
+      - description: Power state registers or first auxiliary window
+      - description: Revision registers or second auxiliary window
+      - description: Third auxiliary window
+      - description: Fourth auxiliary window
+      - description: Fifth auxiliary window
 
   reg-names:
     minItems: 1
-    items:
-      - const: engine
-      - const: pmgr
-      - const: set
-      - const: fuse
+    maxItems: 7
+
+  apple,performance-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP report provider that owns the ANE clock-level request interface.
+      Only supported on T6000. The ANE and report SRAM must remain powered
+      while the driver holds a request.
+
+  interconnects:
+    maxItems: 1
+
+  interconnect-names:
+    const: memory
+    description: DRAM/fabric path; bandwidth requests come from the level OPP.
+
+  operating-points-v2: true
 
   interrupts:
     minItems: 1
@@ -58,11 +74,16 @@ properties:
       - const: ane
 
   iommus:
-    maxItems: 3
+    description:
+      Stream 0 of each of the three DARTs, followed on T6041 by stream 11 of
+      each, which the ANE's MPM uses.
+    minItems: 3
+    maxItems: 6
 
   power-domains:
     description:
-      The power states the engine needs, five on T8103 and T6000, eight on
+      The power states the engine needs, five on T8103, six on T6000 with
+      ANE level control (including PMP report SRAM), eight on
       T602x, seven on T8112 and one system domain on T8140.
     minItems: 1
     maxItems: 8
@@ -76,10 +97,47 @@ properties:
     description: Mailbox of the ANE coprocessor
 
   memory-region:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
     description:
-      IOVA-only reservation of the firmware entry alias in the ANE DART
-      address space.
+      On T602x, the IOVA-only reservation of the firmware entry alias.
+      On T6041 and T8140, bootloader-provided physical TEXT and DATA preload
+      reservations in that order. Each reservation must have no-map, must
+      not be reusable, and must remain reserved until reboot. Physical
+      addresses vary per boot and must not be hard-coded in a board DTS.
+
+  memory-region-names:
+    items:
+      - const: firmware-text
+      - const: firmware-data
+
+  apple,firmware-iovas:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    items:
+      - const: 0x10000000000
+      - const: 0x100000c0000
+    description:
+      Device addresses of the preloaded TEXT and DATA segments. Their sizes
+      are 0xc0000 and 0x2ac000 bytes respectively. The bootloader supplies
+      this property together with the physical reservations.
+
+  apple,ane-type:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0x110, 0x200]
+    description: Firmware generation identifier supplied by the bootloader
+
+  apple,firmware-preloaded:
+    type: boolean
+    description:
+      Firmware has been personalized and preloaded by iBoot. The driver
+      must preserve its runtime patches and must not stage a disk image.
+
+  apple,exclave-assigned:
+    type: boolean
+    description:
+      The ANE belongs to an exclave. Direct access requires a separate
+      Linux ownership provider to acquire a quiesced device and isolate
+      the exclave DART contexts. Absence does not prove a handoff on T8140.
 
 required:
   - compatible
@@ -91,6 +149,24 @@ required:
 
 allOf:
   - if:
+      required:
+        - interconnects
+    then:
+      required:
+        - interconnect-names
+        - operating-points-v2
+  - if:
+      required:
+        - apple,performance-controller
+    then:
+      properties:
+        compatible:
+          const: apple,t6000-ane
+        power-domains:
+          minItems: 6
+          maxItems: 6
+
+  - if:
       properties:
         compatible:
           const: apple,t8140-ane
@@ -98,6 +174,56 @@ allOf:
       properties:
         interrupts:
           minItems: 2
+        power-domains:
+          maxItems: 1
+        apple,ane-type:
+          const: 0x200
+  - if:
+      properties:
+        compatible:
+          const: apple,t8140-ane
+    then:
+      properties:
+        reg:
+          maxItems: 6
+        reg-names:
+          minItems: 1
+          items:
+            - const: engine
+            - const: pmgr
+            - const: aux-0
+            - const: aux-1
+            - const: aux-2
+            - const: aux-3
+  - if:
+      required:
+        - apple,firmware-iovas
+    then:
+      properties:
+        memory-region:
+          minItems: 2
+      required:
+        - memory-region
+        - memory-region-names
+        - apple,firmware-preloaded
+  - if:
+      properties:
+        compatible:
+          enum:
+            - apple,t6041-ane
+            - apple,t8140-ane
+      required:
+        - memory-region
+    then:
+      required:
+        - memory-region-names
+        - apple,firmware-iovas
+  - if:
+      required:
+        - memory-region-names
+    then:
+      required:
+        - apple,firmware-iovas
   - if:
       properties:
         compatible:
@@ -106,6 +232,31 @@ allOf:
       properties:
         interrupts:
           maxItems: 1
+        reg:
+          minItems: 7
+        reg-names:
+          items:
+            - const: engine
+            - const: pmgr
+            - const: aux-0
+            - const: aux-1
+            - const: aux-2
+            - const: aux-3
+            - const: aux-4
+        iommus:
+          minItems: 6
+        power-domains:
+          minItems: 5
+          maxItems: 5
+        apple,ane-type:
+          const: 0x110
+      required:
+        - apple,ane-type
+        - apple,firmware-preloaded
+    else:
+      properties:
+        iommus:
+          maxItems: 3
   - if:
       properties:
         compatible:
@@ -115,24 +266,33 @@ allOf:
               - apple,t6041-ane
     then:
       properties:
-        reg:
-          maxItems: 1
-        reg-names:
-          maxItems: 1
         interrupt-names: false
         iommus:
           minItems: 3
-        power-domains:
-          maxItems: 1
         resets: false
         mboxes: false
-        memory-region: false
     else:
       properties:
         interrupts:
           maxItems: 1
         power-domains:
           minItems: 5
+        reg:
+          maxItems: 4
+        reg-names:
+          minItems: 1
+          items:
+            - const: engine
+            - const: pmgr
+            - const: set
+            - const: fuse
+        memory-region:
+          maxItems: 1
+        memory-region-names: false
+        apple,firmware-iovas: false
+        apple,ane-type: false
+        apple,firmware-preloaded: false
+        apple,exclave-assigned: false
       required:
         - interrupt-names
 
@@ -150,7 +310,7 @@ allOf:
         reg-names:
           maxItems: 1
         power-domains:
-          maxItems: 5
+          maxItems: 6
         resets: false
         mboxes: false
         memory-region: false

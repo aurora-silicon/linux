@@ -101,7 +101,7 @@ struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev)
 		goto put_node;
 	}
 	cooling->cdev = thermal_of_cooling_device_register(dev->of_node, 0,
-							  "asahi-g16g", cooling,
+							  "aurora-g16g", cooling,
 							  &asahi_g16_cooling_ops);
 	if (IS_ERR(cooling->cdev)) {
 		ret = PTR_ERR(cooling->cdev);

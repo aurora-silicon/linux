@@ -55,7 +55,7 @@ struct tas2764_priv {
 	struct snd_soc_component *component;
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *sdz_gpio;
-	struct regulator *sdz_reg;
+	struct regulator *sdz_reg;	/* NULL when the SDZ line is a GPIO or not described */
 	struct regmap *regmap;
 	struct device *dev;
 	int irq;
@@ -106,7 +106,7 @@ static int tas2764_sdz_enable(struct tas2764_priv *tas2764)
 	int ret;
 
 	if (!tas2764->sdz_group)
-		return regulator_enable(tas2764->sdz_reg);
+		return tas2764->sdz_reg ? regulator_enable(tas2764->sdz_reg) : 0;
 
 	mutex_lock(&tas2764_sdz_groups_lock);
 	ret = READ_ONCE(tas2764->sdz_group->failed) ? -EIO : regulator_enable(tas2764->sdz_reg);
@@ -141,8 +141,10 @@ static int tas2764_group_join(struct device *dev, struct tas2764_priv *tas2764)
 	if (!tas2764->irq)
 		return dev_err_probe(dev, -EINVAL, "SDZ group without a fault interrupt\n");
 	supply = of_parse_phandle(dev->of_node, "SDZ-supply", 0);
-	if (!supply)
+	if (!supply || !tas2764->sdz_reg) {
+		of_node_put(supply);
 		return dev_err_probe(dev, -EINVAL, "SDZ group without an SDZ supply\n");
+	}
 
 	mutex_lock(&tas2764_sdz_groups_lock);
 	list_for_each_entry(group, &tas2764_sdz_groups, node) {
@@ -295,7 +297,8 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 		if (tas2764->sdz_gpio)
 			gpiod_set_value_cansleep(tas2764->sdz_gpio, 0);
 
-		regulator_disable(tas2764->sdz_reg);
+		if (tas2764->sdz_reg)
+			regulator_disable(tas2764->sdz_reg);
 	}
 
 	regcache_cache_only(tas2764->regmap, true);
@@ -312,7 +315,7 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	int ret;
 
 	if (!tas2764->sdz_group) {
-		ret = regulator_enable(tas2764->sdz_reg);
+		ret = tas2764->sdz_reg ? regulator_enable(tas2764->sdz_reg) : 0;
 		if (ret) {
 			dev_err(tas2764->dev, "Failed to enable regulator\n");
 			return ret;
@@ -1011,7 +1014,8 @@ static void tas2764_codec_remove(struct snd_soc_component *component)
 	if (tas2764_group_failed(tas2764))
 		return;
 
-	regulator_disable(tas2764->sdz_reg);
+	if (tas2764->sdz_reg)
+		regulator_disable(tas2764->sdz_reg);
 }
 
 static DECLARE_TLV_DB_SCALE(tas2764_digital_tlv, 1100, 50, 0);
@@ -1116,10 +1120,19 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
 	int ret = 0;
 
-	tas2764->sdz_reg = devm_regulator_get(dev, "SDZ");
-	if (IS_ERR(tas2764->sdz_reg))
-		return dev_err_probe(dev, PTR_ERR(tas2764->sdz_reg),
-				"Failed to get SDZ supply\n");
+	/*
+	 * The SDZ supply is optional: most boards drive SDZ from a GPIO
+	 * (shutdown-gpios, shared between amps through the GPIO core), and only
+	 * boards that model the line as a regulator have one. A dummy regulator
+	 * in its place did nothing but warn on every boot.
+	 */
+	tas2764->sdz_reg = devm_regulator_get_optional(dev, "SDZ");
+	if (IS_ERR(tas2764->sdz_reg)) {
+		if (PTR_ERR(tas2764->sdz_reg) != -ENODEV)
+			return dev_err_probe(dev, PTR_ERR(tas2764->sdz_reg),
+					     "Failed to get SDZ supply\n");
+		tas2764->sdz_reg = NULL;
+	}
 
 	tas2764->reset_gpio = devm_gpiod_get_optional(tas2764->dev, "reset",
 						      GPIOD_OUT_HIGH);

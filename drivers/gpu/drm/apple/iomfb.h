@@ -476,7 +476,8 @@ struct dcp_bool_arg {
 
 /*
  * A420 get_gamma_table / A421 set_gamma_table: three channels (red, green,
- * blue) of 257 u32 entries followed by a null flag, 3088 bytes in and out.
+ * blue) of 257 u32 entries. The request appends an input pointer null flag;
+ * the reply appends a return status instead. Both are 3088 bytes.
  */
 #define IOMFB_GAMMA_ENTRIES 257
 
@@ -488,8 +489,7 @@ struct iomfb_gamma_table_req {
 
 struct iomfb_gamma_table_resp {
 	__le32 table[3][IOMFB_GAMMA_ENTRIES];
-	u8 table_null;
-	u8 padding[3];
+	__le32 ret;
 } __packed;
 
 #endif

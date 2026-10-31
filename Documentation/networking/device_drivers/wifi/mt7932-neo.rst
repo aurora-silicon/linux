@@ -201,8 +201,14 @@ OWE layers without another crypto or authentication implementation.
 Legacy VLP channels retain directed hidden-SSID probing and the original
 connect discovery sequence. Channels added only by class packages listen
 passively until the target supplies its class/TPE. RNR-only requests remain
-passive until target-list serialization is implemented. Full-band scans are split into bounded
-32-channel commands. Firmware event channel layout is checked before OCA
+passive until target-list serialization is implemented. cfg80211 splits the
+lower-band and 6 GHz phases, selects PSCs and expands cached RNR entries.
+The driver keeps the supplied channel list, including non-PSC RNR targets,
+and never treats ``psc_no_listen`` as permission for an unconstrained probe.
+Full-band scans are split into bounded 32-channel commands. Internal
+discovery allows the entire passive batch's serialized dwell budget plus
+the existing five-second completion margin; 32 channels with a 233 ms
+budget require a 12456 ms wait. Firmware event channel layout is checked before OCA
 association calibration, queue binding and the two association power pages.
 
 J7RP version 1 remains valid and never authorizes 6 GHz. Version 2 packages
@@ -578,6 +584,65 @@ and command sequence, including ordinary finite or absent TPE and AP-wide
 pre-association class/TPE SET is inserted on this compatibility path. Generic runtime D7
 requests for band 2 (6 GHz) remain rejected by the raw planner. RF behavior,
 rate accounting and calibration still require hardware qualification.
+
+6 GHz software proof and qualification boundary
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The association-start OCA group selector and power-on fragments are separate
+from runtime D7. The raw planner rejects every runtime band-2 request before
+reading a container or producing a partial fragment plan. The runtime worker
+latches that error and closes RF admission. Association success does not
+prove that firmware will never issue such a request, and the 2.4/5 GHz D7
+layouts must not be reused by changing only the band number.
+
+The public producer constructs the 32-byte CID5d header pad from
+``one_ss_pad()`` and copies it unchanged through J7RP and class publication.
+Its bits index channel numbers. It is independent of the primary permission
+mask and does not generate the separate unsupported-rate accounting data.
+Neither a zero pad nor numeric per-rate cells prove that firmware excludes
+unsupported rates. The channel pad must not be relabelled or populated with
+guessed rate bits. Synthetic tests check a nonzero pad, class isolation and
+the exact first-page header without distributing power-table inputs.
+
+The strict class path parses default-client EIRP and PSD TPEs, intersects
+applicable limits, preserves ``0x7f``, deducts the J700 antenna gains and
+submits the separate 60-byte CID5d body before EA/40. A changed or invalid
+home beacon envelope disconnects the strict-class link; disconnect and
+country/reset handling invalidate its decision. This does not establish
+firmware readback or radiated power. The legacy v2 VLP compatibility path
+above still bypasses the new class/TPE submission and beacon comparison;
+tests preserving that sequence are not proof of AP TPE enforcement there.
+
+The software regressions can be exercised without a radio::
+
+  python3 tools/asahi/mt7932-scan-tests.py --out /tmp/mt7932-scan-tests
+  python3 tools/asahi/run-host-tests.py --only mt7932 --jobs 8
+
+The KUnit ``mt7932-six-ghz``, ``mt7932-regulatory`` and
+``mt7932-pmf-lpi`` suites also cover runtime D7 rejection, the header pad,
+and complete passive-scan/TPE golden bodies. The host scan test executes
+the production batcher and internal discovery worker with synthetic
+32/27-channel batches, and requires compiling RNR-probe and short-wait
+mutants to fail their runtime assertions.
+
+Before claiming RF qualification, retain failures as well as successful
+cells and run this AP matrix with an explicitly approved device identity:
+
+* PSC and non-PSC targets, with and without lower-band RNR; wildcard and
+  hidden SSIDs; connected and disconnected scans. Check matching completion,
+  bounded 32/27-channel batches and no probes from RNR-derived passive scans.
+* LPI and VLP at 20/40/80 MHz, both PSD and EIRP TPE, finite and ``0x7f``
+  limits, and changed envelopes. Distinguish strict-class operation from the
+  legacy v2 bypass. Check class pages and TPE precede association, and measure
+  power against country, AP, SAR and board limits.
+* LPI/VLP reconnects, country changes and firmware resets; confirm fresh
+  policy publication and no stale AP envelope after rollback.
+* Calibration events during discovery, association and sustained traffic.
+  Record only band/channel, procedure outcome and nonsecret body hashes;
+  band-2 D7 remains unsupported until its own procedure ABI is established.
+* Rate/NSS/MCS and bandwidth accounting under each class, including rates
+  represented by unsupported or unpopulated cells. Static serialization
+  tests cannot establish the firmware's default rate-selection behavior.
 
 6 GHz LPI table archive (J7RP v3, unbound)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

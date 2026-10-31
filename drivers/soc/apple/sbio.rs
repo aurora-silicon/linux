@@ -1905,7 +1905,16 @@ impl SepData {
         };
 
         if !parsed.matches(user) {
-            dev_info!(self.dev, "verify: enclave found no identity in the Linux user context\n");
+            // The enclave compared a usable capture and did not answer the
+            // Linux user. Usually no template matched (a different finger).
+            // Log the user it did answer, so a match in another user context
+            // can be told apart from a plain non-match.
+            dev_info!(
+                self.dev,
+                "verify: no enrolled finger matched the capture (enclave answered user {}, Linux enrolments use user {})\n",
+                parsed.user_id(),
+                user.value()
+            );
             return bio::VerifyOutcome::NoMatch;
         }
 
@@ -5141,6 +5150,10 @@ impl MatchResult {
 
     pub(crate) fn identity_uuid(&self) -> &[u8; IDENTITY_UUID_LEN] {
         &self.identity
+    }
+
+    pub(crate) fn user_id(&self) -> i32 {
+        self.user_id
     }
 
     pub(crate) fn matches(&self, user: UserId) -> bool {

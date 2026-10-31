@@ -31,6 +31,11 @@ as unsafe, allows manual speeds on every fan with a mode key whatever the
 Devicetree says. It cannot be proven that the system will fail safe if it
 overheats under a manual fan speed.
 
+The driver leaves fan policy to the SMC until userspace writes a nonzero
+``fanX_target``. Thermal zones do not take fans into manual mode. Suspend,
+shutdown and removal release only fans taken over by such a request; resume
+does not reapply it. A new target write is required after resume.
+
 SoC die temperatures are described by the ``apple,soc-die-keys`` string list
 on the hwmon device node. The driver appends these temperature channels after
 the ``temperature-*`` children, in list order, with labels ``SoC die <key>``.

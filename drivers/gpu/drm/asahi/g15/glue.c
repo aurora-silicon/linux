@@ -267,12 +267,12 @@ void asahi_g15_reprobe(void)
 	const struct device_driver *drv;
 	int ret;
 
-	drv = driver_find("asahi-g15", &platform_bus_type);
+	drv = driver_find("aurora-g15", &platform_bus_type);
 	if (!drv) {
-		pr_err("asahi-g15: registered adapter not found for activation\n");
+		pr_err("aurora-g15: registered adapter not found for activation\n");
 		return;
 	}
 	ret = driver_attach(drv);
 	if (ret)
-		pr_err("asahi-g15: activation attach failed: %d\n", ret);
+		pr_err("aurora-g15: activation attach failed: %d\n", ret);
 }

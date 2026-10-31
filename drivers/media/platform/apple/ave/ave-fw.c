@@ -27,8 +27,8 @@
 #include "ave-regs.h"
 
 /*
- * Firmware builds whose command layouts this driver implements, by the CRC32
- * of their TEXT segment. The command formats change between builds.
+ * Legacy TEXT CRCs accepted at T8140 probe. Encoding separately requires
+ * a layout from ave_layout_for_crc(); command formats change between builds.
  */
 static const u32 ave_known_text_crc[] = {
 	0x2ce7359e,	/* AppleAVE2FW 9003.78.0 */
@@ -120,7 +120,7 @@ int ave_fw_probe(struct ave_dev *ave)
 {
 	struct device *dev = ave->dev;
 	u32 text_crc, data_crc, want;
-	bool known = !ave->variant->encoding_text_crc;
+	bool known = !ave->variant->boot_qualified;
 	int ret;
 
 	if (of_count_phandle_with_args(dev->of_node, "memory-region", NULL) != 2)
@@ -156,6 +156,7 @@ int ave_fw_probe(struct ave_dev *ave)
 		return dev_err_probe(dev, -ENODEV, "unsupported firmware (text CRC %08x)\n",
 				     text_crc);
 	ave->text_crc = text_crc;
+	ave->layout = ave_layout_for_crc(text_crc);
 
 	ave->data_pristine = vmalloc(ave->data.size);
 	if (!ave->data_pristine)
@@ -176,9 +177,9 @@ int ave_fw_probe(struct ave_dev *ave)
 
 	ave->data_crc = data_crc;
 	ave->fw_state = AVE_FW_OFF;
-	if (!ave->variant->encoding_text_crc)
-		dev_info(dev, "probe only: device type %u firmware TEXT %08x DATA %08x needs qualification\n",
-			 ave->variant->device_type, text_crc, data_crc);
+	if (!ave->variant->boot_qualified || !ave->layout)
+		dev_info(dev, "probe only: firmware TEXT %08x DATA %08x needs qualification\n",
+			 text_crc, data_crc);
 	return 0;
 
 free_data:
@@ -187,20 +188,21 @@ free_data:
 	return ret;
 }
 
-static void ave_fw_restore_data(struct ave_dev *ave)
+static int ave_fw_restore_data(struct ave_dev *ave)
 {
 	void *va;
 
 	if (!ave->data_dirty)
-		return;
+		return 0;
 	va = memremap(ave->data.phys, ave->data.size, MEMREMAP_WC);
-	if (WARN_ON(!va))
-		return;
+	if (!va)
+		return -ENOMEM;
 	memcpy(va, ave->data_pristine, ave->data.size);
 	/* The restored image must be in memory before the coprocessor starts. */
 	wmb();
 	memunmap(va);
 	ave->data_dirty = false;
+	return 0;
 }
 
 void ave_free(struct ave_dev *ave, struct ave_buf *b)
@@ -243,11 +245,11 @@ int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long
  */
 int ave_fw_check_build(struct ave_dev *ave)
 {
-	if (ave->variant->encoding_text_crc &&
-	    ave->text_crc == ave->variant->encoding_text_crc)
+	if (ave->variant->boot_qualified && ave->variant->regs && ave->layout &&
+	    ave->layout == ave_layout_for_crc(ave->text_crc))
 		return 0;
-	dev_info(ave->dev, "encoding refused: device type %u firmware TEXT %08x DATA %08x has no qualified command constants/MCC DSID\n",
-		 ave->variant->device_type, ave->text_crc, ave->data_crc);
+	dev_info(ave->dev, "encoding refused: firmware TEXT %08x DATA %08x has no qualified command layout/boot sequence\n",
+		 ave->text_crc, ave->data_crc);
 	return -ENOTSUPP;
 }
 
@@ -291,6 +293,21 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 		dev_err(ave->dev, "coprocessor lost its code base (vcbar %#llx)\n",
 			readq(ave->coproc + ave->variant->regs->vcbar));
 		return -EIO;
+	}
+	if (ave->fw_state == AVE_FW_RECOVERING) {
+		/*
+		 * Recovery cleared CTRL itself and re-armed BOOT_ARG as a
+		 * reset witness with control off: require it to have lost
+		 * power too, before reusing DMA memory or restoring DATA. DARTs
+		 * sharing VENC power may suspend later than the consumer.
+		 */
+		if (readl(ave->coproc + ave->variant->regs->ctrl) ||
+		    readl(ave->coproc + ave->variant->regs->boot_arg))
+			return -EAGAIN;
+		ave_sess_reap(ave);
+		ave->fw_state = AVE_FW_HALTED;
+		ave->inject_wedge = false;
+		dev_info(ave->dev, "firmware recovery power cycle confirmed\n");
 	}
 	if (ave->fw_state != AVE_FW_HALTED)
 		return 0;
@@ -348,7 +365,9 @@ static int ave_fw_boot(struct ave_dev *ave)
 	ave->reply_err = 0;
 	ave->scalar_next = 0;
 
-	ave_fw_restore_data(ave);
+	ret = ave_fw_restore_data(ave);
+	if (ret)
+		return ret;
 
 	cfg = ave->boot_cfg.cpu;
 	log = ave->log.cpu;
@@ -418,25 +437,22 @@ int ave_fw_ensure_running(struct ave_dev *ave)
 	case AVE_FW_RUNNING:
 		return 0;
 	case AVE_FW_BROKEN:
-		dev_err(ave->dev, "firmware stopped answering earlier; reboot to use the encoder\n");
+		dev_err_ratelimited(ave->dev, "firmware recovery is waiting for idle runtime suspend\n");
 		return -EIO;
 	case AVE_FW_OFF:
 	case AVE_FW_HALTED:
+	case AVE_FW_RECOVERING:
 		break;
 	}
 
-	/*
-	 * A failed boot has no session buffers in the firmware's hands. If the
-	 * coprocessor was set going, treat it as halted: the next attempt
-	 * then waits for a power cycle. Otherwise nothing changed.
-	 */
+	/* A boot that reached RUN must use the same recovery as a session fault. */
 	prev = ave->fw_state;
 	ret = ave_fw_boot(ave);
-	if (ret) {
-		ave->fw_state = readl(ave->coproc + ave->variant->regs->ctrl) ?
-				AVE_FW_HALTED : prev;
-		memset(ave->ring, 0, sizeof(ave->ring));
-		ave->ipc_fw_base = 0;
+	if (ret && ret != -EAGAIN) {
+		if (readl(ave->coproc + ave->variant->regs->ctrl))
+			ave_fw_mark_broken(ave, ret, "boot");
+		else
+			ave->fw_state = prev;
 	}
 	return ret;
 }
@@ -454,7 +470,7 @@ void ave_fw_halt(struct ave_dev *ave)
 		return;
 	if (ave_cmd_halt(ave)) {
 		dev_err(ave->dev, "cannot send Halt; firmware treated as stuck\n");
-		ave->fw_state = AVE_FW_BROKEN;
+		ave_fw_mark_broken(ave, -EIO, "Halt");
 		return;
 	}
 	msleep(AVE_HALT_SETTLE_MS);
@@ -468,8 +484,8 @@ void ave_fw_halt(struct ave_dev *ave)
  *
  * Sessions keep the device runtime active, so the firmware has normally
  * been halted already. A firmware that stopped answering keeps its power:
- * whether it still has transfers in flight cannot be checked, and only a
- * reboot brings it back.
+ * system sleep must not silently force-stop a potentially live DMA engine.
+ * Runtime recovery is separate and only runs after all owners have gone.
  */
 int ave_fw_shutdown(struct ave_dev *ave)
 {
@@ -479,10 +495,74 @@ int ave_fw_shutdown(struct ave_dev *ave)
 		ave_fw_halt(ave);
 		return ave->fw_state == AVE_FW_HALTED ? 0 : -EBUSY;
 	case AVE_FW_BROKEN:
+	case AVE_FW_RECOVERING:
 		return -EBUSY;
 	default:
 		return 0;
 	}
+}
+
+/* Caller holds hw_lock. Wake even idle sessions so none pins a broken boot. */
+void ave_fw_mark_broken(struct ave_dev *ave, int err, const char *what)
+{
+	lockdep_assert_held(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_BROKEN)
+		dev_err(ave->dev, "firmware failed (%s: %d); scheduling recovery\n", what, err);
+	ave->fw_state = AVE_FW_BROKEN;
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i])
+			mod_delayed_work(ave->wq, &ave->sessions[i]->poll_work, 0);
+}
+
+/*
+ * Only runtime PM may force-stop a broken firmware, with no session owners
+ * and no runtime references. genpd and the IOMMU's PM device links then drop
+ * the VENC domains and DARTs; AVE must not reset or reprogram the DART itself.
+ * System sleep continues to use the strict ave_fw_shutdown() above.
+ */
+int ave_fw_runtime_suspend(struct ave_dev *ave)
+{
+	int ret;
+
+	lockdep_assert_held(&ave->hw_lock);
+	if (ave->fw_state != AVE_FW_BROKEN && ave->fw_state != AVE_FW_RECOVERING)
+		return ave_fw_shutdown(ave);
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i])
+			return -EBUSY;
+	if (ave->fw_state == AVE_FW_RECOVERING)
+		return 0;
+	if (!ave_recovery_allow(&ave->recovery, jiffies)) {
+		dev_err_ratelimited(ave->dev, "firmware recovery limit: 3 attempts per 10 minutes\n");
+		return -EBUSY;
+	}
+	ave->recovery_count++;
+	dev_warn(ave->dev, "firmware recovery %u: stopping coprocessor and cycling VENC power\n",
+		 ave->recovery_count);
+
+	/* A ring may not exist after a failed boot. Never wait for Halt's reply. */
+	ret = ave->inject_wedge ? -ETIMEDOUT : -EIO;
+	if (ave->ipc_fw_base && ave->ring[0].slots && !ave->inject_wedge) {
+		ave->fw_state = AVE_FW_RUNNING;
+		ret = ave_cmd_halt(ave);
+	}
+	if (ret)
+		dev_warn(ave->dev, "recovery Halt failed: %d; forcing control off\n", ret);
+	else
+		msleep(AVE_HALT_SETTLE_MS);
+	writel(0, ave->coproc + ave->variant->regs->ctrl);
+	if (readl(ave->coproc + ave->variant->regs->ctrl)) {
+		ave->fw_state = AVE_FW_BROKEN;
+		return -EIO;
+	}
+	/* CTRL=0 must not masquerade as power loss on the next attach. */
+	writel(AVE_COPROC_BOOT_ARG_VALUE, ave->coproc + ave->variant->regs->boot_arg);
+	if (readl(ave->coproc + ave->variant->regs->boot_arg) != AVE_COPROC_BOOT_ARG_VALUE) {
+		ave->fw_state = AVE_FW_BROKEN;
+		return -EIO;
+	}
+	ave->fw_state = AVE_FW_RECOVERING;
+	return 0;
 }
 
 /* The coprocessor lost power behind the firmware's back. Caller holds hw_lock. */

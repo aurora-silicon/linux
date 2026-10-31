@@ -1256,7 +1256,7 @@ impl Gpu {
             GFP_KERNEL,
         )?;
 
-        let directory = kernel::debugfs::Dir::new(c"asahi-g17");
+        let directory = kernel::debugfs::Dir::new(c"aurora-g17");
         let capacity = KBox::pin_init(
             directory.read_only_file(c"capacity", capacity::View(shared.clone())),
             GFP_KERNEL,

@@ -241,7 +241,7 @@ enum PublicationError {
     Uncertain(Error),
 }
 
-/// Engine statistics, printed by `asahi-g16/stats`.
+/// Engine statistics, printed by `aurora-g16/stats`.
 #[derive(Default)]
 pub(crate) struct Stats {
     pub(crate) pub_ns: u64,
@@ -294,7 +294,7 @@ pub(crate) struct Stats {
 }
 
 /// Host-side phase timers of publication and polling, on with `debug_flags` bit 49
-/// (`Debug1`); printed as the `prof:` line of `asahi-g16/stats`. A measurement aid: nothing is
+/// (`Debug1`); printed as the `prof:` line of `aurora-g16/stats`. A measurement aid: nothing is
 /// timed while the flag is off.
 #[derive(Default)]
 pub(crate) struct Prof {
@@ -411,7 +411,7 @@ pub(crate) struct Engine {
     pub(crate) stats: Stats,
     /// Phase timers (debug_flags bit 49).
     pub(crate) prof: Prof,
-    /// The `asahi-g16/stats` file.
+    /// The `aurora-g16/stats` file.
     pub(crate) debugfs: Option<Pin<KBox<kernel::debugfs::File<Arc<Shared>>>>>,
     scratch: Option<KBox<Scratch>>,
 }
