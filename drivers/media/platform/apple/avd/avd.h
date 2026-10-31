@@ -229,10 +229,18 @@ struct avd_dev {
 	struct avd_ctx *job_ctx;
 	u64 job_seq;
 	bool job_end_sent;
+	/* The current job's VP finished and its PP was kicked. */
+	bool job_vp_done;
 	bool job_pending;
 	enum vb2_buffer_state job_pending_result;
 
 	struct reset_control *rstc;
+	int irq;
+	/* Recovery budget; a retired decoder fails every job until reload. */
+	unsigned long recover_window_start;
+	unsigned int recoveries;
+	unsigned long last_recover;
+	bool retired;
 
 	const struct avd_variant *variant;
 	unsigned int capabilities;
@@ -258,6 +266,8 @@ struct avd_buf {
 struct avd_ctx {
 	struct v4l2_fh fh;
 	struct avd_dev *dev;
+	/* A frame failed in hardware: fail every job until streaming restarts. */
+	bool broken;
 
 	struct v4l2_format coded_fmt;
 	struct v4l2_format decoded_fmt;

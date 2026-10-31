@@ -9,7 +9,7 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 	.bytes = { { 0x3180, 0x63d8 }, { 0x13f28, 0xb1c0 } },
 	.hdr_bytes = 0x12c000,
 	.meta_bytes = 0xc000,
-	.process_timeout_us = 94400000,
+	.process_timeout_us = 46400000,
 	.process_subtype = 0x15,
 	.max_slots = 5,
 	.mcc_dsid = 0x12,
@@ -529,7 +529,11 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 
 const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 {
-	if (crc == AVE_FW_TEXT_CRC_9003_78_0)
+	/*
+	 * The M4 Pro gets the same 25G83 firmware build as the A18 Pro, built
+	 * for its own chip, and speaks the same command layout.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;

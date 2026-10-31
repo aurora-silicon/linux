@@ -9,6 +9,7 @@
 #include <linux/bitops.h>
 #include <linux/cpufreq.h>
 #include <linux/err.h>
+#include <linux/interconnect-provider.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
@@ -19,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/soc/apple/pmgr-misc.h>
+#include <linux/sort.h>
 #include <linux/workqueue.h>
 
 #define APPLE_CLKGEN_PSTATE 0
@@ -59,6 +61,11 @@ struct apple_pmgr_misc_hw {
 	u32 dev_min_ps[DEV_MAX];
 };
 
+struct apple_pmgr_dcs_opp {
+	u32 state;
+	u32 bw;
+};
+
 struct apple_pmgr_misc {
 	struct device *dev;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
@@ -74,6 +81,12 @@ struct apple_pmgr_misc {
 	bool pmp_owned; /* PMP is described: no governor, holds don't raise */
 	bool pmp_sleep; /* PMP runs: this sleep leaves DCS to it (see prepare) */
 	u32 pmp_fabric; /* PMP's desired fabric p-state, saved across suspend */
+	struct icc_provider dcs_provider;
+	struct icc_onecell_data *dcs_data;
+	struct apple_pmgr_dcs_opp dcs_opps[16];
+	unsigned int dcs_num_opps;
+	bool dcs_failed;
+	bool dcs_bw_active;
 	struct {
 		struct regmap *regmap;
 		u32 reg;
@@ -82,6 +95,221 @@ struct apple_pmgr_misc {
 
 static struct apple_pmgr_misc *apple_pmgr_misc_inst;
 static unsigned int idle_fabric_pstate;
+
+static int apple_pmgr_raise_fabric(struct apple_pmgr_misc *misc);
+
+/* Decimal kB/s throughout, as in the OPP and interconnect bindings. */
+static int apple_pmgr_dcs_aggregate(struct icc_node *node, u32 tag, u32 avg,
+				    u32 peak, u32 *agg_avg, u32 *agg_peak)
+{
+	/* Saturate rather than wrap a large group of consumers to a low vote. */
+	*agg_avg = min_t(u64, (u64)*agg_avg + avg, U32_MAX);
+	*agg_peak = max(*agg_peak, peak);
+	return 0;
+}
+
+static int apple_pmgr_dcs_select(struct apple_pmgr_misc *misc, u32 bw, u32 *state)
+{
+	unsigned int i;
+
+	for (i = 0; i < misc->dcs_num_opps; i++) {
+		if (bw <= misc->dcs_opps[i].bw) {
+			*state = misc->dcs_opps[i].state;
+			return 0;
+		}
+	}
+	return -ERANGE;
+}
+
+static int apple_pmgr_dcs_write(struct apple_pmgr_misc *misc, u32 state)
+{
+	void __iomem *reg = misc->devices[DEV_DCS].base + APPLE_CLKGEN_PSTATE;
+	u32 val = readl(reg);
+
+	FIELD_MODIFY(APPLE_CLKGEN_PSTATE_DESIRED, &val, state);
+	writel(val, reg);
+	return readl_poll_timeout(reg, val,
+		FIELD_GET(APPLE_CLKGEN_PSTATE_ACTUAL, val) == state,
+		10, APPLE_PMGR_RAISE_TIMEOUT_US);
+}
+
+static int apple_pmgr_dcs_set(struct icc_node *src, struct icc_node *dst)
+{
+	struct apple_pmgr_misc *misc = src->data;
+	u32 state, old, bw = 0;
+	unsigned int i;
+	int ret;
+
+	guard(mutex)(&misc->lock);
+	if (misc->pmp_owned || misc->sleeping)
+		return -EBUSY;
+	if (misc->dcs_failed)
+		return -EIO;
+	/* sync_state invokes set(node, node); keep both endpoints' constraints. */
+	for (i = 0; i < misc->dcs_data->num_nodes; i++) {
+		struct icc_node *node = misc->dcs_data->nodes[i];
+
+		if (!node)
+			continue;
+		bw = max(bw, max(node->avg_bw, node->peak_bw));
+		bw = max(bw, max(node->init_avg, node->init_peak));
+	}
+	ret = apple_pmgr_dcs_select(misc, bw, &state);
+	if (ret)
+		return ret;
+	/* Untracked DMA clients need the fabric as well as DCS bandwidth. */
+	if (bw) {
+		ret = apple_pmgr_raise_fabric(misc);
+		if (ret)
+			return ret;
+	}
+	old = misc->devices[DEV_DCS].active_state;
+	ret = apple_pmgr_dcs_write(misc, state);
+	if (ret) {
+		/* A failed request must not replace the last confirmed vote. */
+		if (apple_pmgr_dcs_write(misc, old)) {
+			misc->dcs_failed = true;
+			misc->dcs_bw_active = true;
+			dev_err(misc->dev, "DCS vote and rollback timed out; refusing further votes\n");
+		}
+		return ret;
+	}
+	misc->devices[DEV_DCS].active_state = state;
+	misc->dcs_bw_active = bw != 0;
+	return 0;
+}
+
+static int apple_pmgr_dcs_get_bw(struct icc_node *node, u32 *avg, u32 *peak)
+{
+	struct apple_pmgr_misc *misc = node->data;
+
+	/* Keep the boot state until all described consumers have probed. */
+	*avg = 0;
+	*peak = misc->dcs_opps[misc->dcs_num_opps - 1].bw;
+	return 0;
+}
+
+static int apple_pmgr_dcs_opp_cmp(const void *a, const void *b)
+{
+	const struct apple_pmgr_dcs_opp *oa = a, *ob = b;
+
+	return (oa->state > ob->state) - (oa->state < ob->state);
+}
+
+static int apple_pmgr_dcs_validate(struct apple_pmgr_misc *misc)
+{
+	unsigned int i;
+
+	if (misc->dcs_num_opps < 2 || misc->dcs_num_opps > ARRAY_SIZE(misc->dcs_opps))
+		return -EINVAL;
+	sort(misc->dcs_opps, misc->dcs_num_opps, sizeof(misc->dcs_opps[0]),
+	     apple_pmgr_dcs_opp_cmp, NULL);
+	for (i = 0; i < misc->dcs_num_opps; i++) {
+		const struct apple_pmgr_dcs_opp *opp = &misc->dcs_opps[i];
+
+		if (!opp->bw || opp->state < DCS_DEV_PSTATE_MIN_T600X ||
+		    opp->state > FIELD_MAX(APPLE_CLKGEN_PSTATE_DESIRED))
+			return -EINVAL;
+		if (i && (opp->state <= misc->dcs_opps[i - 1].state ||
+			  opp->bw <= misc->dcs_opps[i - 1].bw))
+			return -EINVAL;
+	}
+	/* Never request more than the boot firmware's known working state. */
+	if (misc->dcs_opps[misc->dcs_num_opps - 1].state !=
+	    misc->devices[DEV_DCS].active_state)
+		return -EINVAL;
+	return 0;
+}
+
+static void apple_pmgr_dcs_cleanup(void *data)
+{
+	struct apple_pmgr_misc *misc = data;
+
+	icc_provider_deregister(&misc->dcs_provider);
+	icc_nodes_remove(&misc->dcs_provider);
+}
+
+static void apple_pmgr_misc_sync_state(struct device *dev)
+{
+	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
+
+	if (misc->dcs_data)
+		icc_sync_state(dev);
+}
+
+static int apple_pmgr_dcs_init(struct apple_pmgr_misc *misc)
+{
+	struct device *dev = misc->dev;
+	struct device_node *table __free(device_node) = NULL;
+	struct icc_provider *provider = &misc->dcs_provider;
+	struct icc_node *node;
+	u32 cells;
+	unsigned int i;
+	int ret;
+
+	if (!of_property_present(dev->of_node, "operating-points-v2"))
+		return of_property_present(dev->of_node, "#interconnect-cells") ? -EINVAL : 0;
+	/* This interface is for the direct host owner, never a PMP fallback. */
+	if (misc->pmp_owned || !of_device_is_compatible(dev->of_node, "apple,t6000-pmgr-misc"))
+		return -EBUSY;
+	if (of_property_count_u32_elems(dev->of_node, "operating-points-v2") != 1 ||
+	    of_property_read_u32(dev->of_node, "#interconnect-cells", &cells) || cells != 1)
+		return -EINVAL;
+	table = of_parse_phandle(dev->of_node, "operating-points-v2", 0);
+	if (!table || !of_device_is_available(table) ||
+	    !of_device_is_compatible(table, "operating-points-v2-apple-dcs"))
+		return -EINVAL;
+	for_each_available_child_of_node_scoped(table, child) {
+		struct apple_pmgr_dcs_opp *opp;
+
+		if (misc->dcs_num_opps == ARRAY_SIZE(misc->dcs_opps))
+			return -E2BIG;
+		opp = &misc->dcs_opps[misc->dcs_num_opps++];
+		if (of_property_present(child, "opp-supported-hw") ||
+		    of_property_present(child, "turbo-mode") ||
+		    of_property_count_u32_elems(child, "opp-level") != 1 ||
+		    of_property_count_u32_elems(child, "opp-peak-kBps") != 1 ||
+		    of_property_read_u32(child, "opp-level", &opp->state) ||
+		    of_property_read_u32(child, "opp-peak-kBps", &opp->bw))
+			return -EINVAL;
+	}
+	ret = apple_pmgr_dcs_validate(misc);
+	if (ret)
+		return dev_err_probe(dev, ret, "invalid measured DCS OPP table\n");
+	misc->dcs_data = devm_kzalloc(dev, struct_size(misc->dcs_data, nodes, 2), GFP_KERNEL);
+	if (!misc->dcs_data)
+		return -ENOMEM;
+	misc->dcs_data->num_nodes = 2;
+	provider->dev = dev;
+	provider->set = apple_pmgr_dcs_set;
+	provider->aggregate = apple_pmgr_dcs_aggregate;
+	provider->get_bw = apple_pmgr_dcs_get_bw;
+	provider->xlate = of_icc_xlate_onecell;
+	provider->data = misc->dcs_data;
+	icc_provider_init(provider);
+	for (i = 0; i < 2; i++) {
+		node = icc_node_create_dyn();
+		if (IS_ERR(node)) {
+			ret = PTR_ERR(node);
+			goto remove_nodes;
+		}
+		node->name = i ? "t600x-dcs-memory" : "t600x-dcs-clients";
+		node->data = misc;
+		misc->dcs_data->nodes[i] = node;
+		icc_node_add(node, provider);
+	}
+	ret = icc_link_create(misc->dcs_data->nodes[0], misc->dcs_data->nodes[1]->id);
+	if (ret)
+		goto remove_nodes;
+	ret = icc_provider_register(provider);
+	if (ret)
+		goto remove_nodes;
+	return devm_add_action_or_reset(dev, apple_pmgr_dcs_cleanup, misc);
+
+remove_nodes:
+	icc_nodes_remove(provider);
+	return ret;
+}
 
 static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 					  enum sys_device dev, bool active)
@@ -259,7 +487,7 @@ static void apple_pmgr_idle_eval(struct apple_pmgr_misc *misc)
 		if (misc->sleeping)
 			return;
 		low = idle && idle < active && misc->voters_ok && !misc->pmp_owned &&
-		      !misc->holds && !apple_pmgr_voters_active(misc) &&
+		      !misc->holds && !misc->dcs_bw_active && !apple_pmgr_voters_active(misc) &&
 		      apple_pmgr_cpus_at_min();
 		if (low && misc->fabric_now != idle)
 			apple_pmgr_write_fabric(misc, idle);
@@ -365,13 +593,19 @@ static int __maybe_unused apple_pmgr_misc_prepare(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 
+	/* Serialize the failure check and sleep gate with in-flight votes. */
+	scoped_guard(mutex, &misc->lock) {
+		/* Failed rollback leaves no confirmed DCS state to restore. */
+		if (misc->dcs_failed)
+			return -EIO;
+		if (misc->devices[DEV_FABRIC].base)
+			misc->sleeping = true;
+	}
 	misc->pmp_sleep = misc->pmp_owned && apple_pmgr_pmp_running();
 	if (misc->pmp_owned && !misc->pmp_sleep)
 		dev_warn_once(dev, "PMP is described but not running: sleeping without it\n");
 	if (!misc->devices[DEV_FABRIC].base)
 		return 0;
-	scoped_guard(mutex, &misc->lock)
-		misc->sleeping = true;
 	apple_pmgr_idle_stop(misc);
 	return 0;
 }
@@ -511,6 +745,9 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		INIT_DEFERRABLE_WORK(&misc->idle_work, apple_pmgr_idle_work);
 		INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
 		apple_pmgr_find_voters(misc);
+		ret = apple_pmgr_dcs_init(misc);
+		if (ret)
+			return ret;
 		/* Publish only a set-up instance; pairs with the readers' acquire. */
 		smp_store_release(&apple_pmgr_misc_inst, misc);
 		if (READ_ONCE(idle_fabric_pstate) && misc->pmp_owned) {
@@ -561,6 +798,7 @@ static struct platform_driver apple_pmgr_misc_driver = {
 		.of_match_table = apple_pmgr_misc_of_match,
 		/* The governor's workers and holders would outlive an unbind. */
 		.suppress_bind_attrs = true,
+		.sync_state = apple_pmgr_misc_sync_state,
 		.pm = pm_ptr(&apple_pmgr_misc_pm_ops),
 	},
 };
@@ -570,3 +808,7 @@ MODULE_DESCRIPTION("PMGR misc driver for Apple SoCs");
 MODULE_LICENSE("GPL");
 
 module_platform_driver(apple_pmgr_misc_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST)
+#include "apple-pmgr-dcs-test.c"
+#endif

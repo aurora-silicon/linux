@@ -27,6 +27,7 @@ typedef uint64_t dma_addr_t;
 #define DIV_ROUND_UP(x, a) (((x) + (a) - 1) / (a))
 #define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define max(x, y) ((x) > (y) ? (x) : (y))
+#define max_t(t, x, y) ((t)(x) > (t)(y) ? (t)(x) : (t)(y))
 #define GFP_KERNEL 0
 #define DMA_ATTR_NO_KERNEL_MAPPING 1
 static inline void *kcalloc(size_t n, size_t size, int flags)

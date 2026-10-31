@@ -3453,14 +3453,19 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 	ret = dcp_desktop_start_ext_ep(dcp, map, DPSAC_ENDPOINT, "DPSAC");
 	if (ret)
 		return ret;
-#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-	if (hdmi_audio)
-		ret = avep_init(dcp);
-	else
-#endif
-		ret = dcp_desktop_start_ext_ep(dcp, map, AV_ENDPOINT, "AV");
+	ret = dcp_desktop_start_ext_ep(dcp, map, AV_ENDPOINT, "AV");
 	if (ret)
 		return ret;
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	if (hdmi_audio && (map & BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20))) {
+		ret = avep_init(dcp);
+		if (ret)
+			dcp_desktop_graph_skip(dcp, AV_AUDIO_ENDPOINT_DESKTOP,
+					       "AUDIO", "audio init failed", ret);
+		else if (dcp->avep)
+			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
+	}
+#endif
 	ret = dcp_desktop_start_ext_ep(dcp, map, REMOTE_ALLOC_ENDPOINT,
 				       "REMOTEALLOC");
 	if (ret)
@@ -3558,10 +3563,6 @@ static int dcp_start_desktop(struct apple_dcp *dcp)
 
 		if (endpoint == DPAV_CTRL_ENDPOINT)
 			ret = dcp_desktop_start_dpavctrl(dcp);
-#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-		else if (endpoint == AV_ENDPOINT && hdmi_audio)
-			ret = avep_init(dcp);
-#endif
 		else
 			ret = dcp_desktop_start_ep(dcp, endpoint,
 						   dcp_compact_aux_ops);

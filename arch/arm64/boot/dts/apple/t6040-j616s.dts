@@ -4512,6 +4512,43 @@
 	};
 };
 
+/* The video encoder, its DARTs and its power domains. */
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart0 {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
 #include "t6040-j616s-usb3.dtsi"
 
 /* External display chain, all disabled: the gate in drivers/soc/apple/display-gate.c enables it. */
@@ -4519,6 +4556,7 @@
 #include "t6040-j616s-extdisp-mem-loader.dtsi"
 #include "t6040-j616s-extdisp-hdmi.dtsi"
 #include "t6040-j616s-extdisp-usbc.dtsi"
+#include "t6040-j616s-dpaudio.dtsi"
 /* Additional Abbey PMICs on the two independent NUB SPMI buses. */
 &nub_spmi1 {
 	status = "okay";
