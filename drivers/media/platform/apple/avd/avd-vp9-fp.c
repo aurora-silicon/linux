@@ -30,6 +30,8 @@ static const struct avd_vp9_fp_layout vp9_layouts[] = {
 	/* TODO: t-3862 Daybreak per-SoC ledger; no V3/Borage aliasing. */
 	[AVD_VP9_FP_T8112] = {},
 	[AVD_VP9_FP_T8140] = {},
+	/* t-3862 FP-TABLES 2.3: LilyD is not the public Viola/V3 layout. */
+	[AVD_VP9_FP_T6000] = {},
 };
 
 bool avd_vp9_needs_counts(u32 flags)

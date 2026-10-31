@@ -42,7 +42,7 @@ static void test_slots_and_layouts(void)
 	ctrl.tile_cols_log2 = 0;
 	ctrl.tile_rows_log2 = 255; /* reject before shift */
 	assert(pack_borage(&frames[0], &ctrl) == -EINVAL);
-	for (unsigned int gen = AVD_VP9_FP_T8112; gen <= AVD_VP9_FP_T8140; gen++) {
+	for (unsigned int gen = AVD_VP9_FP_T8112; gen <= AVD_VP9_FP_T6000; gen++) {
 		variant.vp9_fp_generation = gen;
 		assert(avd_vp9_pack_fp(&ctx, &frames[0], &ctrl, NULL, NULL, 0) ==
 		       -EOPNOTSUPP);

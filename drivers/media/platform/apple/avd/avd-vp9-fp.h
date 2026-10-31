@@ -14,6 +14,7 @@ enum avd_vp9_fp_generation {
 	AVD_VP9_FP_BORAGE,
 	AVD_VP9_FP_T8112,
 	AVD_VP9_FP_T8140,
+	AVD_VP9_FP_T6000,
 };
 
 #define AVD_VP9_PROBS_SIZE 0x774

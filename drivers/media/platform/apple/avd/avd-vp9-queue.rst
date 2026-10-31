@@ -55,8 +55,10 @@ from protocol section 6.4. Their product is capped at 256.
 Both Apple packers still return -EOPNOTSUPP for incomplete payloads. V3 needs
 FIFO/PIO work-record patching; Borage needs syntax/surface mappings, the first
 work source and packed address words at command 0x2c/0x34. No partial payload
-may reach firmware. T8112 and T8140 have explicit empty rows pending Daybreak
-ledger task t-3862; neither aliases V3 or Borage. Apple's backend remains
+may reach firmware. T6000, T8112 and T8140 have explicit empty rows tied to
+Daybreak ledger task t-3862; none aliases V3 or Borage. The accepted clean ledger
+identifies T6000 as LilyD, distinct from public Viola/V3, and still leaves syntax
+flag/address meanings open. Apple's backend remains
 inactive in the integration core, so these incomplete layouts do not replace
 the working stock path.
 

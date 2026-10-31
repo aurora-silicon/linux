@@ -360,7 +360,7 @@ static const struct avd_variant avd_t8103_variant = {
 };
 
 static const struct avd_variant avd_t6000_variant = {
-	.vp9_fp_generation = AVD_VP9_FP_V3,
+	.vp9_fp_generation = AVD_VP9_FP_T6000,
 	.vp_slots = {
 		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
