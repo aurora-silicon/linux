@@ -60,6 +60,7 @@ struct avd_qfw {
 	u32 wp;			/* host write count, free-running */
 	u32 fifo_slots;
 	u32 codec_mask;		/* info+0x24, bit n = codec n */
+	u32 next_vp;		/* H.264 VP rotation */
 	bool usable;		/* last boot found a matching ABI 2 image */
 };
 
@@ -217,6 +218,13 @@ static int avd_qfw_submit(struct avd_dev *avd, struct avd_frame *f)
 		vp += avd->variant->vp_slots[i];
 	if (avd->variant->vp_slot_base[codec])
 		vp = avd->variant->vp_slot_base[codec];
+	/*
+	 * H.264 pictures of one stream overlap (two scratch banks), so spread
+	 * them over the codec's VPs. The firmware still starts PP in submission
+	 * order.
+	 */
+	if (codec == AVD_CODEC_H264 && avd->variant->vp_slots[codec] > 1)
+		vp += q->next_vp++ % avd->variant->vp_slots[codec];
 	if (ops->pp_kicks)
 		extra = ops->pp_kicks(ctx) - 1;
 	if (extra > AVDQ_MAX_PP_EXTRA)
