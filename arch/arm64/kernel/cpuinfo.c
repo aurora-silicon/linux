@@ -25,6 +25,7 @@
 #include <linux/smp.h>
 #include <linux/delay.h>
 #include <linux/dmi.h>
+#include <linux/string.h>
 
 /*
  * In case the boot CPU is hotpluggable, we record its initial state and
@@ -221,39 +222,56 @@ static const char *const compat_hwcap2_str[] = {
 #endif /* CONFIG_COMPAT */
 
 /*
- * The processor's name as the firmware gives it, in the Version string of the
- * SMBIOS Processor Information (type 4), e.g. "Apple M4 Pro". x86 reports the
- * CPU's brand string as "model name"; arm64 CPUs have no such string, so the
- * firmware's is the only source, and desktop tools (GNOME, KDE, inxi) read it
- * from here. Empty when there is no SMBIOS or no processor version.
+ * The processor's name as the firmware gives it: the Version string of the
+ * SMBIOS Processor Information (type 4), e.g. "Apple M4 Pro". x86 prints the
+ * CPU's brand string as "model name"; arm64 CPUs have no brand string, so the
+ * firmware's name is the only one there is, and desktop tools (GNOME's About
+ * page, KDE Info Center, inxi, lscpu for cores it has no name for) read it
+ * from here. Empty, and the line left out, when the firmware gives none.
  */
-static char dmi_cpu_model[64];
+static char cpuinfo_model_name[64];
 
-static void __init dmi_find_cpu_model(const struct dmi_header *dm, void *private)
+/*
+ * Copy the Version string of an SMBIOS type 4 structure into @buf, without
+ * leading or trailing white space. Leaves @buf empty if the structure is too
+ * short to have the field, the field names no string or the string is blank.
+ */
+static void dmi_processor_version(const struct dmi_header *dm,
+				  char *buf, size_t size)
 {
-	const u8 *d = (const u8 *)dm;
 	const char *s = (const char *)dm + dm->length;
 	u8 index;
 
-	if (dm->type != DMI_ENTRY_PROCESSOR || dm->length < 0x11 || dmi_cpu_model[0])
+	buf[0] = '\0';
+	if (dm->type != DMI_ENTRY_PROCESSOR || dm->length <= 0x10)
 		return;
-	index = d[0x10];
+
+	/* String numbers count from 1 in the unformatted area after the structure */
+	index = ((const u8 *)dm)[0x10];
 	if (!index)
 		return;
 	while (--index && *s)
 		s += strlen(s) + 1;
-	if (*s) {
-		strscpy(dmi_cpu_model, skip_spaces(s), sizeof(dmi_cpu_model));
-		strim(dmi_cpu_model);
-	}
+	if (!*s)
+		return;
+
+	strscpy(buf, skip_spaces(s), size);
+	strim(buf);
 }
 
-static int __init cpuinfo_dmi_model_init(void)
+static void __init cpuinfo_find_model_name(const struct dmi_header *dm, void *data)
 {
-	dmi_walk(dmi_find_cpu_model, NULL);
+	/* The first processor names the package; later ones repeat it */
+	if (dm->type == DMI_ENTRY_PROCESSOR && !cpuinfo_model_name[0])
+		dmi_processor_version(dm, cpuinfo_model_name, sizeof(cpuinfo_model_name));
+}
+
+static int __init cpuinfo_model_name_init(void)
+{
+	dmi_walk(cpuinfo_find_model_name, NULL);
 	return 0;
 }
-late_initcall(cpuinfo_dmi_model_init);
+late_initcall(cpuinfo_model_name_init);
 
 static int c_show(struct seq_file *m, void *v)
 {
@@ -272,8 +290,8 @@ static int c_show(struct seq_file *m, void *v)
 	if (compat)
 		seq_printf(m, "model name\t: ARMv8 Processor rev %d (%s)\n",
 			   MIDR_REVISION(midr), COMPAT_ELF_PLATFORM);
-	else if (dmi_cpu_model[0])
-		seq_printf(m, "model name\t: %s\n", dmi_cpu_model);
+	else if (cpuinfo_model_name[0])
+		seq_printf(m, "model name\t: %s\n", cpuinfo_model_name);
 
 	seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
 		   loops_per_jiffy / (500000UL/HZ),
@@ -580,3 +598,7 @@ void __init cpuinfo_store_boot_cpu(void)
 	boot_cpu_data = *info;
 	init_cpu_features(&boot_cpu_data);
 }
+
+#if IS_ENABLED(CONFIG_ARM64_CPUINFO_KUNIT_TEST)
+#include "cpuinfo_kunit.c"
+#endif
