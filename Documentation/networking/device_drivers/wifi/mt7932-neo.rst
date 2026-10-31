@@ -30,8 +30,11 @@ bootstrap DMA ownership is active. Kernels may still support kexec elsewhere.
 The station uses 2.4 GHz channels 1-13 and the 5 GHz channels 36-64,
 100-144 and 149-165 that the cfg80211 regulatory domain permits. Radar (DFS)
 channels stay passive: the firmware listens on them while the station is not
-associated, but never probes or joins an access point there, and scans made
-while associated skip them. A channel whose restrictions the driver cannot
+associated and never probes there, and scans made while associated skip them.
+An access point heard on a radar channel may be joined, since the access point
+owns radar detection. A beacon from it that carries a Channel Switch
+Announcement or an Extended one ends the connection, or the join in progress,
+and logs RADAR_CHANNEL_SWITCH. A channel whose restrictions the driver cannot
 apply (reduced power, no OFDM, PSD limits) is disabled rather than used, and
 so is a channel the country package does not permit: every power limit of
 that channel in the applied country package is left undefined.
