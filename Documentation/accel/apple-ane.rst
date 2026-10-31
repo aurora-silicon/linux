@@ -393,7 +393,10 @@ DAPF records per instance against ``apple,dapf-ranges``. The ANE backend
 writes no engine, DART or DAPF register at this rung. Genpd owns power writes.
 
 ``map`` claims an exclusive, singleton IOMMU group and an unmanaged domain
-covering the three SID-0 DART instances. It checks the finalized aperture
+covering the three SID-0 DART instances. Private surfaces currently require
+a DMA-coherent client; noncoherent clients refuse before mapping. No
+unexported architecture cache helper is called from the module. It checks
+the finalized aperture
 rather than widening geometry in the client. TEXT is read-only, DATA is
 read/write, and the four range-containing 16 KiB pages use identity addresses
 and MMIO attributes. Every DAPF lock is checked before any record changes;

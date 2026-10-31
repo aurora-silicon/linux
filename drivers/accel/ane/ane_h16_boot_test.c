@@ -29,6 +29,10 @@ struct ane_h16_sim {
 	u32 ipc_request;
 	u32 heap_request;
 	u32 tick;
+	struct ane_fw_rtk rtk;
+	u32 mailbox_tx;
+	bool offered_mailbox;
+	bool fault_after_run;
 	u16 refuse_id;
 	bool no_ready;
 	bool wrong_table;
@@ -90,7 +94,7 @@ static void sim_reply(struct ane_h16_sim *s)
 	struct ane_fw_transport *t = &s->boot.transport;
 	struct ane_fw_transaction *tx = &t->pending[ANE_FW_IO];
 	u8 *slot = ane_fw_transport_slot(t, ANE_FW_IO);
-	u8 *command = (u8 *)t->pool.cpu + tx->dva - t->pool.dva;
+	u8 *command = (u8 *)t->pool.cpu + (tx->dva - t->pool.dva);
 
 	if (tx->id == 3)
 		put_unaligned_le32(s->tick, command + 8);
@@ -114,6 +118,8 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 	}
 	if (w == ANE_H16_ENGINE && off == f->cpu_control) {
 		s->cpu = value;
+		if (value == f->run && s->fault_after_run)
+			s->fault = BIT(31);
 		if (value == f->run && !s->no_ready) {
 			s->scratch[0] = s->channel_request;
 			s->scratch[1] = s->ipc_request;
@@ -237,9 +243,39 @@ static int sim_pin(void *ctx)
 	return 0;
 }
 
+static int sim_mailbox_send(void *ctx, u64 word0, u64 word1)
+{
+	struct ane_h16_sim *s = ctx;
+	static const u8 types[] = { 2, 8, 8, 5, 6, 0xb, 5 };
+
+	KUNIT_EXPECT_LT(s->test, s->mailbox_tx, ARRAY_SIZE(types));
+	if (s->mailbox_tx < ARRAY_SIZE(types))
+		KUNIT_EXPECT_EQ(s->test, (word0 >> 52) & 0xff, (u64)types[s->mailbox_tx]);
+	KUNIT_EXPECT_EQ(s->test, word1, 0ULL);
+	s->mailbox_tx++;
+	return 0;
+}
+
 static void sim_mailbox(void *ctx)
 {
-	((struct ane_h16_sim *)ctx)->mailbox_polls++;
+	struct ane_h16_sim *s = ctx;
+	static const u64 offered[] = {
+		ANE_FW_RTK_TYPE(1) | (12 << 16) | 12,
+		ANE_FW_RTK_TYPE(8) | BIT(0) | BIT(1),
+		ANE_FW_RTK_TYPE(8) | BIT_ULL(32) | ANE_FW_RTK_LAST | BIT(0),
+		ANE_FW_RTK_TYPE(7) | 0x20,
+		ANE_FW_RTK_TYPE(0xb) | 0x20,
+	};
+	unsigned int i;
+
+	s->mailbox_polls++;
+	if (!s->offered_mailbox || !s->boot.ran || s->mailbox_tx)
+		return;
+	for (i = 0; i < ARRAY_SIZE(offered); i++) {
+		int ret = ane_fw_rtk_receive(&s->rtk, offered[i], 0, s, sim_mailbox_send);
+
+		KUNIT_EXPECT_EQ(s->test, ret, 0);
+	}
 }
 
 static void sim_log(void *ctx, const char *item, u64 a, u64 b)
@@ -519,8 +555,79 @@ static void ane_h16_scratch3_timeout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->command_count, 0U);
 }
 
+static void ane_h16_mailbox_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->offered_mailbox = true;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), 0);
+	KUNIT_EXPECT_EQ(test, s->rtk.phase, ANE_FW_RTK_READY);
+	KUNIT_EXPECT_EQ(test, s->mailbox_tx, 7U);
+}
+
+static void ane_h16_no_heap_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u8 *record;
+
+	s->heap_request = 0;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	KUNIT_EXPECT_EQ(test, s->allocations, 2U);
+	record = (u8 *)s->boot.pool.cpu + s->build.init_offset;
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(record + 0x20), 0ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(record + 0x28), 0ULL);
+}
+
+static void ane_h16_power_actual_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->bad_power = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), -EHOSTDOWN);
+	KUNIT_EXPECT_EQ(test, s->scratch_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->pins, 0U);
+}
+
+static void ane_h16_rvbar_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->bad_rvbar = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), -EBUSY);
+	KUNIT_EXPECT_EQ(test, s->scratch_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->maps, 0U);
+}
+
+static void ane_h16_dart_fault_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->fault_after_run = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), -EIO);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->pins, 1U);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+}
+
+static void ane_h16_map_failure_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->fail_map = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), -ENOMEM);
+	KUNIT_EXPECT_FALSE(test, s->boot.ran);
+	KUNIT_EXPECT_FALSE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->pins, 0U);
+}
+
 static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_happy_test),
+	KUNIT_CASE(ane_h16_mailbox_test),
+	KUNIT_CASE(ane_h16_no_heap_test),
+	KUNIT_CASE(ane_h16_power_actual_test),
+	KUNIT_CASE(ane_h16_rvbar_test),
+	KUNIT_CASE(ane_h16_dart_fault_test),
+	KUNIT_CASE(ane_h16_map_failure_test),
 	KUNIT_CASE(ane_h16_no_ready_test),
 	KUNIT_CASE(ane_h16_wrong_table_test),
 	KUNIT_CASE(ane_h16_stale_table_test),

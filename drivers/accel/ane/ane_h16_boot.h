@@ -227,6 +227,7 @@ static inline bool ane_h16_dapf_record(struct ane_h16_boot *b, unsigned int dart
 	u64 end = b->ops->read32(b->ctx, w, off + 0x10);
 	u32 enabled = b->ops->read32(b->ctx, w, off + 0x20);
 
+	b->ops->log(b->ctx, "DAPF instance/record", dart, record);
 	start |= (u64)b->ops->read32(b->ctx, w, off + 0xc) << 32;
 	end |= (u64)b->ops->read32(b->ctx, w, off + 0x14) << 32;
 	b->ops->log(b->ctx, "DAPF flags/enable", flags, enabled);
@@ -505,7 +506,8 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		ret = ane_fw_transport_wait(&b->transport, ANE_FW_IO);
 		if (ret)
 			return ret;
-		reply = (u8 *)b->pool.cpu + b->transport.pending[ANE_FW_IO].dva - b->pool.dva;
+		reply = (u8 *)b->pool.cpu +
+			(b->transport.pending[ANE_FW_IO].dva - b->pool.dva);
 		b->ops->log(b->ctx, "startup ack", f->startup[i].id, get_unaligned_le16(reply + 6));
 		if (f->startup[i].id == 3) {
 			b->tick = get_unaligned_le32(reply + 8);

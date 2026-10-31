@@ -213,6 +213,10 @@ static int ane_h16_map(void *ctx)
 	unsigned int count = 0, i;
 	int ret;
 
+	if (!dev_is_dma_coherent(h->dev)) {
+		dev_err(h->dev, "H16 private surfaces require a coherent client\n");
+		return -EOPNOTSUPP;
+	}
 	if (of_count_phandle_with_args(h->dev->of_node, "iommus", "#iommu-cells") != 3) {
 		dev_err(h->dev, "H16 map requires only SID 0 on three DARTs; refusing extra streams\n");
 		return -EOPNOTSUPP;
@@ -228,12 +232,13 @@ static int ane_h16_map(void *ctx)
 		return ret;
 	h->claimed = true;
 	h->domain = iommu_paging_domain_alloc(h->dev);
-	if (IS_ERR(h->domain)) {
-		ret = PTR_ERR(h->domain);
+	if (IS_ERR_OR_NULL(h->domain)) {
+		ret = h->domain ? PTR_ERR(h->domain) : -ENOMEM;
 		h->domain = NULL;
 		return ret;
 	}
-	if (!(h->domain->pgsize_bitmap & SZ_16K))
+	if (h->domain->type != IOMMU_DOMAIN_UNMANAGED ||
+	    !(h->domain->pgsize_bitmap & SZ_16K))
 		return -EOPNOTSUPP;
 	/* Never widen a finalized DART aperture by assigning geometry fields. */
 	for (i = 0; i < 4; i++) {
@@ -297,25 +302,19 @@ static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surfa
 
 		if (!page)
 			return -ENOMEM;
-		if (!dev_is_dma_coherent(h->dev))
-			arch_dma_prep_coherent(page, SZ_16K);
 		for (j = 0; j < pages_per_block; j++)
 			m->pages[i * pages_per_block + j] = page + j;
 		m->blocks++;
 	}
-	/* Match the architecture coherent-allocation cache attributes. The cached
-	 * alias is never accessed after preparation on a noncoherent client.
-	 */
-	m->cpu = vmap(m->pages, size / PAGE_SIZE, VM_MAP,
-		      dma_pgprot(h->dev, PAGE_KERNEL, 0));
+	/* The coherent-client gate permits matching cached CPU/device aliases. */
+	m->cpu = vmap(m->pages, size / PAGE_SIZE, VM_MAP, PAGE_KERNEL);
 	if (!m->cpu)
 		return -ENOMEM;
 	memset(m->cpu, 0, size);
 	for (i = 0; i < m->blocks; i++) {
 		ret = iommu_map(h->domain, dva + i * SZ_16K,
 				page_to_phys(m->pages[i * pages_per_block]), SZ_16K,
-				IOMMU_READ | IOMMU_WRITE |
-				(dev_is_dma_coherent(h->dev) ? IOMMU_CACHE : 0), GFP_KERNEL);
+				IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, GFP_KERNEL);
 		if (ret)
 			return ret;
 		m->mapped += SZ_16K;
@@ -474,7 +473,7 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 {
 	struct device_node *np = pdev->dev.of_node;
 	static const char * const names[] = { "engine", "pmgr", "aux-3" };
-	unsigned int i;
+	unsigned int i, j;
 	int ret, irq;
 
 	if (of_count_phandle_with_args(np, "power-domains", "#power-domain-cells") != 5)
@@ -520,6 +519,9 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 		if (!dart)
 			return -EPROBE_DEFER;
 		h->dart[i] = &dart->dev;
+		for (j = 0; j < i; j++)
+			if (h->dart[j] == h->dart[i])
+				return -EINVAL;
 		if (ret)
 			return ret;
 		ret = pm_runtime_resume_and_get(h->dart[i]);
