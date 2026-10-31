@@ -6353,7 +6353,8 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 	    task_fits_cpu(p, cpu)) {
 
 		rq->misfit_task_load = 0;
-		rq->misfit_task = NULL;
+		if (p)
+			p->misfit_runtime = p->se.sum_exec_runtime;
 		return;
 	}
 
@@ -6362,11 +6363,6 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 	 * task_h_load() returns 0.
 	 */
 	rq->misfit_task_load = max_t(unsigned long, task_h_load(p), 1);
-
-	if (rq->misfit_task != p) {
-		rq->misfit_task = p;
-		rq->misfit_since = jiffies;
-	}
 }
 
 void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
@@ -8225,6 +8221,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	unsigned long weight;
 	bool curr;
 
+	if (flags & ENQUEUE_WAKEUP)
+		p->misfit_runtime = se->sum_exec_runtime;
+
 	if (task_is_throttled(p) && enqueue_throttled_task(p))
 		return;
 
@@ -10003,6 +10002,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
 	struct sched_entity *se = &p->se;
+
+	p->misfit_runtime = se->sum_exec_runtime;
 
 	if (!task_on_rq_migrating(p)) {
 		remove_entity_load_avg(se);
@@ -15041,7 +15042,7 @@ static __latent_entropy void sched_balance_softirq(void)
  * ends with a tail in which the tasks that started on small CPUs finish
  * alone on big ones.
  *
- * Once a task has been misfit on a CPU for a few base slices, swap it with
+ * Once a task has executed as a misfit for a few base slices, swap it with
  * the task on a busy bigger CPU. Bigger CPUs are taken round robin, so each
  * task on them takes its turn on a smaller CPU: the big CPUs are time
  * shared, as one runqueue would share them. It only applies when every
@@ -15049,12 +15050,9 @@ static __latent_entropy void sched_balance_softirq(void)
  * misfit task through load balancing instead), and it never moves down a
  * task with a higher weight or a higher uclamp_min than the misfit task.
  */
+/* Serialize destination selection through completion of the swap. */
+static DEFINE_MUTEX(misfit_rotate_mutex);
 static int misfit_rotate_last_cpu;
-
-static unsigned long misfit_rotate_period(void)
-{
-	return max(1UL, nsecs_to_jiffies(4ULL * sysctl_sched_base_slice));
-}
 
 static bool misfit_rotate_candidate(struct task_struct *p)
 {
@@ -15070,10 +15068,18 @@ static void misfit_rotate_work(struct work_struct *work)
 	unsigned long src_cap = arch_scale_cpu_capacity(src_cpu);
 	struct task_struct *p, *t = NULL;
 	bool idle = false;
+	int ret = -EINVAL;
 
 	p = xchg(&src_rq->misfit_rotate_p, NULL);
 	if (!p)
 		return;
+
+	mutex_lock(&misfit_rotate_mutex);
+
+	if (!sched_feat(MISFIT_ROTATE)) {
+		ret = -ECANCELED;
+		goto out;
+	}
 
 	/* The task may have moved, slept or shrunk since the tick. */
 	if (task_cpu(p) != src_cpu || !task_on_rq_queued(p) ||
@@ -15081,7 +15087,7 @@ static void misfit_rotate_work(struct work_struct *work)
 		goto out;
 
 	rcu_read_lock();
-	start = READ_ONCE(misfit_rotate_last_cpu);
+	start = misfit_rotate_last_cpu;
 	for_each_cpu_wrap(cpu, p->cpus_ptr, start + 1) {
 		struct rq *rq = cpu_rq(cpu);
 		struct task_struct *c;
@@ -15112,17 +15118,21 @@ static void misfit_rotate_work(struct work_struct *work)
 
 	if (idle)
 		t = NULL;
-	if (t) {
+	if (t)
 		get_task_struct(t);
-		WRITE_ONCE(misfit_rotate_last_cpu, dst_cpu);
-	}
 	rcu_read_unlock();
 
+	ret = idle ? -EAGAIN : -EBUSY;
 	if (t) {
-		migrate_swap(p, t, dst_cpu, src_cpu);
-		put_task_struct(t);
+		ret = migrate_swap(p, t, dst_cpu, src_cpu);
+		if (!ret)
+			misfit_rotate_last_cpu = dst_cpu;
 	}
 out:
+	trace_sched_misfit_rotate(p, t, src_cpu, dst_cpu, ret);
+	if (t)
+		put_task_struct(t);
+	mutex_unlock(&misfit_rotate_mutex);
 	put_task_struct(p);
 }
 
@@ -15134,15 +15144,14 @@ static void misfit_rotate_trigger(struct rq *rq)
 	if (!sched_feat(MISFIT_ROTATE) || !sched_asym_cpucap_active())
 		return;
 
-	if (READ_ONCE(rq->misfit_task) != p || !READ_ONCE(rq->misfit_task_load) ||
+	if (!READ_ONCE(rq->misfit_task_load) ||
 	    READ_ONCE(rq->nr_running) != 1 || !misfit_rotate_candidate(p))
 		return;
 
-	if (time_before(jiffies, READ_ONCE(rq->misfit_since) + misfit_rotate_period()))
+	/* Preemption must not restart a CPU-bound task's misfit interval. */
+	if (p->se.sum_exec_runtime - p->misfit_runtime <
+	    4ULL * sysctl_sched_base_slice)
 		return;
-
-	/* Whatever the outcome, try again no sooner than one period from now. */
-	WRITE_ONCE(rq->misfit_since, jiffies);
 
 	if (READ_ONCE(rq->misfit_rotate_p))
 		return;
@@ -15152,6 +15161,8 @@ static void misfit_rotate_trigger(struct rq *rq)
 		put_task_struct(p);
 		return;
 	}
+	p->misfit_runtime = p->se.sum_exec_runtime;
+	trace_sched_misfit_rotate(p, NULL, cpu_of(rq), -1, -EINPROGRESS);
 	queue_work_on(cpu_of(rq), system_highpri_wq, &rq->misfit_rotate_work);
 }
 

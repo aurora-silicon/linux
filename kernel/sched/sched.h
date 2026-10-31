@@ -1285,14 +1285,7 @@ struct rq {
 	unsigned char		idle_balance;
 
 	unsigned long		misfit_task_load;
-	/*
-	 * Misfit rotation: the misfit task (compared, never dereferenced),
-	 * the jiffies when it became misfit here, and the task handed (with
-	 * a reference) to the work that swaps it with the task on a busy
-	 * higher-capacity CPU.
-	 */
-	struct task_struct	*misfit_task;
-	unsigned long		misfit_since;
+	/* Task reference handed to the misfit rotation work. */
 	struct task_struct	*misfit_rotate_p;
 	struct work_struct	misfit_rotate_work;
 
