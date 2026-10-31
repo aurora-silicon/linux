@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
@@ -47,7 +48,7 @@ static void avd_retire(struct avd_dev *avd)
 			} else if (ctx->coded_fmt_desc->ops->done) {
 				ctx->coded_fmt_desc->ops->done(ctx, f->src, f->dst, state);
 			}
-			if (ctx->coded_fmt_desc->frame_ops && f->src->vb2_buf.req_obj.req)
+			if (f->src->vb2_buf.req_obj.req)
 				v4l2_ctrl_request_complete(f->src->vb2_buf.req_obj.req,
 							   &ctx->ctrl_hdl);
 			/* CAPTURE first: OUTPUT completion signals the media request. */
@@ -82,6 +83,15 @@ static void avd_reset_queue(struct avd_dev *avd, int status)
 
 	avd->backend->shutdown(avd);
 	ret = reset_control_reset(avd->rstc);
+	if (!ret) {
+		/* Reset alone leaves DART translations cached by the decoder. */
+		ret = iommu_attach_device(avd->empty_domain, avd->dev);
+		if (!ret) {
+			iommu_detach_device(avd->empty_domain, avd->dev);
+			if (iommu_get_domain_for_dev(avd->dev) != avd->domain)
+				ret = -EIO;
+		}
+	}
 	if (!ret)
 		ret = avd_backend_boot(avd);
 	WRITE_ONCE(avd->faulted, !!ret);
@@ -92,10 +102,8 @@ static void avd_reset_queue(struct avd_dev *avd, int status)
 		ctx->session_started = false;
 	spin_lock_irqsave(&avd->queue_lock, flags);
 	for (i = 0; i < AVD_MAX_FRAMES; i++) {
-		if (avd->frames[i].state == AVD_FRAME_FREE)
-			continue;
-		avd->frames[i].status = status;
-		avd->frames[i].state = AVD_FRAME_DONE;
+		avd_slot_reset(&avd->frames[i], status, !!ret,
+			       jiffies + AVD_FRAME_TIMEOUT);
 	}
 	spin_unlock_irqrestore(&avd->queue_lock, flags);
 }
@@ -149,8 +157,15 @@ static void avd_queue_worker(struct work_struct *work)
 		spin_unlock_irqrestore(&avd->queue_lock, flags);
 		if (expired) {
 			dev_err(avd->dev, "frame tag %#x timed out\n", avd->frames[i].tag);
-			avd_reset_queue(avd, -ETIMEDOUT);
-			break;
+			if (avd->frames[i].state == AVD_FRAME_SUBMITTED) {
+				avd_reset_queue(avd, -ETIMEDOUT);
+				break;
+			}
+			/* An inbox retry timeout has no DMA to recover. */
+			spin_lock_irqsave(&avd->queue_lock, flags);
+			avd->frames[i].status = -ETIMEDOUT;
+			avd->frames[i].state = AVD_FRAME_DONE;
+			spin_unlock_irqrestore(&avd->queue_lock, flags);
 		}
 	}
 	avd_retire(avd);
@@ -274,6 +289,14 @@ static void avd_queue_submit_work(struct work_struct *work)
 	f->frame_num = f->tag;
 	f->deadline = jiffies + AVD_FRAME_TIMEOUT;
 	memset(f->cmd, 0, sizeof(f->cmd));
+	if (f->src->vb2_buf.req_obj.req) {
+		ret = v4l2_ctrl_request_setup(f->src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
+		if (ret)
+			goto fail;
+	}
+	ret = avd_validate_request(ctx);
+	if (ret)
+		goto fail;
 	if (ops) {
 		if (!f->prog->cpu) {
 			ret = avd_buf_alloc(avd, f->prog, AVD_PROGRAM_SIZE);
@@ -300,11 +323,6 @@ static void avd_queue_submit_work(struct work_struct *work)
 					goto fail;
 			}
 		}
-		if (f->src->vb2_buf.req_obj.req) {
-			ret = v4l2_ctrl_request_setup(f->src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
-			if (ret)
-				goto fail;
-		}
 		ret = ops->prepare(ctx, f);
 	} else {
 		avd->building = f;
@@ -321,7 +339,7 @@ static void avd_queue_submit_work(struct work_struct *work)
 			ops->retire(ctx, f, VB2_BUF_STATE_DONE);
 		else if (!ops && ctx->coded_fmt_desc->ops->done)
 			ctx->coded_fmt_desc->ops->done(ctx, f->src, f->dst, VB2_BUF_STATE_DONE);
-		if (ops && f->src->vb2_buf.req_obj.req)
+		if (f->src->vb2_buf.req_obj.req)
 			v4l2_ctrl_request_complete(f->src->vb2_buf.req_obj.req, &ctx->ctrl_hdl);
 		pm_runtime_put_autosuspend(avd->dev);
 		spin_lock_irqsave(&avd->queue_lock, flags);
@@ -398,13 +416,23 @@ void avd_queue_drain(struct avd_ctx *ctx)
 		avd->queued_ctx = NULL;
 	spin_unlock_irqrestore(&avd->queue_lock, flags);
 	for (i = 0; i < AVD_MAX_FRAMES; i++) {
-		if (avd->frames[i].state != AVD_FRAME_FREE && avd->frames[i].ctx == ctx) {
+		if (avd->frames[i].state == AVD_FRAME_SUBMITTED && avd->frames[i].ctx == ctx) {
 			if (avd->backend->abort)
 				avd->backend->abort(ctx);
 			avd_reset_queue(avd, -ECANCELED);
 			break;
 		}
 	}
+	spin_lock_irqsave(&avd->queue_lock, flags);
+	for (i = 0; i < AVD_MAX_FRAMES; i++) {
+		struct avd_frame *f = &avd->frames[i];
+
+		if (f->ctx == ctx && f->state == AVD_FRAME_RESERVED) {
+			f->status = -ECANCELED;
+			f->state = AVD_FRAME_DONE;
+		}
+	}
+	spin_unlock_irqrestore(&avd->queue_lock, flags);
 	avd_retire(avd);
 	if (ctx->session_started && avd->backend->session_stop) {
 		int ret = pm_runtime_resume_and_get(avd->dev);
@@ -482,6 +510,8 @@ void avd_queue_cleanup(struct avd_dev *avd)
 	WRITE_ONCE(avd->stopping, true);
 	if (avd->inflight) {
 		avd_reset_queue(avd, -ESHUTDOWN);
+		for (i = 0; i < AVD_MAX_FRAMES; i++)
+			avd_slot_reset(&avd->frames[i], -ESHUTDOWN, true, 0);
 		avd_retire(avd);
 	}
 	mutex_unlock(&avd->queue_mutex);

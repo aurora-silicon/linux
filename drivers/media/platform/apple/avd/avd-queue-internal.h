@@ -65,6 +65,19 @@ static inline bool avd_slot_expired(const struct avd_frame *f, unsigned long now
 		f->state == AVD_FRAME_RESERVED) && time_after_eq(now, f->deadline);
 }
 
+/* Completed results survive recovery; firmware never owned RESERVED slots. */
+static inline void avd_slot_reset(struct avd_frame *f, int status,
+				  bool failed, unsigned long deadline)
+{
+	if (f->state == AVD_FRAME_SUBMITTED ||
+	    (failed && f->state == AVD_FRAME_RESERVED)) {
+		f->status = status;
+		f->state = AVD_FRAME_DONE;
+	} else if (f->state == AVD_FRAME_RESERVED) {
+		f->deadline = deadline;
+	}
+}
+
 static inline bool avd_inbox_full(unsigned int producer, unsigned int consumer)
 {
 	return ((producer + 1) & 7) == consumer;

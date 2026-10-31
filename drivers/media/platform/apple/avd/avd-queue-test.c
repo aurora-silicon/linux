@@ -187,8 +187,34 @@ static void avd_dispatch_reservation(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, avd_queue_ready(&ctx[1]), 1);
 }
 
+static void avd_reset_ownership(struct kunit *test)
+{
+	struct avd_frame f = { .state = AVD_FRAME_FREE, .tag = 123 };
+
+	avd_slot_reset(&f, -ETIMEDOUT, false, 100);
+	KUNIT_EXPECT_EQ(test, f.state, AVD_FRAME_FREE);
+	f.state = AVD_FRAME_RESERVED;
+	avd_slot_reset(&f, -ETIMEDOUT, false, 100);
+	KUNIT_EXPECT_EQ(test, f.state, AVD_FRAME_RESERVED);
+	KUNIT_EXPECT_EQ(test, f.deadline, 100UL);
+	KUNIT_EXPECT_EQ(test, f.tag, 123U);
+	f.state = AVD_FRAME_SUBMITTED;
+	avd_slot_reset(&f, -ETIMEDOUT, false, 100);
+	KUNIT_EXPECT_EQ(test, f.state, AVD_FRAME_DONE);
+	KUNIT_EXPECT_EQ(test, f.status, -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, avd_slot_complete(&f, 123, 0));
+	f.status = 0;
+	avd_slot_reset(&f, -EIO, true, 100);
+	KUNIT_EXPECT_EQ(test, f.status, 0);
+	f.state = AVD_FRAME_RESERVED;
+	avd_slot_reset(&f, -EIO, true, 100);
+	KUNIT_EXPECT_EQ(test, f.state, AVD_FRAME_DONE);
+	KUNIT_EXPECT_EQ(test, f.status, -EIO);
+}
+
 static struct kunit_case avd_queue_cases[] = {
 	KUNIT_CASE(avd_slots_and_tags),
+	KUNIT_CASE(avd_reset_ownership),
 	KUNIT_CASE(avd_retirement_order),
 	KUNIT_CASE(avd_watchdog_and_retry),
 	KUNIT_CASE(avd_completion_parser),

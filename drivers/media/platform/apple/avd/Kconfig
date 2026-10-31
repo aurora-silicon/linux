@@ -26,6 +26,7 @@ config VIDEO_APPLE_AVD_KUNIT_TEST
 	  Build KUnit tests for the Apple video decoder. They exercise the
 	  checks that the H.264 path makes on the slices that userspace
 	  queues, such as finding the slice data after the slice header,
-	  at the limits and one past them.
+	  at the limits and one past them. Also exercise unsupported stream
+	  rejection, V4L2 AV1/VP9 tile controls and recovery slot ownership.
 
 	  If unsure, say N.

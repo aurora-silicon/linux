@@ -587,6 +587,17 @@ static void avd_release_open_firmware(void *data)
 	release_firmware(avd->fw);
 }
 
+static void avd_free_empty_domain(void *data)
+{
+	struct avd_dev *avd = data;
+
+	if (iommu_get_domain_for_dev(avd->dev) == avd->empty_domain) {
+		dev_err(avd->dev, "retaining attached recovery domain\n");
+		return;
+	}
+	iommu_domain_free(avd->empty_domain);
+}
+
 static int avd_probe(struct platform_device *pdev)
 {
 	struct avd_dev *avd;
@@ -624,13 +635,15 @@ static int avd_probe(struct platform_device *pdev)
 		return PTR_ERR(avd->ctrl);
 
 	avd->domain = iommu_get_domain_for_dev(avd->dev);
-	if (avd->domain) {
-		avd->empty_domain = iommu_paging_domain_alloc(avd->dev);
-		if (IS_ERR(avd->empty_domain)) {
-			avd->empty_domain = NULL;
-			dev_warn(avd->dev, "cannot alloc new empty domain");
-		}
-	}
+	if (!avd->domain)
+		return dev_err_probe(avd->dev, -ENODEV, "missing DMA domain for recovery\n");
+	avd->empty_domain = iommu_paging_domain_alloc(avd->dev);
+	if (IS_ERR(avd->empty_domain))
+		return dev_err_probe(avd->dev, PTR_ERR(avd->empty_domain),
+				     "cannot allocate recovery domain\n");
+	ret = devm_add_action_or_reset(avd->dev, avd_free_empty_domain, avd);
+	if (ret)
+		return ret;
 
 	ret = avd_backend_select(avd);
 	if (ret)
@@ -682,9 +695,6 @@ static void avd_remove(struct platform_device *pdev)
 	avd_queue_cleanup(avd);
 
 	avd_v4l2_cleanup(avd);
-
-	if (avd->empty_domain)
-		iommu_domain_free(avd->empty_domain);
 
 	pm_runtime_disable(avd->dev);
 	pm_runtime_dont_use_autosuspend(avd->dev);

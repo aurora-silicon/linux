@@ -309,6 +309,7 @@ int avd_init_ctrls(struct avd_ctx *ctx);
 void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result);
 void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result);
 
+int avd_validate_request(struct avd_ctx *ctx);
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run);
 void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run);
 
