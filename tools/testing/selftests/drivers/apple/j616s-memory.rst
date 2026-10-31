@@ -49,3 +49,16 @@ can change the physical traffic. Record libc, CPU governor, display topology,
 thermal state and the exact kernel/DT alongside the result. Compare idle,
 bounded CPU load, memcpy, and recovery using the same observation method.
 Do not infer lower-state rates from bandwidth response thresholds.
+
+The capture helper checks the board model, records available policy and IIO
+attributes, then runs two seconds idle, five seconds of fourteen CPU workers,
+two seconds recovery, the ten-second memcpy workload, and two seconds recovery::
+
+    python3 tools/testing/selftests/drivers/apple/j616s-parity.py \
+        --memcpy /tmp/memcpy-bw --output /tmp/j616s-parity-NEW
+
+The output directory must be new. Each read failure is recorded in JSON, and
+the helper terminates only its own workload processes on failure or interrupt.
+The memcpy phase needs 4 GiB plus overhead. Polling at 20 Hz can itself cause
+CPU wakeups; use low-overhead counter snapshots for final idle-residency and
+power comparisons. Cached IIO values do not establish report arrival cadence.
