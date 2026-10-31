@@ -24,6 +24,7 @@ properties:
           - apple,blizzard-pmu
           - apple,firestorm-pmu
           - apple,icestorm-pmu
+          - apple,t8140-pmu
           - arm,armv8-pmuv3 # Only for s/w models
           - arm,arm1136-pmu
           - arm,arm1176-pmu
