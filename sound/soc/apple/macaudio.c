@@ -4044,6 +4044,31 @@ struct macaudio_platform_cfg macaudio_j873_cfg = {
 	.spk_secondary_only = true,
 };
 
+/*
+ * J813 (T8142, MacBook Air M5 13"): as on J873, the AOP firmware owns the
+ * audio fabric and the CPU component is the T8152-style AOP audio driver.
+ * The jack is a CS42L84 on "cout"; the speakers are four SN012776 (one
+ * woofer and one tweeter per side) on "spkr", whose voltage and current
+ * sense return on the same stream. As on the other SN012776 laptops, the
+ * speakers are behind the speaker protection interfaces from the bind: the
+ * volumes stay at the lock's ceiling until a protection daemon
+ * (speakersafetyd) holds them, or under "Speaker Protection" at the floor
+ * until an owner is granted. Each amp's level is its apple,speaker-config
+ * from the boot loader.
+ */
+struct macaudio_platform_cfg macaudio_j813_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W1T,
+	.stereo = true,
+	.safe_vol = -20,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
 };
@@ -4296,6 +4321,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
+	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
+	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
