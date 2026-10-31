@@ -94,7 +94,7 @@ impl kernel::debugfs::Writer for View {
         writeln!(
             f,
             "online=1 device={} graph={:?} sampled_ns={}",
-            dev.name(),
+            dev.name().to_str().unwrap_or("<non-UTF8>"),
             self.0.variant.graph,
             super::now_ns()
         )?;
