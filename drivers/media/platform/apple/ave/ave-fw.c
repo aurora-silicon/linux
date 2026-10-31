@@ -27,8 +27,8 @@
 #include "ave-regs.h"
 
 /*
- * Firmware builds whose command layouts this driver implements, by the CRC32
- * of their TEXT segment. The command formats change between builds.
+ * Legacy TEXT CRCs accepted at T8140 probe. Encoding separately requires
+ * a layout from ave_layout_for_crc(); command formats change between builds.
  */
 static const u32 ave_known_text_crc[] = {
 	0x2ce7359e,	/* AppleAVE2FW 9003.78.0 */
@@ -120,7 +120,7 @@ int ave_fw_probe(struct ave_dev *ave)
 {
 	struct device *dev = ave->dev;
 	u32 text_crc, data_crc, want;
-	bool known = !ave->variant->encoding_text_crc;
+	bool known = !ave->variant->boot_qualified;
 	int ret;
 
 	if (of_count_phandle_with_args(dev->of_node, "memory-region", NULL) != 2)
@@ -156,6 +156,7 @@ int ave_fw_probe(struct ave_dev *ave)
 		return dev_err_probe(dev, -ENODEV, "unsupported firmware (text CRC %08x)\n",
 				     text_crc);
 	ave->text_crc = text_crc;
+	ave->layout = ave_layout_for_crc(text_crc);
 
 	ave->data_pristine = vmalloc(ave->data.size);
 	if (!ave->data_pristine)
@@ -176,9 +177,9 @@ int ave_fw_probe(struct ave_dev *ave)
 
 	ave->data_crc = data_crc;
 	ave->fw_state = AVE_FW_OFF;
-	if (!ave->variant->encoding_text_crc)
-		dev_info(dev, "probe only: device type %u firmware TEXT %08x DATA %08x needs qualification\n",
-			 ave->variant->device_type, text_crc, data_crc);
+	if (!ave->variant->boot_qualified || !ave->layout)
+		dev_info(dev, "probe only: firmware TEXT %08x DATA %08x needs qualification\n",
+			 text_crc, data_crc);
 	return 0;
 
 free_data:
@@ -243,11 +244,11 @@ int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size, unsigned long
  */
 int ave_fw_check_build(struct ave_dev *ave)
 {
-	if (ave->variant->encoding_text_crc &&
-	    ave->text_crc == ave->variant->encoding_text_crc)
+	if (ave->variant->boot_qualified && ave->variant->regs && ave->layout &&
+	    ave->layout == ave_layout_for_crc(ave->text_crc))
 		return 0;
-	dev_info(ave->dev, "encoding refused: device type %u firmware TEXT %08x DATA %08x has no qualified command constants/MCC DSID\n",
-		 ave->variant->device_type, ave->text_crc, ave->data_crc);
+	dev_info(ave->dev, "encoding refused: firmware TEXT %08x DATA %08x has no qualified command layout/boot sequence\n",
+		 ave->text_crc, ave->data_crc);
 	return -ENOTSUPP;
 }
 

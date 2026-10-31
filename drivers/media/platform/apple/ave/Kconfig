@@ -10,7 +10,8 @@ config VIDEO_APPLE_AVE
 	help
 	  V4L2 memory-to-memory driver for the AVE H.264/HEVC encoder in
 	  Apple T8140 (A18 Pro) SoCs, as in the MacBook Neo.
-	  T6000 (M1 Pro) and T8112 (M2) have probe-only support; encoding
+	  T6000 (M1 Pro), T6041 (M4 Pro) and T8112 (M2) have probe-only
+	  support; encoding
 	  requires qualified firmware command constants.
 
 	  The encoder firmware is loaded by the bootloader; the driver builds
