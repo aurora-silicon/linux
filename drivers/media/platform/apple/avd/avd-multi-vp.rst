@@ -25,11 +25,16 @@ ABI and dependency contract
 ---------------------------
 
 The wire layout is in avd-open-protocol.h and in avd-fw src/queue.h.
-ABI 1 is incompatible and is rejected when its discovery magic is present.
+ABI 1 queued descriptors are incompatible and are never submitted. Known ABI 1
+images retain their legacy compatibility transport.
 Firmware without queue discovery, or DT without SRAM/PIODMA resources,
-retains the one-frame compatibility transport. A queued image requires both
+retains the one-frame compatibility transport. Missing PIODMA mappings or a
+second DART stream also select that compatibility path. A queued PIODMA image requires both
 DART stream IDs on the AVD device so its coherent packet addresses are valid
-in the PIODMA domain. The DT resource/IOMMU update is a separate dependency.
+in the PIODMA domain. The DT resource/IOMMU update is a separate dependency. VP dispatch itself uses
+a transport feed callback; a future SRAM-direct entry can use the same scheduler
+without issuing PIODMA. The SRAM-direct wire extension must be negotiated before
+using that path; this driver currently submits ABI 2 PIODMA entries only.
 
 Codec prepare defaults to AVD_DEP_PREV_DONE. H.264 and HEVC keep this policy:
 VP-stage reference independence and mutable scratch safety are not proven.

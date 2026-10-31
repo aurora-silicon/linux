@@ -95,6 +95,11 @@ int avd_open_queue_boot(struct avd_dev *avd)
 		info[i] = readl(q->sram + AVD_OPEN_INFO + i * 4);
 	if (info[0] != AVD_OPEN_MAGIC)
 		return 0;
+	/* ABI 1 images retain the same legacy IRQ path until a queue doorbell. */
+	if (info[1] == 1) {
+		dev_info_once(avd->dev, "queue ABI 1 image uses the open compatibility transport\n");
+		return 0;
+	}
 	if (info[1] != AVD_OPEN_VERSION || info[2] != AVD_MAX_FRAMES ||
 	    info[3] != sizeof(struct avd_open_desc) || info[5] != AVD_OPEN_RING ||
 	    info[6] != AVD_OPEN_PACKET_WORDS || info[10] != avd->variant->fifo_slots ||
@@ -111,8 +116,8 @@ int avd_open_queue_boot(struct avd_dev *avd)
 	/* Both DART stream IDs must be attached to the device's DMA domain. */
 	if (!avd->pm.piodma || !avd->domain ||
 	    of_count_phandle_with_args(avd->dev->of_node, "iommus", "#iommu-cells") < 2) {
-		ret = -ENODEV;
-		goto shutdown;
+		dev_info_once(avd->dev, "queued PIODMA unavailable; using the open compatibility transport\n");
+		return 0;
 	}
 	for (i = 0; i < 4; i++) {
 		u32 base = avd->variant->vp_slot_base[i];
