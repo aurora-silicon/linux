@@ -55,6 +55,15 @@
 #define TPS_REG_DATA_STATUS		0x5f
 #define TPS_REG_SLEEP_CONF		0x70
 
+/*
+ * CD321x register 0x50, for which we have no documentation: 6 bytes, of
+ * which macOS reads and writes 4. It writes BIT(13) after each DATA_STATUS
+ * HPD_IRQ and around a disconnect, then clears it; what the bit does is not
+ * known.
+ */
+#define CD321X_REG_0X50			0x50
+#define CD321X_0X50_BIT13		BIT(13)
+
 /* TPS_REG_SYSTEM_CONF bits */
 #define TPS_SYSCONF_PORTINFO(c)		((c) & 7)
 
@@ -1026,6 +1035,76 @@ static void cd321x_dp_notify(struct cd321x *cd321x,
 	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
 }
 
+static void cd321x_write_0x50(struct tps6598x *tps, u32 val)
+{
+	__le32 v = cpu_to_le32(val);
+	int ret;
+
+	ret = tps6598x_block_write(tps, CD321X_REG_0X50, &v, sizeof(v));
+	if (ret)
+		dev_warn(tps->dev, "failed to write 0x%x to register 0x50: %d\n",
+			 val, ret);
+}
+
+/*
+ * After a session in DP alt mode, the controller reports the cable power
+ * path "in" and the session's data status once the partner is gone, and
+ * then gives the next partner no VBUS. macOS puts the port into system
+ * power state 2 on disconnect (and its empty MagSafe controller at boot)
+ * and back into S0 on the next connect; do the same, here also for a
+ * USB-C port found empty at probe. State 2 was never seen entered with a
+ * plug present, so STATUS is read again first and a plug skips the sleep.
+ * switch_power_state() reads the state before and after SSPS (macOS only
+ * after) and skips a state already set. A failure only warns, and leaves
+ * the port state unknown so that the next pass tries again: the cable
+ * state above is already applied, and a later event still reaches the port.
+ */
+static void cd321x_port_sleep(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	u32 status;
+	int ret;
+
+	if (!tps->data->port_sleep)
+		return;
+
+	ret = tps6598x_read32(tps, TPS_REG_STATUS, &status);
+	if (ret || (status & TPS_STATUS_PLUG_PRESENT)) {
+		cd321x->port_power = CD321X_PORT_UNKNOWN;
+		return;
+	}
+
+	cd321x_write_0x50(tps, CD321X_0X50_BIT13);
+	ret = tps->data->switch_power_state(tps, CD321X_SYSTEM_POWER_STATE_UNPLUGGED);
+	if (ret) {
+		dev_warn(tps->dev, "failed to enter the unplugged power state: %d\n",
+			 ret);
+		cd321x->port_power = CD321X_PORT_UNKNOWN;
+	} else {
+		cd321x->port_power = CD321X_PORT_ASLEEP;
+	}
+	cd321x_write_0x50(tps, CD321X_0X50_BIT13);
+	cd321x_write_0x50(tps, 0);
+}
+
+static void cd321x_port_wake(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	int ret;
+
+	if (!tps->data->port_sleep)
+		return;
+
+	ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	if (ret) {
+		dev_warn_ratelimited(tps->dev, "failed to return to S0: %d\n",
+				     ret);
+		cd321x->port_power = CD321X_PORT_UNKNOWN;
+	} else {
+		cd321x->port_power = CD321X_PORT_AWAKE;
+	}
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1132,6 +1211,10 @@ static void cd321x_update_work(struct work_struct *work)
 	if (dp_hpd && cd321x_uses_dp_sid(tps))
 		dp.irq_hpd |= st.dp_sid_irq;
 
+	/* As macOS: S0 as soon as STATUS shows a plug, before any teardown */
+	if (new_connected && cd321x->port_power != CD321X_PORT_AWAKE)
+		cd321x_port_wake(cd321x);
+
 	/* The display goes before anything else on the port changes. */
 	if (dp_route_was_active &&
 	    (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)) {
@@ -1221,6 +1304,9 @@ static void cd321x_update_work(struct work_struct *work)
 	/* If the plug is disconnected, we are done */
 	if (!new_connected) {
 		cd321x->dp_irq_hpd = false;
+		/* also an empty port at probe, and a disconnect retried */
+		if (cd321x->port_power != CD321X_PORT_ASLEEP)
+			cd321x_port_sleep(cd321x);
 		cd321x_update_done(cd321x);
 		return;
 	}
@@ -1551,6 +1637,8 @@ static void cd321x_complete(struct tps6598x *tps)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
 	guard(mutex)(&tps->lock);
+	/* the controller may have been re-initialised over sleep */
+	cd321x->port_power = CD321X_PORT_UNKNOWN;
 	if (cd321x_pm_resume(&cd321x->pm))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
@@ -1618,6 +1706,8 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 		dev_warn(tps->dev, "restored controller power state and interrupt mask\n");
 	/* Only a fresh snapshot may be applied after restoring the controller. */
 	cd321x->state_valid = false;
+	/* setup restores S0 over a port the driver may have put to sleep */
+	cd321x->port_power = CD321X_PORT_UNKNOWN;
 	cd321x->pm.phase = CD321X_PM_REVALIDATE;
 	cd321x->pm.attempts_left = CD321X_RESUME_ATTEMPTS;
 	cd321x->pm.force_reconnect |= ret > 0;
@@ -2661,6 +2751,11 @@ static int cd321x_remove(struct tps6598x *tps)
 	int ret;
 
 	cd321x_stop_work(cd321x);
+	/* Leave the controller in S0 for whatever runs without this driver */
+	scoped_guard(mutex, &tps->lock) {
+		if (cd321x->port_power != CD321X_PORT_AWAKE)
+			cd321x_port_wake(cd321x);
+	}
 
 	/*
 	 * Driver teardown must close the same hardware sessions as a physical
@@ -2992,6 +3087,7 @@ static const struct tipd_data tipd_cd321x_data = {
 	.read_power_status = tps6598x_read_power_status,
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
+	.port_sleep = true,
 	.connect = cd321x_connect,
 	.prepare = cd321x_prepare,
 	.complete = cd321x_complete,
