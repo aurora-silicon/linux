@@ -315,9 +315,12 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 static bool trampoline_analytics_h17p(struct apple_dcp *dcp, int tag,
 				      void *out, void *in)
 {
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
-		return trampoline_zero(dcp, tag, out, in);
-
+	/*
+	 * H17G (M5) needs the same empty dictionary. A zeroed reply fails the
+	 * firmware's OSDictionary deserialization ("OSDictionary
+	 * deserialization failed" in the DCP crash log) and the DCP panics
+	 * with "app NMI" one hour after boot.
+	 */
 	trace_iomfb_callback(dcp, tag, __func__);
 	/* The dispatcher has validated the D114 reply size. */
 	memset(out, 0, 0x1004);
