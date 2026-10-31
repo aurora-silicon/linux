@@ -95,7 +95,7 @@ def main():
 
     path, fd = find_device(args.device)
     if fd is None:
-        print("SKIP: no ABI 3 H16 accel node (h16_stage=program not active)")
+        print("SKIP: no ABI 3 H16 accel node (program stage not reached)")
         return KSFT_SKIP
     print(f"device {path}")
 

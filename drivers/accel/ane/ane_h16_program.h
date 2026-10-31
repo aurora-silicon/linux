@@ -28,6 +28,14 @@
 /* First value of the firmware mcache DSID pool (custom-BAR facts, 4). */
 #define ANE_H16_MCACHE_DSID 36
 
+/* Host-built generic section: header, then one entry per surface. */
+#define ANE_H16_GENERIC_MAGIC		1
+#define ANE_H16_GENERIC_VERSION		0x10
+#define ANE_H16_GENERIC_COUNT		0x204
+#define ANE_H16_GENERIC_HEADER		0x208
+#define ANE_H16_GENERIC_ENTRY		0x30
+#define ANE_H16_GENERIC_ID_MAX		0x3c
+
 /* Host-built sections. Userspace packs their bytes; the kernel places them. */
 enum ane_h16_aux {
 	ANE_H16_AUX_GENERIC,
@@ -113,7 +121,8 @@ int ane_h16_unload_encode(void *command, size_t length, u32 program);
 int ane_h16_id_reply(const void *reply, size_t length, const void *request);
 int ane_h16_gate_encode(void *command, size_t length, u32 value);
 
-int ane_h16_process_bindings(const struct ane_h16_hwx *hwx,
+int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
+			     size_t generic_size,
 			     struct ane_h16_process_binding *bindings,
 			     unsigned int *count);
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,

@@ -7,10 +7,12 @@
 #include "ane_h16_program.h"
 
 /*
- * The one LOAD slot table. Round 5 maps slot 1 to the HWX kernel section
- * (populated only when the program has one) and slot 2 to the task stream.
- * Slots 1 and 2 carry a per-program pair with slot 1 = slot 2 + 1. A later
- * correction to any slot is one line here.
+ * The one LOAD slot table. Slot 1 carries the HWX kernel section, or the
+ * __TEXT,__const constants when the program has no kernel section, and slot 2
+ * the task stream. macOS populated slot 1 in every captured load, with at
+ * least 0x4000 bytes at a sub-page DVA, which is the constants section of a
+ * program without a kernel. Slots 1 and 2 carry a per-program pair with
+ * slot 1 = slot 2 + 1. A later correction to any slot is one line here.
  */
 static const struct ane_h16_slot_rule ane_h16_slot_rules[ANE_H16_LOAD_SLOTS] = {
 	{ ANE_H16_SLOT_AUX_GENERIC, ANE_H16_RESOURCE_GENERIC, 4 },
@@ -81,10 +83,12 @@ int ane_h16_load_slots(const struct ane_h16_hwx *hwx,
 		case ANE_H16_SLOT_EMPTY:
 			continue;
 		case ANE_H16_SLOT_KERNEL:
-			if (!hwx->kernel.size)
-				continue;
-			ret = h16_section_dva(plan, layout, ANE_H16_REGION_KERNEL,
-					      &hwx->kernel, slot);
+			if (hwx->kernel.size)
+				ret = h16_section_dva(plan, layout, ANE_H16_REGION_KERNEL,
+						      &hwx->kernel, slot);
+			else
+				ret = h16_section_dva(plan, layout, ANE_H16_REGION_TEXT,
+						      &hwx->constants, slot);
 			break;
 		case ANE_H16_SLOT_TEXT:
 			ret = h16_section_dva(plan, layout, ANE_H16_REGION_TEXT,
@@ -261,32 +265,57 @@ int ane_h16_id_reply(const void *reply, size_t length, const void *request)
 EXPORT_SYMBOL_GPL(ane_h16_id_reply);
 
 /*
- * Kernel-owned EXECUTE resource map. The class follows the round 5 usage
- * mapping (input usage 1, output usage 2). The index is local to its class
- * in surface order, matching the separate input and output request arrays.
+ * Kernel-owned EXECUTE resource map. EXECUTE names each buffer by its ID in
+ * the generic section that LOAD installs, so the ID comes from that section:
+ * entry k describes surface k in HWX surface order. The entry must agree with
+ * the surface direction and size. IDs are unique and never the reserved
+ * kernel IDs 2 and 3. The class follows the round 5 usage mapping (input
+ * usage 1, output usage 2).
  */
-int ane_h16_process_bindings(const struct ane_h16_hwx *hwx,
+int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
+			     size_t generic_size,
 			     struct ane_h16_process_binding *bindings,
 			     unsigned int *count)
 {
-	u32 next[2] = {};
-	unsigned int i;
+	const u8 *g = generic;
+	u32 seen[2] = {};
+	unsigned int i, j;
 
-	if (!hwx || !bindings || !count || hwx->surface_count < 2 ||
+	if (!hwx || !g || !bindings || !count || hwx->surface_count < 2 ||
 	    hwx->surface_count > ANE_H16_SURFACES)
 		return -EINVAL;
+	if (generic_size != ANE_H16_GENERIC_HEADER +
+			    hwx->surface_count * ANE_H16_GENERIC_ENTRY ||
+	    get_unaligned_le32(g) != ANE_H16_GENERIC_MAGIC ||
+	    !get_unaligned_le32(g + 4) ||
+	    get_unaligned_le32(g + 4) > ANE_H16_GENERIC_VERSION ||
+	    get_unaligned_le32(g + ANE_H16_GENERIC_COUNT) != hwx->surface_count)
+		return -ENOEXEC;
 	for (i = 0; i < hwx->surface_count; i++) {
 		const struct ane_h16_hwx_surface *s = &hwx->surfaces[i];
+		const u8 *e = g + ANE_H16_GENERIC_HEADER + i * ANE_H16_GENERIC_ENTRY;
+		u32 id = get_unaligned_le32(e + 4);
+		u64 bytes = get_unaligned_le64(e + 0x20);
 
 		if (s->direction < 1 || s->direction > 2)
 			return -ENOEXEC;
+		if (get_unaligned_le32(e) != 1 || id == 2 || id == 3 ||
+		    id > ANE_H16_GENERIC_ID_MAX ||
+		    get_unaligned_le32(e + 8) != s->direction - 1 ||
+		    get_unaligned_le32(e + 0x10) != s->direction ||
+		    bytes < s->span || bytes > s->allocation)
+			return -ENOEXEC;
+		for (j = 0; j < i; j++)
+			if (bindings[j].index == id)
+				return -ENOEXEC;
 		bindings[i] = (struct ane_h16_process_binding) {
 			.hwx_vm = s->section.vm,
-			.index = next[s->direction - 1]++,
+			.index = id,
 			.class = ane_h16_usage_class(s->direction),
 		};
+		seen[s->direction - 1]++;
 	}
-	if (!next[0] || next[1] != 1)
+	if (!seen[0] || seen[1] != 1)
 		return -ENOEXEC;
 	*count = hwx->surface_count;
 	return 0;
@@ -431,7 +460,8 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 	unsigned int i, j, count;
 	int ret;
 
-	ret = ane_h16_process_bindings(hwx, bindings, &count);
+	ret = ane_h16_process_bindings(hwx, aux[ANE_H16_AUX_GENERIC],
+				       aux_size[ANE_H16_AUX_GENERIC], bindings, &count);
 	if (ret)
 		return ret;
 	for (i = 0; i < p->plan.count; i++) {

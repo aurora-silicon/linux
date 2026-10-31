@@ -293,19 +293,46 @@ static struct ane_h16_hwx_snapshot *fw_snapshot(struct kunit *test, bool mixed, 
 	return snapshot;
 }
 
+/* Generic section with ID base + k for surface k, as a host builder writes it. */
+static size_t generic_fill(u8 *g, const struct ane_h16_hwx *hwx, u32 base)
+{
+	unsigned int i;
+
+	memset(g, 0, ANE_H16_GENERIC_HEADER + hwx->surface_count * ANE_H16_GENERIC_ENTRY);
+	put_unaligned_le32(ANE_H16_GENERIC_MAGIC, g);
+	put_unaligned_le32(ANE_H16_GENERIC_VERSION, g + 4);
+	put_unaligned_le32(hwx->surface_count, g + ANE_H16_GENERIC_COUNT);
+	for (i = 0; i < hwx->surface_count; i++) {
+		u8 *e = g + ANE_H16_GENERIC_HEADER + i * ANE_H16_GENERIC_ENTRY;
+
+		put_unaligned_le32(1, e);
+		put_unaligned_le32(base + i, e + 4);
+		put_unaligned_le32(hwx->surfaces[i].direction - 1, e + 8);
+		put_unaligned_le32(hwx->surfaces[i].direction, e + 0x10);
+		put_unaligned_le64(hwx->surfaces[i].span, e + 0x20);
+		put_unaligned_le32(0xffff, e + 0x28);
+	}
+	return ANE_H16_GENERIC_HEADER + hwx->surface_count * ANE_H16_GENERIC_ENTRY;
+}
+
 static u8 test_aux[ANE_H16_AUX_COUNT][0x298];
 static const void *const test_aux_ptr[ANE_H16_AUX_COUNT] = {
 	test_aux[0], test_aux[1], test_aux[2], test_aux[3],
 };
 
-static const size_t test_aux_size[ANE_H16_AUX_COUNT] = { 0x298, 0x410 - 0x180, 0x38, 0x28 };
+static size_t test_aux_size[ANE_H16_AUX_COUNT] = { 0x298, 0x410 - 0x180, 0x38, 0x28 };
+
+#define TEST_GENERIC_BASE 8
 
 static int fw_load_program(struct prog_fw *f, struct ane_h16_program **p)
 {
 	struct ane_h16_hwx_snapshot *snapshot = fw_snapshot(f->test, false, false);
+	struct ane_h16_hwx hwx;
 
-	if (!snapshot)
+	if (!snapshot || ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx))
 		return -ENOMEM;
+	test_aux_size[ANE_H16_AUX_GENERIC] =
+		generic_fill(test_aux[ANE_H16_AUX_GENERIC], &hwx, TEST_GENERIC_BASE);
 	return ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size, p);
 }
 
@@ -342,6 +369,8 @@ static void program_add128_slots_test(struct kunit *test)
 	struct ane_h16_load_plan *plan = kunit_kzalloc(test, sizeof(*plan), GFP_KERNEL);
 	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
 	u8 load[ANE_H16_LOAD_SIZE];
+	u8 generic[ANE_H16_GENERIC_HEADER + 3 * ANE_H16_GENERIC_ENTRY];
+	size_t generic_size;
 	unsigned int i, count;
 
 	KUNIT_ASSERT_NOT_NULL(test, plan);
@@ -350,6 +379,8 @@ static void program_add128_slots_test(struct kunit *test)
 	for (i = 0; i < 3; i++) {
 		hwx->surfaces[i].section.vm = 0x30000000 + i * SZ_32K;
 		hwx->surfaces[i].direction = direction[i];
+		hwx->surfaces[i].span = SZ_32K;
+		hwx->surfaces[i].allocation = SZ_32K;
 		plan->regions[i] = (struct ane_h16_hwx_region) {
 			.vm = hwx->surfaces[i].section.vm, .size = SZ_32K,
 			.permissions = direction[i], .kind = ANE_H16_REGION_SURFACE,
@@ -376,24 +407,58 @@ static void program_add128_slots_test(struct kunit *test)
 		layout.aux_size[i] = test_aux_size[i];
 	}
 
-	/* Class-local indices from the kernel-owned map: (0,0), (0,1), (1,0). */
-	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, bindings, &count), 0);
+	/* IDs from the generic section: x = 5, y = 4, z = 6 as the add-128 builder writes. */
+	generic_size = generic_fill(generic, hwx, 0);
+	put_unaligned_le32(5, generic + ANE_H16_GENERIC_HEADER + 4);
+	put_unaligned_le32(4, generic + ANE_H16_GENERIC_HEADER + ANE_H16_GENERIC_ENTRY + 4);
+	put_unaligned_le32(6, generic + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + 4);
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), 0);
 	KUNIT_EXPECT_EQ(test, count, 3);
-	KUNIT_EXPECT_EQ(test, bindings[0].index, 0);
+	KUNIT_EXPECT_EQ(test, bindings[0].index, 5);
 	KUNIT_EXPECT_EQ(test, bindings[0].class, 0);
-	KUNIT_EXPECT_EQ(test, bindings[1].index, 0);
+	KUNIT_EXPECT_EQ(test, bindings[1].index, 4);
 	KUNIT_EXPECT_EQ(test, bindings[1].class, 1);
-	KUNIT_EXPECT_EQ(test, bindings[2].index, 1);
+	KUNIT_EXPECT_EQ(test, bindings[2].index, 6);
 	KUNIT_EXPECT_EQ(test, bindings[2].class, 0);
+
+	/* A generic section that disagrees with the program refuses. */
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size - 4,
+						       bindings, &count), -ENOEXEC);
+	put_unaligned_le32(2, generic + ANE_H16_GENERIC_HEADER + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
+	put_unaligned_le32(4, generic + ANE_H16_GENERIC_HEADER + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
+	put_unaligned_le32(5, generic + ANE_H16_GENERIC_HEADER + 4);
+	put_unaligned_le32(1, generic + ANE_H16_GENERIC_HEADER + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
+	put_unaligned_le32(0, generic + ANE_H16_GENERIC_HEADER + 8);
+	put_unaligned_le64(SZ_32K - 2, generic + ANE_H16_GENERIC_HEADER + 0x20);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
+	put_unaligned_le64(SZ_32K, generic + ANE_H16_GENERIC_HEADER + 0x20);
+	put_unaligned_le32(2, generic + ANE_H16_GENERIC_COUNT);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
+	put_unaligned_le32(3, generic + ANE_H16_GENERIC_COUNT);
+	put_unaligned_le32(0x11, generic + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
+	put_unaligned_le32(ANE_H16_GENERIC_VERSION, generic + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), 0);
 
 	KUNIT_ASSERT_EQ(test, ane_h16_load_slots(hwx, plan, &layout, slots), 0);
 	KUNIT_ASSERT_EQ(test, ane_h16_load_encode(load, sizeof(load), slots), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(load), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le16(load + 4), ANE_H16_LOAD_PROGRAM);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le16(load + 6), 0);
-	expect_slot(test, load, 0, 1002, 4, layout.aux_dva[0], 0x298);
-	/* No kernel section: slot 1 stays empty (round 5, "when present"). */
-	expect_empty(test, load, 1);
+	expect_slot(test, load, 0, 1002, 4, layout.aux_dva[0], layout.aux_size[0]);
+	/* No kernel section: slot 1 carries the constants at their sub-page DVA. */
+	expect_slot(test, load, 1, 1007, 3, layout.regions[3].dva + 0x140, 0x4000);
 	expect_slot(test, load, 2, 1006, 4, layout.regions[3].dva, 0x140);
 	expect_slot(test, load, 3, 1003, 4, layout.aux_dva[1], test_aux_size[1]);
 	expect_slot(test, load, 4, 1004, 4, layout.aux_dva[2], 0x38);
@@ -420,9 +485,12 @@ static void program_add128_slots_test(struct kunit *test)
 
 	/* A program needs an input and exactly one output. */
 	hwx->surfaces[0].direction = 2;
-	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, bindings, &count), -ENOEXEC);
+	generic_size = generic_fill(generic, hwx, 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
 	hwx->surfaces[0].direction = 3;
-	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, bindings, &count), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
+						       &count), -ENOEXEC);
 }
 
 /* Synthetic HWX with a kernel section: slot 1 is class 3 with index 1007. */
@@ -623,8 +691,10 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, p->resource_count, 2);
 	/* Firmware saw the request ID and the synthetic slots. */
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->load + 0x1b8), 0xffffffff);
-	expect_slot(test, f->load, 0, 1002, 4, p->aux[0].dva, 0x298);
-	expect_empty(test, f->load, 1);
+	expect_slot(test, f->load, 0, 1002, 4, p->aux[0].dva,
+		    test_aux_size[ANE_H16_AUX_GENERIC]);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->load + ANE_H16_LOAD_SLOT_OFFSET +
+						 ANE_H16_LOAD_SLOT_SIZE + 4), 1007);
 	expect_slot(test, f->load, 6, 1005, 4, p->aux[3].dva, 0x28);
 	/* Only the output surface is device-writable. */
 	KUNIT_EXPECT_EQ(test, f->writable_maps, 1);
@@ -640,6 +710,9 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x28), 2);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x60 + 8), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x90 + 8), 1);
+	/* Descriptor IDs are the generic-section IDs. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x60 + 4), TEST_GENERIC_BASE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x90 + 4), TEST_GENERIC_BASE + 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x18),
 			p->surfaces[0]->dva);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 1);
