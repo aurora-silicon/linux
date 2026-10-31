@@ -245,6 +245,22 @@ static void centauri_remove(struct pci_dev *pdev)
 	centauri_free_boot(c);
 }
 
+/*
+ * The N1 firmware keeps running across s2idle: it cannot be restarted without
+ * the bootloader's link training. Without PM callbacks the PCI core disables a
+ * function at suspend, which turns bus mastering off under the running
+ * firmware and leaves every ring dead (each scan then fails with -EIO). Save
+ * the state ourselves so the core keeps the function enabled and in D0, and
+ * keep the PCIe host's power domains up through the noirq phase.
+ */
+static int centauri_suspend(struct device *dev)
+{
+	device_set_awake_path(dev);
+	return pci_save_state(to_pci_dev(dev));
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(centauri_pm_ops, centauri_suspend, NULL);
+
 /* 0x1903 is the Beta (Bluetooth) function: btcentauri claims it. This driver needs functions
  * 0 and 1 (1 is enabled here, its BAR is used by the Wi-Fi code) and reaches function 2 only
  * through config space and its struct device for DMA.
@@ -262,6 +278,7 @@ static struct pci_driver centauri_driver = {
 	.id_table = centauri_ids,
 	.probe = centauri_probe,
 	.remove = centauri_remove,
+	.driver.pm = pm_sleep_ptr(&centauri_pm_ops),
 };
 
 static int __init centauri_init(void)
