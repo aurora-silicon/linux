@@ -190,6 +190,8 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 	    !command || size < 8 || get_unaligned_le32(command) ||
 	    get_unaligned_le16((const u8 *)command + 6))
 		return -EINVAL;
+	if (ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
+		return -EPERM;
 	tx = &t->pending[ch];
 	if (tx->active)
 		return -EBUSY;

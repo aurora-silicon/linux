@@ -52,7 +52,8 @@ config DRM_ACCEL_ANE_FW_KUNIT_TEST
 	help
 	  Check preload identity/ranges, channel validation, RTKit ordering,
 	  H16 HWX/resource bounds, UUID retirement, shared transport and bounded
-	  allocation and staged H16 cold boot without hardware.
+	  allocation, staged H16 cold boot and the H16 program lifecycle
+	  without hardware.
 	  These tests can run on architectures other than Apple arm64.
 
 	  If unsure, say N.

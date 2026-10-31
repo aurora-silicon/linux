@@ -115,6 +115,24 @@ ane_fw_channels_host_init(void *ipc, const struct ane_fw_channel *channels)
 }
 
 /* H14 preserves its reserved word; H16 requires bytes 0..3 to be zero. */
+/*
+ * Commands that change engine mode or ownership: secure mode 0x27, 0x28 and
+ * 0x34, exclave mode 0x30 and 0x31. Linux never publishes them.
+ */
+static inline bool ane_fw_command_denied(u16 id)
+{
+	switch (id) {
+	case 0x27:
+	case 0x28:
+	case 0x30:
+	case 0x31:
+	case 0x34:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static inline void ane_fw_command_header(void *command, u16 opcode, bool zero_reserved)
 {
 	u8 *p = command;
