@@ -1,0 +1,13 @@
+What:           /sys/bus/iio/devices/iio:deviceX/in_cct_input
+Date:           October 2026
+Contact:        linux-iio@vger.kernel.org
+Description:
+                Firmware-computed correlated colour temperature in Kelvin on
+                aop-sensors-als devices with a Redbird (VD6286) sensor.
+                Fractional Kelvin are reported with micro resolution. There
+                is no raw photodiode-to-CCT conversion in the host driver.
+                Only the documented 122-byte fake-HID report is decoded.
+                Before a valid positive finite CCT arrives, reading returns
+                ENODATA. A report in another layout or without a valid CCT
+                leaves the last valid reading in place, independently of lux.
+                CT720 and CT817 devices do not expose this attribute.

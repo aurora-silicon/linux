@@ -34,9 +34,9 @@ H16 preflight checks resource geometry, firmware identity and these ranges
 without MMIO or power access. No disk firmware is requested. Missing
 reservations fail with ``-ENODATA``. Malformed reservations fail with
 ``-EINVAL``. Even a valid handoff currently fails with ``-EOPNOTSUPP``:
-the strict preload validator, original-container HWX ABI and cold boot
-backend are incomplete. The section-only load ABI is explicitly refused
-for H16. No accel node or program-loading interface is published.
+the strict preload validator, original-container HWX ABI, firmware process
+resource decoder and cold boot backend are incomplete. The section-only
+load ABI is explicitly refused for H16. No accel node or program-loading interface is published.
 
 The H16 DT nodes stay disabled. The five real PMGR providers already encode
 the system/CPU/MPM/task/base dependency graph. The PMGR binding does not
@@ -61,12 +61,20 @@ start ordering. It does not invent responses for unknown message types or
 unimplemented system endpoint buffer requests. Its caller must provide one
 absolute session deadline and a bounded 64-bit mailbox transport.
 
+H16 task streams begin with little-endian ``u32 1`` and twelve reserved zero
+bytes. This marker precedes the first aligned task; it is not a task count.
+The initial H16 gate rejects a zero marker, other values and nonzero reserved
+bytes. The public H16 encoder fixes this prologue at commit
+``927013f5480768b07c8e62a866e1514c41aba778`` of
+``joshuaswarren/mil-hwx-compiler``, in
+``plugins/H16G/Encoding/H16GALUEncoder.mm``.
+
 H16 validation helpers walk nine fixed task-header words, the documented
 conditional extra word, dense/scatter records and the nine allowed register
 blocks. A separate helper checks the eight-byte Mach-O relocation entries,
 unique aligned offsets, the actual kernel-section ordinal and addend bounds.
-These helpers do not substitute for complete container/tensor/program and
-16-byte task-aperture metadata validation.
+Original-container, tensor, program and aperture validation is provided
+separately as described below.
 
 The device-free selftest in ``tools/testing/selftests/drivers/ane`` generates
 the SPEC-r2 fp16 add-128 inputs and CPU oracle and verifies all three pinned
@@ -78,8 +86,9 @@ Remaining implementation gates
 
 SPEC-r3 supplies the custom descriptor/aperture layouts and a normalized
 immutable preload digest with 42 ordered patchbay records. The complete
-validators, original-container ABI and physical boot backend still need
-implementation. Off-list preload mutations remain refused.
+preload validator, original-container ABI, process-resource decoder and
+physical boot backend still need implementation. Off-list preload mutations
+remain refused.
 
 The 2026-10-31 H16 runtime observation did not capture cold boot, scratch
 negotiation, RTKit management, CONFIG_GET or RESOURCE_INFO_GET. The version-12
@@ -123,8 +132,8 @@ descriptor's original index rather than assuming name order is wire order.
 The transport prepares the H16 envelope and rejects unrecognized runtime
 IDs, wrong sizes, channels and power-gate values before publication.
 H14's 0x0204 procedure packet and short CREATE_PROCESS body remain H14-only;
-H16's standalone serializer and event classifier are described below;
-they are not connected to inference submission.
+H16's serializer and UUID completion table are connected to the shared
+submission and event paths, subject to validated process resources.
 The H16 runtime command table does not authorize startup commands.
 
 H16 execute and event fields
@@ -168,13 +177,80 @@ atomically once on a terminal report, synchronize DMA, and apply quarantine
 rules before considering any mapping release. A classifier result alone
 cannot prove safe release or reject duplicate events without pending state.
 
-The live H16 path still consumes reports as diagnostics. It has no pending
-UUID table, serializer call or inference interface. The legacy 0x28-byte
-completion predicate remains H14-only. Short channel-6 CPU-load reports and
-channel-5 allocation operations are outside these helpers and remain gated.
-Timeouts still retain mappings and quarantine without retry or reset.
+The shared H16 submission path allocates a non-reused 64-bit UUID, installs
+it in a bounded pending table before publishing channel 7, and waits for
+both the transport reply and its own terminal event. Events may arrive
+before the acknowledgment. States 0 and 3 leave the UUID pending; states
+1 and 2 retire it once after matching every identifier. Unknown, duplicate
+and late UUIDs cannot retire another request. An identifier mismatch for a pending UUID or a malformed report
+quarantines the queue. ISP-destination reports and short
+CPU-load notifications cannot complete a general-scheduler request.
+
+One absolute deadline covers acknowledgment and terminal completion; a
+report at or beyond that deadline cannot succeed. Failure state 2,
+transport refusal, timeout or corruption prevents output copy-back and
+quarantines the queue without retry or reset. Firmware-visible process
+mappings remain resident, including after file close. Closing a file
+revokes its process capabilities before freeing its staging BO handles.
+
+Only private coherent DMA mappings may appear in H16 execute descriptors.
+Userspace BOs serve as staging buffers: inputs are snapshotted before
+publication and outputs are copied back after validated terminal success.
+Write barriers order input and command stores before publication; DMA read
+barriers order output reads after completion. Streaming DMA sync APIs must
+not be applied to these coherent allocations. There is no userspace alias
+to code, scratch or live firmware buffers.
+
+The resource map must come from the original HWX and a decoded firmware
+process reply. A userspace index, numeric class or program/process ID cannot
+create that map or confer ownership. Only established input/output classes
+are admitted; custom BAR requests require a validated selector map and
+remain unavailable. The legacy 0x28-byte completion predicate remains
+H14-only. Channel-5 allocation/control/free operations require a validated
+H16 reply provider and remain unavailable; H14 allocation replies are never
+reused for H16.
+
+No original-container load ABI or H16 process-resource decoder is supplied
+by this change. Consequently no H16 process can yet be installed, inference
+remains refused and no accel node is registered. The submission integration
+is preparatory and does not open the boot, preload, ownership, firmware
+version or resource gates.
 
 KUnit covers byte-exact synthetic execute fields, all 1..64 buffer counts,
 zero/one/two custom BAR lengths, wide DVAs/spans, reserved-zero output,
 boundary and overflow refusal, all event states, interleaved identities,
 ISP routing and malformed reports. No test packet is copied from a capture.
+
+Original HWX validation
+-----------------------
+
+The validator consumes one kernel-owned immutable snapshot of the complete
+HWX. It requires subtype 7 and bounded, exactly consumed load commands;
+rejects unknown command kinds, duplicate descriptors, overlapping segments,
+sections and file regions; and validates symbols against the complete
+section-ordinal table. Tensor names, directions, normalized fp16 dimensions,
+overflow-checked strides and full batched spans must agree with their
+surfaces and buffer references. There must be at least one input and one
+output, with the single output last.
+
+The linear and scratch program descriptors have exact fixed fields and
+zero reserved bytes. All five 16-byte aperture records must equal whole
+surface segment bases in order, followed by the optional kernel base;
+reserved halves and unused records are zero. Interior, duplicate, reordered
+and scratch/text aperture addresses are refused. Task counts and word counts
+must agree with the independent stream walk. Relocations use the actual
+kernel section ordinal, unique bounded offsets and valid addends, and may
+patch only packed-record payload words. Headers, register selectors and
+padding remain immutable.
+
+SHA-256 covers the entire original snapshot, including load commands and
+padding. The snapshot digest is rechecked before execution. Validation
+provides metadata, not allocation authority or permission to load a program;
+the original-container ABI and firmware resource map remain required.
+
+The hardware-free KUnit suites cover pending UUID lifecycle, acknowledgment
+versus completion, interleaving, progress, failures, malformed and mismatched
+reports, routing, duplicates, timeouts, capacity and UUID exhaustion. HWX
+tests generate synthetic linear/scratch forms with optional kernel data,
+then exercise command, geometry, tensor, aperture, symbol, relocation and
+digest refusal paths. No hardware inference result is implied.

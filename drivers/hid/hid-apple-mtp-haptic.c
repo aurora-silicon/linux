@@ -68,6 +68,9 @@ EXPORT_SYMBOL_GPL(apple_taptic_switch_modes);
  * fainter than the same pad gives under macOS. A machine whose device tree
  * gives the actuator a click strength has it written over the firmware's,
  * leaving the shape of each waveform as the firmware has it.
+ *
+ * The strength is firmware state, so it is checked again on every resume
+ * the transport passes on, and written if the firmware no longer has it.
  */
 #define APPLE_TAPTIC_PRESS_WAVEFORM	0x22
 #define APPLE_TAPTIC_RELEASE_WAVEFORM	0x23
@@ -93,6 +96,8 @@ static int apple_taptic_set_strength(struct hid_device *haptic_hdev, u8 report,
 	if (buf[APPLE_TAPTIC_WAVEFORM_STRENGTH] == strength)
 		return 0;
 
+	hid_dbg(haptic_hdev, "click waveform 0x%02x strength 0x%02x -> 0x%02x\n",
+		report, buf[APPLE_TAPTIC_WAVEFORM_STRENGTH], strength);
 	buf[APPLE_TAPTIC_WAVEFORM_STRENGTH] = strength;
 	len = hid_hw_raw_request(haptic_hdev, report, buf, len,
 				 HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
@@ -176,6 +181,12 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 	return 0;
 }
 
+static int apple_actuator_resume(struct hid_device *haptic_hdev)
+{
+	apple_taptic_set_click_strength(haptic_hdev);
+	return 0;
+}
+
 static bool actuator_match(struct hid_device *hdev, bool ignore_special_drivers)
 {
 	return apple_taptic_is_actuator(hdev);
@@ -201,7 +212,9 @@ static struct hid_driver apple_actuator_driver = {
 	.id_table = apple_haptic_devices,
 	.probe = apple_actuator_probe,
 	.match = actuator_match,
-	.remove = actuator_remove
+	.remove = actuator_remove,
+	.resume = pm_ptr(apple_actuator_resume),
+	.reset_resume = pm_ptr(apple_actuator_resume),
 };
 module_hid_driver(apple_actuator_driver);
 
