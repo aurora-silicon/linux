@@ -19,7 +19,6 @@
 /delete-node/ &apciec2_dart;
 /delete-node/ &dispext0_dart;
 /delete-node/ &dcpext0_dart;
-/delete-node/ &sep_dart;
 /delete-node/ &apcie1_dart;
 /delete-node/ &sio_dart;
 /delete-node/ &ane0_dart0;
@@ -33,7 +32,6 @@
 /delete-node/ &usb4_0_mbox;
 /delete-node/ &usb4_1_mbox;
 /delete-node/ &usb4_2_mbox;
-/delete-node/ &sep_mbox;
 /delete-node/ &sio_mbox;
 /delete-node/ &pinctrl_smc;
 /delete-node/ &pinctrl_aop;
@@ -46,13 +44,11 @@
 /delete-node/ &ps_i2c0;
 /delete-node/ &ps_i2c5;
 /delete-node/ &ps_i2c7;
-/delete-node/ &ps_spi_p;
 /delete-node/ &ps_uart_p;
 /delete-node/ &ps_dpa_p;
 /delete-node/ &ps_aes;
 /delete-node/ &ps_spi0;
 /delete-node/ &ps_spi1;
-/delete-node/ &ps_spi2;
 /delete-node/ &ps_spi3;
 /delete-node/ &ps_spi4;
 /delete-node/ &ps_spi5;
@@ -92,7 +88,6 @@
 /delete-node/ &ps_apcie_phy_sw;
 /delete-node/ &ps_jpg;
 /delete-node/ &ps_ane_sys;
-/delete-node/ &ps_sep;
 /delete-node/ &pmgr_ane;
 /delete-node/ &pmgr_disp;
 /delete-node/ &ps_ecpu_0;
@@ -201,9 +196,7 @@
 /delete-node/ &ps_nub_spmi2;
 /delete-node/ &ps_nub_spmi3;
 /delete-node/ &ps_nub_spmi4;
-/delete-node/ &sep;
 /delete-node/ &dcuart;
-/delete-node/ &spi2;
 /delete-node/ &spi4;
 /delete-node/ &qspi;
 /delete-node/ &nub_spmi1;
