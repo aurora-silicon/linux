@@ -41,18 +41,25 @@ pub(super) struct Telemetry {
 }
 
 impl Telemetry {
+    /// Core gating ends the logical-state observation, not the preceding
+    /// utilisation interval. A completed burst can report after its cores gate.
+    /// Utilisation still expires at the bounded host age in `read`.
+    pub(super) fn invalidate_pstate(&mut self) {
+        if self.view.pstate_status != UNAVAILABLE {
+            self.view.pstate_status = STALE;
+        }
+        self.timestamp = None;
+        self.delta_ticks = None;
+    }
+
     /// End an epoch. Preserve the reason that formerly valid data is stale,
     /// but never carry an average or a timestamp baseline into a new epoch.
     pub(super) fn invalidate(&mut self) {
         if self.view.util_status != UNAVAILABLE {
             self.view.util_status = STALE;
         }
-        if self.view.pstate_status != UNAVAILABLE {
-            self.view.pstate_status = STALE;
-        }
+        self.invalidate_pstate();
         self.view.util_samples = 0;
-        self.timestamp = None;
-        self.delta_ticks = None;
     }
 
     /// `max_age_ns` is a host policy (two nominal periods), not a packet duration.
