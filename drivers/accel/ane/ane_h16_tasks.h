@@ -33,7 +33,10 @@ static inline bool ane_h16_register_valid(u32 word)
 	return false;
 }
 
-/* This structural gate does not replace container/tensor/aperture validation. */
+/*
+ * H16 streams begin with little-endian u32 1 and twelve reserved zero bytes.
+ * This structural gate does not replace container/tensor/aperture validation.
+ */
 static inline int
 ane_h16_task_stream_validate(const void *text, size_t size, u32 expected_tasks)
 {
@@ -42,7 +45,8 @@ ane_h16_task_stream_validate(const void *text, size_t size, u32 expected_tasks)
 	u32 tasks = 0;
 
 	if (!p || !expected_tasks || size < 16 || size > ANE_H16_TASK_MAX ||
-	    (size & 3) || memchr_inv(p, 0, 16))
+	    (size & 3) || get_unaligned_le32(p) != 1 ||
+	    memchr_inv(p + 4, 0, 12))
 		return -ENOEXEC;
 	while (pos < size) {
 		u32 words, header_words = 9;

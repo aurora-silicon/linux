@@ -7,7 +7,10 @@ config DRM_ACCEL_ANE
 	depends on APPLE_RTKIT
 	depends on APPLE_DART || COMPILE_TEST
 	depends on MMU
+	select INTERCONNECT
+	select PM_OPP
 	select CRYPTO_LIB_SHA256
+	select DRM_ACCEL_ANE_H16_VALIDATION
 	help
 	  Choose this option if you have an Apple SoC with a Neural Engine:
 	  M1 (T8103), M1 Pro, Max and Ultra (T6000, T6001, T6002), M2
@@ -36,13 +39,19 @@ config DRM_ACCEL_ANE_KUNIT_TEST
 
 	  If unsure, say N.
 
+config DRM_ACCEL_ANE_H16_VALIDATION
+	tristate
+	select CRYPTO_LIB_SHA256
+
 config DRM_ACCEL_ANE_FW_KUNIT_TEST
-	tristate "KUnit tests for ANE firmware preflight" if !KUNIT_ALL_TESTS
+	tristate "KUnit tests for ANE firmware validation" if !KUNIT_ALL_TESTS
 	depends on DRM_ACCEL && KUNIT
+	select DRM_ACCEL_ANE_H16_VALIDATION
 	default KUNIT_ALL_TESTS
 	help
 	  Check preload ranges, 27.x channel and reply validation, RTKit
-	  management ordering, and H16 task/relocation bounds without hardware.
+	  management ordering, H16 HWX/resource bounds and UUID retirement
+	  without hardware.
 	  These tests can run on architectures other than Apple arm64.
 
 	  If unsure, say N.

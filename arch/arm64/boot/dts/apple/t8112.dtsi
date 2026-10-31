@@ -1788,7 +1788,6 @@
 			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "recv-not-empty";
 			#mbox-cells = <0>;
-			status = "disabled";
 		};
 
 		ane_dart0: iommu@26b800000 {
@@ -1798,7 +1797,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane_dart1: iommu@26b810000 {
@@ -1808,7 +1806,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane_dart2: iommu@26b820000 {
@@ -1818,7 +1815,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane: ane@26a000000 {
@@ -1836,7 +1832,6 @@
 				<&ps_ane_base>, <&ps_ane_set1>, <&ps_ane_set2>,
 				<&ps_ane_set3>, <&ps_ane_set4>;
 			mboxes = <&ane_mbox>;
-			status = "disabled";
 		};
 
 		dispext0_dart: iommu@271304000 {
