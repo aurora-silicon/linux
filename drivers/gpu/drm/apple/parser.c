@@ -1709,7 +1709,8 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 {
 	struct dcp_display_metadata parsed = {};
 	struct iterator it;
-	bool product = false;
+	bool product = false, chromaticity = false, white = false;
+	unsigned int color_seen = 0;
 	int ret = iterator_begin(handle, &it, true);
 
 	if (ret)
@@ -1725,6 +1726,21 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 				return -EINVAL;
 			product = true;
 			ret = parse_metadata_product(handle, &parsed, true);
+		} else if (!strcmp(key, "Chromaticity")) {
+			struct dcp_parse_ctx color = *handle;
+
+			/* Optional colour data must not invalidate panel identity. */
+			chromaticity = !parse_metadata_chromaticity(&color, &parsed) &&
+				       !(color_seen & 1);
+			color_seen |= 1;
+			ret = skip(handle);
+		} else if (!strcmp(key, "DefaultWhitePoint")) {
+			struct dcp_parse_ctx color = *handle;
+
+			white = !parse_metadata_point(&color, parsed.white, &parsed.gamma) &&
+				!(color_seen & 2);
+			color_seen |= 2;
+			ret = skip(handle);
 		} else {
 			ret = skip(handle);
 		}
@@ -1733,6 +1749,12 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 	}
 	if (!product)
 		return -ENODATA;
+	/* Never combine incomplete or duplicate descriptions with a nominal white. */
+	if (!chromaticity || !white) {
+		memset(parsed.chromaticity, 0, sizeof(parsed.chromaticity));
+		memset(parsed.white, 0, sizeof(parsed.white));
+		parsed.gamma = 0;
+	}
 	*out = parsed;
 	return 0;
 }
