@@ -76,6 +76,7 @@ static inline void put_unaligned_le64(u64 v, void *p)
 		b[i] = v >> (8 * i);
 }
 
+#ifdef TEST_PER_ABI
 static inline u16 get_unaligned_le16(const void *p)
 {
 	const u8 *b = p;
@@ -83,6 +84,7 @@ static inline u16 get_unaligned_le16(const void *p)
 	return (u16)b[0] | (u16)b[1] << 8;
 }
 
+#endif
 static inline u32 get_unaligned_le32(const void *p)
 {
 	const u8 *b = p;
