@@ -15,6 +15,7 @@
 #include <linux/iommu.h>
 #include <linux/reset.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
@@ -300,6 +301,19 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 	if (!ctx)
 		return IRQ_HANDLED;
 
+	/*
+	 * Reading RETRIEVE on an empty mailbox returns the previous message
+	 * again. A repeated PP DONE finishes the next frame before its PP has
+	 * run: userspace gets a wrong picture, the frame's own PP DONE never
+	 * comes, and the watchdog resets the decoder. Give a late message
+	 * 10 us, otherwise acknowledge and ignore the interrupt.
+	 */
+	if (readl_poll_timeout_atomic(avd->mbox + AVD_REG_MBOX1_STATUS, status,
+				      !(status & AVD_MBOX1_STATUS_EMPTY), 1, 10)) {
+		writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+		dev_dbg_ratelimited(avd->dev, "spurious interrupt, mailbox empty\n");
+		return IRQ_HANDLED;
+	}
 	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
 
 	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
