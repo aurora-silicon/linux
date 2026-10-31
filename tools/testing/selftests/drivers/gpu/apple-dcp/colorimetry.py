@@ -64,7 +64,7 @@ static void check(const struct dcp_display_metadata *metadata, bool color, const
             u32 coordinate=(u32)raw[27+i]<<2 | ((low>>(6-2*(i%4)))&3);
             assert(coordinate==(expected[i]+32)/64);
         }
-        assert(raw[23]==120);
+        assert(raw[23]==(metadata->gamma?120:255));
     } else {
         assert(raw[23]==255);
         for(unsigned i=27;i<33;i++)assert(!raw[i]);
@@ -83,6 +83,9 @@ int main(int argc, char **argv)
     check(&p3,true,argv[1]);check(&srgb,true,argv[2]);
 '''
     for i in range(2, len(inputs)):
+        if i == 6:
+            unit += f'{{struct dcp_display_metadata m=decode(color_{i},sizeof(color_{i}));assert(!m.gamma && m.white[0] && m.chromaticity[0][0]);check(&m,true,NULL);}}\n'
+            continue
         unit += f'{{struct dcp_display_metadata m=decode(color_{i},sizeof(color_{i}));assert(!m.gamma && !m.white[0] && !m.chromaticity[0][0]);check(&m,false,NULL);}}\n'
     unit += r'''
     struct dcp_display_metadata invalid=p3;
@@ -97,10 +100,16 @@ int main(int argc, char **argv)
     struct dcp_display_metadata partial=decode(color_2,sizeof(color_2));
     dcp_panel_metadata_replace(&d,&partial);
     assert(notifications==1 && !memcmp(&state.panel_metadata,&p3,sizeof(p3)));
+    /* Newly reported primaries with unknown gamma must not inherit an old gamma. */
+    struct dcp_display_metadata unknown_gamma=decode(color_6,sizeof(color_6));
+    dcp_panel_metadata_replace(&d,&unknown_gamma);
+    assert(notifications==2 && !state.panel_metadata.gamma && state.panel_metadata.white[0]);
+    dcp_panel_metadata_replace(&d,&partial);
+    assert(notifications==2 && !state.panel_metadata.gamma && state.panel_metadata.white[0]);
     /* A replacement panel must not inherit another serial's colour data. */
     partial.serial++;
     dcp_panel_metadata_replace(&d,&partial);
-    assert(notifications==2 && !state.panel_metadata.gamma);
+    assert(notifications==3 && !state.panel_metadata.gamma);
     return 0;
 }
 '''

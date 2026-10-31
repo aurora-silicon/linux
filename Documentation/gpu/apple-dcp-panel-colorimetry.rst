@@ -31,7 +31,8 @@ The existing paths in appledrm are:
 Before the optional-colour fix, the desktop parser retained only
 ``ProductAttributes`` and the panel builder unconditionally emitted zero RGB
 primaries, nominal D65 white and unknown gamma (0xff). The shared colour
-encoder now validates and encodes a complete firmware description. Incomplete,
+encoder now validates and encodes native primaries and white independently
+of an optional gamma. Incomplete,
 duplicate or malformed optional fields leave panel identity usable. A
 standalone ``ProductAttributes`` update for the same panel retains its previous
 colour description. A different panel serial cannot inherit that description.
@@ -43,11 +44,12 @@ The firmware fields to verify are precisely:
 * ``DisplayAttributes.Chromaticity.Red.X`` and ``.Y``;
 * ``DisplayAttributes.Chromaticity.Green.X`` and ``.Y``;
 * ``DisplayAttributes.Chromaticity.Blue.X`` and ``.Y``;
-* ``DisplayAttributes.DefaultWhitePoint.X``, ``.Y`` and ``.Gamma``.
+* ``DisplayAttributes.DefaultWhitePoint.X``, ``.Y`` and optional ``.Gamma``.
 
 The existing parser interprets these as unsigned 16.16 values. EDID base-block
 chromaticities round to units of 1/1024; gamma rounds to a hundredth. An absent
-transfer characteristic must not be replaced by an invented panel gamma.
+transfer characteristic remains unknown (0xff) even when valid primaries and
+white can be published; it must not be replaced by an invented panel gamma.
 The optional values are validated before any colour bytes are changed,
 including nonzero/bounded coordinates, nondegenerate primary triangle and
 white-point containment. These are metadata validation rules, not panel

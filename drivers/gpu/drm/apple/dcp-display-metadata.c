@@ -94,7 +94,8 @@ static int dcp_metadata_color(struct edid *edid, const struct dcp_display_metada
 {
 	u32 coordinate[8], gamma;
 
-	if (metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100)
+	if (metadata->gamma &&
+	    (metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100))
 		return -EINVAL;
 	for (unsigned int i = 0; i < 8; i++) {
 		u32 value = i < 6 ? metadata->chromaticity[i / 2][i % 2] : metadata->white[i - 6];
@@ -121,8 +122,9 @@ static int dcp_metadata_color(struct edid *edid, const struct dcp_display_metada
 				return -EINVAL;
 		}
 	}
-	gamma = DIV_ROUND_CLOSEST(metadata->gamma * 100, 65536) - 100;
-	if (gamma > 254)
+	gamma = metadata->gamma ?
+		DIV_ROUND_CLOSEST(metadata->gamma * 100, 65536) - 100 : 255;
+	if (metadata->gamma && gamma > 254)
 		return -EINVAL;
 
 	edid->gamma = gamma;
@@ -153,6 +155,7 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 	    !metadata->height_cm || metadata->height_cm > 255 ||
 	    metadata->product > U16_MAX || metadata->week > 53 ||
 	    metadata->year < 1990 || metadata->year > 2245 ||
+	    metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100 ||
 	    strnlen(metadata->manufacturer, 4) != 3)
 		return -EINVAL;
 	for (unsigned int i = 0; i < 3; i++) {
