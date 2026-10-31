@@ -53,7 +53,9 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'test-m3-uapi.py': [([], PASS)],
     'test-m3-mailbox.py': [([], PASS)],
+    'test-j613-dcp-power.py': [([], PASS)],
     'aop-als-channel-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
@@ -171,6 +173,7 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST.append('g17-telemetry-tests.rs')
+ASAHI_RUST.append('m3-firmware-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).
