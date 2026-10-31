@@ -2875,6 +2875,11 @@ static u32 dcp_gamma_lookup(const __le32 *fw, u16 v)
 
 static void dcp_gamma_set_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
+	struct iomfb_gamma_table_resp *resp = out;
+
+	if (resp)
+		dev_dbg(dcp->dev, "A421 gamma table status %u\n",
+			le32_to_cpu(resp->ret));
 	do_swap(dcp, NULL, NULL);
 }
 
@@ -2905,23 +2910,31 @@ static void dcp_gamma_read(struct apple_dcp *dcp, void *out, void *cookie)
 	u32 ch, i;
 
 	/* A table to compose with rises from its first to its last entry. */
-	for (ch = 0; resp && ch < 3; ch++) {
+	for (ch = 0; resp && !le32_to_cpu(resp->ret) && ch < 3; ch++) {
 		for (i = 1; i < IOMFB_GAMMA_ENTRIES; i++)
 			if (le32_to_cpu(resp->table[ch][i]) <
 			    le32_to_cpu(resp->table[ch][i - 1]))
 				break;
-		if (resp->table_null || i < IOMFB_GAMMA_ENTRIES ||
+		if (i < IOMFB_GAMMA_ENTRIES ||
 		    !le32_to_cpu(resp->table[ch][IOMFB_GAMMA_ENTRIES - 1]))
 			break;
 	}
 	if (!resp || ch < 3) {
-		dev_warn(dcp->dev, "unusable firmware gamma table, GAMMA_LUT ignored\n");
+		/* External firmware can return no table with status 2. */
+		if (resp && !dcp_has_panel(dcp) && le32_to_cpu(resp->ret) == 2 &&
+		    !memchr_inv(resp->table, 0, sizeof(resp->table)))
+			dev_dbg(dcp->dev,
+				"A420 returned no gamma table (status 2), GAMMA_LUT ignored\n");
+		else
+			dev_warn(dcp->dev, "unusable firmware gamma table, GAMMA_LUT ignored\n");
 		d->gamma_unusable = true;
 		do_swap(dcp, NULL, NULL);
 		return;
 	}
-	memcpy(d->gamma_fw, resp, sizeof(*d->gamma_fw));
+	memset(d->gamma_fw, 0, sizeof(*d->gamma_fw));
+	memcpy(d->gamma_fw->table, resp->table, sizeof(resp->table));
 	d->gamma_fw_read = true;
+	dev_dbg(dcp->dev, "A420 firmware gamma table read\n");
 	dcp_gamma_set(dcp);
 }
 

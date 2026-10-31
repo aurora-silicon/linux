@@ -942,3 +942,157 @@ int main(void)
     return 0;
 }
 '''
+
+
+def gamma(root):
+    base = root / 'drivers/gpu/drm/apple'
+    header = (base / 'iomfb.h').read_text()
+    template = (base / 'iomfb_template.c').read_text()
+    prefix = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32, __le32;
+typedef int64_t s64;
+#define __packed __attribute__((packed))
+#define le32_to_cpu(v) (v)
+#define cpu_to_le32(v) (v)
+#define div_s64(a, b) ((a) / (b))
+'''
+    prefix += next(line for line in header.splitlines()
+                   if line.startswith('#define IOMFB_GAMMA_ENTRIES')) + '\n'
+    for name in ('req', 'resp'):
+        prefix += block(header, 'struct iomfb_gamma_table_' + name + ' {') + ';\n'
+    prefix += r'''
+struct drm_color_lut { u16 red, green, blue, reserved; };
+struct dcp_desktop_state {
+    struct iomfb_gamma_table_req *gamma_fw, *gamma_out;
+    struct drm_color_lut gamma_lut[IOMFB_GAMMA_ENTRIES];
+    bool gamma_user, gamma_fw_read, gamma_unusable;
+};
+struct apple_dcp { struct dcp_desktop_state *desktop; bool panel; void *dev; };
+static unsigned warnings, debug, swaps, writes;
+static bool dcp_has_panel(struct apple_dcp *dcp) { return dcp->panel; }
+static void *memchr_inv(const void *p, int c, size_t n)
+{
+    const unsigned char *bytes = p;
+    for (size_t i = 0; i < n; i++)
+        if (bytes[i] != c) return (void *)(bytes + i);
+    return NULL;
+}
+#define dev_warn(dev, ...) ((void)(dev), warnings++)
+#define dev_dbg(dev, ...) ((void)(dev), debug++)
+static void do_swap(struct apple_dcp *dcp, void *out, void *cookie)
+{ assert(dcp && !out && !cookie); swaps++; }
+static const int dcp_set_gamma_table_method;
+static struct iomfb_gamma_table_req sent;
+static void dcp_push(struct apple_dcp *dcp, bool oob, const int *method,
+                     size_t in_size, size_t out_size, void *in,
+                     void (*cb)(struct apple_dcp *, void *, void *), void *cookie)
+{
+    assert(!oob && method == &dcp_set_gamma_table_method);
+    assert(in_size == sizeof(sent));
+    assert(out_size == sizeof(struct iomfb_gamma_table_resp));
+    struct iomfb_gamma_table_resp reply = {0};
+    memcpy(&sent, in, sizeof(sent));
+    writes++;
+    cb(dcp, &reply, cookie);
+}
+'''
+    production = '\n'.join(block(template, 'static ' + signature) for signature in (
+        'u32 dcp_gamma_lookup(', 'void dcp_gamma_set_done(',
+        'void dcp_gamma_set(', 'void dcp_gamma_read('))
+    suffix = r'''
+static struct iomfb_gamma_table_req fw, output;
+static struct dcp_desktop_state state;
+static struct apple_dcp dcp;
+static struct iomfb_gamma_table_resp reply;
+static void reset(bool panel)
+{
+    memset(&fw, 0xa5, sizeof(fw));
+    memset(&output, 0, sizeof(output));
+    memset(&state, 0, sizeof(state));
+    memset(&reply, 0, sizeof(reply));
+    state.gamma_fw = &fw;
+    state.gamma_out = &output;
+    dcp = (struct apple_dcp){ .desktop = &state, .panel = panel };
+    warnings = debug = swaps = writes = 0;
+}
+static void increasing(void)
+{
+    /* Arbitrary synthetic scales: no assertion about the firmware encoding. */
+    for (unsigned ch = 0; ch < 3; ch++)
+        for (unsigned i = 0; i < IOMFB_GAMMA_ENTRIES; i++)
+            reply.table[ch][i] = (ch + 1) * i * i;
+}
+static void rejected(bool warn)
+{
+    dcp_gamma_read(&dcp, &reply, NULL);
+    assert(state.gamma_unusable && !state.gamma_fw_read);
+    assert(warnings == warn && swaps == 1 && writes == 0);
+    assert(debug == !warn);
+    /* Failure must not turn the reply into a calibration base. */
+    const unsigned char *bytes = (const void *)&fw;
+    for (size_t i = 0; i < sizeof(fw); i++) assert(bytes[i] == 0xa5);
+}
+int main(void)
+{
+    _Static_assert(sizeof(reply) == 3088, "gamma response size");
+    _Static_assert(offsetof(struct iomfb_gamma_table_resp, ret) == 3084,
+                   "gamma return status offset");
+    for (unsigned panel = 0; panel < 2; panel++) {
+        reset(panel); reply.ret = 2; rejected(panel);
+        reset(panel); reply.ret = 1; rejected(true);
+        reset(panel); reply.ret = 0x100; increasing(); rejected(true);
+        reset(panel); reply.ret = 2; increasing(); rejected(true);
+        reset(panel); rejected(true); /* Successful but empty table. */
+        for (unsigned ch = 0; ch < 3; ch++) {
+            reset(panel); increasing();
+            reply.table[ch][10] = reply.table[ch][9] - 1;
+            rejected(true);
+            reset(panel); increasing();
+            memset(reply.table[ch], 0, sizeof(reply.table[ch]));
+            rejected(true);
+        }
+        reset(panel);
+        dcp_gamma_read(&dcp, NULL, NULL);
+        assert(state.gamma_unusable && !state.gamma_fw_read);
+        assert(warnings == 1 && swaps == 1 && writes == 0);
+
+        reset(panel); increasing();
+        dcp_gamma_read(&dcp, &reply, NULL);
+        assert(state.gamma_fw_read && !state.gamma_unusable);
+        assert(!warnings && writes == 1 && swaps == 1);
+        assert(!sent.table_null);
+        assert(!memcmp(sent.table, reply.table, sizeof(sent.table)));
+        assert(!sent.padding[0] && !sent.padding[1] && !sent.padding[2]);
+
+        /* Nonlinear, independent RGB channels; endpoints and interpolation. */
+        state.gamma_user = true;
+        for (unsigned i = 0; i < IOMFB_GAMMA_ENTRIES; i++) {
+            state.gamma_lut[i].red = 0;
+            state.gamma_lut[i].green = 0x7fff;
+            state.gamma_lut[i].blue = 0xffff;
+        }
+        dcp_gamma_set(&dcp);
+        assert(writes == 2 && swaps == 2 && !warnings);
+        for (unsigned i = 0; i < IOMFB_GAMMA_ENTRIES; i++) {
+            assert(sent.table[0][i] == 0);
+            assert(sent.table[1][i] == 32767);
+            assert(sent.table[2][i] == 196608);
+        }
+        state.gamma_user = false;
+        dcp_gamma_set(&dcp);
+        assert(writes == 3 && swaps == 3 && !warnings);
+        assert(!memcmp(sent.table, reply.table, sizeof(sent.table)));
+    }
+    puts("gamma RPC status, admission, composition and restoration passed");
+    return 0;
+}
+'''
+    return prefix + production + suffix
