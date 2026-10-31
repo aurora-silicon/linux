@@ -62,4 +62,18 @@ static inline int apple_qspi_status_allows_write(unsigned int sr1,
 	return !(sr1 & 0x03) && !(sr1 & 0x1c & ~bp_ok) &&
 		!(sr2 & 0xc0) && !(sr3 & 0x04);
 }
+
+/* JEDEC manufacturer ID of Macronix parts. */
+#define APPLE_QSPI_MFR_MACRONIX	0xc2
+
+/*
+ * The Macronix status register holds WIP, WEL and four block-protect bits,
+ * BP[3:0] at bits 5:2. BUSY and WEL are always refused, and block-protect
+ * bits only where bp_ok allows them. QE and SRWD stay unchanged.
+ */
+static inline int apple_qspi_mx_status_allows_write(unsigned int sr,
+						    unsigned int bp_ok)
+{
+	return !(sr & 0x03) && !(sr & 0x3c & ~bp_ok);
+}
 #endif
