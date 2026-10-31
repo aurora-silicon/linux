@@ -61,6 +61,14 @@ start ordering. It does not invent responses for unknown message types or
 unimplemented system endpoint buffer requests. Its caller must provide one
 absolute session deadline and a bounded 64-bit mailbox transport.
 
+H16 task streams begin with little-endian ``u32 1`` and twelve reserved zero
+bytes. This marker precedes the first aligned task; it is not a task count.
+The initial H16 gate rejects a zero marker, other values and nonzero reserved
+bytes. The public H16 encoder fixes this prologue at commit
+``927013f5480768b07c8e62a866e1514c41aba778`` of
+``joshuaswarren/mil-hwx-compiler``, in
+``plugins/H16G/Encoding/H16GALUEncoder.mm``.
+
 H16 validation helpers walk nine fixed task-header words, the documented
 conditional extra word, dense/scatter records and the nine allowed register
 blocks. A separate helper checks the eight-byte Mach-O relocation entries,
