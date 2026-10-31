@@ -4,6 +4,114 @@
 #include <linux/slab.h>
 
 #include "ane_fw_protocol.h"
+#include "ane_h16_protocol.h"
+
+static void ane_h16_id_table_test(struct kunit *test)
+{
+	static const struct ane_h16_command_info expected[] = {
+		{ 0x200, 0x1c0, 0x1c0, 1, 1, false },
+		{ 0x201, 0xc, 0xc, 1, 1, false },
+		{ 0x202, 0x258, 0x258, 1, 1, false },
+		{ 0x203, 0x10, 0x10, 1, 1, false },
+		{ 0x20c, 0xca8, 0xcd8, 0x18, 7, false },
+		{ 0x2d, 0xc, 0xc, 1, 7, false },
+		{ 0x300, 0x60, 0x60, 1, 6, true },
+	};
+	u8 *command = kunit_kzalloc(test, 0xcd8, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, command);
+	for (i = 0; i < ARRAY_SIZE(expected); i++) {
+		const struct ane_h16_command_info *e = &expected[i];
+		const struct ane_h16_command_info *info = ane_h16_command_info(e->id);
+		size_t length;
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, info);
+		KUNIT_EXPECT_EQ(test, info->min_size, e->min_size);
+		KUNIT_EXPECT_EQ(test, info->max_size, e->max_size);
+		KUNIT_EXPECT_EQ(test, info->size_step, e->size_step);
+		KUNIT_EXPECT_EQ(test, info->channel, e->channel);
+		KUNIT_EXPECT_EQ(test, info->from_firmware, e->from_firmware);
+		if (e->from_firmware) {
+			ret = ane_h16_command_prepare(command, e->min_size, e->id, e->channel);
+			KUNIT_EXPECT_EQ(test, ret, -EOPNOTSUPP);
+			continue;
+		}
+		for (length = e->min_size; length <= e->max_size; length += e->size_step) {
+			ret = ane_h16_command_prepare(command, length, e->id, e->channel);
+			KUNIT_EXPECT_EQ(test, ret, 0);
+		}
+		ret = ane_h16_command_prepare(command, e->min_size - 1, e->id, e->channel);
+		KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+		ret = ane_h16_command_prepare(command, e->max_size + 1, e->id, e->channel);
+		KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+		ret = ane_h16_command_prepare(command, e->min_size, e->id, e->channel ^ 1);
+		KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, ane_h16_command_info(0x204), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, ane_h16_command_info(0x301), NULL);
+	KUNIT_EXPECT_EQ(test, ane_h16_command_prepare(command, 0xca8, 0x204, 7),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, ane_h16_command_prepare(command, 0xca9, 0x20c, 7), -EINVAL);
+	/* The H14 CREATE_PROCESS size must never be sent to H16. */
+	KUNIT_EXPECT_EQ(test, ane_h16_command_prepare(command, 0x10, 0x202, 1), -EINVAL);
+}
+
+static void ane_h16_envelope_test(struct kunit *test)
+{
+	u8 command[0xc];
+	const u64 dva = 0x30000000000;
+
+	memset(command, 0xa5, sizeof(command));
+	put_unaligned_le32(1, command + 8);
+	KUNIT_ASSERT_EQ(test, ane_h16_command_prepare(command, sizeof(command), 0x2d, 7), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(command), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(command + 4), (u16)0x2d);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(command + 6), (u16)0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(command + 8), 1U);
+	KUNIT_EXPECT_EQ(test, ane_fw_reply_status(dva | 1, 0xc, 0, dva, 0xc,
+						  0x2d, command, true), 0);
+	/* Test the upper byte too: acknowledgment is u16, not u8. */
+	put_unaligned_le16(0x100, command + 6);
+	KUNIT_EXPECT_EQ(test, ane_fw_reply_status(dva | 1, 0xc, 0, dva, 0xc,
+						  0x2d, command, true), -EREMOTEIO);
+	put_unaligned_le32(0, command + 8);
+	KUNIT_ASSERT_EQ(test, ane_h16_command_prepare(command, sizeof(command), 0x2d, 7), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(command + 6), (u16)0);
+	put_unaligned_le32(2, command + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_command_prepare(command, sizeof(command), 0x2d, 7),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_command_prepare(NULL, sizeof(command), 0x2d, 7),
+			-EINVAL);
+}
+
+static void ane_h16_report_test(struct kunit *test)
+{
+	u8 event[0x60] = {};
+	unsigned int n;
+
+	put_unaligned_le16(0x300, event + 4);
+	for (n = 0; n < 4; n++) {
+		put_unaligned_le32(0xfe00 | n, event);
+		KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 6), 0);
+		/* A report can never satisfy the legacy completion predicate. */
+		KUNIT_EXPECT_EQ(test, ane_fw_finished_event(event, sizeof(event), 0, 0, 0),
+				-EPROTO);
+	}
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 7), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, 0x28, 6), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, 0xc, 6), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(NULL, 0x60, 6), -EPROTO);
+	put_unaligned_le32(0xfe04, event);
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 6), -EPROTO);
+	put_unaligned_le32(0xfe00, event);
+	put_unaligned_le16(0x301, event + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 6), -EPROTO);
+	put_unaligned_le16(0x300, event + 4);
+	put_unaligned_le16(0x100, event + 6);
+	KUNIT_EXPECT_EQ(test, ane_h16_event_report_status(event, sizeof(event), 6), -EPROTO);
+}
 
 #define TEST_IPC_SIZE 0x10000
 #define TEST_IPC_DVA 0x20000000000ULL
@@ -50,6 +158,7 @@ static void ane_dynamic_channels_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, channels[1].bit, 30U);
 	KUNIT_EXPECT_EQ(test, channels[1].slots, 2U);
 	KUNIT_EXPECT_EQ(test, channels[1].offset, 0x2400ULL);
+	KUNIT_EXPECT_EQ(test, channels[1].index, 1U);
 	{
 		u8 saved[ANE_FW_DESCRIPTOR_SIZE];
 		u8 *first = ipc + TEST_TABLE_OFF + ANE_FW_DESCRIPTOR_SIZE;
@@ -60,6 +169,7 @@ static void ane_dynamic_channels_test(struct kunit *test)
 		memcpy(last, saved, sizeof(saved));
 		KUNIT_ASSERT_EQ(test, ane_test_channels_parse(ipc, channels), 0);
 		KUNIT_EXPECT_EQ(test, channels[1].offset, 0x2400ULL);
+		KUNIT_EXPECT_EQ(test, channels[1].index, 7U);
 	}
 	memset(ipc + 0x2000, 0xa5, 0x2000);
 	ane_fw_channels_host_init(ipc, channels);
@@ -240,6 +350,9 @@ static void ane_rtk_rejections_test(struct kunit *test)
 }
 
 static struct kunit_case ane_protocol_cases[] = {
+	KUNIT_CASE(ane_h16_id_table_test),
+	KUNIT_CASE(ane_h16_envelope_test),
+	KUNIT_CASE(ane_h16_report_test),
 	KUNIT_CASE(ane_dynamic_channels_test),
 	KUNIT_CASE(ane_channel_snapshot_test),
 	KUNIT_CASE(ane_channel_rejections_test),

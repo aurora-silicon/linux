@@ -20,6 +20,7 @@ struct ane_fw_channel {
 	u32 slots;
 	u32 type;
 	u32 bit;
+	u32 index;
 };
 
 static inline bool ane_fw_contains(u64 base, u64 bytes, u64 addr, u64 size)
@@ -58,6 +59,7 @@ ane_fw_channels_parse(const void *table, u64 ipc_dva, size_t ipc_size,
 			return -EPROTO;
 		seen |= BIT(j);
 		c = &parsed[j];
+		c->index = i;
 		c->type = get_unaligned_le32(desc + 0x40);
 		c->bit = get_unaligned_le32(desc + 0x44);
 		slots = get_unaligned_le64(desc + 0x48);
@@ -109,6 +111,17 @@ ane_fw_channels_host_init(void *ipc, const struct ane_fw_channel *channels)
 	}
 }
 
+/* H14 preserves its reserved word; H16 requires bytes 0..3 to be zero. */
+static inline void ane_fw_command_header(void *command, u16 opcode, bool zero_reserved)
+{
+	u8 *p = command;
+
+	if (zero_reserved)
+		put_unaligned_le32(0, p);
+	put_unaligned_le16(opcode, p + 4);
+	put_unaligned_le16(0, p + 6);
+}
+
 /* A firmware refusal is distinct from corruption and never means success. */
 static inline int
 ane_fw_reply_status(u64 header, u64 slot_length, u64 slot_result,
@@ -135,7 +148,7 @@ static inline int ane_fw_config_status(const void *command, size_t length)
 	return 0;
 }
 
-/* Only a matching state-1 event completes an execution. */
+/* Legacy H14/comparator layout only; H16 27.0 reports are 0x60 bytes. */
 static inline int
 ane_fw_finished_event(const void *event, size_t length, u64 cookie,
 		      u32 program, u32 process)

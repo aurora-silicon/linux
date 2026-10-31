@@ -32,6 +32,8 @@ const struct ane_fw_platform ane_h16_platform = {
 	.hwx_subtype = 7,
 	.task_generation = 17,
 	.interrupt_count = 1,
+	/* J616s IRQ 1054 drains replies and events from all F2H channels. */
+	.irq_role = ANE_FW_IRQ_CHANNELS,
 	.owner = ANE_FW_OWNER_AP,
 	.reg_names = ane_h16_reg_names,
 	.reg_sizes = ane_h16_reg_sizes,
@@ -157,11 +159,11 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	/* SPEC-r2 defines CONFIG_GET and dynamic channels. Opening this gate
-	 * additionally needs a pinned immutable-image comparison reference and
-	 * the exact custom HWX descriptor/aperture layouts. Neither may be
-	 * replaced by a broad preload-diff rule or a section-only LOAD ioctl.
+	/* SPEC-r3 supplies the preload manifest and HWX layouts. Their full
+	 * validators, original-container ABI and cold boot backend are not yet
+	 * implemented. The runtime capture did not observe firmware startup.
+	 * Neither a broad preload-diff rule nor a section-only LOAD opens this.
 	 */
-	dev_info(dev, "H16 ANE: pinned preload reference and HWX layout unavailable; refusing before power access\n");
+	dev_info(dev, "H16 ANE: preload validation, HWX ABI and boot backend incomplete; refusing before power access\n");
 	return -EOPNOTSUPP;
 }

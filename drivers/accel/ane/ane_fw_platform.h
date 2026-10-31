@@ -16,6 +16,11 @@ enum ane_fw_owner {
 	ANE_FW_OWNER_EXCLAVE,
 };
 
+enum ane_fw_irq_role {
+	ANE_FW_IRQ_UNKNOWN,
+	ANE_FW_IRQ_CHANNELS,
+};
+
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
 	u32 soc;
@@ -24,6 +29,7 @@ struct ane_fw_platform {
 	u8 hwx_subtype;
 	u8 task_generation;
 	u8 interrupt_count;
+	enum ane_fw_irq_role irq_role;
 	enum ane_fw_owner owner;
 	const char * const *reg_names;
 	const u32 *reg_sizes;

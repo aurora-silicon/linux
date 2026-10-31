@@ -92,6 +92,7 @@
 #include <crypto/sha2.h>
 
 #include "ane_fw_platform.h"
+#include "ane_h16_protocol.h"
 #include "ane_fw_protocol.h"
 #include "ane_stats.h"
 #include "ane_t6021.h"
@@ -565,7 +566,14 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 	}
 	if (time_after_eq(jiffies, deadline))
 		goto out;
-	put_unaligned_le16(opcode, (u8 *)command->cpu + 4);
+	if (ane->soc->platform) {
+		result = ane_h16_command_prepare(command->cpu, length, opcode,
+						 ane->channels[channel].index);
+		if (result)
+			goto out;
+	} else {
+		ane_fw_command_header(command->cpu, opcode, false);
+	}
 	if (ane->soc->platform)
 		memset((u8 *)command->cpu + length, 0xa5, command->size - length);
 	WRITE_ONCE(io[1], length);
@@ -893,17 +901,17 @@ static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
 		dma_rmb();
 		dev_dbg(ane->dev, "T2H ch=%u slot=%u len=%#llx\n",
 			channel, slot_i, len);
-		if (channel == 6 && ane->soc->platform) {
+		if (ane->soc->platform) {
 			const void *ev = ane_rtclient_fw_cpu(ane, hdr, len);
-			int status = ane_fw_finished_event(ev, len, ane->call_cookie,
-							   ane->call_program, ane->call_process);
+			int status = ane_h16_event_report_status(ev, len, c->index);
 
 			if (status < 0) {
 				atomic_set(&ane_t6021_quarantined, 1);
 				return false;
 			}
-			if (status == 1)
-				finished = true;
+			/* The captured H16 report has no decoded completion field.
+			 * Consume diagnostics without retiring an execution or its BOs.
+			 */
 		} else if (channel == 6 && len >= ANE_T2H_CALL_STATE_OFF + 4) {
 			const u8 *ev = ane_rtclient_fw_cpu(ane, hdr,
 							   ANE_T2H_CALL_STATE_OFF + 4);
@@ -1021,6 +1029,8 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	int ret;
 	u64 stats_ticket = 0;
 	u64 stats_submit_ns = 0;
+	bool execute = ane->soc->platform ? opcode == ANE_H16_EXECUTE :
+					   opcode == CSNE_CMD_PROCEDURE_CALL;
 
 	ane_t6021_tracing = opcode == CSNE_CMD_PROCEDURE_CALL && trace_td &&
 			    ane->soc->trace_td_off;
@@ -1043,8 +1053,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	 * ring, as on ane.ko: stats=0 or a failed probe allocation leaves
 	 * stats_slots NULL, and the hooks must not run on a NULL ring.
 	 */
-	bool stats_call = ane->stats_slots &&
-			  opcode == CSNE_CMD_PROCEDURE_CALL;
+	bool stats_call = ane->stats_slots && execute;
 
 	if (stats_call) {
 		stats_submit_ns = ktime_get_ns();
@@ -1066,7 +1075,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		atomic_set(&ane_t6021_quarantined, 1);
 		return ret;
 	}
-	if (opcode == CSNE_CMD_PROCEDURE_CALL) {
+	if (execute) {
 		if (ane_t6021_tracing)
 			ane_t6021_trace_add(ANE_TR_ACK, 0);
 		ret = ane_rtclient_call_wait(ane, ane->soc->platform ? deadline :
@@ -1395,6 +1404,9 @@ static int ane_rtclient_create_process(struct ane_rtclient *ane,
 	struct ane_t6021_prog *prog = ane_t6021_prog_by_id(prog_id);
 	int ret;
 
+	/* H16 uses 0x258 bytes; its body is not the H14 0x10-byte body. */
+	if (ane->soc->platform)
+		return -EOPNOTSUPP;
 	if (!prog)
 		return -ENOENT;
 	if (prog->proc_id != U32_MAX) {
@@ -1438,6 +1450,9 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	size_t cmd_size;
 	int ret, i, pinned = 0;
 
+	/* H16 EXECUTE is 0x020c on channel 7 with an undecoded body. */
+	if (ane->soc->platform)
+		return -EOPNOTSUPP;
 	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
 	    user->priority < 2 || user->priority > 7 || !fd)
 		return -EINVAL;
