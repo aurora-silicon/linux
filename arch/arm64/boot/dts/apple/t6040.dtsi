@@ -2124,7 +2124,7 @@
 		power-domains = <&ps_qspi>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-		/* The firmware NOR needs a qualified partition/write policy. */
+		/* Boards enable it with their flash and its nvram partition. */
 		status = "disabled";
 	};
 
