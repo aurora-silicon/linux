@@ -296,8 +296,8 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 	}
 	if (ave->fw_state == AVE_FW_RECOVERING) {
 		/*
-		 * Recovery cleared CTRL itself. BOOT_ARG is set at every boot
-		 * and is not cleared by a control stop: require it to have lost
+		 * Recovery cleared CTRL itself and re-armed BOOT_ARG as a
+		 * reset witness with control off: require it to have lost
 		 * power too, before reusing DMA memory or restoring DATA. DARTs
 		 * sharing VENC power may suspend later than the consumer.
 		 */
@@ -552,6 +552,12 @@ int ave_fw_runtime_suspend(struct ave_dev *ave)
 		msleep(AVE_HALT_SETTLE_MS);
 	writel(0, ave->coproc + ave->variant->regs->ctrl);
 	if (readl(ave->coproc + ave->variant->regs->ctrl)) {
+		ave->fw_state = AVE_FW_BROKEN;
+		return -EIO;
+	}
+	/* CTRL=0 must not masquerade as power loss on the next attach. */
+	writel(AVE_COPROC_BOOT_ARG_VALUE, ave->coproc + ave->variant->regs->boot_arg);
+	if (readl(ave->coproc + ave->variant->regs->boot_arg) != AVE_COPROC_BOOT_ARG_VALUE) {
 		ave->fw_state = AVE_FW_BROKEN;
 		return -EIO;
 	}

@@ -578,11 +578,14 @@ static int ave_buf_prepare(struct vb2_buffer *vb)
 static void ave_buf_queue(struct vb2_buffer *vb)
 {
 	struct ave_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+	unsigned long flags;
 
-	if (READ_ONCE(ctx->failed))
+	spin_lock_irqsave(&ctx->queue_lock, flags);
+	if (ctx->failed)
 		v4l2_m2m_buf_done(to_vb2_v4l2_buffer(vb), VB2_BUF_STATE_ERROR);
 	else
 		v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
+	spin_unlock_irqrestore(&ctx->queue_lock, flags);
 }
 
 static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
@@ -850,8 +853,6 @@ static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
 		v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
 	int ret = 0;
 
-	if (!vb2_is_streaming(other))
-		WRITE_ONCE(ctx->failed, false);
 	if (V4L2_TYPE_IS_OUTPUT(q->type))
 		ctx->src_sequence = 0;
 	else
@@ -869,10 +870,16 @@ static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
 static void ave_stop_streaming(struct vb2_queue *q)
 {
 	struct ave_ctx *ctx = vb2_get_drv_priv(q);
+	struct vb2_queue *other = V4L2_TYPE_IS_OUTPUT(q->type) ?
+		v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx) :
+		v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
 
 	ave_session_end(ctx);
 	ave_reset_drain(ctx);
 	ave_return_bufs(ctx, q, VB2_BUF_STATE_ERROR);
+	/* vb2 hands queued buffers to buf_queue before the next STREAMON callback. */
+	if (!vb2_is_streaming(other))
+		WRITE_ONCE(ctx->failed, false);
 }
 
 static const struct vb2_ops ave_qops = {
@@ -1095,19 +1102,22 @@ static void ave_job_fail(struct ave_ctx *ctx, int err)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	unsigned long flags;
 
 	/* Publish the fatal error before any teardown that can wait on PM/IPC. */
+	spin_lock_irqsave(&ctx->queue_lock, flags);
 	WRITE_ONCE(ctx->failed, true);
-	cancel_delayed_work(&ctx->poll_work);
 	vb2_queue_error(v4l2_m2m_get_src_vq(m2m));
 	vb2_queue_error(v4l2_m2m_get_dst_vq(m2m));
+	ave_return_bufs(ctx, v4l2_m2m_get_src_vq(m2m), VB2_BUF_STATE_ERROR);
+	ave_return_bufs(ctx, v4l2_m2m_get_dst_vq(m2m), VB2_BUF_STATE_ERROR);
+	spin_unlock_irqrestore(&ctx->queue_lock, flags);
+	cancel_delayed_work(&ctx->poll_work);
 	dev_err(ave->dev, "encoding failed: %d\n", err);
 	mutex_lock(&ave->hw_lock);
 	ave_session_close(ctx, false);
 	mutex_unlock(&ave->hw_lock);
 	ave_session_free(ctx);
-	ave_return_bufs(ctx, v4l2_m2m_get_src_vq(m2m), VB2_BUF_STATE_ERROR);
-	ave_return_bufs(ctx, v4l2_m2m_get_dst_vq(m2m), VB2_BUF_STATE_ERROR);
 	ave_reset_drain(ctx);
 }
 
@@ -1249,6 +1259,7 @@ static int ave_open(struct file *file)
 	if (!ctx)
 		return -ENOMEM;
 	ctx->ave = ave;
+	spin_lock_init(&ctx->queue_lock);
 	INIT_WORK(&ctx->run_work, ave_run_work);
 	INIT_DELAYED_WORK(&ctx->poll_work, ave_poll_work);
 	atomic_set(&ctx->ready, 0);

@@ -56,6 +56,7 @@ static struct kunit_suite ave_recovery_suite = {
 	.name = "apple-ave-recovery",
 	.test_cases = ave_recovery_cases,
 };
+
 kunit_test_suite(ave_recovery_suite);
 
 MODULE_LICENSE("GPL");

@@ -9,6 +9,7 @@
 
 #include <linux/atomic.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -300,6 +301,8 @@ struct ave_ctx {
 	bool draining;
 	bool flush_pending;
 	bool stopped;
+	/* Serialises QBUF with fatal-error publication and ready-queue draining. */
+	spinlock_t queue_lock;
 	bool failed;
 	struct vb2_v4l2_buffer *drain_src;
 	u32 src_sequence;

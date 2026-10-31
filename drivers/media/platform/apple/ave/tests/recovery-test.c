@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 static const struct ave_coproc_regs regs = { .ctrl = 0, .boot_arg = 4, .vcbar = 8 };
 static const struct ave_variant variant = { .regs = &regs };
 static u64 coproc[4];
@@ -30,7 +30,8 @@ static void init(void)
 		ctx[i].ave = &ave;
 		ctx[i].fh.m2m_ctx = &m2m[i];
 		m2m[i].src.type = 1;
-		m2m[i].input[3] = (void *)&ctx[i];
+		m2m[i].src.priv = &ctx[i];
+		m2m[i].dst.priv = &ctx[i];
 	}
 }
 
@@ -82,9 +83,11 @@ static void buffer_failure(void)
 		assert(!m2m[i].nsrc && !m2m[i].ndst && !ctx[i].ready);
 		assert(!ctx[i].poll_work.scheduled && !ave_job_ready(&ctx[i]));
 		for (unsigned int n = 0; n < 3; n++)
-			assert(input[i][n].completions == 1 && input[i][n].state == VB2_BUF_STATE_ERROR);
+			assert(input[i][n].completions == 1 &&
+			       input[i][n].state == VB2_BUF_STATE_ERROR);
 		for (unsigned int n = 0; n < 2; n++)
-			assert(output[i][n].completions == 1 && output[i][n].state == VB2_BUF_STATE_ERROR);
+			assert(output[i][n].completions == 1 &&
+			       output[i][n].state == VB2_BUF_STATE_ERROR);
 	}
 	assert(!dev.refs && !freed && ave.failed_sessions && !closes);
 	/* A QBUF racing the failure is returned instead of silently requeued. */
@@ -95,7 +98,9 @@ static void buffer_failure(void)
 		ave_buf_queue(&extra.vb2_buf);
 		assert(extra.completions == 1 && extra.state == VB2_BUF_STATE_ERROR);
 	}
+	*(u32 *)(ave.coproc + regs.boot_arg) = 0;
 	assert(!ave_runtime_suspend(&dev));
+	assert(readl(ave.coproc + regs.boot_arg) == AVE_COPROC_BOOT_ARG_VALUE);
 	assert(ave.fw_state == AVE_FW_RECOVERING && ave.recovery_count == 1);
 	assert(!readl(ave.coproc + regs.ctrl));
 	mutex_lock(&ave.hw_lock);
@@ -106,6 +111,20 @@ static void buffer_failure(void)
 	mutex_unlock(&ave.hw_lock);
 	assert(freed == 2 && !ave.failed_sessions && !ave.inject_wedge);
 	assert(ave.fw_state == AVE_FW_HALTED);
+	m2m[0].dst.streaming = true;
+	ave_stop_streaming(&m2m[0].src);
+	assert(ctx[0].failed); /* STREAMOFF one queue cannot clear the failure. */
+	m2m[0].dst.streaming = false;
+	ave_stop_streaming(&m2m[0].dst);
+	assert(!ctx[0].failed);
+	m2m[0].src.error = false; /* vb2 clears queue errors on STREAMOFF. */
+	{
+		struct vb2_v4l2_buffer extra = {};
+
+		extra.vb2_buf.vb2_queue = &m2m[0].src;
+		ave_buf_queue(&extra.vb2_buf); /* Before start_streaming on STREAMON. */
+		assert(!extra.completions && m2m[0].nsrc == 1);
+	}
 }
 
 static void sleep_guarantees(void)
@@ -198,6 +217,7 @@ int main(void)
 	recovery_failures();
 	busy_ring_deadline();
 	restore_data();
-	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, PM rollback, DATA, IPC deadline");
+	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
+	     "PM rollback, DATA, IPC deadline");
 	return 0;
 }

@@ -32,6 +32,7 @@ def main():
         'ave-sess.c': ('ave_sess_destroy', 'ave_sess_reap'),
         'ave-v4l2.c': ('ave_return_bufs', 'ave_buf_queue', 'ave_session_index',
                        'ave_session_count', 'ave_session_close', 'ave_session_free',
+                       'ave_session_end', 'ave_stop_streaming',
                        'ave_reset_drain', 'ave_job_ready', 'ave_job_fail', 'ave_poll_work'),
         'ave-ipc.c': ('ave_ipc_pump',),
         'ave-drv.c': ('ave_runtime_suspend', 'ave_suspend', 'ave_resume', 'ave_inject_wedge'),
