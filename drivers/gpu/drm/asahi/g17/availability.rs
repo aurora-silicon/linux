@@ -40,7 +40,7 @@ impl Availability {
                     State { generation: 0, waiters: None },
                     "g17::Availability"
                 ),
-                fences: FenceContexts::new(1, c_str!("asahi_resource"), kernel::static_lock_class!())?,
+                fences: FenceContexts::new(1, c_str!("aurora_resource"), kernel::static_lock_class!())?,
             }),
             GFP_KERNEL,
         )

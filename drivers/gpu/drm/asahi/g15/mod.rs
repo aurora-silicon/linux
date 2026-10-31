@@ -441,7 +441,7 @@ impl Gpu {
         *shared.state.lock() = Some(firmware);
         // The engine's statistics file (a debugfs failure does not fail the probe).
         if let Err(error) = shared.start_engine() {
-            dev_warn!(dev.as_ref(), "G15: no asahi-g15 debugfs ({:?})\n", error);
+            dev_warn!(dev.as_ref(), "G15: no aurora-g15 debugfs ({:?})\n", error);
         }
         let gpu = Arc::new(
             Gpu {

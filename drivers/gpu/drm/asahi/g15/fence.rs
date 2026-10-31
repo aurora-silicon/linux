@@ -32,7 +32,7 @@ pub(crate) struct JobFenceOps;
 #[vtable]
 impl FenceOps for JobFenceOps {
     fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
-        c_str!("asahi")
+        c_str!("aurora")
     }
 
     fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
@@ -63,11 +63,11 @@ pub(crate) struct Timeline {
 
 impl Timeline {
     pub(crate) fn new() -> Result<Arc<Self>> {
-        let errors = FenceContexts::new(1, c_str!("asahi_g15_refused"), ERROR_KEY)?;
+        let errors = FenceContexts::new(1, c_str!("aurora_g15_refused"), ERROR_KEY)?;
         let allocation_failure = error_fence(&errors, ENOMEM)?;
         Arc::pin_init(
             try_pin_init!(Self {
-                jobs: FenceContexts::new(1, c_str!("asahi_g15_queue"), TIMELINE_KEY)?,
+                jobs: FenceContexts::new(1, c_str!("aurora_g15_queue"), TIMELINE_KEY)?,
                 errors,
                 pending <- new_mutex!(KVec::new(), "g15::Timeline::pending"),
                 allocation_failure,

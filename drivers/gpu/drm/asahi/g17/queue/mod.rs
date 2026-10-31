@@ -69,7 +69,7 @@ impl Frontend {
             return Err(EINVAL);
         }
         let window = UscWindow::new(usc_base, range.clone())?;
-        let fences = FenceContexts::new(1, c_str!("asahi_g17_queue"), FENCE_KEY)?;
+        let fences = FenceContexts::new(1, c_str!("aurora_g17_queue"), FENCE_KEY)?;
         let allocation_failure = super::fence::allocation_failure(&fences)?;
         Ok(Self {
             fences,

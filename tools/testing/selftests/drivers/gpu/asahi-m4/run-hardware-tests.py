@@ -31,8 +31,8 @@ def main():
     node = args.render_node.resolve(strict=True)
     device = (Path('/sys/class/drm') / node.name / 'device').resolve(strict=True)
     owners = [p / 'driver' for p in [device, *device.parents] if (p / 'driver').is_symlink()]
-    if not any(p.resolve().name == 'asahi-g16' for p in owners):
-        parser.error('Selected render node is not owned by the Rust asahi-g16 platform driver')
+    if not any(p.resolve().name in ('aurora-g16', 'asahi-g16') for p in owners):
+        parser.error('Selected render node is not owned by the Rust G16 platform driver (aurora-g16)')
     output = (args.output or Path(tempfile.mkdtemp(prefix='asahi-m4-hardware-'))).resolve()
     output.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
