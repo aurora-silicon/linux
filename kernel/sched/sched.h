@@ -1285,6 +1285,16 @@ struct rq {
 	unsigned char		idle_balance;
 
 	unsigned long		misfit_task_load;
+	/*
+	 * Misfit rotation: the misfit task (compared, never dereferenced),
+	 * the jiffies when it became misfit here, and the task handed (with
+	 * a reference) to the work that swaps it with the task on a busy
+	 * higher-capacity CPU.
+	 */
+	struct task_struct	*misfit_task;
+	unsigned long		misfit_since;
+	struct task_struct	*misfit_rotate_p;
+	struct work_struct	misfit_rotate_work;
 
 	/* For active balancing */
 	int			active_balance;
@@ -2117,6 +2127,17 @@ static inline int sched_numa_find_closest(const struct cpumask *cpus, int cpu)
 
 #endif /* !CONFIG_NUMA */
 
+#ifdef CONFIG_SMP
+extern int migrate_swap(struct task_struct *p, struct task_struct *t,
+			int cpu, int scpu);
+#else
+static inline int migrate_swap(struct task_struct *p, struct task_struct *t,
+			       int cpu, int scpu)
+{
+	return -EINVAL;
+}
+#endif
+
 #ifdef CONFIG_NUMA_BALANCING
 
 /* The regions in numa_faults array from task_struct */
@@ -2129,8 +2150,6 @@ enum numa_faults_stats {
 
 extern void sched_setnuma(struct task_struct *p, int node);
 extern int migrate_task_to(struct task_struct *p, int cpu);
-extern int migrate_swap(struct task_struct *p, struct task_struct *t,
-			int cpu, int scpu);
 extern void init_numa_balancing(u64 clone_flags, struct task_struct *p);
 
 #else /* !CONFIG_NUMA_BALANCING: */
