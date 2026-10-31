@@ -19,7 +19,8 @@ typedef uint16_t u16;
 typedef uint64_t __le64;
 #define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 #define READ_ONCE(x) (x)
-#define static_assert _Static_assert
+#undef static_assert
+#define static_assert(expr, ...) _Static_assert(expr, #expr)
 #define GFP_KERNEL 0
 static void free_buffer(void *p) {free(*(void **)p);}
 #define __free(x) __attribute__((cleanup(free_buffer)))
