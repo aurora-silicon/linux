@@ -3,7 +3,8 @@ H.264 frame operations (integration draft)
 
 The descriptor exports ``avd_h264_frame_ops`` alongside the legacy callbacks so
 this codec branch builds on aurora-wip while the queue core is developed. The
-legacy entry points must be removed when integrating the frame queue. Neither
+legacy entry points and the weak open-backend compatibility predicate must be
+removed when integrating the frame queue. Neither
 prepare nor retire operates hardware or removes mem2mem buffers. The queue owns
 request control setup/completion, source/destination lifetime and error retire.
 The core must call retire after prepare failures that acquired codec_priv.

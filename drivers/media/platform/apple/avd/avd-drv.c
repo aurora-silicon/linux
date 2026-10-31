@@ -138,6 +138,14 @@ static int avd_wait_submission_queue(struct avd_ctx *ctx, int vp)
 	return 0;
 }
 
+/* Standalone codec branches still have only the legacy open transport.
+ * The queue core supplies the strong backend implementation when integrated.
+ */
+bool __weak avd_backend_is_apple(const struct avd_dev *avd)
+{
+	return false;
+}
+
 int avd_init_job(struct avd_ctx *ctx, enum avd_codec codec, size_t segments)
 {
 	int ret = 0;

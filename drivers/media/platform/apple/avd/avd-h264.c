@@ -593,9 +593,10 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 	if (sl->slice_type == V4L2_H264_SLICE_TYPE_B) {
 		/* bidirectional reference of previous mv */
-		struct vb2_buffer *vb = vb2_find_buffer(
-			&ctx->fh.m2m_ctx->cap_q_ctx.q,
+		struct avd_decoded_buffer *ref = avd_get_ref_buf(
+			ctx, run->base.bufs.dst,
 			decode->dpb[sl->ref_pic_list1[0].index].reference_ts);
+		struct vb2_buffer *vb = &ref->base.vb.vb2_buf;
 
 		dma_addr_t mv_color_addr =
 			vb ? vb2_dma_contig_plane_dma_addr(vb, 0) +
@@ -903,7 +904,6 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		avd_run_postamble(ctx, &run.base);
 		return -EINVAL;
 	}
-
 
 	h264_ctx->slice_num++;
 	h264_ctx->monochrome = run.sps->chroma_format_idc == 0;

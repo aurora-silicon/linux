@@ -107,6 +107,13 @@ int main(void)
   }
 #endif
   fwrite(&words, sizeof(words), 1, stdout); fwrite(output, 4, words, stdout);
+#ifdef TEST_FRAME
+  r.fp_cursor.buf = NULL; r.error = 0; frame.prog_words = 0;
+  program.size = sizeof(u32); output[1] = 0xdeadbeef;
+  stream_hdr(&ctx, &r);
+  assert(r.error == -ENOSPC && frame.prog_words == 1);
+  assert(output[1] == 0xdeadbeef);
+#endif
 #ifndef TEST_FRAME
   free(picture->slices);
 #endif

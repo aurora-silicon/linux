@@ -29,6 +29,9 @@ int main(void)
  assert(!avd_h264_fp_emit(&cursor, AVD_H264_FP_SLC_CHROMA_WEIGHTS_0_, 0x2de08002));
  assert(get_unaligned_le32(p+0x770) == 0x2de04001);
  assert(get_unaligned_le32(p+0x774) == 0x2de08002);
+ assert(fp_word(&fp, fp.size-3, 0) == -ENOSPC);
+ for (int i = 2; i < 96; i++) assert(!avd_h264_fp_emit(&cursor, AVD_H264_FP_SLC_LUMA_WEIGHTS, i));
+ assert(avd_h264_fp_emit(&cursor, AVD_H264_FP_SLC_LUMA_WEIGHTS, 0) == -E2BIG);
  memset(p, 0, fp.size);
  p[0x18] = 1; p[0x19] = 1;
  put_unaligned_le32(0x7f, p+0x3d8);
