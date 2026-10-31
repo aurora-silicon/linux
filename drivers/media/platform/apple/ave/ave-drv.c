@@ -156,6 +156,16 @@ static int ave_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "cannot attach power domains\n");
 
+	/*
+	 * Domain attachment took active supplier references, but the driver
+	 * starts firmware only on first use and begins suspended. Reconcile that
+	 * state before enabling runtime PM, otherwise those references survive
+	 * until the first session has resumed and suspended the encoder.
+	 */
+	ret = pm_runtime_set_suspended(dev);
+	if (ret)
+		return ret;
+
 	pm_runtime_set_autosuspend_delay(dev, AVE_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(dev);
 	ret = devm_pm_runtime_enable(dev);
