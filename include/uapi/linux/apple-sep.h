@@ -88,7 +88,8 @@ struct sep_bio_enclave_list {
 #define SEP_BIO_GUIDANCE_REMOVE_FINGER 4
 
 /* Verify ended without a comparison because the initial contact was stale.
- * Additive to interfaces 4/5; old kernels never return this status. */
+ * Additive to interfaces 4/5; old kernels never return this status.
+ */
 #define SEP_BIO_STATUS_REMOVE_FINGER   8
 
 struct sep_bio_enrol_poll {
