@@ -19,6 +19,20 @@
 
 #include "avd.h"
 
+static bool avd_is_interchange(u32 fourcc)
+{
+	return fourcc == V4L2_PIX_FMT_APPLE_AX12 ||
+	       fourcc == V4L2_PIX_FMT_APPLE_AX16 ||
+	       fourcc == V4L2_PIX_FMT_APPLE_AX03 ||
+	       fourcc == V4L2_PIX_FMT_APPLE_AX23;
+}
+
+static bool avd_capture_fmt_supported(struct avd_ctx *ctx, u32 fourcc)
+{
+	/* The Apple frame-params output layout has not been implemented yet. */
+	return !avd_is_interchange(fourcc) || !avd_backend_is_apple(ctx->dev);
+}
+
 static bool avd_image_fmt_match(enum avd_image_fmt fmt1,
 				enum avd_image_fmt fmt2)
 {
@@ -46,6 +60,8 @@ static u32 avd_enum_decoded_fmt(struct avd_ctx *ctx, int index,
 		return 0;
 
 	for (i = 0; i < desc->num_decoded_fmts; i++) {
+		if (!avd_capture_fmt_supported(ctx, desc->decoded_fmts[i].fourcc))
+			continue;
 		if (!avd_image_fmt_match(desc->decoded_fmts[i].image_fmt,
 					 image_fmt))
 			continue;
@@ -64,7 +80,8 @@ static bool avd_is_valid_fmt(struct avd_ctx *ctx, u32 fourcc,
 	unsigned int i;
 
 	for (i = 0; i < desc->num_decoded_fmts; i++) {
-		if (avd_image_fmt_match(desc->decoded_fmts[i].image_fmt,
+		if (avd_capture_fmt_supported(ctx, fourcc) &&
+		    avd_image_fmt_match(desc->decoded_fmts[i].image_fmt,
 					image_fmt) &&
 		    desc->decoded_fmts[i].fourcc == fourcc)
 			return true;
@@ -73,17 +90,47 @@ static bool avd_is_valid_fmt(struct avd_ctx *ctx, u32 fourcc,
 	return false;
 }
 
+static void avd_capture_comp(struct avd_ctx *ctx,
+			     const struct v4l2_pix_format_mplane *pix_mp,
+			     struct avd_comp *comp)
+{
+	const struct avd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
+	unsigned int i;
+
+	memset(comp, 0, sizeof(*comp));
+	for (i = 0; i < desc->num_decoded_fmts; i++) {
+		if (desc->decoded_fmts[i].fourcc == pix_mp->pixelformat &&
+		    avd_image_fmt_match(desc->decoded_fmts[i].image_fmt,
+					ctx->image_fmt)) {
+			fill_comp(comp, desc->decoded_fmts[i].image_fmt,
+				  pix_mp->width, pix_mp->height);
+			break;
+		}
+	}
+	if (!avd_is_interchange(pix_mp->pixelformat)) {
+		struct v4l2_pix_format_mplane linear = *pix_mp;
+
+		v4l2_fill_pixfmt_mp(&linear, linear.pixelformat,
+				    linear.width, linear.height);
+		comp->start_offset = ALIGN(linear.plane_fmt[0].sizeimage, 128);
+	}
+}
+
 static void avd_fill_decoded_pixfmt(struct avd_ctx *ctx,
 				    struct v4l2_pix_format_mplane *pix_mp)
 {
+	struct avd_comp comp;
+
 	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat, pix_mp->width,
 			    pix_mp->height);
-
-	ctx->comp.start_offset = pix_mp->plane_fmt[0].sizeimage;
-	fill_comp(&ctx->comp, ctx->image_fmt, pix_mp->width, pix_mp->height);
-	pix_mp->plane_fmt[0].sizeimage += ctx->comp.size;
+	avd_capture_comp(ctx, pix_mp, &comp);
+	pix_mp->plane_fmt[0].sizeimage = comp.start_offset + comp.size;
+	if (avd_is_interchange(pix_mp->pixelformat))
+		pix_mp->plane_fmt[0].bytesperline = 0; /* opaque tiled storage */
 	if (ctx->coded_fmt_desc->ops->adjust_decoded_fmt)
 		ctx->coded_fmt_desc->ops->adjust_decoded_fmt(ctx, pix_mp);
+	pix_mp->plane_fmt[0].sizeimage = ALIGN(pix_mp->plane_fmt[0].sizeimage,
+					       AVD_ALIGN);
 }
 
 static void avd_reset_fmt(struct avd_ctx *ctx, struct v4l2_format *f,
@@ -109,6 +156,7 @@ void avd_reset_decoded_fmt(struct avd_ctx *ctx)
 	f->fmt.pix_mp.width = ctx->coded_fmt.fmt.pix_mp.width;
 	f->fmt.pix_mp.height = ctx->coded_fmt.fmt.pix_mp.height;
 	avd_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp);
+	avd_capture_comp(ctx, &f->fmt.pix_mp, &ctx->comp);
 }
 
 static int avd_try_ctrl(struct v4l2_ctrl *ctrl)
@@ -228,6 +276,22 @@ static const struct avd_decoded_fmt_desc avd_hevc_decoded_fmts[] = {
 		.fourcc = V4L2_PIX_FMT_P010,
 		.image_fmt = AVD_IMG_FMT_422_10BIT,
 	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX12,
+		.image_fmt = AVD_IMG_FMT_420_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX03,
+		.image_fmt = AVD_IMG_FMT_420_10BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX16,
+		.image_fmt = AVD_IMG_FMT_422_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX23,
+		.image_fmt = AVD_IMG_FMT_422_10BIT,
+	},
 };
 
 static const struct avd_ctrl_desc avd_h264_ctrl_descs[] = {
@@ -302,6 +366,22 @@ static const struct avd_decoded_fmt_desc avd_h264_decoded_fmts[] = {
 		.fourcc = V4L2_PIX_FMT_P010,
 		.image_fmt = AVD_IMG_FMT_422_10BIT,
 	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX12,
+		.image_fmt = AVD_IMG_FMT_420_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX03,
+		.image_fmt = AVD_IMG_FMT_420_10BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX16,
+		.image_fmt = AVD_IMG_FMT_422_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX23,
+		.image_fmt = AVD_IMG_FMT_422_10BIT,
+	},
 };
 
 static const struct avd_ctrl_desc avd_vp9_ctrl_descs[] = {
@@ -342,6 +422,22 @@ static const struct avd_decoded_fmt_desc avd_vp9_decoded_fmts[] = {
 		.fourcc = V4L2_PIX_FMT_P010,
 		.image_fmt = AVD_IMG_FMT_422_10BIT,
 	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX12,
+		.image_fmt = AVD_IMG_FMT_420_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX03,
+		.image_fmt = AVD_IMG_FMT_420_10BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX16,
+		.image_fmt = AVD_IMG_FMT_422_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX23,
+		.image_fmt = AVD_IMG_FMT_422_10BIT,
+	},
 };
 
 static const struct avd_decoded_fmt_desc avd_av1_decoded_fmts[] = {
@@ -360,6 +456,22 @@ static const struct avd_decoded_fmt_desc avd_av1_decoded_fmts[] = {
 	{
 		/* TODO: missing P210 */
 		.fourcc = V4L2_PIX_FMT_P010,
+		.image_fmt = AVD_IMG_FMT_422_10BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX12,
+		.image_fmt = AVD_IMG_FMT_420_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX03,
+		.image_fmt = AVD_IMG_FMT_420_10BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX16,
+		.image_fmt = AVD_IMG_FMT_422_8BIT,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_APPLE_AX23,
 		.image_fmt = AVD_IMG_FMT_422_10BIT,
 	},
 };
@@ -624,6 +736,7 @@ static int avd_s_capture_fmt(struct file *file, void *priv,
 		return ret;
 
 	ctx->decoded_fmt = *f;
+	avd_capture_comp(ctx, &f->fmt.pix_mp, &ctx->comp);
 	return 0;
 }
 
@@ -893,6 +1006,7 @@ static int avd_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct vb2_v4l2_buffer *vbuf;
 	int ret;
 
+	WRITE_ONCE(ctx->draining, false);
 	if (V4L2_TYPE_IS_CAPTURE(q->type))
 		return 0;
 
@@ -917,7 +1031,7 @@ err_return_buffers:
 	return ret;
 }
 
-static void avd_queue_cleanup(struct vb2_queue *vq, u32 state)
+static void avd_m2m_queue_cleanup(struct vb2_queue *vq, u32 state)
 {
 	struct avd_ctx *ctx = vb2_get_drv_priv(vq);
 
@@ -942,6 +1056,7 @@ static void avd_stop_streaming(struct vb2_queue *q)
 {
 	struct avd_ctx *ctx = vb2_get_drv_priv(q);
 
+	avd_queue_drain(ctx);
 	if (V4L2_TYPE_IS_OUTPUT(q->type)) {
 		const struct avd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
 
@@ -956,7 +1071,7 @@ static void avd_stop_streaming(struct vb2_queue *q)
 		ctx->job.segments = NULL;
 	}
 
-	avd_queue_cleanup(q, VB2_BUF_STATE_ERROR);
+	avd_m2m_queue_cleanup(q, VB2_BUF_STATE_ERROR);
 }
 
 const struct vb2_ops avd_queue_ops = {
@@ -970,36 +1085,17 @@ const struct vb2_ops avd_queue_ops = {
 	.stop_streaming = avd_stop_streaming,
 };
 
+/* Legacy multi-slice codecs finish held OUTPUT requests during prepare. */
 void avd_job_finish_no_pm(struct avd_ctx *ctx, enum vb2_buffer_state result)
 {
-	struct avd_dev *avd = ctx->dev;
-	unsigned long flags;
-
-	spin_lock_irqsave(&avd->job_lock, flags);
-	if (avd->job_ctx == ctx) {
-		avd->job_state = AVD_JOB_IDLE;
-		avd->job_ctx = NULL;
-		avd->job_pending = false;
-	}
-	spin_unlock_irqrestore(&avd->job_lock, flags);
-
-	if (ctx->coded_fmt_desc->ops->done) {
-		struct vb2_v4l2_buffer *src_buf, *dst_buf;
-
-		src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
-		dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
-		ctx->coded_fmt_desc->ops->done(ctx, src_buf, dst_buf, result);
-	}
-
-	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
-					 result);
+	if (WARN_ON(!ctx->dev->building))
+		return;
+	ctx->dev->compat_held = true;
+	ctx->dev->building->status = result == VB2_BUF_STATE_DONE ? 0 : -EIO;
 }
 
 void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result)
 {
-	struct avd_dev *avd = ctx->dev;
-
-	pm_runtime_put_autosuspend(avd->dev);
 	avd_job_finish_no_pm(ctx, result);
 }
 
@@ -1021,7 +1117,7 @@ void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run)
 			      ctx->decoded_fmt.fmt.pix_mp.height;
 
 	run->comp_out = run->y_out + ctx->comp.start_offset;
-	ctx->decomp = true;
+	ctx->decomp = !avd_is_interchange(ctx->decoded_fmt.fmt.pix_mp.pixelformat);
 
 	dst = vb2_to_avd_decoded_buf(&run->bufs.dst->vb2_buf);
 	memcpy(&dst->comp, &ctx->comp, sizeof(ctx->comp));
