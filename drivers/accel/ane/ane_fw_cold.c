@@ -605,8 +605,7 @@ static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *
 	return sysfs_emit(buf, "%s\n", names[READ_ONCE(b->stage)]);
 }
 
-static ssize_t firmware_stage_store(struct device *dev, struct device_attribute *attr,
-				    const char *buf, size_t count)
+static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t count)
 {
 	struct ane_fw_backend *b = ane_backend;
 	enum ane_fw_stage next;
@@ -664,6 +663,16 @@ static ssize_t firmware_stage_store(struct device *dev, struct device_attribute 
 		return ane_fw_quarantine(b, ret);
 	b->stage = next;
 	return count;
+}
+
+static ssize_t firmware_stage_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	unsigned int sleep_flags = lock_system_sleep();
+	ssize_t ret = ane_fw_stage_action(dev, buf, count);
+
+	unlock_system_sleep(sleep_flags);
+	return ret;
 }
 static DEVICE_ATTR_RW(firmware_stage);
 
