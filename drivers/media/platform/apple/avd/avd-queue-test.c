@@ -248,6 +248,21 @@ static void avd_pp_work_count(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f.cmd[1], 1U);
 	KUNIT_EXPECT_EQ(test, f.prog_words, (size_t)8);
 	KUNIT_EXPECT_PTR_EQ(test, ctx->job.segments, NULL);
+	/* A valid 256-tile frame must not truncate its PP work count to u8. */
+	prog.cpu = kunit_kcalloc(test, 1024, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, prog.cpu);
+	prog.size = 1024 * sizeof(u32);
+	ctx->job.codec = AVD_CODEC_VP9;
+	ctx->job.num = 256;
+	ctx->job.pp_execs = 256;
+	ctx->job.segments = kvcalloc(257, sizeof(*ctx->job.segments), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->job.segments);
+	for (i = 0; i < 257; i++)
+		ctx->job.segments[i].num = 1;
+	KUNIT_ASSERT_EQ(test, avd_open_build_program(ctx), 0);
+	KUNIT_EXPECT_EQ(test, f.cmd[1], 256U);
+	KUNIT_EXPECT_EQ(test, f.prog_words, (size_t)514);
+
 }
 
 static void avd_open_metadata_capability(struct kunit *test)
