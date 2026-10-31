@@ -254,3 +254,102 @@ reports, routing, duplicates, timeouts, capacity and UUID exhaustion. HWX
 tests generate synthetic linear/scratch forms with optional kernel data,
 then exercise command, geometry, tensor, aperture, symbol, relocation and
 digest refusal paths. No hardware inference result is implied.
+
+H13 timeout and engine recovery
+==============================
+
+The host task-manager path (``ane.ko``) gives each submission one second,
+including DART fault-drain retries. An expired submission returns
+``-ETIMEDOUT``; recovery never silently retries a program whose output may be
+partial. The task's GEM lookup references are released when the ioctl returns.
+
+Recovery holds the engine and PM-entry locks, drops the current consumer
+runtime-PM reference, synchronously suspends its power-domain suppliers, and
+checks both the PMGR ACTUAL fields and every attached genpd for power-off.
+The SET window omits the shared SYS_CPU parent, whose DART consumers can
+suspend asynchronously; it must also turn off before the consumer resumes.
+Recovery then restores the consumer
+reference, checks power-on before engine MMIO, and runs the probe task-manager
+enable sequence. BO handles and mappings remain valid for resubmission.
+The system-sleep force helpers are unsuitable here: a forced, in-use supplier
+can retain its active runtime status and keep its parent domains powered.
+
+A power-off acknowledgment is required before reinitializing the engine.
+Only after power-on and task-manager readiness are also verified does recovery
+release the exceptional module pin and reclaim preserved BOs. If any step
+fails, mappings, backing pages and the pin remain held; new submissions fail.
+This also covers a partially resumed engine whose retained queue state is
+uncertain. The ``reset`` sysfs write retries recovery. Module reload cannot
+recover a device while that pin is held. Direct PMGR SET writes and speculative
+writes to undocumented task-error registers are not part of this reset path.
+
+The ``ane-pm-recovery`` KUnit suite exercises the shared PM transaction against
+real runtime-PM device links, including repeated cycles, single-domain devices,
+consumer/supplier suspend errors, a missing power-off acknowledgment and a
+failed resume. It checks that every exit restores the caller's PM reference.
+The minimal config is
+``tools/testing/selftests/drivers/ane/pm.kunitconfig``.
+
+Destructive recovery selftest
+----------------------------
+
+``tools/testing/selftests/drivers/ane/recovery.py`` is an explicitly invoked
+hardware test, excluded from the default device-free selftests. It requires
+exclusive ownership of an M1-family ANE, Python 3, the packaged H13 add fixture,
+and a deliberately invalid convolution program. Run it through the hardware
+controller with a watchdog and kernel-log capture::
+
+  python3 recovery.py /usr/share/omarchy-ane/fixtures/h13-anec/add/program-0.anec hang.anec
+
+The test keeps both clients open, submits the invalid program three times,
+requires a bounded ``ETIMEDOUT`` and ``wedged=0`` each time, and runs twenty
+bit-exact add jobs on the surviving client's original fd and mappings after
+each reset. Every call changes its inputs and poisons the valid output lanes,
+so stale output cannot pass. Its oracle uses exact fp16 quarter values and checks the complete
+output, including padding. Closing both clients must return the module
+reference count to its initial value; the boot identity must remain unchanged.
+An operator should also verify three power-off acknowledgments in the kernel
+log and a normal module unload/reload after all clients close. A failed reset
+is a test failure, not permission to force unload the module.
+
+Generate ``hang.anec`` on a build host with ``make-hang-fixture.py`` and a clean
+checkout of the MIT-licensed public compiler at commit
+``ef2dbceefedff38ecce4f3dc593e148c5e7a6d54`` from
+https://github.com/aurora-silicon/mil-hwx-compiler/pull/2::
+
+  python3 make-hang-fixture.py /path/to/mil-hwx-compiler hang.anec --cxx clang++
+
+This first checks that the normal encoder refuses the shape. It bypasses only
+that refusal in a temporary translation unit to generate a deterministic
+stride-2 1x1 128-to-256 convolution at 56-to-28 spatial size, the refused family
+reported to hang the M1 Pro. The compiler checkout is unchanged. No Apple
+binary or private program capture is used. The generator writes a hash receipt;
+the hardware test must fail if this particular instance does not actually
+produce a timeout. The loader pins both fixture hashes and uses ABI 1 ioctls directly, so no
+shared libane library is needed. ``--check-fixtures`` validates the two containers without
+opening a device.
+
+H14 recovery lifecycle
+----------------------
+
+The firmware path (``ane_t6021.ko``) uses one bounded deadline for the command
+acknowledgment and its finish event. H14 engine reset is not enabled by this
+change. Reusing only the H13 task-manager re-arm would leave the firmware and
+its program cache invalid. The corresponding recovery implementation needs to:
+
+* Serialize firmware commands and stop the RX worker before releasing the
+  consumer's runtime-PM reference and synchronously suspending its suppliers.
+* Verify power-off for the CPU and engine partitions through their providers
+  before dropping boot pins or reclaiming firmware-visible allocations.
+* Retain metadata for every firmware-owned BO and boot allocation, including
+  objects whose last userspace reference disappeared. The current release
+  path discards some of this metadata while retaining the backing memory.
+* Restore the validated firmware image and run the existing fenced probe boot
+  sequence, including channel-table validation, host acknowledgment and
+  CONFIG_GET. A failed boot remains quarantined with its DMA backing held.
+* Invalidate the cached program/process IDs across the restart and prevent a
+  stale userspace ID from aliasing a newly allocated firmware ID. Clients must
+  reload their programs before resubmitting.
+
+Those ownership and identifier changes require their own H14 reset test.
+Quarantine must not be cleared solely because a power transition returned zero.
