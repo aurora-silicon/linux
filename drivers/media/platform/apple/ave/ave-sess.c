@@ -25,31 +25,31 @@
 #include "ave.h"
 #include "ave-regs.h"
 
-#define AVE_RC_VBR			4
-#define AVE_RC_CBR			2
+#define AVE_RC_VBR 4
+#define AVE_RC_CBR 2
 
 /* Filler-data NAL unit types */
-#define AVE_H264_NAL_FILLER		12
-#define AVE_HEVC_NAL_FILLER		38
+#define AVE_H264_NAL_FILLER 12
+#define AVE_HEVC_NAL_FILLER 38
 
-#define AVE_H264_BASELINE		2
-#define AVE_H264_MAIN			4
-#define AVE_H264_HIGH			6
-#define AVE_HEVC_MAIN			1
+#define AVE_H264_BASELINE 2
+#define AVE_H264_MAIN 4
+#define AVE_H264_HIGH 6
+#define AVE_HEVC_MAIN 1
 
-#define AVE_META_BYTES			0xc000
+#define AVE_META_BYTES 0xc000
 /* Metadata words: coded bytes (twice), HEVC slice-header bytes, parameter sets */
-#define AVE_META_PAYLOAD		0x120
-#define AVE_META_HEVC_SHDR		0x128
-#define AVE_META_PAYLOAD2		0x12c
-#define AVE_META_PARAMS			0xb2a4
-#define AVE_META_SCAN_FROM		0x200
-#define AVE_SHDR_BYTES			(256 * 0x400)
-#define AVE_SHDR_ENTRY_BYTES		0x400
-#define AVE_CODED_MIN			0x3c000
+#define AVE_META_PAYLOAD 0x120
+#define AVE_META_HEVC_SHDR 0x128
+#define AVE_META_PAYLOAD2 0x12c
+#define AVE_META_PARAMS 0xb2a4
+#define AVE_META_SCAN_FROM 0x200
+#define AVE_SHDR_BYTES (256 * 0x400)
+#define AVE_SHDR_ENTRY_BYTES 0x400
+#define AVE_CODED_MIN 0x3c000
 
 /* H.264 per-frame buffer (Process +0x58c8): unused in bit-rate modes */
-#define AVE_H264_FRAME_BUF		SZ_16K
+#define AVE_H264_FRAME_BUF SZ_16K
 
 /* Level limits: max frame size, max rate, max bit rate (kbit/s, Main). */
 struct ave_level {
@@ -60,20 +60,24 @@ struct ave_level {
 
 /* H.264 Table A-1, in V4L2 menu order (1, 1b, 1.1 ... 5.2); macroblocks. */
 static const struct ave_level ave_h264_levels[] = {
-	{ 99, 1485, 64 }, { 99, 1485, 128 }, { 396, 3000, 192 }, { 396, 6000, 384 },
-	{ 396, 11880, 768 }, { 396, 11880, 2000 }, { 792, 19800, 4000 },
-	{ 1620, 20250, 4000 }, { 1620, 40500, 10000 }, { 3600, 108000, 14000 },
-	{ 5120, 216000, 20000 }, { 8192, 245760, 20000 }, { 8192, 245760, 50000 },
-	{ 8704, 522240, 50000 }, { 22080, 589824, 135000 }, { 36864, 983040, 240000 },
+	{ 99, 1485, 64 },	    { 99, 1485, 128 },
+	{ 396, 3000, 192 },	    { 396, 6000, 384 },
+	{ 396, 11880, 768 },	    { 396, 11880, 2000 },
+	{ 792, 19800, 4000 },	    { 1620, 20250, 4000 },
+	{ 1620, 40500, 10000 },	    { 3600, 108000, 14000 },
+	{ 5120, 216000, 20000 },    { 8192, 245760, 20000 },
+	{ 8192, 245760, 50000 },    { 8704, 522240, 50000 },
+	{ 22080, 589824, 135000 },  { 36864, 983040, 240000 },
 	{ 36864, 2073600, 240000 },
 };
 
 /* HEVC Table A-8 (Main tier), in V4L2 menu order (1, 2, 2.1 ... 5.1); samples. */
 static const struct ave_level ave_hevc_levels[] = {
-	{ 36864, 552960, 128 }, { 122880, 3686400, 1500 }, { 245760, 7372800, 3000 },
-	{ 552960, 16588800, 6000 }, { 983040, 33177600, 10000 },
-	{ 2228224, 66846720, 12000 }, { 2228224, 133693440, 20000 },
-	{ 8912896, 267386880, 25000 }, { 8912896, 534773760, 40000 },
+	{ 36864, 552960, 128 },	       { 122880, 3686400, 1500 },
+	{ 245760, 7372800, 3000 },     { 552960, 16588800, 6000 },
+	{ 983040, 33177600, 10000 },   { 2228224, 66846720, 12000 },
+	{ 2228224, 133693440, 20000 }, { 8912896, 267386880, 25000 },
+	{ 8912896, 534773760, 40000 },
 };
 
 /*
@@ -204,8 +208,8 @@ struct ave_buf_req {
 	unsigned long attrs;
 };
 
-#define AVE_MAX_BUF_REQS	(1 + 6 * AVE_MAX_REFS + 6 + 2 * AVE_TILE_BUFS + 2 + \
-				 4 * AVE_MAX_SLOTS)
+#define AVE_MAX_BUF_REQS \
+	(1 + 6 * AVE_MAX_REFS + 6 + 2 * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
 {
@@ -544,35 +548,41 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
  * A frame reply: +0x10 the session's client token, +0x20 the slot's
  * subtype, +0x40 status. Caller holds hw_lock.
  */
-void ave_sess_reply(struct ave_dev *ave, const u8 *msg, u32 len)
+void ave_sess_reply(struct ave_dev *ave, const struct ave_reply *reply)
 {
-	u64 client = get_unaligned_le64(msg + AVE_REPLY_CLIENT);
-	u32 subtype = get_unaligned_le32(msg + AVE_REPLY_SUBTYPE);
+	u64 client = reply->client;
+	u32 subtype = reply->subtype;
 	u32 slot = subtype - ave->layout->process_subtype;
 	struct ave_session *sess = NULL;
 	struct ave_ctx *ctx = NULL;
 	struct ave_slot *s;
 
 	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
-		if (ave->sessions[i] && ave->sessions[i]->sess->client == client)
+		if (ave->sessions[i] &&
+		    ave->sessions[i]->sess->client == client)
 			ctx = ave->sessions[i];
 	if (ctx)
 		sess = ctx->sess;
-	if (!sess || len < AVE_REPLY_PROCESS_BYTES || slot >= sess->p.slots ||
-	    !sess->slot[slot].busy) {
-		dev_warn(ave->dev, "stray frame reply (client %llu subtype %#x len %u)\n",
-			 client, subtype, len);
+	if (!sess ||
+	    reply->bytes <
+		    (ave->layout->abi->transport->boot_config ? 0x50 : 0x48) ||
+	    slot >= sess->p.slots || !sess->slot[slot].busy) {
+		dev_warn(ave->dev,
+			 "stray frame reply (client %llu subtype %#x len %u)\n",
+			 client, subtype, reply->bytes);
 		return;
 	}
 	s = &sess->slot[slot];
 	sess->progress = jiffies;
-	s->status = get_unaligned_le32(msg + AVE_REPLY_STATUS);
+	s->status = reply->status;
 	if (s->status)
-		dev_dbg(ctx->ave->dev, "frame in slot %u: status %#x\n", slot, s->status);
+		dev_dbg(ctx->ave->dev, "frame in slot %u: status %#x\n", slot,
+			s->status);
 	s->busy = false;
 	s->done = true;
 	sess->busy--;
-	sess->done_fifo[(sess->done_head + sess->done_count) % AVE_MAX_SLOTS] = slot;
+	sess->done_fifo[(sess->done_head + sess->done_count) % AVE_MAX_SLOTS] =
+		slot;
 	sess->done_count++;
 	atomic_inc(&ctx->ready);
 }
@@ -691,7 +701,7 @@ static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *w
  * is not known; if the firmware's output never carries filler, the driver
  * adds it here.
  */
-#define AVE_FILLER_OVERHEAD	7	/* start code, NAL header, trailing bits */
+#define AVE_FILLER_OVERHEAD 7 /* start code, NAL header, trailing bits */
 
 static size_t ave_sess_cbr_fill(struct ave_ctx *ctx, u8 *out, size_t len, size_t room,
 				bool fw_filler)
@@ -828,7 +838,7 @@ bool ave_sess_stalled(struct ave_session *sess)
  * input came for a while, a Complete makes the firmware code what it holds,
  * as macOS does after the first frame.
  */
-#define AVE_STARVE_MS		50
+#define AVE_STARVE_MS 50
 
 bool ave_sess_starved(struct ave_session *sess)
 {

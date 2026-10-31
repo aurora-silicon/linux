@@ -79,6 +79,8 @@ struct ave_dev {
 	bool inject_wedge, data_dirty;
 	void *wq, *m2m_dev, *coproc, *mbox;
 	const struct ave_variant *variant;
+	const struct ave_fw_layout *layout;
+	u32 data_crc;
 	struct ave_fw_segment text, data;
 	void *data_pristine;
 	struct ave_ring ring[2];
@@ -284,3 +286,16 @@ void ave_sess_reap(struct ave_dev *ave);
 static void ave_reset_drain(struct ave_ctx *ctx);
 int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		 bool (*cond)(struct ave_dev *, void *), void *arg);
+
+/* ABI-selected helpers are unreachable in the 9003 recovery fixtures. */
+#define readl_poll_timeout(addr, value, condition, delay, timeout) \
+ ((value) = readl(addr), (condition) ? 0 : -ETIMEDOUT)
+static int ave_fw_crc(const struct ave_fw_segment *segment, u32 *crc, void *copy)
+{
+ assert(!"6070 CRC readback reached a 9003 recovery fixture");
+ return -EIO;
+}
+static void ave_fw_release_boot(struct ave_dev *ave)
+{
+ assert(!"6070 boot teardown reached a 9003 recovery fixture");
+}

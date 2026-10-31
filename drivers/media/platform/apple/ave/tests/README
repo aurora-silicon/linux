@@ -5,7 +5,8 @@ Run python3 run.py with a C compiler providing ASan and UBSan (CC may name
 its executable). No encoder, firmware or captured command image is needed.
 
 run.py reads the real AVE structs and compiles the unmodified bodies of
-ave-image.c, ave-layout.c and ave-cmd.c, plus the real buffer-allocation,
+ave-image.c, ave-layout.c, ave-abi.c, ave-writer.c and ave-cmd.c, plus the real
+buffer-allocation,
 free, reply and firmware-build-gate functions. Only includes and unused
 kernel-facing declarations are omitted. shim.h supplies host primitives;
 boundary.h replaces IPC, DMA and logging. This does not validate the kernel
@@ -27,6 +28,10 @@ The host shim intentionally uses stdint types, Linux's private ENOTSUPP
 value and side-effect-free calls to kernel-like arithmetic macros. Those
 produce checkpatch PREFER_KERNEL_TYPES, ENOTSUPP and MACRO_ARG_REUSE notices.
 MAINTAINERS already covers the entire AVE directory (FILE_PATH_CHANGES).
+
+The ABI refactor also has in-kernel arm64 KUnit tests selected by
+VIDEO_APPLE_AVE_CMD_KUNIT_TEST. The host runner understands both the older
+single-builder sources and the per-ABI writer split for baseline comparison.
 
 Recovery and PM checks
 ----------------------

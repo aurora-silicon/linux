@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 static const struct ave_coproc_regs regs = { .ctrl = 0, .boot_arg = 4, .vcbar = 8 };
-static const struct ave_variant variant = { .regs = &regs };
+static const struct ave_variant variant = {
+ .regs = &regs, .vcbar_mask = ~0ULL, .vcbar_flags = AVE_COPROC_VCBAR_VALID,
+};
+static const struct ave_fw_transport test_transport = { .boot_config = true };
+static const struct ave_fw_abi test_abi = { .transport = &test_transport };
+static const struct ave_fw_layout test_layout = { .abi = &test_abi };
 static u64 coproc[4];
 static u32 mailbox[16];
 static struct ave_dev ave;
@@ -22,6 +27,7 @@ static void init(void)
 	ave.dev = &dev;
 	dev.drvdata = &ave;
 	ave.variant = &variant;
+	ave.layout = &test_layout;
 	ave.coproc = coproc;
 	ave.mbox = mailbox;
 	ave.text.iova = 0x100000000;
@@ -210,8 +216,27 @@ static void restore_data(void)
 	assert(!ave_fw_restore_data(&ave));
 }
 
+static void strict_6070_recovery(void)
+{
+ static const struct ave_fw_transport transport = { .scratch_halt = true };
+ static const struct ave_fw_abi abi = { .transport = &transport };
+ static const struct ave_fw_layout layout = { .abi = &abi };
+
+ init();
+ ave.layout = &layout;
+ ave.fw_state = AVE_FW_BROKEN;
+ *(u32 *)(ave.coproc + regs.ctrl) = AVE_COPROC_CTRL_RUN;
+ assert(ave_runtime_suspend(&dev) == -EBUSY);
+ assert(ave.fw_state == AVE_FW_BROKEN && !halts && !ave.recovery_count);
+ assert(readl(ave.coproc + regs.ctrl) == AVE_COPROC_CTRL_RUN);
+ ave.fw_state = AVE_FW_RECOVERING;
+ assert(ave_runtime_suspend(&dev) == -EBUSY);
+ assert(readl(ave.coproc + regs.ctrl) == AVE_COPROC_CTRL_RUN);
+}
+
 int main(void)
 {
+	strict_6070_recovery();
 	buffer_failure();
 	sleep_guarantees();
 	recovery_failures();

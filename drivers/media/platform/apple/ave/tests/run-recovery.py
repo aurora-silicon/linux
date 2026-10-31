@@ -25,9 +25,12 @@ def main():
     for name in ('ave_codec', 'ave_buf', 'ave_fw_segment', 'ave_ring', 'ave_fw_state',
                  'ave_coproc_regs', 'ave_variant', 'ave_params', 'ave_slot', 'ave_session'):
         code += declaration(header, name)
+    code += declaration(header, 'ave_image')
+    code += declaration(header, 'ave_opcode')
+    code += source((src / 'ave-layout.h').read_text())
     code += (here / 'recovery-boundary.h').read_text()
     groups = {
-        'ave-fw.c': ('ave_fw_mark_broken', 'ave_fw_halt', 'ave_fw_shutdown',
+        'ave-fw.c': ('ave_fw_vcbar', 'ave_fw_lost', 'ave_fw_mark_broken', 'ave_fw_halt', 'ave_fw_shutdown',
                      'ave_fw_runtime_suspend', 'ave_fw_prepare_restart', 'ave_fw_restore_data'),
         'ave-sess.c': ('ave_sess_destroy', 'ave_sess_reap'),
         'ave-v4l2.c': ('ave_return_bufs', 'ave_buf_queue', 'ave_session_index',
@@ -35,7 +38,7 @@ def main():
                        'ave_session_end', 'ave_stop_streaming',
                        'ave_reset_drain', 'ave_job_ready', 'ave_job_fail', 'ave_poll_work'),
         'ave-ipc.c': ('ave_ipc_pump',),
-        'ave-drv.c': ('ave_runtime_suspend', 'ave_suspend', 'ave_resume', 'ave_inject_wedge'),
+        'ave-drv.c': ('ave_runtime_resume', 'ave_runtime_suspend', 'ave_suspend', 'ave_resume', 'ave_inject_wedge'),
     }
     code += '#define AVE_POLL_FAST_ROUNDS 20\n#define AVE_POLL_MS 2\n'
     for filename, names in groups.items():

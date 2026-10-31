@@ -3,6 +3,7 @@
 struct ave_dev {
 	struct ave_ctx *sessions[AVE_MAX_SESSIONS];
 	u32 next_client, text_crc, data_crc;
+	dma_addr_t extra0_dma;
 	const struct ave_fw_layout *layout;
 	const struct ave_variant *variant;
 	enum ave_fw_state fw_state;
@@ -60,8 +61,13 @@ static int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len,
 	assert(len == wire_len);
 	for (unsigned int i = 0; i < 32; i++)
 		assert(wire[len + i] == 0xa5);
+#ifdef TEST_PER_ABI
+	put_unaligned_le64(timeout, wire + ave->layout->abi->timeout_offset);
+	put_unaligned_le64(1234567, wire + ave->layout->abi->created_offset);
+#else
 	put_unaligned_le64(timeout, wire + AVE_CMD_TIMEOUT);
 	put_unaligned_le64(1234567, wire + AVE_CMD_CREATED);
+#endif
 	submissions++;
 	return 0;
 }

@@ -65,9 +65,9 @@ static void facts(void)
 	assert(!ave_layout_for_crc(0xffffffff));
 	assert(!ave_layout_for_crc(0x2ce7359e));
 	assert(ave_layout_for_crc(0x69c54454) == &ave_layout_9003_78_0);
-	assert(ave_fw_check_build(&dev) == -ENOTSUPP);
+	assert(ave_fw_check_build(&dev) == -EOPNOTSUPP);
 	dev.text_crc = 0x69c54454;
-	assert(ave_fw_check_build(&dev) == -ENOTSUPP);
+	assert(ave_fw_check_build(&dev) == -EOPNOTSUPP);
 	dev.layout = ave_layout_for_crc(dev.text_crc);
 	assert(ave_fw_check_build(&dev) == 0);
 	struct ave_variant probe_only = test_variant;
@@ -75,7 +75,7 @@ static void facts(void)
 	probe_only.boot_qualified = false;
 	probe_only.regs = NULL;
 	dev.variant = &probe_only;
-	assert(ave_fw_check_build(&dev) == -ENOTSUPP);
+	assert(ave_fw_check_build(&dev) == -EOPNOTSUPP);
 	dev.variant = &test_variant;
 	dev.layout = &ave_layout_26a428;
 
@@ -148,7 +148,12 @@ static void facts(void)
 		dev.sessions[0] = &ctx;
 		put_unaligned_le64(session.client, reply + 0x10);
 		put_unaligned_le32(0x17, reply + 0x20);
-		ave_sess_reply(&dev, reply, sizeof(reply));
+		struct ave_reply decoded;
+
+		assert(dev.layout->abi->parse_reply(dev.layout->abi, reply,
+						    sizeof(reply),
+						    &decoded) == 0);
+		ave_sess_reply(&dev, &decoded);
 		assert(!session.slot[4].busy && session.slot[4].done);
 		assert(ctx.ready == (int)codec);
 		dev.sessions[0] = NULL;
@@ -236,7 +241,7 @@ int main(int argc, char **argv)
 {
 	struct ave_dev dev = {
 		.variant = &test_variant,
-#ifndef TEST_BASELINE
+#ifdef TEST_LAYOUT
 		.layout = &ave_layout_9003_78_0,
 #endif
 	};
@@ -326,8 +331,10 @@ int main(int argc, char **argv)
 			session.p.coded_cap = session.p.coded_cap * 5 / 4;
 		if (session.p.rc_mode == 3) {
 			session.p.max_qp = 48;
-			session.p.coded_cap = session.p.initial_qp == 40 ? 0x3a4000 :
-					     session.p.initial_qp == 28 ? 0x458000 : 0x5fc000;
+			session.p.coded_cap =
+				session.p.initial_qp == 40 ? 0x3a4000 :
+				session.p.initial_qp == 28 ? 0x458000 :
+							     0x5fc000;
 		}
 #endif
 		start(&ctx);
