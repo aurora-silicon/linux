@@ -54,6 +54,7 @@ ASAHI_TESTS = {
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
     'ave-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-ref', '4db3a5a22c43'], PASS)],
+    'ave-probe-pm-tests.py': [(out(), PASS), (out() + ['--negative-control'], PASS)],
     'binding-lifetime-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-close', 'no-join'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
