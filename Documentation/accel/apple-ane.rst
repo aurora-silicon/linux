@@ -228,7 +228,8 @@ controller with a watchdog and kernel-log capture::
 The test keeps both clients open, submits the invalid program three times,
 requires a bounded ``ETIMEDOUT`` and ``wedged=0`` each time, and runs twenty
 bit-exact add jobs on the surviving client's original fd and mappings after
-each reset. Its oracle uses exact fp16 quarter values and checks the complete
+each reset. Every call changes its inputs and poisons the valid output lanes,
+so stale output cannot pass. Its oracle uses exact fp16 quarter values and checks the complete
 output, including padding. Closing both clients must return the module
 reference count to its initial value; the boot identity must remain unchanged.
 An operator should also verify three power-off acknowledgments in the kernel

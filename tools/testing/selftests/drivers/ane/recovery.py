@@ -155,15 +155,25 @@ def main():
     try:
         good = Program(good_fixture, args.device)
         bad = Program(bad_fixture, args.device)
-        inputs = [[(3 + (i * multiplier) % 11) / 4 for i in range(64)] for multiplier in (1, 3)]
-        expected = surface([a + b for a, b in zip(*inputs)])
-        for channel, values in zip((5, 6), inputs):
-            good.buffers[channel][1][:] = surface(values)
         bad.buffers[5][1][:] = b"\x00\x3c" * (len(bad.buffers[5][1]) // 2)
+        calls = 0
         def check_good():
+            nonlocal calls
+            inputs = [[(3 + (i * multiplier + calls) % 11) / 4 for i in range(64)]
+                      for multiplier in (1, 3)]
+            expected = surface([a + b for a, b in zip(*inputs)])
+            for channel, values in zip((5, 6), inputs):
+                good.buffers[channel][1][:] = surface(values)
+            # Only the first fp16 of each plane is a logical output. Poison
+            # those lanes and zero padding so stale success cannot pass.
+            output = good.buffers[4][1]
+            output[:] = bytes(TILE)
+            for lane in range(64):
+                struct.pack_into("<H", output, lane * 64, 0x7e00)
             good.execute()
-            if good.buffers[4][1][:] != expected:
+            if output[:] != expected:
                 raise RuntimeError("good output differs from independent fp16 add oracle")
+            calls += 1
         check_good()
         for iteration in range(3):
             start = time.monotonic()
