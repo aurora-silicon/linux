@@ -4,6 +4,7 @@
 
 #include "ane_h16_hwx.h"
 #include "ane_h16_tasks.h"
+#include "ane_h16_load.h"
 
 struct hwx_fixture {
 	u8 *bytes;
@@ -194,6 +195,7 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 		put_unaligned_le32(0x07000000 | (mixed ? 6 : 5), f->bytes + f->reloc + 4);
 		put_unaligned_le32(32, f->bytes + SZ_16K + 56);
 	}
+	put_unaligned_le32(1, f->bytes + SZ_16K);
 	put_unaligned_le32(11 << 16, f->bytes + SZ_16K + 16);
 	put_unaligned_le32(0x4100 / 4, f->bytes + SZ_16K + 52);
 	put_unaligned_le32(0xbeefface, f->bytes);
@@ -405,6 +407,185 @@ static void hwx_snapshot_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, snapshot.bytes, NULL);
 }
 
+static void hwx_snapshot_free(void *snapshot)
+{
+	ane_h16_hwx_snapshot_destroy(snapshot);
+}
+
+static struct ane_h16_hwx_snapshot *fixture_snapshot(struct kunit *test,
+						     struct hwx_fixture *f)
+{
+	struct ane_h16_hwx_snapshot *snapshot;
+
+	if (!f)
+		return NULL;
+	snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot || ane_h16_hwx_snapshot_create(f->bytes, f->size, snapshot))
+		return NULL;
+	if (kunit_add_action_or_reset(test, hwx_snapshot_free, snapshot))
+		return NULL;
+	return snapshot;
+}
+
+static void hwx_load_plan_test(struct kunit *test)
+{
+	unsigned int mixed, kernel;
+
+	for (mixed = 0; mixed < 2; mixed++) {
+		for (kernel = 0; kernel < 2; kernel++) {
+			struct hwx_fixture *f = fixture_create(test, mixed, kernel);
+			struct ane_h16_hwx_snapshot *snapshot = fixture_snapshot(test, f);
+			struct ane_h16_load_plan plan;
+			unsigned int text = 2 + mixed;
+
+			KUNIT_ASSERT_NOT_NULL(test, snapshot);
+			KUNIT_ASSERT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), 0);
+			KUNIT_EXPECT_EQ(test, plan.count, 3 + mixed + kernel);
+			KUNIT_EXPECT_EQ(test, plan.total, (u64)(4 + mixed + kernel) * SZ_16K);
+			KUNIT_EXPECT_EQ(test, plan.regions[text].kind, ANE_H16_REGION_TEXT);
+			KUNIT_EXPECT_EQ(test, plan.regions[text].permissions, 5);
+			KUNIT_EXPECT_EQ(test, plan.regions[text].file_offset, (u64)SZ_16K);
+			KUNIT_EXPECT_EQ(test, plan.regions[text].file_size, (u64)SZ_32K);
+			/* One TEXT allocation includes task and constant sections. */
+			KUNIT_EXPECT_EQ(test, plan.allocation[text], (u64)SZ_32K);
+			if (mixed) {
+				KUNIT_EXPECT_EQ(test, plan.regions[0].kind, ANE_H16_REGION_SCRATCH);
+				KUNIT_EXPECT_EQ(test, plan.regions[0].file_size, 0);
+				KUNIT_EXPECT_EQ(test, plan.regions[0].permissions, 3);
+			}
+		}
+	}
+}
+
+static void hwx_load_original_test(struct kunit *test)
+{
+	struct hwx_fixture *f = fixture_create(test, false, false);
+	struct ane_h16_hwx_snapshot *snapshot = fixture_snapshot(test, f);
+	struct ane_h16_load_plan plan;
+
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	/* Cached metadata cannot replace the original authenticated container. */
+	memset(&snapshot->info, 0xff, sizeof(snapshot->info));
+	KUNIT_ASSERT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), 0);
+	KUNIT_EXPECT_EQ(test, plan.count, 3);
+	((u8 *)snapshot->bytes)[f->program] ^= 1;
+	plan.count = 0x1234;
+	KUNIT_EXPECT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, plan.count, 0x1234);
+}
+
+static void fixture_mappings(const struct ane_h16_load_plan *plan,
+			     struct ane_h16_load_mapping *mappings)
+{
+	unsigned int i;
+
+	for (i = 0; i < plan->count; i++) {
+		mappings[i].dva = 0x20000000000ULL + (u64)i * SZ_1M;
+		mappings[i].size = plan->allocation[i];
+		mappings[i].permissions = plan->regions[i].permissions;
+	}
+}
+
+static void hwx_load_resources_test(struct kunit *test)
+{
+	struct hwx_fixture *f = fixture_create(test, true, true);
+	struct ane_h16_hwx_snapshot *snapshot = fixture_snapshot(test, f);
+	struct ane_h16_load_mapping mappings[ANE_H16_REGIONS] = {};
+	struct ane_h16_process_binding bindings[2];
+	struct ane_h16_resource resources[2] = {};
+	struct ane_h16_load_plan plan;
+	unsigned int i;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), 0);
+	fixture_mappings(&plan, mappings);
+	for (i = 0; i < 2; i++) {
+		bindings[i].hwx_vm = snapshot->info.surfaces[i].section.vm;
+		bindings[i].index = 123 + 11 * i;
+		bindings[i].class = i;
+	}
+	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
+					    bindings, 2, resources);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, resources[0].buffer.mapping_dva, mappings[1].dva);
+	KUNIT_EXPECT_EQ(test, resources[1].buffer.index, 134);
+	KUNIT_EXPECT_EQ(test, resources[1].permissions, 2);
+	for (i = 0; i < 7; i++) {
+		struct ane_h16_load_mapping saved = mappings[1];
+
+		switch (i) {
+		case 0:
+			mappings[1].dva++;
+			break;
+		case 1:
+			mappings[1].size++;
+			break;
+		case 2:
+			mappings[1].permissions = 3;
+			break;
+		case 3:
+			mappings[1].dva = mappings[3].dva;
+			break;
+		case 4:
+			mappings[1].dva = 0x10000000000ULL;
+			break;
+		case 5:
+			mappings[1].dva = U64_MAX - SZ_16K + 1;
+			break;
+		case 6:
+			mappings[1].dva = 0;
+			break;
+		}
+		resources[0].buffer.index = 0x1234;
+		ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
+						    bindings, 2, resources);
+		KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+		KUNIT_EXPECT_EQ(test, resources[0].buffer.index, 0x1234);
+		mappings[1] = saved;
+	}
+	bindings[1].index = bindings[0].index;
+	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
+					    bindings, 2, resources);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	bindings[1].index++;
+	bindings[1].class = 8;
+	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
+					    bindings, 2, resources);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	bindings[1].class = 1;
+	bindings[1].hwx_vm += SZ_16K;
+	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
+					    bindings, 2, resources);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count - 1,
+					    bindings, 2, resources);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	ret = ane_h16_load_resources_create(snapshot, mappings, plan.count,
+					    bindings, 1, resources);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+}
+
+static void hwx_import_bounds_test(struct kunit *test)
+{
+	const void __user *invalid = (const void __user *)1UL;
+	struct ane_h16_hwx_snapshot snapshot = {};
+	struct hwx_fixture *f = fixture_create(test, false, false);
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ret = ane_h16_hwx_snapshot_from_user(invalid, U64_MAX, &snapshot);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 31, &snapshot), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 32, &snapshot), -EFAULT);
+	KUNIT_EXPECT_PTR_EQ(test, snapshot.bytes, NULL);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, &snapshot), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_create(f->bytes, f->size, &snapshot), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_from_user(invalid, 32, &snapshot), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_snapshot_check(&snapshot), 0);
+	ane_h16_hwx_snapshot_destroy(&snapshot);
+}
+
 static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_forms_test),
 	KUNIT_CASE(hwx_header_test),
@@ -415,6 +596,10 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_symbols_test),
 	KUNIT_CASE(hwx_relocations_test),
 	KUNIT_CASE(hwx_snapshot_test),
+	KUNIT_CASE(hwx_load_plan_test),
+	KUNIT_CASE(hwx_load_original_test),
+	KUNIT_CASE(hwx_load_resources_test),
+	KUNIT_CASE(hwx_import_bounds_test),
 	{}
 };
 

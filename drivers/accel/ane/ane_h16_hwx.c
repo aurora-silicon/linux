@@ -3,6 +3,7 @@
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/vmalloc.h>
+#include <linux/uaccess.h>
 
 #include "ane_h16_hwx.h"
 #include "ane_h16_tasks.h"
@@ -191,6 +192,17 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 		*dest = section;
 		p->sections[p->section_count++] = section;
 	}
+	if (p->info.region_count == ANE_H16_REGIONS)
+		return -ENOEXEC;
+	p->info.regions[p->info.region_count++] = (struct ane_h16_hwx_region) {
+		.vm = vm,
+		.size = size,
+		.file_offset = file,
+		.file_size = filesz,
+		.permissions = prot,
+		.kind = surface ? ANE_H16_REGION_SURFACE : text ? ANE_H16_REGION_TEXT :
+			kernel ? ANE_H16_REGION_KERNEL : ANE_H16_REGION_SCRATCH,
+	};
 	return 0;
 }
 
@@ -572,29 +584,60 @@ out:
 }
 EXPORT_SYMBOL_GPL(ane_h16_hwx_validate);
 
+static int hwx_snapshot_finish(struct ane_h16_hwx_snapshot *copy,
+			       struct ane_h16_hwx_snapshot *snapshot)
+{
+	int ret;
+
+	ret = ane_h16_hwx_validate(copy->bytes, copy->size, &copy->info);
+	if (ret) {
+		kvfree(copy->bytes);
+		return ret;
+	}
+	sha256(copy->bytes, copy->size, copy->digest);
+	*snapshot = *copy;
+	return 0;
+}
+
 int ane_h16_hwx_snapshot_create(const void *bytes, size_t size,
 				struct ane_h16_hwx_snapshot *snapshot)
 {
 	struct ane_h16_hwx_snapshot copy = {};
-	int ret;
 
 	if (!bytes || !snapshot || size < 32 || size > ANE_H16_HWX_MAX)
 		return -EINVAL;
+	if (snapshot->bytes)
+		return -EBUSY;
 	copy.bytes = kvmalloc(size, GFP_KERNEL);
 	if (!copy.bytes)
 		return -ENOMEM;
 	memcpy(copy.bytes, bytes, size);
 	copy.size = size;
-	ret = ane_h16_hwx_validate(copy.bytes, size, &copy.info);
-	if (ret) {
-		kvfree(copy.bytes);
-		return ret;
-	}
-	sha256(copy.bytes, size, copy.digest);
-	*snapshot = copy;
-	return 0;
+	return hwx_snapshot_finish(&copy, snapshot);
 }
 EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_create);
+
+/* Import exactly once before parsing or hashing. No userspace digest,
+ * section list or resource IDs can substitute for this original container.
+ * Callers supply an empty destination and retain it until all firmware
+ * references end; importing alone grants no process or execution authority.
+ */
+int ane_h16_hwx_snapshot_from_user(const void __user *bytes, u64 size,
+				   struct ane_h16_hwx_snapshot *snapshot)
+{
+	struct ane_h16_hwx_snapshot copy = {};
+
+	if (!bytes || !snapshot || size < 32 || size > ANE_H16_HWX_MAX)
+		return -EINVAL;
+	if (snapshot->bytes)
+		return -EBUSY;
+	copy.bytes = vmemdup_user(bytes, size);
+	if (IS_ERR(copy.bytes))
+		return PTR_ERR(copy.bytes);
+	copy.size = size;
+	return hwx_snapshot_finish(&copy, snapshot);
+}
+EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_from_user);
 
 int ane_h16_hwx_snapshot_check(const struct ane_h16_hwx_snapshot *snapshot)
 {
