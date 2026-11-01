@@ -11,7 +11,7 @@
 
 struct device_node;
 struct platform_device;
-struct ane_h16_build;
+struct ane_h16_profile;
 
 enum ane_fw_owner {
 	ANE_FW_OWNER_AP,
@@ -25,7 +25,8 @@ enum ane_fw_irq_role {
 
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
-	const struct ane_h16_build *h16_boot;
+	const struct ane_h16_profile *h16_profiles;
+	unsigned int h16_profile_count;
 	u32 soc;
 	u16 chip_family;
 	u16 ane_type;

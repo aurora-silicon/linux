@@ -44,7 +44,6 @@ struct ane_h16_tunables {
 
 /* Selected only after the immutable resident firmware identity passes. */
 struct ane_h16_build {
-	const char *identity;
 	u32 cpu_control;
 	u32 rvbar;
 	u32 ce;
@@ -87,6 +86,19 @@ struct ane_h16_build {
 		u16 id;
 		u16 size;
 	} startup[4];
+};
+
+/*
+ * One supported firmware build: how to recognize its iBoot preload and the
+ * values to boot it with. Builds that differ only in their preload share one
+ * ane_h16_build. The platform lists every profile; the first whose preload
+ * rule matches the live preload is used.
+ */
+struct ane_h16_preload_rule;
+struct ane_h16_profile {
+	const char *identity;
+	const struct ane_h16_preload_rule *preload;
+	const struct ane_h16_build *build;
 };
 
 struct ane_h16_boot;

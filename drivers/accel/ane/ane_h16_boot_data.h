@@ -3,6 +3,7 @@
 #define __ANE_H16_BOOT_DATA_H__
 
 #include "ane_h16_boot.h"
+#include "ane_h16_preload.h"
 
 /* H16 27.0 (26A428), r5 sections 1.2-1.4. Ordered masked updates. */
 static const struct ane_h16_tunable ane_h16_axi[] = {
@@ -128,7 +129,6 @@ static const struct ane_h16_tunables ane_h16_tunables_26a428[] = {
 };
 
 static const struct ane_h16_build ane_h16_build_26a428 = {
-	.identity = "H16 27.0 26A428",
 	.cpu_control = 0x1600044,
 	.rvbar = 0x1050000,
 	.ce = 0x18a4000,
@@ -170,6 +170,78 @@ static const struct ane_h16_build ane_h16_build_26a428 = {
 	.tunables = ane_h16_tunables_26a428,
 	.tunable_count = ARRAY_SIZE(ane_h16_tunables_26a428),
 	.startup = { { 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 } },
+};
+
+/*
+ * 27.0 (26A428) preload: ordered aether patchbay records in DATA (whose
+ * firmware VM base is 0xc0000) and the range the bootloader rewrites.
+ * Offsets are DATA-relative. Only the mutable value bytes normalize.
+ */
+static const struct ane_h16_preload_cell ane_h16_patchbay_26a428[] = {
+	{ "BECA", 0x5a20, 8, true },
+	{ "SECA", 0x5a30, 8, false },
+	{ "GKTS", 0x5a40, 8, true },
+	{ "otcd", 0x5a50, 8, false },
+	{ "oscd", 0x5a60, 8, false },
+	{ "oecd", 0x5a70, 8, false },
+	{ "DILS", 0x5a80, 8, true },
+	{ "SRSA", 0x5a90, 8, false },
+	{ "GFCM", 0x5aa0, 8, false },
+	{ "SSSC", 0x5ab0, 8, true },
+	{ "qF8v", 0x5ac0, 4, true },
+	{ "LRSD", 0x5acc, 1, false },
+	{ "SVSD", 0x5ad5, 8, false },
+	{ "LCSD", 0x5ae5, 8, false },
+	{ "ZSTR", 0x5af5, 4, false },
+	{ "BPTP", 0x5b01, 8, false },
+	{ "TNGI", 0x5b11, 1, false },
+	{ "oeNS", 0x5b1a, 1, false },
+	{ "SEBC", 0x5b23, 8, false },
+	{ "ECAP", 0x5b33, 8, true },
+	{ "BVTP", 0x5b43, 8, true },
+	{ "sP1T", 0x5b53, 8, true },
+	{ "BtpG", 0x5b63, 8, true },
+	{ "StpG", 0x5b73, 8, false },
+	{ "BlpP", 0x5b83, 8, true },
+	{ "SPTP", 0x5b93, 8, false },
+	{ "SZSD", 0x5ba3, 8, false },
+	{ "LZSD", 0x5bb3, 8, false },
+	{ "S2xG", 0x5bc3, 8, true },
+	{ "SNUT", 0x5bd3, 8, true },
+	{ "ZNUT", 0x5be3, 4, false },
+	{ "OTTR", 0x5bef, 8, true },
+	{ "LLTR", 0x5bff, 1, false },
+	{ "_COS", 0x5c08, 4, true },
+	{ "RCOS", 0x5c14, 4, true },
+	{ "dApC", 0x5c20, 8, true },
+	{ "dArW", 0x5c30, 8, true },
+	{ "fVED", 0x5c40, 1, true },
+	{ "GLFp", 0x5c49, 8, true },
+	{ "ABOI", 0x5c59, 8, false },
+	{ "ZSOI", 0x5c69, 4, false },
+	{ "ARcM", 0x5c75, 4, true },
+};
+
+static const struct ane_h16_preload_rule ane_h16_preload_26a428 = {
+	.cells = ane_h16_patchbay_26a428,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_26a428),
+	.zero_start = 0x17c80,
+	.zero_end = 0x18320,
+	.digest = {
+		0x1f, 0x86, 0x5e, 0xd0, 0x4c, 0x4c, 0x38, 0xf6,
+		0xfd, 0xcc, 0x45, 0x43, 0xa8, 0x81, 0x4f, 0x81,
+		0x8d, 0x3c, 0xea, 0x58, 0x3d, 0xe6, 0x4d, 0x22,
+		0xff, 0xe9, 0x6e, 0x3a, 0x93, 0xca, 0x46, 0x97,
+	},
+};
+
+/* Every supported H16 firmware build, matched against the live preload. */
+static const struct ane_h16_profile ane_h16_profiles[] = {
+	{
+		.identity = "H16 27.0 26A428",
+		.preload = &ane_h16_preload_26a428,
+		.build = &ane_h16_build_26a428,
+	},
 };
 
 #endif /* __ANE_H16_BOOT_DATA_H__ */

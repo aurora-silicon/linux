@@ -4,6 +4,7 @@
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
+#include "ane_h16_boot_data.h"
 #include "ane_h16_preload.h"
 
 /* Synthetic framing only, with no firmware bytes. Walk records independently
@@ -33,7 +34,33 @@ static const struct {
 struct preload_fixture {
 	u8 *text;
 	u8 *data;
+	struct ane_h16_preload_cell cells[ARRAY_SIZE(records)];
+	struct ane_h16_preload_rule rule;
 };
+
+/* Lay the synthetic records out from @base and describe them as a rule. */
+static size_t preload_frame(struct preload_fixture *f, size_t base, bool write)
+{
+	size_t pos = base;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(records); i++) {
+		if (write) {
+			memcpy(f->data + pos, records[i].tag, 4);
+			put_unaligned_le32(records[i].width, f->data + pos + 4);
+		}
+		memcpy(f->cells[i].tag, records[i].tag, 4);
+		f->cells[i].value = pos + 8;
+		f->cells[i].width = records[i].width;
+		f->cells[i].mutable = records[i].mutable;
+		pos += 8 + records[i].width;
+	}
+	f->rule.cells = f->cells;
+	f->rule.cell_count = ARRAY_SIZE(records);
+	f->rule.zero_start = 0x17c80;
+	f->rule.zero_end = 0x18320;
+	return pos;
+}
 
 static void preload_free(void *allocation)
 {
@@ -43,8 +70,6 @@ static void preload_free(void *allocation)
 static int preload_fixture_init(struct kunit *test)
 {
 	struct preload_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
-	size_t pos = 0x5a18;
-	unsigned int i;
 
 	if (!f)
 		return -ENOMEM;
@@ -61,17 +86,12 @@ static int preload_fixture_init(struct kunit *test)
 		return -ENOMEM;
 	memset(f->text, 0x5a, ANE_H16_PRELOAD_TEXT_SIZE);
 	memset(f->data, 0xa5, ANE_H16_PRELOAD_DATA_SIZE);
-	for (i = 0; i < ARRAY_SIZE(records); i++) {
-		memcpy(f->data + pos, records[i].tag, 4);
-		put_unaligned_le32(records[i].width, f->data + pos + 4);
-		pos += 8 + records[i].width;
-	}
-	return pos == 0x5c79 ? 0 : -EINVAL;
+	return preload_frame(f, 0x5a18, true) == 0x5c79 ? 0 : -EINVAL;
 }
 
 static int preload_digest(struct preload_fixture *f, u8 *digest)
 {
-	return ane_h16_preload_digest(f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+	return ane_h16_preload_digest(&f->rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
 				      f->data, ANE_H16_PRELOAD_DATA_SIZE, digest);
 }
 
@@ -91,9 +111,14 @@ static void preload_identity_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, preload_digest(f, digest), 0);
 	KUNIT_EXPECT_MEMEQ(test, digest, expected, sizeof(digest));
 	/* Correct framing alone cannot authenticate a synthetic image. */
-	ret = ane_h16_preload_validate(f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+	ret = ane_h16_preload_validate(&f->rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
 				       f->data, ANE_H16_PRELOAD_DATA_SIZE);
 	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
+	/* The rule's own digest is the whole identity. */
+	memcpy(f->rule.digest, expected, sizeof(expected));
+	ret = ane_h16_preload_validate(&f->rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+				       f->data, ANE_H16_PRELOAD_DATA_SIZE);
+	KUNIT_EXPECT_EQ(test, ret, 0);
 }
 
 static void preload_mutable_test(struct kunit *test)
@@ -180,22 +205,129 @@ static void preload_bounds_test(struct kunit *test)
 	int delta, ret;
 
 	for (delta = -1; delta <= 1; delta += 2) {
-		ret = ane_h16_preload_digest(f->text, ANE_H16_PRELOAD_TEXT_SIZE + delta,
+		ret = ane_h16_preload_digest(&f->rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE + delta,
 					     f->data, ANE_H16_PRELOAD_DATA_SIZE, digest);
 		KUNIT_EXPECT_EQ(test, ret, -EINVAL);
-		ret = ane_h16_preload_digest(f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+		ret = ane_h16_preload_digest(&f->rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
 					     f->data, ANE_H16_PRELOAD_DATA_SIZE + delta, digest);
 		KUNIT_EXPECT_EQ(test, ret, -EINVAL);
 	}
-	ret = ane_h16_preload_digest(NULL, ANE_H16_PRELOAD_TEXT_SIZE,
+	ret = ane_h16_preload_digest(&f->rule, NULL, ANE_H16_PRELOAD_TEXT_SIZE,
 				     f->data, ANE_H16_PRELOAD_DATA_SIZE, digest);
 	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
-	ret = ane_h16_preload_digest(f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+	ret = ane_h16_preload_digest(&f->rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
 				     NULL, ANE_H16_PRELOAD_DATA_SIZE, digest);
 	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
-	ret = ane_h16_preload_digest(f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+	ret = ane_h16_preload_digest(&f->rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
 				     f->data, ANE_H16_PRELOAD_DATA_SIZE, NULL);
 	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	ret = ane_h16_preload_digest(NULL, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+				     f->data, ANE_H16_PRELOAD_DATA_SIZE, digest);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+}
+
+/* A malformed rule is a driver bug: refused as -EINVAL, never as a mismatch. */
+static void preload_rule_shape_test(struct kunit *test)
+{
+	struct preload_fixture *f = test->priv;
+	u8 digest[SHA256_DIGEST_SIZE];
+	struct ane_h16_preload_rule rule;
+
+	rule = f->rule;
+	rule.cell_count = 0;
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(&rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+						     f->data, ANE_H16_PRELOAD_DATA_SIZE, digest),
+			-EINVAL);
+	rule = f->rule;
+	rule.zero_start = 0x5c70;	/* inside the last record */
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(&rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+						     f->data, ANE_H16_PRELOAD_DATA_SIZE, digest),
+			-EINVAL);
+	rule = f->rule;
+	rule.zero_end = ANE_H16_PRELOAD_DATA_SIZE + 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(&rule, f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+						     f->data, ANE_H16_PRELOAD_DATA_SIZE, digest),
+			-EINVAL);
+	/* Overlapping records. */
+	f->cells[1].value = f->cells[0].value + 4;
+	KUNIT_EXPECT_EQ(test, preload_digest(f, digest), -EINVAL);
+}
+
+/*
+ * A later firmware build moves the patchbay. The rule for one layout rejects
+ * the other as a mismatch (-ENOEXEC), so a profile table can try each rule in
+ * turn and the right one wins.
+ */
+static void preload_layout_select_test(struct kunit *test)
+{
+	struct preload_fixture *f = test->priv;
+	struct ane_h16_preload_rule old_rule;
+	struct ane_h16_preload_cell old_cells[ARRAY_SIZE(records)];
+	u8 digest[SHA256_DIGEST_SIZE];
+
+	memcpy(old_cells, f->cells, sizeof(old_cells));
+	old_rule = f->rule;
+	old_rule.cells = old_cells;
+	memset(f->data + 0x5a18, 0xa5, 0x5c79 - 0x5a18);
+	KUNIT_ASSERT_EQ(test, preload_frame(f, 0x5a18 + 0x3f80, true), 0x5c79 + 0x3f80);
+	f->rule.zero_start += 0x3f80;
+	f->rule.zero_end += 0x3f80;
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(&old_rule, f->text,
+						     ANE_H16_PRELOAD_TEXT_SIZE, f->data,
+						     ANE_H16_PRELOAD_DATA_SIZE, digest),
+			-ENOEXEC);
+	KUNIT_ASSERT_EQ(test, preload_digest(f, digest), 0);
+	memcpy(f->rule.digest, digest, sizeof(digest));
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_validate(&f->rule, f->text,
+						       ANE_H16_PRELOAD_TEXT_SIZE, f->data,
+						       ANE_H16_PRELOAD_DATA_SIZE),
+			0);
+	/* A mutable value of the new layout still normalizes. */
+	memset(f->data + f->cells[0].value, 0x3c, f->cells[0].width);
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_validate(&f->rule, f->text,
+						       ANE_H16_PRELOAD_TEXT_SIZE, f->data,
+						       ANE_H16_PRELOAD_DATA_SIZE),
+			0);
+}
+
+/*
+ * Every shipped profile is well formed: a build to boot with, a rule whose
+ * records frame cleanly when written at their offsets, and an identity no
+ * other profile shares. Synthetic bytes never authenticate as a profile.
+ */
+static void preload_profiles_test(struct kunit *test)
+{
+	struct preload_fixture *f = test->priv;
+	unsigned int i, j, k;
+
+	KUNIT_ASSERT_GT(test, ARRAY_SIZE(ane_h16_profiles), 0);
+	for (i = 0; i < ARRAY_SIZE(ane_h16_profiles); i++) {
+		const struct ane_h16_profile *p = &ane_h16_profiles[i];
+		const struct ane_h16_preload_rule *r = p->preload;
+		u8 digest[SHA256_DIGEST_SIZE];
+
+		KUNIT_ASSERT_NOT_NULL(test, p->build);
+		KUNIT_ASSERT_NOT_NULL(test, p->identity);
+		KUNIT_ASSERT_NOT_NULL(test, r);
+		memset(f->data, 0xa5, ANE_H16_PRELOAD_DATA_SIZE);
+		for (k = 0; k < r->cell_count; k++) {
+			memcpy(f->data + r->cells[k].value - 8, r->cells[k].tag, 4);
+			put_unaligned_le32(r->cells[k].width, f->data + r->cells[k].value - 4);
+		}
+		KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(r, f->text,
+							     ANE_H16_PRELOAD_TEXT_SIZE, f->data,
+							     ANE_H16_PRELOAD_DATA_SIZE, digest),
+				0);
+		KUNIT_EXPECT_EQ(test, ane_h16_preload_validate(r, f->text,
+							       ANE_H16_PRELOAD_TEXT_SIZE, f->data,
+							       ANE_H16_PRELOAD_DATA_SIZE),
+				-ENOEXEC);
+		for (j = 0; j < i; j++) {
+			KUNIT_EXPECT_NE(test, memcmp(r->digest, ane_h16_profiles[j].preload->digest,
+						     SHA256_DIGEST_SIZE), 0);
+			KUNIT_EXPECT_STRNEQ(test, p->identity, ane_h16_profiles[j].identity);
+		}
+	}
 }
 
 static struct kunit_case preload_cases[] = {
@@ -204,6 +336,9 @@ static struct kunit_case preload_cases[] = {
 	KUNIT_CASE(preload_framing_test),
 	KUNIT_CASE(preload_immutable_test),
 	KUNIT_CASE(preload_bounds_test),
+	KUNIT_CASE(preload_rule_shape_test),
+	KUNIT_CASE(preload_layout_select_test),
+	KUNIT_CASE(preload_profiles_test),
 	{}
 };
 

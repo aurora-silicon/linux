@@ -609,6 +609,7 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 {
 	struct ane_h16_boot *b = &h->boot;
 	void *snap[2] = {}, *second = NULL;
+	const char *identity = NULL;
 	unsigned int i;
 	int ret = -ENOMEM;
 
@@ -642,10 +643,35 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 		vfree(second);
 		second = NULL;
 	}
-	ret = ane_h16_preload_validate(snap[0], b->soc->preload_size[0],
-				       snap[1], b->soc->preload_size[1]);
-	if (!ret)
-		dev_info(h->dev, "H16 preload identity %s accepted\n", b->build->identity);
+	ret = -ENOEXEC;
+	for (i = 0; i < b->soc->h16_profile_count && ret == -ENOEXEC; i++) {
+		const struct ane_h16_profile *p = &b->soc->h16_profiles[i];
+		u8 digest[SHA256_DIGEST_SIZE];
+
+		ret = ane_h16_preload_digest(p->preload, snap[0], b->soc->preload_size[0],
+					     snap[1], b->soc->preload_size[1], digest);
+		if (ret)
+			continue;
+		if (memcmp(digest, p->preload->digest, sizeof(digest))) {
+			/* The layout matched; name the image so a new build can be pinned. */
+			dev_info(h->dev, "H16 preload has the %s layout but digest %*phN\n",
+				 p->identity, (int)sizeof(digest), digest);
+			ret = -ENOEXEC;
+			continue;
+		}
+		b->build = p->build;
+		identity = p->identity;
+	}
+	if (ret) {
+		dev_err(h->dev, "H16 preload matches none of %u firmware profiles, error %d\n",
+			b->soc->h16_profile_count, ret);
+		goto out;
+	}
+	/* Firmware DVA layout belongs to the build just selected. */
+	h->shared_next = b->build->shared_dva;
+	h->program_next = b->build->shared_dva + ANE_FW_SHARED_TOTAL;
+	h->program_end = h->program_next + ANE_H16_PROGRAM_WINDOW;
+	dev_info(h->dev, "H16 preload identity %s accepted\n", identity);
 out:
 	vfree(second);
 	vfree(snap[0]);
@@ -797,13 +823,11 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->irq = -1;
 	INIT_LIST_HEAD(&h->mappings);
 	h->boot.soc = soc;
-	h->boot.build = soc->h16_boot;
+	/* The build, and with it the DVA layout, is chosen from the preload. */
+	h->boot.build = NULL;
 	h->boot.ctx = h;
 	h->boot.ops = &ane_h16_ops;
 	h->boot.transport_ops = &ane_h16_transport_ops;
-	h->shared_next = soc->h16_boot->shared_dva;
-	h->program_next = soc->h16_boot->shared_dva + ANE_FW_SHARED_TOTAL;
-	h->program_end = h->program_next + ANE_H16_PROGRAM_WINDOW;
 	ret = of_property_read_u64_array(h->dev->of_node, "apple,dapf-ranges",
 					 &h->boot.ranges[0][0], 8);
 	if (ret)

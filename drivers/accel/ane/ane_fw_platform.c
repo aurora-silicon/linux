@@ -28,7 +28,8 @@ static const u32 ane_h16_power_words[] = {
 };
 
 const struct ane_fw_platform ane_h16_platform = {
-	.h16_boot = &ane_h16_build_26a428,
+	.h16_profiles = ane_h16_profiles,
+	.h16_profile_count = ARRAY_SIZE(ane_h16_profiles),
 	/* The DT compatible is t6041; the physical M4 Pro is T6040. */
 	.soc = 0x6040,
 	.chip_family = 16,
@@ -176,7 +177,7 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	if (!soc->h16_boot || of_property_count_u64_elems(np, "apple,dapf-ranges") != 8)
+	if (!soc->h16_profile_count || of_property_count_u64_elems(np, "apple,dapf-ranges") != 8)
 		return -ENODATA;
 	return 0;
 }
