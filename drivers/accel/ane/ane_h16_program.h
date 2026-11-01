@@ -30,13 +30,22 @@
 /* First value of the firmware mcache DSID pool (custom-BAR facts, 4). */
 #define ANE_H16_MCACHE_DSID 36
 
-/* Host-built generic section: header, then one entry per surface. */
+/*
+ * Host-built generic section: header, then one entry per surface in HWX
+ * segment order, then one entry for the __DATA scratch when the program has
+ * one.
+ */
 #define ANE_H16_GENERIC_MAGIC		1
 #define ANE_H16_GENERIC_VERSION		0x10
 #define ANE_H16_GENERIC_COUNT		0x204
 #define ANE_H16_GENERIC_HEADER		0x208
 #define ANE_H16_GENERIC_ENTRY		0x30
 #define ANE_H16_GENERIC_ID_MAX		0x3c
+
+/* Host-built operation section: a count, then fixed-size BAR records. */
+#define ANE_H16_OPERATION_RECORD	0x40c
+#define ANE_H16_OPERATION_RECORDS_MAX	64
+#define ANE_H16_OPERATION_REFS_MAX	64
 
 /* Host-built sections. Userspace packs their bytes; the kernel places them. */
 enum ane_h16_aux {
@@ -128,6 +137,12 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 			     struct ane_h16_process_binding *bindings,
 			     unsigned int *count,
 			     struct ane_h16_process_binding *scratch);
+int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
+			       const struct ane_h16_hwx *hwx, const void *operation,
+			       size_t operation_size,
+			       const struct ane_h16_process_binding *bindings,
+			       unsigned int count,
+			       const struct ane_h16_process_binding *scratch);
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
 			struct ane_h16_custom_bar *bars, unsigned int *count);
@@ -152,9 +167,15 @@ struct ane_h16_program {
 	struct ane_h16_custom_bar bars[ANE_H16_MAX_CUSTOM_BARS];
 	unsigned int bar_count;
 	unsigned int resource_count;
-	/* Kernel-owned DRAM scratch of a linked program, sent after the surfaces. */
+	/* Per-surface buffer size from the generic section, sent in EXECUTE. */
+	u64 declared[ANE_H16_SURFACES];
+	/*
+	 * The __DATA scratch: a kernel-owned EXECUTE input that carries the
+	 * DRAM edges between tasks. Userspace never sees or fills it.
+	 */
 	struct ane_h16_execute_buffer scratch;
 	bool has_scratch;
+	struct ane_h16_session *session;
 	/* Session-local identity; firmware program IDs are reused after UNLOAD. */
 	u64 generation;
 	struct ane_h16_request_key key;
@@ -162,7 +183,6 @@ struct ane_h16_program {
 	bool closed;
 };
 
-/* One loaded program at a time per firmware session; see ane_h16_session_load(). */
 /*
  * Where the time of one EXECUTE goes, in nanoseconds. The firmware phases
  * are measured by ane_h16_session_execute(); a reply or report is "seen"
@@ -200,12 +220,17 @@ extern const char *const ane_h16_exec_phase_names[ANE_H16_T_PHASES];
 void ane_h16_exec_stats_add(struct ane_h16_exec_stats *st,
 			    const struct ane_h16_exec_sample *x);
 
+/*
+ * Programs of one firmware session: one loaded at a time, any number per
+ * boot; a switch-safe transport may hold several. See ane_h16_session_load().
+ */
 struct ane_h16_session {
 	struct ane_fw_transport *transport;
 	const struct ane_h16_session_ops *ops;
 	void *ctx;
 	u64 timeout_ns;
 	struct ane_h16_pending_table pending;
+	/* The last loaded program. */
 	struct ane_h16_program *program;
 	/* Generation of the last loaded program, and of the last one executed. */
 	u64 generation;

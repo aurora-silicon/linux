@@ -7,6 +7,7 @@
 
 #include "ane_h16_hwx_test_fixture.h"
 #include "ane_h16_add128_fixture.h"
+#include "ane_h17_mobilenet_fixture.h"
 
 #define FW_IPC_DVA 0x100003d0000ULL
 #define FW_POOL_DVA 0x10000384000ULL
@@ -39,16 +40,21 @@ struct prog_fw {
 	/* Time each doorbell takes to answer. */
 	u64 doorbell_ns;
 	u64 late_uuid;
+	u32 late_program, late_process;
 	unsigned int late_polls;
 	u64 next_dva;
 	u32 head[ANE_FW_CHANNELS];
 	u32 reports;
+	/* First IDs; the firmware hands out the lowest free one, reused after teardown. */
 	u32 program, process;
+	u32 programs_live, processes_live;
 	u16 ids[32];
 	u32 values[32];
 	unsigned int count;
 	u8 exec[0xd00];
 	size_t exec_length;
+	u32 exec_flags[32];
+	unsigned int execs;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
 	/* The EXECUTE failure trace lines, by step. */
@@ -84,7 +90,7 @@ static void fw_advance(struct prog_fw *f, unsigned int ch)
 	f->head[ch] = (f->head[ch] + 1) % f->t.channels[ch].slots;
 }
 
-static void fw_report(struct prog_fw *f, u64 uuid, u32 process, u32 state)
+static void fw_report(struct prog_fw *f, u64 uuid, u32 program, u32 process, u32 state)
 {
 	u32 offset = FW_REPORTS + (f->reports++ % 16) * 0x60;
 	u8 *r = (u8 *)f->ipc.cpu + offset, *slot = fw_slot(f, ANE_FW_IO_T2H);
@@ -93,7 +99,7 @@ static void fw_report(struct prog_fw *f, u64 uuid, u32 process, u32 state)
 	put_unaligned_le32(0xfe00 + (state == 1), r);
 	put_unaligned_le16(0x300, r + 4);
 	put_unaligned_le64(uuid, r + 8);
-	put_unaligned_le32(f->program, r + 0x10);
+	put_unaligned_le32(program, r + 0x10);
 	put_unaligned_le32(process, r + 0x14);
 	put_unaligned_le32(state, r + 0x1c);
 	put_unaligned_le64(0x60, slot + 8);
@@ -102,38 +108,53 @@ static void fw_report(struct prog_fw *f, u64 uuid, u32 process, u32 state)
 	fw_advance(f, ANE_FW_IO_T2H);
 }
 
+/* Reports carry the IDs of the EXECUTE they answer. */
 static void fw_execute(struct prog_fw *f, const u8 *cmd)
 {
 	u64 uuid = get_unaligned_le64(cmd + 0x20);
+	u32 program = get_unaligned_le32(cmd + 8), process = get_unaligned_le32(cmd + 0xc);
 
+	if (f->execs < ARRAY_SIZE(f->exec_flags))
+		f->exec_flags[f->execs] = get_unaligned_le32(cmd + ANE_H16_EXECUTE_FLAGS);
+	f->execs++;
 	switch (f->mode) {
 	case FW_REPORT_FOREIGN_UUID:
-		fw_report(f, uuid + 100, f->process, 0);
-		fw_report(f, uuid + 100, f->process, 1);
+		fw_report(f, uuid + 100, program, process, 0);
+		fw_report(f, uuid + 100, program, process, 1);
 		break;
 	case FW_REPORT_WRONG_PROCESS:
-		fw_report(f, uuid, f->process, 0);
-		fw_report(f, uuid, f->process + 1, 1);
+		fw_report(f, uuid, program, process, 0);
+		fw_report(f, uuid, program, process + 1, 1);
 		break;
 	case FW_REPORT_FAILURE:
-		fw_report(f, uuid, f->process, 0);
-		fw_report(f, uuid, f->process, 2);
+		fw_report(f, uuid, program, process, 0);
+		fw_report(f, uuid, program, process, 2);
 		break;
 	case FW_REPORT_LATE:
-		fw_report(f, uuid, f->process, 0);
+		fw_report(f, uuid, program, process, 0);
 		f->late_uuid = uuid;
+		f->late_program = program;
+		f->late_process = process;
 		break;
 	case FW_REPORT_STALL:
 		/* Started on the engine, then never a terminal report. */
-		fw_report(f, uuid, f->process, 0);
-		fw_report(f, uuid, f->process, 3);
+		fw_report(f, uuid, program, process, 0);
+		fw_report(f, uuid, program, process, 3);
 		break;
 	default:
-		fw_report(f, uuid, f->process, 0);
-		fw_report(f, uuid, f->process, 3);
-		fw_report(f, uuid, f->process, 1);
+		fw_report(f, uuid, program, process, 0);
+		fw_report(f, uuid, program, process, 3);
+		fw_report(f, uuid, program, process, 1);
 		break;
 	}
+}
+
+static u32 fw_take_id(u32 *live, u32 base)
+{
+	unsigned int i = ffz(*live);
+
+	*live |= BIT(i);
+	return base + i;
 }
 
 static void fw_command(struct prog_fw *f, unsigned int ch)
@@ -157,11 +178,20 @@ static void fw_command(struct prog_fw *f, unsigned int ch)
 		if (f->mode == FW_LOAD_NAK)
 			put_unaligned_le16(1, cmd + 6);
 		else if (f->mode != FW_LOAD_ID_UNCHANGED)
-			put_unaligned_le32(f->program, cmd + ANE_H16_LOAD_ID_OFFSET);
+			put_unaligned_le32(fw_take_id(&f->programs_live, f->program),
+					   cmd + ANE_H16_LOAD_ID_OFFSET);
+		break;
+	case ANE_H16_UNLOAD_PROGRAM:
+		if (get_unaligned_le32(cmd + 8) - f->program < 32)
+			f->programs_live &= ~BIT(get_unaligned_le32(cmd + 8) - f->program);
+		break;
+	case ANE_H16_TERMINATE_PROCESS:
+		if (get_unaligned_le32(cmd + 0xc) - f->process < 32)
+			f->processes_live &= ~BIT(get_unaligned_le32(cmd + 0xc) - f->process);
 		break;
 	case ANE_H16_CREATE_PROCESS:
 		KUNIT_EXPECT_FALSE(f->test, memchr_inv(cmd + 0xc, 0, ANE_H16_CREATE_SIZE - 0xc));
-		put_unaligned_le32(f->process, cmd + 0xc);
+		put_unaligned_le32(fw_take_id(&f->processes_live, f->process), cmd + 0xc);
 		if (f->mode == FW_CREATE_BODY)
 			cmd[0x100] = 1;
 		break;
@@ -204,8 +234,8 @@ static void fw_relax(void *ctx, u64 waited_ns)
 
 	f->now += 10;
 	if (f->late_uuid && !--f->late_polls) {
-		fw_report(f, f->late_uuid, f->process, 3);
-		fw_report(f, f->late_uuid, f->process, 1);
+		fw_report(f, f->late_uuid, f->late_program, f->late_process, 3);
+		fw_report(f, f->late_uuid, f->late_program, f->late_process, 1);
 		f->late_uuid = 0;
 	}
 }
@@ -232,12 +262,27 @@ static const struct ane_fw_transport_ops fw_ops = {
 	.refused = fw_refused,
 };
 
+static void fw_kvfree(void *p)
+{
+	kvfree(p);
+}
+
+/* Tests own the memory; a MobileNet kernel region exceeds kmalloc's limit. */
+static void *fw_zalloc(struct kunit *test, size_t size)
+{
+	void *p = kvzalloc(size, GFP_KERNEL);
+
+	if (p && kunit_add_action_or_reset(test, fw_kvfree, p))
+		return NULL;
+	return p;
+}
+
 static int fw_map(void *ctx, size_t size, bool write, struct ane_fw_surface *s)
 {
 	struct prog_fw *f = ctx;
 
 	*s = (struct ane_fw_surface) {
-		.cpu = kunit_kzalloc(f->test, size, GFP_KERNEL),
+		.cpu = fw_zalloc(f->test, size),
 		.dva = f->next_dva,
 		.size = size,
 	};
@@ -269,7 +314,7 @@ static const struct ane_h16_session_ops fw_session_ops = {
 	.log = fw_log,
 };
 
-static struct prog_fw *fw_create(struct kunit *test)
+static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 {
 	static const char * const names[] = {
 		"TERMINAL", "IO", "DEBUG", "BUF_H2T", "BUF_T2H",
@@ -281,6 +326,8 @@ static struct prog_fw *fw_create(struct kunit *test)
 	if (!f)
 		return NULL;
 	f->test = test;
+	f->soc.chip_family = family;
+	f->soc.hwx_subtype = family == 17 ? ANE_HWX_SUBTYPE_H17 : ANE_HWX_SUBTYPE_H16;
 	f->soc.doorbell = 0x1884000;
 	f->soc.irq_status = 0x188c000;
 	f->soc.irq_ack = 0x1890000;
@@ -314,6 +361,11 @@ static struct prog_fw *fw_create(struct kunit *test)
 	return f;
 }
 
+static struct prog_fw *fw_create(struct kunit *test)
+{
+	return fw_create_family(test, 16);
+}
+
 static void snapshot_free(void *snapshot)
 {
 	ane_h16_hwx_snapshot_destroy(snapshot);
@@ -333,59 +385,96 @@ static struct ane_h16_hwx_snapshot *fw_snapshot(struct kunit *test, bool mixed, 
 	return snapshot;
 }
 
-/* Generic section with ID base + k for surface k, as a host builder writes it. */
+/*
+ * Generic section with ID base + k for surface k, then base + count for the
+ * scratch, as a host builder writes it.
+ */
 static size_t generic_fill(u8 *g, const struct ane_h16_hwx *hwx, u32 base)
 {
-	unsigned int i;
-
-	unsigned int entries = hwx->surface_count + (hwx->scratch.size ? 1 : 0);
+	unsigned int i, entries = hwx->surface_count + !!hwx->scratch.size;
 
 	memset(g, 0, ANE_H16_GENERIC_HEADER + entries * ANE_H16_GENERIC_ENTRY);
 	put_unaligned_le32(ANE_H16_GENERIC_MAGIC, g);
 	put_unaligned_le32(ANE_H16_GENERIC_VERSION, g + 4);
 	put_unaligned_le32(entries, g + ANE_H16_GENERIC_COUNT);
-	for (i = 0; i < hwx->surface_count; i++) {
+	for (i = 0; i < entries; i++) {
 		u8 *e = g + ANE_H16_GENERIC_HEADER + i * ANE_H16_GENERIC_ENTRY;
+		bool scratch = i == hwx->surface_count;
+		u32 direction = scratch ? 1 : hwx->surfaces[i].direction;
 
 		put_unaligned_le32(1, e);
 		put_unaligned_le32(base + i, e + 4);
-		put_unaligned_le32(hwx->surfaces[i].direction - 1, e + 8);
-		put_unaligned_le32(hwx->surfaces[i].direction, e + 0x10);
-		put_unaligned_le64(hwx->surfaces[i].span, e + 0x20);
-		put_unaligned_le32(0xffff, e + 0x28);
-	}
-	/* A linked program's scratch: last, input usage, covering the segment. */
-	if (hwx->scratch.size) {
-		u8 *e = g + ANE_H16_GENERIC_HEADER + i * ANE_H16_GENERIC_ENTRY;
-
-		put_unaligned_le32(1, e);
-		put_unaligned_le32(base + i, e + 4);
-		put_unaligned_le32(1, e + 0x10);
-		put_unaligned_le64(hwx->scratch.size, e + 0x20);
+		put_unaligned_le32(direction - 1, e + 8);
+		put_unaligned_le32(direction, e + 0x10);
+		put_unaligned_le64(scratch ? hwx->scratch.size : hwx->surfaces[i].span, e + 0x20);
 		put_unaligned_le32(0xffff, e + 0x28);
 	}
 	return ANE_H16_GENERIC_HEADER + entries * ANE_H16_GENERIC_ENTRY;
 }
 
-static u8 test_aux[ANE_H16_AUX_COUNT][0x298];
+/*
+ * Operation section with one record that binds every program-descriptor
+ * slot whose base is a surface, the scratch or the kernel, with the IDs that
+ * generic_fill() gives.
+ */
+static size_t operation_fill(u8 *o, const struct ane_h16_hwx_snapshot *snapshot,
+			     const struct ane_h16_hwx *hwx, u32 base)
+{
+	const u8 *c = (const u8 *)snapshot->bytes + hwx->program_offset;
+	unsigned int slot, i, refs = 0;
+
+	memset(o, 0, 4 + ANE_H16_OPERATION_RECORD);
+	put_unaligned_le32(1, o);
+	for (slot = 0; slot < 64; slot++) {
+		u64 vm = get_unaligned_le64(c + 0x10 * (slot + 1));
+		u32 tag = 0;
+
+		if (!vm)
+			continue;
+		if (hwx->kernel.size && vm == hwx->kernel.vm)
+			tag = ANE_H16_RESOURCE_KERNEL;
+		if (hwx->scratch.size && vm == hwx->scratch.vm)
+			tag = base + hwx->surface_count;
+		for (i = 0; i < hwx->surface_count; i++)
+			if (vm == hwx->surfaces[i].section.vm)
+				tag = base + i;
+		if (!tag)
+			continue;
+		put_unaligned_le32(slot, o + 4 + 0xc + refs * 8);
+		put_unaligned_le32(tag, o + 4 + 0x10 + refs * 8);
+		refs++;
+	}
+	put_unaligned_le32(refs, o + 4 + 8);
+	return 4 + ANE_H16_OPERATION_RECORD;
+}
+
+static u8 test_aux[ANE_H16_AUX_COUNT][0x410];
 static const void *const test_aux_ptr[ANE_H16_AUX_COUNT] = {
 	test_aux[0], test_aux[1], test_aux[2], test_aux[3],
 };
 
-static size_t test_aux_size[ANE_H16_AUX_COUNT] = { 0x298, 0x410 - 0x180, 0x38, 0x28 };
+static size_t test_aux_size[ANE_H16_AUX_COUNT] = { 0x298, 0x410, 0x38, 0x28 };
 
 #define TEST_GENERIC_BASE 8
 
-static int fw_load_program(struct prog_fw *f, struct ane_h16_program **p)
+static int fw_load_snapshot(struct prog_fw *f, struct ane_h16_hwx_snapshot *snapshot,
+			    struct ane_h16_program **p)
 {
-	struct ane_h16_hwx_snapshot *snapshot = fw_snapshot(f->test, false, false);
 	struct ane_h16_hwx hwx;
 
 	if (!snapshot || ane_h16_hwx_validate(snapshot->bytes, snapshot->size, &hwx))
 		return -ENOMEM;
 	test_aux_size[ANE_H16_AUX_GENERIC] =
 		generic_fill(test_aux[ANE_H16_AUX_GENERIC], &hwx, TEST_GENERIC_BASE);
+	test_aux_size[ANE_H16_AUX_OPERATION] =
+		operation_fill(test_aux[ANE_H16_AUX_OPERATION], snapshot, &hwx,
+			       TEST_GENERIC_BASE);
 	return ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size, p);
+}
+
+static int fw_load_program(struct prog_fw *f, struct ane_h16_program **p)
+{
+	return fw_load_snapshot(f, fw_snapshot(f->test, false, false), p);
 }
 
 static void expect_slot(struct kunit *test, const u8 *load, unsigned int slot, u32 resource,
@@ -467,7 +556,7 @@ static void program_add128_slots_test(struct kunit *test)
 	put_unaligned_le32(4, generic + ANE_H16_GENERIC_HEADER + ANE_H16_GENERIC_ENTRY + 4);
 	put_unaligned_le32(6, generic + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + 4);
 	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), 0);
+						       &count, NULL), 0);
 	KUNIT_EXPECT_EQ(test, count, 3);
 	KUNIT_EXPECT_EQ(test, bindings[0].index, 5);
 	KUNIT_EXPECT_EQ(test, bindings[0].class, 0);
@@ -480,32 +569,32 @@ static void program_add128_slots_test(struct kunit *test)
 
 	/* A generic section that disagrees with the program refuses. */
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size - 4,
-						       bindings, &count, &scratch), -ENOEXEC);
+						       bindings, &count, NULL), -ENOEXEC);
 	put_unaligned_le32(2, generic + ANE_H16_GENERIC_HEADER + 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 	put_unaligned_le32(4, generic + ANE_H16_GENERIC_HEADER + 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 	put_unaligned_le32(5, generic + ANE_H16_GENERIC_HEADER + 4);
 	put_unaligned_le32(1, generic + ANE_H16_GENERIC_HEADER + 8);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 	put_unaligned_le32(0, generic + ANE_H16_GENERIC_HEADER + 8);
 	put_unaligned_le64(SZ_32K - 2, generic + ANE_H16_GENERIC_HEADER + 0x20);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 	put_unaligned_le64(SZ_32K, generic + ANE_H16_GENERIC_HEADER + 0x20);
 	put_unaligned_le32(2, generic + ANE_H16_GENERIC_COUNT);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 	put_unaligned_le32(3, generic + ANE_H16_GENERIC_COUNT);
 	put_unaligned_le32(0x11, generic + 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 	put_unaligned_le32(ANE_H16_GENERIC_VERSION, generic + 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), 0);
+						       &count, NULL), 0);
 
 	KUNIT_ASSERT_EQ(test, ane_h16_load_slots(hwx, plan, &layout, slots), 0);
 	KUNIT_ASSERT_EQ(test, ane_h16_load_encode(load, sizeof(load), slots), 0);
@@ -543,10 +632,10 @@ static void program_add128_slots_test(struct kunit *test)
 	hwx->surfaces[0].direction = 2;
 	generic_size = generic_fill(generic, hwx, 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 	hwx->surfaces[0].direction = 3;
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size, bindings,
-						       &count, &scratch), -ENOEXEC);
+						       &count, NULL), -ENOEXEC);
 }
 
 static u8 *sparse_bytes(struct kunit *test, const struct ane_h16_sparse_run *runs,
@@ -677,7 +766,10 @@ static void program_kernel_slots_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, slots[1].resource, 1007);
 	KUNIT_EXPECT_EQ(test, slots[1].class, 3);
 	KUNIT_EXPECT_EQ(test, slots[1].dva, layout.regions[kernel].dva);
-	KUNIT_EXPECT_EQ(test, slots[1].size, hwx->kernel.size);
+	/* The kernel slot spans the section's whole 16 KiB pages. */
+	KUNIT_EXPECT_EQ(test, slots[1].size,
+			min_t(u64, ALIGN(hwx->kernel.size, SZ_16K), plan->allocation[kernel]));
+	KUNIT_EXPECT_EQ(test, hwx->kernel.vm, plan->regions[kernel].vm);
 	KUNIT_EXPECT_EQ(test, slots[2].resource, slots[1].resource - 1);
 	KUNIT_EXPECT_EQ(test, slots[2].dva,
 			layout.regions[text].dva + (hwx->text.vm - plan->regions[text].vm));
@@ -848,7 +940,7 @@ static void program_session_test(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
 	/* The first request after boot sets up EXELOOP state: queued. */
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_QUEUED);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
 	/* EXECUTE: IDs, priority 5, UUID 2, two descriptors and one mcache record. */
 	KUNIT_EXPECT_EQ(test, f->exec_length, 0xcc0);
@@ -864,7 +956,7 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x90 + 4), TEST_GENERIC_BASE + 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x18),
 			p->surfaces[0]->dva);
-	/* Each descriptor covers its whole HWX section. */
+	/* H16: each descriptor covers its whole HWX section. */
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20),
 			p->hwx.surfaces[0].section.size);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 1);
@@ -897,7 +989,7 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, second->key.program, p->key.program);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
 	/* The engine last ran the first program: this request is queued. */
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_QUEUED);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
 	i = f->count;
@@ -1039,7 +1131,7 @@ static void program_stall_trace_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->s.fwlog_lines, 0);
 	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
 	KUNIT_EXPECT_EQ(test, f->fail_step, 3);
-	KUNIT_EXPECT_EQ(test, f->fail_flags, ANE_H16_EXECUTE_QUEUED);
+	KUNIT_EXPECT_EQ(test, f->fail_flags, ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_EXPECT_EQ(test, f->fail_reports, 2);
 	KUNIT_EXPECT_EQ(test, f->fail_state, 3);
 	KUNIT_EXPECT_EQ(test, f->fail_other, 0);
@@ -1144,8 +1236,8 @@ static void program_shared_tag_test(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, t);
 	t->shared_count = 2;
-	t->shared_tag[0] = ANE_FW_SHARED_LOG;
-	t->shared_tag[1] = ANE_FW_SHARED_EXPP;
+	t->shared_tags[0] = ANE_FW_SHARED_LOG;
+	t->shared_tags[1] = ANE_FW_SHARED_EXPP;
 	t->shared[0].dva = 0x10001300000ULL;
 	t->shared[1].dva = 0x10001358000ULL;
 	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_LOG),
@@ -1207,7 +1299,341 @@ static void program_pool_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->count, sent + 2);
 }
 
+static u8 *fw_sparse_large(struct kunit *test, const struct ane_h16_sparse_run *runs,
+			   unsigned int count, size_t size)
+{
+	u8 *bytes = fw_zalloc(test, size);
+	unsigned int i;
+
+	if (!bytes)
+		return NULL;
+	for (i = 0; i < count; i++) {
+		if (runs[i].offset + runs[i].length > size)
+			return NULL;
+		memcpy(bytes + runs[i].offset, runs[i].bytes, runs[i].length);
+	}
+	return bytes;
+}
+
+static struct ane_h16_hwx_snapshot *mobilenet_snapshot(struct kunit *test)
+{
+	struct ane_h16_hwx_snapshot *snapshot = kunit_kzalloc(test, sizeof(*snapshot),
+							      GFP_KERNEL);
+	u8 *hwx = fw_sparse_large(test, mobilenet_hwx_runs, ARRAY_SIZE(mobilenet_hwx_runs),
+				  MOBILENET_HWX_SIZE);
+
+	if (!snapshot || !hwx ||
+	    ane_h16_hwx_snapshot_create(hwx, MOBILENET_HWX_SIZE, snapshot) ||
+	    kunit_add_action_or_reset(test, snapshot_free, snapshot))
+		return NULL;
+	return snapshot;
+}
+
+static void mobilenet_sections(struct kunit *test, const void *aux[ANE_H16_AUX_COUNT],
+			       size_t aux_size[ANE_H16_AUX_COUNT])
+{
+	aux_size[0] = MOBILENET_GENERIC_SIZE;
+	aux_size[1] = MOBILENET_OPERATION_SIZE;
+	aux_size[2] = MOBILENET_PROCEDURE_SIZE;
+	aux_size[3] = MOBILENET_PROPERTIES_SIZE;
+	aux[0] = sparse_bytes(test, mobilenet_generic_runs, ARRAY_SIZE(mobilenet_generic_runs),
+			      aux_size[0]);
+	aux[1] = sparse_bytes(test, mobilenet_operation_runs,
+			      ARRAY_SIZE(mobilenet_operation_runs), aux_size[1]);
+	aux[2] = sparse_bytes(test, mobilenet_procedure_runs,
+			      ARRAY_SIZE(mobilenet_procedure_runs), aux_size[2]);
+	aux[3] = sparse_bytes(test, mobilenet_properties_runs,
+			      ARRAY_SIZE(mobilenet_properties_runs), aux_size[3]);
+}
+
+/*
+ * The H17 MobileNetV1 HWX is one linked program: 28 tasks, input x and
+ * output y as surfaces, the 3.5 MiB __DATA scratch on BAR slot 3 and the
+ * kernel table on slot 8. The H16 rules hold except the subtype and the zero
+ * stream prologue.
+ */
+static void program_h17_hwx_test(struct kunit *test)
+{
+	struct ane_h16_hwx_snapshot *snapshot = mobilenet_snapshot(test);
+	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
+	u8 *bytes;
+
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	bytes = snapshot->bytes;
+	*hwx = snapshot->info;
+	KUNIT_EXPECT_EQ(test, hwx->subtype, ANE_HWX_SUBTYPE_H17);
+	KUNIT_EXPECT_EQ(test, hwx->tasks, 28);
+	KUNIT_EXPECT_EQ(test, hwx->surface_count, 2);
+	KUNIT_EXPECT_EQ(test, hwx->surfaces[0].direction, 1);
+	KUNIT_EXPECT_EQ(test, hwx->surfaces[0].span, 301056);
+	KUNIT_EXPECT_EQ(test, hwx->surfaces[1].direction, 2);
+	KUNIT_EXPECT_EQ(test, hwx->surfaces[1].span, 458752);
+	KUNIT_EXPECT_EQ(test, hwx->scratch.vm, 0x30000000);
+	KUNIT_EXPECT_EQ(test, hwx->scratch.size, 0x380000);
+	KUNIT_EXPECT_EQ(test, hwx->kernel.size, 0x81cb40);
+	KUNIT_EXPECT_EQ(test, hwx->text.size, 0x3110);
+
+	/* Subtype 9 opens its stream with 0; a subtype 7 file must open with 1. */
+	put_unaligned_le32(ANE_HWX_SUBTYPE_H16, bytes + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), -ENOEXEC);
+	put_unaligned_le32(1, bytes + hwx->text.offset);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), 0);
+	KUNIT_EXPECT_EQ(test, hwx->subtype, ANE_HWX_SUBTYPE_H16);
+	put_unaligned_le32(ANE_HWX_SUBTYPE_H17, bytes + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), -ENOEXEC);
+	put_unaligned_le32(0, bytes + hwx->text.offset);
+	put_unaligned_le32(8, bytes + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), -ENOEXEC);
+	put_unaligned_le32(ANE_HWX_SUBTYPE_H17, bytes + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, snapshot->size, hwx), 0);
+}
+
+/* Generic and operation sections of the MobileNet program, and their faults. */
+static void program_h17_sections_test(struct kunit *test)
+{
+	struct ane_h16_hwx_snapshot *snapshot = mobilenet_snapshot(test);
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch = {};
+	const struct ane_h16_hwx *hwx;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	unsigned int count;
+	u8 *g, *o;
+
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	hwx = &snapshot->info;
+	mobilenet_sections(test, aux, aux_size);
+	g = (u8 *)aux[ANE_H16_AUX_GENERIC];
+	o = (u8 *)aux[ANE_H16_AUX_OPERATION];
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	KUNIT_ASSERT_NOT_NULL(test, o);
+
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, g, aux_size[0], bindings, &count,
+						       &scratch), 0);
+	KUNIT_EXPECT_EQ(test, count, 2);
+	KUNIT_EXPECT_EQ(test, bindings[0].index, 5);
+	KUNIT_EXPECT_EQ(test, bindings[0].class, 0);
+	KUNIT_EXPECT_EQ(test, bindings[1].index, 4);
+	KUNIT_EXPECT_EQ(test, bindings[1].class, 1);
+	KUNIT_EXPECT_EQ(test, scratch.index, 6);
+	KUNIT_EXPECT_EQ(test, scratch.class, 0);
+	KUNIT_EXPECT_EQ(test, scratch.hwx_vm, 0x30000000);
+	/* A scratch program needs somewhere to put the scratch binding. */
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, aux_size[0], bindings, &count,
+						       NULL), -EINVAL);
+	/* The scratch entry: input type and direction, exact __bss size, own ID. */
+	g[ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + 8] = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, aux_size[0], bindings, &count,
+						       &scratch), -ENOEXEC);
+	g[ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + 8] = 0;
+	put_unaligned_le64(0x400000, g + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY +
+			   0x20);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, aux_size[0], bindings, &count,
+						       &scratch), -ENOEXEC);
+	put_unaligned_le64(0x380000, g + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY +
+			   0x20);
+	put_unaligned_le32(5, g + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, aux_size[0], bindings, &count,
+						       &scratch), -ENOEXEC);
+	put_unaligned_le32(6, g + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY + 4);
+	/* Without its scratch entry the section no longer describes the program. */
+	put_unaligned_le32(2, g + ANE_H16_GENERIC_COUNT);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, aux_size[0] -
+						       ANE_H16_GENERIC_ENTRY, bindings,
+						       &count, &scratch), -ENOEXEC);
+	put_unaligned_le32(3, g + ANE_H16_GENERIC_COUNT);
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, g, aux_size[0], bindings, &count,
+						       &scratch), 0);
+
+	/* Operation refs {3: scratch 6, 6: x 5, 7: y 4, 8: kernel 1007}. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(o + 4 + 8), 4);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(o + 4 + 0xc), 3);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(o + 4 + 0x10), 6);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(o + 4 + 0x24), 8);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(o + 4 + 0x28), 1007);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), 0);
+	/* The legacy kernel tag 2 asserts the H17 firmware. */
+	put_unaligned_le32(2, o + 4 + 0x28);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), -ENOEXEC);
+	/* A kernel program must bind its kernel. */
+	put_unaligned_le32(3, o + 4 + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), -ENOEXEC);
+	put_unaligned_le32(4, o + 4 + 8);
+	put_unaligned_le32(1007, o + 4 + 0x28);
+	/* Each tag must name the resource at its slot's descriptor base. */
+	put_unaligned_le32(5, o + 4 + 0x10);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), -ENOEXEC);
+	put_unaligned_le32(6, o + 4 + 0x10);
+	put_unaligned_le32(4, o + 4 + 0xc);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), -ENOEXEC);
+	put_unaligned_le32(6, o + 4 + 0xc);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), -ENOEXEC);
+	put_unaligned_le32(3, o + 4 + 0xc);
+	/* Sizes follow the record count. */
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1] - 4,
+							 bindings, count, &scratch), -ENOEXEC);
+	put_unaligned_le32(0, o);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), -ENOEXEC);
+	put_unaligned_le32(1, o);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, aux_size[1],
+							 bindings, count, &scratch), 0);
+}
+
+/*
+ * The MobileNet program through an H17 session: LOAD places the whole
+ * kernel pages, EXECUTE names x, y and the kernel-owned scratch, and only
+ * the first EXECUTE after the program change is queued.
+ */
+static void program_h17_mobilenet_test(struct kunit *test)
+{
+	static const u32 ids[3] = { 5, 4, 6 }, classes[3] = { 0, 1, 0 };
+	/* Whole HWX sections: the input is 0x49800 of tensor in a 0x4c000 section. */
+	static const u64 sizes[3] = { 0x4c000, 458752, 0x380000 };
+	struct ane_h16_hwx_snapshot *snapshot = mobilenet_snapshot(test);
+	struct prog_fw *f = fw_create_family(test, 17);
+	struct ane_h16_program *p = NULL;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	const u8 *slot;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	mobilenet_sections(test, aux, aux_size);
+	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
+		KUNIT_ASSERT_NOT_NULL(test, aux[i]);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, p->resource_count, 2);
+	KUNIT_EXPECT_TRUE(test, p->has_scratch);
+	KUNIT_EXPECT_EQ(test, p->scratch.index, 6);
+	KUNIT_EXPECT_EQ(test, p->scratch.size, 0x380000);
+	KUNIT_EXPECT_EQ(test, p->bar_count, 0);
+	/* Output and scratch are the only device-writable mappings. */
+	KUNIT_EXPECT_EQ(test, f->writable_maps, 2);
+	slot = f->load + ANE_H16_LOAD_SLOT_OFFSET;
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(slot + ANE_H16_LOAD_SLOT_SIZE + 4), 1007);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(slot + ANE_H16_LOAD_SLOT_SIZE + 8), 3);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + ANE_H16_LOAD_SLOT_SIZE + 0x20), 0x820000);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + 2 * ANE_H16_LOAD_SLOT_SIZE + 0x20),
+			0x3110);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32((const u8 *)p->aux[3].cpu + 0xc), 28);
+
+	for (i = 0; i < 3; i++)
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->exec_length, ANE_H16_EXECUTE_BASE_SIZE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x28), 3);
+	for (i = 0; i < 3; i++) {
+		const u8 *d = f->exec + 0x60 + i * 0x30;
+
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), ids[i]);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 8), classes[i]);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x18),
+				i < 2 ? p->surfaces[i]->dva : p->scratch.mapping_dva);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x20), sizes[i]);
+	}
+	KUNIT_ASSERT_EQ(test, f->execs, 3);
+	KUNIT_EXPECT_EQ(test, f->exec_flags[0], ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, f->exec_flags[1], 0);
+	KUNIT_EXPECT_EQ(test, f->exec_flags[2], 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
+/*
+ * An H17 session switches between programs: a second LOAD succeeds, and
+ * every EXECUTE that follows a different program, a LOAD or a CREATE is
+ * queued. H16 keeps one program lifetime, and a program built for the other
+ * engine is refused before any traffic.
+ */
+static void program_h17_switch_test(struct kunit *test)
+{
+	static const u32 queued[] = { 1, 0, 1, 1, 0, 1 };
+	struct prog_fw *f = fw_create_family(test, 17), *h16 = fw_create(test);
+	struct ane_h16_program *a = NULL, *b = NULL, *c = NULL;
+	struct ane_h16_hwx_snapshot *snapshot;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	unsigned int i, sent;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, h16);
+	/* Two H17 programs: two loads of the MobileNet program. */
+	snapshot = mobilenet_snapshot(test);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	mobilenet_sections(test, aux, aux_size);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &a), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+	snapshot = mobilenet_snapshot(test);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &b), 0);
+	KUNIT_EXPECT_NE(test, a->key.program, b->key.program);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, b), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, a), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, a), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, b), 0);
+	KUNIT_ASSERT_EQ(test, f->execs, ARRAY_SIZE(queued));
+	for (i = 0; i < ARRAY_SIZE(queued); i++)
+		KUNIT_EXPECT_EQ(test, f->exec_flags[i], queued[i]);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, a), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, b), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+
+	/* An H17 program on the H16 session, and an H16 one on the H17 session. */
+	sent = h16->count;
+	snapshot = mobilenet_snapshot(test);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_load(&h16->s, snapshot, aux, aux_size, &c),
+			-ENOEXEC);
+	KUNIT_EXPECT_EQ(test, h16->count, sent);
+	sent = f->count;
+	KUNIT_EXPECT_EQ(test, fw_load_program(f, &c), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_PTR_EQ(test, c, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
+ * H17 sends no custom BAR record, even for a linear program whose descriptor
+ * names the mcache field: the H17 firmware asserts on the record.
+ */
+static void program_h17_no_custom_bar_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create_family(test, 17);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	/* The linear add128 fixture is an H16 HWX; let this H17 session take it. */
+	f->soc.hwx_subtype = ANE_HWX_SUBTYPE_H16;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, p->bar_count, 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->exec_length, ANE_H16_EXECUTE_BASE_SIZE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 0);
+	/*
+	 * H17 descriptors carry the size the generic section declared (this
+	 * fixture declares the span), not the larger HWX section.
+	 */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20), p->hwx.surfaces[0].span);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x90 + 0x20), p->hwx.surfaces[1].span);
+	KUNIT_EXPECT_NE(test, p->hwx.surfaces[0].span, p->hwx.surfaces[0].section.size);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
 	KUNIT_CASE(program_add128_hwx_test),
@@ -1224,6 +1650,10 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_shared_tag_test),
 	KUNIT_CASE(program_pool_test),
 	KUNIT_CASE(program_pool_recycle_test),
+	KUNIT_CASE(program_h17_hwx_test),
+	KUNIT_CASE(program_h17_sections_test),
+	KUNIT_CASE(program_h17_mobilenet_test),
+	KUNIT_CASE(program_h17_switch_test),
 	{}
 };
 

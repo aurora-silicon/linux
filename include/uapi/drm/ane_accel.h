@@ -21,9 +21,9 @@ extern "C" {
  * - ane_t6021 (H14 family: T6020, T6021, T6022, T8112) implements ABI
  *   version %DRM_ANE_ABI_V2: GET_CAPS, BO_INIT, BO_FREE, PROG_LOAD,
  *   PROC_CREATE and EXEC.
- * - ane_t6021 on H16 (T6041) implements ABI version %DRM_ANE_ABI_V3:
- *   GET_CAPS, H16_LOAD and H16_EXEC. The node exists only after the staged
- *   H16 opt-in reached its program stage.
+ * - ane_t6021 on H16 (T6041) and H17 (T8140) implements ABI version
+ *   %DRM_ANE_ABI_V3: GET_CAPS, H16_LOAD and H16_EXEC. The node exists only
+ *   after the staged opt-in reached its program stage.
  *
  * The DRM_IOCTL_VERSION major and &drm_ane_get_caps.abi_version both give
  * the ABI version. The two versions share the ioctl numbers and the
@@ -41,6 +41,7 @@ extern "C" {
 #define DRM_ANE_CHIP_H13	13
 #define DRM_ANE_CHIP_H14	14
 #define DRM_ANE_CHIP_H16	16
+#define DRM_ANE_CHIP_H17	17
 
 /* ABI version 1: entries of &drm_ane_submit.handles */
 #define DRM_ANE_TILE_COUNT	0x20
@@ -94,8 +95,8 @@ extern "C" {
  * @flags: In. No flags are defined: must be zero.
  * @size: Out. Bytes of this structure that the driver filled in.
  * @abi_version: Out. %DRM_ANE_ABI_V1, %DRM_ANE_ABI_V2 or %DRM_ANE_ABI_V3.
- * @chip_family: Out. %DRM_ANE_CHIP_H13, %DRM_ANE_CHIP_H14 or
- *	%DRM_ANE_CHIP_H16.
+ * @chip_family: Out. %DRM_ANE_CHIP_H13, %DRM_ANE_CHIP_H14,
+ *	%DRM_ANE_CHIP_H16 or %DRM_ANE_CHIP_H17.
  * @section_size: Out. Size of the &drm_ane_section entries that PROG_LOAD
  *	reads, or 0 if the driver has no PROG_LOAD.
  * @bind_size: Out. Size of the &drm_ane_generic_bind entries that PROG_LOAD
@@ -296,16 +297,19 @@ struct drm_ane_h16_section {
  * @section_count: In. Exactly %DRM_ANE_H16_SECTIONS.
  * @flags: In. No flags are defined: must be zero.
  * @surface_count: Out. Surfaces of the program, inputs and the one output in
- *	the HWX segment order that H16_EXEC uses.
+ *	the HWX segment order that H16_EXEC uses. A program's __DATA scratch
+ *	is kernel-owned and not a surface.
  * @pad: Must be zero.
  * @surface_size: Out. Bytes of each surface, for @surface_count entries.
  * @surface_direction: Out. 1 for an input, 2 for the output.
  *
  * The kernel validates the HWX, places every section in its own private
  * mapping, then loads the program and creates its process. The program
- * belongs to this file and is unloaded when the file closes. Each firmware
- * boot accepts one program: a second H16_LOAD fails with -EBUSY, also after
- * the first program closed. A reboot starts a new firmware boot.
+ * belongs to this file and is unloaded when the file closes. The HWX must
+ * be compiled for the engine that GET_CAPS reports. On H17 a firmware boot
+ * accepts any number of programs, one per file. On H16 a firmware boot
+ * accepts one program: a second H16_LOAD fails with -EBUSY, also after the
+ * first program closed, and a reboot starts a new firmware boot.
  */
 struct drm_ane_h16_load {
 	__u64 hwx_ptr;

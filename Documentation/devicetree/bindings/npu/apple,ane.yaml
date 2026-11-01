@@ -139,6 +139,21 @@ properties:
       containing 16 KiB pages in its private domain. These are MMIO ranges,
       not allocatable DMA memory or additional preload segments.
 
+  apple,dapf-ranges:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 8
+    maxItems: 8
+    description: Four inclusive SID0 physical MMIO start/end pairs
+
+  apple,preload-data-sha256:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 32
+    maxItems: 32
+    description:
+      Bootloader-produced digest of the live reserved DATA including all
+      personalized parameter bytes. This establishes preservation of that
+      boot's DATA, not a cross-build firmware identity. TEXT has a driver pin.
+
   apple,ane-type:
     $ref: /schemas/types.yaml#/definitions/uint32
     enum: [0x110, 0x200]
@@ -203,19 +218,18 @@ allOf:
     then:
       properties:
         reg:
-          maxItems: 6
+          minItems: 3
+          maxItems: 3
         reg-names:
-          minItems: 1
           items:
             - const: engine
             - const: pmgr
-            - const: aux-0
-            - const: aux-1
-            - const: aux-2
-            - const: aux-3
+            - const: pwgate
+      required:
+        - apple,dapf-ranges
   - if:
       required:
-        - apple,firmware-iovas
+        - apple,preload-data-sha256
     then:
       properties:
         memory-region:
@@ -384,13 +398,19 @@ examples:
 
         ane@400000000 {
             compatible = "apple,t8140-ane";
-            reg = <0x4 0x0 0x0 0x2000000>;
-            reg-names = "engine";
+            reg = <0x4 0x0 0x0 0x2000000>,
+                  <0x3 0x00700000 0x0 0x18000>,
+                  <0x3 0x00726680 0x0 0x34>;
+            reg-names = "engine", "pmgr", "pwgate";
             interrupt-parent = <&aic>;
             interrupts = <AIC_IRQ 655 IRQ_TYPE_LEVEL_HIGH>,
                          <AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
             iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
             power-domains = <&ps_ane_sys>;
+            apple,dapf-ranges = /bits/ 64 <0x321668000 0x321668003
+                                         0x30070c000 0x30070c013
+                                         0x300700290 0x300700293
+                                         0x482668000 0x482668003>;
             status = "disabled";
         };
     };

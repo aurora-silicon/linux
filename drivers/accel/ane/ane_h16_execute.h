@@ -2,6 +2,7 @@
 #ifndef __ANE_H16_EXECUTE_H__
 #define __ANE_H16_EXECUTE_H__
 
+#include <linux/bits.h>
 #include <linux/limits.h>
 
 #include "ane_h16_protocol.h"
@@ -11,6 +12,18 @@
 #define ANE_H16_BUFFER_STRIDE 0x30
 #define ANE_H16_MAX_BUFFERS 64
 #define ANE_H16_CUSTOM_BAR_STRIDE 0x18
+/*
+ * Request flags word. Bit 0 keeps the request off the firmware's direct
+ * submission path and queues it on the full execution loop (EXELOOP), which
+ * installs a fresh BAR context and the per-priority L2-spill mapping. The
+ * direct path reuses both and never sets them up. Measured on H17 (T8140):
+ * without it, the first job after the engine ran a different program can
+ * write through that program's stale output binding. Set it on the first
+ * request of each program on the engine, the first one after boot included.
+ */
+#define ANE_H16_EXECUTE_FLAGS 0x30
+#define ANE_H16_EXECUTE_FLAG_QUEUED BIT(0)
+#define ANE_H16_EXECUTE_FLAGS_KNOWN ANE_H16_EXECUTE_FLAG_QUEUED
 /* Conservative observed-version ceiling, not a firmware maximum. */
 #define ANE_H16_MAX_CUSTOM_BARS 2
 
@@ -42,22 +55,12 @@ struct ane_h16_custom_bar {
 	u64 value;
 };
 
-/*
- * Request flags (+0x30) bit 0 vetoes the firmware's direct submission path
- * and queues the request on EXELOOP, which installs a fresh BAR context and
- * the per-priority L2-spill mapping. The direct path reuses both and never
- * sets them up. Set the bit on the first request of each program on the
- * engine, including the first request after boot.
- */
-#define ANE_H16_EXECUTE_QUEUED BIT(0)
-
 struct ane_h16_execute {
 	struct ane_h16_request_key key;
 	const struct ane_h16_execute_buffer *buffers;
 	unsigned int buffer_count;
 	const struct ane_h16_custom_bar *bars;
 	unsigned int bar_count;
-	/* ANE_H16_EXECUTE_QUEUED or 0, at request +0x30. */
 	u32 flags;
 };
 
@@ -75,10 +78,10 @@ ane_h16_execute_encode(void *command, size_t length, const struct ane_h16_execut
 	size_t expected;
 
 	if (!p || !call || !call->buffers || !call->buffer_count ||
-	    (call->flags & ~ANE_H16_EXECUTE_QUEUED) ||
 	    call->buffer_count > ANE_H16_MAX_BUFFERS ||
 	    call->bar_count > ANE_H16_MAX_CUSTOM_BARS ||
-	    (call->bar_count && !call->bars))
+	    (call->bar_count && !call->bars) ||
+	    (call->flags & ~ANE_H16_EXECUTE_FLAGS_KNOWN))
 		return -EINVAL;
 	expected = ANE_H16_EXECUTE_BASE_SIZE + call->bar_count * ANE_H16_CUSTOM_BAR_STRIDE;
 	if (length != expected)
@@ -115,7 +118,7 @@ ane_h16_execute_encode(void *command, size_t length, const struct ane_h16_execut
 	put_unaligned_le32(5, p + 0x18);
 	put_unaligned_le64(call->key.uuid, p + 0x20);
 	put_unaligned_le32(call->buffer_count, p + 0x28);
-	put_unaligned_le32(call->flags, p + 0x30);
+	put_unaligned_le32(call->flags, p + ANE_H16_EXECUTE_FLAGS);
 	for (i = 0; i < call->buffer_count; i++) {
 		const struct ane_h16_execute_buffer *b = &call->buffers[i];
 		u8 *d = p + ANE_H16_BUFFER_OFFSET + i * ANE_H16_BUFFER_STRIDE;

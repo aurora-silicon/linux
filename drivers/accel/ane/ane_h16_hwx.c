@@ -302,8 +302,9 @@ static int hwx_program(struct hwx_parser *p)
 	memcpy(expected + (mixed ? 0x8b0 : 0x890), c + (mixed ? 0x8b0 : 0x890), 4);
 	memcpy(expected + (mixed ? 0x8b8 : 0x898), "main", 5);
 	if (!memcmp(c, expected, length))
-		ret = ane_h16_task_stream_validate(p->bytes + info->text.offset,
-						   info->text.size, info->tasks);
+		ret = ane_hx_task_stream_validate(p->bytes + info->text.offset,
+						  info->text.size, info->tasks,
+						  info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1);
 	kfree(expected);
 	return ret;
 }
@@ -495,7 +496,9 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 
 	if (!c || !info || size < 32 || size > ANE_H16_HWX_MAX ||
 	    get_unaligned_le32(c) != 0xbeefface || get_unaligned_le32(c + 4) != 0x80 ||
-	    get_unaligned_le32(c + 8) != 7 || get_unaligned_le32(c + 12) != 2 ||
+	    (get_unaligned_le32(c + 8) != ANE_HWX_SUBTYPE_H16 &&
+	     get_unaligned_le32(c + 8) != ANE_HWX_SUBTYPE_H17) ||
+	    get_unaligned_le32(c + 12) != 2 ||
 	    get_unaligned_le32(c + 24) != 0x200000 || get_unaligned_le32(c + 28))
 		return -ENOEXEC;
 	count = get_unaligned_le32(c + 16);
@@ -508,6 +511,7 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	p->bytes = bytes;
 	p->size = size;
 	p->command_end = 32 + (size_t)length;
+	p->info.subtype = get_unaligned_le32(p->bytes + 8);
 	for (i = 0; i < count; i++) {
 		u32 cmd, len;
 

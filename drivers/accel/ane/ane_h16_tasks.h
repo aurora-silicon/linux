@@ -34,18 +34,21 @@ static inline bool ane_h16_register_valid(u32 word)
 }
 
 /*
- * H16 streams begin with little-endian u32 1 and twelve reserved zero bytes.
- * This structural gate does not replace container/tensor/aperture validation.
+ * A stream opens with a 16-byte frame: little-endian u32 @prologue, then
+ * twelve reserved zero bytes. H16 programs open with 1; every measured H17
+ * program opens with 0. The last task may end at the end of the section;
+ * every other task is padded with zeros to 16 bytes. This structural gate
+ * does not replace container/tensor/aperture validation.
  */
 static inline int
-ane_h16_task_stream_validate(const void *text, size_t size, u32 expected_tasks)
+ane_hx_task_stream_validate(const void *text, size_t size, u32 expected_tasks, u32 prologue)
 {
 	const u8 *p = text;
 	size_t pos = 16;
 	u32 tasks = 0;
 
 	if (!p || !expected_tasks || size < 16 || size > ANE_H16_TASK_MAX ||
-	    (size & 3) || get_unaligned_le32(p) != 1 ||
+	    (size & 3) || get_unaligned_le32(p) != prologue ||
 	    memchr_inv(p + 4, 0, 12))
 		return -ENOEXEC;
 	while (pos < size) {
@@ -94,15 +97,20 @@ ane_h16_task_stream_validate(const void *text, size_t size, u32 expected_tasks)
 			}
 			rec += count * 4;
 		}
-		/* Tasks start 16-byte aligned; the last one may end the stream. */
-		padded = min_t(size_t, ALIGN(end, 16), size);
-		if (memchr_inv(p + end, 0, padded - end))
+		padded = end == size ? end : ALIGN(end, 16);
+		if (padded > size || memchr_inv(p + end, 0, padded - end))
 			return -ENOEXEC;
 		pos = padded;
 		if (++tasks > expected_tasks)
 			return -ENOEXEC;
 	}
 	return tasks == expected_tasks ? 0 : -ENOEXEC;
+}
+
+static inline int
+ane_h16_task_stream_validate(const void *text, size_t size, u32 expected_tasks)
+{
+	return ane_hx_task_stream_validate(text, size, expected_tasks, 1);
 }
 
 /* Section ordinal is supplied only by the validated complete section table.

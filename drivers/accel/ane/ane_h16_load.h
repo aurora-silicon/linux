@@ -27,6 +27,8 @@ struct ane_h16_process_binding {
 	u64 hwx_vm;
 	u32 index;
 	u32 class;
+	/* Buffer size the generic section declared at LOAD. */
+	u64 bytes;
 };
 
 /* Geometry helpers do not prove DMA ownership or install a process. All

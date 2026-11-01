@@ -27,6 +27,9 @@ static const u32 ane_h16_power_words[] = {
 	0x3c0, 0xc008, 0xc000, 0xc010, 0xc018,
 };
 
+static const char * const ane_h17_reg_names[] = { "engine", "pmgr", "pwgate" };
+static const u32 ane_h17_reg_sizes[] = { 0x2000000, 0x18000, 0x34 };
+
 const struct ane_fw_platform ane_h16_platform = {
 	.h16_profiles = ane_h16_profiles,
 	.h16_profile_count = ARRAY_SIZE(ane_h16_profiles),
@@ -72,12 +75,23 @@ const struct ane_fw_platform ane_h17_platform = {
 	.task_generation = 19,
 	.interrupt_count = 2,
 	.owner = ANE_FW_OWNER_EXCLAVE,
+	.reg_names = ane_h17_reg_names,
+	.reg_sizes = ane_h17_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_h17_reg_names),
+	.wrapper = 0x1600000,
+	.mailbox = 0x1608000,
+	.scratch = 0x1880020,
+	.doorbell = 0x1884000,
+	.irq_status = 0x188c000,
+	.irq_ack = 0x1890000,
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
-	.stream_mask = BIT(0) | BIT(11),
+	.stream_mask = BIT(0),
 	.firmware_preloaded = true,
 	.safe_reset = false,
-	/* No H16 register-map inference is executable on H17. */
+	/* Cold AP-direct acquisition is staged before any power or DMA write.
+	 * The observer uses the measured H17 26.6.2 register layout.
+	 */
 };
 
 /*
@@ -158,7 +172,7 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	 * Check before resources, firmware, power, IOMMU or engine access.
 	 */
 	if (soc->owner == ANE_FW_OWNER_EXCLAVE) {
-		dev_info(dev, "H17 ANE: Linux exclave ownership handoff unavailable; refusing probe\n");
+		dev_info(dev, "H17 ANE: cold acquisition requires staged preflight; refusing direct probe\n");
 		return -EOPNOTSUPP;
 	}
 	if (of_property_read_bool(np, "apple,exclave-assigned")) {

@@ -4,6 +4,7 @@
 
 #include "ane_fw_platform.h"
 #include "ane_fw_protocol.h"
+#include "ane_h16_execute.h"
 
 #define ANE_FW_IO 1
 #define ANE_FW_SHAREDMALLOC 5
@@ -79,7 +80,15 @@ struct ane_fw_transport {
 	struct ane_fw_surface ipc;
 	struct ane_fw_surface pool;
 	struct ane_fw_surface shared[ANE_FW_SHARED_MAX];
-	u32 shared_tag[ANE_FW_SHARED_MAX];
+	bool shared_retired[ANE_FW_SHARED_MAX];
+	u32 shared_tags[ANE_FW_SHARED_MAX];
+	/* FREE reply form: 1 (H16 26A428) or DVA|1 (H17 25G83); else refused. */
+	bool native_free;
+	bool allow_free;
+	u32 free_count;
+	/* H17: program and process of the last published EXECUTE. */
+	bool bar_known;
+	u32 bar_program, bar_process;
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	struct ane_fw_transaction pending[ANE_FW_CHANNELS];
 	u32 head[ANE_FW_CHANNELS];
@@ -92,8 +101,6 @@ struct ane_fw_transport {
 	/* relax() calls made by every wait so far; callers diff it. */
 	u64 polls;
 	bool armed;
-	bool native_free;
-	bool shared_retired[ANE_FW_SHARED_MAX];
 };
 
 /* The live shared allocation the firmware asked for under tag, or NULL. */
@@ -103,7 +110,7 @@ ane_fw_transport_shared_tagged(const struct ane_fw_transport *t, u32 tag)
 	u32 i;
 
 	for (i = 0; i < t->shared_count; i++)
-		if (t->shared_tag[i] == tag && !t->shared_retired[i])
+		if (t->shared_tags[i] == tag && !t->shared_retired[i])
 			return &t->shared[i];
 	return NULL;
 }
@@ -211,6 +218,54 @@ static inline int ane_fw_transport_arm(struct ane_fw_transport *t)
 	return 0;
 }
 
+/*
+ * The H17 firmware's direct submission path reuses the engine's current BAR
+ * context. When that context came from a different program, a job (of a new
+ * or previously loaded program, even after the earlier one was destroyed) can
+ * write through the earlier program's output binding. Bit 0 of the request
+ * flags word queues the job for the full execution loop instead, which
+ * installs a fresh BAR context. Queue the first EXECUTE after any change of program, process or
+ * program lifetime; later jobs of the same process keep the direct path. This
+ * lifts the one-program-per-firmware-session limit. Applies to the pool copy,
+ * so every published EXECUTE follows the rule. H16 shares the firmware
+ * architecture but has not executed under Linux yet; it is left unchanged.
+ */
+static inline void
+ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
+{
+	u16 id = get_unaligned_le16(copy + 4);
+	u32 program, process;
+
+	if (id != 0x20c) {
+		/* LOAD, UNLOAD, CREATE and TERMINATE may reuse IDs. */
+		if (id >= 0x200 && id <= 0x203)
+			t->bar_known = false;
+		return;
+	}
+	if (size < ANE_H16_EXECUTE_FLAGS + 4) {
+		t->bar_known = false;
+		return;
+	}
+	program = get_unaligned_le32(copy + 8);
+	process = get_unaligned_le32(copy + 0xc);
+	if (!t->bar_known || t->bar_program != program || t->bar_process != process)
+		put_unaligned_le32(get_unaligned_le32(copy + ANE_H16_EXECUTE_FLAGS) |
+				   ANE_H16_EXECUTE_FLAG_QUEUED, copy + ANE_H16_EXECUTE_FLAGS);
+	t->bar_known = true;
+	t->bar_program = program;
+	t->bar_process = process;
+}
+
+/*
+ * Whether one firmware session may run several programs: the transport
+ * queues the first EXECUTE after every program change (H17, above). H16
+ * shares the firmware design, but the rule is unconfirmed there.
+ */
+static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t)
+{
+	return t->soc->chip_family == 17;
+}
+
 /* Commands are copied into a monotonic pool arena, never external DMA memory. */
 static inline int
 ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
@@ -255,6 +310,8 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		.active = true,
 	};
 	t->pool_used = offset + size;
+	if (ane_fw_transport_switch_safe(t))
+		ane_fw_transport_bar_context(t, (u8 *)t->pool.cpu + offset, size);
 	t->ops->store64(t->ctx, p + 8, size);
 	t->ops->store64(t->ctx, p + 16, size);
 	t->ops->write_barrier(t->ctx);
@@ -402,14 +459,22 @@ static inline int ane_fw_shared_size(u64 word0, u64 bytes, u64 tag, size_t *size
 	return 0;
 }
 
-/* H16 26A428 native FREE, r5 section 6. Reply before revoking authority.
- * The backend retains backing storage, mappings and quota until reset.
+/*
+ * SHAREDMALLOC FREE of a live allocation. Backing storage, its mapping and
+ * its quota stay until reset; FREE only retires the surface, so no later
+ * report resolves into it. Reply before revoking authority. H16 26A428 (r5
+ * section 6) takes the reply 1. H17 25G83 takes the observed DVA|1, and its
+ * request carries zero length and handle.
  */
 static inline int
-ane_fw_transport_native_free(struct ane_fw_transport *t, void *slot, u64 dva)
+ane_fw_transport_free(struct ane_fw_transport *t, void *slot, u64 dva, u64 bytes, u64 tag)
 {
 	unsigned int i;
 
+	if (!t->native_free && !t->allow_free)
+		return -EOPNOTSUPP;
+	if (!t->native_free && (bytes || tag || !IS_ALIGNED(dva, SZ_16K)))
+		return -EPROTO;
 	for (i = 0; i < t->shared_count; i++)
 		if (!t->shared_retired[i] && dva == t->shared[i].dva)
 			break;
@@ -418,10 +483,11 @@ ane_fw_transport_native_free(struct ane_fw_transport *t, void *slot, u64 dva)
 	t->ops->store64(t->ctx, (u8 *)slot + 8, 0);
 	t->ops->store64(t->ctx, (u8 *)slot + 16, 0);
 	t->ops->write_barrier(t->ctx);
-	t->ops->store64(t->ctx, slot, 1);
+	t->ops->store64(t->ctx, slot, t->native_free ? 1 : dva | 1);
 	t->ops->write_barrier(t->ctx);
 	ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
 	t->shared_retired[i] = true;
+	t->free_count++;
 	ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
 	return 0;
 }
@@ -449,8 +515,8 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 	word2 = t->ops->load64(t->ctx, p + 16);
 	if (!word0 && !word1 && !word2)
 		return -EAGAIN;
-	if (t->native_free && word0) {
-		ret = ane_fw_transport_native_free(t, p, word0);
+	if (word0) {
+		ret = ane_fw_transport_free(t, p, word0, word1, word2);
 		if (ret)
 			goto refused;
 		return 0;
@@ -478,7 +544,7 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 			goto refused;
 		}
 	}
-	t->shared_tag[t->shared_count] = (u32)word2;
+	t->shared_tags[t->shared_count] = word2;
 	t->shared[t->shared_count++] = s;
 	t->shared_bytes += size;
 	t->ops->store64(t->ctx, p + 8, 0);

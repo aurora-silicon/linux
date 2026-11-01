@@ -924,6 +924,163 @@ static void ane_transport_wait_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->now, TEST_DEADLINE);
 }
 
+static void ane_transport_deny_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	const u16 ids[] = { 0x27, 0x28, 0x30, 0x31, 0x34 };
+	u8 command[12] = {};
+	int ret;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	for (unsigned int i = 0; i < ARRAY_SIZE(ids); i++) {
+		put_unaligned_le16(ids[i], command + 4);
+		f->count = 0;
+		ret = ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+					       sizeof(command), TEST_DEADLINE);
+		KUNIT_EXPECT_EQ(test, ret, -EPERM);
+		KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+		KUNIT_EXPECT_FALSE(test, f->t.pending[ANE_FW_IO].active);
+		KUNIT_EXPECT_EQ(test, f->t.pool_used, (size_t)TEST_RESERVED);
+	}
+}
+
+static void ane_transport_free_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *slot;
+	u64 dva;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	dva = f->t.shared[0].dva;
+	KUNIT_EXPECT_EQ(test, f->t.shared_tags[0], ANE_FW_SHARED_EXPP);
+	f->t.allow_free = true;
+	ane_test_shared_request(f, dva, 0, 0);
+	slot = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot), dva | 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + 8), 0ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + 16), 0ULL);
+	KUNIT_EXPECT_EQ(test, f->t.free_count, 1U);
+	KUNIT_EXPECT_TRUE(test, f->t.shared_retired[0]);
+	KUNIT_EXPECT_NOT_NULL(test, f->t.shared[0].cpu);
+	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_report(&f->t, dva, 8), NULL);
+	/* Duplicate FREE cannot acknowledge or retire a different mapping. */
+	ane_test_shared_request(f, dva, 0, 0);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOENT);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+}
+
+static void ane_transport_free_refusal_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_16K, 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	ane_test_shared_request(f, f->t.shared[0].dva, 0, 0);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, f->t.shared_retired[0]);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+}
+
+/* Publish one EXECUTE on the data channel; return its flags word as copied. */
+static u32 ane_test_execute(struct ane_transport_test *f, u32 program, u32 process)
+{
+	const struct ane_fw_transaction *tx = &f->t.pending[ANE_FW_DATA_CHAIN];
+	u8 *command = kunit_kzalloc(f->test, ANE_H16_EXECUTE_BASE_SIZE, GFP_KERNEL);
+	u32 flags;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(f->test, command);
+	put_unaligned_le16(0x20c, command + 4);
+	put_unaligned_le32(program, command + 8);
+	put_unaligned_le32(process, command + 0xc);
+	ret = ane_fw_transport_publish(&f->t, ANE_FW_DATA_CHAIN, command,
+				       ANE_H16_EXECUTE_BASE_SIZE, TEST_DEADLINE);
+	KUNIT_EXPECT_EQ(f->test, ret, 0);
+	flags = get_unaligned_le32((u8 *)f->t.pool.cpu + (tx->dva - f->t.pool.dva) +
+				   ANE_H16_EXECUTE_FLAGS);
+	/* The caller's request is never written. */
+	KUNIT_EXPECT_EQ(f->test, get_unaligned_le32(command + ANE_H16_EXECUTE_FLAGS), 0U);
+	ane_test_reply(f, ANE_FW_DATA_CHAIN);
+	KUNIT_EXPECT_EQ(f->test, ane_fw_transport_poll(&f->t, ANE_FW_DATA_CHAIN), 0);
+	return flags;
+}
+
+static void ane_test_io(struct ane_transport_test *f, u16 id, u32 program)
+{
+	u8 command[0x1c0] = {};
+	int ret;
+
+	put_unaligned_le16(id, command + 4);
+	put_unaligned_le32(program, command + 8);
+	ret = ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+				       id == 0x200 ? sizeof(command) : 16, TEST_DEADLINE);
+	KUNIT_EXPECT_EQ(f->test, ret, 0);
+	ane_test_reply(f, ANE_FW_IO);
+	KUNIT_EXPECT_EQ(f->test, ane_fw_transport_poll(&f->t, ANE_FW_IO), 0);
+}
+
+static void ane_transport_second_load_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	f->soc.chip_family = 17;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	/* A later program is admitted after UNLOAD within one firmware boot. */
+	ane_test_io(f, 0x200, 0);
+	ane_test_io(f, 0x201, 0);
+	ane_test_io(f, 0x200, 1);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
+static void ane_transport_bar_context_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	const u32 q = ANE_H16_EXECUTE_FLAG_QUEUED;
+
+	f->soc.chip_family = 17;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	/* Unknown context after start: queue the first job. */
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), q);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), 0U);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), 0U);
+	/* Switching to another loaded program and back queues each switch. */
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 1, 1), q);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 1, 1), 0U);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), q);
+	/* Same program, different process. */
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 2), q);
+	/* Program lifetime commands forget the context: IDs may be reused. */
+	ane_test_io(f, 0x203, 0);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 2), q);
+	ane_test_io(f, 0x201, 0);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 2), q);
+	ane_test_io(f, 0x200, 0);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 2), q);
+	ane_test_io(f, 0x202, 0);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 2), q);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 2), 0U);
+	/* Other IO commands keep it. */
+	ane_test_io(f, 3, 0);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 2), 0U);
+}
+
+static void ane_transport_bar_context_h16_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	f->soc.chip_family = 16;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	/* Not yet measured on H16: requests are published unchanged. */
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 0, 0), 0U);
+	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 1, 1), 0U);
+}
+
 /* Each relax() learns how long its wait has run, and every call is counted. */
 static void ane_transport_wait_polls_test(struct kunit *test)
 {
@@ -960,6 +1117,12 @@ static void ane_transport_poll_sleep_test(struct kunit *test)
 }
 
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_transport_second_load_test),
+	KUNIT_CASE(ane_transport_bar_context_test),
+	KUNIT_CASE(ane_transport_bar_context_h16_test),
+	KUNIT_CASE(ane_transport_deny_test),
+	KUNIT_CASE(ane_transport_free_test),
+	KUNIT_CASE(ane_transport_free_refusal_test),
 	KUNIT_CASE(ane_transport_table_test),
 	KUNIT_CASE(ane_transport_table_roles_test),
 	KUNIT_CASE(ane_transport_table_bounds_test),
