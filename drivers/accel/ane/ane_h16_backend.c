@@ -78,7 +78,7 @@ static const char *const ane_h16_build_names[ANE_H16_PRELOAD_BUILDS] = {
 static struct debugfs_blob_wrapper ane_h16_dump[2];
 static struct dentry *ane_h16_debugfs;
 /* Failure-only copies; firmware remains live, so these are not atomic dumps. */
-static struct debugfs_blob_wrapper ane_h16_failure[3 + ANE_FW_SHARED_MAX];
+static struct debugfs_blob_wrapper ane_h16_failure[4 + ANE_FW_SHARED_MAX];
 
 static bool ane_h16_observing(void)
 {
@@ -1125,11 +1125,12 @@ static void ane_h16_failure_publish(struct ane_h16_device *h)
 	}
 	ane_h16_failure_copy(h, 1, "failure-ipc", b->ipc.cpu, b->ipc.size, b->ipc.dva);
 	ane_h16_failure_copy(h, 2, "failure-pool", b->pool.cpu, b->pool.size, b->pool.dva);
+	ane_h16_failure_copy(h, 3, "failure-heap", b->heap.cpu, b->heap.size, b->heap.dva);
 	for (i = 0; i < t->shared_count; i++) {
 		char name[32];
 
 		snprintf(name, sizeof(name), "failure-shared-%u", i);
-		ane_h16_failure_copy(h, 3 + i, name, t->shared[i].cpu,
+		ane_h16_failure_copy(h, 4 + i, name, t->shared[i].cpu,
 				     t->shared[i].size, t->shared[i].dva);
 	}
 }
