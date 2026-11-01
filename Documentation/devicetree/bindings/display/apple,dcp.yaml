@@ -72,6 +72,8 @@ properties:
   power-domains:
     maxItems: 1
 
+  dma-noncoherent: true
+
   resets:
     maxItems: 1
 
@@ -299,6 +301,7 @@ properties:
     properties:
       iommus:
         maxItems: 1
+      dma-noncoherent: true
       memory-region:
         minItems: 1
         maxItems: 64

@@ -16,6 +16,8 @@
  * frontend mappings it adds memory-region and apple,j713-inherited-mappings
  * to piodma and display-subsystem and enables them and disp0_dart.
  * apple,j713-native-piodma and apple,j713-native-scanout opt in to that.
+ * The DCP, PIODMA and scanout paths use non-coherent DMA only, so those
+ * nodes are marked dma-noncoherent.
  * The DART driver also reads the ADT through the loader's phram "adt"
  * region. Without that handoff the DCP and frontend are refused.
  *
@@ -81,6 +83,7 @@
 		mbox-names = "mbox";
 		iommus = <&dcp_dart 23>;
 		power-domains = <&ps_disp_cpu>;
+		dma-noncoherent;
 		apple,j713-native-piodma;
 		apple,j713-native-scanout;
 		/* Full 2560x1664 panel including the notch rows, 224 ppi. */
@@ -91,6 +94,7 @@
 
 		disp0_piodma: piodma {
 			iommus = <&disp0_dart 16>;
+			dma-noncoherent;
 			status = "disabled"; /* Enabled by the loader. */
 		};
 	};
@@ -98,6 +102,7 @@
 	display: display-subsystem {
 		compatible = "apple,t8132-display-subsystem", "apple,t8132-display-diagnostics";
 		iommus = <&disp0_dart 0>;
+		dma-noncoherent;
 		status = "disabled"; /* Enabled by the loader. */
 	};
 };
