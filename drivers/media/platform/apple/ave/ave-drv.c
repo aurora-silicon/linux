@@ -76,6 +76,7 @@ const struct ave_variant ave_t8112 = {
 	.timebase_multiplier = 1,
 	.vcbar_mask = 0x000003fffffff800ULL,
 	.vcbar_flags = 0x0102000000000000ULL,
+	.text_link_cell = 0x423c,
 
 	.extra0_size = 0x4000,
 	.boot_qualified = true,

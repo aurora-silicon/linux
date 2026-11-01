@@ -156,6 +156,11 @@ struct ave_variant {
 	u32 timebase_multiplier;
 	u64 vcbar_mask;
 	u64 vcbar_flags;
+	/*
+	 * TEXT offset of the 64-bit cell the loader fills with the DATA
+	 * address; it is zero in the firmware image. 0 when there is none.
+	 */
+	u32 text_link_cell;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
@@ -352,6 +357,8 @@ extern const struct ave_variant ave_t6000, ave_t8112;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
+int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
+		       u64 data_iova, u32 *crc);
 int ave_fw_probe(struct ave_dev *ave);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);

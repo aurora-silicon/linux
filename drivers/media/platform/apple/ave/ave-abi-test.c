@@ -2,6 +2,7 @@
 /* Byte equality against the pre-ABI-refactor 9003 command builders. */
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -394,11 +395,41 @@ static void ave_6070_variants(struct kunit *test)
 		t->ipc_bytes);
 }
 
+/* The loader's TEXT->DATA link cell does not change the image identity. */
+static void ave_6070_text_id(struct kunit *test)
+{
+	const u32 off = ave_t8112.text_link_cell, size = off + 0x100;
+	u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+	u32 image, crc;
+
+	KUNIT_ASSERT_NOT_NULL(test, text);
+	KUNIT_EXPECT_EQ(test, off, 0x423cU);
+	KUNIT_EXPECT_EQ(test, ave_t6000.text_link_cell, 0U);
+	for (u32 i = 0; i < size; i++)
+		text[i] = i * 7 + 3;
+	memset(text + off, 0, 8);
+	image = crc32_le(~0U, text, size) ^ ~0U;
+
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), 0);
+	KUNIT_EXPECT_EQ(test, crc, image);
+	put_unaligned_le64(0x8000d0000ULL, text + off);
+	KUNIT_EXPECT_NE(test, crc32_le(~0U, text, size) ^ ~0U, image);
+	crc = 0;
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000d0000ULL, &crc), 0);
+	KUNIT_EXPECT_EQ(test, crc, image);
+	/* Anything but zero or this boot's DATA address is another build. */
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, off, 0x8000c0000ULL, &crc),
+			-ENODEV);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, size - 4, 0, &crc), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, size + 8, 0, &crc), -EINVAL);
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
-	KUNIT_CASE(ave_6070_variants),	    {}
+	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_6070_text_id),
+	{}
 };
 
 static struct kunit_suite ave_abi_suite = {
