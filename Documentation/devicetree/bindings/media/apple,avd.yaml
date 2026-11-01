@@ -33,22 +33,33 @@ properties:
           - apple,t8140-avd
 
   reg:
+    minItems: 4
     items:
       - description: cm3 code
       - description: cm3 sram
       - description: mbox registers
       - description: decode ctrl registers
+      - description: PIODMA registers
 
   reg-names:
+    minItems: 4
     items:
       - const: code
       - const: sram
       - const: mbox
       - const: ctrl
+      - const: piodma
 
   iommus:
+    description:
+      Decode, PIODMA DMA controller, and optional ADS buffer streams, in that
+      order. Legacy nodes without a PIODMA register range may describe only
+      the decode stream.
     minItems: 1
-    maxItems: 3
+    items:
+      - description: Decode stream
+      - description: PIODMA DMA controller stream
+      - description: ADS buffer stream
 
   power-domains:
     minItems: 1
@@ -74,6 +85,35 @@ properties:
       - description: mailbox 3
       - description: flag 0
       - description: flag 1
+      - description: PIODMA
+
+  interrupt-names:
+    minItems: 2
+    items:
+      - const: mbox0
+      - const: mbox1
+      - const: mbox2
+      - const: mbox3
+      - const: flag0
+      - const: flag1
+      - const: piodma
+
+allOf:
+  - if:
+      properties:
+        reg-names:
+          contains:
+            const: piodma
+    then:
+      properties:
+        reg:
+          minItems: 5
+        iommus:
+          minItems: 2
+    else:
+      properties:
+        reg:
+          maxItems: 4
 
 required:
   - compatible
@@ -105,8 +145,9 @@ examples:
             reg = <0x2 0x89080000 0x0 0x12000>,
                   <0x2 0x89092000 0x0 0x12000>,
                   <0x2 0x890a4000 0x0 0x4000>,
-                  <0x2 0x89100000 0x0 0x10000>;
-            reg-names = "code", "sram", "mbox", "ctrl";
-            iommus = <&avd_dart 0>;
+                  <0x2 0x89100000 0x0 0x10000>,
+                  <0x2 0x89070000 0x0 0x4000>;
+            reg-names = "code", "sram", "mbox", "ctrl", "piodma";
+            iommus = <&avd_dart 0>, <&avd_dart 1>;
         };
     };
