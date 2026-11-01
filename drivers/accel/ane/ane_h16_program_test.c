@@ -23,6 +23,8 @@ enum fw_mode {
 	FW_REPORT_WRONG_PROCESS,
 	FW_REPORT_FAILURE,
 	FW_REPORT_STALL,
+	/* State 0 at once, then states 3 and 1 after late_polls sleeps. */
+	FW_REPORT_LATE,
 };
 
 /* A synchronous fake firmware that answers on each doorbell. */
@@ -34,6 +36,10 @@ struct prog_fw {
 	struct ane_h16_session s;
 	enum fw_mode mode;
 	u64 now;
+	/* Time each doorbell takes to answer. */
+	u64 doorbell_ns;
+	u64 late_uuid;
+	unsigned int late_polls;
 	u64 next_dva;
 	u32 head[ANE_FW_CHANNELS];
 	u32 reports;
@@ -113,6 +119,10 @@ static void fw_execute(struct prog_fw *f, const u8 *cmd)
 		fw_report(f, uuid, f->process, 0);
 		fw_report(f, uuid, f->process, 2);
 		break;
+	case FW_REPORT_LATE:
+		fw_report(f, uuid, f->process, 0);
+		f->late_uuid = uuid;
+		break;
 	case FW_REPORT_STALL:
 		/* Started on the engine, then never a terminal report. */
 		fw_report(f, uuid, f->process, 0);
@@ -174,6 +184,9 @@ static void fw_write32(void *ctx, u32 reg, u32 value)
 
 	if (reg != f->soc.doorbell)
 		return;
+	/* Commands take doorbell_ns to answer; returning report slots is free. */
+	if (value & (BIT(ANE_FW_IO) | BIT(ANE_FW_DATA_CHAIN)))
+		f->now += f->doorbell_ns;
 	if (value & BIT(ANE_FW_IO))
 		fw_command(f, ANE_FW_IO);
 	if (value & BIT(ANE_FW_DATA_CHAIN))
@@ -187,7 +200,14 @@ static u64 fw_now(void *ctx)
 
 static void fw_relax(void *ctx, u64 waited_ns)
 {
-	((struct prog_fw *)ctx)->now += 10;
+	struct prog_fw *f = ctx;
+
+	f->now += 10;
+	if (f->late_uuid && !--f->late_polls) {
+		fw_report(f, f->late_uuid, f->process, 3);
+		fw_report(f, f->late_uuid, f->process, 1);
+		f->late_uuid = 0;
+	}
 }
 
 static int fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
@@ -1036,6 +1056,65 @@ static void program_stall_trace_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->fail_other, 2);
 }
 
+/* The phases of one EXECUTE add up, and only successful ones are accounted. */
+static void program_timing_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	const struct ane_h16_exec_sample *x;
+	struct ane_h16_exec_stats st;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->doorbell_ns = 100;
+	f->mode = FW_REPORT_LATE;
+	f->late_polls = 7;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	x = &f->s.timing;
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_GATE_OPEN], 100ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_SUBMIT_ACK], 100ULL);
+	/* The state-0 report was there with the ack. */
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_ACK_REPORT], 0ULL);
+	/* Seven sleeps of 10 ns until the completion. */
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_REPORT_DONE], 70ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_GATE_CLOSE], 100ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_FIRMWARE], 370ULL);
+	KUNIT_EXPECT_EQ(test, x->polls, 7ULL);
+
+	ane_h16_session_account(&f->s, 5, 6, 400);
+	f->mode = FW_OK;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	/* All three reports came with the ack: nothing between them. */
+	KUNIT_EXPECT_EQ(test, f->s.timing.ns[ANE_H16_T_REPORT_DONE], 0ULL);
+	KUNIT_EXPECT_EQ(test, f->s.timing.polls, 0ULL);
+	ane_h16_session_account(&f->s, 15, 8, 340);
+	ane_h16_session_stats(&f->s, &st, false);
+	KUNIT_EXPECT_EQ(test, st.count, 2ULL);
+	KUNIT_EXPECT_EQ(test, st.last.ns[ANE_H16_T_COPY_IN], 15ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.ns[ANE_H16_T_COPY_IN], 20ULL);
+	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_REPORT_DONE], 0ULL);
+	KUNIT_EXPECT_EQ(test, st.max.ns[ANE_H16_T_REPORT_DONE], 70ULL);
+	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_IOCTL], 340ULL);
+	KUNIT_EXPECT_EQ(test, st.max.ns[ANE_H16_T_IOCTL], 400ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.polls, 7ULL);
+	KUNIT_EXPECT_EQ(test, st.min.polls, 0ULL);
+	KUNIT_EXPECT_EQ(test, st.max.polls, 7ULL);
+
+	/* A reset starts over: the next sample sets min and max alone. */
+	ane_h16_session_stats(&f->s, NULL, true);
+	ane_h16_session_account(&f->s, 9, 9, 500);
+	ane_h16_session_stats(&f->s, &st, false);
+	KUNIT_EXPECT_EQ(test, st.count, 1ULL);
+	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_IOCTL], 500ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.ns[ANE_H16_T_COPY_OUT], 9ULL);
+
+	/* A stalled request times out and leaves the statistics alone. */
+	f->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	ane_h16_session_stats(&f->s, &st, false);
+	KUNIT_EXPECT_EQ(test, st.count, 1ULL);
+}
+
 static void program_fwlog_line_test(struct kunit *test)
 {
 	static const char text[] = "R: [0:1]: CMD = 0x020c\tok\x01  ";
@@ -1136,6 +1215,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_bad_load_test),
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_stall_trace_test),
+	KUNIT_CASE(program_timing_test),
 	KUNIT_CASE(program_fwlog_line_test),
 	KUNIT_CASE(program_shared_tag_test),
 	KUNIT_CASE(program_pool_test),
