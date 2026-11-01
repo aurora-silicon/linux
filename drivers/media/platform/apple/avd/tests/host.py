@@ -53,6 +53,7 @@ struct avd_run {
  dma_addr_t comp_out, y_out, uv_out;
 };
 struct avd_segment { size_t num; u32 instructions[AVD_MAX_INST]; };
+struct avd_job { struct avd_segment *segments; unsigned int num; };
 struct variant { u32 revision, quirks; };
 struct avd_dev { struct variant *variant; void *dev; };
 struct format { struct { struct {
@@ -64,7 +65,7 @@ struct avd_ctx {
  void *priv;
  struct avd_dev *dev;
  struct { struct m2m *m2m_ctx; } fh;
- struct { struct avd_segment *segments; unsigned int num; } job;
+ struct avd_job job;
  struct format decoded_fmt, coded_fmt;
  struct { u32 offsets[4]; } comp;
  bool decomp;
@@ -164,6 +165,7 @@ int main(void)
        }
       }
       run.num_valid = count;
+      dec.flags = count ? 0 : V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC;
       ctx->job.num = 0;
       segments[0].num = segments[1].num = 0;
       stream_hdr(ctx, &run);
@@ -174,6 +176,19 @@ int main(void)
        for (unsigned int i = 0; i < segments[seg].num; i++)
         printf(" %08x", segments[seg].instructions[i]);
       puts("");
+      if (!count) {
+       dec.flags = 0;
+       ctx->job.num = 0;
+       segments[0].num = segments[1].num = 0;
+       stream_hdr(ctx, &run);
+       ctx->job.num = 1;
+       stream_slice(ctx, &run);
+       printf("empty-intra/%u/%u/%u", rev, mode, mb);
+       for (unsigned int seg = 0; seg < 2; seg++)
+        for (unsigned int i = 0; i < segments[seg].num; i++)
+         printf(" %08x", segments[seg].instructions[i]);
+       puts("");
+      }
      }
     }
    }
@@ -238,7 +253,7 @@ def build(driver, current, work, label):
         checks += "\n#define VALIDATE_SLICE avd_h264_validate_slice\n"
     else:
         checks += "\n#define VALIDATE_SLICE(ctx, sl) 0\n"
-    code = SHIM + helpers + inst + body + checks + MAIN
+    code = "\n".join((SHIM, helpers, inst, body, checks, MAIN))
     src = work / (label + ".c")
     exe = work / label
     src.write_text(code)
@@ -289,13 +304,19 @@ def main():
         hevc_checks(current, Path(tmp))
         before = build(a.baseline, current, Path(tmp), "before")
         after = build(current, current, Path(tmp), "after")
-    unchanged = changed = 0
+    unchanged = changed = normalized = 0
     for key, program in after.items():
         if key.startswith("guard/type/"):
             expected = "0" if int(key.rsplit("/", 1)[1]) < 3 else str(-22)
             assert program == expected, (key, program, expected)
         elif key.startswith("guard/groups/"):
             assert program == ("0" if key.endswith("/0") else "-22")
+        elif key.startswith("empty-intra/"):
+            _, rev, mode, mb = key.split("/")
+            # An I picture with no references needs the known IDR program.
+            assert program == before[f"0/{rev}/2/{mode}/{mb}"], key
+            assert program != before[key], key
+            normalized += 1
         elif not key.startswith("17/"):
             assert program == before[key], key
             unchanged += 1
@@ -315,7 +336,8 @@ def main():
     for label, data in (("before", before), ("after", after)):
         (a.out / (label + ".json")).write_text(json.dumps(data, indent=2) + "\n")
     print(f"PASS: {unchanged} dense-DPB complete programs byte-identical; "
-          f"{changed} sparse-DPB programs corrected; all 65536 DPB maps; "
+          f"{changed} sparse-DPB programs corrected; "
+          f"{normalized} empty-DPB intra programs normalized; all 65536 DPB maps; "
           "10 slice-type, 8 slice-group, 7 slice-order and 25 HEVC bit-depth checks")
 
 

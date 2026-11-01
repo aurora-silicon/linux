@@ -26,3 +26,7 @@ queue.py compiles the production queue initializer and format-feature update.
 It reproduces FFmpeg capability probing before S_FMT and verifies that a
 multislice picture reaches hardware once, after its last slice. It also checks
 that changing formats removes stale per-format queue features.
+
+A non-IDR I picture whose DPB is empty must produce exactly the existing
+IDR intra-only program. Separate before/after cases cover this gap-eviction
+case while the normal dense-DPB comparison includes legacy IDR programs.

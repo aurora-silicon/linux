@@ -26,7 +26,7 @@ struct vb2_queue {
  const void *ops, *mem_ops;
  bool supports_requests, allow_cache_hints, bidirectional;
 };
-struct avd_dev { int vdev_lock; void *dev; };
+struct avd_dev { int vdev_lock; void *dev; struct { void *dev; } v4l2_dev; };
 struct avd_coded_fmt_desc { unsigned int subsystem_flags; };
 struct avd_ctx { struct avd_dev *dev; const struct avd_coded_fmt_desc *coded_fmt_desc; };
 struct v4l2_m2m_buffer { int unused; };
