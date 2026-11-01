@@ -713,6 +713,33 @@ static int ane_h16_job_emit(struct ane_h16_job *j, u32 op, int status, u64 ns,
 	return 0;
 }
 
+/* ane_fw_transport_wait with a 10-20 us poll, so job timings are not 1 ms steps. */
+static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	u32 pending;
+	int ret;
+
+	for (;;) {
+		ret = ane_fw_transport_poll(t, ch);
+		if (ret != -EAGAIN)
+			return ret;
+		ret = ane_fw_transport_irq(t, &pending);
+		if (ret)
+			return ret;
+		ret = ane_fw_transport_shared(t);
+		if (ret && ret != -EAGAIN)
+			return ret;
+		if (ktime_get_ns() >= t->pending[ch].deadline_ns)
+			return ane_fw_transport_fail(t, -ETIMEDOUT);
+		ane_h16_mailbox(h);
+		ret = ane_h16_faults(&h->boot, false);
+		if (ret)
+			return ane_fw_transport_fail(t, ret);
+		usleep_range(10, 20);
+	}
+}
+
 static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 			   const u8 *p, u32 length, u64 *ns)
 {
@@ -739,7 +766,7 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 				       start + h->boot.build->command_timeout_ns);
 	if (!ret) {
 		j->published_ns = start;
-		ret = ane_fw_transport_wait(t, channel);
+		ret = ane_h16_job_wait(h, channel);
 	}
 	*ns = ktime_get_ns() - start;
 	if (!ret || ret == -EREMOTEIO) {
@@ -801,7 +828,7 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		if (ret)
 			return ret;
 		ret = -ETIMEDOUT;
-		usleep_range(20, 40);
+		usleep_range(10, 20);
 	}
 	return ret;
 }
