@@ -69,6 +69,10 @@ static char *h16_identity;
 module_param(h16_identity, charp, 0444);
 MODULE_PARM_DESC(h16_identity, "observe: accept an unknown resident image for preflight only and publish it in debugfs ane_h16/");
 
+static const char *const ane_h16_build_names[ANE_H16_PRELOAD_BUILDS] = {
+	"H16 27.0 26A428", "H16 26.5.2 25F84",
+};
+
 static struct debugfs_blob_wrapper ane_h16_dump[2];
 static struct dentry *ane_h16_debugfs;
 
@@ -614,10 +618,13 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 		vfree(second);
 		second = NULL;
 	}
-	ret = ane_h16_preload_validate(snap[0], b->soc->preload_size[0],
+	ret = ane_h16_preload_identify(snap[0], b->soc->preload_size[0],
 				       snap[1], b->soc->preload_size[1]);
-	if (!ret) {
-		dev_info(h->dev, "H16 preload identity %s accepted\n", b->build->identity);
+	if (ret >= 0) {
+		/* 25F84 runs on the 26A428 boot values until a stage shows otherwise. */
+		dev_info(h->dev, "H16 preload identity %s accepted (boot values %s)\n",
+			 ane_h16_build_names[ret], b->build->identity);
+		ret = 0;
 	} else if (ane_h16_observing() && !ane_h16_debugfs) {
 		dev_warn(h->dev, "H16 preload identity refused (%d); observing, image in debugfs ane_h16/\n",
 			 ret);

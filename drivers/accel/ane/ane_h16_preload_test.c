@@ -198,7 +198,30 @@ static void preload_bounds_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
 }
 
+/* 25F84 frames the same records 0x3f80 further into DATA. */
+static void preload_shifted_test(struct kunit *test)
+{
+	struct preload_fixture *f = test->priv;
+	u8 digest[SHA256_DIGEST_SIZE];
+	size_t pos = 0x5a18;
+
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_digest_layout(&ane_h16_preload_layouts[1],
+		f->text, ANE_H16_PRELOAD_TEXT_SIZE, f->data, ANE_H16_PRELOAD_DATA_SIZE,
+		digest), -ENOEXEC);
+	memmove(f->data + pos + 0x3f80, f->data + pos, 0x5c79 - pos);
+	memset(f->data + pos, 0xa5, 0x3f80);
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_digest_layout(&ane_h16_preload_layouts[1],
+		f->text, ANE_H16_PRELOAD_TEXT_SIZE, f->data, ANE_H16_PRELOAD_DATA_SIZE,
+		digest), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_digest(f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+		f->data, ANE_H16_PRELOAD_DATA_SIZE, digest), -ENOEXEC);
+	/* Framing alone identifies nothing. */
+	KUNIT_EXPECT_EQ(test, ane_h16_preload_identify(f->text, ANE_H16_PRELOAD_TEXT_SIZE,
+		f->data, ANE_H16_PRELOAD_DATA_SIZE), -ENOEXEC);
+}
+
 static struct kunit_case preload_cases[] = {
+	KUNIT_CASE(preload_shifted_test),
 	KUNIT_CASE(preload_identity_test),
 	KUNIT_CASE(preload_mutable_test),
 	KUNIT_CASE(preload_framing_test),

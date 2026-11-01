@@ -58,9 +58,32 @@ static const struct {
 	{ "ARcM", 0x5c75, 4, true },
 };
 
-int ane_h16_preload_digest(const void *text, size_t text_size,
-			   const void *data, size_t data_size,
-			   u8 digest[SHA256_DIGEST_SIZE])
+/*
+ * Known resident images. 25F84 (macOS 26.5.2) has the 26A428 framing and
+ * tunables interval moved by +0x3f80 in DATA.
+ */
+const struct ane_h16_preload_layout ane_h16_preload_layouts[ANE_H16_PRELOAD_BUILDS] = {
+	{
+		.shift = 0,
+		.digest = {
+			0x1f, 0x86, 0x5e, 0xd0, 0x4c, 0x4c, 0x38, 0xf6,
+			0xfd, 0xcc, 0x45, 0x43, 0xa8, 0x81, 0x4f, 0x81,
+			0x8d, 0x3c, 0xea, 0x58, 0x3d, 0xe6, 0x4d, 0x22,
+			0xff, 0xe9, 0x6e, 0x3a, 0x93, 0xca, 0x46, 0x97,
+		},
+	},
+	{
+		.shift = 0x3f80,
+		/* Unknown until a live 25F84 image is observed: matches nothing. */
+		.unknown = true,
+	},
+};
+EXPORT_SYMBOL_GPL(ane_h16_preload_layouts);
+
+int ane_h16_preload_digest_layout(const struct ane_h16_preload_layout *layout,
+				  const void *text, size_t text_size,
+				  const void *data, size_t data_size,
+				  u8 digest[SHA256_DIGEST_SIZE])
 {
 	static const u8 zero[64];
 	const u8 *bytes = data;
@@ -68,12 +91,12 @@ int ane_h16_preload_digest(const void *text, size_t text_size,
 	size_t cursor = 0, remaining;
 	unsigned int i;
 
-	if (!text || !data || !digest || text_size != ANE_H16_PRELOAD_TEXT_SIZE ||
+	if (!layout || !text || !data || !digest || text_size != ANE_H16_PRELOAD_TEXT_SIZE ||
 	    data_size != ANE_H16_PRELOAD_DATA_SIZE)
 		return -EINVAL;
 	/* Validate all framing before producing a digest. Odd offsets are valid. */
 	for (i = 0; i < ARRAY_SIZE(ane_h16_patchbay); i++) {
-		u32 value = ane_h16_patchbay[i].value;
+		u32 value = ane_h16_patchbay[i].value + layout->shift;
 
 		if (memcmp(bytes + value - 8, ane_h16_patchbay[i].tag, 4) ||
 		    get_unaligned_le32(bytes + value - 4) != ane_h16_patchbay[i].width)
@@ -82,7 +105,7 @@ int ane_h16_preload_digest(const void *text, size_t text_size,
 	sha256_init(&ctx);
 	sha256_update(&ctx, text, text_size);
 	for (i = 0; i < ARRAY_SIZE(ane_h16_patchbay); i++) {
-		u32 value = ane_h16_patchbay[i].value;
+		u32 value = ane_h16_patchbay[i].value + layout->shift;
 
 		if (!ane_h16_patchbay[i].mutable)
 			continue;
@@ -90,36 +113,62 @@ int ane_h16_preload_digest(const void *text, size_t text_size,
 		sha256_update(&ctx, zero, ane_h16_patchbay[i].width);
 		cursor = value + ane_h16_patchbay[i].width;
 	}
-	sha256_update(&ctx, bytes + cursor, 0x17c80 - cursor);
+	sha256_update(&ctx, bytes + cursor, 0x17c80 + layout->shift - cursor);
 	for (remaining = 0x6a0; remaining; ) {
 		size_t length = min(remaining, sizeof(zero));
 
 		sha256_update(&ctx, zero, length);
 		remaining -= length;
 	}
-	cursor = 0x18320;
+	cursor = 0x18320 + layout->shift;
 	sha256_update(&ctx, bytes + cursor, data_size - cursor);
 	sha256_final(&ctx, digest);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(ane_h16_preload_digest_layout);
+
+int ane_h16_preload_digest(const void *text, size_t text_size,
+			   const void *data, size_t data_size,
+			   u8 digest[SHA256_DIGEST_SIZE])
+{
+	return ane_h16_preload_digest_layout(&ane_h16_preload_layouts[0], text, text_size,
+					     data, data_size, digest);
+}
 EXPORT_SYMBOL_GPL(ane_h16_preload_digest);
+
+/* Index of the known build whose identity the snapshots match, or -ENOEXEC. */
+int ane_h16_preload_identify(const void *text, size_t text_size,
+			     const void *data, size_t data_size)
+{
+	u8 digest[SHA256_DIGEST_SIZE];
+	unsigned int i;
+	int ret = -ENOEXEC;
+
+	for (i = 0; i < ANE_H16_PRELOAD_BUILDS; i++) {
+		const struct ane_h16_preload_layout *l = &ane_h16_preload_layouts[i];
+		int r = ane_h16_preload_digest_layout(l, text, text_size, data, data_size,
+						      digest);
+
+		if (r == -EINVAL)
+			return r;
+		if (!r && !l->unknown && !memcmp(digest, l->digest, sizeof(digest)))
+			return i;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ane_h16_preload_identify);
 
 int ane_h16_preload_validate(const void *text, size_t text_size,
 			     const void *data, size_t data_size)
 {
-	static const u8 expected[SHA256_DIGEST_SIZE] = {
-		0x1f, 0x86, 0x5e, 0xd0, 0x4c, 0x4c, 0x38, 0xf6,
-		0xfd, 0xcc, 0x45, 0x43, 0xa8, 0x81, 0x4f, 0x81,
-		0x8d, 0x3c, 0xea, 0x58, 0x3d, 0xe6, 0x4d, 0x22,
-		0xff, 0xe9, 0x6e, 0x3a, 0x93, 0xca, 0x46, 0x97,
-	};
+	const u8 *expected = ane_h16_preload_layouts[0].digest;
 	u8 digest[SHA256_DIGEST_SIZE];
 	int ret;
 
 	ret = ane_h16_preload_digest(text, text_size, data, data_size, digest);
 	if (ret)
 		return ret;
-	return memcmp(digest, expected, sizeof(digest)) ? -ENOEXEC : 0;
+	return memcmp(digest, expected, SHA256_DIGEST_SIZE) ? -ENOEXEC : 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_preload_validate);
 
