@@ -66,6 +66,8 @@
 #define APPLE_T6040_GFX_WRAPPER_BASE 0x28a600000ULL
 #define APPLE_T6040_GFX_IOP_VBAR_BASE 0x28a050000ULL
 #define APPLE_T6050_ASCWRAP_BASE_DELTA 0x380000000ULL
+/* T8142 (M5) moves T8140's 0x4... GPU ASC bank to 0x5.... */
+#define APPLE_T8142_ASCWRAP_BASE_DELTA 0x100000000ULL
 
 static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_A2I_CONTROL ==
 	      0x8110);
@@ -824,7 +826,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		mbox->ascwrap_v6.wrapper_size = resource_size(res);
 		mbox->ascwrap_v6.iop_vbar_start = iop_vbar_res->start;
 		mbox->ascwrap_v6.iop_vbar_size = resource_size(iop_vbar_res);
-		/* T8140 and T6040 implement both the CPU start and the CPU stop. */
+		/* T8140, T8142 and T6040 implement both the CPU start and stop. */
 		mbox->ascwrap_v6.missing = 0;
 
 		mbox->wrapper_regs =
@@ -977,6 +979,15 @@ static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t8140_ascwrap_v6_
 	  APPLE_T8140_GFX1_WRAPPER_BASE, APPLE_T8140_GFX1_IOP_VBAR_BASE },
 };
 
+static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t8142_ascwrap_v6_roles[] = {
+	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
+	  APPLE_T8140_GFX_WRAPPER_BASE + APPLE_T8142_ASCWRAP_BASE_DELTA,
+	  APPLE_T8140_GFX_IOP_VBAR_BASE + APPLE_T8142_ASCWRAP_BASE_DELTA },
+	{ "GFX1", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX1,
+	  APPLE_T8140_GFX1_WRAPPER_BASE + APPLE_T8142_ASCWRAP_BASE_DELTA,
+	  APPLE_T8140_GFX1_IOP_VBAR_BASE + APPLE_T8142_ASCWRAP_BASE_DELTA },
+};
+
 /* The T6040 runs a single GPU firmware instance. */
 static const struct apple_mbox_ascwrap_v6_role_desc apple_mbox_t6040_ascwrap_v6_roles[] = {
 	{ "GFX", APPLE_MBOX_ASCWRAP_V6_ROLE_GFX,
@@ -988,6 +999,27 @@ static const struct apple_mbox_hw apple_mbox_t8140_ascwrap_v6_hw = {
 	.is_ascwrap_v6 = true,
 	.ascwrap_v6_roles = apple_mbox_t8140_ascwrap_v6_roles,
 	.num_ascwrap_v6_roles = ARRAY_SIZE(apple_mbox_t8140_ascwrap_v6_roles),
+
+	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_ASC_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_ASC_MBOX_A2I_SEND0,
+	.a2i_send1 = APPLE_ASC_MBOX_A2I_SEND1,
+
+	.i2a_control = APPLE_ASC_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
+	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
+
+	.has_irq_controls = false,
+};
+
+/* T8142 (M5): T8140's two GPU firmware CPUs at the 0x5... bank. */
+static const struct apple_mbox_hw apple_mbox_t8142_ascwrap_v6_hw = {
+	.reg_offset = APPLE_ASCWRAP_V6_MBOX_OFFSET,
+	.is_ascwrap_v6 = true,
+	.ascwrap_v6_roles = apple_mbox_t8142_ascwrap_v6_roles,
+	.num_ascwrap_v6_roles = ARRAY_SIZE(apple_mbox_t8142_ascwrap_v6_roles),
 
 	.control_full = APPLE_ASC_MBOX_CONTROL_FULL,
 	.control_empty = APPLE_ASC_MBOX_CONTROL_EMPTY,
@@ -1116,6 +1148,7 @@ static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8122-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t6040-ascwrap-v6", .data = &apple_mbox_t6040_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_t8140_ascwrap_v6_hw },
+	{ .compatible = "apple,t8142-ascwrap-v6", .data = &apple_mbox_t8142_ascwrap_v6_hw },
 	{ .compatible = "apple,t6050-apif-ascwrap-v6", .data = &apple_mbox_t6050_apif_ascwrap_v6_hw },
 	{ .compatible = "apple,t6050-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },
 	{ .compatible = "apple,t6050-x1n1-ascwrap-v6", .data = &apple_mbox_t6050_ascwrap_v6_hw },

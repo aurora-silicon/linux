@@ -692,6 +692,15 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::Always,
 };
 
+/// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
+/// firmware starts endpoint 7 and takes its 8 KiB buffer before it
+/// acknowledges the IOP power state.
+const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+    check_bootargs_uuid: false,
+    coreanalytics: Ep7::Always,
+};
+
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
@@ -711,6 +720,7 @@ kernel::of_device_table!(
     [
         (of::DeviceId::new(c"apple,t8132-pmp-v2"), &HW_CFG_T8132),
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
+        (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]

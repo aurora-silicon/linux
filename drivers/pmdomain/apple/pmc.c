@@ -857,6 +857,23 @@ static const struct apple_pmc_hw apple_pmc_hw_t8140 = {
 };
 
 /*
+ * T8142: the AppleT8142PMC accessors put the floors at agent << 14, the
+ * per-agent states at 0x106000 and the static voter enables at 0x108000;
+ * rails DCS, SOC and DISP (ADT voter-rail-data). The PMC clamps a floor to
+ * DCS 7 and SOC 4.
+ */
+static const struct apple_pmc_hw apple_pmc_hw_t8142 = {
+	.agent_stride = 0x4000,
+	.agents = 4,
+	.rails = 3,
+	.agent_state = 0x0,
+	.rail_enable = 0x2000,
+	.dcs_rail = 0,
+	.dcs_max = 7,
+	.ap_agent = 3,
+};
+
+/*
  * T6040 (M4 Pro): the T8140 layout, with DCS states 0-5 and fabric states
  * 0-2. The ADT's voter-agent rail mask is 0x7 (DCS, SOC and DISP_INT).
  * Agents are enabled on DCS and SOC only: iBoot leaves both at their
@@ -878,6 +895,7 @@ static const struct apple_pmc_hw apple_pmc_hw_t6040 = {
 static const struct of_device_id apple_pmc_of_match[] = {
 	{ .compatible = "apple,t8132-pmc", .data = &apple_pmc_hw_t8132 },
 	{ .compatible = "apple,t8140-pmc", .data = &apple_pmc_hw_t8140 },
+	{ .compatible = "apple,t8142-pmc", .data = &apple_pmc_hw_t8142 },
 	{ .compatible = "apple,t6041-pmc", .data = &apple_pmc_hw_t6040 },
 	{}
 };
