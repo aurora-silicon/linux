@@ -119,7 +119,6 @@ static void dcp_swap_set_brightness(struct DCP_FW_NAME(dcp_swap) *swap, u32 nits
 	}
 
 	swap->bl_update = 1;
-	swap->bl_flags[1] = 1;
 	put_unaligned_le64(bits, &swap->bl_nits);
 }
 
@@ -154,31 +153,80 @@ static u64 dcp_binary64_ratio(u64 num, u64 den)
 }
 
 /*
- * EDR: SDR white stays at @sdr nits while highlights reach @peak.  The swap
- * carries the display EDR scale, SDR white over the peak, and the headroom
- * the frame uses, the peak over SDR white; equal values end EDR.
+ * EDR on a desktop 26.x panel, as macOS drives it.  With applied headroom H
+ * (x1000 below), a swap asks for brightness SDR white x H, display EDR
+ * scale 1 / H and, while the frame uses EDR, headroom used H; the firmware
+ * shows a PQ surface at (PQ nits / 100) x the scale x the panel level, so
+ * PQ 100 lands at SDR white and highlights reach the panel peak.  H rises
+ * in steps linear in stops, one per swap, about 1 s when EDR starts, with
+ * a brightness limit of 1.3 x the brightness in the middle of the ramp.
+ * When EDR ends, headroom used drops to 1.0 and H returns to 1.0.
+ * Unchanged values are left out: the firmware keeps them.
  */
-static void dcp_swap_set_edr(struct DCP_FW_NAME(dcp_swap) *swap, u32 sdr, u32 peak)
-{
-	swap->bl_flags[2] = 1;
-	put_unaligned_le64(dcp_binary64_ratio(sdr, peak), &swap->edr_scale);
-	swap->bl_flags[4] = 1;
-	put_unaligned_le64(dcp_binary64_ratio(peak, sdr), &swap->edr_headroom);
-}
+#define DCP_EDR_STEP_UP		1047	/* x1000 per swap */
 
-/* An EDR panel swap carries the headroom over the current panel level. */
-static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) *swap)
+#define dcp_swap_set_ratio(swap, field, flag, num, den)				\
+	do {								\
+		(swap)->bl_flags[flag] = 1;				\
+		put_unaligned_le64(dcp_binary64_ratio(num, den),	\
+				   &(swap)->field);			\
+	} while (0)
+
+/*
+ * @nits is the level a swap carries itself (@carries: a brightness change
+ * or power on), else the current one stands.  A swap that turns the panel
+ * off keeps its zero.  After a power off the ramp starts again from 1.0:
+ * asking for the peak at once does not take after a power on, on macOS
+ * either.
+ */
+static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) *swap,
+			    bool carries, u32 nits)
 {
 	u32 peak = READ_ONCE(dcp->panel.peak_nits);
-	u32 sdr = dcp->output_edr ? dcp_backlight_desktop_nits(dcp) : 0;
+	u32 sdr = carries ? nits : dcp_backlight_desktop_nits(dcp);
+	u32 cur = dcp->edr_hm ?: 1000, target = 1000, next, bri;
+	bool restart = dcp->edr_restart;
 
-	if (sdr && peak > sdr) {
-		dcp_swap_set_edr(swap, sdr, peak);
+	dcp->edr_restart = false;
+	if (!dcp->output_edr && !dcp->edr_hm)
+		return;		/* no EDR, and none to wind down */
+	if (!sdr)
+		return;
+	if (dcp->output_edr && peak > sdr)
+		target = peak * 1000 / sdr;
+	if (restart && dcp->output_edr)
+		cur = 1000;
+	if (cur == target && !carries && !restart && dcp->edr_sent == dcp->output_edr)
+		return;
+
+	/*
+	 * Up in steps; down at once.  macOS ramps down too, but its compositor
+	 * keeps presenting until the ramp ends.  Here a still desktop may send
+	 * no further swap, and a ramp stuck partway leaves SDR content dimmed
+	 * by the scale (headroom used is already 1.0).
+	 */
+	next = cur;
+	if (target > cur)
+		next = min(cur * DCP_EDR_STEP_UP / 1000 + 1, target);
+	else if (target < cur)
+		next = target;
+
+	bri = (u64)sdr * next / 1000;
+	dcp_swap_set_brightness(swap, bri);
+	dcp_swap_set_ratio(swap, edr_scale, 2, 1000, next);
+	if (dcp->output_edr) {
+		dcp_swap_set_ratio(swap, edr_headroom, 4, next, 1000);
 		dcp->edr_sent = true;
 	} else if (dcp->edr_sent) {
-		dcp_swap_set_edr(swap, 1, 1);
+		dcp_swap_set_ratio(swap, edr_headroom, 4, 1, 1);
 		dcp->edr_sent = false;
 	}
+	if (next != target && next != cur) {
+		swap->bl_flags[1] = 1;
+		put_unaligned_le64(dcp_binary64_ratio(bri * 13, 10), &swap->bl_limit);
+	}
+	/* Back at 1.0 without EDR: leave the firmware's values alone again. */
+	dcp->edr_hm = (!dcp->output_edr && next == 1000) ? 0 : next;
 }
 
 /*
@@ -238,6 +286,7 @@ static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), swap_id) == 0x98);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), bl_update) == 0x354);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), bl_flags) == 0x358);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), bl_nits) == 0x35e);
+static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), bl_limit) == 0x376);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), edr_scale) == 0x37e);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), edr_headroom) == 0x3e6);
 static_assert(offsetof(struct DCP_FW_NAME(dcp_swap), presents_surface) == 0x51e);
@@ -2795,15 +2844,16 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	if (dcp_has_panel(dcp)) {
-		u32 nits;
-		bool have_surface = false;
+		u32 nits = 0;
+		bool have_surface = false, carries;
 
 		for (unsigned int i = 0; i < SWAP_SURFACES; i++)
 			have_surface |= !DCP_FW_SWAP(dcp).surf_null[i];
-		if (dcp_backlight_desktop_prepare(dcp, resp->swap_id,
-						  have_surface, &nits))
+		carries = dcp_backlight_desktop_prepare(dcp, resp->swap_id,
+							have_surface, &nits);
+		if (carries)
 			dcp_swap_set_brightness(&DCP_FW_SWAP(dcp).swap, nits);
-		dcp_edr_prepare(dcp, &DCP_FW_SWAP(dcp).swap);
+		dcp_edr_prepare(dcp, &DCP_FW_SWAP(dcp).swap, carries, nits);
 	}
 #endif
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
