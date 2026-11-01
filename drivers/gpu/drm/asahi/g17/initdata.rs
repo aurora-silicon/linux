@@ -1357,6 +1357,20 @@ impl InitData {
         Ok(())
     }
 
+    /// Validate all three WC destinations before passing any pointer to C.
+    /// No partial transaction is possible on an invalid table entry.
+    pub(super) fn cooling_mirrors(&self, layout: &super::cooling::Layout) -> Result<[*mut u32; 3]> {
+        let bundle = self.object(self.bundle)?;
+        let mut mirrors = [core::ptr::null_mut(); 3];
+        for (index, &offset) in layout.mirrors.iter().enumerate() {
+            if offset % 4 != 0 || layout.mirrors[..index].contains(&offset) {
+                return Err(EINVAL);
+            }
+            mirrors[index] = bundle.pointer(offset, 4)?.cast();
+        }
+        Ok(mirrors)
+    }
+
     pub(super) fn effort(&self) -> Result<u32> {
         Ok(self
             .object(self.region_c)?
