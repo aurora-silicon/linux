@@ -103,11 +103,20 @@ is poisoned with the complement of those bytes before submission. A terminal
 report without expected bytes quarantines immediately; it never counts as
 success and is never retried.
 
-Only one program lifetime per firmware boot is allowed. A new program's first job can write into the previous program's output when
-the EXECUTE buffer counts match. A larger new output can overrun the old
-mapping and crash firmware. Full TLB invalidation does not fix this. A second
-LOAD is refused even after successful TERMINATE/UNLOAD and FREE; no output
-mapping is freed or reused. The firmware-side rebinding rule remains open.
+Several programs may run in one firmware boot. The firmware has a direct
+submission path that reuses the engine's current BAR context. If that context
+belongs to a different program, a job can write through the earlier program's
+output binding. This happens even after that program was terminated and
+unloaded, and a full TLB invalidation does not prevent it. Bit 0 of the
+EXECUTE flags word at offset 0x30 keeps a request off the direct path and
+queues it for the full execution loop, which installs a fresh BAR context.
+The transport sets that bit in its copy of the first EXECUTE after any change
+of program or process, and after any LOAD, CREATE, TERMINATE or UNLOAD, since
+firmware IDs may be reused. Later jobs of the same process keep the direct
+path. Measured on the J700 with 11 of 11 program switches correct, at about
+60 us extra on the switching job only. H16 shares the firmware design but has
+not executed under Linux, so its requests are published unchanged. Output
+mappings of earlier programs stay pinned and are never reused.
 The observed FREE response is DVA|1 with zero length and handle. It is
 accepted only for a live exact allocation during teardown; its backing stays
 pinned and cannot be recycled. Duplicate, interior and unsolicited FREEs

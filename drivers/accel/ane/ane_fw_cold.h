@@ -62,17 +62,6 @@ struct ane_fw_program {
 	u32 kernel_bar;
 };
 
-/* Caller holds the backend lock. Never clear this before hardware reset,
- * including after a failed LOAD or a successful TERMINATE/UNLOAD.
- */
-static inline int ane_fw_program_claim(bool *used)
-{
-	if (*used)
-		return -EBUSY;
-	*used = true;
-	return 0;
-}
-
 /* Kernel-table references must use the LOAD kernel resource index. A legacy
  * H14 tag of 2 asserts the H17 firmware. Reject before publishing LOAD.
  * Record geometry follows the public MIT libane operation format.

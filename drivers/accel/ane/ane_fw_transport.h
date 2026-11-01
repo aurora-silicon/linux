@@ -4,6 +4,7 @@
 
 #include "ane_fw_platform.h"
 #include "ane_fw_protocol.h"
+#include "ane_h16_execute.h"
 
 #define ANE_FW_IO 1
 #define ANE_FW_SHAREDMALLOC 5
@@ -60,7 +61,9 @@ struct ane_fw_transport {
 	u32 shared_tags[ANE_FW_SHARED_MAX];
 	bool allow_free;
 	u32 free_count;
-	bool program_loaded;
+	/* H17: program and process of the last published EXECUTE. */
+	bool bar_known;
+	u32 bar_program, bar_process;
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	struct ane_fw_transaction pending[ANE_FW_CHANNELS];
 	u32 head[ANE_FW_CHANNELS];
@@ -176,6 +179,44 @@ static inline int ane_fw_transport_arm(struct ane_fw_transport *t)
 	return 0;
 }
 
+/*
+ * The H17 firmware's direct submission path reuses the engine's current BAR
+ * context. When that context came from a different program, a job (of a new
+ * or previously loaded program, even after the earlier one was destroyed) can
+ * write through the earlier program's output binding. Bit 0 of the request
+ * flags word queues the job for the full execution loop instead, which
+ * installs a fresh BAR context. Queue the first EXECUTE after any change of program, process or
+ * program lifetime; later jobs of the same process keep the direct path. This
+ * lifts the one-program-per-firmware-session limit. Applies to the pool copy,
+ * so every published EXECUTE follows the rule. H16 shares the firmware
+ * architecture but has not executed under Linux yet; it is left unchanged.
+ */
+static inline void
+ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
+{
+	u16 id = get_unaligned_le16(copy + 4);
+	u32 program, process;
+
+	if (id != 0x20c) {
+		/* LOAD, UNLOAD, CREATE and TERMINATE may reuse IDs. */
+		if (id >= 0x200 && id <= 0x203)
+			t->bar_known = false;
+		return;
+	}
+	if (size < ANE_H16_EXECUTE_FLAGS + 4) {
+		t->bar_known = false;
+		return;
+	}
+	program = get_unaligned_le32(copy + 8);
+	process = get_unaligned_le32(copy + 0xc);
+	if (!t->bar_known || t->bar_program != program || t->bar_process != process)
+		put_unaligned_le32(get_unaligned_le32(copy + ANE_H16_EXECUTE_FLAGS) |
+				   ANE_H16_EXECUTE_FLAG_QUEUED, copy + ANE_H16_EXECUTE_FLAGS);
+	t->bar_known = true;
+	t->bar_program = program;
+	t->bar_process = process;
+}
+
 /* Commands are copied into a monotonic pool arena, never external DMA memory. */
 static inline int
 ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
@@ -195,9 +236,6 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		return -EINVAL;
 	if (ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
 		return -EPERM;
-	if (t->soc->chip_family == 17 && t->program_loaded &&
-	    get_unaligned_le16((const u8 *)command + 4) == 0x200)
-		return -EBUSY;
 	tx = &t->pending[ch];
 	if (tx->active)
 		return -EBUSY;
@@ -223,11 +261,8 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		.active = true,
 	};
 	t->pool_used = offset + size;
-	/* H17 can retain stale output BARs across LOADs. UNLOAD, FREE and
-	 * successful jobs never clear this firmware-session restriction.
-	 */
-	if (t->soc->chip_family == 17 && tx->id == 0x200)
-		t->program_loaded = true;
+	if (t->soc->chip_family == 17)
+		ane_fw_transport_bar_context(t, (u8 *)t->pool.cpu + offset, size);
 	t->ops->store64(t->ctx, p + 8, size);
 	t->ops->store64(t->ctx, p + 16, size);
 	t->ops->write_barrier(t->ctx);

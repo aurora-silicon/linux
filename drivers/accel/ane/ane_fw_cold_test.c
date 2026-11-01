@@ -141,20 +141,7 @@ static void ane_cold_kernel_tag_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_operation_validate(&p), -EINVAL);
 }
 
-static void ane_cold_second_load_test(struct kunit *test)
-{
-	bool used = false;
-
-	KUNIT_ASSERT_EQ(test, ane_fw_program_claim(&used), 0);
-	KUNIT_EXPECT_TRUE(test, used);
-	/* UNLOAD and a FREE reply do not create a new firmware session. */
-	KUNIT_EXPECT_EQ(test, ane_fw_program_claim(&used), -EBUSY);
-	KUNIT_EXPECT_TRUE(test, used);
-	KUNIT_EXPECT_EQ(test, ane_fw_program_claim(&used), -EBUSY);
-}
-
 static struct kunit_case ane_cold_cases[] = {
-	KUNIT_CASE(ane_cold_second_load_test),
 	KUNIT_CASE(ane_cold_evidence_test),
 	KUNIT_CASE(ane_cold_warm_test),
 	KUNIT_CASE(ane_cold_dart_test),

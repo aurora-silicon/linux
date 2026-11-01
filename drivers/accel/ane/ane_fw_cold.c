@@ -58,7 +58,7 @@ struct ane_fw_backend {
 	u64 ranges[ANE_FW_DAPF_RANGES * 2];
 	u64 next_dva, uuid;
 	enum ane_fw_stage stage;
-	bool retained, program_used;
+	bool retained;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
@@ -182,7 +182,8 @@ static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
 		return ret;
 	/* iommu_map includes the DART's normal range synchronization and
 	 * propagates its timeout. Extra invalidates do not fix stale output
-	 * BAR bindings between programs; the one-program rule addresses that.
+	 * BAR bindings between programs; the transport's queued first EXECUTE
+	 * after a program change does.
 	 */
 	for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
 		if (readl(b->dart[i] + 0x100))
@@ -826,7 +827,7 @@ int ane_fw_program_alloc(size_t size, struct ane_fw_surface *surface)
 	if (!b || !surface || !size || size > ANE_FW_SHARED_TOTAL)
 		return -EINVAL;
 	guard(mutex)(&b->lock);
-	if (b->stage != ANE_STAGE_STARTUP || b->program_used)
+	if (b->stage != ANE_STAGE_STARTUP)
 		return -EBUSY;
 	ret = ane_fw_alloc(b, ALIGN(size, SZ_16K), 0, surface);
 	return ret ? ane_fw_quarantine(b, ret) : 0;
@@ -947,14 +948,9 @@ int ane_fw_program_run(struct ane_fw_program *program,
 	ret = ane_fw_load_encode(command, program);
 	if (ret)
 		goto free;
-	/* The next LOAD in this firmware boot is forbidden even after UNLOAD.
-	 * Measured later-program jobs can report success without writing output.
+	/* Later programs in this firmware boot are allowed: the transport queues
+	 * the first EXECUTE after a program change (stale BAR context).
 	 */
-	ret = ane_fw_program_claim(&b->program_used);
-	if (ret) {
-		dev_info(&b->pdev->dev, "ANE second LOAD refused: one program per firmware boot; reboot required\n");
-		goto free;
-	}
 	ret = ane_fw_command(b, ANE_FW_IO, command, ANE_FW_LOAD_SIZE,
 			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
 	if (ret)
