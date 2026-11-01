@@ -176,6 +176,11 @@ struct mt7932 {
 	 * sets connect_lost for the worker to report. Under response_lock.
 	 */
 	bool connect_publishing, connect_lost;
+	/* A connect with the previous BSSID is moving the connection to another
+	 * AP (roam_moving), or the current connection is the result of one
+	 * (roam_landed). Written under response_lock with WRITE_ONCE(); read
+	 * under it, or with READ_ONCE() where the lock is not held.
+	 */
 	bool roam_moving, roam_landed;
 	u16 disconnect_reason;
 	int connect_error;

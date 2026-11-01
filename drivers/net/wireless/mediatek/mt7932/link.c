@@ -817,7 +817,7 @@ report:
 	m->connected = !ret;
 	m->disconnecting = false;
 	roam = m->roam_moving;
-	m->roam_moving = false;
+	WRITE_ONCE(m->roam_moving, false);
 	WRITE_ONCE(m->roam_landed, roam && !ret);
 	if (roam && ret)
 		netif_carrier_off(m->netdev);
@@ -935,7 +935,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	spin_lock_irqsave(&m->response_lock, flags);
 	roam = params->prev_bssid && m->connected;
 	if (roam && !ret)
-		m->roam_moving = true;
+		WRITE_ONCE(m->roam_moving, true);
 	/* The link went first and cfg80211 hasn't processed its end: joining now
 	 * would be overtaken by that report, and iwd would miss the connection.
 	 */
@@ -1008,7 +1008,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connecting = true;
 unlock:
 	if (ret && roam) {
-		m->roam_moving = false;
+		WRITE_ONCE(m->roam_moving, false);
 		netif_carrier_off(m->netdev);
 		cfg80211_disconnected(m->netdev, WLAN_REASON_DEAUTH_LEAVING, NULL, 0, true,
 				      GFP_ATOMIC);
