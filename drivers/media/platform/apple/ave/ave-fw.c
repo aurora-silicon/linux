@@ -599,6 +599,15 @@ static int ave_fw_boot(struct ave_dev *ave)
 	 * power cycled (ave_fw_prepare_restart() refuses otherwise), so the
 	 * DPE has lost its settings too. Program its defaults before RUN.
 	 */
+	/* Clear the SVE idle word first: the codec clocks stay gated otherwise. */
+	if (ave->variant->mbox_idle) {
+		writel(0, ave->mbox + ave->variant->mbox_idle);
+		if (readl(ave->mbox + ave->variant->mbox_idle)) {
+			dev_err(ave->dev, "SVE idle word did not clear\n");
+			return -EIO;
+		}
+		wmb();
+	}
 	if (ave->variant->dpe) {
 		ave_dpe_apply(ave->codec, ave->variant->dpe);
 		if (ave_dpe_check(ave->codec, ave->variant->dpe, ave->dev))

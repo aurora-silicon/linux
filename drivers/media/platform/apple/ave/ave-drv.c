@@ -125,6 +125,7 @@ const struct ave_variant ave_t8112 = {
 	.vcbar_flags = 0x0102000000000000ULL,
 	.text_link_cell = 0x423c,
 	.dpe = &ave_t8112_dpe,
+	.mbox_idle = 0x38,
 
 	.extra0_size = 0x4000,
 	.boot_qualified = true,

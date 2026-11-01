@@ -504,6 +504,8 @@ static void ave_t8112_dpe_defaults(struct kunit *test)
 	unsigned int i;
 
 	KUNIT_EXPECT_NULL(test, ave_t6000.dpe);
+	KUNIT_EXPECT_EQ(test, ave_t8112.mbox_idle, 0x38U);
+	KUNIT_EXPECT_EQ(test, ave_t6000.mbox_idle, 0U);
 	KUNIT_ASSERT_NOT_NULL(test, dpe);
 	KUNIT_EXPECT_EQ(test, dpe->count, 7U);
 	KUNIT_EXPECT_EQ(test, dpe->cat, 0xdc000U);

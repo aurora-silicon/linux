@@ -187,6 +187,11 @@ struct ave_variant {
 	u32 text_link_cell;
 	/* DPE defaults applied before every cold firmware start, or NULL. */
 	const struct ave_dpe_table *dpe;
+	/*
+	 * Mailbox offset of the SVE idle (clock gating) word that must read 0
+	 * before the firmware starts, or 0 when the variant has none.
+	 */
+	u32 mbox_idle;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
