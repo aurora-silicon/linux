@@ -817,11 +817,23 @@ static bool h16_job_quiet_busy;
 module_param(h16_job_quiet_busy, bool, 0444);
 MODULE_PARM_DESC(h16_job_quiet_busy, "Use private busy work instead of one sleep during no-poll interval");
 
+static unsigned int h16_job_quiet_wake_us;
+module_param(h16_job_quiet_wake_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_quiet_wake_us, "Optional private periodic wakes inside quiet window (10..1000 us,0 disables)");
+static unsigned int h16_job_quiet_work_ns;
+module_param(h16_job_quiet_work_ns, uint, 0444);
+MODULE_PARM_DESC(h16_job_quiet_work_ns, "Private work after each quiet wake, at most10000ns");
+static unsigned int h16_job_poll_us = 10;
+module_param(h16_job_poll_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_poll_us, "Diagnostic job polling sleep10..1000us, default10");
+
 static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 {
 	unsigned int us = min_t(unsigned int, h16_job_quiet_us, 10000);
 	u64 until, start, counters[2];
-	u8 data[32];
+	u32 wake_us = h16_job_quiet_wake_us ? clamp(h16_job_quiet_wake_us, 10U, 1000U) : 0;
+	u32 work_ns = min(h16_job_quiet_work_ns, 10000U), wakes = 0, active_ns = 0;
+	u8 data[48];
 
 	/* Only a warmed, single outstanding EXEC with the exact same identity.
 	 * Cached/pipelined completions must not masquerade as quiet execution.
@@ -838,7 +850,22 @@ static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 	put_unaligned_le32(raw_smp_processor_id(), data + 28);
 	start = ktime_get_ns();
 	counters[0] = get_cycles();
-	if (!h16_job_quiet_busy) {
+	if (wake_us) {
+		until = start + (u64)us * NSEC_PER_USEC;
+		while (ktime_get_ns() < until) {
+			u64 began, work_until;
+
+			usleep_range(wake_us, wake_us + 10);
+			began = ktime_get_ns();
+			if (began >= until)
+				break;
+			work_until = min(began + work_ns, until);
+			while (ktime_get_ns() < work_until)
+				cpu_relax();
+			active_ns += ktime_get_ns() - began;
+			wakes++;
+		}
+	} else if (!h16_job_quiet_busy) {
 		usleep_range(us, us + 50);
 	} else {
 		until = start + (u64)us * NSEC_PER_USEC;
@@ -846,6 +873,10 @@ static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 			cpu_relax();
 	}
 	counters[1] = get_cycles();
+	put_unaligned_le32(wake_us, data + 32);
+	put_unaligned_le32(work_ns, data + 36);
+	put_unaligned_le32(wakes, data + 40);
+	put_unaligned_le32(active_ns, data + 44);
 	return ane_h16_job_emit_counters(j, ANE_H16_JOB_QUIET, 0,
 				       ktime_get_ns() - start, data, sizeof(data), counters, 2);
 }
@@ -861,8 +892,11 @@ static void ane_h16_job_relax(u64 spin_deadline)
 {
 	if (spin_deadline && ktime_get_ns() < spin_deadline)
 		cpu_relax();
-	else
-		usleep_range(10, 20);
+	else {
+		unsigned int us = clamp(h16_job_poll_us, 10U, 1000U);
+
+		usleep_range(us, us + 10);
+	}
 }
 
 /* ane_fw_transport_wait with a 10-20 us poll, so job timings are not 1 ms steps. */
