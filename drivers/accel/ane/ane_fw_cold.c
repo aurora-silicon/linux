@@ -207,6 +207,10 @@ static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 		dev_info(dev, "U2 DART%u version=%#x protect=%#x unprotect=%#x lock=%#x error=%#x\n",
 			 i, s->dart[i].version, s->dart[i].protect,
 			 s->dart[i].unprotect, s->dart[i].lock, s->dart[i].error);
+		for (j = 0; j < 16; j++)
+			if (s->dart[i].enabled[j])
+				dev_info(dev, "U2 DART%u stream enable word %u=%#x\n", i, j,
+					 s->dart[i].enabled[j]);
 	}
 	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
 		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
