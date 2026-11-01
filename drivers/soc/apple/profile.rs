@@ -450,6 +450,30 @@ pub(crate) const T6040: PlatformProfile = PlatformProfile {
     ..T8140
 };
 
+/// MacBook Air M4 (J713). The J713 ADT (26.6.2, 25G83) puts the Mesa sensor
+/// on spi2 at `0x3ad108000`, 8 MHz, chip select 0, with power on the NUB GPIO
+/// controller (pin 28) and data-ready on AP GPIO 199. The SEP is
+/// `iop-sep,ascwrap-v6` behind a DART with the BIT(40) input alias, so the SoC
+/// side is J613's.
+///
+/// The sensor is J700's generation (`V3`, 0x3356), not J613's (`R3`): the
+/// enclave refuses the R3 SESSION_SHARE (status 0x16) and its factory
+/// calibration is an FSC2 image. So it takes J700's SPI mode 2 and nonce
+/// session; its device tree names its signed root key. J713 on OS firmware
+/// 26.6.2 provisions its keybag, enrols, matches and restores the enrolment
+/// after a reboot.
+pub(crate) const T8132: PlatformProfile = PlatformProfile {
+    name: "T8132/J713",
+    sensor: SensorProfile {
+        controller_base: 0x3_ad10_8000,
+        mode: SpiMode::Mode2,
+        expected_id: 0x3356,
+        ..T8122.sensor
+    },
+    nonce_session: true,
+    ..T8122
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -467,6 +491,9 @@ static_assert!(T8122.sensor.controller_base == 0x2a1108000);
 static_assert!(T8122.wide_dma_mask);
 static_assert!(T6040.sensor.controller_base == 0x429108000);
 static_assert!(T6040.sensor.expected_id == T8140.sensor.expected_id);
+static_assert!(T8132.sensor.controller_base == 0x3ad108000);
+static_assert!(T8132.sensor.expected_id == T8140.sensor.expected_id);
+static_assert!(T8132.nonce_session && T8132.wide_dma_mask);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -575,21 +602,30 @@ fn t6020_profile() -> &'static PlatformProfile {
 /// rather than guessed at, so the driver cannot run a handshake with the wrong
 /// geometry.
 pub(crate) fn detect() -> Result<&'static PlatformProfile> {
-    if machine_has(b"apple,t8103") {
+    select(&machine_has, &t6020_profile)
+}
+
+/// The profile for a machine whose root `compatible` list `has` answers for,
+/// with `t6020` choosing the M2 Pro and Max key-store dialect.
+fn select(
+    has: &dyn Fn(&[u8]) -> bool,
+    t6020: &dyn Fn() -> &'static PlatformProfile,
+) -> Result<&'static PlatformProfile> {
+    if has(b"apple,t8103") {
         return Ok(&T8103);
     }
-    if machine_has(b"apple,t6020") {
-        return Ok(t6020_profile());
+    if has(b"apple,t6020") {
+        return Ok(t6020());
     }
     // t6020.dtsi is defined as a cut-down t6021: it includes t6021.dtsi and
     // disables the parts the smaller die lacks. Both pull in t602x-die0.dtsi,
     // so the SEP, its DART and the SPI controller sit at the same addresses
     // with the same interrupts on either part, and the T6020 constants apply
     // to the M2 Max unchanged.
-    if machine_has(b"apple,t6021") {
-        return Ok(t6020_profile());
+    if has(b"apple,t6021") {
+        return Ok(t6020());
     }
-    if machine_has(b"apple,t6000") {
+    if has(b"apple,t6000") {
         return Ok(&T6000);
     }
     // t6000.dtsi is defined as a cut-down t6001: it includes t6001.dtsi and
@@ -599,24 +635,28 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     // constants apply to the M1 Max unchanged. The Mac Studio (j375c) is also
     // a t6001 but leaves the SEP disabled, so nothing binds there; apple,t6002
     // (M1 Ultra, no built-in sensor) stays unmapped.
-    if machine_has(b"apple,t6001") {
+    if has(b"apple,t6001") {
         return Ok(&T6000);
     }
-    if machine_has(b"apple,t8140") {
+    if has(b"apple,t8140") {
         return Ok(&T8140);
     }
-    if machine_has(b"apple,t8112") {
+    if has(b"apple,t8112") {
         return Ok(&T8112);
     }
     // Only the boards whose ADTs were read: the other T8122 Macs (J433, J434,
     // J504) share the SoC but their sensor wiring is unchecked.
-    if machine_has(b"apple,t8122") && (machine_has(b"apple,j613") || machine_has(b"apple,j615")) {
+    if has(b"apple,t8122") && (has(b"apple,j613") || has(b"apple,j615")) {
         return Ok(&T8122);
     }
     // Only the board whose ADT was read: J616s. The other T6040 Macs share
     // the SoC but their sensor wiring is unchecked.
-    if machine_has(b"apple,t6040") && machine_has(b"apple,j616s") {
+    if has(b"apple,t6040") && has(b"apple,j616s") {
         return Ok(&T6040);
+    }
+    // Only J713: the other T8132 Macs are unread.
+    if has(b"apple,t8132") && has(b"apple,j713") {
+        return Ok(&T8132);
     }
     Err(ENODEV)
 }
@@ -674,6 +714,34 @@ mod tests {
         assert!(T6040.identity == IdentitySource::Chosen);
         assert!(T6040.xart_guard == 1);
     }
+
+    /// The name of the profile `select` picks for a root `compatible` list.
+    fn picked(compatibles: &[&[u8]]) -> Option<&'static str> {
+        let has = |c: &[u8]| compatibles.iter().any(|x| *x == c);
+        select(&has, &|| &T6020).ok().map(|p| p.name)
+    }
+
+    #[test]
+    fn t8132_selection_is_limited_to_j713() {
+        assert_eq!(picked(&[b"apple,j713", b"apple,t8132"]), Some(T8132.name));
+        assert_eq!(picked(&[b"apple,t8132"]), None);
+        assert_eq!(picked(&[b"apple,j613", b"apple,t8132"]), None);
+        assert_eq!(picked(&[b"apple,j713", b"apple,t8122"]), None);
+        assert_eq!(picked(&[b"apple,j613", b"apple,t8122"]), Some(T8122.name));
+        assert_eq!(picked(&[b"apple,j700", b"apple,t8140"]), Some(T8140.name));
+        assert_eq!(picked(&[b"apple,j616s", b"apple,t6040"]), Some(T6040.name));
+        assert_eq!(picked(&[b"apple,t6040"]), None);
+    }
+
+    #[test]
+    fn j713_takes_the_v3_sensor_on_the_j613_soc_side() {
+        assert!(T8132.sensor.expected_id == T8140.sensor.expected_id);
+        assert!(T8132.sensor.mode == SpiMode::Mode2);
+        assert!(T8132.nonce_session && T8132.wide_dma_mask && T8132.persistent_enrol);
+        assert!(T8132.shmem_capacity == T8122.shmem_capacity);
+        assert!(T8132.xart_guard == T8122.xart_guard);
+        assert!(core::ptr::eq(T8132.dart_window, T8122.dart_window));
+    }
 }
 
 #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
@@ -703,7 +771,16 @@ mod dart_window_tests {
 
     #[test]
     fn the_other_profiles_keep_the_bit40_window() {
-        for profile in [&T8103, &T6000, &T6020, &T8140, &T6020_SEPOS13, &T8122, &T6040] {
+        for profile in [
+            &T8103,
+            &T6000,
+            &T6020,
+            &T8140,
+            &T6020_SEPOS13,
+            &T8122,
+            &T6040,
+            &T8132,
+        ] {
             assert_eq!(offset(profile.dart_window), 1 << 40);
             assert_eq!(range(profile.dart_window), (0, 1 << 32));
         }
