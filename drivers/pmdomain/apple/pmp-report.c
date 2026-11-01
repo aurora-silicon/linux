@@ -1526,6 +1526,9 @@ struct apple_pmp_report_entry {
 	u32 id;
 	/* The PMP does not acknowledge this request (a started PMP only). */
 	bool no_ack;
+	/* Withdrawn for system sleep (apple,release-for-sleep), and now so. */
+	bool sleep_release;
+	bool released;
 	bool removed;
 };
 
@@ -1645,6 +1648,80 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	return ret;
 }
 
+/*
+ * System sleep. An external display processor's request keeps the PMP's
+ * external display state up while nothing is shown, about 0.25 W in
+ * suspend-to-idle on J514S. By the noirq phase every display processor has
+ * suspended, its displays off and its links released or idle: withdraw such a
+ * request if it is acknowledged, with one replacement write as macOS releases
+ * its display requests, and assert it again before the processors resume.
+ */
+static int apple_pmp_report_entry_sleep(struct apple_pmp_report_entry *ent, bool release)
+{
+	struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != ent->report_node)
+			continue;
+		if (release && (!(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY) ||
+				!(readq(rep->base + rep->offsets->actual) & BIT_ULL(ent->id))))
+			ret = -EALREADY;
+		else
+			ret = apple_pmp_report_set_state(rep, ent->id, !release, ent->no_ack);
+		break;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+static int apple_pmp_report_entry_suspend_noirq(struct device *dev)
+{
+	struct apple_pmp_report_entry *ent = dev_get_drvdata(dev);
+	int ret;
+
+	if (!ent || !ent->sleep_release || READ_ONCE(ent->removed))
+		return 0;
+	ret = apple_pmp_report_entry_sleep(ent, true);
+	if (ret == -EALREADY)
+		return 0;
+	/* A withdrawal that was not acknowledged is asserted again all the same. */
+	if (ret)
+		dev_warn(dev, "request %u not withdrawn for sleep: %d\n", ent->id, ret);
+	ent->released = true;
+	return 0;
+}
+
+static int apple_pmp_report_entry_resume_noirq(struct device *dev)
+{
+	struct apple_pmp_report_entry *ent = dev_get_drvdata(dev);
+	int ret, tries = 0;
+
+	if (!ent || !ent->released)
+		return 0;
+	ent->released = false;
+	/*
+	 * Without the request the external display stays dark until reboot:
+	 * write it again, three times at most, while the PMP does not
+	 * acknowledge it in time.
+	 */
+	do {
+		ret = apple_pmp_report_entry_sleep(ent, false);
+	} while (ret == -ETIMEDOUT && ++tries < 3);
+	if (ret)
+		dev_err(dev, "request %u not asserted after sleep: %d\n", ent->id, ret);
+	else if (tries)
+		dev_warn(dev, "request %u asserted after sleep on write %d\n", ent->id,
+			 tries + 1);
+	return ret;
+}
+
+static const struct dev_pm_ops apple_pmp_report_entry_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmp_report_entry_suspend_noirq,
+				  apple_pmp_report_entry_resume_noirq)
+};
+
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 {
 	return apple_pmp_report_entry_set_state(genpd, true);
@@ -1717,6 +1794,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 		}
 		ent->no_ack = of_property_read_bool(node, "apple,no-ack");
 	}
+	ent->sleep_release = of_property_read_bool(node, "apple,release-for-sleep");
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret < 0) {
@@ -1805,6 +1883,7 @@ static struct platform_driver apple_pmp_report_entry_driver = {
 	.driver = {
 		.name = "apple-pmp-report-entry",
 		.of_match_table = apple_pmp_report_entry_of_match,
+		.pm = pm_sleep_ptr(&apple_pmp_report_entry_pm_ops),
 		/* Power-domain providers are not intended for manual unbinding. */
 		.suppress_bind_attrs = true,
 	},

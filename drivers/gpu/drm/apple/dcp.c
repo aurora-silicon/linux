@@ -203,9 +203,9 @@ static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
 
-bool hdmi_audio;
+bool hdmi_audio = true;
 module_param(hdmi_audio, bool, 0644);
-MODULE_PARM_DESC(hdmi_audio, "Enable unstable HDMI audio support");
+MODULE_PARM_DESC(hdmi_audio, "Enable DP/HDMI audio support (default: on)");
 
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
@@ -3773,7 +3773,7 @@ int dcp_start(struct platform_device *pdev)
 
 /*
  * A native T6030 external processor: its DP/HDMI audio endpoint (EP 0x29)
- * on the driver's opt-in (hdmi_audio), as the other DCPs start it, for a
+ * unless hdmi_audio is off, as the other DCPs start it, for a
  * processor whose port@0 links an audio device; once per session, and after
  * the first display's EDID was read: with the endpoint's interfaces
  * published, an EDID copy (dcpavserv_copy_edid()) has the firmware rebuild
@@ -3954,7 +3954,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
-	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
+	/* The 14.7 panel has its own known-level blank and restore hooks. */
+	return (!iomfb_v14_7_panel_nits(dcp) &&
+		dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
 	       (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
@@ -4262,7 +4264,7 @@ void dcp_backlight_takeover_registered(struct platform_device *pdev)
 	schedule_work(&dcp->bl_register_wq);
 }
 
-static void dcp_work_register_backlight(struct work_struct *work)
+VISIBLE_IF_KUNIT void dcp_work_register_backlight(struct work_struct *work)
 {
 	int ret;
 	struct apple_dcp *dcp;
@@ -4270,7 +4272,7 @@ static void dcp_work_register_backlight(struct work_struct *work)
 	dcp = container_of(work, struct apple_dcp, bl_register_wq);
 
 	mutex_lock(&dcp->bl_register_mutex);
-	if (dcp->brightness.bl_dev)
+	if (READ_ONCE(dcp->quiescing) || dcp->brightness.bl_dev)
 		goto out_unlock;
 
 	/* try to register backlight device, */
@@ -6372,6 +6374,7 @@ static int dcp_platform_suspend(struct device *dev)
 		return -EBUSY;
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
+	iomfb_v14_7_backlight_suspend(dcp);
 
 	/* Serialize PM against explicit bring-up, including queued startup work.
 	 * Before a startup attempt the device remains suspendable. After any
@@ -6455,6 +6458,7 @@ static int dcp_platform_resume(struct device *dev)
 
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
+	iomfb_v14_7_backlight_resume(dcp);
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)
