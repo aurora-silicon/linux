@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch, M4 Pro, Nov 2024)
+ *
+ * target-type: J614s
+ *
+ * J614s uses the same T6040 platform topology as the supported J616s
+ * board. Keep the shared SoC resources and driver bindings in one baseline;
+ * board-specific firmware supplies the J614s identity at boot.
+ */
+
+#include "t6040-j616s.dts"
+
+/ {
+	compatible = "apple,j614s", "apple,t6040", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M4 Pro, Nov 2024)";
+};
