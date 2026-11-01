@@ -17,6 +17,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 
 #include "ane_fw_platform.h"
 #include "ane_h16_accel.h"
@@ -69,6 +70,7 @@ struct ane_h16_device {
 	bool refused;
 	bool program_ready;
 	struct ane_h16_session session;
+	struct work_struct start;
 };
 
 static DEFINE_MUTEX(ane_h16_lock);
@@ -795,8 +797,25 @@ refuse:
 }
 
 /*
- * Bring-up control in debugfs: write a stage name to <debugfs>/ane-h16/<dev>/stage
- * to run every stage up to it. Without a write nothing touches the hardware.
+ * The bootloader handed off a preload that passed metadata preflight, so the
+ * engine is brought up to the program stage once per boot, off the probe
+ * path. A failure before RUN leaves the device refused; after RUN it is held
+ * until reboot, as for a stage written to debugfs.
+ */
+static void ane_h16_start_work(struct work_struct *work)
+{
+	struct ane_h16_device *h = container_of(work, struct ane_h16_device, start);
+
+	mutex_lock(&ane_h16_lock);
+	if (!h->acquired)
+		ane_h16_advance(h, ANE_H16_PROGRAM);
+	mutex_unlock(&ane_h16_lock);
+}
+
+/*
+ * Diagnostic control in debugfs: read the stage state, or, before the boot
+ * bring-up has run, write a stage name to <debugfs>/ane-h16/<dev>/stage to
+ * run every stage up to it.
  */
 static ssize_t ane_h16_stage_write(struct file *file, const char __user *ubuf,
 				   size_t count, loff_t *ppos)
@@ -888,8 +907,8 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->debugfs = debugfs_create_dir(dev_name(h->dev), ane_h16_debugfs);
 	debugfs_create_file("stage", 0600, h->debugfs, h, &ane_h16_stage_fops);
 	platform_set_drvdata(pdev, h);
-	dev_info(h->dev, "H16 staged backend idle; no hardware access until a stage is written to debugfs ane-h16/%s/stage\n",
-		 dev_name(h->dev));
+	INIT_WORK(&h->start, ane_h16_start_work);
+	schedule_work(&h->start);
 	ret = 0;
 	goto unlock;
 free:
@@ -906,7 +925,8 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 
 	if (!h)
 		return;
-	/* Waits for any stage write in progress before the lock is taken. */
+	/* Waits for the boot bring-up and any stage write in progress. */
+	cancel_work_sync(&h->start);
 	debugfs_remove_recursive(h->debugfs);
 	mutex_lock(&ane_h16_lock);
 	if (!--ane_h16_debugfs_users) {

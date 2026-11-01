@@ -125,8 +125,13 @@ static int ane_fw_preload_check(struct device *dev,
 		return -ENODATA;
 
 	for (i = 0; i < 2; i++) {
+		struct device_node *mem __free(device_node) =
+			of_parse_phandle(np, "memory-region", i);
 		const char *name;
 
+		/* Board DTs carry disabled placeholders the loader fills in. */
+		if (mem && !of_device_is_available(mem))
+			return -ENODEV;
 		if (of_property_read_string_index(np, "memory-region-names", i,
 						  &name) ||
 		    strcmp(name, i ? "firmware-data" : "firmware-text"))
@@ -179,6 +184,10 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	}
 
 	ret = ane_fw_preload_check(dev, soc);
+	if (ret == -ENODEV) {
+		dev_info(dev, "H16 firmware preload not handed off by the bootloader\n");
+		return ret;
+	}
 	if (ret)
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
