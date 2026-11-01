@@ -554,6 +554,18 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 }
 
 /* The output color element follows the HDR metadata: a change is a modeset. */
+/* The EOTF a connector state asks for, an HDMI_EOTF_* value. */
+static u8 apple_connector_eotf(const struct drm_connector_state *state)
+{
+	const struct hdr_output_metadata *hdr;
+
+	if (!state->hdr_output_metadata ||
+	    state->hdr_output_metadata->length != sizeof(*hdr))
+		return HDMI_EOTF_TRADITIONAL_GAMMA_SDR;
+	hdr = state->hdr_output_metadata->data;
+	return hdr->hdmi_metadata_type1.eotf;
+}
+
 static int apple_connector_atomic_check(struct drm_connector *conn,
 					struct drm_atomic_commit *state)
 {
@@ -563,6 +575,16 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 
 	if (!new->crtc || (old->colorspace == new->colorspace &&
 			   drm_connector_atomic_hdr_metadata_equal(old, new)))
+		return 0;
+	/*
+	 * Where the firmware takes HDR10 static metadata on a live link, a
+	 * new block with the same EOTF and colorspace is sent with the next
+	 * frame (dcp_hdr_metadata_sync()); the colour mode stays.
+	 */
+	if (old->colorspace == new->colorspace && old->crtc == new->crtc &&
+	    apple_connector_eotf(old) == apple_connector_eotf(new) &&
+	    to_apple_connector(conn)->dcp &&
+	    dcp_hdr_metadata_live(to_apple_connector(conn)->dcp))
 		return 0;
 	crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
 	if (IS_ERR(crtc_state))
