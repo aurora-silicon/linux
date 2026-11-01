@@ -722,6 +722,7 @@ enum {
 	ANE_H16_JOB_CMD,	/* u32 channel, u32 fill, command; result: the reply */
 	ANE_H16_JOB_EVENT,	/* u64 uuid, u32 timeout ms; result: reports up to the terminal one */
 	ANE_H16_JOB_PEEK,	/* u64 dva, u64 size; result: the bytes */
+	ANE_H16_JOB_QUIET,	/* result only: UUID, handles, requested us, busy, CPU; two counter anchors */
 };
 
 #define ANE_H16_JOB_FILL_PROGRAM BIT(0)	/* u32 program handle at +8 */
@@ -748,6 +749,9 @@ struct ane_h16_job {
 	size_t pool_mark;
 	bool marked;
 	unsigned int outstanding;
+	u64 last_exec_uuid;
+	u32 last_exec_handles[3], quiet_warm_handles[3];
+	bool quiet_warmed;
 };
 
 static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
@@ -813,20 +817,36 @@ static bool h16_job_quiet_busy;
 module_param(h16_job_quiet_busy, bool, 0444);
 MODULE_PARM_DESC(h16_job_quiet_busy, "Use private busy work instead of one sleep during no-poll interval");
 
-static void ane_h16_job_quiet(void)
+static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 {
 	unsigned int us = min_t(unsigned int, h16_job_quiet_us, 10000);
-	u64 until;
+	u64 until, start, counters[2];
+	u8 data[32];
 
-	if (!us)
-		return;
+	/* Only a warmed, single outstanding EXEC with the exact same identity.
+	 * Cached/pipelined completions must not masquerade as quiet execution.
+	 */
+	if (!us || j->outstanding != 1 || uuid != j->last_exec_uuid ||
+	    !j->quiet_warmed || memcmp(j->last_exec_handles,
+				     j->quiet_warm_handles, sizeof(j->last_exec_handles)))
+		return 0;
+	put_unaligned_le64(uuid, data);
+	memcpy(data + 8, j->last_exec_handles, sizeof(j->last_exec_handles));
+	put_unaligned_le32(us, data + 20);
+	put_unaligned_le32(h16_job_quiet_busy, data + 24);
+	put_unaligned_le32(raw_smp_processor_id(), data + 28);
+	start = ktime_get_ns();
+	counters[0] = get_cycles();
 	if (!h16_job_quiet_busy) {
 		usleep_range(us, us + 50);
-		return;
+	} else {
+		until = start + (u64)us * NSEC_PER_USEC;
+		while (ktime_get_ns() < until)
+			cpu_relax();
 	}
-	until = ktime_get_ns() + (u64)us * NSEC_PER_USEC;
-	while (ktime_get_ns() < until)
-		cpu_relax();
+	counters[1] = get_cycles();
+	return ane_h16_job_emit_counters(j, ANE_H16_JOB_QUIET, 0,
+				       ktime_get_ns() - start, data, sizeof(data), counters, 2);
 }
 
 static u64 ane_h16_job_spin_deadline(void)
@@ -913,8 +933,11 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 				       start + h->boot.build->command_timeout_ns);
 	if (!ret) {
 		j->published_ns = start;
-		if (get_unaligned_le16(command + 4) == ANE_H16_EXECUTE)
+		if (get_unaligned_le16(command + 4) == ANE_H16_EXECUTE) {
 			j->outstanding++;
+			j->last_exec_uuid = get_unaligned_le64(command + 0x20);
+			memcpy(j->last_exec_handles, command + 8, sizeof(j->last_exec_handles));
+		}
 		ret = ane_h16_job_wait(h, channel);
 	}
 	counters[1] = get_cycles();
@@ -955,7 +978,9 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		j->done[i].uuid = 0;
 		return j->done[i].state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO;
 	}
-	ane_h16_job_quiet();
+	ret = ane_h16_job_quiet(j, uuid);
+	if (ret)
+		return ret;
 	while (ktime_get_ns() < deadline) {
 		size_t size = 0;
 		u32 pending;
@@ -977,8 +1002,17 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 
 				if (terminal && j->outstanding)
 					j->outstanding--;
-				if (id == uuid && terminal)
+				if (id == uuid && terminal) {
+					if (state == ANE_H16_EVENT_SUCCESS && size >= 0x30 &&
+					    id == j->last_exec_uuid &&
+					    !memcmp(report + 0x10, j->last_exec_handles,
+						    sizeof(j->last_exec_handles))) {
+						memcpy(j->quiet_warm_handles, j->last_exec_handles,
+						       sizeof(j->quiet_warm_handles));
+						j->quiet_warmed = true;
+					}
 					return state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO;
+				}
 				if (terminal) {
 					j->done[j->done_next].uuid = id;
 					j->done[j->done_next].state = state;
