@@ -697,7 +697,7 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 	if (ret)
 		return ret;
 	h->irq = irq;
-	dev_info(h->dev, "H16 polled mode; channel IRQ remains masked\n");
+	dev_info(h->dev, "H16 startup polling; channel IRQ held masked until startup completes\n");
 	return 0;
 }
 
@@ -1255,7 +1255,8 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		ret = -ETIMEDOUT;
 		ane_h16_job_relax(spin_deadline);
 	}
-	return ret;
+	/* A quiet/progress path may leave ret==0; expiry is never success. */
+	return ane_h16_job_irq_error(h) ?: -ETIMEDOUT;
 }
 
 static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,

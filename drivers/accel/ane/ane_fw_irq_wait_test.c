@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 
@@ -42,6 +43,8 @@ static void ane_irq_signal_waiter_test(struct kunit *test)
 	struct ane_irq_wait_thread wait;
 	struct task_struct *task;
 	unsigned long entered, exited;
+	unsigned int i;
+	bool prepared;
 
 	ane_fw_irq_event_init(&wait.event);
 	init_completion(&wait.entered);
@@ -50,12 +53,16 @@ static void ane_irq_signal_waiter_test(struct kunit *test)
 	task = kthread_run(ane_irq_wait_thread_fn, &wait, "ane-irq-test");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
 	entered = wait_for_completion_timeout(&wait.entered, HZ);
+	for (i = 0; i < 50 && !waitqueue_active(&wait.event.queue); i++)
+		usleep_range(1000, 2000);
+	prepared = waitqueue_active(&wait.event.queue);
 	ane_fw_irq_event_notify(&wait.event, 0);
 	exited = wait_for_completion_timeout(&wait.exited, 2 * HZ);
 	/* Always wake/stop before stack storage goes out of scope. */
 	ane_fw_irq_event_notify(&wait.event, -ECANCELED);
 	kthread_stop(task);
 	KUNIT_EXPECT_NE(test, entered, 0UL);
+	KUNIT_EXPECT_TRUE(test, prepared);
 	KUNIT_EXPECT_NE(test, exited, 0UL);
 	KUNIT_EXPECT_EQ(test, wait.result, 1);
 }
