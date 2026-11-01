@@ -48,4 +48,5 @@ config MT7932_KUNIT_TEST
 	  without radio hardware: receive descriptors, including frames the
 	  hardware did not decrypt, command replies, regulatory snapshots
 	  and country power packages. Also check connection admission, SAE
-	  request encoding and WPA passphrase derivation.
+	  request encoding, WPA passphrase derivation and what is reported
+	  when a move to another AP lands, fails or is cancelled.

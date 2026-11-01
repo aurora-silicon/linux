@@ -53,7 +53,8 @@ static bool mt_channel_event(struct mt7932 *m, const u8 *body, size_t length)
 void mt_report_disconnected(struct mt7932 *m, u16 reason, bool local, gfp_t gfp)
 {
 	cfg80211_disconnected(m->netdev, reason, NULL, 0,
-			      local && !READ_ONCE(m->roam_landed), gfp);
+			      mt7932_disconnect_local(local, READ_ONCE(m->roam_landed)),
+			      gfp);
 }
 
 void mt_rf_fail_locked(struct mt7932 *m, int error)
@@ -709,6 +710,7 @@ void mt_connect_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
 	struct cfg80211_connect_resp_params response = {};
+	struct mt7932_connect_report outcome;
 	unsigned long flags;
 	bool submitted = false, peer_owned = false, cancelled, retry = false;
 	bool retirement_attempted = false, auth_submitted = false, roam;
@@ -828,14 +830,15 @@ report:
 	m->connected = !ret;
 	m->disconnecting = false;
 	roam = m->roam_moving;
+	cancelled = m->connect_cancelled;
+	reason = m->disconnect_reason;
+	outcome = mt7932_connect_report(roam, cancelled, ret, reason);
 	WRITE_ONCE(m->roam_moving, false);
-	WRITE_ONCE(m->roam_landed, roam && !ret);
+	WRITE_ONCE(m->roam_landed, outcome.landed);
 	if (roam && ret) {
 		netif_carrier_off(m->netdev);
 		mt_reg_apply_deferred_locked(m);
 	}
-	cancelled = m->connect_cancelled;
-	reason = m->disconnect_reason;
 	m->connect_publishing = true;
 	if (!ret) {
 		schedule_work(&m->power_work);
@@ -846,23 +849,12 @@ report:
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 
-	/* iwd waits for the result of a move, and takes a local disconnect as
-	 * its own, so a cancelled move still has to report one.
-	 */
-	if (cancelled && !roam) {
-		if (response.links[0].bss)
-			cfg80211_put_bss(m->wiphy, response.links[0].bss);
-		cfg80211_disconnected(m->netdev, reason, NULL, 0, true, GFP_KERNEL);
-	} else {
+	if (outcome.result)
 		cfg80211_connect_done(m->netdev, &response, GFP_KERNEL);
-		/* A failed connect result doesn't end the connection it replaced.
-		 * A cancelled move ends it for the reason the cancel gave.
-		 */
-		if (ret && roam)
-			cfg80211_disconnected(m->netdev,
-					      cancelled ? reason : WLAN_REASON_DEAUTH_LEAVING,
-					      NULL, 0, true, GFP_KERNEL);
-	}
+	else if (response.links[0].bss)
+		cfg80211_put_bss(m->wiphy, response.links[0].bss);
+	if (outcome.disconnect)
+		mt_report_disconnected(m, outcome.reason, true, GFP_KERNEL);
 	if (!ret && !m->connect_open)
 		cfg80211_port_authorized(m->netdev, m->connect_bssid, NULL, 0, GFP_KERNEL);
 
