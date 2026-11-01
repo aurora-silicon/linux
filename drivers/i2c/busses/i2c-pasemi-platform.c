@@ -91,6 +91,32 @@ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
 
 static void pasemi_platform_i2c_remove(struct platform_device *pdev) { }
 
+static int pasemi_platform_i2c_suspend_noirq(struct device *dev)
+{
+	struct pasemi_platform_i2c_data *data = dev_get_drvdata(dev);
+
+	i2c_mark_adapter_suspended(&data->smbus.adapter);
+	return 0;
+}
+
+/*
+ * The controller's power domain may have been off (s2idle), which resets the
+ * clock divider and the enable bit.
+ */
+static int pasemi_platform_i2c_resume_noirq(struct device *dev)
+{
+	struct pasemi_platform_i2c_data *data = dev_get_drvdata(dev);
+
+	pasemi_i2c_restore(&data->smbus);
+	i2c_mark_adapter_resumed(&data->smbus.adapter);
+	return 0;
+}
+
+static const struct dev_pm_ops pasemi_platform_i2c_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(pasemi_platform_i2c_suspend_noirq,
+				  pasemi_platform_i2c_resume_noirq)
+};
+
 static const struct of_device_id pasemi_platform_i2c_of_match[] = {
 	{ .compatible = "apple,t8103-i2c" },
 	{ .compatible = "apple,i2c" },
@@ -102,6 +128,7 @@ static struct platform_driver pasemi_platform_i2c_driver = {
 	.driver	= {
 		.name			= "i2c-apple",
 		.of_match_table		= pasemi_platform_i2c_of_match,
+		.pm			= pm_sleep_ptr(&pasemi_platform_i2c_pm_ops),
 	},
 	.probe	= pasemi_platform_i2c_probe,
 	.remove = pasemi_platform_i2c_remove,

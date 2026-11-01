@@ -22,5 +22,6 @@ struct pasemi_smbus {
 };
 
 int pasemi_i2c_common_probe(struct pasemi_smbus *smbus);
+void pasemi_i2c_restore(struct pasemi_smbus *smbus);
 
 irqreturn_t pasemi_irq_handler(int irq, void *dev_id);
