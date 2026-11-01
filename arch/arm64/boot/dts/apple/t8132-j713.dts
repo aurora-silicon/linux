@@ -36,6 +36,76 @@
 		wifi0 = &wifi0;
 	};
 
+	/*
+	 * The speaker amps' shared shutdown line (SDZ, AP GPIO 15, the ADT
+	 * function-reset; low = shutdown). One fixed regulator, the SDZ supply
+	 * of all four, so one amp's fault takes the whole group down.
+	 */
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/*
+	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
+	 * the four amps); macaudio's J713 variant links the AOP audio
+	 * component's speaker back-end (DAI 3) to them. The codecs are listed in
+	 * the ADT provider order, so each gets its native playback slot (LW 0,
+	 * RW 1, LT 2, RT 3). The idle masks are the ADT amp-tx-zd-config rows 0
+	 * and 1 over the 16 sense byte slots: the left woofer drives zeros in
+	 * the right amps' sense slots, the right woofer in the left amps'.
+	 */
+	sound: sound {
+		compatible = "apple,j713-macaudio", "apple,macaudio";
+		model = "MacBook Air J713";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof>, <&speaker_right_woof>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
+
+	/*
+	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
+	 * to the CS42L84, as a card of its own.
+	 */
+	sound_jack: sound-jack {
+		compatible = "apple,j713-macaudio-jack", "apple,macaudio";
+		model = "MacBook Air J713 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
 	chosen {
 		linux-enablement-mac,disk-boot;
 		linux-enablement-mac,dapf-handoff = "/arm-io/aop", "/arm-io/mtp",
@@ -54,6 +124,126 @@
 			default-state = "keep";
 		};
 	};
+};
+
+/*
+ * m1n1 programs the AOP DART's DAPF and reserves the firmware segments and
+ * the DAPF windows in memory-region when /chosen asks for the AOP's handoff,
+ * or disables the AOP.
+ */
+&aop {
+	status = "okay";
+};
+
+&aop_audio {
+	/*
+	 * The microphones on LEAP; the speakers and their sense on base-ns TX0
+	 * and RX0 (the J616s stream: six playback and twelve sense slots, of
+	 * which the four amps take the first four and eight), the jack on TX2
+	 * and RX2.
+	 */
+	dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>, <&admac1 4>, <&admac1 5>;
+	dma-names = "dma", "spkr", "sense", "cout", "cin";
+	apple,chassis-name = "J713";
+	apple,machine-kind = "MacBook Air";
+};
+
+/*
+ * The four SN012776 speaker amps, held in hardware shutdown until the sound
+ * card enables them (ADT /arm-io/i2c3/audio-speaker at 0x38 and its
+ * speaker1..3): one interrupt line on AP GPIO 14, level low; sense slots from
+ * speaker-config (amp i at RX bytes 4i and 4i + 2, order LW RW LT RT). Names
+ * as speakersafetyd's j413/j613 profiles use them. Every amp joins the SDZ
+ * fail-closed group.
+ */
+&i2c3 {
+	status = "okay";
+
+	speaker_left_woof: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_tweet: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_right_woof: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_tweet: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c1/audio-codec-output at 0x4b).
+ * Its reset line is nub GPIO 17, driven high to run the codec; its interrupt
+ * is AP GPIO 98, level low. The AOP firmware runs the jack's stream.
+ */
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
 };
 
 /* Enable DVFS only with the J713 board thermal owner. */
