@@ -68,6 +68,8 @@ struct ane_h16_device {
 	bool job_irq_mode;
 	struct ane_h16_consume_trace *consume_trace;
 	u32 consume_trace_count, consume_trace_dropped;
+	u64 snapshot_sequence, snapshot_begin, snapshot_end;
+	u32 snapshot_begin_cpu, snapshot_end_cpu;
 	struct ane_fw_irq_event irq_event;
 	atomic_t irq_calls, irq_notifications, irq_empty, irq_empty_run, irq_disabled;
 	atomic_t irq_waits, irq_woken, irq_timeouts;
@@ -103,6 +105,10 @@ MODULE_PARM_DESC(h16_job_trace, "Bounded consume-stage RAM timestamps, max256 re
 static bool h16_map_batch;
 module_param(h16_map_batch, bool, 0444);
 MODULE_PARM_DESC(h16_map_batch, "Diagnostic private surface DART mapping in one SG transaction, default0");
+
+static bool h16_job_snapshot;
+module_param(h16_job_snapshot, bool, 0444);
+MODULE_PARM_DESC(h16_job_snapshot, "Allow bounded fixed firmware DATA snapshots after job, default0; non-atomic read only");
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
@@ -1570,6 +1576,100 @@ static int ane_h16_consume_trace_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(ane_h16_consume_trace);
 
+/* One immutable copy per open. Never dereference a firmware VA as a host pointer. */
+struct ane_h16_data_snapshot {
+	void *data;
+	size_t size;
+};
+
+static int ane_h16_data_snapshot_open(struct inode *inode, struct file *file)
+{
+	struct ane_h16_device *h = inode->i_private;
+	struct ane_h16_data_snapshot *snapshot = NULL;
+	void *live = NULL;
+	size_t size;
+	int ret = -ENOMEM;
+
+	mutex_lock(&ane_h16_lock);
+	size = h->boot.soc->preload_size[1];
+	if (!h16_job_snapshot || !h->boot.ran || size != 0x2ac000 ||
+	    h->boot.soc->preload_dva[1] != 0x100000c0000ULL) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	snapshot = kzalloc_obj(*snapshot);
+	if (!snapshot)
+		goto out;
+	snapshot->data = vmalloc(size);
+	if (!snapshot->data)
+		goto out;
+	live = memremap(h->preload_phys[1], size, MEMREMAP_WB);
+	if (!live)
+		goto out;
+	snapshot->size = size;
+	h->snapshot_begin_cpu = raw_smp_processor_id();
+	h->snapshot_begin = get_cycles();
+	dma_rmb();
+	memcpy(snapshot->data, live, size);
+	dma_rmb();
+	h->snapshot_end = get_cycles();
+	h->snapshot_end_cpu = raw_smp_processor_id();
+	h->snapshot_sequence++;
+	file->private_data = snapshot;
+	ret = nonseekable_open(inode, file);
+	memunmap(live);
+	mutex_unlock(&ane_h16_lock);
+	return ret;
+
+out:
+	if (live)
+		memunmap(live);
+	if (snapshot) {
+		vfree(snapshot->data);
+		kfree(snapshot);
+	}
+	mutex_unlock(&ane_h16_lock);
+	return ret;
+}
+
+static ssize_t ane_h16_data_snapshot_read(struct file *file, char __user *buf,
+					 size_t count, loff_t *ppos)
+{
+	struct ane_h16_data_snapshot *snapshot = file->private_data;
+
+	return simple_read_from_buffer(buf, count, ppos, snapshot->data, snapshot->size);
+}
+
+static int ane_h16_data_snapshot_release(struct inode *inode, struct file *file)
+{
+	struct ane_h16_data_snapshot *snapshot = file->private_data;
+
+	vfree(snapshot->data);
+	kfree(snapshot);
+	return 0;
+}
+
+static const struct file_operations ane_h16_data_snapshot_fops = {
+	.owner = THIS_MODULE,
+	.open = ane_h16_data_snapshot_open,
+	.read = ane_h16_data_snapshot_read,
+	.release = ane_h16_data_snapshot_release,
+};
+
+static int ane_h16_data_snapshot_info_show(struct seq_file *m, void *unused)
+{
+	struct ane_h16_device *h = m->private;
+
+	mutex_lock(&ane_h16_lock);
+	seq_printf(m, "{\"sequence\":%llu,\"begin_counter\":%llu,\"end_counter\":%llu,\"begin_cpu\":%u,\"end_cpu\":%u,\"dva\":%llu,\"size\":%llu,\"firmware_vm_base\":786432,\"atomic\":false}\n",
+		   h->snapshot_sequence, h->snapshot_begin, h->snapshot_end,
+		   h->snapshot_begin_cpu, h->snapshot_end_cpu,
+		   h->boot.soc->preload_dva[1], h->boot.soc->preload_size[1]);
+	mutex_unlock(&ane_h16_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ane_h16_data_snapshot_info);
+
 static void ane_h16_job_publish(struct ane_h16_device *h)
 {
 	if (!h16_job || ane_h16_job_dev)
@@ -1595,6 +1695,12 @@ static void ane_h16_job_publish(struct ane_h16_device *h)
 		dev_info(h->dev, "H16 job IRQ mode enabled on Linux IRQ %d\n", h->irq);
 	}
 	ane_h16_job_dev = h;
+	if (h16_job_snapshot) {
+		debugfs_create_file("data_snapshot", 0400, ane_h16_debugfs, h,
+				    &ane_h16_data_snapshot_fops);
+		debugfs_create_file("data_snapshot_info", 0400, ane_h16_debugfs, h,
+				    &ane_h16_data_snapshot_info_fops);
+	}
 	debugfs_create_file("consume_trace", 0400, ane_h16_debugfs, h, &ane_h16_consume_trace_fops);
 	debugfs_create_file("irq_stats", 0400, ane_h16_debugfs, h, &ane_h16_irq_stats_fops);
 	debugfs_create_file("job", 0200, ane_h16_debugfs, NULL, &ane_h16_job_fops);
