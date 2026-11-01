@@ -19,6 +19,9 @@ static void ane_h16_dense_task_test(struct kunit *test)
 	put_unaligned_le32(0x419c / 4 | (1 << 15), text + 16 + 9 * 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
 	put_unaligned_le32(0x4100 / 4, text + 16 + 9 * 4);
+	/* The last task may end the stream without padding (16 + 44 bytes). */
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, 16 + 11 * 4, 1), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, 16 + 10 * 4, 1), -ENOEXEC);
 	text[63] = 1;
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
 }

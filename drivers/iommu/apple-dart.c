@@ -40,6 +40,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/string.h>
 #include <linux/swab.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
@@ -3291,6 +3292,52 @@ static bool apple_dart_capable(struct device *dev, enum iommu_cap cap)
 	}
 }
 
+/*
+ * Media and ML engines (video decode and encode, neural engine, camera ISP)
+ * are run by their own coprocessor firmware, which can still have DMA in
+ * flight after the host driver has given up on a job: a timeout, a reset,
+ * a stream torn down mid-frame. With deferred flushing the DART keeps
+ * translating a freed buffer's addresses until the flush queue drains, so
+ * such a late write lands silently in pages that already went back to the
+ * allocator. Strict flushing makes it fault at the DART instead. These
+ * engines map their buffers once per stream or model, so the per-unmap
+ * invalidate is not on any hot path.
+ *
+ * The client is identified by its device tree compatible, "apple,<soc>-avd"
+ * and so on, so every SoC generation is covered without a per-SoC table.
+ */
+static const char * const apple_dart_strict_engines[] = {
+	"avd", "ave", "ane", "isp",
+};
+
+static bool apple_dart_compat_is_strict_engine(const char *compat)
+{
+	const char *engine;
+	unsigned int i;
+
+	if (!str_has_prefix(compat, "apple,"))
+		return false;
+	engine = strrchr(compat, '-');
+	engine = engine ? engine + 1 : compat + strlen("apple,");
+	for (i = 0; i < ARRAY_SIZE(apple_dart_strict_engines); i++)
+		if (!strcmp(engine, apple_dart_strict_engines[i]))
+			return true;
+	return false;
+}
+
+static bool apple_dart_master_needs_strict(struct device *dev)
+{
+	struct property *prop;
+	const char *compat;
+
+	if (!dev->of_node)
+		return false;
+	of_property_for_each_string(dev->of_node, "compatible", prop, compat)
+		if (apple_dart_compat_is_strict_engine(compat))
+			return true;
+	return false;
+}
+
 static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
@@ -3309,6 +3356,8 @@ static int apple_dart_def_domain_type(struct device *dev)
 	if (!cfg->supports_bypass)
 		return IOMMU_DOMAIN_DMA;
 	if (cfg->locked)
+		return IOMMU_DOMAIN_DMA;
+	if (apple_dart_master_needs_strict(dev))
 		return IOMMU_DOMAIN_DMA;
 
 	return 0;

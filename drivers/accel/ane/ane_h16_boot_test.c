@@ -398,7 +398,7 @@ static u64 sim_now(void *ctx)
 	return ((struct ane_h16_sim *)ctx)->now;
 }
 
-static void sim_relax(void *ctx)
+static void sim_relax(void *ctx, u64 waited_ns)
 {
 	sim_delay(ctx, 1000);
 }

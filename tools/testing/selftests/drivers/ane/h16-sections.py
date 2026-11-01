@@ -96,6 +96,8 @@ def parse(hwx):
                 elif segment == "__KERN_0" and name == "__kern_0":
                     kernel = (svm, ssize, soff)
                 elif segment == "__DATA" and name == "__bss":
+                    if prot != 3:
+                        raise HwxError("scratch segment is not read/write")
                     scratch = (svm, ssize)
         elif cmd == 4 and u32(hwx, pos + 8) == 4:
             descriptor = pos

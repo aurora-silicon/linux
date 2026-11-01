@@ -2,6 +2,8 @@
 #ifndef __ANE_H16_PROGRAM_H__
 #define __ANE_H16_PROGRAM_H__
 
+#include <linux/spinlock.h>
+
 #include "ane_fw_transport.h"
 #include "ane_h16_load.h"
 #include "ane_h16_pending.h"
@@ -172,14 +174,53 @@ struct ane_h16_program {
 	struct ane_h16_execute_buffer scratch;
 	bool has_scratch;
 	struct ane_h16_session *session;
+	/* Session-local identity; firmware program IDs are reused after UNLOAD. */
+	u64 generation;
 	struct ane_h16_request_key key;
 	bool created;
 	bool closed;
 };
 
 /*
- * Programs of one firmware session. Without a switch-safe transport a
- * session runs one program lifetime; see ane_h16_session_load().
+ * Where the time of one EXECUTE goes, in nanoseconds. The firmware phases
+ * are measured by ane_h16_session_execute(); a reply or report is "seen"
+ * when a poll finds it, so they include the poll latency. The copy and
+ * ioctl phases come from the caller through ane_h16_session_account().
+ */
+enum ane_h16_exec_phase {
+	ANE_H16_T_LOCK,		/* waiting for the session lock */
+	ANE_H16_T_COPY_IN,	/* inputs copied in, outputs poisoned */
+	ANE_H16_T_PREPARE,	/* checks, command buffer, until the opening gate */
+	ANE_H16_T_GATE_OPEN,	/* 0x002d 0 published until its reply */
+	ANE_H16_T_SUBMIT_ACK,	/* EXECUTE published until its channel-7 ack */
+	ANE_H16_T_ACK_REPORT,	/* the ack until the first report of the UUID */
+	ANE_H16_T_REPORT_DONE,	/* that report until the completion report */
+	ANE_H16_T_GATE_CLOSE,	/* 0x002d 1 published until its reply */
+	ANE_H16_T_FINISH,	/* read barrier, freeing the command and its arena */
+	ANE_H16_T_COPY_OUT,	/* outputs copied out */
+	ANE_H16_T_FIRMWARE,	/* opening gate published until closing gate reply */
+	ANE_H16_T_IOCTL,	/* the whole request after copying its buffer table */
+	ANE_H16_T_PHASES
+};
+
+struct ane_h16_exec_sample {
+	u64 ns[ANE_H16_T_PHASES];
+	/* Sleeps between polls over all four waits. */
+	u64 polls;
+};
+
+struct ane_h16_exec_stats {
+	u64 count;
+	struct ane_h16_exec_sample last, sum, min, max;
+};
+
+extern const char *const ane_h16_exec_phase_names[ANE_H16_T_PHASES];
+void ane_h16_exec_stats_add(struct ane_h16_exec_stats *st,
+			    const struct ane_h16_exec_sample *x);
+
+/*
+ * Programs of one firmware session: one loaded at a time, any number per
+ * boot; a switch-safe transport may hold several. See ane_h16_session_load().
  */
 struct ane_h16_session {
 	struct ane_fw_transport *transport;
@@ -187,10 +228,21 @@ struct ane_h16_session {
 	void *ctx;
 	u64 timeout_ns;
 	struct ane_h16_pending_table pending;
+	/* The last loaded program. */
+	struct ane_h16_program *program;
+	/* Generation of the last loaded program, and of the last one executed. */
+	u64 generation;
+	u64 executed;
 	u32 dsid;
 	int error;
-	bool load_claimed;
+	/* Firmware log lines printed after the last failed EXECUTE. */
+	unsigned int fwlog_lines;
 	bool quarantined;
+	/* Firmware phases of the last successful EXECUTE. */
+	struct ane_h16_exec_sample timing;
+	/* Accounted EXECUTEs; the lock lets a reader snapshot them. */
+	spinlock_t stats_lock;
+	struct ane_h16_exec_stats stats;
 };
 
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
@@ -203,5 +255,12 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_program **program);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
+void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in_ns,
+			     u64 copy_out_ns, u64 ioctl_ns);
+void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats *out,
+			   bool reset);
+
+#define ANE_H16_FWLOG_RECORD 0x80
+size_t ane_h16_fwlog_line(const u8 *record, char *line);
 
 #endif /* __ANE_H16_PROGRAM_H__ */

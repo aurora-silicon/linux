@@ -54,17 +54,19 @@ def load_module(name, file):
     return module
 
 
-def find_device(explicit):
+def find_device(explicit, errors):
     candidates = [explicit] if explicit else sorted(glob.glob("/dev/accel/accel*"))
     for path in candidates:
         try:
             fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
-        except OSError:
+        except OSError as e:
+            errors.append(f"open({path}): {e.strerror} (errno {e.errno})")
             continue
         caps = bytearray(GET_CAPS.size)
         try:
             fcntl.ioctl(fd, IOCTL_GET_CAPS, caps)
         except OSError:
+            # Not an ANE node (another accel driver); not a failure of ours.
             os.close(fd)
             continue
         _, _, abi, chip, _, _, _, _ = GET_CAPS.unpack(caps)
@@ -99,7 +101,13 @@ def main():
         sections = list(zip((kind for kind, _ in SECTIONS), built))
         print("sections built: buffer IDs", ids, "BAR refs", refs)
 
-    path, fd = find_device(args.device)
+    errors = []
+    path, fd = find_device(args.device, errors)
+    if fd is None and errors:
+        # An accel node exists but cannot be opened: a driver failure, not a skip.
+        for error in errors:
+            print(f"FAIL: {error}")
+        return KSFT_FAIL
     if fd is None:
         print("SKIP: no ABI 3 H16 accel node (program stage not reached)")
         return KSFT_SKIP

@@ -30,6 +30,7 @@ struct ane_transport_test {
 	unsigned int count;
 	u64 now;
 	u64 alloc_time;
+	u64 waited;
 	u64 next_dva;
 	u32 irq;
 	u32 last_reg;
@@ -98,9 +99,12 @@ static u64 ane_test_now(void *ctx)
 	return ((struct ane_transport_test *)ctx)->now;
 }
 
-static void ane_test_relax(void *ctx)
+static void ane_test_relax(void *ctx, u64 waited_ns)
 {
-	((struct ane_transport_test *)ctx)->now++;
+	struct ane_transport_test *f = ctx;
+
+	f->waited = waited_ns;
+	f->now++;
 }
 
 static int ane_test_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
@@ -1077,6 +1081,41 @@ static void ane_transport_bar_context_h16_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_test_execute(f, 1, 1), 0U);
 }
 
+/* Each relax() learns how long its wait has run, and every call is counted. */
+static void ane_transport_wait_polls_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+	ane_test_reply(f, ANE_FW_IO);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), 0);
+	/* A reply already there: no sleep at all. */
+	KUNIT_EXPECT_EQ(test, f->t.polls, 0ULL);
+	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_DATA_CHAIN), 0);
+	f->now = TEST_DEADLINE - 5;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_DATA_CHAIN), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, f->t.polls, 5ULL);
+	/* The fifth sleep came four ticks after the wait began. */
+	KUNIT_EXPECT_EQ(test, f->waited, 4ULL);
+}
+
+static void ane_transport_poll_sleep_test(struct kunit *test)
+{
+	unsigned int max_us;
+
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(0, &max_us), 20U);
+	KUNIT_EXPECT_EQ(test, max_us, 50U);
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_FINE_NS - 1, &max_us), 20U);
+	KUNIT_EXPECT_EQ(test, max_us, 50U);
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_FINE_NS, &max_us), 250U);
+	KUNIT_EXPECT_EQ(test, max_us, 300U);
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_MEDIUM_NS - 1, &max_us), 250U);
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_MEDIUM_NS, &max_us), 1000U);
+	KUNIT_EXPECT_EQ(test, max_us, 1050U);
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(U64_MAX, &max_us), 1000U);
+}
+
 static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_second_load_test),
 	KUNIT_CASE(ane_transport_bar_context_test),
@@ -1111,6 +1150,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_deadline_test),
 	KUNIT_CASE(ane_transport_deadline_service_test),
 	KUNIT_CASE(ane_transport_wait_test),
+	KUNIT_CASE(ane_transport_wait_polls_test),
+	KUNIT_CASE(ane_transport_poll_sleep_test),
 	{}
 };
 

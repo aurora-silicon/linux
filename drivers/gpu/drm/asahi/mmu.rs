@@ -1307,9 +1307,7 @@ impl KernelMapping {
             return Err(EINVAL);
         }
         let address = self.iova().checked_add(offset as u64).ok_or(EOVERFLOW)?;
-        lock_vm(&self.0.owner, None, false)?
-            .page_table
-            .translate_iova(address)
+        self.0.owner.lock_inner().page_table.translate_iova(address)
     }
 
     /// Writes a userspace timestamp through the retained GEM mapping. Aligned results
@@ -2263,9 +2261,7 @@ impl Vm {
     }
 
     pub(crate) fn covers_range(&self, address: u64, size: u64, read: bool, write: bool) -> bool {
-        let Ok(mut inner) = lock_vm(&self.gpuvm, None, false) else {
-            return false;
-        };
+        let mut inner = self.gpuvm.lock_inner();
         Self::covers_range_locked(&mut inner, address, size, read, write)
     }
 
@@ -2280,9 +2276,7 @@ impl Vm {
         if stride <= block_size {
             return false;
         }
-        let Ok(mut inner) = lock_vm(&self.gpuvm, None, false) else {
-            return false;
-        };
+        let mut inner = self.gpuvm.lock_inner();
         addresses.iter().all(|&address| {
             let Some(guard) = address.checked_add(block_size) else {
                 return false;
@@ -2292,12 +2286,12 @@ impl Vm {
         })
     }
 
-    /// Checks all exact request tuples under one GPUVM exec lock. Access bit0
+    /// Checks all exact request tuples under one hold of the VM reservation. Access bit0
     /// requests reading and bit1 writing. The epoch names this same snapshot.
     pub(crate) fn covers_ranges_batch(&self, ranges: &[(u64, u64, u8)]) -> (bool, Option<u64>) {
-        let Ok(mut inner) = lock_vm(&self.gpuvm, None, false) else {
-            return (false, None);
-        };
+        // Every mapping change holds the VM reservation, so readers need only that one. The full
+        // exec lock would also lock every external BO, making each submit O(external BOs).
+        let mut inner = self.gpuvm.lock_inner();
         let epoch = inner.epoch;
         let covered = ranges.iter().all(|&(address, size, access)| {
             Self::covers_range_locked(&mut inner, address, size, access & 1 != 0, access & 2 != 0)
@@ -2421,7 +2415,7 @@ impl Vm {
         // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
         // every subsequent access to VM data is serialized by the exec lock.
         let mut vm_exec = unsafe {
-            self.gpuvm.exec_lock(/*Some(gem)*/ None, false)?
+            self.gpuvm.exec_lock_vm(/*Some(gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
 
@@ -2508,7 +2502,7 @@ impl Vm {
         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
         let mut vm_exec = unsafe {
             self.gpuvm
-                .exec_lock(/*Some(&gem)*/ None, false)
+                .exec_lock_vm(/*Some(&gem)*/ None, false)
                 .inspect_err(|_| {
                     dev_err!(self.dev, "map_at(): Failed to exec_lock gpuvm\n");
                 })?
@@ -2598,7 +2592,7 @@ impl Vm {
         // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
         // every subsequent access to VM data is serialized by the exec lock.
         let mut vm_exec = unsafe {
-            self.gpuvm.exec_lock(/*Some(&gem)*/ None, false)?
+            self.gpuvm.exec_lock_vm(/*Some(&gem)*/ None, false)?
         };
         let inner = vm_exec.unique_gpuvm.data();
 
@@ -2671,7 +2665,7 @@ impl Vm {
     ) -> Result<KernelMapping> {
         // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
         // every subsequent access to VM data is serialized by the exec lock.
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
 
         if (iova as usize | phys | size) & UAT_PGMSK != 0 {
             dev_err!(
@@ -2777,7 +2771,7 @@ impl Vm {
 
         // SAFETY: Vm construction does not retain its initial UniqueRefGpuVm;
         // every subsequent access to VM data is serialized by the exec lock.
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
 
         mod_dev_dbg!(self.dev, "MMU: sm_unmap: {:#x}:{:#x}\n", iova, size);
         let _commit = if user {
@@ -2808,7 +2802,7 @@ impl Vm {
         let mut ctx = StepContext::new(None, Prot::default(), &mut resources)?;
 
         // SAFETY: See `lock_vm()`.
-        let mut vm_exec = match unsafe { self.gpuvm.exec_lock(None, false) } {
+        let mut vm_exec = match unsafe { self.gpuvm.exec_lock_vm(None, false) } {
             Err(error) if error == ENOMEM => return self.drop_mappings_low_memory(gem),
             result => result?,
         };
@@ -3187,7 +3181,7 @@ impl Uat {
             return Err(EINVAL);
         }
         let root = {
-            let owner = lock_vm(&vm.gpuvm, None, false)?;
+            let owner = vm.gpuvm.lock_inner();
             if owner.is_kernel || !Arc::ptr_eq(&owner.uat_inner, &self.inner) {
                 return Err(EINVAL);
             }
@@ -3332,7 +3326,7 @@ impl Uat {
             return Err(EINVAL);
         }
         {
-            let owner = lock_vm(&vm.gpuvm, None, false)?;
+            let owner = vm.gpuvm.lock_inner();
             if owner.is_kernel
                 || !core::ptr::eq(Arc::as_ptr(&owner.uat_inner), Arc::as_ptr(&self.inner))
             {
@@ -3727,7 +3721,7 @@ impl Vm {
     /// Diagnostic reservation occupancy (including guards), not a placement promise.
     /// Removal can progress between queries; allocations are excluded by the VM lock.
     pub(crate) fn capacity(&self, range: Range<u64>) -> Result<(u64, u64)> {
-        let inner = lock_vm(&self.gpuvm, None, false)?;
+        let inner = self.gpuvm.lock_inner();
         let mut next = range.start;
         let mut used = 0;
         let mut largest = 0;

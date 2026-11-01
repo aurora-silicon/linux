@@ -14,10 +14,12 @@
 #define ANE_H16_CUSTOM_BAR_STRIDE 0x18
 /*
  * Request flags word. Bit 0 keeps the request off the firmware's direct
- * submission path and queues it for the full execution loop, which installs
- * a fresh BAR context. Measured on H17 (T8140): without it, the first job
- * after the engine ran a different program can write through that program's
- * stale output binding.
+ * submission path and queues it on the full execution loop (EXELOOP), which
+ * installs a fresh BAR context and the per-priority L2-spill mapping. The
+ * direct path reuses both and never sets them up. Measured on H17 (T8140):
+ * without it, the first job after the engine ran a different program can
+ * write through that program's stale output binding. Set it on the first
+ * request of each program on the engine, the first one after boot included.
  */
 #define ANE_H16_EXECUTE_FLAGS 0x30
 #define ANE_H16_EXECUTE_FLAG_QUEUED BIT(0)

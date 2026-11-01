@@ -23,6 +23,9 @@ enum fw_mode {
 	FW_REPORT_FOREIGN_UUID,
 	FW_REPORT_WRONG_PROCESS,
 	FW_REPORT_FAILURE,
+	FW_REPORT_STALL,
+	/* State 0 at once, then states 3 and 1 after late_polls sleeps. */
+	FW_REPORT_LATE,
 };
 
 /* A synchronous fake firmware that answers on each doorbell. */
@@ -34,10 +37,17 @@ struct prog_fw {
 	struct ane_h16_session s;
 	enum fw_mode mode;
 	u64 now;
+	/* Time each doorbell takes to answer. */
+	u64 doorbell_ns;
+	u64 late_uuid;
+	u32 late_program, late_process;
+	unsigned int late_polls;
 	u64 next_dva;
 	u32 head[ANE_FW_CHANNELS];
 	u32 reports;
+	/* First IDs; the firmware hands out the lowest free one, reused after teardown. */
 	u32 program, process;
+	u32 programs_live, processes_live;
 	u16 ids[32];
 	u32 values[32];
 	unsigned int count;
@@ -47,6 +57,8 @@ struct prog_fw {
 	unsigned int execs;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
+	/* The EXECUTE failure trace lines, by step. */
+	u64 fail_step, fail_flags, fail_reports, fail_state, fail_other;
 };
 
 static u64 fw_load(void *ctx, const void *p)
@@ -118,12 +130,31 @@ static void fw_execute(struct prog_fw *f, const u8 *cmd)
 		fw_report(f, uuid, program, process, 0);
 		fw_report(f, uuid, program, process, 2);
 		break;
+	case FW_REPORT_LATE:
+		fw_report(f, uuid, program, process, 0);
+		f->late_uuid = uuid;
+		f->late_program = program;
+		f->late_process = process;
+		break;
+	case FW_REPORT_STALL:
+		/* Started on the engine, then never a terminal report. */
+		fw_report(f, uuid, program, process, 0);
+		fw_report(f, uuid, program, process, 3);
+		break;
 	default:
 		fw_report(f, uuid, program, process, 0);
 		fw_report(f, uuid, program, process, 3);
 		fw_report(f, uuid, program, process, 1);
 		break;
 	}
+}
+
+static u32 fw_take_id(u32 *live, u32 base)
+{
+	unsigned int i = ffz(*live);
+
+	*live |= BIT(i);
+	return base + i;
 }
 
 static void fw_command(struct prog_fw *f, unsigned int ch)
@@ -147,11 +178,20 @@ static void fw_command(struct prog_fw *f, unsigned int ch)
 		if (f->mode == FW_LOAD_NAK)
 			put_unaligned_le16(1, cmd + 6);
 		else if (f->mode != FW_LOAD_ID_UNCHANGED)
-			put_unaligned_le32(f->program++, cmd + ANE_H16_LOAD_ID_OFFSET);
+			put_unaligned_le32(fw_take_id(&f->programs_live, f->program),
+					   cmd + ANE_H16_LOAD_ID_OFFSET);
+		break;
+	case ANE_H16_UNLOAD_PROGRAM:
+		if (get_unaligned_le32(cmd + 8) - f->program < 32)
+			f->programs_live &= ~BIT(get_unaligned_le32(cmd + 8) - f->program);
+		break;
+	case ANE_H16_TERMINATE_PROCESS:
+		if (get_unaligned_le32(cmd + 0xc) - f->process < 32)
+			f->processes_live &= ~BIT(get_unaligned_le32(cmd + 0xc) - f->process);
 		break;
 	case ANE_H16_CREATE_PROCESS:
 		KUNIT_EXPECT_FALSE(f->test, memchr_inv(cmd + 0xc, 0, ANE_H16_CREATE_SIZE - 0xc));
-		put_unaligned_le32(f->process++, cmd + 0xc);
+		put_unaligned_le32(fw_take_id(&f->processes_live, f->process), cmd + 0xc);
 		if (f->mode == FW_CREATE_BODY)
 			cmd[0x100] = 1;
 		break;
@@ -174,6 +214,9 @@ static void fw_write32(void *ctx, u32 reg, u32 value)
 
 	if (reg != f->soc.doorbell)
 		return;
+	/* Commands take doorbell_ns to answer; returning report slots is free. */
+	if (value & (BIT(ANE_FW_IO) | BIT(ANE_FW_DATA_CHAIN)))
+		f->now += f->doorbell_ns;
 	if (value & BIT(ANE_FW_IO))
 		fw_command(f, ANE_FW_IO);
 	if (value & BIT(ANE_FW_DATA_CHAIN))
@@ -185,9 +228,16 @@ static u64 fw_now(void *ctx)
 	return ((struct prog_fw *)ctx)->now;
 }
 
-static void fw_relax(void *ctx)
+static void fw_relax(void *ctx, u64 waited_ns)
 {
-	((struct prog_fw *)ctx)->now += 10;
+	struct prog_fw *f = ctx;
+
+	f->now += 10;
+	if (f->late_uuid && !--f->late_polls) {
+		fw_report(f, f->late_uuid, f->late_program, f->late_process, 3);
+		fw_report(f, f->late_uuid, f->late_program, f->late_process, 1);
+		f->late_uuid = 0;
+	}
 }
 
 static int fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
@@ -246,6 +296,17 @@ static int fw_map(void *ctx, size_t size, bool write, struct ane_fw_surface *s)
 
 static void fw_log(void *ctx, const char *item, u64 a, u64 b)
 {
+	struct prog_fw *f = ctx;
+
+	if (!strcmp(item, "EXECUTE step/flags")) {
+		f->fail_step = a;
+		f->fail_flags = b;
+	} else if (!strcmp(item, "EXECUTE reports/last state")) {
+		f->fail_reports = a;
+		f->fail_state = b;
+	} else if (!strcmp(item, "EXECUTE other reports")) {
+		f->fail_other = a;
+	}
 }
 
 static const struct ane_h16_session_ops fw_session_ops = {
@@ -443,18 +504,20 @@ static void expect_empty(struct kunit *test, const u8 *load, unsigned int slot)
 static void program_add128_slots_test(struct kunit *test)
 {
 	static const u32 direction[3] = { 1, 2, 1 };
-	struct ane_h16_process_binding bindings[ANE_H16_SURFACES];
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch;
 	struct ane_h16_load_slot slots[ANE_H16_LOAD_SLOTS];
 	struct ane_h16_load_layout layout = {};
 	struct ane_h16_load_plan *plan = kunit_kzalloc(test, sizeof(*plan), GFP_KERNEL);
 	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
 	u8 load[ANE_H16_LOAD_SIZE];
-	u8 generic[ANE_H16_GENERIC_HEADER + 3 * ANE_H16_GENERIC_ENTRY];
+	u8 *generic = kunit_kzalloc(test, ANE_H16_GENERIC_HEADER + 3 * ANE_H16_GENERIC_ENTRY,
+				    GFP_KERNEL);
 	size_t generic_size;
 	unsigned int i, count;
 
 	KUNIT_ASSERT_NOT_NULL(test, plan);
 	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	KUNIT_ASSERT_NOT_NULL(test, generic);
 
 	for (i = 0; i < 3; i++) {
 		hwx->surfaces[i].section.vm = 0x30000000 + i * SZ_32K;
@@ -501,6 +564,8 @@ static void program_add128_slots_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, bindings[1].class, 1);
 	KUNIT_EXPECT_EQ(test, bindings[2].index, 6);
 	KUNIT_EXPECT_EQ(test, bindings[2].class, 0);
+	/* No scratch segment, no scratch binding. */
+	KUNIT_EXPECT_EQ(test, scratch.index, 0);
 
 	/* A generic section that disagrees with the program refuses. */
 	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, generic, generic_size - 4,
@@ -854,7 +919,7 @@ static void program_session_test(struct kunit *test)
 	};
 	static const u32 gates[] = { 0, 0, 0, 0, 1, 0, 0, 1 };
 	struct prog_fw *f = fw_create(test);
-	struct ane_h16_program *p = NULL, *second = NULL;
+	struct ane_h16_program *p = NULL, *second = NULL, *third = NULL;
 	unsigned int i;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -873,8 +938,10 @@ static void program_session_test(struct kunit *test)
 	/* Only the output surface is device-writable. */
 	KUNIT_EXPECT_EQ(test, f->writable_maps, 1);
 
-	for (i = 0; i < 2; i++)
-		KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	/* The first request after boot sets up EXELOOP state: queued. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
 	/* EXECUTE: IDs, priority 5, UUID 2, two descriptors and one mcache record. */
 	KUNIT_EXPECT_EQ(test, f->exec_length, 0xcc0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 8), 0x11);
@@ -889,10 +956,15 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x90 + 4), TEST_GENERIC_BASE + 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x18),
 			p->surfaces[0]->dva);
+	/* Each descriptor covers its whole HWX section. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20),
+			p->hwx.surfaces[0].section.size);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca8 + 8), 4);
+	/* Later requests of the same program take the direct path. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
 
-	/* Second LOAD in the same firmware session refuses, before any traffic. */
+	/* A second LOAD while the first is loaded refuses, before any traffic. */
 	i = f->count;
 	KUNIT_EXPECT_EQ(test, fw_load_program(f, &second), -EBUSY);
 	KUNIT_EXPECT_EQ(test, f->count, i);
@@ -901,8 +973,6 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 	KUNIT_EXPECT_TRUE(test, p->closed);
 	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -EINVAL);
-	/* Still refused after TERMINATE and UNLOAD: one program per boot. */
-	KUNIT_EXPECT_EQ(test, fw_load_program(f, &second), -EBUSY);
 
 	KUNIT_ASSERT_EQ(test, f->count, ARRAY_SIZE(expected));
 	for (i = 0; i < ARRAY_SIZE(expected); i++)
@@ -910,6 +980,90 @@ static void program_session_test(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(gates); i++)
 		if (f->ids[i] == 0x2d)
 			KUNIT_EXPECT_EQ(test, f->values[i], gates[i]);
+
+	/* After TERMINATE and UNLOAD a new program loads in the same session. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &second), 0);
+	KUNIT_ASSERT_NOT_NULL(test, second);
+	KUNIT_EXPECT_EQ(test, second->generation, 2);
+	/* The firmware reuses the program ID; the session tells them apart. */
+	KUNIT_EXPECT_EQ(test, second->key.program, p->key.program);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
+	/* The engine last ran the first program: this request is queued. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
+	i = f->count;
+	KUNIT_EXPECT_EQ(test, fw_load_program(f, &third), -EBUSY);
+	KUNIT_EXPECT_EQ(test, f->count, i);
+	KUNIT_EXPECT_PTR_EQ(test, third, NULL);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, second), 0);
+	/* Closing the first program's file late is harmless. */
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/* A linked program: the HWX scratch is a kernel buffer sent with every EXECUTE. */
+static void program_scratch_test(struct kunit *test)
+{
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch;
+	struct ane_h16_hwx_snapshot *snapshot = fw_snapshot(test, true, false);
+	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	u8 *g = test_aux[ANE_H16_AUX_GENERIC], *e;
+	unsigned int count;
+	size_t size;
+	const u8 *d;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx), 0);
+	KUNIT_ASSERT_EQ(test, hwx->scratch.size, SZ_16K);
+	size = generic_fill(g, hwx, TEST_GENERIC_BASE);
+	e = g + ANE_H16_GENERIC_HEADER + 2 * ANE_H16_GENERIC_ENTRY;
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, g, size, bindings, &count,
+						       &scratch), 0);
+	KUNIT_EXPECT_EQ(test, count, 2);
+	KUNIT_EXPECT_EQ(test, scratch.index, TEST_GENERIC_BASE + 2);
+	KUNIT_EXPECT_EQ(test, scratch.class, 0);
+	KUNIT_EXPECT_EQ(test, scratch.hwx_vm, hwx->scratch.vm);
+	/* No scratch entry, an output-like or short one, or a reused ID refuse. */
+	put_unaligned_le32(2, g + ANE_H16_GENERIC_COUNT);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, size - ANE_H16_GENERIC_ENTRY,
+						       bindings, &count, &scratch), -ENOEXEC);
+	put_unaligned_le32(3, g + ANE_H16_GENERIC_COUNT);
+	put_unaligned_le32(2, e + 0x10);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, size, bindings, &count,
+						       &scratch), -ENOEXEC);
+	put_unaligned_le32(1, e + 0x10);
+	put_unaligned_le64(SZ_16K - 4, e + 0x20);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, size, bindings, &count,
+						       &scratch), -ENOEXEC);
+	put_unaligned_le64(SZ_16K, e + 0x20);
+	put_unaligned_le32(TEST_GENERIC_BASE, e + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, size, bindings, &count,
+						       &scratch), -ENOEXEC);
+	put_unaligned_le32(TEST_GENERIC_BASE + 2, e + 4);
+
+	test_aux_size[ANE_H16_AUX_GENERIC] = size;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, test_aux_ptr, test_aux_size,
+						   &p), 0);
+	KUNIT_ASSERT_TRUE(test, p->has_scratch);
+	/* Userspace still sees two surfaces. */
+	KUNIT_EXPECT_EQ(test, p->resource_count, 2);
+	/* The output and the scratch are the device-writable mappings. */
+	KUNIT_EXPECT_EQ(test, f->writable_maps, 2);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->exec_length, ANE_H16_EXECUTE_BASE_SIZE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x28), 3);
+	d = f->exec + 0x60 + 2 * 0x30;
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), TEST_GENERIC_BASE + 2);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 8), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x18), p->scratch.mapping_dva);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x20), SZ_16K);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
@@ -961,6 +1115,138 @@ static void program_bad_report_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EIO);
 		KUNIT_EXPECT_EQ(test, f->count, sent);
 	}
+}
+
+/* A request that starts and never ends names the wait step and the last state. */
+static void program_stall_trace_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	/* The fake firmware asked for no log buffer: nothing to print. */
+	KUNIT_EXPECT_EQ(test, f->s.fwlog_lines, 0);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->fail_step, 3);
+	KUNIT_EXPECT_EQ(test, f->fail_flags, ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, f->fail_reports, 2);
+	KUNIT_EXPECT_EQ(test, f->fail_state, 3);
+	KUNIT_EXPECT_EQ(test, f->fail_other, 0);
+
+	/* Reports for another UUID only: none seen for this request. */
+	f = fw_create(test);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->mode = FW_REPORT_FOREIGN_UUID;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, f->fail_step, 3);
+	KUNIT_EXPECT_EQ(test, f->fail_reports, 0);
+	KUNIT_EXPECT_EQ(test, f->fail_state, U32_MAX);
+	KUNIT_EXPECT_EQ(test, f->fail_other, 2);
+}
+
+/* The phases of one EXECUTE add up, and only successful ones are accounted. */
+static void program_timing_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	const struct ane_h16_exec_sample *x;
+	struct ane_h16_exec_stats st;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->doorbell_ns = 100;
+	f->mode = FW_REPORT_LATE;
+	f->late_polls = 7;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	x = &f->s.timing;
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_GATE_OPEN], 100ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_SUBMIT_ACK], 100ULL);
+	/* The state-0 report was there with the ack. */
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_ACK_REPORT], 0ULL);
+	/* Seven sleeps of 10 ns until the completion. */
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_REPORT_DONE], 70ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_GATE_CLOSE], 100ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_FIRMWARE], 370ULL);
+	KUNIT_EXPECT_EQ(test, x->polls, 7ULL);
+	/* Nothing outside the firmware phases takes time in the fake. */
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_PREPARE], 0ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_FINISH], 0ULL);
+
+	ane_h16_session_account(&f->s, 1, 5, 6, 400);
+	f->mode = FW_OK;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	/* All three reports came with the ack: nothing between them. */
+	KUNIT_EXPECT_EQ(test, f->s.timing.ns[ANE_H16_T_REPORT_DONE], 0ULL);
+	KUNIT_EXPECT_EQ(test, f->s.timing.polls, 0ULL);
+	ane_h16_session_account(&f->s, 1, 15, 8, 340);
+	ane_h16_session_stats(&f->s, &st, false);
+	KUNIT_EXPECT_EQ(test, st.count, 2ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.ns[ANE_H16_T_LOCK], 2ULL);
+	KUNIT_EXPECT_EQ(test, st.last.ns[ANE_H16_T_COPY_IN], 15ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.ns[ANE_H16_T_COPY_IN], 20ULL);
+	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_REPORT_DONE], 0ULL);
+	KUNIT_EXPECT_EQ(test, st.max.ns[ANE_H16_T_REPORT_DONE], 70ULL);
+	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_IOCTL], 340ULL);
+	KUNIT_EXPECT_EQ(test, st.max.ns[ANE_H16_T_IOCTL], 400ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.polls, 7ULL);
+	KUNIT_EXPECT_EQ(test, st.min.polls, 0ULL);
+	KUNIT_EXPECT_EQ(test, st.max.polls, 7ULL);
+
+	/* A reset starts over: the next sample sets min and max alone. */
+	ane_h16_session_stats(&f->s, NULL, true);
+	ane_h16_session_account(&f->s, 1, 9, 9, 500);
+	ane_h16_session_stats(&f->s, &st, false);
+	KUNIT_EXPECT_EQ(test, st.count, 1ULL);
+	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_IOCTL], 500ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.ns[ANE_H16_T_COPY_OUT], 9ULL);
+
+	/* A stalled request times out and leaves the statistics alone. */
+	f->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	ane_h16_session_stats(&f->s, &st, false);
+	KUNIT_EXPECT_EQ(test, st.count, 1ULL);
+}
+
+static void program_fwlog_line_test(struct kunit *test)
+{
+	static const char text[] = "R: [0:1]: CMD = 0x020c\tok\x01  ";
+	u8 *r = kunit_kzalloc(test, ANE_H16_FWLOG_RECORD, GFP_KERNEL);
+	char line[ANE_H16_FWLOG_RECORD];
+
+	KUNIT_ASSERT_NOT_NULL(test, r);
+	KUNIT_EXPECT_EQ(test, ane_h16_fwlog_line(r, line), 0);
+	r[0] = 0x12;
+	memcpy(r + 2, text, sizeof(text));
+	KUNIT_EXPECT_EQ(test, ane_h16_fwlog_line(r, line), 26);
+	KUNIT_EXPECT_STREQ(test, line, "R: [0:1]: CMD = 0x020c ok.");
+	/* An unterminated record stops at its end. */
+	memset(r + 2, 'a', ANE_H16_FWLOG_RECORD - 2);
+	KUNIT_EXPECT_EQ(test, ane_h16_fwlog_line(r, line), ANE_H16_FWLOG_RECORD - 2);
+	KUNIT_EXPECT_EQ(test, line[ANE_H16_FWLOG_RECORD - 2], 0);
+}
+
+/* The transport finds the log allocation by its tag. */
+static void program_shared_tag_test(struct kunit *test)
+{
+	struct ane_fw_transport *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	t->shared_count = 2;
+	t->shared_tags[0] = ANE_FW_SHARED_LOG;
+	t->shared_tags[1] = ANE_FW_SHARED_EXPP;
+	t->shared[0].dva = 0x10001300000ULL;
+	t->shared[1].dva = 0x10001358000ULL;
+	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_LOG),
+			    &t->shared[0]);
+	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_EXPP),
+			    &t->shared[1]);
+	t->shared_retired[0] = true;
+	KUNIT_EXPECT_NULL(test, ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_LOG));
+	KUNIT_EXPECT_NULL(test, ane_fw_transport_shared_tagged(t, 0x43434d44));
 }
 
 /*
@@ -1208,7 +1494,8 @@ static void program_h17_sections_test(struct kunit *test)
 static void program_h17_mobilenet_test(struct kunit *test)
 {
 	static const u32 ids[3] = { 5, 4, 6 }, classes[3] = { 0, 1, 0 };
-	static const u64 sizes[3] = { 301056, 458752, 0x380000 };
+	/* Whole HWX sections: the input is 0x49800 of tensor in a 0x4c000 section. */
+	static const u64 sizes[3] = { 0x4c000, 458752, 0x380000 };
 	struct ane_h16_hwx_snapshot *snapshot = mobilenet_snapshot(test);
 	struct prog_fw *f = fw_create_family(test, 17);
 	struct ane_h16_program *p = NULL;
@@ -1323,8 +1610,13 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),
 	KUNIT_CASE(program_session_test),
+	KUNIT_CASE(program_scratch_test),
 	KUNIT_CASE(program_bad_load_test),
 	KUNIT_CASE(program_bad_report_test),
+	KUNIT_CASE(program_stall_trace_test),
+	KUNIT_CASE(program_timing_test),
+	KUNIT_CASE(program_fwlog_line_test),
+	KUNIT_CASE(program_shared_tag_test),
 	KUNIT_CASE(program_pool_test),
 	KUNIT_CASE(program_pool_recycle_test),
 	KUNIT_CASE(program_h17_hwx_test),

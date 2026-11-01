@@ -25,7 +25,8 @@ PREFIX = r'''
 #include <stdio.h>
 #include <stdlib.h>
 struct ave_dev;
-struct device { bool enabled, suspended; unsigned supplier_refs; struct ave_dev *data; };
+struct device { bool enabled, suspended; unsigned supplier_refs; struct ave_dev *data;
+    const void *of_node; };
 struct platform_device { struct device dev; };
 struct iommu_domain { unsigned type; };
 struct ave_dev { struct device *dev; const void *variant; int hw_lock;
@@ -41,7 +42,11 @@ struct dev_pm_domain_attach_data {
 #define DMA_BIT_MASK(x) ((UINT64_C(1) << (x)) - 1)
 #define IS_ERR(x) ((uintptr_t)(x) >= (uintptr_t)-4095)
 #define PTR_ERR(x) ((int)(intptr_t)(x))
-static const char *const ave_pd_names[] = {"dma", "pipe4", "pipe5", "me0", "me1"};
+static const char *const ave_pd_names[] = {"dma", "pipe4", "pipe5", "me0", "me1", "perf"};
+/* Whether the node lists the optional "perf" domain (the M4 Pro SoC floor). */
+static bool has_perf;
+static int of_property_match_string(const void *np, const char *prop, const char *str)
+{ (void)np; (void)prop; (void)str; return has_perf ? 5 : -61; }
 static struct ave_dev context;
 static struct iommu_domain domain = {.type = __IOMMU_DOMAIN_PAGING};
 static int attach_error, state_error, enable_error, fw_error, register_error;
@@ -62,13 +67,14 @@ static int devm_pm_domain_attach_list(struct device *d,
     const struct dev_pm_domain_attach_data *data, void **list)
 {
     assert(!d->enabled && d->suspended);
-    assert(data->num_pd_names == 5 && data->pd_flags == PD_FLAG_DEV_LINK_ON);
+    assert(data->num_pd_names == (has_perf ? 6U : 5U) && data->pd_flags == PD_FLAG_DEV_LINK_ON);
+    assert(data->num_pd_names < 6 || data->pd_names[5][0] == 'p');
     assert(!*list);
     if (attach_error) return attach_error;
-    /* Five virtual devices plus the two preactivated DART supplier links. */
-    d->supplier_refs = 7;
+    /* One virtual device per domain plus the two preactivated DART supplier links. */
+    d->supplier_refs = data->num_pd_names + 2;
     *list = d;
-    return 5;
+    return data->num_pd_names;
 }
 static int pm_runtime_set_suspended(struct device *d)
 {
@@ -93,7 +99,7 @@ static int devm_pm_runtime_enable(struct device *d)
 }
 static int ave_fw_probe(struct ave_dev *a)
 {
-    assert(!a->dev->enabled && a->dev->supplier_refs == 7);
+    assert(!a->dev->enabled && a->dev->supplier_refs == (has_perf ? 8U : 7U));
     fw_probes++;
     return fw_error;
 }
@@ -152,7 +158,13 @@ int main(void)
     register_error = -EIO;
     assert(ave_probe(&p) == -EIO);
     assert(!p.dev.supplier_refs && fw_removes == 1);
-    puts("AVE probe PM: idle suppliers, immediate use, 10 cycles and 5 error paths passed");
+    /* A node with the optional performance floor attaches it with the rest, and it is idle too. */
+    reset(&p);
+    has_perf = true;
+    assert(ave_probe(&p) == 0);
+    assert(!p.dev.supplier_refs);
+    has_perf = false;
+    puts("AVE probe PM: idle suppliers, immediate use, 10 cycles, 5 error paths and the perf domain passed");
 }
 '''
 

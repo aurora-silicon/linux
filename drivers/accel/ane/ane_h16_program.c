@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* H16 program lifecycle on the shared firmware transport. */
+#include <linux/ctype.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -319,7 +320,9 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 		    get_unaligned_le32(e + 8) != direction - 1 ||
 		    get_unaligned_le32(e + 0x10) != direction)
 			return -ENOEXEC;
-		if (is_scratch ? bytes != hwx->scratch.size :
+		/* The scratch entry may round __bss up to its 16 KiB mapping. */
+		if (is_scratch ? bytes < hwx->scratch.size ||
+				 bytes > ALIGN(hwx->scratch.size, SZ_16K) :
 		    bytes < hwx->surfaces[i].span || bytes > hwx->surfaces[i].allocation)
 			return -ENOEXEC;
 		for (j = 0; j < i && j < hwx->surface_count; j++)
@@ -342,6 +345,8 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 	}
 	if (!seen[0] || seen[1] != 1)
 		return -ENOEXEC;
+	if (scratch && !hwx->scratch.size)
+		*scratch = (struct ane_h16_process_binding) {};
 	*count = hwx->surface_count;
 	return 0;
 }
@@ -476,6 +481,7 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	s->ctx = ctx;
 	s->timeout_ns = timeout_ns;
 	s->dsid = ANE_H16_MCACHE_DSID;
+	spin_lock_init(&s->stats_lock);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_init);
@@ -636,12 +642,15 @@ static const size_t h16_load_sequence[] = {
 };
 
 /*
- * On this firmware family the first EXECUTE of a newly loaded program can
- * write into the previous program's output buffer, and a larger output
- * overruns it. A switch-safe transport queues that EXECUTE instead (H17), so
- * its session loads any number of programs. Otherwise a session holds one
- * program lifetime: a second LOAD is refused even after the first program
- * closed, and a reboot starts a new session.
+ * On this firmware family a direct EXECUTE reuses the BAR context of the
+ * program the engine ran last, so the first EXECUTE of a program writes into
+ * the previous program's output buffer unless it is queued. The session
+ * queues the first EXECUTE whenever the engine last ran another program, the
+ * first one after boot included (see ane_h16_session_execute()). A LOAD is
+ * refused while the previous program is still loaded and accepted once it
+ * closed; a switch-safe transport (H17) also requeues on every program or
+ * process change, so its session may hold several programs at once. Every
+ * program's firmware-visible memory stays mapped until reset.
  */
 int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_hwx_snapshot *snapshot,
@@ -660,7 +669,8 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		return -EINVAL;
 	if (s->quarantined)
 		return -EIO;
-	if (s->load_claimed && !ane_fw_transport_switch_safe(s->transport))
+	if (s->program && !s->program->closed &&
+	    !ane_fw_transport_switch_safe(s->transport))
 		return -EBUSY;
 	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
 		if (!aux[i] || aux_size[i] < ANE_H16_AUX_MIN ||
@@ -689,11 +699,13 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	p->snapshot = *snapshot;
 	/*
 	 * From the first mapping on, firmware-visible memory exists that is never
-	 * released before reset, so the single program claim is taken here.
+	 * released before reset, so the program becomes the session's here and
+	 * is never freed.
 	 */
-	s->load_claimed = true;
+	p->generation = ++s->generation;
 	memset(snapshot, 0, sizeof(*snapshot));
 	p->session = s;
+	s->program = p;
 	ret = h16_program_map(s, p, aux, aux_size, &layout);
 	if (!ret)
 		ret = ane_h16_load_encode(command, ANE_H16_LOAD_SIZE, p->slots);
@@ -747,11 +759,106 @@ static int h16_gate(struct ane_h16_session *s, u32 value)
 	return ret;
 }
 
+/*
+ * One firmware log record: a 2-byte header, then NUL-terminated text in the
+ * rest of the 0x80 bytes. Copies the printable text (other bytes become '.')
+ * into line, which holds ANE_H16_FWLOG_RECORD - 1 bytes, and returns its
+ * length; 0 for an empty record.
+ */
+size_t ane_h16_fwlog_line(const u8 *record, char *line)
+{
+	size_t i, n = 0;
+
+	for (i = 2; i < ANE_H16_FWLOG_RECORD && record[i]; i++)
+		line[n++] = isprint(record[i]) ? record[i] : record[i] == '\t' ? ' ' : '.';
+	while (n && line[n - 1] == ' ')
+		n--;
+	line[n] = 0;
+	return n;
+}
+EXPORT_SYMBOL_GPL(ane_h16_fwlog_line);
+
+/*
+ * After a failed EXECUTE the session is quarantined, so this runs at most
+ * once per program: print every non-empty record of the firmware log in
+ * buffer order (at most 512 lines for the 64 KiB log).
+ */
+static unsigned int h16_dump_fwlog(struct ane_h16_session *s)
+{
+	const struct ane_fw_surface *log =
+		ane_fw_transport_shared_tagged(s->transport, ANE_FW_SHARED_LOG);
+	char line[ANE_H16_FWLOG_RECORD];
+	unsigned int i, lines = 0;
+
+	if (!log || !log->cpu) {
+		s->ops->log(s->ctx, "fwlog absent", 0, 0);
+		return 0;
+	}
+	s->transport->ops->read_barrier(s->transport->ctx);
+	for (i = 0; i < log->size / ANE_H16_FWLOG_RECORD; i++) {
+		const u8 *r = (const u8 *)log->cpu + i * ANE_H16_FWLOG_RECORD;
+
+		if (!ane_h16_fwlog_line(r, line))
+			continue;
+		pr_info("H16 fwlog[%03x] %04x %s\n", i, get_unaligned_le16(r), line);
+		lines++;
+	}
+	s->ops->log(s->ctx, "fwlog records printed", lines, log->dva);
+	return lines;
+}
+
+/* Non-zero 16-byte rows of a command or reply, as two little-endian words. */
+static void h16_dump_rows(const char *what, const u8 *p, size_t length)
+{
+	size_t off;
+
+	for (off = 0; off + 16 <= length; off += 16) {
+		u64 lo = get_unaligned_le64(p + off), hi = get_unaligned_le64(p + off + 8);
+
+		if (lo || hi)
+			pr_info("H16 %s +%04zx: %016llx %016llx\n", what, off, lo, hi);
+	}
+}
+
+/* What one EXECUTE saw, logged only when it fails. */
+struct h16_execute_trace {
+	u32 step;
+	u32 reports;
+	u32 last_state;
+	u32 other;
+	/* When the first report and the completion of this UUID were seen. */
+	u64 first_ns;
+	u64 done_ns;
+};
+
+enum {
+	H16_STEP_GATE_OPEN = 1,
+	H16_STEP_SEND,
+	H16_STEP_REPORT,
+	H16_STEP_GATE_CLOSE,
+};
+
+static void h16_trace_report(struct h16_execute_trace *trace, const u8 *report,
+			     size_t size, const struct ane_h16_pending *request, u64 now)
+{
+	struct ane_h16_event e;
+
+	if (!ane_h16_event_decode(report, size, ANE_FW_IO_T2H, &e) &&
+	    e.key.uuid == request->key.uuid) {
+		if (!trace->reports++)
+			trace->first_ns = now;
+		trace->last_state = e.state;
+	} else {
+		trace->other++;
+	}
+}
+
 /* Wait for the terminal report of one pending UUID, servicing allocations. */
 static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *request,
-			   u64 deadline)
+			   u64 deadline, struct h16_execute_trace *trace)
 {
 	struct ane_fw_transport *t = s->transport;
+	u64 start = h16_now(s), now;
 	u8 *report;
 	int ret;
 
@@ -769,6 +876,9 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 						       (unsigned long)div_u64(h16_now(s),
 									      NSEC_PER_USEC));
 			if (ret == ANE_H16_EVENT_COMPLETE) {
+				trace->done_ns = h16_now(s);
+				if (!trace->reports)
+					trace->first_ns = trace->done_ns;
 				ret = 0;
 				break;
 			}
@@ -777,8 +887,14 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 				break;
 			}
 			/* Foreign or late UUIDs and ISP-routed reports never retire this call. */
-			if (ret == ANE_H16_EVENT_PROGRESS || ret == -ENOENT || ret == -ENOMSG)
+			if (ret == ANE_H16_EVENT_PROGRESS) {
+				h16_trace_report(trace, report, size, request, h16_now(s));
 				continue;
+			}
+			if (ret == -ENOENT || ret == -ENOMSG) {
+				trace->other++;
+				continue;
+			}
 			break;
 		}
 		if (ret != -EAGAIN)
@@ -791,11 +907,13 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 		}
 		if (ret)
 			break;
-		if (h16_now(s) >= deadline) {
+		now = h16_now(s);
+		if (now >= deadline) {
 			ret = -ETIMEDOUT;
 			break;
 		}
-		t->ops->relax(t->ctx);
+		t->polls++;
+		t->ops->relax(t->ctx, now - start);
 	}
 	kfree(report);
 	return ret;
@@ -811,12 +929,15 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
 	struct ane_h16_pending request = {};
+	struct h16_execute_trace trace = { .last_state = U32_MAX };
 	struct ane_h16_execute call = {};
+	struct ane_h16_exec_sample *x = &s->timing;
 	size_t length, sequence[5], mark;
 	u8 *command;
-	const u8 *reply;
-	unsigned int i, count;
-	u64 deadline;
+	const u8 *reply = NULL;
+	unsigned int i;
+	u64 deadline, polls, t0, gate_open, t1 = 0, t2 = 0, t3, end;
+	u64 entry = h16_now(s);
 	int ret;
 
 	if (!s || !p || p->session != s)
@@ -825,18 +946,26 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 		return -EIO;
 	if (!p->created || p->closed)
 		return -EINVAL;
-	ret = ane_h16_hwx_snapshot_check(&p->snapshot);
-	if (!ret)
-		ret = ane_h16_resources_validate(&p->hwx, p->resources,
-						 p->resource_count);
+	/*
+	 * The snapshot was hashed and parsed at LOAD, everything the firmware
+	 * reads was copied out of it then, and it stays private and unchanged
+	 * until the program is freed. Hashing it again here (8.4 MB for
+	 * MobileNet, about 2.9 ms) protected nothing per request.
+	 */
+	ret = ane_h16_resources_validate(&p->hwx, p->resources, p->resource_count);
 	if (ret)
 		return ret;
-	for (i = 0; i < p->resource_count; i++)
+	/*
+	 * Each descriptor covers the whole HWX section of its surface, not just
+	 * the tensor span: an input whose rows are padded (MobileNet, 0x49800 of
+	 * 0x4c000) is described as the section, as on the working J700 path.
+	 */
+	for (i = 0; i < p->resource_count; i++) {
 		buffers[i] = p->resources[i].buffer;
-	/* The scratch is the last buffer; its ID differs from every surface's. */
+		buffers[i].size = p->hwx.surfaces[i].section.size;
+	}
 	if (p->has_scratch)
 		buffers[i++] = p->scratch;
-	count = i;
 	length = ANE_H16_EXECUTE_BASE_SIZE + p->bar_count * ANE_H16_CUSTOM_BAR_STRIDE;
 	/* Keep room for the teardown pair after this request. */
 	sequence[0] = ANE_H16_GATE_SIZE;
@@ -853,10 +982,14 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	mark = ane_fw_transport_mark(s->transport);
 	/* Inputs and poisoned outputs must reach memory before any doorbell. */
 	s->transport->ops->write_barrier(s->transport->ctx);
+	polls = s->transport->polls;
+	trace.step = H16_STEP_GATE_OPEN;
+	t0 = h16_now(s);
 	ret = h16_gate(s, 0);
 	if (ret)
 		goto fail;
-	deadline = h16_now(s) + s->timeout_ns;
+	gate_open = h16_now(s) - t0;
+	deadline = t0 + gate_open + s->timeout_ns;
 	request.key = p->key;
 	request.deadline = (unsigned long)div_u64(deadline, NSEC_PER_USEC);
 	ret = ane_h16_pending_insert(&s->pending, &request,
@@ -865,41 +998,157 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 		goto fail;
 	call.key = request.key;
 	call.buffers = buffers;
-	call.buffer_count = count;
+	call.buffer_count = p->resource_count + (p->has_scratch ? 1 : 0);
+	/*
+	 * The first request of a program on the engine, the first one after boot
+	 * included, takes the queued path once: only EXELOOP sets up the BAR
+	 * context and the L2-spill mapping that later direct requests reuse.
+	 */
+	if (s->executed != p->generation) {
+		call.flags = ANE_H16_EXECUTE_FLAG_QUEUED;
+		s->ops->log(s->ctx, "EXECUTE first of this program, queued", p->key.program,
+			    request.key.uuid);
+	}
+	s->executed = p->generation;
 	call.bars = p->bars;
 	call.bar_count = p->bar_count;
 	ret = ane_h16_execute_encode(command, length, &call);
 	if (!ret)
 		ret = ane_h16_command_prepare(command, length, ANE_H16_EXECUTE,
 					      ANE_FW_DATA_CHAIN);
-	if (!ret)
+	if (!ret) {
+		trace.step = H16_STEP_SEND;
+		t1 = h16_now(s);
 		ret = h16_send(s, ANE_FW_DATA_CHAIN, command, length, &reply);
+	}
 	/* The channel-7 reply acknowledges transport only, never completion. */
-	if (!ret)
-		ret = h16_wait_report(s, &request, deadline);
+	if (!ret) {
+		trace.step = H16_STEP_REPORT;
+		t2 = h16_now(s);
+		ret = h16_wait_report(s, &request, deadline, &trace);
+	}
 	if (ret) {
 		if (request.active)
 			ane_h16_pending_abort(&s->pending, &request, ret);
 		goto fail;
 	}
+	trace.step = H16_STEP_GATE_CLOSE;
+	t3 = h16_now(s);
 	ret = h16_gate(s, 1);
 	if (ret)
 		goto fail;
+	end = h16_now(s);
 	s->transport->ops->read_barrier(s->transport->ctx);
+	memset(x, 0, sizeof(*x));
+	x->ns[ANE_H16_T_PREPARE] = t0 - entry;
+	x->ns[ANE_H16_T_GATE_OPEN] = gate_open;
+	x->ns[ANE_H16_T_SUBMIT_ACK] = t2 - t1;
+	x->ns[ANE_H16_T_ACK_REPORT] = trace.first_ns - t2;
+	x->ns[ANE_H16_T_REPORT_DONE] = trace.done_ns - trace.first_ns;
+	x->ns[ANE_H16_T_GATE_CLOSE] = end - t3;
+	x->ns[ANE_H16_T_FIRMWARE] = end - t0;
+	x->polls = s->transport->polls - polls;
 	kfree(command);
 	/*
 	 * The completion report and the closing gate reply both arrived, so the
 	 * firmware no longer reads this sequence's commands: reuse their space.
 	 */
-	return ane_fw_transport_release(s->transport, mark);
+	ret = ane_fw_transport_release(s->transport, mark);
+	x->ns[ANE_H16_T_FINISH] = h16_now(s) - end;
+	return ret;
 fail:
-	kfree(command);
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request.key.uuid);
+	/*
+	 * Step 1 opening gate, 2 channel-7 ack, 3 report wait, 4 closing gate.
+	 * Reports for this UUID and the last state (0 start, 3 engine start,
+	 * ffffffff none), then the count of other reports seen while waiting.
+	 */
+	s->ops->log(s->ctx, "EXECUTE step/flags", trace.step, call.flags);
+	s->ops->log(s->ctx, "EXECUTE reports/last state", trace.reports, trace.last_state);
+	s->ops->log(s->ctx, "EXECUTE other reports", trace.other, 0);
+	if (trace.step >= H16_STEP_SEND) {
+		h16_dump_rows("EXECUTE sent", command, length);
+		if (reply)
+			h16_dump_rows("EXECUTE ack", reply, 0x40);
+	}
+	s->fwlog_lines = h16_dump_fwlog(s);
+	kfree(command);
 	return h16_fail(s, ret);
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);
 
-/* TERMINATE then UNLOAD. Mappings, and any single-program claim, stay. */
+const char *const ane_h16_exec_phase_names[ANE_H16_T_PHASES] = {
+	[ANE_H16_T_LOCK] = "lock",
+	[ANE_H16_T_COPY_IN] = "copy_in",
+	[ANE_H16_T_PREPARE] = "prepare",
+	[ANE_H16_T_GATE_OPEN] = "gate_open",
+	[ANE_H16_T_SUBMIT_ACK] = "submit_ack",
+	[ANE_H16_T_ACK_REPORT] = "ack_report",
+	[ANE_H16_T_REPORT_DONE] = "report_done",
+	[ANE_H16_T_GATE_CLOSE] = "gate_close",
+	[ANE_H16_T_FINISH] = "finish",
+	[ANE_H16_T_COPY_OUT] = "copy_out",
+	[ANE_H16_T_FIRMWARE] = "firmware",
+	[ANE_H16_T_IOCTL] = "ioctl",
+};
+EXPORT_SYMBOL_GPL(ane_h16_exec_phase_names);
+
+/* Fold one sample into last, sum, min and max. */
+void ane_h16_exec_stats_add(struct ane_h16_exec_stats *st,
+			    const struct ane_h16_exec_sample *x)
+{
+	unsigned int i;
+
+	if (!st->count++) {
+		st->min = *x;
+		st->max = *x;
+		memset(&st->sum, 0, sizeof(st->sum));
+	}
+	for (i = 0; i < ANE_H16_T_PHASES; i++) {
+		st->sum.ns[i] += x->ns[i];
+		st->min.ns[i] = min(st->min.ns[i], x->ns[i]);
+		st->max.ns[i] = max(st->max.ns[i], x->ns[i]);
+	}
+	st->sum.polls += x->polls;
+	st->min.polls = min(st->min.polls, x->polls);
+	st->max.polls = max(st->max.polls, x->polls);
+	st->last = *x;
+}
+EXPORT_SYMBOL_GPL(ane_h16_exec_stats_add);
+
+/*
+ * Account the last successful EXECUTE with the caller's copy and whole-request
+ * times. The caller serializes this with ane_h16_session_execute().
+ */
+void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in_ns,
+			     u64 copy_out_ns, u64 ioctl_ns)
+{
+	struct ane_h16_exec_sample x = s->timing;
+
+	x.ns[ANE_H16_T_LOCK] = lock_ns;
+	x.ns[ANE_H16_T_COPY_IN] = copy_in_ns;
+	x.ns[ANE_H16_T_COPY_OUT] = copy_out_ns;
+	x.ns[ANE_H16_T_IOCTL] = ioctl_ns;
+	spin_lock(&s->stats_lock);
+	ane_h16_exec_stats_add(&s->stats, &x);
+	spin_unlock(&s->stats_lock);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_account);
+
+/* A consistent copy of the statistics, optionally starting them over. */
+void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats *out,
+			   bool reset)
+{
+	spin_lock(&s->stats_lock);
+	if (out)
+		*out = s->stats;
+	if (reset)
+		memset(&s->stats, 0, sizeof(s->stats));
+	spin_unlock(&s->stats_lock);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_stats);
+
+/* TERMINATE then UNLOAD. The mappings stay until reset; a new LOAD may follow. */
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	u8 command[ANE_H16_TERMINATE_SIZE];
