@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Build the four host-built H16 LOAD sections for one H16G HWX.
+"""Build the four host-built H16 LOAD sections for one H16G or H17 HWX.
 
 H16_LOAD (ABI 3) takes the original HWX plus four sections that the host
 builds from it: generic, operation, procedure and text properties. This
@@ -10,12 +10,16 @@ derives them from the HWX alone:
   0x204) and one 0x30-byte entry per surface in HWX segment order. Each
   entry names its buffer ID, its type (0 input, 1 output), its direction
   (1 input, 2 output) and its size. The output gets ID 4 and the inputs
-  5, 6, ... in segment order. EXECUTE names buffers by these IDs.
+  5, 6, ... in segment order. A program with a __DATA scratch (a linked
+  program's DRAM edges) gets one more entry, last, typed as an input of
+  the __bss size with the next input ID; the kernel binds it to private
+  memory. EXECUTE names buffers by these IDs.
 - operation: one record whose BAR references bind every slot the task
   stream references. A slot takes its base from the program descriptor
   qword at +0x10 * (slot + 1); a surface base binds that surface's buffer
-  ID, the __KERN_0 base binds the kernel resource index 1007, and a zero
-  base (a config-word slot) stays unbound.
+  ID, the __DATA base binds the scratch ID, the __KERN_0 base binds the
+  kernel resource index 1007, and a zero base (a config-word slot) stays
+  unbound.
 - procedure: the fixed one-procedure form.
 - text properties: one segment covering the whole __TEXT,__text stream,
   with one block per task.
@@ -40,6 +44,8 @@ OPERATION_RECORD = 0x40c
 OPERATION_REFS_MAX = (OPERATION_RECORD - 0x0c) // 8
 RESOURCE_KERNEL = 1007
 FIRST_OUTPUT_ID = 4
+# Mach-O CPU subtype to the u32 that opens the task stream.
+PROLOGUE = {7: 1, 9: 0}
 SECTION_NAMES = ("generic.bin", "operation.bin", "procedure.bin", "text-properties.bin")
 # Byte ranges of the H16 register image that task records may name.
 REGISTERS = ((0x0000, 0x005c), (0x4100, 0x41a4), (0x44d0, 0x44d4), (0x4500, 0x453c),
@@ -65,9 +71,9 @@ def cstr(b):
 
 def parse(hwx):
     """Surfaces in segment order, the text and kernel sections, the program descriptor."""
-    if len(hwx) < 32 or u32(hwx, 0) != 0xbeefface or u32(hwx, 8) != 7:
-        raise HwxError("not an H16G HWX")
-    surfaces, text, kernel, descriptor, tensors = [], None, None, None, {}
+    if len(hwx) < 32 or u32(hwx, 0) != 0xbeefface or u32(hwx, 8) not in PROLOGUE:
+        raise HwxError("not an H16G or H17 HWX")
+    surfaces, text, kernel, scratch, descriptor, tensors = [], None, None, None, None, {}
     pos = 32
     for _ in range(u32(hwx, 16)):
         cmd, size = u32(hwx, pos), u32(hwx, pos + 4)
@@ -89,6 +95,8 @@ def parse(hwx):
                     text = (svm, ssize, soff)
                 elif segment == "__KERN_0" and name == "__kern_0":
                     kernel = (svm, ssize, soff)
+                elif segment == "__DATA" and name == "__bss":
+                    scratch = (svm, ssize)
         elif cmd == 4 and u32(hwx, pos + 8) == 4:
             descriptor = pos
         elif cmd == 4 and u32(hwx, pos + 8) == 3:
@@ -110,17 +118,17 @@ def parse(hwx):
         s["span"] = span
     if sum(s["direction"] == 2 for s in surfaces) != 1:
         raise HwxError("an H16 program has exactly one output")
-    return surfaces, text, kernel, descriptor
+    return surfaces, text, kernel, scratch, descriptor
 
 
 def register_valid(word):
     return any(start <= word * 4 < end for start, end in REGISTERS)
 
 
-def walk(stream):
+def walk(stream, prologue):
     """Count the tasks and collect the BAR slots their records reference."""
-    if len(stream) < 16 or len(stream) % 4 or u32(stream, 0) != 1 or any(stream[4:16]):
-        raise HwxError("task stream lacks the H16 prologue")
+    if len(stream) < 16 or len(stream) % 4 or u32(stream, 0) != prologue or any(stream[4:16]):
+        raise HwxError("task stream lacks the prologue of its target")
     pos, tasks, slots = 16, 0, set()
     while pos < len(stream):
         words = (u32(stream, pos) >> 16) & 0x7ff
@@ -155,22 +163,27 @@ def walk(stream):
 
 def build(hwx):
     """Return the four sections, in H16_LOAD kind order, and the buffer IDs."""
-    surfaces, (text_vm, text_size, text_off), kernel, descriptor = parse(hwx)
+    surfaces, (text_vm, text_size, text_off), kernel, scratch, descriptor = parse(hwx)
     stream = hwx[text_off:text_off + text_size]
-    tasks, slots = walk(stream)
+    tasks, slots = walk(stream, PROLOGUE[u32(hwx, 8)])
 
     inputs = iter(range(FIRST_OUTPUT_ID + 1, 0x3d))
     for s in surfaces:
         s["id"] = FIRST_OUTPUT_ID if s["direction"] == 2 else next(inputs)
+    entries = [(s["id"], s["direction"], s["allocation"]) for s in surfaces]
+    scratch_id = None
+    if scratch:
+        scratch_id = next(inputs)
+        entries.append((scratch_id, 1, scratch[1]))
 
-    generic = bytearray(GENERIC_HEADER + GENERIC_ENTRY * len(surfaces))
+    generic = bytearray(GENERIC_HEADER + GENERIC_ENTRY * len(entries))
     struct.pack_into("<II", generic, 0, GENERIC_MAGIC, GENERIC_VERSION)
-    struct.pack_into("<I", generic, 0x204, len(surfaces))
-    for k, s in enumerate(surfaces):
+    struct.pack_into("<I", generic, 0x204, len(entries))
+    for k, (ident, direction, size) in enumerate(entries):
         e = GENERIC_HEADER + GENERIC_ENTRY * k
-        struct.pack_into("<III", generic, e, 1, s["id"], s["direction"] - 1)
-        struct.pack_into("<I", generic, e + 0x10, s["direction"])
-        struct.pack_into("<Q", generic, e + 0x20, s["allocation"])
+        struct.pack_into("<III", generic, e, 1, ident, direction - 1)
+        struct.pack_into("<I", generic, e + 0x10, direction)
+        struct.pack_into("<Q", generic, e + 0x20, size)
         struct.pack_into("<I", generic, e + 0x28, 0xffff)
 
     refs = []
@@ -181,10 +194,13 @@ def build(hwx):
         hit = [s["id"] for s in surfaces if s["vm"] == base]
         if hit:
             refs.append((slot, hit[0]))
+        elif scratch and base == scratch[0]:
+            refs.append((slot, scratch_id))
         elif kernel and base == kernel[0]:
             refs.append((slot, RESOURCE_KERNEL))
         else:
-            raise HwxError("BAR slot %d base %#x names no surface or kernel" % (slot, base))
+            raise HwxError("BAR slot %d base %#x names no surface, scratch or kernel" %
+                       (slot, base))
     if not refs or len(refs) > OPERATION_REFS_MAX:
         raise HwxError("program binds no buffer through a BAR slot")
     operation = bytearray(4 + OPERATION_RECORD)
@@ -202,7 +218,10 @@ def build(hwx):
     struct.pack_into("<QQQ", properties, 0x10, 0, 0, text_size)
 
     sections = [bytes(generic), bytes(operation), bytes(procedure), bytes(properties)]
-    return sections, {s["name"]: s["id"] for s in surfaces}, refs, tasks
+    ids = {s["name"]: s["id"] for s in surfaces}
+    if scratch:
+        ids["scratch"] = scratch_id
+    return sections, ids, refs, tasks
 
 
 def main():

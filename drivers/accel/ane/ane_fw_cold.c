@@ -12,7 +12,6 @@
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
-#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -20,6 +19,7 @@
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
+#include "ane_h16_accel.h"
 
 #define ANE_FW_POOL_DVA 0x10000384000ULL
 #define ANE_FW_IPC_DVA 0x100003d0000ULL
@@ -33,6 +33,7 @@ enum ane_fw_stage {
 	ANE_STAGE_MAPPED,
 	ANE_STAGE_BOOTED,
 	ANE_STAGE_STARTUP,
+	ANE_STAGE_PROGRAM,
 	ANE_STAGE_QUARANTINED,
 };
 
@@ -49,6 +50,8 @@ struct ane_fw_backend {
 	struct device *power, *memory;
 	struct iommu_domain *domain;
 	struct ane_fw_transport transport;
+	/* Programs and their ABI 3 node, after the program stage. */
+	struct ane_h16_session session;
 	struct ane_fw_surface pool, ipc, heap;
 	struct list_head mappings;
 	/* Serialize stage changes, command publication and retained lifetimes. */
@@ -56,7 +59,7 @@ struct ane_fw_backend {
 	struct notifier_block pm_notifier;
 	struct ane_fw_cold_state cold;
 	u64 ranges[ANE_FW_DAPF_RANGES * 2];
-	u64 next_dva, uuid;
+	u64 next_dva;
 	enum ane_fw_stage stage;
 	bool retained;
 };
@@ -156,16 +159,20 @@ static int ane_fw_retain(struct ane_fw_backend *b)
 {
 	int ret;
 
-	/* The tree's kexec blocker is built-in-only. Modules may observe U2. */
-	if (IS_MODULE(CONFIG_DRM_ACCEL_ANE))
-		return -EOPNOTSUPP;
-	ret = kexec_block(&ane_fw_kexec);
-	if (ret)
-		return ret;
+	/*
+	 * The kexec blocker takes built-in users only. A module, like the H16
+	 * backend, pins itself and refuses system sleep, but cannot veto kexec.
+	 */
+	if (IS_BUILTIN(CONFIG_DRM_ACCEL_ANE)) {
+		ret = kexec_block(&ane_fw_kexec);
+		if (ret)
+			return ret;
+	}
 	b->pm_notifier.notifier_call = ane_fw_pm_event;
 	ret = register_pm_notifier(&b->pm_notifier);
 	if (ret) {
-		kexec_unblock(&ane_fw_kexec);
+		if (IS_BUILTIN(CONFIG_DRM_ACCEL_ANE))
+			kexec_unblock(&ane_fw_kexec);
 		return ret;
 	}
 	__module_get(THIS_MODULE);
@@ -361,29 +368,25 @@ static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
 				   u64 size[2], u64 dva[2], u8 data_pin[SHA256_DIGEST_SIZE])
 {
 	struct device_node *np = b->pdev->dev.of_node;
-	struct device_node *reserved __free(device_node) = of_find_node_by_path("/reserved-memory");
 	unsigned int i;
+	int ret;
 
-	if (!reserved || !of_property_read_bool(np, "apple,firmware-preloaded") ||
+	if (!of_property_read_bool(np, "apple,firmware-preloaded") ||
 	    of_property_count_u32_elems(np, "memory-region") != 2 ||
 	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2) ||
 	    of_property_read_u8_array(np, "apple,preload-data-sha256", data_pin,
 				      SHA256_DIGEST_SIZE))
 		return -ENODATA;
+	/* The same no-map, outside-System-RAM rule as the H16 preload. */
 	for (i = 0; i < 2; i++) {
-		struct device_node *mem __free(device_node) =
-			of_parse_phandle(np, "memory-region", i);
-		struct reserved_mem *rmem = mem ? of_reserved_mem_lookup(mem) : NULL;
 		const char *name;
 
-		if (!rmem || mem->parent != reserved || !of_device_is_available(mem) ||
-		    of_property_read_string_index(np, "memory-region-names", i, &name) ||
-		    strcmp(name, i ? "firmware-data" : "firmware-text") ||
-		    !of_property_read_bool(mem, "no-map") ||
-		    of_property_read_bool(mem, "reusable"))
+		if (of_property_read_string_index(np, "memory-region-names", i, &name) ||
+		    strcmp(name, i ? "firmware-data" : "firmware-text"))
 			return -EINVAL;
-		physical[i] = rmem->base;
-		size[i] = rmem->size;
+		ret = ane_fw_preload_range(np, i, &physical[i], &size[i]);
+		if (ret)
+			return ret;
 	}
 	if (!ane_fw_preload_ranges_valid(b->soc, physical, size, dva))
 		return -EINVAL;
@@ -598,10 +601,60 @@ static int ane_fw_startup(struct ane_fw_backend *b)
 	return 0;
 }
 
+/* Private program mappings come from the same window as SHAREDMALLOC. */
+static int ane_fw_program_map(void *ctx, size_t size, bool write, struct ane_fw_surface *out)
+{
+	struct ane_fw_backend *b = ctx;
+	int ret;
+
+	if (!size || !IS_ALIGNED(size, SZ_16K) ||
+	    b->next_dva > ANE_FW_ALLOC_DVA + SZ_512M - size)
+		return -ENOSPC;
+	ret = ane_fw_alloc_at(b, b->next_dva, size,
+			      IOMMU_READ | (write ? IOMMU_WRITE : 0), out);
+	if (ret)
+		return ret;
+	b->next_dva += size;
+	return 0;
+}
+
+static void ane_fw_program_log(void *ctx, const char *item, u64 a, u64 c)
+{
+	struct ane_fw_backend *b = ctx;
+
+	dev_info(&b->pdev->dev, "H17 %s %llx %llx\n", item, a, c);
+}
+
+static const struct ane_h16_session_ops ane_fw_session_ops = {
+	.map = ane_fw_program_map,
+	.log = ane_fw_program_log,
+};
+
+/*
+ * After startup: the shared program session and its ABI 3 node. From here on
+ * the node serializes all firmware traffic. The firmware frees each process
+ * pool after UNLOAD, often only during a later program, so FREE stays
+ * admitted; backing is retained until reboot.
+ */
+static int ane_fw_program_stage(struct ane_fw_backend *b)
+{
+	int ret;
+
+	b->transport.allow_free = true;
+	ret = ane_h16_session_init(&b->session, &b->transport, &ane_fw_session_ops, b,
+				   ANE_FW_TIMEOUT_NS);
+	if (ret)
+		return ret;
+	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
+	if (!ret)
+		dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
+	return ret;
+}
+
 static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	static const char * const names[] = {
-		"unverified", "probe", "map", "boot", "startup", "quarantined",
+		"unverified", "probe", "map", "boot", "startup", "program", "quarantined",
 	};
 	struct ane_fw_backend *b = ane_backend;
 
@@ -635,6 +688,8 @@ static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t c
 		next = ANE_STAGE_BOOTED;
 	else if (sysfs_streq(buf, "startup"))
 		next = ANE_STAGE_STARTUP;
+	else if (sysfs_streq(buf, "program"))
+		next = ANE_STAGE_PROGRAM;
 	else
 		return -EINVAL;
 	if (next != b->stage + 1)
@@ -659,8 +714,10 @@ static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t c
 		ret = ane_fw_prepare(b);
 	} else if (next == ANE_STAGE_BOOTED) {
 		ret = ane_fw_boot(b);
-	} else {
+	} else if (next == ANE_STAGE_STARTUP) {
 		ret = ane_fw_startup(b);
+	} else {
+		ret = ane_fw_program_stage(b);
 	}
 	if (ret)
 		return ane_fw_quarantine(b, ret);
@@ -803,249 +860,4 @@ bool ane_fw_staged_exit(void)
 	ane_backend = NULL;
 	ane_fw_observer_free(b);
 	return true;
-}
-
-static bool ane_fw_owned(struct ane_fw_backend *b, const struct ane_fw_surface *s)
-{
-	struct ane_fw_mapping *m;
-
-	if (!s || !ane_fw_surface_valid(s))
-		return false;
-	list_for_each_entry(m, &b->mappings, list)
-		if (s->dva >= ANE_FW_ALLOC_DVA &&
-		    ane_fw_contains(m->surface.dva, m->surface.size, s->dva, s->size) &&
-		    s->cpu == m->surface.cpu + s->dva - m->surface.dva)
-			return true;
-	return false;
-}
-
-int ane_fw_program_alloc(size_t size, struct ane_fw_surface *surface)
-{
-	struct ane_fw_backend *b = ane_backend;
-	int ret;
-
-	if (!b || !surface || !size || size > ANE_FW_SHARED_TOTAL)
-		return -EINVAL;
-	guard(mutex)(&b->lock);
-	if (b->stage != ANE_STAGE_STARTUP)
-		return -EBUSY;
-	ret = ane_fw_alloc(b, ALIGN(size, SZ_16K), 0, surface);
-	return ret ? ane_fw_quarantine(b, ret) : 0;
-}
-
-static int ane_fw_program_check(struct ane_fw_backend *b, const struct ane_fw_program *p,
-				const struct ane_fw_surface *output)
-{
-	unsigned int i, outputs = 0;
-
-	if (!p || !p->call.buffers || !p->call.buffer_count ||
-	    p->call.buffer_count > ANE_H16_MAX_BUFFERS || p->call.bar_count ||
-	    !ane_fw_owned(b, output))
-		return -EINVAL;
-	for (i = 0; i < ARRAY_SIZE(p->sections); i++) {
-		bool required = i <= 4 || i == 6;
-		const struct ane_fw_load_section *s = &p->sections[i];
-
-		if (required != !!s->surface.size ||
-		    (required && !ane_fw_owned(b, &s->surface)))
-			return -EINVAL;
-	}
-	if (p->sections[0].index != 1002 || p->sections[1].index != ANE_FW_KERNEL_INDEX ||
-	    p->sections[2].index != 1006 || p->sections[3].index != 1003 ||
-	    p->sections[4].index != 1004 || p->sections[6].index != 1005)
-		return -EINVAL;
-	for (i = 0; i < p->call.buffer_count; i++) {
-		const struct ane_h16_execute_buffer *r = &p->call.buffers[i];
-		struct ane_fw_mapping *m;
-		bool found = false;
-
-		if (!r->size || r->offset || r->class > 1 ||
-		    r->mapping_dva < ANE_FW_ALLOC_DVA || r->size > r->mapping_size)
-			return -EINVAL;
-		for (unsigned int j = 0; j < i; j++)
-			if (p->call.buffers[j].index == r->index)
-				return -EINVAL;
-		list_for_each_entry(m, &b->mappings, list)
-			if (m->surface.dva == r->mapping_dva &&
-			    m->surface.size == r->mapping_size)
-				found = true;
-		if (!found)
-			return -EINVAL;
-		if (r->class == 1) {
-			outputs++;
-			if (r->mapping_dva != output->dva || r->size != output->size)
-				return -EINVAL;
-		}
-	}
-	return outputs == 1 ? ane_fw_operation_validate(p) : -EINVAL;
-}
-
-static int ane_fw_gate(struct ane_fw_backend *b, u32 value, u64 deadline)
-{
-	u8 command[12] = {};
-
-	put_unaligned_le16(ANE_H16_POWER_GATE, command + 4);
-	put_unaligned_le32(value, command + 8);
-	return ane_fw_command(b, ANE_FW_DATA_CHAIN, command, sizeof(command), deadline);
-}
-
-static int ane_fw_program_wait(struct ane_fw_backend *b,
-			       const struct ane_h16_request_key *key, u64 deadline)
-{
-	u8 report[0x60];
-	size_t size;
-	u32 pending;
-	int ret;
-
-	while (ktime_get_ns() < deadline) {
-		ret = ane_fw_transport_consume(&b->transport, report, sizeof(report), &size);
-		if (!ret) {
-			if (size == 12 && get_unaligned_le16(report + 4) == 0x107) {
-				if (get_unaligned_le16(report + 6))
-					return -EPROTO;
-				continue;
-			}
-			ret = ane_h16_event_result(report, size, ANE_FW_IO_T2H, key);
-			if (ret == ANE_H16_EVENT_COMPLETE)
-				return 0;
-			if (ret != ANE_H16_EVENT_PROGRESS)
-				return ret < 0 ? ret : -EIO;
-		} else if (ret != -EAGAIN) {
-			return ret;
-		}
-		ret = ane_fw_transport_irq(&b->transport, &pending);
-		if (ret)
-			return ret;
-		ret = ane_fw_transport_shared(&b->transport);
-		if (ret && ret != -EAGAIN)
-			return ret;
-		ane_fw_relax(b);
-	}
-	return -ETIMEDOUT;
-}
-
-int ane_fw_program_run(struct ane_fw_program *program,
-		       const struct ane_fw_surface *output, const void *expected)
-{
-	struct ane_fw_backend *b = ane_backend;
-	struct ane_h16_execute call;
-	u8 *command;
-	u64 deadline;
-	u32 expp = ANE_FW_SHARED_MAX;
-	int ret;
-
-	if (!b || !expected)
-		return -EINVAL;
-	guard(mutex)(&b->lock);
-	if (b->stage != ANE_STAGE_STARTUP)
-		return -EBUSY;
-	ret = ane_fw_program_check(b, program, output);
-	if (ret)
-		return ret;
-	command = kzalloc(ANE_H16_EXECUTE_BASE_SIZE, GFP_KERNEL);
-	if (!command)
-		return -ENOMEM;
-	ret = ane_fw_load_encode(command, program);
-	if (ret)
-		goto free;
-	/* Later programs in this firmware boot are allowed: the transport queues
-	 * the first EXECUTE after a program change (stale BAR context).
-	 */
-	ret = ane_fw_command(b, ANE_FW_IO, command, ANE_FW_LOAD_SIZE,
-			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	if (ret)
-		goto failed;
-	call = program->call;
-	call.key.program = get_unaligned_le32(command + 0x1b8);
-	if (call.key.program == U32_MAX) {
-		ret = -EPROTO;
-		goto failed;
-	}
-	memset(command, 0, ANE_FW_CREATE_SIZE);
-	put_unaligned_le16(ANE_H16_CREATE_PROCESS, command + 4);
-	put_unaligned_le32(call.key.program, command + 8);
-	ret = ane_fw_command(b, ANE_FW_IO, command, ANE_FW_CREATE_SIZE,
-			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	if (ret)
-		goto failed;
-	if (get_unaligned_le32(command + 8) != call.key.program) {
-		ret = -EPROTO;
-		goto failed;
-	}
-	call.key.process = get_unaligned_le32(command + 0xc);
-	for (unsigned int i = 0; i < b->transport.shared_count; i++) {
-		if (b->transport.shared_tags[i] == ANE_FW_SHARED_EXPP &&
-		    b->transport.shared[i].size == SZ_2M && !b->transport.shared_retired[i]) {
-			if (expp != ANE_FW_SHARED_MAX) {
-				ret = -EPROTO;
-				goto failed;
-			}
-			expp = i;
-		}
-	}
-	if (expp == ANE_FW_SHARED_MAX) {
-		ret = -EPROTO;
-		goto failed;
-	}
-	call.key.uuid = ++b->uuid;
-	for (size_t i = 0; i < output->size; i++)
-		((u8 *)output->cpu)[i] = ((const u8 *)expected)[i] ^ 0xff;
-	dma_wmb();
-	deadline = ktime_get_ns() + ANE_FW_TIMEOUT_NS;
-	ret = ane_fw_gate(b, 0, deadline);
-	if (ret)
-		goto failed;
-	ret = ane_h16_execute_encode(command, ANE_H16_EXECUTE_BASE_SIZE, &call);
-	if (ret)
-		goto failed;
-	ret = ane_fw_command(b, ANE_FW_DATA_CHAIN, command, ANE_H16_EXECUTE_BASE_SIZE, deadline);
-	if (ret)
-		goto failed;
-	/* UUID and all IDs are installed locally before the publish above. */
-	ret = ane_fw_program_wait(b, &call.key, deadline);
-	if (ret)
-		goto failed;
-	dma_rmb();
-	if (memcmp(output->cpu, expected, output->size)) {
-		dev_err(&b->pdev->dev, "ANE terminal report without expected output\n");
-		ret = -EIO;
-		goto failed;
-	}
-	ret = ane_fw_gate(b, 1, deadline);
-	if (ret)
-		goto failed;
-	memset(command, 0, 16);
-	put_unaligned_le16(ANE_H16_TERMINATE_PROCESS, command + 4);
-	put_unaligned_le32(call.key.program, command + 8);
-	put_unaligned_le32(call.key.process, command + 12);
-	ret = ane_fw_command(b, ANE_FW_IO, command, 16, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	if (ret)
-		goto failed;
-	memset(command, 0, 12);
-	put_unaligned_le16(ANE_H16_UNLOAD_PROGRAM, command + 4);
-	put_unaligned_le32(call.key.program, command + 8);
-	b->transport.allow_free = true;
-	deadline = ktime_get_ns() + ANE_FW_TIMEOUT_NS;
-	ret = ane_fw_command(b, ANE_FW_IO, command, 12, deadline);
-	if (ret)
-		goto failed;
-	while (!b->transport.shared_retired[expp]) {
-		if (ktime_get_ns() >= deadline) {
-			ret = -ETIMEDOUT;
-			goto failed;
-		}
-		ret = ane_fw_transport_shared(&b->transport);
-		if (ret && ret != -EAGAIN)
-			goto failed;
-		ane_fw_relax(b);
-	}
-	b->transport.allow_free = false;
-	dev_info(&b->pdev->dev, "ANE program: UUID completion and exact output verified; FREE acknowledged\n");
-	ret = 0;
-	goto free;
-failed:
-	ane_fw_quarantine(b, ret);
-free:
-	kfree(command);
-	return ret;
 }

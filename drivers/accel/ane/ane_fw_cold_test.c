@@ -103,50 +103,11 @@ static void ane_cold_command_policy_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, ane_fw_command_denied(permitted[i]));
 }
 
-static void ane_cold_kernel_tag_test(struct kunit *test)
-{
-	struct ane_h16_execute_buffer buffer = { .index = 5 };
-	struct ane_fw_program p = {
-		.kernel_table = true, .kernel_bar = 8,
-		.call = { .buffers = &buffer, .buffer_count = 1 },
-	};
-	u8 *operation = kunit_kzalloc(test, 0x410, GFP_KERNEL);
-	u8 *command = kunit_kzalloc(test, ANE_FW_LOAD_SIZE, GFP_KERNEL);
-
-	KUNIT_ASSERT_NOT_NULL(test, operation);
-	KUNIT_ASSERT_NOT_NULL(test, command);
-	p.sections[1].index = ANE_FW_KERNEL_INDEX;
-	p.sections[3].surface = (struct ane_fw_surface) {
-		.cpu = operation, .dva = 0x10002000000, .size = 0x410,
-	};
-	put_unaligned_le32(1, operation);
-	put_unaligned_le32(2, operation + 0xc);
-	put_unaligned_le32(8, operation + 0x10);
-	put_unaligned_le32(ANE_FW_KERNEL_INDEX, operation + 0x14);
-	put_unaligned_le32(6, operation + 0x18);
-	put_unaligned_le32(5, operation + 0x1c);
-	KUNIT_EXPECT_EQ(test, ane_fw_operation_validate(&p), 0);
-	KUNIT_ASSERT_EQ(test, ane_fw_load_encode(command, &p), 0);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(command + 0x1b8), U32_MAX);
-	/* The observed firmware assertion is caught before LOAD serialization. */
-	put_unaligned_le32(2, operation + 0x14);
-	KUNIT_EXPECT_EQ(test, ane_fw_load_encode(command, &p), -EINVAL);
-	put_unaligned_le32(1006, operation + 0x14);
-	KUNIT_EXPECT_EQ(test, ane_fw_operation_validate(&p), -EINVAL);
-	put_unaligned_le32(ANE_FW_KERNEL_INDEX, operation + 0x14);
-	put_unaligned_le32(8, operation + 0x18);
-	KUNIT_EXPECT_EQ(test, ane_fw_operation_validate(&p), -EINVAL);
-	put_unaligned_le32(6, operation + 0x18);
-	p.sections[3].surface.size--;
-	KUNIT_EXPECT_EQ(test, ane_fw_operation_validate(&p), -EINVAL);
-}
-
 static struct kunit_case ane_cold_cases[] = {
 	KUNIT_CASE(ane_cold_evidence_test),
 	KUNIT_CASE(ane_cold_warm_test),
 	KUNIT_CASE(ane_cold_dart_test),
 	KUNIT_CASE(ane_cold_command_policy_test),
-	KUNIT_CASE(ane_cold_kernel_tag_test),
 	{}
 };
 

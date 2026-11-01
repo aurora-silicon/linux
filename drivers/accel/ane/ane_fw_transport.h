@@ -219,6 +219,16 @@ ane_fw_transport_bar_context(struct ane_fw_transport *t, u8 *copy, size_t size)
 	t->bar_process = process;
 }
 
+/*
+ * Whether one firmware session may run several programs: the transport
+ * queues the first EXECUTE after every program change (H17, above). H16
+ * shares the firmware design, but the rule is unconfirmed there.
+ */
+static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t)
+{
+	return t->soc->chip_family == 17;
+}
+
 /* Commands are copied into a monotonic pool arena, never external DMA memory. */
 static inline int
 ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
@@ -263,7 +273,7 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		.active = true,
 	};
 	t->pool_used = offset + size;
-	if (t->soc->chip_family == 17)
+	if (ane_fw_transport_switch_safe(t))
 		ane_fw_transport_bar_context(t, (u8 *)t->pool.cpu + offset, size);
 	t->ops->store64(t->ctx, p + 8, size);
 	t->ops->store64(t->ctx, p + 16, size);

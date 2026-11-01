@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * H16 accel node (ABI version 3). It exists only after the staged H16 opt-in
- * completed its program stage. Every firmware-visible byte lives in private
+ * H16 and H17 accel node (ABI version 3). It exists only after the staged
+ * opt-in completed its program stage. Every firmware-visible byte lives in private
  * kernel mappings; userspace passes the original HWX, the host-built sections
  * and plain input/output buffers, never DVAs, firmware IDs or commands.
  */
@@ -40,6 +40,7 @@ static struct ane_h16_accel *to_h16_accel(struct drm_device *drm)
 static int ane_h16_get_caps_ioctl(struct drm_device *drm, void *data,
 				  struct drm_file *file)
 {
+	struct ane_h16_accel *a = to_h16_accel(drm);
 	struct drm_ane_get_caps *args = data;
 
 	if (args->flags || args->pad)
@@ -47,7 +48,7 @@ static int ane_h16_get_caps_ioctl(struct drm_device *drm, void *data,
 	*args = (struct drm_ane_get_caps) {
 		.size = sizeof(*args),
 		.abi_version = DRM_ANE_ABI_V3,
-		.chip_family = DRM_ANE_CHIP_H16,
+		.chip_family = a->session->transport->soc->chip_family,
 		.section_size = sizeof(struct drm_ane_h16_section),
 		.exec_io_size = sizeof(struct drm_ane_h16_buffer),
 	};
@@ -114,7 +115,7 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		ret = ane_h16_session_load(a->session, &snapshot,
 					   (const void *const *)aux, aux_size, &program);
 		if (ret == -EBUSY)
-			drm_err(drm, "H16 one program per firmware boot; reboot required\n");
+			drm_err(drm, "one program per firmware boot; reboot required\n");
 		if (!ret)
 			f->program = program;
 	}
@@ -213,7 +214,7 @@ static void ane_h16_postclose(struct drm_device *drm, struct drm_file *file)
 	if (f->program) {
 		ret = ane_h16_session_close(a->session, f->program);
 		if (ret)
-			drm_err(drm, "H16 program teardown failed %d; session quarantined\n", ret);
+			drm_err(drm, "program teardown failed %d; session quarantined\n", ret);
 	}
 	mutex_unlock(&a->lock);
 	kfree(f);
@@ -247,7 +248,7 @@ static const struct drm_driver ane_h16_drm_driver = {
 	.major = DRM_ANE_ABI_V3,
 	.minor = 0,
 	.name = "ane",
-	.desc = "Apple Neural Engine (H16)",
+	.desc = "Apple Neural Engine (H16 and later)",
 };
 
 int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
@@ -265,6 +266,9 @@ int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 	ret = drm_dev_register(&a->drm, 0);
 	if (ret)
 		return ret;
-	drm_info(&a->drm, "H16 accel node ready (ABI 3, one program per firmware boot)\n");
+	drm_info(&a->drm, "H%u accel node ready (ABI 3, %s)\n",
+		 session->transport->soc->chip_family,
+		 ane_fw_transport_switch_safe(session->transport) ?
+		 "programs switch within one firmware boot" : "one program per firmware boot");
 	return 0;
 }

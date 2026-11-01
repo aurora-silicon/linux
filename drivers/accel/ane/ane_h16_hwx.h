@@ -10,6 +10,9 @@
 #define ANE_H16_SECTIONS 8
 #define ANE_H16_REGIONS 7
 #define ANE_H16_HWX_MAX (SZ_256M + SZ_1M)
+/* Mach-O CPU subtypes of the two targets that share this container form. */
+#define ANE_HWX_SUBTYPE_H16 7
+#define ANE_HWX_SUBTYPE_H17 9
 
 struct ane_h16_hwx_section {
 	u64 vm;
@@ -48,6 +51,8 @@ struct ane_h16_hwx_region {
 
 struct ane_h16_hwx {
 	struct ane_h16_hwx_section text, constants, kernel, scratch;
+	/* Target; a backend accepts only its own engine's subtype. */
+	u32 subtype;
 	struct ane_h16_hwx_surface surfaces[ANE_H16_SURFACES];
 	u32 surface_count;
 	u32 tasks;
