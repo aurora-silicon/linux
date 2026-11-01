@@ -265,11 +265,36 @@ free_data:
 	return ret;
 }
 
+/*
+ * Read-only evidence for the 6070 first start: the coprocessor timebase must
+ * advance, and the reset path rewrites DATA +0x60358 (0xfeed1b00 at rest)
+ * before the firmware enables its MMU.
+ */
+static void ave_fw_6070_probe_state(struct ave_dev *ave, const char *when)
+{
+	const struct ave_coproc_regs *r = ave->variant->regs;
+	u64 tb0, tb1;
+	u32 *va;
+
+	tb0 = readq(ave->coproc + r->timebase);
+	udelay(200);
+	tb1 = readq(ave->coproc + r->timebase);
+	va = memremap(ave->data.phys, ave->data.size, MEMREMAP_WC);
+	dev_info(ave->dev,
+		 "6070 %s: timebase %#llx -> %#llx, ctrl %#x status %#x, DATA+0x60358 %#x +0x18000 %#x\n",
+		 when, tb0, tb1, readl(ave->coproc + r->ctrl),
+		 readl(ave->coproc + r->status),
+		 va ? READ_ONCE(va[0x60358 / 4]) : 0,
+		 va ? READ_ONCE(va[0x18000 / 4]) : 0);
+	if (va)
+		memunmap(va);
+}
+
 static int ave_fw_restore_data(struct ave_dev *ave)
 {
 	void *va;
 
-	if (!ave->data_dirty)
+	if (!ave->data_dirty && !ave->variant->restore_data_first)
 		return 0;
 	va = memremap(ave->data.phys, ave->data.size, MEMREMAP_WC);
 	if (!va)
@@ -284,7 +309,7 @@ static int ave_fw_restore_data(struct ave_dev *ave)
 
 		if (ret || crc != ave->data_crc)
 			return ret ?: -EIO;
-		dev_dbg(ave->dev, "restored DATA CRC %08x\n", ave->data_crc);
+		dev_info(ave->dev, "restored DATA CRC %08x\n", ave->data_crc);
 	}
 	ave->data_dirty = false;
 	return 0;
@@ -684,7 +709,13 @@ static int ave_fw_boot(struct ave_dev *ave)
 	writel(0, ave->coproc + ave->variant->regs->ctrl);
 	writel(ave->variant->boot_arg_value,
 	       ave->coproc + ave->variant->regs->boot_arg);
+	if (ave->variant->restore_data_first)
+		ave_fw_6070_probe_state(ave, "before RUN");
 	writel(AVE_COPROC_CTRL_RUN, ave->coproc + ave->variant->regs->ctrl);
+	if (ave->variant->restore_data_first) {
+		udelay(50);
+		ave_fw_6070_probe_state(ave, "after RUN");
+	}
 
 	ret = readl_poll_timeout(ave->mbox + AVE_MBOX_STATUS, status,
 				 status & AVE_MBOX_STATUS_PENDING, 50,

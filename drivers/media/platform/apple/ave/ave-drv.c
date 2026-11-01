@@ -126,6 +126,7 @@ const struct ave_variant ave_t8112 = {
 	.text_link_cell = 0x423c,
 	.dpe = &ave_t8112_dpe,
 	.mbox_idle = 0x38,
+	.restore_data_first = true,
 
 	.extra0_size = 0x4000,
 	.boot_qualified = true,

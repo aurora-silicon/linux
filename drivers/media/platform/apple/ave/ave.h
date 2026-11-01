@@ -192,6 +192,8 @@ struct ave_variant {
 	 * before the firmware starts, or 0 when the variant has none.
 	 */
 	u32 mbox_idle;
+	/* Restore DATA from the boot snapshot before every start, the first included. */
+	bool restore_data_first;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
