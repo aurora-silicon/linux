@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Shared firmware backend. H17 is the first measured cold power provider. */
 #include <crypto/sha2.h>
+#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -15,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 
@@ -274,8 +276,14 @@ static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
 	return 0;
 }
 
-static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
-			   int prot, struct ane_fw_surface *s)
+/*
+ * Coherent (uncached) memory for firmware-owned state, or, with cached,
+ * CPU-cacheable memory for program surfaces that the CPU copies to and from
+ * on every request. The engine does not snoop either; cached surfaces are
+ * kept coherent by ane_fw_program_sync() around each use.
+ */
+static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
+			    int prot, bool cached, struct ane_fw_surface *s)
 {
 	struct ane_fw_mapping *m;
 	int ret;
@@ -283,10 +291,21 @@ static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
 	m = kzalloc_obj(*m);
 	if (!m)
 		return -ENOMEM;
-	m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical, GFP_KERNEL);
+	if (cached)
+		m->surface.cpu = dma_alloc_noncoherent(b->memory, size, &m->physical,
+						       DMA_BIDIRECTIONAL, GFP_KERNEL);
+	else
+		m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical,
+						    GFP_KERNEL);
 	if (!m->surface.cpu) {
 		kfree(m);
 		return -ENOMEM;
+	}
+	if (cached) {
+		/* Zero it and write the zeroes back before the engine sees it. */
+		memset(m->surface.cpu, 0, size);
+		dma_sync_single_for_device(b->memory, m->physical, size, DMA_BIDIRECTIONAL);
+		m->surface.handle = m->physical;
 	}
 	m->surface.dva = dva;
 	m->surface.size = size;
@@ -296,6 +315,12 @@ static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
 	if (!ret)
 		*s = m->surface;
 	return ret;
+}
+
+static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
+			   int prot, struct ane_fw_surface *s)
+{
+	return ane_fw_alloc_mem(b, dva, size, prot, false, s);
 }
 
 static int ane_fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
@@ -354,16 +379,13 @@ static u64 ane_fw_now(void *ctx)
 }
 
 /*
- * Every wait polls. Sleep in the shared short steps first (see
- * ane_fw_poll_sleep_us()) and back off for long waits such as a stalled
- * request, so a stall costs no more CPU than a 1 ms poll.
+ * Every wait polls, with the shared pacing (see ane_fw_poll_sleep_us()):
+ * busy steps for the first 30 us, then short sleeps, backing off for long
+ * waits such as a stalled request.
  */
 static void ane_fw_relax(void *ctx, u64 waited_ns)
 {
-	unsigned int min_us, max_us;
-
-	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
-	usleep_range(min_us, max_us);
+	ane_fw_poll_pause(waited_ns);
 }
 
 static void ane_fw_refused(void *ctx, u64 word0, u64 word1, u64 word2, int error)
@@ -719,8 +741,8 @@ static int ane_fw_program_map(void *ctx, size_t size, bool write, struct ane_fw_
 	if (!size || !IS_ALIGNED(size, SZ_16K) ||
 	    b->next_dva > ANE_FW_ALLOC_DVA + SZ_512M - size)
 		return -ENOSPC;
-	ret = ane_fw_alloc_at(b, b->next_dva, size,
-			      IOMMU_READ | (write ? IOMMU_WRITE : 0), out);
+	ret = ane_fw_alloc_mem(b, b->next_dva, size,
+			       IOMMU_READ | (write ? IOMMU_WRITE : 0), true, out);
 	if (ret)
 		return ret;
 	b->next_dva += size;
@@ -734,9 +756,21 @@ static void ane_fw_program_log(void *ctx, const char *item, u64 a, u64 c)
 	dev_info(&b->pdev->dev, "H17 %s %llx %llx\n", item, a, c);
 }
 
+/* Program surfaces are cacheable: clean before the engine, invalidate after. */
+static void ane_fw_program_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
+{
+	struct ane_fw_backend *b = ctx;
+
+	if (for_device)
+		dma_sync_single_for_device(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+	else
+		dma_sync_single_for_cpu(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+}
+
 static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.map = ane_fw_program_map,
 	.log = ane_fw_program_log,
+	.sync = ane_fw_program_sync,
 };
 
 /*
@@ -745,6 +779,52 @@ static const struct ane_h16_session_ops ane_fw_session_ops = {
  * pool after UNLOAD, often only during a later program, so FREE stays
  * admitted; backing is retained until reboot.
  */
+/*
+ * <debugfs>/ane-h17/<dev>/execute: per-phase EXECUTE times of the shared
+ * session, see ane_h16_session_stats_show(). Writing anything resets them.
+ * Created at the program stage; the retained backend pins the module, so
+ * the file and its session live until reboot.
+ */
+static int ane_fw_execute_show(struct seq_file *m, void *v)
+{
+	return ane_h16_session_stats_show(m, m->private);
+}
+
+static int ane_fw_execute_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ane_fw_execute_show, inode->i_private);
+}
+
+static ssize_t ane_fw_execute_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	ane_h16_session_stats(((struct seq_file *)file->private_data)->private, NULL, true);
+	return count;
+}
+
+static const struct file_operations ane_fw_execute_fops = {
+	.owner = THIS_MODULE,
+	.open = ane_fw_execute_open,
+	.read = seq_read,
+	.write = ane_fw_execute_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void ane_fw_debugfs(struct ane_fw_backend *b)
+{
+	struct dentry *root = debugfs_lookup("ane-h17", NULL);
+	bool found = root;
+
+	if (!found)
+		root = debugfs_create_dir("ane-h17", NULL);
+	debugfs_create_file("execute", 0600,
+			    debugfs_create_dir(dev_name(&b->pdev->dev), root),
+			    &b->session, &ane_fw_execute_fops);
+	if (found)
+		dput(root);
+}
+
 static int ane_fw_program_stage(struct ane_fw_backend *b)
 {
 	int ret;
@@ -755,9 +835,11 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
-	if (!ret)
-		dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
-	return ret;
+	if (ret)
+		return ret;
+	ane_fw_debugfs(b);
+	dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
+	return 0;
 }
 
 static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *attr, char *buf)

@@ -3,6 +3,7 @@
 #include <linux/ctype.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 
 #include "ane_h16_program.h"
@@ -543,6 +544,29 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 	return 0;
 }
 
+static void h16_sync(struct ane_h16_session *s, const struct ane_fw_surface *surface,
+		     bool for_device)
+{
+	if (s->ops->sync && surface->handle)
+		s->ops->sync(s->ctx, surface, for_device);
+}
+
+/*
+ * Around each EXECUTE: inputs and the poisoned outputs reach memory before
+ * the doorbell (for_device), and the outputs are read fresh after the
+ * completion report (!for_device). Caller holds the node lock.
+ */
+void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
+			  bool for_device)
+{
+	unsigned int i;
+
+	for (i = 0; i < p->resource_count; i++)
+		if (for_device || p->resources[i].permissions == 2)
+			h16_sync(s, p->surfaces[i], for_device);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_sync);
+
 static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 		   struct ane_fw_surface *out)
 {
@@ -586,6 +610,8 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			return ret;
 		memcpy(p->regions[i].cpu, (const u8 *)p->snapshot.bytes + r->file_offset,
 		       r->file_size);
+		/* Weights, text and the zeroed scratch reach memory before LOAD. */
+		h16_sync(s, &p->regions[i], true);
 		layout->regions[i] = (struct ane_h16_load_mapping) {
 			.dva = p->regions[i].dva,
 			.size = p->regions[i].size,
@@ -598,6 +624,7 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 		if (ret)
 			return ret;
 		memcpy(p->aux[i].cpu, aux[i], aux_size[i]);
+		h16_sync(s, &p->aux[i], true);
 		layout->aux_dva[i] = p->aux[i].dva;
 		layout->aux_size[i] = aux_size[i];
 	}
@@ -1165,6 +1192,47 @@ void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats 
 	spin_unlock(&s->stats_lock);
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_stats);
+
+static void h16_us(struct seq_file *m, u64 ns)
+{
+	seq_printf(m, " %9llu.%u", div_u64(ns, 1000), (unsigned int)(div_u64(ns, 100) % 10));
+}
+
+/*
+ * Where the time of the successful EXECUTEs since the last reset went, per
+ * phase in microseconds (last, mean, min, max), and the poll sleeps per
+ * request. Backends expose it as <debugfs>/ane-h1x/<dev>/execute.
+ */
+int ane_h16_session_stats_show(struct seq_file *m, struct ane_h16_session *s)
+{
+	struct ane_h16_exec_stats *st;
+	unsigned int i;
+
+	st = kmalloc_obj(*st);
+	if (!st)
+		return -ENOMEM;
+	ane_h16_session_stats(s, st, false);
+	seq_printf(m, "executes %llu\n", st->count);
+	if (st->count) {
+		seq_printf(m, "%-12s %11s %11s %11s %11s\n", "phase", "last_us", "mean_us",
+			   "min_us", "max_us");
+		for (i = 0; i < ANE_H16_T_PHASES; i++) {
+			seq_printf(m, "%-12s", ane_h16_exec_phase_names[i]);
+			h16_us(m, st->last.ns[i]);
+			h16_us(m, div64_u64(st->sum.ns[i], st->count));
+			h16_us(m, st->min.ns[i]);
+			h16_us(m, st->max.ns[i]);
+			seq_putc(m, '\n');
+		}
+		seq_printf(m, "%-12s %11llu %9llu.%u %11llu %11llu\n", "polls", st->last.polls,
+			   div64_u64(st->sum.polls, st->count),
+			   (unsigned int)(div64_u64(st->sum.polls * 10, st->count) % 10),
+			   st->min.polls, st->max.polls);
+	}
+	kfree(st);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_stats_show);
 
 /* TERMINATE then UNLOAD. The mappings stay until reset; a new LOAD may follow. */
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
