@@ -16,6 +16,7 @@
 / {
 	compatible = "apple,j434", "apple,t8122", "apple,arm-platform";
 	model = "Apple iMac (24-inch, 4x USB-C, M3, 2023)";
+	chassis-type = "all-in-one";
 };
 
 &wifi0 {

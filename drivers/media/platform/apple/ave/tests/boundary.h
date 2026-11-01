@@ -17,8 +17,11 @@ struct ave_ctx {
 };
 
 struct vb2_v4l2_buffer {
-	int unused;
+	struct vb2_buffer { int unused; } vb2_buf;
 };
+
+static struct ave_vb2_mem *ave_vb2_get(struct vb2_buffer *vb) { return NULL; }
+static void ave_vb2_put(void *mem) { assert(!mem); }
 
 static u8 wire[0x1c000 + 32];
 static size_t wire_len;

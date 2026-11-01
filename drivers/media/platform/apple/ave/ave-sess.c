@@ -346,6 +346,8 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->slot[s].aux);
 		ave_free(ave, &sess->slot[s].extra);
 		ave_free(ave, &sess->slot[s].bounce);
+		ave_vb2_put(sess->slot[s].input_mem);
+		sess->slot[s].input_mem = NULL;
 	}
 }
 
