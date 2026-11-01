@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The Neural Engine (H16) of the J616c.
+ *
+ * Same windows, interrupt, DAPF records, firmware IOVAs and PMGR offsets as
+ * the J616s (t6040.dtsi, t6040-j616s.dts), checked against this board's ADT
+ * (/arm-io/ane0, dart-ane0, ANE_SYS/MPM/CPU/TD/BASE). None of the ANE domains
+ * is PMP-notified.
+ *
+ * iBoot pre-loads the personalized firmware. Every node stays disabled here:
+ * the boot loader fills the two firmware reservations from this boot's ane0
+ * segment-ranges, renames them to their physical addresses and enables them,
+ * the ANE, its DARTs and its power domains. The driver uses SID 0 on each
+ * DART.
+ */
+
+/ {
+	aliases {
+		ane = &ane;
+	};
+
+	reserved-memory {
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&ane {
+	reg = <0x4 0x84000000 0x0 0x2000000>,
+	      <0x5 0x02280000 0x0 0x18000>,
+	      <0x5 0x022a0000 0x0 0x4000>,
+	      <0x5 0x003c0000 0x0 0x30000>,
+	      <0x2 0x12000000 0x0 0xff4000>,
+	      <0x5 0x22000000 0x0 0x2000000>,
+	      <0x5 0x08374000 0x0 0x4000>;
+	reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-3", "aux-4";
+	iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
+	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+			<&ps_ane_td>, <&ps_ane_base>;
+	apple,ane-type = <0x110>;
+	apple,firmware-preloaded;
+	/* Inclusive DAPF bounds, in hardware record order. */
+	apple,dapf-ranges = /bits/ 64 <0x5022803c0 0x5022803c3
+				       0x50228c000 0x50228c01b
+				       0x581668000 0x581668003
+				       0x28a668000 0x28a668003>;
+	memory-region = <&ane_fw_text>, <&ane_fw_data>;
+	memory-region-names = "firmware-text", "firmware-data";
+	apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+};
+
+/*
+ * ANE_SYS's parents FAB5_SOC and FAB4_SOC are critical and on from iBoot; the
+ * T6041 device tree does not describe them, so nothing turns them off.
+ */
+&ps_ane_sys {
+	/delete-property/ power-domains;
+};
+
+/* Include the firmware identity MMIO pages below the preload IOVAs. */
+&ane0_dart0 {
+	apple,dma-range = <0x0 0x0 0x400 0x0>;
+};
+
+&ane0_dart1 {
+	apple,dma-range = <0x0 0x0 0x400 0x0>;
+};
+
+&ane0_dart2 {
+	apple,dma-range = <0x0 0x0 0x400 0x0>;
+};

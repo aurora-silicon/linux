@@ -887,3 +887,5 @@
 	dma-noncoherent;
 	memory-region = <&aop_mmio_pmgr>;
 };
+
+#include "t6041-j616c-ane.dtsi"

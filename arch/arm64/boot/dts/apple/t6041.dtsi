@@ -5,7 +5,6 @@
 
 
 /* Keep the validated T6041 topology independent of unqualified T6040 blocks. */
-/delete-node/ &ane;
 /delete-node/ &clk_200m;
 /delete-node/ &sio;
 /delete-node/ &ave0_dart1;
@@ -22,9 +21,6 @@
 /delete-node/ &sep_dart;
 /delete-node/ &apcie1_dart;
 /delete-node/ &sio_dart;
-/delete-node/ &ane0_dart0;
-/delete-node/ &ane0_dart1;
-/delete-node/ &ane0_dart2;
 /delete-node/ &jpeg0_dart;
 /delete-node/ &jpeg1_dart;
 /delete-node/ &scaler0_dart;
@@ -91,9 +87,7 @@
 /delete-node/ &ps_apcie_sys_gp;
 /delete-node/ &ps_apcie_phy_sw;
 /delete-node/ &ps_jpg;
-/delete-node/ &ps_ane_sys;
 /delete-node/ &ps_sep;
-/delete-node/ &pmgr_ane;
 /delete-node/ &pmgr_disp;
 /delete-node/ &ps_ecpu_0;
 /delete-node/ &ps_ecpu_2;
