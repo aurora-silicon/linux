@@ -189,6 +189,47 @@ static inline long ane_t6021_td_blocks(const u8 *p, size_t size)
 	return n;
 }
 
+/*
+ * Header word 2 of each TD block: 0x08 opens the program on its first task
+ * and 0x22 closes it on its last, 0 between, 0x2a for a single task. Every
+ * decoded Apple H14 program follows this. A program with 0x2a on every task
+ * of several returned from its call and then left the firmware unable to
+ * complete any further command until reboot (M2, 13.5 bia firmware), so such
+ * a program is refused before the firmware sees it. Returns -EINVAL for a
+ * stream that parses and breaks the rule, 0 otherwise (a stream that does
+ * not parse is left to the firmware's own descriptor check).
+ */
+static inline int ane_t6021_td_flags_check(const u8 *p, size_t size)
+{
+	size_t cur;
+	u32 w2, last = 0;
+	long n = 0;
+
+	if (size < 4)
+		return 0;
+	cur = (ane_t6021_le32(p) & 4) ? 0x30 : 0x10;
+	while (cur < size) {
+		u32 words;
+
+		if (size - cur < 12)
+			return 0;
+		words = (p[cur + 2] | p[cur + 3] << 8) & 0x7ff;
+		if (words < 3)
+			return 0;
+		w2 = ane_t6021_le32(p + cur + 8);
+		if (n == 0 && w2 != 0x08 && w2 != 0x2a)
+			return -EINVAL;
+		if (n > 0 && last != (n == 1 ? 0x08 : 0))
+			return -EINVAL;
+		last = w2;
+		cur += ((words << 2) + 0xf) & 0x3ff0;
+		n++;
+	}
+	if (!n)
+		return 0;
+	return last == (n == 1 ? 0x2a : 0x22) ? 0 : -EINVAL;
+}
+
 /* ---- program table ---- */
 
 /* The firmware table holds 256 programs; the 257th LOAD is refused. */

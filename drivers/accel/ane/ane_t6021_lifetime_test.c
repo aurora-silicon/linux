@@ -111,6 +111,47 @@ static void task_count_test(struct kunit *test)
 	KUNIT_EXPECT_LT(test, ane_t6021_td_blocks(td, 2), 0L);
 }
 
+static void put_task(u8 *td, size_t at, u32 words, u32 w2)
+{
+	td[at + 2] = words;
+	td[at + 3] = words >> 8;
+	put32(td + at + 8, w2);
+}
+
+static void td_flags_test(struct kunit *test)
+{
+	u8 td[0x200] = {};
+
+	/* One task: opens and closes the program. */
+	put_task(td, 0x10, 0x20, 0x2a);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x90), 0);
+	/* Two and three tasks: 0x08 first, 0 between, 0x22 last. */
+	put_task(td, 0x10, 0x20, 0x08);
+	put_task(td, 0x90, 0x20, 0x22);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x110), 0);
+	put_task(td, 0x90, 0x20, 0);
+	put_task(td, 0x110, 0x20, 0x22);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x190), 0);
+	/* The wedging form: every task opens and closes. */
+	put_task(td, 0x10, 0x20, 0x2a);
+	put_task(td, 0x90, 0x20, 0x2a);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x110), -EINVAL);
+	/* Not closed, closed early, opened twice. */
+	put_task(td, 0x10, 0x20, 0x08);
+	put_task(td, 0x90, 0x20, 0);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x110), -EINVAL);
+	put_task(td, 0x90, 0x20, 0x22);
+	put_task(td, 0x110, 0x20, 0x22);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x190), -EINVAL);
+	put_task(td, 0x90, 0x20, 0x08);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x190), -EINVAL);
+	/* A lone task without both bits. */
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x90), -EINVAL);
+	/* A stream that does not parse is left to the firmware. */
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 0x14), 0);
+	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 2), 0);
+}
+
 /*
  * A fake firmware. Records every command class, fails on demand, and
  * refuses (test failure) to terminate a process of a program not proven
@@ -770,6 +811,7 @@ static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(mring_classify_test),
 	KUNIT_CASE(legtab_reuse_test),
 	KUNIT_CASE(task_count_test),
+	KUNIT_CASE(td_flags_test),
 	KUNIT_CASE(progtab_shared_unload_test),
 	KUNIT_CASE(multitask_never_terminated_test),
 	KUNIT_CASE(progtab_failed_unload_holds_test),

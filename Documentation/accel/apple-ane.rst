@@ -362,6 +362,13 @@ the firmware right now (resident) is managed by the driver:
   ``PROC_CREATE`` or ``EXEC`` loads them again and creates a new process,
   with the same IDs. Unreferenced cache entries are dropped.
 
+A program whose TD stream opens or closes on the wrong task is refused with
+``-EINVAL`` before the firmware sees it. Header word 2 of each TD block must
+be 0x08 on the first task, 0 between and 0x22 on the last (0x2a for a single
+task), as in every decoded Apple H14 program. A program with 0x2a on every
+task of several returned from its call on the M2 and then left the firmware
+unable to complete any further command until reboot.
+
 A failed load or unload keeps the program and its buffers until a verified
 firmware restart.
 

@@ -1679,6 +1679,7 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	struct ane_t6021_prog *cached, *prog = NULL;
 	bool sent = false;
 	long tdprop_tasks = -EINVAL, td_blocks = -EINVAL;
+	int td_flags = 0;
 	u32 key, gen;
 	u8 digest[SHA256_DIGEST_SIZE];
 	size_t binds_size;
@@ -1780,10 +1781,14 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 			/* The same snapshot as the key decides whether the
 			 * program's process may ever be terminated.
 			 */
-			if (sections[i].id == ANE_T6021_SEC_TEXT)
+			if (sections[i].id == ANE_T6021_SEC_TEXT) {
 				td_blocks = ane_t6021_td_blocks((const u8 *)bo->cpu +
 								sections[i].offset,
 								sections[i].size);
+				td_flags = ane_t6021_td_flags_check((const u8 *)bo->cpu +
+								    sections[i].offset,
+								    sections[i].size);
+			}
 			else if (sections[i].id == ANE_T6021_SEC_TDPROP)
 				tdprop_tasks = ane_t6021_tdprop_tasks((const u8 *)bo->cpu +
 								      sections[i].offset,
@@ -1803,6 +1808,15 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		}
 		kvfree(scratch);
 		sha256_final(&sha, digest);
+	}
+	/* A program that opens or closes on the wrong task wedges the firmware
+	 * for every client; refuse it before the firmware sees it.
+	 */
+	if (td_flags) {
+		dev_info_ratelimited(ane->dev,
+				     "LOAD refused: TD first/last task flags malformed\n");
+		ret = td_flags;
+		goto out;
 	}
 	cached = ane_t6021_prog_find(digest);
 	if (cached) {
