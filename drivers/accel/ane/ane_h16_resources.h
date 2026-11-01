@@ -5,9 +5,10 @@
 #include "ane_h16_execute.h"
 #include "ane_h16_hwx.h"
 
-/* Created only from a validated HWX and a decoded firmware process resource
- * map. No userspace field may supply this authority. Each mapping is private,
- * coherent DMA memory with no userspace alias, retained for process lifetime.
+/* Created only by the backend matching a validated HWX with reviewed program
+ * resource bindings. No userspace field may supply this authority. Each
+ * mapping is private, coherent DMA memory with no userspace alias, retained
+ * for process lifetime.
  */
 struct ane_h16_resource {
 	u64 hwx_vm;
@@ -44,7 +45,8 @@ ane_h16_resources_validate(const struct ane_h16_hwx *hwx,
 		for (j = 0; j < i; j++) {
 			const struct ane_h16_execute_buffer *a = &resources[j].buffer;
 
-			if (a->index == b->index ||
+			/* Indices are local to a class (inputs and outputs). */
+			if ((a->index == b->index && a->class == b->class) ||
 			    (b->mapping_dva < a->mapping_dva + a->mapping_size &&
 			     a->mapping_dva < end))
 				return -EINVAL;
