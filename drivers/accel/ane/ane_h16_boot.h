@@ -523,9 +523,16 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 			if (ret == -EREMOTEIO)
 				b->ops->log(b->ctx, "startup refusal ID/ack",
 					    f->startup[i].id, get_unaligned_le16(reply + 6));
+			b->ops->log(b->ctx, "startup wait failed ID/re-rings", f->startup[i].id,
+				    b->transport.pending[ANE_FW_IO].rerings);
+			b->ops->log(b->ctx, "startup IO slot header/error",
+				    b->transport_ops->load64(b->ctx,
+					ane_fw_transport_slot(&b->transport, ANE_FW_IO)), ret);
 			return ret;
 		}
 		b->ops->log(b->ctx, "startup ack", f->startup[i].id, get_unaligned_le16(reply + 6));
+		b->ops->log(b->ctx, "startup doorbell re-rings", f->startup[i].id,
+			    b->transport.pending[ANE_FW_IO].rerings);
 		if (f->startup[i].id == 3) {
 			b->tick = get_unaligned_le32(reply + 8);
 			b->ops->log(b->ctx, "CONFIG_GET tick", b->tick, 0);

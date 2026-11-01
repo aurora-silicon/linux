@@ -43,10 +43,15 @@ struct ane_fw_transport_ops {
 struct ane_fw_transaction {
 	u64 dva;
 	u64 deadline_ns;
+	u64 rung_ns;
+	u32 rerings;
 	size_t size;
 	u16 id;
 	bool active;
 };
+
+/* A doorbell the firmware misses while it initializes is not repeated by it. */
+#define ANE_FW_RERING_NS (10 * NSEC_PER_MSEC)
 
 /* Caller serializes all entry points. No surface is released by this object. */
 struct ane_fw_transport {
@@ -213,6 +218,7 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 		.size = size,
 		.id = get_unaligned_le16((const u8 *)command + 4),
 		.active = true,
+		.rung_ns = t->ops->now_ns(t->ctx),
 	};
 	t->pool_used = offset + size;
 	t->ops->store64(t->ctx, p + 8, size);
@@ -446,6 +452,22 @@ static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending)
 	return 0;
 }
 
+/*
+ * Ring a still-pending command's doorbell again after ANE_FW_RERING_NS. Only
+ * called while the slot is still the firmware's (poll returned -EAGAIN).
+ */
+static inline void ane_fw_transport_rering(struct ane_fw_transport *t, unsigned int ch)
+{
+	struct ane_fw_transaction *tx = &t->pending[ch];
+	u64 now = t->ops->now_ns(t->ctx);
+
+	if (!tx->active || now - tx->rung_ns < ANE_FW_RERING_NS)
+		return;
+	tx->rung_ns = now;
+	tx->rerings++;
+	ane_fw_transport_doorbell(t, ch);
+}
+
 /* The original absolute command deadline survives every provider/IRQ service. */
 static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int ch)
 {
@@ -465,6 +487,7 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 		/* Recheck before sleeping, including time spent in alloc(). */
 		if (t->ops->now_ns(t->ctx) >= t->pending[ch].deadline_ns)
 			return ane_fw_transport_fail(t, -ETIMEDOUT);
+		ane_fw_transport_rering(t, ch);
 		t->ops->relax(t->ctx);
 	}
 }

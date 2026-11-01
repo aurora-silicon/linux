@@ -732,6 +732,7 @@ static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 			return ret;
 		if (ktime_get_ns() >= t->pending[ch].deadline_ns)
 			return ane_fw_transport_fail(t, -ETIMEDOUT);
+		ane_fw_transport_rering(t, ch);
 		ane_h16_mailbox(h);
 		ret = ane_h16_faults(&h->boot, false);
 		if (ret)
@@ -769,6 +770,9 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 		ret = ane_h16_job_wait(h, channel);
 	}
 	*ns = ktime_get_ns() - start;
+	if (t->pending[channel].rerings)
+		dev_info(h->dev, "H16 job command %x on ch %u: %u doorbell re-rings, %d\n",
+			 get_unaligned_le16(command + 4), channel, t->pending[channel].rerings, ret);
 	if (!ret || ret == -EREMOTEIO) {
 		const u8 *reply = (u8 *)t->pool.cpu + (t->pending[channel].dva - t->pool.dva);
 		u16 id = get_unaligned_le16(reply + 4);
