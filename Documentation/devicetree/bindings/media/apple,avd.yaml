@@ -55,12 +55,14 @@ properties:
     items:
       - description: decoder power state
       - description: performance floor (PMC rail or PMP device level) held while decoding
+      - description: additional PMP device performance request held while decoding
 
   power-domain-names:
     minItems: 1
     items:
       - const: core
       - const: perf
+      - const: dvfs
 
   resets:
     maxItems: 1
