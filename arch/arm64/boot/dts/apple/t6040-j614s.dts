@@ -1,53 +1,69 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * MacBook Pro (14-inch, M4 Pro, Nov 2024)
+ * MacBook Pro (14-inch, M4 Pro)
  *
  * target-type: J614s
  *
- * J614s uses the same T6040 platform topology as the supported J616s
- * board. Keep the shared SoC resources and driver bindings in one baseline;
- * board-specific firmware supplies the J614s identity at boot.
+ * Copyright The Asahi Linux Contributors
  */
 
-#include "t6040-j616s.dts"
+/dts-v1/;
+
+#include "t6040.dtsi"
+#include "t604x-j614-j616.dtsi"
 
 / {
 	compatible = "apple,j614s", "apple,t6040", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M4 Pro, Nov 2024)";
 };
 
-&dcp {
-	panel {
-		compatible = "apple,panel-j614", "apple,panel-mini-led", "apple,panel";
-		width-mm = <302>;
-		height-mm = <196>;
-		/delete-property/ adj-height-mm;
-	};
+/* ADT /arm-io/wlan module-instance */
+&wifi0 {
+	brcm,board-type = "apple,mriya";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,mriya";
+};
+
+&panel {
+	compatible = "apple,panel-j614", "apple,panel-mini-led", "apple,panel";
+	width-mm = <302>;
+	height-mm = <196>;
+	adj-height-mm = <189>;
 };
 
 &aop_audio {
 	apple,chassis-name = "J614";
 };
 
-&mtp_hid {
-	multi-touch {
-		firmware-name = "apple/tpmtfw-j614s.bin";
-	};
+&sound {
+	compatible = "apple,j614-macaudio", "apple,macaudio";
+	model = "MacBook Pro J614";
 };
 
-&{/pcie@1cb0000000/pci@0,0/wifi@0,0} {
-	brcm,board-type = "apple,mriya";
+&sound_jack {
+	compatible = "apple,j614-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J614 Jack";
 };
 
-&{/pcie@1cb0000000/pci@0,0/bluetooth@0,1} {
-	brcm,board-type = "apple,mriya";
+&mtp_mt {
+	firmware-name = "apple/tpmtfw-j614s.bin";
 };
 
+/*
+ * Per-device factory data from this Mac's own iBoot system container: the
+ * sealed calibration and the sealed root key.
+ */
 &mesa {
 	firmware-name = "apple/mesacal-j614s.bin", "apple/msrk-j614s.bin";
 };
 
-/* The reader's gP19 SMC output controls its supply. */
+/*
+ * The GL9755 SD reader. Its supply is the SMC's gP19 output, which the
+ * J614s firmware describes as active high. Both CLKREQ pins go on the
+ * controller so that the Wi-Fi and SD ports do not claim the same pins.
+ */
 &apcie1_dart {
 	status = "okay";
 };
