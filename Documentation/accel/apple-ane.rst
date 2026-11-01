@@ -22,23 +22,28 @@ H16 preload handoff
 ------------------
 
 The bootloader must reserve the personalized TEXT and DATA preload segments
-as separate, non-reusable ``no-map`` reserved-memory nodes, attach them in
+as separate, non-reusable ``no-map`` children of ``/reserved-memory``, attach them in
 that order through ``memory-region`` and name them ``firmware-text`` and
 ``firmware-data``. It must also supply ``apple,firmware-iovas`` as two 64-bit
 values: ``0x10000000000`` and ``0x100000c0000``. Their sizes must be
 ``0xc0000`` and ``0x2ac000``. Physical placement is boot-dependent; board DT
 sources must not contain captured physical addresses. The reservations must
-remain intact until reboot, including after driver failure.
+remain intact until reboot, including after driver failure. The driver
+reads each range from its node and refuses it when any part is Linux
+System RAM, so a loader may either reserve the range at boot or leave it
+outside the memory map and describe it with a node.
 
-H16 preflight checks resource geometry, firmware identity and these ranges
-without MMIO or power access. No disk firmware is requested. Missing
-reservations fail with ``-ENODATA``. Malformed reservations fail with
-``-EINVAL``. Even a valid handoff currently fails with ``-EOPNOTSUPP``:
-the strict preload validator, original-container HWX ABI, firmware process
-resource decoder and cold boot backend are incomplete. The section-only
-load ABI is explicitly refused for H16. No accel node or program-loading interface is published.
+Metadata preflight checks resource geometry and these ranges without MMIO
+or power access. Board DTs carry disabled reservation placeholders; while
+the loader has not filled and enabled them the device is refused with
+``-ENODEV`` and one informational message. Missing reservations fail with
+``-ENODATA`` and malformed reservations with ``-EINVAL``. A device that
+passes is brought up through the program stage described below once per
+boot, from a work item after probe. No accel node or program-loading
+interface exists before the program stage.
 
-The H16 DT nodes stay disabled. The five real PMGR providers already encode
+The J616s enables the ANE and its three DARTs; other H16 boards keep them
+disabled until proven. The five real PMGR providers already encode
 the system/CPU/MPM/task/base dependency graph. The PMGR binding does not
 represent the virtual no-state gates, so no fictitious register-backed
 domains are created for them. SID 0 and SID 11 on all three DARTs use the
@@ -84,9 +89,9 @@ It never opens an accel device or claims a Linux inference result.
 Remaining implementation gates
 ------------------------------
 
-SPEC-r3 supplies the custom descriptor/aperture layouts and a normalized
-immutable preload digest with 42 ordered patchbay records. The complete
-preload validator, original-container ABI, process-resource decoder and
+The preload validator can authenticate owned snapshots of the normalized
+resident image with 42 ordered patchbay records. Live snapshot acquisition,
+the original-container userspace load ABI, resolved program bindings and
 physical boot backend still need implementation. Off-list preload mutations
 remain refused.
 
@@ -96,6 +101,63 @@ and 24 MHz predicates remain conservative proposed startup gates; runtime
 traffic does not prove them. Resource and allocation ceilings stay unchanged.
 H17 additionally requires a Linux ownership backend before direct access.
 There are no module parameters to bypass these gates.
+
+Resident image identity
+-----------------------
+
+The preload checker requires exactly ``0xc0000`` TEXT bytes and ``0x2ac000``
+DATA bytes. It validates the raw four-byte tag and little-endian width of
+each of the 42 packed patchbay records, including records at odd offsets.
+It then hashes TEXT followed by DATA, substituting zero only for the 20
+reviewed mutable value cells and the DATA-relative tunables interval
+``[0x17c80, 0x18320)``. The expected SHA-256 is compiled into the validator:
+``1f865ed04c4c38f6fdcc4543a8814f818d3cea583de64d22ffe96e3a93ca4697``.
+Tags, widths, unlisted values, all TEXT bytes and the DATA zerofill tail
+remain authenticated. An off-list change is never accepted merely because
+a zero word became nonzero or a value resembles an address.
+
+Validation never changes its input snapshots. A future boot backend must
+prove ownership and snapshot stability before calling it, preserving the
+resident pages, their personalized mutable values and the reservations.
+The checker is not connected to preflight yet: a generic CPU resource claim
+cannot distinguish an ordinary busy ``no-map`` reservation from another
+owner. No live pages are read by this preparatory path. A successful identity
+check does not establish RTKit state, ownership of a running firmware
+instance or permission to publish new DMA mappings.
+
+Original-container import and load planning
+------------------------------------------
+
+The internal original-HWX import helper bounds the complete 64-bit byte
+count before allocation, copies userspace memory once, then validates and
+digests that private snapshot. It accepts no caller-provided digest or
+section metadata. A failed import leaves the destination untouched, and an
+occupied snapshot cannot be overwritten. No ioctl exposes this helper yet.
+
+Validated metadata retains whole-segment geometry and file extents, so one
+TEXT allocation covers both task and constant sections. Scratch and external
+surfaces have zero file bytes. The load planner reparses the authenticated
+original instead of trusting cached metadata, rounds allocations to 16 KiB
+and applies a 512 MiB aggregate host ceiling before any DMA allocation.
+
+The resource geometry helper requires one backend-owned mapping per planned
+segment and one binding per external surface, resolved by the backend from
+the validated program contract. It checks exact sizes, permissions,
+alignment, full-width DVA overflow and overlap against every other mapping
+and the resident firmware aperture. Binding VMs, classes and unique indices
+must match the validated surface requirements.
+Failure publishes no partial resource map. The helper checks geometry;
+the backend must separately prove mapping ownership and lifetime.
+
+There is no H16 LOAD_PROGRAM or CREATE_PROCESS body serializer or backend
+that resolves resources and installs a process here. CREATE_PROCESS reply
+IDs do not supply resource bindings. The backend must resolve them from the
+validated program contract and verify mapping ownership. No user ID or
+surface ordinal substitutes for that authority, and no load plan installs
+an executable process. The original-HWX userspace ABI remains deferred until
+the backend can return a program capability backed by validated resources.
+Channel-5 allocation replies, boot publication and H17 direct ownership
+remain refused.
 
 H16 macOS 27.0 runtime contract
 ------------------------------
@@ -126,7 +188,7 @@ EVENT_REPORT        0x0300  6        0x60 (firmware to host)
 These sizes bound the observed version, not future firmware. POWER_GATE has
 a u32 Boolean at +8. The execute-size increment of 0x18 counts custom BAR
 records. The channel numbers are observed table indices;
-their mapping to channel names remains unproved. The parser retains each
+the clean cold-boot facts identify their channel names. The parser retains each
 descriptor's original index rather than assuming name order is wire order.
 
 The transport prepares the H16 envelope and rejects unrecognized runtime
@@ -201,8 +263,9 @@ barriers order output reads after completion. Streaming DMA sync APIs must
 not be applied to these coherent allocations. There is no userspace alias
 to code, scratch or live firmware buffers.
 
-The resource map must come from the original HWX and a decoded firmware
-process reply. A userspace index, numeric class or program/process ID cannot
+The backend must resolve the resource map from the original HWX and the
+reviewed program contract, rather than decode it from CREATE_PROCESS reply
+IDs. A userspace index, numeric class or program/process ID cannot
 create that map or confer ownership. Only established input/output classes
 are admitted; custom BAR requests require a validated selector map and
 remain unavailable. The legacy 0x28-byte completion predicate remains
@@ -210,7 +273,7 @@ H14-only. Channel-5 allocation/control/free operations require a validated
 H16 reply provider and remain unavailable; H14 allocation replies are never
 reused for H16.
 
-No original-container load ABI or H16 process-resource decoder is supplied
+No original-container load ABI or H16 process installer is supplied
 by this change. Consequently no H16 process can yet be installed, inference
 remains refused and no accel node is registered. The submission integration
 is preparatory and does not open the boot, preload, ownership, firmware
@@ -220,6 +283,76 @@ KUnit covers byte-exact synthetic execute fields, all 1..64 buffer counts,
 zero/one/two custom BAR lengths, wide DVAs/spans, reserved-zero output,
 boundary and overflow refusal, all event states, interleaved identities,
 ISP routing and malformed reports. No test packet is copied from a capture.
+
+Shared H16/H17 firmware transport
+--------------------------------
+
+``ane_fw_transport.h`` supplies device-independent ring operations over owned
+coherent surfaces and caller-provided memory, DMA-barrier, MMIO, clock and
+allocation accessors. Engine-relative doorbell and pending/acknowledge offsets
+come from ``ane_fw_platform`` match data. The caller must establish ownership,
+firmware identity, power and the private DMA domain before using it. This
+helper does not change probe or enable either generation.
+
+Initialization copies exactly eight 0x100-byte descriptors from the IPC
+surface and validates their names, types, bits, slot counts, alignment and
+non-overlapping ranges, including exclusion of the table itself. IO and
+DATA_CHAIN_H2T require type 0; SHAREDMALLOC and IO_T2H require type 1. Each
+operation checks the immutable table snapshot. Only type-0 slots are armed,
+in word-1, word-2, word-0 order, with values 0, 0, 1 and a DMA write barrier.
+Descriptor geometry and doorbell bits remain authoritative. Logical channel
+names are independent of their descriptor order.
+
+Publication copies a command into a 64-byte-aligned arena inside the pool,
+after the caller's reserved boot prefix. It publishes both length words,
+a DMA write barrier, the command DVA, another barrier and the descriptor's
+doorbell bit. There is one outstanding transaction per sending channel;
+heads advance modulo the descriptor slot count only after a successful
+reply. A reply requires the exact DVA with bit 0 set, unchanged length,
+zero result word, zero command prefix, unchanged u16 ID and zero u16 ack.
+Bit 1 is corruption even before ownership returns. Nonzero ack is returned
+as ``-EREMOTEIO`` and retained for diagnosis.
+
+IO_T2H is present when word 0 has bit 0 clear and either word 0 or word 1 is
+nonzero. Reports must be four-byte aligned and wholly inside one owned
+surface. The transport copies the report before setting word 0 bit 0 and
+ringing the descriptor doorbell, without changing the other slot words.
+Report dispatch and pending UUID lookup belong to the caller. In particular,
+consuming a stale UUID report cannot complete an unrelated request, and the
+DATA_CHAIN reply acknowledges submission rather than inference completion.
+
+The SHAREDMALLOC provider accepts allocation tuples only. Requests are
+rounded to 16 KiB, with a 1 MiB request ceiling, the exact 2 MiB allocation
+with tag 0x45585050 exception, 12 MiB in rounded allocations and 64 handles.
+The allocation callback supplies a zeroed, pinned private-domain mapping;
+the transport checks its size, DVA alignment, overflow and exclusion from
+all other owned surfaces before publishing it. Handles are nonzero ordinals.
+By default, FREE and distinguishable control tuples return ``-EOPNOTSUPP``
+through the mandatory refusal logger. The pinned H16 build enables the
+proved native FREE reply described below. An all-zero slot is empty and
+cannot distinguish a control request; its lookup request layout remains
+unproved. No control reply is invented.
+
+IRQ service reads pending once, rejects bits above 7 and writes the exact
+nonzero snapshot to acknowledge. The wait helper services one allocation at
+a time and checks the original absolute monotonic deadline, including time
+spent inside the allocation callback. Servicing never starts a new timeout.
+
+The caller serializes all entry points. Initialize a fresh transport only
+before firmware starts or after a proved reset. The pool arena is monotonic
+and returns ``-ENOSPC`` when exhausted; command storage is not recycled.
+Successful reply bodies remain in the pool transaction span. A timeout,
+malformed firmware tuple, allocation failure or firmware refusal latches an
+error, retains the transaction and mappings and stops further publication.
+No surface is freed by these helpers, including a rejected allocation result.
+The backend must retain mappings, power and module references until reset.
+
+The field contract follows the clean H16/H17 cold-boot facts, sections 1,
+7 through 11, and the SPEC-r2 channel and deadline rules. Allocation limits
+are conservative host policy observed sufficient on H17, rather than
+firmware-advertised authority. The KUnit suite uses synthetic memory and
+accessor traces, with no MMIO or hardware access. Its configuration fragment
+is ``drivers/accel/ane/transport.kunitconfig`` and runs on x86_64 and arm64.
 
 Original HWX validation
 -----------------------
@@ -540,3 +673,227 @@ size, and vary inputs or poison outputs so retained output cannot pass.
 4. Restore pm_test and mem_sleep selections. Preserve failure evidence before
    using the approved known-good boot fallback. Do not force-unload retained
    firmware memory or treat an unproven stop as permission to remove power.
+
+Staged H16 cold boot
+-------------------
+
+The boot bring-up runs every stage in order. ``<debugfs>/ane-h16/<device>/stage``
+(root only) reports the last completed stage and the run, refusal and
+quarantine state. Before the boot bring-up has started, writing
+``preflight``, ``map``, ``boot``, ``startup`` or ``program`` runs every
+stage that has not run yet, up to the one written, for diagnosis.
+A stage at or below the completed one is refused with ``-EALREADY``. There
+is no module parameter and no H14 boot parameter changes the H16 path. H17 still refuses ownership and registration.
+All build-dependent boot values and ordered masked updates belong to the
+H16 27.0 (26A428) match-data profile. The existing preload validator must
+accept the resident image before that profile can run. Live mutable patchbay
+and firmware tunable values are preserved, with no disk firmware owner.
+
+``preflight`` raises the five real domains through genpd, in DT order, and
+checks every requested/ACTUAL low byte twice before reading the engine.
+CPU control must be zero and RVBAR must be ``0x10000000001``. It reads all
+three DART fault status/address words, version/protect/lock headers and four
+DAPF records per instance against ``apple,dapf-ranges``. The ANE backend
+writes no engine, DART or DAPF register at this rung. Genpd owns power writes.
+
+``map`` claims an exclusive, singleton IOMMU group and an unmanaged domain
+covering the three SID-0 DART instances. Private surfaces currently require
+a DMA-coherent client; noncoherent clients refuse pool allocation before RUN. No
+unexported architecture cache helper is called from the module. It checks
+the finalized aperture
+rather than widening geometry in the client. TEXT is read-only, DATA is
+read/write, and the four range-containing 16 KiB pages use identity addresses
+and MMIO attributes. Every DAPF lock is checked before any record changes;
+a locked mismatch refuses. Unlocked changes preserve unrelated flag bits
+and are read back. The backend does not change protect or lock registers.
+
+The DT must describe only SID 0 on these three instances for this backend.
+The generic IOMMU attachment API attaches every stream in ``iommus``; it
+cannot select a subset from the six-stream production description. Until
+the test DT supplies only SID 0, map and later stages explicitly refuse
+extra streams. The inherited test DTS currently enables the six-stream
+node and therefore needs this integration adjustment before rung 2. The
+production node stays disabled. The driver does not rewrite the live DT
+or access the DART driver's private stream configuration.
+
+``boot`` allocates the zeroed command pool at ``0x10000384000`` and completes
+the H16 CE request/ack protocol, bounded to 5001 delays of 10 us. Ordered
+ANEAXI2AF, ANEXLAXI2AF and selected C1PPT updates follow before any scratch
+write. A pre-existing C1PPT lock requires matching values. There is no H17
+PWGATE sequence. The host clears scratch 0 through 7 in order, prepares the
+polled management client, writes scratch 6 = 1 and 7 = 0, rechecks RVBAR,
+and writes CPU control 0 then 0x10. RVBAR is never rewritten.
+
+The host polls READY ``0x08042006`` every 1 ms, with at most 1000 polls and
+one absolute deadline. Scratch 0 is a channel count below 0x21. IPC bytes
+are scratch 1 plus one; heap bytes are scratch 3; scratch 4 is a Boolean.
+IPC and heap allocations are rounded to 16 KiB and bounded before use.
+The IPC allocation at ``0x100003d0000`` must fit below the fixed heap base
+``0x100003e4000``. The heap has a 16 MiB host-policy limit and must also fit
+below shared allocations. These limits are not firmware capability claims.
+
+The 0x174-byte init record at pool + 0x180 has a zero first qword, IPC DVA,
+0x380000 configured span, the corresponding 0xfc80000 remainder, requested
+heap DVA/bytes, unrounded IPC bytes and pool DVA/bytes. Reserved bytes and
+the cold-start retained value are zero. Template count is 64 and record
++0x12c is 4. A DMA write barrier precedes publication to scratch 0 low,
+scratch 1 high, then scratch 7 ``0xf7fbdff9``. The reply must contain both
+READY and the exact IPC base; unchanged init-record addresses time out.
+The shared transport validates the table before arming any type-0 ring.
+Only then does the host write READY to scratch 3 and wait for zero.
+
+``startup`` sends only PRINT_ENABLE (0x4, 12 bytes), START (0x0, 12),
+CONFIG_GET (0x3, 16) and RESOURCE_INFO_GET (0x22, 100) on IO. SHAREDMALLOC
+allocation requests are serviced under the shared transport's bounded host
+policy while waiting. The pinned H16 profile also acknowledges native FREE
+for its own live allocations with a zero tuple. Backing storage and quota
+stay pinned until reboot; retired allocations cannot authorize reports or
+a second FREE. Foreign frees and control forms without a proved request
+layout quarantine without an invented reply. Other firmware profiles retain
+the default refusal of FREE/control. Each command keeps one absolute
+deadline and requires a zero acknowledgment. The CONFIG_GET tick must be nonzero and is logged;
+24 MHz is a comparison value, not a refusal predicate. All 100 resource-info
+reply bytes are logged and do not grant allocation authority.
+
+Mailbox service uses 64-bit pop-on-read accesses and bounded, nonblocking
+receive/transmit batches. Offered HELLO, EPMAP and power messages use the
+shared version-12 parser. Unknown or incompatible messages are logged and
+receive no invented response. A missing or stalled RTKit session never
+blocks the scratch protocol. IRQ 1054 remains disabled through all stages.
+
+Before RUN, errors unwind mappings and genpd references with a rollback log.
+Immediately before the first RUN write the backend pins the module. Every
+later failure latches quarantine, dumps scratch 0 through 7 and DART fault
+words, and retains mappings, pages and power. Probe stays bound on such an
+error so automatic devres cleanup cannot reclaim firmware DMA. A successful
+boot also stays pinned because no safe in-place shutdown/reset is proved.
+Further attempts are refused until reboot. There is no writable stage knob.
+
+Hardware test plan
+------------------
+
+Use a matching kernel/module set and a DT that enables the ANE and its three
+DARTs with SID 0 only, the two preload ranges and an aperture covering the
+identity pages (``t6040-j616s-ane-test.dts``). Keep shipping DT nodes
+disabled. Each write below is one stage; stop and preserve full dmesg at the
+first unexpected value::
+
+  echo preflight > /sys/kernel/debug/ane-h16/<device>/stage
+  echo map > /sys/kernel/debug/ane-h16/<device>/stage
+
+Before RUN a failed stage rolls back and the module can be reloaded.
+Expected preflight messages include ``H16 preload identity H16 27.0 26A428
+accepted``, ``H16 power ACTUAL`` twice for each of the five words with low
+byte ff, ``H16 CPU control/RVBAR 0 10000000001``, DART status/address and
+DAPF comparisons, then ``H16 stage preflight complete``. Map adds TEXT/DATA
+mapping messages and four ``H16 identity MMIO`` messages, clean fault words
+and ``H16 stage map complete``. A six-stream tree instead logs ``H16 map
+requires only SID 0 on three DARTs; refusing extra streams``.
+
+The boot rung releases the firmware CPU::
+
+  echo boot > /sys/kernel/debug/ane-h16/<device>/stage
+
+Expect CE state/ack and ``H16 tunables applied`` (or locked-match) logs,
+then ``H16 READY 8042006 0``, request logs (the comparator values are
+channels 8, IPC-minus-one c440, heap f00000, mode 0), then
+``H16 table validated 100003d0000 8``, ``H16 scratch 3 cleared 0 0`` and
+``H16 stage boot complete; held until reboot``. Comparator sizing values are
+not additional admission checks. From here the module stays loaded.
+
+In the same boot::
+
+  echo startup > /sys/kernel/debug/ane-h16/<device>/stage
+
+Expect SHAREDMALLOC allocation messages as offered, ``H16 startup ack`` for
+IDs 4, 0, 3 and 22 with zero status, ``H16 CONFIG_GET tick`` with a nonzero
+value, exactly 100 bytes under ``H16 RESOURCE_INFO`` and ``H16 stage startup
+complete; held until reboot``. A failure after RUN must instead show the
+scratch/fault dump and ``H16 quarantine``. Do not retry; collect logs and
+reboot. No inference result is claimed by these diagnostic rungs.
+
+The ``ane-h16-boot`` KUnit suite uses a simulated engine, scratch cells,
+mailbox polling and rings. It covers startup including allocation service,
+missing READY, wrong/stale table publication, oversized IPC/heap requests,
+channel bounds, locked DAPF differences, nonzero acks, scratch-3 timeout,
+zero tick, default refusal and quarantine after RUN. It also covers matching
+locked DAPF, heap/shared overlap, native FREE, foreign FREE and control refusal.
+
+H16 program stage
+-----------------
+
+The ``program`` stage runs every startup step, then registers an accel node
+with ABI version 3 (``DRM_ANE_CHIP_H16``). GET_CAPS, H16_LOAD and H16_EXEC
+are its only ioctls. The node is absent at every other stage, so the default
+refusal and the H17 refusal are unchanged.
+
+H16_LOAD takes the original HWX and four host-built sections: generic,
+operation, procedure and text properties. The kernel imports the HWX once,
+validates it with the HWX and task-stream checks, and plans whole-segment
+mappings. Each region and each host-built section gets its own private
+mapping in a program window above the SHAREDMALLOC range. Only the output
+surface and scratch are device-writable. Userspace never supplies a DVA,
+firmware ID, resource index or command. The LOAD_PROGRAM slots come from one
+table:
+
+====  ==========================  ========  =====
+Slot  Source                      Index     Class
+====  ==========================  ========  =====
+0     generic (host-built)        1002      4
+1     kernel section, else const  1007      3
+2     HWX task stream             1006      4
+3     operation (host-built)      1003      4
+4     procedure (host-built)      1004      4
+5     empty
+6     text properties             1005      4
+7, 8  empty
+====  ==========================  ========  =====
+
+Every populated slot has +0x10 = 1 and a full 64-bit DVA and size. The
+request carries 0xffffffff at +0x1b8. The reply must echo every slot, keep a
+zero acknowledgment and replace that word with the program ID. Zero is a
+valid ID. CREATE_PROCESS (0x258 bytes) sends the program ID with a zero body.
+Its reply must keep the body zero and returns the process ID, where zero is
+also valid. A program with a kernel section must tag its operation record
+with the kernel slot index 1007. The uapi header names these indices.
+
+Slot 1 carries the ``__KERN_0`` kernel section when the program has one and
+otherwise the ``__TEXT,__const`` constants, which macOS loads in every
+program.
+
+EXECUTE resources come from a kernel-owned map. The class follows the
+resource usage mapping (inputs 0, the output 1). Each descriptor names its
+buffer by the ID of the generic section that LOAD installs: generic entry
+k describes surface k in HWX surface order, and the kernel refuses a generic
+section whose count, direction, type or size disagrees with the program,
+that repeats an ID or that uses the reserved IDs 2 and 3. The mcache tuple in the linear program
+descriptor (BAR ID, bit offset and width) adds one custom-BAR record with
+selector 1, value type 0 and the first pool DSID, 36. The scratch form sends
+none.
+
+Each H16_EXEC copies inputs into the private input mappings and poisons the
+output mapping. It then sends 0x002d with 0, keeps the request UUID pending
+before publishing EXECUTE on channel 7, and treats the channel-7 reply as
+transport acknowledgment only. Completion is a state-1 0x0300 report whose
+UUID, program, process and procedure IDs all match. Then 0x002d with 1 and
+a DMA read barrier precede the output copy. A state-2 report, a mismatched
+ID, a malformed report or a timeout quarantines the session. Reports with
+an unknown UUID never complete a request. Closing the file sends TERMINATE
+then UNLOAD. Mappings stay until reboot.
+
+One program lifetime per firmware boot is mandatory. On this firmware
+family the first EXECUTE of a newly loaded program can write into the
+previous program's output buffer when the buffer counts match, and a larger
+output overruns that mapping. A second H16_LOAD therefore fails with -EBUSY
+and the log line ``H16 one program per firmware boot; reboot required``,
+also after the first program closed. The transport never publishes the
+secure-mode commands 0x27, 0x28 and 0x34 or the exclave commands 0x30 and
+0x31.
+
+The ``ane-h16-program`` KUnit suite covers add-128 and synthetic slot
+packing, LOAD/CREATE/TERMINATE/UNLOAD bodies and replies, the deny list,
+the custom-BAR record, a fake-firmware session with two executions and
+teardown, the second-LOAD refusal, bad LOAD/CREATE replies, mismatched
+UUIDs and IDs, and state-2 quarantine.
+``tools/testing/selftests/drivers/ane/h16-run.py`` loads the pinned add-128
+HWX, runs it twice with poisoned output and compares with ``expected.bin``.

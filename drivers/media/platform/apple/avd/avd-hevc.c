@@ -80,7 +80,7 @@ struct avd_hevc_run {
 };
 
 /* See avd-h264.c: one bank per picture in flight on the queued transport. */
-#define AVD_HEVC_BANKS	2
+#define AVD_HEVC_BANKS	AVD_MAX_FRAMES
 
 struct avd_hevc_bank {
 	bool busy;
@@ -1055,9 +1055,13 @@ static int avd_hevc_validate_sps(struct avd_ctx *ctx,
 	if (sps->pic_width_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.width ||
 	    sps->pic_height_in_luma_samples > ctx->coded_fmt.fmt.pix_mp.height)
 		return -EINVAL;
-	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
-		/* Luma and chroma bit depth mismatch: the firmware faults (H0 error) */
+	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "HEVC unequal luma/chroma bit depths (%u/%u) are unsupported\n",
+				    sps->bit_depth_luma_minus8 + 8,
+				    sps->bit_depth_chroma_minus8 + 8);
 		return -EINVAL;
+	}
 	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
 		/* Only 8 and 10 bit have capture formats */
 		return -EINVAL;
@@ -1125,7 +1129,7 @@ static int avd_hevc_start(struct avd_ctx *ctx)
 
 	ctx->priv = hevc_ctx;
 	/* Overlap pictures only where the firmware chains VP to PP itself. */
-	hevc_ctx->nbanks = avd_backend_is_qfw(ctx->dev) ? AVD_HEVC_BANKS : 1;
+	hevc_ctx->nbanks = avd_qfw_picture_banks(ctx->dev, AVD_CODEC_HEVC);
 	hevc_ctx->b = &hevc_ctx->bank[0];
 	for (i = 0; i < hevc_ctx->nbanks; i++) {
 		ret = avd_hevc_alloc_bufs(ctx, &hevc_ctx->bank[i]);
@@ -1454,6 +1458,11 @@ static int avd_hevc_run(struct avd_ctx *ctx)
 	ret = avd_hevc_run_preamble(ctx, &run);
 	if (ret)
 		return ret;
+
+	/* Also validate controls applied from a queued request before submission. */
+	ret = avd_hevc_validate_sps(ctx, run.sps);
+	if (ret)
+		goto complete;
 
 	avd_hevc_normalize_slices(&run,
 				  vb2_get_plane_payload(&run.base.bufs.src->vb2_buf, 0));

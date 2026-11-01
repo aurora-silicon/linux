@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * H16/H17 facts from the 2026-10-31 H16/H17 specification, sections 3-7,
- * 12 and 15. This preflight performs no MMIO, DMA mapping or power access.
+ * 12 and 15, and the H16 cold-boot facts, round 5. Metadata preflight
+ * performs no MMIO, DMA mapping or power access.
  */
 #include <linux/ioport.h>
+#include <linux/mm.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_irq.h>
-#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 
 #include "ane_fw_platform.h"
+#include "ane_h16_boot_data.h"
 
 static const char * const ane_h16_reg_names[] = {
 	"engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-3", "aux-4",
@@ -25,6 +28,14 @@ static const u32 ane_h16_power_words[] = {
 };
 
 const struct ane_fw_platform ane_h16_platform = {
+	.h16_profiles = ane_h16_profiles,
+	.h16_profile_count = ARRAY_SIZE(ane_h16_profiles),
+	.h16_mmio = ane_h16_mmio_t6041,
+	.h16_mmio_count = ARRAY_SIZE(ane_h16_mmio_t6041),
+	.dart_params = 0x8,
+	.dapf_dart = 0,
+	.dapf_offset = 0x10000,
+	.dapf_size = SZ_16K,
 	/* The DT compatible is t6041; the physical M4 Pro is T6040. */
 	.soc = 0x6040,
 	.chip_family = 16,
@@ -69,47 +80,65 @@ const struct ane_fw_platform ane_h17_platform = {
 	/* No H16 register-map inference is executable on H17. */
 };
 
+/*
+ * The iBoot preload is firmware memory. Accept it only as a no-map child of
+ * /reserved-memory that Linux does not manage as System RAM, whether the
+ * loader reserved it at boot or left it outside the memory map. The physical
+ * range comes from the node itself, so the check does not depend on when the
+ * node was added.
+ */
+int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size)
+{
+	struct device_node *reserved __free(device_node) =
+		of_find_node_by_path("/reserved-memory");
+	struct device_node *mem __free(device_node) =
+		of_parse_phandle(np, "memory-region", index);
+	struct resource r;
+
+	if (!reserved || !mem || mem->parent != reserved ||
+	    !of_device_is_available(mem) ||
+	    !of_property_read_bool(mem, "no-map") ||
+	    of_property_read_bool(mem, "reusable") ||
+	    of_address_to_resource(mem, 0, &r) || !resource_size(&r))
+		return -EINVAL;
+	if (region_intersects(r.start, resource_size(&r), IORESOURCE_SYSTEM_RAM,
+			      IORES_DESC_NONE) != REGION_DISJOINT)
+		return -EBUSY;
+	*phys = r.start;
+	*size = resource_size(&r);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_fw_preload_range);
+
 static int ane_fw_preload_check(struct device *dev,
 				const struct ane_fw_platform *soc)
 {
 	struct device_node *np = dev->of_node;
-	struct device_node *reserved __free(device_node) =
-		of_find_node_by_path("/reserved-memory");
 	u64 phys[2], size[2], dva[2];
 	unsigned int i;
+	int ret;
 
-	if (!reserved ||
-	    of_property_count_u32_elems(np, "memory-region") != 2 ||
+	if (of_property_count_u32_elems(np, "memory-region") != 2 ||
 	    of_property_count_strings(np, "memory-region-names") != 2 ||
 	    of_property_count_u64_elems(np, "apple,firmware-iovas") != 2 ||
 	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2))
 		return -ENODATA;
 
 	for (i = 0; i < 2; i++) {
-		struct device_node *mem;
-		struct reserved_mem *rmem;
+		struct device_node *mem __free(device_node) =
+			of_parse_phandle(np, "memory-region", i);
 		const char *name;
-		bool valid;
 
+		/* Board DTs carry disabled placeholders the loader fills in. */
+		if (mem && !of_device_is_available(mem))
+			return -ENODEV;
 		if (of_property_read_string_index(np, "memory-region-names", i,
 						  &name) ||
 		    strcmp(name, i ? "firmware-data" : "firmware-text"))
 			return -EINVAL;
-		mem = of_parse_phandle(np, "memory-region", i);
-		if (!mem)
-			return -EINVAL;
-		rmem = of_reserved_mem_lookup(mem);
-		valid = rmem && mem->parent == reserved &&
-			of_device_is_available(mem) &&
-			of_property_read_bool(mem, "no-map") &&
-			!of_property_read_bool(mem, "reusable");
-		if (valid) {
-			phys[i] = rmem->base;
-			size[i] = rmem->size;
-		}
-		of_node_put(mem);
-		if (!valid)
-			return -EINVAL;
+		ret = ane_fw_preload_range(np, i, &phys[i], &size[i]);
+		if (ret)
+			return ret;
 	}
 
 	return ane_fw_preload_ranges_valid(soc, phys, size, dva) ? 0 : -EINVAL;
@@ -155,14 +184,30 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	}
 
 	ret = ane_fw_preload_check(dev, soc);
+	if (ret == -ENODEV) {
+		dev_info(dev, "H16 firmware preload not handed off by the bootloader\n");
+		return ret;
+	}
 	if (ret)
 		return dev_err_probe(dev, ret,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
-	/* Original HWX validation does not establish firmware ownership,
-	 * preload integrity, startup state or a decoded process resource map.
-	 * Keep the section-only ABI and incomplete boot backend refused.
-	 */
-	dev_info(dev, "H16 ANE: preload validation, HWX ABI and boot backend incomplete; refusing before power access\n");
-	return -EOPNOTSUPP;
+	if (!soc->h16_profile_count || !soc->h16_mmio_count || soc->dapf_dart >= 3 ||
+	    !soc->dapf_size || of_property_count_u64_elems(np, "apple,dapf-ranges") != 8)
+		return -ENODATA;
+	return 0;
+}
+
+int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_platform *soc)
+{
+	int ret = ane_fw_platform_preflight(pdev, soc);
+
+	if (ret)
+		return ret;
+	return ane_h16_backend_probe(pdev, soc);
+}
+
+void ane_fw_platform_remove(struct platform_device *pdev)
+{
+	ane_h16_backend_remove(pdev);
 }

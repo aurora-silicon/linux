@@ -7,5 +7,6 @@ mt7932-fullmac-$(CONFIG_MT7932_KUNIT_TEST) += input-test.o
 mt7932-fullmac-$(CONFIG_MT7932_KUNIT_TEST) += regulatory-test.o
 mt7932-fullmac-$(CONFIG_MT7932_KUNIT_TEST) += association-test.o
 mt7932-fullmac-$(CONFIG_MT7932_KUNIT_TEST) += six-test.o
+mt7932-fullmac-$(CONFIG_MT7932_KUNIT_TEST) += move-test.o
 
 mt7932-fullmac-$(CONFIG_MT7932_KUNIT_TEST) += pmf-lpi-test.o

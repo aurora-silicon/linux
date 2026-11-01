@@ -193,6 +193,8 @@ mod driver {
 mod boot { pub mod glue {
     pub fn retained() -> bool { crate::RETAINED.with(core::cell::Cell::get) }
     pub unsafe fn asahi_g15_reprobe() { crate::activation_reprobe(); }
+    // Reads the device tree and logs; no driver state.
+    pub unsafe fn asahi_g15_report_loader_gpu() {}
 }}
 '''
 

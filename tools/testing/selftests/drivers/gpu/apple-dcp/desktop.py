@@ -206,6 +206,14 @@ def brightness_takeover(root):
         'static void dcp_backlight_sync_hint(',
         'int dcp_backlight_register(', 'static int dcp_set_brightness(',
         'static bool dcp_backlight_controls_device('))
+    # The 14.7 panel's nits policy and class operations (an M3 internal
+    # panel) never run on the desktop panel.
+    if 'static bool dcp_backlight_presents_nits(' in source:
+        functions = ('static bool iomfb_v14_7_panel_nits(struct apple_dcp *d) '
+                     '{(void)d;return false;}\n'
+                     'static const int dcp_backlight_ops_v14;\n' +
+                     block(source, 'static bool dcp_backlight_presents_nits(') +
+                     '\n' + functions)
     return prefix + r'''
 #include <stddef.h>
 #include <string.h>

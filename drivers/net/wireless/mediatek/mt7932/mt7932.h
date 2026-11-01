@@ -176,6 +176,12 @@ struct mt7932 {
 	 * sets connect_lost for the worker to report. Under response_lock.
 	 */
 	bool connect_publishing, connect_lost;
+	/* A connect with the previous BSSID is moving the connection to another
+	 * AP (roam_moving), or the current connection is the result of one
+	 * (roam_landed). Written under response_lock with WRITE_ONCE(); read
+	 * under it, or with READ_ONCE() where the lock is not held.
+	 */
+	bool roam_moving, roam_landed;
 	u16 disconnect_reason;
 	int connect_error;
 	u32 event_cipher;
@@ -222,6 +228,45 @@ struct mt7932 {
 	void *ipc, *aux;
 	dma_addr_t ipc_dma, aux_dma;
 };
+
+/* What the connect worker reports once an attempt has its result. A move, a
+ * connect with the previous BSSID while connected, ends in a connect result,
+ * which is what iwd's reassociation waits for; cfg80211_roamed() is never
+ * used. A failed connect result leaves cfg80211 holding the connection the
+ * move replaced, so a move that fails or is cancelled then reports a
+ * disconnect, for the reason the cancel gave if it was cancelled. A
+ * cancelled connect that was not a move reports only the disconnect. A
+ * cancel always leaves an error in ret.
+ */
+struct mt7932_connect_report {
+	bool result;		/* cfg80211_connect_done() */
+	bool disconnect;	/* then a disconnect, for reason */
+	bool landed;		/* the new connection is the result of a move */
+	u16 reason;
+};
+
+static inline struct mt7932_connect_report
+mt7932_connect_report(bool move, bool cancelled, int ret, u16 cancel_reason)
+{
+	struct mt7932_connect_report report = {
+		.result = move || !cancelled,
+		.disconnect = move ? ret != 0 : cancelled,
+		.landed = move && !ret,
+	};
+
+	if (report.disconnect)
+		report.reason = cancelled ? cancel_reason : WLAN_REASON_DEAUTH_LEAVING;
+	return report;
+}
+
+/* Whether a disconnect the driver ends is reported as local. See
+ * mt_report_disconnected() for why a connection a move made reports it as
+ * from the AP.
+ */
+static inline bool mt7932_disconnect_local(bool local, bool landed)
+{
+	return local && !landed;
+}
 
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
@@ -274,6 +319,7 @@ void mt_connect_work(struct work_struct *work);
 int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		      struct cfg80211_connect_params *params);
 void mt_disconnect_work(struct work_struct *work);
+void mt_report_disconnected(struct mt7932 *m, u16 reason, bool local, gfp_t gfp);
 int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason);
 int mt_deauth(struct wiphy *wiphy, struct net_device *netdev,
 		     struct cfg80211_deauth_request *request);

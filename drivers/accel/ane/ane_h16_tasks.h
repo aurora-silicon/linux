@@ -94,8 +94,9 @@ ane_h16_task_stream_validate(const void *text, size_t size, u32 expected_tasks)
 			}
 			rec += count * 4;
 		}
-		padded = ALIGN(end, 16);
-		if (padded > size || memchr_inv(p + end, 0, padded - end))
+		/* Tasks start 16-byte aligned; the last one may end the stream. */
+		padded = min_t(size_t, ALIGN(end, 16), size);
+		if (memchr_inv(p + end, 0, padded - end))
 			return -ENOEXEC;
 		pos = padded;
 		if (++tasks > expected_tasks)

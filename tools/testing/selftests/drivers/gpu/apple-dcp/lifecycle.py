@@ -483,6 +483,25 @@ static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, u
         prefix += ('#define DCP_FIRMWARE_V_26_6_DESKTOP 100\n'
                    'static int __attribute__((unused)) dcp_desktop_dptx_connect(struct apple_dcp *d, u32 port)\n'
                    '{ (void)d; (void)port; assert(!"desktop 26.6 connect in an H17P scenario"); return -EINVAL; }\n')
+    # Let the real helper classify an occupied display on newer trees, where
+    # -EBUSY means a transient mux/PHY failure rather than a taken pipeline.
+    if re.search(r'cd321x_display_taken\(int ret\)', pm):
+        assert shim.count('mode_error == -EBUSY') == 1
+        assert tests.count('mode_error = -EBUSY;') == 2
+        shim = shim.replace('mode_error == -EBUSY', 'cd321x_display_taken(mode_error)')
+        tests = tests.replace('mode_error = -EBUSY;', 'mode_error = -ENOSPC;')
+        busy = ' CHECK(sink.connected && !notices && !port.display_route_active);\n'
+        assert tests.count(busy) == 1
+        tests = tests.replace(busy, busy + r'''
+ CHECK(roles == 1 && port.pm.phase == CD321X_PM_RUNNING);
+ /* A transient busy mux must retry before switching the USB role. */
+ init(); port.display_route_active = false; role = USB_ROLE_NONE;
+ port.update_status.status = TPS_STATUS_PLUG_PRESENT;
+ port.update_status.data_status = TPS_DATA_STATUS_DP_CONNECTION | CD321X_DATA_STATUS_HPD_LEVEL;
+ mode_error = -EBUSY; cd321x_update_work(&port.update_work.work);
+ CHECK(!roles && port.pm.phase == CD321X_PM_REVALIDATE);
+ CHECK(sink.connected && !notices && !port.display_route_active);
+''')
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
@@ -1730,6 +1749,9 @@ static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
 static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
     struct drm_atomic_commit *s)
 { (void)d; (void)c; (void)s; return 0; }
+/* The panel of a desktop 26.6 machine takes VRR_ENABLED live. */
+static bool dcp_vrr_live(struct apple_dcp *d)
+{ return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
 static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return -ENODEV; }
 static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
@@ -1788,10 +1810,10 @@ DESKTOP_VRR    dcp.crashed = true;
     return 0;
 }
 """
-    # Desktop 26.6 takes VRR_ENABLED with the next frame on the panel and the
-    # external processors alike (the latter reselect their mode in flush):
-    # compositors toggle it in plain page flips, so a VRR_ENABLED change
-    # must never become a DRM mode set.
+    # Desktop 26.6 takes VRR_ENABLED live on the panel (main display), with
+    # the next frame: compositors toggle it in plain page flips, so there a
+    # VRR_ENABLED change must never become a mode set.  The external
+    # processors ignore a live minimum rate and still apply it with a mode set.
     desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
@@ -1809,7 +1831,7 @@ DESKTOP_VRR    dcp.crashed = true;
         state.no_old_crtc = old_vrr == 2;
         state.old_crtc.vrr_enabled = old_vrr == 1;
         assert(dcp_crtc_atomic_check(&crtc, &state) == 0);
-        bool expected = false;
+        bool expected = !panel && enable && old_vrr != 2 && (old_vrr == 1) != vrr;
         if (state.crtc.mode_changed != expected) {
             fprintf(stderr, "desktop panel=%u enable=%u old_vrr=%u vrr=%u: mode_changed=%d expected %d\n",
                     panel, enable, old_vrr, vrr, state.crtc.mode_changed, expected);

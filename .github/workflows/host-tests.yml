@@ -57,6 +57,8 @@ jobs:
             command -v "$p" >/dev/null || need="$need $p"
           done
           command -v "ld.lld-$CLANG_VERSION" >/dev/null || need="$need lld-$CLANG_VERSION"
+          # Device-tree tests read the built trees with fdtget.
+          command -v fdtget >/dev/null || need="$need device-tree-compiler"
           dpkg -s "libclang-rt-$CLANG_VERSION-dev" >/dev/null 2>&1 || need="$need libclang-rt-$CLANG_VERSION-dev"
           if [ -n "$need" ]; then
             sudo apt-get update -q

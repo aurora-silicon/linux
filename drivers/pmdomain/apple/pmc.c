@@ -44,6 +44,7 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/pmc.h>
 #include <linux/spinlock.h>
+#include <linux/string_choices.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -93,6 +94,8 @@ struct apple_pmc {
 	const struct apple_pmc_hw *hw;
 	void __iomem *voters;
 	void __iomem *rails;
+	/* Optional cluster enable control and status words (T8140). */
+	void __iomem *clusters;
 	/*
 	 * Serializes read-modify-write cycles on enable and floor words, and
 	 * protects @enable and @dcs_state.
@@ -122,6 +125,8 @@ struct apple_pmc {
  * @rail: with @floor, the rail
  * @level: with @floor, the performance state held while powered
  * @on: with @floor, whether the floor is held; protected by pmc->lock
+ * @cluster: the domain is a cluster enable bit in the "clusters" region
+ * @bit: with @cluster, the bit in the control and status words
  */
 struct apple_pmc_domain {
 	struct generic_pm_domain genpd;
@@ -133,6 +138,8 @@ struct apple_pmc_domain {
 	unsigned int rail;
 	unsigned int level;
 	bool on;
+	bool cluster;
+	unsigned int bit;
 	bool provider;
 };
 
@@ -634,10 +641,39 @@ static int apple_pmc_floor_set(struct apple_pmc_domain *dom, bool on)
 	return ret;
 }
 
+/* The cluster control word is at +0 and its status at +4. */
+#define APPLE_PMC_CLUSTER_CTRL		0x0
+#define APPLE_PMC_CLUSTER_STATUS	0x4
+#define APPLE_PMC_CLUSTER_TIMEOUT_US	10000
+
+static int apple_pmc_cluster_set(struct apple_pmc_domain *dom, bool on)
+{
+	struct apple_pmc *pmc = dom->pmc;
+	u32 mask = BIT(dom->bit), val;
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	val = readl(pmc->clusters + APPLE_PMC_CLUSTER_CTRL);
+	writel(on ? val | mask : val & ~mask,
+	       pmc->clusters + APPLE_PMC_CLUSTER_CTRL);
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	ret = readl_poll_timeout_atomic(pmc->clusters + APPLE_PMC_CLUSTER_STATUS,
+					val, !!(val & mask) == on, 1,
+					APPLE_PMC_CLUSTER_TIMEOUT_US);
+	if (ret)
+		dev_err(pmc->dev, "%s: cluster bit %u did not turn %s (status %#x)\n",
+			dom->genpd.name, dom->bit, str_on_off(on), val);
+	return ret;
+}
+
 static int apple_pmc_domain_power_on(struct generic_pm_domain *genpd)
 {
 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
 
+	if (dom->cluster)
+		return apple_pmc_cluster_set(dom, true);
 	if (dom->floor)
 		return apple_pmc_floor_set(dom, true);
 	return apple_pmc_agent_enable(dom->pmc, dom->agent, true);
@@ -647,6 +683,8 @@ static int apple_pmc_domain_power_off(struct generic_pm_domain *genpd)
 {
 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
 
+	if (dom->cluster)
+		return apple_pmc_cluster_set(dom, false);
 	if (dom->floor)
 		return apple_pmc_floor_set(dom, false);
 	return apple_pmc_agent_enable(dom->pmc, dom->agent, false);
@@ -711,6 +749,75 @@ static int apple_pmc_domain_add(struct apple_pmc *pmc, struct device_node *np)
 	 */
 	ret = pm_genpd_init(&dom->genpd, NULL,
 			    !(apple_pmc_enable_read(pmc, 0) & BIT(agent)));
+	if (ret) {
+		of_node_put(dom->np);
+		kfree(dom->genpd.name);
+		kfree(dom);
+		return dev_err_probe(dev, ret, "%pOF: genpd init failed\n", np);
+	}
+	list_add_tail(&dom->list, &pmc->domains);
+
+	ret = of_genpd_add_provider_simple(np, &dom->genpd);
+	if (ret)
+		return dev_err_probe(dev, ret, "%pOF: provider failed\n", np);
+	dom->provider = true;
+
+	for (i = 0; !of_parse_phandle_with_args(np, "power-domains",
+						"#power-domain-cells", i,
+						&parent); i++) {
+		struct of_phandle_args child = { .np = np };
+
+		ret = of_genpd_add_subdomain(&parent, &child);
+		of_node_put(parent.np);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "%pOF: failed to join parent domain\n",
+					     np);
+	}
+
+	return 0;
+}
+
+/*
+ * A cluster enable bit, set while the domain is powered: the T8140 video
+ * encoder cluster must be enabled before its performance request takes
+ * effect. Starts off; the bootloader leaves the bits clear.
+ */
+static int apple_pmc_cluster_add(struct apple_pmc *pmc, struct device_node *np)
+{
+	struct device *dev = pmc->dev;
+	struct apple_pmc_domain *dom;
+	struct of_phandle_args parent;
+	const char *label;
+	u32 bit;
+	int i, ret;
+
+	if (!pmc->clusters)
+		return dev_err_probe(dev, -EINVAL, "%pOF: no clusters region\n", np);
+	if (of_property_read_u32(np, "apple,cluster-bit", &bit) || bit >= 32)
+		return dev_err_probe(dev, -EINVAL, "%pOF: invalid cluster bit\n", np);
+
+	dom = kzalloc_obj(*dom);
+	if (!dom)
+		return -ENOMEM;
+
+	dom->pmc = pmc;
+	dom->np = of_node_get(np);
+	dom->cluster = true;
+	dom->bit = bit;
+	if (of_property_read_string(np, "label", &label))
+		label = np->name;
+	dom->genpd.name = kasprintf(GFP_KERNEL, "pmc-%s", label);
+	if (!dom->genpd.name) {
+		of_node_put(dom->np);
+		kfree(dom);
+		return -ENOMEM;
+	}
+	dom->genpd.power_on = apple_pmc_domain_power_on;
+	dom->genpd.power_off = apple_pmc_domain_power_off;
+
+	ret = pm_genpd_init(&dom->genpd, NULL,
+			    !(readl(pmc->clusters + APPLE_PMC_CLUSTER_STATUS) & BIT(bit)));
 	if (ret) {
 		of_node_put(dom->np);
 		kfree(dom->genpd.name);
@@ -905,6 +1012,11 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	pmc->rails = devm_platform_ioremap_resource_byname(pdev, "rails");
 	if (IS_ERR(pmc->rails))
 		return PTR_ERR(pmc->rails);
+	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "clusters")) {
+		pmc->clusters = devm_platform_ioremap_resource_byname(pdev, "clusters");
+		if (IS_ERR(pmc->clusters))
+			return PTR_ERR(pmc->clusters);
+	}
 
 	/* An unpowered PMC reads all-ones; do not write to it. */
 	for (rail = 0; rail < pmc->hw->rails; rail++) {
@@ -953,6 +1065,8 @@ static int apple_pmc_probe(struct platform_device *pdev)
 			continue;
 		if (of_property_present(child, "apple,rail"))
 			ret = apple_pmc_floor_add(pmc, child);
+		else if (of_property_present(child, "apple,cluster-bit"))
+			ret = apple_pmc_cluster_add(pmc, child);
 		else
 			ret = apple_pmc_domain_add(pmc, child);
 		if (ret) {

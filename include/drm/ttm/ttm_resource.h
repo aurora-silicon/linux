@@ -236,6 +236,7 @@ struct ttm_resource_manager {
  * @addr:		mapped virtual address
  * @offset:		physical addr
  * @is_iomem:		is this io memory ?
+ * @is_nonposted:	require non-posted accesses to this I/O memory
  * @caching:		See enum ttm_caching
  *
  * Structure indicating the bus placement of an object.
@@ -244,6 +245,7 @@ struct ttm_bus_placement {
 	void			*addr;
 	phys_addr_t		offset;
 	bool			is_iomem;
+	bool			is_nonposted;
 	enum ttm_caching	caching;
 };
 
