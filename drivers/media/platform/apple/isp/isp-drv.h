@@ -147,8 +147,17 @@ struct isp_preset {
 	bool p010;
 };
 
+struct ane_isp_link;
+
 struct apple_isp_hw {
 	enum isp_generation gen;
+	/*
+	 * How the ANE firmware signals this ISP over the ML noise reduction
+	 * endpoint; the endpoint stays off where it is not known.
+	 */
+	bool ane_doorbell_known;
+	u64 ane_isp_doorbell;
+	u32 ane_isp_doorbell_sel;
 	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
@@ -289,6 +298,11 @@ struct apple_isp {
 	enum isp_firmware_version fw_compat;
 	u32 platform_id;
 	u32 temporal_filter;
+
+	/* ML noise reduction on the neural engine (isp-ane.c) */
+	struct ane_isp_link *ane;
+	struct isp_surf *ane_rings;
+	char ane_afpp[64];
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;
 	int num_presets;

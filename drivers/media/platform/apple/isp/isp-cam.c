@@ -6,6 +6,7 @@
 #include <linux/unaligned.h>
 #include <kunit/static_stub.h>
 
+#include "isp-ane.h"
 #include "isp-cam.h"
 #include "isp-cmd.h"
 #include "isp-fw.h"
@@ -814,6 +815,11 @@ select_config:
 	err = isp_cmd_ch_mbnr_enable(isp, ch, 0, ISP_MBNR_MODE_ENABLE, 1);
 	if (err)
 		return err;
+
+	/* ML noise reduction, only with a live neural engine endpoint */
+	err = apple_isp_ane_stream_start(isp, ch);
+	if (err)
+		dev_warn(isp->dev, "ML noise reduction not enabled: %d\n", err);
 
 	/* The H17 firmware faults on this face-detection metering setup. */
 	if (!h17) {

@@ -250,6 +250,21 @@ struct cmd_ipc_endpoint_set2 {
 } __packed;
 static_assert(sizeof(struct cmd_ipc_endpoint_set2) == 0x30);
 
+struct cmd_ipc_endpoint_unset2 {
+	u64 opcode;
+	u32 unk;
+} __packed;
+static_assert(sizeof(struct cmd_ipc_endpoint_unset2) == 0xc);
+
+/* Channel algorithm enable: CISP_CMD_CH_PROPERTY_WRITE with a 0x14-byte body */
+struct cmd_ch_algorithm_enable {
+	u64 opcode;
+	u32 chan;
+	u32 alg;
+	u32 enable;
+} __packed;
+static_assert(sizeof(struct cmd_ch_algorithm_enable) == 0x14);
+
 struct cmd_flicker_sensor_set {
 	u64 opcode;
 	u32 mode;
@@ -548,6 +563,10 @@ int isp_cmd_ch_output_config_set(struct apple_isp *isp, u32 chan, u32 width,
 				 u32 height, u32 strides[3], u32 colorspace, u32 format);
 int isp_cmd_ch_preview_stream_set(struct apple_isp *isp, u32 chan, u32 stream);
 int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan);
+int isp_cmd_ipc_endpoint_set2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
+			      u32 wr_len, u64 doorbell, u32 doorbell_sel);
+int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp);
+int isp_cmd_ch_algorithm_enable(struct apple_isp *isp, u32 chan, u32 alg, u32 enable);
 int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
 			   u32 mode, u32 enable_chroma);

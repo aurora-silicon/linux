@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
+#include "isp-ane.h"
 #include "isp-fw.h"
 #include "isp-ipc-layout.h"
 
@@ -1082,6 +1083,9 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 
 	isp->fw_state = ISP_FW_RUNNING;
 
+	/* Optional: ML noise reduction needs the neural engine endpoint */
+	apple_isp_ane_start(isp);
+
 	return 0;
 }
 
@@ -1113,6 +1117,7 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 	if (isp->fw_state != ISP_FW_RUNNING)
 		return;
 
+	apple_isp_ane_stop(isp);
 	isp_firmware_shutdown(isp);
 	pm_runtime_put_sync(isp->dev);
 	isp->ipc_stale = NULL;

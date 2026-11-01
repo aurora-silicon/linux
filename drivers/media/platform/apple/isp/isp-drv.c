@@ -14,6 +14,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/workqueue.h>
 
+#include "isp-ane.h"
 #include "isp-cam.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
@@ -546,6 +547,10 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
+	err = apple_isp_ane_init(isp);
+	if (err)
+		goto destroy_wq;
+
 	err = apple_isp_init_iommu(isp);
 	if (err) {
 		dev_err(dev, "failed to init iommu: %d\n", err);
@@ -582,6 +587,7 @@ free_surface:
 free_iommu:
 	apple_isp_free_iommu(isp);
 destroy_wq:
+	apple_isp_ane_exit(isp);
 	destroy_workqueue(isp->wq);
 detach_genpd:
 	apple_isp_detach_genpd(isp);
@@ -599,6 +605,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
 	apple_isp_firmware_halt(isp);
+	apple_isp_ane_exit(isp);
 	apple_isp_free_video(isp);
 	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);

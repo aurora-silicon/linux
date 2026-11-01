@@ -443,6 +443,40 @@ int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan)
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_ipc_endpoint_set2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
+			      u32 wr_len, u64 doorbell, u32 doorbell_sel)
+{
+	struct cmd_ipc_endpoint_set2 args = {
+		.opcode = CISP_OPCODE(CISP_CMD_IPC_ENDPOINT_SET2),
+		.addr1 = rd,
+		.size1 = rd_len,
+		.addr2 = wr,
+		.size2 = wr_len,
+		.regs = doorbell,
+		.unk2 = doorbell_sel,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp)
+{
+	struct cmd_ipc_endpoint_unset2 args = {
+		.opcode = CISP_OPCODE(CISP_CMD_IPC_ENDPOINT_UNSET2),
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_algorithm_enable(struct apple_isp *isp, u32 chan, u32 alg, u32 enable)
+{
+	struct cmd_ch_algorithm_enable args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_PROPERTY_WRITE),
+		.chan = chan,
+		.alg = alg,
+		.enable = enable,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
 int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan)
 {
 	struct cmd_ch_cnr_start args = {
