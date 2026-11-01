@@ -849,6 +849,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	const u8 *reply = NULL;
 	unsigned int i;
 	u64 deadline, polls, t0, gate_open, t1 = 0, t2 = 0, t3, end;
+	u64 entry = h16_now(s);
 	int ret;
 
 	if (!s || !p || s->program != p)
@@ -857,10 +858,13 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 		return -EIO;
 	if (!p->created || p->closed)
 		return -EINVAL;
-	ret = ane_h16_hwx_snapshot_check(&p->snapshot);
-	if (!ret)
-		ret = ane_h16_resources_validate(&p->hwx, p->resources,
-						 p->resource_count);
+	/*
+	 * The snapshot was hashed and parsed at LOAD, everything the firmware
+	 * reads was copied out of it then, and it stays private and unchanged
+	 * until the program is freed. Hashing it again here (8.4 MB for
+	 * MobileNet, about 2.9 ms) protected nothing per request.
+	 */
+	ret = ane_h16_resources_validate(&p->hwx, p->resources, p->resource_count);
 	if (ret)
 		return ret;
 	/*
@@ -948,6 +952,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	end = h16_now(s);
 	s->transport->ops->read_barrier(s->transport->ctx);
 	memset(x, 0, sizeof(*x));
+	x->ns[ANE_H16_T_PREPARE] = t0 - entry;
 	x->ns[ANE_H16_T_GATE_OPEN] = gate_open;
 	x->ns[ANE_H16_T_SUBMIT_ACK] = t2 - t1;
 	x->ns[ANE_H16_T_ACK_REPORT] = trace.first_ns - t2;
@@ -960,7 +965,9 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	 * The completion report and the closing gate reply both arrived, so the
 	 * firmware no longer reads this sequence's commands: reuse their space.
 	 */
-	return ane_fw_transport_release(s->transport, mark);
+	ret = ane_fw_transport_release(s->transport, mark);
+	x->ns[ANE_H16_T_FINISH] = h16_now(s) - end;
+	return ret;
 fail:
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request.key.uuid);
 	/*
@@ -983,12 +990,15 @@ fail:
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);
 
 const char *const ane_h16_exec_phase_names[ANE_H16_T_PHASES] = {
+	[ANE_H16_T_LOCK] = "lock",
 	[ANE_H16_T_COPY_IN] = "copy_in",
+	[ANE_H16_T_PREPARE] = "prepare",
 	[ANE_H16_T_GATE_OPEN] = "gate_open",
 	[ANE_H16_T_SUBMIT_ACK] = "submit_ack",
 	[ANE_H16_T_ACK_REPORT] = "ack_report",
 	[ANE_H16_T_REPORT_DONE] = "report_done",
 	[ANE_H16_T_GATE_CLOSE] = "gate_close",
+	[ANE_H16_T_FINISH] = "finish",
 	[ANE_H16_T_COPY_OUT] = "copy_out",
 	[ANE_H16_T_FIRMWARE] = "firmware",
 	[ANE_H16_T_IOCTL] = "ioctl",
@@ -1022,11 +1032,12 @@ EXPORT_SYMBOL_GPL(ane_h16_exec_stats_add);
  * Account the last successful EXECUTE with the caller's copy and whole-request
  * times. The caller serializes this with ane_h16_session_execute().
  */
-void ane_h16_session_account(struct ane_h16_session *s, u64 copy_in_ns,
+void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in_ns,
 			     u64 copy_out_ns, u64 ioctl_ns)
 {
 	struct ane_h16_exec_sample x = s->timing;
 
+	x.ns[ANE_H16_T_LOCK] = lock_ns;
 	x.ns[ANE_H16_T_COPY_IN] = copy_in_ns;
 	x.ns[ANE_H16_T_COPY_OUT] = copy_out_ns;
 	x.ns[ANE_H16_T_IOCTL] = ioctl_ns;

@@ -147,7 +147,7 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	struct drm_ane_h16_exec *args = data;
 	struct drm_ane_h16_buffer buffers[ANE_H16_SURFACES];
 	struct ane_h16_program *p;
-	u64 start, copied, done;
+	u64 start, locked, copied, done;
 	unsigned int i;
 	int ret = 0;
 
@@ -156,7 +156,9 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	if (copy_from_user(buffers, u64_to_user_ptr(args->buffers_ptr),
 			   array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
+	start = ktime_get_ns();
 	mutex_lock(&a->lock);
+	locked = ktime_get_ns();
 	p = f->program;
 	if (!p || p->closed || args->count != p->resource_count) {
 		ret = -EINVAL;
@@ -169,7 +171,6 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		}
 	}
 	/* The firmware is idle for this program, so its inputs may change now. */
-	start = ktime_get_ns();
 	for (i = 0; i < args->count; i++) {
 		void *cpu = p->surfaces[i]->cpu;
 
@@ -196,15 +197,19 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		u64 end = ktime_get_ns();
 		const u64 *ns = a->session->timing.ns;
 
-		ane_h16_session_account(a->session, copied - start, end - done, end - start);
+		ane_h16_session_account(a->session, locked - start, copied - locked, end - done,
+					end - start);
 		drm_dbg_driver(drm,
-			       "EXECUTE us: in %llu open %llu ack %llu report %llu done %llu close %llu out %llu fw %llu all %llu polls %llu\n",
-			       div_u64(copied - start, 1000),
+			       "EXECUTE us: lock %llu in %llu prep %llu open %llu ack %llu report %llu done %llu close %llu fin %llu out %llu fw %llu all %llu polls %llu\n",
+			       div_u64(locked - start, 1000),
+			       div_u64(copied - locked, 1000),
+			       div_u64(ns[ANE_H16_T_PREPARE], 1000),
 			       div_u64(ns[ANE_H16_T_GATE_OPEN], 1000),
 			       div_u64(ns[ANE_H16_T_SUBMIT_ACK], 1000),
 			       div_u64(ns[ANE_H16_T_ACK_REPORT], 1000),
 			       div_u64(ns[ANE_H16_T_REPORT_DONE], 1000),
 			       div_u64(ns[ANE_H16_T_GATE_CLOSE], 1000),
+			       div_u64(ns[ANE_H16_T_FINISH], 1000),
 			       div_u64(end - done, 1000),
 			       div_u64(ns[ANE_H16_T_FIRMWARE], 1000),
 			       div_u64(end - start, 1000), a->session->timing.polls);

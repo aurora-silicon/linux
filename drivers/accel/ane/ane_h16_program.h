@@ -170,15 +170,18 @@ struct ane_h16_program {
  * ioctl phases come from the caller through ane_h16_session_account().
  */
 enum ane_h16_exec_phase {
+	ANE_H16_T_LOCK,		/* waiting for the session lock */
 	ANE_H16_T_COPY_IN,	/* inputs copied in, outputs poisoned */
+	ANE_H16_T_PREPARE,	/* checks, command buffer, until the opening gate */
 	ANE_H16_T_GATE_OPEN,	/* 0x002d 0 published until its reply */
 	ANE_H16_T_SUBMIT_ACK,	/* EXECUTE published until its channel-7 ack */
 	ANE_H16_T_ACK_REPORT,	/* the ack until the first report of the UUID */
 	ANE_H16_T_REPORT_DONE,	/* that report until the completion report */
 	ANE_H16_T_GATE_CLOSE,	/* 0x002d 1 published until its reply */
+	ANE_H16_T_FINISH,	/* read barrier, freeing the command and its arena */
 	ANE_H16_T_COPY_OUT,	/* outputs copied out */
 	ANE_H16_T_FIRMWARE,	/* opening gate published until closing gate reply */
-	ANE_H16_T_IOCTL,	/* the whole request after its argument checks */
+	ANE_H16_T_IOCTL,	/* the whole request after copying its buffer table */
 	ANE_H16_T_PHASES
 };
 
@@ -229,7 +232,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_program **program);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
-void ane_h16_session_account(struct ane_h16_session *s, u64 copy_in_ns,
+void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in_ns,
 			     u64 copy_out_ns, u64 ioctl_ns);
 void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats *out,
 			   bool reset);

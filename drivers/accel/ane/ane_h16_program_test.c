@@ -1080,16 +1080,20 @@ static void program_timing_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_GATE_CLOSE], 100ULL);
 	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_FIRMWARE], 370ULL);
 	KUNIT_EXPECT_EQ(test, x->polls, 7ULL);
+	/* Nothing outside the firmware phases takes time in the fake. */
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_PREPARE], 0ULL);
+	KUNIT_EXPECT_EQ(test, x->ns[ANE_H16_T_FINISH], 0ULL);
 
-	ane_h16_session_account(&f->s, 5, 6, 400);
+	ane_h16_session_account(&f->s, 1, 5, 6, 400);
 	f->mode = FW_OK;
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
 	/* All three reports came with the ack: nothing between them. */
 	KUNIT_EXPECT_EQ(test, f->s.timing.ns[ANE_H16_T_REPORT_DONE], 0ULL);
 	KUNIT_EXPECT_EQ(test, f->s.timing.polls, 0ULL);
-	ane_h16_session_account(&f->s, 15, 8, 340);
+	ane_h16_session_account(&f->s, 1, 15, 8, 340);
 	ane_h16_session_stats(&f->s, &st, false);
 	KUNIT_EXPECT_EQ(test, st.count, 2ULL);
+	KUNIT_EXPECT_EQ(test, st.sum.ns[ANE_H16_T_LOCK], 2ULL);
 	KUNIT_EXPECT_EQ(test, st.last.ns[ANE_H16_T_COPY_IN], 15ULL);
 	KUNIT_EXPECT_EQ(test, st.sum.ns[ANE_H16_T_COPY_IN], 20ULL);
 	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_REPORT_DONE], 0ULL);
@@ -1102,7 +1106,7 @@ static void program_timing_test(struct kunit *test)
 
 	/* A reset starts over: the next sample sets min and max alone. */
 	ane_h16_session_stats(&f->s, NULL, true);
-	ane_h16_session_account(&f->s, 9, 9, 500);
+	ane_h16_session_account(&f->s, 1, 9, 9, 500);
 	ane_h16_session_stats(&f->s, &st, false);
 	KUNIT_EXPECT_EQ(test, st.count, 1ULL);
 	KUNIT_EXPECT_EQ(test, st.min.ns[ANE_H16_T_IOCTL], 500ULL);
