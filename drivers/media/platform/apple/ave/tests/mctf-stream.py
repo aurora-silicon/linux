@@ -225,6 +225,26 @@ def dqbuf(fd, typ, timeout=12.0):
             select.select([fd], [], [], 0.01)
 
 
+class Pattern:
+    """A static, noise-free test card: a horizontal luma ramp, eight
+    vertical bars in the lower half and chroma ramps, so a tiled or
+    reordered output is easy to recognise."""
+
+    def __init__(self):
+        ramp = bytes(16 + (219 * x) // (W - 1) for x in range(W))
+        bars = b''.join(bytes([16 + 219 * (i % 2)]) * (W // 8) for i in range(8))
+        y = ramp * (H // 2) + bars * (H - H // 2)
+        u = [16 + (224 * x) // (W // 2 - 1) for x in range(W // 2)]
+        rows = []
+        for r in range(H // 2):
+            v = 16 + (224 * r) // (H // 2 - 1)
+            rows.append(bytes(b for x in range(W // 2) for b in (u[x], v)))
+        self.data = y + b''.join(rows)
+
+    def frame(self, n):
+        return self.data
+
+
 class Synth:
     """Flat grey with fixed-sigma noise and a moving white square."""
 
@@ -277,6 +297,7 @@ def main():
     ap.add_argument('-o', '--output', help='write the filtered NV12 frames here')
     ap.add_argument('-l', '--level', type=int, help='MCTF Level (0..31)')
     ap.add_argument('--sigma', type=float, default=8.0, help='synthetic luma noise')
+    ap.add_argument('--pattern', action='store_true', help='static noise-free test card')
     ap.add_argument('--depth', type=int, default=2, help='frames in flight')
     ap.add_argument('--fps', type=float, default=30.0, help='timestamps only')
     ap.add_argument('--warmup', type=int, default=6, help='frames left out of the summary')
@@ -307,7 +328,7 @@ def main():
     fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
     src = open(args.input, 'rb') if args.input else None
-    synth = None if src else Synth(args.sigma)
+    synth = None if src else (Pattern() if args.pattern else Synth(args.sigma))
     sink = open(args.output, 'wb') if args.output else None
 
     for i in range(len(cmaps)):
