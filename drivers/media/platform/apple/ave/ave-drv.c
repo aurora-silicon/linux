@@ -20,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/vmalloc.h>
 
 #include "ave.h"
 #include "ave-regs.h"
@@ -141,6 +142,38 @@ void ave_debugfs_save_mctf(struct ave_dev *ave, enum ave_image kind,
 		memcpy(dst, cmd, len);
 }
 
+static void ave_vfree(void *p)
+{
+	vfree(p);
+}
+
+/*
+ * last_mctf_in and last_mctf_out: with mctf_capture set, the raw compressed
+ * input surface (as the driver wrote it) and output surface (as the firmware
+ * wrote it) of the last delivered frame, a known-plaintext pair.
+ */
+static void ave_debugfs_mctf_surfaces(struct ave_dev *ave,
+				      const struct ave_mctf_layout *l)
+{
+	static const char *const names[2] = { "last_mctf_in", "last_mctf_out" };
+
+	for (unsigned int k = 0; k < 2; k++) {
+		struct debugfs_blob_wrapper *blob;
+		void *data = vzalloc(l->form.bytes);
+
+		if (!data || devm_add_action_or_reset(ave->dev, ave_vfree, data))
+			continue;
+		blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
+		if (!blob)
+			continue;
+		ave->mctf_surf_dump[k] = data;
+		blob->data = data;
+		blob->size = l->form.bytes;
+		debugfs_create_blob(names[k], 0400, ave->debugfs, blob);
+	}
+	debugfs_create_bool("mctf_capture", 0600, ave->debugfs, &ave->mctf_capture);
+}
+
 static void ave_debugfs_mctf(struct ave_dev *ave)
 {
 	static const char *const names[AVE_IMAGE_COUNT] = {
@@ -165,6 +198,7 @@ static void ave_debugfs_mctf(struct ave_dev *ave)
 		blob->size = size;
 		debugfs_create_blob(names[k], 0400, ave->debugfs, blob);
 	}
+	ave_debugfs_mctf_surfaces(ave, l);
 }
 
 static ssize_t ave_lifecycle_write(struct file *file, const char __user *user,

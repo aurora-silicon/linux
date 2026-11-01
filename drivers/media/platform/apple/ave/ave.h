@@ -226,6 +226,9 @@ struct ave_dev {
 	struct v4l2_m2m_dev *mctf_m2m;
 	bool mctf_registered;
 	void *mctf_dump[AVE_IMAGE_COUNT];
+	/* debugfs: the last filtered frame's input and output surfaces, raw */
+	void *mctf_surf_dump[2];
+	bool mctf_capture;
 	/* The video device's ioctl and queue lock. */
 	struct mutex vdev_lock;
 	struct workqueue_struct *wq;
@@ -269,6 +272,7 @@ struct ave_slot {
 	struct vb2_v4l2_buffer *dst; /* MCTF: the firmware writes the frame here */
 	struct ave_vb2_mem *input_mem; /* independent firmware mapping reference */
 	struct ave_vb2_mem *output_mem; /* the same, for an MCTF CAPTURE buffer */
+	u8 mctf_input; /* MCTF: the input surface this frame used */
 	u32 status;
 	bool busy; /* Process sent, reply pending */
 	bool done; /* reply in, output not delivered yet */

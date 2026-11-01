@@ -355,6 +355,9 @@ static int ave_mctf_put_picture(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src
 
 	if (!to || !from || !sess->mctf_surf || !sess->mctf_lin)
 		return -EFAULT;
+	if (src->vb2_buf.planes[0].data_offset + luma * 3 / 2 >
+	    vb2_plane_size(&src->vb2_buf, 0))
+		return -EINVAL;
 	from += src->vb2_buf.planes[0].data_offset;
 	memcpy(sess->mctf_lin, from, luma * 3 / 2);
 	ave_cmp420_pack(g, sess->mctf_surf, sess->mctf_lin, sess->mctf_lin + luma,
@@ -389,7 +392,8 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 	ret = ave_mctf_put_picture(ctx, src, sess->frames % AVE_MCTF_INPUTS);
 	if (ret)
 		return ret;
-	f.in = sess->mctf_in[sess->frames % AVE_MCTF_INPUTS].dma;
+	s->mctf_input = sess->frames % AVE_MCTF_INPUTS;
+	f.in = sess->mctf_in[s->mctf_input].dma;
 	f.out = sess->mctf_out[slot].dma;
 	ret = ave_ipc_wait_ack(ave, buf);
 	if (ret)

@@ -283,7 +283,17 @@ static int ave_mctf_get_picture(struct ave_ctx *ctx, unsigned int slot,
 
 	if (!from || !to || !sess->mctf_surf || !sess->mctf_lin)
 		return -EFAULT;
+	if (vb2_plane_size(&dst->vb2_buf, 0) < luma * 3 / 2)
+		return -EINVAL;
 	memcpy(sess->mctf_surf, from, g->bytes);
+	if (READ_ONCE(ctx->ave->mctf_capture) && ctx->ave->mctf_surf_dump[0] &&
+	    ctx->ave->mctf_surf_dump[1] && sess->mctf_in[sess->slot[slot].mctf_input].cpu) {
+		memcpy(ctx->ave->mctf_surf_dump[0],
+		       sess->mctf_in[sess->slot[slot].mctf_input].cpu, g->bytes);
+		memcpy(ctx->ave->mctf_surf_dump[1], sess->mctf_surf, g->bytes);
+		dev_dbg(ctx->ave->dev, "MCTF frame %u: surfaces captured\n",
+			ctx->dst_sequence);
+	}
 	ave_cmp420_unpack(g, sess->mctf_surf, sess->mctf_lin,
 			  sess->mctf_lin + luma, sess->p.stride, &ys, &cs);
 	memcpy(to, sess->mctf_lin, luma * 3 / 2);

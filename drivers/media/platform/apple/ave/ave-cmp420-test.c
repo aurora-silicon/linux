@@ -375,12 +375,57 @@ static void ave_cmp420_other(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hist[0x55], 1);
 }
 
+/*
+ * Odd geometries with every buffer allocated to its exact size and tight
+ * strides, so KASAN catches any access past a plane or the surface; then
+ * random surfaces (any metadata, any body) through the reader.
+ */
+static void ave_cmp420_bounds(struct kunit *test)
+{
+	static const u32 sizes[][2] = {
+		{ 2, 2 }, { 30, 2 }, { 34, 34 }, { 66, 18 }, { 98, 66 },
+		{ 126, 130 }, { 1922, 1082 }, { 1920, 1080 },
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(sizes); i++) {
+		u32 w = sizes[i][0], h = sizes[i][1];
+		struct ave_cmp420_stats ys, cs;
+		struct t_pic t;
+		u16 hist[256];
+
+		t_round_trip(test, w, h, w);
+		t_pic_init(test, &t, w, h, w);
+		for (unsigned int r = 0; r < 4; r++) {
+			u32 x = 0x9e3779b9 * (r + 1) + i;
+
+			for (u32 k = 0; k < t.g.bytes; k++) {
+				x ^= x << 13;
+				x ^= x >> 17;
+				x ^= x << 5;
+				t.surf[k] = r == 3 ? (u8)(x & 1 ? 0x1f : 0x60) : x;
+			}
+			ave_cmp420_unpack(&t.g, t.surf, t.out, t.out + t.luma,
+					  t.stride, &ys, &cs);
+			KUNIT_EXPECT_EQ(test, ys.raw + ys.solid + ys.other,
+					t.g.tiles_x * t.g.tiles_y * 32);
+			KUNIT_EXPECT_EQ(test, cs.raw + cs.solid + cs.other,
+					t.g.tiles_x * t.g.tiles_y * 8);
+			KUNIT_EXPECT_EQ(test, ys.tiles_raw + ys.tiles_solid +
+					      ys.tiles_mixed + ys.tiles_other,
+					t.g.tiles_x * t.g.tiles_y);
+			ave_cmp420_meta_hist(&t.g, t.surf, false, hist);
+			ave_cmp420_meta_hist(&t.g, t.surf, true, hist);
+		}
+	}
+}
+
 static struct kunit_case ave_cmp420_cases[] = {
 	KUNIT_CASE(ave_cmp420_geom_1080p),
 	KUNIT_CASE(ave_cmp420_pack_layout),
 	KUNIT_CASE(ave_cmp420_round_trip),
 	KUNIT_CASE(ave_cmp420_solid),
 	KUNIT_CASE(ave_cmp420_other),
+	KUNIT_CASE(ave_cmp420_bounds),
 	{}
 };
 
