@@ -2615,6 +2615,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp);
 	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
+	if (dcp->desktop)
+		dcp->desktop->vrr_requested = crtc_state->vrr_enabled;
 	dcp_hdr_metadata_forget(dcp);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
@@ -3155,6 +3157,29 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		if (cs && cs->active && cs->mode.hdisplay) {
 			dev_dbg(dcp->dev, "re-powering the external pipe of an active CRTC\n");
 			dcp_poweron(pdev);
+			dcp_crtc_atomic_modeset(crtc, commit);
+		}
+	}
+
+	/*
+	 * The external processors take adaptive sync only with a mode set;
+	 * macOS too reselects the same timing to switch a display between
+	 * fixed and variable refresh.  Compositors flip VRR_ENABLED in plain
+	 * page flips (mutter when a fullscreen client comes and goes), so a
+	 * change on a live VRR timing reselects the mode here, once.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_vrr_live(dcp) &&
+	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected)) {
+		struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(commit, crtc);
+		struct dcp_display_mode mode;
+
+		if (cs && cs->active && !drm_atomic_crtc_needs_modeset(cs) &&
+		    cs->vrr_enabled != dcp->desktop->vrr_requested &&
+		    lookup_mode(dcp, &cs->mode, &mode) && mode.vrr) {
+			dev_dbg(dcp->dev, "VRR_ENABLED %u: reselecting the mode\n",
+				cs->vrr_enabled);
+			dcp_mode_invalidate(&dcp->mode_state);
 			dcp_crtc_atomic_modeset(crtc, commit);
 		}
 	}
