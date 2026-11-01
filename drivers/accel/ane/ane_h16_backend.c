@@ -220,6 +220,36 @@ static int ane_h16_count_group(struct device *dev, void *data)
 	return 0;
 }
 
+static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, int prot,
+			      struct ane_fw_surface *out);
+
+/*
+ * The firmware span is config_span bytes from the TEXT DVA. The preload covers
+ * TEXT and DATA only; the firmware keeps runtime heap state in the rest, which
+ * the host supplies zeroed and device-writable before boot.
+ */
+static int ane_h16_map_heap_tail(struct ane_h16_device *h)
+{
+	struct ane_h16_boot *b = &h->boot;
+	u64 tail = b->soc->preload_dva[1] + b->soc->preload_size[1];
+	u64 end = b->soc->preload_dva[0] + b->build->config_span;
+	struct ane_fw_surface s;
+	int ret;
+
+	if (tail == end)
+		return 0;
+	if (tail > end || !IS_ALIGNED(tail, SZ_16K) || !IS_ALIGNED(end, SZ_16K) ||
+	    end > b->build->pool_dva)
+		return -ERANGE;
+	ret = ane_h16_alloc_prot(h, tail, end - tail,
+				 IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, &s);
+	if (ret)
+		return ret;
+	dev_info(h->dev, "H16 firmware heap tail mapped at %llx bytes %llx writable\n",
+		 tail, end - tail);
+	return 0;
+}
+
 static int ane_h16_map(void *ctx)
 {
 	struct ane_h16_device *h = ctx;
@@ -277,6 +307,9 @@ static int ane_h16_map(void *ctx)
 		dev_info(h->dev, "H16 preload %s mapped at %llx bytes %llx\n",
 			 i ? "DATA" : "TEXT", b->soc->preload_dva[i], b->soc->preload_size[i]);
 	}
+	ret = ane_h16_map_heap_tail(h);
+	if (ret)
+		return ret;
 	for (i = 0; i < 4; i++) {
 		u64 page = round_down(b->ranges[i][0], SZ_16K);
 
