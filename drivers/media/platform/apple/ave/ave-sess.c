@@ -9,6 +9,7 @@
  *
  * Copyright The Aurora Silicon Contributors
  */
+#include <linux/crc32.h>
 #include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/dma-mapping.h>
@@ -319,11 +320,33 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	return 0;
 }
 
-/* Return the pool if @sess holds it; its memory stays allocated and mapped. */
+/* CRC of every pool buffer, as the CPU sees it */
+static u32 ave_mctf_pool_crc(struct ave_dev *ave)
+{
+	const struct ave_buf *sets[] = { ave->mctf_pool, ave->mctf_pool_in, ave->mctf_pool_out };
+	const unsigned int counts[] = { AVE_MCTF_BUFS, AVE_MCTF_IN_BUFS, AVE_MCTF_OUT_BUFS };
+	u32 crc = ~0U;
+
+	for (unsigned int s = 0; s < ARRAY_SIZE(sets); s++)
+		for (unsigned int i = 0; i < counts[s]; i++)
+			if (sets[s][i].cpu)
+				crc = crc32_le(crc, sets[s][i].cpu, sets[s][i].alloc);
+	return crc;
+}
+
+/*
+ * Return the pool if @sess holds it; its memory stays allocated and mapped.
+ * Its CRC is kept: nothing may write the pool until the next borrow, so a
+ * change by then is a device write after teardown.
+ */
 static void ave_mctf_pool_return(struct ave_dev *ave, struct ave_session *sess)
 {
 	if (!sess->mctf_borrowed)
 		return;
+	if (test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
+		ave->mctf_pool_crc = ave_mctf_pool_crc(ave);
+		ave->mctf_pool_crc_valid = true;
+	}
 	memset(sess->mctf_buf, 0, sizeof(sess->mctf_buf));
 	memset(sess->mctf_in, 0, sizeof(sess->mctf_in));
 	memset(sess->mctf_out, 0, sizeof(sess->mctf_out));
@@ -440,11 +463,45 @@ int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
 	sess->unit = l->unit;
 	sess->arg1 = l->arg1;
 	sess->frame_arg0 = l->frame_arg0;
+	return 0;
+}
 
-	if (test_and_set_bit(AVE_MCTF_POOL_LENT, &ave->mctf_pool_flags))
-		return -EBUSY;	/* one MCTF session at a time */
+static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess);
+
+/*
+ * Lend the pool to @ctx's MCTF session. Called once the firmware runs, so
+ * a session quarantined with the pool was already given back by the reap
+ * that the restart's power-loss proof allows. Caller holds hw_lock.
+ */
+int ave_sess_mctf_borrow(struct ave_ctx *ctx)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+	const struct ave_mctf_layout *l = sess->mctf;
+	int ret;
+
+	lockdep_assert_held(&ave->hw_lock);
+	if (!l || sess->mctf_borrowed)
+		return 0;
+	if (test_and_set_bit(AVE_MCTF_POOL_LENT, &ave->mctf_pool_flags)) {
+		dev_err(ave->dev,
+			"MCTF memory is held by a stopped session until the coprocessor loses power\n");
+		return -EBUSY;
+	}
 	sess->mctf_borrowed = true;	/* from here ave_sess_free_bufs() returns it */
 	if (test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
+		if (ave->mctf_pool_crc_valid) {
+			u32 crc = ave_mctf_pool_crc(ave);
+
+			if (crc != ave->mctf_pool_crc)
+				dev_err(ave->dev,
+					"MCTF memory changed after its session ended (CRC %08x, was %08x): the device wrote it after teardown\n",
+					crc, ave->mctf_pool_crc);
+			else
+				dev_dbg(ave->dev, "MCTF memory unchanged since the last session (CRC %08x)\n",
+					crc);
+			ave->mctf_pool_crc_valid = false;
+		}
 		ave_mctf_pool_zero(ave->mctf_pool, AVE_MCTF_BUFS);
 		ave_mctf_pool_zero(ave->mctf_pool_in, AVE_MCTF_IN_BUFS);
 		ave_mctf_pool_zero(ave->mctf_pool_out, AVE_MCTF_OUT_BUFS);
@@ -459,6 +516,7 @@ int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
 	for (unsigned int i = 0; i < l->n_surfaces; i++)
 		sess->mctf_iova[i] = sess->mctf_buf[i].dma;
 	dev_dbg(ave->dev, "MCTF session on the device pool\n");
+	ave_sess_log_map(ave, sess);
 	return 0;
 }
 
@@ -656,10 +714,24 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 }
 
 /*
- * Keep every firmware-visible allocation mapped until a confirmed power cycle
- * when the firmware failed. An MCTF session's DMA memory is the device pool,
- * which is only handed back here, never freed.
+ * Nothing the firmware was given is freed or unmapped before the coprocessor
+ * is proved to have lost power. A session the firmware saw (Start sent) is
+ * quarantined with all its buffers and its pinned vb2 inputs, whether its
+ * Close was answered or not: a confirmed Close and a Halt (only a settle
+ * delay on 9003) do not prove the engines stopped, and on the Neo freeing
+ * after them corrupted memory. ave_sess_reap() frees it once the restart or
+ * recovery path has seen the reset witness. A session the firmware never
+ * saw is freed now, unless the DMA domain stopped being strict, when even
+ * that waits. An MCTF session's DMA memory is the device pool, which is
+ * only handed back, never freed.
  */
+static bool ave_sess_domain_unsafe(struct ave_dev *ave)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(ave->dev);
+
+	return domain && !ave_domain_type_safe(domain->type);
+}
+
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
@@ -668,8 +740,9 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 	if (!sess)
 		return;
 	mutex_lock(&ave->hw_lock);
-	if (sess->handed && (ave->fw_state == AVE_FW_BROKEN ||
-			     ave->fw_state == AVE_FW_RECOVERING)) {
+	if (sess->handed || ave_sess_domain_unsafe(ave)) {
+		if (!sess->handed)
+			dev_err(ave->dev, "DMA domain is no longer strict; keeping session memory\n");
 		kvfree(sess->mctf_surf);
 		sess->mctf_surf = NULL;
 		kvfree(sess->mctf_lin);
@@ -697,6 +770,10 @@ void ave_sess_reap(struct ave_dev *ave)
 	bool freed = false;
 
 	lockdep_assert_held(&ave->hw_lock);
+	if (ave->failed_sessions && ave_sess_domain_unsafe(ave)) {
+		dev_err(ave->dev, "DMA domain is no longer strict; keeping stopped sessions' memory\n");
+		return;
+	}
 	while ((sess = ave->failed_sessions)) {
 		ave->failed_sessions = sess->failed_next;
 		ave_sess_free_bufs(ave, sess);

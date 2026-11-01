@@ -244,6 +244,11 @@ struct ave_dev {
 	struct ave_buf mctf_pool_in[AVE_MCTF_IN_BUFS];
 	struct ave_buf mctf_pool_out[AVE_MCTF_OUT_BUFS];
 	unsigned long mctf_pool_flags;
+	/* CRC of the pool when it was last given back, checked at the next borrow */
+	u32 mctf_pool_crc;
+	bool mctf_pool_crc_valid;
+	/* The coprocessor was started at least once since probe. */
+	bool fw_ever_ran;
 	/* debugfs: the last filtered frame's input and output surfaces, raw */
 	void *mctf_surf_dump[2];
 	bool mctf_capture;
@@ -479,6 +484,7 @@ bool ave_sess_stalled(struct ave_session *sess);
 bool ave_sess_starved(struct ave_session *sess);
 int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess);
 void ave_mctf_pool_free(struct ave_dev *ave);
+int ave_sess_mctf_borrow(struct ave_ctx *ctx);
 
 /* ave-image.c */
 void ave_image_start(u8 *cmd, size_t len, const struct ave_fw_layout *fw,

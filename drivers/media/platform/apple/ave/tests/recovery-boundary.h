@@ -90,6 +90,11 @@ struct ave_dev {
 	struct ave_ring ring[2];
 	u64 ipc_fw_base;
 	unsigned long mctf_pool_flags;
+	struct ave_buf mctf_pool[AVE_MCTF_BUFS];
+	struct ave_buf mctf_pool_in[AVE_MCTF_IN_BUFS];
+	struct ave_buf mctf_pool_out[AVE_MCTF_OUT_BUFS];
+	u32 mctf_pool_crc;
+	bool mctf_pool_crc_valid;
 };
 
 static void *test_ctrl_addr;
@@ -173,6 +178,8 @@ static int ave_cmd_halt(struct ave_dev *ave)
 static int ave_cmd_close(struct ave_ctx *ctx)
 {
 	closes++;
+	if (!close_result)
+		ctx->sess->fw_open = false;
 	return close_result;
 }
 

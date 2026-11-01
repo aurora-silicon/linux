@@ -646,13 +646,30 @@ static void ave_session_close(struct ave_ctx *ctx, bool flush)
 	if (!sess || idx < 0)
 		return;
 	if (sess->fw_open && ave->fw_state == AVE_FW_RUNNING) {
+		int err = 0;
+
 		/* Complete is a barrier: answered after every frame before it. */
-		if (flush && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
-			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
-		if (ave->fw_state == AVE_FW_RUNNING)
-			ave_cmd_close(ctx);
+		if (flush && sess->frames) {
+			err = ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES);
+			if (!err)
+				err = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		}
+		if (ave->fw_state == AVE_FW_RUNNING) {
+			int cerr = ave_cmd_close(ctx);
+
+			err = err ?: cerr;
+		}
+		/*
+		 * A refused or unanswered Stop/Close/Complete, or frames still
+		 * out, leave the session live in the firmware: fail the
+		 * firmware so only a proven power cycle ends it.
+		 */
+		if ((err || sess->busy) && ave->fw_state == AVE_FW_RUNNING) {
+			dev_err(ave->dev, "session close not confirmed (%d, %u frames out)\n",
+				err, sess->busy);
+			ave_fw_mark_broken(ave, err ?: -EBUSY, "Close");
+		}
 	}
-	sess->fw_open = false;
 	ave->sessions[idx] = NULL;
 	if (!ave_session_count(ave))
 		ave_fw_halt(ave);
@@ -690,7 +707,9 @@ static int ave_session_attach(struct ave_ctx *ctx)
 	sess->frames = 0;
 	sess->nudged = false;
 	ave->sessions[idx] = ctx;
-	ret = ave_cmd_open(ctx);
+	ret = ctx->mctf ? ave_sess_mctf_borrow(ctx) : 0;
+	if (!ret)
+		ret = ave_cmd_open(ctx);
 	if (!ret)
 		ret = ctx->mctf ? ave_mctf_cmd_start(ctx) : ave_cmd_start(ctx);
 	if (ret)

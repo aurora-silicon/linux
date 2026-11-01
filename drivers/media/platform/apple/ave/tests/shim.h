@@ -37,6 +37,17 @@ static inline void *kcalloc(size_t n, size_t size, int flags)
 
 #define kfree(p) free(p)
 #define kvfree(p) free(p)
+static inline u32 crc32_le(u32 crc, const void *p, size_t len)
+{
+	const unsigned char *b = p;
+
+	while (len--) {
+		crc ^= *b++;
+		for (int k = 0; k < 8; k++)
+			crc = (crc >> 1) ^ (0xedb88320U & -(crc & 1));
+	}
+	return crc;
+}
 #define IOMMU_DOMAIN_DMA 3
 #define IOMMU_DOMAIN_DMA_FQ 7
 static inline void clear_bit(int nr, unsigned long *p) { *p &= ~(1UL << nr); }
@@ -49,7 +60,7 @@ static inline int test_and_set_bit(int nr, unsigned long *p)
 	set_bit(nr, p);
 	return old;
 }
-struct iommu_domain;
+struct iommu_domain { unsigned int type; };
 #define iommu_get_domain_for_dev(d) ((void)(d), (struct iommu_domain *)NULL)
 #define iommu_flush_iotlb_all(d) ((void)(d))
 static inline void sort(void *p, size_t n, size_t size,

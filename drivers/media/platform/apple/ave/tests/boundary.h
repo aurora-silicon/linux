@@ -9,6 +9,11 @@ struct ave_dev {
 	enum ave_fw_state fw_state;
 	void *dev;
 	unsigned long mctf_pool_flags;
+	struct ave_buf mctf_pool[AVE_MCTF_BUFS];
+	struct ave_buf mctf_pool_in[AVE_MCTF_IN_BUFS];
+	struct ave_buf mctf_pool_out[AVE_MCTF_OUT_BUFS];
+	u32 mctf_pool_crc;
+	bool mctf_pool_crc_valid;
 };
 
 struct ave_ctx {

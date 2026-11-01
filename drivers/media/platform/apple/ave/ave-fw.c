@@ -416,12 +416,18 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 	if (ave->fw_state != AVE_FW_HALTED)
 		return 0;
 
-	if (readl(ave->coproc + ave->variant->regs->ctrl)) {
+	/*
+	 * Boot left CTRL running and BOOT_ARG set; only a power loss clears
+	 * both. Until then stopped sessions' memory stays, and so does the
+	 * coprocessor: retry once it suspends.
+	 */
+	if (readl(ave->coproc + ave->variant->regs->ctrl) ||
+	    readl(ave->coproc + ave->variant->regs->boot_arg)) {
 		dev_dbg(ave->dev,
 			"coprocessor kept power after its halt; retry once it suspends\n");
 		return -EAGAIN;
 	}
-	/* The coprocessor is in reset: retired session memory can go. */
+	/* The coprocessor and its engines were reset: stopped sessions' memory can go. */
 	ave_sess_reap(ave);
 	status = readl(ave->mbox + AVE_MBOX_STATUS);
 	if (status)
@@ -480,6 +486,10 @@ static int ave_fw_boot(struct ave_dev *ave)
 	ret = ave_fw_restore_data(ave);
 	if (ret)
 		return ret;
+	/* Nothing from an earlier firmware lifetime may be read as ring state. */
+	memset(ave->ipc.cpu, 0, ave->ipc.alloc);
+	if (ave->heap.cpu)
+		memset(ave->heap.cpu, 0, ave->heap.alloc);
 
 	if (t->boot_config) {
 		cfg = ave->boot_cfg.cpu;
@@ -532,6 +542,7 @@ static int ave_fw_boot(struct ave_dev *ave)
 		ave->module_pinned = true;
 	}
 	ave->data_dirty = true;
+	ave->fw_ever_ran = true;
 	writel(1, ave->coproc + ave->variant->regs->keep_mappings);
 	writel(0, ave->coproc + ave->variant->regs->ctrl);
 	writel(ave->variant->boot_arg_value,

@@ -134,7 +134,8 @@ int ave_cmd_close(struct ave_ctx *ctx)
 	err = ave_cmd_scalar(ctx, AVE_OP_CLOSE, AVE_SESSION_ARG0, arg2);
 	if (!err)
 		err = ave_ipc_settle(ctx->ave, AVE_CMD_WAIT_MS);
-	if (legacy || !err)
+	/* Only a fully answered Stop and Close end the session in the firmware. */
+	if (!ret && !err)
 		ctx->sess->fw_open = false;
 	return ret ?: err;
 }
