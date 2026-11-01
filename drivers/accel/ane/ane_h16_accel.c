@@ -228,6 +228,7 @@ static const struct drm_ioctl_desc ane_h16_ioctls[] = {
 
 /* No GEM objects and no mmap: buffers travel by copy only. */
 static const struct file_operations ane_h16_fops = {
+	.fop_flags = FOP_UNSIGNED_OFFSET,
 	.owner = THIS_MODULE,
 	.open = accel_open,
 	.release = drm_release,
