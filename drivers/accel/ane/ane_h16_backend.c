@@ -742,11 +742,34 @@ static int ane_h16_job_emit(struct ane_h16_job *j, u32 op, int status, u64 ns,
 	return ane_h16_job_emit_counters(j, op, status, ns, data, length, NULL, 0);
 }
 
+/* Optional short-request spin before sleeping; default preserves polled mode.
+ * Bound CPU cost to 1 ms per wait even if a larger diagnostic value is supplied.
+ */
+static unsigned int h16_job_spin_us;
+module_param(h16_job_spin_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_spin_us, "Spin up to this many us before sleeping in job waits (max 1000, default 0)");
+
+static u64 ane_h16_job_spin_deadline(void)
+{
+	if (!h16_job_spin_us)
+		return 0;
+	return ktime_get_ns() + (u64)min_t(unsigned int, h16_job_spin_us, 1000) * NSEC_PER_USEC;
+}
+
+static void ane_h16_job_relax(u64 spin_deadline)
+{
+	if (spin_deadline && ktime_get_ns() < spin_deadline)
+		cpu_relax();
+	else
+		usleep_range(10, 20);
+}
+
 /* ane_fw_transport_wait with a 10-20 us poll, so job timings are not 1 ms steps. */
 static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 {
 	struct ane_fw_transport *t = &h->boot.transport;
 	u32 pending;
+	u64 spin_deadline = ane_h16_job_spin_deadline();
 	int ret;
 
 	for (;;) {
@@ -766,7 +789,7 @@ static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 		ret = ane_h16_faults(&h->boot, false);
 		if (ret)
 			return ane_fw_transport_fail(t, ret);
-		usleep_range(10, 20);
+		ane_h16_job_relax(spin_deadline);
 	}
 }
 
@@ -839,6 +862,7 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 	struct ane_fw_transport *t = &h->boot.transport;
 	u64 deadline = ktime_get_ns() + (u64)timeout_ms * NSEC_PER_MSEC;
 	u8 report[0x80];
+	u64 spin_deadline = ane_h16_job_spin_deadline();
 	int ret = -ETIMEDOUT;
 	unsigned int i;
 
@@ -892,7 +916,7 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		if (ret)
 			return ret;
 		ret = -ETIMEDOUT;
-		usleep_range(10, 20);
+		ane_h16_job_relax(spin_deadline);
 	}
 	return ret;
 }
