@@ -3,12 +3,16 @@
  * The 14.x IOMFB board records: which record a DCP gets on which machine,
  * and which DCP firmware image a record admits. The J516C (T6031) record
  * admits only the T6030 image, whose IOMFB layouts were validated, and
- * refuses every other; the existing records are unchanged.
+ * refuses every other; the existing records are unchanged. Which DCPs stamp
+ * their swaps: the internal panel of a T6031 record; the T6030 and T8122
+ * panels and external processors keep zero timestamps, byte for byte.
  */
 #include <kunit/test.h>
 #include <linux/string.h>
+#include <linux/unaligned.h>
 
 #include "iomfb_v14_7_board.h"
+#include "iomfb_v14_7_swap.h"
 
 #define T6030_DCP_IMAGE	"DDF38191-93B3-324A-BC8F-643006F5AC82"
 #define J613_DCP_IMAGE	"90F849E1-B422-367E-B389-50246F8DEC47"
@@ -174,12 +178,83 @@ static void v14_board_unchanged(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, known);
 }
 
+/* Only the internal panel of the J516C record stamps its swaps. */
+static void v14_board_swap_timestamps(struct kunit *test)
+{
+	const struct dcp_v14_board *j516c_b, *j514c_b, *t6030_b, *j613_b;
+	bool known;
+
+	j516c_b = board_for("apple,t6031-dcp", j516c, &known);
+	j514c_b = board_for("apple,t6031-dcp", j514c, &known);
+	t6030_b = board_for("apple,t6030-dcp", j516s, &known);
+	j613_b = board_for("apple,t8122-dcp", j613, &known);
+	KUNIT_ASSERT_TRUE(test, j516c_b && j514c_b && t6030_b && j613_b);
+
+	KUNIT_EXPECT_TRUE(test, j516c_b->swap_timestamps);
+	KUNIT_EXPECT_FALSE(test, j514c_b->swap_timestamps);
+	KUNIT_EXPECT_FALSE(test, t6030_b->swap_timestamps);
+	KUNIT_EXPECT_FALSE(test, j613_b->swap_timestamps);
+
+	KUNIT_EXPECT_TRUE(test, dcp_v14_board_stamps_swaps(j516c_b, false));
+	/* The J514C, the external role, the T6030 (J514S, J516S) and T8122 panels, no record. */
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j514c_b, false));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j516c_b, true));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(t6030_b, false));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j613_b, false));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(NULL, false));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(NULL, true));
+}
+
+/*
+ * A stamped swap holds 120 in timestamp slots 0, 1 and 6 and is otherwise the
+ * encoded record, with or without a surface; an unstamped one keeps every
+ * slot zero.
+ */
+static void v14_swap_timestamps_encoding(struct kunit *test)
+{
+	const size_t end = DCP_V14_SWAP_TIMESTAMP(DCP_V14_SWAP_TIMESTAMPS);
+	u8 surface[DCP_V14_SURFACE_SIZE];
+	unsigned int i, pass;
+	u8 *plain, *stamped;
+
+	plain = kunit_kzalloc(test, DCP_V14_SWAP_SIZE, GFP_KERNEL);
+	stamped = kunit_kzalloc(test, DCP_V14_SWAP_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_TRUE(test, plain && stamped);
+	dcp_v14_encode_surface(surface, 3456 * 4, 3456, 2160, true);
+
+	for (pass = 0; pass < 2; pass++) {
+		const u8 *s = pass ? surface : NULL;
+
+		dcp_v14_encode_swap(plain, 0x2a, 0xff000000, s, 0x10000, pass ? 3456 : 0,
+				    pass ? 2160 : 0, 74, 0);
+		dcp_v14_encode_swap(stamped, 0x2a, 0xff000000, s, 0x10000, pass ? 3456 : 0,
+				    pass ? 2160 : 0, 74, 0);
+		dcp_v14_swap_timestamps(stamped);
+
+		for (i = 0; i < DCP_V14_SWAP_TIMESTAMPS; i++) {
+			size_t at = DCP_V14_SWAP_TIMESTAMP(i);
+			u64 want = i == 0 || i == 1 || i == 6 ? 120 : 0;
+
+			KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le64(plain + at), 0,
+					    "surface %u: unstamped slot %u", pass, i);
+			KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le64(stamped + at), want,
+					    "surface %u: slot %u", pass, i);
+		}
+		/* The rest of the record, from the word after slot 6, is unchanged. */
+		KUNIT_EXPECT_EQ(test,
+				memcmp(plain + end, stamped + end, DCP_V14_SWAP_SIZE - end), 0);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(stamped + DCP_V14_SWAP_ID), 0x2a);
+	}
+}
+
 static struct kunit_case v14_board_cases[] = {
 	KUNIT_CASE(v14_board_j516c),
 	KUNIT_CASE(v14_board_j514c),
 	KUNIT_CASE(v14_board_t6031_other_boards),
 	KUNIT_CASE(v14_board_j516c_image),
 	KUNIT_CASE(v14_board_unchanged),
+	KUNIT_CASE(v14_board_swap_timestamps),
+	KUNIT_CASE(v14_swap_timestamps_encoding),
 	{}
 };
 

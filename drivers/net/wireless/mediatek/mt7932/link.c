@@ -28,13 +28,33 @@ static bool mt_channel_event(struct mt7932 *m, const u8 *body, size_t length)
 		NL80211_CHAN_WIDTH_40 : NL80211_CHAN_WIDTH_20;
 	def.center_freq1 = ieee80211_channel_to_frequency(center, m->connect_band);
 	if (!def.chan || !cfg80211_chandef_valid(&def) ||
-	    !cfg80211_chandef_usable(m->wiphy, &def, IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_RADAR))
+	    !cfg80211_chandef_usable(m->wiphy, &def, IEEE80211_CHAN_DISABLED))
 		return false;
 	if (m->connect_center && (m->connect_center != center || m->connect_chandef.width != def.width))
 		return false;
 	m->connect_center = center;
 	m->connect_chandef = def;
 	return true;
+}
+
+/* iwd keeps its reassociation mark for the life of a connection made by one,
+ * and meanwhile drops any disconnect that isn't from the AP. Nothing else would
+ * tell it the connection has gone, so report these as from the AP. iwd ignores
+ * the report of a disconnect it asked for either way.
+ *
+ * This works around iwd, not cfg80211. As of iwd 3.12, netdev_reassociate()
+ * sets in_reassoc and only netdev_associate_event() clears it, on
+ * NL80211_CMD_ASSOCIATE, which cfg80211 never sends for a driver that reports
+ * through cfg80211_connect_done(). Every nl80211 listener sees the changed
+ * flag, and wpa_supplicant treats a disconnect from the AP differently from a
+ * local one. Drop roam_landed once iwd clears in_reassoc on a successful
+ * connect event.
+ */
+void mt_report_disconnected(struct mt7932 *m, u16 reason, bool local, gfp_t gfp)
+{
+	cfg80211_disconnected(m->netdev, reason, NULL, 0,
+			      mt7932_disconnect_local(local, READ_ONCE(m->roam_landed)),
+			      gfp);
 }
 
 void mt_rf_fail_locked(struct mt7932 *m, int error)
@@ -77,15 +97,17 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	} else if (m->connected) {
 		/* Hardware ownership is uncertain: report failure, retain the peer.
 		 * A connect worker still publishing the connection reports this
-		 * after it, so that cfg80211 sees the two in order.
+		 * after it, so that cfg80211 sees the two in order. A move that
+		 * mt_connect() has just started leaves it to that: its admission
+		 * check sees link_failed and reports the end of the connection,
+		 * after joining any such worker.
 		 */
 		m->connected = false;
 		m->disconnecting = true;
-		if (m->connect_publishing)
+		if (m->connect_publishing && !m->roam_moving)
 			m->connect_lost = true;
-		else
-			cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
-					      NULL, 0, true, GFP_ATOMIC);
+		else if (!m->roam_moving)
+			mt_report_disconnected(m, WLAN_REASON_UNSPECIFIED, true, GFP_ATOMIC);
 	}
 	if (m->scan_request) {
 		m->scan_aborted = true;
@@ -322,7 +344,11 @@ static int mt_retire_connection(struct mt7932 *m)
 
 	if (READ_ONCE(m->stopping))
 		return -ESHUTDOWN;
-	netif_carrier_off(m->netdev);
+	/* A move keeps the carrier, or NetworkManager would restart DHCP and the
+	 * address could change under open connections. Its failure drops it.
+	 */
+	if (!READ_ONCE(m->roam_moving))
+		netif_carrier_off(m->netdev);
 	netif_tx_disable(m->netdev);
 	/* ndo_start_xmit rechecks the closed admission gate under data_lock.
 	 * The queue may have stopped in the middle of a burst; hand the device
@@ -455,8 +481,14 @@ static int mt_connect_prepare(struct mt7932 *m, bool *peer_owned)
 		if (ret)
 			return ret;
 	}
-	if (m->connect_bss->channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR |
-					    IEEE80211_CHAN_NO_20MHZ | IEEE80211_CHAN_RADAR)) {
+	/* A station joins an AP it has heard on a radar or no-IR channel: the AP
+	 * owns radar detection. Leaving on its switch announcement is in RX.
+	 * 6 GHz keeps its no-IR rule, which its power class depends on.
+	 */
+	if ((m->connect_bss->channel->flags & (IEEE80211_CHAN_DISABLED |
+					       IEEE80211_CHAN_NO_20MHZ)) ||
+	    (m->connect_bss->channel->band == NL80211_BAND_6GHZ &&
+	     (m->connect_bss->channel->flags & IEEE80211_CHAN_NO_IR))) {
 		return -EINVAL;
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
@@ -678,9 +710,10 @@ void mt_connect_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, connect_work);
 	struct cfg80211_connect_resp_params response = {};
+	struct mt7932_connect_report outcome;
 	unsigned long flags;
 	bool submitted = false, peer_owned = false, cancelled, retry = false;
-	bool retirement_attempted = false, auth_submitted = false;
+	bool retirement_attempted = false, auth_submitted = false, roam;
 	u16 reason;
 	int ret;
 
@@ -753,10 +786,15 @@ report:
 	}
 	/* Serialize the final outcome with cancellation. In particular, a late
 	 * firmware success must not publish carrier/authorization after .deauth.
-	 * The cfg80211 calls may take bottom-half locks, so they are made after
-	 * response_lock is dropped. command_mutex keeps the disconnect worker,
-	 * which retires the connection before reporting its end, behind them;
-	 * an RF failure in the meantime leaves its report to this worker.
+	 * The connect result, the port authorization and the disconnect that
+	 * follows a failed or cancelled move are reported after response_lock is
+	 * dropped, since cfg80211_connect_done() may sleep. Only the connect_lost
+	 * report below calls cfg80211_disconnected() under the lock, with
+	 * GFP_ATOMIC, as the RF failure path, the disconnect worker and a move
+	 * that mt_connect() refuses do; that call only queues an event.
+	 * command_mutex keeps the disconnect worker, which retires the
+	 * connection before reporting its end, behind them; an RF failure in
+	 * the meantime leaves its report to this worker.
 	 */
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!ret && (m->connect_error || !mt_rf_allowed(m))) {
@@ -796,8 +834,16 @@ report:
 	}
 	m->connected = !ret;
 	m->disconnecting = false;
+	roam = m->roam_moving;
 	cancelled = m->connect_cancelled;
 	reason = m->disconnect_reason;
+	outcome = mt7932_connect_report(roam, cancelled, ret, reason);
+	WRITE_ONCE(m->roam_moving, false);
+	WRITE_ONCE(m->roam_landed, outcome.landed);
+	if (roam && ret) {
+		netif_carrier_off(m->netdev);
+		mt_reg_apply_deferred_locked(m);
+	}
 	m->connect_publishing = true;
 	if (!ret) {
 		schedule_work(&m->power_work);
@@ -808,13 +854,12 @@ report:
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 
-	if (cancelled) {
-		if (response.links[0].bss)
-			cfg80211_put_bss(m->wiphy, response.links[0].bss);
-		cfg80211_disconnected(m->netdev, reason, NULL, 0, true, GFP_KERNEL);
-	} else {
+	if (outcome.result)
 		cfg80211_connect_done(m->netdev, &response, GFP_KERNEL);
-	}
+	else if (response.links[0].bss)
+		cfg80211_put_bss(m->wiphy, response.links[0].bss);
+	if (outcome.disconnect)
+		mt_report_disconnected(m, outcome.reason, true, GFP_KERNEL);
 	if (!ret && !m->connect_open)
 		cfg80211_port_authorized(m->netdev, m->connect_bssid, NULL, 0, GFP_KERNEL);
 
@@ -822,8 +867,7 @@ report:
 	m->connect_publishing = false;
 	if (m->connect_lost) {
 		m->connect_lost = false;
-		cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
-				      NULL, 0, true, GFP_ATOMIC);
+		mt_report_disconnected(m, WLAN_REASON_UNSPECIFIED, true, GFP_ATOMIC);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	if (!ret && m->connect_open)
@@ -871,29 +915,63 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 {
 	struct mt7932 *m = mt_from_wiphy(wiphy);
 	unsigned long flags;
-	bool open = mt_open_request(params);
+	bool open = mt_open_request(params), roam;
 	int auth, ret = 0;
 
 	if (netdev == m->netdev)
 		mt_retry_missing_policy(m);
-	if (!mt_rf_allowed(m) || !m->bss_active || netdev != m->netdev)
+	if (!mt_rf_allowed(m) || !m->bss_active || netdev != m->netdev) {
+		if (netdev == m->netdev && params->prev_bssid)
+			mt_disconnect(wiphy, netdev, WLAN_REASON_DEAUTH_LEAVING);
 		return -EAGAIN;
+	}
 	dev_dbg(&m->pdev->dev,
 		"CONNECT_REQUEST: WPA=%u pairwise-count=%d group=%08x AKM-count=%d PMK-present=%u MFP=%u IE-bytes=%zu\n",
 		params->crypto.wpa_versions, params->crypto.n_ciphers_pairwise,
 		params->crypto.cipher_group, params->crypto.n_akm_suites,
 		!!params->crypto.psk, params->mfp, params->ie_len);
-	if (!params->ssid_len || params->ssid_len > 32)
-		return -EINVAL;
 	auth = open ? 0 : mt7932_connect_auth(params);
-	if (auth < 0)
-		return auth;
-	if (params->bssid && !is_valid_ether_addr(params->bssid))
-		return -EINVAL;
+	if (!params->ssid_len || params->ssid_len > 32 ||
+	    (params->bssid && !is_valid_ether_addr(params->bssid)))
+		ret = -EINVAL;
+	else if (auth < 0)
+		ret = auth;
+	/* The driver can't reassociate. Honour iwd's roam by leaving the current
+	 * AP and joining the requested one: the worker reports the end of this
+	 * move through the connect result, so cfg80211 and iwd see one roam. A
+	 * roam we can't start still ends the connection, or cfg80211 and iwd
+	 * would disagree about it.
+	 */
+	spin_lock_irqsave(&m->response_lock, flags);
+	roam = params->prev_bssid && m->connected;
+	if (roam && !ret)
+		WRITE_ONCE(m->roam_moving, true);
+	/* The link went first and cfg80211 hasn't processed its end: joining now
+	 * would be overtaken by that report, and iwd would miss the connection.
+	 */
+	if (params->prev_bssid && !m->connected && !ret)
+		ret = -EBUSY;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	/* Leaving the old AP waits for a scan in progress to finish
+	 * (mt_scan_quiesce(), about 7 s at most). A scan that is still running
+	 * after that makes the admission check below refuse the join, so the
+	 * move ends as a disconnect and iwd connects again.
+	 */
+	if (roam) {
+		dev_info(&m->pdev->dev, "ROAM_MOVE: %d; from %pM to %pM\n", ret,
+			 params->prev_bssid, params->bssid ?: params->bssid_hint);
+		mt_disconnect(wiphy, netdev, WLAN_REASON_DEAUTH_LEAVING);
+	}
+	if (ret)
+		return ret;
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!mt_rf_allowed(m) || m->link_failed || m->connecting || m->connected || m->disconnecting || m->scan_request || m->retired_scan_seq) {
 		ret = m->link_failed ? -EIO : -EBUSY;
+		dev_info_ratelimited(&m->pdev->dev,
+				     "CONNECT_REFUSED: %d; rf=%u connecting=%u connected=%u disconnecting=%u scan=%u retired=%u\n",
+				     ret, mt_rf_allowed(m), m->connecting, m->connected, m->disconnecting,
+				     !!m->scan_request, !!m->retired_scan_seq);
 		goto unlock;
 	}
 	reinit_completion(&m->assoc_start);
@@ -944,6 +1022,18 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->peer_valid = false;
 	m->connecting = true;
 unlock:
+	if (ret && roam) {
+		/* mt_disconnect() does nothing once the host is stopping, so the
+		 * old connection may still be marked here. Clear it, or
+		 * mt_stop_host() would report its end a second time.
+		 */
+		m->connected = false;
+		WRITE_ONCE(m->roam_moving, false);
+		netif_carrier_off(m->netdev);
+		cfg80211_disconnected(m->netdev, WLAN_REASON_DEAUTH_LEAVING, NULL, 0, true,
+				      GFP_ATOMIC);
+		mt_reg_apply_deferred_locked(m);
+	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	if (!ret) {
 		m->connect_bss = mt_connect_find_bss(m);
@@ -971,8 +1061,15 @@ void mt_disconnect_work(struct work_struct *work)
 	 */
 	spin_lock_irqsave(&m->response_lock, flags);
 	m->disconnecting = false;
-	cfg80211_disconnected(m->netdev, reason, NULL, 0, local, GFP_ATOMIC);
-	mt_reg_apply_deferred_locked(m);
+	/* A roam reports its end through the connect that follows. A deferred
+	 * regulatory pass would close RF admission under it, so the connect
+	 * worker applies that once the move has failed, and a move that lands
+	 * keeps it for the end of the new connection.
+	 */
+	if (!m->roam_moving) {
+		mt_report_disconnected(m, reason, local, GFP_ATOMIC);
+		mt_reg_apply_deferred_locked(m);
+	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	dev_dbg(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
 }
@@ -1005,7 +1102,8 @@ int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
 		m->disconnect_event_received = false;
 		m->disconnect_local = true;
 		m->disconnect_reason = reason;
-		netif_carrier_off(m->netdev);
+		if (!m->roam_moving)
+			netif_carrier_off(m->netdev);
 		netif_stop_queue(m->netdev);
 		reinit_completion(&m->disconnect_done);
 		schedule_work(&m->disconnect_work);
