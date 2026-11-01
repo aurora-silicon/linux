@@ -3237,9 +3237,19 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		return -ENOMEM;
 	cookie = &modeset->wait;
 	modeset->actual = dcp->mode;
-	/* After an adaptive swap timed out (dcp_swap_watchdog), stay fixed. */
-	modeset->vrr = mode->vrr && crtc_state->vrr_enabled &&
+	/*
+	 * A VRR timing goes in with adaptive sync on whatever VRR_ENABLED
+	 * says, at the mode's minimum rate.  Changing adaptive sync through a
+	 * mode set tears the link down (the panel goes dark for about 200 ms),
+	 * so VRR_ENABLED only moves the minimum rate on the live mode, see
+	 * dcp_vrr_update().  Only the panel takes a new minimum on a live mode;
+	 * an external processor keeps installing what VRR_ENABLED asks.  After
+	 * an adaptive swap timed out (dcp_swap_watchdog), stay fixed.
+	 */
+	modeset->vrr = mode->vrr &&
+		       (dcp_vrr_live(dcp) || crtc_state->vrr_enabled) &&
 		       !READ_ONCE(dcp->desktop->vrr_failed);
+	dcp->desktop->vrr_min_on = 0;
 
 	cookie->status = ~0U;
 	init_completion(&cookie->done);
@@ -3316,6 +3326,18 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 	WRITE_ONCE(dcp->desktop->modeset_active, false);
 	dcp->vrr_enabled = !ret && modeset->vrr;
+	if (dcp->vrr_enabled && dcp_vrr_live(dcp)) {
+		/*
+		 * Fixed refresh holds the minimum at the timing's own rate,
+		 * never above the sink's maximum (a 280.001 Hz timing reports
+		 * a maximum just over 280 Hz).
+		 */
+		dcp->desktop->vrr_min_on = mode->min_vrr;
+		dcp->desktop->vrr_min_off = drm_mode_vrefresh(&crtc_state->mode) << 16;
+		if (mode->max_vrr && mode->max_vrr < dcp->desktop->vrr_min_off)
+			dcp->desktop->vrr_min_off = mode->max_vrr;
+		dcp->desktop->vrr_min_sent = mode->min_vrr;
+	}
 	kref_put(&cookie->refcount, release_wait_cookie);
 
 	dcp->desktop->mode_live = !ret;
@@ -3474,6 +3496,45 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
 
 	return 0;
+}
+#endif
+
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+/*
+ * VRR_ENABLED on a live VRR timing.  The firmware takes a new minimum rate
+ * (IOMFBParameter 14) without a mode set: the mode's own minimum lets the
+ * display follow the frames, the nominal rate holds it fixed.  Sent ahead
+ * of the frame's colour updates and swap, which @next continues with.
+ * Returns true when it took over the frame.
+ */
+static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state,
+			   dcp_callback_t next)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct dcp_set_parameter_dcp param = {
+		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.count = 3,
+	};
+	u32 min;
+
+	if (!dcp->vrr_enabled || !d->vrr_min_on)
+		return false;
+	min = crtc_state->vrr_enabled ? d->vrr_min_on : d->vrr_min_off;
+	if (min == d->vrr_min_sent)
+		return false;
+	d->vrr_min_sent = min;
+	/* minRR (16.16 Hz), then mediaTargetRate and the fractional rate */
+	param.value[0] = min;
+	dev_dbg(dcp->dev, "adaptive sync minimum %#x (VRR_ENABLED %u)\n", min,
+		crtc_state->vrr_enabled);
+	dcp_set_parameter_dcp(dcp, false, &param, next, NULL);
+	return true;
+}
+
+/* After an adaptive sync update: the frame's colour matrix, gamma and swap. */
+static void dcp_matrix_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	iomfb_set_matrix(dcp, false, &dcp->desktop->matrix, dcp_gamma_then_swap, NULL);
 }
 #endif
 
@@ -3673,12 +3734,20 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
 #elif DCP_FW_DESKTOP_26(DCP_FW_VER)
 		dcp->desktop->gamma_pending = dcp_gamma_update(dcp, crtc_state);
+		dcp->desktop->matrix = mat;
+		if (dcp_vrr_update(dcp, crtc_state, dcp_matrix_then_swap))
+			return;
 		iomfb_set_matrix(dcp, false, &mat, dcp_gamma_then_swap, NULL);
 #else
 		iomfb_set_matrix(dcp, false, &mat, do_swap, NULL);
 #endif
-	} else
+	} else {
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+		if (dcp_vrr_update(dcp, crtc_state, do_swap))
+			return;
+#endif
 		do_swap(dcp, NULL, NULL);
+	}
 }
 
 static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)

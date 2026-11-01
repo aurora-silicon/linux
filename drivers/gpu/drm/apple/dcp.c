@@ -1509,8 +1509,14 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	    crtc_state->vrr_enabled)
 		return -EINVAL;
 
-	/* The desktop 26.6 firmware applies adaptive sync with a mode set. */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && crtc_state->enable) {
+	/*
+	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
+	 * frame, without a mode set (see dcp_vrr_update()).  The external
+	 * processors ignore a new minimum rate on a live mode, so they still
+	 * change adaptive sync with a mode set.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && crtc_state->enable &&
+	    !dcp_vrr_live(dcp)) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 
@@ -3242,13 +3248,21 @@ bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 	       dcp->fw_compat == DCP_FIRMWARE_V_26_6;
 }
 
-/* GAMMA_LUT entries, 0 where the driver cannot program the gamma table */
+/*
+ * GAMMA_LUT entries, 0 where the driver cannot program the gamma table.
+ *
+ * Desktop 26.x composes the LUT through the firmware's own table (see
+ * dcp_gamma_set()), but no desktop 26.x DCP hands out a usable one: the
+ * J616s panel's A420 table does not rise monotonically and the external
+ * processors return none (status 2).  Offering GAMMA_LUT there meant
+ * accepting a LUT and dropping it, so compositors that move work into it
+ * got wrong output: KWin's HDR encoding curve went missing (PQ content
+ * washed out) and night light did nothing.  Without the property KWin
+ * applies its curves while rendering and mutter uses CTM for night light.
+ */
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev)
 {
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ?
-	       IOMFB_GAMMA_ENTRIES : 0;
+	return 0;
 }
 
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)

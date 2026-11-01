@@ -2175,7 +2175,8 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 
 	if (d->trial_modeset_ok) {
 		d->trial_modeset_ok = false;
-		if (!crtc_state->vrr_enabled && d->mode_live &&
+		/* The trial installed a VRR timing variable too (see the mode set). */
+		if (d->mode_live &&
 		    lookup_mode(dcp, &crtc_state->mode, &matched) &&
 		    matched.timing_mode_id == d->trial_timing_mode_id &&
 		    matched.color_mode_id == d->trial_color_mode_id) {

@@ -2409,6 +2409,21 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
  * each port controller wired to a route waits for the processor that registers
  * the route: a supplier link from the controller to that processor makes it
  * probe once, when it can take every mux it is wired to.
+ *
+ * The device link that fw_devlink makes of it is a managed one, and has to
+ * be. A port controller holds one mux handle for all of its muxes, and once
+ * one of them is unregistered every later transaction on that handle fails
+ * with -ENODEV, the USB and safe states included. So a processor that is
+ * unbound takes its port controllers with it, and they probe again when it
+ * is bound again, instead of staying bound to ports they cannot switch.
+ *
+ * The deferred probe timeout cannot reorder this. Until the processor has a
+ * device the wait is a fwnode link, which the timeout leaves alone. The
+ * device is created with its node enabled, so a controller that the timeout
+ * lets go before the processor binds finds the routes not yet registered and
+ * defers in the Type-C core, which never gives up on a mux. A processor that
+ * gives up on its routes disables them (dcp_typec_routes_disable()), and its
+ * controllers then probe without them.
  */
 static struct fwnode_handle *staged_port_ctrls[ARRAY_SIZE(t6041_usbc_nodes)];
 static unsigned int staged_nr_port_ctrls;
