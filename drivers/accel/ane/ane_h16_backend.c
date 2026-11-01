@@ -1016,6 +1016,9 @@ MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial E
 static unsigned int h16_job_gap_at;
 module_param(h16_job_gap_at, uint, 0444);
 MODULE_PARM_DESC(h16_job_gap_at, "Apply recovery gap only at this warmed serial EXEC ordinal1..128,0=every eligible call");
+static unsigned int h16_job_drain_us;
+module_param(h16_job_drain_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_drain_us, "Private initial drain1..2000us before warmed ordinal1, followed by every-call hold1..100us; default0");
 static unsigned int h16_job_gap_every;
 module_param(h16_job_gap_every, uint, 0444);
 MODULE_PARM_DESC(h16_job_gap_every, "Periodic recovery gap every1..128 warmed serial EXECs, default0; excludes gap_at/pending/quiet probes");
@@ -1452,7 +1455,8 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 		if (ane_job_gap_selected(j->gap_warm_serial, h16_job_gap_at, h16_job_gap_every)) {
 			u8 gap[16];
 			u64 gap_counters[2], began;
-			u32 us = min(h16_job_gap_us, 2000U);
+			u32 us = ane_job_gap_duration(j->gap_warm_serial,
+						      h16_job_gap_us, h16_job_drain_us);
 
 			put_unaligned_le64(get_unaligned_le64(command + 0x20), gap);
 			put_unaligned_le32(us, gap + 8);
@@ -2133,6 +2137,15 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	     h16_job_gap_us || h16_job_early_drain || h16_job_pending_mode ||
 	     h16_job_ack_pending_mode))) {
 		dev_err(&pdev->dev, "H16 IRQ coalescing requires IRQ and excludes gap/quiet/early/pending probes\n");
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (!ane_job_drain_valid(h16_job_drain_us, h16_job_gap_us,
+				h16_job_gap_at, h16_job_gap_every) ||
+	    (h16_job_drain_us && (!h16_job_irq || h16_job_early_drain ||
+	     h16_job_pending_mode || h16_job_ack_pending_mode || h16_job_quiet_us ||
+	     h16_job_irq_coalesce_us))) {
+		dev_err(&pdev->dev, "H16 drain requires IRQ/every-call hold and excludes other probes\n");
 		ret = -EINVAL;
 		goto unlock;
 	}

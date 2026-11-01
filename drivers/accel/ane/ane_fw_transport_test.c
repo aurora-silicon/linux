@@ -1485,7 +1485,29 @@ static void ane_irq_coalesce_bounds_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, U64_MAX, &r), -EOVERFLOW);
 }
 
+static void ane_job_drain_schedule_test(struct kunit *test)
+{
+	u32 i;
+
+	KUNIT_EXPECT_TRUE(test, ane_job_drain_valid(0, 0, 0, 0));
+	KUNIT_EXPECT_TRUE(test, ane_job_drain_valid(2000, 20, 0, 1));
+	KUNIT_EXPECT_FALSE(test, ane_job_drain_valid(2001, 20, 0, 1));
+	KUNIT_EXPECT_FALSE(test, ane_job_drain_valid(2000, 0, 0, 1));
+	KUNIT_EXPECT_FALSE(test, ane_job_drain_valid(2000, 101, 0, 1));
+	KUNIT_EXPECT_FALSE(test, ane_job_drain_valid(2000, 20, 1, 1));
+	KUNIT_EXPECT_FALSE(test, ane_job_drain_valid(2000, 20, 0, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_drain_valid(2000, 20, 0, 6));
+	for (i = 1; i <= 1001; i++) {
+		KUNIT_EXPECT_TRUE(test, ane_job_gap_selected(i, 0, 1));
+		KUNIT_EXPECT_EQ(test, ane_job_gap_duration(i, 20, 2000),
+				i == 1 ? 2000U : 20U);
+		KUNIT_EXPECT_EQ(test, ane_job_gap_duration(i, 20, 0), 20U);
+	}
+	KUNIT_EXPECT_EQ(test, ane_job_gap_duration(2, 3000, 0), 2000U);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_job_drain_schedule_test),
 	KUNIT_CASE(ane_irq_coalesce_deadline_test),
 	KUNIT_CASE(ane_irq_coalesce_error_and_overshoot_test),
 	KUNIT_CASE(ane_irq_coalesce_bounds_test),

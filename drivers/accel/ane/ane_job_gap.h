@@ -20,4 +20,14 @@ static inline bool ane_job_gap_selected(u32 ordinal, u32 at, u32 every)
 		return !(ordinal % every);
 	return !at || ordinal == (at > 128 ? 128 : at);
 }
+/* Private drain-and-hold discriminator: only every-call busy hold is allowed. */
+static inline bool ane_job_drain_valid(u32 drain, u32 hold, u32 at, u32 every)
+{
+	return !drain || (drain <= 2000 && hold && hold <= 100 && !at && every == 1);
+}
+
+static inline u32 ane_job_gap_duration(u32 ordinal, u32 hold, u32 drain)
+{
+	return ordinal == 1 && drain ? drain : (hold > 2000 ? 2000 : hold);
+}
 #endif
