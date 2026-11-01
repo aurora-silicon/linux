@@ -15,3 +15,18 @@
 	compatible = "apple,j614s", "apple,t6040", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M4 Pro, Nov 2024)";
 };
+
+/* J616s speaker hardware and its DMA streams are not qualified on J614s. */
+&aop_audio {
+	dmas = <&admac0 1>, <&admac1 4>, <&admac1 5>;
+	dma-names = "dma", "cout", "cin";
+};
+
+/delete-node/ &sound;
+/delete-node/ &speaker_sdz;
+/delete-node/ &speaker_left_woof1;
+/delete-node/ &speaker_left_woof2;
+/delete-node/ &speaker_left_tweet;
+/delete-node/ &speaker_right_woof1;
+/delete-node/ &speaker_right_woof2;
+/delete-node/ &speaker_right_tweet;
