@@ -53,8 +53,10 @@ static int psp_rap_terminate(struct psp_context *psp);
 static int psp_securedisplay_terminate(struct psp_context *psp);
 
 /*
- * The PSP command, fence and ring buffers and the TA shared buffers are read and written through plain CPU pointers. Behind a
- * non-posted BAR a VRAM placement turns those into Device-nGnRnE accesses that fault on plain stores, so place them in GTT.
+ * The PSP command, fence and ring buffers and the TA shared buffers are read
+ * and written through plain CPU pointers. Behind a non-posted BAR a VRAM
+ * placement turns those into Device-nGnRnE accesses that fault on plain
+ * stores, so place them in GTT.
  */
 static u32 psp_cpu_buf_domain(struct amdgpu_device *adev)
 {

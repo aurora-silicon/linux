@@ -1370,8 +1370,10 @@ vm_fault_t amdgpu_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
 	abo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
 
 	/*
-	 * Behind a non-posted BAR the CPU reaches VRAM as Device-nGnRnE memory, where memcpy() and unaligned stores in userspace take an
-	 * alignment fault. A BO the CPU faults on moves to GTT and stays there; a pinned BO cannot move.
+	 * Behind a non-posted BAR the CPU reaches VRAM as Device-nGnRnE memory,
+	 * where memcpy() and unaligned stores in userspace take an alignment
+	 * fault. A BO the CPU faults on moves to GTT and stays there; a pinned
+	 * BO cannot move.
 	 */
 	if (pci_resource_flags(adev->pdev, 0) & IORESOURCE_MEM_NONPOSTED) {
 		if (bo->resource->mem_type != TTM_PL_VRAM)
