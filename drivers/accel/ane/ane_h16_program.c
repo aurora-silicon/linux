@@ -3,6 +3,7 @@
 #include <linux/ctype.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 
 #include "ane_h16_program.h"
@@ -1165,6 +1166,47 @@ void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats 
 	spin_unlock(&s->stats_lock);
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_stats);
+
+static void h16_us(struct seq_file *m, u64 ns)
+{
+	seq_printf(m, " %9llu.%u", div_u64(ns, 1000), (unsigned int)(div_u64(ns, 100) % 10));
+}
+
+/*
+ * Where the time of the successful EXECUTEs since the last reset went, per
+ * phase in microseconds (last, mean, min, max), and the poll sleeps per
+ * request. Backends expose it as <debugfs>/ane-h1x/<dev>/execute.
+ */
+int ane_h16_session_stats_show(struct seq_file *m, struct ane_h16_session *s)
+{
+	struct ane_h16_exec_stats *st;
+	unsigned int i;
+
+	st = kmalloc_obj(*st);
+	if (!st)
+		return -ENOMEM;
+	ane_h16_session_stats(s, st, false);
+	seq_printf(m, "executes %llu\n", st->count);
+	if (st->count) {
+		seq_printf(m, "%-12s %11s %11s %11s %11s\n", "phase", "last_us", "mean_us",
+			   "min_us", "max_us");
+		for (i = 0; i < ANE_H16_T_PHASES; i++) {
+			seq_printf(m, "%-12s", ane_h16_exec_phase_names[i]);
+			h16_us(m, st->last.ns[i]);
+			h16_us(m, div64_u64(st->sum.ns[i], st->count));
+			h16_us(m, st->min.ns[i]);
+			h16_us(m, st->max.ns[i]);
+			seq_putc(m, '\n');
+		}
+		seq_printf(m, "%-12s %11llu %9llu.%u %11llu %11llu\n", "polls", st->last.polls,
+			   div64_u64(st->sum.polls, st->count),
+			   (unsigned int)(div64_u64(st->sum.polls * 10, st->count) % 10),
+			   st->min.polls, st->max.polls);
+	}
+	kfree(st);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_stats_show);
 
 /* TERMINATE then UNLOAD. The mappings stay until reset; a new LOAD may follow. */
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)

@@ -871,53 +871,24 @@ static const struct file_operations ane_h16_stage_fops = {
 	.llseek = default_llseek,
 };
 
-static void ane_h16_us(struct seq_file *m, u64 ns)
-{
-	seq_printf(m, " %9llu.%u", div_u64(ns, 1000), (unsigned int)(div_u64(ns, 100) % 10));
-}
-
 /*
- * <debugfs>/ane-h16/<dev>/execute: where the time of the successful EXECUTEs
- * since the last reset went, per phase in microseconds (last, mean, min,
- * max), and the poll sleeps per request. Writing anything resets it.
+ * <debugfs>/ane-h16/<dev>/execute: per-phase EXECUTE times, see
+ * ane_h16_session_stats_show(). Writing anything resets them.
  */
 static int ane_h16_execute_show(struct seq_file *m, void *v)
 {
 	struct ane_h16_device *h = m->private;
-	struct ane_h16_exec_stats *st;
-	unsigned int i;
+	bool ready;
 
 	mutex_lock(&ane_h16_lock);
-	if (!h->program_ready) {
-		mutex_unlock(&ane_h16_lock);
+	ready = h->program_ready;
+	mutex_unlock(&ane_h16_lock);
+	if (!ready) {
 		seq_puts(m, "executes 0 (program stage not reached)\n");
 		return 0;
 	}
-	mutex_unlock(&ane_h16_lock);
 	/* program_ready never goes back, and the session outlives this file. */
-	st = kmalloc_obj(*st);
-	if (!st)
-		return -ENOMEM;
-	ane_h16_session_stats(&h->session, st, false);
-	seq_printf(m, "executes %llu\n", st->count);
-	if (st->count) {
-		seq_printf(m, "%-12s %11s %11s %11s %11s\n", "phase", "last_us", "mean_us",
-			   "min_us", "max_us");
-		for (i = 0; i < ANE_H16_T_PHASES; i++) {
-			seq_printf(m, "%-12s", ane_h16_exec_phase_names[i]);
-			ane_h16_us(m, st->last.ns[i]);
-			ane_h16_us(m, div64_u64(st->sum.ns[i], st->count));
-			ane_h16_us(m, st->min.ns[i]);
-			ane_h16_us(m, st->max.ns[i]);
-			seq_putc(m, '\n');
-		}
-		seq_printf(m, "%-12s %11llu %9llu.%u %11llu %11llu\n", "polls", st->last.polls,
-			   div64_u64(st->sum.polls, st->count),
-			   (unsigned int)(div64_u64(st->sum.polls * 10, st->count) % 10),
-			   st->min.polls, st->max.polls);
-	}
-	kfree(st);
-	return 0;
+	return ane_h16_session_stats_show(m, &h->session);
 }
 
 static int ane_h16_execute_open(struct inode *inode, struct file *file)

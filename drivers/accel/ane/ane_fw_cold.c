@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Shared firmware backend. H17 is the first measured cold power provider. */
 #include <crypto/sha2.h>
+#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -15,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 
@@ -745,6 +747,52 @@ static const struct ane_h16_session_ops ane_fw_session_ops = {
  * pool after UNLOAD, often only during a later program, so FREE stays
  * admitted; backing is retained until reboot.
  */
+/*
+ * <debugfs>/ane-h17/<dev>/execute: per-phase EXECUTE times of the shared
+ * session, see ane_h16_session_stats_show(). Writing anything resets them.
+ * Created at the program stage; the retained backend pins the module, so
+ * the file and its session live until reboot.
+ */
+static int ane_fw_execute_show(struct seq_file *m, void *v)
+{
+	return ane_h16_session_stats_show(m, m->private);
+}
+
+static int ane_fw_execute_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ane_fw_execute_show, inode->i_private);
+}
+
+static ssize_t ane_fw_execute_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	ane_h16_session_stats(((struct seq_file *)file->private_data)->private, NULL, true);
+	return count;
+}
+
+static const struct file_operations ane_fw_execute_fops = {
+	.owner = THIS_MODULE,
+	.open = ane_fw_execute_open,
+	.read = seq_read,
+	.write = ane_fw_execute_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void ane_fw_debugfs(struct ane_fw_backend *b)
+{
+	struct dentry *root = debugfs_lookup("ane-h17", NULL);
+	bool found = root;
+
+	if (!found)
+		root = debugfs_create_dir("ane-h17", NULL);
+	debugfs_create_file("execute", 0600,
+			    debugfs_create_dir(dev_name(&b->pdev->dev), root),
+			    &b->session, &ane_fw_execute_fops);
+	if (found)
+		dput(root);
+}
+
 static int ane_fw_program_stage(struct ane_fw_backend *b)
 {
 	int ret;
@@ -755,9 +803,11 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
-	if (!ret)
-		dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
-	return ret;
+	if (ret)
+		return ret;
+	ane_fw_debugfs(b);
+	dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
+	return 0;
 }
 
 static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *attr, char *buf)

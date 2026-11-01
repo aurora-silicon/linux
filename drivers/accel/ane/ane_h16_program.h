@@ -262,6 +262,9 @@ void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in
 void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats *out,
 			   bool reset);
 
+struct seq_file;
+int ane_h16_session_stats_show(struct seq_file *m, struct ane_h16_session *s);
+
 #define ANE_H16_FWLOG_RECORD 0x80
 size_t ane_h16_fwlog_line(const u8 *record, char *line);
 
