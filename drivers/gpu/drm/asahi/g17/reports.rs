@@ -13,6 +13,8 @@ use kernel::prelude::*;
 #[derive(Clone, Copy, Default)]
 struct Sample {
     count: u64,
+    admitted: u64,
+    last_admitted: bool,
     host_ns: u64,
     words: [u32; EVENT_WORDS],
 }
@@ -31,13 +33,21 @@ impl Reports {
         Ok(Self { samples })
     }
 
-    pub(super) fn record(&mut self, role: Role, words: [u32; EVENT_WORDS], host_ns: u64) {
+    pub(super) fn record(
+        &mut self,
+        role: Role,
+        words: [u32; EVENT_WORDS],
+        host_ns: u64,
+        admitted: bool,
+    ) {
         let tag = words[0];
         if tag >= u32::BITS || STATISTICS_TYPES & (1 << tag) == 0 {
             return;
         }
         let sample = &mut self.samples[role as usize * 32 + tag as usize];
         sample.count = sample.count.saturating_add(1);
+        sample.admitted = sample.admitted.saturating_add(u64::from(admitted));
+        sample.last_admitted = admitted;
         sample.host_ns = host_ns;
         sample.words = words;
     }
@@ -55,11 +65,13 @@ impl Reports {
         {
             writeln!(
                 f,
-                "role={} tag={:#x} count={} host_ns={} words={:08x?}",
+                "role={} tag={:#x} count={} host_ns={} admitted={} last_admitted={} words={:08x?}",
                 index / 32,
                 index % 32,
                 sample.count,
                 sample.host_ns,
+                sample.admitted,
+                sample.last_admitted,
                 sample.words
             )?;
         }
@@ -79,7 +91,8 @@ impl kernel::debugfs::Writer for View {
         firmware.observe_statistics_power();
         writeln!(
             f,
-            "online=1 graph={:?} sampled_ns={}",
+            "online=1 device={} graph={:?} sampled_ns={}",
+            self.0.dev.name().to_str().unwrap_or("<non-UTF8>"),
             self.0.variant.graph,
             super::now_ns()
         )?;
@@ -125,15 +138,19 @@ mod tests {
         let mut words = [0; EVENT_WORDS];
         words[0] = 16;
         words[17] = 0xdeadbeef;
-        reports.record(Role::Primary, words, 100);
-        reports.record(Role::Primary, words, 101);
-        reports.record(Role::Secondary, words, 102);
+        reports.record(Role::Primary, words, 100, false);
+        reports.record(Role::Primary, words, 101, true);
+        reports.record(Role::Secondary, words, 102, false);
         assert_eq!(reports.samples[16].count, 2);
         assert_eq!(reports.samples[16].host_ns, 101);
         assert_eq!(reports.samples[16].words, words);
+        assert_eq!(reports.samples[16].admitted, 1);
+        assert!(reports.samples[16].last_admitted);
         assert_eq!(reports.samples[48].count, 1);
+        assert_eq!(reports.samples[48].admitted, 0);
+        assert!(!reports.samples[48].last_admitted);
         words[0] = 17;
-        reports.record(Role::Primary, words, 103);
+        reports.record(Role::Primary, words, 103, true);
         assert_eq!(reports.samples[17].count, 1);
         assert_eq!(reports.samples[16].count, 2);
     }
@@ -144,7 +161,7 @@ mod tests {
         for tag in [0, 15, 29, 31, 32, u32::MAX] {
             let mut words = [0; EVENT_WORDS];
             words[0] = tag;
-            reports.record(Role::Primary, words, 1);
+            reports.record(Role::Primary, words, 1, true);
         }
         assert!(reports.samples.iter().all(|s| s.count == 0));
     }

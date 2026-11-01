@@ -95,10 +95,16 @@ impl Rings {
 
     pub(super) fn write_reports(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         self.reports.write(f)?;
+        writeln!(
+            f,
+            "admission suspended={} discard_queued={:?} quarantine={:?} power_epoch={}",
+            self.suspended, self.discard_statistics, self.quarantined, self.statistics_epoch
+        )?;
         let view = self.read_statistics(super::now_ns());
-        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?}",
+        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={} pstate={}",
             self.max_age_ns, view.util_status, view.util_host_ns, view.util_samples,
-            view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks)
+            view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks,
+            view.tiler, view.renderer, view.device, view.pstate)
     }
 
     pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
@@ -177,7 +183,7 @@ impl Rings {
             }
             if matches!(ring, ReportRing::Statistics) {
                 let host_ns = super::now_ns();
-                reports.record(role, words, host_ns);
+                reports.record(role, words, host_ns, accept_statistics);
                 if accept_statistics {
                     telemetry.record(&words, host_ns, max_age_ns);
                 }

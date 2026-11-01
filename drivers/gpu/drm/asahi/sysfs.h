@@ -23,10 +23,12 @@ struct asahi_qualified_stats {
 
 typedef void (*asahi_stats_read_fn)(const void *snapshot, struct asahi_qualified_stats *out);
 typedef void (*asahi_stats_suspend_fn)(const void *snapshot, bool suspended);
+typedef bool (*asahi_stats_frequency_fn)(const void *snapshot, u32 pstate, u64 *frequency_hz);
 
 int asahi_sysfs_register(struct device *dev, const void *snapshot,
 			 int export_enabled, const void *memory, void **handle,
-			 asahi_stats_read_fn read, asahi_stats_suspend_fn suspend);
+			 asahi_stats_read_fn read, asahi_stats_suspend_fn suspend,
+			 asahi_stats_frequency_fn frequency);
 int asahi_sysfs_register_idle(struct device *dev, u32 *word);
 void asahi_sysfs_unregister(struct device *dev, void *handle);
 

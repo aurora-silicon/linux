@@ -27,6 +27,14 @@ mod prelude {
     pub type Result<T = ()> = std::result::Result<T, i32>;
     pub const EIO: i32 = -5;
     pub const EAGAIN: i32 = -11;
+    pub const GFP_KERNEL: u32 = 0;
+    pub struct KVec<T>(Vec<T>);
+    impl<T> KVec<T> {
+        pub fn with_capacity(n:usize,_:u32)->Result<Self> { Ok(Self(Vec::with_capacity(n))) }
+        pub fn push(&mut self,v:T,_:u32)->Result { self.0.push(v);Ok(()) }
+    }
+    impl<T> core::ops::Deref for KVec<T> { type Target=[T];fn deref(&self)->&[T] { &self.0 } }
+    impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self)->&mut [T] { &mut self.0 } }
 }
 mod device {
     pub struct Device;
@@ -101,15 +109,7 @@ mod g17 {
             pub fn publish_control(&self,_:u32,_:&[u8],_:bool,_:u32)->Result { Ok(()) }
         }
     }
-    mod reports {
-        use super::Role;
-        pub struct Reports;
-        impl Reports {
-            pub fn new()->crate::prelude::Result<Self> { Ok(Self) }
-            pub fn record(&mut self,_:Role,_:[u32;18],_:u64) {}
-            pub fn write(&self,_:&mut crate::fmt::Formatter<'_>)->crate::fmt::Result { Ok(()) }
-        }
-    }
+    mod reports;
 '''
 RUST_TESTS = r'''
     #[test]
@@ -232,6 +232,12 @@ C_TESTS = r'''
 static struct asahi_qualified_stats current;
 static void read_stats(const void *ptr,struct asahi_qualified_stats *out) { (void)ptr;*out=current; }
 static void suspend_stats(const void *ptr,bool suspended) { (void)ptr;suspend_calls+=suspended?1:10; }
+static bool read_frequency(const void *ptr,u32 pstate,u64 *hz) {
+    static const u64 table[]={0,338000000,618000000,492000000};
+    (void)ptr;
+    if(pstate>=sizeof(table)/sizeof(*table))return false;
+    *hz=table[pstate];return true;
+}
 int main(void) {
     struct asahi_stats_snapshot snap;
     struct asahi_stats_attribute stats={.snapshot=&snap,.export_enabled=true};
@@ -248,6 +254,15 @@ int main(void) {
         ssize_t before=old_agx_stats_show(NULL,&stats.attr,old);
         ssize_t after=agx_stats_show(NULL,&stats.attr,now);
         assert(before==after && !memcmp(old,now,before+1));
+        stats.frequency=read_frequency;
+        after=agx_stats_show(NULL,&stats.attr,now);
+        assert(after>before && !memcmp(old,now,before));
+        static const char *expected[]={"0", "338000000", "618000000", "492000000"};
+        char suffix[128];
+        snprintf(suffix,sizeof(suffix),"requested_frequency_hz %s\n",
+                 snap.pstate<4?expected[snap.pstate]:"unsupported");
+        assert(!strcmp(now+before,suffix));
+        stats.frequency=NULL;
     }
     stats.export_enabled=false;
     assert(agx_stats_show(NULL,&stats.attr,now)==12);
@@ -273,7 +288,7 @@ int main(void) {
     struct device dev;
     struct asahi_gpu_memory memory={0};
     void *handle=NULL;
-    assert(!asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats));
+    assert(!asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL));
     struct asahi_stats_attribute *registered_stats=handle;
     assert(registered==1 && removed==0);
     asahi_stats_pm_notify(&registered_stats->pm_notifier,PM_SUSPEND_PREPARE,NULL);
@@ -283,14 +298,14 @@ int main(void) {
     assert(removed==1);
     for(int failure=1;failure<=2;failure++) {
         created=0;fail_file=failure;handle=NULL;
-        assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats)==-12);
+        assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
         assert(registered==removed);
         assert(handle==NULL);
     }
     fail_file=0;fail_notifier=1;created=0;
-    assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats)==-12);
+    assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
     assert(created==0 && registered==removed);
-    puts("PASS: 512 byte-identical legacy outputs, G17 capabilities, PM lifecycle and registration rollback");
+    puts("PASS: 512 byte-identical legacy prefixes and frequency lookups, G17 capabilities, PM lifecycle and registration rollback");
 }
 '''
 
@@ -311,6 +326,11 @@ def main():
     # kernel logging and allocation adapters are replaced by host fixtures.
     channel = '\n'.join(line for line in channel.splitlines() if not line.startswith('//!'))
     (work / 'channel.rs').write_text(channel)
+    reports = (DRIVER / 'g17/reports.rs').read_text()
+    store = reports.split('/// The view owns the session')[0]
+    tests = reports.split('#[kernel::macros::kunit_tests(asahi_g17_reports)]')[1]
+    reports = '\n'.join(line for line in store.splitlines() if not line.startswith('//!')) + tests
+    (work / 'reports.rs').write_text(reports)
     telemetry = (DRIVER / 'g17/telemetry.rs').read_text()
     changes = {
         'fields': ('[words[3], words[4], words[6]]', '[words[3], words[4], words[5]]'),
@@ -336,7 +356,7 @@ def main():
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.
     (work / 'g17').mkdir(exist_ok=True)
-    for name in ['channel.rs', 'telemetry.rs']:
+    for name in ['channel.rs', 'telemetry.rs', 'reports.rs']:
         (work / 'g17' / name).write_text((work / name).read_text())
     subprocess.run(['rustc', '--edition=2021', '--test', str(work / 'rings.rs'), '-o', str(work / 'rings')], check=True)
     subprocess.run([str(work / 'rings')], check=True)

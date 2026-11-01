@@ -825,7 +825,17 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
-        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
+        let mut frequencies_hz = KVec::with_capacity(dyncfg.pwr.perf_states.len(), GFP_KERNEL)?;
+        for state in &dyncfg.pwr.perf_states {
+            frequencies_hz.push(u64::from(state.freq_hz), GFP_KERNEL)?;
+        }
+        let stats_snap = Arc::new(
+            stats::StatsSnapshot {
+                frequencies_hz,
+                ..Default::default()
+            },
+            GFP_KERNEL,
+        )?;
         let stats_snap_clone = stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(

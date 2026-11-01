@@ -43,6 +43,15 @@ Description:
 
 		pstate     u32; current performance state index (PowerState.pstate).
 
+		requested_frequency_hz
+		           G13/G14: nominal OPP frequency in Hz for the pstate
+		           printed in this read. Uses the driver's parsed
+		           operating-points-v2 table in firmware order, without
+		           sorting. This is not a measured achieved frequency.
+		           Unsupported if the index has no table entry.
+		           All pre-existing keys retain their format and order;
+		           this key is appended after temperature_scale.
+
 		power_mw   u32; latest average power reading in milliwatts
 		           (AvgPower.avg_power). May be 0 if the firmware has not
 		           yet reported AvgPower.
@@ -66,7 +75,7 @@ Description:
 		must not assume binary layout of this file.
 
 		G16S (T6040/V25G83) and G17P (T8140/V26A428) use a separate,
-		qualified snapshot. The G13/G14 output above is unchanged.
+		qualified snapshot. The existing G13/G14 keys above are unchanged.
 		The following keys replace the legacy keys on these firmwares:
 
 		utilisation_status, pstate_status
@@ -119,3 +128,8 @@ Description:
 		policy, timestamp and diagnostic tick deltas. Tick deltas are
 		never accumulated as GPU busy time. Firmware role streams are
 		merged in drain order without deduplication.
+		The diagnostic also identifies the platform device, records the
+		transport-admitted count and last-admission decision per role/tag,
+		and shows suspension, queued-record discard and quarantine state.
+		Transport admission does not imply semantic validity: the decoder
+		still checks each percentage, selector and timestamp.
