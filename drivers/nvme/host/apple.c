@@ -2695,6 +2695,18 @@ static const struct apple_nvme_hw apple_nvme_t8140_hw = {
 };
 
 /*
+ * T8142 (M5) is laid out like T8140; the final shutdown sends SHN, as on
+ * every post-M4 controller.
+ */
+static const struct apple_nvme_hw apple_nvme_t8142_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.max_queue_depth = 64,
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+};
+
+/*
  * T6040 (M4 Pro) with the 26.x ANS firmware: the T8132 controller, but the
  * "nvme" register block ends at 0x10000 and the linear submission queue
  * doorbells are in the NVMMU block. APST has never been run on it.
@@ -2714,6 +2726,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
+	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };
