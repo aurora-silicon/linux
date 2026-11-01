@@ -185,7 +185,9 @@ static int apple_rtkit_helper_inherit_buffers(
 	/* T8140 producers predating the buffer inventory remain compatible. */
 	inventory = of_find_property(np, "apple,rtkit-buffers", &length);
 	if (!inventory) {
-		if (of_device_is_compatible(np, "apple,t8132-mtp"))
+		if (of_device_is_compatible(np, "apple,t8132-mtp") ||
+		    (of_machine_is_compatible("apple,j614s") &&
+		     of_device_is_compatible(np, "apple,t6041-mtp")))
 			return -EINVAL;
 		return 0;
 	}
@@ -273,8 +275,10 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		count = apple_rtkit_helper_inherit_buffers(helper, buffers);
 		if (count < 0)
 			return dev_err_probe(dev, count, "Invalid inherited RTKit buffers\n");
-		if (of_machine_is_compatible("apple,j713") &&
-		    of_device_is_compatible(dev->of_node, "apple,t8132-mtp"))
+		if ((of_machine_is_compatible("apple,j713") &&
+		     of_device_is_compatible(dev->of_node, "apple,t8132-mtp")) ||
+		    (of_machine_is_compatible("apple,j614s") &&
+		     of_device_is_compatible(dev->of_node, "apple,t6041-mtp")))
 			helper->preserved = true;
 	}
 
@@ -321,7 +325,9 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		 */
 		helper->adopted = true;
 		helper->strict_buffers = count > 0 ||
-			of_device_is_compatible(dev->of_node, "apple,t8132-mtp");
+			of_device_is_compatible(dev->of_node, "apple,t8132-mtp") ||
+			(of_machine_is_compatible("apple,j614s") &&
+			 of_device_is_compatible(dev->of_node, "apple,t6041-mtp"));
 		helper->rtk = apple_rtkit_init_adopted_with_buffers(
 			dev, helper, NULL, 0, &apple_rtkit_helper_ops, buffers, count);
 		if (IS_ERR(helper->rtk))
