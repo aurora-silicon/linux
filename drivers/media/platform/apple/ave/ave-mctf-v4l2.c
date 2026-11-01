@@ -242,44 +242,59 @@ static int ave_mctf_job_ready(void *priv)
 		v4l2_m2m_num_dst_bufs_ready(m2m));
 }
 
-static unsigned int ave_mctf_nonzero(const u8 *p, size_t len)
+/* Log every distinct metadata byte of one plane of the CPU surface copy */
+static void ave_mctf_log_meta(struct ave_ctx *ctx, const char *plane, bool chroma)
 {
-	unsigned int n = 0;
+	const struct ave_session *sess = ctx->sess;
+	unsigned int distinct = 0;
+	u16 hist[256];
+	char line[128];
+	int len = 0;
 
-	for (size_t i = 0; i < len; i++)
-		n += !!p[i];
-	return n;
+	ave_cmp420_meta_hist(&sess->mctf_geom, sess->mctf_surf, chroma, hist);
+	line[0] = 0;
+	for (unsigned int v = 0; v < ARRAY_SIZE(hist); v++) {
+		if (!hist[v])
+			continue;
+		distinct++;
+		if (len < (int)sizeof(line) - 16)
+			len += scnprintf(line + len, sizeof(line) - len, " %02x:%u",
+					 v, hist[v]);
+	}
+	dev_dbg(ctx->ave->dev, "MCTF frame %u %s metadata, %u values:%s%s\n",
+		ctx->dst_sequence, plane, distinct, line,
+		len < (int)sizeof(line) - 16 ? "" : " ...");
 }
 
 /*
- * Copy the output surface of @slot into @dst: the data planes as NV12
- * rows. That is the picture only if the client writes plain rows, which is
- * not established; the debug log shows the header planes it wrote.
+ * Read the output surface of @slot into @dst as NV12. Raw and solid tiles
+ * are exact; other tile modes are not decoded and show the marker colour.
+ * The debug log counts the tile kinds of every frame.
  */
 static int ave_mctf_get_picture(struct ave_ctx *ctx, unsigned int slot,
 				struct vb2_v4l2_buffer *dst)
 {
-	const struct ave_session *sess = ctx->sess;
-	const struct ave_mctf_surface_form *form = &sess->mctf->form;
-	u32 luma = sess->p.stride * sess->p.height;
+	struct ave_session *sess = ctx->sess;
+	const struct ave_cmp420_geom *g = &sess->mctf_geom;
+	size_t luma = (size_t)sess->p.stride * sess->p.height;
 	const u8 *from = sess->mctf_out[slot].cpu;
 	u8 *to = vb2_plane_vaddr(&dst->vb2_buf, 0);
+	struct ave_cmp420_stats ys, cs;
 
-	if (!from || !to)
+	if (!from || !to || !sess->mctf_surf || !sess->mctf_lin)
 		return -EFAULT;
-	memcpy(to, from, luma);
-	memcpy(to + luma, from + form->c, luma / 2);
+	memcpy(sess->mctf_surf, from, g->bytes);
+	ave_cmp420_unpack(g, sess->mctf_surf, sess->mctf_lin,
+			  sess->mctf_lin + luma, sess->p.stride, &ys, &cs);
+	memcpy(to, sess->mctf_lin, luma * 3 / 2);
 	dev_dbg(ctx->ave->dev,
-		"MCTF output slot %u: non-zero header bytes Y %u/%#x CbCr %u/%#x\n",
-		slot, ave_mctf_nonzero(from + form->y_hdr, form->c - form->y_hdr),
-		form->c - form->y_hdr,
-		ave_mctf_nonzero(from + form->c_hdr, form->bytes - form->c_hdr),
-		form->bytes - form->c_hdr);
-	print_hex_dump_debug("mctf out Y hdr: ", DUMP_PREFIX_OFFSET, 16, 1,
-			     from + form->y_hdr, 64, false);
-	print_hex_dump_debug("mctf out Y: ", DUMP_PREFIX_OFFSET, 16, 1, from, 64, false);
-	print_hex_dump_debug("mctf out C hdr: ", DUMP_PREFIX_OFFSET, 16, 1,
-			     from + form->c_hdr, 32, false);
+		"MCTF frame %u slot %u tiles raw/solid/mixed/other: Y %u/%u/%u/%u CbCr %u/%u/%u/%u; blocks raw/solid/other: Y %u/%u/%u CbCr %u/%u/%u\n",
+		ctx->dst_sequence, slot,
+		ys.tiles_raw, ys.tiles_solid, ys.tiles_mixed, ys.tiles_other,
+		cs.tiles_raw, cs.tiles_solid, cs.tiles_mixed, cs.tiles_other,
+		ys.raw, ys.solid, ys.other, cs.raw, cs.solid, cs.other);
+	ave_mctf_log_meta(ctx, "Y", false);
+	ave_mctf_log_meta(ctx, "CbCr", true);
 	return 0;
 }
 

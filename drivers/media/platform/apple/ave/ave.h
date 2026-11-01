@@ -18,6 +18,8 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fh.h>
+
+#include "ave-cmp420.h"
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-v4l2.h>
 
@@ -303,6 +305,9 @@ struct ave_session {
 	dma_addr_t mctf_iova[AVE_MCTF_BUFS];
 	struct ave_buf mctf_in[AVE_MCTF_IN_BUFS];
 	struct ave_buf mctf_out[AVE_MCTF_OUT_BUFS];
+	/* CPU copies of one picture surface and one NV12 picture */
+	struct ave_cmp420_geom mctf_geom;
+	u8 *mctf_surf, *mctf_lin;
 	/* Header words; zero means the encoder's values */
 	u32 unit, arg1, frame_arg0;
 	u8 done_fifo[AVE_MAX_SLOTS];

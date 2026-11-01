@@ -19,10 +19,10 @@
  * +0xac88/+0xac90 are firmware-owned; a user picture copied to +0xac88
  * came back untouched, so it is not the picture path.
  *
- * Moving pictures between V4L2 NV12 and these surfaces is not solved: the
- * header format is unknown. Until it is, the driver copies NV12 rows into
- * the data planes with zeroed headers and copies the output data planes
- * back; see ave-mctf-v4l2.c.
+ * The surfaces are Apple's lossless compressed 4:2:0 form (ave-cmp420.c).
+ * The driver writes each NV12 input picture as raw tiles and reads the
+ * output's raw and solid tiles back to NV12 on the CPU; any other tile mode
+ * is counted and shown as a marker (ave-mctf-v4l2.c).
  *
  * Copyright The Aurora Silicon Contributors
  */
@@ -340,27 +340,26 @@ int ave_mctf_cmd_start(struct ave_ctx *ctx)
 }
 
 /*
- * Fill input surface @n from the NV12 picture in @src: luma and chroma rows
- * into the data planes, headers zero. Whether zero headers make the client
- * read the data planes as plain rows is not established yet.
+ * Fill input surface @n from the NV12 picture in @src, every tile raw. The
+ * conversion runs in cached memory; the DMA surfaces see only bulk copies.
  */
 static int ave_mctf_put_picture(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src,
 				unsigned int n)
 {
-	const struct ave_session *sess = ctx->sess;
-	const struct ave_mctf_surface_form *form = &sess->mctf->form;
+	struct ave_session *sess = ctx->sess;
+	const struct ave_cmp420_geom *g = &sess->mctf_geom;
 	const struct ave_params *p = &sess->p;
-	u32 luma = p->stride * p->height;
+	size_t luma = (size_t)p->stride * p->height;
 	u8 *to = sess->mctf_in[n].cpu;
 	const u8 *from = vb2_plane_vaddr(&src->vb2_buf, 0);
 
-	if (!to || !from)
+	if (!to || !from || !sess->mctf_surf || !sess->mctf_lin)
 		return -EFAULT;
 	from += src->vb2_buf.planes[0].data_offset;
-	memcpy(to, from, luma);
-	memcpy(to + form->c, from + luma, luma / 2);
-	memset(to + form->y_hdr, 0, form->c - form->y_hdr);
-	memset(to + form->c_hdr, 0, form->bytes - form->c_hdr);
+	memcpy(sess->mctf_lin, from, luma * 3 / 2);
+	ave_cmp420_pack(g, sess->mctf_surf, sess->mctf_lin, sess->mctf_lin + luma,
+			p->stride);
+	memcpy(to, sess->mctf_surf, g->bytes);
 	return 0;
 }
 

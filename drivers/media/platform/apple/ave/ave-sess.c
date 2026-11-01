@@ -350,6 +350,18 @@ int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
 		.fps_int = 30,
 		.slots = l->slots,
 	};
+	ret = ave_cmp420_geom(&sess->mctf_geom, AVE_MCTF_WIDTH, AVE_MCTF_HEIGHT);
+	if (ret || sess->mctf_geom.y_meta != l->form.y_hdr ||
+	    sess->mctf_geom.c != l->form.c ||
+	    sess->mctf_geom.c_meta != l->form.c_hdr ||
+	    sess->mctf_geom.bytes != l->form.bytes) {
+		dev_err(ave->dev, "MCTF picture surface is not the compressed 4:2:0 form\n");
+		return -EINVAL;
+	}
+	sess->mctf_surf = kvmalloc(l->form.bytes, GFP_KERNEL);
+	sess->mctf_lin = kvmalloc((size_t)p->stride * p->height * 3 / 2, GFP_KERNEL);
+	if (!sess->mctf_surf || !sess->mctf_lin)
+		return -ENOMEM;
 	sess->mctf = l;
 	sess->unit = l->unit;
 	sess->arg1 = l->arg1;
@@ -417,6 +429,10 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->mctf_in[i]);
 	for (unsigned int i = 0; i < AVE_MCTF_OUT_BUFS; i++)
 		ave_free(ave, &sess->mctf_out[i]);
+	kvfree(sess->mctf_surf);
+	sess->mctf_surf = NULL;
+	kvfree(sess->mctf_lin);
+	sess->mctf_lin = NULL;
 	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++) {
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);

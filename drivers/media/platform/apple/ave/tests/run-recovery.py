@@ -23,6 +23,7 @@ def main():
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     code += source((src / 'ave-regs.h').read_text())
     code += 'struct vb2_v4l2_buffer;\n'
+    code += source((src / 'ave-cmp420.h').read_text())
     for name in ('ave_codec', 'ave_buf', 'ave_fw_segment', 'ave_ring', 'ave_fw_state',
                  'ave_coproc_regs', 'ave_variant', 'ave_params', 'ave_slot', 'ave_session'):
         code += declaration(header, name)

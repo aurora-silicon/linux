@@ -36,6 +36,7 @@ static inline void *kcalloc(size_t n, size_t size, int flags)
 }
 
 #define kfree(p) free(p)
+#define kvfree(p) free(p)
 static inline void sort(void *p, size_t n, size_t size,
 			int (*cmp)(const void *, const void *), void *unused)
 {

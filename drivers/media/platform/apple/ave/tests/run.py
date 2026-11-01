@@ -45,6 +45,8 @@ def build(src, out, baseline):
         m = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
         if m:
             code += m[0] + '\n'
+    if (src / 'ave-cmp420.h').exists():
+        code += source((src / 'ave-cmp420.h').read_text())
     for name in ('ave_codec', 'ave_buf', 'ave_fw_state', 'ave_image',
                  'ave_coproc_regs', 'ave_variant', 'ave_params', 'ave_slot', 'ave_session'):
         code += declaration(header, name)
