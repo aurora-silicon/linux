@@ -4,6 +4,7 @@
 #include <linux/slab.h>
 
 #include "ane_fw_transport.h"
+#include "ane_fw_irq_wait.h"
 #include "ane_h16_execute.h"
 
 #define TEST_IPC_DVA 0x100003d0000ULL
@@ -718,6 +719,50 @@ static void ane_transport_shared_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->t.shared_count, 2U);
 }
 
+static void ane_transport_coalesced_shared_irq_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	struct ane_fw_irq_event event;
+	bool progress;
+	unsigned int sequence;
+	u8 *p;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_fw_irq_event_init(&event);
+	sequence = ane_fw_irq_event_sequence(&event);
+	ane_test_shared_request(f, 0, SZ_16K, 0x1234);
+	p = ane_test_slot(f, ANE_FW_SHAREDMALLOC) + ANE_FW_SLOT_SIZE;
+	put_unaligned_le64(0, p);
+	put_unaligned_le64(SZ_16K, p + 8);
+	put_unaligned_le64(0x1235, p + 16);
+	/* One IRQ for both slots, between empty check and wait preparation. */
+	ane_fw_irq_event_notify(&event, 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared_drain(&f->t, &progress), 0);
+	KUNIT_EXPECT_TRUE(test, progress);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 2U);
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_event_wait(&event, sequence,
+					 ns_to_ktime(NSEC_PER_MSEC)), 1);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared_drain(&f->t, &progress), 0);
+	KUNIT_EXPECT_FALSE(test, progress);
+}
+
+static void ane_transport_shared_drain_refusal_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	bool progress;
+	u8 *p;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_16K, 0x1234);
+	p = ane_test_slot(f, ANE_FW_SHAREDMALLOC) + ANE_FW_SLOT_SIZE;
+	put_unaligned_le64(2, p);
+	put_unaligned_le64(SZ_16K, p + 8);
+	put_unaligned_le64(0x1235, p + 16);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared_drain(&f->t, &progress), -EOPNOTSUPP);
+	KUNIT_EXPECT_TRUE(test, progress);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+}
+
 static void ane_transport_shared_rejections_test(struct kunit *test)
 {
 	static const u64 tuples[][3] = {
@@ -999,6 +1044,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_report_word2_test),
 	KUNIT_CASE(ane_transport_presence_test),
 	KUNIT_CASE(ane_transport_shared_test),
+	KUNIT_CASE(ane_transport_coalesced_shared_irq_test),
+	KUNIT_CASE(ane_transport_shared_drain_refusal_test),
 	KUNIT_CASE(ane_transport_shared_rejections_test),
 	KUNIT_CASE(ane_transport_allocator_rejections_test),
 	KUNIT_CASE(ane_transport_shared_overlap_test),

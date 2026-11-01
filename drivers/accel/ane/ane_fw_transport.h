@@ -475,6 +475,31 @@ refused:
 	return ane_fw_transport_fail(t, ret);
 }
 
+/* Drain one coalesced IRQ's allocation requests before sleeping. Bound a
+ * pass by the ring size; caller rechecks target/deadline after any progress.
+ */
+static inline int ane_fw_transport_shared_drain(struct ane_fw_transport *t,
+					       bool *progress)
+{
+	unsigned int i;
+	int ret = ane_fw_transport_check(t);
+
+	if (ret)
+		return ret;
+	if (!progress || !t->armed)
+		return -EINVAL;
+	*progress = false;
+	for (i = 0; i < t->channels[ANE_FW_SHAREDMALLOC].slots; i++) {
+		ret = ane_fw_transport_shared(t);
+		if (ret == -EAGAIN)
+			return 0;
+		if (ret)
+			return ret;
+		*progress = true;
+	}
+	return 0;
+}
+
 /* Read once, reject unknown channels, acknowledge exactly that snapshot. */
 static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending)
 {
