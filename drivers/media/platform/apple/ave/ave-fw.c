@@ -441,6 +441,60 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 	return 0;
 }
 
+/*
+ * Read-only audit of every stream of the encoder's DARTs (T8110 layout).
+ * The AVE DMA window (0x100_0000_4000..0x100_ffff_ffff) is numerically the
+ * first 4 GiB of DRAM, so a stream that bypasses the DART, or translates
+ * through tables that are not Linux's, turns our IOVAs into physical writes
+ * to memory Linux owns. Refuse to start the firmware if any stream does.
+ */
+#define AVE_DART_PARAMS4	0x0c
+#define AVE_DART_PROTECT	0x200
+#define AVE_DART_TCR(sid)	(0x1000 + 4 * (sid))
+#define AVE_DART_TTBR(sid)	(0x1400 + 4 * (sid))
+
+int ave_dart_audit(struct ave_dev *ave, const char *when)
+{
+	int ret = 0;
+
+	for (unsigned int d = 0; d < ave->n_darts; d++) {
+		void __iomem *r = ave->dart_regs[d];
+		u32 own = ave->dart_sid[d];
+		u32 own_ttbr = readl(r + AVE_DART_TTBR(own));
+		u32 sids = min_t(u32, readl(r + AVE_DART_PARAMS4) & 0x1ff, 256);
+		unsigned int live = 0, bad = 0, len = 0;
+		char line[160];
+
+		line[0] = 0;
+		for (u32 sid = 0; sid < sids; sid++) {
+			u32 tcr = readl(r + AVE_DART_TCR(sid));
+			u32 ttbr = readl(r + AVE_DART_TTBR(sid));
+			enum ave_dart_stream k = ave_dart_classify(tcr, ttbr, sid == own,
+								   own, own_ttbr);
+
+			if (k == AVE_DART_STREAM_OFF)
+				continue;
+			live++;
+			if (k == AVE_DART_STREAM_UNSAFE)
+				bad++;
+			if (len < sizeof(line) - 32)
+				len += scnprintf(line + len, sizeof(line) - len,
+						 " %u:%x/%x%s", sid, tcr, ttbr,
+						 k == AVE_DART_STREAM_UNSAFE ? "!" : "");
+		}
+		dev_info(ave->dev,
+			 "DART%u %s: lock %#x, %u streams, %u live, %u unsafe:%s\n",
+			 d, when, readl(r + AVE_DART_PROTECT), sids, live, bad, line);
+		if (bad) {
+			dev_err(ave->dev,
+				"DART%u has %u streams outside the encoder's domain; refusing to run the firmware\n",
+				d, bad);
+			ret = -EPERM;
+		}
+	}
+	return ret;
+}
+
 /* Boot the coprocessor and bring up its command rings. Caller holds hw_lock. */
 static int ave_fw_boot(struct ave_dev *ave)
 {
@@ -546,6 +600,10 @@ static int ave_fw_boot(struct ave_dev *ave)
 			return -ENODEV;
 		ave->module_pinned = true;
 	}
+	/* No AVE DART stream may bypass or translate outside our domain. */
+	ret = ave_dart_audit(ave, "before start");
+	if (ret)
+		return ret;
 	/* The coprocessor is in reset: drop every cached translation before it runs. */
 	domain = iommu_get_domain_for_dev(ave->dev);
 	if (domain)
@@ -570,16 +628,26 @@ static int ave_fw_boot(struct ave_dev *ave)
 		hello[i] = readl(ave->mbox + AVE_MBOX_SCRATCH(i));
 	dma_rmb();
 
-	/* The reset witness is only as good as BOOT_ARG holding what boot wrote. */
+	/*
+	 * The reset witness: BOOT_ARG is nonzero while the coprocessor has
+	 * power (the firmware adds bit 10 to what boot wrote: 0x10000 reads
+	 * 0x10400) and zero after a power loss. A zero here proves nothing.
+	 */
 	status = readl(ave->coproc + ave->variant->regs->boot_arg);
 	dev_dbg(ave->dev, "BOOT_ARG after start %#x (wrote %#x)\n", status,
 		ave->variant->boot_arg_value);
-	if (t->boot_config && status != ave->variant->boot_arg_value &&
-	    !ave->witness_unusable) {
+	if (t->boot_config && !ave_witness_armed(status) && !ave->witness_unusable) {
 		ave->witness_unusable = true;
 		dev_warn(ave->dev,
-			 "BOOT_ARG reads %#x after start, not %#x: no reset proof, stopped sessions keep their memory\n",
-			 status, ave->variant->boot_arg_value);
+			 "BOOT_ARG reads %#x after start: no reset proof, stopped sessions keep their memory\n",
+			 status);
+	}
+
+	/* The firmware may program its own DART streams: check again now. */
+	ret = ave_dart_audit(ave, "after start");
+	if (ret) {
+		ave_fw_mark_broken(ave, ret, "DART stream outside the domain");
+		return ret;
 	}
 
 	ret = ave_ipc_negotiate(ave, hello);

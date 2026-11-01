@@ -16,6 +16,7 @@
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -289,6 +290,37 @@ static void ave_debugfs_init(struct ave_dev *ave)
 static const char *const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0",
 					    "me1", "perf" };
 
+/*
+ * Map the encoder's T8110-layout DARTs for the read-only stream audit
+ * (ave_dart_audit()). The DART driver owns them; nothing here writes.
+ */
+static void ave_map_darts(struct ave_dev *ave)
+{
+	struct device_node *np = ave->dev->of_node;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave->dart_regs); i++) {
+		struct of_phandle_args args;
+		struct resource res;
+		void __iomem *r;
+
+		if (of_parse_phandle_with_args(np, "iommus", "#iommu-cells", i, &args))
+			break;
+		if (!of_device_is_compatible(args.np, "apple,t8110-dart") ||
+		    args.args_count != 1 || of_address_to_resource(args.np, 0, &res)) {
+			of_node_put(args.np);
+			continue;
+		}
+		of_node_put(args.np);
+		r = devm_ioremap(ave->dev, res.start, resource_size(&res));
+		if (!r)
+			continue;
+		ave->dart_regs[ave->n_darts] = r;
+		ave->dart_sid[ave->n_darts] = args.args[0];
+		ave->n_darts++;
+	}
+	dev_dbg(ave->dev, "%u DARTs for the stream audit\n", ave->n_darts);
+}
+
 static int ave_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -325,6 +357,7 @@ static int ave_probe(struct platform_device *pdev)
 	ave->domain = iommu_get_domain_for_dev(dev);
 	if (!ave->domain || !(ave->domain->type & __IOMMU_DOMAIN_PAGING))
 		return dev_err_probe(dev, -ENODEV, "needs a translating IOMMU\n");
+	ave_map_darts(ave);
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
 		return ret;

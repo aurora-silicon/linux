@@ -253,6 +253,10 @@ struct ave_dev {
 	 * BOOT_ARG did not read back as written after a boot: a clear
 	 * BOOT_ARG proves nothing, so stopped sessions are never reaped.
 	 */
+	/* The encoder's DARTs, read-only for the stream audit */
+	void __iomem *dart_regs[2];
+	u32 dart_sid[2];
+	unsigned int n_darts;
 	bool witness_unusable;
 	/* Times the MCTF pool CRC changed while no session held it */
 	u32 mctf_pool_changed;
@@ -415,6 +419,7 @@ u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
+int ave_dart_audit(struct ave_dev *ave, const char *when);
 void ave_fw_halt(struct ave_dev *ave);
 int ave_fw_shutdown(struct ave_dev *ave);
 int ave_fw_runtime_suspend(struct ave_dev *ave);
