@@ -4278,6 +4278,38 @@ params_done:
 		(of_device_is_compatible(dev->of_node, "apple,t6041-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
+	/*
+	 * J614s may arrive with the MTP live after the boot keyboard used it.
+	 * Do not reset its DART unless there is no advertised handoff.
+	 */
+	if (of_machine_is_compatible("apple,j614s") &&
+	    res->start == 0x514800000ULL) {
+		struct device_node *mtp, *iommu;
+		const char *handoff;
+		bool live, advertised;
+
+		mtp = of_find_node_by_path("/mtp@514600000");
+		iommu = mtp ? of_parse_phandle(mtp, "iommus", 0) : NULL;
+		advertised = mtp && of_find_property(mtp, "apple,rtkit-handoff", NULL);
+		live = advertised && of_device_is_compatible(mtp, "apple,t6041-mtp") &&
+		       !of_property_read_string(mtp, "apple,rtkit-handoff", &handoff) &&
+		       !strcmp(handoff, "mtp-live-v1");
+		if (advertised && (!live || iommu != dev->of_node || dart->hw->type != DART_T8110 ||
+				   dart->locked || tunneled || !dart->supports_bypass ||
+				   !apple_dart_streams_bypassed(dart))) {
+			of_node_put(iommu);
+			of_node_put(mtp);
+			dev_err(dev, "Refusing invalid J614s live MTP DART handoff\n");
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		if (live) {
+			dart->retained_mtp = true;
+			dev_info(dev, "Retaining the live J614s MTP bypass\n");
+		}
+		of_node_put(iommu);
+		of_node_put(mtp);
+	}
 	if (of_machine_is_compatible("apple,j713") &&
 	    of_machine_is_compatible("apple,t8132") &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
