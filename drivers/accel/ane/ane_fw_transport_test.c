@@ -5,6 +5,7 @@
 
 #include "ane_fw_transport.h"
 #include "ane_fw_irq_wait.h"
+#include "ane_fw_pending.h"
 #include "ane_h16_execute.h"
 
 #define TEST_IPC_DVA 0x100003d0000ULL
@@ -1100,7 +1101,189 @@ static void ane_transport_terminal_wrap_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + ANE_FW_SLOT_SIZE), 1ULL);
 }
 
+struct ane_pending_test {
+	u64 ns, counter;
+	u32 reads, delays, cpus;
+};
+
+static u64 ane_pending_test_now(void *ctx)
+{
+	return ((struct ane_pending_test *)ctx)->ns;
+}
+
+static u64 ane_pending_test_counter(void *ctx)
+{
+	return ++((struct ane_pending_test *)ctx)->counter;
+}
+
+static u32 ane_pending_test_cpu(void *ctx)
+{
+	return ((struct ane_pending_test *)ctx)->cpus++;
+}
+
+static u32 ane_pending_test_read(void *ctx)
+{
+	struct ane_pending_test *f = ctx;
+
+	return f->reads++ < 1 ? BIT(6) : 0;
+}
+
+static void ane_pending_test_delay(void *ctx, u32 us)
+{
+	struct ane_pending_test *f = ctx;
+
+	f->ns += (u64)us * NSEC_PER_USEC;
+	f->delays++;
+}
+
+static const struct ane_fw_pending_ops ane_pending_test_ops = {
+	.now_ns = ane_pending_test_now,
+	.counter = ane_pending_test_counter,
+	.cpu = ane_pending_test_cpu,
+	.read_pending = ane_pending_test_read,
+	.delay_us = ane_pending_test_delay,
+};
+
+static void ane_pending_deadline_and_migration_test(struct kunit *test)
+{
+	struct ane_pending_test f = {};
+	struct ane_fw_pending_sample samples[4] = {};
+	u32 count = 99;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_pending_capture(&f, &ane_pending_test_ops,
+			samples, 4, 3000, true, &count), 0);
+	KUNIT_EXPECT_EQ(test, count, 3U);
+	KUNIT_EXPECT_EQ(test, f.reads, 3U);
+	KUNIT_EXPECT_EQ(test, f.delays, 3U);
+	KUNIT_EXPECT_EQ(test, samples[0].value, (u32)BIT(6));
+	KUNIT_EXPECT_EQ(test, samples[1].value, 0U);
+	KUNIT_EXPECT_EQ(test, samples[0].before, 1ULL);
+	KUNIT_EXPECT_EQ(test, samples[0].after, 2ULL);
+	KUNIT_EXPECT_EQ(test, samples[0].before_cpu, 0U);
+	KUNIT_EXPECT_EQ(test, samples[0].after_cpu, 1U);
+	KUNIT_EXPECT_EQ(test, samples[0].valid, 1U);
+	KUNIT_EXPECT_EQ(test, samples[3].before, 0ULL);
+}
+
+static void ane_pending_private_control_test(struct kunit *test)
+{
+	struct ane_pending_test f = {};
+	struct ane_fw_pending_sample samples[4] = {};
+	u32 count;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_pending_capture(&f, &ane_pending_test_ops,
+			samples, 4, 3000, false, &count), 0);
+	KUNIT_EXPECT_EQ(test, count, 3U);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.delays, 3U);
+	KUNIT_EXPECT_EQ(test, samples[0].valid, 0U);
+	KUNIT_EXPECT_EQ(test, samples[0].value, 0U);
+}
+
+static void ane_pending_capacity_test(struct kunit *test)
+{
+	struct ane_pending_test f = {};
+	struct ane_fw_pending_sample samples[3] = {};
+	u32 count;
+
+	samples[2].before = 0xabc;
+	KUNIT_EXPECT_EQ(test, ane_fw_pending_capture(&f, &ane_pending_test_ops,
+			samples, 2, 5000, true, &count), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, count, 2U);
+	KUNIT_EXPECT_EQ(test, f.reads, 2U);
+	KUNIT_EXPECT_EQ(test, samples[2].before, 0xabcULL);
+}
+
+static void ane_pending_expired_test(struct kunit *test)
+{
+	struct ane_pending_test f = { .ns = 5000 };
+	struct ane_fw_pending_sample samples[2] = {};
+	u32 count;
+
+	KUNIT_EXPECT_EQ(test, ane_fw_pending_capture(&f, &ane_pending_test_ops,
+			samples, 2, 5000, true, &count), 0);
+	KUNIT_EXPECT_EQ(test, count, 0U);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.counter, 0ULL);
+	KUNIT_EXPECT_EQ(test, f.delays, 0U);
+}
+
+static void ane_pending_test_stalled_delay(void *ctx, u32 us)
+{
+	((struct ane_pending_test *)ctx)->delays++;
+}
+
+static void ane_pending_stalled_clock_test(struct kunit *test)
+{
+	struct ane_pending_test f = {};
+	struct ane_fw_pending_ops ops = ane_pending_test_ops;
+	struct ane_fw_pending_sample samples[3] = {};
+	u32 count;
+
+	ops.delay_us = ane_pending_test_stalled_delay;
+	samples[2].before = 0xabc;
+	KUNIT_EXPECT_EQ(test, ane_fw_pending_capture(&f, &ops, samples, 2,
+			5000, true, &count), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, count, 2U);
+	KUNIT_EXPECT_EQ(test, f.reads, 2U);
+	KUNIT_EXPECT_EQ(test, f.ns, 0ULL);
+	KUNIT_EXPECT_EQ(test, samples[2].before, 0xabcULL);
+}
+
+static u32 ane_pending_test_slow_read(void *ctx)
+{
+	struct ane_pending_test *f = ctx;
+
+	f->ns += 5000;
+	f->reads++;
+	return BIT(6);
+}
+
+static void ane_pending_read_overshoot_test(struct kunit *test)
+{
+	struct ane_pending_test f = {};
+	struct ane_fw_pending_ops ops = ane_pending_test_ops;
+	struct ane_fw_pending_sample samples[3] = {};
+	u32 count;
+
+	ops.read_pending = ane_pending_test_slow_read;
+	KUNIT_EXPECT_EQ(test, ane_fw_pending_capture(&f, &ops, samples, 3,
+			3000, true, &count), 0);
+	KUNIT_EXPECT_EQ(test, count, 1U);
+	KUNIT_EXPECT_EQ(test, f.reads, 1U);
+	KUNIT_EXPECT_GT(test, f.ns, 3000ULL);
+	KUNIT_EXPECT_EQ(test, samples[0].value, (u32)BIT(6));
+	KUNIT_EXPECT_EQ(test, samples[0].after, 2ULL);
+	KUNIT_EXPECT_EQ(test, samples[1].before, 0ULL);
+}
+
+static void ane_pending_invalid_config_test(struct kunit *test)
+{
+	struct ane_pending_test f = {};
+	struct ane_fw_pending_sample sample;
+	u32 count = 99;
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_pending_config_valid(0, 0, 0));
+	KUNIT_EXPECT_TRUE(test, ane_fw_pending_config_valid(1, 2000, 10));
+	KUNIT_EXPECT_TRUE(test, ane_fw_pending_config_valid(2, 2000, 128));
+	KUNIT_EXPECT_FALSE(test, ane_fw_pending_config_valid(3, 2000, 10));
+	KUNIT_EXPECT_FALSE(test, ane_fw_pending_config_valid(2, 1999, 10));
+	KUNIT_EXPECT_FALSE(test, ane_fw_pending_config_valid(2, 2000, 0));
+	KUNIT_EXPECT_FALSE(test, ane_fw_pending_config_valid(2, 2000, 129));
+	KUNIT_EXPECT_EQ(test, ane_fw_pending_capture(&f, &ane_pending_test_ops,
+			&sample, 0, 5000, true, &count), -EINVAL);
+	KUNIT_EXPECT_EQ(test, count, 0U);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_pending_deadline_and_migration_test),
+	KUNIT_CASE(ane_pending_private_control_test),
+	KUNIT_CASE(ane_pending_capacity_test),
+	KUNIT_CASE(ane_pending_expired_test),
+	KUNIT_CASE(ane_pending_invalid_config_test),
+	KUNIT_CASE(ane_pending_stalled_clock_test),
+	KUNIT_CASE(ane_pending_read_overshoot_test),
 	KUNIT_CASE(ane_transport_terminal_ack_test),
 	KUNIT_CASE(ane_transport_terminal_bounds_test),
 	KUNIT_CASE(ane_transport_terminal_wrap_test),

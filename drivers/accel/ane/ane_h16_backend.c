@@ -28,6 +28,7 @@
 #include "ane_h16_boot.h"
 #include "ane_fw_irq_wait.h"
 #include "ane_fw_report_fifo.h"
+#include "ane_fw_pending.h"
 #include "ane_h16_execute.h"
 #include "ane_h16_preload.h"
 
@@ -852,6 +853,7 @@ enum {
 	ANE_H16_JOB_QUIET,	/* result only: UUID, handles, requested us, busy, CPU; two counter anchors */
 	ANE_H16_JOB_GAP,	/* result only: UUID, requested us, CPU; two gap counter anchors */
 	ANE_H16_JOB_RETURN,	/* result only: UUID, CPU, reserved; one EVENT-return counter */
+	ANE_H16_JOB_PENDING,	/* result only: bounded quiet-window samples */
 };
 
 #define ANE_H16_JOB_FILL_PROGRAM BIT(0)	/* u32 program handle at +8 */
@@ -883,6 +885,8 @@ struct ane_h16_job {
 	bool quiet_warmed, quiet_batch_pipelined;
 	struct ane_fw_report_fifo early;
 	u32 gap_warm_serial;
+	struct ane_fw_pending_sample *pending_samples;
+	u8 *pending_record;
 };
 
 static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
@@ -960,6 +964,100 @@ MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial E
 static unsigned int h16_job_gap_at;
 module_param(h16_job_gap_at, uint, 0444);
 MODULE_PARM_DESC(h16_job_gap_at, "Apply recovery gap only at this warmed serial EXEC ordinal1..128,0=every eligible call");
+/* Read-only firmware IRQ-delivery probe, only inside a one-time2ms gap.
+ * Mode1 is a private active-window control; mode2 also reads FW pending.
+ */
+static unsigned int h16_job_pending_mode;
+module_param(h16_job_pending_mode, uint, 0444);
+MODULE_PARM_DESC(h16_job_pending_mode, "Gap pending probe:0off,1private active control,2read FW pending; requires2ms one-shot gap");
+
+static u64 ane_h16_pending_counter(void *ctx)
+{
+	return get_cycles();
+}
+
+static u32 ane_h16_pending_cpu(void *ctx)
+{
+	return raw_smp_processor_id();
+}
+
+static u32 ane_h16_pending_read(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+
+	/* 25F84 FW0x8cd0 LDR32; explicit channel clear precedes ACK semaphore.
+	 * Read only. A write here would ACK firmware pending and is forbidden.
+	 */
+	return readl(h->window[ANE_H16_ENGINE] + 0x1888000);
+}
+
+static void ane_h16_pending_delay(void *ctx, u32 us)
+{
+	udelay(us);
+}
+
+static const struct ane_fw_pending_ops ane_h16_pending_ops = {
+	.now_ns = ane_h16_now,
+	.counter = ane_h16_pending_counter,
+	.cpu = ane_h16_pending_cpu,
+	.read_pending = ane_h16_pending_read,
+	.delay_us = ane_h16_pending_delay,
+};
+
+#define ANE_H16_PENDING_HEADER 64
+#define ANE_H16_PENDING_STRIDE 32
+#define ANE_H16_PENDING_BYTES (ANE_H16_PENDING_HEADER + ANE_FW_PENDING_MAX * ANE_H16_PENDING_STRIDE)
+
+static int ane_h16_pending_record(struct ane_h16_device *h, struct ane_h16_job *j,
+				 u64 uuid, u64 began, u64 until)
+{
+	u8 *p = j->pending_record;
+	u32 count, i, bit = h->boot.transport.channels[ANE_FW_IO_T2H].bit;
+	u64 active_begin = ktime_get_ns(), active_end;
+	int ret;
+
+	ret = ane_fw_pending_capture(h, &ane_h16_pending_ops, j->pending_samples,
+			ANE_FW_PENDING_MAX, until, h16_job_pending_mode == 2, &count);
+	active_end = ktime_get_ns();
+	if (ret && ret != -ENOSPC)
+		return ret;
+	put_unaligned_le64(uuid, p);
+	put_unaligned_le32(h16_job_pending_mode, p + 8);
+	put_unaligned_le32(count, p + 12);
+	put_unaligned_le32(bit, p + 16);
+	put_unaligned_le32(ANE_FW_PENDING_MAX, p + 20);
+	put_unaligned_le32(ANE_FW_PENDING_ACTIVE_US, p + 24);
+	put_unaligned_le32(2000, p + 28);
+	put_unaligned_le32(ret == -ENOSPC, p + 32);
+	put_unaligned_le32(0, p + 36);
+	put_unaligned_le64(active_begin, p + 40);
+	put_unaligned_le64(active_end, p + 48);
+	put_unaligned_le64(until, p + 56);
+	for (i = 0; i < count; i++) {
+		const struct ane_fw_pending_sample *sample = &j->pending_samples[i];
+		u8 *d = p + ANE_H16_PENDING_HEADER + i * ANE_H16_PENDING_STRIDE;
+
+		put_unaligned_le64(sample->before, d);
+		put_unaligned_le64(sample->after, d + 8);
+		put_unaligned_le32(sample->value, d + 16);
+		put_unaligned_le32(sample->before_cpu, d + 20);
+		put_unaligned_le32(sample->after_cpu, d + 24);
+		put_unaligned_le32(sample->valid, d + 28);
+	}
+	/* Serialization is inside the overall gap; its existing anchors include it.
+	 * Sleep only the remainder to the SAME original2ms absolute deadline.
+	 */
+	until = began + 2000 * NSEC_PER_USEC;
+	active_end = ktime_get_ns();
+	if (active_end < until) {
+		u32 remaining_us = DIV_ROUND_UP_ULL(until - active_end, NSEC_PER_USEC);
+
+		usleep_range(remaining_us, remaining_us + 10);
+	}
+	return ane_h16_job_emit(j, ANE_H16_JOB_PENDING, 0, ktime_get_ns() - began,
+			       p, ANE_H16_PENDING_HEADER + count * ANE_H16_PENDING_STRIDE);
+}
+
 static unsigned int h16_job_poll_us = 10;
 module_param(h16_job_poll_us, uint, 0444);
 MODULE_PARM_DESC(h16_job_poll_us, "Diagnostic job polling sleep10..1000us, default10");
@@ -1262,10 +1360,18 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 			put_unaligned_le32(raw_smp_processor_id(), gap + 12);
 			began = ktime_get_ns();
 			gap_counters[0] = get_cycles();
-			if (us > 100)
+			if (h16_job_pending_mode) {
+				ret = ane_h16_pending_record(h, j, get_unaligned_le64(command + 0x20),
+						began, began + ANE_FW_PENDING_ACTIVE_US * NSEC_PER_USEC);
+				if (ret) {
+					kfree(command);
+					return ret;
+				}
+			} else if (us > 100) {
 				usleep_range(us, us + 10);
-			else
+			} else {
 				udelay(us);
+			}
 			gap_counters[1] = get_cycles();
 			ret = ane_h16_job_emit_counters(j, ANE_H16_JOB_GAP, 0,
 						      ktime_get_ns() - began, gap, sizeof(gap), gap_counters, 2);
@@ -1577,9 +1683,22 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 		kvfree(in);
 		return -ENOMEM;
 	}
+	if (h16_job_pending_mode) {
+		j.pending_samples = kcalloc(ANE_FW_PENDING_MAX, sizeof(*j.pending_samples), GFP_KERNEL);
+		j.pending_record = kmalloc(ANE_H16_PENDING_BYTES, GFP_KERNEL);
+		if (!j.pending_samples || !j.pending_record) {
+			kfree(j.pending_samples);
+			kfree(j.pending_record);
+			vfree(j.out);
+			kvfree(in);
+			return -ENOMEM;
+		}
+	}
 	if (h16_job_early_drain) {
 		ret = ane_fw_report_fifo_init(&j.early);
 		if (ret) {
+			kfree(j.pending_samples);
+			kfree(j.pending_record);
 			vfree(j.out);
 			kvfree(in);
 			return ret;
@@ -1615,6 +1734,8 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 	ane_h16_job_result.size = j.used;
 	mutex_unlock(&ane_h16_lock);
 	ane_fw_report_fifo_free(&j.early);
+	kfree(j.pending_samples);
+	kfree(j.pending_record);
 	kvfree(in);
 	return ret ? ret : count;
 }
@@ -1890,6 +2011,13 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	}
 	if ((h16_job_irq || h16_job_early_drain) && h16_job_quiet_us) {
 		dev_err(&pdev->dev, "H16 IRQ/early-drain and quiet probes cannot be combined\n");
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (!ane_fw_pending_config_valid(h16_job_pending_mode, h16_job_gap_us, h16_job_gap_at) ||
+	    (h16_job_pending_mode && (h16_job_quiet_us || h16_job_early_drain ||
+				    soc->doorbell != 0x1884000))) {
+		dev_err(&pdev->dev, "H16 pending probe requires one-shot2ms gap, no quiet/early mode and T6041 layout\n");
 		ret = -EINVAL;
 		goto unlock;
 	}
