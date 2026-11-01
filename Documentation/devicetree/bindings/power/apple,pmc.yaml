@@ -112,6 +112,37 @@ patternProperties:
       - reg
       - '#power-domain-cells'
 
+  '^floor-[a-z0-9-]+$':
+    type: object
+    description: |
+      A rail floor, provided as a power domain. While the domain is powered,
+      the AP's voter agent holds the rail at least at the given performance
+      state. Floors on the same rail combine to the highest powered one. The
+      AP agent must be a static voter, and the DCS rail cannot have a floor.
+    additionalProperties: false
+
+    properties:
+      label:
+        description: Name of the power domain.
+
+      '#power-domain-cells':
+        const: 0
+
+      apple,rail:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Rail index.
+
+      apple,level:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 15
+        description: Performance state held while the domain is powered.
+
+    required:
+      - '#power-domain-cells'
+      - apple,rail
+      - apple,level
+
   '^performance-controller@[0-9a-f]+$':
     type: object
     description: The host performance controller's voter agent.
@@ -169,6 +200,13 @@ examples:
                 reg = <2>;
                 label = "gfx";
                 #power-domain-cells = <0>;
+            };
+
+            floor-soc-max {
+                label = "soc-max";
+                #power-domain-cells = <0>;
+                apple,rail = <1>;
+                apple,level = <2>;
             };
         };
     };

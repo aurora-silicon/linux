@@ -38,15 +38,22 @@ properties:
     maxItems: 5
 
   power-domains:
-    maxItems: 5
+    minItems: 5
+    maxItems: 6
 
   power-domain-names:
+    minItems: 5
     items:
       - const: dma
       - const: pipe4
       - const: pipe5
       - const: me0
       - const: me1
+      - const: perf
+        description: |
+          A performance floor the encoder needs to run at full speed, held
+          while the encoder is powered (for example the SoC rail floor of a
+          PMC).
 
   iommus:
     maxItems: 2
