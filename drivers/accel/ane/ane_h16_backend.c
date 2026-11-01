@@ -667,6 +667,10 @@ out:
  * {u32 op, s32 status, u64 ns, u32 length, u32 trailer, data} per job record. The
  * host builds every firmware command; the kernel maps, sends and waits.
  */
+static unsigned int h16_startup_drain_ms;
+module_param(h16_startup_drain_ms, uint, 0444);
+MODULE_PARM_DESC(h16_startup_drain_ms, "Service startup allocation/log channels before first IO, max1000ms, default0");
+
 static bool h16_job;
 module_param(h16_job, bool, 0444);
 MODULE_PARM_DESC(h16_job, "Diagnostic: after startup, run host-built jobs from debugfs ane_h16/job");
@@ -1103,7 +1107,7 @@ static void ane_h16_failure_publish(struct ane_h16_device *h)
 	void *live;
 	unsigned int i;
 
-	/* 25F84 fw IRQ receiver reads this pending register (firmware 0x8c88).
+	/* 25F84 fw IRQ receiver reads this pending register (firmware 0x8c90).
 	 * Read only: no inferred clear/ack semantics are used here.
 	 */
 	if (b->soc->doorbell == 0x1884000)
@@ -1153,6 +1157,7 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->boot.ctx = h;
 	h->boot.ops = &ane_h16_ops;
 	h->boot.transport_ops = &ane_h16_transport_ops;
+	h->boot.startup_drain_ms = min(h16_startup_drain_ms, 1000U);
 	h->shared_next = soc->h16_boot->shared_dva;
 	ret = of_property_read_u64_array(h->dev->of_node, "apple,dapf-ranges",
 					 &h->boot.ranges[0][0], 8);

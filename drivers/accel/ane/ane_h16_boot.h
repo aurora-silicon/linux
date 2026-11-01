@@ -120,6 +120,7 @@ struct ane_h16_boot {
 	u64 ranges[4][2];
 	u32 requests[5];
 	u32 tick;
+	u32 startup_drain_ms; /* Diagnostic only: service FW before first IO. */
 	u8 resource_info[100];
 	int error;
 	bool attempted;
@@ -505,6 +506,33 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 	const struct ane_h16_build *f = b->build;
 	unsigned int i;
 	int ret;
+
+	/* Isolate early-IO ordering without withholding allocation/log service. */
+	if (b->startup_drain_ms) {
+		u64 until = b->transport_ops->now_ns(b->ctx) +
+			(u64)min(b->startup_drain_ms, 1000U) * NSEC_PER_MSEC;
+
+		do {
+			u32 pending;
+
+			ret = ane_fw_transport_irq(&b->transport, &pending);
+			if (ret)
+				return ret;
+			ret = ane_fw_transport_shared(&b->transport);
+			if (ret && ret != -EAGAIN)
+				return ret;
+			ret = ane_fw_transport_terminal(&b->transport);
+			if (ret)
+				return ret;
+			b->ops->mailbox(b->ctx);
+			ret = ane_h16_faults(b, false);
+			if (ret)
+				return ret;
+			b->ops->delay_us(b->ctx, 10);
+		} while (b->transport_ops->now_ns(b->ctx) < until);
+		b->ops->log(b->ctx, "startup pre-IO shared/messages",
+			    b->transport.shared_count, b->transport.terminal_messages);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(f->startup); i++) {
 		u8 command[100] = {};
