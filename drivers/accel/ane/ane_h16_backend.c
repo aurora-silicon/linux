@@ -751,7 +751,7 @@ struct ane_h16_job {
 	unsigned int outstanding;
 	u64 last_exec_uuid;
 	u32 last_exec_handles[3], quiet_warm_handles[3];
-	bool quiet_warmed;
+	bool quiet_warmed, quiet_batch_pipelined;
 };
 
 static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
@@ -826,7 +826,8 @@ static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 	/* Only a warmed, single outstanding EXEC with the exact same identity.
 	 * Cached/pipelined completions must not masquerade as quiet execution.
 	 */
-	if (!us || j->outstanding != 1 || uuid != j->last_exec_uuid ||
+	if (!us || j->outstanding != 1 || j->quiet_batch_pipelined ||
+	    uuid != j->last_exec_uuid ||
 	    !j->quiet_warmed || memcmp(j->last_exec_handles,
 				     j->quiet_warm_handles, sizeof(j->last_exec_handles)))
 		return 0;
@@ -934,6 +935,8 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 	if (!ret) {
 		j->published_ns = start;
 		if (get_unaligned_le16(command + 4) == ANE_H16_EXECUTE) {
+			if (j->outstanding)
+				j->quiet_batch_pipelined = true;
 			j->outstanding++;
 			j->last_exec_uuid = get_unaligned_le64(command + 0x20);
 			memcpy(j->last_exec_handles, command + 8, sizeof(j->last_exec_handles));
@@ -1000,8 +1003,11 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 				bool terminal = state == ANE_H16_EVENT_SUCCESS ||
 						state == ANE_H16_EVENT_FAILURE;
 
-				if (terminal && j->outstanding)
+				if (terminal && j->outstanding) {
 					j->outstanding--;
+					if (!j->outstanding)
+						j->quiet_batch_pipelined = false;
+				}
 				if (id == uuid && terminal) {
 					if (state == ANE_H16_EVENT_SUCCESS && size >= 0x30 &&
 					    id == j->last_exec_uuid &&
