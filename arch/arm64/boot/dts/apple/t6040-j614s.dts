@@ -14,7 +14,7 @@
 
 / {
 	compatible = "apple,j614s", "apple,t6040", "apple,arm-platform";
-	model = "Apple MacBook Pro (14-inch, M4 Pro, Nov 2024)";
+	model = "Apple MacBook Pro (14-inch, M4 Pro)";
 };
 
 /* ADT /arm-io/wlan module-instance */
