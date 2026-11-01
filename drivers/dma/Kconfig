@@ -111,7 +111,7 @@ config APPLE_SIO_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Check which SIO device-tree nodes the probe goes on with: the
-	  generic SIO of the M1 and M2, and a T6030 SIO only with validated
+	  generic SIO of the M1 and M2, and T6030/T6041 SIO only with validated
 	  protocol-10 boot tables. The compatible selects the firmware layout.
 	  Also check protocol-9 table order, DMA array counts and ACK failures.
 
