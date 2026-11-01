@@ -44,7 +44,7 @@ static inline bool ane_fw_cold_gate_valid(const struct ane_fw_cold_state *s)
 
 static inline bool ane_fw_cold_engine_valid(const struct ane_fw_cold_state *s)
 {
-	unsigned int i, j;
+	unsigned int i;
 
 	if ((s->ce_state & 3) || s->ce_error || s->control || s->status != 0x6a ||
 	    s->rvbar != 0x10000000001ULL || s->pending)
@@ -52,14 +52,16 @@ static inline bool ane_fw_cold_engine_valid(const struct ane_fw_cold_state *s)
 	for (i = 0; i < ARRAY_SIZE(s->scratch); i++)
 		if (s->scratch[i])
 			return false;
+	/*
+	 * Stream enables are not judged: the Linux DART driver enables every
+	 * stream globally when it binds and isolates them through the per-stream
+	 * TCRs, so they read set on every boot once the DARTs are bound.
+	 */
 	for (i = 0; i < ANE_FW_DARTS; i++) {
 		if ((s->dart[i].version & 0xffff) != 0x203 ||
 		    (s->dart[i].protect & BIT(0)) ||
 		    (s->dart[i].lock & (BIT(0) | BIT(2))) || s->dart[i].error)
 			return false;
-		for (j = 0; j < ARRAY_SIZE(s->dart[i].enabled); j++)
-			if (s->dart[i].enabled[j])
-				return false;
 	}
 	return true;
 }

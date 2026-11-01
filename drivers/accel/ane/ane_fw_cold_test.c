@@ -116,10 +116,11 @@ static void ane_cold_dart_test(struct kunit *test)
 		s = original;
 		s.dart[i].error = 1;
 		KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+		/* The bound DART driver enables all streams; that is not a refusal. */
 		for (unsigned int j = 0; j < 16; j++) {
 			s = original;
-			s.dart[i].enabled[j] = BIT(31);
-			KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+			s.dart[i].enabled[j] = U32_MAX;
+			KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, true));
 		}
 	}
 }
