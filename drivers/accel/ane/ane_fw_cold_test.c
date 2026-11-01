@@ -136,7 +136,39 @@ static void ane_cold_command_policy_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, ane_fw_command_denied(permitted[i]));
 }
 
+/* The measured 26.6.2 layout: DATA ends 0x14000 short of the span. */
+static void ane_cold_heap_tail_test(struct kunit *test)
+{
+	u64 dva[2] = { 0x10000000000ULL, 0x100000c0000ULL };
+	u64 size[2] = { 0xc0000, 0x2ac000 };
+	const u64 pool = 0x10000384000ULL;
+	u64 tail = 0, tail_size = 0;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_heap_tail(dva, size, pool, &tail, &tail_size), 0);
+	KUNIT_EXPECT_EQ(test, tail, 0x1000036c000ULL);
+	KUNIT_EXPECT_EQ(test, tail_size, 0x14000ULL);
+	/* The faulting writes of neo-run-0045B lie inside the tail. */
+	KUNIT_EXPECT_LE(test, tail, 0x1000037c040ULL);
+	KUNIT_EXPECT_GT(test, tail + tail_size, 0x1000037fc00ULL);
+	/* DATA that ends the span leaves nothing to map. */
+	size[1] = ANE_FW_SPAN - 0xc0000;
+	KUNIT_ASSERT_EQ(test, ane_fw_heap_tail(dva, size, pool, &tail, &tail_size), 0);
+	KUNIT_EXPECT_EQ(test, tail_size, 0ULL);
+	/* DATA past the span, a partial page, overlap, or the pool: refused. */
+	size[1] = ANE_FW_SPAN;
+	KUNIT_EXPECT_EQ(test, ane_fw_heap_tail(dva, size, pool, &tail, &tail_size), -ERANGE);
+	size[1] = 0x2ab000;
+	KUNIT_EXPECT_EQ(test, ane_fw_heap_tail(dva, size, pool, &tail, &tail_size), -ERANGE);
+	size[1] = 0x2ac000;
+	dva[1] = 0x100000bc000ULL;
+	KUNIT_EXPECT_EQ(test, ane_fw_heap_tail(dva, size, pool, &tail, &tail_size), -ERANGE);
+	dva[1] = 0x100000c0000ULL;
+	KUNIT_EXPECT_EQ(test, ane_fw_heap_tail(dva, size, 0x10000370000ULL, &tail,
+					       &tail_size), -ERANGE);
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_heap_tail_test),
 	KUNIT_CASE(ane_cold_evidence_test),
 	KUNIT_CASE(ane_cold_step_test),
 	KUNIT_CASE(ane_cold_warm_test),

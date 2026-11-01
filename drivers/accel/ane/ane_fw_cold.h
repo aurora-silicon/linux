@@ -72,6 +72,30 @@ static inline bool ane_fw_cold_valid(const struct ane_fw_cold_state *s, bool raw
 	       ane_fw_cold_engine_valid(s);
 }
 
+/* Bytes of firmware memory from the TEXT DVA (boot argument +0x10). */
+#define ANE_FW_SPAN 0x380000ULL
+
+/*
+ * The firmware owns ANE_FW_SPAN bytes from its TEXT DVA, but the bootloader
+ * preload covers only TEXT and DATA. The firmware keeps runtime heap state in
+ * the rest of the span (0x14000 bytes past DATA on the 26.6.2 build), which
+ * the host supplies zeroed and device-writable before boot. Returns the tail
+ * DVA and size (0 when DATA ends the span), or -ERANGE when the layout would
+ * overlap DATA, is not in whole 16 KiB pages, or reaches the command pool.
+ */
+static inline int ane_fw_heap_tail(const u64 dva[2], const u64 size[2], u64 limit,
+				   u64 *tail, u64 *tail_size)
+{
+	u64 start = dva[1] + size[1], end = dva[0] + ANE_FW_SPAN;
+
+	if (dva[1] < dva[0] + size[0] || start < dva[1] || start > end ||
+	    !IS_ALIGNED(start, SZ_16K) || !IS_ALIGNED(end, SZ_16K) || end > limit)
+		return -ERANGE;
+	*tail = start;
+	*tail_size = end - start;
+	return 0;
+}
+
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc);
 bool ane_fw_staged_exit(void);
 

@@ -504,8 +504,8 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
 		0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
 	};
-	u64 physical[2], size[2], dva[2];
-	struct ane_fw_surface snapshots[2];
+	u64 physical[2], size[2], dva[2], tail, tail_size;
+	struct ane_fw_surface snapshots[2], heap_tail;
 	u8 digest[SHA256_DIGEST_SIZE], data_pin[SHA256_DIGEST_SIZE];
 	unsigned int i;
 	int ret;
@@ -534,7 +534,15 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 	}
 	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
 	dma_wmb();
-	return 0;
+	ret = ane_fw_heap_tail(dva, size, ANE_FW_POOL_DVA, &tail, &tail_size);
+	if (ret || !tail_size)
+		return ret;
+	/* Zeroed by the coherent allocation; kept until reset like the preload. */
+	ret = ane_fw_alloc_at(b, tail, tail_size, IOMMU_READ | IOMMU_WRITE, &heap_tail);
+	if (!ret)
+		dev_info(&b->pdev->dev, "ANE map: firmware heap tail at %#llx bytes %#llx\n",
+			 tail, tail_size);
+	return ret;
 }
 
 static int ane_fw_prepare(struct ane_fw_backend *b)
@@ -624,7 +632,7 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	    ane_rd32(b, scratch + 12) != 0xf00000 || ane_rd32(b, scratch + 16))
 		return -EPROTO;
 	put_unaligned_le64(b->ipc.dva, init + 8);
-	put_unaligned_le64(0x380000, init + 0x10);
+	put_unaligned_le64(ANE_FW_SPAN, init + 0x10);
 	put_unaligned_le64(0xfc80000, init + 0x18);
 	put_unaligned_le64(b->heap.dva, init + 0x20);
 	put_unaligned_le64(b->heap.size, init + 0x28);
