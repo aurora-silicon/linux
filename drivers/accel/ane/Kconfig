@@ -63,8 +63,9 @@ config DRM_ACCEL_ANE_PM_KUNIT_TEST
 	help
 	  Exercise supplier suspension, power-off verification failure and
 	  runtime resume errors against the runtime-PM and device-link core.
+	  Also check H14 system-sleep callback ordering, serialization and
+	  failed stop/restart submission fencing with a fake lifetime backend.
 	  No ANE hardware is required. These tests can run independently of
-	  the ANE driver on non-Apple platforms. Also test that firmware
-	  restarts cannot reuse a stale userspace program identifier.
+	  the ANE driver on non-Apple platforms.
 
 	  If unsure, say N.

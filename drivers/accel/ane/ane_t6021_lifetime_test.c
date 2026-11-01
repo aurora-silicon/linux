@@ -720,6 +720,29 @@ static const struct ane_t6021_restart_ops fr_ops = {
 	.boot = fr_boot,
 };
 
+static void restart_stop_boundary_test(struct kunit *test)
+{
+	struct fake_restart r = {};
+	static const char failures[] = "pwh";
+	unsigned int i;
+
+	/* System suspend stops here; its PM owner performs the power transition. */
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_stop(&fr_ops, &r, true), 0);
+	KUNIT_EXPECT_STREQ(test, r.log, "pwh");
+	memset(&r, 0, sizeof(r));
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_stop(&fr_ops, &r, false), 0);
+	KUNIT_EXPECT_STREQ(test, r.log, "h");
+	for (i = 0; i < sizeof(failures) - 1; i++) {
+		memset(&r, 0, sizeof(r));
+		r.fail = failures[i];
+		KUNIT_EXPECT_EQ(test, ane_t6021_restart_stop(&fr_ops, &r, true),
+				-ETIMEDOUT);
+		KUNIT_EXPECT_EQ(test, r.n, i + 1);
+		KUNIT_EXPECT_NULL(test, strchr(r.log, 'c'));
+		KUNIT_EXPECT_NULL(test, strchr(r.log, 'b'));
+	}
+}
+
 static void restart_state_machine_test(struct kunit *test)
 {
 	enum ane_t6021_restart_stage stage;
@@ -742,7 +765,7 @@ static void restart_state_machine_test(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, r.log, "pwh");
 	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_STOP);
 
-	/* No POWER_DOWN completion: not even the RUN clear is tried. */
+	/* POWER_DOWN not accepted: not even the RUN clear is tried. */
 	memset(&r, 0, sizeof(r));
 	r.fail = 'p';
 	KUNIT_EXPECT_NE(test, ane_t6021_restart_run(&fr_ops, &r, true, &stage), 0);
@@ -782,6 +805,7 @@ static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(progtab_cancel_test),
 	KUNIT_CASE(unload_order_test),
 	KUNIT_CASE(restart_state_machine_test),
+	KUNIT_CASE(restart_stop_boundary_test),
 	{}
 };
 

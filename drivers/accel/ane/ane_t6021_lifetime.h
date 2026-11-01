@@ -696,13 +696,14 @@ struct ane_t6021_restart_ops {
 	int (*boot)(void *ctx);		/* cold boot and handshake */
 };
 
-static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
-					void *ctx, bool planned,
-					enum ane_t6021_restart_stage *stage)
+/* The stop boundary is shared by runtime recovery and system sleep.
+ * The PM owner removes/restores power only after this returns success.
+ */
+static inline int ane_t6021_restart_stop(const struct ane_t6021_restart_ops *ops,
+					 void *ctx, bool planned)
 {
 	int ret;
 
-	*stage = ANE_T6021_RESTART_STOP;
 	if (planned) {
 		ret = ops->power_down(ctx);
 		if (!ret)
@@ -710,7 +711,17 @@ static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
 		if (ret)
 			return ret;
 	}
-	ret = ops->halt(ctx);
+	return ops->halt(ctx);
+}
+
+static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
+					void *ctx, bool planned,
+					enum ane_t6021_restart_stage *stage)
+{
+	int ret;
+
+	*stage = ANE_T6021_RESTART_STOP;
+	ret = ane_t6021_restart_stop(ops, ctx, planned);
 	if (ret)
 		return ret;
 	*stage = ANE_T6021_RESTART_CYCLE;
