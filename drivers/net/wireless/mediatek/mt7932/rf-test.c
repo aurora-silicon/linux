@@ -412,6 +412,40 @@ static void mt_rf_failure_during_publication_test(struct kunit *test)
 	m->connect_publishing = false;
 }
 
+/* mt_connect() has marked a move but not yet left the old AP. It reports the
+ * end of the connection itself once its admission check sees link_failed, so
+ * the RF failure must not report it too, nor queue it behind a publishing
+ * worker, which mt_connect() joins first. The synthetic netdev has no wdev:
+ * a cfg80211 report here would not survive.
+ */
+static void mt_rf_failure_at_move_start_test(struct kunit *test)
+{
+	struct mt7932 *m = test->priv;
+	unsigned int publishing;
+
+	for (publishing = 0; publishing < 2; publishing++) {
+		m->connecting = false;
+		m->connected = true;
+		m->disconnecting = false;
+		m->link_failed = false;
+		m->rf_ready = true;
+		m->roam_moving = true;
+		m->connect_publishing = publishing;
+		netif_carrier_on(m->netdev);
+		mt_rf_test_fail(m, -EIO);
+		KUNIT_EXPECT_FALSE(test, m->connected);
+		KUNIT_EXPECT_TRUE(test, m->disconnecting);
+		KUNIT_EXPECT_TRUE(test, m->link_failed);
+		KUNIT_EXPECT_FALSE(test, m->connect_lost);
+		KUNIT_EXPECT_TRUE(test, m->roam_moving);
+		KUNIT_EXPECT_FALSE(test, mt_rf_allowed(m));
+		KUNIT_EXPECT_FALSE(test, netif_carrier_ok(m->netdev));
+		KUNIT_EXPECT_TRUE(test, m->peer_valid);
+	}
+	m->roam_moving = false;
+	m->connect_publishing = false;
+}
+
 static void mt_invalid_association_channel_wakes_both_test(struct kunit *test)
 {
 	struct mt7932 *m = test->priv;
@@ -538,6 +572,7 @@ static struct kunit_case mt_rf_test_cases[] = {
 	KUNIT_CASE(mt_rf_failure_preserves_first_error_test),
 	KUNIT_CASE(mt_scan_quiesce_retirement_test),
 	KUNIT_CASE(mt_rf_failure_during_publication_test),
+	KUNIT_CASE(mt_rf_failure_at_move_start_test),
 	{}
 };
 

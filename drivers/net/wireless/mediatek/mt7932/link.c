@@ -88,13 +88,16 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	} else if (m->connected) {
 		/* Hardware ownership is uncertain: report failure, retain the peer.
 		 * A connect worker still publishing the connection reports this
-		 * after it, so that cfg80211 sees the two in order.
+		 * after it, so that cfg80211 sees the two in order. A move that
+		 * mt_connect() has just started leaves it to that: its admission
+		 * check sees link_failed and reports the end of the connection,
+		 * after joining any such worker.
 		 */
 		m->connected = false;
 		m->disconnecting = true;
-		if (m->connect_publishing)
+		if (m->connect_publishing && !m->roam_moving)
 			m->connect_lost = true;
-		else
+		else if (!m->roam_moving)
 			mt_report_disconnected(m, WLAN_REASON_UNSPECIFIED, true, GFP_ATOMIC);
 	}
 	if (m->scan_request) {
@@ -1010,6 +1013,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connecting = true;
 unlock:
 	if (ret && roam) {
+		/* mt_disconnect() does nothing once the host is stopping, so the
+		 * old connection may still be marked here. Clear it, or
+		 * mt_stop_host() would report its end a second time.
+		 */
+		m->connected = false;
 		WRITE_ONCE(m->roam_moving, false);
 		netif_carrier_off(m->netdev);
 		cfg80211_disconnected(m->netdev, WLAN_REASON_DEAUTH_LEAVING, NULL, 0, true,
