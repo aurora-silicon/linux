@@ -5,6 +5,7 @@
 
 #include "ane_fw_transport.h"
 #include "ane_fw_irq_wait.h"
+#include "ane_fw_irq_coalesce.h"
 #include "ane_fw_pending.h"
 #include "ane_job_gap.h"
 #include "ane_fw_ack_pending.h"
@@ -1397,7 +1398,98 @@ static void ane_job_gap_schedule_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(125, 0, 6, false, false, true));
 }
 
+struct ane_coalesce_fake {
+	u64 now, step, error_at, error_delay;
+	u32 error_calls, advance_on_call;
+};
+static u64 ane_coalesce_test_now(void *ctx)
+{
+	return ((struct ane_coalesce_fake *)ctx)->now;
+}
+static int ane_coalesce_test_error(void *ctx)
+{
+	struct ane_coalesce_fake *f = ctx;
+
+	if (++f->error_calls == f->advance_on_call)
+		f->now += f->error_delay;
+	return f->error_at && f->now >= f->error_at ? -EIO : 0;
+}
+static void ane_coalesce_test_delay(void *ctx, u32 us)
+{
+	struct ane_coalesce_fake *f = ctx;
+
+	f->now += f->step * us;
+}
+static const struct ane_fw_irq_coalesce_ops ane_coalesce_test_ops = {
+	.now_ns = ane_coalesce_test_now,
+	.error = ane_coalesce_test_error,
+	.delay_us = ane_coalesce_test_delay,
+};
+static void ane_irq_coalesce_deadline_test(struct kunit *test)
+{
+	struct ane_coalesce_fake f = { .step = 1000 };
+	struct ane_fw_irq_coalesce_result r;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 100000, &r), 0);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 5000ULL);
+	KUNIT_EXPECT_EQ(test, r.iterations, 5U);
+	KUNIT_EXPECT_FALSE(test, r.clipped);
+	f.now = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 3000, &r), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 3000ULL);
+	KUNIT_EXPECT_TRUE(test, r.clipped);
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 3000, &r), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 0ULL);
+}
+static void ane_irq_coalesce_error_and_overshoot_test(struct kunit *test)
+{
+	struct ane_coalesce_fake f = { .step = 1000, .error_at = 2000 };
+	struct ane_fw_irq_coalesce_result r;
+
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 100000, &r), -EIO);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 2000ULL);
+	f.now = 0;
+	f.error_at = 0;
+	f.step = 50000;
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 100000, &r), 0);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 50000ULL); /* retain preemption overshoot */
+	f.now = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 25, 20000, &r), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 50000ULL);
+}
+static void ane_irq_coalesce_final_check_preemption_test(struct kunit *test)
+{
+	struct ane_coalesce_fake f = { .step = 1000, .advance_on_call = 6,
+		.error_delay = 200000 };
+	struct ane_fw_irq_coalesce_result r;
+
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 100000, &r), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 205000ULL);
+	f = (struct ane_coalesce_fake) { .step = 1000, .advance_on_call = 2,
+		.error_delay = 200000, .error_at = 1000 };
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 100000, &r), -EIO);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 201000ULL);
+}
+
+static void ane_irq_coalesce_bounds_test(struct kunit *test)
+{
+	struct ane_coalesce_fake f = {};
+	struct ane_fw_irq_coalesce_result r;
+
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 0, 100000, &r), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 26, 100000, &r), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, 100000, &r), -EIO);
+	KUNIT_EXPECT_EQ(test, r.iterations, 128U);
+	KUNIT_EXPECT_EQ(test, r.elapsed_ns, 0ULL);
+	f.now = U64_MAX - 1000;
+	KUNIT_EXPECT_EQ(test, ane_fw_irq_coalesce(&f, &ane_coalesce_test_ops, 5, U64_MAX, &r), -EOVERFLOW);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_irq_coalesce_deadline_test),
+	KUNIT_CASE(ane_irq_coalesce_error_and_overshoot_test),
+	KUNIT_CASE(ane_irq_coalesce_bounds_test),
+	KUNIT_CASE(ane_irq_coalesce_final_check_preemption_test),
 	KUNIT_CASE(ane_job_gap_schedule_test),
 	KUNIT_CASE(ane_ack_pending_read_order_test),
 	KUNIT_CASE(ane_ack_pending_private_test),

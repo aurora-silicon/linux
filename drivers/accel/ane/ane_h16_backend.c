@@ -27,6 +27,7 @@
 
 #include "ane_h16_boot.h"
 #include "ane_fw_irq_wait.h"
+#include "ane_fw_irq_coalesce.h"
 #include "ane_fw_report_fifo.h"
 #include "ane_fw_pending.h"
 #include "ane_job_gap.h"
@@ -83,6 +84,7 @@ struct ane_h16_device {
 	atomic_t irq_status_count[ANE_FW_CHANNELS];
 	cpumask_t irq_seen_cpus;
 	u32 irq_job_base[6];
+	struct ane_fw_irq_coalesce_stats coalesce_stats[2]; /* CMD, EVENT */
 	u32 mailbox_rx_count;
 	struct ane_fw_rtk rtk;
 	struct {
@@ -1004,6 +1006,10 @@ MODULE_PARM_DESC(h16_job_quiet_wake_us, "Optional private periodic wakes inside 
 static unsigned int h16_job_quiet_work_ns;
 module_param(h16_job_quiet_work_ns, uint, 0444);
 MODULE_PARM_DESC(h16_job_quiet_work_ns, "Private work after each quiet wake, at most10000ns");
+static unsigned int h16_job_irq_coalesce_us;
+module_param(h16_job_irq_coalesce_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_irq_coalesce_us, "Experimental worker delay after IRQ wake,0off/1..25us; preserves original deadline/ACK writes");
+
 static unsigned int h16_job_gap_us;
 module_param(h16_job_gap_us, uint, 0444);
 MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial EXECUTE, max2000us/default0; >100us sleeps; included in throughput");
@@ -1219,8 +1225,28 @@ static int ane_h16_job_irq_service(struct ane_h16_device *h, bool *progress)
 	return ret ? ret : ane_h16_job_irq_error(h);
 }
 
+static u64 ane_h16_coalesce_now(void *ctx)
+{
+	return ktime_get_ns();
+}
+static int ane_h16_coalesce_error(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+
+	return ane_fw_irq_event_error(&h->irq_event);
+}
+static void ane_h16_coalesce_delay(void *ctx, u32 us)
+{
+	udelay(us);
+}
+static const struct ane_fw_irq_coalesce_ops ane_h16_coalesce_ops = {
+	.now_ns = ane_h16_coalesce_now,
+	.error = ane_h16_coalesce_error,
+	.delay_us = ane_h16_coalesce_delay,
+};
+
 static int ane_h16_job_irq_pause(struct ane_h16_device *h, unsigned int sequence,
-				 u64 deadline, u64 spin_deadline)
+				 u64 deadline, u64 spin_deadline, bool event_wait)
 {
 	u64 now = ktime_get_ns(), remaining;
 	int ret;
@@ -1238,8 +1264,26 @@ static int ane_h16_job_irq_pause(struct ane_h16_device *h, unsigned int sequence
 		return ane_fw_transport_fail(&h->boot.transport, ret);
 	if (!ret)
 		atomic_inc(&h->irq_timeouts);
-	else
+	else {
 		atomic_inc(&h->irq_woken);
+		if (h16_job_irq_coalesce_us) {
+			struct ane_fw_irq_coalesce_result result;
+			struct ane_fw_irq_coalesce_stats *stats = &h->coalesce_stats[event_wait];
+
+			ret = ane_fw_irq_coalesce(h, &ane_h16_coalesce_ops,
+					h16_job_irq_coalesce_us, deadline, &result);
+			stats->calls++;
+			stats->total_ns += result.elapsed_ns;
+			if (stats->calls == 1 || result.elapsed_ns < stats->min_ns)
+				stats->min_ns = result.elapsed_ns;
+			stats->max_ns = max(stats->max_ns, result.elapsed_ns);
+			stats->iterations += result.iterations;
+			stats->clipped += result.clipped;
+			stats->errors += !!ret;
+			if (ret)
+				return ane_fw_transport_fail(&h->boot.transport, ret);
+		}
+	}
 	return ane_h16_job_irq_error(h);
 }
 
@@ -1338,7 +1382,7 @@ static int ane_h16_job_wait(struct ane_h16_device *h, struct ane_h16_job *j,
 			if (progress || early_progress)
 				continue;
 			ret = ane_h16_job_irq_pause(h, sequence, t->pending[ch].deadline_ns,
-						     spin_deadline);
+						     spin_deadline, false);
 			if (ret)
 				return ret;
 			continue;
@@ -1560,7 +1604,7 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 				return ane_fw_transport_fail(t, r);
 			if (progress)
 				continue;
-			r = ane_h16_job_irq_pause(h, sequence, deadline, spin_deadline);
+			r = ane_h16_job_irq_pause(h, sequence, deadline, spin_deadline, true);
 			if (r)
 				return r;
 			ret = -ETIMEDOUT;
@@ -1680,6 +1724,7 @@ static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
 
 static void ane_h16_irq_job_begin(struct ane_h16_device *h)
 {
+	memset(h->coalesce_stats, 0, sizeof(h->coalesce_stats));
 	h->irq_job_base[0] = atomic_read(&h->irq_calls);
 	h->irq_job_base[1] = atomic_read(&h->irq_notifications);
 	h->irq_job_base[2] = atomic_read(&h->irq_empty);
@@ -1715,6 +1760,14 @@ static int ane_h16_irq_stats_show(struct seq_file *s, void *unused)
 		   cpumask_pr_args(&h->irq_seen_cpus), cpumask_pr_args(effective));
 	for (i = 0; i < ANE_FW_CHANNELS; i++)
 		seq_printf(s, "%s%u", i ? "," : "", (u32)atomic_read(&h->irq_status_count[i]));
+	seq_printf(s, "],\"coalesce_us\":%u,\"coalesce\":[", h16_job_irq_coalesce_us);
+	for (i = 0; i < 2; i++) {
+		struct ane_fw_irq_coalesce_stats *c = &h->coalesce_stats[i];
+
+		seq_printf(s, "%s{\"source\":\"%s\",\"calls\":%llu,\"total_ns\":%llu,\"min_ns\":%llu,\"max_ns\":%llu,\"iterations\":%llu,\"clipped\":%llu,\"errors\":%llu}",
+			i ? "," : "", i ? "EVENT" : "CMD", c->calls, c->total_ns,
+			c->min_ns, c->max_ns, c->iterations, c->clipped, c->errors);
+	}
 	seq_puts(s, "]}\n");
 	return 0;
 }
@@ -2072,6 +2125,14 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	}
 	if ((h16_job_irq || h16_job_early_drain) && h16_job_quiet_us) {
 		dev_err(&pdev->dev, "H16 IRQ/early-drain and quiet probes cannot be combined\n");
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (h16_job_irq_coalesce_us > ANE_FW_IRQ_COALESCE_MAX_US ||
+	    (h16_job_irq_coalesce_us && (!h16_job_irq || h16_job_quiet_us ||
+	     h16_job_gap_us || h16_job_early_drain || h16_job_pending_mode ||
+	     h16_job_ack_pending_mode))) {
+		dev_err(&pdev->dev, "H16 IRQ coalescing requires IRQ and excludes gap/quiet/early/pending probes\n");
 		ret = -EINVAL;
 		goto unlock;
 	}
