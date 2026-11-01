@@ -162,10 +162,10 @@ static inline int ane_h16_faults(struct ane_h16_boot *b, bool log)
 	for (i = 0; i < 3; i++) {
 		enum ane_h16_window w = ANE_H16_DART0 + i;
 		u32 status = b->ops->read32(b->ctx, w, f->dart_fault);
-		u64 address = b->ops->read32(b->ctx, w, f->dart_address_lo);
-
-		address |= (u64)b->ops->read32(b->ctx, w, f->dart_address_hi) << 32;
 		if (log || (status & BIT(31))) {
+			u64 address = b->ops->read32(b->ctx, w, f->dart_address_lo);
+
+			address |= (u64)b->ops->read32(b->ctx, w, f->dart_address_hi) << 32;
 			b->ops->log(b->ctx, "DART status", i, status);
 			b->ops->log(b->ctx, "DART address", i, address);
 		}
