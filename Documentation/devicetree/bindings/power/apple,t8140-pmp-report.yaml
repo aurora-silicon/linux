@@ -115,7 +115,20 @@ patternProperties:
         const: 0
 
       power-domains:
-        maxItems: 1
+        minItems: 1
+        maxItems: 2
+
+      apple,dvfs:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - description: SOC-DEV-DVFS entry holding the device's request.
+          - description: Performance level requested while powered (0-31).
+            maximum: 31
+        description:
+          The device also has a performance request. While the domain is
+          powered, after the PMP acknowledges the device, the host writes the
+          level (with the valid bit) to the entry once; before clearing the
+          device request it writes level 0.
 
       apple,always-on:
         type: boolean
