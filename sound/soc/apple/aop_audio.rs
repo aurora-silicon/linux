@@ -81,6 +81,8 @@ impl fmt::Debug for U32 {
 
 const EPIC_SUBTYPE_WRAPPED_CALL: u16 = 0x20;
 const CALLTYPE_AUDIO_ATTACH_DEVICE: u32 = 0xc3000002;
+/// kIOReturnBusy: the firmware keeps an attachment for its lifetime, so a reload sees this.
+const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 const CALLTYPE_AUDIO_SET_PROP: u32 = 0xc3000005;
 const DECIM_NUM_COEFFS: usize = 120;
 const DECIM_NUM_COEFFS_HF: usize = 1023;
@@ -697,9 +699,14 @@ impl SndSocAopData {
         }
         Ok(())
     }
+    /// A device the firmware still holds from before a module reload counts as attached.
     fn audio_attach_device(&self, dev_id: u32) -> Result<()> {
         let msg = AudioAttachDevice::new(dev_id);
         let ret = self.epic_wrapped_call(&msg)?;
+        if ret == AUDIO_RET_BUSY {
+            dev_dbg!(self.dev, "device {:#x} still attached\n", dev_id);
+            return Ok(());
+        }
         if ret != 0 {
             dev_err!(
                 self.dev,
