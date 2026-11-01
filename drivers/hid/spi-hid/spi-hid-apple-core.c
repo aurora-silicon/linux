@@ -293,9 +293,9 @@ static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 				    sizeof(spi_hid_apple_status_ok));
 	if (bad_status) {
 		u8 *b = spihid->status_buf;
-		dev_warn_ratelimited(&spihid->spidev->dev, "status message "
-				     "mismatch: %02x %02x %02x %02x\n",
-				     b[0], b[1], b[2], b[3]);
+		dev_warn_ratelimited(&spihid->spidev->dev,
+				     "status message mismatch: %02x %02x %02x %02x (device %u request %02x report %02x id %u)\n",
+				     b[0], b[1], b[2], b[3], target, unk0, unk1, hdr->id);
 	}
 	if (err < 0 || bad_status) {
 		/*
