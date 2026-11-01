@@ -29,6 +29,7 @@
 #include "ane_fw_irq_wait.h"
 #include "ane_fw_report_fifo.h"
 #include "ane_fw_pending.h"
+#include "ane_fw_ack_pending.h"
 #include "ane_h16_execute.h"
 #include "ane_h16_preload.h"
 
@@ -47,6 +48,7 @@ struct ane_h16_mapping {
 #define ANE_H16_CONSUME_TRACE_MAX 256
 struct ane_h16_consume_trace {
 	struct ane_fw_consume_trace transport;
+	struct ane_fw_ack_pending_trace ack_pending;
 	u64 begin_counter, end_counter, uuid;
 	u32 token, command_id, state, begin_cpu, end_cpu, irq_before, irq_after;
 };
@@ -69,6 +71,7 @@ struct ane_h16_device {
 	int irq;
 	bool job_irq_mode;
 	struct ane_h16_consume_trace *consume_trace;
+	struct ane_fw_ack_pending_trace *active_ack_pending;
 	u32 consume_trace_count, consume_trace_dropped;
 	u32 early_consumes, early_peak, early_remaining, early_full_errors;
 	u64 snapshot_sequence, snapshot_begin, snapshot_end;
@@ -100,6 +103,10 @@ struct ane_h16_device {
 static bool h16_job_irq;
 module_param(h16_job_irq, bool, 0444);
 MODULE_PARM_DESC(h16_job_irq, "Diagnostic IRQ completion after startup, default0; incompatible with quiet probes");
+
+static unsigned int h16_job_ack_pending_mode;
+module_param(h16_job_ack_pending_mode, uint, 0444);
+MODULE_PARM_DESC(h16_job_ack_pending_mode, "Per-report ACK observer:0off,1private bookkeeping,2read FW pending; requires consume trace");
 
 static bool h16_job_trace;
 module_param(h16_job_trace, bool, 0444);
@@ -495,11 +502,49 @@ static void ane_h16_startup_record(struct ane_h16_device *h, u32 type, u32 value
 	h->startup_trace_count++;
 }
 
+static u64 ane_h16_ack_counter(void *ctx)
+{
+	return get_cycles();
+}
+
+static u32 ane_h16_ack_cpu(void *ctx)
+{
+	return raw_smp_processor_id();
+}
+
+static u32 ane_h16_ack_read(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+
+	return readl(h->window[ANE_H16_ENGINE] + 0x1888000);
+}
+
+static void ane_h16_ack_write(void *ctx, u32 value)
+{
+	struct ane_h16_device *h = ctx;
+
+	ane_h16_mmio_write32(h, ANE_H16_ENGINE, h->boot.soc->doorbell, value);
+}
+
+static const struct ane_fw_ack_pending_ops ane_h16_ack_ops = {
+	.counter = ane_h16_ack_counter,
+	.cpu = ane_h16_ack_cpu,
+	.read_pending = ane_h16_ack_read,
+	.write_doorbell = ane_h16_ack_write,
+};
+
 static void ane_h16_engine_write(void *ctx, u32 offset, u32 value)
 {
 	struct ane_h16_device *h = ctx;
 
-	ane_h16_mmio_write32(ctx, ANE_H16_ENGINE, offset, value);
+	if (h16_job_ack_pending_mode && h->active_ack_pending &&
+	    offset == h->boot.soc->doorbell &&
+	    value == BIT(h->boot.transport.channels[ANE_FW_IO_T2H].bit))
+		ane_fw_ack_pending_observe(h, &ane_h16_ack_ops, h->active_ack_pending,
+				h16_job_ack_pending_mode,
+				h->boot.transport.channels[ANE_FW_IO_T2H].bit, value);
+	else
+		ane_h16_mmio_write32(ctx, ANE_H16_ENGINE, offset, value);
 	if (offset == h->boot.soc->doorbell)
 		ane_h16_startup_record(h, 1, value);
 	if (offset == h->boot.soc->irq_ack) {
@@ -1204,7 +1249,7 @@ static int ane_h16_job_capture(void *ctx, struct ane_fw_report *packet)
 	struct ane_h16_device *h = c->h;
 	struct ane_h16_job *j = c->j;
 	struct ane_fw_transport *t = &h->boot.transport;
-	struct ane_h16_consume_trace trace;
+	struct ane_h16_consume_trace trace = {};
 	bool tracing = h->consume_trace && h->consume_trace_count < ANE_H16_CONSUME_TRACE_MAX;
 	u8 *report = packet->data;
 	size_t size = 0;
@@ -1216,8 +1261,13 @@ static int ane_h16_job_capture(void *ctx, struct ane_fw_report *packet)
 		trace.irq_before = atomic_read(&h->irq_calls);
 		trace.begin_counter = get_cycles();
 	}
+	/* Valid only during this synchronous consume. Always clear before any
+	 * return, including EAGAIN/ENOSPC/errors; IRQ ACK offsets never match.
+	 */
+	h->active_ack_pending = tracing && h16_job_ack_pending_mode ? &trace.ack_pending : NULL;
 	r = ane_fw_transport_consume_traced(t, report, sizeof(packet->data), &size,
 					 tracing ? &trace.transport : NULL);
+	h->active_ack_pending = NULL;
 	if (r)
 		return r;
 	ns = ktime_get_ns() - j->published_ns;
@@ -1771,9 +1821,9 @@ static int ane_h16_consume_trace_show(struct seq_file *m, void *unused)
 	u32 i, k;
 
 	mutex_lock(&ane_h16_lock);
-	seq_printf(m, "{\"schema\":1,\"enabled\":%s,\"count\":%u,\"dropped\":%u,\"records\":[",
+	seq_printf(m, "{\"schema\":1,\"enabled\":%s,\"count\":%u,\"dropped\":%u,\"ack_pending_mode\":%u,\"records\":[",
 		   h->consume_trace ? "true" : "false", h->consume_trace_count,
-		   h->consume_trace_dropped);
+		   h->consume_trace_dropped, h16_job_ack_pending_mode);
 	for (i = 0; i < h->consume_trace_count; i++) {
 		struct ane_h16_consume_trace *r = &h->consume_trace[i];
 
@@ -1785,7 +1835,13 @@ static int ane_h16_consume_trace_show(struct seq_file *m, void *unused)
 			   r->irq_before, r->irq_after);
 		for (k = 0; k < ARRAY_SIZE(r->transport.ns); k++)
 			seq_printf(m, "%s%llu", k ? "," : "", r->transport.ns[k]);
-		seq_puts(m, "]}");
+		seq_printf(m, "],\"ack_pending\":{\"mode\":%u,\"calls\":%u,\"bit\":%u,\"valid\":%u,\"before_value\":%u,\"after_value\":%u,\"before_cpu\":%u,\"after_cpu\":%u,\"counters\":[",
+			   r->ack_pending.mode, r->ack_pending.calls, r->ack_pending.bit,
+			   r->ack_pending.valid, r->ack_pending.before_value, r->ack_pending.after_value,
+			   r->ack_pending.before_cpu, r->ack_pending.after_cpu);
+		for (k = 0; k < ARRAY_SIZE(r->ack_pending.counters); k++)
+			seq_printf(m, "%s%llu", k ? "," : "", r->ack_pending.counters[k]);
+		seq_puts(m, "]}}");
 	}
 	seq_puts(m, "]}\n");
 	mutex_unlock(&ane_h16_lock);
@@ -2018,6 +2074,14 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	    (h16_job_pending_mode && (h16_job_quiet_us || h16_job_early_drain ||
 				    soc->doorbell != 0x1884000))) {
 		dev_err(&pdev->dev, "H16 pending probe requires one-shot2ms gap, no quiet/early mode and T6041 layout\n");
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (h16_job_ack_pending_mode > 2 || (h16_job_ack_pending_mode &&
+	    (!h16_job_trace || h16_job_pending_mode || h16_job_quiet_us ||
+	     h16_job_early_drain || soc->doorbell != 0x1884000 ||
+	     !ane_fw_pending_config_valid(1, h16_job_gap_us, h16_job_gap_at)))) {
+		dev_err(&pdev->dev, "H16 ACK pending observer requires trace and one-shot2ms gap, without other observers\n");
 		ret = -EINVAL;
 		goto unlock;
 	}

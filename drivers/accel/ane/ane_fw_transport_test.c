@@ -6,6 +6,7 @@
 #include "ane_fw_transport.h"
 #include "ane_fw_irq_wait.h"
 #include "ane_fw_pending.h"
+#include "ane_fw_ack_pending.h"
 #include "ane_h16_execute.h"
 
 #define TEST_IPC_DVA 0x100003d0000ULL
@@ -1101,6 +1102,100 @@ static void ane_transport_terminal_wrap_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + ANE_FW_SLOT_SIZE), 1ULL);
 }
 
+struct ane_ack_pending_test {
+	char access[16];
+	u32 used, writes, written, reads;
+	u64 counter;
+};
+
+static u64 ane_ack_test_counter(void *ctx)
+{
+	return ++((struct ane_ack_pending_test *)ctx)->counter;
+}
+
+static u32 ane_ack_test_cpu(void *ctx)
+{
+	return 0;
+}
+
+static u32 ane_ack_test_read(void *ctx)
+{
+	struct ane_ack_pending_test *f = ctx;
+
+	f->access[f->used++] = 'R';
+	return f->reads++ ? 0 : BIT(6);
+}
+
+static void ane_ack_test_write(void *ctx, u32 value)
+{
+	struct ane_ack_pending_test *f = ctx;
+
+	f->access[f->used++] = 'W';
+	f->writes++;
+	f->written = value;
+}
+
+static const struct ane_fw_ack_pending_ops ane_ack_test_ops = {
+	.counter = ane_ack_test_counter,
+	.cpu = ane_ack_test_cpu,
+	.read_pending = ane_ack_test_read,
+	.write_doorbell = ane_ack_test_write,
+};
+
+static void ane_ack_pending_read_order_test(struct kunit *test)
+{
+	struct ane_ack_pending_test f = {};
+	struct ane_fw_ack_pending_trace t = {};
+	u32 i;
+
+	ane_fw_ack_pending_observe(&f, &ane_ack_test_ops, &t, 2, 6, BIT(6));
+	KUNIT_EXPECT_MEMEQ(test, f.access, "RWR", 3);
+	KUNIT_EXPECT_EQ(test, f.used, 3U);
+	KUNIT_EXPECT_EQ(test, f.writes, 1U);
+	KUNIT_EXPECT_EQ(test, f.written, (u32)BIT(6));
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_EQ(test, t.mode, 2U);
+	KUNIT_EXPECT_EQ(test, t.bit, 6U);
+	KUNIT_EXPECT_EQ(test, t.valid, 1U);
+	KUNIT_EXPECT_EQ(test, t.before_value, (u32)BIT(6));
+	KUNIT_EXPECT_EQ(test, t.after_value, 0U);
+	for (i = 0; i < ARRAY_SIZE(t.counters); i++)
+		KUNIT_EXPECT_EQ(test, t.counters[i], (u64)i + 1);
+}
+
+static void ane_ack_pending_private_test(struct kunit *test)
+{
+	struct ane_ack_pending_test f = {};
+	struct ane_fw_ack_pending_trace t = {};
+
+	ane_fw_ack_pending_observe(&f, &ane_ack_test_ops, &t, 1, 6, BIT(6));
+	KUNIT_EXPECT_EQ(test, f.used, 1U);
+	KUNIT_EXPECT_EQ(test, f.access[0], 'W');
+	KUNIT_EXPECT_EQ(test, f.writes, 1U);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, t.calls, 1U);
+	KUNIT_EXPECT_EQ(test, t.valid, 0U);
+	KUNIT_EXPECT_EQ(test, t.before_value, 0U);
+	KUNIT_EXPECT_EQ(test, t.after_value, 0U);
+	KUNIT_EXPECT_EQ(test, t.counters[5], 6ULL);
+}
+
+static void ane_ack_pending_disabled_test(struct kunit *test)
+{
+	struct ane_ack_pending_test f = {};
+	struct ane_fw_ack_pending_trace t = {};
+
+	ane_fw_ack_pending_observe(&f, &ane_ack_test_ops, &t, 0, 6, BIT(6));
+	KUNIT_EXPECT_EQ(test, f.writes, 1U);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.counter, 0ULL);
+	KUNIT_EXPECT_EQ(test, t.calls, 0U);
+	ane_fw_ack_pending_observe(&f, &ane_ack_test_ops, NULL, 2, 6, BIT(6));
+	KUNIT_EXPECT_EQ(test, f.writes, 2U);
+	KUNIT_EXPECT_EQ(test, f.reads, 0U);
+	KUNIT_EXPECT_EQ(test, f.counter, 0ULL);
+}
+
 struct ane_pending_test {
 	u64 ns, counter;
 	u32 reads, delays, cpus;
@@ -1277,6 +1372,9 @@ static void ane_pending_invalid_config_test(struct kunit *test)
 }
 
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_ack_pending_read_order_test),
+	KUNIT_CASE(ane_ack_pending_private_test),
+	KUNIT_CASE(ane_ack_pending_disabled_test),
 	KUNIT_CASE(ane_pending_deadline_and_migration_test),
 	KUNIT_CASE(ane_pending_private_control_test),
 	KUNIT_CASE(ane_pending_capacity_test),
