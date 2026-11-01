@@ -17,6 +17,12 @@
  * and models each dynamic agent as a power domain that sits between the
  * device and its PMGR power state, which gives the same ordering.
  *
+ * A rail floor is a power domain too: while any device in it is powered,
+ * the AP's own agent holds that rail at a given performance state. The AVE
+ * encoder on the M4 Pro runs on the SoC fabric clock and needs the SoC rail
+ * at its highest state to encode at full speed; macOS raises the same rail
+ * for every encode session. Floors on one rail combine to the highest.
+ *
  * Under thermal pressure the driver can also limit the DRAM controller
  * (DCS) rail: it stops honouring the other agents on that rail and votes
  * on their behalf through the AP's own agent, capped. This bounds the heat
@@ -96,6 +102,8 @@ struct apple_pmc {
 	/* Agents enabled on each rail, before any DCS limit is applied. */
 	u32 enable[APPLE_PMC_MAX_RAILS];
 	u32 static_agents;
+	/* Rails with a floor domain. */
+	u32 floor_rails;
 	struct list_head domains;
 	struct dentry *debugfs;
 	/* Cooling state of the DCS limit: 0 is none, dcs_max holds DCS at 0. */
@@ -107,12 +115,24 @@ struct apple_pmc {
 	struct delayed_work dcs_work;
 };
 
+/**
+ * struct apple_pmc_domain - a power domain provided by the PMC
+ * @agent: dynamic voter agent the domain enables (not for a floor)
+ * @floor: the domain is a rail floor held through the AP's agent
+ * @rail: with @floor, the rail
+ * @level: with @floor, the performance state held while powered
+ * @on: with @floor, whether the floor is held; protected by pmc->lock
+ */
 struct apple_pmc_domain {
 	struct generic_pm_domain genpd;
 	struct apple_pmc *pmc;
 	struct device_node *np;
 	struct list_head list;
 	unsigned int agent;
+	bool floor;
+	unsigned int rail;
+	unsigned int level;
+	bool on;
 	bool provider;
 };
 
@@ -269,6 +289,32 @@ u32 apple_pmc_floor_read(struct device *dev, unsigned int agent)
 }
 EXPORT_SYMBOL_GPL(apple_pmc_floor_read);
 
+/* Caller holds pmc->lock. */
+static int __apple_pmc_floor_update(struct apple_pmc *pmc, unsigned int agent,
+				    u32 mask, u32 value)
+{
+	void __iomem *reg = pmc->voters + agent * pmc->hw->agent_stride;
+	u32 old, val;
+	int ret = 0;
+
+	if (pmc->hw->has_pending) {
+		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
+		if (ret)
+			return ret;
+	}
+	old = readl(reg);
+	val = (old & ~mask) | (value & mask);
+	if (val != old) {
+		writel(val, reg);
+		if ((readl(reg) & mask) != (value & mask))
+			ret = -EIO;
+	}
+	if (!ret && pmc->hw->has_pending)
+		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
+
+	return ret;
+}
+
 /**
  * apple_pmc_floor_update() - update the perf-state floor of an agent
  * @dev: the PMC device
@@ -287,31 +333,14 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
 			   u32 value)
 {
 	struct apple_pmc *pmc = apple_pmc_from_dev(dev);
-	void __iomem *reg;
 	unsigned long flags;
-	u32 old, val;
-	int ret = 0;
+	int ret;
 
 	if (!pmc || agent >= pmc->hw->agents)
 		return -EINVAL;
 
-	reg = pmc->voters + agent * pmc->hw->agent_stride;
 	raw_spin_lock_irqsave(&pmc->lock, flags);
-	if (pmc->hw->has_pending) {
-		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
-		if (ret)
-			goto unlock;
-	}
-	old = readl(reg);
-	val = (old & ~mask) | (value & mask);
-	if (val != old) {
-		writel(val, reg);
-		if ((readl(reg) & mask) != (value & mask))
-			ret = -EIO;
-	}
-	if (!ret && pmc->hw->has_pending)
-		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
-unlock:
+	ret = __apple_pmc_floor_update(pmc, agent, mask, value);
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
 	return ret;
@@ -569,10 +598,48 @@ static int apple_pmc_dcs_init(struct apple_pmc *pmc)
 	return 0;
 }
 
+/*
+ * Caller holds pmc->lock. The AP agent's floor on @rail becomes the highest
+ * level of the floors held there.
+ */
+static int apple_pmc_floor_apply(struct apple_pmc *pmc, unsigned int rail)
+{
+	struct apple_pmc_domain *dom;
+	unsigned int level = 0;
+
+	list_for_each_entry(dom, &pmc->domains, list)
+		if (dom->floor && dom->rail == rail && dom->on)
+			level = max(level, dom->level);
+
+	return __apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
+					APPLE_PMC_RAIL_MASK(rail),
+					level << APPLE_PMC_RAIL_SHIFT(rail));
+}
+
+static int apple_pmc_floor_set(struct apple_pmc_domain *dom, bool on)
+{
+	struct apple_pmc *pmc = dom->pmc;
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	dom->on = on;
+	ret = apple_pmc_floor_apply(pmc, dom->rail);
+	if (ret) {
+		dom->on = !on;
+		apple_pmc_floor_apply(pmc, dom->rail);
+	}
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	return ret;
+}
+
 static int apple_pmc_domain_power_on(struct generic_pm_domain *genpd)
 {
 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
 
+	if (dom->floor)
+		return apple_pmc_floor_set(dom, true);
 	return apple_pmc_agent_enable(dom->pmc, dom->agent, true);
 }
 
@@ -580,6 +647,8 @@ static int apple_pmc_domain_power_off(struct generic_pm_domain *genpd)
 {
 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
 
+	if (dom->floor)
+		return apple_pmc_floor_set(dom, false);
 	return apple_pmc_agent_enable(dom->pmc, dom->agent, false);
 }
 
@@ -671,10 +740,72 @@ static int apple_pmc_domain_add(struct apple_pmc *pmc, struct device_node *np)
 	return 0;
 }
 
+/* A rail floor held through the AP's agent while the domain is powered. */
+static int apple_pmc_floor_add(struct apple_pmc *pmc, struct device_node *np)
+{
+	const struct apple_pmc_hw *hw = pmc->hw;
+	struct device *dev = pmc->dev;
+	struct apple_pmc_domain *dom;
+	const char *label;
+	u32 rail, level;
+	int ret;
+
+	if (of_property_read_u32(np, "apple,rail", &rail) ||
+	    of_property_read_u32(np, "apple,level", &level))
+		return dev_err_probe(dev, -EINVAL, "%pOF: missing rail or level\n", np);
+	/* The DCS rail's AP vote belongs to the DCS limit. */
+	if (rail >= hw->rails || rail == hw->dcs_rail ||
+	    (hw->agent_rails && !(hw->agent_rails & BIT(rail))))
+		return dev_err_probe(dev, -EINVAL, "%pOF: invalid rail %u\n", np, rail);
+	if (!level || level >= APPLE_PMC_MAX_STATES)
+		return dev_err_probe(dev, -EINVAL, "%pOF: invalid level %u\n", np, level);
+	if (!(pmc->static_agents & BIT(hw->ap_agent)))
+		return dev_err_probe(dev, -EINVAL,
+				     "%pOF: the AP agent is not a static voter\n", np);
+
+	dom = kzalloc_obj(*dom);
+	if (!dom)
+		return -ENOMEM;
+
+	dom->pmc = pmc;
+	dom->np = of_node_get(np);
+	dom->floor = true;
+	dom->rail = rail;
+	dom->level = level;
+	if (of_property_read_string(np, "label", &label))
+		label = np->name;
+	dom->genpd.name = kasprintf(GFP_KERNEL, "pmc-%s", label);
+	if (!dom->genpd.name) {
+		of_node_put(dom->np);
+		kfree(dom);
+		return -ENOMEM;
+	}
+	dom->genpd.power_on = apple_pmc_domain_power_on;
+	dom->genpd.power_off = apple_pmc_domain_power_off;
+
+	ret = pm_genpd_init(&dom->genpd, NULL, true);
+	if (ret) {
+		of_node_put(dom->np);
+		kfree(dom->genpd.name);
+		kfree(dom);
+		return dev_err_probe(dev, ret, "%pOF: genpd init failed\n", np);
+	}
+	list_add_tail(&dom->list, &pmc->domains);
+
+	ret = of_genpd_add_provider_simple(np, &dom->genpd);
+	if (ret)
+		return dev_err_probe(dev, ret, "%pOF: provider failed\n", np);
+	dom->provider = true;
+	pmc->floor_rails |= BIT(rail);
+
+	return 0;
+}
+
 static int apple_pmc_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_pmc *pmc = s->private;
 	const struct apple_pmc_hw *hw = pmc->hw;
+	struct apple_pmc_domain *dom;
 	unsigned int i;
 
 	seq_printf(s, "static agents: %#x\n", pmc->static_agents);
@@ -687,6 +818,10 @@ static int apple_pmc_status_show(struct seq_file *s, void *unused)
 			   i, apple_pmc_enable_read(pmc, i), pmc->saved_enable[i]);
 	seq_printf(s, "dcs limit: state %lu of %u\n", READ_ONCE(pmc->dcs_state),
 		   hw->dcs_max);
+	list_for_each_entry(dom, &pmc->domains, list)
+		if (dom->floor)
+			seq_printf(s, "%s: rail%u level %u %s\n", dom->genpd.name,
+				   dom->rail, dom->level, READ_ONCE(dom->on) ? "held" : "released");
 
 	return 0;
 }
@@ -709,6 +844,11 @@ static void apple_pmc_release(void *data)
 	/* The cooling device is gone by now; drop any limit it left. */
 	cancel_delayed_work_sync(&pmc->dcs_work);
 	raw_spin_lock_irqsave(&pmc->lock, flags);
+	/* No floor outlives its domains. */
+	for (rail = 0; rail < pmc->hw->rails; rail++)
+		if (pmc->floor_rails & BIT(rail))
+			__apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
+						 APPLE_PMC_RAIL_MASK(rail), 0);
 	for (rail = 0; rail < pmc->hw->rails; rail++)
 		writel(pmc->saved_enable[rail],
 		       pmc->rails + pmc->hw->rail_enable + 4 * rail);
@@ -811,7 +951,10 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	for_each_available_child_of_node(np, child) {
 		if (!of_property_present(child, "#power-domain-cells"))
 			continue;
-		ret = apple_pmc_domain_add(pmc, child);
+		if (of_property_present(child, "apple,rail"))
+			ret = apple_pmc_floor_add(pmc, child);
+		else
+			ret = apple_pmc_domain_add(pmc, child);
 		if (ret) {
 			of_node_put(child);
 			return ret;
