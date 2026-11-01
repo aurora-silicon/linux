@@ -455,10 +455,10 @@ The adapter contract is:
   ``ANE_T6021_PM_ACTIVE`` state.
 * Use ``DEFINE_ANE_T6021_SYSTEM_PM_OPS(name, getter)`` to define the device PM
   operations. The getter returns the embedded adapter without replacing the
-  driver's own drvdata. The driver binds ``pm_sleep_ptr(&name)`` to ``driver.pm`` and supplies
-  the shared lifetime callbacks below.
-* Every external firmware-facing submission checks ``ane_t6021_pm_submit_error()`` under
-  that same firmware mutex. Suspend acquires the mutex, draining the current
+  driver's own drvdata. The driver binds ``pm_sleep_ptr(&name)`` to
+  ``driver.pm`` and supplies the shared lifetime callbacks below.
+* Every external firmware-facing submission checks
+  ``ane_t6021_pm_submit_error()`` under that same firmware mutex. Suspend acquires the mutex, draining the current
   synchronous command and its finish event, and fences queued submitters
   before calling the shared stop callback.
 * The stop callback performs the validated firmware shutdown handshake, drains
@@ -467,14 +467,15 @@ The adapter contract is:
   power claims, DMA mappings, firmware backing and the module pin.
 * The restart callback is the same cold-start/handshake/program-replay path
   used by timeout recovery. Supplier and DART system callbacks must restore
-  access first. Return success only after channels, CONFIG_GET and desired firmware
-  properties are restored and the lifetime owner has made public IDs usable
-  under its normal lazy-reload policy. RX and all firmware-owned resources stay with this one lifetime
-  implementation.
+  access first. Return success only after channels, CONFIG_GET and desired
+  firmware properties are restored and the lifetime owner has made public IDs
+  usable under its normal lazy-reload policy. RX and all firmware-owned
+  resources stay with this one lifetime implementation.
 
-System PM disables runtime PM and holds an additional consumer reference.
-Consequently suspend stops at ``ane_t6021_restart_stop()`` and keeps the shared
-restart transaction on the client across the system power boundary. Genpd and
+System PM holds an additional consumer reference and disables runtime PM
+during the late/noirq phases. Suspend stops at ``ane_t6021_restart_stop()`` and
+keeps the shared restart transaction on the client across the system power
+boundary. Genpd and
 DART system callbacks perform that power transition. Resume checks provider
 access and the stopped-core predicate, then invokes the same boot and commit
 functions as runtime recovery. Runtime recovery still uses the shared runtime-PM
@@ -506,7 +507,8 @@ M2 validation plan
 ------------------
 
 Runtime testing requires the shared lifetime implementation and this PM
-integration together. Do not infer a hardware pass from the adapter's KUnit results.
+integration together. Do not infer a hardware pass from the adapter's KUnit
+results.
 Run on a T8112 with the candidate kernel and its matching ane_t6021 module,
 through the hardware controller with exclusive device ownership, bounded
 console capture and a tested boot fallback. Record the kernel/module revision,

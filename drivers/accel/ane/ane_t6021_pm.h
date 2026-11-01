@@ -7,7 +7,7 @@
 #include <linux/mutex.h>
 #include <linux/pm.h>
 
-/* Every state access, including submission checks, holds the firmware mutex. */
+/* State transitions and submission checks hold the firmware mutex. */
 enum ane_t6021_pm_state {
 	ANE_T6021_PM_ACTIVE,
 	ANE_T6021_PM_SUSPENDED,

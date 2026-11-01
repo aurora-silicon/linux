@@ -171,3 +171,4 @@ static struct kunit_suite ane_sleep_suite = {
 kunit_test_suite(ane_sleep_suite);
 
 MODULE_LICENSE("Dual MIT/GPL");
+MODULE_DESCRIPTION("ANE H14 system sleep adapter tests");

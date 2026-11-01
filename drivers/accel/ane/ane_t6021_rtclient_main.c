@@ -3480,9 +3480,10 @@ static int ane_rtclient_restart(struct ane_rtclient *ane)
 	return ret == -EOPNOTSUPP || ret == -ENOSPC ? -ENOSPC : ret;
 }
 
-/* System PM owns the power transition; it has disabled runtime PM and
- * holds an extra consumer reference. Reuse the lifetime stop/boot/commit
- * boundaries without invoking the runtime power-cycle transaction.
+/* System PM owns the supplier transition and holds a consumer reference.
+ * Reuse the lifetime stop/boot/commit boundaries without invoking the
+ * runtime power-cycle transaction. Runtime PM is disabled in the late/noirq
+ * phases, after this stop and before the normal resume callback.
  */
 static int ane_rtclient_sleep_stop(void *ctx)
 {
