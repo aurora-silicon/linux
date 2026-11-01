@@ -408,3 +408,135 @@ static struct kunit_suite pmp_start_suite = {
 };
 
 kunit_test_suite(pmp_start_suite);
+
+/* Device DVFS: emulated report/update windows, no hardware. */
+
+static void pmp_t8112_encoding_test(struct kunit *test)
+{
+	const struct apple_pmp_report_offsets *o = &apple_pmp_offsets_t8112;
+	struct apple_pmp_report *rep = kunit_kzalloc(test, sizeof(*rep), GFP_KERNEL);
+	void *mem = kunit_kzalloc(test, 0x20000, GFP_KERNEL);
+	u64 other = 3ULL << 36;
+
+	KUNIT_ASSERT_NOT_NULL(test, rep);
+	KUNIT_ASSERT_NOT_NULL(test, mem);
+	rep->offsets = o;
+	rep->base = (void __iomem *)mem;
+	spin_lock_init(&rep->lock);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 2));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xaf, 2));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb1, 2));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xa7, 2));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb8, 2));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_report_dvfs_valid(o, 0xb0, 32));
+	KUNIT_EXPECT_EQ(test, o->update + 8 * 0xb0, 0x10580U);
+	apple_pmp_report_dvfs_write(rep, 0xb0, PMP_DVFS_VALID | 2);
+	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), 0x2000000000000002ULL);
+	/* Another provider-owned class survives a default-floor update/release. */
+	rep->dvfs_words[0] |= other;
+	apple_pmp_report_dvfs_write(rep, 0xb0, PMP_DVFS_VALID);
+	KUNIT_EXPECT_EQ(test, readq(rep->base + 0x10580), PMP_DVFS_VALID | other);
+	KUNIT_EXPECT_EQ(test, rep->dvfs_words[0], PMP_DVFS_VALID | other);
+	KUNIT_EXPECT_EQ(test, rep->dvfs_known, 1ULL);
+}
+
+struct pmp_dvfs_test {
+	struct apple_pmp_report rep;
+	struct apple_pmp_report_entry ent;
+};
+
+static int pmp_dvfs_init(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	void *mem = kunit_kzalloc(test, 0x20000, GFP_KERNEL);
+
+	if (!t || !mem)
+		return -ENOMEM;
+	test->priv = t;
+	t->rep.base = (void __iomem *)mem;
+	t->rep.offsets = &apple_pmp_offsets_t8112;
+	/* Identity only: neither callback dereferences this emulated node. */
+	t->ent.report_node = (struct device_node *)t;
+	t->rep.dev = kunit_kzalloc(test, sizeof(*t->rep.dev), GFP_KERNEL);
+	if (!t->rep.dev)
+		return -ENOMEM;
+	t->rep.dev->of_node = t->ent.report_node;
+	t->ent.id = 10;
+	t->ent.dvfs = true;
+	t->ent.dvfs_entry = 0xb0;
+	t->ent.dvfs_on = PMP_DVFS_VALID | 2;
+	spin_lock_init(&t->rep.lock);
+	mutex_lock(&apple_pmp_reports_lock);
+	list_add_tail_rcu(&t->rep.list, &apple_pmp_reports);
+	mutex_unlock(&apple_pmp_reports_lock);
+	return 0;
+}
+
+static void pmp_dvfs_exit(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	mutex_lock(&apple_pmp_reports_lock);
+	list_del_rcu(&t->rep.list);
+	mutex_unlock(&apple_pmp_reports_lock);
+	synchronize_rcu();
+}
+
+static void pmp_t8112_stopped_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, t->rep.known, 0ULL);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_known, 0ULL);
+	writeq(1, t->rep.base + 0x10);
+	t->rep.defer = true;
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_known, 0ULL);
+}
+
+static void pmp_t8112_ack_timeout_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	writeq(1, t->rep.base + 0x10);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), BIT_ULL(10));
+	KUNIT_EXPECT_EQ(test, t->rep.dvfs_known, 0ULL);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), 0ULL);
+}
+
+static void pmp_t8112_active_release_test(struct kunit *test)
+{
+	struct pmp_dvfs_test *t = test->priv;
+
+	writeq(1, t->rep.base + 0x10);
+	writeq(BIT_ULL(10), t->rep.base + 0xa40);
+	KUNIT_ASSERT_EQ(test, apple_pmp_report_entry_power_on(&t->ent.genpd), 0);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), BIT_ULL(10));
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), PMP_DVFS_VALID | 2);
+	/* ACK deliberately stays asserted: release is stored before ACK clear. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_off(&t->ent.genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10580), PMP_DVFS_VALID);
+	KUNIT_EXPECT_EQ(test, readq(t->rep.base + 0x10500), 0ULL);
+	writeq(0, t->rep.base + 0xa40);
+	KUNIT_EXPECT_EQ(test, apple_pmp_report_entry_power_off(&t->ent.genpd), 0);
+	KUNIT_EXPECT_EQ(test, t->rep.shadow, 0ULL);
+}
+
+static struct kunit_case pmp_dvfs_cases[] = {
+	KUNIT_CASE(pmp_t8112_encoding_test),
+	KUNIT_CASE(pmp_t8112_stopped_test),
+	KUNIT_CASE(pmp_t8112_ack_timeout_test),
+	KUNIT_CASE(pmp_t8112_active_release_test),
+	{}
+};
+
+static struct kunit_suite pmp_dvfs_suite = {
+	.name = "apple-pmp-dvfs",
+	.init = pmp_dvfs_init,
+	.exit = pmp_dvfs_exit,
+	.test_cases = pmp_dvfs_cases,
+};
+
+kunit_test_suite(pmp_dvfs_suite);

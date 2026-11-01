@@ -87,7 +87,7 @@ config APPLE_PMC_KUNIT_TEST
 	  registers are simulated in memory. Only useful for kernel developers.
 
 config APPLE_PMP_REPORT_START_KUNIT_TEST
-	bool "KUnit tests for starting a halted Apple PMP" if !KUNIT_ALL_TESTS
+	bool "KUnit tests for Apple PMP startup and device DVFS" if !KUNIT_ALL_TESTS
 	depends on APPLE_PMP_REPORT && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
@@ -96,7 +96,9 @@ config APPLE_PMP_REPORT_START_KUNIT_TEST
 	  report ready or acknowledge its startup requests, consumers that
 	  time out, and the teardown of the report and its entries while a
 	  start or a consumer waits. The report region is simulated in
-	  memory. Only useful for kernel developers.
+	  memory. Also checks T8112 device DVFS encoding, ACK failures and
+	  idle release using emulated request and update windows.
+	  Only useful for kernel developers.
 
 endif
 
