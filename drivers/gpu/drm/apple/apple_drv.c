@@ -601,6 +601,29 @@ static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 };
 
 /*
+ * A desktop 26.x panel shows PQ as EDR (see dcp_edr_prepare()): PQ 100 cd/m²
+ * lands on the white the backlight sets, and brighter levels use the
+ * headroom above it, up to the panel's peak. macOS uses the panel the same
+ * way. PQ_REFERENCE_LUMINANCE tells a compositor where that white is in PQ,
+ * so it can put its reference white there and keep using the backlight as
+ * the brightness control in PQ.
+ */
+#define DCP_EDR_PQ_REFERENCE_NITS	100
+
+static int apple_connector_attach_pq_reference(struct drm_connector *connector)
+{
+	struct drm_property *prop;
+
+	prop = drm_property_create_range(connector->dev, DRM_MODE_PROP_IMMUTABLE,
+					 "PQ_REFERENCE_LUMINANCE", 0, 10000);
+	if (!prop)
+		return -ENOMEM;
+	drm_object_attach_property(&connector->base, prop,
+				   DCP_EDR_PQ_REFERENCE_NITS);
+	return 0;
+}
+
+/*
  * External displays can take a PQ BT.2020 signal where the firmware
  * offers one, and a desktop 26.x panel PQ content it shows as EDR;
  * dcp_crtc_atomic_check() refuses it elsewhere.
@@ -633,6 +656,8 @@ static int apple_connector_attach_hdr(struct drm_connector *connector,
 	if (ret)
 		return ret;
 	drm_connector_attach_hdr_output_metadata_property(connector);
+	if (connector->connector_type == DRM_MODE_CONNECTOR_eDP)
+		return apple_connector_attach_pq_reference(connector);
 	return 0;
 }
 
