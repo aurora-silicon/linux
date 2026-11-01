@@ -398,3 +398,4 @@
 #include "t8142-j813-usb.dtsi"
 #include "t8142-j813-avd.dtsi"
 #include "t8142-j813-isp.dtsi"
+#include "t8142-j813-psci-idle.dtsi"
