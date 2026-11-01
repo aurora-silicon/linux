@@ -413,6 +413,9 @@ impl crate::g17::Shared {
             return Err(EIO);
         }
         if recover {
+            if let Some(cooling) = firmware.cooling.as_ref() {
+                cooling.rearm();
+            }
             firmware.service_runtime_recovery(deferred)?;
             if !firmware.recovery.pending() {
                 if !self.preparations.reopen() {

@@ -16,6 +16,8 @@ config DRM_ASAHI
 	depends on MMU
 	depends on IOMMU_SUPPORT
 	depends on PAGE_SIZE_16KB
+	select THERMAL
+	select THERMAL_OF if OF
 	select APPLE_PMP_REPORT
 	select RUST_DRM_SCHED
 	select RUST_DRM_GEM_SHMEM_HELPER
@@ -68,3 +70,13 @@ config DRM_ASAHI_G15
 	  The native display driver must be built in, or both drivers must
 	  be modules, so a modular display provider finishes initialization
 	  before the GPU module can probe through its direct helper import.
+
+config DRM_ASAHI_COOLING_KUNIT_TEST
+	tristate "Aurora GPU power-cap policy tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise percent ceiling mapping, composition and failed publication
+	  without a GPU or Rust toolchain. The same production mapping and
+	  fake actuator cases also run on a host compiler.
+	  These tests do not qualify firmware layouts or thermal response.

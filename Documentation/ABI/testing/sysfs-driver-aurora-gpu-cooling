@@ -1,0 +1,22 @@
+What:		/sys/devices/platform/.../gpu_power_ceiling
+Date:		November 2026
+Contact:		Asahi Linux contributors <asahi@lists.linux.dev>
+Description:
+		Read-only diagnostics for the common G16S/G17P firmware percent
+		ceiling. Present only after registration with a qualified firmware
+		layout. One key/value pair per line:
+
+		requested_percent: 100 minus the thermal cooling state (0..100).
+		published_percent: the percent synchronously stored in all three
+		firmware mirrors, after composing the qualification backstop.
+		applied_percent: unsupported; host stores have no acknowledgement.
+		achieved_percent: unsupported; not inferred from a nominal OPP.
+		qualification_backstop_percent: maximum allowed host publication.
+
+		All numeric values are interface percentages, not watts, frequency
+		or a proven achieved utilization. The qualification backstop cannot
+		be released through this attribute. Firmware-reported achieved
+		pstate, when available, is independently exposed in agx_stats and
+		does not acknowledge a percent ceiling. J700 initialization is
+		refused while its firmware allocation-relative layout is unknown;
+		this attribute is consequently absent on that board.

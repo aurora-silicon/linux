@@ -28,6 +28,7 @@ mod channel;
 mod command;
 pub(crate) use command::Attachments;
 mod completion;
+mod cooling;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
@@ -649,6 +650,8 @@ struct Firmware {
     /// Render kick ring storage, kept and reused for the life of the device.
     render_rings: Arc<kick::RenderRings>,
     render_ids: Arc<freelist::RenderIds>,
+    // Drain independent thermal callbacks before dropping firmware storage.
+    cooling: Option<cooling::Cooling>,
     init: initdata::InitData,
     _render_global: mmu::Vm,
     _pm_metrics: Arc<KernelObject>,
@@ -657,6 +660,7 @@ struct Firmware {
 
 impl Drop for Firmware {
     fn drop(&mut self) {
+        drop(self.cooling.take());
         if let Some(secondary) = self.secondary.as_mut() {
             secondary.stop();
         }
@@ -1167,6 +1171,7 @@ impl Gpu {
             None
         };
         let variant = Self::firmware_variant(dev, &cfg.firmware)?;
+        cooling::admit(dev.as_ref().as_ref(), variant)?;
         let id = regs.get_g17_id()?;
         if let Some(calibration) = calibration {
             calibration.check_cores(&id.core_masks)?;
@@ -1458,6 +1463,7 @@ impl Gpu {
                 pool: object::Pool::new()?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
+                cooling: None,
                 init: initdata::InitData::new(),
                 _render_global: render_global,
                 _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
@@ -1489,6 +1495,8 @@ impl Gpu {
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
+        session.cooling =
+            cooling::Cooling::attach(dev.as_ref().as_ref(), shared.variant, &session.init)?;
         let mailbox: *const Mailbox = &*session.primary.rtkit;
         session.port.attach(
             session.init.port_views(mailbox)?,
