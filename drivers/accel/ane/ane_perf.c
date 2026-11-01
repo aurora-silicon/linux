@@ -76,6 +76,7 @@ int ane_perf_begin(struct ane_device *ane)
 		if (ret)
 			goto out;
 		p->voted = true;
+		WRITE_ONCE(p->raises, p->raises + 1);
 	}
 	if (p->report && !p->clock_held) {
 		ret = apple_pmp_report_ane_perf(p->report, ane->dev, p->high_level,
@@ -83,6 +84,7 @@ int ane_perf_begin(struct ane_device *ane)
 		if (ret)
 			goto out;
 		p->level = p->high_level;
+		WRITE_ONCE(p->raises, p->raises + 1);
 	}
 out:
 	p->error = ret;

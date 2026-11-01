@@ -15,6 +15,7 @@
 
 #include <drm/ane_accel.h>
 
+#include "ane_exec_timing.h"
 #include "ane_stats.h"
 
 #define ANE_DART_MAX 3
@@ -124,6 +125,8 @@ struct ane_device {
 		u32 peak_bw;
 		int error;
 		unsigned int release_retries;
+		/* Clock or bandwidth requests made by ane_perf_begin(). */
+		u64 raises;
 		bool initialized;
 		bool busy;
 		bool voted;
@@ -159,6 +162,35 @@ struct ane_device {
 	struct ane_stats_counters stats_ctrs;
 	struct ane_stats_ring stats_ring;
 	struct ane_stats_ring_entry *stats_slots;
+
+	/*
+	 * Per-phase timing of successful submits (ane_exec_timing.h) at
+	 * <debugfs>/accel/<dev>/execute. xt_cur is the submit in flight,
+	 * filled by ane_drm_ioctl() and ane_submit() under pm_lock.
+	 */
+	struct ane_xt xt;
+	struct ane_xt_sample xt_cur;
+	struct dentry *xt_file;
+	u64 xt_pm_end;		/* ane_drm_ioctl() holds its PM reference */
+	u64 xt_resumes;		/* runtime resumes since probe */
+	bool xt_done;		/* the submit in flight completed */
+};
+
+/* The phases and counts of the execute file, in xt_cur order. */
+enum ane_xt_phase {
+	ANE_XT_PM,		/* pm_lock and the runtime-PM reference */
+	ANE_XT_SETUP,		/* argument checks, BO lookups, engine_lock */
+	ANE_XT_PERF,		/* clock and bandwidth requests */
+	ANE_XT_KICK,		/* queue writes, DART mask, event drain, push */
+	ANE_XT_ENGINE,		/* push until the poll saw both completions */
+	ANE_XT_FINISH,		/* completion writes, DART unmask */
+	ANE_XT_RELEASE,		/* request release, engine_lock, BO puts */
+	ANE_XT_IOCTL,		/* the whole ioctl */
+	ANE_XT_NS,
+	ANE_XT_POLLS = ANE_XT_NS,	/* completion poll steps */
+	ANE_XT_RESUMED,		/* 1 when this submit powered the engine up */
+	ANE_XT_RAISED,		/* 1 when it requested clock or bandwidth */
+	ANE_XT_COUNT
 };
 
 struct ane_request {
@@ -168,6 +200,10 @@ struct ane_request {
 	u32 td_count;
 	u32 btsp_iova;
 	u32 bar[DRM_ANE_TILE_COUNT];
+	/* Filled by ane_tm_execute() for the execute file. */
+	u64 t_push;
+	u64 t_done;
+	u32 polls;
 };
 
 #if IS_ENABLED(CONFIG_KUNIT)

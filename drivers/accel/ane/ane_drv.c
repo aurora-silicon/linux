@@ -603,6 +603,28 @@ VISIBLE_IF_KUNIT int ane_submit_check_sizes(const struct drm_ane_submit *args,
 }
 EXPORT_SYMBOL_IF_KUNIT(ane_submit_check_sizes);
 
+/*
+ * <debugfs>/accel/<dev>/execute: where the time of the successful submits
+ * since the last reset went (ane_exec_timing.h). The engine phase ends when
+ * a poll step sees both completion lines, so it includes the poll latency.
+ * polls counts the poll steps; resumed and raised are 1 for a submit that
+ * had to power the engine up or request its clock or bandwidth, so their
+ * mean is the fraction of submits that paid for it.
+ */
+static const char *const ane_xt_names[ANE_XT_COUNT] = {
+	[ANE_XT_PM] = "pm",
+	[ANE_XT_SETUP] = "setup",
+	[ANE_XT_PERF] = "perf",
+	[ANE_XT_KICK] = "kick",
+	[ANE_XT_ENGINE] = "engine",
+	[ANE_XT_FINISH] = "finish",
+	[ANE_XT_RELEASE] = "release",
+	[ANE_XT_IOCTL] = "ioctl",
+	[ANE_XT_POLLS] = "polls",
+	[ANE_XT_RESUMED] = "resumed",
+	[ANE_XT_RAISED] = "raised",
+};
+
 static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct ane_device *ane = drm->dev_private;
@@ -612,6 +634,8 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	struct ane_bo *bo;
 	struct ane_request req;
 	u64 stats_idx = 0;
+	u64 t_lock, t_perf, t_exec, raises;
+	bool timed = false;
 	int err;
 
 	memset(&req, 0, sizeof(req));
@@ -690,7 +714,10 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 		goto unlock;
 	}
 
+	t_lock = ktime_get_ns();
+	raises = READ_ONCE(ane->perf.raises);
 	err = ane_perf_begin(ane);
+	t_perf = ktime_get_ns();
 	if (err) {
 		dev_err_ratelimited(ane->dev, "performance request failed: %d\n", err);
 		ane_perf_end(ane);
@@ -707,7 +734,20 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 					    ktime_get_ns(), req.td_count);
 
 	err = ane_tm_execute(ane, &req);
+	t_exec = ktime_get_ns();
 	ane_perf_end(ane);
+	if (!err) {
+		struct ane_xt_sample *x = &ane->xt_cur;
+
+		timed = true;
+		x->v[ANE_XT_SETUP] = t_lock - ane->xt_pm_end;
+		x->v[ANE_XT_PERF] = t_perf - t_lock;
+		x->v[ANE_XT_KICK] = req.t_push - t_perf;
+		x->v[ANE_XT_ENGINE] = req.t_done - req.t_push;
+		x->v[ANE_XT_FINISH] = t_exec - req.t_done;
+		x->v[ANE_XT_POLLS] = req.polls;
+		x->v[ANE_XT_RAISED] = READ_ONCE(ane->perf.raises) != raises;
+	}
 
 	if (ane->stats_slots)
 		ane_stats_complete(&ane->stats_ctrs, &ane->stats_ring,
@@ -721,6 +761,10 @@ put:
 	for (int bdx = 0; bdx < DRM_ANE_TILE_COUNT; bdx++) {
 		if (gem[bdx])
 			drm_gem_object_put(gem[bdx]);
+	}
+	if (timed) {
+		ane->xt_cur.v[ANE_XT_RELEASE] = ktime_get_ns() - t_exec;
+		ane->xt_done = true;
 	}
 	return err;
 }
@@ -863,6 +907,7 @@ static long ane_drm_ioctl(struct file *file, unsigned int cmd,
 	struct drm_file *filp = file->private_data;
 	struct drm_device *drm = filp->minor->dev;
 	struct ane_device *ane = drm->dev_private;
+	u64 t0, resumes;
 	long err;
 
 	/* Reject anything outside the drm type ('d') namespace outright, and
@@ -881,14 +926,28 @@ static long ane_drm_ioctl(struct file *file, unsigned int cmd,
 	    _IOC_NR(cmd) >= DRM_COMMAND_END)
 		return -ENOTTY;
 
+	t0 = ktime_get_ns();
 	mutex_lock(&ane->pm_lock);
+	resumes = ane->xt_resumes;
 	err = pm_runtime_resume_and_get(ane->dev);
 	if (err < 0)
 		goto unlock_pm;
+	ane->xt_pm_end = ktime_get_ns();
+	ane->xt_done = false;
 
 	err = dispatch(file, cmd, arg);
 
 	pm_runtime_put_autosuspend(ane->dev);
+	/* Only a completed submit sets xt_done (ane_submit()). */
+	if (ane->xt_done) {
+		struct ane_xt_sample *x = &ane->xt_cur;
+
+		x->v[ANE_XT_PM] = ane->xt_pm_end - t0;
+		x->v[ANE_XT_RESUMED] = ane->xt_resumes != resumes;
+		x->v[ANE_XT_IOCTL] = ktime_get_ns() - t0;
+		ane_xt_add(&ane->xt, x);
+		ane->xt_done = false;
+	}
 
 unlock_pm:
 	mutex_unlock(&ane->pm_lock);
@@ -1286,9 +1345,11 @@ static int ane_platform_probe(struct platform_device *pdev)
 				     ane_timeline_show,
 				     &ane->stats_ring);
 
+	ane_xt_init(&ane->xt, ane_xt_names, ANE_XT_NS, ANE_XT_COUNT);
 	err = drm_dev_register(drm, 0);
 	if (err < 0)
 		goto put_pm;
+	ane->xt_file = ane_xt_debugfs("execute", drm->debugfs_root, &ane->xt);
 
 	dev_info(dev, "loaded ane\n");
 
@@ -1312,6 +1373,9 @@ static void ane_platform_remove(struct platform_device *pdev)
 	struct ane_device *ane = platform_get_drvdata(pdev);
 	struct ane_bo *bo, *tmp;
 	int err;
+
+	debugfs_remove(ane->xt_file);
+	ane->xt_file = NULL;
 
 	/* Powered and pinned for the teardown: the unmaps below flush the
 	 * DART TLBs, and no autosuspend may race the genpd detach.
@@ -1372,6 +1436,8 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 {
 	struct ane_device *ane = dev_get_drvdata(dev);
 	bool first = !ane->tm_status_known;
+
+	ane->xt_resumes++;
 
 	/* The only path that touches the engine while its partition comes
 	 * up: probe's first resume and every later ungate land here. Every

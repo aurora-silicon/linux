@@ -254,6 +254,7 @@ static int ane_tm_collect_events(struct ane_device *ane,
 static int ane_tm_poll_step(struct ane_device *ane, struct ane_request *req,
 			    u32 *finished)
 {
+	req->polls++;
 	if (ane_dart_faulted(ane, NULL, NULL))
 		return 1;
 	return ane_tm_collect_events(ane, req, finished);
@@ -280,6 +281,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	 */
 	wmb();
 	ane_tm_push_tq(ane, req);
+	req->t_push = ktime_get_ns();
 
 	for (;;) {
 		if (ktime_compare(ktime_get(), deadline) >= 0) {
@@ -314,6 +316,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 		}
 		break;
 	}
+	req->t_done = ktime_get_ns();
 
 	if (faulted) {
 		/* The faulting program drained through the scratch pages
