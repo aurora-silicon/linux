@@ -559,6 +559,8 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		}
 		if (f->startup[i].id == 0x22)
 			memcpy(b->resource_info, reply, sizeof(b->resource_info));
+		b->ops->log(b->ctx, "startup terminal messages/bytes",
+			    b->transport.terminal_messages, b->transport.terminal_bytes);
 		ret = ane_h16_faults(b, false);
 		if (ret)
 			return ret;

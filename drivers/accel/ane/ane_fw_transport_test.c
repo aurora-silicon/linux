@@ -920,7 +920,69 @@ static void ane_transport_wait_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->now, TEST_DEADLINE);
 }
 
+static void ane_transport_terminal_ack_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *slot, *next;
+	u32 last_reg;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	slot = ane_test_slot(f, ANE_FW_TERMINAL);
+	next = slot + ANE_FW_SLOT_SIZE;
+	put_unaligned_le64(TEST_POOL_DVA | 2, slot);
+	put_unaligned_le64(1, slot + 8);
+	put_unaligned_le64(4, slot + 16);
+	put_unaligned_le64(3, next);
+	last_reg = f->last_reg;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_terminal(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot), 1ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + 8), 1ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + 16), 4ULL);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_TERMINAL], 1U);
+	KUNIT_EXPECT_EQ(test, f->t.terminal_messages, 1ULL);
+	KUNIT_EXPECT_EQ(test, f->t.terminal_bytes, 1ULL);
+	KUNIT_EXPECT_EQ(test, f->last_reg, last_reg); /* no ACK doorbell */
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_terminal(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.terminal_messages, 1ULL);
+}
+
+static void ane_transport_terminal_bounds_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *slot;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	slot = ane_test_slot(f, ANE_FW_TERMINAL);
+	put_unaligned_le64(0xdead0002, slot);
+	put_unaligned_le64(1, slot + 8);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_terminal(&f->t), -EPROTO);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot), 0xdead0002ULL);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_TERMINAL], 0U);
+}
+
+static void ane_transport_terminal_wrap_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *slot;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	slot = ane_test_slot(f, ANE_FW_TERMINAL);
+	for (unsigned int i = 0; i < 2; i++) {
+		put_unaligned_le64(TEST_POOL_DVA | 2, slot + i * ANE_FW_SLOT_SIZE);
+		put_unaligned_le64(i + 1, slot + i * ANE_FW_SLOT_SIZE + 8);
+	}
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_terminal(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_TERMINAL], 0U);
+	KUNIT_EXPECT_EQ(test, f->t.terminal_messages, 2ULL);
+	KUNIT_EXPECT_EQ(test, f->t.terminal_bytes, 3ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot), 1ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot + ANE_FW_SLOT_SIZE), 1ULL);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_transport_terminal_ack_test),
+	KUNIT_CASE(ane_transport_terminal_bounds_test),
+	KUNIT_CASE(ane_transport_terminal_wrap_test),
 	KUNIT_CASE(ane_transport_table_test),
 	KUNIT_CASE(ane_transport_table_roles_test),
 	KUNIT_CASE(ane_transport_table_bounds_test),

@@ -782,6 +782,9 @@ static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 		ret = ane_fw_transport_shared(t);
 		if (ret && ret != -EAGAIN)
 			return ret;
+		ret = ane_fw_transport_terminal(t);
+		if (ret)
+			return ret;
 		if (ktime_get_ns() >= t->pending[ch].deadline_ns)
 			return ane_fw_transport_fail(t, -ETIMEDOUT);
 		ane_fw_transport_rering(t, ch);
@@ -910,6 +913,9 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 			return r;
 		r = ane_fw_transport_shared(t);
 		if (r && r != -EAGAIN)
+			return r;
+		r = ane_fw_transport_terminal(t);
+		if (r)
 			return r;
 		ane_h16_mailbox(h);
 		ret = ane_h16_faults(&h->boot, false);

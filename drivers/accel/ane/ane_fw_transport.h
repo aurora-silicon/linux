@@ -5,6 +5,7 @@
 #include "ane_fw_platform.h"
 #include "ane_fw_protocol.h"
 
+#define ANE_FW_TERMINAL 0
 #define ANE_FW_IO 1
 #define ANE_FW_SHAREDMALLOC 5
 #define ANE_FW_IO_T2H 6
@@ -69,6 +70,8 @@ struct ane_fw_transport {
 	size_t pool_used;
 	size_t shared_bytes;
 	u32 shared_count;
+	u64 terminal_messages;
+	u64 terminal_bytes;
 	int error;
 	bool armed;
 	bool native_free;
@@ -329,6 +332,44 @@ ane_fw_transport_consume(struct ane_fw_transport *t, void *report, size_t capaci
 	return 0;
 }
 
+/* 25F84 _IOProcessorChannelUnidirectionalReceive (0x929a260): type-2
+ * TERMINAL owns a slot when bit0 is clear, masks pointer bits[1:0], and
+ * returns only header=1 to the producer. It does not echo the DVA or ring
+ * a doorbell. Drain at most one ring per service; retain all backing pages.
+ * Text is deliberately discarded here, avoiding firmware printf backpressure.
+ */
+static inline int ane_fw_transport_terminal(struct ane_fw_transport *t)
+{
+	unsigned int i;
+	int ret = ane_fw_transport_check(t);
+
+	if (ret)
+		return ret;
+	if (!t->armed)
+		return -EINVAL;
+	if (t->channels[ANE_FW_TERMINAL].type != 2)
+		return 0;
+	for (i = 0; i < t->channels[ANE_FW_TERMINAL].slots; i++) {
+		u8 *slot = ane_fw_transport_slot(t, ANE_FW_TERMINAL);
+		u64 header = t->ops->load64(t->ctx, slot), bytes, dva;
+
+		t->ops->read_barrier(t->ctx);
+		if (header & 1)
+			break;
+		bytes = t->ops->load64(t->ctx, slot + 8);
+		dva = header & ~3ULL;
+		if (bytes && !ane_fw_transport_report(t, dva, bytes))
+			return ane_fw_transport_fail(t, -EPROTO);
+		t->terminal_messages++;
+		t->terminal_bytes += bytes;
+		t->ops->write_barrier(t->ctx);
+		t->ops->store64(t->ctx, slot, 1);
+		t->ops->write_barrier(t->ctx);
+		ane_fw_transport_advance(t, ANE_FW_TERMINAL);
+	}
+	return 0;
+}
+
 /* Conservative default allocation policy. Native FREE requires build opt-in. */
 static inline int ane_fw_shared_size(u64 word0, u64 bytes, u64 tag, size_t *size)
 {
@@ -483,6 +524,9 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 			return ret;
 		ret = ane_fw_transport_shared(t);
 		if (ret && ret != -EAGAIN)
+			return ret;
+		ret = ane_fw_transport_terminal(t);
+		if (ret)
 			return ret;
 		/* Recheck before sleeping, including time spent in alloc(). */
 		if (t->ops->now_ns(t->ctx) >= t->pending[ch].deadline_ns)
