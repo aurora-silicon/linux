@@ -678,11 +678,23 @@ enum {
 #define ANE_H16_JOB_FILL_PROCESS BIT(1)	/* u32 process handle at +0xc */
 #define ANE_H16_JOB_RESULT_MAX SZ_64M
 
+#define ANE_H16_JOB_DONE 64
+
 struct ane_h16_job {
 	u8 *out;
 	size_t used, size;
 	u32 program, process;
 	u64 published_ns;
+	/* Terminal events consumed while waiting for another UUID (pipelined). */
+	struct {
+		u64 uuid;
+		u32 state;
+	} done[ANE_H16_JOB_DONE];
+	unsigned int done_next;
+	/* Pool offset where job commands start, and EXECUTEs not yet terminal. */
+	size_t pool_mark;
+	bool marked;
+	unsigned int outstanding;
 };
 
 static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
@@ -779,12 +791,24 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 		put_unaligned_le32(j->program, command + 8);
 	if ((fill & ANE_H16_JOB_FILL_PROCESS) && length >= 16)
 		put_unaligned_le32(j->process, command + 0xc);
+	/*
+	 * The transport appends commands to its pool and never reuses it. Wrap to
+	 * the job's first command once nothing is outstanding.
+	 */
+	if (!j->marked) {
+		j->pool_mark = t->pool_used;
+		j->marked = true;
+	}
+	if (ALIGN(t->pool_used, ANE_FW_SLOT_SIZE) + length > t->pool.size && !j->outstanding)
+		t->pool_used = j->pool_mark;
 	start = ktime_get_ns();
 	counters[0] = get_cycles();
 	ret = ane_fw_transport_publish(t, channel, command, length,
 				       start + h->boot.build->command_timeout_ns);
 	if (!ret) {
 		j->published_ns = start;
+		if (get_unaligned_le16(command + 4) == ANE_H16_EXECUTE)
+			j->outstanding++;
 		ret = ane_h16_job_wait(h, channel);
 	}
 	counters[1] = get_cycles();
@@ -816,7 +840,14 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 	u64 deadline = ktime_get_ns() + (u64)timeout_ms * NSEC_PER_MSEC;
 	u8 report[0x80];
 	int ret = -ETIMEDOUT;
+	unsigned int i;
 
+	for (i = 0; i < ANE_H16_JOB_DONE; i++) {
+		if (j->done[i].uuid != uuid || !uuid)
+			continue;
+		j->done[i].uuid = 0;
+		return j->done[i].state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO;
+	}
 	while (ktime_get_ns() < deadline) {
 		size_t size = 0;
 		u32 pending;
@@ -830,14 +861,21 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 						      &counter, 1);
 			if (r)
 				return r;
-			if (size >= 0x20 && get_unaligned_le16(report + 4) == ANE_H16_EVENT_REPORT &&
-			    get_unaligned_le64(report + 8) == uuid) {
+			if (size >= 0x20 && get_unaligned_le16(report + 4) == ANE_H16_EVENT_REPORT) {
+				u64 id = get_unaligned_le64(report + 8);
 				u32 state = get_unaligned_le32(report + 0x1c);
+				bool terminal = state == ANE_H16_EVENT_SUCCESS ||
+						state == ANE_H16_EVENT_FAILURE;
 
-				if (state == ANE_H16_EVENT_SUCCESS)
-					return 0;
-				if (state == ANE_H16_EVENT_FAILURE)
-					return -EIO;
+				if (terminal && j->outstanding)
+					j->outstanding--;
+				if (id == uuid && terminal)
+					return state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO;
+				if (terminal) {
+					j->done[j->done_next].uuid = id;
+					j->done[j->done_next].state = state;
+					j->done_next = (j->done_next + 1) % ANE_H16_JOB_DONE;
+				}
 			}
 			continue;
 		}
