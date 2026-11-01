@@ -23,6 +23,26 @@ struct ane_fw_surface {
 };
 
 /*
+ * Sleep bounds between two polls of one wait. Command replies arrive within
+ * tens of microseconds and an EXECUTE completes within a few milliseconds,
+ * so the first 5 ms poll every 20-50 us: a reply is seen at most ~50 us late
+ * instead of a whole millisecond. Long waits (firmware startup, a stalled
+ * request) back off to 250 us and, after 50 ms, to the 1 ms cadence, so
+ * they cost no more CPU than a fixed 1 ms poll did.
+ */
+#define ANE_FW_POLL_FINE_NS (5ULL * 1000 * 1000)
+#define ANE_FW_POLL_MEDIUM_NS (50ULL * 1000 * 1000)
+
+static inline unsigned int ane_fw_poll_sleep_us(u64 waited_ns, unsigned int *max_us)
+{
+	unsigned int us = waited_ns < ANE_FW_POLL_FINE_NS ? 20 :
+			  waited_ns < ANE_FW_POLL_MEDIUM_NS ? 250 : 1000;
+
+	*max_us = us == 20 ? 50 : us + 50;
+	return us;
+}
+
+/*
  * Accessors operate on coherent owned memory and engine-relative registers.
  * Barriers must supply DMA read/write ordering, not just compiler ordering.
  * alloc returns a zeroed, pinned, private-domain mapping of exactly size bytes.
@@ -37,7 +57,8 @@ struct ane_fw_transport_ops {
 	u32 (*read32)(void *ctx, u32 reg);
 	void (*write32)(void *ctx, u32 reg, u32 value);
 	u64 (*now_ns)(void *ctx);
-	void (*relax)(void *ctx);
+	/* Wait before the next poll of a wait that began waited_ns ago. */
+	void (*relax)(void *ctx, u64 waited_ns);
 	int (*alloc)(void *ctx, size_t size, u32 tag, struct ane_fw_surface *surface);
 	void (*refused)(void *ctx, u64 word0, u64 word1, u64 word2, int error);
 };
@@ -68,6 +89,8 @@ struct ane_fw_transport {
 	size_t shared_bytes;
 	u32 shared_count;
 	int error;
+	/* relax() calls made by every wait so far; callers diff it. */
+	u64 polls;
 	bool armed;
 	bool native_free;
 	bool shared_retired[ANE_FW_SHARED_MAX];
@@ -492,6 +515,7 @@ static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending)
 /* The original absolute command deadline survives every provider/IRQ service. */
 static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int ch)
 {
+	u64 start = t->ops->now_ns(t->ctx), now;
 	u32 pending;
 	int ret;
 
@@ -506,9 +530,11 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 		if (ret && ret != -EAGAIN)
 			return ret;
 		/* Recheck before sleeping, including time spent in alloc(). */
-		if (t->ops->now_ns(t->ctx) >= t->pending[ch].deadline_ns)
+		now = t->ops->now_ns(t->ctx);
+		if (now >= t->pending[ch].deadline_ns)
 			return ane_fw_transport_fail(t, -ETIMEDOUT);
-		t->ops->relax(t->ctx);
+		t->polls++;
+		t->ops->relax(t->ctx, now - start);
 	}
 }
 

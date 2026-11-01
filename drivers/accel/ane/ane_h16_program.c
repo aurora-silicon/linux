@@ -765,6 +765,7 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 			   u64 deadline, struct h16_execute_trace *trace)
 {
 	struct ane_fw_transport *t = s->transport;
+	u64 start = h16_now(s), now;
 	u8 *report;
 	int ret;
 
@@ -810,11 +811,13 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 		}
 		if (ret)
 			break;
-		if (h16_now(s) >= deadline) {
+		now = h16_now(s);
+		if (now >= deadline) {
 			ret = -ETIMEDOUT;
 			break;
 		}
-		t->ops->relax(t->ctx);
+		t->polls++;
+		t->ops->relax(t->ctx, now - start);
 	}
 	kfree(report);
 	return ret;

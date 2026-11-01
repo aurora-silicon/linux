@@ -439,16 +439,23 @@ static u64 ane_h16_now(void *ctx)
 	return ktime_get_ns();
 }
 
-static void ane_h16_relax(void *ctx)
+/*
+ * The channel IRQ stays masked, so every wait polls. Sleep in short steps
+ * first (see ane_fw_poll_sleep_us()): a fixed 1 ms sleep made each of the
+ * four waits of an EXECUTE cost at least a millisecond.
+ */
+static void ane_h16_relax(void *ctx, u64 waited_ns)
 {
 	struct ane_h16_device *h = ctx;
+	unsigned int min_us, max_us;
 	int ret;
 
 	ane_h16_mailbox(h);
 	ret = ane_h16_faults(&h->boot, false);
 	if (ret)
 		ane_fw_transport_fail(&h->boot.transport, ret);
-	usleep_range(1000, 1050);
+	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
+	usleep_range(min_us, max_us);
 }
 
 static int ane_h16_alloc_shared(void *ctx, size_t size, u32 tag, struct ane_fw_surface *out)
