@@ -17,6 +17,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/timex.h>
 #include <linux/vmalloc.h>
 
 #include "ane_h16_boot.h"
@@ -657,7 +658,7 @@ out:
  * Diagnostic job interface (workspace ane). With h16_job=1 and a completed
  * startup stage, one write to debugfs ane_h16/job runs a sequence of records
  * {u32 op, u32 length, payload} in order; ane_h16/result then holds one record
- * {u32 op, s32 status, u64 ns, u32 length, u32 0, data} per job record. The
+ * {u32 op, s32 status, u64 ns, u32 length, u32 trailer, data} per job record. The
  * host builds every firmware command; the kernel maps, sends and waits.
  */
 static bool h16_job;
@@ -694,23 +695,39 @@ static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
 	return NULL;
 }
 
-static int ane_h16_job_emit(struct ane_h16_job *j, u32 op, int status, u64 ns,
-			    const void *data, size_t length)
+/*
+ * @trailer: how many u64 get_cycles() values (on arm64 the 24 MHz system
+ * counter, the clock of the firmware's event timestamps) follow @data; they
+ * count in the length.
+ */
+static int ane_h16_job_emit_counters(struct ane_h16_job *j, u32 op, int status, u64 ns,
+				     const void *data, size_t length,
+				     const u64 *counters, u32 trailer)
 {
+	size_t total = length + trailer * sizeof(u64);
 	u8 *r;
+	u32 i;
 
-	if (j->size - j->used < 24 || length > j->size - j->used - 24)
+	if (j->size - j->used < 24 || total > j->size - j->used - 24)
 		return -ENOSPC;
 	r = j->out + j->used;
 	put_unaligned_le32(op, r);
 	put_unaligned_le32(status, r + 4);
 	put_unaligned_le64(ns, r + 8);
-	put_unaligned_le32(length, r + 16);
-	put_unaligned_le32(0, r + 20);
+	put_unaligned_le32(total, r + 16);
+	put_unaligned_le32(trailer, r + 20);
 	if (length)
 		memcpy(r + 24, data, length);
-	j->used += 24 + length;
+	for (i = 0; i < trailer; i++)
+		put_unaligned_le64(counters[i], r + 24 + length + i * sizeof(u64));
+	j->used += 24 + total;
 	return 0;
+}
+
+static int ane_h16_job_emit(struct ane_h16_job *j, u32 op, int status, u64 ns,
+			    const void *data, size_t length)
+{
+	return ane_h16_job_emit_counters(j, op, status, ns, data, length, NULL, 0);
 }
 
 /* ane_fw_transport_wait with a 10-20 us poll, so job timings are not 1 ms steps. */
@@ -747,7 +764,7 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 	struct ane_fw_transport *t = &h->boot.transport;
 	u32 channel, fill;
 	u8 *command;
-	u64 start;
+	u64 start, counters[2];
 	int ret;
 
 	if (length < 16)
@@ -763,12 +780,14 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 	if ((fill & ANE_H16_JOB_FILL_PROCESS) && length >= 16)
 		put_unaligned_le32(j->process, command + 0xc);
 	start = ktime_get_ns();
+	counters[0] = get_cycles();
 	ret = ane_fw_transport_publish(t, channel, command, length,
 				       start + h->boot.build->command_timeout_ns);
 	if (!ret) {
 		j->published_ns = start;
 		ret = ane_h16_job_wait(h, channel);
 	}
+	counters[1] = get_cycles();
 	*ns = ktime_get_ns() - start;
 	if (t->pending[channel].rerings)
 		dev_info(h->dev, "H16 job command %x on ch %u: %u doorbell re-rings, %d\n",
@@ -783,7 +802,8 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 			j->process = get_unaligned_le32(reply + 0xc);
 		memcpy(command, reply, length);
 	}
-	ret = ane_h16_job_emit(j, ANE_H16_JOB_CMD, ret, *ns, command, length) ?: ret;
+	ret = ane_h16_job_emit_counters(j, ANE_H16_JOB_CMD, ret, *ns, command, length,
+					counters, 2) ?: ret;
 	kfree(command);
 	return ret;
 }
@@ -804,8 +824,10 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 
 		if (!r) {
 			u64 ns = ktime_get_ns() - j->published_ns;
+			u64 counter = get_cycles();
 
-			r = ane_h16_job_emit(j, ANE_H16_JOB_EVENT, 0, ns, report, size);
+			r = ane_h16_job_emit_counters(j, ANE_H16_JOB_EVENT, 0, ns, report, size,
+						      &counter, 1);
 			if (r)
 				return r;
 			if (size >= 0x20 && get_unaligned_le16(report + 4) == ANE_H16_EVENT_REPORT &&
@@ -950,6 +972,26 @@ static const struct file_operations ane_h16_job_fops = {
 	.write = ane_h16_job_write,
 };
 
+/*
+ * Diagnostic, workspace ane: macOS 25F84 ends ANE_Init with these three engine
+ * writes after its startup commands (re/25F84-kext.md, epilogue 0x92dfbf0).
+ */
+static bool h16_postboot;
+module_param(h16_postboot, bool, 0444);
+MODULE_PARM_DESC(h16_postboot, "After startup, do macOS's post-boot writes 0x1880058=1, 0x1880060=0, 0x196c000|=1");
+
+static void ane_h16_postboot(struct ane_h16_device *h)
+{
+	void __iomem *e = h->window[ANE_H16_ENGINE];
+	u32 a = readl(e + 0x1880058), b = readl(e + 0x1880060), c = readl(e + 0x196c000);
+
+	writel(1, e + 0x1880058);
+	writel(0, e + 0x1880060);
+	writel(c | 1, e + 0x196c000);
+	dev_info(h->dev, "H16 post-boot writes: 0x1880058 %x->%x 0x1880060 %x->%x 0x196c000 %x->%x\n",
+		 a, readl(e + 0x1880058), b, readl(e + 0x1880060), c, readl(e + 0x196c000));
+}
+
 static void ane_h16_job_publish(struct ane_h16_device *h)
 {
 	if (!h16_job || ane_h16_job_dev)
@@ -1027,6 +1069,8 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 			print_hex_dump(KERN_INFO, "H16 RESOURCE_INFO ", DUMP_PREFIX_OFFSET,
 				       16, 1, h->boot.resource_info,
 				       sizeof(h->boot.resource_info), false);
+			if (h16_postboot)
+				ane_h16_postboot(h);
 			ane_h16_job_publish(h);
 		}
 	}
