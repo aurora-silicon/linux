@@ -197,7 +197,7 @@ impl Ledger {
 
     /// Whether a short idle re-initializes the heap: more than half the maximum posted and
     /// idle for [`DRAIN_IDLE_NS`]. Back-to-back heavy scenes (a new client every few hundred
-    /// ms) never reach `g15_pb_idle_ms`, and posted blocks never come back while a PB lives, so
+    /// ms) never reach `tuning::PB_IDLE_MS`, and posted blocks never come back while a PB lives, so
     /// without this they run the heap to the maximum. A re-initialization with no idle time
     /// faulted at the heap base (at a client switch, the second in a row with no recovery
     /// between); with 50 ms of idle none did, also between two renders of one client.
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(Ledger::new(true, 512, 100).backed, 0);
         let fixed = Ledger::new(false, 512, 1024);
         assert_eq!((fixed.initial, fixed.max, fixed.posted), (4095, 4095, 4095));
-        // The values the driver passes (g15_pb_blocks 64, tuning::PB_MAX_BLOCKS) are kept.
+        // The values the driver passes (tuning::PB_BLOCKS 64, tuning::PB_MAX_BLOCKS) are kept.
         let l = Ledger::new(true, 64, 4095);
         assert_eq!(
             (l.initial, l.max, l.posted, l.producer()),
@@ -814,7 +814,7 @@ mod tests {
             }
         }
         // The case of the J516C run: a client-boundary re-initialization left 23 chunks for
-        // 264 posted blocks; the free is due after g15_pb_idle_ms of idle.
+        // 264 posted blocks; the free is due after tuning::PB_IDLE_MS of idle.
         let mut l = Ledger::new(true, 64, 4095);
         l.unback_to(23);
         l.posted = 264;

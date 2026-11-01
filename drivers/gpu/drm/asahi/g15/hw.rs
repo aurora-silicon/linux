@@ -581,8 +581,17 @@ pub(crate) mod tuning {
     pub(crate) const SLOT_ROTATE: bool = true;
     /// Flights per VM.
     pub(crate) const MAX_INFLIGHT: u32 = 2;
-    /// PB growth through event 7 / DEVCTL 7; the initial posting is `g15_pb_blocks` (64).
+    /// PB growth through event 7 / DEVCTL 7, from the initial posting of [`PB_BLOCKS`].
     pub(crate) const PB_GROW: bool = true;
+    /// PB blocks posted at (re)initialization: 64 blocks of 128 KiB (8 MiB).
+    pub(crate) const PB_BLOCKS: u32 = 64;
+    /// PB reclaim when the engine is idle: 0 never, 1 re-initialize, 2 also free the backing
+    /// above the initial posting and the reserve.
+    pub(crate) const PB_RECLAIM: u32 = 2;
+    /// Idle time before a PB reclaim, ms.
+    pub(crate) const PB_IDLE_MS: u32 = 1000;
+    /// Posted PB blocks above which an idle engine reclaims the PB.
+    pub(crate) const PB_RECLAIM_BLOCKS: u32 = 1024;
     /// The most PB blocks that may be posted: one below the mapped heap's block count, so the
     /// block-list producer (modulo K = 4096) never returns to 0.
     pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS - 1;

@@ -6,11 +6,11 @@ The harness extracts from drivers/gpu/drm/asahi/g15/pools.rs Firmware::answer_gr
 answer_request(), map_pb(), refill_backing(), note_idle(), reclaim_check(), free_backing() and
 reclaim_delay_ns(), Pools::soft_max(), map_heap(), free_chunks() and back_chunk(), PbChunk,
 chunk_gva(), CHUNK_BYTES and Pools::new's PB backing statements; from vm.rs VmState::map_one(),
-map_heap(), map_chunk() and unmap_heap_above(); pb_max_blocks(), pb_blocks(), pb_reclaim(),
-pb_idle_ns() and pb_reclaim_blocks() from params.rs; the PB sizes, tuning and PB leaf word from
-hw.rs; Prot::from_pte() and is_cached_noncoherent() from pgtable.rs; and the parameters' defaults
-from asahi_core.rs. It includes pools/growth.rs, fw/buffer.rs and fw/channels.rs whole. The bodies
-run against a model of the firmware objects, the GEM backing allocation, the shared layer's map_at()
+map_heap(), map_chunk() and unmap_heap_above(); pb_max_blocks() from params.rs, whose
+pb_blocks(), pb_reclaim(), pb_idle_ns() and pb_reclaim_blocks() must return the fixed hw.rs tuning
+values; the PB sizes, tuning and PB leaf word from hw.rs; Prot::from_pte() and
+is_cached_noncoherent() from pgtable.rs; and the g15_pb_max_blocks default from asahi_core.rs.
+It includes pools/growth.rs, fw/buffer.rs and fw/channels.rs whole. The bodies run against a model of the firmware objects, the GEM backing allocation, the shared layer's map_at()
 and the DEVCTL wait, which logs every allocation, alias map, unmap, free, block record, barrier,
 producer store, reply and log line in order. Allocation and alias map failures can be injected.
 Source checks: publish_prefix_into() starts with the PB catch-up, and pools.rs asserts the PB leaf
@@ -451,7 +451,8 @@ thread_local! {
     pub static LOG: RefCell<Vec<Ev>> = RefCell::new(Vec::new());
     pub static PARAM: Cell<u32> = Cell::new(PARAM_DEFAULT);
     pub static PARAM_BLOCKS: Cell<u32> = Cell::new(PB_BLOCKS_DEFAULT);
-    /// The reclaim parameters (g15_pb_reclaim, g15_pb_idle_ms, g15_pb_reclaim_blocks).
+    /// The initial posting and the reclaim values (hw::tuning PB_BLOCKS, PB_RECLAIM,
+    /// PB_IDLE_MS and PB_RECLAIM_BLOCKS), which a test may vary from the driver's.
     pub static PARAM_RECLAIM: Cell<u32> = Cell::new(PB_RECLAIM_DEFAULT);
     pub static PARAM_IDLE_MS: Cell<u32> = Cell::new(PB_IDLE_MS_DEFAULT);
     pub static PARAM_RECLAIM_BLOCKS: Cell<u32> = Cell::new(PB_RECLAIM_BLOCKS_DEFAULT);
@@ -507,22 +508,6 @@ pub mod module_parameters {
         }
     }
     pub static g15_pb_max_blocks: Param = Param;
-    pub struct Blocks;
-    impl Blocks {
-        pub fn value(&self) -> u32 {
-            crate::PARAM_BLOCKS.with(|p| p.get())
-        }
-    }
-    pub static g15_pb_blocks: Blocks = Blocks;
-    pub struct Cellp(pub &'static std::thread::LocalKey<std::cell::Cell<u32>>);
-    impl Cellp {
-        pub fn value(&self) -> u32 {
-            self.0.with(|p| p.get())
-        }
-    }
-    pub static g15_pb_reclaim: Cellp = Cellp(&crate::PARAM_RECLAIM);
-    pub static g15_pb_idle_ms: Cellp = Cellp(&crate::PARAM_IDLE_MS);
-    pub static g15_pb_reclaim_blocks: Cellp = Cellp(&crate::PARAM_RECLAIM_BLOCKS);
 }
 
 pub mod driver {
@@ -1832,7 +1817,7 @@ mod pb_growth_tests {
         assert!(take().is_empty());
     }
 
-    /// With g15_pb_reclaim 1 the client-boundary re-initialization keeps the backing for good.
+    /// With a reclaim level of 1 (tuning::PB_RECLAIM is 2) the client-boundary re-initialization keeps the backing for good.
     #[test]
     fn client_boundary_reinit_at_level_1_keeps_the_backing() {
         defaults();
@@ -1852,7 +1837,7 @@ mod pb_growth_tests {
     }
 
     /// Nothing grown since the initialization: an initial posting above half the maximum
-    /// (g15_pb_blocks 3000), or a floor below it (g15_pb_reclaim_blocks 32): no
+    /// (an initial posting of 3000), or a floor below it (a reclaim floor of 32): no
     /// re-initialization at any idle.
     #[test]
     fn nothing_grown_reinitializes_nothing() {
@@ -2121,23 +2106,38 @@ def main():
             if init.count(line) != 1:
                 raise SystemExit('Pools::init() does not hold: ' + line)
         reset = '\n'.join('p.' + line[len('self.'):] for line in LEDGER_RESET)
-        pb_max_blocks = '\n'.join(item(src[PARAMS], f'pub(crate) fn {name}() -> ')
-                                   for name in ('pb_max_blocks', 'pb_blocks', 'pb_reclaim', 'pb_idle_ns',
-                                                'pb_reclaim_blocks'))
+        pb_max_blocks = item(src[PARAMS], 'pub(crate) fn pb_max_blocks() -> ')
+        # The initial posting and the reclaim values are fixed driver values (hw::tuning), not
+        # module parameters: production's accessors must return exactly those constants. The
+        # harness's accessors read cells that start at them, so a test can vary them.
+        fixed = {'pb_blocks': ('u32', 'super::hw::tuning::PB_BLOCKS', 'PARAM_BLOCKS'),
+                 'pb_reclaim': ('u32', 'super::hw::tuning::PB_RECLAIM', 'PARAM_RECLAIM'),
+                 'pb_idle_ns': ('u64', 'super::hw::tuning::PB_IDLE_MS as u64 * 1_000_000', 'PARAM_IDLE_MS'),
+                 'pb_reclaim_blocks': ('u32', 'super::hw::tuning::PB_RECLAIM_BLOCKS', 'PARAM_RECLAIM_BLOCKS')}
+        for name, (ty, body, cell) in fixed.items():
+            got = item(src[PARAMS], f'pub(crate) fn {name}() -> ')
+            want = f'pub(crate) fn {name}() -> {ty} {{\n    {body}\n}}'
+            if got.strip() != want:
+                raise SystemExit(f'params.rs {name}() is not the fixed tuning value: {got!r}')
+            value = f'crate::{cell}.with(|p| p.get())'
+            if name == 'pb_idle_ns':
+                value = f'{value} as u64 * 1_000_000'
+            pb_max_blocks += f'\npub(crate) fn {name}() -> {ty} {{\n    {value}\n}}\n'
+        tuning_hw = item(hw, 'pub(crate) mod tuning {')
         reclaim_defaults = {}
-        for param, const in (('g15_pb_reclaim', 'PB_RECLAIM_DEFAULT'), ('g15_pb_idle_ms', 'PB_IDLE_MS_DEFAULT'),
-                             ('g15_pb_reclaim_blocks', 'PB_RECLAIM_BLOCKS_DEFAULT')):
-            m = re.search(rf'{param}: u32 \{{\s*default: (\d+),', src[CORE])
+        for name, const in (('PB_RECLAIM', 'PB_RECLAIM_DEFAULT'), ('PB_IDLE_MS', 'PB_IDLE_MS_DEFAULT'),
+                            ('PB_RECLAIM_BLOCKS', 'PB_RECLAIM_BLOCKS_DEFAULT')):
+            m = re.search(rf'pub\(crate\) const {name}: u32 = (\d+);', tuning_hw)
             if not m:
-                raise SystemExit(f'{param} default not found')
+                raise SystemExit(f'tuning::{name} not found')
             reclaim_defaults[const] = int(m.group(1))
         m = re.search(r'g15_pb_max_blocks: u32 \{\s*default: (\d+),', src[CORE])
         if not m:
             raise SystemExit('g15_pb_max_blocks default not found')
         param_default = int(m.group(1))
-        m = re.search(r'g15_pb_blocks: u32 \{\s*default: (\d+),', src[CORE])
+        m = re.search(r'pub\(crate\) const PB_BLOCKS: u32 = (\d+);', tuning_hw)
         if not m:
-            raise SystemExit('g15_pb_blocks default not found')
+            raise SystemExit('tuning::PB_BLOCKS not found')
         blocks_default = int(m.group(1))
         sizes = consts(item(hw, 'pub(crate) mod sizes {'), ['PB_BLOCKS'])
         tuning = consts(item(hw, 'pub(crate) mod tuning {'), ['PB_GROW', 'PB_MAX_BLOCKS'])

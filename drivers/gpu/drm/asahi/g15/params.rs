@@ -111,25 +111,24 @@ pub(crate) fn pb_max_blocks() -> u32 {
     module_parameters::g15_pb_max_blocks.value().clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
 }
 
-/// The initial PB posting, in blocks (64..=4095; the ledger clamps it again). Read-only after
-/// boot.
+/// The initial PB posting, in blocks: a fixed driver value, not a module parameter.
 pub(crate) fn pb_blocks() -> u32 {
-    module_parameters::g15_pb_blocks.value().clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
+    super::hw::tuning::PB_BLOCKS
 }
 
 /// PB reclaim at idle: 0 never, 1 re-initialize, 2 re-initialize and free the backing.
 pub(crate) fn pb_reclaim() -> u32 {
-    module_parameters::g15_pb_reclaim.value().min(2)
+    super::hw::tuning::PB_RECLAIM
 }
 
-/// Idle time before a PB reclaim, ns (at least 100 ms).
+/// Idle time before a PB reclaim, ns.
 pub(crate) fn pb_idle_ns() -> u64 {
-    module_parameters::g15_pb_idle_ms.value().max(100) as u64 * 1_000_000
+    super::hw::tuning::PB_IDLE_MS as u64 * 1_000_000
 }
 
 /// Posted blocks above which an idle engine reclaims the PB.
 pub(crate) fn pb_reclaim_blocks() -> u32 {
-    module_parameters::g15_pb_reclaim_blocks.value()
+    super::hw::tuning::PB_RECLAIM_BLOCKS
 }
 
 /// Whether FRAGMENT_BARRIERS is advertised and mapped to early tiling.

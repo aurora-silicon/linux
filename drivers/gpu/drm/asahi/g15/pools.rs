@@ -12,7 +12,7 @@
 //!   the fixed client GVA: each VM's before its prefixes are published ([`Firmware::map_pb`]),
 //!   and a chunk backed later also into the VM of the flights; nothing names its pages through
 //!   the host window or context 0 (the records hold client GVAs only). Initial
-//!   `g15_pb_blocks` (64), at most [`super::hw::tuning::PB_MAX_BLOCKS`] (4095) posted, so the
+//!   `tuning::PB_BLOCKS` (64), at most [`super::hw::tuning::PB_MAX_BLOCKS`] (4095) posted, so the
 //!   producer never returns to 0; the firmware is given [`Pools::soft_max`] (default 3072) as
 //!   its growth maximum. Truthful K = 4096 in every
 //!   profile (PB reconstruction, also in recovery, synchronizes 8 * K bytes of the block list:
@@ -21,15 +21,15 @@
 //!   replies of a pass, while fewer than a reserve chunk remain, [`Firmware::refill_backing`]
 //!   backs the next chunk, so a reply never waits for the allocator. Only a reserve that ran dry
 //!   makes a request wait: it stays queued, the pass backs a chunk and the next pass answers it.
-//! - Reclaim ([`Firmware::reclaim_check`], `g15_pb_reclaim`): posted blocks never come back
+//! - Reclaim ([`Firmware::reclaim_check`], `tuning::PB_RECLAIM`): posted blocks never come back
 //!   while a PB lives (the firmware recycles pages inside its own pool; the host has no view of
-//!   it), so an engine idle for `g15_pb_idle_ms` with more than `g15_pb_reclaim_blocks` posted
+//!   it), so an engine idle for `tuning::PB_IDLE_MS` with more than `tuning::PB_RECLAIM_BLOCKS` posted
 //!   re-initializes the PB at its next render through the re-initialization path of a recovered
 //!   abort (fresh lists and manager, InitBM of the initial blocks, no halt) and frees the backing
 //!   above the kept chunks (also with fewer posted, when more is backed than they need); an
 //!   engine idle for 50 ms (a client boundary) with more than half the maximum posted
 //!   re-initializes it the same way but keeps the backing; if no render follows, with
-//!   `g15_pb_reclaim` 2 the backing above the kept chunks is freed after `g15_pb_idle_ms`.
+//!   `tuning::PB_RECLAIM` 2 the backing above the kept chunks is freed after `tuning::PB_IDLE_MS`.
 //! - Growth: the event drain queues type-7 requests; [`Firmware::answer_growth`] answers each
 //!   one in the poll pass: type 7, PB slot 0, the context of a live published render prefix,
 //!   counter >= next expected, epoch == current halt count; write records `(G - 0x1000000000)
@@ -82,7 +82,7 @@ static_assert!(buffer::PAGE_LIST_SIZE as u64 == client::PB_PAGE_LIST_SIZE);
 static_assert!(uma_manager::SEEDS == sizes::FREELIST_SEED);
 static_assert!(uma_pools::POOL_SIZE == sizes::POOL_SIZE);
 // The ledger keeps the driver's PB maximum: it is not capped by [`growth::MAX_POSTED`]. The
-// initial posting (`g15_pb_blocks`) is clamped to MIN_BLOCKS..=PB_MAX_BLOCKS.
+// initial posting (`tuning::PB_BLOCKS`) is clamped to MIN_BLOCKS..=PB_MAX_BLOCKS.
 static_assert!(tuning::PB_MAX_BLOCKS <= growth::MAX_POSTED);
 static_assert!(buffer::MIN_BLOCKS <= tuning::PB_MAX_BLOCKS);
 // The PB alias is GPU-only (not cached and firmware-visible): dropping one is a plain unmap,
@@ -700,17 +700,17 @@ impl Firmware {
         self.pools.idle.note(idle, super::engine::now_ns());
     }
 
-    /// Reclaims the PB when the engine has been idle for `g15_pb_idle_ms` with more than
-    /// `g15_pb_reclaim_blocks` posted or more backing than the posted blocks need, or for
+    /// Reclaims the PB when the engine has been idle for `tuning::PB_IDLE_MS` with more than
+    /// `tuning::PB_RECLAIM_BLOCKS` posted or more backing than the posted blocks need, or for
     /// [`growth::DRAIN_IDLE_NS`] with more than half the maximum posted
     /// ([`growth::Ledger::drain_reinit_due`]; re-initialization only): the next render prefix
     /// re-initializes the render allocators and the PB (InitBM of the initial blocks;
     /// `recovery.reinit`, as after a recovered abort but with no halt), and with
-    /// `g15_pb_reclaim` 2 the backing chunks above those of the initial posting and the reserve
+    /// `tuning::PB_RECLAIM` 2 the backing chunks above those of the initial posting and the reserve
     /// are freed now, unmapped from every VM of the registry (a VM that publishes later drops
     /// its stale mappings at [`VmState::map_heap`]). While a reclaim's re-initialization is
-    /// pending (a client-boundary one kept the backing), `g15_pb_reclaim` 2 frees the backing
-    /// above those chunks once the engine has been idle for `g15_pb_idle_ms`
+    /// pending (a client-boundary one kept the backing), `tuning::PB_RECLAIM` 2 frees the backing
+    /// above those chunks once the engine has been idle for `tuning::PB_IDLE_MS`
     /// ([`growth::Ledger::pending_free_due`]). Called under the device lock when a job arrives
     /// at an idle engine and in idle poll passes.
     pub(crate) fn reclaim_check(&mut self) {
