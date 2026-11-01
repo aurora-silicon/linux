@@ -634,6 +634,16 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 	ret = ane_h16_load_slots(hwx, &p->plan, layout, p->slots);
 	if (ret)
 		return ret;
+	/*
+	 * H17 (T8140, 26.6.2 firmware) asserts in EXELOOP right after logging a
+	 * custom BAR record (CAneProgramManagerHx.cpp:416) and never reports the
+	 * request: the mcache record of a linear relu stopped the Neo there.
+	 * Every H17 request that ran sent no record, so H17 programs carry none
+	 * and keep the firmware's default mcache DSID.
+	 */
+	p->bar_count = 0;
+	if (s->transport->soc->chip_family >= 17)
+		return 0;
 	return ane_h16_custom_bars(&p->snapshot, hwx, s->dsid, p->bars, &p->bar_count);
 }
 

@@ -1602,7 +1602,31 @@ static void program_h17_switch_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
+/*
+ * H17 sends no custom BAR record, even for a linear program whose descriptor
+ * names the mcache field: the H17 firmware asserts on the record.
+ */
+static void program_h17_no_custom_bar_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create_family(test, 17);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	/* The linear add128 fixture is an H16 HWX; let this H17 session take it. */
+	f->soc.hwx_subtype = ANE_HWX_SUBTYPE_H16;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, p->bar_count, 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->exec_length, ANE_H16_EXECUTE_BASE_SIZE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
 	KUNIT_CASE(program_add128_hwx_test),
