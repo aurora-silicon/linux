@@ -100,8 +100,8 @@ struct apple_qspi_soc {
 /*
  * A board whose NVRAM may be written: the controller compatible, the
  * machine, the controller aperture, the nvram partition the device tree
- * must describe, the boot NOR JEDEC ID and the SR1 block-protect bits its
- * firmware leaves set at boot.
+ * must describe, the boot NOR JEDEC ID, the SR1 block-protect bits its
+ * firmware leaves set at boot and the JEDEC ID of a second part, if any.
  */
 struct apple_qspi_board {
 	const char *controller;
@@ -111,6 +111,7 @@ struct apple_qspi_board {
 	u32 nvram_size;
 	u8 jedec[3];
 	u8 bp_ok;
+	u8 jedec_alt[3];
 };
 
 #define APPLE_QSPI_JEDEC_W25Q64		{ 0xef, 0x65, 0x17 }
@@ -122,9 +123,10 @@ static const struct apple_qspi_board apple_qspi_boards[] = {
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
 	{ "apple,t8132-qspi", "apple,j713", 0x3ad118000ULL,
 	  0x700000, 0x100000, APPLE_QSPI_JEDEC_W25Q64, 0 },
-	/* Macronix; the ID macOS reports for the J616s boot NOR. */
+	/* Macronix is the ID macOS reports; a J616s also reads W25Q64 on the bus. */
 	{ "apple,t6041-qspi", "apple,j616s", 0x429118000ULL,
-	  0x700000, 0x100000, APPLE_QSPI_JEDEC_MX_2B27, 0 },
+	  0x700000, 0x100000, APPLE_QSPI_JEDEC_MX_2B27, 0,
+	  APPLE_QSPI_JEDEC_W25Q64 },
 	/* iBoot leaves BP0 set on the J700, over the top 64 KiB. */
 	{ "apple,t8140-qspi", "apple,j700", 0x385110000ULL,
 	  0x24000, 0x1d0000, APPLE_QSPI_JEDEC_W25Q16, 0x1c },
@@ -198,8 +200,9 @@ struct apple_qspi {
 	/* The nvram partition [window_start, window_end). */
 	u64 window_start;
 	u64 window_end;
-	/* Expected JEDEC ID and the SR1 block-protect bits left by firmware. */
+	/* Expected JEDEC IDs and the SR1 block-protect bits left by firmware. */
 	u8 jedec[3];
+	u8 jedec_alt[3];
 	u8 bp_ok;
 	bool nvram_write_candidate;
 	bool write_fault;
@@ -710,7 +713,8 @@ static int apple_qspi_nvram_modify(struct spi_mem *mem, const struct spi_mem_op 
 	ret = apple_qspi_read_register(mem, 0x9f, id, sizeof(id));
 	if (ret)
 		goto out;
-	if (memcmp(id, qspi->jedec, sizeof(id))) {
+	if (memcmp(id, qspi->jedec, sizeof(id)) &&
+	    (!qspi->jedec_alt[0] || memcmp(id, qspi->jedec_alt, sizeof(id)))) {
 		ret = -ENODEV;
 		goto out;
 	}
@@ -823,14 +827,18 @@ static int apple_qspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	if (!apple_qspi_supports_op(mem, op) || apple_qspi_shape_op(op, &shape))
 		return -EOPNOTSUPP;
 	mutex_lock(&apple_qspi_policy_lock);
-	/* 35h is EQIO, not a register read, on Macronix parts. */
-	if (op->cmd.opcode == 0x35 &&
-	    qspi->jedec[0] == APPLE_QSPI_MFR_MACRONIX) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
 	if (op->data.dir == SPI_MEM_DATA_IN && op->data.nbytes &&
 	    apple_qspi_opcode_is_read(op->cmd.opcode)) {
+		/* 35h is EQIO, not a register read, on Macronix parts. */
+		if (op->cmd.opcode == 0x35) {
+			u8 id[3];
+
+			ret = apple_qspi_read_register(mem, 0x9f, id, sizeof(id));
+			if (!ret && id[0] == APPLE_QSPI_MFR_MACRONIX)
+				ret = -EOPNOTSUPP;
+			if (ret)
+				goto out;
+		}
 		ret = apple_qspi_transfer_op(mem, op);
 		goto out;
 	}
@@ -1006,6 +1014,7 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	if (board && qspi->window_start == board->nvram_start &&
 	    qspi->window_end == (u64)board->nvram_start + board->nvram_size) {
 		memcpy(qspi->jedec, board->jedec, sizeof(qspi->jedec));
+		memcpy(qspi->jedec_alt, board->jedec_alt, sizeof(qspi->jedec_alt));
 		qspi->bp_ok = board->bp_ok;
 		qspi->nvram_write_candidate = true;
 	}

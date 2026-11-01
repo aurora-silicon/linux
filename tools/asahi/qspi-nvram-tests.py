@@ -69,7 +69,7 @@ static int param_get_bool(char*b,const struct kernel_param*p){b[0]=*(bool*)p->ar
 struct apple_qspi {
  bool nvram_policy, nvram_write_candidate, write_fault, nvram_window;
  u64 window_start, window_end;
- u8 jedec[3]; u8 bp_ok;
+ u8 jedec[3]; u8 jedec_alt[3]; u8 bp_ok;
  int irq;
 };
 struct spi_controller;
@@ -164,6 +164,7 @@ int main(void){
  struct device_node t6041={"apple,t6041-qspi"},t8140={"apple,t8140-qspi"};
  machine="apple,j616s";qb=apple_qspi_nvram_write_board(&t6041,0x429118000ULL);
  assert(qb&&qb->nvram_start==0x700000&&qb->nvram_size==0x100000&&qb->jedec[0]==0xc2&&qb->jedec[1]==0x2b&&qb->jedec[2]==0x27&&!qb->bp_ok);
+ assert(qb->jedec_alt[0]==0xef&&qb->jedec_alt[1]==0x65&&qb->jedec_alt[2]==0x17);
  machine="apple,j700";qb=apple_qspi_nvram_write_board(&t8140,0x385110000ULL);
  assert(qb&&qb->nvram_start==0x24000&&qb->nvram_size==0x1d0000&&qb->jedec[2]==0x15&&qb->bp_ok==0x1c);
  puts("PASS J613/J713/J700/J616s board, controller and full-width aperture qualification (140 combinations)");
@@ -241,12 +242,24 @@ int main(void){
  erase.addr.val=0x701000;
  wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20)&&!sent(0x35));
  struct spi_mem_op rdcr2=SPI_MEM_OP(SPI_MEM_OP_CMD(0x35,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_DATA_IN(1,id,1));
- wire_count=0;assert(apple_qspi_exec_op(&mem,&rdcr2)<0&&!wire_count);
+ wire_count=0;assert(apple_qspi_exec_op(&mem,&rdcr2)<0&&!sent(0x35));
  for(unsigned int bp=0x04;bp<=0x20;bp<<=1){reset();jedec[0]=0xc2;jedec[1]=0x2b;jedec[2]=0x27;memcpy(q.jedec,jedec,3);arm();
   sr[0]=bp;wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x35));}
  reset();memcpy(q.jedec,(u8[]){0xc2,0x2b,0x27},3);arm();wire_count=0;o=program(0x700000,1,data);
  assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
  puts("PASS Macronix J616s part: no 35h on the wire, SR/CR checks, BP0-BP3 refusal and JEDEC mismatch");
+ /* J616s W25Q64 part: the same board entry, and 35h is its SR2 read. */
+ reset();memcpy(q.jedec,(u8[]){0xc2,0x2b,0x27},3);memcpy(q.jedec_alt,jedec,3);arm();memset(data,0x55,sizeof(data));
+ o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&sent(0x35));
+ assert(!memcmp(flash+0x700000,data,256)&&!sr[0]);
+ wire_count=0;assert(!apple_qspi_exec_op(&mem,&rdcr2)&&sent(0x35));
+ /* A second-slot match keeps the Winbond protection checks. */
+ sr[1]=0x40;wire_count=0;o=program(0x700100,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
+ sr[1]=0;jedec[2]^=1;wire_count=0;assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
+ /* An empty second slot admits nothing, even on a bus that reads zeroes. */
+ reset();memset(jedec,0,3);arm();wire_count=0;o=program(0x700000,1,data);
+ assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
+ puts("PASS W25Q64 J616s part: second ID admitted with SR2 read and checks, third ID and empty slot refused");
  /* Model spi-mem's outer reference. Every private JEDEC/status/WREN,
   * completion poll, WRDI and readback must finish before the idle stamp.
   * Hardware tests must still prove genpd and the actual suspend timer. */
@@ -324,7 +337,9 @@ def main():
             ('bp-ok', '!(sr1 & 0x1c & ~bp_ok)', '1'),
             ('mx-bp3', '!(sr & 0x3c & ~bp_ok)', '!(sr & 0x1c & ~bp_ok)'),
             ('mx-eqio', 'opcode = macronix;', 'opcode = winbond;'),
-            ('mx-eqio-read', 'qspi->jedec[0] == APPLE_QSPI_MFR_MACRONIX) {', '0) {'),
+            ('mx-eqio-read', '!ret && id[0] == APPLE_QSPI_MFR_MACRONIX', '0'),
+            ('jedec-alt', 'memcmp(id, qspi->jedec_alt, sizeof(id))', '1'),
+            ('jedec-alt-empty', '!qspi->jedec_alt[0] || ', ''),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;'),
