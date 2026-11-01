@@ -2392,8 +2392,48 @@ void dcp_hdr_metadata_forget(struct apple_dcp *dcp)
 
 	if (!d)
 		return;
-	scoped_guard(spinlock_irqsave, &d->hdr_lock)
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
 		d->hdr_sent_valid = false;
+		d->hdr_infoframe = false;
+	}
+}
+
+/*
+ * Clear the Dynamic Range and Mastering InfoFrame of a live link before it
+ * leaves PQ, as macOS does: DCPAV selector 0x14 first, then the SDR colour
+ * mode.  Setting the SDR colour mode alone would leave the sink an HDR
+ * InfoFrame for an SDR signal.
+ */
+static void dcp_hdr_infoframe_stop(struct apple_dcp *dcp)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct apple_epic_service *service = NULL;
+	u8 msg[DCP_HDR_STOP_SIZE], reply[DCP_HDR_STOP_SIZE] = {};
+	size_t received = 0;
+	u32 retcode = 0;
+	int ret;
+
+	if (!d || READ_ONCE(dcp->crashed))
+		return;
+	scoped_guard(spinlock_irqsave, &d->hdr_lock)
+		if (d->hdr_infoframe)
+			service = afk_service_get(d->av_service);
+	if (!service)
+		return;
+
+	dcp_hdr_stop_message(msg);
+	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
+					      msg, sizeof(msg), reply, sizeof(reply),
+					      &retcode, &received);
+	ret = dcp_hdr_stop_reply(ret, retcode, reply, received);
+	if (ret)
+		dev_warn(dcp->dev, "HDR InfoFrame not stopped: %d\n", ret);
+	else
+		dev_dbg(dcp->dev, "HDR InfoFrame stopped\n");
+	scoped_guard(spinlock_irqsave, &d->hdr_lock)
+		if (d->av_service == service)
+			d->hdr_infoframe = false;
+	afk_service_put(service);
 }
 
 /* Whether @pdev takes a change of HDR_OUTPUT_METADATA without a mode set. */
@@ -2410,8 +2450,8 @@ bool dcp_hdr_metadata_live(struct platform_device *pdev)
  * link carries PQ: after the mode set that selected a PQ colour mode, and
  * whenever the metadata changes on it.  Never per frame, and never on an
  * SDR link (the firmware would build a DRM InfoFrame with the SDR EOTF).
- * Going back to SDR is a mode set, and the link set up again carries no
- * InfoFrame.
+ * Going back to SDR is a mode set that first stops the InfoFrame
+ * (dcp_hdr_infoframe_stop()).
  */
 static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 				  struct drm_atomic_commit *commit)
@@ -2473,6 +2513,8 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		if (d->av_service == service) {
 			memcpy(d->hdr_sent, data, sizeof(data));
 			d->hdr_sent_valid = true;
+			if (!ret)
+				d->hdr_infoframe = true;
 		}
 	}
 	afk_service_put(service);
@@ -2642,6 +2684,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
 			  dcp_crtc_bt2020(dcp, crtc, commit);
 	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
+	if (!dcp->pq_requested)
+		dcp_hdr_infoframe_stop(dcp);
 	dcp_hdr_metadata_forget(dcp);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
