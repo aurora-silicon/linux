@@ -956,7 +956,12 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 			result = -EIO;
 			goto out;
 		}
-		if (!ane_rtclient_channels_unchanged(ane)) {
+		/* The H14 channel table is checked before the doorbell and
+		 * again before a reply is accepted below; the slots are found
+		 * from the host's own copy, so a look needs no check of its
+		 * own.
+		 */
+		if (ane->soc->platform && !ane_rtclient_channels_unchanged(ane)) {
 			result = -EPROTO;
 			goto out;
 		}
@@ -1217,16 +1222,20 @@ static const void *ane_rtclient_fw_cpu(struct ane_rtclient *ane, u64 iova,
  * bit, as the allocation ring does. The ioctls drain channels 4/6 after
  * every completed exchange. Returns true when
  * an IO_T2H slot held the finish event of a CALL.
+ *
+ * check validates the channel table first. Only the H14 finish-event poll
+ * passes false, and validates it once the event is in; see
+ * ane_rtclient_call_wait().
  */
-static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
-				   unsigned int channel)
+static bool __ane_rtclient_drain_t2h(struct ane_rtclient *ane,
+				     unsigned int channel, bool check)
 {
 	const struct ane_fw_channel *c = &ane->channels[channel];
 	unsigned int n = 0, slot_i = ane->legacy_cmd_cursor[channel];
 	void __iomem *ipi = ane_rtclient_doorbell(ane);
 	bool finished = false;
 
-	if (!ane_rtclient_channels_unchanged(ane)) {
+	if (check && !ane_rtclient_channels_unchanged(ane)) {
 		atomic_set(&ane_t6021_quarantined, 1);
 		if (ane->soc->platform) {
 			ane->pending.error = -EPROTO;
@@ -1302,6 +1311,12 @@ static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
 	return finished;
 }
 
+static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
+				   unsigned int channel)
+{
+	return __ane_rtclient_drain_t2h(ane, channel, true);
+}
+
 /* The completion wait with trace_td on: the same finish-event test with a
  * 20-40 us poll, and one TD-word sample per poll under the PS-word guard
  * (see trace_td).
@@ -1374,7 +1389,15 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 				return ane->pending.error ?: -EIO;
 			if (ane->waiting && ane->waiting->terminal)
 				return ane->waiting->status;
-		} else if (ane_rtclient_drain_t2h(ane, 6)) {
+		} else if (__ane_rtclient_drain_t2h(ane, 6, false)) {
+			/* Each look reads the slots through the host's copy
+			 * of the channel table, so the table is validated
+			 * once, on the event, rather than on every look.
+			 */
+			if (!ane_rtclient_channels_unchanged(ane)) {
+				atomic_set(&ane_t6021_quarantined, 1);
+				return -EIO;
+			}
 			return 0;
 		} else if (ane_rtclient_malloc_drain(ane)) {
 			/* A program waiting on an unanswered request never
