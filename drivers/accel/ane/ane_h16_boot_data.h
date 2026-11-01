@@ -159,6 +159,8 @@ static const struct ane_h16_build ane_h16_build_26a428 = {
 	.dart_address_lo = 0x170,
 	.dart_address_hi = 0x174,
 	.dapf_version = 8,
+	.dapf_version_value = 0x203,
+	.dapf_instances = 3,
 	.dapf_protect = 0x200,
 	.dapf_lock = 0x208,
 	.dapf_stride = 0x40,
@@ -170,6 +172,62 @@ static const struct ane_h16_build ane_h16_build_26a428 = {
 	.tunables = ane_h16_tunables_26a428,
 	.tunable_count = ARRAY_SIZE(ane_h16_tunables_26a428),
 	.startup = { { 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 } },
+};
+
+/*
+ * 25F84 (macOS 26.5.2) on J616c: the 26A428 boot values until a 25F84 stage
+ * shows otherwise (rg-ane-00: power, CPU control and RVBAR as 26A428).
+ */
+static const struct ane_h16_build ane_h16_build_25f84 = {
+	.identity = "H16 26.5.2 25F84",
+	.cpu_control = 0x1600044,
+	.rvbar = 0x1050000,
+	.ce = 0x18a4000,
+	.ce_delays = 5001,
+	.ce_delay_us = 10,
+	.ready = 0x08042006,
+	.run = 0x10,
+	.scratch_polls = 1000,
+	.scratch_delay_us = 1000,
+	.command_timeout_ns = 3000000000ULL,
+	.pool_dva = 0x10000384000,
+	.ipc_dva = 0x100003d0000,
+	.heap_dva = 0x100003e4000,
+	.shared_dva = 0x10001300000,
+	.expected_rvbar = 0x10000000001,
+	.pool_size = 0x40000,
+	.init_offset = 0x180,
+	.init_size = 0x174,
+	.config_span = 0x380000,
+	.config_window = 0x10000000,
+	.template_count = 64,
+	.template_word = 0x12c,
+	.template_value = 4,
+	.max_channels = 0x21,
+	/* Host allocation policy, not a recovered firmware ceiling. */
+	.max_heap = SZ_16M,
+	.dart_fault = 0x100,
+	.dart_address_lo = 0x170,
+	.dart_address_hi = 0x174,
+	.dapf_version = 8,
+	/* J616c: DART word 0x2a2a0202; one DAPF (dart-ane0 reg 3, "DAPF LLT"). */
+	.dapf_version_value = 0x202,
+	.dapf_instances = 1,
+	.dapf_protect = 0x200,
+	.dapf_lock = 0x208,
+	.dapf_stride = 0x40,
+	/* Version/protect/lock are DART registers; DAPF records are separate. */
+	.dapf_records = 0,
+	.dapf_layout_known = true,
+	.native_free = true,
+	.c1ppt = true,
+	.tunables = ane_h16_tunables_26a428,
+	.tunable_count = ARRAY_SIZE(ane_h16_tunables_26a428),
+	.startup = { { 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 } },
+};
+
+static const struct ane_h16_build *const ane_h16_builds[] = {
+	&ane_h16_build_26a428, &ane_h16_build_25f84,
 };
 
 #endif /* __ANE_H16_BOOT_DATA_H__ */

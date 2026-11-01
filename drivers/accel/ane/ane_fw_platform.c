@@ -33,6 +33,7 @@ static const u32 ane_h16_power_words[] = {
 
 const struct ane_fw_platform ane_h16_platform = {
 	.h16_boot = &ane_h16_build_26a428,
+	.h16_builds = ane_h16_builds,
 	/* The DT compatible is t6041; the physical M4 Pro is T6040. */
 	.soc = 0x6040,
 	.chip_family = 16,

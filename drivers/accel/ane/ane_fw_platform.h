@@ -25,6 +25,8 @@ enum ane_fw_irq_role {
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
 	const struct ane_h16_build *h16_boot;
+	/* Indexed like ane_h16_preload_layouts. */
+	const struct ane_h16_build *const *h16_builds;
 	u32 soc;
 	u16 chip_family;
 	u16 ane_type;

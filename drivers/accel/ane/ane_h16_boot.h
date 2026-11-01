@@ -73,6 +73,9 @@ struct ane_h16_build {
 	u32 dart_address_lo;
 	u32 dart_address_hi;
 	u32 dapf_version;
+	/* Expected low half of the DART word at dapf_version; DAPF instances. */
+	u32 dapf_version_value;
+	u32 dapf_instances;
 	u32 dapf_protect;
 	u32 dapf_lock;
 	u32 dapf_records;
@@ -253,8 +256,10 @@ static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
 
 		b->ops->log(b->ctx, "DAPF version", dart, version);
 		b->ops->log(b->ctx, "DAPF protect/lock", protect, lock);
-		if ((version & 0xffff) != 0x203)
+		if ((version & 0xffff) != f->dapf_version_value)
 			return -ENODEV;
+		if (dart >= f->dapf_instances)
+			continue;
 		for (record = 0; record < 4; record++)
 			if (!ane_h16_dapf_record(b, dart, record) &&
 			    program && (lock & BIT(2)))
@@ -262,7 +267,7 @@ static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
 	}
 	if (!program)
 		return 0;
-	for (dart = 0; dart < 3; dart++) {
+	for (dart = 0; dart < f->dapf_instances; dart++) {
 		enum ane_h16_window w = ANE_H16_DAPF0 + dart;
 
 		for (record = 0; record < 4; record++) {

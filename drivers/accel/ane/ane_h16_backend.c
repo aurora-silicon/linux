@@ -621,7 +621,9 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 	ret = ane_h16_preload_identify(snap[0], b->soc->preload_size[0],
 				       snap[1], b->soc->preload_size[1]);
 	if (ret >= 0) {
-		/* 25F84 runs on the 26A428 boot values until a stage shows otherwise. */
+		if (b->soc->h16_builds)
+			b->build = b->soc->h16_builds[ret];
+		h->shared_next = b->build->shared_dva;
 		dev_info(h->dev, "H16 preload identity %s accepted (boot values %s)\n",
 			 ane_h16_build_names[ret], b->build->identity);
 		ret = 0;
