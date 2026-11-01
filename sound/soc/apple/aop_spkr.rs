@@ -76,7 +76,8 @@ use kernel::{
 };
 
 use super::{
-    AudioAttachDevice, AudioSetDeviceProp, PowerSetting, SndSocAopData, EPIC_SUBTYPE_WRAPPED_CALL,
+    AudioAttachDevice, AudioSetDeviceProp, PowerSetting, SndSocAopData, AUDIO_RET_BUSY,
+    EPIC_SUBTYPE_WRAPPED_CALL,
 };
 
 const CALLTYPE_AUDIO_GET_PROP: u32 = 0xc3000004;
@@ -93,8 +94,6 @@ const STATE_PWRD: u32 = from_fourcc(b"pwrd");
 const PWRD_OUTPUT: u32 = 2;
 /// The same for an input stream (the microphones' `pwrd` request uses 1).
 const PWRD_INPUT: u32 = 1;
-/// kIOReturnBusy: the firmware keeps an attachment for its lifetime, so a reload sees this.
-const AUDIO_RET_BUSY: u32 = 0xe00002d5;
 
 /// Property read (0xc3000004): the same header as the property write, with a trailing 1.
 #[repr(C, packed(4))]
