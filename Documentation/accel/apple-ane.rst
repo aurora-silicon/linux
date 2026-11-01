@@ -34,13 +34,16 @@ System RAM, so a loader may either reserve the range at boot or leave it
 outside the memory map and describe it with a node.
 
 Metadata preflight checks resource geometry and these ranges without MMIO
-or power access. Missing reservations fail with ``-ENODATA`` and malformed
-reservations with ``-EINVAL``. A device that passes binds idle, without
-power or MMIO access, and only a stage written to its debugfs control file
-starts the diagnostic backend described below. No accel node or
-program-loading interface exists before the program stage.
+or power access. Board DTs carry disabled reservation placeholders; while
+the loader has not filled and enabled them the device is refused with
+``-ENODEV`` and one informational message. Missing reservations fail with
+``-ENODATA`` and malformed reservations with ``-EINVAL``. A device that
+passes is brought up through the program stage described below once per
+boot, from a work item after probe. No accel node or program-loading
+interface exists before the program stage.
 
-The H16 DT nodes stay disabled. The five real PMGR providers already encode
+The J616s enables the ANE and its three DARTs; other H16 boards keep them
+disabled until proven. The five real PMGR providers already encode
 the system/CPU/MPM/task/base dependency graph. The PMGR binding does not
 represent the virtual no-state gates, so no fictitious register-backed
 domains are created for them. SID 0 and SID 11 on all three DARTs use the
@@ -674,10 +677,11 @@ size, and vary inputs or poison outputs so retained output cannot pass.
 Staged H16 cold boot
 -------------------
 
-Bring-up is driven from ``<debugfs>/ane-h16/<device>/stage`` (root only).
-Writing ``preflight``, ``map``, ``boot``, ``startup`` or ``program`` runs
-every stage that has not run yet, up to the one written; reading the file
-reports the last completed stage and the run, refusal and quarantine state.
+The boot bring-up runs every stage in order. ``<debugfs>/ane-h16/<device>/stage``
+(root only) reports the last completed stage and the run, refusal and
+quarantine state. Before the boot bring-up has started, writing
+``preflight``, ``map``, ``boot``, ``startup`` or ``program`` runs every
+stage that has not run yet, up to the one written, for diagnosis.
 A stage at or below the completed one is refused with ``-EALREADY``. There
 is no module parameter and no H14 boot parameter changes the H16 path. H17 still refuses ownership and registration.
 All build-dependent boot values and ordered masked updates belong to the
