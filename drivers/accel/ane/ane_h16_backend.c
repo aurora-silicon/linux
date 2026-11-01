@@ -801,6 +801,34 @@ static unsigned int h16_job_spin_us;
 module_param(h16_job_spin_us, uint, 0444);
 MODULE_PARM_DESC(h16_job_spin_us, "Spin up to this many us before sleeping in job waits (max 1000, default 0)");
 
+/* Mechanism probe, not a latency optimization: after the EXECUTE slot ACK,
+ * withhold transport/MMIO service briefly while firmware runs. At most 10 ms;
+ * the existing completion deadline and post-window servicing remain in force.
+ * Default zero leaves the diagnostic polling path unchanged.
+ */
+static unsigned int h16_job_quiet_us;
+module_param(h16_job_quiet_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_quiet_us, "Diagnostic no-poll interval before event drain (0..10000 us, default 0)");
+static bool h16_job_quiet_busy;
+module_param(h16_job_quiet_busy, bool, 0444);
+MODULE_PARM_DESC(h16_job_quiet_busy, "Use private busy work instead of one sleep during no-poll interval");
+
+static void ane_h16_job_quiet(void)
+{
+	unsigned int us = min_t(unsigned int, h16_job_quiet_us, 10000);
+	u64 until;
+
+	if (!us)
+		return;
+	if (!h16_job_quiet_busy) {
+		usleep_range(us, us + 50);
+		return;
+	}
+	until = ktime_get_ns() + (u64)us * NSEC_PER_USEC;
+	while (ktime_get_ns() < until)
+		cpu_relax();
+}
+
 static u64 ane_h16_job_spin_deadline(void)
 {
 	if (!h16_job_spin_us)
@@ -927,6 +955,7 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		j->done[i].uuid = 0;
 		return j->done[i].state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO;
 	}
+	ane_h16_job_quiet();
 	while (ktime_get_ns() < deadline) {
 		size_t size = 0;
 		u32 pending;
