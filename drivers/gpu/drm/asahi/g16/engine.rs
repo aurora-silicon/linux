@@ -1358,5 +1358,7 @@ impl Firmware {
             s.starved_ns += s.pub_ns.wrapping_sub(s.starve_from_ns);
         }
         s.starve_from_ns = 0;
+        let now = s.pub_ns;
+        self.power.utilization.busy(now);
     }
 }

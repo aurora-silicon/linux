@@ -189,6 +189,19 @@ assert projection[-1]['ceiling'] == '1' and projection[-1]['ceiling_reason'] == 
 report={'passed':True,'scope':'Shared production C cooling policy against frozen regression traces, plus production Rust scheduling/selector units; no hardware qualification.', 'rows':len(cases), 'production_sha256':sha(ROOT/'include/linux/soc/apple/pmp-cooling.h'), 'rust_composition_sha256':sha(ROOT/'drivers/gpu/drm/asahi/g16/power/policy.rs'), 'oracle_sha256':sha(FIXTURES/'thermal-policy-oracle.json')}
 (OUT/'thermal-policy-host.json').write_text(json.dumps(report,indent=2)+'\n')
 print(unit)
+
+# The governor's accounting is policy::Governor, run by the units above. These
+# are the calls that connect it: publication, drain, the power service with
+# whether flights are outstanding, and the idle poll's re-arm.
+G16 = ROOT/'drivers/gpu/drm/asahi/g16'
+for path, call in [
+        ('engine.rs', 'self.power.utilization.busy(now);'),
+        ('poll.rs', 'self.power.utilization.idle(self.engine.stats.idle_from_ns);'),
+        ('power.rs', '.govern(now, limit, !self.engine.flights.is_empty());'),
+        ('poll.rs', 'Ok(false) if firmware.power.utilization.decaying() => {\n                        self.mod_poll('),
+]:
+    assert (G16/path).read_text().count(call) == 1, (path, call)
+print('Governor connected at publication, drain, power service and idle re-arm')
 print(json.dumps(report,indent=2))
 
 # Read/reattach interleavings exercise the provider's actual epoch state helpers.

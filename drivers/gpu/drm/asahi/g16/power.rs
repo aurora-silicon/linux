@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! PMP-owned cooling requests and retained-session performance ceiling.
+//! PMP-owned cooling requests, retained-session performance ceiling and the
+//! utilization governor.
 //!
 //! The firmware owns voltage and clock transitions through PMP. The host
 //! consumes PMP-owner telemetry and publishes only three Globals selectors,
 //! in hundredths of a performance state. Firmware power tables and policy
 //! words from other GPU generations are never modified here.
+//!
+//! The firmware runs at the published state, busy or not, so the host requests
+//! one from the GPU's busy share of each window, bounded by the ceiling.
 
 pub(crate) mod policy;
 
@@ -113,6 +117,7 @@ pub(crate) struct Power {
     pub(crate) sensor_errors: u64,
     pub(crate) decisions: u64,
     last_decision: Option<(u32, u32, u32, u32, Option<Error>)>,
+    pub(crate) utilization: policy::Governor,
 }
 
 impl Power {
@@ -139,6 +144,7 @@ impl Power {
             sensor_errors: 0,
             decisions: 0,
             last_decision: None,
+            utilization: policy::Governor::new(),
         })
     }
 
@@ -184,6 +190,10 @@ impl Firmware {
         }
         let now = now_ns();
         let (limit, decision) = self.power.ceiling(now);
+        let target = self
+            .power
+            .utilization
+            .govern(now, limit, !self.engine.flights.is_empty());
         if decision {
             dev_info!(
                 self.dev(),
@@ -197,15 +207,15 @@ impl Firmware {
                 limit
             );
         }
-        if limit == self.power.effective {
+        if target == self.power.effective {
             return Ok(());
         }
         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
         for offset in globals::PSTATE_SELECTORS {
-            globals.w32(offset, limit * 100)?;
+            globals.w32(offset, target * 100)?;
         }
         wmb();
-        self.power.effective = limit;
+        self.power.effective = target;
         self.power.updates += 1;
         Ok(())
     }
