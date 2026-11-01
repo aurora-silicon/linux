@@ -46,10 +46,10 @@ static void ave_header_9003(u8 *cmd, const struct ave_fw_abi *abi,
 	put_unaligned_le64(h->token, cmd + 0x08);
 	put_unaligned_le64(h->client, cmd + 0x10);
 	if (h->op != AVE_OP_CONFIG && h->op != AVE_OP_HALT) {
-		put_unaligned_le32(1, cmd + 0x18);
+		put_unaligned_le32(h->unit ?: AVE_SESSION_UNIT, cmd + 0x18);
 		put_unaligned_le32(h->codec, cmd + 0x1c);
 		put_unaligned_le32(h->arg0, cmd + 0x24);
-		put_unaligned_le32(0x36, cmd + 0x28);
+		put_unaligned_le32(h->arg1 ?: AVE_SESSION_ARG1, cmd + 0x28);
 		put_unaligned_le32(h->arg2, cmd + 0x2c);
 	}
 	put_unaligned_le32(h->subtype, cmd + 0x20);

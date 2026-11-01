@@ -125,7 +125,9 @@ void ave_write_header(struct ave_ctx *ctx, u8 *cmd, enum ave_opcode op,
 		.codec = ctx->sess->p.codec,
 		.client = ctx->sess->client,
 		.subtype = echo,
+		.unit = ctx->sess->unit,
 		.arg0 = arg0,
+		.arg1 = ctx->sess->arg1,
 		.arg2 = arg2,
 	};
 

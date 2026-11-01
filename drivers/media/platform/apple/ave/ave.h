@@ -265,6 +265,8 @@ struct ave_slot {
 
 #define AVE_MAX_REFS 5
 #define AVE_TILE_BUFS 8
+/* Start surfaces of an MCTF session, aliases included */
+#define AVE_MCTF_BUFS 72
 
 struct ave_session {
 	struct ave_session *failed_next;
@@ -283,6 +285,8 @@ struct ave_session {
 	struct ave_buf tile_aux[AVE_TILE_BUFS];
 	struct ave_buf hevc_extra[2];
 	struct ave_slot slot[AVE_MAX_SLOTS];
+	/* Header words; zero means the encoder's values */
+	u32 unit, arg1, frame_arg0;
 	u8 done_fifo[AVE_MAX_SLOTS];
 	unsigned int done_head;
 	unsigned int done_count;

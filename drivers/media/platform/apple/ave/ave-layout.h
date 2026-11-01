@@ -11,7 +11,8 @@ struct ave_command {
 	enum ave_opcode op;
 	enum ave_codec codec;
 	u64 token;
-	u32 client, subtype, arg0, arg2;
+	/* Zero unit and arg1 mean the encoder's values. */
+	u32 client, subtype, unit, arg0, arg1, arg2;
 };
 
 /* Status is normalized to zero for success by the ABI parser. */

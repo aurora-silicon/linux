@@ -107,7 +107,8 @@ int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count)
 	int ret = 0;
 
 	for (unsigned int i = 0; i < count && !ret; i++)
-		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, 0, ave_session_arg2(ctx));
+		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, ctx->sess->frame_arg0,
+				     ave_session_arg2(ctx));
 	return ret;
 }
 

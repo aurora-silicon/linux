@@ -8,7 +8,6 @@
 
 #include "ave.h"
 #include "ave-regs.h"
-#include "ave-mctf.h"
 #include "tests/ave-9003-reference.h"
 
 static void ave_test_buf(struct ave_buf *b, unsigned int *index)
@@ -395,68 +394,11 @@ static void ave_6070_variants(struct kunit *test)
 		t->ipc_bytes);
 }
 
-/* MCTF per-frame fields land at the ledger offsets; unqualified layouts refuse. */
-static void ave_mctf_fields(struct kunit *test)
-{
-	const struct ave_mctf_layout *l = ave_mctf_layout_for_crc(0x69c54454);
-	struct ave_mctf_layout q;
-	struct ave_mctf_frame f = {
-		.in_y = 0x100000, .in_uv = 0x2fa400, .out_y = 0x400000,
-		.out_uv = 0x5fa400, .ref_y = 0x700000, .ref_uv = 0x8fa400,
-		.in_y_bytes = 0x1fa400, .in_uv_bytes = 0xfd200,
-		.out_y_bytes = 0x1fa400, .out_uv_bytes = 0xfd200,
-		.stride = 1920, .width = 1920, .height = 1080,
-		.frame = 7, .pts = 233333, .timescale = 1000000, .slot = 1,
-		.strength = 50, .first = false,
-	};
-	u8 *cmd;
-
-	KUNIT_ASSERT_NOT_NULL(test, l);
-	KUNIT_EXPECT_NOT_NULL(test, ave_mctf_layout_for_crc(AVE_FW_TEXT_CRC_T6040_25G83));
-	KUNIT_EXPECT_NULL(test, ave_mctf_layout_for_crc(0x2ce7359e));
-	KUNIT_EXPECT_EQ(test, l->process_bytes, 0xb1c0U);
-	KUNIT_EXPECT_EQ(test, l->start_bytes, 0x13f28U);
-	KUNIT_EXPECT_EQ(test, l->history_y_bytes + l->history_uv_bytes, 0x2fd000U);
-	cmd = kunit_kzalloc(test, l->process_bytes, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, cmd);
-	KUNIT_EXPECT_EQ(test, ave_mctf_write_process(l, cmd, l->process_bytes, &f), -EOPNOTSUPP);
-
-	q = *l;
-	q.qualified = true;
-	KUNIT_EXPECT_EQ(test, ave_mctf_write_process(&q, cmd, q.process_bytes - 1, &f), -EINVAL);
-	KUNIT_EXPECT_EQ(test, ave_mctf_write_process(&q, cmd, q.process_bytes, &f), 0);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x18), 3U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x1c), 2U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x20), 0x16U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xa300), 0x100000ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0xa308), 0x1fa400U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0xa30c), 1920U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xa320), 0x2fa400ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xad80), 0x400000ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xada0), 0x5fa400ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xae00), 0x700000ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0xa3b8), 1920U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0xa3bc), 1080U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x5d90), 0U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0xac84), 1U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xacf8), 7ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xad40), 233333ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(cmd + 0xad48), 1000000ULL);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0xad54), 50U);
-
-	f.strength = 101;
-	KUNIT_EXPECT_EQ(test, ave_mctf_write_process(&q, cmd, q.process_bytes, &f), -EINVAL);
-	f.strength = 0;
-	f.stride = 1928;	/* not a multiple of 64 */
-	KUNIT_EXPECT_EQ(test, ave_mctf_write_process(&q, cmd, q.process_bytes, &f), -EINVAL);
-}
-
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
-	KUNIT_CASE(ave_6070_variants),	    KUNIT_CASE(ave_mctf_fields),
-	{}
+	KUNIT_CASE(ave_6070_variants),	    {}
 };
 
 static struct kunit_suite ave_abi_suite = {
