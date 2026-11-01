@@ -196,11 +196,15 @@ static inline long ane_t6021_td_blocks(const u8 *p, size_t size)
 #define ANE_T6021_PROG_SECS	9
 #define ANE_T6021_NO_ID		U32_MAX
 /*
- * Programs resident in the firmware at once. Each may own one process, and
- * each process one 2 MiB firmware allocation. With eight programs and
- * eight processes resident the next LOAD never completed (M2, 13.5 bia
- * firmware: 9 baseline + 8 x 2 MiB allocations), so no LOAD is sent while
- * this many are resident.
+ * Programs resident in the firmware at once, each with at most one process.
+ * The firmware's L2 spill pool holds eight 2 MiB EXPP buffers: every
+ * CREATE_PROCESS grows it while it holds fewer than eight, whatever the
+ * program, and a TERMINATE may shrink it again. Its program and process
+ * tables are far larger (240 and 496 advertised). On the M2 a LOAD sent with
+ * eight processes resident (9 baseline + 8 x 2 MiB allocations) never
+ * completed, and the firmware has no static check that explains it. So no
+ * LOAD or CREATE is sent while this many programs are resident, which keeps
+ * one spill buffer per live process and stays below that observed state.
  */
 #define ANE_T6021_FW_RESIDENT_MAX	8
 
@@ -670,11 +674,12 @@ static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
  * A cold restart of the H14 firmware. The ASC must be proven stopped
  * (CPU_STATUS STOPPED) before its power domains go off: on T8112 an idle
  * core reads 0x2c and a halted but running one 0x28, neither stopped. A
- * planned restart first asks the firmware to shut down (POWER_DOWN) and
- * waits for its completion and for WFI. After a command timeout that
- * handshake is impossible, so only the RUN clear is tried. If STOPPED is
- * not seen nothing is powered off, and the caller keeps the instance
- * quarantined with every mapping and its power claim.
+ * planned restart first asks the idle firmware to shut down (POWER_DOWN,
+ * which never completes; its dispatch is seen instead) and waits for WFI.
+ * After a command timeout the command worker is blocked and nothing can
+ * overtake it, so only the RUN clear is tried. If STOPPED is not seen
+ * nothing is powered off, and the caller keeps the instance quarantined
+ * with every mapping and its power claim.
  */
 enum ane_t6021_restart_stage {
 	ANE_T6021_RESTART_STOP,		/* failed before power removal */
@@ -684,7 +689,7 @@ enum ane_t6021_restart_stage {
 };
 
 struct ane_t6021_restart_ops {
-	int (*power_down)(void *ctx);	/* POWER_DOWN and its completion */
+	int (*power_down)(void *ctx);	/* POWER_DOWN taken by the firmware */
 	int (*wait_idle)(void *ctx);	/* bounded wait for WFI */
 	int (*halt)(void *ctx);		/* clear RUN, require STOPPED */
 	int (*power_cycle)(void *ctx);	/* domains verified off, then on */

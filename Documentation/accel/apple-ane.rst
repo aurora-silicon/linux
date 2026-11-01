@@ -338,9 +338,12 @@ refuse a program the file holds no reference on with ``-ENOENT``. A program's
 kernel IDs stay valid for as long as a file holds it; whether it is loaded in
 the firmware right now (resident) is managed by the driver:
 
-- Every process holds one 2 MiB firmware allocation, and a LOAD sent while
-  eight programs with processes are resident never completes. At most eight
-  programs are resident, and room is made before each LOAD.
+- The firmware's L2 spill pool holds eight 2 MiB buffers; every
+  CREATE_PROCESS grows it while it holds fewer than eight, and a LOAD sent
+  while eight programs with processes were resident never completed. At most
+  eight programs are resident, and room is made before each LOAD. The
+  firmware's program and process tables (240 and 496 advertised) are not the
+  limit.
 - TERMINATE_PROCESS (0x203) of a process whose program has more than one task
   waits inside the firmware without a timeout and never completes, and no
   other command frees such a process. The driver never sends it for one. A
@@ -392,11 +395,15 @@ initial boots remain fenced. A second H14 binding is refused because the
 firmware cache and BO pool have one owner.
 
 A restart for room (planned) runs with the firmware idle under the firmware
-lock. It sends POWER_DOWN (0x0b), waits for its completion and for the ASC to
-report WFI, then clears CPU_CONTROL RUN (bit 4) and bit 5, and requires
-CPU_STATUS STOPPED (bit 1) with RUN clear. On T8112 an idle core reads 0x2c
+lock. It answers any pending SHAREDMALLOC request and posts POWER_DOWN
+(0x0b, the 8-byte header only). That command never completes: the firmware
+stops its timers and waits in WFI for good. The driver instead waits for the
+dispatcher to clear the completion field it marked, then for the ASC to report
+WFI on twenty reads 100 us apart, then clears CPU_CONTROL RUN (bit 4) and
+requires CPU_STATUS STOPPED (bit 1) with RUN clear. On T8112 an idle core reads 0x2c
 and a halted one 0x28, neither of which is stopped. After a command timeout
-the firmware cannot answer POWER_DOWN, so only the RUN clear is tried. If
+the command worker is blocked and nothing can overtake the stuck command, so
+only the RUN clear is tried. If
 STOPPED is not seen, nothing is powered off: the device stays quarantined
 with its mappings, power claim and pin. Only after STOPPED does the restart
 suspend the consumer and suppliers through the shared PM transaction. This

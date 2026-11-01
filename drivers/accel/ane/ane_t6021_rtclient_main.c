@@ -120,14 +120,16 @@
 #define ANE_ASC_CPU_STATUS_RUNNING	BIT(0)
 #define ANE_ASC_CPU_STATUS_STOPPED	BIT(1)
 #define ANE_ASC_CPU_STATUS_IDLE		BIT(5)
-/* CPU_CONTROL bit cleared after RUN in the ASC stop sequence. */
-#define ANE_ASC_CPU_CONTROL_B5		BIT(5)
 
-/* Legacy 13.5 POWER_DOWN: the firmware stops its timers and waits in WFI
- * for good. Zero-filled body; the completion arrives before the WFI.
+/* Legacy 13.5 POWER_DOWN: exactly the 8-byte header (any other length
+ * asserts). The firmware stops its timers, requests its power state and
+ * waits in WFI for good. It never posts a completion: its slot stays
+ * firmware-owned. The dispatcher zeroes the completion field at +6 on
+ * entry, which is the only sign the command was taken.
  */
 #define ANE_T6021_CMD_POWER_DOWN	0x000b
-#define ANE_T6021_POWER_DOWN_LEN	0x10
+#define ANE_T6021_POWER_DOWN_LEN	8
+#define ANE_T6021_DISPATCH_MARK		0xa55a
 
 /* Boot-time module parameters — defaults are the configuration that
  * boots the firmware, with fw_alias_reserved defaulting to own memory.
@@ -3050,41 +3052,101 @@ struct ane_rtclient_restart {
 	struct ane_rtclient_cycle cycle;
 	struct ane_rtclient_retired *retired;
 	struct ane_legacy_buffer *fresh;
-	bool refused;		/* POWER_DOWN answered with a refusal */
+	bool live;		/* POWER_DOWN never reached the firmware */
 };
 
-/* Ask the firmware to shut down. Only a live instance can answer, so this
- * is never tried after a command timeout.
+/*
+ * Post a command that never completes (POWER_DOWN). Same slot rules as
+ * ane_rtclient_legacy_exchange(): only a host-owned slot, and every request
+ * already on the SHAREDMALLOC ring is answered first, because a core in
+ * WFI cannot finish that handshake. The completion field carries a mark the
+ * dispatcher clears when it takes the command.
+ */
+static int ane_rtclient_legacy_post(struct ane_rtclient *ane,
+				    struct ane_legacy_buffer *command,
+				    size_t length, u16 opcode,
+				    unsigned int channel)
+{
+	u64 *io;
+	int ret;
+
+	if (!ane->held || !ane_rtclient_channels_unchanged(ane) ||
+	    ane->soc->platform)
+		return -EPROTO;
+	if (length < 8 || length > command->size)
+		return -EINVAL;
+	io = ane->fw->boot_ipc + ane->channels[channel].offset +
+	     (size_t)ane->legacy_cmd_cursor[channel] * 64;
+	if (!(READ_ONCE(io[0]) & 1))
+		return -EBUSY;
+	ret = ane_rtclient_malloc_drain(ane);
+	if (ret)
+		return ret;
+	ane_fw_command_header(command->cpu, opcode, false);
+	put_unaligned_le16(ANE_T6021_DISPATCH_MARK, (u8 *)command->cpu + 6);
+	WRITE_ONCE(io[1], length);
+	WRITE_ONCE(io[2], length);
+	dma_wmb();
+	WRITE_ONCE(io[0], command->dma);
+	dma_wmb();
+	writel(BIT(ane->channels[channel].bit), ane_rtclient_doorbell(ane));
+	return 0;
+}
+
+static u16 ane_rtclient_cmd_mark(struct ane_legacy_buffer *command)
+{
+	return le16_to_cpu(READ_ONCE(*(__le16 *)((u8 *)command->cpu + 6)));
+}
+
+/* Ask the firmware to shut down and wait until its dispatcher took the
+ * command. Only a live, idle instance can take it: after a timeout the
+ * command worker is blocked and nothing can overtake the stuck command, so
+ * this is never tried then.
  */
 static int ane_rtclient_rs_power_down(void *ctx)
 {
 	struct ane_rtclient_restart *rs = ctx;
 	struct ane_rtclient *ane = rs->ane;
+	u16 mark;
 	int ret;
 
 	if (!ane->cmd_buf)
 		return -ENODEV;
 	memset(ane->cmd_buf->cpu, 0, SZ_16K);
-	ret = ane_rtclient_legacy_exchange(ane, ane->cmd_buf,
-					   ANE_T6021_POWER_DOWN_LEN,
-					   ANE_T6021_CMD_POWER_DOWN, 1,
-					   jiffies + msecs_to_jiffies(3000));
-	rs->refused = ret == -EREMOTEIO;
-	dev_info(ane->dev, "restart: POWER_DOWN %d (CPU_STATUS %#x)\n", ret,
+	ret = ane_rtclient_legacy_post(ane, ane->cmd_buf,
+				       ANE_T6021_POWER_DOWN_LEN,
+				       ANE_T6021_CMD_POWER_DOWN, 1);
+	/* Nothing was posted: the instance keeps serving. */
+	rs->live = ret == -EINVAL;
+	if (!ret)
+		ret = read_poll_timeout(ane_rtclient_cmd_mark, mark, !mark, 50,
+					100000, false, ane->cmd_buf);
+	dev_info(ane->dev, "restart: POWER_DOWN %s %d (CPU_STATUS %#x)\n",
+		 ret ? "not taken" : "taken", ret,
 		 readl(ane->engine + ANE_ASC_CPU_STATUS));
 	return ret;
 }
 
+/* The shutdown path ends in WFI. IDLE is also set at ordinary idle points,
+ * so require it on twenty reads 100 us apart after the command was taken.
+ */
 static int ane_rtclient_rs_wait_idle(void *ctx)
 {
 	struct ane_rtclient_restart *rs = ctx;
-	u32 status;
+	void __iomem *st = rs->ane->engine + ANE_ASC_CPU_STATUS;
+	unsigned long until = jiffies + msecs_to_jiffies(100);
+	unsigned int run = 0;
 
-	return readl_poll_timeout(rs->ane->engine + ANE_ASC_CPU_STATUS, status,
-				  status & ANE_ASC_CPU_STATUS_IDLE, 100, 100000);
+	while (time_before(jiffies, until)) {
+		run = readl(st) & ANE_ASC_CPU_STATUS_IDLE ? run + 1 : 0;
+		if (run >= 20)
+			return 0;
+		usleep_range(100, 150);
+	}
+	return -ETIMEDOUT;
 }
 
-/* Clear RUN, then bit 5, each read back; then require STOPPED with RUN
+/* Clear RUN (read-modify-write, read back), then require STOPPED with RUN
  * clear. Nothing is powered off unless this returns zero.
  */
 static int ane_rtclient_rs_halt(void *ctx)
@@ -3099,8 +3161,6 @@ static int ane_rtclient_rs_halt(void *ctx)
 	if (ret)
 		return ret;
 	writel(readl(ctl) & ~ANE_ASC_CPU_CONTROL_RUN, ctl);
-	readl(ctl);
-	writel(readl(ctl) & ~ANE_ASC_CPU_CONTROL_B5, ctl);
 	readl(ctl);
 	ret = readl_poll_timeout(ane->engine + ANE_ASC_CPU_STATUS, status,
 				 (status & ANE_ASC_CPU_STATUS_STOPPED) &&
@@ -3307,10 +3367,10 @@ failed:
 	if (rs.fresh)
 		devm_kfree(ane->dev, rs.fresh);
 	kfree(rs.retired);
-	/* A refused POWER_DOWN is a normal completion: the instance is still
-	 * live and nothing was stopped.
+	/* A POWER_DOWN that was never posted left the instance in service.
+	 * Once posted, the firmware is shut down or about to be.
 	 */
-	if (!rs.refused)
+	if (!rs.live)
 		atomic_set(&ane_t6021_quarantined, 1);
 	WRITE_ONCE(ane->recovering, false);
 	dev_err(ane->dev,
