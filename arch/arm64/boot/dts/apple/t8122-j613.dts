@@ -17,6 +17,7 @@
 / {
 	compatible = "apple,j613", "apple,t8122", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M3, 2024)";
+	chassis-type = "laptop";
 
 	aliases {
 		sep = &sep;

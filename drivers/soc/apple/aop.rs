@@ -2511,6 +2511,8 @@ struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
     ec0p: u64,
+    /// The `nCal` boot argument.
+    ncal: u64,
     alig: u64,
     aopt: u64,
     /// Complete the firmware's boot arguments before starting it.
@@ -2534,6 +2536,7 @@ struct AopHwConfig {
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: 0,
     aopt: 1,
     alig: 128,
     patch_bootargs: true,
@@ -2546,6 +2549,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: 0,
     aopt: 0,
     alig: 128,
     patch_bootargs: true,
@@ -2558,6 +2562,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: 0,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2570,6 +2575,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
+    ncal: 0,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2580,12 +2586,14 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     fw_regions: false,
     halt_on_failed_start: false,
 };
-/// T6040 (J616s): macOS writes the same four boot arguments as for the
-/// T6020. The firmware's external code and log live in DRAM, mapped through
-/// the reserved regions the bootloader describes; the RTKit firmware is shut
-/// down on unbind.
+/// T6040 (J616s): the firmware's external code and log live in DRAM, mapped
+/// through the reserved regions the bootloader describes; the RTKit firmware
+/// is shut down on unbind. `nCal` keeps the firmware's own default of 1:
+/// with 0 the accelerometer and gyroscope services accept their calibration
+/// and report interval but never send a report.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
+    ncal: 1,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2603,6 +2611,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ec0p: 0,
+    ncal: 0,
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
@@ -2666,7 +2675,7 @@ impl platform::Driver for AopDriver {
                 &aop_mmio,
                 &[
                     (from_fourcc(b"EC0p"), cfg.ec0p),
-                    (from_fourcc(b"nCal"), 0x0),
+                    (from_fourcc(b"nCal"), cfg.ncal),
                     (from_fourcc(b"alig"), cfg.alig),
                     (from_fourcc(b"AOPt"), cfg.aopt),
                 ],
