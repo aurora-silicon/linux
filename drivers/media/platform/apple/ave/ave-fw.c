@@ -421,8 +421,12 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 	 * both. Until then stopped sessions' memory stays, and so does the
 	 * coprocessor: retry once it suspends.
 	 */
+	dev_dbg(ave->dev, "restart: CTRL %#x BOOT_ARG %#x\n",
+		readl(ave->coproc + ave->variant->regs->ctrl),
+		readl(ave->coproc + ave->variant->regs->boot_arg));
 	if (readl(ave->coproc + ave->variant->regs->ctrl) ||
-	    readl(ave->coproc + ave->variant->regs->boot_arg)) {
+	    (!ave->witness_unusable &&
+	     readl(ave->coproc + ave->variant->regs->boot_arg))) {
 		dev_dbg(ave->dev,
 			"coprocessor kept power after its halt; retry once it suspends\n");
 		return -EAGAIN;
@@ -441,6 +445,7 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 static int ave_fw_boot(struct ave_dev *ave)
 {
 	const struct ave_fw_transport *t = ave->layout->abi->transport;
+	struct iommu_domain *domain;
 	__le32 *cfg, *log;
 	u32 status, hello[4];
 	int ret;
@@ -541,6 +546,10 @@ static int ave_fw_boot(struct ave_dev *ave)
 			return -ENODEV;
 		ave->module_pinned = true;
 	}
+	/* The coprocessor is in reset: drop every cached translation before it runs. */
+	domain = iommu_get_domain_for_dev(ave->dev);
+	if (domain)
+		iommu_flush_iotlb_all(domain);
 	ave->data_dirty = true;
 	ave->fw_ever_ran = true;
 	writel(1, ave->coproc + ave->variant->regs->keep_mappings);
@@ -560,6 +569,18 @@ static int ave_fw_boot(struct ave_dev *ave)
 	for (unsigned int i = 0; i < 4; i++)
 		hello[i] = readl(ave->mbox + AVE_MBOX_SCRATCH(i));
 	dma_rmb();
+
+	/* The reset witness is only as good as BOOT_ARG holding what boot wrote. */
+	status = readl(ave->coproc + ave->variant->regs->boot_arg);
+	dev_dbg(ave->dev, "BOOT_ARG after start %#x (wrote %#x)\n", status,
+		ave->variant->boot_arg_value);
+	if (t->boot_config && status != ave->variant->boot_arg_value &&
+	    !ave->witness_unusable) {
+		ave->witness_unusable = true;
+		dev_warn(ave->dev,
+			 "BOOT_ARG reads %#x after start, not %#x: no reset proof, stopped sessions keep their memory\n",
+			 status, ave->variant->boot_arg_value);
+	}
 
 	ret = ave_ipc_negotiate(ave, hello);
 	if (ret) {

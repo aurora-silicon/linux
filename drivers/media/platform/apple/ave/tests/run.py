@@ -80,7 +80,7 @@ def build(src, out, baseline):
             while line.endswith('\\'):
                 line = next(lines)
                 code += line + '\n'
-    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_mctf_pool_crc', 'ave_mctf_pool_return', 'ave_sess_free_bufs', 'ave_sess_reply'):
+    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_mctf_pool_crc', 'ave_mctf_pool_check', 'ave_mctf_pool_return', 'ave_sess_free_bufs', 'ave_sess_reply'):
         code += function(session, name)
     if not baseline:
         fw = (src / 'ave-fw.c').read_text()

@@ -339,14 +339,34 @@ static u32 ave_mctf_pool_crc(struct ave_dev *ave)
  * Its CRC is kept: nothing may write the pool until the next borrow, so a
  * change by then is a device write after teardown.
  */
+/*
+ * Compare the pool with the CRC kept when its session stopped; a change
+ * there is a device write after teardown. Then keep a fresh CRC.
+ */
+static void ave_mctf_pool_check(struct ave_dev *ave, const char *when)
+{
+	u32 crc;
+
+	if (!test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags))
+		return;
+	crc = ave_mctf_pool_crc(ave);
+	if (ave->mctf_pool_crc_valid && crc != ave->mctf_pool_crc) {
+		ave->mctf_pool_changed++;
+		dev_err(ave->dev,
+			"MCTF memory changed after its session ended, seen %s (CRC %08x, was %08x): the device wrote it after teardown\n",
+			when, crc, ave->mctf_pool_crc);
+	} else if (ave->mctf_pool_crc_valid) {
+		dev_dbg(ave->dev, "MCTF memory unchanged %s (CRC %08x)\n", when, crc);
+	}
+	ave->mctf_pool_crc = crc;
+	ave->mctf_pool_crc_valid = true;
+}
+
 static void ave_mctf_pool_return(struct ave_dev *ave, struct ave_session *sess)
 {
 	if (!sess->mctf_borrowed)
 		return;
-	if (test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
-		ave->mctf_pool_crc = ave_mctf_pool_crc(ave);
-		ave->mctf_pool_crc_valid = true;
-	}
+	ave_mctf_pool_check(ave, "at reap");
 	memset(sess->mctf_buf, 0, sizeof(sess->mctf_buf));
 	memset(sess->mctf_in, 0, sizeof(sess->mctf_in));
 	memset(sess->mctf_out, 0, sizeof(sess->mctf_out));
@@ -490,18 +510,8 @@ int ave_sess_mctf_borrow(struct ave_ctx *ctx)
 	}
 	sess->mctf_borrowed = true;	/* from here ave_sess_free_bufs() returns it */
 	if (test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
-		if (ave->mctf_pool_crc_valid) {
-			u32 crc = ave_mctf_pool_crc(ave);
-
-			if (crc != ave->mctf_pool_crc)
-				dev_err(ave->dev,
-					"MCTF memory changed after its session ended (CRC %08x, was %08x): the device wrote it after teardown\n",
-					crc, ave->mctf_pool_crc);
-			else
-				dev_dbg(ave->dev, "MCTF memory unchanged since the last session (CRC %08x)\n",
-					crc);
-			ave->mctf_pool_crc_valid = false;
-		}
+		ave_mctf_pool_check(ave, "at next start");
+		ave->mctf_pool_crc_valid = false;
 		ave_mctf_pool_zero(ave->mctf_pool, AVE_MCTF_BUFS);
 		ave_mctf_pool_zero(ave->mctf_pool_in, AVE_MCTF_IN_BUFS);
 		ave_mctf_pool_zero(ave->mctf_pool_out, AVE_MCTF_OUT_BUFS);
@@ -743,6 +753,11 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 	if (sess->handed || ave_sess_domain_unsafe(ave)) {
 		if (!sess->handed)
 			dev_err(ave->dev, "DMA domain is no longer strict; keeping session memory\n");
+		/* From here nothing may write the pool; the reap checks it. */
+		if (sess->mctf_borrowed && test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
+			ave->mctf_pool_crc = ave_mctf_pool_crc(ave);
+			ave->mctf_pool_crc_valid = true;
+		}
 		kvfree(sess->mctf_surf);
 		sess->mctf_surf = NULL;
 		kvfree(sess->mctf_lin);
@@ -770,6 +785,10 @@ void ave_sess_reap(struct ave_dev *ave)
 	bool freed = false;
 
 	lockdep_assert_held(&ave->hw_lock);
+	if (ave->failed_sessions && ave->witness_unusable) {
+		dev_warn_once(ave->dev, "no reset proof; keeping stopped sessions' memory\n");
+		return;
+	}
 	if (ave->failed_sessions && ave_sess_domain_unsafe(ave)) {
 		dev_err(ave->dev, "DMA domain is no longer strict; keeping stopped sessions' memory\n");
 		return;

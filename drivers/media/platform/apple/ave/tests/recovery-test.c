@@ -405,6 +405,9 @@ static void session_lifetime(void)
 	ave_sess_destroy(&ctx[1]);
 	assert(!freed && ave.failed_sessions == sess);
 	assert(ave.mctf_pool_flags & 1UL << AVE_MCTF_POOL_LENT);
+	/* The canary is taken when the session stops. */
+	assert(ave.mctf_pool_crc_valid &&
+	       ave.mctf_pool_crc == crc32_le(~0U, pool_mem, sizeof(pool_mem)));
 
 	/* Halted, power not yet lost (CTRL or BOOT_ARG still set): nothing goes. */
 	ave.fw_state = AVE_FW_HALTED;
@@ -425,6 +428,7 @@ static void session_lifetime(void)
 	assert(!ave_fw_prepare_restart(&ave));
 	mutex_unlock(&ave.hw_lock);
 	assert(!ave.failed_sessions && freed == 1);
+	assert(ave.mctf_pool_changed == 1);	/* written after it stopped: seen at reap */
 	assert(ave.mctf_pool_flags == 1UL << AVE_MCTF_POOL_READY);
 	assert(ave.mctf_pool_crc_valid &&
 	       ave.mctf_pool_crc == crc32_le(~0U, pool_mem, sizeof(pool_mem)));
@@ -437,6 +441,29 @@ static void session_lifetime(void)
 	ctx[0].sess = sess;
 	ave_sess_destroy(&ctx[0]);
 	assert(freed == 2 && !ave.failed_sessions);
+}
+
+/* A BOOT_ARG that did not hold its boot value proves nothing: never reap. */
+static void unusable_witness(void)
+{
+	struct ave_session *sess;
+
+	init();
+	sess = calloc(1, sizeof(*sess));
+	assert(sess);
+	sess->handed = true;
+	sess->hdr.cpu = (void *)1;
+	ctx[0].sess = sess;
+	ave.fw_state = AVE_FW_RUNNING;
+	ave_sess_destroy(&ctx[0]);
+	ave.witness_unusable = true;
+	ave.fw_state = AVE_FW_HALTED;
+	stop_seen = power_seen = true;
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_fw_prepare_restart(&ave));	/* restart still allowed on CTRL */
+	mutex_unlock(&ave.hw_lock);
+	assert(!freed && ave.failed_sessions == sess);
+	free(sess);
 }
 
 /* An unanswered Close, or frames still out, fail the firmware; fw_open stays. */
@@ -470,6 +497,7 @@ int main(void)
 {
 	session_lifetime();
 	unconfirmed_close();
+	unusable_witness();
 	mapping_lifetimes();
 	failed_submission();
 	failed_start();
@@ -481,6 +509,6 @@ int main(void)
 	restore_data();
 	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
 	     "PM rollback, DATA, IPC deadline, MMAP/dma-buf release ordering, "
-	     "session and MCTF pool lifetime, unconfirmed Close");
+	     "session and MCTF pool lifetime, canary, unconfirmed Close, unusable witness");
 	return 0;
 }

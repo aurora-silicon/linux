@@ -249,6 +249,13 @@ struct ave_dev {
 	bool mctf_pool_crc_valid;
 	/* The coprocessor was started at least once since probe. */
 	bool fw_ever_ran;
+	/*
+	 * BOOT_ARG did not read back as written after a boot: a clear
+	 * BOOT_ARG proves nothing, so stopped sessions are never reaped.
+	 */
+	bool witness_unusable;
+	/* Times the MCTF pool CRC changed while no session held it */
+	u32 mctf_pool_changed;
 	/* debugfs: the last filtered frame's input and output surfaces, raw */
 	void *mctf_surf_dump[2];
 	bool mctf_capture;

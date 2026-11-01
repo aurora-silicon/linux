@@ -73,6 +73,7 @@ static inline void sort(void *p, size_t n, size_t size,
 #define dev_info(...) test_log(__VA_ARGS__)
 #define dev_dbg(...) test_log(__VA_ARGS__)
 #define dev_warn(...) test_log(__VA_ARGS__)
+#define dev_warn_once(...) test_log(__VA_ARGS__)
 #define WARN_ON_ONCE(c) ((c) ? (abort(), 1) : 0)
 #define ENOTSUPP 524
 static inline void test_log(void *dev, const char *fmt, ...)

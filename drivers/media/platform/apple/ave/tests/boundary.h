@@ -14,6 +14,8 @@ struct ave_dev {
 	struct ave_buf mctf_pool_out[AVE_MCTF_OUT_BUFS];
 	u32 mctf_pool_crc;
 	bool mctf_pool_crc_valid;
+	bool witness_unusable;
+	u32 mctf_pool_changed;
 };
 
 struct ave_ctx {

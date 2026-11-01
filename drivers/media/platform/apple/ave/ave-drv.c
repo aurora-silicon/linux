@@ -398,10 +398,12 @@ static int ave_runtime_suspend(struct device *dev)
 	struct ave_dev *ave = dev_get_drvdata(dev);
 	int ret;
 
+	/*
+	 * The IPC, heap and log buffers stay mapped: runtime suspend gives no
+	 * reset proof, and the next boot reuses them at the same addresses.
+	 */
 	mutex_lock(&ave->hw_lock);
 	ret = ave_fw_runtime_suspend(ave);
-	if (!ret && ave->layout && ave->layout->abi->transport->scratch_halt)
-		ave_fw_release_boot(ave);
 	mutex_unlock(&ave->hw_lock);
 	return ret;
 }
