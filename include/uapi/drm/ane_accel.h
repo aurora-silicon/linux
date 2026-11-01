@@ -204,9 +204,12 @@ struct drm_ane_generic_bind {
  * @generic_ptr: In. Pointer to struct drm_ane_generic_bind[@generic_count].
  * @section_count: In. 1 to %DRM_ANE_MAX_SECTIONS.
  * @generic_count: In. 0 to %DRM_ANE_MAX_BINDS.
- * @prog_id_out: Out. Firmware program id. Identical sections give the same
- *	program id.
+ * @prog_id_out: Out. Opaque program id. Identical sections in one firmware
+ *	generation give the same program id.
  * @pad: Must be zero.
+ *
+ * Device reset invalidates program and process ids. Reload the sections and
+ * create the process again before resubmitting.
  */
 struct drm_ane_prog_load {
 	__u64 sections_ptr;
@@ -221,7 +224,7 @@ struct drm_ane_prog_load {
  * struct drm_ane_proc_create - DRM_IOCTL_ANE_PROC_CREATE argument
  *	(ABI version 2)
  * @prog_id: In. Program id from PROG_LOAD.
- * @proc_id_out: Out. Firmware process id.
+ * @proc_id_out: Out. Opaque process id.
  */
 struct drm_ane_proc_create {
 	__u32 prog_id;
@@ -252,7 +255,8 @@ struct drm_ane_exec_io {
  * @prog_id: In. Program id from PROG_LOAD.
  * @proc_id: In. Process id from PROC_CREATE.
  * @priority: In. 2 to 7.
- * @timeout_ms: In. Firmware completion timeout, 0 for 5000 ms.
+ * @timeout_ms: In. Firmware completion timeout, capped at 5000 ms; 0 uses
+ *	5000 ms.
  * @count: In. 1 to %DRM_ANE_MAX_BINDS.
  * @pad: Must be zero.
  * @io_ptr: In. Pointer to struct drm_ane_exec_io[@count].

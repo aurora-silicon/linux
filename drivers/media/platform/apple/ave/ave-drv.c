@@ -206,15 +206,23 @@ static void ave_debugfs_init(struct ave_dev *ave)
 		}
 }
 
+/*
+ * The encoder pipes, the DMA block and the motion engines, then optionally
+ * "perf": a performance floor the encoder needs to run at full speed, such
+ * as the SoC rail floor on the M4 Pro. It is held while the encoder is
+ * powered, like the other domains, so it ends with the last session.
+ */
 static const char *const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0",
-					    "me1" };
+					    "me1", "perf" };
 
 static int ave_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	bool perf = of_property_match_string(dev->of_node, "power-domain-names",
+					     "perf") >= 0;
 	const struct dev_pm_domain_attach_data pd_data = {
 		.pd_names = ave_pd_names,
-		.num_pd_names = ARRAY_SIZE(ave_pd_names),
+		.num_pd_names = ARRAY_SIZE(ave_pd_names) - !perf,
 		.pd_flags = PD_FLAG_DEV_LINK_ON,
 	};
 	struct ave_dev *ave;
@@ -247,7 +255,6 @@ static int ave_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	/* The encoder pipes, the DMA block and the motion engines. */
 	ret = devm_pm_domain_attach_list(dev, &pd_data, &ave->pd_list);
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "cannot attach power domains\n");

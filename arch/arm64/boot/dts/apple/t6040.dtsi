@@ -648,7 +648,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1442 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 1443 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
+		power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
+		power-domain-names = "core", "perf";
 		resets = <&ps_avd_sys>;
 		iommus = <&avd_dart 0>;
 	};
@@ -1170,6 +1171,17 @@
 			compatible = "apple,t6041-clpc";
 			reg = <1>;
 
+		};
+
+		/*
+		 * The SoC rail at its highest state. The video encoder runs on
+		 * the fabric clock and encodes at less than half speed below it.
+		 */
+		pmc_soc_max: floor-soc-max {
+			label = "soc-max";
+			#power-domain-cells = <0>;
+			apple,rail = <1>;
+			apple,level = <2>;
 		};
 	};
 
@@ -2292,8 +2304,9 @@
 			     <AIC_IRQ 1460 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 1459 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
-				<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>;
-		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+				<&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
+				<&pmc_soc_max>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 		iommus = <&ave0_dart0 0>, <&ave0_dart1 0>;
 		status = "disabled";
 	};

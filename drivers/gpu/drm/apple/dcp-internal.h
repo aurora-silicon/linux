@@ -268,6 +268,25 @@ struct dcp_desktop_state {
 	bool modeset_callback_error;
 	/* An adaptive swap that timed out keeps fixed refresh until the next boot. */
 	bool vrr_failed;
+	/*
+	 * Adaptive sync of a VRR timing installed by this pipe alone: the
+	 * minimum rates for VRR_ENABLED on and off (16.16 Hz), and the one
+	 * the firmware was last given.  Zero when not installed that way.
+	 */
+	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
+	/* VRR_ENABLED as of the last mode set (external processors). */
+	bool vrr_requested;
+	/* The frame's colour matrix, sent after an adaptive sync update. */
+	struct iomfb_set_matrix_req matrix;
+	/*
+	 * HDR10 static metadata (external processors): the pinned
+	 * dcpav-service-epic service, and the Type 1 body last sent on this
+	 * link (taken or refused), if any.  hdr_lock protects both.
+	 */
+	spinlock_t hdr_lock;
+	struct apple_epic_service *av_service;
+	u8 hdr_sent[24];
+	bool hdr_sent_valid;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -552,6 +571,13 @@ struct apple_dcp {
 	bool output_pq;
 	bool output_edr;
 	bool edr_sent;
+	/*
+	 * EDR headroom the panel was last given, x1000 (0: not in use), and
+	 * a power off since, after which the ramp starts again from 1.0 (see
+	 * dcp_edr_prepare()).
+	 */
+	u32 edr_hm;
+	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -899,6 +925,17 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+/*
+ * The desktop 26.6 panel takes VRR_ENABLED on its live mode, through the
+ * adaptive sync minimum rate (see dcp_vrr_update()).  The external
+ * processors ignore a new minimum on a live mode.
+ */
+static inline bool dcp_vrr_live(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->main_display &&
+	       dcp_has_panel(dcp);
+}
 
 /*
  * Does @dcp's firmware speak the 14.7 AFK, DPTX and DPAV endpoint protocol,
