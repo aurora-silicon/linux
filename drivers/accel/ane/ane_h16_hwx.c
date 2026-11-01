@@ -308,10 +308,42 @@ static int hwx_program(struct hwx_parser *p)
 	return ret;
 }
 
-static int hwx_tensor(struct hwx_parser *p, u32 index)
+/*
+ * Buffer references follow the surface segments, but tensor descriptors list
+ * the inputs before the output, so the add-128 HWX describes segments x, y, z
+ * with tensors x, z, y. Pair each surface with the one tensor whose short name
+ * is the name its buffer reference gives.
+ */
+static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
+{
+	const u8 *ref = p->bytes + p->refs[index];
+	u32 i, match = ANE_H16_SURFACES;
+
+	for (i = 0; i < p->tensor_count; i++) {
+		const u8 *c = p->bytes + p->tensors[i];
+		u32 length = get_unaligned_le32(c + 4), shortoff = get_unaligned_le32(c + 0x7c);
+		size_t room;
+
+		if (shortoff >= length)
+			return -ENOEXEC;
+		room = min_t(size_t, length - shortoff, 8);
+		if (strnlen(c + shortoff, room) == room ||
+		    strncmp(c + shortoff, ref + 0x18, 8))
+			continue;
+		if (match != ANE_H16_SURFACES || (*used & BIT(i)))
+			return -ENOEXEC;
+		match = i;
+	}
+	if (match == ANE_H16_SURFACES)
+		return -ENOEXEC;
+	*used |= BIT(match);
+	return match;
+}
+
+static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 {
 	struct ane_h16_hwx_surface *b = &p->info.surfaces[index];
-	const u8 *c = p->bytes + p->tensors[index];
+	const u8 *c = p->bytes + p->tensors[tensor];
 	const u8 *ref = p->bytes + p->refs[index];
 	u32 length = get_unaligned_le32(c + 4), shortoff;
 	u64 n, channels, height, width, row, plane, batch, minimum;
@@ -356,7 +388,7 @@ static int hwx_tensor(struct hwx_parser *p, u32 index)
 	    !hwx_zero(c, shortoff + short_length + 1, length))
 		return -ENOEXEC;
 	memcpy(b->name, c + shortoff, short_length);
-	b->symbol_offset = p->tensors[index] + 0xd3d;
+	b->symbol_offset = p->tensors[tensor] + 0xd3d;
 	if (get_unaligned_le64(ref + 8) != 0x18 ||
 	    get_unaligned_le64(ref + 0x10) != b->section.vm ||
 	    memcmp(ref + 0x18, b->name, sizeof(b->name)))
@@ -457,7 +489,7 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	const void *relocations;
 	const u8 *c = bytes;
 	size_t pos = 32;
-	u32 count, length, i;
+	u32 count, length, i, outputs, used;
 	unsigned long *seen = NULL;
 	int ret = -ENOEXEC;
 
@@ -543,14 +575,18 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	    p->info.surface_count < 2 || p->ref_count != p->info.surface_count ||
 	    p->tensor_count != p->info.surface_count)
 		goto invalid;
-	for (i = 0; i < p->info.surface_count; i++) {
-		/* Inputs in segment order, exactly one output last. */
-		if (p->info.surfaces[i].direction != (i == p->info.surface_count - 1 ? 2 : 1))
-			goto invalid;
-		ret = hwx_tensor(p, i);
+	for (i = 0, outputs = 0, used = 0; i < p->info.surface_count; i++) {
+		/* Surfaces stay in segment order: inputs and exactly one output. */
+		outputs += p->info.surfaces[i].direction == 2;
+		ret = hwx_tensor_for(p, i, &used);
+		if (ret < 0)
+			goto out;
+		ret = hwx_tensor(p, i, ret);
 		if (ret)
 			goto out;
 	}
+	if (outputs != 1)
+		goto invalid;
 	ret = hwx_program(p);
 	if (ret)
 		goto out;

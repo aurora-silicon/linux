@@ -102,6 +102,95 @@ static void hwx_tensor_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
+static u8 *fixture_ref(struct hwx_fixture *f, unsigned int index)
+{
+	size_t pos = 32;
+	unsigned int i, seen = 0;
+
+	for (i = 0; i < f->commands; i++) {
+		u8 *c = f->bytes + pos;
+
+		if (get_unaligned_le32(c) == 0x40 && seen++ == index)
+			return c;
+		pos += get_unaligned_le32(c + 4);
+	}
+	return NULL;
+}
+
+static void fixture_surface_kind(struct hwx_fixture *f, unsigned int index, u32 prot)
+{
+	u8 *c = f->bytes + f->segment[index];
+
+	put_unaligned_le32(prot, c + 56);
+	put_unaligned_le32(prot, c + 60);
+	memset(c + 72, 0, 16);
+	strscpy(c + 72, prot == 1 ? "__const" : "__data", 16);
+	put_unaligned_le32(prot == 1 ? 0x21 : 0x23, c + 72 + 64);
+}
+
+/*
+ * Surfaces stay in segment order whatever order the tensor descriptors use:
+ * the add-128 HWX has segments x, y, z (in, out, in) and tensors x, z, y.
+ */
+static void hwx_surface_order_test(struct kunit *test)
+{
+	struct hwx_fixture *f = fixture_create(test, false, false);
+	struct ane_h16_hwx info;
+	u8 *tensor = kunit_kzalloc(test, 0xd48, GFP_KERNEL), *ref[2], *symbol[2];
+	u64 value;
+	u8 ordinal;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, tensor);
+	/* Tensors listed out of segment order pair by name. */
+	memcpy(tensor, f->bytes + f->tensor[0], 0xd48);
+	memmove(f->bytes + f->tensor[0], f->bytes + f->tensor[1], 0xd48);
+	memcpy(f->bytes + f->tensor[1], tensor, 0xd48);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "in");
+	KUNIT_EXPECT_EQ(test, info.surfaces[0].direction, 1U);
+	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "out");
+	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 2U);
+
+	/* The output need not be the last segment. */
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ref[0] = fixture_ref(f, 0);
+	ref[1] = fixture_ref(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, ref[0]);
+	KUNIT_ASSERT_NOT_NULL(test, ref[1]);
+	fixture_surface_kind(f, 0, 2);
+	fixture_surface_kind(f, 1, 1);
+	memset(ref[0] + 0x18, 0, 8);
+	memset(ref[1] + 0x18, 0, 8);
+	strscpy(ref[0] + 0x18, "out", 8);
+	strscpy(ref[1] + 0x18, "in", 8);
+	symbol[0] = f->bytes + f->symbols;
+	symbol[1] = symbol[0] + 16;
+	value = get_unaligned_le64(symbol[0] + 8);
+	put_unaligned_le64(get_unaligned_le64(symbol[1] + 8), symbol[0] + 8);
+	put_unaligned_le64(value, symbol[1] + 8);
+	ordinal = symbol[0][5];
+	symbol[0][5] = symbol[1][5];
+	symbol[1][5] = ordinal;
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "out");
+	KUNIT_EXPECT_EQ(test, info.surfaces[0].direction, 2U);
+	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "in");
+	KUNIT_EXPECT_EQ(test, info.surfaces[1].direction, 1U);
+
+	/* A reference naming no tensor refuses. */
+	strscpy(ref[1] + 0x18, "zz", 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+
+	/* Exactly one output: two inputs and no output refuse. */
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	fixture_surface_kind(f, 1, 1);
+	put_unaligned_le32(1, f->bytes + f->tensor[1] + 0x14);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
 static void hwx_program_test(struct kunit *test)
 {
 	static const u32 fields[] = {
@@ -392,6 +481,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_header_test),
 	KUNIT_CASE(hwx_command_test),
 	KUNIT_CASE(hwx_tensor_test),
+	KUNIT_CASE(hwx_surface_order_test),
 	KUNIT_CASE(hwx_program_test),
 	KUNIT_CASE(hwx_geometry_test),
 	KUNIT_CASE(hwx_symbols_test),
