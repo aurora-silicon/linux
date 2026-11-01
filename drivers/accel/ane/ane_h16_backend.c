@@ -933,6 +933,7 @@ struct ane_h16_job {
 	bool quiet_warmed, quiet_batch_pipelined;
 	struct ane_fw_report_fifo early;
 	u32 gap_warm_serial;
+	struct ane_job_recovery recovery;
 	struct ane_fw_pending_sample *pending_samples;
 	u8 *pending_record;
 };
@@ -1019,6 +1020,9 @@ MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial E
 static unsigned int h16_job_gap_at;
 module_param(h16_job_gap_at, uint, 0444);
 MODULE_PARM_DESC(h16_job_gap_at, "Apply recovery gap only at this warmed serial EXEC ordinal1..128,0=every eligible call");
+static unsigned int h16_job_recovery_us;
+module_param(h16_job_recovery_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_recovery_us, "Private serial recovery after ordinary/unknown SUCCESS; dedicated uses gap_us; default0, max2000us");
 static unsigned int h16_job_drain_us;
 module_param(h16_job_drain_us, uint, 0444);
 MODULE_PARM_DESC(h16_job_drain_us, "Private initial drain1..2000us before warmed ordinal1, followed by every-call hold1..100us; default0");
@@ -1461,6 +1465,9 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 			u32 us = ane_job_gap_duration(j->gap_warm_serial,
 						      h16_job_gap_us, h16_job_drain_us);
 
+			if (h16_job_recovery_us)
+				us = ane_job_recovery_duration(&j->recovery, j->quiet_warm_handles,
+							       h16_job_gap_us, h16_job_recovery_us);
 			put_unaligned_le64(get_unaligned_le64(command + 0x20), gap);
 			put_unaligned_le32(us, gap + 8);
 			put_unaligned_le32(raw_smp_processor_id(), gap + 12);
@@ -1487,6 +1494,12 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 			}
 		}
 	}
+	/* Consume feedback once, before any new EXECUTE (including new identities
+	 * and overlapping submissions). Only a matching serial SUCCESS restores it.
+	 */
+	if (h16_job_recovery_us && length >= 8 &&
+	    get_unaligned_le16(command + 4) == ANE_H16_EXECUTE)
+		ane_job_recovery_reset(&j->recovery);
 	start = ktime_get_ns();
 	counters[0] = get_cycles();
 	ret = ane_fw_transport_publish(t, channel, command, length,
@@ -1578,6 +1591,7 @@ static int ane_h16_job_event_inner(struct ane_h16_device *h, struct ane_h16_job 
 				u32 state = get_unaligned_le32(report + 0x1c);
 				bool terminal = state == ANE_H16_EVENT_SUCCESS ||
 						state == ANE_H16_EVENT_FAILURE;
+				bool serial = j->outstanding == 1 && !j->quiet_batch_pipelined;
 
 				if (terminal && j->outstanding) {
 					j->outstanding--;
@@ -1592,6 +1606,9 @@ static int ane_h16_job_event_inner(struct ane_h16_device *h, struct ane_h16_job 
 						memcpy(j->quiet_warm_handles, j->last_exec_handles,
 						       sizeof(j->quiet_warm_handles));
 						j->quiet_warmed = true;
+						if (h16_job_recovery_us)
+							ane_job_recovery_observe(&j->recovery, serial,
+								get_unaligned_le32(report), j->last_exec_handles);
 					}
 					return ane_h16_job_irq_error(h) ?: (state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO);
 				}
@@ -2170,6 +2187,15 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	    h16_job_trace || h16_job_quiet_us || h16_job_pending_mode ||
 	    h16_job_ack_pending_mode || h16_job_irq_coalesce_us)) {
 		dev_err(&pdev->dev, "H16 ACK batching requires IRQ and excludes trace/early/quiet/pending/coalescing probes\n");
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (!ane_job_recovery_valid(h16_job_recovery_us, h16_job_gap_us,
+				h16_job_gap_at, h16_job_gap_every, h16_job_drain_us) ||
+	    (h16_job_recovery_us && (!h16_job_irq || h16_job_ack_batch ||
+	     h16_job_early_drain || h16_job_trace || h16_job_quiet_us ||
+	     h16_job_pending_mode || h16_job_ack_pending_mode || h16_job_irq_coalesce_us))) {
+		dev_err(&pdev->dev, "H16 adaptive recovery requires IRQ/every1, bounded hold/recovery and no drain/other probes\n");
 		ret = -EINVAL;
 		goto unlock;
 	}

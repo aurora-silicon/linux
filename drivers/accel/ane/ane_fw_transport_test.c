@@ -1596,7 +1596,49 @@ static void ane_report_batch_empty_error_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->t.report_ack_defer);
 }
 
+static void ane_job_recovery_config_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, ane_job_recovery_valid(0, 0, 0, 0, 0));
+	KUNIT_EXPECT_TRUE(test, ane_job_recovery_valid(125, 30, 0, 1, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(2001, 30, 0, 1, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(125, 0, 0, 1, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(125, 101, 0, 1, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(30, 30, 0, 1, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(20, 30, 0, 1, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(125, 30, 1, 1, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(125, 30, 0, 6, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_recovery_valid(125, 30, 0, 1, 2000));
+}
+
+static void ane_job_recovery_feedback_test(struct kunit *test)
+{
+	struct ane_job_recovery r = {};
+	u32 a[3] = { 1, 2, 3 }, b[3] = { 1, 2, 4 };
+	u32 token;
+
+	KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, a, 30, 125), 125U);
+	for (token = 0xfe00; token <= 0xfe03; token++) {
+		ane_job_recovery_observe(&r, true, token, a);
+		KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, a, 30, 125), 30U);
+		KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, b, 30, 125), 125U);
+	}
+	ane_job_recovery_reset(&r);
+	KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, a, 30, 125), 125U);
+	ane_job_recovery_observe(&r, true, 1, a);
+	KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, a, 30, 125), 125U);
+	ane_job_recovery_observe(&r, true, 0xfe04, a);
+	KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, a, 30, 125), 125U);
+	ane_job_recovery_observe(&r, true, 0xfdff, a);
+	KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, a, 30, 125), 125U);
+	/* Last terminal in an overlapped batch is still NOT serial feedback. */
+	ane_job_recovery_observe(&r, false, 0xfe01, a);
+	KUNIT_EXPECT_FALSE(test, r.valid);
+	KUNIT_EXPECT_EQ(test, ane_job_recovery_duration(&r, a, 30, 125), 125U);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_job_recovery_config_test),
+	KUNIT_CASE(ane_job_recovery_feedback_test),
 	KUNIT_CASE(ane_report_batch_scope_test),
 	KUNIT_CASE(ane_report_batch_burst_test),
 	KUNIT_CASE(ane_report_batch_bound_test),
