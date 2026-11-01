@@ -92,6 +92,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: PMP firmware provider owning the GPU power vote and telemetry
 
+  "#cooling-cells":
+    const: 2
+    description: |
+      GPU firmware percent ceiling. State N requests (100 - N) percent,
+      for N in 0..100. Firmware initialization fails if the live ceiling ABI
+      for the selected firmware is not established. A qualification backstop
+      may impose a stricter ceiling than requested by the thermal framework.
+
   operating-points-v2: true
 
   apple,firmware-version:
