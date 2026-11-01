@@ -12,6 +12,7 @@
 #include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/log2.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -592,7 +593,15 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	return sess;
 }
 
-/* Keep every firmware-visible allocation mapped until a confirmed power cycle. */
+/*
+ * Keep every firmware-visible allocation mapped until a confirmed power cycle.
+ *
+ * An MCTF session the firmware has seen is always kept until then: its
+ * surfaces (44 MiB) were freed at STREAMOFF right after Close and a 20 ms
+ * Halt settle while the coprocessor kept power, and the encoder DART flushes
+ * lazily, so a late firmware write could land in pages already reused. Only
+ * the CPU copies go now.
+ */
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
@@ -601,8 +610,15 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 	if (!sess)
 		return;
 	mutex_lock(&ave->hw_lock);
-	if (sess->handed && (ave->fw_state == AVE_FW_BROKEN ||
+	if (sess->handed && (sess->mctf || ave->fw_state == AVE_FW_BROKEN ||
 			     ave->fw_state == AVE_FW_RECOVERING)) {
+		kvfree(sess->mctf_surf);
+		sess->mctf_surf = NULL;
+		kvfree(sess->mctf_lin);
+		sess->mctf_lin = NULL;
+		if (sess->mctf)
+			dev_dbg(ave->dev,
+				"MCTF session retired: surfaces stay mapped until the coprocessor loses power\n");
 		sess->failed_next = ave->failed_sessions;
 		ave->failed_sessions = sess;
 	} else {
@@ -613,17 +629,28 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 	mutex_unlock(&ave->hw_lock);
 }
 
-/* Caller holds hw_lock and has verified that the coprocessor lost power. */
+/*
+ * Caller holds hw_lock, has verified that the coprocessor lost power, and
+ * holds a runtime PM reference (the DART is powered). The pages go back
+ * with the device in reset; the DART TLB is then flushed so no stale
+ * translation of them survives into the next firmware boot.
+ */
 void ave_sess_reap(struct ave_dev *ave)
 {
+	struct iommu_domain *domain;
 	struct ave_session *sess;
+	bool freed = false;
 
 	lockdep_assert_held(&ave->hw_lock);
 	while ((sess = ave->failed_sessions)) {
 		ave->failed_sessions = sess->failed_next;
 		ave_sess_free_bufs(ave, sess);
 		kfree(sess);
+		freed = true;
 	}
+	domain = freed ? iommu_get_domain_for_dev(ave->dev) : NULL;
+	if (domain)
+		iommu_flush_iotlb_all(domain);
 }
 
 int ave_sess_free_slot(struct ave_session *sess)

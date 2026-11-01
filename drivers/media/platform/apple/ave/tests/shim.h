@@ -37,6 +37,9 @@ static inline void *kcalloc(size_t n, size_t size, int flags)
 
 #define kfree(p) free(p)
 #define kvfree(p) free(p)
+struct iommu_domain;
+#define iommu_get_domain_for_dev(d) ((void)(d), (struct iommu_domain *)NULL)
+#define iommu_flush_iotlb_all(d) ((void)(d))
 static inline void sort(void *p, size_t n, size_t size,
 			int (*cmp)(const void *, const void *), void *unused)
 {

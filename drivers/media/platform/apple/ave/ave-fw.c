@@ -421,6 +421,8 @@ static int ave_fw_prepare_restart(struct ave_dev *ave)
 			"coprocessor kept power after its halt; retry once it suspends\n");
 		return -EAGAIN;
 	}
+	/* The coprocessor is in reset: retired session memory can go. */
+	ave_sess_reap(ave);
 	status = readl(ave->mbox + AVE_MBOX_STATUS);
 	if (status)
 		writel(status, ave->mbox + AVE_MBOX_STATUS);
