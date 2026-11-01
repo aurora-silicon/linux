@@ -50,12 +50,13 @@ config DRM_ACCEL_ANE_FW_KUNIT_TEST
 	tristate "KUnit tests for ANE firmware validation" if !KUNIT_ALL_TESTS
 	depends on DRM_ACCEL && KUNIT
 	select DRM_ACCEL_ANE_H16_VALIDATION
+	select DRM_KUNIT_TEST_HELPERS
 	default KUNIT_ALL_TESTS
 	help
 	  Check preload identity/ranges, channel validation, RTKit ordering,
 	  H16 HWX/resource bounds, UUID retirement, shared transport and bounded
-	  allocation, staged H16 cold boot and the H16 program lifecycle
-	  without hardware.
+	  allocation, staged H16 cold boot, the H16 program lifecycle and
+	  opening the H16 accel node without hardware.
 	  These tests can run on architectures other than Apple arm64.
 
 	  If unsure, say N.

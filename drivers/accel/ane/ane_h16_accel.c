@@ -225,9 +225,14 @@ static const struct drm_ioctl_desc ane_h16_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(ANE_H16_EXEC, ane_h16_exec_ioctl, DRM_RENDER_ALLOW),
 };
 
-/* No GEM objects and no mmap: buffers travel by copy only. */
+/*
+ * No GEM objects and no mmap: buffers travel by copy only, so this is
+ * DRM_ACCEL_FOPS without .mmap (drm_gem_mmap needs DRIVER_GEM). The DRM core
+ * refuses to open a file whose fops lack FOP_UNSIGNED_OFFSET.
+ */
 static const struct file_operations ane_h16_fops = {
 	.owner = THIS_MODULE,
+	.fop_flags = FOP_UNSIGNED_OFFSET,
 	.open = accel_open,
 	.release = drm_release,
 	.unlocked_ioctl = drm_ioctl,
