@@ -648,7 +648,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1442 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 1443 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
+		power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
+		power-domain-names = "core", "perf";
 		resets = <&ps_avd_sys>;
 		iommus = <&avd_dart 0>;
 	};
