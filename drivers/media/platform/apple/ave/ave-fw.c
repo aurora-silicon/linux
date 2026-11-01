@@ -405,6 +405,78 @@ u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova)
 	return (text_iova & variant->vcbar_mask) | variant->vcbar_flags;
 }
 
+void ave_dpe_apply(void __iomem *codec, const struct ave_dpe_table *t)
+{
+	for (unsigned int i = 0; i < t->count; i++) {
+		const struct ave_dpe_rmw *r = &t->rows[i];
+
+		for (u32 j = 0; j < r->count; j++) {
+			void __iomem *reg = codec + r->offset + 4 * j;
+			u32 value = r->values ? r->values[j] : r->value;
+
+			writel((readl(reg) & ~r->mask) | value, reg);
+		}
+	}
+	/* The settings must have landed before the coprocessor runs. */
+	wmb();
+}
+
+/* Count (and log, given a device) registers whose masked field differs. */
+unsigned int ave_dpe_check(void __iomem *codec, const struct ave_dpe_table *t,
+			   struct device *dev)
+{
+	unsigned int bad = 0;
+
+	for (unsigned int i = 0; i < t->count; i++) {
+		const struct ave_dpe_rmw *r = &t->rows[i];
+
+		for (u32 j = 0; j < r->count; j++) {
+			u32 off = r->offset + 4 * j;
+			u32 want = r->values ? r->values[j] : r->value;
+			u32 got = readl(codec + off);
+
+			if ((got & r->mask) == want)
+				continue;
+			bad++;
+			if (dev)
+				dev_warn(dev, "DPE %#x reads %#x, field %#x wants %#x\n",
+					 off, got, r->mask, want);
+		}
+	}
+	return bad;
+}
+
+/*
+ * Read-only state after a 6070 start that posted no hello: coprocessor
+ * control and CPU status, the mailbox set aliases, pending words and
+ * scratch0..3, and the DPE words the cold defaults touch.
+ */
+static void ave_fw_hello_snapshot(struct ave_dev *ave)
+{
+	const struct ave_coproc_regs *r = ave->variant->regs;
+	const struct ave_dpe_table *dpe = ave->variant->dpe;
+
+	dev_err(ave->dev,
+		"no hello: ctrl %#x cpu %#x mbox %#x %#x %#x %#x scratch %#x %#x %#x %#x\n",
+		readl(ave->coproc + r->ctrl), readl(ave->coproc + r->status),
+		readl(ave->mbox + 0x08), readl(ave->mbox + 0x0c),
+		readl(ave->mbox + AVE_MBOX_STATUS), readl(ave->mbox + 0x14),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(0)),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(1)),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(2)),
+		readl(ave->mbox + AVE_MBOX_SCRATCH(3)));
+	if (!dpe)
+		return;
+	dev_err(ave->dev,
+		"no hello: DPE cat %#x %#x cac %#x %#x %#x %#x %#x, %u fields differ\n",
+		readl(ave->codec + dpe->cat), readl(ave->codec + dpe->cat + 0x004),
+		readl(ave->codec + dpe->cac), readl(ave->codec + dpe->cac + 0x004),
+		readl(ave->codec + dpe->cac + 0x0a4),
+		readl(ave->codec + dpe->cac + 0x0a8),
+		readl(ave->codec + dpe->cac + 0x1ec),
+		ave_dpe_check(ave->codec, dpe, NULL));
+}
+
 static bool ave_fw_idle(struct ave_dev *ave)
 {
 	if (readq(ave->coproc + ave->variant->regs->vcbar) !=
@@ -521,6 +593,19 @@ static int ave_fw_boot(struct ave_dev *ave)
 		return -EIO;
 	}
 
+	/*
+	 * The coprocessor is in reset here: never started, or halted and then
+	 * power cycled (ave_fw_prepare_restart() refuses otherwise), so the
+	 * DPE has lost its settings too. Program its defaults before RUN.
+	 */
+	if (ave->variant->dpe) {
+		ave_dpe_apply(ave->codec, ave->variant->dpe);
+		if (ave_dpe_check(ave->codec, ave->variant->dpe, ave->dev))
+			dev_warn(ave->dev, "DPE defaults did not all read back\n");
+		else
+			dev_dbg(ave->dev, "DPE defaults applied\n");
+	}
+
 	memset(ave->ring, 0, sizeof(ave->ring));
 	ave->unacked = 0;
 	memset(ave->want, 0, sizeof(ave->want));
@@ -597,6 +682,8 @@ static int ave_fw_boot(struct ave_dev *ave)
 	if (ret) {
 		dev_err(ave->dev, "firmware did not answer (status %#x)\n",
 			readl(ave->coproc + ave->variant->regs->status));
+		if (!t->boot_config)
+			ave_fw_hello_snapshot(ave);
 		return ret;
 	}
 	for (unsigned int i = 0; i < 4; i++)

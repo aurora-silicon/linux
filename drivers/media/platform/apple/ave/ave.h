@@ -144,6 +144,28 @@ struct ave_coproc_regs {
 	u32 keep_mappings;
 };
 
+/*
+ * One row of masked 32-bit read-modify-writes in the DPE, at codec resource
+ * offsets: new = (old & ~mask) | value. A row covers count consecutive
+ * registers 4 bytes apart; values, when set, gives each register its own
+ * value in place of value.
+ */
+struct ave_dpe_rmw {
+	u32 offset;
+	u32 mask;
+	u32 value;
+	u32 count;
+	const u16 *values;
+};
+
+struct ave_dpe_table {
+	const struct ave_dpe_rmw *rows;
+	unsigned int count;
+	/* CAT and CAC block bases, for the read-only hello-timeout snapshot. */
+	u32 cat;
+	u32 cac;
+};
+
 struct ave_variant {
 	const struct ave_coproc_regs *regs;
 	u32 fw_text_size;
@@ -161,6 +183,8 @@ struct ave_variant {
 	 * address; it is zero in the firmware image. 0 when there is none.
 	 */
 	u32 text_link_cell;
+	/* DPE defaults applied before every cold firmware start, or NULL. */
+	const struct ave_dpe_table *dpe;
 
 	size_t extra0_size;
 	/* Register sequence and boot/hello configuration have been qualified. */
@@ -359,6 +383,9 @@ extern const struct ave_variant ave_t6000, ave_t8112;
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 		       u64 data_iova, u32 *crc);
+void ave_dpe_apply(void __iomem *codec, const struct ave_dpe_table *t);
+unsigned int ave_dpe_check(void __iomem *codec, const struct ave_dpe_table *t,
+			   struct device *dev);
 int ave_fw_probe(struct ave_dev *ave);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
