@@ -737,10 +737,12 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 	 * The DPDEV, DPAVSERV and AV services are announced again under a
 	 * fresh interface after every external hotplug, without a teardown
 	 * for the previous one: replace the same logical service in place.
-	 * Other endpoints (DPAVCTRL) announce several services with the same
-	 * name and no unit, so the name is no key there.
+	 * The metadata service on 0x2a also opts into replacement. Other
+	 * endpoints (DPAVCTRL) announce several services with the same name
+	 * and no unit, so the name is no key there.
 	 */
-	if (ep->endpoint >= 0x27 && ep->endpoint <= 0x29) {
+	if ((ep->endpoint >= 0x27 && ep->endpoint <= 0x29) ||
+	    (ep->endpoint == AV_SERVICE_ENDPOINT_DESKTOP && ops->reusable)) {
 		for (i = 0; i < ep->num_channels; i++) {
 			service = &ep->services[i];
 			if (service->enabled && service->ops == ops &&

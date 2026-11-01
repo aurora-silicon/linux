@@ -106,14 +106,14 @@ static void afk_serialized_report_test(struct kunit *test)
 static void afk_compact_pinned_slot_test(struct kunit *test)
 {
 	static const struct apple_epic_service_ops ops = {
-		.name = "DCPAVSimpleVideoInterface",
+		.name = "dcpav-service-epic",
 		.reusable = true,
 	};
 	struct apple_dcp_afkep *ep = test->priv;
 	struct apple_epic_service *old = &ep->services[0];
 	struct apple_epic_service *next;
 
-	ep->endpoint = AV_ENDPOINT;
+	ep->endpoint = AV_SERVICE_ENDPOINT_DESKTOP;
 	old->ops = &ops;
 	old->unit = 0;
 	strscpy(old->name, ops.name, sizeof(old->name));
