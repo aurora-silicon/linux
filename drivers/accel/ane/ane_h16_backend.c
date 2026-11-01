@@ -349,7 +349,7 @@ static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surfa
 	m->cpu = vmap(m->pages, size / PAGE_SIZE, VM_MAP, PAGE_KERNEL);
 	if (!m->cpu)
 		return -ENOMEM;
-	memset(m->cpu, 0, size);
+	/* Every backing page was allocated with __GFP_ZERO above. */
 	for (i = 0; i < m->blocks; i++) {
 		ret = iommu_map(h->domain, dva + i * SZ_16K,
 				page_to_phys(m->pages[i * pages_per_block]), SZ_16K,
