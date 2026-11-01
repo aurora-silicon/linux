@@ -76,6 +76,7 @@ int dcp_start(struct platform_device *pdev);
 int dcp_activate(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+bool dcp_hdr_metadata_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
