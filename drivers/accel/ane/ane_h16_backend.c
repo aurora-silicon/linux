@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Staged H16 backend, using the accepted H16 cold-boot facts, round 5. */
 #include <linux/debugfs.h>
+#include <linux/cpumask.h>
+#include <linux/irq.h>
+#include <linux/seq_file.h>
 #include <linux/delay.h>
 #include <linux/sched/cputime.h>
 #include <linux/dma-map-ops.h>
@@ -22,6 +25,7 @@
 #include <linux/vmalloc.h>
 
 #include "ane_h16_boot.h"
+#include "ane_fw_irq_wait.h"
 #include "ane_h16_execute.h"
 #include "ane_h16_preload.h"
 
@@ -53,6 +57,14 @@ struct ane_h16_device {
 	bool attached;
 	bool pinned;
 	int irq;
+	bool job_irq_mode;
+	struct ane_fw_irq_event irq_event;
+	atomic_t irq_calls, irq_notifications, irq_empty, irq_empty_run, irq_disabled;
+	atomic_t irq_waits, irq_woken, irq_timeouts;
+	atomic_t irq_status_count[ANE_FW_CHANNELS];
+	cpumask_t irq_seen_cpus;
+	u32 irq_job_base[6];
+	u32 mailbox_rx_count;
 	struct ane_fw_rtk rtk;
 	struct {
 		u64 word0;
@@ -69,6 +81,10 @@ struct ane_h16_device {
 		u32 type, value, shared_count;
 	} startup_trace[128];
 };
+
+static bool h16_job_irq;
+module_param(h16_job_irq, bool, 0444);
+MODULE_PARM_DESC(h16_job_irq, "Diagnostic IRQ completion after startup, default0; incompatible with quiet probes");
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
@@ -209,6 +225,7 @@ static void ane_h16_mailbox(void *ctx)
 		/* Two 64-bit accesses. Reading the second word pops the entry. */
 		word0 = readq(mb + 0x830);
 		word1 = readq(mb + 0x838);
+		h->mailbox_rx_count++;
 		dev_info(h->dev, "H16 ASC RX %016llx %016llx\n", word0, word1);
 		if (h->rtk_failed)
 			continue;
@@ -550,9 +567,51 @@ static void ane_h16_cleanup(struct ane_h16_device *h)
 	kfree(h);
 }
 
-static irqreturn_t ane_h16_masked_irq(int irq, void *data)
+/* Only this handler owns AP channel-status acknowledgment in IRQ mode.
+ * All transport/ring/allocation state remains in the process-context worker.
+ */
+static void ane_h16_irq_fault(struct ane_h16_device *h, int error)
 {
-	return IRQ_NONE;
+	if (!atomic_cmpxchg(&h->irq_disabled, 0, 1))
+		disable_irq_nosync(h->irq);
+	ane_fw_irq_event_notify(&h->irq_event, error);
+}
+
+static irqreturn_t ane_h16_channel_irq(int irq, void *data)
+{
+	struct ane_h16_device *h = data;
+	u32 value;
+	unsigned int i;
+
+	if (!READ_ONCE(h->job_irq_mode))
+		return IRQ_NONE;
+	cpumask_set_cpu(raw_smp_processor_id(), &h->irq_seen_cpus);
+	atomic_inc(&h->irq_calls);
+	if (atomic_read(&h->irq_disabled))
+		return IRQ_HANDLED;
+	value = ane_h16_engine_read(h, h->boot.soc->irq_status);
+	if (value & ~GENMASK(7, 0)) {
+		ane_h16_irq_fault(h, -EPROTO);
+		return IRQ_HANDLED;
+	}
+	if (!value) {
+		atomic_inc(&h->irq_empty);
+		/* A wrong source/clear mapping must not storm on this level line. */
+		if (atomic_inc_return(&h->irq_empty_run) >= 32) {
+			ane_h16_irq_fault(h, -EIO);
+			return IRQ_HANDLED;
+		}
+		return IRQ_NONE;
+	}
+	atomic_set(&h->irq_empty_run, 0);
+	ane_h16_engine_write(h, h->boot.soc->irq_ack, value);
+	/* engine_write completes the ACK barrier BEFORE sequence publication. */
+	for (i = 0; i < ANE_FW_CHANNELS; i++)
+		if (value & BIT(i))
+			atomic_inc(&h->irq_status_count[i]);
+	atomic_inc(&h->irq_notifications);
+	ane_fw_irq_event_notify(&h->irq_event, 0);
+	return IRQ_HANDLED;
 }
 
 static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *h)
@@ -622,7 +681,19 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
-	ret = request_irq(irq, ane_h16_masked_irq, IRQF_NO_AUTOEN, "ane-h16-polled", h);
+	ane_fw_irq_event_init(&h->irq_event);
+	cpumask_clear(&h->irq_seen_cpus);
+	atomic_set(&h->irq_calls, 0);
+	atomic_set(&h->irq_notifications, 0);
+	atomic_set(&h->irq_empty, 0);
+	atomic_set(&h->irq_empty_run, 0);
+	atomic_set(&h->irq_disabled, 0);
+	atomic_set(&h->irq_waits, 0);
+	atomic_set(&h->irq_woken, 0);
+	atomic_set(&h->irq_timeouts, 0);
+	for (i = 0; i < ANE_FW_CHANNELS; i++)
+		atomic_set(&h->irq_status_count[i], 0);
+	ret = request_irq(irq, ane_h16_channel_irq, IRQF_NO_AUTOEN, "ane-h16-channel", h);
 	if (ret)
 		return ret;
 	h->irq = irq;
@@ -907,6 +978,58 @@ static void ane_h16_job_relax(u64 spin_deadline)
 	}
 }
 
+static int ane_h16_job_irq_error(struct ane_h16_device *h)
+{
+	int error = h->job_irq_mode ? ane_fw_irq_event_error(&h->irq_event) : 0;
+
+	return error ? ane_fw_transport_fail(&h->boot.transport, error) : 0;
+}
+
+/* All coalesced auxiliary requests must be drained before blocking. */
+static int ane_h16_job_irq_service(struct ane_h16_device *h, bool *progress)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	u64 terminal_before = t->terminal_messages;
+	u32 rx_before = h->mailbox_rx_count, tx_before = h->tx_read;
+	int ret = ane_fw_transport_shared_drain(t, progress);
+
+	if (ret)
+		return ret;
+	ret = ane_fw_transport_terminal(t);
+	if (ret)
+		return ret;
+	ane_h16_mailbox(h);
+	if (terminal_before != t->terminal_messages || rx_before != h->mailbox_rx_count ||
+	    tx_before != h->tx_read)
+		*progress = true;
+	ret = ane_h16_faults(&h->boot, false);
+	return ret ? ret : ane_h16_job_irq_error(h);
+}
+
+static int ane_h16_job_irq_pause(struct ane_h16_device *h, unsigned int sequence,
+				 u64 deadline, u64 spin_deadline)
+{
+	u64 now = ktime_get_ns(), remaining;
+	int ret;
+
+	if (now >= deadline)
+		return ane_fw_transport_fail(&h->boot.transport, -ETIMEDOUT);
+	if (spin_deadline && now < spin_deadline) {
+		cpu_relax();
+		return ane_h16_job_irq_error(h);
+	}
+	remaining = min_t(u64, deadline - now, 10 * NSEC_PER_MSEC);
+	atomic_inc(&h->irq_waits);
+	ret = ane_fw_irq_event_wait(&h->irq_event, sequence, ns_to_ktime(remaining));
+	if (ret < 0)
+		return ane_fw_transport_fail(&h->boot.transport, ret);
+	if (!ret)
+		atomic_inc(&h->irq_timeouts);
+	else
+		atomic_inc(&h->irq_woken);
+	return ane_h16_job_irq_error(h);
+}
+
 /* ane_fw_transport_wait with a 10-20 us poll, so job timings are not 1 ms steps. */
 static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 {
@@ -916,9 +1039,30 @@ static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 	int ret;
 
 	for (;;) {
+		unsigned int sequence = ane_fw_irq_event_sequence(&h->irq_event);
+		bool progress;
+
+		ret = ane_h16_job_irq_error(h);
+		if (ret)
+			return ret;
 		ret = ane_fw_transport_poll(t, ch);
 		if (ret != -EAGAIN)
-			return ret;
+			return ane_h16_job_irq_error(h) ?: ret;
+		if (h->job_irq_mode) {
+			ret = ane_h16_job_irq_service(h, &progress);
+			if (ret)
+				return ane_fw_transport_fail(t, ret);
+			if (ktime_get_ns() >= t->pending[ch].deadline_ns)
+				return ane_fw_transport_fail(t, -ETIMEDOUT);
+			ane_fw_transport_rering(t, ch);
+			if (progress)
+				continue;
+			ret = ane_h16_job_irq_pause(h, sequence, t->pending[ch].deadline_ns,
+						     spin_deadline);
+			if (ret)
+				return ret;
+			continue;
+		}
 		ret = ane_fw_transport_irq(t, &pending);
 		if (ret)
 			return ret;
@@ -1021,11 +1165,14 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 	int ret = -ETIMEDOUT;
 	unsigned int i;
 
+	ret = ane_h16_job_irq_error(h);
+	if (ret)
+		return ret;
 	for (i = 0; i < ANE_H16_JOB_DONE; i++) {
 		if (j->done[i].uuid != uuid || !uuid)
 			continue;
 		j->done[i].uuid = 0;
-		return j->done[i].state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO;
+		return ane_h16_job_irq_error(h) ?: (j->done[i].state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO);
 	}
 	ret = ane_h16_job_quiet(j, uuid);
 	if (ret)
@@ -1033,8 +1180,13 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 	while (ktime_get_ns() < deadline) {
 		size_t size = 0;
 		u32 pending;
-		int r = ane_fw_transport_consume(t, report, sizeof(report), &size);
+		unsigned int sequence = ane_fw_irq_event_sequence(&h->irq_event);
+		bool progress;
+		int r = ane_h16_job_irq_error(h);
 
+		if (r)
+			return r;
+		r = ane_fw_transport_consume(t, report, sizeof(report), &size);
 		if (!r) {
 			u64 ns = ktime_get_ns() - j->published_ns;
 			u64 counter = get_cycles();
@@ -1063,7 +1215,7 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 						       sizeof(j->quiet_warm_handles));
 						j->quiet_warmed = true;
 					}
-					return state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO;
+					return ane_h16_job_irq_error(h) ?: (state == ANE_H16_EVENT_SUCCESS ? 0 : -EIO);
 				}
 				if (terminal) {
 					j->done[j->done_next].uuid = id;
@@ -1075,6 +1227,18 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		}
 		if (r != -EAGAIN)
 			return r;
+		if (h->job_irq_mode) {
+			r = ane_h16_job_irq_service(h, &progress);
+			if (r)
+				return ane_fw_transport_fail(t, r);
+			if (progress)
+				continue;
+			r = ane_h16_job_irq_pause(h, sequence, deadline, spin_deadline);
+			if (r)
+				return r;
+			ret = -ETIMEDOUT;
+			continue;
+		}
 		r = ane_fw_transport_irq(t, &pending);
 		if (r)
 			return r;
@@ -1168,6 +1332,48 @@ static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
 	return size ? -EINVAL : 0;
 }
 
+static void ane_h16_irq_job_begin(struct ane_h16_device *h)
+{
+	h->irq_job_base[0] = atomic_read(&h->irq_calls);
+	h->irq_job_base[1] = atomic_read(&h->irq_notifications);
+	h->irq_job_base[2] = atomic_read(&h->irq_empty);
+	h->irq_job_base[3] = atomic_read(&h->irq_waits);
+	h->irq_job_base[4] = atomic_read(&h->irq_woken);
+	h->irq_job_base[5] = atomic_read(&h->irq_timeouts);
+}
+
+static int ane_h16_irq_stats_show(struct seq_file *s, void *unused)
+{
+	struct ane_h16_device *h = s->private;
+	const struct cpumask *effective = irq_get_effective_affinity_mask(h->irq);
+	u32 calls = (u32)atomic_read(&h->irq_calls) - h->irq_job_base[0];
+	u32 notifications = (u32)atomic_read(&h->irq_notifications) - h->irq_job_base[1];
+	u32 empty = (u32)atomic_read(&h->irq_empty) - h->irq_job_base[2];
+	u32 waits = (u32)atomic_read(&h->irq_waits) - h->irq_job_base[3];
+	u32 woken = (u32)atomic_read(&h->irq_woken) - h->irq_job_base[4];
+	u32 timeouts = (u32)atomic_read(&h->irq_timeouts) - h->irq_job_base[5];
+	int error = ane_fw_irq_event_error(&h->irq_event);
+	unsigned int i;
+
+	if (!effective)
+		effective = cpu_possible_mask;
+	seq_printf(s, "{\"available\":true,\"mode\":%s,\"active\":%s,\"linux_irq\":%d,",
+		   h->job_irq_mode ? "true" : "false",
+		   h->job_irq_mode && !atomic_read(&h->irq_disabled) ? "true" : "false", h->irq);
+	seq_printf(s, "\"calls\":%u,\"notifications\":%u,\"empty\":%u,\"waits\":%u,\"woken\":%u,\"fallbacks\":%u,",
+		   calls, notifications, empty, waits, woken, timeouts);
+	seq_printf(s, "\"delivered\":%s,\"wait_notified\":%s,\"error\":%d,\"ok\":%s,",
+		   notifications ? "true" : "false", woken ? "true" : "false", error,
+		   !error && !atomic_read(&h->irq_disabled) ? "true" : "false");
+	seq_printf(s, "\"handler_cpus_since_enable\":\"%*pbl\",\"effective_affinity\":\"%*pbl\",\"status_counts_since_enable\":[",
+		   cpumask_pr_args(&h->irq_seen_cpus), cpumask_pr_args(effective));
+	for (i = 0; i < ANE_FW_CHANNELS; i++)
+		seq_printf(s, "%s%u", i ? "," : "", (u32)atomic_read(&h->irq_status_count[i]));
+	seq_puts(s, "]}\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ane_h16_irq_stats);
+
 static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size_t count,
 				 loff_t *ppos)
 {
@@ -1190,7 +1396,11 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 	if (!ane_h16_job_dev) {
 		ret = -ENODEV;
 	} else {
-		ret = ane_h16_job_run(ane_h16_job_dev, &j, in, count);
+		ane_h16_irq_job_begin(ane_h16_job_dev);
+		ret = ane_h16_job_irq_error(ane_h16_job_dev);
+		if (!ret)
+			ret = ane_h16_job_run(ane_h16_job_dev, &j, in, count);
+		ret = ane_h16_job_irq_error(ane_h16_job_dev) ?: ret;
 		dev_info(ane_h16_job_dev->dev, "H16 job %zu bytes: %d, result %zu bytes\n",
 			 count, ret, j.used);
 	}
@@ -1233,7 +1443,20 @@ static void ane_h16_job_publish(struct ane_h16_device *h)
 		return;
 	if (!ane_h16_debugfs)
 		ane_h16_debugfs = debugfs_create_dir("ane_h16", NULL);
+	if (h16_job_irq) {
+		u32 pending;
+		int ret = ane_fw_transport_irq(&h->boot.transport, &pending);
+
+		if (ret) {
+			dev_err(h->dev, "H16 IRQ preflight refused: %d\n", ret);
+			return;
+		}
+		WRITE_ONCE(h->job_irq_mode, true);
+		enable_irq(h->irq);
+		dev_info(h->dev, "H16 job IRQ mode enabled on Linux IRQ %d\n", h->irq);
+	}
 	ane_h16_job_dev = h;
+	debugfs_create_file("irq_stats", 0400, ane_h16_debugfs, h, &ane_h16_irq_stats_fops);
 	debugfs_create_file("job", 0200, ane_h16_debugfs, NULL, &ane_h16_job_fops);
 	debugfs_create_blob("result", 0400, ane_h16_debugfs, &ane_h16_job_result);
 	dev_info(h->dev, "H16 job interface in debugfs ane_h16/\n");
@@ -1307,6 +1530,10 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	if (ane_h16_released) {
 		ret = -EBUSY;
 		goto unlock;
+	}
+	if (h16_job_irq && h16_job_quiet_us) {
+		dev_err(&pdev->dev, "H16 IRQ and quiet probes cannot be combined\n");
+		return -EINVAL;
 	}
 	h = kzalloc_obj(*h);
 	if (!h) {
