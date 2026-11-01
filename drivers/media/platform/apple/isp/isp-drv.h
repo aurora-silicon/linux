@@ -161,8 +161,17 @@ struct isp_preset {
 	bool remapped;
 };
 
+struct ane_isp_link;
+
 struct apple_isp_hw {
 	enum isp_generation gen;
+	/*
+	 * How the ANE firmware signals this ISP over the ML noise reduction
+	 * endpoint; the endpoint stays off where it is not known.
+	 */
+	bool ane_doorbell_known;
+	u64 ane_isp_doorbell;
+	u32 ane_isp_doorbell_sel;
 	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
@@ -376,6 +385,11 @@ struct apple_isp {
 	u32 temporal_filter;
 	/* setfile name of the board's camera module (DT apple,module-tuning), or NULL */
 	const char *module_tuning;
+
+	/* ML noise reduction on the neural engine (isp-ane.c) */
+	struct ane_isp_link *ane;
+	struct isp_surf *ane_rings;
+	char ane_afpp[64];
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;
 	int num_presets;
