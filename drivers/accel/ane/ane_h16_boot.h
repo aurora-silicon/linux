@@ -528,6 +528,24 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 			b->ops->log(b->ctx, "startup IO slot header/error",
 				    b->transport_ops->load64(b->ctx,
 					ane_fw_transport_slot(&b->transport, ANE_FW_IO)), ret);
+			b->ops->log(b->ctx, "startup IRQ status/shared count",
+				    b->transport_ops->read32(b->ctx, b->soc->irq_status),
+				    b->transport.shared_count);
+			/* Read coherent ring state before quarantine; no ownership changes. */
+			for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
+				struct ane_fw_transport *t = &b->transport;
+				const struct ane_fw_channel *c = &t->channels[ch];
+				u32 head = t->head[ch], prev = (head + c->slots - 1) % c->slots;
+				u8 *slot = (u8 *)t->ipc.cpu + c->offset + head * ANE_FW_SLOT_SIZE;
+				u8 *last = (u8 *)t->ipc.cpu + c->offset + prev * ANE_FW_SLOT_SIZE;
+
+				b->transport_ops->read_barrier(b->ctx);
+				b->ops->log(b->ctx, "startup channel/head", ch, head);
+				b->ops->log(b->ctx, "startup current slot header/word1",
+					    t->ops->load64(b->ctx, slot), t->ops->load64(b->ctx, slot + 8));
+				b->ops->log(b->ctx, "startup previous slot header/word1",
+					    t->ops->load64(b->ctx, last), t->ops->load64(b->ctx, last + 8));
+			}
 			return ret;
 		}
 		b->ops->log(b->ctx, "startup ack", f->startup[i].id, get_unaligned_le16(reply + 6));
