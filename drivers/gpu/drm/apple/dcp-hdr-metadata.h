@@ -10,6 +10,13 @@
  * CTA-861.3 Type 1 body in the order of struct hdr_metadata_infoframe from
  * display_primaries to max_fall, little-endian.  The EOTF is not in it: the
  * firmware takes it from the colour mode the link runs.
+ *
+ * Ending HDR on a live link, the host first clears that InfoFrame with
+ * selector 0x14 (stopInfoFrame), then sets the SDR colour mode; it never
+ * sends an empty metadata block.  The stop message has a fixed 0x80 bytes:
+ * the usual header, a 32-byte InfoFrame at 0x40 whose type byte selects
+ * the slot to clear (0x87, Dynamic Range and Mastering), the link source
+ * at 0x60 (0) and the DCP status at 0x70.
  */
 #ifndef __APPLE_DCP_HDR_METADATA_H__
 #define __APPLE_DCP_HDR_METADATA_H__
@@ -20,6 +27,7 @@
 #include <linux/unaligned.h>
 #include <drm/drm_mode.h>
 
+#define DCP_HDR_SELECTOR_STOP_INFOFRAME	0x14
 #define DCP_HDR_SELECTOR_SET_STATIC	0x15
 #define DCP_HDR_IPC_MAGIC		0x69706378	/* "xcpi" */
 #define DCP_HDR_DATA_SIZE		24
@@ -48,6 +56,11 @@
 #define DCP_HDR_MSG_HEADER		0x60
 #define DCP_HDR_MSG_STATUS		0x40
 #define DCP_HDR_MSG_SIZE		(DCP_HDR_MSG_HEADER + DCP_HDR_OBJECT_SIZE)
+
+#define DCP_HDR_STOP_SIZE		0x80
+#define DCP_HDR_STOP_INFOFRAME		0x40
+#define DCP_HDR_STOP_STATUS		0x70
+#define DCP_HDR_INFOFRAME_DRM		0x87
 
 /* The 24-byte Type 1 body of @hdr; -EINVAL unless it is a Type 1 block. */
 static inline int dcp_hdr_data(u8 data[DCP_HDR_DATA_SIZE],
@@ -97,17 +110,43 @@ static inline void dcp_hdr_message(u8 msg[DCP_HDR_MSG_SIZE],
 	memcpy(obj + DCP_HDR_OFF_DATA, data, DCP_HDR_DATA_SIZE);
 }
 
-/* The result of a selector 0x15 command: transport, AFK, then DCP status. */
-static inline int dcp_hdr_reply(int transport, u32 retcode, const u8 *reply,
-				size_t length)
+/* The selector 0x14 message clearing the Dynamic Range and Mastering InfoFrame. */
+static inline void dcp_hdr_stop_message(u8 msg[DCP_HDR_STOP_SIZE])
+{
+	memset(msg, 0, DCP_HDR_STOP_SIZE);
+	put_unaligned_le32(DCP_HDR_SELECTOR_STOP_INFOFRAME, msg + 0x04);
+	put_unaligned_le32(DCP_HDR_STOP_SIZE - 0x40, msg + 0x08);
+	put_unaligned_le32(DCP_HDR_IPC_MAGIC, msg + 0x0c);
+	msg[DCP_HDR_STOP_INFOFRAME] = DCP_HDR_INFOFRAME_DRM;
+}
+
+/* The result of a DCPAV command: transport, AFK, then DCP status at @status. */
+static inline int dcp_hdr_result(int transport, u32 retcode, const u8 *reply,
+				 size_t length, size_t status)
 {
 	if (transport)
 		return transport;
 	if (retcode)
 		return -EIO;
-	if (length < DCP_HDR_MSG_STATUS + 4)
+	if (length < status + 4)
 		return -EPROTO;
-	return get_unaligned_le32(reply + DCP_HDR_MSG_STATUS) ? -EIO : 0;
+	return get_unaligned_le32(reply + status) ? -EIO : 0;
+}
+
+/* The result of a selector 0x15 command. */
+static inline int dcp_hdr_reply(int transport, u32 retcode, const u8 *reply,
+				size_t length)
+{
+	return dcp_hdr_result(transport, retcode, reply, length,
+			      DCP_HDR_MSG_STATUS);
+}
+
+/* The result of a selector 0x14 command. */
+static inline int dcp_hdr_stop_reply(int transport, u32 retcode,
+				     const u8 *reply, size_t length)
+{
+	return dcp_hdr_result(transport, retcode, reply, length,
+			      DCP_HDR_STOP_STATUS);
 }
 
 #endif /* __APPLE_DCP_HDR_METADATA_H__ */
