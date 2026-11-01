@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Exercise the raw firmware statistics snapshot and its export format.
 
 The snapshot keeps the firmware words verbatim: no unit is assumed, nothing is
@@ -11,8 +12,8 @@ import re
 import subprocess
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
-stats = (ROOT / "stats_raw.rs").read_text()
+ROOT = Path(__file__).resolve().parents[2]
+stats = (ROOT / "drivers/gpu/drm/asahi/stats_raw.rs").read_text()
 
 
 def block(marker):
