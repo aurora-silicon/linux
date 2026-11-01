@@ -1,0 +1,28 @@
+H.264 host instruction regression tests
+======================================
+
+host.py extracts the production H.264 builders verbatim and compiles them
+against a userspace shim. It compares complete header and slice instruction
+programs with a supplied baseline. Synthetic DMA addresses make the output
+reproducible. No decoder device or firmware is needed.
+
+On a Linux build host, with an older driver directory in BASELINE:
+
+  python3 tests/host.py --baseline BASELINE --out OUT
+  python3 tests/queue.py --baseline BASELINE --out OUT
+
+The comparison spans dense DPBs with zero through sixteen entries, I/P/B
+slices, CAVLC/CABAC, explicit/implicit weighting, first/continuation slices,
+and both address encodings. Dense programs must remain byte-identical.
+Sparse programs may change only the DPB slot operand of reference-list
+instructions. All 65536 DPB occupancy maps are checked independently.
+The tests also exercise slice-type, slice-group and HEVC bit-depth rejection.
+OUT/before.json and OUT/after.json retain the instruction programs for review.
+
+These tests verify control translation and compatibility, not decoded pixels.
+A hardware conformance rerun is still needed to demonstrate pixel correctness.
+
+queue.py compiles the production queue initializer and format-feature update.
+It reproduces FFmpeg capability probing before S_FMT and verifies that a
+multislice picture reaches hardware once, after its last slice. It also checks
+that changing formats removes stale per-format queue features.

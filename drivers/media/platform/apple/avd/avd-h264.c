@@ -22,6 +22,7 @@
 
 #include "avd.h"
 #include "avd-inst.h"
+#include "avd-h264-params.h"
 
 #define H264_SCL_DIMS	(0x1000000 | ((64 / 4) << 5) | (((16 / 4) << 5) - 1))
 
@@ -72,6 +73,7 @@ struct avd_h264_ctx {
 	size_t alloc_slice_num;
 	/* allocated size of the held slices */
 	size_t slice_bytes;
+	u32 last_mb;
 
 	struct avd_h264_bufs {
 		struct avd_buf inst;
@@ -481,7 +483,8 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 			push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(0) |
 				     AVD_OP_REF_LOOP_IDX(i) |
 				     AVD_OP_REF_DBP_IDX(
-					     sl->ref_pic_list0[i].index),
+					     avd_h264_ref_slot(decode,
+							       sl->ref_pic_list0[i].index)),
 			     "slc_6e8_cmd_ref_list_0");
 
 		if (sl->slice_type == V4L2_H264_SLICE_TYPE_B) {
@@ -491,7 +494,8 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 				push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(1) |
 					     AVD_OP_REF_LOOP_IDX(i) |
 					     AVD_OP_REF_DBP_IDX(
-						     sl->ref_pic_list1[i].index),
+						     avd_h264_ref_slot(decode,
+								       sl->ref_pic_list1[i].index)),
 				     "slc_6e8_cmd_ref_list_0");
 		}
 		stream_weights(ctx, run);
@@ -591,7 +595,21 @@ static int avd_h264_validate_pps(struct avd_ctx *ctx,
 				 const struct v4l2_ctrl_h264_pps *pps)
 {
 	if (pps->num_slice_groups_minus1 != 0) {
-		dev_err(ctx->dev->dev, "pps->num_slice_groups_minus1 != 0");
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 slice groups (FMO) are unsupported: no slice-group map in the stateless API\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int avd_h264_validate_slice(struct avd_ctx *ctx,
+				   const struct v4l2_ctrl_h264_slice_params *sl)
+{
+	if (!avd_h264_slice_type_supported(sl)) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 slice type %u is unsupported (SP/SI switching pictures)\n",
+				    sl->slice_type);
 		return -EINVAL;
 	}
 
@@ -604,9 +622,13 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	if (sps->chroma_format_idc > 2)
 		/* Only 4:0:0, 4:2:0 and 4:2:2 are supported */
 		return -EINVAL;
-	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
-		/* Luma and chroma bit depth mismatch */
+	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 unequal luma/chroma bit depths (%u/%u) are unsupported\n",
+				    sps->bit_depth_luma_minus8 + 8,
+				    sps->bit_depth_chroma_minus8 + 8);
 		return -EINVAL;
+	}
 	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
 		/* Only 8 and 10 bit have capture formats */
 		return -EINVAL;
@@ -772,8 +794,8 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx, size_t max_slices)
 /*
  * Check that every reference in the slice's ref lists points at a DPB entry
  * that is VALID. stream_refs() only pushes a reference header (and its RVRA
- * addresses) for VALID entries and the slice command indexes those by DPB
- * index, so a reference to any other entry makes the VP dereference an
+ * addresses) for VALID entries and the slice command indexes those by their
+ * packed header slot, so a reference to any other entry makes the VP dereference an
  * uninitialised reference slot: that ends in a DART translation fault, a
  * frame that never completes and a watchdog reset of the VP, which also
  * disturbs the other contexts. It happens whenever a client starts decoding
@@ -862,6 +884,27 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 	avd_h264_run_preamble(ctx, &run);
 
+	/* Recheck applied controls before allocating or building any instructions. */
+	ret = avd_h264_validate_sps(ctx, run.sps);
+	if (!ret)
+		ret = avd_h264_validate_pps(ctx, run.pps);
+	if (!ret)
+		ret = avd_h264_validate_slice(ctx, run.slice_params);
+	if (ret) {
+		avd_h264_drop_slices(ctx);
+		goto err_free_jobs;
+	}
+
+	if (!avd_h264_slice_order_supported(h264_ctx->slice_num,
+					   h264_ctx->last_mb,
+					   run.slice_params->first_mb_in_slice)) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 arbitrary slice order (ASO) is unsupported\n");
+		avd_h264_drop_slices(ctx);
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
+
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	u32 payload_len = vb2_get_plane_payload(&src->vb2_buf, 0);
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
@@ -898,6 +941,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		goto err_free_jobs;
 	memcpy(h264_ctx->active_slice->cpu, data, payload_len);
 	h264_ctx->slice_num++;
+	h264_ctx->last_mb = run.slice_params->first_mb_in_slice;
 	h264_ctx->slice_bytes += PAGE_ALIGN((size_t)payload_len);
 	h264_ctx->monochrome = run.sps->chroma_format_idc == 0;
 
@@ -905,7 +949,8 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	v4l2_h264_init_reflist_builder(&reflist_builder, run.decode_params,
 				       run.sps, run.decode_params->dpb);
 
-	run.num_valid = reflist_builder.num_valid;
+	/* Count exactly the entries stream_refs() emits, including inactive ones. */
+	run.num_valid = avd_h264_num_refs(run.decode_params);
 	run.cur_poc = reflist_builder.cur_pic_order_count;
 
 	v4l2_h264_build_p_ref_list(&reflist_builder, h264_ctx->reflists.p);
@@ -1009,6 +1054,8 @@ static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 		return avd_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
 	if (ctrl->id == V4L2_CID_STATELESS_H264_PPS)
 		return avd_h264_validate_pps(ctx, ctrl->p_new.p_h264_pps);
+	if (ctrl->id == V4L2_CID_STATELESS_H264_SLICE_PARAMS)
+		return avd_h264_validate_slice(ctx, ctrl->p_new.p_h264_slice_params);
 
 	return 0;
 }

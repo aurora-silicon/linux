@@ -650,6 +650,13 @@ static int avd_queue_init(void *priv, struct vb2_queue *src_vq,
 	src_vq->dev = ctx->dev->v4l2_dev.dev;
 	src_vq->supports_requests = true;
 	src_vq->allow_cache_hints = true;
+	/*
+	 * Clients can query CREATE_BUFS capabilities before S_FMT. In particular,
+	 * FFmpeg caches them then and submits every H.264 slice as a complete
+	 * picture if HOLD_CAPTURE_BUF is missing. Advertise the initial format's
+	 * queue features before vb2 exposes the queue.
+	 */
+	src_vq->subsystem_flags = ctx->coded_fmt_desc->subsystem_flags;
 
 	ret = vb2_queue_init(src_vq);
 	if (ret)
