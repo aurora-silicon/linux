@@ -288,6 +288,8 @@ static const struct midr_range apple_cpus[] = {
 	MIDR_ALL_VERSIONS(MIDR_APPLE_M2_AVALANCHE_PRO),
 	MIDR_ALL_VERSIONS(MIDR_APPLE_M2_BLIZZARD_MAX),
 	MIDR_ALL_VERSIONS(MIDR_APPLE_M2_AVALANCHE_MAX),
+	MIDR_ALL_VERSIONS(MIDR_APPLE_TAHITI_E),
+	MIDR_ALL_VERSIONS(MIDR_APPLE_TAHITI_P),
 	{},
 };
 
@@ -307,10 +309,7 @@ static bool has_impdef_pmuv3(const struct arm64_cpu_capabilities *entry, int sco
 	return is_midr_in_range_list(apple_cpus);
 }
 
-/*
- * Apple cores with the same vGIC as M1/M2 that aren't in apple_cpus yet:
- * that list also turns on the IMPDEF PMUv3 traps, unverified here.
- */
+/* Apple cores with the same vGIC as M1/M2 that are not in apple_cpus. */
 static const struct midr_range apple_broken_seis_cpus[] = {
 	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_E),
 	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_P),
