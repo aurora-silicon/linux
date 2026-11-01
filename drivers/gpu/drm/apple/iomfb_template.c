@@ -3685,14 +3685,15 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->surf[l].base.surface_id = 0;
 #endif
 
-		/* Use sRGB colorspace only for internal panels. External
-		 * displays are expected to have EDID and user space can use
-		 * the contained colorimetry information to provide native
-		 * colors.
+		/* Internal panels: tag untagged RGB with the panel's own
+		 * primaries (P3-D65, as its EDID reports), so the firmware
+		 * shows the compositor's values unconverted. External
+		 * displays keep the unspecified tag; user space reads their
+		 * colorimetry from the EDID.
 		 */
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
-			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_UNSPECIFIED)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_P3_D65;
 
 		/*
 		 * On a PQ output the compositor has already encoded RGB
@@ -3701,20 +3702,21 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 */
 		if ((dcp->output_pq || dcp->output_edr) &&
 		    !new_state->fb->format->is_yuv) {
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
-			req->surf[l].base.xfer_func = DCP_XFER_FUNC_HDR;
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+			req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
 		}
 
 #if DCP_FW_H17(DCP_FW_VER)
-		/* H17P external SDR RGB needs an sRGB source tag. Native
-		 * tagging washes out the same pixel values on this profile.
+		/* H17P external SDR RGB needs the unspecified (sRGB) source
+		 * tag. P3-D65 tagging washes out the same pixel values on this
+		 * profile.
 		 * Keep YUV, other source spaces and other profiles unchanged.
 		 */
 		if (dcp->hw.iomfb_method_profile ==
 			    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		    !new_state->fb->format->is_yuv &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3_D65)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_UNSPECIFIED;
 #endif
 	}
 
