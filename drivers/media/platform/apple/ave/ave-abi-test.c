@@ -527,6 +527,9 @@ static void ave_t8112_dpe_defaults(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cat[0], junk | 1);
 	/* Steps 2 and 6 on CAC +0x000. */
 	KUNIT_EXPECT_EQ(test, cac[0], (junk & ~0x01ff0003U) | 0x00030003U);
+	/* CAC +0x000 bit 1 is a command and reads back 0 on hardware. */
+	cac[0] &= ~BIT(1);
+	KUNIT_EXPECT_EQ(test, ave_dpe_check((void __iomem *)buf, dpe, NULL), 0U);
 	/* Step 3: CAC +0x004..+0x0a0 bit 0 set. */
 	for (i = 1; i <= 0xa0 / 4; i++)
 		KUNIT_EXPECT_EQ(test, cac[i], junk | 1);

@@ -432,15 +432,16 @@ unsigned int ave_dpe_check(void __iomem *codec, const struct ave_dpe_table *t,
 
 		for (u32 j = 0; j < r->count; j++) {
 			u32 off = r->offset + 4 * j;
-			u32 want = r->values ? r->values[j] : r->value;
+			u32 keep = r->retained ? r->retained : r->mask;
+			u32 want = (r->values ? r->values[j] : r->value) & keep;
 			u32 got = readl(codec + off);
 
-			if ((got & r->mask) == want)
+			if ((got & keep) == want)
 				continue;
 			bad++;
 			if (dev)
 				dev_warn(dev, "DPE %#x reads %#x, field %#x wants %#x\n",
-					 off, got, r->mask, want);
+					 off, got, keep, want);
 		}
 	}
 	return bad;

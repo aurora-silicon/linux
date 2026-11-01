@@ -156,6 +156,8 @@ struct ave_dpe_rmw {
 	u32 value;
 	u32 count;
 	const u16 *values;
+	/* Bits that keep their value; 0 means all of mask. */
+	u32 retained;
 };
 
 struct ave_dpe_table {
