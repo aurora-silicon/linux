@@ -1394,7 +1394,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
 	mutex_unlock(&apple_pmp_reports_lock);
 
-	if (rep->offsets->fast_die || rep->start)
+	if (rep->offsets->fast_die || rep->start || rep->offsets->dvfs_count)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
 						   apple_pmp_report_debugfs, rep,
 						   &apple_pmp_report_status_fops);
