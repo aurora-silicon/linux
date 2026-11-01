@@ -1152,9 +1152,15 @@ static void ane_h16_failure_publish(struct ane_h16_device *h)
 	/* 25F84 fw IRQ receiver reads this pending register (firmware 0x8c90).
 	 * Read only: no inferred clear/ack semantics are used here.
 	 */
-	if (b->soc->doorbell == 0x1884000)
+	if (b->soc->doorbell == 0x1884000) {
+		u32 idle = readl(h->window[ANE_H16_ENGINE] + 0x1600048);
+
 		dev_info(h->dev, "H16 failure firmware IRQ pending=%x\n",
 			 readl(h->window[ANE_H16_ENGINE] + 0x1888000));
+		/* 25F84 ANE_deInit reads32 and calls mask3 nonzero CPU-in-WFI. */
+		dev_info(h->dev, "H16 failure ASCWRAP_IDLE_STATUS=%x AppleWFI=%u\n",
+			 idle, !!(idle & 3));
+	}
 	if (!ane_h16_debugfs)
 		ane_h16_debugfs = debugfs_create_dir("ane_h16", NULL);
 	live = memremap(h->preload_phys[1], b->soc->preload_size[1], MEMREMAP_WB);
