@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * N1 Wi-Fi/Bluetooth on apcie port 0. The bootloader trains the link (AUS5
+ * PHY, refclk buffer, N1 reset, port; see the m5air FINDINGS); Linux uses the
+ * root port as a generic ECAM host and owns the DART and the endpoint.
+ * Ranges and the DART IRQ from the J813 ADT, as in t8142-j813-wifi.dts.
+ */
+&{/} {
+	pcie0: pcie@1cb0000000 {
+		compatible = "pci-host-ecam-generic";
+		device_type = "pci";
+		#address-cells = <3>;
+		#size-cells = <2>;
+		bus-range = <0 1>;
+		reg = <0x1c 0xb0000000 0 0x200000>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000>,
+			 <0x02000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		dma-coherent;
+		msi-parent = <&pcie0_msi>;
+		/* N1's three ADT mapper nodes use stream zero. */
+		iommu-map = <0x100 &dart_apcie0 0 1>,
+			    <0x101 &dart_apcie0 0 1>,
+			    <0x102 &dart_apcie0 0 1>;
+	};
+};
+
+&{/soc} {
+	/*
+	 * Port 0's MSI map (ADT apcie reg[8]). ADT msi-address 0xfffff000,
+	 * msi-vector-offset 1741, #msi-vectors 96 for three ports: port 0
+	 * owns the first 32.
+	 */
+	pcie0_msi: msi-controller@488028000 {
+		compatible = "apple,t8142-pcie-msi";
+		reg = <4 0x88028000 0 0x8000>;
+		msi-controller;
+		msi-ranges = <&aic AIC_IRQ 1741 IRQ_TYPE_EDGE_RISING 32>;
+	};
+
+	dart_apcie0: iommu@488000000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <4 0x88000000 0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1463 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+	};
+};
