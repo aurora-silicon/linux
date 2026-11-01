@@ -6,6 +6,7 @@
 #include "ane_h16_program.h"
 
 #include "ane_h16_hwx_test_fixture.h"
+#include "ane_h16_add128_fixture.h"
 
 #define FW_IPC_DVA 0x100003d0000ULL
 #define FW_POOL_DVA 0x10000384000ULL
@@ -493,6 +494,97 @@ static void program_add128_slots_test(struct kunit *test)
 						       &count), -ENOEXEC);
 }
 
+static u8 *sparse_bytes(struct kunit *test, const struct ane_h16_sparse_run *runs,
+			unsigned int count, size_t size)
+{
+	u8 *bytes = kunit_kzalloc(test, size, GFP_KERNEL);
+	unsigned int i;
+
+	if (!bytes)
+		return NULL;
+	for (i = 0; i < count; i++) {
+		if (runs[i].offset + runs[i].length > size)
+			return NULL;
+		memcpy(bytes + runs[i].offset, runs[i].bytes, runs[i].length);
+	}
+	return bytes;
+}
+
+/*
+ * The pinned add-128 program and the sections h16-sections.py builds for it
+ * load and run against the fake firmware. Segments are x (in), y (out), z (in)
+ * while the tensors list x, z, y; EXECUTE names x = 5, y = 4, z = 6.
+ */
+static void program_add128_hwx_test(struct kunit *test)
+{
+	static const u32 ids[3] = { 5, 4, 6 }, classes[3] = { 0, 1, 0 };
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_program *p = NULL;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT] = {
+		ADD128_GENERIC_SIZE, ADD128_OPERATION_SIZE,
+		ADD128_PROCEDURE_SIZE, ADD128_PROPERTIES_SIZE,
+	};
+	struct prog_fw *f = fw_create(test);
+	u8 *hwx;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	hwx = sparse_bytes(test, add128_hwx_runs, ARRAY_SIZE(add128_hwx_runs), ADD128_HWX_SIZE);
+	aux[0] = sparse_bytes(test, add128_generic_runs, ARRAY_SIZE(add128_generic_runs),
+			      ADD128_GENERIC_SIZE);
+	aux[1] = sparse_bytes(test, add128_operation_runs, ARRAY_SIZE(add128_operation_runs),
+			      ADD128_OPERATION_SIZE);
+	aux[2] = sparse_bytes(test, add128_procedure_runs, ARRAY_SIZE(add128_procedure_runs),
+			      ADD128_PROCEDURE_SIZE);
+	aux[3] = sparse_bytes(test, add128_properties_runs, ARRAY_SIZE(add128_properties_runs),
+			      ADD128_PROPERTIES_SIZE);
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
+		KUNIT_ASSERT_NOT_NULL(test, aux[i]);
+	snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_snapshot_create(hwx, ADD128_HWX_SIZE, snapshot), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, snapshot_free, snapshot), 0);
+	KUNIT_ASSERT_MEMEQ(test, snapshot->digest, add128_hwx_sha256, SHA256_DIGEST_SIZE);
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_EXPECT_EQ(test, p->hwx.surface_count, 3);
+	KUNIT_EXPECT_EQ(test, p->hwx.surfaces[1].direction, 2);
+	KUNIT_EXPECT_EQ(test, p->resource_count, 3);
+	expect_slot(test, f->load, 0, 1002, 4, p->aux[0].dva, ADD128_GENERIC_SIZE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->load + ANE_H16_LOAD_SLOT_OFFSET +
+						 ANE_H16_LOAD_SLOT_SIZE + 8), 3);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->load + ANE_H16_LOAD_SLOT_OFFSET +
+						 ANE_H16_LOAD_SLOT_SIZE + 0x20), 0x4000);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->load + ANE_H16_LOAD_SLOT_OFFSET +
+						 2 * ANE_H16_LOAD_SLOT_SIZE + 0x20), 0x130);
+	expect_slot(test, f->load, 3, 1003, 4, p->aux[1].dva, ADD128_OPERATION_SIZE);
+	expect_slot(test, f->load, 4, 1004, 4, p->aux[2].dva, ADD128_PROCEDURE_SIZE);
+	expect_empty(test, f->load, 5);
+	expect_slot(test, f->load, 6, 1005, 4, p->aux[3].dva, ADD128_PROPERTIES_SIZE);
+	expect_empty(test, f->load, 7);
+	expect_empty(test, f->load, 8);
+	/* Only the output is device-writable. */
+	KUNIT_EXPECT_EQ(test, f->writable_maps, 1);
+
+	for (i = 0; i < 2; i++)
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x28), 3);
+	for (i = 0; i < 3; i++) {
+		const u8 *d = f->exec + 0x60 + i * 0x30;
+
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), ids[i]);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 8), classes[i]);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x10), 3);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x18), p->surfaces[i]->dva);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x20), SZ_32K);
+	}
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
 /* Synthetic HWX with a kernel section: slot 1 is class 3 with index 1007. */
 static void program_kernel_slots_test(struct kunit *test)
 {
@@ -810,6 +902,7 @@ static void program_pool_test(struct kunit *test)
 static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
+	KUNIT_CASE(program_add128_hwx_test),
 	KUNIT_CASE(program_replies_test),
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),
