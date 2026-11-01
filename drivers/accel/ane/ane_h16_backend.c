@@ -882,6 +882,7 @@ struct ane_h16_job {
 	u32 last_exec_handles[3], quiet_warm_handles[3];
 	bool quiet_warmed, quiet_batch_pipelined;
 	struct ane_fw_report_fifo early;
+	u32 gap_warm_serial;
 };
 
 static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
@@ -955,7 +956,10 @@ module_param(h16_job_quiet_work_ns, uint, 0444);
 MODULE_PARM_DESC(h16_job_quiet_work_ns, "Private work after each quiet wake, at most10000ns");
 static unsigned int h16_job_gap_us;
 module_param(h16_job_gap_us, uint, 0444);
-MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial EXECUTE, max100us/default0; included in throughput");
+MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial EXECUTE, max2000us/default0; >100us sleeps; included in throughput");
+static unsigned int h16_job_gap_at;
+module_param(h16_job_gap_at, uint, 0444);
+MODULE_PARM_DESC(h16_job_gap_at, "Apply recovery gap only at this warmed serial EXEC ordinal1..128,0=every eligible call");
 static unsigned int h16_job_poll_us = 10;
 module_param(h16_job_poll_us, uint, 0444);
 MODULE_PARM_DESC(h16_job_poll_us, "Diagnostic job polling sleep10..1000us, default10");
@@ -1247,22 +1251,28 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 	    get_unaligned_le16(command + 4) == ANE_H16_EXECUTE &&
 	    !j->outstanding && j->quiet_warmed &&
 	    !memcmp(command + 8, j->quiet_warm_handles, sizeof(j->quiet_warm_handles))) {
-		u8 gap[16];
-		u64 gap_counters[2], began;
-		u32 us = min(h16_job_gap_us, 100U);
+		j->gap_warm_serial++;
+		if (!h16_job_gap_at || j->gap_warm_serial == min(h16_job_gap_at, 128U)) {
+			u8 gap[16];
+			u64 gap_counters[2], began;
+			u32 us = min(h16_job_gap_us, 2000U);
 
-		put_unaligned_le64(get_unaligned_le64(command + 0x20), gap);
-		put_unaligned_le32(us, gap + 8);
-		put_unaligned_le32(raw_smp_processor_id(), gap + 12);
-		began = ktime_get_ns();
-		gap_counters[0] = get_cycles();
-		udelay(us);
-		gap_counters[1] = get_cycles();
-		ret = ane_h16_job_emit_counters(j, ANE_H16_JOB_GAP, 0,
-					      ktime_get_ns() - began, gap, sizeof(gap), gap_counters, 2);
-		if (ret) {
-			kfree(command);
-			return ret;
+			put_unaligned_le64(get_unaligned_le64(command + 0x20), gap);
+			put_unaligned_le32(us, gap + 8);
+			put_unaligned_le32(raw_smp_processor_id(), gap + 12);
+			began = ktime_get_ns();
+			gap_counters[0] = get_cycles();
+			if (us > 100)
+				usleep_range(us, us + 10);
+			else
+				udelay(us);
+			gap_counters[1] = get_cycles();
+			ret = ane_h16_job_emit_counters(j, ANE_H16_JOB_GAP, 0,
+						      ktime_get_ns() - began, gap, sizeof(gap), gap_counters, 2);
+			if (ret) {
+				kfree(command);
+				return ret;
+			}
 		}
 	}
 	start = ktime_get_ns();
