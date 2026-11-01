@@ -595,16 +595,6 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
 						ADDR_INDIRECT);
 }
 
-/**
- * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
- *
- * @wiphy: wiphy device of new interface.
- * @name: name of the new interface.
- * @params: contains mac address for AP or STA device.
- * @type: interface type.
- *
- * Return: pointer to new vif on success, ERR_PTR(-errno) if not
- */
 static void brcmf_awdl_cleanup_locked(struct brcmf_cfg80211_info *cfg)
 {
 	struct brcmf_cfg80211_vif *vif;
@@ -866,6 +856,16 @@ int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
 	return err;
 }
 
+/**
+ * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
+ *
+ * @wiphy: wiphy device of new interface.
+ * @name: name of the new interface.
+ * @params: contains mac address for AP or STA device.
+ * @type: interface type.
+ *
+ * Return: pointer to new vif on success, ERR_PTR(-errno) if not
+ */
 static
 struct wireless_dev *brcmf_apsta_add_vif(struct wiphy *wiphy, const char *name,
 					 struct vif_params *params,
@@ -1365,7 +1365,7 @@ brcmf_run_escan(struct brcmf_cfg80211_info *cfg, struct brcmf_if *ifp,
 	void *prepped_params = NULL;
 	u32 params_size = 0;
 	struct brcmf_escan_params_le *params;
-	s32 err = 0;
+	s32 err = 0, fwerr;
 
 	brcmf_dbg(SCAN, "E-SCAN START\n");
 
@@ -1397,12 +1397,17 @@ brcmf_run_escan(struct brcmf_cfg80211_info *cfg, struct brcmf_if *ifp,
 	params->action = cpu_to_le16(WL_ESCAN_ACTION_START);
 	params->sync_id = cpu_to_le16(0x1234);
 
-	err = brcmf_fil_iovar_data_set(ifp, "escan", params, params_size);
+	err = brcmf_fil_iovar_data_set_fwerr(ifp, "escan", params,
+					     params_size, &fwerr);
+	/* Association or another firmware scan can temporarily own the radio. */
+	if (err == -EBADE && fwerr == -BRCMF_FW_BUSY)
+		err = -EBUSY;
 	if (err) {
 		if (err == -EBUSY)
 			brcmf_dbg(INFO, "system busy : escan canceled\n");
 		else
-			bphy_err(drvr, "error (%d)\n", err);
+			bphy_err(drvr, "error (%d), firmware status (%d)\n",
+				 err, fwerr);
 	}
 
 	kfree(params);
@@ -1465,8 +1470,8 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		return -EAGAIN;
 	}
 	if (test_bit(BRCMF_VIF_STATUS_CONNECTING, &vif->sme_state)) {
-		bphy_err(drvr, "Connecting: status (%lu)\n", vif->sme_state);
-		return -EAGAIN;
+		brcmf_dbg(SCAN, "Connecting: status (%lu)\n", vif->sme_state);
+		return -EBUSY;
 	}
 
 	brcmf_dbg(SCAN, "START ESCAN\n");
@@ -1495,6 +1500,8 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		  timeout, request->n_channels);
 
 	err = brcmf_do_escan(vif->ifp, request);
+	if (err == -EBUSY)
+		goto scan_cleanup;
 	if (err)
 		goto scan_out;
 
@@ -1506,6 +1513,7 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 
 scan_out:
 	bphy_err(drvr, "scan error (%d)\n", err);
+scan_cleanup:
 	clear_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status);
 	cfg->scan_request = NULL;
 	return err;
