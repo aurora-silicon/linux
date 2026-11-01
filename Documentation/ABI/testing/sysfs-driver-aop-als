@@ -1,8 +1,9 @@
-What:           /sys/bus/iio/devices/iio:deviceX/in_cct_input
+What:           /sys/bus/iio/devices/iio:deviceX/in_colortemp_input
 Date:           October 2026
 Contact:        linux-iio@vger.kernel.org
 Description:
-                Firmware-computed correlated colour temperature in Kelvin on
+                Firmware-computed light colour temperature (correlated colour
+                temperature) in Kelvin, processed, on
                 aop-sensors-als devices with a Redbird (VD6286) sensor.
                 Fractional Kelvin are reported with micro resolution. There
                 is no raw photodiode-to-CCT conversion in the host driver.
