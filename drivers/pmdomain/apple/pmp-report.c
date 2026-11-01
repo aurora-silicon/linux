@@ -46,6 +46,9 @@
  * struct apple_pmp_report_offsets - per-SoC layout of the report region
  * @tgt_read: power state request, read side
  * @tgt_write: power state request, write side
+ * @update: update aperture base offset (8 bytes per entry)
+ * @dvfs_first: first qualified SOC-DEV-DVFS entry
+ * @dvfs_count: number of qualified SOC-DEV-DVFS entries
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
