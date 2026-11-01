@@ -271,25 +271,31 @@ EXPORT_SYMBOL_GPL(ane_h16_id_reply);
  * the surface direction and size. IDs are unique and never the reserved
  * kernel IDs 2 and 3. The class follows the round 5 usage mapping (input
  * usage 1, output usage 2).
+ *
+ * A linked program (an HWX with a __DATA,__bss scratch segment) has one more
+ * entry, last: the scratch buffer, described as an input-usage buffer that
+ * covers the segment. Its binding goes to @scratch; it is kernel memory and
+ * never a userspace surface. Without scratch, @scratch reads index 0.
  */
 int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 			     size_t generic_size,
 			     struct ane_h16_process_binding *bindings,
-			     unsigned int *count)
+			     unsigned int *count,
+			     struct ane_h16_process_binding *scratch)
 {
 	const u8 *g = generic;
 	u32 seen[2] = {};
-	unsigned int i, j;
+	unsigned int i, j, entries;
 
-	if (!hwx || !g || !bindings || !count || hwx->surface_count < 2 ||
+	if (!hwx || !g || !bindings || !count || !scratch || hwx->surface_count < 2 ||
 	    hwx->surface_count > ANE_H16_SURFACES)
 		return -EINVAL;
-	if (generic_size != ANE_H16_GENERIC_HEADER +
-			    hwx->surface_count * ANE_H16_GENERIC_ENTRY ||
+	entries = hwx->surface_count + (hwx->scratch.size ? 1 : 0);
+	if (generic_size != ANE_H16_GENERIC_HEADER + entries * ANE_H16_GENERIC_ENTRY ||
 	    get_unaligned_le32(g) != ANE_H16_GENERIC_MAGIC ||
 	    !get_unaligned_le32(g + 4) ||
 	    get_unaligned_le32(g + 4) > ANE_H16_GENERIC_VERSION ||
-	    get_unaligned_le32(g + ANE_H16_GENERIC_COUNT) != hwx->surface_count)
+	    get_unaligned_le32(g + ANE_H16_GENERIC_COUNT) != entries)
 		return -ENOEXEC;
 	for (i = 0; i < hwx->surface_count; i++) {
 		const struct ane_h16_hwx_surface *s = &hwx->surfaces[i];
@@ -317,6 +323,26 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 	}
 	if (!seen[0] || seen[1] != 1)
 		return -ENOEXEC;
+	*scratch = (struct ane_h16_process_binding) {};
+	if (hwx->scratch.size) {
+		const u8 *e = g + ANE_H16_GENERIC_HEADER + i * ANE_H16_GENERIC_ENTRY;
+		u32 id = get_unaligned_le32(e + 4);
+		u64 bytes = get_unaligned_le64(e + 0x20);
+
+		if (get_unaligned_le32(e) != 1 || id == 2 || id == 3 ||
+		    id > ANE_H16_GENERIC_ID_MAX || get_unaligned_le32(e + 8) != 0 ||
+		    get_unaligned_le32(e + 0x10) != 1 || bytes < hwx->scratch.size ||
+		    bytes > ALIGN(hwx->scratch.size, SZ_16K))
+			return -ENOEXEC;
+		for (j = 0; j < i; j++)
+			if (bindings[j].index == id)
+				return -ENOEXEC;
+		*scratch = (struct ane_h16_process_binding) {
+			.hwx_vm = hwx->scratch.vm,
+			.index = id,
+			.class = ane_h16_usage_class(1),
+		};
+	}
 	*count = hwx->surface_count;
 	return 0;
 }
@@ -456,13 +482,14 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			   const size_t aux_size[ANE_H16_AUX_COUNT],
 			   struct ane_h16_load_layout *layout)
 {
-	struct ane_h16_process_binding bindings[ANE_H16_SURFACES];
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch;
 	const struct ane_h16_hwx *hwx = &p->hwx;
 	unsigned int i, j, count;
 	int ret;
 
 	ret = ane_h16_process_bindings(hwx, aux[ANE_H16_AUX_GENERIC],
-				       aux_size[ANE_H16_AUX_GENERIC], bindings, &count);
+				       aux_size[ANE_H16_AUX_GENERIC], bindings, &count,
+				       &scratch);
 	if (ret)
 		return ret;
 	for (i = 0; i < p->plan.count; i++) {
@@ -505,6 +532,23 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 		if (!p->surfaces[i])
 			return -EINVAL;
 	}
+	if (hwx->scratch.size) {
+		for (j = 0; j < p->plan.count; j++)
+			if (p->plan.regions[j].kind == ANE_H16_REGION_SCRATCH &&
+			    p->plan.regions[j].vm == scratch.hwx_vm)
+				break;
+		if (j == p->plan.count || !(p->plan.regions[j].permissions & 2) ||
+		    p->regions[j].size < hwx->scratch.size)
+			return -ENOEXEC;
+		p->scratch = (struct ane_h16_execute_buffer) {
+			.index = scratch.index,
+			.class = scratch.class,
+			.mapping_dva = p->regions[j].dva,
+			.mapping_size = p->regions[j].size,
+			.size = hwx->scratch.size,
+		};
+		p->has_scratch = true;
+	}
 	ret = ane_h16_load_slots(hwx, &p->plan, layout, p->slots);
 	if (ret)
 		return ret;
@@ -516,10 +560,12 @@ static const size_t h16_load_sequence[] = {
 };
 
 /*
- * One loaded program per firmware session. On this firmware family the first
- * EXECUTE of a newly loaded program writes into the previous program's output
- * buffer, and a larger output overruns it. A second LOAD is therefore refused
- * even after the first program closed; a reboot starts a new session.
+ * One loaded program at a time per firmware session: a LOAD is refused while
+ * the previous program is still loaded, and accepted once it closed. Its
+ * firmware-visible memory stays mapped until reset. The first EXECUTE after
+ * the engine last ran a different program goes through the firmware's queued
+ * path (see ane_h16_session_execute()), which installs that program's own
+ * BAR context instead of reusing the previous one.
  */
 int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_hwx_snapshot *snapshot,
@@ -538,7 +584,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 		return -EINVAL;
 	if (s->quarantined)
 		return -EIO;
-	if (s->load_claimed)
+	if (s->program && !s->program->closed)
 		return -EBUSY;
 	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
 		if (!aux[i] || aux_size[i] < ANE_H16_AUX_MIN ||
@@ -564,9 +610,10 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	p->snapshot = *snapshot;
 	/*
 	 * From the first mapping on, firmware-visible memory exists that is never
-	 * released before reset, so the single program claim is taken here.
+	 * released before reset, so the program becomes the session's here and
+	 * is never freed.
 	 */
-	s->load_claimed = true;
+	p->generation = ++s->generation;
 	memset(snapshot, 0, sizeof(*snapshot));
 	s->program = p;
 	ret = h16_program_map(s, p, aux, aux_size, &layout);
@@ -684,7 +731,7 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
  */
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
-	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES];
+	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
 	struct ane_h16_pending request = {};
 	struct ane_h16_execute call = {};
 	size_t length, sequence[5], mark;
@@ -708,6 +755,8 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 		return ret;
 	for (i = 0; i < p->resource_count; i++)
 		buffers[i] = p->resources[i].buffer;
+	if (p->has_scratch)
+		buffers[i++] = p->scratch;
 	length = ANE_H16_EXECUTE_BASE_SIZE + p->bar_count * ANE_H16_CUSTOM_BAR_STRIDE;
 	/* Keep room for the teardown pair after this request. */
 	sequence[0] = ANE_H16_GATE_SIZE;
@@ -736,7 +785,14 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 		goto fail;
 	call.key = request.key;
 	call.buffers = buffers;
-	call.buffer_count = p->resource_count;
+	call.buffer_count = p->resource_count + (p->has_scratch ? 1 : 0);
+	/* The engine last ran another program: take the queued path once. */
+	if (s->executed && s->executed != p->generation) {
+		call.flags = ANE_H16_EXECUTE_QUEUED;
+		s->ops->log(s->ctx, "EXECUTE after a program switch, queued", p->key.program,
+			    request.key.uuid);
+	}
+	s->executed = p->generation;
 	call.bars = p->bars;
 	call.bar_count = p->bar_count;
 	ret = ane_h16_execute_encode(command, length, &call);
@@ -770,17 +826,19 @@ fail:
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);
 
-/* TERMINATE then UNLOAD. Mappings and the single-program claim stay. */
+/* TERMINATE then UNLOAD. The mappings stay until reset; a new LOAD may follow. */
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	u8 command[ANE_H16_TERMINATE_SIZE];
 	const u8 *reply;
 	int ret;
 
-	if (!s || !p || s->program != p)
+	if (!s || !p)
 		return -EINVAL;
 	if (p->closed || !p->created)
 		return 0;
+	if (s->program != p)
+		return -EINVAL;
 	p->closed = true;
 	if (s->quarantined)
 		return -EIO;

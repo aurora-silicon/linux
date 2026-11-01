@@ -10,12 +10,16 @@ derives them from the HWX alone:
   0x204) and one 0x30-byte entry per surface in HWX segment order. Each
   entry names its buffer ID, its type (0 input, 1 output), its direction
   (1 input, 2 output) and its size. The output gets ID 4 and the inputs
-  5, 6, ... in segment order. EXECUTE names buffers by these IDs.
+  5, 6, ... in segment order. EXECUTE names buffers by these IDs. A linked
+  program (one with a __DATA,__bss scratch segment) gets one more entry,
+  last: the scratch, with the next ID, input type and direction and the
+  segment size. The kernel owns that buffer; userspace never passes it.
 - operation: one record whose BAR references bind every slot the task
   stream references. A slot takes its base from the program descriptor
   qword at +0x10 * (slot + 1); a surface base binds that surface's buffer
-  ID, the __KERN_0 base binds the kernel resource index 1007, and a zero
-  base (a config-word slot) stays unbound.
+  ID, the scratch base (slot 3 in compiler output) binds the scratch ID,
+  the __KERN_0 base binds the kernel resource index 1007, and a zero base
+  (a config-word slot) stays unbound.
 - procedure: the fixed one-procedure form.
 - text properties: one segment covering the whole __TEXT,__text stream,
   with one block per task.
@@ -67,7 +71,7 @@ def parse(hwx):
     """Surfaces in segment order, the text and kernel sections, the program descriptor."""
     if len(hwx) < 32 or u32(hwx, 0) != 0xbeefface or u32(hwx, 8) != 7:
         raise HwxError("not an H16G HWX")
-    surfaces, text, kernel, descriptor, tensors = [], None, None, None, {}
+    surfaces, text, kernel, descriptor, tensors, scratch = [], None, None, None, {}, None
     pos = 32
     for _ in range(u32(hwx, 16)):
         cmd, size = u32(hwx, pos), u32(hwx, pos + 4)
@@ -89,6 +93,10 @@ def parse(hwx):
                     text = (svm, ssize, soff)
                 elif segment == "__KERN_0" and name == "__kern_0":
                     kernel = (svm, ssize, soff)
+                elif segment == "__DATA" and name == "__bss":
+                    if prot != 3:
+                        raise HwxError("scratch segment is not read/write")
+                    scratch = (svm, ssize)
         elif cmd == 4 and u32(hwx, pos + 8) == 4:
             descriptor = pos
         elif cmd == 4 and u32(hwx, pos + 8) == 3:
@@ -110,7 +118,7 @@ def parse(hwx):
         s["span"] = span
     if sum(s["direction"] == 2 for s in surfaces) != 1:
         raise HwxError("an H16 program has exactly one output")
-    return surfaces, text, kernel, descriptor
+    return surfaces, text, kernel, descriptor, scratch
 
 
 def register_valid(word):
@@ -155,22 +163,27 @@ def walk(stream):
 
 def build(hwx):
     """Return the four sections, in H16_LOAD kind order, and the buffer IDs."""
-    surfaces, (text_vm, text_size, text_off), kernel, descriptor = parse(hwx)
+    surfaces, (text_vm, text_size, text_off), kernel, descriptor, scratch = parse(hwx)
     stream = hwx[text_off:text_off + text_size]
     tasks, slots = walk(stream)
 
     inputs = iter(range(FIRST_OUTPUT_ID + 1, 0x3d))
     for s in surfaces:
         s["id"] = FIRST_OUTPUT_ID if s["direction"] == 2 else next(inputs)
+    entries = [(s["id"], s["direction"], s["allocation"]) for s in surfaces]
+    scratch_id = None
+    if scratch:
+        scratch_id = next(inputs)
+        entries.append((scratch_id, 1, scratch[1]))
 
-    generic = bytearray(GENERIC_HEADER + GENERIC_ENTRY * len(surfaces))
+    generic = bytearray(GENERIC_HEADER + GENERIC_ENTRY * len(entries))
     struct.pack_into("<II", generic, 0, GENERIC_MAGIC, GENERIC_VERSION)
-    struct.pack_into("<I", generic, 0x204, len(surfaces))
-    for k, s in enumerate(surfaces):
+    struct.pack_into("<I", generic, 0x204, len(entries))
+    for k, (ident, direction, size) in enumerate(entries):
         e = GENERIC_HEADER + GENERIC_ENTRY * k
-        struct.pack_into("<III", generic, e, 1, s["id"], s["direction"] - 1)
-        struct.pack_into("<I", generic, e + 0x10, s["direction"])
-        struct.pack_into("<Q", generic, e + 0x20, s["allocation"])
+        struct.pack_into("<III", generic, e, 1, ident, direction - 1)
+        struct.pack_into("<I", generic, e + 0x10, direction)
+        struct.pack_into("<Q", generic, e + 0x20, size)
         struct.pack_into("<I", generic, e + 0x28, 0xffff)
 
     refs = []
@@ -181,6 +194,8 @@ def build(hwx):
         hit = [s["id"] for s in surfaces if s["vm"] == base]
         if hit:
             refs.append((slot, hit[0]))
+        elif scratch and base == scratch[0]:
+            refs.append((slot, scratch_id))
         elif kernel and base == kernel[0]:
             refs.append((slot, RESOURCE_KERNEL))
         else:
@@ -202,7 +217,10 @@ def build(hwx):
     struct.pack_into("<QQQ", properties, 0x10, 0, 0, text_size)
 
     sections = [bytes(generic), bytes(operation), bytes(procedure), bytes(properties)]
-    return sections, {s["name"]: s["id"] for s in surfaces}, refs, tasks
+    ids = {s["name"]: s["id"] for s in surfaces}
+    if scratch:
+        ids["scratch"] = scratch_id
+    return sections, ids, refs, tasks
 
 
 def main():

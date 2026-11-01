@@ -114,7 +114,7 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		ret = ane_h16_session_load(a->session, &snapshot,
 					   (const void *const *)aux, aux_size, &program);
 		if (ret == -EBUSY)
-			drm_err(drm, "H16 one program per firmware boot; reboot required\n");
+			drm_err(drm, "H16 another program is still loaded; close it first\n");
 		if (!ret)
 			f->program = program;
 	}
@@ -270,6 +270,6 @@ int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 	ret = drm_dev_register(&a->drm, 0);
 	if (ret)
 		return ret;
-	drm_info(&a->drm, "H16 accel node ready (ABI 3, one program per firmware boot)\n");
+	drm_info(&a->drm, "H16 accel node ready (ABI 3, one loaded program at a time)\n");
 	return 0;
 }

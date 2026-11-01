@@ -124,7 +124,8 @@ int ane_h16_gate_encode(void *command, size_t length, u32 value);
 int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 			     size_t generic_size,
 			     struct ane_h16_process_binding *bindings,
-			     unsigned int *count);
+			     unsigned int *count,
+			     struct ane_h16_process_binding *scratch);
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
 			struct ane_h16_custom_bar *bars, unsigned int *count);
@@ -149,12 +150,17 @@ struct ane_h16_program {
 	struct ane_h16_custom_bar bars[ANE_H16_MAX_CUSTOM_BARS];
 	unsigned int bar_count;
 	unsigned int resource_count;
+	/* Kernel-owned DRAM scratch of a linked program, sent after the surfaces. */
+	struct ane_h16_execute_buffer scratch;
+	bool has_scratch;
+	/* Session-local identity; firmware program IDs are reused after UNLOAD. */
+	u64 generation;
 	struct ane_h16_request_key key;
 	bool created;
 	bool closed;
 };
 
-/* One program lifetime per firmware session; see ane_h16_session_load(). */
+/* One loaded program at a time per firmware session; see ane_h16_session_load(). */
 struct ane_h16_session {
 	struct ane_fw_transport *transport;
 	const struct ane_h16_session_ops *ops;
@@ -162,9 +168,11 @@ struct ane_h16_session {
 	u64 timeout_ns;
 	struct ane_h16_pending_table pending;
 	struct ane_h16_program *program;
+	/* Generation of the last loaded program, and of the last one executed. */
+	u64 generation;
+	u64 executed;
 	u32 dsid;
 	int error;
-	bool load_claimed;
 	bool quarantined;
 };
 
