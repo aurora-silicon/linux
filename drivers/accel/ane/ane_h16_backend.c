@@ -21,6 +21,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/scatterlist.h>
 #include <linux/timex.h>
 #include <linux/vmalloc.h>
 
@@ -98,6 +99,10 @@ MODULE_PARM_DESC(h16_job_irq, "Diagnostic IRQ completion after startup, default0
 static bool h16_job_trace;
 module_param(h16_job_trace, bool, 0444);
 MODULE_PARM_DESC(h16_job_trace, "Bounded consume-stage RAM timestamps, max256 reports/default0; perturbs timing");
+
+static bool h16_map_batch;
+module_param(h16_map_batch, bool, 0444);
+MODULE_PARM_DESC(h16_map_batch, "Diagnostic private surface DART mapping in one SG transaction, default0");
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
@@ -396,14 +401,35 @@ static int ane_h16_alloc_at(void *ctx, u64 dva, size_t size, struct ane_fw_surfa
 	m->cpu = vmap(m->pages, size / PAGE_SIZE, VM_MAP, PAGE_KERNEL);
 	if (!m->cpu)
 		return -ENOMEM;
-	/* Every backing page was allocated with __GFP_ZERO above. */
-	for (i = 0; i < m->blocks; i++) {
-		ret = iommu_map(h->domain, dva + i * SZ_16K,
-				page_to_phys(m->pages[i * pages_per_block]), SZ_16K,
-				IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, GFP_KERNEL);
+	/* One provider TLB synchronization for the complete surface, retaining
+	 * identical pages/protection/DVA. iommu_map_sgtable rolls back on error.
+	 */
+	if (h16_map_batch) {
+		struct sg_table sgt;
+		ssize_t mapped;
+
+		ret = sg_alloc_table_from_pages(&sgt, m->pages, size / PAGE_SIZE,
+						0, size, GFP_KERNEL);
 		if (ret)
 			return ret;
-		m->mapped += SZ_16K;
+		mapped = iommu_map_sgtable(h->domain, dva, &sgt,
+					  IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
+		sg_free_table(&sgt);
+		if (mapped < 0)
+			return mapped;
+		m->mapped = mapped;
+		if ((size_t)mapped != size)
+			return -EIO;
+	} else {
+		/* Every backing page was allocated with __GFP_ZERO above. */
+		for (i = 0; i < m->blocks; i++) {
+			ret = iommu_map(h->domain, dva + i * SZ_16K,
+					page_to_phys(m->pages[i * pages_per_block]), SZ_16K,
+					IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, GFP_KERNEL);
+			if (ret)
+				return ret;
+			m->mapped += SZ_16K;
+		}
 	}
 	*out = (struct ane_fw_surface) { .cpu = m->cpu, .dva = dva, .size = size };
 	return 0;
@@ -1351,9 +1377,11 @@ static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
 			bytes = get_unaligned_le64(a + 8);
 			if (length - 16 > bytes)
 				return -EINVAL;
+			ns = ktime_get_ns();
 			ret = ane_h16_alloc_at(h, dva, ALIGN(bytes, SZ_16K), &s);
 			if (!ret)
 				memcpy(s.cpu, a + 16, length - 16);
+			ns = ktime_get_ns() - ns;
 			break;
 		}
 		case ANE_H16_JOB_WRITE:
@@ -1371,12 +1399,16 @@ static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
 				ret = -ENOENT;
 				break;
 			}
+			if (op != ANE_H16_JOB_PEEK)
+				ns = ktime_get_ns();
 			if (op == ANE_H16_JOB_WRITE)
 				memcpy(cpu, a + 8, bytes);
 			else if (op == ANE_H16_JOB_FILL)
 				memset(cpu, length >= 20 ? a[16] : 0, bytes);
 			else
 				ret = ane_h16_job_emit(j, op, 0, 0, cpu, bytes);
+			if (op != ANE_H16_JOB_PEEK)
+				ns = ktime_get_ns() - ns;
 			break;
 		}
 		case ANE_H16_JOB_CMD:
