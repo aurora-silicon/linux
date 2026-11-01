@@ -41,6 +41,14 @@ static bool mt_channel_event(struct mt7932 *m, const u8 *body, size_t length)
  * and meanwhile drops any disconnect that isn't from the AP. Nothing else would
  * tell it the connection has gone, so report these as from the AP. iwd ignores
  * the report of a disconnect it asked for either way.
+ *
+ * This works around iwd, not cfg80211. As of iwd 3.12, netdev_reassociate()
+ * sets in_reassoc and only netdev_associate_event() clears it, on
+ * NL80211_CMD_ASSOCIATE, which cfg80211 never sends for a driver that reports
+ * through cfg80211_connect_done(). Every nl80211 listener sees the changed
+ * flag, and wpa_supplicant treats a disconnect from the AP differently from a
+ * local one. Drop roam_landed once iwd clears in_reassoc on a successful
+ * connect event.
  */
 void mt_report_disconnected(struct mt7932 *m, u16 reason, bool local, gfp_t gfp)
 {
