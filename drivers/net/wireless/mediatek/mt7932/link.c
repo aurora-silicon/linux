@@ -842,9 +842,12 @@ report:
 		cfg80211_disconnected(m->netdev, reason, NULL, 0, true, GFP_KERNEL);
 	} else {
 		cfg80211_connect_done(m->netdev, &response, GFP_KERNEL);
-		/* A failed connect result doesn't end the connection it replaced. */
+		/* A failed connect result doesn't end the connection it replaced.
+		 * A cancelled move ends it for the reason the cancel gave.
+		 */
 		if (ret && roam)
-			cfg80211_disconnected(m->netdev, WLAN_REASON_DEAUTH_LEAVING,
+			cfg80211_disconnected(m->netdev,
+					      cancelled ? reason : WLAN_REASON_DEAUTH_LEAVING,
 					      NULL, 0, true, GFP_KERNEL);
 	}
 	if (!ret && !m->connect_open)
