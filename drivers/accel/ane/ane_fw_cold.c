@@ -276,8 +276,14 @@ static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
 	return 0;
 }
 
-static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
-			   int prot, struct ane_fw_surface *s)
+/*
+ * Coherent (uncached) memory for firmware-owned state, or, with cached,
+ * CPU-cacheable memory for program surfaces that the CPU copies to and from
+ * on every request. The engine does not snoop either; cached surfaces are
+ * kept coherent by ane_fw_program_sync() around each use.
+ */
+static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
+			    int prot, bool cached, struct ane_fw_surface *s)
 {
 	struct ane_fw_mapping *m;
 	int ret;
@@ -285,10 +291,21 @@ static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
 	m = kzalloc_obj(*m);
 	if (!m)
 		return -ENOMEM;
-	m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical, GFP_KERNEL);
+	if (cached)
+		m->surface.cpu = dma_alloc_noncoherent(b->memory, size, &m->physical,
+						       DMA_BIDIRECTIONAL, GFP_KERNEL);
+	else
+		m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical,
+						    GFP_KERNEL);
 	if (!m->surface.cpu) {
 		kfree(m);
 		return -ENOMEM;
+	}
+	if (cached) {
+		/* Zero it and write the zeroes back before the engine sees it. */
+		memset(m->surface.cpu, 0, size);
+		dma_sync_single_for_device(b->memory, m->physical, size, DMA_BIDIRECTIONAL);
+		m->surface.handle = m->physical;
 	}
 	m->surface.dva = dva;
 	m->surface.size = size;
@@ -298,6 +315,12 @@ static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
 	if (!ret)
 		*s = m->surface;
 	return ret;
+}
+
+static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
+			   int prot, struct ane_fw_surface *s)
+{
+	return ane_fw_alloc_mem(b, dva, size, prot, false, s);
 }
 
 static int ane_fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
@@ -721,8 +744,8 @@ static int ane_fw_program_map(void *ctx, size_t size, bool write, struct ane_fw_
 	if (!size || !IS_ALIGNED(size, SZ_16K) ||
 	    b->next_dva > ANE_FW_ALLOC_DVA + SZ_512M - size)
 		return -ENOSPC;
-	ret = ane_fw_alloc_at(b, b->next_dva, size,
-			      IOMMU_READ | (write ? IOMMU_WRITE : 0), out);
+	ret = ane_fw_alloc_mem(b, b->next_dva, size,
+			       IOMMU_READ | (write ? IOMMU_WRITE : 0), true, out);
 	if (ret)
 		return ret;
 	b->next_dva += size;
@@ -736,9 +759,21 @@ static void ane_fw_program_log(void *ctx, const char *item, u64 a, u64 c)
 	dev_info(&b->pdev->dev, "H17 %s %llx %llx\n", item, a, c);
 }
 
+/* Program surfaces are cacheable: clean before the engine, invalidate after. */
+static void ane_fw_program_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
+{
+	struct ane_fw_backend *b = ctx;
+
+	if (for_device)
+		dma_sync_single_for_device(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+	else
+		dma_sync_single_for_cpu(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+}
+
 static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.map = ane_fw_program_map,
 	.log = ane_fw_program_log,
+	.sync = ane_fw_program_sync,
 };
 
 /*

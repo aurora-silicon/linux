@@ -544,6 +544,29 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 	return 0;
 }
 
+static void h16_sync(struct ane_h16_session *s, const struct ane_fw_surface *surface,
+		     bool for_device)
+{
+	if (s->ops->sync && surface->handle)
+		s->ops->sync(s->ctx, surface, for_device);
+}
+
+/*
+ * Around each EXECUTE: inputs and the poisoned outputs reach memory before
+ * the doorbell (for_device), and the outputs are read fresh after the
+ * completion report (!for_device). Caller holds the node lock.
+ */
+void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
+			  bool for_device)
+{
+	unsigned int i;
+
+	for (i = 0; i < p->resource_count; i++)
+		if (for_device || p->resources[i].permissions == 2)
+			h16_sync(s, p->surfaces[i], for_device);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_sync);
+
 static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 		   struct ane_fw_surface *out)
 {
@@ -587,6 +610,8 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			return ret;
 		memcpy(p->regions[i].cpu, (const u8 *)p->snapshot.bytes + r->file_offset,
 		       r->file_size);
+		/* Weights, text and the zeroed scratch reach memory before LOAD. */
+		h16_sync(s, &p->regions[i], true);
 		layout->regions[i] = (struct ane_h16_load_mapping) {
 			.dva = p->regions[i].dva,
 			.size = p->regions[i].size,
@@ -599,6 +624,7 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 		if (ret)
 			return ret;
 		memcpy(p->aux[i].cpu, aux[i], aux_size[i]);
+		h16_sync(s, &p->aux[i], true);
 		layout->aux_dva[i] = p->aux[i].dva;
 		layout->aux_size[i] = aux_size[i];
 	}

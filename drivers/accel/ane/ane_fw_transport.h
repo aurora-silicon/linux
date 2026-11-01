@@ -21,6 +21,12 @@ struct ane_fw_surface {
 	void *cpu;
 	u64 dva;
 	size_t size;
+	/*
+	 * Backend handle of a CPU-cacheable surface the device reads and writes
+	 * without snooping, kept coherent through ane_h16_session_ops.sync; 0
+	 * for coherent (uncached) memory.
+	 */
+	u64 handle;
 };
 
 /*

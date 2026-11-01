@@ -152,6 +152,13 @@ struct ane_h16_session_ops {
 	int (*map)(void *ctx, size_t size, bool device_write,
 		   struct ane_fw_surface *surface);
 	void (*log)(void *ctx, const char *item, u64 a, u64 b);
+	/*
+	 * Optional. For a surface with a handle: before the engine uses it
+	 * (for_device) write back CPU writes; after the engine wrote it
+	 * (!for_device) drop stale lines before the CPU reads. Without it,
+	 * or for a surface without a handle, memory is coherent.
+	 */
+	void (*sync)(void *ctx, const struct ane_fw_surface *surface, bool for_device);
 };
 
 struct ane_h16_program {
@@ -257,6 +264,8 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_program **program);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
+void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
+			  bool for_device);
 void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in_ns,
 			     u64 copy_out_ns, u64 ioctl_ns);
 void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats *out,

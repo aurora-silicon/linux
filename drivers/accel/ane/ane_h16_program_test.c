@@ -57,6 +57,10 @@ struct prog_fw {
 	unsigned int execs;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
+	/* Cache maintenance calls, when the fake hands out cached surfaces. */
+	bool cached;
+	unsigned int syncs_device, syncs_cpu;
+	u64 last_sync_dva;
 	/* The EXECUTE failure trace lines, by step. */
 	u64 fail_step, fail_flags, fail_reports, fail_state, fail_other;
 };
@@ -285,6 +289,7 @@ static int fw_map(void *ctx, size_t size, bool write, struct ane_fw_surface *s)
 		.cpu = fw_zalloc(f->test, size),
 		.dva = f->next_dva,
 		.size = size,
+		.handle = f->cached ? f->next_dva : 0,
 	};
 	if (!s->cpu)
 		return -ENOMEM;
@@ -309,9 +314,22 @@ static void fw_log(void *ctx, const char *item, u64 a, u64 b)
 	}
 }
 
+static void fw_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
+{
+	struct prog_fw *f = ctx;
+
+	KUNIT_EXPECT_NE(f->test, s->handle, 0ULL);
+	if (for_device)
+		f->syncs_device++;
+	else
+		f->syncs_cpu++;
+	f->last_sync_dva = s->dva;
+}
+
 static const struct ane_h16_session_ops fw_session_ops = {
 	.map = fw_map,
 	.log = fw_log,
+	.sync = fw_sync,
 };
 
 static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
@@ -1632,7 +1650,45 @@ static void program_h17_no_custom_bar_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
+/*
+ * Cached program surfaces: LOAD writes back every mapping it filled, and
+ * the per-request sync writes back every surface before the engine and
+ * drops the output lines after it. Coherent surfaces (no handle) are never
+ * synced.
+ */
+static void program_cached_sync_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test), *g = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	f->cached = true;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	/* Every HWX region and every aux section, once. */
+	KUNIT_EXPECT_EQ(test, f->syncs_device, p->plan.count + ANE_H16_AUX_COUNT);
+	KUNIT_EXPECT_EQ(test, f->syncs_cpu, 0);
+	f->syncs_device = 0;
+	ane_h16_session_sync(&f->s, p, true);
+	KUNIT_EXPECT_EQ(test, f->syncs_device, p->resource_count);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	ane_h16_session_sync(&f->s, p, false);
+	/* One output: only its lines are dropped. */
+	KUNIT_EXPECT_EQ(test, f->syncs_cpu, 1);
+	KUNIT_EXPECT_EQ(test, f->last_sync_dva, p->surfaces[1]->dva);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+
+	/* Coherent memory: nothing to maintain. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(g, &q), 0);
+	ane_h16_session_sync(&g->s, q, true);
+	ane_h16_session_sync(&g->s, q, false);
+	KUNIT_EXPECT_EQ(test, g->syncs_device + g->syncs_cpu, 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&g->s, q), 0);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_cached_sync_test),
 	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
