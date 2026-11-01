@@ -24,6 +24,7 @@ RUST_HEADER = r'''
 #![allow(dead_code)]
 extern crate self as kernel;
 mod prelude {
+    pub type Error = i32;
     pub type Result<T = ()> = std::result::Result<T, i32>;
     pub const EIO: i32 = -5;
     pub const EAGAIN: i32 = -11;
@@ -36,8 +37,13 @@ mod prelude {
     impl<T> core::ops::Deref for KVec<T> { type Target=[T];fn deref(&self)->&[T] { &self.0 } }
     impl<T> core::ops::DerefMut for KVec<T> { fn deref_mut(&mut self)->&mut [T] { &mut self.0 } }
 }
+mod sync { pub use std::sync::Arc; }
+mod debugfs {
+    pub trait Writer { fn write(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result; }
+}
 mod device {
     pub struct Device;
+    impl Device { pub fn name(&self)->&std::ffi::CStr { std::ffi::CStr::from_bytes_with_nul(b"test.gpu\0").unwrap() } }
     impl AsRef<Device> for Device { fn as_ref(&self) -> &Device { self } }
 }
 mod fmt { pub use std::fmt::*; }
@@ -51,7 +57,7 @@ mod g17 {
     mod trace { pub fn report(_:u8, _:u8, _:&[u32;18]) {} pub fn message(_:u32,_:u64) {} pub const CONTROL:u32=0; }
     mod fw {
         pub mod variant {
-            #[derive(Clone, Copy)]
+            #[derive(Clone, Copy, Debug)]
             pub enum InitGraph { V25G83, G17P }
         }
         pub mod channels {
@@ -109,9 +115,144 @@ mod g17 {
             pub fn publish_control(&self,_:u32,_:&[u8],_:bool,_:u32)->Result { Ok(()) }
         }
     }
+    struct Firmware { rings:channel::Rings }
+    struct State(std::sync::Mutex<Option<Box<Firmware>>>);
+    impl State {
+        fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
+    }
+    struct Variant { graph:fw::variant::InitGraph }
+    struct Shared { state:State, dev:crate::device::Device, variant:Variant }
     mod reports;
 '''
 RUST_TESTS = r'''
+    // Complete V26A428 payloads; unqualified words must never become pstate.
+    const HIST_IDLE:[u32;18]=[0x12,0x0dc6727d,0,8,4,1,0,3,7,0,0,1000,0,0,0,0,0,0];
+    const HIST_ACTIVE:[u32;18]=[0x12,0x0003c9f5,0,10,0,1,0,3,9,0,0,1000,0,0,0,0,0,0];
+    const HIST_OTHER:[u32;18]=[0x11,0x04952a22,0,0x85498734,0,1,0,9,10,0,0,1000,0,0,0,0,0,0];
+    const TRANSITION:[u32;18]=[0x1a,0xf93dc8f2,0,1,0,1,0,3,9,0,0,1000,0,0,0,0,0,0];
+
+    fn report(rings:&channel::Rings)->String {
+        struct View<'a>(&'a channel::Rings);
+        impl std::fmt::Display for View<'_> {
+            fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { self.0.write_reports(f) }
+        }
+        format!("{}",View(rings))
+    }
+
+    #[test]
+    fn captured_histograms_are_preserved_without_inventing_pstate() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(graph).unwrap();
+            for words in [HIST_IDLE,HIST_ACTIVE,HIST_OTHER,TRANSITION] {
+                init.push(Secondary,words);
+                rings.drain_statistics(&dev,&init,Secondary);
+                assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+                assert!(report(&rings).contains(&format!("words={:08x?}",words)));
+            }
+        }
+    }
+
+    #[test]
+    fn power_cutoff_discards_only_the_old_prefix_per_role_including_wrap() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        for start in [0,5,7] {
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(InitGraph::G17P).unwrap();
+            for &role in &[Primary,Secondary] {
+                for cursor in &init.cursors[role as usize] { cursor.store(start,Ordering::Relaxed); }
+                for words in [HIST_OTHER,HIST_ACTIVE,TRANSITION] { init.push(role,words); }
+            }
+            rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+            for &role in &[Primary,Secondary] {
+                for words in [HIST_OTHER,HIST_ACTIVE,TRANSITION] { init.push(role,words); }
+                rings.drain_statistics(&dev,&init,role);
+            }
+            let text=report(&rings);
+            for role in [0,1] { for tag in [0x11,0x12,0x1a] {
+                let line=text.lines().find(|line|line.starts_with(&format!("role={} tag={:#x} ",role,tag))).unwrap();
+                assert!(line.contains("count=2 host_ns=1 admitted=1 last_admitted=true"),"{}",line);
+            } }
+            assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+        }
+    }
+
+    #[test]
+    fn empty_boundary_keeps_new_qualified_records_but_late_wake_is_conservative() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
+        let pstate=[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0];
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        init.push(Primary,util);
+        init.push(Secondary,pstate);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate),(telemetry::VALID,97,telemetry::VALID,6));
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,1);
+        init.push(Primary,util);
+        init.push(Secondary,pstate);
+        // A wake seen after records arrived cannot prove which side they belong to.
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::STALE));
+        init.push(Primary,util);
+        init.push(Secondary,pstate);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+    }
+
+    #[test]
+    fn off_drains_and_invalid_boundary_producers_never_admit_live_data() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,0);
+        init.push(Secondary,HIST_IDLE);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert!(report(&rings).contains("admitted=0 last_admitted=false"));
+        init.cursors[1][1].store(fw::channels::STATISTICS_SLOTS,Ordering::Relaxed);
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        init.cursors[1][1].store(1,Ordering::Relaxed);
+        init.push(Primary,[0x13,0,0,100,100,0,100,0,0,0,0,0,0,0,0,0,0,0]);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).util_status,telemetry::UNAVAILABLE);
+        assert!(report(&rings).contains("quarantine=[[false, false], [false, true]]"));
+    }
+
+    #[test]
+    fn debugfs_reads_do_not_change_pending_cutoffs_or_admission() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let graph=InitGraph::G17P;
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(graph).unwrap();
+        init.push(Secondary,HIST_IDLE);
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
+        init.push(Secondary,HIST_ACTIVE);
+        let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware { rings })))),dev,variant:Variant { graph } });
+        let view=reports::View(shared.clone());
+        struct View<'a>(&'a reports::View);
+        impl std::fmt::Display for View<'_> {
+            fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { crate::debugfs::Writer::write(self.0,f) }
+        }
+        let before=format!("{}",View(&view));
+        for _ in 0..10 { assert_eq!(format!("{}",View(&view)),before); }
+        let mut state=shared.state.lock();
+        let firmware=state.as_mut().unwrap();
+        firmware.rings.drain_statistics(&shared.dev,&init,Secondary);
+        assert!(report(&firmware.rings).contains("admitted=1 last_admitted=true"));
+    }
     #[test]
     fn roles_merge_and_any_statistics_quarantine_disables_both() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
@@ -150,13 +291,14 @@ RUST_TESTS = r'''
             init.push(Primary,words); // Unread at the epoch boundary.
             match boundary {
                 0=> { rings.suspend_statistics(true); rings.drain_statistics(&dev,&init,Primary); rings.suspend_statistics(false); init.push(Primary,words); }
-                1=>rings.observe_statistics_power(false,0),
-                2=>rings.observe_statistics_power(true,1), // Wake observed by a fast publisher.
+                1=>rings.observe_statistics_power(&dev,&init,&[Primary],false,0),
+                2=>rings.observe_statistics_power(&dev,&init,&[Primary],true,1), // Wake observed by a fast publisher.
                 _=>rings.invalidate_statistics(), // Restart handshake.
             }
             assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
             rings.drain_statistics(&dev,&init,Primary);
             assert_eq!(rings.read_statistics(1).util_status,telemetry::STALE);
+            rings.observe_statistics_power(&dev,&init,&[Primary],true,u64::from(boundary >= 2));
             init.push(Primary,words);
             rings.drain_statistics(&dev,&init,Primary);
             assert_eq!(rings.read_statistics(1).util_status,telemetry::VALID);
@@ -316,7 +458,7 @@ def main():
     ap.add_argument('--baseline', default='ebcf9cb777a434867e9d880892ee2b46887728bb',
                     help='revision containing the legacy formatter')
     ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age',
-                                           'quarantine', 'epoch', 'legacy-format'])
+                                           'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'])
     args = ap.parse_args()
     work = args.out or Path(tempfile.mkdtemp(prefix='asahi-g17-telemetry-'))
     work.mkdir(parents=True, exist_ok=True)
@@ -329,7 +471,13 @@ def main():
     reports = (DRIVER / 'g17/reports.rs').read_text()
     store = reports.split('/// The view owns the session')[0]
     tests = reports.split('#[kernel::macros::kunit_tests(asahi_g17_reports)]')[1]
-    reports = '\n'.join(line for line in store.splitlines() if not line.startswith('//!')) + tests
+    view = reports[reports.index('/// The view owns the session'):reports.index('fn write_power(')]
+    power_stub = '''
+fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::fmt::Result {
+    writeln!(f,"power fixture")
+}
+'''
+    reports = '\n'.join(line for line in store.splitlines() if not line.startswith('//!')) + view + power_stub + tests
     (work / 'reports.rs').write_text(reports)
     telemetry = (DRIVER / 'g17/telemetry.rs').read_text()
     changes = {
@@ -340,10 +488,12 @@ def main():
         'age': ('now_ns - received >= max_age_ns', 'now_ns - received > max_age_ns'),
         'quarantine': ('.any(|rings| rings[ReportRing::Statistics as usize])', '.any(|_| false)'),
         'epoch': ('self.discard_statistics = [true; 2]', 'self.discard_statistics = [false; 2]'),
+        'cutoff': ('accept_statistics && statistics_cutoff.is_none()', 'accept_statistics'),
+        'whole-batch': ('            self.telemetry.invalidate();', '            self.invalidate_statistics();'),
     }
     if args.mutation in changes:
         before, after = changes[args.mutation]
-        if args.mutation in ('quarantine', 'epoch'):
+        if args.mutation in ('quarantine', 'epoch', 'cutoff', 'whole-batch'):
             assert before in channel
             channel = channel.replace(before, after, 1)
             (work / 'channel.rs').write_text(channel)

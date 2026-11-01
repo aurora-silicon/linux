@@ -733,14 +733,16 @@ impl Firmware {
         Ok(())
     }
 
-    /// Returns the delay in ns for a follow-up idle check. Queue owners report only submitted,
-    /// unretired work; quarantined work retaining mappings is excluded. Submissions published
-    /// without the device mutex count as activity, and a clear that races one is abandoned.
+    /// Observe a telemetry epoch boundary without changing GPU power policy.
     fn observe_statistics_power(&mut self) {
         if self.rings.statistics_suspended() {
             return;
         }
+        let roles = self.roles();
         self.rings.observe_statistics_power(
+            &self.primary.state.shared.dev,
+            &self.init,
+            roles,
             self.bridge.regs.g17_core_power() & 0xf != 0,
             self.port.statistics_epoch(),
         );

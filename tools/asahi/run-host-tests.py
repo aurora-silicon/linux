@@ -100,7 +100,7 @@ ASAHI_TESTS = {
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
     'g17-telemetry-integration-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('fields', 'range', 'timestamp', 'age',
-                                   'quarantine', 'epoch', 'legacy-format'), out()),
+                                   'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],

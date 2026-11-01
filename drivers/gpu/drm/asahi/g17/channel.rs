@@ -51,6 +51,8 @@ pub(crate) struct Rings {
     suspended: bool,
     discard_statistics: [bool; 2],
     statistics_epoch: u64,
+    statistics_powered: bool,
+    statistics_cutoff: [Option<u32>; 2],
 }
 
 impl Rings {
@@ -63,6 +65,8 @@ impl Rings {
             suspended: false,
             discard_statistics: [false; 2],
             statistics_epoch: 0,
+            statistics_powered: true,
+            statistics_cutoff: [None; 2],
         })
     }
 
@@ -71,6 +75,7 @@ impl Rings {
         // The packets have no epoch marker. Discard each role's already
         // queued records before accepting a new baseline after the boundary.
         self.discard_statistics = [true; 2];
+        self.statistics_cutoff = [None; 2];
     }
 
     pub(super) fn suspend_statistics(&mut self, suspended: bool) {
@@ -82,10 +87,41 @@ impl Rings {
         self.suspended
     }
 
-    pub(super) fn observe_statistics_power(&mut self, powered: bool, epoch: u64) {
-        if !powered || epoch != self.statistics_epoch {
-            self.invalidate_statistics();
+    pub(super) fn observe_statistics_power(
+        &mut self,
+        dev: &Device,
+        init: &InitData,
+        roles: &[Role],
+        powered: bool,
+        epoch: u64,
+    ) {
+        if !powered || !self.statistics_powered || epoch != self.statistics_epoch {
+            self.telemetry.invalidate();
+            // End the queued prefix *now*, not at the next drain. A boolean
+            // discard-next-batch also throws away records produced after this
+            // observation, even if the queue was empty at the boundary.
+            for &role in roles {
+                if self.quarantined[role as usize][ReportRing::Statistics as usize] {
+                    continue;
+                }
+                let cutoff = (|| {
+                    let state = status::STATS_STATE as usize;
+                    let producer = init
+                        .status_word(role, state + RX_PRODUCER_OFFSET)?
+                        .load(Ordering::Relaxed);
+                    fence(Ordering::Acquire);
+                    if producer >= STATISTICS_SLOTS {
+                        return Err(EIO);
+                    }
+                    Ok(producer)
+                })();
+                match cutoff {
+                    Ok(producer) => self.statistics_cutoff[role as usize] = Some(producer),
+                    Err(error) => self.stop_report(dev, role, ReportRing::Statistics, error),
+                }
+            }
         }
+        self.statistics_powered = powered;
         self.statistics_epoch = epoch;
     }
 
@@ -97,8 +133,9 @@ impl Rings {
         self.reports.write(f)?;
         writeln!(
             f,
-            "admission suspended={} discard_queued={:?} quarantine={:?} power_epoch={}",
-            self.suspended, self.discard_statistics, self.quarantined, self.statistics_epoch
+            "admission suspended={} discard_queued={:?} quarantine={:?} power_epoch={} powered={} cutoff={:?}",
+            self.suspended, self.discard_statistics, self.quarantined, self.statistics_epoch,
+            self.statistics_powered, self.statistics_cutoff
         )?;
         let view = self.read_statistics(super::now_ns());
         writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={} pstate={}",
@@ -121,6 +158,7 @@ impl Rings {
         }
         let statistics = matches!(ring, ReportRing::Statistics);
         let accept = !self.suspended
+            && self.statistics_powered
             && !self.discard_statistics[role as usize]
             && !self
                 .quarantined
@@ -134,21 +172,26 @@ impl Rings {
             &mut self.telemetry,
             self.max_age_ns,
             accept,
+            &mut self.statistics_cutoff[role as usize],
         ) {
-            self.quarantined[role as usize][ring as usize] = true;
-            if statistics {
-                self.invalidate_statistics();
-            }
-            dev_err!(
-                dev.as_ref(),
-                "G17 {:?} {:?} ring stopped: {:?}\n",
-                role,
-                ring,
-                error
-            );
+            self.stop_report(dev, role, ring, error);
         } else if statistics && !self.suspended {
             self.discard_statistics[role as usize] = false;
         }
+    }
+
+    fn stop_report(&mut self, dev: &Device, role: Role, ring: ReportRing, error: Error) {
+        self.quarantined[role as usize][ring as usize] = true;
+        if matches!(ring, ReportRing::Statistics) {
+            self.invalidate_statistics();
+        }
+        dev_err!(
+            dev.as_ref(),
+            "G17 {:?} {:?} ring stopped: {:?}\n",
+            role,
+            ring,
+            error
+        );
     }
 
     fn consume_report(
@@ -159,6 +202,7 @@ impl Rings {
         telemetry: &mut super::telemetry::Telemetry,
         max_age_ns: u64,
         accept_statistics: bool,
+        statistics_cutoff: &mut Option<u32>,
     ) -> Result {
         let (state, entries, capacity, allowed_types) = ring.geometry();
         let consumer_word = init.status_word(role, state)?;
@@ -172,6 +216,9 @@ impl Rings {
             return Err(EIO);
         }
         while consumer != producer {
+            if matches!(ring, ReportRing::Statistics) && *statistics_cutoff == Some(consumer) {
+                *statistics_cutoff = None;
+            }
             let offset = entries + consumer as usize * EVENT_RECORD_SIZE;
             // Decode only the complete copy, before returning the slot.
             // Statistics never affect scheduling or power control.
@@ -183,8 +230,9 @@ impl Rings {
             }
             if matches!(ring, ReportRing::Statistics) {
                 let host_ns = super::now_ns();
-                reports.record(role, words, host_ns, accept_statistics);
-                if accept_statistics {
+                let admitted = accept_statistics && statistics_cutoff.is_none();
+                reports.record(role, words, host_ns, admitted);
+                if admitted {
                     telemetry.record(&words, host_ns, max_age_ns);
                 }
             }
@@ -196,6 +244,9 @@ impl Rings {
             }
         }
         if matches!(ring, ReportRing::Statistics) {
+            if *statistics_cutoff == Some(consumer) {
+                *statistics_cutoff = None;
+            }
             fence(Ordering::SeqCst);
         }
         Ok(())

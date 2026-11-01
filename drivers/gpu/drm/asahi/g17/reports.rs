@@ -84,11 +84,10 @@ pub(super) struct View(pub(super) kernel::sync::Arc<super::Shared>);
 
 impl kernel::debugfs::Writer for View {
     fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        let mut state = self.0.state.lock();
-        let Some(firmware) = state.as_deref_mut() else {
+        let state = self.0.state.lock();
+        let Some(firmware) = state.as_deref() else {
             return writeln!(f, "online=0");
         };
-        firmware.observe_statistics_power();
         writeln!(
             f,
             "online=1 device={} graph={:?} sampled_ns={}",
