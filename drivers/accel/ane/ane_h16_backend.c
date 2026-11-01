@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
@@ -439,16 +440,23 @@ static u64 ane_h16_now(void *ctx)
 	return ktime_get_ns();
 }
 
-static void ane_h16_relax(void *ctx)
+/*
+ * The channel IRQ stays masked, so every wait polls. Sleep in short steps
+ * first (see ane_fw_poll_sleep_us()): a fixed 1 ms sleep made each of the
+ * four waits of an EXECUTE cost at least a millisecond.
+ */
+static void ane_h16_relax(void *ctx, u64 waited_ns)
 {
 	struct ane_h16_device *h = ctx;
+	unsigned int min_us, max_us;
 	int ret;
 
 	ane_h16_mailbox(h);
 	ret = ane_h16_faults(&h->boot, false);
 	if (ret)
 		ane_fw_transport_fail(&h->boot.transport, ret);
-	usleep_range(1000, 1050);
+	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
+	usleep_range(min_us, max_us);
 }
 
 static int ane_h16_alloc_shared(void *ctx, size_t size, u32 tag, struct ane_fw_surface *out)
@@ -863,6 +871,83 @@ static const struct file_operations ane_h16_stage_fops = {
 	.llseek = default_llseek,
 };
 
+static void ane_h16_us(struct seq_file *m, u64 ns)
+{
+	seq_printf(m, " %9llu.%u", div_u64(ns, 1000), (unsigned int)(div_u64(ns, 100) % 10));
+}
+
+/*
+ * <debugfs>/ane-h16/<dev>/execute: where the time of the successful EXECUTEs
+ * since the last reset went, per phase in microseconds (last, mean, min,
+ * max), and the poll sleeps per request. Writing anything resets it.
+ */
+static int ane_h16_execute_show(struct seq_file *m, void *v)
+{
+	struct ane_h16_device *h = m->private;
+	struct ane_h16_exec_stats *st;
+	unsigned int i;
+
+	mutex_lock(&ane_h16_lock);
+	if (!h->program_ready) {
+		mutex_unlock(&ane_h16_lock);
+		seq_puts(m, "executes 0 (program stage not reached)\n");
+		return 0;
+	}
+	mutex_unlock(&ane_h16_lock);
+	/* program_ready never goes back, and the session outlives this file. */
+	st = kmalloc_obj(*st);
+	if (!st)
+		return -ENOMEM;
+	ane_h16_session_stats(&h->session, st, false);
+	seq_printf(m, "executes %llu\n", st->count);
+	if (st->count) {
+		seq_printf(m, "%-12s %11s %11s %11s %11s\n", "phase", "last_us", "mean_us",
+			   "min_us", "max_us");
+		for (i = 0; i < ANE_H16_T_PHASES; i++) {
+			seq_printf(m, "%-12s", ane_h16_exec_phase_names[i]);
+			ane_h16_us(m, st->last.ns[i]);
+			ane_h16_us(m, div64_u64(st->sum.ns[i], st->count));
+			ane_h16_us(m, st->min.ns[i]);
+			ane_h16_us(m, st->max.ns[i]);
+			seq_putc(m, '\n');
+		}
+		seq_printf(m, "%-12s %11llu %9llu.%u %11llu %11llu\n", "polls", st->last.polls,
+			   div64_u64(st->sum.polls, st->count),
+			   (unsigned int)(div64_u64(st->sum.polls * 10, st->count) % 10),
+			   st->min.polls, st->max.polls);
+	}
+	kfree(st);
+	return 0;
+}
+
+static int ane_h16_execute_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ane_h16_execute_show, inode->i_private);
+}
+
+static ssize_t ane_h16_execute_write(struct file *file, const char __user *ubuf,
+				     size_t count, loff_t *ppos)
+{
+	struct ane_h16_device *h = ((struct seq_file *)file->private_data)->private;
+	bool ready;
+
+	mutex_lock(&ane_h16_lock);
+	ready = h->program_ready;
+	mutex_unlock(&ane_h16_lock);
+	if (ready)
+		ane_h16_session_stats(&h->session, NULL, true);
+	return count;
+}
+
+static const struct file_operations ane_h16_execute_fops = {
+	.owner = THIS_MODULE,
+	.open = ane_h16_execute_open,
+	.read = seq_read,
+	.write = ane_h16_execute_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
 	struct ane_h16_device *h;
@@ -906,6 +991,7 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 		ane_h16_debugfs = debugfs_create_dir("ane-h16", NULL);
 	h->debugfs = debugfs_create_dir(dev_name(h->dev), ane_h16_debugfs);
 	debugfs_create_file("stage", 0600, h->debugfs, h, &ane_h16_stage_fops);
+	debugfs_create_file("execute", 0600, h->debugfs, h, &ane_h16_execute_fops);
 	platform_set_drvdata(pdev, h);
 	INIT_WORK(&h->start, ane_h16_start_work);
 	schedule_work(&h->start);

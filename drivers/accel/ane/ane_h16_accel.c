@@ -5,6 +5,7 @@
  * kernel mappings; userspace passes the original HWX, the host-built sections
  * and plain input/output buffers, never DVAs, firmware IDs or commands.
  */
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -146,6 +147,7 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	struct drm_ane_h16_exec *args = data;
 	struct drm_ane_h16_buffer buffers[ANE_H16_SURFACES];
 	struct ane_h16_program *p;
+	u64 start, locked, copied, done;
 	unsigned int i;
 	int ret = 0;
 
@@ -154,7 +156,9 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	if (copy_from_user(buffers, u64_to_user_ptr(args->buffers_ptr),
 			   array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
+	start = ktime_get_ns();
 	mutex_lock(&a->lock);
+	locked = ktime_get_ns();
 	p = f->program;
 	if (!p || p->closed || args->count != p->resource_count) {
 		ret = -EINVAL;
@@ -179,14 +183,37 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			memset(cpu, 0xff, buffers[i].size);
 		}
 	}
+	copied = ktime_get_ns();
 	ret = ane_h16_session_execute(a->session, p);
 	if (ret)
 		goto unlock;
+	done = ktime_get_ns();
 	for (i = 0; i < args->count; i++)
 		if (p->resources[i].permissions == 2 &&
 		    copy_to_user(u64_to_user_ptr(buffers[i].ptr), p->surfaces[i]->cpu,
 				 buffers[i].size))
 			ret = -EFAULT;
+	if (!ret) {
+		u64 end = ktime_get_ns();
+		const u64 *ns = a->session->timing.ns;
+
+		ane_h16_session_account(a->session, locked - start, copied - locked, end - done,
+					end - start);
+		drm_dbg_driver(drm,
+			       "EXECUTE us: lock %llu in %llu prep %llu open %llu ack %llu report %llu done %llu close %llu fin %llu out %llu fw %llu all %llu polls %llu\n",
+			       div_u64(locked - start, 1000),
+			       div_u64(copied - locked, 1000),
+			       div_u64(ns[ANE_H16_T_PREPARE], 1000),
+			       div_u64(ns[ANE_H16_T_GATE_OPEN], 1000),
+			       div_u64(ns[ANE_H16_T_SUBMIT_ACK], 1000),
+			       div_u64(ns[ANE_H16_T_ACK_REPORT], 1000),
+			       div_u64(ns[ANE_H16_T_REPORT_DONE], 1000),
+			       div_u64(ns[ANE_H16_T_GATE_CLOSE], 1000),
+			       div_u64(ns[ANE_H16_T_FINISH], 1000),
+			       div_u64(end - done, 1000),
+			       div_u64(ns[ANE_H16_T_FIRMWARE], 1000),
+			       div_u64(end - start, 1000), a->session->timing.polls);
+	}
 unlock:
 	mutex_unlock(&a->lock);
 	return ret;
