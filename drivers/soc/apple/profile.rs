@@ -613,9 +613,10 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     if machine_has(b"apple,t8122") && (machine_has(b"apple,j613") || machine_has(b"apple,j615")) {
         return Ok(&T8122);
     }
-    // Only the board whose ADT was read: J616s. The other T6040 Macs share
-    // the SoC but their sensor wiring is unchecked.
-    if machine_has(b"apple,t6040") && machine_has(b"apple,j616s") {
+    // The T6040 profile is tested on J614s and J616s.
+    if machine_has(b"apple,t6040")
+        && (machine_has(b"apple,j616s") || machine_has(b"apple,j614s"))
+    {
         return Ok(&T6040);
     }
     Err(ENODEV)

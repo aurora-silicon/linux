@@ -94,6 +94,7 @@ dtb-$(CONFIG_ARCH_APPLE) += t6031-j516c.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6032-j575d.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6034-j514m.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6034-j516m.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t6040-j614s.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6040-j616s.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t6040-j616s-tether.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8112-j413.dtb

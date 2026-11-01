@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch, M4 Pro)
+ *
+ * target-type: J614s
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6040.dtsi"
+#include "t604x-j614-j616.dtsi"
+
+/ {
+	compatible = "apple,j614s", "apple,t6040", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M4 Pro)";
+};
+
+/* ADT /arm-io/wlan module-instance */
+&wifi0 {
+	brcm,board-type = "apple,mriya";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,mriya";
+};
+
+&panel {
+	compatible = "apple,panel-j614", "apple,panel-mini-led", "apple,panel";
+	width-mm = <302>;
+	height-mm = <196>;
+	adj-height-mm = <189>;
+};
+
+&aop_audio {
+	apple,chassis-name = "J614";
+};
+
+&sound {
+	compatible = "apple,j614-macaudio", "apple,macaudio";
+	model = "MacBook Pro J614";
+};
+
+&sound_jack {
+	compatible = "apple,j614-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J614 Jack";
+};
+
+&mtp_mt {
+	firmware-name = "apple/tpmtfw-j614s.bin";
+};
+
+/*
+ * Per-device factory data from this Mac's own iBoot system container: the
+ * sealed calibration and the sealed root key.
+ */
+&mesa {
+	firmware-name = "apple/mesacal-j614s.bin", "apple/msrk-j614s.bin";
+};
+
+/*
+ * The GL9755 SD reader. Its supply is the SMC's gP19 output, which the
+ * J614s firmware describes as active high. Both CLKREQ pins go on the
+ * controller so that the Wi-Fi and SD ports do not claim the same pins.
+ */
+&apcie1_dart {
+	status = "okay";
+};
+
+&pcie0 {
+	bus-range = <0 2>;
+	pinctrl-0 = <&wifi_clkreq_pins &sd_clkreq_pins>;
+};
+
+&port01 {
+	/delete-property/ pinctrl-0;
+	/delete-property/ pinctrl-names;
+	bus-range = <2 2>;
+	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+
+	mmc@0,0 {
+		compatible = "pci17a0,9755";
+		reg = <0x20000 0 0 0 0>;
+		cd-inverted;
+		wp-inverted;
+	};
+};

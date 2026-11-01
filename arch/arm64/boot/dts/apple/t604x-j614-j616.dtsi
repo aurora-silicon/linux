@@ -1,0 +1,4765 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14/16-inch, M4 Pro)
+ *
+ * This file contains the parts common to the J614s and J616s. Apple's
+ * device trees for the two boards differ only in the panel, the speaker
+ * tuning, the Wi-Fi module, the trackpad and the power limits; the board
+ * files set those.
+ *
+ * target-type: J614s / J616s
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
+
+/ {
+	chassis-type = "laptop";
+
+	aliases {
+		keyboard = &keyboard;
+		nvram = &nvram;
+		spi0 = &qspi;
+		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
+		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
+		/* used by the loader to hand over the display */
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		/* the boot loader finds the GPU node through this alias */
+		gpu = &gpu;
+		pmp = &pmp;
+		/* the boot loader reserves the SEP firmware through this alias */
+		sep = &sep;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* The loader adds its own reservations */
+
+		/*
+		 * The loader must fill reg from ane0 segment-ranges, rename each
+		 * node to match its physical address and enable it. Leave these
+		 * disabled until then; allocating replacement memory would lose
+		 * the personalized preload. TEXT is 0xc0000 bytes and DATA is
+		 * 0x2ac000 bytes. Neither segment may be reclaimed before reboot.
+		 */
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		/*
+		 * iBoot loads the ISP firmware below the kernel's memory. Its
+		 * segments are the ADT's isp0 segment-ranges (macOS 26.6.2,
+		 * iBoot mBoot-18000.161.10), mapped where the firmware runs them:
+		 * 0x100_0000_0000 onwards, its 32 MiB main memory. The driver
+		 * checks that the coprocessor's reset vector is this text before
+		 * it starts the firmware.
+		 */
+		isp_fw_text: isp-firmware-text@10000c44000 {
+			reg = <0x100 0x00c44000 0x0 0xca8000>;
+			iommu-addresses = <&isp 0x100 0x0 0x0 0xca8000>;
+			no-map;
+		};
+
+		isp_fw_data: isp-firmware-data@10001e7c000 {
+			reg = <0x100 0x01e7c000 0x0 0x1344000>;
+			iommu-addresses = <&isp 0x100 0xca8000 0x0 0x1344000>;
+			no-map;
+		};
+
+		/* the firmware's main memory, the driver allocates above it */
+		isp_heap: isp-heap {
+			iommu-addresses = <&isp 0x100 0x0 0x0 0x2000000>;
+		};
+
+		/*
+		 * Text segment of the loaded GPU firmware (ADT gfx-asc
+		 * segment-ranges[0]); the driver identifies the build from it.
+		 */
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			status = "disabled";
+			no-map;
+		};
+
+		/*
+		 * Data segment of the loaded GPU firmware (ADT sgx gfx-data-*); it
+		 * places its crash log here.
+		 */
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			status = "disabled";
+			no-map;
+		};
+
+		/*
+		 * The UAT ranges (ADT sgx gpu-region-*, gfx-shared-region-*,
+		 * gfx-shared-l2-region-*, gfx-handoff-*). They stay no-map until
+		 * the boot loader adds them to /memory.
+		 */
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			status = "disabled";
+			no-map;
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
+			no-map;
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			status = "disabled";
+			no-map;
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			status = "disabled";
+			no-map;
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* To be filled by loader */
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "apple::kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+		};
+	};
+
+	/*
+	 * GPU performance states, one opp-microvolt cell per cluster (ADT
+	 * /arm-io/sgx perf-states and perf-states1). The operating points are
+	 * binned per device: the loader fills these placeholders.
+	 * The driver requires a completed calibration handoff. Entries keep the
+	 * order of the GPU performance states, which is not sorted by frequency.
+	 */
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0>;
+		};
+	};
+
+	/* The GPU's CS clock domain (ADT cs-perf-states) */
+	gpu_cs_opp: opp-table-gpucs {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	/* The GPU's AFR clock domain (ADT afr-perf-states) */
+	gpu_afr_opp: opp-table-gpuafr {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	/*
+	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
+	 * smc_hwmon. The PMP's fast die-temperature limit regulates: its loop
+	 * holds its own hot-spot sensors at 110 C (ADT fast-die-ctrl-loop),
+	 * and under a sustained all-core load TCMz then settles at 113.4 to
+	 * 114.7 C with the fans running. This zone is the backstop above that:
+	 * passive at 116 C, critical (orderly shutdown) at 118 C, polled once a
+	 * second as the SMC refreshes TCMz. The cpufreq cooling device sits on a
+	 * cluster's policy CPU, so each map lists every CPU of its cluster.
+	 *
+	 * Per-cluster and GPU zones follow, one per SMC die-maximum sensor
+	 * (smc_hwmon channels 1-23, in the order of the temperature nodes
+	 * below): Tex0-3 throttle the E cluster, Tpx0-5 the first P cluster
+	 * and Tpx8-D the second, with the same 116/118 C backstop as TCMz.
+	 * Unlike the fanless J700, this machine has two SMC-driven fans and
+	 * the PMP regulates the dies itself, so these zones only catch a
+	 * failure of that loop; they never act in normal use.
+	 *
+	 * The GPU has no cooling device of its own: its firmware sets the GPU
+	 * performance state and starts limiting at 101 C. So when a GPU die
+	 * sensor reaches the GPU firmware's limit, the seven
+	 * hottest ones (Tg05, Tg0S, Tg0Y, Tg0k, Tg0z, Tg1V, Tg1l) also shed
+	 * CPU power through the CPU clusters, from the same 101 C, leaving the
+	 * shared heat budget to the GPU. They shut down at 118 C. While the
+	 * GPU is powered off its sensors report placeholder values from -4 to
+	 * 4 C.
+	 *
+	 * The fans: left to themselves (SMC mode 3, with no OS asking for
+	 * cooling) they stay off, or switch on late and ramp slowly, while the
+	 * dies heat up under load. So the CPU die zone and the GPU zones also
+	 * run both fans through a ladder of active trips; a fan takes the
+	 * highest state any zone asks for and goes back to the SMC once no
+	 * zone asks for anything. States 1-8 of a fan run it from its minimum
+	 * (1350 rpm) to its maximum (5777 rpm) in even steps.
+	 *
+	 * sustainable-power is what the CPUs dissipate with the die held at
+	 * its operating point: 720 s of all-core load (10 P, 4 E busy loops),
+	 * headless, SMC fans in their own mode. Over the last 600 s TCMz held
+	 * 112.0 to 113.8 C with the PMP limiting the P clusters to a mean of
+	 * about 3.7 GHz and the fans at 3450/3730 rpm (where macOS settles
+	 * too). The SMC core rails then read P0 25.3 W, P1 23.9 W and E 2.1 W
+	 * on average, the units of the energy model. Each zone gets the sum
+	 * over the clusters it throttles. Without it the power allocator
+	 * estimates a budget from the cooling devices' lowest states, which
+	 * throttles far below what this machine sustains.
+	 *
+	 * All of these values were measured on the J616s. The J614s inherits
+	 * them until it is measured: Apple's package power limits for it are
+	 * about 78% (CPU) and 90% (GPU) of the J616s ones, so its budgets are
+	 * generous here, but these zones are a backstop behind the PMP.
+	 */
+#define J616S_FAN_TRIP(label, node, temp, hyst)	\
+	label: node {					\
+		temperature = <temp>;			\
+		hysteresis = <hyst>;			\
+		type = "active";			\
+	};
+
+#define J616S_FAN_TRIPS(zone)					\
+	J616S_FAN_TRIP(zone##_fan1, trip-fan1, 75000, 10000)	\
+	J616S_FAN_TRIP(zone##_fan2, trip-fan2, 80000, 5000)	\
+	J616S_FAN_TRIP(zone##_fan3, trip-fan3, 85000, 5000)	\
+	J616S_FAN_TRIP(zone##_fan4, trip-fan4, 90000, 5000)	\
+	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 95000, 5000)
+
+#define J616S_FAN_MAP(trip_label, node, state)			\
+	node {							\
+		trip = <&trip_label>;				\
+		cooling-device = <&smc_hwmon 0 state state>,	\
+				 <&smc_hwmon 1 state state>;	\
+	};
+
+#define J616S_FAN_MAPS(zone)				\
+	J616S_FAN_MAP(zone##_fan1, map-fan1, 1)		\
+	J616S_FAN_MAP(zone##_fan2, map-fan2, 2)		\
+	J616S_FAN_MAP(zone##_fan3, map-fan3, 3)		\
+	J616S_FAN_MAP(zone##_fan4, map-fan4, 5)		\
+	J616S_FAN_MAP(zone##_fan5, map-fan5, 8)
+
+	thermal-zones {
+		cpu-die-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <51300>;
+			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
+
+			trips {
+				J616S_FAN_TRIPS(cpu_die)
+
+				cpu_die_passive: cpu-die-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				cpu-die-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(cpu_die)
+
+				map-e {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-e0-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <2100>;
+			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
+
+			trips {
+				cpu_e0_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&cpu_e0_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-e1-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <2100>;
+			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
+
+			trips {
+				cpu_e1_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&cpu_e1_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-e2-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <2100>;
+			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
+
+			trips {
+				cpu_e2_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&cpu_e2_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-e3-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <2100>;
+			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
+
+			trips {
+				cpu_e3_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&cpu_e3_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p00-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <25300>;
+			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
+
+			trips {
+				cpu_p00_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p0 {
+					trip = <&cpu_p00_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p01-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <25300>;
+			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
+
+			trips {
+				cpu_p01_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p0 {
+					trip = <&cpu_p01_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p02-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <25300>;
+			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
+
+			trips {
+				cpu_p02_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p0 {
+					trip = <&cpu_p02_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p03-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <25300>;
+			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
+
+			trips {
+				cpu_p03_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p0 {
+					trip = <&cpu_p03_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p04-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <25300>;
+			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
+
+			trips {
+				cpu_p04_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p0 {
+					trip = <&cpu_p04_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p05-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <25300>;
+			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
+
+			trips {
+				cpu_p05_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p0 {
+					trip = <&cpu_p05_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p10-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <23900>;
+			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
+
+			trips {
+				cpu_p10_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p1 {
+					trip = <&cpu_p10_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p11-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <23900>;
+			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
+
+			trips {
+				cpu_p11_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p1 {
+					trip = <&cpu_p11_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p12-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <23900>;
+			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
+
+			trips {
+				cpu_p12_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p1 {
+					trip = <&cpu_p12_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p13-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <23900>;
+			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
+
+			trips {
+				cpu_p13_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p1 {
+					trip = <&cpu_p13_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p14-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <23900>;
+			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
+
+			trips {
+				cpu_p14_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p1 {
+					trip = <&cpu_p14_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p15-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <23900>;
+			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
+
+			trips {
+				cpu_p15_passive: trip-passive {
+					temperature = <116000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p1 {
+					trip = <&cpu_p15_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu0-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 17>;	/* Tg05 */
+
+			trips {
+				J616S_FAN_TRIPS(gpu0)
+
+				gpu0_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(gpu0)
+
+				map-e {
+					trip = <&gpu0_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu0_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu0_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu1-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 18>;	/* Tg0S */
+
+			trips {
+				J616S_FAN_TRIPS(gpu1)
+
+				gpu1_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(gpu1)
+
+				map-e {
+					trip = <&gpu1_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu1_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu1_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu2-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 19>;	/* Tg0Y */
+
+			trips {
+				J616S_FAN_TRIPS(gpu2)
+
+				gpu2_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(gpu2)
+
+				map-e {
+					trip = <&gpu2_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu2_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu2_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu3-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 20>;	/* Tg0k */
+
+			trips {
+				J616S_FAN_TRIPS(gpu3)
+
+				gpu3_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(gpu3)
+
+				map-e {
+					trip = <&gpu3_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu3_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu3_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu4-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 21>;	/* Tg0z */
+
+			trips {
+				J616S_FAN_TRIPS(gpu4)
+
+				gpu4_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(gpu4)
+
+				map-e {
+					trip = <&gpu4_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu4_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu4_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu5-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 22>;	/* Tg1V */
+
+			trips {
+				J616S_FAN_TRIPS(gpu5)
+
+				gpu5_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(gpu5)
+
+				map-e {
+					trip = <&gpu5_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu5_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu5_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		gpu6-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 23>;	/* Tg1l */
+
+			trips {
+				J616S_FAN_TRIPS(gpu6)
+
+				gpu6_passive: trip-passive {
+					temperature = <101000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				J616S_FAN_MAPS(gpu6)
+
+				map-e {
+					trip = <&gpu6_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&gpu6_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&gpu6_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The speaker amps' shared shutdown line (SDZ, AP pin 54, low =
+	 * shutdown). One fixed regulator, the SDZ supply of all six, not
+	 * per-amp shutdown-gpios: with GPIO_SHARED six references become a
+	 * vote, and one amp driving the line low would not shut the other
+	 * five down.
+	 */
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl 54 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/*
+	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
+	 * all six amps); the board's variant of macaudio links the AOP audio
+	 * component's speaker back-end (DAI 3) to the amps. The codecs are
+	 * listed in the ADT provider order, so each gets its native playback
+	 * slot (LW1 0, RW1 1, LW2 2, RW2 3, LT 4, RT 5). The idle masks are the
+	 * ADT amp-tx-zd-config rows 0 and 1: LW1 drives zeros in the right
+	 * amps' sense slots, RW1 in the left amps'.
+	 */
+	sound: sound {
+		speaker-id-gpios = <&pinctrl 52 GPIO_ACTIVE_HIGH>,
+				   <&pinctrl 53 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
+
+	/*
+	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
+	 * to the CS42L84. A card of its own, so a codec that does not answer
+	 * costs the jack only, never the speakers.
+	 */
+	sound_jack: sound-jack {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+&cpuidle {
+	status = "okay";
+};
+
+&smc {
+	status = "okay";
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&nub_spmi0 {
+	status = "okay";
+};
+
+&pinctrl {
+	status = "okay";
+
+	wifi_clkreq_pins: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(0, 1)>;
+	};
+};
+
+/*
+ * The AP takes none of the always-on bank's interrupts: the AOP firmware
+ * owns some of its pins and interrupt registers, and a chained handler here
+ * would see their pending bits without a handler of ours.
+ */
+&pinctrl_nub {
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+/* apple_sep enables the SEP and its DART when it loads. */
+&sep_mbox {
+	status = "okay";
+};
+
+/*
+ * Boot NOR. The partition is the J616s ADT /arm-io/qspi/spinor/anvram,
+ * flash-relative; asahi-bless and asahi-nvram find it by its label.
+ */
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+		spi-rx-bus-width = <1>;
+		spi-tx-bus-width = <1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@700000 {
+				label = "nvram";
+				reg = <0x700000 0x100000>;
+			};
+		};
+	};
+};
+
+/* The QSPI controller cannot probe while its power state is disabled. */
+&ps_qspi {
+	status = "okay";
+};
+
+/*
+ * Touch ID sensor (Mesa 0x3356). Its power is NUB GPIO 53 and its
+ * data-ready line is AP GPIO 116, as the J616s ADT describes them.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_nub 53 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl>;
+	interrupts = <116 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/* The board file names the per-device factory data. */
+};
+
+/* The Type-C retimers (ADT atcrt at 0x18/0x19/0x1a) sit on this bus; no driver yet. */
+&i2c6 {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	/* SMC key gp1c powers the trackpad analog front end. */
+	apple,afe-smc = <&smc>;
+
+	mtp_mt: multi-touch {
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <2>;
+	};
+
+	stm {
+	};
+
+	actuator {
+	};
+
+	tp-accel {
+	};
+
+	mtp {
+	};
+};
+
+&smc_hwmon {
+	/*
+	 * TCMz and the 23 zone sensors after it must stay the first
+	 * temperature children: the thermal zones name a sensor by its index,
+	 * so the shared hwmon includes below only append after them.
+	 *
+	 * Every key below is in this machine's SMC key table as a readable
+	 * float and was read on the J616s (SMC firmware of macOS 26.6.2).
+	 * The J614s key table has not been read yet.
+	 * Keys that only ever read a fixed placeholder (Tz1*, Ta0*) or a
+	 * fixed limit (TVMx, TVmS, TVms, PHPB, PHPM) are left out; rails that
+	 * read 0 W while idle are kept. GPU (Tg*), P-cluster (Tp*) and
+	 * E-cluster (Te*) labels follow load tests: Tg* only read live while
+	 * the GPU is powered and rise with GPU load, Tp* and Te* rise with CPU
+	 * load. Other names follow the SMC key groups and are not otherwise
+	 * verified. SBA1-3 are the three cells of the 3S battery.
+	 */
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "CPU Die Max";
+	};
+
+	temperature-Tex0 {
+		apple,key-id = "Tex0";
+		label = "E-cluster Tex0";
+	};
+
+	temperature-Tex1 {
+		apple,key-id = "Tex1";
+		label = "E-cluster Tex1";
+	};
+
+	temperature-Tex2 {
+		apple,key-id = "Tex2";
+		label = "E-cluster Tex2";
+	};
+
+	temperature-Tex3 {
+		apple,key-id = "Tex3";
+		label = "E-cluster Tex3";
+	};
+
+	temperature-Tpx0 {
+		apple,key-id = "Tpx0";
+		label = "P-cluster Tpx0";
+	};
+
+	temperature-Tpx1 {
+		apple,key-id = "Tpx1";
+		label = "P-cluster Tpx1";
+	};
+
+	temperature-Tpx2 {
+		apple,key-id = "Tpx2";
+		label = "P-cluster Tpx2";
+	};
+
+	temperature-Tpx3 {
+		apple,key-id = "Tpx3";
+		label = "P-cluster Tpx3";
+	};
+
+	temperature-Tpx4 {
+		apple,key-id = "Tpx4";
+		label = "P-cluster Tpx4";
+	};
+
+	temperature-Tpx5 {
+		apple,key-id = "Tpx5";
+		label = "P-cluster Tpx5";
+	};
+
+	temperature-Tpx8 {
+		apple,key-id = "Tpx8";
+		label = "P-cluster Tpx8";
+	};
+
+	temperature-Tpx9 {
+		apple,key-id = "Tpx9";
+		label = "P-cluster Tpx9";
+	};
+
+	temperature-TpxA {
+		apple,key-id = "TpxA";
+		label = "P-cluster TpxA";
+	};
+
+	temperature-TpxB {
+		apple,key-id = "TpxB";
+		label = "P-cluster TpxB";
+	};
+
+	temperature-TpxC {
+		apple,key-id = "TpxC";
+		label = "P-cluster TpxC";
+	};
+
+	temperature-TpxD {
+		apple,key-id = "TpxD";
+		label = "P-cluster TpxD";
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+	};
+
+	temperature-Tg0S {
+		apple,key-id = "Tg0S";
+		label = "GPU Tg0S";
+	};
+
+	temperature-Tg0Y {
+		apple,key-id = "Tg0Y";
+		label = "GPU Tg0Y";
+	};
+
+	temperature-Tg0k {
+		apple,key-id = "Tg0k";
+		label = "GPU Tg0k";
+	};
+
+	temperature-Tg0z {
+		apple,key-id = "Tg0z";
+		label = "GPU Tg0z";
+	};
+
+	temperature-Tg1V {
+		apple,key-id = "Tg1V";
+		label = "GPU Tg1V";
+	};
+
+	temperature-Tg1l {
+		apple,key-id = "Tg1l";
+		label = "GPU Tg1l";
+	};
+
+	temperature-TAOL {
+		apple,key-id = "TAOL";
+		label = "SMC TAOL";
+	};
+
+	temperature-TB1T {
+		apple,key-id = "TB1T";
+		label = "Battery 1";
+	};
+
+	temperature-TB2T {
+		apple,key-id = "TB2T";
+		label = "Battery 2";
+	};
+
+	temperature-TCMb {
+		apple,key-id = "TCMb";
+		label = "SMC TCMb";
+	};
+
+	temperature-TD00 {
+		apple,key-id = "TD00";
+		label = "SMC TD00";
+	};
+
+	temperature-TD01 {
+		apple,key-id = "TD01";
+		label = "SMC TD01";
+	};
+
+	temperature-TD02 {
+		apple,key-id = "TD02";
+		label = "SMC TD02";
+	};
+
+	temperature-TD03 {
+		apple,key-id = "TD03";
+		label = "SMC TD03";
+	};
+
+	temperature-TD04 {
+		apple,key-id = "TD04";
+		label = "SMC TD04";
+	};
+
+	temperature-TD10 {
+		apple,key-id = "TD10";
+		label = "SMC TD10";
+	};
+
+	temperature-TD11 {
+		apple,key-id = "TD11";
+		label = "SMC TD11";
+	};
+
+	temperature-TD12 {
+		apple,key-id = "TD12";
+		label = "SMC TD12";
+	};
+
+	temperature-TD13 {
+		apple,key-id = "TD13";
+		label = "SMC TD13";
+	};
+
+	temperature-TD14 {
+		apple,key-id = "TD14";
+		label = "SMC TD14";
+	};
+
+	temperature-TD20 {
+		apple,key-id = "TD20";
+		label = "SMC TD20";
+	};
+
+	temperature-TD21 {
+		apple,key-id = "TD21";
+		label = "SMC TD21";
+	};
+
+	temperature-TD22 {
+		apple,key-id = "TD22";
+		label = "SMC TD22";
+	};
+
+	temperature-TD23 {
+		apple,key-id = "TD23";
+		label = "SMC TD23";
+	};
+
+	temperature-TD24 {
+		apple,key-id = "TD24";
+		label = "SMC TD24";
+	};
+
+	temperature-TDBP {
+		apple,key-id = "TDBP";
+		label = "SMC TDBP";
+	};
+
+	temperature-TDCR {
+		apple,key-id = "TDCR";
+		label = "SMC TDCR";
+	};
+
+	temperature-TDEC {
+		apple,key-id = "TDEC";
+		label = "SMC TDEC";
+	};
+
+	temperature-TDEL {
+		apple,key-id = "TDEL";
+		label = "SMC TDEL";
+	};
+
+	temperature-TDER {
+		apple,key-id = "TDER";
+		label = "SMC TDER";
+	};
+
+	temperature-TDTP {
+		apple,key-id = "TDTP";
+		label = "SMC TDTP";
+	};
+
+	temperature-TDVx {
+		apple,key-id = "TDVx";
+		label = "SMC TDVx";
+	};
+
+	temperature-TDeL {
+		apple,key-id = "TDeL";
+		label = "SMC TDeL";
+	};
+
+	temperature-TDeR {
+		apple,key-id = "TDeR";
+		label = "SMC TDeR";
+	};
+
+	temperature-TF2S {
+		apple,key-id = "TF2S";
+		label = "SMC TF2S";
+	};
+
+	temperature-TH0a {
+		apple,key-id = "TH0a";
+		label = "SMC TH0a";
+	};
+
+	temperature-TH0b {
+		apple,key-id = "TH0b";
+		label = "SMC TH0b";
+	};
+
+	temperature-TMVR {
+		apple,key-id = "TMVR";
+		label = "SMC TMVR";
+	};
+
+	temperature-TPD0 {
+		apple,key-id = "TPD0";
+		label = "SMC TPD0";
+	};
+
+	temperature-TPD1 {
+		apple,key-id = "TPD1";
+		label = "SMC TPD1";
+	};
+
+	temperature-TPD2 {
+		apple,key-id = "TPD2";
+		label = "SMC TPD2";
+	};
+
+	temperature-TPD3 {
+		apple,key-id = "TPD3";
+		label = "SMC TPD3";
+	};
+
+	temperature-TPD4 {
+		apple,key-id = "TPD4";
+		label = "SMC TPD4";
+	};
+
+	temperature-TPD5 {
+		apple,key-id = "TPD5";
+		label = "SMC TPD5";
+	};
+
+	temperature-TPD6 {
+		apple,key-id = "TPD6";
+		label = "SMC TPD6";
+	};
+
+	temperature-TPD7 {
+		apple,key-id = "TPD7";
+		label = "SMC TPD7";
+	};
+
+	temperature-TPD8 {
+		apple,key-id = "TPD8";
+		label = "SMC TPD8";
+	};
+
+	temperature-TPD9 {
+		apple,key-id = "TPD9";
+		label = "SMC TPD9";
+	};
+
+	temperature-TPDX {
+		apple,key-id = "TPDX";
+		label = "SMC TPDX";
+	};
+
+	temperature-TPDa {
+		apple,key-id = "TPDa";
+		label = "SMC TPDa";
+	};
+
+	temperature-TPDb {
+		apple,key-id = "TPDb";
+		label = "SMC TPDb";
+	};
+
+	temperature-TPDc {
+		apple,key-id = "TPDc";
+		label = "SMC TPDc";
+	};
+
+	temperature-TPDd {
+		apple,key-id = "TPDd";
+		label = "SMC TPDd";
+	};
+
+	temperature-TPDe {
+		apple,key-id = "TPDe";
+		label = "SMC TPDe";
+	};
+
+	temperature-TPDf {
+		apple,key-id = "TPDf";
+		label = "SMC TPDf";
+	};
+
+	temperature-TPH3 {
+		apple,key-id = "TPH3";
+		label = "SMC TPH3";
+	};
+
+	temperature-TPMP {
+		apple,key-id = "TPMP";
+		label = "SMC TPMP";
+	};
+
+	temperature-TPSP {
+		apple,key-id = "TPSP";
+		label = "SMC TPSP";
+	};
+
+	temperature-TRD0 {
+		apple,key-id = "TRD0";
+		label = "SMC TRD0";
+	};
+
+	temperature-TRD1 {
+		apple,key-id = "TRD1";
+		label = "SMC TRD1";
+	};
+
+	temperature-TRD2 {
+		apple,key-id = "TRD2";
+		label = "SMC TRD2";
+	};
+
+	temperature-TRD3 {
+		apple,key-id = "TRD3";
+		label = "SMC TRD3";
+	};
+
+	temperature-TRD4 {
+		apple,key-id = "TRD4";
+		label = "SMC TRD4";
+	};
+
+	temperature-TRD5 {
+		apple,key-id = "TRD5";
+		label = "SMC TRD5";
+	};
+
+	temperature-TRD6 {
+		apple,key-id = "TRD6";
+		label = "SMC TRD6";
+	};
+
+	temperature-TRD7 {
+		apple,key-id = "TRD7";
+		label = "SMC TRD7";
+	};
+
+	temperature-TRD8 {
+		apple,key-id = "TRD8";
+		label = "SMC TRD8";
+	};
+
+	temperature-TRD9 {
+		apple,key-id = "TRD9";
+		label = "SMC TRD9";
+	};
+
+	temperature-TRDX {
+		apple,key-id = "TRDX";
+		label = "SMC TRDX";
+	};
+
+	temperature-TRDa {
+		apple,key-id = "TRDa";
+		label = "SMC TRDa";
+	};
+
+	temperature-TRDb {
+		apple,key-id = "TRDb";
+		label = "SMC TRDb";
+	};
+
+	temperature-TRDc {
+		apple,key-id = "TRDc";
+		label = "SMC TRDc";
+	};
+
+	temperature-TRDd {
+		apple,key-id = "TRDd";
+		label = "SMC TRDd";
+	};
+
+	temperature-TRDe {
+		apple,key-id = "TRDe";
+		label = "SMC TRDe";
+	};
+
+	temperature-TRDf {
+		apple,key-id = "TRDf";
+		label = "SMC TRDf";
+	};
+
+	temperature-TS0P {
+		apple,key-id = "TS0P";
+		label = "SMC TS0P";
+	};
+
+	temperature-TSG1 {
+		apple,key-id = "TSG1";
+		label = "SMC TSG1";
+	};
+
+	temperature-TUD0 {
+		apple,key-id = "TUD0";
+		label = "SMC TUD0";
+	};
+
+	temperature-TUD1 {
+		apple,key-id = "TUD1";
+		label = "SMC TUD1";
+	};
+
+	temperature-TUD2 {
+		apple,key-id = "TUD2";
+		label = "SMC TUD2";
+	};
+
+	temperature-TUD3 {
+		apple,key-id = "TUD3";
+		label = "SMC TUD3";
+	};
+
+	temperature-TUD4 {
+		apple,key-id = "TUD4";
+		label = "SMC TUD4";
+	};
+
+	temperature-TUD5 {
+		apple,key-id = "TUD5";
+		label = "SMC TUD5";
+	};
+
+	temperature-TUD6 {
+		apple,key-id = "TUD6";
+		label = "SMC TUD6";
+	};
+
+	temperature-TUD7 {
+		apple,key-id = "TUD7";
+		label = "SMC TUD7";
+	};
+
+	temperature-TUD8 {
+		apple,key-id = "TUD8";
+		label = "SMC TUD8";
+	};
+
+	temperature-TUD9 {
+		apple,key-id = "TUD9";
+		label = "SMC TUD9";
+	};
+
+	temperature-TUDX {
+		apple,key-id = "TUDX";
+		label = "SMC TUDX";
+	};
+
+	temperature-TUDa {
+		apple,key-id = "TUDa";
+		label = "SMC TUDa";
+	};
+
+	temperature-TUDb {
+		apple,key-id = "TUDb";
+		label = "SMC TUDb";
+	};
+
+	temperature-TUDc {
+		apple,key-id = "TUDc";
+		label = "SMC TUDc";
+	};
+
+	temperature-TUDd {
+		apple,key-id = "TUDd";
+		label = "SMC TUDd";
+	};
+
+	temperature-TUDe {
+		apple,key-id = "TUDe";
+		label = "SMC TUDe";
+	};
+
+	temperature-TUDf {
+		apple,key-id = "TUDf";
+		label = "SMC TUDf";
+	};
+
+	temperature-TVA0 {
+		apple,key-id = "TVA0";
+		label = "SMC TVA0";
+	};
+
+	temperature-TVD0 {
+		apple,key-id = "TVD0";
+		label = "SMC TVD0";
+	};
+
+	temperature-TVMR {
+		apple,key-id = "TVMR";
+		label = "SMC TVMR";
+	};
+
+	temperature-TVMX {
+		apple,key-id = "TVMX";
+		label = "SMC TVMX";
+	};
+
+	temperature-TVMr {
+		apple,key-id = "TVMr";
+		label = "SMC TVMr";
+	};
+
+	temperature-TVS0 {
+		apple,key-id = "TVS0";
+		label = "SMC TVS0";
+	};
+
+	temperature-TVS1 {
+		apple,key-id = "TVS1";
+		label = "SMC TVS1";
+	};
+
+	temperature-TVS2 {
+		apple,key-id = "TVS2";
+		label = "SMC TVS2";
+	};
+
+	temperature-TVV0 {
+		apple,key-id = "TVV0";
+		label = "SMC TVV0";
+	};
+
+	temperature-TVXX {
+		apple,key-id = "TVXX";
+		label = "SMC TVXX";
+	};
+
+	temperature-TVXh {
+		apple,key-id = "TVXh";
+		label = "SMC TVXh";
+	};
+
+	temperature-TVXm {
+		apple,key-id = "TVXm";
+		label = "SMC TVXm";
+	};
+
+	temperature-TVh0 {
+		apple,key-id = "TVh0";
+		label = "SMC TVh0";
+	};
+
+	temperature-TVh1 {
+		apple,key-id = "TVh1";
+		label = "SMC TVh1";
+	};
+
+	temperature-TVm0 {
+		apple,key-id = "TVm0";
+		label = "SMC TVm0";
+	};
+
+	temperature-TVxx {
+		apple,key-id = "TVxx";
+		label = "SMC TVxx";
+	};
+
+	temperature-TaLP {
+		apple,key-id = "TaLP";
+		label = "SMC TaLP";
+	};
+
+	temperature-TaLT {
+		apple,key-id = "TaLT";
+		label = "SMC TaLT";
+	};
+
+	temperature-TaLW {
+		apple,key-id = "TaLW";
+		label = "SMC TaLW";
+	};
+
+	temperature-TaRF {
+		apple,key-id = "TaRF";
+		label = "SMC TaRF";
+	};
+
+	temperature-TaRT {
+		apple,key-id = "TaRT";
+		label = "SMC TaRT";
+	};
+
+	temperature-TaRW {
+		apple,key-id = "TaRW";
+		label = "SMC TaRW";
+	};
+
+	temperature-TaTP {
+		apple,key-id = "TaTP";
+		label = "SMC TaTP";
+	};
+
+	temperature-Te04 {
+		apple,key-id = "Te04";
+		label = "E-cluster Te04";
+	};
+
+	temperature-Te05 {
+		apple,key-id = "Te05";
+		label = "E-cluster Te05";
+	};
+
+	temperature-Te06 {
+		apple,key-id = "Te06";
+		label = "E-cluster Te06";
+	};
+
+	temperature-Te0R {
+		apple,key-id = "Te0R";
+		label = "E-cluster Te0R";
+	};
+
+	temperature-Te0S {
+		apple,key-id = "Te0S";
+		label = "E-cluster Te0S";
+	};
+
+	temperature-Te0T {
+		apple,key-id = "Te0T";
+		label = "E-cluster Te0T";
+	};
+
+	temperature-TfC0 {
+		apple,key-id = "TfC0";
+		label = "SMC TfC0";
+	};
+
+	temperature-TfC1 {
+		apple,key-id = "TfC1";
+		label = "SMC TfC1";
+	};
+
+	temperature-TfC2 {
+		apple,key-id = "TfC2";
+		label = "SMC TfC2";
+	};
+
+	temperature-TfC3 {
+		apple,key-id = "TfC3";
+		label = "SMC TfC3";
+	};
+
+	temperature-TfC4 {
+		apple,key-id = "TfC4";
+		label = "SMC TfC4";
+	};
+
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+	};
+
+	temperature-Tg0K {
+		apple,key-id = "Tg0K";
+		label = "GPU Tg0K";
+	};
+
+	temperature-Tg0L {
+		apple,key-id = "Tg0L";
+		label = "GPU Tg0L";
+	};
+
+	temperature-Tg0R {
+		apple,key-id = "Tg0R";
+		label = "GPU Tg0R";
+	};
+
+	temperature-Tg0X {
+		apple,key-id = "Tg0X";
+		label = "GPU Tg0X";
+	};
+
+	temperature-Tg0d {
+		apple,key-id = "Tg0d";
+		label = "GPU Tg0d";
+	};
+
+	temperature-Tg0e {
+		apple,key-id = "Tg0e";
+		label = "GPU Tg0e";
+	};
+
+	temperature-Tg0j {
+		apple,key-id = "Tg0j";
+		label = "GPU Tg0j";
+	};
+
+	temperature-Tg0y {
+		apple,key-id = "Tg0y";
+		label = "GPU Tg0y";
+	};
+
+	temperature-Tg1E {
+		apple,key-id = "Tg1E";
+		label = "GPU Tg1E";
+	};
+
+	temperature-Tg1F {
+		apple,key-id = "Tg1F";
+		label = "GPU Tg1F";
+	};
+
+	temperature-Tg1U {
+		apple,key-id = "Tg1U";
+		label = "GPU Tg1U";
+	};
+
+	temperature-Tg1c {
+		apple,key-id = "Tg1c";
+		label = "GPU Tg1c";
+	};
+
+	temperature-Tg1d {
+		apple,key-id = "Tg1d";
+		label = "GPU Tg1d";
+	};
+
+	temperature-Tg1k {
+		apple,key-id = "Tg1k";
+		label = "GPU Tg1k";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "P-cluster Tp00";
+	};
+
+	temperature-Tp01 {
+		apple,key-id = "Tp01";
+		label = "P-cluster Tp01";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "P-cluster Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "P-cluster Tp04";
+	};
+
+	temperature-Tp05 {
+		apple,key-id = "Tp05";
+		label = "P-cluster Tp05";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "P-cluster Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "P-cluster Tp08";
+	};
+
+	temperature-Tp09 {
+		apple,key-id = "Tp09";
+		label = "P-cluster Tp09";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "P-cluster Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "P-cluster Tp0C";
+	};
+
+	temperature-Tp0D {
+		apple,key-id = "Tp0D";
+		label = "P-cluster Tp0D";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "P-cluster Tp0E";
+	};
+
+	temperature-Tp0G {
+		apple,key-id = "Tp0G";
+		label = "P-cluster Tp0G";
+	};
+
+	temperature-Tp0H {
+		apple,key-id = "Tp0H";
+		label = "P-cluster Tp0H";
+	};
+
+	temperature-Tp0I {
+		apple,key-id = "Tp0I";
+		label = "P-cluster Tp0I";
+	};
+
+	temperature-Tp0K {
+		apple,key-id = "Tp0K";
+		label = "P-cluster Tp0K";
+	};
+
+	temperature-Tp0L {
+		apple,key-id = "Tp0L";
+		label = "P-cluster Tp0L";
+	};
+
+	temperature-Tp0M {
+		apple,key-id = "Tp0M";
+		label = "P-cluster Tp0M";
+	};
+
+	temperature-Tp0O {
+		apple,key-id = "Tp0O";
+		label = "P-cluster Tp0O";
+	};
+
+	temperature-Tp0P {
+		apple,key-id = "Tp0P";
+		label = "P-cluster Tp0P";
+	};
+
+	temperature-Tp0Q {
+		apple,key-id = "Tp0Q";
+		label = "P-cluster Tp0Q";
+	};
+
+	temperature-Tp0S {
+		apple,key-id = "Tp0S";
+		label = "P-cluster Tp0S";
+	};
+
+	temperature-Tp0T {
+		apple,key-id = "Tp0T";
+		label = "P-cluster Tp0T";
+	};
+
+	temperature-Tp0U {
+		apple,key-id = "Tp0U";
+		label = "P-cluster Tp0U";
+	};
+
+	temperature-Tp0W {
+		apple,key-id = "Tp0W";
+		label = "P-cluster Tp0W";
+	};
+
+	temperature-Tp0X {
+		apple,key-id = "Tp0X";
+		label = "P-cluster Tp0X";
+	};
+
+	temperature-Tp0Y {
+		apple,key-id = "Tp0Y";
+		label = "P-cluster Tp0Y";
+	};
+
+	temperature-Tp0a {
+		apple,key-id = "Tp0a";
+		label = "P-cluster Tp0a";
+	};
+
+	temperature-Tp0b {
+		apple,key-id = "Tp0b";
+		label = "P-cluster Tp0b";
+	};
+
+	temperature-Tp0c {
+		apple,key-id = "Tp0c";
+		label = "P-cluster Tp0c";
+	};
+
+	temperature-Tp0d {
+		apple,key-id = "Tp0d";
+		label = "P-cluster Tp0d";
+	};
+
+	temperature-Tp0e {
+		apple,key-id = "Tp0e";
+		label = "P-cluster Tp0e";
+	};
+
+	temperature-Tp0f {
+		apple,key-id = "Tp0f";
+		label = "P-cluster Tp0f";
+	};
+
+	temperature-Tp0g {
+		apple,key-id = "Tp0g";
+		label = "P-cluster Tp0g";
+	};
+
+	temperature-Tp0i {
+		apple,key-id = "Tp0i";
+		label = "P-cluster Tp0i";
+	};
+
+	temperature-Tp0k {
+		apple,key-id = "Tp0k";
+		label = "P-cluster Tp0k";
+	};
+
+	temperature-Tp0l {
+		apple,key-id = "Tp0l";
+		label = "P-cluster Tp0l";
+	};
+
+	temperature-Tp0m {
+		apple,key-id = "Tp0m";
+		label = "P-cluster Tp0m";
+	};
+
+	temperature-Tp0n {
+		apple,key-id = "Tp0n";
+		label = "P-cluster Tp0n";
+	};
+
+	temperature-Tp0o {
+		apple,key-id = "Tp0o";
+		label = "P-cluster Tp0o";
+	};
+
+	temperature-Tp0q {
+		apple,key-id = "Tp0q";
+		label = "P-cluster Tp0q";
+	};
+
+	temperature-Tp0t {
+		apple,key-id = "Tp0t";
+		label = "P-cluster Tp0t";
+	};
+
+	temperature-Tp0u {
+		apple,key-id = "Tp0u";
+		label = "P-cluster Tp0u";
+	};
+
+	temperature-Tp0v {
+		apple,key-id = "Tp0v";
+		label = "P-cluster Tp0v";
+	};
+
+	temperature-Tp0w {
+		apple,key-id = "Tp0w";
+		label = "P-cluster Tp0w";
+	};
+
+	temperature-Tp1i {
+		apple,key-id = "Tp1i";
+		label = "P-cluster Tp1i";
+	};
+
+	temperature-Tp1j {
+		apple,key-id = "Tp1j";
+		label = "P-cluster Tp1j";
+	};
+
+	temperature-Tp1k {
+		apple,key-id = "Tp1k";
+		label = "P-cluster Tp1k";
+	};
+
+	temperature-Tp1m {
+		apple,key-id = "Tp1m";
+		label = "P-cluster Tp1m";
+	};
+
+	temperature-Tp1n {
+		apple,key-id = "Tp1n";
+		label = "P-cluster Tp1n";
+	};
+
+	temperature-Tp1o {
+		apple,key-id = "Tp1o";
+		label = "P-cluster Tp1o";
+	};
+
+	temperature-Tp1q {
+		apple,key-id = "Tp1q";
+		label = "P-cluster Tp1q";
+	};
+
+	temperature-Tp1t {
+		apple,key-id = "Tp1t";
+		label = "P-cluster Tp1t";
+	};
+
+	temperature-Tp1u {
+		apple,key-id = "Tp1u";
+		label = "P-cluster Tp1u";
+	};
+
+	temperature-Tp1v {
+		apple,key-id = "Tp1v";
+		label = "P-cluster Tp1v";
+	};
+
+	temperature-Tp1w {
+		apple,key-id = "Tp1w";
+		label = "P-cluster Tp1w";
+	};
+
+	temperature-Tp1x {
+		apple,key-id = "Tp1x";
+		label = "P-cluster Tp1x";
+	};
+
+	temperature-Tp1y {
+		apple,key-id = "Tp1y";
+		label = "P-cluster Tp1y";
+	};
+
+	temperature-Tp1z {
+		apple,key-id = "Tp1z";
+		label = "P-cluster Tp1z";
+	};
+
+	temperature-Tp20 {
+		apple,key-id = "Tp20";
+		label = "P-cluster Tp20";
+	};
+
+	temperature-Tp21 {
+		apple,key-id = "Tp21";
+		label = "P-cluster Tp21";
+	};
+
+	temperature-Tp22 {
+		apple,key-id = "Tp22";
+		label = "P-cluster Tp22";
+	};
+
+	temperature-Tp23 {
+		apple,key-id = "Tp23";
+		label = "P-cluster Tp23";
+	};
+
+	temperature-Tp24 {
+		apple,key-id = "Tp24";
+		label = "P-cluster Tp24";
+	};
+
+	temperature-Tp25 {
+		apple,key-id = "Tp25";
+		label = "P-cluster Tp25";
+	};
+
+	temperature-Tp26 {
+		apple,key-id = "Tp26";
+		label = "P-cluster Tp26";
+	};
+
+	temperature-Tp27 {
+		apple,key-id = "Tp27";
+		label = "P-cluster Tp27";
+	};
+
+	temperature-Tp28 {
+		apple,key-id = "Tp28";
+		label = "P-cluster Tp28";
+	};
+
+	temperature-Tp29 {
+		apple,key-id = "Tp29";
+		label = "P-cluster Tp29";
+	};
+
+	temperature-Tp2A {
+		apple,key-id = "Tp2A";
+		label = "P-cluster Tp2A";
+	};
+
+	temperature-Tp2B {
+		apple,key-id = "Tp2B";
+		label = "P-cluster Tp2B";
+	};
+
+	temperature-Tp2C {
+		apple,key-id = "Tp2C";
+		label = "P-cluster Tp2C";
+	};
+
+	temperature-Tp2D {
+		apple,key-id = "Tp2D";
+		label = "P-cluster Tp2D";
+	};
+
+	temperature-Tp2E {
+		apple,key-id = "Tp2E";
+		label = "P-cluster Tp2E";
+	};
+
+	temperature-Tp2G {
+		apple,key-id = "Tp2G";
+		label = "P-cluster Tp2G";
+	};
+
+	temperature-Tp2I {
+		apple,key-id = "Tp2I";
+		label = "P-cluster Tp2I";
+	};
+
+	temperature-Tp2J {
+		apple,key-id = "Tp2J";
+		label = "P-cluster Tp2J";
+	};
+
+	temperature-Tp2K {
+		apple,key-id = "Tp2K";
+		label = "P-cluster Tp2K";
+	};
+
+	temperature-Tp2L {
+		apple,key-id = "Tp2L";
+		label = "P-cluster Tp2L";
+	};
+
+	temperature-Tp2M {
+		apple,key-id = "Tp2M";
+		label = "P-cluster Tp2M";
+	};
+
+	temperature-Tp2N {
+		apple,key-id = "Tp2N";
+		label = "P-cluster Tp2N";
+	};
+
+	temperature-Tp2O {
+		apple,key-id = "Tp2O";
+		label = "P-cluster Tp2O";
+	};
+
+	temperature-Tp2Q {
+		apple,key-id = "Tp2Q";
+		label = "P-cluster Tp2Q";
+	};
+
+	temperature-Tp2R {
+		apple,key-id = "Tp2R";
+		label = "P-cluster Tp2R";
+	};
+
+	temperature-Tp2S {
+		apple,key-id = "Tp2S";
+		label = "P-cluster Tp2S";
+	};
+
+	temperature-Tp2T {
+		apple,key-id = "Tp2T";
+		label = "P-cluster Tp2T";
+	};
+
+	temperature-Tp2U {
+		apple,key-id = "Tp2U";
+		label = "P-cluster Tp2U";
+	};
+
+	temperature-Tp2V {
+		apple,key-id = "Tp2V";
+		label = "P-cluster Tp2V";
+	};
+
+	temperature-Tp2W {
+		apple,key-id = "Tp2W";
+		label = "P-cluster Tp2W";
+	};
+
+	temperature-Tp2X {
+		apple,key-id = "Tp2X";
+		label = "P-cluster Tp2X";
+	};
+
+	temperature-Ts00 {
+		apple,key-id = "Ts00";
+		label = "SMC Ts00";
+	};
+
+	temperature-Ts01 {
+		apple,key-id = "Ts01";
+		label = "SMC Ts01";
+	};
+
+	temperature-Ts02 {
+		apple,key-id = "Ts02";
+		label = "SMC Ts02";
+	};
+
+	temperature-Ts04 {
+		apple,key-id = "Ts04";
+		label = "SMC Ts04";
+	};
+
+	temperature-Ts05 {
+		apple,key-id = "Ts05";
+		label = "SMC Ts05";
+	};
+
+	temperature-Ts06 {
+		apple,key-id = "Ts06";
+		label = "SMC Ts06";
+	};
+
+	temperature-Ts08 {
+		apple,key-id = "Ts08";
+		label = "SMC Ts08";
+	};
+
+	temperature-Ts09 {
+		apple,key-id = "Ts09";
+		label = "SMC Ts09";
+	};
+
+	temperature-Ts0A {
+		apple,key-id = "Ts0A";
+		label = "SMC Ts0A";
+	};
+
+	temperature-Ts0C {
+		apple,key-id = "Ts0C";
+		label = "SMC Ts0C";
+	};
+
+	temperature-Ts0D {
+		apple,key-id = "Ts0D";
+		label = "SMC Ts0D";
+	};
+
+	temperature-Ts0E {
+		apple,key-id = "Ts0E";
+		label = "SMC Ts0E";
+	};
+
+	temperature-Ts0G {
+		apple,key-id = "Ts0G";
+		label = "SMC Ts0G";
+	};
+
+	temperature-Ts0H {
+		apple,key-id = "Ts0H";
+		label = "SMC Ts0H";
+	};
+
+	temperature-Ts0I {
+		apple,key-id = "Ts0I";
+		label = "SMC Ts0I";
+	};
+
+	temperature-Ts0K {
+		apple,key-id = "Ts0K";
+		label = "SMC Ts0K";
+	};
+
+	temperature-Ts0L {
+		apple,key-id = "Ts0L";
+		label = "SMC Ts0L";
+	};
+
+	temperature-Ts0M {
+		apple,key-id = "Ts0M";
+		label = "SMC Ts0M";
+	};
+
+	temperature-Ts0O {
+		apple,key-id = "Ts0O";
+		label = "SMC Ts0O";
+	};
+
+	temperature-Ts0P {
+		apple,key-id = "Ts0P";
+		label = "SMC Ts0P";
+	};
+
+	temperature-Ts0Q {
+		apple,key-id = "Ts0Q";
+		label = "SMC Ts0Q";
+	};
+
+	temperature-Ts0R {
+		apple,key-id = "Ts0R";
+		label = "SMC Ts0R";
+	};
+
+	temperature-Ts0T {
+		apple,key-id = "Ts0T";
+		label = "SMC Ts0T";
+	};
+
+	temperature-Ts0U {
+		apple,key-id = "Ts0U";
+		label = "SMC Ts0U";
+	};
+
+	temperature-Ts0W {
+		apple,key-id = "Ts0W";
+		label = "SMC Ts0W";
+	};
+
+	temperature-Ts1P {
+		apple,key-id = "Ts1P";
+		label = "SMC Ts1P";
+	};
+
+	temperature-Tsx0 {
+		apple,key-id = "Tsx0";
+		label = "SMC Tsx0";
+	};
+
+	temperature-Tsx1 {
+		apple,key-id = "Tsx1";
+		label = "SMC Tsx1";
+	};
+
+	voltage-VDM2 {
+		apple,key-id = "VDM2";
+		label = "SMC VDM2";
+	};
+
+	voltage-VDMA {
+		apple,key-id = "VDMA";
+		label = "SMC VDMA";
+	};
+
+	voltage-VDMM {
+		apple,key-id = "VDMM";
+		label = "SMC VDMM";
+	};
+
+	voltage-VP0R {
+		apple,key-id = "VP0R";
+		label = "SMC VP0R";
+	};
+
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "SMC VP0b";
+	};
+
+	voltage-VP1b {
+		apple,key-id = "VP1b";
+		label = "SMC VP1b";
+	};
+
+	voltage-VP1l {
+		apple,key-id = "VP1l";
+		label = "SMC VP1l";
+	};
+
+	voltage-VP2b {
+		apple,key-id = "VP2b";
+		label = "SMC VP2b";
+	};
+
+	voltage-VP3b {
+		apple,key-id = "VP3b";
+		label = "SMC VP3b";
+	};
+
+	voltage-VP4b {
+		apple,key-id = "VP4b";
+		label = "SMC VP4b";
+	};
+
+	voltage-VP5l {
+		apple,key-id = "VP5l";
+		label = "SMC VP5l";
+	};
+
+	voltage-VP7b {
+		apple,key-id = "VP7b";
+		label = "SMC VP7b";
+	};
+
+	voltage-VP7l {
+		apple,key-id = "VP7l";
+		label = "SMC VP7l";
+	};
+
+	voltage-VP9b {
+		apple,key-id = "VP9b";
+		label = "SMC VP9b";
+	};
+
+	voltage-VP9l {
+		apple,key-id = "VP9l";
+		label = "SMC VP9l";
+	};
+
+	voltage-VPal {
+		apple,key-id = "VPal";
+		label = "SMC VPal";
+	};
+
+	voltage-VPbb {
+		apple,key-id = "VPbb";
+		label = "SMC VPbb";
+	};
+
+	voltage-VPdb {
+		apple,key-id = "VPdb";
+		label = "SMC VPdb";
+	};
+
+	voltage-VPeb {
+		apple,key-id = "VPeb";
+		label = "SMC VPeb";
+	};
+
+	voltage-VR0b {
+		apple,key-id = "VR0b";
+		label = "SMC VR0b";
+	};
+
+	voltage-VR1b {
+		apple,key-id = "VR1b";
+		label = "SMC VR1b";
+	};
+
+	voltage-VR2b {
+		apple,key-id = "VR2b";
+		label = "SMC VR2b";
+	};
+
+	voltage-VR3b {
+		apple,key-id = "VR3b";
+		label = "SMC VR3b";
+	};
+
+	voltage-VR3l {
+		apple,key-id = "VR3l";
+		label = "SMC VR3l";
+	};
+
+	voltage-VR4b {
+		apple,key-id = "VR4b";
+		label = "SMC VR4b";
+	};
+
+	voltage-VR7b {
+		apple,key-id = "VR7b";
+		label = "SMC VR7b";
+	};
+
+	voltage-VR8l {
+		apple,key-id = "VR8l";
+		label = "SMC VR8l";
+	};
+
+	voltage-VR9b {
+		apple,key-id = "VR9b";
+		label = "SMC VR9b";
+	};
+
+	voltage-VR9l {
+		apple,key-id = "VR9l";
+		label = "SMC VR9l";
+	};
+
+	voltage-VRal {
+		apple,key-id = "VRal";
+		label = "SMC VRal";
+	};
+
+	voltage-VRbb {
+		apple,key-id = "VRbb";
+		label = "SMC VRbb";
+	};
+
+	voltage-VRdb {
+		apple,key-id = "VRdb";
+		label = "SMC VRdb";
+	};
+
+	voltage-VReb {
+		apple,key-id = "VReb";
+		label = "SMC VReb";
+	};
+
+	voltage-VS0b {
+		apple,key-id = "VS0b";
+		label = "SMC VS0b";
+	};
+
+	voltage-VS1b {
+		apple,key-id = "VS1b";
+		label = "SMC VS1b";
+	};
+
+	voltage-VS2b {
+		apple,key-id = "VS2b";
+		label = "SMC VS2b";
+	};
+
+	voltage-VS3b {
+		apple,key-id = "VS3b";
+		label = "SMC VS3b";
+	};
+
+	voltage-VS4b {
+		apple,key-id = "VS4b";
+		label = "SMC VS4b";
+	};
+
+	voltage-VS7b {
+		apple,key-id = "VS7b";
+		label = "SMC VS7b";
+	};
+
+	voltage-VS9b {
+		apple,key-id = "VS9b";
+		label = "SMC VS9b";
+	};
+
+	voltage-VS9l {
+		apple,key-id = "VS9l";
+		label = "SMC VS9l";
+	};
+
+	voltage-VSal {
+		apple,key-id = "VSal";
+		label = "SMC VSal";
+	};
+
+	voltage-VSbb {
+		apple,key-id = "VSbb";
+		label = "SMC VSbb";
+	};
+
+	voltage-VSeb {
+		apple,key-id = "VSeb";
+		label = "SMC VSeb";
+	};
+
+	voltage-Vb0f {
+		apple,key-id = "Vb0f";
+		label = "SMC Vb0f";
+	};
+
+	voltage-Vb1f {
+		apple,key-id = "Vb1f";
+		label = "SMC Vb1f";
+	};
+
+	voltage-SBA1 {
+		apple,key-id = "SBA1";
+		label = "Battery Cell 1";
+	};
+
+	voltage-SBA2 {
+		apple,key-id = "SBA2";
+		label = "Battery Cell 2";
+	};
+
+	voltage-SBA3 {
+		apple,key-id = "SBA3";
+		label = "Battery Cell 3";
+	};
+
+	current-I3F2 {
+		apple,key-id = "I3F2";
+		label = "SMC I3F2";
+	};
+
+	current-I5SR {
+		apple,key-id = "I5SR";
+		label = "SMC I5SR";
+	};
+
+	current-IALR {
+		apple,key-id = "IALR";
+		label = "SMC IALR";
+	};
+
+	current-IARR {
+		apple,key-id = "IARR";
+		label = "SMC IARR";
+	};
+
+	current-ICMC {
+		apple,key-id = "ICMC";
+		label = "SMC ICMC";
+	};
+
+	current-ID3C {
+		apple,key-id = "ID3C";
+		label = "SMC ID3C";
+	};
+
+	current-IDBC {
+		apple,key-id = "IDBC";
+		label = "SMC IDBC";
+	};
+
+	current-IDBR {
+		apple,key-id = "IDBR";
+		label = "SMC IDBR";
+	};
+
+	current-IFLR {
+		apple,key-id = "IFLR";
+		label = "SMC IFLR";
+	};
+
+	current-IH0R {
+		apple,key-id = "IH0R";
+		label = "SMC IH0R";
+	};
+
+	current-IHCR {
+		apple,key-id = "IHCR";
+		label = "SMC IHCR";
+	};
+
+	current-IIDR {
+		apple,key-id = "IIDR";
+		label = "SMC IIDR";
+	};
+
+	current-IINC {
+		apple,key-id = "IINC";
+		label = "SMC IINC";
+	};
+
+	current-IMVC {
+		apple,key-id = "IMVC";
+		label = "SMC IMVC";
+	};
+
+	current-IMVR {
+		apple,key-id = "IMVR";
+		label = "SMC IMVR";
+	};
+
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "SMC IP0b";
+	};
+
+	current-IP1b {
+		apple,key-id = "IP1b";
+		label = "SMC IP1b";
+	};
+
+	current-IP1l {
+		apple,key-id = "IP1l";
+		label = "SMC IP1l";
+	};
+
+	current-IP2b {
+		apple,key-id = "IP2b";
+		label = "SMC IP2b";
+	};
+
+	current-IP3b {
+		apple,key-id = "IP3b";
+		label = "SMC IP3b";
+	};
+
+	current-IP4b {
+		apple,key-id = "IP4b";
+		label = "SMC IP4b";
+	};
+
+	current-IP5l {
+		apple,key-id = "IP5l";
+		label = "SMC IP5l";
+	};
+
+	current-IP7b {
+		apple,key-id = "IP7b";
+		label = "SMC IP7b";
+	};
+
+	current-IP7l {
+		apple,key-id = "IP7l";
+		label = "SMC IP7l";
+	};
+
+	current-IP9b {
+		apple,key-id = "IP9b";
+		label = "SMC IP9b";
+	};
+
+	current-IP9l {
+		apple,key-id = "IP9l";
+		label = "SMC IP9l";
+	};
+
+	current-IPBR {
+		apple,key-id = "IPBR";
+		label = "SMC IPBR";
+	};
+
+	current-IPMC {
+		apple,key-id = "IPMC";
+		label = "SMC IPMC";
+	};
+
+	current-IPSC {
+		apple,key-id = "IPSC";
+		label = "SMC IPSC";
+	};
+
+	current-IPal {
+		apple,key-id = "IPal";
+		label = "SMC IPal";
+	};
+
+	current-IPbb {
+		apple,key-id = "IPbb";
+		label = "SMC IPbb";
+	};
+
+	current-IPdb {
+		apple,key-id = "IPdb";
+		label = "SMC IPdb";
+	};
+
+	current-IPeb {
+		apple,key-id = "IPeb";
+		label = "SMC IPeb";
+	};
+
+	current-IR0b {
+		apple,key-id = "IR0b";
+		label = "SMC IR0b";
+	};
+
+	current-IR1b {
+		apple,key-id = "IR1b";
+		label = "SMC IR1b";
+	};
+
+	current-IR2b {
+		apple,key-id = "IR2b";
+		label = "SMC IR2b";
+	};
+
+	current-IR3b {
+		apple,key-id = "IR3b";
+		label = "SMC IR3b";
+	};
+
+	current-IR3l {
+		apple,key-id = "IR3l";
+		label = "SMC IR3l";
+	};
+
+	current-IR4b {
+		apple,key-id = "IR4b";
+		label = "SMC IR4b";
+	};
+
+	current-IR7b {
+		apple,key-id = "IR7b";
+		label = "SMC IR7b";
+	};
+
+	current-IR8l {
+		apple,key-id = "IR8l";
+		label = "SMC IR8l";
+	};
+
+	current-IR9b {
+		apple,key-id = "IR9b";
+		label = "SMC IR9b";
+	};
+
+	current-IR9l {
+		apple,key-id = "IR9l";
+		label = "SMC IR9l";
+	};
+
+	current-IRal {
+		apple,key-id = "IRal";
+		label = "SMC IRal";
+	};
+
+	current-IRbb {
+		apple,key-id = "IRbb";
+		label = "SMC IRbb";
+	};
+
+	current-IRdb {
+		apple,key-id = "IRdb";
+		label = "SMC IRdb";
+	};
+
+	current-IReb {
+		apple,key-id = "IReb";
+		label = "SMC IReb";
+	};
+
+	current-IS0b {
+		apple,key-id = "IS0b";
+		label = "SMC IS0b";
+	};
+
+	current-IS1b {
+		apple,key-id = "IS1b";
+		label = "SMC IS1b";
+	};
+
+	current-IS2b {
+		apple,key-id = "IS2b";
+		label = "SMC IS2b";
+	};
+
+	current-IS3b {
+		apple,key-id = "IS3b";
+		label = "SMC IS3b";
+	};
+
+	current-IS4b {
+		apple,key-id = "IS4b";
+		label = "SMC IS4b";
+	};
+
+	current-IS7b {
+		apple,key-id = "IS7b";
+		label = "SMC IS7b";
+	};
+
+	current-IS9b {
+		apple,key-id = "IS9b";
+		label = "SMC IS9b";
+	};
+
+	current-IS9l {
+		apple,key-id = "IS9l";
+		label = "SMC IS9l";
+	};
+
+	current-ISDR {
+		apple,key-id = "ISDR";
+		label = "SMC ISDR";
+	};
+
+	current-ISal {
+		apple,key-id = "ISal";
+		label = "SMC ISal";
+	};
+
+	current-ISbb {
+		apple,key-id = "ISbb";
+		label = "SMC ISbb";
+	};
+
+	current-ISeb {
+		apple,key-id = "ISeb";
+		label = "SMC ISeb";
+	};
+
+	current-IU1C {
+		apple,key-id = "IU1C";
+		label = "SMC IU1C";
+	};
+
+	current-IU1R {
+		apple,key-id = "IU1R";
+		label = "SMC IU1R";
+	};
+
+	current-IU2C {
+		apple,key-id = "IU2C";
+		label = "SMC IU2C";
+	};
+
+	current-IU2R {
+		apple,key-id = "IU2R";
+		label = "SMC IU2R";
+	};
+
+	current-IW3C {
+		apple,key-id = "IW3C";
+		label = "SMC IW3C";
+	};
+
+	current-Ib0f {
+		apple,key-id = "Ib0f";
+		label = "SMC Ib0f";
+	};
+
+	current-Ib8f {
+		apple,key-id = "Ib8f";
+		label = "SMC Ib8f";
+	};
+
+	current-SBAC {
+		apple,key-id = "SBAC";
+		label = "Battery Current";
+	};
+
+	power-P3F2 {
+		apple,key-id = "P3F2";
+		label = "SMC P3F2";
+	};
+
+	power-P5SR {
+		apple,key-id = "P5SR";
+		label = "SMC P5SR";
+	};
+
+	power-PALR {
+		apple,key-id = "PALR";
+		label = "SMC PALR";
+	};
+
+	power-PARR {
+		apple,key-id = "PARR";
+		label = "SMC PARR";
+	};
+
+	power-PCMC {
+		apple,key-id = "PCMC";
+		label = "SMC PCMC";
+	};
+
+	power-PD3C {
+		apple,key-id = "PD3C";
+		label = "SMC PD3C";
+	};
+
+	power-PDBC {
+		apple,key-id = "PDBC";
+		label = "SMC PDBC";
+	};
+
+	power-PDBR {
+		apple,key-id = "PDBR";
+		label = "SMC PDBR";
+	};
+
+	power-PFLR {
+		apple,key-id = "PFLR";
+		label = "SMC PFLR";
+	};
+
+	power-PH0R {
+		apple,key-id = "PH0R";
+		label = "SMC PH0R";
+	};
+
+	power-PHCR {
+		apple,key-id = "PHCR";
+		label = "SMC PHCR";
+	};
+
+	power-PIDR {
+		apple,key-id = "PIDR";
+		label = "SMC PIDR";
+	};
+
+	power-PINC {
+		apple,key-id = "PINC";
+		label = "SMC PINC";
+	};
+
+	power-PMVC {
+		apple,key-id = "PMVC";
+		label = "SMC PMVC";
+	};
+
+	power-PP0b {
+		apple,key-id = "PP0b";
+		label = "SMC PP0b";
+	};
+
+	power-PP1b {
+		apple,key-id = "PP1b";
+		label = "SMC PP1b";
+	};
+
+	power-PP1l {
+		apple,key-id = "PP1l";
+		label = "SMC PP1l";
+	};
+
+	power-PP2b {
+		apple,key-id = "PP2b";
+		label = "SMC PP2b";
+	};
+
+	power-PP3b {
+		apple,key-id = "PP3b";
+		label = "SMC PP3b";
+	};
+
+	power-PP4b {
+		apple,key-id = "PP4b";
+		label = "SMC PP4b";
+	};
+
+	power-PP5l {
+		apple,key-id = "PP5l";
+		label = "SMC PP5l";
+	};
+
+	power-PP7b {
+		apple,key-id = "PP7b";
+		label = "SMC PP7b";
+	};
+
+	power-PP7l {
+		apple,key-id = "PP7l";
+		label = "SMC PP7l";
+	};
+
+	power-PP9b {
+		apple,key-id = "PP9b";
+		label = "SMC PP9b";
+	};
+
+	power-PP9l {
+		apple,key-id = "PP9l";
+		label = "SMC PP9l";
+	};
+
+	power-PPBR {
+		apple,key-id = "PPBR";
+		label = "SMC PPBR";
+	};
+
+	power-PPMC {
+		apple,key-id = "PPMC";
+		label = "SMC PPMC";
+	};
+
+	power-PPSC {
+		apple,key-id = "PPSC";
+		label = "SMC PPSC";
+	};
+
+	power-PPal {
+		apple,key-id = "PPal";
+		label = "SMC PPal";
+	};
+
+	power-PPbb {
+		apple,key-id = "PPbb";
+		label = "SMC PPbb";
+	};
+
+	power-PPdb {
+		apple,key-id = "PPdb";
+		label = "SMC PPdb";
+	};
+
+	power-PPeb {
+		apple,key-id = "PPeb";
+		label = "SMC PPeb";
+	};
+
+	power-PR0b {
+		apple,key-id = "PR0b";
+		label = "SMC PR0b";
+	};
+
+	power-PR1b {
+		apple,key-id = "PR1b";
+		label = "SMC PR1b";
+	};
+
+	power-PR2b {
+		apple,key-id = "PR2b";
+		label = "SMC PR2b";
+	};
+
+	power-PR3b {
+		apple,key-id = "PR3b";
+		label = "SMC PR3b";
+	};
+
+	power-PR3l {
+		apple,key-id = "PR3l";
+		label = "SMC PR3l";
+	};
+
+	power-PR4b {
+		apple,key-id = "PR4b";
+		label = "SMC PR4b";
+	};
+
+	power-PR7b {
+		apple,key-id = "PR7b";
+		label = "SMC PR7b";
+	};
+
+	power-PR8l {
+		apple,key-id = "PR8l";
+		label = "SMC PR8l";
+	};
+
+	power-PR9b {
+		apple,key-id = "PR9b";
+		label = "SMC PR9b";
+	};
+
+	power-PR9l {
+		apple,key-id = "PR9l";
+		label = "SMC PR9l";
+	};
+
+	power-PRal {
+		apple,key-id = "PRal";
+		label = "SMC PRal";
+	};
+
+	power-PRbb {
+		apple,key-id = "PRbb";
+		label = "SMC PRbb";
+	};
+
+	power-PRdb {
+		apple,key-id = "PRdb";
+		label = "SMC PRdb";
+	};
+
+	power-PReb {
+		apple,key-id = "PReb";
+		label = "SMC PReb";
+	};
+
+	power-PS0b {
+		apple,key-id = "PS0b";
+		label = "SMC PS0b";
+	};
+
+	power-PS1b {
+		apple,key-id = "PS1b";
+		label = "SMC PS1b";
+	};
+
+	power-PS2b {
+		apple,key-id = "PS2b";
+		label = "SMC PS2b";
+	};
+
+	power-PS3b {
+		apple,key-id = "PS3b";
+		label = "SMC PS3b";
+	};
+
+	power-PS4b {
+		apple,key-id = "PS4b";
+		label = "SMC PS4b";
+	};
+
+	power-PS7b {
+		apple,key-id = "PS7b";
+		label = "SMC PS7b";
+	};
+
+	power-PS9b {
+		apple,key-id = "PS9b";
+		label = "SMC PS9b";
+	};
+
+	power-PS9l {
+		apple,key-id = "PS9l";
+		label = "SMC PS9l";
+	};
+
+	power-PSDR {
+		apple,key-id = "PSDR";
+		label = "SMC PSDR";
+	};
+
+	power-PSal {
+		apple,key-id = "PSal";
+		label = "SMC PSal";
+	};
+
+	power-PSbb {
+		apple,key-id = "PSbb";
+		label = "SMC PSbb";
+	};
+
+	power-PSeb {
+		apple,key-id = "PSeb";
+		label = "SMC PSeb";
+	};
+
+	power-PTHS {
+		apple,key-id = "PTHS";
+		label = "SMC PTHS";
+	};
+
+	power-PU1C {
+		apple,key-id = "PU1C";
+		label = "SMC PU1C";
+	};
+
+	power-PU1R {
+		apple,key-id = "PU1R";
+		label = "SMC PU1R";
+	};
+
+	power-PU2C {
+		apple,key-id = "PU2C";
+		label = "SMC PU2C";
+	};
+
+	power-PU2R {
+		apple,key-id = "PU2R";
+		label = "SMC PU2R";
+	};
+
+	power-PW3C {
+		apple,key-id = "PW3C";
+		label = "SMC PW3C";
+	};
+
+	power-PZC0 {
+		apple,key-id = "PZC0";
+		label = "SMC PZC0";
+	};
+
+	power-PZC1 {
+		apple,key-id = "PZC1";
+		label = "SMC PZC1";
+	};
+
+	power-PZCB {
+		apple,key-id = "PZCB";
+		label = "SMC PZCB";
+	};
+
+	power-PZCU {
+		apple,key-id = "PZCU";
+		label = "SMC PZCU";
+	};
+
+	power-PZD1 {
+		apple,key-id = "PZD1";
+		label = "SMC PZD1";
+	};
+
+	power-PZT0 {
+		apple,key-id = "PZT0";
+		label = "SMC PZT0";
+	};
+
+	power-Pb0f {
+		apple,key-id = "Pb0f";
+		label = "SMC Pb0f";
+	};
+
+	power-SBAP {
+		apple,key-id = "SBAP";
+		label = "Battery Power";
+	};
+};
+
+/* Fan monitoring and explicit userspace manual control. */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
+&smc_hwmon {
+	apple,thermal-pressure-key = "mTPL";
+
+	/*
+	 * The SMC accepts a manual speed for both fans once its fan test
+	 * key unlocks them, and returns them to system mode when the
+	 * request is dropped.
+	 */
+	fan-F0Ac {
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-manual-control;
+	};
+};
+
+&pcie_dart {
+	status = "okay";
+};
+
+/*
+ * Wi-Fi and Bluetooth (BCM4388). The boot loader finds these nodes by
+ * the paths in the wifi0 and bluetooth0 aliases and adds the per-unit
+ * calibration, the antenna SKU and the addresses to them.
+ */
+/ {
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6041-pcie", "apple,t6020-pcie";
+		reg = <0x1c 0xb0000000 0x0 0x1000000>,	/* config */
+		      <0x4 0x14000000 0x0 0x4000>,	/* rc */
+		      <0x4 0x10028000 0x0 0x4000>,	/* port0 */
+		      <0x4 0x11028000 0x0 0x4000>,	/* port1 */
+		      <0x4 0x12028000 0x0 0x4000>,	/* port2 */
+		      <0x4 0x13028000 0x0 0x4000>,	/* port3 */
+		      <0x4 0x17020000 0x0 0x4000>,	/* phy0 */
+		      <0x4 0x17024000 0x0 0x4000>,	/* phy1 */
+		      <0x4 0x17028000 0x0 0x4000>,	/* phy2 */
+		      <0x4 0x1702c000 0x0 0x4000>;	/* phy3 */
+		reg-names = "config", "rc",
+			    "port0", "port1", "port2", "port3",
+			    "phy0", "phy1", "phy2", "phy3";
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_clkreq_pins>;
+		#size-cells = <2>;
+		#address-cells = <3>;
+		bus-range = <0 1>;
+		iommu-map-mask = <0xffff>;
+		iommu-map = <0x100 &pcie_dart 1 2>;
+		msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
+		msi-parent = <&pcie0>;
+		msi-controller;
+		interrupts = <0 0x6bb 4>;
+		interrupt-parent = <&aic>;
+		device_type = "pci";
+
+		port00: pci@0,0 {
+			reg = <0 0 0 0 0>;
+			ranges;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map-mask = <0 0 0 7>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			#size-cells = <2>;
+			#address-cells = <3>;
+			pwren-gpios = <&smc_gpio 0x13 0>;
+			reset-gpios = <&pinctrl 4 1>;
+			device_type = "pci";
+
+			bluetooth0: bluetooth@0,1 {
+				compatible = "pci14e4,5f72";
+				reg = <0x100 0 0 0 0>;
+				/* To be filled by the loader */
+				local-bd-address = [00 00 00 00 00 00];
+				status = "okay";
+			};
+
+			wifi0: wifi@0,0 {
+				compatible = "pci14e4,4434", "brcm,bcm4329-fmac";
+				reg = <0 0 0 0 0>;
+				brcm,ccode-map-trivial;
+			};
+		};
+	};
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&ans_sart {
+	status = "okay";
+};
+
+&nvme {
+	status = "okay";
+};
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&dcp {
+	panel: panel {
+		status = "disabled";
+	};
+};
+
+&pmc {
+	status = "okay";
+};
+
+&mcc {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+/* The sensor is on the logic board, in the base. */
+&aop_accel {
+	label = "accel-base";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,machine-kind = "MacBook Pro";
+};
+
+/*
+ * The six SN012776 speaker amps, held in hardware shutdown until a sound
+ * card enables them (ADT /arm-io/i2c1/audio-speaker@38): one interrupt line
+ * on AP pin 55, level low; sense slots from speaker-config (speaker i at RX
+ * bytes 4i and 4i + 2, order LW1 RW1 LW2 RW2 LT RT). Names as on the J314
+ * and J316, which speakersafetyd's profile uses. Every amp joins the SDZ
+ * fail-closed group: an over-temperature or over-current fault on any one
+ * forces the shared shutdown line low.
+ */
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output@4B). Its
+ * reset line is nub GPIO pin 58, driven high to run the codec (the driver's
+ * "reset" is an enable, as on the J514/J516); its interrupt is AP pin 106,
+ * level low. The AOP firmware runs the jack's stream on MCA cluster 2.
+ */
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 58 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl 106 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&isp {
+	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+	memory-region-names = "text", "data", "heap";
+	apple,platform-id = <5>;
+	/* ADT isp0 cam-connections-scheme */
+	apple,cam-connections-scheme = <0x10>;
+	status = "okay";
+
+	/*
+	 * The front camera, an IMX958: firmware configuration 5 as the
+	 * firmware reports it.
+	 */
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <0 0 1920 1080>;
+		};
+		/* 1280x720 */
+		preset1 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 0 1280 720>;
+		};
+	};
+};
+
+&isp_dart0 {
+	status = "okay";
+};
+
+&isp_dart1 {
+	status = "okay";
+};
+
+&isp_dart2 {
+	status = "okay";
+};
+
+/*
+ * The loaded GPU firmware keeps running across system sleep. Like the Neo's
+ * GFX domain, these domains must not be switched off while that image lives.
+ * The PMP report vote is still owned by the GPU consumer.
+ */
+&ps_afr {
+	apple,always-on;
+};
+
+&ps_gfx {
+	apple,always-on;
+};
+
+/* The loader fills the operating points, calibration and all six memory regions. */
+&gfx_mbox {
+	status = "okay";
+};
+
+&gpu {
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+			      "l2-pagetables", "fw-text";
+	operating-points-v2 = <&gpu_opp>;
+	apple,cs-opp = <&gpu_cs_opp>;
+	apple,afr-opp = <&gpu_afr_opp>;
+	/* Avoid a core power cycle between interactive submissions, then release. */
+	apple,idle-off-delay-ms = <16>;
+	status = "okay";
+};
+
+/*
+ * The Type-C ports (ADT nub-spmi-a0 hpm0/hpm1, nub-spmi-a1 hpm2) and the
+ * MagSafe controller (nub-spmi-a0 hpm5). The ADT lists the event, sleep and
+ * wake interrupts; select is event + 2.
+ */
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Back";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_con_hs: endpoint {
+						remote-endpoint = <&usb_drd0_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec0_con_ss: endpoint {
+						remote-endpoint = <&atcphy0_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <39 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_con_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_con_ss: endpoint {
+						remote-endpoint = <&atcphy1_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	/* MagSafe port */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <65 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+	};
+};
+
+&nub_spmi_a1 {
+	status = "okay";
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec2_con_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec2_con_ss: endpoint {
+						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	status = "okay";
+
+	port {
+		atcphy0_ss: endpoint {
+			remote-endpoint = <&typec0_con_ss>;
+		};
+	};
+};
+
+&atcphy0_mbox {
+	status = "okay";
+};
+
+&usb_drd0_dart_0 {
+	status = "okay";
+};
+
+&usb_drd0_dart_1 {
+	status = "okay";
+};
+
+&usb_drd0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd0_hs: endpoint {
+				remote-endpoint = <&typec0_con_hs>;
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	status = "okay";
+
+	port {
+		atcphy1_ss: endpoint {
+			remote-endpoint = <&typec1_con_ss>;
+		};
+	};
+};
+
+&atcphy1_mbox {
+	status = "okay";
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
+
+&usb_drd1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd1_hs: endpoint {
+				remote-endpoint = <&typec1_con_hs>;
+			};
+		};
+	};
+};
+
+&atcphy2 {
+	status = "okay";
+
+	port {
+		atcphy2_ss: endpoint {
+			remote-endpoint = <&typec2_con_ss>;
+		};
+	};
+};
+
+&atcphy2_mbox {
+	status = "okay";
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd2_hs: endpoint {
+				remote-endpoint = <&typec2_con_hs>;
+			};
+		};
+	};
+};
+
+/* The video encoder, its DARTs and its power domains. */
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart0 {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
+#include "t6040-j616s-usb3.dtsi"
+
+/* External display chain, all disabled: the gate in drivers/soc/apple/display-gate.c enables it. */
+#include "t6040-j616s-extdisp.dtsi"
+#include "t6040-j616s-extdisp-mem-loader.dtsi"
+#include "t6040-j616s-extdisp-hdmi.dtsi"
+#include "t6040-j616s-extdisp-usbc.dtsi"
+#include "t6040-j616s-dpaudio.dtsi"
+/* Additional Abbey PMICs on the two independent NUB SPMI buses. */
+&nub_spmi1 {
+	status = "okay";
+
+	pmic@e {
+		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+	};
+};
+
+&nub_spmi2 {
+	status = "okay";
+
+	pmic@e {
+		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+		reg = <0xe SPMI_USID>;
+	};
+};
+
+&ps_nub_spmi_ahb {
+	status = "okay";
+};
+
+&ps_nub_spmi1 {
+	status = "okay";
+};
+
+&ps_nub_spmi2 {
+	status = "okay";
+};
+
+&pinctrl {
+	sd_clkreq_pins: sd-clkreq-pins {
+		pinmux = <APPLE_PINMUX(1, 1)>;
+	};
+};
+
+&pcie0 {
+	interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1732 IRQ_TYPE_LEVEL_HIGH>;
+	/* Widen bus-range only with the SD power/port ownership handoff. */
+	iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie1_dart 1 1>;
+
+	port01: pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0 0 0 0>;
+		reset-gpios = <&pinctrl 5 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&sd_clkreq_pins>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
+				<0 0 0 2 &port01 0 0 0 1>,
+				<0 0 0 3 &port01 0 0 0 2>,
+				<0 0 0 4 &port01 0 0 0 3>;
+		/* The SD power switch needs an SMC service binding. */
+		status = "disabled";
+	};
+};
+
+/*
+ * The SMC owns automatic fan policy. Drop the host fan trip/map instances
+ * after the board's thermal descriptions, retaining all passive and critical
+ * protection. Keep this final policy separate from ladder descriptions so
+ * independent ladder updates cannot restore autonomous SMC writes.
+ */
+
+#define J616S_DELETE_FAN_TRIPS \
+	/delete-node/ trip-fan1; \
+	/delete-node/ trip-fan2; \
+	/delete-node/ trip-fan3; \
+	/delete-node/ trip-fan4; \
+	/delete-node/ trip-fan5;
+
+/* Some CPU ladders also map full fan speed to the passive trip. */
+#define J616S_DELETE_FAN_MAPS \
+	/delete-node/ map-fan1; \
+	/delete-node/ map-fan2; \
+	/delete-node/ map-fan3; \
+	/delete-node/ map-fan4; \
+	/delete-node/ map-fan5; \
+	/delete-node/ map-fan6;
+
+/ {
+	thermal-zones {
+		cpu-die-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu0-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu1-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu2-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu3-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu4-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu5-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu6-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+	};
+};
+
+#undef J616S_DELETE_FAN_TRIPS
+#undef J616S_DELETE_FAN_MAPS
+
+/*
+ * Proven on the J616s (MobileNetV1 top-1 16/16). The ANE stays idle until
+ * the loader fills and enables the two preload reservations above.
+ */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	memory-region = <&ane_fw_text>, <&ane_fw_data>;
+	memory-region-names = "firmware-text", "firmware-data";
+	status = "okay";
+};
