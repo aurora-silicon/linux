@@ -865,6 +865,35 @@ static void ane_rtclient_dump_rings(struct ane_rtclient *ane)
  * 64-byte IO slot would wedge the ring; cursor advances after each
  * completed command (the fw treats bit0 as host-owned).
  */
+/*
+ * Both H14 waits, for a command's acknowledgment in the IO ring and for a
+ * CALL's finish event in the coherent IO_T2H ring, poll, so the poll cadence
+ * is the whole detection lag. call_poll_us is how long the head of each wait
+ * sleeps only 1..2 us between looks (the real period is the hrtimer wake
+ * latency) before it falls back to 50..100 us, which keeps long programs (the
+ * Parakeet encoder, about 254 ms) from spending the wait on hrtimer wakeups.
+ *
+ * The default covers 5 ms. At the old 1 ms a MobileNet CALL (about 1.1 ms on
+ * the M2) ran past the head and paid up to 100 us more for its finish event,
+ * and the acknowledgment wait busy-waited 50 us between looks. 0 restores the
+ * uniform 50..100 us cadence; a very large value makes every wait 1..2 us
+ * sleeps. Writable at run time (0644), so cadences can be compared in one
+ * boot.
+ */
+static unsigned int call_poll_us = 5000;
+module_param(call_poll_us, uint, 0644);
+MODULE_PARM_DESC(call_poll_us,
+		 "Microseconds at the head of the H14 acknowledgment and CALL finish-event waits that sleep only 1..2 us between looks, then 50..100 us (default 5000; 0 = uniform 50..100 us; a very large value makes every wait 1..2 us sleeps)");
+
+/* One sleep of an H14 wait that started at start; see call_poll_us. */
+static void ane_rtclient_poll_sleep(ktime_t start, unsigned int tight_us)
+{
+	if (tight_us && ktime_us_delta(ktime_get(), start) < tight_us)
+		usleep_range(1, 2);
+	else
+		usleep_range(50, 100);
+}
+
 static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 					struct ane_legacy_buffer *command,
 				       size_t length, u16 opcode,
@@ -874,6 +903,8 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 	struct ane_t6021 *a = ane->fw;
 	u64 *io, header;
 	void __iomem *ipi = ane_rtclient_doorbell(ane);
+	unsigned int poll_us = ane->soc->platform ? 0 : READ_ONCE(call_poll_us);
+	ktime_t start;
 	int result = -ETIMEDOUT;
 
 	if (!ane->held || !ane_rtclient_channels_unchanged(ane))
@@ -917,6 +948,7 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 	WRITE_ONCE(io[0], command->dma);
 	dma_wmb();
 	writel(BIT(ane->channels[channel].bit), ipi);
+	start = ktime_get();
 	while (time_before(jiffies, deadline)) {
 		u32 pending;
 
@@ -984,10 +1016,11 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 					ane->channels[channel].slots;
 			goto out;
 		}
-		/* Fast poll: check the rings every 50 us instead of
-		 * sleeping 1-2 ms.
-		 */
-		udelay(50);
+		/* The later generations keep their 50 us busy-wait. */
+		if (ane->soc->platform)
+			udelay(50);
+		else
+			ane_rtclient_poll_sleep(start, poll_us);
 		ane->xt_ack_polls++;
 	}
 	dev_info(ane->dev, "LEGACY timeout ch=%u op=%#x io=%016llx\n",
@@ -1007,22 +1040,6 @@ static unsigned int call_settle_us;
 module_param(call_settle_us, uint, 0644);
 MODULE_PARM_DESC(call_settle_us,
 		 "Microseconds to sleep after a CALL's finish event (default 0: the event marks the output in DRAM)");
-
-/*
- * The finish-event wait polls the coherent IO_T2H ring, so the poll cadence is
- * the whole detection lag: a uniform 50..100 us sleep adds 0..100 us of pure
- * wait to every CALL. call_poll_us is how long the head of the wait sleeps
- * only 1..2 us between looks (the real period is the hrtimer wake latency)
- * before it falls back to the 50..100 us sleep, which keeps long programs (the
- * Parakeet encoder, about 254 ms) from spending the wait on hrtimer wakeups.
- * 0 restores the uniform 50..100 us cadence. A very large value makes the
- * whole wait 1..2 us sleeps. Writable at run time (0644), so both cadences can
- * be compared in one boot.
- */
-static unsigned int call_poll_us = 1000;
-module_param(call_poll_us, uint, 0644);
-MODULE_PARM_DESC(call_poll_us,
-		 "Microseconds at the head of the CALL finish-event wait that sleep only 1..2 us between looks, then 50..100 us (default 1000; 0 = uniform 50..100 us; a very large value makes the whole wait 1..2 us sleeps)");
 
 /* trace_td: a read-only timeline of each CALL for performance work. Off
  * by default; switch it at runtime with
@@ -1341,8 +1358,7 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 				  unsigned long deadline)
 {
 	unsigned int poll_us = ane->soc->platform ? 0 : READ_ONCE(call_poll_us);
-	ktime_t tight_end = ktime_add_ns(ktime_get(),
-					 (u64)poll_us * NSEC_PER_USEC);
+	ktime_t start = ktime_get();
 
 	if (ane_t6021_tracing)
 		return ane_rtclient_call_wait_traced(ane, deadline);
@@ -1366,10 +1382,7 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 			 */
 			return -EPROTO;
 		}
-		if (poll_us && ktime_before(ktime_get(), tight_end))
-			usleep_range(1, 2);
-		else
-			usleep_range(50, 100);
+		ane_rtclient_poll_sleep(start, poll_us);
 		ane->xt_finish_polls++;
 	} while (time_before(jiffies, deadline));
 	if (atomic_read(&ane_t6021_quarantined))
