@@ -157,14 +157,13 @@ static u64 dcp_binary64_ratio(u64 num, u64 den)
  * (x1000 below), a swap asks for brightness SDR white x H, display EDR
  * scale 1 / H and, while the frame uses EDR, headroom used H; the firmware
  * shows a PQ surface at (PQ nits / 100) x the scale x the panel level, so
- * PQ 100 lands at SDR white and highlights reach the panel peak.  H moves
- * in steps linear in stops, one per swap: about 1 s up when EDR starts and
- * 2 s down when it ends, with a brightness limit of 1.3 x the brightness in
- * the middle of a ramp.  Headroom used drops to 1.0 as soon as EDR ends.
+ * PQ 100 lands at SDR white and highlights reach the panel peak.  H rises
+ * in steps linear in stops, one per swap, about 1 s when EDR starts, with
+ * a brightness limit of 1.3 x the brightness in the middle of the ramp.
+ * When EDR ends, headroom used drops to 1.0 and H returns to 1.0.
  * Unchanged values are left out: the firmware keeps them.
  */
 #define DCP_EDR_STEP_UP		1047	/* x1000 per swap */
-#define DCP_EDR_STEP_DOWN	1023
 
 #define dcp_swap_set_ratio(swap, field, flag, num, den)				\
 	do {								\
@@ -200,11 +199,17 @@ static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) 
 	if (cur == target && !carries && !restart && dcp->edr_sent == dcp->output_edr)
 		return;
 
+	/*
+	 * Up in steps; down at once.  macOS ramps down too, but its compositor
+	 * keeps presenting until the ramp ends.  Here a still desktop may send
+	 * no further swap, and a ramp stuck partway leaves SDR content dimmed
+	 * by the scale (headroom used is already 1.0).
+	 */
 	next = cur;
 	if (target > cur)
 		next = min(cur * DCP_EDR_STEP_UP / 1000 + 1, target);
 	else if (target < cur)
-		next = max(cur * 1000 / DCP_EDR_STEP_DOWN, target);
+		next = target;
 
 	bri = (u64)sdr * next / 1000;
 	dcp_swap_set_brightness(swap, bri);
