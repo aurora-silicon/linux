@@ -687,6 +687,9 @@ enum {
 #define ANE_H16_JOB_FILL_PROGRAM BIT(0)	/* u32 program handle at +8 */
 #define ANE_H16_JOB_FILL_PROCESS BIT(1)	/* u32 process handle at +0xc */
 #define ANE_H16_JOB_RESULT_MAX SZ_64M
+static unsigned int h16_job_result_mb = 64;
+module_param(h16_job_result_mb, uint, 0444);
+MODULE_PARM_DESC(h16_job_result_mb, "Diagnostic result allocation1..64MiB, default64");
 
 #define ANE_H16_JOB_DONE 64
 
@@ -717,10 +720,9 @@ static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
 	return NULL;
 }
 
-/*
- * @trailer: how many u64 get_cycles() values (on arm64 the 24 MHz system
- * counter, the clock of the firmware's event timestamps) follow @data; they
- * count in the length.
+/* @trailer counts host architectural-counter values after @data; they count
+ * in the length. Decode with the host arch_timer frequency, independently of
+ * the firmware event clock (M4 Linux1GHz host versus24MHz firmware).
  */
 static int ane_h16_job_emit_counters(struct ane_h16_job *j, u32 op, int status, u64 ns,
 				     const void *data, size_t length,
@@ -1018,12 +1020,12 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 	u8 *in;
 	int ret;
 
-	if (*ppos || count > SZ_256M)
+	if (*ppos || count > SZ_256M || !h16_job_result_mb || h16_job_result_mb > 64)
 		return -EINVAL;
 	in = vmemdup_user(buf, count);
 	if (IS_ERR(in))
 		return PTR_ERR(in);
-	j.size = ANE_H16_JOB_RESULT_MAX;
+	j.size = (size_t)h16_job_result_mb * SZ_1M;
 	j.out = vzalloc(j.size);
 	if (!j.out) {
 		kvfree(in);
