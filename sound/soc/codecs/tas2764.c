@@ -79,6 +79,11 @@ struct tas2764_priv {
 	/* Muted at a stream's end, until the next one: the bus clock may stop */
 	bool stream_stopped;
 	struct delayed_work shutdown_work;
+	/*
+	 * Orders the fault handler's read and judgement of the latches against
+	 * an unmute clearing a stale clock fault and stream_stopped
+	 */
+	struct mutex fault_lock;
 };
 
 #include "tas2764-quirks.h"
@@ -203,9 +208,8 @@ static const unsigned int tas2764_int_readout_regs[6] = {
 	TAS2764_INT_LTCH4,
 };
 
-static irqreturn_t tas2764_irq(int irq, void *data)
+static irqreturn_t tas2764_irq_locked(struct tas2764_priv *tas2764)
 {
-	struct tas2764_priv *tas2764 = data;
 	u8 latched[6] = {0, 0, 0, 0, 0, 0};
 	unsigned int val;
 	int ret = IRQ_NONE;
@@ -250,6 +254,19 @@ static irqreturn_t tas2764_irq(int irq, void *data)
 					      TAS2764_INT_CLK_CFG_IRQZ_CLR,
 					      TAS2764_INT_CLK_CFG_IRQZ_CLR);
 	}
+
+	return ret;
+}
+
+static irqreturn_t tas2764_irq(int irq, void *data)
+{
+	struct tas2764_priv *tas2764 = data;
+	irqreturn_t ret;
+
+	/* A stream's unmute does not come between reading the latches and judging them */
+	mutex_lock(&tas2764->fault_lock);
+	ret = tas2764_irq_locked(tas2764);
+	mutex_unlock(&tas2764->fault_lock);
 
 	return ret;
 }
@@ -446,9 +463,28 @@ static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 
 	if (!mute) {
 		if (tas2764->deferred_shutdown) {
+			unsigned int latched;
+
 			/* still muted from the last stream: no shutdown in between */
 			cancel_delayed_work_sync(&tas2764->shutdown_work);
+
+			/*
+			 * A clock fault the amp latched while the bus was stopped is
+			 * not this stream's: the handler, which can run several
+			 * milliseconds behind on the shared line, must not see it
+			 * after stream_stopped clears.
+			 */
+			mutex_lock(&tas2764->fault_lock);
+			if (tas2764->irq &&
+			    !regmap_read(tas2764->regmap, TAS2764_INT_LTCH0, &latched) &&
+			    latched == TAS2764_INT_LTCH0_TDM_CLOCK) {
+				snd_soc_component_update_bits(tas2764->component,
+							      TAS2764_INT_CLK_CFG,
+							      TAS2764_INT_CLK_CFG_IRQZ_CLR,
+							      TAS2764_INT_CLK_CFG_IRQZ_CLR);
+			}
 			WRITE_ONCE(tas2764->stream_stopped, false);
+			mutex_unlock(&tas2764->fault_lock);
 		}
 		tas2764->dac_powered = true;
 		ret = tas2764_update_pwr_ctrl(tas2764);
@@ -1235,6 +1271,9 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 	tas2764->dev = &client->dev;
 	tas2764->irq = client->irq;
 	INIT_DELAYED_WORK(&tas2764->shutdown_work, tas2764_shutdown_work);
+	result = devm_mutex_init(&client->dev, &tas2764->fault_lock);
+	if (result)
+		return result;
 	i2c_set_clientdata(client, tas2764);
 	dev_set_drvdata(&client->dev, tas2764);
 
