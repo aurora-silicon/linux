@@ -393,6 +393,75 @@
 				};
 			};
 		};
+
+		/*
+		 * Reporting zones for the SoC, charger and enclosure sensors. These
+		 * indices count temperature-* children of smc_hwmon, including the
+		 * six CPU channels inherited from t8140.dtsi. Keep the sensor order.
+		 *
+		 * These zones have no trips: firmware die-temperature limits do not
+		 * establish limits for these SMC readings. GPU cooling requires a
+		 * qualified firmware ceiling and board-specific thermal policy.
+		 */
+		smc-tp0t-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 6>;
+		};
+
+		charger-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 11>; /* TCMz */
+		};
+
+		chassis1-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 12>; /* Ts0A */
+		};
+
+		chassis2-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 13>; /* Ts0I */
+		};
+
+		chassis3-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 14>; /* Ts0M */
+		};
+
+		smc-tp02-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 50>;
+		};
+
+		smc-tp06-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 52>;
+		};
+
+		smc-tp0e-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 56>;
+		};
+
+		smc-tpx1-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 63>;
+		};
+
+		smc-tpx3-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 65>;
+		};
 	};
 
 	/*
