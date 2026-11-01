@@ -3296,9 +3296,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * an external processor keeps installing what VRR_ENABLED asks.  After
 	 * an adaptive swap timed out (dcp_swap_watchdog), stay fixed.
 	 */
-	modeset->vrr = mode->vrr &&
-		       (dcp_vrr_live(dcp) || crtc_state->vrr_enabled) &&
-		       !READ_ONCE(dcp->desktop->vrr_failed);
+	modeset->vrr = mode->vrr && !READ_ONCE(dcp->desktop->vrr_failed);
 	dcp->desktop->vrr_min_on = 0;
 
 	cookie->status = ~0U;
@@ -3376,7 +3374,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 	WRITE_ONCE(dcp->desktop->modeset_active, false);
 	dcp->vrr_enabled = !ret && modeset->vrr;
-	if (dcp->vrr_enabled && dcp_vrr_live(dcp)) {
+	if (dcp->vrr_enabled) {
 		/*
 		 * Fixed refresh holds the minimum at the timing's own rate,
 		 * never above the sink's maximum (a 280.001 Hz timing reports
@@ -3386,7 +3384,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		dcp->desktop->vrr_min_off = drm_mode_vrefresh(&crtc_state->mode) << 16;
 		if (mode->max_vrr && mode->max_vrr < dcp->desktop->vrr_min_off)
 			dcp->desktop->vrr_min_off = mode->max_vrr;
-		dcp->desktop->vrr_min_sent = mode->min_vrr;
+		/*
+		 * The panel starts at the minimum it was installed with.  An
+		 * external processor's frame pacing state is not known after a
+		 * mode set, so the next frame sends it.
+		 */
+		dcp->desktop->vrr_min_sent = dcp_vrr_live(dcp) ? mode->min_vrr : 0;
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
 
@@ -3551,9 +3554,10 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 /*
- * VRR_ENABLED on a live VRR timing.  The firmware takes a new minimum rate
- * (IOMFBParameter 14) without a mode set: the mode's own minimum lets the
- * display follow the frames, the nominal rate holds it fixed.  Sent ahead
+ * VRR_ENABLED on a live VRR timing, without a mode set.  The panel takes a
+ * new minimum rate (IOMFBParameter 14): the mode's own minimum lets the
+ * display follow the frames, the nominal rate holds it fixed.  An external
+ * processor switches video power savings instead (see below).  Sent ahead
  * of the frame's colour updates and swap, which @next continues with.
  * Returns true when it took over the frame.
  */
@@ -3573,6 +3577,21 @@ static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_st
 	if (min == d->vrr_min_sent)
 		return false;
 	d->vrr_min_sent = min;
+	if (!dcp_vrr_live(dcp)) {
+		/*
+		 * An external processor keeps adaptive sync installed for the
+		 * whole VRR timing and ignores a new minimum rate.  Like macOS
+		 * when a fullscreen client comes and goes, switch its video
+		 * power savings instead: on (1) holds the timing's own rate,
+		 * off (0) lets the frames pace the display.
+		 */
+		d->vrr_pacing = crtc_state->vrr_enabled ? 0 : 1;
+		dev_dbg(dcp->dev, "video power savings %u (VRR_ENABLED %u)\n",
+			d->vrr_pacing, crtc_state->vrr_enabled);
+		dcp_enable_disable_video_power_savings(dcp, false, &d->vrr_pacing,
+						       next, NULL);
+		return true;
+	}
 	/* minRR (16.16 Hz), then mediaTargetRate and the fractional rate */
 	param.value[0] = min;
 	dev_dbg(dcp->dev, "adaptive sync minimum %#x (VRR_ENABLED %u)\n", min,

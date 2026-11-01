@@ -1511,9 +1511,9 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 
 	/*
 	 * On desktop 26.6 firmware VRR_ENABLED takes effect with the next
-	 * frame, without a DRM mode set: the panel through a new minimum
-	 * rate (dcp_vrr_update()), the external processors by reselecting
-	 * their timing (dcp_flush()).
+	 * frame, without a DRM mode set (dcp_vrr_update()): the panel through
+	 * a new minimum rate, the external processors through video power
+	 * savings with adaptive sync installed for the whole VRR timing.
 	 */
 
 	/* DRM core only caps the blob size; the gamma update copies a full table. */
