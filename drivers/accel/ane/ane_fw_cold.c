@@ -47,6 +47,12 @@ struct ane_fw_backend {
 	struct platform_device *pdev;
 	const struct ane_fw_platform *soc;
 	void __iomem *engine, *pmgr, *gate, *dart[ANE_FW_DARTS];
+	/* Mapped register windows, for the MMIO trace hook. */
+	struct {
+		void __iomem *base;
+		phys_addr_t pa;
+		resource_size_t size;
+	} window[3 + ANE_FW_DARTS];
 	struct device *power, *memory;
 	struct iommu_domain *domain;
 	struct ane_fw_transport transport;
@@ -62,12 +68,57 @@ struct ane_fw_backend {
 	u64 next_dva;
 	enum ane_fw_stage stage;
 	bool retained;
+	/* ANE_SYS and the child power states are on: the engine is readable. */
+	bool powered;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
  * the platform bus would otherwise resume genpd and attach DMA before probe.
  */
 static struct ane_fw_backend *ane_backend;
+
+/*
+ * Every register access of this backend goes through these helpers, so a
+ * debug build can log the physical address of each access before it is
+ * made. The hook is empty here.
+ */
+static inline void ane_fw_trace(struct ane_fw_backend *b, char op, const void __iomem *a,
+				u64 value)
+{
+}
+
+static u32 ane_rd32(struct ane_fw_backend *b, const void __iomem *a)
+{
+	ane_fw_trace(b, 'r', a, 0);
+	return readl(a);
+}
+
+static u64 ane_rd64(struct ane_fw_backend *b, const void __iomem *a)
+{
+	ane_fw_trace(b, 'R', a, 0);
+	return readq(a);
+}
+
+static void ane_wr32(struct ane_fw_backend *b, u32 value, void __iomem *a)
+{
+	ane_fw_trace(b, 'w', a, value);
+	writel(value, a);
+}
+
+static void ane_wr64(struct ane_fw_backend *b, u64 value, void __iomem *a)
+{
+	ane_fw_trace(b, 'W', a, value);
+	writeq(value, a);
+}
+
+static int ane_poll32(struct ane_fw_backend *b, void __iomem *a, u32 mask, u32 want,
+		      unsigned long sleep_us, u64 timeout_us)
+{
+	u32 value;
+
+	ane_fw_trace(b, 'p', a, want);
+	return readl_poll_timeout(a, value, (value & mask) == want, sleep_us, timeout_us);
+}
 static struct kexec_blocker ane_fw_kexec = {
 	.users = ATOMIC_INIT(0),
 	.reason = "ANE firmware retains private DMA mappings until hardware reset",
@@ -80,13 +131,16 @@ static int ane_fw_quarantine(struct ane_fw_backend *b, int error)
 	b->stage = ANE_STAGE_QUARANTINED;
 	dev_err(&b->pdev->dev, "ANE quarantined (%d); mappings and power retained, reboot required\n",
 		error);
+	/* The engine and DARTs are only readable once powered. */
+	if (!b->powered)
+		return error;
 	for (i = 0; i < 8; i++)
 		dev_info(&b->pdev->dev, "scratch%u=%#x\n", i,
-			 readl(b->engine + b->soc->scratch + i * 4));
+			 ane_rd32(b, b->engine + b->soc->scratch + i * 4));
 	for (i = 0; i < ANE_FW_DARTS; i++)
 		dev_info(&b->pdev->dev, "DART%u error=%#x address=%#x:%#x\n", i,
-			 readl(b->dart[i] + 0x100), readl(b->dart[i] + 0x174),
-			 readl(b->dart[i] + 0x170));
+			 ane_rd32(b, b->dart[i] + 0x100), ane_rd32(b, b->dart[i] + 0x174),
+			 ane_rd32(b, b->dart[i] + 0x170));
 	return error;
 }
 
@@ -99,49 +153,67 @@ static bool ane_fw_raw_boot(void)
 	       !strcmp(evidence, "raw-no-xnu-ane-untouched-v1");
 }
 
-static void ane_fw_snapshot(struct ane_fw_backend *b, bool log)
+/*
+ * Step 1: PMGR words only. These are the only reads made with ANE_SYS in an
+ * unknown power state; the engine block and its DARTs sit behind ANE_SYS and
+ * an access to them while it is off stalls the bus.
+ */
+static void ane_fw_snapshot_pmgr(struct ane_fw_backend *b)
+{
+	struct ane_fw_cold_state *s = &b->cold;
+
+	s->sys = ane_rd32(b, b->pmgr + 0x290);
+	s->cpu = ane_rd32(b, b->pmgr + 0xc000);
+	s->subblock = ane_rd32(b, b->pmgr + 0xc008);
+	dev_info(&b->pdev->dev, "U2 ANE_SYS=%#x CPU_PS=%#x subblock=%#x\n",
+		 s->sys, s->cpu, s->subblock);
+}
+
+/* Step 2: PWGATE, with ANE_SYS on and before the child power step. */
+static void ane_fw_snapshot_gate(struct ane_fw_backend *b)
+{
+	struct ane_fw_cold_state *s = &b->cold;
+
+	s->gate_request = ane_rd32(b, b->gate + 0xc);
+	s->gate_ack = ane_rd32(b, b->gate + 0x30);
+	dev_info(&b->pdev->dev, "U2 PWGATE=%#x/%#x\n", s->gate_request, s->gate_ack);
+}
+
+/* Step 3: the engine and its DARTs, after the child power step. */
+static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 {
 	struct ane_fw_cold_state *s = &b->cold;
 	struct device *dev = &b->pdev->dev;
 	unsigned int i, j;
 
-	s->sys = readl(b->pmgr + 0x290);
-	s->cpu = readl(b->pmgr + 0xc000);
-	s->subblock = readl(b->pmgr + 0xc008);
-	s->gate_request = readl(b->gate + 0xc);
-	s->gate_ack = readl(b->gate + 0x30);
-	s->ce_state = readq(b->engine + 0x18a4010);
-	s->ce_error = readq(b->engine + 0x18a4018);
-	s->rvbar = readq(b->engine + 0x1050000);
-	s->control = readl(b->engine + b->soc->wrapper + 0x44);
-	s->status = readl(b->engine + b->soc->wrapper + 0x48);
-	s->pending = readl(b->engine + b->soc->irq_status);
+	s->ce_state = ane_rd64(b, b->engine + 0x18a4010);
+	s->ce_error = ane_rd64(b, b->engine + 0x18a4018);
+	s->rvbar = ane_rd64(b, b->engine + 0x1050000);
+	s->control = ane_rd32(b, b->engine + b->soc->wrapper + 0x44);
+	s->status = ane_rd32(b, b->engine + b->soc->wrapper + 0x48);
+	s->pending = ane_rd32(b, b->engine + b->soc->irq_status);
 	for (i = 0; i < 8; i++)
-		s->scratch[i] = readl(b->engine + b->soc->scratch + i * 4);
-	for (i = 0; i < ANE_FW_DARTS; i++) {
-		s->dart[i].version = readl(b->dart[i] + 8);
-		s->dart[i].protect = readl(b->dart[i] + 0x200);
-		s->dart[i].unprotect = readl(b->dart[i] + 0x204);
-		s->dart[i].lock = readl(b->dart[i] + 0x208);
-		s->dart[i].error = readl(b->dart[i] + 0x100);
-		for (j = 0; j < 16; j++)
-			s->dart[i].enabled[j] = readl(b->dart[i] + 0xc00 + 4 * j);
-		if (log)
-			dev_info(dev, "U2 DART%u version=%#x protect=%#x unprotect=%#x lock=%#x error=%#x\n",
-				 i, s->dart[i].version, s->dart[i].protect,
-				 s->dart[i].unprotect, s->dart[i].lock, s->dart[i].error);
-	}
-	if (!log)
-		return;
-	dev_info(dev, "U2 ANE_SYS=%#x CPU_PS=%#x subblock=%#x PWGATE=%#x/%#x\n",
-		 s->sys, s->cpu, s->subblock, s->gate_request, s->gate_ack);
+		s->scratch[i] = ane_rd32(b, b->engine + b->soc->scratch + i * 4);
 	dev_info(dev, "U2 control=%#x status=%#x RVBAR=%#llx CE=%#llx/%#llx pending=%#x\n",
 		 s->control, s->status, s->rvbar, s->ce_state, s->ce_error, s->pending);
+	for (i = 0; i < ANE_FW_DARTS; i++) {
+		s->dart[i].version = ane_rd32(b, b->dart[i] + 8);
+		s->dart[i].protect = ane_rd32(b, b->dart[i] + 0x200);
+		s->dart[i].unprotect = ane_rd32(b, b->dart[i] + 0x204);
+		s->dart[i].lock = ane_rd32(b, b->dart[i] + 0x208);
+		s->dart[i].error = ane_rd32(b, b->dart[i] + 0x100);
+		for (j = 0; j < 16; j++)
+			s->dart[i].enabled[j] = ane_rd32(b, b->dart[i] + 0xc00 + 4 * j);
+		dev_info(dev, "U2 DART%u version=%#x protect=%#x unprotect=%#x lock=%#x error=%#x\n",
+			 i, s->dart[i].version, s->dart[i].protect,
+			 s->dart[i].unprotect, s->dart[i].lock, s->dart[i].error);
+	}
 	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
 		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
 
 		dev_info(dev, "U2 DAPF%u flags=%#x start=%#llx end=%#llx enable=%#x\n",
-			 i, readl(r), readq(r + 8), readq(r + 0x10), readl(r + 0x20));
+			 i, ane_rd32(b, r), ane_rd64(b, r + 8), ane_rd64(b, r + 0x10),
+			 ane_rd32(b, r + 0x20));
 	}
 }
 
@@ -193,7 +265,7 @@ static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
 	 * after a program change does.
 	 */
 	for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
-		if (readl(b->dart[i] + 0x100))
+		if (ane_rd32(b, b->dart[i] + 0x100))
 			return -EIO;
 	return 0;
 }
@@ -262,14 +334,14 @@ static u32 ane_fw_read32(void *ctx, u32 reg)
 {
 	struct ane_fw_backend *b = ctx;
 
-	return readl(b->engine + reg);
+	return ane_rd32(b, b->engine + reg);
 }
 
 static void ane_fw_write32(void *ctx, u32 reg, u32 value)
 {
 	struct ane_fw_backend *b = ctx;
 
-	writel(value, b->engine + reg);
+	ane_wr32(b, value, b->engine + reg);
 }
 
 static u64 ane_fw_now(void *ctx)
@@ -298,46 +370,65 @@ static const struct ane_fw_transport_ops ane_fw_ops = {
 	.alloc = ane_fw_alloc, .refused = ane_fw_refused,
 };
 
-static int ane_fw_power(struct ane_fw_backend *b)
+/*
+ * Power in the order the H17 U2 runs measured: genpd ANE_SYS on, PWGATE read,
+ * CPU power state on, PWGATE request cleared, sub-block power state on. Only
+ * then are the engine and DARTs read and checked for their reset state, before
+ * Linux writes anything to the engine. A failed check after power-on retains
+ * power and mappings until reboot, like any other quarantine.
+ */
+static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
 {
-	u32 value;
+	struct device *dev = &b->pdev->dev;
 	u64 ce;
 	int ret;
 
-	b->power = dev_pm_domain_attach_by_id(&b->pdev->dev, 0);
+	b->power = dev_pm_domain_attach_by_id(dev, 0);
 	if (IS_ERR_OR_NULL(b->power))
 		return b->power ? PTR_ERR(b->power) : -ENODEV;
 	ret = pm_runtime_resume_and_get(b->power);
 	if (ret < 0)
 		return ret;
-	/* ANE_SYS can already be physically on while genpd reports off. That
-	 * alone does not make the CPU warm. The pre-write snapshot decides.
-	 */
-	if ((readl(b->pmgr + 0x290) & 0xff) != 0xff)
+	if ((ane_rd32(b, b->pmgr + 0x290) & 0xff) != 0xff)
 		return -EIO;
-	writel(readl(b->pmgr + 0xc000) | 0xf, b->pmgr + 0xc000);
-	ret = readl_poll_timeout(b->pmgr + 0xc000, value, (value & 0xff) == 0xff,
-				 1, 100000);
+	/* The child state may not have moved since the probe stage. */
+	ane_fw_snapshot_pmgr(b);
+	ane_fw_snapshot_gate(b);
+	if (!ane_fw_cold_pmgr_valid(&b->cold, raw_boot) || !ane_fw_cold_gate_valid(&b->cold)) {
+		dev_info(dev, "H17 ANE: child power or gate not in the cold state; refusing\n");
+		return -EPERM;
+	}
+	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc000) | 0xf, b->pmgr + 0xc000);
+	ret = ane_poll32(b, b->pmgr + 0xc000, 0xff, 0xff, 1, 100000);
 	if (ret)
 		return ret;
-	writel(readl(b->pmgr + 0xc008) | 0xf, b->pmgr + 0xc008);
-	ret = readl_poll_timeout(b->pmgr + 0xc008, value, (value & 0xff) == 0xff,
-				 1, 100000);
+	ane_wr32(b, 0, b->gate + 0xc);
+	ret = ane_poll32(b, b->gate + 0xc, 3, 0, 1, 100000);
 	if (ret)
 		return ret;
-	writel(0, b->gate + 0xc);
-	ret = readl_poll_timeout(b->gate + 0x30, value, !value, 1, 100000);
+	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) | 0xf, b->pmgr + 0xc008);
+	ret = ane_poll32(b, b->pmgr + 0xc008, 0xff, 0xff, 1, 100000);
 	if (ret)
 		return ret;
-	writeq(3, b->engine + 0x18a4000);
+	ret = ane_poll32(b, b->gate + 0x30, U32_MAX, 0, 1, 100000);
+	if (ret)
+		return ret;
+	b->powered = true;
+	ane_fw_snapshot_engine(b);
+	if (!ane_fw_cold_engine_valid(&b->cold)) {
+		dev_info(dev, "H17 ANE: engine or DART not in its reset state; refusing\n");
+		return -EPERM;
+	}
+	ane_wr64(b, 3, b->engine + 0x18a4000);
+	ane_fw_trace(b, 'P', b->engine + 0x18a4008, 3);
 	ret = readq_poll_timeout(b->engine + 0x18a4008, ce, (ce & 3) == 3, 1, 100000);
 	if (ret)
 		return ret;
-	writeq(3, b->engine + 0x18a4008);
-	if ((readq(b->engine + 0x18a4010) & 3) != 3 ||
-	    readq(b->engine + 0x18a4018))
+	ane_wr64(b, 3, b->engine + 0x18a4008);
+	if ((ane_rd64(b, b->engine + 0x18a4010) & 3) != 3 ||
+	    ane_rd64(b, b->engine + 0x18a4018))
 		return -EIO;
-	dev_info(&b->pdev->dev, "ANE power: ANE_SYS on, child/PWGATE/CE ready\n");
+	dev_info(dev, "ANE power: ANE_SYS on, child/PWGATE/CE ready\n");
 	return 0;
 }
 
@@ -349,16 +440,16 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
 		u64 start = b->ranges[i * 2], end = b->ranges[i * 2 + 1];
 
-		if (readl(b->dart[0] + 0x208) & BIT(2))
+		if (ane_rd32(b, b->dart[0] + 0x208) & BIT(2))
 			return -EPERM;
-		writel(0x31, r);
-		writel(lower_32_bits(start), r + 8);
-		writel(upper_32_bits(start), r + 0xc);
-		writel(lower_32_bits(end), r + 0x10);
-		writel(upper_32_bits(end), r + 0x14);
-		writel(1, r + 0x20);
-		if ((readl(r) & 0x333) != 0x31 || readq(r + 8) != start ||
-		    readq(r + 0x10) != end || (readl(r + 0x20) & 0xffff) != 1)
+		ane_wr32(b, 0x31, r);
+		ane_wr32(b, lower_32_bits(start), r + 8);
+		ane_wr32(b, upper_32_bits(start), r + 0xc);
+		ane_wr32(b, lower_32_bits(end), r + 0x10);
+		ane_wr32(b, upper_32_bits(end), r + 0x14);
+		ane_wr32(b, 1, r + 0x20);
+		if ((ane_rd32(b, r) & 0x333) != 0x31 || ane_rd64(b, r + 8) != start ||
+		    ane_rd64(b, r + 0x10) != end || (ane_rd32(b, r + 0x20) & 0xffff) != 1)
 			return -EIO;
 	}
 	return 0;
@@ -440,7 +531,7 @@ static int ane_fw_prepare(struct ane_fw_backend *b)
 	unsigned int i;
 	int ret;
 
-	ret = ane_fw_power(b);
+	ret = ane_fw_power(b, ane_fw_raw_boot());
 	if (ret)
 		return ret;
 	ret = of_dma_configure(dev, dev->of_node, true);
@@ -495,10 +586,8 @@ static int ane_fw_prepare(struct ane_fw_backend *b)
 
 static int ane_fw_scratch_wait(struct ane_fw_backend *b, unsigned int cell, u32 wanted)
 {
-	u32 value;
-
-	return readl_poll_timeout(b->engine + b->soc->scratch + cell * 4, value,
-				  value == wanted, 100, 3000000);
+	return ane_poll32(b, b->engine + b->soc->scratch + cell * 4, U32_MAX, wanted,
+			  100, 3000000);
 }
 
 static int ane_fw_boot(struct ane_fw_backend *b)
@@ -510,17 +599,17 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	int ret;
 
 	for (i = 0; i < 8; i++)
-		writel(0, scratch + i * 4);
-	writel(1, scratch + 6 * 4);
-	writel(0, b->engine + b->soc->wrapper + 0x44);
+		ane_wr32(b, 0, scratch + i * 4);
+	ane_wr32(b, 1, scratch + 6 * 4);
+	ane_wr32(b, 0, b->engine + b->soc->wrapper + 0x44);
 	dma_wmb();
-	writel(0x10, b->engine + b->soc->wrapper + 0x44);
+	ane_wr32(b, 0x10, b->engine + b->soc->wrapper + 0x44);
 	ret = ane_fw_scratch_wait(b, 7, 0x08042006);
 	if (ret)
 		return ret;
 	dev_info(&b->pdev->dev, "ANE boot: READY\n");
-	if (readl(scratch) != 8 || readl(scratch + 4) != 0xc440 ||
-	    readl(scratch + 12) != 0xf00000 || readl(scratch + 16))
+	if (ane_rd32(b, scratch) != 8 || ane_rd32(b, scratch + 4) != 0xc440 ||
+	    ane_rd32(b, scratch + 12) != 0xf00000 || ane_rd32(b, scratch + 16))
 		return -EPROTO;
 	put_unaligned_le64(b->ipc.dva, init + 8);
 	put_unaligned_le64(0x380000, init + 0x10);
@@ -533,13 +622,13 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	put_unaligned_le32(64, init + 0x68);
 	put_unaligned_le32(4, init + 0x12c);
 	dma_wmb();
-	writel(lower_32_bits(b->pool.dva + 0x180), scratch);
-	writel(upper_32_bits(b->pool.dva + 0x180), scratch + 4);
-	writel(0xf7fbdff9, scratch + 7 * 4);
+	ane_wr32(b, lower_32_bits(b->pool.dva + 0x180), scratch);
+	ane_wr32(b, upper_32_bits(b->pool.dva + 0x180), scratch + 4);
+	ane_wr32(b, 0xf7fbdff9, scratch + 7 * 4);
 	ret = ane_fw_scratch_wait(b, 7, 0x08042006);
 	if (ret)
 		return ret;
-	table = (u64)readl(scratch + 4) << 32 | readl(scratch);
+	table = (u64)ane_rd32(b, scratch + 4) << 32 | ane_rd32(b, scratch);
 	if (table != b->ipc.dva)
 		return -EPROTO;
 	ret = ane_fw_transport_init(&b->transport, b->soc, &ane_fw_ops, b,
@@ -549,7 +638,7 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	ret = ane_fw_transport_arm(&b->transport);
 	if (ret)
 		return ret;
-	writel(0x08042006, scratch + 3 * 4);
+	ane_wr32(b, 0x08042006, scratch + 3 * 4);
 	ret = ane_fw_scratch_wait(b, 3, 0);
 	if (!ret)
 		dev_info(&b->pdev->dev, "ANE boot: eight channels armed, scratch3 cleared (polled)\n");
@@ -673,13 +762,14 @@ static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t c
 	if (sysfs_streq(buf, "probe")) {
 		if (b->retained)
 			return -EBUSY;
-		ane_fw_snapshot(b, true);
-		if (!ane_fw_cold_valid(&b->cold, ane_fw_raw_boot())) {
-			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or reset state); refusing\n");
+		/* PMGR only: ANE_SYS may be off, which makes the engine unreadable. */
+		ane_fw_snapshot_pmgr(b);
+		if (!ane_fw_cold_pmgr_valid(&b->cold, ane_fw_raw_boot())) {
+			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or child power state); refusing\n");
 			return -EPERM;
 		}
 		b->stage = ANE_STAGE_PROBED;
-		dev_info(dev, "ANE probe: cold reset state and raw-boot evidence verified; no writes\n");
+		dev_info(dev, "ANE probe: raw-boot evidence and cold child power verified; no writes\n");
 		return count;
 	}
 	if (sysfs_streq(buf, "map"))
@@ -698,9 +788,9 @@ static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t c
 		u64 physical[2], size[2], dva[2];
 		u8 data_pin[SHA256_DIGEST_SIZE];
 
-		ane_fw_snapshot(b, false);
-		if (!ane_fw_cold_valid(&b->cold, ane_fw_raw_boot())) {
-			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or reset state); refusing\n");
+		ane_fw_snapshot_pmgr(b);
+		if (!ane_fw_cold_pmgr_valid(&b->cold, ane_fw_raw_boot())) {
+			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or child power state); refusing\n");
 			return -EPERM;
 		}
 		ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin);
@@ -751,6 +841,22 @@ static void ane_fw_observer_free(struct ane_fw_backend *b)
 		iounmap(b->gate);
 	put_device(&b->pdev->dev);
 	kfree(b);
+}
+
+/* Record a mapped register window; the trace hook names accesses by PA. */
+static int ane_fw_window(struct ane_fw_backend *b, unsigned int index, void __iomem *base,
+			 struct device_node *np, unsigned int reg)
+{
+	struct resource res;
+
+	if (!base)
+		return -ENOMEM;
+	if (of_address_to_resource(np, reg, &res))
+		return -EINVAL;
+	b->window[index].base = base;
+	b->window[index].pa = res.start;
+	b->window[index].size = resource_size(&res);
+	return 0;
 }
 
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc)
@@ -821,19 +927,21 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		}
 		dart_phandles[i] = args.np->phandle;
 		b->dart[i] = of_iomap(args.np, 0);
+		ret = ane_fw_window(b, 3 + i, b->dart[i], args.np, 0);
 		of_node_put(args.np);
-		if (!b->dart[i]) {
-			ret = -ENOMEM;
+		if (ret)
 			goto fail;
-		}
 	}
 	b->engine = of_iomap(np, 0);
 	b->pmgr = of_iomap(np, 1);
 	b->gate = of_iomap(np, 2);
-	if (!b->engine || !b->pmgr || !b->gate) {
-		ret = -ENOMEM;
+	ret = ane_fw_window(b, 0, b->engine, np, 0);
+	if (!ret)
+		ret = ane_fw_window(b, 1, b->pmgr, np, 1);
+	if (!ret)
+		ret = ane_fw_window(b, 2, b->gate, np, 2);
+	if (ret)
 		goto fail;
-	}
 	ane_backend = b;
 	ret = device_create_file(&pdev->dev, &dev_attr_firmware_stage);
 	if (ret) {

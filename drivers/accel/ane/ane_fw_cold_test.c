@@ -26,9 +26,41 @@ static void ane_cold_evidence_test(struct kunit *test)
 
 	KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, true));
 	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, false));
-	/* Physical ANE_SYS on is the measured cold state, despite genpd off. */
+	/*
+	 * ANE_SYS is no marker: it may read on while genpd reports off, and
+	 * generic DART runtime PM powers it off again.
+	 */
 	s.sys = 0x2300;
-	KUNIT_EXPECT_FALSE(test, ane_fw_cold_valid(&s, true));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_valid(&s, true));
+}
+
+/*
+ * Each step judges only what its power state makes readable: the probe
+ * step only PMGR words, so a warm engine cannot fail it, and the engine
+ * step nothing in PMGR.
+ */
+static void ane_cold_step_test(struct kunit *test)
+{
+	struct ane_fw_cold_state s = ane_cold_fixture();
+
+	s.control = 0x10;
+	s.dart[0].enabled[0] = 1;
+	s.gate_request = 0;
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_pmgr_valid(&s, true));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_gate_valid(&s));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_valid(&s));
+	s = ane_cold_fixture();
+	s.cpu = 0x0f0003ff;
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_pmgr_valid(&s, true));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_gate_valid(&s));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_valid(&s));
+	s = ane_cold_fixture();
+	s.subblock = 0x3ff;
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_pmgr_valid(&s, true));
+	s = ane_cold_fixture();
+	s.gate_ack = 1;
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_pmgr_valid(&s, true));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_gate_valid(&s));
 }
 
 static void ane_cold_warm_test(struct kunit *test)
@@ -105,6 +137,7 @@ static void ane_cold_command_policy_test(struct kunit *test)
 
 static struct kunit_case ane_cold_cases[] = {
 	KUNIT_CASE(ane_cold_evidence_test),
+	KUNIT_CASE(ane_cold_step_test),
 	KUNIT_CASE(ane_cold_warm_test),
 	KUNIT_CASE(ane_cold_dart_test),
 	KUNIT_CASE(ane_cold_command_policy_test),

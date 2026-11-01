@@ -42,28 +42,38 @@ Stages and recovery
 -------------------
 
 Use the platform device's root-writable ``firmware_stage`` attribute. Reading
-it reports ``unverified``, ``probe``, ``map``, ``boot``, ``startup`` or
-``quarantined``. Write these actions in order::
+it reports ``unverified``, ``probe``, ``map``, ``boot``, ``startup``,
+``program`` or ``quarantined``. Write these actions in order::
 
   echo probe > firmware_stage
   echo map > firmware_stage
   echo boot > firmware_stage
   echo startup > firmware_stage
+  echo program > firmware_stage
 
-``probe`` reads and logs DART version/protect/unprotect/lock, DAPF records,
-CPU control/status, RVBAR, child power, PWGATE, CE, IRQ pending and scratch.
-It writes no hardware register, ring, power state or mapping. Missing loader
-evidence still permits the diagnostic log, then refuses acquisition with one
-info line. Physically-on ANE_SYS (0x23ff) is the measured cold state even when
-genpd reports off. CPU/subblock, PWGATE and CE must independently be cold;
-DAPF and invalid TTBR payloads are not cold markers.
+The engine block and its DARTs sit behind ANE_SYS, and an access to them
+while it is off stalls the bus. ANE_SYS is no cold marker: it can read on
+while genpd reports off, and generic DART runtime PM or a refused platform
+probe turns it off again. Every register is therefore read only once its
+block is known to be powered, in the order the U2 runs measured as safe.
 
-``map`` repeats the cold check, retains the module and power lifetime, blocks
-kexec and system sleep, acquires genpd ANE_SYS, powers the children, opens
-PWGATE and completes CE before scratch access. Only SID0 on three DARTs is
-attached to the private paging domain. Four DT-provided DAPF ranges are
-written and read back, and their pages are mapped as identity MMIO.
-Preloads, command pool, IPC and heap are mapped at their documented DVAs.
+``probe`` reads only PMGR: ANE_SYS, the ANE CPU power state (low byte off)
+and the sub-block power state (0x300). With the loader's raw-boot evidence it
+moves to ``probe``; it writes nothing and never touches the engine or DARTs.
+
+``map`` repeats the PMGR check, then retains the module and power lifetime,
+blocks system sleep (and kexec when built in) and acquires genpd ANE_SYS. It
+reads PWGATE (request 3, acknowledge 0), turns the CPU power state on, clears
+the PWGATE request and turns the sub-block on. Only then does it read and
+check the engine and DARTs: CE state and error, CPU control (0) and status
+(0x6a), RVBAR, IRQ pending, scratch, and unlocked, unfaulted DARTs of version
+0x203 with no stream enabled. DAPF records and invalid TTBR payloads are
+logged, never used as cold markers. Nothing in the engine has been written at
+that point; a failed check quarantines with power retained. ``map`` then
+completes CE, attaches only SID0 on three DARTs to the private paging domain,
+writes and reads back the four DT-provided DAPF ranges, maps their pages as
+identity MMIO, and maps preloads, command pool, IPC and heap at their
+documented DVAs.
 
 ``boot`` runs the scratch handshake, checks the exact request sizes, validates
 all eight channel descriptors and arms host rings. ``startup`` sends only
@@ -83,25 +93,16 @@ entry, never module unload after acquisition.
 Program integration and measured limits
 --------------------------------------
 
-``ane_fw_program_alloc`` and ``ane_fw_program_run`` are internal interfaces
-for the original-HWX frontend; they are not a section-upload userspace ABI.
-The original-HWX frontend from the companion load-ABI work is not yet wired
-to H17. No public H17 inference ioctl is advertised by this patch.
-
-The backend serializes LOAD/CREATE, 0x2d/EXECUTE/0x2d, TERMINATE and UNLOAD.
-Every section and tensor must resolve to a backend-owned mapping. Operation
-records with a kernel table must bind the kernel BAR to LOAD slot 1's
-resource index 1007. Legacy tag 2 is refused before LOAD because the measured
-H17 firmware asserts on it. Custom BARs, multiple outputs and unsupported
-resource classes are refused by this initial test path.
-
-Mappings retain the DART driver's normal per-range synchronization, including
-mappings made after firmware start, and propagate synchronization errors. A matching terminal
-UUID and program/process/procedure IDs is followed by a DMA read barrier and
-an exact comparison with the frontend's immutable expected output. The output
-is poisoned with the complement of those bytes before submission. A terminal
-report without expected bytes quarantines immediately; it never counts as
-success and is never retried.
+``program`` creates the shared H16/H17 program session on this transport and
+registers the ABI 3 accel node (``DRM_ANE_CHIP_H17``). Userspace passes the
+original H17 HWX and its four host-built sections, as on H16; the kernel
+validates them, places every section in private mappings, binds a linked
+program's ``__DATA`` scratch to kernel-owned memory and runs the
+0x2d/EXECUTE/0x2d sequence with UUID completion. Operation records with a
+kernel table must bind the kernel BAR to resource index 1007; legacy tag 2 is
+refused before LOAD because the measured H17 firmware asserts on it. The
+firmware frees each process pool after UNLOAD, often only during a later
+program; that FREE is acknowledged and its backing retained until reboot.
 
 Several programs may run in one firmware boot. The firmware has a direct
 submission path that reuses the engine's current BAR context. If that context
@@ -118,10 +119,12 @@ path. Measured on the J700 with 11 of 11 program switches correct, at about
 not executed under Linux, so its requests are published unchanged. Output
 mappings of earlier programs stay pinned and are never reused.
 The observed FREE response is DVA|1 with zero length and handle. It is
-accepted only for a live exact allocation during teardown; its backing stays
-pinned and cannot be recycled. Duplicate, interior and unsolicited FREEs
-refuse. The canonical FREE form remains unproven; a delayed FREE beyond the
-absolute teardown deadline quarantines rather than allowing another LOAD.
+accepted for any live exact allocation once the program stage started, since
+the firmware frees a process pool after UNLOAD, often only during a later
+program. Its backing and quota stay pinned and are never recycled, so the
+12 MiB allocation quota bounds the program lifetimes of one firmware boot
+(each process pool is 2 MiB). Duplicate, interior and unsolicited FREEs
+refuse. The canonical FREE form remains unproven.
 
 Provenance
 ----------
