@@ -104,6 +104,7 @@
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
 #include "ane_t6021_lifetime.h"
+#include "ane_t6021_pm.h"
 
 #include <drm/ane_accel.h>
 
@@ -238,6 +239,8 @@ struct ane_rtclient_retired {
 	struct ane_t6021_boot_allocs boot;
 };
 
+struct ane_rtclient_restart;
+
 struct ane_rtclient {
 	struct device *dev;
 	void __iomem *engine;
@@ -256,6 +259,8 @@ struct ane_rtclient {
 	struct apple_rtkit *rtk;
 	struct reset_control *cpu_rst;
 	struct delayed_work poll_work;
+	struct ane_t6021_pm sleep_pm;
+	struct ane_rtclient_restart *sleep_restart;
 
 	/* fw_start=1 view over the shared boot/fwload helpers. */
 	struct ane_t6021 *fw;
@@ -1488,6 +1493,8 @@ static int ane_t6021_unload_cmd(void *ctx, u16 opcode, u32 fw_prog, u32 fw_proc)
 	size_t length = opcode == ANE_T6021_CMD_TERMINATE_PROCESS ? 0x10 : 0x0c;
 	int ret;
 
+	if (ane_t6021_pm_submit_error(ane->sleep_pm.state))
+		return -EHOSTDOWN;
 	if (!command || atomic_read(&ane_t6021_quarantined))
 		return -ENODEV;
 	memset(command->cpu, 0, SZ_16K);
@@ -1950,6 +1957,10 @@ static int ane_rtclient_h16_call(struct ane_rtclient *ane, struct drm_file *file
 	if (IS_ERR(ios))
 		return PTR_ERR(ios);
 	mutex_lock(&ane_t6021_fw_lock);
+	if (ane_t6021_pm_submit_error(ane->sleep_pm.state)) {
+		ret = -EHOSTDOWN;
+		goto out;
+	}
 	if (atomic_read(&ane_t6021_quarantined) || ane->pending.quarantined) {
 		ret = -EIO;
 		goto out;
@@ -2108,6 +2119,10 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	}
 
 	mutex_lock(&ane_t6021_fw_lock);
+	if (ane_t6021_pm_submit_error(ane->sleep_pm.state)) {
+		ret = -EHOSTDOWN;
+		goto unlock;
+	}
 	if (atomic_read(&ane_t6021_quarantined)) {
 		ret = -ETIMEDOUT;
 		goto unlock;
@@ -2217,6 +2232,8 @@ static int ane_t6021_bo_init_locked(struct drm_device *drm, void *data,
 	struct ane_t6021_bo *bo;
 	struct ane_rtclient *ane = to_ane_t6021_drm(drm)->ane;
 
+	if (ane_t6021_pm_submit_error(ane->sleep_pm.state))
+		return -EHOSTDOWN;
 	if (atomic_read(&ane_t6021_quarantined) || READ_ONCE(ane->recovering))
 		return -EIO;
 	if (args->pad || args->size == 0 || args->size > ANE_T6021_BO_MAX ||
@@ -2304,8 +2321,8 @@ static void ane_t6021_bo_drop(struct ane_t6021_bo *bo)
 	kref_put(&bo->refcount, ane_t6021_bo_release);
 }
 
-static int ane_t6021_bo_free_ioctl(struct drm_device *drm, void *data,
-				   struct drm_file *file)
+static int ane_t6021_bo_free_locked(struct drm_device *drm, void *data,
+				  struct drm_file *file)
 {
 	struct drm_ane_bo_free *args = data;
 	struct ane_t6021_fd *fd = file->driver_priv;
@@ -2326,6 +2343,20 @@ static int ane_t6021_bo_free_ioctl(struct drm_device *drm, void *data,
 		ane_t6021_bo_drop(bo);
 	mutex_unlock(&ane_t6021_bo_lock);
 	return bo ? 0 : -ENOENT;
+}
+
+static int ane_t6021_bo_free_ioctl(struct drm_device *drm, void *data,
+				 struct drm_file *file)
+{
+	struct ane_t6021_drm *adrm = to_ane_t6021_drm(drm);
+	int ret;
+
+	mutex_lock(&ane_t6021_fw_lock);
+	ret = ane_t6021_pm_submit_error(adrm->ane->sleep_pm.state);
+	if (!ret)
+		ret = ane_t6021_bo_free_locked(drm, data, file);
+	mutex_unlock(&ane_t6021_fw_lock);
+	return ret;
 }
 
 /* Resolve the BO a user mmap names (BO_INIT returned offset = handle
@@ -2455,6 +2486,10 @@ static int ane_t6021_prog_load_ioctl(struct drm_device *drm, void *data,
 	int ret;
 
 	mutex_lock(&ane_t6021_fw_lock);
+	if (ane_t6021_pm_submit_error(adrm->ane->sleep_pm.state)) {
+		mutex_unlock(&ane_t6021_fw_lock);
+		return -EHOSTDOWN;
+	}
 	if (atomic_read(&ane_t6021_quarantined)) {
 		mutex_unlock(&ane_t6021_fw_lock);
 		return -ETIMEDOUT;
@@ -2514,6 +2549,10 @@ static int ane_t6021_perf_mode_set(const char *val,
 	if (!ane)
 		return -ENODEV;
 	mutex_lock(&ane_t6021_fw_lock);
+	if (ane_t6021_pm_submit_error(ane->sleep_pm.state)) {
+		mutex_unlock(&ane_t6021_fw_lock);
+		return -EHOSTDOWN;
+	}
 	if (atomic_read(&ane_t6021_quarantined)) {
 		mutex_unlock(&ane_t6021_fw_lock);
 		return -ETIMEDOUT;
@@ -2553,6 +2592,10 @@ static int ane_t6021_proc_create_ioctl(struct drm_device *drm, void *data,
 	int ret;
 
 	mutex_lock(&ane_t6021_fw_lock);
+	if (ane_t6021_pm_submit_error(adrm->ane->sleep_pm.state)) {
+		mutex_unlock(&ane_t6021_fw_lock);
+		return -EHOSTDOWN;
+	}
 	if (atomic_read(&ane_t6021_quarantined)) {
 		mutex_unlock(&ane_t6021_fw_lock);
 		return -ETIMEDOUT;
@@ -3169,11 +3212,29 @@ static int ane_rtclient_rs_halt(void *ctx)
 	return ret;
 }
 
-static int ane_rtclient_rs_power_cycle(void *ctx)
+/* Shared post-power-transition admission, including system resume. */
+static int ane_rtclient_rs_ready(void *ctx)
 {
 	struct ane_rtclient_restart *rs = ctx;
 	struct ane_rtclient *ane = rs->ane;
 	u32 status;
+	int ret;
+
+	ret = ane_rtclient_engine_accessible(ane);
+	if (ret)
+		return ret;
+	status = readl(ane->engine + ANE_ASC_CPU_STATUS);
+	if ((status & ANE_ASC_CPU_STATUS_RUNNING) ||
+	    !(status & ANE_ASC_CPU_STATUS_STOPPED) ||
+	    (readl(ane->engine + ANE_ASC_CPU_CONTROL) & ANE_ASC_CPU_CONTROL_RUN))
+		return -EBUSY;
+	return 0;
+}
+
+static int ane_rtclient_rs_power_cycle(void *ctx)
+{
+	struct ane_rtclient_restart *rs = ctx;
+	struct ane_rtclient *ane = rs->ane;
 	int ret;
 
 	/* Probe retains one consumer reference for this firmware lifetime. */
@@ -3181,15 +3242,7 @@ static int ane_rtclient_rs_power_cycle(void *ctx)
 			   ane_rtclient_verify_off, &rs->cycle);
 	if (ret)
 		return ret;
-	/* Repeat probe's gates before any engine-aperture read. */
-	ret = ane_rtclient_engine_accessible(ane);
-	if (ret)
-		return ret;
-	status = readl(ane->engine + ANE_ASC_CPU_STATUS);
-	if ((status & ANE_ASC_CPU_STATUS_RUNNING) ||
-	    !(status & ANE_ASC_CPU_STATUS_STOPPED))
-		return -EBUSY;
-	return 0;
+	return ane_rtclient_rs_ready(ctx);
 }
 
 static int ane_rtclient_rs_boot(void *ctx)
@@ -3291,28 +3344,19 @@ static const struct ane_t6021_restart_ops ane_rtclient_restart_ops = {
 	.boot = ane_rtclient_rs_boot,
 };
 
-/*
- * Cold-restart the Linux-owned firmware. @planned: the instance is live and
- * idle (the caller holds the firmware lock, so no command or call is in
- * flight) and is asked to shut down first. Otherwise a command timed out
- * and only the RUN clear is tried. The ASC must be proven stopped before
- * its domains go off; if it is not, nothing changes and the device stays
- * quarantined with every mapping, its power claim and its pin.
+/* Allocate the lifetime owner's transaction before either PM path stops it.
+ * The same transaction survives the system power boundary in sleep_restart.
  */
-static int __ane_rtclient_recover(struct ane_rtclient *ane, bool planned)
+static int ane_rtclient_rs_prepare(struct ane_rtclient_restart *rs)
 {
+	struct ane_rtclient *ane = rs->ane;
 	struct ane_t6021 *a = ane->fw;
-	struct ane_rtclient_restart rs = { .ane = ane, .cycle.ane = ane };
 	struct ane_rtclient_pd *pd;
-	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_STOP;
 	unsigned int domains = ane->soc->soc == 0x8112 ? 7 : 8;
-	int ret;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!ane->registered)
 		return -EOPNOTSUPP;
-	if (!planned && !atomic_read(&ane_t6021_quarantined))
-		return 0;
 	/* Only the qualified, Linux-owned legacy boot profile can restart.
 	 * Borrowed firmware, RTKit and later-generation ownership stay fenced.
 	 */
@@ -3326,24 +3370,32 @@ static int __ane_rtclient_recover(struct ane_rtclient *ane, bool planned)
 	mutex_lock(&ane_rtclient_pd_lock);
 	list_for_each_entry(pd, &ane_rtclient_pd_list, list)
 		if (pd->dev == ane->dev && pd->count == domains)
-			rs.cycle.pd = pd;
+			rs->cycle.pd = pd;
 	mutex_unlock(&ane_rtclient_pd_lock);
-	if (!rs.cycle.pd || !ane->engine_ps_valid)
+	if (!rs->cycle.pd || !ane->engine_ps_valid)
 		return -EOPNOTSUPP;
-	rs.retired = kzalloc_obj(*rs.retired);
-	if (!rs.retired)
+	rs->retired = kzalloc_obj(*rs->retired);
+	if (!rs->retired)
 		return -ENOMEM;
-	rs.fresh = devm_kcalloc(ane->dev, ANE_LEGACY_ALLOCS, sizeof(*rs.fresh),
-				GFP_KERNEL);
-	if (!rs.fresh) {
-		kfree(rs.retired);
+	rs->fresh = devm_kcalloc(ane->dev, ANE_LEGACY_ALLOCS, sizeof(*rs->fresh),
+				 GFP_KERNEL);
+	if (!rs->fresh) {
+		kfree(rs->retired);
 		return -ENOMEM;
 	}
 
 	WRITE_ONCE(ane->recovering, true);
 	cancel_delayed_work_sync(&ane->poll_work);
-	ret = ane_t6021_restart_run(&ane_rtclient_restart_ops, &rs, planned,
-				    &stage);
+	return 0;
+}
+
+/* Commit or retain the lifetime owner's transaction in exactly one place. */
+static int ane_rtclient_rs_finish(struct ane_rtclient_restart *rs, bool planned,
+				  enum ane_t6021_restart_stage stage, int ret)
+{
+	struct ane_rtclient *ane = rs->ane;
+
+	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (ret)
 		goto failed;
 	/* Opaque IDs never alias a new firmware instance; programs files still
@@ -3355,18 +3407,19 @@ static int __ane_rtclient_recover(struct ane_rtclient *ane, bool planned)
 				    ane);
 	ane_rtclient_reap_retired(ane);
 	WRITE_ONCE(ane->recovering, false);
+	ane->sleep_pm.state = ANE_T6021_PM_ACTIVE;
 	dev_info(ane->dev, "firmware %s; programs reload on next use\n",
 		 planned ? "restarted" : "recovered");
 	return 0;
 
 failed:
-	if (rs.fresh)
-		devm_kfree(ane->dev, rs.fresh);
-	kfree(rs.retired);
+	if (rs->fresh)
+		devm_kfree(ane->dev, rs->fresh);
+	kfree(rs->retired);
 	/* A POWER_DOWN that was never posted left the instance in service.
 	 * Once posted, the firmware is shut down or about to be.
 	 */
-	if (!rs.live)
+	if (!rs->live)
 		atomic_set(&ane_t6021_quarantined, 1);
 	WRITE_ONCE(ane->recovering, false);
 	dev_err(ane->dev,
@@ -3378,9 +3431,37 @@ failed:
 	return ret;
 }
 
+/*
+ * Cold-restart the Linux-owned firmware. @planned: the instance is live and
+ * idle (the caller holds the firmware lock, so no command or call is in
+ * flight) and is asked to shut down first. Otherwise a command timed out
+ * and only the RUN clear is tried. The ASC must be proven stopped before
+ * its domains go off; if it is not, nothing changes and the device stays
+ * quarantined with every mapping, its power claim and its pin.
+ */
+static int __ane_rtclient_recover(struct ane_rtclient *ane, bool planned)
+{
+	struct ane_rtclient_restart rs = { .ane = ane, .cycle.ane = ane };
+	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_STOP;
+	int ret;
+
+	lockdep_assert_held(&ane_t6021_fw_lock);
+	if (!ane->registered)
+		return -EOPNOTSUPP;
+	if (!planned && !atomic_read(&ane_t6021_quarantined))
+		return 0;
+	ret = ane_rtclient_rs_prepare(&rs);
+	if (ret)
+		return ret;
+	ret = ane_t6021_restart_run(&ane_rtclient_restart_ops, &rs, planned, &stage);
+	return ane_rtclient_rs_finish(&rs, planned, stage, ret);
+}
+
 static int ane_rtclient_recover(struct ane_rtclient *ane)
 {
-	return __ane_rtclient_recover(ane, false);
+	return __ane_rtclient_recover(ane,
+		!atomic_read(&ane_t6021_quarantined) &&
+		ane->sleep_pm.state == ANE_T6021_PM_FAILED);
 }
 
 /*
@@ -3398,6 +3479,74 @@ static int ane_rtclient_restart(struct ane_rtclient *ane)
 	ret = __ane_rtclient_recover(ane, true);
 	return ret == -EOPNOTSUPP || ret == -ENOSPC ? -ENOSPC : ret;
 }
+
+/* System PM owns the power transition; it has disabled runtime PM and
+ * holds an extra consumer reference. Reuse the lifetime stop/boot/commit
+ * boundaries without invoking the runtime power-cycle transaction.
+ */
+static int ane_rtclient_sleep_stop(void *ctx)
+{
+	struct ane_rtclient *ane = ctx;
+	struct ane_rtclient_restart *rs;
+	int ret;
+
+	lockdep_assert_held(&ane_t6021_fw_lock);
+	if (atomic_read(&ane_t6021_quarantined) || ane->sleep_restart)
+		return -EBUSY;
+	rs = kzalloc_obj(*rs);
+	if (!rs)
+		return -ENOMEM;
+	rs->ane = ane;
+	rs->cycle.ane = ane;
+	ret = ane_rtclient_rs_prepare(rs);
+	if (ret)
+		goto free;
+	ret = ane_t6021_restart_stop(&ane_rtclient_restart_ops, rs, true);
+	if (ret) {
+		ane_rtclient_rs_finish(rs, true, ANE_T6021_RESTART_STOP, ret);
+		goto free;
+	}
+	ane->sleep_restart = rs;
+	return 0;
+free:
+	kfree(rs);
+	return ret;
+}
+
+static int ane_rtclient_sleep_restart(void *ctx)
+{
+	struct ane_rtclient *ane = ctx;
+	struct ane_rtclient_restart *rs = ane->sleep_restart;
+	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_CYCLE;
+	int ret;
+
+	lockdep_assert_held(&ane_t6021_fw_lock);
+	if (!rs)
+		return -EIO;
+	ane->sleep_restart = NULL;
+	ret = ane_rtclient_rs_ready(rs);
+	if (!ret) {
+		stage = ANE_T6021_RESTART_BOOT;
+		ret = ane_rtclient_rs_boot(rs);
+	}
+	ret = ane_rtclient_rs_finish(rs, true, stage, ret);
+	kfree(rs);
+	return ret;
+}
+
+static const struct ane_t6021_pm_ops ane_rtclient_sleep_ops = {
+	.stop = ane_rtclient_sleep_stop,
+	.restart = ane_rtclient_sleep_restart,
+};
+
+static struct ane_t6021_pm *ane_rtclient_get_sleep_pm(struct device *dev)
+{
+	struct ane_rtclient *ane = dev_get_drvdata(dev);
+
+	return &ane->sleep_pm;
+}
+
+DEFINE_ANE_T6021_SYSTEM_PM_OPS(ane_rtclient_sleep_pm, ane_rtclient_get_sleep_pm);
 
 static int ane_rtclient_probe_inner(struct platform_device *pdev,
 				    bool *hardware_touched)
@@ -3454,6 +3603,12 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 	ane->soc = of_device_get_match_data(dev);
 	platform_set_drvdata(pdev, ane);
 	INIT_DELAYED_WORK(&ane->poll_work, ane_rtclient_post_boot);
+	ane->sleep_pm = (struct ane_t6021_pm) {
+		.fw_lock = &ane_t6021_fw_lock,
+		.ops = &ane_rtclient_sleep_ops,
+		.ctx = ane,
+		.state = ANE_T6021_PM_ACTIVE,
+	};
 	INIT_LIST_HEAD(&ane->retired);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -3952,7 +4107,8 @@ static ssize_t wedged_show(struct device *dev, struct device_attribute *attr,
 	struct ane_rtclient *ane = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%d\n", atomic_read(&ane_t6021_quarantined) ||
-			  READ_ONCE(ane->recovering) || !READ_ONCE(ane->registered));
+			  READ_ONCE(ane->recovering) || !READ_ONCE(ane->registered) ||
+			  READ_ONCE(ane->sleep_pm.state) == ANE_T6021_PM_FAILED);
 }
 static DEVICE_ATTR_RO(wedged);
 
@@ -4002,6 +4158,7 @@ static struct platform_driver ane_rtclient_driver = {
 		.name = "ane_t6021",
 		.of_match_table = ane_rtclient_of_match,
 		.dev_groups = ane_t6021_stats_groups,
+		.pm = pm_sleep_ptr(&ane_rtclient_sleep_pm),
 		.suppress_bind_attrs = true,
 	},
 	.probe = ane_rtclient_probe,

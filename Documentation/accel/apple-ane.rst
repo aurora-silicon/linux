@@ -437,3 +437,104 @@ after verified quiescence and acquires a new one before the first boot write;
 it does not accumulate one reference per failure. This change does not provide
 normal H14 module unload while firmware is active. H14 restart still requires
 silicon qualification; the H13 hang fixture must not be submitted through ABI 2.
+
+H14 system-sleep adapter
+=======================
+
+``ane_t6021_pm.h`` provides the system-sleep PM operations and submission
+fencing used by ane_t6021. Stop, firmware reload, channels, allocation ownership
+and program replay remain in the shared H14 lifetime implementation from
+https://github.com/aurora-silicon/linux/pull/737. System sleep and timeout
+recovery use one stop helper, one boot function and one transaction commit.
+The shutdown protocol is not implemented a second time by the PM adapter.
+
+The adapter contract is:
+
+* Embed ``struct ane_t6021_pm`` in the client, initialized once at probe with
+  its existing firmware mutex, lifetime callback table, client context and
+  ``ANE_T6021_PM_ACTIVE`` state.
+* Use ``DEFINE_ANE_T6021_SYSTEM_PM_OPS(name, getter)`` to define the device PM
+  operations. The getter returns the embedded adapter without replacing the
+  driver's own drvdata. The driver binds ``pm_sleep_ptr(&name)`` to ``driver.pm`` and supplies
+  the shared lifetime callbacks below.
+* Every external firmware-facing submission checks ``ane_t6021_pm_submit_error()`` under
+  that same firmware mutex. Suspend acquires the mutex, draining the current
+  synchronous command and its finish event, and fences queued submitters
+  before calling the shared stop callback.
+* The stop callback performs the validated firmware shutdown handshake, drains
+  RX and proves ASC STOPPED with RUN clear before returning success. Clearing
+  RUN or observing ordinary WFI/idle is insufficient. Failure must retain
+  power claims, DMA mappings, firmware backing and the module pin.
+* The restart callback is the same cold-start/handshake/program-replay path
+  used by timeout recovery. Supplier and DART system callbacks must restore
+  access first. Return success only after channels, CONFIG_GET and desired firmware
+  properties are restored and the lifetime owner has made public IDs usable
+  under its normal lazy-reload policy. RX and all firmware-owned resources stay with this one lifetime
+  implementation.
+
+System PM disables runtime PM and holds an additional consumer reference.
+Consequently suspend stops at ``ane_t6021_restart_stop()`` and keeps the shared
+restart transaction on the client across the system power boundary. Genpd and
+DART system callbacks perform that power transition. Resume checks provider
+access and the stopped-core predicate, then invokes the same boot and commit
+functions as runtime recovery. Runtime recovery still uses the shared runtime-PM
+cycle between stop and boot. No runtime-PM force/cycle helper is called by the
+system-sleep callbacks.
+
+Failure leaves submissions fenced with EHOSTDOWN and retains firmware-visible
+backing and pins. A verified explicit recovery can reopen the PM gate. The
+adapter never sends firmware power commands or duplicates the program/allocation
+cache. Internal shutdown/restart commands run through the shared lifetime owner
+while external work is fenced.
+
+Device-free tests
+-----------------
+
+The ``ane-h14-sleep`` KUnit suite invokes the generated device callbacks with a
+fake shared-lifetime backend. It checks three successive cycles, that callbacks
+hold the firmware mutex with submissions fenced, failed stop and restart
+propagation, unwind before suspend, and suspend/freeze/poweroff versus
+resume/thaw/restore callback mapping. Firmware stop predicates, shutdown command
+layouts and program replay are tested by the lifetime owner, not reimplemented
+here. Run the PM suites without hardware::
+
+  ./tools/testing/kunit/kunit.py run \
+    --kunitconfig=tools/testing/selftests/drivers/ane/pm.kunitconfig \
+    --jobs=8
+
+M2 validation plan
+------------------
+
+Runtime testing requires the shared lifetime implementation and this PM
+integration together. Do not infer a hardware pass from the adapter's KUnit results.
+Run on a T8112 with the candidate kernel and its matching ane_t6021 module,
+through the hardware controller with exclusive device ownership, bounded
+console capture and a tested boot fallback. Record the kernel/module revision,
+firmware identity, boot ID, initial kernel log and the smoke command. Use the
+same known-good H14 smoke and model/input fixtures for the baseline and every
+post-resume check. Verify the complete output, including its expected surface
+size, and vary inputs or poison outputs so retained output cannot pass.
+
+1. Run the smoke before suspend. Keep a client with a loaded program, process,
+   BO handles and mappings open for the duration of the test.
+2. Save the current pm_test setting. Repeat the following three times, capturing
+   the new kernel log and running the smoke after *each* cycle::
+
+     echo platform > /sys/power/pm_test
+     echo mem > /sys/power/state
+     # Run the recorded H14 smoke, checking its exit status and full output.
+
+   Require the shared stop proof and successful restart/handshake/replay receipts
+   each time. Exercise the surviving client's original handles with new inputs,
+   and a newly opened client, after each cycle. Require an unchanged boot ID,
+   correct nonempty outputs, and no LEGACY timeout, failed exchange, DART fault,
+   crash or PM failure. Confirm identical repeated cycles do not accumulate
+   module references or retained allocations.
+3. Set pm_test to ``none``. If ``/sys/power/mem_sleep`` advertises ``s2idle``,
+   select it, arrange a supported timed or external wake through the controller,
+   and run a real ``echo mem > /sys/power/state`` cycle. Run both smokes after
+   wake and apply the same checks. Record unsupported s2idle or wake support
+   explicitly; a platform test does not establish real-suspend behavior.
+4. Restore pm_test and mem_sleep selections. Preserve failure evidence before
+   using the approved known-good boot fallback. Do not force-unload retained
+   firmware memory or treat an unproven stop as permission to remove power.
