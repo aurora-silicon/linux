@@ -355,7 +355,8 @@ static int sim_alloc_shared(void *ctx, size_t size, u32 tag, struct ane_fw_surfa
 {
 	struct ane_h16_sim *s = ctx;
 
-	return sim_alloc_at(ctx, s->build.shared_dva, size, out);
+	return sim_alloc_at(ctx, s->build.shared_dva +
+			    s->boot.transport.shared_count * SZ_16K, size, out);
 }
 
 static void sim_refused(void *ctx, u64 w0, u64 w1, u64 w2, int error)
