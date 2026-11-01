@@ -128,7 +128,9 @@ patternProperties:
           The device also has a performance request. While the domain is
           powered, after the PMP acknowledges the device, the host writes the
           level (with the valid bit) to the entry once; before clearing the
-          device request it writes level 0.
+          device request it writes level 0. On T8112, only the AVD request at
+          entry 0xb0 is qualified; level 2 requests SOC VMAX. The provider owns the whole
+          request word and preserves other software-owned request classes.
 
       apple,always-on:
         type: boolean
@@ -154,6 +156,19 @@ patternProperties:
           The entry is the parent of IRQ-safe PMGR power states and is
           switched with interrupts disabled. Setting the state takes a
           spinlock and polls the acknowledgment atomically.
+
+    allOf:
+      - if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8112-pmp-v2-report-entry
+        then:
+          properties:
+            apple,dvfs:
+              items:
+                - const: 0xb0
+                - const: 2
 
     required:
       - compatible
