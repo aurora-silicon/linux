@@ -167,6 +167,8 @@ struct ane_h16_program {
 	struct ane_h16_custom_bar bars[ANE_H16_MAX_CUSTOM_BARS];
 	unsigned int bar_count;
 	unsigned int resource_count;
+	/* Per-surface buffer size from the generic section, sent in EXECUTE. */
+	u64 declared[ANE_H16_SURFACES];
 	/*
 	 * The __DATA scratch: a kernel-owned EXECUTE input that carries the
 	 * DRAM edges between tasks. Userspace never sees or fills it.

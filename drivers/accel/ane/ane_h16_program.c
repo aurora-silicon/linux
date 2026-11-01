@@ -340,6 +340,7 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 			.hwx_vm = hwx->surfaces[i].section.vm,
 			.index = id,
 			.class = ane_h16_usage_class(direction),
+			.bytes = bytes,
 		};
 		seen[direction - 1]++;
 	}
@@ -606,6 +607,8 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 	if (ret)
 		return ret;
 	p->resource_count = count;
+	for (i = 0; i < count; i++)
+		p->declared[i] = bindings[i].bytes;
 	for (i = 0; i < count; i++) {
 		for (j = 0; j < p->plan.count; j++)
 			if (p->regions[j].dva == p->resources[i].buffer.mapping_dva)
@@ -966,13 +969,17 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	if (ret)
 		return ret;
 	/*
-	 * Each descriptor covers the whole HWX section of its surface, not just
-	 * the tensor span: an input whose rows are padded (MobileNet, 0x49800 of
-	 * 0x4c000) is described as the section, as on the working J700 path.
+	 * Each descriptor carries the size the generic section declared for its
+	 * buffer at LOAD: the firmware checks the request against that program
+	 * contract. H17 asserts in its program manager when a descriptor is
+	 * smaller (relu64: section 0x1000 of a declared 0x4000 surface). The
+	 * declared size lies between the tensor span and the mapped allocation;
+	 * for MobileNet it is the whole 0x4c000 section, as on the working J700
+	 * path. Userspace still sees and copies the span.
 	 */
 	for (i = 0; i < p->resource_count; i++) {
 		buffers[i] = p->resources[i].buffer;
-		buffers[i].size = p->hwx.surfaces[i].section.size;
+		buffers[i].size = p->declared[i];
 	}
 	if (p->has_scratch)
 		buffers[i++] = p->scratch;

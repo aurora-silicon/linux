@@ -956,9 +956,11 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x90 + 4), TEST_GENERIC_BASE + 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x18),
 			p->surfaces[0]->dva);
-	/* Each descriptor covers its whole HWX section. */
+	/* Each descriptor carries the size the generic section declared (here the span). */
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20),
-			p->hwx.surfaces[0].section.size);
+			p->hwx.surfaces[0].span);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x90 + 0x20),
+			p->hwx.surfaces[1].span);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca8 + 8), 4);
 	/* Later requests of the same program take the direct path. */
