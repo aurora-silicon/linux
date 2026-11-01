@@ -46,6 +46,8 @@ struct ane_h16_sim {
 	bool bad_power;
 	bool bad_rvbar;
 	bool fail_map;
+	bool must_allocate_first;
+	bool fault_on_drain;
 };
 
 static const u32 sim_power_words[] = { 0x3c0, 0xc008, 0xc000, 0xc010, 0xc018 };
@@ -163,6 +165,8 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 			KUNIT_EXPECT_LT(s->test, s->command_count, 4U);
 			if (s->command_count < 4)
 				KUNIT_EXPECT_EQ(s->test, tx->id, f->startup[s->command_count].id);
+			if (s->must_allocate_first)
+				KUNIT_EXPECT_TRUE(s->test, s->shared_replied);
 			s->command_count++;
 			if (tx->id == 3 && s->lifecycle_mode) {
 				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
@@ -196,7 +200,8 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 				KUNIT_EXPECT_EQ(s->test, get_unaligned_le64(slot + 8), 0ULL);
 				KUNIT_EXPECT_EQ(s->test, get_unaligned_le64(slot + 16), 0ULL);
 			}
-			sim_reply(s);
+			if (t->pending[ANE_FW_IO].active)
+				sim_reply(s);
 		}
 		return;
 	}
@@ -216,7 +221,11 @@ static void sim_write64(void *ctx, enum ane_h16_window w, u32 off, u64 value)
 
 static void sim_delay(void *ctx, unsigned int us)
 {
-	((struct ane_h16_sim *)ctx)->now += (u64)us * 1000;
+	struct ane_h16_sim *s = ctx;
+
+	s->now += (u64)us * 1000;
+	if (s->fault_on_drain && s->boot.transport.armed)
+		s->fault = BIT(31);
 }
 
 static int sim_map(void *ctx)
@@ -703,7 +712,38 @@ static void ane_h16_foreign_free_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, s->boot.transport.shared_retired[0]);
 }
 
+static void ane_h16_pre_io_allocation_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	u8 *slot;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	slot = ane_fw_transport_slot(&s->boot.transport, ANE_FW_SHAREDMALLOC);
+	put_unaligned_le64(0, slot);
+	put_unaligned_le64(SZ_16K, slot + 8);
+	put_unaligned_le64(0, slot + 16);
+	s->must_allocate_first = true;
+	s->boot.startup_drain_ms = 1;
+	KUNIT_ASSERT_EQ(test, ane_h16_startup(&s->boot), 0);
+	KUNIT_EXPECT_TRUE(test, s->shared_replied);
+	KUNIT_EXPECT_EQ(test, s->command_count, 4U);
+}
+
+static void ane_h16_pre_io_fault_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->boot.startup_drain_ms = 10;
+	s->fault_on_drain = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EIO);
+	KUNIT_EXPECT_EQ(test, s->command_count, 0U);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
+}
+
 static struct kunit_case ane_h16_boot_cases[] = {
+	KUNIT_CASE(ane_h16_pre_io_allocation_test),
+	KUNIT_CASE(ane_h16_pre_io_fault_test),
 	KUNIT_CASE(ane_h16_happy_test),
 	KUNIT_CASE(ane_h16_locked_matching_test),
 	KUNIT_CASE(ane_h16_heap_overlap_test),
