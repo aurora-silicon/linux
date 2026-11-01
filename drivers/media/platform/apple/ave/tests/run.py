@@ -41,7 +41,7 @@ def build(src, out, baseline):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     # Later additions; an older baseline does not define them.
     for name in ('AVE_FW_TEXT_CRC_T6040_25G83', 'AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS',
-                 'AVE_MCTF_OUT_BUFS'):
+                 'AVE_MCTF_OUT_BUFS', 'AVE_MCTF_POOL_LENT', 'AVE_MCTF_POOL_READY'):
         m = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
         if m:
             code += m[0] + '\n'
@@ -80,7 +80,7 @@ def build(src, out, baseline):
             while line.endswith('\\'):
                 line = next(lines)
                 code += line + '\n'
-    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_sess_free_bufs', 'ave_sess_reply'):
+    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_mctf_pool_return', 'ave_sess_free_bufs', 'ave_sess_reply'):
         code += function(session, name)
     if not baseline:
         fw = (src / 'ave-fw.c').read_text()

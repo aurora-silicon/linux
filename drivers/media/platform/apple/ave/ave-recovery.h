@@ -2,6 +2,7 @@
 #ifndef _APPLE_AVE_RECOVERY_H_
 #define _APPLE_AVE_RECOVERY_H_
 
+#include <linux/iommu.h>
 #include <linux/jiffies.h>
 #include <linux/types.h>
 
@@ -25,6 +26,17 @@ static inline bool ave_recovery_allow(struct ave_recovery_history *h, unsigned l
 	if (h->count < AVE_RECOVERY_ATTEMPTS)
 		h->count++;
 	return true;
+}
+
+/*
+ * The encoder may only run on a strict translating DMA domain: an unmap
+ * invalidates the DART before the pages go back. A flush queue (DMA-FQ),
+ * a bypass or no domain at all would let a late firmware write reach memory
+ * the kernel has reused.
+ */
+static inline bool ave_domain_type_safe(unsigned int type)
+{
+	return type == IOMMU_DOMAIN_DMA;
 }
 
 #endif

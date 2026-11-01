@@ -369,8 +369,57 @@ static void mapping_lifetimes(void)
 	assert(dbuf.refs == 1 && !dev.dma_refs);
 }
 
+/*
+ * MCTF DMA memory is the device pool: a session borrows it and gives it
+ * back; no teardown path (normal, failed, reaped) frees or unmaps it, and
+ * the pool is lent to one session at a time.
+ */
+static void mctf_pool_lifetime(void)
+{
+	static char pool_mem[4];
+	struct ave_session *sess;
+
+	init();
+	power_seen = stop_seen = false;
+	ave.mctf_pool_flags = 1UL << AVE_MCTF_POOL_READY | 1UL << AVE_MCTF_POOL_LENT;
+	sess = calloc(1, sizeof(*sess));
+	assert(sess);
+	sess->mctf_borrowed = true;
+	sess->handed = true;
+	sess->mctf_buf[0].cpu = &pool_mem[0];
+	sess->mctf_buf[0].dma = 0x10000004000ULL;
+	sess->mctf_in[0].cpu = &pool_mem[1];
+	sess->mctf_out[1].cpu = &pool_mem[2];
+	ctx[0].sess = sess;
+	/* Normal STREAMOFF teardown with a running firmware: nothing freed. */
+	ave.fw_state = AVE_FW_RUNNING;
+	ave_sess_destroy(&ctx[0]);
+	assert(!freed && !ctx[0].sess);
+	assert(ave.mctf_pool_flags == 1UL << AVE_MCTF_POOL_READY);
+
+	/* A failed session is quarantined holding the pool; reaping returns it unfreed. */
+	sess = calloc(1, sizeof(*sess));
+	assert(sess);
+	sess->mctf_borrowed = true;
+	sess->handed = true;
+	sess->mctf_buf[3].cpu = &pool_mem[3];
+	ave.mctf_pool_flags |= 1UL << AVE_MCTF_POOL_LENT;
+	ctx[0].sess = sess;
+	ave.fw_state = AVE_FW_BROKEN;
+	ave_sess_destroy(&ctx[0]);
+	assert(ave.failed_sessions == sess && !freed);
+	assert(ave.mctf_pool_flags & 1UL << AVE_MCTF_POOL_LENT);
+	stop_seen = power_seen = true;
+	mutex_lock(&ave.hw_lock);
+	ave_sess_reap(&ave);
+	mutex_unlock(&ave.hw_lock);
+	assert(!ave.failed_sessions && !freed);
+	assert(ave.mctf_pool_flags == 1UL << AVE_MCTF_POOL_READY);
+}
+
 int main(void)
 {
+	mctf_pool_lifetime();
 	mapping_lifetimes();
 	failed_submission();
 	failed_start();
@@ -381,6 +430,7 @@ int main(void)
 	busy_ring_deadline();
 	restore_data();
 	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
-	     "PM rollback, DATA, IPC deadline, MMAP/dma-buf release ordering");
+	     "PM rollback, DATA, IPC deadline, MMAP/dma-buf release ordering, "
+	     "MCTF pool lifetime");
 	return 0;
 }

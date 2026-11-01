@@ -165,6 +165,15 @@ struct ave_variant {
 	bool boot_qualified;
 };
 
+/* Start surfaces of an MCTF session, aliases included */
+#define AVE_MCTF_BUFS 72
+/* MCTF picture surfaces: inputs used in turn, one output per slot */
+#define AVE_MCTF_IN_BUFS 5
+#define AVE_MCTF_OUT_BUFS 2
+/* ave_dev.mctf_pool_flags */
+#define AVE_MCTF_POOL_LENT	0	/* a session holds the pool */
+#define AVE_MCTF_POOL_READY	1	/* every pool buffer is allocated */
+
 struct ave_dev {
 	struct device *dev;
 	const struct ave_variant *variant;
@@ -226,6 +235,15 @@ struct ave_dev {
 	struct v4l2_m2m_dev *mctf_m2m;
 	bool mctf_registered;
 	void *mctf_dump[AVE_IMAGE_COUNT];
+	/*
+	 * MCTF DMA memory: allocated by the first MCTF session and lent to
+	 * every later one at the same addresses. Never unmapped while the
+	 * firmware may have run (see ave_sess_mctf_init()).
+	 */
+	struct ave_buf mctf_pool[AVE_MCTF_BUFS];
+	struct ave_buf mctf_pool_in[AVE_MCTF_IN_BUFS];
+	struct ave_buf mctf_pool_out[AVE_MCTF_OUT_BUFS];
+	unsigned long mctf_pool_flags;
 	/* debugfs: the last filtered frame's input and output surfaces, raw */
 	void *mctf_surf_dump[2];
 	bool mctf_capture;
@@ -280,11 +298,6 @@ struct ave_slot {
 
 #define AVE_MAX_REFS 5
 #define AVE_TILE_BUFS 8
-/* Start surfaces of an MCTF session, aliases included */
-#define AVE_MCTF_BUFS 72
-/* MCTF picture surfaces: inputs used in turn, one output per slot */
-#define AVE_MCTF_IN_BUFS 5
-#define AVE_MCTF_OUT_BUFS 2
 
 struct ave_session {
 	struct ave_session *failed_next;
@@ -312,6 +325,7 @@ struct ave_session {
 	/* CPU copies of one picture surface and one NV12 picture */
 	struct ave_cmp420_geom mctf_geom;
 	u8 *mctf_surf, *mctf_lin;
+	bool mctf_borrowed; /* mctf_buf/in/out are the device pool's */
 	/* Header words; zero means the encoder's values */
 	u32 unit, arg1, frame_arg0;
 	u8 done_fifo[AVE_MAX_SLOTS];
@@ -464,6 +478,7 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);
 bool ave_sess_stalled(struct ave_session *sess);
 bool ave_sess_starved(struct ave_session *sess);
 int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess);
+void ave_mctf_pool_free(struct ave_dev *ave);
 
 /* ave-image.c */
 void ave_image_start(u8 *cmd, size_t len, const struct ave_fw_layout *fw,

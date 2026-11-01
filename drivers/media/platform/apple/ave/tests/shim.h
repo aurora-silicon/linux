@@ -37,6 +37,18 @@ static inline void *kcalloc(size_t n, size_t size, int flags)
 
 #define kfree(p) free(p)
 #define kvfree(p) free(p)
+#define IOMMU_DOMAIN_DMA 3
+#define IOMMU_DOMAIN_DMA_FQ 7
+static inline void clear_bit(int nr, unsigned long *p) { *p &= ~(1UL << nr); }
+static inline void set_bit(int nr, unsigned long *p) { *p |= 1UL << nr; }
+static inline int test_bit(int nr, const unsigned long *p) { return (*p >> nr) & 1; }
+static inline int test_and_set_bit(int nr, unsigned long *p)
+{
+	int old = test_bit(nr, p);
+
+	set_bit(nr, p);
+	return old;
+}
 struct iommu_domain;
 #define iommu_get_domain_for_dev(d) ((void)(d), (struct iommu_domain *)NULL)
 #define iommu_flush_iotlb_all(d) ((void)(d))

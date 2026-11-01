@@ -8,6 +8,7 @@ struct ave_dev {
 	const struct ave_variant *variant;
 	enum ave_fw_state fw_state;
 	void *dev;
+	unsigned long mctf_pool_flags;
 };
 
 struct ave_ctx {

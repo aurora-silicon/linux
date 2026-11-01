@@ -758,12 +758,21 @@ static void ave_session_free(struct ave_ctx *ctx)
 static int ave_session_begin(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
+	struct iommu_domain *domain;
 	struct ave_session *sess;
 	bool pm_lost;
 	int ret;
 
 	if (ctx->sess)
 		return 0;
+	/* The domain type can still change (DMA to DMA-FQ) while bound. */
+	domain = iommu_get_domain_for_dev(ave->dev);
+	if (!domain || !ave_domain_type_safe(domain->type)) {
+		dev_err(ave->dev,
+			"encoder DMA domain is not strict (type %#x); refusing to start\n",
+			domain ? domain->type : 0);
+		return -EPERM;
+	}
 	ret = ctx->mctf ? ave_mctf_check_build(ave) : ave_fw_check_build(ave);
 	if (ret)
 		return ret;

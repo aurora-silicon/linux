@@ -19,7 +19,8 @@ def main():
     code += '#define HZ 1000\n#define time_before(a, b) ((long)((a) - (b)) < 0)\n'
     code += source((src / 'ave-recovery.h').read_text())
     for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS', 'AVE_MAX_SESSIONS',
-                 'AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS', 'AVE_MCTF_OUT_BUFS'):
+                 'AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS', 'AVE_MCTF_OUT_BUFS',
+                 'AVE_MCTF_POOL_LENT', 'AVE_MCTF_POOL_READY'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     code += source((src / 'ave-regs.h').read_text())
     code += 'struct vb2_v4l2_buffer;\n'
@@ -39,7 +40,7 @@ def main():
     groups = {
         'ave-fw.c': ('ave_fw_vcbar', 'ave_fw_lost', 'ave_fw_mark_broken', 'ave_fw_halt', 'ave_fw_shutdown',
                      'ave_fw_runtime_suspend', 'ave_fw_prepare_restart', 'ave_fw_restore_data'),
-        'ave-sess.c': ('ave_sess_free_bufs', 'ave_sess_destroy', 'ave_sess_reap'),
+        'ave-sess.c': ('ave_mctf_pool_return', 'ave_sess_free_bufs', 'ave_sess_destroy', 'ave_sess_reap'),
         'ave-v4l2.c': ('ave_return_bufs', 'ave_buf_queue', 'ave_session_index',
                        'ave_session_count', 'ave_session_close', 'ave_session_free',
                        'ave_session_end', 'ave_stop_streaming',

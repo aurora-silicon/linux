@@ -45,7 +45,18 @@ static void ave_recovery_wrap_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ave_recovery_allow(&h, start + AVE_RECOVERY_WINDOW));
 }
 
+static void ave_recovery_domain_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, ave_domain_type_safe(IOMMU_DOMAIN_DMA));
+	KUNIT_EXPECT_FALSE(test, ave_domain_type_safe(IOMMU_DOMAIN_DMA_FQ));
+	KUNIT_EXPECT_FALSE(test, ave_domain_type_safe(IOMMU_DOMAIN_IDENTITY));
+	KUNIT_EXPECT_FALSE(test, ave_domain_type_safe(IOMMU_DOMAIN_BLOCKED));
+	KUNIT_EXPECT_FALSE(test, ave_domain_type_safe(IOMMU_DOMAIN_UNMANAGED));
+	KUNIT_EXPECT_FALSE(test, ave_domain_type_safe(0));
+}
+
 static struct kunit_case ave_recovery_cases[] = {
+	KUNIT_CASE(ave_recovery_domain_test),
 	KUNIT_CASE(ave_recovery_limit_test),
 	KUNIT_CASE(ave_recovery_sliding_test),
 	KUNIT_CASE(ave_recovery_wrap_test),

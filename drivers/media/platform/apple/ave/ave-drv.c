@@ -386,6 +386,8 @@ static void ave_remove(struct platform_device *pdev)
 			 "firmware was started, keeping its memory\n");
 		return;
 	}
+	/* The firmware never ran, so no MCTF memory can be in use. */
+	ave_mctf_pool_free(ave);
 	mutex_unlock(&ave->hw_lock);
 	ave_fw_remove(ave);
 }

@@ -89,6 +89,7 @@ struct ave_dev {
 	void *data_pristine;
 	struct ave_ring ring[2];
 	u64 ipc_fw_base;
+	unsigned long mctf_pool_flags;
 };
 
 static void *test_ctrl_addr;

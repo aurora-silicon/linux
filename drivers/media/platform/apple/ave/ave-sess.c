@@ -319,19 +319,92 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	return 0;
 }
 
+/* Return the pool if @sess holds it; its memory stays allocated and mapped. */
+static void ave_mctf_pool_return(struct ave_dev *ave, struct ave_session *sess)
+{
+	if (!sess->mctf_borrowed)
+		return;
+	memset(sess->mctf_buf, 0, sizeof(sess->mctf_buf));
+	memset(sess->mctf_in, 0, sizeof(sess->mctf_in));
+	memset(sess->mctf_out, 0, sizeof(sess->mctf_out));
+	sess->mctf_borrowed = false;
+	clear_bit(AVE_MCTF_POOL_LENT, &ave->mctf_pool_flags);
+}
+
 /*
- * An MCTF session: fixed 1080p NV12 on the selector-2 carriers, the
- * firmware-owned surfaces of the layout (zeroed by the DMA allocator and
- * never mapped for the CPU), largest first like the encoder's buffers.
+ * Only for a driver whose firmware never ran: nothing else may unmap MCTF
+ * memory (ave_remove() keeps all firmware-visible memory otherwise).
+ */
+void ave_mctf_pool_free(struct ave_dev *ave)
+{
+	for (unsigned int i = 0; i < AVE_MCTF_BUFS; i++)
+		ave_free(ave, &ave->mctf_pool[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_IN_BUFS; i++)
+		ave_free(ave, &ave->mctf_pool_in[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_OUT_BUFS; i++)
+		ave_free(ave, &ave->mctf_pool_out[i]);
+	ave->mctf_pool_flags = 0;
+}
+
+/*
+ * Allocate what is missing of the MCTF pool: the firmware-owned surfaces
+ * of the layout largest first, like the encoder's buffers, then the picture
+ * surfaces. Kernel-mapped, so a later session can zero them.
+ */
+static int ave_mctf_pool_fill(struct ave_dev *ave, const struct ave_mctf_layout *l)
+{
+	struct ave_buf_req *r;
+	unsigned int n = 0;
+	size_t mapped = 0;
+	int ret = 0;
+
+	r = kcalloc(l->n_surfaces, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	for (unsigned int i = 0; i < l->n_surfaces; i++)
+		if (l->surfaces[i].alloc)
+			ave_req(r, &n, &ave->mctf_pool[i], l->surfaces[i].alloc, 0, 0);
+	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
+	for (unsigned int i = 0; i < n && !ret; i++) {
+		ret = ave_alloc(ave, r[i].b, r[i].size, r[i].attrs);
+		mapped += r[i].b->alloc;
+	}
+	kfree(r);
+	for (unsigned int i = 0; i < l->inputs && !ret; i++)
+		ret = ave_alloc(ave, &ave->mctf_pool_in[i], l->form.bytes, 0);
+	for (unsigned int i = 0; i < l->slots && !ret; i++)
+		ret = ave_alloc(ave, &ave->mctf_pool_out[i], l->form.bytes, 0);
+	if (ret) {
+		dev_err(ave->dev, "out of encoder DMA space for the MCTF pool (%zu MiB)\n",
+			mapped >> 20);
+		return -ENOMEM;
+	}
+	set_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags);
+	dev_dbg(ave->dev, "MCTF pool: %u surfaces, %zu KiB mapped once\n", n, mapped >> 10);
+	return 0;
+}
+
+static void ave_mctf_pool_zero(struct ave_buf *b, unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++)
+		if (b[i].cpu)
+			memset(b[i].cpu, 0, b[i].alloc);
+}
+
+/*
+ * An MCTF session: fixed 1080p NV12 on the selector-2 carriers. Its DMA
+ * memory is the device's MCTF pool, lent to one session at a time and
+ * zeroed for each: the same buffers at the same addresses for every
+ * session and every firmware boot, never unmapped while the driver is
+ * bound. A late or stale firmware or engine write after a session (rev 7
+ * and 8 on the Neo corrupted kernel memory after one) can then only reach
+ * memory this driver still owns.
  */
 int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
 {
 	struct ave_dev *ave = ctx->ave;
 	const struct ave_mctf_layout *l = ave_mctf_qualified(ave->text_crc);
 	struct ave_params *p = &sess->p;
-	struct ave_buf_req *r;
-	unsigned int n = 0;
-	size_t mapped = 0;
 	int ret = 0;
 
 	if (!l)
@@ -368,41 +441,30 @@ int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
 	sess->arg1 = l->arg1;
 	sess->frame_arg0 = l->frame_arg0;
 
-	r = kcalloc(l->n_surfaces, sizeof(*r), GFP_KERNEL);
-	if (!r)
-		return -ENOMEM;
-	for (unsigned int i = 0; i < l->n_surfaces; i++)
-		if (l->surfaces[i].alloc)
-			ave_req(r, &n, &sess->mctf_buf[i], l->surfaces[i].alloc, 0,
-				DMA_ATTR_NO_KERNEL_MAPPING);
-	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
-	for (unsigned int i = 0; i < n && !ret; i++) {
-		ret = ave_alloc(ave, r[i].b, r[i].size, r[i].attrs);
-		mapped += r[i].b->alloc;
+	if (test_and_set_bit(AVE_MCTF_POOL_LENT, &ave->mctf_pool_flags))
+		return -EBUSY;	/* one MCTF session at a time */
+	sess->mctf_borrowed = true;	/* from here ave_sess_free_bufs() returns it */
+	if (test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
+		ave_mctf_pool_zero(ave->mctf_pool, AVE_MCTF_BUFS);
+		ave_mctf_pool_zero(ave->mctf_pool_in, AVE_MCTF_IN_BUFS);
+		ave_mctf_pool_zero(ave->mctf_pool_out, AVE_MCTF_OUT_BUFS);
+	} else {
+		ret = ave_mctf_pool_fill(ave, l);
+		if (ret)
+			return ret;
 	}
-	kfree(r);
-	if (ret) {
-		dev_err(ave->dev, "out of encoder DMA space after %zu MiB of MCTF surfaces\n",
-			mapped >> 20);
-		return -ENOMEM;
-	}
+	memcpy(sess->mctf_buf, ave->mctf_pool, sizeof(sess->mctf_buf));
+	memcpy(sess->mctf_in, ave->mctf_pool_in, sizeof(sess->mctf_in));
+	memcpy(sess->mctf_out, ave->mctf_pool_out, sizeof(sess->mctf_out));
 	for (unsigned int i = 0; i < l->n_surfaces; i++)
 		sess->mctf_iova[i] = sess->mctf_buf[i].dma;
-	/* Picture surfaces: the CPU moves pictures in and out of them. */
-	for (unsigned int i = 0; i < l->inputs && !ret; i++)
-		ret = ave_alloc(ave, &sess->mctf_in[i], l->form.bytes, 0);
-	for (unsigned int i = 0; i < l->slots && !ret; i++)
-		ret = ave_alloc(ave, &sess->mctf_out[i], l->form.bytes, 0);
-	if (ret) {
-		dev_err(ave->dev, "no DMA space for the MCTF picture surfaces\n");
-		return -ENOMEM;
-	}
-	dev_dbg(ave->dev, "MCTF session: %u surfaces, %zu KiB mapped\n", n, mapped >> 10);
+	dev_dbg(ave->dev, "MCTF session on the device pool\n");
 	return 0;
 }
 
 static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 {
+	ave_mctf_pool_return(ave, sess);
 	ave_free(ave, &sess->hdr);
 	for (unsigned int i = 0; i < AVE_MAX_REFS; i++) {
 		ave_free(ave, &sess->ref_a[i]);
@@ -594,13 +656,9 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 }
 
 /*
- * Keep every firmware-visible allocation mapped until a confirmed power cycle.
- *
- * An MCTF session the firmware has seen is always kept until then: its
- * surfaces (44 MiB) were freed at STREAMOFF right after Close and a 20 ms
- * Halt settle while the coprocessor kept power, and the encoder DART flushes
- * lazily, so a late firmware write could land in pages already reused. Only
- * the CPU copies go now.
+ * Keep every firmware-visible allocation mapped until a confirmed power cycle
+ * when the firmware failed. An MCTF session's DMA memory is the device pool,
+ * which is only handed back here, never freed.
  */
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
@@ -610,15 +668,12 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 	if (!sess)
 		return;
 	mutex_lock(&ave->hw_lock);
-	if (sess->handed && (sess->mctf || ave->fw_state == AVE_FW_BROKEN ||
+	if (sess->handed && (ave->fw_state == AVE_FW_BROKEN ||
 			     ave->fw_state == AVE_FW_RECOVERING)) {
 		kvfree(sess->mctf_surf);
 		sess->mctf_surf = NULL;
 		kvfree(sess->mctf_lin);
 		sess->mctf_lin = NULL;
-		if (sess->mctf)
-			dev_dbg(ave->dev,
-				"MCTF session retired: surfaces stay mapped until the coprocessor loses power\n");
 		sess->failed_next = ave->failed_sessions;
 		ave->failed_sessions = sess;
 	} else {
