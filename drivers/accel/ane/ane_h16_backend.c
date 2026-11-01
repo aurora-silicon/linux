@@ -826,7 +826,7 @@ static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 	/* Only a warmed, single outstanding EXEC with the exact same identity.
 	 * Cached/pipelined completions must not masquerade as quiet execution.
 	 */
-	if (!us || j->outstanding != 1 || j->quiet_batch_pipelined ||
+	if (!us || !uuid || j->outstanding != 1 || j->quiet_batch_pipelined ||
 	    uuid != j->last_exec_uuid ||
 	    !j->quiet_warmed || memcmp(j->last_exec_handles,
 				     j->quiet_warm_handles, sizeof(j->last_exec_handles)))
@@ -938,8 +938,12 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 			if (j->outstanding)
 				j->quiet_batch_pipelined = true;
 			j->outstanding++;
-			j->last_exec_uuid = get_unaligned_le64(command + 0x20);
-			memcpy(j->last_exec_handles, command + 8, sizeof(j->last_exec_handles));
+			j->last_exec_uuid = 0;
+			if (length >= 0x28) {
+				j->last_exec_uuid = get_unaligned_le64(command + 0x20);
+				memcpy(j->last_exec_handles, command + 8,
+				       sizeof(j->last_exec_handles));
+			}
 		}
 		ret = ane_h16_job_wait(h, channel);
 	}
