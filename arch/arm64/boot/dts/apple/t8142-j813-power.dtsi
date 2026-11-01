@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M5) J813: SMC power off / restart, the PMU on
+ * SPMI and the watchdog.
+ */
+
+&{/soc} {
+	/* ADT /arm-io/wdt (wdt,t8142): restart (and the SMC's fallback). */
+	wdt: watchdog@3882b0000 {
+		compatible = "apple,t8142-wdt", "apple,t8103-wdt";
+		reg = <0x3 0x882b0000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
+
+&{/soc} {
+	/*
+	 * ADT /arm-io/nub-spmi0 (gen 4) and its primary PMU, pmu-main
+	 * ("abbey", slave 0xe). The boot flags live in the legacy scratchpad
+	 * (info-leg_scrpad = 0xf800), laid out as on T8103 and J873.
+	 */
+	nub_spmi0: spmi@388714000 {
+		compatible = "apple,t8142-spmi";
+		reg = <0x3 0x88714000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		pmic@e {
+			compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+			reg = <0xe SPMI_USID>;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				boot_stage: boot-stage@f801 {
+					reg = <0xf801 0x1>;
+				};
+
+				boot_error_count: boot-error-count@f802,0 {
+					reg = <0xf802 0x1>;
+					bits = <0 4>;
+				};
+
+				panic_count: panic-count@f802,4 {
+					reg = <0xf802 0x1>;
+					bits = <4 4>;
+				};
+
+				/* Set before off1, or the machine powers back on. */
+				shutdown_flag: shutdown-flag@f80f,3 {
+					reg = <0xf80f 0x1>;
+					bits = <3 1>;
+				};
+			};
+		};
+	};
+};
+
+&smc {
+	/* Power off (MBSE = off1) and restart (MBSE = phra). */
+	reboot {
+		compatible = "apple,smc-reboot";
+		nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+			      <&boot_error_count>, <&panic_count>;
+		nvmem-cell-names = "shutdown_flag", "boot_stage",
+				   "boot_error_count", "panic_count";
+	};
+};

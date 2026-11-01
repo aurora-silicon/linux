@@ -179,6 +179,36 @@
 			opp-hz = /bits/ 64 <972000000>;
 			opp-level = <2>;
 		};
+
+		opp-1152000000 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-level = <3>;
+		};
+
+		opp-1584000000 {
+			opp-hz = /bits/ 64 <1584000000>;
+			opp-level = <4>;
+		};
+
+		opp-1992000000 {
+			opp-hz = /bits/ 64 <1992000000>;
+			opp-level = <5>;
+		};
+
+		opp-2352000000 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <6>;
+		};
+
+		opp-2700000000 {
+			opp-hz = /bits/ 64 <2700000000>;
+			opp-level = <7>;
+		};
+
+		opp-2964000000 {
+			opp-hz = /bits/ 64 <2964000000>;
+			opp-level = <8>;
+		};
 	};
 
 	pcluster_opp: opp-table-1 {
@@ -234,6 +264,53 @@
 			opp-hz = /bits/ 64 <3516000000>;
 			opp-level = <10>;
 		};
+
+		/* ADT levels 11-20, measured on J813 (level 19, 4416 MHz, is below
+		 * level 18 and left out). The SoC throttles them when hot. */
+		opp-3720000000 {
+			opp-hz = /bits/ 64 <3720000000>;
+			opp-level = <11>;
+		};
+
+		opp-3876000000 {
+			opp-hz = /bits/ 64 <3876000000>;
+			opp-level = <12>;
+		};
+
+		opp-4020000000 {
+			opp-hz = /bits/ 64 <4020000000>;
+			opp-level = <13>;
+		};
+
+		opp-4176000000 {
+			opp-hz = /bits/ 64 <4176000000>;
+			opp-level = <14>;
+		};
+
+		opp-4248000000 {
+			opp-hz = /bits/ 64 <4248000000>;
+			opp-level = <15>;
+		};
+
+		opp-4272000000 {
+			opp-hz = /bits/ 64 <4272000000>;
+			opp-level = <16>;
+		};
+
+		opp-4332000000 {
+			opp-hz = /bits/ 64 <4332000000>;
+			opp-level = <17>;
+		};
+
+		opp-4428000000 {
+			opp-hz = /bits/ 64 <4428000000>;
+			opp-level = <18>;
+		};
+
+		opp-4464000000 {
+			opp-hz = /bits/ 64 <4464000000>;
+			opp-level = <20>;
+		};
 	};
 
 	clkref: clock-ref {
@@ -259,6 +336,30 @@
 			compatible = "apple,t8142-cluster-cpufreq";
 			reg = <0x2 0x11e20000 0 0x1000>;
 			#performance-domain-cells = <0>;
+		};
+
+		/*
+		 * PMC voter interface (AppleT8142PMC, ADT pmc-pmgr 31 + 0x700000):
+		 * floors at 0x382700000 + agent * 0x4000, per-agent states at
+		 * +0x106000, rail enables at +0x108000. Agents (ADT voter-agent):
+		 * PMP 0, CLPC 1, GFX 2, AP 3. iBoot leaves every enable at 0, so
+		 * no vote is honoured and DRAM and fabric stay at their lowest
+		 * states (CPU DRAM latency 171 ns instead of 70 ns).
+		 */
+		pmc: power-management@382700000 {
+			compatible = "apple,t8142-pmc";
+			reg = <0x3 0x82700000 0x0 0x10000>,
+			      <0x3 0x82806000 0x0 0x3000>;
+			reg-names = "voters", "rails";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			/* PMP, CLPC and AP agents */
+			apple,static-voters = <0 1 3>;
+
+			clpc: performance-controller@1 {
+				compatible = "apple,t8142-clpc";
+				reg = <1>;
+			};
 		};
 
 		aic: interrupt-controller@381000000 {
@@ -292,5 +393,13 @@
 };
 
 #include "t8142-j813-display.dtsi"
+#include "t8142-j813-gpu.dtsi"
 #include "t8142-j813-peripherals.dtsi"
 #include "t8142-j813-usb.dtsi"
+#include "t8142-j813-avd.dtsi"
+#include "t8142-j813-isp.dtsi"
+#include "t8142-j813-psci-idle.dtsi"
+#include "t8142-j813-nvme.dtsi"
+#include "t8142-j813-n1.dtsi"
+#include "t8142-j813-power.dtsi"
+#include "t8142-j813-audio.dtsi"
