@@ -27,6 +27,7 @@
 
 #include "ane_h16_boot.h"
 #include "ane_fw_irq_wait.h"
+#include "ane_fw_report_fifo.h"
 #include "ane_h16_execute.h"
 #include "ane_h16_preload.h"
 
@@ -68,6 +69,7 @@ struct ane_h16_device {
 	bool job_irq_mode;
 	struct ane_h16_consume_trace *consume_trace;
 	u32 consume_trace_count, consume_trace_dropped;
+	u32 early_consumes, early_peak, early_remaining, early_full_errors;
 	u64 snapshot_sequence, snapshot_begin, snapshot_end;
 	u32 snapshot_begin_cpu, snapshot_end_cpu;
 	struct ane_fw_irq_event irq_event;
@@ -109,6 +111,13 @@ MODULE_PARM_DESC(h16_map_batch, "Diagnostic private surface DART mapping in one 
 static bool h16_job_snapshot;
 module_param(h16_job_snapshot, bool, 0444);
 MODULE_PARM_DESC(h16_job_snapshot, "Allow bounded fixed firmware DATA snapshots after job, default0; non-atomic read only");
+
+static bool h16_job_early_drain;
+module_param(h16_job_early_drain, bool, 0444);
+MODULE_PARM_DESC(h16_job_early_drain, "Copy/ACK T2H during EXEC CMD wait into bounded FIFO, default0; incompatible with quiet");
+static bool h16_job_return_trace;
+module_param(h16_job_return_trace, bool, 0444);
+MODULE_PARM_DESC(h16_job_return_trace, "Record actual EVENT helper return counter, default0; includes CMD acceptance/FIFO dispatch");
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
@@ -842,6 +851,7 @@ enum {
 	ANE_H16_JOB_PEEK,	/* u64 dva, u64 size; result: the bytes */
 	ANE_H16_JOB_QUIET,	/* result only: UUID, handles, requested us, busy, CPU; two counter anchors */
 	ANE_H16_JOB_GAP,	/* result only: UUID, requested us, CPU; two gap counter anchors */
+	ANE_H16_JOB_RETURN,	/* result only: UUID, CPU, reserved; one EVENT-return counter */
 };
 
 #define ANE_H16_JOB_FILL_PROGRAM BIT(0)	/* u32 program handle at +8 */
@@ -871,6 +881,7 @@ struct ane_h16_job {
 	u64 last_exec_uuid;
 	u32 last_exec_handles[3], quiet_warm_handles[3];
 	bool quiet_warmed, quiet_batch_pipelined;
+	struct ane_fw_report_fifo early;
 };
 
 static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
@@ -1080,21 +1091,83 @@ static int ane_h16_job_irq_pause(struct ane_h16_device *h, unsigned int sequence
 	return ane_h16_job_irq_error(h);
 }
 
+struct ane_h16_report_capture {
+	struct ane_h16_device *h;
+	struct ane_h16_job *j;
+};
+
+static int ane_h16_job_capture(void *ctx, struct ane_fw_report *packet)
+{
+	struct ane_h16_report_capture *c = ctx;
+	struct ane_h16_device *h = c->h;
+	struct ane_h16_job *j = c->j;
+	struct ane_fw_transport *t = &h->boot.transport;
+	struct ane_h16_consume_trace trace;
+	bool tracing = h->consume_trace && h->consume_trace_count < ANE_H16_CONSUME_TRACE_MAX;
+	u8 *report = packet->data;
+	size_t size = 0;
+	u64 ns, counter;
+	int r;
+
+	if (tracing) {
+		trace.begin_cpu = raw_smp_processor_id();
+		trace.irq_before = atomic_read(&h->irq_calls);
+		trace.begin_counter = get_cycles();
+	}
+	r = ane_fw_transport_consume_traced(t, report, sizeof(packet->data), &size,
+					 tracing ? &trace.transport : NULL);
+	if (r)
+		return r;
+	ns = ktime_get_ns() - j->published_ns;
+	counter = get_cycles();
+	packet->size = size;
+	packet->ns = ns;
+	packet->counter = counter;
+	/* Original physical consume endpoint precedes FIFO/result bookkeeping. */
+	if (tracing) {
+		trace.end_counter = counter;
+		trace.end_cpu = raw_smp_processor_id();
+		trace.irq_after = atomic_read(&h->irq_calls);
+		trace.token = get_unaligned_le32(report);
+		trace.command_id = get_unaligned_le16(report + 4);
+		trace.uuid = 0;
+		trace.state = U32_MAX;
+		if (trace.command_id == ANE_H16_EVENT_REPORT && size >= 0x20) {
+			trace.uuid = get_unaligned_le64(report + 8);
+			trace.state = get_unaligned_le32(report + 0x1c);
+		}
+		h->consume_trace[h->consume_trace_count++] = trace;
+	} else if (h->consume_trace) {
+		h->consume_trace_dropped++;
+	}
+	return 0;
+}
+
 /* ane_fw_transport_wait with a 10-20 us poll, so job timings are not 1 ms steps. */
-static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
+static int ane_h16_job_wait(struct ane_h16_device *h, struct ane_h16_job *j,
+			    unsigned int ch, bool early)
 {
 	struct ane_fw_transport *t = &h->boot.transport;
 	u32 pending;
+	struct ane_h16_report_capture capture = { h, j };
 	u64 spin_deadline = ane_h16_job_spin_deadline();
 	int ret;
 
 	for (;;) {
 		unsigned int sequence = ane_fw_irq_event_sequence(&h->irq_event);
-		bool progress;
+		bool progress, early_progress = false;
 
 		ret = ane_h16_job_irq_error(h);
 		if (ret)
 			return ret;
+		if (early) {
+			if (ktime_get_ns() >= t->pending[ch].deadline_ns)
+				return ane_fw_transport_fail(t, -ETIMEDOUT);
+			ret = ane_fw_report_fifo_prefetch(&j->early, ane_h16_job_capture,
+						  &capture, 4, &early_progress);
+			if (ret)
+				return ane_fw_transport_fail(t, ret);
+		}
 		ret = ane_fw_transport_poll(t, ch);
 		if (ret != -EAGAIN)
 			return ane_h16_job_irq_error(h) ?: ret;
@@ -1105,7 +1178,7 @@ static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 			if (ktime_get_ns() >= t->pending[ch].deadline_ns)
 				return ane_fw_transport_fail(t, -ETIMEDOUT);
 			ane_fw_transport_rering(t, ch);
-			if (progress)
+			if (progress || early_progress)
 				continue;
 			ret = ane_h16_job_irq_pause(h, sequence, t->pending[ch].deadline_ns,
 						     spin_deadline);
@@ -1129,6 +1202,8 @@ static int ane_h16_job_wait(struct ane_h16_device *h, unsigned int ch)
 		ret = ane_h16_faults(&h->boot, false);
 		if (ret)
 			return ane_fw_transport_fail(t, ret);
+		if (early_progress)
+			continue;
 		ane_h16_job_relax(spin_deadline);
 	}
 }
@@ -1207,7 +1282,8 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 				       sizeof(j->last_exec_handles));
 			}
 		}
-		ret = ane_h16_job_wait(h, channel);
+		ret = ane_h16_job_wait(h, j, channel, h16_job_early_drain &&
+			get_unaligned_le16(command + 4) == ANE_H16_EXECUTE);
 	}
 	counters[1] = get_cycles();
 	*ns = ktime_get_ns() - start;
@@ -1236,7 +1312,9 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 {
 	struct ane_fw_transport *t = &h->boot.transport;
 	u64 deadline = ktime_get_ns() + (u64)timeout_ms * NSEC_PER_MSEC;
-	u8 report[0x80];
+	struct ane_fw_report packet;
+	u8 *report = packet.data;
+	struct ane_h16_report_capture capture = { h, j };
 	u64 spin_deadline = ane_h16_job_spin_deadline();
 	int ret = -ETIMEDOUT;
 	unsigned int i;
@@ -1259,40 +1337,16 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		unsigned int sequence = ane_fw_irq_event_sequence(&h->irq_event);
 		bool progress;
 		int r = ane_h16_job_irq_error(h);
-		struct ane_h16_consume_trace trace;
-		bool tracing = h->consume_trace &&
-			h->consume_trace_count < ANE_H16_CONSUME_TRACE_MAX;
 
 		if (r)
 			return r;
-		if (tracing) {
-			trace.begin_cpu = raw_smp_processor_id();
-			trace.irq_before = atomic_read(&h->irq_calls);
-			trace.begin_counter = get_cycles();
-		}
-		r = ane_fw_transport_consume_traced(t, report, sizeof(report), &size,
-						tracing ? &trace.transport : NULL);
+		r = ane_fw_report_fifo_pop(&j->early, &packet);
+		if (r == -EAGAIN)
+			r = ane_h16_job_capture(&capture, &packet);
 		if (!r) {
-			u64 ns = ktime_get_ns() - j->published_ns;
-			u64 counter = get_cycles();
+			u64 ns = packet.ns, counter = packet.counter;
 
-			/* Preserve the original EVENT endpoint before trace bookkeeping. */
-			if (tracing) {
-				trace.end_counter = counter;
-				trace.end_cpu = raw_smp_processor_id();
-				trace.irq_after = atomic_read(&h->irq_calls);
-				trace.token = get_unaligned_le32(report);
-				trace.command_id = get_unaligned_le16(report + 4);
-				trace.uuid = 0;
-				trace.state = U32_MAX;
-				if (trace.command_id == ANE_H16_EVENT_REPORT && size >= 0x20) {
-					trace.uuid = get_unaligned_le64(report + 8);
-					trace.state = get_unaligned_le32(report + 0x1c);
-				}
-				h->consume_trace[h->consume_trace_count++] = trace;
-			} else if (h->consume_trace) {
-				h->consume_trace_dropped++;
-			}
+			size = packet.size;
 			r = ane_h16_job_emit_counters(j, ANE_H16_JOB_EVENT, 0, ns, report, size,
 						      &counter, 1);
 			if (r)
@@ -1426,6 +1480,18 @@ static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
 			if (length < 12)
 				return -EINVAL;
 			ret = ane_h16_job_event(h, j, get_unaligned_le64(a), get_unaligned_le32(a + 8));
+			if (h16_job_return_trace) {
+				u8 data[16] = {};
+				u64 counter = get_cycles();
+				int emitted;
+
+				put_unaligned_le64(get_unaligned_le64(a), data);
+				put_unaligned_le32(raw_smp_processor_id(), data + 8);
+				emitted = ane_h16_job_emit_counters(j, ANE_H16_JOB_RETURN, ret,
+					0, data, sizeof(data), &counter, 1);
+				if (emitted)
+					return emitted;
+			}
 			ns = ktime_get_ns() - j->published_ns;
 			break;
 		default:
@@ -1501,6 +1567,14 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 		kvfree(in);
 		return -ENOMEM;
 	}
+	if (h16_job_early_drain) {
+		ret = ane_fw_report_fifo_init(&j.early);
+		if (ret) {
+			vfree(j.out);
+			kvfree(in);
+			return ret;
+		}
+	}
 	mutex_lock(&ane_h16_lock);
 	if (!ane_h16_job_dev) {
 		ret = -ENODEV;
@@ -1512,6 +1586,17 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 		if (!ret)
 			ret = ane_h16_job_run(ane_h16_job_dev, &j, in, count);
 		ret = ane_h16_job_irq_error(ane_h16_job_dev) ?: ret;
+		if (!ret && h16_job_early_drain) {
+			ret = ane_fw_report_fifo_complete(&j.early, j.outstanding);
+			if (ret) {
+				ane_h16_job_emit(&j, ANE_H16_JOB_EVENT, ret, 0, NULL, 0);
+				ret = ane_fw_transport_fail(&ane_h16_job_dev->boot.transport, ret);
+			}
+		}
+		ane_h16_job_dev->early_consumes = j.early.captured;
+		ane_h16_job_dev->early_peak = j.early.peak;
+		ane_h16_job_dev->early_remaining = ane_fw_report_fifo_count(&j.early);
+		ane_h16_job_dev->early_full_errors = j.early.full_errors;
 		dev_info(ane_h16_job_dev->dev, "H16 job %zu bytes: %d, result %zu bytes\n",
 			 count, ret, j.used);
 	}
@@ -1519,6 +1604,7 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 	ane_h16_job_result.data = j.out;
 	ane_h16_job_result.size = j.used;
 	mutex_unlock(&ane_h16_lock);
+	ane_fw_report_fifo_free(&j.early);
 	kvfree(in);
 	return ret ? ret : count;
 }
@@ -1670,6 +1756,20 @@ static int ane_h16_data_snapshot_info_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(ane_h16_data_snapshot_info);
 
+static int ane_h16_early_stats_show(struct seq_file *m, void *unused)
+{
+	struct ane_h16_device *h = m->private;
+
+	mutex_lock(&ane_h16_lock);
+	seq_printf(m, "{\"mode\":%s,\"return_trace\":%s,\"consumed\":%u,\"fifo_peak\":%u,\"remaining\":%u,\"full_errors\":%u}\n",
+		   h16_job_early_drain ? "true" : "false",
+		   h16_job_return_trace ? "true" : "false", h->early_consumes,
+		   h->early_peak, h->early_remaining, h->early_full_errors);
+	mutex_unlock(&ane_h16_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ane_h16_early_stats);
+
 static void ane_h16_job_publish(struct ane_h16_device *h)
 {
 	if (!h16_job || ane_h16_job_dev)
@@ -1701,6 +1801,7 @@ static void ane_h16_job_publish(struct ane_h16_device *h)
 		debugfs_create_file("data_snapshot_info", 0400, ane_h16_debugfs, h,
 				    &ane_h16_data_snapshot_info_fops);
 	}
+	debugfs_create_file("early_stats", 0400, ane_h16_debugfs, h, &ane_h16_early_stats_fops);
 	debugfs_create_file("consume_trace", 0400, ane_h16_debugfs, h, &ane_h16_consume_trace_fops);
 	debugfs_create_file("irq_stats", 0400, ane_h16_debugfs, h, &ane_h16_irq_stats_fops);
 	debugfs_create_file("job", 0200, ane_h16_debugfs, NULL, &ane_h16_job_fops);
@@ -1777,8 +1878,8 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 		ret = -EBUSY;
 		goto unlock;
 	}
-	if (h16_job_irq && h16_job_quiet_us) {
-		dev_err(&pdev->dev, "H16 IRQ and quiet probes cannot be combined\n");
+	if ((h16_job_irq || h16_job_early_drain) && h16_job_quiet_us) {
+		dev_err(&pdev->dev, "H16 IRQ/early-drain and quiet probes cannot be combined\n");
 		ret = -EINVAL;
 		goto unlock;
 	}
