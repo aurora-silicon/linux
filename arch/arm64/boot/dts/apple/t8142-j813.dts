@@ -179,6 +179,36 @@
 			opp-hz = /bits/ 64 <972000000>;
 			opp-level = <2>;
 		};
+
+		opp-1152000000 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-level = <3>;
+		};
+
+		opp-1584000000 {
+			opp-hz = /bits/ 64 <1584000000>;
+			opp-level = <4>;
+		};
+
+		opp-1992000000 {
+			opp-hz = /bits/ 64 <1992000000>;
+			opp-level = <5>;
+		};
+
+		opp-2352000000 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <6>;
+		};
+
+		opp-2700000000 {
+			opp-hz = /bits/ 64 <2700000000>;
+			opp-level = <7>;
+		};
+
+		opp-2964000000 {
+			opp-hz = /bits/ 64 <2964000000>;
+			opp-level = <8>;
+		};
 	};
 
 	pcluster_opp: opp-table-1 {
@@ -233,6 +263,53 @@
 		opp-3516000000 {
 			opp-hz = /bits/ 64 <3516000000>;
 			opp-level = <10>;
+		};
+
+		/* ADT levels 11-20, measured on J813 (level 19, 4416 MHz, is below
+		 * level 18 and left out). The SoC throttles them when hot. */
+		opp-3720000000 {
+			opp-hz = /bits/ 64 <3720000000>;
+			opp-level = <11>;
+		};
+
+		opp-3876000000 {
+			opp-hz = /bits/ 64 <3876000000>;
+			opp-level = <12>;
+		};
+
+		opp-4020000000 {
+			opp-hz = /bits/ 64 <4020000000>;
+			opp-level = <13>;
+		};
+
+		opp-4176000000 {
+			opp-hz = /bits/ 64 <4176000000>;
+			opp-level = <14>;
+		};
+
+		opp-4248000000 {
+			opp-hz = /bits/ 64 <4248000000>;
+			opp-level = <15>;
+		};
+
+		opp-4272000000 {
+			opp-hz = /bits/ 64 <4272000000>;
+			opp-level = <16>;
+		};
+
+		opp-4332000000 {
+			opp-hz = /bits/ 64 <4332000000>;
+			opp-level = <17>;
+		};
+
+		opp-4428000000 {
+			opp-hz = /bits/ 64 <4428000000>;
+			opp-level = <18>;
+		};
+
+		opp-4464000000 {
+			opp-hz = /bits/ 64 <4464000000>;
+			opp-level = <20>;
 		};
 	};
 
