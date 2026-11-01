@@ -881,7 +881,39 @@ static void program_bad_report_test(struct kunit *test)
 	}
 }
 
-/* The command arena is never recycled; running out refuses cleanly. */
+/*
+ * Each completed EXECUTE gives its arena back, so a long run never fills
+ * the pool; LOAD and CREATE keep theirs.
+ */
+static void program_pool_recycle_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	size_t mark;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	mark = ane_fw_transport_mark(&f->t);
+	KUNIT_EXPECT_GT(test, mark, 0);
+	/* Far more requests than one pass through the 256 KiB arena holds. */
+	for (i = 0; i < 1000; i++) {
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_mark(&f->t), mark);
+	}
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	/* A failed request keeps its space: nothing is reused after a fault. */
+	f->mode = FW_REPORT_FAILURE;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -EIO);
+	KUNIT_EXPECT_GT(test, f->t.pool_used, mark);
+	/* Release refuses while a command is in flight or below the arena use. */
+	f->t.pending[ANE_FW_IO].active = true;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_release(&f->t, mark), -EBUSY);
+	f->t.pending[ANE_FW_IO].active = false;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_release(&f->t, f->t.pool_used + 1), -EINVAL);
+}
+
+/* Running out of arena refuses cleanly, before any traffic. */
 static void program_pool_test(struct kunit *test)
 {
 	struct prog_fw *f = fw_create(test);
@@ -910,6 +942,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_bad_load_test),
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_pool_test),
+	KUNIT_CASE(program_pool_recycle_test),
 	{}
 };
 

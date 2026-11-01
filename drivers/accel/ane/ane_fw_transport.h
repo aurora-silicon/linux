@@ -226,6 +226,31 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 	return 0;
 }
 
+/* Command arena position, for ane_fw_transport_release(). */
+static inline size_t ane_fw_transport_mark(const struct ane_fw_transport *t)
+{
+	return t->pool_used;
+}
+
+/*
+ * Give back the arena used by every command published since @mark. The caller
+ * guarantees that the firmware is done with all of them, not only that they
+ * were acknowledged: an EXECUTE is done once its completion report arrived.
+ * Refused while any channel still has a command in flight.
+ */
+static inline int ane_fw_transport_release(struct ane_fw_transport *t, size_t mark)
+{
+	unsigned int ch;
+
+	if (t->error || mark > t->pool_used || mark > t->pool.size)
+		return -EINVAL;
+	for (ch = 0; ch < ANE_FW_CHANNELS; ch++)
+		if (t->pending[ch].active)
+			return -EBUSY;
+	t->pool_used = mark;
+	return 0;
+}
+
 /* On success/refusal the reply remains in the pool for the caller to inspect. */
 static inline int ane_fw_transport_poll(struct ane_fw_transport *t, unsigned int ch)
 {

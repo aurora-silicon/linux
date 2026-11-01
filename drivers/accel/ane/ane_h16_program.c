@@ -418,8 +418,9 @@ static int h16_send(struct ane_h16_session *s, unsigned int ch, const void *comm
 }
 
 /*
- * The transport copies commands into a monotonic pool arena that is never
- * recycled before reset. Refuse a sequence up front when it cannot fit, so
+ * The transport copies commands into a pool arena. LOAD and CREATE stay in
+ * it; each EXECUTE sequence gives its space back once the firmware reported
+ * the request complete. Refuse a sequence up front when it cannot fit, so
  * running out of arena is a clean -ENOSPC and never a half-sent sequence.
  */
 static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
@@ -686,7 +687,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES];
 	struct ane_h16_pending request = {};
 	struct ane_h16_execute call = {};
-	size_t length, sequence[5];
+	size_t length, sequence[5], mark;
 	u8 *command;
 	const u8 *reply;
 	unsigned int i;
@@ -720,6 +721,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	command = kzalloc(length, GFP_KERNEL);
 	if (!command)
 		return -ENOMEM;
+	mark = ane_fw_transport_mark(s->transport);
 	/* Inputs and poisoned outputs must reach memory before any doorbell. */
 	s->transport->ops->write_barrier(s->transport->ctx);
 	ret = h16_gate(s, 0);
@@ -756,7 +758,11 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 		goto fail;
 	s->transport->ops->read_barrier(s->transport->ctx);
 	kfree(command);
-	return 0;
+	/*
+	 * The completion report and the closing gate reply both arrived, so the
+	 * firmware no longer reads this sequence's commands: reuse their space.
+	 */
+	return ane_fw_transport_release(s->transport, mark);
 fail:
 	kfree(command);
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request.key.uuid);
