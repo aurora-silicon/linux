@@ -72,6 +72,10 @@ struct ane_fw_transport {
 	u32 shared_count;
 	u64 terminal_messages;
 	u64 terminal_bytes;
+	/* Caller owns the drain scope; IRQ handler never accesses these fields. */
+	u64 report_ack_slots, report_ack_doorbells;
+	u32 report_ack_pending, report_ack_peak;
+	bool report_ack_defer;
 	int error;
 	bool armed;
 	bool native_free;
@@ -152,6 +156,30 @@ static inline void ane_fw_transport_advance(struct ane_fw_transport *t, unsigned
 static inline void ane_fw_transport_doorbell(struct ane_fw_transport *t, unsigned int ch)
 {
 	t->ops->write32(t->ctx, t->soc->doorbell, BIT(t->channels[ch].bit));
+}
+
+/* Each ownership store already has its original trailing DMA write barrier.
+ * Flush even after a sticky transport error: previously returned slots still
+ * need their notification. No ownership writes or new delay are added here.
+ */
+static inline void ane_fw_report_ack_flush(struct ane_fw_transport *t)
+{
+	if (!t->report_ack_pending)
+		return;
+	ane_fw_transport_doorbell(t, ANE_FW_IO_T2H);
+	t->report_ack_doorbells++;
+	t->report_ack_pending = 0;
+}
+
+static inline bool ane_fw_report_batch_eligible(bool mode, u32 outstanding, bool pipelined)
+{
+	return mode && outstanding == 1 && !pipelined;
+}
+
+static inline void ane_fw_report_batch_end(struct ane_fw_transport *t)
+{
+	t->report_ack_defer = false;
+	ane_fw_report_ack_flush(t);
 }
 
 static inline int ane_fw_transport_arm(struct ane_fw_transport *t)
@@ -315,7 +343,7 @@ ane_fw_transport_consume_traced(struct ane_fw_transport *t, void *report, size_t
 		return ret;
 	if (trace)
 		trace->ns[0] = t->ops->now_ns(t->ctx);
-	if (!t->armed || !report || !size)
+	if (!t->armed || !report || !size || (trace && t->report_ack_defer))
 		return -EINVAL;
 	p = ane_fw_transport_slot(t, ANE_FW_IO_T2H);
 	word0 = t->ops->load64(t->ctx, p);
@@ -352,7 +380,12 @@ ane_fw_transport_consume_traced(struct ane_fw_transport *t, void *report, size_t
 	t->ops->write_barrier(t->ctx);
 	if (trace)
 		trace->ns[5] = t->ops->now_ns(t->ctx);
-	ane_fw_transport_doorbell(t, ANE_FW_IO_T2H);
+	t->report_ack_slots++;
+	t->report_ack_pending++;
+	t->report_ack_peak = max(t->report_ack_peak, t->report_ack_pending);
+	/* Bound a burst even if unsolicited reports keep the ring nonempty. */
+	if (!t->report_ack_defer || t->report_ack_pending >= 4)
+		ane_fw_report_ack_flush(t);
 	if (trace)
 		trace->ns[6] = t->ops->now_ns(t->ctx);
 	ane_fw_transport_advance(t, ANE_FW_IO_T2H);

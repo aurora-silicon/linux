@@ -1006,6 +1006,9 @@ MODULE_PARM_DESC(h16_job_quiet_wake_us, "Optional private periodic wakes inside 
 static unsigned int h16_job_quiet_work_ns;
 module_param(h16_job_quiet_work_ns, uint, 0444);
 MODULE_PARM_DESC(h16_job_quiet_work_ns, "Private work after each quiet wake, at most10000ns");
+static bool h16_job_ack_batch;
+module_param(h16_job_ack_batch, bool, 0444);
+MODULE_PARM_DESC(h16_job_ack_batch, "Private serial EVENT report ACK notification batching, defaultoff; flush before wait/exit, at most4slots");
 static unsigned int h16_job_irq_coalesce_us;
 module_param(h16_job_irq_coalesce_us, uint, 0444);
 MODULE_PARM_DESC(h16_job_irq_coalesce_us, "Experimental worker delay after IRQ wake,0off/1..25us; preserves original deadline/ACK writes");
@@ -1526,7 +1529,7 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 }
 
 /* Collect IO_T2H reports until the terminal event of @uuid or the timeout. */
-static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
+static int ane_h16_job_event_inner(struct ane_h16_device *h, struct ane_h16_job *j,
 			     u64 uuid, u32 timeout_ms)
 {
 	struct ane_fw_transport *t = &h->boot.transport;
@@ -1602,6 +1605,8 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		}
 		if (r != -EAGAIN)
 			return r;
+		/* EMPTY is a flush boundary, before any service or sleep. */
+		ane_fw_report_ack_flush(t);
 		if (h->job_irq_mode) {
 			r = ane_h16_job_irq_service(h, &progress);
 			if (r)
@@ -1632,6 +1637,20 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 	}
 	/* A quiet/progress path may leave ret==0; expiry is never success. */
 	return ane_h16_job_irq_error(h) ?: -ETIMEDOUT;
+}
+
+/* All inner returns, including errors/timeout/terminal, pass this flush. */
+static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
+			     u64 uuid, u32 timeout_ms)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	int ret;
+
+	t->report_ack_defer = ane_fw_report_batch_eligible(h16_job_ack_batch,
+					j->outstanding, j->quiet_batch_pipelined);
+	ret = ane_h16_job_event_inner(h, j, uuid, timeout_ms);
+	ane_fw_report_batch_end(t);
+	return ret;
 }
 
 static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
@@ -1728,6 +1747,9 @@ static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
 
 static void ane_h16_irq_job_begin(struct ane_h16_device *h)
 {
+	h->boot.transport.report_ack_slots = 0;
+	h->boot.transport.report_ack_doorbells = 0;
+	h->boot.transport.report_ack_peak = 0;
 	memset(h->coalesce_stats, 0, sizeof(h->coalesce_stats));
 	h->irq_job_base[0] = atomic_read(&h->irq_calls);
 	h->irq_job_base[1] = atomic_read(&h->irq_notifications);
@@ -1772,7 +1794,11 @@ static int ane_h16_irq_stats_show(struct seq_file *s, void *unused)
 			i ? "," : "", i ? "EVENT" : "CMD", c->calls, c->total_ns,
 			c->min_ns, c->max_ns, c->iterations, c->clipped, c->errors);
 	}
-	seq_puts(s, "]}\n");
+	seq_printf(s, "],\"report_acks\":{\"batch\":%s,\"slots\":%llu,\"doorbells\":%llu,\"pending\":%u,\"peak\":%u,\"defer\":%s}}\n",
+		   h16_job_ack_batch ? "true" : "false",
+		   h->boot.transport.report_ack_slots, h->boot.transport.report_ack_doorbells,
+		   h->boot.transport.report_ack_pending, h->boot.transport.report_ack_peak,
+		   h->boot.transport.report_ack_defer ? "true" : "false");
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ane_h16_irq_stats);
@@ -2137,6 +2163,13 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	     h16_job_gap_us || h16_job_early_drain || h16_job_pending_mode ||
 	     h16_job_ack_pending_mode))) {
 		dev_err(&pdev->dev, "H16 IRQ coalescing requires IRQ and excludes gap/quiet/early/pending probes\n");
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (h16_job_ack_batch && (!h16_job_irq || h16_job_early_drain ||
+	    h16_job_trace || h16_job_quiet_us || h16_job_pending_mode ||
+	    h16_job_ack_pending_mode || h16_job_irq_coalesce_us)) {
+		dev_err(&pdev->dev, "H16 ACK batching requires IRQ and excludes trace/early/quiet/pending/coalescing probes\n");
 		ret = -EINVAL;
 		goto unlock;
 	}

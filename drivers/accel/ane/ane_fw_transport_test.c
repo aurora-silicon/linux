@@ -1506,7 +1506,101 @@ static void ane_job_drain_schedule_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_job_gap_duration(2, 3000, 0), 2000U);
 }
 
+static void ane_report_batch_scope_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, ane_fw_report_batch_eligible(true, 1, false));
+	KUNIT_EXPECT_FALSE(test, ane_fw_report_batch_eligible(false, 1, false));
+	KUNIT_EXPECT_FALSE(test, ane_fw_report_batch_eligible(true, 0, false));
+	KUNIT_EXPECT_FALSE(test, ane_fw_report_batch_eligible(true, 2, false));
+	KUNIT_EXPECT_FALSE(test, ane_fw_report_batch_eligible(true, 1, true));
+}
+
+static void ane_report_batch_burst_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 report[0x60], *p;
+	size_t size = 0;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->t.report_ack_defer = true;
+	for (i = 0; i < 3; i++) {
+		ane_transport_report_request(f, f->pool.dva + 0x100, sizeof(report));
+		p = ane_test_slot(f, ANE_FW_IO_T2H);
+		f->count = 0;
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_consume(&f->t, report, sizeof(report), &size), 0);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), (f->pool.dva + 0x100) | 1);
+		KUNIT_EXPECT_MEMEQ(test, report, (u8 *)f->pool.cpu + 0x100, sizeof(report));
+		/* The ownership store keeps both original ordering barriers. */
+		KUNIT_EXPECT_EQ(test, f->access[f->count - 3].kind, 'W');
+		KUNIT_EXPECT_PTR_EQ(test, f->access[f->count - 2].p, p);
+		KUNIT_EXPECT_EQ(test, f->access[f->count - 1].kind, 'W');
+		KUNIT_EXPECT_EQ(test, f->t.report_ack_doorbells, 0ULL);
+	}
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_slots, 3ULL);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_pending, 3U);
+	ane_fw_report_batch_end(&f->t);
+	KUNIT_EXPECT_FALSE(test, f->t.report_ack_defer);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_pending, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_doorbells, 1ULL);
+	KUNIT_EXPECT_EQ(test, f->last_value, (u32)BIT(6));
+	ane_fw_report_ack_flush(&f->t);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_doorbells, 1ULL);
+}
+
+static void ane_report_batch_bound_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 report[0x60];
+	size_t size = 0;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->t.report_ack_defer = true;
+	for (i = 0; i < 5; i++) {
+		ane_transport_report_request(f, f->pool.dva + 0x100, sizeof(report));
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_consume(&f->t, report, sizeof(report), &size), 0);
+	}
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_peak, 4U);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_pending, 1U);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_doorbells, 1ULL);
+	ane_fw_report_batch_end(&f->t);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_pending, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_doorbells, 2ULL);
+}
+
+static void ane_report_batch_empty_error_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	struct ane_fw_consume_trace trace;
+	u8 report[0x60];
+	size_t size = 0;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->t.report_ack_defer = true;
+	ane_transport_report_request(f, f->pool.dva + 0x100, sizeof(report));
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_consume_traced(&f->t, report, sizeof(report), &size, &trace), -EINVAL);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_pending, 0U);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_consume(&f->t, report, sizeof(report), &size), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_consume(&f->t, report, sizeof(report), &size), -EAGAIN);
+	ane_fw_report_ack_flush(&f->t); /* EMPTY boundary before wait. */
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_pending, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_doorbells, 1ULL);
+	ane_transport_report_request(f, f->pool.dva + 0x100, sizeof(report));
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_consume(&f->t, report, sizeof(report), &size), 0);
+	f->t.error = -EPROTO;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_consume(&f->t, report, sizeof(report), &size), -EPROTO);
+	ane_fw_report_batch_end(&f->t); /* Every error/timeout/terminal exit. */
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_pending, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.report_ack_doorbells, 2ULL);
+	KUNIT_EXPECT_FALSE(test, f->t.report_ack_defer);
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_report_batch_scope_test),
+	KUNIT_CASE(ane_report_batch_burst_test),
+	KUNIT_CASE(ane_report_batch_bound_test),
+	KUNIT_CASE(ane_report_batch_empty_error_test),
 	KUNIT_CASE(ane_job_drain_schedule_test),
 	KUNIT_CASE(ane_irq_coalesce_deadline_test),
 	KUNIT_CASE(ane_irq_coalesce_error_and_overshoot_test),
