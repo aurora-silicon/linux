@@ -52,9 +52,19 @@ mt7932_connect_auth(const struct cfg80211_connect_params *p)
 
 	switch (p->crypto.akm_suites[0]) {
 	case WLAN_AKM_SUITE_PSK:
-		if ((versions & NL80211_WPA_VERSION_2) && p->crypto.psk &&
-		    (p->mfp == NL80211_MFP_NO || p->mfp == NL80211_MFP_OPTIONAL))
+		/* iwd and wpa_supplicant both send REQUIRED once they have
+		 * negotiated PMF with an MFPC AP; wpa_supplicant sends OPTIONAL
+		 * when either outcome will do. Admission against the AP's RSN
+		 * capabilities decides.
+		 */
+		if ((versions & NL80211_WPA_VERSION_2) && p->crypto.psk)
 			return WLAN_AKM_SUITE_PSK;
+		break;
+	case WLAN_AKM_SUITE_PSK_SHA256:
+		if ((versions & NL80211_WPA_VERSION_2) && p->crypto.psk &&
+		    (p->mfp == NL80211_MFP_OPTIONAL ||
+		     p->mfp == NL80211_MFP_REQUIRED))
+			return WLAN_AKM_SUITE_PSK_SHA256;
 		break;
 	case WLAN_AKM_SUITE_OWE:
 		if (p->auth_type == NL80211_AUTHTYPE_OPEN_SYSTEM &&
@@ -80,6 +90,122 @@ mt7932_connect_auth(const struct cfg80211_connect_params *p)
 		break;
 	}
 	return -EOPNOTSUPP;
+}
+
+/* A selected AKM is not an MFP policy field. Firmware owns all handshake
+ * keys, including IGTK, and BIP verification. No host management-key command
+ * or optional/required bit has been established for EA/40.
+ */
+static inline int mt7932_connect_psk_akm(u8 *body, size_t length, u32 akm)
+{
+	if (length < 856 || body[1] != 4 ||
+	    (akm != WLAN_AKM_SUITE_PSK && akm != WLAN_AKM_SUITE_PSK_SHA256))
+		return -EINVAL;
+	put_unaligned_le16(akm == WLAN_AKM_SUITE_PSK_SHA256 ? 0x0400 : 0x0008,
+			   body + 0x14);
+	return 0;
+}
+
+/* Validate the entire RSN payload before using capabilities for admission.
+ * The group management suite defaults to BIP-CMAC-128 when omitted. Reject
+ * unsupported explicit suites rather than letting firmware choose one.
+ */
+static inline int mt7932_rsn_admit(const u8 *rsn, size_t length, u32 akm,
+				   enum nl80211_mfp mfp, bool *pmf)
+{
+	unsigned int count, i;
+	u16 caps = 0;
+	bool selected = false, ccmp = false;
+
+	*pmf = false;
+	if (mfp > NL80211_MFP_OPTIONAL || length < 8 ||
+	    get_unaligned_le16(rsn) != 1 ||
+	    get_unaligned_be32(rsn + 2) != WLAN_CIPHER_SUITE_CCMP)
+		return -EINVAL;
+	rsn += 6;
+	length -= 6;
+	count = get_unaligned_le16(rsn);
+	rsn += 2;
+	length -= 2;
+	if (!count || count > length / 4)
+		return -EINVAL;
+	for (i = 0; i < count; i++)
+		ccmp |= get_unaligned_be32(rsn + 4 * i) ==
+			WLAN_CIPHER_SUITE_CCMP;
+	rsn += 4 * count;
+	length -= 4 * count;
+	if (!ccmp || length < 2)
+		return -EINVAL;
+	count = get_unaligned_le16(rsn);
+	rsn += 2;
+	length -= 2;
+	if (!count || count > length / 4)
+		return -EINVAL;
+	for (i = 0; i < count; i++)
+		selected |= get_unaligned_be32(rsn + 4 * i) == akm;
+	rsn += 4 * count;
+	length -= 4 * count;
+	if (!selected)
+		return -EOPNOTSUPP;
+	if (length) {
+		if (length < 2)
+			return -EINVAL;
+		caps = get_unaligned_le16(rsn);
+		rsn += 2;
+		length -= 2;
+	}
+	if (length) {
+		if (length < 2)
+			return -EINVAL;
+		count = get_unaligned_le16(rsn);
+		rsn += 2;
+		length -= 2;
+		if (count > length / 16)
+			return -EINVAL;
+		rsn += 16 * count;
+		length -= 16 * count;
+	}
+	if (length && (length != 4 ||
+		       get_unaligned_be32(rsn) != WLAN_CIPHER_SUITE_AES_CMAC))
+		return -EOPNOTSUPP;
+	if ((caps & BIT(6)) && !(caps & BIT(7)))
+		return -EINVAL;
+	/* On the AKM 2 arm the firmware sets MFPC itself and negotiates PMF
+	 * with any AP that sets MFPC, so the AP's capability is the outcome.
+	 * A request for PMF needs an MFPC AP, and refusing PMF cannot join
+	 * an AP that sets MFPR.
+	 */
+	if (akm == WLAN_AKM_SUITE_PSK) {
+		if ((mfp == NL80211_MFP_REQUIRED && !(caps & BIT(7))) ||
+		    (mfp == NL80211_MFP_NO && (caps & BIT(6))))
+			return -EOPNOTSUPP;
+		*pmf = !!(caps & BIT(7));
+		return 0;
+	}
+	if (mfp == NL80211_MFP_NO || !(caps & BIT(7)))
+		return -EOPNOTSUPP;
+	*pmf = true;
+	return 0;
+}
+
+static inline int mt7932_connect_admit(const u8 *ies, size_t length, u32 akm,
+				       enum nl80211_mfp mfp, bool *pmf)
+{
+	const struct element *elem, *rsn = NULL;
+	size_t parsed = 0;
+
+	*pmf = false;
+	for_each_element(elem, ies, length) {
+		parsed += elem->datalen + 2;
+		if (elem->id != WLAN_EID_RSN)
+			continue;
+		if (rsn)
+			return -EINVAL;
+		rsn = elem;
+	}
+	if (parsed != length || !rsn)
+		return -EINVAL;
+	return mt7932_rsn_admit(rsn->data, rsn->datalen, akm, mfp, pmf);
 }
 
 /* The SAE offload needs both the password and a WPA passphrase-derived PMK.

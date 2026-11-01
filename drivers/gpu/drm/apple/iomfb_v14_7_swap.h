@@ -3,6 +3,9 @@
 #ifndef __APPLE_IOMFB_V14_7_SWAP_H__
 #define __APPLE_IOMFB_V14_7_SWAP_H__
 
+#include <linux/bitops.h>
+#include <linux/build_bug.h>
+#include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
@@ -11,6 +14,8 @@
 #define DCP_V14_SURFACE_SIZE		0x22c
 
 /* Offsets in the swap record. Rectangles are x, y, w, h (u32 each). */
+#define DCP_V14_SWAP_TIMESTAMP(n)	((n) * 8)	/* u64, slots 0 to 6 */
+#define DCP_V14_SWAP_TIMESTAMPS		7
 #define DCP_V14_SWAP_ID			0x98
 #define DCP_V14_SWAP_SURF_ID(p)		(0x9c + (p) * 4)
 #define DCP_V14_SWAP_SRC(p)		(0xac + (p) * 16)	/* in the surface */
@@ -25,6 +30,54 @@
 
 #define DCP_V14_SWAP_LAYERS		0x7
 #define DCP_V14_SWAP_SET_BACKGROUND	BIT(31)
+
+/*
+ * The panel level block of the swap record (the 14.7 J514S/J516S panel): a
+ * present byte at +0x354 and the level in nits as an unaligned IEEE 754
+ * binary64 at +0x35c, both zero when the level does not change. The same
+ * layout as SiliconForest commit 44fe00e5eb58d54baf1cc9ad607293e774bfed44
+ * and omacom/linux-aurora PR148 (02524534c6b8).
+ */
+#define DCP_V14_SWAP_NITS_PRESENT	0x354
+#define DCP_V14_SWAP_NITS		0x35c
+/* The nits field takes integral levels up to the panel maximum. */
+#define DCP_V14_NITS_MAX		500
+/*
+ * The level userspace is shown before Linux has set one. It is never
+ * presented on its own: until a level is requested the panel keeps the boot
+ * loader's level, which Linux does not know.
+ */
+#define DCP_V14_NITS_DEFAULT		140
+
+static_assert(DCP_V14_SWAP_NITS_PRESENT >= DCP_V14_SWAP_BACKGROUND + 4);
+static_assert(DCP_V14_SWAP_NITS >= DCP_V14_SWAP_NITS_PRESENT + 1);
+static_assert(DCP_V14_SWAP_NITS + 8 <= DCP_V14_SWAP_SURFACE(0));
+
+/* Integral nits as IEEE 754 binary64, without kernel floating point. */
+static inline u64 dcp_v14_nits_binary64(u32 nits)
+{
+	unsigned int bit;
+
+	if (!nits)
+		return 0;
+	bit = fls(nits) - 1;
+	return ((u64)(1023 + bit) << 52) |
+	       ((u64)(nits - (1U << bit)) << (52 - bit));
+}
+
+/*
+ * The level block of an encoded swap: @nits when @change, else none. A level
+ * above the wire bound leaves the record untouched.
+ */
+static inline int dcp_v14_encode_nits(u8 *swap, bool change, u32 nits)
+{
+	if (change && nits > DCP_V14_NITS_MAX)
+		return -EINVAL;
+	swap[DCP_V14_SWAP_NITS_PRESENT] = change;
+	put_unaligned_le64(change ? dcp_v14_nits_binary64(nits) : 0,
+			   swap + DCP_V14_SWAP_NITS);
+	return 0;
+}
 
 /* Offsets in a surface record. */
 #define DCP_V14_SURF_OPAQUE		0x02
@@ -113,6 +166,21 @@ static inline void dcp_v14_encode_swap(u8 *swap, u32 id, u32 background, const u
 		dcp_v14_put_rect(swap + DCP_V14_SWAP_DST(layer), 0, dst_y, width, height);
 		swap[DCP_V14_SWAP_SURF_NULL(layer)] = 0;
 	}
+}
+
+/*
+ * The swap timestamps of a board that asks for them: the constant 120 in
+ * slots 0, 1 and 6, a time that is never in the future. Counter values
+ * (1 GHz on T6031) make the firmware time out on the first swap. Call after
+ * dcp_v14_encode_swap(), which zeroes the record.
+ */
+#define DCP_V14_SWAP_TIMESTAMP_VALUE	120
+
+static inline void dcp_v14_swap_timestamps(u8 *swap)
+{
+	put_unaligned_le64(DCP_V14_SWAP_TIMESTAMP_VALUE, swap + DCP_V14_SWAP_TIMESTAMP(0));
+	put_unaligned_le64(DCP_V14_SWAP_TIMESTAMP_VALUE, swap + DCP_V14_SWAP_TIMESTAMP(1));
+	put_unaligned_le64(DCP_V14_SWAP_TIMESTAMP_VALUE, swap + DCP_V14_SWAP_TIMESTAMP(6));
 }
 
 #endif /* __APPLE_IOMFB_V14_7_SWAP_H__ */

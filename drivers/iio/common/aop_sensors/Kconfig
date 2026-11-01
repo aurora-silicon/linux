@@ -20,3 +20,18 @@ config IIO_AOP_SENSOR_ALS
 	help
 	  Module to handle the ambient light sensor attached to the AOP
 	  coprocessor on Apple laptops.
+
+config IIO_AOP_SENSOR_MOTION
+	tristate "AOP accelerometer and gyroscope"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on RUST
+	depends on SYSFS
+	select APPLE_AOP
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Module to handle the accelerometer and gyroscope that the AOP
+	  coprocessor of Apple laptops reads. Each sensor is an IIO device
+	  with X, Y and Z channels, readable directly or through a buffer.
+	  The bootloader has to pass the machine's sensor calibration in
+	  the device tree.

@@ -21,6 +21,8 @@
 
 	aliases {
 		keyboard = &keyboard;
+		nvram = &nvram;
+		spi0 = &qspi;
 		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
 		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
 		/* used by the loader to hand over the display */
@@ -52,6 +54,27 @@
 		#size-cells = <2>;
 		ranges;
 		/* The loader adds its own reservations */
+
+		/*
+		 * The loader must fill reg from ane0 segment-ranges, rename each
+		 * node to match its physical address and enable it. Leave these
+		 * disabled until then; allocating replacement memory would lose
+		 * the personalized preload. TEXT is 0xc0000 bytes and DATA is
+		 * 0x2ac000 bytes. Neither segment may be reclaimed before reboot.
+		 */
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
 
 		/*
 		 * iBoot loads the ISP firmware below the kernel's memory. Its
@@ -299,16 +322,18 @@
 
 	/*
 	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
-	 * smc_hwmon. The PMP's fast die-temperature limit regulates (TCMz
-	 * settles near 111 C); this zone is the backstop above it: passive at
-	 * 113 C, critical (orderly shutdown) at 118 C, polled once a second as
-	 * the SMC refreshes TCMz. The cpufreq cooling device sits on a
+	 * smc_hwmon. The PMP's fast die-temperature limit regulates: its loop
+	 * holds its own hot-spot sensors at 110 C (ADT fast-die-ctrl-loop),
+	 * and under a sustained all-core load TCMz then settles at 113.4 to
+	 * 114.7 C with the fans running. This zone is the backstop above that:
+	 * passive at 116 C, critical (orderly shutdown) at 118 C, polled once a
+	 * second as the SMC refreshes TCMz. The cpufreq cooling device sits on a
 	 * cluster's policy CPU, so each map lists every CPU of its cluster.
 	 *
 	 * Per-cluster and GPU zones follow, one per SMC die-maximum sensor
 	 * (smc_hwmon channels 1-23, in the order of the temperature nodes
 	 * below): Tex0-3 throttle the E cluster, Tpx0-5 the first P cluster
-	 * and Tpx8-D the second, with the same 113/118 C backstop as TCMz.
+	 * and Tpx8-D the second, with the same 116/118 C backstop as TCMz.
 	 * Unlike the fanless J700, this machine has two SMC-driven fans and
 	 * the PMP regulates the dies itself, so these zones only catch a
 	 * failure of that loop; they never act in normal use.
@@ -329,6 +354,17 @@
 	 * highest state any zone asks for and goes back to the SMC once no
 	 * zone asks for anything. States 1-8 of a fan run it from its minimum
 	 * (1350 rpm) to its maximum (5777 rpm) in even steps.
+	 *
+	 * sustainable-power is what the CPUs dissipate with the die held at
+	 * its operating point: 720 s of all-core load (10 P, 4 E busy loops),
+	 * headless, SMC fans in their own mode. Over the last 600 s TCMz held
+	 * 112.0 to 113.8 C with the PMP limiting the P clusters to a mean of
+	 * about 3.7 GHz and the fans at 3450/3730 rpm (where macOS settles
+	 * too). The SMC core rails then read P0 25.3 W, P1 23.9 W and E 2.1 W
+	 * on average, the units of the energy model. Each zone gets the sum
+	 * over the clusters it throttles. Without it the power allocator
+	 * estimates a budget from the cooling devices' lowest states, which
+	 * throttles far below what this machine sustains.
 	 */
 #define J616S_FAN_TRIP(label, node, temp, hyst)	\
 	label: node {					\
@@ -362,13 +398,14 @@
 		cpu-die-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
 			trips {
 				J616S_FAN_TRIPS(cpu_die)
 
 				cpu_die_passive: cpu-die-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -417,11 +454,12 @@
 		cpu-e0-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
 
 			trips {
 				cpu_e0_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -448,11 +486,12 @@
 		cpu-e1-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
 
 			trips {
 				cpu_e1_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -479,11 +518,12 @@
 		cpu-e2-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
 
 			trips {
 				cpu_e2_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -510,11 +550,12 @@
 		cpu-e3-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
 
 			trips {
 				cpu_e3_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -541,11 +582,12 @@
 		cpu-p00-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
 
 			trips {
 				cpu_p00_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -573,11 +615,12 @@
 		cpu-p01-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
 
 			trips {
 				cpu_p01_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -605,11 +648,12 @@
 		cpu-p02-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
 
 			trips {
 				cpu_p02_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -637,11 +681,12 @@
 		cpu-p03-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
 
 			trips {
 				cpu_p03_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -669,11 +714,12 @@
 		cpu-p04-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
 
 			trips {
 				cpu_p04_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -701,11 +747,12 @@
 		cpu-p05-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
 
 			trips {
 				cpu_p05_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -733,11 +780,12 @@
 		cpu-p10-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
 
 			trips {
 				cpu_p10_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -765,11 +813,12 @@
 		cpu-p11-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
 
 			trips {
 				cpu_p11_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -797,11 +846,12 @@
 		cpu-p12-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
 
 			trips {
 				cpu_p12_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -829,11 +879,12 @@
 		cpu-p13-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
 
 			trips {
 				cpu_p13_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -861,11 +912,12 @@
 		cpu-p14-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
 
 			trips {
 				cpu_p14_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -893,11 +945,12 @@
 		cpu-p15-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
 
 			trips {
 				cpu_p15_passive: trip-passive {
-					temperature = <113000>;
+					temperature = <116000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
@@ -1427,6 +1480,38 @@
 
 /* apple_sep enables the SEP and its DART when it loads. */
 &sep_mbox {
+	status = "okay";
+};
+
+/*
+ * Boot NOR. The partition is the J616s ADT /arm-io/qspi/spinor/anvram,
+ * flash-relative; asahi-bless and asahi-nvram find it by its label.
+ */
+&qspi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+		spi-rx-bus-width = <1>;
+		spi-tx-bus-width = <1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			nvram: partition@700000 {
+				label = "nvram";
+				reg = <0x700000 0x100000>;
+			};
+		};
+	};
+};
+
+/* The QSPI controller cannot probe while its power state is disabled. */
+&ps_qspi {
 	status = "okay";
 };
 
@@ -3851,23 +3936,26 @@
 	};
 };
 
-/*
- * Fan speeds, limits, targets and modes, and the common SMC sensors; every
- * key exists on this machine's SMC. Both fans list their target (F0Tg,
- * F1Tg) and mode (F0Md, F1Md) keys, so with the driver's fan_control
- * parameter fanN_target becomes writable; by default the attributes are
- * read-only, and the thermal zones above drive the fans.
- */
+/* Fan monitoring and explicit userspace manual control. */
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
 
-/*
- * Both fans are cooling devices of the CPU die and GPU zones, as
- * <&smc_hwmon fan-index lower upper>.
- */
 &smc_hwmon {
-	#cooling-cells = <3>;
+	apple,thermal-pressure-key = "mTPL";
+
+	/*
+	 * The SMC accepts a manual speed for both fans once its fan test
+	 * key unlocks them, and returns them to system mode when the
+	 * request is dropped.
+	 */
+	fan-F0Ac {
+		apple,fan-manual-control;
+	};
+
+	fan-F1Ac {
+		apple,fan-manual-control;
+	};
 };
 
 &pcie_dart {
@@ -3998,6 +4086,11 @@
 
 &aop_dart {
 	status = "okay";
+};
+
+/* The sensor is on the logic board, in the base. */
+&aop_accel {
+	label = "accel-base";
 };
 
 &admac0 {
@@ -4440,6 +4533,43 @@
 	};
 };
 
+/* The video encoder, its DARTs and its power domains. */
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart0 {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
 #include "t6040-j616s-usb3.dtsi"
 
 /* External display chain, all disabled: the gate in drivers/soc/apple/display-gate.c enables it. */
@@ -4447,6 +4577,7 @@
 #include "t6040-j616s-extdisp-mem-loader.dtsi"
 #include "t6040-j616s-extdisp-hdmi.dtsi"
 #include "t6040-j616s-extdisp-usbc.dtsi"
+#include "t6040-j616s-dpaudio.dtsi"
 /* Additional Abbey PMICs on the two independent NUB SPMI buses. */
 &nub_spmi1 {
 	status = "okay";
@@ -4509,4 +4640,136 @@
 		/* The SD power switch needs an SMC service binding. */
 		status = "disabled";
 	};
+};
+
+/*
+ * The SMC owns automatic fan policy. Drop the host fan trip/map instances
+ * after the board's thermal descriptions, retaining all passive and critical
+ * protection. Keep this final policy separate from ladder descriptions so
+ * independent ladder updates cannot restore autonomous SMC writes.
+ */
+
+#define J616S_DELETE_FAN_TRIPS \
+	/delete-node/ trip-fan1; \
+	/delete-node/ trip-fan2; \
+	/delete-node/ trip-fan3; \
+	/delete-node/ trip-fan4; \
+	/delete-node/ trip-fan5;
+
+/* Some CPU ladders also map full fan speed to the passive trip. */
+#define J616S_DELETE_FAN_MAPS \
+	/delete-node/ map-fan1; \
+	/delete-node/ map-fan2; \
+	/delete-node/ map-fan3; \
+	/delete-node/ map-fan4; \
+	/delete-node/ map-fan5; \
+	/delete-node/ map-fan6;
+
+/ {
+	thermal-zones {
+		cpu-die-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu0-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu1-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu2-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu3-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu4-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu5-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+
+		gpu6-thermal {
+			trips {
+				J616S_DELETE_FAN_TRIPS
+			};
+
+			cooling-maps {
+				J616S_DELETE_FAN_MAPS
+			};
+		};
+	};
+};
+
+#undef J616S_DELETE_FAN_TRIPS
+#undef J616S_DELETE_FAN_MAPS
+
+/*
+ * Proven on the J616s (MobileNetV1 top-1 16/16). The ANE stays idle until
+ * the loader fills and enables the two preload reservations above.
+ */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	memory-region = <&ane_fw_text>, <&ane_fw_data>;
+	memory-region-names = "firmware-text", "firmware-data";
+	status = "okay";
 };

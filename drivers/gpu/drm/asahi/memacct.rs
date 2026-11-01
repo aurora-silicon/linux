@@ -131,7 +131,7 @@ fn try_add_within(counter: &AtomicU64, bytes: u64, limit: u64, extra: u64) -> bo
 fn sub(counter: &AtomicU64, bytes: u64) {
     let prev = counter.fetch_sub(bytes, Ordering::AcqRel);
     if prev < bytes {
-        pr_warn!("asahi: GPU memory accounting underflow ({} < {})\n", prev, bytes);
+        pr_warn!("GPU memory accounting underflow ({} < {})\n", prev, bytes);
         counter.store(0, Ordering::Relaxed);
     }
 }
@@ -162,7 +162,7 @@ impl Ledger {
         );
         self.set_limits(limits);
         pr_info!(
-            "asahi: GPU memory limits: device {} MiB, per client {} MiB (0 = none)\n",
+            "GPU memory limits: device {} MiB, per client {} MiB (0 = none)\n",
             limits.device >> 20,
             limits.client >> 20
         );

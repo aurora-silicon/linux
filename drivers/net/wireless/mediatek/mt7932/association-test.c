@@ -188,7 +188,7 @@ static void mt_connect_auth_test(struct kunit *test)
 	} cases[] = {
 		{ "pure PSK", MT_AUTH_PSK, 0, WLAN_AKM_SUITE_PSK },
 		{ "PSK missing PMK", MT_AUTH_PSK, 1, -EOPNOTSUPP },
-		{ "PSK required MFP", MT_AUTH_PSK, 2, -EOPNOTSUPP },
+		{ "PSK required MFP", MT_AUTH_PSK, 2, WLAN_AKM_SUITE_PSK },
 		{ "pure SAE", MT_AUTH_NONE, 0, WLAN_AKM_SUITE_SAE },
 		{ "optional MFP", MT_AUTH_MFP, NL80211_MFP_OPTIONAL, WLAN_AKM_SUITE_SAE },
 		{ "no MFP", MT_AUTH_MFP, NL80211_MFP_NO, -EOPNOTSUPP },
@@ -221,7 +221,7 @@ static void mt_connect_auth_test(struct kunit *test)
 		{ "SAE first missing password", MT_AUTH_SAE_FIRST, 1, -EOPNOTSUPP },
 		{ "PSK first optional MFP", MT_AUTH_PSK_FIRST, 0, WLAN_AKM_SUITE_PSK },
 		{ "PSK first missing PMK", MT_AUTH_PSK_FIRST, 1, -EOPNOTSUPP },
-		{ "PSK first required MFP", MT_AUTH_PSK_FIRST, 2, -EOPNOTSUPP },
+		{ "PSK first required MFP", MT_AUTH_PSK_FIRST, 2, WLAN_AKM_SUITE_PSK },
 		{ "PSK first no MFP", MT_AUTH_PSK_FIRST, 3, WLAN_AKM_SUITE_PSK },
 		{ "PSK first mixed versions", MT_AUTH_PSK_FIRST, 4, WLAN_AKM_SUITE_PSK },
 		{ "PSK first VERSION_3 only", MT_AUTH_PSK_FIRST, 5, -EOPNOTSUPP },

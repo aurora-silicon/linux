@@ -121,6 +121,10 @@ const EPIC_CATEGORY_NOTIFY: u8 = 0x10;
 const EPIC_CATEGORY_REPLY: u8 = 0x20;
 const EPIC_SUBTYPE_STD_SERVICE: u16 = 0xc0;
 const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
+/// The T8132 firmware sends its gyroscope and accelerometer samples with
+/// these report subtypes; they carry the same payload as a fake-HID report.
+const EPIC_SUBTYPE_GYRO_REPORT: u16 = 0xc1;
+const EPIC_SUBTYPE_ACCEL_REPORT: u16 = 0xc2;
 const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
 const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
 const EPIC_SUBTYPE_STRING: u16 = 0x8a;
@@ -756,7 +760,10 @@ impl AFKEndpoint {
                 let name = &name[..name.iter().position(|x| *x == 0).unwrap_or(name.len())];
                 let chan = le_u32(data, EPIC_ANNOUNCE_CHANNEL_OFFSET);
                 return Into::<Arc<_>>::into(client).register_service(self, chan, name);
-            } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT {
+            } else if subtype == EPIC_SUBTYPE_FAKEHID_REPORT
+                || subtype == EPIC_SUBTYPE_GYRO_REPORT
+                || subtype == EPIC_SUBTYPE_ACCEL_REPORT
+            {
                 return client.process_fakehid_report(self, qhdr.channel, data);
             } else if client.process_report(self, qhdr.channel, subtype, data)? {
                 return Ok(());
@@ -1471,6 +1478,8 @@ impl AopData {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
             b"als" => c_str!("als"),
+            b"accel" => c_str!("accel"),
+            b"gyro" => c_str!("gyro"),
             _ => {
                 return Ok(());
             }
@@ -2502,6 +2511,8 @@ struct AopDriver(Arc<dyn AOP>);
 
 struct AopHwConfig {
     ec0p: u64,
+    /// The `nCal` boot argument.
+    ncal: u64,
     alig: u64,
     aopt: u64,
     /// Complete the firmware's boot arguments before starting it.
@@ -2525,6 +2536,7 @@ struct AopHwConfig {
 
 const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: 0,
     aopt: 1,
     alig: 128,
     patch_bootargs: true,
@@ -2537,6 +2549,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: 0,
     aopt: 0,
     alig: 128,
     patch_bootargs: true,
@@ -2549,6 +2562,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ec0p: 0x020000,
+    ncal: 0,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2561,6 +2575,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
+    ncal: 0,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2571,12 +2586,14 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     fw_regions: false,
     halt_on_failed_start: false,
 };
-/// T6040 (J616s): macOS writes the same four boot arguments as for the
-/// T6020. The firmware's external code and log live in DRAM, mapped through
-/// the reserved regions the bootloader describes; the RTKit firmware is shut
-/// down on unbind.
+/// T6040 (J616s): the firmware's external code and log live in DRAM, mapped
+/// through the reserved regions the bootloader describes; the RTKit firmware
+/// is shut down on unbind. `nCal` keeps the firmware's own default of 1:
+/// with 0 the accelerometer and gyroscope services accept their calibration
+/// and report interval but never send a report.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
+    ncal: 1,
     aopt: 0,
     alig: 64,
     patch_bootargs: true,
@@ -2594,6 +2611,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
 /// are started if they will.
 const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ec0p: 0,
+    ncal: 0,
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
@@ -2657,7 +2675,7 @@ impl platform::Driver for AopDriver {
                 &aop_mmio,
                 &[
                     (from_fourcc(b"EC0p"), cfg.ec0p),
-                    (from_fourcc(b"nCal"), 0x0),
+                    (from_fourcc(b"nCal"), cfg.ncal),
                     (from_fourcc(b"alig"), cfg.alig),
                     (from_fourcc(b"AOPt"), cfg.aopt),
                 ],

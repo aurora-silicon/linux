@@ -551,6 +551,164 @@ static u8 *pkg_build_v2(struct kunit *test, const char *alpha2, u64 primaries, s
 	return data;
 }
 
+static u8 *pkg_build_v4(struct kunit *test, size_t *size)
+{
+	size_t base_size;
+	u8 *base = pkg_build(test, "AU", &base_size), *data, *directory;
+	unsigned int i, j;
+
+	*size = base_size + 16 + 2 * 13476;
+	data = kunit_kzalloc(test, *size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	memcpy(data, base, base_size);
+	put_unaligned_le16(4, data + 4);
+	put_unaligned_le32(*size, data + 12);
+	directory = data + base_size;
+	memcpy(directory, "6GCL", 4);
+	directory[4] = 1;
+	directory[5] = 2;
+	directory[6] = 1;
+	put_unaligned_le32(16 + 2 * 13476, directory + 8);
+	for (i = 0; i < 2; i++) {
+		u8 *section = directory + 16 + i * 13476;
+		unsigned int channel = 1;
+
+		section[0] = i + 1;
+		section[1] = i;
+		section[2] = 1;
+		section[3] = 110;
+		put_unaligned_le32(13476, section + 4);
+		put_unaligned_le64(BIT_ULL(i ? 1 : 9), section + 8);
+		memcpy(section + 16, "AU", 2);
+		for (j = 0; j < 110; j++) {
+			u8 *record = section + 56 + j * 122;
+
+			record[0] = j ? channel : 2;
+			memset(record + 1, i ? 40 : 20, 121);
+			if (j) {
+				channel += 2;
+				while (channel == 31 || channel == 63 ||
+				       channel == 95 || channel == 127 ||
+				       channel == 159 || channel == 191 ||
+				       channel == 223 || channel == 231)
+					channel += 2;
+			}
+		}
+	}
+	return data;
+}
+
+static void mt7932_policy_v4_classes_test(struct kunit *test)
+{
+	struct mt7932_policy *policy =
+		kunit_kzalloc(test, sizeof(*policy), GFP_KERNEL);
+	size_t size, base_size;
+	u8 *data = pkg_build_v4(test, &size), *body, *ext;
+	unsigned int first, total = 0;
+	int length;
+
+	KUNIT_ASSERT_NOT_NULL(test, policy);
+	body = kunit_kzalloc(test, 1021, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, body);
+	KUNIT_ASSERT_EQ(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
+	KUNIT_EXPECT_EQ(test, policy->six_class[MT7932_6G_LPI].channels,
+			BIT_ULL(1));
+	KUNIT_EXPECT_EQ(test, policy->six_class[MT7932_6G_VLP].channels,
+			BIT_ULL(9));
+	KUNIT_EXPECT_TRUE(test,
+			  mt7932_policy_permits(policy, NL80211_BAND_6GHZ, 5));
+	KUNIT_EXPECT_TRUE(test,
+			  mt7932_policy_permits(policy, NL80211_BAND_6GHZ, 37));
+	KUNIT_EXPECT_FALSE(test,
+			   mt7932_policy_permits(policy, NL80211_BAND_6GHZ, 1));
+	KUNIT_EXPECT_LT(test,
+			mt7932_6g_class_page(body, 1020, policy, MT7932_6G_SP,
+					     "AU", 0),
+			0);
+	for (first = 0; first < 110; first += 8) {
+		length = mt7932_6g_class_page(body, 1020, policy, MT7932_6G_LPI,
+					      "AU", first);
+		KUNIT_ASSERT_GT(test, length, 0);
+		KUNIT_EXPECT_EQ(test, body[0], 0);
+		KUNIT_EXPECT_EQ(test, body[1], 0x1a);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le16(body + 2), length);
+		KUNIT_EXPECT_EQ(test, body[5], 3);
+		KUNIT_EXPECT_EQ(test, body[6], first == 104);
+		KUNIT_EXPECT_EQ(test, body[45], 40);
+		total += body[4];
+	}
+	KUNIT_EXPECT_EQ(test, total, 110U);
+	KUNIT_EXPECT_EQ(test, length, 776);
+	KUNIT_EXPECT_EQ(test,
+			mt7932_6g_class_page(body, 1020, policy, MT7932_6G_VLP,
+					     "AU", 0),
+			1020);
+	KUNIT_EXPECT_EQ(test, body[1], 0x2a);
+	KUNIT_EXPECT_EQ(test, body[45], 20);
+	KUNIT_EXPECT_LT(test,
+			mt7932_6g_class_page(body, 1019, policy, MT7932_6G_LPI,
+					     "AU", 0),
+			0);
+	KUNIT_EXPECT_LT(test,
+			mt7932_6g_class_page(body, 1020, policy, MT7932_6G_LPI,
+					     "AU", 1),
+			0);
+	base_size = size - 16 - 2 * 13476;
+	ext = data + base_size;
+	/* Unbound v3 cannot acquire runtime authority through a path rename. */
+	put_unaligned_le16(3, data + 4);
+	ext[6] = 0;
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
+	put_unaligned_le16(4, data + 4);
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
+	ext[6] = 1;
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(policy, data, size - 1, "AU"),
+			0);
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(policy, data, size, "NZ"), 0);
+	ext[16 + 13476] = 3; /* never serialize SP */
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
+	ext[16 + 13476] = 2;
+	ext[16 + 56] = 1; /* first record must be channel 2 */
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
+}
+
+/* The public producer's 32-byte 1SS channel pad is copied verbatim. It is
+ * independent of the primary permission mask and of rate-support accounting.
+ */
+static void mt7932_policy_6g_pad_test(struct kunit *test)
+{
+	static const u8 expected[44] = {
+		[1] = 0x1a, [2] = 0xfc, 3, 8, 3,
+		[8] = 'A', 'U',
+		[12] = 0x20, [16] = 0x20, [41] = 2,
+	};
+	struct mt7932_policy *policy =
+		kunit_kzalloc(test, sizeof(*policy), GFP_KERNEL);
+	size_t size;
+	u8 *data = pkg_build_v4(test, &size), *body, *pad;
+
+	KUNIT_ASSERT_NOT_NULL(test, policy);
+	body = kunit_kmalloc(test, 1020, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, body);
+	/* Directory plus VLP section, then LPI header and its channel pad. */
+	pad = data + size - 13476 + 24;
+	pad[0] = 0x20; /* channel 5 */
+	pad[4] = 0x20; /* channel 37, not rate index 37 */
+	pad[29] = 2; /* channel 233 */
+	KUNIT_ASSERT_EQ(test, mt7932_policy_parse(policy, data, size, "AU"), 0);
+	KUNIT_EXPECT_EQ(test, policy->six_class[MT7932_6G_LPI].channels,
+			BIT_ULL(1));
+	KUNIT_ASSERT_EQ(test, mt7932_6g_class_page(body, 1020, policy,
+						   MT7932_6G_LPI, "AU", 0), 1020);
+	KUNIT_EXPECT_MEMEQ(test, body, expected, sizeof(expected));
+	KUNIT_ASSERT_EQ(test, mt7932_6g_class_page(body, 1020, policy,
+						   MT7932_6G_LPI, "AU", 104), 776);
+	KUNIT_EXPECT_MEMEQ(test, body + 12, pad, 32);
+	KUNIT_ASSERT_EQ(test, mt7932_6g_class_page(body, 1020, policy,
+						   MT7932_6G_VLP, "AU", 0), 1020);
+	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(body + 12, 0, 32), NULL);
+}
+
 #define FAKE_FILES 8
 #define FAKE_LOG 16
 
@@ -590,8 +748,9 @@ static void fake_put(void *ctx, struct mt7932_policy_file *file)
 {
 	struct fake_fs *fs = ctx;
 
-	fs->held--;
+	fs->held -= file->class_handle ? 2 : 1;
 	file->handle = NULL;
+	file->class_handle = NULL;
 }
 
 static void fake_add(struct fake_fs *fs, const char *path, const u8 *data, size_t size)
@@ -665,10 +824,11 @@ static void mt7932_policy_order_test(struct kunit *test)
 	char path[MT7932_POLICY_PATH_MAX];
 	struct select_env *env = select_env(test);
 
-	KUNIT_ASSERT_EQ(test, mt7932_policy_candidates("AU", sources), 3);
-	KUNIT_EXPECT_EQ(test, sources[0], MT7932_POLICY_V2);
-	KUNIT_EXPECT_EQ(test, sources[1], MT7932_POLICY_V1);
-	KUNIT_EXPECT_EQ(test, sources[2], MT7932_POLICY_WORLD);
+	KUNIT_ASSERT_EQ(test, mt7932_policy_candidates("AU", sources), 4);
+	KUNIT_EXPECT_EQ(test, sources[0], MT7932_POLICY_V4);
+	KUNIT_EXPECT_EQ(test, sources[1], MT7932_POLICY_V2);
+	KUNIT_EXPECT_EQ(test, sources[2], MT7932_POLICY_V1);
+	KUNIT_EXPECT_EQ(test, sources[3], MT7932_POLICY_WORLD);
 	KUNIT_ASSERT_EQ(test, mt7932_policy_candidates("00", sources), 1);
 	KUNIT_EXPECT_EQ(test, sources[0], MT7932_POLICY_WORLD);
 	mt7932_policy_path(path, sizeof(path), MT7932_POLICY_V2, "AU");
@@ -680,13 +840,18 @@ static void mt7932_policy_order_test(struct kunit *test)
 
 	/* Nothing installed: every candidate is asked for, in order. */
 	KUNIT_EXPECT_EQ(test, select_run(env, "NZ", false), -ENOENT);
-	KUNIT_ASSERT_EQ(test, env->fs.requests, 3);
-	KUNIT_EXPECT_STREQ(test, env->fs.log[0], "mediatek/mt7932/policy-v2/NZ.bin");
-	KUNIT_EXPECT_STREQ(test, env->fs.log[1], "mediatek/mt7932/policy/NZ.bin");
-	KUNIT_EXPECT_STREQ(test, env->fs.log[2], "mediatek/mt7932/policy/world-XZ.bin");
+	KUNIT_ASSERT_EQ(test, env->fs.requests, 4);
+	KUNIT_EXPECT_STREQ(test, env->fs.log[0],
+			   "mediatek/mt7932/policy-v4/NZ.bin");
+	KUNIT_EXPECT_STREQ(test, env->fs.log[1],
+			   "mediatek/mt7932/policy-v2/NZ.bin");
+	KUNIT_EXPECT_STREQ(test, env->fs.log[2],
+			   "mediatek/mt7932/policy/NZ.bin");
+	KUNIT_EXPECT_STREQ(test, env->fs.log[3],
+			   "mediatek/mt7932/policy/world-XZ.bin");
 	KUNIT_EXPECT_PTR_EQ(test, env->file.handle, NULL);
 	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_NONE);
-	KUNIT_EXPECT_EQ(test, env->choice.n_tried, 3);
+	KUNIT_EXPECT_EQ(test, env->choice.n_tried, 4);
 
 	/* cfg80211's numeric codes have no package of their own. */
 	KUNIT_EXPECT_EQ(test, mt7932_policy_candidates("98", sources), 1);
@@ -717,7 +882,7 @@ static void mt7932_policy_v2_preferred_test(struct kunit *test)
 	fake_add(&env->fs, "mediatek/mt7932/policy/world-XZ.bin", xz, xz_size);
 
 	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
-	KUNIT_EXPECT_EQ(test, env->fs.requests, 1);
+	KUNIT_EXPECT_EQ(test, env->fs.requests, 2);
 	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_V2);
 	KUNIT_EXPECT_EQ(test, env->choice.version, 2);
 	KUNIT_EXPECT_EQ(test, env->choice.size, v2_size);
@@ -738,8 +903,8 @@ static void mt7932_policy_v2_preferred_test(struct kunit *test)
 	/* Malformed v2: v1 is used and 6 GHz leaves the firmware domain. */
 	put_unaligned_le32(v2_size - 1, v2 + 12);
 	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
-	KUNIT_EXPECT_EQ(test, env->fs.requests, 2);
-	KUNIT_EXPECT_EQ(test, env->choice.tried[0].error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, env->fs.requests, 3);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[1].error, -EINVAL);
 	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_V1);
 	KUNIT_EXPECT_EQ(test, env->choice.version, 1);
 	KUNIT_EXPECT_EQ(test, env->choice.fallback, 0);
@@ -748,6 +913,64 @@ static void mt7932_policy_v2_preferred_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, env->reg.length, 12 + 5 * 8);
 	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&env->policy, NL80211_BAND_6GHZ, 5));
 	KUNIT_EXPECT_EQ(test, env->fs.held, 1);
+	fake_put(&env->fs, &env->file);
+	KUNIT_EXPECT_EQ(test, env->fs.held, 0);
+}
+
+static void mt7932_policy_v4_preferred_test(struct kunit *test)
+{
+	struct select_env *env = select_env(test);
+	struct mt7932_policy *baseline =
+		kunit_kzalloc(test, sizeof(*baseline), GFP_KERNEL);
+	size_t size, v2_size;
+	u8 *data = pkg_build_v4(test, &size);
+	u8 *v2 = pkg_build_v2(test, "AU", BIT_ULL(9), &v2_size);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, baseline);
+	KUNIT_ASSERT_EQ(test, mt7932_policy_parse(baseline, v2, v2_size, "AU"),
+			0);
+	fake_add(&env->fs, "mediatek/mt7932/policy-v4/AU.bin", data, size);
+	fake_add(&env->fs, "mediatek/mt7932/policy-v2/AU.bin", v2, v2_size);
+	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
+	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_V2);
+	KUNIT_EXPECT_EQ(test, env->choice.version, 2);
+	KUNIT_EXPECT_TRUE(test, env->choice.class_valid);
+	KUNIT_EXPECT_EQ(test, env->choice.six_primaries, 2);
+	KUNIT_EXPECT_EQ(test, env->policy.legacy_channels, BIT_ULL(9));
+	KUNIT_EXPECT_EQ(test, env->fs.requests, 2);
+	KUNIT_EXPECT_EQ(test, env->fs.held, 2);
+	/* Every original startup CID/body, and both post-queue association
+	 * pages, are retained byte for byte even with the LPI sidecar.
+	 */
+	KUNIT_ASSERT_EQ(test, env->policy.six_pages, baseline->six_pages);
+	for (i = 0; i < baseline->six_pages; i++) {
+		KUNIT_EXPECT_EQ(test, env->policy.six_cid[i],
+				baseline->six_cid[i]);
+		KUNIT_EXPECT_EQ(test, env->policy.six_length[i],
+				baseline->six_length[i]);
+		KUNIT_EXPECT_MEMEQ(test, env->policy.six_page[i],
+				   baseline->six_page[i],
+				   baseline->six_length[i]);
+	}
+	for (i = 0; i < 2; i++)
+		KUNIT_EXPECT_MEMEQ(test, env->policy.assoc_power[i],
+				   baseline->assoc_power[i], 1020);
+	/* Extra LP channels must not change the legacy VLP numeric clamp. */
+	env->reg.power[mt7932_6g_reg_index(5)] = -1;
+	env->reg.power[mt7932_6g_reg_index(37)] = 14;
+	KUNIT_EXPECT_EQ(test,
+			mt7932_6g_limits_mask(&env->reg,
+					      env->policy.legacy_channels)
+				.eirp,
+			28);
+	KUNIT_EXPECT_EQ(test, mt7932_6g_limits(&env->reg).eirp, -2);
+	data[4] = 3;
+	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
+	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_V2);
+	KUNIT_EXPECT_FALSE(test, env->choice.class_valid);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[0].error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, env->choice.six_primaries, 1);
 	fake_put(&env->fs, &env->file);
 	KUNIT_EXPECT_EQ(test, env->fs.held, 0);
 }
@@ -771,8 +994,8 @@ static void mt7932_policy_version_test(struct kunit *test)
 	fake_add(&env->fs, "mediatek/mt7932/policy/AU.bin", v2, v2_size);
 	fake_add(&env->fs, "mediatek/mt7932/policy/world-XZ.bin", xz, xz_size);
 	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
-	KUNIT_EXPECT_EQ(test, env->choice.tried[0].error, -ENOENT);
-	KUNIT_EXPECT_EQ(test, env->choice.tried[1].error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[1].error, -ENOENT);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[2].error, -EINVAL);
 	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_WORLD);
 	KUNIT_EXPECT_EQ(test, env->choice.fallback, -EINVAL);
 	KUNIT_EXPECT_EQ(test, env->choice.six_primaries, 0);
@@ -782,7 +1005,7 @@ static void mt7932_policy_version_test(struct kunit *test)
 	fake_add(&env->fs, "mediatek/mt7932/policy-v2/AU.bin", v1, v1_size);
 	fake_add(&env->fs, "mediatek/mt7932/policy/AU.bin", v1, v1_size);
 	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
-	KUNIT_EXPECT_EQ(test, env->choice.tried[0].error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[1].error, -EINVAL);
 	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_V1);
 
 	/* Over 16 KiB as v1, over 64 KiB as v2. */
@@ -795,8 +1018,8 @@ static void mt7932_policy_version_test(struct kunit *test)
 	fake_add(&env->fs, "mediatek/mt7932/policy/AU.bin", big, big_size);
 	fake_add(&env->fs, "mediatek/mt7932/policy/world-XZ.bin", xz, xz_size);
 	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
-	KUNIT_EXPECT_EQ(test, env->choice.tried[0].error, -EINVAL);
 	KUNIT_EXPECT_EQ(test, env->choice.tried[1].error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[2].error, -EINVAL);
 	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_WORLD);
 
 	/* Another country's package under this country's name. */
@@ -932,6 +1155,29 @@ static void mt7932_policy_switch_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, env->fs.held, 0);
 }
 
+/* Unbound class archives must never be consumed as firmware command pages. */
+static void mt7932_policy_unbound_test(struct kunit *test)
+{
+	struct select_env *env = select_env(test);
+	struct mt7932_policy policy;
+	size_t size, xz_size;
+	u8 *data, *xz;
+
+	data = pkg_build_v2(test, "AU", BIT_ULL(1), &size);
+	xz = pkg_build(test, "XZ", &xz_size);
+	put_unaligned_le16(3, data + 4);
+	KUNIT_EXPECT_EQ(test, mt7932_policy_parse(&policy, data, size, "AU"),
+			-EINVAL);
+	fake_add(&env->fs, "mediatek/mt7932/policy-v2/AU.bin", data, size);
+	fake_add(&env->fs, "mediatek/mt7932/policy/AU.bin", data, size);
+	fake_add(&env->fs, "mediatek/mt7932/policy/world-XZ.bin", xz, xz_size);
+	KUNIT_ASSERT_EQ(test, select_run(env, "AU", false), 0);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[1].error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, env->choice.tried[2].error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, env->choice.source, MT7932_POLICY_WORLD);
+	KUNIT_EXPECT_EQ(test, env->choice.six_primaries, 0);
+}
+
 static struct kunit_case mt7932_policy_test_cases[] = {
 	KUNIT_CASE(mt7932_reg_relaxation_test),
 	KUNIT_CASE(mt7932_policy_valid_test),
@@ -947,8 +1193,12 @@ static struct kunit_case mt7932_policy_test_cases[] = {
 	KUNIT_CASE(mt7932_6g_power_limit_test),
 	KUNIT_CASE(mt7932_policy_corruption_test),
 	KUNIT_CASE(mt7932_policy_order_test),
+	KUNIT_CASE(mt7932_policy_v4_classes_test),
+	KUNIT_CASE(mt7932_policy_6g_pad_test),
+	KUNIT_CASE(mt7932_policy_v4_preferred_test),
 	KUNIT_CASE(mt7932_policy_v2_preferred_test),
 	KUNIT_CASE(mt7932_policy_version_test),
+	KUNIT_CASE(mt7932_policy_unbound_test),
 	KUNIT_CASE(mt7932_policy_fallback_test),
 	KUNIT_CASE(mt7932_policy_switch_test),
 	{}

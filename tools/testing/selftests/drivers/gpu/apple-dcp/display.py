@@ -381,3 +381,117 @@ int main(void) {
     return 0;
 }
 '''
+
+
+def hdr_metadata(root):
+    """HDR10 static metadata message for DCPAV selector 0x15, byte for byte."""
+    header = (root / 'drivers/gpu/drm/apple/dcp-hdr-metadata.h').read_text()
+    header = '\n'.join(line for line in header.splitlines()
+                       if not line.startswith('#include'))
+    header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
+    # An independent encoding of the same message: the DCPAV IPC header, then
+    # the serialized { "Type": "CEA-861:Type1", "Data": <24 bytes> }.
+    def tag(last, kind, size):
+        return struct.pack('<I', (last << 31) | (kind << 24) | size)
+
+    def pad(raw):
+        return raw + b'\0' * (-len(raw) % 4)
+
+    body = struct.pack('<12H', 35400, 14600, 8500, 39850, 6550, 2300,
+                       15635, 16450, 1000, 50, 1000, 400)
+    obj = struct.pack('<I', 0xd3) + tag(1, 1, 2)
+    obj += tag(0, 8, 5) + pad(b'Type\0')
+    obj += tag(0, 9, 13) + pad(b'CEA-861:Type1')
+    obj += tag(0, 8, 5) + pad(b'Data\0')
+    obj += tag(1, 10, 24) + body
+    msg = bytearray(0x60)
+    struct.pack_into('<HHIII', msg, 0, 0, 1, 0x15, len(obj) + 0x20, 0x69706378)
+    struct.pack_into('<I', msg, 0x50, len(obj))
+    msg += obj
+    expected = ','.join(map(str, msg))
+    # selector 0x14: a fixed 0x80-byte message clearing InfoFrame type 0x87
+    stop = bytearray(0x80)
+    struct.pack_into('<HHIII', stop, 0, 0, 0, 0x14, 0x40, 0x69706378)
+    stop[0x40] = 0x87
+    expected_stop = ','.join(map(str, stop))
+    return r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+typedef uint8_t __u8; typedef uint16_t __u16; typedef uint32_t __u32;
+static void put_unaligned_le16(u16 v, void *p) { u8 *b = p; b[0] = v; b[1] = v >> 8; }
+static void put_unaligned_le32(u32 v, void *p) { u8 *b = p; for (int i = 0; i < 4; i++) b[i] = v >> (8 * i); }
+static u16 __attribute__((unused)) get_unaligned_le16(const void *p) { const u8 *b = p; return b[0] | b[1] << 8; }
+static u32 get_unaligned_le32(const void *p) { const u8 *b = p; return b[0] | b[1] << 8 | b[2] << 16 | (u32)b[3] << 24; }
+/* include/uapi/drm/drm_mode.h */
+struct hdr_metadata_infoframe {
+    __u8 eotf; __u8 metadata_type;
+    struct { __u16 x, y; } display_primaries[3];
+    struct { __u16 x, y; } white_point;
+    __u16 max_display_mastering_luminance, min_display_mastering_luminance;
+    __u16 max_cll, max_fall;
+};
+struct hdr_output_metadata {
+    __u32 metadata_type;
+    union { struct hdr_metadata_infoframe hdmi_metadata_type1; };
+};
+""" + header + r"""
+static const u8 expected[] = {""" + expected + r"""};
+static const u8 expected_stop[] = {""" + expected_stop + r"""};
+int main(void)
+{
+    struct hdr_output_metadata hdr = { .metadata_type = 0, .hdmi_metadata_type1 = {
+        .eotf = 2, .metadata_type = 0,
+        .display_primaries = { { 35400, 14600 }, { 8500, 39850 }, { 6550, 2300 } },
+        .white_point = { 15635, 16450 },
+        .max_display_mastering_luminance = 1000, .min_display_mastering_luminance = 50,
+        .max_cll = 1000, .max_fall = 400 } };
+    u8 data[DCP_HDR_DATA_SIZE], msg[DCP_HDR_MSG_SIZE], reply[DCP_HDR_MSG_SIZE] = {0};
+
+    assert(sizeof(expected) == DCP_HDR_MSG_SIZE);
+    assert(!dcp_hdr_data(data, &hdr));
+    dcp_hdr_message(msg, data);
+    for (size_t i = 0; i < sizeof(msg); i++)
+        if (msg[i] != expected[i]) {
+            fprintf(stderr, "byte %#zx: %#x, expected %#x\n", i, msg[i], expected[i]);
+            return 1;
+        }
+    /* Only static metadata Type 1 is sent. */
+    hdr.metadata_type = 1;
+    assert(dcp_hdr_data(data, &hdr) == -EINVAL);
+    hdr.metadata_type = 0; hdr.hdmi_metadata_type1.metadata_type = 1;
+    assert(dcp_hdr_data(data, &hdr) == -EINVAL);
+    /* Transport error, AFK return code, short reply, DCP status at 0x40. */
+    assert(dcp_hdr_reply(-ETIMEDOUT, 0, reply, sizeof(reply)) == -ETIMEDOUT);
+    assert(dcp_hdr_reply(0, 5, reply, sizeof(reply)) == -EIO);
+    assert(dcp_hdr_reply(0, 0, reply, 0x43) == -EPROTO);
+    assert(dcp_hdr_reply(0, 0, reply, 0x44) == 0);
+    put_unaligned_le32(0xe00002c2, reply + 0x40);
+    assert(dcp_hdr_reply(0, 0, reply, sizeof(reply)) == -EIO);
+    /* Ending HDR: the selector 0x14 stop message, DCP status at 0x70. */
+    {
+        u8 stop[DCP_HDR_STOP_SIZE], sreply[DCP_HDR_STOP_SIZE] = {0};
+
+        assert(sizeof(expected_stop) == DCP_HDR_STOP_SIZE);
+        memset(stop, 0xa5, sizeof(stop));
+        dcp_hdr_stop_message(stop);
+        assert(!memcmp(stop, expected_stop, sizeof(stop)));
+        assert(dcp_hdr_stop_reply(-EIO, 0, sreply, sizeof(sreply)) == -EIO);
+        assert(dcp_hdr_stop_reply(0, 3, sreply, sizeof(sreply)) == -EIO);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, 0x73) == -EPROTO);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, 0x74) == 0);
+        /* the 0x15 status offset does not count for a stop */
+        put_unaligned_le32(1, sreply + 0x40);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, sizeof(sreply)) == 0);
+        put_unaligned_le32(1, sreply + 0x70);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, sizeof(sreply)) == -EIO);
+    }
+    printf("PASS: HDR10 static metadata message (%zu bytes), InfoFrame stop and reply checks\n", sizeof(msg));
+    return 0;
+}
+"""

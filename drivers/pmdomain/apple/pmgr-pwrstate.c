@@ -12,6 +12,7 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
@@ -370,12 +371,63 @@ static int apple_pmgr_reset_xlate(struct reset_controller_dev *rcdev,
 	return 0;
 }
 
+/*
+ * genpd adds a power state that is on only below parents that are on. With a
+ * single parent the platform bus has already attached this device to it and
+ * powered it on before probe; with more than one it attaches to none, so a
+ * domain the boot loader left on (DISPEXT1_SYS on the J616s, below FAB7_SOC
+ * and its PMP request) could not be added. Power every parent on through a
+ * virtual device until the subdomain links hold them.
+ */
+static int apple_pmgr_ps_hold_parents(struct apple_pmgr_ps *ps, bool active,
+				      struct dev_pm_domain_list **parents)
+{
+	static const struct dev_pm_domain_attach_data data = {
+		.pd_flags = PD_FLAG_NO_DEV_LINK,
+	};
+	struct dev_pm_domain_list *list = NULL;
+	unsigned int i;
+	int ret;
+
+	*parents = NULL;
+	if (!active || of_count_phandle_with_args(ps->dev->of_node, "power-domains",
+						  "#power-domain-cells") < 2)
+		return 0;
+
+	ret = dev_pm_domain_attach_list(ps->dev, &data, &list);
+	if (ret <= 0)
+		return ret;
+	for (i = 0; i < list->num_pds; i++) {
+		ret = pm_runtime_resume_and_get(list->pd_devs[i]);
+		if (ret < 0) {
+			while (i--)
+				pm_runtime_put(list->pd_devs[i]);
+			dev_pm_domain_detach_list(list);
+			return dev_err_probe(ps->dev, ret, "cannot power parent domain %u\n", i);
+		}
+	}
+	*parents = list;
+	return 0;
+}
+
+static void apple_pmgr_ps_release_parents(struct dev_pm_domain_list *parents)
+{
+	unsigned int i;
+
+	if (!parents)
+		return;
+	for (i = 0; i < parents->num_pds; i++)
+		pm_runtime_put(parents->pd_devs[i]);
+	dev_pm_domain_detach_list(parents);
+}
+
 static int apple_pmgr_ps_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct apple_pmgr_ps *ps;
 	struct regmap *regmap;
+	struct dev_pm_domain_list *parents = NULL;
 	struct of_phandle_iterator it;
 	int ret;
 	const char *name;
@@ -528,6 +580,10 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = apple_pmgr_ps_hold_parents(ps, active, &parents);
+	if (ret < 0)
+		goto err_remove;
+
 	of_for_each_phandle(&it, ret, node, "power-domains", "#power-domain-cells", -1) {
 		struct of_phandle_args parent, child;
 
@@ -548,6 +604,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* The subdomain links hold the parents now. */
+	apple_pmgr_ps_release_parents(parents);
+
 	/*
 	 * Do not participate in regular PM; parent power domains are handled via the
 	 * genpd hierarchy.
@@ -567,6 +626,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	return 0;
 err_remove:
+	apple_pmgr_ps_release_parents(parents);
 	of_genpd_del_provider(node);
 	pm_genpd_remove(&ps->genpd);
 	return ret;

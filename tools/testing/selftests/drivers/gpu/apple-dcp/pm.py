@@ -214,6 +214,13 @@ static int usb_hub_port_power_on(struct usb_device *u, int port)
  usb3_port_down=false;
  return 0;
 }
+static int usb_hub_port_retrain(struct usb_device *u, int port)
+{
+ assert(u==&roots[3]&&port==1&&root_locked&&pm_refs==1&&!pm_phy->lock);
+ assert(!usb3_port_down&&pm_phy->host_active&&!pm_phy->mode_dirty&&!pm_phy->pipe_pending);
+ assert(pm_phy->pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+ return 0;
+}
 #endif
 '''
     suffix=ns['suffix'].replace('int main(', 'int __attribute__((unused)) fixture_main(',1)
@@ -499,6 +506,7 @@ struct cd321x {
 };
 static struct fwnode_handle connector;
 static int mux_error, notifier_error, switch_error;
+static bool mux_transient;
 static int ports,altmodes,muxes,switches,notifiers,stop_calls;
 struct typec_thunderbolt_switch;
 static bool keep_waiting=true;
@@ -521,7 +529,14 @@ static void __attribute__((unused)) fwnode_handle_put(struct fwnode_handle *f) {
 static void *fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *f) {
  (void)f;if(switch_error)return (void *)(intptr_t)switch_error;switches++;return &switches;
 }
-static int typec_set_mode(void *p,unsigned long m) { (void)p;assert(m==TYPEC_STATE_SAFE);return mux_error; }
+static int cd321x_mux_set(struct cd321x *c,bool *held) {
+ assert(c->state.mode==TYPEC_STATE_SAFE);
+ *held=mux_error==-ETIMEDOUT&&mux_transient;return mux_error;
+}
+static void cd321x_retry_held_mux(struct cd321x *c) {
+ assert(c->pm.phase==CD321X_PM_INITIALIZING);
+ assert(cd321x_pm_mux_held(&c->pm,0));
+}
 static int cd321x_tbt_notify(struct notifier_block *n,unsigned long e,void *d) { (void)n;(void)e;(void)d;return 0; }
 static int typec_thunderbolt_switch_register_notifier(void *s,struct notifier_block *n) {
  (void)n;if(!s)return 0;if(notifier_error)return notifier_error;notifiers++;return 0;
@@ -540,11 +555,13 @@ static void cd321x_stop_work(struct cd321x *c) {
     production = switch_get.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
     init_work = block(core, 'VISIBLE_IF_KUNIT void cd321x_init_work(')
     production += init_work.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
+    init_mux = block(core, 'VISIBLE_IF_KUNIT int cd321x_init_mux(')
+    production += init_mux.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
     production += function(core, 'cd321x_register_port') + '\n' + function(core, 'cd321x_unregister_port')
     controls = r'''
 static void reset(struct cd321x *c) {
  memset(c,0,sizeof(*c));connector.refs=0;
- mux_error=notifier_error=switch_error=0;stop_calls=0;keep_waiting=true;
+ mux_error=notifier_error=switch_error=0;stop_calls=0;keep_waiting=true;mux_transient=false;
  assert(!ports&&!altmodes&&!muxes&&!switches&&!notifiers);
 }
 static void balanced(void) {
@@ -608,6 +625,13 @@ int main(void) {
  reset(&c);mux_error=-EIO;
  assert(cd321x_register_port(&c.tps,&connector)==0&&!c.state_valid);
  cd321x_unregister_port(&c.tps);balanced();
+ /* A probe-time transient timeout keeps its series until ready enables work. */
+ reset(&c);mux_error=-ETIMEDOUT;mux_transient=true;
+ assert(cd321x_register_port(&c.tps,&connector)==0&&!c.state_valid);
+ assert(c.pm.phase==CD321X_PM_INITIALIZING&&c.pm.mux_retry_ms&&c.pm.force_reconnect);
+ assert(!c.resume_work.pending&&!c.update_work.pending&&cd321x_pm_ready(&c.pm));
+ assert(c.pm.mux_retry_ms&&c.pm.force_reconnect);
+ cd321x_unregister_port(&c.tps);balanced();
  /* Missing router defers while suppliers may still bind, then is optional. */
  reset(&c);switch_error=-EPROBE_DEFER;
  assert(cd321x_register_port(&c.tps,&connector)==-EPROBE_DEFER);balanced();
@@ -617,6 +641,19 @@ int main(void) {
  puts("PASS actual cd321x port: mux defer/reprobe, rollback, fwnode balance and ordinary scope");
 }
 '''
+
+    # Newer trees report an occupied pipeline as -ENOSPC on every SoC.
+    # Keep the old two-argument contract covered when testing an older tree.
+    if re.search(r'cd321x_display_taken\(int ret\)', pm):
+        old = ' assert(cd321x_display_taken(-ENOSPC,true)&&!cd321x_display_taken(-EBUSY,true)&&!cd321x_display_taken(0,true)&&cd321x_display_taken(-EBUSY,false)&&!cd321x_display_taken(-ENOSPC,false)&&!cd321x_display_taken(0,false));'
+        assert controls.count(old) == 1
+        controls = controls.replace(old, r'''
+ /* An occupied display permits USB progress; transient/other errors retry. */
+ assert(cd321x_display_taken(-ENOSPC));
+ assert(!cd321x_display_taken(-EBUSY)&&!cd321x_display_taken(-EAGAIN));
+ assert(!cd321x_display_taken(-ETIMEDOUT)&&!cd321x_display_taken(-EIO));
+ assert(!cd321x_display_taken(0));
+''')
 
     # A mux that holds a change up is retried outside the cable-state budget.
     if 'cd321x_pm_mux_held(' in pm:
@@ -710,7 +747,7 @@ def kconfig(root, output):
 
 
 def probe_dispatch(root):
-    """Connect real port probe -> typec_set_mode -> mux core -> PM wrapper."""
+    """Connect real port probe -> init_mux -> mux core -> PM wrapper."""
     unit = ownership(root)
     unit = unit.replace('int main(void)', 'static int __attribute__((unused)) ownership_fixture_main(void)', 1)
     unit = unit.replace('#define IS_ERR_OR_NULL(p) (!(p))', '#define IS_ERR(p) ((intptr_t)(p)<0)\n #define IS_ERR_OR_NULL(p) (!(p)||IS_ERR(p))')
@@ -719,13 +756,20 @@ def probe_dispatch(root):
     # Type-C and mutex declarations already belong to the shared PM fixture.
     port = port.replace('struct typec_mux_state { void *alt,*data; unsigned long mode; };', '')
     port = port.replace('#define guard(kind) (void)', '')
-    port = port.replace('static int typec_set_mode(void *p,unsigned long m) { (void)p;assert(m==TYPEC_STATE_SAFE);return mux_error; }', '')
+    start = port.index('static int cd321x_mux_set(')
+    end = port.index('static void cd321x_retry_held_mux(', start)
+    core = (root / 'drivers/usb/typec/tipd/core.c').read_text()
+    dispatch = block(core, 'static bool cd321x_mux_held(') + '\n' + block(core, 'static int cd321x_mux_set(')
+    timeout = block((root / 'drivers/usb/typec/mux.c').read_text(),
+                    'bool typec_mux_timeout_transient(')
+    port = port[:start] + timeout + '\n' + dispatch + '\n' + port[end:]
     port = port.replace('(void)f;t->port=t;ports++;return 0;', '(void)f;t->port=&probe_port;ports++;return 0;')
-    # Real class dispatch requires the port's mux; its allocator remains a mock.
+    # Both handles refer to the same route; its allocator remains a mock.
     declarations = 'struct typec_port { struct typec_mux *mux; };\nstatic struct typec_port probe_port;\n'
-    dispatch = block((root / 'drivers/usb/typec/class.c').read_text(), 'int typec_set_mode(')
     marker = port.index('static int tps6598x_register_port(')
-    port = port[:marker] + declarations + dispatch + '\n' + port[marker:]
+    port = port[:marker] + declarations + port[marker:]
+    port = port.replace('(void)f;muxes++;return &muxes;',
+                        '(void)f;muxes++;return probe_port.mux;')
     import re
     # Only helpers used at this boundary belong in this translation unit;
     # the separate probe group exercises the complete retry state machine.
@@ -733,13 +777,14 @@ def probe_dispatch(root):
             'cd321x_pm_begin_read', 'cd321x_pm_snapshot_ready',
             'cd321x_pm_complete', 'cd321x_pm_can_update',
             # which, once retries of a held mux exist, ends them on removal
-            'cd321x_pm_mux_done'}
+            'cd321x_pm_mux_done', 'cd321x_pm_mux_held'}
     for match in list(re.finditer(r'^static inline (?:void|bool|unsigned int) (cd321x_\w+)\(', port, re.M))[::-1]:
         if match.group(1) not in used:
             body = block(port, match.group())
             port = port[:match.start()] + port[match.start() + len(body):]
     port = port.replace('static int mux_error, notifier_error, switch_error;',
                         'static int notifier_error, switch_error;')
+    port = port.replace('static bool mux_transient;', '')
     existing = set(re.findall(r'^\s*#define (\w+)', unit, re.M))
     port = '\n'.join(line for line in port.splitlines()
                      if not (line.startswith('#define ') and line.split()[1].split('(')[0] in existing))
@@ -770,7 +815,13 @@ int main(void)
     memset(&c,0,sizeof(c));prepare(&p,true,true,false);resume_error=-EIO;before=writes;
     assert(cd321x_register_port(&c.tps,&connector)==0 && !c.state_valid && writes==before);
     balanced(&p);cd321x_unregister_port(&c.tps);port_balance();
-    puts("PASS: actual CD321x probe -> typec_set_mode -> typec_mux_set -> bounded PM wrapper; delayed root reprobe and rollback references");
+    memset(&c,0,sizeof(c));prepare(&p,true,true,false);resume_error=0;
+    provider.transient_timeouts=true;fail_caller="atcphy_pipehandler_lock_timeout";
+    assert(cd321x_register_port(&c.tps,&connector)==0&&!c.state_valid);
+    assert(c.pm.phase==CD321X_PM_INITIALIZING&&c.pm.mux_retry_ms&&c.pm.force_reconnect);
+    assert(!c.resume_work.pending&&!c.update_work.pending);
+    balanced(&p);cd321x_unregister_port(&c.tps);port_balance();fail_caller=NULL;
+    puts("PASS: actual CD321x probe -> init_mux -> typec_mux_set -> bounded PM wrapper; delayed root, initial PIPE timeout and rollback references");
 }
 """
     return unit + '\n' + port + '\n' + controls

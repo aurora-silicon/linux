@@ -229,6 +229,7 @@ static void mt_rx_drain(struct mt7932 *m, struct mt7932_ring *q)
 			break;
 		dma_rmb();
 		length = (ctrl >> 16) & 0x3fff;
+		m->rx_ring_records[q - m->rx]++;
 		if (length <= MT7932_RX_CAPACITY && (ctrl & BIT(30)))
 			mt_receive(m, q->buffers + q->tail * RX_STRIDE, length);
 		else
@@ -274,8 +275,18 @@ static irqreturn_t mt_irq(int irq, void *data)
 
 static void mt_service(struct mt7932 *m)
 {
-	u32 causes = mt_read(m, W + 0x200) & m->irq_mask;
+	u32 raw = mt_read(m, W + 0x200), causes = raw & m->irq_mask;
 	unsigned int i;
+
+	/* Status bits outside the enabled mask never raise an interrupt; if
+	 * one of them announces ring work, that work waits for an unrelated
+	 * cause. Record them so a test can see such a source.
+	 */
+	m->irq_passes++;
+	if ((raw & ~m->irq_mask) && raw != U32_MAX) {
+		m->irq_unmasked |= raw & ~m->irq_mask;
+		m->irq_unmasked_passes++;
+	}
 
 	/*
 	 * Acknowledge before servicing the rings. A completion that lands

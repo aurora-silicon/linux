@@ -64,6 +64,8 @@ struct ane_device {
 	 * and protects bo_list, preserved_list and removed.
 	 */
 	struct mutex engine_lock;
+	/* Serializes runtime-PM references across a recovery cycle. */
+	struct mutex pm_lock;
 	struct list_head bo_list;
 
 	/*
@@ -110,11 +112,32 @@ struct ane_device {
 	 */
 	bool tm_retention;
 
+	/* Protected independently of engine_lock so idle work can release votes. */
+	struct ane_perf {
+		struct mutex lock; /* protects votes, idle work and status */
+		struct delayed_work idle;
+		struct device_node *report;
+		struct icc_path *memory;
+		unsigned int high_level;
+		unsigned int level;
+		u32 avg_bw;
+		u32 peak_bw;
+		int error;
+		unsigned int release_retries;
+		bool initialized;
+		bool busy;
+		bool voted;
+		bool clock_held;
+		bool pinned;
+		bool cpu_boost;
+	} perf;
+
 	/*
 	 * Engine-busy CPU cluster boost (ane_boost.c): min-frequency QoS on
 	 * every cpufreq policy while a submit runs and until boost_idle_ms
-	 * after the last one completes: on T8103 bandwidth-bound programs
-	 * run ~2x slower while schedutil parks the idle clusters low.
+	 * after the last one completes. Used only when the DT binds no
+	 * performance controller, so the engine keeps the boost it had
+	 * until it gets a clock level instead.
 	 */
 	struct ane_boost {
 		struct mutex lock;	/* protects the fields below */
@@ -158,6 +181,12 @@ int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
  * recovery power cycle, or at driver remove. Callers hold engine_lock.
  */
 void ane_reclaim_preserved(struct ane_device *ane);
+
+int ane_perf_init(struct ane_device *ane, unsigned int high_level);
+int ane_perf_exit(struct ane_device *ane);
+int ane_perf_begin(struct ane_device *ane);
+void ane_perf_end(struct ane_device *ane);
+int ane_perf_suspend(struct ane_device *ane);
 
 int ane_boost_init(struct ane_device *ane);
 void ane_boost_exit(struct ane_device *ane);

@@ -482,6 +482,12 @@ def blank(root):
     functions = '\n'.join(block(backlight, name) for name in (
         'bool dcp_backlight_active(', 'int dcp_backlight_dpms(',
         'int dcp_backlight_prepare(', 'bool dcp_backlight_complete('))
+    # The 14.7 panel's nits policy (an M3 internal panel) never runs here.
+    if 'static bool dcp_backlight_presents_nits(' in backlight:
+        functions = ('static bool iomfb_v14_7_panel_nits(struct apple_dcp *dcp) '
+                     '{ (void)dcp; return false; }\n' +
+                     block(backlight, 'static bool dcp_backlight_presents_nits(') +
+                     '\n' + functions)
     return production(root) + r'''
 #define min(x,y) ((x)<(y)?(x):(y))
 static u64 div_u64(u64 x,u32 y) { return x/y; }

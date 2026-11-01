@@ -266,7 +266,7 @@ impl VmShrinker {
         )?;
         // SAFETY: The format is static and has no format arguments.
         let raw =
-            unsafe { kernel::bindings::shrinker_alloc(0, c_str!("asahi-idle-vm").as_char_ptr()) };
+            unsafe { kernel::bindings::shrinker_alloc(0, c_str!("aurora-idle-vm").as_char_ptr()) };
         if raw.is_null() {
             return Err(ENOMEM);
         }

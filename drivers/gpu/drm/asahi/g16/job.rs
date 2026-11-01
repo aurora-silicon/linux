@@ -121,6 +121,10 @@ pub(crate) struct Job {
 }
 
 impl Job {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The job owns independently prepared command, mapping and fence resources."
+    )]
     pub(crate) fn new(
         id: u64,
         queue: Arc<QueueState>,
@@ -467,7 +471,7 @@ impl Scheduler {
             hw::sizes::SCHEDULER_CREDITS,
             0,
             hw::tuning::SCHED_TIMEOUT_MS,
-            c_str!("asahi_g16"),
+            c_str!("aurora_g16"),
         )?;
         // With one run queue, only the kernel priority is valid.
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;

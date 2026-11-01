@@ -8,9 +8,41 @@ on:
       - 'tools/aurora-bindgen/**'
       - 'drivers/soc/apple/**'
       - 'include/uapi/linux/apple-sep.h'
+      - 'tools/aurora-sep/**'
       - '.github/workflows/sep-source.yml'
 
 jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            drivers/soc/apple/**
+            include/uapi/linux/apple-sep.h
+            tools/aurora-sep/**
+      - name: Check biometric ioctl ABI sizes
+        run: |
+          cat > /tmp/sep-abi.c <<'EOF'
+          #include <linux/apple-sep.h>
+          _Static_assert(sizeof(struct sep_bio_enrol_start) == 144, "enrol ABI");
+          _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
+          _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
+          int main(void) { return 0; }
+          EOF
+          cc -Wall -Werror -Iinclude/uapi /tmp/sep-abi.c -o /tmp/sep-abi
+          /tmp/sep-abi
+      - name: Test recovery utility and package sources
+        run: |
+          python3 -m unittest tools/aurora-sep/tests/test_sep_bio_identities.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_orphan_delete.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_enrol_admission.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_owner_preparation.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
+
   rust-build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45

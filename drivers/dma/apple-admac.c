@@ -16,6 +16,7 @@
 #include <linux/of_dma.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
@@ -680,6 +681,11 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 	struct admac_data *ad = adchan->host;
 	int ret;
 
+	/* Keep MMIO accessible for config, status and the atomic DMA callbacks. */
+	ret = pm_runtime_resume_and_get(ad->dev);
+	if (ret < 0)
+		return ret;
+
 	dma_cookie_init(&adchan->chan);
 
 	/*
@@ -699,8 +705,10 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 
 	ret = admac_alloc_sram_carveout(ad, admac_chan_direction(adchan->no),
 					&adchan->carveout);
-	if (ret < 0)
+	if (ret < 0) {
+		pm_runtime_put_autosuspend(ad->dev);
 		return ret;
+	}
 
 	writel_relaxed(adchan->carveout,
 		       ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
@@ -715,6 +723,7 @@ static void admac_free_chan_resources(struct dma_chan *chan)
 	admac_synchronize(chan);
 	admac_free_sram_carveout(adchan->host, admac_chan_direction(adchan->no),
 				 adchan->carveout);
+	pm_runtime_put_autosuspend(adchan->host->dev);
 }
 
 static struct dma_chan *admac_dma_of_xlate(struct of_phandle_args *dma_spec,
@@ -976,6 +985,37 @@ static int admac_device_config(struct dma_chan *chan,
 	return 0;
 }
 
+static int admac_runtime_suspend(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+
+	/* No channel resources remain; drain handlers before genpd gates MMIO. */
+	disable_irq(ad->irq);
+	if (dev->pm_domain)
+		ad->ctl_programmed = false;
+
+	return 0;
+}
+
+static int admac_runtime_resume(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+
+	/*
+	 * Defer register restoration to alloc/config, before any transfer. Some
+	 * controllers are powered by firmware only after the audio handshake.
+	 * Restore only the requested channel, never reset the shared fabric.
+	 */
+	enable_irq(ad->irq);
+
+	return 0;
+}
+
+/* Allocated channels must stay powered, including paused cyclic transfers. */
+static const struct dev_pm_ops admac_pm_ops = {
+	RUNTIME_PM_OPS(admac_runtime_suspend, admac_runtime_resume, NULL)
+};
+
 static int admac_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -1093,24 +1133,37 @@ static int admac_probe(struct platform_device *pdev)
 		goto free_reset;
 	}
 
+	pm_runtime_get_noresume(ad->dev);
+	err = pm_runtime_set_active(ad->dev);
+	if (err)
+		goto put_pm;
+	pm_runtime_set_autosuspend_delay(ad->dev, 100);
+	pm_runtime_use_autosuspend(ad->dev);
+	pm_runtime_enable(ad->dev);
+
 	err = dma_async_device_register(&ad->dma);
 	if (err) {
 		dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
-		goto free_irq;
+		goto disable_pm;
 	}
 
 	err = of_dma_controller_register(pdev->dev.of_node, admac_dma_of_xlate, ad);
 	if (err) {
 		dma_async_device_unregister(&ad->dma);
 		dev_err_probe(&pdev->dev, err, "failed to register with OF\n");
-		goto free_irq;
+		goto disable_pm;
 	}
 
 	dev_info(&pdev->dev, "Audio DMA Controller\n");
+	pm_runtime_put_autosuspend(ad->dev);
 
 	return 0;
 
-free_irq:
+disable_pm:
+	pm_runtime_disable(ad->dev);
+	pm_runtime_dont_use_autosuspend(ad->dev);
+put_pm:
+	pm_runtime_put_noidle(ad->dev);
 	free_irq(ad->irq, ad);
 free_reset:
 	reset_control_rearm(ad->rstc);
@@ -1123,6 +1176,8 @@ static void admac_remove(struct platform_device *pdev)
 
 	of_dma_controller_free(pdev->dev.of_node);
 	dma_async_device_unregister(&ad->dma);
+	pm_runtime_disable(ad->dev);
+	pm_runtime_dont_use_autosuspend(ad->dev);
 	free_irq(ad->irq, ad);
 	reset_control_rearm(ad->rstc);
 }
@@ -1163,6 +1218,7 @@ static struct platform_driver apple_admac_driver = {
 	.driver = {
 		.name = "apple-admac",
 		.of_match_table = admac_of_match,
+		.pm = pm_ptr(&admac_pm_ops),
 	},
 	.probe = admac_probe,
 	.remove = admac_remove,

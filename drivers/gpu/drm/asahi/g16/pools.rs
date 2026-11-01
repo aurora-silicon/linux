@@ -99,7 +99,7 @@ fn read64(o: &FwObject, at: usize) -> Result<u64> {
         let high = o.r32(at + 4)?;
         let low = o.r32(at)?;
         if high == o.r32(at + 4)? {
-            return Ok((high as u64) << 32 | low as u64);
+            return Ok(u64::from(high) << 32 | u64::from(low));
         }
     }
     Err(EAGAIN)
@@ -347,7 +347,7 @@ impl PbEpoch {
             buffer::page_record(heap, i as u32).to_le_bytes()
         })?;
         write_records(&self.blocks, buffer::MAX_BLOCKS as usize, |i| {
-            (buffer::block_record(heap, i as u32) as u64).to_le_bytes()
+            u64::from(buffer::block_record(heap, i as u32)).to_le_bytes()
         })?;
         self.ring.w32(0, buffer::MAX_BLOCKS)?;
         self.ring.w32(4, buffer::MAX_BLOCKS)?;

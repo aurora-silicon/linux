@@ -17,7 +17,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = "drivers/media/platform/apple/avd/avd-drv.c"
+SOURCE = "drivers/media/platform/apple/avd/avd-backend-open.c"
 HEADER = "drivers/media/platform/apple/avd/avd.h"
 
 
@@ -38,13 +38,14 @@ def build_source(body, defines):
 #define dev_info(...) ((void)0)
 ''' + defines + r'''
 struct firmware { const unsigned char *data; size_t size; };
-struct variant { unsigned int capabilities; };
+struct variant { unsigned int capabilities, fw_caps_required; };
 struct avd_dev {
     struct firmware *fw;
     const struct variant *variant;
-    unsigned int capabilities;
+    unsigned int capabilities, fw_capabilities;
 };
-static char *strnstr(const char *s, const char *needle, size_t n)
+#define strnstr fixture_strnstr
+static char *fixture_strnstr(const char *s, const char *needle, size_t n)
 {
     size_t len = strlen(needle);
     for (size_t i = 0; i + len <= n && s[i]; i++)
@@ -52,10 +53,10 @@ static char *strnstr(const char *s, const char *needle, size_t n)
             return (char *)s + i;
     return NULL;
 }
+''' + body + r'''
 static unsigned int probe_tail(struct avd_dev *avd)
 {
-    const char *codec_info = NULL;
-''' + body + r'''
+    avd_open_capabilities(avd);
     return avd->capabilities;
 }
 int main(int argc, char **argv)
@@ -67,12 +68,14 @@ int main(int argc, char **argv)
     if (!data)
         return 2;
     struct firmware fw = {data, size};
-    struct variant variant = {strtoul(argv[3], NULL, 0)};
-    struct avd_dev avd = {&fw, &variant, 0};
+    struct variant variant = {strtoul(argv[3], NULL, 0), 0};
+    struct avd_dev avd = {&fw, &variant, 0, 0};
     size_t len = strlen(argv[2]);
     if (size >= AVD_CODEC_INFO_MAX_SIZE && len <= AVD_CODEC_INFO_MAX_SIZE)
         memcpy(data + size - AVD_CODEC_INFO_MAX_SIZE, argv[2], len);
     unsigned int actual = probe_tail(&avd);
+    if (actual != avd.fw_capabilities)
+        return 1;
     unsigned int expected = strtoul(argv[4], NULL, 0);
     printf("size=%zu variant=%u capabilities=%u expected=%u\n",
            size, variant.capabilities, actual, expected);
@@ -122,12 +125,12 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     source, header = read(SOURCE, args.ref), read(HEADER, args.ref)
-    start = source.index("\t/* Determine firmware and HW variant capabilities */")
-    end = source.index("\n\tret = dma_set_mask_and_coherent", start)
+    start = source.index("static void avd_open_capabilities(")
+    end = source.index("static int avd_open_request_firmware(", start)
     body = source[start:end]
-    wanted = ["AVD_CODEC_INFO_MAX_SIZE", "AVD_CAPABILITY_AV1", "AVD_CAPABILITY_H264",
+    wanted = ["AVD_CAPABILITY_AV1", "AVD_CAPABILITY_H264",
               "AVD_CAPABILITY_HEVC", "AVD_CAPABILITY_VP9"]
-    defines = ""
+    defines = "#define AVD_CODEC_INFO_MAX_SIZE 0x40\n#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))\n#define u32 unsigned int\n"
     for macro in wanted:
         matches = re.findall(r"^#define\s+" + macro + r"\s+[^\n]+$",
                              source + "\n" + header, re.M)
@@ -148,16 +151,15 @@ def main():
               (128, "legacy", 5, 5)]
     variants = [("control-before", body)]
     if args.mutations:
-        anchor = "\tif (avd->fw->size >= AVD_CODEC_INFO_MAX_SIZE)\n"
+        anchor = "!avd->fw || avd->fw->size < 0x40"
         if body.count(anchor) != 1:
             raise ValueError("size-guard mutation did not match exactly once")
-        variants += [("no-size-guard", body.replace(anchor, "")),
+        variants += [("no-size-guard", body.replace(anchor, "!avd->fw")),
                      ("no-variant-intersection", body.replace(
-                         "\t\tunsigned int variant_caps = avd->variant->capabilities;\n", ""
-                     ).replace("caps |= variant_caps & ", "caps |= ")),
+                         "avd->variant->capabilities & codecs[i].bit", "codecs[i].bit")),
                      ("no-legacy-fallback", body.replace(
-                         "avd->capabilities = avd->variant->capabilities;",
-                         "avd->capabilities = 0;"))]
+                         "avd->variant->capabilities &\n\t\t\t    ~avd->variant->fw_caps_required",
+                         "0"))]
         variants.append(("control-after", body))
     results = [run_variant(args.output, name, text, defines, cases)
                for name, text in variants]
@@ -176,10 +178,21 @@ def main():
                "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
                "defines_sha256": hashlib.sha256(defines.encode()).hexdigest(),
                "cases_per_variant": len(cases), "results": results, "passed": ok}
+    if ok and not args.ref and not args.mutations:
+        tests = ROOT / "drivers/media/platform/apple/avd/tests"
+        for script in ("program-test.py", "dispatch-test.py"):
+            subprocess.run([sys.executable, str(tests / script),
+                            str(args.output / script.removesuffix(".py"))],
+                           check=True)
+        receipt["h264_program_and_dispatch"] = "PASS"
     (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps({"passed": ok, "cases": len(cases),
                       "variants": [{k: x[k] for k in ("name", "failed_cases", "verdict")}
                                    for x in results]}))
+    # Keep production AV1 bank/dependency coverage in the registered host suite.
+    if ok and not args.ref and not args.mutations:
+        subprocess.run([sys.executable, "-B", str(ROOT / "drivers/media/platform/apple/avd/tests/av1-test.py"),
+                        str(args.output / "av1-banks")], check=True)
     return 0 if ok else 1
 
 

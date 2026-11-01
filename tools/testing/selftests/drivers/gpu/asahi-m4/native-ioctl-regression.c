@@ -170,7 +170,10 @@ struct compute_stats {
 
 static int compute_stats(struct compute_stats *s)
 {
-	FILE *file = fopen("/sys/kernel/debug/asahi-g16/stats", "re");
+	/* Kernels before the Aurora rename used "asahi-g16". */
+	FILE *file = fopen("/sys/kernel/debug/aurora-g16/stats", "re");
+	if (!file)
+		file = fopen("/sys/kernel/debug/asahi-g16/stats", "re");
 	char *line = NULL;
 	size_t size = 0;
 	bool compute = false, mixed = false, publications = false;
@@ -410,7 +413,7 @@ static int identity(const char *release, const char *boot, const char *source, c
 	if (n < 0) return -1;
 	target[n] = 0;
 	const char *owner = strrchr(target, '/');
-	if (!owner || strcmp(owner + 1, "asahi-g16") ||
+	if (!owner || (strcmp(owner + 1, "aurora-g16") && strcmp(owner + 1, "asahi-g16")) ||
 	    access("/sys/module/gpu_m4_drm", F_OK) == 0 ||
 	    access("/sys/module/apple_gpu_m4_power", F_OK) == 0) return -1;
 	return 0;

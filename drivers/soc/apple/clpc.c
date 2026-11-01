@@ -136,6 +136,7 @@ struct apple_clpc {
 	u32 saved_floor;
 	unsigned long samples;
 	unsigned long update_errors;
+	unsigned long gpu_read_errors;
 	struct dentry *debugfs;
 	struct regmap *gpu_pmgr;
 	struct apple_clpc_gpu *gpu;
@@ -422,6 +423,12 @@ static bool apple_clpc_gpu_streaming(struct apple_clpc *clpc, unsigned long now)
 
 	clpc->gpu_sampled = now;
 	err = regmap_read(clpc->gpu_pmgr, clpc->gpu_offset, &status);
+	if (err) {
+		clpc->gpu_read_errors++;
+		dev_warn_once(clpc->dev,
+			      "graphics power state read failed (%d); holding the GPU floor\n",
+			      err);
+	}
 	if (!err && (status & GENMASK(7, 4)) != GENMASK(7, 4)) {
 		clpc->gpu_on = false;
 		return false;
@@ -647,6 +654,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 			   clpc->gpu_floor_releases, clpc->gpu_floor_returns);
 		seq_printf(s, "gpu floor samples: streaming %lu dense %lu\n",
 			   clpc->gpu_streaming_samples, clpc->gpu_dense_samples);
+		seq_printf(s, "gpu read errors: %lu\n", clpc->gpu_read_errors);
 	}
 	for (i = 0; i < clpc->nr_clusters; i++)
 		seq_printf(s, "cluster cpu%u: busy %u%% level %u%% -> dcs %u soc %u\n",
@@ -711,6 +719,7 @@ static void apple_clpc_stop(void *data)
 static int apple_clpc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct device_node *gpu = NULL;
 	struct apple_clpc *clpc;
 	unsigned int rail, i;
 	int ret;
@@ -737,19 +746,18 @@ static int apple_clpc_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
-	if (clpc->hw->gpu_demand) {
-		struct device_node *gpu = of_parse_phandle(dev->of_node,
-							 "apple,gpu-power-state", 0);
-
-		if (!gpu)
-			return dev_err_probe(dev, -EINVAL, "missing graphics power state\n");
+	/* The property is optional: without it, CPU demand alone sets the floors. */
+	if (clpc->hw->gpu_demand)
+		gpu = of_parse_phandle(dev->of_node, "apple,gpu-power-state", 0);
+	if (gpu) {
 		ret = of_property_read_u32(gpu, "reg", &clpc->gpu_offset);
 		clpc->gpu_pmgr = syscon_node_to_regmap(gpu->parent);
 		of_node_put(gpu);
 		if (ret)
-			return ret;
+			return dev_err_probe(dev, ret, "graphics power state has no reg\n");
 		if (IS_ERR(clpc->gpu_pmgr))
-			return PTR_ERR(clpc->gpu_pmgr);
+			return dev_err_probe(dev, PTR_ERR(clpc->gpu_pmgr),
+					     "no regmap for the graphics power state\n");
 	}
 	if (!apple_pmc_rail_count(clpc->pmc))
 		return dev_err_probe(dev, -ENODEV, "parent is not a PMC\n");

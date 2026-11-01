@@ -263,6 +263,9 @@ impl<F: StoreIo> Store<F> {
             pr_info!("created a new host-state store\n");
             return Ok(store);
         }
+        if size < STORE_SIZE as u64 {
+            return Err(store.refuse(Damage::Size));
+        }
 
         let mut sb = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
         sb.resize(BLOCK_SIZE, 0, GFP_KERNEL)?;
@@ -357,6 +360,12 @@ impl<F: StoreIo> Store<F> {
 
     fn find_free(&self) -> Option<usize> {
         self.slots.iter().position(|s| !s.used)
+    }
+
+    /// Admission check for the copy-on-write slot used by the next write.
+    /// Even replacing an existing key needs a free slot until commit.
+    pub(crate) fn can_write(&self, key: &Key, len: usize) -> bool {
+        valid_kind(key.kind) && len <= MAX_VALUE && self.find_free().is_some()
     }
 
     fn block_offset(slot: usize) -> u64 {

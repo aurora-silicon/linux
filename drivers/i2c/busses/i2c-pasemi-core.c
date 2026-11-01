@@ -13,6 +13,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/pm_runtime.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
@@ -244,19 +245,29 @@ static int pasemi_i2c_xfer(struct i2c_adapter *adapter,
 	struct pasemi_smbus *smbus = adapter->algo_data;
 	int ret, i;
 
+	if (smbus->runtime_pm) {
+		ret = pm_runtime_resume_and_get(smbus->dev);
+		if (ret < 0)
+			return ret;
+	}
+
 	ret = pasemi_smb_clear(smbus);
 	if (ret)
-		return ret;
+		goto out;
 
 	for (i = 0; i < num && !ret; i++)
 		ret = pasemi_i2c_xfer_msg(adapter, &msgs[i], (i == (num - 1)));
 
+out:
+	if (smbus->runtime_pm)
+		pm_runtime_put_autosuspend(smbus->dev);
 	return ret ? ret : num;
 }
 
-static int pasemi_smb_xfer(struct i2c_adapter *adapter,
-		u16 addr, unsigned short flags, char read_write, u8 command,
-		int size, union i2c_smbus_data *data)
+static int pasemi_smb_xfer_unlocked(struct i2c_adapter *adapter, u16 addr,
+				    unsigned short flags, char read_write,
+				    u8 command, int size,
+				    union i2c_smbus_data *data)
 {
 	struct pasemi_smbus *smbus = adapter->algo_data;
 	unsigned int rd;
@@ -414,16 +425,47 @@ static u32 pasemi_smb_func(struct i2c_adapter *adapter)
 	       I2C_FUNC_SMBUS_BLOCK_PROC_CALL | I2C_FUNC_I2C;
 }
 
+static int pasemi_smb_xfer(struct i2c_adapter *adapter,
+			   u16 addr, unsigned short flags, char read_write,
+			   u8 command, int size, union i2c_smbus_data *data)
+{
+	struct pasemi_smbus *smbus = adapter->algo_data;
+	int ret;
+
+	if (smbus->runtime_pm) {
+		ret = pm_runtime_resume_and_get(smbus->dev);
+		if (ret < 0)
+			return ret;
+	}
+
+	ret = pasemi_smb_xfer_unlocked(adapter, addr, flags, read_write, command,
+				       size, data);
+	if (smbus->runtime_pm)
+		pm_runtime_put_autosuspend(smbus->dev);
+
+	return ret;
+}
+
 static const struct i2c_algorithm smbus_algorithm = {
 	.xfer = pasemi_i2c_xfer,
 	.smbus_xfer = pasemi_smb_xfer,
 	.functionality = pasemi_smb_func,
 };
 
-int pasemi_i2c_common_probe(struct pasemi_smbus *smbus)
+void pasemi_i2c_init(struct pasemi_smbus *smbus)
 {
-	int error;
+	init_completion(&smbus->irq_completion);
 
+	if (smbus->hw_rev != PASEMI_HW_REV_PCI)
+		smbus->hw_rev = reg_read(smbus, REG_REV);
+
+	reg_write(smbus, REG_IMASK, 0);
+	pasemi_reset(smbus);
+}
+EXPORT_SYMBOL_GPL(pasemi_i2c_init);
+
+int pasemi_i2c_register_adapter(struct pasemi_smbus *smbus)
+{
 	smbus->adapter.owner = THIS_MODULE;
 	snprintf(smbus->adapter.name, sizeof(smbus->adapter.name),
 		 "PA Semi SMBus adapter (%s)", dev_name(smbus->dev));
@@ -432,21 +474,14 @@ int pasemi_i2c_common_probe(struct pasemi_smbus *smbus)
 
 	/* set up the sysfs linkage to our parent device */
 	smbus->adapter.dev.parent = smbus->dev;
-	smbus->use_irq = 0;
-	init_completion(&smbus->irq_completion);
+	return devm_i2c_add_adapter(smbus->dev, &smbus->adapter);
+}
+EXPORT_SYMBOL_GPL(pasemi_i2c_register_adapter);
 
-	if (smbus->hw_rev != PASEMI_HW_REV_PCI)
-		smbus->hw_rev = reg_read(smbus, REG_REV);
-
-	reg_write(smbus, REG_IMASK, 0);
-
-	pasemi_reset(smbus);
-
-	error = devm_i2c_add_adapter(smbus->dev, &smbus->adapter);
-	if (error)
-		return error;
-
-	return 0;
+int pasemi_i2c_common_probe(struct pasemi_smbus *smbus)
+{
+	pasemi_i2c_init(smbus);
+	return pasemi_i2c_register_adapter(smbus);
 }
 EXPORT_SYMBOL_GPL(pasemi_i2c_common_probe);
 
@@ -459,6 +494,10 @@ irqreturn_t pasemi_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 EXPORT_SYMBOL_GPL(pasemi_irq_handler);
+
+#if IS_ENABLED(CONFIG_I2C_PASEMI_KUNIT_TEST)
+#include "i2c-pasemi-core-test.c"
+#endif
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Olof Johansson <olof@lixom.net>");

@@ -401,6 +401,13 @@ pub(crate) struct Fences {
     pub(crate) ready: Fence,
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
+    pub(crate) owner: Arc<Completion>,
+}
+
+impl super::dependency::Retention for Fences {
+    fn retained(&self) -> bool {
+        self.owner.retains_vm()
+    }
 }
 
 impl Fences {
@@ -418,8 +425,8 @@ impl Fences {
 impl<B: Backend> Scheduler<B> {
     pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
         let (credits, name) = match engine {
-            Engine::Render => (RENDER_CREDITS, c_str!("asahi_g17_render")),
-            Engine::Compute => (COMPUTE_CREDITS, c_str!("asahi_g17_compute")),
+            Engine::Render => (RENDER_CREDITS, c_str!("aurora_g17_render")),
+            Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
         let scheduler = sched::Scheduler::new(dev.as_ref().as_ref(), 1, credits, 0, TIMEOUT_MS, name)?;
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
@@ -479,6 +486,6 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, completed, publication: host_publication })
+        Ok(Fences { ready, completed, publication: host_publication, owner: packet.completion.clone() })
     }
 }

@@ -3,7 +3,9 @@
 """Execute the actual report probe -> entry seed -> DCP -> PMP -> G15 graph.
 
 The actual overlay supplies the report entries. OF storage, allocation, MMIO,
-workqueue execution and the PMP hardware operations are typed host boundaries.
+workqueue execution, DRAM parsing, sysfs registration and PMP hardware operations
+are typed host boundaries. The DRAM parser itself has firmware-property KUnit
+coverage; this suite checks its probe integration and the actual sysfs readers.
 The production probe, descriptor validation, startup, waiter and supplier/command
 bodies are extracted verbatim. This is not a firmware or hardware test.
 """
@@ -39,7 +41,8 @@ def main():
              'static bool apple_pmp_start_stopping(', 'static void apple_pmp_start_work(',
              'static void apple_pmp_start_drain(', 'static int apple_pmp_start_init(',
              'static int apple_pmp_start_wait(', 'int apple_pmp_report_wait_ready(',
-             'static int apple_pmp_report_set_state(', 'static int apple_pmp_report_entry_set_state(',
+             'static int apple_pmp_report_set_state(', 'static void apple_pmp_report_dvfs_write(',
+             'static int apple_pmp_report_entry_set_state(',
              'static int apple_pmp_report_entry_power_on(', 'static int apple_pmp_report_entry_power_off(',
              'static void apple_pmp_report_entry_free(', 'static int apple_pmp_report_entry_probe(',
              'static int apple_pmp_report_probe(', 'static struct device_node *apple_pmp_report_t6030_entry(',
@@ -48,10 +51,31 @@ def main():
         names.insert(0, 'static bool apple_pmp_report_running(')
     if 'static int apple_pmp_report_wait_t6030_bound(' in source:
         names.insert(names.index('static struct device_node *apple_pmp_report_t6030_entry('), 'static int apple_pmp_report_wait_t6030_bound(')
+    # System sleep (apple,release-for-sleep), where the source has it.
+    sleep = 'static int apple_pmp_report_entry_sleep(' in source
+    if sleep:
+        at = names.index('static int apple_pmp_report_entry_power_on(')
+        names[at:at] = ['static int apple_pmp_report_entry_sleep(',
+                        'static int apple_pmp_report_entry_suspend_noirq(',
+                        'static int apple_pmp_report_entry_resume_noirq(']
     offsets = re.search(r'static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = \{.*?\n\};', source, re.S)[0]
     functions = '\n'.join(extract.function(source, n) for n in names)
     validation = re.sub(r'^#include .*\n', '', (ROOT / 'drivers/pmdomain/apple/pmp-report-validation.h').read_text(), flags=re.M)
-    code = offsets + '\n' + validation + '\n' + functions
+    dram_type = re.search(r'struct apple_pmp_dram \{.*?\n\};',
+                          (ROOT / 'drivers/pmdomain/apple/pmp-dram.h').read_text(), re.S)[0]
+    has_dram = 'ret = apple_pmp_dram_parse(' in source
+    assert has_dram or args.ref, 'DRAM probe hook missing from production source'
+    (args.output / 'dram-type.h').write_text(f'#define HOST_HAS_DRAM {int(has_dram)}\n' + dram_type + '\n')
+    # Keep the real readers, modes and group wired into the extracted probe.
+    dram_attrs = source[source.index('static ssize_t type_show('):
+                        source.index('static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;')] if has_dram else ''
+    # Kernel sysfs callbacks intentionally leave the attribute argument unused.
+    # Match the kernel warning policy only around those verbatim callbacks.
+    dram_attrs = ('#pragma GCC diagnostic push\n'
+                  '#pragma GCC diagnostic ignored "-Wunused-parameter"\n' +
+                  dram_attrs + '#pragma GCC diagnostic pop\n')
+    code = (('#define HAVE_SLEEP_RELEASE 1\n' if sleep else '') + offsets + '\n' + validation +
+            '\n' + dram_attrs + '\n' + functions)
     # The actual overlay must still describe a halted supplier and disabled DMA/mailbox.
     assert overlay.count('status = \"disabled\";') >= 3
     (args.output / 'production.h').write_text(code)
@@ -70,7 +94,21 @@ def main():
     print(result.stdout + result.stderr)
     mutations = []
     if args.mutations:
-        controls = [
+        dram_controls = [
+            ('no-dram-parse', 'ret = apple_pmp_dram_parse(dev_fwnode(dev), &rep->dram);',
+             'ret = -ENODATA; (void)apple_pmp_dram_parse; (void)dev_fwnode;'),
+            ('reject-absent-dram', 'ret && ret != -ENODATA', 'ret'),
+            ('ignore-invalid-dram', 'ret && ret != -ENODATA', 'false'),
+            ('no-dram-group', 'ret = devm_device_add_group(dev, &apple_pmp_dram_group);',
+             'ret = 0; (void)devm_device_add_group; (void)apple_pmp_dram_group;'),
+            ('ignore-dram-group-error', 'ret = devm_device_add_group(dev, &apple_pmp_dram_group);',
+             '(void)devm_device_add_group(dev, &apple_pmp_dram_group); ret = 0;'),
+            ('dram-group-without-metadata', 'if (!ret) {\n\t\tret = devm_device_add_group',
+             'if (ret == -ENODATA) {\n\t\tret = devm_device_add_group'),
+            ('dram-wrong-rate-reader', 'APPLE_PMP_DRAM_ATTR(max_data_rate, max_rate,',
+             'APPLE_PMP_DRAM_ATTR(max_data_rate, peak_bandwidth,'),
+        ]
+        controls = (dram_controls if has_dram else []) + [
             ('no-managed-owner', '.starts_pmp = IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK)', '.starts_pmp = false'),
             ('no-managed-probe', 'ret = apple_pmp_start_init(rep);', 'ret = 0; (void)apple_pmp_start_init;'),
             ('no-child-seeding', 'apple_pmp_report_entry_set_state(&ent->genpd, true);', '(void)0;'),
@@ -86,6 +124,13 @@ def main():
             ('irq-safe-without-property', 'of_property_read_bool(node, "apple,irq-safe")', 'true'),
             ('skip-supplier-wait', 'apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms))', '((void)timeout_ms, 0)'),
         ]
+        if sleep:
+            controls += [
+                ('sleep-releases-unacked', '!(readq(rep->base + rep->offsets->actual) & BIT_ULL(ent->id))', 'false'),
+                ('sleep-not-reasserted', 'ret = apple_pmp_report_entry_sleep(ent, false);', 'ret = 0;'),
+                ('sleep-ignores-mark', '!ent->sleep_release ||', ''),
+                ('sleep-not-rewritten', '++tries < 3', '++tries < 1'),
+            ]
         for name, old, new in controls:
             assert code.count(old) == 1, (name, code.count(old))
             (args.output / 'production.h').write_text(code.replace(old, new))

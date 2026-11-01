@@ -6,11 +6,11 @@
 
 #include <linux/hrtimer.h>
 #include <linux/list.h>
+#include <linux/maple_tree.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 
-#include <drm/drm_mm.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-core.h>
@@ -82,7 +82,6 @@ enum isp_firmware_version {
 };
 
 struct isp_surf {
-	struct drm_mm_node *mm;
 	struct list_head head;
 	u64 size;
 	u64 type;
@@ -94,6 +93,7 @@ struct isp_surf {
 	refcount_t refcount;
 	bool gc;
 	bool submitted;
+	bool iova_reserved; /* @iova comes from &apple_isp.iovas */
 };
 
 struct isp_message {
@@ -201,6 +201,9 @@ struct apple_isp_hw {
 	/* size of a capture metadata buffer, 0 for no such pool */
 	u32 capture_meta_size;
 
+	/* metadata buffers carry the frame's exposure report (H17 firmware) */
+	bool meta_exposure;
+
 	/*
 	 * The firmware can be started only once per system boot, so it is
 	 * started at probe and kept running while the driver is bound.
@@ -302,6 +305,13 @@ struct apple_isp {
 	struct v4l2_device v4l2_dev;
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *exposure_priority;
+	struct v4l2_ctrl *power_line_frequency;
+	/* read-only exposure report of the last frame, NULL without one */
+	struct v4l2_ctrl *gain;
+	struct v4l2_ctrl *exposure;
+	/* last reported total gain (1/256 steps) and exposure (us) */
+	u32 frame_gain;
+	u32 frame_exposure_us;
 	struct vb2_queue vbq;
 	struct mutex video_lock;
 	unsigned int sequence;
@@ -325,10 +335,10 @@ struct apple_isp {
 
 	struct iommu_domain *domain;
 	unsigned long shift;
-	struct drm_mm iovad; /* TODO iova.c can't allocate bottom-up */
-	u64 iova_size; /* size of the iovad range */
+	/* allocated IOVA ranges, in IOMMU pages, lowest free range first */
+	struct maple_tree iovas;
+	u64 iova_size; /* size of the range @iovas allocates from */
 	u64 fw_iova_mask; /* see isp_fw_iova() */
-	struct mutex iovad_lock;
 
 	struct isp_firmware {
 		u64 heap_base;
@@ -378,7 +388,17 @@ struct apple_isp {
 	struct list_head bufs_returned;
 	u64 buffer_tag;
 	unsigned long meta_returned;
-	/* A timed-out command leaves slot ownership ambiguous until reboot. */
+	/*
+	 * The channel of a timed-out request that has not been answered yet,
+	 * see isp_ipc_resync(). Sends are serialized by the callers, which
+	 * share the command area.
+	 */
+	struct isp_channel *ipc_stale;
+	/*
+	 * Not even a late answer came, so where the firmware is in the ring
+	 * is unknown. Nothing is sent until the firmware is stopped, and
+	 * resident firmware cannot be started again before the next boot.
+	 */
 	bool ipc_failed;
 };
 

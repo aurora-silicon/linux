@@ -1542,9 +1542,16 @@ fn to_kvec<const N: usize>(
     Ok(v)
 }
 
+/// The first PCM device number of the back-ends' internal PCMs, above every front-end's.
+const BE_PCM_BASE: i32 = 16;
+
 fn component_driver(name: &'static CStr) -> bindings::snd_soc_component_driver {
     bindings::snd_soc_component_driver {
         name: name.as_char_ptr(),
+        // A front-end's PCM device is its link number, so a front-end that macaudio leaves
+        // unbound (one that only completes the fixed routes) does not renumber the others.
+        use_dai_pcm_id: true,
+        be_pcm_base: BE_PCM_BASE,
         open: Some(pcm_open),
         close: Some(pcm_close),
         hw_params: Some(pcm_hw_params),

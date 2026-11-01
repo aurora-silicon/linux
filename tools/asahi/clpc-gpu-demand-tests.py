@@ -58,6 +58,8 @@ typedef uint64_t u64;
 #define time_after(a,b) ((long)((a)-(b)) > 0)
 #define time_before(a,b) ((long)((a)-(b)) < 0)
 #define msecs_to_jiffies(ms) (ms)
+static int warned;
+#define dev_warn_once(d, ...) ((void)(d), warned++)
 enum apple_clpc_rail { APPLE_CLPC_DCS, APPLE_CLPC_SOC, APPLE_CLPC_RAILS };
 ''' + types + r'''
 struct apple_clpc_gpu { bool active; u64 sequence; };
@@ -67,7 +69,8 @@ struct apple_clpc {
  struct apple_clpc_cluster clusters[1];
  struct apple_clpc_vote vote[APPLE_CLPC_RAILS];
  unsigned int nr_clusters, agent;
- unsigned long samples, next_scan, update_errors;
+ unsigned long samples, next_scan, update_errors, gpu_read_errors;
+ void *dev;
  void *covered, *pmc, *gpu_pmgr;
  u32 gpu_offset, mask, last_floor, last_reason;
  bool gpu_on, gpu_limited, gpu_floor_released;
@@ -110,9 +113,12 @@ static void check_t8132(void) {
  assert(published==0x35 && c.last_reason==16);
  jiffies=132; apple_clpc_sample(&c); assert(published==0 && queued_idle);
  // A failed power-state read still protects an active graphics consumer.
- jiffies=200; pmgr_status=0xe0; read_error=-EIO;
+ jiffies=200; pmgr_status=0xe0; read_error=-EIO; warned=0;
  apple_clpc_sample(&c); assert(published==0x35);
+ // The failure is counted for debugfs and warned about once.
+ assert(c.gpu_read_errors==1 && warned==1);
  jiffies=232; read_error=0; apple_clpc_sample(&c); assert(published==0);
+ assert(c.gpu_read_errors==1);
 }
 
 static void check_t8140(void) {
@@ -199,6 +205,7 @@ int main(void) {
             ('dense-ignores-late', code.replace('if (!threshold || late || submissions < threshold)',
                                                 'if (!threshold || (late && false) || submissions < threshold)')),
             ('uncounted-floor-return', code.replace('clpc->gpu_floor_returns++;', 'clpc->gpu_floor_returns += 0;')),
+            ('uncounted-read-error', code.replace('clpc->gpu_read_errors++;', 'clpc->gpu_read_errors += 0;')),
             ('omit-pmp-backoff', code.replace('bool released = apple_clpc_gpu_limited(clpc, now);',
                                               'bool released = (apple_clpc_gpu_limited(clpc, now), false);')),
             ('release-too-early', code.replace('msecs_to_jiffies(APPLE_CLPC_HOLD_MS)', '0')),

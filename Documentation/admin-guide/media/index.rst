@@ -43,6 +43,7 @@ Documentation/process/debugging/media_specific_debugging_guide.rst
 
 	v4l-drivers
 	dvb-drivers
+	apple-ave
 
 **Copyright** |copy| 1999-2020 : LinuxTV Developers
 

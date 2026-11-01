@@ -116,6 +116,7 @@ static void put_unaligned_le32(u32 v,u8*p){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>2
 #define for_each_set_bit(i,b,n) for((i)=0;(i)<(n);(i)++) if((b)[(i)/64]&(1ULL<<((i)%64)))
 #define bitmap_zero(b,n) memset((b),0,((n)+63)/64*8)
 #define IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT 128
+#define IEEE80211_CHAN_NO_HE 256
 #define NL80211_RRF_NO_IR (1<<7)
 struct ieee80211_channel {unsigned flags,hw_value;int max_power;enum nl80211_band band;int center_freq;s8 psd;};
 static u64 get_unaligned_le64(const u8*p){return get_unaligned_le32(p)|(u64)get_unaligned_le32(p+4)<<32;}
@@ -131,7 +132,7 @@ static void rtnl_lock(void){assert(!rtnl_depth++);}
 static void rtnl_unlock(void){assert(rtnl_depth--==1);}
 static void wiphy_lock(struct wiphy*w){assert(rtnl_depth&& !wiphy_depth++);}
 static void wiphy_unlock(struct wiphy*w){assert(wiphy_depth--==1);}
-struct mt7932 {struct ieee80211_channel channels[MT7932_CHANNELS_2G],channels5[MT7932_CHANNELS_5G],channels6[MT7932_CHANNELS_6G];struct wiphy*wiphy;struct net_device*netdev;struct {struct device dev;}*pdev;struct mt7932_reg_snapshot reg_desired,reg_deferred;unsigned reg_generation,response_lock,startup_work;bool reg_pending,stopping,interface_registered,connecting,connected,disconnecting,reg_deferral,data_ready;int data_lock;int connect_error,assoc_start,assoc_done,discovery_done;uint64_t policy_disabled[(MT7932_CHANNELS+63)/64];};
+struct mt7932 {struct ieee80211_channel channels[MT7932_CHANNELS_2G],channels5[MT7932_CHANNELS_5G],channels6[MT7932_CHANNELS_6G];struct wiphy*wiphy;struct net_device*netdev;struct {struct device dev;}*pdev;struct mt7932_reg_snapshot reg_desired,reg_deferred;unsigned reg_generation,response_lock,startup_work;bool reg_pending,stopping,interface_registered,connecting,connected,disconnecting,reg_deferral,data_ready,six_ap_valid,roam_moving;int data_lock;int connect_error,assoc_start,assoc_done,discovery_done;uint64_t policy_disabled[(MT7932_CHANNELS+63)/64];};
 #define spin_lock(l) ((void)(l))
 #define spin_unlock(l) ((void)(l))
 static void mt_data_kick_locked(struct mt7932*m){assert(0 && "unexpected TX boundary");}
@@ -191,7 +192,14 @@ int main(int argc,char**argv){
    memset(tables[t]+44+j*122,0xc4,122);tables[t][44+j*122]=c->hw_value;
    if(i!=10)tables[t][45+j*122]=1;
   }
-  /* 6 GHz: VLP permission bitmap, NO_IR until cfg80211's rule lifts it, PSD limits. */
+  /* The VLP-client flag gates the selected AP class, not the whole
+   * country domain: the same channel can still admit LPI.
+   */
+  assert(mt7932_6g_class(2,0)==MT7932_6G_VLP);
+  assert(mt7932_6g_class(2,IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT)==-EACCES);
+  assert(mt7932_6g_class(0,IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT)==MT7932_6G_LPI);
+  assert(mt7932_6g_class(1,0)==-EOPNOTSUPP);
+  /* Country bitmap, NO_IR until cfg80211's rule lifts it, PSD limits. */
   p.six_channels=GENMASK_ULL(MT7932_CHANNELS_6G-1,0)&~BIT_ULL(3);
   for(unsigned k=0;k<MT7932_CHANNELS_6G;k++){
    struct ieee80211_channel*c=mt_channel(&m,N25+k);assert(c==&m.channels6[k]);
@@ -202,14 +210,15 @@ int main(int argc,char**argv){
   /* Channel numbers mean nothing without their band. */
   assert(mt7932_policy_permits(&p,NL80211_BAND_2GHZ,13)&&!mt7932_policy_permits(&p,NL80211_BAND_6GHZ,13)&&mt7932_policy_permits(&p,NL80211_BAND_6GHZ,1));
   assert(!mt7932_policy_permits(&p,NL80211_BAND_5GHZ,1)&&!mt7932_policy_permits(&p,NL80211_BAND_2GHZ,36)&&!mt7932_policy_permits(&p,NL80211_BAND_6GHZ,3)&&!mt7932_policy_permits(&p,NUM_NL80211_BANDS,1));
-  struct regulatory_request request={.alpha2={'U','S'}};rule_lookups=0;mt_regulatory_notify(&w,&request);m.reg_pending=false;
+  struct regulatory_request request={.alpha2={'U','S'}};rule_lookups=0;m.six_ap_valid=true;mt_regulatory_notify(&w,&request);m.reg_pending=false;
+  assert(!m.six_ap_valid);
   assert(rule_lookups==MT7932_CHANNELS_6G);
-  /* The VLP-client channel stays out of the firmware domain; the others lose NO_IR there. */
-  assert(m.reg_desired.length==12+(MT7932_CHANNELS-1)*8&&m.reg_desired.domain[8]==13&&m.reg_desired.domain[9]==MT7932_CHANNELS_5G&&m.reg_desired.domain[10]==MT7932_CHANNELS_6G-1);
-  for(unsigned i=0;i<MT7932_CHANNELS-1;i++){
+  /* All country channels remain available for class admission; NO_IR is lifted in the domain. */
+  assert(m.reg_desired.length==12+MT7932_CHANNELS*8&&m.reg_desired.domain[8]==13&&m.reg_desired.domain[9]==MT7932_CHANNELS_5G&&m.reg_desired.domain[10]==MT7932_CHANNELS_6G);
+  for(unsigned i=0;i<MT7932_CHANNELS;i++){
    const u8*e=m.reg_desired.domain+12+i*8;u32 f=get_unaligned_le32(e+4);
    if(i<N25)assert(get_unaligned_le16(e)==mt_channel(&m,i)->hw_value&&!f);
-   else{unsigned k=i-N25+(i>=VLP);assert(get_unaligned_le16(e)==mt7932_channel_6g(k)&&f==IEEE80211_CHAN_PSD);}
+   else{unsigned k=i-N25;u32 expected=IEEE80211_CHAN_PSD|(i==VLP?IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT:0);assert(get_unaligned_le16(e)==mt7932_channel_6g(k)&&f==expected);}
   }
   for(unsigned k=0;k<MT7932_CHANNELS_6G;k++)assert(m.reg_desired.power[N25+k]==14&&m.reg_desired.psd[N25+k]==-1);
   unsigned generation=m.reg_generation;mt_policy_disable(&m,&p,generation-1);assert(!m.channels[10].flags&&!m.policy_disabled[0]&&!m.policy_disabled[1]);
@@ -219,8 +228,8 @@ int main(int argc,char**argv){
   assert(rule_lookups==MT7932_CHANNELS_6G-1&&(m.channels6[3].flags&IEEE80211_CHAN_DISABLED)&&(m.channels6[3].flags&IEEE80211_CHAN_NO_IR));
   for(unsigned k=0;k<MT7932_CHANNELS_6G;k++)if(k!=3)assert(!(m.channels6[k].flags&(IEEE80211_CHAN_NO_IR|IEEE80211_CHAN_DISABLED)));
   struct mt7932_reg_snapshot reg=m.reg_desired;mt7932_policy_filter(&reg,&p);
-  assert(reg.length==12+(MT7932_CHANNELS-3)*8&&reg.domain[8]==12&&reg.domain[9]==MT7932_CHANNELS_5G&&reg.domain[10]==MT7932_CHANNELS_6G-2);
-  for(unsigned i=0;i<MT7932_CHANNELS-3;i++){unsigned c=get_unaligned_le16(reg.domain+12+i*8);assert(i<12?c!=11:i>=N25-1?c!=13:true);}
+  assert(reg.length==12+(MT7932_CHANNELS-2)*8&&reg.domain[8]==12&&reg.domain[9]==MT7932_CHANNELS_5G&&reg.domain[10]==MT7932_CHANNELS_6G-1);
+  for(unsigned i=0;i<MT7932_CHANNELS-2;i++){unsigned c=get_unaligned_le16(reg.domain+12+i*8);assert(i<12?c!=11:i>=N25-1?c!=13:true);}
   /* A rule that keeps NO_IR, or no rule at all, leaves the channel passive. */
   m.channels6[0].flags|=IEEE80211_CHAN_NO_IR;m.channels6[1].flags|=IEEE80211_CHAN_NO_IR;
   rule6.flags=NL80211_RRF_NO_IR;mt_policy_disable(&m,&p,generation);assert(m.channels6[0].flags&IEEE80211_CHAN_NO_IR);
@@ -236,6 +245,10 @@ int main(int argc,char**argv){
   assert(m.reg_generation==applied&&!m.reg_pending&&m.reg_deferral);
   assert(get_unaligned_le32(m.reg_desired.domain+16)==IEEE80211_CHAN_NO_IR);
   assert(get_unaligned_le32(m.reg_deferred.domain+16)==0);
+  /* A move to another AP carries the connection on: still deferred. */
+  m.connected=false;m.roam_moving=true;m.reg_deferral=false;mt_regulatory_notify(&w,&request);
+  assert(m.reg_generation==applied&&!m.reg_pending&&m.reg_deferral&&get_unaligned_le32(m.reg_desired.domain+16)==IEEE80211_CHAN_NO_IR);
+  m.roam_moving=false;
   m.stopping=true;unsigned n=m.reg_generation;request.alpha2[0]='U';mt_regulatory_notify(&w,&request);assert(m.reg_generation==n);
  }
  puts("PASS");return 0;
@@ -255,6 +268,7 @@ def main():
         'drivers/soc/apple/dockchannel.c': ['dockchannel_init_wakeup'],
         'drivers/soc/apple/pm_shim.c': ['sep_pm_release_domains', 'sep_pm_keep_domains'],
         'drivers/usb/dwc3/dwc3-apple.c': ['dwc3_apple_core_stop', 'dwc3_apple_init', 'dwc3_apple_exit'],
+        'drivers/net/wireless/mediatek/mt7932/six.h': ['mt7932_6g_class'],
         'drivers/net/wireless/mediatek/mt7932/startup.c': ['mt_channel', 'mt_policy_disable', 'mt_regulatory_notify'],
     }
     bodies = {}
@@ -267,7 +281,13 @@ def main():
             bodies[name] = function(text, name)
     headers = [ROOT/'drivers/net/wireless/mediatek/mt7932/channels.h',
                ROOT/'drivers/net/wireless/mediatek/mt7932/regulatory.h']
-    header = '\n'.join(re.sub(r'^#include .*\n', '', path.read_text(), flags=re.M)
+    # regulatory.h's class parser/pages depend on the production enum.
+    # Extract only that declaration, avoiding the unrelated HE/TPE helpers.
+    six = (ROOT/'drivers/net/wireless/mediatek/mt7932/six.h').read_text()
+    power_class = re.search(r'^enum mt7932_6g_class \{[^}]*\};', six, re.M)
+    if not power_class:
+        raise ValueError('MT7932 6 GHz class enum')
+    header = power_class[0] + '\n' + '\n'.join(re.sub(r'^#include .*\n', '', path.read_text(), flags=re.M)
                        for path in headers)
     # The receive IRQ request statement from dockchannel_init(), run against a recording stub.
     dock = (ROOT/'drivers/soc/apple/dockchannel.c').read_text()
@@ -287,7 +307,7 @@ def main():
         'rx-suspend': ('IRQF_NO_AUTOEN | IRQF_NO_SUSPEND', 'IRQF_NO_AUTOEN'),
         'stale-policy': ('generation != READ_ONCE(m->reg_generation)', 'false'),
         'usb-rpm': ('pm_runtime_put_autosuspend(appledwc->dev);', '(void)0;'),
-        'vlp-client': ('if (flags & IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT)', 'if (0)'),
+        'vlp-client': ('return flags & IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT ?', 'return false ?'),
         'six-band': ('(policy->six_channels & BIT_ULL((channel - 1) / 4))', 'true'),
     }
     if args.mutation:

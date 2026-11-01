@@ -64,28 +64,44 @@ struct apple_drm_private {
 };
 
 /* Component readiness is later than platform probe/bind. */
-static DEFINE_MUTEX(apple_t6030_display_lock);
+static DEFINE_MUTEX(apple_g15_display_lock);
 static struct device *apple_t6030_display;
+static struct device *apple_t6031_display;
 
-static int apple_t6030_display_publish(struct device *dev)
+/* The publication slot of a G15 SoC's internal display subsystem, or NULL. */
+static struct device **apple_g15_display_slot(struct device *dev)
 {
-	if (!of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
+	if (of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
+		return &apple_t6030_display;
+	if (of_device_is_compatible(dev->of_node, "apple,t6031-display-subsystem"))
+		return &apple_t6031_display;
+	return NULL;
+}
+
+static int apple_g15_display_publish(struct device *dev)
+{
+	struct device **slot = apple_g15_display_slot(dev);
+
+	if (!slot)
 		return 0;
-	guard(mutex)(&apple_t6030_display_lock);
-	if (apple_t6030_display)
-		return apple_t6030_display == dev ? 0 : -EBUSY;
-	apple_t6030_display = get_device(dev);
+	guard(mutex)(&apple_g15_display_lock);
+	if (*slot)
+		return *slot == dev ? 0 : -EBUSY;
+	*slot = get_device(dev);
 	return 0;
 }
 
-static void apple_t6030_display_withdraw(struct device *dev)
+static void apple_g15_display_withdraw(struct device *dev)
 {
+	struct device **slot = apple_g15_display_slot(dev);
 	struct device *old = NULL;
 
-	scoped_guard(mutex, &apple_t6030_display_lock) {
-		if (apple_t6030_display == dev) {
-			old = apple_t6030_display;
-			apple_t6030_display = NULL;
+	if (!slot)
+		return;
+	scoped_guard(mutex, &apple_g15_display_lock) {
+		if (*slot == dev) {
+			old = *slot;
+			*slot = NULL;
 		}
 	}
 	put_device(old);
@@ -96,21 +112,34 @@ static void apple_t6030_display_withdraw(struct device *dev)
  * publish separately. This lock protects only publication and a device link;
  * no display calls or firmware RPC run while it is held.
  */
-int apple_drm_t6030_link_device(struct device *consumer)
+static int apple_g15_link_device(struct device *consumer, const char *machine,
+				 const char *gpu, struct device **display)
 {
 	struct device_link *link;
 
-	if (!of_machine_is_compatible("apple,t6030") || !consumer->of_node ||
-	    !of_device_is_compatible(consumer->of_node, "apple,agx-t6030"))
+	if (!of_machine_is_compatible(machine) || !consumer->of_node ||
+	    !of_device_is_compatible(consumer->of_node, gpu))
 		return -ENODEV;
-	guard(mutex)(&apple_t6030_display_lock);
-	if (!apple_t6030_display)
+	guard(mutex)(&apple_g15_display_lock);
+	if (!*display)
 		return -EPROBE_DEFER;
-	link = device_link_add(consumer, apple_t6030_display,
-			       DL_FLAG_AUTOREMOVE_CONSUMER);
+	link = device_link_add(consumer, *display, DL_FLAG_AUTOREMOVE_CONSUMER);
 	return link ? 0 : -EINVAL;
 }
+
+int apple_drm_t6030_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t6030", "apple,agx-t6030",
+				     &apple_t6030_display);
+}
 EXPORT_SYMBOL_GPL(apple_drm_t6030_link_device);
+
+int apple_drm_t6031_link_device(struct device *consumer)
+{
+	return apple_g15_link_device(consumer, "apple,t6031", "apple,agx-t6031",
+				     &apple_t6031_display);
+}
+EXPORT_SYMBOL_GPL(apple_drm_t6031_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
@@ -150,14 +179,86 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 #endif
 
 /*
+ * HDR is asked for by the compositor that set it, but connector properties
+ * outlive their client.  When it exits, the next client (Plymouth at
+ * shutdown, the fbdev console) would inherit HDR_OUTPUT_METADATA and BT.2020
+ * and have its SDR frames shown as PQ, at the panel's peak.  So when a
+ * former master closes and no client has taken over, take its outputs back
+ * to SDR the way an HDR-off commit from it would.  A master that only drops
+ * master for a VT switch keeps its state: it comes back without resending
+ * it.
+ */
+static void apple_drm_reset_hdr(struct drm_device *dev)
+{
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_connector_list_iter iter;
+	struct drm_atomic_commit *state;
+	struct drm_connector *conn;
+	bool changed;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_atomic_commit_alloc(dev);
+	if (!state)
+		goto out_ctx;
+	state->acquire_ctx = &ctx;
+retry:
+	changed = false;
+	ret = drm_modeset_lock(&dev->mode_config.connection_mutex, &ctx);
+	if (ret)
+		goto out;
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(conn, &iter) {
+		struct drm_connector_state *cs = conn->state;
+
+		if (!cs->crtc || (!cs->hdr_output_metadata &&
+				  cs->colorspace == DRM_MODE_COLORIMETRY_DEFAULT))
+			continue;
+		cs = drm_atomic_get_connector_state(state, conn);
+		if (IS_ERR(cs)) {
+			ret = PTR_ERR(cs);
+			break;
+		}
+		drm_property_blob_put(cs->hdr_output_metadata);
+		cs->hdr_output_metadata = NULL;
+		cs->colorspace = DRM_MODE_COLORIMETRY_DEFAULT;
+		changed = true;
+	}
+	drm_connector_list_iter_end(&iter);
+	if (!ret && changed)
+		ret = drm_atomic_commit(state);
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_commit_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+	if (ret)
+		drm_warn(dev, "HDR output state kept after the DRM master left (%d)\n",
+			 ret);
+	drm_atomic_commit_put(state);
+out_ctx:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+}
+
+/*
  * A compositor or boot splash is closing the device.  drm_release() has
  * already taken its file off the file list, so the Type-C fabric can tell
  * whether any other one still has the device open.
  */
 static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
 {
-	if (file->was_master)
-		dcp_typec_reorder();
+	bool unowned;
+
+	if (!file->was_master)
+		return;
+	dcp_typec_reorder();
+	mutex_lock(&drm->master_mutex);
+	unowned = !drm->master;
+	mutex_unlock(&drm->master_mutex);
+	if (unowned)
+		apple_drm_reset_hdr(drm);
 }
 
 static const struct drm_driver apple_drm_driver = {
@@ -553,7 +654,18 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 	return NULL;
 }
 
-/* The output color element follows the HDR metadata: a change is a modeset. */
+/* The EOTF a connector state asks for, an HDMI_EOTF_* value. */
+static u8 apple_connector_eotf(const struct drm_connector_state *state)
+{
+	const struct hdr_output_metadata *hdr;
+
+	if (!state->hdr_output_metadata ||
+	    state->hdr_output_metadata->length != sizeof(*hdr))
+		return HDMI_EOTF_TRADITIONAL_GAMMA_SDR;
+	hdr = state->hdr_output_metadata->data;
+	return hdr->hdmi_metadata_type1.eotf;
+}
+
 static int apple_connector_atomic_check(struct drm_connector *conn,
 					struct drm_atomic_commit *state)
 {
@@ -567,6 +679,17 @@ static int apple_connector_atomic_check(struct drm_connector *conn,
 	crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
 	if (IS_ERR(crtc_state))
 		return PTR_ERR(crtc_state);
+	/*
+	 * The output colour element follows the EOTF and colorspace, so a
+	 * change of either is a mode set.  Where the firmware takes HDR10
+	 * static metadata on a live link, a new block alone is sent with this
+	 * commit's flush (dcp_hdr_metadata_sync()) and the colour mode stays.
+	 */
+	if (old->colorspace == new->colorspace && old->crtc == new->crtc &&
+	    apple_connector_eotf(old) == apple_connector_eotf(new) &&
+	    to_apple_connector(conn)->dcp &&
+	    dcp_hdr_metadata_live(to_apple_connector(conn)->dcp))
+		return 0;
 	crtc_state->mode_changed = true;
 	return 0;
 }
@@ -577,6 +700,29 @@ static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 	.atomic_best_encoder	= apple_connector_atomic_best_encoder,
 	.atomic_check		= apple_connector_atomic_check,
 };
+
+/*
+ * A desktop 26.x panel shows PQ as EDR (see dcp_edr_prepare()): PQ 100 cd/m²
+ * lands on the white the backlight sets, and brighter levels use the
+ * headroom above it, up to the panel's peak. macOS uses the panel the same
+ * way. PQ_REFERENCE_LUMINANCE tells a compositor where that white is in PQ,
+ * so it can put its reference white there and keep using the backlight as
+ * the brightness control in PQ.
+ */
+#define DCP_EDR_PQ_REFERENCE_NITS	100
+
+static int apple_connector_attach_pq_reference(struct drm_connector *connector)
+{
+	struct drm_property *prop;
+
+	prop = drm_property_create_range(connector->dev, DRM_MODE_PROP_IMMUTABLE,
+					 "PQ_REFERENCE_LUMINANCE", 0, 10000);
+	if (!prop)
+		return -ENOMEM;
+	drm_object_attach_property(&connector->base, prop,
+				   DCP_EDR_PQ_REFERENCE_NITS);
+	return 0;
+}
 
 /*
  * External displays can take a PQ BT.2020 signal where the firmware
@@ -611,6 +757,8 @@ static int apple_connector_attach_hdr(struct drm_connector *connector,
 	if (ret)
 		return ret;
 	drm_connector_attach_hdr_output_metadata_property(connector);
+	if (connector->connector_type == DRM_MODE_CONNECTOR_eDP)
+		return apple_connector_attach_pq_reference(connector);
 	return 0;
 }
 
@@ -1316,7 +1464,7 @@ static int apple_drm_init(struct device *dev)
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
 	/* A subsequent successful platform probe retries deferred GPU probes. */
-	ret = apple_t6030_display_publish(dev);
+	ret = apple_g15_display_publish(dev);
 	if (ret) {
 		drm_dev_unregister(&apple->drm);
 		goto err_unbind;
@@ -1338,7 +1486,7 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	apple_t6030_display_withdraw(dev);
+	apple_g15_display_withdraw(dev);
 
 	/* An aborted takeover leaves its DCPs running until the reboot. */
 	if (apple->aborted)
@@ -1559,3 +1707,10 @@ module_exit(appledrm_unregister);
 MODULE_AUTHOR("Asahi Linux contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("Dual MIT/GPL");
+/*
+ * The DCPs take their HDMI and Type-C route mux controls from the display
+ * crossbar. Without this, initramfs generators leave it out, it loads only
+ * from the root filesystem, and a DCP probe that waits past the deferred
+ * probe timeout (an encrypted root's passphrase prompt) gives up its routes.
+ */
+MODULE_SOFTDEP("pre: mux-apple-display-crossbar");

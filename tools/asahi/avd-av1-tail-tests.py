@@ -15,7 +15,7 @@ DRIVER = Path('drivers/media/platform/apple/avd')
 
 
 def function(source, name):
-    match = re.search(r'^(?:static )?(?:int|void)\s+' + name + r'\(', source, re.M)
+    match = re.search(r'^(?:static )?(?:int|void|u64)\s+' + name + r'\(', source, re.M)
     if not match:
         raise ValueError(name)
     start = match.start()
@@ -47,6 +47,8 @@ typedef uint8_t u8;
 typedef int8_t s8;
 typedef uint16_t u16;
 typedef uint32_t u32;
+typedef uint64_t u64;
+#define U64_MAX UINT64_MAX
 typedef uint64_t dma_addr_t;
 #define ALIGN(x,a) (((x)+(a)-1)&~((__typeof__(x))(a)-1))
 #define ALIGN_DOWN(x,a) ((x)&~((__typeof__(x))(a)-1))
@@ -211,7 +213,7 @@ def main():
     text = {name: p.read_text() for name, p in paths.items()}
     src = text['avd-av1.c']
     macros = src[src.index('#define AVD_CDFS_SIZE'):src.index('struct avd_av1_run {')]
-    functions = {n: function(src, n) for n in ['avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
+    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
     unaligned = ('\n#define UNALIGNED_CDFS_OFFSET(dst,cl) ((dst)-ALIGN(cl,AVD_ALIGN)-ALIGN(AVD_CDFS_SIZE,AVD_ALIGN))\n'
                  '#define UNALIGNED_SEG_OFFSET(dst,cl,sl) (UNALIGNED_CDFS_OFFSET(dst,cl)-(sl))\n')
     # Each mutation names the extracted text it rewrites; a stale one is refused, never run as a no-op.

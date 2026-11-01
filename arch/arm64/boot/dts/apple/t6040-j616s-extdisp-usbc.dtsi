@@ -152,7 +152,26 @@
 	};
 };
 
+/*
+ * As DISPEXT0: dcpext1, its DARTs and its mailbox are in the DISPEXT1 block,
+ * so they hold DISPEXT1_FE (and with it the PMP request) while they are bound.
+ * Without it DISPEXT1 is only powered when iBoot left it on for a display
+ * plugged in at boot, and genpd turns it off as unused under a running dcpext1.
+ */
+&dcpext1_dart {
+	power-domains = <&ps_dispext1_fe>;
+};
+
+&dispext1_dart {
+	power-domains = <&ps_dispext1_fe>;
+};
+
+&dcpext1_mbox {
+	power-domains = <&ps_dispext1_fe>;
+};
+
 &dcpext1 {
+	power-domains = <&ps_dispext1_fe>;
 	apple,connector-type = "USB-C";
 	/* as dcpext0: without it apple-dcp's probe fails with -EINVAL (m4.63) */
 	apple,iomfb-surfaces = <1 1 0 0>;

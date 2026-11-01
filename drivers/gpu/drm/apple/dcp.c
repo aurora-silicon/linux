@@ -548,8 +548,8 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 }
 
 /*
- * A desktop 26.x external processor has no dcpav-service-epic to read the
- * sink's EDID through, but exports the TimingElements and DisplayAttributes
+ * A desktop 26.x external processor does not hand out the sink's EDID through
+ * its DCPAV service, but exports the TimingElements and DisplayAttributes
  * of every sink it drives, on HDMI and Type-C alike.
  */
 static bool dcp_sink_metadata(struct apple_dcp *dcp)
@@ -909,6 +909,12 @@ void dcp_panel_metadata_replace(struct apple_dcp *dcp,
 			merged.serial = old->serial;
 		if (same_serial && !merged.serial_text[0])
 			memcpy(merged.serial_text, old->serial_text, sizeof(merged.serial_text));
+		/* Standalone ProductAttributes setters omit the colour description. */
+		if (same_serial && !merged.chromaticity[0][0] && !merged.white[0]) {
+			memcpy(merged.chromaticity, old->chromaticity, sizeof(merged.chromaticity));
+			memcpy(merged.white, old->white, sizeof(merged.white));
+			merged.gamma = old->gamma;
+		}
 		if (!merged.year)
 			merged.year = old->year;
 		if (!merged.week)
@@ -1503,8 +1509,14 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	    crtc_state->vrr_enabled)
 		return -EINVAL;
 
-	/* The desktop 26.6 firmware applies adaptive sync with a mode set. */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && crtc_state->enable) {
+	/*
+	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
+	 * frame, without a mode set (see dcp_vrr_update()).  The external
+	 * processors ignore a new minimum rate on a live mode, so they still
+	 * change adaptive sync with a mode set.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && crtc_state->enable &&
+	    !dcp_vrr_live(dcp)) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 
@@ -3236,13 +3248,21 @@ bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 	       dcp->fw_compat == DCP_FIRMWARE_V_26_6;
 }
 
-/* GAMMA_LUT entries, 0 where the driver cannot program the gamma table */
+/*
+ * GAMMA_LUT entries, 0 where the driver cannot program the gamma table.
+ *
+ * Desktop 26.x composes the LUT through the firmware's own table (see
+ * dcp_gamma_set()), but no desktop 26.x DCP hands out a usable one: the
+ * J616s panel's A420 table does not rise monotonically and the external
+ * processors return none (status 2).  Offering GAMMA_LUT there meant
+ * accepting a LUT and dropping it, so compositors that move work into it
+ * got wrong output: KWin's HDR encoding curve went missing (PQ content
+ * washed out) and night light did nothing.  Without the property KWin
+ * applies its curves while rendering and mutter uses CTM for night light.
+ */
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev)
 {
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ?
-	       IOMFB_GAMMA_ENTRIES : 0;
+	return 0;
 }
 
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
@@ -3282,6 +3302,57 @@ static void dcp_compact_aux_init(struct apple_epic_service *service,
  * call is answered with -EOPNOTSUPP and logged by the AFK core.
  */
 static const struct apple_epic_service_ops dcp_compact_aux_ops[] = {
+	{
+		.name = "*",
+		.init = dcp_compact_aux_init,
+	},
+	{},
+};
+
+/* The DCPAV service of an external processor: HDR10 static metadata. */
+static void dcp_av_service_init(struct apple_epic_service *service,
+				const char *name, const char *class, s64 unit)
+{
+	struct dcp_desktop_state *d = service->ep->dcp->desktop;
+	struct apple_epic_service *old;
+
+	service = afk_service_get(service);
+	if (!service)
+		return;
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		old = d->av_service;
+		d->av_service = service;
+		d->hdr_sent_valid = false;
+		d->hdr_infoframe = false;
+	}
+	if (old)
+		afk_service_put(old);
+}
+
+static void dcp_av_service_teardown(struct apple_epic_service *service)
+{
+	struct dcp_desktop_state *d = service->ep->dcp->desktop;
+	bool owned;
+
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		owned = d->av_service == service;
+		if (owned) {
+			d->av_service = NULL;
+			d->hdr_sent_valid = false;
+			d->hdr_infoframe = false;
+		}
+	}
+	if (owned)
+		afk_service_put(service);
+}
+
+static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
+	{
+		.name = "dcpav-service-epic",
+		.reusable = true,
+		.init = dcp_av_service_init,
+		.teardown = dcp_av_service_teardown,
+	},
 	{
 		.name = "*",
 		.init = dcp_compact_aux_init,
@@ -3438,18 +3509,37 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 	ret = dcp_desktop_start_ext_ep(dcp, map, DPSAC_ENDPOINT, "DPSAC");
 	if (ret)
 		return ret;
-#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-	if (hdmi_audio)
-		ret = avep_init(dcp);
-	else
-#endif
-		ret = dcp_desktop_start_ext_ep(dcp, map, AV_ENDPOINT, "AV");
+	ret = dcp_desktop_start_ext_ep(dcp, map, AV_ENDPOINT, "AV");
 	if (ret)
 		return ret;
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	if (hdmi_audio && (map & BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20))) {
+		ret = avep_init(dcp);
+		if (ret)
+			dcp_desktop_graph_skip(dcp, AV_AUDIO_ENDPOINT_DESKTOP,
+					       "AUDIO", "audio init failed", ret);
+		else if (dcp->avep)
+			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
+	}
+#endif
 	ret = dcp_desktop_start_ext_ep(dcp, map, REMOTE_ALLOC_ENDPOINT,
 				       "REMOTEALLOC");
 	if (ret)
 		return ret;
+
+	/*
+	 * DCPAV service (dcpav-service-epic, HDR10 static metadata).  Without
+	 * it a PQ link still works, only without mastering data.
+	 */
+	if (map & BIT(DPAVSERV_ENDPOINT_V2 - 0x20)) {
+		ret = dcp_desktop_start_ep(dcp, DPAVSERV_ENDPOINT_V2,
+					   dcp_ext_av_service_ops);
+		if (ret)
+			dcp_desktop_graph_skip(dcp, DPAVSERV_ENDPOINT_V2,
+					       "DPAVSERV", "start failed", ret);
+		else
+			d->graph_started |= BIT(DPAVSERV_ENDPOINT_V2 - 0x20);
+	}
 
 	/* An idle Type-C pipeline has no PHY until a route is claimed. */
 	if (!dcp->phy && !dcp->nr_typec_routes) {
@@ -3543,10 +3633,6 @@ static int dcp_start_desktop(struct apple_dcp *dcp)
 
 		if (endpoint == DPAV_CTRL_ENDPOINT)
 			ret = dcp_desktop_start_dpavctrl(dcp);
-#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-		else if (endpoint == AV_ENDPOINT && hdmi_audio)
-			ret = avep_init(dcp);
-#endif
 		else
 			ret = dcp_desktop_start_ep(dcp, endpoint,
 						   dcp_compact_aux_ops);
@@ -3751,6 +3837,10 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6_DESKTOP:
 		iomfb_poweroff_v26_6_desktop(dcp);
+		if (dcp->edr_hm)
+			dcp->edr_restart = true;
+		/* The link set up again starts without HDR10 metadata. */
+		dcp_hdr_metadata_forget(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -3868,7 +3958,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
-	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
+	/* The 14.7 panel has its own known-level blank and restore hooks. */
+	return (!iomfb_v14_7_panel_nits(dcp) &&
+		dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
 	       (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
@@ -4176,7 +4268,7 @@ void dcp_backlight_takeover_registered(struct platform_device *pdev)
 	schedule_work(&dcp->bl_register_wq);
 }
 
-static void dcp_work_register_backlight(struct work_struct *work)
+VISIBLE_IF_KUNIT void dcp_work_register_backlight(struct work_struct *work)
 {
 	int ret;
 	struct apple_dcp *dcp;
@@ -4184,7 +4276,7 @@ static void dcp_work_register_backlight(struct work_struct *work)
 	dcp = container_of(work, struct apple_dcp, bl_register_wq);
 
 	mutex_lock(&dcp->bl_register_mutex);
-	if (dcp->brightness.bl_dev)
+	if (READ_ONCE(dcp->quiescing) || dcp->brightness.bl_dev)
 		goto out_unlock;
 
 	/* try to register backlight device, */
@@ -5550,6 +5642,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)
 			return -ENOMEM;
+		spin_lock_init(&dcp->desktop->hdr_lock);
 		/*
 		 * The opaque client identity of the IOMFB calls.  The firmware's
 		 * own client passes a kernel pointer there; pass a random value
@@ -6285,6 +6378,7 @@ static int dcp_platform_suspend(struct device *dev)
 		return -EBUSY;
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
+	iomfb_v14_7_backlight_suspend(dcp);
 
 	/* Serialize PM against explicit bring-up, including queued startup work.
 	 * Before a startup attempt the device remains suspendable. After any
@@ -6368,6 +6462,7 @@ static int dcp_platform_resume(struct device *dev)
 
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
+	iomfb_v14_7_backlight_resume(dcp);
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)

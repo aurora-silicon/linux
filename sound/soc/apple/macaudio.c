@@ -121,6 +121,14 @@ struct macaudio_platform_cfg {
 	 */
 	bool fe_cpu_is_platform;
 	/*
+	 * Front-ends (bits by link index) whose CPU DAI only completes the
+	 * fixed DAPM routes and can never carry a stream on this machine.
+	 * Their links are not bound, so the card has no PCM device for them
+	 * that userspace could probe and fail to open. The CPU component
+	 * keeps the other front-ends on their link numbers.
+	 */
+	unsigned int route_only_fes;
+	/*
 	 * The highest headphone volume, a "Jack DAC Playback Volume" value
 	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
 	 */
@@ -859,6 +867,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		memcpy(link_props, &macaudio_fe_link_props[i], sizeof(struct macaudio_link_props));
 		if (ma->cfg->fe_dai_names[i])
 			link->cpus[0].dai_name = ma->cfg->fe_dai_names[i];
+		if (ma->cfg->route_only_fes & BIT(i))
+			link->ignore = 1;
 		if (ma->cfg->dai_fmt && !link_props->is_sense)
 			link->dai_fmt = ma->cfg->dai_fmt;
 		if (i == 0 && ma->cfg->primary_bclk_ratio)
@@ -1876,8 +1886,18 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	long val = uvalue->value.integer.value[0];
 
-	if (uvalue->value.integer.value[0] != SPEAKER_MAGIC_VALUE)
+	/*
+	 * Reads return the lock state (0 or 1), so a saved mixer state holds
+	 * one of those. Writing it back changes nothing: only the lock owner's
+	 * magic value renews the lease. Accept it as a no-op so that restoring
+	 * a saved state before the daemon has taken the lock is not an error.
+	 */
+	if (val == 0 || val == 1)
+		return 0;
+
+	if (val != SPEAKER_MAGIC_VALUE)
 		return -EINVAL;
 
 	mutex_lock(&ma->volume_lock_mutex);
@@ -2117,6 +2137,8 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
 	.secondary_bclk_ratio = 250,
 	.fe_cpu_is_platform = true,
+	/* No headphone codec on this card: the jack is a card of its own. */
+	.route_only_fes = BIT(0),
 };
 
 /*
@@ -2133,6 +2155,7 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
 	.fe_dai_names = { "j616-jack-pcm-0", "j616-jack-pcm-1" },
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
 	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(1),
 	/*
 	 * Above 0 dB the DAC only adds digital gain, which clips a full-scale
 	 * signal. The 6 dB below that are margin: the analog full scale of

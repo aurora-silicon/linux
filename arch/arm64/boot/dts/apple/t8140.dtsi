@@ -448,11 +448,44 @@
 		nonposted-mmio;
 		ranges;
 
+		jpeg0: jpeg@28d000000 {
+			compatible = "apple,t8140-jpeg";
+			reg = <0x2 0x8d000000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1040 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg_dart 0>;
+			power-domains = <&ps_jpg>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+			status = "disabled";
+		};
+
 		jpeg_dart: iommu@28d020000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x2 0x8d020000 0x0 0xc000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1041 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		jpeg1: jpeg@28d060000 {
+			compatible = "apple,t8140-jpeg";
+			reg = <0x2 0x8d060000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1043 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg1_dart 0>;
+			power-domains = <&ps_jpg>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+			status = "disabled";
+		};
+
+		jpeg1_dart: iommu@28d080000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x8d080000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1044 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
 			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
 			power-domains = <&ps_jpg>;
@@ -497,6 +530,34 @@
 				#power-domain-cells = <0>;
 				power-domains = <&ps_gfx>;
 				apple,always-on;
+			};
+
+			/*
+			 * PMP soc-device 15 (AVE0): the encoder's power request
+			 * and, in SOC-DEV-DVFS entry 0x198, its VMAX performance
+			 * request. The PMP then votes the AVE rail up itself.
+			 */
+			pmp_report_ave0: report@f {
+				compatible = "apple,t8140-pmp-v2-report-entry";
+				reg = <0xf>;
+				label = "pmp-ave0";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_venc0_sys>, <&pmc_venc_cluster>;
+				apple,dvfs = <0x198 2>;
+			};
+
+			/*
+			 * AVD is soc-device record 17, DVFS ordinal 10. Its VMAX
+			 * request votes the SOC rail through the PMP's static agent.
+			 * It has no cluster-agent bit: VENC-CLSTR-V is AVE-only.
+			 */
+			pmp_report_avd0: report@11 {
+				compatible = "apple,t8140-pmp-v2-report-entry";
+				reg = <0x11>;
+				label = "pmp-avd0";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_avd_sys>;
+				apple,dvfs = <0x19a 2>;
 			};
 		};
 
@@ -982,7 +1043,7 @@
 			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_sys>;
 			#iommu-cells = <1>;
-			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
 			status = "disabled";
 		};
 
@@ -993,7 +1054,7 @@
 			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_sys>;
 			#iommu-cells = <1>;
-			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
 			status = "disabled";
 		};
 
@@ -1010,8 +1071,10 @@
 				     <AIC_IRQ 954 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 953 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
-				       <&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>;
-			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+				       <&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
+				       <&pmp_report_ave0>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1",
+					     "perf";
 			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
 			status = "disabled";
 		};
@@ -1231,8 +1294,9 @@
 		pmc: power-management@302800000 {
 			compatible = "apple,t8140-pmc";
 			reg = <0x3 0x02800000 0x0 0x10000>,
-			      <0x3 0x028aa000 0x0 0x3000>;
-			reg-names = "voters", "rails";
+			      <0x3 0x028aa000 0x0 0x3000>,
+			      <0x3 0x028a9c18 0x0 0x8>;
+			reg-names = "voters", "rails", "clusters";
 			power-domains = <&ps_pmc>;
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -1240,6 +1304,13 @@
 			/* PMP, CLPC and AP agents */
 			apple,static-voters = <0 1 3>;
 			status = "disabled";
+
+			/* VENC-CLSTR-V: the video encoder cluster, bit 3. */
+			pmc_venc_cluster: cluster-venc {
+				label = "venc-cluster";
+				#power-domain-cells = <0>;
+				apple,cluster-bit = <3>;
+			};
 
 			clpc: performance-controller@1 {
 				compatible = "apple,t8140-clpc";
@@ -1340,7 +1411,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 936 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 937 IRQ_TYPE_LEVEL_HIGH>;
-			power-domains = <&ps_avd_sys>;
+			power-domains = <&ps_avd_sys>, <&pmp_report_avd0>;
+			power-domain-names = "core", "perf";
 			resets = <&ps_avd_sys>;
 			reg = <0x3 0x81080000 0x0 0x10000>,
 			      <0x3 0x81090000 0x0 0x10000>,
@@ -1730,51 +1802,103 @@
 		};
 
 		ane_dart0: iommu@401800000 {
-			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			compatible = "apple,t8140-ane-dart", "apple,t8140-dart",
+				     "apple,t8110-dart";
 			reg = <0x4 0x01800000 0x0 0xc000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			apple,dma-range = <0x100 0x0 0x300 0x0>;
 			status = "disabled";
 		};
 
 		ane_dart1: iommu@401820000 {
-			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			compatible = "apple,t8140-ane-dart", "apple,t8140-dart",
+				     "apple,t8110-dart";
 			reg = <0x4 0x01820000 0x0 0x20000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			apple,dma-range = <0x100 0x0 0x300 0x0>;
 			status = "disabled";
 		};
 
 		ane_dart2: iommu@401840000 {
-			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			compatible = "apple,t8140-ane-dart", "apple,t8140-dart",
+				     "apple,t8110-dart";
 			reg = <0x4 0x01840000 0x0 0x20000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			apple,dma-range = <0x100 0x0 0x300 0x0>;
 			status = "disabled";
 		};
 
-		/* The T8140 firmware and child power sequence need their own backend. */
+		/* Cold AP-direct is staged; production nodes remain disabled. */
 		ane: ane@400000000 {
 			compatible = "apple,t8140-ane";
-			reg = <0x4 0x0 0x0 0x2000000>;
-			reg-names = "engine";
+			reg = <0x4 0x0 0x0 0x2000000>,
+			      <0x3 0x00700000 0x0 0x18000>,
+			      <0x3 0x00726680 0x0 0x34>;
+			reg-names = "engine", "pmgr", "pwgate";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 655 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
 			power-domains = <&ps_ane_sys>;
+			apple,firmware-preloaded;
+			apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+			/* Inclusive SID0 identity windows from the ADT. */
+			apple,dapf-ranges = /bits/ 64 <0x321668000 0x321668003
+						     0x30070c000 0x30070c013
+						     0x300700290 0x300700293
+						     0x482668000 0x482668003>;
 			status = "disabled";
 		};
 	};
 };
 
 #include "t8140-pmgr.dtsi"
+
+/*
+ * DRAM interface class: width and maximum rate are inferred from topology
+ * and the published bandwidth class. Lower-state rates remain unqualified.
+ * State IDs below describe firmware DCS states, not PMGR codes.
+ */
+/ {
+	dram_opp: opp-table-dram {
+		compatible = "operating-points-v2-apple-dram";
+		opp-shared;
+
+		opp-0 {
+			opp-level = <0>;
+		};
+
+		opp-1 {
+			opp-level = <1>;
+		};
+
+		opp-2 {
+			opp-level = <2>;
+		};
+
+		opp-3 {
+			opp-level = <3>;
+		};
+
+		opp-4 {
+			opp-level = <4>;
+			opp-hz = /bits/ 64 <3750000000>;
+			apple,data-rate = /bits/ 64 <7500000000>;
+		};
+	};
+};
+
+&pmp_report {
+	operating-points-v2 = <&dram_opp>;
+	apple,dram-type = "lpddr5";
+	apple,data-bus-width = <64>;
+	apple,dcs-state-count = <5>;
+	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <60000000000>;
+	apple,bandwidth-class-bytes-per-second = /bits/ 64 <60000000000>;
+};

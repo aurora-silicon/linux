@@ -70,6 +70,8 @@ struct mt7932 {
 	/* Hardware-free calibration transport seam; production builds omit it. */
 	int (*cal_test_send)(struct mt7932 *m, const void *body, size_t length);
 	void *cal_test_context;
+	int (*power_test_send)(struct mt7932 *m, const void *body, size_t length);
+	void *power_test_context;
 #endif
 	u8 cal_requests[32][16];
 	u8 cal_request_seq[32];
@@ -110,12 +112,15 @@ struct mt7932 {
 	struct ieee80211_channel channels6[MT7932_CHANNELS_6G];
 	struct ieee80211_sband_iftype_data he6;
 	u8 six_assoc_power[2][1020];
-	bool six_power_valid;
+	bool six_power_valid, six_legacy_assoc, six_ap_valid, six_class_dirty;
+	u64 six_legacy_channels;
+	struct mt7932_6g_ap six_ap;
 	u8 scan_band, scan_batch;
 	unsigned int scan_cursor;
 	enum nl80211_band connect_band, scan_home_band;
 	u32 connect_akm;
 	enum nl80211_mfp connect_mfp;
+	bool connect_pmf; /* admitted request, never firmware readback */
 	enum nl80211_sae_pwe_mechanism connect_sae_pwe;
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
@@ -171,6 +176,12 @@ struct mt7932 {
 	 * sets connect_lost for the worker to report. Under response_lock.
 	 */
 	bool connect_publishing, connect_lost;
+	/* A connect with the previous BSSID is moving the connection to another
+	 * AP (roam_moving), or the current connection is the result of one
+	 * (roam_landed). Written under response_lock with WRITE_ONCE(); read
+	 * under it, or with READ_ONCE() where the lock is not held.
+	 */
+	bool roam_moving, roam_landed;
 	u16 disconnect_reason;
 	int connect_error;
 	u32 event_cipher;
@@ -199,6 +210,15 @@ struct mt7932 {
 	u64 rx_integrity, rx_malformed, rx_unsupported;
 	u64 rx_wrong_peer, rx_unprotected, rx_duplicate, rx_no_memory;
 	u64 rx_retry, rx_amsdu;
+	/* Lifetime transport observations for ethtool. The ring and cause
+	 * counters are written only by the interrupt thread; the BSS presence
+	 * counters are under response_lock, the data counters under data_lock.
+	 */
+	u64 irq_passes, irq_unmasked_passes, rx_ring_records[9];
+	u32 irq_unmasked;
+	u64 tx_free_events, bss_absent_events, bss_absent_ms;
+	unsigned long bss_absent_since;
+	u64 home_beacons, rx_band_records[3];
 	/* TX0 descriptors published since the last doorbell; data_lock. */
 	unsigned int data_unkicked;
 	bool data_ready;
@@ -209,8 +229,48 @@ struct mt7932 {
 	dma_addr_t ipc_dma, aux_dma;
 };
 
+/* What the connect worker reports once an attempt has its result. A move, a
+ * connect with the previous BSSID while connected, ends in a connect result,
+ * which is what iwd's reassociation waits for; cfg80211_roamed() is never
+ * used. A failed connect result leaves cfg80211 holding the connection the
+ * move replaced, so a move that fails or is cancelled then reports a
+ * disconnect, for the reason the cancel gave if it was cancelled. A
+ * cancelled connect that was not a move reports only the disconnect. A
+ * cancel always leaves an error in ret.
+ */
+struct mt7932_connect_report {
+	bool result;		/* cfg80211_connect_done() */
+	bool disconnect;	/* then a disconnect, for reason */
+	bool landed;		/* the new connection is the result of a move */
+	u16 reason;
+};
+
+static inline struct mt7932_connect_report
+mt7932_connect_report(bool move, bool cancelled, int ret, u16 cancel_reason)
+{
+	struct mt7932_connect_report report = {
+		.result = move || !cancelled,
+		.disconnect = move ? ret != 0 : cancelled,
+		.landed = move && !ret,
+	};
+
+	if (report.disconnect)
+		report.reason = cancelled ? cancel_reason : WLAN_REASON_DEAUTH_LEAVING;
+	return report;
+}
+
+/* Whether a disconnect the driver ends is reported as local. See
+ * mt_report_disconnected() for why a connection a move made reports it as
+ * from the AP.
+ */
+static inline bool mt7932_disconnect_local(bool local, bool landed)
+{
+	return local && !landed;
+}
+
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
+int mt_6g_connect_policy(struct mt7932 *m, const struct mt7932_6g_ap *ap);
 void mt_reg_apply_deferred_locked(struct mt7932 *m);
 void mt_policy_debugfs_init(struct mt7932 *m);
 int mt_net_open(struct net_device *netdev);
@@ -247,6 +307,7 @@ struct mt7932 *mt_from_wiphy(struct wiphy *wiphy);
 void mt_scan_event(struct mt7932 *m, const struct mt7932_event *event);
 void mt_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev);
 int mt_scan_quiesce(struct mt7932 *m);
+void mt_scan_settle_retired(struct mt7932 *m);
 int mt_connect_discover(struct mt7932 *m);
 int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request);
 int mt_register_interface(struct mt7932 *m);
@@ -258,6 +319,7 @@ void mt_connect_work(struct work_struct *work);
 int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		      struct cfg80211_connect_params *params);
 void mt_disconnect_work(struct work_struct *work);
+void mt_report_disconnected(struct mt7932 *m, u16 reason, bool local, gfp_t gfp);
 int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason);
 int mt_deauth(struct wiphy *wiphy, struct net_device *netdev,
 		     struct cfg80211_deauth_request *request);

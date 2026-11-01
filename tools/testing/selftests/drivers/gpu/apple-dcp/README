@@ -51,6 +51,12 @@ concurrency and system suspend require separate kernel/hardware qualification.
 Kernel KUnit tests and apple-afkv2 remain separate tests in their existing
 standard layouts. No archived diagnostic script is a dependency of this suite.
 
+The display group's desktop-gamma fixture executes the production A420/A421
+callbacks and composition with synthetic tables. It checks full return-status
+handling, the external empty status-2 reply, internal-panel diagnostics,
+malformed tables, independent RGB interpolation and restoration of the base.
+It does not establish firmware table encoding or external A421 support.
+
 The runner preserves host artifacts on failure as well as success. Existing
 physical-disconnect fixture warnings for unused mock boundaries and signed
 host/kernel ABI comparisons are handled only by those fixtures' original
@@ -202,3 +208,10 @@ ensure the machine's serial cannot override the panel's. Panel EDID tests cover
 a missing firmware identity, real EDID priority and invalid replacement retention.
 Desktop backlight notification tests exercise accepted, rejected, duplicate and
 out-of-order completions and preserve the requested target during notification.
+
+The audio group executes the native AV call and OSObject reply boundaries with
+synthetic transport replies, including truncated bodies, inconsistent used
+sizes and transport errors. It retains the legacy reply behavior. KUnit's
+apple-av-native-audio suite separately runs service replacement, Terminate and
+link lifecycle checks for both external 14.7 and desktop 26.x firmware roles.
+These fixtures do not establish the desktop audio firmware ABI or SIO support.

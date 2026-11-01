@@ -26,8 +26,10 @@ bool asahi_g15_board(void);
 bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_release_power(struct device *dev);
-void asahi_g15_module_get(void);
+bool asahi_g15_module_try_get(void);
+void asahi_g15_module_put(void);
 void asahi_g15_reprobe(void);
+void asahi_g15_report_loader_gpu(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
 bool asahi_g15_ram_disjoint(u64 start, u64 size);
 bool asahi_g15_ram_within(u64 start, u64 size);
@@ -35,9 +37,52 @@ unsigned int asahi_g15_memory_mode(u64 start, u64 size);
 void __iomem *asahi_g15_ioremap_wc(u64 start, size_t size);
 bool asahi_g15_dma_coherent(struct device *dev);
 int asahi_g15_pmp_prepare(struct device *dev);
+int asahi_g15_display_prepare(struct device *dev);
 int asahi_g15_pmp_get(struct device *dev);
+int asahi_g15_pmp_ready(void);
 void asahi_g15_pmp_put(struct device *dev);
 bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size);
+
+/*
+ * The boot loader enables the T6030/T6031 GPU node only when its
+ * chosen.asahi,t603x-gpu setting is on; otherwise the node stays disabled,
+ * the adapter never probes and nothing says why native G15 is absent. Name
+ * the setting once, at module activation, on a machine whose /chosen has it
+ * and whose GPU node is disabled. Nothing else changes.
+ */
+void asahi_g15_report_loader_gpu(void)
+{
+	static const struct {
+		const char *prop;
+		const char *compatible;
+	} socs[] = {
+		{ "asahi,t6031-gpu", "apple,agx-t6031" },
+		{ "asahi,t6030-gpu", "apple,agx-t6030" },
+	};
+	struct device_node *chosen, *np;
+	const char *value;
+	unsigned int i;
+	u32 cell;
+
+	chosen = of_find_node_by_path("/chosen");
+	if (!chosen)
+		return;
+	for (i = 0; i < ARRAY_SIZE(socs); i++) {
+		if (!of_property_present(chosen, socs[i].prop))
+			continue;
+		np = of_find_compatible_node(NULL, NULL, socs[i].compatible);
+		if (np && !of_device_is_available(np)) {
+			if (!of_property_read_string(chosen, socs[i].prop, &value))
+				pr_info("asahi: G15: native G15 not started: the boot loader left the GPU node %pOF disabled (/chosen/%s = \"%s\")\n",
+					np, socs[i].prop, value);
+			else if (!of_property_read_u32(chosen, socs[i].prop, &cell))
+				pr_info("asahi: G15: native G15 not started: the boot loader left the GPU node %pOF disabled (/chosen/%s = %u)\n",
+					np, socs[i].prop, cell);
+		}
+		of_node_put(np);
+	}
+	of_node_put(chosen);
+}
 
 /*
  * The maintained m1n1 handoff keeps these four UAT regions in the linear map.
@@ -46,20 +91,31 @@ bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size);
  */
 bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size)
 {
-	static const char *const paths[] = {
-		"/reserved-memory/uat-ttbs",
-		"/reserved-memory/uat-pagetables",
-		"/reserved-memory/uat-handoff",
-		"/reserved-memory/uat-pagetables-l2",
+	static const char *const names[] = {
+		"uat-ttbs",
+		"uat-pagetables",
+		"uat-handoff",
+		"uat-pagetables-l2",
 	};
-	struct device_node *np;
+	struct device_node *rmem, *child, *np = NULL;
 	struct resource res;
+	unsigned int count = 0;
 	bool match;
 
-	if (index >= ARRAY_SIZE(paths))
+	if (index >= ARRAY_SIZE(names))
 		return false;
-	np = of_find_node_by_path(paths[index]);
-	match = np && of_device_is_available(np) &&
+
+	/* Unit addresses belong to the DT layout, not the reservation name. */
+	rmem = of_find_node_by_path("/reserved-memory");
+	for_each_child_of_node(rmem, child) {
+		if (!of_node_name_eq(child, names[index]))
+			continue;
+		count++;
+		if (!np)
+			np = of_node_get(child);
+	}
+	of_node_put(rmem);
+	match = count == 1 && np && of_device_is_available(np) &&
 		!of_property_read_bool(np, "reusable") &&
 		!of_get_address(np, 1, NULL, NULL) &&
 		!of_address_to_resource(np, 0, &res) &&
@@ -90,6 +146,33 @@ int asahi_g15_pmp_prepare(struct device *dev)
 	return apple_pmp_link_device(dev);
 }
 
+/*
+ * T6031 has no PMP vote, but its first firmware start follows the native
+ * display as T6030's does: defer until that display is up. The display can
+ * be off for this boot (no handoff, or not requested), so say once why. An
+ * enabled display that is not published yet is said once too: if it never
+ * comes up (its DCP refused or failed to bind), that line is why the GPU
+ * stays off.
+ */
+int asahi_g15_display_prepare(struct device *dev)
+{
+	struct device_node *np;
+	int ret;
+
+	if (!dev->of_node || !of_device_is_compatible(dev->of_node, "apple,agx-t6031"))
+		return -ENODEV;
+	ret = apple_drm_t6031_link_device(dev);
+	if (ret != -EPROBE_DEFER)
+		return ret;
+	np = of_find_compatible_node(NULL, NULL, "apple,t6031-display-subsystem");
+	if (!np || !of_device_is_available(np))
+		dev_info_once(dev, "G15: waiting for the T6031 native display, which this boot did not enable (it needs the boot loader's display handoff, and apple_t6031_display.enable=1 except on the J516C)\n");
+	else
+		dev_info_once(dev, "G15: waiting for the T6031 native display to come up: the GPU firmware starts only after the display is published\n");
+	of_node_put(np);
+	return ret;
+}
+
 int asahi_g15_pmp_get(struct device *dev)
 {
 	if (!asahi_g15_board() || !dev->of_node ||
@@ -97,6 +180,11 @@ int asahi_g15_pmp_get(struct device *dev)
 		return -ENODEV;
 	return apple_pmp_set_device_power(0x0f, 5, 1);
 
+}
+
+int asahi_g15_pmp_ready(void)
+{
+	return apple_pmp_t6030_gpu_ready();
 }
 
 /*
@@ -159,10 +247,20 @@ void asahi_g15_release_power(struct device *dev)
 
 }
 
-/* Pin this module until reboot. */
-void asahi_g15_module_get(void)
+/*
+ * Pin this module until reboot, unless its removal has begun: a deferred or
+ * asynchronous probe can run after an ordinary rmmod has passed its reference
+ * check, which __module_get() would not stop.
+ */
+bool asahi_g15_module_try_get(void)
 {
-	__module_get(THIS_MODULE);
+	return try_module_get(THIS_MODULE);
+}
+
+/* Drop a reference asahi_g15_module_try_get() took. */
+void asahi_g15_module_put(void)
+{
+	module_put(THIS_MODULE);
 }
 
 /*
@@ -267,12 +365,12 @@ void asahi_g15_reprobe(void)
 	const struct device_driver *drv;
 	int ret;
 
-	drv = driver_find("asahi-g15", &platform_bus_type);
+	drv = driver_find("aurora-g15", &platform_bus_type);
 	if (!drv) {
-		pr_err("asahi-g15: registered adapter not found for activation\n");
+		pr_err("aurora-g15: registered adapter not found for activation\n");
 		return;
 	}
 	ret = driver_attach(drv);
 	if (ret)
-		pr_err("asahi-g15: activation attach failed: %d\n", ret);
+		pr_err("aurora-g15: activation attach failed: %d\n", ret);
 }
