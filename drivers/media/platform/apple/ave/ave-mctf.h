@@ -47,7 +47,12 @@ struct ave_mctf_slot_ref {
 	u32 off, start, stride;
 };
 
-/* Linear NV12 plane descriptor: u64 address, u32 bytes, u32 line stride */
+/*
+ * A picture: one 0x40-byte entry per component (Y, then CbCr): data at
+ * +0x00 {u64 address, u32 bytes, u32 row bytes}, the compression header
+ * plane at +0x10 (zero for linear pictures), width and height at +0x24 and
+ * +0x28 (CbCr in sample pairs), row bytes again at +0x34.
+ */
 struct ave_mctf_nv12 {
 	u32 y, uv;
 };

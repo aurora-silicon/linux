@@ -11,10 +11,12 @@
  * the first-frame word, the frame index and the filter level.
  *
  * The camera hands macOS compressed pictures (a data and a header plane per
- * component, in 0x40-byte plane entries). This driver takes linear NV12,
- * described the way the same Process carrier takes it for encoding: Y at
- * +0x00 and CbCr at +0x20 of the descriptor, each {u64 address, u32 bytes,
- * u32 line stride}. The compressed-plane words of the capture are not sent.
+ * component, in 0x40-byte plane entries). This driver takes linear NV12
+ * in the same picture entries (see ave-mctf.h), with no header planes and
+ * the linear sizes and row bytes in place of the compressed ones. The
+ * encoder's linear form (CbCr at +0x20) made the first Process hang on the
+ * Neo: in this client +0x24 and +0x28 of a picture are its width and
+ * height, so the CbCr address was read as a luma size.
  *
  * Copyright The Aurora Silicon Contributors
  */
@@ -145,8 +147,8 @@ static const struct ave_mctf_word ave_mctf_process_25g83[] = {
 		/* the slot's output and statistics surfaces */		\
 		.slot_refs = { { 0xac88, 0xd50, 0x10 },			\
 			       { 0xac90, 0xf50, 0x10 } },		\
-		.input = { 0xa300, 0xa320 },				\
-		.output = { 0xad80, 0xada0 },				\
+		.input = { 0xa300, 0xa340 },				\
+		.output = { 0xad80, 0xadc0 },				\
 		.width = 0xa3b8, .height = 0xa3bc,			\
 		.first_frame = 0x5d90, .first_value = 5,		\
 		.next_value = 4,					\
@@ -225,11 +227,15 @@ int ave_mctf_build_start(const struct ave_mctf_layout *l, u8 *cmd, size_t len,
 	return 0;
 }
 
-static void ave_mctf_plane(u8 *cmd, u32 off, u64 addr, u32 bytes, u32 stride)
+static void ave_mctf_plane(u8 *cmd, u32 off, u64 addr, u32 bytes, u32 stride,
+			   u32 width, u32 height)
 {
 	put_unaligned_le64(addr, cmd + off);
-	put_unaligned_le32(bytes, cmd + off + 8);
-	put_unaligned_le32(stride, cmd + off + 12);
+	put_unaligned_le32(bytes, cmd + off + 0x08);
+	put_unaligned_le32(stride, cmd + off + 0x0c);
+	put_unaligned_le32(width, cmd + off + 0x24);
+	put_unaligned_le32(height, cmd + off + 0x28);
+	put_unaligned_le32(stride, cmd + off + 0x34);
 }
 
 /* Process for one frame; the caller writes the header (subtype base + slot). */
@@ -251,10 +257,14 @@ int ave_mctf_build_process(const struct ave_mctf_layout *l, u8 *cmd,
 	ret = ave_mctf_words(cmd, len, l->process_words, l->n_process_words);
 	if (ret)
 		return ret;
-	ave_mctf_plane(cmd, l->input.y, f->in, luma, f->stride);
-	ave_mctf_plane(cmd, l->input.uv, f->in + luma, luma / 2, f->stride);
-	ave_mctf_plane(cmd, l->output.y, f->out, luma, f->stride);
-	ave_mctf_plane(cmd, l->output.uv, f->out + luma, luma / 2, f->stride);
+	ave_mctf_plane(cmd, l->input.y, f->in, luma, f->stride, f->width,
+		       f->height);
+	ave_mctf_plane(cmd, l->input.uv, f->in + luma, luma / 2, f->stride,
+		       f->width / 2, f->height / 2);
+	ave_mctf_plane(cmd, l->output.y, f->out, luma, f->stride, f->width,
+		       f->height);
+	ave_mctf_plane(cmd, l->output.uv, f->out + luma, luma / 2, f->stride,
+		       f->width / 2, f->height / 2);
 	put_unaligned_le32(f->width, cmd + l->width);
 	put_unaligned_le32(f->height, cmd + l->height);
 	put_unaligned_le32(f->frame ? l->next_value : l->first_value,
@@ -304,6 +314,8 @@ int ave_mctf_cmd_start(struct ave_ctx *ctx)
 	ave_write_header(ctx, cmd, AVE_OP_START, AVE_OP_START, AVE_SESSION_ARG0,
 			 ave_session_setup_arg2(ctx));
 	ave_debugfs_save_mctf(ave, AVE_IMAGE_START, cmd, len);
+	dev_dbg(ave->dev, "MCTF Start: client %u token %llu\n", sess->client,
+		sess->token);
 
 	/* A failed submission may already have exposed the Start buffers. */
 	sess->handed = true;
@@ -363,6 +375,9 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 	s->output_mem = ave_vb2_get(&dst->vb2_buf);
 	ret = ave_ipc_submit(ave, buf, l->process_bytes,
 			     ave->layout->process_timeout_us, false);
+	dev_dbg(ave->dev,
+		"MCTF Process frame %u slot %u token %llu level %u in %pad out %pad: %d\n",
+		f.frame, slot, sess->token, f.level, &f.in, &f.out, ret);
 	if (ret)
 		return ret;
 	s->src = src;

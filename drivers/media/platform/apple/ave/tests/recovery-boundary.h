@@ -92,6 +92,7 @@ struct ave_dev {
 };
 
 static void *test_ctrl_addr;
+static void ave_ipc_dump(struct ave_dev *ave, const char *why) {}
 static int halt_result, close_result;
 static unsigned int halts, closes, freed, suspends, resumes, schedules, barriers;
 static unsigned int polls, sleep_ms;

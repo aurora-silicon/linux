@@ -210,6 +210,7 @@ struct ave_dev {
 	u32 unacked;
 	u8 want[AVE_OP_COUNT];
 	int reply_err;
+	struct ave_reply last_reply; /* for the debug state dump */
 	unsigned int scalar_next;
 	struct ave_ctx *sessions[AVE_MAX_SESSIONS];
 	u8 msg[AVE_MSG_MAX];
@@ -400,6 +401,7 @@ int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len,
 int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		 bool (*cond)(struct ave_dev *ave, void *arg), void *arg);
 int ave_ipc_settle(struct ave_dev *ave, unsigned int wait_ms);
+void ave_ipc_dump(struct ave_dev *ave, const char *why);
 
 /* ave-writer.c: pure command builders, also exercised by KUnit. */
 u32 ave_session_arg2(struct ave_ctx *ctx);

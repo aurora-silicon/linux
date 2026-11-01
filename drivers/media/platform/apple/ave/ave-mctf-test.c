@@ -145,7 +145,7 @@ static const struct ave_mctf_word t_process_const[] = {
 	{ 0xade4, 0x3c0 }, { 0xade8, 0x21c }, { 0xadf4, 0x7800 },
 };
 
-/* Captured compressed-plane words, replaced by the linear NV12 descriptors */
+/* Captured picture words, rewritten for linear NV12 (width/height included) */
 static const u32 t_process_planes[] = {
 	0xa308, 0xa30c, 0xa318, 0xa324, 0xa328, 0xa334, 0xa348, 0xa34c,
 	0xa358, 0xa364, 0xa368, 0xa374, 0xad88, 0xad8c, 0xad98, 0xada4,
@@ -270,6 +270,16 @@ static void ave_mctf_start_image(struct kunit *test)
 	KUNIT_EXPECT_GE(test, t.l->surfaces[0].alloc, 0x12c000U);
 }
 
+static void t_picture(u8 *exp, u32 off, u64 addr, u32 bytes, u32 w, u32 h)
+{
+	put_unaligned_le64(addr, exp + off);
+	put_unaligned_le32(bytes, exp + off + 0x08);
+	put_unaligned_le32(1920, exp + off + 0x0c);
+	put_unaligned_le32(w, exp + off + 0x24);
+	put_unaligned_le32(h, exp + off + 0x28);
+	put_unaligned_le32(1920, exp + off + 0x34);
+}
+
 /* Process over frames 0..6, as macOS sent them, byte for byte. */
 static void ave_mctf_process_frames(struct kunit *test)
 {
@@ -327,19 +337,14 @@ static void ave_mctf_process_frames(struct kunit *test)
 				   exp + 0xac90);
 		put_unaligned_le32(n, exp + 0xacf8);
 		put_unaligned_le32(levels[n], exp + 0xad68);
-		/* Linear NV12 pictures: {address, bytes, stride} for Y and CbCr */
-		put_unaligned_le64(in, exp + 0xa300);
-		put_unaligned_le32(luma, exp + 0xa308);
-		put_unaligned_le32(1920, exp + 0xa30c);
-		put_unaligned_le64(in + luma, exp + 0xa320);
-		put_unaligned_le32(luma / 2, exp + 0xa328);
-		put_unaligned_le32(1920, exp + 0xa32c);
-		put_unaligned_le64(out, exp + 0xad80);
-		put_unaligned_le32(luma, exp + 0xad88);
-		put_unaligned_le32(1920, exp + 0xad8c);
-		put_unaligned_le64(out + luma, exp + 0xada0);
-		put_unaligned_le32(luma / 2, exp + 0xada8);
-		put_unaligned_le32(1920, exp + 0xadac);
+		/*
+		 * Linear NV12 in the captured picture entries: no header
+		 * planes, linear bytes and row bytes, the captured sizes.
+		 */
+		t_picture(exp, 0xa300, in, luma, 1920, 1080);
+		t_picture(exp, 0xa340, in + luma, luma / 2, 960, 540);
+		t_picture(exp, 0xad80, out, luma, 1920, 1080);
+		t_picture(exp, 0xadc0, out + luma, luma / 2, 960, 540);
 		KUNIT_EXPECT_MEMEQ_MSG(test, cmd, exp, T_PROCESS_BYTES, "frame %u", n);
 	}
 	/* The two slots use different surfaces. */

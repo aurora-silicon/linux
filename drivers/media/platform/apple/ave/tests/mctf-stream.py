@@ -208,7 +208,7 @@ def qbuf(fd, typ, index, used=0, ts_us=None):
     fcntl.ioctl(fd, QBUF, b)
 
 
-def dqbuf(fd, typ, timeout=5.0):
+def dqbuf(fd, typ, timeout=12.0):
     planes = (Plane * 1)()
     b = Buffer(type=typ, memory=MEMORY_MMAP, length=1)
     b.m.planes = planes

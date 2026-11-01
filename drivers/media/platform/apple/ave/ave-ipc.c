@@ -485,6 +485,9 @@ static int ave_ipc_dispatch(struct ave_dev *ave)
 		ave->reply_err = ret;
 		return 0;
 	}
+	ave->last_reply = reply;
+	dev_dbg(ave->dev, "message op %u client %llu subtype %#x status %#x len %u\n",
+		reply.op, reply.client, reply.subtype, reply.raw_status, reply.bytes);
 	if (reply.op == AVE_OP_PROCESS) {
 		if (!ave->layout->encode_ready)
 			return -EPROTO;
@@ -598,6 +601,7 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		if (cond && cond(ave, arg))
 			return 0;
 		if (cond && ktime_after(ktime_get(), deadline)) {
+			ave_ipc_dump(ave, "no answer");
 			ave_fw_mark_broken(ave, -ETIMEDOUT, "no answer");
 			return -ETIMEDOUT;
 		}
@@ -621,6 +625,45 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 			usleep_range(50, 100);
 		else
 			usleep_range(500, 1000);
+	}
+}
+
+/*
+ * Dynamic-debug dump of what the host still waits for: commands not yet
+ * acknowledged (by buffer), replies outstanding (by operation), the rings,
+ * the mailbox and the last firmware message. Caller holds hw_lock.
+ */
+void ave_ipc_dump(struct ave_dev *ave, const char *why)
+{
+	const struct ave_reply *r = &ave->last_reply;
+
+	dev_dbg(ave->dev, "%s: unacked %#x (bit 0 Start, 1..%u scalar, %u+ Process)\n",
+		why, ave->unacked, AVE_IPC_SCALAR_BUFS, AVE_BUF_PROC(0));
+	for (unsigned int op = 1; op < AVE_OP_COUNT; op++)
+		if (ave->want[op])
+			dev_dbg(ave->dev, "%s: %u replies outstanding for operation %u\n",
+				why, ave->want[op], op);
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave->ring); i++)
+		dev_dbg(ave->dev, "%s: ring %s producer %d consumer %d of %u\n", why,
+			ave->ring[i].name, ave->ring[i].producer,
+			ave->ring[i].consumer, ave->ring[i].slots);
+	dev_dbg(ave->dev, "%s: mailbox status %#x, firmware state %d\n", why,
+		readl(ave->mbox + AVE_MBOX_STATUS), ave->fw_state);
+	dev_dbg(ave->dev, "%s: last message op %u client %llu subtype %#x status %#x len %u\n",
+		why, r->op, r->client, r->subtype, r->raw_status, r->bytes);
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++) {
+		struct ave_ctx *ctx = ave->sessions[i];
+
+		if (!ctx || !ctx->sess)
+			continue;
+		for (unsigned int s = 0; s < ctx->sess->p.slots; s++)
+			if (ctx->sess->slot[s].busy)
+				dev_dbg(ave->dev,
+					"%s: session %u client %u%s slot %u (subtype %#x) unanswered, %u frames sent\n",
+					why, i, ctx->sess->client,
+					ctx->mctf ? " (MCTF)" : "", s,
+					ave->layout->process_subtype + s,
+					ctx->sess->frames);
 	}
 }
 

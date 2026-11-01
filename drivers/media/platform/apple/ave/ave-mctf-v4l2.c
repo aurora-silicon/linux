@@ -339,6 +339,7 @@ static void ave_mctf_poll_work(struct work_struct *work)
 		if (!fail && ave_sess_stalled(ctx->sess)) {
 			dev_err(ave->dev, "%u MCTF frames unanswered; firmware is stuck\n",
 				ctx->sess->busy);
+			ave_ipc_dump(ave, "MCTF frame timeout");
 			ave_fw_mark_broken(ave, -ETIMEDOUT, "MCTF frame timeout");
 			fail = true;
 		}
