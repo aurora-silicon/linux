@@ -424,7 +424,8 @@ int main(void) {
         } else {
             assert(strstr(now,"util_device_percent unsupported\n"));
             assert(strstr(now,"pstate unsupported\n"));
-            assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unavailable\n"));
+            assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unsupported\n"));
+            assert(strstr(now,status==2?"utilisation_status stale\n":"utilisation_status unavailable\n"));
         }
     }
     struct device dev;

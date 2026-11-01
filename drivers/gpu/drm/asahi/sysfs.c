@@ -79,8 +79,15 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 				   "util_renderer_percent unsupported\n"
 				   "util_device_percent unsupported\n");
 	}
+	/*
+	 * V25G83 and V26A428 accept tag 0x10 but never emit it, and no other
+	 * record carries the current pstate, so on these firmwares pstate is
+	 * unsupported rather than temporarily unavailable. A firmware that
+	 * does send it still reports valid or stale.
+	 */
 	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
-			   asahi_stats_quality(snap.pstate_status));
+			   snap.pstate_status ? asahi_stats_quality(snap.pstate_status) :
+						"unsupported");
 	if (snap.pstate_status == 1)
 		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
 	else

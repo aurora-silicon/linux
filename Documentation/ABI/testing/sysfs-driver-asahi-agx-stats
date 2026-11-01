@@ -79,9 +79,14 @@ Description:
 		The following keys replace the legacy keys on these firmwares:
 
 		utilisation_status, pstate_status
-		           Each is valid, stale, or unavailable. Numeric metrics
-		           are printed only while their capability is valid;
-		           otherwise their value is the string unsupported.
+		           utilisation_status is valid, stale, or unavailable.
+		           pstate_status is valid, stale, or unsupported: the
+		           V25G83 and V26A428 firmwares accept tag 0x10 but never
+		           emit it, and no other record carries the current
+		           pstate, so on these firmwares it reads unsupported.
+		           Numeric metrics are printed only while their
+		           capability is valid; otherwise their value is the
+		           string unsupported.
 
 		util_tiler_percent, util_renderer_percent, util_device_percent
 		           Unsigned integer percent (0..100), from tag 0x13
