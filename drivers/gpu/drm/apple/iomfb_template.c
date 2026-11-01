@@ -3773,12 +3773,8 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			.location = 9,
 		};
 
-		if (crtc_state->ctm) {
-			struct drm_color_ctm *ctm = (struct drm_color_ctm *)crtc_state->ctm->data;
-			memcpy(mat.matrix, ctm->matrix, sizeof(mat.matrix));
-		} else {
-			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
-		}
+		dcp_ctm_to_fw(mat.matrix, crtc_state->ctm ?
+			      crtc_state->ctm->data : NULL);
 
 #if DCP_FW_H17(DCP_FW_VER)
 		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);

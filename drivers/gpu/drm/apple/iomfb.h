@@ -391,6 +391,9 @@ struct iomfb_set_matrix_req {
 	u8 padding[3];
 } __packed;
 
+struct drm_color_ctm;
+void dcp_ctm_to_fw(u64 fw[9], const struct drm_color_ctm *ctm);
+
 struct iomfb_set_matrix_resp {
 	u32 ret;
 } __packed;
