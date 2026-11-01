@@ -237,6 +237,145 @@ static void facts(void)
 }
 #endif
 
+#if defined(TEST_PER_ABI) && !defined(TEST_BASELINE)
+static void facts_6070(void)
+{
+	struct ave_variant variant = test_variant;
+	struct ave_fw_layout fw = ave_layout_6070_11_1;
+	struct ave_dev dev = { .layout = &fw, .variant = &variant };
+	struct ave_session session = {};
+	struct ave_ctx ctx = { .ave = &dev, .sess = &session };
+	u8 *actual = malloc(0x32dc8 + 32), *expected = malloc(0x32dc8);
+	u8 msg[0x48] = {};
+	struct ave_reply reply;
+
+	assert(actual && expected);
+	variant.lfs_ref_scale = 1;
+	for (unsigned int codec = 1; codec <= 2; codec++) {
+		dev.text_crc = codec == 1 ? 0x460c7a7c : 0x25bfd039;
+		dev.layout = ave_layout_for_crc(dev.text_crc);
+		assert(ave_fw_check_build(&dev) == -EOPNOTSUPP);
+		dev.layout = &fw;
+		fw.encode_ready =
+			true; /* private copy for software tests only */
+		for (unsigned int b = 0; b < 2; b++) {
+			size_t len = fw.bytes[codec - 1][AVE_IMAGE_START];
+
+			params(&session.p, codec, 1920, 1080);
+			session.p.bframes = b;
+			session.p.refs = b ? 5 : 2;
+			session.p.slots = b ? 5 : 3;
+			session.token = 400;
+			session.client = 10;
+			assert(ave_sess_alloc(&dev, &session) == 0);
+			assert(!session.mb.cpu && !session.mb.size);
+			for (unsigned int rate = 0; rate < 2; rate++) {
+				session.p.fps_num = rate ? 30000 : 30;
+				session.p.fps_den = rate ? 1001 : 1;
+				memset(actual, 0xa5, len + 32);
+				ave_6070_reference_start(&session, expected,
+							 len);
+				assert(ave_build_start(&ctx, actual, len) == 0);
+				assert(!memcmp(actual, expected, len));
+				for (unsigned int i = 0; i < 32; i++)
+					assert(actual[len + i] == 0xa5);
+			}
+			session.p.fps_num = 30;
+			session.p.fps_den = 1;
+			len = fw.bytes[codec - 1][AVE_IMAGE_PROCESS];
+			assert(ave_build_process(&ctx, actual, len, 0,
+						 0x10012340000ULL, 6000000,
+						 false) == -EOPNOTSUPP);
+			session.process_state = malloc(len);
+			assert(session.process_state);
+			session.process_state_bytes = len;
+			for (unsigned int i = 0; i < len; i++)
+				session.process_state[i] = i ^ 0xa5;
+			for (unsigned int frame = 0; frame < 2; frame++)
+				for (unsigned int slot = 0;
+				     slot < session.p.slots; slot++) {
+					int ret;
+
+					session.frames = frame ? 7 : 0;
+					ave_6070_reference_process(&session,
+								   expected,
+								   len, slot,
+								   frame);
+					memset(actual, 0xa5, len + 32);
+					ret = ave_build_process(&ctx, actual, len, slot,
+								0x10012340000ULL, 6000000, frame);
+					assert(ret == 0);
+					assert(!memcmp(actual, expected, len));
+					for (unsigned int i = 0; i < 32; i++)
+						assert(actual[len + i] == 0xa5);
+				}
+			ave_sess_free_bufs(&dev, &session);
+			memset(&session, 0, sizeof(session));
+		}
+	}
+	for (unsigned int id = 0xe01; id <= 0xe0b; id++) {
+		u32 len = id == 0xe06 ? 0x48 : 0x40;
+
+		put_unaligned_le16(id, msg);
+		put_unaligned_le32(10, msg + 0x10);
+		put_unaligned_le32(0x19, msg + 0x1c);
+		put_unaligned_le32(0x00ee0000, msg + 0x38);
+		put_unaligned_le32(0x12345678, msg + 0x40);
+		if (id == 0xe07 || id == 0xe08) {
+			assert(ave_abi_6070.parse_reply(&ave_abi_6070, msg, len,
+							&reply) == -EOPNOTSUPP);
+			continue;
+		}
+		assert(ave_abi_6070.parse_reply(&ave_abi_6070, msg, len,
+						&reply) == 0);
+		assert(reply.done_id == id && reply.client == 10 &&
+		       reply.subtype == 0x19);
+		assert(!reply.status && reply.raw_status == 0x00ee0000);
+		assert(reply.process_extra == (id == 0xe06 ? 0x12345678U : 0));
+		assert(ave_abi_6070.parse_reply(&ave_abi_6070, msg, len - 1,
+						&reply) == -EPROTO);
+		put_unaligned_le32(1, msg + 0x38);
+		assert(ave_abi_6070.parse_reply(&ave_abi_6070, msg, len,
+						&reply) == 0);
+		assert(reply.status == 1);
+	}
+	/* Complete drains with barriers, never with the queue-purging Flush. */
+	unsigned int sent = submissions, settled = settlements;
+
+	params(&session.p, 2, 1920, 1080);
+	assert(ave_cmd_complete(&ctx, 3) == 0);
+	assert(submissions == sent + 3 && settlements == settled + 3);
+	assert(wire_len == 0x40 && get_unaligned_le16(wire) == 13);
+	assert(get_unaligned_le32(wire + 0x1c) == 9);
+	/* EncodeDone routing must not free another session or slot. */
+	params(&session.p, 2, 1920, 1080);
+	session.client = 10;
+	session.busy = 1;
+	session.slot[4].busy = true;
+	dev.sessions[0] = &ctx;
+	put_unaligned_le16(0xe06, msg);
+	put_unaligned_le32(11, msg + 0x10);
+	put_unaligned_le32(0x19, msg + 0x1c);
+	put_unaligned_le32(0x00ee0000, msg + 0x38);
+	assert(ave_abi_6070.parse_reply(&ave_abi_6070, msg, 0x48, &reply) == 0);
+	ave_sess_reply(&dev, &reply);
+	assert(session.busy == 1 && !session.done_count);
+	put_unaligned_le32(10, msg + 0x10);
+	assert(ave_abi_6070.parse_reply(&ave_abi_6070, msg, 0x48, &reply) == 0);
+	ave_sess_reply(&dev, &reply);
+	assert(!session.busy && session.done_count == 1 &&
+	       session.done_fifo[0] == 4);
+	assert(session.slot[4].done && !session.slot[4].status &&
+	       ctx.ready == 1);
+	ave_sess_reply(&dev, &reply);
+	assert(session.done_count == 1 && ctx.ready == 1);
+	assert(alloc_count == free_count);
+	free(expected);
+	free(actual);
+	puts("ok: 6070 named fields, retained partitions, bounds, parser, CRC refusal");
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	struct ave_dev dev = {
@@ -347,6 +486,9 @@ int main(int argc, char **argv)
 	}
 #ifndef TEST_BASELINE
 	facts();
+#ifdef TEST_PER_ABI
+	facts_6070();
+#endif
 #else
 	(void)test_regs;
 #endif

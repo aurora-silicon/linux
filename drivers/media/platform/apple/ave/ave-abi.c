@@ -96,6 +96,7 @@ static int ave_reply_9003(const struct ave_fw_abi *abi, const u8 *msg, u32 len,
 	if (len < 0x48)
 		return -EPROTO;
 	id = get_unaligned_le16(msg);
+	*reply = (struct ave_reply){ .done_id = id };
 	reply->op = id < AVE_OP_COUNT ? id : 0;
 	reply->client = get_unaligned_le64(msg + 0x10);
 	reply->subtype = get_unaligned_le32(msg + 0x20);
@@ -113,17 +114,23 @@ static int ave_reply_6070(const struct ave_fw_abi *abi, const u8 *msg, u32 len,
 	if (len < 0x40)
 		return -EPROTO;
 	id = get_unaligned_le16(msg);
+	/* Standalone LRME/MCTF notifications cannot complete an encode slot. */
+	if (id == 0xe07 || id == 0xe08)
+		return -EOPNOTSUPP;
 	for (unsigned int op = 1; op < AVE_OP_COUNT; op++) {
 		if (!abi->reply_id[op] || abi->reply_id[op] != id)
 			continue;
 		if (len != (op == AVE_OP_PROCESS ? 0x48 : 0x40))
 			return -EPROTO;
+		*reply = (struct ave_reply){ .done_id = id };
 		reply->op = op;
 		reply->client = get_unaligned_le32(msg + 0x10);
 		reply->subtype = get_unaligned_le32(msg + 0x1c);
 		reply->raw_status = get_unaligned_le32(msg + 0x38);
 		reply->status = reply->raw_status;
 		reply->bytes = len;
+		if (op == AVE_OP_PROCESS)
+			reply->process_extra = get_unaligned_le32(msg + 0x40);
 		if (reply->status == 0x00ee0000)
 			reply->status = 0;
 		else if (!reply->status)

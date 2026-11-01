@@ -70,7 +70,11 @@ void ave_write_surface(const struct ave_fw_layout *fw, u8 *cmd,
 	u32 address_off = l->address + l->address_stride * index;
 	u32 size_off = l->size + l->size_stride * index;
 
+	if (!l->address)
+		return;
 	ave_put64(cmd, address_off, addr);
+	if (!l->size)
+		return;
 	ave_put32(cmd, size_off, size);
 	if (fw->abi->padded_surfaces)
 		ave_put32(cmd, size_off + 4, 0);
@@ -239,6 +243,60 @@ static void ave_start_surfaces(struct ave_session *sess, u8 *cmd,
 				    sess->hevc_extra[i].size);
 }
 
+/*
+ * 6070 fixed-capacity banks. Unused entries stay zero in the command supplied
+ * by IPC. Sizes are serialized only where the ledger defines a size array.
+ * Secondary reference unions and the neighbour-FW group need a resource
+ * continuation before this ABI can be qualified for streaming.
+ */
+static void ave_start_surfaces_6070(struct ave_session *sess, u8 *cmd,
+				    const struct ave_fw_layout *fw)
+{
+	const struct ave_params *p = &sess->p;
+	const struct ave_start_layout *l = &fw->start[p->codec - 1];
+	unsigned int tiles = p->codec == AVE_CODEC_HEVC ? 4 : AVE_TILE_BUFS;
+
+	ave_put_buf(fw, cmd, &l->header, 0, &sess->hdr, fw->hdr_bytes);
+	for (unsigned int i = 0; i < p->refs; i++) {
+		ave_put_buf(fw, cmd, &l->ref_a, i, &sess->ref_a[i], 0);
+		ave_put_buf(fw, cmd, &l->ref_b, i, &sess->ref_b[i], 0);
+		ave_put_buf(fw, cmd, &l->ref_c, i, &sess->ref_c[i], 0);
+		ave_put_buf(fw, cmd, &l->ref_d, i, &sess->ref_d[i], 0);
+	}
+	for (unsigned int i = 0; i < p->slots; i++) {
+		ave_put_buf(fw, cmd, &l->coded, i, &sess->slot[i].coded,
+			    p->coded_cap);
+		ave_put_buf(fw, cmd, &l->meta, i, &sess->slot[i].meta,
+			    sess->slot[i].meta.size);
+	}
+	for (unsigned int set = 0; set < 4; set++) {
+		ave_put_buf(fw, cmd, &l->row_a, set,
+			    set ? &sess->row_a_set[set - 1] : &sess->row_a, 0);
+		ave_put_buf(fw, cmd, &l->row_b, set,
+			    set ? &sess->row_b_set[set - 1] : &sess->row_b, 0);
+		ave_put_buf(fw, cmd, &l->fixed, set,
+			    set ? &sess->fixed_set[set - 1] : &sess->fixed, 0);
+		for (unsigned int k = 0; k < tiles; k++) {
+			struct ave_surface_layout bank = l->tiles[k];
+			const struct ave_buf *main =
+				set ? &sess->tile_set[set - 1][k] :
+				      &sess->tile[k];
+			const struct ave_buf *aux =
+				set ? &sess->tile_aux_set[set - 1][k] :
+				      &sess->tile_aux[k];
+
+			bank.address += 8 * set;
+			bank.size += 4 * set;
+			ave_put_buf(fw, cmd, &bank, 0, main, main->size);
+			ave_put_buf(fw, cmd, &bank, 1, aux, aux->size);
+		}
+	}
+	if (p->codec == AVE_CODEC_HEVC)
+		for (unsigned int i = 0; i < 2; i++)
+			ave_put_buf(fw, cmd, &l->hevc_extra, i,
+				    &sess->hevc_extra[i], 0);
+}
+
 static void ave_start_put32(u8 *cmd, u32 off, u32 val)
 {
 	if (off)
@@ -268,12 +326,13 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put32(cmd, l->geometry_depth, depth);
 	ave_start_put32(cmd, l->const_214, 0x39d);
 	ave_start_put32(cmd, l->const_218, 0x18);
-	ave_start_put32(cmd, l->fps, p->fps_int);
+	ave_start_put32(cmd, l->fps, l->fps_den ? p->fps_num : p->fps_int);
+	ave_start_put32(cmd, l->fps_den, p->fps_den);
 
 	/* Rate control */
 	ave_start_put32(cmd, l->rc_mode, p->rc_mode);
 	ave_start_put32(cmd, l->bitrate, p->bitrate);
-	for (unsigned int i = 0; i < 3; i++)
+	for (unsigned int i = 0; i < (l->init_qp_words ?: 3); i++)
 		ave_put32(cmd, (l->init_qp + 4 * i),
 			  cq ? p->initial_qp : AVE_START_INIT_QP_VALUE);
 	ave_start_put32(cmd, l->limits, p->limit_bytes ? 1 : 0);
@@ -283,10 +342,14 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 				  1));
 		ave_put64(cmd, l->limit_secs, ave_f64(1, 1));
 	}
-	ave_put64(cmd, l->f64_288, ave_f64(1, 1));
-	ave_put64(cmd, l->f64_290, ave_f64(1, 2));
-	ave_put64(cmd, l->f64_2c0, AVE_F64_NEG | ave_f64(1, 1));
-	ave_put64(cmd, l->f64_2c8, AVE_F64_NEG | ave_f64(1, 1));
+	if (l->f64_288)
+		ave_put64(cmd, l->f64_288, ave_f64(1, 1));
+	if (l->f64_290)
+		ave_put64(cmd, l->f64_290, ave_f64(1, 2));
+	if (l->f64_2c0)
+		ave_put64(cmd, l->f64_2c0, AVE_F64_NEG | ave_f64(1, 1));
+	if (l->f64_2c8)
+		ave_put64(cmd, l->f64_2c8, AVE_F64_NEG | ave_f64(1, 1));
 	ave_start_put32(cmd, l->min_qp, p->min_qp);
 	ave_start_put32(cmd, l->max_qp, p->max_qp);
 	ave_start_put32(cmd, l->min_qp2, p->min_qp);
@@ -414,11 +477,23 @@ int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len)
 	if (len != fw->bytes[p->codec - 1][AVE_IMAGE_START] || !p->refs ||
 	    p->refs > AVE_MAX_REFS || !p->slots || p->slots > fw->max_slots)
 		return -EINVAL;
-	ave_image_start(cmd, len, fw, p->codec, p->reorder_off,
-			p->codec == AVE_CODEC_HEVC && !p->bframes);
+	if (fw->abi == &ave_abi_6070) {
+		if (p->rc_mode == 3 || (p->bit_depth && p->bit_depth != 8))
+			return -EOPNOTSUPP;
+		if (!p->fps_num || !p->fps_den ||
+		    p->slots != (p->bframes ? 5 : 3))
+			return -EINVAL;
+		memset(cmd, 0, len);
+	} else {
+		ave_image_start(cmd, len, fw, p->codec, p->reorder_off,
+				p->codec == AVE_CODEC_HEVC && !p->bframes);
+	}
 	ave_write_header(ctx, cmd, AVE_OP_START, AVE_OP_START, AVE_SESSION_ARG0,
 			 ave_session_setup_arg2(ctx));
-	ave_start_surfaces(sess, cmd, fw);
+	if (fw->abi == &ave_abi_6070)
+		ave_start_surfaces_6070(sess, cmd, fw);
+	else
+		ave_start_surfaces(sess, cmd, fw);
 	ave_start_config(p, cmd, fw);
 	return 0;
 }
@@ -428,6 +503,23 @@ int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len)
 #define AVE_PROC_SHDR_STRIDE 0x400
 #define AVE_PROC_FORCED_TYPE 2
 #define AVE_PROC_LOW_DELAY 3
+
+/* Copy only the codec-owned partitions from independently prepared state. */
+static int ave_process_state_6070(const struct ave_session *sess, u8 *cmd,
+				  size_t len)
+{
+	if (!sess->process_state || sess->process_state_bytes != len)
+		return -EOPNOTSUPP;
+	memset(cmd, 0, len);
+	if (sess->p.codec == AVE_CODEC_H264) {
+		memcpy(cmd + 0x40, sess->process_state + 0x40, 0x984);
+	} else {
+		memcpy(cmd + 0x40, sess->process_state + 0x40, 0x5570);
+		memcpy(cmd + 0x6524, sess->process_state + 0x6524, 0x16c);
+		memcpy(cmd + 0x6690, sess->process_state + 0x6690, 0x1a8);
+	}
+	return 0;
+}
 
 int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
@@ -450,16 +542,36 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 	    (!l->bitrate && bitrate != p->bitrate))
 		return -EOPNOTSUPP;
 	s = &sess->slot[slot];
-	ave_image_process(cmd, len, fw, p->codec);
+	if (fw->abi == &ave_abi_6070) {
+		int ret;
+
+		if (!p->fps_num || !p->fps_den ||
+		    p->slots != (p->bframes ? 5 : 3))
+			return -EINVAL;
+		if (p->rc_mode == 3 || (p->bit_depth && p->bit_depth != 8))
+			return -EOPNOTSUPP;
+		ret = ave_process_state_6070(sess, cmd, len);
+		if (ret)
+			return ret;
+	} else {
+		ave_image_process(cmd, len, fw, p->codec);
+	}
 	ave_write_header(ctx, cmd, AVE_OP_PROCESS, fw->process_subtype + slot,
 			 0, ave_session_arg2(ctx));
 	/* Input picture: NV12, chroma right after p->height luma lines. */
 	ave_put64(cmd, l->y, y);
-	ave_put32(cmd, l->y + 8, p->stride * p->height);
-	ave_put32(cmd, l->y + 12, p->stride);
 	ave_put64(cmd, l->uv, y + p->stride * p->height);
-	ave_put32(cmd, l->uv + 8, p->stride * p->height / 2);
-	ave_put32(cmd, l->uv + 12, p->stride);
+	if (fw->abi == &ave_abi_6070) {
+		ave_put32(cmd, l->y + 8, p->stride);
+		ave_put32(cmd, l->y + 12, 0);
+		ave_put32(cmd, l->uv + 8, p->stride);
+		ave_put32(cmd, l->uv + 12, 0);
+	} else {
+		ave_put32(cmd, l->y + 8, p->stride * p->height);
+		ave_put32(cmd, l->y + 12, p->stride);
+		ave_put32(cmd, l->uv + 8, p->stride * p->height / 2);
+		ave_put32(cmd, l->uv + 12, p->stride);
+	}
 	ave_put32(cmd, l->in_w, p->width);
 	ave_put32(cmd, l->in_h, p->height);
 
@@ -483,7 +595,10 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 			  p->cw != p->width || p->ch != p->height);
 
 	/* This frame */
-	ave_put32(cmd, l->first_frame, sess->frames == 0);
+	if (l->picture_size)
+		ave_put32(cmd, l->picture_size, 0xf68);
+	if (l->first_frame)
+		ave_put32(cmd, l->first_frame, sess->frames == 0);
 	ave_put32(cmd, l->slot, slot);
 	ave_put64(cmd, l->coded, s->coded.dma);
 	ave_put64(cmd, l->meta, s->meta.dma);

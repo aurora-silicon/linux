@@ -84,6 +84,8 @@ def build(src, out, baseline):
         if per_abi:
             code += function(fw, 'ave_fw_check_boot')
         code += function(fw, 'ave_fw_check_build')
+    if per_abi and not baseline:
+        code += (Path(__file__).parent / 'ave-6070-reference.h').read_text()
     code += (Path(__file__).parent / 'test.c').read_text()
     out.mkdir(parents=True, exist_ok=True)
     (out / 'host.c').write_text(code)

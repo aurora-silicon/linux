@@ -9,6 +9,7 @@
 #include "ave.h"
 #include "ave-regs.h"
 #include "tests/ave-9003-reference.h"
+#include "tests/ave-6070-reference.h"
 
 static void ave_test_buf(struct ave_buf *b, unsigned int *index)
 {
@@ -159,6 +160,112 @@ static void ave_9003_byte_equality(struct kunit *test)
 	}
 }
 
+static void ave_6070_payload_fields(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess =
+		kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	struct ave_fw_layout *fw = kunit_kmalloc(test, sizeof(*fw), GFP_KERNEL);
+	u8 *actual = kunit_kmalloc(test, 0x32dc8 + 32, GFP_KERNEL);
+	u8 *expected = kunit_kmalloc(test, 0x32dc8, GFP_KERNEL);
+	u8 *state = kunit_kmalloc(test, 0x6838, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	KUNIT_ASSERT_NOT_NULL(test, fw);
+	KUNIT_ASSERT_NOT_NULL(test, actual);
+	KUNIT_ASSERT_NOT_NULL(test, expected);
+	KUNIT_ASSERT_NOT_NULL(test, state);
+	*fw = ave_layout_6070_11_1;
+	/* Test a private layout; the selectable CRCs remain refused. */
+	fw->encode_ready = true;
+	ave->layout = fw;
+	ctx->ave = ave;
+	ctx->sess = sess;
+	for (unsigned int i = 0; i < 0x6838; i++)
+		state[i] = i ^ 0xa5;
+	for (unsigned int codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC;
+	     codec++) {
+		for (unsigned int b = 0; b < 2; b++) {
+			size_t len = fw->bytes[codec - 1][AVE_IMAGE_START];
+			unsigned int index = 100;
+
+			memset(sess, 0, sizeof(*sess));
+			ave_test_session(sess, codec, 1920, 1080, b);
+			sess->p.gop = 30;
+			sess->p.bitrate = 4000000;
+			sess->p.limit_bytes = 1000000;
+			sess->p.min_qp = 0;
+			sess->p.profile = codec == AVE_CODEC_H264 ? 4 : 1;
+			sess->p.high = false;
+			sess->p.level = codec == AVE_CODEC_H264 ? 12 : 6;
+			for (unsigned int set = 0; set < 3; set++) {
+				ave_test_buf(&sess->row_a_set[set], &index);
+				ave_test_buf(&sess->row_b_set[set], &index);
+				ave_test_buf(&sess->fixed_set[set], &index);
+				for (unsigned int k = 0; k < 8; k++) {
+					ave_test_buf(&sess->tile_set[set][k],
+						     &index);
+					ave_test_buf(&sess->tile_aux_set[set][k],
+						     &index);
+				}
+			}
+			memset(actual, 0xa5, len + 32);
+			ave_6070_reference_start(sess, expected, len);
+			KUNIT_ASSERT_EQ(test, ave_build_start(ctx, actual, len),
+					0);
+			KUNIT_EXPECT_MEMEQ(test, actual, expected, len);
+			for (unsigned int i = 0; i < 32; i++)
+				KUNIT_EXPECT_EQ(test, actual[len + i],
+						(u8)0xa5);
+			/* Check a rational frame rate independently of integer fps. */
+			sess->p.fps_num = 30000;
+			sess->p.fps_den = 1001;
+			ave_6070_reference_start(sess, expected, len);
+			KUNIT_ASSERT_EQ(test, ave_build_start(ctx, actual, len),
+					0);
+			KUNIT_EXPECT_MEMEQ(test, actual, expected, len);
+			sess->p.fps_num = 30;
+			sess->p.fps_den = 1;
+			len = fw->bytes[codec - 1][AVE_IMAGE_PROCESS];
+			/* Missing retained state must fail before writing the command. */
+			memset(actual, 0xa5, len);
+			memset(expected, 0xa5, len);
+			KUNIT_EXPECT_EQ(test,
+					ave_build_process(ctx, actual, len, 0,
+							  0x10012340000ULL,
+							  6000000, false),
+					-EOPNOTSUPP);
+			KUNIT_EXPECT_MEMEQ(test, actual, expected, len);
+			sess->process_state = state;
+			sess->process_state_bytes = len;
+			for (unsigned int frame = 0; frame < 2; frame++)
+				for (unsigned int slot = 0;
+				     slot < sess->p.slots; slot++) {
+					int ret;
+
+					sess->frames = frame ? 7 : 0;
+					memset(actual, 0xa5, len + 32);
+					ave_6070_reference_process(sess,
+								   expected,
+								   len, slot,
+								   frame);
+					ret = ave_build_process(ctx, actual, len, slot,
+								0x10012340000ULL, 6000000, frame);
+					KUNIT_ASSERT_EQ(test, ret, 0);
+					KUNIT_EXPECT_MEMEQ(test, actual,
+							   expected, len);
+					for (unsigned int i = 0; i < 32; i++)
+						KUNIT_EXPECT_EQ(test,
+								actual[len + i],
+								(u8)0xa5);
+				}
+		}
+	}
+}
+
 static void ave_6070_images(struct kunit *test)
 {
 	const struct ave_fw_abi *abi = &ave_abi_6070;
@@ -238,12 +345,17 @@ static void ave_6070_replies(struct kunit *test)
 		put_unaligned_le32(10, msg + 0x10);
 		put_unaligned_le32(abi->semantic[op], msg + 0x1c);
 		put_unaligned_le32(0x00ee0000, msg + 0x38);
+		put_unaligned_le32(0x12345678, msg + 0x40);
 		KUNIT_ASSERT_EQ(test, abi->parse_reply(abi, msg, len, &reply),
 				0);
 		KUNIT_EXPECT_EQ(test, reply.op, (enum ave_opcode)op);
 		KUNIT_EXPECT_EQ(test, reply.client, 10ULL);
 		KUNIT_EXPECT_EQ(test, reply.subtype, abi->semantic[op]);
 		KUNIT_EXPECT_EQ(test, reply.status, 0U);
+		KUNIT_EXPECT_EQ(test, reply.done_id, abi->reply_id[op]);
+		KUNIT_EXPECT_EQ(test, reply.raw_status, 0x00ee0000U);
+		KUNIT_EXPECT_EQ(test, reply.process_extra,
+				op == AVE_OP_PROCESS ? 0x12345678U : 0U);
 		KUNIT_EXPECT_EQ(test,
 				abi->parse_reply(abi, msg, len - 1, &reply),
 				-EPROTO);
@@ -255,9 +367,51 @@ static void ave_6070_replies(struct kunit *test)
 				0);
 		KUNIT_EXPECT_NE(test, reply.status, 0U);
 	}
+	for (unsigned int id = 0xe07; id <= 0xe08; id++) {
+		put_unaligned_le16(id, msg);
+		KUNIT_EXPECT_EQ(test, abi->parse_reply(abi, msg, 0x40, &reply),
+				-EOPNOTSUPP);
+	}
 	put_unaligned_le16(2, msg); /* Request IDs are not completion IDs. */
 	KUNIT_EXPECT_EQ(test, abi->parse_reply(abi, msg, 0x40, &reply),
 			-EPROTO);
+}
+
+static void ave_6070_reply_routing(struct kunit *test)
+{
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess =
+		kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	struct ave_reply reply;
+	u8 msg[0x48] = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	ave->layout = &ave_layout_6070_11_1;
+	ctx->ave = ave;
+	ctx->sess = sess;
+	ave->sessions[0] = ctx;
+	sess->p.slots = 5;
+	sess->client = 10;
+	sess->busy = 1;
+	sess->slot[4].busy = true;
+	put_unaligned_le16(0xe06, msg);
+	put_unaligned_le32(10, msg + 0x10);
+	put_unaligned_le32(0x19, msg + 0x1c);
+	put_unaligned_le32(0x00ee0000, msg + 0x38);
+	KUNIT_ASSERT_EQ(test,
+			ave_abi_6070.parse_reply(&ave_abi_6070, msg,
+						 sizeof(msg), &reply),
+			0);
+	ave_sess_reply(ave, &reply);
+	KUNIT_EXPECT_EQ(test, sess->busy, 0U);
+	KUNIT_EXPECT_EQ(test, sess->done_count, 1U);
+	KUNIT_EXPECT_EQ(test, sess->done_fifo[0], (u8)4);
+	KUNIT_EXPECT_EQ(test, sess->slot[4].status, 0U);
+	KUNIT_EXPECT_TRUE(test, sess->slot[4].done);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ctx->ready), 1);
 }
 
 static void ave_6070_split_surfaces(struct kunit *test)
@@ -395,10 +549,16 @@ static void ave_6070_variants(struct kunit *test)
 }
 
 static struct kunit_case ave_abi_cases[] = {
-	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_6070_images),
-	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_split_surfaces),
-	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
-	KUNIT_CASE(ave_6070_variants),	    {}
+	KUNIT_CASE(ave_9003_byte_equality),
+	KUNIT_CASE(ave_6070_images),
+	KUNIT_CASE(ave_6070_payload_fields),
+	KUNIT_CASE(ave_6070_replies),
+	KUNIT_CASE(ave_6070_reply_routing),
+	KUNIT_CASE(ave_6070_split_surfaces),
+	KUNIT_CASE(ave_6070_gate),
+	KUNIT_CASE(ave_6070_channels),
+	KUNIT_CASE(ave_6070_variants),
+	{}
 };
 
 static struct kunit_suite ave_abi_suite = {

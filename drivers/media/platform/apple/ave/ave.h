@@ -281,6 +281,13 @@ struct ave_session {
 	struct ave_buf row_a, row_b, fixed;
 	struct ave_buf tile[AVE_TILE_BUFS];
 	struct ave_buf tile_aux[AVE_TILE_BUFS];
+	/* 6070 has four independently writable neighbour/entropy sets. */
+	struct ave_buf row_a_set[3], row_b_set[3], fixed_set[3];
+	struct ave_buf tile_set[3][AVE_TILE_BUFS];
+	struct ave_buf tile_aux_set[3][AVE_TILE_BUFS];
+	/* Retained 6070 codec state; an initializer is still required. */
+	u8 *process_state;
+	size_t process_state_bytes;
 	struct ave_buf hevc_extra[2];
 	struct ave_slot slot[AVE_MAX_SLOTS];
 	u8 done_fifo[AVE_MAX_SLOTS];

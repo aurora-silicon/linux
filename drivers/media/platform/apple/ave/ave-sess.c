@@ -205,8 +205,9 @@ struct ave_buf_req {
 	unsigned long attrs;
 };
 
-#define AVE_MAX_BUF_REQS \
-	(1 + 6 * AVE_MAX_REFS + 6 + 2 * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
+#define AVE_MAX_BUF_REQS                                    \
+	(1 + 6 * AVE_MAX_REFS + 6 + 2 * AVE_TILE_BUFS + 2 + \
+	 4 * AVE_MAX_SLOTS + 3 * (3 + 2 * AVE_TILE_BUFS))
 
 static int ave_buf_req_cmp(const void *a, const void *b)
 {
@@ -269,7 +270,9 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 			ave_req(r, &n, &sess->ref_f[i], ref_b / 4, 0, nomap);
 		}
 	}
-	ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
+	/* The 6070 LRME-stat resource is not a Start resource. */
+	if (fw->abi != &ave_abi_6070)
+		ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
 	if (fw->counted && p->rc_mode == 3)
 		for (unsigned int i = 0; i < 2; i++)
 			ave_req(r, &n, &sess->mb_extra[i], ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
@@ -283,9 +286,32 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		ave_req(r, &n, &sess->tile[i], tile, 0, nomap);
 		ave_req(r, &n, &sess->tile_aux[i], ALIGN(h, 128), 0, nomap);
 	}
-	if (hevc)
+	if (fw->abi == &ave_abi_6070)
+		for (unsigned int set = 0; set < 3; set++) {
+			ave_req(r, &n, &sess->row_a_set[set],
+				hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), 0,
+				nomap);
+			ave_req(r, &n, &sess->row_b_set[set],
+				ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0,
+				nomap);
+			ave_req(r, &n, &sess->fixed_set[set], SZ_16K, 0, nomap);
+			for (unsigned int k = 0; k < (hevc ? 4 : AVE_TILE_BUFS);
+			     k++) {
+				ave_req(r, &n, &sess->tile_set[set][k], tile, 0,
+					nomap);
+				ave_req(r, &n, &sess->tile_aux_set[set][k],
+					ALIGN(h, 128), 0, nomap);
+			}
+		}
+
+	if (hevc) {
+		size_t extra = fw->abi == &ave_abi_6070 ?
+				       ALIGN(ALIGN(w, 32) * h32, 0x1000) :
+				       ALIGN(w * h32, SZ_16K);
+
 		for (unsigned int i = 0; i < 2; i++)
-			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0, nomap);
+			ave_req(r, &n, &sess->hevc_extra[i], extra, 0, nomap);
+	}
 	for (unsigned int s = 0; s < p->slots; s++) {
 		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0, 0);
 		ave_req(r, &n, &sess->slot[s].meta, fw->meta_bytes, 0, 0);
@@ -338,6 +364,19 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->tile[i]);
 		ave_free(ave, &sess->tile_aux[i]);
 	}
+	for (unsigned int set = 0; set < 3; set++) {
+		ave_free(ave, &sess->row_a_set[set]);
+		ave_free(ave, &sess->row_b_set[set]);
+		ave_free(ave, &sess->fixed_set[set]);
+		for (unsigned int k = 0; k < AVE_TILE_BUFS; k++) {
+			ave_free(ave, &sess->tile_set[set][k]);
+			ave_free(ave, &sess->tile_aux_set[set][k]);
+		}
+	}
+	kfree(sess->process_state);
+	sess->process_state = NULL;
+	sess->process_state_bytes = 0;
+
 	for (unsigned int i = 0; i < 2; i++)
 		ave_free(ave, &sess->hevc_extra[i]);
 	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++) {
@@ -547,8 +586,8 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 }
 
 /*
- * A frame reply: +0x10 the session's client token, +0x20 the slot's
- * subtype, +0x40 status. Caller holds hw_lock.
+ * A decoded frame reply, with ABI-specific routing and status normalized by
+ * the envelope parser. Caller holds hw_lock.
  */
 void ave_sess_reply(struct ave_dev *ave, const struct ave_reply *reply)
 {

@@ -18,11 +18,38 @@ The constant image tables in ave-image.c are unchanged by this refactor.
 6070.11.1 is selected only for T6000 TEXT CRC 460c7a7c or T8112 TEXT CRC 25bfd039,
 with the corresponding SoC identity. Boot, seven-channel discovery, Config,
 Open, Close and scratch-confirmed Halt are implemented from the clean derived
-SPEC-6070-lifecycle.md ledger. Start and Process return EOPNOTSUPP before writing
-a payload or submitting a command. Reset also remains unavailable: its request
-has a codec-dependent body, rather than a scalar header. No Priority command is
-sent for this ABI. The split surface writer supports separate address and size
-arrays, without assuming a semantic mapping for the unqualified fields.
+SPEC-6070-lifecycle.md ledger. Start revision 2 and Process revision P1 supply
+the named payload fields. The 6070 writer uses rational Start fps, one initial
+QP word, split coded/metadata arrays, address-only neighbour surfaces and four
+independent interleaved entropy sets. It does not serialize an MB/LRME-stat
+buffer in Start. Process inputs carry stride at descriptor +8 and zero at +12;
+normal HEVC uses ID 8, subtype 0x15 + slot, and a 256-entry slice-header table.
+Complete is the normal drain barrier. Each 6070 Complete is settled before
+another is sent; Flush remains a separate cancel/purge operation.
+
+Streaming is refused for both CRCs by the single source-only
+``AVE_6070_STREAMING_QUALIFIED`` gate in ave-layout.c. There is no module
+parameter. Lifecycle validation remains available. Reset remains unavailable:
+its request has a codec-dependent body. No Priority command is sent on 6070.
+
+This is a partial payload implementation, not a hardware qualification build.
+The current ledger names primary reference banks but does not specify all
+secondary reference unions, the fourth neighbour-FW resource, invariant codec
+words or the initializer for the retained Process codec partitions. Those must
+be completed before flipping the gate for a hardware test. A Process build
+without explicitly prepared retained state returns EOPNOTSUPP without changing
+the command. Synthetic state used by tests proves partition preservation only;
+it is never installed by session setup or accepted as a codec initializer.
+
+The reply parser normalizes 6070 success 0x00ee0000, validates exact scalar and
+encode lengths, routes client/subtype independently of 9003 and preserves the
+raw done ID and EncodeDone extra word. The extra word's semantics are not in
+the supplied ledger, so it is retained as opaque data. Standalone LRME (0xe07)
+and internal MCTF (0xe08) are recognized and refused with EOPNOTSUPP; they cannot
+retire a normal encode slot. Metadata interpretation still needs 6070
+qualification. Field tests compare complete synthetic command buffers against
+literal wire offsets, including all named scalars, absent fields, split output
+banks and all four entropy sets, with B frames on and off for 1080p AVC/HEVC.
 
 Lifecycle-only validation
 -------------------------

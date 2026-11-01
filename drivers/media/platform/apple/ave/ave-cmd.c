@@ -106,8 +106,12 @@ int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count)
 {
 	int ret = 0;
 
-	for (unsigned int i = 0; i < count && !ret; i++)
+	for (unsigned int i = 0; i < count && !ret; i++) {
 		ret = ave_cmd_scalar(ctx, AVE_OP_COMPLETE, 0, ave_session_arg2(ctx));
+		/* 6070 permits one outstanding scalar of each operation. */
+		if (!ret && ctx->ave->layout->abi == &ave_abi_6070)
+			ret = ave_ipc_settle(ctx->ave, AVE_CMD_WAIT_MS);
+	}
 	return ret;
 }
 

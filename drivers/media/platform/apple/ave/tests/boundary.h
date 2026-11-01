@@ -23,9 +23,9 @@ struct vb2_v4l2_buffer {
 static struct ave_vb2_mem *ave_vb2_get(struct vb2_buffer *vb) { return NULL; }
 static void ave_vb2_put(void *mem) { assert(!mem); }
 
-static u8 wire[0x1c000 + 32];
+static u8 wire[0x34000 + 32];
 static size_t wire_len;
-static unsigned int submissions;
+static unsigned int submissions, settlements;
 static u64 next_dma = 0x10002000000ULL;
 static unsigned int alloc_count, free_count;
 static void ave_free(struct ave_dev *ave, struct ave_buf *buf)
@@ -82,6 +82,7 @@ static int ave_ipc_scalar_buf(struct ave_dev *ave)
 
 static int ave_ipc_settle(struct ave_dev *ave, unsigned int ms)
 {
+	settlements++;
 	return 0;
 }
 

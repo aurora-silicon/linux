@@ -19,6 +19,7 @@ struct ave_reply {
 	enum ave_opcode op;
 	u64 client;
 	u32 subtype, status, raw_status, bytes;
+	u32 done_id, process_extra;
 };
 
 struct ave_fw_transport {
@@ -76,7 +77,8 @@ struct ave_start_layout {
 	u32 flag_8bit;
 	u32 const_214;
 	u32 const_218;
-	u32 fps;
+	u32 fps, fps_den;
+	u32 init_qp_words; /* zero retains the three-word 9003 form */
 	u32 rc_mode;
 	u32 bitrate;
 	u32 init_qp;
@@ -155,8 +157,9 @@ struct ave_start_layout {
 };
 
 struct ave_proc_layout {
+	u32 picture_size; /* 6070 PIC size tag, not a first-frame flag */
 	u32 first_frame;
-	u32 y, uv; /* {u64 address, u32 size, u32 stride} */
+	u32 y, uv; /* 6070: {u64 address, u32 stride, u32 zero} */
 	u32 in_w, in_h;
 	u32 coded_cap;
 	u32 fps_int;
