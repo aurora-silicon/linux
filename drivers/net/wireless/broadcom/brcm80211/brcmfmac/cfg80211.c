@@ -595,16 +595,6 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
 						ADDR_INDIRECT);
 }
 
-/**
- * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
- *
- * @wiphy: wiphy device of new interface.
- * @name: name of the new interface.
- * @params: contains mac address for AP or STA device.
- * @type: interface type.
- *
- * Return: pointer to new vif on success, ERR_PTR(-errno) if not
- */
 static void brcmf_awdl_cleanup_locked(struct brcmf_cfg80211_info *cfg)
 {
 	struct brcmf_cfg80211_vif *vif;
@@ -866,6 +856,16 @@ int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
 	return err;
 }
 
+/**
+ * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
+ *
+ * @wiphy: wiphy device of new interface.
+ * @name: name of the new interface.
+ * @params: contains mac address for AP or STA device.
+ * @type: interface type.
+ *
+ * Return: pointer to new vif on success, ERR_PTR(-errno) if not
+ */
 static
 struct wireless_dev *brcmf_apsta_add_vif(struct wiphy *wiphy, const char *name,
 					 struct vif_params *params,
