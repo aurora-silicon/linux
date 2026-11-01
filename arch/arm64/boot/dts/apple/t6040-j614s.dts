@@ -46,3 +46,28 @@
 &mesa {
 	firmware-name = "apple/mesacal-j614s.bin", "apple/msrk-j614s.bin";
 };
+
+/* The reader's gP19 SMC output controls its supply. */
+&apcie1_dart {
+	status = "okay";
+};
+
+&pcie0 {
+	bus-range = <0 2>;
+	pinctrl-0 = <&wifi_clkreq_pins &sd_clkreq_pins>;
+};
+
+&port01 {
+	/delete-property/ pinctrl-0;
+	/delete-property/ pinctrl-names;
+	bus-range = <2 2>;
+	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+
+	mmc@0,0 {
+		compatible = "pci17a0,9755";
+		reg = <0x20000 0 0 0 0>;
+		cd-inverted;
+		wp-inverted;
+	};
+};
