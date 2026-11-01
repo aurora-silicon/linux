@@ -1041,9 +1041,28 @@ int avep_init(struct apple_dcp *dcp)
 #endif
 	}
 
+	/*
+	 * Only a processor whose port@0 links an audio device has DP/HDMI
+	 * audio to start. Look before the firmware: a processor without one
+	 * (an internal panel's, or one whose firmware has no audio service
+	 * here, such as H17P) stays as it is without hdmi_audio, quietly.
+	 */
+	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
+	if (endpoint) {
+		audio_node = of_graph_get_remote_port_parent(endpoint);
+		of_node_put(endpoint);
+	}
+	if (!audio_node || !of_device_is_available(audio_node)) {
+		of_node_put(audio_node);
+		dev_dbg(dev, "No audio support\n");
+		return 0;
+	}
+
 	audiosrv_data = devm_kzalloc(dcp->dev, sizeof(*audiosrv_data), GFP_KERNEL);
-	if (!audiosrv_data)
+	if (!audiosrv_data) {
+		of_node_put(audio_node);
 		return -ENOMEM;
+	}
 	init_rwsem(&audiosrv_data->srv_rwsem);
 	mutex_init(&audiosrv_data->plug_lock);
 
@@ -1068,6 +1087,7 @@ int avep_init(struct apple_dcp *dcp)
 			break;
 		}
 #endif
+		of_node_put(audio_node);
 		dev_err(dcp->dev, "Audio not supported for firmware\n");
 		return -ENODEV;
 	}
@@ -1079,17 +1099,6 @@ int avep_init(struct apple_dcp *dcp)
 #endif
 	audiosrv_data->works_live = true;
 	dcp->audiosrv = audiosrv_data;
-
-	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
-	if (endpoint) {
-		audio_node = of_graph_get_remote_port_parent(endpoint);
-		of_node_put(endpoint);
-	}
-	if (!audio_node || !of_device_is_available(audio_node)) {
-		of_node_put(audio_node);
-		dev_info(dev, "No audio support\n");
-		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
-	}
 
 	audio_pdev = of_find_device_by_node(audio_node);
 	of_node_put(audio_node);
