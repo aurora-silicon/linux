@@ -728,6 +728,7 @@ static void ane_h16_pre_io_allocation_test(struct kunit *test)
 	put_unaligned_le64(0, slot + 16);
 	s->must_allocate_first = true;
 	s->boot.startup_drain_ms = 1;
+	s->boot.startup_drain_poll_us = 1000;
 	KUNIT_ASSERT_EQ(test, ane_h16_startup(&s->boot), 0);
 	KUNIT_EXPECT_TRUE(test, s->shared_replied);
 	KUNIT_EXPECT_EQ(test, s->command_count, 4U);

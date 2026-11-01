@@ -61,12 +61,28 @@ struct ane_h16_device {
 	u32 tx_write;
 	bool rtk_failed;
 	u64 shared_next;
+	bool startup_tracing;
+	u32 startup_trace_count, startup_trace_dropped;
+	struct {
+		u64 ns, counter;
+		u32 type, value, shared_count;
+	} startup_trace[128];
 };
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
 
 /* Diagnostic, workspace ane: observe an unknown resident image. */
+static unsigned int h16_startup_poll_us = 1000;
+module_param(h16_startup_poll_us, uint, 0444);
+MODULE_PARM_DESC(h16_startup_poll_us, "Startup wait service cadence10..1000us, default1000");
+static unsigned int h16_startup_drain_poll_us = 10;
+module_param(h16_startup_drain_poll_us, uint, 0444);
+MODULE_PARM_DESC(h16_startup_drain_poll_us, "Pre-IO service cadence10..1000us, default10");
+static bool h16_startup_trace;
+module_param(h16_startup_trace, bool, 0444);
+MODULE_PARM_DESC(h16_startup_trace, "Record bounded startup allocation/doorbell timestamps, print only after probe");
+
 static char *h16_identity;
 module_param(h16_identity, charp, 0444);
 MODULE_PARM_DESC(h16_identity, "observe: accept an unknown resident image for preflight only and publish it in debugfs ane_h16/");
@@ -387,11 +403,32 @@ static u32 ane_h16_engine_read(void *ctx, u32 offset)
 	return ane_h16_mmio_read32(ctx, ANE_H16_ENGINE, offset);
 }
 
+static void ane_h16_startup_record(struct ane_h16_device *h, u32 type, u32 value)
+{
+	u32 i;
+
+	if (!h->startup_tracing)
+		return;
+	i = h->startup_trace_count;
+	if (i == ARRAY_SIZE(h->startup_trace)) {
+		h->startup_trace_dropped++;
+		return;
+	}
+	h->startup_trace[i].ns = ktime_get_ns();
+	h->startup_trace[i].counter = get_cycles();
+	h->startup_trace[i].type = type;
+	h->startup_trace[i].value = value;
+	h->startup_trace[i].shared_count = h->boot.transport.shared_count;
+	h->startup_trace_count++;
+}
+
 static void ane_h16_engine_write(void *ctx, u32 offset, u32 value)
 {
 	struct ane_h16_device *h = ctx;
 
 	ane_h16_mmio_write32(ctx, ANE_H16_ENGINE, offset, value);
+	if (offset == h->boot.soc->doorbell)
+		ane_h16_startup_record(h, 1, value);
 	if (offset == h->boot.soc->irq_ack) {
 		/* Complete the snapshot acknowledgment before ring reads (r5). */
 		mb();
@@ -412,13 +449,16 @@ static void ane_h16_relax(void *ctx)
 	ret = ane_h16_faults(&h->boot, false);
 	if (ret)
 		ane_fw_transport_fail(&h->boot.transport, ret);
-	usleep_range(1000, 1050);
+	ane_h16_delay(h, clamp(h16_startup_poll_us, 10U, 1000U));
 }
 
 static int ane_h16_alloc_shared(void *ctx, size_t size, u32 tag, struct ane_fw_surface *out)
 {
 	struct ane_h16_device *h = ctx;
-	int ret = ane_h16_alloc_at(h, h->shared_next, size, out);
+	int ret;
+
+	ane_h16_startup_record(h, 2, tag);
+	ret = ane_h16_alloc_at(h, h->shared_next, size, out);
 
 	if (!ret) {
 		h->shared_next += size;
@@ -1161,6 +1201,7 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->boot.ops = &ane_h16_ops;
 	h->boot.transport_ops = &ane_h16_transport_ops;
 	h->boot.startup_drain_ms = min(h16_startup_drain_ms, 1000U);
+	h->boot.startup_drain_poll_us = clamp(h16_startup_drain_poll_us, 10U, 1000U);
 	h->shared_next = soc->h16_boot->shared_dva;
 	ret = of_property_read_u64_array(h->dev->of_node, "apple,dapf-ranges",
 					 &h->boot.ranges[0][0], 8);
@@ -1189,7 +1230,16 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	ret = ane_h16_acquire(pdev, h);
 	if (ret)
 		goto cleanup;
+	h->startup_tracing = h16_startup_trace;
 	ret = ane_h16_run(&h->boot, stage);
+	h->startup_tracing = false;
+	for (i = 0; i < h->startup_trace_count; i++)
+		dev_info(h->dev, "H16 STARTUP_TRACE %u type=%u value=%x shared=%u ns=%llu cnt=%llu\n",
+			 i, h->startup_trace[i].type, h->startup_trace[i].value,
+			 h->startup_trace[i].shared_count, h->startup_trace[i].ns,
+			 h->startup_trace[i].counter);
+	if (h->startup_trace_dropped)
+		dev_info(h->dev, "H16 STARTUP_TRACE dropped=%u\n", h->startup_trace_dropped);
 	if (ret && !h->boot.ran)
 		goto cleanup;
 	/* Bind even on a post-RUN error. devres teardown must never reclaim DMA. */
