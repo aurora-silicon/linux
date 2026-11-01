@@ -20,6 +20,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <sound/soc.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -59,6 +60,8 @@ struct tas2764_priv {
 	struct regmap *regmap;
 	struct device *dev;
 	int irq;
+	/* Set while the component holds the fault IRQ */
+	bool irq_requested;
 	enum tas2764_devid devid;
 
 	int v_sense_slot;
@@ -72,12 +75,32 @@ struct tas2764_priv {
 		int tx_mode;
 		unsigned int tx_mask;
 	} idle_slot_config;
+
+	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
+	bool deferred_shutdown;
+	/* Muted at a stream's end, until the next one: the bus clock may stop */
+	bool stream_stopped;
+	struct delayed_work shutdown_work;
+	/*
+	 * Orders the fault handler's read and judgement of the latches against
+	 * an unmute clearing a stale clock fault and stream_stopped
+	 */
+	struct mutex fault_lock;
 };
 
 #include "tas2764-quirks.h"
 
 /* LTCH0 faults that shut the whole SDZ group down: over temperature, over current */
 #define TAS2764_INT_LTCH0_GROUP_FAULTS	(BIT(0) | BIT(1))
+#define TAS2764_INT_LTCH0_TDM_CLOCK	BIT(2)
+
+/*
+ * With apple,deferred-shutdown, how long after a stream's end the muted amp
+ * goes to software shutdown.  On the J713 the AOP's speaker bus ran on for
+ * up to 3520 frames (73 ms at 48 kHz) after a stream's end; this leaves
+ * margin over that.
+ */
+#define TAS2764_DEFERRED_SHUTDOWN_MS	150
 
 static bool tas2764_group_failed(struct tas2764_priv *tas2764)
 {
@@ -187,9 +210,8 @@ static const unsigned int tas2764_int_readout_regs[6] = {
 	TAS2764_INT_LTCH4,
 };
 
-static irqreturn_t tas2764_irq(int irq, void *data)
+static irqreturn_t tas2764_irq_locked(struct tas2764_priv *tas2764)
 {
-	struct tas2764_priv *tas2764 = data;
 	u8 latched[6] = {0, 0, 0, 0, 0, 0};
 	unsigned int val;
 	int ret = IRQ_NONE;
@@ -202,6 +224,17 @@ static irqreturn_t tas2764_irq(int irq, void *data)
 			return IRQ_NONE;
 		}
 		latched[i] = val;
+	}
+
+	/*
+	 * An amp muted at a stream's end with its shutdown deferred, or shut
+	 * down since, sees the bus clock stop: that is expected, not a fault.
+	 */
+	if (latched[0] == TAS2764_INT_LTCH0_TDM_CLOCK && READ_ONCE(tas2764->stream_stopped)) {
+		snd_soc_component_update_bits(tas2764->component, TAS2764_INT_CLK_CFG,
+					      TAS2764_INT_CLK_CFG_IRQZ_CLR,
+					      TAS2764_INT_CLK_CFG_IRQZ_CLR);
+		return IRQ_HANDLED;
 	}
 
 	for (i = 0; i < 8; i++) {
@@ -223,6 +256,19 @@ static irqreturn_t tas2764_irq(int irq, void *data)
 					      TAS2764_INT_CLK_CFG_IRQZ_CLR,
 					      TAS2764_INT_CLK_CFG_IRQZ_CLR);
 	}
+
+	return ret;
+}
+
+static irqreturn_t tas2764_irq(int irq, void *data)
+{
+	struct tas2764_priv *tas2764 = data;
+	irqreturn_t ret;
+
+	/* A stream's unmute does not come between reading the latches and judging them */
+	mutex_lock(&tas2764->fault_lock);
+	ret = tas2764_irq_locked(tas2764);
+	mutex_unlock(&tas2764->fault_lock);
 
 	return ret;
 }
@@ -267,6 +313,8 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 	return 0;
 }
 
+static void tas2764_flush_shutdown(struct tas2764_priv *tas2764);
+
 #ifdef CONFIG_PM
 /*
  * Members of an SDZ group keep the shared SDZ line high across system sleep: the amp waits in
@@ -283,6 +331,8 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
+
+	tas2764_flush_shutdown(tas2764);
 
 	ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
 					    TAS2764_PWR_CTRL_MASK,
@@ -387,6 +437,26 @@ static int tas2764_startup(struct snd_pcm_substream *substream, struct snd_soc_d
 	return 0;
 }
 
+static void tas2764_shutdown_work(struct work_struct *work)
+{
+	struct tas2764_priv *tas2764 = container_of(to_delayed_work(work),
+						    struct tas2764_priv, shutdown_work);
+	int ret;
+
+	tas2764->dac_powered = false;
+	ret = tas2764_update_pwr_ctrl(tas2764);
+	/* a failed group has its SDZ supply forced off already */
+	if (ret && !tas2764_group_failed(tas2764))
+		dev_err(tas2764->dev, "deferred shutdown failed: %d\n", ret);
+}
+
+/* A deferred shutdown happens now (suspend, removal) */
+static void tas2764_flush_shutdown(struct tas2764_priv *tas2764)
+{
+	if (cancel_delayed_work_sync(&tas2764->shutdown_work))
+		tas2764_shutdown_work(&tas2764->shutdown_work.work);
+}
+
 static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
 	struct tas2764_priv *tas2764 =
@@ -394,6 +464,30 @@ static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 	int ret;
 
 	if (!mute) {
+		if (tas2764->deferred_shutdown) {
+			unsigned int latched;
+
+			/* still muted from the last stream: no shutdown in between */
+			cancel_delayed_work_sync(&tas2764->shutdown_work);
+
+			/*
+			 * A clock fault the amp latched while the bus was stopped is
+			 * not this stream's: the handler, which can run several
+			 * milliseconds behind on the shared line, must not see it
+			 * after stream_stopped clears.
+			 */
+			mutex_lock(&tas2764->fault_lock);
+			if (tas2764->irq &&
+			    !regmap_read(tas2764->regmap, TAS2764_INT_LTCH0, &latched) &&
+			    latched == TAS2764_INT_LTCH0_TDM_CLOCK) {
+				snd_soc_component_update_bits(tas2764->component,
+							      TAS2764_INT_CLK_CFG,
+							      TAS2764_INT_CLK_CFG_IRQZ_CLR,
+							      TAS2764_INT_CLK_CFG_IRQZ_CLR);
+			}
+			WRITE_ONCE(tas2764->stream_stopped, false);
+			mutex_unlock(&tas2764->fault_lock);
+		}
 		tas2764->dac_powered = true;
 		ret = tas2764_update_pwr_ctrl(tas2764);
 		if (ret)
@@ -408,6 +502,14 @@ static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 	if (mute) {
 		/* Wait for ramp-down */
 		usleep_range(6000, 7000);
+
+		if (tas2764->deferred_shutdown) {
+			/* the bus still runs: shut down once its clock has stopped */
+			WRITE_ONCE(tas2764->stream_stopped, true);
+			schedule_delayed_work(&tas2764->shutdown_work,
+					      msecs_to_jiffies(TAS2764_DEFERRED_SHUTDOWN_MS));
+			return 0;
+		}
 
 		tas2764->dac_powered = false;
 		ret = tas2764_update_pwr_ctrl(tas2764);
@@ -934,34 +1036,30 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 	tas2764_reset(tas2764);
 	regmap_reinit_cache(tas2764->regmap, &tas2764_i2c_regmap);
 
+	/* The reset cleared the idle slot setup: make the next set_tdm_idle() write it */
+	tas2764->idle_slot_config.tx_mask = 0;
+	tas2764->idle_slot_config.tx_mode = SND_SOC_DAI_TDM_IDLE_NONE;
+
 	if (tas2764->irq) {
 		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK0, 0x00);
 		if (ret < 0)
-			return ret;
+			goto err_sdz;
 
 		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK1, 0xff);
 		if (ret < 0)
-			return ret;
+			goto err_sdz;
 
 		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK2, 0xff);
 		if (ret < 0)
-			return ret;
+			goto err_sdz;
 
 		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK3, 0xff);
 		if (ret < 0)
-			return ret;
+			goto err_sdz;
 
 		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK4, 0xff);
 		if (ret < 0)
-			return ret;
-
-		ret = devm_request_threaded_irq(tas2764->dev, tas2764->irq, NULL, tas2764_irq,
-						IRQF_ONESHOT | IRQF_SHARED | IRQF_TRIGGER_LOW,
-						"tas2764", tas2764);
-		if (ret && tas2764->sdz_group)
-			return dev_err_probe(tas2764->dev, ret, "SDZ group needs its fault IRQ\n");
-		if (ret)
-			dev_warn(tas2764->dev, "failed to request IRQ: %d\n", ret);
+			goto err_sdz;
 	}
 
 	if (tas2764->i_sense_slot != -1 && tas2764->v_sense_slot != -1) {
@@ -969,7 +1067,7 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 						   tas2764->v_sense_slot);
 
 		if (ret < 0)
-			return ret;
+			goto err_sdz;
 	}
 
 	switch (tas2764->devid) {
@@ -978,7 +1076,7 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 					TAS2764_PWR_CTRL_BOP_SRC,
 					TAS2764_PWR_CTRL_BOP_SRC);
 		if (ret < 0)
-			return ret;
+			goto err_sdz;
 
 		for (i = 0; i < ARRAY_SIZE(sn012776_bop_presets); i++) {
 			ret = snd_soc_component_write(component,
@@ -986,26 +1084,59 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 						sn012776_bop_presets[i]);
 
 			if (ret < 0)
-				return ret;
+				goto err_sdz;
 		}
 
 		/* Apply all enabled Apple quirks */
 		ret = tas2764_apply_init_quirks(tas2764);
 
 		if (ret < 0)
-			return ret;
+			goto err_sdz;
 
 		break;
 	default:
 		break;
 	}
 
+	/*
+	 * Last, so that no failure leaves the handler behind: the IRQ belongs to the I2C
+	 * device, which outlives the component, and the remove frees it.
+	 */
+	if (tas2764->irq) {
+		ret = devm_request_threaded_irq(tas2764->dev, tas2764->irq, NULL, tas2764_irq,
+						IRQF_ONESHOT | IRQF_SHARED | IRQF_TRIGGER_LOW,
+						"tas2764", tas2764);
+		if (ret && tas2764->sdz_group) {
+			dev_err_probe(tas2764->dev, ret, "SDZ group needs its fault IRQ\n");
+			goto err_sdz;
+		}
+		if (ret)
+			dev_warn(tas2764->dev, "failed to request IRQ: %d\n", ret);
+		else
+			tas2764->irq_requested = true;
+	}
+
 	return 0;
+
+err_sdz:
+	/* Undo the power-up: ASoC doesn't call the remove after a failed probe */
+	if (tas2764->sdz_gpio)
+		gpiod_set_value_cansleep(tas2764->sdz_gpio, 0);
+	if (!tas2764_group_failed(tas2764))
+		regulator_disable(tas2764->sdz_reg);
+	return ret;
 }
 
 static void tas2764_codec_remove(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+
+	if (tas2764->irq_requested) {
+		devm_free_irq(tas2764->dev, tas2764->irq, tas2764);
+		tas2764->irq_requested = false;
+	}
+
+	tas2764_flush_shutdown(tas2764);
 
 	/* A failed group's supply was forced off: there is no enable left to balance. */
 	if (tas2764_group_failed(tas2764))
@@ -1148,6 +1279,9 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 	if (ret)
 		tas2764->v_sense_slot = -1;
 
+	tas2764->deferred_shutdown = of_property_read_bool(dev->of_node,
+							   "apple,deferred-shutdown");
+
 	return tas2764_group_join(dev, tas2764);
 }
 
@@ -1165,6 +1299,10 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 
 	tas2764->dev = &client->dev;
 	tas2764->irq = client->irq;
+	INIT_DELAYED_WORK(&tas2764->shutdown_work, tas2764_shutdown_work);
+	result = devm_mutex_init(&client->dev, &tas2764->fault_lock);
+	if (result)
+		return result;
 	i2c_set_clientdata(client, tas2764);
 	dev_set_drvdata(&client->dev, tas2764);
 

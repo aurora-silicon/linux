@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/soc/apple/apple,t6041-aop.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T604x Always-On Processor
+title: Apple T604x and T8132 Always-On Processor
 
 maintainers:
   - Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
@@ -16,9 +16,15 @@ description:
   reaches its services through the RTKit endpoints. The firmware's external
   code and log segments live in DRAM, and the bootloader reserves them.
 
+  On T8132 the bootloader also programs the AOP DART's address filter (DAPF)
+  and reserves its windows, which the firmware reaches through its DART at
+  their physical addresses.
+
 properties:
   compatible:
-    const: apple,t6041-aop
+    enum:
+      - apple,t6041-aop
+      - apple,t8132-aop
 
   reg:
     minItems: 2
@@ -47,11 +53,12 @@ properties:
 
   memory-region:
     minItems: 1
-    maxItems: 4
+    maxItems: 18
     description:
-      The firmware segments in DRAM (its external code and its log), filled in
-      by the bootloader from the ADT. The iommu-addresses property of each
-      region gives the address the firmware uses for it.
+      The firmware segments in DRAM (its external code and its log) and, on
+      T8132, the DAPF windows, filled in by the bootloader from the ADT. The
+      iommu-addresses property of each region gives the address the firmware
+      uses for it.
 
   audio:
     type: object
@@ -92,6 +99,16 @@ required:
   - mboxes
   - mbox-names
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t6041-aop
+    then:
+      properties:
+        memory-region:
+          maxItems: 4
 
 additionalProperties: false
 

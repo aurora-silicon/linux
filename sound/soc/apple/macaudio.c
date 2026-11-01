@@ -27,6 +27,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
 #include <linux/suspend.h>
 #include <sound/core.h>
 #include <sound/jack.h>
@@ -125,6 +126,12 @@ struct macaudio_platform_cfg {
 	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
 	 */
 	int jack_max_vol;
+	/*
+	 * The speaker front-end's channel count where the CPU component's
+	 * stream has more slots than amps (0: one channel per amp). The amps
+	 * keep the first slots in codec order; the others carry silence.
+	 */
+	unsigned int speaker_fe_channels;
 };
 
 static const char *volume_control_names[] = {
@@ -154,6 +161,12 @@ static const char *volume_control_names[] = {
 struct ma_codec_idle {
 	int idle_mode;
 	u32 idle_mask;
+};
+
+/* A speaker volume control and its value, as the system-sleep lock found it */
+struct macaudio_pm_volume {
+	struct snd_kcontrol *kctl;
+	long value[2];
 };
 
 struct macaudio_snd_data {
@@ -201,6 +214,15 @@ struct macaudio_snd_data {
 	/* Between PM_SUSPEND_PREPARE and PM_POST_SUSPEND: the speaker volumes stay locked */
 	bool pm_quiesced;
 	struct notifier_block pm_nb;
+	/*
+	 * The speaker volumes as the system-sleep lock found them. Locking clips
+	 * them to its ceiling and unlocking only lifts the ceiling; the daemon
+	 * keeps its lease across the sleep and does not set them again.
+	 */
+	struct macaudio_pm_volume *pm_volumes;
+	unsigned int pm_nr_volumes;
+	/* Allocated with them, so that setting them again cannot fail */
+	struct snd_ctl_elem_value *pm_uval;
 
 	/*
 	 * Software-gain amplifier: a lower gain cannot change samples that
@@ -447,6 +469,113 @@ static void macaudio_lock_fail_work(struct work_struct *work)
 	macaudio_stop_playback(ma, false);
 }
 
+static void macaudio_pm_volumes_drop(struct macaudio_snd_data *ma)
+{
+	kfree(ma->pm_volumes);
+	kfree(ma->pm_uval);
+	ma->pm_volumes = NULL;
+	ma->pm_nr_volumes = 0;
+	ma->pm_uval = NULL;
+}
+
+/*
+ * Keep the speaker volumes before the system-sleep lock clips them.
+ *
+ * Context: volume_lock_mutex and the card's controls_rwsem held, so the daemon
+ * cannot set a volume between this and the clip.
+ */
+static void macaudio_pm_volumes_save(struct macaudio_snd_data *ma)
+{
+	const char *name = volume_control_names[ma->cfg->amp];
+	struct snd_ctl_elem_value *uval = NULL;
+	struct macaudio_pm_volume *vols = NULL;
+	struct snd_kcontrol *kctl;
+	unsigned int nr = 0, i = 0;
+	int ret;
+
+	lockdep_assert_held(&ma->volume_lock_mutex);
+	lockdep_assert_held(&ma->card.snd_card->controls_rwsem);
+
+	if (!ma->has_safety || !name || ma->card.snd_card->shutdown)
+		return;
+	/*
+	 * Locked already, as after a sleep the daemon has not pinged since:
+	 * the volumes are at the ceiling, and those from before it are kept.
+	 */
+	if (!ma->speaker_volume_unlocked)
+		return;
+	macaudio_pm_volumes_drop(ma);
+
+	list_for_each_entry(kctl, &ma->card.snd_card->controls, list)
+		if (snd_soc_control_matches(kctl, name))
+			nr++;
+	if (!nr)
+		return;
+
+	vols = kzalloc_objs(*vols, nr);
+	uval = kzalloc_obj(*uval);
+	if (!vols || !uval)
+		goto out;
+
+	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
+		if (!snd_soc_control_matches(kctl, name))
+			continue;
+		memset(uval, 0, sizeof(*uval));
+		uval->id = kctl->id;
+		ret = kctl->get(kctl, uval);
+		if (ret < 0) {
+			dev_warn(ma->card.dev, "Failed to keep volume %s for the system sleep: %d\n",
+				 kctl->id.name, ret);
+			goto out;
+		}
+		vols[i].kctl = kctl;
+		vols[i].value[0] = uval->value.integer.value[0];
+		vols[i].value[1] = uval->value.integer.value[1];
+		i++;
+	}
+
+	ma->pm_volumes = vols;
+	ma->pm_nr_volumes = i;
+	ma->pm_uval = uval;
+	return;
+out:
+	kfree(uval);
+	kfree(vols);
+}
+
+/*
+ * At the unlock after a system sleep: the volumes the daemon had set.
+ *
+ * Context: volume_lock_mutex and the card's controls_rwsem held, so no volume
+ * write races these.
+ */
+static void macaudio_pm_volumes_restore(struct macaudio_snd_data *ma)
+{
+	struct snd_ctl_elem_value *uval = ma->pm_uval;
+	unsigned int i;
+	int ret;
+
+	if (!ma->pm_volumes)
+		return;
+
+	for (i = 0; i < ma->pm_nr_volumes; i++) {
+		struct snd_kcontrol *kctl = ma->pm_volumes[i].kctl;
+
+		memset(uval, 0, sizeof(*uval));
+		uval->id = kctl->id;
+		uval->value.integer.value[0] = ma->pm_volumes[i].value[0];
+		uval->value.integer.value[1] = ma->pm_volumes[i].value[1];
+		ret = kctl->put(kctl, uval);
+		if (ret < 0)
+			dev_err(ma->card.dev, "Failed to restore volume %s: %d\n",
+				kctl->id.name, ret);
+		else if (ret > 0)
+			snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &kctl->id);
+	}
+	macaudio_pm_volumes_drop(ma);
+}
+
 static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 {
 	int i;
@@ -507,6 +636,8 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 		}
 
 		macaudio_vlimit_unlock(ma, unlock);
+		if (unlock)
+			macaudio_pm_volumes_restore(ma);
 		if (!unlock && ma->cfg->amp == AMP_MAX98360A) {
 			/* Samples already converted at the old gain must not play */
 			atomic_inc(&ma->sw_gain_lock_epoch);
@@ -538,6 +669,12 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 		return NOTIFY_DONE;
 	}
 
+	/*
+	 * Volume writes hold the controls for writing: none can land between
+	 * keeping the volumes and clipping them. Control writes take
+	 * volume_lock_mutex inside it as well.
+	 */
+	down_read(&ma->card.snd_card->controls_rwsem);
 	mutex_lock(&ma->volume_lock_mutex);
 	ma->pm_quiesced = quiesce;
 	/*
@@ -549,9 +686,11 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 	if (quiesce) {
 		cancel_delayed_work(&ma->lock_timeout_work);
 		ma->speaker_lock_remain = 0;
+		macaudio_pm_volumes_save(ma);
 	}
 	macaudio_vlimit_update(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
+	up_read(&ma->card.snd_card->controls_rwsem);
 
 	return NOTIFY_OK;
 }
@@ -645,10 +784,13 @@ static void macaudio_vlimit_update_work(struct work_struct *wrk)
         struct macaudio_snd_data *ma = container_of(wrk,
 						    struct macaudio_snd_data, lock_update_work);
 
+	/* An unlock here sets the kept volumes again: no volume write may race it */
+	down_read(&ma->card.snd_card->controls_rwsem);
 	if (ma->bes_active)
 		macaudio_vlimit_enable_timeout(ma);
 	else
 		macaudio_vlimit_disable_timeout(ma);
+	up_read(&ma->card.snd_card->controls_rwsem);
 }
 
 static bool macaudio_sw_gain_pcm(struct snd_pcm_substream *substream)
@@ -951,6 +1093,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		/* Save the max number of channels on the platform */
 		if (nchannels > ma->max_channels)
 			ma->max_channels = nchannels;
+		if (speakers && ma->cfg->speaker_fe_channels > ma->max_channels)
+			ma->max_channels = ma->cfg->speaker_fe_channels;
 
 		/*
 		 * If there is a single speaker, assign two channels to it, because
@@ -1657,6 +1801,15 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
 	unregister_pm_notifier(&ma->pm_nb);
+	/*
+	 * No back-end can trigger any more, but a lock update it queued takes
+	 * the card's controls_rwsem: finish it while the snd_card still exists.
+	 */
+	cancel_work_sync(&ma->lock_update_work);
+	cancel_delayed_work_sync(&ma->lock_timeout_work);
+	mutex_lock(&ma->volume_lock_mutex);
+	macaudio_pm_volumes_drop(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
 	return 0;
 }
 
@@ -1942,6 +2095,8 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 	cancel_delayed_work(&ma->lock_timeout_work);
 	ma->speaker_lock_remain = 0;
 	ma->speaker_lock_timeout = 0;
+	/* A new owner sets the volumes itself */
+	macaudio_pm_volumes_drop(ma);
 
 	ma->speaker_lock_owner = owner;
 	macaudio_vlimit_update(ma);
@@ -2120,6 +2275,28 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 };
 
 /*
+ * J713 (T8132, MacBook Air 13" M4): the J616s stream, six 32-bit playback
+ * and twelve 16-bit sense slots in the same 250-bit frame, with four
+ * SN012776 amps, a woofer and a tweeter per side, on the first four and the
+ * first eight. The front-end carries all six channels; the last two are
+ * silent.
+ */
+struct macaudio_platform_cfg macaudio_j713_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W1T,
+	.stereo = true,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	.speaker_fe_channels = 6,
+};
+
+/*
  * The J616s headphone jack, a card of its own: a CS42L84 on the AOP's
  * "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
  * frame at 48 kHz (3.072 MHz, the primary front-end's ratio) with a
@@ -2207,6 +2384,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j616-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
+	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
+	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
+	/* The J713 jack runs on the AOP like the J616s one, with the same cap. */
+	{ .compatible = "apple,j713-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
@@ -2342,4 +2523,5 @@ MODULE_LICENSE("GPL");
 
 #if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
 #include "macaudio-admission-test.h"
+#include "macaudio-pm-volumes-test.h"
 #endif
