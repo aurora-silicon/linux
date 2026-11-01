@@ -10,6 +10,7 @@
 struct pmgr_ps_test_reg {
 	u32 val;
 	bool stuck;		/* the actual state no longer follows the target */
+	unsigned int active_reads;	/* reads before a delayed power-on ACK */
 	unsigned int auto_writes;	/* writes that enabled automatic PM */
 };
 
@@ -17,6 +18,12 @@ static int pmgr_ps_test_read(void *ctx, unsigned int reg, unsigned int *val)
 {
 	struct pmgr_ps_test_reg *r = ctx;
 
+	if (!r->stuck && r->active_reads &&
+	    FIELD_GET(APPLE_PMGR_PS_TARGET, r->val) == APPLE_PMGR_PS_ACTIVE &&
+	    !--r->active_reads) {
+		r->val &= ~APPLE_PMGR_PS_ACTUAL;
+		r->val |= FIELD_PREP(APPLE_PMGR_PS_ACTUAL, APPLE_PMGR_PS_ACTIVE);
+	}
 	*val = r->val;
 	return 0;
 }
@@ -24,7 +31,7 @@ static int pmgr_ps_test_read(void *ctx, unsigned int reg, unsigned int *val)
 static int pmgr_ps_test_write(void *ctx, unsigned int reg, unsigned int val)
 {
 	struct pmgr_ps_test_reg *r = ctx;
-	u32 actual = r->stuck ? FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val) :
+	u32 actual = r->stuck || r->active_reads ? FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val) :
 				FIELD_GET(APPLE_PMGR_PS_TARGET, val);
 
 	if (val & APPLE_PMGR_AUTO_ENABLE)
@@ -130,10 +137,41 @@ static void pmgr_ps_power_on_fails_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, r->auto_writes, 0U);
 }
 
+/* An ACK later than the old 100 us budget must complete before auto-PM. */
+static void pmgr_ps_power_on_delayed_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_CLKGATE, false, &r);
+	/* Each unsuccessful poll delays 1 us; this exceeds the old budget. */
+	r->active_reads = 250;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), 0);
+	KUNIT_EXPECT_EQ(test, r->active_reads, 0U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, r->auto_writes, 1U);
+}
+
+/* genpd ignores noirq power-on errors: retain the on request, but fail. */
+static void pmgr_ps_power_on_sleep_stuck_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_CLKGATE, false, &r);
+	ps->system_sleep = true;
+	r->stuck = true;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val), APPLE_PMGR_PS_CLKGATE);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val), APPLE_PMGR_PS_ACTIVE);
+}
+
 static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_test),
 	KUNIT_CASE(pmgr_ps_power_off_undo_test),
 	KUNIT_CASE(pmgr_ps_power_on_fails_test),
+	KUNIT_CASE(pmgr_ps_power_on_delayed_test),
+	KUNIT_CASE(pmgr_ps_power_on_sleep_stuck_test),
 	{}
 };
 

@@ -37,6 +37,7 @@
 #define APPLE_PMGR_PS_PWRGATE   0x0
 
 #define APPLE_PMGR_PS_SET_TIMEOUT 100
+#define APPLE_PMGR_PS_ACTIVE_TIMEOUT 10000
 #define APPLE_PMGR_RESET_TIME 1
 #define APPLE_PMGR_T8132_RESET_TIME 10
 
@@ -69,7 +70,14 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	int ret;
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	u32 reg, cur;
-	u32 timeout = ps->strict_state ? 10000 : APPLE_PMGR_PS_SET_TIMEOUT;
+	/*
+	 * A power-on includes waking the domain's upstream power/clock path.
+	 * In particular, GFX can still be clock-gated after 100 us on resume.
+	 * Use the same bounded power-on budget as m1n1, while still requiring
+	 * an actual-state acknowledgment and reporting a stuck domain.
+	 */
+	u32 timeout = ps->strict_state || pstate == APPLE_PMGR_PS_ACTIVE ?
+		APPLE_PMGR_PS_ACTIVE_TIMEOUT : APPLE_PMGR_PS_SET_TIMEOUT;
 
 	ret = regmap_read(ps->regmap, ps->offset, &reg);
 	if (ret < 0)
@@ -124,7 +132,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 		ret = regmap_read_poll_timeout_atomic(
 			ps->regmap, ps->offset, cur,
 			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) >= APPLE_PMGR_PS_CLKGATE, 1,
-			APPLE_PMGR_PS_SET_TIMEOUT);
+			timeout);
 	} else {
 		ret = regmap_read_poll_timeout_atomic(
 			ps->regmap, ps->offset, cur,
