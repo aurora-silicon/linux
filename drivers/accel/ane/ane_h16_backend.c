@@ -77,6 +77,8 @@ static const char *const ane_h16_build_names[ANE_H16_PRELOAD_BUILDS] = {
 
 static struct debugfs_blob_wrapper ane_h16_dump[2];
 static struct dentry *ane_h16_debugfs;
+/* Failure-only copies; firmware remains live, so these are not atomic dumps. */
+static struct debugfs_blob_wrapper ane_h16_failure[3 + ANE_FW_SHARED_MAX];
 
 static bool ane_h16_observing(void)
 {
@@ -88,11 +90,15 @@ static struct debugfs_blob_wrapper ane_h16_job_result;
 
 void ane_h16_backend_exit(void)
 {
+	unsigned int i;
+
 	debugfs_remove_recursive(ane_h16_debugfs);
 	ane_h16_debugfs = NULL;
 	vfree(ane_h16_dump[0].data);
 	vfree(ane_h16_dump[1].data);
 	vfree(ane_h16_job_result.data);
+	for (i = 0; i < ARRAY_SIZE(ane_h16_failure); i++)
+		vfree(ane_h16_failure[i].data);
 	ane_h16_job_dev = NULL;
 }
 
@@ -1028,6 +1034,8 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 			 count, ret, j.used);
 	}
 	vfree(ane_h16_job_result.data);
+	for (i = 0; i < ARRAY_SIZE(ane_h16_failure); i++)
+		vfree(ane_h16_failure[i].data);
 	ane_h16_job_result.data = j.out;
 	ane_h16_job_result.size = j.used;
 	mutex_unlock(&ane_h16_lock);
@@ -1070,6 +1078,56 @@ static void ane_h16_job_publish(struct ane_h16_device *h)
 	debugfs_create_file("job", 0200, ane_h16_debugfs, NULL, &ane_h16_job_fops);
 	debugfs_create_blob("result", 0400, ane_h16_debugfs, &ane_h16_job_result);
 	dev_info(h->dev, "H16 job interface in debugfs ane_h16/\n");
+}
+
+/* Never alter DMA ownership or reset the firmware while observing a failure. */
+static void ane_h16_failure_copy(struct ane_h16_device *h, unsigned int index,
+				const char *name, const void *cpu, size_t size, u64 dva)
+{
+	struct debugfs_blob_wrapper *blob = &ane_h16_failure[index];
+
+	if (!cpu || !size || blob->data)
+		return;
+	blob->data = vmalloc(size);
+	if (!blob->data)
+		return;
+	dma_rmb();
+	memcpy(blob->data, cpu, size);
+	blob->size = size;
+	debugfs_create_blob(name, 0400, ane_h16_debugfs, blob);
+	dev_info(h->dev, "H16 failure snapshot %s DVA=%llx bytes=%zx\n", name, dva, size);
+}
+
+static void ane_h16_failure_publish(struct ane_h16_device *h)
+{
+	struct ane_h16_boot *b = &h->boot;
+	struct ane_fw_transport *t = &b->transport;
+	void *live;
+	unsigned int i;
+
+	/* 25F84 fw IRQ receiver reads this pending register (firmware 0x8c88).
+	 * Read only: no inferred clear/ack semantics are used here.
+	 */
+	if (b->soc->doorbell == 0x1884000)
+		dev_info(h->dev, "H16 failure firmware IRQ pending=%x\n",
+			 readl(h->window[ANE_H16_ENGINE] + 0x1888000));
+	if (!ane_h16_debugfs)
+		ane_h16_debugfs = debugfs_create_dir("ane_h16", NULL);
+	live = memremap(h->preload_phys[1], b->soc->preload_size[1], MEMREMAP_WB);
+	if (live) {
+		ane_h16_failure_copy(h, 0, "failure-data", live,
+				     b->soc->preload_size[1], b->soc->preload_dva[1]);
+		memunmap(live);
+	}
+	ane_h16_failure_copy(h, 1, "failure-ipc", b->ipc.cpu, b->ipc.size, b->ipc.dva);
+	ane_h16_failure_copy(h, 2, "failure-pool", b->pool.cpu, b->pool.size, b->pool.dva);
+	for (i = 0; i < t->shared_count; i++) {
+		char name[32];
+
+		snprintf(name, sizeof(name), "failure-shared-%u", i);
+		ane_h16_failure_copy(h, 3 + i, name, t->shared[i].cpu,
+				     t->shared[i].size, t->shared[i].dva);
+	}
 }
 
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc,
@@ -1130,6 +1188,8 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 		goto cleanup;
 	/* Bind even on a post-RUN error. devres teardown must never reclaim DMA. */
 	platform_set_drvdata(pdev, h);
+	if (ret && h16_job)
+		ane_h16_failure_publish(h);
 	if (!ret) {
 		dev_info(h->dev, "H16 stage %u complete%s\n", stage,
 			 h->boot.ran ? "; held until reboot" : "");
