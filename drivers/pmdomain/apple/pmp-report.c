@@ -1673,8 +1673,9 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node != ent->report_node)
 			continue;
-		/* T6041 can defer residency, but a DVFS update needs a running PMP. */
-		if (ent->dvfs && !apple_pmp_report_running(rep)) {
+		/* DVFS must follow an acknowledged, non-deferred residency request. */
+		if (ent->dvfs &&
+		    (READ_ONCE(rep->defer) || !apple_pmp_report_running(rep))) {
 			ret = -EAGAIN;
 			break;
 		}
