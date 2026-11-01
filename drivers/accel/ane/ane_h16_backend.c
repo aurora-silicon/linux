@@ -795,6 +795,7 @@ enum {
 	ANE_H16_JOB_EVENT,	/* u64 uuid, u32 timeout ms; result: reports up to the terminal one */
 	ANE_H16_JOB_PEEK,	/* u64 dva, u64 size; result: the bytes */
 	ANE_H16_JOB_QUIET,	/* result only: UUID, handles, requested us, busy, CPU; two counter anchors */
+	ANE_H16_JOB_GAP,	/* result only: UUID, requested us, CPU; two gap counter anchors */
 };
 
 #define ANE_H16_JOB_FILL_PROGRAM BIT(0)	/* u32 program handle at +8 */
@@ -895,6 +896,9 @@ MODULE_PARM_DESC(h16_job_quiet_wake_us, "Optional private periodic wakes inside 
 static unsigned int h16_job_quiet_work_ns;
 module_param(h16_job_quiet_work_ns, uint, 0444);
 MODULE_PARM_DESC(h16_job_quiet_work_ns, "Private work after each quiet wake, at most10000ns");
+static unsigned int h16_job_gap_us;
+module_param(h16_job_gap_us, uint, 0444);
+MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial EXECUTE, max100us/default0; included in throughput");
 static unsigned int h16_job_poll_us = 10;
 module_param(h16_job_poll_us, uint, 0444);
 MODULE_PARM_DESC(h16_job_poll_us, "Diagnostic job polling sleep10..1000us, default10");
@@ -1114,6 +1118,32 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 	}
 	if (ALIGN(t->pool_used, ANE_FW_SLOT_SIZE) + length > t->pool.size && !j->outstanding)
 		t->pool_used = j->pool_mark;
+	/* A diagnostic recovery interval for RPC report retirement. Never hold
+	 * back an already-pipelined request or the first call of a new identity.
+	 * Its separate record keeps the interval in complete cycle accounting.
+	 */
+	if (h16_job_gap_us && length >= 0x28 &&
+	    get_unaligned_le16(command + 4) == ANE_H16_EXECUTE &&
+	    !j->outstanding && j->quiet_warmed &&
+	    !memcmp(command + 8, j->quiet_warm_handles, sizeof(j->quiet_warm_handles))) {
+		u8 gap[16];
+		u64 gap_counters[2], began;
+		u32 us = min(h16_job_gap_us, 100U);
+
+		put_unaligned_le64(get_unaligned_le64(command + 0x20), gap);
+		put_unaligned_le32(us, gap + 8);
+		put_unaligned_le32(raw_smp_processor_id(), gap + 12);
+		began = ktime_get_ns();
+		gap_counters[0] = get_cycles();
+		udelay(us);
+		gap_counters[1] = get_cycles();
+		ret = ane_h16_job_emit_counters(j, ANE_H16_JOB_GAP, 0,
+					      ktime_get_ns() - began, gap, sizeof(gap), gap_counters, 2);
+		if (ret) {
+			kfree(command);
+			return ret;
+		}
+	}
 	start = ktime_get_ns();
 	counters[0] = get_cycles();
 	ret = ane_fw_transport_publish(t, channel, command, length,
