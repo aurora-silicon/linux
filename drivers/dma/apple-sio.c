@@ -51,6 +51,12 @@
 #define SIO_SHMEM_SIZE		0x1000
 #define SIO_NO_DESC_SLOTS	64
 
+/* Protocol 9 publishes entry counts, rather than allocation sizes. */
+#define SIO_V9_SEGMENTS		0xaaa
+#define SIO_V9_SEGMENT_SIZE	12
+#define SIO_V9_RESPONSES		0x1b80
+#define SIO_V9_RESPONSE_SIZE	16
+
 /*
  * There are two kinds of 'transaction descriptors' in play here.
  *
@@ -80,6 +86,8 @@ struct sio_coproc_desc {
 	u64 pad3;
 } __packed;
 static_assert(sizeof(struct sio_coproc_desc) == 48);
+static_assert(56 + SIO_NO_DESC_SLOTS * sizeof(struct sio_coproc_desc) <=
+	      SIO_V9_SEGMENTS * SIO_V9_SEGMENT_SIZE);
 
 struct sio_shmem_chan_config {
 	u32 datashape;
@@ -120,7 +128,11 @@ struct sio_data {
 	struct dma_device dma;
 	struct device *dev;
 	struct apple_rtkit *rtk;
+	u32 protocol;
 	void *shmem;
+	dma_addr_t shmem_iova;
+	void *responses;
+	dma_addr_t responses_iova;
 	struct sio_coproc_desc *shmem_desc_base;
 	unsigned long *desc_allocated;
 
@@ -712,6 +724,7 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 
 	switch (type) {
 	case MSG_STARTED:
+		sio->protocol = data;
 		dev_info(sio->dev, "SIO protocol v%u\n", data);
 		type = MSG_ACK; /* Pretend this is an ACK */
 		fallthrough;
@@ -897,41 +910,166 @@ static int sio_device_config(struct dma_chan *chan,
 	return ret;
 }
 
-static int sio_alloc_shmem(struct sio_data *sio)
+static int sio_set_param(struct sio_data *sio, u32 key, u32 val)
 {
-	dma_addr_t iova;
 	int err;
 
-	sio->shmem = dma_alloc_coherent(sio->dev, SIO_SHMEM_SIZE,
-					&iova, GFP_KERNEL | __GFP_ZERO);
+	err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_SETUP) |
+			    FIELD_PREP(SIOMSG_PARAM, key & 0xff) |
+			    FIELD_PREP(SIOMSG_EP, key >> 8) |
+			    FIELD_PREP(SIOMSG_DATA, val));
+	if (err == 1)
+		return 0;
+	if (!err)
+		err = -ENXIO;
+	return dev_err_probe(sio->dev, err, "sending SIO parameter %#x value %#x\n",
+			     key, val);
+}
+
+/*
+ * Control tables must precede performance and DMA state. In particular, the
+ * shim size (0x23) makes the firmware consume the shim table. Do not enable
+ * the performance endpoint or publish DMA response state before that ACK.
+ */
+static const u16 sio_v9_param_order[] = {
+	0x0f, 0x10,	/* panic buffer */
+	0x1a, 0x1b,	/* map ranges */
+	0x1e, 0x1f,	/* ASC-wrapper tunables */
+	0x20, 0x21,	/* optional miscellaneous tunables */
+	0x24, 0x25,	/* optional power-state register table */
+	0x22, 0x23,	/* DMA shims */
+	0x1c, 0x1d,	/* device types, after shims */
+	0x30d, 0x30e,	/* performance endpoint, after control tables */
+};
+
+#define SIO_V9_REQUIRED_PARAMS (GENMASK(15, 0) & ~GENMASK(9, 6))
+
+static int sio_send_v9_dt_params(struct sio_data *sio, const __be32 *params,
+				 unsigned int nparams,
+				 int (*set_param)(struct sio_data *, u32, u32))
+{
+	u32 values[ARRAY_SIZE(sio_v9_param_order)];
+	u32 present = 0;
+	unsigned int i, j;
+	int err;
+
+	if (!nparams || nparams % 2)
+		return -EINVAL;
+
+	for (i = 0; i < nparams; i += 2) {
+		u32 key = be32_to_cpu(params[i]);
+
+		/* Replace the loader's undersized response mapping with our own. */
+		if (key == 0x0b || key == 0x0c)
+			continue;
+		for (j = 0; j < ARRAY_SIZE(sio_v9_param_order); j++)
+			if (key == sio_v9_param_order[j])
+				break;
+		if (j == ARRAY_SIZE(sio_v9_param_order) || (present & BIT(j)))
+			return -EINVAL;
+		present |= BIT(j);
+		values[j] = be32_to_cpu(params[i + 1]);
+	}
+	if ((present & SIO_V9_REQUIRED_PARAMS) != SIO_V9_REQUIRED_PARAMS)
+		return -EINVAL;
+	/* An optional table still requires both its address and its size. */
+	for (i = 0; i < ARRAY_SIZE(sio_v9_param_order); i += 2)
+		if (!!(present & BIT(i)) != !!(present & BIT(i + 1)))
+			return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(sio_v9_param_order); i++) {
+		if (!(present & BIT(i)))
+			continue;
+		err = set_param(sio, sio_v9_param_order[i], values[i]);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static void sio_free_v9_shmem(void *data)
+{
+	struct sio_data *sio = data;
+	int err;
+
+	/* An acknowledged shutdown must precede releasing firmware DMA targets. */
+	err = apple_rtkit_shutdown(sio->rtk);
+	if (err) {
+		dev_err(sio->dev, "SIO shutdown failed: %d; retaining DMA buffers\n", err);
+		return;
+	}
+	dma_free_coherent(sio->dev, SIO_V9_RESPONSES * SIO_V9_RESPONSE_SIZE,
+			  sio->responses, sio->responses_iova);
+	dma_free_coherent(sio->dev, SIO_V9_SEGMENTS * SIO_V9_SEGMENT_SIZE,
+			  sio->shmem, sio->shmem_iova);
+}
+
+static int sio_send_v9_shmem(struct sio_data *sio,
+			     int (*set_param)(struct sio_data *, u32, u32))
+{
+	const struct {
+		u32 key;
+		u32 value;
+	} params[] = {
+		{ 1, sio->shmem_iova >> 12 },
+		{ 2, SIO_V9_SEGMENTS },
+		{ 0x0b, sio->responses_iova >> 12 },
+		{ 0x0c, SIO_V9_RESPONSES },
+	};
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < ARRAY_SIZE(params); i++) {
+		err = set_param(sio, params[i].key, params[i].value);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int sio_alloc_shmem(struct sio_data *sio)
+{
+	bool v9 = sio->protocol == 9;
+	size_t size = v9 ? SIO_V9_SEGMENTS * SIO_V9_SEGMENT_SIZE : SIO_SHMEM_SIZE;
+	int err;
+
+	sio->shmem = dma_alloc_coherent(sio->dev, size,
+					&sio->shmem_iova, GFP_KERNEL | __GFP_ZERO);
 	if (!sio->shmem)
 		return -ENOMEM;
 
 	sio->shmem_desc_base = (struct sio_coproc_desc *) (sio->shmem + 56);
 	sio->desc_allocated = devm_kzalloc(sio->dev, SIO_NO_DESC_SLOTS / 32,
 					   GFP_KERNEL);
-	if (!sio->desc_allocated)
-		return -ENOMEM;
-
-	err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_SETUP) |
-			    FIELD_PREP(SIOMSG_PARAM, 1) |
-			    FIELD_PREP(SIOMSG_DATA, iova >> 12));
-	if (err != 1) {
-		if (err == 0)
-			err = -EINVAL;
-		return err;
+	if (!sio->desc_allocated) {
+		err = -ENOMEM;
+		goto free_shmem;
 	}
 
-	err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_SETUP) |
-			    FIELD_PREP(SIOMSG_PARAM, 2) |
-			    FIELD_PREP(SIOMSG_DATA, SIO_SHMEM_SIZE));
-	if (err != 1) {
-		if (err == 0)
-			err = -EINVAL;
-		return err;
+	if (v9) {
+		sio->responses = dma_alloc_coherent(sio->dev,
+						    SIO_V9_RESPONSES * SIO_V9_RESPONSE_SIZE,
+						    &sio->responses_iova, GFP_KERNEL | __GFP_ZERO);
+		if (!sio->responses) {
+			err = -ENOMEM;
+			goto free_shmem;
+		}
+		/* Registered before publication, released before the RTKit handle. */
+		err = devm_add_action_or_reset(sio->dev, sio_free_v9_shmem, sio);
+		if (err)
+			return err;
+		return sio_send_v9_shmem(sio, sio_set_param);
 	}
 
-	return 0;
+	err = sio_set_param(sio, 1, sio->shmem_iova >> 12);
+	if (err)
+		return err;
+	return sio_set_param(sio, 2, SIO_SHMEM_SIZE);
+
+free_shmem:
+	/* No address has been published yet. */
+	dma_free_coherent(sio->dev, size, sio->shmem, sio->shmem_iova);
+	return err;
 }
 
 static int sio_send_dt_params(struct sio_data *sio)
@@ -945,6 +1083,13 @@ static int sio_send_dt_params(struct sio_data *sio)
 		err = nparams;
 		goto badprop;
 	}
+	if (sio->protocol == 9) {
+		const __be32 *params = of_get_property(np, propname, NULL);
+
+		if (!params)
+			return -EINVAL;
+		return sio_send_v9_dt_params(sio, params, nparams, sio_set_param);
+	}
 
 	for (i = 0; i < nparams / 2; i++) {
 		u32 key, val;
@@ -956,16 +1101,9 @@ static int sio_send_dt_params(struct sio_data *sio)
 		if (err)
 			goto badprop;
 
-		err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_SETUP) |
-				    FIELD_PREP(SIOMSG_PARAM, key & 0xff) |
-				    FIELD_PREP(SIOMSG_EP, key >> 8) |
-				    FIELD_PREP(SIOMSG_DATA, val));
-		if (err < 1) {
-			if (err == 0)
-				err = -ENXIO;
-			return dev_err_probe(sio->dev, err, "sending SIO parameter %#x value %#x\n",
-					     key, val);
-		}
+		err = sio_set_param(sio, key, val);
+		if (err)
+			return err;
 	}
 
 	return 0;
@@ -1148,4 +1286,5 @@ MODULE_LICENSE("Dual MIT/GPL");
 
 #if IS_ENABLED(CONFIG_APPLE_SIO_KUNIT_TEST)
 #include "apple-sio-probe-test.c"
+#include "apple-sio-boot-test.c"
 #endif
