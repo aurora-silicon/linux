@@ -940,7 +940,31 @@ static void apple_dart_test_resume_reset_retry(struct kunit *test)
 			dart->hw->ttbr_valid | 0x1000);
 }
 
+static void apple_dart_test_strict_engines(struct kunit *test)
+{
+	static const char * const strict[] = {
+		"apple,t8103-avd", "apple,t6000-avd", "apple,t8112-avd", "apple,t6041-avd",
+		"apple,t8132-avd", "apple,t8140-avd", "apple,t6000-ave", "apple,t8112-ave",
+		"apple,t6041-ave", "apple,t8103-ane", "apple,t6021-ane", "apple,t6041-ane",
+		"apple,t8112-isp", "apple,t6041-isp", "apple,isp",
+	};
+	static const char * const lazy[] = {
+		"apple,t6021-ane-mailbox", "apple,asc-mailbox-v4", "apple,t8103-display-pipe",
+		"apple,nvme-ans2", "apple,t8103-dart", "apple,t6000-display-crossbar",
+		"brcm,bcm4378-fmac", "apple,", "avd", "foo,t8112-avd", "apple,t8112-avdx",
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(strict); i++)
+		KUNIT_EXPECT_TRUE_MSG(test, apple_dart_compat_is_strict_engine(strict[i]),
+				      "%s", strict[i]);
+	for (i = 0; i < ARRAY_SIZE(lazy); i++)
+		KUNIT_EXPECT_FALSE_MSG(test, apple_dart_compat_is_strict_engine(lazy[i]),
+				       "%s", lazy[i]);
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
+	KUNIT_CASE(apple_dart_test_strict_engines),
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),
 	KUNIT_CASE(apple_dart_test_independent_remap_roots),
 	KUNIT_CASE(apple_dart_test_before_attach),
