@@ -1111,6 +1111,11 @@ def panel_dimensions(root):
     unit, block = n['unit'], n['block']
     unit = unit.replace('bool modes_lock,modes_admitted,',
                         'bool external_physically_absent,modes_lock,modes_admitted,', 1)
+    # The connector's physical size, which DRM keeps in display_info.
+    old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;'
+    assert unit.count(old) == 1
+    unit = unit.replace(old, 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; '
+                        'int width_mm,height_mm; } display_info;')
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     unit = unit.replace(block(unit, 'static bool __attribute__((unused)) dcp_has_panel('),
                         block(dcp, 'bool dcp_has_panel('))
