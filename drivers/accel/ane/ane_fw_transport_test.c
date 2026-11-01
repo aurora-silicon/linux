@@ -1104,7 +1104,11 @@ static void ane_transport_poll_sleep_test(struct kunit *test)
 {
 	unsigned int max_us;
 
-	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(0, &max_us), 20U);
+	/* A reply within the first 30 us is caught by busy steps, no sleep. */
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(0, &max_us), 0U);
+	KUNIT_EXPECT_EQ(test, max_us, 0U);
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_SPIN_NS - 1, &max_us), 0U);
+	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_SPIN_NS, &max_us), 20U);
 	KUNIT_EXPECT_EQ(test, max_us, 50U);
 	KUNIT_EXPECT_EQ(test, ane_fw_poll_sleep_us(ANE_FW_POLL_FINE_NS - 1, &max_us), 20U);
 	KUNIT_EXPECT_EQ(test, max_us, 50U);

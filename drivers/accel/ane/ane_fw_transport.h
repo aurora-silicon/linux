@@ -2,6 +2,8 @@
 #ifndef __ANE_FW_TRANSPORT_H__
 #define __ANE_FW_TRANSPORT_H__
 
+#include <linux/delay.h>
+
 #include "ane_fw_platform.h"
 #include "ane_fw_protocol.h"
 #include "ane_h16_execute.h"
@@ -30,23 +32,39 @@ struct ane_fw_surface {
 };
 
 /*
- * Sleep bounds between two polls of one wait. Command replies arrive within
- * tens of microseconds and an EXECUTE completes within a few milliseconds,
- * so the first 5 ms poll every 20-50 us: a reply is seen at most ~50 us late
- * instead of a whole millisecond. Long waits (firmware startup, a stalled
- * request) back off to 250 us and, after 50 ms, to the 1 ms cadence, so
- * they cost no more CPU than a fixed 1 ms poll did.
+ * Pacing between two polls of one wait. A command reply arrives within tens
+ * of microseconds, so the first ANE_FW_POLL_SPIN_NS of a wait polls in 2 us
+ * busy steps and sees it without a sleep and its wakeup latency. Up to 5 ms
+ * (a whole inference) each step sleeps 20-50 us; long waits (firmware
+ * startup, a stalled request) back off to 250 us and, after 50 ms, to the
+ * 1 ms cadence, so they cost no more CPU than a fixed 1 ms poll did.
+ * Returns the sleep in microseconds, or 0 for a busy step.
  */
+#define ANE_FW_POLL_SPIN_NS (30ULL * 1000)
+#define ANE_FW_POLL_SPIN_STEP_US 2
 #define ANE_FW_POLL_FINE_NS (5ULL * 1000 * 1000)
 #define ANE_FW_POLL_MEDIUM_NS (50ULL * 1000 * 1000)
 
 static inline unsigned int ane_fw_poll_sleep_us(u64 waited_ns, unsigned int *max_us)
 {
-	unsigned int us = waited_ns < ANE_FW_POLL_FINE_NS ? 20 :
+	unsigned int us = waited_ns < ANE_FW_POLL_SPIN_NS ? 0 :
+			  waited_ns < ANE_FW_POLL_FINE_NS ? 20 :
 			  waited_ns < ANE_FW_POLL_MEDIUM_NS ? 250 : 1000;
 
-	*max_us = us == 20 ? 50 : us + 50;
+	*max_us = !us ? 0 : us == 20 ? 50 : us + 50;
 	return us;
+}
+
+/* One pacing step of a wait that began waited_ns ago (process context). */
+static inline void ane_fw_poll_pause(u64 waited_ns)
+{
+	unsigned int min_us, max_us;
+
+	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
+	if (min_us)
+		usleep_range(min_us, max_us);
+	else
+		udelay(ANE_FW_POLL_SPIN_STEP_US);
 }
 
 /*

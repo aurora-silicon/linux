@@ -379,16 +379,13 @@ static u64 ane_fw_now(void *ctx)
 }
 
 /*
- * Every wait polls. Sleep in the shared short steps first (see
- * ane_fw_poll_sleep_us()) and back off for long waits such as a stalled
- * request, so a stall costs no more CPU than a 1 ms poll.
+ * Every wait polls, with the shared pacing (see ane_fw_poll_sleep_us()):
+ * busy steps for the first 30 us, then short sleeps, backing off for long
+ * waits such as a stalled request.
  */
 static void ane_fw_relax(void *ctx, u64 waited_ns)
 {
-	unsigned int min_us, max_us;
-
-	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
-	usleep_range(min_us, max_us);
+	ane_fw_poll_pause(waited_ns);
 }
 
 static void ane_fw_refused(void *ctx, u64 word0, u64 word1, u64 word2, int error)
