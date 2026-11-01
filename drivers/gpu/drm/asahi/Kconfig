@@ -29,6 +29,7 @@ config DRM_ASAHI_G16
 	bool "Apple M4 (G16G) support (experimental)"
 	depends on DRM_ASAHI && ARM64
 	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
+	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
 	depends on THERMAL_OF
 	help
 	  Rust Asahi backend for the qualified J713/T8132 GPU firmware.

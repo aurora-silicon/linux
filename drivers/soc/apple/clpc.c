@@ -226,6 +226,7 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	if (!np)
 		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
 	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
+	    !of_device_is_compatible(np, "apple,t8132-clpc") &&
 	    !of_device_is_compatible(np, "apple,t8140-clpc")) {
 		of_node_put(np);
 		return -EINVAL;
@@ -510,6 +511,25 @@ static void apple_clpc_gpu_floor_count(struct apple_clpc *clpc, bool released)
 	clpc->gpu_floor_released = released;
 }
 
+/*
+ * The GPU driver's input, where it drives demand instead of the GFX power
+ * state: every rail at its top state while the driver reports work.
+ */
+static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
+					struct apple_clpc_gpu *gpu,
+					unsigned int *demand)
+{
+	u64 updated, sequence;
+	unsigned int rail;
+
+	if (!gpu || hw->gpu_demand ||
+	    !apple_clpc_gpu_active(gpu, &updated, &sequence))
+		return false;
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+		demand[rail] = max(demand[rail], hw->map[rail][APPLE_CLPC_LEVELS - 1]);
+	return true;
+}
+
 static void apple_clpc_sample(struct apple_clpc *clpc)
 {
 	unsigned int demand[APPLE_CLPC_RAILS] = {};
@@ -535,16 +555,8 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		if (demand[rail])
 			reason |= 1;
-	if (clpc->gpu && !clpc->hw->gpu_demand) {
-		u64 updated, sequence;
-
-		if (apple_clpc_gpu_active(clpc->gpu, &updated, &sequence)) {
-			reason |= 2;
-			for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-				demand[rail] = max(demand[rail],
-						clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1]);
-		}
-	}
+	if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))
+		reason |= 2;
 	if (clpc->gpu_pmgr) {
 		/* Both run every sample: each tracks state across samples. */
 		bool late = time_after(now, clpc->gpu_sampled +
@@ -724,9 +736,11 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->hw = of_device_get_match_data(dev);
 	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
 	 * host publication/idle input, not that supplier state, drives demand.
-	 * On T8140 the same input counts submissions for dense light work.
+	 * On T8140 the same input counts submissions for dense light work. The
+	 * T8132 GPU driver reports its work through it as well.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-clpc") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8132-clpc") ||
 	    clpc->hw->gpu_dense) {
 		clpc->gpu = kzalloc_obj(*clpc->gpu);
 		if (!clpc->gpu)
@@ -845,6 +859,13 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_clpc_pm_ops, apple_clpc_suspend,
 
 /* Only the stock M5/F3 busy floor is qualified on T8132. Do not invent
  * intermediate frequency-to-memory tables; idle can still release the vote.
+ *
+ * The G16 firmware keeps graphics powered while the GPU idles, so its power
+ * state would hold the floor up all the time: on J713 that keeps the DCS and
+ * the fabric at their top states at an idle desktop, about 0.45 W more than
+ * with the floor released. The GPU driver reports its work instead, as on
+ * T6040, and gets the M5/F3 floor while it has work in flight. Without that
+ * floor, rendering is about 45% slower.
  */
 static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
@@ -852,8 +873,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
 		[APPLE_CLPC_DCS] = { 5, 5, 5, 5 },
 		[APPLE_CLPC_SOC] = { 3, 3, 3, 3 },
 	},
-	.gpu_demand = true,
-	.gpu = { [APPLE_CLPC_DCS] = 5, [APPLE_CLPC_SOC] = 3 },
+	.gpu_demand = false,
 };
 
 /*
@@ -1032,7 +1052,50 @@ static void apple_clpc_gpu_dense_test(struct kunit *test)
 						       sequence, 0, false));
 }
 
+/* T8132: the GPU driver's reported work, not GFX power, gets the M5/F3 floor. */
+static void apple_clpc_t8132_gpu_input_test(struct kunit *test)
+{
+	struct apple_clpc_hw power_state = apple_clpc_hw_t8132;
+	unsigned int demand[APPLE_CLPC_RAILS] = {};
+	struct apple_clpc_gpu *gpu = kzalloc_obj(*gpu);
+
+	KUNIT_ASSERT_NOT_NULL(test, gpu);
+	kref_init(&gpu->ref);
+	spin_lock_init(&gpu->lock);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_hw_t8132.gpu_demand);
+
+	/* No input, or no work reported: no GPU floor. */
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_input_demand(&apple_clpc_hw_t8132,
+							     NULL, demand));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_input_demand(&apple_clpc_hw_t8132,
+							     gpu, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 0u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 0u);
+
+	/* Work in flight: DCS 5 and fabric 3. */
+	apple_clpc_gpu_set_active(gpu, true);
+	KUNIT_EXPECT_TRUE(test, apple_clpc_gpu_input_demand(&apple_clpc_hw_t8132,
+							    gpu, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 5u);
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_SOC], 3u);
+
+	/* A table that follows GFX power ignores the input. */
+	power_state.gpu_demand = true;
+	memset(demand, 0, sizeof(demand));
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_input_demand(&power_state, gpu,
+							     demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 0u);
+
+	/* Drained: nothing more is asked; the vote's hold releases it. */
+	apple_clpc_gpu_set_active(gpu, false);
+	KUNIT_EXPECT_FALSE(test, apple_clpc_gpu_input_demand(&apple_clpc_hw_t8132,
+							     gpu, demand));
+	KUNIT_EXPECT_EQ(test, demand[APPLE_CLPC_DCS], 0u);
+	apple_clpc_gpu_put(gpu);
+}
+
 static struct kunit_case apple_clpc_cases[] = {
+	KUNIT_CASE(apple_clpc_t8132_gpu_input_test),
 	KUNIT_CASE(apple_clpc_gpu_dense_test),
 	KUNIT_CASE(apple_clpc_gpu_cold_wake_test),
 	KUNIT_CASE(apple_clpc_gpu_request_lifetime_test),
