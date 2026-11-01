@@ -400,6 +400,7 @@ struct avd_qfw;
 int avd_qfw_probe(struct avd_dev *avd);
 void avd_qfw_select(struct avd_dev *avd);
 void avd_qfw_prepare_boot(struct avd_dev *avd);
+void avd_qfw_debug(struct avd_dev *avd, struct avd_frame *f, const char *where);
 bool avd_backend_is_qfw(const struct avd_dev *avd);
 int avd_backend_select(struct avd_dev *avd);
 bool avd_mbox_pop(struct avd_dev *avd, u32 *msg);
