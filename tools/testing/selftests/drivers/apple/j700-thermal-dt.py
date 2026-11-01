@@ -62,6 +62,43 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def check_policy(tree, zone):
+    path = f"/thermal-zones/{zone}"
+    if zone == "charger-thermal":
+        temps = [80000, 83000, 88000, 92000, 95000]
+    elif zone.startswith("chassis"):
+        temps = [70000, 75000, 80000, 85000, 88000]
+    else:
+        temps = [85000, 88000, 92000, 95000, 98000]
+    require(tree.cells(path, "polling-delay") == [100], "polling too slow")
+    require(tree.cells(path, "polling-delay-passive") == [100], "passive polling too slow")
+    require(tree.strings(path, "critical-action") == ["shutdown"], "wrong critical action")
+    gpu_nodes = [f"/soc/{n}" for n in tree.children("/soc") if n.startswith("gpu@")]
+    require(len(gpu_nodes) == 1, "expected one GPU")
+    gpu = gpu_nodes[0]
+    require(tree.cells(gpu, "#cooling-cells") == [2], "GPU cooling admission missing")
+    gpu_phandle, = tree.cells(gpu, "phandle")
+    for index, state in enumerate([25, 50, 75, 100]):
+        trip = f"{path}/trips/cap-{index}"
+        require(tree.cells(trip, "temperature") == [temps[index]], "wrong cap temperature")
+        require(tree.cells(trip, "hysteresis") == [5000], "wrong cap hysteresis")
+        require(tree.strings(trip, "type") == ["active"], "non-power-actor ladder required")
+        phandle, = tree.cells(trip, "phandle")
+        mapping = f"{path}/cooling-maps/map{index}"
+        require(tree.cells(mapping, "trip") == [phandle], "wrong trip reference")
+        require(tree.cells(mapping, "cooling-device") == [gpu_phandle, state, state],
+                "wrong GPU or non-exact cap request")
+    require(tree.cells(f"{path}/trips/trip-hot", "temperature") == [temps[2]],
+            "wrong hot temperature")
+    require(tree.strings(f"{path}/trips/trip-hot", "type") == ["hot"], "missing hot trip")
+    require(tree.cells(f"{path}/trips/trip-hot", "hysteresis") == [5000],
+            "wrong hot hysteresis")
+    critical = f"{path}/trips/trip-critical"
+    require(tree.cells(critical, "temperature") == [temps[4]], "wrong critical temperature")
+    require(tree.strings(critical, "type") == ["critical"], "missing critical shutdown")
+    require(tree.cells(critical, "hysteresis") == [0], "wrong critical hysteresis")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtb", type=Path, default=os.environ.get("APPLE_J700_DTB"))
@@ -108,7 +145,9 @@ def main():
             require(owner == phandle, "wrong sensor provider")
             require(channel < len(channels), "sensor channel out of range")
             require(keys[channel] == [key], f"channel {channel} is {keys[channel]}, expected {key}")
-            print(f"ok {number} - {zone} reads {key}")
+            if not zone.startswith("cpu-"):
+                check_policy(tree, zone)
+            print(f"ok {number} - {zone} reads {key} with expected policy")
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"not ok {number} - {zone}: {str(error).splitlines()[0]}")
             failed = True

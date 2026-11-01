@@ -3,121 +3,170 @@
 GPU thermal integration and qualification
 =========================================
 
-J700 exposes additional SMC SoC, charger and enclosure readings through
-reporting-only thermal zones. They have no trips or cooling maps and do not
-throttle the GPU. The ``Tp*`` zone names identify keys, not verified physical
-sensor locations. Do not infer a GPU junction temperature from their names.
+Status
+------
 
-Source contracts
-----------------
+This branch is an incomplete cooling integration, with a deliberate safety
+interlock. J700 requests GPU cooling in DT. Both firmware ABI variants still
+lack a qualified allocation-relative ceiling layout, so J700 GPU probe fails
+with ``EOPNOTSUPP`` before either GPU processor boots. This is expected and
+must not be presented as successful hardware throttling. Existing G16S DTs
+without cooling bindings retain their existing behavior.
 
-G17P/T8140 and G16S/T6040 share the ``g17`` backend. The ``g16`` backend is
-the separate G16G/T8132 implementation; its PMP consumer and nine-state
-ceiling must not be copied as a board policy for J700.
+J700's SMC zones have independent critical shutdown trips. They register
+through hwmon/thermal even when the GPU driver is absent or probe fails.
+The firmware backstop target is provisionally lowered to 95 C with its
+80 C release, sensor mask and gains preserved. It cannot take effect while
+GPU probe is refused. Polling SMC at 100 ms does not accelerate its source
+refresh or establish a fast transient safety guarantee.
 
-The T8140 configuration selects 26A428. Its power configuration initializes
-a die limiter with sensor mask ``0x82a``, a 110.00 C target and an 80.00 C
-release point. T6040/25G83 instead initializes its power-state object with
-101.00 C and 96.00 C. These describe the driver's firmware setup. They do
-not establish macOS board policy, SMC sensor equivalence, or safe charger
-and enclosure temperatures.
+Source contract and unresolved ABI
+----------------------------------
 
-The live effort input requests a performance floor. Reducing that request
-does not establish a maximum performance state. Similarly, a maximum-power
-value written while building firmware configuration does not establish a
-live power-limit interface. A cooling device needs a qualified ceiling
-interface, including units, update ordering and firmware ownership.
+G17P/T8140 and G16S/T6040 use the same ``g17`` backend. G16G/T8132 and its
+PMP cooling consumer are a separate backend.
 
-Integration requirements
-------------------------
+The clean facts from AGXG17G 353.14, macOS 26.6.2 build 25G83,
+``AGXArmFirmware::setGPUMaxPower``, describe three synchronous u32 writes,
+clamped to 0..100 percent, at offsets ``0xf150``, ``0xf2d0`` and ``0xf39c``
+from a power-control object. No mailbox, sequence or acknowledgement is
+specified. This ceiling is separate from the effort floor, PMP and CLPC.
 
-Use a single cooling implementation for G17P and G16S, with a firmware
-variant supplying any ABI differences. Derive the state range and conversion
-from validated performance tables and loader/firmware data. Keep board
-trips and cooling maps in DT. Do not add a module parameter or use direct
-clock or voltage writes to implement a thermal limit.
+Those offsets alone are insufficient to choose a Linux allocation. They
+exceed both existing power configuration structures: 26A428 is ``0x2dc0``
+bytes, and 25G83 is ``0x6510`` bytes. The shared bundle also contains work
+rings and control data; fitting in that larger allocation is not proof of
+field ownership. The clean facts do not resolve the pointer chain from
+that power-control object to the bundle, status block, firmware data or
+another allocation. No G16S-specific ceiling layout or lowest validated
+nonzero percent endpoint is established.
 
-The cooling state is an upper bound, independent of the work-driven effort
-request. State zero permits the full validated table; increasing cooling
-must monotonically reduce the ceiling. Multiple zones must compose by the
-most restrictive request, and any other budget must not relax that request.
-Report requested and applied limits separately. A successful host write
-alone is not evidence of firmware acceptance or achieved frequency.
+``fw::Variant::power_ceiling`` therefore remains ``None`` for both builds.
+Do not populate it by adding those offsets to an arbitrary mapped base.
+A follow-up must supply a facts-only pointer/ownership contract and exact
+per-build layout, validate the mapping and memory attributes, and then
+populate the ABI tables. DT never supplies addresses or firmware offsets.
 
-Thermal callbacks must not invert the GPU lock order. A bounded owner-side
-service must enforce updates while already submitted work runs, including
-a single long dispatch with no completions. Enforce the startup limit before
-the first publication; cover direct submissions, render and compute, recovery,
-idle wake and teardown. Firmware state must not be written after its owner
-stops. Preserve a restrictive ceiling across provider faults, recovery and
-missing policy until revalidated. Define which sensor errors can be detected:
-repeated identical SMC values are not by themselves a freshness witness.
+Common cooling owner
+--------------------
 
-SMC polling is an outer loop. Polling faster than the sensor refresh cannot
-provide a fast-die backstop. Qualification must establish the independent
-fast signal and actuator response before using SMC trips to protect rapid
-load transients. Charger and enclosure policy requires its own evidence.
+The common implementation accepts three checked, distinct, aligned WC
+words from an admitted firmware ABI table. It validates every destination
+before writing any of them. A per-device mutex serializes all three stores
+and a write barrier; callbacks do not acquire the GPU mutex or wait for a
+completion. Registration publishes a 25 percent backstop before INIT,
+port attachment and work publication. Recovery republishes the strictest
+retained cap before reopening queues. Stop and teardown unregister and drain
+thermal/sysfs callbacks before stopping the processors or releasing mappings.
 
-Offline checks
---------------
+Cooling state N requests ``100 - N`` percent for N in 0..100. It is an
+interface percentage, not an OPP selector or measured watts. The thermal
+framework composes multiple zones by maximum state. The effective host
+publication also cannot exceed the 25 percent qualification backstop.
+There is no userspace knob to release it. Failed publication does not commit
+a new request or published value. Matching host words are never called
+applied or achieved; the diagnostic attribute labels both unsupported.
+A firmware-reported pstate alone cannot acknowledge this percent ceiling.
 
-Build ``apple/t8140-j700.dtb``, then run::
+Provisional J700 outer policy
+----------------------------
+
+These thresholds are a conservative Linux bring-up proposal, not recovered
+Apple board limits or safety ratings. Independent zones make the most
+restrictive correlated sensor win; they do not imply that SMC keys are
+GPU-local MTR sensors.
+
+=================== ===================== ============= ========
+Zones               Cap temperatures (C)   Hot (C)       Critical
+=================== ===================== ============= ========
+Tp*/Tpx*            85, 88, 92, 95         92            98 C
+Charger (TCMz)      80, 83, 88, 92         88            95 C
+Chassis (Ts0A/I/M)  70, 75, 80, 85         80            88 C
+=================== ===================== ============= ========
+
+The four cap requests are 75, 50, 25 and 0 percent, with 5 C hysteresis.
+The final zero request is deliberately stricter than the proposed lowest
+validated nonzero endpoint, which remains unknown. Zero has no demonstrated
+hardware stop semantics; critical shutdown must never depend on that request.
+Do not replace zero with an invented minimum pstate or a percentage inferred
+from an OPP's power. J700 GPU initialization remains refused independently.
+
+DT uses ``active`` trip types for this non-power-actor ladder, with equal
+lower/upper cooling states. The tree's power_allocator governor explicitly
+services such active instances, and step_wise also honors these exact
+bounds. Passive trips on a device without power-actor callbacks would not
+implement the requested cap under power_allocator. Hot trips carry policy
+information; independent ``critical-action = "shutdown"`` provides the
+shutdown action without any GPU callback.
+
+Offline verification
+--------------------
+
+Run the same production mapping and fake-publication suite on the host::
+
+  python3 tools/testing/selftests/drivers/apple/gpu-cooling.py
+
+Run it in arm64 QEMU without a GPU or Rust toolchain::
+
+  python3 tools/testing/kunit/kunit.py run --arch arm64 --jobs 8 \
+    --kunitconfig drivers/gpu/drm/asahi/.kunitconfig.cooling \
+    --make_options LLVM=1 'asahi-gpu-cooling*'
+
+The suite covers all 101 states, invalid endpoints, all pairs of demand and
+budget, startup restriction, identical mirror transactions, rejected
+publication, and restoration after reset. It does not qualify a live ABI,
+firmware acceptance, a lowest nonzero endpoint, or a thermal response time.
+
+Compile ``apple/t8140-j700.dtb``, then verify sensor identities, all cap maps,
+hysteresis, polling and critical actions in the flattened tree::
 
   python3 tools/testing/selftests/drivers/apple/j700-thermal-dt.py \
     --dtb out/arch/arm64/boot/dts/apple/t8140-j700.dtb
 
-This resolves each compiled sensor reference to its key, including inherited
-temperature children. It also checks the six existing CPU references. A
-missing SMC key keeps its channel slot in the driver; it must never silently
-move a later zone to another key. Exercise that driver behavior and the SMC
-readers without an SMC using::
-
-  python3 tools/testing/kunit/kunit.py run --arch arm64 \
-    --kunitconfig drivers/hwmon/.kunitconfig.macsmc 'macsmc*'
-
-Ceiling implementation tests must additionally cover every valid state and
-invalid endpoint, composition of simultaneous requests, startup restriction,
-provider failure and recovery, publication ordering and teardown races. Run
-the same production policy in host tests and KUnit with a fake actuator that
-can reject or delay updates. Tests must verify that failed application cannot
-be reported as an applied limit.
-
-Owner qualification
+Owner one-shot plan
 -------------------
 
-First record the exact board, kernel, DTB, Mesa and both firmware versions.
-Verify every zone's key identity, cooling binding and state range without a
-GPU load. Missing sensors, missing bindings or an unconfirmed applied ceiling
-must prevent progression to load tests. Retain the known-good boot entry and
-one-shot boot fallback throughout qualification.
+No device run is performed by the implementation worker. The owner first
+reviews the missing ABI/endpoint facts and requests a device-specific test
+through the controller. Preserve a known-good kernel/DTB and bootguard's
+one-shot fallback. Record exact candidate and baseline source commits,
+firmware identities, kernel, DTB, Mesa, workload, power source and ambient
+conditions. Preserve hashes and the rollback entry before staging a candidate.
 
-On matching macOS and Linux configurations, record synchronized sensor,
-power, requested/applied state, achieved frequency and frame-time traces.
-Use the same workload, resolution, presentation mode, ambient conditions,
-power source and comparable starting temperatures. Record sensor update
-cadence, missing values and timestamp domains. Preserve raw traces for the
-owner; publish only reviewed summaries without device identifiers.
+For this incomplete revision, the only candidate check is a no-load boot:
+verify independent thermal zones, critical trips and the expected GPU probe
+refusal, then restore the known-good entry. Do not use this revision for a
+rendering or performance acceptance test and do not remove its cooling
+binding to bypass the interlock.
 
-Before a Linux GPU experiment, obtain the required device approval and arm
-a verified restrictive ceiling and independent temperature supervisor. Prove
-the stop action and its latency before generating heat. Start with short,
-bounded work at the lowest qualified ceiling. Stop before a non-CPU reading
-reaches 100 C, with additional margin for refresh and stopping latency. The
-owner's absolute abort rule also applies; it is not a normal control target.
-If the available sampling cannot bound overshoot, do not extend the load.
+After a qualified ABI and nonzero endpoint are integrated, rebuild and review
+that exact candidate. Prove all three mirror publications and independent
+achieved pstate/power readback with the pre-armed 25 percent ceiling. Prove
+sensor-error handling, restrictive reset/recovery, callback teardown and the
+independent shutdown path with no heat-generating workload first. Keep missing
+or implausible fast-die information restrictive; repeated SMC values alone do
+not identify a stale source.
 
-Once the actuator and trips have been independently qualified and integrated,
-run vkmark cube for ten minutes, glmark2 terrain for ten minutes, and a fixed
-game replay. Include warm starts, mixed CPU/GPU load, idle transitions and
-both supported firmware variants. Plot temperature and limiting reason
-against frame time; report maxima, time above each trip, cooling residency,
-frame-time percentiles and sustained throughput. Require every relevant
-non-CPU sensor to remain below 100 C and the derived board limits, with no
-GPU fault or lost binding. Compare matched macOS traces without treating
-unavailable telemetry as zero. These tests remain pending until the cooling
-actuator and board policy exist.
+Use existing baseline traces from the current kernel; do not recreate an
+uncapped baseline. With a separately approved capped baseline and candidate,
+start at matched cool temperatures and issue only short, bounded bursts
+(initially at most 100 ms), one workload at a time. Keep a temperature
+supervisor independent of GPU progress and prove its stop latency before
+load. Do not extend bursts if source-refresh and stopping delay cannot bound
+overshoot below every critical threshold and 100 C. No sustained games,
+full CTS, or multi-minute benchmarks belong to this plan.
 
-On any failure, stop the workload, retain the restrictive ceiling, preserve
-traces and restore the known-good kernel/DTB through the boot fallback. Check
-the restored identities and temperatures. A rollback is evidence of a failed
-qualification, not a passing sustained-load result.
+Capture monotonic timestamps, all relevant SMC temperatures and read errors,
+firmware die readings if qualified, requested/published/applied cap quality,
+achieved pstate or power, frame times and limiting reasons. Never substitute
+zero for unsupported telemetry. Compare the same workload's frame-time
+p50/p95/p99/max and throughput against the capped current kernel, together
+with peak temperatures, time above each trip and cooling residency. A 25
+percent retained backstop is expected to affect throughput; report that limit.
+
+Stop on missing telemetry, a failed cap update, a lost binding, GPU fault,
+excessive excursion or an independent supervisor action. Retain the strongest
+cap, preserve failure traces and restore the known-good kernel/DTB through
+the fallback. Verify the restored boot identity, zone identities and cooldown.
+Record the rollback as a failed qualification, not a passing result. Sustained
+load remains outside authorization until a separate thermal qualification.
