@@ -631,3 +631,54 @@ its program cache invalid. The corresponding recovery implementation needs to:
 
 Those ownership and identifier changes require their own H14 reset test.
 Quarantine must not be cleared solely because a power transition returned zero.
+
+J616c / 25F84 diagnostic inference measurements
+=============================================
+
+The explicit ``h16_stage=startup h16_job=1`` debugfs job path can load the
+resident 25F84 profile and run host-built inference records on J616c. It is a
+private bring-up interface, not a production accel ABI. The loader must fill
+both disabled preload reservations from the live ADT; this series does not
+include that m1n1 handoff or distribute Apple firmware/HWX files.
+
+An optional serial governor chooses a 30 us hold after a matching dedicated
+SUCCESS token and a 125 us recovery after an ordinary or unknown completion.
+It invalidates feedback before each new EXECUTE and across overlap, and never
+delays an already outstanding submission. Its parameters remain off by default.
+
+Tiny-convolution measurements on one J616c/M4 Max with 25F84 firmware:
+
+======================= ============ =========== ==================
+Configuration           Timed calls  Rate / s    Dedicated SUCCESS
+======================= ============ =========== ==================
+Fixed 30 us hold         1,000        7,929       286 / 1,000
+Adaptive 30 / 125 us     1,000        12,045      996 / 1,000
+Adaptive exact repeat   1,000        12,229      999 / 1,000
+Adaptive longer run     3,000        12,078      2,993 / 3,000
+======================= ============ =========== ==================
+
+The longer run is the retained result (campaign run242, kernel
+``c597f3ae89ff81273af692120032cc62a5ca22b9``). All gaps and preparation are
+included in the kernel EVENT-return span, about 0.25 s. Two full output
+comparisons bracket each timed block; the input is constant within it. All
+four cells pass with zero DART faults and IRQ fallbacks. The selected module
+arguments, in addition to the startup/job selection, were::
+
+    h16_startup_drain_ms=10 h16_postboot=1 h16_job_irq=1 h16_map_batch=1
+    h16_job_result_mb=32 h16_job_return_trace=1 h16_job_gap_us=30
+    h16_job_gap_every=1 h16_job_drain_us=0 h16_job_recovery_us=125
+
+The worker and IRQ handler ran on CPU0; PCPU1 requested its maximum floor and
+fabric requests were DCS5/SOC2. These requests do not prove achieved ANE clocks.
+Native fresh-process checked loops reach 12.4--12.9k/s with userspace work and
+per-call comparisons, so these results do not establish full API, correctness
+cadence, long-duration stability or energy parity. Large-model logits/masks and
+mixed independent-buffer jobs also match the retained native outputs.
+
+Spin200, natural report-notification batching and firmware PMU registration
+followed by disable-gating did not establish a throughput improvement. Keep
+these experiments and the governor opt-in. Intermittent boot/startup failures,
+production lifetime/recovery and matched userspace/energy comparisons remain
+open. The review branch replays the ANE changes onto the GPU dependency; the
+campaign measurements apply to the source identity above, not a new boot of
+that rebased tree.
