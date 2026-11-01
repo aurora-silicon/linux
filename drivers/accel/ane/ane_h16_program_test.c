@@ -22,6 +22,7 @@ enum fw_mode {
 	FW_REPORT_FOREIGN_UUID,
 	FW_REPORT_WRONG_PROCESS,
 	FW_REPORT_FAILURE,
+	FW_REPORT_STALL,
 };
 
 /* A synchronous fake firmware that answers on each doorbell. */
@@ -44,6 +45,8 @@ struct prog_fw {
 	size_t exec_length;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
+	/* The EXECUTE failure trace lines, by step. */
+	u64 fail_step, fail_flags, fail_reports, fail_state, fail_other;
 };
 
 static u64 fw_load(void *ctx, const void *p)
@@ -109,6 +112,11 @@ static void fw_execute(struct prog_fw *f, const u8 *cmd)
 	case FW_REPORT_FAILURE:
 		fw_report(f, uuid, f->process, 0);
 		fw_report(f, uuid, f->process, 2);
+		break;
+	case FW_REPORT_STALL:
+		/* Started on the engine, then never a terminal report. */
+		fw_report(f, uuid, f->process, 0);
+		fw_report(f, uuid, f->process, 3);
 		break;
 	default:
 		fw_report(f, uuid, f->process, 0);
@@ -223,6 +231,17 @@ static int fw_map(void *ctx, size_t size, bool write, struct ane_fw_surface *s)
 
 static void fw_log(void *ctx, const char *item, u64 a, u64 b)
 {
+	struct prog_fw *f = ctx;
+
+	if (!strcmp(item, "EXECUTE step/flags")) {
+		f->fail_step = a;
+		f->fail_flags = b;
+	} else if (!strcmp(item, "EXECUTE reports/last state")) {
+		f->fail_reports = a;
+		f->fail_state = b;
+	} else if (!strcmp(item, "EXECUTE other reports")) {
+		f->fail_other = a;
+	}
 }
 
 static const struct ane_h16_session_ops fw_session_ops = {
@@ -807,8 +826,10 @@ static void program_session_test(struct kunit *test)
 	/* Only the output surface is device-writable. */
 	KUNIT_EXPECT_EQ(test, f->writable_maps, 1);
 
-	for (i = 0; i < 2; i++)
-		KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	/* The first request after boot sets up EXELOOP state: queued. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_QUEUED);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
 	/* EXECUTE: IDs, priority 5, UUID 2, two descriptors and one mcache record. */
 	KUNIT_EXPECT_EQ(test, f->exec_length, 0xcc0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 8), 0x11);
@@ -825,7 +846,7 @@ static void program_session_test(struct kunit *test)
 			p->surfaces[0]->dva);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca8 + 8), 4);
-	/* Only one program has run: the direct path stays allowed. */
+	/* Later requests of the same program take the direct path. */
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
 
 	/* A second LOAD while the first is loaded refuses, before any traffic. */
@@ -981,6 +1002,35 @@ static void program_bad_report_test(struct kunit *test)
 	}
 }
 
+/* A request that starts and never ends names the wait step and the last state. */
+static void program_stall_trace_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->fail_step, 3);
+	KUNIT_EXPECT_EQ(test, f->fail_flags, ANE_H16_EXECUTE_QUEUED);
+	KUNIT_EXPECT_EQ(test, f->fail_reports, 2);
+	KUNIT_EXPECT_EQ(test, f->fail_state, 3);
+	KUNIT_EXPECT_EQ(test, f->fail_other, 0);
+
+	/* Reports for another UUID only: none seen for this request. */
+	f = fw_create(test);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->mode = FW_REPORT_FOREIGN_UUID;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, f->fail_step, 3);
+	KUNIT_EXPECT_EQ(test, f->fail_reports, 0);
+	KUNIT_EXPECT_EQ(test, f->fail_state, U32_MAX);
+	KUNIT_EXPECT_EQ(test, f->fail_other, 2);
+}
+
 /*
  * Each completed EXECUTE gives its arena back, so a long run never fills
  * the pool; LOAD and CREATE keep theirs.
@@ -1042,6 +1092,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_scratch_test),
 	KUNIT_CASE(program_bad_load_test),
 	KUNIT_CASE(program_bad_report_test),
+	KUNIT_CASE(program_stall_trace_test),
 	KUNIT_CASE(program_pool_test),
 	KUNIT_CASE(program_pool_recycle_test),
 	{}

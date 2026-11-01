@@ -669,9 +669,38 @@ static int h16_gate(struct ane_h16_session *s, u32 value)
 	return ret;
 }
 
+/* What one EXECUTE saw, logged only when it fails. */
+struct h16_execute_trace {
+	u32 step;
+	u32 reports;
+	u32 last_state;
+	u32 other;
+};
+
+enum {
+	H16_STEP_GATE_OPEN = 1,
+	H16_STEP_SEND,
+	H16_STEP_REPORT,
+	H16_STEP_GATE_CLOSE,
+};
+
+static void h16_trace_report(struct h16_execute_trace *trace, const u8 *report,
+			     size_t size, const struct ane_h16_pending *request)
+{
+	struct ane_h16_event e;
+
+	if (!ane_h16_event_decode(report, size, ANE_FW_IO_T2H, &e) &&
+	    e.key.uuid == request->key.uuid) {
+		trace->reports++;
+		trace->last_state = e.state;
+	} else {
+		trace->other++;
+	}
+}
+
 /* Wait for the terminal report of one pending UUID, servicing allocations. */
 static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *request,
-			   u64 deadline)
+			   u64 deadline, struct h16_execute_trace *trace)
 {
 	struct ane_fw_transport *t = s->transport;
 	u8 *report;
@@ -699,8 +728,14 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 				break;
 			}
 			/* Foreign or late UUIDs and ISP-routed reports never retire this call. */
-			if (ret == ANE_H16_EVENT_PROGRESS || ret == -ENOENT || ret == -ENOMSG)
+			if (ret == ANE_H16_EVENT_PROGRESS) {
+				h16_trace_report(trace, report, size, request);
 				continue;
+			}
+			if (ret == -ENOENT || ret == -ENOMSG) {
+				trace->other++;
+				continue;
+			}
 			break;
 		}
 		if (ret != -EAGAIN)
@@ -733,6 +768,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
 	struct ane_h16_pending request = {};
+	struct h16_execute_trace trace = { .last_state = U32_MAX };
 	struct ane_h16_execute call = {};
 	size_t length, sequence[5], mark;
 	u8 *command;
@@ -773,6 +809,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	mark = ane_fw_transport_mark(s->transport);
 	/* Inputs and poisoned outputs must reach memory before any doorbell. */
 	s->transport->ops->write_barrier(s->transport->ctx);
+	trace.step = H16_STEP_GATE_OPEN;
 	ret = h16_gate(s, 0);
 	if (ret)
 		goto fail;
@@ -786,10 +823,14 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	call.key = request.key;
 	call.buffers = buffers;
 	call.buffer_count = p->resource_count + (p->has_scratch ? 1 : 0);
-	/* The engine last ran another program: take the queued path once. */
-	if (s->executed && s->executed != p->generation) {
+	/*
+	 * The first request of a program on the engine, the first one after boot
+	 * included, takes the queued path once: only EXELOOP sets up the BAR
+	 * context and the L2-spill mapping that later direct requests reuse.
+	 */
+	if (s->executed != p->generation) {
 		call.flags = ANE_H16_EXECUTE_QUEUED;
-		s->ops->log(s->ctx, "EXECUTE after a program switch, queued", p->key.program,
+		s->ops->log(s->ctx, "EXECUTE first of this program, queued", p->key.program,
 			    request.key.uuid);
 	}
 	s->executed = p->generation;
@@ -799,16 +840,21 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	if (!ret)
 		ret = ane_h16_command_prepare(command, length, ANE_H16_EXECUTE,
 					      ANE_FW_DATA_CHAIN);
-	if (!ret)
+	if (!ret) {
+		trace.step = H16_STEP_SEND;
 		ret = h16_send(s, ANE_FW_DATA_CHAIN, command, length, &reply);
+	}
 	/* The channel-7 reply acknowledges transport only, never completion. */
-	if (!ret)
-		ret = h16_wait_report(s, &request, deadline);
+	if (!ret) {
+		trace.step = H16_STEP_REPORT;
+		ret = h16_wait_report(s, &request, deadline, &trace);
+	}
 	if (ret) {
 		if (request.active)
 			ane_h16_pending_abort(&s->pending, &request, ret);
 		goto fail;
 	}
+	trace.step = H16_STEP_GATE_CLOSE;
 	ret = h16_gate(s, 1);
 	if (ret)
 		goto fail;
@@ -822,6 +868,14 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 fail:
 	kfree(command);
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request.key.uuid);
+	/*
+	 * Step 1 opening gate, 2 channel-7 ack, 3 report wait, 4 closing gate.
+	 * Reports for this UUID and the last state (0 start, 3 engine start,
+	 * ffffffff none), then the count of other reports seen while waiting.
+	 */
+	s->ops->log(s->ctx, "EXECUTE step/flags", trace.step, call.flags);
+	s->ops->log(s->ctx, "EXECUTE reports/last state", trace.reports, trace.last_state);
+	s->ops->log(s->ctx, "EXECUTE other reports", trace.other, 0);
 	return h16_fail(s, ret);
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);

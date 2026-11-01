@@ -44,8 +44,10 @@ struct ane_h16_custom_bar {
 
 /*
  * Request flags (+0x30) bit 0 vetoes the firmware's direct submission path
- * and queues the request on EXELOOP, which installs a fresh BAR context. Set
- * it on the first request after the engine last ran a different program.
+ * and queues the request on EXELOOP, which installs a fresh BAR context and
+ * the per-priority L2-spill mapping. The direct path reuses both and never
+ * sets them up. Set the bit on the first request of each program on the
+ * engine, including the first request after boot.
  */
 #define ANE_H16_EXECUTE_QUEUED BIT(0)
 
