@@ -6,7 +6,6 @@
  */
 
 #include <linux/bitfield.h>
-#include <linux/bitmap.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
 #include <linux/device.h>
@@ -1040,7 +1039,8 @@ static int sio_alloc_shmem(struct sio_data *sio)
 		return -ENOMEM;
 
 	sio->shmem_desc_base = (struct sio_coproc_desc *) (sio->shmem + 56);
-	sio->desc_allocated = devm_bitmap_zalloc(sio->dev, SIO_NO_DESC_SLOTS, GFP_KERNEL);
+	sio->desc_allocated = devm_kzalloc(sio->dev, SIO_NO_DESC_SLOTS / 32,
+					   GFP_KERNEL);
 	if (!sio->desc_allocated) {
 		err = -ENOMEM;
 		goto free_shmem;
