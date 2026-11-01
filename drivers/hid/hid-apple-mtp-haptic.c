@@ -62,11 +62,15 @@ int apple_taptic_switch_modes(struct hid_device *haptic_hdev, bool enable_host_c
 	 * Sending 0x21 makes the controller return status 9c 17 e5 f8
 	 * instead of the write-ok status. The part powers up
 	 * device-controlled, which is what a false argument asks for.
-	 * A true argument has no 0x21 report to send either.
+	 * Host control cannot be taken without the report, so refuse it
+	 * and let the caller keep the firmware's click. The MTP actuators
+	 * take 0x21 whatever their descriptor says, so only an SPI one
+	 * is checked.
 	 */
-	if (!apple_taptic_has_report(haptic_hdev, HID_FEATURE_REPORT, 0x21) &&
+	if (haptic_hdev->bus == BUS_SPI &&
+	    !apple_taptic_has_report(haptic_hdev, HID_FEATURE_REPORT, 0x21) &&
 	    !apple_taptic_has_report(haptic_hdev, HID_OUTPUT_REPORT, 0x21))
-		return 0;
+		return enable_host_controlled ? -EOPNOTSUPP : 0;
 
 	ret = hid_hw_raw_request(haptic_hdev, msg[0], msg, sizeof(msg),
 				 HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
