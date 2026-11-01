@@ -14,6 +14,9 @@ is not registered fails the run, so it cannot be silently skipped.
 Negative controls read older revisions with `git show`, so the checkout needs
 the commits (a full or treeless clone, not a depth-1 one).
 
+A test that reads device trees gets '{dtc}', this tree's scripts/dtc/dtc, built
+with the kconfig tool unless --dtc names one.
+
 Usage: tools/asahi/run-host-tests.py [--jobs N] [--work DIR] [--only SUBSTR]
 """
 import argparse
@@ -168,7 +171,7 @@ SUITES = [
 ]
 
 
-def jobs(work, conf):
+def jobs(work, conf, dtc):
     found = {p.name for p in ASAHI.iterdir()
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
@@ -190,9 +193,11 @@ def jobs(work, conf):
     for name, runs in ASAHI_TESTS.items():
         for index, (args, expect) in enumerate(runs):
             label = name.removesuffix('.py') + ('' if not args or args == out() or args == out('--output')
-                                                 else ' ' + ' '.join(a for a in args if a not in ('{out}', '--out', '--output', '{conf}', '--conf')))
+                                                 else ' ' + ' '.join(a for a in args if a not in ('{out}', '--out', '--output', '{conf}', '--conf',
+                                                                                                   '{dtc}', '--dtc')))
             d = work / f'{name}.{index}'
-            cmd = ['python3', '-I', '-B', str(ASAHI / name)] + [a.replace('{out}', str(d / 'out')).replace('{conf}', str(conf)) for a in args]
+            cmd = ['python3', '-I', '-B', str(ASAHI / name)] + [a.replace('{out}', str(d / 'out')).replace('{conf}', str(conf))
+                                                                 .replace('{dtc}', str(dtc)) for a in args]
             result.append((label, cmd, ASAHI, expect, d, {}))
     for name in ASAHI_RUST:
         d = work / name
@@ -233,6 +238,7 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--work', type=Path, help='keep logs and build products here (default: a temporary directory)')
     ap.add_argument('--conf', type=Path, help='a built scripts/kconfig/conf (default: build one)')
+    ap.add_argument('--dtc', type=Path, help='a built scripts/dtc/dtc (default: build one)')
     ap.add_argument('--only', help='run only jobs whose name contains this text')
     ap.add_argument('--timeout', type=int, default=900)
     args = ap.parse_args()
@@ -240,13 +246,18 @@ def main():
     work = args.work or Path(tempfile.mkdtemp(prefix='aurora-host-tests-'))
     work = work.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    conf = args.conf
-    if conf is None:
-        build = work / 'kconfig'
+    conf, dtc = args.conf, args.dtc
+    build = work / 'kconfig'
+    if conf is None or dtc is None:
         subprocess.run(['make', '-s', '-C', str(ROOT), f'O={build}', 'ARCH=arm64', 'allnoconfig'],
                        check=True, stdout=subprocess.DEVNULL)
+    if conf is None:
         conf = build / 'scripts/kconfig/conf'
-    todo = jobs(work, conf.resolve())
+    if dtc is None:
+        subprocess.run(['make', '-s', '-C', str(ROOT), f'O={build}', 'ARCH=arm64', 'scripts_dtc'],
+                       check=True, stdout=subprocess.DEVNULL)
+        dtc = build / 'scripts/dtc/dtc'
+    todo = jobs(work, conf.resolve(), dtc.resolve())
     if args.only:
         todo = [j for j in todo if args.only in j[0]]
     print(f'{len(todo)} runs, {args.jobs} at a time, logs in {work}', flush=True)
