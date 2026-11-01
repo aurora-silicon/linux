@@ -60,6 +60,8 @@ struct tas2764_priv {
 	struct regmap *regmap;
 	struct device *dev;
 	int irq;
+	/* Set while the component holds the fault IRQ */
+	bool irq_requested;
 	enum tas2764_devid devid;
 
 	int v_sense_slot;
@@ -1058,14 +1060,6 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK4, 0xff);
 		if (ret < 0)
 			return ret;
-
-		ret = devm_request_threaded_irq(tas2764->dev, tas2764->irq, NULL, tas2764_irq,
-						IRQF_ONESHOT | IRQF_SHARED | IRQF_TRIGGER_LOW,
-						"tas2764", tas2764);
-		if (ret && tas2764->sdz_group)
-			return dev_err_probe(tas2764->dev, ret, "SDZ group needs its fault IRQ\n");
-		if (ret)
-			dev_warn(tas2764->dev, "failed to request IRQ: %d\n", ret);
 	}
 
 	if (tas2764->i_sense_slot != -1 && tas2764->v_sense_slot != -1) {
@@ -1104,12 +1098,33 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 		break;
 	}
 
+	/*
+	 * Last, so that no failure leaves the handler behind: the IRQ belongs to the I2C
+	 * device, which outlives the component, and the remove frees it.
+	 */
+	if (tas2764->irq) {
+		ret = devm_request_threaded_irq(tas2764->dev, tas2764->irq, NULL, tas2764_irq,
+						IRQF_ONESHOT | IRQF_SHARED | IRQF_TRIGGER_LOW,
+						"tas2764", tas2764);
+		if (ret && tas2764->sdz_group)
+			return dev_err_probe(tas2764->dev, ret, "SDZ group needs its fault IRQ\n");
+		if (ret)
+			dev_warn(tas2764->dev, "failed to request IRQ: %d\n", ret);
+		else
+			tas2764->irq_requested = true;
+	}
+
 	return 0;
 }
 
 static void tas2764_codec_remove(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+
+	if (tas2764->irq_requested) {
+		devm_free_irq(tas2764->dev, tas2764->irq, tas2764);
+		tas2764->irq_requested = false;
+	}
 
 	tas2764_flush_shutdown(tas2764);
 
