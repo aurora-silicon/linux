@@ -332,14 +332,35 @@ opening a device.
 H14 program lifetime
 --------------------
 
-Byte-identical sections share one firmware program and one process. Every
-file holds a reference on each program it loaded, and ``PROC_CREATE`` and
-``EXEC`` refuse a program the file holds no reference on with ``-ENOENT``.
-When the last file holding a program closes, the driver sends
-TERMINATE_PROCESS (0x203) for its process and then DESTROY_PROGRAM (0x201).
-Only after both are acknowledged does it drop its references on the section
-buffers, which are then freed or pooled like any other BO. A failed unload
-keeps the program and its buffers until a verified firmware restart.
+Byte-identical sections share one program and one process. Every file holds
+a reference on each program it loaded, and ``PROC_CREATE`` and ``EXEC``
+refuse a program the file holds no reference on with ``-ENOENT``. A program's
+kernel IDs stay valid for as long as a file holds it; whether it is loaded in
+the firmware right now (resident) is managed by the driver:
+
+- Every process holds one 2 MiB firmware allocation, and a LOAD sent while
+  eight programs with processes are resident never completes. At most eight
+  programs are resident, and room is made before each LOAD.
+- TERMINATE_PROCESS (0x203) of a process whose program has more than one task
+  waits inside the firmware without a timeout and never completes, and no
+  other command frees such a process. The driver never sends it for one. A
+  program is single-task only when its TD property section (load id 7) and
+  its TD stream (load id 3) both count one task; anything else, including a
+  section it cannot parse, counts as multi-task.
+- When the last file holding a program closes, a single-task program (or any
+  program without a process) is unloaded: TERMINATE_PROCESS, then
+  DESTROY_PROGRAM (0x201), and only after both are acknowledged are the
+  section buffers given back. A multi-task program stays resident as a cache
+  entry, and the next load of the same bytes reuses it without a command.
+- Room comes first from unloading single-task programs, unreferenced ones
+  before the least recently used. When every resident program is a
+  multi-task process, the driver restarts the firmware at that idle point
+  (see below). Programs that files still hold become non-resident; the next
+  ``PROC_CREATE`` or ``EXEC`` loads them again and creates a new process,
+  with the same IDs. Unreferenced cache entries are dropped.
+
+A failed load or unload keeps the program and its buffers until a verified
+firmware restart.
 
 The firmware asks for memory on the SHAREDMALLOC ring and gives it back with
 a FREE request, which carries the returned IOVA in the slot header and an
@@ -351,8 +372,9 @@ buffer and its table slot, so the table and its byte count follow the live
 allocations rather than every allocation since boot.
 
 ``fw_memory`` in the device's accel debugfs directory reports the live
-firmware allocations, their bytes, the table high-water mark, and the loaded
-and held programs. A command timeout also logs the allocation ring and the
+firmware allocations, their bytes, the table high-water mark, the known,
+held, resident, cached and single-task programs, the resident limit, the
+budget restarts and the firmware generation. A command timeout also logs the allocation ring and the
 target-to-host rings at the host cursors.
 
 H14 recovery lifecycle
@@ -369,8 +391,15 @@ boot sequence. Borrowed firmware, RTKit mode, later generations and incomplete
 initial boots remain fenced. A second H14 binding is refused because the
 firmware cache and BO pool have one owner.
 
-Recovery clears only the owned ASC CPU's RUN bit and waits for STOPPED before
-suspending the consumer and suppliers through the shared PM transaction. This
+A restart for room (planned) runs with the firmware idle under the firmware
+lock. It sends POWER_DOWN (0x0b), waits for its completion and for the ASC to
+report WFI, then clears CPU_CONTROL RUN (bit 4) and bit 5, and requires
+CPU_STATUS STOPPED (bit 1) with RUN clear. On T8112 an idle core reads 0x2c
+and a halted one 0x28, neither of which is stopped. After a command timeout
+the firmware cannot answer POWER_DOWN, so only the RUN clear is tried. If
+STOPPED is not seen, nothing is powered off: the device stays quarantined
+with its mappings, power claim and pin. Only after STOPPED does the restart
+suspend the consumer and suppliers through the shared PM transaction. This
 prevents firmware power-state writes from racing provider shutdown. It then
 verifies every domain and the CPU ACTUAL field off, resumes, repeats the probe
 power/PWGATE gates, and requires the CPU to be stopped before changing its
@@ -390,10 +419,13 @@ reclaims retired arenas and closed BOs. Live old BO handles and mappings remain
 client-owned memory and can be reused for loading a program again.
 
 Program and process IDs are opaque kernel identifiers. The allocator survives
-firmware restarts and refuses exhaustion instead of wrapping. Reset invalidates
-the program cache, so an old ID cannot alias a reused firmware wire ID. Clients
-must reload their program and create its process before retrying. The
-``ane-fw-ids`` KUnit suite checks non-reuse and exhaustion boundaries.
+firmware restarts and refuses exhaustion instead of wrapping. A restart drops
+every firmware wire ID; programs that files hold load again with new wire IDs
+on their next use, so an old wire ID never aliases a new one and clients keep
+their kernel IDs. The ``ane-fw-ids`` KUnit suite checks non-reuse and
+exhaustion boundaries, and ``ane-t6021-lifetime`` checks the task count, the
+never-terminate rule, the resident budget, eviction order, reload after a
+restart and the restart stop sequence.
 
 H14 keeps its existing domain-link lifetime reference and a reference for the
 currently running firmware CPU. Recovery releases the old CPU reference only
