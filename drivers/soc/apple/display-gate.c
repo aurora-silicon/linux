@@ -53,9 +53,13 @@
  * option.
  *
  * On T6031 (M3 Max) the gate serves the same handoff, marked
- * apple,t6031-handoff, but only when apple_t6031_display.enable=1 is on the
- * kernel command line: the native display is off by default there until it
- * has been seen to work. The PMP values must come from the boot loader, in
+ * apple,t6031-handoff. Its default is scoped to the J516C: there the native
+ * display is on unless apple_t6031_display.enable=0; the other T6031 boards
+ * need apple_t6031_display.enable=1. The T6031 GPU starts its firmware only
+ * after this native display is up, so enable=0 (or a display that never
+ * comes up) keeps the GPU off for that boot too: it is not a display-only
+ * switch. The default changes no check of the
+ * handoff or the PMP below. The PMP values must come from the boot loader, in
  * /chosen/asahi,t6031-pmp; there is no fallback. Its PMP topology is
  * reused from the device tree, as on T8122. The T6031 display power
  * states nest the other way round (the DCP's DISP_FE under DISP_CPU under
@@ -160,8 +164,20 @@ static const char gate_t6031_pmp_uuid[] __initconst = "07FF4C5B-CB2E-3DE6-95FF-3
  */
 static bool gate_requested __initdata = true;
 
-/* apple_t6031_display.enable: the T6031 native display is off unless it is 1. */
+/*
+ * apple_t6031_display.enable: -1 while it is not on the command line, else 0
+ * or 1. Unset, the T6031 native display is on only on gate_t6031_board.
+ */
+static int gate_t6031_switch __initdata = -1;
+static const char *gate_t6031_board __initdata = "apple,j516c";
+/* The resolved request, set by gate_run() on a T6031. */
 static bool gate_t6031_requested __initdata;
+
+/* Whether the T6031 native display is requested: an explicit 0 or 1 wins. */
+static bool __init gate_t6031_wanted(int sw, bool default_board)
+{
+	return sw < 0 ? default_board : sw;
+}
 
 /* One SoC's internal display handoff, as the gate checks and completes it */
 struct gate_soc {
@@ -259,8 +275,10 @@ static const struct gate_soc gate_t8122 __initconst = {
 };
 
 /*
- * T6031 (M3 Max): the T6030 handoff at the T6031 addresses, off unless
- * apple_t6031_display.enable=1. The PMP values must come from the boot
+ * T6031 (M3 Max): the T6030 handoff at the T6031 addresses, on by default on
+ * the J516C and off unless apple_t6031_display.enable=1 on the other boards;
+ * apple_t6031_display.enable=0 keeps it, and with it the GPU, off everywhere.
+ * The PMP values must come from the boot
  * loader: there is no built-in fallback. The PMP image is T6031's own;
  * any other, the T6030 image included, is refused. The report driver checks
  * the image's SRAM layout before it starts the PMP. The internal display's
@@ -368,10 +386,18 @@ static int __init gate_setup_t8122(char *arg)
 }
 early_param("apple_t8122_display.enable", gate_setup_t8122);
 
-/* Its own switch: the T6030 and T8122 options do not change it, nor it them. */
+/*
+ * Its own switch: the T6030 and T8122 options do not change it, nor it them.
+ * A value kstrtobool() rejects sets nothing, so the board default stays.
+ */
 static int __init gate_setup_t6031(char *arg)
 {
-	return kstrtobool(arg, &gate_t6031_requested);
+	bool on;
+	int ret = kstrtobool(arg, &on);
+
+	if (!ret)
+		gate_t6031_switch = on;
+	return ret;
 }
 early_param("apple_t6031_display.enable", gate_setup_t6031);
 
@@ -1993,8 +2019,17 @@ static void __init gate_run(void)
 	if (gate_soc->describe)
 		gate_describe();
 
+	if (gate_soc == &gate_t6031) {
+		bool board = of_machine_is_compatible(gate_t6031_board);
+
+		gate_t6031_requested = gate_t6031_wanted(gate_t6031_switch, board);
+		if (gate_t6031_switch < 0 && board)
+			gate_info("native display on by default on %s; apple_t6031_display.enable=0 keeps the boot framebuffer\n",
+				  gate_t6031_board);
+	}
+
 	if (!*gate_soc->requested) {
-		if (gate_soc->opt_in)
+		if (gate_soc->opt_in && gate_t6031_switch < 0)
 			gate_info("native display not requested (%s is not on the command line), display stays on the boot framebuffer\n",
 				  gate_soc->opt_in);
 		else

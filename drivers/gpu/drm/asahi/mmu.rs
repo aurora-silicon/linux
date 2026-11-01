@@ -412,6 +412,21 @@ fn lock_vm(
     Ok(VmExecGuard(unsafe { gpuvm.exec_lock(obj, interruptible)? }))
 }
 
+#[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+pub(crate) struct VmReadGuard(VmExecGuard);
+
+#[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+impl VmReadGuard {
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn covers_range(&mut self, address: u64, size: u64, read: bool, write: bool) -> bool {
+        Vm::covers_range_locked(&mut self.0, address, size, read, write)
+    }
+
+    pub(crate) fn read_user(&mut self, va: u64, buf: &mut [u8]) -> Result {
+        Vm::read_user_locked(&mut self.0, va, buf)
+    }
+}
+
 /// Slot binding-related inner data for a Vm instance.
 struct VmBinding {
     active_users: usize,
@@ -2220,7 +2235,16 @@ impl Vm {
     /// mappings cannot change during the copy (GPUVM exec lock).
     #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
-        let mut inner = lock_vm(&self.gpuvm, None, false)?;
+        self.read_lock()?.read_user(va, buf)
+    }
+
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    pub(crate) fn read_lock(&self) -> Result<VmReadGuard> {
+        Ok(VmReadGuard(lock_vm(&self.gpuvm, None, false)?))
+    }
+
+    #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
+    fn read_user_locked(inner: &mut VmInner, va: u64, buf: &mut [u8]) -> Result {
         let mut done = 0usize;
         while done < buf.len() {
             let address = va.checked_add(done as u64).ok_or(EFAULT)?;
@@ -3317,6 +3341,16 @@ impl Uat {
 
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
+        self.bind_inner(vm, true)
+    }
+
+    /// Binds a VM without waiting for another slot owner to retire.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn try_bind(&self, vm: &Vm) -> Result<VmBind> {
+        self.bind_inner(vm, false)
+    }
+
+    fn bind_inner(&self, vm: &Vm, wait: bool) -> Result<VmBind> {
         self.inner.check_m4()?;
         let mut binding = vm.binding.lock();
         self.inner.check_m4()?;
@@ -3332,7 +3366,11 @@ impl Uat {
                 None
             });
 
-            let slot = self.slots.get(binding.bind_token)?;
+            let slot = if wait {
+                self.slots.get(binding.bind_token)?
+            } else {
+                self.slots.try_get(binding.bind_token)?
+            };
             if slot.changed() {
                 mod_pr_debug!("Vm Bind [{}]: bind_token={:?}\n", vm.id, slot.token(),);
                 let idx = (slot.slot() as usize) + UAT_USER_CTX_START;
