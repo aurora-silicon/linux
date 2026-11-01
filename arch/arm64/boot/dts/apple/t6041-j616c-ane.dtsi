@@ -58,6 +58,11 @@
 	memory-region = <&ane_fw_text>, <&ane_fw_data>;
 	memory-region-names = "firmware-text", "firmware-data";
 	apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+	/*
+	 * The ANE's DART descriptors are cacheable and its accesses cohere with
+	 * the CPU caches, as on M1/M2 (accel/ane map_mode 3 buffer-reuse checks).
+	 */
+	dma-coherent;
 };
 
 /*
