@@ -206,6 +206,8 @@ struct apple_isp_hw {
 	 * started at probe and kept running while the driver is bound.
 	 */
 	bool resident_fw;
+	/* The xx24 setfiles' lens shading strides need zeroing (T8142). */
+	bool setfile_stride_fixup;
 };
 
 enum isp_sensor_id {
