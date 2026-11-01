@@ -141,6 +141,25 @@ static void mt_scan_retire_wait(struct mt7932 *m, unsigned long timeout)
 	}
 }
 
+/* No lock held. A supplicant cancels its scan just before it connects, and
+ * the firmware ends the cancelled batch a moment later. Wait for that end,
+ * bounded, instead of refusing the connect: wpa_supplicant answers a refused
+ * connect by skipping the BSS for 10 s. A scan that is still running belongs
+ * to its requester and is left alone.
+ */
+void mt_scan_settle_retired(struct mt7932 *m)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+	long left;
+
+	while (READ_ONCE(m->retired_scan_seq) && !READ_ONCE(m->scan_request) &&
+	       !READ_ONCE(m->stopping)) {
+		left = (long)(deadline - jiffies);
+		if (left <= 0 || !wait_for_completion_timeout(&m->scan_done, left))
+			break;
+	}
+}
+
 /* No command/response lock held. The caller closes new scan admission first.
  * Natural EID0d completion fences the scan; a local cancel alone does not.
  * The batch awaited here may already have been followed by the next one,

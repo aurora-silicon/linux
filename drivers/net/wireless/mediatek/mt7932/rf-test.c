@@ -340,6 +340,48 @@ static void mt_scan_retire_test_finish(struct work_struct *work)
 		schedule_delayed_work(&ctx->retire, msecs_to_jiffies(300));
 }
 
+/* A connect right after a cancelled scan waits for the firmware to end it. */
+static void mt_scan_connect_settle_test(struct kunit *test)
+{
+	struct mt_scan_retire_test_context ctx = {};
+	struct cfg80211_scan_request *scan;
+	struct mt7932 *m = test->priv;
+	unsigned long start;
+
+	scan = kunit_kzalloc(test, sizeof(*scan), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, scan);
+	init_completion(&m->scan_done);
+	INIT_DELAYED_WORK(&ctx.retire, mt_scan_retire_test_late);
+	ctx.m = m;
+
+	/* The cancelled batch ends 300 ms later: the connect goes ahead then. */
+	m->scan_request = NULL;
+	m->retired_scan_seq = 8;
+	schedule_delayed_work(&ctx.retire, msecs_to_jiffies(300));
+	start = jiffies;
+	mt_scan_settle_retired(m);
+	KUNIT_EXPECT_EQ(test, m->retired_scan_seq, 0);
+	KUNIT_EXPECT_LT(test, jiffies - start, msecs_to_jiffies(1500));
+	cancel_delayed_work_sync(&ctx.retire);
+
+	/* A batch the firmware never ends is waited for only up to the bound. */
+	reinit_completion(&m->scan_done);
+	m->retired_scan_seq = 8;
+	start = jiffies;
+	mt_scan_settle_retired(m);
+	KUNIT_EXPECT_EQ(test, m->retired_scan_seq, 8);
+	KUNIT_EXPECT_GE(test, jiffies - start, msecs_to_jiffies(1900));
+	KUNIT_EXPECT_LE(test, jiffies - start, msecs_to_jiffies(3000));
+
+	/* A running scan is not waited for: the connect refuses it as before. */
+	m->scan_request = scan;
+	start = jiffies;
+	mt_scan_settle_retired(m);
+	KUNIT_EXPECT_LT(test, jiffies - start, msecs_to_jiffies(100));
+	m->scan_request = NULL;
+	m->retired_scan_seq = 0;
+}
+
 static void mt_scan_quiesce_retirement_test(struct kunit *test)
 {
 	static const struct cfg80211_ops ops = {};
@@ -537,6 +579,7 @@ static struct kunit_case mt_rf_test_cases[] = {
 	KUNIT_CASE(mt_rf_failure_blocks_startup_test),
 	KUNIT_CASE(mt_rf_failure_preserves_first_error_test),
 	KUNIT_CASE(mt_scan_quiesce_retirement_test),
+	KUNIT_CASE(mt_scan_connect_settle_test),
 	KUNIT_CASE(mt_rf_failure_during_publication_test),
 	{}
 };

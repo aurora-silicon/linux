@@ -890,6 +890,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		return auth;
 	if (params->bssid && !is_valid_ether_addr(params->bssid))
 		return -EINVAL;
+	mt_scan_settle_retired(m);
 	mutex_lock(&m->command_mutex);
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!mt_rf_allowed(m) || m->link_failed || m->connecting || m->connected || m->disconnecting || m->scan_request || m->retired_scan_seq) {
