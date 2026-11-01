@@ -28,6 +28,7 @@ struct debugfs_blob_wrapper;
 struct dentry;
 struct dev_pm_domain_list;
 struct iommu_domain;
+struct ave_vb2_mem;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
 #define AVE_MAX_SLOTS 7
@@ -256,6 +257,7 @@ struct ave_slot {
 	struct ave_buf extra; /* counted layout: per-slot 16 KiB buffer */
 	struct ave_buf bounce; /* input copied to the encoder's stride */
 	struct vb2_v4l2_buffer *src;
+	struct ave_vb2_mem *input_mem; /* independent firmware mapping reference */
 	u32 status;
 	bool busy; /* Process sent, reply pending */
 	bool done; /* reply in, output not delivered yet */
@@ -407,6 +409,11 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 		    bool force_key);
 int ave_cmd_complete(struct ave_ctx *ctx, unsigned int count);
 int ave_cmd_close(struct ave_ctx *ctx);
+
+/* ave-vb2.c */
+extern const struct vb2_mem_ops ave_vb2_memops;
+struct ave_vb2_mem *ave_vb2_get(struct vb2_buffer *vb);
+void ave_vb2_put(void *buf_priv);
 
 /* ave-sess.c */
 struct ave_session *ave_sess_create(struct ave_ctx *ctx);
