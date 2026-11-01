@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * M5 (T8142) ISP: the Neo's (T8140) ISP17a at another base. From the J813
+ * ADT (arm-io offset 0x210000000): isp reg 0x4a0000000 + 0x4000000, IRQs
+ * [425 426 427 428 438] (425 carries the IPC mailbox), sensor-type 0x71;
+ * dart-isp at +0x28c0000/+0x28e0000/+0x2900000, IRQ 443, vm-size 0xe0000000,
+ * remap streams 1 2 3 6 7 10 11 -> 0; EIC mmio-wd-isp 0x4e3b10000 + 0x8000.
+ * PMGR (0x380700000): ISP_SYS +0x2f8 (ADT id 75), the ISP17a slots
+ * +0x4000..+0x4060 (ids 162-174, the Neo's offsets), ISPSENS0/1 +0x190/+0x198.
+ * aura carves the firmware heap and adds it as "isp-heap"; without it, aura
+ * disables the node.
+ */
+
+/ {
+	aliases {
+		isp = &isp;
+	};
+};
+
+&pmgr {
+	ps_isp_sys: power-controller@2f8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2f8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sys";
+	};
+
+	ps_ispsens0: power-controller@190 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x190 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens0";
+	};
+
+	ps_ispsens1: power-controller@198 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x198 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens1";
+	};
+
+	ps_isp_cpu: power-controller@4000 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+		power-domains = <&ps_isp_sys>;
+	};
+
+	ps_isp_cpu_core0: power-controller@4008 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu_core0";
+		power-domains = <&ps_isp_cpu>;
+	};
+
+	/*
+	 * Not here: ISP_CPU_CORE1 (+0x4010), ISP_SECURE (+0x4028), ISP_STS1
+	 * (+0x4038), ISP_PEARL (+0x4040), ISP_CVD (+0x4058) and ISP_CVM
+	 * (+0x4060). On J813 their target fields ignore writes from the AP and
+	 * read back 0. The dart-isp DAPF passes this block to the ISP.
+	 */
+
+	ps_isp_fe: power-controller@4018 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+		power-domains = <&ps_isp_sys>;
+	};
+
+	/* Unnamed in the ADT, as on the Neo: the firmware's ISP_DPRX. */
+	ps_isp_dprx: power-controller@4020 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_sts0: power-controller@4030 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sts0";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_be: power-controller@4048 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_clr: power-controller@4050 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
+	};
+
+};
+
+&{/soc} {
+	isp_dart0: iommu@4a28c0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0xa28c0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 443 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		/* As on the Neo: 3-level tables, the ISP fetches at vm-base
+		 * 0x10000000000 and the walk ignores the high bits. */
+		apple,dma-range = <0x0 0x0 0x8 0x0>;
+		apple,remap-streams = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>,
+				      <10 0>, <11 0>;
+	};
+
+	isp_dart1: iommu@4a28e0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0xa28e0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 443 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,dma-range = <0x0 0x0 0x8 0x0>;
+		apple,remap-streams = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>,
+				      <10 0>, <11 0>;
+	};
+
+	isp_dart2: iommu@4a2900000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x4 0xa2900000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 443 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,dma-range = <0x0 0x0 0x8 0x0>;
+		apple,remap-streams = <1 0>, <2 0>, <3 0>, <6 0>, <7 0>,
+				      <10 0>, <11 0>;
+	};
+
+	/*
+	 * As on the Neo: "coproc" stops short of the secure route table at
+	 * +0x1804000 (a read takes a sticky SError) and of the IRQ block
+	 * (+0x2920000, "mbox") and the GPIO words (+0x2921000).
+	 */
+	isp: isp@4a0000000 {
+		compatible = "apple,t8142-isp", "apple,isp";
+		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+		reg-names = "coproc", "mbox", "gpio", "wdt";
+		reg = <0x4 0xa0000000 0x0 0x1801000>,
+		      <0x4 0xa2920000 0x0 0x1000>,
+		      <0x4 0xa2921000 0x0 0x100>,
+		      <0x4 0xe3b10000 0x0 0x8000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 425 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
+				<&ps_isp_cpu_core0>, <&ps_isp_fe>,
+				<&ps_isp_dprx>, <&ps_isp_sts0>,
+				<&ps_isp_be>, <&ps_isp_clr>;
+		apple,dart-vm-size = <0x0 0xe0000000>;
+		apple,platform-id = <0x71>;
+		apple,temporal-filter = <1>;
+	};
+};
+
+/*
+ * The J813 IMX958 (sensor version 0x958) as its firmware lists it: 13 configs,
+ * among them 3040x2880 (config 7) and a binned 1520x1440 (config 10); half
+ * of them report doubled heights and are left out. Its setfile is
+ * apple/isp_2224_01XX.dat (from macOS appleh16camerad).
+ */
+#include "isp-common.dtsi"
+
+&isp {
+	apple,temporal-filter = <1>;
+
+	sensor-presets {
+		/* 1280x720 */
+		preset0 {
+			apple,config-index = <10>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 292 1520 856>;
+		};
+		/* 1440x1080 (4:3) */
+		preset1 {
+			apple,config-index = <10>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1440 1080>;
+			apple,crop = <40 180 1440 1080>;
+		};
+		/* 1080x1080 (1:1) */
+		preset2 {
+			apple,config-index = <10>;
+			apple,input-size = <1520 1440>;
+			apple,output-size = <1080 1080>;
+			apple,crop = <220 180 1080 1080>;
+		};
+		/* 1920x1080 */
+		preset3 {
+			apple,config-index = <7>;
+			apple,input-size = <3040 2880>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <0 584 3040 1710>;
+		};
+	};
+};

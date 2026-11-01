@@ -397,3 +397,4 @@
 #include "t8142-j813-peripherals.dtsi"
 #include "t8142-j813-usb.dtsi"
 #include "t8142-j813-avd.dtsi"
+#include "t8142-j813-isp.dtsi"
