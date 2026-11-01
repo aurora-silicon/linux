@@ -307,6 +307,7 @@ struct mt7932 *mt_from_wiphy(struct wiphy *wiphy);
 void mt_scan_event(struct mt7932 *m, const struct mt7932_event *event);
 void mt_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev);
 int mt_scan_quiesce(struct mt7932 *m);
+void mt_scan_settle_retired(struct mt7932 *m);
 int mt_connect_discover(struct mt7932 *m);
 int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request);
 int mt_register_interface(struct mt7932 *m);

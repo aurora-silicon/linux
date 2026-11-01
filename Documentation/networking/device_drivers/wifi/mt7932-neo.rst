@@ -125,21 +125,27 @@ permit security fallback.
 For SAE, userspace supplies SAE authentication, an 8-63 byte password and
 required or optional management frame protection (MFP). Firmware uses required
 MFP for the SAE arm. On a PSK+SAE transition network, the first AKM supplied
-by userspace selects the arm: PSK keeps the existing binary-PMK request and
-disables MFP, while SAE uses the password and required MFP. PSK with required
-MFP is rejected on legacy AKM 2. WPA2 PMF uses the explicitly selected
-PSK-SHA256 AKM (6), with a binary 32-byte PMK and optional or required MFP.
-The only EA/40 security delta is little-endian 0x0400 at body +0x14. The
-host retains the MFP policy; there is no standalone optional/required field.
+by userspace selects the arm: PSK keeps the binary-PMK request, while SAE
+uses the password and required MFP. On the PSK (AKM 2) arm the firmware sets
+MFPC in its own RSN element and negotiates PMF with any AP that sets MFPC, so
+a WPA2 network with optional or required PMF is joined with PMF on. iwd and
+wpa_supplicant both ask for required MFP once they have negotiated PMF with
+such an AP, and wpa_supplicant asks for optional MFP when either outcome will
+do; every MFP setting is accepted on this arm. WPA2 PMF with the PSK-SHA256 AKM (6)
+also takes a binary 32-byte PMK and optional or required MFP; its only EA/40
+security delta is little-endian 0x0400 at body +0x14. There is no standalone
+optional/required field.
 
 Before any association command, the host validates the candidate's RSN IE,
-selected AKM, CCMP and MFPC/MFPR. A required request cannot downgrade to
-AKM 2 or a non-MFPC AP. Only BIP-CMAC-128 is accepted as an explicit group
+selected AKM, CCMP and MFPC/MFPR. A request for PMF cannot join an AP
+without MFPC, and a request with MFP disabled cannot join an AP that sets
+MFPR. With MFP disabled, the AKM 2 arm still negotiates PMF when the AP
+offers it, because the firmware always sets MFPC there. Only BIP-CMAC-128
+is accepted as an explicit group
 management suite; the standard omitted-suite default is also CMAC-128.
 Firmware owns IGTK extraction, install/removal and BIP verification. No
-add_key or set_default_mgmt_key operation is added. iwd's BIP gate is now
-satisfied, but WPA2-PMF and iwd behavior still require hardware qualification.
-The admitted PMF state is host policy, not a firmware readback. Selectors
+add_key or set_default_mgmt_key operation is added. The admitted PMF state
+follows the AP's RSN capabilities; it is not a firmware readback. Selectors
 0x40/0x42 retain their normal completion contract; neither reports PMF state.
 
 The standard SAE PWE settings (unspecified, hunting-and-pecking,
@@ -155,6 +161,14 @@ transition network has confirmed, on 2.4 GHz channel 6 and 5 GHz channel 149:
 * PSK with MFP disabled, and a ``wpa-psk`` profile with optional MFP, which
   joins the transition network as PSK;
 * repeated reconnection through NetworkManager after each change of profile.
+
+With iwd 3.12 and with NetworkManager and wpa_supplicant, against hostapd
+access points, every network that offers PMF is joined with it (hostapd
+lists the station with MFP): WPA2 with optional PMF and with required PMF on
+AKM 2, WPA2 with required PMF on AKM 6, the WPA2/WPA3 transition network and
+WPA3-only networks on 5 GHz, and WPA3 on 6 GHz. OWE with iwd needs an iwd
+that knows ``NL80211_EXT_FEATURE_OWE_OFFLOAD``; iwd 3.12 runs its own OWE
+exchange, which a firmware-offload device cannot serve.
 
 The request layout, transition admission and PMK derivation also have
 automated tests. A pure WPA3 network, exact PWE policy behavior, WPA2

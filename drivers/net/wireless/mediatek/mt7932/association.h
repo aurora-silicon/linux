@@ -52,8 +52,12 @@ mt7932_connect_auth(const struct cfg80211_connect_params *p)
 
 	switch (p->crypto.akm_suites[0]) {
 	case WLAN_AKM_SUITE_PSK:
-		if ((versions & NL80211_WPA_VERSION_2) && p->crypto.psk &&
-		    (p->mfp == NL80211_MFP_NO || p->mfp == NL80211_MFP_OPTIONAL))
+		/* iwd and wpa_supplicant both send REQUIRED once they have
+		 * negotiated PMF with an MFPC AP; wpa_supplicant sends OPTIONAL
+		 * when either outcome will do. Admission against the AP's RSN
+		 * capabilities decides.
+		 */
+		if ((versions & NL80211_WPA_VERSION_2) && p->crypto.psk)
 			return WLAN_AKM_SUITE_PSK;
 		break;
 	case WLAN_AKM_SUITE_PSK_SHA256:
@@ -166,13 +170,18 @@ static inline int mt7932_rsn_admit(const u8 *rsn, size_t length, u32 akm,
 		return -EOPNOTSUPP;
 	if ((caps & BIT(6)) && !(caps & BIT(7)))
 		return -EINVAL;
-	/* Legacy PSK has no established PMF firmware selection. Optional may
-	 * join it without PMF; required must never downgrade to that arm.
+	/* On the AKM 2 arm the firmware sets MFPC itself and negotiates PMF
+	 * with any AP that sets MFPC, so the AP's capability is the outcome.
+	 * A request for PMF needs an MFPC AP, and refusing PMF cannot join
+	 * an AP that sets MFPR.
 	 */
-	if (akm == WLAN_AKM_SUITE_PSK)
-		return mfp == NL80211_MFP_REQUIRED || (caps & BIT(6)) ?
-			       -EOPNOTSUPP :
-			       0;
+	if (akm == WLAN_AKM_SUITE_PSK) {
+		if ((mfp == NL80211_MFP_REQUIRED && !(caps & BIT(7))) ||
+		    (mfp == NL80211_MFP_NO && (caps & BIT(6))))
+			return -EOPNOTSUPP;
+		*pmf = !!(caps & BIT(7));
+		return 0;
+	}
 	if (mfp == NL80211_MFP_NO || !(caps & BIT(7)))
 		return -EOPNOTSUPP;
 	*pmf = true;
