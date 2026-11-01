@@ -18,6 +18,7 @@ typedef uint64_t dma_addr_t;
 #define AVE_BUF_CMD 0
 #define AVE_BUF_PROC(s) (17 + (s))
 #define SZ_16K 0x4000U
+#define SZ_1M 0x100000U
 #define U32_MAX UINT32_MAX
 #define GENMASK_ULL(h, l) ((~0ULL >> (63 - (h))) & (~0ULL << (l)))
 #define BIT(n) (1U << (n))
@@ -26,6 +27,7 @@ typedef uint64_t dma_addr_t;
 #define DIV_ROUND_UP(x, a) (((x) + (a) - 1) / (a))
 #define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define max(x, y) ((x) > (y) ? (x) : (y))
+#define max_t(t, x, y) ((t)(x) > (t)(y) ? (t)(x) : (t)(y))
 #define GFP_KERNEL 0
 #define DMA_ATTR_NO_KERNEL_MAPPING 1
 static inline void *kcalloc(size_t n, size_t size, int flags)
@@ -52,7 +54,6 @@ static inline void test_log(void *dev, const char *fmt, ...)
 
 #define atomic_inc(p) (++*(p))
 static unsigned long jiffies = 42;
-#ifndef TEST_BASELINE
 static inline void put_unaligned_le16(u16 v, void *p)
 {
 	u8 *b = p;
@@ -60,7 +61,6 @@ static inline void put_unaligned_le16(u16 v, void *p)
 	for (unsigned int i = 0; i < 2; i++)
 		b[i] = v >> (8 * i);
 }
-#endif
 static inline void put_unaligned_le32(u32 v, void *p)
 {
 	u8 *b = p;
@@ -77,6 +77,15 @@ static inline void put_unaligned_le64(u64 v, void *p)
 		b[i] = v >> (8 * i);
 }
 
+#ifdef TEST_PER_ABI
+static inline u16 get_unaligned_le16(const void *p)
+{
+	const u8 *b = p;
+
+	return (u16)b[0] | (u16)b[1] << 8;
+}
+
+#endif
 static inline u32 get_unaligned_le32(const void *p)
 {
 	const u8 *b = p;

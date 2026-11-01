@@ -11,6 +11,8 @@
  */
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
+#include <linux/fs.h>
+#include <linux/limits.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -22,7 +24,7 @@
 #include "ave.h"
 #include "ave-regs.h"
 
-#define AVE_AUTOSUSPEND_MS	2000
+#define AVE_AUTOSUSPEND_MS 2000
 
 static const struct ave_coproc_regs ave_coproc_v40 = {
 	.vcbar = AVE_COPROC_VCBAR,
@@ -34,30 +36,68 @@ static const struct ave_coproc_regs ave_coproc_v40 = {
 	.keep_mappings = AVE_COPROC_KEEP_MAPPINGS,
 };
 
-/* Pre-M4 wire layouts are shared; their command constants still need traces. */
-static const struct ave_variant ave_t6000 = {
-	.regs = &ave_coproc_v40,
+/* Panda/Castor register family used by 6070.11.1. */
+static const struct ave_coproc_regs ave_coproc_6070 = {
+	.vcbar = 0x50000,
+	.timebase_freq = 0x160020,
+	.timebase = 0x178000,
+	.ctrl = 0x400044,
+	.status = 0x400048,
+	.boot_arg = 0x400400,
+	.keep_mappings = 0x400808,
+};
+
+const struct ave_variant ave_t6000 = {
+	.regs = &ave_coproc_6070,
 	.fw_text_size = 0xd0000,
 	.fw_data_size = 0x128000,
 	.boot_device_id = 11,
 	.device_type = 9,
 	.lfs_ref_scale = 1,
+	.text_crc = 0x460c7a7c,
+	.boot_arg_value = 0x400,
+	.timebase_multiplier = 1000000,
+	.vcbar_mask = 0x0000000ffffff800ULL,
+	.vcbar_flags = 0x0102000000000000ULL,
+
+	.extra0_size = 0x24,
+	.boot_qualified = true,
 };
 
-static const struct ave_variant ave_t8112 = {
-	.regs = &ave_coproc_v40,
+const struct ave_variant ave_t8112 = {
+	.regs = &ave_coproc_6070,
 	.fw_text_size = 0xd0000,
 	.fw_data_size = 0x128000,
 	.boot_device_id = 15,
 	.device_type = 13,
 	.lfs_ref_scale = 1,
+	.text_crc = 0x25bfd039,
+	.boot_arg_value = 0x10000,
+	.timebase_multiplier = 1,
+	.vcbar_mask = 0x000003fffffff800ULL,
+	.vcbar_flags = 0x0102000000000000ULL,
+
+	.extra0_size = 0x4000,
+	.boot_qualified = true,
 };
 
-/* CRC, boot-config words and coprocessor start registers remain unqualified. */
+/*
+ * The M4 Pro (T6040 in the ADT, apple,t6041 in the DT) starts its encoder
+ * like the A18 Pro: same coprocessor registers and boot sequence, its own
+ * device ID and type.
+ */
 static const struct ave_variant ave_t6041 = {
+	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
 	.fw_data_size = 0x12c000,
+	.boot_device_id = 27,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 25,
 	.lfs_ref_scale = 2,
+	.boot_qualified = true,
 };
 
 static const struct ave_variant ave_t8140 = {
@@ -65,6 +105,10 @@ static const struct ave_variant ave_t8140 = {
 	.fw_text_size = 0x14c000,
 	.fw_data_size = 0x130000,
 	.boot_device_id = 29,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
 	.device_type = 27,
 	.lfs_ref_scale = 2,
 	.boot_qualified = true,
@@ -75,14 +119,35 @@ static const struct ave_variant ave_t8140 = {
  * last_process0_{h264,hevc} the first Process of the last session, so the
  * generated commands can be compared with reference captures.
  */
-void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec, enum ave_image kind,
-		      const void *cmd, size_t len)
+void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec,
+		      enum ave_image kind, const void *cmd, size_t len)
 {
 	void *dst = ave->dump[codec - 1][kind];
 
 	if (ave->layout && dst && len == ave->layout->bytes[codec - 1][kind])
 		memcpy(dst, cmd, len);
 }
+
+static ssize_t ave_lifecycle_write(struct file *file, const char __user *user,
+				   size_t count, loff_t *ppos)
+{
+	struct ave_dev *ave = file->private_data;
+	unsigned int codec;
+	int ret = kstrtouint_from_user(user, count, 0, &codec);
+
+	if (ret)
+		return ret;
+	if (codec != AVE_CODEC_H264 && codec != AVE_CODEC_HEVC)
+		return -EINVAL;
+	ret = ave_fw_lifecycle_test(ave, codec);
+	return ret ?: count;
+}
+
+static const struct file_operations ave_lifecycle_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = ave_lifecycle_write,
+};
 
 /* Root-only software timeout injection; does not send malformed firmware commands. */
 static int ave_inject_wedge(void *data, u64 value)
@@ -106,7 +171,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(ave_inject_wedge_fops, NULL, ave_inject_wedge, "%llu\n"
 
 static void ave_debugfs_init(struct ave_dev *ave)
 {
-	static const char * const names[2][AVE_IMAGE_COUNT] = {
+	static const char *const names[2][AVE_IMAGE_COUNT] = {
 		{ "last_start_h264", "last_process0_h264" },
 		{ "last_start_hevc", "last_process0_hevc" },
 	};
@@ -114,6 +179,11 @@ static void ave_debugfs_init(struct ave_dev *ave)
 	if (!IS_ENABLED(CONFIG_DEBUG_FS) || !ave->layout)
 		return;
 	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
+	if (ave->layout->abi == &ave_abi_6070) {
+		debugfs_create_file("lifecycle_test", 0200, ave->debugfs, ave,
+				    &ave_lifecycle_fops);
+		return;
+	}
 	debugfs_create_file("inject_wedge", 0200, ave->debugfs, ave,
 			    &ave_inject_wedge_fops);
 	for (unsigned int c = 0; c < 2; c++)
@@ -121,19 +191,23 @@ static void ave_debugfs_init(struct ave_dev *ave)
 			struct debugfs_blob_wrapper *blob;
 			size_t size = ave->layout->bytes[c][k];
 
-			blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
-			ave->dump[c][k] = devm_kzalloc(ave->dev, size, GFP_KERNEL);
+			blob = devm_kzalloc(ave->dev, sizeof(*blob),
+					    GFP_KERNEL);
+			ave->dump[c][k] =
+				devm_kzalloc(ave->dev, size, GFP_KERNEL);
 			if (!blob || !ave->dump[c][k]) {
 				ave->dump[c][k] = NULL;
 				continue;
 			}
 			blob->data = ave->dump[c][k];
 			blob->size = ave->layout->bytes[c][k];
-			debugfs_create_blob(names[c][k], 0400, ave->debugfs, blob);
+			debugfs_create_blob(names[c][k], 0400, ave->debugfs,
+					    blob);
 		}
 }
 
-static const char * const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0", "me1" };
+static const char *const ave_pd_names[] = { "dma", "pipe4", "pipe5", "me0",
+					    "me1" };
 
 static int ave_probe(struct platform_device *pdev)
 {
@@ -227,7 +301,8 @@ static void ave_remove(struct platform_device *pdev)
 	mutex_lock(&ave->hw_lock);
 	if (ave->fw_state != AVE_FW_OFF) {
 		mutex_unlock(&ave->hw_lock);
-		dev_warn(ave->dev, "firmware was started, keeping its memory\n");
+		dev_warn(ave->dev,
+			 "firmware was started, keeping its memory\n");
 		return;
 	}
 	mutex_unlock(&ave->hw_lock);
@@ -241,12 +316,21 @@ static int ave_runtime_suspend(struct device *dev)
 
 	mutex_lock(&ave->hw_lock);
 	ret = ave_fw_runtime_suspend(ave);
+	if (!ret && ave->layout && ave->layout->abi->transport->scratch_halt)
+		ave_fw_release_boot(ave);
 	mutex_unlock(&ave->hw_lock);
 	return ret;
 }
 
 static int ave_runtime_resume(struct device *dev)
 {
+	struct ave_dev *ave = dev_get_drvdata(dev);
+
+	mutex_lock(&ave->hw_lock);
+	if (ave->layout && ave->layout->abi->transport->scratch_halt &&
+	    ave->fw_state == AVE_FW_HALTED)
+		ave_fw_lost(ave);
+	mutex_unlock(&ave->hw_lock);
 	return 0;
 }
 
@@ -266,6 +350,8 @@ static int ave_suspend(struct device *dev)
 	mutex_lock(&ave->hw_lock);
 	ave_v4l2_suspend(ave);
 	ret = ave_fw_shutdown(ave);
+	if (!ret && ave->layout && ave->layout->abi->transport->scratch_halt)
+		ave_fw_release_boot(ave);
 	mutex_unlock(&ave->hw_lock);
 	if (ret) {
 		/*
@@ -284,13 +370,14 @@ static int ave_resume(struct device *dev)
 	struct ave_dev *ave = dev_get_drvdata(dev);
 
 	/* The next boot checks the coprocessor state itself. */
+	ave_runtime_resume(dev);
 	v4l2_m2m_resume(ave->m2m_dev);
 	return 0;
 }
 
 static const struct dev_pm_ops ave_pm_ops = {
 	SYSTEM_SLEEP_PM_OPS(ave_suspend, ave_resume)
-	RUNTIME_PM_OPS(ave_runtime_suspend, ave_runtime_resume, NULL)
+		RUNTIME_PM_OPS(ave_runtime_suspend, ave_runtime_resume, NULL)
 };
 
 static const struct of_device_id ave_of_match[] = {
@@ -298,7 +385,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6041-ave", .data = &ave_t6041 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
-	{ }
+	{}
 };
 MODULE_DEVICE_TABLE(of, ave_of_match);
 
@@ -317,3 +404,4 @@ module_platform_driver(ave_driver);
 
 MODULE_DESCRIPTION("Apple AVE video encoder");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("DMA_BUF");

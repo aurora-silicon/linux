@@ -448,11 +448,44 @@
 		nonposted-mmio;
 		ranges;
 
+		jpeg0: jpeg@28d000000 {
+			compatible = "apple,t8140-jpeg";
+			reg = <0x2 0x8d000000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1040 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg_dart 0>;
+			power-domains = <&ps_jpg>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+			status = "disabled";
+		};
+
 		jpeg_dart: iommu@28d020000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x2 0x8d020000 0x0 0xc000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1041 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
+			power-domains = <&ps_jpg>;
+			status = "disabled";
+		};
+
+		jpeg1: jpeg@28d060000 {
+			compatible = "apple,t8140-jpeg";
+			reg = <0x2 0x8d060000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1043 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&jpeg1_dart 0>;
+			power-domains = <&ps_jpg>;
+			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+			status = "disabled";
+		};
+
+		jpeg1_dart: iommu@28d080000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x8d080000 0x0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1044 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
 			apple,dma-range = /bits/ 64 <0x10000000000 0x30000000000>;
 			power-domains = <&ps_jpg>;
@@ -982,7 +1015,7 @@
 			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_sys>;
 			#iommu-cells = <1>;
-			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
 			status = "disabled";
 		};
 
@@ -993,7 +1026,7 @@
 			interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_sys>;
 			#iommu-cells = <1>;
-			apple,dma-range = <0x100 0x00004000 0 0x0fffc000>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
 			status = "disabled";
 		};
 

@@ -5,7 +5,8 @@ Run python3 run.py with a C compiler providing ASan and UBSan (CC may name
 its executable). No encoder, firmware or captured command image is needed.
 
 run.py reads the real AVE structs and compiles the unmodified bodies of
-ave-image.c, ave-layout.c and ave-cmd.c, plus the real buffer-allocation,
+ave-image.c, ave-layout.c, ave-abi.c, ave-writer.c and ave-cmd.c, plus the real
+buffer-allocation,
 free, reply and firmware-build-gate functions. Only includes and unused
 kernel-facing declarations are omitted. shim.h supplies host primitives;
 boundary.h replaces IPC, DMA and logging. This does not validate the kernel
@@ -28,6 +29,10 @@ value and side-effect-free calls to kernel-like arithmetic macros. Those
 produce checkpatch PREFER_KERNEL_TYPES, ENOTSUPP and MACRO_ARG_REUSE notices.
 MAINTAINERS already covers the entire AVE directory (FILE_PATH_CHANGES).
 
+The ABI refactor also has in-kernel arm64 KUnit tests selected by
+VIDEO_APPLE_AVE_CMD_KUNIT_TEST. The host runner understands both the older
+single-builder sources and the per-ABI writer split for baseline comparison.
+
 Recovery and PM checks
 ----------------------
 
@@ -39,6 +44,14 @@ retained power, failed control stop, the recovery limit, pristine DATA restore
 failure, suspend refusal/rollback and a busy IPC stream reaching its deadline.
 MMIO, DMA allocation and PM are simulated: this cannot establish hardware reset
 values or that a VENC domain actually powered down.
+
+The recovery runner also uses the production OUTPUT memory operations and
+Process submission callback. Both MMAP and imported dma-buf mappings survive
+immediate vb2 release after ERROR, including loss of the importing fd and an
+uncertain command submission. The fake DMA boundary rejects any release of a
+command-referenced mapping before the control-off marker AND simulated shared
+DART/VENC power loss. A failed stop and CTRL=0 with retained BOOT_ARG must not
+reclaim it. Allocator failures and ordinary import/map/release are covered too.
 
 The apple-ave-recovery KUnit suite tests the actual sliding-window helper at
 expiry boundaries, with staggered attempts and across jiffies wrap. Run with
@@ -85,3 +98,49 @@ J616s and Neo. Repeat the recovery with a genuine firmware timeout/DART fault
 when a safe reproducer is available. Keep captures and machine records outside
 the public source tree. Rollback is a normal revert of the recovery commits;
 use the lane's existing boot fallback when testing candidate kernels.
+
+LEAD-RUN: Neo failed-session mapping regression
+----------------------------------------------
+
+Run in the approved Neo hardware lane, using the hardware procedure above.
+This is a re-test plan, not a claim of hardware qualification. Preserve the
+normal candidate-kernel boot fallback and the known-good module/kernel for
+rollback. Record the full source commit, kernel config, module hash/vermagic,
+firmware CRCs and boot ID with the results. Build and install the matching
+candidate through the lane's normal procedure; do not load a module built for
+a different kernel. Keep machine journals and captures outside public source.
+
+1. Save a complete kernel log before the test and collect a continuous kernel
+   journal with monotonic timestamps throughout each scenario. Establish fresh
+   AVC and HEVC encode/decode success. Use the same queue exerciser as the
+   original hardware procedure to record injection time, first POLLERR/EIO and
+   each buffer's completion count/state. Include MMAP OUTPUT and imported
+   dma-buf OUTPUT runs, with immediate DQBUF, STREAMOFF, REQBUFS(0), close and
+   release of the importing fd after the error. This exercises lifetime beyond
+   the V4L2 context. Do not require the client to wait for the stop or reset.
+2. Re-run hardware steps 2-4: inject during a long encode, require prompt queue
+   errors (compare with the prior 5-9 ms POLLERR measurements), and exactly one
+   ERROR completion per buffer still owned by the driver. Require the existing
+   recovery stop and power-cycle-confirmed messages and a valid new encode
+   without rebooting. Inspect the entire interval from injection through the
+   subsequent encode, not just the recovery's last messages.
+3. Re-run step 5 with two clients, including the idle owner. Release both
+   contexts promptly after ERROR. Require both clients to fail promptly,
+   balanced PM ownership, a confirmed recovery and a valid fresh encode.
+4. Re-run step 6 with a fresh recovery budget: three injections in ten minutes,
+   restarting and verifying an encode after each. The next failure must retain
+   queue errors and report the three-attempt limit without a new boot. After
+   the oldest attempt expires, require successful recovery and encoding. Use
+   the lane's normal fresh-boot procedure or allow the earlier attempts to
+   expire between scenarios; do not reset the counter by reloading the driver.
+5. PASS requires zero apple-dart translation faults after EVERY injection,
+   including the limited attempt and its expiry/retry, with no new suppressed
+   fault messages. Preserve complete logs and per-injection windows, completion
+   counts, error latency and recovery results even on failure. Any new DART
+   fault, missing/duplicate completion, lost prompt error or unconfirmed reset
+   is a failed re-test. The existing strict sleep check in step 7 remains
+   required in its separate approved sleep lane.
+
+On failure, preserve the candidate logs and restore the known-good kernel or
+module through the lane's rollback procedure. Keep the draft unmerged pending
+this LEAD-RUN evidence. Software injection does not qualify a real DMA overrun.

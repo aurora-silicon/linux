@@ -36,7 +36,7 @@ static void mutex_unlock(struct mutex *m)
 #define spin_lock_irqsave(p, flags) do { (flags) = 0; mutex_lock(p); } while (0)
 #define spin_unlock_irqrestore(p, flags) do { (void)(flags); mutex_unlock(p); } while (0)
 struct ave_dev;
-struct device { struct ave_dev *drvdata; unsigned int refs; };
+struct device { struct ave_dev *drvdata; unsigned int refs, dma_refs; };
 
 static void *dev_get_drvdata(struct device *dev)
 {
@@ -45,7 +45,11 @@ static void *dev_get_drvdata(struct device *dev)
 
 struct vb2_queue { unsigned int type; bool error, streaming; void *priv; };
 
-struct vb2_buffer { struct vb2_queue *vb2_queue; void *priv; };
+struct vb2_buffer {
+	struct vb2_queue *vb2_queue;
+	void *priv;
+	struct { void *mem_priv; } planes[1];
+};
 
 struct vb2_v4l2_buffer { struct vb2_buffer vb2_buf; unsigned int completions; int state; };
 
@@ -79,12 +83,15 @@ struct ave_dev {
 	bool inject_wedge, data_dirty;
 	void *wq, *m2m_dev, *coproc, *mbox;
 	const struct ave_variant *variant;
+	const struct ave_fw_layout *layout;
+	u32 data_crc;
 	struct ave_fw_segment text, data;
 	void *data_pristine;
 	struct ave_ring ring[2];
 	u64 ipc_fw_base;
 };
 
+static void *test_ctrl_addr;
 static int halt_result, close_result;
 static unsigned int halts, closes, freed, suspends, resumes, schedules, barriers;
 static unsigned int polls, sleep_ms;
@@ -116,8 +123,11 @@ static u64 readq(const void *p)
 
 static void writel(u32 v, void *p)
 {
-	if (!ctrl_sticky)
+	if (!ctrl_sticky) {
 		*(u32 *)p = v;
+		if (p == test_ctrl_addr)
+			stop_seen = !v;
+	}
 }
 
 static void *memremap(phys_addr_t p, size_t size, unsigned int mode)
@@ -191,9 +201,13 @@ static bool ave_sess_stalled(struct ave_session *sess)
 	return false;
 }
 
-static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
+static void ave_free(struct ave_dev *ave, struct ave_buf *buf)
 {
-	freed++;
+	if (buf->cpu) {
+		assert(stop_seen && power_seen);
+		freed++;
+		buf->cpu = NULL;
+	}
 }
 
 static void pm_runtime_mark_last_busy(struct device *dev) { }
@@ -284,3 +298,16 @@ void ave_sess_reap(struct ave_dev *ave);
 static void ave_reset_drain(struct ave_ctx *ctx);
 int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		 bool (*cond)(struct ave_dev *, void *), void *arg);
+
+/* ABI-selected helpers are unreachable in the 9003 recovery fixtures. */
+#define readl_poll_timeout(addr, value, condition, delay, timeout) \
+ ((value) = readl(addr), (condition) ? 0 : -ETIMEDOUT)
+static int ave_fw_crc(const struct ave_fw_segment *segment, u32 *crc, void *copy)
+{
+ assert(!"6070 CRC readback reached a 9003 recovery fixture");
+ return -EIO;
+}
+static void ave_fw_release_boot(struct ave_dev *ave)
+{
+ assert(!"6070 boot teardown reached a 9003 recovery fixture");
+}

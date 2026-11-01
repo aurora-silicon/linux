@@ -29,19 +29,20 @@
  */
 #define AVE_MIN_W		320
 #define AVE_MIN_H		240
-#define AVE_MAX_W		2560
-#define AVE_MAX_H		1600
+#define AVE_MAX_W		4096
+#define AVE_MAX_H		2304
 #define AVE_STEP		16
 #define AVE_STRIDE_ALIGN	64
 #define AVE_DEFAULT_W		1920
 #define AVE_DEFAULT_H		1080
 /*
- * Buffer counts are limited so a full set fits the encoder's 256 MiB DART
- * window next to a session: each queue may use this much, counting every
- * buffer at the power-of-two size the DMA layer maps it with.
+ * Buffer counts are limited so the queues of a few concurrent sessions fit
+ * the encoder's 4 GiB DART window next to their session buffers: each queue
+ * may use this much, counting every buffer at the power-of-two size the DMA
+ * layer maps it with. That is 16 OUTPUT frames at 3840x2160.
  */
-#define AVE_OUTPUT_BUDGET	(80 * SZ_1M)
-#define AVE_CAPTURE_BUDGET	(40 * SZ_1M)
+#define AVE_OUTPUT_BUDGET	(256 * SZ_1M)
+#define AVE_CAPTURE_BUDGET	(128 * SZ_1M)
 #define AVE_MAX_QUEUE_BUFS	16
 #define AVE_RESTART_TRIES	10
 #define AVE_RESTART_WAIT_MS	100
@@ -73,19 +74,28 @@ static bool ave_fmt_listed(const u32 *list, unsigned int n, u32 fourcc)
 	return false;
 }
 
-static void ave_clamp_size(u32 *w, u32 *h)
+/* HEVC Main tier levels 5 to 5.2 allow at most this many luma samples. */
+#define AVE_HEVC_MAX_SAMPLES	8912896
+
+/* @coded is the coded format the size is for: HEVC caps the picture area. */
+static void ave_clamp_size(u32 coded, u32 *w, u32 *h)
 {
 	*w = clamp_t(u32, ALIGN(*w, 2), AVE_MIN_W, AVE_MAX_W);
 	*h = clamp_t(u32, ALIGN(*h, 2), AVE_MIN_H, AVE_MAX_H);
+	if (coded == V4L2_PIX_FMT_HEVC && *w * *h > AVE_HEVC_MAX_SAMPLES)
+		*h = rounddown(AVE_HEVC_MAX_SAMPLES / *w, 2);
 }
 
-/* Raw NV12, one buffer: Y plane, then interleaved CbCr at half height. */
-static void ave_fill_raw(struct v4l2_pix_format_mplane *f)
+/*
+ * Raw NV12, one buffer: Y plane, then interleaved CbCr at half height.
+ * @coded is the context's coded format, which limits the size.
+ */
+static void ave_fill_raw(struct v4l2_pix_format_mplane *f, u32 coded)
 {
 	u32 stride, height;
 
 	f->pixelformat = V4L2_PIX_FMT_NV12;
-	ave_clamp_size(&f->width, &f->height);
+	ave_clamp_size(coded, &f->width, &f->height);
 	/* Keep a client's stride, within reason, rounded to 64 bytes. */
 	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width, 2 * AVE_MAX_W),
 		       AVE_STRIDE_ALIGN);
@@ -104,7 +114,7 @@ static void ave_fill_coded(struct v4l2_pix_format_mplane *f)
 
 	if (!ave_fmt_listed(ave_coded_fmts, ARRAY_SIZE(ave_coded_fmts), f->pixelformat))
 		f->pixelformat = ave_coded_fmts[0];
-	ave_clamp_size(&f->width, &f->height);
+	ave_clamp_size(f->pixelformat, &f->width, &f->height);
 	/* The firmware's coded-data capacity plus parameter sets and headers. */
 	min = ALIGN(3 * ALIGN(f->width, 32) * ALIGN(f->height, 16) / 2, SZ_16K) + SZ_64K;
 	f->num_planes = 1;
@@ -128,7 +138,7 @@ static void ave_reset_fmts(struct ave_ctx *ctx)
 	memset(src, 0, sizeof(*src));
 	src->width = dst->width;
 	src->height = dst->height;
-	ave_fill_raw(src);
+	ave_fill_raw(src, dst->pixelformat);
 	src->colorspace = V4L2_COLORSPACE_REC709;
 	src->xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	src->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -203,7 +213,7 @@ static int ave_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
 
-	ave_fill_raw(pix);
+	ave_fill_raw(pix, ctx->dst_fmt.pixelformat);
 	if (pix->colorspace == V4L2_COLORSPACE_DEFAULT) {
 		pix->colorspace = ctx->src_fmt.colorspace;
 		pix->xfer_func = ctx->src_fmt.xfer_func;
@@ -544,7 +554,7 @@ static int ave_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned i
 	/* Frames stay with the firmware until encoded; keep one spare. */
 	if (V4L2_TYPE_IS_OUTPUT(vq->type) && have + *nbufs < AVE_MAX_SLOTS + 1)
 		*nbufs = AVE_MAX_SLOTS + 1 - have;
-	/* A full set of both queues must fit the encoder's 256 MiB DART window. */
+	/* A full set of both queues must fit the budget for the DART window. */
 	if (have >= max) {
 		dev_dbg(ctx->ave->dev, "%s queue already has its %u buffers\n",
 			V4L2_TYPE_IS_OUTPUT(vq->type) ? "OUTPUT" : "CAPTURE", max);
@@ -900,7 +910,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	src->drv_priv = ctx;
 	src->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	src->ops = &ave_qops;
-	src->mem_ops = &vb2_dma_contig_memops;
+	src->mem_ops = &ave_vb2_memops;
 	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src->lock = &ctx->ave->vdev_lock;
 	src->dev = ctx->ave->dev;
@@ -984,6 +994,8 @@ static bool ave_deliver(struct ave_ctx *ctx)
 			dst->flags |= V4L2_BUF_FLAG_LAST;
 			last = true;
 		}
+		ave_vb2_put(s->input_mem);
+		s->input_mem = NULL;
 		v4l2_m2m_buf_done(s->src, state);
 		s->src = NULL;
 		v4l2_m2m_buf_done(dst, state);

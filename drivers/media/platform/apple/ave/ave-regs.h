@@ -74,7 +74,7 @@
 #define AVE_CHAN_DESC_ADDR		0x4c
 #define AVE_RING_SLOT_BYTES		64
 
-/* Common command header */
+/* 9003 command header (also used by the frozen regression oracle). */
 #define AVE_CMD_OPCODE			0x00
 #define AVE_CMD_TOKEN			0x08
 #define AVE_CMD_CLIENT			0x10
@@ -97,19 +97,7 @@
 /* Halt is never answered; give the firmware this long before power-off. */
 #define AVE_HALT_SETTLE_MS		20
 
-enum ave_opcode {
-	AVE_OP_CONFIG = 1,
-	AVE_OP_HALT = 2,
-	AVE_OP_OPEN = 3,
-	AVE_OP_CLOSE = 4,
-	AVE_OP_START = 6,
-	AVE_OP_STOP = 7,
-	AVE_OP_PROCESS = 8,
-	AVE_OP_COMPLETE = 9,
-	AVE_OP_PRIORITY = 10,
-};
-
-/* Firmware-to-host messages */
+/* 9003 firmware-to-host messages */
 #define AVE_REPLY_ID			0x00
 #define AVE_REPLY_CLIENT		0x10
 #define AVE_REPLY_SUBTYPE		0x20

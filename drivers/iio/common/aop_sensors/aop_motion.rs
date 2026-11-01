@@ -46,6 +46,30 @@ const CALIBRATION: [(u32, &CStr); 3] = [
 /// at byte 6. The other bytes carry no sample.
 const REPORT_LEN: usize = 22;
 const XYZ_OFFSET: usize = 6;
+/// The status a calibration write is answered with when the service already
+/// holds a calibration from an earlier start in the same AOP boot, as after a
+/// rebind or a resume. The firmware keeps that calibration, so the reports can
+/// be started without it.
+const STATUS_UNSUPPORTED: u32 = 0xe000_02c7;
+
+/// What the status of a calibration write means for the start of the reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalStatus {
+    /// The firmware took the packet.
+    Taken,
+    /// The firmware holds a calibration from an earlier start.
+    Held,
+    /// Anything else: the reports are not started.
+    Refused,
+}
+
+fn cal_status(status: u32) -> CalStatus {
+    match status {
+        0 => CalStatus::Taken,
+        STATUS_UNSUPPORTED => CalStatus::Held,
+        _ => CalStatus::Refused,
+    }
+}
 
 /// What one of the two services measures.
 struct Kind {
@@ -146,30 +170,51 @@ impl Control {
         )?)
     }
 
-    fn set(&self, prop: u32, value: &[u8]) -> Result {
+    /// Writes a property and returns the firmware's status.
+    fn write(&self, prop: u32, value: &[u8]) -> Result<u32> {
         let mut msg = KVec::with_capacity(8 + value.len(), GFP_KERNEL)?;
         msg.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
         msg.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
         msg.extend_from_slice(value, GFP_KERNEL)?;
-        let status = self
-            .aop
-            .epic_call(&self.service, SUBTYPE_SET_PROPERTY, &msg)?;
-        if status != 0 {
-            dev_err!(
-                self.dev,
-                "property {} refused: status {:#x}\n",
-                prop,
-                status
-            );
-            return Err(EIO);
+        self.aop
+            .epic_call(&self.service, SUBTYPE_SET_PROPERTY, &msg)
+    }
+
+    fn refused(&self, prop: u32, status: u32) -> Error {
+        dev_err!(
+            self.dev,
+            "property {} refused: status {:#x}\n",
+            prop,
+            status
+        );
+        EIO
+    }
+
+    fn set(&self, prop: u32, value: &[u8]) -> Result {
+        match self.write(prop, value)? {
+            0 => Ok(()),
+            status => Err(self.refused(prop, status)),
         }
-        Ok(())
     }
 
     /// Sends the calibration, then the interval that starts the reports.
     fn start(&self) -> Result {
+        let mut held = 0;
         for ((prop, _), packet) in CALIBRATION.iter().zip(self.packets.iter()) {
-            self.set(*prop, packet)?;
+            let status = self.write(*prop, packet)?;
+            match cal_status(status) {
+                CalStatus::Taken => {}
+                CalStatus::Held => held += 1,
+                CalStatus::Refused => return Err(self.refused(*prop, status)),
+            }
+        }
+        if held > 0 {
+            dev_info!(
+                self.dev,
+                "{} of {} calibration packets kept from an earlier start\n",
+                held,
+                CALIBRATION.len()
+            );
         }
         self.set(PROP_INTERVAL, &INTERVAL_US.to_le_bytes())
     }
