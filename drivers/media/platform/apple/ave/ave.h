@@ -354,7 +354,8 @@ struct ave_ctx {
 
 	struct ave_session *sess;
 	bool mctf; /* an MCTF context, on the MCTF video device */
-	u32 mctf_level;
+	s32 mctf_level;
+	u32 mctf_strength;
 	atomic_t ready; /* outputs waiting for a CAPTURE buffer */
 	bool draining;
 	bool flush_pending;

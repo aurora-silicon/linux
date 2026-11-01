@@ -202,7 +202,7 @@ static bool t_listed(const u32 *list, unsigned int n, u32 off)
 static void t_build_start(struct kunit *test, struct t_mctf *t, u8 *cmd)
 {
 	KUNIT_ASSERT_EQ(test, ave_mctf_build_start(t->l, cmd, T_START_BYTES,
-						   t->sess->mctf_iova), 0);
+						   t->sess->mctf_iova, 16), 0);
 	ave_write_header(t->ctx, cmd, AVE_OP_START, AVE_OP_START,
 			 AVE_SESSION_ARG0, ave_session_setup_arg2(t->ctx));
 	ave_stamp_command(t->ave->layout->abi, cmd, 94400000, T_CREATED);
@@ -276,7 +276,8 @@ static void t_picture(u8 *exp, u32 off, u64 base)
 /* Process over frames 0..6, as macOS sent them, byte for byte. */
 static void ave_mctf_process_frames(struct kunit *test)
 {
-	static const u8 levels[] = { 16, 16, 16, 12, 12, 12, 9 };
+	/* macOS overrides the level per frame; -1 keeps the Start strength */
+	static const s32 levels[] = { 16, 16, 16, 12, -1, 12, 9 };
 	u8 *start = kunit_kzalloc(test, T_START_BYTES, GFP_KERNEL);
 	u8 *cmd = kunit_kzalloc(test, T_PROCESS_BYTES, GFP_KERNEL);
 	u8 *exp = kunit_kzalloc(test, T_PROCESS_BYTES, GFP_KERNEL);
@@ -327,7 +328,7 @@ static void ave_mctf_process_frames(struct kunit *test)
 		put_unaligned_le64(get_unaligned_le64(start + 0xf50 + 0x10 * slot),
 				   exp + 0xac90);
 		put_unaligned_le32(n, exp + 0xacf8);
-		put_unaligned_le32(levels[n], exp + 0xad68);
+		put_unaligned_le32((u32)levels[n], exp + 0xad68);
 		/* The input and output surfaces, every other word as captured */
 		t_picture(exp, 0xa300, in);
 		t_picture(exp, 0xad80, out);
@@ -362,21 +363,25 @@ static void ave_mctf_refusal(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, m4->qualified);
 	KUNIT_EXPECT_NULL(test, ave_mctf_qualified(AVE_FW_TEXT_CRC_T6040_25G83));
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_start(m4, cmd, T_START_BYTES,
-						   t.sess->mctf_iova), -EOPNOTSUPP);
+						   t.sess->mctf_iova, 16), -EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_process(m4, cmd, T_PROCESS_BYTES,
 						     t.sess->mctf_iova, &f),
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_start(NULL, cmd, T_START_BYTES,
-						   t.sess->mctf_iova), -EOPNOTSUPP);
+						   t.sess->mctf_iova, 16), -EOPNOTSUPP);
 
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_start(t.l, cmd, T_START_BYTES - 4,
-						   t.sess->mctf_iova), -EINVAL);
+						   t.sess->mctf_iova, 16), -EINVAL);
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_process(t.l, cmd, T_PROCESS_BYTES,
 						     t.sess->mctf_iova, &f), 0);
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_process(t.l, cmd, T_PROCESS_BYTES - 4,
 						     t.sess->mctf_iova, &f), -EINVAL);
 	bad = f;
 	bad.level = AVE_MCTF_LEVEL_MAX + 1;
+	KUNIT_EXPECT_EQ(test, ave_mctf_build_process(t.l, cmd, T_PROCESS_BYTES,
+						     t.sess->mctf_iova, &bad), -EINVAL);
+	bad = f;
+	bad.level = AVE_MCTF_LEVEL_MIN - 1;
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_process(t.l, cmd, T_PROCESS_BYTES,
 						     t.sess->mctf_iova, &bad), -EINVAL);
 	bad = f;
@@ -395,13 +400,32 @@ static void ave_mctf_refusal(struct kunit *test)
 	/* A missing surface address is refused, not sent as zero. */
 	t.sess->mctf_iova[0] = 0;
 	KUNIT_EXPECT_EQ(test, ave_mctf_build_start(t.l, cmd, T_START_BYTES,
-						   t.sess->mctf_iova), -EINVAL);
+						   t.sess->mctf_iova, 16), -EINVAL);
+}
+
+/* Start +0x26f8 carries the session strength (0..24); 16 is the capture. */
+static void ave_mctf_strength(struct kunit *test)
+{
+	u8 *cmd = kunit_kzalloc(test, T_START_BYTES, GFP_KERNEL);
+	struct t_mctf t;
+
+	KUNIT_ASSERT_NOT_NULL(test, cmd);
+	t_mctf_init(test, &t);
+	for (u32 s = 0; s <= AVE_MCTF_STRENGTH_MAX; s += 6) {
+		KUNIT_ASSERT_EQ(test, ave_mctf_build_start(t.l, cmd, T_START_BYTES,
+							   t.sess->mctf_iova, s), 0);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 0x26f8), s);
+	}
+	KUNIT_EXPECT_EQ(test, ave_mctf_build_start(t.l, cmd, T_START_BYTES,
+						   t.sess->mctf_iova,
+						   AVE_MCTF_STRENGTH_MAX + 1), -EINVAL);
 }
 
 static struct kunit_case ave_mctf_cases[] = {
 	KUNIT_CASE(ave_mctf_start_image),
 	KUNIT_CASE(ave_mctf_process_frames),
 	KUNIT_CASE(ave_mctf_refusal),
+	KUNIT_CASE(ave_mctf_strength),
 	{}
 };
 

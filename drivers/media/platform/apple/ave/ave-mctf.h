@@ -21,12 +21,21 @@
 #define AVE_MCTF_INPUTS		5
 
 /*
- * Filter level, written raw to every Process command. macOS uses 16 for the
- * first frames of a session, then 12 in room light and 9 in the dark.
+ * Per-frame filter level, written raw to Process +0xad68. -1 (0xffffffff)
+ * means "use the session strength"; the camera daemon on macOS overrides it
+ * with 16 for the first frames, then 12 in room light and 9 in the dark.
  */
 #define V4L2_CID_APPLE_AVE_MCTF_LEVEL	(V4L2_CID_USER_BASE + 0x1240)
+#define AVE_MCTF_LEVEL_MIN	-1
 #define AVE_MCTF_LEVEL_MAX	31
-#define AVE_MCTF_LEVEL_DEFAULT	16
+#define AVE_MCTF_LEVEL_DEFAULT	-1
+/*
+ * Session strength, Start +0x26f8: round(24 x strength) for strength 0..1.
+ * The camera daemon uses 16. Takes effect at the next STREAMON.
+ */
+#define V4L2_CID_APPLE_AVE_MCTF_STRENGTH	(V4L2_CID_USER_BASE + 0x1241)
+#define AVE_MCTF_STRENGTH_MAX	24
+#define AVE_MCTF_STRENGTH_DEFAULT	16
 
 /* One constant u32 word of a command image */
 struct ave_mctf_word {
@@ -80,6 +89,7 @@ struct ave_mctf_layout {
 	u32 width, height;	/* input geometry */
 	u32 first_frame, first_value, next_value;
 	u32 slot, frame, level;
+	u32 strength;	/* Start offset */
 	/* Start and Process images match captures of this build at 1080p. */
 	bool qualified;
 };
@@ -87,13 +97,14 @@ struct ave_mctf_layout {
 struct ave_mctf_frame {
 	dma_addr_t in, out;	/* input and output surfaces (base addresses) */
 	u32 stride, width, height;
-	u32 slot, frame, level;
+	u32 slot, frame;
+	s32 level;	/* AVE_MCTF_LEVEL_MIN..AVE_MCTF_LEVEL_MAX */
 };
 
 const struct ave_mctf_layout *ave_mctf_layout_for_crc(u32 text_crc);
 const struct ave_mctf_layout *ave_mctf_qualified(u32 text_crc);
 int ave_mctf_build_start(const struct ave_mctf_layout *l, u8 *cmd, size_t len,
-			 const dma_addr_t *surf);
+			 const dma_addr_t *surf, u32 strength);
 int ave_mctf_build_process(const struct ave_mctf_layout *l, u8 *cmd,
 			   size_t len, const dma_addr_t *surf,
 			   const struct ave_mctf_frame *f);

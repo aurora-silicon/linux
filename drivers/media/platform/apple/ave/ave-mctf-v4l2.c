@@ -5,7 +5,8 @@
  * One NV12 1920x1080 picture in on OUTPUT, the filtered picture out on
  * CAPTURE, with the OUTPUT timestamp. The firmware keeps the temporal
  * history itself; a session runs from STREAMON to STREAMOFF, so the next
- * STREAMON starts again with no history. The filter level control is
+ * STREAMON starts again with no history. The strength control applies at
+ * STREAMON; the per-frame level control (-1: the strength) is
  * written into every frame.
  *
  * Sessions share the encoder's firmware, session table, power and recovery
@@ -146,10 +147,16 @@ static int ave_mctf_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ave_ctx *ctx = container_of(ctrl->handler, struct ave_ctx, hdl);
 
-	if (ctrl->id != V4L2_CID_APPLE_AVE_MCTF_LEVEL)
+	switch (ctrl->id) {
+	case V4L2_CID_APPLE_AVE_MCTF_LEVEL:
+		WRITE_ONCE(ctx->mctf_level, ctrl->val);
+		return 0;
+	case V4L2_CID_APPLE_AVE_MCTF_STRENGTH:
+		WRITE_ONCE(ctx->mctf_strength, ctrl->val);
+		return 0;
+	default:
 		return -EINVAL;
-	WRITE_ONCE(ctx->mctf_level, ctrl->val);
-	return 0;
+	}
 }
 
 static const struct v4l2_ctrl_ops ave_mctf_ctrl_ops = {
@@ -161,18 +168,30 @@ static const struct v4l2_ctrl_config ave_mctf_level = {
 	.id = V4L2_CID_APPLE_AVE_MCTF_LEVEL,
 	.name = "MCTF Level",
 	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min = 0,
+	.min = AVE_MCTF_LEVEL_MIN,
 	.max = AVE_MCTF_LEVEL_MAX,
 	.step = 1,
 	.def = AVE_MCTF_LEVEL_DEFAULT,
+};
+
+static const struct v4l2_ctrl_config ave_mctf_strength = {
+	.ops = &ave_mctf_ctrl_ops,
+	.id = V4L2_CID_APPLE_AVE_MCTF_STRENGTH,
+	.name = "MCTF Strength",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.min = 0,
+	.max = AVE_MCTF_STRENGTH_MAX,
+	.step = 1,
+	.def = AVE_MCTF_STRENGTH_DEFAULT,
 };
 
 static int ave_mctf_init_ctrls(struct ave_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
 
-	v4l2_ctrl_handler_init(hdl, 1);
+	v4l2_ctrl_handler_init(hdl, 2);
 	v4l2_ctrl_new_custom(hdl, &ave_mctf_level, NULL);
+	v4l2_ctrl_new_custom(hdl, &ave_mctf_strength, NULL);
 	if (hdl->error) {
 		int ret = hdl->error;
 
@@ -425,6 +444,7 @@ static int ave_mctf_open(struct file *file)
 	ctx->ave = ave;
 	ctx->mctf = true;
 	ctx->mctf_level = AVE_MCTF_LEVEL_DEFAULT;
+	ctx->mctf_strength = AVE_MCTF_STRENGTH_DEFAULT;
 	spin_lock_init(&ctx->queue_lock);
 	INIT_WORK(&ctx->run_work, ave_mctf_run_work);
 	INIT_DELAYED_WORK(&ctx->poll_work, ave_mctf_poll_work);

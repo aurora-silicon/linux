@@ -170,6 +170,7 @@ static const struct ave_mctf_word ave_mctf_process_25g83[] = {
 		.first_frame = 0x5d90, .first_value = 5,		\
 		.next_value = 4,					\
 		.slot = 0xac84, .frame = 0xacf8, .level = 0xad68,	\
+		.strength = 0x26f8,					\
 		.qualified = (ok),					\
 	}
 
@@ -222,13 +223,14 @@ static int ave_mctf_surface_index(const struct ave_mctf_layout *l, u32 off)
  * writes the header.
  */
 int ave_mctf_build_start(const struct ave_mctf_layout *l, u8 *cmd, size_t len,
-			 const dma_addr_t *surf)
+			 const dma_addr_t *surf, u32 strength)
 {
 	int ret;
 
 	if (!l || !l->qualified)
 		return -EOPNOTSUPP;
-	if (len != l->start_bytes || l->n_surfaces > AVE_MCTF_BUFS)
+	if (len != l->start_bytes || l->n_surfaces > AVE_MCTF_BUFS ||
+	    strength > AVE_MCTF_STRENGTH_MAX)
 		return -EINVAL;
 	memset(cmd, 0, len);
 	ret = ave_mctf_words(cmd, len, l->start_words, l->n_start_words);
@@ -241,6 +243,7 @@ int ave_mctf_build_start(const struct ave_mctf_layout *l, u8 *cmd, size_t len,
 			return -EINVAL;
 		put_unaligned_le64(surf[at], cmd + l->surfaces[i].off);
 	}
+	put_unaligned_le32(strength, cmd + l->strength);
 	return 0;
 }
 
@@ -263,7 +266,8 @@ int ave_mctf_build_process(const struct ave_mctf_layout *l, u8 *cmd,
 	if (!l || !l->qualified)
 		return -EOPNOTSUPP;
 	if (len != l->process_bytes || f->slot >= l->slots ||
-	    f->level > AVE_MCTF_LEVEL_MAX || f->width != AVE_MCTF_WIDTH ||
+	    f->level < AVE_MCTF_LEVEL_MIN || f->level > AVE_MCTF_LEVEL_MAX ||
+	    f->width != AVE_MCTF_WIDTH ||
 	    f->height != AVE_MCTF_HEIGHT || f->stride < f->width ||
 	    f->stride % 64 || !f->in || !f->out)
 		return -EINVAL;
@@ -316,7 +320,8 @@ int ave_mctf_cmd_start(struct ave_ctx *ctx)
 	cmd = ave_ipc_cmd(ave, AVE_BUF_CMD, len);
 	if (!cmd)
 		return -EBUSY;
-	ret = ave_mctf_build_start(l, cmd, len, sess->mctf_iova);
+	ret = ave_mctf_build_start(l, cmd, len, sess->mctf_iova,
+				   READ_ONCE(ctx->mctf_strength));
 	if (ret)
 		return ret;
 	ave_write_header(ctx, cmd, AVE_OP_START, AVE_OP_START, AVE_SESSION_ARG0,
@@ -409,7 +414,7 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 	ret = ave_ipc_submit(ave, buf, l->process_bytes,
 			     ave->layout->process_timeout_us, false);
 	dev_dbg(ave->dev,
-		"MCTF Process frame %u slot %u token %llu level %u in %pad out %pad: %d\n",
+		"MCTF Process frame %u slot %u token %llu level %d in %pad out %pad: %d\n",
 		f.frame, slot, sess->token, f.level, &f.in, &f.out, ret);
 	if (ret)
 		return ret;
