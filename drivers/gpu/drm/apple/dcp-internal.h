@@ -276,6 +276,15 @@ struct dcp_desktop_state {
 	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
 	/* The frame's colour matrix, sent after an adaptive sync update. */
 	struct iomfb_set_matrix_req matrix;
+	/*
+	 * HDR10 static metadata (external processors): the pinned
+	 * dcpav-service-epic service, and the Type 1 body last sent on this
+	 * link (taken or refused), if any.  hdr_lock protects both.
+	 */
+	spinlock_t hdr_lock;
+	struct apple_epic_service *av_service;
+	u8 hdr_sent[24];
+	bool hdr_sent_valid;
 	u32 present_id;
 	bool present_pending;
 	/*

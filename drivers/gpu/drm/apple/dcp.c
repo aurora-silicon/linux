@@ -548,8 +548,8 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 }
 
 /*
- * A desktop 26.x external processor has no dcpav-service-epic to read the
- * sink's EDID through, but exports the TimingElements and DisplayAttributes
+ * A desktop 26.x external processor does not hand out the sink's EDID through
+ * its DCPAV service, but exports the TimingElements and DisplayAttributes
  * of every sink it drives, on HDMI and Type-C alike.
  */
 static bool dcp_sink_metadata(struct apple_dcp *dcp)
@@ -3309,6 +3309,55 @@ static const struct apple_epic_service_ops dcp_compact_aux_ops[] = {
 	{},
 };
 
+/* The DCPAV service of an external processor: HDR10 static metadata. */
+static void dcp_av_service_init(struct apple_epic_service *service,
+				const char *name, const char *class, s64 unit)
+{
+	struct dcp_desktop_state *d = service->ep->dcp->desktop;
+	struct apple_epic_service *old;
+
+	service = afk_service_get(service);
+	if (!service)
+		return;
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		old = d->av_service;
+		d->av_service = service;
+		d->hdr_sent_valid = false;
+	}
+	if (old)
+		afk_service_put(old);
+}
+
+static void dcp_av_service_teardown(struct apple_epic_service *service)
+{
+	struct dcp_desktop_state *d = service->ep->dcp->desktop;
+	bool owned;
+
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		owned = d->av_service == service;
+		if (owned) {
+			d->av_service = NULL;
+			d->hdr_sent_valid = false;
+		}
+	}
+	if (owned)
+		afk_service_put(service);
+}
+
+static const struct apple_epic_service_ops dcp_ext_av_service_ops[] = {
+	{
+		.name = "dcpav-service-epic",
+		.reusable = true,
+		.init = dcp_av_service_init,
+		.teardown = dcp_av_service_teardown,
+	},
+	{
+		.name = "*",
+		.init = dcp_compact_aux_init,
+	},
+	{},
+};
+
 static void dcp_dpavctrl_service_init(struct apple_epic_service *service,
 				      const char *name, const char *class,
 				      s64 unit)
@@ -3475,6 +3524,20 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 				       "REMOTEALLOC");
 	if (ret)
 		return ret;
+
+	/*
+	 * DCPAV service (dcpav-service-epic, HDR10 static metadata).  Without
+	 * it a PQ link still works, only without mastering data.
+	 */
+	if (map & BIT(DPAVSERV_ENDPOINT_V2 - 0x20)) {
+		ret = dcp_desktop_start_ep(dcp, DPAVSERV_ENDPOINT_V2,
+					   dcp_ext_av_service_ops);
+		if (ret)
+			dcp_desktop_graph_skip(dcp, DPAVSERV_ENDPOINT_V2,
+					       "DPAVSERV", "start failed", ret);
+		else
+			d->graph_started |= BIT(DPAVSERV_ENDPOINT_V2 - 0x20);
+	}
 
 	/* An idle Type-C pipeline has no PHY until a route is claimed. */
 	if (!dcp->phy && !dcp->nr_typec_routes) {
@@ -3772,6 +3835,8 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6_DESKTOP:
 		iomfb_poweroff_v26_6_desktop(dcp);
+		/* The link set up again starts without HDR10 metadata. */
+		dcp_hdr_metadata_forget(dcp);
 		break;
 	case DCP_FIRMWARE_V_26_6:
 		iomfb_v26_6_poweroff(dcp);
@@ -5571,6 +5636,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)
 			return -ENOMEM;
+		spin_lock_init(&dcp->desktop->hdr_lock);
 		/*
 		 * The opaque client identity of the IOMFB calls.  The firmware's
 		 * own client passes a kernel pointer there; pass a random value

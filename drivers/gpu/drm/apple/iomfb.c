@@ -34,6 +34,7 @@
 #include <drm/drm_vblank.h>
 
 #include "dcp.h"
+#include "dcp-hdr-metadata.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
@@ -2355,6 +2356,102 @@ u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	return hdr->hdmi_metadata_type1.eotf;
 }
 
+/*
+ * HDR10 static metadata is link state on the external processors: a link
+ * set up again (mode set, power off) starts without it.
+ */
+void dcp_hdr_metadata_forget(struct apple_dcp *dcp)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+
+	if (!d)
+		return;
+	scoped_guard(spinlock_irqsave, &d->hdr_lock)
+		d->hdr_sent_valid = false;
+}
+
+/* Whether @pdev takes a change of HDR_OUTPUT_METADATA without a mode set. */
+bool dcp_hdr_metadata_live(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       !dcp_has_panel(dcp);
+}
+
+/*
+ * Send the connector's HDR10 static metadata to the DCPAV service once the
+ * link carries PQ: after the mode set that selected a PQ colour mode, and
+ * whenever the metadata changes on it.  Never per frame, and never on an
+ * SDR link (the firmware would build a DRM InfoFrame with the SDR EOTF).
+ * Going back to SDR is a mode set, and the link set up again carries no
+ * InfoFrame.
+ */
+static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				  struct drm_atomic_commit *commit)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	const struct drm_connector_state *conn_state = NULL;
+	struct drm_connector_state *state;
+	struct drm_connector *connector;
+	struct apple_epic_service *service;
+	u8 data[DCP_HDR_DATA_SIZE], msg[DCP_HDR_MSG_SIZE];
+	u8 reply[DCP_HDR_MSG_SIZE] = {};
+	size_t received = 0;
+	u32 retcode = 0;
+	bool same;
+	int i, ret;
+
+	if (!d || !dcp->output_pq || READ_ONCE(dcp->crashed) ||
+	    !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
+		return;
+	for_each_new_connector_in_state(commit, connector, state, i)
+		if (state->crtc == crtc)
+			conn_state = state;
+	if (!conn_state && dcp->connector && dcp->connector->base.state &&
+	    dcp->connector->base.state->crtc == crtc)
+		conn_state = dcp->connector->base.state;
+	if (!conn_state || !conn_state->hdr_output_metadata ||
+	    conn_state->hdr_output_metadata->length != sizeof(struct hdr_output_metadata))
+		return;
+	if (((const struct hdr_output_metadata *)conn_state->hdr_output_metadata->data)
+		    ->hdmi_metadata_type1.eotf != HDMI_EOTF_SMPTE_ST2084 ||
+	    dcp_hdr_data(data, conn_state->hdr_output_metadata->data))
+		return;
+
+	/* Most frames change nothing: compare before pinning the service. */
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		same = d->hdr_sent_valid && !memcmp(d->hdr_sent, data, sizeof(data));
+		service = same ? NULL : afk_service_get(d->av_service);
+	}
+	if (!service)
+		return;
+
+	dcp_hdr_message(msg, data);
+	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
+					      msg, sizeof(msg), reply, sizeof(reply),
+					      &retcode, &received);
+	ret = dcp_hdr_reply(ret, retcode, reply, received);
+	/*
+	 * A block the firmware refused is not sent again on every frame (the
+	 * command is synchronous): only a new block, a new mode set or a new
+	 * service instance retries.
+	 */
+	if (ret)
+		dev_warn_ratelimited(dcp->dev, "HDR static metadata not taken: %d\n", ret);
+	else
+		dev_dbg(dcp->dev, "HDR static metadata: MaxCLL %u MaxFALL %u mastering %u/%u\n",
+			get_unaligned_le16(data + 20), get_unaligned_le16(data + 22),
+			get_unaligned_le16(data + 16), get_unaligned_le16(data + 18));
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		if (d->av_service == service) {
+			memcpy(d->hdr_sent, data, sizeof(data));
+			d->hdr_sent_valid = true;
+		}
+	}
+	afk_service_put(service);
+}
+
 /* Only an SDR or a PQ signal, and PQ only where the timing has an element. */
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *commit)
@@ -2518,6 +2615,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
 	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp);
 	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
+	dcp_hdr_metadata_forget(dcp);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -3064,6 +3162,11 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		iomfb_v14_7_flush(dcp, crtc, commit);
 		return;
 	}
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected))
+		dcp_hdr_metadata_sync(dcp, crtc, commit);
 
 	if (iomfb_uses_queue(dcp)) {
 		iomfb_queue_atomic(dcp, crtc, commit);
