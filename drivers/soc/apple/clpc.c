@@ -78,6 +78,9 @@ enum apple_clpc_rail {
  *	@pmp_agent, limits the DCS, see apple_clpc_gpu_limited()
  * @gpu_dense: submissions per sampling period that make light GPU work
  *	dense, see apple_clpc_gpu_dense(); 0 for none
+ * @gpu_input: the GPU driver reports its work in flight through
+ *	apple_clpc_gpu_get(); while there is some, both rails go to the top
+ *	of @map
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -89,6 +92,7 @@ struct apple_clpc_hw {
 	bool pmp_backoff;
 	unsigned int pmp_agent;
 	unsigned int gpu_dense;
+	bool gpu_input;
 };
 
 struct apple_clpc_cluster {
@@ -226,7 +230,8 @@ int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
 	if (!np)
 		return of_find_property(dev->of_node, "apple,clpc", NULL) ? -EINVAL : 0;
 	if (!of_device_is_compatible(np, "apple,t6041-clpc") &&
-	    !of_device_is_compatible(np, "apple,t8140-clpc")) {
+	    !of_device_is_compatible(np, "apple,t8140-clpc") &&
+	    !of_device_is_compatible(np, "apple,t8142-clpc")) {
 		of_node_put(np);
 		return -EINVAL;
 	}
@@ -723,11 +728,11 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->pmc = dev->parent;
 	clpc->hw = of_device_get_match_data(dev);
 	/* T6040 firmware keeps GFX powered for its whole lifetime. A separate
-	 * host publication/idle input, not that supplier state, drives demand.
+	 * host publication/idle input, not that supplier state, drives demand;
+	 * the M5 (T8142) GPU driver reports through the same input.
 	 * On T8140 the same input counts submissions for dense light work.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6041-clpc") ||
-	    clpc->hw->gpu_dense) {
+	if (clpc->hw->gpu_input || clpc->hw->gpu_dense) {
 		clpc->gpu = kzalloc_obj(*clpc->gpu);
 		if (!clpc->gpu)
 			return -ENOMEM;
@@ -920,6 +925,26 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	},
 	.sustain = 3,
 	.gpu_demand = false,
+	.gpu_input = true,
+};
+
+/*
+ * T8142: DCS states 0-7 on rail 0, fabric states 0-4 on rail 1. The fabric
+ * state bounds CPU memory bandwidth: four P cores copy at ~40 GB/s with the
+ * fabric at 1 and at ~110 GB/s at 4 (macOS ~124).
+ *
+ * The M5 GPU driver reports its submissions in flight. Once the PMP runs, its
+ * vote (agent 0) drops from iBoot's DCS 7 / fabric 1 to 0 and nothing else
+ * raises the floor for the GPU: a 4K RGBA16F fill then takes 5.1 ms instead
+ * of 0.9 ms with both rails at the top of the map.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t8142 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 2, 4, 6, 7 },
+		[APPLE_CLPC_SOC] = { 1, 2, 3, 4 },
+	},
+	.gpu_input = true,
 };
 
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
@@ -1049,6 +1074,7 @@ kunit_test_suite(apple_clpc_suite);
 static const struct of_device_id apple_clpc_of_match[] = {
 	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
+	{ .compatible = "apple,t8142-clpc", .data = &apple_clpc_hw_t8142 },
 	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
 	{}
 };
