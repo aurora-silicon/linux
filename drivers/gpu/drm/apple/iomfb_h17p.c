@@ -168,30 +168,37 @@ static u64 iomfb_nits_binary64_h17p(u32 nits)
 	return value;
 }
 
-void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
-				 u32 maximum, bool update)
+/* @swap is the swap record of a present; H17G sends it unserialized. */
+void iomfb_encode_backlight_swap_h17p(u8 *swap, u32 nits, u32 maximum,
+				      bool update)
 {
 	u64 ceiling = iomfb_nits_binary64_h17p(maximum);
 	u64 unity = iomfb_nits_binary64_h17p(1);
 
 	/* This profile does not use the older DAC/power words. */
-	memset(wire->swap + 0x32f, 0, 0xd);
-	memset(wire->swap + 0x354, 0, 0x9a);
+	memset(swap + 0x32f, 0, 0xd);
+	memset(swap + 0x354, 0, 0x9a);
 	/* The ceiling pair must remain valid even on a brightness-idle frame. */
-	put_unaligned_le64(ceiling, wire->swap + 0x36e);
-	put_unaligned_le64(ceiling, wire->swap + 0x376);
+	put_unaligned_le64(ceiling, swap + 0x36e);
+	put_unaligned_le64(ceiling, swap + 0x376);
 	if (!update)
 		return;
 
 	/* Linux brightness changes and soft DPMS use the same activation bytes. */
-	put_unaligned_le32(1, wire->swap + 0x354);
-	wire->swap[0x358] = 1;
-	wire->swap[0x359] = 1;
-	wire->swap[0x35a] = 1;
-	put_unaligned_le16(1, wire->swap + 0x35c);
-	put_unaligned_le64(iomfb_nits_binary64_h17p(nits), wire->swap + 0x35e);
-	put_unaligned_le64(unity, wire->swap + 0x37e);
-	put_unaligned_le64(unity, wire->swap + 0x3e6);
+	put_unaligned_le32(1, swap + 0x354);
+	swap[0x358] = 1;
+	swap[0x359] = 1;
+	swap[0x35a] = 1;
+	put_unaligned_le16(1, swap + 0x35c);
+	put_unaligned_le64(iomfb_nits_binary64_h17p(nits), swap + 0x35e);
+	put_unaligned_le64(unity, swap + 0x37e);
+	put_unaligned_le64(unity, swap + 0x3e6);
+}
+
+void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
+				 u32 maximum, bool update)
+{
+	iomfb_encode_backlight_swap_h17p(wire->swap, nits, maximum, update);
 }
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
@@ -308,9 +315,12 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 static bool trampoline_analytics_h17p(struct apple_dcp *dcp, int tag,
 				      void *out, void *in)
 {
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
-		return trampoline_zero(dcp, tag, out, in);
-
+	/*
+	 * H17G (M5) needs the same empty dictionary. A zeroed reply fails the
+	 * firmware's OSDictionary deserialization ("OSDictionary
+	 * deserialization failed" in the DCP crash log) and the DCP panics
+	 * with "app NMI" one hour after boot.
+	 */
 	trace_iomfb_callback(dcp, tag, __func__);
 	/* The dispatcher has validated the D114 reply size. */
 	memset(out, 0, 0x1004);
