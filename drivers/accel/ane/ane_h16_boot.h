@@ -25,13 +25,6 @@ enum ane_h16_window {
 	ANE_H16_WINDOWS,
 };
 
-enum ane_h16_dapf_owner {
-	/* The loader programs the bank from the ADT; the kernel only verifies. */
-	ANE_H16_DAPF_LOADER,
-	/* The kernel rewrites records that differ, unless the bank is locked. */
-	ANE_H16_DAPF_KERNEL,
-};
-
 /*
  * Every DART and DAPF register offset the stages read or write, for one DART
  * revision: PARAMS3 bits 15:0 of the instance that owns the DAPF bank. The
@@ -50,7 +43,10 @@ struct ane_h16_mmio {
 	u32 dapf_stride;
 	/* Record end bits that read back; the bounds are inclusive. */
 	u64 dapf_end_mask;
-	enum ane_h16_dapf_owner dapf_owner;
+	/* Record words other than the bounds, as the ADT dapf-instance gives them. */
+	u8 dapf_r0;
+	u32 dapf_r4;
+	u16 dapf_r20;
 };
 
 struct ane_h16_tunable {
@@ -287,7 +283,11 @@ static inline int ane_h16_preflight(struct ane_h16_boot *b)
 	return 0;
 }
 
-/* One record of the DAPF bank, read only. Record words as the ADT dapf-instance. */
+/*
+ * One record of the DAPF bank, read only. Record words as the ADT
+ * dapf-instance: r0 (+0x00, only its low byte reads back), r4, the inclusive
+ * start and end, r20 (+0x20, its low half is the enable).
+ */
 static inline bool ane_h16_dapf_record(struct ane_h16_boot *b, unsigned int record)
 {
 	const struct ane_h16_mmio *m = b->mmio;
@@ -301,15 +301,17 @@ static inline bool ane_h16_dapf_record(struct ane_h16_boot *b, unsigned int reco
 	b->ops->log(b->ctx, "DAPF record/r4", record, r4);
 	b->ops->log(b->ctx, "DAPF flags/enable", flags, enabled);
 	b->ops->log(b->ctx, "DAPF start/end", start, end);
-	return (flags & 0x333) == 0x31 && (enabled & 0xffff) == 1 &&
-	       start == b->ranges[record][0] &&
+	return (flags & 0xff) == m->dapf_r0 && r4 == m->dapf_r4 &&
+	       (enabled & 0xffff) == m->dapf_r20 && start == b->ranges[record][0] &&
 	       (end & m->dapf_end_mask) == (b->ranges[record][1] & m->dapf_end_mask);
 }
 
 /*
  * Compare the four records with apple,dapf-ranges. Preflight only reports.
- * Map refuses a difference when the loader owns the bank or it is locked,
- * and otherwise rewrites the differing records and reads them back.
+ * The bank loses its records whenever its power domain does, so map writes
+ * every record that differs, in the order the t8110 bank takes them, and
+ * reads it back. A bank whose lock word has bit 2 set and that differs is
+ * refused before any write.
  */
 static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
 {
@@ -325,26 +327,25 @@ static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
 		match[record] = ane_h16_dapf_record(b, record);
 		matched += match[record];
 	}
-	b->ops->log(b->ctx, "DAPF records matching/owner", matched, m->dapf_owner);
+	b->ops->log(b->ctx, "DAPF records matching", matched, 4);
 	if (!program || matched == 4)
 		return 0;
-	if (m->dapf_owner == ANE_H16_DAPF_LOADER || (lock & BIT(2)))
+	if (lock & BIT(2))
 		return -EPERM;
 	for (record = 0; record < 4; record++) {
 		u32 off = m->dapf_records + record * m->dapf_stride;
-		u32 value;
 
 		if (match[record])
 			continue;
+		b->ops->write32(b->ctx, ANE_H16_DAPF, off + 4, m->dapf_r4);
 		b->ops->write64(b->ctx, ANE_H16_DAPF, off + 8, b->ranges[record][0]);
 		b->ops->write64(b->ctx, ANE_H16_DAPF, off + 0x10, b->ranges[record][1]);
-		value = b->ops->read32(b->ctx, ANE_H16_DAPF, off);
-		b->ops->write32(b->ctx, ANE_H16_DAPF, off, (value & ~0x333) | 0x31);
-		value = b->ops->read32(b->ctx, ANE_H16_DAPF, off + 0x20);
-		b->ops->write32(b->ctx, ANE_H16_DAPF, off + 0x20, (value & ~0xffff) | 1);
+		b->ops->write32(b->ctx, ANE_H16_DAPF, off, m->dapf_r0);
+		b->ops->write32(b->ctx, ANE_H16_DAPF, off + 0x20, m->dapf_r20);
 		if (!ane_h16_dapf_record(b, record))
 			return -EIO;
 	}
+	b->ops->log(b->ctx, "DAPF records written/read back", 4 - matched, 4);
 	return 0;
 }
 

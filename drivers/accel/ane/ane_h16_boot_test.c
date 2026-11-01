@@ -14,6 +14,8 @@ struct ane_h16_sim {
 	u32 dapf[SZ_16K / 4];
 	u32 dart_params;
 	u32 dapf_reads;
+	u32 dapf_order[8];
+	int dapf_stuck;
 	u64 now;
 	u64 ce_ack;
 	u32 cpu;
@@ -152,8 +154,16 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 
 	if (w == ANE_H16_DAPF) {
 		sim_check_dapf(s, off, 4);
-		s->dapf[off / 4] = value;
+		if (s->dapf_writes < ARRAY_SIZE(s->dapf_order))
+			s->dapf_order[s->dapf_writes] = off;
 		s->dapf_writes++;
+		/* Like the hardware, r0 keeps only its low byte. */
+		if (off % s->mmio.dapf_stride == 0)
+			value &= 0xff;
+		if (off % s->mmio.dapf_stride == 0x20 &&
+		    (int)(off / s->mmio.dapf_stride) == s->dapf_stuck)
+			return;
+		s->dapf[off / 4] = value;
 		return;
 	}
 	KUNIT_EXPECT_TRUE(s->test, w == ANE_H16_ENGINE || w == ANE_H16_XL);
@@ -255,6 +265,8 @@ static void sim_write64(void *ctx, enum ane_h16_window w, u32 off, u64 value)
 			value &= s->mmio.dapf_end_mask;
 		s->dapf[off / 4] = lower_32_bits(value);
 		s->dapf[off / 4 + 1] = upper_32_bits(value);
+		if (s->dapf_writes < ARRAY_SIZE(s->dapf_order))
+			s->dapf_order[s->dapf_writes] = off;
 		s->dapf_writes++;
 		return;
 	}
@@ -429,7 +441,7 @@ static const struct ane_fw_transport_ops sim_transport_ops = {
 	.refused = sim_refused,
 };
 
-/* The bank as the loader leaves it, ends without their low two bits. */
+/* A programmed bank, ends without their low two bits. */
 static void sim_program_dapf(struct ane_h16_sim *s)
 {
 	unsigned int i;
@@ -438,7 +450,8 @@ static void sim_program_dapf(struct ane_h16_sim *s)
 		u32 *p = &s->dapf[(s->mmio.dapf_records + i * s->mmio.dapf_stride) / 4];
 		u64 end = s->boot.ranges[i][1] & s->mmio.dapf_end_mask;
 
-		p[0] = 0x80000031;
+		p[0] = 0x31;
+		p[1] = 0;
 		p[2] = lower_32_bits(s->boot.ranges[i][0]);
 		p[3] = upper_32_bits(s->boot.ranges[i][0]);
 		p[4] = lower_32_bits(end);
@@ -481,7 +494,10 @@ static int sim_init(struct kunit *test)
 		s->boot.ranges[i][0] = 0x500000000ULL + i * SZ_16K;
 		s->boot.ranges[i][1] = s->boot.ranges[i][0] + 3;
 	}
-	sim_program_dapf(s);
+	/* The J616s bank after iBoot: power-on values, flags 0. */
+	for (i = 0; i < ARRAY_SIZE(s->dapf); i++)
+		s->dapf[i] = i % 16 ? 0x5a5a0000 | i : 0;
+	s->dapf_stuck = -1;
 	s->channel_request = 8;
 	s->ipc_request = 0xc440;
 	s->heap_request = 0xf00000;
@@ -581,8 +597,6 @@ static void ane_h16_locked_dapf_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
 
-	memset(s->dapf, 0, sizeof(s->dapf));
-	s->mmio.dapf_owner = ANE_H16_DAPF_KERNEL;
 	s->lock = BIT(2);
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EPERM);
 	KUNIT_EXPECT_FALSE(test, s->boot.ran);
@@ -752,38 +766,58 @@ static void ane_h16_locked_matching_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
 
-	s->mmio.dapf_owner = ANE_H16_DAPF_KERNEL;
+	sim_program_dapf(s);
 	s->lock = BIT(2);
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
 	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
 }
 
-/* The J616s table: the loader owns the bank and the kernel never writes it. */
-static void ane_h16_loader_dapf_test(struct kunit *test)
+/* Preflight only reads the unprogrammed bank; map writes it in t8110 order. */
+static void ane_h16_dapf_program_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
-
-	memset(s->dapf, 0, sizeof(s->dapf));
-	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), 0);
-	KUNIT_EXPECT_GT(test, s->dapf_reads, 0U);
-	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EPERM);
-	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
-	KUNIT_EXPECT_FALSE(test, s->boot.ran);
-	KUNIT_EXPECT_EQ(test, s->pins, 0U);
-}
-
-/* A kernel-owned unlocked bank is written in place and read back. */
-static void ane_h16_kernel_dapf_test(struct kunit *test)
-{
-	struct ane_h16_sim *s = test->priv;
+	static const u32 order[] = { 4, 8, 0x10, 0, 0x20 };
 	unsigned int i;
 
-	memset(s->dapf, 0, sizeof(s->dapf));
-	s->mmio.dapf_owner = ANE_H16_DAPF_KERNEL;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
 	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
-	KUNIT_EXPECT_EQ(test, s->dapf_writes, 16U);
-	for (i = 0; i < 4; i++)
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 20U);
+	for (i = 0; i < ARRAY_SIZE(order); i++)
+		KUNIT_EXPECT_EQ(test, s->dapf_order[i], order[i]);
+	for (i = 0; i < 4; i++) {
+		u32 *p = &s->dapf[(s->mmio.dapf_records + i * s->mmio.dapf_stride) / 4];
+
 		KUNIT_EXPECT_TRUE(test, ane_h16_dapf_record(&s->boot, i));
+		KUNIT_EXPECT_EQ(test, p[0], 0x31U);
+		KUNIT_EXPECT_EQ(test, p[1], 0U);
+		KUNIT_EXPECT_EQ(test, p[8], 1U);
+	}
+	KUNIT_EXPECT_FALSE(test, s->boot.ran);
+}
+
+/* Only records that differ are written. */
+static void ane_h16_dapf_partial_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	sim_program_dapf(s);
+	s->dapf[(s->mmio.dapf_records + 2 * s->mmio.dapf_stride + 8) / 4] ^= 0x4000;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 5U);
+	KUNIT_EXPECT_EQ(test, s->dapf_order[1], s->mmio.dapf_records + 2 * s->mmio.dapf_stride + 8);
+}
+
+/* A record that does not read back fails map before RUN. */
+static void ane_h16_dapf_readback_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->dapf_stuck = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EIO);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 10U);
+	KUNIT_EXPECT_FALSE(test, s->boot.ran);
+	KUNIT_EXPECT_EQ(test, s->pins, 0U);
 }
 
 /* A DART revision without a table stops after the PARAMS3 reads. */
@@ -842,8 +876,9 @@ static void ane_h16_foreign_free_test(struct kunit *test)
 static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_happy_test),
 	KUNIT_CASE(ane_h16_locked_matching_test),
-	KUNIT_CASE(ane_h16_loader_dapf_test),
-	KUNIT_CASE(ane_h16_kernel_dapf_test),
+	KUNIT_CASE(ane_h16_dapf_program_test),
+	KUNIT_CASE(ane_h16_dapf_partial_test),
+	KUNIT_CASE(ane_h16_dapf_readback_test),
 	KUNIT_CASE(ane_h16_unknown_revision_test),
 	KUNIT_CASE(ane_h16_heap_overlap_test),
 	KUNIT_CASE(ane_h16_native_free_test),

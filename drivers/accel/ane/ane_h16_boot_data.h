@@ -132,9 +132,11 @@ static const struct ane_h16_tunables ane_h16_tunables_26a428[] = {
  * T6041 (J616s) ANE DARTs, revision 2.2 (PARAMS3 0x2a2a0202). The ADT
  * dart-ane0 node has one DAPF bank, the reg entry its instance property tags
  * FPAD "DAPFLLT" at DART0 + 0x10000; BRD and BWR have none, and their
- * +0x10000 is outside every ADT reg entry. The loader programs the bank from
- * dapf-instance-0, so the kernel only reads it. A t8110 DAPF record end does
- * not read back its low two bits on the T8132; every J616s end has them set.
+ * +0x10000 is outside every ADT reg entry. iBoot leaves the bank unprogrammed
+ * and it sits in the ANE_SYS domain, so the kernel writes it after power-up.
+ * Every dapf-instance-0 record has r0 0x31, r4 0 and r20 1. A t8110 DAPF
+ * record end does not read back its low two bits on the T8132; every J616s
+ * end has them set.
  */
 static const struct ane_h16_mmio ane_h16_mmio_t6041[] = {
 	{
@@ -147,7 +149,9 @@ static const struct ane_h16_mmio ane_h16_mmio_t6041[] = {
 		.dapf_records = 0,
 		.dapf_stride = 0x40,
 		.dapf_end_mask = ~3ULL,
-		.dapf_owner = ANE_H16_DAPF_LOADER,
+		.dapf_r0 = 0x31,
+		.dapf_r4 = 0,
+		.dapf_r20 = 1,
 	},
 };
 
