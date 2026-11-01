@@ -235,11 +235,79 @@ static const struct ane_h16_preload_rule ane_h16_preload_26a428 = {
 	},
 };
 
+/*
+ * 26.6.2 (25G83) preload, the build the J616s Linux volume boots with: the
+ * same patchbay records and rewritten range as 26A428, 0x3f80 bytes later
+ * in DATA. Its boot values are the 26A428 ones (25G83 facts, section 2).
+ */
+static const struct ane_h16_preload_cell ane_h16_patchbay_25g83[] = {
+	{ "BECA", 0x99a0, 8, true },
+	{ "SECA", 0x99b0, 8, false },
+	{ "GKTS", 0x99c0, 8, true },
+	{ "otcd", 0x99d0, 8, false },
+	{ "oscd", 0x99e0, 8, false },
+	{ "oecd", 0x99f0, 8, false },
+	{ "DILS", 0x9a00, 8, true },
+	{ "SRSA", 0x9a10, 8, false },
+	{ "GFCM", 0x9a20, 8, false },
+	{ "SSSC", 0x9a30, 8, true },
+	{ "qF8v", 0x9a40, 4, true },
+	{ "LRSD", 0x9a4c, 1, false },
+	{ "SVSD", 0x9a55, 8, false },
+	{ "LCSD", 0x9a65, 8, false },
+	{ "ZSTR", 0x9a75, 4, false },
+	{ "BPTP", 0x9a81, 8, false },
+	{ "TNGI", 0x9a91, 1, false },
+	{ "oeNS", 0x9a9a, 1, false },
+	{ "SEBC", 0x9aa3, 8, false },
+	{ "ECAP", 0x9ab3, 8, true },
+	{ "BVTP", 0x9ac3, 8, true },
+	{ "sP1T", 0x9ad3, 8, true },
+	{ "BtpG", 0x9ae3, 8, true },
+	{ "StpG", 0x9af3, 8, false },
+	{ "BlpP", 0x9b03, 8, true },
+	{ "SPTP", 0x9b13, 8, false },
+	{ "SZSD", 0x9b23, 8, false },
+	{ "LZSD", 0x9b33, 8, false },
+	{ "S2xG", 0x9b43, 8, true },
+	{ "SNUT", 0x9b53, 8, true },
+	{ "ZNUT", 0x9b63, 4, false },
+	{ "OTTR", 0x9b6f, 8, true },
+	{ "LLTR", 0x9b7f, 1, false },
+	{ "_COS", 0x9b88, 4, true },
+	{ "RCOS", 0x9b94, 4, true },
+	{ "dApC", 0x9ba0, 8, true },
+	{ "dArW", 0x9bb0, 8, true },
+	{ "fVED", 0x9bc0, 1, true },
+	{ "GLFp", 0x9bc9, 8, true },
+	{ "ABOI", 0x9bd9, 8, false },
+	{ "ZSOI", 0x9be9, 4, false },
+	{ "ARcM", 0x9bf5, 4, true },
+};
+
+static const struct ane_h16_preload_rule ane_h16_preload_25g83 = {
+	.cells = ane_h16_patchbay_25g83,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_25g83),
+	.zero_start = 0x1bc00,
+	.zero_end = 0x1c2a0,
+	.digest = {
+		0x83, 0x4b, 0xf6, 0xa8, 0xf1, 0xa7, 0x5c, 0x02,
+		0xf8, 0x95, 0x2d, 0xd7, 0xd4, 0x1b, 0xce, 0xe6,
+		0x6d, 0x46, 0x80, 0x7e, 0xec, 0x7e, 0xa6, 0xa6,
+		0x2e, 0x44, 0x8e, 0xfe, 0x18, 0x1d, 0x8b, 0xe8,
+	},
+};
+
 /* Every supported H16 firmware build, matched against the live preload. */
 static const struct ane_h16_profile ane_h16_profiles[] = {
 	{
 		.identity = "H16 27.0 26A428",
 		.preload = &ane_h16_preload_26a428,
+		.build = &ane_h16_build_26a428,
+	},
+	{
+		.identity = "H16 26.6.2 25G83",
+		.preload = &ane_h16_preload_25g83,
 		.build = &ane_h16_build_26a428,
 	},
 };
