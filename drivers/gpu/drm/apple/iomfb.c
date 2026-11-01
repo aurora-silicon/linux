@@ -2402,7 +2402,8 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	bool same;
 	int i, ret;
 
-	if (!d || !dcp->output_pq || !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
+	if (!d || !dcp->output_pq || READ_ONCE(dcp->crashed) ||
+	    !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
 		return;
 	for_each_new_connector_in_state(commit, connector, state, i)
 		if (state->crtc == crtc)
@@ -2431,20 +2432,23 @@ static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
 					      msg, sizeof(msg), reply, sizeof(reply),
 					      &retcode, &received);
 	ret = dcp_hdr_reply(ret, retcode, reply, received);
-	if (ret) {
+	/*
+	 * A block the firmware refused is not sent again on every frame (the
+	 * command is synchronous): only a new block, a new mode set or a new
+	 * service instance retries.
+	 */
+	if (ret)
 		dev_warn_ratelimited(dcp->dev, "HDR static metadata not taken: %d\n", ret);
-		goto out;
-	}
-	dev_dbg(dcp->dev, "HDR static metadata: MaxCLL %u MaxFALL %u mastering %u/%u\n",
-		get_unaligned_le16(data + 20), get_unaligned_le16(data + 22),
-		get_unaligned_le16(data + 16), get_unaligned_le16(data + 18));
+	else
+		dev_dbg(dcp->dev, "HDR static metadata: MaxCLL %u MaxFALL %u mastering %u/%u\n",
+			get_unaligned_le16(data + 20), get_unaligned_le16(data + 22),
+			get_unaligned_le16(data + 16), get_unaligned_le16(data + 18));
 	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
 		if (d->av_service == service) {
 			memcpy(d->hdr_sent, data, sizeof(data));
 			d->hdr_sent_valid = true;
 		}
 	}
-out:
 	afk_service_put(service);
 }
 

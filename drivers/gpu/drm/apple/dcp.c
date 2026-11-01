@@ -548,8 +548,8 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 }
 
 /*
- * A desktop 26.x external processor has no dcpav-service-epic to read the
- * sink's EDID through, but exports the TimingElements and DisplayAttributes
+ * A desktop 26.x external processor does not hand out the sink's EDID through
+ * its DCPAV service, but exports the TimingElements and DisplayAttributes
  * of every sink it drives, on HDMI and Type-C alike.
  */
 static bool dcp_sink_metadata(struct apple_dcp *dcp)

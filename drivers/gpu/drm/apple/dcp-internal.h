@@ -278,8 +278,8 @@ struct dcp_desktop_state {
 	struct iomfb_set_matrix_req matrix;
 	/*
 	 * HDR10 static metadata (external processors): the pinned
-	 * dcpav-service-epic service, and the Type 1 body the link carries,
-	 * if any.  hdr_lock protects both.
+	 * dcpav-service-epic service, and the Type 1 body last sent on this
+	 * link (taken or refused), if any.  hdr_lock protects both.
 	 */
 	spinlock_t hdr_lock;
 	struct apple_epic_service *av_service;
