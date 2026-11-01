@@ -235,9 +235,32 @@ int avd_submit_job(struct avd_ctx *ctx)
  * frame), so: stop the interrupt handler and the CM3 first, block the
  * decoder's DMA at its DART so a transfer still in flight faults instead
  * of reaching memory that may already be reused, give such transfers time
- * to drain, and only then assert the pmgr reset. Recover sparingly, and
- * retire the decoder after a failed or a third recovery within a minute.
+ * to drain, and only then assert the pmgr reset. Recover sparingly: a
+ * third recovery within a minute parks the decoder (DMA blocked) until the
+ * minute is over, and only a failed reset retires it.
  */
+/*
+ * Parking (resting or retired): stop the CM3 and leave the decoder's DMA
+ * blocked at its DART, so an engine that is still running (the frame timed
+ * out, after all) can only fault, never write memory whose buffers are about
+ * to go back to userspace.
+ */
+static void avd_park(struct avd_dev *avd)
+{
+	if (pm_runtime_resume_and_get(avd->dev) < 0)
+		return;
+	disable_irq(avd->irq);
+	avd->irq_parked = true;
+	avd_shutdown(avd);
+	if (avd->empty_domain && !avd->dma_parked) {
+		if (iommu_attach_device(avd->empty_domain, avd->dev))
+			dev_err(avd->dev, "retire: could not block DMA\n");
+		else
+			avd->dma_parked = true;
+	}
+	pm_runtime_put_autosuspend(avd->dev);
+}
+
 static int avd_reset(struct avd_dev *avd)
 {
 	int ret = 0;
@@ -250,8 +273,19 @@ static int avd_reset(struct avd_dev *avd)
 		avd->recoveries = 0;
 	}
 	if (++avd->recoveries > AVD_RECOVER_MAX) {
-		ret = -EBUSY;
-		goto retire;
+		/*
+		 * Out of budget: stop the decoder with its DMA blocked and let
+		 * it rest until the window ends. Frames fail without touching
+		 * the hardware meanwhile; the next frame after that recovers
+		 * it. Bad streams (or conformance vectors using features the
+		 * hardware lacks) must not cost the user the decoder until a
+		 * reboot.
+		 */
+		avd_park(avd);
+		avd->rest_until = avd->recover_window_start + AVD_RECOVER_WINDOW;
+		dev_warn(avd->dev, "decoder resting after repeated resets, new frames fail for up to %u s\n",
+			 jiffies_to_msecs(avd->rest_until - jiffies) / 1000 + 1);
+		return -EBUSY;
 	}
 	if (avd->last_recover &&
 	    time_before(jiffies, avd->last_recover + msecs_to_jiffies(AVD_RECOVER_GAP_MS)))
@@ -278,7 +312,10 @@ static int avd_reset(struct avd_dev *avd)
 	ret = reset_control_reset(avd->rstc);
 	if (ret)
 		dev_err(avd->dev, "recover: reset failed: %d\n", ret);
-	if (avd->empty_domain) {
+	if (avd->empty_domain && ret) {
+		/* A decoder that failed its reset keeps its DMA blocked. */
+		avd->dma_parked = true;
+	} else if (avd->empty_domain) {
 		dev_warn(avd->dev, "recover: restore DMA\n");
 		iommu_detach_device(avd->empty_domain, avd->dev);
 		if (avd->domain && iommu_get_domain_for_dev(avd->dev) != avd->domain) {
@@ -303,8 +340,44 @@ put:
 		return 0;
 retire:
 	avd->retired = true;
-	dev_err(avd->dev, "decoder retired after %s (%d): reload the module to use it again\n",
-		ret == -EBUSY ? "repeated resets" : "a failed reset", ret);
+	dev_err(avd->dev, "decoder retired after a failed reset (%d): reload the module to use it again\n",
+		ret);
+	return ret;
+}
+
+/* Bring a rested decoder back: reset with DMA still blocked, restore, boot. */
+static int avd_wake(struct avd_dev *avd)
+{
+	int ret;
+
+	ret = pm_runtime_resume_and_get(avd->dev);
+	if (ret < 0)
+		return ret;
+	dev_warn(avd->dev, "recover: wake after rest\n");
+	avd_shutdown(avd);
+	ret = reset_control_reset(avd->rstc);
+	if (!ret && avd->dma_parked) {
+		iommu_detach_device(avd->empty_domain, avd->dev);
+		if (avd->domain && iommu_get_domain_for_dev(avd->dev) != avd->domain)
+			ret = -EIO;
+		else
+			avd->dma_parked = false;
+	}
+	if (!ret)
+		ret = avd_boot(avd);
+	if (!ret) {
+		avd->recoveries = 0;
+		avd->last_recover = jiffies ?: 1;
+		if (avd->irq_parked)
+			enable_irq(avd->irq);
+		avd->irq_parked = false;
+		dev_warn(avd->dev, "recover: done\n");
+	} else {
+		avd->retired = true;
+		dev_err(avd->dev, "decoder retired after a failed wake (%d): reload the module to use it again\n",
+			ret);
+	}
+	pm_runtime_put_autosuspend(avd->dev);
 	return ret;
 }
 
@@ -410,7 +483,7 @@ static irqreturn_t avd_irq_handler(int irq, void *data)
 		 * timeout: it resets the AVD and fails only this frame, and it
 		 * ignores a job the hardware does not own yet.
 		 */
-		mod_delayed_work(system_wq, &ctx->watchdog_work, 0);
+		mod_delayed_work(system_dfl_wq, &ctx->watchdog_work, 0);
 		goto done;
 	}
 
@@ -460,14 +533,22 @@ static void avd_device_run(void *priv)
 	enum vb2_buffer_state result = VB2_BUF_STATE_ERROR;
 	const char *outcome = "already finished";
 	unsigned long flags;
-	bool finish = false;
+	bool finish = false, fail;
 	u64 seq;
 	int ret;
 
 	if (WARN_ON(!desc))
 		return;
 
-	if (READ_ONCE(avd->retired) || ctx->broken) {
+	fail = READ_ONCE(avd->retired) || ctx->broken;
+	/* A rested decoder stays parked until its window ends, then wakes. */
+	if (!fail && avd->rest_until) {
+		if (time_before(jiffies, avd->rest_until) || avd_wake(avd))
+			fail = true;
+		else
+			avd->rest_until = 0;
+	}
+	if (fail) {
 		struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 
 		/* Complete the request's controls too, or its fd never signals. */
@@ -527,7 +608,7 @@ static void avd_device_run(void *priv)
 		} else {
 			avd->job_state = AVD_JOB_SUBMITTED;
 			ctx->wd_seq = seq;
-			schedule_delayed_work(&ctx->watchdog_work, msecs_to_jiffies(2000));
+			queue_delayed_work(system_dfl_wq, &ctx->watchdog_work, msecs_to_jiffies(2000));
 			outcome = "submitted";
 		}
 	}
@@ -1087,6 +1168,8 @@ static void avd_remove(struct platform_device *pdev)
 
 	avd_v4l2_cleanup(avd);
 
+	if (avd->dma_parked)
+		iommu_detach_device(avd->empty_domain, avd->dev);
 	if (avd->empty_domain)
 		iommu_domain_free(avd->empty_domain);
 
