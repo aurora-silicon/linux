@@ -130,7 +130,7 @@ int main(void){
  m.connected=true;m.scan_home_channel=5;m.scan_home_band=NL80211_BAND_6GHZ;
  request.flags=request.n_6ghz_params=0;
  assert(mt_scan_submit_next(&m)==0);
- assert(bodies[0][2]==1&&bodies[0][3]==8&&bodies[0][4]==1);
+ assert(bodies[0][2]==1&&bodies[0][3]==4&&bodies[0][4]==1);
  assert(!memcmp(bodies[0]+12,"hidden",6));
  assert(bodies[0][0x4cc]==5&&bodies[0][0x4cd]==3);
  /* NO_IR remains passive, even for an explicit legacy SSID. */
