@@ -2118,12 +2118,14 @@ struct macaudio_platform_cfg macaudio_j493_cfg = {
 };
 
 /*
- * J616s (T6040, MacBook Pro 16" M4 Pro): the AOP firmware runs MCA cluster
- * 0, so the CPU component is the AOP audio driver (front-ends j616-pcm-N,
- * back-end spkr). One serializer carries all six SN012776 amps in a 250-bit
- * frame at 12 MHz: six 32-bit playback slots, twelve 16-bit sense slots. The
- * amps take I2S with an inverted frame clock and a normal bit clock, as on
- * the J713 (T8132: the same amp and frame).
+ * J614s and J616s (T6040, MacBook Pro 14" and 16" M4 Pro): the AOP firmware
+ * runs MCA cluster 0, so the CPU component is the AOP audio driver
+ * (front-ends j616-pcm-N, back-end spkr). One serializer carries all six
+ * SN012776 amps in a 250-bit frame at 12 MHz: six 32-bit playback slots,
+ * twelve 16-bit sense slots. The amps take I2S with an inverted frame clock
+ * and a normal bit clock, as on the J713 (T8132: the same amp and frame).
+ * Apple's device trees for the two boards describe the same amps, slots and
+ * sense layout; only the speakers and their tuning differ.
  */
 struct macaudio_platform_cfg macaudio_j616_cfg = {
 	.enable_speakers = true,
@@ -2142,8 +2144,8 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 };
 
 /*
- * The J616s headphone jack, a card of its own: a CS42L84 on the AOP's
- * "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
+ * The J614s and J616s headphone jack, a card of its own: a CS42L84 on the
+ * AOP's "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
  * frame at 48 kHz (3.072 MHz, the primary front-end's ratio) with a
  * one-SCLK FSYNC pulse, two 32-bit slots and data launched on the rising
  * SCLK edge: DSP_A with an inverted bit clock, as on the J700. A card binds
@@ -2224,6 +2226,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
+	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
+	{ .compatible = "apple,j614-macaudio", .data = &macaudio_j616_cfg },
+	/* j614    AID34   cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j614-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j616    AID35   sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j616-macaudio", .data = &macaudio_j616_cfg },
 	/* j616    AID35   cs42l84     -       the jack, a card of its own (AOP-fed) */
