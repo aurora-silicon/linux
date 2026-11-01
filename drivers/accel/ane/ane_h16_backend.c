@@ -590,10 +590,18 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 			return ret;
 		h->darts_powered++;
 		h->window[ANE_H16_DART0 + i] = ioremap_np(r.start, resource_size(&r));
-		h->window[ANE_H16_DAPF0 + i] = ioremap_np(r.start + 0x10000, SZ_16K);
-		if (!h->window[ANE_H16_DART0 + i] || !h->window[ANE_H16_DAPF0 + i])
+		if (!h->window[ANE_H16_DART0 + i])
+			return -ENOMEM;
+		/* Only the instance the platform names has a DAPF bank. */
+		if (i != h->boot.soc->dapf_dart)
+			continue;
+		h->window[ANE_H16_DAPF] = ioremap_np(r.start + h->boot.soc->dapf_offset,
+						     h->boot.soc->dapf_size);
+		if (!h->window[ANE_H16_DAPF])
 			return -ENOMEM;
 	}
+	if (!h->window[ANE_H16_DAPF])
+		return -ENODEV;
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;

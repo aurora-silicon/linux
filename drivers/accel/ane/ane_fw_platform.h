@@ -12,6 +12,7 @@
 struct device_node;
 struct platform_device;
 struct ane_h16_profile;
+struct ane_h16_mmio;
 
 enum ane_fw_owner {
 	ANE_FW_OWNER_AP,
@@ -27,6 +28,15 @@ enum ane_fw_irq_role {
 struct ane_fw_platform {
 	const struct ane_h16_profile *h16_profiles;
 	unsigned int h16_profile_count;
+	/* DART/DAPF register tables, one per supported DART revision. */
+	const struct ane_h16_mmio *h16_mmio;
+	unsigned int h16_mmio_count;
+	/* DART PARAMS3, the one DART register read before a table is chosen. */
+	u32 dart_params;
+	/* The DAPF bank: iommus entry that owns it, offset from its reg, size. */
+	u32 dapf_dart;
+	u32 dapf_offset;
+	u32 dapf_size;
 	u32 soc;
 	u16 chip_family;
 	u16 ane_type;

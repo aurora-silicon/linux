@@ -20,10 +20,37 @@ enum ane_h16_window {
 	ANE_H16_DART0,
 	ANE_H16_DART1,
 	ANE_H16_DART2,
-	ANE_H16_DAPF0,
-	ANE_H16_DAPF1,
-	ANE_H16_DAPF2,
+	/* The one DAPF bank: the DART reg entry the ADT tags FPAD. */
+	ANE_H16_DAPF,
 	ANE_H16_WINDOWS,
+};
+
+enum ane_h16_dapf_owner {
+	/* The loader programs the bank from the ADT; the kernel only verifies. */
+	ANE_H16_DAPF_LOADER,
+	/* The kernel rewrites records that differ, unless the bank is locked. */
+	ANE_H16_DAPF_KERNEL,
+};
+
+/*
+ * Every DART and DAPF register offset the stages read or write, for one DART
+ * revision: PARAMS3 bits 15:0 of the instance that owns the DAPF bank. The
+ * platform lists one entry per supported revision. PARAMS3 is read before an
+ * entry is chosen; with no entry nothing else in the DARTs or the bank is
+ * touched, and an entry names every other offset that is.
+ */
+struct ane_h16_mmio {
+	u16 dart_revision;
+	u32 dart_fault;
+	u32 dart_address_lo;
+	u32 dart_address_hi;
+	u32 dart_protect;
+	u32 dart_lock;
+	u32 dapf_records;
+	u32 dapf_stride;
+	/* Record end bits that read back; the bounds are inclusive. */
+	u64 dapf_end_mask;
+	enum ane_h16_dapf_owner dapf_owner;
 };
 
 struct ane_h16_tunable {
@@ -69,16 +96,7 @@ struct ane_h16_build {
 	u32 template_value;
 	u32 max_channels;
 	u32 max_heap;
-	u32 dart_fault;
-	u32 dart_address_lo;
-	u32 dart_address_hi;
-	u32 dapf_version;
-	u32 dapf_protect;
-	u32 dapf_lock;
-	u32 dapf_records;
-	u32 dapf_stride;
 	bool native_free;
-	bool dapf_layout_known;
 	bool c1ppt;
 	const struct ane_h16_tunables *tunables;
 	size_t tunable_count;
@@ -123,6 +141,8 @@ struct ane_h16_boot_ops {
 struct ane_h16_boot {
 	const struct ane_fw_platform *soc;
 	const struct ane_h16_build *build;
+	/* Chosen from the DART revision in preflight. */
+	const struct ane_h16_mmio *mmio;
 	const struct ane_h16_boot_ops *ops;
 	const struct ane_fw_transport_ops *transport_ops;
 	void *ctx;
@@ -171,16 +191,18 @@ static inline void ane_h16_write(struct ane_h16_boot *b, u32 cell, u32 value)
 
 static inline int ane_h16_faults(struct ane_h16_boot *b, bool log)
 {
-	const struct ane_h16_build *f = b->build;
+	const struct ane_h16_mmio *m = b->mmio;
 	unsigned int i;
 	int ret = 0;
 
+	if (!m)
+		return 0;
 	for (i = 0; i < 3; i++) {
 		enum ane_h16_window w = ANE_H16_DART0 + i;
-		u32 status = b->ops->read32(b->ctx, w, f->dart_fault);
-		u64 address = b->ops->read32(b->ctx, w, f->dart_address_lo);
+		u32 status = b->ops->read32(b->ctx, w, m->dart_fault);
+		u64 address = b->ops->read32(b->ctx, w, m->dart_address_lo);
 
-		address |= (u64)b->ops->read32(b->ctx, w, f->dart_address_hi) << 32;
+		address |= (u64)b->ops->read32(b->ctx, w, m->dart_address_hi) << 32;
 		if (log || (status & BIT(31))) {
 			b->ops->log(b->ctx, "DART status", i, status);
 			b->ops->log(b->ctx, "DART address", i, address);
@@ -207,6 +229,31 @@ static inline int ane_h16_fail(struct ane_h16_boot *b, int error)
 	return b->error;
 }
 
+/*
+ * PARAMS3 of the three instances, logged; the DAPF owner's revision selects
+ * the register table. The other two are only reported.
+ */
+static inline int ane_h16_select_mmio(struct ane_h16_boot *b)
+{
+	const struct ane_fw_platform *soc = b->soc;
+	u32 params[3];
+	unsigned int i;
+
+	for (i = 0; i < 3; i++) {
+		params[i] = b->ops->read32(b->ctx, ANE_H16_DART0 + i, soc->dart_params);
+		b->ops->log(b->ctx, "DART PARAMS3", i, params[i]);
+	}
+	for (i = 0; i < soc->h16_mmio_count; i++) {
+		if (soc->h16_mmio[i].dart_revision == (params[soc->dapf_dart] & 0xffff)) {
+			b->mmio = &soc->h16_mmio[i];
+			return 0;
+		}
+	}
+	b->ops->log(b->ctx, "DART revision has no register table", params[soc->dapf_dart] & 0xffff,
+		    soc->h16_mmio_count);
+	return -ENODEV;
+}
+
 static inline int ane_h16_preflight(struct ane_h16_boot *b)
 {
 	const struct ane_h16_build *f = b->build;
@@ -231,77 +278,72 @@ static inline int ane_h16_preflight(struct ane_h16_boot *b)
 	b->ops->log(b->ctx, "CPU control/RVBAR", control, rvbar);
 	if (control || rvbar != f->expected_rvbar)
 		return -EBUSY;
+	ret = ane_h16_select_mmio(b);
+	if (ret)
+		return ret;
 	ret = ane_h16_faults(b, true);
 	if (ret)
 		return ret;
 	return 0;
 }
 
-static inline bool ane_h16_dapf_record(struct ane_h16_boot *b, unsigned int dart,
-				       unsigned int record)
+/* One record of the DAPF bank, read only. Record words as the ADT dapf-instance. */
+static inline bool ane_h16_dapf_record(struct ane_h16_boot *b, unsigned int record)
 {
-	const struct ane_h16_build *f = b->build;
-	enum ane_h16_window w = ANE_H16_DAPF0 + dart;
-	u32 off = f->dapf_records + record * f->dapf_stride;
-	u32 flags = b->ops->read32(b->ctx, w, off);
-	u64 start = b->ops->read32(b->ctx, w, off + 8);
-	u64 end = b->ops->read32(b->ctx, w, off + 0x10);
-	u32 enabled = b->ops->read32(b->ctx, w, off + 0x20);
+	const struct ane_h16_mmio *m = b->mmio;
+	u32 off = m->dapf_records + record * m->dapf_stride;
+	u32 flags = b->ops->read32(b->ctx, ANE_H16_DAPF, off);
+	u32 r4 = b->ops->read32(b->ctx, ANE_H16_DAPF, off + 4);
+	u64 start = b->ops->read64(b->ctx, ANE_H16_DAPF, off + 8);
+	u64 end = b->ops->read64(b->ctx, ANE_H16_DAPF, off + 0x10);
+	u32 enabled = b->ops->read32(b->ctx, ANE_H16_DAPF, off + 0x20);
 
-	b->ops->log(b->ctx, "DAPF instance/record", dart, record);
-	start |= (u64)b->ops->read32(b->ctx, w, off + 0xc) << 32;
-	end |= (u64)b->ops->read32(b->ctx, w, off + 0x14) << 32;
+	b->ops->log(b->ctx, "DAPF record/r4", record, r4);
 	b->ops->log(b->ctx, "DAPF flags/enable", flags, enabled);
 	b->ops->log(b->ctx, "DAPF start/end", start, end);
 	return (flags & 0x333) == 0x31 && (enabled & 0xffff) == 1 &&
-	       start == b->ranges[record][0] && end == b->ranges[record][1];
+	       start == b->ranges[record][0] &&
+	       (end & m->dapf_end_mask) == (b->ranges[record][1] & m->dapf_end_mask);
 }
 
+/*
+ * Compare the four records with apple,dapf-ranges. Preflight only reports.
+ * Map refuses a difference when the loader owns the bank or it is locked,
+ * and otherwise rewrites the differing records and reads them back.
+ */
 static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
 {
-	const struct ane_h16_build *f = b->build;
-	unsigned int dart, record;
+	const struct ane_h16_mmio *m = b->mmio;
+	enum ane_h16_window owner = ANE_H16_DART0 + b->soc->dapf_dart;
+	u32 protect = b->ops->read32(b->ctx, owner, m->dart_protect);
+	u32 lock = b->ops->read32(b->ctx, owner, m->dart_lock);
+	unsigned int record, matched = 0;
+	bool match[4];
 
-	if (!f->dapf_layout_known)
-		return -ENODATA;
-	/* Check every lock before writing any record. */
-	for (dart = 0; dart < 3; dart++) {
-		enum ane_h16_window w = ANE_H16_DART0 + dart;
-		u32 version = b->ops->read32(b->ctx, w, f->dapf_version);
-		u32 protect = b->ops->read32(b->ctx, w, f->dapf_protect);
-		u32 lock = b->ops->read32(b->ctx, w, f->dapf_lock);
-
-		b->ops->log(b->ctx, "DAPF version", dart, version);
-		b->ops->log(b->ctx, "DAPF protect/lock", protect, lock);
-		if ((version & 0xffff) != 0x203)
-			return -ENODEV;
-		for (record = 0; record < 4; record++)
-			if (!ane_h16_dapf_record(b, dart, record) &&
-			    program && (lock & BIT(2)))
-				return -EPERM;
+	b->ops->log(b->ctx, "DAPF protect/lock", protect, lock);
+	for (record = 0; record < 4; record++) {
+		match[record] = ane_h16_dapf_record(b, record);
+		matched += match[record];
 	}
-	if (!program)
+	b->ops->log(b->ctx, "DAPF records matching/owner", matched, m->dapf_owner);
+	if (!program || matched == 4)
 		return 0;
-	for (dart = 0; dart < 3; dart++) {
-		enum ane_h16_window w = ANE_H16_DAPF0 + dart;
+	if (m->dapf_owner == ANE_H16_DAPF_LOADER || (lock & BIT(2)))
+		return -EPERM;
+	for (record = 0; record < 4; record++) {
+		u32 off = m->dapf_records + record * m->dapf_stride;
+		u32 value;
 
-		for (record = 0; record < 4; record++) {
-			u32 off = f->dapf_records + record * f->dapf_stride;
-			u32 value;
-
-			if (ane_h16_dapf_record(b, dart, record))
-				continue;
-			value = b->ops->read32(b->ctx, w, off);
-			b->ops->write32(b->ctx, w, off, (value & ~0x333) | 0x31);
-			b->ops->write32(b->ctx, w, off + 8, lower_32_bits(b->ranges[record][0]));
-			b->ops->write32(b->ctx, w, off + 0xc, upper_32_bits(b->ranges[record][0]));
-			b->ops->write32(b->ctx, w, off + 0x10, lower_32_bits(b->ranges[record][1]));
-			b->ops->write32(b->ctx, w, off + 0x14, upper_32_bits(b->ranges[record][1]));
-			value = b->ops->read32(b->ctx, w, off + 0x20);
-			b->ops->write32(b->ctx, w, off + 0x20, (value & ~0xffff) | 1);
-			if (!ane_h16_dapf_record(b, dart, record))
-				return -EIO;
-		}
+		if (match[record])
+			continue;
+		b->ops->write64(b->ctx, ANE_H16_DAPF, off + 8, b->ranges[record][0]);
+		b->ops->write64(b->ctx, ANE_H16_DAPF, off + 0x10, b->ranges[record][1]);
+		value = b->ops->read32(b->ctx, ANE_H16_DAPF, off);
+		b->ops->write32(b->ctx, ANE_H16_DAPF, off, (value & ~0x333) | 0x31);
+		value = b->ops->read32(b->ctx, ANE_H16_DAPF, off + 0x20);
+		b->ops->write32(b->ctx, ANE_H16_DAPF, off + 0x20, (value & ~0xffff) | 1);
+		if (!ane_h16_dapf_record(b, record))
+			return -EIO;
 	}
 	return 0;
 }

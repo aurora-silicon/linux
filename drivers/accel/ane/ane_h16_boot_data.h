@@ -128,6 +128,29 @@ static const struct ane_h16_tunables ane_h16_tunables_26a428[] = {
 	  .c1ppt = true, .lock_offset = 0x3ffc, .lock_mask = 1 },
 };
 
+/*
+ * T6041 (J616s) ANE DARTs, revision 2.2 (PARAMS3 0x2a2a0202). The ADT
+ * dart-ane0 node has one DAPF bank, the reg entry its instance property tags
+ * FPAD "DAPFLLT" at DART0 + 0x10000; BRD and BWR have none, and their
+ * +0x10000 is outside every ADT reg entry. The loader programs the bank from
+ * dapf-instance-0, so the kernel only reads it. A t8110 DAPF record end does
+ * not read back its low two bits on the T8132; every J616s end has them set.
+ */
+static const struct ane_h16_mmio ane_h16_mmio_t6041[] = {
+	{
+		.dart_revision = 0x0202,
+		.dart_fault = 0x100,
+		.dart_address_lo = 0x170,
+		.dart_address_hi = 0x174,
+		.dart_protect = 0x200,
+		.dart_lock = 0x208,
+		.dapf_records = 0,
+		.dapf_stride = 0x40,
+		.dapf_end_mask = ~3ULL,
+		.dapf_owner = ANE_H16_DAPF_LOADER,
+	},
+};
+
 static const struct ane_h16_build ane_h16_build_26a428 = {
 	.cpu_control = 0x1600044,
 	.rvbar = 0x1050000,
@@ -155,16 +178,6 @@ static const struct ane_h16_build ane_h16_build_26a428 = {
 	.max_channels = 0x21,
 	/* Host allocation policy, not a recovered firmware ceiling. */
 	.max_heap = SZ_16M,
-	.dart_fault = 0x100,
-	.dart_address_lo = 0x170,
-	.dart_address_hi = 0x174,
-	.dapf_version = 8,
-	.dapf_protect = 0x200,
-	.dapf_lock = 0x208,
-	.dapf_stride = 0x40,
-	/* Version/protect/lock are DART registers; DAPF records are separate. */
-	.dapf_records = 0,
-	.dapf_layout_known = true,
 	.native_free = true,
 	.c1ppt = true,
 	.tunables = ane_h16_tunables_26a428,

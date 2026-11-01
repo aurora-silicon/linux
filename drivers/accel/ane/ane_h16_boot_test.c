@@ -8,9 +8,12 @@ struct ane_h16_sim {
 	struct kunit *test;
 	struct ane_h16_boot boot;
 	struct ane_h16_build build;
+	struct ane_h16_mmio mmio;
 	struct ane_fw_platform soc;
 	u32 scratch[8];
-	u32 dapf[3][SZ_16K / 4];
+	u32 dapf[SZ_16K / 4];
+	u32 dart_params;
+	u32 dapf_reads;
 	u64 now;
 	u64 ce_ack;
 	u32 cpu;
@@ -50,6 +53,30 @@ struct ane_h16_sim {
 
 static const u32 sim_power_words[] = { 0x3c0, 0xc008, 0xc000, 0xc010, 0xc018 };
 
+/* Only the PARAMS3 word and the offsets of the selected table are accessed. */
+static void sim_check_dart(struct ane_h16_sim *s, enum ane_h16_window w, u32 off)
+{
+	const struct ane_h16_mmio *m = s->boot.mmio;
+
+	if (off == s->soc.dart_params)
+		return;
+	KUNIT_ASSERT_NOT_NULL(s->test, m);
+	if (off == m->dart_fault || off == m->dart_address_lo || off == m->dart_address_hi)
+		return;
+	KUNIT_EXPECT_EQ(s->test, w, ANE_H16_DART0 + s->soc.dapf_dart);
+	KUNIT_EXPECT_TRUE(s->test, off == m->dart_protect || off == m->dart_lock);
+}
+
+static void sim_check_dapf(struct ane_h16_sim *s, u32 off, u32 width)
+{
+	const struct ane_h16_mmio *m = s->boot.mmio;
+
+	KUNIT_ASSERT_NOT_NULL(s->test, m);
+	KUNIT_EXPECT_GE(s->test, off, m->dapf_records);
+	KUNIT_EXPECT_LE(s->test, off + width, m->dapf_records + 4 * m->dapf_stride);
+	KUNIT_EXPECT_LE(s->test, off + width, s->soc.dapf_size);
+}
+
 static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 {
 	struct ane_h16_sim *s = ctx;
@@ -57,16 +84,20 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 	if (w == ANE_H16_PMGR)
 		return s->bad_power ? 0xf : 0xff;
 	if (w >= ANE_H16_DART0 && w <= ANE_H16_DART2) {
-		if (off == s->build.dapf_version)
-			return 0x203;
-		if (off == s->build.dapf_protect || off == s->build.dapf_lock)
+		sim_check_dart(s, w, off);
+		if (off == s->soc.dart_params)
+			return s->dart_params;
+		if (off == s->mmio.dart_protect || off == s->mmio.dart_lock)
 			return s->lock;
-		if (off == s->build.dart_fault)
+		if (off == s->mmio.dart_fault)
 			return s->fault;
 		return 0;
 	}
-	if (w >= ANE_H16_DAPF0)
-		return s->dapf[w - ANE_H16_DAPF0][off / 4];
+	if (w == ANE_H16_DAPF) {
+		sim_check_dapf(s, off, 4);
+		s->dapf_reads++;
+		return s->dapf[off / 4];
+	}
 	if (w == ANE_H16_ENGINE) {
 		if (off == s->build.cpu_control)
 			return s->cpu;
@@ -84,6 +115,12 @@ static u64 sim_read64(void *ctx, enum ane_h16_window w, u32 off)
 {
 	struct ane_h16_sim *s = ctx;
 
+	if (w == ANE_H16_DAPF) {
+		sim_check_dapf(s, off, 8);
+		s->dapf_reads++;
+		return s->dapf[off / 4] | (u64)s->dapf[off / 4 + 1] << 32;
+	}
+	KUNIT_EXPECT_EQ(s->test, w, ANE_H16_ENGINE);
 	if (off == s->build.rvbar)
 		return s->bad_rvbar ? 0 : s->build.expected_rvbar;
 	if (off == s->build.ce + 8)
@@ -113,11 +150,13 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 	struct ane_h16_sim *s = ctx;
 	const struct ane_h16_build *f = &s->build;
 
-	if (w >= ANE_H16_DAPF0) {
-		s->dapf[w - ANE_H16_DAPF0][off / 4] = value;
+	if (w == ANE_H16_DAPF) {
+		sim_check_dapf(s, off, 4);
+		s->dapf[off / 4] = value;
 		s->dapf_writes++;
 		return;
 	}
+	KUNIT_EXPECT_TRUE(s->test, w == ANE_H16_ENGINE || w == ANE_H16_XL);
 	if (w == ANE_H16_ENGINE && off == f->cpu_control) {
 		s->cpu = value;
 		if (value == f->run && s->fault_after_run)
@@ -209,6 +248,16 @@ static void sim_write64(void *ctx, enum ane_h16_window w, u32 off, u64 value)
 {
 	struct ane_h16_sim *s = ctx;
 
+	if (w == ANE_H16_DAPF) {
+		sim_check_dapf(s, off, 8);
+		/* The hardware drops the low two bits of an end. */
+		if (off % s->mmio.dapf_stride == 0x10)
+			value &= s->mmio.dapf_end_mask;
+		s->dapf[off / 4] = lower_32_bits(value);
+		s->dapf[off / 4 + 1] = upper_32_bits(value);
+		s->dapf_writes++;
+		return;
+	}
 	KUNIT_EXPECT_EQ(s->test, w, ANE_H16_ENGINE);
 	if (off == s->build.ce && !s->ce_timeout)
 		s->ce_ack = value;
@@ -380,6 +429,24 @@ static const struct ane_fw_transport_ops sim_transport_ops = {
 	.refused = sim_refused,
 };
 
+/* The bank as the loader leaves it, ends without their low two bits. */
+static void sim_program_dapf(struct ane_h16_sim *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < 4; i++) {
+		u32 *p = &s->dapf[(s->mmio.dapf_records + i * s->mmio.dapf_stride) / 4];
+		u64 end = s->boot.ranges[i][1] & s->mmio.dapf_end_mask;
+
+		p[0] = 0x80000031;
+		p[2] = lower_32_bits(s->boot.ranges[i][0]);
+		p[3] = upper_32_bits(s->boot.ranges[i][0]);
+		p[4] = lower_32_bits(end);
+		p[5] = upper_32_bits(end);
+		p[8] = 0xabcd0001;
+	}
+}
+
 static int sim_init(struct kunit *test)
 {
 	struct ane_h16_sim *s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
@@ -390,7 +457,15 @@ static int sim_init(struct kunit *test)
 	test->priv = s;
 	s->test = test;
 	s->build = ane_h16_build_26a428;
+	s->mmio = ane_h16_mmio_t6041[0];
+	s->dart_params = 0x2a2a0202;
+	s->soc.h16_mmio = &s->mmio;
+	s->soc.h16_mmio_count = 1;
 	/* Separate DART header and DAPF record windows. */
+	s->soc.dart_params = 8;
+	s->soc.dapf_dart = 0;
+	s->soc.dapf_offset = 0x10000;
+	s->soc.dapf_size = SZ_16K;
 	s->soc.scratch = 0x1880020;
 	s->soc.doorbell = 0x1884000;
 	s->soc.irq_status = 0x188c000;
@@ -406,6 +481,7 @@ static int sim_init(struct kunit *test)
 		s->boot.ranges[i][0] = 0x500000000ULL + i * SZ_16K;
 		s->boot.ranges[i][1] = s->boot.ranges[i][0] + 3;
 	}
+	sim_program_dapf(s);
 	s->channel_request = 8;
 	s->ipc_request = 0xc440;
 	s->heap_request = 0xf00000;
@@ -505,6 +581,8 @@ static void ane_h16_locked_dapf_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
 
+	memset(s->dapf, 0, sizeof(s->dapf));
+	s->mmio.dapf_owner = ANE_H16_DAPF_KERNEL;
 	s->lock = BIT(2);
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EPERM);
 	KUNIT_EXPECT_FALSE(test, s->boot.ran);
@@ -528,7 +606,9 @@ static void ane_h16_preflight_test(struct kunit *test)
 	struct ane_h16_sim *s = test->priv;
 
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), 0);
+	KUNIT_EXPECT_PTR_EQ(test, s->boot.mmio, &s->mmio);
 	KUNIT_EXPECT_EQ(test, s->maps, 0U);
+	KUNIT_EXPECT_EQ(test, s->dapf_reads, 20U);
 	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
 	KUNIT_EXPECT_EQ(test, s->tuning_writes, 0U);
 	KUNIT_EXPECT_EQ(test, s->scratch_writes, 0U);
@@ -671,23 +751,52 @@ static void ane_h16_map_failure_test(struct kunit *test)
 static void ane_h16_locked_matching_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
-	unsigned int dart, i;
 
+	s->mmio.dapf_owner = ANE_H16_DAPF_KERNEL;
 	s->lock = BIT(2);
-	for (dart = 0; dart < 3; dart++) {
-		for (i = 0; i < 4; i++) {
-			u32 *p = &s->dapf[dart][(s->build.dapf_records + i * 0x40) / 4];
-
-			p[0] = 0x80000031;
-			p[2] = lower_32_bits(s->boot.ranges[i][0]);
-			p[3] = upper_32_bits(s->boot.ranges[i][0]);
-			p[4] = lower_32_bits(s->boot.ranges[i][1]);
-			p[5] = upper_32_bits(s->boot.ranges[i][1]);
-			p[8] = 0xabcd0001;
-		}
-	}
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
 	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
+}
+
+/* The J616s table: the loader owns the bank and the kernel never writes it. */
+static void ane_h16_loader_dapf_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	memset(s->dapf, 0, sizeof(s->dapf));
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), 0);
+	KUNIT_EXPECT_GT(test, s->dapf_reads, 0U);
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), -EPERM);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
+	KUNIT_EXPECT_FALSE(test, s->boot.ran);
+	KUNIT_EXPECT_EQ(test, s->pins, 0U);
+}
+
+/* A kernel-owned unlocked bank is written in place and read back. */
+static void ane_h16_kernel_dapf_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	unsigned int i;
+
+	memset(s->dapf, 0, sizeof(s->dapf));
+	s->mmio.dapf_owner = ANE_H16_DAPF_KERNEL;
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_MAP), 0);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 16U);
+	for (i = 0; i < 4; i++)
+		KUNIT_EXPECT_TRUE(test, ane_h16_dapf_record(&s->boot, i));
+}
+
+/* A DART revision without a table stops after the PARAMS3 reads. */
+static void ane_h16_unknown_revision_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->dart_params = 0x2a2a0203;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_PREFLIGHT), -ENODEV);
+	KUNIT_EXPECT_NULL(test, s->boot.mmio);
+	KUNIT_EXPECT_EQ(test, s->dapf_reads, 0U);
+	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
+	KUNIT_EXPECT_EQ(test, s->maps, 0U);
 }
 
 static void ane_h16_heap_overlap_test(struct kunit *test)
@@ -733,6 +842,9 @@ static void ane_h16_foreign_free_test(struct kunit *test)
 static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_happy_test),
 	KUNIT_CASE(ane_h16_locked_matching_test),
+	KUNIT_CASE(ane_h16_loader_dapf_test),
+	KUNIT_CASE(ane_h16_kernel_dapf_test),
+	KUNIT_CASE(ane_h16_unknown_revision_test),
 	KUNIT_CASE(ane_h16_heap_overlap_test),
 	KUNIT_CASE(ane_h16_native_free_test),
 	KUNIT_CASE(ane_h16_control_refusal_test),
