@@ -3130,6 +3130,7 @@ module_init(ane_rtclient_init);
 static void __exit ane_rtclient_exit(void)
 {
 	platform_driver_unregister(&ane_rtclient_driver);
+	ane_h16_backend_exit();
 	ane_t6021_trace_free();
 }
 module_exit(ane_rtclient_exit);

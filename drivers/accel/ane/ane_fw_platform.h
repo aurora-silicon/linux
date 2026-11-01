@@ -79,5 +79,6 @@ void ane_fw_platform_remove(struct platform_device *pdev);
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc,
 			  unsigned int stage);
 void ane_h16_backend_remove(struct platform_device *pdev);
+void ane_h16_backend_exit(void);
 
 #endif /* __ANE_FW_PLATFORM_H__ */

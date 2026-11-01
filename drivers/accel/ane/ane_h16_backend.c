@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Staged H16 backend, using the accepted H16 cold-boot facts, round 5. */
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-map-ops.h>
 #include <linux/interrupt.h>
@@ -62,6 +63,27 @@ struct ane_h16_device {
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
+
+/* Diagnostic, workspace ane: observe an unknown resident image. */
+static char *h16_identity;
+module_param(h16_identity, charp, 0444);
+MODULE_PARM_DESC(h16_identity, "observe: accept an unknown resident image for preflight only and publish it in debugfs ane_h16/");
+
+static struct debugfs_blob_wrapper ane_h16_dump[2];
+static struct dentry *ane_h16_debugfs;
+
+static bool ane_h16_observing(void)
+{
+	return h16_identity && !strcmp(h16_identity, "observe");
+}
+
+void ane_h16_backend_exit(void)
+{
+	debugfs_remove_recursive(ane_h16_debugfs);
+	ane_h16_debugfs = NULL;
+	vfree(ane_h16_dump[0].data);
+	vfree(ane_h16_dump[1].data);
+}
 
 static u32 ane_h16_mmio_read32(void *ctx, enum ane_h16_window w, u32 off)
 {
@@ -594,8 +616,21 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 	}
 	ret = ane_h16_preload_validate(snap[0], b->soc->preload_size[0],
 				       snap[1], b->soc->preload_size[1]);
-	if (!ret)
+	if (!ret) {
 		dev_info(h->dev, "H16 preload identity %s accepted\n", b->build->identity);
+	} else if (ane_h16_observing() && !ane_h16_debugfs) {
+		dev_warn(h->dev, "H16 preload identity refused (%d); observing, image in debugfs ane_h16/\n",
+			 ret);
+		for (i = 0; i < 2; i++) {
+			ane_h16_dump[i].data = snap[i];
+			ane_h16_dump[i].size = b->soc->preload_size[i];
+			snap[i] = NULL;
+		}
+		ane_h16_debugfs = debugfs_create_dir("ane_h16", NULL);
+		debugfs_create_blob("text", 0400, ane_h16_debugfs, &ane_h16_dump[0]);
+		debugfs_create_blob("data", 0400, ane_h16_debugfs, &ane_h16_dump[1]);
+		ret = 0;
+	}
 out:
 	vfree(second);
 	vfree(snap[0]);
@@ -645,6 +680,10 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 				ret = -EINVAL;
 				goto cleanup;
 			}
+	}
+	if (ane_h16_observing() && stage != ANE_H16_PREFLIGHT) {
+		ret = -EPERM;
+		goto cleanup;
 	}
 	ret = ane_h16_preload_identity(h);
 	if (ret)
