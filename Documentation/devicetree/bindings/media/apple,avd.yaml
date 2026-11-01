@@ -12,6 +12,22 @@ description:
 maintainers:
   - Sofus <sofus.c@icloud.com>
 
+allOf:
+  - if:
+      properties:
+        power-domains:
+          minItems: 2
+    then:
+      required:
+        - power-domain-names
+      properties:
+        power-domain-names:
+          minItems: 2
+    else:
+      properties:
+        power-domain-names:
+          maxItems: 1
+
 properties:
   compatible:
     oneOf:
