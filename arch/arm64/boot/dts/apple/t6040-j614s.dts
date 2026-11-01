@@ -15,3 +15,34 @@
 	compatible = "apple,j614s", "apple,t6040", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M4 Pro, Nov 2024)";
 };
+
+&dcp {
+	panel {
+		compatible = "apple,panel-j614", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		/delete-property/ adj-height-mm;
+	};
+};
+
+&aop_audio {
+	apple,chassis-name = "J614";
+};
+
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j614s.bin";
+	};
+};
+
+&{/pcie@1cb0000000/pci@0,0/wifi@0,0} {
+	brcm,board-type = "apple,mriya";
+};
+
+&{/pcie@1cb0000000/pci@0,0/bluetooth@0,1} {
+	brcm,board-type = "apple,mriya";
+};
+
+&mesa {
+	firmware-name = "apple/mesacal-j614s.bin", "apple/msrk-j614s.bin";
+};
