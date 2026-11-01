@@ -9,7 +9,10 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 
+struct device_node;
 struct platform_device;
+struct ane_h16_profile;
+struct ane_h16_mmio;
 
 enum ane_fw_owner {
 	ANE_FW_OWNER_AP,
@@ -23,6 +26,17 @@ enum ane_fw_irq_role {
 
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
+	const struct ane_h16_profile *h16_profiles;
+	unsigned int h16_profile_count;
+	/* DART/DAPF register tables, one per supported DART revision. */
+	const struct ane_h16_mmio *h16_mmio;
+	unsigned int h16_mmio_count;
+	/* DART PARAMS3, the one DART register read before a table is chosen. */
+	u32 dart_params;
+	/* The DAPF bank: iommus entry that owns it, offset from its reg, size. */
+	u32 dapf_dart;
+	u32 dapf_offset;
+	u32 dapf_size;
 	u32 soc;
 	u16 chip_family;
 	u16 ane_type;
@@ -70,5 +84,12 @@ ane_fw_preload_ranges_valid(const struct ane_fw_platform *soc, const u64 phys[2]
 extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
+
+int ane_fw_platform_probe(struct platform_device *pdev,
+			  const struct ane_fw_platform *soc);
+void ane_fw_platform_remove(struct platform_device *pdev);
+int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
+int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc);
+void ane_h16_backend_remove(struct platform_device *pdev);
 
 #endif /* __ANE_FW_PLATFORM_H__ */

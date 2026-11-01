@@ -3,6 +3,7 @@
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/vmalloc.h>
+#include <linux/uaccess.h>
 
 #include "ane_h16_hwx.h"
 #include "ane_h16_tasks.h"
@@ -191,6 +192,17 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 		*dest = section;
 		p->sections[p->section_count++] = section;
 	}
+	if (p->info.region_count == ANE_H16_REGIONS)
+		return -ENOEXEC;
+	p->info.regions[p->info.region_count++] = (struct ane_h16_hwx_region) {
+		.vm = vm,
+		.size = size,
+		.file_offset = file,
+		.file_size = filesz,
+		.permissions = prot,
+		.kind = surface ? ANE_H16_REGION_SURFACE : text ? ANE_H16_REGION_TEXT :
+			kernel ? ANE_H16_REGION_KERNEL : ANE_H16_REGION_SCRATCH,
+	};
 	return 0;
 }
 
@@ -296,10 +308,42 @@ static int hwx_program(struct hwx_parser *p)
 	return ret;
 }
 
-static int hwx_tensor(struct hwx_parser *p, u32 index)
+/*
+ * Buffer references follow the surface segments, but tensor descriptors list
+ * the inputs before the output, so the add-128 HWX describes segments x, y, z
+ * with tensors x, z, y. Pair each surface with the one tensor whose short name
+ * is the name its buffer reference gives.
+ */
+static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
+{
+	const u8 *ref = p->bytes + p->refs[index];
+	u32 i, match = ANE_H16_SURFACES;
+
+	for (i = 0; i < p->tensor_count; i++) {
+		const u8 *c = p->bytes + p->tensors[i];
+		u32 length = get_unaligned_le32(c + 4), shortoff = get_unaligned_le32(c + 0x7c);
+		size_t room;
+
+		if (shortoff >= length)
+			return -ENOEXEC;
+		room = min_t(size_t, length - shortoff, 8);
+		if (strnlen(c + shortoff, room) == room ||
+		    strncmp(c + shortoff, ref + 0x18, 8))
+			continue;
+		if (match != ANE_H16_SURFACES || (*used & BIT(i)))
+			return -ENOEXEC;
+		match = i;
+	}
+	if (match == ANE_H16_SURFACES)
+		return -ENOEXEC;
+	*used |= BIT(match);
+	return match;
+}
+
+static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 {
 	struct ane_h16_hwx_surface *b = &p->info.surfaces[index];
-	const u8 *c = p->bytes + p->tensors[index];
+	const u8 *c = p->bytes + p->tensors[tensor];
 	const u8 *ref = p->bytes + p->refs[index];
 	u32 length = get_unaligned_le32(c + 4), shortoff;
 	u64 n, channels, height, width, row, plane, batch, minimum;
@@ -344,7 +388,7 @@ static int hwx_tensor(struct hwx_parser *p, u32 index)
 	    !hwx_zero(c, shortoff + short_length + 1, length))
 		return -ENOEXEC;
 	memcpy(b->name, c + shortoff, short_length);
-	b->symbol_offset = p->tensors[index] + 0xd3d;
+	b->symbol_offset = p->tensors[tensor] + 0xd3d;
 	if (get_unaligned_le64(ref + 8) != 0x18 ||
 	    get_unaligned_le64(ref + 0x10) != b->section.vm ||
 	    memcmp(ref + 0x18, b->name, sizeof(b->name)))
@@ -445,7 +489,7 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	const void *relocations;
 	const u8 *c = bytes;
 	size_t pos = 32;
-	u32 count, length, i;
+	u32 count, length, i, outputs, used;
 	unsigned long *seen = NULL;
 	int ret = -ENOEXEC;
 
@@ -531,14 +575,18 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 	    p->info.surface_count < 2 || p->ref_count != p->info.surface_count ||
 	    p->tensor_count != p->info.surface_count)
 		goto invalid;
-	for (i = 0; i < p->info.surface_count; i++) {
-		/* Inputs in segment order, exactly one output last. */
-		if (p->info.surfaces[i].direction != (i == p->info.surface_count - 1 ? 2 : 1))
-			goto invalid;
-		ret = hwx_tensor(p, i);
+	for (i = 0, outputs = 0, used = 0; i < p->info.surface_count; i++) {
+		/* Surfaces stay in segment order: inputs and exactly one output. */
+		outputs += p->info.surfaces[i].direction == 2;
+		ret = hwx_tensor_for(p, i, &used);
+		if (ret < 0)
+			goto out;
+		ret = hwx_tensor(p, i, ret);
 		if (ret)
 			goto out;
 	}
+	if (outputs != 1)
+		goto invalid;
 	ret = hwx_program(p);
 	if (ret)
 		goto out;
@@ -572,29 +620,60 @@ out:
 }
 EXPORT_SYMBOL_GPL(ane_h16_hwx_validate);
 
+static int hwx_snapshot_finish(struct ane_h16_hwx_snapshot *copy,
+			       struct ane_h16_hwx_snapshot *snapshot)
+{
+	int ret;
+
+	ret = ane_h16_hwx_validate(copy->bytes, copy->size, &copy->info);
+	if (ret) {
+		kvfree(copy->bytes);
+		return ret;
+	}
+	sha256(copy->bytes, copy->size, copy->digest);
+	*snapshot = *copy;
+	return 0;
+}
+
 int ane_h16_hwx_snapshot_create(const void *bytes, size_t size,
 				struct ane_h16_hwx_snapshot *snapshot)
 {
 	struct ane_h16_hwx_snapshot copy = {};
-	int ret;
 
 	if (!bytes || !snapshot || size < 32 || size > ANE_H16_HWX_MAX)
 		return -EINVAL;
+	if (snapshot->bytes)
+		return -EBUSY;
 	copy.bytes = kvmalloc(size, GFP_KERNEL);
 	if (!copy.bytes)
 		return -ENOMEM;
 	memcpy(copy.bytes, bytes, size);
 	copy.size = size;
-	ret = ane_h16_hwx_validate(copy.bytes, size, &copy.info);
-	if (ret) {
-		kvfree(copy.bytes);
-		return ret;
-	}
-	sha256(copy.bytes, size, copy.digest);
-	*snapshot = copy;
-	return 0;
+	return hwx_snapshot_finish(&copy, snapshot);
 }
 EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_create);
+
+/* Import exactly once before parsing or hashing. No userspace digest,
+ * section list or resource IDs can substitute for this original container.
+ * Callers supply an empty destination and retain it until all firmware
+ * references end; importing alone grants no process or execution authority.
+ */
+int ane_h16_hwx_snapshot_from_user(const void __user *bytes, u64 size,
+				   struct ane_h16_hwx_snapshot *snapshot)
+{
+	struct ane_h16_hwx_snapshot copy = {};
+
+	if (!bytes || !snapshot || size < 32 || size > ANE_H16_HWX_MAX)
+		return -EINVAL;
+	if (snapshot->bytes)
+		return -EBUSY;
+	copy.bytes = vmemdup_user(bytes, size);
+	if (IS_ERR(copy.bytes))
+		return PTR_ERR(copy.bytes);
+	copy.size = size;
+	return hwx_snapshot_finish(&copy, snapshot);
+}
+EXPORT_SYMBOL_GPL(ane_h16_hwx_snapshot_from_user);
 
 int ane_h16_hwx_snapshot_check(const struct ane_h16_hwx_snapshot *snapshot)
 {
