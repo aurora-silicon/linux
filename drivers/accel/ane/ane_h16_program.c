@@ -969,17 +969,18 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	if (ret)
 		return ret;
 	/*
-	 * Each descriptor carries the size the generic section declared for its
-	 * buffer at LOAD: the firmware checks the request against that program
-	 * contract. H17 asserts in its program manager when a descriptor is
-	 * smaller (relu64: section 0x1000 of a declared 0x4000 surface). The
-	 * declared size lies between the tensor span and the mapped allocation;
-	 * for MobileNet it is the whole 0x4c000 section, as on the working J700
-	 * path. Userspace still sees and copies the span.
+	 * H17 checks each descriptor against the size the generic section
+	 * declared for its buffer at LOAD and asserts in its program manager
+	 * when it is smaller (relu64: section 0x1000 of a declared 0x4000
+	 * surface), so H17 descriptors carry the declared size. H16 keeps the
+	 * whole HWX section, which is what ran MobileNet on the J616s; the two
+	 * agree there (0x4c000). The declared size lies between the tensor span
+	 * and the mapped allocation. Userspace still sees and copies the span.
 	 */
 	for (i = 0; i < p->resource_count; i++) {
 		buffers[i] = p->resources[i].buffer;
-		buffers[i].size = p->declared[i];
+		buffers[i].size = s->transport->soc->chip_family >= 17 ? p->declared[i] :
+				  p->hwx.surfaces[i].section.size;
 	}
 	if (p->has_scratch)
 		buffers[i++] = p->scratch;

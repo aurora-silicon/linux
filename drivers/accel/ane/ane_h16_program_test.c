@@ -956,11 +956,9 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x90 + 4), TEST_GENERIC_BASE + 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x18),
 			p->surfaces[0]->dva);
-	/* Each descriptor carries the size the generic section declared (here the span). */
+	/* H16: each descriptor covers its whole HWX section. */
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20),
-			p->hwx.surfaces[0].span);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x90 + 0x20),
-			p->hwx.surfaces[1].span);
+			p->hwx.surfaces[0].section.size);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca8 + 8), 4);
 	/* Later requests of the same program take the direct path. */
@@ -1622,6 +1620,13 @@ static void program_h17_no_custom_bar_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
 	KUNIT_EXPECT_EQ(test, f->exec_length, ANE_H16_EXECUTE_BASE_SIZE);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 0);
+	/*
+	 * H17 descriptors carry the size the generic section declared (this
+	 * fixture declares the span), not the larger HWX section.
+	 */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20), p->hwx.surfaces[0].span);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x90 + 0x20), p->hwx.surfaces[1].span);
+	KUNIT_EXPECT_NE(test, p->hwx.surfaces[0].span, p->hwx.surfaces[0].section.size);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
