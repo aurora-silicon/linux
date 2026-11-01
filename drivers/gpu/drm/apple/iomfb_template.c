@@ -3057,6 +3057,27 @@ static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 }
 #endif
 
+/*
+ * The colour matrix reply, then the rest of the colour update and the swap.
+ * A refused matrix leaves the previous one in place, so say so.
+ */
+static void dcp_set_matrix_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_set_matrix_resp *resp = out;
+
+	if (!resp || resp->ret)
+		dev_warn_ratelimited(dcp->dev, "colour matrix not applied (%s %u)\n",
+				     resp ? "status" : "no reply",
+				     resp ? resp->ret : 0);
+#if DCP_FW_H17(DCP_FW_VER)
+	dcp_pre_swap_a428(dcp, NULL, NULL);
+#elif DCP_FW_DESKTOP_26(DCP_FW_VER)
+	dcp_gamma_then_swap(dcp, NULL, NULL);
+#else
+	do_swap(dcp, NULL, NULL);
+#endif
+}
+
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 					  void *cookie)
 {
@@ -3584,7 +3605,7 @@ static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_st
 /* After an adaptive sync update: the frame's colour matrix, gamma and swap. */
 static void dcp_matrix_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	iomfb_set_matrix(dcp, false, &dcp->desktop->matrix, dcp_gamma_then_swap, NULL);
+	iomfb_set_matrix(dcp, false, &dcp->desktop->matrix, dcp_set_matrix_done, NULL);
 }
 #endif
 
@@ -3776,17 +3797,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		dcp_ctm_to_fw(mat.matrix, crtc_state->ctm ?
 			      crtc_state->ctm->data : NULL);
 
-#if DCP_FW_H17(DCP_FW_VER)
-		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
-#elif DCP_FW_DESKTOP_26(DCP_FW_VER)
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
 		dcp->desktop->gamma_pending = dcp_gamma_update(dcp, crtc_state);
 		dcp->desktop->matrix = mat;
 		if (dcp_vrr_update(dcp, crtc_state, dcp_matrix_then_swap))
 			return;
-		iomfb_set_matrix(dcp, false, &mat, dcp_gamma_then_swap, NULL);
-#else
-		iomfb_set_matrix(dcp, false, &mat, do_swap, NULL);
 #endif
+		iomfb_set_matrix(dcp, false, &mat, dcp_set_matrix_done, NULL);
 	} else {
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 		if (dcp_vrr_update(dcp, crtc_state, do_swap))
