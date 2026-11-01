@@ -165,6 +165,8 @@ const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
 /// The service endpoints that request buffers; boot completes once all of
 /// them have theirs.
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
+/// Service endpoints a setup port may announce in its EPMAP.
+const SETUP_MAX_ENDPOINTS: usize = 16;
 const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
 // A request to a service endpoint: the payload goes into the endpoint's
 // message page, (3 << 60) | length announces it, the firmware answers with a
@@ -1014,7 +1016,12 @@ struct SetupState {
     arena: Option<Coherent<[u8]>>,
     /// The next unassigned page of the arena.
     next_page: usize,
-    endpoints: [Option<SetupEndpoint>; SETUP_ENDPOINTS.len()],
+    endpoints: [Option<SetupEndpoint>; SETUP_MAX_ENDPOINTS],
+    /// The service endpoints that must get buffers: T8140's fixed set, or
+    /// those the EPMAP announces.
+    expected: [u8; SETUP_MAX_ENDPOINTS],
+    expected_count: usize,
+    epmap_endpoints: bool,
     map_done: bool,
     ap_ready: bool,
     power_sent: bool,
@@ -1023,12 +1030,21 @@ struct SetupState {
 }
 
 impl SetupState {
-    fn new() -> SetupState {
+    fn new(epmap_endpoints: bool) -> SetupState {
+        let mut expected = [0; SETUP_MAX_ENDPOINTS];
+        let mut expected_count = 0;
+        if !epmap_endpoints {
+            expected[..SETUP_ENDPOINTS.len()].copy_from_slice(&SETUP_ENDPOINTS);
+            expected_count = SETUP_ENDPOINTS.len();
+        }
         SetupState {
             mbox: None,
             arena: None,
             next_page: 0,
-            endpoints: [None; SETUP_ENDPOINTS.len()],
+            endpoints: [None; SETUP_MAX_ENDPOINTS],
+            expected,
+            expected_count,
+            epmap_endpoints,
             map_done: false,
             ap_ready: false,
             power_sent: false,
@@ -1070,7 +1086,8 @@ impl SetupState {
     /// Boot is complete once the AP power state is on and every service
     /// endpoint has its buffers.
     fn ready(&self) -> bool {
-        self.ap_ready && self.endpoint_count() == SETUP_ENDPOINTS.len()
+        self.ap_ready && self.expected_count != 0
+            && self.endpoint_count() == self.expected_count
     }
 
     /// Sends one word to a setup-port endpoint. Callers run in process
@@ -1368,7 +1385,7 @@ impl AopData {
                     required_endpoints: cfg.required_endpoints,
                     setup_queue,
                     setup_lost: Atomic::new(false),
-                    setup <- new_mutex!(SetupState::new()),
+                    setup <- new_mutex!(SetupState::new(cfg.setup_epmap_endpoints)),
                     setup_cv <- new_condvar!(),
                     rtkit <- new_mutex!(None),
                     endpoints <- pin_init::pin_init_array_from_fn(|i| {
@@ -2147,6 +2164,24 @@ impl AopData {
                     // Each fragment of the endpoint map is acknowledged by
                     // echoing it.
                     st.send(SETUP_MGMT_EP, word)?;
+                    if st.epmap_endpoints {
+                        // RTKit layout: a 32-endpoint bitmap, its base in
+                        // bits 32..34. Endpoint 0 is this management one.
+                        let base = ((word >> 32) & 7) as u8 * 32;
+                        dev_dbg!(self.dev, "setup port: EPMAP {:#x}\n", word);
+                        for bit in 0..32u8 {
+                            let ep = base + bit;
+                            if word & (1 << bit) != 0 && ep != SETUP_MGMT_EP
+                                && !st.expected[..st.expected_count].contains(&ep)
+                            {
+                                if st.expected_count == SETUP_MAX_ENDPOINTS {
+                                    return Err(ENOSPC);
+                                }
+                                st.expected[st.expected_count] = ep;
+                                st.expected_count += 1;
+                            }
+                        }
+                    }
                     if word & SETUP_EPMAP_LAST != 0 {
                         st.map_done = true;
                     }
@@ -2203,7 +2238,7 @@ impl AopData {
     /// from the arena.
     fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
         let requested = (word & 0xffff_ffff) as usize;
-        let slot = SETUP_ENDPOINTS
+        let slot = st.expected[..st.expected_count]
             .iter()
             .position(|e| *e == ep)
             .ok_or(EINVAL)?;
@@ -2444,7 +2479,7 @@ impl AopData {
                 "setup port: boot incomplete (AP power on: {}, endpoints: {}/{}): {:?}",
                 st.ap_ready,
                 st.endpoint_count(),
-                SETUP_ENDPOINTS.len(),
+                st.expected_count,
                 e
             );
             return Err(e);
@@ -2510,6 +2545,8 @@ struct AopHwConfig {
     epic_v4: bool,
     /// The firmware boots through a second, "setup", mailbox as well.
     setup_port: bool,
+    /// Its service endpoints are the ones its EPMAP announces, not T8140's.
+    setup_epmap_endpoints: bool,
     /// Shut the co-processor down on unbind and retain its buffers if the
     /// shutdown cannot be confirmed.
     quiesce_on_unbind: bool,
@@ -2530,6 +2567,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_epmap_endpoints: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2542,6 +2580,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_epmap_endpoints: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2554,6 +2593,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_epmap_endpoints: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2566,6 +2606,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_epmap_endpoints: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
     fw_regions: false,
@@ -2582,6 +2623,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
+    setup_epmap_endpoints: false,
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: true,
@@ -2599,8 +2641,43 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     patch_bootargs: false,
     epic_v4: true,
     setup_port: true,
+    setup_epmap_endpoints: false,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
+    fw_regions: false,
+    halt_on_failed_start: false,
+};
+/// T8152: like T8140, but the setup port (mailbox 1 of the AOP bank, and the
+/// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
+const HW_CFG_T8152: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    aopt: 0,
+    alig: 0,
+    patch_bootargs: false,
+    epic_v4: true,
+    setup_port: false,
+    setup_epmap_endpoints: false,
+    quiesce_on_unbind: true,
+    required_endpoints: &[],
+    fw_regions: false,
+    halt_on_failed_start: false,
+};
+
+/// T8142 (M5): booted through a setup port as on T8140, at the ADT's
+/// aop-exclave-mailbox (0x3d067c000, AOP ASC + 0x4007c000, untranslated),
+/// whose EPMAP names the service endpoints (0x4, 0x20, 0x23 and 0x32 on the
+/// MacBook Air J813, not T8140's set). EPIC and AFK as on T8152; the
+/// firmware runs with the boot arguments iBoot left.
+const HW_CFG_T8142: AopHwConfig = AopHwConfig {
+    ec0p: 0,
+    aopt: 0,
+    alig: 0,
+    patch_bootargs: false,
+    epic_v4: true,
+    setup_port: true,
+    setup_epmap_endpoints: true,
+    quiesce_on_unbind: true,
+    required_endpoints: &[],
     fw_regions: false,
     halt_on_failed_start: false,
 };
@@ -2615,6 +2692,8 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
         (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
+        (of::DeviceId::new(c_str!("apple,t8142-aop")), &HW_CFG_T8142),
+        (of::DeviceId::new(c_str!("apple,t8152-aop")), &HW_CFG_T8152),
     ]
 );
 
@@ -2663,7 +2742,14 @@ impl platform::Driver for AopDriver {
                 ],
             )?;
         }
-        let rtkit = rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?;
+        // The T8142 AOP places its own crashlog buffer in its firmware-mapped
+        // DART slot and asks for it on endpoint 1 with that IOVA; take it as
+        // the firmware's instead of refusing the request.
+        let rtkit = if cfg.setup_epmap_endpoints {
+            rtkit::RtKit::<AopData>::new_with_firmware_crashlog(pdev.as_ref(), None, 0, data.clone())?
+        } else {
+            rtkit::RtKit::<AopData>::new(pdev.as_ref(), None, 0, data.clone())?
+        };
         data.rtkit.lock().as_mut().set(Some(rtkit));
         if cfg.setup_port {
             AopData::setup_open(&data, pdev.as_ref())?;

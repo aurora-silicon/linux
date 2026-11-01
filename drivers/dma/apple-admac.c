@@ -127,6 +127,8 @@ struct admac_chan {
 	spinlock_t lock;
 	struct admac_tx *current_tx;
 	int nperiod_acks;
+	/* frame size a paused capture restarts aligned to on resume, or 0 */
+	u32 realign_bytes;
 
 	/*
 	 * We maintain a 'submitted' and 'issued' list mainly for interface
@@ -337,6 +339,21 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 }
 
 /*
+ * Write one hardware descriptor.
+ */
+static void admac_write_hw_desc(struct admac_data *ad, int channo,
+				dma_addr_t addr, size_t len)
+{
+	dev_dbg(ad->dev, "ch%d descriptor: addr=0x%pad len=0x%zx flags=0x%lx\n",
+		channo, &addr, len, FLAG_DESC_NOTIFY);
+
+	writel_relaxed(lower_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(upper_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(len,                 ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(FLAG_DESC_NOTIFY,    ad->base + REG_DESC_WRITE(channo));
+}
+
+/*
  * Write one hardware descriptor for a dmaengine cyclic transaction.
  */
 static bool admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
@@ -352,13 +369,7 @@ static bool admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
 	/* If happens means we have buggy code */
 	WARN_ON_ONCE(addr + tx->period_len > tx->buf_end);
 
-	dev_dbg(ad->dev, "ch%d descriptor: addr=0x%pad len=0x%zx flags=0x%lx\n",
-		channo, &addr, tx->period_len, FLAG_DESC_NOTIFY);
-
-	writel_relaxed(lower_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
-	writel_relaxed(upper_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
-	writel_relaxed(tx->period_len,      ad->base + REG_DESC_WRITE(channo));
-	writel_relaxed(FLAG_DESC_NOTIFY,    ad->base + REG_DESC_WRITE(channo));
+	admac_write_hw_desc(ad, channo, addr, tx->period_len);
 	/* Include a descriptor already consumed while the ring is refilled. */
 	tx->nperiods_outstanding++;
 
@@ -608,6 +619,62 @@ static int admac_pause(struct dma_chan *chan)
 	return 0;
 }
 
+static int admac_drain_reports(struct admac_data *ad, int channo);
+
+/*
+ * Restart a paused cyclic capture at the next frame boundary of the current
+ * period. A source that stopped in the middle of a frame (a serializer that
+ * firmware stops whenever it likes) leaves a partial frame in the buffer, and
+ * without this every later frame would be off by its words. Called with the
+ * channel stopped and the lock held.
+ */
+static void admac_cyclic_realign(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	struct admac_tx *tx = adchan->current_tx;
+	int ch = adchan->no;
+	size_t done, aligned;
+	int nreports;
+
+	/* Periods completed before the pause */
+	nreports = admac_drain_reports(ad, ch);
+	tx->nperiods_outstanding -= min_t(unsigned int, nreports, tx->nperiods_outstanding);
+	adchan->nperiod_acks += nreports;
+	tx->reclaimed_pos += nreports * tx->period_len;
+	tx->reclaimed_pos %= 2 * tx->buf_len;
+
+	done = tx->period_len -
+		min_t(size_t, readl_relaxed(ad->base + REG_RESIDUE(ad, ch)), tx->period_len);
+	aligned = roundup(done, adchan->realign_bytes);
+	if (aligned >= tx->period_len) {
+		adchan->nperiod_acks++;
+		tx->reclaimed_pos += tx->period_len;
+		tx->reclaimed_pos %= 2 * tx->buf_len;
+		aligned = 0;
+	}
+	if (adchan->nperiod_acks)
+		tasklet_schedule(&adchan->tasklet);
+
+	dev_dbg(ad->dev, "ch%d realign: %zu bytes into the period, restart at %zu\n",
+		ch, done, aligned);
+
+	admac_reset_rings(adchan);
+	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
+	/* The reset dropped every descriptor still in the ring. */
+	tx->nperiods_outstanding = 0;
+
+	/* The rest of the current period, then whole periods as before */
+	tx->submitted_pos = tx->reclaimed_pos;
+	admac_write_hw_desc(ad, ch, tx->buf_addr + (tx->submitted_pos % tx->buf_len) + aligned,
+			    tx->period_len - aligned);
+	tx->nperiods_outstanding++;
+	tx->submitted_pos += tx->period_len;
+	tx->submitted_pos %= 2 * tx->buf_len;
+
+	admac_start_chan(adchan);
+	admac_cyclic_write_desc(ad, ch, tx);
+}
+
 static int admac_resume(struct dma_chan *chan)
 {
 	struct admac_chan *adchan = to_admac_chan(chan);
@@ -617,6 +684,9 @@ static int admac_resume(struct dma_chan *chan)
 	spin_lock_irqsave(&adchan->lock, flags);
 	if (adchan->current_tx && adchan->current_tx->error)
 		ret = -EIO;
+	else if (adchan->realign_bytes && adchan->current_tx &&
+		 admac_chan_direction(adchan->no) == DMA_DEV_TO_MEM)
+		admac_cyclic_realign(adchan);
 	else
 		admac_start_chan(adchan);
 	spin_unlock_irqrestore(&adchan->lock, flags);
@@ -961,6 +1031,15 @@ static int admac_device_config(struct dma_chan *chan,
 	}
 
 	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(ad, adchan->no));
+
+	/*
+	 * Optional: a u32 frame size in bytes, which a paused capture is
+	 * restarted aligned to on resume (see admac_cyclic_realign()).
+	 */
+	if (config->peripheral_config && config->peripheral_size == sizeof(u32))
+		adchan->realign_bytes = *(u32 *)config->peripheral_config;
+	else
+		adchan->realign_bytes = 0;
 
 	/*
 	 * By FIFOCTL_LIMIT we seem to set the maximal number of bytes allowed to be

@@ -63,6 +63,8 @@ struct tas2764_priv {
 
 	int v_sense_slot;
 	int i_sense_slot;
+	/* TAS2764_CLK_CFG value for a fixed BCLK/FS ratio, or -1 to auto-detect */
+	int bclk_ratio_code;
 
 	bool dac_powered;
 	bool unmuted;
@@ -1000,6 +1002,19 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 		break;
 	}
 
+	if (tas2764->bclk_ratio_code >= 0) {
+		ret = snd_soc_component_write(component, TAS2764_CLK_CFG,
+					      tas2764->bclk_ratio_code);
+		if (ret < 0)
+			return ret;
+
+		ret = snd_soc_component_update_bits(component, TAS2764_TDM_CFG0,
+						    TAS2764_TDM_CFG0_FIXED_RATIO,
+						    TAS2764_TDM_CFG0_FIXED_RATIO);
+		if (ret < 0)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -1112,9 +1127,24 @@ static const struct regmap_config tas2764_i2c_regmap = {
 	.max_register = 0xffff,
 };
 
+/*
+ * BCLK/FS ratios and the TAS2764_CLK_CFG value that makes the amplifier
+ * accept them. Only the J873 speaker frame (250 BCLKs, which the ratio
+ * auto-detection rejects with "bad TDM clock") is verified on hardware;
+ * other ratios are left to the auto-detection.
+ */
+static const struct {
+	u16 ratio;
+	u8 code;
+} tas2764_bclk_ratio_codes[] = {
+	{ 250, 0x30 },
+};
+
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
+	u32 ratio;
 	int ret = 0;
+	int i;
 
 	tas2764->sdz_reg = devm_regulator_get(dev, "SDZ");
 	if (IS_ERR(tas2764->sdz_reg))
@@ -1148,6 +1178,15 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 	if (ret)
 		tas2764->v_sense_slot = -1;
 
+	if (!fwnode_property_read_u32(dev->fwnode, "ti,bclk-ratio", &ratio)) {
+		for (i = 0; i < ARRAY_SIZE(tas2764_bclk_ratio_codes); i++)
+			if (tas2764_bclk_ratio_codes[i].ratio == ratio)
+				tas2764->bclk_ratio_code = tas2764_bclk_ratio_codes[i].code;
+		if (tas2764->bclk_ratio_code < 0)
+			return dev_err_probe(dev, -EINVAL,
+					     "unsupported ti,bclk-ratio %u\n", ratio);
+	}
+
 	return tas2764_group_join(dev, tas2764);
 }
 
@@ -1165,6 +1204,8 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 
 	tas2764->dev = &client->dev;
 	tas2764->irq = client->irq;
+	/* Auto-detect the ratio unless the firmware node sets one. */
+	tas2764->bclk_ratio_code = -1;
 	i2c_set_clientdata(client, tas2764);
 	dev_set_drvdata(&client->dev, tas2764);
 

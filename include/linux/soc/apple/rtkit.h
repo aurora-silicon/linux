@@ -58,6 +58,13 @@ struct apple_rtkit_inherited_buffer {
 #define APPLE_RTKIT_NEEDS_COREANALYTICS	BIT(1)
 
 /*
+ * The co-processor keeps its crash buffer in memory it maps itself (the T8142
+ * AOP) and asks for it with that IOVA: take the buffer as the firmware's,
+ * without a CPU mapping, and acknowledge the request unchanged.
+ */
+#define APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG	BIT(2)
+
+/*
  * Struct to represent implementation-specific RTKit operations.
  *
  * @flags:         Combination of APPLE_RTKIT_* flags describing the

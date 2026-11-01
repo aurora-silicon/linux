@@ -410,6 +410,13 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
 		request.size, &request.iova);
 
+	if ((rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG) &&
+	    ep == APPLE_RTKIT_EP_CRASHLOG && request.iova) {
+		*buffer = request;
+		buffer->is_mapped = true;
+		return apple_rtkit_send_message(rtk, ep, msg, NULL, false);
+	}
+
 	if (request.iova && !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
 		err = -EINVAL;
 		goto error;
@@ -733,6 +740,14 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
+
+	/* A firmware-owned crash buffer has no CPU mapping to read the log from. */
+	if (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem) {
+		rtk->crashed = true;
+		if (rtk->ops->crashed)
+			rtk->ops->crashed(rtk->cookie, NULL, 0);
+		return;
+	}
 
 	/*
 	 * create a shadow copy here to make sure the co-processor isn't able
