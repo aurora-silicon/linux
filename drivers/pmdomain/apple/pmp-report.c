@@ -46,6 +46,9 @@
  * struct apple_pmp_report_offsets - per-SoC layout of the report region
  * @tgt_read: power state request, read side
  * @tgt_write: power state request, write side
+ * @update: update aperture base offset (8 bytes per entry)
+ * @dvfs_first: first qualified SOC-DEV-DVFS entry
+ * @dvfs_count: number of qualified SOC-DEV-DVFS entries
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
@@ -91,7 +94,7 @@ struct apple_pmp_report {
 	struct device *ane_owner;
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
-	/* Protects the request word, @shadow, @known and @defer. */
+	/* Protects the request word, request caches and @defer. */
 	spinlock_t lock;
 	struct list_head list;
 	struct dentry *debugfs;
@@ -100,6 +103,9 @@ struct apple_pmp_report {
 	/* Requests made through entries: bits requested on, all bits. */
 	u64 shadow;
 	u64 known;
+	/* Last host DVFS stores, indexed relative to offsets->dvfs_first. */
+	u64 dvfs_known;
+	u8 dvfs_levels[64];
 	/* Requests are held in memory until the PMP runs (@defer_requests). */
 	bool defer;
 	unsigned int polls;
@@ -344,16 +350,33 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
 static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st);
 
-/* Read only the documented status and fast-die entries, never the aperture. */
+/* Never read DVFS requests: that can retire a pending update. Show host caches. */
 static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_pmp_report *rep = s->private;
 	const struct apple_pmp_report_offsets *offs = rep->offsets;
 	bool running = apple_pmp_report_running(rep);
 	unsigned int lane;
+	unsigned long flags;
+	u64 known, shadow, dvfs_known;
+	u8 levels[64];
 	u32 effort;
 
+	spin_lock_irqsave(&rep->lock, flags);
+	known = rep->known;
+	shadow = rep->shadow;
+	dvfs_known = rep->dvfs_known;
+	memcpy(levels, rep->dvfs_levels, sizeof(levels));
+	spin_unlock_irqrestore(&rep->lock, flags);
+
 	seq_printf(s, "running: %u\n", running);
+	seq_printf(s, "requests_known: %#llx\nrequests_on: %#llx\n", known, shadow);
+	if (running)
+		seq_printf(s, "acknowledged: %#llx\n", readq(rep->base + offs->actual));
+	for (lane = 0; lane < ARRAY_SIZE(levels); lane++)
+		if (dvfs_known & BIT_ULL(lane))
+			seq_printf(s, "dvfs_request@%x: %u (host)\n",
+				   offs->dvfs_first + lane, levels[lane]);
 	if (rep->start)
 		apple_pmp_start_show(s, rep->start);
 	if (!running || !offs->fast_die)
@@ -1485,6 +1508,10 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t6041 = {
 	.tgt_read = 0x1e00,
 	.tgt_write = 0x10f00,
+	.update = 0x10000,
+	/* Only the qualified AVD0 SOC-DEV-DVFS entry. */
+	.dvfs_first = 0x1fd,
+	.dvfs_count = 1,
 	.actual = 0x1e80,
 	.status = 0x10,
 	.fast_die = 0x2580,
@@ -1650,7 +1677,14 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
  */
 static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val)
 {
+	unsigned int index = entry - rep->offsets->dvfs_first;
+	unsigned long flags;
+
+	spin_lock_irqsave(&rep->lock, flags);
 	writeq(val, rep->base + rep->offsets->update + 8 * entry);
+	rep->dvfs_levels[index] = val & 0x1f;
+	rep->dvfs_known |= BIT_ULL(index);
+	spin_unlock_irqrestore(&rep->lock, flags);
 }
 
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
@@ -1666,6 +1700,12 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node != ent->report_node)
 			continue;
+		/* DVFS must follow an acknowledged, non-deferred residency request. */
+		if (ent->dvfs &&
+		    (READ_ONCE(rep->defer) || !apple_pmp_report_running(rep))) {
+			ret = -EAGAIN;
+			break;
+		}
 		/* The device request is admitted first and the level dropped first. */
 		if (ent->dvfs && !enable)
 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, PMP_DVFS_VALID);
@@ -1830,6 +1870,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 
 		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
 		if (ret || !rep || !rep->offsets->update || dvfs[1] > 0x1f ||
+		    rep->offsets->dvfs_count > ARRAY_SIZE(rep->dvfs_levels) ||
 		    dvfs[0] < rep->offsets->dvfs_first ||
 		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count) {
 			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
