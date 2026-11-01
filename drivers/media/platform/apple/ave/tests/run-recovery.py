@@ -19,7 +19,7 @@ def main():
     code += '#define HZ 1000\n#define time_before(a, b) ((long)((a) - (b)) < 0)\n'
     code += source((src / 'ave-recovery.h').read_text())
     for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS', 'AVE_MAX_SESSIONS',
-                 'AVE_MCTF_BUFS'):
+                 'AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS', 'AVE_MCTF_OUT_BUFS'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     code += source((src / 'ave-regs.h').read_text())
     code += 'struct vb2_v4l2_buffer;\n'

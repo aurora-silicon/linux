@@ -276,6 +276,9 @@ struct ave_slot {
 #define AVE_TILE_BUFS 8
 /* Start surfaces of an MCTF session, aliases included */
 #define AVE_MCTF_BUFS 72
+/* MCTF picture surfaces: inputs used in turn, one output per slot */
+#define AVE_MCTF_IN_BUFS 5
+#define AVE_MCTF_OUT_BUFS 2
 
 struct ave_session {
 	struct ave_session *failed_next;
@@ -298,6 +301,8 @@ struct ave_session {
 	const struct ave_mctf_layout *mctf;
 	struct ave_buf mctf_buf[AVE_MCTF_BUFS];
 	dma_addr_t mctf_iova[AVE_MCTF_BUFS];
+	struct ave_buf mctf_in[AVE_MCTF_IN_BUFS];
+	struct ave_buf mctf_out[AVE_MCTF_OUT_BUFS];
 	/* Header words; zero means the encoder's values */
 	u32 unit, arg1, frame_arg0;
 	u8 done_fifo[AVE_MAX_SLOTS];

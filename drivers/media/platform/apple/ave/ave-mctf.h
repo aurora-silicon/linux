@@ -18,6 +18,7 @@
 #define AVE_MCTF_WIDTH		1920
 #define AVE_MCTF_HEIGHT		1080
 #define AVE_MCTF_SLOTS		2
+#define AVE_MCTF_INPUTS		5
 
 /*
  * Filter level, written raw to every Process command. macOS uses 16 for the
@@ -48,13 +49,17 @@ struct ave_mctf_slot_ref {
 };
 
 /*
- * A picture: one 0x40-byte entry per component (Y, then CbCr): data at
- * +0x00 {u64 address, u32 bytes, u32 row bytes}, the compression header
- * plane at +0x10 (zero for linear pictures), width and height at +0x24 and
- * +0x28 (CbCr in sample pairs), row bytes again at +0x34.
+ * A picture is a compressed surface in four planes, each {u64 address,
+ * u32 bytes, u32 row bytes}: Y data, Y header, CbCr data, CbCr header, at
+ * these Process offsets. Sizes, row bytes and dimensions are constant words.
  */
-struct ave_mctf_nv12 {
-	u32 y, uv;
+struct ave_mctf_picture {
+	u32 y, y_hdr, c, c_hdr;
+};
+
+/* Where the planes sit inside one driver-owned surface (as macOS lays them) */
+struct ave_mctf_surface_form {
+	u32 y_hdr, c, c_hdr, bytes;
 };
 
 struct ave_mctf_layout {
@@ -69,7 +74,9 @@ struct ave_mctf_layout {
 	const struct ave_mctf_surface *surfaces;
 	unsigned int n_surfaces;
 	struct ave_mctf_slot_ref slot_refs[2];
-	struct ave_mctf_nv12 input, output;
+	struct ave_mctf_picture input, output;
+	struct ave_mctf_surface_form form;
+	u32 inputs;	/* input surfaces, used in turn */
 	u32 width, height;	/* input geometry */
 	u32 first_frame, first_value, next_value;
 	u32 slot, frame, level;
@@ -78,7 +85,7 @@ struct ave_mctf_layout {
 };
 
 struct ave_mctf_frame {
-	dma_addr_t in, out;	/* NV12, chroma right after the luma lines */
+	dma_addr_t in, out;	/* input and output surfaces (base addresses) */
 	u32 stride, width, height;
 	u32 slot, frame, level;
 };

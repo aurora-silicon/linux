@@ -40,7 +40,8 @@ def build(src, out, baseline):
                  'AVE_MAX_SESSIONS', 'AVE_FW_TEXT_CRC_9003_78_0'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     # Later additions; an older baseline does not define them.
-    for name in ('AVE_FW_TEXT_CRC_T6040_25G83', 'AVE_MCTF_BUFS'):
+    for name in ('AVE_FW_TEXT_CRC_T6040_25G83', 'AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS',
+                 'AVE_MCTF_OUT_BUFS'):
         m = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
         if m:
             code += m[0] + '\n'

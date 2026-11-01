@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * MCTF Start and Process images against the MacBook Neo captures: every
- * constant word macOS set in six sessions (header words included), the
- * surface addresses, and the per-frame words over the first seven frames.
+ * constant word macOS set in six sessions (header words included, Process
+ * picture geometry too), the surface addresses, and the per-frame words over
+ * the first seven frames.
  * The expected tables here are kept apart from the driver's own tables.
  *
  * Copyright The Aurora Silicon Contributors
@@ -145,13 +146,6 @@ static const struct ave_mctf_word t_process_const[] = {
 	{ 0xade4, 0x3c0 }, { 0xade8, 0x21c }, { 0xadf4, 0x7800 },
 };
 
-/* Captured picture words, rewritten for linear NV12 (width/height included) */
-static const u32 t_process_planes[] = {
-	0xa308, 0xa30c, 0xa318, 0xa324, 0xa328, 0xa334, 0xa348, 0xa34c,
-	0xa358, 0xa364, 0xa368, 0xa374, 0xad88, 0xad8c, 0xad98, 0xada4,
-	0xada8, 0xadb4, 0xadc8, 0xadcc, 0xadd8, 0xade4, 0xade8, 0xadf4,
-};
-
 /* Captured per-frame address words (their high words are constants) */
 static const u32 t_process_addr[] = {
 	0xa300, 0xa310, 0xa340, 0xa350, 0xac88, 0xac90, 0xad80, 0xad90,
@@ -270,14 +264,13 @@ static void ave_mctf_start_image(struct kunit *test)
 	KUNIT_EXPECT_GE(test, t.l->surfaces[0].alloc, 0x12c000U);
 }
 
-static void t_picture(u8 *exp, u32 off, u64 addr, u32 bytes, u32 w, u32 h)
+/* A surface: Y, Y header +0x1fe000, CbCr +0x21e000, CbCr header +0x31d000 */
+static void t_picture(u8 *exp, u32 off, u64 base)
 {
-	put_unaligned_le64(addr, exp + off);
-	put_unaligned_le32(bytes, exp + off + 0x08);
-	put_unaligned_le32(1920, exp + off + 0x0c);
-	put_unaligned_le32(w, exp + off + 0x24);
-	put_unaligned_le32(h, exp + off + 0x28);
-	put_unaligned_le32(1920, exp + off + 0x34);
+	put_unaligned_le64(base, exp + off);
+	put_unaligned_le64(base + 0x1fe000, exp + off + 0x10);
+	put_unaligned_le64(base + 0x21e000, exp + off + 0x40);
+	put_unaligned_le64(base + 0x31d000, exp + off + 0x50);
 }
 
 /* Process over frames 0..6, as macOS sent them, byte for byte. */
@@ -287,7 +280,6 @@ static void ave_mctf_process_frames(struct kunit *test)
 	u8 *start = kunit_kzalloc(test, T_START_BYTES, GFP_KERNEL);
 	u8 *cmd = kunit_kzalloc(test, T_PROCESS_BYTES, GFP_KERNEL);
 	u8 *exp = kunit_kzalloc(test, T_PROCESS_BYTES, GFP_KERNEL);
-	const u32 luma = 1920 * 1080;
 	struct t_mctf t;
 
 	KUNIT_ASSERT_NOT_NULL(test, start);
@@ -298,9 +290,9 @@ static void ave_mctf_process_frames(struct kunit *test)
 	t_build_start(test, &t, start);
 
 	for (u32 n = 0; n < ARRAY_SIZE(levels); n++) {
-		/* A five-picture input ring, as the camera hands them over */
+		/* Five input surfaces in turn, one output surface per slot */
 		u64 in = 0x900000000ULL + (n % 5) * 0x400000;
-		u64 out = 0x980000000ULL + (n % 3) * 0x400000;
+		u64 out = 0x980000000ULL + (n == 1) * 0x400000;
 		u32 slot = n == 1;	/* macOS: the second frame goes in slot 1 */
 		struct ave_mctf_frame f = {
 			.in = in, .out = out, .stride = 1920, .width = 1920,
@@ -318,8 +310,7 @@ static void ave_mctf_process_frames(struct kunit *test)
 		for (unsigned int i = 0; i < ARRAY_SIZE(t_process_const); i++) {
 			u32 off = t_process_const[i].off;
 
-			if (t_listed(t_process_planes, ARRAY_SIZE(t_process_planes), off) ||
-			    t_listed(t_process_addr, ARRAY_SIZE(t_process_addr), off - 4))
+			if (t_listed(t_process_addr, ARRAY_SIZE(t_process_addr), off - 4))
 				continue;
 			put_unaligned_le32(t_process_const[i].val, exp + off);
 		}
@@ -337,14 +328,9 @@ static void ave_mctf_process_frames(struct kunit *test)
 				   exp + 0xac90);
 		put_unaligned_le32(n, exp + 0xacf8);
 		put_unaligned_le32(levels[n], exp + 0xad68);
-		/*
-		 * Linear NV12 in the captured picture entries: no header
-		 * planes, linear bytes and row bytes, the captured sizes.
-		 */
-		t_picture(exp, 0xa300, in, luma, 1920, 1080);
-		t_picture(exp, 0xa340, in + luma, luma / 2, 960, 540);
-		t_picture(exp, 0xad80, out, luma, 1920, 1080);
-		t_picture(exp, 0xadc0, out + luma, luma / 2, 960, 540);
+		/* The input and output surfaces, every other word as captured */
+		t_picture(exp, 0xa300, in);
+		t_picture(exp, 0xad80, out);
 		KUNIT_EXPECT_MEMEQ_MSG(test, cmd, exp, T_PROCESS_BYTES, "frame %u", n);
 	}
 	/* The two slots use different surfaces. */

@@ -335,7 +335,8 @@ int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
 
 	if (!l)
 		return -EOPNOTSUPP;
-	if (l->n_surfaces > AVE_MCTF_BUFS || l->slots > AVE_MAX_SLOTS)
+	if (l->n_surfaces > AVE_MCTF_BUFS || l->slots > AVE_MAX_SLOTS ||
+	    l->slots > AVE_MCTF_OUT_BUFS || l->inputs > AVE_MCTF_IN_BUFS)
 		return -EINVAL;
 	*p = (struct ave_params){
 		.codec = AVE_CODEC_HEVC,	/* the selector-2 carriers */
@@ -374,6 +375,15 @@ int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
 	}
 	for (unsigned int i = 0; i < l->n_surfaces; i++)
 		sess->mctf_iova[i] = sess->mctf_buf[i].dma;
+	/* Picture surfaces: the CPU moves pictures in and out of them. */
+	for (unsigned int i = 0; i < l->inputs && !ret; i++)
+		ret = ave_alloc(ave, &sess->mctf_in[i], l->form.bytes, 0);
+	for (unsigned int i = 0; i < l->slots && !ret; i++)
+		ret = ave_alloc(ave, &sess->mctf_out[i], l->form.bytes, 0);
+	if (ret) {
+		dev_err(ave->dev, "no DMA space for the MCTF picture surfaces\n");
+		return -ENOMEM;
+	}
 	dev_dbg(ave->dev, "MCTF session: %u surfaces, %zu KiB mapped\n", n, mapped >> 10);
 	return 0;
 }
@@ -403,6 +413,10 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->hevc_extra[i]);
 	for (unsigned int i = 0; i < AVE_MCTF_BUFS; i++)
 		ave_free(ave, &sess->mctf_buf[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_IN_BUFS; i++)
+		ave_free(ave, &sess->mctf_in[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_OUT_BUFS; i++)
+		ave_free(ave, &sess->mctf_out[i]);
 	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++) {
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);

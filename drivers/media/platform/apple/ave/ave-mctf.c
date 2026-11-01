@@ -10,13 +10,19 @@
  * header, the input and output pictures, the slot and its two surfaces,
  * the first-frame word, the frame index and the filter level.
  *
- * The camera hands macOS compressed pictures (a data and a header plane per
- * component, in 0x40-byte plane entries). This driver takes linear NV12
- * in the same picture entries (see ave-mctf.h), with no header planes and
- * the linear sizes and row bytes in place of the compressed ones. The
- * encoder's linear form (CbCr at +0x20) made the first Process hang on the
- * Neo: in this client +0x24 and +0x28 of a picture are its width and
- * height, so the CbCr address was read as a luma size.
+ * The client filters compressed surfaces: four planes per picture (Y data,
+ * Y header, CbCr data, CbCr header). The camera hands macOS such surfaces;
+ * here the input and output surfaces are driver-owned, five inputs used in
+ * turn and one output per slot, as macOS does. The Neo answers every
+ * Process in this form (the earlier linear descriptors made it hang, then
+ * fault on header planes at address 0). The slot's Start surfaces at
+ * +0xac88/+0xac90 are firmware-owned; a user picture copied to +0xac88
+ * came back untouched, so it is not the picture path.
+ *
+ * Moving pictures between V4L2 NV12 and these surfaces is not solved: the
+ * header format is unknown. Until it is, the driver copies NV12 rows into
+ * the data planes with zeroed headers and copies the output data planes
+ * back; see ave-mctf-v4l2.c.
  *
  * Copyright The Aurora Silicon Contributors
  */
@@ -122,13 +128,21 @@ static const struct ave_mctf_surface ave_mctf_surfaces_25g83[] = {
 #undef S
 #undef ALIAS
 
-/* Process words other than the header, the pictures and the frame fields */
+/* Process words other than the header, the surface addresses and the frame fields */
 static const struct ave_mctf_word ave_mctf_process_25g83[] = {
 	{ 0xb4c, 0x5 }, { 0xb50, 0x5 }, { 0xd7c, 0x1 },
 	{ 0x6158, 0x1 }, { 0x74cc, 0xffffffff }, { 0x74dc, 0x10000 },
+	{ 0xa308, 0x1fe000 }, { 0xa30c, 0xf000 }, { 0xa318, 0x20000 },
+	{ 0xa324, 0x780 }, { 0xa328, 0x438 }, { 0xa334, 0xf000 },
+	{ 0xa348, 0xff000 }, { 0xa34c, 0x7800 }, { 0xa358, 0x8000 },
+	{ 0xa364, 0x3c0 }, { 0xa368, 0x21c }, { 0xa374, 0x7800 },
 	{ 0xa3b8, 0x780 }, { 0xa3bc, 0x438 }, { 0xac98, 0x2f8000 },
 	{ 0xad08, 0x5 }, { 0xad3c, 0x403e0000 }, { 0xad60, 0x1 },
-	{ 0xad74, 0x3ff00000 },
+	{ 0xad74, 0x3ff00000 }, { 0xad88, 0x1fe000 }, { 0xad8c, 0xf000 },
+	{ 0xad98, 0x20000 }, { 0xada4, 0x780 }, { 0xada8, 0x438 },
+	{ 0xadb4, 0xf000 }, { 0xadc8, 0xff000 }, { 0xadcc, 0x7800 },
+	{ 0xadd8, 0x8000 }, { 0xade4, 0x3c0 }, { 0xade8, 0x21c },
+	{ 0xadf4, 0x7800 },
 };
 
 #define AVE_MCTF_25G83(crc, ok)						\
@@ -147,8 +161,11 @@ static const struct ave_mctf_word ave_mctf_process_25g83[] = {
 		/* the slot's output and statistics surfaces */		\
 		.slot_refs = { { 0xac88, 0xd50, 0x10 },			\
 			       { 0xac90, 0xf50, 0x10 } },		\
-		.input = { 0xa300, 0xa340 },				\
-		.output = { 0xad80, 0xadc0 },				\
+		.input = { 0xa300, 0xa310, 0xa340, 0xa350 },		\
+		.output = { 0xad80, 0xad90, 0xadc0, 0xadd0 },		\
+		.form = { .y_hdr = 0x1fe000, .c = 0x21e000,		\
+			  .c_hdr = 0x31d000, .bytes = 0x325000 },	\
+		.inputs = AVE_MCTF_INPUTS,				\
 		.width = 0xa3b8, .height = 0xa3bc,			\
 		.first_frame = 0x5d90, .first_value = 5,		\
 		.next_value = 4,					\
@@ -227,15 +244,13 @@ int ave_mctf_build_start(const struct ave_mctf_layout *l, u8 *cmd, size_t len,
 	return 0;
 }
 
-static void ave_mctf_plane(u8 *cmd, u32 off, u64 addr, u32 bytes, u32 stride,
-			   u32 width, u32 height)
+static void ave_mctf_put_surface(u8 *cmd, const struct ave_mctf_picture *p,
+				 const struct ave_mctf_surface_form *form, u64 base)
 {
-	put_unaligned_le64(addr, cmd + off);
-	put_unaligned_le32(bytes, cmd + off + 0x08);
-	put_unaligned_le32(stride, cmd + off + 0x0c);
-	put_unaligned_le32(width, cmd + off + 0x24);
-	put_unaligned_le32(height, cmd + off + 0x28);
-	put_unaligned_le32(stride, cmd + off + 0x34);
+	put_unaligned_le64(base, cmd + p->y);
+	put_unaligned_le64(base + form->y_hdr, cmd + p->y_hdr);
+	put_unaligned_le64(base + form->c, cmd + p->c);
+	put_unaligned_le64(base + form->c_hdr, cmd + p->c_hdr);
 }
 
 /* Process for one frame; the caller writes the header (subtype base + slot). */
@@ -243,7 +258,6 @@ int ave_mctf_build_process(const struct ave_mctf_layout *l, u8 *cmd,
 			   size_t len, const dma_addr_t *surf,
 			   const struct ave_mctf_frame *f)
 {
-	u32 luma = f->stride * f->height;
 	int ret;
 
 	if (!l || !l->qualified)
@@ -257,14 +271,8 @@ int ave_mctf_build_process(const struct ave_mctf_layout *l, u8 *cmd,
 	ret = ave_mctf_words(cmd, len, l->process_words, l->n_process_words);
 	if (ret)
 		return ret;
-	ave_mctf_plane(cmd, l->input.y, f->in, luma, f->stride, f->width,
-		       f->height);
-	ave_mctf_plane(cmd, l->input.uv, f->in + luma, luma / 2, f->stride,
-		       f->width / 2, f->height / 2);
-	ave_mctf_plane(cmd, l->output.y, f->out, luma, f->stride, f->width,
-		       f->height);
-	ave_mctf_plane(cmd, l->output.uv, f->out + luma, luma / 2, f->stride,
-		       f->width / 2, f->height / 2);
+	ave_mctf_put_surface(cmd, &l->input, &l->form, f->in);
+	ave_mctf_put_surface(cmd, &l->output, &l->form, f->out);
 	put_unaligned_le32(f->width, cmd + l->width);
 	put_unaligned_le32(f->height, cmd + l->height);
 	put_unaligned_le32(f->frame ? l->next_value : l->first_value,
@@ -326,6 +334,31 @@ int ave_mctf_cmd_start(struct ave_ctx *ctx)
 	return ave_ipc_settle(ave, AVE_START_WAIT_MS);
 }
 
+/*
+ * Fill input surface @n from the NV12 picture in @src: luma and chroma rows
+ * into the data planes, headers zero. Whether zero headers make the client
+ * read the data planes as plain rows is not established yet.
+ */
+static int ave_mctf_put_picture(struct ave_ctx *ctx, struct vb2_v4l2_buffer *src,
+				unsigned int n)
+{
+	const struct ave_session *sess = ctx->sess;
+	const struct ave_mctf_surface_form *form = &sess->mctf->form;
+	const struct ave_params *p = &sess->p;
+	u32 luma = p->stride * p->height;
+	u8 *to = sess->mctf_in[n].cpu;
+	const u8 *from = vb2_plane_vaddr(&src->vb2_buf, 0);
+
+	if (!to || !from)
+		return -EFAULT;
+	from += src->vb2_buf.planes[0].data_offset;
+	memcpy(to, from, luma);
+	memcpy(to + form->c, from + luma, luma / 2);
+	memset(to + form->y_hdr, 0, form->c - form->y_hdr);
+	memset(to + form->c_hdr, 0, form->bytes - form->c_hdr);
+	return 0;
+}
+
 /* Filter @src into @dst in @slot. Caller holds hw_lock. */
 int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 			 struct vb2_v4l2_buffer *src,
@@ -349,11 +382,11 @@ int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 
 	if (!l || slot >= sess->p.slots)
 		return -EINVAL;
-	f.in = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0) +
-	       src->vb2_buf.planes[0].data_offset;
-	f.out = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
-	if (!IS_ALIGNED(f.in, 64) || !IS_ALIGNED(f.out, 64))
-		return -EINVAL;
+	ret = ave_mctf_put_picture(ctx, src, sess->frames % AVE_MCTF_INPUTS);
+	if (ret)
+		return ret;
+	f.in = sess->mctf_in[sess->frames % AVE_MCTF_INPUTS].dma;
+	f.out = sess->mctf_out[slot].dma;
 	ret = ave_ipc_wait_ack(ave, buf);
 	if (ret)
 		return ret;

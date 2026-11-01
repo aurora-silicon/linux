@@ -223,6 +223,47 @@ static int ave_mctf_job_ready(void *priv)
 		v4l2_m2m_num_dst_bufs_ready(m2m));
 }
 
+static unsigned int ave_mctf_nonzero(const u8 *p, size_t len)
+{
+	unsigned int n = 0;
+
+	for (size_t i = 0; i < len; i++)
+		n += !!p[i];
+	return n;
+}
+
+/*
+ * Copy the output surface of @slot into @dst: the data planes as NV12
+ * rows. That is the picture only if the client writes plain rows, which is
+ * not established; the debug log shows the header planes it wrote.
+ */
+static int ave_mctf_get_picture(struct ave_ctx *ctx, unsigned int slot,
+				struct vb2_v4l2_buffer *dst)
+{
+	const struct ave_session *sess = ctx->sess;
+	const struct ave_mctf_surface_form *form = &sess->mctf->form;
+	u32 luma = sess->p.stride * sess->p.height;
+	const u8 *from = sess->mctf_out[slot].cpu;
+	u8 *to = vb2_plane_vaddr(&dst->vb2_buf, 0);
+
+	if (!from || !to)
+		return -EFAULT;
+	memcpy(to, from, luma);
+	memcpy(to + luma, from + form->c, luma / 2);
+	dev_dbg(ctx->ave->dev,
+		"MCTF output slot %u: non-zero header bytes Y %u/%#x CbCr %u/%#x\n",
+		slot, ave_mctf_nonzero(from + form->y_hdr, form->c - form->y_hdr),
+		form->c - form->y_hdr,
+		ave_mctf_nonzero(from + form->c_hdr, form->bytes - form->c_hdr),
+		form->bytes - form->c_hdr);
+	print_hex_dump_debug("mctf out Y hdr: ", DUMP_PREFIX_OFFSET, 16, 1,
+			     from + form->y_hdr, 64, false);
+	print_hex_dump_debug("mctf out Y: ", DUMP_PREFIX_OFFSET, 16, 1, from, 64, false);
+	print_hex_dump_debug("mctf out C hdr: ", DUMP_PREFIX_OFFSET, 16, 1,
+			     from + form->c_hdr, 32, false);
+	return 0;
+}
+
 /* Hand answered frames back, in answer order. Caller holds hw_lock. */
 static void ave_mctf_deliver(struct ave_ctx *ctx)
 {
@@ -239,6 +280,8 @@ static void ave_mctf_deliver(struct ave_ctx *ctx)
 					     ctx->dst_sequence, s->status);
 			state = VB2_BUF_STATE_ERROR;
 		}
+		if (state == VB2_BUF_STATE_DONE && ave_mctf_get_picture(ctx, slot, s->dst))
+			state = VB2_BUF_STATE_ERROR;
 		vb2_set_plane_payload(&s->dst->vb2_buf, 0,
 				      state == VB2_BUF_STATE_DONE ?
 				      ctx->dst_fmt.plane_fmt[0].sizeimage : 0);
