@@ -571,6 +571,13 @@ struct apple_dcp {
 	bool output_pq;
 	bool output_edr;
 	bool edr_sent;
+	/*
+	 * EDR headroom the panel was last given, x1000 (0: not in use), and
+	 * a power off since, after which the ramp starts again from 1.0 (see
+	 * dcp_edr_prepare()).
+	 */
+	u32 edr_hm;
+	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
