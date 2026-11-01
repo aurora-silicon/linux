@@ -12,8 +12,14 @@
 
 #include "ane.h"
 
-/* Amortize clock transitions across a stream of short submissions. */
-#define ANE_PERF_IDLE_MS 32
+/*
+ * Amortize clock transitions across a stream of short submissions. A camera
+ * pipeline submits once per frame, 33 to 42 ms apart at 30 to 24 fps, so a
+ * shorter hold drops the clock and bandwidth requests between frames and
+ * every frame pays to raise them again. 100 ms covers streams down to 10 fps,
+ * the same hold the CPU boost uses.
+ */
+#define ANE_PERF_IDLE_MS 100
 
 static int ane_perf_drop(struct ane_device *ane)
 {

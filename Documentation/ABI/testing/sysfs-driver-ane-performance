@@ -6,7 +6,7 @@ Description:
                 when the device tree does not describe a supported controller.
                 This is a firmware request, not a measured clock frequency.
                 Work raises the level from the SoC match data. It drops to 0
-                after 32 ms without a submission. A stream amortizes the clock
+                after 100 ms without a submission. A stream amortizes the clock
                 transition cost; the first job after idle includes that cost.
                 The runtime PM reference covers the entire request lifetime.
 
