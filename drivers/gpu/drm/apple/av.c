@@ -27,8 +27,10 @@ struct dcp_av_audio_cmds {
 	u32 close;
 	u32 prepare;
 	u32 start_link;
+	u32 did_start_link;
+	u32 will_stop_link;
 	u32 stop_link;
-	u32 unprepare;
+	u32 complete;
 	/* commands in group 1*/
 	u32 get_elements;
 	u32 get_product_attrs;
@@ -40,7 +42,7 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v12_3 = {
 	.prepare = 8,
 	.start_link = 9,
 	.stop_link = 12,
-	.unprepare = 13,
+	.complete = 13,
 	.get_elements = 18,
 	.get_product_attrs = 20,
 };
@@ -50,8 +52,10 @@ static const struct dcp_av_audio_cmds dcp_av_audio_cmds_v13_5 = {
 	.close = 5,
 	.prepare = 6,
 	.start_link = 7,
+	.did_start_link = 8,
+	.will_stop_link = 9,
 	.stop_link = 10,
-	.unprepare = 11,
+	.complete = 11,
 	.get_elements = 16,
 	.get_product_attrs = 18,
 };
@@ -246,7 +250,7 @@ int dcp_audiosrv_unprepare(struct device *dev)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
-	ret = afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, NULL, 0, 64,
+	ret = afk_service_call(asrv->srv, 0, asrv->cmds.complete, NULL, 0, 64,
 			       NULL, 0, 64);
 	up_write(&asrv->srv_rwsem);
 
@@ -388,28 +392,43 @@ bool dcp_audiosrv_link_on(struct device *dev, u64 gen)
 	return asrv->open_srv && asrv->open_gen == gen && asrv->link_gen == gen;
 }
 
-/*
- * The link commands of the 14.7 external role's audio service, the native
- * audio driver's: prepare, start, stop and complete all take the selected
- * element's 32-byte link data at body+0 and link source 0 at +32, and
- * answer a status at body+48.
- */
+/* All link methods carry IOAVAudioLinkData, IOAVLinkSource and a status at +48. */
+static int av_audiosrv_link_call(struct apple_epic_service *srv, u32 command,
+				const u8 body[64])
+{
+	u8 reply[64];
+	int ret;
+
+	ret = av_audiosrv_call(srv, command, body, 64, 0, reply, sizeof(reply));
+	if (ret)
+		return ret;
+	if (get_unaligned_le32(reply + 48)) {
+		dev_err(srv->ep->dcp->dev, "audiosrv: link method %u answered %#x\n",
+			command, get_unaligned_le32(reply + 48));
+		return -EIO;
+	}
+	return 0;
+}
+
 int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
-		      const struct dcp_sound_cookie *cookie)
+		      const struct dcp_sound_cookie *cookie, u8 source)
 {
 	struct apple_dcp *dcp;
 	struct audiosrv_data *asrv;
-	u8 body[64] = {}, reply[64];
-	u32 command, status;
-	int ret;
+	u8 body[64] = {};
+	u32 command;
+	bool desktop;
+	int ret, notify_ret = 0;
 
-	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link, dev, op, cookie);
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link, dev, op, cookie, source);
+
 	dcp = dev_get_drvdata(dev);
 	asrv = dcp->audiosrv;
 	if (!asrv)
 		return -ENODEV;
 	if (!cookie)
 		return -EINVAL;
+	desktop = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 
 	switch (op) {
 	case DCP_AUDIO_LINK_PREPARE:
@@ -422,33 +441,40 @@ int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 		command = asrv->cmds.stop_link;
 		break;
 	case DCP_AUDIO_LINK_COMPLETE:
-		command = asrv->cmds.unprepare;
+		command = asrv->cmds.complete;
 		break;
 	default:
 		return -EINVAL;
 	}
 	static_assert(sizeof(*cookie) == DCP_SOUND_COOKIE_SIZE_V14_7);
 	memcpy(body, cookie, sizeof(*cookie));
+	body[0x20] = source;
 
-	scoped_guard(mutex, &asrv->open_lock) {
-		if (!asrv->open_srv)
-			return -ENODEV;
-		/* A link ends on the instance it was prepared on; one gone took it along. */
-		if (op != DCP_AUDIO_LINK_PREPARE && asrv->link_gen != asrv->open_gen)
-			return -ENODEV;
-		ret = av_audiosrv_call(asrv->open_srv, command, body, sizeof(body), 0,
-				       reply, sizeof(reply));
-		if (ret)
+	guard(mutex)(&asrv->open_lock);
+	if (!asrv->open_srv)
+		return -ENODEV;
+	/* A link ends on the instance it was prepared on; one gone took it along. */
+	if (op != DCP_AUDIO_LINK_PREPARE && asrv->link_gen != asrv->open_gen)
+		return -ENODEV;
+	if (desktop && op == DCP_AUDIO_LINK_STOP)
+		notify_ret = av_audiosrv_link_call(asrv->open_srv,
+						 asrv->cmds.will_stop_link, body);
+	/* Even a refused WillStop must not prevent Stop/Complete cleanup. */
+	ret = av_audiosrv_link_call(asrv->open_srv, command, body);
+	if (ret)
+		return ret;
+	if (op == DCP_AUDIO_LINK_PREPARE)
+		asrv->link_gen = asrv->open_gen;
+	if (desktop && op == DCP_AUDIO_LINK_START) {
+		ret = av_audiosrv_link_call(asrv->open_srv, asrv->cmds.did_start_link, body);
+		if (ret) {
+			/* Start succeeded: unwind it even if DidStart failed. */
+			av_audiosrv_link_call(asrv->open_srv, asrv->cmds.will_stop_link, body);
+			av_audiosrv_link_call(asrv->open_srv, asrv->cmds.stop_link, body);
 			return ret;
-		status = get_unaligned_le32(reply + 48);
-		if (status) {
-			dev_err(dev, "audiosrv: link method %u answered %#x\n", command, status);
-			return -EIO;
 		}
-		if (op == DCP_AUDIO_LINK_PREPARE)
-			asrv->link_gen = asrv->open_gen;
 	}
-	return 0;
+	return notify_ret;
 }
 #endif
 
@@ -465,11 +491,15 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	} __attribute__((packed)) *hdr;
 	static_assert(sizeof(*hdr) == 48);
 	size_t received = 0, used;
+	u32 status;
 	size_t bfr_len = output_maxsize + sizeof(*hdr);
-	void *bfr __free(kfree) = NULL;
+	void *bfr __free(kvfree) = NULL;
 	int ret;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_osobject_call, service, group, command,
+				   output, output_maxsize, output_size);
+
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -477,7 +507,7 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 	hdr->max_size = cpu_to_le64(output_maxsize);
 	if (READ_ONCE(service->ep->compact))
 		ret = afk_service_call_with_reply_len(service, group, command, hdr,
-						    sizeof(*hdr), output_maxsize, bfr,
+						    sizeof(*hdr), 0, bfr,
 						    bfr_len, 0, &received);
 	else
 		ret = afk_service_call(service, group, command, hdr, sizeof(*hdr),
@@ -487,8 +517,15 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 
 	used = le64_to_cpu(hdr->used_size);
 	if (READ_ONCE(service->ep->compact)) {
-		if (used > output_maxsize || received < sizeof(*hdr) ||
-		    used > received - sizeof(*hdr))
+		if (received < sizeof(*hdr))
+			return -EMSGSIZE;
+		status = get_unaligned_le32(bfr + 0x10);
+		/* IOKit's kIOReturnNoSpace; only this method error permits growth. */
+		if (status == 0xe00002db)
+			return -ENOSPC;
+		if (status)
+			return -EIO;
+		if (used > output_maxsize || used > received - sizeof(*hdr))
 			return -EMSGSIZE;
 		if (output) {
 			memset(output, 0, output_maxsize);
@@ -501,6 +538,27 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
 		*output_size = used;
 
 	return 0;
+}
+
+/* Keep the initial native size distinct from the bounded ABI maximum. */
+static int dcp_audiosrv_osobject_get(struct apple_epic_service *srv, u32 command,
+				   void *output, size_t maxsize, size_t *used)
+{
+	size_t capacity = maxsize;
+	int ret;
+
+	if (!READ_ONCE(srv->ep->compact))
+		return dcp_audiosrv_osobject_call(srv, 1, command, output, maxsize, used);
+	maxsize = min_t(size_t, maxsize, DCP_AUDIO_OSOBJECT_MAX);
+	capacity = min_t(size_t, maxsize, command == 16 ? SZ_256K : SZ_32K);
+	for (;;) {
+		ret = dcp_audiosrv_osobject_call(srv, 1, command, output, capacity, used);
+		if (!ret && output)
+			memset(output + capacity, 0, maxsize - capacity);
+		if (ret != -ENOSPC || capacity == maxsize)
+			return ret;
+		capacity = min(capacity * 2, maxsize);
+	}
 }
 
 int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize)
@@ -517,7 +575,7 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 		srv = afk_service_get(asrv->srv);
 	if (!srv)
 		return -ENODEV;
-	ret = dcp_audiosrv_osobject_call(srv, 1, asrv->cmds.get_elements,
+	ret = dcp_audiosrv_osobject_get(srv, asrv->cmds.get_elements,
 					 elements, maxsize, &size);
 	afk_service_put(srv);
 
@@ -545,7 +603,7 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 		srv = afk_service_get(asrv->srv);
 	if (!srv)
 		return -ENODEV;
-	ret = dcp_audiosrv_osobject_call(srv, 1,
+	ret = dcp_audiosrv_osobject_get(srv,
 					 asrv->cmds.get_product_attrs, attrs,
 					 maxsize, &size);
 	afk_service_put(srv);
@@ -640,14 +698,15 @@ static int av_desktop_audio_prepare(struct apple_epic_service *service, const ch
 
 	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || !dcp->external ||
 	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP ||
-	    !name || strcmp(name, "dcpav-audio-epic") || unit != 0)
+	    !name || strcmp(name, "dcpav-audio-interface-epic") ||
+	    !class || strcmp(class, "dcpav-interface-ep") || unit != 0)
 		return -EINVAL;
 	return 0;
 }
 
 static const struct apple_epic_service_ops av_desktop_ops[] = {
 	{
-		.name = "dcpav-audio-epic",
+		.name = "dcpav-audio-interface-epic",
 		.reusable = true,
 		.prepare = av_desktop_audio_prepare,
 		.init = av_audiosrv_init,

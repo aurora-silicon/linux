@@ -18,8 +18,8 @@ struct av_v14_test {
 	struct apple_epic_service svc;
 	struct apple_epic_service other;
 	/* Service calls: the command, and the instance generation it went to */
-	u32 calls[8];
-	u64 call_gens[8];
+	u32 calls[16];
+	u64 call_gens[16];
 	unsigned int ncalls;
 	/* The card's disconnects, and link releases with the instance asked for */
 	unsigned int disconnects;
@@ -29,6 +29,13 @@ struct av_v14_test {
 	bool successor_during_release;
 	u32 link_status;
 	u8 link_body[64];
+	u8 link_bodies[16][64];
+	u32 fail_command;
+	int call_error;
+	size_t capacities[16];
+	unsigned int nobjects;
+	size_t object_needed;
+	int object_error;
 };
 
 static struct av_v14_test *av_v14_current;
@@ -42,14 +49,18 @@ static int av_v14_call(struct apple_epic_service *srv, u32 command, const void *
 		t->calls[t->ncalls] = command;
 		t->call_gens[t->ncalls] = t->asrv->gen;
 	}
+	if (body_len == sizeof(t->link_body) && t->ncalls < ARRAY_SIZE(t->calls))
+		memcpy(t->link_bodies[t->ncalls], body, body_len);
 	t->ncalls++;
+	if (command == t->fail_command && t->call_error)
+		return t->call_error;
 	memset(reply, 0, reply_len);
 	/* Open: status 0 at +0, opened at +16 */
 	if (command == t->asrv->cmds.open && reply_len >= 24)
 		put_unaligned_le64(1, reply + 16);
 	if (body_len == sizeof(t->link_body)) {
 		memcpy(t->link_body, body, body_len);
-		put_unaligned_le32(t->link_status, reply + 48);
+		put_unaligned_le32(command == t->fail_command ? 1 : t->link_status, reply + 48);
 	}
 	return 0;
 }
@@ -79,7 +90,16 @@ static void av_v14_publish(struct av_v14_test *t)
 {
 	t->svc.enabled = true;
 	t->svc.torndown = false;
-	av_audiosrv_init(&t->svc, "DCPAVAudioInterface", "test", 0);
+	if (t->ep.compact) {
+		const char *name = "dcpav-audio-interface-epic";
+		const char *class = "dcpav-interface-ep";
+
+		KUNIT_ASSERT_EQ(kunit_get_current_test(),
+				av_desktop_audio_prepare(&t->svc, name, class, 0), 0);
+		av_audiosrv_init(&t->svc, name, class, 0);
+	} else {
+		av_audiosrv_init(&t->svc, "DCPAVAudioInterface", "test", 0);
+	}
 }
 
 /* The instance removed, and its successor published in the same slot */
@@ -302,20 +322,25 @@ static void av_v14_link_instance(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
 	old = t->asrv->gen;
-	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE,
+					      &cookie, 0), 0);
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, old));
 	av_v14_replace(t);
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
 	KUNIT_ASSERT_EQ(test, t->ncalls, 3U);
-	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_STOP, &cookie), -ENODEV);
-	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE, &cookie),
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_STOP,
+					      &cookie, 0), -ENODEV);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE,
+					      &cookie, 0),
 			-ENODEV);
 	KUNIT_EXPECT_EQ(test, t->ncalls, 3U);
 	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, old));
 	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
-	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE,
+					      &cookie, 0), 0);
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
-	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE, &cookie), 0);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE,
+					      &cookie, 0), 0);
 	KUNIT_EXPECT_EQ(test, t->ncalls, 5U);
 }
 
@@ -338,50 +363,148 @@ static void av_native_link_payload_status(struct kunit *test)
 {
 	struct av_v14_test *t = av_v14_setup(test);
 	struct dcp_sound_cookie cookie;
+	bool desktop = t->ep.compact;
+	const u32 desktop_calls[] = { 4, 6, 6, 7, 8, 9, 10, 11 };
+	const u32 legacy_calls[] = { 4, 6, 6, 7, 10, 11 };
+	const u32 *calls = desktop ? desktop_calls : legacy_calls;
+	size_t ncalls = desktop ? ARRAY_SIZE(desktop_calls) : ARRAY_SIZE(legacy_calls);
 
 	memset(&cookie, 0xa5, sizeof(cookie));
 	KUNIT_ASSERT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
 	t->link_status = 1;
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE,
-					      &cookie), -EIO);
+					      &cookie, 0x5a), -EIO);
 	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_START,
-					      &cookie), -ENODEV);
+					      &cookie, 0x5a), -ENODEV);
 	t->link_status = 0;
 	for (enum dcp_audio_link op = DCP_AUDIO_LINK_PREPARE;
-	     op <= DCP_AUDIO_LINK_COMPLETE; op++) {
-		KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, op, &cookie), 0);
-		KUNIT_EXPECT_MEMEQ(test, t->link_body, &cookie, sizeof(cookie));
-		for (size_t i = sizeof(cookie); i < sizeof(t->link_body); i++)
-			KUNIT_EXPECT_EQ(test, t->link_body[i], 0);
+	     op <= DCP_AUDIO_LINK_COMPLETE; op++)
+		KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, op, &cookie, 0x5a), 0);
+	KUNIT_ASSERT_EQ(test, t->ncalls, ncalls);
+	for (size_t n = 0; n < ncalls; n++) {
+		KUNIT_EXPECT_EQ(test, t->calls[n], calls[n]);
+		if (!n)
+			continue;
+		KUNIT_EXPECT_MEMEQ(test, t->link_bodies[n], &cookie, sizeof(cookie));
+		KUNIT_EXPECT_EQ(test, t->link_bodies[n][0x20], 0x5a);
+		for (size_t i = 0x21; i < sizeof(t->link_body); i++)
+			KUNIT_EXPECT_EQ(test, t->link_bodies[n][i], 0);
 	}
-	KUNIT_EXPECT_EQ(test, t->calls[2], t->asrv->cmds.prepare);
-	KUNIT_EXPECT_EQ(test, t->calls[3], t->asrv->cmds.start_link);
-	KUNIT_EXPECT_EQ(test, t->calls[4], t->asrv->cmds.stop_link);
-	KUNIT_EXPECT_EQ(test, t->calls[5], t->asrv->cmds.unprepare);
 	dcp_audiosrv_close(t->dcp->dev);
+}
+
+/* A failed DidStart unwinds Start; a failed WillStop still sends Stop. */
+static void av_desktop_notification_errors(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	struct dcp_sound_cookie cookie = {};
+
+	if (!t->ep.compact)
+		return;
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE,
+					      &cookie, 1), 0);
+	t->ncalls = 0;
+	t->fail_command = 7;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_START,
+					      &cookie, 1), -EIO);
+	KUNIT_ASSERT_EQ(test, t->ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, t->calls[0], 7U);
+	t->ncalls = 0;
+	t->fail_command = 8;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_START,
+					      &cookie, 1), -EIO);
+	KUNIT_ASSERT_EQ(test, t->ncalls, 4U);
+	KUNIT_EXPECT_EQ(test, t->calls[0], 7U);
+	KUNIT_EXPECT_EQ(test, t->calls[1], 8U);
+	KUNIT_EXPECT_EQ(test, t->calls[2], 9U);
+	KUNIT_EXPECT_EQ(test, t->calls[3], 10U);
+	t->fail_command = 9;
+	t->call_error = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_STOP,
+					      &cookie, 1), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, t->calls[4], 9U);
+	KUNIT_EXPECT_EQ(test, t->calls[5], 10U);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE,
+					      &cookie, 1), 0);
+	KUNIT_EXPECT_EQ(test, t->calls[6], 11U);
+	dcp_audiosrv_close(t->dcp->dev);
+}
+
+static int av_native_object_call(struct apple_epic_service *srv, u16 group,
+				u32 command, void *output, size_t capacity, size_t *used)
+{
+	struct av_v14_test *t = av_v14_current;
+
+	if (t->nobjects < ARRAY_SIZE(t->capacities))
+		t->capacities[t->nobjects] = capacity;
+	t->nobjects++;
+	if (t->object_error)
+		return t->object_error;
+	if (capacity < t->object_needed)
+		return -ENOSPC;
+	*used = t->object_needed;
+	return 0;
+}
+
+static void av_desktop_catalog_growth(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	size_t used = 0;
+
+	if (!t->ep.compact)
+		return;
+	kunit_activate_static_stub(test, dcp_audiosrv_osobject_call, av_native_object_call);
+	t->object_needed = SZ_8M;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_osobject_get(&t->svc, 16, NULL, SZ_8M, &used), 0);
+	KUNIT_EXPECT_EQ(test, used, (size_t)SZ_8M);
+	KUNIT_ASSERT_EQ(test, t->nobjects, 6U);
+	for (size_t i = 0; i < t->nobjects; i++)
+		KUNIT_EXPECT_EQ(test, t->capacities[i], (size_t)SZ_256K << i);
+	t->nobjects = 0;
+	t->object_needed = SZ_8M + 1;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_osobject_get(&t->svc, 16, NULL, SZ_8M, &used),
+			-ENOSPC);
+	KUNIT_EXPECT_EQ(test, t->nobjects, 6U);
+	t->nobjects = 0;
+	t->object_error = -EMSGSIZE;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_osobject_get(&t->svc, 16, NULL, SZ_8M, &used),
+			-EMSGSIZE);
+	KUNIT_EXPECT_EQ(test, t->nobjects, 1U);
+	t->object_error = 0;
+	t->nobjects = 0;
+	t->object_needed = SZ_8M;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_osobject_get(&t->svc, 18, NULL, SZ_8M, &used), 0);
+	KUNIT_EXPECT_EQ(test, t->capacities[0], (size_t)SZ_32K);
+	KUNIT_EXPECT_EQ(test, t->nobjects, 9U);
 }
 
 static void av_desktop_service_admission(struct kunit *test)
 {
 	struct av_v14_test *t = av_v14_setup(test);
-	const char *name = "dcpav-audio-epic";
+	const char *name = "dcpav-audio-interface-epic";
+	const char *class = "dcpav-interface-ep";
 	bool desktop = t->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_native_link(t->dcp->dev));
-	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0),
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, class, 0),
 			desktop ? 0 : -EINVAL);
 	t->dcp->fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
 	t->ep.endpoint = AV_ENDPOINT;
-	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, class, 0), -EINVAL);
 	t->ep.endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
-	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-device-epic", name, 0),
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-device-epic", class, 0),
 			-EINVAL);
-	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, NULL, name, 0), -EINVAL);
-	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, NULL, class, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, class, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, NULL, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, "dcpav-audio-epic", class, 0),
+			-EINVAL);
 	t->dcp->external = false;
 	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_native_link(t->dcp->dev));
-	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, name, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, av_desktop_audio_prepare(&t->svc, name, class, 0), -EINVAL);
 	dcp_audiosrv_close(t->dcp->dev);
 }
 
@@ -406,6 +529,8 @@ static struct kunit_case av_v14_cases[] = {
 	KUNIT_CASE_PARAM(av_v14_terminate_unpublished, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_native_link_payload_status, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_desktop_service_admission, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_desktop_notification_errors, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_desktop_catalog_growth, av_native_gen_params),
 	{}
 };
 

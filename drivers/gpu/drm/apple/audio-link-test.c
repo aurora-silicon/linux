@@ -25,7 +25,7 @@ static bool dcpaud_link_test_on(struct device *dev, u64 gen)
 }
 
 static int dcpaud_link_test_call(struct device *dev, enum dcp_audio_link op,
-				 const struct dcp_sound_cookie *cookie)
+				 const struct dcp_sound_cookie *cookie, u8 source)
 {
 	if (op == DCP_AUDIO_LINK_COMPLETE)
 		dcpaud_link_current->completes++;

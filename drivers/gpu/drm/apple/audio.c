@@ -33,7 +33,7 @@
 
 #define DCPAUD_ELEMENTS_MAXSIZE		16384
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
-/* The native element catalog capacity (14.7 external role). */
+/* Initial legacy native size; desktop catalogs may grow to 8 MiB. */
 #define DCPAUD_ELEMENTS_V14_7		SZ_256K
 
 /*
@@ -84,6 +84,11 @@ struct dcp_audio {
 #endif
 };
 
+static void __maybe_unused dcpaud_free_elements(void *data)
+{
+	kvfree(data);
+}
+
 /* Native external audio service (DRM_APPLE_DCP_T6030_AUDIO only). */
 static inline bool dcpaud_native_link(struct dcp_audio *dcpaud)
 {
@@ -96,6 +101,10 @@ static inline bool dcpaud_native_link(struct dcp_audio *dcpaud)
 
 static inline size_t dcpaud_elements_size(struct dcp_audio *dcpaud)
 {
+	struct apple_dcp *dcp = dev_get_drvdata(dcpaud->dcp_dev);
+
+	if (dcpaud_native_link(dcpaud) && dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+		return DCP_AUDIO_OSOBJECT_MAX;
 	return dcpaud_native_link(dcpaud) ? DCPAUD_ELEMENTS_V14_7 : DCPAUD_ELEMENTS_MAXSIZE;
 }
 
@@ -649,14 +658,14 @@ static void dcpaud_link_teardown(struct dcp_audio *dcpaud, bool live)
 	lockdep_assert_held(&dcpaud->link_lock);
 	if (dcpaud->link_started && live) {
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
-					&dcpaud->selected_cookie);
+					&dcpaud->selected_cookie, 0);
 		if (ret)
 			dev_err(dcpaud->dev, "audio link stop failed: %d\n", ret);
 	}
 	dcpaud->link_started = false;
 	if (dcpaud->link_prepared && live) {
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_COMPLETE,
-					&dcpaud->selected_cookie);
+					&dcpaud->selected_cookie, 0);
 		if (ret)
 			dev_err(dcpaud->dev, "audio link complete failed: %d\n", ret);
 	}
@@ -712,7 +721,7 @@ static int dcp_pcm_native_prepare(struct snd_pcm_substream *substream)
 		return ret;
 
 	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_PREPARE,
-				&dcpaud->selected_cookie);
+				&dcpaud->selected_cookie, 0);
 	if (ret)
 		return ret;
 
@@ -739,7 +748,7 @@ static int dcp_pcm_native_start(struct snd_pcm_substream *substream, int cmd)
 	if (dcpaud->link_started)
 		return 0;
 	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
-				&dcpaud->selected_cookie);
+				&dcpaud->selected_cookie, 0);
 	dcpaud->link_started = !ret;
 	return ret;
 }
@@ -1058,10 +1067,15 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/* Native external roles share the link lifecycle and element catalog. */
-	if (dcp_audiosrv_native_link(dcpaud->dcp_dev)) {
-		void *elements = devm_kzalloc(dev, DCPAUD_ELEMENTS_V14_7, GFP_KERNEL);
+	if (dcp_audiosrv_native_link(dcpaud->dcp_dev) && !dcpaud->native_link) {
+		struct apple_dcp *dcp = dev_get_drvdata(dcpaud->dcp_dev);
+		size_t size = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ?
+			DCP_AUDIO_OSOBJECT_MAX : DCPAUD_ELEMENTS_V14_7;
+		void *elements = kvzalloc(size, GFP_KERNEL);
 
 		if (!elements)
+			goto rpm_put;
+		if (devm_add_action_or_reset(dev, dcpaud_free_elements, elements))
 			goto rpm_put;
 		devm_kfree(dev, dcpaud->elements);
 		dcpaud->elements = elements;

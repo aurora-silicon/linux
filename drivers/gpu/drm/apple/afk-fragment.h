@@ -11,7 +11,8 @@
  * fragment, including 255 -> 0. Messages are not interleaved on an endpoint.
  */
 #define AFK_COMPACT_FRAGMENT_SIZE 1028U
-#define AFK_COMPACT_MESSAGE_MAX (1024U * 1024U)
+/* 8 MiB data + 8 timestamp + 8 subheader + 8 descriptor + 64 call + 48 property. */
+#define AFK_COMPACT_MESSAGE_MAX (8U * 1024U * 1024U + 136U)
 
 struct afk_fragment_state {
 	u32 total;

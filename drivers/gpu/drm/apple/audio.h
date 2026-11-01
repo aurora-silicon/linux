@@ -2,6 +2,9 @@
 #define __AUDIO_H__
 
 #include <linux/types.h>
+#include <linux/sizes.h>
+
+#define DCP_AUDIO_OSOBJECT_MAX SZ_8M
 
 struct device;
 struct platform_device;
@@ -30,7 +33,7 @@ bool dcp_audiosrv_native_link(struct device *dev);
 int dcp_audiosrv_open(struct device *dev);
 void dcp_audiosrv_close(struct device *dev);
 int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
-		      const struct dcp_sound_cookie *cookie);
+		      const struct dcp_sound_cookie *cookie, u8 source);
 /* @gen: only a link prepared on that instance, still the open one (NULL: any) */
 void dcpaud_release_link(struct platform_device *pdev, const u64 *gen);
 /* Whether the link prepared last is on instance @gen, still the open one */

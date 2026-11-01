@@ -185,30 +185,90 @@ each failed validation, as well as unchanged other-SoC policy. No new policy
 flag or kernel bypass is needed. This kernel series does not replace Stage 2.
 
 
-Desktop external audio (draft)
-------------------------------
+Desktop external audio (disabled clients)
+-----------------------------------------
 
 The desktop audio integration uses the existing DCP PCM and native link
 lifecycle, with a separate compact service binding on endpoint 0x2b. Endpoint
-0x29 retains AV device control. Only the external firmware role admits the
-``dcpav-audio-epic`` unit-zero service; the internal panel does not acquire an
-audio client. The existing ``hdmi_audio`` opt-in still controls service startup.
+0x29 retains AV device control. Only the external firmware role admits service
+``dcpav-audio-interface-epic``, class ``dcpav-interface-ep``, unit zero. The
+internal panel does not acquire an audio client. Admission validates the name,
+class, unit, endpoint and firmware role. The existing ``hdmi_audio`` opt-in
+controls service startup.
 
-A PCM opens and pins one service instance. Prepare, Start, Stop and Complete
-use that instance's element link data. Sink termination disconnects the card,
-drains the DMA and completes its link before closing that instance. Replacement
-services cannot inherit an old instance's Close or link completion. Compact
-method replies must have the expected body length; serialized property replies
-must contain their declared used bytes within the actual received body.
+The desktop 26.x audio interface has these commands (body sizes exclude the
+compact transport and service-call headers):
+
+===== ======== ============================== =============
+Group Selector Operation                      Body bytes
+===== ======== ============================== =============
+0     4        Open                           32
+0     5        Close                          16
+0     6        PrepareLinkWithData            64
+0     7        StartLinkWithData              64
+0     8        DidStartLinkWithData           64
+0     9        WillStopLinkWithData           64
+0     10       StopLinkWithData               64
+0     11       CompleteLinkWithData           64
+0     12       GetLinkData                    64
+0     13       GetLinkStatus                  64
+0     14       GetTransport                   48
+0     15       GetPortID                      16
+1     16       CopyElements                   variable
+1     17       CopyChannelLayoutElements      variable
+1     18       CopyProductAttributes          variable
+1     19       CopyEDIDUUID                   variable
+===== ======== ============================== =============
+
+A PCM opens and pins one service instance. Prepare, Start, DidStart, WillStop,
+Stop and Complete use that instance's element link data. Selector 11 completes
+the link; the older Linux ``unprepare`` entry point is a caller-side name.
+Desktop Start is followed by DidStart, and Stop is preceded by WillStop.
+A failed DidStart unwinds the successful Start with WillStop and Stop; a failed
+WillStop still permits Stop and later Complete. The 14.7 external path retains
+its existing sequence.
+
+Each of these six link methods sends 64 bytes: the selected 32-byte
+``IOAVAudioLinkData`` at 0x00, an explicit one-byte ``IOAVLinkSource`` at 0x20,
+and zeros at 0x21 through 0x3f. The method status is at reply offset 0x30.
+The source is a separate argument to the link helper, not part of the element
+cookie or padding. The PCM caller currently retains source zero; the clean
+interface facts do not establish the correct source value for the disabled
+DPA clients. That selection must be qualified before enabling them.
+
+``IOAVAudioLinkData`` consists of eight little-endian 32-bit words: Format,
+ChannelCount, SampleSize, LinkSampleRate, reserved zero, ChannelAllocation,
+reserved zero and reserved zero. ChannelAllocation 0xffffffff denotes no
+selected allocation. CopyElements returns a serialized root array of audio
+element dictionaries, with ElementType 2 and a 32-byte ElementData object.
+The duplicate Format, ChannelCount, SampleSize and LinkSampleRate properties
+match that object. MaxChannelCount and StreamSampleRate describe the stream;
+AudioChannelLayoutElements contains the layout dictionaries. A layout has
+ElementType 3 and 40-byte ElementData (ChannelCount, ActiveChannelCount and
+eight ordered 32-bit speaker values), with ChannelLayout strings and a
+ChannelAllocation boolean. Selector 17 returns those layouts separately;
+selectors 18 and 19 return product attributes and the EDID UUID. These optional
+getters and selectors 12 through 15 are not required by the current PCM path.
+
+Serialized methods carry a 48-byte header: maximum accepted bytes at 0x00,
+method status at 0x10, used bytes at 0x20 and serialized data at 0x30. Remaining
+header bytes are zero or reserved. CopyElements starts with 256 KiB of space,
+then doubles on a no-space method reply up to 8 MiB; 256 KiB is not the ABI
+maximum. The other serialized getters start at 32 KiB, subject to the caller's
+capacity, and share the 8 MiB ceiling. Transport errors, truncated replies and
+other method errors do not trigger a size retry. Compact replies must contain
+their declared used bytes within the actual received body. A smaller successful
+replacement clears the unused catalog tail. Large property and transport
+buffers use virtually contiguous allocations.
+
+Sink termination disconnects the card, drains the DMA and completes its link
+before closing that instance. Replacement services cannot inherit an old
+instance's Close or link completion.
 
 J616s DPA1 and DPA2 are described with SIO channels 0x66 and 0x68, connected
 bidirectionally to DCPEXT0 and DCPEXT1 port zero, respectively. Both clients
 remain disabled. This description does not enable SIO, its DART, its mailbox
 or any DPA power domain. A generation-specific SIO firmware backend and loader
-handoff are still required before a candidate may enable the clients.
-
-The desktop service name/unit, shared 13.5 command numbers and native 14.7 link
-and element layouts are provisional integration choices. Build and synthetic
-regression results cannot qualify them against firmware. Qualification must
-confirm those contracts and actual sink element catalogs before enabling these
-outputs. No sink-specific rates or capabilities are synthesized here.
+handoff are still required before enabling the clients. Build and synthetic
+regression results verify source behavior, not audio firmware or sink operation.
+No sink-specific rates or capabilities are synthesized here.

@@ -3037,7 +3037,7 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 			       &bfr_len) || bfr_len > U32_MAX)
 		return -EOVERFLOW;
 
-	bfr = kzalloc(bfr_len, GFP_KERNEL);
+	bfr = kvzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
 
@@ -3082,7 +3082,7 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 	}
 
 out:
-	kfree(bfr);
+	kvfree(bfr);
 	return ret;
 }
 
