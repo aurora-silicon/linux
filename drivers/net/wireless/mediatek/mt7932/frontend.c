@@ -182,8 +182,8 @@ static int mt_scan_submit_next(struct mt7932 *m)
 			bool listen = mt7932_scan_listen(request, channel,
 						     m->six_legacy_channels);
 
-			/* Radar channels are never joined; while associated,
-			 * a passive dwell there only delays the home channel.
+			/* While associated, a passive dwell on a radar channel
+			 * only delays the home channel.
 			 */
 			if (mt7932_channel_band(channel->band, channel->hw_value) != m->scan_band ||
 			    listen != passive || (radar && m->scan_home_channel))
@@ -268,8 +268,12 @@ int mt_connect_discover(struct mt7932 *m)
 
 			if (m->connect_channel_req && channel != m->connect_channel_req)
 				continue;
-			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ |
-					      IEEE80211_CHAN_RADAR))
+			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ))
+				continue;
+			/* Probes are forbidden on radar channels: leave them to the
+			 * passive attempts, so the rest of the band keeps probing.
+			 */
+			if (!passive && (channel->flags & IEEE80211_CHAN_RADAR))
 				continue;
 			passive |= !!(channel->flags & IEEE80211_CHAN_NO_IR);
 			passive |= band == 3 &&
@@ -667,6 +671,24 @@ int mt_enable_scan(struct mt7932 *m)
 	return 0;
 }
 
+/* A station on a radar channel must stop transmitting when its AP announces a
+ * switch away; the firmware's CSA handling is unknown. The beacon's IEs are
+ * already bounds-checked by mt7932_rx_beacon().
+ */
+static bool mt_radar_switch_announced(const struct ieee80211_channel *channel,
+				      const struct mt7932_rx_frame *frame)
+{
+	const u8 *ies = frame->data + 36;
+	size_t length = frame->length - 36;
+	const struct element *csa, *ecsa;
+
+	if (!(channel->flags & IEEE80211_CHAN_RADAR))
+		return false;
+	csa = cfg80211_find_elem(WLAN_EID_CHANNEL_SWITCH, ies, length);
+	ecsa = cfg80211_find_elem(WLAN_EID_EXT_CHANSWITCH_ANN, ies, length);
+	return (csa && csa->datalen >= 3) || (ecsa && ecsa->datalen >= 4);
+}
+
 void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 {
 	struct mt7932_rx_frame frame;
@@ -705,7 +727,18 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		unsigned long flags;
 
 		spin_lock_irqsave(&m->response_lock, flags);
-		if (m->connected && !m->disconnecting && !m->stopping &&
+		if (m->connecting && !m->disconnecting && !m->stopping && !m->connect_error &&
+		    frame.channel == m->connect_channel &&
+		    ether_addr_equal(frame.data + 16, m->connect_bssid) &&
+		    mt_radar_switch_announced(channel, &frame)) {
+			/* The connect worker owns teardown: fail its attempt and wake it. */
+			m->connect_error = -ECONNRESET;
+			complete(&m->assoc_start);
+			complete(&m->assoc_done);
+			complete(&m->discovery_done);
+			dev_info(&m->pdev->dev, "RADAR_CHANNEL_SWITCH: AP announced a switch; abandoning the join on channel %u\n",
+				 m->connect_channel);
+		} else if (m->connected && !m->disconnecting && !m->stopping &&
 		    frame.channel == m->connect_channel &&
 		    ether_addr_equal(frame.data + 16, m->connect_bssid)) {
 			m->home_beacons++;
@@ -730,7 +763,20 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 				}
 			}
 			mt_cqm_signal(m, mt7932_rx_signal(&frame, m->antenna_mask));
-			if (tim && tim->datalen >= 4 && !m->power_tim) {
+			if (m->connected && mt_radar_switch_announced(channel, &frame)) {
+				m->connected = false;
+				m->disconnecting = true;
+				m->disconnect_seen = false;
+				m->disconnect_event_received = false;
+				m->disconnect_local = true;
+				m->disconnect_reason = WLAN_REASON_DISASSOC_STA_HAS_LEFT;
+				netif_carrier_off(m->netdev);
+				netif_stop_queue(m->netdev);
+				reinit_completion(&m->disconnect_done);
+				schedule_work(&m->disconnect_work);
+				dev_info(&m->pdev->dev, "RADAR_CHANNEL_SWITCH: AP announced a switch; leaving channel %u\n",
+					 m->connect_channel);
+			} else if (tim && tim->datalen >= 4 && !m->power_tim) {
 				m->power_tim = true;
 				schedule_work(&m->power_work);
 			}
