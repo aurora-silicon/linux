@@ -1034,8 +1034,6 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 			 count, ret, j.used);
 	}
 	vfree(ane_h16_job_result.data);
-	for (i = 0; i < ARRAY_SIZE(ane_h16_failure); i++)
-		vfree(ane_h16_failure[i].data);
 	ane_h16_job_result.data = j.out;
 	ane_h16_job_result.size = j.used;
 	mutex_unlock(&ane_h16_lock);
