@@ -29,7 +29,7 @@ struct ane_transport_test {
 	struct ane_fw_surface pool;
 	struct ane_test_access access[128];
 	unsigned int count;
-	u64 now;
+	u64 now, now_step;
 	u64 alloc_time;
 	u64 next_dva;
 	u32 irq;
@@ -96,7 +96,11 @@ static void ane_test_write32(void *ctx, u32 reg, u32 value)
 
 static u64 ane_test_now(void *ctx)
 {
-	return ((struct ane_transport_test *)ctx)->now;
+	struct ane_transport_test *f = ctx;
+	u64 now = f->now;
+
+	f->now += f->now_step;
+	return now;
 }
 
 static void ane_test_relax(void *ctx)
@@ -625,6 +629,78 @@ static void ane_transport_consume_test(struct kunit *test)
 			-EAGAIN);
 }
 
+static void ane_transport_consume_trace_order_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	struct ane_test_access access[16];
+	struct ane_fw_consume_trace trace;
+	u8 report[0x60], *p;
+	size_t size = 0;
+	u32 count, i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_transport_report_request(f, f->pool.dva + 0x100, sizeof(report));
+	p = ane_test_slot(f, ANE_FW_IO_T2H);
+	f->count = 0;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_consume(&f->t, report, sizeof(report), &size), 0);
+	count = f->count;
+	KUNIT_ASSERT_LE(test, count, (u32)ARRAY_SIZE(access));
+	memcpy(access, f->access, count * sizeof(access[0]));
+	/* Replay the same slot, proving tracing does not add or reorder transport access. */
+	f->t.head[ANE_FW_IO_T2H] = 0;
+	ane_transport_report_request(f, f->pool.dva + 0x100, sizeof(report));
+	f->count = 0;
+	f->now = 42;
+	f->now_step = 1;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_consume_traced(&f->t, report,
+				 sizeof(report), &size, &trace), 0);
+	KUNIT_ASSERT_EQ(test, f->count, count);
+	for (i = 0; i < count; i++) {
+		KUNIT_EXPECT_EQ(test, f->access[i].kind, access[i].kind);
+		KUNIT_EXPECT_PTR_EQ(test, f->access[i].p, access[i].p);
+		KUNIT_EXPECT_EQ(test, f->access[i].value, access[i].value);
+	}
+	KUNIT_EXPECT_EQ(test, trace.dva, f->pool.dva + 0x100);
+	KUNIT_EXPECT_EQ(test, trace.length, sizeof(report));
+	KUNIT_EXPECT_EQ(test, trace.slot, 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), trace.dva | 1);
+	for (i = 0; i < ARRAY_SIZE(trace.ns); i++)
+		KUNIT_EXPECT_EQ(test, trace.ns[i], 42ULL + i);
+	KUNIT_EXPECT_EQ(test, f->now, 50ULL);
+}
+
+static void ane_transport_consume_trace_refusal_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	struct ane_fw_consume_trace trace;
+	u8 report[0x60], *p;
+	size_t size = 0;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_consume_traced(&f->t, report,
+				 sizeof(report), &size, &trace), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_IO_T2H], 0U);
+	ane_transport_report_request(f, f->pool.dva + 0x100, sizeof(report));
+	p = ane_test_slot(f, ANE_FW_IO_T2H);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_consume_traced(&f->t, report,
+				 8, &size, &trace), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_IO_T2H], 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), f->pool.dva + 0x100);
+	put_unaligned_le64(1, p + 16);
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_consume_traced(&f->t, report,
+				 sizeof(report), &size, &trace), -EPROTO);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_IO_T2H], 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p), f->pool.dva + 0x100);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(p + 16), 1ULL);
+	KUNIT_EXPECT_EQ(test, size, (size_t)0);
+}
+
 static void ane_transport_report_bounds_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
@@ -1040,6 +1116,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_pool_test),
 	KUNIT_CASE(ane_transport_snapshot_test),
 	KUNIT_CASE(ane_transport_consume_test),
+	KUNIT_CASE(ane_transport_consume_trace_order_test),
+	KUNIT_CASE(ane_transport_consume_trace_refusal_test),
 	KUNIT_CASE(ane_transport_report_bounds_test),
 	KUNIT_CASE(ane_transport_report_word2_test),
 	KUNIT_CASE(ane_transport_presence_test),

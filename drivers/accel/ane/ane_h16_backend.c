@@ -41,6 +41,13 @@ struct ane_h16_mapping {
 	void *cpu;
 };
 
+#define ANE_H16_CONSUME_TRACE_MAX 256
+struct ane_h16_consume_trace {
+	struct ane_fw_consume_trace transport;
+	u64 begin_counter, end_counter, uuid;
+	u32 token, command_id, state, begin_cpu, end_cpu, irq_before, irq_after;
+};
+
 struct ane_h16_device {
 	struct ane_h16_boot boot;
 	struct device *dev;
@@ -58,6 +65,8 @@ struct ane_h16_device {
 	bool pinned;
 	int irq;
 	bool job_irq_mode;
+	struct ane_h16_consume_trace *consume_trace;
+	u32 consume_trace_count, consume_trace_dropped;
 	struct ane_fw_irq_event irq_event;
 	atomic_t irq_calls, irq_notifications, irq_empty, irq_empty_run, irq_disabled;
 	atomic_t irq_waits, irq_woken, irq_timeouts;
@@ -85,6 +94,10 @@ struct ane_h16_device {
 static bool h16_job_irq;
 module_param(h16_job_irq, bool, 0444);
 MODULE_PARM_DESC(h16_job_irq, "Diagnostic IRQ completion after startup, default0; incompatible with quiet probes");
+
+static bool h16_job_trace;
+module_param(h16_job_trace, bool, 0444);
+MODULE_PARM_DESC(h16_job_trace, "Bounded consume-stage RAM timestamps, max256 reports/default0; perturbs timing");
 
 static DEFINE_MUTEX(ane_h16_lock);
 static bool ane_h16_released;
@@ -564,6 +577,7 @@ static void ane_h16_cleanup(struct ane_h16_device *h)
 		dev_pm_domain_detach(pd, true);
 	}
 	dev_info(h->dev, "H16 pre-RUN rollback complete; no CPU release\n");
+	kfree(h->consume_trace);
 	kfree(h);
 }
 
@@ -1213,14 +1227,40 @@ static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
 		unsigned int sequence = ane_fw_irq_event_sequence(&h->irq_event);
 		bool progress;
 		int r = ane_h16_job_irq_error(h);
+		struct ane_h16_consume_trace trace;
+		bool tracing = h->consume_trace &&
+			h->consume_trace_count < ANE_H16_CONSUME_TRACE_MAX;
 
 		if (r)
 			return r;
-		r = ane_fw_transport_consume(t, report, sizeof(report), &size);
+		if (tracing) {
+			trace.begin_cpu = raw_smp_processor_id();
+			trace.irq_before = atomic_read(&h->irq_calls);
+			trace.begin_counter = get_cycles();
+		}
+		r = ane_fw_transport_consume_traced(t, report, sizeof(report), &size,
+						tracing ? &trace.transport : NULL);
 		if (!r) {
 			u64 ns = ktime_get_ns() - j->published_ns;
 			u64 counter = get_cycles();
 
+			/* Preserve the original EVENT endpoint before trace bookkeeping. */
+			if (tracing) {
+				trace.end_counter = counter;
+				trace.end_cpu = raw_smp_processor_id();
+				trace.irq_after = atomic_read(&h->irq_calls);
+				trace.token = get_unaligned_le32(report);
+				trace.command_id = get_unaligned_le16(report + 4);
+				trace.uuid = 0;
+				trace.state = U32_MAX;
+				if (trace.command_id == ANE_H16_EVENT_REPORT && size >= 0x20) {
+					trace.uuid = get_unaligned_le64(report + 8);
+					trace.state = get_unaligned_le32(report + 0x1c);
+				}
+				h->consume_trace[h->consume_trace_count++] = trace;
+			} else if (h->consume_trace) {
+				h->consume_trace_dropped++;
+			}
 			r = ane_h16_job_emit_counters(j, ANE_H16_JOB_EVENT, 0, ns, report, size,
 						      &counter, 1);
 			if (r)
@@ -1427,6 +1467,8 @@ static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size
 	if (!ane_h16_job_dev) {
 		ret = -ENODEV;
 	} else {
+		ane_h16_job_dev->consume_trace_count = 0;
+		ane_h16_job_dev->consume_trace_dropped = 0;
 		ane_h16_irq_job_begin(ane_h16_job_dev);
 		ret = ane_h16_job_irq_error(ane_h16_job_dev);
 		if (!ret)
@@ -1468,12 +1510,46 @@ static void ane_h16_postboot(struct ane_h16_device *h)
 		 a, readl(e + 0x1880058), b, readl(e + 0x1880060), c, readl(e + 0x196c000));
 }
 
+static int ane_h16_consume_trace_show(struct seq_file *m, void *unused)
+{
+	struct ane_h16_device *h = m->private;
+	u32 i, k;
+
+	mutex_lock(&ane_h16_lock);
+	seq_printf(m, "{\"schema\":1,\"enabled\":%s,\"count\":%u,\"dropped\":%u,\"records\":[",
+		   h->consume_trace ? "true" : "false", h->consume_trace_count,
+		   h->consume_trace_dropped);
+	for (i = 0; i < h->consume_trace_count; i++) {
+		struct ane_h16_consume_trace *r = &h->consume_trace[i];
+
+		seq_printf(m, "%s{\"index\":%u,\"dva\":%llu,\"length\":%llu,\"slot\":%u,\"token\":%u,\"command_id\":%u,\"uuid\":%llu,\"state\":%u,",
+			   i ? "," : "", i, r->transport.dva, r->transport.length,
+			   r->transport.slot, r->token, r->command_id, r->uuid, r->state);
+		seq_printf(m, "\"begin_counter\":%llu,\"end_counter\":%llu,\"begin_cpu\":%u,\"end_cpu\":%u,\"irq_before\":%u,\"irq_after\":%u,\"ns\":[",
+			   r->begin_counter, r->end_counter, r->begin_cpu, r->end_cpu,
+			   r->irq_before, r->irq_after);
+		for (k = 0; k < ARRAY_SIZE(r->transport.ns); k++)
+			seq_printf(m, "%s%llu", k ? "," : "", r->transport.ns[k]);
+		seq_puts(m, "]}");
+	}
+	seq_puts(m, "]}\n");
+	mutex_unlock(&ane_h16_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ane_h16_consume_trace);
+
 static void ane_h16_job_publish(struct ane_h16_device *h)
 {
 	if (!h16_job || ane_h16_job_dev)
 		return;
 	if (!ane_h16_debugfs)
 		ane_h16_debugfs = debugfs_create_dir("ane_h16", NULL);
+	if (h16_job_trace) {
+		h->consume_trace = kcalloc(ANE_H16_CONSUME_TRACE_MAX,
+					       sizeof(*h->consume_trace), GFP_KERNEL);
+		if (!h->consume_trace)
+			return;
+	}
 	if (h16_job_irq) {
 		u32 pending;
 		int ret = ane_fw_transport_irq(&h->boot.transport, &pending);
@@ -1487,6 +1563,7 @@ static void ane_h16_job_publish(struct ane_h16_device *h)
 		dev_info(h->dev, "H16 job IRQ mode enabled on Linux IRQ %d\n", h->irq);
 	}
 	ane_h16_job_dev = h;
+	debugfs_create_file("consume_trace", 0400, ane_h16_debugfs, h, &ane_h16_consume_trace_fops);
 	debugfs_create_file("irq_stats", 0400, ane_h16_debugfs, h, &ane_h16_irq_stats_fops);
 	debugfs_create_file("job", 0200, ane_h16_debugfs, NULL, &ane_h16_job_fops);
 	debugfs_create_blob("result", 0400, ane_h16_debugfs, &ane_h16_job_result);

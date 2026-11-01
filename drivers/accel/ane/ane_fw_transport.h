@@ -292,10 +292,19 @@ ane_fw_transport_report(struct ane_fw_transport *t, u64 dva, u64 size)
 	return NULL;
 }
 
+/* Optional diagnostic RAM timestamps; clock is ops->now_ns, not FW ticks.
+ * No additional transport reads/writes or changes to ownership ordering.
+ */
+struct ane_fw_consume_trace {
+	u64 ns[8]; /* post-check, ready, resolved, copied, copy barrier, ownership, doorbell, advance */
+	u64 dva, length;
+	u32 slot;
+};
+
 /* Copy before acknowledging. UUID dispatch is deliberately above the transport. */
 static inline int
-ane_fw_transport_consume(struct ane_fw_transport *t, void *report, size_t capacity,
-			 size_t *size)
+ane_fw_transport_consume_traced(struct ane_fw_transport *t, void *report, size_t capacity,
+				size_t *size, struct ane_fw_consume_trace *trace)
 {
 	const void *src;
 	u64 word0, word1, word2;
@@ -304,6 +313,8 @@ ane_fw_transport_consume(struct ane_fw_transport *t, void *report, size_t capaci
 
 	if (ret)
 		return ret;
+	if (trace)
+		trace->ns[0] = t->ops->now_ns(t->ctx);
 	if (!t->armed || !report || !size)
 		return -EINVAL;
 	p = ane_fw_transport_slot(t, ANE_FW_IO_T2H);
@@ -312,6 +323,8 @@ ane_fw_transport_consume(struct ane_fw_transport *t, void *report, size_t capaci
 	word1 = t->ops->load64(t->ctx, p + 8);
 	if (!ane_fw_transport_present(word0, word1))
 		return -EAGAIN;
+	if (trace)
+		trace->ns[1] = t->ops->now_ns(t->ctx);
 	t->ops->read_barrier(t->ctx);
 	word2 = t->ops->load64(t->ctx, p + 16);
 	if ((word0 & 3) || word1 < 8 || word2)
@@ -321,15 +334,38 @@ ane_fw_transport_consume(struct ane_fw_transport *t, void *report, size_t capaci
 		return ane_fw_transport_fail(t, -EPROTO);
 	if (word1 > capacity)
 		return -ENOSPC;
+	if (trace) {
+		trace->dva = word0;
+		trace->length = word1;
+		trace->slot = t->head[ANE_FW_IO_T2H];
+		trace->ns[2] = t->ops->now_ns(t->ctx);
+	}
 	memcpy(report, src, word1);
+	if (trace)
+		trace->ns[3] = t->ops->now_ns(t->ctx);
 	*size = word1;
 	/* The copy must finish before firmware is allowed to recycle the report. */
 	t->ops->write_barrier(t->ctx);
+	if (trace)
+		trace->ns[4] = t->ops->now_ns(t->ctx);
 	t->ops->store64(t->ctx, p, word0 | 1);
 	t->ops->write_barrier(t->ctx);
+	if (trace)
+		trace->ns[5] = t->ops->now_ns(t->ctx);
 	ane_fw_transport_doorbell(t, ANE_FW_IO_T2H);
+	if (trace)
+		trace->ns[6] = t->ops->now_ns(t->ctx);
 	ane_fw_transport_advance(t, ANE_FW_IO_T2H);
+	if (trace)
+		trace->ns[7] = t->ops->now_ns(t->ctx);
 	return 0;
+}
+
+static inline int
+ane_fw_transport_consume(struct ane_fw_transport *t, void *report, size_t capacity,
+			 size_t *size)
+{
+	return ane_fw_transport_consume_traced(t, report, capacity, size, NULL);
 }
 
 /* 25F84 _IOProcessorChannelUnidirectionalReceive (0x929a260): type-2
