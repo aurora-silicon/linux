@@ -80,7 +80,7 @@
 	};
 
 	/*
-	 * The J700 is fanless: the CPUs are the only cooling devices.  Every
+	 * The J700 is fanless. Every
 	 * die sensor gets a zone that throttles both clusters, since they share
 	 * one die and one heat spreader.  The power allocator splits the budget
 	 * by the energy models, with the E cluster weighted three to one: its
@@ -399,68 +399,651 @@
 		 * indices count temperature-* children of smc_hwmon, including the
 		 * six CPU channels inherited from t8140.dtsi. Keep the sensor order.
 		 *
-		 * These zones have no trips: firmware die-temperature limits do not
-		 * establish limits for these SMC readings. GPU cooling requires a
-		 * qualified firmware ceiling and board-specific thermal policy.
+		 * Provisional outer protection, not recovered Apple board limits.
+		 * The active-trip ladder works with the power_allocator governor's
+		 * non-power-actor path as well as step_wise. Equal map bounds give
+		 * exact percent requests, with the strictest zone winning. Critical
+		 * shutdown remains independent of GPU probe and forward progress.
+		 * The last rung requests zero until a nonzero endpoint is qualified.
 		 */
 		smc-tp0t-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 6>;
+			critical-action = "shutdown";
+
+			trips {
+				smc_tp0t_thermal_0: cap-0 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp0t_thermal_1: cap-1 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp0t_thermal_2: cap-2 {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp0t_thermal_3: cap-3 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <98000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&smc_tp0t_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&smc_tp0t_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&smc_tp0t_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&smc_tp0t_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		charger-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 11>; /* TCMz */
+			critical-action = "shutdown";
+
+			trips {
+				charger_thermal_0: cap-0 {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				charger_thermal_1: cap-1 {
+					temperature = <83000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				charger_thermal_2: cap-2 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				charger_thermal_3: cap-3 {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <95000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&charger_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&charger_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&charger_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&charger_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		chassis1-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 12>; /* Ts0A */
+			critical-action = "shutdown";
+
+			trips {
+				chassis1_thermal_0: cap-0 {
+					temperature = <70000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis1_thermal_1: cap-1 {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis1_thermal_2: cap-2 {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis1_thermal_3: cap-3 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <88000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&chassis1_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&chassis1_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&chassis1_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&chassis1_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		chassis2-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 13>; /* Ts0I */
+			critical-action = "shutdown";
+
+			trips {
+				chassis2_thermal_0: cap-0 {
+					temperature = <70000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis2_thermal_1: cap-1 {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis2_thermal_2: cap-2 {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis2_thermal_3: cap-3 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <88000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&chassis2_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&chassis2_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&chassis2_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&chassis2_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		chassis3-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 14>; /* Ts0M */
+			critical-action = "shutdown";
+
+			trips {
+				chassis3_thermal_0: cap-0 {
+					temperature = <70000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis3_thermal_1: cap-1 {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis3_thermal_2: cap-2 {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				chassis3_thermal_3: cap-3 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <88000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&chassis3_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&chassis3_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&chassis3_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&chassis3_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		smc-tp02-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 50>;
+			critical-action = "shutdown";
+
+			trips {
+				smc_tp02_thermal_0: cap-0 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp02_thermal_1: cap-1 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp02_thermal_2: cap-2 {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp02_thermal_3: cap-3 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <98000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&smc_tp02_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&smc_tp02_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&smc_tp02_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&smc_tp02_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		smc-tp06-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 52>;
+			critical-action = "shutdown";
+
+			trips {
+				smc_tp06_thermal_0: cap-0 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp06_thermal_1: cap-1 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp06_thermal_2: cap-2 {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp06_thermal_3: cap-3 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <98000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&smc_tp06_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&smc_tp06_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&smc_tp06_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&smc_tp06_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		smc-tp0e-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 56>;
+			critical-action = "shutdown";
+
+			trips {
+				smc_tp0e_thermal_0: cap-0 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp0e_thermal_1: cap-1 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp0e_thermal_2: cap-2 {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tp0e_thermal_3: cap-3 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <98000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&smc_tp0e_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&smc_tp0e_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&smc_tp0e_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&smc_tp0e_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		smc-tpx1-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 63>;
+			critical-action = "shutdown";
+
+			trips {
+				smc_tpx1_thermal_0: cap-0 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tpx1_thermal_1: cap-1 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tpx1_thermal_2: cap-2 {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tpx1_thermal_3: cap-3 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <98000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&smc_tpx1_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&smc_tpx1_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&smc_tpx1_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&smc_tpx1_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 
 		smc-tpx3-thermal {
-			polling-delay-passive = <1000>;
-			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
 			thermal-sensors = <&smc_hwmon 65>;
+			critical-action = "shutdown";
+
+			trips {
+				smc_tpx3_thermal_0: cap-0 {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tpx3_thermal_1: cap-1 {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tpx3_thermal_2: cap-2 {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				smc_tpx3_thermal_3: cap-3 {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+
+				trip-hot {
+					temperature = <92000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+
+				trip-critical {
+					temperature = <98000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&smc_tpx3_thermal_0>;
+					cooling-device = <&gpu 25 25>;
+				};
+				map1 {
+					trip = <&smc_tpx3_thermal_1>;
+					cooling-device = <&gpu 50 50>;
+				};
+				map2 {
+					trip = <&smc_tpx3_thermal_2>;
+					cooling-device = <&gpu 75 75>;
+				};
+				map3 {
+					trip = <&smc_tpx3_thermal_3>;
+					cooling-device = <&gpu 100 100>;
+				};
+			};
 		};
 	};
 
@@ -1916,6 +2499,7 @@
 };
 
 &gpu {
+	#cooling-cells = <2>;
 	status = "okay";
 };
 

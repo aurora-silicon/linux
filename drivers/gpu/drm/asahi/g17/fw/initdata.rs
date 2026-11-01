@@ -1594,7 +1594,8 @@ static_assert!(private::STATUS_B + size_of::<SecondaryConfig>() == private::SECO
 /// Die temperature sensors read by the die temperature limiter.
 const TEMP_SENSOR_MASK: u64 = 0x82a;
 /// Die temperature the limiter holds the GPU below, in 0.01 °C.
-const TEMP_TARGET: u32 = 11_000;
+// Conservative J700 bring-up policy; retain the native gains and 16 ms period.
+const TEMP_TARGET: u32 = 9_500;
 /// Die temperature below which the limiter releases, in 0.01 °C.
 const TEMP_RELEASE: u32 = 8_000;
 /// Proportional gain of the limiter: 20.34 as an IEEE-754 single.
