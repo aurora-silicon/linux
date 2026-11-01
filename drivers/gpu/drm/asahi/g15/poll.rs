@@ -737,7 +737,7 @@ impl Firmware {
             s.hz_ahead
         )?;
         self.pools.write_stats(f)?;
-        // What is left before the stamps wrap, and the renumbering margins (0: off).
+        // What is left before the stamps wrap, and the renumbering margins.
         let (compute_left, render_left) = self.stamps_left();
         writeln!(
             f,

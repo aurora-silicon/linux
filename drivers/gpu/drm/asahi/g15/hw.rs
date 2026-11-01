@@ -592,6 +592,12 @@ pub(crate) mod tuning {
     pub(crate) const PB_IDLE_MS: u32 = 1000;
     /// Posted PB blocks above which an idle engine reclaims the PB.
     pub(crate) const PB_RECLAIM_BLOCKS: u32 = 1024;
+    /// Renders before the TA stamp wrap within which the TA/FS stamps are renumbered while
+    /// nothing is in flight (the wrap is at about 16.7 million renders).
+    pub(crate) const STAMP_RESEED_MARGIN: u64 = 100_000;
+    /// Computes before the compute stamp wrap within which the compute stamp is renumbered
+    /// while nothing is in flight (the wrap is at 4128768 computes).
+    pub(crate) const COMPUTE_RESEED_MARGIN: u64 = 100_000;
     /// The most PB blocks that may be posted: one below the mapped heap's block count, so the
     /// block-list producer (modulo K = 4096) never returns to 0.
     pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS - 1;

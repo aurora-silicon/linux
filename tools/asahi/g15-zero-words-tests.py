@@ -14,7 +14,8 @@ MAX_VMS and its lifetime-slot comment only), and when Board::DeviceTree was
 gated on CONFIG_DRM_ASAHI_G15 for the T8122 runtime without the G15 backend
 (one #[cfg] line; the tables are unchanged), and when the initial PB posting
 and the idle reclaim became fixed tuning constants instead of module
-parameters (four constants; the tables are unchanged). Its T6030
+parameters (four constants; the tables are unchanged), and when the two stamp
+renumbering margins became tuning constants (the tables are unchanged). Its T6030
 configuration module is
 independently pinned to the original bytes,
 except for the J514S B0 FirmwareBuild row added to its firmware table: the
@@ -36,7 +37,7 @@ G15 = "drivers/gpu/drm/asahi/g15"
 GOLDEN_FILES = {
     "board/data.rs": "7c5ff1077ca3296cbfc9e7144294162b6dea78a3774c38eeed4b0f59a14d7a5c",
     "board/template.rs": "286872f5474a67534f214e83e659253299f85143f3dc59035fa80894022e2549",
-    "hw.rs": "4480fed5406a8c89f53aa4d63c5217705d68265eb4f06f00868460d535ff69a9",
+    "hw.rs": "c54a4f8342fb466f82f4b9cfed6a137ee1ca1f4d80ede4e1b7f397d39223558e",
     "power/idle.rs": "4928ecf7699b3ca85ff5143eb6e996efd40d47321e29a238a02c8873bc9f102c",
 }
 GOLDEN_FUNCTIONS = {
