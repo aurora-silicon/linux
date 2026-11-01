@@ -819,8 +819,10 @@ report:
 	roam = m->roam_moving;
 	WRITE_ONCE(m->roam_moving, false);
 	WRITE_ONCE(m->roam_landed, roam && !ret);
-	if (roam && ret)
+	if (roam && ret) {
 		netif_carrier_off(m->netdev);
+		mt_reg_apply_deferred_locked(m);
+	}
 	cancelled = m->connect_cancelled;
 	reason = m->disconnect_reason;
 	m->connect_publishing = true;
@@ -1012,6 +1014,7 @@ unlock:
 		netif_carrier_off(m->netdev);
 		cfg80211_disconnected(m->netdev, WLAN_REASON_DEAUTH_LEAVING, NULL, 0, true,
 				      GFP_ATOMIC);
+		mt_reg_apply_deferred_locked(m);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	if (!ret) {
@@ -1040,10 +1043,15 @@ void mt_disconnect_work(struct work_struct *work)
 	 */
 	spin_lock_irqsave(&m->response_lock, flags);
 	m->disconnecting = false;
-	/* A roam reports its end through the connect that follows. */
-	if (!m->roam_moving)
+	/* A roam reports its end through the connect that follows. A deferred
+	 * regulatory pass would close RF admission under it, so the connect
+	 * worker applies that once the move has failed, and a move that lands
+	 * keeps it for the end of the new connection.
+	 */
+	if (!m->roam_moving) {
 		mt_report_disconnected(m, reason, local, GFP_ATOMIC);
-	mt_reg_apply_deferred_locked(m);
+		mt_reg_apply_deferred_locked(m);
+	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	dev_dbg(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
 }

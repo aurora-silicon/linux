@@ -99,6 +99,7 @@ static void schedule_work(int*w){work_count++;}
 static void netif_carrier_on(struct net_device*n){carrier++;}
 static void netif_carrier_off(struct net_device*n){}
 static void mt_report_disconnected(struct mt7932*m,u16 r,bool local,gfp_t f){disconnections++;}
+static void mt_reg_apply_deferred_locked(struct mt7932*m){}
 static void netif_wake_queue(struct net_device*n){}
 static void cfg80211_port_authorized(struct net_device*n,const u8*b,const u8*p,size_t l,gfp_t f){authorizations++;}
 HELPER
