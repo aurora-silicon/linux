@@ -190,7 +190,7 @@ enum dcpep_method {
 	dcpep_pipe_query_478,
 	dcpep_pipe_query_474,
 	dcpep_pipe_set_476,
-	dcpep_pipe_set_428,
+	iomfbep_set_brightness_correction,
 	dcpep_num_methods
 };
 

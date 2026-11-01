@@ -501,8 +501,8 @@ DCP_THUNK_INOUT(dcp_pipe_cfg_414, dcpep_pipe_cfg_414, u64, u64);
 DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
-DCP_THUNK_INOUT(dcp_pipe_set_428, dcpep_pipe_set_428, u32, u32);
 #endif
+DCP_THUNK_INOUT(dcp_set_brightness_correction, iomfbep_set_brightness_correction, u32, u32);
 
 DCP_THUNK_VOID(dcp_first_client_open, dcpep_first_client_open);
 
@@ -3033,29 +3033,21 @@ static bool dcp_gamma_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_
 #endif
 
 #if DCP_FW_H17(DCP_FW_VER)
-/*
- * H17P expects A428 between set_matrix and swap_start, with 0x10000 (1.0 in
- * 16.16 fixed point), the same identity value the D006 reply carries.
- */
-#if DCP_FW_H17(DCP_FW_VER)
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
 {
 	do_swap(dcp, NULL, NULL);
 }
 #endif
 
-static void dcp_post_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
+/* After the colour matrix: the gamma table where there is one, then the swap. */
+static void dcp_matrix_next(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	do_swap(dcp, out, cookie);
-}
-
-static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
-{
-	u32 identity = 0x10000;
-
-	dcp_pipe_set_428(dcp, false, &identity, dcp_post_swap_a428, cookie);
-}
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+	dcp_gamma_then_swap(dcp, NULL, NULL);
+#else
+	do_swap(dcp, NULL, NULL);
 #endif
+}
 
 /*
  * The colour matrix reply, then the rest of the colour update and the swap.
@@ -3069,13 +3061,20 @@ static void dcp_set_matrix_done(struct apple_dcp *dcp, void *out, void *cookie)
 		dev_warn_ratelimited(dcp->dev, "colour matrix not applied (%s %u)\n",
 				     resp ? "status" : "no reply",
 				     resp ? resp->ret : 0);
-#if DCP_FW_H17(DCP_FW_VER)
-	dcp_pre_swap_a428(dcp, NULL, NULL);
-#elif DCP_FW_DESKTOP_26(DCP_FW_VER)
-	dcp_gamma_then_swap(dcp, NULL, NULL);
-#else
-	do_swap(dcp, NULL, NULL);
-#endif
+	/*
+	 * Every known working matrix update follows set_matrix with identity
+	 * brightness correction, 0x10000 (1.0 in 16.16), before the swap.
+	 * H17P requires it, and on 12.3/13.5 a location 9 matrix stays in
+	 * the firmware's cache without it. The reply is not a status.
+	 */
+	if (dcp_methods[iomfbep_set_brightness_correction].tag[0]) {
+		u32 identity = 0x10000;
+
+		dcp_set_brightness_correction(dcp, false, &identity,
+					      dcp_matrix_next, NULL);
+		return;
+	}
+	dcp_matrix_next(dcp, NULL, NULL);
 }
 
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
