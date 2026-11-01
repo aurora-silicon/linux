@@ -28,13 +28,21 @@
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/suspend.h>
+#include <linux/dma/apple-admac.h>
+#include <linux/ktime.h>
 #include <sound/core.h>
 #include <sound/jack.h>
 #include <sound/pcm.h>
 #include <sound/simple_card_utils.h>
 #include <sound/soc.h>
 #include <sound/soc-jack.h>
+#include <sound/dmaengine_pcm.h>
+#include <sound/pcm_params.h>
+#include <sound/tas27xx-energy.h>
+#include <uapi/sound/apple-speaker.h>
 #include <uapi/linux/input-event-codes.h>
+
+#include "speaker-energy.h"
 
 #define DRIVER_NAME "snd-soc-macaudio"
 
@@ -133,6 +141,8 @@ struct macaudio_platform_cfg {
 	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
 	 */
 	int jack_max_vol;
+	/* The alternate CPU component exposes a dmaengine playback runtime. */
+	bool energy_dmaengine;
 };
 
 static const char *volume_control_names[] = {
@@ -162,6 +172,21 @@ static const char *volume_control_names[] = {
 struct ma_codec_idle {
 	int idle_mode;
 	u32 idle_mask;
+};
+
+struct macaudio_snd_data;
+
+struct macaudio_energy_stream {
+	struct macaudio_snd_data *ma;
+	u64 epoch;
+	unsigned int channels;
+	int format;
+	bool prepared;
+	bool needs_prepare;
+	bool speakers;
+	bool opened;
+	bool attached;
+	struct dma_chan *chan;
 };
 
 struct macaudio_snd_data {
@@ -229,11 +254,339 @@ struct macaudio_snd_data {
 	 */
 	bool speaker_lock_failed;
 	struct work_struct lock_fail_work;
+	struct apple_energy_gate energy;
+	struct macaudio_energy_stream energy_stream[2];
+	struct snd_kcontrol *energy_kctl;
+	bool has_energy;
+	bool energy_enforced;
+	u32 energy_transfer;
+	u32 energy_tail_us[APPLE_ENERGY_SPEAKERS];
+	u32 energy_channels;
+	int energy_format;
+	/* -1 while a mux change owns the closed front ends, else open count. */
+	atomic_t energy_open;
 };
 
 static int please_blow_up_my_speakers;
 module_param(please_blow_up_my_speakers, int, 0644);
 MODULE_PARM_DESC(please_blow_up_my_speakers, "Deprecated: cannot bypass speaker admission or protection");
+
+static void macaudio_vlimit_update(struct macaudio_snd_data *ma);
+static bool macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock);
+
+static void macaudio_energy_fault(void *context)
+{
+	struct macaudio_energy_stream *stream = context;
+	struct macaudio_snd_data *ma = stream->ma;
+
+	apple_energy_revoke(&ma->energy);
+	WRITE_ONCE(ma->speaker_lock_failed, true);
+	schedule_work(&ma->lock_fail_work);
+}
+
+static int macaudio_energy_process(void *context, void *data, size_t bytes, u64 *ticket)
+{
+	struct macaudio_energy_stream *stream = context;
+	struct apple_energy_snapshot state;
+	unsigned int width = stream->format == SNDRV_PCM_FORMAT_S16_LE ? 2 : 4;
+
+	apple_energy_snapshot(&stream->ma->energy, &state);
+	if (!READ_ONCE(stream->prepared) || stream->epoch != state.epoch ||
+	    bytes % (width * stream->channels))
+		return -EPIPE;
+	return apple_energy_filter_pcm(&stream->ma->energy, data,
+			bytes / (width * stream->channels), stream->channels,
+			stream->format, ktime_get_boottime_ns(), ticket);
+}
+
+static int macaudio_energy_retire(void *context, u64 ticket)
+{
+	struct macaudio_energy_stream *stream = context;
+
+	return apple_energy_complete(&stream->ma->energy, ticket);
+}
+
+/* DT assigns one physical speaker to each full-width PCM slot. */
+static int macaudio_energy_transfer(struct macaudio_snd_data *ma)
+{
+	struct snd_soc_pcm_runtime *rtd;
+	unsigned int mask = 0, count = 0, transfer = 0;
+	int i, ret;
+
+	ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+	memset(ma->energy_tail_us, 0, sizeof(ma->energy_tail_us));
+	/* No uniform firmware/analogue/residual bound has yet been established
+	 * for the Neo. A digital tap or a finite sine probe is insufficient.
+	 * Never ask a TAS codec helper to certify this fixed-gain amplifier.
+	 */
+	if (ma->cfg->amp == AMP_MAX98360A)
+		return -EOPNOTSUPP;
+	if (!ma->has_energy || please_blow_up_my_speakers ||
+	    ma->max_channels > APPLE_ENERGY_SPEAKERS)
+		return -EOPNOTSUPP;
+	for_each_card_rtds(&ma->card, rtd) {
+		struct macaudio_link_props *props = &ma->link_props[rtd->dai_link->id];
+		struct snd_soc_dai *dai;
+		unsigned int slots;
+
+		if (!rtd->dai_link->no_pcm || !props->is_speakers)
+			continue;
+		slots = props->tdm_mask;
+		for_each_rtd_codec_dais(rtd, i, dai) {
+			struct tas27xx_playback_state state;
+			unsigned int slot;
+
+			if (!slots)
+				return -EINVAL;
+			slot = __ffs(slots);
+			if (slot >= APPLE_ENERGY_SPEAKERS || (mask & BIT(slot)))
+				return -EOPNOTSUPP;
+			slots &= ~BIT(slot);
+			if (ma->cfg->amp == AMP_SN012776)
+				ret = tas2764_playback_state(dai->component, &state);
+			else
+				ret = tas2770_playback_state(dai->component, &state);
+			if (ret)
+				return ret;
+			if (state.left_slot != slot || state.right_slot != slot ||
+			    state.gain_millidbv > 11000 + ma->cfg->amp_gain * 500 ||
+			    !state.transfer || (transfer && state.transfer != transfer))
+				return -EOPNOTSUPP;
+			transfer = state.transfer;
+			ma->energy_tail_us[slot] = state.tail_us;
+			mask |= BIT(slot);
+			count++;
+		}
+		if (slots)
+			return -EOPNOTSUPP;
+	}
+	if (!count || count != ma->max_channels || mask != BIT(count) - 1)
+		return -EOPNOTSUPP;
+	ma->energy_transfer = transfer;
+	return 0;
+}
+
+static bool macaudio_energy_owner(struct macaudio_snd_data *ma)
+{
+	struct snd_kcontrol *control;
+	int i;
+
+	if (!ma->speaker_lock_owner || !ma->energy_kctl ||
+	    ma->energy_kctl->vd[0].owner != ma->speaker_lock_owner)
+		return false;
+	list_for_each_entry(control, &ma->card.snd_card->controls, list) {
+		if (!snd_soc_control_matches(control, volume_control_names[ma->cfg->amp]) &&
+		    !snd_soc_control_matches(control, "* Amp Gain Volume"))
+			continue;
+		for (i = 0; i < control->count; i++)
+			if (control->vd[i].owner != ma->speaker_lock_owner)
+				return false;
+	}
+	return true;
+}
+
+/* Jack/DAPM pin changes need not pass through a userspace control. Any
+ * open raw FE must therefore keep the existing hardware caps down, even
+ * when its current route is headphones. Startup revokes before it can run.
+ */
+static bool macaudio_energy_frontends_ready(struct macaudio_snd_data *ma, u64 epoch)
+{
+	unsigned int k;
+
+	for (k = 0; k < ARRAY_SIZE(ma->energy_stream); k++) {
+		struct macaudio_energy_stream *stream = &ma->energy_stream[k];
+
+		if (!READ_ONCE(stream->opened))
+			continue;
+		if (!READ_ONCE(stream->prepared) || READ_ONCE(stream->needs_prepare) ||
+		    !READ_ONCE(stream->attached) || !READ_ONCE(stream->speakers) ||
+		    READ_ONCE(stream->epoch) != epoch)
+			return false;
+	}
+	return true;
+}
+
+static bool macaudio_energy_permitted(struct macaudio_snd_data *ma)
+{
+	struct apple_energy_snapshot state;
+	unsigned int k;
+
+	apple_energy_snapshot(&ma->energy, &state);
+	for (k = 0; k < state.speakers; k++)
+		if (state.unbudgeted[k])
+			return false;
+	return ma->energy_transfer && state.configured && state.enabled &&
+		macaudio_energy_frontends_ready(ma, state.epoch) &&
+		!state.failed && ktime_get_boottime_ns() < state.deadline_ns &&
+		macaudio_energy_owner(ma);
+}
+
+/* The ABI describes submitted payloads, which may differ from user PCM. */
+static int macaudio_energy_payload_format(struct macaudio_snd_data *ma,
+					 struct snd_pcm_runtime *runtime,
+					 bool sw_gain)
+{
+	if (ma->cfg->sw_gain_dai) {
+		if (!sw_gain || ma->cfg->amp != AMP_MAX98360A ||
+		    runtime->format != SNDRV_PCM_FORMAT_S32_LE ||
+		    runtime->channels != 2 || runtime->rate != 48000)
+			return -EINVAL;
+		return APPLE_ENERGY_FORMAT_NEO_F32;
+	}
+	if (runtime->format != SNDRV_PCM_FORMAT_S16_LE &&
+	    runtime->format != SNDRV_PCM_FORMAT_S24_LE &&
+	    runtime->format != SNDRV_PCM_FORMAT_S32_LE)
+		return -EINVAL;
+	return runtime->format;
+}
+
+static int macaudio_energy_prepare(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+	struct macaudio_energy_stream *stream;
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct apple_admac_playback_filter filter;
+	struct apple_energy_snapshot state;
+	struct snd_soc_dpcm *dpcm;
+	u8 slots[APPLE_ENERGY_SPEAKERS];
+	unsigned int k;
+	int ret;
+
+	/* Qualification is established before exposing the card. An optional,
+	 * unqualified control must not probe sleeping codec I/O under the legacy
+	 * volume mutex: that could delay its time-based fallback. Once enforced,
+	 * immutable refills bound energy independently of that mutex/workqueue.
+	 */
+	if (!ma->has_energy || !ma->energy_enforced ||
+	    substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+		return 0;
+	if (rtd->dai_link->id >= ARRAY_SIZE(ma->energy_stream))
+		return -EINVAL;
+	stream = &ma->energy_stream[rtd->dai_link->id];
+	stream->chan = snd_dmaengine_pcm_get_chan(substream);
+	ret = dmaengine_terminate_sync(stream->chan);
+	if (!ret)
+		ret = apple_admac_playback_quiesced(stream->chan);
+	if (ret) {
+		macaudio_energy_fault(stream);
+		return ret;
+	}
+	stream->prepared = false;
+	stream->speakers = false;
+	for_each_dpcm_be(rtd, substream->stream, dpcm)
+		if (ma->link_props[dpcm->be->dai_link->id].is_speakers)
+			stream->speakers = true;
+	if (!stream->speakers) {
+		ret = apple_admac_set_playback_filter(stream->chan, NULL);
+		stream->attached = false;
+		return ret == -EOPNOTSUPP ? 0 : ret;
+	}
+	mutex_lock(&ma->volume_lock_mutex);
+	apple_energy_revoke(&ma->energy);
+	ma->speaker_lock_remain = 0;
+	ret = macaudio_energy_transfer(ma);
+	if (!ret)
+		ma->energy_enforced = true;
+	/* Once enforced, a lost certificate must never restore a raw route. */
+	if (!ma->energy_enforced) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		return 0;
+	}
+	macaudio_vlimit_update(ma);
+	if (!macaudio_vlimit_unlock(ma, false)) {
+		mutex_unlock(&ma->volume_lock_mutex);
+		return -EIO;
+	}
+	ret = macaudio_energy_payload_format(ma, runtime,
+			ma->link_props[rtd->dai_link->id].sw_gain);
+	if (ret < 0) {
+		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+		mutex_unlock(&ma->volume_lock_mutex);
+		return -EINVAL;
+	}
+	if (runtime->period_size > APPLE_ENERGY_MAX_FRAMES) {
+		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+		mutex_unlock(&ma->volume_lock_mutex);
+		return -EINVAL;
+	}
+	if (runtime->channels != ma->max_channels)
+		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+	stream->channels = runtime->channels;
+	stream->format = ret;
+	ma->energy_channels = runtime->channels;
+	ma->energy_format = stream->format;
+	for (k = 0; k < min_t(unsigned int, runtime->channels, ARRAY_SIZE(slots)); k++)
+		slots[k] = k;
+	ret = apple_energy_configure(&ma->energy, runtime->rate, runtime->channels,
+				    runtime->channels, slots);
+	if (!ret && ma->energy_transfer)
+		ret = apple_energy_metric(&ma->energy,
+			ma->energy_transfer == MACAUDIO_ENERGY_TRANSFER_BOUNDED_CURRENT ?
+			APPLE_ENERGY_ABSOLUTE : APPLE_ENERGY_SQUARED);
+	if (ret)
+		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+	/* TAS DVC max=1 is -100 dB; the integer gain rounds downward. */
+	apple_energy_fallback(&ma->energy, ma->cfg->sw_gain_dai ? 0 : 21474);
+	apple_energy_snapshot(&ma->energy, &state);
+	stream->epoch = state.epoch;
+	macaudio_vlimit_update(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
+	if (ret)
+		return ret;
+	filter = (struct apple_admac_playback_filter) {
+		.source = runtime->dma_area,
+		.source_dma = runtime->dma_addr,
+		.buffer_bytes = snd_pcm_lib_buffer_bytes(substream),
+		.period_bytes = snd_pcm_lib_period_bytes(substream),
+		.context = stream,
+		.process = macaudio_energy_process,
+		.retire = macaudio_energy_retire,
+		.fault = macaudio_energy_fault,
+	};
+	ret = apple_admac_set_playback_filter(stream->chan, &filter);
+	if (ret) {
+		macaudio_energy_fault(stream);
+		return ret;
+	}
+	stream->attached = true;
+	stream->needs_prepare = false;
+	WRITE_ONCE(stream->prepared, true);
+	/* Rate notification can precede prepare: wake userspace when ready too. */
+	snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &ma->energy_kctl->id);
+	return 0;
+}
+
+static void macaudio_energy_shutdown(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+	struct macaudio_energy_stream *stream;
+	bool quiesced = true;
+
+	if (!ma->has_energy || rtd->dai_link->no_pcm ||
+	    substream->stream != SNDRV_PCM_STREAM_PLAYBACK ||
+	    rtd->dai_link->id >= ARRAY_SIZE(ma->energy_stream))
+		return;
+	stream = &ma->energy_stream[rtd->dai_link->id];
+	if (stream->chan) {
+		quiesced = !dmaengine_terminate_sync(stream->chan) &&
+			!apple_admac_playback_quiesced(stream->chan);
+		if (quiesced && stream->attached)
+			quiesced = !apple_admac_set_playback_filter(stream->chan, NULL);
+		stream->chan = NULL;
+	}
+	if (!quiesced)
+		macaudio_energy_fault(stream);
+	stream->attached = false;
+	stream->prepared = false;
+	stream->needs_prepare = true;
+	/* Retain route exclusion forever when even a raw FE may still be active. */
+	if (stream->opened && quiesced) {
+		stream->opened = false;
+		atomic_dec(&ma->energy_open);
+	}
+}
 
 SND_SOC_DAILINK_DEFS(primary,
 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
@@ -325,22 +678,26 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
 	}
 };
 
-static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
+static bool macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 {
 	int ret, max, hits = 0;
 	const char *name = volume_control_names[ma->cfg->amp];
 	struct snd_kcontrol *kctl;
 	bool failed = false;
+	bool requested = unlock;
 
 	if (!name) {
 		WARN_ON_ONCE(1);
-		return;
+		return false;
 	}
+	/* Charge every cached raw payload before any volume range is raised. */
+	if (unlock && ma->has_energy && apple_energy_hardware_safe(&ma->energy, false))
+		unlock = false;
 
 	switch (ma->cfg->amp) {
 	case AMP_NONE:
 		WARN_ON_ONCE(1);
-		return;
+		return false;
 	case AMP_TAS5770:
 		if (unlock)
 			max = TAS5770_0DB;
@@ -399,6 +756,12 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 		WRITE_ONCE(ma->speaker_lock_failed, true);
 		schedule_work(&ma->lock_fail_work);
 	}
+	/* A copy-time gain is not a cap on already converted queued words.
+	 * Neo copies must always be billed, never cached raw or refunded.
+	 */
+	if (!unlock && !failed && hits && ma->has_energy && !ma->cfg->sw_gain_dai)
+		apple_energy_hardware_safe(&ma->energy, true);
+	return !failed && hits && (!requested || unlock);
 }
 
 /*
@@ -452,6 +815,11 @@ static void macaudio_lock_fail_work(struct work_struct *work)
 						  lock_fail_work);
 
 	dev_crit(ma->card.dev, "speaker volume lock failed: stopping and refusing playback\n");
+	mutex_lock(&ma->volume_lock_mutex);
+	ma->speaker_lock_remain = 0;
+	apple_energy_revoke(&ma->energy);
+	macaudio_vlimit_update(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
 	macaudio_stop_playback(ma, false);
 }
 
@@ -489,6 +857,14 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 		reason = "System suspend";
 		unlock = false;
 	}
+	if (READ_ONCE(ma->speaker_lock_failed)) {
+		reason = "A speaker lock or playback gate failed";
+		unlock = false;
+	}
+	if (ma->energy_enforced && !macaudio_energy_permitted(ma)) {
+		reason = "No valid playback energy grant";
+		unlock = false;
+	}
 
 	/* Check that *every* limited control is locked by the same owner */
 	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
@@ -505,6 +881,10 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 
 
 	if (unlock != ma->speaker_volume_unlocked) {
+		if (!macaudio_vlimit_unlock(ma, unlock) && unlock)
+			unlock = false;
+		if (unlock == ma->speaker_volume_unlocked)
+			return;
 		if (unlock) {
 			dev_info(ma->card.dev, "Speaker volumes unlocked\n");
 		} else  {
@@ -514,7 +894,6 @@ static void macaudio_vlimit_update(struct macaudio_snd_data *ma)
 				ma->speaker_volume_was_locked = true;
 		}
 
-		macaudio_vlimit_unlock(ma, unlock);
 		if (!unlock && ma->cfg->amp == AMP_MAX98360A) {
 			/* Samples already converted at the old gain must not play */
 			atomic_inc(&ma->sw_gain_lock_epoch);
@@ -557,6 +936,10 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 	if (quiesce) {
 		cancel_delayed_work(&ma->lock_timeout_work);
 		ma->speaker_lock_remain = 0;
+		apple_energy_revoke(&ma->energy);
+		ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+		ma->energy_stream[0].needs_prepare = true;
+		ma->energy_stream[1].needs_prepare = true;
 	}
 	macaudio_vlimit_update(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
@@ -591,6 +974,12 @@ static void macaudio_vlimit_disable_timeout(struct macaudio_snd_data *ma)
 	ktime_t now;
 
 	mutex_lock(&ma->volume_lock_mutex);
+	/* An energy deadline is absolute, including idle gaps. Same lease/work. */
+	if (ma->energy_enforced) {
+		macaudio_vlimit_update(ma);
+		mutex_unlock(&ma->volume_lock_mutex);
+		return;
+	}
 
 	if (!ma->speaker_lock_timeout_enabled) {
 		mutex_unlock(&ma->volume_lock_mutex);
@@ -642,6 +1031,8 @@ static void macaudio_vlimit_timeout_work(struct work_struct *wrk)
 	}
 
 	ma->speaker_lock_remain = 0;
+	if (ma->energy_enforced)
+		apple_energy_revoke(&ma->energy);
 	macaudio_vlimit_update(ma);
 
 out:
@@ -1169,6 +1560,37 @@ static int macaudio_fe_startup(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		return ret;
 
+	if (ma->energy_enforced && substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		ret = snd_pcm_hw_constraint_minmax(substream->runtime,
+				SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 1, APPLE_ENERGY_MAX_FRAMES);
+		if (ret)
+			return ret;
+	}
+	if (ma->has_energy && substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		int count = atomic_read(&ma->energy_open);
+
+		if (rtd->dai_link->id >= ARRAY_SIZE(ma->energy_stream))
+			return -EINVAL;
+		do {
+			if (count < 0)
+				return -EBUSY;
+		} while (!atomic_try_cmpxchg(&ma->energy_open, &count, count + 1));
+		ma->energy_stream[rtd->dai_link->id].opened = true;
+		if (ma->energy_enforced) {
+			/* Before DMA can start or an automatic jack event can route it. */
+			mutex_lock(&ma->volume_lock_mutex);
+			apple_energy_revoke(&ma->energy);
+			ma->speaker_lock_remain = 0;
+			macaudio_vlimit_update(ma);
+			ret = READ_ONCE(ma->speaker_lock_failed) ? -EIO : 0;
+			mutex_unlock(&ma->volume_lock_mutex);
+			if (ret) {
+				ma->energy_stream[rtd->dai_link->id].opened = false;
+				atomic_dec(&ma->energy_open);
+				return ret;
+			}
+		}
+	}
 	return 0;
 }
 
@@ -1202,6 +1624,8 @@ static void macaudio_dpcm_shutdown(struct snd_pcm_substream *substream)
 	struct snd_soc_dai *dai;
 	int bclk_ratio = macaudio_get_runtime_bclk_ratio(substream);
 	int i;
+
+	macaudio_energy_shutdown(substream);
 
 	if (bclk_ratio) {
 		for_each_rtd_codec_dais(rtd, i, dai)
@@ -1269,10 +1693,14 @@ static int macaudio_fe_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+	int ret;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
 	    READ_ONCE(ma->speaker_lock_failed))
 		return -EIO;
+	ret = macaudio_energy_prepare(substream);
+	if (ret)
+		return ret;
 
 	if (!macaudio_sw_gain_pcm(substream))
 		return 0;
@@ -1295,6 +1723,7 @@ static int macaudio_fe_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+	struct macaudio_energy_stream *stream;
 
 	/*
 	 * A prepare can pass just before a failed lock is recorded and the
@@ -1309,6 +1738,33 @@ static int macaudio_fe_trigger(struct snd_pcm_substream *substream, int cmd)
 			return -EIO;
 		default:
 			break;
+		}
+	}
+	if (ma->has_energy && ma->energy_enforced &&
+	    substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+	    rtd->dai_link->id < ARRAY_SIZE(ma->energy_stream)) {
+		struct apple_energy_snapshot state;
+
+		stream = &ma->energy_stream[rtd->dai_link->id];
+		if (stream->speakers) {
+			apple_energy_snapshot(&ma->energy, &state);
+			switch (cmd) {
+			case SNDRV_PCM_TRIGGER_START:
+			case SNDRV_PCM_TRIGGER_RESUME:
+			case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+				if (!READ_ONCE(stream->prepared) || !stream->attached ||
+				    stream->needs_prepare || stream->epoch != state.epoch ||
+				    state.failed)
+					return -EPIPE;
+				break;
+			case SNDRV_PCM_TRIGGER_STOP:
+			case SNDRV_PCM_TRIGGER_SUSPEND:
+				stream->needs_prepare = true;
+				fallthrough;
+			case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+				apple_energy_revoke(&ma->energy);
+				break;
+			}
 		}
 	}
 
@@ -1609,6 +2065,29 @@ static int macaudio_add_pin_routes(struct snd_soc_card *card, struct snd_soc_com
 	return ret;
 }
 
+/* INACTIVE is a UI hint, not write exclusion. Fixed speaker transforms
+ * must also be read-only to userspace before a transfer can be certified.
+ */
+static void macaudio_energy_fixed_controls(struct snd_soc_card *card, const char *prefix)
+{
+	static const char * const names[] = {
+		"ASI1 Sel", "HPF Corner Frequency", "OCE Handling",
+	};
+	struct snd_kcontrol *control;
+	unsigned int k, i;
+	char name[sizeof(control->id.name)];
+
+	for (k = 0; k < ARRAY_SIZE(names); k++) {
+		snprintf(name, sizeof(name), "%s%s%s", prefix ?: "", prefix ? " " : "", names[k]);
+		list_for_each_entry(control, &card->snd_card->controls, list) {
+			if (strcmp(control->id.name, name))
+				continue;
+			for (i = 0; i < control->count; i++)
+				control->vd[i].access &= ~SNDRV_CTL_ELEM_ACCESS_WRITE;
+		}
+	}
+}
+
 static int macaudio_late_probe(struct snd_soc_card *card)
 {
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
@@ -1631,6 +2110,8 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		}
 
 		for_each_rtd_codec_dais(rtd, i, dai) {
+			if (ma->has_energy && props->is_speakers)
+				macaudio_energy_fixed_controls(card, dai->component->name_prefix);
 			ret = macaudio_add_pin_routes(card, dai->component,
 						      props->is_speakers);
 
@@ -1649,6 +2130,14 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		mutex_lock(&ma->volume_lock_mutex);
 		macaudio_vlimit_unlock(ma, false);
 		mutex_unlock(&ma->volume_lock_mutex);
+	}
+
+	if (ma->has_energy) {
+		ma->energy_kctl = snd_soc_card_get_kcontrol(card, "Speaker Energy Grant");
+		if (!ma->energy_kctl)
+			return -EINVAL;
+		if (!macaudio_energy_transfer(ma))
+			ma->energy_enforced = true;
 	}
 
 	/* Append identity metadata without renumbering the existing controls. */
@@ -1818,8 +2307,58 @@ static const char * const macaudio_spk_mux_texts[] = {
 
 SOC_ENUM_SINGLE_VIRT_DECL(macaudio_spk_mux_enum, macaudio_spk_mux_texts);
 
+static int macaudio_energy_mux_put(struct snd_kcontrol *control,
+				   struct snd_ctl_elem_value *value)
+{
+	struct snd_soc_dapm_context *dapm = snd_soc_dapm_kcontrol_to_dapm(control);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(snd_soc_dapm_to_card(dapm));
+	int ret;
+
+	if (!ma->energy_enforced)
+		return snd_soc_dapm_put_enum_double(control, value);
+	if (READ_ONCE(ma->speaker_lock_failed))
+		return -EIO;
+	/* FE shutdown proves DMA stopped before dropping this open count. */
+	if (atomic_cmpxchg(&ma->energy_open, 0, -1))
+		return -EBUSY;
+	mutex_lock(&ma->volume_lock_mutex);
+	apple_energy_revoke(&ma->energy);
+	ma->speaker_lock_remain = 0;
+	ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+	macaudio_vlimit_update(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
+	ret = snd_soc_dapm_put_enum_double(control, value);
+	atomic_set(&ma->energy_open, 0);
+	return ret;
+}
+
+static int macaudio_energy_pin_put(struct snd_kcontrol *control,
+				   struct snd_ctl_elem_value *value)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(control);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	int ret;
+
+	if (!ma->energy_enforced)
+		return snd_soc_dapm_put_pin_switch(control, value);
+	if (READ_ONCE(ma->speaker_lock_failed))
+		return -EIO;
+	if (atomic_cmpxchg(&ma->energy_open, 0, -1))
+		return -EBUSY;
+	mutex_lock(&ma->volume_lock_mutex);
+	apple_energy_revoke(&ma->energy);
+	ma->speaker_lock_remain = 0;
+	ma->energy_transfer = MACAUDIO_ENERGY_TRANSFER_NONE;
+	macaudio_vlimit_update(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
+	ret = snd_soc_dapm_put_pin_switch(control, value);
+	atomic_set(&ma->energy_open, 0);
+	return ret;
+}
+
 static const struct snd_kcontrol_new macaudio_spk_mux =
-	SOC_DAPM_ENUM("Speaker Playback Mux", macaudio_spk_mux_enum);
+	SOC_DAPM_ENUM_EXT("Speaker Playback Mux", macaudio_spk_mux_enum,
+			 snd_soc_dapm_get_enum_double, macaudio_energy_mux_put);
 
 static const char * const macaudio_hp_mux_texts[] = {
 	"Primary",
@@ -1829,7 +2368,8 @@ static const char * const macaudio_hp_mux_texts[] = {
 SOC_ENUM_SINGLE_VIRT_DECL(macaudio_hp_mux_enum, macaudio_hp_mux_texts);
 
 static const struct snd_kcontrol_new macaudio_hp_mux =
-	SOC_DAPM_ENUM("Headphones Playback Mux", macaudio_hp_mux_enum);
+	SOC_DAPM_ENUM_EXT("Headphones Playback Mux", macaudio_hp_mux_enum,
+			 snd_soc_dapm_get_enum_double, macaudio_energy_mux_put);
 
 static const struct snd_soc_dapm_widget macaudio_snd_widgets[] = {
 	SND_SOC_DAPM_SPK("Speaker", NULL),
@@ -1882,6 +2422,27 @@ static int macaudio_slk_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_
 	return 0;
 }
 
+/* Both controls renew the one existing volume-unlock lease. */
+static void macaudio_renew_lease(struct macaudio_snd_data *ma)
+{
+	u64 remain = (u64)SPEAKER_LOCK_TIMEOUT * NSEC_PER_MSEC;
+
+	cancel_delayed_work(&ma->lock_timeout_work);
+	if (ma->energy_enforced) {
+		struct apple_energy_snapshot state;
+		u64 now = ktime_get_boottime_ns();
+
+		apple_energy_snapshot(&ma->energy, &state);
+		remain = state.deadline_ns > now ? min(remain, state.deadline_ns - now) : 0;
+		ma->speaker_lock_timeout_enabled = true;
+	}
+	ma->speaker_lock_remain = ns_to_ktime(remain);
+	ma->speaker_lock_timeout = ktime_add(ktime_get(), ma->speaker_lock_remain);
+	macaudio_vlimit_update(ma);
+	if (ma->speaker_lock_timeout_enabled && remain)
+		schedule_delayed_work(&ma->lock_timeout_work, nsecs_to_jiffies(remain));
+}
+
 static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *uvalue)
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
@@ -1920,17 +2481,7 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 		return 0;
 	}
 
-	cancel_delayed_work(&ma->lock_timeout_work);
-
-	ma->speaker_lock_remain = ms_to_ktime(SPEAKER_LOCK_TIMEOUT);
-	ma->speaker_lock_timeout = ktime_add(ktime_get(), ma->speaker_lock_remain);
-	macaudio_vlimit_update(ma);
-
-	if (ma->speaker_lock_timeout_enabled) {
-		dev_dbg(ma->card.dev, "Volume limit timeout ping: %ld us left\n",
-			(long)ktime_to_us(ma->speaker_lock_remain));
-		schedule_delayed_work(&ma->lock_timeout_work, usecs_to_jiffies(ktime_to_us(ma->speaker_lock_remain)));
-	}
+	macaudio_renew_lease(ma);
 
 	mutex_unlock(&ma->volume_lock_mutex);
 
@@ -1964,6 +2515,7 @@ static int macaudio_slk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 	ma->speaker_lock_timeout = 0;
 
 	ma->speaker_lock_owner = owner;
+	apple_energy_revoke(&ma->energy);
 	macaudio_vlimit_update(ma);
 
 	/*
@@ -1989,8 +2541,196 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
 	ma->speaker_lock_owner = NULL;
 	ma->speaker_lock_remain = 0;
 	ma->speaker_lock_timeout = 0;
+	apple_energy_revoke(&ma->energy);
 	macaudio_vlimit_update(ma);
 	mutex_unlock(&ma->volume_lock_mutex);
+}
+
+static int macaudio_energy_info(struct snd_kcontrol *control,
+				struct snd_ctl_elem_info *info)
+{
+	static_assert(sizeof(struct macaudio_energy_ctl) == 512);
+	info->type = SNDRV_CTL_ELEM_TYPE_BYTES;
+	info->count = sizeof(struct macaudio_energy_ctl);
+	return 0;
+}
+
+static int macaudio_energy_get(struct snd_kcontrol *control,
+			       struct snd_ctl_elem_value *value)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(control);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	struct macaudio_energy_ctl *out = (void *)value->value.bytes.data;
+	struct apple_energy_snapshot state;
+	u32 flags = MACAUDIO_ENERGY_AVAILABLE;
+	unsigned int k;
+
+	mutex_lock(&ma->volume_lock_mutex);
+	apple_energy_snapshot(&ma->energy, &state);
+	if (state.configured && ma->energy_channels == ma->max_channels &&
+	    macaudio_energy_frontends_ready(ma, state.epoch))
+		flags |= MACAUDIO_ENERGY_CONFIGURED;
+	if (ma->energy_transfer)
+		flags |= MACAUDIO_ENERGY_TRANSFER_VALID;
+	if (state.failed || READ_ONCE(ma->speaker_lock_failed))
+		flags |= MACAUDIO_ENERGY_FAILED;
+	if (macaudio_energy_owner(ma))
+		flags |= MACAUDIO_ENERGY_OWNED;
+	if (ma->energy_enforced)
+		flags |= MACAUDIO_ENERGY_REQUIRED;
+	if (state.enabled && state.clock_ns < state.deadline_ns)
+		flags |= MACAUDIO_ENERGY_LIVE;
+	if (READ_ONCE(ma->bes_active))
+		flags |= MACAUDIO_ENERGY_PLAYING;
+	memset(out, 0, sizeof(*out));
+	out->version = cpu_to_le32(MACAUDIO_ENERGY_VERSION);
+	out->flags = cpu_to_le32(flags);
+	out->epoch = cpu_to_le64(state.epoch);
+	out->sequence = cpu_to_le64(state.sequence);
+	out->clock_ns = cpu_to_le64(state.clock_ns);
+	out->deadline_ns = cpu_to_le64(state.deadline_ns);
+	out->rate = cpu_to_le32(state.rate);
+	out->channels = cpu_to_le32(ma->energy_channels);
+	out->speakers = cpu_to_le32(ma->max_channels);
+	out->format = cpu_to_le32(ma->energy_format);
+	out->transfer = cpu_to_le32(ma->energy_transfer);
+	out->amp_gain_millidbv = cpu_to_le32(ma->cfg->sw_gain_dai ? 0 :
+						11000 + ma->cfg->amp_gain * 500);
+	out->safe_reduction_millidb = cpu_to_le32(ma->cfg->sw_gain_dai ?
+						 -ma->cfg->safe_vol * 1000 : 100000);
+	out->pending = cpu_to_le32(state.pending);
+	strscpy((char *)out->card_id, card->snd_card->id, sizeof(out->card_id));
+	for (k = 0; k < APPLE_ENERGY_SPEAKERS; k++) {
+		out->slot[k] = cpu_to_le32(k);
+		out->submitted[k] = cpu_to_le64(state.submitted[k]);
+		out->completed[k] = cpu_to_le64(state.completed[k]);
+		out->source_submitted[k] = cpu_to_le64(state.source_submitted[k]);
+		out->source_completed[k] = cpu_to_le64(state.source_completed[k]);
+		out->refunded[k] = cpu_to_le64(state.refunded[k]);
+		out->unbudgeted[k] = cpu_to_le64(state.unbudgeted[k]);
+		out->ceiling[k] = cpu_to_le64(state.ceiling[k]);
+		out->gain_q31[k] = cpu_to_le32(state.gain_q31[k]);
+		out->tail_us[k] = cpu_to_le32(ma->energy_tail_us[k]);
+	}
+	mutex_unlock(&ma->volume_lock_mutex);
+	return 0;
+}
+
+static int macaudio_energy_lock(struct snd_kcontrol *control, struct snd_ctl_file *owner)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(control);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	int ret;
+
+	mutex_lock(&ma->volume_lock_mutex);
+	ret = ma->speaker_lock_owner == owner ? 0 : -EPERM;
+	mutex_unlock(&ma->volume_lock_mutex);
+	return ret;
+}
+
+static void macaudio_energy_unlock(struct snd_kcontrol *control)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(control);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+
+	mutex_lock(&ma->volume_lock_mutex);
+	apple_energy_revoke(&ma->energy);
+	ma->speaker_lock_remain = 0;
+	macaudio_vlimit_update(ma);
+	mutex_unlock(&ma->volume_lock_mutex);
+}
+
+static int macaudio_energy_put(struct snd_kcontrol *control,
+			       struct snd_ctl_elem_value *value)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(control);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	const struct macaudio_energy_ctl *in = (const void *)value->value.bytes.data;
+	struct apple_energy_snapshot expected = {};
+	u64 ceiling[APPLE_ENERGY_SPEAKERS], now, deadline;
+	u32 gains[APPLE_ENERGY_SPEAKERS];
+	unsigned int k;
+	int ret = -EINVAL;
+
+	mutex_lock(&ma->volume_lock_mutex);
+	if (!macaudio_energy_owner(ma)) {
+		ret = -EPERM;
+		goto fail;
+	}
+	if (le32_to_cpu(in->version) != MACAUDIO_ENERGY_VERSION)
+		goto fail;
+	for (k = 0; k < APPLE_ENERGY_SPEAKERS; k++)
+		if (le32_to_cpu(in->tail_us[k]) != ma->energy_tail_us[k]) {
+			ret = -ESTALE;
+			goto fail;
+		}
+	if (le32_to_cpu(in->flags) == MACAUDIO_ENERGY_REVOKE) {
+		apple_energy_revoke(&ma->energy);
+		ma->speaker_lock_remain = 0;
+		macaudio_vlimit_update(ma);
+		ret = 0;
+		goto out;
+	}
+	if (le32_to_cpu(in->flags) || ma->pm_quiesced ||
+	    READ_ONCE(ma->speaker_lock_failed))
+		goto fail;
+	if (!ma->energy_enforced || !ma->energy_transfer) {
+		ret = -EOPNOTSUPP;
+		goto fail;
+	}
+	apple_energy_snapshot(&ma->energy, &expected);
+	if (!macaudio_energy_frontends_ready(ma, expected.epoch)) {
+		ret = -EAGAIN;
+		goto fail;
+	}
+	if (le32_to_cpu(in->rate) != expected.rate ||
+	    le32_to_cpu(in->channels) != ma->energy_channels ||
+	    ma->energy_channels != ma->max_channels ||
+	    le32_to_cpu(in->speakers) != ma->max_channels ||
+	    le32_to_cpu(in->format) != ma->energy_format ||
+	    le32_to_cpu(in->transfer) != ma->energy_transfer ||
+	    le32_to_cpu(in->amp_gain_millidbv) != (ma->cfg->sw_gain_dai ? 0 :
+						  11000 + ma->cfg->amp_gain * 500) ||
+	    le32_to_cpu(in->safe_reduction_millidb) != (ma->cfg->sw_gain_dai ?
+						 -ma->cfg->safe_vol * 1000 : 100000) ||
+	    strncmp((const char *)in->card_id, card->snd_card->id, sizeof(in->card_id))) {
+		ret = -ESTALE;
+		goto fail;
+	}
+	deadline = le64_to_cpu(in->deadline_ns);
+	now = ktime_get_boottime_ns();
+	if (deadline <= now) {
+		ret = -ETIMEDOUT;
+		goto fail;
+	}
+	if (deadline - now > (u64)SPEAKER_LOCK_TIMEOUT * NSEC_PER_MSEC)
+		goto fail;
+	for (k = 0; k < APPLE_ENERGY_SPEAKERS; k++) {
+		if (le32_to_cpu(in->slot[k]) != k)
+			goto fail;
+		ceiling[k] = le64_to_cpu(in->ceiling[k]);
+		gains[k] = le32_to_cpu(in->gain_q31[k]);
+	}
+	expected.epoch = le64_to_cpu(in->epoch);
+	expected.sequence = le64_to_cpu(in->sequence);
+	ret = apple_energy_grant_gains(&ma->energy, &expected, ceiling, gains, now, deadline);
+	if (ret == -EAGAIN) {
+		/* Protected copies replace the unaffordable safe-level raw prefix. */
+		ma->speaker_lock_remain = 0;
+		macaudio_vlimit_update(ma);
+		goto out;
+	}
+	if (ret)
+		goto fail;
+	macaudio_renew_lease(ma);
+	goto out;
+fail:
+	apple_energy_revoke(&ma->energy);
+	ma->speaker_lock_remain = 0;
+	macaudio_vlimit_update(ma);
+out:
+	mutex_unlock(&ma->volume_lock_mutex);
+	return ret;
 }
 
 /*
@@ -1998,16 +2738,30 @@ static void macaudio_slk_unlock(struct snd_kcontrol *kcontrol)
  * leaving sample rate, since that can be useful for safety
  * bring-up before the kernel-side caps are ready.
  */
-#define MACAUDIO_NUM_SPEAKER_LIMIT_CONTROLS 1
+#define MACAUDIO_NUM_SPEAKER_LIMIT_CONTROLS 2
 /*
  * If there are no speakers configured at all, we can drop both
  * controls.
  */
-#define MACAUDIO_NUM_SPEAKER_CONTROLS 2
+#define MACAUDIO_NUM_SPEAKER_CONTROLS 3
 
 static const struct snd_kcontrol_new macaudio_controls[] = {
-	SOC_DAPM_PIN_SWITCH("Speaker"),
-	SOC_DAPM_PIN_SWITCH("Headphone"),
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Speaker Switch",
+		.info = snd_soc_dapm_info_pin_switch,
+		.get = snd_soc_dapm_get_pin_switch,
+		.put = macaudio_energy_pin_put,
+		.private_value = (unsigned long)"Speaker",
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.name = "Headphone Switch",
+		.info = snd_soc_dapm_info_pin_switch,
+		.get = snd_soc_dapm_get_pin_switch,
+		.put = macaudio_energy_pin_put,
+		.private_value = (unsigned long)"Headphone",
+	},
 	SOC_DAPM_PIN_SWITCH("Headset Mic"),
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
@@ -2025,6 +2779,17 @@ static const struct snd_kcontrol_new macaudio_controls[] = {
 		.info = macaudio_slk_info,
 		.put = macaudio_slk_put, .get = macaudio_slk_get,
 		.lock = macaudio_slk_lock, .unlock = macaudio_slk_unlock,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_WRITE |
+			  SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+		.name = "Speaker Energy Grant",
+		.info = macaudio_energy_info,
+		.get = macaudio_energy_get,
+		.put = macaudio_energy_put,
+		.lock = macaudio_energy_lock,
+		.unlock = macaudio_energy_unlock,
 	},
 };
 
@@ -2084,6 +2849,7 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 	.safe_vol = -20,
 	.spk_out_widget = "Speaker",
 	.sw_gain_dai = "j700-pcm-1",
+	.energy_dmaengine = true,
 	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
 	.primary_bclk_ratio = 125,
@@ -2139,6 +2905,7 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 	.fe_cpu_is_platform = true,
 	/* No headphone codec on this card: the jack is a card of its own. */
 	.route_only_fes = BIT(0),
+	.energy_dmaengine = true,
 };
 
 /*
@@ -2257,6 +3024,11 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	snd_soc_card_set_drvdata(card, data);
 	dev_set_drvdata(&pdev->dev, data);
 	mutex_init(&data->volume_lock_mutex);
+	apple_energy_init(&data->energy);
+	atomic_set(&data->energy_open, 0);
+	data->energy_format = SNDRV_PCM_FORMAT_S32_LE;
+	for (i = 0; i < ARRAY_SIZE(data->energy_stream); i++)
+		data->energy_stream[i].ma = data;
 
 	card->owner = THIS_MODULE;
 	card->driver_name = "macaudio";
@@ -2309,6 +3081,17 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 		card->num_controls -= MACAUDIO_NUM_SPEAKER_LIMIT_CONTROLS;
 	else /* Speakers with safety, mark us as such */
 		data->has_safety = true;
+	data->has_energy = data->has_safety &&
+		(data->cfg->amp == AMP_TAS5770 || data->cfg->amp == AMP_SN012776 ||
+		 data->cfg->amp == AMP_MAX98360A) &&
+		(!data->cfg->fe_cpu_is_platform || data->cfg->energy_dmaengine);
+	/* Unqualified paths retain the legacy interlock and daemon reserve.
+	 * Once certified, enforcement is sticky until the device is removed.
+	 */
+	data->energy_enforced = false;
+	/* The optional bytes control is last, after the two older controls. */
+	if (data->has_safety && !data->has_energy)
+		card->num_controls--;
 
 	for_each_card_prelinks(card, i, link) {
 		if (link->no_pcm) {
@@ -2365,4 +3148,8 @@ MODULE_LICENSE("GPL");
 
 #if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
 #include "macaudio-admission-test.h"
+#endif
+
+#if IS_REACHABLE(CONFIG_KUNIT) && IS_ENABLED(CONFIG_SND_SOC_APPLE_SPEAKER_ENERGY_KUNIT_TEST)
+#include "macaudio-energy-test.h"
 #endif

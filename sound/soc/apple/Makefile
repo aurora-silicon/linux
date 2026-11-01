@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+snd-soc-apple-speaker-energy-y := speaker-energy.o
+obj-$(CONFIG_SND_SOC_APPLE_SPEAKER_ENERGY) += snd-soc-apple-speaker-energy.o
+obj-$(CONFIG_SND_SOC_APPLE_SPEAKER_ENERGY_KUNIT_TEST) += speaker-energy-test.o
+
 snd-soc-aop-y		:= aop_audio.o
 obj-$(CONFIG_SND_SOC_APPLE_AOP_AUDIO)	+= snd-soc-aop.o
 

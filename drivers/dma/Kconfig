@@ -85,6 +85,16 @@ config AMCC_PPC440SPE_ADMA
 	help
 	  Enable support for the AMCC PPC440SPe RAID engines.
 
+config APPLE_ADMAC_KUNIT_TEST
+	tristate "KUnit tests for ADMAC private playback payloads" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise immutable descriptor copies, completion ownership, repeated
+	  cyclic periods, queue exhaustion and failed-stop quarantine without
+	  touching hardware. These tests do not register a DMA controller.
+	  They can run on a UML kernel.
+
 config APPLE_ADMAC
 	tristate "Apple ADMAC support"
 	depends on ARCH_APPLE || COMPILE_TEST

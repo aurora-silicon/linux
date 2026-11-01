@@ -28,6 +28,7 @@
 #include <sound/tlv.h>
 
 #include "tas2770.h"
+#include <sound/tas27xx-energy.h>
 
 #define TAS2770_MDELAY 0xFFFFFFFE
 
@@ -611,6 +612,41 @@ static struct snd_soc_dai_driver tas2770_dai_driver[] = {
 		.symmetric_rate = 1,
 	},
 };
+
+int tas2770_playback_state(struct snd_soc_component *component,
+			  struct tas27xx_playback_state *state)
+{
+	struct tas2770_priv *amp = snd_soc_component_get_drvdata(component);
+	unsigned int gain, hpf, slots, source;
+	int ret;
+
+	memset(state, 0, sizeof(*state));
+	ret = regmap_read(amp->regmap, TAS2770_PLAY_CFG_REG0, &gain);
+	if (ret)
+		return ret;
+	ret = regmap_read(amp->regmap, TAS2770_PLAY_CFG_REG1, &hpf);
+	if (ret)
+		return ret;
+	ret = regmap_read(amp->regmap, TAS2770_TDM_CFG_REG3, &slots);
+	if (ret)
+		return ret;
+	ret = regmap_read(amp->regmap, TAS2770_TDM_CFG_REG2, &source);
+	if (ret)
+		return ret;
+	/* PB_SRC selects a PDM path which is outside the PCM grant. */
+	if (gain & BIT(5) || !(hpf & 7))
+		return -EOPNOTSUPP;
+	gain &= 0x1f;
+	if (gain > 0x14 || (hpf & 7) > 6)
+		return -EINVAL;
+	state->gain_millidbv = 11000 + gain * 500;
+	state->hpf = hpf & 7;
+	state->left_slot = slots & 0xf;
+	state->right_slot = slots >> 4;
+	state->source = (source >> 4) & 3;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tas2770_playback_state);
 
 static int tas2770_read_die_temp(struct tas2770_priv *tas2770, long *result)
 {

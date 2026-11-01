@@ -22,6 +22,7 @@
 #include <linux/interrupt.h>
 
 #include "dmaengine.h"
+#include "apple-admac-payload.h"
 
 #define NCHANNELS_MAX	64
 #define IRQ_NOUTPUTS	4
@@ -139,6 +140,9 @@ struct admac_chan {
 	struct list_head issued;
 
 	struct list_head to_free;
+	struct admac_payload *payload;
+	bool quarantined;
+	bool quiesced;
 };
 
 struct admac_sram {
@@ -309,6 +313,14 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 
 	if (direction != admac_chan_direction(adchan->no))
 		return NULL;
+	if (adchan->quarantined)
+		return NULL;
+	if (adchan->payload &&
+	    (direction != DMA_MEM_TO_DEV ||
+	     adchan->payload->filter.source_dma != buf_addr ||
+	     adchan->payload->filter.buffer_bytes != buf_len ||
+	     adchan->payload->filter.period_bytes != period_len))
+		return NULL;
 
 	/* Reports advance whole periods, and residue is a u32. */
 	if (!buf_len || !period_len || period_len > buf_len ||
@@ -337,6 +349,88 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 	return &adtx->tx;
 }
 
+int apple_admac_playback_quiesced(struct dma_chan *chan)
+{
+	struct admac_chan *adchan;
+	unsigned long flags;
+	int ret;
+
+	if (!chan || chan->device->device_prep_dma_cyclic != admac_prep_dma_cyclic)
+		return -EOPNOTSUPP;
+	adchan = to_admac_chan(chan);
+	spin_lock_irqsave(&adchan->lock, flags);
+	ret = adchan->quiesced && !adchan->quarantined && !adchan->current_tx &&
+		list_empty(&adchan->submitted) && list_empty(&adchan->issued) &&
+		list_empty(&adchan->to_free) ? 0 : -EIO;
+	spin_unlock_irqrestore(&adchan->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_admac_playback_quiesced);
+
+static void admac_payload_free(struct admac_chan *chan, struct admac_payload *p)
+{
+	if (!p)
+		return;
+	dma_free_coherent(chan->host->dev,
+			  p->filter.period_bytes * ADMAC_PAYLOAD_SLOTS,
+			  p->area, p->dma);
+	kfree(p);
+}
+
+int apple_admac_set_playback_filter(struct dma_chan *chan,
+			const struct apple_admac_playback_filter *filter)
+{
+	struct admac_payload *p = NULL, *old;
+	struct admac_chan *adchan;
+	unsigned long flags;
+	int ret = 0;
+
+	if (!chan || chan->device->device_prep_dma_cyclic != admac_prep_dma_cyclic)
+		return -EOPNOTSUPP;
+	adchan = to_admac_chan(chan);
+	if (admac_chan_direction(adchan->no) != DMA_MEM_TO_DEV)
+		return -EINVAL;
+	if (filter) {
+		if (!filter->source || !filter->process || !filter->retire ||
+		    !filter->fault || !filter->period_bytes ||
+		    filter->period_bytes > ADMAC_PAYLOAD_MAX_PERIOD ||
+		    filter->buffer_bytes < filter->period_bytes ||
+		    filter->buffer_bytes % filter->period_bytes)
+			return -EINVAL;
+		p = kzalloc_obj(*p);
+		if (!p)
+			return -ENOMEM;
+		p->filter = *filter;
+		p->area = dma_alloc_coherent(adchan->host->dev,
+			filter->period_bytes * ADMAC_PAYLOAD_SLOTS, &p->dma, GFP_KERNEL);
+		if (!p->area) {
+			kfree(p);
+			return -ENOMEM;
+		}
+	}
+	spin_lock_irqsave(&adchan->lock, flags);
+	if (adchan->quarantined) {
+		ret = -EIO;
+		goto out;
+	}
+	if (adchan->current_tx || !list_empty(&adchan->submitted) ||
+	    !list_empty(&adchan->issued) || !list_empty(&adchan->to_free) ||
+	    (adchan->payload && adchan->payload->pending)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	old = adchan->payload;
+	adchan->payload = p;
+	spin_unlock_irqrestore(&adchan->lock, flags);
+	admac_payload_free(adchan, old);
+	return 0;
+out:
+	spin_unlock_irqrestore(&adchan->lock, flags);
+	admac_payload_free(adchan, p);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_admac_set_playback_filter);
+
 /*
  * Write one hardware descriptor for a dmaengine cyclic transaction.
  */
@@ -352,6 +446,17 @@ static bool admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
 
 	/* If happens means we have buggy code */
 	WARN_ON_ONCE(addr + tx->period_len > tx->buf_end);
+	if (ad->channels[channo].payload) {
+		struct admac_payload *p = ad->channels[channo].payload;
+
+		if (admac_payload_prepare(p, tx->submitted_pos % tx->buf_len, &addr)) {
+			tx->error = true;
+			p->filter.fault(p->filter.context);
+			return false;
+		}
+		/* Publish only the protected, private copy, never the mmap ring. */
+		dma_wmb();
+	}
 
 	dev_dbg(ad->dev, "ch%d descriptor: addr=0x%pad len=0x%zx flags=0x%lx\n",
 		channo, &addr, tx->period_len, FLAG_DESC_NOTIFY);
@@ -485,6 +590,7 @@ static void admac_start_chan(struct admac_chan *adchan)
 	struct admac_data *ad = adchan->host;
 	u32 startbit = 1 << (adchan->no / 2);
 
+	adchan->quiesced = false;
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
 		       ad->base + REG_CHAN_INTSTATUS(ad, adchan->no, ad->irq_index));
 	writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
@@ -527,7 +633,7 @@ static void admac_stop_chan(struct admac_chan *adchan)
  */
 #define ADMAC_STOP_TIMEOUT_US	100000
 
-static void admac_wait_stopped(struct admac_chan *adchan)
+static bool admac_wait_stopped(struct admac_chan *adchan)
 {
 	struct admac_data *ad = adchan->host;
 	u32 bit = BIT(adchan->no / 2);
@@ -542,12 +648,15 @@ static void admac_wait_stopped(struct admac_chan *adchan)
 		reg = ad->base + REG_RX_START;
 		break;
 	default:
-		return;
+		return false;
 	}
 
-	if (readl_poll_timeout(reg, val, !(val & bit), 10, ADMAC_STOP_TIMEOUT_US))
+	if (readl_poll_timeout(reg, val, !(val & bit), 10, ADMAC_STOP_TIMEOUT_US)) {
 		dev_warn_ratelimited(ad->dev, "ch%d still enabled %d us after stop\n",
 				     adchan->no, ADMAC_STOP_TIMEOUT_US);
+		return false;
+	}
+	return true;
 }
 
 static void admac_reset_rings(struct admac_chan *adchan)
@@ -655,19 +764,44 @@ static void admac_synchronize(struct dma_chan *chan)
 	struct admac_tx *adtx, *_adtx;
 	unsigned long flags;
 	LIST_HEAD(head);
+	bool stopped;
 
 	/*
 	 * terminate_all() only requests the stop: make sure the channel no
 	 * longer touches the memory of the terminated descriptors before the
 	 * client is allowed to reuse or free it.
 	 */
-	admac_wait_stopped(adchan);
+	stopped = admac_wait_stopped(adchan);
 
 	spin_lock_irqsave(&adchan->lock, flags);
 	list_splice_tail_init(&adchan->to_free, &head);
 	spin_unlock_irqrestore(&adchan->lock, flags);
 
 	tasklet_kill(&adchan->tasklet);
+	spin_lock_irqsave(&adchan->lock, flags);
+	if (adchan->payload && !adchan->quarantined) {
+		struct admac_payload *p = adchan->payload;
+
+		if (stopped) {
+			while (p->pending) {
+				/* Discarded buffers are conservatively charged as played. */
+				if (admac_payload_retire(p)) {
+					stopped = false;
+					break;
+				}
+			}
+		}
+		if (!stopped) {
+			/* Retain DMA storage permanently rather than risk a late read. */
+			adchan->quarantined = true;
+			admac_payload_quarantine(p);
+		}
+	}
+	/* A raw headphone channel is equally unsafe to route after a failed stop. */
+	if (!stopped)
+		adchan->quarantined = true;
+	adchan->quiesced = stopped && !adchan->quarantined;
+	spin_unlock_irqrestore(&adchan->lock, flags);
 
 	list_for_each_entry_safe(adtx, _adtx, &head, node) {
 		list_del(&adtx->node);
@@ -680,6 +814,9 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 	struct admac_chan *adchan = to_admac_chan(chan);
 	struct admac_data *ad = adchan->host;
 	int ret;
+
+	if (adchan->quarantined)
+		return -EIO;
 
 	/* Keep MMIO accessible for config, status and the atomic DMA callbacks. */
 	ret = pm_runtime_resume_and_get(ad->dev);
@@ -721,6 +858,10 @@ static void admac_free_chan_resources(struct dma_chan *chan)
 
 	admac_terminate_all(chan);
 	admac_synchronize(chan);
+	if (adchan->quarantined)
+		return;
+	admac_payload_free(adchan, adchan->payload);
+	adchan->payload = NULL;
 	admac_free_sram_carveout(adchan->host, admac_chan_direction(adchan->no),
 				 adchan->carveout);
 	pm_runtime_put_autosuspend(adchan->host->dev);
@@ -778,6 +919,8 @@ static void admac_handle_status_err(struct admac_data *ad, int channo)
 		adchan->current_tx->error = true;
 		adchan->nperiod_acks = 0;
 		admac_stop_chan(adchan);
+		if (adchan->payload)
+			adchan->payload->filter.fault(adchan->payload->filter.context);
 	}
 
 	if (readl_relaxed(ad->base + REG_DESC_RING(ad, channo)) & RING_ERR) {
@@ -820,6 +963,13 @@ static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
 			goto error;
 
 		tx->nperiods_outstanding -= nreports;
+		if (adchan->payload) {
+			int i;
+
+			for (i = 0; i < nreports; i++)
+				if (admac_payload_retire(adchan->payload))
+					goto error;
+		}
 		adchan->nperiod_acks += nreports;
 		tx->reclaimed_pos += nreports * tx->period_len;
 		tx->reclaimed_pos %= 2 * tx->buf_len;
@@ -832,6 +982,8 @@ error:
 		tx->error = true;
 		adchan->nperiod_acks = 0;
 		admac_stop_chan(adchan);
+		if (adchan->payload)
+			adchan->payload->filter.fault(adchan->payload->filter.context);
 		dev_err_ratelimited(ad->dev, "ch%d completion accounting error\n", channo);
 	}
 out:
