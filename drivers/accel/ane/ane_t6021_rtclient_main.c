@@ -65,6 +65,8 @@
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -90,6 +92,11 @@
 #include <drm/drm_mm.h>
 #include <crypto/sha2.h>
 
+#include "ane_fw_platform.h"
+#include "ane_h16_protocol.h"
+#include "ane_h16_pending.h"
+#include "ane_h16_resources.h"
+#include "ane_fw_protocol.h"
 #include "ane_stats.h"
 #include "ane_t6021.h"
 #include "ane_t6021_boot.h"
@@ -191,6 +198,22 @@ struct ane_legacy_buffer {
 	size_t size;
 };
 
+struct ane_t6021_fd;
+
+/* Populated only by an original-container loader and decoded process reply.
+ * Those interfaces remain refused until their complete wire contract exists.
+ * The firmware mutex protects this list and every pending UUID operation.
+ */
+struct ane_h16_process {
+	struct list_head node;
+	struct list_head owner_node;
+	struct ane_h16_hwx_snapshot original;
+	struct ane_h16_request_key key;
+	struct ane_h16_resource resources[ANE_H16_SURFACES];
+	struct ane_legacy_buffer mappings[ANE_H16_SURFACES];
+	u32 resource_count;
+};
+
 struct ane_rtclient {
 	struct device *dev;
 	void __iomem *engine;
@@ -213,6 +236,12 @@ struct ane_rtclient {
 
 	/* ChMan descriptor table validated against the 'IPC ' surface. */
 	bool chman_ok;
+	struct ane_fw_channel channels[ANE_FW_CHANNELS];
+	u8 channel_snapshot[ANE_FW_TABLE_SIZE];
+	u64 channel_table_offset;
+	struct ane_h16_pending_table pending;
+	struct ane_h16_pending *waiting;
+	struct list_head h16_processes;
 	struct ane_legacy_buffer *legacy_buffers;
 	u32 legacy_allocated;
 	size_t legacy_bytes;
@@ -245,6 +274,7 @@ struct ane_rtclient {
  */
 struct ane_t6021_fd {
 	struct list_head bos;
+	struct list_head h16_processes;
 };
 
 /* Per-file handle counter and every per-fd list against same-fd concurrent
@@ -400,7 +430,10 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 					struct ane_legacy_buffer *command,
 				       size_t length, u16 opcode,
 				       unsigned int channel,
-				       unsigned int timeout_ms);
+				       unsigned long deadline);
+
+static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
+				   unsigned int channel);
 
 /* ---- boot helpers (shared with boot.c / fwload.c) ---- */
 
@@ -442,6 +475,31 @@ static void ane_rtclient_validate_chman(struct ane_rtclient *ane)
 			 "chman: no host IPC surface — table not validated\n");
 		return;
 	}
+	if (ane->soc->platform) {
+		int ret;
+
+		if (!ane_fw_contains(a->boot_ipc_iova, a->boot_ipc_size,
+				     a->boot_scratch_result, ANE_FW_TABLE_SIZE)) {
+			dev_err(ane->dev, "27.x channel table outside IPC\n");
+			return;
+		}
+		ane->channel_table_offset = a->boot_scratch_result - a->boot_ipc_iova;
+		dma_rmb();
+		memcpy(ane->channel_snapshot,
+		       a->boot_ipc + ane->channel_table_offset, ANE_FW_TABLE_SIZE);
+		ret = ane_fw_channels_parse(ane->channel_snapshot, a->boot_ipc_iova,
+					    a->boot_ipc_size, a->boot_scratch_result,
+					    ane->channels);
+		dma_rmb();
+		if (ret || memcmp(ane->channel_snapshot,
+				  a->boot_ipc + ane->channel_table_offset,
+				  ANE_FW_TABLE_SIZE)) {
+			dev_err(ane->dev, "27.x channel table rejected or changed\n");
+			return;
+		}
+		ane->chman_ok = true;
+		return;
+	}
 	if (a->boot_ipc_size < ANE_T6021_CHMAN_TOTAL) {
 		dev_warn(ane->dev,
 			 "chman: IPC surface %#llx bytes < fw layout %#x — table not validated\n",
@@ -465,8 +523,37 @@ static void ane_rtclient_validate_chman(struct ane_rtclient *ane)
 	}
 
 	ane->chman_ok = !bad;
+	if (!bad)
+		for (i = 0; i < ANE_FW_CHANNELS; i++) {
+			const struct ane_t6021_chman_static *c = &ane_t6021_chman_layout[i];
+
+			ane->channels[i] = (struct ane_fw_channel) {
+				.offset = c->off, .slots = c->size,
+				.type = c->type, .bit = c->bit,
+			};
+		}
 	dev_info(ane->dev, "chman: table %s (mismatch mask %#x)\n",
 		 bad ? "NOT VALIDATED" : "VALIDATED", bad);
+}
+
+static bool ane_rtclient_channels_unchanged(struct ane_rtclient *ane)
+{
+	struct ane_t6021 *a = ane->fw;
+
+	if (!a || !ane->chman_ok)
+		return false;
+	dma_rmb();
+	if (ane->soc->platform)
+		return !memcmp(ane->channel_snapshot,
+			       a->boot_ipc + ane->channel_table_offset,
+			       ANE_FW_TABLE_SIZE);
+	return !ane_t6021_chman_check(a->boot_ipc, a->boot_ipc_iova);
+}
+
+static void __iomem *ane_rtclient_doorbell(struct ane_rtclient *ane)
+{
+	return ane->engine + (ane->soc->platform ?
+		ane->soc->platform->doorbell : ANE_IPI_OFF);
 }
 
 /* Legacy ChMan exchange (post-DONE 13.5 transport). Resends to the same
@@ -477,46 +564,66 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 					struct ane_legacy_buffer *command,
 				       size_t length, u16 opcode,
 				       unsigned int channel,
-				       unsigned int timeout_ms)
+				       unsigned long deadline)
 {
 	struct ane_t6021 *a = ane->fw;
 	u64 *io, *malloc_ring, header;
-	u64 *t2h_buf, *t2h_ioq;
-	void __iomem *ipi = ane->engine + ANE_IPI_OFF;
+	void __iomem *ipi = ane_rtclient_doorbell(ane);
 	unsigned int cursor = ane->legacy_malloc_cursor;
-	unsigned long deadline;
-	u32 *reply;
 	int result = -ETIMEDOUT;
 
-	if (!ane->held || !ane->chman_ok ||
-	    ane_t6021_chman_check(a->boot_ipc, a->boot_ipc_iova))
+	if (!ane->held || !ane_rtclient_channels_unchanged(ane))
 		return -EPROTO;
 	if (length < 8 || length > command->size ||
 	    channel >= ANE_T6021_CHMAN_COUNT) {
 		result = -EINVAL;
 		goto out;
 	}
-	io = a->boot_ipc + ane_t6021_chman_layout[channel].off +
+	io = a->boot_ipc + ane->channels[channel].offset +
 	     (size_t)ane->legacy_cmd_cursor[channel] * 64;
-	malloc_ring = a->boot_ipc + ane_t6021_chman_layout[5].off;
-	t2h_buf = a->boot_ipc + ane_t6021_chman_layout[4].off;
-	t2h_ioq = a->boot_ipc + ane_t6021_chman_layout[6].off;
+	malloc_ring = a->boot_ipc + ane->channels[5].offset;
 
 	if (!(READ_ONCE(io[0]) & 1)) {
 		result = -EBUSY;
 		goto out;
 	}
-	reply = command->cpu;
-	((u16 *)reply)[2] = opcode;
+	if (time_after_eq(jiffies, deadline))
+		goto out;
+	if (ane->soc->platform) {
+		result = ane_h16_command_prepare(command->cpu, length, opcode,
+						 ane->channels[channel].index);
+		if (result)
+			goto out;
+	} else {
+		ane_fw_command_header(command->cpu, opcode, false);
+	}
+	if (ane->soc->platform)
+		memset((u8 *)command->cpu + length, 0xa5, command->size - length);
 	WRITE_ONCE(io[1], length);
 	WRITE_ONCE(io[2], length);
 	dma_wmb();
 	WRITE_ONCE(io[0], command->dma);
 	dma_wmb();
-	writel(BIT(ane_t6021_chman_layout[channel].bit), ipi);
-	deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	writel(BIT(ane->channels[channel].bit), ipi);
 	while (time_before(jiffies, deadline)) {
-		u32 pending = readl(ipi + 0x8000);
+		u32 pending;
+
+		if (atomic_read(&ane_t6021_quarantined)) {
+			result = -EIO;
+			goto out;
+		}
+		if (!ane_rtclient_channels_unchanged(ane)) {
+			result = -EPROTO;
+			goto out;
+		}
+		if (ane->soc->platform && opcode == ANE_H16_EXECUTE) {
+			ane_rtclient_drain_t2h(ane, 6);
+			if (ane->pending.quarantined) {
+				result = ane->pending.error ?: -EIO;
+				goto out;
+			}
+		}
+		pending = readl(ipi + 0x8000);
 
 		if (pending) {
 			writel(pending, ipi + 0xc000);
@@ -538,6 +645,13 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				u64 size, tag;
 				struct ane_legacy_buffer *buf;
 
+				/* H16 needs its own validated allocation/reply provider.
+				 * Never answer it with the legacy H14 allocation index.
+				 */
+				if (ane->soc->platform) {
+					result = -EOPNOTSUPP;
+					goto out;
+				}
 				dma_rmb();
 				size = READ_ONCE(slot[1]);
 				tag = READ_ONCE(slot[2]);
@@ -546,7 +660,7 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				 * is a malformed ring and we stop.
 				 */
 				if (alloc_hdr || tag > U32_MAX) {
-					result = -EOPNOTSUPP;
+					result = -EPROTO;
 					goto out;
 				}
 				if (ane_rtclient_legacy_alloc(ane, size)) {
@@ -559,22 +673,36 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 				dma_wmb();
 				WRITE_ONCE(slot[0], buf->dma | 1);
 				dma_wmb();
-				writel(BIT(5), ipi);
+				writel(BIT(ane->channels[5].bit), ipi);
 				cursor = (cursor + 1) %
-					ane_t6021_chman_layout[5].size;
+					ane->channels[5].slots;
 			}
 		}
+		/* Allocation service cannot extend the command deadline. */
+		if (time_after_eq(jiffies, deadline))
+			goto out;
 		header = READ_ONCE(io[0]);
 		if (header & 1) {
 			dma_rmb();
-			result = (header == (command->dma | 1) &&
-				  READ_ONCE(io[1]) == length &&
-				  READ_ONCE(io[2]) == 0 &&
-				  ((u16 *)reply)[2] == opcode &&
-				  ((u16 *)reply)[3] == 0) ? 0 : -EPROTO;
-			ane->legacy_cmd_cursor[channel] =
-				(ane->legacy_cmd_cursor[channel] + 1) %
-				ane_t6021_chman_layout[channel].size;
+			result = ane_fw_reply_status(header, READ_ONCE(io[1]),
+						     READ_ONCE(io[2]), command->dma,
+						     length, opcode, command->cpu,
+						     !!ane->soc->platform);
+			/* Corruption does not retire the unknown slot. A refusal
+			 * retires ownership but remains a nonzero result.
+			 */
+			if (!ane_rtclient_channels_unchanged(ane) ||
+			    (ane->soc->platform &&
+			     memchr_inv((u8 *)command->cpu + length, 0xa5,
+					command->size - length)))
+				result = -EPROTO;
+			if (result == -EREMOTEIO)
+				dev_info(ane->dev, "firmware refused op=%#x ack=%#x; no retry\n",
+					 opcode, get_unaligned_le16((u8 *)command->cpu + 6));
+			if (!result || result == -EREMOTEIO)
+				ane->legacy_cmd_cursor[channel] =
+					(ane->legacy_cmd_cursor[channel] + 1) %
+					ane->channels[channel].slots;
 			goto out;
 		}
 		/* Fast poll: check the rings every 50 us instead of
@@ -766,18 +894,24 @@ static void ane_t6021_trace_free(void)
 static const void *ane_rtclient_fw_cpu(struct ane_rtclient *ane, u64 iova,
 				       size_t len)
 {
+	const void *found = NULL;
 	u32 i;
 
 	for (i = 0; i < ane->legacy_allocated; i++) {
 		const struct ane_legacy_buffer *b = &ane->legacy_buffers[i];
 
-		if (iova >= b->dma && iova - b->dma + len <= b->size)
-			return b->cpu + (iova - b->dma);
+		if (ane_fw_contains(b->dma, b->size, iova, len)) {
+			if (!ane->soc->platform)
+				return b->cpu + (iova - b->dma);
+			if (found)
+				return NULL;
+			found = b->cpu + (iova - b->dma);
+		}
 	}
-	if (iova >= ane->fw->boot_ipc_iova &&
-	    iova - ane->fw->boot_ipc_iova + len <= ane->fw->boot_ipc_size)
-		return ane->fw->boot_ipc + (iova - ane->fw->boot_ipc_iova);
-	return NULL;
+	if (ane_fw_contains(ane->fw->boot_ipc_iova, ane->fw->boot_ipc_size,
+			    iova, len))
+		return found ? NULL : ane->fw->boot_ipc + (iova - ane->fw->boot_ipc_iova);
+	return found;
 }
 
 /* Return every firmware-owned slot on a target-to-host ring to the fw:
@@ -790,23 +924,62 @@ static const void *ane_rtclient_fw_cpu(struct ane_rtclient *ane, u64 iova,
 static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
 				   unsigned int channel)
 {
-	const struct ane_t6021_chman_static *c = &ane_t6021_chman_layout[channel];
+	const struct ane_fw_channel *c = &ane->channels[channel];
 	unsigned int n = 0, slot_i = ane->legacy_cmd_cursor[channel];
-	void __iomem *ipi = ane->engine + ANE_IPI_OFF;
+	void __iomem *ipi = ane_rtclient_doorbell(ane);
 	bool finished = false;
 
-	if (!ane->fw || !ane->fw->boot_ipc)
+	if (!ane_rtclient_channels_unchanged(ane)) {
+		atomic_set(&ane_t6021_quarantined, 1);
+		if (ane->soc->platform) {
+			ane->pending.error = -EPROTO;
+			ane->pending.quarantined = true;
+		}
 		return false;
-	while (n < c->size) {
-		u64 *slot = ane->fw->boot_ipc + c->off + (size_t)slot_i * 64;
-		u64 hdr = READ_ONCE(slot[0]), len = READ_ONCE(slot[1]);
+	}
+	if (c->type != 1)
+		return false;
+	while (n < c->slots) {
+		u64 *slot = ane->fw->boot_ipc + c->offset + (size_t)slot_i * 64;
+		u64 hdr = READ_ONCE(slot[0]), len;
 
 		if (hdr & 1)
 			break;
 		dma_rmb();
-		dev_dbg(ane->dev, "T2H ch=%s slot=%u hdr=%016llx len=%#llx\n",
-			c->name, slot_i, hdr, len);
-		if (channel == 6 && len >= ANE_T2H_CALL_STATE_OFF + 4) {
+		len = READ_ONCE(slot[1]);
+		dev_dbg(ane->dev, "T2H ch=%u slot=%u len=%#llx\n",
+			channel, slot_i, len);
+		if (ane->soc->platform) {
+			u8 snapshot[0x60];
+			const void *ev;
+			int status;
+
+			/* Other channels have different message types; never apply
+			 * the event predicate to logs or allocation traffic.
+			 */
+			if (c->index != 6 || (len != sizeof(snapshot) && len != 0xc)) {
+				atomic_set(&ane_t6021_quarantined, 1);
+				ane->pending.error = -EPROTO;
+				ane->pending.quarantined = true;
+				return false;
+			}
+			ev = ane_rtclient_fw_cpu(ane, hdr, len);
+			if (!ev) {
+				atomic_set(&ane_t6021_quarantined, 1);
+				ane->pending.error = -EPROTO;
+				ane->pending.quarantined = true;
+				return false;
+			}
+			memcpy(snapshot, ev, len);
+			status = ane_h16_pending_dispatch(&ane->pending, snapshot,
+							  len, c->index, jiffies);
+			if (ane->pending.quarantined) {
+				atomic_set(&ane_t6021_quarantined, 1);
+				return false;
+			}
+			if (status == ANE_H16_EVENT_COMPLETE)
+				finished = true;
+		} else if (channel == 6 && len >= ANE_T2H_CALL_STATE_OFF + 4) {
 			const u8 *ev = ane_rtclient_fw_cpu(ane, hdr,
 							   ANE_T2H_CALL_STATE_OFF + 4);
 
@@ -826,7 +999,7 @@ static bool ane_rtclient_drain_t2h(struct ane_rtclient *ane,
 		WRITE_ONCE(slot[0], hdr | 1);
 		dma_wmb();
 		writel(BIT(c->bit), ipi);
-		slot_i = (slot_i + 1) % c->size;
+		slot_i = (slot_i + 1) % c->slots;
 		ane->legacy_cmd_cursor[channel] = slot_i;
 	}
 	return finished;
@@ -885,24 +1058,38 @@ static int ane_rtclient_call_wait_traced(struct ane_rtclient *ane,
  * Return zero on the event, or -ETIMEDOUT.
  */
 static int ane_rtclient_call_wait(struct ane_rtclient *ane,
-				  unsigned int timeout_ms)
+				  unsigned long deadline)
 {
-	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
-	unsigned int poll_us = READ_ONCE(call_poll_us);
+	unsigned int poll_us = ane->soc->platform ? 0 : READ_ONCE(call_poll_us);
 	ktime_t tight_end = ktime_add_ns(ktime_get(),
 					 (u64)poll_us * NSEC_PER_USEC);
 
 	if (ane_t6021_tracing)
 		return ane_rtclient_call_wait_traced(ane, deadline);
+	if (time_after_eq(jiffies, deadline))
+		return -ETIMEDOUT;
 
 	do {
-		if (ane_rtclient_drain_t2h(ane, 6))
+		if (atomic_read(&ane_t6021_quarantined))
+			return -EIO;
+		if (ane->soc->platform) {
+			ane_rtclient_drain_t2h(ane, 6);
+			if (atomic_read(&ane_t6021_quarantined))
+				return ane->pending.error ?: -EIO;
+			if (ane->waiting && ane->waiting->terminal)
+				return ane->waiting->status;
+		} else if (ane_rtclient_drain_t2h(ane, 6)) {
 			return 0;
+		}
 		if (poll_us && ktime_before(ktime_get(), tight_end))
 			usleep_range(1, 2);
 		else
 			usleep_range(50, 100);
 	} while (time_before(jiffies, deadline));
+	if (atomic_read(&ane_t6021_quarantined))
+		return -EIO;
+	if (ane->soc->platform)
+		return -ETIMEDOUT;
 	return ane_rtclient_drain_t2h(ane, 6) ? 0 : -ETIMEDOUT;
 }
 
@@ -912,9 +1099,12 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						     unsigned int channel,
 						     unsigned int timeout_ms)
 {
+	unsigned long deadline;
 	int ret;
 	u64 stats_ticket = 0;
 	u64 stats_submit_ns = 0;
+	bool execute = ane->soc->platform ? opcode == ANE_H16_EXECUTE :
+					   opcode == CSNE_CMD_PROCEDURE_CALL;
 
 	ane_t6021_tracing = opcode == CSNE_CMD_PROCEDURE_CALL && trace_td &&
 			    ane->soc->trace_td_off;
@@ -937,8 +1127,16 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	 * ring, as on ane.ko: stats=0 or a failed probe allocation leaves
 	 * stats_slots NULL, and the hooks must not run on a NULL ring.
 	 */
-	bool stats_call = ane->stats_slots &&
-			  opcode == CSNE_CMD_PROCEDURE_CALL;
+	bool stats_call = ane->stats_slots && execute;
+
+	if (ane->soc->platform && execute &&
+	    (!ane->waiting || !ane->waiting->active || ane->pending.quarantined))
+		return -EIO;
+
+	/* One bounded budget covers both ACK and finish, including H14. */
+	timeout_ms = min(timeout_ms, 5000U);
+	deadline = ane->soc->platform && ane->waiting ?
+		ane->waiting->deadline : jiffies + msecs_to_jiffies(timeout_ms);
 
 	if (stats_call) {
 		stats_submit_ns = ktime_get_ns();
@@ -947,7 +1145,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 					       stats_submit_ns, 1);
 	}
 	ret = ane_rtclient_legacy_exchange(ane, command, length, opcode,
-					   channel, timeout_ms);
+					   channel, deadline);
 	if (ret) {
 		ane_t6021_tracing = false;
 		if (stats_call)
@@ -959,12 +1157,14 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		atomic_set(&ane_t6021_quarantined, 1);
 		return ret;
 	}
-	if (opcode == CSNE_CMD_PROCEDURE_CALL) {
+	if (execute) {
 		if (ane_t6021_tracing)
 			ane_t6021_trace_add(ANE_TR_ACK, 0);
-		ret = ane_rtclient_call_wait(ane, timeout_ms);
+		ret = ane_rtclient_call_wait(ane, deadline);
 		ane_t6021_tracing = false;
-		if (!ret && call_settle_us)
+		if (!ret)
+			dma_rmb();
+		if (!ret && !ane->soc->platform && call_settle_us)
 			usleep_range(call_settle_us, call_settle_us + 100);
 		if (ret) {
 			if (stats_call)
@@ -974,7 +1174,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						   ktime_get_ns(),
 						   (u32)ret, 0);
 			dev_err(ane->dev,
-				"call completion wait failed %d: no finish event in %u ms\n",
+				"call completion failed %d within %u ms\n",
 				ret, timeout_ms);
 			atomic_set(&ane_t6021_quarantined, 1);
 			return ret;
@@ -987,8 +1187,11 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	 * hand those slots back so the rings never fill (channels 4
 	 * and 6).
 	 */
-	ane_rtclient_drain_t2h(ane, 4);
+	if (!ane->soc->platform)
+		ane_rtclient_drain_t2h(ane, 4);
 	ane_rtclient_drain_t2h(ane, 6);
+	if (atomic_read(&ane_t6021_quarantined))
+		return -EIO;
 	/* BOs are dma_alloc_coherent memory mapped write-combined for the
 	 * CPU, so no cache maintenance is needed on either side.
 	 */
@@ -1058,6 +1261,9 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	int ret, i, j;
 
 	BUILD_BUG_ON(DRM_ANE_MAX_SECTIONS != ANE_T6021_LOAD_SEC_COUNT);
+	/* H16 requires the original HWX, not caller-asserted section identity. */
+	if (ane->soc->platform)
+		return -EOPNOTSUPP;
 	if (user->pad || user->section_count < 1 ||
 	    user->section_count > ANE_T6021_LOAD_SEC_COUNT ||
 	    user->generic_count > DRM_ANE_MAX_BINDS || !fd)
@@ -1280,6 +1486,9 @@ static int ane_rtclient_create_process(struct ane_rtclient *ane,
 	struct ane_t6021_prog *prog = ane_t6021_prog_by_id(prog_id);
 	int ret;
 
+	/* H16 uses 0x258 bytes; its body is not the H14 0x10-byte body. */
+	if (ane->soc->platform)
+		return -EOPNOTSUPP;
 	if (!prog)
 		return -ENOENT;
 	if (prog->proc_id != U32_MAX) {
@@ -1311,6 +1520,140 @@ static int ane_rtclient_create_process(struct ane_rtclient *ane,
 	return ret;
 }
 
+/* H16 consumes only backend-owned process resources. The ABI-2 section
+ * loader and short process packet cannot create an entry in h16_processes.
+ */
+static int ane_rtclient_h16_call(struct ane_rtclient *ane, struct drm_file *file,
+				 const struct drm_ane_exec *user)
+{
+	struct ane_t6021_fd *fd = file->driver_priv;
+	struct ane_h16_process *process = NULL, *p;
+	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES];
+	struct ane_t6021_bo *bos[ANE_H16_SURFACES] = {};
+	struct drm_ane_exec_io *ios;
+	struct ane_h16_pending request = {};
+	struct ane_h16_execute call = {};
+	unsigned int i, j, pinned = 0;
+	int ret = -EOPNOTSUPP;
+
+	if (!fd || user->pad || user->priority != 5 || user->count < 2 ||
+	    user->count > ANE_H16_SURFACES || user->timeout_ms > 30000)
+		return -EINVAL;
+	ios = memdup_user(u64_to_user_ptr(user->io_ptr),
+			  array_size(user->count, sizeof(*ios)));
+	if (IS_ERR(ios))
+		return PTR_ERR(ios);
+	mutex_lock(&ane_t6021_fw_lock);
+	if (atomic_read(&ane_t6021_quarantined) || ane->pending.quarantined) {
+		ret = -EIO;
+		goto out;
+	}
+	list_for_each_entry(p, &fd->h16_processes, owner_node) {
+		if (p->key.program == user->prog_id &&
+		    p->key.process == user->proc_id) {
+			process = p;
+			break;
+		}
+	}
+	if (!process)
+		goto out;
+	ret = ane_h16_hwx_snapshot_check(&process->original);
+	if (!ret)
+		ret = ane_h16_resources_validate(&process->original.info,
+						 process->resources, process->resource_count);
+	if (ret)
+		goto out;
+	if (user->count != process->resource_count || !ane->cmd_buf ||
+	    process->key.program == U32_MAX || process->key.process == U32_MAX ||
+	    process->key.procedure == U32_MAX) {
+		ret = -EINVAL;
+		goto out;
+	}
+	for (i = 0; i < user->count; i++) {
+		struct ane_t6021_bo *b;
+		const struct ane_h16_resource *r = &process->resources[i];
+		const struct ane_legacy_buffer *m = &process->mappings[i];
+
+		if (ios[i].flags || ios[i].reserved ||
+		    ios[i].buffer_id != r->buffer.index || ios[i].type != r->buffer.class ||
+		    ios[i].size != r->buffer.size || !m->cpu ||
+		    m->dma != r->buffer.mapping_dva || m->size != r->buffer.mapping_size) {
+			ret = -EINVAL;
+			goto out;
+		}
+		for (j = 0; j < i; j++) {
+			if (ios[j].bo_handle == ios[i].bo_handle) {
+				ret = -EINVAL;
+				goto out;
+			}
+		}
+		mutex_lock(&ane_t6021_bo_lock);
+		list_for_each_entry(b, &fd->bos, node) {
+			if (b->handle == ios[i].bo_handle && b->owner == fd &&
+			    b->size >= ios[i].size) {
+				kref_get(&b->refcount);
+				bos[pinned++] = b;
+				break;
+			}
+		}
+		mutex_unlock(&ane_t6021_bo_lock);
+		if (pinned != i + 1) {
+			ret = -ENOENT;
+			goto out;
+		}
+		buffers[i] = r->buffer;
+	}
+	/* All user-facing BOs are staging only. Concurrent mmap writes cannot
+	 * change code, input snapshots or firmware-visible output allocations.
+	 */
+	for (i = 0; i < user->count; i++) {
+		if (process->resources[i].permissions == 1)
+			memcpy(process->mappings[i].cpu, bos[i]->cpu, buffers[i].size);
+		else
+			memset(process->mappings[i].cpu, 0xff, buffers[i].size);
+	}
+	request.key = process->key;
+	request.deadline = jiffies + msecs_to_jiffies(user->timeout_ms ?: 5000);
+	ret = ane_h16_pending_insert(&ane->pending, &request, jiffies);
+	if (ret)
+		goto out;
+	call.key = request.key;
+	call.buffers = buffers;
+	call.buffer_count = user->count;
+	/* Custom BAR selectors/values have no validated process map yet. */
+	ret = ane_h16_execute_encode(ane->cmd_buf->cpu, ANE_H16_EXECUTE_BASE_SIZE, &call);
+	if (ret) {
+		ane_h16_pending_remove(&ane->pending, &request);
+		goto out;
+	}
+	ane->waiting = &request;
+	/* Coherent allocations require ordering, not streaming-map sync calls. */
+	wmb();
+	dma_wmb();
+	ret = ane_rtclient_command(ane, ane->cmd_buf, ANE_H16_EXECUTE_BASE_SIZE,
+				   ANE_H16_EXECUTE, 7, user->timeout_ms ?: 5000);
+	ane->waiting = NULL;
+	if (ret || !request.terminal || request.status) {
+		ret = ret ?: -EIO;
+		ane_h16_pending_abort(&ane->pending, &request, ret);
+		atomic_set(&ane_t6021_quarantined, 1);
+		goto out;
+	}
+	dma_rmb();
+	for (i = 0; i < user->count; i++)
+		if (process->resources[i].permissions == 2)
+			memcpy(bos[i]->cpu, process->mappings[i].cpu, buffers[i].size);
+	/* Private DMA mappings remain resident for the entire process lifetime,
+	 * including after terminal failure or an uncertain transport outcome.
+	 */
+out:
+	while (pinned)
+		kref_put(&bos[--pinned]->refcount, ane_t6021_bo_release);
+	mutex_unlock(&ane_t6021_fw_lock);
+	kfree(ios);
+	return ret;
+}
+
 static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 				       struct drm_file *file,
 				       const struct drm_ane_exec *user)
@@ -1323,6 +1666,8 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	size_t cmd_size;
 	int ret, i, pinned = 0;
 
+	if (ane->soc->platform)
+		return ane_rtclient_h16_call(ane, file, user);
 	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
 	    user->priority < 2 || user->priority > 7 || !fd)
 		return -EINVAL;
@@ -1451,6 +1796,8 @@ static int ane_t6021_bo_init_ioctl(struct drm_device *drm, void *data,
 	struct ane_t6021_bo *bo;
 	struct ane_rtclient *ane;
 
+	if (atomic_read(&ane_t6021_quarantined))
+		return -EIO;
 	if (args->pad || args->size == 0 || args->size > ANE_T6021_BO_MAX ||
 	    !fd)
 		return -EINVAL;
@@ -1611,6 +1958,7 @@ static int ane_t6021_open(struct drm_device *drm, struct drm_file *file)
 	if (!fd)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&fd->bos);
+	INIT_LIST_HEAD(&fd->h16_processes);
 	file->driver_priv = fd;
 	return 0;
 }
@@ -1619,13 +1967,19 @@ static void ane_t6021_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	struct ane_t6021_fd *fd = file->driver_priv;
 	struct ane_t6021_bo *bo, *tmp;
+	struct ane_h16_process *process, *next;
 
 	if (!fd)
 		return;
+	mutex_lock(&ane_t6021_fw_lock);
+	/* Revoke per-file authority, retaining device-owned DMA allocations. */
+	list_for_each_entry_safe(process, next, &fd->h16_processes, owner_node)
+		list_del_init(&process->owner_node);
 	mutex_lock(&ane_t6021_bo_lock);
 	list_for_each_entry_safe(bo, tmp, &fd->bos, node)
 		ane_t6021_bo_drop(bo);
 	mutex_unlock(&ane_t6021_bo_lock);
+	mutex_unlock(&ane_t6021_fw_lock);
 	kfree(fd);
 	file->driver_priv = NULL;
 }
@@ -1921,6 +2275,13 @@ struct ane_rtclient_pd {
 	struct device **pd_dev;
 	struct device_link **pd_link;
 	int count;
+
+	/* T8112 power gate, kept in step with power-domains[0]. */
+	struct notifier_block pwgate_nb;
+	void __iomem *pwgate_base;
+	void __iomem *pwgate;
+	bool pwgate_nb_added;
+	bool pwgate_opened;
 };
 
 static LIST_HEAD(ane_rtclient_pd_list);
@@ -1932,9 +2293,101 @@ static DEFINE_MUTEX(ane_rtclient_probe_guard_lock);
 static void ane_rtclient_pd_free(struct ane_rtclient_pd *pd)
 {
 	list_del(&pd->list);
+	if (pd->pwgate_base)
+		iounmap(pd->pwgate_base);
 	kfree(pd->pd_dev);
 	kfree(pd->pd_link);
 	kfree(pd);
+}
+
+/*
+ * T8112 power gate. A word in the "set" window gates the ANE: bits 29:28
+ * set (the word reads 0x30000000) is closed, both clear is open. It must be
+ * open before the ANE CPU power state (ane_sys_cpu) turns on and is closed
+ * again after that state turns off, with ane_sys, the parent, on both
+ * times. power-domains[0] is ane_sys_cpu, and genpd calls this notifier
+ * after ane_sys is on and before ane_sys_cpu is written (PRE_ON), and
+ * after ane_sys_cpu is off and before ane_sys goes off (OFF), which is that
+ * order. Only the two known values are written. Any other word fails the
+ * power-up without a write.
+ */
+#define ANE_PWGATE_CLOSED	GENMASK(29, 28)
+#define ANE_PWGATE_POLL_US	10
+#define ANE_PWGATE_TIMEOUT_US	100000
+
+static int ane_rtclient_pwgate_notify(struct notifier_block *nb,
+				      unsigned long action, void *data)
+{
+	struct ane_rtclient_pd *pd =
+		container_of(nb, struct ane_rtclient_pd, pwgate_nb);
+	u32 gate;
+	int ret;
+
+	switch (action) {
+	case GENPD_NOTIFY_PRE_ON:
+		gate = readl(pd->pwgate);
+		if (!(gate & ANE_PWGATE_CLOSED))
+			return NOTIFY_OK;
+		if (gate != ANE_PWGATE_CLOSED) {
+			dev_err(pd->dev, "power gate word %#x is not a known state\n",
+				gate);
+			return notifier_from_errno(-EIO);
+		}
+		writel(0, pd->pwgate);
+		ret = readl_poll_timeout_atomic(pd->pwgate, gate,
+						!(gate & ANE_PWGATE_CLOSED),
+						ANE_PWGATE_POLL_US,
+						ANE_PWGATE_TIMEOUT_US);
+		if (ret) {
+			writel(ANE_PWGATE_CLOSED, pd->pwgate);
+			dev_err(pd->dev, "power gate did not open (word %#x)\n",
+				gate);
+			return notifier_from_errno(ret);
+		}
+		pd->pwgate_opened = true;
+		return NOTIFY_OK;
+	case GENPD_NOTIFY_OFF:
+		if (!pd->pwgate_opened)
+			return NOTIFY_OK;
+		pd->pwgate_opened = false;
+		writel(ANE_PWGATE_CLOSED, pd->pwgate);
+		ret = readl_poll_timeout_atomic(pd->pwgate, gate,
+						(gate & ANE_PWGATE_CLOSED) ==
+						ANE_PWGATE_CLOSED,
+						ANE_PWGATE_POLL_US,
+						ANE_PWGATE_TIMEOUT_US);
+		if (ret)
+			dev_warn(pd->dev, "power gate did not close (word %#x)\n",
+				 gate);
+		return NOTIFY_OK;
+	default:
+		return NOTIFY_DONE;
+	}
+}
+
+/*
+ * Register the power gate notifier on power-domains[0] before its device
+ * link is created: the link resumes the domain at once.
+ */
+static int ane_rtclient_pwgate_add(struct ane_rtclient *ane,
+				   struct ane_rtclient_pd *pd)
+{
+	int ret;
+
+	if (!ane->soc->pwgate_off || pd->pwgate_nb_added)
+		return 0;
+	if (!pd->pwgate_base) {
+		pd->pwgate_base = of_iomap(ane->dev->of_node, 2);
+		if (!pd->pwgate_base)
+			return -ENOMEM;
+		pd->pwgate = pd->pwgate_base + ane->soc->pwgate_off;
+	}
+	pd->pwgate_nb.notifier_call = ane_rtclient_pwgate_notify;
+	ret = dev_pm_genpd_add_notifier(pd->pd_dev[0], &pd->pwgate_nb);
+	if (ret)
+		return ret;
+	pd->pwgate_nb_added = true;
+	return 0;
 }
 
 static int ane_rtclient_attach_genpd(struct ane_rtclient *ane)
@@ -1985,6 +2438,11 @@ found:
 				goto out;
 			}
 		}
+		if (i == 0) {
+			err = ane_rtclient_pwgate_add(ane, pd);
+			if (err)
+				goto out;
+		}
 		if (!pd->pd_link[i]) {
 			if (!ane_rtclient_pinned) {
 				if (!try_module_get(THIS_MODULE)) {
@@ -2029,6 +2487,15 @@ static void ane_rtclient_detach_genpd(struct device *dev)
 		for (i = count - 1; i >= 0; i--) {
 			if (pd->pd_link[i])
 				device_link_del(pd->pd_link[i]);
+			/*
+			 * genpd keeps a notifier past detach, so drop it first.
+			 * The domain may then go off with the gate open, the
+			 * state between the two power-up steps.
+			 */
+			if (i == 0 && pd->pwgate_nb_added) {
+				dev_pm_genpd_remove_notifier(pd->pd_dev[0]);
+				pd->pwgate_nb_added = false;
+			}
 			if (pd->pd_dev[i])
 				dev_pm_domain_detach(pd->pd_dev[i], true);
 		}
@@ -2093,6 +2560,7 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 	if (!ane->legacy_buffers)
 		return -ENOMEM;
 	ane->dev = dev;
+	INIT_LIST_HEAD(&ane->h16_processes);
 	ane->soc = of_device_get_match_data(dev);
 	platform_set_drvdata(pdev, ane);
 	INIT_DELAYED_WORK(&ane->poll_work, ane_rtclient_post_boot);
@@ -2140,9 +2608,10 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		pm_runtime_disable(dev);
 		return -EPROBE_DEFER;
 	}
-	/* T8112: macOS (type 0x70) opens PWGATE (bits 29:28 = 0) before
-	 * the ps words. This driver only reads it: an engine read behind a
-	 * closed gate is untested, so it refuses first.
+	/* T8112: the power gate notifier opened the gate before ane_sys_cpu
+	 * turned on. A gate that still reads closed means the state was
+	 * already on without it (no power-up ran), so refuse before any
+	 * engine read.
 	 */
 	if (ane->soc->pwgate_off) {
 		void __iomem *set = devm_of_iomap(dev, dev->of_node, 2, NULL);
@@ -2335,14 +2804,13 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			 * reboot.
 			 */
 			struct ane_legacy_buffer *command = ane->cmd_buf;
+			unsigned long query_deadline = jiffies + msecs_to_jiffies(3000);
 			int qret;
 
 			if (command) {
 				memset(command->cpu, 0, SZ_16K);
-				qret = ane_rtclient_legacy_exchange(ane,
-								    command,
-								     16, 0x03,
-								     1, 3000);
+				qret = ane_rtclient_legacy_exchange(ane, command, 16, 0x03, 1,
+								    query_deadline);
 				dev_dbg(dev,
 					"LEGACY CONFIG_GET words %08x %08x result=%d (DMA remains held)\n",
 					READ_ONCE(((u32 *)command->cpu)[1]),
@@ -2483,8 +2951,15 @@ err_pm_or_hold:
 
 static int ane_rtclient_probe(struct platform_device *pdev)
 {
+	const struct ane_t602x_soc *soc = of_device_get_match_data(&pdev->dev);
 	bool hardware_touched = false;
 	int ret;
+
+	if (!soc)
+		return -ENODEV;
+	/* Later generations cannot enter H14 boot or parameter paths. */
+	if (soc->platform)
+		return ane_fw_platform_probe(pdev, soc->platform);
 
 	mutex_lock(&ane_rtclient_probe_guard_lock);
 	if (ane_rtclient_probe_failed_dirty) {
@@ -2514,7 +2989,13 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 
 static void ane_rtclient_remove(struct platform_device *pdev)
 {
+	const struct ane_t602x_soc *soc = of_device_get_match_data(&pdev->dev);
 	struct ane_rtclient *ane = platform_get_drvdata(pdev);
+
+	if (soc->platform) {
+		ane_fw_platform_remove(pdev);
+		return;
+	}
 
 	if (READ_ONCE(ane_t6021_perf_ane) == ane)
 		WRITE_ONCE(ane_t6021_perf_ane, NULL);
@@ -2526,11 +3007,21 @@ static void ane_rtclient_remove(struct platform_device *pdev)
 			 "remove HELD: no teardown — reboot reclaims\n");
 }
 
+static const struct ane_t602x_soc ane_h16_soc = {
+	.platform = &ane_h16_platform,
+};
+
+static const struct ane_t602x_soc ane_h17_soc = {
+	.platform = &ane_h17_platform,
+};
+
 static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6020-ane", .data = &ane_t6020_soc },
 	{ .compatible = "apple,t6021-ane", .data = &ane_t6021_soc },
 	{ .compatible = "apple,t6022-ane", .data = &ane_t6022_soc },
 	{ .compatible = "apple,t8112-ane", .data = &ane_t8112_soc },
+	{ .compatible = "apple,t6041-ane", .data = &ane_h16_soc },
+	{ .compatible = "apple,t8140-ane", .data = &ane_h17_soc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ane_rtclient_of_match);
@@ -2558,8 +3049,12 @@ static struct attribute *ane_t6021_stats_attrs[] = {
 static umode_t ane_t6021_stats_is_visible(struct kobject *kobj,
 					  struct attribute *attr, int n)
 {
-	struct ane_rtclient *ane = dev_get_drvdata(kobj_to_dev(kobj));
+	struct device *dev = kobj_to_dev(kobj);
+	const struct ane_t602x_soc *soc = of_device_get_match_data(dev);
+	struct ane_rtclient *ane = dev_get_drvdata(dev);
 
+	if (soc->platform)
+		return 0;
 	if (attr == &dev_attr_ane_stats.attr && !ane->stats_slots)
 		return 0;
 	return attr->mode;
@@ -2588,7 +3083,40 @@ static struct platform_driver ane_rtclient_driver = {
 
 static int __init ane_rtclient_init(void)
 {
+	const struct of_device_id *match;
+	struct device_node *np;
 	int ret;
+
+	/* platform_probe() powers a single genpd, and DMA configuration
+	 * happens even earlier. Refuse later generations before registering
+	 * the driver, including disabled nodes, so these core paths cannot
+	 * precede the ownership and firmware preflight. These SoCs have one
+	 * ANE generation; refusing registration cannot hide an H14 engine.
+	 */
+	for_each_matching_node_and_match(np, ane_rtclient_of_match, &match) {
+		const struct ane_t602x_soc *soc = match->data;
+		struct platform_device *pdev;
+
+		if (!soc->platform)
+			continue;
+		if (soc->platform->owner == ANE_FW_OWNER_EXCLAVE) {
+			of_node_put(np);
+			pr_info("ane: H17 ANE: Linux exclave ownership handoff unavailable; refusing registration\n");
+			return -EOPNOTSUPP;
+		}
+		pdev = of_find_device_by_node(np);
+		of_node_put(np);
+		if (!pdev) {
+			pr_info("ane: H16 ANE: firmware transport unvalidated; keeping disabled\n");
+			return -EOPNOTSUPP;
+		}
+		ret = ane_fw_platform_preflight(pdev, soc->platform);
+		put_device(&pdev->dev);
+		if (ret)
+			return ret;
+		ane_rtclient_driver.driver_managed_dma = true;
+		break;
+	}
 
 	WRITE_ONCE(ane_rtclient_probe_failed_dirty, false);
 	ret = platform_driver_register(&ane_rtclient_driver);
@@ -2607,4 +3135,4 @@ static void __exit ane_rtclient_exit(void)
 module_exit(ane_rtclient_exit);
 
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_DESCRIPTION("Apple Neural Engine (T6021/M2) installed module");
+MODULE_DESCRIPTION("Apple Neural Engine firmware driver with H16/H17 preflight");

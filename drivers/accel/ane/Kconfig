@@ -7,11 +7,17 @@ config DRM_ACCEL_ANE
 	depends on APPLE_RTKIT
 	depends on APPLE_DART || COMPILE_TEST
 	depends on MMU
+	select INTERCONNECT
+	select PM_OPP
 	select CRYPTO_LIB_SHA256
+	select DRM_ACCEL_ANE_H16_VALIDATION
 	help
 	  Choose this option if you have an Apple SoC with a Neural Engine:
 	  M1 (T8103), M1 Pro, Max and Ultra (T6000, T6001, T6002), M2
 	  (T8112), or M2 Pro, Max and Ultra (T6020, T6021, T6022).
+	  H16 (M4 Pro) and H17 are recognized for firmware preflight and
+	  ownership refusal by default. An explicit h16_stage module parameter
+	  enables H16 cold-boot diagnostics. Inference is not available.
 
 	  The interface exposed to userspace is described in
 	  include/uapi/drm/ane_accel.h.
@@ -31,5 +37,34 @@ config DRM_ACCEL_ANE_KUNIT_TEST
 	  the buffer sizes that DRM_IOCTL_ANE_SUBMIT accepts against the
 	  task descriptor layout that userspace builds, at the limits, one
 	  past them and with a size product that overflows.
+
+	  If unsure, say N.
+
+config DRM_ACCEL_ANE_H16_VALIDATION
+	tristate
+	select CRYPTO_LIB_SHA256
+
+config DRM_ACCEL_ANE_FW_KUNIT_TEST
+	tristate "KUnit tests for ANE firmware validation" if !KUNIT_ALL_TESTS
+	depends on DRM_ACCEL && KUNIT
+	select DRM_ACCEL_ANE_H16_VALIDATION
+	default KUNIT_ALL_TESTS
+	help
+	  Check preload identity/ranges, channel validation, RTKit ordering,
+	  H16 HWX/resource bounds, UUID retirement, shared transport and bounded
+	  allocation and staged H16 cold boot without hardware.
+	  These tests can run on architectures other than Apple arm64.
+
+	  If unsure, say N.
+
+config DRM_ACCEL_ANE_PM_KUNIT_TEST
+	tristate "KUnit tests for ANE runtime-PM recovery" if !KUNIT_ALL_TESTS
+	depends on DRM_ACCEL && KUNIT && PM
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise supplier suspension, power-off verification failure and
+	  runtime resume errors against the runtime-PM and device-link core.
+	  No ANE hardware is required. These tests can run independently of
+	  the ANE driver on non-Apple platforms.
 
 	  If unsure, say N.
