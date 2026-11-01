@@ -20,6 +20,7 @@
 #include <linux/vmalloc.h>
 
 #include "ane_h16_boot.h"
+#include "ane_h16_execute.h"
 #include "ane_h16_preload.h"
 
 #define ANE_H16_TX_WORDS 272
@@ -81,12 +82,17 @@ static bool ane_h16_observing(void)
 	return h16_identity && !strcmp(h16_identity, "observe");
 }
 
+static struct ane_h16_device *ane_h16_job_dev;
+static struct debugfs_blob_wrapper ane_h16_job_result;
+
 void ane_h16_backend_exit(void)
 {
 	debugfs_remove_recursive(ane_h16_debugfs);
 	ane_h16_debugfs = NULL;
 	vfree(ane_h16_dump[0].data);
 	vfree(ane_h16_dump[1].data);
+	vfree(ane_h16_job_result.data);
+	ane_h16_job_dev = NULL;
 }
 
 static u32 ane_h16_mmio_read32(void *ctx, enum ane_h16_window w, u32 off)
@@ -647,6 +653,284 @@ out:
 	return ret;
 }
 
+/*
+ * Diagnostic job interface (workspace ane). With h16_job=1 and a completed
+ * startup stage, one write to debugfs ane_h16/job runs a sequence of records
+ * {u32 op, u32 length, payload} in order; ane_h16/result then holds one record
+ * {u32 op, s32 status, u64 ns, u32 length, u32 0, data} per job record. The
+ * host builds every firmware command; the kernel maps, sends and waits.
+ */
+static bool h16_job;
+module_param(h16_job, bool, 0444);
+MODULE_PARM_DESC(h16_job, "Diagnostic: after startup, run host-built jobs from debugfs ane_h16/job");
+
+enum {
+	ANE_H16_JOB_MAP = 1,	/* u64 dva, u64 size, data: zero-filled 16K-aligned mapping */
+	ANE_H16_JOB_WRITE,	/* u64 dva, data */
+	ANE_H16_JOB_FILL,	/* u64 dva, u64 size, u32 byte */
+	ANE_H16_JOB_CMD,	/* u32 channel, u32 fill, command; result: the reply */
+	ANE_H16_JOB_EVENT,	/* u64 uuid, u32 timeout ms; result: reports up to the terminal one */
+	ANE_H16_JOB_PEEK,	/* u64 dva, u64 size; result: the bytes */
+};
+
+#define ANE_H16_JOB_FILL_PROGRAM BIT(0)	/* u32 program handle at +8 */
+#define ANE_H16_JOB_FILL_PROCESS BIT(1)	/* u32 process handle at +0xc */
+#define ANE_H16_JOB_RESULT_MAX SZ_64M
+
+struct ane_h16_job {
+	u8 *out;
+	size_t used, size;
+	u32 program, process;
+	u64 published_ns;
+};
+
+static void *ane_h16_job_cpu(struct ane_h16_device *h, u64 dva, u64 size)
+{
+	struct ane_h16_mapping *m;
+
+	list_for_each_entry(m, &h->mappings, node)
+		if (m->cpu && dva >= m->dva && size <= m->size && dva - m->dva <= m->size - size)
+			return (u8 *)m->cpu + (dva - m->dva);
+	return NULL;
+}
+
+static int ane_h16_job_emit(struct ane_h16_job *j, u32 op, int status, u64 ns,
+			    const void *data, size_t length)
+{
+	u8 *r;
+
+	if (j->size - j->used < 24 || length > j->size - j->used - 24)
+		return -ENOSPC;
+	r = j->out + j->used;
+	put_unaligned_le32(op, r);
+	put_unaligned_le32(status, r + 4);
+	put_unaligned_le64(ns, r + 8);
+	put_unaligned_le32(length, r + 16);
+	put_unaligned_le32(0, r + 20);
+	if (length)
+		memcpy(r + 24, data, length);
+	j->used += 24 + length;
+	return 0;
+}
+
+static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
+			   const u8 *p, u32 length, u64 *ns)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	u32 channel, fill;
+	u8 *command;
+	u64 start;
+	int ret;
+
+	if (length < 16)
+		return -EINVAL;
+	channel = get_unaligned_le32(p);
+	fill = get_unaligned_le32(p + 4);
+	length -= 8;
+	command = kmemdup(p + 8, length, GFP_KERNEL);
+	if (!command)
+		return -ENOMEM;
+	if (fill & ANE_H16_JOB_FILL_PROGRAM)
+		put_unaligned_le32(j->program, command + 8);
+	if ((fill & ANE_H16_JOB_FILL_PROCESS) && length >= 16)
+		put_unaligned_le32(j->process, command + 0xc);
+	start = ktime_get_ns();
+	ret = ane_fw_transport_publish(t, channel, command, length,
+				       start + h->boot.build->command_timeout_ns);
+	if (!ret) {
+		j->published_ns = start;
+		ret = ane_fw_transport_wait(t, channel);
+	}
+	*ns = ktime_get_ns() - start;
+	if (!ret || ret == -EREMOTEIO) {
+		const u8 *reply = (u8 *)t->pool.cpu + (t->pending[channel].dva - t->pool.dva);
+		u16 id = get_unaligned_le16(reply + 4);
+
+		if (!ret && id == ANE_H16_LOAD_PROGRAM && length >= 0x1bc)
+			j->program = get_unaligned_le32(reply + 0x1b8);
+		if (!ret && id == ANE_H16_CREATE_PROCESS && length >= 0x10)
+			j->process = get_unaligned_le32(reply + 0xc);
+		memcpy(command, reply, length);
+	}
+	ret = ane_h16_job_emit(j, ANE_H16_JOB_CMD, ret, *ns, command, length) ?: ret;
+	kfree(command);
+	return ret;
+}
+
+/* Collect IO_T2H reports until the terminal event of @uuid or the timeout. */
+static int ane_h16_job_event(struct ane_h16_device *h, struct ane_h16_job *j,
+			     u64 uuid, u32 timeout_ms)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	u64 deadline = ktime_get_ns() + (u64)timeout_ms * NSEC_PER_MSEC;
+	u8 report[0x80];
+	int ret = -ETIMEDOUT;
+
+	while (ktime_get_ns() < deadline) {
+		size_t size = 0;
+		u32 pending;
+		int r = ane_fw_transport_consume(t, report, sizeof(report), &size);
+
+		if (!r) {
+			u64 ns = ktime_get_ns() - j->published_ns;
+
+			r = ane_h16_job_emit(j, ANE_H16_JOB_EVENT, 0, ns, report, size);
+			if (r)
+				return r;
+			if (size >= 0x20 && get_unaligned_le16(report + 4) == ANE_H16_EVENT_REPORT &&
+			    get_unaligned_le64(report + 8) == uuid) {
+				u32 state = get_unaligned_le32(report + 0x1c);
+
+				if (state == ANE_H16_EVENT_SUCCESS)
+					return 0;
+				if (state == ANE_H16_EVENT_FAILURE)
+					return -EIO;
+			}
+			continue;
+		}
+		if (r != -EAGAIN)
+			return r;
+		r = ane_fw_transport_irq(t, &pending);
+		if (r)
+			return r;
+		r = ane_fw_transport_shared(t);
+		if (r && r != -EAGAIN)
+			return r;
+		ane_h16_mailbox(h);
+		ret = ane_h16_faults(&h->boot, false);
+		if (ret)
+			return ret;
+		ret = -ETIMEDOUT;
+		usleep_range(20, 40);
+	}
+	return ret;
+}
+
+static int ane_h16_job_run(struct ane_h16_device *h, struct ane_h16_job *j,
+			   const u8 *p, size_t size)
+{
+	while (size >= 8) {
+		u32 op = get_unaligned_le32(p), length = get_unaligned_le32(p + 4);
+		const u8 *a = p + 8;
+		u64 ns = 0;
+		int ret = 0;
+
+		if (length > size - 8)
+			return -EINVAL;
+		switch (op) {
+		case ANE_H16_JOB_MAP: {
+			struct ane_fw_surface s;
+			u64 dva, bytes;
+
+			if (length < 16)
+				return -EINVAL;
+			dva = get_unaligned_le64(a);
+			bytes = get_unaligned_le64(a + 8);
+			if (length - 16 > bytes)
+				return -EINVAL;
+			ret = ane_h16_alloc_at(h, dva, ALIGN(bytes, SZ_16K), &s);
+			if (!ret)
+				memcpy(s.cpu, a + 16, length - 16);
+			break;
+		}
+		case ANE_H16_JOB_WRITE:
+		case ANE_H16_JOB_FILL:
+		case ANE_H16_JOB_PEEK: {
+			u64 dva, bytes;
+			u8 *cpu;
+
+			if (length < (op == ANE_H16_JOB_WRITE ? 8 : 16))
+				return -EINVAL;
+			dva = get_unaligned_le64(a);
+			bytes = op == ANE_H16_JOB_WRITE ? length - 8 : get_unaligned_le64(a + 8);
+			cpu = ane_h16_job_cpu(h, dva, bytes);
+			if (!cpu) {
+				ret = -ENOENT;
+				break;
+			}
+			if (op == ANE_H16_JOB_WRITE)
+				memcpy(cpu, a + 8, bytes);
+			else if (op == ANE_H16_JOB_FILL)
+				memset(cpu, length >= 20 ? a[16] : 0, bytes);
+			else
+				ret = ane_h16_job_emit(j, op, 0, 0, cpu, bytes);
+			break;
+		}
+		case ANE_H16_JOB_CMD:
+			ret = ane_h16_job_cmd(h, j, a, length, &ns);
+			if (ret)
+				return ret;
+			break;
+		case ANE_H16_JOB_EVENT:
+			if (length < 12)
+				return -EINVAL;
+			ret = ane_h16_job_event(h, j, get_unaligned_le64(a), get_unaligned_le32(a + 8));
+			ns = ktime_get_ns() - j->published_ns;
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (op != ANE_H16_JOB_PEEK && op != ANE_H16_JOB_CMD)
+			ane_h16_job_emit(j, op, ret, ns, NULL, 0);
+		if (ret)
+			return ret;
+		p += 8 + length;
+		size -= 8 + length;
+	}
+	return size ? -EINVAL : 0;
+}
+
+static ssize_t ane_h16_job_write(struct file *file, const char __user *buf, size_t count,
+				 loff_t *ppos)
+{
+	struct ane_h16_job j = {};
+	u8 *in;
+	int ret;
+
+	if (*ppos || count > SZ_256M)
+		return -EINVAL;
+	in = vmemdup_user(buf, count);
+	if (IS_ERR(in))
+		return PTR_ERR(in);
+	j.size = ANE_H16_JOB_RESULT_MAX;
+	j.out = vzalloc(j.size);
+	if (!j.out) {
+		kvfree(in);
+		return -ENOMEM;
+	}
+	mutex_lock(&ane_h16_lock);
+	if (!ane_h16_job_dev) {
+		ret = -ENODEV;
+	} else {
+		ret = ane_h16_job_run(ane_h16_job_dev, &j, in, count);
+		dev_info(ane_h16_job_dev->dev, "H16 job %zu bytes: %d, result %zu bytes\n",
+			 count, ret, j.used);
+	}
+	vfree(ane_h16_job_result.data);
+	ane_h16_job_result.data = j.out;
+	ane_h16_job_result.size = j.used;
+	mutex_unlock(&ane_h16_lock);
+	kvfree(in);
+	return ret ? ret : count;
+}
+
+static const struct file_operations ane_h16_job_fops = {
+	.owner = THIS_MODULE,
+	.write = ane_h16_job_write,
+};
+
+static void ane_h16_job_publish(struct ane_h16_device *h)
+{
+	if (!h16_job || ane_h16_job_dev)
+		return;
+	if (!ane_h16_debugfs)
+		ane_h16_debugfs = debugfs_create_dir("ane_h16", NULL);
+	ane_h16_job_dev = h;
+	debugfs_create_file("job", 0200, ane_h16_debugfs, NULL, &ane_h16_job_fops);
+	debugfs_create_blob("result", 0400, ane_h16_debugfs, &ane_h16_job_result);
+	dev_info(h->dev, "H16 job interface in debugfs ane_h16/\n");
+}
+
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc,
 			  unsigned int stage)
 {
@@ -708,10 +992,12 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	if (!ret) {
 		dev_info(h->dev, "H16 stage %u complete%s\n", stage,
 			 h->boot.ran ? "; held until reboot" : "");
-		if (stage == ANE_H16_STARTUP)
+		if (stage == ANE_H16_STARTUP) {
 			print_hex_dump(KERN_INFO, "H16 RESOURCE_INFO ", DUMP_PREFIX_OFFSET,
 				       16, 1, h->boot.resource_info,
 				       sizeof(h->boot.resource_info), false);
+			ane_h16_job_publish(h);
+		}
 	}
 	ret = 0;
 	goto unlock;
