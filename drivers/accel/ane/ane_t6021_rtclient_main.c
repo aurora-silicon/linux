@@ -98,6 +98,7 @@
 #include "ane_h16_pending.h"
 #include "ane_h16_resources.h"
 #include "ane_fw_protocol.h"
+#include "ane_exec_timing.h"
 #include "ane_stats.h"
 #include "ane_pm.h"
 #include "ane_fw_ids.h"
@@ -305,6 +306,50 @@ struct ane_rtclient {
 	struct ane_stats_counters stats_ctrs;
 	struct ane_stats_ring stats_ring;
 	struct ane_stats_ring_entry *stats_slots;
+
+	/*
+	 * Per-phase timing of successful H14 CALLs (ane_exec_timing.h) at
+	 * <debugfs>/accel/<dev>/execute. The xt_ fields describe the CALL in
+	 * flight; ane_t6021_fw_lock serializes them.
+	 */
+	struct ane_xt xt;
+	struct dentry *xt_file;
+	u64 xt_ack_ns;		/* the firmware acknowledged the CALL */
+	u64 xt_finish_ns;	/* its finish event was seen */
+	u32 xt_ack_polls;
+	u32 xt_finish_polls;
+};
+
+/* The phases and counts of the execute file. */
+enum ane_t6021_xt_phase {
+	ANE_T6021_XT_SETUP,	/* IO list copy, allocations, fw_lock */
+	ANE_T6021_XT_ENSURE,	/* program and process resident (or reloaded) */
+	ANE_T6021_XT_BUILD,	/* command words and IO element lookups */
+	ANE_T6021_XT_ACK,	/* ring service, doorbell, until the ack */
+	ANE_T6021_XT_FINISH,	/* the ack until the finish event */
+	ANE_T6021_XT_TAIL,	/* ring drains after the finish event */
+	ANE_T6021_XT_CALL,	/* the whole EXEC ioctl */
+	ANE_T6021_XT_NS,
+	ANE_T6021_XT_ACK_POLLS = ANE_T6021_XT_NS,
+	ANE_T6021_XT_FINISH_POLLS,
+	ANE_T6021_XT_COUNT
+};
+
+/*
+ * A poll is one sleep between looks at the ring. The ack and finish phases
+ * end when a look finds the reply or the event, so they include the poll
+ * latency.
+ */
+static const char *const ane_t6021_xt_names[ANE_T6021_XT_COUNT] = {
+	[ANE_T6021_XT_SETUP] = "setup",
+	[ANE_T6021_XT_ENSURE] = "ensure",
+	[ANE_T6021_XT_BUILD] = "build",
+	[ANE_T6021_XT_ACK] = "ack",
+	[ANE_T6021_XT_FINISH] = "finish",
+	[ANE_T6021_XT_TAIL] = "tail",
+	[ANE_T6021_XT_CALL] = "call",
+	[ANE_T6021_XT_ACK_POLLS] = "ack_polls",
+	[ANE_T6021_XT_FINISH_POLLS] = "finish_polls",
 };
 
 /* Per-open BO ownership (drm_file->driver_priv). Handles live in the
@@ -943,6 +988,7 @@ static int ane_rtclient_legacy_exchange(struct ane_rtclient *ane,
 		 * sleeping 1-2 ms.
 		 */
 		udelay(50);
+		ane->xt_ack_polls++;
 	}
 	dev_info(ane->dev, "LEGACY timeout ch=%u op=%#x io=%016llx\n",
 		 channel, opcode, READ_ONCE(io[0]));
@@ -1324,6 +1370,7 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 			usleep_range(1, 2);
 		else
 			usleep_range(50, 100);
+		ane->xt_finish_polls++;
 	} while (time_before(jiffies, deadline));
 	if (atomic_read(&ane_t6021_quarantined))
 		return -EIO;
@@ -1383,8 +1430,11 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 					       &ane->stats_ring,
 					       stats_submit_ns, 1);
 	}
+	ane->xt_ack_polls = 0;
+	ane->xt_finish_polls = 0;
 	ret = ane_rtclient_legacy_exchange(ane, command, length, opcode,
 					   channel, deadline);
+	ane->xt_ack_ns = ktime_get_ns();
 	if (ret) {
 		ane_t6021_tracing = false;
 		if (stats_call)
@@ -1402,6 +1452,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 		if (ane_t6021_tracing)
 			ane_t6021_trace_add(ANE_TR_ACK, 0);
 		ret = ane_rtclient_call_wait(ane, deadline);
+		ane->xt_finish_ns = ktime_get_ns();
 		ane_t6021_tracing = false;
 		if (!ret)
 			dma_rmb();
@@ -2082,10 +2133,13 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 	struct ane_t6021_fd *fd = file->driver_priv;
 	size_t ios_size;
 	size_t cmd_size;
+	struct ane_xt_sample x = {};
+	u64 t0, t_lock = 0, t_ensure = 0, t_build = 0, t_done = 0;
 	int ret, i, pinned = 0;
 
 	if (ane->soc->platform)
 		return ane_rtclient_h16_call(ane, file, user);
+	t0 = ktime_get_ns();
 	if (user->pad || user->count < 1 || user->count > DRM_ANE_MAX_BINDS ||
 	    user->priority < 2 || user->priority > 7 || !fd)
 		return -EINVAL;
@@ -2134,6 +2188,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 		ret = -ESTALE;
 		goto unlock;
 	}
+	t_lock = ktime_get_ns();
 	/* Load it and its process again if an eviction or a restart took
 	 * them out of the firmware. This may restart the firmware.
 	 */
@@ -2141,6 +2196,7 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 				       &ane_t6021_progtab_ops, ane);
 	if (ret)
 		goto unlock;
+	t_ensure = ktime_get_ns();
 	command = ane->cmd_buf;
 	if (!command) {
 		ret = -ENODEV;
@@ -2194,12 +2250,24 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 		 * the fw starts reading them.
 		 */
 		wmb();
+		t_build = ktime_get_ns();
 		ret = ane_rtclient_command(ane, command,
 					   cmd_size,
 							       CSNE_CMD_PROCEDURE_CALL,
 							       1,
 							       user->timeout_ms ?
 							       user->timeout_ms : 5000);
+		t_done = ktime_get_ns();
+		if (!ret) {
+			x.v[ANE_T6021_XT_SETUP] = t_lock - t0;
+			x.v[ANE_T6021_XT_ENSURE] = t_ensure - t_lock;
+			x.v[ANE_T6021_XT_BUILD] = t_build - t_ensure;
+			x.v[ANE_T6021_XT_ACK] = ane->xt_ack_ns - t_build;
+			x.v[ANE_T6021_XT_FINISH] = ane->xt_finish_ns - ane->xt_ack_ns;
+			x.v[ANE_T6021_XT_TAIL] = t_done - ane->xt_finish_ns;
+			x.v[ANE_T6021_XT_ACK_POLLS] = ane->xt_ack_polls;
+			x.v[ANE_T6021_XT_FINISH_POLLS] = ane->xt_finish_polls;
+		}
 	}
 unlock:
 	/* Command failures latch quarantine before these final puts. */
@@ -2208,6 +2276,10 @@ unlock:
 	kfree(exec_bos);
 	mutex_unlock(&ane_t6021_fw_lock);
 	kfree(ios);
+	if (!ret && t_done) {
+		x.v[ANE_T6021_XT_CALL] = ktime_get_ns() - t0;
+		ane_xt_add(&ane->xt, &x);
+	}
 	return ret;
 }
 
@@ -3611,6 +3683,8 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 		.state = ANE_T6021_PM_ACTIVE,
 	};
 	INIT_LIST_HEAD(&ane->retired);
+	ane_xt_init(&ane->xt, ane_t6021_xt_names, ANE_T6021_XT_NS,
+		    ANE_T6021_XT_COUNT);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
@@ -3985,8 +4059,12 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 			drm_debugfs_add_file(&adrm->drm, "fw_memory",
 					     ane_t6021_fw_memory_show, ane);
 		drmret = drm_dev_register(&adrm->drm, 0);
-		if (!drmret)
+		if (!drmret) {
 			ane->registered = true;
+			ane->xt_file = ane_xt_debugfs("execute",
+						      adrm->drm.debugfs_root,
+						      &ane->xt);
+		}
 		if (drmret) {
 			dev_err_probe(dev, drmret, "drm_dev_register\n");
 			ret = drmret;
@@ -4068,6 +4146,8 @@ static void ane_rtclient_remove(struct platform_device *pdev)
 	if (READ_ONCE(ane_t6021_perf_ane) == ane)
 		WRITE_ONCE(ane_t6021_perf_ane, NULL);
 
+	debugfs_remove(ane->xt_file);
+	ane->xt_file = NULL;
 	cancel_delayed_work_sync(&ane->poll_work);
 
 	if (ane->held)

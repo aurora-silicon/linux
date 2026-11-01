@@ -3,6 +3,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 
+#include "ane_exec_timing.h"
 #include "ane_t6021_lifetime.h"
 
 static void mring_classify_test(struct kunit *test)
@@ -750,6 +751,61 @@ static void restart_state_machine_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_BOOT);
 }
 
+/* The execute files' table: last, sum, minimum and maximum per entry. */
+static void exec_timing_fold_test(struct kunit *test)
+{
+	static const char *const names[] = { "a", "b", "polls" };
+	struct ane_xt_sample x = {};
+	struct ane_xt_stats *st;
+	struct ane_xt *xt;
+
+	xt = kunit_kzalloc(test, sizeof(*xt), GFP_KERNEL);
+	st = kunit_kzalloc(test, sizeof(*st), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, xt);
+	KUNIT_ASSERT_NOT_NULL(test, st);
+	ane_xt_init(xt, names, 2, ARRAY_SIZE(names));
+	x.v[0] = 300;
+	x.v[1] = 5;
+	x.v[2] = 3;
+	x.v[3] = 11;
+	ane_xt_add(xt, &x);
+	x.v[0] = 100;
+	x.v[1] = 9;
+	x.v[2] = 0;
+	ane_xt_add(xt, &x);
+	ane_xt_snapshot(xt, st, false);
+	KUNIT_EXPECT_EQ(test, st->count, 2ULL);
+	KUNIT_EXPECT_EQ(test, st->sum.v[0], 400ULL);
+	KUNIT_EXPECT_EQ(test, st->min.v[0], 100ULL);
+	KUNIT_EXPECT_EQ(test, st->max.v[0], 300ULL);
+	KUNIT_EXPECT_EQ(test, st->last.v[0], 100ULL);
+	KUNIT_EXPECT_EQ(test, st->min.v[1], 5ULL);
+	KUNIT_EXPECT_EQ(test, st->max.v[1], 9ULL);
+	/* A zero count is a real minimum, not an unset one. */
+	KUNIT_EXPECT_EQ(test, st->min.v[2], 0ULL);
+	KUNIT_EXPECT_EQ(test, st->max.v[2], 3ULL);
+	/* Entries past n are never folded. */
+	KUNIT_EXPECT_EQ(test, st->sum.v[3], 0ULL);
+
+	/* A reset hands back what it cleared. */
+	ane_xt_snapshot(xt, st, true);
+	KUNIT_EXPECT_EQ(test, st->count, 2ULL);
+	ane_xt_snapshot(xt, st, false);
+	KUNIT_EXPECT_EQ(test, st->count, 0ULL);
+	x.v[0] = 7;
+	ane_xt_add(xt, &x);
+	ane_xt_snapshot(xt, st, false);
+	KUNIT_EXPECT_EQ(test, st->min.v[0], 7ULL);
+	KUNIT_EXPECT_EQ(test, st->max.v[0], 7ULL);
+
+	/* The sizes clamp to the sample. */
+	ane_xt_init(xt, names, 99, 99);
+	KUNIT_EXPECT_EQ(test, xt->n, (unsigned int)ANE_XT_MAX);
+	KUNIT_EXPECT_EQ(test, xt->nns, (unsigned int)ANE_XT_MAX);
+	ane_xt_init(xt, names, 3, 2);
+	KUNIT_EXPECT_EQ(test, xt->nns, 2U);
+}
+
 static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(mring_classify_test),
 	KUNIT_CASE(legtab_reuse_test),
@@ -767,6 +823,7 @@ static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(unload_order_test),
 	KUNIT_CASE(restart_state_machine_test),
 	KUNIT_CASE(restart_stop_boundary_test),
+	KUNIT_CASE(exec_timing_fold_test),
 	{}
 };
 
