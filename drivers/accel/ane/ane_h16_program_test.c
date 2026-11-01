@@ -844,6 +844,9 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x90 + 4), TEST_GENERIC_BASE + 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x18),
 			p->surfaces[0]->dva);
+	/* Each descriptor covers its whole HWX section. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20),
+			p->hwx.surfaces[0].section.size);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca0), 1);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xca8 + 8), 4);
 	/* Later requests of the same program take the direct path. */
@@ -1012,6 +1015,8 @@ static void program_stall_trace_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
 	f->mode = FW_REPORT_STALL;
 	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ETIMEDOUT);
+	/* The fake firmware asked for no log buffer: nothing to print. */
+	KUNIT_EXPECT_EQ(test, f->s.fwlog_lines, 0);
 	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
 	KUNIT_EXPECT_EQ(test, f->fail_step, 3);
 	KUNIT_EXPECT_EQ(test, f->fail_flags, ANE_H16_EXECUTE_QUEUED);
@@ -1029,6 +1034,44 @@ static void program_stall_trace_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->fail_reports, 0);
 	KUNIT_EXPECT_EQ(test, f->fail_state, U32_MAX);
 	KUNIT_EXPECT_EQ(test, f->fail_other, 2);
+}
+
+static void program_fwlog_line_test(struct kunit *test)
+{
+	static const char text[] = "R: [0:1]: CMD = 0x020c\tok\x01  ";
+	u8 *r = kunit_kzalloc(test, ANE_H16_FWLOG_RECORD, GFP_KERNEL);
+	char line[ANE_H16_FWLOG_RECORD];
+
+	KUNIT_ASSERT_NOT_NULL(test, r);
+	KUNIT_EXPECT_EQ(test, ane_h16_fwlog_line(r, line), 0);
+	r[0] = 0x12;
+	memcpy(r + 2, text, sizeof(text));
+	KUNIT_EXPECT_EQ(test, ane_h16_fwlog_line(r, line), 26);
+	KUNIT_EXPECT_STREQ(test, line, "R: [0:1]: CMD = 0x020c ok.");
+	/* An unterminated record stops at its end. */
+	memset(r + 2, 'a', ANE_H16_FWLOG_RECORD - 2);
+	KUNIT_EXPECT_EQ(test, ane_h16_fwlog_line(r, line), ANE_H16_FWLOG_RECORD - 2);
+	KUNIT_EXPECT_EQ(test, line[ANE_H16_FWLOG_RECORD - 2], 0);
+}
+
+/* The transport finds the log allocation by its tag. */
+static void program_shared_tag_test(struct kunit *test)
+{
+	struct ane_fw_transport *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	t->shared_count = 2;
+	t->shared_tag[0] = ANE_FW_SHARED_LOG;
+	t->shared_tag[1] = ANE_FW_SHARED_EXPP;
+	t->shared[0].dva = 0x10001300000ULL;
+	t->shared[1].dva = 0x10001358000ULL;
+	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_LOG),
+			    &t->shared[0]);
+	KUNIT_EXPECT_PTR_EQ(test, ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_EXPP),
+			    &t->shared[1]);
+	t->shared_retired[0] = true;
+	KUNIT_EXPECT_NULL(test, ane_fw_transport_shared_tagged(t, ANE_FW_SHARED_LOG));
+	KUNIT_EXPECT_NULL(test, ane_fw_transport_shared_tagged(t, 0x43434d44));
 }
 
 /*
@@ -1093,6 +1136,8 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_bad_load_test),
 	KUNIT_CASE(program_bad_report_test),
 	KUNIT_CASE(program_stall_trace_test),
+	KUNIT_CASE(program_fwlog_line_test),
+	KUNIT_CASE(program_shared_tag_test),
 	KUNIT_CASE(program_pool_test),
 	KUNIT_CASE(program_pool_recycle_test),
 	{}

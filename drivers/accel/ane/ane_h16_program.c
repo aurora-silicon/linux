@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* H16 program lifecycle on the shared firmware transport. */
+#include <linux/ctype.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -669,6 +670,67 @@ static int h16_gate(struct ane_h16_session *s, u32 value)
 	return ret;
 }
 
+/*
+ * One firmware log record: a 2-byte header, then NUL-terminated text in the
+ * rest of the 0x80 bytes. Copies the printable text (other bytes become '.')
+ * into line, which holds ANE_H16_FWLOG_RECORD - 1 bytes, and returns its
+ * length; 0 for an empty record.
+ */
+size_t ane_h16_fwlog_line(const u8 *record, char *line)
+{
+	size_t i, n = 0;
+
+	for (i = 2; i < ANE_H16_FWLOG_RECORD && record[i]; i++)
+		line[n++] = isprint(record[i]) ? record[i] : record[i] == '\t' ? ' ' : '.';
+	while (n && line[n - 1] == ' ')
+		n--;
+	line[n] = 0;
+	return n;
+}
+EXPORT_SYMBOL_GPL(ane_h16_fwlog_line);
+
+/*
+ * After a failed EXECUTE the session is quarantined, so this runs at most
+ * once per program: print every non-empty record of the firmware log in
+ * buffer order (at most 512 lines for the 64 KiB log).
+ */
+static unsigned int h16_dump_fwlog(struct ane_h16_session *s)
+{
+	const struct ane_fw_surface *log =
+		ane_fw_transport_shared_tagged(s->transport, ANE_FW_SHARED_LOG);
+	char line[ANE_H16_FWLOG_RECORD];
+	unsigned int i, lines = 0;
+
+	if (!log || !log->cpu) {
+		s->ops->log(s->ctx, "fwlog absent", 0, 0);
+		return 0;
+	}
+	s->transport->ops->read_barrier(s->transport->ctx);
+	for (i = 0; i < log->size / ANE_H16_FWLOG_RECORD; i++) {
+		const u8 *r = (const u8 *)log->cpu + i * ANE_H16_FWLOG_RECORD;
+
+		if (!ane_h16_fwlog_line(r, line))
+			continue;
+		pr_info("H16 fwlog[%03x] %04x %s\n", i, get_unaligned_le16(r), line);
+		lines++;
+	}
+	s->ops->log(s->ctx, "fwlog records printed", lines, log->dva);
+	return lines;
+}
+
+/* Non-zero 16-byte rows of a command or reply, as two little-endian words. */
+static void h16_dump_rows(const char *what, const u8 *p, size_t length)
+{
+	size_t off;
+
+	for (off = 0; off + 16 <= length; off += 16) {
+		u64 lo = get_unaligned_le64(p + off), hi = get_unaligned_le64(p + off + 8);
+
+		if (lo || hi)
+			pr_info("H16 %s +%04zx: %016llx %016llx\n", what, off, lo, hi);
+	}
+}
+
 /* What one EXECUTE saw, logged only when it fails. */
 struct h16_execute_trace {
 	u32 step;
@@ -772,7 +834,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	struct ane_h16_execute call = {};
 	size_t length, sequence[5], mark;
 	u8 *command;
-	const u8 *reply;
+	const u8 *reply = NULL;
 	unsigned int i;
 	u64 deadline;
 	int ret;
@@ -789,8 +851,15 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 						 p->resource_count);
 	if (ret)
 		return ret;
-	for (i = 0; i < p->resource_count; i++)
+	/*
+	 * Each descriptor covers the whole HWX section of its surface, not just
+	 * the tensor span: an input whose rows are padded (MobileNet, 0x49800 of
+	 * 0x4c000) is described as the section, as on the working J700 path.
+	 */
+	for (i = 0; i < p->resource_count; i++) {
 		buffers[i] = p->resources[i].buffer;
+		buffers[i].size = p->hwx.surfaces[i].section.size;
+	}
 	if (p->has_scratch)
 		buffers[i++] = p->scratch;
 	length = ANE_H16_EXECUTE_BASE_SIZE + p->bar_count * ANE_H16_CUSTOM_BAR_STRIDE;
@@ -866,7 +935,6 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 	 */
 	return ane_fw_transport_release(s->transport, mark);
 fail:
-	kfree(command);
 	s->ops->log(s->ctx, "EXECUTE failed", (u64)-ret, request.key.uuid);
 	/*
 	 * Step 1 opening gate, 2 channel-7 ack, 3 report wait, 4 closing gate.
@@ -876,6 +944,13 @@ fail:
 	s->ops->log(s->ctx, "EXECUTE step/flags", trace.step, call.flags);
 	s->ops->log(s->ctx, "EXECUTE reports/last state", trace.reports, trace.last_state);
 	s->ops->log(s->ctx, "EXECUTE other reports", trace.other, 0);
+	if (trace.step >= H16_STEP_SEND) {
+		h16_dump_rows("EXECUTE sent", command, length);
+		if (reply)
+			h16_dump_rows("EXECUTE ack", reply, 0x40);
+	}
+	s->fwlog_lines = h16_dump_fwlog(s);
+	kfree(command);
 	return h16_fail(s, ret);
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);

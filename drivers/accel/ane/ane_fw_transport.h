@@ -13,6 +13,8 @@
 #define ANE_FW_SHARED_LIMIT SZ_1M
 #define ANE_FW_SHARED_TOTAL (12 * SZ_1M)
 #define ANE_FW_SHARED_EXPP 0x45585050U
+/* The firmware's text log, 0x80-byte records. */
+#define ANE_FW_SHARED_LOG 0x004c4f47U
 
 struct ane_fw_surface {
 	void *cpu;
@@ -56,6 +58,7 @@ struct ane_fw_transport {
 	struct ane_fw_surface ipc;
 	struct ane_fw_surface pool;
 	struct ane_fw_surface shared[ANE_FW_SHARED_MAX];
+	u32 shared_tag[ANE_FW_SHARED_MAX];
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	struct ane_fw_transaction pending[ANE_FW_CHANNELS];
 	u32 head[ANE_FW_CHANNELS];
@@ -69,6 +72,18 @@ struct ane_fw_transport {
 	bool native_free;
 	bool shared_retired[ANE_FW_SHARED_MAX];
 };
+
+/* The live shared allocation the firmware asked for under tag, or NULL. */
+static inline const struct ane_fw_surface *
+ane_fw_transport_shared_tagged(const struct ane_fw_transport *t, u32 tag)
+{
+	u32 i;
+
+	for (i = 0; i < t->shared_count; i++)
+		if (t->shared_tag[i] == tag && !t->shared_retired[i])
+			return &t->shared[i];
+	return NULL;
+}
 
 static inline bool ane_fw_surface_valid(const struct ane_fw_surface *s)
 {
@@ -440,6 +455,7 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 			goto refused;
 		}
 	}
+	t->shared_tag[t->shared_count] = (u32)word2;
 	t->shared[t->shared_count++] = s;
 	t->shared_bytes += size;
 	t->ops->store64(t->ctx, p + 8, 0);

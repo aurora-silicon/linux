@@ -173,6 +173,8 @@ struct ane_h16_session {
 	u64 executed;
 	u32 dsid;
 	int error;
+	/* Firmware log lines printed after the last failed EXECUTE. */
+	unsigned int fwlog_lines;
 	bool quarantined;
 };
 
@@ -186,5 +188,8 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_program **program);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
+
+#define ANE_H16_FWLOG_RECORD 0x80
+size_t ane_h16_fwlog_line(const u8 *record, char *line);
 
 #endif /* __ANE_H16_PROGRAM_H__ */
