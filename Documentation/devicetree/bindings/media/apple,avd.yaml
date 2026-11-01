@@ -54,7 +54,7 @@ properties:
     minItems: 1
     items:
       - description: decoder power state
-      - description: performance floor (PMC rail level) held while decoding
+      - description: performance floor (PMC rail or PMP device level) held while decoding
 
   power-domain-names:
     minItems: 1

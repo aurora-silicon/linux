@@ -545,6 +545,20 @@
 				power-domains = <&ps_venc0_sys>, <&pmc_venc_cluster>;
 				apple,dvfs = <0x198 2>;
 			};
+
+			/*
+			 * AVD is soc-device record 17, DVFS ordinal 10. Its VMAX
+			 * request votes the SOC rail through the PMP's static agent.
+			 * It has no cluster-agent bit: VENC-CLSTR-V is AVE-only.
+			 */
+			pmp_report_avd0: report@11 {
+				compatible = "apple,t8140-pmp-v2-report-entry";
+				reg = <0x11>;
+				label = "pmp-avd0";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_avd_sys>;
+				apple,dvfs = <0x19a 2>;
+			};
 		};
 
 		pmp: pmp@300500000 {
@@ -1397,7 +1411,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 936 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 937 IRQ_TYPE_LEVEL_HIGH>;
-			power-domains = <&ps_avd_sys>;
+			power-domains = <&ps_avd_sys>, <&pmp_report_avd0>;
+			power-domain-names = "core", "perf";
 			resets = <&ps_avd_sys>;
 			reg = <0x3 0x81080000 0x0 0x10000>,
 			      <0x3 0x81090000 0x0 0x10000>,
