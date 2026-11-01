@@ -1534,7 +1534,8 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	}
 	if (h16_job_irq && h16_job_quiet_us) {
 		dev_err(&pdev->dev, "H16 IRQ and quiet probes cannot be combined\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto unlock;
 	}
 	h = kzalloc_obj(*h);
 	if (!h) {
