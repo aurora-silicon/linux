@@ -274,8 +274,6 @@ struct dcp_desktop_state {
 	 * the firmware was last given.  Zero when not installed that way.
 	 */
 	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
-	/* VRR_ENABLED as of the last mode set (external processors). */
-	bool vrr_requested;
 	/* The frame's colour matrix, sent after an adaptive sync update. */
 	struct iomfb_set_matrix_req matrix;
 	/*

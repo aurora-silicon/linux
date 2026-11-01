@@ -1510,11 +1510,19 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 		return -EINVAL;
 
 	/*
-	 * On desktop 26.6 firmware VRR_ENABLED takes effect with the next
-	 * frame, without a DRM mode set: the panel through a new minimum
-	 * rate (dcp_vrr_update()), the external processors by reselecting
-	 * their timing (dcp_flush()).
+	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
+	 * frame, without a mode set (see dcp_vrr_update()).  The external
+	 * processors ignore a new minimum rate on a live mode, so they still
+	 * change adaptive sync with a mode set.
 	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && crtc_state->enable &&
+	    !dcp_vrr_live(dcp)) {
+		struct drm_crtc_state *old =
+			drm_atomic_get_old_crtc_state(commit, crtc);
+
+		if (old && old->vrr_enabled != crtc_state->vrr_enabled)
+			crtc_state->mode_changed = true;
+	}
 
 	/* DRM core only caps the blob size; the gamma update copies a full table. */
 	if (crtc_state->color_mgmt_changed && crtc_state->gamma_lut &&
