@@ -99,7 +99,8 @@ static const struct ave_dpe_rmw ave_t8112_dpe_rows[] = {
 	{ AVE_T8112_CAC + 0x0a4, 0x00000001, 0, 1 },
 	{ AVE_T8112_CAC + 0x0a8, 0x000001ff, 0,
 	  ARRAY_SIZE(ave_t8112_cac_levels), ave_t8112_cac_levels },
-	{ AVE_T8112_CAC + 0x000, 0x00000003, 0x00000003, 1 },
+	/* Bit 1 is a command and reads back 0. */
+	{ AVE_T8112_CAC + 0x000, 0x00000003, 0x00000003, 1, NULL, 0x00000001 },
 	{ AVE_T8112_CAT + 0x000, 0x00000001, 0x00000001, 1 },
 };
 
