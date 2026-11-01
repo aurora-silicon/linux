@@ -20,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/vmalloc.h>
 
 #include "ave.h"
 #include "ave-regs.h"
@@ -220,6 +221,32 @@ static int ave_inject_wedge(void *data, u64 value)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(ave_inject_wedge_fops, NULL, ave_inject_wedge, "%llu\n");
 
+static void ave_vfree(void *p)
+{
+	vfree(p);
+}
+
+/* The read-only DATA image the 6070 hello timeout leaves (private evidence) */
+static void ave_debugfs_6070_capture(struct ave_dev *ave)
+{
+	struct debugfs_blob_wrapper *blob;
+	void *data;
+
+	if (!ave->variant->restore_data_first || !ave->data.size)
+		return;
+	data = vzalloc(ave->data.size);
+	if (!data || devm_add_action_or_reset(ave->dev, ave_vfree, data))
+		return;
+	blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
+	if (!blob)
+		return;
+	ave->boot_capture = data;
+	ave->boot_capture_size = ave->data.size;
+	blob->data = data;
+	blob->size = ave->data.size;
+	debugfs_create_blob("last_6070_data", 0400, ave->debugfs, blob);
+}
+
 static void ave_debugfs_init(struct ave_dev *ave)
 {
 	static const char *const names[2][AVE_IMAGE_COUNT] = {
@@ -233,6 +260,7 @@ static void ave_debugfs_init(struct ave_dev *ave)
 	if (ave->layout->abi == &ave_abi_6070) {
 		debugfs_create_file("lifecycle_test", 0200, ave->debugfs, ave,
 				    &ave_lifecycle_fops);
+		ave_debugfs_6070_capture(ave);
 		return;
 	}
 	debugfs_create_file("inject_wedge", 0200, ave->debugfs, ave,

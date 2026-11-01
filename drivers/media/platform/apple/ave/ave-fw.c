@@ -290,6 +290,140 @@ static void ave_fw_6070_probe_state(struct ave_dev *ave, const char *when)
 		memunmap(va);
 }
 
+/*
+ * 6070 (T8112) reset-to-hello probe ladder, read-only (SPEC-6070-hello r5).
+ * Offsets are into the firmware TEXT and DATA segments. Nothing here writes
+ * a segment, the mailbox or the DART, and nothing gates RUN or recovery: a
+ * cacheable firmware store may still be dirty in the AVE cache, so only a
+ * visible change means anything. Console lines are bounded; the whole DATA
+ * image at the timeout goes to debugfs last_6070_data.
+ */
+#define AVE_6070_PT_START	0x20000
+#define AVE_6070_PT_END		0x60000
+#define AVE_6070_DATA_VA	0x000d0000
+#define AVE_6070_DATA_VA_END	0x001f8000
+
+static u64 ave_6070_q(const u8 *va, size_t size, size_t off)
+{
+	return off + 8 <= size ? le64_to_cpu(READ_ONCE(*(const __le64 *)(va + off))) : 0;
+}
+
+static u32 ave_6070_l(const u8 *va, size_t size, size_t off)
+{
+	return off + 4 <= size ? le32_to_cpu(READ_ONCE(*(const __le32 *)(va + off))) : 0;
+}
+
+/* Unaligned patchbay values, read through a WC (normal, uncached) mapping */
+static u64 ave_6070_uq(const u8 *va, size_t size, size_t off)
+{
+	return off + 8 <= size ? get_unaligned_le64(va + off) : 0;
+}
+
+/* Count, CRC and the first @show nonzero 64-bit words of [lo, hi) */
+static void ave_6070_range(struct ave_dev *ave, const char *when, const char *name,
+			   const u8 *va, size_t size, size_t lo, size_t hi,
+			   unsigned int show)
+{
+	unsigned int nonzero = 0, shown = 0, len = 0;
+	char line[200];
+	u32 crc;
+
+	hi = min(hi, size);
+	if (lo >= hi)
+		return;
+	crc = crc32_le(~0U, va + lo, hi - lo) ^ ~0U;
+	line[0] = 0;
+	for (size_t off = lo; off + 8 <= hi; off += 8) {
+		u64 v = ave_6070_q(va, size, off);
+
+		if (!v)
+			continue;
+		nonzero++;
+		if (shown < show && len < sizeof(line) - 40) {
+			len += scnprintf(line + len, sizeof(line) - len, " +%#zx=%#llx", off, v);
+			shown++;
+		}
+	}
+	dev_info(ave->dev, "6070 %s: %s [%#zx,%#zx) crc %08x nonzero %u%s%s\n",
+		 when, name, lo, hi, crc, nonzero, nonzero ? ":" : "", line);
+}
+
+static void ave_fw_6070_boot_snapshot(struct ave_dev *ave, const char *when,
+				      bool keep)
+{
+	const struct ave_coproc_regs *r = ave->variant->regs;
+	size_t ts = ave->text.size, ds = ave->data.size;
+	const u8 *t, *d;
+	u64 crash;
+
+	t = memremap(ave->text.phys, ts, MEMREMAP_WC);
+	d = memremap(ave->data.phys, ds, MEMREMAP_WC);
+	if (!t || !d) {
+		dev_info(ave->dev, "6070 %s: cannot map TEXT/DATA for the probe\n", when);
+		goto out;
+	}
+
+	dev_info(ave->dev,
+		 "6070 %s: ctrl %#x cpu %#x mbox %#x scratch %#x %#x %#x %#x %#x %#x %#x %#x (s7 assert %u)\n",
+		 when, readl(ave->coproc + r->ctrl), readl(ave->coproc + r->status),
+		 readl(ave->mbox + AVE_MBOX_STATUS),
+		 readl(ave->mbox + AVE_MBOX_SCRATCH(0)), readl(ave->mbox + AVE_MBOX_SCRATCH(1)),
+		 readl(ave->mbox + AVE_MBOX_SCRATCH(2)), readl(ave->mbox + AVE_MBOX_SCRATCH(3)),
+		 readl(ave->mbox + AVE_MBOX_SCRATCH(4)), readl(ave->mbox + AVE_MBOX_SCRATCH(5)),
+		 readl(ave->mbox + AVE_MBOX_SCRATCH(6)), readl(ave->mbox + AVE_MBOX_SCRATCH(7)),
+		 !!(readl(ave->mbox + AVE_MBOX_SCRATCH(7)) & BIT(30)));
+	/* 4.1 static prerequisites and the loader patchbay */
+	dev_info(ave->dev,
+		 "6070 %s: TEXT+0x423c %#llx page %u/%#x/%u DATA+0x60000 %#llx +0x60008 %#llx patch crc %08x guard %#llx rt %#llx soc %#x rev %#x asc %#llx %#llx\n",
+		 when, (u64)ave_6070_l(t, ts, 0x4240) << 32 | ave_6070_l(t, ts, 0x423c),
+		 ave_6070_l(t, ts, 0xcdfd8), ave_6070_l(t, ts, 0xcdfdc),
+		 ave_6070_l(t, ts, 0xcdfe0),
+		 ave_6070_q(d, ds, 0x60000), ave_6070_q(d, ds, 0x60008),
+		 0x37a4 <= ds ? crc32_le(~0U, d + 0x35d8, 0x37a4 - 0x35d8) ^ ~0U : 0,
+		 ave_6070_q(d, ds, 0x35d8), ave_6070_uq(d, ds, 0x363d),
+		 ave_6070_l(d, ds, 0x3743), ave_6070_l(d, ds, 0x374f),
+		 ave_6070_uq(d, ds, 0x375b), ave_6070_uq(d, ds, 0x376b));
+	/* 4.2 reset and MMU boundary */
+	dev_info(ave->dev,
+		 "6070 %s: resume %#llx tmp +0x1fff0 %#llx +0x1fff8 %#llx\n",
+		 when, ave_6070_q(d, ds, 0x60358), ave_6070_q(d, ds, 0x1fff0),
+		 ave_6070_q(d, ds, 0x1fff8));
+	ave_6070_range(ave, when, "temp PTE", d, ds, 0x18000, 0x18080, 16);
+	ave_6070_range(ave, when, "final PT", d, ds, AVE_6070_PT_START, AVE_6070_PT_END, 16);
+	ave_6070_range(ave, when, "MMU cfg", d, ds, 0x126fc0, 0x127068, 8);
+	/* 4.3 runtime, platform and channel milestones */
+	dev_info(ave->dev,
+		 "6070 %s: guard live %#llx patch %#llx (%s) env %#llx log %#llx gpr %#llx exc %#llx crashbuf %#llx/%#llx task %#llx gpio %#llx ipi %#llx\n",
+		 when, ave_6070_q(d, ds, 0x2338), ave_6070_q(d, ds, 0x35d8),
+		 ave_6070_q(d, ds, 0x2338) == ave_6070_q(d, ds, 0x35d8) ? "equal" : "differ",
+		 ave_6070_q(d, ds, 0x60be0), ave_6070_q(d, ds, 0x60b00),
+		 ave_6070_q(d, ds, 0x126e60), ave_6070_q(d, ds, 0x126f38),
+		 ave_6070_q(d, ds, 0x2b58), ave_6070_q(d, ds, 0x2b80),
+		 ave_6070_q(d, ds, 0x60bc8), ave_6070_q(d, ds, 0x60b40),
+		 ave_6070_q(d, ds, 0x60b68));
+	ave_6070_range(ave, when, "IPC logger", d, ds, 0x60c10, 0x60c58, 0);
+	/* 4.4 failure state: derived values only, raw records stay private */
+	dev_info(ave->dev,
+		 "6070 %s: terminal %#llx (3 exception, 4 abort, 2 main returned) asserted %#x\n",
+		 when, ave_6070_q(d, ds, 0x126d58), ave_6070_l(d, ds, 0x60af8));
+	ave_6070_range(ave, when, "crash state", d, ds, 0x2b30, 0x2bc0, 0);
+	ave_6070_range(ave, when, "NMI state", d, ds, 0x1266a0, 0x1266c8, 5);
+	crash = ave_6070_q(d, ds, 0x2b58);
+	if (crash >= AVE_6070_DATA_VA && crash < AVE_6070_DATA_VA_END) {
+		size_t off = crash - AVE_6070_DATA_VA;
+
+		ave_6070_range(ave, when, "crash buffer", d, ds, off,
+			       off + min_t(size_t, 0x400, ds > off ? ds - off : 0), 0);
+	}
+	if (keep && ave->boot_capture && ave->boot_capture_size == ds)
+		memcpy(ave->boot_capture, d, ds);
+out:
+	if (d)
+		memunmap((void *)d);
+	if (t)
+		memunmap((void *)t);
+}
+
 static int ave_fw_restore_data(struct ave_dev *ave)
 {
 	void *va;
@@ -709,12 +843,23 @@ static int ave_fw_boot(struct ave_dev *ave)
 	writel(0, ave->coproc + ave->variant->regs->ctrl);
 	writel(ave->variant->boot_arg_value,
 	       ave->coproc + ave->variant->regs->boot_arg);
-	if (ave->variant->restore_data_first)
+	if (ave->variant->restore_data_first) {
 		ave_fw_6070_probe_state(ave, "before RUN");
+		ave_fw_6070_boot_snapshot(ave, "pre-run", false);
+	}
 	writel(AVE_COPROC_CTRL_RUN, ave->coproc + ave->variant->regs->ctrl);
 	if (ave->variant->restore_data_first) {
+		/* Read-only ladder; none of it decides anything. */
 		udelay(50);
+		ave_fw_6070_boot_snapshot(ave, "50us", false);
 		ave_fw_6070_probe_state(ave, "after RUN");
+		usleep_range(900, 1100);
+		ave_fw_6070_boot_snapshot(ave, "1ms", false);
+		ret = readl_poll_timeout(ave->mbox + AVE_MBOX_STATUS, status,
+					 status & AVE_MBOX_STATUS_PENDING, 50,
+					 100 * USEC_PER_MSEC);
+		if (ret)
+			ave_fw_6070_boot_snapshot(ave, "100ms", false);
 	}
 
 	ret = readl_poll_timeout(ave->mbox + AVE_MBOX_STATUS, status,
@@ -725,6 +870,8 @@ static int ave_fw_boot(struct ave_dev *ave)
 			readl(ave->coproc + ave->variant->regs->status));
 		if (!t->boot_config)
 			ave_fw_hello_snapshot(ave);
+		if (ave->variant->restore_data_first)
+			ave_fw_6070_boot_snapshot(ave, "timeout", true);
 		return ret;
 	}
 	for (unsigned int i = 0; i < 4; i++)

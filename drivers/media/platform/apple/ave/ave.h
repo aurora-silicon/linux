@@ -224,6 +224,9 @@ struct ave_dev {
 	bool inject_wedge;
 
 	/* debugfs: the last Start and first Process built, per codec */
+	/* debugfs last_6070_data: DATA as the 6070 hello timeout left it */
+	void *boot_capture;
+	size_t boot_capture_size;
 	struct dentry *debugfs;
 	void *dump[2][AVE_IMAGE_COUNT];
 
