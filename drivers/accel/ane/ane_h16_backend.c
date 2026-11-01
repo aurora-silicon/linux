@@ -29,6 +29,7 @@
 #include "ane_fw_irq_wait.h"
 #include "ane_fw_report_fifo.h"
 #include "ane_fw_pending.h"
+#include "ane_job_gap.h"
 #include "ane_fw_ack_pending.h"
 #include "ane_h16_execute.h"
 #include "ane_h16_preload.h"
@@ -1009,6 +1010,10 @@ MODULE_PARM_DESC(h16_job_gap_us, "Diagnostic recovery gap before warmed serial E
 static unsigned int h16_job_gap_at;
 module_param(h16_job_gap_at, uint, 0444);
 MODULE_PARM_DESC(h16_job_gap_at, "Apply recovery gap only at this warmed serial EXEC ordinal1..128,0=every eligible call");
+static unsigned int h16_job_gap_every;
+module_param(h16_job_gap_every, uint, 0444);
+MODULE_PARM_DESC(h16_job_gap_every, "Periodic recovery gap every1..128 warmed serial EXECs, default0; excludes gap_at/pending/quiet probes");
+
 /* Read-only firmware IRQ-delivery probe, only inside a one-time2ms gap.
  * Mode1 is a private active-window control; mode2 also reads FW pending.
  */
@@ -1400,7 +1405,7 @@ static int ane_h16_job_cmd(struct ane_h16_device *h, struct ane_h16_job *j,
 	    !j->outstanding && j->quiet_warmed &&
 	    !memcmp(command + 8, j->quiet_warm_handles, sizeof(j->quiet_warm_handles))) {
 		j->gap_warm_serial++;
-		if (!h16_job_gap_at || j->gap_warm_serial == min(h16_job_gap_at, 128U)) {
+		if (ane_job_gap_selected(j->gap_warm_serial, h16_job_gap_at, h16_job_gap_every)) {
 			u8 gap[16];
 			u64 gap_counters[2], began;
 			u32 us = min(h16_job_gap_us, 2000U);
@@ -2067,6 +2072,12 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	}
 	if ((h16_job_irq || h16_job_early_drain) && h16_job_quiet_us) {
 		dev_err(&pdev->dev, "H16 IRQ/early-drain and quiet probes cannot be combined\n");
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (!ane_job_gap_valid(h16_job_gap_us, h16_job_gap_at, h16_job_gap_every,
+			h16_job_pending_mode, h16_job_ack_pending_mode, h16_job_quiet_us)) {
+		dev_err(&pdev->dev, "H16 periodic gap requires1..128 interval,1..2000us and no one-shot/pending/quiet probes\n");
 		ret = -EINVAL;
 		goto unlock;
 	}

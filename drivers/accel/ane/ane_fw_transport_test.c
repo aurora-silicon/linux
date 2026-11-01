@@ -6,6 +6,7 @@
 #include "ane_fw_transport.h"
 #include "ane_fw_irq_wait.h"
 #include "ane_fw_pending.h"
+#include "ane_job_gap.h"
 #include "ane_fw_ack_pending.h"
 #include "ane_h16_execute.h"
 
@@ -1371,7 +1372,33 @@ static void ane_pending_invalid_config_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f.reads, 0U);
 }
 
+static void ane_job_gap_schedule_test(struct kunit *test)
+{
+	u32 i, n6 = 0, n7 = 0;
+
+	for (i = 0; i <= 1001; i++) {
+		n6 += ane_job_gap_selected(i, 0, 6);
+		n7 += ane_job_gap_selected(i, 0, 7);
+	}
+	KUNIT_EXPECT_EQ(test, n6, 166U);
+	KUNIT_EXPECT_EQ(test, n7, 143U);
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_selected(5, 0, 6));
+	KUNIT_EXPECT_TRUE(test, ane_job_gap_selected(6, 0, 6));
+	KUNIT_EXPECT_TRUE(test, ane_job_gap_selected(10, 10, 0));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_selected(11, 10, 0));
+	KUNIT_EXPECT_TRUE(test, ane_job_gap_valid(0, 0, 0, false, false, false));
+	KUNIT_EXPECT_TRUE(test, ane_job_gap_valid(125, 0, 6, false, false, false));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(0, 0, 6, false, false, false));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(2001, 0, 6, false, false, false));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(125, 1, 6, false, false, false));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(125, 0, 129, false, false, false));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(125, 0, 6, true, false, false));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(125, 0, 6, false, true, false));
+	KUNIT_EXPECT_FALSE(test, ane_job_gap_valid(125, 0, 6, false, false, true));
+}
+
 static struct kunit_case ane_transport_cases[] = {
+	KUNIT_CASE(ane_job_gap_schedule_test),
 	KUNIT_CASE(ane_ack_pending_read_order_test),
 	KUNIT_CASE(ane_ack_pending_private_test),
 	KUNIT_CASE(ane_ack_pending_disabled_test),
