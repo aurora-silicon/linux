@@ -138,7 +138,7 @@ static const struct ane_h16_tunables ane_h16_tunables_26a428[] = {
  * record end does not read back its low two bits on the T8132; every J616s
  * end has them set.
  */
-static const struct ane_h16_mmio ane_h16_mmio_t6041[] = {
+static const struct ane_h16_mmio ane_h16_mmio_t6041[] __maybe_unused = {
 	{
 		.dart_revision = 0x0202,
 		.dart_fault = 0x100,
@@ -316,7 +316,7 @@ static const struct ane_h16_preload_rule ane_h16_preload_25g83 = {
 };
 
 /* Every supported H16 firmware build, matched against the live preload. */
-static const struct ane_h16_profile ane_h16_profiles[] = {
+static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	{
 		.identity = "H16 27.0 26A428",
 		.preload = &ane_h16_preload_26a428,
