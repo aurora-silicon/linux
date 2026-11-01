@@ -290,6 +290,7 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 	u8 buf[BRCMF_DCMD_SMLEN];
 	struct brcmf_bus *bus;
 	struct brcmf_rev_info_le revinfo;
+	struct brcmf_fil_country_le country = {};
 	struct brcmf_rev_info *ri;
 	char *clmver;
 	char *ptr;
@@ -379,6 +380,18 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 		bphy_err(drvr, "download calibration blob file failed, %d\n", err);
 		goto done;
 	}
+
+	/* Record the firmware's initial domain after loading regulatory and
+	 * calibration data, before userspace can scan or associate. cfg80211's
+	 * custom domain does not identify the country selected by firmware.
+	 */
+	err = brcmf_fil_iovar_data_get(ifp, "country", &country, sizeof(country));
+	if (err)
+		brcmf_dbg(INFO, "Retrieving initial country failed, %d\n", err);
+	else
+		brcmf_info("Initial firmware country: %.4s (%.4s/%d)\n",
+			   country.country_abbrev, country.ccode,
+			   le32_to_cpu(country.rev));
 
 	/* query for 'ver' to get version info from firmware */
 	memset(buf, 0, sizeof(buf));
@@ -634,4 +647,3 @@ static void __exit brcmfmac_module_exit(void)
 
 module_init(brcmfmac_module_init);
 module_exit(brcmfmac_module_exit);
-

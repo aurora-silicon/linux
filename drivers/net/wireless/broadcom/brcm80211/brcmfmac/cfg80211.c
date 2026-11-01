@@ -6831,6 +6831,12 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 				  &ifp->vif->sme_state);
 			clear_bit(BRCMF_VIF_STATUS_ASSOC_SUCCESS,
 				  &ifp->vif->sme_state);
+			/* This status is synthesized, not an AP response. Keep the
+			 * firmware cause visible for failures such as NO_NETWORKS.
+			 */
+			wiphy_info(cfg->wiphy,
+				   "Connection failed: event=%u status=%u reason=%u\n",
+				   e->event_code, e->status, e->reason);
 			conn_params.status = WLAN_STATUS_AUTH_TIMEOUT;
 		}
 		conn_params.links[0].bssid = profile->bssid;
