@@ -24,6 +24,7 @@
 
 #include "ave.h"
 #include "ave-regs.h"
+#include "ave-mctf.h"
 
 #define AVE_RC_VBR 4
 #define AVE_RC_CBR 2
@@ -317,6 +318,66 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	return 0;
 }
 
+/*
+ * An MCTF session: fixed 1080p NV12 on the selector-2 carriers, the
+ * firmware-owned surfaces of the layout (zeroed by the DMA allocator and
+ * never mapped for the CPU), largest first like the encoder's buffers.
+ */
+int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
+{
+	struct ave_dev *ave = ctx->ave;
+	const struct ave_mctf_layout *l = ave_mctf_qualified(ave->text_crc);
+	struct ave_params *p = &sess->p;
+	struct ave_buf_req *r;
+	unsigned int n = 0;
+	size_t mapped = 0;
+	int ret = 0;
+
+	if (!l)
+		return -EOPNOTSUPP;
+	if (l->n_surfaces > AVE_MCTF_BUFS || l->slots > AVE_MAX_SLOTS)
+		return -EINVAL;
+	*p = (struct ave_params){
+		.codec = AVE_CODEC_HEVC,	/* the selector-2 carriers */
+		.width = AVE_MCTF_WIDTH,
+		.height = AVE_MCTF_HEIGHT,
+		.cw = AVE_MCTF_WIDTH,
+		.ch = ALIGN(AVE_MCTF_HEIGHT, 16),
+		.stride = ctx->src_fmt.plane_fmt[0].bytesperline,
+		.fps_num = 30,
+		.fps_den = 1,
+		.fps_int = 30,
+		.slots = l->slots,
+	};
+	sess->mctf = l;
+	sess->unit = l->unit;
+	sess->arg1 = l->arg1;
+	sess->frame_arg0 = l->frame_arg0;
+
+	r = kcalloc(l->n_surfaces, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	for (unsigned int i = 0; i < l->n_surfaces; i++)
+		if (l->surfaces[i].alloc)
+			ave_req(r, &n, &sess->mctf_buf[i], l->surfaces[i].alloc, 0,
+				DMA_ATTR_NO_KERNEL_MAPPING);
+	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
+	for (unsigned int i = 0; i < n && !ret; i++) {
+		ret = ave_alloc(ave, r[i].b, r[i].size, r[i].attrs);
+		mapped += r[i].b->alloc;
+	}
+	kfree(r);
+	if (ret) {
+		dev_err(ave->dev, "out of encoder DMA space after %zu MiB of MCTF surfaces\n",
+			mapped >> 20);
+		return -ENOMEM;
+	}
+	for (unsigned int i = 0; i < l->n_surfaces; i++)
+		sess->mctf_iova[i] = sess->mctf_buf[i].dma;
+	dev_dbg(ave->dev, "MCTF session: %u surfaces, %zu KiB mapped\n", n, mapped >> 10);
+	return 0;
+}
+
 static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 {
 	ave_free(ave, &sess->hdr);
@@ -340,6 +401,8 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 	}
 	for (unsigned int i = 0; i < 2; i++)
 		ave_free(ave, &sess->hevc_extra[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_BUFS; i++)
+		ave_free(ave, &sess->mctf_buf[i]);
 	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++) {
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);
@@ -348,6 +411,8 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->slot[s].bounce);
 		ave_vb2_put(sess->slot[s].input_mem);
 		sess->slot[s].input_mem = NULL;
+		ave_vb2_put(sess->slot[s].output_mem);
+		sess->slot[s].output_mem = NULL;
 	}
 }
 
@@ -455,6 +520,8 @@ static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 		ave_log_buf(ave, "tile", i, &sess->tile[i]);
 		ave_log_buf(ave, "tile_aux", i, &sess->tile_aux[i]);
 	}
+	for (int i = 0; i < AVE_MCTF_BUFS; i++)
+		ave_log_buf(ave, "mctf", i, &sess->mctf_buf[i]);
 	for (int i = 0; i < AVE_MAX_SLOTS; i++) {
 		ave_log_buf(ave, "coded", i, &sess->slot[i].coded);
 		ave_log_buf(ave, "meta", i, &sess->slot[i].meta);
@@ -471,9 +538,13 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	sess = kzalloc_obj(*sess);
 	if (!sess)
 		return ERR_PTR(-ENOMEM);
-	ret = ave_sess_params(ctx, &sess->p);
-	if (!ret)
-		ret = ave_sess_alloc(ctx->ave, sess);
+	if (ctx->mctf) {
+		ret = ave_sess_mctf_init(ctx, sess);
+	} else {
+		ret = ave_sess_params(ctx, &sess->p);
+		if (!ret)
+			ret = ave_sess_alloc(ctx->ave, sess);
+	}
 	if (ret) {
 		ave_sess_free_bufs(ctx->ave, sess);
 		kfree(sess);
@@ -541,7 +612,8 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 {
 	struct ave_slot *s = &sess->slot[slot];
 
-	memset(s->meta.cpu, 0, s->meta.size);
+	if (s->meta.cpu)
+		memset(s->meta.cpu, 0, s->meta.size);
 	if (sess->p.codec == AVE_CODEC_HEVC && s->aux.cpu)
 		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
 }

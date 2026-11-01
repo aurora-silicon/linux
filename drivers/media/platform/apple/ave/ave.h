@@ -29,6 +29,7 @@ struct dentry;
 struct dev_pm_domain_list;
 struct iommu_domain;
 struct ave_vb2_mem;
+struct ave_mctf_layout;
 
 /* Frames the firmware can hold at once per session (Process "slots"). */
 #define AVE_MAX_SLOTS 7
@@ -217,6 +218,11 @@ struct ave_dev {
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
 	struct v4l2_m2m_dev *m2m_dev;
+	/* The MCTF video device, present on a qualified firmware build */
+	struct video_device mctf_vdev;
+	struct v4l2_m2m_dev *mctf_m2m;
+	bool mctf_registered;
+	void *mctf_dump[AVE_IMAGE_COUNT];
 	/* The video device's ioctl and queue lock. */
 	struct mutex vdev_lock;
 	struct workqueue_struct *wq;
@@ -257,7 +263,9 @@ struct ave_slot {
 	struct ave_buf extra; /* counted layout: per-slot 16 KiB buffer */
 	struct ave_buf bounce; /* input copied to the encoder's stride */
 	struct vb2_v4l2_buffer *src;
+	struct vb2_v4l2_buffer *dst; /* MCTF: the firmware writes the frame here */
 	struct ave_vb2_mem *input_mem; /* independent firmware mapping reference */
+	struct ave_vb2_mem *output_mem; /* the same, for an MCTF CAPTURE buffer */
 	u32 status;
 	bool busy; /* Process sent, reply pending */
 	bool done; /* reply in, output not delivered yet */
@@ -285,6 +293,10 @@ struct ave_session {
 	struct ave_buf tile_aux[AVE_TILE_BUFS];
 	struct ave_buf hevc_extra[2];
 	struct ave_slot slot[AVE_MAX_SLOTS];
+	/* MCTF client (work type 3): its layout and firmware-owned surfaces */
+	const struct ave_mctf_layout *mctf;
+	struct ave_buf mctf_buf[AVE_MCTF_BUFS];
+	dma_addr_t mctf_iova[AVE_MCTF_BUFS];
 	/* Header words; zero means the encoder's values */
 	u32 unit, arg1, frame_arg0;
 	u8 done_fifo[AVE_MAX_SLOTS];
@@ -335,6 +347,8 @@ struct ave_ctx {
 	bool force_key_frame;
 
 	struct ave_session *sess;
+	bool mctf; /* an MCTF context, on the MCTF video device */
+	u32 mctf_level;
 	atomic_t ready; /* outputs waiting for a CAPTURE buffer */
 	bool draining;
 	bool flush_pending;
@@ -432,6 +446,7 @@ int ave_sess_output(struct ave_ctx *ctx, unsigned int slot,
 void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot);
 bool ave_sess_stalled(struct ave_session *sess);
 bool ave_sess_starved(struct ave_session *sess);
+int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess);
 
 /* ave-image.c */
 void ave_image_start(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
@@ -443,11 +458,26 @@ void ave_image_process(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
 /* ave-drv.c */
 void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec,
 		      enum ave_image kind, const void *cmd, size_t len);
+void ave_debugfs_save_mctf(struct ave_dev *ave, enum ave_image kind,
+			   const void *cmd, size_t len);
 
-/* ave-v4l2.c */
+/* ave-v4l2.c: the session plumbing both video devices share */
+extern const struct vb2_ops ave_qops;
 void ave_v4l2_suspend(struct ave_dev *ave);
 int ave_v4l2_register(struct ave_dev *ave);
 void ave_v4l2_unregister(struct ave_dev *ave);
 enum ave_codec ave_ctx_codec(struct ave_ctx *ctx);
+int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx);
+int ave_session_reopen(struct ave_ctx *ctx);
+void ave_job_fail(struct ave_ctx *ctx, int err);
+
+/* ave-mctf.c, ave-mctf-v4l2.c */
+int ave_mctf_check_build(struct ave_dev *ave);
+int ave_mctf_cmd_start(struct ave_ctx *ctx);
+int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
+			 struct vb2_v4l2_buffer *src,
+			 struct vb2_v4l2_buffer *dst);
+int ave_mctf_register(struct ave_dev *ave);
+void ave_mctf_unregister(struct ave_dev *ave);
 
 #endif

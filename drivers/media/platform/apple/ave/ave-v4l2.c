@@ -615,7 +615,7 @@ static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
 
 /* Sessions */
 
-static int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx)
+int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx)
 {
 	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
 		if (ave->sessions[i] == ctx)
@@ -692,7 +692,7 @@ static int ave_session_attach(struct ave_ctx *ctx)
 	ave->sessions[idx] = ctx;
 	ret = ave_cmd_open(ctx);
 	if (!ret)
-		ret = ave_cmd_start(ctx);
+		ret = ctx->mctf ? ave_mctf_cmd_start(ctx) : ave_cmd_start(ctx);
 	if (ret)
 		ave_session_close(ctx, false);
 	return ret;
@@ -744,6 +744,9 @@ static void ave_session_free(struct ave_ctx *ctx)
 		if (s->src)
 			v4l2_m2m_buf_done(s->src, VB2_BUF_STATE_ERROR);
 		s->src = NULL;
+		if (s->dst)
+			v4l2_m2m_buf_done(s->dst, VB2_BUF_STATE_ERROR);
+		s->dst = NULL;
 	}
 	atomic_set(&ctx->ready, 0);
 	ave_sess_destroy(ctx);
@@ -761,7 +764,7 @@ static int ave_session_begin(struct ave_ctx *ctx)
 
 	if (ctx->sess)
 		return 0;
-	ret = ave_fw_check_build(ave);
+	ret = ctx->mctf ? ave_mctf_check_build(ave) : ave_fw_check_build(ave);
 	if (ret)
 		return ret;
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
@@ -799,7 +802,7 @@ static int ave_session_begin(struct ave_ctx *ctx)
  * Open and Start it again with the same parameters; its next frame is an
  * IDR with fresh parameter sets, so the stream stays decodable.
  */
-static int ave_session_reopen(struct ave_ctx *ctx)
+int ave_session_reopen(struct ave_ctx *ctx)
 {
 	bool pm_lost;
 	int ret;
@@ -892,7 +895,7 @@ static void ave_stop_streaming(struct vb2_queue *q)
 		WRITE_ONCE(ctx->failed, false);
 }
 
-static const struct vb2_ops ave_qops = {
+const struct vb2_ops ave_qops = {
 	.queue_setup = ave_queue_setup,
 	.buf_prepare = ave_buf_prepare,
 	.buf_queue = ave_buf_queue,
@@ -1110,7 +1113,7 @@ static bool ave_finish_drain(struct ave_ctx *ctx)
 }
 
 /* The firmware or the session failed: return everything, fail the queues. */
-static void ave_job_fail(struct ave_ctx *ctx, int err)
+void ave_job_fail(struct ave_ctx *ctx, int err)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
@@ -1359,8 +1362,13 @@ int ave_v4l2_register(struct ave_dev *ave)
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
 		goto err_m2m;
+	ret = ave_mctf_register(ave);
+	if (ret)
+		goto err_vdev;
 	return 0;
 
+err_vdev:
+	video_unregister_device(vdev);
 err_m2m:
 	v4l2_m2m_release(ave->m2m_dev);
 err_v4l2:
@@ -1372,6 +1380,7 @@ err_wq:
 
 void ave_v4l2_unregister(struct ave_dev *ave)
 {
+	ave_mctf_unregister(ave);
 	video_unregister_device(&ave->vdev);
 	v4l2_m2m_release(ave->m2m_dev);
 	v4l2_device_unregister(&ave->v4l2_dev);

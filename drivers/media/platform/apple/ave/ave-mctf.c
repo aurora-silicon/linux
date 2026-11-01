@@ -19,9 +19,12 @@
  * Copyright The Aurora Silicon Contributors
  */
 #include <linux/errno.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+
+#include <media/videobuf2-dma-contig.h>
 
 #include "ave.h"
 #include "ave-regs.h"
@@ -267,5 +270,108 @@ int ave_mctf_build_process(const struct ave_mctf_layout *l, u8 *cmd,
 	}
 	put_unaligned_le32(f->frame, cmd + l->frame);
 	put_unaligned_le32(f->level, cmd + l->level);
+	return 0;
+}
+
+/* MCTF needs a qualified boot and a qualified MCTF layout for this build. */
+int ave_mctf_check_build(struct ave_dev *ave)
+{
+	int ret = ave_fw_check_boot(ave);
+
+	if (ret)
+		return ret;
+	return ave_mctf_qualified(ave->text_crc) ? 0 : -EOPNOTSUPP;
+}
+
+int ave_mctf_cmd_start(struct ave_ctx *ctx)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+	const struct ave_mctf_layout *l = sess->mctf;
+	size_t len;
+	u8 *cmd;
+	int ret;
+
+	if (!l)
+		return -EOPNOTSUPP;
+	len = l->start_bytes;
+	cmd = ave_ipc_cmd(ave, AVE_BUF_CMD, len);
+	if (!cmd)
+		return -EBUSY;
+	ret = ave_mctf_build_start(l, cmd, len, sess->mctf_iova);
+	if (ret)
+		return ret;
+	ave_write_header(ctx, cmd, AVE_OP_START, AVE_OP_START, AVE_SESSION_ARG0,
+			 ave_session_setup_arg2(ctx));
+	ave_debugfs_save_mctf(ave, AVE_IMAGE_START, cmd, len);
+
+	/* A failed submission may already have exposed the Start buffers. */
+	sess->handed = true;
+	ret = ave_ipc_submit(ave, AVE_BUF_CMD, len, AVE_CMD_SESSION_TIMEOUT_US,
+			     true);
+	if (ret)
+		return ret;
+	return ave_ipc_settle(ave, AVE_START_WAIT_MS);
+}
+
+/* Filter @src into @dst in @slot. Caller holds hw_lock. */
+int ave_mctf_cmd_process(struct ave_ctx *ctx, unsigned int slot,
+			 struct vb2_v4l2_buffer *src,
+			 struct vb2_v4l2_buffer *dst)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+	const struct ave_mctf_layout *l = sess->mctf;
+	unsigned int buf = AVE_BUF_PROC(sess->index * AVE_MAX_SLOTS + slot);
+	struct ave_slot *s = &sess->slot[slot];
+	struct ave_mctf_frame f = {
+		.stride = sess->p.stride,
+		.width = sess->p.width,
+		.height = sess->p.height,
+		.slot = slot,
+		.frame = sess->frames,
+		.level = READ_ONCE(ctx->mctf_level),
+	};
+	u8 *cmd;
+	int ret;
+
+	if (!l || slot >= sess->p.slots)
+		return -EINVAL;
+	f.in = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0) +
+	       src->vb2_buf.planes[0].data_offset;
+	f.out = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
+	if (!IS_ALIGNED(f.in, 64) || !IS_ALIGNED(f.out, 64))
+		return -EINVAL;
+	ret = ave_ipc_wait_ack(ave, buf);
+	if (ret)
+		return ret;
+	cmd = ave_ipc_cmd(ave, buf, l->process_bytes);
+	if (!cmd)
+		return -EBUSY;
+	ret = ave_mctf_build_process(l, cmd, l->process_bytes, sess->mctf_iova,
+				     &f);
+	if (ret)
+		return ret;
+	ave_write_header(ctx, cmd, AVE_OP_PROCESS, l->subtype + slot,
+			 sess->frame_arg0, ave_session_arg2(ctx));
+	if (!sess->frames)
+		ave_debugfs_save_mctf(ave, AVE_IMAGE_PROCESS, cmd,
+				      l->process_bytes);
+
+	/* Pin both pictures before publishing the command. */
+	s->input_mem = ave_vb2_get(&src->vb2_buf);
+	s->output_mem = ave_vb2_get(&dst->vb2_buf);
+	ret = ave_ipc_submit(ave, buf, l->process_bytes,
+			     ave->layout->process_timeout_us, false);
+	if (ret)
+		return ret;
+	s->src = src;
+	s->dst = dst;
+	s->busy = true;
+	s->status = 0;
+	sess->progress = jiffies;
+	sess->last_sent = jiffies;
+	sess->busy++;
+	sess->frames++;
 	return 0;
 }

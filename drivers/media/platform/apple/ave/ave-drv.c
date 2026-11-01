@@ -23,6 +23,7 @@
 
 #include "ave.h"
 #include "ave-regs.h"
+#include "ave-mctf.h"
 
 #define AVE_AUTOSUSPEND_MS 2000
 
@@ -128,6 +129,44 @@ void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec,
 		memcpy(dst, cmd, len);
 }
 
+/* The last MCTF Start and the first Process of the last MCTF session */
+void ave_debugfs_save_mctf(struct ave_dev *ave, enum ave_image kind,
+			   const void *cmd, size_t len)
+{
+	const struct ave_mctf_layout *l = ave_mctf_layout_for_crc(ave->text_crc);
+	void *dst = ave->mctf_dump[kind];
+
+	if (l && dst &&
+	    len == (kind == AVE_IMAGE_START ? l->start_bytes : l->process_bytes))
+		memcpy(dst, cmd, len);
+}
+
+static void ave_debugfs_mctf(struct ave_dev *ave)
+{
+	static const char *const names[AVE_IMAGE_COUNT] = {
+		"last_start_mctf", "last_process0_mctf",
+	};
+	const struct ave_mctf_layout *l = ave_mctf_qualified(ave->text_crc);
+
+	if (!l)
+		return;
+	for (unsigned int k = 0; k < AVE_IMAGE_COUNT; k++) {
+		struct debugfs_blob_wrapper *blob;
+		size_t size = k == AVE_IMAGE_START ? l->start_bytes :
+						     l->process_bytes;
+
+		blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
+		ave->mctf_dump[k] = devm_kzalloc(ave->dev, size, GFP_KERNEL);
+		if (!blob || !ave->mctf_dump[k]) {
+			ave->mctf_dump[k] = NULL;
+			continue;
+		}
+		blob->data = ave->mctf_dump[k];
+		blob->size = size;
+		debugfs_create_blob(names[k], 0400, ave->debugfs, blob);
+	}
+}
+
 static ssize_t ave_lifecycle_write(struct file *file, const char __user *user,
 				   size_t count, loff_t *ppos)
 {
@@ -204,6 +243,7 @@ static void ave_debugfs_init(struct ave_dev *ave)
 			debugfs_create_blob(names[c][k], 0400, ave->debugfs,
 					    blob);
 		}
+	ave_debugfs_mctf(ave);
 }
 
 /*

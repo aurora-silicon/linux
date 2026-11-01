@@ -39,8 +39,8 @@ def build(src, out, baseline):
     for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS',
                  'AVE_MAX_SESSIONS', 'AVE_FW_TEXT_CRC_9003_78_0'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
-    # Later firmware builds; an older baseline does not define them.
-    for name in ('AVE_FW_TEXT_CRC_T6040_25G83',):
+    # Later additions; an older baseline does not define them.
+    for name in ('AVE_FW_TEXT_CRC_T6040_25G83', 'AVE_MCTF_BUFS'):
         m = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
         if m:
             code += m[0] + '\n'
