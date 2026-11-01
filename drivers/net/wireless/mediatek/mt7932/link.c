@@ -786,10 +786,15 @@ report:
 	}
 	/* Serialize the final outcome with cancellation. In particular, a late
 	 * firmware success must not publish carrier/authorization after .deauth.
-	 * The cfg80211 calls may take bottom-half locks, so they are made after
-	 * response_lock is dropped. command_mutex keeps the disconnect worker,
-	 * which retires the connection before reporting its end, behind them;
-	 * an RF failure in the meantime leaves its report to this worker.
+	 * The connect result, the port authorization and the disconnect that
+	 * follows a failed or cancelled move are reported after response_lock is
+	 * dropped, since cfg80211_connect_done() may sleep. Only the connect_lost
+	 * report below calls cfg80211_disconnected() under the lock, with
+	 * GFP_ATOMIC, as the RF failure path, the disconnect worker and a move
+	 * that mt_connect() refuses do; that call only queues an event.
+	 * command_mutex keeps the disconnect worker, which retires the
+	 * connection before reporting its end, behind them; an RF failure in
+	 * the meantime leaves its report to this worker.
 	 */
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!ret && (m->connect_error || !mt_rf_allowed(m))) {
@@ -947,6 +952,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	if (params->prev_bssid && !m->connected && !ret)
 		ret = -EBUSY;
 	spin_unlock_irqrestore(&m->response_lock, flags);
+	/* Leaving the old AP waits for a scan in progress to finish
+	 * (mt_scan_quiesce(), about 7 s at most). A scan that is still running
+	 * after that makes the admission check below refuse the join, so the
+	 * move ends as a disconnect and iwd connects again.
+	 */
 	if (roam) {
 		dev_info(&m->pdev->dev, "ROAM_MOVE: %d; from %pM to %pM\n", ret,
 			 params->prev_bssid, params->bssid ?: params->bssid_hint);
