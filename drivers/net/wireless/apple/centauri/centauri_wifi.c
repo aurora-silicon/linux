@@ -30,6 +30,11 @@ static_assert(DATA_RX_BUFFER + DATA_RX_SLOTS * 4096 <= DATA_TX_BUFFER);
 static_assert(DATA_TX_BUFFER + DATA_TX_SLOTS * BUFFER_SIZE <=
 	      CEN_ALPHA_WINDOW_SIZE);
 
+static bool host_setup = true;
+module_param(host_setup, bool, 0644);
+MODULE_PARM_DESC(host_setup,
+		 "Before a join, tell the firmware the host is awake (command 6) and apply the reference TX defaults (commands 43 and 52); 1 = on (default)");
+
 struct centauri_wifi {
 	struct centauri *control;
 	struct cen_alpha_resources a;
@@ -69,6 +74,9 @@ struct centauri_wifi {
 	struct net_device_stats station_start;
 	u8 country[3];
 	bool country_valid;
+	/* Sent once per firmware boot, before the first join (host_setup). */
+	bool host_awake_sent;
+	u8 tx_defaults_applied;
 	u32 data_rings_open;
 	bool data_failed;
 	struct ieee80211_supported_band bands[2];
@@ -1084,6 +1092,43 @@ out:
 	return ret;
 }
 
+/*
+ * Without the host power state the firmware treats the host as asleep, powers
+ * the PHYs down and traps. Called with wifi->lock held.
+ */
+static void host_setup_commands(struct centauri_wifi *wifi)
+{
+	static const u8 awake[3] = {};
+	static const u8 control_profile[] = { 0x54, 1, 10, 0, 0, 8, 0, 0,
+					      0xff, 0xff, 0xff, 0xff, 1, 1 };
+	struct device *dev = &wifi->control->pdev->dev;
+	u8 lifetime[20] = {};
+	int ret, i;
+
+	if (!host_setup)
+		return;
+	if (!wifi->host_awake_sent) {
+		ret = command(wifi, 6, awake, sizeof(awake));
+		dev_info(dev, "host power state awake: rc=%d status=%u\n", ret,
+			 wifi->reply_status);
+		wifi->host_awake_sent = !ret;
+	}
+	if (!(wifi->tx_defaults_applied & BIT(0))) {
+		for (i = 0; i < 4; i++)
+			put_unaligned_le32(2000000, lifetime + 4 + 4 * i);
+		ret = command(wifi, 43, lifetime, sizeof(lifetime));
+		if (!ret)
+			wifi->tx_defaults_applied |= BIT(0);
+		dev_info(dev, "TX packet lifetime defaults: rc=%d\n", ret);
+	}
+	if (!(wifi->tx_defaults_applied & BIT(1))) {
+		ret = command(wifi, 52, control_profile, sizeof(control_profile));
+		if (!ret)
+			wifi->tx_defaults_applied |= BIT(1);
+		dev_info(dev, "TX control profile defaults: rc=%d\n", ret);
+	}
+}
+
 static void connect_worker(struct work_struct *work)
 {
 	struct centauri_wifi *wifi =
@@ -1098,6 +1143,7 @@ static void connect_worker(struct work_struct *work)
 		mutex_unlock(&wifi->lock);
 		return;
 	}
+	host_setup_commands(wifi);
 	slot = wifi->command_head;
 	ret = command(wifi, 131072, wifi->connect_payload, wifi->connect_size);
 	memzero_explicit(wifi->connect_payload, sizeof(wifi->connect_payload));
