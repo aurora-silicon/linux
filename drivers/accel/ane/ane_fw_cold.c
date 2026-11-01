@@ -1,0 +1,1051 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/* Shared firmware backend. H17 is the first measured cold power provider. */
+#include <crypto/sha2.h>
+#include <linux/dma-mapping.h>
+#include <linux/io.h>
+#include <linux/iommu.h>
+#include <linux/iopoll.h>
+#include <linux/kexec.h>
+#include <linux/list.h>
+#include <linux/module.h>
+#include <linux/of_address.h>
+#include <linux/of_device.h>
+#include <linux/of_irq.h>
+#include <linux/of_platform.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
+#include <linux/slab.h>
+#include <linux/suspend.h>
+
+#include "ane_fw_cold.h"
+
+#define ANE_FW_POOL_DVA 0x10000384000ULL
+#define ANE_FW_IPC_DVA 0x100003d0000ULL
+#define ANE_FW_HEAP_DVA 0x100003e4000ULL
+#define ANE_FW_ALLOC_DVA 0x10001300000ULL
+#define ANE_FW_TIMEOUT_NS (3ULL * NSEC_PER_SEC)
+
+enum ane_fw_stage {
+	ANE_STAGE_UNVERIFIED,
+	ANE_STAGE_PROBED,
+	ANE_STAGE_MAPPED,
+	ANE_STAGE_BOOTED,
+	ANE_STAGE_STARTUP,
+	ANE_STAGE_QUARANTINED,
+};
+
+struct ane_fw_mapping {
+	struct list_head list;
+	struct ane_fw_surface surface;
+	dma_addr_t physical;
+};
+
+struct ane_fw_backend {
+	struct platform_device *pdev;
+	const struct ane_fw_platform *soc;
+	void __iomem *engine, *pmgr, *gate, *dart[ANE_FW_DARTS];
+	struct device *power, *memory;
+	struct iommu_domain *domain;
+	struct ane_fw_transport transport;
+	struct ane_fw_surface pool, ipc, heap;
+	struct list_head mappings;
+	/* Serialize stage changes, command publication and retained lifetimes. */
+	struct mutex lock;
+	struct notifier_block pm_notifier;
+	struct ane_fw_cold_state cold;
+	u64 ranges[ANE_FW_DAPF_RANGES * 2];
+	u64 next_dva, uuid;
+	enum ane_fw_stage stage;
+	bool retained;
+};
+
+/* One ANE per SoC. The observer exists before platform driver registration:
+ * the platform bus would otherwise resume genpd and attach DMA before probe.
+ */
+static struct ane_fw_backend *ane_backend;
+static struct kexec_blocker ane_fw_kexec = {
+	.users = ATOMIC_INIT(0),
+	.reason = "ANE firmware retains private DMA mappings until hardware reset",
+};
+
+static int ane_fw_quarantine(struct ane_fw_backend *b, int error)
+{
+	unsigned int i;
+
+	b->stage = ANE_STAGE_QUARANTINED;
+	dev_err(&b->pdev->dev, "ANE quarantined (%d); mappings and power retained, reboot required\n",
+		error);
+	for (i = 0; i < 8; i++)
+		dev_info(&b->pdev->dev, "scratch%u=%#x\n", i,
+			 readl(b->engine + b->soc->scratch + i * 4));
+	for (i = 0; i < ANE_FW_DARTS; i++)
+		dev_info(&b->pdev->dev, "DART%u error=%#x address=%#x:%#x\n", i,
+			 readl(b->dart[i] + 0x100), readl(b->dart[i] + 0x174),
+			 readl(b->dart[i] + 0x170));
+	return error;
+}
+
+static bool ane_fw_raw_boot(void)
+{
+	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
+	const char *evidence;
+
+	return chosen && !of_property_read_string(chosen, "apple,ane-cold-boot", &evidence) &&
+	       !strcmp(evidence, "raw-no-xnu-ane-untouched-v1");
+}
+
+static void ane_fw_snapshot(struct ane_fw_backend *b, bool log)
+{
+	struct ane_fw_cold_state *s = &b->cold;
+	struct device *dev = &b->pdev->dev;
+	unsigned int i, j;
+
+	s->sys = readl(b->pmgr + 0x290);
+	s->cpu = readl(b->pmgr + 0xc000);
+	s->subblock = readl(b->pmgr + 0xc008);
+	s->gate_request = readl(b->gate + 0xc);
+	s->gate_ack = readl(b->gate + 0x30);
+	s->ce_state = readq(b->engine + 0x18a4010);
+	s->ce_error = readq(b->engine + 0x18a4018);
+	s->rvbar = readq(b->engine + 0x1050000);
+	s->control = readl(b->engine + b->soc->wrapper + 0x44);
+	s->status = readl(b->engine + b->soc->wrapper + 0x48);
+	s->pending = readl(b->engine + b->soc->irq_status);
+	for (i = 0; i < 8; i++)
+		s->scratch[i] = readl(b->engine + b->soc->scratch + i * 4);
+	for (i = 0; i < ANE_FW_DARTS; i++) {
+		s->dart[i].version = readl(b->dart[i] + 8);
+		s->dart[i].protect = readl(b->dart[i] + 0x200);
+		s->dart[i].unprotect = readl(b->dart[i] + 0x204);
+		s->dart[i].lock = readl(b->dart[i] + 0x208);
+		s->dart[i].error = readl(b->dart[i] + 0x100);
+		for (j = 0; j < 16; j++)
+			s->dart[i].enabled[j] = readl(b->dart[i] + 0xc00 + 4 * j);
+		if (log)
+			dev_info(dev, "U2 DART%u version=%#x protect=%#x unprotect=%#x lock=%#x error=%#x\n",
+				 i, s->dart[i].version, s->dart[i].protect,
+				 s->dart[i].unprotect, s->dart[i].lock, s->dart[i].error);
+	}
+	if (!log)
+		return;
+	dev_info(dev, "U2 ANE_SYS=%#x CPU_PS=%#x subblock=%#x PWGATE=%#x/%#x\n",
+		 s->sys, s->cpu, s->subblock, s->gate_request, s->gate_ack);
+	dev_info(dev, "U2 control=%#x status=%#x RVBAR=%#llx CE=%#llx/%#llx pending=%#x\n",
+		 s->control, s->status, s->rvbar, s->ce_state, s->ce_error, s->pending);
+	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
+
+		dev_info(dev, "U2 DAPF%u flags=%#x start=%#llx end=%#llx enable=%#x\n",
+			 i, readl(r), readq(r + 8), readq(r + 0x10), readl(r + 0x20));
+	}
+}
+
+static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
+{
+	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, pm_notifier);
+
+	if ((event == PM_SUSPEND_PREPARE || event == PM_HIBERNATION_PREPARE ||
+	     event == PM_RESTORE_PREPARE) && READ_ONCE(b->retained))
+		return NOTIFY_BAD;
+	return NOTIFY_DONE;
+}
+
+static int ane_fw_retain(struct ane_fw_backend *b)
+{
+	int ret;
+
+	/* The tree's kexec blocker is built-in-only. Modules may observe U2. */
+	if (IS_MODULE(CONFIG_DRM_ACCEL_ANE))
+		return -EOPNOTSUPP;
+	ret = kexec_block(&ane_fw_kexec);
+	if (ret)
+		return ret;
+	b->pm_notifier.notifier_call = ane_fw_pm_event;
+	ret = register_pm_notifier(&b->pm_notifier);
+	if (ret) {
+		kexec_unblock(&ane_fw_kexec);
+		return ret;
+	}
+	__module_get(THIS_MODULE);
+	b->retained = true;
+	return 0;
+}
+
+static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
+		      size_t size, int prot)
+{
+	int ret = iommu_map(b->domain, dva, pa, size, prot, GFP_KERNEL);
+
+	if (ret)
+		return ret;
+	/* iommu_map includes the DART's normal range synchronization and
+	 * propagates its timeout. Extra invalidates do not fix stale output
+	 * BAR bindings between programs; the transport's queued first EXECUTE
+	 * after a program change does.
+	 */
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
+		if (readl(b->dart[i] + 0x100))
+			return -EIO;
+	return 0;
+}
+
+static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
+			   int prot, struct ane_fw_surface *s)
+{
+	struct ane_fw_mapping *m;
+	int ret;
+
+	m = kzalloc_obj(*m);
+	if (!m)
+		return -ENOMEM;
+	m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical, GFP_KERNEL);
+	if (!m->surface.cpu) {
+		kfree(m);
+		return -ENOMEM;
+	}
+	m->surface.dva = dva;
+	m->surface.size = size;
+	/* Record before publication, including a failed/partial mapping. */
+	list_add_tail(&m->list, &b->mappings);
+	ret = ane_fw_map(b, dva, m->physical, size, prot);
+	if (!ret)
+		*s = m->surface;
+	return ret;
+}
+
+static int ane_fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
+{
+	struct ane_fw_backend *b = ctx;
+	int ret;
+
+	if (!size || size > ANE_FW_SHARED_TOTAL ||
+	    b->next_dva > ANE_FW_ALLOC_DVA + SZ_512M - size)
+		return -ENOSPC;
+	ret = ane_fw_alloc_at(b, b->next_dva, size, IOMMU_READ | IOMMU_WRITE, s);
+	if (!ret) {
+		b->next_dva += size;
+		dev_info(&b->pdev->dev, "SHAREDMALLOC tag=%#x bytes=%zu\n", tag, size);
+	}
+	return ret;
+}
+
+static u64 ane_fw_load64(void *ctx, const void *p)
+{
+	return le64_to_cpu(READ_ONCE(*(__le64 *)p));
+}
+
+static void ane_fw_store64(void *ctx, void *p, u64 value)
+{
+	WRITE_ONCE(*(__le64 *)p, cpu_to_le64(value));
+}
+
+static void ane_fw_rmb(void *ctx)
+{
+	dma_rmb();
+}
+
+static void ane_fw_wmb(void *ctx)
+{
+	dma_wmb();
+}
+
+static u32 ane_fw_read32(void *ctx, u32 reg)
+{
+	struct ane_fw_backend *b = ctx;
+
+	return readl(b->engine + reg);
+}
+
+static void ane_fw_write32(void *ctx, u32 reg, u32 value)
+{
+	struct ane_fw_backend *b = ctx;
+
+	writel(value, b->engine + reg);
+}
+
+static u64 ane_fw_now(void *ctx)
+{
+	return ktime_get_ns();
+}
+
+static void ane_fw_relax(void *ctx)
+{
+	usleep_range(10, 20);
+}
+
+static void ane_fw_refused(void *ctx, u64 word0, u64 word1, u64 word2, int error)
+{
+	struct ane_fw_backend *b = ctx;
+
+	dev_info(&b->pdev->dev, "SHAREDMALLOC refused tuple=%#llx/%#llx/%#llx error=%d\n",
+		 word0, word1, word2, error);
+}
+
+static const struct ane_fw_transport_ops ane_fw_ops = {
+	.load64 = ane_fw_load64, .store64 = ane_fw_store64,
+	.read_barrier = ane_fw_rmb, .write_barrier = ane_fw_wmb,
+	.read32 = ane_fw_read32, .write32 = ane_fw_write32,
+	.now_ns = ane_fw_now, .relax = ane_fw_relax,
+	.alloc = ane_fw_alloc, .refused = ane_fw_refused,
+};
+
+static int ane_fw_power(struct ane_fw_backend *b)
+{
+	u32 value;
+	u64 ce;
+	int ret;
+
+	b->power = dev_pm_domain_attach_by_id(&b->pdev->dev, 0);
+	if (IS_ERR_OR_NULL(b->power))
+		return b->power ? PTR_ERR(b->power) : -ENODEV;
+	ret = pm_runtime_resume_and_get(b->power);
+	if (ret < 0)
+		return ret;
+	/* ANE_SYS can already be physically on while genpd reports off. That
+	 * alone does not make the CPU warm. The pre-write snapshot decides.
+	 */
+	if ((readl(b->pmgr + 0x290) & 0xff) != 0xff)
+		return -EIO;
+	writel(readl(b->pmgr + 0xc000) | 0xf, b->pmgr + 0xc000);
+	ret = readl_poll_timeout(b->pmgr + 0xc000, value, (value & 0xff) == 0xff,
+				 1, 100000);
+	if (ret)
+		return ret;
+	writel(readl(b->pmgr + 0xc008) | 0xf, b->pmgr + 0xc008);
+	ret = readl_poll_timeout(b->pmgr + 0xc008, value, (value & 0xff) == 0xff,
+				 1, 100000);
+	if (ret)
+		return ret;
+	writel(0, b->gate + 0xc);
+	ret = readl_poll_timeout(b->gate + 0x30, value, !value, 1, 100000);
+	if (ret)
+		return ret;
+	writeq(3, b->engine + 0x18a4000);
+	ret = readq_poll_timeout(b->engine + 0x18a4008, ce, (ce & 3) == 3, 1, 100000);
+	if (ret)
+		return ret;
+	writeq(3, b->engine + 0x18a4008);
+	if ((readq(b->engine + 0x18a4010) & 3) != 3 ||
+	    readq(b->engine + 0x18a4018))
+		return -EIO;
+	dev_info(&b->pdev->dev, "ANE power: ANE_SYS on, child/PWGATE/CE ready\n");
+	return 0;
+}
+
+static int ane_fw_dapf(struct ane_fw_backend *b)
+{
+	unsigned int i;
+
+	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
+		u64 start = b->ranges[i * 2], end = b->ranges[i * 2 + 1];
+
+		if (readl(b->dart[0] + 0x208) & BIT(2))
+			return -EPERM;
+		writel(0x31, r);
+		writel(lower_32_bits(start), r + 8);
+		writel(upper_32_bits(start), r + 0xc);
+		writel(lower_32_bits(end), r + 0x10);
+		writel(upper_32_bits(end), r + 0x14);
+		writel(1, r + 0x20);
+		if ((readl(r) & 0x333) != 0x31 || readq(r + 8) != start ||
+		    readq(r + 0x10) != end || (readl(r + 0x20) & 0xffff) != 1)
+			return -EIO;
+	}
+	return 0;
+}
+
+static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
+				   u64 size[2], u64 dva[2], u8 data_pin[SHA256_DIGEST_SIZE])
+{
+	struct device_node *np = b->pdev->dev.of_node;
+	struct device_node *reserved __free(device_node) = of_find_node_by_path("/reserved-memory");
+	unsigned int i;
+
+	if (!reserved || !of_property_read_bool(np, "apple,firmware-preloaded") ||
+	    of_property_count_u32_elems(np, "memory-region") != 2 ||
+	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2) ||
+	    of_property_read_u8_array(np, "apple,preload-data-sha256", data_pin,
+				      SHA256_DIGEST_SIZE))
+		return -ENODATA;
+	for (i = 0; i < 2; i++) {
+		struct device_node *mem __free(device_node) =
+			of_parse_phandle(np, "memory-region", i);
+		struct reserved_mem *rmem = mem ? of_reserved_mem_lookup(mem) : NULL;
+		const char *name;
+
+		if (!rmem || mem->parent != reserved || !of_device_is_available(mem) ||
+		    of_property_read_string_index(np, "memory-region-names", i, &name) ||
+		    strcmp(name, i ? "firmware-data" : "firmware-text") ||
+		    !of_property_read_bool(mem, "no-map") ||
+		    of_property_read_bool(mem, "reusable"))
+			return -EINVAL;
+		physical[i] = rmem->base;
+		size[i] = rmem->size;
+	}
+	if (!ane_fw_preload_ranges_valid(b->soc, physical, size, dva))
+		return -EINVAL;
+	return 0;
+}
+
+static int ane_fw_preload(struct ane_fw_backend *b)
+{
+	static const u8 text_pin[SHA256_DIGEST_SIZE] = {
+		0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
+		0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
+		0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
+		0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
+	};
+	u64 physical[2], size[2], dva[2];
+	struct ane_fw_surface snapshots[2];
+	u8 digest[SHA256_DIGEST_SIZE], data_pin[SHA256_DIGEST_SIZE];
+	unsigned int i;
+	int ret;
+
+	ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin);
+	if (ret)
+		return ret;
+	for (i = 0; i < 2; i++) {
+		void *source = memremap(physical[i], size[i], MEMREMAP_WB);
+		struct sha256_ctx hash;
+
+		if (!source)
+			return -ENOMEM;
+		ret = ane_fw_alloc_at(b, dva[i], size[i],
+				      IOMMU_READ | (i ? IOMMU_WRITE : 0), &snapshots[i]);
+		if (!ret)
+			memcpy(snapshots[i].cpu, source, size[i]);
+		memunmap(source);
+		if (ret)
+			return ret;
+		sha256_init(&hash);
+		sha256_update(&hash, snapshots[i].cpu, size[i]);
+		sha256_final(&hash, digest);
+		if (memcmp(digest, i ? data_pin : text_pin, sizeof(digest)))
+			return -EKEYREJECTED;
+	}
+	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
+	dma_wmb();
+	return 0;
+}
+
+static int ane_fw_prepare(struct ane_fw_backend *b)
+{
+	struct device *dev = &b->pdev->dev;
+	unsigned int i;
+	int ret;
+
+	ret = ane_fw_power(b);
+	if (ret)
+		return ret;
+	ret = of_dma_configure(dev, dev->of_node, true);
+	if (ret)
+		return ret;
+	ret = iommu_device_claim_dma_owner(dev, b);
+	if (ret)
+		return ret;
+	b->domain = iommu_paging_domain_alloc(dev);
+	if (IS_ERR(b->domain))
+		return PTR_ERR(b->domain);
+	ret = iommu_attach_device(b->domain, dev);
+	if (ret)
+		return ret;
+	if (!(b->domain->pgsize_bitmap & SZ_16K) || !b->domain->ops->iotlb_sync_map ||
+	    b->domain->geometry.aperture_start ||
+	    b->domain->geometry.aperture_end < ANE_FW_ALLOC_DVA + SZ_512M)
+		return -ERANGE;
+	b->memory = root_device_register("ane-fw-memory");
+	if (IS_ERR(b->memory))
+		return PTR_ERR(b->memory);
+	ret = dma_coerce_mask_and_coherent(b->memory, DMA_BIT_MASK(64));
+	if (ret)
+		return ret;
+	ret = ane_fw_preload(b);
+	if (ret)
+		return ret;
+	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+		u64 page = round_down(b->ranges[i * 2], SZ_16K);
+
+		ret = ane_fw_map(b, page, page, SZ_16K, IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO);
+		if (ret)
+			return ret;
+	}
+	ret = ane_fw_dapf(b);
+	if (ret)
+		return ret;
+	ret = ane_fw_alloc_at(b, ANE_FW_POOL_DVA, SZ_256K,
+			      IOMMU_READ | IOMMU_WRITE, &b->pool);
+	if (ret)
+		return ret;
+	ret = ane_fw_alloc_at(b, ANE_FW_IPC_DVA, SZ_64K,
+			      IOMMU_READ | IOMMU_WRITE, &b->ipc);
+	if (ret)
+		return ret;
+	ret = ane_fw_alloc_at(b, ANE_FW_HEAP_DVA, 15 * SZ_1M,
+			      IOMMU_READ | IOMMU_WRITE, &b->heap);
+	if (!ret)
+		dev_info(dev, "ANE map: reserved preload, SID0 on three DARTs, DAPF verified\n");
+	return ret;
+}
+
+static int ane_fw_scratch_wait(struct ane_fw_backend *b, unsigned int cell, u32 wanted)
+{
+	u32 value;
+
+	return readl_poll_timeout(b->engine + b->soc->scratch + cell * 4, value,
+				  value == wanted, 100, 3000000);
+}
+
+static int ane_fw_boot(struct ane_fw_backend *b)
+{
+	void __iomem *scratch = b->engine + b->soc->scratch;
+	u8 *init = b->pool.cpu + 0x180;
+	u64 table;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < 8; i++)
+		writel(0, scratch + i * 4);
+	writel(1, scratch + 6 * 4);
+	writel(0, b->engine + b->soc->wrapper + 0x44);
+	dma_wmb();
+	writel(0x10, b->engine + b->soc->wrapper + 0x44);
+	ret = ane_fw_scratch_wait(b, 7, 0x08042006);
+	if (ret)
+		return ret;
+	dev_info(&b->pdev->dev, "ANE boot: READY\n");
+	if (readl(scratch) != 8 || readl(scratch + 4) != 0xc440 ||
+	    readl(scratch + 12) != 0xf00000 || readl(scratch + 16))
+		return -EPROTO;
+	put_unaligned_le64(b->ipc.dva, init + 8);
+	put_unaligned_le64(0x380000, init + 0x10);
+	put_unaligned_le64(0xfc80000, init + 0x18);
+	put_unaligned_le64(b->heap.dva, init + 0x20);
+	put_unaligned_le64(b->heap.size, init + 0x28);
+	put_unaligned_le64(0xc441, init + 0x50);
+	put_unaligned_le64(b->pool.dva, init + 0x58);
+	put_unaligned_le64(b->pool.size, init + 0x60);
+	put_unaligned_le32(64, init + 0x68);
+	put_unaligned_le32(4, init + 0x12c);
+	dma_wmb();
+	writel(lower_32_bits(b->pool.dva + 0x180), scratch);
+	writel(upper_32_bits(b->pool.dva + 0x180), scratch + 4);
+	writel(0xf7fbdff9, scratch + 7 * 4);
+	ret = ane_fw_scratch_wait(b, 7, 0x08042006);
+	if (ret)
+		return ret;
+	table = (u64)readl(scratch + 4) << 32 | readl(scratch);
+	if (table != b->ipc.dva)
+		return -EPROTO;
+	ret = ane_fw_transport_init(&b->transport, b->soc, &ane_fw_ops, b,
+				    b->ipc, b->pool, 0x4000, table, ANE_FW_TABLE_SIZE);
+	if (ret)
+		return ret;
+	ret = ane_fw_transport_arm(&b->transport);
+	if (ret)
+		return ret;
+	writel(0x08042006, scratch + 3 * 4);
+	ret = ane_fw_scratch_wait(b, 3, 0);
+	if (!ret)
+		dev_info(&b->pdev->dev, "ANE boot: eight channels armed, scratch3 cleared (polled)\n");
+	return ret;
+}
+
+static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
+			  void *command, size_t size, u64 deadline)
+{
+	struct ane_fw_transaction *tx = &b->transport.pending[channel];
+	int ret;
+
+	ret = ane_fw_transport_publish(&b->transport, channel, command, size, deadline);
+	if (ret)
+		return ret;
+	ret = ane_fw_transport_wait(&b->transport, channel);
+	if (!ret)
+		memcpy(command, b->pool.cpu + tx->dva - b->pool.dva, size);
+	return ret;
+}
+
+static int ane_fw_startup(struct ane_fw_backend *b)
+{
+	static const struct { u16 id, size; } commands[] = {
+		{ 4, 12 }, { 0, 12 }, { 3, 16 }, { 0x22, 100 },
+	};
+	u8 command[100];
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(commands); i++) {
+		memset(command, 0, sizeof(command));
+		put_unaligned_le16(commands[i].id, command + 4);
+		ret = ane_fw_command(b, ANE_FW_IO, command, commands[i].size,
+				     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+		if (ret)
+			return ret;
+		if (commands[i].id == 4 && get_unaligned_le32(command + 8))
+			return -EPROTO;
+		if (commands[i].id == 3 && ane_fw_config_status(command, 16))
+			return -EPROTO;
+		dev_info(&b->pdev->dev, "ANE startup: command %#x ack=0\n", commands[i].id);
+		if (commands[i].id == 3)
+			dev_info(&b->pdev->dev, "ANE CONFIG_GET tick=%u\n",
+				 get_unaligned_le32(command + 8));
+		if (commands[i].id == 0x22)
+			dev_info(&b->pdev->dev, "ANE RESOURCE_INFO: %*ph\n", 100, command);
+	}
+	return 0;
+}
+
+static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	static const char * const names[] = {
+		"unverified", "probe", "map", "boot", "startup", "quarantined",
+	};
+	struct ane_fw_backend *b = ane_backend;
+
+	return sysfs_emit(buf, "%s\n", names[READ_ONCE(b->stage)]);
+}
+
+static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t count)
+{
+	struct ane_fw_backend *b = ane_backend;
+	enum ane_fw_stage next;
+	int ret = 0;
+
+	guard(mutex)(&b->lock);
+	if (b->stage == ANE_STAGE_QUARANTINED)
+		return -EIO;
+	if (sysfs_streq(buf, "probe")) {
+		if (b->retained)
+			return -EBUSY;
+		ane_fw_snapshot(b, true);
+		if (!ane_fw_cold_valid(&b->cold, ane_fw_raw_boot())) {
+			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or reset state); refusing\n");
+			return -EPERM;
+		}
+		b->stage = ANE_STAGE_PROBED;
+		dev_info(dev, "ANE probe: cold reset state and raw-boot evidence verified; no writes\n");
+		return count;
+	}
+	if (sysfs_streq(buf, "map"))
+		next = ANE_STAGE_MAPPED;
+	else if (sysfs_streq(buf, "boot"))
+		next = ANE_STAGE_BOOTED;
+	else if (sysfs_streq(buf, "startup"))
+		next = ANE_STAGE_STARTUP;
+	else
+		return -EINVAL;
+	if (next != b->stage + 1)
+		return -EINVAL;
+	if (next == ANE_STAGE_MAPPED) {
+		u64 physical[2], size[2], dva[2];
+		u8 data_pin[SHA256_DIGEST_SIZE];
+
+		ane_fw_snapshot(b, false);
+		if (!ane_fw_cold_valid(&b->cold, ane_fw_raw_boot())) {
+			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or reset state); refusing\n");
+			return -EPERM;
+		}
+		ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin);
+		if (ret) {
+			dev_info(dev, "H17 ANE: loader preload reservation or digest missing; refusing\n");
+			return ret;
+		}
+		ret = ane_fw_retain(b);
+		if (ret)
+			return ret;
+		ret = ane_fw_prepare(b);
+	} else if (next == ANE_STAGE_BOOTED) {
+		ret = ane_fw_boot(b);
+	} else {
+		ret = ane_fw_startup(b);
+	}
+	if (ret)
+		return ane_fw_quarantine(b, ret);
+	b->stage = next;
+	return count;
+}
+
+static ssize_t firmware_stage_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	unsigned int sleep_flags = lock_system_sleep();
+	ssize_t ret = ane_fw_stage_action(dev, buf, count);
+
+	unlock_system_sleep(sleep_flags);
+	return ret;
+}
+static DEVICE_ATTR_RW(firmware_stage);
+
+static void ane_fw_observer_free(struct ane_fw_backend *b)
+{
+	unsigned int i;
+
+	for (i = 0; i < ANE_FW_DARTS; i++)
+		if (b->dart[i])
+			iounmap(b->dart[i]);
+	if (b->engine)
+		iounmap(b->engine);
+	if (b->pmgr)
+		iounmap(b->pmgr);
+	if (b->gate)
+		iounmap(b->gate);
+	put_device(&b->pdev->dev);
+	kfree(b);
+}
+
+int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct ane_fw_backend *b;
+	unsigned int i;
+	u32 dart_phandles[ANE_FW_DARTS];
+	int ret = -EINVAL;
+
+	if (ane_backend || soc->soc != 0x8140)
+		return -EOPNOTSUPP;
+	b = kzalloc_obj(*b);
+	if (!b)
+		return -ENOMEM;
+	b->pdev = pdev;
+	get_device(&pdev->dev);
+	b->soc = soc;
+	b->next_dva = ANE_FW_ALLOC_DVA;
+	mutex_init(&b->lock);
+	INIT_LIST_HEAD(&b->mappings);
+	if (of_property_count_strings(np, "reg-names") != soc->reg_count ||
+	    of_irq_count(np) != soc->interrupt_count ||
+	    of_count_phandle_with_args(np, "power-domains", "#power-domain-cells") != 1)
+		goto fail;
+	for (i = 0; i < soc->reg_count; i++) {
+		struct resource res;
+		const char *name;
+
+		if (of_address_to_resource(np, i, &res) ||
+		    resource_size(&res) != soc->reg_sizes[i] ||
+		    of_property_read_string_index(np, "reg-names", i, &name) ||
+		    strcmp(name, soc->reg_names[i]))
+			goto fail;
+	}
+	if (of_property_read_u64_array(np, "apple,dapf-ranges", b->ranges,
+				       ARRAY_SIZE(b->ranges)))
+		goto fail;
+	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+		u64 start = b->ranges[i * 2], end = b->ranges[i * 2 + 1];
+
+		if (start > end || round_down(start, SZ_16K) != round_down(end, SZ_16K))
+			goto fail;
+		for (unsigned int j = 0; j < i; j++)
+			if (round_down(start, SZ_16K) == round_down(b->ranges[j * 2], SZ_16K))
+				goto fail;
+	}
+	if (of_count_phandle_with_args(np, "iommus", "#iommu-cells") != ANE_FW_DARTS)
+		goto fail;
+	for (i = 0; i < ANE_FW_DARTS; i++) {
+		struct of_phandle_args args;
+
+		ret = of_parse_phandle_with_args(np, "iommus", "#iommu-cells", i, &args);
+		if (ret)
+			goto fail;
+		if (args.args_count != 1 || args.args[0] ||
+		    !of_device_is_compatible(args.np, "apple,t8140-ane-dart")) {
+			of_node_put(args.np);
+			ret = -EINVAL;
+			goto fail;
+		}
+		for (unsigned int j = 0; j < i; j++) {
+			if (dart_phandles[j] == args.np->phandle) {
+				of_node_put(args.np);
+				ret = -EINVAL;
+				goto fail;
+			}
+		}
+		dart_phandles[i] = args.np->phandle;
+		b->dart[i] = of_iomap(args.np, 0);
+		of_node_put(args.np);
+		if (!b->dart[i]) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+	}
+	b->engine = of_iomap(np, 0);
+	b->pmgr = of_iomap(np, 1);
+	b->gate = of_iomap(np, 2);
+	if (!b->engine || !b->pmgr || !b->gate) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	ane_backend = b;
+	ret = device_create_file(&pdev->dev, &dev_attr_firmware_stage);
+	if (ret) {
+		ane_backend = NULL;
+		goto fail;
+	}
+	dev_info(&pdev->dev, "H17 ANE: read-only staged observer ready; IRQs 655/668 remain masked\n");
+	return 0;
+fail:
+	ane_fw_observer_free(b);
+	return ret;
+}
+
+bool ane_fw_staged_exit(void)
+{
+	struct ane_fw_backend *b = ane_backend;
+
+	if (!b)
+		return false;
+	/* A retained backend pins the module. No unload or in-place retry. */
+	if (WARN_ON(b->retained))
+		return true;
+	device_remove_file(&b->pdev->dev, &dev_attr_firmware_stage);
+	ane_backend = NULL;
+	ane_fw_observer_free(b);
+	return true;
+}
+
+static bool ane_fw_owned(struct ane_fw_backend *b, const struct ane_fw_surface *s)
+{
+	struct ane_fw_mapping *m;
+
+	if (!s || !ane_fw_surface_valid(s))
+		return false;
+	list_for_each_entry(m, &b->mappings, list)
+		if (s->dva >= ANE_FW_ALLOC_DVA &&
+		    ane_fw_contains(m->surface.dva, m->surface.size, s->dva, s->size) &&
+		    s->cpu == m->surface.cpu + s->dva - m->surface.dva)
+			return true;
+	return false;
+}
+
+int ane_fw_program_alloc(size_t size, struct ane_fw_surface *surface)
+{
+	struct ane_fw_backend *b = ane_backend;
+	int ret;
+
+	if (!b || !surface || !size || size > ANE_FW_SHARED_TOTAL)
+		return -EINVAL;
+	guard(mutex)(&b->lock);
+	if (b->stage != ANE_STAGE_STARTUP)
+		return -EBUSY;
+	ret = ane_fw_alloc(b, ALIGN(size, SZ_16K), 0, surface);
+	return ret ? ane_fw_quarantine(b, ret) : 0;
+}
+
+static int ane_fw_program_check(struct ane_fw_backend *b, const struct ane_fw_program *p,
+				const struct ane_fw_surface *output)
+{
+	unsigned int i, outputs = 0;
+
+	if (!p || !p->call.buffers || !p->call.buffer_count ||
+	    p->call.buffer_count > ANE_H16_MAX_BUFFERS || p->call.bar_count ||
+	    !ane_fw_owned(b, output))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(p->sections); i++) {
+		bool required = i <= 4 || i == 6;
+		const struct ane_fw_load_section *s = &p->sections[i];
+
+		if (required != !!s->surface.size ||
+		    (required && !ane_fw_owned(b, &s->surface)))
+			return -EINVAL;
+	}
+	if (p->sections[0].index != 1002 || p->sections[1].index != ANE_FW_KERNEL_INDEX ||
+	    p->sections[2].index != 1006 || p->sections[3].index != 1003 ||
+	    p->sections[4].index != 1004 || p->sections[6].index != 1005)
+		return -EINVAL;
+	for (i = 0; i < p->call.buffer_count; i++) {
+		const struct ane_h16_execute_buffer *r = &p->call.buffers[i];
+		struct ane_fw_mapping *m;
+		bool found = false;
+
+		if (!r->size || r->offset || r->class > 1 ||
+		    r->mapping_dva < ANE_FW_ALLOC_DVA || r->size > r->mapping_size)
+			return -EINVAL;
+		for (unsigned int j = 0; j < i; j++)
+			if (p->call.buffers[j].index == r->index)
+				return -EINVAL;
+		list_for_each_entry(m, &b->mappings, list)
+			if (m->surface.dva == r->mapping_dva &&
+			    m->surface.size == r->mapping_size)
+				found = true;
+		if (!found)
+			return -EINVAL;
+		if (r->class == 1) {
+			outputs++;
+			if (r->mapping_dva != output->dva || r->size != output->size)
+				return -EINVAL;
+		}
+	}
+	return outputs == 1 ? ane_fw_operation_validate(p) : -EINVAL;
+}
+
+static int ane_fw_gate(struct ane_fw_backend *b, u32 value, u64 deadline)
+{
+	u8 command[12] = {};
+
+	put_unaligned_le16(ANE_H16_POWER_GATE, command + 4);
+	put_unaligned_le32(value, command + 8);
+	return ane_fw_command(b, ANE_FW_DATA_CHAIN, command, sizeof(command), deadline);
+}
+
+static int ane_fw_program_wait(struct ane_fw_backend *b,
+			       const struct ane_h16_request_key *key, u64 deadline)
+{
+	u8 report[0x60];
+	size_t size;
+	u32 pending;
+	int ret;
+
+	while (ktime_get_ns() < deadline) {
+		ret = ane_fw_transport_consume(&b->transport, report, sizeof(report), &size);
+		if (!ret) {
+			if (size == 12 && get_unaligned_le16(report + 4) == 0x107) {
+				if (get_unaligned_le16(report + 6))
+					return -EPROTO;
+				continue;
+			}
+			ret = ane_h16_event_result(report, size, ANE_FW_IO_T2H, key);
+			if (ret == ANE_H16_EVENT_COMPLETE)
+				return 0;
+			if (ret != ANE_H16_EVENT_PROGRESS)
+				return ret < 0 ? ret : -EIO;
+		} else if (ret != -EAGAIN) {
+			return ret;
+		}
+		ret = ane_fw_transport_irq(&b->transport, &pending);
+		if (ret)
+			return ret;
+		ret = ane_fw_transport_shared(&b->transport);
+		if (ret && ret != -EAGAIN)
+			return ret;
+		ane_fw_relax(b);
+	}
+	return -ETIMEDOUT;
+}
+
+int ane_fw_program_run(struct ane_fw_program *program,
+		       const struct ane_fw_surface *output, const void *expected)
+{
+	struct ane_fw_backend *b = ane_backend;
+	struct ane_h16_execute call;
+	u8 *command;
+	u64 deadline;
+	u32 expp = ANE_FW_SHARED_MAX;
+	int ret;
+
+	if (!b || !expected)
+		return -EINVAL;
+	guard(mutex)(&b->lock);
+	if (b->stage != ANE_STAGE_STARTUP)
+		return -EBUSY;
+	ret = ane_fw_program_check(b, program, output);
+	if (ret)
+		return ret;
+	command = kzalloc(ANE_H16_EXECUTE_BASE_SIZE, GFP_KERNEL);
+	if (!command)
+		return -ENOMEM;
+	ret = ane_fw_load_encode(command, program);
+	if (ret)
+		goto free;
+	/* Later programs in this firmware boot are allowed: the transport queues
+	 * the first EXECUTE after a program change (stale BAR context).
+	 */
+	ret = ane_fw_command(b, ANE_FW_IO, command, ANE_FW_LOAD_SIZE,
+			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (ret)
+		goto failed;
+	call = program->call;
+	call.key.program = get_unaligned_le32(command + 0x1b8);
+	if (call.key.program == U32_MAX) {
+		ret = -EPROTO;
+		goto failed;
+	}
+	memset(command, 0, ANE_FW_CREATE_SIZE);
+	put_unaligned_le16(ANE_H16_CREATE_PROCESS, command + 4);
+	put_unaligned_le32(call.key.program, command + 8);
+	ret = ane_fw_command(b, ANE_FW_IO, command, ANE_FW_CREATE_SIZE,
+			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (ret)
+		goto failed;
+	if (get_unaligned_le32(command + 8) != call.key.program) {
+		ret = -EPROTO;
+		goto failed;
+	}
+	call.key.process = get_unaligned_le32(command + 0xc);
+	for (unsigned int i = 0; i < b->transport.shared_count; i++) {
+		if (b->transport.shared_tags[i] == ANE_FW_SHARED_EXPP &&
+		    b->transport.shared[i].size == SZ_2M && !b->transport.shared_retired[i]) {
+			if (expp != ANE_FW_SHARED_MAX) {
+				ret = -EPROTO;
+				goto failed;
+			}
+			expp = i;
+		}
+	}
+	if (expp == ANE_FW_SHARED_MAX) {
+		ret = -EPROTO;
+		goto failed;
+	}
+	call.key.uuid = ++b->uuid;
+	for (size_t i = 0; i < output->size; i++)
+		((u8 *)output->cpu)[i] = ((const u8 *)expected)[i] ^ 0xff;
+	dma_wmb();
+	deadline = ktime_get_ns() + ANE_FW_TIMEOUT_NS;
+	ret = ane_fw_gate(b, 0, deadline);
+	if (ret)
+		goto failed;
+	ret = ane_h16_execute_encode(command, ANE_H16_EXECUTE_BASE_SIZE, &call);
+	if (ret)
+		goto failed;
+	ret = ane_fw_command(b, ANE_FW_DATA_CHAIN, command, ANE_H16_EXECUTE_BASE_SIZE, deadline);
+	if (ret)
+		goto failed;
+	/* UUID and all IDs are installed locally before the publish above. */
+	ret = ane_fw_program_wait(b, &call.key, deadline);
+	if (ret)
+		goto failed;
+	dma_rmb();
+	if (memcmp(output->cpu, expected, output->size)) {
+		dev_err(&b->pdev->dev, "ANE terminal report without expected output\n");
+		ret = -EIO;
+		goto failed;
+	}
+	ret = ane_fw_gate(b, 1, deadline);
+	if (ret)
+		goto failed;
+	memset(command, 0, 16);
+	put_unaligned_le16(ANE_H16_TERMINATE_PROCESS, command + 4);
+	put_unaligned_le32(call.key.program, command + 8);
+	put_unaligned_le32(call.key.process, command + 12);
+	ret = ane_fw_command(b, ANE_FW_IO, command, 16, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (ret)
+		goto failed;
+	memset(command, 0, 12);
+	put_unaligned_le16(ANE_H16_UNLOAD_PROGRAM, command + 4);
+	put_unaligned_le32(call.key.program, command + 8);
+	b->transport.allow_free = true;
+	deadline = ktime_get_ns() + ANE_FW_TIMEOUT_NS;
+	ret = ane_fw_command(b, ANE_FW_IO, command, 12, deadline);
+	if (ret)
+		goto failed;
+	while (!b->transport.shared_retired[expp]) {
+		if (ktime_get_ns() >= deadline) {
+			ret = -ETIMEDOUT;
+			goto failed;
+		}
+		ret = ane_fw_transport_shared(&b->transport);
+		if (ret && ret != -EAGAIN)
+			goto failed;
+		ane_fw_relax(b);
+	}
+	b->transport.allow_free = false;
+	dev_info(&b->pdev->dev, "ANE program: UUID completion and exact output verified; FREE acknowledged\n");
+	ret = 0;
+	goto free;
+failed:
+	ane_fw_quarantine(b, ret);
+free:
+	kfree(command);
+	return ret;
+}

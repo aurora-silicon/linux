@@ -93,6 +93,7 @@
 #include <crypto/sha2.h>
 
 #include "ane_fw_platform.h"
+#include "ane_fw_cold.h"
 #include "ane_h16_protocol.h"
 #include "ane_h16_pending.h"
 #include "ane_h16_resources.h"
@@ -3099,18 +3100,18 @@ static int __init ane_rtclient_init(void)
 
 		if (!soc->platform)
 			continue;
-		if (soc->platform->owner == ANE_FW_OWNER_EXCLAVE) {
-			of_node_put(np);
-			pr_info("ane: H17 ANE: Linux exclave ownership handoff unavailable; refusing registration\n");
-			return -EOPNOTSUPP;
-		}
+		if (!of_device_is_available(np))
+			continue;
 		pdev = of_find_device_by_node(np);
 		of_node_put(np);
 		if (!pdev) {
 			pr_info("ane: H16 ANE: firmware transport unvalidated; keeping disabled\n");
 			return -EOPNOTSUPP;
 		}
-		ret = ane_fw_platform_preflight(pdev, soc->platform);
+		if (soc->platform->soc == 0x8140)
+			ret = ane_fw_staged_init(pdev, soc->platform);
+		else
+			ret = ane_fw_platform_preflight(pdev, soc->platform);
 		put_device(&pdev->dev);
 		if (ret)
 			return ret;
@@ -3129,6 +3130,8 @@ module_init(ane_rtclient_init);
 
 static void __exit ane_rtclient_exit(void)
 {
+	if (ane_fw_staged_exit())
+		return;
 	platform_driver_unregister(&ane_rtclient_driver);
 	ane_t6021_trace_free();
 }

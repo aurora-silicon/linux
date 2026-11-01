@@ -386,7 +386,7 @@ then exercise command, geometry, tensor, aperture, symbol, relocation and
 digest refusal paths. No hardware inference result is implied.
 
 H13 timeout and engine recovery
-==============================
+=======================
 
 The host task-manager path (``ane.ko``) gives each submission one second,
 including DART fault-drain retries. An expired submission returns
@@ -706,3 +706,6 @@ teardown, the second-LOAD refusal, bad LOAD/CREATE replies, mismatched
 UUIDs and IDs, and state-2 quarantine.
 ``tools/testing/selftests/drivers/ane/h16-run.py`` loads the pinned add-128
 HWX, runs it twice with poisoned output and compares with ``expected.bin``.
+=======
+For the experimental T8140 cold AP-direct stages and their ownership and
+loader requirements, see :doc:`apple-ane-cold`.

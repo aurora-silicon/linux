@@ -1763,48 +1763,57 @@
 		};
 
 		ane_dart0: iommu@401800000 {
-			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			compatible = "apple,t8140-ane-dart", "apple,t8140-dart",
+				     "apple,t8110-dart";
 			reg = <0x4 0x01800000 0x0 0xc000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			apple,dma-range = <0x100 0x0 0x300 0x0>;
 			status = "disabled";
 		};
 
 		ane_dart1: iommu@401820000 {
-			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			compatible = "apple,t8140-ane-dart", "apple,t8140-dart",
+				     "apple,t8110-dart";
 			reg = <0x4 0x01820000 0x0 0x20000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			apple,dma-range = <0x100 0x0 0x300 0x0>;
 			status = "disabled";
 		};
 
 		ane_dart2: iommu@401840000 {
-			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			compatible = "apple,t8140-ane-dart", "apple,t8140-dart",
+				     "apple,t8110-dart";
 			reg = <0x4 0x01840000 0x0 0x20000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			apple,dma-range = <0x100 0x0 0x300 0x0>;
 			status = "disabled";
 		};
 
-		/* The T8140 firmware and child power sequence need their own backend. */
+		/* Cold AP-direct is staged; production nodes remain disabled. */
 		ane: ane@400000000 {
 			compatible = "apple,t8140-ane";
-			reg = <0x4 0x0 0x0 0x2000000>;
-			reg-names = "engine";
+			reg = <0x4 0x0 0x0 0x2000000>,
+			      <0x3 0x00700000 0x0 0x18000>,
+			      <0x3 0x00726680 0x0 0x34>;
+			reg-names = "engine", "pmgr", "pwgate";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 655 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
 			power-domains = <&ps_ane_sys>;
+			apple,firmware-preloaded;
+			apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+			/* Inclusive SID0 identity windows from the ADT. */
+			apple,dapf-ranges = /bits/ 64 <0x321668000 0x321668003
+						     0x30070c000 0x30070c013
+						     0x300700290 0x300700293
+						     0x482668000 0x482668003>;
 			status = "disabled";
 		};
 	};

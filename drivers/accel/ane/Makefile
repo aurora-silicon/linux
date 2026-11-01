@@ -9,7 +9,7 @@ obj-$(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST) += ane_fw_platform_test.o \
 	ane_fw_protocol_test.o ane_h16_tasks_test.o ane_h16_execute_test.o \
 	ane_fw_transport_test.o ane_h16_boot_test.o \
 	ane_h16_pending_test.o ane_h16_hwx_test.o ane_h16_preload_test.o \
-	ane_h16_program_test.o
+	ane_h16_program_test.o ane_fw_cold_test.o
 
 ane-y := \
 	ane_drv.o \
@@ -22,6 +22,7 @@ ane_t6021-y := \
 	ane_fw_platform.o \
 	ane_h16_backend.o \
 	ane_h16_accel.o \
+	ane_fw_cold.o \
 	ane_t6021_rtclient_main.o \
 	ane_t6021_fwload.o \
 	ane_t6021_boot.o

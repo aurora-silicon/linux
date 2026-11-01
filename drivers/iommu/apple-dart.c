@@ -313,6 +313,8 @@ struct apple_dart {
 	/* Resources reachable by a retained domain outlive device removal. */
 	bool retained;
 	bool retained_mtp;
+	/* Cold ANE owns SID0 only; all other streams remain inherited. */
+	bool cold_ane;
 	u16 managed_sids;
 	bool managed_failed;
 	/* Serialize owned TCR publication against IRQ quarantine. */
@@ -1927,7 +1929,7 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	struct apple_dart_stream_map stream_map;
 	int i;
 
-	if (dart->managed_sids)
+	if (dart->managed_sids || dart->cold_ane)
 		return -EBUSY;
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
@@ -2284,7 +2286,13 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	if (dart->managed_sids) {
+	if (dart->cold_ane) {
+		if (bitmap_weight(stream_map->sidmap, dart->num_streams) != 1 ||
+		    !test_bit(0, stream_map->sidmap))
+			return -EPERM;
+		apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->enable_streams) | BIT(0),
+				  dart->hw->enable_streams);
+	} else if (dart->managed_sids) {
 		/* Admission owns only ordinary SIDs 1/2, both in the first word. */
 		apple_dart_writel(dart, stream_map->sidmap[0] & dart->managed_sids,
 				  dart->hw->enable_streams);
@@ -2584,9 +2592,11 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 			spin_unlock_irqrestore(&dart->managed_lock, flags);
 			if (ret)
 				goto err;
-		} else if (!stream_map->dart->locked)
-			apple_dart_setup_translation(dart_domain, stream_map);
-		else {
+		} else if (!stream_map->dart->locked) {
+			ret = apple_dart_setup_translation(dart_domain, stream_map);
+			if (ret)
+				goto err;
+		} else {
 			ret = apple_dart_setup_translation_locked(dart_domain, stream_map);
 			if (ret)
 				goto err;
@@ -2879,6 +2889,8 @@ static int apple_dart_of_xlate(struct device *dev,
 		return i;
 
 	sid = args->args[0];
+	if (dart->cold_ane && sid != 0)
+		return -EPERM;
 	if (dart->managed_sids &&
 	    (sid <= 0 || sid >= 16 || !(dart->managed_sids & BIT(sid))))
 		return -EINVAL;
@@ -2918,7 +2930,7 @@ static int apple_dart_of_xlate(struct device *dev,
 			return -EINVAL;
 	}
 
-	cfg->supports_bypass &= dart->supports_bypass && !dart->managed_sids;
+	cfg->supports_bypass &= dart->supports_bypass && !dart->managed_sids && !dart->cold_ane;
 	cfg->locked |= dart->locked;
 
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
@@ -3947,6 +3959,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart");
+	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
+		return -EOPNOTSUPP;
 	dart->per_stream = of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 			   of_device_is_compatible(dev->of_node, "apple,t8142-dart");
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
@@ -3987,7 +4002,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (tunneled)
 		dart->regs = apple_dart_platform_ioremap_np_resource(pdev, 0,
 							      &res);
-	else if (dart->managed_sids || dart->preserve_display)
+	else if (dart->managed_sids || dart->preserve_display || dart->cold_ane)
 		dart->regs = apple_dart_retained_ioremap(dart, res);
 	else
 		dart->regs = devm_platform_get_and_ioremap_resource(pdev, 0,
@@ -4234,7 +4249,21 @@ params_done:
 		if (ret)
 			goto err_clk_disable;
 	}
-	if (dart->managed_sids) {
+	if (dart->cold_ane) {
+		/* No reset, TCR/TTBR clear, global enable, remap or IRQ ACK.
+		 * Cold acquisition is checked by the staged ANE backend before
+		 * it attaches a private SID0 domain. Even bypass SIDs stay intact.
+		 */
+		if (dart->locked || dart->version != 0x203 || dart->num_streams != 16 ||
+		    !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {
+			ret = -EPERM;
+			goto err_clk_disable;
+		}
+		dart->irq = -1;
+		dart->retained = true;
+		get_device(dev);
+		dev_info(dev, "cold ANE DART: inherited streams preserved; SID0 only\n");
+	} else if (dart->managed_sids) {
 		bool init_bypass = false;
 
 		ret = apple_dart_fault_pending(dart) ? -EBUSY :
@@ -4328,7 +4357,8 @@ params_done:
 		goto err_sysfs_remove;
 
 	/* Retain supplier references; generic suspend/resume is not applicable. */
-	if (!dart->retained_mtp && !dart->managed_sids && !apple_dart_has_borrowed(dart))
+	if (!dart->retained_mtp && !dart->managed_sids && !dart->cold_ane &&
+	    !apple_dart_has_borrowed(dart))
 		pm_runtime_put(dev);
 
 	dev_dbg(
@@ -4464,6 +4494,10 @@ static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
+	if (dart->cold_ane) {
+		dev_warn(&pdev->dev, "cold ANE DART retained until reset\n");
+		return;
+	}
 	if (dart->managed_sids) {
 		apple_dart_managed_quarantine(dart);
 		if (dart->irq >= 0)
@@ -4644,7 +4678,8 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	if (READ_ONCE(dart->commands_gated))
 		return 0;
 	/* Neither retained radio nor display has a qualified suspend boundary. */
-	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
+	if (dart->managed_sids || dart->cold_ane || dart->preserve_display ||
+	    apple_dart_has_borrowed(dart))
 		return -EBUSY;
 	/* The tunneled DART has no state to save when its domain stays on. */
 	if (dart->power_retained || dart->retained_mtp)
@@ -4732,7 +4767,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
-	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
+	if (dart->managed_sids || dart->cold_ane || dart->preserve_display ||
+	    apple_dart_has_borrowed(dart))
 		return -EBUSY;
 
 	/* PCIe-C restored these mappings before starting its downstream link. */

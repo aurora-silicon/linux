@@ -2,6 +2,7 @@
 #ifndef __ANE_H16_EXECUTE_H__
 #define __ANE_H16_EXECUTE_H__
 
+#include <linux/bits.h>
 #include <linux/limits.h>
 
 #include "ane_h16_protocol.h"
@@ -11,6 +12,16 @@
 #define ANE_H16_BUFFER_STRIDE 0x30
 #define ANE_H16_MAX_BUFFERS 64
 #define ANE_H16_CUSTOM_BAR_STRIDE 0x18
+/*
+ * Request flags word. Bit 0 keeps the request off the firmware's direct
+ * submission path and queues it for the full execution loop, which installs
+ * a fresh BAR context. Measured on H17 (T8140): without it, the first job
+ * after the engine ran a different program can write through that program's
+ * stale output binding.
+ */
+#define ANE_H16_EXECUTE_FLAGS 0x30
+#define ANE_H16_EXECUTE_FLAG_QUEUED BIT(0)
+#define ANE_H16_EXECUTE_FLAGS_KNOWN ANE_H16_EXECUTE_FLAG_QUEUED
 /* Conservative observed-version ceiling, not a firmware maximum. */
 #define ANE_H16_MAX_CUSTOM_BARS 2
 
@@ -48,6 +59,7 @@ struct ane_h16_execute {
 	unsigned int buffer_count;
 	const struct ane_h16_custom_bar *bars;
 	unsigned int bar_count;
+	u32 flags;
 };
 
 /*
@@ -66,7 +78,8 @@ ane_h16_execute_encode(void *command, size_t length, const struct ane_h16_execut
 	if (!p || !call || !call->buffers || !call->buffer_count ||
 	    call->buffer_count > ANE_H16_MAX_BUFFERS ||
 	    call->bar_count > ANE_H16_MAX_CUSTOM_BARS ||
-	    (call->bar_count && !call->bars))
+	    (call->bar_count && !call->bars) ||
+	    (call->flags & ~ANE_H16_EXECUTE_FLAGS_KNOWN))
 		return -EINVAL;
 	expected = ANE_H16_EXECUTE_BASE_SIZE + call->bar_count * ANE_H16_CUSTOM_BAR_STRIDE;
 	if (length != expected)
@@ -103,6 +116,7 @@ ane_h16_execute_encode(void *command, size_t length, const struct ane_h16_execut
 	put_unaligned_le32(5, p + 0x18);
 	put_unaligned_le64(call->key.uuid, p + 0x20);
 	put_unaligned_le32(call->buffer_count, p + 0x28);
+	put_unaligned_le32(call->flags, p + ANE_H16_EXECUTE_FLAGS);
 	for (i = 0; i < call->buffer_count; i++) {
 		const struct ane_h16_execute_buffer *b = &call->buffers[i];
 		u8 *d = p + ANE_H16_BUFFER_OFFSET + i * ANE_H16_BUFFER_STRIDE;
