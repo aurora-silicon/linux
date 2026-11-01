@@ -46,9 +46,9 @@ IOCTL_H16_LOAD = ioc(3, 0x07, LOAD.size)
 IOCTL_H16_EXEC = ioc(1, 0x08, EXEC.size)
 
 
-def fixture_module():
-    path = pathlib.Path(__file__).resolve().parent / "h16-fixture.py"
-    spec = importlib.util.spec_from_file_location("h16_fixture", path)
+def load_module(name, file):
+    path = pathlib.Path(__file__).resolve().parent / file
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -78,20 +78,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hwx", type=pathlib.Path, required=True,
                         help="pinned add-128 HWX from prepare_alu")
-    parser.add_argument("--sections", type=pathlib.Path, required=True,
+    parser.add_argument("--sections", type=pathlib.Path,
                         help="directory with generic.bin, operation.bin, procedure.bin "
-                             "and text-properties.bin for this HWX")
+                             "and text-properties.bin for this HWX; default: build them "
+                             "with h16-sections.py")
     parser.add_argument("--device", help="accel node; default: the first ABI 3 H16 node")
     parser.add_argument("--runs", type=int, default=2)
     args = parser.parse_args()
 
-    fixture = fixture_module()
+    fixture = load_module("h16_fixture", "h16-fixture.py")
     hwx = args.hwx.read_bytes()
     if len(hwx) != fixture.HWX_SIZE or hashlib.sha256(hwx).hexdigest() != fixture.HWX_SHA256:
         print("FAIL: HWX is not the pinned add-128 fixture")
         return KSFT_FAIL
     data = fixture.buffers()
-    sections = [(kind, (args.sections / name).read_bytes()) for kind, name in SECTIONS]
+    if args.sections:
+        sections = [(kind, (args.sections / name).read_bytes()) for kind, name in SECTIONS]
+    else:
+        built, ids, refs, _ = load_module("h16_sections", "h16-sections.py").build(hwx)
+        sections = list(zip((kind for kind, _ in SECTIONS), built))
+        print("sections built: buffer IDs", ids, "BAR refs", refs)
 
     path, fd = find_device(args.device)
     if fd is None:
