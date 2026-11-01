@@ -5,7 +5,9 @@ static const struct ave_variant variant = {
 };
 static const struct ave_fw_transport test_transport = { .boot_config = true };
 static const struct ave_fw_abi test_abi = { .transport = &test_transport };
-static const struct ave_fw_layout test_layout = { .abi = &test_abi };
+static const struct ave_fw_layout test_layout = {
+	.abi = &test_abi, .encode_ready = true, .max_slots = 2,
+};
 static u64 coproc[4];
 static u32 mailbox[16];
 static struct ave_dev ave;
@@ -24,6 +26,10 @@ static void init(void)
 	halts = closes = freed = suspends = resumes = schedules = polls = sleep_ms = 0;
 	halt_result = close_result = poll_result = 0;
 	map_fail = ctrl_sticky = stopped_for_sleep = false;
+	stop_seen = power_seen = dma_alloc_fail = dma_attach_fail = dma_map_fail = false;
+	mapping_frees = mapping_unmaps = mapping_detaches = 0;
+	submit_result = 0;
+	test_ctrl_addr = (char *)coproc + regs.ctrl;
 	ave.dev = &dev;
 	dev.drvdata = &ave;
 	ave.variant = &variant;
@@ -48,6 +54,8 @@ static void owners(void)
 		assert(ctx[i].sess);
 		ctx[i].sess->handed = ctx[i].sess->fw_open = true;
 		ctx[i].sess->p.slots = 2;
+		ctx[i].sess->p.codec = AVE_CODEC_H264;
+		ctx[i].sess->hdr.cpu = (void *)1;
 		ave.sessions[i] = &ctx[i];
 		dev.refs++;
 	}
@@ -61,10 +69,24 @@ static void owners(void)
 static void buffer_failure(void)
 {
 	struct vb2_v4l2_buffer input[2][3] = {}, output[2][2] = {};
+	struct dma_buf imported = { .refs = 1 };
 
 	init();
 	owners();
 	for (unsigned int i = 0; i < 2; i++) {
+		struct vb2_buffer *vb = &input[i][0].vb2_buf;
+
+		vb->planes[0].mem_priv = i ?
+			ave_vb2_memops.attach_dmabuf(vb, &dev, &imported, SZ_16K) :
+			ave_vb2_memops.alloc(vb, &dev, SZ_16K);
+		assert(!IS_ERR(vb->planes[0].mem_priv));
+		if (i)
+			assert(!ave_vb2_memops.map_dmabuf(vb->planes[0].mem_priv));
+		submit_ctx = &ctx[i];
+		submit_slot = 0;
+		mutex_lock(&ave.hw_lock);
+		assert(!ave_cmd_process(&ctx[i], 0, &input[i][0], 0, 0, false));
+		mutex_unlock(&ave.hw_lock);
 		ctx[i].sess->slot[0].src = &input[i][0];
 		/* One idle owner and one with a firmware-owned frame. */
 		ctx[i].sess->busy = i;
@@ -94,7 +116,19 @@ static void buffer_failure(void)
 		for (unsigned int n = 0; n < 2; n++)
 			assert(output[i][n].completions == 1 &&
 			       output[i][n].state == VB2_BUF_STATE_ERROR);
+		/* DQBUF/REQBUFS/close immediately after ERROR: vb2 lets go. */
+		if (i) {
+			ave_vb2_memops.unmap_dmabuf(input[i][0].vb2_buf.planes[0].mem_priv);
+			ave_vb2_memops.detach_dmabuf(input[i][0].vb2_buf.planes[0].mem_priv);
+		} else {
+			ave_vb2_memops.put(input[i][0].vb2_buf.planes[0].mem_priv);
+		}
+		input[i][0].vb2_buf.planes[0].mem_priv = NULL;
+		assert(!mapping_frees && !mapping_unmaps && !mapping_detaches);
 	}
+	/* Even dropping the importing fd cannot destroy its retained attachment. */
+	dma_buf_put(&imported);
+	assert(imported.refs == 1 && dev.dma_refs == 1);
 	assert(!dev.refs && !freed && ave.failed_sessions && !closes);
 	/* A QBUF racing the failure is returned instead of silently requeued. */
 	{
@@ -113,9 +147,12 @@ static void buffer_failure(void)
 	/* CTRL=0 alone is not proof of a power cycle. */
 	assert(ave_fw_prepare_restart(&ave) == -EAGAIN && !freed);
 	*(u32 *)(ave.coproc + regs.boot_arg) = 0;
+	power_seen = true; /* VENC and its DART have now lost power. */
 	assert(!ave_fw_prepare_restart(&ave));
 	mutex_unlock(&ave.hw_lock);
 	assert(freed == 2 && !ave.failed_sessions && !ave.inject_wedge);
+	assert(stop_seen && mapping_frees == 2 && mapping_unmaps == 1 && mapping_detaches == 1);
+	assert(!imported.refs && !dev.dma_refs);
 	assert(ave.fw_state == AVE_FW_HALTED);
 	m2m[0].dst.streaming = true;
 	ave_stop_streaming(&m2m[0].src);
@@ -193,6 +230,7 @@ static void busy_ring_deadline(void)
 	ave_poll_work(&ctx[0].poll_work.work);
 	ave_poll_work(&ctx[1].poll_work.work);
 	mutex_lock(&ave.hw_lock);
+	stop_seen = power_seen = true;
 	ave_sess_reap(&ave); /* Fake reset for test cleanup only. */
 	mutex_unlock(&ave.hw_lock);
 }
@@ -234,8 +272,108 @@ static void strict_6070_recovery(void)
  assert(readl(ave.coproc + regs.ctrl) == AVE_COPROC_CTRL_RUN);
 }
 
+/* An uncertain send failure must keep its pin even without a slot src. */
+static void failed_submission(void)
+{
+	struct vb2_v4l2_buffer input = {};
+	void *mem;
+
+	init();
+	owners();
+	mem = ave_vb2_memops.alloc(&input.vb2_buf, &dev, SZ_16K);
+	assert(!IS_ERR(mem));
+	input.vb2_buf.planes[0].mem_priv = mem;
+	submit_ctx = &ctx[0];
+	submit_slot = 0;
+	submit_result = -EIO;
+	mutex_lock(&ave.hw_lock);
+	assert(ave_cmd_process(&ctx[0], 0, &input, 0, 0, false) == -EIO);
+	mutex_unlock(&ave.hw_lock);
+	assert(!ctx[0].sess->slot[0].src && ctx[0].sess->slot[0].input_mem);
+	ave_vb2_memops.put(mem); /* The caller returns this failed submission. */
+	ave_poll_work(&ctx[0].poll_work.work);
+	ave_poll_work(&ctx[1].poll_work.work);
+	assert(!mapping_frees);
+	for (unsigned int i = 0; i < AVE_RECOVERY_ATTEMPTS; i++)
+		assert(ave_recovery_allow(&ave.recovery, jiffies));
+	assert(ave_runtime_suspend(&dev) == -EBUSY);
+	assert(!stop_seen && !mapping_frees && !freed);
+	jiffies += AVE_RECOVERY_WINDOW;
+	ctrl_sticky = true;
+	assert(ave_runtime_suspend(&dev) == -EIO);
+	assert(!stop_seen && !mapping_frees && !freed);
+	ctrl_sticky = false;
+	assert(!ave_runtime_suspend(&dev));
+	assert(stop_seen && !mapping_frees);
+	assert(ave_fw_prepare_restart(&ave) == -EAGAIN);
+	*(u32 *)(ave.coproc + regs.boot_arg) = 0;
+	power_seen = true;
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_fw_prepare_restart(&ave));
+	mutex_unlock(&ave.hw_lock);
+	assert(mapping_frees == 1 && freed == 2);
+}
+
+/* Start can expose scratch even if submission reports failure. */
+static void failed_start(void)
+{
+	init();
+	owners();
+	submit_ctx = &ctx[0];
+	ctx[0].sess->handed = false;
+	submit_result = -EIO;
+	mutex_lock(&ave.hw_lock);
+	assert(ave_cmd_start(&ctx[0]) == -EIO);
+	assert(ctx[0].sess->handed);
+	mutex_unlock(&ave.hw_lock);
+	ave_poll_work(&ctx[0].poll_work.work);
+	ave_poll_work(&ctx[1].poll_work.work);
+	assert(!freed && ave.failed_sessions);
+	assert(!ave_runtime_suspend(&dev));
+	assert(stop_seen && !freed);
+	*(u32 *)(ave.coproc + regs.boot_arg) = 0;
+	power_seen = true;
+	mutex_lock(&ave.hw_lock);
+	assert(!ave_fw_prepare_restart(&ave));
+	mutex_unlock(&ave.hw_lock);
+	assert(freed == 2);
+}
+
+/* Allocator failures and normal vb2-only lifetimes do not leak references. */
+static void mapping_lifetimes(void)
+{
+	struct vb2_buffer vb = {};
+	struct dma_buf dbuf = { .refs = 1 };
+	void *mem;
+
+	init();
+	dma_alloc_fail = true;
+	assert(IS_ERR(ave_vb2_memops.alloc(&vb, &dev, SZ_16K)));
+	dma_alloc_fail = false;
+	dma_attach_fail = true;
+	assert(IS_ERR(ave_vb2_memops.attach_dmabuf(&vb, &dev, &dbuf, SZ_16K)));
+	assert(dbuf.refs == 1 && !dev.dma_refs);
+	dma_attach_fail = false;
+	mem = ave_vb2_memops.attach_dmabuf(&vb, &dev, &dbuf, SZ_16K);
+	assert(!IS_ERR(mem));
+	dma_map_fail = true;
+	assert(ave_vb2_memops.map_dmabuf(mem) == -EIO);
+	dma_map_fail = false;
+	assert(!ave_vb2_memops.map_dmabuf(mem));
+	ave_vb2_memops.unmap_dmabuf(mem);
+	assert(!mapping_unmaps);
+	assert(!ave_vb2_memops.map_dmabuf(mem)); /* Reuses the retained mapping. */
+	ave_vb2_memops.unmap_dmabuf(mem);
+	ave_vb2_memops.detach_dmabuf(mem);
+	assert(mapping_unmaps == 1 && mapping_detaches == 1 && mapping_frees == 1);
+	assert(dbuf.refs == 1 && !dev.dma_refs);
+}
+
 int main(void)
 {
+	mapping_lifetimes();
+	failed_submission();
+	failed_start();
 	strict_6070_recovery();
 	buffer_failure();
 	sleep_guarantees();
@@ -243,6 +381,6 @@ int main(void)
 	busy_ring_deadline();
 	restore_data();
 	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
-	     "PM rollback, DATA, IPC deadline");
+	     "PM rollback, DATA, IPC deadline, MMAP/dma-buf release ordering");
 	return 0;
 }

@@ -404,3 +404,4 @@ module_platform_driver(ave_driver);
 
 MODULE_DESCRIPTION("Apple AVE video encoder");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("DMA_BUF");
