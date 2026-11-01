@@ -387,9 +387,11 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 	 */
 	err = brcmf_fil_iovar_data_get(ifp, "country", &country, sizeof(country));
 	if (err)
-		brcmf_dbg(INFO, "Retrieving initial country failed, %d\n", err);
+		wiphy_info(drvr->wiphy, "Initial firmware country unavailable: %d\n",
+			   err);
 	else
-		brcmf_info("Initial firmware country: %.4s (%.4s/%d)\n",
+		wiphy_info(drvr->wiphy,
+			   "Initial firmware country: %.4s (%.4s/%d)\n",
 			   country.country_abbrev, country.ccode,
 			   le32_to_cpu(country.rev));
 
