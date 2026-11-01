@@ -1,18 +1,29 @@
-policy_module(aurora_sep, 1.0.0)
+policy_module(aurora_sep, 1.1.0)
 
 ########################################
 #
 # Declarations
 #
 
-# /dev/sep-bio, the apple_sep driver's Touch ID device.
-type sep_bio_device_t;
-dev_node(sep_bio_device_t)
+# /dev/sep-bio, the apple_sep driver's Touch ID device. The distribution
+# packages build this module under the same name, so the type name has to
+# match theirs: a module that drops the type leaves the node with a context
+# the policy no longer knows.
+type aurora_sep_device_t;
+dev_node(aurora_sep_device_t)
 
 ########################################
 #
 # Local policy
 #
+
+gen_require(`
+	type init_t;
+')
+
+# The units' helpers activate Touch ID with a read-only open and ask the
+# driver about its sensor with an ioctl. Let them where they run as init_t.
+allow init_t aurora_sep_device_t:chr_file { getattr open read ioctl };
 
 # fprintd, through libfprint's aurora driver, is the device's only user.
 optional_policy(`
@@ -20,5 +31,10 @@ optional_policy(`
 		type fprintd_t;
 	')
 
-	allow fprintd_t sep_bio_device_t:chr_file rw_chr_file_perms;
+	allow fprintd_t aurora_sep_device_t:chr_file rw_chr_file_perms;
+
+	# libfprint hides the reader while the lid is closed. It follows the
+	# lid through the SW_LID switch of an input event device, which the
+	# targeted policy keeps fprintd from reading.
+	dev_read_input(fprintd_t)
 ')
