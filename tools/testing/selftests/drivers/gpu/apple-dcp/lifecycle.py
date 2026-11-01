@@ -1749,6 +1749,9 @@ static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
 static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
     struct drm_atomic_commit *s)
 { (void)d; (void)c; (void)s; return 0; }
+/* The panel of a desktop 26.6 machine takes VRR_ENABLED live. */
+static bool dcp_vrr_live(struct apple_dcp *d)
+{ return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
 static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return -ENODEV; }
 static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
@@ -1807,10 +1810,10 @@ DESKTOP_VRR    dcp.crashed = true;
     return 0;
 }
 """
-    # Desktop 26.6 takes VRR_ENABLED with the next frame on the panel and the
-    # external processors alike (the latter reselect their mode in flush):
-    # compositors toggle it in plain page flips, so a VRR_ENABLED change
-    # must never become a DRM mode set.
+    # Desktop 26.6 takes VRR_ENABLED live on the panel (main display), with
+    # the next frame: compositors toggle it in plain page flips, so there a
+    # VRR_ENABLED change must never become a mode set.  The external
+    # processors ignore a live minimum rate and still apply it with a mode set.
     desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
@@ -1828,7 +1831,7 @@ DESKTOP_VRR    dcp.crashed = true;
         state.no_old_crtc = old_vrr == 2;
         state.old_crtc.vrr_enabled = old_vrr == 1;
         assert(dcp_crtc_atomic_check(&crtc, &state) == 0);
-        bool expected = false;
+        bool expected = !panel && enable && old_vrr != 2 && (old_vrr == 1) != vrr;
         if (state.crtc.mode_changed != expected) {
             fprintf(stderr, "desktop panel=%u enable=%u old_vrr=%u vrr=%u: mode_changed=%d expected %d\n",
                     panel, enable, old_vrr, vrr, state.crtc.mode_changed, expected);

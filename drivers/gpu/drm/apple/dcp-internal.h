@@ -274,19 +274,20 @@ struct dcp_desktop_state {
 	 * the firmware was last given.  Zero when not installed that way.
 	 */
 	u32 vrr_min_on, vrr_min_off, vrr_min_sent;
-	/* VRR_ENABLED as of the last mode set (external processors). */
-	bool vrr_requested;
 	/* The frame's colour matrix, sent after an adaptive sync update. */
 	struct iomfb_set_matrix_req matrix;
 	/*
 	 * HDR10 static metadata (external processors): the pinned
-	 * dcpav-service-epic service, and the Type 1 body last sent on this
-	 * link (taken or refused), if any.  hdr_lock protects both.
+	 * dcpav-service-epic service, the Type 1 body last sent on this link
+	 * (taken or refused), if any, and whether the firmware took one, so
+	 * that the link carries a Dynamic Range and Mastering InfoFrame.
+	 * hdr_lock protects all of them.
 	 */
 	spinlock_t hdr_lock;
 	struct apple_epic_service *av_service;
 	u8 hdr_sent[24];
 	bool hdr_sent_valid;
+	bool hdr_infoframe;
 	u32 present_id;
 	bool present_pending;
 	/*

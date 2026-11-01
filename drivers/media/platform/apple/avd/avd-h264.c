@@ -22,6 +22,7 @@
 
 #include "avd.h"
 #include "avd-inst.h"
+#include "avd-h264-params.h"
 
 #define H264_SCL_DIMS	(0x1000000 | ((64 / 4) << 5) | (((16 / 4) << 5) - 1))
 
@@ -58,12 +59,12 @@ struct avd_h264_run {
 };
 
 /*
- * One bank per picture in flight. With the queued transport two pictures of
- * a stream overlap (VP of one, PP of the other), so everything the hardware
- * reads or writes while decoding a picture, and the CPU copies of its slices,
- * exists once per bank. The legacy transport uses a single bank.
+ * One bank per picture in flight. The queued transport retains a bank for PP
+ * while the advertised VP pool processes later pictures. Everything the
+ * hardware reads or writes for a picture, and the CPU copies of its slices,
+ * exists once per bank. Old queue firmware keeps two; legacy uses one.
  */
-#define AVD_H264_BANKS	2
+#define AVD_H264_BANKS	AVD_MAX_FRAMES
 
 struct avd_bank {
 	bool monochrome;
@@ -75,6 +76,7 @@ struct avd_bank {
 	size_t alloc_slice_num;
 	/* allocated size of the held slices */
 	size_t slice_bytes;
+	u32 last_mb;
 
 	struct avd_h264_bufs {
 		/* VP to PP instruction FIFO for pictures of this bank */
@@ -220,9 +222,21 @@ static void stream_scaling(struct avd_ctx *ctx, struct avd_h264_run *run)
 	}
 }
 
+static bool avd_h264_intra_header(const struct avd_h264_run *run)
+{
+	/*
+	 * frame_num gaps can evict every real reference. A non-IDR I picture
+	 * still decodes without references, but an inter header has no way to
+	 * encode an empty reference table: its count lives in the first entry.
+	 * Use the same reference-free header as an IDR picture in that case.
+	 */
+	return (run->decode_params->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) ||
+	       (!run->num_valid &&
+		run->slice_params->slice_type == V4L2_H264_SLICE_TYPE_I);
+}
+
 static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
-	const struct v4l2_ctrl_h264_decode_params *decode = run->decode_params;
 	const struct v4l2_ctrl_h264_sps *sps = run->sps;
 	const struct v4l2_ctrl_h264_pps *pps = run->pps;
 	struct avd_dev *avd = ctx->dev;
@@ -230,11 +244,10 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	u32 bytesperline;
 	u32 width = (sps->pic_width_in_mbs_minus1 + 1) * 16;
 	u32 height = (sps->pic_height_in_map_units_minus1 + 1) * 16;
+	bool intra_header = avd_h264_intra_header(run);
 
 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
-		     AVD_OP_HDR_FLAG_INTRA(
-			     decode->flags &
-			     V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC) |
+		     AVD_OP_HDR_FLAG_INTRA(intra_header) |
 		     AVD_OP_HDR_CONST |
 		     AVD_OP_HDR_FLAG_PIPE_STATE(
 			     !(avd->variant->quirks & AVD_QUIRK_NO_PIPE_STATE)),
@@ -267,8 +280,7 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 
 	push(H264_FLAG_ENTROPY_CODING_MODE(
 		     pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) |
-		     H264_FLAG_NOT_IDR(!(decode->flags &
-					 V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC)) |
+		     H264_FLAG_NOT_IDR(!intra_header) |
 		     h264_FLAG_CI_PRED(
 			     pps->flags &
 			     V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED),
@@ -319,7 +331,7 @@ static void stream_hdr(struct avd_ctx *ctx, struct avd_h264_run *run)
 	push(0, "cm3_mark_end_section");
 	push(((height - 1) << 16) | (width - 1), "hdr_54_height_width");
 
-	if (!(decode->flags & V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC))
+	if (!intra_header)
 		stream_refs(ctx, run);
 
 	if (pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT)
@@ -499,7 +511,8 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 			push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(0) |
 				     AVD_OP_REF_LOOP_IDX(i) |
 				     AVD_OP_REF_DBP_IDX(
-					     sl->ref_pic_list0[i].index),
+					     avd_h264_ref_slot(decode,
+							       sl->ref_pic_list0[i].index)),
 			     "slc_6e8_cmd_ref_list_0");
 
 		if (sl->slice_type == V4L2_H264_SLICE_TYPE_B) {
@@ -509,7 +522,8 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 				push(AVD_OP_REF | AVD_OP_REF_LIST_IDX(1) |
 					     AVD_OP_REF_LOOP_IDX(i) |
 					     AVD_OP_REF_DBP_IDX(
-						     sl->ref_pic_list1[i].index),
+						     avd_h264_ref_slot(decode,
+								       sl->ref_pic_list1[i].index)),
 				     "slc_6e8_cmd_ref_list_0");
 		}
 		stream_weights(ctx, run);
@@ -608,7 +622,21 @@ static int avd_h264_validate_pps(struct avd_ctx *ctx,
 				 const struct v4l2_ctrl_h264_pps *pps)
 {
 	if (pps->num_slice_groups_minus1 != 0) {
-		dev_err(ctx->dev->dev, "pps->num_slice_groups_minus1 != 0");
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 slice groups (FMO) are unsupported: no slice-group map in the stateless API\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int avd_h264_validate_slice(struct avd_ctx *ctx,
+				   const struct v4l2_ctrl_h264_slice_params *sl)
+{
+	if (!avd_h264_slice_type_supported(sl)) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 slice type %u is unsupported (SP/SI switching pictures)\n",
+				    sl->slice_type);
 		return -EINVAL;
 	}
 
@@ -621,9 +649,13 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	if (sps->chroma_format_idc > 2)
 		/* Only 4:0:0, 4:2:0 and 4:2:2 are supported */
 		return -EINVAL;
-	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8)
-		/* Luma and chroma bit depth mismatch */
+	if (sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 unequal luma/chroma bit depths (%u/%u) are unsupported\n",
+				    sps->bit_depth_luma_minus8 + 8,
+				    sps->bit_depth_chroma_minus8 + 8);
 		return -EINVAL;
+	}
 	if (sps->bit_depth_luma_minus8 != 0 && sps->bit_depth_luma_minus8 != 2)
 		/* Only 8 and 10 bit have capture formats */
 		return -EINVAL;
@@ -644,14 +676,7 @@ static void avd_h264_drop_bank_slices(struct avd_ctx *ctx, struct avd_bank *bank
 		avd_buf_free(ctx->dev, &bank->slices[i]);
 	bank->slice_num = 0;
 	bank->slice_bytes = 0;
-}
-
-/* Free the slices held for the picture being built. */
-static void avd_h264_drop_slices(struct avd_ctx *ctx)
-{
-	struct avd_h264_ctx *h264_ctx = ctx->priv;
-
-	avd_h264_drop_bank_slices(ctx, h264_ctx->b);
+	bank->last_mb = 0;
 }
 
 static void avd_h264_stop(struct avd_ctx *ctx)
@@ -702,7 +727,7 @@ static int avd_h264_start(struct avd_ctx *ctx)
 
 	ctx->priv = h264_ctx;
 	/* Overlap pictures only where the firmware chains VP to PP itself. */
-	h264_ctx->nbanks = avd_backend_is_qfw(ctx->dev) ? AVD_H264_BANKS : 1;
+	h264_ctx->nbanks = avd_qfw_picture_banks(ctx->dev, AVD_CODEC_H264);
 	h264_ctx->b = &h264_ctx->bank[0];
 
 	for (unsigned int i = 0; i < h264_ctx->nbanks; i++) {
@@ -808,8 +833,8 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx, size_t max_slices)
 /*
  * Check that every reference in the slice's ref lists points at a DPB entry
  * that is VALID. stream_refs() only pushes a reference header (and its RVRA
- * addresses) for VALID entries and the slice command indexes those by DPB
- * index, so a reference to any other entry makes the VP dereference an
+ * addresses) for VALID entries and the slice command indexes their packed
+ * header slots, so a reference to any other entry makes the VP dereference an
  * uninitialised reference slot: that ends in a DART translation fault, a
  * frame that never completes and a watchdog reset of the VP, which also
  * disturbs the other contexts. It happens whenever a client starts decoding
@@ -916,21 +941,67 @@ static int avd_h264_pick_bank(struct avd_ctx *ctx, struct vb2_v4l2_buffer *dst)
 	return 0;
 }
 
+/* A rejected slice must never release the other picture's DMA-owned bank. */
+static void avd_h264_abort_picture(struct avd_ctx *ctx,
+				   struct vb2_v4l2_buffer *dst)
+{
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
+	struct avd_bank *bank = h264_ctx->b;
+	struct avd_decoded_buffer *buf = vb2_to_avd_decoded_buf(&dst->vb2_buf);
+
+	if (!bank->busy || bank->submitted ||
+	    buf->bank != bank - h264_ctx->bank + 1)
+		return;
+	avd_h264_drop_bank_slices(ctx, bank);
+	bank->busy = false;
+	buf->bank = 0;
+}
+
 static int avd_h264_run(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	struct v4l2_h264_reflist_builder reflist_builder;
 	struct avd_h264_run run;
+	size_t held = h264_ctx->b->busy && !h264_ctx->b->submitted ?
+		      h264_ctx->b->slice_num : 0;
 	int ret;
 
 	avd_h264_run_preamble(ctx, &run);
 
-	if (run.slice_params && is_new_frame(run.slice_params)) {
+	if (!run.sps || !run.pps || !run.slice_params || !run.decode_params) {
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
+
+	/* Recheck controls applied from this request before building instructions. */
+	ret = avd_h264_validate_sps(ctx, run.sps);
+	if (!ret)
+		ret = avd_h264_validate_pps(ctx, run.pps);
+	if (!ret)
+		ret = avd_h264_validate_slice(ctx, run.slice_params);
+	if (ret)
+		goto err_free_jobs;
+
+	/* Check before pick_bank() can discard an unfinished picture's slices. */
+	if (!avd_h264_slice_order_supported(held, h264_ctx->b->last_mb,
+					    run.slice_params->first_mb_in_slice)) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "H.264 arbitrary slice order (ASO) is unsupported\n");
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
+
+	if (is_new_frame(run.slice_params)) {
 		ret = avd_h264_pick_bank(ctx, run.base.bufs.dst);
-		if (ret) {
-			avd_run_postamble(ctx, &run.base);
-			return ret;
-		}
+		if (ret)
+			goto err_free_jobs;
+	}
+
+	if (!h264_ctx->b->busy || h264_ctx->b->submitted ||
+	    vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf)->bank !=
+				   h264_ctx->b - h264_ctx->bank + 1) {
+		ret = -EINVAL;
+		goto err_free_jobs;
 	}
 
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
@@ -942,8 +1013,8 @@ static int avd_h264_run(struct avd_ctx *ctx)
 					       &run.slice_data_off)) {
 		dev_dbg_ratelimited(ctx->dev->dev,
 				    "slice has no data after its header\n");
-		avd_run_postamble(ctx, &run.base);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_free_jobs;
 	}
 
 	if (!avd_h264_slice_fits(run.sps, h264_ctx->b->slice_num,
@@ -951,8 +1022,6 @@ static int avd_h264_run(struct avd_ctx *ctx)
 				 ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage)) {
 		dev_err_ratelimited(ctx->dev->dev,
 				    "too many slices for one picture, dropping it\n");
-		/* The unsubmitted job table points at the dropped slices. */
-		avd_h264_drop_slices(ctx);
 		ret = -EINVAL;
 		goto err_free_jobs;
 	}
@@ -969,6 +1038,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		goto err_free_jobs;
 	memcpy(h264_ctx->b->active_slice->cpu, data, payload_len);
 	h264_ctx->b->slice_num++;
+	h264_ctx->b->last_mb = run.slice_params->first_mb_in_slice;
 	h264_ctx->b->slice_bytes += PAGE_ALIGN((size_t)payload_len);
 	h264_ctx->b->monochrome = run.sps->chroma_format_idc == 0;
 
@@ -976,19 +1046,19 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	v4l2_h264_init_reflist_builder(&reflist_builder, run.decode_params,
 				       run.sps, run.decode_params->dpb);
 
-	run.num_valid = reflist_builder.num_valid;
+	/* stream_refs() emits VALID entries, including inactive references. */
+	run.num_valid = avd_h264_num_refs(run.decode_params);
 	run.cur_poc = reflist_builder.cur_pic_order_count;
 
 	v4l2_h264_build_p_ref_list(&reflist_builder, h264_ctx->reflists.p);
 	v4l2_h264_build_b_ref_lists(&reflist_builder, h264_ctx->reflists.b0,
 				    h264_ctx->reflists.b1);
 
-	avd_run_postamble(ctx, &run.base);
-
 	if (!avd_h264_refs_valid(&run)) {
 		dev_dbg_ratelimited(ctx->dev->dev,
 				    "slice references an invalid DPB entry, dropping frame\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_free_jobs;
 	}
 
 	if (is_new_frame(run.slice_params)) {
@@ -996,15 +1066,18 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		ret = avd_init_job(ctx, AVD_CODEC_H264,
 				   h264_ctx->b->alloc_slice_num + 1);
 		if (ret)
-			return ret;
+			goto err_free_jobs;
 		stream_hdr(ctx, &run);
 	}
 
-	if (!ctx->job.segments)
-		return -EINVAL;
+	if (!ctx->job.segments) {
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
 
 	ctx->job.num++;
 	stream_slice(ctx, &run);
+	avd_run_postamble(ctx, &run.base);
 
 	if (run.base.bufs.src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) {
 		avd_job_finish(ctx, VB2_BUF_STATE_DONE);
@@ -1016,6 +1089,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	return avd_submit_job(ctx);
 
 err_free_jobs:
+	avd_h264_abort_picture(ctx, run.base.bufs.dst);
 	kvfree(ctx->job.segments);
 	ctx->job.segments = NULL;
 	avd_run_postamble(ctx, &run.base);
@@ -1092,6 +1166,8 @@ static int avd_h264_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
 		return avd_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
 	if (ctrl->id == V4L2_CID_STATELESS_H264_PPS)
 		return avd_h264_validate_pps(ctx, ctrl->p_new.p_h264_pps);
+	if (ctrl->id == V4L2_CID_STATELESS_H264_SLICE_PARAMS)
+		return avd_h264_validate_slice(ctx, ctrl->p_new.p_h264_slice_params);
 
 	return 0;
 }
