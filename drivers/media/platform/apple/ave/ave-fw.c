@@ -22,6 +22,7 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -493,6 +494,61 @@ int ave_dart_audit(struct ave_dev *ave, const char *when)
 		}
 	}
 	return ret;
+}
+
+#define AVE_DART_PARAMS1	0x00
+#define AVE_DART_PARAMS2	0x04
+#define AVE_DART_PARAMS3	0x08
+#define AVE_DART_ERROR		0x100
+#define AVE_DART_ERROR_ADDR_LO	0x170
+#define AVE_DART_ERROR_ADDR_HI	0x174
+#define AVE_DART_PROTECT_LOCK	0x208
+#define AVE_DART_ENABLE		0xc00
+
+/*
+ * Raw, read-only register dump of the encoder's DARTs for debugfs: base,
+ * PARAMS1-4 (PARAMS2 bit 0 is bypass support), PROTECT and its lock, the
+ * error state, the stream-enable words, and TCR/TTBR of every stream that
+ * is not off, with the audit's verdict. Caller holds hw_lock and keeps the
+ * DARTs powered.
+ */
+void ave_dart_dump(struct ave_dev *ave, struct seq_file *m)
+{
+	seq_printf(m, "coprocessor ctrl %#x boot_arg %#x fw_state %d\n",
+		   readl(ave->coproc + ave->variant->regs->ctrl),
+		   readl(ave->coproc + ave->variant->regs->boot_arg), ave->fw_state);
+	for (unsigned int d = 0; d < ave->n_darts; d++) {
+		void __iomem *r = ave->dart_regs[d];
+		u32 own = ave->dart_sid[d];
+		u32 own_ttbr = readl(r + AVE_DART_TTBR(own));
+		u32 sids = min_t(u32, readl(r + AVE_DART_PARAMS4) & 0x1ff, 256);
+
+		seq_printf(m, "DART%u base %pa attached sid %u\n", d, &ave->dart_phys[d], own);
+		seq_printf(m, "  params %08x %08x %08x %08x (bypass support %u, %u sids)\n",
+			   readl(r + AVE_DART_PARAMS1), readl(r + AVE_DART_PARAMS2),
+			   readl(r + AVE_DART_PARAMS3), readl(r + AVE_DART_PARAMS4),
+			   readl(r + AVE_DART_PARAMS2) & 1, sids);
+		seq_printf(m, "  protect %08x lock %08x error %08x addr %08x%08x\n",
+			   readl(r + AVE_DART_PROTECT), readl(r + AVE_DART_PROTECT_LOCK),
+			   readl(r + AVE_DART_ERROR), readl(r + AVE_DART_ERROR_ADDR_HI),
+			   readl(r + AVE_DART_ERROR_ADDR_LO));
+		seq_puts(m, "  enable");
+		for (u32 w = 0; w < DIV_ROUND_UP(sids, 32); w++)
+			seq_printf(m, " %08x", readl(r + AVE_DART_ENABLE + 4 * w));
+		seq_puts(m, "\n");
+		for (u32 sid = 0; sid < sids; sid++) {
+			u32 tcr = readl(r + AVE_DART_TCR(sid));
+			u32 ttbr = readl(r + AVE_DART_TTBR(sid));
+			enum ave_dart_stream k = ave_dart_classify(tcr, ttbr, sid == own,
+								   own, own_ttbr);
+
+			if (k == AVE_DART_STREAM_OFF && !ttbr)
+				continue;
+			seq_printf(m, "  sid %3u tcr %08x ttbr %08x %s\n", sid, tcr, ttbr,
+				   k == AVE_DART_STREAM_OURS ? "ours" :
+				   k == AVE_DART_STREAM_UNSAFE ? "UNSAFE" : "off (ttbr set)");
+		}
+	}
 }
 
 /* Boot the coprocessor and bring up its command rings. Caller holds hw_lock. */

@@ -255,6 +255,7 @@ struct ave_dev {
 	 */
 	/* The encoder's DARTs, read-only for the stream audit */
 	void __iomem *dart_regs[2];
+	phys_addr_t dart_phys[2];
 	u32 dart_sid[2];
 	unsigned int n_darts;
 	bool witness_unusable;
@@ -420,6 +421,8 @@ int ave_fw_probe(struct ave_dev *ave);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 int ave_dart_audit(struct ave_dev *ave, const char *when);
+struct seq_file;
+void ave_dart_dump(struct ave_dev *ave, struct seq_file *m);
 void ave_fw_halt(struct ave_dev *ave);
 int ave_fw_shutdown(struct ave_dev *ave);
 int ave_fw_runtime_suspend(struct ave_dev *ave);

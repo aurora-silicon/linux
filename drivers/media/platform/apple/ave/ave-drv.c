@@ -21,6 +21,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/vmalloc.h>
 
 #include "ave.h"
@@ -243,6 +244,31 @@ static int ave_inject_wedge(void *data, u64 value)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(ave_inject_wedge_fops, NULL, ave_inject_wedge, "%llu\n");
 
+/*
+ * debugfs dart_audit: power the encoder (and through it its DARTs) without
+ * starting the coprocessor, run the stream audit and dump the DART
+ * registers, all read-only, then let it suspend again.
+ */
+static int ave_dart_audit_show(struct seq_file *m, void *unused)
+{
+	struct ave_dev *ave = m->private;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(ave->dev);
+	if (ret)
+		return ret;
+	mutex_lock(&ave->hw_lock);
+	ret = ave_dart_audit(ave, "debugfs");
+	seq_printf(m, "audit of %u DARTs: %s\n", ave->n_darts,
+		   !ave->n_darts ? "NONE MAPPED" : ret ? "UNSAFE streams" : "all streams safe");
+	ave_dart_dump(ave, m);
+	mutex_unlock(&ave->hw_lock);
+	pm_runtime_mark_last_busy(ave->dev);
+	pm_runtime_put_autosuspend(ave->dev);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ave_dart_audit);
+
 static void ave_debugfs_init(struct ave_dev *ave)
 {
 	static const char *const names[2][AVE_IMAGE_COUNT] = {
@@ -260,6 +286,7 @@ static void ave_debugfs_init(struct ave_dev *ave)
 	}
 	debugfs_create_file("inject_wedge", 0200, ave->debugfs, ave,
 			    &ave_inject_wedge_fops);
+	debugfs_create_file("dart_audit", 0400, ave->debugfs, ave, &ave_dart_audit_fops);
 	for (unsigned int c = 0; c < 2; c++)
 		for (unsigned int k = 0; k < AVE_IMAGE_COUNT; k++) {
 			struct debugfs_blob_wrapper *blob;
@@ -315,6 +342,7 @@ static void ave_map_darts(struct ave_dev *ave)
 		if (!r)
 			continue;
 		ave->dart_regs[ave->n_darts] = r;
+		ave->dart_phys[ave->n_darts] = res.start;
 		ave->dart_sid[ave->n_darts] = args.args[0];
 		ave->n_darts++;
 	}
