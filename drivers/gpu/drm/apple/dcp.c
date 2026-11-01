@@ -3348,12 +3348,12 @@ static int dcp_desktop_start_ep(struct apple_dcp *dcp, u32 endpoint,
 	struct apple_dcp_afkep *ep;
 	int ret;
 
-	if (endpoint == AV_ENDPOINT)
+	if (endpoint == AV_SERVICE_ENDPOINT_DESKTOP)
 		ops = av_video_service_ops();
 	ep = afk_init(dcp, endpoint, ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
-	if (endpoint == AV_ENDPOINT) {
+	if (endpoint == AV_SERVICE_ENDPOINT_DESKTOP) {
 		ret = av_video_register_cleanup(ep);
 		if (ret)
 			return ret;
@@ -3395,7 +3395,7 @@ static const struct {
 	{ DPDEV_ENDPOINT, "DPDEV" },
 	{ DPAVSERV_ENDPOINT, "DPAVSERV" },
 	{ AV_ENDPOINT, "AV" },
-	{ DPTX_ENDPOINT, "DPTX" },
+	{ AV_SERVICE_ENDPOINT_DESKTOP, "AVSERVICE" },
 	{ HDCP_ENDPOINT, "HDCP" },
 	{ EPIC2C_ENDPOINT, "EPIC2C" },
 	{ REMOTE_ALLOC_ENDPOINT, "REMOTEALLOC" },
@@ -3454,6 +3454,10 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 	if (ret)
 		return ret;
 	ret = dcp_desktop_start_ext_ep(dcp, map, AV_ENDPOINT, "AV");
+	if (ret)
+		return ret;
+	ret = dcp_desktop_start_ext_ep(dcp, map, AV_SERVICE_ENDPOINT_DESKTOP,
+				       "AVSERVICE");
 	if (ret)
 		return ret;
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)

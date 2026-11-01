@@ -97,6 +97,8 @@ enum {
 	DPAVSERV_ENDPOINT = 0x28,
 	DPAVSERV_ENDPOINT_V2 = 0x2a,
 	AV_ENDPOINT = 0x29,
+	/* DCPAVServiceProxy metadata service, separate from AV device control. */
+	AV_SERVICE_ENDPOINT_DESKTOP = 0x2a,
 	/* Desktop 26.x separates the audio service from AV device control. */
 	AV_AUDIO_ENDPOINT_DESKTOP = 0x2b,
 	DPTX_ENDPOINT = 0x2a,

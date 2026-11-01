@@ -6,10 +6,13 @@ Apple DCPAV HDR10 static metadata
 Desktop 26.x external display processors accept HDR10 static link metadata
 through the AV endpoint. The atomic modeset first selects the existing PQ
 colour element through IOMFB. After a successful modeset, DCPAV selector 0x15
-is sent with AFK command 0xc0. Internal panels keep their existing EDR path.
+is sent with AFK command 0xc0 through ``dcpav-service-epic`` on endpoint 0x2a.
+This is separate from AV device control on 0x29 and audio on 0x2b, and starts
+when advertised even with audio disabled. Internal panels keep their existing EDR path.
 Other firmware ABIs are not admitted to this metadata transport.
 
-The message contains a two-pair Apple 0xd3 dictionary. ``Type`` is the string
+The message contains a two-pair Apple 0xd3 dictionary with canonical symbol
+keys, including their terminating NUL and alignment padding. ``Type`` is the string
 ``CEA-861:Type1`` and ``Data`` is the 24-byte little-endian CTA Type 1 body,
 from DRM's display primaries through MaxFALL, without EOTF or descriptor ID.
 Both DRM metadata type fields must be zero. The current output colour element

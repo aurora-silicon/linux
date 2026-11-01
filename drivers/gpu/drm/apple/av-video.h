@@ -11,7 +11,7 @@
 /* One fixed dictionary: Type string and the 24-byte CTA Type 1 body. */
 #define DCP_HDR_DATA_SIZE 24
 #define DCP_HDR_TYPE "CEA-861:Type1"
-#define DCP_HDR_DATA_OFFSET 48
+#define DCP_HDR_DATA_OFFSET 56
 #define DCP_HDR_OBJECT_SIZE (DCP_HDR_DATA_OFFSET + DCP_HDR_DATA_SIZE)
 #define DCP_HDR_MESSAGE_SIZE (0x60 + DCP_HDR_OBJECT_SIZE)
 
@@ -29,15 +29,16 @@ static inline int dcp_hdr_encode(u8 object[DCP_HDR_OBJECT_SIZE],
 	put_unaligned_le32(0xd3, object);
 	/* A two-pair dictionary, last in the root collection. */
 	put_unaligned_le32(0x81000002, object + 4);
-	put_unaligned_le32(0x09000004, object + 8);
-	memcpy(object + 12, "Type", 4);
-	put_unaligned_le32(0x09000000 | (sizeof(DCP_HDR_TYPE) - 1), object + 16);
-	memcpy(object + 20, DCP_HDR_TYPE, sizeof(DCP_HDR_TYPE) - 1);
+	/* Canonical symbol keys include the NUL and use 32-bit padding. */
+	put_unaligned_le32(0x08000005, object + 8);
+	memcpy(object + 12, "Type", 5);
+	put_unaligned_le32(0x09000000 | (sizeof(DCP_HDR_TYPE) - 1), object + 20);
+	memcpy(object + 24, DCP_HDR_TYPE, sizeof(DCP_HDR_TYPE) - 1);
 	/* The 13-byte Type string is padded to the next 32-bit tag. */
-	put_unaligned_le32(0x09000004, object + 36);
-	memcpy(object + 40, "Data", 4);
+	put_unaligned_le32(0x08000005, object + 40);
+	memcpy(object + 44, "Data", 5);
 	/* The blob is the dictionary's last value. */
-	put_unaligned_le32(0x8a000018, object + 44);
+	put_unaligned_le32(0x8a000018, object + 52);
 	for (i = 0; i < 3; i++) {
 		put_unaligned_le16(hdr->display_primaries[i].x, data + i * 4);
 		put_unaligned_le16(hdr->display_primaries[i].y, data + i * 4 + 2);

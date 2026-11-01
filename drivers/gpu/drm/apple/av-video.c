@@ -15,7 +15,7 @@ void av_video_init(struct apple_epic_service *service, const char *name,
 	struct apple_epic_service *old;
 
 	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
-	    service->ep->endpoint != AV_ENDPOINT)
+	    service->ep->endpoint != AV_SERVICE_ENDPOINT_DESKTOP)
 		return;
 	service = afk_service_get(service);
 	if (!service)
@@ -35,7 +35,7 @@ void av_video_teardown(struct apple_epic_service *service)
 	bool owned;
 
 	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
-	    service->ep->endpoint != AV_ENDPOINT) {
+	    service->ep->endpoint != AV_SERVICE_ENDPOINT_DESKTOP) {
 		afk_service_disable(service);
 		return;
 	}
@@ -74,21 +74,15 @@ static void av_video_cleanup(void *data)
 int av_video_register_cleanup(struct apple_dcp_afkep *ep)
 {
 	if (ep->dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP ||
-	    ep->endpoint != AV_ENDPOINT)
+	    ep->endpoint != AV_SERVICE_ENDPOINT_DESKTOP)
 		return 0;
 	return devm_add_action_or_reset(ep->dcp->dev, av_video_cleanup, ep);
 }
 
-/* AV is needed even with audio disabled. Leave other services untouched. */
+/* The metadata service is needed even with audio disabled. */
 static const struct apple_epic_service_ops av_video_ops[] = {
 	{
-		.name = "dcpav-device-epic",
-		.reusable = true,
-		.init = av_video_init,
-		.teardown = av_video_teardown,
-	},
-	{
-		.name = "DCPAVSimpleVideoInterface",
+		.name = "dcpav-service-epic",
 		.reusable = true,
 		.init = av_video_init,
 		.teardown = av_video_teardown,
