@@ -1485,6 +1485,10 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t6041 = {
 	.tgt_read = 0x1e00,
 	.tgt_write = 0x10f00,
+	.update = 0x10000,
+	/* Only the qualified AVD0 SOC-DEV-DVFS entry. */
+	.dvfs_first = 0x1fd,
+	.dvfs_count = 1,
 	.actual = 0x1e80,
 	.status = 0x10,
 	.fast_die = 0x2580,
@@ -1666,6 +1670,11 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node != ent->report_node)
 			continue;
+		/* T6041 can defer residency, but a DVFS update needs a running PMP. */
+		if (ent->dvfs && !apple_pmp_report_running(rep)) {
+			ret = -EAGAIN;
+			break;
+		}
 		/* The device request is admitted first and the level dropped first. */
 		if (ent->dvfs && !enable)
 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, PMP_DVFS_VALID);
