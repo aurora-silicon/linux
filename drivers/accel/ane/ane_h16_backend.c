@@ -2,6 +2,7 @@
 /* Staged H16 backend, using the accepted H16 cold-boot facts, round 5. */
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/sched/cputime.h>
 #include <linux/dma-map-ops.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -830,10 +831,10 @@ MODULE_PARM_DESC(h16_job_poll_us, "Diagnostic job polling sleep10..1000us, defau
 static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 {
 	unsigned int us = min_t(unsigned int, h16_job_quiet_us, 10000);
-	u64 until, start, counters[2];
+	u64 until, start, counters[2], user_before, sys_before, user_after, sys_after;
 	u32 wake_us = h16_job_quiet_wake_us ? clamp(h16_job_quiet_wake_us, 10U, 1000U) : 0;
 	u32 work_ns = min(h16_job_quiet_work_ns, 10000U), wakes = 0, active_ns = 0;
-	u8 data[48];
+	u8 data[56];
 
 	/* Only a warmed, single outstanding EXEC with the exact same identity.
 	 * Cached/pipelined completions must not masquerade as quiet execution.
@@ -848,6 +849,7 @@ static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 	put_unaligned_le32(us, data + 20);
 	put_unaligned_le32(h16_job_quiet_busy, data + 24);
 	put_unaligned_le32(raw_smp_processor_id(), data + 28);
+	task_cputime_adjusted(current, &user_before, &sys_before);
 	start = ktime_get_ns();
 	counters[0] = get_cycles();
 	if (wake_us) {
@@ -873,10 +875,16 @@ static int ane_h16_job_quiet(struct ane_h16_job *j, u64 uuid)
 			cpu_relax();
 	}
 	counters[1] = get_cycles();
+	task_cputime_adjusted(current, &user_after, &sys_after);
 	put_unaligned_le32(wake_us, data + 32);
 	put_unaligned_le32(work_ns, data + 36);
 	put_unaligned_le32(wakes, data + 40);
+	/* Completed private blocks exclude the final wake beyond the deadline.
+	 * active_ns is block wall time, including any preemption/IRQ service.
+	 * Scheduler-accounted task CPU delta has its own resolution limits.
+	 */
 	put_unaligned_le32(active_ns, data + 44);
+	put_unaligned_le64(user_after + sys_after - user_before - sys_before, data + 48);
 	return ane_h16_job_emit_counters(j, ANE_H16_JOB_QUIET, 0,
 				       ktime_get_ns() - start, data, sizeof(data), counters, 2);
 }
