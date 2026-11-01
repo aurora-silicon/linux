@@ -99,6 +99,7 @@ struct generic_pm_domain {
 };
 struct apple_pmp_report_offsets {
 	u32 tgt_read, tgt_write, actual, status, fast_die, fast_die_lanes;
+	u32 update, dvfs_first, dvfs_count;
 	bool starts_pmp;
 	const char *name, *fallback, *pwrstate;
 	bool devices_ordered;
@@ -195,8 +196,11 @@ struct apple_pmp_report_entry {
 	struct generic_pm_domain genpd;
 	struct device_node *node, *report_node;
 	u32 id;
-	bool no_ack, removed;
+	bool no_ack, dvfs, removed;
+	u32 dvfs_entry;
+	u64 dvfs_on;
 };
+#define PMP_DVFS_VALID BIT_ULL(61)
 #define genpd_to_apple_pmp_report_entry(p) \
 	container_of(p, struct apple_pmp_report_entry, genpd)
 struct of_phandle_iterator {
@@ -479,6 +483,13 @@ static int of_property_read_u32(const struct device_node *n, const char *p,
 	assert(!strcmp(p, "reg"));
 	*v = n->reg;
 	return 0;
+}
+/* No T6030 graph node carries an array property the probe reads. */
+static int of_property_read_u32_array(const struct device_node *n,
+				      const char *p, u32 *v, size_t count)
+{
+	(void)n; (void)p; (void)v; (void)count;
+	return -EINVAL;
 }
 static int of_property_count_u32_elems(const struct device_node *n,
 				       const char *p)
