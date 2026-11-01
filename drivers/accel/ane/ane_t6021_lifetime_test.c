@@ -69,48 +69,6 @@ static void put32(u8 *p, u32 v)
 	p[3] = v >> 24;
 }
 
-static void task_count_test(struct kunit *test)
-{
-	u8 tdp[8 + 2 * ANE_T6021_TDPROP_SEG] = {};
-	u8 td[0x200] = {};
-
-	/* One segment of one block: the single-task form a builder emits. */
-	put32(tdp, 1);
-	put32(tdp + 0xc, 1);
-	KUNIT_EXPECT_EQ(test, ane_t6021_tdprop_tasks(tdp, 40), 1L);
-	put32(tdp + 0xc, 4);
-	KUNIT_EXPECT_EQ(test, ane_t6021_tdprop_tasks(tdp, 40), 4L);
-	/* Segments add up. */
-	put32(tdp, 2);
-	put32(tdp + 0xc, 1);
-	put32(tdp + 0x2c, 1);
-	KUNIT_EXPECT_EQ(test, ane_t6021_tdprop_tasks(tdp, sizeof(tdp)), 2L);
-	/* Truncated, empty or absurd tables do not parse. */
-	KUNIT_EXPECT_LT(test, ane_t6021_tdprop_tasks(tdp, 40), 0L);
-	KUNIT_EXPECT_LT(test, ane_t6021_tdprop_tasks(tdp, 4), 0L);
-	put32(tdp, 0);
-	KUNIT_EXPECT_LT(test, ane_t6021_tdprop_tasks(tdp, sizeof(tdp)), 0L);
-	put32(tdp, ANE_T6021_TDPROP_MAX_SEGS + 1);
-	KUNIT_EXPECT_LT(test, ane_t6021_tdprop_tasks(tdp, sizeof(tdp)), 0L);
-
-	/* TD stream: 0x10-byte header, then one block of 0x20 words. */
-	td[0x10 + 2] = 0x20;
-	KUNIT_EXPECT_EQ(test, ane_t6021_td_blocks(td, 0x10 + 0x80), 1L);
-	/* A second block of 0x41 words, padded to 16 bytes. */
-	td[0x90 + 2] = 0x41;
-	KUNIT_EXPECT_EQ(test, ane_t6021_td_blocks(td, 0x90 + 0x110), 2L);
-	/* Header bit 2 selects a 0x30-byte header. */
-	memset(td, 0, sizeof(td));
-	td[0] = 4;
-	td[0x30 + 2] = 0x10;
-	KUNIT_EXPECT_EQ(test, ane_t6021_td_blocks(td, 0x30 + 0x40), 1L);
-	/* A zero word count where a block must start does not parse. */
-	KUNIT_EXPECT_LT(test, ane_t6021_td_blocks(td, 0x30 + 0x50), 0L);
-	/* Neither does a block header cut short. */
-	KUNIT_EXPECT_LT(test, ane_t6021_td_blocks(td, 0x30 + 0x42), 0L);
-	KUNIT_EXPECT_LT(test, ane_t6021_td_blocks(td, 2), 0L);
-}
-
 static void put_task(u8 *td, size_t at, u32 words, u32 w2)
 {
 	td[at + 2] = words;
@@ -152,16 +110,12 @@ static void td_flags_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_t6021_td_flags_check(td, 2), 0);
 }
 
-/*
- * A fake firmware. Records every command class, fails on demand, and
- * refuses (test failure) to terminate a process of a program not proven
- * single-task, which on hardware halts the firmware for good.
- */
+/* A fake firmware. Records every command class and fails on demand. */
 struct fake_fw {
 	struct kunit *test;
 	struct ane_t6021_progtab *t;
 	unsigned int unloads, releases, loads, creates, restarts;
-	unsigned int terminates, multi_terminates;
+	unsigned int terminates;
 	int fail_unload, fail_restart;
 	bool restart_in_unload;
 	int sec_refs;
@@ -175,11 +129,8 @@ static int fake_unload(void *ctx, struct ane_t6021_prog *p)
 	struct fake_fw *fw = ctx;
 
 	fw->unloads++;
-	if (p->fw_proc_id != ANE_T6021_NO_ID) {
+	if (p->fw_proc_id != ANE_T6021_NO_ID)
 		fw->terminates++;
-		if (!p->single_task)
-			fw->multi_terminates++;
-	}
 	if (fw->restart_in_unload) {
 		ane_t6021_progtab_restarted(fw->t, &fake_ops, fw);
 		return -ETIMEDOUT;
@@ -257,8 +208,7 @@ static struct ane_t6021_fdprogs *new_fd(struct kunit *test)
 
 /* What the driver's LOAD ioctl does for a new program. */
 static struct ane_t6021_prog *load(struct ane_t6021_progtab *t,
-				   struct fake_fw *fw, u32 tag, u32 id,
-				   bool single)
+				   struct fake_fw *fw, u32 tag, u32 id)
 {
 	u8 digest[32] = {};
 	struct ane_t6021_prog *p;
@@ -270,7 +220,6 @@ static struct ane_t6021_prog *load(struct ane_t6021_progtab *t,
 	p = ane_t6021_progtab_reserve(t, digest);
 	if (!p)
 		return NULL;
-	p->single_task = single;
 	p->sec[0] = fw;
 	p->sec[6] = fw;
 	fw->sec_refs += 2;
@@ -283,8 +232,7 @@ static struct ane_t6021_prog *load(struct ane_t6021_progtab *t,
 static struct ane_t6021_prog *open_run(struct kunit *test,
 				       struct ane_t6021_progtab *t,
 				       struct fake_fw *fw,
-				       struct ane_t6021_fdprogs *f, u32 tag,
-				       bool single)
+				       struct ane_t6021_fdprogs *f, u32 tag)
 {
 	u8 digest[32] = {};
 	struct ane_t6021_prog *p;
@@ -293,7 +241,7 @@ static struct ane_t6021_prog *open_run(struct kunit *test,
 	digest[1] = tag >> 8;
 	p = ane_t6021_progtab_find(t, digest);
 	if (!p)
-		p = load(t, fw, tag, 1000 + tag, single);
+		p = load(t, fw, tag, 1000 + tag);
 	KUNIT_ASSERT_NOT_NULL(test, p);
 	KUNIT_ASSERT_EQ(test, ane_t6021_fdprogs_ref(t, f, p), 0);
 	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p, true, &fake_ops, fw), 0);
@@ -311,11 +259,11 @@ static void progtab_shared_unload_test(struct kunit *test)
 	struct ane_t6021_fdprogs *a = new_fd(test), *b = new_fd(test);
 	struct ane_t6021_prog *p, *q;
 
-	p = open_run(test, t, &fw, a, 1, true);
+	p = open_run(test, t, &fw, a, 1);
 	/* A second load of identical sections finds the same program and
 	 * process: no command reaches the firmware.
 	 */
-	q = open_run(test, t, &fw, b, 1, true);
+	q = open_run(test, t, &fw, b, 1);
 	KUNIT_ASSERT_PTR_EQ(test, q, p);
 	/* Taking the same reference twice from one file counts once. */
 	KUNIT_ASSERT_EQ(test, ane_t6021_fdprogs_ref(t, b, q), 0);
@@ -328,7 +276,7 @@ static void progtab_shared_unload_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, p->users, 1U);
 	KUNIT_EXPECT_EQ(test, fw.sec_refs, 2);
 
-	/* A single-task program is unloaded at its last close. */
+	/* The program is unloaded at its last close. */
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, b, &fake_ops, &fw), 0U);
 	KUNIT_EXPECT_EQ(test, fw.unloads, 1U);
 	KUNIT_EXPECT_EQ(test, fw.terminates, 1U);
@@ -337,48 +285,38 @@ static void progtab_shared_unload_test(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, ane_t6021_progtab_by_id(t, 1001));
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 0U);
 	/* The slot is reused by the next program. */
-	q = load(t, &fw, 2, 1002, true);
+	q = load(t, &fw, 2, 1002);
 	KUNIT_EXPECT_PTR_EQ(test, q, p);
 	KUNIT_EXPECT_EQ(test, t->hi, 1U);
 }
 
-static void multitask_never_terminated_test(struct kunit *test)
+static void multitask_unloaded_at_close_test(struct kunit *test)
 {
 	struct fake_fw fw = {};
 	struct ane_t6021_progtab *t = new_table(test, &fw);
-	struct ane_t6021_fdprogs *a = new_fd(test), *b = new_fd(test);
-	struct ane_t6021_prog *p, *q;
+	struct ane_t6021_fdprogs *a = new_fd(test);
+	struct ane_t6021_prog *p;
 	struct ane_t6021_progtab_stats st;
 
-	p = open_run(test, t, &fw, a, 3, false);
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, a, &fake_ops, &fw), 0U);
-	/* No TERMINATE, no DESTROY: the program stays resident as a cache
-	 * entry with its section references.
+	/* Any program with a process, whatever its task count, is terminated
+	 * and destroyed at its last close; nothing stays cached.
 	 */
-	KUNIT_EXPECT_EQ(test, fw.unloads, 0U);
-	KUNIT_EXPECT_EQ(test, fw.releases, 0U);
-	KUNIT_EXPECT_EQ(test, fw.sec_refs, 2);
-	KUNIT_EXPECT_TRUE(test, p->resident);
-	ane_t6021_progtab_count(t, &st);
-	KUNIT_EXPECT_EQ(test, st.cached, 1U);
-	/* The next opener of the same bytes reuses program and process. */
-	q = open_run(test, t, &fw, b, 3, false);
-	KUNIT_EXPECT_PTR_EQ(test, q, p);
-	KUNIT_EXPECT_EQ(test, fw.loads, 1U);
-	KUNIT_EXPECT_EQ(test, fw.creates, 1U);
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, b, &fake_ops, &fw), 0U);
-	/* Nor can an eviction pick it. */
-	KUNIT_EXPECT_NULL(test, ane_t6021_progtab_victim(t, NULL));
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_evict(t, p, &fake_ops, &fw), -EBUSY);
-	KUNIT_EXPECT_EQ(test, fw.multi_terminates, 0U);
-
-	/* A multi-task program that never got a process can be destroyed. */
-	p = load(t, &fw, 4, 1004, false);
-	KUNIT_ASSERT_EQ(test, ane_t6021_fdprogs_ref(t, a, p), 0);
+	p = open_run(test, t, &fw, a, 3);
 	KUNIT_EXPECT_TRUE(test, ane_t6021_prog_unloadable(p));
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, a, &fake_ops, &fw), 0U);
 	KUNIT_EXPECT_EQ(test, fw.unloads, 1U);
-	KUNIT_EXPECT_EQ(test, fw.terminates, 0U);
+	KUNIT_EXPECT_EQ(test, fw.terminates, 1U);
+	KUNIT_EXPECT_EQ(test, fw.sec_refs, 0);
+	ane_t6021_progtab_count(t, &st);
+	KUNIT_EXPECT_EQ(test, st.cached, 0U);
+	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 0U);
+
+	/* A program that never got a process is only destroyed. */
+	p = load(t, &fw, 4, 1004);
+	KUNIT_ASSERT_EQ(test, ane_t6021_fdprogs_ref(t, a, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, a, &fake_ops, &fw), 0U);
+	KUNIT_EXPECT_EQ(test, fw.unloads, 2U);
+	KUNIT_EXPECT_EQ(test, fw.terminates, 1U);
 }
 
 static void progtab_failed_unload_holds_test(struct kunit *test)
@@ -389,7 +327,7 @@ static void progtab_failed_unload_holds_test(struct kunit *test)
 	struct ane_t6021_progtab_stats st;
 	struct ane_t6021_prog *p, *q;
 
-	p = open_run(test, t, &fw, a, 5, true);
+	p = open_run(test, t, &fw, a, 5);
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, a, &fake_ops, &fw), 1U);
 	/* The firmware may still read the sections: nothing is released. */
 	KUNIT_EXPECT_EQ(test, fw.releases, 0U);
@@ -402,7 +340,7 @@ static void progtab_failed_unload_holds_test(struct kunit *test)
 	/* A HELD program still counts against the firmware budget. */
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 1U);
 	/* A held slot is never reused before a restart. */
-	q = load(t, &fw, 6, 1006, true);
+	q = load(t, &fw, 6, 1006);
 	KUNIT_EXPECT_PTR_NE(test, q, p);
 	KUNIT_EXPECT_EQ(test, t->hi, 2U);
 	/* A verified restart frees everything no file holds. */
@@ -442,16 +380,16 @@ static void progtab_restart_keeps_ids_test(struct kunit *test)
 	struct ane_t6021_prog *p, *z;
 	u32 fw_prog, fw_proc;
 
-	p = open_run(test, t, &fw, a, 7, false);
-	/* An unreferenced cache entry next to it. */
-	z = open_run(test, t, &fw, b, 8, false);
+	p = open_run(test, t, &fw, a, 7);
+	/* A second program, closed again: it is unloaded at once. */
+	z = open_run(test, t, &fw, b, 8);
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, b, &fake_ops, &fw), 0U);
 	fw_prog = p->fw_prog_id;
 	fw_proc = p->fw_proc_id;
 
 	KUNIT_ASSERT_EQ(test, fake_restart(&fw), 0);
 	/* The held program keeps its kernel ID and sections, not its
-	 * firmware IDs; the cache entry is gone.
+	 * firmware IDs.
 	 */
 	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_by_id(t, 1007), p);
 	KUNIT_EXPECT_FALSE(test, p->resident);
@@ -486,64 +424,62 @@ static void budget_eviction_order_test(struct kunit *test)
 
 	for (i = 0; i <= ANE_T6021_FW_RESIDENT_MAX; i++)
 		f[i] = new_fd(test);
-	/* 0..5 multi-task and held, 6 and 7 single-task and held. */
+	/* Eight programs, each held open by its own file. */
 	for (i = 0; i < ANE_T6021_FW_RESIDENT_MAX; i++)
-		p[i] = open_run(test, t, &fw, f[i], 10 + i, i >= 6);
+		p[i] = open_run(test, t, &fw, f[i], 10 + i);
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t),
 			(unsigned int)ANE_T6021_FW_RESIDENT_MAX);
-	/* 7 was used last, so 6 is the least recently used single-task one. */
-	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[7], true, &fake_ops, &fw), 0);
-	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_victim(t, NULL), p[6]);
-	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_victim(t, p[6]), p[7]);
-	/* A new program takes the least recently used single-task slot. */
-	p[8] = open_run(test, t, &fw, f[8], 30, false);
+	/* Using 0 again makes 1 the least recently used. */
+	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[0], true, &fake_ops, &fw), 0);
+	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_victim(t, NULL), p[1]);
+	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_victim(t, p[1]), p[2]);
+	/* A ninth program unloads 1 for room; no restart. */
+	p[8] = open_run(test, t, &fw, f[8], 30);
 	KUNIT_EXPECT_EQ(test, fw.restarts, 0U);
 	KUNIT_EXPECT_EQ(test, fw.unloads, 1U);
-	KUNIT_EXPECT_FALSE(test, p[6]->resident);
-	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_by_id(t, 1016), p[6]);
-	/* Using 6 again evicts 7, the last single-task resident one. */
-	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[6], true, &fake_ops, &fw), 0);
-	KUNIT_EXPECT_FALSE(test, p[7]->resident);
+	KUNIT_EXPECT_EQ(test, fw.terminates, 1U);
+	KUNIT_EXPECT_FALSE(test, p[1]->resident);
+	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_by_id(t, 1011), p[1]);
+	/* Its file uses it again: 2 goes, 1 loads with a new process. */
+	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[1], true, &fake_ops, &fw), 0);
+	KUNIT_EXPECT_FALSE(test, p[2]->resident);
+	KUNIT_EXPECT_TRUE(test, p[1]->resident);
 	KUNIT_EXPECT_EQ(test, fw.restarts, 0U);
-	/* The two single-task programs now take turns in the last slot; the
-	 * multi-task ones are never touched and no restart is needed.
+	/* HELD programs cannot be given back; when all residents are HELD the
+	 * firmware is restarted, and the held programs files still hold come
+	 * back as non-resident LIVE programs.
 	 */
-	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[7], true, &fake_ops, &fw), 0);
-	KUNIT_EXPECT_EQ(test, fw.restarts, 0U);
-	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[6], true, &fake_ops, &fw), 0);
-	KUNIT_EXPECT_EQ(test, fw.restarts, 0U);
-	/* Close the single-task holders; their programs unload. */
-	ane_t6021_progtab_fd_close(t, f[6], &fake_ops, &fw);
-	ane_t6021_progtab_fd_close(t, f[7], &fake_ops, &fw);
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 7U);
-	/* One more multi-task load fits; the next one forces the restart. */
-	p[6] = open_run(test, t, &fw, f[6], 40, false);
-	KUNIT_EXPECT_EQ(test, fw.restarts, 0U);
-	p[7] = open_run(test, t, &fw, f[7], 41, false);
+	for (i = 0; i <= ANE_T6021_FW_RESIDENT_MAX; i++)
+		if (p[i]->resident)
+			p[i]->state = ANE_T6021_PROG_HELD;
+	KUNIT_EXPECT_NULL(test, ane_t6021_progtab_victim(t, NULL));
+	KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[2], true, &fake_ops, &fw), 0);
 	KUNIT_EXPECT_EQ(test, fw.restarts, 1U);
 	KUNIT_EXPECT_EQ(test, t->restarts, 1U);
-	/* After it only the new program is resident; the others are known
-	 * and load on use.
-	 */
 	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 1U);
 	KUNIT_EXPECT_PTR_EQ(test, ane_t6021_progtab_by_id(t, 1010), p[0]);
 	KUNIT_EXPECT_FALSE(test, p[0]->resident);
-	KUNIT_EXPECT_EQ(test, fw.multi_terminates, 0U);
 	/* A failed restart reaches the caller and changes nothing. */
-	for (i = 1; i < 8; i++)
-		KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[i - 1], true,
+	for (i = 0; i <= ANE_T6021_FW_RESIDENT_MAX; i++)
+		KUNIT_ASSERT_EQ(test, ane_t6021_progtab_ensure(t, p[i], true,
 							       &fake_ops, &fw), 0);
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 8U);
+	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t),
+			(unsigned int)ANE_T6021_FW_RESIDENT_MAX);
+	/* Nine programs, eight resident: the one left out is p[0]. */
+	KUNIT_EXPECT_FALSE(test, p[0]->resident);
+	for (i = 1; i <= ANE_T6021_FW_RESIDENT_MAX; i++)
+		p[i]->state = ANE_T6021_PROG_HELD;
 	fw.fail_restart = -EBUSY;
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_ensure(t, p[8], true, &fake_ops, &fw),
+	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_ensure(t, p[0], true, &fake_ops, &fw),
 			-EBUSY);
-	KUNIT_EXPECT_FALSE(test, p[8]->resident);
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 8U);
+	KUNIT_EXPECT_FALSE(test, p[0]->resident);
+	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t),
+			(unsigned int)ANE_T6021_FW_RESIDENT_MAX);
 }
 
-/* Thirty distinct programs, every third one multi-task, each opened, run
- * and closed: the budget holds at every step, no multi-task process is
- * ever terminated, and only the multi-task cache entries force restarts.
+/* Thirty distinct programs, each opened, run and closed, while one more is
+ * held open throughout: everything unloads at close, the budget holds at
+ * every step and no restart is ever needed.
  */
 static void budget_sequence_test(struct kunit *test)
 {
@@ -552,29 +488,21 @@ static void budget_sequence_test(struct kunit *test)
 	struct ane_t6021_fdprogs *f = new_fd(test), *keep = new_fd(test);
 	unsigned int i;
 
-	/* One MobileNet-like program held open across the whole run. */
-	open_run(test, t, &fw, keep, 500, false);
+	open_run(test, t, &fw, keep, 500);
 	for (i = 0; i < 30; i++) {
-		struct ane_t6021_prog *p = open_run(test, t, &fw, f, 600 + i,
-						    i % 3 != 0);
+		struct ane_t6021_prog *p = open_run(test, t, &fw, f, 600 + i);
 
 		KUNIT_EXPECT_EQ(test, ane_t6021_progtab_fd_close(t, f, &fake_ops, &fw),
 				0U);
-		if (i % 3)
-			KUNIT_EXPECT_EQ(test, p->state, ANE_T6021_PROG_FREE);
-		KUNIT_EXPECT_LE(test, ane_t6021_progtab_resident(t),
-				(unsigned int)ANE_T6021_FW_RESIDENT_MAX);
+		KUNIT_EXPECT_EQ(test, p->state, ANE_T6021_PROG_FREE);
+		KUNIT_EXPECT_LE(test, ane_t6021_progtab_resident(t), 2U);
 	}
-	KUNIT_EXPECT_EQ(test, fw.multi_terminates, 0U);
-	/* Ten multi-task programs plus the held one: one restart after the
-	 * cache filled, and the held program still loads on use.
-	 */
-	KUNIT_EXPECT_EQ(test, fw.restarts, 1U);
+	KUNIT_EXPECT_EQ(test, fw.restarts, 0U);
+	KUNIT_EXPECT_EQ(test, fw.terminates, 30U);
 	KUNIT_ASSERT_NOT_NULL(test, ane_t6021_progtab_by_id(t, 1500));
-	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_ensure(t, ane_t6021_progtab_by_id(t, 1500),
-						       true, &fake_ops, &fw), 0);
+	KUNIT_EXPECT_TRUE(test, ane_t6021_progtab_by_id(t, 1500)->resident);
 	ane_t6021_progtab_fd_close(t, keep, &fake_ops, &fw);
-	KUNIT_EXPECT_EQ(test, fw.multi_terminates, 0U);
+	KUNIT_EXPECT_EQ(test, ane_t6021_progtab_resident(t), 0U);
 }
 
 static void progtab_capacity_test(struct kunit *test)
@@ -588,7 +516,7 @@ static void progtab_capacity_test(struct kunit *test)
 
 	/* Known programs are bounded by the firmware table, not the budget. */
 	for (i = 0; i < ANE_T6021_MAX_PROGRAMS; i++) {
-		p = load(t, &fw, i, 1000 + i, true);
+		p = load(t, &fw, i, 1000 + i);
 		KUNIT_ASSERT_NOT_NULL(test, p);
 		KUNIT_ASSERT_EQ(test, ane_t6021_fdprogs_ref(t, a, p), 0);
 		KUNIT_ASSERT_LE(test, ane_t6021_progtab_resident(t),
@@ -622,8 +550,8 @@ static void progtab_restart_during_unload_test(struct kunit *test)
 	struct ane_t6021_fdprogs *a = new_fd(test);
 	struct ane_t6021_prog *p, *q;
 
-	p = open_run(test, t, &fw, a, 50, true);
-	q = open_run(test, t, &fw, a, 51, true);
+	p = open_run(test, t, &fw, a, 50);
+	q = open_run(test, t, &fw, a, 51);
 	/* The first unload fails and its recovery restarts the firmware.
 	 * Nothing may be marked HELD afterwards, and the second program,
 	 * no longer resident, needs no unload.
@@ -676,7 +604,7 @@ static int fake_cmd(void *ctx, u16 opcode, u32 fw_prog, u32 fw_proc)
 static void unload_order_test(struct kunit *test)
 {
 	struct ane_t6021_prog p = {
-		.fw_prog_id = 4, .fw_proc_id = 9, .single_task = true,
+		.fw_prog_id = 4, .fw_proc_id = 9,
 	};
 	struct fake_cmds c = {};
 
@@ -705,14 +633,6 @@ static void unload_order_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_t6021_prog_unload_cmds(&p, fake_cmd, &c),
 			-ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, c.n, 1U);
-
-	/* A process of a program not proven single-task is never terminated,
-	 * and nothing else is sent for it.
-	 */
-	memset(&c, 0, sizeof(c));
-	p.single_task = false;
-	KUNIT_EXPECT_EQ(test, ane_t6021_prog_unload_cmds(&p, fake_cmd, &c), -EBUSY);
-	KUNIT_EXPECT_EQ(test, c.n, 0U);
 }
 
 /* The restart steps, recorded in order; a step fails when asked to. */
@@ -810,10 +730,9 @@ static void restart_state_machine_test(struct kunit *test)
 static struct kunit_case lifetime_cases[] = {
 	KUNIT_CASE(mring_classify_test),
 	KUNIT_CASE(legtab_reuse_test),
-	KUNIT_CASE(task_count_test),
 	KUNIT_CASE(td_flags_test),
 	KUNIT_CASE(progtab_shared_unload_test),
-	KUNIT_CASE(multitask_never_terminated_test),
+	KUNIT_CASE(multitask_unloaded_at_close_test),
 	KUNIT_CASE(progtab_failed_unload_holds_test),
 	KUNIT_CASE(progtab_load_failure_test),
 	KUNIT_CASE(progtab_restart_keeps_ids_test),

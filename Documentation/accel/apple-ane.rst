@@ -338,29 +338,19 @@ refuse a program the file holds no reference on with ``-ENOENT``. A program's
 kernel IDs stay valid for as long as a file holds it; whether it is loaded in
 the firmware right now (resident) is managed by the driver:
 
+- When the last file holding a program closes, the driver sends
+  TERMINATE_PROCESS (0x203) for its process and then DESTROY_PROGRAM (0x201),
+  and only after both are acknowledged gives the section buffers back.
 - The firmware's L2 spill pool holds eight 2 MiB buffers; every
-  CREATE_PROCESS grows it while it holds fewer than eight, and a LOAD sent
-  while eight programs with processes were resident never completed. At most
-  eight programs are resident, and room is made before each LOAD. The
-  firmware's program and process tables (240 and 496 advertised) are not the
-  limit.
-- TERMINATE_PROCESS (0x203) of a process whose program has more than one task
-  waits inside the firmware without a timeout and never completes, and no
-  other command frees such a process. The driver never sends it for one. A
-  program is single-task only when its TD property section (load id 7) and
-  its TD stream (load id 3) both count one task; anything else, including a
-  section it cannot parse, counts as multi-task.
-- When the last file holding a program closes, a single-task program (or any
-  program without a process) is unloaded: TERMINATE_PROCESS, then
-  DESTROY_PROGRAM (0x201), and only after both are acknowledged are the
-  section buffers given back. A multi-task program stays resident as a cache
-  entry, and the next load of the same bytes reuses it without a command.
-- Room comes first from unloading single-task programs, unreferenced ones
-  before the least recently used. When every resident program is a
-  multi-task process, the driver restarts the firmware at that idle point
-  (see below). Programs that files still hold become non-resident; the next
-  ``PROC_CREATE`` or ``EXEC`` loads them again and creates a new process,
-  with the same IDs. Unreferenced cache entries are dropped.
+  CREATE_PROCESS grows it while it holds fewer than eight. At most eight
+  programs are resident. Before each LOAD the least recently used program a
+  file still holds is unloaded for room; its next ``PROC_CREATE`` or ``EXEC``
+  loads it again and creates a new process, with the same IDs. The firmware's
+  program and process tables (240 and 496 advertised) are not the limit.
+- Only when every resident program is held (a load or unload whose outcome is
+  unknown) does the driver restart the firmware at that idle point (see
+  below). Programs that files still hold become non-resident and load again
+  on use.
 
 A program whose TD stream opens or closes on the wrong task is refused with
 ``-EINVAL`` before the firmware sees it. Header word 2 of each TD block must
@@ -383,8 +373,8 @@ allocations rather than every allocation since boot.
 
 ``fw_memory`` in the device's accel debugfs directory reports the live
 firmware allocations, their bytes, the table high-water mark, the known,
-held, resident, cached and single-task programs, the resident limit, the
-budget restarts and the firmware generation. A command timeout also logs the allocation ring and the
+held, resident and cached programs, the resident limit, the restarts for
+room and the firmware generation. A command timeout also logs the allocation ring and the
 target-to-host rings at the host cursors.
 
 H14 recovery lifecycle

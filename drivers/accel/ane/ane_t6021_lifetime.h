@@ -25,27 +25,23 @@
  *    the next poll and the cursor does not move.
  *
  * A program is shared by every file that loaded byte-identical sections and
- * outlives the firmware instance it was first loaded into. Each file holds one
+ * outlives the firmware instance it was loaded into. Each file holds one
  * reference per program it loaded, by an opaque kernel ID that never changes.
  * Whether the program is in the firmware right now (resident) is separate:
  *
- *  - Every live process holds a 2 MiB firmware allocation, and a LOAD sent
- *    while eight programs with processes are resident never completes. The
- *    driver keeps at most ANE_T6021_FW_RESIDENT_MAX programs resident and
- *    makes room before each LOAD.
- *  - TERMINATE_PROCESS (0x203) of a process whose program has more than one
- *    task waits inside the firmware without a timeout and never completes,
- *    and no other command frees such a process. Such a process is never
- *    terminated. Only a program proven to have exactly one task (its TD
- *    property section and its TD stream both count one) is unloaded:
- *    TERMINATE_PROCESS for its process, then DESTROY_PROGRAM (0x201).
- *  - An unreferenced program that cannot be unloaded stays resident as a
- *    cache entry; a later load of the same bytes reuses it with no command.
- *  - Room comes first from unloading a single-task program (unreferenced
- *    first, then the least recently used), and when none is left from a
- *    cold firmware restart at an idle point. A restart drops every cache
- *    entry; referenced programs become non-resident and are loaded again,
- *    with a new process, on their next use. Files see no change.
+ *  - When the last file holding a program closes, it is unloaded:
+ *    TERMINATE_PROCESS (0x203) for its process, then DESTROY_PROGRAM (0x201).
+ *  - The firmware's L2 spill pool holds eight 2 MiB buffers and grows on every
+ *    CREATE_PROCESS. At most ANE_T6021_FW_RESIDENT_MAX programs are resident;
+ *    before each LOAD the least recently used one a file still holds is
+ *    unloaded to make room, and loaded again, with a new process, on its
+ *    next use. Files see no change.
+ *  - Only when every resident program is HELD (a load or unload whose outcome
+ *    is unknown) is the firmware restarted, at an idle point. A restart drops
+ *    every program from the firmware; the ones files hold load again on use.
+ *  - A program whose TD stream opens or closes on the wrong task is refused at
+ *    LOAD: such a program leaves the firmware unable to complete another
+ *    command (see ane_t6021_td_flags_check()).
  *
  * A program whose load or unload failed is HELD: its buffers stay and its
  * slot is not reused until a verified firmware restart.
@@ -125,68 +121,13 @@ static inline int ane_t6021_legtab_find(const struct ane_legacy_buffer *t,
 	return -1;
 }
 
-/* ---- task count ---- */
+/* ---- TD stream ---- */
 
-/*
- * The task count of a program, from the two sections that carry it. The
- * firmware rejects a LOAD whose counts disagree, so both are read here and
- * a program is single-task only when both say one. Anything this code
- * cannot parse counts as multi-task: such a process is never terminated.
- * The TD walk follows the firmware's block walk as omarchy-ane's libane
- * section builder (Joshua Warren, MIT) documents it.
- */
-#define ANE_T6021_SEC_TEXT	3	/* the TD stream */
-#define ANE_T6021_SEC_TDPROP	7	/* TD property segments */
-#define ANE_T6021_TDPROP_SEG	0x20
-#define ANE_T6021_TDPROP_MAX_SEGS 64
+#define ANE_T6021_SEC_TEXT	3	/* LOAD section id of the TD stream */
 
 static inline u32 ane_t6021_le32(const u8 *p)
 {
 	return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24;
-}
-
-/* Sum of blockNbr over the TD property segments: u32 count at +0, then
- * count 0x20-byte segments from +8, blockNbr at segment +4.
- */
-static inline long ane_t6021_tdprop_tasks(const u8 *p, size_t size)
-{
-	u32 segs, i;
-	u64 sum = 0;
-
-	if (size < 8)
-		return -EINVAL;
-	segs = ane_t6021_le32(p);
-	if (!segs || segs > ANE_T6021_TDPROP_MAX_SEGS ||
-	    size < 8 + (size_t)segs * ANE_T6021_TDPROP_SEG)
-		return -EINVAL;
-	for (i = 0; i < segs; i++)
-		sum += ane_t6021_le32(p + 8 + i * ANE_T6021_TDPROP_SEG + 4);
-	return sum > INT_MAX ? -EINVAL : (long)sum;
-}
-
-/* TD blocks in the stream: a 0x10-byte header (0x30 when word 0 bit 2 is
- * set), then blocks whose u16 at +2 holds the word count in bits 10:0.
- */
-static inline long ane_t6021_td_blocks(const u8 *p, size_t size)
-{
-	size_t cur;
-	long n = 0;
-
-	if (size < 4)
-		return -EINVAL;
-	cur = (ane_t6021_le32(p) & 4) ? 0x30 : 0x10;
-	while (cur < size) {
-		u32 words;
-
-		if (size - cur < 4)
-			return -EINVAL;
-		words = (p[cur + 2] | p[cur + 3] << 8) & 0x7ff;
-		if (!words)
-			return -EINVAL;
-		cur += ((words << 2) + 0xf) & 0x3ff0;
-		n++;
-	}
-	return n;
 }
 
 /*
@@ -267,7 +208,6 @@ struct ane_t6021_prog {
 	u32 users;		/* files holding a reference */
 	enum ane_t6021_prog_state state;
 	bool resident;		/* LOADed into the current firmware instance */
-	bool single_task;	/* proven: its process may be terminated */
 	u64 last_use;
 	/* The program's own reference on each section buffer, or NULL, and
 	 * the IOVA and size its LOAD names for that section.
@@ -348,13 +288,10 @@ ane_t6021_progtab_resident(const struct ane_t6021_progtab *t)
 	return n;
 }
 
-/* The firmware can give a resident program back without a restart: it has
- * no process, or its process runs a program proven to have one task.
- */
+/* The firmware can give a resident program back without a restart. */
 static inline bool ane_t6021_prog_unloadable(const struct ane_t6021_prog *p)
 {
-	return p->state == ANE_T6021_PROG_LIVE && p->resident &&
-	       (p->fw_proc_id == ANE_T6021_NO_ID || p->single_task);
+	return p->state == ANE_T6021_PROG_LIVE && p->resident;
 }
 
 /*
@@ -454,8 +391,7 @@ static inline int ane_t6021_fdprogs_ref(struct ane_t6021_progtab *t,
 /*
  * The firmware commands of an unload: the process first, because destroying
  * a program that still has a process halts the firmware. @cmd returns zero
- * only for an acknowledged command. Nothing after a failure is sent, and a
- * process of a program not proven single-task is never terminated.
+ * only for an acknowledged command. Nothing after a failure is sent.
  */
 static inline int
 ane_t6021_prog_unload_cmds(const struct ane_t6021_prog *p,
@@ -466,8 +402,6 @@ ane_t6021_prog_unload_cmds(const struct ane_t6021_prog *p,
 	int ret;
 
 	if (p->fw_proc_id != ANE_T6021_NO_ID) {
-		if (!p->single_task)
-			return -EBUSY;
 		ret = cmd(ctx, ANE_T6021_CMD_TERMINATE_PROCESS, p->fw_prog_id,
 			  p->fw_proc_id);
 		if (ret)
@@ -519,9 +453,8 @@ static inline int ane_t6021_progtab_evict(struct ane_t6021_progtab *t,
 
 /*
  * The file is closing: drop its references. A program whose last reference
- * this was is unloaded when the firmware can give it back, freed when it is
- * not resident, and otherwise kept resident as a cache entry. Returns how
- * many programs ended HELD.
+ * this was is unloaded if resident and freed. Returns how many programs
+ * ended HELD.
  */
 static inline unsigned int
 ane_t6021_progtab_fd_close(struct ane_t6021_progtab *t,
@@ -540,8 +473,7 @@ ane_t6021_progtab_fd_close(struct ane_t6021_progtab *t,
 			continue;
 		if (!p->resident)
 			ane_t6021_progtab_free(p, ops, ctx);
-		else if (ane_t6021_prog_unloadable(p) &&
-			 ane_t6021_progtab_evict(t, p, ops, ctx) &&
+		else if (ane_t6021_progtab_evict(t, p, ops, ctx) &&
 			 p->state == ANE_T6021_PROG_HELD)
 			held++;
 	}
@@ -549,9 +481,8 @@ ane_t6021_progtab_fd_close(struct ane_t6021_progtab *t,
 	return held;
 }
 
-/*
- * The resident program the firmware can give back most cheaply, never
- * @keep: an unreferenced one first, then the least recently used.
+/* The resident program to give back for room, never @keep: an
+ * unreferenced one first (none normally exist), then the least recently used.
  */
 static inline struct ane_t6021_prog *
 ane_t6021_progtab_victim(struct ane_t6021_progtab *t,
@@ -573,9 +504,9 @@ ane_t6021_progtab_victim(struct ane_t6021_progtab *t,
 }
 
 /*
- * Make room for one more resident program. Evicts single-task programs
- * first; when none is left, restarts the firmware, which drops every
- * resident program. @keep is never evicted.
+ * Make room for one more resident program by unloading the least recently
+ * used one. Only when none can be unloaded (all HELD) is the firmware
+ * restarted, which drops every resident program. @keep is never evicted.
  */
 static inline int ane_t6021_progtab_make_room(struct ane_t6021_progtab *t,
 					      const struct ane_t6021_prog *keep,
@@ -686,7 +617,7 @@ static inline void ane_t6021_progtab_cancel(struct ane_t6021_prog *p,
 }
 
 struct ane_t6021_progtab_stats {
-	unsigned int live, held, resident, cached, single_task;
+	unsigned int live, held, resident, cached;
 };
 
 static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
@@ -704,7 +635,6 @@ static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
 			s->live++;
 			s->resident += p->resident;
 			s->cached += p->resident && !p->users;
-			s->single_task += p->single_task;
 		}
 	}
 }

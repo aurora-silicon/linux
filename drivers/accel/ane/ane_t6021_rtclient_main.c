@@ -1441,15 +1441,11 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 /* Two loads of byte-identical sections share one program and one process.
  * The key is SHA-256 over every section's id, size and bytes, so a client
  * can only reach a program whose bytes it also supplied, and every file
- * holds a reference on each program it loaded. Which programs are in the
- * firmware at a time, which may be unloaded and when the firmware is
- * restarted to make room is in ane_t6021_lifetime.h: a process of a
- * multi-task program is never terminated, at most
- * ANE_T6021_FW_RESIDENT_MAX programs are resident, and a program a file
- * still holds loads again on its next use after an eviction or a restart.
- * Without unloads every program and process stayed in the firmware until
- * reboot and the firmware stopped answering after eight processes.
- * Protected by ane_t6021_fw_lock.
+ * holds a reference on each program it loaded. The last close unloads a
+ * program, at most ANE_T6021_FW_RESIDENT_MAX programs are resident, and a
+ * program a file still holds loads again on its next use after it was
+ * unloaded for room or a restart (ane_t6021_lifetime.h). Protected by
+ * ane_t6021_fw_lock.
  */
 static struct ane_t6021_progtab ane_t6021_progtab;
 static struct ane_fw_ids ane_t6021_ids;
@@ -1678,7 +1674,6 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 	struct ane_t6021_fd *fd = file->driver_priv;
 	struct ane_t6021_prog *cached, *prog = NULL;
 	bool sent = false;
-	long tdprop_tasks = -EINVAL, td_blocks = -EINVAL;
 	int td_flags = 0;
 	u32 key, gen;
 	u8 digest[SHA256_DIGEST_SIZE];
@@ -1778,21 +1773,11 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 				goto out;
 			}
 			sha256_update(&sha, (const u8 *)hdr, sizeof(hdr));
-			/* The same snapshot as the key decides whether the
-			 * program's process may ever be terminated.
-			 */
-			if (sections[i].id == ANE_T6021_SEC_TEXT) {
-				td_blocks = ane_t6021_td_blocks((const u8 *)bo->cpu +
-								sections[i].offset,
-								sections[i].size);
+			/* Checked in the same snapshot as the key. */
+			if (sections[i].id == ANE_T6021_SEC_TEXT)
 				td_flags = ane_t6021_td_flags_check((const u8 *)bo->cpu +
 								    sections[i].offset,
 								    sections[i].size);
-			}
-			else if (sections[i].id == ANE_T6021_SEC_TDPROP)
-				tdprop_tasks = ane_t6021_tdprop_tasks((const u8 *)bo->cpu +
-								      sections[i].offset,
-								      sections[i].size);
 			left = sections[i].size;
 			while (left) {
 				size_t n = min_t(size_t, left,
@@ -1853,7 +1838,6 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		ret = -ENOSPC;
 		goto out;
 	}
-	prog->single_task = tdprop_tasks == 1 && td_blocks == 1;
 	gen = ane_t6021_progtab.gen;
 	/* The record slot IS the section identity (slot = id - 1). The program
 	 * takes its own reference on each section buffer, kept until the
@@ -1900,10 +1884,8 @@ static int ane_rtclient_load_program(struct ane_rtclient *ane,
 		if (WARN_ON(ret))
 			goto out;
 		*prog_id = key;
-		dev_dbg(ane->dev, "loaded program %u (fw %u, %s) (fw allocations live %u, %zu bytes)\n",
-			key, prog->fw_prog_id,
-			prog->single_task ? "single task" : "multi task or unknown",
-			ane->legacy_live, ane->legacy_bytes);
+		dev_dbg(ane->dev, "loaded program %u (fw %u) (fw allocations live %u, %zu bytes)\n",
+			key, prog->fw_prog_id, ane->legacy_live, ane->legacy_bytes);
 	} else if (ane_t6021_progtab.gen != gen) {
 		/* A firmware restart already released the reservation. */
 		prog = NULL;
@@ -2507,8 +2489,8 @@ static int ane_t6021_fw_memory_show(struct seq_file *m, void *v)
 	ane_t6021_progtab_count(&ane_t6021_progtab, &st);
 	seq_printf(m, "allocations: %u\nbytes: %zu\nhigh_water: %u\n",
 		   ane->legacy_live, ane->legacy_bytes, ane->legacy_allocated);
-	seq_printf(m, "programs: %u\nheld: %u\nresident: %u\ncached: %u\nsingle_task: %u\n",
-		   st.live, st.held, st.resident, st.cached, st.single_task);
+	seq_printf(m, "programs: %u\nheld: %u\nresident: %u\ncached: %u\n",
+		   st.live, st.held, st.resident, st.cached);
 	seq_printf(m, "resident_max: %u\nrestarts: %u\nfw_generation: %u\nquarantined: %d\n",
 		   ANE_T6021_FW_RESIDENT_MAX, ane_t6021_progtab.restarts,
 		   ane_t6021_progtab.gen, atomic_read(&ane_t6021_quarantined));
@@ -3402,8 +3384,8 @@ static int ane_rtclient_recover(struct ane_rtclient *ane)
 }
 
 /*
- * The budget restart: every resident program is a multi-task process the
- * firmware cannot give back, and a new one must be loaded.
+ * The restart for room: every resident program is HELD (its load or unload
+ * outcome is unknown), so none can be given back, and a new one must load.
  */
 static int ane_rtclient_restart(struct ane_rtclient *ane)
 {
