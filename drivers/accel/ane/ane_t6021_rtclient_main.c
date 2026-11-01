@@ -1066,7 +1066,7 @@ static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 
 	if (ane_t6021_tracing)
 		return ane_rtclient_call_wait_traced(ane, deadline);
-	if (ane->soc->platform && time_after_eq(jiffies, deadline))
+	if (time_after_eq(jiffies, deadline))
 		return -ETIMEDOUT;
 
 	do {
@@ -1099,8 +1099,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						     unsigned int channel,
 						     unsigned int timeout_ms)
 {
-	unsigned long deadline = ane->soc->platform && ane->waiting ?
-		ane->waiting->deadline : jiffies + msecs_to_jiffies(timeout_ms);
+	unsigned long deadline;
 	int ret;
 	u64 stats_ticket = 0;
 	u64 stats_submit_ns = 0;
@@ -1134,6 +1133,11 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	    (!ane->waiting || !ane->waiting->active || ane->pending.quarantined))
 		return -EIO;
 
+	/* One bounded budget covers both ACK and finish, including H14. */
+	timeout_ms = min(timeout_ms, 5000U);
+	deadline = ane->soc->platform && ane->waiting ?
+		ane->waiting->deadline : jiffies + msecs_to_jiffies(timeout_ms);
+
 	if (stats_call) {
 		stats_submit_ns = ktime_get_ns();
 		stats_ticket = ane_stats_begin(&ane->stats_ctrs,
@@ -1141,8 +1145,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 					       stats_submit_ns, 1);
 	}
 	ret = ane_rtclient_legacy_exchange(ane, command, length, opcode,
-					   channel, ane->soc->platform ? deadline :
-					   jiffies + msecs_to_jiffies(timeout_ms));
+					   channel, deadline);
 	if (ret) {
 		ane_t6021_tracing = false;
 		if (stats_call)
@@ -1157,8 +1160,7 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 	if (execute) {
 		if (ane_t6021_tracing)
 			ane_t6021_trace_add(ANE_TR_ACK, 0);
-		ret = ane_rtclient_call_wait(ane, ane->soc->platform ? deadline :
-					    jiffies + msecs_to_jiffies(timeout_ms));
+		ret = ane_rtclient_call_wait(ane, deadline);
 		ane_t6021_tracing = false;
 		if (!ret)
 			dma_rmb();

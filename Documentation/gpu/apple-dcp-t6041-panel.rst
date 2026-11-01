@@ -183,3 +183,32 @@ A failed transaction must publish no partial handoff. Loader host tests should
 cover supported DT without the chosen property, an unsupported board/DT, and
 each failed validation, as well as unchanged other-SoC policy. No new policy
 flag or kernel bypass is needed. This kernel series does not replace Stage 2.
+
+
+Desktop external audio (draft)
+------------------------------
+
+The desktop audio integration uses the existing DCP PCM and native link
+lifecycle, with a separate compact service binding on endpoint 0x2b. Endpoint
+0x29 retains AV device control. Only the external firmware role admits the
+``dcpav-audio-epic`` unit-zero service; the internal panel does not acquire an
+audio client. The existing ``hdmi_audio`` opt-in still controls service startup.
+
+A PCM opens and pins one service instance. Prepare, Start, Stop and Complete
+use that instance's element link data. Sink termination disconnects the card,
+drains the DMA and completes its link before closing that instance. Replacement
+services cannot inherit an old instance's Close or link completion. Compact
+method replies must have the expected body length; serialized property replies
+must contain their declared used bytes within the actual received body.
+
+J616s DPA1 and DPA2 are described with SIO channels 0x66 and 0x68, connected
+bidirectionally to DCPEXT0 and DCPEXT1 port zero, respectively. Both clients
+remain disabled. This description does not enable SIO, its DART, its mailbox
+or any DPA power domain. A generation-specific SIO firmware backend and loader
+handoff are still required before a candidate may enable the clients.
+
+The desktop service name/unit, shared 13.5 command numbers and native 14.7 link
+and element layouts are provisional integration choices. Build and synthetic
+regression results cannot qualify them against firmware. Qualification must
+confirm those contracts and actual sink element catalogs before enabling these
+outputs. No sink-specific rates or capabilities are synthesized here.

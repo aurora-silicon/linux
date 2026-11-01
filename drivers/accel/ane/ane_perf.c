@@ -60,6 +60,9 @@ int ane_perf_begin(struct ane_device *ane)
 	struct ane_perf *p = &ane->perf;
 	int ret = 0;
 
+	if (p->cpu_boost)
+		ane_boost_begin(ane);
+
 	/* The submit ioctl already holds a runtime PM reference. */
 	mutex_lock(&p->lock);
 	p->busy = true;
@@ -95,6 +98,9 @@ out:
 void ane_perf_end(struct ane_device *ane)
 {
 	struct ane_perf *p = &ane->perf;
+
+	if (p->cpu_boost)
+		ane_boost_end(ane);
 
 	mutex_lock(&p->lock);
 	p->busy = false;
@@ -199,10 +205,26 @@ int ane_perf_init(struct ane_device *ane, unsigned int high_level)
 		dev_pm_opp_put(opp);
 		if (!p->peak_bw || p->avg_bw > p->peak_bw)
 			return -EINVAL;
-	} else {
-		dev_warn(ane->dev, "no memory bandwidth provider; CPU frequency boost removed\n");
 	}
-	return devm_device_add_group(ane->dev, &ane_perf_group);
+
+	ret = devm_device_add_group(ane->dev, &ane_perf_group);
+	if (ret)
+		return ret;
+
+	/*
+	 * Without a performance controller the engine runs at its boot
+	 * clock, and the CPU cluster boost is what keeps bandwidth-bound
+	 * programs and the submit tail fast. Keep it until the DT binds a
+	 * controller.
+	 */
+	if (!p->report) {
+		ret = ane_boost_init(ane);
+		if (ret)
+			return ret;
+		p->cpu_boost = true;
+		dev_info(ane->dev, "no performance controller; keeping the CPU frequency boost\n");
+	}
+	return 0;
 }
 
 int ane_perf_exit(struct ane_device *ane)
@@ -212,6 +234,10 @@ int ane_perf_exit(struct ane_device *ane)
 
 	if (!p->initialized)
 		return 0;
+	if (p->cpu_boost) {
+		ane_boost_exit(ane);
+		p->cpu_boost = false;
+	}
 	cancel_delayed_work_sync(&p->idle);
 	mutex_lock(&p->lock);
 	p->error = ane_perf_drop(ane);

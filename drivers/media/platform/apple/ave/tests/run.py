@@ -33,23 +33,40 @@ def source(text):
 
 def build(src, out, baseline):
     header = (src / 'ave.h').read_text()
+    per_abi = (src / 'ave-writer.c').exists()
+    has_layout = (src / 'ave-layout.h').exists()
     code = (Path(__file__).parent / 'shim.h').read_text()
     for name in ('AVE_MAX_SLOTS', 'AVE_MAX_REFS', 'AVE_TILE_BUFS',
                  'AVE_MAX_SESSIONS', 'AVE_FW_TEXT_CRC_9003_78_0'):
         code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
+    # Later firmware builds; an older baseline does not define them.
+    for name in ('AVE_FW_TEXT_CRC_T6040_25G83',):
+        m = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
+        if m:
+            code += m[0] + '\n'
     for name in ('ave_codec', 'ave_buf', 'ave_fw_state', 'ave_image',
                  'ave_coproc_regs', 'ave_variant', 'ave_params', 'ave_slot', 'ave_session'):
         code += declaration(header, name)
+    if per_abi:
+        code = '#define TEST_PER_ABI 1\n' + code
+        code += declaration(header, 'ave_opcode')
+        for name in ('AVE_IPC_BYTES', 'AVE_IPC_CMD_OFF', 'AVE_IPC_CMD_BYTES',
+                     'AVE_IPC_SCALAR_OFF', 'AVE_IPC_PROC_OFF', 'AVE_IPC_PROC_BYTES'):
+            code += re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)[0] + '\n'
     if baseline:
         code = '#define TEST_BASELINE 1\n' + code
         code += '\n'.join(re.findall(r'^#define AVE_(?:START|PROCESS)_\w+.*$', header, re.M)) + '\n'
-    else:
+    if has_layout:
+        code = '#define TEST_LAYOUT 1\n' + code
         code += source((src / 'ave-layout.h').read_text())
         code += source((src / 'ave-layout.c').read_text())
     code += source((src / 'ave-regs.h').read_text())
     code += source((src / 'ave-sizes.h').read_text())
     code += (Path(__file__).parent / 'boundary.h').read_text()
     code += source((src / 'ave-image.c').read_text())
+    if per_abi:
+        code += source((src / 'ave-writer.c').read_text())
+        code += source((src / 'ave-abi.c').read_text())
     code += source((src / 'ave-cmd.c').read_text())
     session = (src / 'ave-sess.c').read_text()
     code += declaration(session, 'ave_buf_req')
@@ -63,7 +80,10 @@ def build(src, out, baseline):
     for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_sess_free_bufs', 'ave_sess_reply'):
         code += function(session, name)
     if not baseline:
-        code += function((src / 'ave-fw.c').read_text(), 'ave_fw_check_build')
+        fw = (src / 'ave-fw.c').read_text()
+        if per_abi:
+            code += function(fw, 'ave_fw_check_boot')
+        code += function(fw, 'ave_fw_check_build')
     code += (Path(__file__).parent / 'test.c').read_text()
     out.mkdir(parents=True, exist_ok=True)
     (out / 'host.c').write_text(code)

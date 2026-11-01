@@ -682,6 +682,8 @@ static void avd_remove(struct platform_device *pdev)
 	avd_queue_cleanup(avd);
 	avd_pm_disable(avd);
 	avd_v4l2_cleanup(avd);
+	if (avd->pm.dma_parked)
+		iommu_detach_device(avd->empty_domain, avd->dev);
 	if (avd->empty_domain)
 		iommu_domain_free(avd->empty_domain);
 }

@@ -10,9 +10,9 @@ config VIDEO_APPLE_AVE
 	help
 	  V4L2 memory-to-memory driver for the AVE H.264/HEVC encoder in
 	  Apple T8140 (A18 Pro) SoCs, as in the MacBook Neo.
-	  T6000 (M1 Pro), T6041 (M4 Pro) and T8112 (M2) have probe-only
-	  support; encoding
-	  requires qualified firmware command constants.
+	  T6000 (M1 Pro) and T8112 (M2) support lifecycle-only validation
+	  of firmware 6070.11.1 through debugfs; encoding stays disabled.
+	  T6041 (M4 Pro) has probe-only support.
 
 	  The encoder firmware is loaded by the bootloader; the driver builds
 	  every command itself. See Documentation/admin-guide/media/apple-ave.rst.
@@ -21,7 +21,7 @@ config VIDEO_APPLE_AVE
 	  will be called apple-ave.
 
 config VIDEO_APPLE_AVE_KUNIT_TEST
-	tristate "KUnit tests for Apple AVE buffer sizing" if !KUNIT_ALL_TESTS
+	tristate "KUnit tests for Apple AVE buffer sizing and recovery" if !KUNIT_ALL_TESTS
 	depends on KUNIT
 	default KUNIT_ALL_TESTS
 	help
@@ -29,3 +29,14 @@ config VIDEO_APPLE_AVE_KUNIT_TEST
 	  encoders, including picture alignment boundaries and the reference
 	  1920x1080 AVC and HEVC sizes. The tests do not need an encoder or
 	  any firmware and can run independently of the AVE driver.
+	  Also test the firmware recovery sliding window and jiffies wrap.
+
+config VIDEO_APPLE_AVE_CMD_KUNIT_TEST
+	bool "KUnit tests for Apple AVE firmware ABIs" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_APPLE_AVE=y
+	default KUNIT_ALL_TESTS
+	help
+	  Compare AVC/HEVC 9003 Start and Process images byte for byte with
+	  the pre-refactor builder. Test 6070 lifecycle envelopes, replies,
+	  split surface arrays, seven-channel discovery and encoding refusal.
+	  These tests run without firmware or encoder hardware.
