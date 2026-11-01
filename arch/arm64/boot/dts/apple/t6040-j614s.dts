@@ -87,3 +87,27 @@
 		wp-inverted;
 	};
 };
+
+/* The loader reserves this boot's ISP firmware before enabling the camera. */
+&isp {
+	memory-region = <&isp_j614_text>, <&isp_j614_data>, <&isp_j614_heap>;
+	status = "disabled";
+};
+
+/delete-node/ &isp_fw_text;
+/delete-node/ &isp_fw_data;
+/delete-node/ &isp_heap;
+
+/ {
+	reserved-memory {
+		isp_j614_text: isp-firmware-text { };
+		isp_j614_data: isp-firmware-data { };
+		isp_j614_heap: isp-heap {
+			iommu-addresses = <&isp 0x100 0x0 0x0 0x2000000>;
+		};
+	};
+};
+
+&isp_dart0 { status = "disabled"; };
+&isp_dart1 { status = "disabled"; };
+&isp_dart2 { status = "disabled"; };
