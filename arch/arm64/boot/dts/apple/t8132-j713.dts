@@ -65,6 +65,10 @@
 	status = "okay";
 };
 
+&cpuidle {
+	status = "okay";
+};
+
 &qspi {
 	status = "okay";
 
