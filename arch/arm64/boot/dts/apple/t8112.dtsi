@@ -1763,6 +1763,7 @@
 			#else
 			power-domains = <&ps_avd_sys>;
 			#endif
+			power-domain-names = "core";
 			resets = <&ps_avd_sys>;
 			reg = <0x2 0x69080000 0x0 0x10000>,
 				<0x2 0x69090000 0x0 0x10000>,
