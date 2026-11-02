@@ -156,9 +156,11 @@ properties:
     minItems: 32
     maxItems: 32
     description:
-      Bootloader-produced digest of the live reserved DATA including all
-      personalized parameter bytes. This establishes preservation of that
-      boot's DATA, not a cross-build firmware identity. TEXT has a driver pin.
+      Optional bootloader-produced digest of the live reserved DATA
+      including all personalized parameter bytes. This establishes
+      preservation of that boot's DATA, not a cross-build firmware identity.
+      Without it the driver checks its copy against the live DATA. TEXT has
+      a driver pin.
 
   apple,ane-type:
     $ref: /schemas/types.yaml#/definitions/uint32
