@@ -16,6 +16,7 @@
 #define _APPLE_PRORES_H
 
 #include <linux/bits.h>
+#include <linux/errno.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
 
@@ -52,6 +53,31 @@
 
 #define APR_RING_BYTES		SZ_128K
 #define APR_DESC_BYTES		0x180
+
+/* One published descriptor, with the rest of a batch staged behind it. */
+struct apr_batch {
+	u32 start;
+	unsigned int count;
+	unsigned int done;
+};
+
+static inline u32 apr_batch_head(const struct apr_batch *batch)
+{
+	return batch->start + (batch->done + 1) * APR_DESC_BYTES;
+}
+
+/* 0: publish the next job, 1: whole batch finished, negative: reset needed. */
+static inline int apr_batch_complete(struct apr_batch *batch, u32 status, u32 tail)
+{
+	if (!status)
+		return -EAGAIN;
+	if (!batch->count || batch->done >= batch->count)
+		return -EINVAL;
+	if (status != APR_IRQ_DONE || tail != apr_batch_head(batch))
+		return -EIO;
+	batch->done++;
+	return batch->done == batch->count;
+}
 
 /* Quantisation tables the engine holds, in register order. */
 enum apr_qtable {

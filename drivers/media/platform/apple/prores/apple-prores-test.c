@@ -244,6 +244,38 @@ static void apr_test_output(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_check_output(out, SZ_4K, &bytes), -EIO);
 }
 
+/* A fetch tail is allowed to reach the head before DONE is asserted. */
+static void apr_test_batch_fence(struct kunit *test)
+{
+	for (unsigned int depth = 1; depth <= 4; depth++) {
+		struct apr_batch batch = { .start = 0x600, .count = depth };
+
+		for (unsigned int i = 0; i < depth; i++) {
+			u32 head = 0x600 + (i + 1) * APR_DESC_BYTES;
+
+			KUNIT_EXPECT_EQ(test, apr_batch_head(&batch), head);
+			KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, 0, head), -EAGAIN);
+			KUNIT_EXPECT_EQ(test, batch.done, i);
+			KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, APR_IRQ_DONE, head),
+					i + 1 == depth ? 1 : 0);
+		}
+	}
+}
+
+static void apr_test_batch_errors(struct kunit *test)
+{
+	struct apr_batch batch = { .start = 0x600, .count = 4 };
+	u32 head = apr_batch_head(&batch);
+
+	KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, APR_IRQ_DONE, head - 0x80), -EIO);
+	KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, APR_IRQ_DONE, head + APR_DESC_BYTES),
+			-EIO);
+	KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, APR_IRQ_ERROR, head), -EIO);
+	KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, APR_IRQ_DONE | APR_IRQ_ERROR, head),
+			-EIO);
+	KUNIT_EXPECT_EQ(test, batch.done, 0U);
+}
+
 static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_qmat_regs),
 	KUNIT_CASE(apr_test_dc_scale),
@@ -254,6 +286,8 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_budgets),
 	KUNIT_CASE(apr_test_slices),
 	KUNIT_CASE(apr_test_output),
+	KUNIT_CASE(apr_test_batch_fence),
+	KUNIT_CASE(apr_test_batch_errors),
 	{}
 };
 
