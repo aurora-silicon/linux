@@ -4365,6 +4365,9 @@ static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 #endif /* CONFIG_PM */
 
+static void brcmf_cfg80211_set_country(struct brcmf_cfg80211_info *cfg,
+				       char alpha2[2]);
+
 static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
@@ -4372,6 +4375,15 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 	struct brcmf_if *ifp = netdev_priv(ndev);
 
 	brcmf_dbg(TRACE, "Enter\n");
+
+	/* The parent bus has resumed before the wiphy resume callback. */
+	mutex_lock(&cfg->regd_lock);
+	cfg->regd_suspended = false;
+	if (cfg->regd_pending[0]) {
+		brcmf_cfg80211_set_country(cfg, cfg->regd_pending);
+		cfg->regd_pending[0] = 0;
+	}
+	mutex_unlock(&cfg->regd_lock);
 
 	if (cfg->wowl.active) {
 		brcmf_report_wowl_wakeind(wiphy, ifp);
@@ -4522,6 +4534,10 @@ exit:
 	brcmf_dbg(TRACE, "Exit\n");
 	/* clear any scanning activity */
 	cfg->scan_status = 0;
+	/* Finish any notifier I/O before the parent bus goes to sleep. */
+	mutex_lock(&cfg->regd_lock);
+	cfg->regd_suspended = true;
+	mutex_unlock(&cfg->regd_lock);
 	return 0;
 }
 
@@ -7208,6 +7224,7 @@ static s32 wl_init_priv(struct brcmf_cfg80211_info *cfg)
 		return err;
 	brcmf_register_event_handlers(cfg);
 	mutex_init(&cfg->usr_sync);
+	mutex_init(&cfg->regd_lock);
 	brcmf_init_escan(cfg);
 	brcmf_init_conf(cfg->conf);
 	brcmf_init_wmm_prio(cfg->ac_priority);
@@ -8828,30 +8845,13 @@ exit:
 	return err;
 }
 
-static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
-					struct regulatory_request *req)
+static void brcmf_cfg80211_set_country(struct brcmf_cfg80211_info *cfg,
+				       char alpha2[2])
 {
-	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_if *ifp = brcmf_get_ifp(cfg->pub, 0);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmf_fil_country_le ccreq;
 	s32 err;
-	int i;
-
-	/* The country code gets set to "00" by default at boot, ignore */
-	if (req->alpha2[0] == '0' && req->alpha2[1] == '0')
-		return;
-
-	/* ignore non-ISO3166 country codes */
-	for (i = 0; i < 2; i++)
-		if (req->alpha2[i] < 'A' || req->alpha2[i] > 'Z') {
-			bphy_err(drvr, "not an ISO3166 code (0x%02x 0x%02x)\n",
-				 req->alpha2[0], req->alpha2[1]);
-			return;
-		}
-
-	brcmf_dbg(TRACE, "Enter: initiator=%d, alpha=%c%c\n", req->initiator,
-		  req->alpha2[0], req->alpha2[1]);
 
 	err = brcmf_fil_iovar_data_get(ifp, "country", &ccreq, sizeof(ccreq));
 	if (err) {
@@ -8859,7 +8859,7 @@ static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
 		return;
 	}
 
-	err = brcmf_translate_country_code(ifp->drvr, req->alpha2, &ccreq);
+	err = brcmf_translate_country_code(ifp->drvr, alpha2, &ccreq);
 	if (err) {
 		/* Because we ignore the default country code above,
 		 * we will start out in our custom reg domain, but the chip
@@ -8877,6 +8877,39 @@ static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
 		return;
 	}
 	brcmf_setup_wiphybands(cfg);
+}
+
+static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
+					struct regulatory_request *req)
+{
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_pub *drvr = cfg->pub;
+	int i;
+
+	/* The country code gets set to "00" by default at boot, ignore */
+	if (req->alpha2[0] == '0' && req->alpha2[1] == '0')
+		return;
+
+	/* ignore non-ISO3166 country codes */
+	for (i = 0; i < 2; i++)
+		if (req->alpha2[i] < 'A' || req->alpha2[i] > 'Z') {
+			bphy_err(drvr, "not an ISO3166 code (0x%02x 0x%02x)\n",
+				 req->alpha2[0], req->alpha2[1]);
+			return;
+		}
+
+	brcmf_dbg(TRACE, "Enter: initiator=%d, alpha=%c%c\n", req->initiator,
+		  req->alpha2[0], req->alpha2[1]);
+
+	mutex_lock(&cfg->regd_lock);
+	if (cfg->regd_suspended) {
+		/* Keep the latest request, not the notifier's transient pointer. */
+		memcpy(cfg->regd_pending, req->alpha2, sizeof(cfg->regd_pending));
+		brcmf_dbg(TRACE, "deferring country setting until resume\n");
+	} else {
+		brcmf_cfg80211_set_country(cfg, req->alpha2);
+	}
+	mutex_unlock(&cfg->regd_lock);
 }
 
 static void brcmf_free_wiphy(struct wiphy *wiphy)

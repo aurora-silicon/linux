@@ -343,6 +343,9 @@ struct brcmf_cfg80211_wowl {
  * @btcoex: Bluetooth coexistence information.
  * @scan_request: cfg80211 scan request object.
  * @usr_sync: mainly for dongle up/down synchronization.
+ * @regd_lock: serializes country updates with system suspend/resume.
+ * @regd_suspended: country updates must wait for system resume.
+ * @regd_pending: latest deferred country, or zero if none is pending.
  * @bss_list: bss_list holding scanned ap information.
  * @bss_info: bss information for cfg80211 layer.
  * @conn_info: association info.
@@ -376,6 +379,10 @@ struct brcmf_cfg80211_info {
 	struct brcmf_btcoex_info *btcoex;
 	struct cfg80211_scan_request *scan_request;
 	struct mutex usr_sync;
+	/* Serialize regulatory notifications with system suspend/resume. */
+	struct mutex regd_lock;
+	bool regd_suspended;
+	char regd_pending[2];
 	struct wl_cfg80211_bss_info *bss_info;
 	struct brcmf_cfg80211_connect_info conn_info;
 	struct brcmf_pmk_list_le pmk_list;

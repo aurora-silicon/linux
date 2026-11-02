@@ -3083,7 +3083,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	devinfo = bus->bus_priv.pcie->devinfo;
 
 	brcmf_pcie_fwcon_timer(devinfo, false);
-	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	brcmf_bus_change_state(bus, BRCMF_BUS_SLEEP);
 
 	devinfo->mbdata_completed = false;
 	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
