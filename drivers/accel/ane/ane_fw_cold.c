@@ -73,6 +73,9 @@ struct ane_fw_backend {
 	u8 data_digest[SHA256_DIGEST_SIZE];
 	/* Powered down for system sleep; a (cold or warm) boot is due. */
 	bool slept;
+	/* The last cold boot after sleep: firmware ready, first replay, count. */
+	u64 resume_ready_ns, resume_first_ns;
+	unsigned int resume_replayed;
 	/*
 	 * EXCLAVE_MODE_STOP completed in this firmware boot: the warm boots
 	 * keep the firmware out of Exclave mode. Cleared by every cold boot.
@@ -278,15 +281,18 @@ static int ane_fw_scratch_wait(struct ane_fw_backend *b, unsigned int cell, u32 
 #define ANE_FW_WARM_BOOT 1
 
 /*
- * The warm path is the default. SUSPEND alone never completed on 26.6.2
- * (C2, C3a, C3b): the firmware runs in Exclave mode and the 0x24 handler
- * waits for the SNE DM bus to go idle. EXCLAVE_MODE_STOP (0x31) first takes
- * it out of that mode (SPEC-ANE-SLEEP-H17.md). The cold cycle stays as the
- * fallback when the warm boot fails after power-off, and as the whole path
- * with ane_fw_sleep_warm false: no firmware cooperation, programs lost,
- * the firmware booted again from the kernel-held preload.
+ * Two system sleep paths, chosen by the platform's sleep_warm flag:
+ * - cold (the H17 default): the engine is powered off with no firmware
+ *   cooperation; after resume the firmware is booted again from the
+ *   kernel-held preload and every open program is replayed (LOAD, CREATE)
+ *   behind its existing handle, so applications see no change;
+ * - warm: EXCLAVE_MODE_STOP (0x31, once per firmware boot), SUSPEND (0x24),
+ *   WFI, power-off, then a warm boot with SCRATCH7 = 1 that keeps the
+ *   firmware and its programs (SPEC-ANE-SLEEP-H17.md). On 25G83 0x24 is
+ *   still not taken after 0x31 (C7). A failed warm boot falls back to the
+ *   cold one.
  */
-static const bool ane_fw_sleep_warm = true;
+#define ane_fw_sleep_warm(b) ((b)->soc->sleep_warm)
 #define ANE_FW_SUSPEND_REPORT_MAX 0x100
 
 static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
@@ -494,6 +500,7 @@ static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
 /* Reverse of the proven power-up: sub-block, PWGATE, CPU, then ANE_SYS. */
 static int ane_fw_power_down(struct ane_fw_backend *b)
 {
+	u32 sys;
 	int ret;
 
 	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) & ~0xf, b->pmgr + 0xc008);
@@ -512,7 +519,13 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	b->powered = false;
 	b->power_ref = false;
 	pm_runtime_put_sync(b->power);
-	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep\n");
+	/*
+	 * PMGR reads are safe in any power state. ANE_SYS's actual state
+	 * (bits 7:4) reads 0 once genpd has really turned the domain off.
+	 */
+	sys = ane_rd32(b, b->pmgr + 0x290);
+	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep; ANE_SYS %s (%#x)\n",
+		 sys & 0xf0 ? "still on" : "off", sys);
 	return 0;
 }
 
@@ -679,10 +692,18 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	b->transport.allow_free = true;
+	b->resume_ready_ns = ktime_get_ns();
+	dev_info(dev, "H17 ANE: booted again from the preload after system sleep in %llu ms\n",
+		 div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC));
+	/* Every open program back behind its handle, as the application left it. */
 	ane_h16_session_restart(&b->session);
-	dev_info(dev, "H17 ANE: booted again from the preload after system sleep in %llu ms; earlier programs are lost\n",
-		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC));
-	return 0;
+	ret = ane_h16_session_replay(&b->session, &b->resume_replayed, &b->resume_first_ns);
+	if (ret) {
+		dev_err(dev, "H17 ANE: PROGRAM REPLAY FAILED %d after %u programs; session quarantined\n",
+			ret, b->resume_replayed);
+		WARN_ONCE(1, "H17 ANE: program replay failed after system sleep (%d)\n", ret);
+	}
+	return ret;
 }
 
 /* The cold way down: nothing in flight, then power off under the firmware. */
@@ -724,7 +745,7 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	if (b->stage != ANE_STAGE_PROGRAM)
 		return -EBUSY;
 	ane_h16_session_sleep(&b->session, true);
-	if (!ane_fw_sleep_warm) {
+	if (!ane_fw_sleep_warm(b)) {
 		ret = ane_fw_cold_cycle_down(b);
 		if (ret == -EBUSY) {
 			/* Nothing was written: refuse this sleep and keep running. */
@@ -753,16 +774,22 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 
 static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 {
+	s64 ready, first;
+	u64 start;
 	int ret;
 
 	guard(mutex)(&b->lock);
 	if (!b->slept)
 		return;
 	b->slept = false;
-	ret = ane_fw_sleep_warm ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b);
-	if (ret && ane_fw_sleep_warm) {
+	start = ktime_get_ns();
+	b->resume_ready_ns = 0;
+	b->resume_first_ns = 0;
+	b->resume_replayed = 0;
+	ret = ane_fw_sleep_warm(b) ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b);
+	if (ret && ane_fw_sleep_warm(b)) {
 		/* Fall back to the cold cycle: off again, then boot from the preload. */
-		dev_warn(&b->pdev->dev, "H17 ANE: warm boot failed (%d); cold boot, programs lost\n",
+		dev_warn(&b->pdev->dev, "H17 ANE: warm boot failed (%d); cold boot and program replay\n",
 			 ret);
 		ret = b->powered ? ane_fw_power_down(b) : 0;
 		if (!ret)
@@ -774,6 +801,13 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		b->session.quarantined = true;
 	}
 	ane_h16_session_sleep(&b->session, false);
+	/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
+	ready = b->resume_ready_ns ? div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
+	first = b->resume_first_ns ? div_u64(b->resume_first_ns - start, NSEC_PER_MSEC) : -1;
+	dev_info(&b->pdev->dev,
+		 "H17 ANE: resume %s: firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed\n",
+		 ret ? "FAILED" : "ok", ready, first,
+		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), b->resume_replayed);
 }
 
 static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void *unused)

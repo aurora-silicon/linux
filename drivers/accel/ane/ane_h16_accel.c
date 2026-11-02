@@ -109,7 +109,7 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 						     args->hwx_size, &snapshot);
 	if (ret)
 		goto out;
-	ret = ane_h16_session_enter(a->session);
+	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
 	if (ret)
 		goto out;
 	/* Lost across system sleep: release it, the caller is reloading. */
@@ -166,7 +166,7 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			   array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
 	start = ktime_get_ns();
-	ret = ane_h16_session_enter(a->session);
+	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
 	if (ret)
 		return ret;
 	locked = ktime_get_ns();

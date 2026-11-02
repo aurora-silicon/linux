@@ -201,6 +201,8 @@ struct ane_h16_program {
 	struct list_head deferred;
 	/* Firmware boot the program was loaded in; an older one means lost. */
 	u64 epoch;
+	/* In the session's list of programs to replay after a cold boot. */
+	struct list_head node;
 };
 
 /* The quiet time that ends serving the SHAREDMALLOC ring after UNLOAD. */
@@ -281,9 +283,12 @@ struct ane_h16_session {
 	struct list_head deferred;
 	/*
 	 * Firmware boot count: a cold restart across system sleep loses every
-	 * program loaded before it (ane_h16_session_restart()).
+	 * program loaded before it (ane_h16_session_restart()) until it is
+	 * replayed (ane_h16_session_replay()).
 	 */
 	u64 epoch;
+	/* Created programs not yet closed, in load order. */
+	struct list_head programs;
 	wait_queue_head_t wake;
 	/* The accel node lock the sleep gate serializes on. */
 	struct mutex *lock;
@@ -313,10 +318,12 @@ int ane_h16_session_load(struct ane_h16_session *s,
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
 void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
-int ane_h16_session_enter(struct ane_h16_session *s);
+int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
 unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
 void ane_h16_session_restart(struct ane_h16_session *s);
+int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
+			   u64 *first_ns);
 bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p);
 
 void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,

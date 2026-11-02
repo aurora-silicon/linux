@@ -487,6 +487,7 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	s->settle_ns = ANE_H16_SETTLE_QUIET_NS;
 	init_waitqueue_head(&s->wake);
 	INIT_LIST_HEAD(&s->deferred);
+	INIT_LIST_HEAD(&s->programs);
 	spin_lock_init(&s->stats_lock);
 	return 0;
 }
@@ -790,6 +791,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	p->generation = ++s->generation;
 	p->epoch = s->epoch;
 	INIT_LIST_HEAD(&p->deferred);
+	INIT_LIST_HEAD(&p->node);
 	memset(snapshot, 0, sizeof(*snapshot));
 	p->session = s;
 	s->program = p;
@@ -821,6 +823,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	/* Each validated program has exactly one procedure. */
 	p->key.procedure = 0;
 	p->created = true;
+	list_add_tail(&p->node, &s->programs);
 	s->ops->log(s->ctx, "CREATE process", p->key.program, p->key.process);
 	*program = p;
 out:
@@ -1333,6 +1336,7 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 		return -EINPROGRESS;
 	}
 	p->closed = true;
+	list_del_init(&p->node);
 	/*
 	 * The firmware that knew this program was powered off and booted again
 	 * from the preload: there is nothing to tear down, and nothing reads
@@ -1380,11 +1384,14 @@ EXPORT_SYMBOL_GPL(ane_h16_session_close);
  * system sleep, freezably so the freezer can stop their task, and enter with
  * the session's serializing lock held.
  */
-int ane_h16_session_enter(struct ane_h16_session *s)
+int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock)
 {
 	int ret;
 
 	for (;;) {
+		/* O_NONBLOCK: a clean -EAGAIN while the engine is cycled. */
+		if (nonblock && READ_ONCE(s->asleep))
+			return -EAGAIN;
 		ret = wait_event_freezable(s->wake, !READ_ONCE(s->asleep));
 		if (ret)
 			return ret;
@@ -1439,6 +1446,87 @@ void ane_h16_session_restart(struct ane_h16_session *s)
 EXPORT_SYMBOL_GPL(ane_h16_session_restart);
 
 /*
+ * Put one program back on a firmware booted again from the preload, behind
+ * its existing handle: its regions are rewritten from the HWX snapshot as at
+ * its first LOAD (the aux sections and every mapping kept their DVAs), then
+ * LOAD and CREATE are sent again and the firmware's new program and process
+ * IDs replace the old ones. The firmware sees exactly the image it saw at
+ * the first LOAD, so the program computes the same outputs.
+ */
+static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	u8 *command;
+	const u8 *reply;
+	unsigned int i;
+	int ret;
+
+	ret = h16_pool_room(s, h16_load_sequence, 2);
+	if (ret)
+		return ret;
+	command = kzalloc(ANE_H16_CREATE_SIZE, GFP_KERNEL);
+	if (!command)
+		return -ENOMEM;
+	for (i = 0; i < p->plan.count; i++) {
+		const struct ane_h16_hwx_region *r = &p->plan.regions[i];
+
+		memset(p->regions[i].cpu, 0, p->regions[i].size);
+		memcpy(p->regions[i].cpu, (const u8 *)p->snapshot.bytes + r->file_offset,
+		       r->file_size);
+		h16_sync(s, &p->regions[i], true);
+	}
+	ret = ane_h16_load_encode(command, ANE_H16_LOAD_SIZE, p->slots);
+	if (!ret)
+		ret = h16_send(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE, &reply);
+	if (!ret)
+		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
+	if (!ret) {
+		memset(command, 0, ANE_H16_CREATE_SIZE);
+		ret = ane_h16_create_encode(command, ANE_H16_CREATE_SIZE, p->key.program);
+	}
+	if (!ret)
+		ret = h16_send(s, ANE_FW_IO, command, ANE_H16_CREATE_SIZE, &reply);
+	if (!ret)
+		ret = ane_h16_create_reply(reply, ANE_H16_CREATE_SIZE, p->key.program,
+					   &p->key.process);
+	kfree(command);
+	if (ret)
+		return h16_fail(s, ret);
+	p->epoch = s->epoch;
+	s->ops->log(s->ctx, "program replayed", p->key.program, p->key.process);
+	return 0;
+}
+
+/*
+ * After ane_h16_session_restart(): replay every program that was loaded and
+ * not closed, in load order, so that its handle runs again unchanged. A
+ * program closed while asleep is only released (it stays lost). A failed
+ * replay is a bug: it is logged loudly, quarantines the session (the
+ * firmware state is uncertain) and returns the error.
+ */
+int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
+			   u64 *first_ns)
+{
+	struct ane_h16_program *p;
+	int ret;
+
+	*replayed = 0;
+	*first_ns = 0;
+	list_for_each_entry(p, &s->programs, node) {
+		if (!list_empty(&p->deferred))
+			continue;
+		ret = h16_replay(s, p);
+		if (ret) {
+			s->ops->log(s->ctx, "PROGRAM REPLAY FAILED", p->key.program, (u64)-ret);
+			return ret;
+		}
+		if (!(*replayed)++)
+			*first_ns = h16_now(s);
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_replay);
+
+/*
  * The caller's last reference: free a closed program and its HWX snapshot.
  * A program whose teardown failed keeps everything until reset.
  */
@@ -1448,6 +1536,7 @@ void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p)
 		return;
 	if (s->program == p)
 		s->program = NULL;
+	list_del_init(&p->node);
 	ane_h16_hwx_snapshot_destroy(&p->snapshot);
 	kfree(p);
 }
