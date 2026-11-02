@@ -24,6 +24,7 @@ properties:
       - apple,t6050-apif-ascwrap-v6
       - apple,t6050-ascwrap-v6
       - apple,t6050-x1n1-ascwrap-v6
+      - apple,t6050-j775d-ascwrap-v6
 
   reg:
     items:
