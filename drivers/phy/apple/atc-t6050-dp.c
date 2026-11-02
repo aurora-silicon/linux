@@ -83,7 +83,9 @@ struct t6050_dp {
 	void __iomem *banks[45];
 	struct resource resources[45];
 	struct apple_tunable *tunables[ARRAY_SIZE(tunable_names)];
-	struct atc_domain domain[3]; /* USB AON, common, wrapper: native order. */
+	/* USB AON, common, wrapper: native order; a combo may add USB. */
+	struct atc_domain domain[4];
+	unsigned int ndomains;
 	u32 training[4][16];
 	u32 voltage[4], pre[4];
 	int rate;
@@ -605,14 +607,14 @@ static int t6050_typec_register(struct t6050_dp *dp)
 
 static int t6050_dp_probe(struct platform_device *pdev)
 {
-	static const char * const domains[] = {"usb-aon", "common", "wrapper"};
+	static const char * const domains[] = {"usb-aon", "common", "wrapper", "usb"};
 	struct device *dev = &pdev->dev;
 	struct t6050_dp *dp;
 	struct phy_provider *provider;
 	struct phy *phy;
 	struct resource *core;
 	void __iomem *base;
-	int ret;
+	int ndomains, ret;
 
 	dp = devm_kzalloc(dev, sizeof(*dp), GFP_KERNEL);
 	if (!dp)
@@ -741,10 +743,16 @@ static int t6050_dp_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
-	/* Three named domains prevent automatic wrapper enable at probe time. */
-	if (of_count_phandle_with_args(dev->of_node, "power-domains", "#power-domain-cells") != 3)
+	/*
+	 * Named domains prevent automatic wrapper enable at probe time. A combo
+	 * PHY may also name the USB controller's domain, which its USB2 banks
+	 * are in (combo_start()).
+	 */
+	ndomains = of_count_phandle_with_args(dev->of_node, "power-domains", "#power-domain-cells");
+	if (ndomains != 3 && !(dp->combo && ndomains == 4))
 		return -EINVAL;
-	for (unsigned int i = 0; i < ARRAY_SIZE(domains); i++) {
+	dp->ndomains = ndomains;
+	for (unsigned int i = 0; i < dp->ndomains; i++) {
 		dp->domain[i].dev = dev_pm_domain_attach_by_name(dev, domains[i]);
 		if (IS_ERR_OR_NULL(dp->domain[i].dev))
 			return dev_err_probe(dev, dp->domain[i].dev ? PTR_ERR(dp->domain[i].dev) : -ENODEV,
