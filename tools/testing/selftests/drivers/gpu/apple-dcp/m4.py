@@ -196,6 +196,20 @@ static void routes(void)
         assert(!dcp_m4_callback_ack(&packet, &ack));
         assert(ack == (0x342U | (stream << 10)));
     }
+    /* Out of band: stream 1 for the AP packet, its reply and its callbacks. */
+    assert(dcp_m4_decode_word(0x402 | (12ULL << 32), &packet) == -EPROTO);
+    assert(!dcp_m4_decode_word_oob(0x402 | (64ULL << 16) | (36ULL << 32), &packet));
+    assert(packet.stream == 1 && packet.offset == 64 && !packet.reply);
+    assert(dcp_m4_packet_offset(&packet, false) == 0x8040);
+    assert(dcp_m4_packet_offset(&packet, true) == 0x68040);
+    assert(!dcp_m4_callback_ack(&packet, &ack) && ack == 0x442);
+    assert(!dcp_m4_nested_offset(&packet, false, 12, &offset) && offset == 128);
+    assert(!dcp_m4_decode_word_oob(0x442, &packet) && packet.reply && packet.stream == 1);
+    assert(!dcp_m4_decode_word_oob(2 | (12ULL << 32), &packet) && !packet.stream);
+    assert(dcp_m4_decode_word_oob(0x802 | (12ULL << 32), &packet) == -EPROTO);
+    assert(dcp_m4_decode_word_oob(0xc02 | (12ULL << 32), &packet) == -EPROTO);
+    packet = (struct dcp_m4_packet){.stream = 2, .length = 12};
+    assert(dcp_m4_packet_offset(&packet, false) == -EINVAL);
     puts("PASS READY identity, bounded packet parsing, nested offset and callback routing");
 }
 
@@ -496,6 +510,12 @@ static u64 mul_u32_u32(u32 x,u32 y) { return (u64)x*y; }
 #define spin_lock_irqsave(p,f) do { (void)(p); (f)=0; } while(0)
 #define spin_unlock_irqrestore(p,f) do { (void)(p); (void)(f); } while(0)
 typedef u64 dma_addr_t;
+typedef int64_t s64;
+typedef s64 ktime_t;
+#define max(x,y) ((x)>(y)?(x):(y))
+static ktime_t clock_ns;
+static ktime_t ktime_get(void) { return clock_ns += 1000; }
+static s64 ktime_us_delta(ktime_t later,ktime_t earlier) { return (later-earlier)/1000; }
 struct iomfb_m4;
 struct apple_dcp {
     struct iomfb_m4 *v26_6;
@@ -518,6 +538,10 @@ struct iomfb_m4 {
     struct drm_framebuffer *active_fb,*uncertain_fb;
     struct dcp_m4_frame active_frame;
     u64 flips,blanks;
+    bool powered_off;
+    bool display_off;
+    u64 display_off_cycles;
+    s64 display_off_us,display_off_us_max,display_on_us,display_on_us_max;
 };
 static void mutex_lock(int *lock) { assert(!*lock); *lock=1; }
 static void mutex_unlock(int *lock) { assert(*lock==1); *lock=0; }
@@ -529,6 +553,11 @@ static void dcp_backlight_kick(struct apple_dcp *dcp) { assert(dcp->v26_6); defe
 static void drm_framebuffer_get(struct drm_framebuffer *fb) { fb->refs++; }
 static void drm_framebuffer_put(struct drm_framebuffer *fb) { assert(fb->refs); fb->refs--; }
 static void dcp_m4_failed(struct iomfb_m4 *dcp,int error) { if(!dcp->error) dcp->error=error; }
+static unsigned cache_kicks;
+static void iomfb_m4_idle_cache_kick(struct iomfb_m4 *dcp) { assert(dcp->lock==1); cache_kicks++; }
+static unsigned power_offs,power_ons;
+static int dcp_m4_set_power_state(struct iomfb_m4 *dcp,bool on)
+{ assert(dcp->lock==1); if(on) power_ons++; else power_offs++; return 0; }
 static int dcp_m4_runtime_live(struct dcp_m4_runtime *r) { return r->dcp->error; }
 static int iomfb_m4_check_frame(const struct dcp_m4_frame *f)
 { return dcp_m4_frame_check(f); }
@@ -573,13 +602,26 @@ int main(void)
         assert(fb.refs==2 && dcp.active_fb==&fb && !dcp.uncertain_fb);
         assert(!dcp_backlight_dpms(&owner,false));
         assert(deferred_kicks==kicks_before+1 && owner.backlight.state.actual==120);
+        unsigned offs_before=power_offs,ons_before=power_ons;
         /* No queued backlight worker has run: blank itself must carry zero. */
         assert(!iomfb_m4_blank(&owner));
         assert(carried_brightness && carried_nits==0 && owner.backlight.state.actual==0);
         assert(fb.refs==1 && !dcp.active_fb && !dcp.active_frame.dva && dcp.blanks==1);
+        /* The blank powered the display down, once. */
+        assert(dcp.display_off && dcp.display_off_cycles==1 && power_offs==offs_before+1);
+        /* Powered down for system sleep: refused, no reference, session intact. */
+        dcp.powered_off=true;
+        assert(iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000)==-EAGAIN);
+        assert(fb.refs==1 && !dcp.active_fb && !dcp.error);
+        assert(dcp.display_off && power_ons==ons_before);
+        dcp.powered_off=false;
         assert(!dcp_backlight_dpms(&owner,true));
         assert(deferred_kicks==kicks_before+2); /* This second kick is still deferred. */
         assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
+        /* The first frame after the blank powered it back up. */
+        assert(!dcp.display_off && power_ons==ons_before+1);
+        /* Every shown frame restarts the idle-cache countdown. */
+        assert(cache_kicks==2*order+2);
         assert(carried_brightness && carried_nits==120 && owner.backlight.state.actual==120);
         assert(fb.refs==2 && dcp.active_fb==&fb);
         failure=1;
@@ -591,6 +633,8 @@ int main(void)
     }
     puts("PASS DPMS-off blank carries zero before delayed work and completes only after both exact receipts");
     puts("PASS actual present/blank retain active+uncertain DMA framebuffer references across a missing receipt");
+    puts("PASS a present while the display is powered off for sleep is refused without a reference");
+    puts("PASS a blank powers the display down once, and the next frame powers it back up");
     return 0;
 }
 '''
