@@ -142,6 +142,8 @@ pub(crate) enum ProbeConfig {
     Legacy(&'static hw::HwConfig),
     G17(&'static g17::Config),
     M3(crate::m3::Chip),
+    /// The M5 (T8142) backend, refused unless it is built.
+    M5,
 }
 
 // OF Device ID table. Linux 7.3's of_device_table!() takes no attributes on
@@ -164,6 +166,10 @@ macro_rules! asahi_of_device_table {
                 (
                     of::DeviceId::new(c"apple,agx-t6041"),
                     ProbeConfig::G17(&hw::t6041::CONFIG)
+                ),
+                (
+                    of::DeviceId::new(c"apple,agx-t8142"),
+                    ProbeConfig::M5
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t8103"),
@@ -253,6 +259,10 @@ impl platform::Driver for AsahiPlatformDriver {
             ProbeConfig::Legacy(cfg) => *cfg,
             ProbeConfig::G17(cfg) => return AsahiPlatformDriver::probe_g17(pdev, cfg),
             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
+            #[cfg(CONFIG_DRM_ASAHI_M5)]
+            ProbeConfig::M5 => return AsahiPlatformDriver::probe_m5(pdev),
+            #[cfg(not(CONFIG_DRM_ASAHI_M5))]
+            ProbeConfig::M5 => return Err(ENODEV),
         };
 
         // SAFETY: The selected SoC's UAT output width bounds all device DMA.
@@ -440,6 +450,37 @@ impl AsahiPlatformDriver {
             raw_dev,
             raw_stats,
             stats,
+        })
+    }
+}
+
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+impl AsahiPlatformDriver {
+    fn probe_m5<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        // SAFETY: The M5 UAT has 42 output bits.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(42)?)? };
+        let resources = regs::Resources::new(pdev)?;
+        let res = regs::G17Resources::new(pdev)?;
+        let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
+        let gpu = crate::m5::probe(pdev, &drm, res)?;
+        let data = try_pin_init!(AsahiDrmRegistrationData {
+            gpu: gpu as Arc<dyn gpu::Gpu>,
+            resources,
+        });
+        // SAFETY: The registration is stored and unregistered by platform data destruction.
+        // The M5 firmware session retains its firmware-visible state until reboot.
+        let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
+        Ok(AsahiPlatformDriverData {
+            _device: reg.device().into(),
+            _reg: reg,
+            g17: None,
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            g16: None,
+            raw_dev: core::ptr::null_mut(),
+            raw_stats: core::ptr::null_mut(),
+            stats: None,
         })
     }
 }

@@ -209,7 +209,8 @@ struct drm_asahi_params_global {
 	 *
 	 * G13-G15 on 14.x report DRM_ASAHI_GPU_HAL_LEGACY.
 	 * The exact J613 25G83 runtime and the G17P runtime report
-	 * DRM_ASAHI_GPU_HAL_200.
+	 * DRM_ASAHI_GPU_HAL_200, the M5 (T8142) runtime
+	 * DRM_ASAHI_GPU_HAL_300.
 	 */
 	__u32 gpu_hal_generation;
 
@@ -241,7 +242,7 @@ enum drm_asahi_gpu_hal_generation {
 	 */
 	DRM_ASAHI_GPU_HAL_200 = 200,
 
-	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. Never reported by this kernel. */
+	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream, reported by the M5 (T8142) runtime. */
 	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
