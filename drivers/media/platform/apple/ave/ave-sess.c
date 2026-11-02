@@ -36,6 +36,9 @@
 #define AVE_H264_MAIN 4
 #define AVE_H264_HIGH 6
 #define AVE_HEVC_MAIN 1
+#define AVE_HEVC_MAIN_10 2
+/* QpBdOffset: 10-bit HEVC lets the QP go 12 below the 8-bit range. */
+#define AVE_QP_BD_OFFSET_10 12
 
 #define AVE_META_BYTES 0xc000
 /* Metadata words: coded bytes (twice), HEVC slice-header bytes, parameter sets */
@@ -114,6 +117,7 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->cw = ALIGN(p->width, 16);
 	p->ch = ALIGN(p->height, 16);
 	p->stride = ctx->src_fmt.plane_fmt[0].bytesperline;
+	p->sample_bytes = ctx->src_fmt.pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
 	p->mbs = (p->cw / 16) * (p->ch / 16);
 	p->fps_num = ctx->timeperframe.denominator;
 	p->fps_den = ctx->timeperframe.numerator;
@@ -143,6 +147,24 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	}
 	if (p->min_qp > p->max_qp)
 		p->min_qp = p->max_qp;
+
+	/*
+	 * HEVC Main 10 encodes P010 input; Main encodes NV12. The firmware
+	 * takes 16-bit samples for Main 10 (macOS converts 8-bit input to that
+	 * first), so other pairings are refused rather than converted.
+	 */
+	if ((p->codec == AVE_CODEC_HEVC &&
+	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
+	    (p->sample_bytes == 2))
+		return -EINVAL;
+	if (p->sample_bytes == 2) {
+		/* Only the 9003 layout's Main 10 fields are mapped. */
+		if (ctx->ave->layout->counted)
+			return -EOPNOTSUPP;
+		p->profile = AVE_HEVC_MAIN_10;
+		p->bit_depth = 10;
+		p->min_qp -= AVE_QP_BD_OFFSET_10;
+	}
 
 	/*
 	 * Reference structures as macOS sets them up: a B-frame pyramid,
@@ -180,6 +202,9 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->coded_cap = ALIGN(3 * (p->codec == AVE_CODEC_HEVC ? ALIGN(p->width, 32) :
 							       ALIGN(p->width, 16)) *
 			     ALIGN(p->height, 16) / 2, SZ_16K);
+	/* 10-bit sessions get a quarter more, as macOS sizes them. */
+	if (p->bit_depth == 10)
+		p->coded_cap = ALIGN(p->coded_cap * 5 / 4, SZ_16K);
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
 	if (ctx->ave->layout->counted &&
 	    (p->fps_num != 30ULL * p->fps_den ||
@@ -361,7 +386,7 @@ static void ave_note_copy(struct ave_ctx *ctx, u32 stride, const char *how)
 }
 
 /*
- * The input picture for @slot, as a DART address. The encoder reads NV12
+ * The input picture for @slot, as a DART address. The encoder reads NV12 (P010)
  * with the 64-byte aligned stride S_FMT reported and chroma right after
  * height luma lines. Some clients (ffmpeg's v4l2m2m encoder) fill the
  * buffer with their own, smaller line size instead, which shows in the
@@ -377,7 +402,7 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	u32 off = vb->planes[0].data_offset;
 	u32 used = vb2_get_plane_payload(vb, 0) - min(off, vb2_get_plane_payload(vb, 0));
 	u32 crows = DIV_ROUND_UP(p->height, 2), rows = p->height + crows;
-	u32 width = ALIGN(p->width, 2), stride;
+	u32 width = ALIGN(p->width, 2) * p->sample_bytes, stride;
 	struct ave_buf *b = &sess->slot[slot].bounce;
 	const u8 *from;
 	u8 *to;

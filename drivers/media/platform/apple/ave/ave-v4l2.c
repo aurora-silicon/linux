@@ -54,6 +54,7 @@ static const u32 ave_coded_fmts[] = {
 
 static const u32 ave_raw_fmts[] = {
 	V4L2_PIX_FMT_NV12,
+	V4L2_PIX_FMT_P010,
 };
 
 static const struct v4l2_event ave_eos_event = {
@@ -87,17 +88,22 @@ static void ave_clamp_size(u32 coded, u32 *w, u32 *h)
 }
 
 /*
- * Raw NV12, one buffer: Y plane, then interleaved CbCr at half height.
- * @coded is the context's coded format, which limits the size.
+ * Raw NV12 or P010, one buffer: Y plane, then interleaved CbCr at half
+ * height. P010 holds 10-bit samples in the high bits of 16-bit words; it
+ * is the input for HEVC Main 10. @coded is the context's coded format,
+ * which limits the size.
  */
 static void ave_fill_raw(struct v4l2_pix_format_mplane *f, u32 coded)
 {
-	u32 stride, height;
+	u32 stride, height, bytes;
 
-	f->pixelformat = V4L2_PIX_FMT_NV12;
+	if (f->pixelformat != V4L2_PIX_FMT_P010 || coded != V4L2_PIX_FMT_HEVC)
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+	bytes = f->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
 	ave_clamp_size(coded, &f->width, &f->height);
 	/* Keep a client's stride, within reason, rounded to 64 bytes. */
-	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width, 2 * AVE_MAX_W),
+	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width * bytes,
+			       2 * AVE_MAX_W * bytes),
 		       AVE_STRIDE_ALIGN);
 	height = ALIGN(f->height, AVE_STEP);
 	f->num_planes = 1;
@@ -449,8 +455,10 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
 		ctx->hevc_max_qp = ctrl->val;
 		break;
-	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
+		ctx->hevc_profile = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
 	default:
@@ -510,8 +518,11 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 0, 51, 1, 51);
 
+	/* Main 10 takes P010 input; the profile is checked against it at STREAMON. */
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, 0,
+			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+			       ~(BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) |
+				 BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)),
 			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1, 0,
