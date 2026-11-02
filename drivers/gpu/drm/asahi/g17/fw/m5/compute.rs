@@ -137,10 +137,6 @@ pub(crate) struct Resources {
     pub(crate) policy: u64,
     /// Backed blocks of the queue's private pool this command needs ([`Gpu::plan`]).
     pub(crate) pool_blocks: usize,
-    /// The stream dispatches: it declared programs. The firmware writes a kick's descriptor
-    /// times only for a stream that dispatches (a flush-only kick completed with its
-    /// record and stamp and left them zero).
-    pub(crate) dispatches: bool,
 }
 
 /// Device policy of S's compute demand (`render_resources.rs` `plan_compute_scs`): warps resident
@@ -481,7 +477,6 @@ impl Gpu {
             control: demand.resource_flags().map_err(|_| EINVAL)?,
             policy: u64::from(ptc_target(demand.pressure(), ACTIVE_KICKS)) << 32 | RESOURCE_POLICY,
             pool_blocks,
-            dispatches: !declared.programs().is_empty(),
         })
     }
 }

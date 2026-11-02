@@ -191,6 +191,12 @@ impl Packet {
         Ok(())
     }
 
+    /// The packet relies on a firmware wait for another engine's completion (a producer that was
+    /// only published when this one was scheduled). M5 kicks encode no such wait.
+    pub(crate) fn has_firmware_waits(&self) -> bool {
+        !self.firmware.is_empty()
+    }
+
     /// Dependency-bearing packets remain on the scheduler publication path.
     pub(crate) fn has_dependencies(&self) -> bool {
         !self.inputs.is_empty() || !self.firmware.is_empty()

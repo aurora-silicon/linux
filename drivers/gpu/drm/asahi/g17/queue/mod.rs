@@ -304,7 +304,7 @@ impl<B: Backend> Queue<B> {
         let mut dependencies =
             KVec::with_capacity(inputs.len() + count + timestamp_count + failure_count, GFP_KERNEL)?;
         let mut checked_inputs =
-            KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
+            KVec::with_capacity(inputs.len() + timestamp_count + failure_count + count, GFP_KERNEL)?;
         let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
         for fence in failures.into_iter().flatten() {
             checked_inputs.push(fence.clone(), GFP_KERNEL)?;
@@ -324,6 +324,16 @@ impl<B: Backend> Queue<B> {
             // ready fence adds no ordering and would prevent shallow inline
             // publication. Failed and pending producers still need checking.
             if fences.status() > 0 {
+                continue;
+            }
+            // An M5 kick carries no firmware wait on another engine's stamp (neither the compute
+            // channel's nor the render pair's descriptor encodes one), so a ready (published)
+            // producer would order nothing on the GPU: a copy after a render read the target
+            // before the pass wrote it. The scheduler waits for the producer's completion
+            // instead, and the command consumes its status as it does an input's.
+            if self.m5.is_some() {
+                dependencies.push(fences.completed.clone(), GFP_KERNEL)?;
+                checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
                 continue;
             }
             dependencies.push(fences.ready.clone(), GFP_KERNEL)?;

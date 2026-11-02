@@ -27,6 +27,17 @@ use kernel::{prelude::*, sync::Arc};
 
 /// Queues the result of one M5 kick for signalling off the device mutex. A failed kick stays
 /// owned by its channel: its fence errors while its command stays pinned.
+/// An M5 kick has nowhere to carry a firmware wait on another engine's completion: submission
+/// gives M5 packets completion dependencies instead (`queue::Queue::enqueue`). One that still
+/// carries such a wait would publish unordered.
+fn refuse_firmware_waits(packet: &Packet) -> Result {
+    if packet.has_firmware_waits() {
+        pr_warn!("G17 M5: command with a firmware wait on another engine refused\n");
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
 fn defer(deferred: &mut DeferredBatch, retired: Retired) -> Result {
     let Some(packet) = retired.packet else {
         return Ok(());
@@ -317,6 +328,7 @@ impl Backend {
     /// (early publication from the ioctl) each returns FALLBACK, leaving the command unpublished
     /// for its scheduler.
     pub(super) fn m5_packet(&self, packet: &Arc<Packet>, wait: bool) -> Result {
+        refuse_firmware_waits(packet)?;
         packet.check_dependencies()?;
         let dispatch = Dispatch::of(&packet.command)?;
         let deadline = super::now_ns().saturating_add(WORK_RING_WAIT_NS);
@@ -537,6 +549,7 @@ impl Backend {
     /// its first pass. Each condition that clears with retirement or with recovery closing is
     /// waited for, bounded, as for M5 compute ([`Self::m5_packet`]).
     pub(in crate::g17) fn m5_render_packet(&self, packet: &Arc<Packet>) -> Result {
+        refuse_firmware_waits(packet)?;
         packet.check_dependencies()?;
         let crate::g17::command::Validated::Render {
             pass,

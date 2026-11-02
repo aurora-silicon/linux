@@ -127,8 +127,6 @@ struct Active {
     slot: usize,
     /// The pool's submission count that covers this kick.
     pool_target: u64,
-    /// Its stream dispatches, so its descriptor carries the firmware's times.
-    timed: bool,
     work: Arc<WorkStateLease>,
     /// The DRM command; `None` for the qualification's own kicks.
     packet: Option<Arc<Packet>>,
@@ -771,7 +769,6 @@ impl Channel {
                 ticket,
                 slot,
                 pool_target,
-                timed: dispatch.resources.dispatches,
                 work: work.clone(),
                 packet,
                 observed: None,
@@ -873,8 +870,11 @@ impl Channel {
 
     /// The retirement predicate of one kick: `Some` with its record's timestamps once every
     /// witness agrees, `None` while any is missing or disagrees. The witnesses: its completion
-    /// record, the stamp, the consumed item ring, the pool's count, the drained work node and,
-    /// for a stream that dispatches, the descriptor times agreeing with the record.
+    /// record, the stamp, the consumed item ring, the pool's count and the drained work node.
+    /// The descriptor's times are not a witness: the firmware writes them only for a kick that
+    /// launched work, which neither a flush-only stream nor a dispatch of an empty grid
+    /// (CTS `indirect_dispatch.upload_buffer.empty_command`) does. Where it wrote them they are
+    /// checked against the record as a diagnostic.
     fn check(&self, active: &Active, generation: u64, state: u32) -> Result<Option<[u64; 2]>> {
         if state != 0 {
             return Ok(None);
@@ -907,8 +907,12 @@ impl Channel {
             u64::from(words[0]) | (u64::from(words[1]) << 32),
             u64::from(words[2]) | (u64::from(words[3]) << 32),
         ];
-        if active.timed && (timestamps[1] != descriptor[1] || timestamps[0] > descriptor[0]) {
-            return Ok(None);
+        if descriptor != [0; 2] && (timestamps[1] != descriptor[1] || timestamps[0] > descriptor[0])
+        {
+            kernel::pr_warn_once!(
+                "G17 M5: queue {} kick {:#x}: descriptor times {:?} disagree with the record's {:?}\n",
+                self.qid(), active.ticket.kick, descriptor, timestamps
+            );
         }
         Ok(Some(timestamps))
     }
