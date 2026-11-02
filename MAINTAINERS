@@ -2822,6 +2822,14 @@ F:	Documentation/devicetree/bindings/media/apple,t8140-ave.yaml
 F:	drivers/media/platform/apple/ave/
 F:	tools/asahi/ave*-tests.py
 
+ARM/APPLE PRORES VIDEO ENCODER DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+W:	https://aurora-silicon.github.io
+F:	Documentation/devicetree/bindings/media/apple,prores.yaml
+F:	drivers/media/platform/apple/prores/
+
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
 W:	https://aurora-silicon.github.io
@@ -8194,7 +8202,6 @@ F:	Documentation/ABI/testing/sysfs-driver-ane-performance
 F:	Documentation/accel/apple-ane-cold.rst
 F:	Documentation/accel/apple-ane.rst
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
-F:	arch/arm64/boot/dts/apple/t8140-j700-ane-test.dts
 F:	drivers/accel/ane/
 F:	include/uapi/drm/ane_accel.h
 F:	tools/accel/ane-bench.py

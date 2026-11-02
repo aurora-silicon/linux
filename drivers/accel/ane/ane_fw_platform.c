@@ -11,6 +11,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 
+#include "ane_fw_cold.h"
 #include "ane_fw_platform.h"
 #include "ane_h16_boot_data.h"
 
@@ -171,10 +172,13 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	/* No backend has acquired ownership, even if DT omits the marker.
 	 * Check before resources, firmware, power, IOMMU or engine access.
 	 */
-	if (soc->owner == ANE_FW_OWNER_EXCLAVE) {
-		dev_info(dev, "H17 ANE: cold acquisition requires staged preflight; refusing direct probe\n");
-		return -EOPNOTSUPP;
-	}
+	/*
+	 * H17 is started (or left alone) by the staged path before the driver
+	 * registers; the platform probe never acquires it. -ENODEV keeps the
+	 * driver core quiet; the staged path already said why.
+	 */
+	if (soc->owner == ANE_FW_OWNER_EXCLAVE)
+		return -ENODEV;
 	if (of_property_read_bool(np, "apple,exclave-assigned")) {
 		dev_info(dev, "ANE: exclave-assigned device has no Linux ownership provider\n");
 		return -EOPNOTSUPP;
@@ -214,7 +218,12 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 
 int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
-	int ret = ane_fw_platform_preflight(pdev, soc);
+	int ret;
+
+	/* H17: the staged backend owns the engine; the device binds for it. */
+	if (ane_fw_platform_staged(soc))
+		return ane_fw_staged_bind(pdev);
+	ret = ane_fw_platform_preflight(pdev, soc);
 
 	if (ret)
 		return ret;
@@ -223,5 +232,24 @@ int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_plat
 
 void ane_fw_platform_remove(struct platform_device *pdev)
 {
+	if (ane_fw_staged_bound(&pdev->dev)) {
+		ane_fw_staged_unbind(pdev);
+		return;
+	}
 	ane_h16_backend_remove(pdev);
+}
+
+/* System sleep callbacks of the bound H16 or H17 device. */
+int ane_fw_platform_suspend(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_suspend(dev);
+	return ane_h16_backend_suspend(dev);
+}
+
+int ane_fw_platform_resume(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return 0;
+	return ane_h16_backend_resume(dev);
 }

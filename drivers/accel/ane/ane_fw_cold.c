@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Shared firmware backend. H17 is the first measured cold power provider. */
 #include <crypto/sha2.h>
+#include <linux/crash_dump.h>
+#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -15,10 +17,12 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
+#include "ane_fw_sleep.h"
 #include "ane_h16_accel.h"
 
 #define ANE_FW_POOL_DVA 0x10000384000ULL
@@ -68,14 +72,29 @@ struct ane_fw_backend {
 	u64 next_dva;
 	enum ane_fw_stage stage;
 	bool retained;
+	/* Brings the engine up to the program stage after a loader hand-off. */
+	struct work_struct start;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
+	/* The bound device holds ANE_SYS for a hand-off until the bring-up does. */
+	bool bind_held;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
  * the platform bus would otherwise resume genpd and attach DMA before probe.
  */
 static struct ane_fw_backend *ane_backend;
+/* The H17 platform device, bound by ane_fw_staged_bind(). */
+static struct device *ane_fw_bound_dev;
+
+/* The bring-up holds ANE_SYS itself now: drop the bind's hand-off reference. */
+static void ane_fw_bind_release(struct ane_fw_backend *b)
+{
+	if (!b->bind_held)
+		return;
+	b->bind_held = false;
+	pm_runtime_put(&b->pdev->dev);
+}
 
 /*
  * Every register access of this backend goes through these helpers, so a
@@ -150,7 +169,7 @@ static bool ane_fw_raw_boot(void)
 	const char *evidence;
 
 	return chosen && !of_property_read_string(chosen, "apple,ane-cold-boot", &evidence) &&
-	       !strcmp(evidence, "raw-no-xnu-ane-untouched-v1");
+	       !strcmp(evidence, ANE_FW_COLD_BOOT_EVIDENCE);
 }
 
 /*
@@ -224,11 +243,11 @@ static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
 {
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, pm_notifier);
+	bool retained = READ_ONCE(b->retained);
 
-	if ((event == PM_SUSPEND_PREPARE || event == PM_HIBERNATION_PREPARE ||
-	     event == PM_RESTORE_PREPARE) && READ_ONCE(b->retained))
-		return NOTIFY_BAD;
-	return NOTIFY_DONE;
+	if (ane_fw_sleep_refused(event, retained))
+		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_event(event, retained);
 }
 
 static int ane_fw_retain(struct ane_fw_backend *b)
@@ -274,8 +293,14 @@ static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
 	return 0;
 }
 
-static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
-			   int prot, struct ane_fw_surface *s)
+/*
+ * Coherent (uncached) memory for firmware-owned state, or, with cached,
+ * CPU-cacheable memory for program surfaces that the CPU copies to and from
+ * on every request. The engine does not snoop either; cached surfaces are
+ * kept coherent by ane_fw_program_sync() around each use.
+ */
+static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
+			    int prot, bool cached, struct ane_fw_surface *s)
 {
 	struct ane_fw_mapping *m;
 	int ret;
@@ -283,10 +308,21 @@ static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
 	m = kzalloc_obj(*m);
 	if (!m)
 		return -ENOMEM;
-	m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical, GFP_KERNEL);
+	if (cached)
+		m->surface.cpu = dma_alloc_noncoherent(b->memory, size, &m->physical,
+						       DMA_BIDIRECTIONAL, GFP_KERNEL);
+	else
+		m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical,
+						    GFP_KERNEL);
 	if (!m->surface.cpu) {
 		kfree(m);
 		return -ENOMEM;
+	}
+	if (cached) {
+		/* Zero it and write the zeroes back before the engine sees it. */
+		memset(m->surface.cpu, 0, size);
+		dma_sync_single_for_device(b->memory, m->physical, size, DMA_BIDIRECTIONAL);
+		m->surface.handle = m->physical;
 	}
 	m->surface.dva = dva;
 	m->surface.size = size;
@@ -296,6 +332,12 @@ static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
 	if (!ret)
 		*s = m->surface;
 	return ret;
+}
+
+static int ane_fw_alloc_at(struct ane_fw_backend *b, u64 dva, size_t size,
+			   int prot, struct ane_fw_surface *s)
+{
+	return ane_fw_alloc_mem(b, dva, size, prot, false, s);
 }
 
 static int ane_fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *s)
@@ -354,16 +396,13 @@ static u64 ane_fw_now(void *ctx)
 }
 
 /*
- * Every wait polls. Sleep in the shared short steps first (see
- * ane_fw_poll_sleep_us()) and back off for long waits such as a stalled
- * request, so a stall costs no more CPU than a 1 ms poll.
+ * Every wait polls, with the shared pacing (see ane_fw_poll_sleep_us()):
+ * busy steps for the first 30 us, then short sleeps, backing off for long
+ * waits such as a stalled request.
  */
 static void ane_fw_relax(void *ctx, u64 waited_ns)
 {
-	unsigned int min_us, max_us;
-
-	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
-	usleep_range(min_us, max_us);
+	ane_fw_poll_pause(waited_ns);
 }
 
 static void ane_fw_refused(void *ctx, u64 word0, u64 word1, u64 word2, int error)
@@ -374,12 +413,21 @@ static void ane_fw_refused(void *ctx, u64 word0, u64 word1, u64 word2, int error
 		 word0, word1, word2, error);
 }
 
+static void ane_fw_cold_shared_note(void *ctx, const char *event, u64 dva, u64 size, u32 tag)
+{
+	struct ane_fw_backend *b = ctx;
+
+	dev_info(&b->pdev->dev, "SHAREDMALLOC %s tag=%#x bytes=%llu dva=%#llx\n",
+		 event, tag, size, dva);
+}
+
 static const struct ane_fw_transport_ops ane_fw_ops = {
 	.load64 = ane_fw_load64, .store64 = ane_fw_store64,
 	.read_barrier = ane_fw_rmb, .write_barrier = ane_fw_wmb,
 	.read32 = ane_fw_read32, .write32 = ane_fw_write32,
 	.now_ns = ane_fw_now, .relax = ane_fw_relax,
 	.alloc = ane_fw_alloc, .refused = ane_fw_refused,
+	.shared_note = ane_fw_cold_shared_note,
 };
 
 /*
@@ -395,10 +443,16 @@ static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
 	u64 ce;
 	int ret;
 
-	b->power = dev_pm_domain_attach_by_id(dev, 0);
-	if (IS_ERR_OR_NULL(b->power))
-		return b->power ? PTR_ERR(b->power) : -ENODEV;
+	/*
+	 * The bound device carries ANE_SYS itself: platform_probe attached it
+	 * to its single domain, so genpd sees the engine's own reference.
+	 */
+	if (!dev->pm_domain || dev != ane_fw_bound_dev)
+		return -ENODEV;
+	b->power = dev;
 	ret = pm_runtime_resume_and_get(b->power);
+	/* The bring-up holds ANE_SYS now (or failed and stops here). */
+	ane_fw_bind_release(b);
 	if (ret < 0)
 		return ret;
 	if ((ane_rd32(b, b->pmgr + 0x290) & 0xff) != 0xff)
@@ -467,8 +521,25 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 	return 0;
 }
 
+/*
+ * The measured 26.6.2 H17 TEXT. A different firmware build is refused before
+ * anything is powered or written.
+ */
+static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE] = {
+	0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
+	0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
+	0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
+	0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
+};
+
+/*
+ * The loader's preload hand-off. apple,preload-data-sha256 is optional: with
+ * it the private DATA copy must match the loader's digest of what it handed
+ * off; without it, the live DATA at copy time (ane_fw_preload()).
+ */
 static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
-				   u64 size[2], u64 dva[2], u8 data_pin[SHA256_DIGEST_SIZE])
+				   u64 size[2], u64 dva[2], u8 data_pin[SHA256_DIGEST_SIZE],
+				   bool *have_data_pin)
 {
 	struct device_node *np = b->pdev->dev.of_node;
 	unsigned int i;
@@ -476,10 +547,10 @@ static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
 
 	if (!of_property_read_bool(np, "apple,firmware-preloaded") ||
 	    of_property_count_u32_elems(np, "memory-region") != 2 ||
-	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2) ||
-	    of_property_read_u8_array(np, "apple,preload-data-sha256", data_pin,
-				      SHA256_DIGEST_SIZE))
+	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2))
 		return -ENODATA;
+	*have_data_pin = !of_property_read_u8_array(np, "apple,preload-data-sha256",
+						     data_pin, SHA256_DIGEST_SIZE);
 	/* The same no-map, outside-System-RAM rule as the H16 preload. */
 	for (i = 0; i < 2; i++) {
 		const char *name;
@@ -498,19 +569,14 @@ static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
 
 static int ane_fw_preload(struct ane_fw_backend *b)
 {
-	static const u8 text_pin[SHA256_DIGEST_SIZE] = {
-		0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
-		0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
-		0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
-		0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
-	};
 	u64 physical[2], size[2], dva[2], tail, tail_size;
 	struct ane_fw_surface snapshots[2], heap_tail;
 	u8 digest[SHA256_DIGEST_SIZE], data_pin[SHA256_DIGEST_SIZE];
+	bool have_data_pin;
 	unsigned int i;
 	int ret;
 
-	ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin);
+	ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin, &have_data_pin);
 	if (ret)
 		return ret;
 	for (i = 0; i < 2; i++) {
@@ -519,6 +585,9 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 
 		if (!source)
 			return -ENOMEM;
+		/* Without a loader digest, the copy must match the live DATA. */
+		if (i && !have_data_pin)
+			sha256(source, size[i], data_pin);
 		ret = ane_fw_alloc_at(b, dva[i], size[i],
 				      IOMMU_READ | (i ? IOMMU_WRITE : 0), &snapshots[i]);
 		if (!ret)
@@ -529,7 +598,7 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		sha256_init(&hash);
 		sha256_update(&hash, snapshots[i].cpu, size[i]);
 		sha256_final(&hash, digest);
-		if (memcmp(digest, i ? data_pin : text_pin, sizeof(digest)))
+		if (memcmp(digest, i ? data_pin : ane_fw_text_pin, sizeof(digest)))
 			return -EKEYREJECTED;
 	}
 	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
@@ -719,8 +788,8 @@ static int ane_fw_program_map(void *ctx, size_t size, bool write, struct ane_fw_
 	if (!size || !IS_ALIGNED(size, SZ_16K) ||
 	    b->next_dva > ANE_FW_ALLOC_DVA + SZ_512M - size)
 		return -ENOSPC;
-	ret = ane_fw_alloc_at(b, b->next_dva, size,
-			      IOMMU_READ | (write ? IOMMU_WRITE : 0), out);
+	ret = ane_fw_alloc_mem(b, b->next_dva, size,
+			       IOMMU_READ | (write ? IOMMU_WRITE : 0), true, out);
 	if (ret)
 		return ret;
 	b->next_dva += size;
@@ -734,9 +803,21 @@ static void ane_fw_program_log(void *ctx, const char *item, u64 a, u64 c)
 	dev_info(&b->pdev->dev, "H17 %s %llx %llx\n", item, a, c);
 }
 
+/* Program surfaces are cacheable: clean before the engine, invalidate after. */
+static void ane_fw_program_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
+{
+	struct ane_fw_backend *b = ctx;
+
+	if (for_device)
+		dma_sync_single_for_device(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+	else
+		dma_sync_single_for_cpu(b->memory, s->handle, s->size, DMA_BIDIRECTIONAL);
+}
+
 static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.map = ane_fw_program_map,
 	.log = ane_fw_program_log,
+	.sync = ane_fw_program_sync,
 };
 
 /*
@@ -745,6 +826,52 @@ static const struct ane_h16_session_ops ane_fw_session_ops = {
  * pool after UNLOAD, often only during a later program, so FREE stays
  * admitted; backing is retained until reboot.
  */
+/*
+ * <debugfs>/ane-h17/<dev>/execute: per-phase EXECUTE times of the shared
+ * session, see ane_h16_session_stats_show(). Writing anything resets them.
+ * Created at the program stage; the retained backend pins the module, so
+ * the file and its session live until reboot.
+ */
+static int ane_fw_execute_show(struct seq_file *m, void *v)
+{
+	return ane_h16_session_stats_show(m, m->private);
+}
+
+static int ane_fw_execute_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ane_fw_execute_show, inode->i_private);
+}
+
+static ssize_t ane_fw_execute_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	ane_h16_session_stats(((struct seq_file *)file->private_data)->private, NULL, true);
+	return count;
+}
+
+static const struct file_operations ane_fw_execute_fops = {
+	.owner = THIS_MODULE,
+	.open = ane_fw_execute_open,
+	.read = seq_read,
+	.write = ane_fw_execute_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static void ane_fw_debugfs(struct ane_fw_backend *b)
+{
+	struct dentry *root = debugfs_lookup("ane-h17", NULL);
+	bool found = root;
+
+	if (!found)
+		root = debugfs_create_dir("ane-h17", NULL);
+	debugfs_create_file("execute", 0600,
+			    debugfs_create_dir(dev_name(&b->pdev->dev), root),
+			    &b->session, &ane_fw_execute_fops);
+	if (found)
+		dput(root);
+}
+
 static int ane_fw_program_stage(struct ane_fw_backend *b)
 {
 	int ret;
@@ -755,9 +882,11 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
-	if (!ret)
-		dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
-	return ret;
+	if (ret)
+		return ret;
+	ane_fw_debugfs(b);
+	dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
+	return 0;
 }
 
 static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -807,15 +936,16 @@ static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t c
 	if (next == ANE_STAGE_MAPPED) {
 		u64 physical[2], size[2], dva[2];
 		u8 data_pin[SHA256_DIGEST_SIZE];
+		bool have_data_pin;
 
 		ane_fw_snapshot_pmgr(b);
 		if (!ane_fw_cold_pmgr_valid(&b->cold, ane_fw_raw_boot())) {
 			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or child power state); refusing\n");
 			return -EPERM;
 		}
-		ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin);
+		ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin, &have_data_pin);
 		if (ret) {
-			dev_info(dev, "H17 ANE: loader preload reservation or digest missing; refusing\n");
+			dev_info(dev, "H17 ANE: loader preload reservation missing; refusing\n");
 			return ret;
 		}
 		ret = ane_fw_retain(b);
@@ -845,6 +975,79 @@ static ssize_t firmware_stage_store(struct device *dev, struct device_attribute 
 	return ret;
 }
 static DEVICE_ATTR_RW(firmware_stage);
+
+/*
+ * Read the loader hand-off without touching the engine: the raw-boot marker,
+ * the preload reservations (disabled placeholders until a loader fills them)
+ * and the TEXT segment against the driver's pin.
+ */
+static bool ane_fw_handoff_present(struct platform_device *pdev,
+				   const struct ane_fw_platform *soc, struct ane_fw_handoff *hp)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
+	struct ane_fw_handoff h = {};
+	u8 digest[SHA256_DIGEST_SIZE];
+	unsigned int i;
+
+	if (chosen)
+		of_property_read_string(chosen, "apple,ane-cold-boot", &h.marker);
+	h.preloaded = of_property_read_bool(np, "apple,firmware-preloaded");
+	h.regions_ok = of_property_count_u32_elems(np, "memory-region") == 2 &&
+		       of_property_count_u64_elems(np, "apple,firmware-iovas") == 2 &&
+		       !of_property_read_u64_array(np, "apple,firmware-iovas", h.dva, 2);
+	for (i = 0; h.regions_ok && i < 2; i++) {
+		const char *name;
+
+		h.regions_ok = !of_property_read_string_index(np, "memory-region-names", i,
+							      &name) &&
+			       !strcmp(name, i ? "firmware-data" : "firmware-text") &&
+			       !ane_fw_preload_range(np, i, &h.phys[i], &h.size[i]);
+	}
+	if (h.regions_ok && ane_fw_preload_ranges_valid(soc, h.phys, h.size, h.dva)) {
+		void *text = memremap(h.phys[0], h.size[0], MEMREMAP_WB);
+
+		if (text) {
+			sha256(text, h.size[0], digest);
+			memunmap(text);
+			h.text_ok = !memcmp(digest, ane_fw_text_pin, sizeof(digest));
+		}
+	}
+	*hp = h;
+	if (ane_fw_cold_handoff_loader_ok(&h, soc))
+		return true;
+	dev_info(&pdev->dev, "H17 ANE: no loader hand-off (%s); leaving the engine alone\n",
+		 !h.marker || strcmp(h.marker, ANE_FW_COLD_BOOT_EVIDENCE) ? "raw-boot marker" :
+		 !h.preloaded || !h.regions_ok ? "preload reservations" :
+		 !h.text_ok ? "firmware TEXT pin" : "preload layout");
+	return false;
+}
+
+/*
+ * Run probe..program once, as the stage file would, so the accel node exists
+ * on every boot with a loader hand-off. A failure stops at that stage; after
+ * acquisition it quarantines, as from the stage file.
+ */
+static void ane_fw_start_work(struct work_struct *work)
+{
+	static const char *const steps[] = { "probe", "map", "boot", "startup", "program" };
+	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, start);
+	unsigned int i, flags;
+	ssize_t ret;
+
+	for (i = 0; i < ARRAY_SIZE(steps); i++) {
+		flags = lock_system_sleep();
+		ret = ane_fw_stage_action(&b->pdev->dev, steps[i], strlen(steps[i]));
+		unlock_system_sleep(flags);
+		if (ret < 0) {
+			dev_err(&b->pdev->dev, "H17 ANE: boot bring-up stopped at %s, error %zd\n",
+				steps[i], ret);
+			ane_fw_bind_release(b);
+			return;
+		}
+	}
+	dev_info(&b->pdev->dev, "H17 ANE: up at boot, accel node ready\n");
+}
 
 static void ane_fw_observer_free(struct ane_fw_backend *b)
 {
@@ -882,6 +1085,7 @@ static int ane_fw_window(struct ane_fw_backend *b, unsigned int index, void __io
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
 	struct device_node *np = pdev->dev.of_node;
+	struct ane_fw_handoff handoff;
 	struct ane_fw_backend *b;
 	unsigned int i;
 	u32 dart_phandles[ANE_FW_DARTS];
@@ -889,6 +1093,9 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 
 	if (ane_backend || soc->soc != 0x8140)
 		return -EOPNOTSUPP;
+	/* No hand-off (an older loader, a warm boot): leave the engine alone. */
+	if (!ane_fw_handoff_present(pdev, soc, &handoff))
+		return -ENODEV;
 	b = kzalloc_obj(*b);
 	if (!b)
 		return -ENOMEM;
@@ -962,17 +1169,115 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		ret = ane_fw_window(b, 2, b->gate, np, 2);
 	if (ret)
 		goto fail;
+	/*
+	 * The marker survives a kexec. Read PMGR (safe in any power state) and
+	 * start only if the ANE CPU and sub-block are still off, never in a
+	 * kdump kernel.
+	 */
+	ane_fw_snapshot_pmgr(b);
+	handoff.pmgr = &b->cold;
+	handoff.crash_kernel = is_kdump_kernel();
+	if (!ane_fw_cold_handoff_valid(&handoff, soc)) {
+		dev_info(&pdev->dev, "H17 ANE: engine not cold (%s); leaving it alone\n",
+			 handoff.crash_kernel ? "kdump kernel" : "CPU or sub-block powered");
+		ret = -ENODEV;
+		goto fail;
+	}
 	ane_backend = b;
 	ret = device_create_file(&pdev->dev, &dev_attr_firmware_stage);
 	if (ret) {
 		ane_backend = NULL;
 		goto fail;
 	}
-	dev_info(&pdev->dev, "H17 ANE: read-only staged observer ready; IRQs 655/668 remain masked\n");
+	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
+	INIT_WORK(&b->start, ane_fw_start_work);
 	return 0;
 fail:
 	ane_fw_observer_free(b);
 	return ret;
+}
+
+/*
+ * Bind the H17 platform device. Left unbound, it is a fw_devlink consumer
+ * that never binds, so the PMGR power controller's sync_state never runs and
+ * genpd keeps every boot-on domain under it on (stay_on), ANE_SYS included,
+ * whatever the backend puts: the domain never powers off, at idle or across
+ * system sleep. Bound, the device carries ANE_SYS through its own runtime
+ * PM: platform_probe attached it to its single domain. With a loader
+ * hand-off the engine is powered as the loader left it, so the bind holds
+ * ANE_SYS until the bring-up takes its own reference (ane_fw_power()) or
+ * stops; without one the device is runtime suspended and the domain is
+ * free to go off.
+ */
+int ane_fw_staged_bind(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct ane_fw_backend *b = ane_backend;
+	bool handoff = b && b->pdev == pdev;
+	int ret;
+
+	if (ane_fw_bound_dev)
+		return -EBUSY;
+	if (handoff) {
+		ret = pm_runtime_set_active(dev);
+		if (ret)
+			return ret;
+		pm_runtime_get_noresume(dev);
+		b->bind_held = true;
+	}
+	ret = devm_pm_runtime_enable(dev);
+	if (ret) {
+		if (handoff) {
+			b->bind_held = false;
+			pm_runtime_put_noidle(dev);
+			pm_runtime_set_suspended(dev);
+		}
+		return ret;
+	}
+	ane_fw_bound_dev = dev;
+	dev_info(dev, "H17 ANE: bound; %s\n", handoff ?
+		 "ANE_SYS held until the bring-up owns it" : "no hand-off, engine left off");
+	return 0;
+}
+
+bool ane_fw_staged_bound(struct device *dev)
+{
+	return dev && dev == ane_fw_bound_dev;
+}
+
+void ane_fw_staged_unbind(struct platform_device *pdev)
+{
+	struct ane_fw_backend *b = ane_backend;
+
+	if (b && b->pdev == pdev)
+		ane_fw_bind_release(b);
+	ane_fw_bound_dev = NULL;
+}
+
+/*
+ * Device suspend of the bound H17 device: the PM notifier already refused
+ * system sleep while the firmware is retained; this is the backstop for a
+ * sleep path that skipped the notifiers.
+ */
+int ane_fw_staged_suspend(struct device *dev)
+{
+	struct ane_fw_backend *b = ane_backend;
+	bool retained = b && &b->pdev->dev == dev && READ_ONCE(b->retained);
+
+	if (retained)
+		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_backstop(retained);
+}
+
+/*
+ * Start the bring-up once the platform driver is registered: its probe has
+ * bound this device (ane_fw_staged_bind()) by then and cannot race the power
+ * sequence.
+ */
+void ane_fw_staged_start(void)
+{
+	if (ane_backend)
+		schedule_work(&ane_backend->start);
 }
 
 bool ane_fw_staged_exit(void)
@@ -981,6 +1286,7 @@ bool ane_fw_staged_exit(void)
 
 	if (!b)
 		return false;
+	cancel_work_sync(&b->start);
 	/* A retained backend pins the module. No unload or in-place retry. */
 	if (WARN_ON(b->retained))
 		return true;

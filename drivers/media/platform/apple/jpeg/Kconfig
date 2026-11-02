@@ -1,25 +1,26 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 config VIDEO_APPLE_JPEG
-	tristate "Apple Silicon JPEG codec skeleton"
+	tristate "Apple Silicon JPEG encoder"
 	depends on VIDEO_DEV
 	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
 	depends on OF_ADDRESS && IOMMU_API && PM
 	select V4L2_MEM2MEM_DEV
 	select VIDEOBUF2_DMA_CONTIG
 	help
-	  Build the common Apple JPEG memory-to-memory driver scaffold.
-	  Hardware revisions are not qualified yet: probe reads HWREV and
-	  refuses all currently described hardware. No reset, interrupt
-	  acknowledgment or DMA job is implemented, and streaming is refused.
-	  Device tree nodes must remain disabled pending hardware qualification.
+	  V4L2 memory-to-memory baseline JPEG encoder for the JPEG engine
+	  in Apple A18 Pro (T8140) SoCs. It takes full-range NV12M (4:2:0)
+	  or NV16M (4:2:2) frames. Other SoCs' engines are identified and
+	  refused until their register layout is supported.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-jpeg.
 
 config VIDEO_APPLE_JPEG_KUNIT_TEST
-	tristate "KUnit tests for Apple JPEG admission" if !KUNIT_ALL_TESTS
-	depends on KUNIT
+	tristate "KUnit tests for the Apple JPEG encoder" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_APPLE_JPEG
 	default KUNIT_ALL_TESTS
 	help
-	  Test exact per-compatible HWREV matching and the empty target
-	  allow-lists, including invalid readbacks and revisions observed
-	  on other SoCs. Synthetic match data exercises the admission helper.
-	  These tests do not access hardware or qualify any target revision.
+	  Check engine identification, the quantisation tables and every
+	  register write of 4:2:0 and 4:2:2 encode jobs. No hardware is
+	  needed.
