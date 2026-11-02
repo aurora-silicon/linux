@@ -8,6 +8,7 @@
 
 use core::ops::Range;
 use core::result::Result;
+use kernel::alloc::KVec;
 
 pub(crate) const ROOT_SIZE_PRIMARY: usize = 0x0b8;
 
@@ -1482,16 +1483,14 @@ const J714_AUX_PERF_STATES: [(u32, u32, u32); 14] = [
 
 // Evaluate the frequency-only curve at compile time; no kernel FPU use.
 // Conversion uses Hz before the single-precision multiply and divide.
-pub(crate) const fn relative_frequency(mhz: &[u32; 14]) -> [u32; 16] {
+pub(crate) fn relative_frequency(mhz: &[u32; M5_PERF_STATES]) -> [u32; 16] {
+    use crate::float::F32;
     let mut values = [0; 16];
-    let base = mhz[1] as u64 * 1_000_000;
-    let maximum = mhz[13] as u64 * 1_000_000;
-    let denominator = (maximum - base) as f32;
-    let mut state = 2;
-    while state < 14 {
-        let frequency = mhz[state] as u64 * 1_000_000;
-        values[state] = (((frequency - base) as f32 * 100.0) / denominator).to_bits();
-        state += 1;
+    let base = mhz[1] * 1_000_000;
+    let denominator = F32::from(mhz[M5_PERF_STATES - 1] * 1_000_000 - base);
+    for state in 2..M5_PERF_STATES {
+        let above = F32::from(mhz[state] * 1_000_000 - base);
+        values[state] = (above * F32::from(100u32) / denominator).to_bits();
     }
     values
 }
@@ -1499,27 +1498,36 @@ pub(crate) const fn relative_frequency(mhz: &[u32; 14]) -> [u32; 16] {
 /// Voltage lanes an M5 platform table holds (J775D: one per cluster, two dies x four).
 pub(crate) const M5_PLATFORM_LANES: usize = 8;
 
-/// What the M5 hardware data takes from the platform, in place of S's J714 literals.
-pub(crate) struct M5Platform {
+/// Performance states of the main and auxiliary clock domains, P0 included.
+pub(crate) const M5_PERF_STATES: usize = 14;
+
+/// The board's fixed part of the M5 hardware data, in place of S's J714 literals.
+pub(crate) struct M5Board {
     /// Firmware core type and firmware revision (HwData +0x10d4/+0x10d8; its encoding, not the raw
     /// ID revision byte).
     pub(crate) core_revision: (u32, u32),
     /// Nominal cores (+0x10dc).
     pub(crate) nominal_cores: u32,
+    /// Voltage lanes of the main clock domain's operating points.
+    pub(crate) lanes: usize,
+    /// Register windows with their physical instances, in device-VA order.
+    pub(crate) windows: &'static [J714RegisterWindowSpec],
+}
+
+/// What the M5 hardware data takes from the platform: the board's fixed part and the tables the
+/// boot loader fills into the device tree from the ADT.
+pub(crate) struct M5Platform {
+    pub(crate) board: &'static M5Board,
     /// Runnable performance states, P0 excluded (+0x10e0).
     pub(crate) perf_states: u32,
     /// Main clock domain, P0 first: MHz, then core and SRAM mV per voltage lane.
-    pub(crate) perf: [(u32, [u32; M5_PLATFORM_LANES], [u32; M5_PLATFORM_LANES]); 14],
-    /// Voltage lanes in use in `perf`.
-    pub(crate) lanes: usize,
+    pub(crate) perf: [(u32, [u32; M5_PLATFORM_LANES], [u32; M5_PLATFORM_LANES]); M5_PERF_STATES],
     /// `relative_frequency()` of `perf`'s frequencies.
     pub(crate) relative: [u32; 16],
     /// Auxiliary clock domain (CS/AFR): MHz, then core and SRAM mV for its two lanes.
-    pub(crate) aux: [(u32, [u32; 2], [u32; 2]); 14],
+    pub(crate) aux: [(u32, [u32; 2], [u32; 2]); M5_PERF_STATES],
     /// AON power-telemetry descriptors: FourCC and the two ADT words of each.
-    pub(crate) aon: &'static [[u32; 3]],
-    /// Register windows with their physical instances, in device-VA order.
-    pub(crate) windows: &'static [J714RegisterWindowSpec],
+    pub(crate) aon: KVec<[u32; 3]>,
 }
 
 fn encode_m5_aux_perf_states(out: &mut [u8], platform: &M5Platform) {
@@ -1890,7 +1898,10 @@ pub(crate) fn encode_m5_hw_data(
     platform: &M5Platform,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    if out.len() != M5_HW_DATA_SIZE || platform.lanes == 0 || platform.lanes > M5_PLATFORM_LANES {
+    if out.len() != M5_HW_DATA_SIZE
+        || platform.board.lanes == 0
+        || platform.board.lanes > M5_PLATFORM_LANES
+    {
         return Err(InitdataError::BufferSize);
     }
     required_address(qos_high)?;
@@ -1909,7 +1920,7 @@ pub(crate) fn encode_m5_hw_data(
     let g18 = &mut out[..COMMON26_HW_DATA_SIZE];
     g18.fill(0);
     write_relocated_words(M5_25G76_HW_PLATFORM_WORDS, 0, COMMON26_HW_DATA_BANDS, g18)?;
-    encode_j714_register_map(windows, platform.windows,
+    encode_j714_register_map(windows, platform.board.windows,
         &mut g18[HW_REGISTER_MAP_OFFSET..COMMON26_HW_REGISTER_MAP_END])?;
     put_u32(g18, COMMON26_HW_CHIP_ID_OFFSET, 0x6050);
     put_u32(g18, COMMON26_HW_PERF_STATE_COUNT, platform.perf_states);
@@ -1919,9 +1930,9 @@ pub(crate) fn encode_m5_hw_data(
     // J714's 26A428 hardware data carries 1 here.
     // Firmware copies the fb0..fbf header at initialization.
     put_u32(g18, 0x0fb8, 1);
-    put_u32(g18, 0x10d4, platform.core_revision.0);
-    put_u32(g18, 0x10d8, platform.core_revision.1);
-    put_u32(g18, 0x10dc, platform.nominal_cores);
+    put_u32(g18, 0x10d4, platform.board.core_revision.0);
+    put_u32(g18, 0x10d8, platform.board.core_revision.1);
+    put_u32(g18, 0x10dc, platform.board.nominal_cores);
     put_u32(g18, 0x283a, 1);
     put_u32(g18, 0x283e, 1);
     let top = platform.perf[platform.perf.len() - 1].0;
@@ -1934,7 +1945,7 @@ pub(crate) fn encode_m5_hw_data(
         // Lanes past the platform's repeat its last one, as S's J714 rows repeated lane 0.
         for lane in 0..COMMON26_HW_PERF_LANES {
             let row = state * COMMON26_HW_PERF_ROW_STRIDE + lane * 4;
-            let source = if lane < platform.lanes { lane } else { 0 };
+            let source = if lane < platform.board.lanes { lane } else { 0 };
             put_u32(g18, COMMON26_HW_PERF_CORE_VOLTAGE + row, core[source]);
             put_u32(g18, COMMON26_HW_PERF_SRAM_VOLTAGE + row, sram[source]);
         }

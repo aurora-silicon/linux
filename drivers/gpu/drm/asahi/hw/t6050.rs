@@ -9,7 +9,7 @@
 //! checks them against the device tree's operating points, which the boot loader fills from the
 //! same ADT.
 
-use crate::g17::fw::m5::initdata::{relative_frequency, J714RegisterWindowSpec, M5Platform};
+use crate::g17::fw::m5::initdata::{J714RegisterWindowSpec, M5Board};
 use crate::g17::{Config, CoreLayout, CrashBuffers, FixedBuffer, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 use crate::mmu::UatQuirks;
@@ -38,7 +38,7 @@ pub(crate) const CONFIG: Config = Config {
         va: 0x10_0008_0000,
         size: 0x8000,
     },
-    // The M5 graph takes its windows from M5_PLATFORM.
+    // The M5 graph takes its windows from M5_BOARD.
     windows: &[],
     reserved_slots: &[],
     perf: &crate::hw::t8140::PERF,
@@ -68,7 +68,7 @@ pub(crate) const CONFIG: Config = Config {
         operand_state: crate::g17::fw::compute::OperandState::ONE_BY_SIX,
         deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
     },
-    m5: Some(&M5_PLATFORM),
+    m5: Some(&M5_BOARD),
 };
 
 /// Chip identifier written to the hardware data.
@@ -193,117 +193,14 @@ const WINDOWS: [J714RegisterWindowSpec; 32] = [
     ),
 ];
 
-const MHZ: [u32; 14] = [
-    0, 338, 486, 636, 796, 888, 988, 1084, 1182, 1278, 1374, 1470, 1578, 1620,
-];
-
-/// The J775D platform of the M5 hardware data.
-pub(crate) const M5_PLATFORM: M5Platform = M5Platform {
+/// The J775D board's fixed part of the M5 hardware data. Its performance, auxiliary and AON
+/// tables come from the device tree, which the boot loader fills from the ADT.
+pub(crate) const M5_BOARD: M5Board = M5Board {
     // Core type 0x1a (variant 6) and firmware revision 2 for raw revision 0x11.
     core_revision: (0x1a, 2),
     // 2 dies x 4 clusters x 10 slots; 64 enabled, counted from the core masks at probe.
     nominal_cores: 80,
-    perf_states: 13,
-    // ADT sgx perf-states (one table per cluster) and perf-states-sram, mV.
-    perf: [
-        (
-            0,
-            [125, 125, 125, 125, 125, 125, 125, 125],
-            [775, 775, 775, 775, 775, 775, 775, 775],
-        ),
-        (
-            338,
-            [615, 615, 615, 615, 615, 610, 610, 615],
-            [775, 775, 775, 775, 775, 775, 775, 775],
-        ),
-        (
-            486,
-            [670, 655, 655, 670, 650, 665, 665, 650],
-            [775, 775, 775, 775, 775, 775, 775, 775],
-        ),
-        (
-            636,
-            [695, 690, 690, 695, 690, 690, 690, 690],
-            [775, 775, 775, 775, 775, 775, 775, 775],
-        ),
-        (
-            796,
-            [760, 745, 745, 760, 745, 740, 740, 745],
-            [775, 775, 775, 775, 775, 775, 775, 775],
-        ),
-        (
-            888,
-            [770, 755, 755, 770, 750, 750, 750, 750],
-            [775, 775, 775, 775, 775, 775, 775, 775],
-        ),
-        (
-            988,
-            [795, 780, 780, 795, 775, 775, 775, 775],
-            [795, 780, 780, 795, 775, 775, 775, 775],
-        ),
-        (
-            1084,
-            [805, 805, 805, 805, 815, 800, 800, 815],
-            [805, 805, 805, 805, 815, 800, 800, 815],
-        ),
-        (
-            1182,
-            [815, 810, 810, 815, 825, 820, 820, 825],
-            [815, 810, 810, 815, 825, 820, 820, 825],
-        ),
-        (
-            1278,
-            [860, 845, 845, 860, 870, 855, 855, 870],
-            [860, 845, 845, 860, 870, 855, 855, 870],
-        ),
-        (
-            1374,
-            [885, 885, 885, 885, 895, 895, 895, 895],
-            [885, 885, 885, 885, 895, 895, 895, 895],
-        ),
-        (
-            1470,
-            [930, 930, 930, 930, 940, 935, 935, 940],
-            [930, 930, 930, 930, 940, 935, 935, 940],
-        ),
-        (
-            1578,
-            [1020, 1005, 1005, 1020, 1030, 1015, 1015, 1030],
-            [1020, 1005, 1005, 1020, 1030, 1015, 1015, 1030],
-        ),
-        (
-            1620,
-            [1045, 1040, 1040, 1045, 1065, 1050, 1050, 1065],
-            [1045, 1040, 1040, 1045, 1065, 1050, 1050, 1065],
-        ),
-    ],
+    // One voltage lane per cluster.
     lanes: 8,
-    relative: relative_frequency(&MHZ),
-    // ADT afr-perf-states / cs-perf-states (one lane per die), mV; SRAM floor 775 mV.
-    aux: [
-        (24, [125, 125], [775, 775]),
-        (338, [600, 600], [775, 775]),
-        (486, [660, 655], [775, 775]),
-        (636, [670, 665], [775, 775]),
-        (796, [710, 705], [775, 775]),
-        (888, [720, 720], [775, 775]),
-        (988, [755, 765], [775, 775]),
-        (1084, [800, 795], [800, 795]),
-        (1182, [810, 820], [810, 820]),
-        (1278, [850, 860], [850, 860]),
-        (1374, [905, 915], [905, 915]),
-        (1470, [945, 955], [945, 955]),
-        (1578, [1030, 1040], [1030, 1040]),
-        (1620, [1075, 1085], [1075, 1085]),
-    ],
-    // The Ultra's ADT AON power-telemetry records.
-    aon: &[
-        [0x6730_5452, 0x019f_0001, 0x0000_1401], // g0TR
-        [0x6731_5452, 0x01bb_0001, 0x0000_1401], // g1TR
-        [0x6732_5452, 0x00a7_0001, 0x0000_1401], // g2TR
-        [0x6733_5452, 0x00c3_0001, 0x0000_1401], // g3TR
-        [0x7230_5452, 0x0113_0001, 0x0000_1401], // r0TR
-        [0x7231_5452, 0x001b_0001, 0x0000_1401], // r1TR
-    ],
     windows: &WINDOWS,
 };

@@ -162,9 +162,10 @@ impl InitData {
             &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total],
         )
         .map_err(|e| bad("private cluster", e))?;
-        let windows = m::m5_register_windows(platform.windows).map_err(|e| bad("windows", e))?;
-        let windows = &windows[..platform.windows.len()];
-        for (window, spec) in windows.iter().zip(platform.windows) {
+        let windows =
+            m::m5_register_windows(platform.board.windows).map_err(|e| bad("windows", e))?;
+        let windows = &windows[..platform.board.windows.len()];
+        for (window, spec) in windows.iter().zip(platform.board.windows) {
             let stride =
                 (u64::from(window.size) + mmu::UAT_PGMSK as u64) & !(mmu::UAT_PGMSK as u64);
             for (instance, physical) in spec.instances.iter().copied().enumerate() {

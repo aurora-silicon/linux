@@ -201,9 +201,9 @@ pub(crate) struct Config {
     pub(crate) firmware: fw::variant::Firmware,
     /// Layouts of the command buffers that follow the GPU's core layout.
     pub(crate) core_layout: CoreLayout,
-    /// The platform of the M5 firmware graph ([`fw::variant::InitGraph::M5`]); `None` for the
+    /// The board of the M5 firmware graph ([`fw::variant::InitGraph::M5`]); `None` for the
     /// others.
-    pub(crate) m5: Option<&'static fw::m5::initdata::M5Platform>,
+    pub(crate) m5: Option<&'static fw::m5::initdata::M5Board>,
 }
 
 /// Layouts of the firmware command buffers that follow a SoC's GPU core layout.
@@ -1526,9 +1526,8 @@ impl Gpu {
         root_entries: Option<[u64; 3]>,
         shared: &Arc<Shared>,
     ) -> Result {
-        let platform = cfg.m5.ok_or(EINVAL)?;
-        Self::check_m5_opps(dev, cfg, platform)?;
-        session.init.build_m5(dev, &session.uat, platform, shared.active_cores)?;
+        let platform = Self::m5_platform(dev, cfg, cfg.m5.ok_or(EINVAL)?)?;
+        session.init.build_m5(dev, &session.uat, &platform, shared.active_cores)?;
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
@@ -1549,28 +1548,114 @@ impl Gpu {
         Ok(())
     }
 
-    /// The platform's performance table must be the device tree's operating points, which the boot
-    /// loader fills from the ADT: one source, checked here rather than trusted twice.
-    fn check_m5_opps(
+    /// The M5 platform tables, from the device tree the boot loader fills from the ADT: the main
+    /// operating points with their core and SRAM voltage per lane, the auxiliary (CS/AFR) ones
+    /// with one voltage per die, the CS/AFR SRAM floor and the AON power-telemetry records.
+    fn m5_platform(
         dev: &AsahiDrmDevice,
         cfg: &'static Config,
-        platform: &fw::m5::initdata::M5Platform,
-    ) -> Result {
-        let opps = initdata::InitData::opps(dev, cfg.opps, platform.lanes as u32)?;
-        for (index, (opp, (mhz, core, _))) in opps.iter().zip(platform.perf.iter()).enumerate() {
-            let volts = &opp.volt_uv[..platform.lanes];
-            if opp.freq_hz != u64::from(*mhz) * 1_000_000
-                || volts.iter().zip(core).any(|(uv, mv)| *uv != mv * 1000)
-            {
-                dev_err!(
-                    dev.as_ref(),
-                    "GPU operating point {} differs from the M5 platform table\n",
-                    index
+        board: &'static fw::m5::initdata::M5Board,
+    ) -> Result<KBox<fw::m5::initdata::M5Platform>> {
+        use fw::m5::initdata::{relative_frequency, M5_PERF_STATES, M5_PLATFORM_LANES};
+        let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
+        let bad = |what: &str| {
+            dev_err!(dev.as_ref(), "M5 platform: invalid {} in the device tree\n", what);
+            EINVAL
+        };
+        let mv = |cells: &KVec<u32>, count: usize, what: &str| -> Result<KVec<u32>> {
+            if cells.len() != count || cells.iter().any(|uv| uv % 1000 != 0) {
+                return Err(bad(what));
+            }
+            let mut out = KVec::with_capacity(count, GFP_KERNEL)?;
+            for uv in cells.iter() {
+                out.push(uv / 1000, GFP_KERNEL)?;
+            }
+            Ok(out)
+        };
+        let lanes = board.lanes;
+        if cfg.opps != M5_PERF_STATES || lanes == 0 || lanes > M5_PLATFORM_LANES {
+            return Err(bad("operating-point shape"));
+        }
+
+        let mut perf = [(0, [0; M5_PLATFORM_LANES], [0; M5_PLATFORM_LANES]); M5_PERF_STATES];
+        let mut mhz = [0; M5_PERF_STATES];
+        let table = node.parse_phandle(c_str!("operating-points-v2"), 0).ok_or(EIO)?;
+        let mut count = 0;
+        for (state, opp) in table.children().enumerate() {
+            let entry = perf.get_mut(state).ok_or_else(|| bad("operating-points-v2 count"))?;
+            let hz: u64 = opp.get_property(c_str!("opp-hz"))?;
+            if hz % 1_000_000 != 0 {
+                return Err(bad("opp-hz"));
+            }
+            entry.0 = u32::try_from(hz / 1_000_000)?;
+            mhz[state] = entry.0;
+            let core = mv(&opp.get_property(c_str!("opp-microvolt"))?, lanes, "opp-microvolt")?;
+            let sram = mv(
+                &opp.get_property(c_str!("opp-microvolt-sram"))?,
+                lanes,
+                "opp-microvolt-sram",
+            )?;
+            entry.1[..lanes].copy_from_slice(&core);
+            entry.2[..lanes].copy_from_slice(&sram);
+            count += 1;
+        }
+        if count != M5_PERF_STATES {
+            return Err(bad("operating-points-v2 count"));
+        }
+
+        // CS and AFR share the firmware's one auxiliary table, so the two must agree. SRAM is
+        // the core voltage, held at the CS/AFR SRAM floor.
+        let floor: u32 = node.get_property(c_str!("apple,csafr-min-sram-microvolt"))?;
+        let floor = floor / 1000;
+        let mut aux = [(0, [0; 2], [0; 2]); M5_PERF_STATES];
+        for (index, name) in [c_str!("apple,cs-opp"), c_str!("apple,afr-opp")]
+            .into_iter()
+            .enumerate()
+        {
+            let table = node.parse_phandle(name, 0).ok_or(EIO)?;
+            let mut count = 0;
+            for (state, opp) in table.children().enumerate() {
+                let hz: u64 = opp.get_property(c_str!("opp-hz"))?;
+                let core = mv(
+                    &opp.get_property(c_str!("opp-microvolt"))?,
+                    2,
+                    "auxiliary opp-microvolt",
+                )?;
+                let entry = (
+                    u32::try_from(hz / 1_000_000)?,
+                    [core[0], core[1]],
+                    [core[0].max(floor), core[1].max(floor)],
                 );
-                return Err(EINVAL);
+                let slot = aux.get_mut(state).ok_or_else(|| bad("auxiliary opp count"))?;
+                if index > 0 && *slot != entry {
+                    return Err(bad("CS/AFR tables (they differ)"));
+                }
+                *slot = entry;
+                count += 1;
+            }
+            if count != M5_PERF_STATES {
+                return Err(bad("auxiliary opp count"));
             }
         }
-        Ok(())
+
+        let cells: KVec<u32> = node.get_property(c_str!("apple,aon-ptd"))?;
+        if cells.is_empty() || cells.len() % 3 != 0 {
+            return Err(bad("apple,aon-ptd"));
+        }
+        let mut aon = KVec::with_capacity(cells.len() / 3, GFP_KERNEL)?;
+        for record in cells.chunks_exact(3) {
+            aon.push([record[0], record[1], record[2]], GFP_KERNEL)?;
+        }
+
+        // On the heap: boot_m5's frame stays small under the deep paths it calls.
+        Ok(KBox::new(fw::m5::initdata::M5Platform {
+            board,
+            perf_states: M5_PERF_STATES as u32 - 1,
+            perf,
+            relative: relative_frequency(&mhz),
+            aux,
+            aon,
+        }, GFP_KERNEL)?)
     }
 
     /// Waits for a firmware that sends no acknowledgment message to accept its
