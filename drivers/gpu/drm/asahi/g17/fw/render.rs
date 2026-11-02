@@ -126,6 +126,8 @@ const MACRO_TILES: u64 = 4;
 const REGION_ENTRY_SIZE: u64 = 5;
 /// Highest number of samples per pixel, as a power of two.
 const SAMPLES_LOG2_MAX: u8 = 2;
+/// The M5 register programs' highest (S `write_m5`): HAL300 also renders 8x.
+const M5_SAMPLES_LOG2_MAX: u8 = 3;
 /// Bytes of tile buffer per block.
 const TIB_BLOCK_SIZE: u64 = 2048;
 const TILE_CONFIG_BASE: u64 = 0x280;
@@ -456,7 +458,11 @@ struct PassWords {
 
 impl PassWords {
     fn new(pass: &RenderPass) -> Result<Self> {
-        if pass.samples_log2 > SAMPLES_LOG2_MAX {
+        Self::with_sample_limit(pass, SAMPLES_LOG2_MAX)
+    }
+
+    fn with_sample_limit(pass: &RenderPass, max_samples_log2: u8) -> Result<Self> {
+        if pass.samples_log2 > max_samples_log2 {
             return Err(EINVAL);
         }
         let samples = 1u64 << pass.samples_log2;
@@ -1613,7 +1619,7 @@ impl CommonPrograms {
             return Err(EINVAL);
         }
         let g = Geometry::new(args.pass)?;
-        let w = PassWords::new(args.pass)?;
+        let w = PassWords::with_sample_limit(args.pass, M5_SAMPLES_LOG2_MAX)?;
         self.ta = without_scs(&ta_registers(args, &g, &w)?, TA_SCS_ENABLE_INDEX)?;
         self.fragment = without_scs(&fragment_registers(args, &g, &w), FRAGMENT_SCS_ENABLE_INDEX)?;
         self.store = partial_store_registers(args.pass, &w);

@@ -657,29 +657,92 @@ fn m5_compute(
     gpu.plan(declared.ok_or(EINVAL)?)
 }
 
+/// ZLS control bits (Mesa's genxml "ZLS Control"; S `m5_render_submission.rs`). Each aspect has a
+/// load and a store, each with a tiling and a compression bit; depth also has a format.
+mod zls {
+    pub(super) const Z_LOAD: u64 = 1 << 15;
+    pub(super) const S_LOAD: u64 = 1 << 14;
+    pub(super) const Z_STORE: u64 = 1 << 19;
+    pub(super) const S_STORE: u64 = 1 << 18;
+    pub(super) const Z_TILING: u64 = 1 << 1 | 1 << 5;
+    pub(super) const S_TILING: u64 = 1 << 3 | 1 << 7;
+    pub(super) const Z_COMPRESS: u64 = 1 << 2 | 1 << 6;
+    pub(super) const S_COMPRESS: u64 = 1 << 4 | 1 << 8;
+    /// Depth format, bits 25:26: 0 is D32F, 2 is D16 (bit 26).
+    pub(super) const Z_FORMAT: u64 = 3 << 25;
+    pub(super) const Z_FORMAT_16: u64 = 1 << 26;
+    pub(super) const DEPTH: u64 = Z_LOAD | Z_STORE | Z_TILING | Z_COMPRESS | Z_FORMAT;
+    pub(super) const STENCIL: u64 = S_LOAD | S_STORE | S_TILING | S_COMPRESS;
+}
+
+/// The M5 depth/stencil forms of an admitted pass: what Honeykrisp's M5 render setup emits
+/// (`agx_pack_zls_control` over D16, D32F and the two independent planes of D32F_S8 / D16_S8,
+/// and S8), with or without the M5 lossless depth/stencil compression
+/// (`hk_m5_depth_compression_eligible`). Every set bit is a known one of an attached aspect; a
+/// compressed aspect has its metadata and compresses its load and its store alike, and a plain
+/// one has none, because the partial phases load and store every attached aspect with the main
+/// pass's control ([`super::fw::render`] `partial_zls_control`); one tiling for both
+/// directions, for the same reason. The surfaces' mappings were checked by the common parser.
+/// No ZLS resolve (bits 56 and 58): Honeykrisp does not emit it.
+fn m5_zls(pass: &RenderPass) -> bool {
+    let control = pass.zls_control;
+    let aspect = |attached: &ZlsSurface, bits: u64, tiling: u64, compress: u64| {
+        let used = control & bits;
+        (attached.va != 0 || used == 0)
+            && (used & tiling == 0 || used & tiling == tiling)
+            && match used & compress {
+                0 => attached.compression_va == 0,
+                both if both == compress => attached.compression_va != 0,
+                _ => false,
+            }
+    };
+    control & !(zls::DEPTH | zls::STENCIL) == 0
+        && control & zls::Z_FORMAT & !zls::Z_FORMAT_16 == 0
+        && aspect(&pass.depth, zls::DEPTH, zls::Z_TILING, zls::Z_COMPRESS)
+        && aspect(&pass.stencil, zls::STENCIL, zls::S_TILING, zls::S_COMPRESS)
+        // A multisample pass keeps the plain layout: Honeykrisp compresses multisample depth only
+        // for a kernel that advertises M5_DEPTH_MSAA_COMPRESSION, which this one does not.
+        && (pass.samples_log2 == 0
+            || (pass.depth.compression_va == 0 && pass.stencil.compression_va == 0))
+}
+
 /// The M5 subset of a render pass, after the common checks, and the plan of its declarations.
-/// The first admitted form: one layer, one sample, stored color without depth or
-/// stencil, few or many primitives; no ray queries, scratch or helper programs. The fragment
-/// attachment list is validated and not yet encoded: the M5 kick carries no cache-maintenance
-/// table. Other forms are admitted as they qualify.
+/// The admitted forms (widened by qualification): one layer; one sample, or 2, 4
+/// or 8 (S's multisample form: at least 8 bytes per sample and at most 2048 samples per tile, so
+/// 8x needs 16x16 tiles), with the tile's storage within the render plan's bound
+/// ([`m5::compute::MAX_IMAGEBLOCK_BYTES`]); stored color, resolved or not (the resolve is the
+/// end-of-tile program's); the depth/stencil forms of [`m5_zls`] with their load, clear and
+/// store operations (and the firmware's partial store and reload of each attached aspect); few
+/// or many primitives; no ray queries, scratch or helper programs. The fragment attachment list is
+/// validated and not yet encoded: the M5 kick carries no cache-maintenance table. Other forms
+/// are admitted as they qualify.
 fn m5_render(
     pass: &RenderPass,
     ray_query: &[RayQueryStage; 2],
     gpu: &m5::compute::Gpu,
     declared: &Option<RenderDeclared>,
 ) -> Result<m5::compute::RenderPlan> {
-    let single_sample = pass.layers == 1
-        && pass.samples_log2 == 0
+    let tile = u32::from(pass.utile_width) * u32::from(pass.utile_height);
+    let samples = 1u32 << pass.samples_log2;
+    let storage = pass.layers == 1
         && pass.sample_size % 8 == 0
-        && u32::from(pass.sample_size) * u32::from(pass.utile_width) * u32::from(pass.utile_height)
-            <= m5::compute::MAX_IMAGEBLOCK_BYTES;
-    if !single_sample
-        || pass.zls_control != 0
-        || pass.depth.va != 0
-        || pass.stencil.va != 0
+        && (pass.samples_log2 == 0 || (pass.sample_size >= 8 && tile * samples <= 2048))
+        && u32::from(pass.sample_size) * tile * samples <= m5::compute::MAX_IMAGEBLOCK_BYTES;
+    if !storage
+        || !m5_zls(pass)
         || ray_query.iter().any(|stage| stage.intersection.enabled() || stage.scratch.enabled())
     {
         kernel::pr_warn_once!("G17 M5: render form outside the M5 subset refused\n");
+        let attached = |surface: &ZlsSurface| match (surface.va != 0, surface.compression_va != 0) {
+            (false, _) => "none",
+            (true, false) => "plain",
+            (true, true) => "compressed",
+        };
+        let (depth, stencil) = (attached(&pass.depth), attached(&pass.stencil));
+        pr_warn!(
+            "G17 M5: render form refused: {} layers, {} samples, {} B/sample, ZLS {:#x}, depth {}, stencil {}\n",
+            pass.layers, samples, pass.sample_size, pass.zls_control, depth, stencil
+        );
         return Err(EOPNOTSUPP);
     }
     let declared = declared.as_ref().ok_or_else(|| {

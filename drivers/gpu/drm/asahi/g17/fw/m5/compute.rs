@@ -162,8 +162,13 @@ const MAX_THREADS: u32 = 1024;
 const MAX_SHARED_BYTES: u32 = 32 * 1024;
 /// Compute profiles one command may declare.
 const MAX_PROGRAMS: usize = 16;
-/// Tile storage of a single-sample pass in the M5 render subset (`command::m5_render`).
+/// Tile storage of a pass in the M5 render subset (`command::m5_render`): bytes per sample times
+/// samples times the tile's pixels.
 pub(crate) const MAX_IMAGEBLOCK_BYTES: u32 = 65536;
+/// The multisample storage a tile declaration carries beside its imageblock. Honeykrisp's M5
+/// declaration (`hk_cmd_buffer.c`) is a quarter, the whole and four times one sample's tile
+/// storage at 2x, 4x and 8x: at most half the imageblock.
+const MAX_MULTISAMPLE_PER_IMAGEBLOCK: u32 = 2;
 /// S's configured context storage per enabled core (`M5Policy::new` `CONTEXT_FLOOR`).
 pub(crate) const CONTEXT_FLOOR: u32 = 96;
 
@@ -411,15 +416,19 @@ impl Gpu {
             }
         }
         // And the largest a render pass's tile record needs: every imageblock size in 64-byte
-        // steps (the tile storage rounds to them) with the default programs.
+        // steps (the tile storage rounds to them), with no multisample storage and with the most
+        // a multisample pass of that imageblock declares, and the default programs.
         let mut render_blocks = 0;
         for imageblock_bytes in (0..=MAX_IMAGEBLOCK_BYTES).step_by(64) {
-            let tile = uapi::drm_asahi_render_program {
-                stage: 1,
-                imageblock_bytes,
-                ..Default::default()
-            };
-            render_blocks = render_blocks.max(topology.render(&[tile])?.pool_blocks);
+            for multisample_bytes in [0, imageblock_bytes / MAX_MULTISAMPLE_PER_IMAGEBLOCK] {
+                let tile = uapi::drm_asahi_render_program {
+                    stage: 1,
+                    imageblock_bytes,
+                    multisample_bytes,
+                    ..Default::default()
+                };
+                render_blocks = render_blocks.max(topology.render(&[tile])?.pool_blocks);
+            }
         }
         Ok(Self {
             profile: &board.compute,
