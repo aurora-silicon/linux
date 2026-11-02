@@ -14,8 +14,8 @@ The provider is enabled only by an explicit ``operating-points-v2`` phandle
 and ``#interconnect-cells = <1>`` on the existing PMGR miscellaneous node. Its
 table uses ``operating-points-v2-apple-dcs``. Each enabled OPP supplies a raw
 ``opp-level`` and one ``opp-peak-kBps`` value. The driver validates duplicate
-states, zero or decreasing capacities, the T600x sleep floor of 7, and the
-boot-state ceiling before publishing the provider. It does not derive states
+states, zero or decreasing capacities, the sparse T6000 raw state set
+``{5, 6, 7, 9}``, and the boot-state ceiling before publishing the provider. It does not derive states
 from child order or convert firmware thresholds to bandwidth. Existing DTs
 without this table retain their boot and suspend policy.
 
@@ -23,8 +23,13 @@ The highest table entry must equal the boot desired state. That entry remains
 the initial vote until interconnect sync_state releases boot constraints.
 Nonzero bandwidth also holds the fabric at its boot state so untracked DMA
 clients cannot lose their fabric bandwidth to the idle governor. Requests
-change only the desired low nibble and wait for the actual field to
-confirm the requested state. A timeout restores the previous confirmed vote.
+write the raw state as one complete 32-bit command word, with all upper
+bits zero, and wait for the actual field to confirm it. Readback status
+bits must not be preserved in the command. Raw 8 is invalid; raw 9 is the
+highest DCS state. Fabric has a separate state map. A timeout restores the
+previous confirmed vote with the same complete-word command. The current
+desired and actual fields must agree with the last confirmed vote before
+a new request.
 If restoration also times out, the fabric hold remains asserted and subsequent requests and system sleep fail with
 ``-EIO`` until reboot. Errors propagate to consumers, which must not start work requiring a
 bandwidth request that failed. Firmware ownership and system sleep reject
