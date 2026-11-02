@@ -1745,8 +1745,8 @@ impl super::recovery::Memory for InitData {
         let mask = self.object(self.cluster)?
             .dword(self.recovery_slot_mask_offset())?
             .load(Ordering::Relaxed);
-        // The M5 progress records are not qualified: keep the firmware's blame without
-        // attribution evidence.
+        // M5 restarts are attributed by the queues' own start times at the halted instant
+        // (`Queues::halted_progress`), not by these progress records.
         if self.m5 {
             return Ok(super::recovery::Sources::sample(mask as u32, |_| None));
         }

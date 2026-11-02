@@ -1289,6 +1289,29 @@ impl Channel {
             None => recovery::Interrupted::None,
         }
     }
+    /// Logs what the firmware made of a kick a restart interrupted, which fails however its
+    /// witnesses read (`Completion::note_interrupted`): its record, and its descriptor's times,
+    /// which the firmware writes only for a kick that launched work. Neither proves the dispatch
+    /// whole: a measured interrupted kick ran to its record's end and still left 64 workgroups
+    /// wrong.
+    fn report_interrupted(&self, front: &Active, outcome: core::result::Result<[u64; 2], Error>) {
+        let words = self
+            .descriptors
+            .read_words::<4>(front.slot * DESCRIPTOR_BYTES + DESCRIPTOR_TIMES);
+        let launched = match words.as_ref().is_ok_and(|w| w[0] != 0 || w[1] != 0) {
+            true => "launched",
+            false => "launched no work",
+        };
+        let (how, record) = match outcome {
+            Ok(times) => ("retired by the firmware", Some(times)),
+            Err(_) => (
+                "failed by the firmware",
+                front.observed.map(|o| o.timestamps),
+            ),
+        };
+        pr_info!("G17 M5: lane {}: kick {:#x} ({}), interrupted by a restart, {} ({:?}): record {:?}, descriptor times {:x?} ({}); it fails\n",
+            self.qid(), front.ticket.kick, innocence(front), how, outcome.err(), record, words, launched);
+    }
     pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
         for (_, packet) in self.commands() {
             visit(packet.completion.status());
@@ -1300,6 +1323,37 @@ impl Channel {
                 .completion
                 .classify(class(packet.completion.status()));
         }
+    }
+    /// Notes the DRM kicks in flight for recovery's attribution, read while the firmware is
+    /// halted ([`recovery::Progress`]): the lane runs them in order, so the newest one whose
+    /// descriptor has a start time (cleared at its publication, written once it launched work)
+    /// is the one running, and with none the lane's work never started. A flush-only or
+    /// empty-grid kick writes no times; as unstarted it can lose a blame, never gain one.
+    pub(crate) fn note_progress(&self, progress: &mut recovery::Progress) {
+        let mut running = None;
+        fence(Ordering::Acquire);
+        for active in self.active.iter().filter(|active| active.packet.is_some()) {
+            let Ok(words) = self
+                .descriptors
+                .read_words::<2>(active.slot * DESCRIPTOR_BYTES + DESCRIPTOR_TIMES)
+            else {
+                return;
+            };
+            let start = u64::from(words[0]) | (u64::from(words[1]) << 32);
+            if start != 0 {
+                running = Some((active.ticket.kick, start));
+            }
+            running.get_or_insert((active.ticket.kick, 0));
+        }
+        let Some((kick, start)) = running else {
+            return;
+        };
+        progress.note(
+            [self.qid(); 2],
+            recovery::Work::Kick,
+            kick,
+            (start != 0).then_some(start),
+        );
     }
 
     /// The inner item ring's cursors.
@@ -1874,6 +1928,13 @@ impl Channel {
         while let Some(front) = self.active.first() {
             match self.check(front, state) {
                 Ok(Some(timestamps)) => {
+                    if front
+                        .packet
+                        .as_ref()
+                        .is_some_and(|p| p.completion.interrupted())
+                    {
+                        self.report_interrupted(front, Ok(timestamps));
+                    }
                     complete_qos(self.qos_owner())?;
                     // Reported before the channel gives the kick up, as Neo's release does
                     // (`Pair::release_witnessed`): a refused report leaves it owned here.
@@ -1908,6 +1969,13 @@ impl Channel {
                 // A zero-duration record is the firmware's own failure of the kick (ENODATA,
                 // `retirement::poll`); any other error is a witness that cannot be read.
                 Err(error) => {
+                    if front
+                        .packet
+                        .as_ref()
+                        .is_some_and(|p| p.completion.interrupted())
+                    {
+                        self.report_interrupted(front, Err(error));
+                    }
                     let failure = if error == ENODATA {
                         Failure::Settled
                     } else {
@@ -2186,5 +2254,16 @@ impl Channel {
                 }
             }
         }
+    }
+}
+
+/// How a recovery classified an interrupted kick, for its log line.
+fn innocence(active: &Active) -> &'static str {
+    match active.packet.as_ref().map(|packet| &packet.completion) {
+        Some(c) if c.blamed() => "blamed",
+        Some(c) if c.guilty() => "guilty",
+        Some(c) if c.spared() => "spared",
+        Some(_) => "unclassified",
+        None => "no command",
     }
 }

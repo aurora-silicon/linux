@@ -8,10 +8,12 @@
 //! processor stop. A failed fence alone never releases mappings.
 
 mod attribution;
+mod progress;
 mod slot;
 mod safety;
 pub(crate) use safety::{note_retired, since_retired};
 pub(crate) use attribution::Sources;
+pub(crate) use progress::{Progress, Work};
 use attribution::Attribution;
 
 pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {
@@ -40,6 +42,8 @@ pub(super) const RECOVERY_RECORDS: usize = 256;
 pub(super) struct Entries {
     guilty: u128,
     cancelled: u128,
+    /// QIDs with at least one valid record.
+    listed_qids: u128,
     /// Valid records, each naming one command that was in flight at the restart.
     pub(super) listed: u32,
     /// Listed commands found by their exact stamp, and by the oldest-work fallback.
@@ -62,6 +66,7 @@ impl Entries {
         if flags & u32::from(CANCELLED) != 0 {
             self.cancelled |= bit;
         }
+        self.listed_qids |= bit;
         self.listed += 1;
         true
     }
@@ -92,6 +97,12 @@ pub(super) enum Class {
 pub(super) trait Queues {
     fn render_scheduler_active(&self) -> bool;
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool>;
+    /// Each queue's work in flight and whether it started, read while the firmware is halted
+    /// in state 1, for a restart whose fault sources cannot attribute ([`Progress`]). None where
+    /// [`Sources`] does (Neo).
+    fn halted_progress(&self) -> Option<Progress> {
+        None
+    }
     /// Copy every retained queue's live producer to its recovery target, then
     /// issue a full barrier. A failed graph must not skip subsequent queues.
     fn publish_recovery_targets(&self) -> Option<Error>;
@@ -103,6 +114,8 @@ pub(super) trait Queues {
     /// partly executed, so it must never report success; see
     /// `Completion::note_interrupted`.
     fn note_interrupted(&mut self, qid: u8, stamp: u32) -> Interrupted;
+    /// Optional diagnostics only: one valid recovery record, before its command is marked.
+    fn report_record(&self, _index: usize, _flags: u32, _stamp: u32) {}
     /// Optional diagnostics only; absence cannot alter attribution or release.
     fn report_blamed_render(&self, _qid: u8) {}
     fn settle_blamed_render(&mut self, qid: u8, error: Error);
@@ -256,6 +269,7 @@ pub(super) fn service<H: Host>(
     // acknowledged; sampling them during classification can blame a bystander.
     let attribution = sources.attribute(request.blamed,
         |qid, stamp| host.render_pass_started(qid, stamp));
+    let progress = host.halted_progress();
     let target_error = host.publish_recovery_targets();
     host.transition(1, 2)?;
     let mut recovered = false;
@@ -286,6 +300,16 @@ pub(super) fn service<H: Host>(
     host.recovery_mut().pending = None;
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
+    // Without fault sources to attribute by, the table's guilty flags are checked against the
+    // work's own start times from the halted instant.
+    let (attribution, culprit) = match (&progress, attribution) {
+        (Some(progress), Attribution::Firmware) => {
+            let verdict = progress.attribute(&entries, request.blamed);
+            progress.report(&entries, request.blamed, &verdict);
+            verdict
+        }
+        (_, attribution) => (attribution, None),
+    };
     let (cancelled, blame) = classify(host, entries, request.blamed, attribution);
     if listed != 0 {
         pr_warn!(
@@ -305,6 +329,12 @@ pub(super) fn service<H: Host>(
         if blame {
             host.settle_blamed_render(qid, EIO);
             host.settle_blamed_compute(qid, EIO);
+        }
+        // The firmware's blame moved to the work that ran: it is settled as the blamed QID's
+        // would have been.
+        if let Some(culprit) = culprit.filter(|culprit| culprit.qids() & (1u128 << qid) == 0) {
+            host.settle_blamed_render(culprit.qid(), EIO);
+            host.settle_blamed_compute(culprit.qid(), EIO);
         }
     }
     if cancelled != 0 {
@@ -326,6 +356,7 @@ fn read_entries<H: Host>(host: &mut H) -> Entries {
         if !entries.include(flags) {
             break;
         }
+        host.report_record(index, flags, stamp);
         match host.note_interrupted(((flags >> 4) & 0x7f) as u8, stamp) {
             Interrupted::Exact => entries.exact += 1,
             Interrupted::Oldest => entries.fallback += 1,

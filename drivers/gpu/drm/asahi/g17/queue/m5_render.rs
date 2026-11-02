@@ -1604,6 +1604,21 @@ impl Pair {
                 .load(Ordering::Relaxed);
         }
         let failed = self.quarantine_error;
+        if let Some(packet) = active
+            .packet
+            .as_ref()
+            .filter(|p| p.completion.interrupted())
+        {
+            // An interrupted pass fails however its witnesses read
+            // (`Completion::note_interrupted`). Logged with its stage times, all zero for a pass
+            // that never started.
+            let started = match times == [0; 4] {
+                true => "never started",
+                false => "started",
+            };
+            pr_info!("G17 M5: render pair {:?}: pass {} ({}), interrupted by a restart, retired by the firmware: times {:x?} ({}); it fails\n",
+                self.qids(), active.ordinal, innocence(&packet.completion), times, started);
+        }
         retired(Retired {
             packet: active.packet.clone(),
             times,
@@ -1765,6 +1780,31 @@ impl Pair {
                 .classify(class(packet.completion.status()));
         }
     }
+    /// Notes the DRM pass in flight for recovery's attribution, read while the firmware is
+    /// halted ([`recovery::Progress`]): it started if the firmware wrote any of its stage times
+    /// (all are cleared at its publication; [`Self::retire`] logs the same words).
+    pub(crate) fn note_progress(&self, progress: &mut recovery::Progress) {
+        let Some(active) = self
+            .active
+            .as_ref()
+            .filter(|active| active.packet.is_some())
+        else {
+            return;
+        };
+        fence(Ordering::Acquire);
+        let slot = active.ordinal as usize % DEPTH;
+        let mut start = None;
+        for index in 0..4 {
+            let Ok(word) = self.support.dword(TIMES + slot * 32 + index * 8) else {
+                return;
+            };
+            let time = word.load(Ordering::Relaxed);
+            if time != 0 {
+                start = Some(start.map_or(time, |start: u64| start.min(time)));
+            }
+        }
+        progress.note(self.qids(), recovery::Work::Pass, active.ordinal, start);
+    }
 }
 
 /// [`Pair::report`]'s witnesses.
@@ -1784,4 +1824,17 @@ pub(crate) struct Report {
 /// The completion stamp of pass `ordinal` (S: the pass's sequence number, ordinal + 1, << 8).
 fn stamp_of(ordinal: u64) -> u32 {
     (ordinal as u32).wrapping_add(1).wrapping_shl(8)
+}
+
+/// How a recovery classified an interrupted pass, for its log line.
+fn innocence(completion: &crate::g17::completion::Completion) -> &'static str {
+    if completion.blamed() {
+        "blamed"
+    } else if completion.guilty() {
+        "guilty"
+    } else if completion.spared() {
+        "spared"
+    } else {
+        "unclassified"
+    }
 }

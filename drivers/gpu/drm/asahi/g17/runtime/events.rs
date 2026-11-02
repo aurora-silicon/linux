@@ -292,6 +292,20 @@ impl recovery::Queues for Service<'_> {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.firmware.queues.render_pass_started(qid, stamp)
     }
+    fn halted_progress(&self) -> Option<recovery::Progress> {
+        // M5 only: its restarts report no reason, so the fault sources cannot attribute.
+        if self.firmware.variant.submission != crate::g17::fw::variant::Submission::M5HostCommand {
+            return None;
+        }
+        let mut progress = recovery::Progress::default();
+        for channel in super::m5::channels(&self.firmware.queues.compute) {
+            channel.note_progress(&mut progress);
+        }
+        for pair in &self.firmware.queues.m5_render {
+            pair.note_progress(&mut progress);
+        }
+        Some(progress)
+    }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
         for queue in self
@@ -344,6 +358,25 @@ impl recovery::Queues for Service<'_> {
             }
         });
         interrupted
+    }
+    fn report_record(&self, index: usize, flags: u32, stamp: u32) {
+        // M5 only: each record says which of its lanes and pairs the restart caught in flight.
+        if self.firmware.variant.submission != crate::g17::fw::variant::Submission::M5HostCommand {
+            return;
+        }
+        let qid = ((flags >> 4) & 0x7f) as u8;
+        let lane = super::m5::channels(&self.firmware.queues.compute).any(|channel| channel.qid() == qid);
+        let pair = self.firmware.queues.m5_render.iter().find(|pair| pair.qids().contains(&qid));
+        let kind = match (lane, pair.is_some()) {
+            (true, _) => "compute lane",
+            (false, true) => "render pair",
+            (false, false) => "no M5 queue",
+        };
+        let guilty = match flags & 2 { 0 => "", _ => " guilty" };
+        let cancelled = match flags & 4 { 0 => "", _ => " cancelled" };
+        let now = crate::g17::qos::clock().0;
+        pr_info!("G17 M5: recovery record {}: queue {} ({}), stamp {:#x}, flags {:#x}{}{}, now {:#x}\n",
+            index, qid, kind, stamp, flags, guilty, cancelled, now);
     }
     fn report_blamed_render(&self, qid: u8) {
         self.firmware.queues.report_render_recovery(qid, &self.firmware.port);
