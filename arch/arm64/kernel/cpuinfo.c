@@ -172,6 +172,7 @@ static const char *const hwcap_str[] = {
 	[KERNEL_HWCAP_F16F32DOT]	= "f16f32dot",
 	[KERNEL_HWCAP_F16F32MM]		= "f16f32mm",
 	[KERNEL_HWCAP_SVE_LUT6]		= "svelut6",
+	[KERNEL_HWCAP_APPLE_APFLG]	= "apple_apflg",
 };
 
 #ifdef CONFIG_COMPAT

@@ -773,6 +773,45 @@ int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+int apple_x86_flags_get(void)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		return -EINVAL;
+
+	return read_sysreg(actlr_el1) & ACTLR_APPLE_APFLG ?
+		PR_AURORA_X86_FLAGS_ON : PR_AURORA_X86_FLAGS_OFF;
+}
+
+int apple_x86_flags_set(unsigned long val)
+{
+	u64 actlr;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		return -EINVAL;
+	if (val != PR_AURORA_X86_FLAGS_ON && val != PR_AURORA_X86_FLAGS_OFF)
+		return -EINVAL;
+
+	/* The task switch saves the live ACTLR_EL1, so update it atomically */
+	preempt_disable();
+	actlr = read_sysreg(actlr_el1);
+	if (val == PR_AURORA_X86_FLAGS_ON) {
+		actlr |= ACTLR_APPLE_APFLG;
+		set_thread_flag(TIF_APPLE_APFLG);
+	} else {
+		actlr &= ~ACTLR_APPLE_APFLG;
+		clear_thread_flag(TIF_APPLE_APFLG);
+	}
+	write_sysreg(actlr, actlr_el1);
+	current->thread.actlr = actlr;
+	preempt_enable();
+
+	/* Start from clear flags either way; ERET loads them from here */
+	current_pt_regs()->pstate &= ~(PSR_APPLE_PF_BIT | PSR_APPLE_AF_BIT);
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_ARM64_ACTLR_STATE
 /*
  * IMPDEF control register ACTLR_EL1 handling. Some CPUs use this to
@@ -968,6 +1007,10 @@ void arch_setup_new_exec(void)
 	ptrauth_thread_init_user();
 	mte_thread_init_user();
 	do_set_tsc_mode(PR_TSC_ENABLE);
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+	if (alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		apple_x86_flags_set(PR_AURORA_X86_FLAGS_OFF);
+#endif
 
 	if (task_spec_ssb_noexec(current)) {
 		arch_prctl_spec_ctrl_set(current, PR_SPEC_STORE_BYPASS,
