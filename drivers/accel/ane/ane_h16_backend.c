@@ -76,6 +76,8 @@ struct ane_h16_device {
 	bool acquired;
 	bool refused;
 	bool program_ready;
+	/* Firmware suspended and the engine power gated for system sleep. */
+	bool slept;
 	struct ane_h16_session session;
 	struct work_struct start;
 };
@@ -137,14 +139,177 @@ static void ane_h16_quarantine(void *ctx, int error)
 		error);
 }
 
+/*
+ * System sleep the macOS way (SPEC-ANE-SLEEP.md sections 4.1, 4.2 and 5.1):
+ * suspend the firmware with SUSPEND (0x24), power gate the engine through
+ * the PM domains it holds (DARTs first, then base, td, mpm, cpu, sys), and
+ * after resume power it back up in order, let the DARTs restore their
+ * translation state, rewrite the DAPF records, restore CE and the tunables
+ * and release the CPU with SCRATCH7 = 1, the warm-boot argument. The same
+ * firmware instance resumes with its programs; no LOAD or CREATE is replayed.
+ */
+#define ANE_H16_CMD_SUSPEND 0x24
+#define ANE_H16_WARM_BOOT 1
+
+static void ane_h16_busy(void *ctx, bool busy);
+
+static int ane_h16_suspend_firmware(struct ane_h16_device *h)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	const struct ane_h16_build *f = h->boot.build;
+	u8 command[8] = {};
+	u32 status;
+	int ret;
+
+	if (t->error)
+		return t->error;
+	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++)
+		if (t->pending[ch].active)
+			return -EBUSY;
+	ret = ane_fw_transport_settle(t, 2 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
+	if (ret < 0)
+		return ret;
+	put_unaligned_le16(ANE_H16_CMD_SUSPEND, command + 4);
+	ret = ane_fw_transport_publish(t, ANE_FW_IO, command, sizeof(command),
+				       ktime_get_ns() + 3 * NSEC_PER_SEC);
+	if (!ret)
+		ret = ane_fw_transport_wait(t, ANE_FW_IO);
+	if (ret)
+		return ret;
+	status = h->boot.ops->read32(h->boot.ctx, ANE_H16_ENGINE, f->cpu_control + 4);
+	dev_info(h->dev, "H16 ANE: SUSPEND acknowledged, wrapper status %#x\n", status);
+	/*
+	 * The ANE CPU idles in WFI (ASC wrapper status). The held H16 shutdown
+	 * read 0x6e against the 0x6a reset value: bit 2. TODO(hardware): confirm.
+	 */
+	for (u64 deadline = ktime_get_ns() + NSEC_PER_SEC;;) {
+		status = h->boot.ops->read32(h->boot.ctx, ANE_H16_ENGINE, f->cpu_control + 4);
+		if ((status & BIT(2)) || ktime_get_ns() >= deadline)
+			break;
+		usleep_range(20, 50);
+	}
+	dev_info(h->dev, "H16 ANE: firmware suspended, wrapper status %#x\n", status);
+	return status & BIT(2) ? 0 : -ETIMEDOUT;
+}
+
+/* Reverse of acquisition: perf floor, DARTs, then base, td, mpm, cpu, sys. */
+static void ane_h16_power_down(struct ane_h16_device *h)
+{
+	unsigned int i;
+
+	ane_h16_busy(h, false);
+	for (i = ARRAY_SIZE(h->dart); i-- > 0; )
+		pm_runtime_put_sync(h->dart[i]);
+	for (i = h->powered; i-- > 0; )
+		pm_runtime_put_sync(h->power[i]);
+	dev_info(h->dev, "H16 ANE: powered down for system sleep\n");
+}
+
+static int ane_h16_warm_boot(struct ane_h16_device *h)
+{
+	struct ane_h16_boot *b = &h->boot;
+	const struct ane_h16_build *f = b->build;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < h->powered; i++) {
+		ret = pm_runtime_resume_and_get(h->power[i]);
+		if (ret < 0)
+			return ret;
+	}
+	/* The DART runtime resume restores TCR/TTBR and syncs the TLBs. */
+	for (i = 0; i < ARRAY_SIZE(h->dart); i++) {
+		ret = pm_runtime_resume_and_get(h->dart[i]);
+		if (ret < 0)
+			return ret;
+	}
+	ret = ane_h16_dapf(b, true);
+	if (!ret)
+		ret = ane_h16_prepare(b);
+	if (ret)
+		return ret;
+	if (b->ops->read64(b->ctx, ANE_H16_ENGINE, f->rvbar) != f->expected_rvbar)
+		return -EIO;
+	for (i = 0; i < 8; i++)
+		ane_h16_write(b, i, 0);
+	ane_h16_write(b, 6, 1);
+	ane_h16_write(b, 7, ANE_H16_WARM_BOOT);
+	b->ops->write32(b->ctx, ANE_H16_ENGINE, f->cpu_control, 0);
+	b->transport_ops->write_barrier(b->ctx);
+	b->ops->write32(b->ctx, ANE_H16_ENGINE, f->cpu_control, f->run);
+	ret = ane_h16_wait(b, 7, f->ready, false);
+	dev_info(h->dev, "H16 ANE: warm boot RVBAR %#llx SCRATCH7 %#x wrapper status %#x (%d)\n",
+		 b->ops->read64(b->ctx, ANE_H16_ENGINE, f->rvbar), ane_h16_read(b, 7),
+		 b->ops->read32(b->ctx, ANE_H16_ENGINE, f->cpu_control + 4), ret);
+	if (ret)
+		return ret;
+	ret = ane_fw_transport_check(&b->transport);
+	if (!ret)
+		dev_info(h->dev, "H16 ANE: firmware resumed (warm boot); programs kept\n");
+	return ret;
+}
+
+static int ane_h16_sleep_prepare(struct ane_h16_device *h)
+{
+	int ret;
+
+	guard(mutex)(&ane_h16_lock);
+	if (!h->program_ready || h->boot.quarantined)
+		return -EBUSY;
+	ane_h16_session_sleep(&h->session, true);
+	ret = ane_h16_suspend_firmware(h);
+	if (ret) {
+		/* Powered, maybe suspended: keep everything, refuse, close. */
+		ane_h16_quarantine(h, ret);
+		h->boot.quarantined = true;
+		h->session.quarantined = true;
+		ane_h16_session_sleep(&h->session, false);
+		return ret;
+	}
+	ane_h16_power_down(h);
+	WRITE_ONCE(h->slept, true);
+	return 0;
+}
+
+static void ane_h16_sleep_resume(struct ane_h16_device *h)
+{
+	int ret;
+
+	guard(mutex)(&ane_h16_lock);
+	if (!h->slept)
+		return;
+	ret = ane_h16_warm_boot(h);
+	WRITE_ONCE(h->slept, false);
+	if (ret) {
+		/* Every mapping and backing stays for diagnosis; no cold replay. */
+		ane_h16_quarantine(h, ret);
+		h->boot.quarantined = true;
+		h->session.quarantined = true;
+	}
+	ane_h16_session_sleep(&h->session, false);
+}
+
 static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
 {
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
 
-	if (ane_fw_sleep_refused(event, pinned))
+	if (event == PM_POST_SUSPEND) {
+		ane_h16_sleep_resume(h);
+		return NOTIFY_DONE;
+	}
+	if (event == PM_SUSPEND_PREPARE && pinned) {
+		if (!ane_h16_sleep_prepare(h))
+			return NOTIFY_DONE;
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
-	return ane_fw_sleep_event(event, pinned);
+		return NOTIFY_BAD;
+	}
+	/* Hibernation and restore stay refused. */
+	if (ane_fw_sleep_refused_cycle(event, pinned, true)) {
+		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
+		return NOTIFY_BAD;
+	}
+	return NOTIFY_DONE;
 }
 
 static int ane_h16_pin(void *ctx)
@@ -176,11 +341,12 @@ static int ane_h16_pin(void *ctx)
 int ane_h16_backend_suspend(struct device *dev)
 {
 	struct ane_h16_device *h = dev_get_drvdata(dev);
-	bool pinned = h && READ_ONCE(h->pinned);
+	/* Running firmware that the notifier did not suspend: refuse. */
+	bool running = h && READ_ONCE(h->pinned) && !READ_ONCE(h->slept);
 
-	if (pinned)
+	if (running)
 		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
-	return ane_fw_sleep_backstop(pinned);
+	return ane_fw_sleep_backstop(running);
 }
 
 int ane_h16_backend_resume(struct device *dev)
