@@ -580,6 +580,8 @@ static inline void ane_h16_startup_timeout(struct ane_h16_boot *b)
 		    t->ops->read32(t->ctx, t->soc->irq_status), t->polls);
 	b->ops->log(b->ctx, "startup SHAREDMALLOC head/slots",
 		    t->head[ANE_FW_SHAREDMALLOC], c->slots);
+	b->ops->log(b->ctx, "startup SHAREDMALLOC ready/allocations",
+		    t->shared_ready, t->shared_count);
 	/* Geometry was validated before startup; include slots behind the cursor. */
 	for (i = 0; i < c->slots; i++) {
 		p = (u8 *)t->ipc.cpu + c->offset + i * ANE_FW_SLOT_SIZE;

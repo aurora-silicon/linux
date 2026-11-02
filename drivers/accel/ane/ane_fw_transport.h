@@ -80,6 +80,7 @@ struct ane_fw_transport_ops {
 	void (*read_barrier)(void *ctx);
 	void (*write_barrier)(void *ctx);
 	u32 (*read32)(void *ctx, u32 reg);
+	/* Complete/order an irq_ack write before subsequent coherent ring reads. */
 	void (*write32)(void *ctx, u32 reg, u32 value);
 	u64 (*now_ns)(void *ctx);
 	/* Wait before the next poll of a wait that began waited_ns ago. */
