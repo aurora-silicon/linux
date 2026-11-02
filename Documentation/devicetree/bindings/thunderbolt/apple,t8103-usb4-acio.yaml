@@ -38,6 +38,7 @@ properties:
               - apple,t6031-usb4-acio
               - apple,t8112-usb4-acio
               - apple,t8122-usb4-acio
+              - apple,t8132-usb4-acio
           - const: apple,t8103-usb4-acio
 
   reg:
@@ -49,6 +50,7 @@ properties:
           PCIe adapter configuration space of the USB4 router. Present where
           the root complex exposes the adapter separately, so that the tunnel
           can be configured before a PCIe-C link is brought up.
+      - description: MxWrap co-processor control registers, on T8132
 
   reg-names:
     minItems: 2
@@ -56,6 +58,7 @@ properties:
       - const: rc
       - const: sram
       - const: pcie-adapter
+      - const: cpu
 
   mboxes:
     maxItems: 1
@@ -179,6 +182,17 @@ required:
 
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-usb4-acio
+    then:
+      properties:
+        reg:
+          minItems: 4
+        reg-names:
+          minItems: 4
 
 additionalProperties: false
 
