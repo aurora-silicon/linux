@@ -1183,6 +1183,18 @@
 			apple,rail = <1>;
 			apple,level = <2>;
 		};
+
+		/*
+		 * DCS (DRAM) at its highest state on top of the SoC rail floor,
+		 * for engines whose speed follows memory. The DCS limit caps it.
+		 */
+		pmc_soc_dcs_max: floor-dcs-max {
+			label = "soc-dcs-max";
+			#power-domain-cells = <0>;
+			apple,rail = <0>;
+			apple,level = <5>;
+			power-domains = <&pmc_soc_max>;
+		};
 	};
 
 	/*
