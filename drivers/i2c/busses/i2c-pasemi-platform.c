@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/reset.h>
 #include <linux/types.h>
 
 #include "i2c-pasemi-core.h"
@@ -73,6 +74,14 @@ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
 	error = pasemi_platform_i2c_calc_clk_div(data, frequency);
 	if (error)
 		return error;
+
+	smbus->reset = devm_reset_control_get_optional_exclusive(dev, NULL);
+	if (IS_ERR(smbus->reset))
+		return dev_err_probe(dev, PTR_ERR(smbus->reset),
+				     "failed to get the reset\n");
+	/* A transfer stuck in the controller is retried once after a reset */
+	if (smbus->reset)
+		smbus->adapter.retries = 1;
 
 	smbus->adapter.dev.of_node = pdev->dev.of_node;
 	error = pasemi_i2c_common_probe(smbus);

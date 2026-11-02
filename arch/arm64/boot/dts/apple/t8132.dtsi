@@ -739,6 +739,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c0>;
+			resets = <&ps_i2c0>;
 
 			status = "disabled";
 		};
@@ -754,6 +755,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c1>;
+			resets = <&ps_i2c1>;
 
 			status = "disabled";
 		};
@@ -769,6 +771,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c2>;
+			resets = <&ps_i2c2>;
 
 			status = "disabled";
 		};
@@ -784,6 +787,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c3>;
+			resets = <&ps_i2c3>;
 
 			status = "disabled";
 		};
@@ -799,6 +803,7 @@
 			#address-cells = <0x1>;
 			#size-cells = <0x0>;
 			power-domains = <&ps_i2c4>;
+			resets = <&ps_i2c4>;
 
 			status = "disabled";
 		};
