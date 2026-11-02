@@ -145,6 +145,11 @@ patternProperties:
         maximum: 15
         description: Performance state held while the domain is powered.
 
+      power-domains:
+        maxItems: 1
+        description: A domain held while this floor is, such as a floor on
+          another rail.
+
     required:
       - '#power-domain-cells'
       - apple,rail
