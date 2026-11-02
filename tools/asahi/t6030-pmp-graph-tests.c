@@ -158,6 +158,9 @@ struct apple_pmp_report {
 	struct apple_pmp_start *start;
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
+	/* Cached host DVFS stores; unused by T6030. */
+	u64 dvfs_known;
+	u8 dvfs_levels[64];
 	bool defer;
 	unsigned int polls;
 	struct delayed_work ready_work;
