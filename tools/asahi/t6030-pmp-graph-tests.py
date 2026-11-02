@@ -47,6 +47,9 @@ def main():
              'static void apple_pmp_report_entry_free(', 'static int apple_pmp_report_entry_probe(',
              'static int apple_pmp_report_probe(', 'static struct device_node *apple_pmp_report_t6030_entry(',
              'static int apple_pmp_report_wait_t6030_14(', 'int apple_pmp_report_wait_supplier_ready(']
+    if 'static bool apple_pmp_report_dvfs_valid(' in source:
+        names.insert(names.index('static void apple_pmp_report_dvfs_write('),
+                     'static bool apple_pmp_report_dvfs_valid(')
     if 'static bool apple_pmp_report_running(' in source:
         names.insert(0, 'static bool apple_pmp_report_running(')
     if 'static int apple_pmp_report_wait_t6030_bound(' in source:
