@@ -90,6 +90,8 @@ const struct ane_fw_platform ane_h17_platform = {
 	.stream_mask = BIT(0),
 	.firmware_preloaded = true,
 	.safe_reset = false,
+	/* 25G83 boots this firmware in Exclave mode (SPEC-ANE-SLEEP-H17.md). */
+	.exclave_mode_stop = true,
 	/* Cold AP-direct acquisition is staged before any power or DMA write.
 	 * The observer uses the measured H17 26.6.2 register layout.
 	 */
@@ -221,7 +223,7 @@ int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_plat
 	int ret;
 
 	/* H17: the staged backend owns the engine; the device binds for it. */
-	if (ane_fw_platform_staged(soc))
+	if (soc->owner == ANE_FW_OWNER_EXCLAVE)
 		return ane_fw_staged_bind(pdev);
 	ret = ane_fw_platform_preflight(pdev, soc);
 

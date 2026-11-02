@@ -61,6 +61,11 @@ struct ane_fw_platform {
 	u16 stream_mask;
 	bool firmware_preloaded;
 	bool safe_reset;
+	/*
+	 * System sleep first takes the firmware out of Exclave mode
+	 * (EXCLAVE_MODE_STOP on the control ring) so that SUSPEND can run.
+	 */
+	bool exclave_mode_stop;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */

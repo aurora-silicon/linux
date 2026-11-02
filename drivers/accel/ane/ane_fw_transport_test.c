@@ -1133,6 +1133,56 @@ static void ane_transport_carry_shared_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, memchr_inv(f->t.shared[0].cpu, 0, SZ_64K));
 }
 
+/*
+ * EXCLAVE_MODE_STOP goes on the command ring at table position 2 (DEBUG),
+ * 24 bytes with a zero body, and completes like any command. The public
+ * publish path still refuses it, and refuses that ring.
+ */
+static void ane_transport_mode_stop_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 command[ANE_FW_MODE_STOP_SIZE] = {};
+	const u8 *sent;
+	u32 ch = f->t.control_ch;
+
+	KUNIT_ASSERT_EQ(test, ch, 2U);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	put_unaligned_le16(ANE_FW_CMD_EXCLAVE_MODE_STOP, command + 4);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_publish(&f->t, ANE_FW_IO, command,
+						       sizeof(command), TEST_DEADLINE), -EPERM);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_publish(&f->t, ch, command,
+						       sizeof(command), TEST_DEADLINE), -EINVAL);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish_mode_stop(&f->t, TEST_DEADLINE), 0);
+	KUNIT_EXPECT_TRUE(test, f->t.pending[ch].active);
+	KUNIT_EXPECT_EQ(test, f->t.pending[ch].size, (size_t)ANE_FW_MODE_STOP_SIZE);
+	KUNIT_EXPECT_EQ(test, f->t.pending[ch].id, ANE_FW_CMD_EXCLAVE_MODE_STOP);
+	sent = (const u8 *)f->t.pool.cpu + (f->t.pending[ch].dva - f->t.pool.dva);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(sent + 4), ANE_FW_CMD_EXCLAVE_MODE_STOP);
+	KUNIT_EXPECT_FALSE(test, memchr_inv(sent + 8, 0, 16));
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(ane_test_slot(f, ch) + 8),
+			(u64)ANE_FW_MODE_STOP_SIZE);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_poll(&f->t, ch), -EAGAIN);
+	ane_test_reply(f, ch);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch), 0);
+	KUNIT_EXPECT_FALSE(test, f->t.pending[ch].active);
+	KUNIT_EXPECT_EQ(test, f->t.head[ch], 1U);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+}
+
+/* A table whose position 2 is not a host command ring has no control ring. */
+static void ane_transport_no_control_ring_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *desc = (u8 *)f->ipc.cpu + 2 * ANE_FW_DESCRIPTOR_SIZE;
+
+	put_unaligned_le32(1, desc + 0x40);
+	KUNIT_ASSERT_EQ(test, ane_test_init_transport(f), 0);
+	KUNIT_EXPECT_EQ(test, f->t.control_ch, (u32)ANE_FW_CHANNELS);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_publish_mode_stop(&f->t, TEST_DEADLINE), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_poll(&f->t, 2), -EINVAL);
+}
+
 static void ane_transport_free_refusal_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
@@ -1291,6 +1341,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_pool_no_free_test),
 	KUNIT_CASE(ane_transport_settle_test),
 	KUNIT_CASE(ane_transport_carry_shared_test),
+	KUNIT_CASE(ane_transport_mode_stop_test),
+	KUNIT_CASE(ane_transport_no_control_ring_test),
 	KUNIT_CASE(ane_transport_free_refusal_test),
 	KUNIT_CASE(ane_transport_table_test),
 	KUNIT_CASE(ane_transport_table_roles_test),
