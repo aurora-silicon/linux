@@ -178,6 +178,12 @@ static const u16 m1_pmu_event_affinity[M1_PMU_PERFCTR_LAST + 1] = {
  * 2-7 count the selected event. Counters 8 and 9 have stayed at zero for
  * every selection tried, so they are not exposed.
  *
+ * The E and P cores share this event encoding and counter layout, so one
+ * PMU instance covers both clusters. Perf events, including the ones KVM
+ * creates to back a guest PMU, then keep counting when a task or vCPU
+ * moves between clusters. Per-cluster counts can still be had with perf's
+ * CPU filtering.
+ *
  * No configurable event is known to count cycles, so the M1 cycles number
  * is kept to select the fixed cycle counter.
  */
@@ -855,35 +861,21 @@ static int m4_pmu_init(struct arm_pmu *cpu_pmu)
 	return 0;
 }
 
-static int m4_pmu_brava_e_init(struct arm_pmu *cpu_pmu)
+static int m4_pmu_t6040_init(struct arm_pmu *cpu_pmu)
 {
-	cpu_pmu->name = "apple_brava_e_pmu";
+	cpu_pmu->name = "apple_t6040_pmu";
 	return m4_pmu_init(cpu_pmu);
 }
 
-static int m4_pmu_brava_p_init(struct arm_pmu *cpu_pmu)
+static int m4_pmu_t8140_init(struct arm_pmu *cpu_pmu)
 {
-	cpu_pmu->name = "apple_brava_p_pmu";
-	return m4_pmu_init(cpu_pmu);
-}
-
-static int m4_pmu_tahiti_e_init(struct arm_pmu *cpu_pmu)
-{
-	cpu_pmu->name = "apple_tahiti_e_pmu";
-	return m4_pmu_init(cpu_pmu);
-}
-
-static int m4_pmu_tahiti_p_init(struct arm_pmu *cpu_pmu)
-{
-	cpu_pmu->name = "apple_tahiti_p_pmu";
+	cpu_pmu->name = "apple_t8140_pmu";
 	return m4_pmu_init(cpu_pmu);
 }
 
 static const struct of_device_id m1_pmu_of_device_ids[] = {
-	{ .compatible = "apple,tahiti-p-pmu",	.data = m4_pmu_tahiti_p_init, },
-	{ .compatible = "apple,tahiti-e-pmu",	.data = m4_pmu_tahiti_e_init, },
-	{ .compatible = "apple,brava-p-pmu",	.data = m4_pmu_brava_p_init, },
-	{ .compatible = "apple,brava-e-pmu",	.data = m4_pmu_brava_e_init, },
+	{ .compatible = "apple,t8140-pmu",	.data = m4_pmu_t8140_init, },
+	{ .compatible = "apple,t6040-pmu",	.data = m4_pmu_t6040_init, },
 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },
