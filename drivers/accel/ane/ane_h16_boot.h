@@ -462,7 +462,14 @@ static inline int ane_h16_wait(struct ane_h16_boot *b, u32 cell, u32 value,
 static inline int ane_h16_alloc(struct ane_h16_boot *b, u64 dva, size_t size,
 				struct ane_fw_surface *s)
 {
-	int ret = b->ops->alloc_at(b->ctx, dva, size, s);
+	int ret;
+
+	/* A cold boot after sleep reuses the surface it mapped before, cleared. */
+	if (s->cpu && s->dva == dva && s->size == size) {
+		memset(s->cpu, 0, size);
+		return 0;
+	}
+	ret = b->ops->alloc_at(b->ctx, dva, size, s);
 
 	if (ret)
 		return ret;

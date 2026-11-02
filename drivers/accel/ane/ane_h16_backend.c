@@ -89,6 +89,18 @@ struct ane_h16_device {
 	u64 resume_ready_ns;
 	/* EXCLAVE_MODE_STOP completed in this firmware boot (variant build). */
 	bool mode_stopped;
+	/*
+	 * For a cold boot after sleep: the firmware runs from the preload in
+	 * place, so its DATA is live. The verified DATA from bring-up is kept
+	 * (warm-sleep builds only) and copied back; the heap tail is cleared.
+	 */
+	void *pristine_data;
+	struct ane_fw_surface heap_tail;
+	/* Our runtime references on the five domains and the DARTs are held. */
+	bool engine_on;
+	u64 resume_first_ns;
+	unsigned int resume_replayed;
+	bool resume_cold;
 	struct ane_h16_session session;
 	struct work_struct start;
 };
@@ -244,7 +256,58 @@ static void ane_h16_power_down(struct ane_h16_device *h)
 		pm_runtime_put_sync(h->dart[i]);
 	for (i = h->powered; i-- > 0; )
 		pm_runtime_put_sync(h->power[i]);
+	h->engine_on = false;
 	dev_info(h->dev, "H16 ANE: powered down for system sleep\n");
+}
+
+/* The five domains in order, then the DARTs (their resume restores SID0). */
+static int ane_h16_power_up(struct ane_h16_device *h)
+{
+	unsigned int i, j;
+	int ret;
+
+	for (i = 0; i < h->powered; i++) {
+		ret = pm_runtime_resume_and_get(h->power[i]);
+		if (ret < 0)
+			goto power;
+	}
+	for (j = 0; j < ARRAY_SIZE(h->dart); j++) {
+		ret = pm_runtime_resume_and_get(h->dart[j]);
+		if (ret < 0)
+			goto dart;
+	}
+	h->engine_on = true;
+	return 0;
+dart:
+	while (j--)
+		pm_runtime_put_sync(h->dart[j]);
+power:
+	while (i--)
+		pm_runtime_put_sync(h->power[i]);
+	return ret;
+}
+
+/*
+ * RVBAR must name TEXT. It keeps the latched entry while the domain stays
+ * on; a real power-off may clear it, and the entry is written again only
+ * while bit 0 (latched) is clear.
+ */
+static int ane_h16_rvbar_ready(struct ane_h16_device *h)
+{
+	struct ane_h16_boot *b = &h->boot;
+	const struct ane_h16_build *f = b->build;
+	u64 rvbar = b->ops->read64(b->ctx, ANE_H16_ENGINE, f->rvbar);
+
+	if (rvbar == f->expected_rvbar)
+		return 0;
+	if (rvbar & 1) {
+		dev_err(h->dev, "H16 ANE: RVBAR %#llx latched at another entry\n", rvbar);
+		return -EIO;
+	}
+	b->ops->write64(b->ctx, ANE_H16_ENGINE, f->rvbar, f->expected_rvbar & ~1ULL);
+	rvbar = b->ops->read64(b->ctx, ANE_H16_ENGINE, f->rvbar);
+	dev_info(h->dev, "H16 ANE: RVBAR rewritten, reads %#llx\n", rvbar);
+	return rvbar == f->expected_rvbar || rvbar == (f->expected_rvbar & ~1ULL) ? 0 : -EIO;
 }
 
 static int ane_h16_warm_boot(struct ane_h16_device *h)
@@ -254,24 +317,17 @@ static int ane_h16_warm_boot(struct ane_h16_device *h)
 	unsigned int i;
 	int ret;
 
-	for (i = 0; i < h->powered; i++) {
-		ret = pm_runtime_resume_and_get(h->power[i]);
-		if (ret < 0)
-			return ret;
-	}
 	/* The DART runtime resume restores TCR/TTBR and syncs the TLBs. */
-	for (i = 0; i < ARRAY_SIZE(h->dart); i++) {
-		ret = pm_runtime_resume_and_get(h->dart[i]);
-		if (ret < 0)
-			return ret;
-	}
+	ret = ane_h16_power_up(h);
+	if (ret)
+		return ret;
 	ret = ane_h16_dapf(b, true);
 	if (!ret)
 		ret = ane_h16_prepare(b);
+	if (!ret)
+		ret = ane_h16_rvbar_ready(h);
 	if (ret)
 		return ret;
-	if (b->ops->read64(b->ctx, ANE_H16_ENGINE, f->rvbar) != f->expected_rvbar)
-		return -EIO;
 	for (i = 0; i < 8; i++)
 		ane_h16_write(b, i, 0);
 	ane_h16_write(b, 6, 1);
@@ -322,6 +378,68 @@ static void ane_h16_genpd_record(struct ane_h16_device *h)
 	dev_info(h->dev, "H16 ANE: domains while asleep (genpd): %s\n", line);
 }
 
+/*
+ * The cold fallback after a failed warm boot: the engine is powered off
+ * again, then booted from the preload as at bring-up (pristine DATA, heap
+ * tail, pool, IPC and heap cleared and reused, RTKit restarted, 0x29 at
+ * startup), the shared allocations carried over, and every open program
+ * replayed behind its handle.
+ */
+static int ane_h16_cold_boot(struct ane_h16_device *h)
+{
+	struct ane_h16_boot *b = &h->boot;
+	struct ane_fw_transport *old;
+	size_t size = b->soc->preload_size[1];
+	void *live;
+	int ret;
+
+	if (!h->pristine_data)
+		return -ENODATA;
+	if (h->engine_on)
+		ane_h16_power_down(h);
+	ret = ane_h16_power_up(h);
+	if (!ret)
+		ret = ane_h16_dapf(b, true);
+	if (!ret)
+		ret = ane_h16_rvbar_ready(h);
+	if (ret)
+		return ret;
+	live = memremap(h->preload_phys[1], size, MEMREMAP_WB);
+	if (!live)
+		return -ENOMEM;
+	memcpy(live, h->pristine_data, size);
+	memunmap(live);
+	if (h->heap_tail.cpu)
+		memset(h->heap_tail.cpu, 0, h->heap_tail.size);
+	b->transport_ops->write_barrier(b->ctx);
+	memset(&h->rtk, 0, sizeof(h->rtk));
+	h->rtk_failed = false;
+	h->tx_read = 0;
+	h->tx_write = 0;
+	h->mode_stopped = false;
+	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
+	if (!old)
+		return -ENOMEM;
+	ret = ane_h16_scratch_boot(b);
+	if (!ret)
+		ane_fw_transport_carry_shared(&b->transport, old);
+	kfree(old);
+	if (!ret)
+		ret = ane_h16_startup(b);
+	if (ret)
+		return ret;
+	h->resume_ready_ns = ktime_get_ns();
+	dev_info(h->dev, "H16 ANE: booted again from the preload after system sleep\n");
+	ane_h16_session_restart(&h->session);
+	ret = ane_h16_session_replay(&h->session, &h->resume_replayed, &h->resume_first_ns);
+	if (ret) {
+		dev_err(h->dev, "H16 ANE: PROGRAM REPLAY FAILED %d after %u programs; session quarantined\n",
+			ret, h->resume_replayed);
+		WARN_ONCE(1, "H16 ANE: program replay failed after system sleep (%d)\n", ret);
+	}
+	return ret;
+}
+
 static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 {
 	int ret;
@@ -352,6 +470,7 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 
 static void ane_h16_sleep_resume(struct ane_h16_device *h)
 {
+	s64 ready, first;
 	u64 start;
 	int ret;
 
@@ -359,14 +478,20 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	if (!h->slept)
 		return;
 	start = ktime_get_ns();
+	h->resume_ready_ns = 0;
+	h->resume_first_ns = 0;
+	h->resume_replayed = 0;
+	h->resume_cold = false;
 	ret = ane_h16_warm_boot(h);
+	if (ret) {
+		dev_warn(h->dev, "H16 ANE: warm boot failed (%d); cold boot and program replay\n",
+			 ret);
+		h->resume_cold = true;
+		ret = ane_h16_cold_boot(h);
+	}
 	WRITE_ONCE(h->slept, false);
 	if (ret) {
-		/*
-		 * Every mapping and backing stays for diagnosis. No cold
-		 * fallback on H16 yet: its firmware runs from the preload in
-		 * place, so a cold boot needs a pristine DATA copy first.
-		 */
+		/* Every mapping and backing stays for diagnosis. */
 		ane_h16_quarantine(h, ret);
 		h->boot.quarantined = true;
 		h->session.quarantined = true;
@@ -374,10 +499,12 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	ane_h16_session_sleep(&h->session, false);
 	ane_h16_genpd_record(h);
 	/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
-	dev_info(h->dev, "H16 ANE: resume %s: warm, firmware ready %llu ms, node reopened %llu ms, programs kept\n",
-		 ret ? "FAILED" : "ok",
-		 h->resume_ready_ns > start ? div_u64(h->resume_ready_ns - start, NSEC_PER_MSEC) : 0,
-		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC));
+	ready = h->resume_ready_ns ? div_u64(h->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
+	first = h->resume_first_ns ? div_u64(h->resume_first_ns - start, NSEC_PER_MSEC) : -1;
+	dev_info(h->dev,
+		 "H16 ANE: resume %s: %s, firmware ready %lld ms, first program ready %lld ms, node reopened %llu ms, %u programs replayed\n",
+		 ret ? "FAILED" : "ok", h->resume_cold ? "cold" : "warm", ready, first,
+		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed);
 }
 
 static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
@@ -414,6 +541,9 @@ static int ane_h16_pin(void *ctx)
 	struct ane_h16_device *h = ctx;
 	int ret;
 
+	/* A cold boot after sleep runs the boot again; pinned once for good. */
+	if (h->pinned)
+		return 0;
 	if (!try_module_get(THIS_MODULE))
 		return -ENODEV;
 	/* Pinned for good: the notifier stays registered until reboot. */
@@ -557,6 +687,7 @@ static int ane_h16_map_heap_tail(struct ane_h16_device *h)
 				 IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, &s);
 	if (ret)
 		return ret;
+	h->heap_tail = s;
 	dev_info(h->dev, "H16 firmware heap tail mapped at %llx bytes %llx writable\n",
 		 tail, end - tail);
 	return 0;
@@ -1045,6 +1176,7 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 		if (ret < 0)
 			return ret;
 		h->darts_powered++;
+		h->engine_on = h->darts_powered == ARRAY_SIZE(h->dart);
 		h->window[ANE_H16_DART0 + i] = ioremap_np(r.start, resource_size(&r));
 		if (!h->window[ANE_H16_DART0 + i])
 			return -ENOMEM;
@@ -1132,6 +1264,11 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 		goto out;
 	}
 	/* Firmware DVA layout belongs to the build just selected. */
+	/* Warm-sleep builds keep the verified DATA for a cold boot after sleep. */
+	if (b->soc->sleep_warm) {
+		h->pristine_data = snap[1];
+		snap[1] = NULL;
+	}
 	h->shared_next = b->build->shared_dva;
 	h->program_next = b->build->shared_dva + ANE_FW_SHARED_TOTAL;
 	h->program_end = h->program_next + ANE_H16_PROGRAM_WINDOW;
