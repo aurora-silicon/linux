@@ -128,12 +128,14 @@ static int apple_cpuidle_probe(struct platform_device *pdev)
 
 	/*
 	 * CPU PD writes CYC_OVRD, which is an undefined instruction on
-	 * T8140. Its WFI already lets the hardware power-gate idle
-	 * secondary cores, so both entries must use WFI. Keep index 1:
-	 * the generic s2idle selector skips fallback index 0, otherwise
-	 * tick_freeze() and timekeeping suspension are never reached.
+	 * T8140 and is not available to a T6050 guest. Their WFI already
+	 * lets the hardware power-gate idle secondary cores, so both
+	 * entries must use WFI. Keep index 1: the generic s2idle selector
+	 * skips fallback index 0, otherwise tick_freeze() and timekeeping
+	 * suspension are never reached.
 	 */
-	if (of_machine_is_compatible("apple,t8140") || t604x)
+	if (of_machine_is_compatible("apple,t8140") ||
+	    of_machine_is_compatible("apple,t6050") || t604x)
 		apple_idle_driver.states[STATE_PWRDOWN] = apple_idle_driver.states[STATE_WFI];
 
 	return cpuidle_register(&apple_idle_driver, NULL);
@@ -186,6 +188,7 @@ static int __init apple_cpuidle_init(void)
 	      of_machine_is_compatible("apple,t6031") ||
 	      of_machine_is_compatible("apple,t6032") ||
 	      of_machine_is_compatible("apple,t6034") ||
+	      of_machine_is_compatible("apple,t6050") ||
 	      of_machine_is_compatible("apple,t8140")))
 		return 0;
 
