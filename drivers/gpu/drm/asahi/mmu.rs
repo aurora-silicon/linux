@@ -994,6 +994,9 @@ impl VmInner {
 pub(crate) struct Vm {
     dev: ARef<device::Device>,
     id: u64,
+    /// The range reserved for kernel-managed objects at creation.
+    #[cfg_attr(not(CONFIG_DRM_ASAHI_M5), allow(dead_code))]
+    kernel_range: Range<u64>,
     mapping_epoch: Option<Arc<MappingEpoch>>,
     lifetime: Option<Arc<lifetime::VmLifetime>>,
     residency: Option<Arc<residency::Gate>>,
@@ -2106,7 +2109,7 @@ impl Vm {
             &dev,
             &*dummy_obj.gem,
             gpuvm_range,
-            kernel_range,
+            kernel_range.clone(),
             VmInner {
                 dev: dev.clone(),
                 is_kernel,
@@ -2125,6 +2128,7 @@ impl Vm {
         Ok(Vm {
             dev: dev.as_ref().as_ref().into(),
             id,
+            kernel_range,
             gpuvm,
             mapping_epoch,
             lifetime: None,
@@ -2135,6 +2139,12 @@ impl Vm {
             dummy_obj: dummy_obj.gem.clone(),
             binding,
         })
+    }
+
+    /// The range reserved for kernel-managed objects when this VM was created.
+    #[cfg_attr(not(CONFIG_DRM_ASAHI_M5), allow(dead_code))]
+    pub(crate) fn kernel_range(&self) -> Range<u64> {
+        self.kernel_range.clone()
     }
 
     /// Attach a status before sharing a newly created user VM with queues.
