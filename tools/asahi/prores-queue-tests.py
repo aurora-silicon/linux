@@ -24,7 +24,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument('--out', type=Path)
-    parser.add_argument('--mutation', choices=('tail-only', 'release-early', 'publish-batch', 'reset-free'))
+    parser.add_argument('--mutation', choices=('tail-only', 'release-early', 'publish-batch',
+                                             'reset-free', 'ack-order'))
     args = parser.parse_args()
     driver = args.root / 'drivers/media/platform/apple/prores'
     header = (driver / 'apple-prores.h').read_text()
@@ -45,6 +46,11 @@ def main():
         watch = watch.replace('vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));',
                               'vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));\n'
                               '\t\tapr_finish_job(apr, ctx, err);')
+    elif args.mutation == 'ack-order':
+        take = take.replace('apr_write(apr, APR_REG_IRQ_STATUS, status);', '')
+        take = take.replace('tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;',
+                            'tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;\n'
+                            '\tapr_write(apr, APR_REG_IRQ_STATUS, status);')
     # Keep register values shared with the driver, without host Linux headers.
     defines = '\n'.join(line for line in header.splitlines() if
                         line.startswith('#define APR_') and
@@ -106,13 +112,23 @@ static void get_device(void *d) { (void)d; device_pins++; }
 static struct vb2_queue *v4l2_m2m_get_src_vq(struct v4l2_m2m_ctx *m) { return &m->src; }
 static struct vb2_queue *v4l2_m2m_get_dst_vq(struct v4l2_m2m_ctx *m) { return &m->dst; }
 static void vb2_queue_error(struct vb2_queue *q) { q->error = true; }
-static u32 apr_read(struct apr_dev *a, u32 reg) { (void)a; return mmio[reg/4]; }
+static u32 pending_ack;
+static u32 apr_read(struct apr_dev *a, u32 reg) {
+    (void)a;
+    /* MMIO reads complete prior posted ACK writes at the device. */
+    mmio[APR_REG_IRQ_STATUS/4] &= ~pending_ack;
+    pending_ack = 0;
+    return mmio[reg/4];
+}
 static void apr_write(struct apr_dev *a, u32 reg, u32 value) {
     (void)a;
-    if (reg == APR_REG_IRQ_STATUS) mmio[reg/4] &= ~value;
+    if (reg == APR_REG_IRQ_STATUS) pending_ack |= value;
     else mmio[reg/4] = value;
 }
-static void writel(u32 value, void *addr) { *(u32 *)addr = value; }
+static void writel(u32 value, void *addr) {
+    assert(!pending_ack);
+    *(u32 *)addr = value;
+}
 static void mod_delayed_work(void *q, void *w, int delay) {
     (void)q; (void)w; (void)delay; resets_queued++;
 }
@@ -136,6 +152,7 @@ static struct apr_dev begin(unsigned int depth, u32 base) {
     released = pm_puts = slots_finished = resets_queued = 0;
     reset_calls = module_pins = device_pins = 0;
     reset_rc = last_err = 0;
+    pending_ack = 0;
     m2m.src.error = m2m.dst.error = false;
     jiffies = 100;
     for (unsigned int i = 0; i < sizeof(mmio)/sizeof(mmio[0]); i++) mmio[i] = 0;

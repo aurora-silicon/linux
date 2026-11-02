@@ -471,9 +471,9 @@ static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err, u32 *status_
 	if (!status)
 		return NULL;
 	*status_out = status;
-	/* Snapshot the completion boundary before acknowledging it. */
-	tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;
 	apr_write(apr, APR_REG_IRQ_STATUS, status);
+	/* Read back after ACK before an immediate next-head publication. */
+	tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;
 	*err = apr_batch_complete(&apr->batch, status, tail);
 	if (*err < 0) {
 		dev_err_ratelimited(apr->dev,
