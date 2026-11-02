@@ -788,6 +788,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	 * is never freed.
 	 */
 	p->generation = ++s->generation;
+	p->epoch = s->epoch;
 	INIT_LIST_HEAD(&p->deferred);
 	memset(snapshot, 0, sizeof(*snapshot));
 	p->session = s;
@@ -1174,12 +1175,22 @@ fail:
 	return h16_fail(s, ret);
 }
 
+/* Loaded before the firmware was booted again across system sleep. */
+bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p)
+{
+	return p->epoch != s->epoch;
+}
+EXPORT_SYMBOL_GPL(ane_h16_program_lost);
+
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	int ret;
 
 	if (!s || !p || p->session != s)
 		return -EINVAL;
+	/* The firmware that knew it is gone: no firmware traffic, reload. */
+	if (ane_h16_program_lost(s, p))
+		return -ENODEV;
 	if (s->ops->busy)
 		s->ops->busy(s->ctx, true);
 	ret = h16_execute(s, p);
@@ -1322,6 +1333,17 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 		return -EINPROGRESS;
 	}
 	p->closed = true;
+	/*
+	 * The firmware that knew this program was powered off and booted again
+	 * from the preload: there is nothing to tear down, and nothing reads
+	 * its memory any more.
+	 */
+	if (ane_h16_program_lost(s, p)) {
+		h16_give_back(s, p);
+		s->ops->log(s->ctx, "program lost across sleep, released", p->key.program,
+			    p->key.process);
+		return 0;
+	}
 	if (s->quarantined)
 		return -EIO;
 	ret = ane_h16_terminate_encode(command, ANE_H16_TERMINATE_SIZE, p->key.program,
@@ -1397,6 +1419,24 @@ void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep)
 		wake_up_all(&s->wake);
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_sleep);
+
+/*
+ * The firmware was booted again from the preload (system sleep without
+ * firmware cooperation): every program loaded before is lost (EXECUTE
+ * refuses it with -ENODEV, close only releases its memory), no request is
+ * pending, and the next program starts a new BAR context. Called with the
+ * session asleep, before it reopens.
+ */
+void ane_h16_session_restart(struct ane_h16_session *s)
+{
+	s->epoch++;
+	s->program = NULL;
+	s->executed = 0;
+	memset(s->pending.slots, 0, sizeof(s->pending.slots));
+	s->pending.error = 0;
+	s->error = 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_restart);
 
 /*
  * The caller's last reference: free a closed program and its HWX snapshot.

@@ -112,6 +112,12 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	ret = ane_h16_session_enter(a->session);
 	if (ret)
 		goto out;
+	/* Lost across system sleep: release it, the caller is reloading. */
+	if (f->program && ane_h16_program_lost(a->session, f->program) &&
+	    !ane_h16_session_close(a->session, f->program)) {
+		ane_h16_session_put(a->session, f->program);
+		f->program = NULL;
+	}
 	if (f->program) {
 		ret = -EBUSY;
 	} else {

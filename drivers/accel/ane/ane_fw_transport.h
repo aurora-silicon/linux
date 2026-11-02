@@ -191,6 +191,27 @@ ane_fw_transport_init(struct ane_fw_transport *t, const struct ane_fw_platform *
 	return ret ? ane_fw_transport_fail(t, ret) : 0;
 }
 
+/*
+ * After the firmware was booted again (ane_fw_transport_init() on the same
+ * IPC and pool), give the new transport the shared allocations of the old
+ * one, all retired: the new firmware owns none of them, and its SHAREDMALLOC
+ * requests of the same tag and size are served from them
+ * (ane_fw_shared_reusable()) instead of mapping new memory every cycle.
+ */
+static inline void ane_fw_transport_carry_shared(struct ane_fw_transport *t,
+						 const struct ane_fw_transport *old)
+{
+	unsigned int i;
+
+	t->shared_count = old->shared_count;
+	t->shared_bytes = old->shared_bytes;
+	for (i = 0; i < old->shared_count; i++) {
+		t->shared[i] = old->shared[i];
+		t->shared_tags[i] = old->shared_tags[i];
+		t->shared_retired[i] = true;
+	}
+}
+
 static inline int ane_fw_transport_check(struct ane_fw_transport *t)
 {
 	if (t->error)

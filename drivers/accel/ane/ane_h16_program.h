@@ -199,6 +199,8 @@ struct ane_h16_program {
 	bool released;
 	/* Closed while the engine slept: torn down when the session reopens. */
 	struct list_head deferred;
+	/* Firmware boot the program was loaded in; an older one means lost. */
+	u64 epoch;
 };
 
 /* The quiet time that ends serving the SHAREDMALLOC ring after UNLOAD. */
@@ -277,6 +279,11 @@ struct ane_h16_session {
 	 */
 	bool asleep;
 	struct list_head deferred;
+	/*
+	 * Firmware boot count: a cold restart across system sleep loses every
+	 * program loaded before it (ane_h16_session_restart()).
+	 */
+	u64 epoch;
 	wait_queue_head_t wake;
 	/* The accel node lock the sleep gate serializes on. */
 	struct mutex *lock;
@@ -309,6 +316,8 @@ void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_enter(struct ane_h16_session *s);
 unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
+void ane_h16_session_restart(struct ane_h16_session *s);
+bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p);
 
 void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
 			  bool for_device);
