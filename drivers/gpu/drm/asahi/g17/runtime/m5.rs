@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! DRM compute on the M5 profile: each logical queue owns one M5 channel
-//! ([`crate::g17::queue::m5::Channel`]) from QUEUE_CREATE on, installed before the queue exists
-//! and retained by the registry for the rest of the firmware session. Every compute command,
-//! from the scheduler or published early from its ioctl, goes through [`Backend::m5_packet`] and
-//! the channel's one publication transaction; the shared completion scan
+//! ([`crate::g17::queue::m5::Channel`]) from QUEUE_CREATE on, installed before the queue exists.
+//! An installed lane (QID, kick ring, graph, support page and pool) stays with the firmware
+//! session; logical queues lease it: the 26A428 firmware has no queue uninstall.
+//! A closed queue's lane parks once its context's scheduler release (0x13) is consumed
+//! (`runtime::teardown`, [`Lanes`]), and the next QUEUE_CREATE adopts it; a quarantined lane is
+//! never reused, and past [`LEAKED_LANES`] of them creation fails with ENOSPC. Every compute
+//! command, from the scheduler or published early from its ioctl, goes through
+//! [`Backend::m5_packet`] and the channel's one publication transaction; the shared completion scan
 //! (`Firmware::scan_compute`) retires it with the channel's strict predicate.
 
 use super::{render::FALLBACK, Backend, DeferredBatch, Registry, WORK_RING_WAIT_NS};
@@ -24,6 +28,82 @@ use crate::g17::{
 };
 use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
+
+/// Quarantined compute lanes the session tolerates: each keeps its QID, kick ring, pool and its
+/// owner's execution context, so past this many a new logical queue is refused (ENOSPC) rather
+/// than losing its device at the first submission.
+pub(super) const LEAKED_LANES: usize = 8;
+
+/// The M5 lanes as the scheduler-release teardown sees them (`runtime::teardown::Service`).
+pub(super) struct Lanes<'a> {
+    pub(super) channels: &'a mut KVec<KBox<Channel>>,
+    pub(super) parked: &'a mut KVec<crate::g17::queue::m5::ParkedLane>,
+    pub(super) pairs: &'a mut KVec<KBox<Pair>>,
+}
+
+impl Lanes<'_> {
+    /// Every compute channel of `context` is closed and its lane idle (`Channel::parkable`).
+    pub(super) fn compute_idle(&self, context: &Arc<Context>) -> bool {
+        self.channels
+            .iter()
+            .filter(|channel| Arc::ptr_eq(channel.context(), context))
+            .all(|channel| channel.parkable().unwrap_or(false))
+    }
+
+    /// No render pair of `context` has a pass in flight or failed.
+    pub(super) fn render_idle(&self, context: &Arc<Context>) -> bool {
+        self.pairs
+            .iter()
+            .filter(|pair| Arc::ptr_eq(pair.context(), context))
+            .all(|pair| !pair.in_flight() && pair.quarantined().is_none())
+    }
+
+    /// The number of `context`'s channels that park at its release.
+    pub(super) fn parkable(&self, context: &Arc<Context>) -> Result<usize> {
+        let mut count = 0;
+        for channel in self
+            .channels
+            .iter()
+            .filter(|channel| Arc::ptr_eq(channel.context(), context))
+        {
+            if !channel.parkable()? {
+                return Err(EBUSY);
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Parks every channel of `context`: its lane joins the parked lanes, its binding goes to
+    /// `binding` to be dropped off the device mutex. The firmware consumed the context's
+    /// scheduler release, and every channel is idle ([`Self::parkable`]).
+    pub(super) fn park(
+        &mut self,
+        context: &Arc<Context>,
+        binding: &mut impl FnMut(crate::g17::queue::m5::Binding) -> Result,
+    ) -> Result {
+        while let Some(index) = self
+            .channels
+            .iter()
+            .position(|channel| Arc::ptr_eq(channel.context(), context))
+        {
+            self.parked.reserve(1, GFP_KERNEL)?;
+            let channel = self.channels.remove(index).map_err(|_| EIO)?;
+            let (lane, owner) = channel.park();
+            if crate::module_parameters::m5_lane_trace.value() != 0 {
+                pr_info!(
+                    "M5 lane {}: parked (owner {} closed, {} parked)\n",
+                    lane.qid(),
+                    owner.owner(),
+                    self.parked.len() + 1
+                );
+            }
+            self.parked.push_within_capacity(lane).map_err(|_| ENOMEM)?;
+            binding(owner)?;
+        }
+        Ok(())
+    }
+}
 
 /// Queues the result of one M5 kick for signalling off the device mutex. A failed kick stays
 /// owned by its channel: its fence errors while its command stays pinned.
@@ -123,9 +203,14 @@ impl Registry {
     }
 
     /// Fails `pair`'s pass in flight with `error`: its fence errors while the pair keeps the
-    /// command pinned.
+    /// command pinned. Its render lease goes back now. An M5 admission slot names no physical
+    /// pair, so nothing it guards outlives the failure: the pair stays quarantined and refuses
+    /// its owner's later passes itself, and the failed pass no longer orders others (as a
+    /// quarantined lease does not on the other paths). A lease kept with the pinned command,
+    /// or quarantined, would never return: the pass never retires.
     fn fail_pair(pair: &mut Pair, error: Error, deferred: &mut DeferredBatch) -> Result {
         if let Some(packet) = pair.fail(error) {
+            drop(packet.completion.detach_render_lease());
             deferred.push(Deferred::FailedOwned(packet.completion.clone(), error))?;
         }
         Ok(())
@@ -230,8 +315,8 @@ impl Registry {
 }
 
 impl crate::g17::Firmware {
-    /// Builds and installs the channel of logical queue `owner`. From its installation on the
-    /// channel is retained whatever happens.
+    /// Builds and installs the channel of logical queue `owner`, or adopts a parked lane. From
+    /// its installation on the lane is retained whatever happens.
     pub(super) fn create_m5_channel(
         &mut self,
         alloc: &Allocator<'_>,
@@ -250,6 +335,54 @@ impl crate::g17::Firmware {
             );
             error
         };
+        let leaked = self
+            .queues
+            .m5
+            .iter()
+            .filter(|channel| channel.quarantined().is_some())
+            .count();
+        if leaked >= LEAKED_LANES {
+            dev_warn!(
+                dev.as_ref(),
+                "M5 queue {} refused: {} quarantined compute lanes (cap {})\n",
+                owner,
+                leaked,
+                LEAKED_LANES
+            );
+            return Err(ENOSPC);
+        }
+        // A parked lane of the same class first (no outer-ring change), else any.
+        let class = context.policy().priority();
+        let parked = self
+            .queues
+            .m5_parked
+            .iter()
+            .position(|lane| lane.class() == class)
+            .or_else(|| (!self.queues.m5_parked.is_empty()).then_some(0));
+        if let Some(index) = parked {
+            self.queues.m5.reserve(1, GFP_KERNEL)?;
+            let channel = Channel::adopt(alloc, &mut self.queues.m5_parked, index, context, owner)
+                .map_err(|error| refused("adoption", error))?;
+            if crate::module_parameters::m5_lane_trace.value() != 0 {
+                pr_info!(
+                    "M5 lane {}: bound to queue {} class {} ({}), next kick {:#x}\n",
+                    channel.qid(),
+                    owner,
+                    class,
+                    if channel.class_changed() {
+                        "class changed"
+                    } else {
+                        "same class"
+                    },
+                    channel.next_kick()
+                );
+            }
+            return self
+                .queues
+                .m5
+                .push_within_capacity(channel)
+                .map_err(|_| ENOMEM);
+        }
         // QIDs are owned by host identities, not logical queues (whose numbers the bootstrap
         // render reservations share). M5 refuses render: no logical queue reserves a render pair
         // beside its channel.
@@ -328,6 +461,24 @@ impl Backend {
     /// (early publication from the ioctl) each returns FALLBACK, leaving the command unpublished
     /// for its scheduler.
     pub(super) fn m5_packet(&self, packet: &Arc<Packet>, wait: bool) -> Result {
+        self.m5_publication(packet, wait)
+            .inspect_err(|error| self.note_m5_failure("compute", *error))
+    }
+
+    /// A command this queue fails at publication: logged, since its fence and the VM's status
+    /// carry only the errno. Fallback, contention and cancellation are not failures.
+    fn note_m5_failure(&self, engine: &str, error: Error) {
+        if ![FALLBACK, EAGAIN, ECANCELED].contains(&error) {
+            pr_warn!(
+                "G17 M5: {} command of queue {} failed at publication: {:?}\n",
+                engine,
+                self.owner,
+                error
+            );
+        }
+    }
+
+    fn m5_publication(&self, packet: &Arc<Packet>, wait: bool) -> Result {
         refuse_firmware_waits(packet)?;
         packet.check_dependencies()?;
         let dispatch = Dispatch::of(&packet.command)?;
@@ -549,6 +700,11 @@ impl Backend {
     /// its first pass. Each condition that clears with retirement or with recovery closing is
     /// waited for, bounded, as for M5 compute ([`Self::m5_packet`]).
     pub(in crate::g17) fn m5_render_packet(&self, packet: &Arc<Packet>) -> Result {
+        self.m5_render_publication(packet)
+            .inspect_err(|error| self.note_m5_failure("render", *error))
+    }
+
+    fn m5_render_publication(&self, packet: &Arc<Packet>) -> Result {
         refuse_firmware_waits(packet)?;
         packet.check_dependencies()?;
         let crate::g17::command::Validated::Render {
@@ -572,6 +728,19 @@ impl Backend {
             }
             Ok(())
         };
+        // Render admission orders this pass against every other live render whose attachments
+        // overlap (`queue::admission`, `hazard::plan`), as on every other path. M5 has no render
+        // barriers (`Variant::render_barriers`), so another queue's overlapping render, in this
+        // VM or through a shared object, is waited for here, off the device lock, until it
+        // retires. The completion holds the lease until this pass retires, or until its pair
+        // fails it ([`Registry::fail_pair`]).
+        let render_lease = self.admission.acquire_render(
+            self.owner,
+            crate::g17::queue::admission::Request::of(packet),
+            deadline,
+            &check,
+        )?;
+        packet.completion.attach_render_lease(render_lease)?;
         let admission = Admission::new(deadline, &check);
         let progress = &self.shared.progress;
         loop {

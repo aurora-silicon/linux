@@ -7,9 +7,13 @@
 //! one publication transaction ([`Channel::publish`]) and one retirement predicate
 //! ([`Channel::retire`]).
 //!
-//! An installed channel stays with its firmware session: no M5 queue release is established, and
-//! the M5 profile keeps every stopped session (`Variant::retain_stopped`). Its QID, execution
-//! context and backing are never reused, and a failed kick keeps its command pinned.
+//! An installed lane (QID, kick ring, graph, descriptors, support page and pool) stays with its
+//! firmware session: a channel binds it
+//! to one logical queue, parks it once that queue closed, the lane is idle and its context's
+//! scheduler release was consumed ([`Channel::park`]), and a later queue adopts it
+//! ([`Channel::adopt`]), reconfiguring the hardware queue at its first kick. Kick timestamps and
+//! stamps continue across owners. A quarantined lane is never reused, and a failed kick keeps
+//! its command pinned.
 //!
 //! Retirement is exact and strict: the completion record of this queue, kick and
 //! descriptor, the queue's stamp covering the kick, the inner consumer past the kick's items, the
@@ -190,6 +194,27 @@ impl Lane {
         self.id.qid()
     }
 
+    /// Rewrites the record's host-owned words for `context` ([`QueueRecord::set_owner`]). The
+    /// caller proved the lane idle with its previous owner's scheduler release consumed.
+    pub(crate) fn set_owner(&mut self, context: &Context) -> Result {
+        let pointer = self
+            .graph
+            .pointer(0, core::mem::size_of::<fw::m5::queue::QueueRecord>())?
+            .cast::<fw::m5::queue::QueueRecord>();
+        // SAFETY: The checked packed record (alignment 1, integer fields only) stays mapped
+        // with the graph; the device mutex and the idle proof exclude any other writer.
+        let result = unsafe {
+            (*pointer).set_owner(
+                context.work_head_va(),
+                context.scheduler_va(),
+                context.owner_pid(),
+                context.policy(),
+            )
+        };
+        fence(Ordering::SeqCst);
+        result
+    }
+
     fn word(&self, offset: usize) -> Result<u32> {
         Ok(self.graph.word(offset)?.load(Ordering::Acquire))
     }
@@ -310,12 +335,26 @@ impl Lane {
     }
 }
 
-/// One M5 hardware compute queue. Field order drops every alias before its backing.
+/// One M5 hardware compute queue: an installed lane (its QID, kick ring, graph, descriptors,
+/// support page, pool, operand and preemption storage), bound to one logical queue's context.
+/// The lane outlives the binding ([`Self::park`], [`Self::adopt`]). Field order drops every
+/// alias before its backing.
 pub(crate) struct Channel {
+    /// The client aliases of the binding: in the owner's VM.
     aliases: KVec<mmu::KernelMapping>,
     context: Arc<Context>,
     owner: u64,
+    /// The scheduler page and work storage of the lane's previous owner, which its record named
+    /// until this binding rewrote it.
+    _previous_pages: Option<crate::g17::context::FirmwarePages>,
+    /// Set by an adoption until the binding's first kick: whether the class (and so the outer
+    /// work ring) changed.
+    rebound: Option<bool>,
+    /// The class whose outer work ring last carried this queue's first slot.
+    class: u8,
     gpu: Gpu,
+    /// The descriptors' canonical low alias (the kernel's lower VM); it stays with the lane.
+    descriptors_lower: mmu::KernelMapping,
     lane: Lane,
     descriptors: KernelObject,
     descriptors_low: u64,
@@ -338,6 +377,87 @@ pub(crate) struct Channel {
     closed: bool,
     /// The firmware reported a failed kick of this queue.
     faulted: bool,
+}
+
+/// Maps a lane's client-visible storage into `vm`: the kick ring (unless `Lane::new` did), the
+/// descriptors and operand state at their canonical addresses, the pool, and client-private
+/// views of the preemption buffer and the usage page. Returns those two views' addresses.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "One argument per lane object a binding maps."
+)]
+fn client_aliases(
+    alloc: &Allocator<'_>,
+    vm: &mmu::Vm,
+    aliases: &mut KVec<mmu::KernelMapping>,
+    kick: Option<&mut kick::Queue>,
+    (descriptors, descriptors_low): (&KernelObject, u64),
+    pool: &M5Pool,
+    operand: &KernelObject,
+    preempt: &KernelObject,
+    usage: &KernelObject,
+) -> Result<(u64, u64)> {
+    let shared = mmu::PROT_GPU_SHARED_RW;
+    if let Some(kick) = kick {
+        aliases.push(kick.map_client(vm)?, GFP_KERNEL)?;
+    }
+    aliases.push(
+        descriptors.map_alias(vm, descriptors_low, shared)?,
+        GFP_KERNEL,
+    )?;
+    aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
+    aliases.push(operand.map_alias(vm, operand.gpu_va(), shared)?, GFP_KERNEL)?;
+    // Kernel-owned buffers the GPU writes in the client's context: client-private views.
+    let private = alloc.domain(Domain::Private);
+    let preempt_alias = preempt.alias_in(vm, private.clone(), PAGE as u64, shared)?;
+    let preempt_va = preempt_alias.iova();
+    aliases.push(preempt_alias, GFP_KERNEL)?;
+    let usage_alias = usage.alias_in(vm, private, PAGE as u64, shared)?;
+    let usage_va = usage_alias.iova();
+    aliases.push(usage_alias, GFP_KERNEL)?;
+    Ok((preempt_va, usage_va))
+}
+
+/// An installed compute lane without an owner: everything the
+/// firmware's installed queue still names, and the previous owner's scheduler page and work
+/// storage its record names until the next owner rewrites it. Never dropped while the session
+/// runs: its QID stays configured with this ring.
+pub(crate) struct ParkedLane {
+    gpu: Gpu,
+    descriptors_lower: mmu::KernelMapping,
+    lane: Lane,
+    descriptors: KernelObject,
+    descriptors_low: u64,
+    support: KernelObject,
+    pool: M5Pool,
+    operand: KernelObject,
+    preempt: KernelObject,
+    usage: KernelObject,
+    class: u8,
+    pages: crate::g17::context::FirmwarePages,
+}
+
+impl ParkedLane {
+    pub(crate) fn qid(&self) -> u8 {
+        self.lane.qid()
+    }
+    /// The class whose outer ring last carried this lane.
+    pub(crate) fn class(&self) -> u8 {
+        self.class
+    }
+}
+
+/// A parked lane's former owner binding: its aliases in that owner's VM, then its context.
+pub(crate) struct Binding {
+    _aliases: KVec<mmu::KernelMapping>,
+    _context: Arc<Context>,
+    owner: u64,
+}
+
+impl Binding {
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
+    }
 }
 
 impl Channel {
@@ -367,43 +487,39 @@ impl Channel {
             mmu::PROT_GPU_SHARED_RW,
         )?;
         let descriptors_low = low.iova();
-        aliases.push(low, GFP_KERNEL)?;
-        aliases.push(
-            descriptors.map_alias(vm, descriptors_low, mmu::PROT_GPU_SHARED_RW)?,
-            GFP_KERNEL,
-        )?;
         let support = alloc.kernel(SUPPORT_BYTES, PAGE as u64, prot, cpu)?;
         let geometry = fw::m5::pool::PoolGeometry::of(gpu.pool_blocks, gpu.block_bytes())
             .map_err(|_| EINVAL)?;
         let pool = M5Pool::new(alloc, id.qid(), geometry, fw::m5::pool::Engine::Compute)?;
-        aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
         let operand = alloc.lower(
             gpu.profile.operand.bytes,
             PAGE as u64,
             mmu::PROT_GPU_SHARED_RW,
             cpu,
         )?;
-        aliases.push(
-            operand.map_alias(vm, operand.gpu_va(), mmu::PROT_GPU_SHARED_RW)?,
-            GFP_KERNEL,
-        )?;
-        // Kernel-owned buffers the GPU writes in the client's context: client-private views.
-        let private = alloc.domain(Domain::Private);
         let preempt = alloc.kernel(compute::PREEMPT_BYTES, PAGE as u64, prot, cpu)?;
-        let preempt_alias =
-            preempt.alias_in(vm, private.clone(), PAGE as u64, mmu::PROT_GPU_SHARED_RW)?;
-        let preempt_va = preempt_alias.iova();
-        aliases.push(preempt_alias, GFP_KERNEL)?;
         let usage = alloc.kernel(PAGE, PAGE as u64, prot, cpu)?;
-        let usage_alias = usage.alias_in(vm, private, PAGE as u64, mmu::PROT_GPU_SHARED_RW)?;
-        let usage_va = usage_alias.iova();
-        aliases.push(usage_alias, GFP_KERNEL)?;
+        let (preempt_va, usage_va) = client_aliases(
+            alloc,
+            vm,
+            &mut aliases,
+            None,
+            (&descriptors, descriptors_low),
+            &pool,
+            &operand,
+            &preempt,
+            &usage,
+        )?;
         let channel = KBox::new(
             Self {
                 aliases,
                 context,
                 owner,
+                _previous_pages: None,
+                rebound: None,
+                class: u8::MAX,
                 gpu,
+                descriptors_lower: low,
                 lane,
                 descriptors,
                 descriptors_low,
@@ -431,6 +547,7 @@ impl Channel {
     /// Publishes the complete mapping set to every context naming its roots, before any record
     /// names it. The kick ring's own aliases are published when its first entry is installed.
     fn publish_mappings(&self) -> Result {
+        self.descriptors_lower.publish_to_contexts();
         for alias in &self.aliases {
             alias.publish_to_contexts();
         }
@@ -445,6 +562,154 @@ impl Channel {
             object.publish_to_contexts()?;
         }
         self.pool.publish_to_contexts()
+    }
+
+    /// Adopts parked lane `index` for `context`'s logical queue `owner`: maps
+    /// the lane into the new VM and rewrites the record's host-owned words. The firmware's
+    /// queue is reconfigured at the binding's first kick ([`Self::publish`]); the kick
+    /// timestamp and the stamps continue. On failure the lane stays parked.
+    pub(crate) fn adopt(
+        alloc: &Allocator<'_>,
+        parked: &mut KVec<ParkedLane>,
+        index: usize,
+        context: Arc<Context>,
+        owner: u64,
+    ) -> Result<KBox<Self>> {
+        let lane = parked.get_mut(index).ok_or(EINVAL)?;
+        let mut aliases = KVec::with_capacity(8, GFP_KERNEL)?;
+        let (preempt_va, usage_va) = client_aliases(
+            alloc,
+            context.vm(),
+            &mut aliases,
+            Some(&mut lane.lane.kick),
+            (&lane.descriptors, lane.descriptors_low),
+            &lane.pool,
+            &lane.operand,
+            &lane.preempt,
+            &lane.usage,
+        )?;
+        let active = KVec::with_capacity(DEPTH, GFP_KERNEL)?;
+        let slot = KBox::<Self>::new_uninit(GFP_KERNEL)?;
+        // The lane is idle and its owner's release consumed: no reader of the record remains.
+        lane.lane.set_owner(&context)?;
+        let lane = parked.remove(index).map_err(|_| EINVAL)?;
+        let class_changed = lane.class != context.policy().priority();
+        let channel = KBox::write(
+            slot,
+            Self {
+                aliases,
+                context,
+                owner,
+                _previous_pages: Some(lane.pages),
+                rebound: Some(class_changed),
+                class: lane.class,
+                gpu: lane.gpu,
+                descriptors_lower: lane.descriptors_lower,
+                lane: lane.lane,
+                descriptors: lane.descriptors,
+                descriptors_low: lane.descriptors_low,
+                support: lane.support,
+                pool: lane.pool,
+                operand: lane.operand,
+                preempt: lane.preempt,
+                usage: lane.usage,
+                preempt_va,
+                usage_va,
+                installed: true,
+                ordinal: 0,
+                active,
+                quarantine: None,
+                failed: KVec::new(),
+                closed: false,
+                faulted: false,
+            },
+        );
+        if let Err(error) = channel.publish_mappings() {
+            let (lane, _binding) = channel.park();
+            parked.push_within_capacity(lane).map_err(|_| ENOMEM)?;
+            return Err(error);
+        }
+        // The rewritten record names this context's scheduler page.
+        channel.context.mark_published();
+        Ok(channel)
+    }
+
+    /// The channel's logical queue closed and its lane is idle: no kick in flight or failed, the
+    /// inner ring consumed to its producer, the pool's count complete and the stamp at the
+    /// lane's last kick. A quarantined lane never parks.
+    pub(crate) fn parkable(&self) -> Result<bool> {
+        if !self.closed
+            || !self.installed
+            || self.quarantine.is_some()
+            || self.faulted
+            || !self.active.is_empty()
+            || !self.failed.is_empty()
+        {
+            return Ok(false);
+        }
+        if !self.lane.idle_at(self.lane.cursors()?.producer)?
+            || self.pool.completed_submissions()? != self.pool.submitted()?
+        {
+            return Ok(false);
+        }
+        let next = self.lane.kick.timestamp();
+        Ok(next.get() == KickTimestamp::FIRST.get()
+            || retirement::stamp_covers(self.stamp()?, next.prev().get()))
+    }
+
+    /// Splits a parked channel ([`Self::parkable`], its context's release consumed) into its
+    /// lane and its binding. The lane keeps the context's scheduler page and work storage, which
+    /// the record names until the next owner rewrites it.
+    pub(crate) fn park(self: KBox<Self>) -> (ParkedLane, Binding) {
+        let Self {
+            aliases,
+            context,
+            owner,
+            class,
+            gpu,
+            descriptors_lower,
+            lane,
+            descriptors,
+            descriptors_low,
+            support,
+            pool,
+            operand,
+            preempt,
+            usage,
+            ..
+        } = KBox::into_inner(self);
+        let pages = context.retain_firmware_pages();
+        (
+            ParkedLane {
+                gpu,
+                descriptors_lower,
+                lane,
+                descriptors,
+                descriptors_low,
+                support,
+                pool,
+                operand,
+                preempt,
+                usage,
+                class,
+                pages,
+            },
+            Binding {
+                _aliases: aliases,
+                _context: context,
+                owner,
+            },
+        )
+    }
+
+    /// An adopted lane whose class differs from its previous binding's, until its first kick.
+    pub(crate) fn class_changed(&self) -> bool {
+        self.rebound == Some(true)
+    }
+
+    /// The timestamp the lane's next kick takes.
+    pub(crate) fn next_kick(&self) -> u64 {
+        self.lane.kick.timestamp().get()
     }
 
     pub(crate) fn qid(&self) -> u8 {
@@ -541,14 +806,22 @@ impl Channel {
         }
     }
 
+    /// The queue configuration: the installation's (`install`), the first kick's context and
+    /// pool update, or an adopted lane's first kick: a new owner's context, scheduler and QoS
+    /// identity on the queue's continuing completion value, reinstalled when its class changed
+    /// (S `queue_config`).
     fn config(&self, install: bool, completion_seed: Option<u64>) -> Result<QueueConfig> {
+        let rebound = (!install).then_some(self.rebound).flatten();
         QueueConfig::new(&QueueConfigArgs {
             target: QueueConfigTarget::Compute,
             kick_ring_va: self.lane.kick.low_va(),
             kick_ring_fw_va: self.lane.kick.firmware_va(),
             qid: self.qid(),
-            install,
-            completion_seed,
+            install: install || rebound == Some(true),
+            completion_seed: match rebound {
+                Some(_) => None,
+                None => completion_seed,
+            },
             context_id: self.context.id().try_into()?,
             // The pool is bound with the first kick's context update.
             free_list: match install {
@@ -566,7 +839,7 @@ impl Channel {
             scheduler_va: self.context.scheduler_va(),
             policy: self.context.policy(),
             qos_slot: self.context.qos_id(),
-            qos_update: install,
+            qos_update: install || rebound.is_some(),
             owner_pid: self.context.owner_pid(),
             context_update: !install,
         })
@@ -588,6 +861,9 @@ impl Channel {
         self.lane.stage_install(self.config(true, None)?)?;
         host.qids.publish(self.lane.id)?;
         self.installed = true;
+        // The installation names the context's scheduler page: its close releases it.
+        self.context.mark_published();
+        self.class = self.context.policy().priority();
         let result = (|| {
             self.lane.expose(host.port, claim, 1, true, None)?;
             Lane::await_install(host.crashed, &[&self.lane], |lane| {
@@ -744,8 +1020,15 @@ impl Channel {
             fence(Ordering::SeqCst);
             // The work ring names the queue and the firmware hears of it before the host
             // command makes it runnable; whether the cores are powered is not a prerequisite.
-            self.lane
-                .expose(host.port, claim, target, false, Some(&command))
+            // The first slot naming the queue on a class's outer ring says so: an adopted lane
+            // whose class changed starts on its new ring.
+            self.lane.expose(
+                host.port,
+                claim,
+                target,
+                self.class != policy.priority(),
+                Some(&command),
+            )
         })();
         let ticket = Ticket {
             owner: self.owner,
@@ -763,6 +1046,8 @@ impl Channel {
         if first && result.is_ok() {
             self.log_class(policy, qos_row, &command);
         }
+        self.class = policy.priority();
+        self.rebound = None;
         self.ordinal = self.ordinal.saturating_add(1);
         self.active
             .push_within_capacity(Active {

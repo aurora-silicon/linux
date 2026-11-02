@@ -10,6 +10,10 @@
 //! every other pair. Admission never waits for such an overlap. Only a
 //! cross-VM overlap through a shared object waits on the host for retirement,
 //! so that one VM's fault can never hold another VM's kick in firmware.
+//!
+//! A firmware whose render kicks encode no such wait (`Variant::render_barriers`
+//! off, M5) orders a same-VM overlap of another owner as a cross-VM one: the
+//! later render waits on the host for the earlier one's retirement.
 
 use super::job::Order;
 
@@ -109,6 +113,7 @@ pub(crate) struct Live<'a> {
 /// of any set of renders overlapping one publication, the last admitted saw all
 /// the others live.
 pub(crate) fn plan<'a>(
+    barriers: bool,
     owner: u64,
     prefix: Option<u64>,
     ticket: Option<u64>,
@@ -121,7 +126,8 @@ pub(crate) fn plan<'a>(
     let mut count = 0;
     let mut crowded = false;
     for entry in live {
-        let foreign = entry.owner != owner && footprint.same_vm(entry.footprint);
+        // Ordered in firmware at publication; without render barriers, waited for as across VMs.
+        let foreign = barriers && entry.owner != owner && footprint.same_vm(entry.footprint);
         if let Some(slot) = entry.slot.filter(|_| foreign) {
             if !pairs[..count].contains(&slot) {
                 if count == PUBLICATION_BARRIERS {

@@ -383,8 +383,12 @@ impl Context {
         }
         Ok(result)
     }
+    /// Sizes the render pool QUEUE_CREATE's SCS layouts need. The reservation is consumed when
+    /// the pool is built ([`Self::render_pool`]); until then it may be set. Publication is not
+    /// the condition: an M5 channel names the context's scheduler from its installation, which
+    /// precedes this call in QUEUE_CREATE.
     pub(crate) fn reserve_render_blocks(&self, blocks: usize) -> Result {
-        if self.is_published() || self.render.lock().is_some() { return Err(EBUSY); }
+        if self.render.lock().is_some() { return Err(EBUSY); }
         self.render_blocks.store(blocks, Ordering::Release);
         Ok(())
     }

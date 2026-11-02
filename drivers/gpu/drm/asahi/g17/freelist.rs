@@ -763,6 +763,10 @@ impl M5Pool {
         fence(Ordering::SeqCst);
         Ok(next)
     }
+    /// The host's submission count ([`Self::reserve_submission`]).
+    pub(crate) fn submitted(&self) -> Result<u64> {
+        Ok(self.state.dword(0)?.load(Ordering::Acquire))
+    }
     /// The firmware-completed submission count, an unaligned packed counter.
     pub(crate) fn completed_submissions(&self) -> Result<u64> {
         let pointer = self.control.pointer(super::fw::m5::pool::COMPLETED, 8)?;

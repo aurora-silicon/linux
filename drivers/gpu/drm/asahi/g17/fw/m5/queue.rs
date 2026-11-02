@@ -104,6 +104,32 @@ impl QueueRecord {
         }
     }
 
+    /// A new owner's host-owned words on an installed record (S `set_compute_owner`): job-list
+    /// head, scheduler page, owner, priority and class words. A class change invalidates +0x40.
+    /// Firmware-owned words stay.
+    pub(crate) fn set_owner(
+        &mut self,
+        job_list_va: u64,
+        scheduler_va: u64,
+        owner_pid: u32,
+        policy: Policy,
+    ) -> Result {
+        let (reserved_30, sentinel_36, reserved_38) = Self::scheduling_words(policy)?;
+        let priority = self.priority;
+        if priority[0] != u32::from(policy.priority()) {
+            self.sentinel_40 = u32::MAX;
+        }
+        self.job_list_va = job_list_va;
+        self.scheduler_va = scheduler_va;
+        self.owner_pid = owner_pid;
+        self.priority = [u32::from(policy.priority()); 2];
+        self.reserved_30 = reserved_30;
+        self.sentinel_36 = sentinel_36;
+        self.reserved_38 = reserved_38;
+        self.policy = u32::from(policy.policy());
+        Ok(())
+    }
+
     /// Builds the record described by `args`.
     pub(crate) fn new(args: &QueueRecordArgs) -> Result<Self> {
         let (reserved_30, sentinel_36, reserved_38) = Self::scheduling_words(args.policy)?;

@@ -82,11 +82,15 @@ struct State {
     epoch: u64,
     footprints: KVec<InFlight>,
     next_ticket: u64,
+    /// Render kicks can wait in firmware for another pair's fragment kick
+    /// (`Variant::render_barriers`): a same-VM overlap of another owner is then
+    /// ordered at publication instead of waited for (`hazard::plan`).
+    barriers: bool,
 }
 
 impl State {
     const MASK: u64 = (u64::MAX >> (64 - cfg::RENDER_SLOTS)) & !1;
-    const fn new() -> Self {
+    const fn new(barriers: bool) -> Self {
         Self {
             active: 0,
             refs: [0; cfg::RENDER_SLOTS],
@@ -102,6 +106,7 @@ impl State {
             epoch: 0,
             footprints: KVec::new(),
             next_ticket: 1,
+            barriers,
         }
     }
     fn exhausted(&self) -> bool {
@@ -317,6 +322,7 @@ impl State {
             return Plan::Any;
         };
         hazard::plan(
+            self.barriers,
             owner,
             request.prefix,
             ticket,
@@ -444,10 +450,11 @@ pub(crate) struct Pool {
 impl Pool {
     #[cfg(CONFIG_KUNIT = "y")]
     pub(crate) fn new(max_queues: u32) -> Result<Arc<Self>> {
-        Self::with_waiters(max_queues, None, None)
+        Self::with_waiters(max_queues, true, None, None)
     }
     pub(crate) fn with_waiters(
         max_queues: u32,
+        barriers: bool,
         waiters: Option<Arc<crate::g17::availability::Availability>>,
         renders: Option<Arc<crate::g17::availability::Availability>>,
     ) -> Result<Arc<Self>> {
@@ -456,7 +463,7 @@ impl Pool {
         }
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State::new(), "G17 render admission"),
+                state <- new_mutex!(State::new(barriers), "G17 render admission"),
                 released <- new_condvar!("G17 render pair release"),
                 queues: AtomicU32::new(0),
                 max_queues,
@@ -713,7 +720,7 @@ mod accounting_tests {
 
     #[test]
     fn every_logical_owner_fits_without_speculative_spares() {
-        let mut state = State::new();
+        let mut state = State::new(true);
         for owner in 1..=u64::from(MAX_EXECUTION_CONTEXTS) {
             let slot = state.acquire(owner).unwrap();
             assert_eq!(state.owners.iter().filter(|id| **id == owner).count(), 1);
@@ -725,7 +732,7 @@ mod accounting_tests {
 
     #[test]
     fn close_does_not_reuse_an_active_lease() {
-        let mut state = State::new();
+        let mut state = State::new(true);
         let slot = state.acquire(1).unwrap();
         state.released |= 1u64 << slot;
         assert!(!state.reassign_unused_spare(slot, Some(1), None));
@@ -738,7 +745,7 @@ mod accounting_tests {
 
     #[test]
     fn warming_quarantine_and_exit_hold_exclude_reassignment() {
-        let mut state = State::new();
+        let mut state = State::new(true);
         let primary = state.acquire(1).unwrap();
         // A retained legacy sibling still obeys all quarantine/kill guards.
         state.owners[2] = 1;
@@ -1141,7 +1148,7 @@ mod shared_depth_tests {
     use super::*;
     #[test]
     fn a_full_pair_waits_for_retirement_instead_of_allocating_a_spare() {
-        let mut state = State::new();
+        let mut state = State::new(true);
         let first = state.acquire(1).unwrap();
         for _ in 1..cfg::RENDER_DEPTH { assert_eq!(state.acquire(1), Some(first)); }
         assert_eq!(state.acquire(1), None);
@@ -1212,5 +1219,26 @@ mod deadline_tests {
         }
         assert_eq!(wait_slice_ms(deadline, deadline), Err(EBUSY));
         assert_eq!(wait_slice_ms(deadline, deadline + 1), Err(EBUSY));
+    }
+}
+
+#[kunit_tests(asahi_g17_render_barriers)]
+mod barrier_tests {
+    use super::*;
+
+    #[test]
+    fn same_vm_overlap_of_another_owner_waits_without_render_barriers() {
+        for barriers in [true, false] {
+            let mut footprint = Footprint::new(7);
+            footprint.push_vm(0x10000, 0x20000);
+            let footprint = Arc::new(footprint, GFP_KERNEL).unwrap();
+            let request = Request { footprint: &footprint, sequence: 1, prefix: None };
+            let mut state = State::new(barriers);
+            let slot = state.pick(1, state.plan(1, Some(request), None)).unwrap();
+            assert!(state.record(1, Some(slot), 0, request).is_some());
+            // With barriers the later render is ordered at publication; without, it waits.
+            let plan = state.plan(2, Some(request), None);
+            assert_eq!(plan == Plan::Wait, !barriers);
+        }
     }
 }

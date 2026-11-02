@@ -273,7 +273,14 @@ impl ControlRecord {
         match self {
             Self::TvbGrow(_) => DeviceControlOp::TvbGrowReply,
             Self::IdlePowerOff(_) => DeviceControlOp::IdlePowerOff,
-            Self::SchedulerStateRelease(_) => DeviceControlOp::SchedulerStateRelease,
+            Self::SchedulerStateRelease(record) => {
+                let opcode = record.opcode;
+                if opcode == DeviceControlOp::M5SchedulerStateRelease as u32 {
+                    DeviceControlOp::M5SchedulerStateRelease
+                } else {
+                    DeviceControlOp::SchedulerStateRelease
+                }
+            }
             Self::FreeListRelease(_) => DeviceControlOp::FreeListRelease,
             Self::ContextKill(_) => DeviceControlOp::ContextKill,
         }
@@ -305,6 +312,9 @@ pub(crate) enum DeviceControlOp {
     IdlePowerOff = 0x0a,
     /// Release a logical queue's scheduler state ([`SchedulerStateRelease`]).
     SchedulerStateRelease = 0x14,
+    /// The M5 firmware's scheduler-state release (S
+    /// `M5SchedulerStateRelease`): the same record under another opcode.
+    M5SchedulerStateRelease = 0x13,
     /// Release a free list's buffer slot ([`FreeListRelease`]).
     FreeListRelease = 0x2e,
     /// Stop the queues named by a closed logical scheduler.
@@ -440,6 +450,13 @@ impl SchedulerStateRelease {
             page_va,
             unk_14: [0; 0x2c],
         }
+    }
+
+    /// The same release in the M5 firmware's opcode.
+    pub(crate) const fn m5(page_va: u64, id: [u8; 4]) -> Self {
+        let mut record = Self::new(page_va, id);
+        record.opcode = DeviceControlOp::M5SchedulerStateRelease as u32;
+        record
     }
 }
 

@@ -23,6 +23,8 @@ const CONTEXTS: usize = 128;
 /// Pop under the reclaim mutex, then finish after dropping every device lock.
 pub(in crate::g17) enum Reclaim {
     Binding(RetiredBinding),
+    /// A parked M5 lane's last owner binding: its aliases in that owner's VM and its context.
+    M5(crate::g17::queue::m5::Binding),
     Context(Arc<Context>),
 }
 
@@ -30,6 +32,7 @@ impl Reclaim {
     pub(in crate::g17) fn finish(self) {
         match self {
             Self::Binding(binding) => drop(binding),
+            Self::M5(binding) => drop(binding),
             Self::Context(context) => {
                 context.release_execution();
                 drop(context.take_render_pool());
@@ -43,6 +46,7 @@ impl Reclaim {
 /// slots let a validated transfer move ownership without a fallible vector push.
 pub(in crate::g17) struct ReclaimBatch {
     bindings: KVVec<Option<RetiredBinding>>,
+    m5: KVec<Option<crate::g17::queue::m5::Binding>>,
     contexts: KVec<Option<Arc<Context>>>,
 }
 
@@ -53,20 +57,31 @@ impl ReclaimBatch {
             bindings.push(None, GFP_KERNEL)?;
         }
         let mut contexts = KVec::with_capacity(CONTEXTS, GFP_KERNEL)?;
+        let mut m5 = KVec::with_capacity(CONTEXTS, GFP_KERNEL)?;
         for _ in 0..CONTEXTS {
             contexts.push(None, GFP_KERNEL)?;
+            m5.push(None, GFP_KERNEL)?;
         }
-        Ok(Self { bindings, contexts })
+        Ok(Self {
+            bindings,
+            m5,
+            contexts,
+        })
     }
 
     pub(in crate::g17) fn is_empty(&self) -> bool {
-        self.bindings.iter().all(Option::is_none) && self.contexts.iter().all(Option::is_none)
+        self.bindings.iter().all(Option::is_none)
+            && self.m5.iter().all(Option::is_none)
+            && self.contexts.iter().all(Option::is_none)
     }
 
     /// Graphs go before the Context owners that armed their scheduler releases.
     pub(in crate::g17) fn take_one(&mut self) -> Option<Reclaim> {
         if let Some(slot) = self.bindings.iter_mut().find(|slot| slot.is_some()) {
             return slot.take().map(Reclaim::Binding);
+        }
+        if let Some(slot) = self.m5.iter_mut().find(|slot| slot.is_some()) {
+            return slot.take().map(Reclaim::M5);
         }
         self.contexts
             .iter_mut()
@@ -85,6 +100,21 @@ impl ReclaimBatch {
             .iter_mut()
             .find(|slot| slot.is_none())
             .ok_or(EBUSY)
+    }
+
+    /// Room for `count` M5 bindings.
+    fn m5_room(&self, count: usize) -> bool {
+        self.m5.iter().filter(|slot| slot.is_none()).count() >= count
+    }
+
+    fn m5_binding(&mut self, binding: crate::g17::queue::m5::Binding) -> Result {
+        let slot = self
+            .m5
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(EBUSY)?;
+        *slot = Some(binding);
+        Ok(())
     }
 
     fn context(&mut self, context: &Arc<Context>) -> Result {
@@ -107,18 +137,27 @@ struct Service<'a> {
     init: &'a InitData,
     primary: &'a mut Coprocessor,
     reclaim: &'a mut ReclaimBatch,
+    /// The M5 lanes: bound compute channels, parked ones and render pairs (`queue::m5`).
+    m5: Option<super::m5::Lanes<'a>>,
 }
 
 impl Host for Service<'_> {
     fn render_idle(&mut self, context: &Arc<Context>) -> Result<bool> {
+        if let Some(m5) = &self.m5 {
+            if !m5.render_idle(context) {
+                return Ok(false);
+            }
+        }
         self.render.teardown_idle(context)
     }
     fn compute_idle(&self, context: &Arc<Context>) -> bool {
-        self.compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .all(|queue| queue.idle_for_context(context) && !queue.switching_from(context))
+        self.m5.as_ref().is_none_or(|m5| m5.compute_idle(context))
+            && self
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .all(|queue| queue.idle_for_context(context) && !queue.switching_from(context))
     }
     fn flists_released(&self, context: &Arc<Context>) -> bool {
         self.render.teardown_pools_released(context)
@@ -127,18 +166,26 @@ impl Host for Service<'_> {
         self.render.control_backpressured()
     }
     fn publish(&mut self, record: &SchedulerStateRelease) -> Result<u32> {
-        Rings::publish_control(
-            self.init,
-            &ControlRecord::SchedulerStateRelease(SchedulerStateRelease::new(
-                record.page_va,
-                record.id,
-            )),
-        )
+        let (page_va, id) = (record.page_va, record.id);
+        let release = match self.m5 {
+            // M5 releases under its own opcode.
+            Some(_) => SchedulerStateRelease::m5(page_va, id),
+            None => SchedulerStateRelease::new(page_va, id),
+        };
+        Rings::publish_control(self.init, &ControlRecord::SchedulerStateRelease(release))
     }
     fn notify(&mut self) -> Result {
         self.primary.notify(MSG_CONTROL_NOTIFY)
     }
     fn detach(&mut self, context: &Arc<Context>) -> Result {
+        if let Some(m5) = &mut self.m5 {
+            // Every compute lane of the context parks; its bindings drop off the device mutex.
+            let count = m5.parkable(context)?;
+            if !self.reclaim.m5_room(count) || !self.reclaim.has_room(0, 1) {
+                return Err(EBUSY);
+            }
+            m5.park(context, &mut |binding| self.reclaim.m5_binding(binding))?;
+        }
         let linked = context.retain_linked_work(self.objects);
         let (_, _, slots) = self.render.exit_scope(context);
         crate::g17::trace::teardown(5, u64::from(context.id()), slots, u64::from(linked));
@@ -181,12 +228,16 @@ impl Firmware {
         }
         self.queues.render.observe_teardown_releases(&self.init)?;
         let recovery = self.recovery.pending() || self.init.recovery_state()? != 0;
+        let m5 = self.primary.state.shared.m5.is_some();
         let Registry {
             admission,
             render,
             compute,
             buffers,
             teardown,
+            m5: channels,
+            m5_parked,
+            m5_render,
             ..
         } = &mut self.queues;
         let mut service = Service {
@@ -198,6 +249,11 @@ impl Firmware {
             init: &self.init,
             primary: &mut self.primary,
             reclaim,
+            m5: m5.then_some(super::m5::Lanes {
+                channels,
+                parked: m5_parked,
+                pairs: m5_render,
+            }),
         };
         teardown.publish_ready(&mut service, recovery, super::now_ns())?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);

@@ -79,6 +79,11 @@ pub(crate) struct Variant {
     /// Render item rings carry lead commands: InitBufferManager before the first tiling pass
     /// of a buffer manager.
     pub(crate) lead_commands: bool,
+    /// A render's fragment kick can wait in firmware for other pairs' fragment kicks: admission
+    /// orders a same-VM attachment overlap of another logical queue at publication
+    /// (`hazard::plan`). Without it, the later render waits on the host for the earlier one's
+    /// retirement, as a cross-VM overlap does.
+    pub(crate) render_barriers: bool,
     /// Register programs of the render descriptors.
     pub(crate) programs: super::render::RegisterPrograms,
     /// How published compute work becomes runnable.
@@ -131,6 +136,7 @@ pub(crate) const V26A428: Variant = Variant {
     ray_traversal: true,
     fragment_busy: true,
     lead_commands: false,
+    render_barriers: true,
     programs: super::render::RegisterPrograms::G17P,
     submission: Submission::Doorbell,
     effort: crate::g17::power::FULL_EFFORT,
@@ -163,6 +169,7 @@ pub(crate) const V25G83: Variant = Variant {
     // adding memory and the tiler stops silently; macOS always writes 0.
     fragment_busy: false,
     lead_commands: true,
+    render_barriers: true,
     programs: super::render::RegisterPrograms::V25G83,
     submission: Submission::Doorbell,
     effort: crate::g17::power::FULL_EFFORT,
@@ -193,6 +200,9 @@ pub(crate) const V26A428_M5: Variant = Variant {
     ray_traversal: false,
     fragment_busy: false,
     lead_commands: false,
+    // Neither the M5 render pair's nor the compute channel's kick encodes a wait on another
+    // queue's stamp.
+    render_barriers: false,
     // The A18 Pro's: the M5 render pair takes its tile-buffer layout (`target::Layout`) and the
     // common register lists it adapts (`CommonPrograms::write_m5`) from them.
     programs: super::render::RegisterPrograms::G17P,

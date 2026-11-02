@@ -140,6 +140,10 @@ module! {
             default: 0,
             description: "M5: log every retired DRM compute kick's class and firmware start/end stamps (nonzero: on)",
         },
+        m5_lane_trace: u32 {
+            default: 0,
+            description: "M5: log each lane's park, adoption and quarantine (nonzero: on)",
+        },
         robust_isolation: u32 {
             default: 0,
             // permissions: 0o644,

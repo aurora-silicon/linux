@@ -183,9 +183,12 @@ pub(super) struct Registry {
     completion_seen: KVVec<u64>,
     worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
-    /// The M5 profile's compute channels, one per logical queue ever created, each retained
-    /// from its installation to the end of the firmware session ([`queue::m5`]).
+    /// The M5 profile's bound compute channels, one per open logical queue, plus each closed
+    /// one until its context's scheduler release is consumed, and the quarantined ones, which
+    /// stay for the firmware session ([`queue::m5`]).
     m5: KVec<KBox<queue::m5::Channel>>,
+    /// Idle installed compute lanes without an owner: the next QUEUE_CREATE adopts one.
+    m5_parked: KVec<queue::m5::ParkedLane>,
     /// Its render pairs, one per logical queue that rendered, retained the same way
     /// ([`queue::m5_render`]).
     m5_render: KVec<KBox<queue::m5_render::Pair>>,
@@ -225,7 +228,8 @@ impl Registry {
                 _ => MetricsIds::new(),
             }, GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
-            admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues, renders)?,
+            admission: admission::Pool::with_waiters(
+                kick::queue_limit(variant.qid_floor), variant.render_barriers, queues, renders)?,
             render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
             identities: queue::Identities::new(),
             compute: {
@@ -252,6 +256,7 @@ impl Registry {
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
             m5: KVec::new(),
+            m5_parked: KVec::new(),
             m5_render: KVec::new(),
         })
     }

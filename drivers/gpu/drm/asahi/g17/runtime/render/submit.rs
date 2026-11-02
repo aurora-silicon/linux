@@ -148,11 +148,10 @@ impl Backend {
     /// Scheduler admission of a render packet. A work state of its context or
     /// a pair admission it lacks becomes a fence that the return providing it
     /// signals, so run_job finds both ready instead of waiting for them.
-    /// Errors, and anything else publication may wait for, are left to it.
+    /// Errors, and anything else publication may wait for, are left to it
+    /// (on M5, its pair's room: `m5_render_packet`).
     pub(in crate::g17::runtime) fn admit_render(&self, packet: &Arc<Packet>) -> Option<kernel::dma_fence::Fence> {
-        // M5 publication waits for its pair's room itself (`m5_render_packet`).
-        if self.shared.m5.is_some()
-            || packet.early_result().is_some()
+        if packet.early_result().is_some()
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
             || self.admission_open().is_err()

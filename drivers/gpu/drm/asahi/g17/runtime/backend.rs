@@ -101,15 +101,14 @@ impl Backend {
         // Retain a published scheduler before a never-kicked physical graph is
         // removed. The teardown entry owns its root until control consumption.
         if self.shared.m5.is_some() {
-            // No M5 scheduler release is established: the channel and its context stay with
-            // the firmware session (`queue::m5`).
+            // The channel closes; its lane parks once the scheduler release armed below is
+            // consumed (`runtime::m5::Lanes`).
             firmware.queues.close_m5(self.owner);
-        } else {
-            firmware
-                .queues
-                .teardown
-                .close(&self.context, super::now_ns())?;
         }
+        firmware
+            .queues
+            .teardown
+            .close(&self.context, super::now_ns())?;
         firmware.queues.release_compute(self.owner)?;
         firmware.queues.release_render(self.owner)?;
         firmware.queues.admission.release_owner(self.owner);
