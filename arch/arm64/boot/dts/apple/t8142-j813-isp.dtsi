@@ -190,27 +190,33 @@
 &isp {
 	apple,temporal-filter = <1>;
 
+	/*
+	 * All presets scale from the full-resolution sensor mode (config 7).
+	 * In the binned mode (config 10, 1520x1440) the firmware's AWB keeps
+	 * the setfile's default white point and the picture is magenta; in
+	 * config 7 it converges.
+	 */
 	sensor-presets {
 		/* 1280x720 */
 		preset0 {
-			apple,config-index = <10>;
-			apple,input-size = <1520 1440>;
+			apple,config-index = <7>;
+			apple,input-size = <3040 2880>;
 			apple,output-size = <1280 720>;
-			apple,crop = <0 292 1520 856>;
+			apple,crop = <0 584 3040 1710>;
 		};
 		/* 1440x1080 (4:3) */
 		preset1 {
-			apple,config-index = <10>;
-			apple,input-size = <1520 1440>;
+			apple,config-index = <7>;
+			apple,input-size = <3040 2880>;
 			apple,output-size = <1440 1080>;
-			apple,crop = <40 180 1440 1080>;
+			apple,crop = <80 360 2880 2160>;
 		};
 		/* 1080x1080 (1:1) */
 		preset2 {
-			apple,config-index = <10>;
-			apple,input-size = <1520 1440>;
+			apple,config-index = <7>;
+			apple,input-size = <3040 2880>;
 			apple,output-size = <1080 1080>;
-			apple,crop = <220 180 1080 1080>;
+			apple,crop = <440 360 2160 2160>;
 		};
 		/* 1920x1080 */
 		preset3 {
