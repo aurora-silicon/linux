@@ -518,7 +518,7 @@ impl Registry {
         for lane in self.m5_parked.iter().filter(|lane| lane.vacate_candidate()) {
             count += 1;
             let age = now.saturating_sub(lane.released_at());
-            if age >= expiry {
+            if lane.needs_fresh_backing() || age >= expiry {
                 forced += 1;
             } else {
                 let left = expiry - age;
@@ -542,7 +542,9 @@ impl Registry {
             candidates.push((key, queue.qid(), false), GFP_KERNEL)?;
         }
         for lane in self.m5_parked.iter().filter(|lane| lane.vacate_candidate()) {
-            candidates.push((lane.released_at(), lane.qid(), true), GFP_KERNEL)?;
+            // A lane recycled after a kill sorts first, as a recycled Neo queue does.
+            let key = if lane.needs_fresh_backing() { 0 } else { lane.released_at() };
+            candidates.push((key, lane.qid(), true), GFP_KERNEL)?;
         }
         // Recycled and expired pools are the oldest keys and sort first.
         candidates.sort_unstable();
@@ -992,8 +994,17 @@ impl Backend {
                         Err(error) => return Err(error),
                     }
                 }
-                if published && firmware.m5_install_consumed(owner, expired)? {
-                    return Ok(());
+                if published {
+                    // An adopted recycled lane is reinstalled first (`Channel::reinstall`).
+                    match firmware.m5_reinstall(owner) {
+                        Ok(()) => {}
+                        Err(error) if error == EAGAIN && !expired => {}
+                        Err(error) if error == EAGAIN => return Err(EBUSY),
+                        Err(error) => return Err(error),
+                    }
+                    if firmware.m5_install_consumed(owner, expired)? {
+                        return Ok(());
+                    }
                 }
             }
             shared.queue_events();

@@ -1319,7 +1319,10 @@ pub(crate) enum Failure {
     /// retirement is the witness that ends the quarantine.
     Settled,
     /// The work failed with the firmware's view of it unknown (a timeout, its VM failed): the
-    /// quarantine stays. After a settled failure it is a repeat and changes nothing.
+    /// quarantine stays. After a settled failure it is a repeat and changes nothing. On the M5
+    /// Ultra a closed lane's held kicks are then stopped by its context's kill, whose settlement
+    /// awaits their exact drain (`queue::m5::Channel::settle_kill`); that drain recycles the lane
+    /// (`queue::m5::Channel::recycle_killed`).
     Final,
     /// A retirement witness could not be read: the quarantine stays, whatever came first.
     Ambiguous,

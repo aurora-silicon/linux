@@ -7,7 +7,9 @@ use core::sync::atomic::{fence, AtomicU32, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 pub(crate) const POLL_NS: u64 = 2_500_000_000;
-const QUARANTINED_DELAY_NS: u64 = 250_000_000;
+/// A closed context's quarantined queue is left this long before its kill, so that ordinary
+/// retirement goes first.
+pub(crate) const QUARANTINED_DELAY_NS: u64 = 250_000_000;
 const CANCELLED_DELAY_NS: u64 = 2_000_000_000;
 
 // Firmware-visible cookie namespace persists for the loaded module's lifetime.
@@ -68,7 +70,9 @@ enum Phase {
     Released,
 }
 
-pub(super) struct Transaction {
+/// One published kill of a closed context, from its publication to its settlement: Neo's compute
+/// queues and the M5 Ultra's compute lanes (`queue::m5::Channel`) each keep their own.
+pub(crate) struct Transaction {
     cookie: u64,
     published: u64,
     phase: Phase,
@@ -76,9 +80,52 @@ pub(super) struct Transaction {
 }
 
 impl Transaction {
+    /// A kill just published with `cookie`.
+    pub(crate) fn new(cookie: u64, now: u64) -> Self {
+        Self { cookie, published: now, phase: Phase::Published, announced: None }
+    }
     /// The firmware acknowledged the kill and the killed commands were settled.
-    pub(super) fn released(&self) -> bool {
+    pub(crate) fn released(&self) -> bool {
         self.phase == Phase::Released
+    }
+    /// Acknowledged (or acknowledged and not yet proved by the scheduler page): settlement next.
+    pub(crate) fn settling(&self) -> bool {
+        matches!(self.phase, Phase::Acknowledged | Phase::Unproven)
+    }
+    /// When the kill was published.
+    pub(crate) fn published_at(&self) -> u64 {
+        self.published
+    }
+    /// The scheduler page did not show the killed state at settlement: re-read on later passes.
+    pub(crate) fn mark_unproven(&mut self) {
+        self.phase = Phase::Unproven;
+    }
+    /// Settled.
+    pub(crate) fn mark_released(&mut self) {
+        self.phase = Phase::Released;
+    }
+    /// A failed doorbell does not undo the published kill or consume its retry.
+    /// The caller retries under the device mutex; only the original record exists.
+    pub(crate) fn announce(&mut self, now: u64, notify: impl FnOnce() -> Result) -> Result {
+        if self.phase != Phase::Published || self.announced.is_some() {
+            return Ok(());
+        }
+        notify()?;
+        self.announced = Some(now);
+        Ok(())
+    }
+    pub(crate) fn polling(&self, now: u64) -> bool {
+        self.phase == Phase::Published
+            && now.saturating_sub(self.announced.unwrap_or(self.published)) < POLL_NS
+    }
+    /// Only this kill's exact nonzero cookie acknowledges it, once; `qid` is traced.
+    pub(crate) fn acknowledge(&mut self, cookie: u64, qid: u8) -> bool {
+        if cookie == 0 || self.cookie != cookie || self.phase != Phase::Published {
+            return false;
+        }
+        self.phase = Phase::Acknowledged;
+        crate::g17::trace::teardown(4, cookie, u64::from(qid), 0);
+        true
     }
 }
 
@@ -147,45 +194,25 @@ impl Queue {
         self.kill_wait.take().map_or(0, |(since, _)| now.saturating_sub(since))
     }
     pub(crate) fn record_exit(&mut self, cookie: u64, now: u64) {
-        self.exit = Some(Transaction {
-            cookie,
-            published: now,
-            phase: Phase::Published,
-            announced: None,
-        });
+        self.exit = Some(Transaction::new(cookie, now));
     }
-    /// A failed doorbell does not undo the published kill or consume its retry.
-    /// The caller retries under the device mutex; only the original record exists.
+    /// A failed doorbell does not undo the published kill or consume its retry
+    /// ([`Transaction::announce`]).
     pub(crate) fn announce_exit(&mut self, now: u64, notify: impl FnOnce() -> Result) -> Result {
-        let Some(exit) = self.exit.as_mut() else {
-            return Ok(());
-        };
-        if exit.phase != Phase::Published || exit.announced.is_some() {
-            return Ok(());
+        match self.exit.as_mut() {
+            Some(exit) => exit.announce(now, notify),
+            None => Ok(()),
         }
-        notify()?;
-        exit.announced = Some(now);
-        Ok(())
     }
     pub(crate) fn exit_polling(&self, now: u64) -> bool {
-        self.exit.as_ref().is_some_and(|exit| {
-            exit.phase == Phase::Published
-                && now.saturating_sub(exit.announced.unwrap_or(exit.published)) < POLL_NS
-        })
+        self.exit.as_ref().is_some_and(|exit| exit.polling(now))
     }
     /// Event consumption and record_exit are serialized by the device mutex.
     /// A kill pins this exact queue transaction through its final witness;
     /// duplicate, unknown and terminal cookies cannot acknowledge another owner.
     pub(crate) fn acknowledge_exit(&mut self, cookie: u64) -> bool {
-        let Some(exit) = self.exit.as_mut() else {
-            return false;
-        };
-        if cookie == 0 || exit.cookie != cookie || exit.phase != Phase::Published {
-            return false;
-        }
-        exit.phase = Phase::Acknowledged;
-        crate::g17::trace::teardown(4, cookie, u64::from(self.qid()), 0);
-        true
+        let qid = self.qid();
+        self.exit.as_mut().is_some_and(|exit| exit.acknowledge(cookie, qid))
     }
     pub(crate) fn settle_exit(
         &mut self,
@@ -254,5 +281,36 @@ impl Queue {
         self.retire_pending = false;
         self.retirement_ready = false;
         Ok(())
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_exit_transaction)]
+mod transaction_tests {
+    use super::{Transaction, POLL_NS};
+
+    #[test]
+    fn only_the_exact_cookie_acknowledges_a_kill_once() {
+        let mut kill = Transaction::new(7, 1_000);
+        assert!(kill.polling(1_000) && !kill.polling(1_000 + POLL_NS) && !kill.settling());
+        assert!(!kill.acknowledge(0, 9));
+        assert!(!kill.acknowledge(8, 9));
+        assert!(kill.acknowledge(7, 9));
+        assert!(!kill.acknowledge(7, 9));
+        assert!(kill.settling() && !kill.polling(1_000));
+        kill.mark_unproven();
+        assert!(kill.settling() && !kill.released());
+        kill.mark_released();
+        assert!(kill.released() && !kill.settling());
+    }
+
+    #[test]
+    fn a_kill_rings_its_doorbell_once() {
+        let mut kill = Transaction::new(7, 1_000);
+        assert!(kill.announce(1_001, || Err(kernel::error::code::EIO)).is_err());
+        let mut rung = 0;
+        assert!(kill.announce(1_002, || { rung += 1; Ok(()) }).is_ok());
+        assert!(kill.announce(1_003, || { rung += 1; Ok(()) }).is_ok());
+        assert_eq!(rung, 1);
+        assert!(kill.polling(1_002 + POLL_NS - 1) && !kill.polling(1_002 + POLL_NS));
     }
 }

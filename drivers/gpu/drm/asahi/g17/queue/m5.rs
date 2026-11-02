@@ -12,8 +12,11 @@
 //! to one logical queue, parks it once that queue closed, the lane is idle and its context's
 //! scheduler release was consumed ([`Channel::park`]), and a later queue adopts it
 //! ([`Channel::adopt`]), reconfiguring the hardware queue at its first kick. Kick timestamps and
-//! stamps continue across owners. A quarantined lane is never reused, and a failed kick keeps
-//! its command pinned.
+//! stamps continue across owners. A quarantined lane is not reused, and a failed kick keeps its
+//! command pinned, until a witness ends the quarantine: a settled failure's exact drain returns
+//! the lane as it is, and a killed context's exact drain recycles it with fresh backing
+//! ([`Channel::recycle_killed`]), as Neo's compute queue is recycled
+//! (`queue::compute::Queue::recycle_killed`).
 //!
 //! Retirement is exact and strict: the completion record of this queue, kick and
 //! descriptor, the queue's stamp covering the kick, the inner consumer past the kick's items, the
@@ -25,7 +28,7 @@
 //! witnesses prove that the firmware retired the kick, not that every workgroup ran: dispatches
 //! that lost workgroups retired with all of them.
 
-use super::compute::{awaits_witness, Failure, GRAPH_SIZE, ITEMS, POINTERS};
+use super::compute::{awaits_witness, exit, Failure, GRAPH_SIZE, ITEMS, POINTERS};
 use super::pool_state::{PoolPhase, PoolState};
 use crate::g17::{
     context::{Context, WorkStateLease},
@@ -149,6 +152,9 @@ struct Active {
     /// The DRM command; `None` for the qualification's own kicks.
     packet: Option<Arc<Packet>>,
     observed: Option<Observation>,
+    /// Its QoS publication is open (`Port::qos_publish` succeeded): its retirement, or its
+    /// failure's drain, completes it, as for a Neo compute command (`qos_pending`).
+    qos: bool,
     /// Its publication order across both engines (`Port::next_publication`), for cross-VM
     /// timeout attribution.
     published: u64,
@@ -254,6 +260,17 @@ impl Lane {
         self.graph.write(ITEMS, self.graph.gpu_va() + CONFIG as u64)
     }
 
+    /// Stages a reinstallation: `config` as item `producer`, the installation's record reused (its
+    /// item was consumed long ago). Returns the producer after it.
+    fn stage_reinstall(&mut self, producer: u32, config: QueueConfig) -> Result<u32> {
+        self.graph.write(CONFIG, config)?;
+        self.graph.write(
+            ITEMS + producer as usize * 8,
+            self.graph.gpu_va() + CONFIG as u64,
+        )?;
+        Ok((producer + 1) % ITEM_RING_ENTRIES)
+    }
+
     /// The firmware finished every item up to `target` and holds nothing else: `done`, its own
     /// cursor (+0x30) and the producer all stand there, the host's idle condition
     /// ([`PointerBlock`]).
@@ -261,6 +278,27 @@ impl Lane {
         Ok(self.word(POINTERS)? == target
             && self.word(POINTERS + 0x30)? == target
             && self.word(POINTERS + self.producer)? == target)
+    }
+
+    /// A killed queue's item ring restarts empty at the firmware's consumer cursor, as Neo's
+    /// (`queue::compute` `Graph::reset_items`): every item slot is cleared and the producer set to
+    /// the consumer. Only once the ring is idle at its producer with nothing pending.
+    fn reset_items(&mut self) -> Result {
+        let cursors = self.cursors()?;
+        if cursors.count != ITEM_RING_ENTRIES || cursors.consumer >= cursors.count {
+            return Err(EIO);
+        }
+        for index in 0..ITEM_RING_ENTRIES as usize {
+            self.graph
+                .dword(ITEMS + index * 8)?
+                .store(0, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        self.graph
+            .word(POINTERS + self.producer)?
+            .store(cursors.consumer, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Waits until `installed` holds for every lane's installation item.
@@ -370,6 +408,8 @@ pub(crate) struct Channel {
     /// Set by an adoption until the binding's first kick: whether the class (and so the outer
     /// work ring) changed.
     rebound: Option<bool>,
+    /// An adopted recycled lane's reinstallation ([`Self::reinstall`]).
+    reinstall: Reinstall,
     /// The class whose outer work ring last carried this queue's first slot.
     class: u8,
     /// Set once this binding's client views are unmapped, after it parks.
@@ -418,6 +458,31 @@ pub(crate) struct Channel {
     /// event has been consumed, so the event worker polls until it retires, as for a Neo
     /// compute queue (`queue::compute::Queue::retirement_polling`).
     retire_pending: bool,
+    /// The kill of this lane's closed context, published because its failed kicks would not
+    /// drain on their own ([`Self::kill_candidate`]): Neo's compute-exit transaction
+    /// (`queue::compute::exit::Transaction`).
+    exit: Option<exit::Transaction>,
+    /// The kill was refused (its scheduler page named a queue outside the context, or it was
+    /// inactive): the lane keeps its quarantine as before.
+    kill_refused: bool,
+    /// When the kill was settled ([`Self::settle_kill`]): the failed kicks' drain is awaited from
+    /// then on.
+    killed_at: Option<u64>,
+    /// The lane was recycled after its context's kill ([`Self::recycle_killed`]): its pool is
+    /// released and vacant before any owner adopts it, as for a recycled Neo queue
+    /// (`queue::compute::Queue::needs_fresh_backing`).
+    needs_fresh_backing: bool,
+}
+
+/// The reinstallation of a lane recycled after a kill, at its adoption ([`Channel::reinstall`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reinstall {
+    /// Not needed: a fresh channel, or a lane adopted as it parked.
+    None,
+    /// Due before the binding's first kick.
+    Due,
+    /// Published; consumed once the firmware's consumer reaches this producer.
+    Published(u32),
 }
 
 /// Maps a lane's client-visible storage into `vm`: the kick ring (unless `Lane::new` did), the
@@ -482,6 +547,9 @@ pub(crate) struct ParkedLane {
     pool_state: PoolState,
     /// When it parked: the vacate pass releases the least recently parked pools first.
     parked_at: u64,
+    /// Recycled after a kill ([`Channel::recycle_killed`]): adoptable only once its pool is
+    /// vacant, and vacated whatever the warm cap.
+    needs_fresh_backing: bool,
 }
 
 impl ParkedLane {
@@ -490,8 +558,17 @@ impl ParkedLane {
     }
     /// Its previous binding's client views are unmapped (a new owner in the same VM may map
     /// the lane at the same addresses), and no release of its pool is in flight.
+    /// A recycled lane's pool must be vacant too: its next owner's first command backs it afresh
+    /// (as Neo's `queue::compute::Queue::reusable`).
     pub(crate) fn adoptable(&self) -> bool {
-        self.unmapped.done() && !self.pool_state.pending()
+        self.unmapped.done()
+            && !self.pool_state.pending()
+            && (!self.needs_fresh_backing || self.pool_state.phase() == PoolPhase::Vacant)
+    }
+    /// Recycled after a kill and still holding the backing the killed work used: the vacate pass
+    /// releases it first and beyond the cap (`Registry::vacate_idle_pools`).
+    pub(crate) fn needs_fresh_backing(&self) -> bool {
+        self.needs_fresh_backing
     }
     /// Its pool is backed and kept: an adoption needs no fresh backing.
     pub(crate) fn backed(&self) -> bool {
@@ -659,6 +736,7 @@ impl Channel {
                 _previous_pages: None,
                 unmapped: Unmapped::new()?,
                 rebound: None,
+                reinstall: Reinstall::None,
                 class: u8::MAX,
                 gpu,
                 descriptors_lower: low,
@@ -682,6 +760,10 @@ impl Channel {
                 faulted: false,
                 awaiting_witness: false,
                 retire_pending: false,
+                exit: None,
+                kill_refused: false,
+                killed_at: None,
+                needs_fresh_backing: false,
             },
             GFP_KERNEL,
         )?;
@@ -747,6 +829,15 @@ impl Channel {
         // The lane is idle and its owner's release consumed: no reader of the record remains.
         lane.lane.set_owner(&context)?;
         let lane = parked.remove(index).map_err(|_| EINVAL)?;
+        let recycled = lane.needs_fresh_backing;
+        if recycled {
+            pr_info!(
+                "G17 M5: lane {}: recycled after a kill, adopted by queue {} (context {})\n",
+                lane.qid(),
+                owner,
+                context.id()
+            );
+        }
         let class_changed = lane.class != context.policy().priority();
         let channel = KBox::write(
             slot,
@@ -757,6 +848,11 @@ impl Channel {
                 _previous_pages: Some(lane.pages),
                 unmapped,
                 rebound: Some(class_changed),
+                reinstall: if recycled {
+                    Reinstall::Due
+                } else {
+                    Reinstall::None
+                },
                 class: lane.class,
                 gpu: lane.gpu,
                 descriptors_lower: lane.descriptors_lower,
@@ -780,6 +876,10 @@ impl Channel {
                 faulted: false,
                 awaiting_witness: false,
                 retire_pending: false,
+                exit: None,
+                kill_refused: false,
+                killed_at: None,
+                needs_fresh_backing: false,
             },
         );
         if let Err(error) = channel.publish_mappings() {
@@ -819,9 +919,10 @@ impl Channel {
     pub(crate) fn report_park(&self) {
         let next = self.lane.kick.timestamp();
         pr_warn!(
-            "G17 M5: lane {}: closed {} installed {} quarantine {:?} faulted {} active {} failed {}, cursors {:x?}, idle {:?}, pool {:?}/{:?}, stamp {:x?} for kick {:#x}\n",
+            "G17 M5: lane {}: closed {} installed {} quarantine {:?} faulted {} active {} failed {}, kill: due {} published {} settled {} refused {}, cursors {:x?}, idle {:?}, pool {:?}/{:?}, stamp {:x?} for kick {:#x}\n",
             self.qid(), self.closed, self.installed, self.quarantine_error, self.faulted, self.active.len(),
-            self.failed.len(), self.lane.cursors(),
+            self.failed.len(), self.kill_candidate(), self.exit.is_some(), self.killed_at.is_some(),
+            self.kill_refused, self.lane.cursors(),
             self.lane.cursors().and_then(|cursors| self.lane.idle_at(cursors.producer)),
             self.pool.completed_submissions(), self.pool.submitted(), self.stamp(), next.prev().get(),
         );
@@ -832,11 +933,114 @@ impl Channel {
     /// quarantined Neo queue does not (`Queue::idle_for_context` waits for the firmware, not for
     /// the witness): the healthy lanes of the context park, and this one parks only if it drained
     /// before the release was consumed ([`Self::end_witness_wait`]).
+    /// A lane whose context is to be killed waits for the kill ([`Self::kill_holds_release`]).
     pub(crate) fn settled(&self) -> Result<bool> {
         if self.quarantine_error.is_none() {
             return self.parkable();
         }
-        Ok(self.closed && self.lane.idle_at(self.lane.cursors()?.producer)?)
+        Ok(self.closed
+            && self.lane.idle_at(self.lane.cursors()?.producer)?
+            && !self.kill_holds_release(crate::g17::now_ns()))
+    }
+
+    /// The firmware may still run this closed lane's failed kicks: they are held (`failed`) with
+    /// no drain awaited, as after a timeout or its VM's failure ([`Failure::Final`]), and an
+    /// unreadable witness ([`Failure::Ambiguous`]). The firmware consumes a kick's items when it
+    /// launches its work, so an idle ring does not say the work ended: a measured compute spin kept
+    /// the GPU busy after its timeout. Its context is killed as a Neo queue's closed context with
+    /// retained commands is (`Firmware::publish_compute_exit`).
+    pub(crate) fn kill_candidate(&self) -> bool {
+        self.closed
+            && self.quarantine_error.is_some()
+            && !self.awaiting_witness
+            && !self.failed.is_empty()
+            && self.exit.is_none()
+            && !self.kill_refused
+    }
+
+    /// The context's scheduler release waits for its kill: due, published and not yet settled
+    /// (for [`exit::POLL_NS`] at most), or settled with the drain awaited (as long again). Past
+    /// those bounds the release goes as before the kill, and the lane stays quarantined
+    /// ([`Self::end_witness_wait`]).
+    fn kill_holds_release(&self, now: u64) -> bool {
+        if self.kill_candidate() {
+            return true;
+        }
+        match (&self.exit, self.killed_at) {
+            (Some(exit), None) => {
+                !exit.released() && now.saturating_sub(exit.published_at()) < exit::POLL_NS
+            }
+            (Some(_), Some(killed)) => {
+                self.awaiting_witness && now.saturating_sub(killed) < exit::POLL_NS
+            }
+            (None, _) => false,
+        }
+    }
+
+    /// The kill of this lane's context was published with `cookie`.
+    pub(crate) fn record_kill(&mut self, cookie: u64, now: u64) {
+        self.exit = Some(exit::Transaction::new(cookie, now));
+    }
+
+    /// The kill could not be published for this context; the lane stays quarantined.
+    pub(crate) fn refuse_kill(&mut self) {
+        self.kill_refused = true;
+    }
+
+    /// The kill's doorbell, retried until it rings once ([`exit::Transaction::announce`]).
+    pub(crate) fn announce_kill(&mut self, now: u64, notify: impl FnOnce() -> Result) -> Result {
+        match self.exit.as_mut() {
+            Some(exit) => exit.announce(now, notify),
+            None => Ok(()),
+        }
+    }
+
+    /// The event worker polls while the kill awaits its acknowledgement, and while the settled
+    /// kill's drain is awaited, each within [`exit::POLL_NS`].
+    pub(crate) fn kill_polling(&self, now: u64) -> bool {
+        self.exit.as_ref().is_some_and(|exit| exit.polling(now))
+            || self.killed_at.is_some_and(|killed| {
+                self.awaiting_witness && now.saturating_sub(killed) < exit::POLL_NS
+            })
+    }
+
+    /// The firmware acknowledged the kill with `cookie` (event 12): only this kill's exact cookie.
+    pub(crate) fn acknowledge_kill(&mut self, cookie: u64) -> bool {
+        let qid = self.qid();
+        self.exit
+            .as_mut()
+            .is_some_and(|exit| exit.acknowledge(cookie, qid))
+    }
+
+    /// Settles an acknowledged kill once recovery is closed (`recovery_closed`) and the context's
+    /// scheduler page shows it killed (+0x34 == 1); until then it is re-read on later passes. The
+    /// acknowledgement and the killed state say the firmware stopped the context, not that it
+    /// retired the failed kicks: from here their exact drain ([`Self::drained`]) is awaited, as a
+    /// settled failure's is, and it alone gives them up ([`Self::rehabilitate`]); the lane is then
+    /// recycled ([`Self::recycle_killed`]).
+    pub(crate) fn settle_kill(&mut self, recovery_closed: bool, now: u64) {
+        let Some(transaction) = self.exit.as_mut() else {
+            return;
+        };
+        if !transaction.settling() || !recovery_closed {
+            return;
+        }
+        let Ok(state) = exit::State::read(&self.context) else {
+            return;
+        };
+        if state.killed != 1 {
+            transaction.mark_unproven();
+            return;
+        }
+        transaction.mark_released();
+        self.killed_at = Some(now.max(1));
+        self.awaiting_witness = true;
+        pr_info!(
+            "G17 M5: lane {}: its context {} was killed; awaiting its {} failed kicks' drain\n",
+            self.qid(),
+            self.context.id(),
+            self.failed.len()
+        );
     }
 
     /// Splits a parked channel ([`Self::parkable`], its context's release consumed) into its
@@ -860,6 +1064,7 @@ impl Channel {
             usage,
             unmapped,
             pool_state,
+            needs_fresh_backing,
             ..
         } = KBox::into_inner(self);
         let pages = context.retain_firmware_pages();
@@ -880,6 +1085,7 @@ impl Channel {
                 unmapped: unmapped.clone(),
                 pool_state,
                 parked_at: crate::g17::now_ns(),
+                needs_fresh_backing,
             },
             Binding {
                 aliases,
@@ -1215,6 +1421,47 @@ impl Channel {
         result
     }
 
+    /// Reinstalls an adopted recycled lane for its new owner before the binding's first kick: the
+    /// installation's configuration (the new context, its scheduler and QoS identity, the
+    /// completion value continuing) as one item with no kick, exposed through the outer slot as a
+    /// fresh lane's installation is, its consumption awaited as that one's
+    /// ([`Self::install_consumed`]). A lane adopted as it parked has nothing to reinstall. The
+    /// firmware fails the first kick on a killed context's lane at once with a zero-duration
+    /// record, after the item-ring reset, the cleared parent, the cleared descriptors and fresh
+    /// pool backing alike; the configuration reaching the firmware before any kick is what
+    /// a fresh lane has. EAGAIN: no outer slot yet, nothing published. A failure after the
+    /// publication quarantines the channel.
+    pub(crate) fn reinstall(&mut self, host: &mut Host<'_>) -> Result {
+        if self.reinstall != Reinstall::Due {
+            return Ok(());
+        }
+        if let Some(error) = self.quarantine_error {
+            return Err(error);
+        }
+        let priority = self.context.policy().priority();
+        let producer = self.lane.cursors()?.producer;
+        if !self.lane.idle_at(producer)? {
+            return Err(EIO);
+        }
+        let claim = host.port.reserve_compute(priority)?;
+        let target = self
+            .lane
+            .stage_reinstall(producer, self.config(true, None)?)?;
+        let first = self.class != priority;
+        self.class = priority;
+        self.rebound = Some(false);
+        self.reinstall = Reinstall::Published(target);
+        self.context.mark_published();
+        let result = self
+            .lane
+            .expose(host.port, claim, target, first, None)
+            .map(|_| ());
+        if let Err(error) = result {
+            self.quarantine_error = Some(error);
+        }
+        result
+    }
+
     /// Whether the firmware consumed the installation's configuration ([`Self::install`]); an
     /// adopted lane's binding has none and is consumed at once. A crash, or the configuration
     /// still unconsumed once the wait `expired` ([`INSTALL_WAIT_MS`]), quarantines the channel.
@@ -1222,7 +1469,21 @@ impl Channel {
         if let Some(error) = self.quarantine_error {
             return Err(error);
         }
-        if self.rebound.is_some() || self.lane.cursors()?.consumer == 1 {
+        let consumed = match self.reinstall {
+            Reinstall::Published(target) => self.lane.cursors()?.consumer == target,
+            Reinstall::Due => false,
+            Reinstall::None => self.rebound.is_some() || self.lane.cursors()?.consumer == 1,
+        };
+        if consumed {
+            if let Reinstall::Published(target) = self.reinstall {
+                self.reinstall = Reinstall::None;
+                pr_info!(
+                    "G17 M5: lane {}: reinstalled for queue {} (consumed at {:#x})\n",
+                    self.qid(),
+                    self.owner,
+                    target
+                );
+            }
             return Ok(true);
         }
         let error = match () {
@@ -1543,6 +1804,7 @@ impl Channel {
                 work: work.clone(),
                 packet,
                 observed: None,
+                qos: qos_row.is_some(),
                 published,
             })
             .map_err(|_| ENOMEM)?;
@@ -1596,7 +1858,7 @@ impl Channel {
         retired: &mut impl FnMut(Retired) -> Result,
     ) -> Result {
         if self.quarantine_error.is_some() {
-            return self.rehabilitate(state, retired);
+            return self.rehabilitate(state, complete_qos, retired);
         }
         if self.faulted {
             return self.fail(EIO, Failure::Settled, retired);
@@ -1772,7 +2034,17 @@ impl Channel {
     /// then a fence the failure never reached failed), and only then given up; the channel is
     /// healthy again and a closed one parks. Witnesses that cannot be read make the failure
     /// Ambiguous: the quarantine stays, and so do the kicks, pinned.
-    fn rehabilitate(&mut self, state: u32, retired: &mut impl FnMut(Retired) -> Result) -> Result {
+    /// Each drained kick's QoS publication is completed first, as a Neo compute queue's exact drain
+    /// completes it (`Queue::release_witnessed`) and a render pair's drained pass does
+    /// (`Pair::retire`): left open, the QID's in-flight count and its owner's QoS row outlive the
+    /// kick, and the lane's next owner with another QoS slot is refused (EBUSY) at every
+    /// publication.
+    fn rehabilitate(
+        &mut self,
+        state: u32,
+        complete_qos: &mut impl FnMut(qos::Owner) -> Result,
+        retired: &mut impl FnMut(Retired) -> Result,
+    ) -> Result {
         if !self.awaiting_witness {
             return Ok(());
         }
@@ -1788,6 +2060,11 @@ impl Channel {
         }
         let error = self.quarantine_error.unwrap_or(EIO);
         while let Some(front) = self.failed.first() {
+            if front.qos {
+                complete_qos(self.qos_owner())?;
+                self.failed.first_mut().ok_or(EIO)?.qos = false;
+            }
+            let front = self.failed.first().ok_or(EIO)?;
             retired(Retired {
                 ticket: front.ticket,
                 packet: front.packet.clone(),
@@ -1795,6 +2072,10 @@ impl Channel {
                 drained: true,
             })?;
             self.failed.remove(0).map_err(|_| EINVAL)?;
+        }
+        if self.killed_at.is_some() {
+            self.awaiting_witness = false;
+            return self.recycle_killed(error);
         }
         self.quarantine_error = None;
         self.awaiting_witness = false;
@@ -1804,6 +2085,42 @@ impl Channel {
             self.qid(),
             error
         );
+        Ok(())
+    }
+
+    /// Returns a lane whose context was killed to service once the kill settled
+    /// ([`Self::settle_kill`]) and its failed kicks drained exactly ([`Self::drained`]), as Neo's
+    /// compute queue is recycled (`queue::compute::Queue::recycle_killed`): the item ring restarts
+    /// empty at the firmware's consumer, the next kick names no parent (the killed kick was the
+    /// last), every descriptor slot is cleared, and the pool is released and vacant before any
+    /// owner adopts the lane ([`ParkedLane::adoptable`]), whose first command backs it afresh
+    /// ([`Self::grow`]). Returning the lane as it was failed its next owner's first kick at once,
+    /// each time, with a zero-duration record. A ring that cannot be reset keeps the
+    /// quarantine.
+    fn recycle_killed(&mut self, error: Error) -> Result {
+        if !self.installed
+            || !self.exit.as_ref().is_some_and(|exit| exit.released())
+            || !self.active.is_empty()
+            || !self.failed.is_empty()
+        {
+            return Ok(());
+        }
+        if let Err(reset) = self.lane.reset_items() {
+            pr_warn!("G17 M5: lane {}: its ring could not be reset after its context's kill ({:?}); the lane stays quarantined\n",
+                self.qid(), reset);
+            return Ok(());
+        }
+        self.lane.kick.clear_parent_after_recovery();
+        self.descriptors.bytes_mut().fill(0);
+        fence(Ordering::SeqCst);
+        self.exit = None;
+        self.killed_at = None;
+        self.quarantine_error = None;
+        self.faulted = false;
+        self.retire_pending = false;
+        self.needs_fresh_backing = true;
+        pr_info!("G17 M5: lane {}: its failed kicks ({:?}) drained after its context's kill; the lane is recycled\n",
+            self.qid(), error);
         Ok(())
     }
 

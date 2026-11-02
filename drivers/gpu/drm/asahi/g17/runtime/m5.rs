@@ -7,10 +7,12 @@
 //! An installed lane (QID, kick ring, graph, support page and pool) stays with the firmware
 //! session; logical queues lease it: the 26A428 firmware has no queue uninstall.
 //! A closed queue's lane parks once its context's scheduler release (0x13) is consumed
-//! (`runtime::teardown`, [`Lanes`]), and the next QUEUE_CREATE adopts it; a quarantined lane is
-//! never reused, and past [`LEAKED_LANES`] of them creation fails with ENOSPC. Every compute
-//! command, from the scheduler or published early from its ioctl, goes through
-//! [`Backend::m5_packet`] and the channel's one publication transaction; the shared completion scan
+//! (`runtime::teardown`, [`Lanes`]), and the next QUEUE_CREATE adopts it. A quarantined lane is
+//! not reused until a witness ends its quarantine (a settled failure's drain, or a killed
+//! context's drain, which recycles it: `Channel::recycle_killed`); past [`LEAKED_LANES`] of them
+//! creation fails with ENOSPC. Every compute command,
+//! from the scheduler or published early from its ioctl, goes through [`Backend::m5_packet`] and
+//! the channel's one publication transaction; the shared completion scan
 //! (`Firmware::scan_compute`) retires it with the channel's strict predicate.
 
 use super::{
@@ -36,7 +38,9 @@ use kernel::{prelude::*, sync::Arc};
 
 /// Quarantined compute lanes the session tolerates: each keeps its QID, kick ring, pool and its
 /// owner's execution context, so past this many a new logical queue is refused (ENOSPC) rather
-/// than losing its device at the first submission.
+/// than losing its device at the first submission. A timed-out lane whose
+/// context was killed is recycled and does not count; what stays is a quarantine no witness
+/// ends (the release consumed before the drain, a refused kill, a timed-out render pass).
 pub(super) const LEAKED_LANES: usize = 8;
 
 /// The M5 compute channels of the compute entries `compute` ([`ComputeEntry::m5`]); none off
@@ -313,8 +317,54 @@ impl Registry {
         self.m5_channels().find(|channel| channel.owner() == owner)
     }
 
+    /// The M5 compute channel on QID `qid`.
+    pub(super) fn m5_lane_mut(&mut self, qid: u8) -> Option<&mut Channel> {
+        channels_mut(&mut self.compute).find(|channel| channel.qid() == qid)
+    }
+
     fn m5_channel_mut(&mut self, owner: u64) -> Option<&mut Channel> {
         channels_mut(&mut self.compute).find(|channel| channel.owner() == owner)
+    }
+
+    /// Every M5 render pair of `context` is settled (`Pair::settled`): its kill waits for them,
+    /// as a Neo context's waits for its render side.
+    pub(super) fn m5_render_settled(&self, context: &Arc<Context>) -> bool {
+        self.m5_render
+            .iter()
+            .filter(|pair| Arc::ptr_eq(pair.context(), context))
+            .all(|pair| pair.settled().unwrap_or(false))
+    }
+
+    /// The QIDs of `context`'s M5 lanes (its compute channels and render pairs), and those of
+    /// every other bound lane, for the scope check of its kill (`exit::State::scope`).
+    pub(super) fn m5_exit_scope(&self, context: &Arc<Context>) -> (u128, u128) {
+        let (mut own, mut foreign) = (0u128, 0u128);
+        let mut note = |bound: &Arc<Context>, bits: u128| match Arc::ptr_eq(bound, context) {
+            true => own |= bits,
+            false => foreign |= bits,
+        };
+        for channel in self.m5_channels() {
+            note(channel.context(), 1u128 << channel.qid());
+        }
+        for pair in self.m5_render.iter() {
+            let [tiling, fragment] = pair.qids();
+            note(pair.context(), 1u128 << tiling | 1u128 << fragment);
+        }
+        (own, foreign)
+    }
+
+    /// Another context's M5 kick or render pass is in flight on a healthy lane: a kill waits
+    /// for a moment without it, as for Neo's queues (`Firmware::kill_unsafe`). None off the M5
+    /// Ultra.
+    pub(super) fn m5_foreign_in_flight(&self, context: &Arc<Context>) -> bool {
+        self.m5_channels().any(|channel| {
+            channel.in_flight()
+                && channel.quarantined().is_none()
+                && !Arc::ptr_eq(channel.context(), context)
+        }) || self
+            .m5_render
+            .iter()
+            .any(|pair| pair.polls() && !Arc::ptr_eq(pair.context(), context))
     }
 
     /// Whether any M5 kick or render pass is in flight: the event worker polls their retirement.
@@ -820,6 +870,21 @@ impl crate::g17::Firmware {
                     error
                 );
             }
+        })
+    }
+
+    /// Reinstalls `owner`'s adopted channel when its lane was recycled after a kill
+    /// ([`Channel::reinstall`]); nothing for any other channel. EAGAIN: no outer slot yet.
+    pub(super) fn m5_reinstall(&mut self, owner: u64) -> Result {
+        let queues = &mut self.queues;
+        let channel = channels_mut(&mut queues.compute)
+            .find(|channel| channel.owner() == owner)
+            .ok_or(EIO)?;
+        channel.reinstall(&mut Host {
+            init: &self.init,
+            port: &self.port,
+            qids: &mut queues.qids,
+            crashed: &self.primary.state.shared.crashed,
         })
     }
 

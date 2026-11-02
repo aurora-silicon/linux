@@ -134,6 +134,10 @@ impl super::Registry {
                 }
             }
         }
+        // The M5 Ultra's compute lanes (none elsewhere) carry their kills as Neo's queues do.
+        if super::m5::channels_mut(&mut self.compute).any(|channel| channel.acknowledge_kill(cookie)) {
+            return;
+        }
         if self.teardown.acknowledge_render_kill(cookie) {
             RENDER_KILLS[RENDER_KILL_ACKNOWLEDGED].fetch_add(1, Ordering::Relaxed);
             crate::g17::trace::teardown(4, cookie, 0x100, 0);
@@ -154,6 +158,13 @@ impl Firmware {
                 )?;
             }
         }
+        let m5 = self.primary.state.shared.m5.is_some();
+        if m5 {
+            let now = now_ns();
+            for channel in super::m5::channels_mut(&mut self.queues.compute) {
+                channel.settle_kill(recovery_closed, now);
+            }
+        }
         if self.recovery.pending() || !recovery_closed {
             return Ok(());
         }
@@ -163,6 +174,12 @@ impl Firmware {
         for entry in self.queues.compute.iter_mut().flatten() {
             if let Some(mut queue) = entry.queue.as_deref_mut() {
                 let _ = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY));
+            }
+        }
+        if m5 {
+            let primary = &mut self.primary;
+            for channel in super::m5::channels_mut(&mut self.queues.compute) {
+                let _ = channel.announce_kill(now, || primary.notify(MSG_CONTROL_NOTIFY));
             }
         }
         let primary = &mut self.primary;
@@ -175,6 +192,19 @@ impl Firmware {
             let Some((context, age)) = self.queues.teardown.closed(index, now) else {
                 continue;
             };
+            // An M5 context's queues are its compute lane and render pair, which Neo's arms
+            // below do not see.
+            if m5 {
+                if let Err(error) = self.publish_m5_kill(&context, age, now) {
+                    dev_err!(
+                        self.primary.state.shared.dev.as_ref(),
+                        "Scheduler {} kill request failed: {:?}\n",
+                        context.id(),
+                        error
+                    );
+                }
+                continue;
+            }
             if !self.queues.render.teardown_idle(&context)? {
                 self.queues.teardown.clear_kill_wait(index);
                 continue;
@@ -314,6 +344,66 @@ impl Firmware {
             dev_warn!(
                 self.primary.state.shared.dev.as_ref(),
                 "Scheduler {} exit announcement failed: {:?}\n",
+                context.id(),
+                error
+            );
+        }
+        Ok(())
+    }
+
+    /// Kills a closed M5 context whose compute lane holds failed kicks that the firmware may
+    /// still run (`Channel::kill_candidate`), with Neo's rules for a closed context's kill
+    /// (`publish_compute_exit`): after [`exit::QUARANTINED_DELAY_NS`], with its render pairs
+    /// settled, at a moment without other contexts' work in flight unless the GPU stopped
+    /// ([`Self::kill_unsafe`]), and only when its scheduler page names nothing outside the
+    /// context. The opcode, record and acknowledgement are Neo's (0x29, event 12).
+    fn publish_m5_kill(&mut self, context: &Arc<Context>, age: u64, now: u64) -> Result {
+        let Some(target) = super::m5::channels(&self.queues.compute)
+            .find(|channel| Arc::ptr_eq(channel.context(), context) && channel.kill_candidate())
+            .map(|channel| channel.qid())
+        else {
+            return Ok(());
+        };
+        if age < exit::QUARANTINED_DELAY_NS
+            || self.render_control_backpressured()
+            || !self.queues.m5_render_settled(context)
+            || self.kill_unsafe(context, now)
+        {
+            return Ok(());
+        }
+        let (own, foreign) = self.queues.m5_exit_scope(context);
+        let state = exit::State::read(context)?;
+        let Some(qids) = state.scope(target, own, foreign) else {
+            pr_warn!("G17 M5: context {} not killed: its scheduler page (slot {:#x}, queues {:#x}) is inactive or names queues outside it ({:#x}); lane {} stays quarantined\n",
+                context.id(), state.slot, state.qids, own, target);
+            self.queues.m5_lane_mut(target).ok_or(EIO)?.refuse_kill();
+            return Ok(());
+        };
+        let cookie = match exit::next_cookie() {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                self.queues.m5_lane_mut(target).ok_or(EIO)?.refuse_kill();
+                return Err(error);
+            }
+        };
+        let record = ControlRecord::ContextKill(ContextKill::new(context.scheduler_va(), cookie));
+        if let Err(error) = Rings::publish_control(&self.init, &record) {
+            return if error == EAGAIN { Ok(()) } else { Err(error) };
+        }
+        // Publication is irrevocable even if its doorbell fails: record it first.
+        context.note_kill_published();
+        self.queues.m5_lane_mut(target).ok_or(EIO)?.record_kill(cookie, now);
+        crate::g17::trace::teardown(3, cookie, u64::from(context.id()), 0);
+        pr_info!("G17 M5: kill of context {} published (lane {}, queues {:#x}, cookie {}), {} ms after its close\n",
+            context.id(), target, qids, cookie, age / 1_000_000);
+        fence(Ordering::SeqCst);
+        let primary = &mut self.primary;
+        let lane = self.queues.m5_lane_mut(target).ok_or(EIO)?;
+        if let Err(error) = lane.announce_kill(now, || primary.notify(MSG_CONTROL_NOTIFY))
+        {
+            dev_warn!(
+                self.primary.state.shared.dev.as_ref(),
+                "Scheduler {} kill announcement failed: {:?}\n",
                 context.id(),
                 error
             );
@@ -462,6 +552,7 @@ impl Firmware {
             return false;
         }
         self.queues.render.foreign_in_flight(context)
+            || self.queues.m5_foreign_in_flight(context)
             || self
                 .queues
                 .compute
@@ -485,6 +576,9 @@ impl Firmware {
             return true;
         }
         if self.queues.teardown.render_kill_polling(now, exit::POLL_NS) {
+            return true;
+        }
+        if super::m5::channels(&self.queues.compute).any(|channel| channel.kill_polling(now)) {
             return true;
         }
         (0..self.queues.teardown.len()).any(|index| {
