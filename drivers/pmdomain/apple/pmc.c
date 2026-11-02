@@ -1132,10 +1132,30 @@ static const struct apple_pmc_hw apple_pmc_hw_t6040 = {
 	.ap_agent = 3,
 };
 
+/*
+ * T6050 (M5): the T8140 layout with five agents (PMP, CLPC, GFX, AP and the
+ * second die's PMP1) and the T8132 pending word after each floor word. DCS
+ * states 0-6 and fabric states 0-3 (the ADT's PMP dvfs-domain counts).
+ * Agents are enabled on DCS and SOC only, as on T6040.
+ */
+static const struct apple_pmc_hw apple_pmc_hw_t6050 = {
+	.agent_stride = 0x4000,
+	.agents = 5,
+	.rails = 4,
+	.agent_state = 0x0,
+	.rail_enable = 0x2000,
+	.dcs_rail = 0,
+	.dcs_max = 6,
+	.agent_rails = GENMASK(1, 0),
+	.ap_agent = 3,
+	.has_pending = true,
+};
+
 static const struct of_device_id apple_pmc_of_match[] = {
 	{ .compatible = "apple,t8132-pmc", .data = &apple_pmc_hw_t8132 },
 	{ .compatible = "apple,t8140-pmc", .data = &apple_pmc_hw_t8140 },
 	{ .compatible = "apple,t6041-pmc", .data = &apple_pmc_hw_t6040 },
+	{ .compatible = "apple,t6050-pmc", .data = &apple_pmc_hw_t6050 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_pmc_of_match);

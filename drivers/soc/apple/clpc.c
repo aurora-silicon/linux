@@ -930,6 +930,25 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.gpu_demand = false,
 };
 
+/*
+ * T6050: DCS states 0-6 on rail 0, fabric states 0-3 on rail 1 (the ADT's
+ * PMP dvfs-domain counts). The boot loader enables no agent on either rail.
+ * GPU work, which the host publication/idle input reports as on T6040,
+ * holds DCS 6 and fabric 3: on the M5 Ultra that floor makes scratch-heavy
+ * fragment passes 25-35 % faster and an ALU-bound pass 20 % faster, and a
+ * CPU's dependent DRAM loads take 120-140 ns instead of 300. Only that
+ * column is measured; with no cpufreq driver no cluster requests the others.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 0, 0, 0, 6 },
+		[APPLE_CLPC_SOC] = { 0, 0, 0, 3 },
+	},
+	.sustain = 3,
+	.gpu_demand = false,
+};
+
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
 #include <kunit/test.h>
 #include <linux/completion.h>
@@ -1058,6 +1077,7 @@ static const struct of_device_id apple_clpc_of_match[] = {
 	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
 	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
+	{ .compatible = "apple,t6050-clpc", .data = &apple_clpc_hw_t6050 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_clpc_of_match);
