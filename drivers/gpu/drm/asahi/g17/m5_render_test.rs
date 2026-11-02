@@ -111,7 +111,7 @@ impl Render {
                 pair.context().id(),
                 pair.qids(),
                 pair.pool_blocks(),
-                shared.m5.map_or(0, |gpu| gpu.block_bytes() >> 20),
+                shared.m5.as_ref().map_or(0, |gpu| gpu.block_bytes() >> 20),
                 pair.parameter_blocks()
             ),
             Err(error) => dev_err!(
@@ -134,7 +134,7 @@ impl Render {
         firmware: &mut Firmware,
         shared: &Arc<Shared>,
     ) -> Result<KBox<Self>> {
-        let gpu = shared.m5.ok_or(EINVAL)?;
+        let gpu = shared.m5.clone().ok_or(EINVAL)?;
         let uat = firmware.uat.clone();
         let alloc = Allocator {
             dev,

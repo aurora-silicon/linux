@@ -1368,7 +1368,7 @@ impl Backend {
             return Err(EINVAL);
         };
         let draw = Draw { pass, plan: *plan };
-        let gpu = self.shared.m5.ok_or(EINVAL)?;
+        let gpu = self.shared.m5.clone().ok_or(EINVAL)?;
         let deadline = super::now_ns().saturating_add(WORK_RING_WAIT_NS);
         let check = || {
             if packet.cancel_requested() {
@@ -1510,7 +1510,7 @@ impl Backend {
                 self.owner,
                 packet,
                 &draw,
-                Some((&alloc, &gpu, &mut grown)),
+                Some((&alloc, &*gpu, &mut grown)),
             );
             match result {
                 Err(error) if error == EAGAIN && !packet.is_published() => {

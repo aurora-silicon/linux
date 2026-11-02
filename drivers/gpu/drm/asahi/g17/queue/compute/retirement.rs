@@ -276,14 +276,18 @@ const NO_FRONTIER: u64 = u64::MAX;
 const KICK_MASK: u64 = (1 << 40) - 1;
 
 impl Batch {
-    pub(crate) fn new() -> Result<Self> {
-        let mut heads = KVVec::with_capacity(QIDS * IN_FLIGHT, GFP_KERNEL)?;
-        for _ in 0..QIDS * IN_FLIGHT {
-            heads.push_within_capacity(NO_REQUEST).map_err(|_| ENOSPC)?;
-        }
-        Ok(Self {
+    /// Initialized where it lives (the registry, the qualification): its per-QID tables are
+    /// kilobytes, which built by value were a stack temporary of every frame that holds one.
+    pub(crate) fn new() -> impl Init<Self, Error> {
+        kernel::try_init!(Self {
             requests: KVVec::with_capacity(QIDS * IN_FLIGHT, GFP_KERNEL)?,
-            heads,
+            heads: {
+                let mut heads = KVVec::with_capacity(QIDS * IN_FLIGHT, GFP_KERNEL)?;
+                for _ in 0..QIDS * IN_FLIGHT {
+                    heads.push_within_capacity(NO_REQUEST).map_err(|_| ENOSPC)?;
+                }
+                heads
+            },
             slots: [(0, 0); QIDS],
             open: None,
             unobserved: 0,
@@ -654,7 +658,7 @@ mod index_tests {
     }
     #[test]
     fn stale_kick_reads_only_the_control_even_on_a_bucket_collision() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         batch.request(&ticket(7, 33, 0x1000), false).unwrap();
         let words = record(&ticket(7, 17, 0x1000), [10, 20]);
         batch.fold_reader(|word| {
@@ -665,7 +669,7 @@ mod index_tests {
     }
     #[test]
     fn collisions_and_reused_descriptors_keep_full_kick_identity() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         let first = ticket(7, 33, 0x1000);
         let second = ticket(7, 49, 0x1000);
         batch.request(&first, false).unwrap(); batch.request(&second, false).unwrap();
@@ -680,7 +684,7 @@ mod index_tests {
     }
     #[test]
     fn same_kick_still_checks_descriptor_and_zero_duration_is_retained() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         let first = ticket(7, 33, 0x1000);
         let second = ticket(7, 33, 0x2000);
         batch.request(&first, false).unwrap(); batch.request(&second, false).unwrap();
@@ -691,7 +695,7 @@ mod index_tests {
     }
     #[test]
     fn duplicate_identity_keeps_the_first_staged_request() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         let current = ticket(7, 33, 0x1000);
         batch.request(&current, false).unwrap(); batch.request(&current, false).unwrap();
         let words = record(&current, [10, 20]);
@@ -701,7 +705,7 @@ mod index_tests {
     }
     #[test]
     fn clear_restarts_buckets_and_later_publication_stays_unobserved() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         batch.request(&ticket(7, 33, 0x1000), false).unwrap(); batch.clear();
         let current = ticket(7, 49, 0x1000);
         batch.request(&current, false).unwrap();
@@ -715,7 +719,7 @@ mod index_tests {
     }
     #[test]
     fn a_requested_record_still_being_written_is_read_again() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         let current = ticket(7, 33, 0x1000);
         batch.request(&current, true).unwrap();
         let mut words = record(&current, [10, 20]);
@@ -731,7 +735,7 @@ mod index_tests {
     }
     #[test]
     fn a_command_published_during_the_scan_is_left_for_the_next_batch() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         batch.stage_frontier(7, 50).unwrap();
         batch.request(&ticket(7, 49, 0x1000), false).unwrap();
         batch.stage_frontier(9, 3).unwrap();
@@ -777,7 +781,7 @@ mod index_tests {
     }
     #[test]
     fn an_unrequested_or_stale_record_is_passed() {
-        let mut batch = Batch::new().unwrap();
+        let mut batch = KBox::init(Batch::new(), GFP_KERNEL).unwrap();
         batch.request(&ticket(7, 49, 0x1000), false).unwrap();
         let mut stale = record(&ticket(7, 33, 0x1000), [10, 20]);
         stale[7] = 0;

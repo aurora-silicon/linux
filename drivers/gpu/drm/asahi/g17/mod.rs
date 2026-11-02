@@ -885,8 +885,9 @@ struct Shared {
     active_cores: u32,
     variant: &'static fw::Variant,
     /// The M5 descriptor profile ([`Config::m5`]): DRM compute runs on M5 channels
-    /// ([`queue::m5`]) where it is present.
-    m5: Option<fw::m5::compute::Gpu>,
+    /// ([`queue::m5`]) where it is present. Shared, not copied: it is kilobytes, and every
+    /// queue, lane and constructor that names it holds this one.
+    m5: Option<Arc<fw::m5::compute::Gpu>>,
     /// Layout of compute queues' operand-state buffers for this GPU's cores.
     operand_state: &'static fw::compute::OperandState,
     /// Layout of renders' deflake buffers for this GPU's cores.
@@ -1272,7 +1273,9 @@ impl Gpu {
         }
         let m5 = cfg
             .m5
-            .map(|board| fw::m5::compute::Gpu::new(board, &id.core_masks))
+            .map(|board| -> Result<_> {
+                Ok(Arc::new(fw::m5::compute::Gpu::new(board, &id.core_masks)?, GFP_KERNEL)?)
+            })
             .transpose()?;
         if let Some(gpu) = &m5 {
             dev_info!(dev.as_ref(), "M5 compute: {} pool blocks of {} MiB per queue, growing to at most {}\n", gpu.pool_blocks, gpu.block_bytes() >> 20, gpu.max_pool_blocks);
@@ -1631,7 +1634,7 @@ impl Gpu {
         Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
         dev_info!(dev.as_ref(), "M5 opening records retired\n");
         if crate::module_parameters::m5_compute_test.value() != 0 {
-            let mut test = m5_test::Compute::new(dev, session, shared, shared.m5.ok_or(EINVAL)?)?;
+            let mut test = m5_test::Compute::new(dev, session, shared, shared.m5.as_ref().ok_or(EINVAL)?)?;
             // Retain the graph before propagating any failure: firmware may still read it.
             let result = test.run(dev, session);
             session.m5_compute = Some(test);
@@ -1649,6 +1652,9 @@ impl Gpu {
     /// The M5 platform tables, from the device tree the boot loader fills from the ADT: the main
     /// operating points with their core and SRAM voltage per lane, the auxiliary (CS/AFR) ones
     /// with one voltage per die, the CS/AFR SRAM floor and the AON power-telemetry records.
+    /// Out of line: inlined, its tables stayed reserved in `boot_m5`'s frame under the
+    /// qualifications it runs next.
+    #[inline(never)]
     fn m5_platform(
         dev: &AsahiDrmDevice,
         cfg: &'static Config,
@@ -1746,7 +1752,6 @@ impl Gpu {
             aon.push([record[0], record[1], record[2]], GFP_KERNEL)?;
         }
 
-        // On the heap: boot_m5's frame stays small under the deep paths it calls.
         Ok(KBox::new(fw::m5::initdata::M5Platform {
             board,
             clusters,
@@ -1952,7 +1957,7 @@ impl gpu::Gpu for Gpu {
     /// M5 descriptor profile (`Shared::m5`): compute on M5 channels ([`queue::m5`]), render on M5
     /// pairs (`queue::m5_render`). Without it, EOPNOTSUPP.
     fn submission(&self) -> Result {
-        match (self.shared.variant.submission, self.shared.m5) {
+        match (self.shared.variant.submission, &self.shared.m5) {
             (fw::variant::Submission::Doorbell, _) => Ok(()),
             (fw::variant::Submission::M5HostCommand, Some(_)) => Ok(()),
             (fw::variant::Submission::M5HostCommand, None) => Err(EOPNOTSUPP),
@@ -2010,7 +2015,7 @@ impl gpu::Gpu for Gpu {
             usc_exec_base,
             self.geometry.user_usable_range(),
             self.shared.variant,
-            self.shared.m5,
+            self.shared.m5.clone(),
         )
         .inspect_err(|error| {
             if self.shared.m5.is_some() {
@@ -2019,7 +2024,7 @@ impl gpu::Gpu for Gpu {
         })?;
         // One profile per queue, chosen here; the record, configuration, work ring, kick header,
         // host command and QoS row all take it from the context.
-        let policy = match self.shared.m5 {
+        let policy = match &self.shared.m5 {
             Some(_) => fw::m5::queue::scheduling_policy(priority)?,
             None => scheduling_policy(priority)?,
         };

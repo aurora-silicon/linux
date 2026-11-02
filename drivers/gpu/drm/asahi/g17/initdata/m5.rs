@@ -64,7 +64,10 @@ impl InitData {
         Ok(())
     }
 
-    /// Builds the M5 graph in the kernel window both roots now share.
+    /// Builds the M5 graph in the kernel window both roots now share. Out of line: inlined, its
+    /// encoders' tables stayed reserved in `Gpu::boot_m5`'s frame under the qualifications it
+    /// runs next, deep in probe's stack.
+    #[inline(never)]
     pub(in crate::g17) fn build_m5(
         &mut self,
         dev: &AsahiDrmDevice,

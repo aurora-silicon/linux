@@ -291,7 +291,7 @@ impl Registry {
             compute_building: false,
             compute_scheduler_building: false,
             replay_outer_wait: None,
-            observations: compute::retirement::Batch::new()?,
+            observations <- compute::retirement::Batch::new(),
             completion_cursor: [0; super::initdata::COMPUTE_COMPLETION_RINGS],
             completion_seen: {
                 let slots = super::initdata::COMPUTE_COMPLETION_SLOTS
@@ -955,7 +955,7 @@ impl Backend {
         if !lease.is_current() || shared.state.lock().is_none() {
             return Err(EAGAIN);
         }
-        if let Some(gpu) = shared.m5 {
+        if let Some(gpu) = &shared.m5 {
             Self::install_m5(shared, &lease, &alloc, &context, owner, gpu)?;
         }
         let admission = held.as_ref().ok_or(EINVAL)?.pool().clone();
@@ -1010,7 +1010,7 @@ impl Backend {
         alloc: &super::object::Allocator<'_>,
         context: &Arc<Context>,
         owner: u64,
-        gpu: super::fw::m5::compute::Gpu,
+        gpu: &Arc<super::fw::m5::compute::Gpu>,
     ) -> Result {
         let deadline = now_ns().saturating_add(u64::from(queue::m5::INSTALL_WAIT_MS) * 1_000_000);
         let open = || -> Result { Ok(()) };
@@ -1459,7 +1459,7 @@ impl Backend {
                 // The global scheduler is created after pool/kick backing and
                 // retained even if this queue's later descriptor graph fails.
                 self.compute_scheduler(&alloc, &lease, admission)?;
-                let queue = compute::Queue::new(
+                compute::Queue::new(
                     &alloc,
                     &objects,
                     backing,
@@ -1467,8 +1467,7 @@ impl Backend {
                     self.context.clone(),
                     self.shared.variant.pointers,
                     self.shared.operand_state,
-                )?;
-                Ok(KBox::new(queue, GFP_KERNEL)?)
+                )
             })();
             let (mut built, build_error) = match built {
                 Ok(queue) => (Some(queue), None),

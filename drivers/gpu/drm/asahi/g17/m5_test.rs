@@ -168,12 +168,13 @@ impl Laps {
 
 impl Compute {
     /// Builds the channel and the fixture pages. Nothing is visible to the firmware yet, so a
-    /// failure here frees everything.
+    /// failure here frees everything. Built in its allocation, as the channel is: this runs deep
+    /// in probe's stack, and the qualification's retirement batch alone is kilobytes.
     pub(super) fn new(
         dev: &AsahiDrmDevice,
         firmware: &mut Firmware,
         shared: &Arc<Shared>,
-        gpu: compute::Gpu,
+        gpu: &Arc<compute::Gpu>,
     ) -> Result<KBox<Self>> {
         let uat = firmware.uat.clone();
         let alloc = Allocator {
@@ -240,19 +241,20 @@ impl Compute {
             channel.context().map_or(0, |context| context.id()),
             channel.qid()
         );
-        Ok(KBox::new(
-            Self {
+        let buffers = buffers.ok_or(EINVAL)?;
+        KBox::try_init(
+            kernel::try_init!(Self {
                 current_work: None,
                 channel,
                 objects,
-                buffers: buffers.ok_or(EINVAL)?,
+                buffers,
                 bias: 0,
-                observations: Batch::new()?,
+                observations <- Batch::new(),
                 seen: KVVec::from_elem(0, COMPUTE_COMPLETION_SLOTS, GFP_KERNEL)?,
                 laps: Laps::default(),
-            },
+            }),
             GFP_KERNEL,
-        )?)
+        )
     }
 
     /// What the channel uses of the firmware session.

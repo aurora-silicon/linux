@@ -771,7 +771,8 @@ impl Graph {
 /// to its settlement), `needs_fresh_backing` (a recycled lane, until its
 /// reinstallation is published) and `m5_install` (the installation or reinstallation in flight).
 pub(crate) struct LaneState {
-    gpu: Gpu,
+    /// The device's M5 description, shared ([`crate::g17::Shared`]'s): kilobytes, not copied.
+    gpu: Arc<Gpu>,
     /// The class whose outer work ring last carried this queue's first slot.
     class: u8,
     /// Set by an adoption until the binding's first kick: whether the class (and so the outer
@@ -785,7 +786,7 @@ pub(crate) struct LaneState {
 }
 
 impl LaneState {
-    fn new(gpu: Gpu, class: u8, rebound: Option<bool>) -> Result<KBox<Self>> {
+    fn new(gpu: Arc<Gpu>, class: u8, rebound: Option<bool>) -> Result<KBox<Self>> {
         Ok(KBox::new(
             Self {
                 gpu,
@@ -804,7 +805,7 @@ impl LaneState {
 /// storage its record names until the next owner rewrites it. Never dropped while the session
 /// runs: its QID stays configured with this ring.
 pub(crate) struct ParkedLane {
-    gpu: Gpu,
+    gpu: Arc<Gpu>,
     kick: kick::Queue,
     graph: Graph,
     /// The `m5` arm of Neo's compute pool.
@@ -959,14 +960,14 @@ impl Drop for Binding {
 impl Queue {
     /// Builds the M5 Ultra compute queue of QID `id` for `context` and maps it into the context's
     /// VM. Nothing is visible to the firmware yet, so a failure here frees everything; the caller
-    /// cancels the unpublished QID. Boxed: the queue holds a dozen objects, and the boot-time
+    /// cancels the unpublished QID. Built in its allocation ([`Self::assemble`]): the boot-time
     /// qualification builds it deep in probe's stack.
     pub(crate) fn new_m5(
         alloc: &Allocator<'_>,
         context: Arc<Context>,
         id: kick::Id,
         owner: u64,
-        gpu: Gpu,
+        gpu: &Arc<Gpu>,
         pointers: &PointerLayout,
     ) -> Result<KBox<Self>> {
         let vm = context.vm();
@@ -974,14 +975,14 @@ impl Queue {
         let kick_alias = kick.map_client(vm)?;
         let geometry = fw::m5::pool::PoolGeometry::of(gpu.pool_blocks, gpu.block_bytes())
             .map_err(|_| EINVAL)?;
-        let (mut graph, pool) = Graph::new_m5(alloc, &context, &gpu, pointers, || {
+        let (mut graph, pool) = Graph::new_m5(alloc, &context, gpu, pointers, || {
             ComputePool::new_m5(alloc, id.qid(), geometry)
         })?;
         let pool_alias = pool_view(pool.m5()?, vm)?;
         let binding = graph.bind(context, kick_alias, pool_alias)?;
         let readers = Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?;
-        let lane = LaneState::new(gpu, u8::MAX, None)?;
-        let queue = KBox::new(
+        let lane = LaneState::new(gpu.clone(), u8::MAX, None)?;
+        let queue = KBox::init(
             Self::assemble(
                 Some(owner),
                 Some(binding),
@@ -1061,7 +1062,7 @@ impl Queue {
         }
         let recycled = lane.needs_fresh_backing;
         let class_changed = lane.class != context.policy().priority();
-        let state = LaneState::new(lane.gpu, lane.class, Some(class_changed))?;
+        let state = LaneState::new(lane.gpu.clone(), lane.class, Some(class_changed))?;
         let kick_alias = lane.kick.map_client(context.vm())?;
         let pool_alias = pool_view(lane.pool.m5()?, context.vm())?;
         let binding = lane.graph.bind(context.clone(), kick_alias, pool_alias)?;
@@ -1086,18 +1087,15 @@ impl Queue {
             pool_state,
             ..
         } = lane;
-        let mut queue = KBox::write(
-            slot,
-            Self::assemble(
-                Some(owner),
-                Some(binding),
-                kick,
-                pool,
-                graph,
-                readers,
-                Some(state),
-            ),
-        );
+        let Ok(mut queue) = slot.write_init(Self::assemble(
+            Some(owner),
+            Some(binding),
+            kick,
+            pool,
+            graph,
+            readers,
+            Some(state),
+        ));
         queue.retained_owner = Some(pages);
         queue.installed = true;
         queue.pool_state = pool_state;
@@ -1315,7 +1313,7 @@ impl Queue {
         self.kick.id()
     }
     pub(crate) fn gpu(&self) -> Result<&Gpu> {
-        Ok(&self.lane()?.gpu)
+        Ok(&*self.lane()?.gpu)
     }
     /// Its logical queue is open.
     pub(crate) fn open(&self) -> bool {
@@ -1775,7 +1773,7 @@ impl Queue {
             return Err(EAGAIN);
         }
         let owner = self.owner.ok_or(EINVAL)?;
-        let gpu = self.lane()?.gpu;
+        let gpu = self.lane()?.gpu.clone();
         let context = self.m5_context()?.clone();
         let (preempt_va, usage_va) = match self.binding.as_ref() {
             Some(binding) => (binding.preempt.iova(), binding.usage.iova()),

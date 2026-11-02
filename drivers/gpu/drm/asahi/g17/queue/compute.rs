@@ -482,12 +482,14 @@ pub(in crate::g17::queue) struct Fifo<T> {
     pub(in crate::g17::queue) len: usize,
 }
 impl<T> Fifo<T> {
-    fn new() -> Self {
-        Self {
-            entries: core::array::from_fn(|_| None),
+    /// Initialized where it lives: a compute queue's command ring is kilobytes, and a queue is
+    /// built in its allocation ([`Queue::assemble`]).
+    fn new() -> impl Init<Self> {
+        pin_init::init!(Self {
+            entries <- pin_init::init_array_from_fn(|_| None),
             head: 0,
             len: 0,
-        }
+        })
     }
     pub(in crate::g17::queue) fn front(&self) -> Option<&T> {
         self.entries[self.head].as_ref()
@@ -717,7 +719,7 @@ impl Queue {
         context: Arc<Context>,
         pointers: PointerLayout,
         operand_state: &'static OperandState,
-    ) -> Result<Self> {
+    ) -> Result<KBox<Self>> {
         let Backing { mut pool, mut kick } = backing;
         let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state)?;
         let kick_alias = kick.map_client(context.vm())?;
@@ -726,21 +728,16 @@ impl Queue {
         context.mark_published();
         context.note_compute_binding(true);
         crate::g17::trace::bind(crate::g17::trace::COMPUTE, kick.id().qid(), context.id(), 0);
-        Ok(Self::assemble(
-            Some(owner),
-            Some(binding),
-            kick,
-            pool,
-            graph,
-            Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
-            None,
-        ))
+        let readers = Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?;
+        KBox::init(Self::assemble(Some(owner), Some(binding), kick, pool, graph, readers, None), GFP_KERNEL)
     }
 
     /// A queue of `kick`, `pool` and `graph` bound to `owner` through `binding`, in its initial
     /// state: never published, healthy, no command in flight. [`Self::new`] builds Neo's (`m5`
     /// `None`); the M5 Ultra's lane is built by `Queue::new_m5` and `Queue::adopt_m5`
-    /// (`queue::m5`).
+    /// (`queue::m5`). An initializer, written in the queue's allocation: a queue is several KiB
+    /// (its command rings most of it), and built by value it was a stack temporary in every
+    /// constructor's frame, deep in probe's stack for the boot-time M5 qualification.
     pub(in crate::g17::queue) fn assemble(
         owner: Option<u64>,
         binding: Option<Binding>,
@@ -749,8 +746,8 @@ impl Queue {
         graph: Graph,
         source_readers: Arc<core::sync::atomic::AtomicU32>,
         m5: Option<KBox<super::m5::LaneState>>,
-    ) -> Self {
-        Self {
+    ) -> impl Init<Self> {
+        pin_init::init!(Self {
             owner,
             retained_owner: None,
             pool_state: PoolState::FRESH,
@@ -765,8 +762,8 @@ impl Queue {
             kick,
             pool,
             graph,
-            active: Fifo::new(),
-            replays: Fifo::new(),
+            active <- Fifo::new(),
+            replays <- Fifo::new(),
             replay_retirement: false,
             replay_error: None,
             replay_prepared: false,
@@ -798,7 +795,7 @@ impl Queue {
             source_readers,
             source_hint: crate::g17::sync_input::ReaderHint::new(),
             m5,
-        }
+        })
     }
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
     /// zero-duration completion record for it, which quarantines the queue, but stores no
@@ -1608,7 +1605,7 @@ mod admission_tests {
 
     #[test]
     fn retained_ring_pressure_waits_without_discarding_work() {
-        let mut active = Fifo::new();
+        let mut active = KBox::init(Fifo::new(), GFP_KERNEL).unwrap();
         for sequence in 0..IN_FLIGHT {
             active.push(sequence).unwrap();
         }

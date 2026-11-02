@@ -110,9 +110,12 @@ macro_rules! at {
 }
 
 /// `result`, naming `step` of a pair's construction when it failed: construction has many
-/// steps that refuse the same way.
-fn step<T>(step: &str, result: Result<T>) -> Result<T> {
-    result.inspect_err(|error| pr_err!("G17 M5: render pair {} refused: {:?}\n", step, error))
+/// steps that refuse the same way. A macro, as [`at!`] is: a function took each step's value
+/// by value, the parameter buffer's manager among them, and copied it through its own frame.
+macro_rules! step {
+    ($name:literal, $result:expr) => {
+        $result.inspect_err(|error| pr_err!("G17 M5: render pair {} refused: {:?}\n", $name, error))
+    };
 }
 
 /// One owner's storage of a pair, in that owner's VM: dropped with the binding
@@ -369,18 +372,18 @@ impl Storage {
             aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
         }
         // Target and parameter buffer, both in the client's compact window.
-        let layout = step(
+        let layout = step!(
             "layout",
-            target::Layout::new(args.pass, args.clusters, args.programs),
+            target::Layout::new(args.pass, args.clusters, args.programs)
         )?;
         let blocks = layout.tvb_blocks;
         let initial = blocks.checked_mul(PB_BLOCK).ok_or(EOVERFLOW)?;
         let minimum = fw::m5::budget::minimum_parameter_pages(args.clusters).ok_or(EINVAL)?;
-        let geometry = step(
+        let geometry = step!(
             "parameter geometry",
-            BlockGeometry::m5(compact.clone(), memory_bytes()?, initial as u64),
+            BlockGeometry::m5(compact.clone(), memory_bytes()?, initial as u64)
         )?;
-        let layout = step(
+        let layout = step!(
             "target slices",
             layout.with_m5_slices(
                 args.pass,
@@ -388,20 +391,20 @@ impl Storage {
                 SEGMENTS,
                 minimum,
                 Pair::grown_bytes(geometry)?,
-                compact.clone(),
-            ),
+                compact.clone()
+            )
         )?;
-        let target = step("target", target::Target::new(dev, vm, &layout))?;
-        let (tvb, mappings) = step(
+        let target = step!("target", target::Target::new(dev, vm, &layout))?;
+        let (tvb, mappings) = step!(
             "parameter blocks",
-            buffer::Tvb::with_geometry(dev, vm, blocks, geometry),
+            buffer::Tvb::with_geometry(dev, vm, blocks, geometry)
         )?;
         for mapping in mappings {
             aliases.push(mapping, GFP_KERNEL)?;
         }
-        let scratch_bytes = step(
+        let scratch_bytes = step!(
             "scratch size",
-            pool::parameter_scratch_stride(geometry.capacity, 0).map_err(|_| EINVAL),
+            pool::parameter_scratch_stride(geometry.capacity, 0).map_err(|_| EINVAL)
         )?
         .checked_mul(pool::SCENE_TABLE_ENTRIES)
         .ok_or(EOVERFLOW)?;
@@ -416,9 +419,9 @@ impl Storage {
                 cpu,
             )
         };
-        let scratch = step("scratch", in_compact(scratch_bytes))?;
-        let discard = step("discard", in_compact(DISCARD_BYTES))?;
-        let manager = step(
+        let scratch = step!("scratch", in_compact(scratch_bytes))?;
+        let discard = step!("discard", in_compact(DISCARD_BYTES))?;
+        let manager = step!(
             "parameter buffer",
             buffer::Manager::new(
                 alloc,
@@ -432,9 +435,9 @@ impl Storage {
                     generation: args.pm_generation,
                     first_ordinal,
                 },
-            ),
+            )
         )?;
-        let state = step(
+        let state = step!(
             "tiling state",
             KernelObject::new(
                 dev,
@@ -442,10 +445,10 @@ impl Storage {
                 Placement::In(compact, cfg::TVB_PAGE),
                 STATE_BYTES,
                 prot,
-                cpu,
-            ),
+                cpu
+            )
         )?;
-        let status_fw = step(
+        let status_fw = step!(
             "status view",
             state.map_range(
                 alloc.uat.kernel_vm(),
@@ -454,7 +457,7 @@ impl Storage {
                 PAGE as u64,
                 mmu::PROT_FW_SHARED_RW,
                 0,
-            ),
+            )
         )?;
         // Boxed: the parameter buffer's manager is large, and a pair is built on the probe's
         // stack by the render qualification (by value, it overflowed that stack).
@@ -507,14 +510,14 @@ impl Pair {
         let support = alloc.kernel(PAGE, PAGE as u64, prot, cpu)?;
         // The pair's pool, at the tiling queue's pool ID, covers every pass without primary
         // storage; a pass that needs more grows it first ([`Self::grow`]).
-        let geometry = step(
+        let geometry = step!(
             "pool geometry",
             pool::PoolGeometry::of(args.gpu.render_pool_blocks, args.gpu.block_bytes())
-                .map_err(|_| EINVAL),
+                .map_err(|_| EINVAL)
         )?;
-        let pool = step(
+        let pool = step!(
             "pool",
-            M5Pool::new(alloc, tiling.qid(), geometry, pool::Engine::Render),
+            M5Pool::new(alloc, tiling.qid(), geometry, pool::Engine::Render)
         )?;
         let binding = args.binding;
         let (owner, pb, pm_generation, clusters, programs) = (
