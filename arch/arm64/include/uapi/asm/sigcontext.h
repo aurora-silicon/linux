@@ -160,6 +160,17 @@ struct tpidr2_context {
 };
 
 /* FPMR context */
+/*
+ * Aurora: Apple AFPCR_EL0 (DAZ in bit 0, FTZ in bit 1) of a thread with the
+ * x86 floating-point mode on (PR_AURORA_SET_X86_FP). sigreturn restores it.
+ */
+#define APPLE_AFPCR_MAGIC	0x41465043
+
+struct apple_afpcr_context {
+	struct _aarch64_ctx head;
+	__u64 afpcr;
+};
+
 #define FPMR_MAGIC	0x46504d52
 
 struct fpmr_context {

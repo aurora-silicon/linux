@@ -30,6 +30,7 @@
 #include <linux/elf.h>
 #include <linux/rseq.h>
 
+#include <asm/apple_cpufeature.h>
 #include <asm/compat.h>
 #include <asm/cpufeature.h>
 #include <asm/debug-monitors.h>
@@ -1564,6 +1565,44 @@ static int poe_set(struct task_struct *target, const struct
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+static int apple_afpcr_active(struct task_struct *target,
+			      const struct user_regset *regset)
+{
+	return apple_afp_enabled(target) ? regset->n : 0;
+}
+
+static int apple_afpcr_get(struct task_struct *target,
+			   const struct user_regset *regset,
+			   struct membuf to)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return -EINVAL;
+
+	return membuf_store(&to, apple_afp_read_afpcr(target));
+}
+
+static int apple_afpcr_set(struct task_struct *target,
+			   const struct user_regset *regset, unsigned int pos,
+			   unsigned int count, const void *kbuf,
+			   const void __user *ubuf)
+{
+	u64 afpcr;
+	int ret;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return -EINVAL;
+
+	afpcr = apple_afp_read_afpcr(target);
+	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &afpcr, 0, -1);
+	if (ret)
+		return ret;
+
+	apple_afp_write_afpcr(target, afpcr);
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_ARM64_GCS
 static void task_gcs_to_user(struct user_gcs *user_gcs,
 			     const struct task_struct *target)
@@ -1658,6 +1697,9 @@ enum aarch64_regset {
 #endif
 #ifdef CONFIG_ARM64_GCS
 	REGSET_GCS,
+#endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	REGSET_APPLE_AFPCR,
 #endif
 };
 
@@ -1836,6 +1878,17 @@ static const struct user_regset aarch64_regsets[] = {
 		.align = sizeof(u64),
 		.regset_get = gcs_get,
 		.set = gcs_set,
+	},
+#endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	[REGSET_APPLE_AFPCR] = {
+		USER_REGSET_NOTE_TYPE(AURORA_APPLE_AFPCR),
+		.n = 1,
+		.size = sizeof(u64),
+		.align = sizeof(u64),
+		.active = apple_afpcr_active,
+		.regset_get = apple_afpcr_get,
+		.set = apple_afpcr_set,
 	},
 #endif
 };

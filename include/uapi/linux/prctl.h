@@ -442,4 +442,25 @@ struct prctl_mm_map {
 #define PR_AURORA_SET_DEFAULT_PAGE_SIZE 0x41555003
 #define PR_AURORA_GET_DEFAULT_PAGE_SIZE 0x41555004
 
+/*
+ * Aurora experimental ABI: Apple x86 floating-point mode (AFP).
+ * With ON, floating point in the calling thread follows x86 SSE rules:
+ * operations that produce a default NaN return 0xffc00000/0xfff8000000000000,
+ * FMAX and FMIN return their second operand when either operand is a NaN or
+ * both are zeros, and FPCR.FZ is ignored. The thread may then use AFPCR_EL0
+ * (S3_6_C15_C2_5): bit 0 is DAZ (denormal inputs as zero), bit 1 is FTZ
+ * (flush denormal results to zero); EL0 accesses to it trap while OFF.
+ * Turning it ON clears AFPCR_EL0. GET returns ON or OFF. Both fail with
+ * EINVAL on CPUs without AFP. Mode and AFPCR_EL0 are per thread, inherited
+ * by fork and clone, and reset by execve. Signal frames save and restore
+ * AFPCR_EL0 (APPLE_AFPCR_MAGIC); ptrace and core dumps carry it as the
+ * NT_AURORA_APPLE_AFPCR regset.
+ * HWCAP3_APPLE_AFP in AT_HWCAP3 and "apple_afp" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_X86_FP		0x41555007
+#define PR_AURORA_SET_X86_FP		0x41555008
+# define PR_AURORA_X86_FP_OFF		0
+# define PR_AURORA_X86_FP_ON		1
+
 #endif /* _LINUX_PRCTL_H */

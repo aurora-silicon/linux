@@ -205,6 +205,9 @@ struct thread_struct {
 #ifdef CONFIG_ARM64_ACTLR_STATE
 	u64			actlr;
 #endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	u64			afpcr;		/* AFPCR_EL0 while EnAFP is set */
+#endif
 };
 
 static inline unsigned int thread_get_vl(struct thread_struct *thread,
@@ -422,6 +425,16 @@ extern void __init minsigstksz_setup(void);
 #include <asm/fpsimd.h>
 
 /* Userspace interface for PR_S[MV]E_{SET,GET}_VL prctl()s: */
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+int apple_x86_fp_get(void);
+int apple_x86_fp_set(unsigned long val);
+bool apple_afp_enabled(struct task_struct *t);
+u64 apple_afp_read_afpcr(struct task_struct *t);
+void apple_afp_write_afpcr(struct task_struct *t, u64 afpcr);
+#define AURORA_GET_X86_FP()		apple_x86_fp_get()
+#define AURORA_SET_X86_FP(arg)		apple_x86_fp_set(arg)
+#endif
+
 #define SVE_SET_VL(arg)	sve_set_current_vl(arg)
 #define SVE_GET_VL()	sve_get_current_vl()
 #define SME_SET_VL(arg)	sme_set_current_vl(arg)
