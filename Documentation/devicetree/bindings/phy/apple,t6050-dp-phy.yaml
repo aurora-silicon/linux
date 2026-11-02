@@ -74,14 +74,20 @@ properties:
     description: Offset, mask and value tuples for the PIPE handler
 
   power-domains:
+    description:
+      A combo PHY may name the USB controller's domain fourth ("usb"). Its
+      USB2 PHY and digital banks are in that domain, and the PHY then holds it
+      while it runs, also on a port with no USB controller bound.
     minItems: 3
-    maxItems: 3
+    maxItems: 4
 
   power-domain-names:
+    minItems: 3
     items:
       - const: usb-aon
       - const: common
       - const: wrapper
+      - const: usb
 
   apple,tunable-axi2af:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -184,6 +190,10 @@ allOf:
       properties:
         '#phy-cells':
           const: 0
+        power-domains:
+          maxItems: 3
+        power-domain-names:
+          maxItems: 3
       if:
         required:
           - mode-switch
