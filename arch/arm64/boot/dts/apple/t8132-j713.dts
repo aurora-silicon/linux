@@ -392,7 +392,16 @@
 
 &atcphy0 {
 	status = "okay";
-	/* Retain USB2 until this port's common-power handoff is qualified. */
+	/* Leave the display crossbar at core + 0x4c000 to its own driver. */
+	reg = <0x4 0x02a90000 0x0 0x4000>,
+	      <0x4 0x02a84000 0x0 0x4000>,
+	      <0x4 0x03000000 0x0 0x24000>,
+	      <0x4 0x00000000 0x0 0x8000>,
+	      <0x4 0x00020000 0x0 0x4000>,
+	      <0x4 0x03044000 0x0 0x4000>,
+	      <0x4 0x03050000 0x0 0x4000>;
+	reg-names = "usb2phy", "pipehandler", "core", "axi2af", "lioa",
+		    "fabric", "common-config";
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -417,6 +426,9 @@
 &dwc3_0 {
 	status = "okay";
 	dr_mode = "host";
+	maximum-speed = "super-speed";
+	phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
+	phy-names = "usb2-phy", "usb3-phy";
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
