@@ -467,6 +467,10 @@
 	status = "okay";
 };
 
+&jpeg0 {
+	status = "okay";
+};
+
 &apr_dart {
 	status = "okay";
 };

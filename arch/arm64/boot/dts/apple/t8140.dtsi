@@ -478,7 +478,6 @@
 			interrupts = <AIC_IRQ 1040 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&jpeg_dart 0>;
 			power-domains = <&ps_jpg>;
-			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
 			status = "disabled";
 		};
 
@@ -500,7 +499,6 @@
 			interrupts = <AIC_IRQ 1043 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&jpeg1_dart 0>;
 			power-domains = <&ps_jpg>;
-			apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
 			status = "disabled";
 		};
 
