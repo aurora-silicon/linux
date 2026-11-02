@@ -4203,10 +4203,14 @@ static int __init ane_rtclient_init(void)
 			pr_info("ane: H16 ANE: firmware transport unvalidated; keeping disabled\n");
 			return -EOPNOTSUPP;
 		}
-		if (soc->platform->soc == 0x8140)
+		if (soc->platform->soc == 0x8140) {
 			ret = ane_fw_staged_init(pdev, soc->platform);
-		else
+			/* No loader hand-off: the probe below refuses quietly. */
+			if (ret == -ENODEV)
+				ret = 0;
+		} else {
 			ret = ane_fw_platform_preflight(pdev, soc->platform);
+		}
 		put_device(&pdev->dev);
 		if (ret)
 			return ret;
@@ -4219,6 +4223,8 @@ static int __init ane_rtclient_init(void)
 
 	if (ret)
 		ane_t6021_trace_free();
+	else
+		ane_fw_staged_start();
 	return ret;
 }
 module_init(ane_rtclient_init);

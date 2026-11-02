@@ -96,7 +96,38 @@ static inline int ane_fw_heap_tail(const u64 dva[2], const u64 size[2], u64 limi
 	return 0;
 }
 
+/* The exact /chosen/apple,ane-cold-boot value a raw loader boot publishes. */
+#define ANE_FW_COLD_BOOT_EVIDENCE "raw-no-xnu-ane-untouched-v1"
+
+/*
+ * What the loader handed off, as read from the DT and the TEXT segment.
+ * marker is /chosen/apple,ane-cold-boot or NULL; regions_ok says both
+ * preload reservations are enabled, no-map, not reusable and outside System
+ * RAM; text_ok that TEXT matches the driver's firmware pin.
+ */
+struct ane_fw_handoff {
+	const char *marker;
+	bool preloaded;
+	bool regions_ok;
+	u64 phys[2], size[2], dva[2];
+	bool text_ok;
+};
+
+/*
+ * Start at boot only with the whole hand-off: raw-boot evidence, the
+ * firmware-preloaded flag, both filled reservations at the exact sizes and
+ * DVAs, and the pinned TEXT. Anything less leaves the engine alone.
+ */
+static inline bool ane_fw_cold_handoff_valid(const struct ane_fw_handoff *h,
+					     const struct ane_fw_platform *soc)
+{
+	return h->marker && !strcmp(h->marker, ANE_FW_COLD_BOOT_EVIDENCE) &&
+	       h->preloaded && h->regions_ok &&
+	       ane_fw_preload_ranges_valid(soc, h->phys, h->size, h->dva) && h->text_ok;
+}
+
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc);
+void ane_fw_staged_start(void);
 bool ane_fw_staged_exit(void);
 
 #endif /* __ANE_FW_COLD_H__ */
