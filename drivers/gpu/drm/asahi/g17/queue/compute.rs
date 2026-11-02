@@ -64,6 +64,35 @@ static_assert!(core::mem::size_of::<GraphLayout>() == GRAPH_SIZE);
 static_assert!(core::mem::offset_of!(GraphLayout, pointers) == POINTERS);
 static_assert!(core::mem::offset_of!(GraphLayout, items) == ITEMS);
 
+/// Initializes the queue graph of an M5 compute queue in a zeroed
+/// object of at least [`GRAPH_SIZE`] bytes: the M5 queue record in the 0x100-byte header, the
+/// cursors at `+0x100` inside the graph, the job-list head at `+0x200` and the item ring at
+/// `+0x4000`. Production queues keep their cursors on a separate page.
+pub(in crate::g17) fn initialize_m5_graph(
+    graph: &mut KernelObject,
+    context: &Context,
+    pointers: &PointerLayout,
+) -> Result {
+    let address = graph.gpu_va();
+    graph.initialize::<GraphLayout>(0, |view| {
+        view.pointers = PointerBlock::new(pointers)?;
+        view.jobs = JobListHead::new(address + 0x200);
+        Ok(())
+    })?;
+    // The M5 record is 0x80 bytes; the rest of the header stays zero.
+    graph.write(
+        0,
+        crate::g17::fw::m5::queue::QueueRecord::new(&QueueRecordArgs {
+            pointers_va: address + POINTERS as u64,
+            items_va: address + ITEMS as u64,
+            job_list_va: context.work_head_va(),
+            scheduler_va: context.scheduler_va(),
+            owner_pid: context.owner_pid(),
+            policy: context.policy(),
+        })?,
+    )
+}
+
 /// Aliases are destroyed before the logical root they name. Superseded bindings remain owned
 /// until the first exact successful publication under their replacement has retired.
 /// Backing of a vacated pool and descriptor ring, freed outside the device
@@ -2091,6 +2120,7 @@ impl Queue {
             timestamp: kick_timestamp,
             parent: kick_parent,
             barriers: dependencies,
+            dependency_types: None,
             descriptor_va: descriptor_high,
             queue_va: self.graph.graph.gpu_va(),
             qos: KickQos {

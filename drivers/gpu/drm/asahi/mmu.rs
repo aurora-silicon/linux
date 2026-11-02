@@ -1206,6 +1206,8 @@ pub(crate) struct KernelMappingInner {
     bo: Option<MappingBo>,
     _gem: Option<gem::KernelMappingPin>,
     owner: ARef<gpuvm::GpuVm<VmInner>>,
+    /// The owner's translation table base, fixed for the owner's life.
+    root: u64,
     uat_inner: Arc<UatInner>,
     prot: Prot,
     offset: usize,
@@ -1308,6 +1310,26 @@ impl KernelMapping {
     /// Returns the IOVA base of this mapping
     pub(crate) fn iova_range(&self) -> Range<u64> {
         self.0.start()..(self.0.start() + self.0.mapped_size as u64)
+    }
+
+    /// Publishes this mapping's page-table updates to every TTBAT context whose lower or upper
+    /// half names the owner's root: a mapping of the kernel upper window reaches the firmware
+    /// contexts and every execution context, a kernel lower one the contexts that still name the
+    /// kernel lower root. Call once the mapping set is complete, before work naming it becomes
+    /// visible.
+    pub(crate) fn publish_to_contexts(&self) {
+        let contexts = self
+            .0
+            .uat_inner
+            .lock()
+            .contexts_naming_root_in_either_half(self.0.root);
+        mem::sync();
+        for ctx in 0..UAT_NUM_CTX {
+            if contexts & (1 << ctx) != 0 {
+                mem::tlbi_range_or_asid(ctx as u8, self.iova() as usize, self.size());
+            }
+        }
+        mem::sync();
     }
 
     /// Resolves a byte in this retained mapping without creating page tables.
@@ -1721,6 +1743,19 @@ impl UatShared {
     }
 
     /// Returns the mask of TTBAT contexts whose lower half is the root `ttb`.
+    /// Contexts naming root `ttb` in their lower or upper half.
+    fn contexts_naming_root_in_either_half(&self, ttb: u64) -> u64 {
+        self.ttbs()
+            .iter()
+            .enumerate()
+            .filter(|(ctx, slot)| {
+                let expected = tagged_root(ttb, *ctx);
+                slot.ttb0.load(Ordering::Acquire) == expected
+                    || slot.ttb1.load(Ordering::Acquire) == expected
+            })
+            .fold(0, |mask, (ctx, _)| mask | (1 << ctx))
+    }
+
     fn contexts_naming_root(&self, ttb: u64, adopted: bool) -> u64 {
         self.ttbs()
             .iter()
@@ -2406,12 +2441,14 @@ impl Vm {
 
         let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone()));
         let uat_inner = inner.uat_inner.clone();
+        let root = inner.ttb();
         // A failed reservation drops its payload while exec still owns GEM
         // reservations. Attach BO/GEM references only after success, since
         // their destructors may acquire the same reservation locks.
         let result = inner.mm.insert_node_in_range(
             KernelMappingInner {
                 owner: self.gpuvm.clone(),
+                root,
                 uat_inner,
                 prot,
                 bo: None,
@@ -2504,11 +2541,13 @@ impl Vm {
 
         let mut vm_bo = Some(MappingBo::new(vm_bo, self.gpuvm.clone()));
         let uat_inner = inner.uat_inner.clone();
+        let root = inner.ttb();
         // Keep reservation-locking destructors out of the allocator payload
         // until reservation succeeds.
         let result = inner.mm.reserve_node(
             KernelMappingInner {
                 owner: self.gpuvm.clone(),
+                root,
                 uat_inner,
                 prot,
                 bo: None,
@@ -2671,9 +2710,11 @@ impl Vm {
 
         let inner = vm_exec.unique_gpuvm.data();
         let uat_inner = inner.uat_inner.clone();
+        let root = inner.ttb();
         let node = inner.mm.reserve_node(
             KernelMappingInner {
                 owner: self.gpuvm.clone(),
+                root,
                 uat_inner,
                 prot,
                 bo: None,

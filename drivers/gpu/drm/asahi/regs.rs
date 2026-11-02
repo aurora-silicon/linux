@@ -602,6 +602,54 @@ impl G17Resources {
         Ok(true)
     }
 
+    /// Publishes through the M5 host command port, including the kick that makes an idle queue
+    /// runnable. Core activity is not a prerequisite.
+    pub(crate) fn submit_m5_work(
+        &self,
+        submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+    ) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        for &(offset, value) in submission.writes() {
+            sgx.try_write64(value, offset)?;
+        }
+        Ok(())
+    }
+
+    /// Samples the two owned queue configuration words through the host tag/data port. The
+    /// caller holds the device mutex and power hold.
+    pub(crate) fn m5_queue_configurations(&self, qids: [u8; 2]) -> Result<[u64; 2]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Err(EAGAIN);
+        }
+        let mut values = [0; 2];
+        for (value, qid) in values.iter_mut().zip(qids) {
+            let tag = crate::g17::fw::m5::queue::HardwareSubmission::configuration_tag(qid)?;
+            sgx.try_write64(tag, 0x4090)?;
+            *value = sgx.try_read64(0x4098)?;
+        }
+        Ok(values)
+    }
+
+    /// Raw M5 fault-window witness; the selector is observed, never changed.
+    pub(crate) fn m5_fault_registers(&self) -> Result<[u64; 6]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Err(EAGAIN);
+        }
+        Ok([
+            sgx.try_read64(0xd800)?,
+            sgx.try_read64(0xd8c0)?,
+            sgx.try_read64(0xd8c8)?,
+            sgx.try_read64(0xc078)?,
+            sgx.try_read64(0xc008)?,
+            sgx.try_read64(0xc028)?,
+        ])
+    }
+
     fn sgx_read32<const OFF: usize>(&self) -> u32 {
         if let Some(sgx) = self.sgx.try_access() {
             (&*sgx).as_view().relaxed().read32(OFF)

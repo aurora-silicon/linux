@@ -698,6 +698,7 @@ impl Pair {
             timestamp: kicks[stage],
             parent: parents[stage],
             barriers,
+            dependency_types: None,
             descriptor_va: self.memory.graph.descriptor_va(stage, ordinal),
             queue_va: queues[stage],
             qos: KickQos {

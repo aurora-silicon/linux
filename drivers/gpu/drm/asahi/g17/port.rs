@@ -75,8 +75,9 @@ pub(super) struct Views {
     pub(super) compute: [RingView; PRIORITIES],
     pub(super) tiling: [RingView; PRIORITIES],
     pub(super) fragment: [RingView; PRIORITIES],
-    /// Completion stamp page A: one word per QID, written by the firmware.
-    pub(super) stamps: *const AtomicU32,
+    /// Completion stamp page A: one word per QID, written by the firmware. `None` on a graph
+    /// without per-QID stamp pages (M5), whose work names its own stamps.
+    pub(super) stamps: Option<*const AtomicU32>,
     pub(super) qos: *mut u8,
     pub(super) recovery: *const AtomicU32,
     pub(super) mailbox: *const super::Mailbox,
@@ -366,7 +367,7 @@ impl Port {
         if qid > super::fw::kick::QID_MAX {
             return Err(EINVAL);
         }
-        let base = self.views()?.stamps;
+        let base = self.views()?.stamps.ok_or(ENODEV)?;
         // SAFETY: Page A holds one word per QID up to QID_MAX; the session retains it.
         let value = unsafe { (*base.add(usize::from(qid))).load(Ordering::Relaxed) };
         fence(Ordering::Acquire);

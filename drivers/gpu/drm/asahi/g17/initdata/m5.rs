@@ -3,8 +3,9 @@
 //! The M5 (26A428) bootstrap graph: linux-aurora t6050-gpu's `build_m5` (g17/initdata/m5.rs) on
 //! this tree's objects, built after both coprocessors published their kernel roots
 //! ([`mmu::UatFirmware::PublishedRoots`]) instead of before an SPTM context bind, and with the
-//! platform's values ([`m::M5Platform`]) in place of J714's. Nothing past the bootstrap: no
-//! metrics alias, no J714 power-controller calibration, no diagnostics.
+//! platform's values ([`m::M5Platform`]) in place of J714's. No metrics alias and no J714
+//! power-controller calibration. The objects the GPU reaches through the kernel lower root are
+//! mapped there before the coprocessors start ([`InitData::prepare_m5_lower`]).
 
 use super::*;
 use crate::g17::fw::m5::initdata as m;
@@ -26,6 +27,59 @@ const PB: u64 = BASE + 0x15e_0000;
 const UMA: u64 = BASE + 0x15e_8000;
 
 impl InitData {
+    /// Maps the M5 graph's kernel-lower objects, before either coprocessor starts: the firmware
+    /// samples the lower root's top-level entries only then. These are the parameter-buffer
+    /// and page-pool descriptor tables and the four completion rings; [`Self::build_m5`] adds
+    /// their firmware aliases once the firmware has published its kernel window. Their window
+    /// (`0x70_0000_0000..0x80_0000_0000`, one top-level entry) also holds the canonical low
+    /// arena of queues and clients ([`crate::hw::t8140::dynamic`]).
+    pub(in crate::g17) fn prepare_m5_lower(
+        &mut self,
+        dev: &AsahiDrmDevice,
+        uat: &mmu::Uat,
+    ) -> Result {
+        use mmu::PROT_GPU_SHARED_RW as GPU;
+        if self.m5 || !self.objects.is_empty() {
+            return Err(EBUSY);
+        }
+        let lower = |address, size, cpu| {
+            KernelObject::new(
+                dev,
+                uat.kernel_lower_vm(),
+                Placement::At(address),
+                size,
+                GPU,
+                cpu,
+            )
+        };
+        self.pb = self.add(lower(
+            m::REGION_VIEW_LOW_ADDRS[0],
+            mmu::UAT_PGSZ,
+            CpuMap::WriteCombined,
+        )?)?;
+        self.page_pool = self.add(lower(
+            m::REGION_VIEW_LOW_ADDRS[1],
+            mmu::UAT_PGSZ,
+            CpuMap::WriteCombined,
+        )?)?;
+        for index in 0..m::M5_25G76_COMPLETION_QUEUE_COUNT {
+            // After initialization the host only reads completion records; the compute ring
+            // is the one it scans.
+            let cpu = if index == 0 {
+                CpuMap::WriteBack
+            } else {
+                CpuMap::WriteCombined
+            };
+            self.m5_completions[index] = self.add(lower(
+                COMPLETION_LOW + index as u64 * COMPLETION_STRIDE,
+                m::M5_25G76_COMPLETION_BACKING_SIZE,
+                cpu,
+            )?)?;
+        }
+        self.m5 = true;
+        Ok(())
+    }
+
     /// Builds the M5 graph in the kernel window both roots now share.
     pub(in crate::g17) fn build_m5(
         &mut self,
@@ -34,7 +88,7 @@ impl InitData {
         platform: &m::M5Platform,
         enabled_cores: u32,
     ) -> Result {
-        use mmu::{PROT_FW_SHARED_RO as RO, PROT_FW_SHARED_RW as RW, PROT_GPU_SHARED_RW as GPU};
+        use mmu::{PROT_FW_SHARED_RO as RO, PROT_FW_SHARED_RW as RW};
         if uat.geometry().kernel_range().start != BASE {
             dev_err!(
                 dev.as_ref(),
@@ -43,7 +97,9 @@ impl InitData {
             );
             return Err(EINVAL);
         }
-        self.m5 = true;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
         let fixed = |address, size, protection| {
             KernelObject::new(
                 dev,
@@ -69,42 +125,20 @@ impl InitData {
         )?)?;
         let aon = self.add(fixed(AON, m::M5_AON_PTD_SIZE, RW)?)?;
         self.bundle = self.add(fixed(BUNDLE, shared.total, RW)?)?;
-        self.pb = self.add(fixed(PB, mmu::UAT_PGSZ, RW)?)?;
-        self.page_pool = self.add(fixed(UMA, mmu::UAT_PGSZ, RW)?)?;
+        // The firmware aliases of the objects prepare_m5_lower mapped low.
+        self.alias(self.pb, uat.kernel_vm(), PB, RW)?;
+        self.alias(self.page_pool, uat.kernel_vm(), UMA, RW)?;
         // The primary-view sentinel needs zeroed backing.
         self.add(fixed(BASE + 0xc07e_0000, mmu::UAT_PGSZ, RW)?)?;
-        self.alias(
-            self.pb,
-            uat.kernel_lower_vm(),
-            m::REGION_VIEW_LOW_ADDRS[0],
-            GPU,
-        )?;
-        self.alias(
-            self.page_pool,
-            uat.kernel_lower_vm(),
-            m::REGION_VIEW_LOW_ADDRS[1],
-            GPU,
-        )?;
         let mut completions =
             [m::G17PKsmCompletionAliases { low: 0, high: 0 }; m::M5_25G76_COMPLETION_QUEUE_COUNT];
         for (index, pair) in completions.iter_mut().enumerate() {
             pair.low = COMPLETION_LOW + index as u64 * COMPLETION_STRIDE;
             pair.high = COMPLETION_HIGH + index as u64 * COMPLETION_STRIDE;
-            // After initialization the host only reads completion records.
-            let object = self.add(KernelObject::new(
-                dev,
-                uat.kernel_vm(),
-                Placement::At(pair.high),
-                m::M5_25G76_COMPLETION_BACKING_SIZE,
-                RW,
-                if index == 0 {
-                    CpuMap::WriteBack
-                } else {
-                    CpuMap::WriteCombined
-                },
-            )?)?;
-            self.m5_completions[index] = object;
-            self.alias(object, uat.kernel_lower_vm(), pair.low, GPU)?;
+            if self.object(self.m5_completions[index])?.gpu_va() != pair.low {
+                return Err(EINVAL);
+            }
+            self.alias(self.m5_completions[index], uat.kernel_vm(), pair.high, RW)?;
         }
         let bad = |what: &str, e: m::InitdataError| {
             dev_err!(
@@ -238,6 +272,70 @@ impl InitData {
             shared.total,
             windows.len()
         );
+        Ok(())
+    }
+}
+
+impl InitData {
+    /// Installs a fresh M5 compute pool's page-pool (UMA) descriptor row at `slot`, before any
+    /// queue configuration names the pool. An installed row keeps its firmware-owned counters
+    /// and must never be rewritten.
+    pub(in crate::g17) fn install_m5_compute_pool(&self, slot: u16, words: [u64; 8]) -> Result {
+        const ROW: usize = 64;
+        if !self.m5 || slot == 0 || slot > u16::from(crate::g17::fw::kick::QID_MAX) + 1 {
+            return Err(EINVAL);
+        }
+        let object = self.object(self.page_pool)?;
+        let offset = usize::from(slot) * ROW;
+        object.pointer(offset, ROW)?;
+        for (index, word) in words.into_iter().enumerate() {
+            object
+                .dword(offset + index * 8)?
+                .store(word, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Logs the M5 firmware state a failed qualification leaves: the recovery report, the
+    /// recovery words of status B, and each role's status A. Only nonzero words are logged.
+    pub(in crate::g17) fn dump_m5_failure(&self, dev: &AsahiDrmDevice) {
+        if let Err(error) = self.try_dump_m5_failure(dev) {
+            dev_warn!(dev.as_ref(), "M5 failure state unreadable: {:?}\n", error);
+        }
+    }
+
+    fn try_dump_m5_failure(&self, dev: &AsahiDrmDevice) -> Result {
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let report = m::M5_BUNDLE_VIEW_OFFSETS[abi::recovery::REPORT_VIEW];
+        let status_b = m::M5_PRIVATE_LAYOUT.status_b;
+        let regions = [
+            ("recovery report", self.bundle, report, 0x100),
+            ("status B recovery", self.cluster, status_b + 0x4a80, 0x90),
+            (
+                "primary status A",
+                self.cluster,
+                m::M5_PRIVATE_STATUS_A[0],
+                0x2c0,
+            ),
+            (
+                "secondary status A",
+                self.cluster,
+                m::M5_PRIVATE_STATUS_A[1],
+                0x2c0,
+            ),
+        ];
+        for (label, object, offset, size) in regions {
+            let object = self.object(object)?;
+            for row in (0..size).step_by(0x20) {
+                let words = object.read_words::<8>(offset + row)?;
+                if words != [0; 8] {
+                    dev_info!(dev.as_ref(), "M5 {} +{:#x}: {:08x?}\n", label, row, words);
+                }
+            }
+        }
         Ok(())
     }
 }

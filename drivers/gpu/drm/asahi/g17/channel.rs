@@ -23,6 +23,8 @@ enum ReportRing {
 }
 
 impl ReportRing {
+    /// State and ring offsets in status A, capacity, and the record tags of the common
+    /// firmware (see [`InitData::statistics_types`]).
     fn geometry(self) -> (usize, usize, u32, u32) {
         match self {
             Self::Trace => (
@@ -87,6 +89,10 @@ impl Rings {
 
     fn consume_report(init: &InitData, role: Role, ring: ReportRing, reports: &mut super::reports::Reports) -> Result {
         let (state, entries, capacity, allowed_types) = ring.geometry();
+        let allowed_types = match ring {
+            ReportRing::Trace => u64::from(allowed_types),
+            ReportRing::Statistics => init.statistics_types(),
+        };
         let consumer_word = init.status_word(role, state)?;
         let producer_word = init.status_word(role, state + RX_PRODUCER_OFFSET)?;
         fence(Ordering::Acquire);
@@ -104,7 +110,7 @@ impl Rings {
             let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
             super::trace::report(role as u8, ring as u8, &words);
             let tag = words[0];
-            if tag >= u32::BITS || allowed_types & (1 << tag) == 0 {
+            if tag >= u64::BITS || allowed_types & (1 << tag) == 0 {
                 return Err(EIO);
             }
             if matches!(ring, ReportRing::Statistics) {
@@ -143,7 +149,7 @@ impl Rings {
         init.publish_control(
             producer,
             record.bytes(),
-            record.opcode().asserts_gpu_power(),
+            init.control_asserts_gpu_power(record.opcode()),
             next,
         )?;
         super::trace::message(super::trace::CONTROL, record.opcode() as u64);

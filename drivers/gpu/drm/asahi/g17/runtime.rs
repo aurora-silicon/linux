@@ -516,6 +516,12 @@ impl Registry {
         }
     }
 
+    /// A fresh host identity for a physical channel outside the compute registry, whose QID it
+    /// then owns.
+    pub(super) fn reserve_identity(&mut self) -> Result<u64> {
+        Ok(self.identities.reserve(1)?.start)
+    }
+
     pub(super) fn reserve_compute(&mut self, owner: u64) -> Result<ComputeReservation> {
         if owner == 0
             || self.compute.iter().flatten().any(|entry| {

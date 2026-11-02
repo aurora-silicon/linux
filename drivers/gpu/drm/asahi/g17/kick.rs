@@ -20,7 +20,7 @@ use super::{
     fw::{kick::*, queue::DataMaster},
     object::{Allocator, CpuMap, KernelObject},
 };
-use crate::{hw::t8140, mem, mmu};
+use crate::{hw::t8140, mmu};
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
@@ -681,17 +681,14 @@ impl Queue {
     }
 
     /// Both aliases are owned mappings of the same full ring. Publish their
-    /// page-table updates to each live translation regime before installation.
+    /// page-table updates to each live translation regime before installation:
+    /// every context whose TTBAT names the canonical low or the firmware root.
     pub(crate) fn prepare_compute_install(&self) -> Result {
-        if self.id.engine != DataMaster::Compute {
+        let Backing::Compute { high, low } = &self.backing else {
             return Err(EINVAL);
-        }
-        mem::sync();
-        for asid in 0..4 {
-            mem::tlbi_range_or_asid(asid, self.low_va() as usize, KICK_RING_SIZE);
-            mem::tlbi_range_or_asid(asid, self.firmware_va() as usize, KICK_RING_SIZE);
-        }
-        mem::sync();
+        };
+        low.publish_to_contexts()?;
+        high.publish_to_contexts();
         Ok(())
     }
 

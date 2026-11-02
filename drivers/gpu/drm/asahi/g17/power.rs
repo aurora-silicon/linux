@@ -201,6 +201,14 @@ fn wait<C: Control>(control: &C, target: u32, require_powered: bool) -> kernel::
         }
         control.wait_tick();
     }
+    pr_warn!(
+        "G17 power control timed out: target {} counters {:?} retired {} require_powered {} powered {}\n",
+        target,
+        control.counters(),
+        retired,
+        require_powered,
+        control.powered()
+    );
     Err(ETIMEDOUT)
 }
 

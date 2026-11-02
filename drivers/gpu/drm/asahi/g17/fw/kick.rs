@@ -371,6 +371,9 @@ pub(crate) struct KickArgs<'a> {
     pub(crate) parent: KickTimestamp,
     /// Kicks of other queues this kick must wait for.
     pub(crate) barriers: &'a [KickDependency],
+    /// Two-bit completion classes of the explicit barriers followed by the implicit parent, on
+    /// firmware with typed dependencies (M5); `None` elsewhere.
+    pub(crate) dependency_types: Option<&'a [u8]>,
     /// GPU address of the work descriptor (firmware alias).
     pub(crate) descriptor_va: u64,
     /// GPU address of the queue record.
@@ -418,7 +421,10 @@ pub(crate) struct KickEntry {
     pub(crate) register_arrays: [u64; 4],
     pub(crate) unk_170: u64,
     pub(crate) unk_178: u64,
-    pub(crate) pad_180: [u8; KICK_ENTRY_STRIDE - 0x180],
+    /// Two bits per valid dependency, in the order of `dependencies`; zero on firmware without
+    /// typed dependencies.
+    pub(crate) dependency_types: u64,
+    pub(crate) pad_188: [u8; KICK_ENTRY_STRIDE - 0x188],
 }
 
 static_assert!(size_of::<KickEntry>() == KICK_ENTRY_STRIDE);
@@ -426,6 +432,7 @@ static_assert!(core::mem::offset_of!(KickEntry, dependency_control) == 0x20);
 static_assert!(core::mem::offset_of!(KickEntry, event_mask) == 0x128);
 static_assert!(core::mem::offset_of!(KickEntry, register_arrays) == 0x150);
 static_assert!(core::mem::offset_of!(KickEntry, unk_178) == 0x178);
+static_assert!(core::mem::offset_of!(KickEntry, dependency_types) == 0x180);
 static_assert!(size_of::<RegisterWrite>() == 0xc);
 static_assert!(size_of::<McacheRange>() == 0x10);
 static_assert!(size_of::<RegisterArray>() == 0x720);
@@ -481,6 +488,15 @@ impl KickEntry {
         }
         .word();
         let count = barriers + 1;
+        let mut dependency_types = 0;
+        if let Some(types) = args.dependency_types {
+            if types.len() != count || types.iter().any(|&class| class > 3) {
+                return Err(EINVAL);
+            }
+            for (index, &class) in types.iter().enumerate() {
+                dependency_types |= u64::from(class) << (2 * index);
+            }
+        }
         let mask = if count == KICK_DEPENDENCIES {
             u32::MAX
         } else {
@@ -502,7 +518,8 @@ impl KickEntry {
             register_arrays: args.register_arrays.map(RegisterArrayBinding::word),
             unk_170: 0,
             unk_178: Self::UNK_178,
-            pad_180: [0; KICK_ENTRY_STRIDE - 0x180],
+            dependency_types,
+            pad_188: [0; KICK_ENTRY_STRIDE - 0x188],
         })
     }
 }

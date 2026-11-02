@@ -1448,6 +1448,10 @@ impl Gpu {
             GFP_KERNEL,
         )?;
         let session = &mut *firmware;
+        if shared.variant.graph == fw::variant::InitGraph::M5 {
+            // As for the metrics above: the M5 graph's lower objects precede the first start.
+            session.init.prepare_m5_lower(dev, &session.uat)?;
+        }
         session.primary.boot()?;
         if let Some(secondary) = session.secondary.as_mut() {
             secondary.boot()?;
@@ -1461,7 +1465,7 @@ impl Gpu {
         if shared.variant.graph == fw::variant::InitGraph::M5 {
             // Bootstrap only: whatever happened, keep the session. A stopped CPU is not proof that
             // no engine still reads the graph, so nothing it was given is freed or unmapped.
-            let result = Self::boot_m5(dev, cfg, session, root_entries, shared.active_cores);
+            let result = Self::boot_m5(dev, cfg, session, root_entries, shared);
             match &result {
                 Ok(()) => dev_info!(
                     dev.as_ref(),
@@ -1520,14 +1524,16 @@ impl Gpu {
         cfg: &'static Config,
         session: &mut Firmware,
         root_entries: Option<[u64; 3]>,
-        active_cores: u32,
+        shared: &Arc<Shared>,
     ) -> Result {
         let platform = cfg.m5.ok_or(EINVAL)?;
         Self::check_m5_opps(dev, cfg, platform)?;
-        session.init.build_m5(dev, &session.uat, platform, active_cores)?;
+        session.init.build_m5(dev, &session.uat, platform, shared.active_cores)?;
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
+        let mailbox: *const Mailbox = &*session.primary.rtkit;
+        session.port.attach(session.init.port_views(mailbox)?, session.bridge.regs.clone())?;
         session.uat.mirror_secondary_root()?;
         session.bridge.regs.prepare_m5_firmware()?;
         let ack = session.variant.init_ack;

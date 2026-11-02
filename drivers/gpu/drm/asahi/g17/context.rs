@@ -85,6 +85,11 @@ impl WorkStorage {
     /// Whether the firmware completed every kick counted so far on node `word`.
     fn drained(&self, word: u32) -> Result<bool> {
         let slot = (word & 63) as usize;
+        Ok(self.completed(word)? >= self.counts[slot])
+    }
+    /// The number of kicks the firmware completed on node `word`.
+    fn completed(&self, word: u32) -> Result<u32> {
+        let slot = (word & 63) as usize;
         if self.words.get(slot) != Some(&Some(word)) {
             return Err(EINVAL);
         }
@@ -93,7 +98,7 @@ impl WorkStorage {
             .word(slot * NODE_STRIDE + core::mem::offset_of!(fw::WorkNode, completed))?
             .load(Ordering::Relaxed);
         fence(Ordering::Acquire);
-        Ok(completed >= self.counts[slot])
+        Ok(completed)
     }
     fn change_count(&mut self, word: u32, kicks: u32, add: bool) -> Result<u32> {
         let slot = (word & 63) as usize;
@@ -498,6 +503,15 @@ impl WorkStateLease {
             return Err(EINVAL);
         }
         self.context.work.lock().drained(word)
+    }
+    /// The number of kicks the firmware completed on this ioctl's node. Progress only: other
+    /// engines' kicks count on the same node, so it is no retirement witness for one command.
+    pub(crate) fn completed_kicks(&self) -> Result<u32> {
+        let word = self.word();
+        if word == FREE {
+            return Err(EINVAL);
+        }
+        self.context.work.lock().completed(word)
     }
     pub(crate) fn add_submitted_kicks(&self, kicks: u32) -> Result<u32> {
         self.context

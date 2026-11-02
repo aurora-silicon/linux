@@ -652,6 +652,125 @@ impl ComputePool {
     }
 }
 
+/// The private-memory pool of an M5 compute queue, with the same QID-derived slot as
+/// [`ComputePool`]. The M5 firmware's pool is a page directory over a fixed address inventory
+/// and a block free list ([`super::fw::m5::pool`]), followed in one canonical low allocation by
+/// its backed blocks, and a shared state the firmware completes into. It is never vacated.
+pub(crate) struct M5ComputePool {
+    backing: KernelObject,
+    layout: super::fw::m5::pool::PoolLayout,
+    /// The shared pool state, which the queue configuration names.
+    control: KernelObject,
+    /// The host-submitted counter, which the shared state names.
+    state: KernelObject,
+    id: u16,
+}
+impl M5ComputePool {
+    /// A pool of `blocks` backed blocks for queue `qid`, built without the device mutex.
+    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8, blocks: usize) -> Result<Self> {
+        use super::fw::m5::pool;
+        if qid > super::fw::kick::QID_MAX {
+            return Err(EINVAL);
+        }
+        let id = u16::from(qid) + 1;
+        let geometry = pool::PoolGeometry::compute(blocks).map_err(|_| EINVAL)?;
+        let size = geometry.backing_bytes().map_err(|_| EINVAL)?;
+        let mut backing = place_lower(size, || {
+            alloc.lower(
+                size,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RW,
+                CpuMap::WriteCombined,
+            )
+        })?;
+        let base = backing.gpu_va();
+        let tables = geometry.directory_bytes + geometry.freelist_bytes;
+        let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
+        for index in 0..blocks {
+            addresses.push(base + (tables + index * geometry.block_bytes()) as u64, GFP_KERNEL)?;
+        }
+        let bytes = backing.bytes_mut();
+        pool::encode_directory(geometry, &addresses, &mut bytes[..geometry.directory_bytes])
+            .map_err(|_| EINVAL)?;
+        pool::encode_freelist(geometry, &addresses, &mut bytes[geometry.directory_bytes..tables])
+            .map_err(|_| EINVAL)?;
+        let layout = pool::PoolLayout {
+            geometry,
+            directory: base,
+            freelist: base + geometry.directory_bytes as u64,
+            hardware_id: u32::from(id),
+        };
+        let mut control = alloc.kernel(
+            CONTROL_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            CpuMap::WriteCombined,
+        )?;
+        let state = alloc.kernel(
+            CONTROL_SIZE,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            CpuMap::WriteCombined,
+        )?;
+        pool::encode_compute_state(layout, state.gpu_va(), control.bytes_mut())
+            .map_err(|_| EINVAL)?;
+        fence(Ordering::SeqCst);
+        Ok(Self {
+            backing,
+            layout,
+            control,
+            state,
+            id,
+        })
+    }
+    pub(crate) fn id(&self) -> u16 {
+        self.id
+    }
+    pub(crate) fn control_va(&self) -> u64 {
+        self.control.gpu_va()
+    }
+    /// The page-pool descriptor row the caller installs at [`Self::id`] before publishing any
+    /// queue configuration that names this pool.
+    pub(crate) fn descriptor(&self) -> Result<[u64; 8]> {
+        super::fw::m5::pool::initial_uma_descriptor(self.layout).map_err(|_| EINVAL)
+    }
+    /// Maps the directory, free list and blocks into the client at their canonical addresses.
+    pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        self.backing
+            .map_alias(vm, self.backing.gpu_va(), mmu::PROT_GPU_SHARED_RW)
+    }
+    /// Publishes the page-table updates of the pool's own mappings to every context naming
+    /// their roots, before a queue configuration names the pool.
+    pub(crate) fn publish_to_contexts(&self) -> Result {
+        self.backing.publish_to_contexts()?;
+        self.control.publish_to_contexts()?;
+        self.state.publish_to_contexts()
+    }
+    /// Counts one more submission before its publication; returns the new count.
+    pub(crate) fn reserve_submission(&self) -> Result<u64> {
+        let counter = self.state.dword(0)?;
+        let next = counter
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .ok_or(EOVERFLOW)?;
+        counter.store(next, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        Ok(next)
+    }
+    /// The firmware-completed submission count, an unaligned packed counter.
+    pub(crate) fn completed_submissions(&self) -> Result<u64> {
+        let pointer = self.control.pointer(super::fw::m5::pool::COMPLETED, 8)?;
+        let mut bytes = [0; 8];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            // SAFETY: The checked eight-byte range stays mapped; byte accesses
+            // match the unaligned packed counter the firmware writes.
+            *byte = unsafe { pointer.add(index).read_volatile() };
+        }
+        fence(Ordering::Acquire);
+        Ok(u64::from_le_bytes(bytes))
+    }
+}
+
 /// Registration identity held by a free-list lease. The cookie is the end of
 /// the run list; it remains stable while overlapping command pairs share it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
