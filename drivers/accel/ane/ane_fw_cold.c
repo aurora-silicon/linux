@@ -274,6 +274,8 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 		return ret;
 	if (get_unaligned_le16(command + 6))
 		return -EREMOTEIO;
+	dev_info(&b->pdev->dev, "H17 ANE: SUSPEND acknowledged, wrapper status %#x\n",
+		 ane_rd32(b, b->engine + b->soc->wrapper + 0x48));
 	/*
 	 * Wait for the ANE CPU to idle in WFI (ASC wrapper status). The held
 	 * H16 shutdown reads 0x6e against the 0x6a reset value; this takes
@@ -348,6 +350,9 @@ static int ane_fw_warm_boot(struct ane_fw_backend *b)
 	dma_wmb();
 	ane_wr32(b, 0x10, b->engine + b->soc->wrapper + 0x44);
 	ret = ane_fw_scratch_wait(b, 7, 0x08042006);
+	dev_info(dev, "H17 ANE: warm boot RVBAR %#llx SCRATCH7 %#x wrapper status %#x (%d)\n",
+		 b->cold.rvbar, ane_rd32(b, scratch + 7 * 4),
+		 ane_rd32(b, b->engine + b->soc->wrapper + 0x48), ret);
 	if (ret)
 		return ret;
 	/* The retained channel table must be what the firmware still uses. */
