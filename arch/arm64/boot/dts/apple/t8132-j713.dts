@@ -705,3 +705,4 @@
 };
 #include "t8132-j713-gpu.dtsi"
 #include "t8132-j713-display.dtsi"
+#include "t8132-j713-atcphy-tunables.dtsi"
