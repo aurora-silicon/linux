@@ -1134,6 +1134,18 @@ impl Shared {
     }
 }
 
+/// The names of the admitted builds, for a refusal.
+struct BuildNames(&'static [fw::variant::Build]);
+
+impl kernel::fmt::Display for BuildNames {
+    fn fmt(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        for (i, build) in self.0.iter().enumerate() {
+            write!(f, "{}{}", if i == 0 { "" } else { "; " }, build.name)?;
+        }
+        Ok(())
+    }
+}
+
 /// A G17 GPU.
 pub(crate) struct Gpu {
     cfg: &'static Config,
@@ -1301,7 +1313,8 @@ impl Gpu {
     }
 
     /// Returns the variant of the loaded firmware build. An identified SoC refuses a build it
-    /// does not know, before anything is written to the GPU.
+    /// does not know, before anything is written to the GPU, with one log line that states the
+    /// measured identity as a pinned build would.
     fn firmware_variant(
         dev: &AsahiDrmDevice,
         firmware: &fw::variant::Firmware,
@@ -1311,6 +1324,13 @@ impl Gpu {
             fw::variant::Firmware::Identified(builds) => builds,
         };
         let version = Self::os_firmware_version(dev);
+        let mut measured = Self::measure_image(dev).inspect_err(|e| {
+            dev_err!(
+                dev.as_ref(),
+                "GPU refused: the loaded firmware cannot be measured ({:?})\n",
+                e
+            )
+        })?;
         // iBoot strings can be shared by OS releases. Prefer the reported release's
         // candidate, but admit only an exact loaded image, regardless of that hint.
         let preferred = builds
@@ -1320,32 +1340,35 @@ impl Gpu {
             .iter()
             .filter(|build| Some(build.os_version) != version);
         for build in Iterator::chain(preferred, others) {
-            if Self::identify_image(dev, build).is_ok() {
-                dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
+            if let Some(image) = measured.find(build.images) {
+                dev_info!(
+                    dev.as_ref(),
+                    "GPU firmware: {} ({})\n",
+                    build.name,
+                    image.name
+                );
                 return Ok(build.variant);
             }
         }
         dev_err!(
             dev.as_ref(),
-            "Unsupported GPU firmware image (reported macOS version {:?})\n",
-            version
+            "GPU refused: unsupported firmware build: {} (reported macOS {:?}; admitted: {})\n",
+            measured.identity(builds.iter().flat_map(|build| build.images)),
+            version,
+            BuildNames(builds)
         );
         Err(ENODEV)
     }
 
-    /// Checks that the loaded TEXT (the `fw-text` region) is one of `build`'s images, with the DATA size
-    /// of the `fw-data` region. The version property is only a selection hint.
-    fn identify_image(dev: &AsahiDrmDevice, build: &'static fw::variant::Build) -> Result {
+    /// Measures the loaded TEXT (the `fw-text` region), with the DATA size of the `fw-data`
+    /// region.
+    fn measure_image(dev: &AsahiDrmDevice) -> Result<crate::fwid::Measured> {
         let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
         let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
         let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
         let start = text.start();
         let end = start.checked_add(text.size()).ok_or(EINVAL)?;
-        crate::fwid::identify(dev.as_ref().as_ref(), start..end, data.size(), build.images)
-            .inspect_err(|e| {
-                dev_err!(dev.as_ref(), "GPU firmware image not admitted: {:?}\n", e)
-            })?;
-        Ok(())
+        crate::fwid::measure(start..end, data.size())
     }
 
     /// The macOS version the boot loader reports for the boot firmware that loaded the GPU
