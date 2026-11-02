@@ -47,6 +47,8 @@ mod initdata;
 mod job;
 mod capacity;
 mod kick;
+mod m5_test;
+mod m5_test_program;
 pub(crate) mod m5_vm;
 mod object;
 mod port;
@@ -655,6 +657,8 @@ struct Firmware {
     init: initdata::InitData,
     _render_global: mmu::Vm,
     _pm_metrics: Arc<KernelObject>,
+    /// The M5 arithmetic qualification's queue graph, retained with the session it ran in.
+    m5_compute: Option<KBox<m5_test::Compute>>,
     uat: Arc<mmu::Uat>,
 }
 
@@ -1494,6 +1498,7 @@ impl Gpu {
                 init: initdata::InitData::new(),
                 _render_global: render_global,
                 _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
+                m5_compute: None,
                 uat,
             }),
             GFP_KERNEL,
@@ -1576,8 +1581,9 @@ impl Gpu {
 
     /// The M5 firmware's initialization (linux-aurora t6050-gpu's M5 boot, on published roots):
     /// the M5 graph, the M5 preparation, InitData to the primary and then the secondary, each
-    /// acknowledged, POWER_ON_DONE to both, and both opening records retired. Render contexts are
-    /// not activated: the M5 profile has none.
+    /// acknowledged, POWER_ON_DONE to both, and both opening records retired. Then, with
+    /// `m5_compute_test`, the arithmetic qualification, whose graph the session retains. Render
+    /// contexts are not activated: the M5 profile has none.
     fn boot_m5(
         dev: &AsahiDrmDevice,
         cfg: &'static Config,
@@ -1603,6 +1609,13 @@ impl Gpu {
         session.end_power_on()?;
         Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
         dev_info!(dev.as_ref(), "M5 opening records retired\n");
+        if crate::module_parameters::m5_compute_test.value() != 0 {
+            let mut test = m5_test::Compute::new(dev, session, shared, shared.m5.ok_or(EINVAL)?)?;
+            // Retain the graph before propagating any failure: firmware may still read it.
+            let result = test.run(dev, session);
+            session.m5_compute = Some(test);
+            result?;
+        }
         Ok(())
     }
 

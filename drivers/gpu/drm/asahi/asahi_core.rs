@@ -128,6 +128,10 @@ module! {
             // permissions: 0o644,
             description: "Initial TVB size in blocks",
         },
+        m5_compute_test: u32 {
+            default: 0,
+            description: "Run the M5 arithmetic qualification after firmware startup (nonzero: on)",
+        },
         robust_isolation: u32 {
             default: 0,
             // permissions: 0o644,
