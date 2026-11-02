@@ -1237,11 +1237,24 @@
 		reg = <0x5 0x09014000 0x0 0x100>;
 		#address-cells = <2>;
 		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0x340 IRQ_TYPE_LEVEL_HIGH>;
 		status = "disabled";
 
 		pmic@e {
 			compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
 			reg = <0xe SPMI_USID>;
+
+			pmu_rtc: rtc {
+				compatible = "apple,t6041-pmu-rtc";
+				interrupt-parent = <&nub_spmi0>;
+				interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+				nvmem-cells = <&rtc_offset>;
+				nvmem-cell-names = "rtc_offset";
+				wakeup-source;
+			};
 
 			nvmem-layout {
 				compatible = "fixed-layout";

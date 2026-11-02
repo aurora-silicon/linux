@@ -3,6 +3,7 @@
 #include <linux/ctype.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 
 #include "ane_h16_program.h"
@@ -482,6 +483,7 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	s->ctx = ctx;
 	s->timeout_ns = timeout_ns;
 	s->dsid = ANE_H16_MCACHE_DSID;
+	s->settle_ns = ANE_H16_SETTLE_QUIET_NS;
 	spin_lock_init(&s->stats_lock);
 	return 0;
 }
@@ -543,10 +545,62 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 	return 0;
 }
 
+static void h16_sync(struct ane_h16_session *s, const struct ane_fw_surface *surface,
+		     bool for_device)
+{
+	if (s->ops->sync && surface->handle)
+		s->ops->sync(s->ctx, surface, for_device);
+}
+
+/*
+ * Around each EXECUTE: inputs and the poisoned outputs reach memory before
+ * the doorbell (for_device), and the outputs are read fresh after the
+ * completion report (!for_device). Caller holds the node lock.
+ */
+void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
+			  bool for_device)
+{
+	unsigned int i;
+
+	for (i = 0; i < p->resource_count; i++)
+		if (for_device || p->resources[i].permissions == 2)
+			h16_sync(s, p->surfaces[i], for_device);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_sync);
+
+static bool h16_take_spare(struct ane_h16_session *s, size_t size, bool write,
+			   struct ane_fw_surface *out)
+{
+	unsigned int i;
+
+	for (i = 0; i < s->spare_count; i++) {
+		if (s->spares[i].surface.size != size || s->spares[i].write != write)
+			continue;
+		*out = s->spares[i].surface;
+		s->spares[i] = s->spares[--s->spare_count];
+		/* Zeroed like new memory; LOAD writes it back after filling it. */
+		memset(out->cpu, 0, size);
+		return true;
+	}
+	return false;
+}
+
+static void h16_give_spare(struct ane_h16_session *s, struct ane_fw_surface *surface,
+			   bool write)
+{
+	/* A full table keeps the surface mapped and unused until reset. */
+	if (surface->cpu && s->spare_count < ANE_H16_SPARES)
+		s->spares[s->spare_count++] = (struct ane_h16_spare) {
+			.surface = *surface,
+			.write = write,
+		};
+	memset(surface, 0, sizeof(*surface));
+}
+
 static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 		   struct ane_fw_surface *out)
 {
-	int ret = s->ops->map(s->ctx, size, write, out);
+	int ret = h16_take_spare(s, size, write, out) ? 0 : s->ops->map(s->ctx, size, write, out);
 
 	if (ret)
 		return ret;
@@ -586,6 +640,8 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			return ret;
 		memcpy(p->regions[i].cpu, (const u8 *)p->snapshot.bytes + r->file_offset,
 		       r->file_size);
+		/* Weights, text and the zeroed scratch reach memory before LOAD. */
+		h16_sync(s, &p->regions[i], true);
 		layout->regions[i] = (struct ane_h16_load_mapping) {
 			.dva = p->regions[i].dva,
 			.size = p->regions[i].size,
@@ -598,6 +654,7 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 		if (ret)
 			return ret;
 		memcpy(p->aux[i].cpu, aux[i], aux_size[i]);
+		h16_sync(s, &p->aux[i], true);
 		layout->aux_dva[i] = p->aux[i].dva;
 		layout->aux_size[i] = aux_size[i];
 	}
@@ -938,7 +995,7 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
  * barrier before the caller reads outputs. Any uncertain outcome quarantines
  * the session and keeps every mapping.
  */
-int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
 	struct ane_h16_pending request = {};
@@ -1093,6 +1150,20 @@ fail:
 	kfree(command);
 	return h16_fail(s, ret);
 }
+
+int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	int ret;
+
+	if (!s || !p || p->session != s)
+		return -EINVAL;
+	if (s->ops->busy)
+		s->ops->busy(s->ctx, true);
+	ret = h16_execute(s, p);
+	if (s->ops->busy)
+		s->ops->busy(s->ctx, false);
+	return ret;
+}
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);
 
 const char *const ane_h16_exec_phase_names[ANE_H16_T_PHASES] = {
@@ -1166,11 +1237,53 @@ void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats 
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_stats);
 
+static void h16_us(struct seq_file *m, u64 ns)
+{
+	seq_printf(m, " %9llu.%u", div_u64(ns, 1000), (unsigned int)(div_u64(ns, 100) % 10));
+}
+
+/*
+ * Where the time of the successful EXECUTEs since the last reset went, per
+ * phase in microseconds (last, mean, min, max), and the poll sleeps per
+ * request. Backends expose it as <debugfs>/ane-h1x/<dev>/execute.
+ */
+int ane_h16_session_stats_show(struct seq_file *m, struct ane_h16_session *s)
+{
+	struct ane_h16_exec_stats *st;
+	unsigned int i;
+
+	st = kmalloc_obj(*st);
+	if (!st)
+		return -ENOMEM;
+	ane_h16_session_stats(s, st, false);
+	seq_printf(m, "executes %llu\n", st->count);
+	if (st->count) {
+		seq_printf(m, "%-12s %11s %11s %11s %11s\n", "phase", "last_us", "mean_us",
+			   "min_us", "max_us");
+		for (i = 0; i < ANE_H16_T_PHASES; i++) {
+			seq_printf(m, "%-12s", ane_h16_exec_phase_names[i]);
+			h16_us(m, st->last.ns[i]);
+			h16_us(m, div64_u64(st->sum.ns[i], st->count));
+			h16_us(m, st->min.ns[i]);
+			h16_us(m, st->max.ns[i]);
+			seq_putc(m, '\n');
+		}
+		seq_printf(m, "%-12s %11llu %9llu.%u %11llu %11llu\n", "polls", st->last.polls,
+			   div64_u64(st->sum.polls, st->count),
+			   (unsigned int)(div64_u64(st->sum.polls * 10, st->count) % 10),
+			   st->min.polls, st->max.polls);
+	}
+	kfree(st);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_stats_show);
+
 /* TERMINATE then UNLOAD. The mappings stay until reset; a new LOAD may follow. */
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	u8 command[ANE_H16_TERMINATE_SIZE];
 	const u8 *reply;
+	unsigned int i;
 	int ret;
 
 	if (!s || !p || p->session != s)
@@ -1195,9 +1308,39 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 	if (ret)
 		return h16_fail(s, ret);
 	s->ops->log(s->ctx, "TERMINATE and UNLOAD", p->key.program, p->key.process);
+	/* Answer the FREE of the process pool while the firmware waits for it. */
+	ret = ane_fw_transport_settle(s->transport, s->settle_ns,
+				      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
+	if (ret < 0)
+		return h16_fail(s, ret);
+	/*
+	 * The firmware acknowledged TERMINATE and UNLOAD, so it no longer
+	 * reads or writes this program's memory: later programs may reuse it.
+	 */
+	for (i = 0; i < p->plan.count; i++)
+		h16_give_spare(s, &p->regions[i], p->plan.regions[i].permissions & 2);
+	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
+		h16_give_spare(s, &p->aux[i], false);
+	memset(p->surfaces, 0, sizeof(p->surfaces));
+	p->released = true;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_close);
+
+/*
+ * The caller's last reference: free a closed program and its HWX snapshot.
+ * A program whose teardown failed keeps everything until reset.
+ */
+void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	if (!s || !p || p->session != s || !p->released)
+		return;
+	if (s->program == p)
+		s->program = NULL;
+	ane_h16_hwx_snapshot_destroy(&p->snapshot);
+	kfree(p);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_put);
 
 MODULE_DESCRIPTION("H16 program load, execute and teardown on the shared transport");
 MODULE_LICENSE("Dual MIT/GPL");

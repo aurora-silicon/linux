@@ -152,6 +152,19 @@ struct ane_h16_session_ops {
 	int (*map)(void *ctx, size_t size, bool device_write,
 		   struct ane_fw_surface *surface);
 	void (*log)(void *ctx, const char *item, u64 a, u64 b);
+	/*
+	 * Optional. For a surface with a handle: before the engine uses it
+	 * (for_device) write back CPU writes; after the engine wrote it
+	 * (!for_device) drop stale lines before the CPU reads. Without it,
+	 * or for a surface without a handle, memory is coherent.
+	 */
+	void (*sync)(void *ctx, const struct ane_fw_surface *surface, bool for_device);
+	/*
+	 * Optional. Called with true before an EXECUTE touches the firmware
+	 * and with false after it ended, successful or not, so a backend can
+	 * hold a performance vote only while work is in flight.
+	 */
+	void (*busy)(void *ctx, bool busy);
 };
 
 struct ane_h16_program {
@@ -181,7 +194,13 @@ struct ane_h16_program {
 	struct ane_h16_request_key key;
 	bool created;
 	bool closed;
+	/* Torn down cleanly: its memory went back to the session's spares. */
+	bool released;
 };
+
+/* The quiet time that ends serving the SHAREDMALLOC ring after UNLOAD. */
+#define ANE_H16_SETTLE_QUIET_NS (10ULL * 1000 * 1000)
+#define ANE_H16_SETTLE_LIMIT_NS (100ULL * 1000 * 1000)
 
 /*
  * Where the time of one EXECUTE goes, in nanoseconds. The firmware phases
@@ -224,6 +243,19 @@ void ane_h16_exec_stats_add(struct ane_h16_exec_stats *st,
  * Programs of one firmware session: one loaded at a time, any number per
  * boot; a switch-safe transport may hold several. See ane_h16_session_load().
  */
+/*
+ * Program memory given back by a program that the firmware unloaded. It
+ * stays mapped until reset like every firmware-visible mapping, and serves
+ * a later program's mapping of the same size and permission instead of a
+ * new one, so loading the same model again and again uses no new memory.
+ */
+#define ANE_H16_SPARES 64
+
+struct ane_h16_spare {
+	struct ane_fw_surface surface;
+	bool write;
+};
+
 struct ane_h16_session {
 	struct ane_fw_transport *transport;
 	const struct ane_h16_session_ops *ops;
@@ -232,6 +264,10 @@ struct ane_h16_session {
 	struct ane_h16_pending_table pending;
 	/* The last loaded program. */
 	struct ane_h16_program *program;
+	struct ane_h16_spare spares[ANE_H16_SPARES];
+	unsigned int spare_count;
+	/* Quiet time that ends serving the SHAREDMALLOC ring after UNLOAD. */
+	u64 settle_ns;
 	/* Generation of the last loaded program, and of the last one executed. */
 	u64 generation;
 	u64 executed;
@@ -257,10 +293,16 @@ int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_program **program);
 int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
+void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
+void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
+			  bool for_device);
 void ane_h16_session_account(struct ane_h16_session *s, u64 lock_ns, u64 copy_in_ns,
 			     u64 copy_out_ns, u64 ioctl_ns);
 void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats *out,
 			   bool reset);
+
+struct seq_file;
+int ane_h16_session_stats_show(struct seq_file *m, struct ane_h16_session *s);
 
 #define ANE_H16_FWLOG_RECORD 0x80
 size_t ane_h16_fwlog_line(const u8 *record, char *line);

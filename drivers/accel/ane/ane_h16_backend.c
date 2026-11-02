@@ -20,6 +20,7 @@
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 
+#include "ane_fw_sleep.h"
 #include "ane_fw_platform.h"
 #include "ane_h16_accel.h"
 #include "ane_h16_boot.h"
@@ -44,6 +45,9 @@ struct ane_h16_device {
 	struct device *dev;
 	void __iomem *window[ANE_H16_WINDOWS];
 	struct device *power[5];
+	/* Optional "perf" floor, voted only while an EXECUTE is in flight. */
+	struct device *perf;
+	bool perf_held;
 	struct device *dart[3];
 	u32 powered;
 	u32 darts_powered;
@@ -54,6 +58,8 @@ struct ane_h16_device {
 	bool claimed;
 	bool attached;
 	bool pinned;
+	/* While pinned: refuse system sleep (ane_fw_sleep.h). */
+	struct notifier_block pm_notifier;
 	int irq;
 	struct ane_fw_rtk rtk;
 	struct {
@@ -131,14 +137,54 @@ static void ane_h16_quarantine(void *ctx, int error)
 		error);
 }
 
+static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
+{
+	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
+	bool pinned = READ_ONCE(h->pinned);
+
+	if (ane_fw_sleep_refused(event, pinned))
+		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_event(event, pinned);
+}
+
 static int ane_h16_pin(void *ctx)
 {
 	struct ane_h16_device *h = ctx;
+	int ret;
 
 	if (!try_module_get(THIS_MODULE))
 		return -ENODEV;
+	/* Pinned for good: the notifier stays registered until reboot. */
+	h->pm_notifier.notifier_call = ane_h16_pm_event;
+	ret = register_pm_notifier(&h->pm_notifier);
+	if (ret) {
+		module_put(THIS_MODULE);
+		return ret;
+	}
 	h->pinned = true;
 	ane_h16_released = true;
+	return 0;
+}
+
+/*
+ * System sleep callbacks of a bound H16 device. While the firmware runs the
+ * notifier normally refuses the transition first; refuse here too, as a
+ * backstop for firmware started after it ran (the start work item is not
+ * freezable) or a path that skipped the notifiers. A device whose engine
+ * was never started has nothing to save.
+ */
+int ane_h16_backend_suspend(struct device *dev)
+{
+	struct ane_h16_device *h = dev_get_drvdata(dev);
+	bool pinned = h && READ_ONCE(h->pinned);
+
+	if (pinned)
+		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_backstop(pinned);
+}
+
+int ane_h16_backend_resume(struct device *dev)
+{
 	return 0;
 }
 
@@ -441,22 +487,21 @@ static u64 ane_h16_now(void *ctx)
 }
 
 /*
- * The channel IRQ stays masked, so every wait polls. Sleep in short steps
- * first (see ane_fw_poll_sleep_us()): a fixed 1 ms sleep made each of the
- * four waits of an EXECUTE cost at least a millisecond.
+ * The channel IRQ stays masked, so every wait polls, with the shared pacing
+ * (see ane_fw_poll_sleep_us()): busy steps for the first 30 us, then short
+ * sleeps. A fixed 1 ms sleep made each of the four waits of an EXECUTE cost
+ * at least a millisecond.
  */
 static void ane_h16_relax(void *ctx, u64 waited_ns)
 {
 	struct ane_h16_device *h = ctx;
-	unsigned int min_us, max_us;
 	int ret;
 
 	ane_h16_mailbox(h);
 	ret = ane_h16_faults(&h->boot, false);
 	if (ret)
 		ane_fw_transport_fail(&h->boot.transport, ret);
-	min_us = ane_fw_poll_sleep_us(waited_ns, &max_us);
-	usleep_range(min_us, max_us);
+	ane_fw_poll_pause(waited_ns);
 }
 
 static int ane_h16_alloc_shared(void *ctx, size_t size, u32 tag, struct ane_fw_surface *out)
@@ -480,6 +525,14 @@ static void ane_h16_refused(void *ctx, u64 w0, u64 w1, u64 w2, int error)
 		w0, w1, w2, error);
 }
 
+static void ane_h16_shared_note(void *ctx, const char *event, u64 dva, u64 size, u32 tag)
+{
+	struct ane_h16_device *h = ctx;
+
+	dev_info(h->dev, "H16 SHAREDMALLOC %s bytes %llx tag %08x DVA %llx\n",
+		 event, size, tag, dva);
+}
+
 static const struct ane_h16_boot_ops ane_h16_ops = {
 	.read32 = ane_h16_mmio_read32,
 	.read64 = ane_h16_mmio_read64,
@@ -494,9 +547,12 @@ static const struct ane_h16_boot_ops ane_h16_ops = {
 	.quarantine = ane_h16_quarantine,
 };
 
+static void ane_h16_busy(void *ctx, bool busy);
+
 static const struct ane_h16_session_ops ane_h16_session_ops = {
 	.map = ane_h16_program_map,
 	.log = ane_h16_log,
+	.busy = ane_h16_busy,
 };
 
 static const struct ane_fw_transport_ops ane_h16_transport_ops = {
@@ -510,6 +566,7 @@ static const struct ane_fw_transport_ops ane_h16_transport_ops = {
 	.relax = ane_h16_relax,
 	.alloc = ane_h16_alloc_shared,
 	.refused = ane_h16_refused,
+	.shared_note = ane_h16_shared_note,
 };
 
 /* Pre-RUN rollback of everything a stage acquired. h itself stays. */
@@ -558,6 +615,14 @@ static void ane_h16_release(struct ane_h16_device *h)
 			put_device(h->dart[i]);
 		h->dart[i] = NULL;
 	}
+	if (h->perf) {
+		if (h->perf_held)
+			pm_runtime_put_sync(h->perf);
+		h->perf_held = false;
+		pm_runtime_dont_use_autosuspend(h->perf);
+		dev_pm_domain_detach(h->perf, false);
+		h->perf = NULL;
+	}
 	while (h->powered) {
 		struct device *pd = h->power[--h->powered];
 
@@ -573,14 +638,57 @@ static irqreturn_t ane_h16_masked_irq(int irq, void *data)
 	return IRQ_NONE;
 }
 
+/*
+ * The optional "perf" domain is a performance floor (the PMC SoC-max floor
+ * on the M4 Pro): engine time roughly halves with the SoC and fabric at
+ * their highest state. Attached powered off, it is voted for each EXECUTE
+ * and released 100 ms after the last one ends (autosuspend), so a burst of
+ * requests keeps it and an idle engine does not hold the SoC up.
+ */
+#define ANE_H16_PERF_IDLE_MS 100
+
+static int ane_h16_attach_perf(struct ane_h16_device *h)
+{
+	struct device *pd = dev_pm_domain_attach_by_id(h->dev, 5);
+
+	if (IS_ERR_OR_NULL(pd))
+		return pd ? PTR_ERR(pd) : -ENODEV;
+	pm_runtime_set_autosuspend_delay(pd, ANE_H16_PERF_IDLE_MS);
+	pm_runtime_use_autosuspend(pd);
+	h->perf = pd;
+	dev_info(h->dev, "H16 perf floor attached, held per request (%u ms idle)\n",
+		 ANE_H16_PERF_IDLE_MS);
+	return 0;
+}
+
+static void ane_h16_busy(void *ctx, bool busy)
+{
+	struct ane_h16_device *h = ctx;
+
+	if (!h->perf)
+		return;
+	if (busy) {
+		/* Best effort: without the floor the request still runs, slower. */
+		if (!h->perf_held && pm_runtime_resume_and_get(h->perf) >= 0)
+			h->perf_held = true;
+	} else if (h->perf_held) {
+		pm_runtime_mark_last_busy(h->perf);
+		pm_runtime_put_autosuspend(h->perf);
+		h->perf_held = false;
+	}
+}
+
 static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *h)
 {
 	struct device_node *np = pdev->dev.of_node;
 	static const char * const names[] = { "engine", "pmgr", "aux-3" };
 	unsigned int i, j;
-	int ret, irq;
+	bool perf;
+	int ret, irq, n;
 
-	if (of_count_phandle_with_args(np, "power-domains", "#power-domain-cells") != 5)
+	n = of_count_phandle_with_args(np, "power-domains", "#power-domain-cells");
+	perf = n == 6 && of_property_match_string(np, "power-domain-names", "perf") == 5;
+	if (n != 5 && !perf)
 		return -EINVAL;
 	for (i = 0; i < 5; i++) {
 		struct device *pd = dev_pm_domain_attach_by_id(h->dev, i);
@@ -593,6 +701,11 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 			return ret;
 		}
 		h->power[h->powered++] = pd;
+	}
+	if (perf) {
+		ret = ane_h16_attach_perf(h);
+		if (ret)
+			return ret;
 	}
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
 		struct resource *r = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
@@ -813,11 +926,15 @@ refuse:
 static void ane_h16_start_work(struct work_struct *work)
 {
 	struct ane_h16_device *h = container_of(work, struct ane_h16_device, start);
+	unsigned int flags;
 
+	/* Never start the firmware in the middle of a system sleep transition. */
+	flags = lock_system_sleep();
 	mutex_lock(&ane_h16_lock);
 	if (!h->acquired)
 		ane_h16_advance(h, ANE_H16_PROGRAM);
 	mutex_unlock(&ane_h16_lock);
+	unlock_system_sleep(flags);
 }
 
 /*
@@ -871,53 +988,24 @@ static const struct file_operations ane_h16_stage_fops = {
 	.llseek = default_llseek,
 };
 
-static void ane_h16_us(struct seq_file *m, u64 ns)
-{
-	seq_printf(m, " %9llu.%u", div_u64(ns, 1000), (unsigned int)(div_u64(ns, 100) % 10));
-}
-
 /*
- * <debugfs>/ane-h16/<dev>/execute: where the time of the successful EXECUTEs
- * since the last reset went, per phase in microseconds (last, mean, min,
- * max), and the poll sleeps per request. Writing anything resets it.
+ * <debugfs>/ane-h16/<dev>/execute: per-phase EXECUTE times, see
+ * ane_h16_session_stats_show(). Writing anything resets them.
  */
 static int ane_h16_execute_show(struct seq_file *m, void *v)
 {
 	struct ane_h16_device *h = m->private;
-	struct ane_h16_exec_stats *st;
-	unsigned int i;
+	bool ready;
 
 	mutex_lock(&ane_h16_lock);
-	if (!h->program_ready) {
-		mutex_unlock(&ane_h16_lock);
+	ready = h->program_ready;
+	mutex_unlock(&ane_h16_lock);
+	if (!ready) {
 		seq_puts(m, "executes 0 (program stage not reached)\n");
 		return 0;
 	}
-	mutex_unlock(&ane_h16_lock);
 	/* program_ready never goes back, and the session outlives this file. */
-	st = kmalloc_obj(*st);
-	if (!st)
-		return -ENOMEM;
-	ane_h16_session_stats(&h->session, st, false);
-	seq_printf(m, "executes %llu\n", st->count);
-	if (st->count) {
-		seq_printf(m, "%-12s %11s %11s %11s %11s\n", "phase", "last_us", "mean_us",
-			   "min_us", "max_us");
-		for (i = 0; i < ANE_H16_T_PHASES; i++) {
-			seq_printf(m, "%-12s", ane_h16_exec_phase_names[i]);
-			ane_h16_us(m, st->last.ns[i]);
-			ane_h16_us(m, div64_u64(st->sum.ns[i], st->count));
-			ane_h16_us(m, st->min.ns[i]);
-			ane_h16_us(m, st->max.ns[i]);
-			seq_putc(m, '\n');
-		}
-		seq_printf(m, "%-12s %11llu %9llu.%u %11llu %11llu\n", "polls", st->last.polls,
-			   div64_u64(st->sum.polls, st->count),
-			   (unsigned int)(div64_u64(st->sum.polls * 10, st->count) % 10),
-			   st->min.polls, st->max.polls);
-	}
-	kfree(st);
-	return 0;
+	return ane_h16_session_stats_show(m, &h->session);
 }
 
 static int ane_h16_execute_open(struct inode *inode, struct file *file)

@@ -57,6 +57,13 @@ struct prog_fw {
 	unsigned int execs;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
+	/* busy(true) and busy(false) calls, and the deepest nesting seen. */
+	unsigned int busy_on, busy_off;
+	int busy_depth, busy_max;
+	/* Cache maintenance calls, when the fake hands out cached surfaces. */
+	bool cached;
+	unsigned int syncs_device, syncs_cpu;
+	u64 last_sync_dva;
 	/* The EXECUTE failure trace lines, by step. */
 	u64 fail_step, fail_flags, fail_reports, fail_state, fail_other;
 };
@@ -285,6 +292,7 @@ static int fw_map(void *ctx, size_t size, bool write, struct ane_fw_surface *s)
 		.cpu = fw_zalloc(f->test, size),
 		.dva = f->next_dva,
 		.size = size,
+		.handle = f->cached ? f->next_dva : 0,
 	};
 	if (!s->cpu)
 		return -ENOMEM;
@@ -309,9 +317,36 @@ static void fw_log(void *ctx, const char *item, u64 a, u64 b)
 	}
 }
 
+static void fw_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
+{
+	struct prog_fw *f = ctx;
+
+	KUNIT_EXPECT_NE(f->test, s->handle, 0ULL);
+	if (for_device)
+		f->syncs_device++;
+	else
+		f->syncs_cpu++;
+	f->last_sync_dva = s->dva;
+}
+
+static void fw_busy(void *ctx, bool busy)
+{
+	struct prog_fw *f = ctx;
+
+	if (busy) {
+		f->busy_on++;
+		f->busy_max = max(f->busy_max, ++f->busy_depth);
+	} else {
+		f->busy_off++;
+		f->busy_depth--;
+	}
+}
+
 static const struct ane_h16_session_ops fw_session_ops = {
 	.map = fw_map,
 	.log = fw_log,
+	.busy = fw_busy,
+	.sync = fw_sync,
 };
 
 static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
@@ -358,6 +393,8 @@ static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 	    ane_fw_transport_arm(&f->t) ||
 	    ane_h16_session_init(&f->s, &f->t, &fw_session_ops, f, 1000))
 		return NULL;
+	/* The fake clock moves 10 ns per poll; keep the post-UNLOAD settle short. */
+	f->s.settle_ns = 100;
 	return f;
 }
 
@@ -1632,7 +1669,166 @@ static void program_h17_no_custom_bar_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
+/*
+ * Cached program surfaces: LOAD writes back every mapping it filled, and
+ * the per-request sync writes back every surface before the engine and
+ * drops the output lines after it. Coherent surfaces (no handle) are never
+ * synced.
+ */
+static void program_cached_sync_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test), *g = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	f->cached = true;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	/* Every HWX region and every aux section, once. */
+	KUNIT_EXPECT_EQ(test, f->syncs_device, p->plan.count + ANE_H16_AUX_COUNT);
+	KUNIT_EXPECT_EQ(test, f->syncs_cpu, 0);
+	f->syncs_device = 0;
+	ane_h16_session_sync(&f->s, p, true);
+	KUNIT_EXPECT_EQ(test, f->syncs_device, p->resource_count);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	ane_h16_session_sync(&f->s, p, false);
+	/* One output: only its lines are dropped. */
+	KUNIT_EXPECT_EQ(test, f->syncs_cpu, 1);
+	KUNIT_EXPECT_EQ(test, f->last_sync_dva, p->surfaces[1]->dva);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+
+	/* Coherent memory: nothing to maintain. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(g, &q), 0);
+	ane_h16_session_sync(&g->s, q, true);
+	ane_h16_session_sync(&g->s, q, false);
+	KUNIT_EXPECT_EQ(test, g->syncs_device + g->syncs_cpu, 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&g->s, q), 0);
+}
+
+/*
+ * Fifty programs loaded, run and closed one after another (each close is
+ * what the last close of the accel file does) map memory only for the
+ * first: every later LOAD is served from the spares the previous program
+ * gave back, zeroed, and each closed program is freed.
+ */
+static void program_cycle_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p;
+	unsigned int i, maps = 0, spares = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (i = 0; i < 50; i++) {
+		p = NULL;
+		KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+		KUNIT_ASSERT_NOT_NULL(test, p);
+		if (!i)
+			maps = f->maps;
+		/* Reused memory comes back zeroed before LOAD fills it. */
+		KUNIT_EXPECT_FALSE(test, memchr_inv(p->surfaces[1]->cpu, 0,
+						    p->surfaces[1]->size));
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+		memset(p->surfaces[1]->cpu, 0x5a, p->surfaces[1]->size);
+		KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+		if (!i)
+			spares = f->s.spare_count;
+		ane_h16_session_put(&f->s, p);
+	}
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, spares);
+	KUNIT_EXPECT_GT(test, spares, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, f->s.program, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/* The same for H17 MobileNet, with its kernel-owned scratch. */
+static void program_h17_cycle_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create_family(test, 17);
+	struct ane_h16_hwx_snapshot *snapshot;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	struct ane_h16_program *p;
+	unsigned int i, maps = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	mobilenet_sections(test, aux, aux_size);
+	for (i = 0; i < 50; i++) {
+		snapshot = mobilenet_snapshot(test);
+		KUNIT_ASSERT_NOT_NULL(test, snapshot);
+		p = NULL;
+		KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+		if (!i)
+			maps = f->maps;
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+		/* Every program's first request is queued, reused memory or not. */
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30),
+				ANE_H16_EXECUTE_FLAG_QUEUED);
+		KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+		ane_h16_session_put(&f->s, p);
+	}
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/* A program whose teardown failed keeps its memory and is never freed. */
+static void program_failed_close_keeps_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->s.quarantined = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EIO);
+	KUNIT_EXPECT_FALSE(test, p->released);
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, 0U);
+	ane_h16_session_put(&f->s, p);
+	/* Still there: put refused a program that was not released. */
+	KUNIT_EXPECT_TRUE(test, p->closed);
+	KUNIT_EXPECT_NOT_NULL(test, p->surfaces[0]);
+}
+
+/*
+ * The busy hook brackets every EXECUTE that reaches the firmware, pass or
+ * fail, exactly once and never nested; a refused call never votes.
+ */
+static void program_busy_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test), *g = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 0);
+	for (i = 0; i < 5; i++)
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 5);
+	KUNIT_EXPECT_EQ(test, f->busy_off, 5);
+	KUNIT_EXPECT_EQ(test, f->busy_max, 1);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, NULL), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&g->s, p), -EINVAL);
+	KUNIT_EXPECT_EQ(test, f->busy_on + g->busy_on, 5);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+
+	/* A stalled request still releases the vote. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(g, &q), 0);
+	g->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_NE(test, ane_h16_session_execute(&g->s, q), 0);
+	KUNIT_EXPECT_EQ(test, g->busy_on, 1);
+	KUNIT_EXPECT_EQ(test, g->busy_off, 1);
+	KUNIT_EXPECT_EQ(test, g->busy_depth, 0);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_cycle_test),
+	KUNIT_CASE(program_h17_cycle_test),
+	KUNIT_CASE(program_failed_close_keeps_test),
+	KUNIT_CASE(program_busy_test),
+	KUNIT_CASE(program_cached_sync_test),
 	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),

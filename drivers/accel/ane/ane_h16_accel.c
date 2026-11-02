@@ -184,11 +184,13 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			memset(cpu, 0xff, buffers[i].size);
 		}
 	}
+	ane_h16_session_sync(a->session, p, true);
 	copied = ktime_get_ns();
 	ret = ane_h16_session_execute(a->session, p);
 	if (ret)
 		goto unlock;
 	done = ktime_get_ns();
+	ane_h16_session_sync(a->session, p, false);
 	for (i = 0; i < args->count; i++)
 		if (p->resources[i].permissions == 2 &&
 		    copy_to_user(u64_to_user_ptr(buffers[i].ptr), p->surfaces[i]->cpu,
@@ -242,6 +244,8 @@ static void ane_h16_postclose(struct drm_device *drm, struct drm_file *file)
 		ret = ane_h16_session_close(a->session, f->program);
 		if (ret)
 			drm_err(drm, "program teardown failed %d; session quarantined\n", ret);
+		else
+			ane_h16_session_put(a->session, f->program);
 	}
 	mutex_unlock(&a->lock);
 	kfree(f);
