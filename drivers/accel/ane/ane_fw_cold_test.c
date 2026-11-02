@@ -3,6 +3,7 @@
 #include <linux/module.h>
 
 #include "ane_fw_cold.h"
+#include "ane_fw_sleep.h"
 
 static struct ane_fw_cold_state ane_cold_fixture(void)
 {
@@ -261,7 +262,33 @@ static void ane_cold_handoff_warm_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_fw_cold_handoff_valid(&h, &soc));
 }
 
+/*
+ * While the firmware is retained every sleep state is refused at prepare;
+ * the matching post events and anything without retained firmware pass.
+ */
+static void ane_cold_sleep_test(struct kunit *test)
+{
+	static const unsigned long refused[] = {
+		PM_SUSPEND_PREPARE, PM_HIBERNATION_PREPARE, PM_RESTORE_PREPARE,
+	};
+	static const unsigned long passed[] = {
+		PM_POST_SUSPEND, PM_POST_HIBERNATION, PM_POST_RESTORE,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(refused); i++) {
+		KUNIT_EXPECT_TRUE(test, ane_fw_sleep_refused(refused[i], true));
+		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(refused[i], true), NOTIFY_BAD);
+		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(refused[i], false), NOTIFY_DONE);
+	}
+	for (i = 0; i < ARRAY_SIZE(passed); i++) {
+		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(passed[i], true), NOTIFY_DONE);
+		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(passed[i], false), NOTIFY_DONE);
+	}
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_sleep_test),
 	KUNIT_CASE(ane_cold_handoff_warm_test),
 	KUNIT_CASE(ane_cold_handoff_test),
 	KUNIT_CASE(ane_cold_heap_tail_test),

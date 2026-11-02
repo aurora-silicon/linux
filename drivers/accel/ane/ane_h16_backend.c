@@ -20,6 +20,7 @@
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 
+#include "ane_fw_sleep.h"
 #include "ane_fw_platform.h"
 #include "ane_h16_accel.h"
 #include "ane_h16_boot.h"
@@ -57,6 +58,8 @@ struct ane_h16_device {
 	bool claimed;
 	bool attached;
 	bool pinned;
+	/* While pinned: refuse system sleep (ane_fw_sleep.h). */
+	struct notifier_block pm_notifier;
 	int irq;
 	struct ane_fw_rtk rtk;
 	struct {
@@ -134,21 +137,39 @@ static void ane_h16_quarantine(void *ctx, int error)
 		error);
 }
 
+static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
+{
+	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
+	bool pinned = READ_ONCE(h->pinned);
+
+	if (ane_fw_sleep_refused(event, pinned))
+		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_event(event, pinned);
+}
+
 static int ane_h16_pin(void *ctx)
 {
 	struct ane_h16_device *h = ctx;
+	int ret;
 
 	if (!try_module_get(THIS_MODULE))
 		return -ENODEV;
+	/* Pinned for good: the notifier stays registered until reboot. */
+	h->pm_notifier.notifier_call = ane_h16_pm_event;
+	ret = register_pm_notifier(&h->pm_notifier);
+	if (ret) {
+		module_put(THIS_MODULE);
+		return ret;
+	}
 	h->pinned = true;
 	ane_h16_released = true;
 	return 0;
 }
 
 /*
- * System sleep callbacks of a bound H16 device, reached only through the
- * generation dispatch of the ane_t6021 driver. A device whose engine was
- * never started has nothing to save.
+ * System sleep callbacks of a bound H16 device. While the firmware runs the
+ * notifier has already refused the transition, so these only see a device
+ * whose engine was never started, which has nothing to save.
  */
 int ane_h16_backend_suspend(struct device *dev)
 {

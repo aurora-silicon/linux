@@ -22,6 +22,7 @@
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
+#include "ane_fw_sleep.h"
 #include "ane_h16_accel.h"
 
 #define ANE_FW_POOL_DVA 0x10000384000ULL
@@ -229,11 +230,11 @@ static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
 {
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, pm_notifier);
+	bool retained = READ_ONCE(b->retained);
 
-	if ((event == PM_SUSPEND_PREPARE || event == PM_HIBERNATION_PREPARE ||
-	     event == PM_RESTORE_PREPARE) && READ_ONCE(b->retained))
-		return NOTIFY_BAD;
-	return NOTIFY_DONE;
+	if (ane_fw_sleep_refused(event, retained))
+		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_event(event, retained);
 }
 
 static int ane_fw_retain(struct ane_fw_backend *b)
