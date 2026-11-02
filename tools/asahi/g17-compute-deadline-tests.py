@@ -37,19 +37,21 @@ def fixture():
         packet = packet.replace(old, new)
         ensure = ensure.replace(old, new)
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
-                 item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()')
+                 item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
     gate = item(preparation, 'pub(super) fn enter_until(').replace('pub(super) ', '')
     return r'''
 #![allow(dead_code,unused_variables,irrefutable_let_patterns)]
+use std::cell::Cell;
 use std::sync::{Arc,Mutex,MutexGuard,atomic::{AtomicBool,AtomicU64,AtomicUsize,Ordering}};
 type Result<T=()> = std::result::Result<T,i32>;
 const EINVAL:i32=-22;const ECANCELED:i32=-125;const EIO:i32=-5;const ENODEV:i32=-19;const EBUSY:i32=-16;const EAGAIN:i32=-11;
 const RECOVERY_SETTLE_POLLS:usize=200;const WORK_RING_WAIT_NS:u64=2_000_000_000;
+const RECOVERY_WAIT_MS:u32=26_000;const RECOVERY_WAIT_NS:u64=RECOVERY_WAIT_MS as u64*1_000_000;
 static NOW:AtomicU64=AtomicU64::new(0);static CALLS:AtomicUsize=AtomicUsize::new(0);
 static MODE:AtomicUsize=AtomicUsize::new(0);static CANCEL:AtomicU64=AtomicU64::new(u64::MAX);
 static STATUS:AtomicU64=AtomicU64::new(u64::MAX);static CLOSED:AtomicBool=AtomicBool::new(false);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
-fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);assert!(now_ns()<=6_000_000_000,"admission budget exceeded");}
+fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);assert!(now_ns()<=RECOVERY_WAIT_NS+4_000_000_000,"admission budget exceeded");}
 mod kernel{pub mod time{
  pub fn msecs_to_jiffies(ms:u32)->u32{ms}
  pub struct Delta(pub u64);impl Delta{pub fn from_millis(ms:u64)->Self{Self(ms*1_000_000)}pub fn from_micros(us:i64)->Self{Self(us as u64*1_000)}}
@@ -59,7 +61,7 @@ mod kernel{pub mod time{
 struct Wait;
 impl Wait{fn lock(&self){}}
 struct Changed;
-impl Changed{fn wait_timeout(&self,_:&mut (),_:u32){advance(1_000_000);assert!(now_ns()<=WORK_RING_WAIT_NS,"gate wake storm must remain bounded");}}
+impl Changed{fn wait_timeout(&self,_:&mut (),_:u32){advance(1_000_000);assert!(now_ns()<=RECOVERY_WAIT_NS,"gate wake storm must remain bounded");}}
 struct Gate{wait:Wait,changed:Changed}
 struct Lease;
 impl Lease{fn is_current(&self)->bool{true}}
@@ -120,7 +122,8 @@ fn main(){
   MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
   let r=b.compute_packet(&p,&mut DeferredBatch);
   assert_eq!(r,Err(EBUSY),"one admission budget covers binding theft/recovery/publication");
-  assert!(now_ns()<=WORK_RING_WAIT_NS+10_000_000,"admission budget exceeded");
+  let budget=if mode==1{RECOVERY_WAIT_NS}else{WORK_RING_WAIT_NS};
+  assert!(now_ns()>=budget&&now_ns()<=budget+10_000_000,"admission budget exceeded");
   if mode==0{assert_eq!(CALLS.load(Ordering::SeqCst),4);assert_eq!(now_ns(),WORK_RING_WAIT_NS);}
   println!("PASS mode={} result={:?} calls={} elapsed_ms={}",mode,r,CALLS.load(Ordering::SeqCst),now_ns()/1_000_000);
  }
@@ -147,8 +150,8 @@ fn main(){
   NOW.store(0,Ordering::SeqCst);CLOSED.store(true,Ordering::SeqCst);
   let check=||{if cancel&&now_ns()>=10_000_000{Err(ECANCELED)}else{Ok(())}};
   let admission=Admission::new(20_000_000,&check);
-  assert!(matches!(b.shared.preparations.enter_until(&admission),Err(e) if e==if cancel{ECANCELED}else{EBUSY}),"gate wake storm must check original deadline and cancellation");
-  assert_eq!(now_ns(),if cancel{10_000_000}else{20_000_000});
+  assert!(matches!(b.shared.preparations.enter_until(&admission),Err(e) if e==if cancel{ECANCELED}else{EBUSY}),"gate wake storm must check the recovery deadline and cancellation");
+  assert_eq!(now_ns(),if cancel{10_000_000}else{RECOVERY_WAIT_NS});
  }
  println!("PASS spent budgets, nested capacity cancellation/status, gate recovery wake storms");
 }
@@ -160,12 +163,13 @@ def main():
     mutants = [
         ('fixed', source, ''),
         ('renew-on-binding-loss', source.replace('let admission = Admission::new(deadline, &check);\n        let progress = &self.shared.progress;\n        loop {', 'let progress = &self.shared.progress;\n        loop {\n            let admission = Admission::new(now_ns().saturating_add(WORK_RING_WAIT_NS), &check);'), 'admission budget exceeded'),
-        ('ignore-deadline', source.replace('if now_ns() >= self.deadline', 'if false'), 'admission budget exceeded'),
+        ('ignore-deadline', source.replace('if now_ns() >= self.deadline.get()', 'if false'), 'admission budget exceeded'),
         ('render-work-state', source.replace('acquire(crate::g17::job::Engine::Compute)', 'acquire(crate::g17::job::Engine::Render)'), 'compute admission takes a compute work state'),
         ('omit-gate-check', source.replace('            admission.check()?;\n            match self.try_enter()', '            match self.try_enter()').replace('admission.slice_ms()?', '10'), 'gate wake storm'),
+        ('no-recovery-extension', source.replace('admission.extend_for_recovery();', ''), 'admission budget exceeded'),
     ]
     # Bind the old unbounded mutant with the review's eventual cancellation.
-    mutants[1] = (mutants[1][0], mutants[1][1].replace('for mode in 0..4 {', 'CANCEL.store(10_000_000_000,Ordering::SeqCst);\n for mode in 0..4 {'), mutants[1][2])
+    mutants[1] = (mutants[1][0], mutants[1][1].replace('for mode in 0..4 {', 'CANCEL.store(40_000_000_000,Ordering::SeqCst);\n for mode in 0..4 {'), mutants[1][2])
     with tempfile.TemporaryDirectory(prefix='g17-compute-deadline-') as tmp:
         for name, code, expected in mutants:
             if name != 'fixed':
