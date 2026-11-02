@@ -106,7 +106,7 @@ def modes(root):
     checks = []
     blobs = []
 
-    def case(elements, expected, ranges=None, desktop=True):
+    def case(elements, expected, ranges=None, desktop=True, internal=True, external=False):
         raw = bytearray(struct.pack('<I', 0xd3))
         f['wire'](elements, raw)
         i = len(blobs)
@@ -114,7 +114,7 @@ def modes(root):
                      (i, ','.join(map(str, raw))))
         check = (f'{{ struct dcp_parse_ctx c; unsigned n=99; '
                  f'assert(!parse(b{i},sizeof(b{i}),&c)); c.zero_vrr_range_fallback={int(desktop)}; '
-                 'struct dcp_display_mode *m=enumerate_modes(&c,&n,355,230,0,true,false); '
+                 f'struct dcp_display_mode *m=enumerate_modes(&c,&n,355,230,0,{int(internal)},{int(external)}); '
                  f'assert(!IS_ERR(m) && n=={len(expected)});')
         for j, hz in enumerate(expected):
             check += (f'assert(m[{j}].mode.clock=={round(2200*1125*hz/1000)}); '
@@ -122,7 +122,7 @@ def modes(root):
                       f'assert(m[{j}].mode.htotal==2200 && m[{j}].mode.vtotal==1125); '
                       f'assert(m[{j}].mode.flags==(DRM_MODE_FLAG_PHSYNC|DRM_MODE_FLAG_PVSYNC)); ')
         for j, hz in enumerate(expected):
-            if hz >= 119.88:
+            if hz >= 119.88 and internal:
                 check += f'assert(m[{j}].needs_timestamps); '
         if ranges:
             for j, (lo, hi) in enumerate(ranges):
@@ -161,6 +161,18 @@ def modes(root):
     checks.append('{struct dcp_parse_ctx c;unsigned n;assert(!parse(dup,sizeof(dup),&c));'
                   'struct dcp_display_mode *m=enumerate_modes(&c,&n,355,230,0,true,false);'
                   'assert(!IS_ERR(m) && n==1 && !m[0].vrr);free(m);}')
+    # H17P external ranges must come from firmware, never ProMotion fallback.
+    for lo, hi, valid in ((48<<16,144<<16,True), (0,0,False),
+                          (0,144<<16,False), (48<<16,0,False),
+                          (144<<16,48<<16,False), (48<<16,280<<16,False)):
+        m=copy.deepcopy(baseline)
+        m['VerticalAttributes']['PreciseSyncRate']=144<<16
+        m['MinimumVariableRefreshRate']=lo
+        m['MaximumVariableRefreshRate']=hi
+        case([m],[144],[(lo,hi) if valid else (0,0)],
+             desktop=False,internal=False,external=True)
+    m=copy.deepcopy(supported[0])
+    case([m],[120],[(0,0)],desktop=False,internal=False,external=True)
     # Bad geometry and virtual modes are still rejected.
     for field, value in (('Total', 1000), ('FrontPorch', 65536)):
         m=copy.deepcopy(supported[0]);m['HorizontalAttributes'][field]=value
