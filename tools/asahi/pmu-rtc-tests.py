@@ -256,7 +256,8 @@ def main():
         unit.write_text(PRELUDE + code + CASES)
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
                         '-Werror', str(unit), '-o', str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
+        result = subprocess.run([str(binary)])
+        raise SystemExit(1 if result.returncode else 0)
 
 
 if __name__ == '__main__':
