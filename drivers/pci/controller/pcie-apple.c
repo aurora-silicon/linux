@@ -207,6 +207,7 @@ struct hw_info {
 	u32 pwren_on_ms;
 	bool sid_indexed_rid2sid;
 	bool retain_clocks;
+	bool adopt_link;
 	bool root_bus_only;
 	bool tunneled;
 	bool tunnel_intr2axi;
@@ -280,6 +281,24 @@ static const struct hw_info t8152_hw = {
 	.refbuf_off		= true,
 	.pipe_rst		= true,
 };
+
+/*
+ * Bare-metal T6050 adoption only. Firmware owns power, PHY, reset and training.
+ * The 64-entry route table is never probed with test writes.
+ */
+static const struct hw_info t6050_hw = {
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi		= PORT_T602X_MSIADDR_HI,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 64,
+	.retain_clocks		= true,
+	.adopt_link		= true,
+};
+
+#define T6050_ROUTE(rid, sid)	(PORT_RID2SID_VALID | \
+				 ((sid) << PORT_RID2SID_SID_SHIFT) | (rid))
 
 static const struct hw_info t8103_pciec_hw = {
 	.port_msiaddr		= PORT_MSIADDR,
@@ -456,6 +475,10 @@ struct apple_pcie_port {
 	bool			needs_stop;
 	bool			link_failed;
 	bool			irq_disabled;
+	bool			adopted_route;
+	void __iomem		*intr2axi;	/* adopt_link: this port's */
+	u16			adopted_rid;	/* adopt_link: secondary bus << 8 */
+	u32			adopted_sid;
 };
 
 static int apple_pcie_managed_admit(struct apple_pcie_port *port);
@@ -767,9 +790,20 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 	struct apple_pcie *pcie = port->pcie;
 	u32 val = 0;
 
-	/* FIXME: consider moving each interrupt under each port */
-	port->irq = irq_of_parse_and_map(to_of_node(dev_fwnode(port->pcie->dev)),
-					 port->idx);
+	if (pcie->hw->adopt_link) {
+		char name[16];
+		int irq;
+
+		snprintf(name, sizeof(name), "port%d", port->idx);
+		irq = of_irq_get_byname(pcie->dev->of_node, name);
+
+		if (irq <= 0)
+			return irq ?: -ENXIO;
+		port->irq = irq;
+	} else {
+		/* FIXME: consider moving each interrupt under each port */
+		port->irq = irq_of_parse_and_map(pcie->dev->of_node, port->idx);
+	}
 	if (!port->irq)
 		return -ENXIO;
 
@@ -781,6 +815,9 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 		port->irq = 0;
 		return -ENOMEM;
 	}
+
+	if (pcie->hw->adopt_link)
+		apple_pcie_port_writel(port, 0, PORT_MSICFG);
 
 	/* Disable all interrupts */
 	apple_pcie_port_writel(port, ~0, PORT_INTMSK);
@@ -815,7 +852,22 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 		val = ilog2(pcie->nvecs) << PORT_MSICFG_L2MSINUM_SHIFT;
 	}
 
+	if (pcie->hw->adopt_link) {
+		if (apple_pcie_port_readl(port, pcie->hw->port_msiaddr) != DOORBELL_ADDR ||
+		    apple_pcie_port_readl(port, pcie->hw->port_msiaddr_hi))
+			return -EIO;
+		for (int i = 0; i < pcie->nvecs; i++)
+			if (apple_pcie_port_readl(port, pcie->hw->port_msimap + 4 * i) !=
+			    (PORT_MSIMAP_ENABLE | (pcie->msi_vector_base + i)))
+				return -EIO;
+		/* Enable command is not readable; +0x84 is only a completion read. */
+		writel(PCIEC_INTR2AXI_ENABLE, port->intr2axi + PCIEC_INTR2AXI_CTRL);
+		readl(port->intr2axi + 0x84);
+	}
 	apple_pcie_port_writel(port, val | PORT_MSICFG_EN, PORT_MSICFG);
+	if (pcie->hw->adopt_link &&
+	    !(apple_pcie_port_readl(port, PORT_MSICFG) & PORT_MSICFG_EN))
+		return -EIO;
 	return 0;
 }
 
@@ -831,6 +883,8 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 		complete_all(&port->pcie->event);
 		break;
 	case PORT_INT_LINK_DOWN:
+		if (port->pcie->hw->adopt_link)
+			WRITE_ONCE(port->link_failed, true);
 		/* A later link-up alone does not prove downstream state survived. */
 		if (port->pcie->hw->tunneled && READ_ONCE(port->started)) {
 			WRITE_ONCE(port->link_failed, true);
@@ -1509,8 +1563,17 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 	apple_pcie_port_disable_irq(port);
 
 	/* Busy managed admission has not acquired or programmed this IRQ block. */
-	if (port->base && (!port->pcie->managed_sids || port->domain))
+	if (port->base &&
+	    (port->domain ||
+	     (!port->pcie->managed_sids && !port->pcie->hw->adopt_link)))
 		apple_pcie_port_writel(port, ~0, PORT_INTMSK);
+
+	if (port->pcie->hw->adopt_link && port->domain)
+		apple_pcie_port_writel(port, 0, PORT_MSICFG);
+	if (port->adopted_route) {
+		apple_pcie_rid2sid_write(port, port->adopted_sid, 0);
+		port->adopted_route = false;
+	}
 
 	if (port->pcie->hw->tunneled && (port->started || port->needs_stop))
 		apple_pcie_tunnel_stop(port);
@@ -1593,6 +1656,134 @@ static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 	apple_pcie_port_writel(port, val, offset);
 	/* Read back to ensure completion of the write */
 	return apple_pcie_port_readl(port, offset);
+}
+
+/*
+ * Qualified J775D handoff of one bootloader-trained port: its root port
+ * 00:<port>.0 and the single endpoint on its secondary bus, with DMA and
+ * endpoint MSI disabled. Every resource comes from the DT by the port's index
+ * (port<n>, phy<n>, intr2axi<n>, interrupt port<n>, the iommu-map entry for the
+ * endpoint's RID). All checks precede the first PCIe register write.
+ */
+static int apple_pcie_adopt_link(struct apple_pcie_port *port)
+{
+	static const char *const names[] = { "port%d", "phy%d", "intr2axi%d" };
+	struct apple_pcie *pcie = port->pcie;
+	struct platform_device *pdev = to_platform_device(pcie->dev);
+	struct of_phandle_args iommu = {};
+	void __iomem *rp, *ep;
+	char name[16];
+	u32 value, bus;
+	u8 cap;
+	bool msi = false;
+	int ret, i;
+
+	if (pcie->cfg->busr.start != 0 ||
+	    !platform_get_resource_byname(pdev, IORESOURCE_MEM, "config") ||
+	    !platform_get_resource_byname(pdev, IORESOURCE_MEM, "rc"))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		snprintf(name, sizeof(name), names[i], port->idx);
+		if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, name))
+			return -EINVAL;
+	}
+
+	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
+	    !(readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY) ||
+	    !(apple_pcie_port_readl(port, PORT_STATUS) & PORT_STATUS_READY) ||
+	    (apple_pcie_port_readl(port, PORT_LINKSTS) &
+	     (PORT_LINKSTS_UP | PORT_LINKSTS_BUSY)) != PORT_LINKSTS_UP ||
+	    !(apple_pcie_port_readl(port, PORT_LTSSMCTL) & PORT_LTSSMCTL_START) ||
+	    (apple_pcie_port_readl(port, PORT_APPCLK) & 0x101) != 0x101 ||
+	    (apple_pcie_port_readl(port, pcie->hw->port_perst) & 0x10001) != 1 ||
+	    (readl(port->phy + PHY_LANE_CFG) & 0x1000061f) != 0x60f)
+		return -ENOLINK;
+
+	/* The bootloader numbered the root port's buses: primary 0, one secondary. */
+	rp = pcie->cfg->win + (PCI_DEVFN(port->idx, 0) << 12);
+	value = readl(rp + PCI_PRIMARY_BUS);
+	bus = (value >> 8) & 0xff;
+	if (readl(rp) != 0x100c106b || (value & 0xff) != 0 || !bus ||
+	    ((value >> 16) & 0xff) != bus || bus > pcie->cfg->busr.end ||
+	    (readw(rp + PCI_BRIDGE_CONTROL) & PCI_BRIDGE_CTL_BUS_RESET))
+		return -ENODEV;
+	ep = pcie->cfg->win + (bus << 20);
+	value = readl(ep);
+	if (value == 0xffffffff || !(value & 0xffff) ||
+	    (readb(ep + PCI_HEADER_TYPE) & 0x7f) != PCI_HEADER_TYPE_NORMAL ||
+	    (readw(ep + PCI_COMMAND) & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+				       PCI_COMMAND_MASTER)))
+		return -ENODEV;
+
+	port->adopted_rid = bus << 8;
+	ret = of_map_iommu_id(pcie->dev->of_node, port->adopted_rid, &iommu);
+	if (ret)
+		return ret;
+	ret = iommu.args_count == 1 && iommu.args[0] &&
+	      iommu.args[0] < pcie->hw->max_rid2sid &&
+	      of_device_is_compatible(iommu.np, "apple,t6050-dart") ? 0 : -EINVAL;
+	port->adopted_sid = iommu.args[0];
+	of_node_put(iommu.np);
+	if (ret)
+		return ret;
+
+	snprintf(name, sizeof(name), "intr2axi%d", port->idx);
+	port->intr2axi = devm_platform_ioremap_resource_byname(pdev, name);
+	if (IS_ERR(port->intr2axi))
+		return PTR_ERR(port->intr2axi);
+
+	/* The currently qualified handoff is Gen3 x1, with no retrain in progress. */
+	cap = readb(rp + PCI_CAPABILITY_LIST);
+	for (i = 0; cap && i < 48; i++) {
+		if (cap < 0x40 || (cap & 3))
+			return -EINVAL;
+		if (readb(rp + cap + PCI_CAP_LIST_ID) == PCI_CAP_ID_EXP)
+			break;
+		cap = readb(rp + cap + PCI_CAP_LIST_NEXT);
+	}
+	if (!cap || i == 48)
+		return -EINVAL;
+	value = readw(rp + cap + PCI_EXP_LNKSTA);
+	if ((value & (PCI_EXP_LNKSTA_CLS | PCI_EXP_LNKSTA_NLW | PCI_EXP_LNKSTA_LT)) !=
+	    (PCI_EXP_LNKSTA_CLS_8_0GB | (1 << PCI_EXP_LNKSTA_NLW_SHIFT)))
+		return -ENOLINK;
+
+	/* Refuse an active endpoint or malformed capability chain. */
+	cap = readb(ep + PCI_CAPABILITY_LIST);
+	for (i = 0; cap && i < 48; i++) {
+		if (cap < 0x40 || (cap & 3))
+			return -EINVAL;
+		value = readw(ep + cap + PCI_MSI_FLAGS);
+		switch (readb(ep + cap + PCI_CAP_LIST_ID)) {
+		case PCI_CAP_ID_MSI:
+			if (value & PCI_MSI_FLAGS_ENABLE)
+				return -EBUSY;
+			msi = true;
+			break;
+		case PCI_CAP_ID_MSIX:
+			if (value & PCI_MSIX_FLAGS_ENABLE)
+				return -EBUSY;
+			msi = true;
+			break;
+		}
+		cap = readb(ep + cap + PCI_CAP_LIST_NEXT);
+	}
+	if (cap || !msi)
+		return -EINVAL;
+
+	for (i = 0; i < pcie->hw->max_rid2sid; i++)
+		if (apple_pcie_port_readl(port, port_rid2sid_offset(port, i)) &
+		    PORT_RID2SID_VALID)
+			return -EBUSY;
+
+	/* The route goes in the slot whose index is the SID, as on J775D's adopted ports. */
+	value = T6050_ROUTE(port->adopted_rid, port->adopted_sid);
+	port->adopted_route = true;
+	if (apple_pcie_rid2sid_write(port, port->adopted_sid, value) != value)
+		return -EIO;
+	dev_info(pcie->dev, "adopted port %d, RID %04x -> SID %u, slot %u\n",
+		 port->idx, port->adopted_rid, port->adopted_sid, port->adopted_sid);
+	return 0;
 }
 
 static int apple_pcie_setup_link(struct apple_pcie *pcie,
@@ -1881,6 +2072,10 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 					goto err_teardown;
 			}
 		}
+	} else if (pcie->hw->adopt_link) {
+		ret = apple_pcie_adopt_link(port);
+		if (ret)
+			goto err_teardown;
 	} else {
 		if (pcie->hw->retain_clocks)
 			rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
@@ -1922,9 +2117,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (ret)
 		goto err_teardown;
 
-	if (pcie->managed_sids) {
+	if (pcie->managed_sids || pcie->hw->adopt_link)
 		goto rid2sid_ready;
-	}
 
 	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
 	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
@@ -1949,6 +2143,10 @@ rid2sid_ready:
 		unsigned long timeout, left = 0;
 		int attempt, attempts = 1;
 
+		if (pcie->hw->adopt_link) {
+			ret = -ENOLINK;
+			goto err_teardown;
+		}
 		if (pcie->hw->tunneled) {
 			if (pcie->kernel_init) {
 				apple_pcie_tunnel_apply_tunable(port->base,
@@ -2095,6 +2293,17 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		return ret;
 	}
 
+	if (pcie->hw->adopt_link) {
+		ret = of_property_read_u32(to_of_node(fwnode), "apple,msi-vector-base",
+					   &pcie->msi_vector_base);
+		if (ret || pcie->msi_vector_base != 64 ||
+		    (pcie->nvecs != 32 && pcie->nvecs != 64) ||
+		    args.args_count != 4 || args.args[0] != 0 || args.args[1] != 0 ||
+		    args.args[2] != 1888 || args.args[3] != IRQ_TYPE_EDGE_RISING ||
+		    DOORBELL_ADDR != 0xfffff000)
+			goto invalid_slice;
+	}
+
 	/*
 	 * The controller-wide ADT count (512) is not a per-host allocation.
 	 * Internal PCIe owns vectors 0..31. Each PCIe-C bridge owns a distinct
@@ -2218,7 +2427,7 @@ static int apple_msi_init(struct apple_pcie *pcie)
 invalid_slice:
 	of_node_put(args.np);
 	return dev_err_probe(pcie->dev, -EINVAL,
-			     "invalid or missing PCIe-C MSI slice\n");
+			     "invalid or missing MSI slice\n");
 }
 
 static void apple_pcie_cleanup(void *data)
@@ -2419,6 +2628,11 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	of_node_put(iommu_spec.np);
 	sid = iommu_spec.args[0];
+	if (pcie->hw->adopt_link)
+		return rid == port->adopted_rid && sid == port->adopted_sid &&
+		       !READ_ONCE(port->link_failed) &&
+		       apple_pcie_port_readl(port, port_rid2sid_offset(port, sid)) ==
+		       T6050_ROUTE(rid, sid) ? 0 : -ENODEV;
 	mutex_lock(&port->pcie->lock);
 
 	if (port->pcie->managed_sids || port->pcie->hw->sid_indexed_rid2sid) {
@@ -2485,7 +2699,7 @@ static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci
 	int idx;
 
 	port = apple_pcie_get_port(pdev);
-	if (!port)
+	if (!port || port->pcie->hw->adopt_link)
 		return;
 
 	mutex_lock(&port->pcie->lock);
@@ -2526,9 +2740,13 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 		ret = apple_pcie_setup_port(pcie, of_port);
 		if (ret) {
 			dev_err(dev, "Port %pOF setup fail: %d\n", of_port, ret);
-			return ret;
+			/* Adopted ports are independent: one refused leaves the others. */
+			if (!pcie->hw->adopt_link)
+				return ret;
 		}
 	}
+	if (pcie->hw->adopt_link && list_empty(&pcie->ports))
+		return -ENODEV;
 
 	/* The bus scan follows this callback. */
 	apple_pcie_tunnel_wait_ready(pcie);
@@ -2548,6 +2766,27 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	struct apple_pcie_port *port;
 
+	if (pcie->hw->adopt_link) {
+		/* Only adopted ports' root ports, and the one endpoint behind each. */
+		list_for_each_entry(port, &pcie->ports, entry) {
+			if (bus->number == 0) {
+				if (devfn == PCI_DEVFN(port->idx, 0))
+					return pci_ecam_map_bus(bus, devfn, where);
+				continue;
+			}
+			if (bus->number != port->adopted_rid >> 8)
+				continue;
+			if (devfn || READ_ONCE(port->link_failed))
+				return NULL;
+			if ((apple_pcie_port_readl(port, PORT_LINKSTS) &
+			     (PORT_LINKSTS_UP | PORT_LINKSTS_BUSY)) != PORT_LINKSTS_UP) {
+				WRITE_ONCE(port->link_failed, true);
+				return NULL;
+			}
+			return pci_ecam_map_bus(bus, devfn, where);
+		}
+		return NULL;
+	}
 	if (!pcie->hw->root_bus_only)
 		return pci_ecam_map_bus(bus, devfn, where);
 
@@ -3121,7 +3360,22 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	 * reset-gpios provider here rejects the valid synthesized port before
 	 * the tunneled setup path can consume that handoff.
 	 */
-	if (!hw->tunneled) {
+	if (hw->adopt_link) {
+		if (!of_get_available_child_count(dev->of_node) ||
+		    of_property_present(dev->of_node, "power-domains"))
+			return -EINVAL;
+		for_each_available_child_of_node_scoped(dev->of_node, child) {
+			u32 reg;
+
+			/* A root port 00:<n>.0 on bus 0, n a GP port */
+			if (of_property_read_u32(child, "reg", &reg) || reg & ~0xf800 ||
+			    !(reg >> 11) || (reg >> 11) > 3 ||
+			    !of_property_read_bool(child, "apple,link-trained-by-bootloader") ||
+			    of_property_present(child, "reset-gpios") ||
+			    of_property_present(child, "pwren-gpios"))
+				return -EINVAL;
+		}
+	} else if (!hw->tunneled) {
 		/* Check for probe dependencies for all ports first */
 		for_each_available_child_of_node(dev->of_node, of_port) {
 			ret = apple_pcie_probe_port(of_port);
@@ -3164,15 +3418,15 @@ static int apple_pcie_probe(struct platform_device *pdev)
 			return ret;
 	}
 	pcie->piodma_supplier = piodma_supplier;
-	/* Only this retained-DMA radio hierarchy forbids user reset/removal. */
-	if (piodma_supplier || pcie->managed_sids) {
+	/* Firmware-owned links cannot be recovered by user reset/removal. */
+	if (piodma_supplier || pcie->managed_sids || hw->adopt_link) {
 		bridge->no_user_remove = true;
 		bridge->reset_sensitive = true;
 		bridge->native_pcie_hotplug = false;
 		bridge->native_shpc_hotplug = false;
 		bridge->native_aer = false;
 		bridge->native_dpc = false;
-		dev_dbg(dev, "radio host: automatic AER/DPC recovery disabled for retained DMA\n");
+		dev_dbg(dev, "firmware-owned host: automatic AER/DPC recovery disabled\n");
 	}
 	if (hw->root_bus_only && !piodma_supplier)
 		dev_info(dev, "root-port probe only; downstream config is blocked\n");
@@ -3952,6 +4206,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	 */
 	if (pcie->managed_sids)
 		return pm_suspend_target_state == PM_SUSPEND_TO_IDLE ? 0 : -EBUSY;
+	if (pcie->hw->adopt_link)
+		return -EBUSY;
 	if (!pcie->hw->tunneled)
 		return 0;
 	pcie->reset_on_resume = false;
@@ -4095,6 +4351,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
+	{ .compatible = "apple,t6050-pcie",	.data = &t6050_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }
 };
