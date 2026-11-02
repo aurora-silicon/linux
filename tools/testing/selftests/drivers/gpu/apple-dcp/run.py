@@ -58,6 +58,7 @@ def main():
                                        'failed-flip-return', 'live-park'))
     tests = [
         ('display', 'external-vrr-callbacks', external_vrr.callbacks, ((),), ()),
+        ('rate', 'external-vrr-publication', external_vrr.publication, ((),), ()),
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),

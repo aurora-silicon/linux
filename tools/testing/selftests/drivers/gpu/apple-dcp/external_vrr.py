@@ -2,6 +2,35 @@
 # Copyright 2026 Ryan Murray
 """H17P Variable-mode callbacks against a delayed, fallible RPC transport."""
 from common import block
+import rate
+
+
+def publication(root):
+    unit = rate.publication(root)['unit']
+    old = block(unit, 'static void drm_connector_set_vrr_capable_property(')
+    unit = unit.replace(old, '''static bool vrr_reported;
+static void drm_connector_set_vrr_capable_property(struct drm_connector *c,bool capable)
+{ (void)c;vrr_reported=capable; }''')
+    checks = r'''
+static void external_ranges(void) {
+    reset();callbacks(false);callbacks(true);timings();admit(0);
+    d.modes[0].vrr=true;d.modes[0].min_vrr=48U<<16;d.modes[0].max_vrr=60U<<16;
+    con.base.display_info.monitor_range.min_vfreq=48;
+    con.base.display_info.monitor_range.max_vfreq=280;
+    probe(true);
+    assert(vrr_reported && con.base.display_info.monitor_range.min_vfreq==48);
+    assert(con.base.display_info.monitor_range.max_vfreq==60);
+    /* Reprobe after a link/catalog change must also allow a higher ceiling. */
+    d.modes[0].max_vrr=144U<<16;probe(true);
+    assert(vrr_reported && con.base.display_info.monitor_range.max_vfreq==144);
+    d.modes[0].vrr=false;probe(true);assert(!vrr_reported);
+    cleanup();
+}
+'''
+    unit = unit.replace('int main(int argc,char **argv) {',
+                        checks + 'int main(int argc,char **argv) {')
+    return unit.replace('    transport_edid=raw;',
+                        '    transport_edid=raw;external_ranges();', 1)
 
 
 def callbacks(root):
