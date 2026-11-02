@@ -113,6 +113,8 @@ bool apr_input_is_444(enum apr_input input);
 enum apr_qtable apr_profile_qtable(enum apr_profile profile);
 u32 apr_qmat_reg(const u8 *qmat, unsigned int index);
 u32 apr_dc_scale_reg(unsigned int index);
+void apr_frame_budget(enum apr_profile profile, u32 width, u32 height,
+		      u32 *target, u32 *max);
 u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
 int apr_build_desc(const struct apr_frame *f, u8 *desc);
 int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
