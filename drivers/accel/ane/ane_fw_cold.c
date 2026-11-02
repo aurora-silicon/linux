@@ -386,18 +386,40 @@ static int ane_fw_suspend_wait(struct ane_fw_backend *b)
 static int ane_fw_exclave_mode_stop(struct ane_fw_backend *b)
 {
 	struct ane_fw_transport *t = &b->transport;
-	int ret;
+	struct device *dev = &b->pdev->dev;
+	u32 ch = t->control_ch;
+	u64 before[3] = {};
+	int published, ret;
+	u8 *slot = NULL;
 
 	if (!b->soc->exclave_mode_stop || b->exclave_mode_stopped)
 		return 0;
-	ret = ane_fw_transport_publish_mode_stop(t, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	if (!ret)
-		ret = ane_fw_transport_wait(t, t->control_ch);
+	if (ch < ANE_FW_CHANNELS) {
+		slot = ane_fw_transport_slot(t, ch);
+		for (unsigned int i = 0; i < 3; i++)
+			before[i] = ane_fw_load64(b, slot + 8 * i);
+	}
+	published = ane_fw_transport_publish_mode_stop(t, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	ret = published ?: ane_fw_transport_wait(t, ch);
 	if (ret) {
-		dev_err(&b->pdev->dev,
-			"H17 ANE: EXCLAVE_MODE_STOP (0x31) failed %d on %s; no SUSPEND, no power-off\n",
-			ret, t->control_ch < ANE_FW_CHANNELS ? "the control ring" :
-			"a table without one");
+		const struct ane_fw_transaction *tx = &t->pending[ch < ANE_FW_CHANNELS ? ch : 0];
+
+		dev_err(dev, "H17 ANE: EXCLAVE_MODE_STOP (0x31) failed %d in %s on %s (table position %d); no SUSPEND, no power-off\n",
+			ret, published ? "publish" : "wait", ane_fw_channel_name(ch),
+			ch < ANE_FW_CHANNELS ? (int)t->channels[ch].index : -1);
+		dev_err(dev, "H17 ANE: 0x31 transport error %d raised at ane_fw_transport.h:%u\n",
+			t->error, t->error_line);
+		if (slot) {
+			dev_err(dev, "H17 ANE: 0x31 slot head %u before %#llx %#llx %#llx after %#llx %#llx %#llx\n",
+				t->head[ch], before[0], before[1], before[2],
+				ane_fw_load64(b, slot), ane_fw_load64(b, slot + 8),
+				ane_fw_load64(b, slot + 16));
+		}
+		/* Only a published command has its copy in the pool. */
+		if (slot && !published)
+			dev_err(dev, "H17 ANE: 0x31 command at %#llx size %zu: %*ph\n", tx->dva,
+				tx->size, ANE_FW_MODE_STOP_SIZE,
+				(u8 *)t->pool.cpu + (tx->dva - t->pool.dva));
 		return ret;
 	}
 	b->exclave_mode_stopped = true;
@@ -1285,6 +1307,14 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	ret = ane_fw_scratch_wait(b, 3, 0);
 	if (!ret)
 		dev_info(&b->pdev->dev, "ANE boot: eight channels armed, scratch3 cleared (polled)\n");
+	/* The firmware's table order, which the macOS channel selectors index. */
+	for (i = 0; !ret && i < ANE_FW_CHANNELS; i++) {
+		const struct ane_fw_channel *c = &b->transport.channels[i];
+
+		dev_info(&b->pdev->dev,
+			 "ANE channel %s: table position %u, type %u, doorbell bit %u, %u slots at IPC +%#llx\n",
+			 ane_fw_channel_name(i), c->index, c->type, c->bit, c->slots, c->offset);
+	}
 	return ret;
 }
 
