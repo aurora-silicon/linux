@@ -354,7 +354,7 @@ pub(crate) enum Validated {
         sampler_heap_va: u64,
         sampler_count: u32,
         timestamps: uapi::drm_asahi_timestamps,
-        /// The planned resources of an M5 kick ([`m5::compute::Profile::plan`]); `None` on the
+        /// The planned resources of an M5 kick ([`m5::compute::Gpu::plan`]); `None` on the
         /// other submission paths.
         resources: Option<m5::compute::Resources>,
     },
@@ -385,7 +385,7 @@ impl Payload {
         &self,
         window: &UscWindow,
         variant: &super::fw::Variant,
-        m5: Option<&m5::compute::Profile>,
+        m5: Option<&m5::compute::Gpu>,
         space: &impl AddressSpace,
     ) -> Result<Validated> {
         match self {
@@ -543,7 +543,7 @@ impl Payload {
                     if code != 0 { require_range(space, code, 64, Access::Read)?; }
                 }
                 let resources = match m5 {
-                    Some(profile) => Some(m5_compute(cmd, attachments, intersection, scratch, profile, *declared)?),
+                    Some(gpu) => Some(m5_compute(cmd, attachments, intersection, scratch, gpu, *declared)?),
                     None if declared.is_some() => return Err(EINVAL),
                     None => None,
                 };
@@ -573,7 +573,7 @@ fn m5_compute(
     attachments: &Attachments,
     intersection: &IntersectionTables,
     scratch: ScratchRequest,
-    profile: &m5::compute::Profile,
+    gpu: &m5::compute::Gpu,
     declared: Option<m5::compute::Declared>,
 ) -> Result<m5::compute::Resources> {
     if cmd.cdm_ctrl_stream_base & 7 != 0 {
@@ -591,7 +591,7 @@ fn m5_compute(
         kernel::pr_warn_once!("G17 M5: compute feature outside the M5 subset refused\n");
         return Err(EOPNOTSUPP);
     }
-    profile.plan(declared.ok_or(EINVAL)?)
+    gpu.plan(declared.ok_or(EINVAL)?)
 }
 
 /// Ray-traversal work on a firmware build that does not run it ([`super::fw::Variant`]).

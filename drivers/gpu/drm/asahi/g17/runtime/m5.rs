@@ -95,8 +95,18 @@ impl Registry {
     }
 
     /// The firmware failed a kick of `qid` ([`crate::g17::fw::channels::Event::ComputeFault`]).
-    pub(super) fn m5_fault(&mut self, qid: u8) {
+    /// `window` is the raw fault window read as the event was serviced (`regs.rs`
+    /// `m5_fault_registers`: 0xd800, the fault status 0xd8c0 and address 0xd8c8, 0xc078, 0xc008,
+    /// 0xc028), logged for each M5 fault: nothing else says what the GPU faulted on.
+    pub(super) fn m5_fault(&mut self, qid: u8, stamp: u32, window: Result<[u64; 6]>) {
         for channel in self.m5.iter_mut().filter(|channel| channel.qid() == qid) {
+            pr_warn!(
+                "G17 M5: compute fault on queue {} (stamp {:#x}, {} kicks published): fault window {:x?}\n",
+                qid,
+                stamp,
+                channel.kicks(),
+                window
+            );
             channel.note_fault();
         }
     }
@@ -134,7 +144,7 @@ impl crate::g17::Firmware {
         alloc: &Allocator<'_>,
         context: Arc<Context>,
         owner: u64,
-        profile: &'static crate::g17::fw::m5::compute::Profile,
+        gpu: crate::g17::fw::m5::compute::Gpu,
     ) -> Result {
         let dev = alloc.dev;
         let refused = |step: &str, error: Error| {
@@ -156,14 +166,14 @@ impl crate::g17::Firmware {
             .qids
             .reserve_for(identity, DataMaster::Compute, None, 0)
             .map_err(|error| refused("QID", error))?;
-        let mut channel =
-            match Channel::new(alloc, context, id, owner, profile, &self.variant.pointers) {
-                Ok(channel) => channel,
-                Err(error) => {
-                    self.queues.qids.cancel_unpublished(id)?;
-                    return Err(refused("construction", error));
-                }
-            };
+        let mut channel = match Channel::new(alloc, context, id, owner, gpu, &self.variant.pointers)
+        {
+            Ok(channel) => channel,
+            Err(error) => {
+                self.queues.qids.cancel_unpublished(id)?;
+                return Err(refused("construction", error));
+            }
+        };
         self.queues.m5.reserve(1, GFP_KERNEL)?;
         let result = channel.install(&mut Host {
             init: &self.init,

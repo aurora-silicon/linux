@@ -27,7 +27,7 @@ use crate::g17::{
         self,
         kick::{KickArgs, KickQos, KickTimestamp},
         m5::{
-            compute::{self, Descriptor, DescriptorArgs, Profile, RegisterArgs, Resources},
+            compute::{self, Descriptor, DescriptorArgs, Gpu, RegisterArgs, Resources},
             queue::{HardwareSubmission, Notification},
         },
         queue::*,
@@ -154,7 +154,7 @@ pub(crate) struct Channel {
     context: Arc<Context>,
     id: kick::Id,
     owner: u64,
-    profile: &'static Profile,
+    gpu: Gpu,
     graph: KernelObject,
     descriptors: KernelObject,
     descriptors_low: u64,
@@ -192,7 +192,7 @@ impl Channel {
         context: Arc<Context>,
         id: kick::Id,
         owner: u64,
-        profile: &'static Profile,
+        gpu: Gpu,
         pointers: &PointerLayout,
     ) -> Result<KBox<Self>> {
         let vm = context.vm();
@@ -218,10 +218,10 @@ impl Channel {
             GFP_KERNEL,
         )?;
         let support = alloc.kernel(SUPPORT_BYTES, PAGE as u64, prot, cpu)?;
-        let pool = M5ComputePool::new(alloc, id.qid(), profile.no_storage.pool_blocks)?;
+        let pool = M5ComputePool::new(alloc, id.qid(), gpu.pool_blocks)?;
         aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
         let operand = alloc.lower(
-            profile.operand.bytes,
+            gpu.profile.operand.bytes,
             PAGE as u64,
             mmu::PROT_GPU_SHARED_RW,
             cpu,
@@ -247,7 +247,7 @@ impl Channel {
                 context,
                 id,
                 owner,
-                profile,
+                gpu,
                 graph,
                 descriptors,
                 descriptors_low,
@@ -296,8 +296,8 @@ impl Channel {
     pub(crate) fn qid(&self) -> u8 {
         self.id.qid()
     }
-    pub(crate) fn profile(&self) -> &'static Profile {
-        self.profile
+    pub(crate) fn gpu(&self) -> &Gpu {
+        &self.gpu
     }
     pub(crate) fn owner(&self) -> u64 {
         self.owner
@@ -493,6 +493,10 @@ impl Channel {
         if (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count < items {
             return Err(EAGAIN);
         }
+        // The pool is sized for every accepted plan (`Gpu::new`); a larger one is a planning bug.
+        if dispatch.resources.pool_blocks > self.gpu.pool_blocks {
+            return Err(EINVAL);
+        }
         let claim = host.port.reserve_compute(policy.priority())?;
         let timestamp = self.kick.timestamp();
         let slot = timestamp.slot() % DEPTH;
@@ -515,11 +519,11 @@ impl Channel {
                 work_state: work_word,
                 object_ids: compute::OBJECT_IDS,
                 resource_policy: dispatch.resources.policy,
-                preempt_state_offset: self.profile.preempt_state_offset,
-                operand: self.profile.operand,
+                preempt_state_offset: self.gpu.profile.preempt_state_offset,
+                operand: self.gpu.profile.operand,
                 resource_control: dispatch.resources.control,
-                dispatch_control: self.profile.dispatch_control,
-                auxiliary_control: self.profile.auxiliary_control,
+                dispatch_control: self.gpu.profile.dispatch_control,
+                auxiliary_control: self.gpu.profile.auxiliary_control,
             },
             descriptor_va: low,
             submit_sequence: 0,

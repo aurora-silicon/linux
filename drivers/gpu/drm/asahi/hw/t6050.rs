@@ -247,10 +247,5 @@ pub(crate) const M5_BOARD: M5Board = M5Board {
         operand: crate::g17::fw::m5::compute::OperandLayout::of(CLUSTERS, CORE_SLOTS),
         dispatch_control: crate::g17::fw::m5::compute::dispatch_control(0x10c0_8860, CLUSTERS),
         auxiliary_control: 0,
-        no_storage: crate::g17::fw::m5::compute::Resources {
-            control: 0x54b,
-            policy: 0xf5_0040_0020,
-            pool_blocks: 8,
-        },
     },
 };

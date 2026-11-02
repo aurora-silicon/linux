@@ -59,7 +59,7 @@ pub(crate) struct Frontend {
     window: UscWindow,
     variant: &'static crate::g17::fw::Variant,
     /// The board's M5 compute profile, on the M5 submission path.
-    m5: Option<&'static crate::g17::fw::m5::compute::Profile>,
+    m5: Option<crate::g17::fw::m5::compute::Gpu>,
 }
 
 impl Frontend {
@@ -68,7 +68,7 @@ impl Frontend {
         usc_base: u64,
         range: Range<u64>,
         variant: &'static crate::g17::fw::Variant,
-        m5: Option<&'static crate::g17::fw::m5::compute::Profile>,
+        m5: Option<crate::g17::fw::m5::compute::Gpu>,
     ) -> Result<Self> {
         if priority > 3 {
             return Err(EINVAL);
@@ -102,7 +102,7 @@ pub(crate) struct Queue<B: Backend> {
     range: Range<u64>,
     window: UscWindow,
     variant: &'static crate::g17::fw::Variant,
-    m5: Option<&'static crate::g17::fw::m5::compute::Profile>,
+    m5: Option<crate::g17::fw::m5::compute::Gpu>,
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
@@ -403,7 +403,7 @@ impl<B: Backend> Queue<B> {
                 self.range.clone(),
                 &self.window,
                 self.variant,
-                self.m5,
+                self.m5.as_ref(),
                 &command.payload,
             )?;
             let engine = match &payload {

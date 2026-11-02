@@ -83,7 +83,8 @@ impl event::Queues for Service<'_> {
                 }
             }
         }
-        self.firmware.queues.m5_fault(qid);
+        let window = self.firmware.bridge.regs.m5_fault_registers();
+        self.firmware.queues.m5_fault(qid, stamp, window);
     }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
@@ -135,6 +136,14 @@ impl recovery::Memory for Service<'_> {
         self.firmware.init.host_recovery()
     }
     fn fault_sources(&self) -> Result<recovery::Sources> {
+        // An M5 firmware restart is the one report a lost dispatch makes; the raw fault window
+        // (`m5_fault_registers`) is what says what the GPU faulted on.
+        if self.firmware.variant.submission == crate::g17::fw::variant::Submission::M5HostCommand {
+            pr_warn!(
+                "G17 M5: firmware restart: fault window {:x?}\n",
+                self.firmware.bridge.regs.m5_fault_registers()
+            );
+        }
         self.firmware.init.fault_sources()
     }
 

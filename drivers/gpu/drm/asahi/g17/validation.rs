@@ -147,7 +147,7 @@ impl Proof {
         range: Range<u64>,
         window: &UscWindow,
         variant: &crate::g17::fw::Variant,
-        m5: Option<&crate::g17::fw::m5::compute::Profile>,
+        m5: Option<&crate::g17::fw::m5::compute::Gpu>,
         payload: &Payload,
     ) -> Result<Validated> {
         let requests = RefCell::new(Requests::new());

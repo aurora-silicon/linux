@@ -786,12 +786,12 @@ impl Backend {
         if !lease.is_current() || state.is_none() {
             return Err(EAGAIN);
         }
-        if let Some(profile) = shared.m5 {
+        if let Some(gpu) = shared.m5 {
             // The queue's channel is installed before the queue exists. A retry would
             // build a second one: nothing here is retried.
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             firmware
-                .create_m5_channel(&alloc, context.clone(), owner, profile)
+                .create_m5_channel(&alloc, context.clone(), owner, gpu)
                 .map_err(|error| if error == EAGAIN { EBUSY } else { error })?;
         }
         drop(state);

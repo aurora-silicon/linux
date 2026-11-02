@@ -54,8 +54,6 @@ pub(crate) struct Profile {
     pub(crate) dispatch_control: u64,
     /// Register 0x0a731's first write.
     pub(crate) auxiliary_control: u64,
-    /// What a dispatch without per-thread or workgroup storage needs ([`Self::plan`]).
-    pub(crate) no_storage: Resources,
 }
 
 /// Operand bytes per core slot.
@@ -133,57 +131,242 @@ pub(crate) struct Resources {
     pub(crate) control: u64,
     /// Pool target and resource policy of register 0x0a599's first write.
     pub(crate) policy: u64,
-    /// Backed 4 MiB blocks of the queue's private pool.
+    /// Backed 4 MiB blocks of the queue's private pool this command needs ([`Gpu::plan`]).
     pub(crate) pool_blocks: usize,
 }
 
-/// Workgroup size bound of the storage-free profile: two 32-thread warps. S's demand formulas
-/// (`render_demand.rs` `include_compute`) give the same resource control for every thread count
-/// without storage, and a pressure that differs only by warp rounding; 64 is the qualified one.
-const NO_STORAGE_THREADS: u32 = 64;
+/// Device policy of S's compute demand (`render_resources.rs` `plan_compute_scs`): warps resident
+/// per core and the threadgroup storage they share. G17S values; the qualified storage-free
+/// dispatch reproduces through them (the const check below).
+const RESIDENT_WARPS: u64 = 96;
+const SHARED_BUDGET: u64 = 112 * 1024;
+/// Resident compute kicks of a non-realtime queue: the PTC target is the pressure shared among
+/// them, clamped to the firmware's range.
+const ACTIVE_KICKS: u32 = 2;
+const PTC_TARGET: core::ops::RangeInclusive<u32> = 96..=512;
+/// The low half of register 0x0a599's first write, under the PTC target.
+const RESOURCE_POLICY: u64 = 0x0040_0020;
+/// The API's workgroup bound.
+const MAX_THREADS: u32 = 1024;
+/// Threadgroup storage of one workgroup: Honeykrisp's `maxComputeSharedMemorySize`.
+const MAX_SHARED_BYTES: u32 = 32 * 1024;
+/// S's configured context storage per enabled core (`M5Policy::new` `CONTEXT_FLOOR`).
+const CONTEXT_FLOOR: u64 = 96;
+/// A pool block (`fw/m5/pool.rs`).
+const POOL_BLOCK_BYTES: u64 = 0x40_0000;
 
-/// A compute command's storage declarations (`DRM_ASAHI_SET_COMPUTE_RESOURCES`), merged over its
-/// dispatch profiles. Each record is checked on its own before it is merged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Declared {
-    pub(crate) programs: u32,
-    /// Some profile declares per-thread or workgroup storage.
-    pub(crate) storage: bool,
-    /// The largest workgroup.
-    pub(crate) threads: u32,
+const fn pages(bytes: u64, size: u64) -> u64 {
+    bytes.div_ceil(size)
 }
 
-impl Declared {
-    /// Merges one record: zero flags and a nonzero workgroup, as the UAPI requires.
-    pub(crate) fn include(&mut self, program: &uapi::drm_asahi_compute_program) -> Result {
-        if program.flags != 0 || program.threads == 0 {
+/// One dispatch profile's demand (S `render_demand.rs` `include_compute`): the stack frame and
+/// threadgroup storage in 64 KiB pages, and the pressure of the workgroups resident on a core.
+/// None of it depends on the GPU's topology; the pool it needs does ([`Gpu::pool_blocks`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Demand {
+    primary_large: u64,
+    secondary_large: u64,
+    shared_large: u64,
+    pressure: u64,
+}
+
+impl Demand {
+    fn of(program: &uapi::drm_asahi_compute_program) -> Result<Self> {
+        let threads = u64::from(program.threads);
+        let primary = u64::from(program.primary_bytes) + u64::from(program.linked_bytes);
+        let frame = primary.max(u64::from(program.minimum_primary_bytes)) * 32 + 0x4380;
+        let secondary = u64::from(program.secondary_bytes) * 32;
+        let small = pages(frame, 0x1000) + pages(secondary, 0x1000);
+        let large = pages(frame, 0x10000) + pages(secondary, 0x10000);
+        let shared = u64::from(program.threadgroup_bytes);
+        let warps = pages(threads, 32);
+        let mut groups = RESIDENT_WARPS / warps;
+        if shared != 0 {
+            groups = groups.min(SHARED_BUDGET / (pages(shared, 64) * 64));
+        }
+        if groups == 0 {
             return Err(EINVAL);
         }
-        self.programs = self.programs.checked_add(1).ok_or(EINVAL)?;
-        self.storage |= program.primary_bytes != 0
-            || program.secondary_bytes != 0
-            || program.linked_bytes != 0
-            || program.minimum_primary_bytes != 0
-            || program.threadgroup_bytes != 0;
-        self.threads = self.threads.max(program.threads);
-        Ok(())
+        let resident = groups * warps;
+        Ok(Self {
+            primary_large: pages(frame, 0x10000),
+            secondary_large: pages(secondary, 0x10000),
+            shared_large: pages(shared, 0x10000),
+            pressure: resident.min(96) * small
+                + resident.min(10) * large
+                + groups * pages(shared, 0x1000)
+                + groups.min(8) * pages(shared, 0x10000),
+        })
+    }
+
+    fn max(self, other: Self) -> Self {
+        Self {
+            primary_large: self.primary_large.max(other.primary_large),
+            secondary_large: self.secondary_large.max(other.secondary_large),
+            shared_large: self.shared_large.max(other.shared_large),
+            pressure: self.pressure.max(other.pressure),
+        }
     }
 }
 
-impl Profile {
-    /// The resources of a command with `declared` storage. Only the storage-free subset is
-    /// planned: the stack frame, pool and pressure of declared storage are not derived for this
-    /// GPU, so such a command is refused rather than run with the subset's values. A command
-    /// with no declaration at all is refused too: no declaration is not a declaration of none.
+/// A compute command's storage declarations (`DRM_ASAHI_SET_COMPUTE_RESOURCES`): each record's
+/// demand, merged by component maxima as S does, since different profiles may maximize different
+/// terms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Declared {
+    programs: u32,
+    /// Some profile declares per-thread (scratch) storage.
+    scratch: bool,
+    demand: Demand,
+}
+
+impl Declared {
+    /// Merges one record: zero flags and a workgroup within the API's bound, as the UAPI
+    /// requires.
+    pub(crate) fn include(&mut self, program: &uapi::drm_asahi_compute_program) -> Result {
+        if program.flags != 0
+            || !(1..=MAX_THREADS).contains(&program.threads)
+            || program.threadgroup_bytes > MAX_SHARED_BYTES
+        {
+            return Err(EINVAL);
+        }
+        self.demand = self.demand.max(Demand::of(program)?);
+        self.programs = self.programs.checked_add(1).ok_or(EINVAL)?;
+        self.scratch |= program.primary_bytes != 0
+            || program.secondary_bytes != 0
+            || program.linked_bytes != 0
+            || program.minimum_primary_bytes != 0;
+        Ok(())
+    }
+
+    /// One storage-free profile of `threads`: what the arithmetic qualification declares.
+    pub(crate) fn threads(threads: u32) -> Result<Self> {
+        let mut declared = Self::default();
+        declared.include(&uapi::drm_asahi_compute_program {
+            threads,
+            ..Default::default()
+        })?;
+        Ok(declared)
+    }
+}
+
+/// A GPU's enabled cores as S's pool formulas count them (`RenderDemand::new`,
+/// `RenderBudget::new`): clusters, the most enabled cores in one cluster, and all enabled cores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Topology {
+    clusters: u64,
+    cluster_cores: u64,
+    cores: u64,
+}
+
+impl Topology {
+    pub(crate) fn of(core_masks: &[u32]) -> Result<Self> {
+        let counts = core_masks.iter().map(|mask| u64::from(mask.count_ones()));
+        let topology = Self {
+            clusters: core_masks.len() as u64,
+            cluster_cores: counts.clone().max().unwrap_or(0),
+            cores: counts.sum(),
+        };
+        if topology.cores == 0 {
+            return Err(EINVAL);
+        }
+        Ok(topology)
+    }
+
+    /// The private pool a queue running `demand` needs, in blocks: S's ideal size
+    /// (`RenderDemand::requirements`, `RenderBudget::sizes` without history), from which S
+    /// allocates. Its terms per program are merged maxima, so this bounds S's per-program
+    /// maximum. J775D, a storage-free dispatch: 44 blocks; the qualified 8 lose workgroups once a
+    /// dispatch spreads past two clusters, and 48 do not.
+    fn pool_blocks(&self, demand: &Demand) -> u64 {
+        let Self {
+            clusters,
+            cluster_cores,
+            cores,
+        } = *self;
+        let tail = demand.primary_large + demand.secondary_large + demand.shared_large + 64;
+        let ideal = cluster_cores
+            * (CONTEXT_FLOOR + 11 + demand.pressure.saturating_sub(CONTEXT_FLOOR))
+            + 58
+            + tail;
+        let ideal_pages = (ideal * clusters + 7) & !7;
+        let counts = demand.primary_large + demand.secondary_large + demand.shared_large;
+        let render_target = (cluster_cores * 11 + counts + 10) * clusters;
+        let constant =
+            (cluster_cores * CONTEXT_FLOOR + 32) * clusters * u64::from(ACTIVE_KICKS - 1);
+        // Execution state for every enabled core (no spill: scratch is refused), then one render
+        // target reservation per resident kick beyond the one the ideal size already covers.
+        let pages =
+            ideal_pages + cores * 64 + constant + render_target * u64::from(ACTIVE_KICKS - 1);
+        (pages << 12).div_ceil(POOL_BLOCK_BYTES)
+    }
+}
+
+/// The board's descriptor profile on this GPU's topology: what M5 channels and command validation
+/// take. Each queue's pool covers every command the plan accepts.
+#[derive(Clone, Copy)]
+pub(crate) struct Gpu {
+    pub(crate) profile: &'static Profile,
+    topology: Topology,
+    pub(crate) pool_blocks: usize,
+}
+
+impl Gpu {
+    pub(crate) fn new(profile: &'static Profile, core_masks: &[u32]) -> Result<Self> {
+        let topology = Topology::of(core_masks)?;
+        // The largest pool an accepted declaration needs: every warp count and threadgroup size
+        // in 64-byte steps (Demand::of rounds storage to them).
+        let mut blocks = 0;
+        for warps in 1..=MAX_THREADS / 32 {
+            for shared in (0..=MAX_SHARED_BYTES).step_by(64) {
+                let program = uapi::drm_asahi_compute_program {
+                    threads: warps * 32,
+                    threadgroup_bytes: shared,
+                    ..Default::default()
+                };
+                blocks = blocks.max(topology.pool_blocks(&Demand::of(&program)?));
+            }
+        }
+        Ok(Self {
+            profile,
+            topology,
+            pool_blocks: blocks.try_into()?,
+        })
+    }
+
+    /// The resources of a command with `declared` storage: register 0x0d4a1 packs the stack
+    /// frame's and threadgroup storage's 64 KiB pages (S `resource_flags`), the PTC target is the
+    /// pressure over the resident kicks, and the pool is what the demand needs on this topology.
+    /// Scratch is refused: its backing (the shader-context storage the scratch words name) is not
+    /// planned. A command with no declaration at all is refused too: no declaration is not a
+    /// declaration of none.
     pub(crate) fn plan(&self, declared: Declared) -> Result<Resources> {
         if declared.programs == 0 {
             return Err(EINVAL);
         }
-        if declared.storage || declared.threads > NO_STORAGE_THREADS {
-            kernel::pr_warn_once!("G17 M5: compute storage outside the planned subset refused\n");
+        if declared.scratch {
+            kernel::pr_warn_once!("G17 M5: compute scratch storage refused (not planned yet)\n");
             return Err(EOPNOTSUPP);
         }
-        Ok(self.no_storage)
+        let demand = declared.demand;
+        if demand.primary_large > 0xff || demand.secondary_large > 0xf || demand.shared_large > 3 {
+            return Err(EINVAL);
+        }
+        let pool_blocks: usize = self.topology.pool_blocks(&demand).try_into()?;
+        if pool_blocks > self.pool_blocks {
+            return Err(EINVAL);
+        }
+        let target = u32::try_from(demand.pressure / u64::from(ACTIVE_KICKS))
+            .unwrap_or(u32::MAX)
+            .clamp(*PTC_TARGET.start(), *PTC_TARGET.end());
+        Ok(Resources {
+            control: 0x14b
+                | demand.primary_large << 10
+                | demand.secondary_large << 18
+                | demand.shared_large << 22,
+            policy: u64::from(target) << 32 | RESOURCE_POLICY,
+            pool_blocks,
+        })
     }
 }
 

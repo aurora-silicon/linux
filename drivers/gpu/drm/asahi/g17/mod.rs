@@ -876,7 +876,7 @@ struct Shared {
     variant: &'static fw::Variant,
     /// The M5 descriptor profile ([`Config::m5`]): DRM compute runs on M5 channels
     /// ([`queue::m5`]) where it is present.
-    m5: Option<&'static fw::m5::compute::Profile>,
+    m5: Option<fw::m5::compute::Gpu>,
     /// Layout of compute queues' operand-state buffers for this GPU's cores.
     operand_state: &'static fw::compute::OperandState,
     /// Layout of renders' deflake buffers for this GPU's cores.
@@ -1260,6 +1260,13 @@ impl Gpu {
                 return Err(ENODEV);
             }
         }
+        let m5 = cfg
+            .m5
+            .map(|board| fw::m5::compute::Gpu::new(&board.compute, &id.core_masks))
+            .transpose()?;
+        if let Some(gpu) = &m5 {
+            dev_info!(dev.as_ref(), "M5 compute: {} pool blocks per queue\n", gpu.pool_blocks);
+        }
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),
@@ -1267,7 +1274,7 @@ impl Gpu {
                 clusters: id.num_clusters,
                 active_cores,
                 variant,
-                m5: cfg.m5.map(|board| &board.compute),
+                m5,
                 operand_state: &cfg.core_layout.operand_state,
                 deflake: cfg.core_layout.deflake,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
