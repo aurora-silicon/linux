@@ -396,12 +396,21 @@ static void ane_fw_refused(void *ctx, u64 word0, u64 word1, u64 word2, int error
 		 word0, word1, word2, error);
 }
 
+static void ane_fw_cold_shared_note(void *ctx, const char *event, u64 dva, u64 size, u32 tag)
+{
+	struct ane_fw_backend *b = ctx;
+
+	dev_info(&b->pdev->dev, "SHAREDMALLOC %s tag=%#x bytes=%llu dva=%#llx\n",
+		 event, tag, size, dva);
+}
+
 static const struct ane_fw_transport_ops ane_fw_ops = {
 	.load64 = ane_fw_load64, .store64 = ane_fw_store64,
 	.read_barrier = ane_fw_rmb, .write_barrier = ane_fw_wmb,
 	.read32 = ane_fw_read32, .write32 = ane_fw_write32,
 	.now_ns = ane_fw_now, .relax = ane_fw_relax,
 	.alloc = ane_fw_alloc, .refused = ane_fw_refused,
+	.shared_note = ane_fw_cold_shared_note,
 };
 
 /*

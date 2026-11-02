@@ -376,6 +376,8 @@ static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 	    ane_fw_transport_arm(&f->t) ||
 	    ane_h16_session_init(&f->s, &f->t, &fw_session_ops, f, 1000))
 		return NULL;
+	/* The fake clock moves 10 ns per poll; keep the post-UNLOAD settle short. */
+	f->s.settle_ns = 100;
 	return f;
 }
 
@@ -1687,7 +1689,94 @@ static void program_cached_sync_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&g->s, q), 0);
 }
 
+/*
+ * Fifty programs loaded, run and closed one after another (each close is
+ * what the last close of the accel file does) map memory only for the
+ * first: every later LOAD is served from the spares the previous program
+ * gave back, zeroed, and each closed program is freed.
+ */
+static void program_cycle_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p;
+	unsigned int i, maps = 0, spares = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (i = 0; i < 50; i++) {
+		p = NULL;
+		KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+		KUNIT_ASSERT_NOT_NULL(test, p);
+		if (!i)
+			maps = f->maps;
+		/* Reused memory comes back zeroed before LOAD fills it. */
+		KUNIT_EXPECT_FALSE(test, memchr_inv(p->surfaces[1]->cpu, 0,
+						    p->surfaces[1]->size));
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+		memset(p->surfaces[1]->cpu, 0x5a, p->surfaces[1]->size);
+		KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+		if (!i)
+			spares = f->s.spare_count;
+		ane_h16_session_put(&f->s, p);
+	}
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, spares);
+	KUNIT_EXPECT_GT(test, spares, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, f->s.program, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/* The same for H17 MobileNet, with its kernel-owned scratch. */
+static void program_h17_cycle_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create_family(test, 17);
+	struct ane_h16_hwx_snapshot *snapshot;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	struct ane_h16_program *p;
+	unsigned int i, maps = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	mobilenet_sections(test, aux, aux_size);
+	for (i = 0; i < 50; i++) {
+		snapshot = mobilenet_snapshot(test);
+		KUNIT_ASSERT_NOT_NULL(test, snapshot);
+		p = NULL;
+		KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+		if (!i)
+			maps = f->maps;
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+		/* Every program's first request is queued, reused memory or not. */
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30),
+				ANE_H16_EXECUTE_FLAG_QUEUED);
+		KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+		ane_h16_session_put(&f->s, p);
+	}
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/* A program whose teardown failed keeps its memory and is never freed. */
+static void program_failed_close_keeps_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->s.quarantined = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EIO);
+	KUNIT_EXPECT_FALSE(test, p->released);
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, 0U);
+	ane_h16_session_put(&f->s, p);
+	/* Still there: put refused a program that was not released. */
+	KUNIT_EXPECT_TRUE(test, p->closed);
+	KUNIT_EXPECT_NOT_NULL(test, p->surfaces[0]);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_cycle_test),
+	KUNIT_CASE(program_h17_cycle_test),
+	KUNIT_CASE(program_failed_close_keeps_test),
 	KUNIT_CASE(program_cached_sync_test),
 	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),

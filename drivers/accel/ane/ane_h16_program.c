@@ -483,6 +483,7 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	s->ctx = ctx;
 	s->timeout_ns = timeout_ns;
 	s->dsid = ANE_H16_MCACHE_DSID;
+	s->settle_ns = ANE_H16_SETTLE_QUIET_NS;
 	spin_lock_init(&s->stats_lock);
 	return 0;
 }
@@ -567,10 +568,39 @@ void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_sync);
 
+static bool h16_take_spare(struct ane_h16_session *s, size_t size, bool write,
+			   struct ane_fw_surface *out)
+{
+	unsigned int i;
+
+	for (i = 0; i < s->spare_count; i++) {
+		if (s->spares[i].surface.size != size || s->spares[i].write != write)
+			continue;
+		*out = s->spares[i].surface;
+		s->spares[i] = s->spares[--s->spare_count];
+		/* Zeroed like new memory; LOAD writes it back after filling it. */
+		memset(out->cpu, 0, size);
+		return true;
+	}
+	return false;
+}
+
+static void h16_give_spare(struct ane_h16_session *s, struct ane_fw_surface *surface,
+			   bool write)
+{
+	/* A full table keeps the surface mapped and unused until reset. */
+	if (surface->cpu && s->spare_count < ANE_H16_SPARES)
+		s->spares[s->spare_count++] = (struct ane_h16_spare) {
+			.surface = *surface,
+			.write = write,
+		};
+	memset(surface, 0, sizeof(*surface));
+}
+
 static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 		   struct ane_fw_surface *out)
 {
-	int ret = s->ops->map(s->ctx, size, write, out);
+	int ret = h16_take_spare(s, size, write, out) ? 0 : s->ops->map(s->ctx, size, write, out);
 
 	if (ret)
 		return ret;
@@ -1239,6 +1269,7 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	u8 command[ANE_H16_TERMINATE_SIZE];
 	const u8 *reply;
+	unsigned int i;
 	int ret;
 
 	if (!s || !p || p->session != s)
@@ -1263,9 +1294,39 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 	if (ret)
 		return h16_fail(s, ret);
 	s->ops->log(s->ctx, "TERMINATE and UNLOAD", p->key.program, p->key.process);
+	/* Answer the FREE of the process pool while the firmware waits for it. */
+	ret = ane_fw_transport_settle(s->transport, s->settle_ns,
+				      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
+	if (ret < 0)
+		return h16_fail(s, ret);
+	/*
+	 * The firmware acknowledged TERMINATE and UNLOAD, so it no longer
+	 * reads or writes this program's memory: later programs may reuse it.
+	 */
+	for (i = 0; i < p->plan.count; i++)
+		h16_give_spare(s, &p->regions[i], p->plan.regions[i].permissions & 2);
+	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
+		h16_give_spare(s, &p->aux[i], false);
+	memset(p->surfaces, 0, sizeof(p->surfaces));
+	p->released = true;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_close);
+
+/*
+ * The caller's last reference: free a closed program and its HWX snapshot.
+ * A program whose teardown failed keeps everything until reset.
+ */
+void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	if (!s || !p || p->session != s || !p->released)
+		return;
+	if (s->program == p)
+		s->program = NULL;
+	ane_h16_hwx_snapshot_destroy(&p->snapshot);
+	kfree(p);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_put);
 
 MODULE_DESCRIPTION("H16 program load, execute and teardown on the shared transport");
 MODULE_LICENSE("Dual MIT/GPL");
