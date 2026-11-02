@@ -124,6 +124,8 @@ struct ane_fw_transport {
 	size_t shared_bytes;
 	u32 shared_count;
 	int error;
+	/* ane_fw_transport.h line that raised error, for diagnosis. */
+	unsigned int error_line;
 	/*
 	 * The second host-to-firmware command ring, at table position 2: the
 	 * firmware's mode commands (EXCLAVE_MODE_STOP) go there, outside the
@@ -158,12 +160,18 @@ ane_fw_surfaces_overlap(const struct ane_fw_surface *a, const struct ane_fw_surf
 	return a->dva < b->dva + b->size && b->dva < a->dva + a->size;
 }
 
-static inline int ane_fw_transport_fail(struct ane_fw_transport *t, int error)
+/* The first error is kept, with the line of this file that raised it. */
+static inline int __ane_fw_transport_fail(struct ane_fw_transport *t, int error,
+					  unsigned int line)
 {
-	if (!t->error)
+	if (!t->error) {
 		t->error = error;
+		t->error_line = line;
+	}
 	return t->error;
 }
+
+#define ane_fw_transport_fail(t, error) __ane_fw_transport_fail(t, error, __LINE__)
 
 /*
  * The command ring at table position 2 (macOS channel selector 2), when it

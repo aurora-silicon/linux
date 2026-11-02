@@ -29,6 +29,17 @@ static inline bool ane_fw_contains(u64 base, u64 bytes, u64 addr, u64 size)
 	       addr - base <= bytes - size;
 }
 
+/* The firmware's channel names, in the logical order of the driver. */
+static inline const char *ane_fw_channel_name(unsigned int ch)
+{
+	static const char * const names[ANE_FW_CHANNELS] = {
+		"TERMINAL", "IO", "DEBUG", "BUF_H2T", "BUF_T2H",
+		"SHAREDMALLOC", "IO_T2H", "DATA_CHAIN_H2T",
+	};
+
+	return ch < ANE_FW_CHANNELS ? names[ch] : "none";
+}
+
 /* Parse a host-owned descriptor snapshot; output indices are logical names. */
 static inline int
 ane_fw_channels_parse(const void *table, u64 ipc_dva, size_t ipc_size,

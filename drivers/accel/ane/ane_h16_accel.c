@@ -251,9 +251,19 @@ static void ane_h16_postclose(struct drm_device *drm, struct drm_file *file)
 
 	mutex_lock(&a->lock);
 	if (f->program) {
+		/* Quarantined before this close: nothing failed here. */
+		bool quarantined = a->session->quarantined;
+
 		ret = ane_h16_session_close(a->session, f->program);
-		/* -EINPROGRESS: deferred to the end of system sleep. */
-		if (ret && ret != -EINPROGRESS)
+		/*
+		 * -EINPROGRESS: deferred to the end of system sleep. -EIO on an
+		 * already quarantined session: no firmware traffic was tried, and
+		 * the program's memory stays mapped with every other mapping
+		 * until reboot, since the quarantined firmware may still read it.
+		 */
+		if (ret == -EIO && quarantined)
+			drm_dbg(drm, "program kept until reboot: engine quarantined\n");
+		else if (ret && ret != -EINPROGRESS)
 			drm_err(drm, "program teardown failed %d; session quarantined\n", ret);
 		else if (!ret)
 			ane_h16_session_put(a->session, f->program);
