@@ -300,6 +300,25 @@ impl InitData {
         Ok(())
     }
 
+    /// The descriptor row at `slot` as the firmware last left it ([`Self::install_m5_pb`]'s
+    /// row): the previous words an idle-host growth reloads, as Neo's growth reads its row
+    /// from the same table.
+    pub(in crate::g17) fn m5_pb_row(&self, slot: u8) -> Result<[u32; 4]> {
+        const ROW: usize = 16;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let object = self.object(self.pb)?;
+        let offset = usize::from(slot) * ROW;
+        object.pointer(offset, ROW)?;
+        fence(Ordering::Acquire);
+        let mut words = [0; 4];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = object.word(offset + index * 4)?.load(Ordering::Relaxed);
+        }
+        Ok(words)
+    }
+
     /// Logs the M5 firmware state a failed qualification leaves: the recovery report, the
     /// recovery words of status B, and each role's status A. Only nonzero words are logged.
     pub(in crate::g17) fn dump_m5_failure(&self, dev: &AsahiDrmDevice) {

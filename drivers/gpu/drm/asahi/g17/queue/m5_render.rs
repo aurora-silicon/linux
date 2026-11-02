@@ -218,14 +218,18 @@ impl ParkedPair {
     }
 }
 
-/// A growth request being served for one pair ([`Pair::begin_growth`]): what the worker
-/// allocates off the device mutex, and the pair it returns to.
+/// A growth of one pair's parameter buffer being served: a firmware request
+/// ([`Pair::begin_growth`]) or a pre-growth before a pass ([`Pair::pregrowth`]). What is
+/// allocated off the device mutex, and the pair and buffer it returns to.
 pub(crate) struct PairGrowth {
     pub(crate) owner: u64,
     pub(crate) vm: mmu::Vm,
     pub(crate) geometry: BlockGeometry,
     pub(crate) from: usize,
     pub(crate) target: usize,
+    /// The grown buffer's graph ([`buffer::Manager::state_va`]): a pre-growth commits only to
+    /// the binding it was planned for.
+    graph: u64,
 }
 
 /// A published pass, until its strict retirement.
@@ -801,7 +805,8 @@ impl Pair {
 
     /// The parameter buffer's descriptor row (S `reload_descriptor` over the page list).
     fn pb_row(&self) -> Result<[u32; 4]> {
-        let pages = u32::try_from(self.storage.manager.blocks() * 16)?;
+        let manager = &self.storage.manager;
+        let pages = u32::try_from(manager.blocks() * manager.geometry().pages())?;
         Ok(fw::buffer::reload_descriptor(
             [0; 4],
             self.storage.manager.page_list_va(),
@@ -1073,16 +1078,129 @@ impl Pair {
         if self.active.is_none() || self.growing || self.quarantine_error.is_some() {
             return Err(ENOENT);
         }
+        let target = self.storage.manager.firmware_target();
+        let growth = self.growth_to(target);
+        self.growing = true;
+        Ok(growth)
+    }
+
+    /// A growth of this binding's parameter buffer to `target` blocks.
+    fn growth_to(&self, target: usize) -> PairGrowth {
         let manager = &self.storage.manager;
-        let growth = PairGrowth {
+        PairGrowth {
             owner: self.owner,
             vm: self.context.vm().clone(),
             geometry: manager.geometry(),
             from: manager.blocks(),
-            target: manager.firmware_target(),
+            target,
+            graph: manager.state_va(),
+        }
+    }
+
+    /// Whether the pair is idle for a pre-growth: installed and healthy, no pass in flight or
+    /// growth being served, both lanes consumed to their producers (as [`Self::publish`]
+    /// requires of a pass).
+    fn idle(&self) -> Result<bool> {
+        if !self.installed
+            || self.quarantine_error.is_some()
+            || self.active.is_some()
+            || self.growing
+        {
+            return Ok(false);
+        }
+        for lane in &self.lanes {
+            if !lane.idle_at(lane.cursors()?.producer)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The pre-growth `pass` needs before its publication (S `host_growth_target`): the
+    /// parameter buffer grows to the pass layout's blocks and, from the binding's second pass
+    /// on, to the high-water feedback of the passes before it, when it holds less. A binding's
+    /// buffer is sized for its first pass, so a later, larger pass (more tiles or layers) needs
+    /// this. None when the buffer holds enough, or while the pair is not idle: publication then
+    /// waits for room. The caller allocates `target - from` blocks off the device mutex
+    /// (`buffer::Tvb::allocate_growth`) for [`Self::finish_pregrowth`].
+    pub(crate) fn pregrowth(&mut self, pass: &RenderPass) -> Result<Option<PairGrowth>> {
+        if !self.idle()? {
+            return Ok(None);
+        }
+        let required = target::Layout::new(pass, self.clusters, self.programs)?.tvb_blocks;
+        let manager = &mut self.storage.manager;
+        let feedback = if self.unbound {
+            0
+        } else {
+            manager.automatic_target()?.unwrap_or(0)
         };
-        self.growing = true;
-        Ok(growth)
+        let target = required.max(feedback);
+        if target <= manager.blocks() {
+            return Ok(None);
+        }
+        Ok(Some(self.growth_to(target)))
+    }
+
+    /// Ends [`Self::pregrowth`] under the device mutex. When the pair is still idle with the
+    /// same binding at `growth.from` blocks, it publishes `blocks` as an idle-host growth (S's
+    /// pre-growth, Neo's idle path): the block table, the page list rebuilt from the read
+    /// cursor, the buffer state and the cursors (`buffer::Manager::commit_growth` with the
+    /// binding's descriptor row), then the row reloaded for the new page count, before the pass
+    /// names it. The blocks' mappings join the binding's `aliases`. Returns whether the heap
+    /// grew; Ok(false) leaves everything unchanged. Whatever is not published stays in `blocks`
+    /// or `prepared`, for the caller to drop off the mutex.
+    pub(crate) fn finish_pregrowth(
+        &mut self,
+        init: &crate::g17::initdata::InitData,
+        growth: &PairGrowth,
+        blocks: &mut Option<buffer::TvbGrowth>,
+        prepared: &mut Option<buffer::PreparedGrowth>,
+    ) -> Result<bool> {
+        let manager = &self.storage.manager;
+        if blocks.is_none()
+            || growth.owner != self.owner
+            || growth.graph != manager.state_va()
+            || growth.from != manager.blocks()
+            || !self.idle()?
+        {
+            return Ok(false);
+        }
+        // Read (and so bounds-checked) before the heap changes: the reload cannot fail after.
+        let row = init.m5_pb_row(self.pb.0)?;
+        let row = self
+            .commit_blocks(growth, blocks, prepared, Some(row))?
+            .ok_or(EIO)?;
+        init.install_m5_pb(self.pb.0, row)?;
+        Ok(true)
+    }
+
+    /// Plans `blocks` into the heap and commits them (`buffer::Manager::accept_growth`, then
+    /// `commit_growth`), their mappings joining `aliases`: a firmware-request growth without
+    /// `descriptor`, an idle-host growth with it, whose reloaded row is returned.
+    fn commit_blocks(
+        &mut self,
+        growth: &PairGrowth,
+        blocks: &mut Option<buffer::TvbGrowth>,
+        prepared: &mut Option<buffer::PreparedGrowth>,
+        descriptor: Option<[u32; 4]>,
+    ) -> Result<Option<[u32; 4]>> {
+        self.aliases
+            .reserve(growth.target - growth.from, GFP_KERNEL)?;
+        let manager = &mut self.storage.manager;
+        *prepared = Some(manager.accept_growth(
+            self.context.vm(),
+            blocks,
+            growth.from,
+            growth.target,
+            descriptor,
+        )?);
+        let aliases = &mut self.aliases;
+        manager.commit_growth(prepared, |_, _, mappings| {
+            while let Some(mapping) = mappings.pop() {
+                aliases.push_within_capacity(mapping).map_err(|_| ENOMEM)?;
+            }
+            Ok(())
+        })
     }
 
     /// Ends [`Self::begin_growth`]. With `commit` (the request is still current) it publishes
@@ -1105,18 +1223,7 @@ impl Pair {
         if !commit || blocks.is_none() {
             return Ok(false);
         }
-        self.aliases
-            .reserve(growth.target - growth.from, GFP_KERNEL)?;
-        let manager = &mut self.storage.manager;
-        *prepared =
-            Some(manager.accept_growth(self.context.vm(), blocks, growth.from, growth.target)?);
-        let aliases = &mut self.aliases;
-        manager.commit_growth(prepared, |_, _, mappings| {
-            while let Some(mapping) = mappings.pop() {
-                aliases.push_within_capacity(mapping).map_err(|_| ENOMEM)?;
-            }
-            Ok(())
-        })?;
+        self.commit_blocks(growth, blocks, prepared, None)?;
         pr_info!(
             "G17 M5: render pair of queue {}: parameter buffer grew from {} to {} blocks\n",
             self.owner,
@@ -1160,11 +1267,12 @@ impl Pair {
             }
         }
         let layout = at!("layout", self.layout(draw.pass))?;
+        // The caller pre-grows the buffer for the pass under the same hold of the device mutex
+        // ([`Self::pregrowth`]): a pass larger than the buffer is never published.
         if layout.tvb_blocks > self.storage.manager.blocks() {
-            kernel::pr_warn_once!(
-                "G17 M5: a render pass needs a larger parameter buffer (growth not planned yet)\n"
-            );
-            return Err(EOPNOTSUPP);
+            pr_warn!("G17 M5: render pass of {} blocks reached publication without its pre-growth ({} blocks)\n",
+                layout.tvb_blocks, self.storage.manager.blocks());
+            return Err(EINVAL);
         }
         let priority = self.context.policy().priority();
         let claims = [
@@ -1179,7 +1287,8 @@ impl Pair {
         let qids = self.qids();
         // The pass's storage: target records, tiling state, scene.
         let storage = &mut self.storage;
-        // The target fits each pass, as on the other render queues; the pair's PB does not grow.
+        // The target fits each pass, as on the other render queues; the parameter buffer was
+        // grown for it before publication ([`Self::pregrowth`]).
         let owners = storage.target.owners();
         at!(
             "target capacity",

@@ -1253,8 +1253,17 @@ impl Backend {
         packet.completion.attach_render_lease(render_lease)?;
         let admission = Admission::new(deadline, &check);
         let progress = &self.shared.progress;
+        // A pre-growth allocated off the device mutex ([`Pair::pregrowth`]), with the recovery
+        // generation it was planned in, for the next hold to commit.
+        let mut pregrowth: Option<(PairGrowth, u64, Option<crate::g17::buffer::TvbGrowth>)> = None;
         loop {
             admission.check()?;
+            // What a pre-growth leaves unpublished, dropped after the device mutex (declared
+            // before its guard).
+            let mut spare: (
+                Option<crate::g17::buffer::TvbGrowth>,
+                Option<crate::g17::buffer::PreparedGrowth>,
+            ) = (None, None);
             let observed = progress.observe();
             let retry = |lease| -> Result {
                 drop(lease);
@@ -1313,6 +1322,39 @@ impl Backend {
                     }
                     result => result?,
                 }
+            }
+            // The pass's parameter buffer, grown first when the binding's (sized for its first
+            // pass) holds less than the pass needs (S's pre-growth): the blocks are allocated off
+            // the device mutex, then committed under it while the pair is still idle with that
+            // binding, in a recovery generation unchanged since the plan.
+            if let Some((growth, epoch, blocks)) = pregrowth.take() {
+                spare.0 = blocks;
+                if epoch == firmware.recovery.generation() {
+                    let init = &firmware.init;
+                    let pair = firmware.queues.m5_pair(self.owner).ok_or(EIO)?;
+                    if pair.finish_pregrowth(init, &growth, &mut spare.0, &mut spare.1)
+                        .inspect_err(|error| pr_warn!("G17 M5: render pair of queue {}: parameter buffer pre-growth from {} to {} blocks refused: {:?}\n",
+                            self.owner, growth.from, growth.target, error))?
+                    {
+                        pr_info!("G17 M5: render pair of queue {}: parameter buffer pre-grew from {} to {} blocks for a {}x{}x{} pass\n",
+                            self.owner, growth.from, growth.target, pass.width, pass.height, pass.layers);
+                    }
+                }
+            }
+            if let Some(growth) = firmware
+                .queues
+                .m5_pair(self.owner)
+                .ok_or(EIO)?
+                .pregrowth(pass)?
+            {
+                let epoch = firmware.recovery.generation();
+                drop(state);
+                let blocks = crate::g17::buffer::Tvb::allocate_growth(&dev, &growth.vm, growth.geometry,
+                    growth.from, growth.target)
+                    .inspect_err(|error| pr_warn!("G17 M5: render pair of queue {}: parameter buffer pre-growth from {} to {} blocks failed: {:?}\n",
+                        self.owner, growth.from, growth.target, error))?;
+                pregrowth = Some((growth, epoch, blocks));
+                continue;
             }
             match firmware.publish_m5_render(&dev, self.owner, packet, &draw) {
                 Err(error) if error == EAGAIN && !packet.is_published() => {

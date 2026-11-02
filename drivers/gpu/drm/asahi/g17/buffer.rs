@@ -1010,15 +1010,17 @@ impl Manager {
     }
 
     /// M5: adds `growth`, allocated off the device mutex for a heap of `from` blocks
-    /// ([`Tvb::allocate_growth`]), as a firmware-request growth to `target`. The heap must
-    /// still hold `from` blocks. `growth` is taken only once the plan is complete, so a refused
-    /// one stays with the caller, to be dropped off the mutex.
+    /// ([`Tvb::allocate_growth`]), to `target`: a firmware-request growth without `descriptor`,
+    /// an idle-host growth with the buffer's descriptor row (as [`Self::prepare_growth`]). The
+    /// heap must still hold `from` blocks. `growth` is taken only once the plan is complete, so
+    /// a refused one stays with the caller, to be dropped off the mutex.
     pub(crate) fn accept_growth(
         &mut self,
         vm: &mmu::Vm,
         growth: &mut Option<TvbGrowth>,
         from: usize,
         target: usize,
+        descriptor: Option<[u32; 4]>,
     ) -> Result<PreparedGrowth> {
         let added = growth.as_ref().ok_or(EINVAL)?.addresses.len();
         if self.blocks() != from || target.checked_sub(from) != Some(added) {
@@ -1026,7 +1028,7 @@ impl Manager {
         }
         self.validate_vm(vm)?;
         self.tvb.reserve_growth(added)?;
-        self.plan_growth(from, target, growth, None)
+        self.plan_growth(from, target, growth, descriptor)
     }
 
     /// The words a growth of `previous` blocks to `target` writes, with `growth`'s blocks. It
