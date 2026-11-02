@@ -47,6 +47,7 @@ mod initdata;
 mod job;
 mod capacity;
 mod kick;
+mod m5_render_test;
 mod m5_test;
 mod m5_test_program;
 pub(crate) mod m5_vm;
@@ -662,6 +663,8 @@ struct Firmware {
     /// M5: the scene metrics every parameter buffer leases an entry of
     /// ([`buffer::MetricsIds`]), in the firmware's upper space; clients alias it.
     m5_metrics: Option<Arc<KernelObject>>,
+    /// The M5 render-pair qualification's pair, retained with the session it ran in.
+    m5_render: Option<KBox<m5_render_test::Render>>,
     uat: Arc<mmu::Uat>,
 }
 
@@ -1503,6 +1506,7 @@ impl Gpu {
                 _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
                 m5_compute: None,
                 m5_metrics: None,
+                m5_render: None,
                 uat,
             }),
             GFP_KERNEL,
@@ -1630,6 +1634,12 @@ impl Gpu {
             // Retain the graph before propagating any failure: firmware may still read it.
             let result = test.run(dev, session);
             session.m5_compute = Some(test);
+            result?;
+        }
+        if crate::module_parameters::m5_render_test.value() != 0 {
+            // Retained before propagating any failure: firmware may still read the pair.
+            let (test, result) = m5_render_test::Render::run(dev, session, shared);
+            session.m5_render = test;
             result?;
         }
         Ok(())
