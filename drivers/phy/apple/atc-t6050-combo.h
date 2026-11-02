@@ -94,6 +94,8 @@ static int combo_stop(struct t6050_dp *dp)
 		if (!ret)
 			dp->usb2_active = false;
 	}
+	if (!ret && dp->ndomains > 3)
+		ret = atc_domain_set(&dp->domain[3], false);
 	if (!ret)
 		ret = atc_domain_set(&dp->domain[1], false);
 	if (!ret)
@@ -118,6 +120,12 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 	ret = atc_domain_set(&dp->domain[0], true);
 	if (!ret)
 		ret = atc_domain_set(&dp->domain[1], true);
+	/*
+	 * The USB2 PHY and digital banks are unclocked without the USB domain,
+	 * which a USB controller holds only while one is bound to this port.
+	 */
+	if (!ret && dp->ndomains > 3)
+		ret = atc_domain_set(&dp->domain[3], true);
 	if (!ret)
 		ret = APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_usb2_host);
 	if (!ret)
