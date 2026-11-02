@@ -1520,6 +1520,10 @@ pub(crate) struct M5Board {
     pub(crate) compute: super::compute::Profile,
     /// The board's GPU power model and power-policy controller values.
     pub(crate) power: M5BoardPower,
+    /// The host counts its submissions in the firmware's idle-prediction bins
+    /// ([`crate::g17::activity`]). Measured on the M5 Ultra (J775D) only: another M5 board sets
+    /// it once its firmware is shown to read the same counters.
+    pub(crate) activity_counters: bool,
 }
 
 /// The board's GPU power model and the policy controller values that depend on the board. The

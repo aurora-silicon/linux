@@ -81,6 +81,9 @@ pub(super) struct Views {
     pub(super) qos: *mut u8,
     pub(super) recovery: *const AtomicU32,
     pub(super) mailbox: *const super::Mailbox,
+    /// The submission-activity counters of the firmware's idle prediction, on a board that sets
+    /// `M5Board::activity_counters` (the M5 Ultra); `None` elsewhere.
+    pub(super) activity: Option<super::activity::Activity>,
 }
 
 // SAFETY: The views only name memory and a mailbox owned by the firmware session, which outlives
@@ -203,6 +206,19 @@ impl Port {
         self.views.as_ref().ok_or(ENODEV)
     }
 
+    /// Counts one submission for the firmware's idle prediction ([`super::activity`]) before it
+    /// is published, in the firmware's 24 MHz time base. Graphs without the counters, and a
+    /// clock that cannot be converted, leave it uncounted.
+    fn count_activity(&self) {
+        let Some(activity) = self.views().ok().and_then(|views| views.activity.as_ref()) else {
+            return;
+        };
+        let (counter, frequency) = super::qos::clock();
+        if let Ok(now) = super::qos::time_from_host(counter, frequency) {
+            activity.record(now);
+        }
+    }
+
     fn ring(&self, priority: u8) -> Result<(usize, RingView)> {
         let index = usize::from(priority);
         Ok((index, *self.views()?.compute.get(index).ok_or(EINVAL)?))
@@ -275,6 +291,7 @@ impl Port {
         submission: Option<&super::fw::m5::queue::HardwareSubmission>,
     ) -> Result<u32> {
         let message = super::fw::channels::work_notification(claim.priority.try_into()?, DataMaster::Compute);
+        self.count_activity();
         let next = self.publish_compute(claim, record)?;
         self.notify(message)?;
         if let Some(submission) = submission {
@@ -301,6 +318,10 @@ impl Port {
             || records.iter().any(|record| record.data_master != DataMaster::Compute as u32)
         {
             return Err(EINVAL);
+        }
+        // The pair is two submissions, fragment and tiling.
+        for _ in records {
+            self.count_activity();
         }
         let ring = self.views()?.compute[priority];
         let mut reserved = self.rings.lock();

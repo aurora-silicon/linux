@@ -701,9 +701,12 @@ impl InitData {
     /// Raw views of the memory publishers share without the device mutex: every work ring,
     /// the completion stamps, the QoS table and the recovery state word. They stay valid for
     /// this session.
+    /// `activity_counters`: the board's firmware reads the host's submission counters
+    /// ([`super::activity`]); only the M5 layout has them.
     pub(super) fn port_views(
         &self,
         mailbox: *const super::Mailbox,
+        activity_counters: bool,
     ) -> Result<super::port::Views> {
         use super::fw::{channels, queue::{DataMaster, Policy}};
         let ring_of = |priority: u8, engine: DataMaster| -> Result<super::port::RingView> {
@@ -750,6 +753,15 @@ impl InitData {
                 false => abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_STATE,
             })?,
             mailbox,
+            activity: match self.m5 && activity_counters {
+                true => {
+                    let (start, length) = super::activity::SPAN;
+                    let offset = super::fw::m5::initdata::M5_PRIVATE_LAYOUT.status_config + start;
+                    let view = self.object(self.cluster)?.pointer(offset, length)?;
+                    Some(super::activity::Activity::new(view)?)
+                }
+                false => None,
+            },
         })
     }
 

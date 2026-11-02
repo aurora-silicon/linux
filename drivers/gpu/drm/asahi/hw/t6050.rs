@@ -331,4 +331,7 @@ pub(crate) const M5_BOARD: M5Board = M5Board {
             ),
         ],
     },
+    // Measured: without the counters the firmware powers the GPU off between back-to-back
+    // submissions (see `g17::activity`).
+    activity_counters: true,
 };

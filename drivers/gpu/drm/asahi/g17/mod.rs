@@ -21,6 +21,7 @@
 //! nests inside nothing. Capacity waits block on an availability domain signalled by the
 //! release that provides the capacity, never on a sleep.
 
+mod activity;
 mod availability;
 mod buffer;
 mod calibration;
@@ -1570,7 +1571,7 @@ impl Gpu {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
         let mailbox: *const Mailbox = &*session.primary.rtkit;
-        session.port.attach(session.init.port_views(mailbox)?, session.bridge.regs.clone())?;
+        session.port.attach(session.init.port_views(mailbox, false)?, session.bridge.regs.clone())?;
         session.uat.mirror_secondary_root()?;
         if cfg.fabric_bridge {
             session.bridge.regs.enable_g17_gating()?;
@@ -1621,7 +1622,9 @@ impl Gpu {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
         let mailbox: *const Mailbox = &*session.primary.rtkit;
-        session.port.attach(session.init.port_views(mailbox)?, session.bridge.regs.clone())?;
+        let counters = cfg.m5.is_some_and(|board| board.activity_counters);
+        let views = session.init.port_views(mailbox, counters)?;
+        session.port.attach(views, session.bridge.regs.clone())?;
         session.uat.mirror_secondary_root()?;
         session.bridge.regs.prepare_m5_firmware()?;
         let ack = session.variant.init_ack;
