@@ -134,11 +134,125 @@ impl Dispatch {
     }
 }
 
-/// A grown pool's old backing and the client's old view of it ([`Channel::grow`]), dropped off
-/// the device mutex: the view first.
+/// A grown pool's old backing and the client's old view of it ([`grow_pool`]), dropped off the
+/// device mutex: the view first. With the blocks it held and holds now.
 pub(crate) struct Grown {
     _view: Option<mmu::KernelMapping>,
     _backing: Option<M5Backing>,
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+}
+
+/// One M5 queue's private pool as a growth sees it: a compute lane's ([`Channel::grow`]) or a
+/// render pair's (`m5_render::Pair::grow`), the pool's registration, and the binding's client
+/// views (in `vm`) and quarantine.
+pub(crate) struct PoolSite<'a> {
+    /// The QID whose page-pool slot the pool takes (a pair's tiling queue).
+    pub(crate) qid: u8,
+    pub(crate) pool: &'a mut M5Pool,
+    pub(crate) state: &'a mut PoolState,
+    pub(crate) vm: &'a mmu::Vm,
+    pub(crate) aliases: &'a mut KVec<mmu::KernelMapping>,
+    pub(crate) quarantine: &'a mut Option<Error>,
+}
+
+/// Whether a command whose plan needs `blocks` must back `pool` first ([`grow_pool`]): it is
+/// smaller, vacant, or being released.
+pub(crate) fn needs_pool(pool: &M5Pool, state: &PoolState, blocks: usize) -> bool {
+    state.phase() != PoolPhase::Populated || blocks > pool.blocks()
+}
+
+/// The one growth rule of an M5 private pool, a compute lane's or a render pair's: backs the
+/// pool for a command whose plan needs `blocks` (at most `maximum`, the inventory; at least
+/// `minimum`, a fresh pool's) before that command is published, through the release
+/// transaction of a Neo compute queue's growth (`queue::compute::Queue::begin_growth`,
+/// `finish_growth`). A kick queue whose private-memory pool changed is reconfigured at its next
+/// submission, and only while it is empty. So: EAGAIN until the queue is `idle`
+/// (asked only of a backed pool, with the pool to read its counts); then the pool's
+/// registration is released (FreeListRelease, announced through `notify`) and EAGAIN again until
+/// the firmware consumed it, the publication loop waiting on the event worker's progress, as
+/// Neo's growth does. Once the pool is vacant, fresh backing and its client view are built
+/// (ENOMEM refuses this command only; the pool stays vacant), installed with its page-pool row,
+/// and the next publication registers the pool with its configuration update, as an adopted
+/// queue's first does. A failure after the release quarantines the queue. Returns the old
+/// backing and view, which the caller drops off the device mutex.
+pub(crate) fn grow_pool(
+    alloc: &Allocator<'_>,
+    init: &InitData,
+    notify: impl FnOnce() -> Result,
+    site: PoolSite<'_>,
+    idle: impl FnOnce(&M5Pool) -> Result<bool>,
+    blocks: usize,
+    (minimum, maximum): (usize, usize),
+) -> Result<Option<Grown>> {
+    let PoolSite {
+        qid,
+        pool,
+        state,
+        vm,
+        aliases,
+        quarantine,
+    } = site;
+    if blocks > maximum {
+        return Err(EINVAL);
+    }
+    if !needs_pool(pool, state, blocks) {
+        return Ok(None);
+    }
+    if state.phase() == PoolPhase::Populated {
+        if !idle(pool)? {
+            return Err(EAGAIN);
+        }
+        if state.release(init, pool.release_record(1))? {
+            notify()?;
+            return Err(EAGAIN);
+        }
+    }
+    fence(Ordering::Acquire);
+    let consumer = init.control_consumer()?.load(Ordering::Relaxed);
+    let producer = init.control_producer()?.load(Ordering::Relaxed);
+    state.observe(consumer, producer)?;
+    if state.phase() != PoolPhase::Vacant {
+        return Err(EAGAIN);
+    }
+    let target = blocks.max(minimum);
+    let geometry =
+        fw::m5::pool::PoolGeometry::of(target, pool.block_bytes()).map_err(|_| EINVAL)?;
+    let no_memory = |error: Error| if error == EINVAL { error } else { ENOMEM };
+    let fresh = M5Backing::new(alloc, qid, geometry).map_err(no_memory)?;
+    let view = fresh.map_client(vm).map_err(no_memory)?;
+    aliases.reserve(1, GFP_KERNEL)?;
+    let old_va = pool.backing_va().ok();
+    let from = pool.blocks();
+    let result = (|| {
+        let old = pool.rearm(fresh)?;
+        init.install_m5_pool(pool.id(), pool.descriptor()?)?;
+        pool.publish_to_contexts()?;
+        view.publish_to_contexts();
+        Ok(old)
+    })();
+    let old = match result {
+        Ok(old) => old,
+        Err(error) => {
+            *quarantine = Some(error);
+            return Err(error);
+        }
+    };
+    let index = old_va.and_then(|va| aliases.iter().position(|alias| alias.iova() == va));
+    let old_view = match index {
+        Some(index) => Some(core::mem::replace(&mut aliases[index], view)),
+        None => {
+            aliases.push_within_capacity(view).map_err(|_| ENOMEM)?;
+            None
+        }
+    };
+    state.populate();
+    Ok(Some(Grown {
+        _view: old_view,
+        _backing: old,
+        from,
+        to: target,
+    }))
 }
 
 /// A kick in flight.
@@ -1552,22 +1666,14 @@ impl Channel {
     /// Whether a command whose plan needs `blocks` must back the pool first ([`Self::grow`]):
     /// it is smaller, vacant, or being released.
     pub(crate) fn needs_pool(&self, blocks: usize) -> bool {
-        self.pool_state.phase() != PoolPhase::Populated || blocks > self.pool.blocks()
+        needs_pool(&self.pool, &self.pool_state, blocks)
     }
 
     /// Backs the lane's pool for a command whose plan needs `blocks`, before that command is
-    /// published, through the release transaction of a Neo compute queue's growth
-    /// (`queue::compute::Queue::begin_growth`, `finish_growth`). A kick queue whose
-    /// private-memory pool changed is reconfigured at the submission, only on an empty queue
-    ///. So: EAGAIN until the lane is idle; then the pool's registration is
-    /// released (FreeListRelease, announced through `notify`) and EAGAIN again until the
-    /// firmware consumed it, the publication loop waiting on the event worker's progress, as
-    /// Neo's growth does. Once the pool is vacant, fresh backing for `blocks` (at least a fresh
-    /// pool's) and its client view are built (ENOMEM refuses this command only; the pool stays
-    /// vacant), installed with its page-pool row, and the next kick registers the pool with its
-    /// configuration update, as an adopted lane's first kick does. A failure after the release
-    /// quarantines the channel. Returns the old backing and view, which the caller drops off
-    /// the device mutex.
+    /// published ([`grow_pool`], the rule a render pair's pool shares): the lane is idle once no
+    /// kick is in flight or failed, the item ring is consumed to its producer, the pool's count
+    /// is complete and the stamp covers the lane's last kick. Returns the old backing and view,
+    /// which the caller drops off the device mutex.
     pub(crate) fn grow(
         &mut self,
         alloc: &Allocator<'_>,
@@ -1578,85 +1684,54 @@ impl Channel {
         if let Some(error) = self.quarantine_error {
             return Err(error);
         }
-        if !self.installed || self.closed || blocks > self.gpu.max_pool_blocks {
+        if !self.installed || self.closed {
             return Err(EINVAL);
         }
-        if !self.needs_pool(blocks) {
-            return Ok(None);
-        }
-        if self.pool_state.phase() == PoolPhase::Populated {
-            let next = self.lane.kick.timestamp();
-            if self.faulted
-                || !self.active.is_empty()
-                || !self.failed.is_empty()
-                || !self.lane.idle_at(self.lane.cursors()?.producer)?
-                || self.pool.completed_submissions()? != self.pool.submitted()?
+        let (lane, support, faulted) = (&self.lane, &self.support, self.faulted);
+        let (active, failed) = (&self.active, &self.failed);
+        let idle = |pool: &M5Pool| -> Result<bool> {
+            let next = lane.kick.timestamp();
+            // The queue's completion stamp ([`Self::stamp`]), read last, as the growth always did.
+            let stamp = || -> Result<u32> {
+                fence(Ordering::Acquire);
+                Ok(support.word(STAMPS)?.load(Ordering::Relaxed))
+            };
+            let busy = faulted
+                || !active.is_empty()
+                || !failed.is_empty()
+                || !lane.idle_at(lane.cursors()?.producer)?
+                || pool.completed_submissions()? != pool.submitted()?
                 || (next.get() != KickTimestamp::FIRST.get()
-                    && !retirement::stamp_covers(self.stamp()?, next.prev().get()))
-            {
-                return Err(EAGAIN);
-            }
-            if self
-                .pool_state
-                .release(host.init, self.pool.release_record(1))?
-            {
-                notify()?;
-                return Err(EAGAIN);
-            }
-        }
-        fence(Ordering::Acquire);
-        let consumer = host.init.control_consumer()?.load(Ordering::Relaxed);
-        let producer = host.init.control_producer()?.load(Ordering::Relaxed);
-        self.pool_state.observe(consumer, producer)?;
-        if self.pool_state.phase() != PoolPhase::Vacant {
-            return Err(EAGAIN);
-        }
-        let target = blocks.max(self.gpu.pool_blocks);
-        let geometry =
-            fw::m5::pool::PoolGeometry::of(target, self.gpu.block_bytes()).map_err(|_| EINVAL)?;
-        let no_memory = |error: Error| if error == EINVAL { error } else { ENOMEM };
-        let fresh = M5Backing::new(alloc, self.qid(), geometry).map_err(no_memory)?;
-        let view = fresh.map_client(self.context.vm()).map_err(no_memory)?;
-        self.aliases.reserve(1, GFP_KERNEL)?;
-        let old_va = self.pool.backing_va().ok();
-        let from = self.pool.blocks();
-        let result = (|| {
-            let old = self.pool.rearm(fresh)?;
-            host.init
-                .install_m5_pool(self.pool.id(), self.pool.descriptor()?)?;
-            self.pool.publish_to_contexts()?;
-            view.publish_to_contexts();
-            Ok(old)
-        })();
-        let old = match result {
-            Ok(old) => old,
-            Err(error) => {
-                self.quarantine_error = Some(error);
-                return Err(error);
-            }
+                    && !retirement::stamp_covers(stamp()?, next.prev().get()));
+            Ok(!busy)
         };
-        let index = old_va.and_then(|va| self.aliases.iter().position(|alias| alias.iova() == va));
-        let old_view = match index {
-            Some(index) => Some(core::mem::replace(&mut self.aliases[index], view)),
-            None => {
-                self.aliases
-                    .push_within_capacity(view)
-                    .map_err(|_| ENOMEM)?;
-                None
-            }
+        let site = PoolSite {
+            qid: lane.qid(),
+            pool: &mut self.pool,
+            state: &mut self.pool_state,
+            vm: self.context.vm(),
+            aliases: &mut self.aliases,
+            quarantine: &mut self.quarantine_error,
         };
-        self.pool_state.populate();
-        pr_info!(
-            "M5 lane {}: pool backed with {} blocks (from {}) for queue {}\n",
-            self.qid(),
-            target,
-            from,
-            self.owner
-        );
-        Ok(Some(Grown {
-            _view: old_view,
-            _backing: old,
-        }))
+        let grown = grow_pool(
+            alloc,
+            host.init,
+            notify,
+            site,
+            idle,
+            blocks,
+            (self.gpu.pool_blocks, self.gpu.max_pool_blocks),
+        )?;
+        if let Some(grown) = &grown {
+            pr_info!(
+                "M5 lane {}: pool backed with {} blocks (from {}) for queue {}\n",
+                self.qid(),
+                grown.to,
+                grown.from,
+                self.owner
+            );
+        }
+        Ok(grown)
     }
 
     /// A release of the pool is in flight (the event worker reports its consumption as

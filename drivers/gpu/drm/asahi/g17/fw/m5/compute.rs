@@ -391,9 +391,9 @@ impl Topology {
 }
 
 /// The board's descriptor profile on this GPU's topology: what M5 channels and command validation
-/// take. Each compute queue's pool starts covering every command without primary storage and
-/// grows to a command's plan before its publication (`queue::m5::Channel::grow`), up to the
-/// pool's whole inventory.
+/// take. Each compute queue's pool starts covering every command without primary storage, and
+/// each render pair's every pass without it; both grow to a command's plan before its
+/// publication (`queue::m5::grow_pool`), up to the pool's whole inventory.
 #[derive(Clone, Copy)]
 pub(crate) struct Gpu {
     pub(crate) profile: &'static Profile,
@@ -401,10 +401,11 @@ pub(crate) struct Gpu {
     /// A compute queue's pool when it is built: what every declaration without primary storage
     /// needs.
     pub(crate) pool_blocks: usize,
-    /// The largest pool a compute plan may need: the pool's address inventory
+    /// The largest pool a compute or render plan may need: the pool's address inventory
     /// ([`super::pool::inventory_blocks`]).
     pub(crate) max_pool_blocks: usize,
-    /// Likewise each render pair's pool, over the subset's tile storage.
+    /// A render pair's pool when it is built: what every pass of the subset's tile storage
+    /// without primary storage needs.
     pub(crate) render_pool_blocks: usize,
 }
 
@@ -448,6 +449,9 @@ impl Gpu {
                 render_blocks = render_blocks.max(topology.render(&[tile])?.pool_blocks);
             }
         }
+        if render_blocks > max_blocks {
+            return Err(EINVAL);
+        }
         Ok(Self {
             profile: &board.compute,
             topology,
@@ -457,20 +461,45 @@ impl Gpu {
         })
     }
 
-    /// The plan of a render pass whose linked programs declared `programs`, refused when it needs
-    /// more than a pair's pool.
+    /// The plan of a render pass whose linked programs declared `programs`. Primary storage
+    /// (the vertex and fragment programs' spills and private arrays) is part of the demand, as
+    /// for compute ([`Self::plan`]): the pair's pool grows to the plan before the pass
+    /// (`queue::m5_render::Pair::grow`). Refused only when the pool would need more blocks than
+    /// the inventory holds.
     pub(crate) fn plan_render(
         &self,
         programs: &[uapi::drm_asahi_render_program],
     ) -> Result<RenderPlan> {
+        use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
         let plan = self.topology.render(programs)?;
-        if plan.pool_blocks > self.render_pool_blocks {
-            pr_warn!(
-                "G17 M5: render pass needs {} pool blocks, a pair has {}\n",
-                plan.pool_blocks,
-                self.render_pool_blocks
-            );
+        let primary = |stage| {
+            programs
+                .iter()
+                .filter(|program| program.stage == stage)
+                .map(|program| program.primary_bytes)
+                .max()
+                .unwrap_or(0)
+        };
+        if plan.pool_blocks > self.max_pool_blocks {
+            static REFUSALS: AtomicU32 = AtomicU32::new(0);
+            if REFUSALS.fetch_add(1, Ordering::Relaxed) < 16 {
+                pr_warn!("G17 M5: render plan needs {} pool blocks (primary: vertex {} B/thread, fragment {} B/thread), the inventory holds {}\n",
+                    plan.pool_blocks, primary(0), primary(1), self.max_pool_blocks);
+            }
             return Err(EINVAL);
+        }
+        // Bring-up: plans with primary storage, each time the (vertex, fragment) primary shape
+        // changes, at most 64 lines.
+        static PRIMARY_LOGS: AtomicU32 = AtomicU32::new(0);
+        static PRIMARY_LAST: AtomicU64 = AtomicU64::new(0);
+        let shape = u64::from(primary(0)) << 32 | u64::from(primary(1));
+        if shape != 0
+            && PRIMARY_LAST.swap(shape, Ordering::Relaxed) != shape
+            && PRIMARY_LOGS.fetch_add(1, Ordering::Relaxed) < 64
+        {
+            pr_info!("G17 M5: render plan, primary vertex {} B/thread, fragment {} B/thread: controls {:#x}/{:#x}, {} pool blocks (fresh pair {}, at most {})\n",
+                primary(0), primary(1), plan.stages[0].resource_flags, plan.stages[1].resource_flags,
+                plan.pool_blocks, self.render_pool_blocks, self.max_pool_blocks);
         }
         Ok(plan)
     }

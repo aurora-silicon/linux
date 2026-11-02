@@ -80,6 +80,14 @@ pub(super) struct Lanes<'a> {
     pub(super) parked_pairs: &'a mut KVec<ParkedPair>,
 }
 
+/// What a render publication may grow its pair's pool with (`Firmware::publish_m5_render`): the
+/// allocator, the GPU's bounds and the slot for the old backing.
+type M5Growth<'a, 'b> = (
+    &'a Allocator<'b>,
+    &'a crate::g17::fw::m5::compute::Gpu,
+    &'a mut Option<crate::g17::queue::m5::Grown>,
+);
+
 /// How [`crate::g17::Firmware::bind_m5_channel`] bound a new logical queue.
 pub(super) enum M5Bind {
     /// A parked lane was adopted: the channel is bound and placed, with nothing to install.
@@ -1111,10 +1119,17 @@ impl crate::g17::Firmware {
         // buffer, target and tiling state.
         let class = context.policy().priority();
         let pairs = &self.queues.m5_parked_pairs;
-        let parked = pairs
-            .iter()
-            .position(|pair| pair.adoptable() && pair.class() == class)
-            .or_else(|| pairs.iter().position(|pair| pair.adoptable()));
+        // A pair whose pool is still backed before a vacated one (`Registry::vacate_idle_pools`),
+        // as for a lane (`Self::bind_m5_channel`).
+        let pick = |backed: bool, same: bool| {
+            pairs.iter().position(|pair| {
+                pair.adoptable() && (!backed || pair.backed()) && (!same || pair.class() == class)
+            })
+        };
+        let parked = pick(true, true)
+            .or_else(|| pick(true, false))
+            .or_else(|| pick(false, true))
+            .or_else(|| pick(false, false));
         if parked.is_none() && (!pairs.is_empty() || !self.fresh_lanes_allowed()) {
             // A parked pair still unmapping its previous binding is adoptable shortly; past the
             // quarantine cap no fresh pair is built.
@@ -1296,7 +1311,8 @@ impl crate::g17::Firmware {
                     },
                 ) => {
                     let draw = Draw { pass, plan: *plan };
-                    self.publish_m5_render(&dev, owner, &packet, &draw)
+                    // Its pool was grown for it before its first publication.
+                    self.publish_m5_render(&dev, owner, &packet, &draw, None)
                 }
                 (None, _) => Err(EINVAL),
             };
@@ -1329,13 +1345,18 @@ impl crate::g17::Firmware {
         Ok(())
     }
 
-    /// Publishes `packet`'s pass on `owner`'s pair. EAGAIN: the pair has no room yet.
+    /// Publishes `packet`'s pass on `owner`'s pair, its pool grown first when the pass's plan
+    /// needs more and `growth` allows it ([`Pair::grow`], the compute channel's rule; the old
+    /// backing lands in its slot, for the caller to drop off the device mutex). Without
+    /// `growth` a pass the pool is too small for is refused (EINVAL, `Pair::publish`). EAGAIN:
+    /// the pair has no room yet, or is not idle for a growth.
     fn publish_m5_render(
         &mut self,
         dev: &crate::driver::AsahiDrmDevice,
         owner: u64,
         packet: &Arc<Packet>,
         draw: &Draw<'_>,
+        growth: Option<M5Growth<'_, '_>>,
     ) -> Result {
         let work = packet.completion.work_state()?;
         let pair = self
@@ -1356,6 +1377,17 @@ impl crate::g17::Firmware {
             qids: &mut self.queues.qids,
             crashed: &self.primary.state.shared.crashed,
         };
+        if let Some((alloc, gpu, grown)) = growth.filter(|_| pair.needs_pool(draw.plan.pool_blocks))
+        {
+            let primary = &self.primary;
+            *grown = pair.grow(
+                alloc,
+                &mut host,
+                || primary.notify(crate::g17::MSG_CONTROL_NOTIFY),
+                gpu,
+                draw.plan.pool_blocks,
+            )?;
+        }
         let result = pair.publish(dev, &mut host, draw, &work, Some(packet.clone()));
         if packet.is_published() {
             self.note_submission()?;
@@ -1515,12 +1547,30 @@ impl Backend {
                 pregrowth = Some((growth, epoch, blocks));
                 continue;
             }
-            match firmware.publish_m5_render(&dev, self.owner, packet, &draw) {
+            let uat = firmware.uat.clone();
+            let alloc = Allocator {
+                dev: &dev,
+                uat: &uat,
+                layout: firmware.variant.vm_layout,
+            };
+            let mut grown = None;
+            let result = firmware.publish_m5_render(
+                &dev,
+                self.owner,
+                packet,
+                &draw,
+                Some((&alloc, &gpu, &mut grown)),
+            );
+            match result {
                 Err(error) if error == EAGAIN && !packet.is_published() => {
                     drop(state);
+                    drop(grown);
                     retry(lease)?;
                 }
                 result => {
+                    // The old backing goes off the device mutex, after its view.
+                    drop(state);
+                    drop(grown);
                     if let Err(error) = result {
                         pr_warn!(
                             "G17 M5: render pass of queue {} not published: {:?}\n",

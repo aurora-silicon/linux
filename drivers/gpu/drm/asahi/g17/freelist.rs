@@ -777,6 +777,10 @@ impl M5Pool {
     pub(crate) fn vacant(&self) -> bool {
         self.backing.is_none()
     }
+    /// Bytes of one block, whatever the backing: what a growth backs the pool in.
+    pub(crate) fn block_bytes(&self) -> usize {
+        self.layout.geometry.block_bytes()
+    }
     fn backing(&self) -> Result<&KernelObject> {
         self.backing.as_ref().ok_or(EAGAIN)
     }

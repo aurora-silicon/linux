@@ -5,7 +5,9 @@
 //! M5 render memory): the command storage of both stages, the stage stamps and usage records,
 //! the parameter buffer ([`buffer::Manager`] on the M5 block geometry), the target records and
 //! TPC ([`target::Target`] with M5 slices), the per-pass tiling state, and the pair's private
-//! pool ([`M5Pool`], [`pool::Engine::Render`]).
+//! pool ([`M5Pool`], [`pool::Engine::Render`]). The pool starts at what every pass without primary
+//! storage needs and grows before a pass whose plan needs more, by the compute lane's rule
+//! ([`super::m5::grow_pool`]); a parked pair's pool is vacated as a parked lane's is.
 //!
 //! Installation follows S: both pool and parameter-buffer rows, both configurations, both QIDs,
 //! then the pair's two outer records in one publication (fragment first) and the wait for both
@@ -19,12 +21,13 @@
 use super::{
     compute::retirement,
     compute::{awaits_witness, Failure},
-    m5::{Host, Lane},
+    m5::{Grown, Host, Lane, PoolSite},
+    pool_state::{PoolPhase, PoolState},
 };
 use crate::g17::{
     buffer::{self, target, BlockGeometry},
     context::{Context, WorkStateLease},
-    freelist::M5Pool,
+    freelist::{M5Backing, M5Pool},
     fw::{
         self,
         channels::TvbGrowRequest,
@@ -144,10 +147,12 @@ pub(crate) struct Pair {
     descriptors_low: u64,
     support: KernelObject,
     pool: M5Pool,
+    /// The pool as the firmware sees it, carried to the parked pair and the next binding, as a
+    /// compute lane's (`m5::Channel`).
+    pool_state: PoolState,
     /// The parameter buffer's ID and generation.
     pb: (u8, u64),
     pm_generation: u64,
-    pool_blocks: usize,
     /// What each pass's target layout is derived from.
     clusters: u32,
     programs: RegisterPrograms,
@@ -206,18 +211,64 @@ pub(crate) struct ParkedPair {
     descriptors_low: u64,
     support: KernelObject,
     pool: M5Pool,
-    pool_blocks: usize,
+    pool_state: PoolState,
     compact: [u64; 2],
     ordinal: u64,
     class: u8,
     pages: crate::g17::context::FirmwarePages,
     unmapped: super::m5::Unmapped,
+    /// When it parked: the vacate pass releases the least recently parked pools first.
+    parked_at: u64,
 }
 
 impl ParkedPair {
-    /// Its previous binding's client views are unmapped ([`super::m5::ParkedLane::adoptable`]).
+    /// Its previous binding's client views are unmapped, and no release of its pool is in
+    /// flight ([`super::m5::ParkedLane::adoptable`]).
     pub(crate) fn adoptable(&self) -> bool {
-        self.unmapped.done()
+        self.unmapped.done() && !self.pool_state.pending()
+    }
+    /// Its pool is backed and kept: an adoption needs no fresh backing.
+    pub(crate) fn backed(&self) -> bool {
+        self.pool_state.phase() == PoolPhase::Populated && !self.pool.vacant()
+    }
+    /// An idle pool the vacate pass may give back (`Registry::vacate_idle_pools`), as a parked
+    /// lane's (`super::m5::ParkedLane::vacate_candidate`).
+    pub(crate) fn vacate_candidate(&self) -> bool {
+        self.backed() && self.unmapped.done()
+    }
+    /// When the pair parked.
+    pub(crate) fn released_at(&self) -> u64 {
+        self.parked_at
+    }
+    /// Releases this parked pair's pool (the caller holds the device mutex and announces a
+    /// published record), as a parked lane's (`super::m5::ParkedLane::vacate`): the backing is
+    /// freed once the firmware consumed the release ([`Self::observe_vacancy`]); the lanes stay
+    /// installed, and the next binding's first pass backs the pool for its plan.
+    pub(crate) fn vacate(&mut self, init: &crate::g17::initdata::InitData) -> Result<bool> {
+        if !self.vacate_candidate() {
+            return Err(EBUSY);
+        }
+        // Generation 1, as every binding's configuration publishes it.
+        self.pool_state.release(init, self.pool.release_record(1))
+    }
+    /// The backing of a vacant pool no client maps any more, once the firmware consumed its
+    /// release; the caller frees it off the device mutex.
+    pub(crate) fn observe_vacancy(
+        &mut self,
+        consumer: u32,
+        producer: u32,
+    ) -> Result<Option<M5Backing>> {
+        self.pool_state.observe(consumer, producer)?;
+        if self.pool_state.phase() != PoolPhase::Vacant || !self.unmapped.done() {
+            return Ok(None);
+        }
+        Ok(self.pool.vacate())
+    }
+    pub(crate) fn pool_release_pending(&self) -> bool {
+        self.pool_state.pending()
+    }
+    pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
+        self.pool_state.stalled(now)
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
         [self.lanes[TILING].qid(), self.lanes[FRAGMENT].qid()]
@@ -315,7 +366,10 @@ impl Storage {
             descriptors.map_alias(vm, descriptors_low, mmu::PROT_GPU_SHARED_RW)?,
             GFP_KERNEL,
         )?;
-        aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
+        // A vacant pool is mapped when the binding's first pass backs it (`Pair::grow`).
+        if !pool.vacant() {
+            aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
+        }
         // Target and parameter buffer, both in the client's compact window.
         let layout = step(
             "layout",
@@ -453,11 +507,12 @@ impl Pair {
         )?;
         let descriptors_low = descriptors_lower.iova();
         let support = alloc.kernel(PAGE, PAGE as u64, prot, cpu)?;
-        // The pair's pool, at the tiling queue's pool ID, covers every pass the plan accepts.
-        let pool_blocks = args.gpu.render_pool_blocks;
+        // The pair's pool, at the tiling queue's pool ID, covers every pass without primary
+        // storage; a pass that needs more grows it first ([`Self::grow`]).
         let geometry = step(
             "pool geometry",
-            pool::PoolGeometry::of(pool_blocks, args.gpu.block_bytes()).map_err(|_| EINVAL),
+            pool::PoolGeometry::of(args.gpu.render_pool_blocks, args.gpu.block_bytes())
+                .map_err(|_| EINVAL),
         )?;
         let pool = step(
             "pool",
@@ -494,9 +549,9 @@ impl Pair {
                 descriptors_low,
                 support,
                 pool,
+                pool_state: PoolState::FRESH,
                 pb,
                 pm_generation,
-                pool_blocks,
                 clusters,
                 programs,
                 compact: [compact.start, compact.end],
@@ -534,6 +589,11 @@ impl Pair {
         let lane = parked.get_mut(index).ok_or(EINVAL)?;
         if !lane.adoptable() {
             return Err(EAGAIN);
+        }
+        // A vacant pool's leftover backing (no registration, no client view) goes: the binding's
+        // first pass backs the pool for its plan ([`Self::grow`]), as for an adopted lane.
+        if lane.pool_state.phase() == PoolPhase::Vacant {
+            drop(lane.pool.vacate());
         }
         let unmapped = super::m5::Unmapped::new()?;
         let mut aliases = KVec::with_capacity(16, GFP_KERNEL)?;
@@ -578,9 +638,9 @@ impl Pair {
                 descriptors_low: lane.descriptors_low,
                 support: lane.support,
                 pool: lane.pool,
+                pool_state: lane.pool_state,
                 pb,
                 pm_generation,
-                pool_blocks: lane.pool_blocks,
                 clusters,
                 programs,
                 compact: lane.compact,
@@ -624,25 +684,33 @@ impl Pair {
         if !self.installed || self.quarantine_error.is_some() || self.in_flight() || self.growing {
             return Ok(false);
         }
-        for lane in &self.lanes {
+        Self::drained(&self.lanes, &self.support, self.ordinal, &self.pool)
+    }
+
+    /// The firmware is done with every pass published on `lanes`: both lanes consumed to their
+    /// producers, `pool`'s count complete and both stage stamps at the last pass's (of
+    /// `ordinal` passes). What parking and a pool's growth wait for.
+    fn drained(
+        lanes: &[Lane; 2],
+        support: &KernelObject,
+        ordinal: u64,
+        pool: &M5Pool,
+    ) -> Result<bool> {
+        for lane in lanes {
             if !lane.idle_at(lane.cursors()?.producer)? {
                 return Ok(false);
             }
         }
-        if self.pool.completed_submissions()? != self.pool.submitted()? {
+        if pool.completed_submissions()? != pool.submitted()? {
             return Ok(false);
         }
-        if self.ordinal == 0 {
+        if ordinal == 0 {
             return Ok(true);
         }
         fence(Ordering::Acquire);
-        let stamp = stamp_of(self.ordinal - 1);
-        Ok(self.support.word(STAMPS)?.load(Ordering::Relaxed) == stamp
-            && self
-                .support
-                .word(STAMPS + STAGE_STRIDE)?
-                .load(Ordering::Relaxed)
-                == stamp)
+        let stamp = stamp_of(ordinal - 1);
+        Ok(support.word(STAMPS)?.load(Ordering::Relaxed) == stamp
+            && support.word(STAMPS + STAGE_STRIDE)?.load(Ordering::Relaxed) == stamp)
     }
 
     /// Logs the park witnesses ([`Self::parkable`]) one by one, for a stalled release.
@@ -695,7 +763,7 @@ impl Pair {
             descriptors_low,
             support,
             pool,
-            pool_blocks,
+            pool_state,
             compact,
             ordinal,
             class,
@@ -711,12 +779,13 @@ impl Pair {
                 descriptors_low,
                 support,
                 pool,
-                pool_blocks,
+                pool_state,
                 compact,
                 ordinal,
                 class,
                 pages,
                 unmapped: unmapped.clone(),
+                parked_at: crate::g17::now_ns(),
             },
             super::m5::Binding::render(aliases, storage, context, owner, unmapped),
         )
@@ -769,8 +838,9 @@ impl Pair {
     pub(crate) fn quarantined(&self) -> Option<Error> {
         self.quarantine_error
     }
+    /// The pool's backed blocks.
     pub(crate) fn pool_blocks(&self) -> usize {
-        self.pool_blocks
+        self.pool.blocks()
     }
     pub(crate) fn parameter_blocks(&self) -> usize {
         self.storage.manager.blocks()
@@ -1057,6 +1127,75 @@ impl Pair {
     pub(crate) fn has_room(&self) -> bool {
         !self.in_flight()
     }
+
+    /// Whether a pass whose plan needs `blocks` must back the pool first ([`Self::grow`]).
+    pub(crate) fn needs_pool(&self, blocks: usize) -> bool {
+        super::m5::needs_pool(&self.pool, &self.pool_state, blocks)
+    }
+
+    /// Backs the pair's pool for a pass whose plan needs `blocks` (spills and private arrays of
+    /// its vertex and fragment programs), before that pass is published, by the compute lane's
+    /// rule ([`super::m5::grow_pool`]): between `gpu`'s fresh render pool and the inventory, once
+    /// the pair is idle as it is to park ([`Self::drained`]: both lanes consumed, the pool's
+    /// count complete, both stage stamps at the last pass's). Both stages name the pool, and the
+    /// next pass binds the new backing with both configurations ([`Self::publish`]). Returns the
+    /// old backing and view, which the caller drops off the device mutex.
+    pub(crate) fn grow(
+        &mut self,
+        alloc: &Allocator<'_>,
+        host: &mut Host<'_>,
+        notify: impl FnOnce() -> Result,
+        gpu: &Gpu,
+        blocks: usize,
+    ) -> Result<Option<Grown>> {
+        if let Some(error) = self.quarantine_error {
+            return Err(error);
+        }
+        if !self.installed {
+            return Err(EINVAL);
+        }
+        if self.in_flight() || self.growing {
+            return Err(EAGAIN);
+        }
+        let (lanes, support, ordinal) = (&self.lanes, &self.support, self.ordinal);
+        let idle = |pool: &M5Pool| Self::drained(lanes, support, ordinal, pool);
+        let site = PoolSite {
+            qid: lanes[TILING].qid(),
+            pool: &mut self.pool,
+            state: &mut self.pool_state,
+            vm: self.context.vm(),
+            aliases: &mut self.aliases,
+            quarantine: &mut self.quarantine_error,
+        };
+        let grown = super::m5::grow_pool(
+            alloc,
+            host.init,
+            notify,
+            site,
+            idle,
+            blocks,
+            (gpu.render_pool_blocks, gpu.max_pool_blocks),
+        )?;
+        if let Some(grown) = &grown {
+            pr_info!(
+                "G17 M5: render pair {:?}: pool backed with {} blocks (from {}) for queue {}\n",
+                self.qids(),
+                grown.to,
+                grown.from,
+                self.owner
+            );
+        }
+        Ok(grown)
+    }
+
+    /// A release of the pool is in flight (the event worker reports its consumption as
+    /// progress).
+    pub(crate) fn pool_release_pending(&self) -> bool {
+        self.pool_state.pending()
+    }
+    pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
+        self.pool_state.stalled(now)
+    }
     /// The event worker polls this pair's retirement: a healthy pass in flight, or one awaiting
     /// its replay. A quarantined pair's pass is not in flight, as a quarantined Neo queue's
     /// commands are not (`Queue::in_flight`): each event pass checks its drain ([`Self::retire`])
@@ -1261,12 +1400,16 @@ impl Pair {
         if self.active.is_some() {
             return Err(EAGAIN);
         }
-        if draw.plan.pool_blocks > self.pool_blocks {
+        // A pass that needs a larger pool, or a pool at all, backs it first ([`Self::grow`]).
+        if self.needs_pool(draw.plan.pool_blocks) {
             return Err(EINVAL);
         }
         // The binding's first pass, not the lanes': it binds this owner's parameter buffer,
         // pool and context.
         let first = self.unbound;
+        // A later pass after a growth rebinds the grown pool with the same configurations, its
+        // completion value continuing, as a compute lane's next kick does (`m5::Channel::publish`).
+        let bind = first || !self.pool_state.registered();
         for lane in &self.lanes {
             let cursors = lane.cursors()?;
             if !lane.idle_at(cursors.producer)? {
@@ -1434,7 +1577,7 @@ impl Pair {
             assembly::link_completions(commands, timestamps, payload, false)
         )?;
         // Configurations, kicks and items, still invisible.
-        let configs = match first {
+        let configs = match bind {
             true => [
                 Some(self.bound_config(TILING, payload)?),
                 Some(self.bound_config(FRAGMENT, payload)?),
@@ -1526,6 +1669,7 @@ impl Pair {
         for kick in prepared {
             kick.commit();
         }
+        self.pool_state.register();
         at!(
             "claim scene",
             self.storage.manager.claim_scene(ordinal, scene)
