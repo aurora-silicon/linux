@@ -414,6 +414,8 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
+	u32 afk_power_gen;
 	bool external;
 	/*
 	 * T8122 dcpext: the panel's DRM device never waits on this processor.
