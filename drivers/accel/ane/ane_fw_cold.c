@@ -1026,8 +1026,10 @@ static void ane_fw_write32(void *ctx, u32 reg, u32 value)
 	struct ane_fw_backend *b = ctx;
 
 	ane_wr32(b, value, b->engine + reg);
-	if (reg == b->soc->irq_ack)
+	if (reg == b->soc->irq_ack) {
+		/* Complete the snapshot acknowledgment before coherent ring reads. */
 		mb();
+	}
 }
 
 static u64 ane_fw_now(void *ctx)
