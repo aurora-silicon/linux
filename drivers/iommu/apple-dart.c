@@ -4726,9 +4726,15 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	dart->tunnel_state_restored = false;
 	if (READ_ONCE(dart->commands_gated))
 		return 0;
+	/*
+	 * The cold ANE DARTs belong to the ANE backend, which refuses system
+	 * sleep up front while it runs the firmware. Otherwise they hold
+	 * nothing to keep: neither save nor reset them.
+	 */
+	if (dart->cold_ane)
+		return 0;
 	/* Neither retained radio nor display has a qualified suspend boundary. */
-	if (dart->managed_sids || dart->cold_ane || dart->preserve_display ||
-	    apple_dart_has_borrowed(dart))
+	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
 		return -EBUSY;
 	/* The tunneled DART has no state to save when its domain stays on. */
 	if (dart->power_retained || dart->retained_mtp)
@@ -4816,8 +4822,10 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
-	if (dart->managed_sids || dart->cold_ane || dart->preserve_display ||
-	    apple_dart_has_borrowed(dart))
+	/* No reset or restore: see apple_dart_suspend(). */
+	if (dart->cold_ane)
+		return 0;
+	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
 		return -EBUSY;
 
 	/* PCIe-C restored these mappings before starting its downstream link. */
