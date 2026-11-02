@@ -2613,14 +2613,14 @@ impl Registry {
         writeln!(f, "scheduler_teardown pending={}", self.teardown.len())?;
         // M5: bound and parked lanes and pairs, the quarantined ones and those awaiting a settled
         // failure's drain, and whether any still needs the event worker's polling.
-        writeln!(f, "m5_lanes bound={} parked={} quarantined={} awaiting_drain={}",
+        writeln!(f, "m5_lanes bound={} parked={} quarantined={} awaiting_witness={}",
                  self.m5.len(), self.m5_parked.len(),
                  self.m5.iter().filter(|channel| channel.quarantined().is_some()).count(),
-                 self.m5.iter().filter(|channel| channel.awaiting_drain()).count())?;
-        writeln!(f, "m5_pairs bound={} parked={} quarantined={} awaiting_drain={} polling={}",
+                 self.m5.iter().filter(|channel| channel.awaiting_witness()).count())?;
+        writeln!(f, "m5_pairs bound={} parked={} quarantined={} awaiting_witness={} polling={}",
                  self.m5_render.len(), self.m5_parked_pairs.len(),
                  self.m5_render.iter().filter(|pair| pair.quarantined().is_some()).count(),
-                 self.m5_render.iter().filter(|pair| pair.awaiting_drain()).count(),
+                 self.m5_render.iter().filter(|pair| pair.awaiting_witness()).count(),
                  u8::from(self.m5_in_flight()))?;
         for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
             queue.write_capacity(f)?;

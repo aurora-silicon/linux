@@ -933,7 +933,8 @@ impl Queue {
         error: Error,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result<Option<Arc<VmStatus>>> {
-        if !self.quarantined {
+        let first = !self.quarantined;
+        if first {
             self.quarantined = true;
             self.quarantine_error = Some(error);
             self.failure_status_pending = true;
@@ -962,8 +963,13 @@ impl Queue {
             }
         }
         self.failure_status_pending = false;
-        self.awaiting_witness =
-            self.active.len != 0 && self.active.iter().all(|a| a.ticket.is_some());
+        // Neo's rule (`None`): reassessed at every failure.
+        self.awaiting_witness = awaits_witness(
+            None,
+            first,
+            self.awaiting_witness,
+            self.active.len != 0 && self.active.iter().all(|a| a.ticket.is_some()),
+        );
         Ok(terminal)
     }
 
@@ -1302,6 +1308,129 @@ fn retained_capacity(
 /// Exact retirement still owns the transition.
 fn release_pending(released: bool, quarantined: bool, active: usize, retiring: bool) -> bool {
     released && !quarantined && (active != 0 || retiring)
+}
+
+/// What a failure of a quarantined queue's work says of its state, on a variant whose retirement
+/// witness ends the quarantine (the M5 Ultra's lanes and render pairs, `queue::m5::Channel::fail`,
+/// `queue::m5_render::Pair::fail`). Neo's queues pass none to [`awaits_witness`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// Recovery settled it: the firmware restarted and resumed or failed the work, so its exact
+    /// retirement is the witness that ends the quarantine.
+    Settled,
+    /// The work failed with the firmware's view of it unknown (a timeout, its VM failed): the
+    /// quarantine stays. After a settled failure it is a repeat and changes nothing.
+    Final,
+    /// A retirement witness could not be read: the quarantine stays, whatever came first.
+    Ambiguous,
+}
+
+/// The `awaiting_witness` of a quarantined queue after one more failure: whether its retained
+/// work's exact retirement witness is awaited. `first`: the queue was healthy before this failure.
+/// `awaiting`: whether the witness was awaited before it. `witnessable`: every retained command
+/// carries the identity (ticket) the witness checks.
+///
+/// `failure: None` is Neo's rule, which every Neo queue keeps (T8140, and S's M5 Pro and Max
+/// through the same `Queue`): reassessed at every failure, the witness is awaited while the work
+/// is witnessable. It releases the retained commands (`release_witnessed`), and it ends the
+/// quarantine only for spared work, which the first failure alone decides (`spared_quarantine`).
+///
+/// `Some` is the M5 Ultra's rule, a divergence for a measured need. There the witness of a
+/// settled failure also ends the quarantine: the lane or pair returns to its owner
+/// (`Channel::rehabilitate`, `Pair::retire`). So, as for Neo's spared work, the first failure
+/// decides; reassessed, a later failure could hand a lane back that the firmware may still run.
+/// On J775D a timed-out pass drained and the firmware restarted on its QID 1.5 s later, failing
+/// the next owner's pass, and a blamed pass failed again with its VM: a timeout or a VM failure
+/// is `Final`, and a repeat after a settled failure changes nothing. A later `Ambiguous` takes the
+/// witness away: an unreadable witness proves nothing.
+pub(crate) fn awaits_witness(
+    failure: Option<Failure>,
+    first: bool,
+    awaiting: bool,
+    witnessable: bool,
+) -> bool {
+    match (failure, first) {
+        (None, _) => witnessable,
+        (Some(failure), true) => witnessable && failure == Failure::Settled,
+        (Some(Failure::Ambiguous), false) => false,
+        (Some(_), false) => witnessable && awaiting,
+    }
+}
+
+#[kunit_tests(asahi_g17_quarantine)]
+mod quarantine_tests {
+    use super::*;
+
+    const KINDS: [Option<Failure>; 4] =
+        [None, Some(Failure::Settled), Some(Failure::Final), Some(Failure::Ambiguous)];
+
+    /// Neo's rule, before the shared function: `active.len != 0 && every ticket is some`,
+    /// recomputed at every `quarantine()` call whatever came before.
+    #[test]
+    fn neo_reassesses_at_every_failure() {
+        for first in [false, true] {
+            for awaiting in [false, true] {
+                for witnessable in [false, true] {
+                    assert_eq!(awaits_witness(None, first, awaiting, witnessable), witnessable);
+                }
+            }
+        }
+    }
+
+    /// The M5 Ultra's rule, before the shared function (`m5::Failure::awaits_drain`), whose
+    /// callers always pass `witnessable`: `(first, kind)` maps `(true, k)` to `k == Settled`,
+    /// `(false, Ambiguous)` to false and `(false, _)` to `awaiting`.
+    #[test]
+    fn m5_lets_the_first_failure_decide() {
+        let table = [
+            // (failure, first, awaiting, awaits)
+            (Failure::Settled, true, false, true),
+            (Failure::Settled, true, true, true),
+            (Failure::Final, true, false, false),
+            (Failure::Final, true, true, false),
+            (Failure::Ambiguous, true, false, false),
+            (Failure::Ambiguous, true, true, false),
+            (Failure::Settled, false, false, false),
+            (Failure::Settled, false, true, true),
+            (Failure::Final, false, false, false),
+            (Failure::Final, false, true, true),
+            (Failure::Ambiguous, false, false, false),
+            (Failure::Ambiguous, false, true, false),
+        ];
+        for (failure, first, awaiting, awaits) in table {
+            assert_eq!(awaits_witness(Some(failure), first, awaiting, true), awaits);
+        }
+    }
+
+    /// Work without the witness's identities never awaits it, under either rule.
+    #[test]
+    fn unwitnessable_work_never_awaits() {
+        for kind in KINDS {
+            for first in [false, true] {
+                for awaiting in [false, true] {
+                    assert!(!awaits_witness(kind, first, awaiting, false));
+                }
+            }
+        }
+    }
+
+    /// The sequences measured on J775D: a blame then its VM's failure keeps the drain; a
+    /// timeout first never gets it; an unreadable witness takes it away.
+    #[test]
+    fn m5_sequences() {
+        let run = |kinds: &[Failure]| {
+            let mut awaiting = false;
+            for (index, kind) in kinds.iter().enumerate() {
+                awaiting = awaits_witness(Some(*kind), index == 0, awaiting, true);
+            }
+            awaiting
+        };
+        assert!(run(&[Failure::Settled, Failure::Final]));
+        assert!(run(&[Failure::Settled, Failure::Settled]));
+        assert!(!run(&[Failure::Final, Failure::Settled]));
+        assert!(!run(&[Failure::Settled, Failure::Ambiguous]));
+        assert!(!run(&[Failure::Settled, Failure::Ambiguous, Failure::Settled]));
+    }
 }
 
 #[kunit_tests(asahi_g17_compute_admission)]

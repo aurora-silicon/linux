@@ -20,8 +20,8 @@ use crate::g17::{
     object::Allocator,
     preparation::Admission,
     queue::{
-        compute::retirement::Batch,
-        m5::{Channel, Dispatch, Failure, Host, Retired},
+        compute::{retirement::Batch, Failure},
+        m5::{Channel, Dispatch, Host, Retired},
         m5_render::{BindingArgs, Draw, Pair, PairArgs, ParkedPair},
     },
     status::VmStatus,
@@ -180,14 +180,14 @@ impl Lanes<'_> {
             .iter_mut()
             .filter(|channel| Arc::ptr_eq(channel.context(), context))
         {
-            channel.end_drain_wait();
+            channel.end_witness_wait();
         }
         for pair in self
             .pairs
             .iter_mut()
             .filter(|pair| Arc::ptr_eq(pair.context(), context))
         {
-            pair.end_drain_wait();
+            pair.end_witness_wait();
         }
         Ok(())
     }
@@ -332,7 +332,7 @@ impl Registry {
             );
             if let Err(error) = result {
                 // A channel already past its failure (Final or Ambiguous) is only reported once.
-                if channel.quarantined().is_none() || channel.awaiting_drain() {
+                if channel.quarantined().is_none() || channel.awaiting_witness() {
                     pr_warn!(
                         "G17 M5: lane {} failed to retire: {:?}\n",
                         channel.qid(),
@@ -363,7 +363,7 @@ impl Registry {
                 },
             );
             if let Err(error) = result {
-                if pair.quarantined().is_none() || pair.awaiting_drain() {
+                if pair.quarantined().is_none() || pair.awaiting_witness() {
                     pr_warn!(
                         "G17 M5: render pair of queue {} failed to retire: {:?}: {:x?}\n",
                         pair.owner(),

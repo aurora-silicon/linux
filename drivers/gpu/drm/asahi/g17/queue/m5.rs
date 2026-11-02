@@ -25,7 +25,7 @@
 //! witnesses prove that the firmware retired the kick, not that every workgroup ran: dispatches
 //! that lost workgroups retired with all of them.
 
-use super::compute::{GRAPH_SIZE, ITEMS, POINTERS};
+use super::compute::{awaits_witness, Failure, GRAPH_SIZE, ITEMS, POINTERS};
 use super::pool_state::{PoolPhase, PoolState};
 use crate::g17::{
     context::{Context, WorkStateLease},
@@ -136,33 +136,6 @@ impl Dispatch {
 pub(crate) struct Grown {
     _view: Option<mmu::KernelMapping>,
     _backing: Option<M5Backing>,
-}
-
-/// What a failure of a lane's or pair's work says of its state ([`Channel::fail`],
-/// [`super::m5_render::Pair::fail`]). Only the first failure decides whether the failed work's
-/// drain can end the quarantine; a later one can only take that away, when it is `Ambiguous`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Failure {
-    /// Recovery settled it: the firmware restarted and resumed or failed the work, so its exact
-    /// retirement is the drain witness that ends the quarantine.
-    Settled,
-    /// The work failed with the firmware's view of it unknown (a timeout, its VM failed): the
-    /// quarantine stays. After a settled failure it is a repeat and changes nothing.
-    Final,
-    /// A retirement witness could not be read: the quarantine stays, whatever came first.
-    Ambiguous,
-}
-
-impl Failure {
-    /// Whether the failed work's drain ends the quarantine, given whether it did before this
-    /// failure (`awaiting`) and whether this is the first.
-    pub(crate) fn awaits_drain(self, first: bool, awaiting: bool) -> bool {
-        match (first, self) {
-            (true, kind) => kind == Self::Settled,
-            (false, Self::Ambiguous) => false,
-            (false, _) => awaiting,
-        }
-    }
 }
 
 /// A kick in flight.
@@ -421,8 +394,12 @@ pub(crate) struct Channel {
     pool_state: PoolState,
     active: KVec<Active>,
     /// Set once a kick failed or the channel's state became ambiguous: nothing more is published,
-    /// and every failed kick stays in `failed`, pinning its command.
-    quarantine: Option<Error>,
+    /// and every failed kick stays in `failed`, pinning its command. With `awaiting_witness` these
+    /// are Neo's quarantine fields (`queue::compute::Queue`), under their names so the lane folds
+    /// into that queue (spec 2026-10-31-m5-registry-fold §7.2, L1-L2). Neo's separate
+    /// `quarantined` flag is left out: every M5 quarantine has its error, so it would only repeat
+    /// `is_some()`.
+    quarantine_error: Option<Error>,
     failed: KVec<Active>,
     /// The logical queue closed; the channel stays installed.
     closed: bool,
@@ -434,8 +411,8 @@ pub(crate) struct Channel {
     /// the quarantine, as a Neo compute queue's quarantine ends once its ring is proved retired
     /// (`retirement::quarantined_retired`). A broken retirement witness, a timeout or the VM's
     /// failure keeps the quarantine (`Registry::fail_pair` says why), as does the context's release
-    /// consumed before the drain ([`Self::end_drain_wait`]).
-    awaiting_drain: bool,
+    /// consumed before the drain ([`Self::end_witness_wait`]).
+    awaiting_witness: bool,
     /// The oldest kick finished but is not retirable yet (`Self::retire`): its record or inner
     /// item is visible ahead of the stamp, the pool counter or the work node. Its completion
     /// event has been consumed, so the event worker polls until it retires, as for a Neo
@@ -699,11 +676,11 @@ impl Channel {
                 ordinal: 0,
                 pool_state: PoolState::FRESH,
                 active: KVec::with_capacity(DEPTH, GFP_KERNEL)?,
-                quarantine: None,
+                quarantine_error: None,
                 failed: KVec::new(),
                 closed: false,
                 faulted: false,
-                awaiting_drain: false,
+                awaiting_witness: false,
                 retire_pending: false,
             },
             GFP_KERNEL,
@@ -797,11 +774,11 @@ impl Channel {
                 ordinal: 0,
                 pool_state: lane.pool_state,
                 active,
-                quarantine: None,
+                quarantine_error: None,
                 failed: KVec::new(),
                 closed: false,
                 faulted: false,
-                awaiting_drain: false,
+                awaiting_witness: false,
                 retire_pending: false,
             },
         );
@@ -821,7 +798,7 @@ impl Channel {
     pub(crate) fn parkable(&self) -> Result<bool> {
         if !self.closed
             || !self.installed
-            || self.quarantine.is_some()
+            || self.quarantine_error.is_some()
             || self.faulted
             || !self.active.is_empty()
             || !self.failed.is_empty()
@@ -843,7 +820,7 @@ impl Channel {
         let next = self.lane.kick.timestamp();
         pr_warn!(
             "G17 M5: lane {}: closed {} installed {} quarantine {:?} faulted {} active {} failed {}, cursors {:x?}, idle {:?}, pool {:?}/{:?}, stamp {:x?} for kick {:#x}\n",
-            self.qid(), self.closed, self.installed, self.quarantine, self.faulted, self.active.len(),
+            self.qid(), self.closed, self.installed, self.quarantine_error, self.faulted, self.active.len(),
             self.failed.len(), self.lane.cursors(),
             self.lane.cursors().and_then(|cursors| self.lane.idle_at(cursors.producer)),
             self.pool.completed_submissions(), self.pool.submitted(), self.stamp(), next.prev().get(),
@@ -854,9 +831,9 @@ impl Channel {
     /// the firmware idle on its ring. A drain still awaited does not hold the release back, as a
     /// quarantined Neo queue does not (`Queue::idle_for_context` waits for the firmware, not for
     /// the witness): the healthy lanes of the context park, and this one parks only if it drained
-    /// before the release was consumed ([`Self::end_drain_wait`]).
+    /// before the release was consumed ([`Self::end_witness_wait`]).
     pub(crate) fn settled(&self) -> Result<bool> {
-        if self.quarantine.is_none() {
+        if self.quarantine_error.is_none() {
             return self.parkable();
         }
         Ok(self.closed && self.lane.idle_at(self.lane.cursors()?.producer)?)
@@ -949,8 +926,8 @@ impl Channel {
     /// A settled failure's drain is awaited ([`Self::rehabilitate`]). The event worker does not
     /// poll for it: a quarantined channel has no kick in flight ([`Self::in_flight`]), as a
     /// quarantined Neo queue is not in flight (`Queue::in_flight`); each event pass checks it.
-    pub(crate) fn awaiting_drain(&self) -> bool {
-        self.awaiting_drain
+    pub(crate) fn awaiting_witness(&self) -> bool {
+        self.awaiting_witness
     }
     /// The context's scheduler release was consumed while this quarantined channel still awaited
     /// its failed kicks' drain: the channel stays quarantined, leaked under the cap, its kicks
@@ -958,11 +935,11 @@ impl Channel {
     /// context, and nothing else can witness the drain: on M5 neither a kill's acknowledgement nor
     /// the scheduler page's killed state proves the firmware finished reading (S
     /// `queue/compute/exit.rs` `settle_exit`). Returns whether a wait ended.
-    pub(crate) fn end_drain_wait(&mut self) -> bool {
-        if !self.awaiting_drain {
+    pub(crate) fn end_witness_wait(&mut self) -> bool {
+        if !self.awaiting_witness {
             return false;
         }
-        self.awaiting_drain = false;
+        self.awaiting_witness = false;
         pr_warn!("G17 M5: lane {}: its context was released before its {} failed kicks drained; the lane stays quarantined\n",
             self.qid(), self.failed.len());
         true
@@ -973,10 +950,13 @@ impl Channel {
     }
     /// Room for another kick: installed, healthy, open and below [`DEPTH`].
     pub(crate) fn has_room(&self) -> bool {
-        self.installed && self.quarantine.is_none() && !self.closed && self.active.len() < DEPTH
+        self.installed
+            && self.quarantine_error.is_none()
+            && !self.closed
+            && self.active.len() < DEPTH
     }
     pub(crate) fn quarantined(&self) -> Option<Error> {
-        self.quarantine
+        self.quarantine_error
     }
     pub(crate) fn close(&mut self) {
         self.closed = true;
@@ -995,7 +975,7 @@ impl Channel {
     /// drain to await describes no live pipe order. The qualification's kicks carry no packet
     /// and take no part.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
-        if self.quarantine.is_some() && !self.awaiting_drain {
+        if self.quarantine_error.is_some() && !self.awaiting_witness {
             return None;
         }
         Iterator::chain(self.failed.iter(), self.active.iter())
@@ -1005,14 +985,14 @@ impl Channel {
                 vm: packet.context.vm().id(),
                 published: active.published,
                 finished: active.observed.is_some(),
-                failed: self.quarantine.is_some(),
+                failed: self.quarantine_error.is_some(),
             })
     }
 
     /// The watchdog of `packet` may classify this channel's work (Neo:
     /// `queue::compute::Queue::can_classify_timeout`): it is healthy and `packet` is in flight.
     pub(crate) fn can_classify_timeout(&self, packet: &Arc<Packet>) -> bool {
-        self.quarantine.is_none()
+        self.quarantine_error.is_none()
             && self.active.iter().any(|active| {
                 active
                     .packet
@@ -1024,7 +1004,7 @@ impl Channel {
     /// The oldest kick is a published long job (ray traversal or AS build) whose completion
     /// record the driver has not seen yet (Neo: `queue::compute::Queue::long_job_running`).
     pub(crate) fn long_job_running(&self) -> bool {
-        self.quarantine.is_none()
+        self.quarantine_error.is_none()
             && self.active.first().is_some_and(|active| {
                 active.observed.is_none()
                     && active
@@ -1040,7 +1020,7 @@ impl Channel {
     /// event. So the event worker polls a channel only while its oldest kick finished ahead of
     /// its retirement witnesses ([`Self::retire_pending`]), not while any kick is in flight.
     pub(crate) fn retirement_polling(&self) -> bool {
-        self.quarantine.is_none() && self.retire_pending
+        self.quarantine_error.is_none() && self.retire_pending
     }
 
     /// The oldest kick's completion record was seen, or the firmware consumed its inner items
@@ -1226,7 +1206,7 @@ impl Channel {
             .expose(host.port, claim, 1, true, None)
             .map(|_| ());
         if let Err(error) = result {
-            self.quarantine = Some(error);
+            self.quarantine_error = Some(error);
         }
         result
     }
@@ -1235,7 +1215,7 @@ impl Channel {
     /// adopted lane's binding has none and is consumed at once. A crash, or the configuration
     /// still unconsumed once the wait `expired` ([`INSTALL_WAIT_MS`]), quarantines the channel.
     pub(crate) fn install_consumed(&mut self, crashed: &AtomicBool, expired: bool) -> Result<bool> {
-        if let Some(error) = self.quarantine {
+        if let Some(error) = self.quarantine_error {
             return Err(error);
         }
         if self.rebound.is_some() || self.lane.cursors()?.consumer == 1 {
@@ -1246,7 +1226,7 @@ impl Channel {
             _ if expired => ETIMEDOUT,
             _ => return Ok(false),
         };
-        self.quarantine = Some(error);
+        self.quarantine_error = Some(error);
         Err(error)
     }
 
@@ -1276,7 +1256,7 @@ impl Channel {
         notify: impl FnOnce() -> Result,
         blocks: usize,
     ) -> Result<Option<Grown>> {
-        if let Some(error) = self.quarantine {
+        if let Some(error) = self.quarantine_error {
             return Err(error);
         }
         if !self.installed || self.closed || blocks > self.gpu.max_pool_blocks {
@@ -1332,7 +1312,7 @@ impl Channel {
         let old = match result {
             Ok(old) => old,
             Err(error) => {
-                self.quarantine = Some(error);
+                self.quarantine_error = Some(error);
                 return Err(error);
             }
         };
@@ -1383,7 +1363,7 @@ impl Channel {
         epoch: u64,
         packet: Option<Arc<Packet>>,
     ) -> Result<Published> {
-        if let Some(error) = self.quarantine {
+        if let Some(error) = self.quarantine_error {
             return Err(error);
         }
         if !self.installed || self.closed {
@@ -1570,7 +1550,7 @@ impl Channel {
             }),
             Err(error) => {
                 // The kick stays in flight and is failed with the channel.
-                self.quarantine = Some(error);
+                self.quarantine_error = Some(error);
                 Err(error)
             }
         }
@@ -1579,7 +1559,7 @@ impl Channel {
     /// Stages the exact identity of every kick not yet observed for the shared completion-ring
     /// scan. Returns whether any was staged.
     pub(crate) fn request(&self, batch: &mut Batch) -> Result<bool> {
-        if self.active.is_empty() || self.quarantine.is_some() {
+        if self.active.is_empty() || self.quarantine_error.is_some() {
             return Ok(false);
         }
         batch.stage_frontier(self.qid(), self.lane.kick.timestamp().get())?;
@@ -1611,7 +1591,7 @@ impl Channel {
         complete_qos: &mut impl FnMut(qos::Owner) -> Result,
         retired: &mut impl FnMut(Retired) -> Result,
     ) -> Result {
-        if self.quarantine.is_some() {
+        if self.quarantine_error.is_some() {
             return self.rehabilitate(state, retired);
         }
         if self.faulted {
@@ -1730,9 +1710,17 @@ impl Channel {
         failure: Failure,
         retired: &mut impl FnMut(Retired) -> Result,
     ) -> Result {
-        self.awaiting_drain = failure.awaits_drain(self.quarantine.is_none(), self.awaiting_drain);
-        self.quarantine.get_or_insert(error);
-        let error = self.quarantine.unwrap_or(error);
+        // The M5 Ultra's rule (`awaits_witness`): the first failure decides. Every kick carries
+        // its ticket from publication, and an empty lane's witness is its idle ring
+        // ([`Self::drained`]), so the work is always witnessable.
+        self.awaiting_witness = awaits_witness(
+            Some(failure),
+            self.quarantine_error.is_none(),
+            self.awaiting_witness,
+            true,
+        );
+        self.quarantine_error.get_or_insert(error);
+        let error = self.quarantine_error.unwrap_or(error);
         self.failed.reserve(self.active.len(), GFP_KERNEL)?;
         while let Some(front) = self.active.first() {
             // Reported before the kick moves to `failed`, as Neo reports before it gives a command
@@ -1781,7 +1769,7 @@ impl Channel {
     /// healthy again and a closed one parks. Witnesses that cannot be read make the failure
     /// Ambiguous: the quarantine stays, and so do the kicks, pinned.
     fn rehabilitate(&mut self, state: u32, retired: &mut impl FnMut(Retired) -> Result) -> Result {
-        if !self.awaiting_drain {
+        if !self.awaiting_witness {
             return Ok(());
         }
         match self.drained(state) {
@@ -1790,11 +1778,11 @@ impl Channel {
             Err(error) => {
                 pr_warn!("G17 M5: lane {}: its failed kicks' drain witnesses unreadable ({:?}); the lane stays quarantined\n",
                     self.qid(), error);
-                self.awaiting_drain = false;
+                self.awaiting_witness = false;
                 return Ok(());
             }
         }
-        let error = self.quarantine.unwrap_or(EIO);
+        let error = self.quarantine_error.unwrap_or(EIO);
         while let Some(front) = self.failed.first() {
             retired(Retired {
                 ticket: front.ticket,
@@ -1804,8 +1792,8 @@ impl Channel {
             })?;
             self.failed.remove(0).map_err(|_| EINVAL)?;
         }
-        self.quarantine = None;
-        self.awaiting_drain = false;
+        self.quarantine_error = None;
+        self.awaiting_witness = false;
         self.faulted = false;
         pr_info!(
             "G17 M5: lane {}: its failed kicks ({:?}) drained; the lane returns\n",
@@ -1864,7 +1852,7 @@ impl Channel {
             self.pool.completed_submissions(),
             published.pool_target,
             self.cursors().map(|c| (c.producer, c.consumer)),
-            self.quarantine
+            self.quarantine_error
         );
         for offset in (0..STATUS + 0x10).step_by(4) {
             if let Ok(value) = self
