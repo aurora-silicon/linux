@@ -345,6 +345,8 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
+	const struct dcp_method_entry *v27_methods;
 	bool external;
 	/*
 	 * T8122 dcpext: the panel's DRM device never waits on this processor.

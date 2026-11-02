@@ -212,6 +212,9 @@ struct dcp_method_entry {
 	char tag_h17g[4];
 };
 
+/* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
+const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+
 #define IOMFB_MAX_CB (1000)
 
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
