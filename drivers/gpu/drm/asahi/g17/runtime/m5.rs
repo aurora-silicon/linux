@@ -15,14 +15,14 @@ use super::{render::FALLBACK, Backend, DeferredBatch, Registry, WORK_RING_WAIT_N
 use crate::g17::{
     completion::Deferred,
     context::Context,
-    fw::queue::DataMaster,
+    fw::{channels::TvbGrowRequest, queue::DataMaster},
     job::{Engine, Packet},
     object::Allocator,
     preparation::Admission,
     queue::{
         compute::{retirement::Batch, Failure},
         m5::{Channel, Dispatch, Host, Retired},
-        m5_render::{BindingArgs, Draw, Pair, PairArgs, ParkedPair},
+        m5_render::{BindingArgs, Draw, Pair, PairArgs, PairGrowth, ParkedPair},
     },
     status::VmStatus,
 };
@@ -293,6 +293,30 @@ impl Registry {
     pub(super) fn m5_polling(&self) -> bool {
         self.m5.iter().any(|channel| channel.retirement_polling())
             || self.m5_render.iter().any(|pair| pair.polls())
+    }
+
+    /// The M5 pair growth request `request` names, started serving (`Pair::begin_growth`):
+    /// None when no pair is named, as `RenderState::grow_owner` finds no render entry. A twin
+    /// of that lookup while M5 pairs are not render entries (`Pair::grows`).
+    pub(super) fn m5_grow_begin(&mut self, request: &TvbGrowRequest) -> Option<Result<PairGrowth>> {
+        self.m5_render
+            .iter_mut()
+            .find(|pair| pair.grows(request))
+            .map(|pair| pair.begin_growth())
+    }
+
+    /// Ends serving `growth` on its pair (`Pair::finish_growth`); EIO if the pair is gone,
+    /// which its `growing` mark rules out.
+    pub(super) fn m5_grow_finish(
+        &mut self,
+        growth: &PairGrowth,
+        blocks: &mut Option<crate::g17::buffer::TvbGrowth>,
+        prepared: &mut Option<crate::g17::buffer::PreparedGrowth>,
+        commit: bool,
+    ) -> Result<bool> {
+        self.m5_pair(growth.owner)
+            .ok_or(EIO)?
+            .finish_growth(growth, blocks, prepared, commit)
     }
 
     fn m5_pair(&mut self, owner: u64) -> Option<&mut Pair> {

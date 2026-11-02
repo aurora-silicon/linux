@@ -178,7 +178,9 @@ pub(crate) struct M5TaCommandFields {
     pub uma_state: u64,
 
     pub d1444: u8,
-    pub d1174: u8,
+    /// TA +0x892: at an overflow of the parameter buffer, the firmware asks the host for blocks
+    /// (the type-6 growth request) instead of rendering partially.
+    pub host_growth: u8,
     pub d1177: u8,
     pub policy: M5TaPolicy,
     pub extra: M5ExtraAddresses,
@@ -493,7 +495,7 @@ pub(crate) fn encode_m5_ta_command(
     put8(out, 0x936, t.d1444 & 1);
     put64(out, 0x8fe, t.d08b0);
     put64(out, 0x906, t.diagnostic_ta_timestamp_upper);
-    put32(out, 0x892, u32::from(t.d1174 & 1));
+    put32(out, 0x892, u32::from(t.host_growth & 1));
     put32(out, 0x89a, u32::from(t.d1177 & 1));
     put32(out, 0x89e, u32::from(m5_ta_policy_bit(&t.policy, t.d1177)));
     put32(out, 0x8a2, 0);

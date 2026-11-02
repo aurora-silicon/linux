@@ -27,6 +27,7 @@ use crate::g17::{
     freelist::M5Pool,
     fw::{
         self,
+        channels::TvbGrowRequest,
         kick::{KickArgs, KickDependency, KickQos},
         m5::{
             compute::{Gpu, RenderPlan},
@@ -181,6 +182,9 @@ pub(crate) struct Pair {
     /// the pass, so its footprint keeps ordering overlapping renders
     /// (`Completion::quarantine_resumed_render`).
     awaiting_witness: bool,
+    /// A growth request of the pass in flight is being served off the device mutex
+    /// ([`Self::begin_growth`]): the pair neither parks nor settles until it ends.
+    growing: bool,
 }
 
 /// An installed render pair without an owner: both lanes, the storage they name across owners,
@@ -212,6 +216,16 @@ impl ParkedPair {
     pub(crate) fn class(&self) -> u8 {
         self.class
     }
+}
+
+/// A growth request being served for one pair ([`Pair::begin_growth`]): what the worker
+/// allocates off the device mutex, and the pair it returns to.
+pub(crate) struct PairGrowth {
+    pub(crate) owner: u64,
+    pub(crate) vm: mmu::Vm,
+    pub(crate) geometry: BlockGeometry,
+    pub(crate) from: usize,
+    pub(crate) target: usize,
 }
 
 /// A published pass, until its strict retirement.
@@ -297,6 +311,10 @@ impl Storage {
         let blocks = layout.tvb_blocks;
         let initial = blocks.checked_mul(PB_BLOCK).ok_or(EOVERFLOW)?;
         let minimum = fw::m5::budget::minimum_parameter_pages(args.clusters).ok_or(EINVAL)?;
+        let geometry = step(
+            "parameter geometry",
+            BlockGeometry::m5(compact.clone(), memory_bytes()?, initial as u64),
+        )?;
         let layout = step(
             "target slices",
             layout.with_m5_slices(
@@ -304,15 +322,11 @@ impl Storage {
                 GROUPS,
                 SEGMENTS,
                 minimum,
-                initial,
+                Pair::grown_bytes(geometry)?,
                 compact.clone(),
             ),
         )?;
         let target = step("target", target::Target::new(dev, vm, &layout))?;
-        let geometry = step(
-            "parameter geometry",
-            BlockGeometry::m5(compact.clone(), memory_bytes()?, initial as u64),
-        )?;
         let (tvb, mappings) = step(
             "parameter blocks",
             buffer::Tvb::with_geometry(dev, vm, blocks, geometry),
@@ -482,6 +496,7 @@ impl Pair {
                 active: None,
                 quarantine_error: None,
                 awaiting_witness: false,
+                growing: false,
             },
             GFP_KERNEL,
         )?;
@@ -563,6 +578,7 @@ impl Pair {
                 active: None,
                 quarantine_error: None,
                 awaiting_witness: false,
+                growing: false,
             },
         );
         if let Err(error) = pair.publish_mappings() {
@@ -588,7 +604,11 @@ impl Pair {
     /// The pair is idle: healthy, no pass in flight, both lanes consumed to their producers,
     /// both stage stamps at the last pass's and the pool's count complete.
     pub(crate) fn parkable(&self) -> Result<bool> {
-        if !self.installed || self.quarantine_error.is_some() || self.active.is_some() {
+        if !self.installed
+            || self.quarantine_error.is_some()
+            || self.active.is_some()
+            || self.growing
+        {
             return Ok(false);
         }
         for lane in &self.lanes {
@@ -632,6 +652,9 @@ impl Pair {
     /// for a compute lane (`Channel::settled`): the context's healthy lanes park, and this pair
     /// parks only if its pass drained before the release was consumed.
     pub(crate) fn settled(&self) -> Result<bool> {
+        if self.growing {
+            return Ok(false);
+        }
         if self.quarantine_error.is_none() {
             return self.parkable();
         }
@@ -851,15 +874,21 @@ impl Pair {
             self.clusters
         };
         let minimum = fw::m5::budget::minimum_parameter_pages(self.clusters).ok_or(EINVAL)?;
-        let initial = layout.tvb_blocks.checked_mul(PB_BLOCK).ok_or(EOVERFLOW)?;
         layout.with_m5_slices(
             pass,
             groups,
             SEGMENTS,
             minimum,
-            initial,
+            Self::grown_bytes(self.storage.manager.geometry())?,
             self.compact[0]..self.compact[1],
         )
+    }
+
+    /// The parameter-buffer extent a pass's target slices are sized for: the whole inventory,
+    /// so that growth during the pass ([`Self::begin_growth`]) never outgrows the target storage
+    /// the pass already names.
+    fn grown_bytes(geometry: BlockGeometry) -> Result<usize> {
+        geometry.max_blocks().checked_mul(PB_BLOCK).ok_or(EOVERFLOW)
     }
 
     /// The pass's register controls (S `m5_render_submission::controls`) with the plan's stage
@@ -955,6 +984,8 @@ impl Pair {
         fields.fragment.uma_state = r.free_list_control_va;
         fields.ta.d1444 = 1;
         fields.fragment.dbc4 = 1;
+        // The pair serves its growth requests ([`Self::begin_growth`]).
+        fields.ta.host_growth = 1;
         Ok(fields)
     }
 
@@ -1019,6 +1050,80 @@ impl Pair {
     }
     pub(crate) fn in_flight(&self) -> bool {
         self.active.is_some()
+    }
+
+    // An M5 pair serves the shared growth worker (`runtime/render/grow.rs`) through these three,
+    // beside Neo's render entries: a twin of their growth while M5 pairs are not render
+    // entries. Its two hooks are the `growing` flag, which stands for the worker's borrow of a
+    // Neo pair, and the `aliases` install in `finish_growth`, which stands for Neo's VM
+    // render-pool cache.
+
+    /// Whether growth request `request` names this pair's parameter buffer: its ID, and its
+    /// context's VM slot unless the request names none (as `RenderState::grow_owner`).
+    pub(crate) fn grows(&self, request: &TvbGrowRequest) -> bool {
+        u32::from(self.pb.0) == request.buffer_slot
+            && (request.vm_slot == -1 || request.vm_slot as u32 == self.context.id())
+    }
+
+    /// Starts serving a growth request of the pass in flight, which the firmware holds until
+    /// the reply: the pair stays in place, marked growing, while the worker allocates
+    /// `target - from` blocks off the device mutex (`buffer::Tvb::allocate_growth`) for
+    /// [`Self::finish_growth`]. ENOENT without a pass in flight or with one already served.
+    pub(crate) fn begin_growth(&mut self) -> Result<PairGrowth> {
+        if self.active.is_none() || self.growing || self.quarantine_error.is_some() {
+            return Err(ENOENT);
+        }
+        let manager = &self.storage.manager;
+        let growth = PairGrowth {
+            owner: self.owner,
+            vm: self.context.vm().clone(),
+            geometry: manager.geometry(),
+            from: manager.blocks(),
+            target: manager.firmware_target(),
+        };
+        self.growing = true;
+        Ok(growth)
+    }
+
+    /// Ends [`Self::begin_growth`]. With `commit` (the request is still current) it publishes
+    /// `blocks` as a firmware-request growth: the block table, then the committed cursor; the
+    /// page list and the descriptor stay the firmware's, which takes the blocks into the live
+    /// ring when it reads the reply. The blocks' mappings join the binding's `aliases`.
+    /// Whatever is not published stays in `blocks` or `prepared`, for the caller to drop off
+    /// the mutex. Returns whether the heap grew.
+    pub(crate) fn finish_growth(
+        &mut self,
+        growth: &PairGrowth,
+        blocks: &mut Option<buffer::TvbGrowth>,
+        prepared: &mut Option<buffer::PreparedGrowth>,
+        commit: bool,
+    ) -> Result<bool> {
+        if !self.growing {
+            return Err(EIO);
+        }
+        self.growing = false;
+        if !commit || blocks.is_none() {
+            return Ok(false);
+        }
+        self.aliases
+            .reserve(growth.target - growth.from, GFP_KERNEL)?;
+        let manager = &mut self.storage.manager;
+        *prepared =
+            Some(manager.accept_growth(self.context.vm(), blocks, growth.from, growth.target)?);
+        let aliases = &mut self.aliases;
+        manager.commit_growth(prepared, |_, _, mappings| {
+            while let Some(mapping) = mappings.pop() {
+                aliases.push_within_capacity(mapping).map_err(|_| ENOMEM)?;
+            }
+            Ok(())
+        })?;
+        pr_info!(
+            "G17 M5: render pair of queue {}: parameter buffer grew from {} to {} blocks\n",
+            self.owner,
+            growth.from,
+            growth.target
+        );
+        Ok(true)
     }
 
     /// Publishes one pass (S `draw_one`): its target records, tiling state and scene, both

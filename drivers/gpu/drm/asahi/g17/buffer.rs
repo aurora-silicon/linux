@@ -195,7 +195,9 @@ impl Scenes {
     }
 }
 
-/// A snapshot of the block ring; all values are modulo its fixed capacity.
+/// A snapshot of the block ring; all values are modulo the geometry's block capacity
+/// ([`BlockGeometry::capacity`]: Neo's `TVB_BLOCK_SLOTS`, M5's inventory). The capacity
+/// arguments are S's (linux-aurora t6050-gpu, "integrate M5 Pro firmware").
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cursors {
     pub(crate) total: u32,
@@ -203,16 +205,16 @@ pub(crate) struct Cursors {
     pub(crate) read: u32,
 }
 impl Cursors {
-    fn valid(self) -> bool {
+    fn valid(self, capacity: usize) -> bool {
         [self.total, self.committed, self.read]
             .into_iter()
-            .all(|v| (v as usize) < cfg::TVB_BLOCK_SLOTS)
+            .all(|v| (v as usize) < capacity)
     }
     /// Firmware-paused growth permits consumption of the already committed
     /// prefix. Retired-host growth requires the complete snapshot unchanged.
-    pub(crate) fn permits(self, after: Self, firmware_request: bool) -> bool {
-        if !self.valid()
-            || !after.valid()
+    pub(crate) fn permits_capacity(self, after: Self, firmware_request: bool, capacity: usize) -> bool {
+        if !self.valid(capacity)
+            || !after.valid(capacity)
             || self.total != after.total
             || self.committed != after.committed
         {
@@ -221,7 +223,7 @@ impl Cursors {
         if !firmware_request {
             return self == after;
         }
-        let capacity = cfg::TVB_BLOCK_SLOTS as u32;
+        let capacity = capacity as u32;
         (after.read + capacity - self.read) % capacity
             <= (self.committed + capacity - self.read) % capacity
     }
@@ -230,23 +232,25 @@ impl Cursors {
 /// Checked block-table indices for one bulk allocation. One ring slot stays
 /// empty even when all physical backing has been retained by the owner.
 pub(crate) struct Growth {
+    capacity: usize,
     before: Cursors,
     added: usize,
     retained: usize,
     target: usize,
 }
 impl Growth {
-    pub(crate) fn new(before: Cursors, added: usize) -> Result<Self> {
-        if !before.valid() || before.total != before.committed || added == 0 {
+    pub(crate) fn with_capacity(before: Cursors, added: usize, capacity: usize) -> Result<Self> {
+        if capacity < 2 || capacity > u32::MAX as usize
+            || !before.valid(capacity) || before.total != before.committed || added == 0 {
             return Err(EINVAL);
         }
-        let retained = (before.total as usize + cfg::TVB_BLOCK_SLOTS - before.read as usize)
-            % cfg::TVB_BLOCK_SLOTS;
-        if retained.checked_add(added).ok_or(EOVERFLOW)? >= cfg::TVB_BLOCK_SLOTS {
+        let retained = (before.total as usize + capacity - before.read as usize) % capacity;
+        if retained.checked_add(added).ok_or(EOVERFLOW)? >= capacity {
             return Err(ENOSPC);
         }
-        let target = (before.total as usize + added) % cfg::TVB_BLOCK_SLOTS;
+        let target = (before.total as usize + added) % capacity;
         Ok(Self {
+            capacity,
             before,
             added,
             retained,
@@ -266,32 +270,27 @@ impl Growth {
         if index >= self.added {
             return Err(EINVAL);
         }
-        Ok((self.before.total as usize + index) % cfg::TVB_BLOCK_SLOTS)
+        Ok((self.before.total as usize + index) % self.capacity)
     }
     pub(crate) fn available_slot(&self, index: usize) -> Result<usize> {
         if index >= self.available() {
             return Err(EINVAL);
         }
-        Ok((self.before.read as usize + index) % cfg::TVB_BLOCK_SLOTS)
+        Ok((self.before.read as usize + index) % self.capacity)
     }
-}
-
-pub(crate) fn firmware_growth_target(current: usize) -> usize {
-    current
-        .saturating_add(fw::GROW_BLOCKS)
-        .min(cfg::TVB_MAX_BLOCKS)
 }
 
 /// The high-water sample estimates capacity, not current occupancy. A growth
 /// reserves three times the demand only once twice that demand no longer fits.
-pub(crate) fn automatic_growth_target(used_pages: usize, current: usize) -> Option<usize> {
-    let maximum = fw::NORMAL_MAX_BLOCKS;
+/// `pages` is the geometry's pages per block and `maximum` the layout's normal
+/// maximum in blocks (Neo: `TVB_PAGES_PER_BLOCK`, `NORMAL_MAX_BLOCKS`).
+fn automatic_target_for(used_pages: usize, current: usize, pages: usize, maximum: usize) -> Option<usize> {
     if current >= maximum {
         return None;
     }
     let need = used_pages
         .saturating_mul(2)
-        .div_ceil(cfg::TVB_PAGES_PER_BLOCK)
+        .div_ceil(pages)
         .min(maximum);
     if need <= current {
         return None;
@@ -299,7 +298,7 @@ pub(crate) fn automatic_growth_target(used_pages: usize, current: usize) -> Opti
     Some(
         used_pages
             .saturating_mul(3)
-            .div_ceil(cfg::TVB_PAGES_PER_BLOCK)
+            .div_ceil(pages)
             .min(maximum),
     )
 }
@@ -364,13 +363,22 @@ impl Tvb {
         if geometry == BlockGeometry::NEO {
             let mapping =
                 compact_alias(object, vm, source, cfg::TVB_PAGE, mmu::PROT_GPU_SHARED_RW, guard)?;
-            fw::compact_page(mapping.iova())?;
+            Self::first_page(geometry, mapping.iova())?;
             return Ok(mapping);
         }
         let mapping = object.map_range(vm, source, geometry.base..geometry.end,
             BlockGeometry::PAGE as u64, mmu::PROT_GPU_SHARED_RW, guard)?;
-        geometry.compact_page(mapping.iova())?;
+        Self::first_page(geometry, mapping.iova())?;
         Ok(mapping)
+    }
+    /// The block's first page in the firmware's page numbering: Neo's compact
+    /// pages from `USER_BASE`, M5's from its compact window.
+    fn first_page(geometry: BlockGeometry, address: u64) -> Result<u32> {
+        if geometry == BlockGeometry::NEO {
+            fw::compact_page(address)
+        } else {
+            geometry.compact_page(address)
+        }
     }
     pub(crate) fn new(
         dev: &AsahiDrmDevice,
@@ -415,16 +423,21 @@ impl Tvb {
     pub(crate) fn geometry(&self) -> BlockGeometry {
         self.geometry
     }
-    /// Blocks of each growth extension; extensions are packed like the primary.
-    fn extension_blocks(extension: &KernelObject) -> usize {
-        extension.size() / cfg::TVB_BLOCK_SIZE
+    /// Blocks of each growth extension, laid out like the primary at the
+    /// geometry's backing stride ([`BlockGeometry::backing_bytes`] inverted).
+    fn extension_blocks(&self, extension: &KernelObject) -> usize {
+        let geometry = self.geometry;
+        extension
+            .size()
+            .checked_sub(geometry.block_bytes)
+            .map_or(0, |rest| rest / geometry.backing_stride + 1)
     }
     /// Blocks of the primary backing, which a heap never gives back.
     fn primary_blocks(&self) -> usize {
         self.extensions
             .iter()
             .fold(self.blocks(), |blocks, extension| {
-                blocks.saturating_sub(Self::extension_blocks(extension))
+                blocks.saturating_sub(self.extension_blocks(extension))
             })
     }
 
@@ -437,18 +450,41 @@ impl Tvb {
         if target <= self.blocks() {
             return Ok(None);
         }
-        // Growth is the A18 Pro's: M5 parameter buffers keep their initial blocks.
-        if self.geometry != BlockGeometry::NEO || target > cfg::TVB_MAX_BLOCKS {
+        // Neo: `TVB_MAX_BLOCKS`; M5: its inventory less the empty ring slot.
+        if target > self.geometry.max_blocks() {
             return Err(ERANGE);
         }
-        let added = target - self.blocks();
+        self.reserve_growth(target - self.blocks())?;
+        Self::allocate_growth(dev, vm, self.geometry, self.blocks(), target)
+    }
+    /// Room for one extension of `added` blocks in the heap's own lists.
+    fn reserve_growth(&mut self, added: usize) -> Result {
         self.extensions.reserve(1, GFP_KERNEL)?;
         self.addresses.reserve(added, GFP_KERNEL)?;
-        let backing = KernelObject::backing(dev, self.geometry.backing_bytes(added)?, CpuMap::WriteCombined)?;
+        Ok(())
+    }
+    /// Backs and maps the blocks that take a heap of `geometry` from `blocks` to `target`,
+    /// without the heap: an M5 pair stays in place while this runs off the device mutex
+    /// ([`Manager::accept_growth`] adds it to the heap under the mutex).
+    pub(crate) fn allocate_growth(
+        dev: &AsahiDrmDevice,
+        vm: &mmu::Vm,
+        geometry: BlockGeometry,
+        blocks: usize,
+        target: usize,
+    ) -> Result<Option<TvbGrowth>> {
+        if target <= blocks {
+            return Ok(None);
+        }
+        if target > geometry.max_blocks() {
+            return Err(ERANGE);
+        }
+        let added = target - blocks;
+        let backing = KernelObject::backing(dev, geometry.backing_bytes(added)?, CpuMap::WriteCombined)?;
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
         for relative in 0..added {
-            let mapping = Self::map_block(&backing, vm, relative, self.geometry)?;
+            let mapping = Self::map_block(&backing, vm, relative, geometry)?;
             addresses.push(mapping.iova(), GFP_KERNEL)?;
             mappings.push(mapping, GFP_KERNEL)?;
         }
@@ -735,12 +771,15 @@ impl Manager {
             read(core::mem::offset_of!(fw::State, block_capacity)),
             read(core::mem::offset_of!(fw::State, producer)),
             read(core::mem::offset_of!(fw::State, consumer)),
-            read(fw::CONTROL + core::mem::offset_of!(fw::Control, max_pages)),
-            read(fw::CONTROL + core::mem::offset_of!(fw::Control, reset)),
+            read(self.layout.control + core::mem::offset_of!(fw::Control, max_pages)),
+            read(self.layout.control + core::mem::offset_of!(fw::Control, reset)),
             self.initialized);
     }
     pub(crate) fn state_va(&self) -> u64 {
         self.graph.gpu_va()
+    }
+    pub(crate) fn geometry(&self) -> BlockGeometry {
+        self.tvb.geometry()
     }
     pub(crate) fn page_list_va(&self) -> u64 {
         self.page_list_client
@@ -828,7 +867,13 @@ impl Manager {
     pub(crate) fn automatic_target(&mut self) -> Result<Option<usize>> {
         self.sample_max_pages()?;
         let pages = core::mem::take(&mut self.shrink.growth_max);
-        Ok(automatic_growth_target(pages as usize, self.blocks()))
+        Ok(automatic_target_for(pages as usize, self.blocks(), self.tvb.geometry.pages(),
+            self.layout.normal_blocks))
+    }
+    /// The size a firmware growth request grows to: `GROW_BLOCKS` more, within
+    /// the geometry's inventory (S `Manager::firmware_target`).
+    pub(crate) fn firmware_target(&self) -> usize {
+        self.blocks().saturating_add(fw::GROW_BLOCKS).min(self.tvb.geometry.max_blocks())
     }
     /// Records the blocks a pass layout requires, the floor of any shrink.
     /// A pass is being prepared at `now`; the heap counts as busy.
@@ -849,11 +894,14 @@ impl Manager {
     pub(crate) fn grown(&self) -> bool {
         !self.tvb.extensions.is_empty()
     }
-    /// Whether the heap holds growth that a shrink could give back.
+    /// Whether the heap holds growth that a shrink could give back. The shrink
+    /// policy is Neo's (`TVB_PAGES_PER_BLOCK`, the Neo layout); an M5 heap keeps
+    /// its growth until its pair is rebuilt.
     pub(crate) fn shrinkable(&self) -> bool {
-        self.tvb.extensions.last().is_some_and(|extension| {
-            self.blocks() - Tvb::extension_blocks(extension) >= self.shrink_floor()
-        })
+        self.tvb.geometry == BlockGeometry::NEO
+            && self.tvb.extensions.last().is_some_and(|extension| {
+                self.blocks() - self.tvb.extension_blocks(extension) >= self.shrink_floor()
+            })
     }
     /// Advances the shrink policy at `now` and returns the block count an idle
     /// heap should shrink to. `busy` is true while the pair has work in flight
@@ -895,7 +943,7 @@ impl Manager {
         if now.saturating_sub(self.shrink.last_busy) >= SHRINK_IDLE_NS {
             return Ok(Some(self.shrink_floor()));
         }
-        let last = self.tvb.extensions.last().map_or(0, Tvb::extension_blocks);
+        let last = self.tvb.extensions.last().map_or(0, |extension| self.tvb.extension_blocks(extension));
         Ok((last != 0 && self.shrink.credit >= last).then(|| self.blocks() - last))
     }
     fn cursors(&self) -> Result<Cursors> {
@@ -925,12 +973,14 @@ impl Manager {
     /// Validate every retained sparse block and its reserved trailing guard in
     /// one VM snapshot before constructing more aliases.
     pub(crate) fn validate_vm(&self, vm: &mmu::Vm) -> Result {
-        if self.blocks() < cfg::TVB_INITIAL_PAGES.len()
-            || self.blocks() > cfg::TVB_MAX_BLOCKS
+        let geometry = self.tvb.geometry;
+        let minimum = if geometry == BlockGeometry::NEO { cfg::TVB_INITIAL_PAGES.len() } else { 1 };
+        if self.blocks() < minimum
+            || self.blocks() > geometry.max_blocks()
             || !vm.covers_sparse_blocks_with_guards(
                 self.tvb.addresses(),
-                cfg::TVB_BLOCK_SIZE as u64,
-                cfg::TVB_BLOCK_STRIDE,
+                geometry.block_bytes as u64,
+                geometry.stride as u64,
             )
         {
             return Err(EFAULT);
@@ -956,24 +1006,57 @@ impl Manager {
         let Some(growth) = self.tvb.prepare_growth(dev, vm, target)? else {
             return Ok(None);
         };
+        self.plan_growth(previous, target, &mut Some(growth), descriptor).map(Some)
+    }
+
+    /// M5: adds `growth`, allocated off the device mutex for a heap of `from` blocks
+    /// ([`Tvb::allocate_growth`]), as a firmware-request growth to `target`. The heap must
+    /// still hold `from` blocks. `growth` is taken only once the plan is complete, so a refused
+    /// one stays with the caller, to be dropped off the mutex.
+    pub(crate) fn accept_growth(
+        &mut self,
+        vm: &mmu::Vm,
+        growth: &mut Option<TvbGrowth>,
+        from: usize,
+        target: usize,
+    ) -> Result<PreparedGrowth> {
+        let added = growth.as_ref().ok_or(EINVAL)?.addresses.len();
+        if self.blocks() != from || target.checked_sub(from) != Some(added) {
+            return Err(EBUSY);
+        }
+        self.validate_vm(vm)?;
+        self.tvb.reserve_growth(added)?;
+        self.plan_growth(from, target, growth, None)
+    }
+
+    /// The words a growth of `previous` blocks to `target` writes, with `growth`'s blocks. It
+    /// takes `growth` last, when nothing more can fail.
+    fn plan_growth(
+        &self,
+        previous: usize,
+        target: usize,
+        growth: &mut Option<TvbGrowth>,
+        descriptor: Option<[u32; 4]>,
+    ) -> Result<PreparedGrowth> {
+        let geometry = self.tvb.geometry;
+        let block_pages = geometry.pages();
         let before = self.cursors()?;
-        let plan = Growth::new(before, target - previous)?;
+        let plan = Growth::with_capacity(before, target - previous, geometry.capacity)?;
         let firmware_request = descriptor.is_none();
-        let pages = target
-            .checked_mul(cfg::TVB_PAGES_PER_BLOCK)
-            .ok_or(EOVERFLOW)? as u32;
-        let mut added = KVec::with_capacity(growth.addresses.len(), GFP_KERNEL)?;
-        for (index, &address) in growth.addresses.iter().enumerate() {
-            let first = fw::compact_page(address)?;
+        let pages = u32::try_from(target.checked_mul(block_pages).ok_or(EOVERFLOW)?)?;
+        let addresses = &growth.as_ref().ok_or(EINVAL)?.addresses;
+        let mut added = KVec::with_capacity(addresses.len(), GFP_KERNEL)?;
+        for (index, &address) in addresses.iter().enumerate() {
+            let first = Tvb::first_page(geometry, address)?;
             first
-                .checked_add(cfg::TVB_PAGES_PER_BLOCK as u32 - 1)
+                .checked_add(block_pages as u32 - 1)
                 .ok_or(EOVERFLOW)?;
             added.push((plan.added_slot(index)?, first), GFP_KERNEL)?;
         }
         let rebuilt_count = if firmware_request {
             0
         } else {
-            plan.available() * cfg::TVB_PAGES_PER_BLOCK
+            plan.available() * block_pages
         };
         let mut rebuilt = KVec::with_capacity(rebuilt_count, GFP_KERNEL)?;
         if !firmware_request {
@@ -984,33 +1067,33 @@ impl Manager {
                 let first = if ordinal < plan.retained() {
                     let slot = plan.available_slot(ordinal)?;
                     self.graph
-                        .word(fw::BLOCK_TABLE + slot * size_of::<fw::Block>())?
+                        .word(self.layout.blocks + slot * size_of::<fw::Block>())?
                         .load(Ordering::Relaxed)
                 } else {
                     added[ordinal - plan.retained()].1
                 };
                 first
-                    .checked_add(cfg::TVB_PAGES_PER_BLOCK as u32 - 1)
+                    .checked_add(block_pages as u32 - 1)
                     .ok_or(EOVERFLOW)?;
-                for page in 0..cfg::TVB_PAGES_PER_BLOCK {
+                for page in 0..block_pages {
                     rebuilt.push(first + page as u32, GFP_KERNEL)?;
                 }
             }
         }
         let descriptor =
             descriptor.map(|old| fw::reload_descriptor(old, self.page_list_client, pages));
-        Ok(Some(PreparedGrowth {
+        Ok(PreparedGrowth {
             owner: self.graph.gpu_va(),
             previous,
             target,
             before,
             plan,
-            growth,
+            growth: growth.take().ok_or(EINVAL)?,
             added,
             rebuilt,
             pages,
             descriptor,
-        }))
+        })
     }
 
     /// The caller holds the device mutex after revalidating its preparation
@@ -1026,7 +1109,8 @@ impl Manager {
             return Err(EBUSY);
         }
         let firmware_request = candidate.descriptor.is_none();
-        let base = self.graph.pointer(0, fw::SIZE)?.cast::<u32>();
+        let layout = self.layout;
+        let base = self.graph.pointer(0, layout.bytes)?.cast::<u32>();
         // Bounds, actual alignment and every reserved host entry are checked
         // before transferring aliases or consuming the caller-owned plan.
         self.graph.word(0)?;
@@ -1036,7 +1120,9 @@ impl Manager {
         {
             return Err(EIO);
         }
-        if !candidate.before.permits(self.cursors()?, firmware_request) {
+        if !candidate.before.permits_capacity(self.cursors()?, firmware_request,
+            self.tvb.geometry.capacity)
+        {
             return Err(EAGAIN);
         }
         // The callback retains its input on error. The caller can therefore
@@ -1077,13 +1163,13 @@ impl Manager {
             unsafe { AtomicU32::from_ptr(base.add(offset / 4)).store(value, Ordering::Relaxed) };
         };
         for (slot, first) in added.into_iter() {
-            let at = fw::BLOCK_TABLE + slot * size_of::<fw::Block>();
+            let at = layout.blocks + slot * size_of::<fw::Block>();
             write(at, first);
             write(at + 4, 0);
         }
         if descriptor.is_some() {
             for (entry, value) in rebuilt.into_iter().enumerate() {
-                write(fw::PAGE_LIST + entry * 4, value);
+                write(layout.pages + entry * 4, value);
             }
             write(core::mem::offset_of!(fw::State, pages), pages);
             write(core::mem::offset_of!(fw::State, producer), plan.target());
@@ -1091,9 +1177,9 @@ impl Manager {
             write(core::mem::offset_of!(fw::State, last_page), pages - 1);
         }
         append_reserved(&mut self.tvb.extensions, extension);
-        write(fw::CONTROL, plan.target());
+        write(layout.control, plan.target());
         fence(Ordering::SeqCst);
-        write(fw::CONTROL + 4, plan.target());
+        write(layout.control + 4, plan.target());
         fence(Ordering::SeqCst);
         Ok(descriptor)
     }
@@ -1116,11 +1202,15 @@ impl Manager {
         descriptor: [u32; 4],
         truncate: impl FnOnce(usize, usize, &mut KVec<mmu::KernelMapping>) -> Result,
     ) -> Result<Option<([u32; 4], TvbRelease)>> {
+        // The rebuild below writes Neo's layout (see `shrinkable`).
+        if self.tvb.geometry != BlockGeometry::NEO {
+            return Ok(None);
+        }
         let blocks = self.blocks();
         let mut kept = blocks;
         let mut dropped = 0;
         for extension in self.tvb.extensions.iter().rev() {
-            let size = Tvb::extension_blocks(extension);
+            let size = self.tvb.extension_blocks(extension);
             if kept - size < target.max(self.tvb.primary_blocks()) {
                 break;
             }
@@ -1133,7 +1223,7 @@ impl Manager {
         let before = self.cursors()?;
         let retained = (before.total as usize + cfg::TVB_BLOCK_SLOTS - before.read as usize)
             % cfg::TVB_BLOCK_SLOTS;
-        if !before.valid() || before.total != before.committed || retained != blocks {
+        if !before.valid(cfg::TVB_BLOCK_SLOTS) || before.total != before.committed || retained != blocks {
             return Ok(None);
         }
         // Allocation failure only postpones the shrink to a later pass.
@@ -1257,5 +1347,99 @@ mod capacity_tests {
             assert!(ids.entries.iter().all(|entry| entry.free()));
             assert_eq!(ids.returned_count, BUFFER_IDS);
         }
+    }
+}
+
+/// The growth arithmetic at Neo's sizes (where it must equal the fixed-slot
+/// arithmetic it replaced) and at an M5 inventory (a measured 32-block pair).
+#[kunit_tests(asahi_g17_buffer_growth)]
+mod growth_tests {
+    use super::*;
+
+    const M5_CAPACITY: usize = 33 * 294;
+    const M5_PAGES: usize = 0x80000 / BlockGeometry::PAGE;
+
+    #[test]
+    fn neo_geometry_is_the_fixed_constants() {
+        let neo = BlockGeometry::NEO;
+        assert_eq!(neo.capacity, cfg::TVB_BLOCK_SLOTS);
+        assert_eq!(neo.max_blocks(), cfg::TVB_MAX_BLOCKS);
+        assert_eq!(neo.pages(), cfg::TVB_PAGES_PER_BLOCK);
+        assert_eq!(neo.block_bytes, cfg::TVB_BLOCK_SIZE);
+        assert_eq!(neo.stride as u64, cfg::TVB_BLOCK_STRIDE);
+        let layout = layout::Layout::NEO;
+        assert_eq!(layout.blocks, fw::BLOCK_TABLE);
+        assert_eq!(layout.pages, fw::PAGE_LIST);
+        assert_eq!(layout.control, fw::CONTROL);
+        assert_eq!(layout.bytes, fw::SIZE);
+        assert_eq!(layout.normal_blocks, fw::NORMAL_MAX_BLOCKS);
+    }
+
+    #[test]
+    fn neo_growth_wraps_at_the_block_slots() {
+        let slots = cfg::TVB_BLOCK_SLOTS;
+        let at = |total: usize, read: usize| Cursors {
+            total: total as u32,
+            committed: total as u32,
+            read: read as u32,
+        };
+        let plan = Growth::with_capacity(at(slots - 2, 5), 3, slots).unwrap();
+        assert_eq!(plan.retained(), slots - 7);
+        assert_eq!(plan.target(), 1);
+        assert_eq!(plan.added_slot(0).unwrap(), slots - 2);
+        assert_eq!(plan.added_slot(2).unwrap(), 0);
+        assert_eq!(plan.available_slot(plan.available() - 1).unwrap(), 0);
+        // One ring slot stays empty.
+        assert_eq!(Growth::with_capacity(at(4, 5), 1, slots).err(), Some(ENOSPC));
+        assert_eq!(Growth::with_capacity(at(slots, 0), 1, slots).err(), Some(EINVAL));
+        // The automatic target of the fixed-constant function.
+        assert_eq!(automatic_target_for(100, 32, cfg::TVB_PAGES_PER_BLOCK, fw::NORMAL_MAX_BLOCKS),
+            Some(75));
+        assert_eq!(automatic_target_for(60, 32, cfg::TVB_PAGES_PER_BLOCK, fw::NORMAL_MAX_BLOCKS),
+            None);
+        assert_eq!(automatic_target_for(usize::MAX / 4, 0, cfg::TVB_PAGES_PER_BLOCK,
+            fw::NORMAL_MAX_BLOCKS), Some(fw::NORMAL_MAX_BLOCKS));
+    }
+
+    #[test]
+    fn m5_growth_uses_the_inventory() {
+        let at = |total: usize, read: usize| Cursors {
+            total: total as u32,
+            committed: total as u32,
+            read: read as u32,
+        };
+        // A measured pair: 32 blocks, read 0. Past Neo's slot count, which the old
+        // arithmetic would have refused as invalid cursors.
+        let plan = Growth::with_capacity(at(0x20, 0), 103, M5_CAPACITY).unwrap();
+        assert_eq!(plan.target(), 135);
+        assert_eq!(plan.available(), 135);
+        let far = cfg::TVB_BLOCK_SLOTS + 10;
+        let plan = Growth::with_capacity(at(far, far - 32), 8, M5_CAPACITY).unwrap();
+        assert_eq!(plan.added_slot(7).unwrap(), far + 7);
+        assert_eq!(Growth::with_capacity(at(M5_CAPACITY - 1, 0), 1, M5_CAPACITY).err(),
+            Some(ENOSPC));
+        // Measured high-water samples: 467 pages (exact) and 717 (restart), on 32
+        // blocks of 16 pages, with the layout's normal maximum (capacity / 3).
+        let normal = M5_CAPACITY / 3;
+        assert_eq!(automatic_target_for(467, 32, M5_PAGES, normal), Some(88));
+        assert_eq!(automatic_target_for(717, 32, M5_PAGES, normal), Some(135));
+        assert_eq!(automatic_target_for(200, 32, M5_PAGES, normal), None);
+    }
+
+    #[test]
+    fn firmware_paused_growth_checks_the_capacity() {
+        let before = Cursors { total: 40, committed: 40, read: 30 };
+        let consumed = Cursors { read: 38, ..before };
+        let past = Cursors { read: 41, ..before };
+        assert!(before.permits_capacity(consumed, true, M5_CAPACITY));
+        assert!(!before.permits_capacity(past, true, M5_CAPACITY));
+        assert!(!before.permits_capacity(consumed, false, M5_CAPACITY));
+        assert!(before.permits_capacity(before, false, M5_CAPACITY));
+        let beyond = Cursors { total: 40, committed: 40, read: M5_CAPACITY as u32 };
+        assert!(!before.permits_capacity(beyond, true, M5_CAPACITY));
+        // At Neo's slot count, M5-sized cursors are invalid, as before.
+        let big = Cursors { total: 5000, committed: 5000, read: 4990 };
+        assert!(!big.permits_capacity(big, false, cfg::TVB_BLOCK_SLOTS));
+        assert!(big.permits_capacity(big, false, M5_CAPACITY));
     }
 }

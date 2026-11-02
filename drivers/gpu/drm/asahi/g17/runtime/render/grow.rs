@@ -195,7 +195,7 @@ impl crate::g17::Shared {
         loop {
             let lease = self.preparations.enter(false)?;
             let dev = self.drm()?;
-            let (request, slot, mut pair) = {
+            let (request, slot, mut pair, m5) = {
                 let mut state = self.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
                 if firmware.render_control_backpressured() {
@@ -236,8 +236,34 @@ impl crate::g17::Shared {
                     None => None,
                 };
                 render.grow.active = Some(request);
-                (request, slot, pair)
+                // No render entry: an M5 pair may be named (`Pair::grows`, a twin of
+                // `grow_owner` while M5 pairs are not render entries).
+                let m5 = match slot {
+                    Some(_) => None,
+                    None => firmware.queues.m5_grow_begin(&request),
+                };
+                (request, slot, pair, m5)
             };
+            let (m5, m5_refused) = match m5 {
+                Some(Ok(growth)) => (Some(growth), None),
+                Some(Err(error)) => (None, Some(error)),
+                None => (None, None),
+            };
+            // The M5 pair stays in its registry, marked growing: only its new blocks are
+            // allocated here, off the mutex, and its heap is planned under it
+            // (`Pair::finish_growth`).
+            let mut m5_blocks = None;
+            let mut m5_prepared = None;
+            let m5_allocation = m5.as_ref().map(|growth| {
+                crate::g17::buffer::Tvb::allocate_growth(
+                    &dev,
+                    &growth.vm,
+                    growth.geometry,
+                    growth.from,
+                    growth.target,
+                )
+                .map(|blocks| m5_blocks = blocks)
+            });
             let prepared = match pair.as_mut() {
                 Some(pair) => {
                     let vm = pair.context().vm().clone();
@@ -248,12 +274,7 @@ impl crate::g17::Shared {
                     if vm.render_pool_tvb_blocks(slot, pool) != Some(before) {
                         Err(EFAULT)
                     } else {
-                        manager.prepare_growth(
-                            &dev,
-                            &vm,
-                            crate::g17::buffer::firmware_growth_target(before),
-                            None,
-                        )
+                        manager.prepare_growth(&dev, &vm, manager.firmware_target(), None)
                     }
                 }
                 None => Err(ENOENT),
@@ -264,6 +285,24 @@ impl crate::g17::Shared {
             };
             let mut state = self.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            // An M5 growth ends first, whatever follows: its pair's mark goes, and its blocks
+            // are published only for a request still current.
+            let m5_result = match (&m5, m5_allocation) {
+                (Some(growth), Some(allocation)) => {
+                    let current = firmware.queues.render.grow.active == Some(request)
+                        && lease.is_current()
+                        && request.halt_count == firmware.recovery.generation();
+                    let commit = current && allocation.is_ok();
+                    let finished = firmware.queues.m5_grow_finish(
+                        growth,
+                        &mut m5_blocks,
+                        &mut m5_prepared,
+                        commit,
+                    );
+                    Some(allocation.and(finished))
+                }
+                _ => m5_refused.map(Err),
+            };
             if let Some(slot) = slot {
                 let entry = firmware.queues.render.entries[slot].as_mut().ok_or(EIO)?;
                 if entry.pair.is_some() || !entry.growing {
@@ -284,7 +323,9 @@ impl crate::g17::Shared {
             if !lease.is_current() || request.halt_count != firmware.recovery.generation() {
                 continue;
             }
-            let result = if let Some(error) = prepare_error {
+            let result = if let Some(result) = m5_result {
+                result
+            } else if let Some(error) = prepare_error {
                 Err(error)
             } else if prepared.is_none() {
                 Ok(false)
