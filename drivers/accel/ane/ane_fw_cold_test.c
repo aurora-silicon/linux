@@ -285,6 +285,12 @@ static void ane_cold_sleep_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(passed[i], true), NOTIFY_DONE);
 		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(passed[i], false), NOTIFY_DONE);
 	}
+	/* A backend that cycles the engine lets suspend through, not hibernation. */
+	KUNIT_EXPECT_FALSE(test, ane_fw_sleep_refused_cycle(PM_SUSPEND_PREPARE, true, true));
+	KUNIT_EXPECT_TRUE(test, ane_fw_sleep_refused_cycle(PM_HIBERNATION_PREPARE, true, true));
+	KUNIT_EXPECT_TRUE(test, ane_fw_sleep_refused_cycle(PM_RESTORE_PREPARE, true, true));
+	KUNIT_EXPECT_TRUE(test, ane_fw_sleep_refused_cycle(PM_SUSPEND_PREPARE, true, false));
+	KUNIT_EXPECT_FALSE(test, ane_fw_sleep_refused_cycle(PM_HIBERNATION_PREPARE, false, true));
 	/* The device callback backstop: refuse with running firmware only. */
 	KUNIT_EXPECT_EQ(test, ane_fw_sleep_backstop(true), -EBUSY);
 	KUNIT_EXPECT_EQ(test, ane_fw_sleep_backstop(false), 0);

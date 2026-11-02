@@ -8,16 +8,26 @@
 #define ANE_FW_SLEEP_REFUSED "ANE: system sleep not supported yet, suspend refused\n"
 
 /*
- * System sleep while the H16/H17 firmware runs. The firmware was started
- * from the bootloader's preload and cannot yet be stopped and brought back,
- * so while it is retained every sleep state is refused up front, before any
- * device suspends: suspend (including suspend-to-idle), hibernation and
- * restore. Without retained firmware nothing is refused.
+ * System sleep while the H16/H17 firmware runs. Hibernation and restore are
+ * always refused while the firmware is retained: the image would carry a
+ * firmware state the restored kernel cannot match. Suspend passes only for a
+ * backend that cycles the engine across it (powers it off at prepare and
+ * boots it again from the preload after resume, ane_fw_cold.c); otherwise it
+ * is refused up front, before any device suspends. Without retained firmware
+ * nothing is refused.
  */
+static inline bool ane_fw_sleep_refused_cycle(unsigned long event, bool retained, bool cycles)
+{
+	if (!retained)
+		return false;
+	if (event == PM_HIBERNATION_PREPARE || event == PM_RESTORE_PREPARE)
+		return true;
+	return event == PM_SUSPEND_PREPARE && !cycles;
+}
+
 static inline bool ane_fw_sleep_refused(unsigned long event, bool retained)
 {
-	return retained && (event == PM_SUSPEND_PREPARE || event == PM_HIBERNATION_PREPARE ||
-			    event == PM_RESTORE_PREPARE);
+	return ane_fw_sleep_refused_cycle(event, retained, false);
 }
 
 static inline int ane_fw_sleep_event(unsigned long event, bool retained)

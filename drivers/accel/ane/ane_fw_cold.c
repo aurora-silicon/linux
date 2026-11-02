@@ -63,6 +63,16 @@ struct ane_fw_backend {
 	/* Programs and their ABI 3 node, after the program stage. */
 	struct ane_h16_session session;
 	struct ane_fw_surface pool, ipc, heap;
+	/*
+	 * For a re-boot after system sleep: the private TEXT/DATA copies and the
+	 * reserved preload they came from (still no-map and untouched: the
+	 * firmware runs from the copies), the digest DATA had, and the heap tail.
+	 */
+	struct ane_fw_surface preload[2], heap_tail;
+	u64 preload_phys[2];
+	u8 data_digest[SHA256_DIGEST_SIZE];
+	/* Powered down for system sleep; a re-boot is due after resume. */
+	bool slept;
 	struct list_head mappings;
 	/* Serialize stage changes, command publication and retained lifetimes. */
 	struct mutex lock;
@@ -76,25 +86,12 @@ struct ane_fw_backend {
 	struct work_struct start;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
-	/* The bound device holds ANE_SYS for a hand-off until the bring-up does. */
-	bool bind_held;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
  * the platform bus would otherwise resume genpd and attach DMA before probe.
  */
 static struct ane_fw_backend *ane_backend;
-/* The H17 platform device, bound by ane_fw_staged_bind(). */
-static struct device *ane_fw_bound_dev;
-
-/* The bring-up holds ANE_SYS itself now: drop the bind's hand-off reference. */
-static void ane_fw_bind_release(struct ane_fw_backend *b)
-{
-	if (!b->bind_held)
-		return;
-	b->bind_held = false;
-	pm_runtime_put(&b->pdev->dev);
-}
 
 /*
  * Every register access of this backend goes through these helpers, so a
@@ -240,14 +237,187 @@ static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 	}
 }
 
+static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE];
+static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot);
+static int ane_fw_dapf(struct ane_fw_backend *b);
+static int ane_fw_boot(struct ane_fw_backend *b);
+static int ane_fw_startup(struct ane_fw_backend *b);
+
+/*
+ * System sleep, the macOS way (prototype): power the engine off at
+ * PM_SUSPEND_PREPARE and boot it again from the kernel-held preload after
+ * resume. The firmware-protocol parts that t-4515 (what macOS does to the
+ * ANE across sleep, SPEC-ANE-SLEEP.md) will settle are marked TODO(t-4515);
+ * until then this only uses what the cold bring-up already proved.
+ */
+static int ane_fw_power_down(struct ane_fw_backend *b)
+{
+	int ret;
+
+	/*
+	 * TODO(t-4515): stop the firmware the way macOS does (a power-down
+	 * command and its acknowledgment) before cutting power. Today the
+	 * session is idle (gate closed, nothing pending) and power goes off
+	 * under a quiet firmware.
+	 */
+	if (b->transport.error)
+		return b->transport.error;
+	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++)
+		if (b->transport.pending[ch].active)
+			return -EBUSY;
+	/* TODO(t-4515): confirm this order (reverse of the power-up). */
+	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) & ~0xf, b->pmgr + 0xc008);
+	ret = ane_poll32(b, b->pmgr + 0xc008, 0xff, 0, 1, 100000);
+	if (ret)
+		return ret;
+	ane_wr32(b, 3, b->gate + 0xc);
+	ret = ane_poll32(b, b->gate + 0xc, 3, 3, 1, 100000);
+	if (ret)
+		return ret;
+	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc000) & ~0xf, b->pmgr + 0xc000);
+	ret = ane_poll32(b, b->pmgr + 0xc000, 0xff, 0, 1, 100000);
+	if (ret)
+		return ret;
+	b->powered = false;
+	pm_runtime_put_sync(b->power);
+	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep\n");
+	return 0;
+}
+
+/* Copy one preload segment back from its reservation and check it. */
+static int ane_fw_reload_segment(struct ane_fw_backend *b, unsigned int i)
+{
+	struct ane_fw_surface *s = &b->preload[i];
+	u8 digest[SHA256_DIGEST_SIZE];
+	void *source = memremap(b->preload_phys[i], s->size, MEMREMAP_WB);
+
+	if (!source)
+		return -ENOMEM;
+	memcpy(s->cpu, source, s->size);
+	memunmap(source);
+	dma_wmb();
+	sha256(s->cpu, s->size, digest);
+	return memcmp(digest, i ? b->data_digest : ane_fw_text_pin, sizeof(digest)) ?
+	       -EKEYREJECTED : 0;
+}
+
+/*
+ * After resume: power up from the cold state again, restore the DART and
+ * DAPF state the power-off lost, put back pristine TEXT and DATA and clean
+ * runtime memory, then boot and start the firmware as at boot. The shared
+ * allocations are carried into the new transport and served again.
+ */
+static int ane_fw_reboot(struct ane_fw_backend *b)
+{
+	struct device *dev = &b->pdev->dev;
+	struct ane_fw_transport *old;
+	int ret;
+
+	/* We powered it down ourselves: the cold PMGR state is our evidence. */
+	ret = ane_fw_power_up(b, true);
+	if (ret)
+		return ret;
+	/*
+	 * TODO(t-4515): the DART lost SID0's translation registers with
+	 * ANE_SYS. Attaching the domain again rewrites them; check on the
+	 * hardware that the cold ANE DART profile accepts the detach.
+	 */
+	iommu_detach_device(b->domain, dev);
+	ret = iommu_attach_device(b->domain, dev);
+	if (ret)
+		return ret;
+	ret = ane_fw_dapf(b);
+	if (ret)
+		return ret;
+	ret = ane_fw_reload_segment(b, 0);
+	if (!ret)
+		ret = ane_fw_reload_segment(b, 1);
+	if (ret)
+		return ret;
+	memset(b->heap.cpu, 0, b->heap.size);
+	if (b->heap_tail.cpu)
+		memset(b->heap_tail.cpu, 0, b->heap_tail.size);
+	memset(b->pool.cpu, 0, b->pool.size);
+	memset(b->ipc.cpu, 0, b->ipc.size);
+	dma_wmb();
+	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
+	if (!old)
+		return -ENOMEM;
+	ret = ane_fw_boot(b);
+	if (!ret)
+		ane_fw_transport_carry_shared(&b->transport, old);
+	kfree(old);
+	/* TODO(t-4515): does macOS replay the full startup set after wake? */
+	if (!ret)
+		ret = ane_fw_startup(b);
+	if (ret)
+		return ret;
+	b->transport.allow_free = true;
+	ane_h16_session_restart(&b->session);
+	dev_info(dev, "H17 ANE: booted again after system sleep; earlier programs are lost\n");
+	return 0;
+}
+
+static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
+{
+	int ret;
+
+	guard(mutex)(&b->lock);
+	if (b->stage != ANE_STAGE_PROGRAM)
+		return -EBUSY;
+	ane_h16_session_sleep(&b->session, true);
+	ret = ane_fw_power_down(b);
+	if (ret) {
+		/*
+		 * Still powered: refuse the sleep and keep running. A failure
+		 * after power went off quarantines instead.
+		 */
+		if (!b->powered)
+			ane_fw_quarantine(b, ret);
+		ane_h16_session_sleep(&b->session, false);
+		return ret;
+	}
+	b->slept = true;
+	return 0;
+}
+
+static void ane_fw_sleep_resume(struct ane_fw_backend *b)
+{
+	int ret;
+
+	guard(mutex)(&b->lock);
+	if (!b->slept)
+		return;
+	b->slept = false;
+	ret = ane_fw_reboot(b);
+	if (ret) {
+		ane_fw_quarantine(b, ret);
+		b->session.quarantined = true;
+	}
+	ane_h16_session_sleep(&b->session, false);
+}
+
 static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
 {
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, pm_notifier);
 	bool retained = READ_ONCE(b->retained);
 
-	if (ane_fw_sleep_refused(event, retained))
+	if (event == PM_POST_SUSPEND) {
+		ane_fw_sleep_resume(b);
+		return NOTIFY_DONE;
+	}
+	if (event == PM_SUSPEND_PREPARE && retained) {
+		if (!ane_fw_sleep_prepare(b))
+			return NOTIFY_DONE;
 		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
-	return ane_fw_sleep_event(event, retained);
+		return NOTIFY_BAD;
+	}
+	/* Hibernation and restore stay refused. */
+	if (ane_fw_sleep_refused_cycle(event, retained, true)) {
+		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
+		return NOTIFY_BAD;
+	}
+	return NOTIFY_DONE;
 }
 
 static int ane_fw_retain(struct ane_fw_backend *b)
@@ -440,19 +610,24 @@ static const struct ane_fw_transport_ops ane_fw_ops = {
 static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
 {
 	struct device *dev = &b->pdev->dev;
+
+	b->power = dev_pm_domain_attach_by_id(dev, 0);
+	if (IS_ERR_OR_NULL(b->power))
+		return b->power ? PTR_ERR(b->power) : -ENODEV;
+	return ane_fw_power_up(b, raw_boot);
+}
+
+/*
+ * ANE_SYS on, then the child power steps from the cold state, then the
+ * engine's reset values. At boot and again after a power-down for sleep.
+ */
+static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot)
+{
+	struct device *dev = &b->pdev->dev;
 	u64 ce;
 	int ret;
 
-	/*
-	 * The bound device carries ANE_SYS itself: platform_probe attached it
-	 * to its single domain, so genpd sees the engine's own reference.
-	 */
-	if (!dev->pm_domain || dev != ane_fw_bound_dev)
-		return -ENODEV;
-	b->power = dev;
 	ret = pm_runtime_resume_and_get(b->power);
-	/* The bring-up holds ANE_SYS now (or failed and stops here). */
-	ane_fw_bind_release(b);
 	if (ret < 0)
 		return ret;
 	if ((ane_rd32(b, b->pmgr + 0x290) & 0xff) != 0xff)
@@ -600,7 +775,10 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		sha256_final(&hash, digest);
 		if (memcmp(digest, i ? data_pin : ane_fw_text_pin, sizeof(digest)))
 			return -EKEYREJECTED;
+		b->preload[i] = snapshots[i];
+		b->preload_phys[i] = physical[i];
 	}
+	memcpy(b->data_digest, data_pin, sizeof(b->data_digest));
 	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
 	dma_wmb();
 	ret = ane_fw_heap_tail(dva, size, ANE_FW_POOL_DVA, &tail, &tail_size);
@@ -608,6 +786,8 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		return ret;
 	/* Zeroed by the coherent allocation; kept until reset like the preload. */
 	ret = ane_fw_alloc_at(b, tail, tail_size, IOMMU_READ | IOMMU_WRITE, &heap_tail);
+	if (!ret)
+		b->heap_tail = heap_tail;
 	if (!ret)
 		dev_info(&b->pdev->dev, "ANE map: firmware heap tail at %#llx bytes %#llx\n",
 			 tail, tail_size);
@@ -1042,7 +1222,6 @@ static void ane_fw_start_work(struct work_struct *work)
 		if (ret < 0) {
 			dev_err(&b->pdev->dev, "H17 ANE: boot bring-up stopped at %s, error %zd\n",
 				steps[i], ret);
-			ane_fw_bind_release(b);
 			return;
 		}
 	}
@@ -1198,81 +1377,9 @@ fail:
 }
 
 /*
- * Bind the H17 platform device. Left unbound, it is a fw_devlink consumer
- * that never binds, so the PMGR power controller's sync_state never runs and
- * genpd keeps every boot-on domain under it on (stay_on), ANE_SYS included,
- * whatever the backend puts: the domain never powers off, at idle or across
- * system sleep. Bound, the device carries ANE_SYS through its own runtime
- * PM: platform_probe attached it to its single domain. With a loader
- * hand-off the engine is powered as the loader left it, so the bind holds
- * ANE_SYS until the bring-up takes its own reference (ane_fw_power()) or
- * stops; without one the device is runtime suspended and the domain is
- * free to go off.
- */
-int ane_fw_staged_bind(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct ane_fw_backend *b = ane_backend;
-	bool handoff = b && b->pdev == pdev;
-	int ret;
-
-	if (ane_fw_bound_dev)
-		return -EBUSY;
-	if (handoff) {
-		ret = pm_runtime_set_active(dev);
-		if (ret)
-			return ret;
-		pm_runtime_get_noresume(dev);
-		b->bind_held = true;
-	}
-	ret = devm_pm_runtime_enable(dev);
-	if (ret) {
-		if (handoff) {
-			b->bind_held = false;
-			pm_runtime_put_noidle(dev);
-			pm_runtime_set_suspended(dev);
-		}
-		return ret;
-	}
-	ane_fw_bound_dev = dev;
-	dev_info(dev, "H17 ANE: bound; %s\n", handoff ?
-		 "ANE_SYS held until the bring-up owns it" : "no hand-off, engine left off");
-	return 0;
-}
-
-bool ane_fw_staged_bound(struct device *dev)
-{
-	return dev && dev == ane_fw_bound_dev;
-}
-
-void ane_fw_staged_unbind(struct platform_device *pdev)
-{
-	struct ane_fw_backend *b = ane_backend;
-
-	if (b && b->pdev == pdev)
-		ane_fw_bind_release(b);
-	ane_fw_bound_dev = NULL;
-}
-
-/*
- * Device suspend of the bound H17 device: the PM notifier already refused
- * system sleep while the firmware is retained; this is the backstop for a
- * sleep path that skipped the notifiers.
- */
-int ane_fw_staged_suspend(struct device *dev)
-{
-	struct ane_fw_backend *b = ane_backend;
-	bool retained = b && &b->pdev->dev == dev && READ_ONCE(b->retained);
-
-	if (retained)
-		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
-	return ane_fw_sleep_backstop(retained);
-}
-
-/*
- * Start the bring-up once the platform driver is registered: its probe has
- * bound this device (ane_fw_staged_bind()) by then and cannot race the power
- * sequence.
+ * Start the bring-up once the platform driver is registered: its probe of
+ * this device (refused, but with a genpd attach and detach) has finished by
+ * then and cannot race the power sequence.
  */
 void ane_fw_staged_start(void)
 {
