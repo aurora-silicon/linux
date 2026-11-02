@@ -863,8 +863,10 @@ static int apple_pmc_floor_add(struct apple_pmc *pmc, struct device_node *np)
 	const struct apple_pmc_hw *hw = pmc->hw;
 	struct device *dev = pmc->dev;
 	struct apple_pmc_domain *dom;
+	struct of_phandle_args parent;
 	const char *label;
 	u32 rail, level;
+	unsigned int i;
 	int ret;
 
 	if (of_property_read_u32(np, "apple,rail", &rail) ||
@@ -915,6 +917,19 @@ static int apple_pmc_floor_add(struct apple_pmc *pmc, struct device_node *np)
 		return dev_err_probe(dev, ret, "%pOF: provider failed\n", np);
 	dom->provider = true;
 	pmc->floor_rails |= BIT(rail);
+
+	/* A floor may sit on other domains, such as a floor on another rail. */
+	for (i = 0; !of_parse_phandle_with_args(np, "power-domains",
+						"#power-domain-cells", i,
+						&parent); i++) {
+		struct of_phandle_args child = { .np = np };
+
+		ret = of_genpd_add_subdomain(&parent, &child);
+		of_node_put(parent.np);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "%pOF: failed to join parent domain\n", np);
+	}
 
 	return 0;
 }
