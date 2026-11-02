@@ -167,6 +167,7 @@ int main(void){
  assert(qb->jedec_alt[0]==0xef&&qb->jedec_alt[1]==0x65&&qb->jedec_alt[2]==0x17);
  machine="apple,j700";qb=apple_qspi_nvram_write_board(&t8140,0x385110000ULL);
  assert(qb&&qb->nvram_start==0x24000&&qb->nvram_size==0x1d0000&&qb->jedec[2]==0x15&&qb->bp_ok==0x1c);
+ assert(qb->jedec_alt[0]==0xc8&&qb->jedec_alt[1]==0x83&&qb->jedec_alt[2]==0x15);
  puts("PASS J613/J713/J700/J616s board, controller and full-width aperture qualification (140 combinations)");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
@@ -260,6 +261,37 @@ int main(void){
  reset();memset(jedec,0,3);arm();wire_count=0;o=program(0x700000,1,data);
  assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
  puts("PASS W25Q64 J616s part: second ID admitted with SR2 read and checks, third ID and empty slot refused");
+ /* J700 GD25UF16E part: the second slot of the J700 entry, GigaDevice checks. */
+ const u8 w25q16[3]={0xef,0x65,0x15},gd25uf16e[3]={0xc8,0x83,0x15};
+ reset();memcpy(jedec,gd25uf16e,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
+ memset(data,0x55,sizeof(data));sr[0]=0x04;sr[1]=0x02;
+ o=program(0x700000,256,data);wire_count=0;assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&sent(0x35)&&sent(0x15));
+ assert(!memcmp(flash+0x700000,data,256)&&sr[0]==0x04&&sr[1]==0x02);
+ erase.addr.val=0x701000;memset(flash+0x701000,0,4096);
+ wire_count=0;assert(!apple_qspi_exec_op(&mem,&erase)&&sent(0x20));
+ for(unsigned int i=0;i<4096;i++)assert(flash[0x701000+i]==0xff);
+ wire_count=0;assert(!apple_qspi_exec_op(&mem,&rdcr2)&&sent(0x35));
+ /* SRP0, SRP1, LB1-LB3 and the SR3 drive, dummy and low-power bits stay as found. */
+ sr[0]=0x84;sr[1]=0x3b;sr[2]=0x67;o=program(0x700200,1,data);wire_count=0;
+ assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02)&&flash[0x700200]==0x55);
+ /* Refused before WREN: WIP, WEL, BP3, BP4, CMP, SUS1 and SUS2. */
+ const u8 gd_refused[][3]={{0x01,0x02,0},{0x02,0x02,0},{0x24,0x02,0},{0x44,0x02,0},
+  {0x04,0x42,0},{0x04,0x82,0},{0x04,0x06,0}};
+ for(unsigned int i=0;i<ARRAY_SIZE(gd_refused);i++){
+  reset();memcpy(jedec,gd25uf16e,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
+  memcpy(sr,gd_refused[i],3);wire_count=0;o=program(0x700000,1,data);
+  assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06)&&!sent(0x02));
+ }
+ /* BP0 is refused where the board does not name it. */
+ reset();memcpy(jedec,gd25uf16e,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);arm();
+ sr[0]=0x04;wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-EACCES&&!sent(0x06));
+ /* The same SR1 bit 5 is Winbond TB, left as found on the W25Q16 in the first slot. */
+ reset();memcpy(jedec,w25q16,3);memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
+ sr[0]=0x24;wire_count=0;o=program(0x700000,1,data);assert(!apple_qspi_exec_op(&mem,&o)&&sent(0x02));
+ /* Other GigaDevice IDs stay refused. */
+ reset();memcpy(jedec,gd25uf16e,3);jedec[1]=0x60;memcpy(q.jedec,w25q16,3);memcpy(q.jedec_alt,gd25uf16e,3);q.bp_ok=0x1c;arm();
+ wire_count=0;o=program(0x700000,1,data);assert(apple_qspi_exec_op(&mem,&o)==-ENODEV&&!sent(0x06));
+ puts("PASS GD25UF16E J700 part: second ID admitted with GigaDevice SR1/SR2/SR3 checks; WIP, WEL, BP3, BP4, CMP, SUS1, SUS2 and other IDs refused");
  /* Model spi-mem's outer reference. Every private JEDEC/status/WREN,
   * completion poll, WRDI and readback must finish before the idle stamp.
   * Hardware tests must still prove genpd and the actual suspend timer. */
@@ -340,6 +372,13 @@ def main():
             ('mx-eqio-read', '!ret && id[0] == APPLE_QSPI_MFR_MACRONIX', '0'),
             ('jedec-alt', 'memcmp(id, qspi->jedec_alt, sizeof(id))', '1'),
             ('jedec-alt-empty', '!qspi->jedec_alt[0] || ', ''),
+            ('gd-dispatch', 'return apple_qspi_gd_status_allows_write(sr1, sr2, bp_ok);',
+             'return apple_qspi_status_allows_write(sr1, sr2, sr3, bp_ok);'),
+            ('gd-bp34', '!(sr1 & 0x7c & ~bp_ok)', '!(sr1 & 0x1c & ~bp_ok)'),
+            ('gd-sus2', '!(sr2 & 0xc4)', '!(sr2 & 0xc0)'),
+            ('gd-cmp', '!(sr2 & 0xc4)', '!(sr2 & 0x84)'),
+            ('j700-gd-id', 'APPLE_QSPI_JEDEC_GD25UF16E\t{ 0xc8, 0x83, 0x15 }',
+             'APPLE_QSPI_JEDEC_GD25UF16E\t{ 0xc8, 0x83, 0x16 }'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
             ('fault-latch', 'write_fault_latched = true;', 'write_fault_latched = false;'),
