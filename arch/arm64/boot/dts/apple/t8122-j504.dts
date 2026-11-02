@@ -17,6 +17,7 @@
 / {
 	compatible = "apple,j504", "apple,t8122", "apple,arm-platform";
 	model = "Apple MacBook Pro (14-inch, M3, 2023)";
+	chassis-type = "laptop";
 
 	led-controller {
 		compatible = "pwm-leds";

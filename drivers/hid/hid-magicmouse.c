@@ -2481,6 +2481,15 @@ static void magicmouse_remove(struct hid_device *hdev)
 }
 
 #ifdef CONFIG_PM
+static int magicmouse_resume(struct hid_device *hdev)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+
+	if (msc)
+		magicmouse_haptic_forget_mode(msc);
+	return 0;
+}
+
 static int magicmouse_reset_resume(struct hid_device *hdev)
 {
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
@@ -2567,6 +2576,7 @@ static struct hid_driver magicmouse_driver = {
 	.input_mapping = magicmouse_input_mapping,
 	.input_configured = magicmouse_input_configured,
 #ifdef CONFIG_PM
+	.resume = magicmouse_resume,
 	.reset_resume = magicmouse_reset_resume,
 #endif
 };

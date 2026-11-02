@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_JPEG
+	tristate "Apple Silicon JPEG codec skeleton"
+	depends on VIDEO_DEV
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+	depends on OF_ADDRESS && IOMMU_API && PM
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Build the common Apple JPEG memory-to-memory driver scaffold.
+	  Hardware revisions are not qualified yet: probe reads HWREV and
+	  refuses all currently described hardware. No reset, interrupt
+	  acknowledgment or DMA job is implemented, and streaming is refused.
+	  Device tree nodes must remain disabled pending hardware qualification.
+
+config VIDEO_APPLE_JPEG_KUNIT_TEST
+	tristate "KUnit tests for Apple JPEG admission" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test exact per-compatible HWREV matching and the empty target
+	  allow-lists, including invalid readbacks and revisions observed
+	  on other SoCs. Synthetic match data exercises the admission helper.
+	  These tests do not access hardware or qualify any target revision.

@@ -50,6 +50,15 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'aop-als-channel-tests.py': [([], PASS)],
+    'mtp-pm-tests.py': [(out(), PASS),
+                         (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
+    'ave-pm-tests.py': [(out(), PASS),
+                         (out() + ['--old-ref', '4db3a5a22c43'], PASS)],
+    'ave-probe-pm-tests.py': [(out(), PASS), (out() + ['--negative-control'], PASS)],
+    'binding-lifetime-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('no-close', 'no-join'), out()),
+    'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'atc-usb3-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
@@ -89,6 +98,9 @@ ASAHI_TESTS = {
     'g15-retention-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-stats-drain-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
+    'g17-telemetry-integration-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('fields', 'range', 'timestamp', 'age',
+                                   'quarantine', 'epoch', 'legacy-format'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
@@ -108,12 +120,15 @@ ASAHI_TESTS = {
     'mt7932-connect-result-tests.py': [(out('--output'), PASS)],
     'mt7932-owe-retry-tests.py': [(out(), PASS)],
     'mt7932-policy-6ghz-tests.py': [([], PASS)],
+    'mt7932-policy-classes-tests.py': [([], PASS)],
+    'mt7932-scan-tests.py': [(out(), PASS)],
     'neo-auxiliary-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutation'], KILL),
                                (out('--output') + ['--old'], KILL)],
     'neo-stability-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy',
                                    'usb-rpm', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
+    'pciec-policy-tests.py': [(out(), PASS)],
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
@@ -134,8 +149,12 @@ ASAHI_TESTS = {
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
-ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs']
+ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
+              'usage-tests.rs']
 ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
+
+# Production G17 decoder vectors also build directly with rustc --test.
+ASAHI_RUST.append('g17-telemetry-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).

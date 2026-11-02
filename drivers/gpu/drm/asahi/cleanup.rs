@@ -33,7 +33,7 @@ impl QueueOwner {
         // SAFETY: The name is NUL terminated and contains no format specifiers.
         let raw = unsafe {
             bindings::alloc_workqueue_noprof(
-                c_str!("asahi-ts-cleanup").as_char_ptr(),
+                c_str!("aurora-ts-cleanup").as_char_ptr(),
                 bindings::wq_flags_WQ_UNBOUND | bindings::wq_flags_WQ_MEM_RECLAIM,
                 0,
             )

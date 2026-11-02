@@ -58,6 +58,14 @@ builds. Packagers prepare this entry point in their build roots. Make does not
 fetch tools or install anything system-wide. If the entry point is absent,
 Kbuild uses ``bindgen`` from PATH and the same mandatory assertions apply.
 
+``make LLVM=1 rustavailable`` probes the selected generator's empty-record
+alignment support, including locally patched versions. An affected generator
+prints the preparation command above. This is a warning so it cannot silently
+disable Rust drivers during configuration; the layout assertions still reject
+incorrect bindings when compiling the kernel. Prepare the tool before running
+``defconfig`` and merging ``asahi.config``, then keep the resolved configuration
+unchanged for the kernel build.
+
 The generated bindings are consumed by the Rust kernel crate and by several
 drivers. After changing the bindings generator, rebuild the kernel Image and
 all modules together.

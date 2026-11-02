@@ -1233,6 +1233,11 @@ static int atcphy_pipehandler_lock_timeout(struct apple_atcphy *atcphy, u32 time
 	dev_dbg(atcphy->dev, "PIPE request: req=%#x mode=%u pipe=%u host=%u dirty=%u\n",
 		requested, atcphy->mode, atcphy->pipe_state,
 		atcphy->host_active, atcphy->mode_dirty);
+	dev_dbg(atcphy->dev, "PIPE before lock: ack=%#x aon=%#x mux=%#x override=%#x\n",
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK),
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
+		readl(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE));
 	if (requested & PIPEHANDLER_LOCK_EN) {
 		dev_dbg(atcphy->dev, "Pipehandler lock already requested\n");
 	} else {
@@ -5082,6 +5087,14 @@ static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_p
 	ret = usb_hub_port_power_on(pm->root, 1);
 	if (ret < 0)
 		dev_warn(atcphy->dev, "Failed to power the SuperSpeed port on: %d\n", ret);
+	else if (!ret && atcphy->fixed_usb2 && atcphy->hw->has_t8140_dp) {
+		int retrain = usb_hub_port_retrain(pm->root, 1);
+
+		/* An absent SS receiver is normal for a USB2-only device or cable. */
+		if (retrain < 0 && retrain != -ENOTCONN)
+			dev_warn(atcphy->dev, "SuperSpeed handover retrain failed: %d\n", retrain);
+		/* Power was restored even if no receiver answered the bounded retrain. */
+	}
 #endif
 	return ret;
 }
@@ -6202,6 +6215,7 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb4 = true,
+	.park_pipe_unlocked = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8122 = {

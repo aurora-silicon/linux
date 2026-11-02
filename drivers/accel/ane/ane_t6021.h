@@ -742,6 +742,7 @@ bool ane_t6021_fwload_options_ok(void);
 bool ane_t6021_fwload_placement_ok(struct device *dev);
 bool ane_t6021_fwload_requested(void);
 
+struct ane_fw_platform;
 struct ane_fw_image;
 struct ane_asc_tunables;
 
@@ -753,8 +754,9 @@ struct ane_asc_tunables;
  *    for this SoC (T6021 only), so fw_alias_reserved=1 may map it; the
  *    other SoCs always run the firmware from driver-owned memory.
  *  ps_cpu_off: the ANE CPU ps word in the DT "pmgr" window (probe guard).
- *  pwgate_off: the PWGATE word in the DT "set" window, checked
- *    open before any engine read; 0 = not checked.
+ *  pwgate_off: the power gate word in the DT "set" window. The driver
+ *    opens it before ane_sys_cpu powers on, closes it after that state
+ *    powers off, and checks it open before any engine read; 0 = no gate.
  *  pmu_pa: the page of the seven ANE ps words; the firmware's power
  *    service writes them through its DART at IOVA == PA. ps_off: the
  *    first of the seven in that page.
@@ -762,6 +764,7 @@ struct ane_asc_tunables;
  *    trace_td; 0 = trace_td unsupported.
  */
 struct ane_t602x_soc {
+	const struct ane_fw_platform *platform;
 	u32 soc;
 	u32 soc_revision;
 	bool revision_fuse;
