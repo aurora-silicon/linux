@@ -1042,6 +1042,22 @@
 			power-domains = <&ps_gfx>;
 		};
 
+		/*
+		 * ANE0: soc-device record 14, DVFS ordinal 4. Level 2 is the fast
+		 * class of the PMP's own ANE fabric and DCS bandwidth controllers.
+		 * The ANE takes it as its performance domain, so the SoC rail
+		 * floor is its second parent.
+		 */
+		pmp_report_ane: report@e {
+			compatible = "apple,t6041-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xe>;
+			label = "pmp-ane";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_ane_cpu>, <&pmc_soc_max>;
+			apple,dvfs = <0x1f4 2>;
+		};
+
 		/* AVD0: soc-device record 23, DVFS ordinal 13; state 2 is VMAX. */
 		pmp_report_avd0: report@17 {
 			compatible = "apple,t6041-pmp-v2-report-entry",

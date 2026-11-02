@@ -4925,11 +4925,12 @@
 	memory-region = <&ane_fw_text>, <&ane_fw_data>;
 	memory-region-names = "firmware-text", "firmware-data";
 	/*
-	 * The SoC rail floor, held only while ANE requests are in flight:
-	 * MobileNet engine time 0.87 -> 0.54 ms on an idle system.
+	 * The PMP's fast ANE class on top of the SoC rail floor, held only
+	 * while ANE requests are in flight. The floor alone took MobileNet
+	 * engine time from 0.87 to 0.54 ms on an idle system.
 	 */
 	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
-			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
+			<&ps_ane_td>, <&ps_ane_base>, <&pmp_report_ane>;
 	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
 	status = "okay";
 };
