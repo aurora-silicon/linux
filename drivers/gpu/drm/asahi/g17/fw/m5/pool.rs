@@ -61,14 +61,27 @@ fn round_page(bytes: usize) -> Result<usize, PoolError> {
         .ok_or(PoolError::Geometry)
 }
 
+/// The bytes of the inventory a pool of `block_bytes` blocks describes: the ring's limit, rounded
+/// down to whole blocks.
+fn inventory_bytes(block_bytes: usize) -> Result<u64, PoolError> {
+    if block_bytes == 0 || block_bytes % POOL_PAGE != 0 {
+        return Err(PoolError::Geometry);
+    }
+    Ok(INVENTORY_BYTES.min(RING_MAX_PAGES * POOL_PAGE as u64) & !(block_bytes as u64 - 1))
+}
+
+/// The most blocks of `block_bytes` a pool can back: its whole address inventory (256 blocks of
+/// 16 MiB on G17D). The directory always spans the inventory, so every count up to this one has
+/// the same encodings.
+pub(crate) fn inventory_blocks(block_bytes: usize) -> Result<usize, PoolError> {
+    usize::try_from(inventory_bytes(block_bytes)? / block_bytes as u64)
+        .map_err(|_| PoolError::Geometry)
+}
+
 impl PoolGeometry {
     /// A pool of `blocks` backed blocks of `block_bytes` over the full inventory.
     pub(crate) fn of(blocks: usize, block_bytes: usize) -> Result<Self, PoolError> {
-        if block_bytes == 0 || block_bytes % POOL_PAGE != 0 {
-            return Err(PoolError::Geometry);
-        }
-        let bytes =
-            INVENTORY_BYTES.min(RING_MAX_PAGES * POOL_PAGE as u64) & !(block_bytes as u64 - 1);
+        let bytes = inventory_bytes(block_bytes)?;
         Self::new(blocks, block_bytes, (bytes / POOL_PAGE as u64) as u32)
     }
 
