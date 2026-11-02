@@ -3548,7 +3548,35 @@ static struct ane_t6021_pm *ane_rtclient_get_sleep_pm(struct device *dev)
 	return &ane->sleep_pm;
 }
 
-DEFINE_ANE_T6021_SYSTEM_PM_OPS(ane_rtclient_sleep_pm, ane_rtclient_get_sleep_pm);
+/*
+ * One platform driver binds the H13/H14 rtclient and, through the shared
+ * firmware platform, the H16 backend, each with its own drvdata. Dispatch by
+ * generation: the rtclient sleep path must never see an H16 device.
+ */
+static bool ane_rtclient_is_platform(struct device *dev)
+{
+	const struct ane_t602x_soc *soc = of_device_get_match_data(dev);
+
+	return soc && ane_fw_sleep_path(soc->platform) == ANE_SLEEP_FW_BACKEND;
+}
+
+static int __maybe_unused ane_rtclient_sleep_pm_suspend(struct device *dev)
+{
+	if (ane_rtclient_is_platform(dev))
+		return ane_h16_backend_suspend(dev);
+	return ane_t6021_pm_suspend(ane_rtclient_get_sleep_pm(dev));
+}
+
+static int __maybe_unused ane_rtclient_sleep_pm_resume(struct device *dev)
+{
+	if (ane_rtclient_is_platform(dev))
+		return ane_h16_backend_resume(dev);
+	return ane_t6021_pm_resume(ane_rtclient_get_sleep_pm(dev));
+}
+
+static const struct dev_pm_ops __maybe_unused ane_rtclient_sleep_pm = {
+	SYSTEM_SLEEP_PM_OPS(ane_rtclient_sleep_pm_suspend, ane_rtclient_sleep_pm_resume)
+};
 
 static int ane_rtclient_probe_inner(struct platform_device *pdev,
 				    bool *hardware_touched)

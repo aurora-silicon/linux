@@ -37,7 +37,21 @@ static void ane_preload_ranges_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_fw_preload_ranges_valid(&soc, phys, size, dva));
 }
 
+/*
+ * H16 and H17 devices (any firmware platform) take the backend's sleep path,
+ * never the rtclient one; only the H13/H14 rtclient (no platform) does.
+ */
+static void ane_platform_sleep_path_test(struct kunit *test)
+{
+	static const struct ane_fw_platform h16 = { .soc = 0x6041 }, h17 = { .soc = 0x8140 };
+
+	KUNIT_EXPECT_EQ(test, ane_fw_sleep_path(&h16), ANE_SLEEP_FW_BACKEND);
+	KUNIT_EXPECT_EQ(test, ane_fw_sleep_path(&h17), ANE_SLEEP_FW_BACKEND);
+	KUNIT_EXPECT_EQ(test, ane_fw_sleep_path(NULL), ANE_SLEEP_RTCLIENT);
+}
+
 static struct kunit_case ane_fw_platform_cases[] = {
+	KUNIT_CASE(ane_platform_sleep_path_test),
 	KUNIT_CASE(ane_preload_ranges_test),
 	{}
 };
