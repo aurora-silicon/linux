@@ -4373,6 +4373,8 @@ static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 #endif /* CONFIG_PM */
 
+static int brcmf_cfg80211_update_country(struct brcmf_cfg80211_info *cfg);
+
 static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
@@ -4398,6 +4400,8 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			cfg->wowl.nd_enabled = false;
 		}
 	}
+	cfg->suspended = false;
+	brcmf_cfg80211_update_country(cfg);
 	return 0;
 }
 
@@ -4530,6 +4534,7 @@ exit:
 	brcmf_dbg(TRACE, "Exit\n");
 	/* clear any scanning activity */
 	cfg->scan_status = 0;
+	cfg->suspended = true;
 	return 0;
 }
 
@@ -8836,14 +8841,56 @@ exit:
 	return err;
 }
 
-static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
-					struct regulatory_request *req)
+static int brcmf_cfg80211_update_country(struct brcmf_cfg80211_info *cfg)
 {
-	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_if *ifp = brcmf_get_ifp(cfg->pub, 0);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmf_fil_country_le ccreq;
 	s32 err;
+
+	if (!cfg->country_pending || cfg->suspended ||
+	    drvr->bus_if->state != BRCMF_BUS_UP)
+		return 0;
+
+	err = brcmf_fil_iovar_data_get(ifp, "country", &ccreq, sizeof(ccreq));
+	if (err) {
+		bphy_err(drvr, "Country code iovar returned err = %d\n", err);
+		return err;
+	}
+
+	err = brcmf_translate_country_code(ifp->drvr, cfg->country_alpha2, &ccreq);
+	if (err) {
+		/* Because we ignore the default country code above,
+		 * we will start out in our custom reg domain, but the chip
+		 * may already be set to the right country.
+		 * As such, we force the bands to be re-set the first
+		 * time we try to set a country for real.
+		 */
+		if (err != -EAGAIN)
+			return err;
+		if (!cfg->force_band_setup) {
+			cfg->country_pending = false;
+			return 0;
+		}
+	}
+	err = brcmf_fil_iovar_data_set(ifp, "country", &ccreq, sizeof(ccreq));
+	if (err) {
+		bphy_err(drvr, "Firmware rejected country setting\n");
+		return err;
+	}
+	err = brcmf_setup_wiphybands(cfg);
+	if (err)
+		return err;
+	cfg->force_band_setup = false;
+	cfg->country_pending = false;
+	return 0;
+}
+
+static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
+					struct regulatory_request *req)
+{
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_pub *drvr = cfg->pub;
 	int i;
 
 	/* The country code gets set to "00" by default at boot, ignore */
@@ -8861,30 +8908,12 @@ static void brcmf_cfg80211_reg_notifier(struct wiphy *wiphy,
 	brcmf_dbg(TRACE, "Enter: initiator=%d, alpha=%c%c\n", req->initiator,
 		  req->alpha2[0], req->alpha2[1]);
 
-	err = brcmf_fil_iovar_data_get(ifp, "country", &ccreq, sizeof(ccreq));
-	if (err) {
-		bphy_err(drvr, "Country code iovar returned err = %d\n", err);
-		return;
-	}
-
-	err = brcmf_translate_country_code(ifp->drvr, req->alpha2, &ccreq);
-	if (err) {
-		/* Because we ignore the default country code above,
-		 * we will start out in our custom reg domain, but the chip
-		 * may already be set to the right country.
-		 * As such, we force the bands to be re-set the first
-		 * time we try to set a country for real.
-		 */
-		if (err != -EAGAIN || !cfg->force_band_setup)
-			return;
-	}
-	cfg->force_band_setup = false;
-	err = brcmf_fil_iovar_data_set(ifp, "country", &ccreq, sizeof(ccreq));
-	if (err) {
-		bphy_err(drvr, "Firmware rejected country setting\n");
-		return;
-	}
-	brcmf_setup_wiphybands(cfg);
+	/* cfg80211 can notify after the bus has entered D3. Keep only the
+	 * latest request and replay it from wiphy resume, after bus resume.
+	 */
+	memcpy(cfg->country_alpha2, req->alpha2, sizeof(cfg->country_alpha2));
+	cfg->country_pending = true;
+	brcmf_cfg80211_update_country(cfg);
 }
 
 static void brcmf_free_wiphy(struct wiphy *wiphy)
