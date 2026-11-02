@@ -528,8 +528,6 @@ static void ave_fw_6070_walk_temp(struct ave_dev *ave, const char *when,
 				  in.text_iova + pc_va, true);
 	result.store = ave_temp_walk(e->observed[slot], &in, store_va,
 				     in.data_iova + AVE_6070_PT_START, false);
-	if (!ave_temp_model_inputs(&in))
-		result.store.fault = AVE_TEMP_GEOMETRY;
 	ave_temp_compare(e->observed[slot], &in, &result);
 	memset(e->model, 0, sizeof(e->model));
 	if (result.model_valid)

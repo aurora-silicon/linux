@@ -180,7 +180,10 @@ point to the temporary pages, TEXT is read-only and executable, DATA is
 writable, and holes are zero. Loader linkage, page geometry, final geometry
 and table overrides are captured independently. Nonzero table overrides or
 unsupported loader inputs mark the model unavailable rather than reporting
-a match. This mapping model is an expected address/attribute ledger, not an
+a match. Model availability never replaces a decoded walk verdict. With
+unsupported address overrides the displayed store VA is a candidate rather
+than a qualified first-store target. This mapping model is an expected
+address/attribute ledger, not an
 independent observation of the core's system registers or a hardware proof
 of the reset code's descriptor-generation algorithm.
 
