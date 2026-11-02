@@ -315,7 +315,7 @@ impl job::Backend for Backend {
         firmware.queues.compute.iter().flatten()
             .filter_map(|entry| entry.queue.as_deref())
             .any(|other| other.owner() != Some(self.owner) && other.long_job_running())
-            || firmware.queues.m5.iter()
+            || firmware.queues.m5_channels()
                 .any(|other| other.owner() != self.owner && other.long_job_running())
     }
 

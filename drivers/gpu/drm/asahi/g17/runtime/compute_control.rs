@@ -25,10 +25,8 @@ impl Backend {
                 .filter(|queue| queue.can_classify_timeout(packet))
                 .and_then(|queue| queue.timeout_head());
             // An M5 queue's work runs on its channel.
-            let m5 = |queues: &super::Registry| queues.m5.iter()
-                .position(|channel| channel.owner() == self.owner);
             let own = own.or_else(|| {
-                let channel = &firmware.queues.m5[m5(&firmware.queues)?];
+                let channel = firmware.queues.m5_channel(self.owner)?;
                 channel.can_classify_timeout(packet).then(|| channel.timeout_head()).flatten()
             });
             let Some(own) = own else {
@@ -39,7 +37,7 @@ impl Backend {
             if decision == Decision::Spare {
                 match firmware.queues.compute(self.owner) {
                     Some(queue) => queue.classify(&|_| Class::Spared),
-                    None => firmware.queues.m5[m5(&firmware.queues).ok_or(EIO)?]
+                    None => firmware.queues.m5_channel(self.owner).ok_or(EIO)?
                         .classify(&|_| Class::Spared),
                 }
             }

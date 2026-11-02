@@ -2,6 +2,8 @@
 
 //! DRM compute on the M5 profile: each logical queue owns one M5 channel
 //! ([`crate::g17::queue::m5::Channel`]) from QUEUE_CREATE on, installed before the queue exists.
+//! A bound channel lives in a compute entry of the registry ([`ComputeEntry::m5`]), the table
+//! Neo's compute queues live in, on the QID it reserved.
 //! An installed lane (QID, kick ring, graph, support page and pool) stays with the firmware
 //! session; logical queues lease it: the 26A428 firmware has no queue uninstall.
 //! A closed queue's lane parks once its context's scheduler release (0x13) is consumed
@@ -11,7 +13,10 @@
 //! [`Backend::m5_packet`] and the channel's one publication transaction; the shared completion scan
 //! (`Firmware::scan_compute`) retires it with the channel's strict predicate.
 
-use super::{render::FALLBACK, Backend, DeferredBatch, Registry, WORK_RING_WAIT_NS};
+use super::{
+    render::FALLBACK, Backend, ComputeEntry, ComputeReservation, ComputeSlot, DeferredBatch,
+    Registry, WORK_RING_WAIT_NS,
+};
 use crate::g17::{
     completion::Deferred,
     context::Context,
@@ -34,26 +39,52 @@ use kernel::{prelude::*, sync::Arc};
 /// than losing its device at the first submission.
 pub(super) const LEAKED_LANES: usize = 8;
 
-/// The M5 lanes as the scheduler-release teardown sees them (`runtime::teardown::Service`):
-/// compute channels and render pairs, bound and parked. Both kinds park through the same
-/// release and are adopted by later queues.
+/// The M5 compute channels of the compute entries `compute` ([`ComputeEntry::m5`]); none off
+/// the M5 Ultra.
+pub(super) fn channels(compute: &[Option<ComputeEntry>]) -> impl Iterator<Item = &Channel> {
+    compute
+        .iter()
+        .flatten()
+        .filter_map(|entry| entry.m5.as_deref())
+}
+
+/// [`channels`], mutable.
+pub(super) fn channels_mut(
+    compute: &mut [Option<ComputeEntry>],
+) -> impl Iterator<Item = &mut Channel> {
+    compute
+        .iter_mut()
+        .flatten()
+        .filter_map(|entry| entry.m5.as_deref_mut())
+}
+
+/// Every compute channel of `context` among the compute entries is settled: closed and idle, or
+/// quarantined with the firmware idle on it (`Channel::settled`).
+pub(super) fn compute_idle(compute: &[Option<ComputeEntry>], context: &Arc<Context>) -> bool {
+    channels(compute)
+        .filter(|channel| Arc::ptr_eq(channel.context(), context))
+        .all(|channel| channel.settled().unwrap_or(false))
+}
+
+/// The M5 lanes besides the bound compute channels, as the scheduler-release teardown sees them
+/// (`runtime::teardown::Service`): parked compute lanes and render pairs, bound and parked. The
+/// bound channels are read from the compute entries the teardown already walks. Both kinds park
+/// through the same release and are adopted by later queues.
 pub(super) struct Lanes<'a> {
-    pub(super) channels: &'a mut KVec<KBox<Channel>>,
     pub(super) parked: &'a mut KVec<crate::g17::queue::m5::ParkedLane>,
     pub(super) pairs: &'a mut KVec<KBox<Pair>>,
     pub(super) parked_pairs: &'a mut KVec<ParkedPair>,
 }
 
-impl Lanes<'_> {
-    /// Every compute channel of `context` is settled: closed and idle, or quarantined with the
-    /// firmware idle on it (`Channel::settled`).
-    pub(super) fn compute_idle(&self, context: &Arc<Context>) -> bool {
-        self.channels
-            .iter()
-            .filter(|channel| Arc::ptr_eq(channel.context(), context))
-            .all(|channel| channel.settled().unwrap_or(false))
-    }
+/// How [`crate::g17::Firmware::bind_m5_channel`] bound a new logical queue.
+pub(super) enum M5Bind {
+    /// A parked lane was adopted: the channel is bound and placed, with nothing to install.
+    Adopted,
+    /// A compute entry and a fresh QID are reserved for a channel to build and install.
+    Fresh(ComputeReservation),
+}
 
+impl Lanes<'_> {
     /// Every render pair of `context` is settled (`Pair::settled`). A failed pair does not hold
     /// back the release of the context's healthy lanes.
     pub(super) fn render_idle(&self, context: &Arc<Context>) -> bool {
@@ -63,15 +94,15 @@ impl Lanes<'_> {
             .all(|pair| pair.settled().unwrap_or(false))
     }
 
-    /// The number of `context`'s healthy channels and pairs that park at its release; its
-    /// quarantined ones stay.
-    pub(super) fn parkable(&self, context: &Arc<Context>) -> Result<usize> {
+    /// The number of `context`'s healthy channels (in `compute`) and pairs that park at its
+    /// release; its quarantined ones stay.
+    pub(super) fn parkable(
+        &self,
+        compute: &[Option<ComputeEntry>],
+        context: &Arc<Context>,
+    ) -> Result<usize> {
         let mut count = 0;
-        for channel in self
-            .channels
-            .iter()
-            .filter(|channel| Arc::ptr_eq(channel.context(), context))
-        {
+        for channel in channels(compute).filter(|channel| Arc::ptr_eq(channel.context(), context)) {
             match channel.quarantined() {
                 Some(_) if channel.settled()? => continue,
                 None if channel.parkable()? => count += 1,
@@ -93,12 +124,8 @@ impl Lanes<'_> {
     }
 
     /// Logs each of `context`'s lanes' park witnesses (a stalled release's diagnostic).
-    pub(super) fn report(&self, context: &Arc<Context>) {
-        for channel in self
-            .channels
-            .iter()
-            .filter(|channel| Arc::ptr_eq(channel.context(), context))
-        {
+    pub(super) fn report(&self, compute: &[Option<ComputeEntry>], context: &Arc<Context>) {
+        for channel in channels(compute).filter(|channel| Arc::ptr_eq(channel.context(), context)) {
             channel.report_park();
         }
         for pair in self
@@ -113,8 +140,8 @@ impl Lanes<'_> {
     /// A quarantined lane of `context` remains: it keeps the context, and with it the
     /// execution context the firmware may still name, for the session (bounded by
     /// [`LEAKED_LANES`]).
-    pub(super) fn retains(&self, context: &Arc<Context>) -> bool {
-        self.channels.iter().any(|channel| {
+    pub(super) fn retains(&self, compute: &[Option<ComputeEntry>], context: &Arc<Context>) -> bool {
+        channels(compute).any(|channel| {
             Arc::ptr_eq(channel.context(), context) && channel.quarantined().is_some()
         }) || self
             .pairs
@@ -122,20 +149,29 @@ impl Lanes<'_> {
             .any(|pair| Arc::ptr_eq(pair.context(), context) && pair.quarantined().is_some())
     }
 
-    /// Parks every channel of `context`: its lane joins the parked lanes, its binding goes to
+    /// Parks every channel of `context`: its lane joins the parked lanes and leaves its compute
+    /// entry, which is freed (the lane keeps its published QID), and its binding goes to
     /// `binding` to be dropped off the device mutex. The firmware consumed the context's
     /// scheduler release, and every channel is idle ([`Self::parkable`]).
     pub(super) fn park(
         &mut self,
+        compute: &mut [Option<ComputeEntry>],
         context: &Arc<Context>,
         buffers: &mut crate::g17::buffer::BufferIds,
         binding: &mut impl FnMut(crate::g17::queue::m5::Binding) -> Result,
     ) -> Result {
-        while let Some(index) = self.channels.iter().position(|channel| {
-            Arc::ptr_eq(channel.context(), context) && channel.quarantined().is_none()
-        }) {
+        for slot in compute.iter_mut() {
+            let parks = slot
+                .as_ref()
+                .and_then(|entry| entry.m5.as_deref())
+                .is_some_and(|channel| {
+                    Arc::ptr_eq(channel.context(), context) && channel.quarantined().is_none()
+                });
+            if !parks {
+                continue;
+            }
             self.parked.reserve(1, GFP_KERNEL)?;
-            let channel = self.channels.remove(index).map_err(|_| EIO)?;
+            let channel = slot.take().and_then(|entry| entry.m5).ok_or(EIO)?;
             let (lane, owner) = channel.park();
             if crate::module_parameters::m5_lane_trace.value() != 0 {
                 pr_info!(
@@ -175,10 +211,8 @@ impl Lanes<'_> {
         // What stays is quarantined. A drain it still awaited can no longer be witnessed: the
         // firmware, idle on its rings (`settled`), consumed the context's release. It stays
         // quarantined for good, counted toward the cap, as the old rule had it.
-        for channel in self
-            .channels
-            .iter_mut()
-            .filter(|channel| Arc::ptr_eq(channel.context(), context))
+        for channel in
+            channels_mut(compute).filter(|channel| Arc::ptr_eq(channel.context(), context))
         {
             channel.end_witness_wait();
         }
@@ -269,19 +303,25 @@ fn defer(deferred: &mut DeferredBatch, retired: Retired) -> Result {
 }
 
 impl Registry {
-    fn m5_channel(&mut self, owner: u64) -> Option<&mut Channel> {
-        self.m5
-            .iter_mut()
-            .find(|channel| channel.owner() == owner)
-            .map(|channel| &mut **channel)
+    /// The M5 compute channels, each in its compute entry ([`channels`]).
+    pub(super) fn m5_channels(&self) -> impl Iterator<Item = &Channel> {
+        channels(&self.compute)
+    }
+
+    /// `owner`'s M5 compute channel.
+    pub(super) fn m5_channel(&self, owner: u64) -> Option<&Channel> {
+        self.m5_channels().find(|channel| channel.owner() == owner)
+    }
+
+    fn m5_channel_mut(&mut self, owner: u64) -> Option<&mut Channel> {
+        channels_mut(&mut self.compute).find(|channel| channel.owner() == owner)
     }
 
     /// Whether any M5 kick or render pass is in flight: the event worker polls their retirement.
     /// Quarantined lanes and pairs are not in flight, as quarantined Neo queues are not
     /// (`queue::compute::Queue::in_flight`).
     pub(super) fn m5_in_flight(&self) -> bool {
-        self.m5
-            .iter()
+        self.m5_channels()
             .any(|channel| channel.in_flight() && channel.quarantined().is_none())
             || self.m5_render.iter().any(|pair| pair.polls())
     }
@@ -291,7 +331,8 @@ impl Registry {
     /// render pass in flight on a healthy pair. A quarantined lane or pair awaiting its drain is
     /// not polled, as [`Self::m5_in_flight`] leaves it out; each event pass still checks it.
     pub(super) fn m5_polling(&self) -> bool {
-        self.m5.iter().any(|channel| channel.retirement_polling())
+        self.m5_channels()
+            .any(|channel| channel.retirement_polling())
             || self.m5_render.iter().any(|pair| pair.polls())
     }
 
@@ -326,10 +367,86 @@ impl Registry {
             .map(|pair| &mut **pair)
     }
 
+    /// A free compute entry for an M5 channel and its (empty) cell, taken before the channel is
+    /// bound or installed so that placing it ([`Self::place_m5`]) cannot fail on capacity or
+    /// memory. The compute entries outnumber the QIDs, and a parked lane holds none.
+    fn m5_entry(&self) -> Result<(usize, ComputeSlot)> {
+        let slot = self
+            .compute
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| {
+                crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeSlots)
+            })?;
+        Ok((slot, ComputeSlot::new()?))
+    }
+
+    /// Reserves a compute entry and a fresh QID for `owner`'s channel, as [`Self::reserve_compute`]
+    /// does for a Neo queue: the entry holds the reservation, with an empty cell and no channel,
+    /// while the channel is built off the device mutex; `Firmware::install_m5_channel` installs
+    /// it there, or [`Self::cancel_compute`] returns the entry and the QID. The QID is M5's
+    /// (`qids.reserve_for` with no preferred QID and no render reservation: the caller's reach
+    /// check keeps the render pairs within reach) and its refusals are returned as they are.
+    fn reserve_m5(&mut self, owner: u64) -> Result<ComputeReservation> {
+        if owner == 0
+            || self
+                .compute
+                .iter()
+                .flatten()
+                .any(|entry| entry.reservation.owner == owner)
+        {
+            return Err(EINVAL);
+        }
+        let (slot, queue) = self.m5_entry()?;
+        // QIDs are owned by host identities, not logical queues (whose numbers the bootstrap
+        // render reservations share).
+        let identity = self.reserve_identity()?;
+        let id = self
+            .qids
+            .reserve_for(identity, DataMaster::Compute, None, 0)?;
+        let reservation = ComputeReservation { slot, id, owner };
+        self.compute[slot] = Some(ComputeEntry {
+            reservation,
+            queue,
+            m5: None,
+        });
+        Ok(reservation)
+    }
+
+    /// M5 channels being built: reserved entries ([`Self::reserve_m5`]) with neither a queue nor a
+    /// channel yet. On the M5 Ultra every such entry is one, since Neo's builder does not run.
+    fn m5_building(&self) -> usize {
+        self.compute
+            .iter()
+            .flatten()
+            .filter(|entry| entry.m5.is_none() && entry.queue.is_none())
+            .count()
+    }
+
+    /// Places a bound channel in the entry [`Self::m5_entry`] took, under the channel's QID and
+    /// owner. The device mutex is held from that call on, so the entry is still free.
+    fn place_m5(&mut self, (slot, queue): (usize, ComputeSlot), channel: KBox<Channel>) -> Result {
+        let entry = self.compute.get_mut(slot).ok_or(EIO)?;
+        if entry.is_some() {
+            return Err(EIO);
+        }
+        let reservation = ComputeReservation {
+            slot,
+            id: channel.id(),
+            owner: channel.owner(),
+        };
+        *entry = Some(ComputeEntry {
+            reservation,
+            queue,
+            m5: Some(channel),
+        });
+        Ok(())
+    }
+
     /// Stages every M5 kick not yet observed into the shared completion scan.
     pub(super) fn request_m5(&mut self) -> Result<bool> {
         let mut requested = false;
-        for channel in &self.m5 {
+        for channel in channels(&self.compute) {
             requested |= channel.request(&mut self.observations)?;
         }
         Ok(requested)
@@ -347,7 +464,7 @@ impl Registry {
         // lane or pair (Ambiguous); any error left over is returned once all were scanned.
         let mut failure = None;
         let observations: &mut Batch = &mut self.observations;
-        for channel in &mut self.m5 {
+        for channel in channels_mut(&mut self.compute) {
             let result = channel.retire(
                 observations,
                 state,
@@ -434,7 +551,7 @@ impl Registry {
         error: Error,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        for channel in &mut self.m5 {
+        for channel in channels_mut(&mut self.compute) {
             if channel.in_flight() && Arc::ptr_eq(channel.context().status(), status) {
                 channel.fail(error, Failure::Final, &mut |retired| {
                     defer(deferred, retired)
@@ -454,7 +571,7 @@ impl Registry {
     /// `m5_fault_registers`: 0xd800, the fault status 0xd8c0 and address 0xd8c8, 0xc078, 0xc008,
     /// 0xc028), logged for each M5 fault: nothing else says what the GPU faulted on.
     pub(super) fn m5_fault(&mut self, qid: u8, stamp: u32, window: Result<[u64; 6]>) {
-        for channel in self.m5.iter_mut().filter(|channel| channel.qid() == qid) {
+        for channel in channels_mut(&mut self.compute).filter(|channel| channel.qid() == qid) {
             pr_warn!(
                 "G17 M5: compute fault on queue {} (stamp {:#x}, {} kicks published): fault window {:x?}\n",
                 qid,
@@ -490,7 +607,7 @@ impl Registry {
 
     /// Closes `owner`'s channel; it stays installed and retained.
     pub(super) fn close_m5(&mut self, owner: u64) {
-        if let Some(channel) = self.m5_channel(owner) {
+        if let Some(channel) = self.m5_channel_mut(owner) {
             channel.close();
         }
     }
@@ -502,7 +619,7 @@ impl Registry {
         packet: &Arc<Packet>,
         deferred: &mut DeferredBatch,
     ) -> Result<bool> {
-        let Some(channel) = self.m5_channel(owner) else {
+        let Some(channel) = self.m5_channel_mut(owner) else {
             return Ok(false);
         };
         if !channel.owns_packet(packet) {
@@ -534,8 +651,7 @@ impl crate::g17::Firmware {
     /// render pair's two.
     fn quarantined_lanes(&self) -> usize {
         self.queues
-            .m5
-            .iter()
+            .m5_channels()
             .filter(|channel| channel.quarantined().is_some())
             .count()
             + 2 * self
@@ -551,15 +667,17 @@ impl crate::g17::Firmware {
         self.quarantined_lanes() < LEAKED_LANES
     }
 
-    /// Builds and installs the channel of logical queue `owner`, or adopts a parked lane. From
-    /// its installation on the lane is retained whatever happens.
-    pub(super) fn create_m5_channel(
+    /// Binds logical queue `owner` to an M5 lane under the device mutex: adopts a parked lane, or
+    /// reserves a compute entry and a fresh QID for a channel the caller builds off the device
+    /// mutex and installs there ([`Self::install_m5_channel`]), as `Backend::build_compute` does
+    /// for a Neo queue. Refusals (the quarantine cap, a render pair out of reach, no QID) come
+    /// before anything is reserved.
+    pub(super) fn bind_m5_channel(
         &mut self,
         alloc: &Allocator<'_>,
         context: Arc<Context>,
         owner: u64,
-        gpu: crate::g17::fw::m5::compute::Gpu,
-    ) -> Result {
+    ) -> Result<M5Bind> {
         let dev = alloc.dev;
         let refused = |step: &str, error: Error| {
             dev_warn!(
@@ -603,7 +721,8 @@ impl crate::g17::Firmware {
         }
         // Every open logical queue keeps a render pair within reach, as off M5
         // (`Qids::render_fits`): one already built, a parked one, or two free QIDs. A queue
-        // refused here fails at QUEUE_CREATE, not at its first pass.
+        // refused here fails at QUEUE_CREATE, not at its first pass. A channel still being built
+        // (a reserved entry, [`Registry::reserve_m5`]) counts as an open queue.
         let free = match fresh {
             true => self
                 .queues
@@ -613,66 +732,70 @@ impl crate::g17::Firmware {
             false => 0,
         };
         let reach = self.queues.m5_parked_pairs.len() + free / 2;
-        let waiting = 1 + self
-            .queues
-            .m5
-            .iter()
-            .filter(|channel| channel.open() && channel.quarantined().is_none())
-            .filter(|channel| {
-                !self
-                    .queues
-                    .m5_render
-                    .iter()
-                    .any(|pair| pair.owner() == channel.owner())
-            })
-            .count();
+        let waiting = 1
+            + self.queues.m5_building()
+            + self
+                .queues
+                .m5_channels()
+                .filter(|channel| channel.open() && channel.quarantined().is_none())
+                .filter(|channel| {
+                    !self
+                        .queues
+                        .m5_render
+                        .iter()
+                        .any(|pair| pair.owner() == channel.owner())
+                })
+                .count();
         if reach < waiting {
             return Err(crate::g17::capacity::refused(
                 crate::g17::capacity::Site::PhysicalQids,
             ));
         }
-        if let Some(index) = parked {
-            self.queues.m5.reserve(1, GFP_KERNEL)?;
-            let channel = Channel::adopt(alloc, &mut self.queues.m5_parked, index, context, owner)
-                .map_err(|error| refused("adoption", error))?;
-            if crate::module_parameters::m5_lane_trace.value() != 0 {
-                pr_info!(
-                    "M5 lane {}: bound to queue {} class {} ({}), next kick {:#x}\n",
-                    channel.qid(),
-                    owner,
-                    class,
-                    if channel.class_changed() {
-                        "class changed"
-                    } else {
-                        "same class"
-                    },
-                    channel.next_kick()
-                );
-            }
+        let Some(index) = parked else {
             return self
                 .queues
-                .m5
-                .push_within_capacity(channel)
-                .map_err(|_| ENOMEM);
-        }
-        // QIDs are owned by host identities, not logical queues (whose numbers the bootstrap
-        // render reservations share). M5 refuses render: no logical queue reserves a render pair
-        // beside its channel.
-        let identity = self.queues.reserve_identity()?;
-        let id = self
-            .queues
-            .qids
-            .reserve_for(identity, DataMaster::Compute, None, 0)
-            .map_err(|error| refused("QID", error))?;
-        let mut channel = match Channel::new(alloc, context, id, owner, gpu, &self.variant.pointers)
-        {
-            Ok(channel) => channel,
-            Err(error) => {
-                self.queues.qids.cancel_unpublished(id)?;
-                return Err(refused("construction", error));
-            }
+                .reserve_m5(owner)
+                .map(M5Bind::Fresh)
+                .map_err(|error| refused("QID", error));
         };
-        self.queues.m5.reserve(1, GFP_KERNEL)?;
+        // The channel's compute entry first: once bound it must have a place.
+        let entry = self.queues.m5_entry()?;
+        let channel = Channel::adopt(alloc, &mut self.queues.m5_parked, index, context, owner)
+            .map_err(|error| refused("adoption", error))?;
+        if crate::module_parameters::m5_lane_trace.value() != 0 {
+            pr_info!(
+                "M5 lane {}: bound to queue {} class {} ({}), next kick {:#x}\n",
+                channel.qid(),
+                owner,
+                class,
+                if channel.class_changed() {
+                    "class changed"
+                } else {
+                    "same class"
+                },
+                channel.next_kick()
+            );
+        }
+        self.queues.place_m5(entry, channel)?;
+        Ok(M5Bind::Adopted)
+    }
+
+    /// Installs `built`, the channel of `reservation` built off the device mutex, and places it in
+    /// the reserved entry. From its installation on the lane is retained whatever happens: an
+    /// installed channel leaves `built`, whatever the result. Otherwise `built` keeps it and the
+    /// reservation stands: EAGAIN (no outer slot yet, nothing published) is the caller's to wait
+    /// out; after another failure the caller drops the channel, then cancels the reservation.
+    pub(super) fn install_m5_channel(
+        &mut self,
+        dev: &crate::driver::AsahiDrmDevice,
+        reservation: ComputeReservation,
+        built: &mut Option<KBox<Channel>>,
+    ) -> Result {
+        self.queues.reserved(reservation)?;
+        let channel = built.as_mut().ok_or(EINVAL)?;
+        if channel.id() != reservation.id || channel.owner() != reservation.owner {
+            return Err(EIO);
+        }
         let result = channel.install(&mut Host {
             init: &self.init,
             port: &self.port,
@@ -680,19 +803,22 @@ impl crate::g17::Firmware {
             crashed: &self.primary.state.shared.crashed,
         });
         if channel.installed() {
-            self.queues
-                .m5
-                .push_within_capacity(channel)
-                .map_err(|_| ENOMEM)?;
-        } else if self.queues.qids.can_cancel_unpublished(id) {
-            self.queues.qids.cancel_unpublished(id)?;
+            let entry = self
+                .queues
+                .compute
+                .get_mut(reservation.slot)
+                .and_then(Option::as_mut)
+                .ok_or(EIO)?;
+            entry.m5 = built.take();
         }
-        // EAGAIN (no outer slot yet, nothing published) is the caller's to wait out.
-        result.map_err(|error| {
-            if error == EAGAIN {
-                error
-            } else {
-                refused("installation", error)
+        result.inspect_err(|error| {
+            if *error != EAGAIN {
+                dev_warn!(
+                    dev.as_ref(),
+                    "M5 channel of queue {}: installation failed: {:?}\n",
+                    reservation.owner,
+                    error
+                );
             }
         })
     }
@@ -701,7 +827,7 @@ impl crate::g17::Firmware {
     /// ([`Channel::install_consumed`]). EIO: the channel is gone (a recovery closed it).
     pub(super) fn m5_install_consumed(&mut self, owner: u64, expired: bool) -> Result<bool> {
         let crashed = &self.primary.state.shared.crashed;
-        let channel = self.queues.m5_channel(owner).ok_or(EIO)?;
+        let channel = self.queues.m5_channel_mut(owner).ok_or(EIO)?;
         channel.install_consumed(crashed, expired)
     }
 
@@ -718,10 +844,7 @@ impl crate::g17::Firmware {
     ) -> Result {
         let work = packet.completion.work_state()?;
         let epoch = self.recovery.generation();
-        let channel = self
-            .queues
-            .m5
-            .iter_mut()
+        let channel = channels_mut(&mut self.queues.compute)
             .find(|channel| channel.owner() == owner)
             .ok_or(EIO)?;
         if let Some(error) = channel.quarantined() {

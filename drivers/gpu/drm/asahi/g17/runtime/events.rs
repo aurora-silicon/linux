@@ -255,8 +255,8 @@ impl super::Registry {
         for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
             visit(&*queue);
         }
-        for channel in &self.m5 {
-            visit(&**channel);
+        for channel in super::m5::channels(&self.compute) {
+            visit(channel);
         }
         for pair in &self.m5_render {
             visit(&**pair);
@@ -278,8 +278,8 @@ impl super::Registry {
         for mut queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
             failure = failure.or(settle(&mut *queue).err());
         }
-        for channel in &mut self.m5 {
-            failure = failure.or(settle(&mut **channel).err());
+        for channel in super::m5::channels_mut(&mut self.compute) {
+            failure = failure.or(settle(channel).err());
         }
         for pair in &mut self.m5_render {
             failure = failure.or(settle(&mut **pair).err());

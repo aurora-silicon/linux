@@ -102,6 +102,10 @@ pub(super) struct ComputeReservation {
 struct ComputeEntry {
     reservation: ComputeReservation,
     queue: ComputeSlot,
+    /// The M5 Ultra's compute channel on this entry's QID ([`queue::m5`]), bound to the
+    /// reservation's owner; its cell stays empty. Set only by `Firmware::bind_m5_channel` and
+    /// `Firmware::install_m5_channel`, so `None` on every other GPU.
+    m5: Option<KBox<queue::m5::Channel>>,
 }
 
 /// A physical compute queue behind its own lock. Publication into a bound queue takes only
@@ -215,10 +219,6 @@ pub(super) struct Registry {
     completion_seen: KVVec<u64>,
     worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
-    /// The M5 profile's bound compute channels, one per open logical queue, plus each closed
-    /// one until its context's scheduler release is consumed, and the quarantined ones, which
-    /// stay for the firmware session ([`queue::m5`]).
-    m5: KVec<KBox<queue::m5::Channel>>,
     /// Idle installed compute lanes without an owner: the next QUEUE_CREATE adopts one.
     m5_parked: KVec<queue::m5::ParkedLane>,
     /// Idle installed render pairs without an owner: the next queue's first pass adopts one.
@@ -292,7 +292,6 @@ impl Registry {
             },
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
-            m5: KVec::new(),
             m5_parked: KVec::new(),
             m5_parked_pairs: KVec::new(),
             m5_refused: 0,
@@ -323,7 +322,7 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
             .filter_map(|queue| queue.timeout_head());
-        let m5 = self.m5.iter().filter_map(|channel| channel.timeout_head());
+        let m5 = self.m5_channels().filter_map(|channel| channel.timeout_head());
         Iterator::chain(Iterator::chain(computes, self.render_timeout_heads()), m5)
     }
 
@@ -630,9 +629,10 @@ impl Registry {
         }
     }
 
-    /// A fresh host identity for a physical channel outside the compute registry: the retained
-    /// M5 diagnostic queue (`g17/m5_test.rs`) and each M5 channel (`queue::m5`), whose QID it
-    /// then owns.
+    /// A fresh host identity for a physical channel whose QID [`Self::reserve_compute`] does not
+    /// reserve: the retained M5 diagnostic queue (`g17/m5_test.rs`) and each M5 channel
+    /// (`queue::m5`), whose QID it then owns and which `Firmware::install_m5_channel` places in a
+    /// compute entry.
     pub(super) fn reserve_identity(&mut self) -> Result<u64> {
         Ok(self.identities.reserve(1)?.start)
     }
@@ -667,6 +667,7 @@ impl Registry {
         self.compute[slot] = Some(ComputeEntry {
             reservation,
             queue: ComputeSlot::new()?,
+            m5: None,
         });
         Ok(reservation)
     }
@@ -680,6 +681,7 @@ impl Registry {
         if entry.reservation.id != reservation.id
             || entry.reservation.owner != reservation.owner
             || entry.queue.is_some()
+            || entry.m5.is_some()
         {
             return Err(EIO);
         }
@@ -921,14 +923,18 @@ impl Backend {
         }
     }
 
-    /// Builds or adopts the M5 channel of `owner` under the device mutex, then waits off it for
-    /// the firmware to consume a fresh channel's installation, on the event worker's progress as
-    /// a publication waits ([`wait_release`]); a full outer work ring (EAGAIN, nothing published
-    /// yet) is waited out the same way. The queue's channel is installed before the queue
-    /// exists, and once published it is retained whatever happens: nothing is retried after the
-    /// publication, and an installation still unconsumed after [`queue::m5::INSTALL_WAIT_MS`]
-    /// quarantines the channel. The preparation lease is held throughout, as it was when this
-    /// wait held the device mutex.
+    /// Binds `owner` to its M5 channel, as `build_compute` binds a Neo queue: under the device
+    /// mutex a parked lane is adopted, or a compute entry and a fresh QID are reserved; a fresh
+    /// channel is built off the mutex and installed into that entry under it. Then this waits off
+    /// the mutex for the firmware to consume a fresh channel's installation, on the event
+    /// worker's progress as a publication waits ([`wait_release`]); a full outer work ring
+    /// (EAGAIN, nothing published yet) is waited out the same way, keeping the built channel. The
+    /// queue's channel is installed before the queue exists, and once published it is retained
+    /// whatever happens: nothing is retried after the publication, and an installation still
+    /// unconsumed after [`queue::m5::INSTALL_WAIT_MS`] quarantines the channel. A reservation
+    /// that never installed is returned in `finish_uninstalled_compute`'s order: the built
+    /// channel's aliases go first, then the entry and its unpublished QID. The preparation lease
+    /// is held throughout.
     fn install_m5(
         shared: &Arc<super::Shared>,
         lease: &super::preparation::Lease,
@@ -940,19 +946,47 @@ impl Backend {
         let deadline = now_ns().saturating_add(u64::from(queue::m5::INSTALL_WAIT_MS) * 1_000_000);
         let open = || -> Result { Ok(()) };
         let admission = Admission::new(deadline, &open);
+        let mut reservation = None;
+        let mut built = None;
         let mut published = false;
-        loop {
+        let result = (|| loop {
             let observed = shared.progress.observe();
             let expired = now_ns() >= deadline;
+            if !published && reservation.is_none() {
+                let mut state = shared.state.lock();
+                let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+                if !lease.is_current() {
+                    return Err(EAGAIN);
+                }
+                match firmware.bind_m5_channel(alloc, context.clone(), owner)? {
+                    m5::M5Bind::Adopted => published = true,
+                    m5::M5Bind::Fresh(fresh) => reservation = Some(fresh),
+                }
+            }
+            if let (false, Some(fresh), None) = (published, reservation, built.as_ref()) {
+                // Nothing of it is visible to the firmware until its installation.
+                let channel = queue::m5::Channel::new(alloc, context.clone(), fresh.id, owner, gpu,
+                    &shared.variant.pointers).inspect_err(|error| {
+                    dev_warn!(alloc.dev.as_ref(), "M5 channel of queue {}: construction failed: {:?}\n",
+                        owner, error);
+                })?;
+                built = Some(channel);
+            }
             {
                 let mut state = shared.state.lock();
                 let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-                if !published {
+                if let (false, Some(fresh)) = (published, reservation) {
                     if !lease.is_current() {
                         return Err(EAGAIN);
                     }
-                    match firmware.create_m5_channel(alloc, context.clone(), owner, gpu) {
-                        Ok(()) => published = true,
+                    let result = firmware.install_m5_channel(alloc.dev, fresh, &mut built);
+                    if built.is_none() {
+                        // Installed and placed: the entry is the channel's from here on.
+                        reservation = None;
+                        published = true;
+                    }
+                    match result {
+                        Ok(()) => {}
                         Err(error) if error == EAGAIN && !expired => {}
                         Err(error) if error == EAGAIN => return Err(EBUSY),
                         Err(error) => return Err(error),
@@ -967,7 +1001,18 @@ impl Backend {
                 Err(error) if error != EBUSY => return Err(error),
                 _ => {}
             }
+        })();
+        if let Some(fresh) = reservation {
+            drop(built.take());
+            let mut state = shared.state.lock();
+            if let Some(firmware) = (*state).as_deref_mut() {
+                firmware.queues.cancel_compute(fresh)?;
+            }
+            drop(state);
+            // The slot and its never-published QID are free again.
+            shared.channels.notify();
         }
+        result
     }
 
     /// The shared aperture has exactly one builder. Other queues sleep without
@@ -2533,7 +2578,7 @@ impl super::Firmware {
             freed |= busy && queue.channel_free();
             releasing |= queue.pool_release_pending();
         }
-        releasing |= self.queues.m5.iter().any(|channel| channel.pool_release_pending())
+        releasing |= self.queues.m5_channels().any(|channel| channel.pool_release_pending())
             || self.queues.m5_parked.iter().any(|lane| lane.pool_release_pending());
         freed |= self.queues.observe_pool_releases(&self.init, deferred)? != 0;
         let shared = &self.primary.state.shared;
@@ -2554,7 +2599,7 @@ impl super::Firmware {
         }
         if self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
             .any(|queue| queue.pool_release_stalled(now))
-            || self.queues.m5.iter().any(|channel| channel.pool_release_stalled(now))
+            || self.queues.m5_channels().any(|channel| channel.pool_release_stalled(now))
             || self.queues.m5_parked.iter().any(|lane| lane.pool_release_stalled(now))
         {
             return Err(ETIMEDOUT);
@@ -2606,7 +2651,7 @@ impl Registry {
         writeln!(f, "compute_slots used={} total={} reusable={} building={}",
                  self.compute.iter().flatten().count(), self.compute.len(),
                  self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).filter(|queue| queue.reusable()).count(),
-                 self.compute.iter().flatten().filter(|entry| entry.queue.is_none()).count())?;
+                 self.compute.iter().flatten().filter(|entry| entry.queue.is_none() && entry.m5.is_none()).count())?;
         writeln!(f, "compute_channels used={} fresh_fits={}",
                  self.compute.iter().flatten().count(),
                  u8::from(self.qids.compute_fits(self.admission.queues() as usize)))?;
@@ -2614,9 +2659,9 @@ impl Registry {
         // M5: bound and parked lanes and pairs, the quarantined ones and those awaiting a settled
         // failure's drain, and whether any still needs the event worker's polling.
         writeln!(f, "m5_lanes bound={} parked={} quarantined={} awaiting_witness={}",
-                 self.m5.len(), self.m5_parked.len(),
-                 self.m5.iter().filter(|channel| channel.quarantined().is_some()).count(),
-                 self.m5.iter().filter(|channel| channel.awaiting_witness()).count())?;
+                 self.m5_channels().count(), self.m5_parked.len(),
+                 self.m5_channels().filter(|channel| channel.quarantined().is_some()).count(),
+                 self.m5_channels().filter(|channel| channel.awaiting_witness()).count())?;
         writeln!(f, "m5_pairs bound={} parked={} quarantined={} awaiting_witness={} polling={}",
                  self.m5_render.len(), self.m5_parked_pairs.len(),
                  self.m5_render.iter().filter(|pair| pair.quarantined().is_some()).count(),

@@ -132,12 +132,14 @@ struct Service<'a> {
     render: &'a mut super::render::RenderState,
     admission: &'a crate::g17::queue::admission::Pool,
     objects: &'a Arc<crate::g17::object::Pool>,
-    compute: &'a [Option<ComputeEntry>],
+    /// The compute entries: Neo's compute queues and the M5 Ultra's bound compute channels.
+    compute: &'a mut [Option<ComputeEntry>],
     buffers: &'a mut BufferIds,
     init: &'a InitData,
     primary: &'a mut Coprocessor,
     reclaim: &'a mut ReclaimBatch,
-    /// The M5 lanes: bound compute channels, parked ones and render pairs (`queue::m5`).
+    /// The M5 lanes besides the bound compute channels: parked compute lanes and render pairs
+    /// (`queue::m5`).
     m5: Option<super::m5::Lanes<'a>>,
 }
 
@@ -151,7 +153,8 @@ impl Host for Service<'_> {
         self.render.teardown_idle(context)
     }
     fn compute_idle(&self, context: &Arc<Context>) -> bool {
-        self.m5.as_ref().is_none_or(|m5| m5.compute_idle(context))
+        // The M5 channels among the entries first; there are none off the M5 Ultra.
+        super::m5::compute_idle(self.compute, context)
             && self
                 .compute
                 .iter()
@@ -181,15 +184,15 @@ impl Host for Service<'_> {
         let mut retained = false;
         if let Some(m5) = &mut self.m5 {
             // Every compute lane of the context parks; its bindings drop off the device mutex.
-            let count = m5.parkable(context)?;
+            let count = m5.parkable(self.compute, context)?;
             if !self.reclaim.m5_room(count) || !self.reclaim.has_room(0, 1) {
                 return Err(EBUSY);
             }
             let reclaim = &mut *self.reclaim;
-            m5.park(context, self.buffers, &mut |binding| {
+            m5.park(self.compute, context, self.buffers, &mut |binding| {
                 reclaim.m5_binding(binding)
             })?;
-            retained = m5.retains(context);
+            retained = m5.retains(self.compute, context);
         }
         let linked = context.retain_linked_work(self.objects);
         let (_, _, slots) = self.render.exit_scope(context);
@@ -245,7 +248,6 @@ impl Firmware {
             compute,
             buffers,
             teardown,
-            m5: channels,
             m5_parked,
             m5_parked_pairs,
             m5_render,
@@ -261,7 +263,6 @@ impl Firmware {
             primary: &mut self.primary,
             reclaim,
             m5: m5.then_some(super::m5::Lanes {
-                channels,
                 parked: m5_parked,
                 pairs: m5_render,
                 parked_pairs: m5_parked_pairs,
@@ -295,7 +296,7 @@ impl Firmware {
                     service.control_backpressured(),
                 );
                 if let Some(m5) = &service.m5 {
-                    m5.report(&context);
+                    m5.report(service.compute, &context);
                 }
             }
         }

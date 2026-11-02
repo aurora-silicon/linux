@@ -904,6 +904,10 @@ impl Channel {
     pub(crate) fn qid(&self) -> u8 {
         self.lane.qid()
     }
+    /// The QID and the host identity that reserved it: the compute entry's reservation.
+    pub(crate) fn id(&self) -> kick::Id {
+        self.lane.id
+    }
     pub(crate) fn gpu(&self) -> &Gpu {
         &self.gpu
     }
