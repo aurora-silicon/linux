@@ -113,6 +113,8 @@ struct apple_pmc {
 	unsigned long dcs_state;
 	/* DCS state the AP's agent voted for before probe, kept without a limit. */
 	unsigned int ap_dcs_vote;
+	/* Highest DCS floor held by a floor domain; protected by @lock. */
+	unsigned int dcs_floor;
 	/* Power cost of each DCS state in mW, if a model is described. */
 	u32 dcs_power[APPLE_PMC_MAX_STATES];
 	struct delayed_work dcs_work;
@@ -386,19 +388,20 @@ static unsigned int apple_pmc_ap_dcs_read(struct apple_pmc *pmc)
 
 /*
  * Caller holds pmc->lock. Vote through the AP's agent for what the other
- * agents ask for, capped by the limit; without a limit, put back the vote
- * the AP's agent had before probe.
+ * agents ask for and the DCS floors held, capped by the limit; without a
+ * limit, the vote the AP's agent had before probe or the floors, if higher.
  */
 static void apple_pmc_dcs_vote(struct apple_pmc *pmc)
 {
 	const struct apple_pmc_hw *hw = pmc->hw;
 	void __iomem *reg = pmc->voters + hw->ap_agent * hw->agent_stride;
 	u32 mask = APPLE_PMC_RAIL_MASK(hw->dcs_rail);
-	unsigned int state = pmc->ap_dcs_vote;
+	unsigned int state = max(pmc->ap_dcs_vote, pmc->dcs_floor);
 	u32 old, val;
 
 	if (pmc->dcs_state)
-		state = min_t(unsigned int, apple_pmc_dcs_demand(pmc),
+		state = min_t(unsigned int,
+			      max(apple_pmc_dcs_demand(pmc), pmc->dcs_floor),
 			      hw->dcs_max - pmc->dcs_state);
 
 	old = readl(reg);
@@ -617,6 +620,13 @@ static int apple_pmc_floor_apply(struct apple_pmc *pmc, unsigned int rail)
 	list_for_each_entry(dom, &pmc->domains, list)
 		if (dom->floor && dom->rail == rail && dom->on)
 			level = max(level, dom->level);
+
+	/* The AP's DCS vote also carries the DCS limit; it combines both. */
+	if (rail == pmc->hw->dcs_rail) {
+		pmc->dcs_floor = level;
+		apple_pmc_dcs_vote(pmc);
+		return 0;
+	}
 
 	return __apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
 					APPLE_PMC_RAIL_MASK(rail),
@@ -860,11 +870,12 @@ static int apple_pmc_floor_add(struct apple_pmc *pmc, struct device_node *np)
 	if (of_property_read_u32(np, "apple,rail", &rail) ||
 	    of_property_read_u32(np, "apple,level", &level))
 		return dev_err_probe(dev, -EINVAL, "%pOF: missing rail or level\n", np);
-	/* The DCS rail's AP vote belongs to the DCS limit. */
-	if (rail >= hw->rails || rail == hw->dcs_rail ||
+	/* A DCS floor shares the AP's DCS vote with the DCS limit, which caps it. */
+	if (rail >= hw->rails ||
 	    (hw->agent_rails && !(hw->agent_rails & BIT(rail))))
 		return dev_err_probe(dev, -EINVAL, "%pOF: invalid rail %u\n", np, rail);
-	if (!level || level >= APPLE_PMC_MAX_STATES)
+	if (!level || level >= APPLE_PMC_MAX_STATES ||
+	    (rail == hw->dcs_rail && level > hw->dcs_max))
 		return dev_err_probe(dev, -EINVAL, "%pOF: invalid level %u\n", np, level);
 	if (!(pmc->static_agents & BIT(hw->ap_agent)))
 		return dev_err_probe(dev, -EINVAL,
