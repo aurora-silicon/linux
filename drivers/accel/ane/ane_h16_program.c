@@ -486,6 +486,7 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	s->dsid = ANE_H16_MCACHE_DSID;
 	s->settle_ns = ANE_H16_SETTLE_QUIET_NS;
 	init_waitqueue_head(&s->wake);
+	INIT_LIST_HEAD(&s->deferred);
 	spin_lock_init(&s->stats_lock);
 	return 0;
 }
@@ -787,7 +788,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	 * is never freed.
 	 */
 	p->generation = ++s->generation;
-	p->epoch = s->epoch;
+	INIT_LIST_HEAD(&p->deferred);
 	memset(snapshot, 0, sizeof(*snapshot));
 	p->session = s;
 	s->program = p;
@@ -1010,12 +1011,6 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
  * barrier before the caller reads outputs. Any uncertain outcome quarantines
  * the session and keeps every mapping.
  */
-bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p)
-{
-	return p->epoch != s->epoch;
-}
-EXPORT_SYMBOL_GPL(ane_h16_program_lost);
-
 static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
@@ -1178,9 +1173,6 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 
 	if (!s || !p || p->session != s)
 		return -EINVAL;
-	/* Loaded before the firmware restarted across system sleep. */
-	if (ane_h16_program_lost(s, p))
-		return -ENODEV;
 	if (s->ops->busy)
 		s->ops->busy(s->ctx, true);
 	ret = h16_execute(s, p);
@@ -1313,18 +1305,18 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 		return -EINVAL;
 	if (p->closed || !p->created)
 		return 0;
+	/*
+	 * The firmware is suspended for system sleep and keeps this program:
+	 * tear it down when the session reopens. The session owns it until.
+	 */
+	if (s->asleep) {
+		if (list_empty(&p->deferred))
+			list_add_tail(&p->deferred, &s->deferred);
+		return -EINPROGRESS;
+	}
 	p->closed = true;
 	if (s->quarantined)
 		return -EIO;
-	/*
-	 * The firmware that knew this program is gone (or is being cycled
-	 * across system sleep and will not know it): nothing to tear down.
-	 */
-	if (ane_h16_program_lost(s, p) || s->asleep) {
-		h16_give_back(s, p);
-		s->ops->log(s->ctx, "program lost across sleep, released", p->key.program, 0);
-		return 0;
-	}
 	ret = ane_h16_terminate_encode(command, ANE_H16_TERMINATE_SIZE, p->key.program,
 				       p->key.process);
 	if (!ret)
@@ -1381,29 +1373,23 @@ EXPORT_SYMBOL_GPL(ane_h16_session_enter);
  */
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep)
 {
+	struct ane_h16_program *p, *n;
+
 	mutex_lock(s->lock);
 	WRITE_ONCE(s->asleep, asleep);
+	/* Closes that came in while asleep, now that the firmware is back. */
+	if (!asleep) {
+		list_for_each_entry_safe(p, n, &s->deferred, deferred) {
+			list_del_init(&p->deferred);
+			if (!ane_h16_session_close(s, p))
+				ane_h16_session_put(s, p);
+		}
+	}
 	mutex_unlock(s->lock);
 	if (!asleep)
 		wake_up_all(&s->wake);
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_sleep);
-
-/*
- * The firmware was booted again: every program loaded before is lost
- * (EXECUTE refuses it, close only releases its memory), no request is
- * pending and the next program starts a new BAR context.
- */
-void ane_h16_session_restart(struct ane_h16_session *s)
-{
-	s->epoch++;
-	s->program = NULL;
-	s->executed = 0;
-	memset(s->pending.slots, 0, sizeof(s->pending.slots));
-	s->pending.error = 0;
-	s->error = 0;
-}
-EXPORT_SYMBOL_GPL(ane_h16_session_restart);
 
 /*
  * The caller's last reference: free a closed program and its HWX snapshot.
