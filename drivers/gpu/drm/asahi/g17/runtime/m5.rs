@@ -260,8 +260,13 @@ impl Pair {
     }
 
     /// The recovery table cancelled one of this pair's QIDs (`qids`): its spared pass in flight
-    /// fails with ECANCELED, as on Neo (`Firmware::settle_cancelled_renders`).
+    /// fails with ECANCELED, as on Neo (`Firmware::settle_cancelled_renders`), unless the restart
+    /// cancelled it before it started (`Pair::hold_unstarted`): that one runs again once the
+    /// firmware has retired it (`Pair::retire`, [`crate::g17::Firmware::replay_m5_render`]).
     pub(super) fn settle_cancelled(&mut self, qids: u128, deferred: &mut DeferredBatch) -> Result {
+        if self.held() {
+            return Ok(());
+        }
         if self
             .qids()
             .into_iter()
@@ -582,12 +587,19 @@ impl Registry {
     /// failing the next owner's pass. Those pairs stay quarantined and count toward the cap
     /// (`Failure::Final`). A repeat after a settled failure changes nothing: recoveries
     /// failed the blamed pass, then its VM's failure failed it again.
+    /// A pass awaiting its replay (`Pair::retire`) was retired by the firmware and holds nothing
+    /// of the pair: it fails as the restart would have failed it, released at once, and the pair
+    /// stays healthy.
     pub(super) fn fail_pair(
         pair: &mut Pair,
         error: Error,
         failure: Failure,
         deferred: &mut DeferredBatch,
     ) -> Result {
+        if let Some((packet, _)) = pair.take_replay() {
+            packet.completion.note_interrupted();
+            return deferred.push(Deferred::Drained(packet.completion.clone(), Err(error)));
+        }
         if let Some(packet) = pair.fail(error, failure) {
             deferred.push(Deferred::FailedOwned(packet.completion.clone(), error))?;
         }
@@ -1233,6 +1245,88 @@ impl crate::g17::Firmware {
             qids.cancel_unpublished(tiling)?;
         }
         result.map_err(|error| refused("installation", error))
+    }
+
+    /// Publishes again each M5 pass a restart cancelled before it started and the firmware then
+    /// retired without running it (`Pair::retire`), on its own pair and ahead of its queue's
+    /// later passes, which wait for the pair's room. Neo's rules (`replay_render_front`): a
+    /// cancelled or failed command, or one whose context is gone, is not run again, nor one past
+    /// `MAX_REPLAYS`; a replay with no room waits, bounded as a publication's wait for ring room.
+    /// One that cannot be published fails as the restart would have failed it (ECANCELED).
+    /// Called only at the event worker's outer boundary, after recovery has settled. None off
+    /// the M5 Ultra: there are no M5 pairs.
+    pub(in crate::g17) fn replay_m5_render(&mut self, deferred: &mut DeferredBatch) -> Result {
+        if self
+            .queues
+            .m5_render
+            .iter()
+            .all(|pair| pair.replay().is_none())
+        {
+            return Ok(());
+        }
+        if self.recovery.pending() || crate::g17::recovery::Memory::recovery_state(&self.init)? != 0
+        {
+            return Ok(());
+        }
+        let dev = self.primary.state.shared.drm()?;
+        for index in 0..self.queues.m5_render.len() {
+            let pair = &mut self.queues.m5_render[index];
+            let Some((packet, since)) = pair.take_replay() else {
+                continue;
+            };
+            let (owner, qids) = (pair.owner(), pair.qids());
+            let completion = &packet.completion;
+            let refused = if packet.cancel_requested() || !packet.context.is_current() {
+                Some(ECANCELED)
+            } else if completion.status().get() != 0 {
+                Some(EIO)
+            } else if completion.replay_count() >= crate::g17::completion::MAX_REPLAYS {
+                Some(ECANCELED)
+            } else {
+                None
+            };
+            let result = match (refused, &packet.command) {
+                (Some(error), _) => Err(error),
+                (
+                    None,
+                    crate::g17::command::Validated::Render {
+                        pass,
+                        plan: Some(plan),
+                        ..
+                    },
+                ) => {
+                    let draw = Draw { pass, plan: *plan };
+                    self.publish_m5_render(&dev, owner, &packet, &draw)
+                }
+                (None, _) => Err(EINVAL),
+            };
+            let pair = self.queues.m5_render.get_mut(index).ok_or(EIO)?;
+            match result {
+                Ok(()) => {
+                    // Published from the start: it reports its own result
+                    // (`Completion::begin_replay` clears the restart's interruption).
+                    completion.begin_replay();
+                    pr_info!("G17 M5: render pair {:?}: the pass the restart cancelled before it started runs again as pass {} (replay {})\n",
+                        qids, pair.next_ordinal().wrapping_sub(1), completion.replay_count());
+                }
+                // Published, then refused: the pair failed it, and its retirement reports it.
+                Err(_) if pair.owns_packet(&packet) => {
+                    completion.begin_replay();
+                }
+                Err(error)
+                    if error == EAGAIN
+                        && super::now_ns().saturating_sub(since) < WORK_RING_WAIT_NS =>
+                {
+                    pair.restore_replay((packet, since));
+                }
+                Err(error) => {
+                    pr_warn!("G17 M5: render pair {:?}: the pass the restart cancelled before it started could not run again ({:?}); it fails\n",
+                        qids, error);
+                    deferred.push(Deferred::Drained(completion.clone(), Err(ECANCELED)))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Publishes `packet`'s pass on `owner`'s pair. EAGAIN: the pair has no room yet.

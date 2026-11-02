@@ -185,6 +185,15 @@ pub(crate) struct Pair {
     /// A growth request of the pass in flight is being served off the device mutex
     /// ([`Self::begin_growth`]): the pair neither parks nor settles until it ends.
     growing: bool,
+    /// A restart interrupted the pass in flight before any stage started
+    /// ([`Self::hold_unstarted`]): recovery does not fail it with the restart's cancellation, and
+    /// once the firmware has retired it without running it ([`Self::retire`]) it is published
+    /// again.
+    held: bool,
+    /// The pass a restart cancelled before it started, retired by the firmware unrun, and when it
+    /// was: it is published again ahead of its queue's later passes, which wait for the pair's
+    /// room (`Firmware::replay_m5_render`). The firmware holds nothing of it.
+    replay: Option<(Arc<Packet>, u64)>,
 }
 
 /// An installed render pair without an owner: both lanes, the storage they name across owners,
@@ -501,6 +510,8 @@ impl Pair {
                 quarantine_error: None,
                 awaiting_witness: false,
                 growing: false,
+                held: false,
+                replay: None,
             },
             GFP_KERNEL,
         )?;
@@ -583,6 +594,8 @@ impl Pair {
                 quarantine_error: None,
                 awaiting_witness: false,
                 growing: false,
+                held: false,
+                replay: None,
             },
         );
         if let Err(error) = pair.publish_mappings() {
@@ -608,11 +621,7 @@ impl Pair {
     /// The pair is idle: healthy, no pass in flight, both lanes consumed to their producers,
     /// both stage stamps at the last pass's and the pool's count complete.
     pub(crate) fn parkable(&self) -> Result<bool> {
-        if !self.installed
-            || self.quarantine_error.is_some()
-            || self.active.is_some()
-            || self.growing
-        {
+        if !self.installed || self.quarantine_error.is_some() || self.in_flight() || self.growing {
             return Ok(false);
         }
         for lane in &self.lanes {
@@ -1043,18 +1052,20 @@ impl Pair {
         )
     }
 
+    /// No pass in flight and none awaiting its replay: a queue's later pass waits for the pass
+    /// a restart cancelled to run again first.
     pub(crate) fn has_room(&self) -> bool {
-        self.active.is_none()
+        !self.in_flight()
     }
-    /// The event worker polls this pair's retirement: a healthy pass in flight. A quarantined
-    /// pair's pass is not in flight, as a quarantined Neo queue's commands are not
-    /// (`Queue::in_flight`): each event pass checks its drain ([`Self::retire`]) without keeping
-    /// the worker polling, so the idle check can reach idle.
+    /// The event worker polls this pair's retirement: a healthy pass in flight, or one awaiting
+    /// its replay. A quarantined pair's pass is not in flight, as a quarantined Neo queue's
+    /// commands are not (`Queue::in_flight`): each event pass checks its drain ([`Self::retire`])
+    /// without keeping the worker polling, so the idle check can reach idle.
     pub(crate) fn polls(&self) -> bool {
-        self.active.is_some() && self.quarantine_error.is_none()
+        self.replay.is_some() || (self.active.is_some() && self.quarantine_error.is_none())
     }
     pub(crate) fn in_flight(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() || self.replay.is_some()
     }
 
     // An M5 pair serves the shared growth worker (`runtime/render/grow.rs`) through these three,
@@ -1101,11 +1112,7 @@ impl Pair {
     /// growth being served, both lanes consumed to their producers (as [`Self::publish`]
     /// requires of a pass).
     fn idle(&self) -> Result<bool> {
-        if !self.installed
-            || self.quarantine_error.is_some()
-            || self.active.is_some()
-            || self.growing
-        {
+        if !self.installed || self.quarantine_error.is_some() || self.in_flight() || self.growing {
             return Ok(false);
         }
         for lane in &self.lanes {
@@ -1604,26 +1611,49 @@ impl Pair {
                 .load(Ordering::Relaxed);
         }
         let failed = self.quarantine_error;
+        // A pass held at the restart (it had not started) that the firmware retired without
+        // starting it either: no stage time was written from its publication to its retirement.
+        // Every witness above says the firmware is done with it, so it runs again from the start
+        // rather than failing (Neo's rule, `queue::render` `replay_abandoned`: interrupted work is
+        // run again only if it never started).
+        let replay = core::mem::take(&mut self.held)
+            && failed.is_none()
+            && times == [0; 4]
+            && active
+                .packet
+                .as_ref()
+                .is_some_and(|packet| replayable(&packet.completion));
         if let Some(packet) = active
             .packet
             .as_ref()
             .filter(|p| p.completion.interrupted())
         {
             // An interrupted pass fails however its witnesses read
-            // (`Completion::note_interrupted`). Logged with its stage times, all zero for a pass
-            // that never started.
+            // (`Completion::note_interrupted`), unless it never started. Logged with its stage
+            // times, all zero for a pass that never started.
             let started = match times == [0; 4] {
                 true => "never started",
                 false => "started",
             };
-            pr_info!("G17 M5: render pair {:?}: pass {} ({}), interrupted by a restart, retired by the firmware: times {:x?} ({}); it fails\n",
-                self.qids(), active.ordinal, innocence(&packet.completion), times, started);
+            let fate = match replay {
+                true => "it runs again",
+                false => "it fails",
+            };
+            pr_info!("G17 M5: render pair {:?}: pass {} ({}), interrupted by a restart, retired by the firmware: times {:x?} ({}); {}\n",
+                self.qids(), active.ordinal, innocence(&packet.completion), times, started, fate);
         }
-        retired(Retired {
-            packet: active.packet.clone(),
-            times,
-            failed,
-        })?;
+        if replay {
+            self.replay = active
+                .packet
+                .clone()
+                .map(|packet| (packet, crate::g17::now_ns()));
+        } else {
+            retired(Retired {
+                packet: active.packet.clone(),
+                times,
+                failed,
+            })?;
+        }
         self.active = None;
         if failed.is_none() {
             // The GPU is retiring work: a watchdog of a queue beside it renews
@@ -1703,6 +1733,7 @@ impl Pair {
     /// its footprint (`Completion::quarantine_resumed_render`). The lease goes at the drain
     /// (`Completion::release_after_retirement`).
     pub(crate) fn fail(&mut self, error: Error, failure: Failure) -> Option<Arc<Packet>> {
+        self.held = false;
         let first = self.quarantine_error.is_none();
         // The M5 Ultra's rule (`awaits_witness`), as for a lane (`Channel::fail`): the pass
         // carries its stamp and targets from publication.
@@ -1730,8 +1761,39 @@ impl Pair {
         self.active
             .as_ref()
             .and_then(|active| active.packet.as_ref())
+            .or(self.replay.as_ref().map(|(own, _)| own))
             .is_some_and(|own| Arc::ptr_eq(own, packet))
     }
+
+    /// The pass awaiting its replay ([`Self::retire`]), and since when.
+    pub(crate) fn replay(&self) -> Option<&(Arc<Packet>, u64)> {
+        self.replay.as_ref()
+    }
+    /// Takes the pass awaiting its replay, to publish or fail it.
+    pub(crate) fn take_replay(&mut self) -> Option<(Arc<Packet>, u64)> {
+        self.replay.take()
+    }
+    /// Puts back a replay its publication found no room for yet; nothing of it was published.
+    pub(crate) fn restore_replay(&mut self, replay: (Arc<Packet>, u64)) {
+        self.replay = Some(replay);
+    }
+    /// The pass in flight is held for replay ([`Self::hold_unstarted`]): the restart's
+    /// cancellation does not fail it (`Pair::settle_cancelled`).
+    pub(crate) fn held(&self) -> bool {
+        self.held
+    }
+}
+
+/// Whether `completion`, interrupted by a restart, may run again: innocent and under Neo's
+/// replay limit (`completion::MAX_REPLAYS`). Innocent as Neo's replay has it
+/// (`queue::render` `replay_abandoned`): not classified guilty and never blamed; work a recovery
+/// left unclassified (its guilty VMs unresolved) counts as innocent, as for Neo
+/// (`Completion::settle_blamed`).
+fn replayable(completion: &crate::g17::completion::Completion) -> bool {
+    completion.interrupted()
+        && !completion.guilty()
+        && !completion.blamed()
+        && completion.replay_count() < crate::g17::completion::MAX_REPLAYS
 }
 
 /// Recovery attribution (`recovery::Queues`), as a Neo render pair takes part in it. A pair
@@ -1804,6 +1866,33 @@ impl Pair {
             }
         }
         progress.note(self.qids(), recovery::Work::Pass, active.ordinal, start);
+    }
+    /// Holds the DRM pass in flight for replay when the restart's table listed it (it was
+    /// interrupted), it is innocent ([`replayable`]), and the halted instant proved it had not
+    /// started: none
+    /// of its stage times was written ([`recovery::Progress::never_started`]). Missing evidence,
+    /// or a pass blamed, guilty, failed or past its replays, fails as before.
+    pub(crate) fn hold_unstarted(&mut self, progress: &recovery::Progress, listed: u128) {
+        self.held = false;
+        if self.quarantine_error.is_some() {
+            return;
+        }
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let Some(packet) = active.packet.as_ref() else {
+            return;
+        };
+        let qids = self.qids();
+        if qids.iter().all(|qid| listed & (1u128 << qid) == 0)
+            || !replayable(&packet.completion)
+            || !progress.never_started(qids)
+        {
+            return;
+        }
+        self.held = true;
+        pr_info!("G17 M5: render pair {:?}: pass {} ({}) had not started at the restart; it is held to run again\n",
+            qids, active.ordinal, innocence(&packet.completion));
     }
 }
 

@@ -10,6 +10,9 @@
 //! the blame goes to the work that started. Work that never started is never guilty; of several
 //! started candidates, the one that started first, the longest running, is blamed alone; with
 //! nothing started, nobody is. Missing evidence for a guilty queue keeps the firmware's blame.
+//!
+//! The same evidence says which work in flight is proven never to have started, which recovery
+//! may run again instead of failing ([`Progress::never_started`]).
 
 use super::{Attribution, Entries};
 use kernel::fmt;
@@ -43,6 +46,8 @@ pub(super) struct Started {
 pub(crate) struct Progress {
     /// QIDs whose work in flight was read, started or not.
     known: u128,
+    /// QIDs whose work in flight was read and had no start time written: never started.
+    unstarted: u128,
     started: [Started; STARTED],
     count: usize,
     overflow: bool,
@@ -101,6 +106,7 @@ impl Progress {
     pub(crate) fn note(&mut self, qids: [u8; 2], work: Work, id: u64, start: Option<u64>) {
         self.known |= mask(qids);
         let Some(start) = start else {
+            self.unstarted |= mask(qids);
             return;
         };
         match self.started.get_mut(self.count) {
@@ -115,6 +121,14 @@ impl Progress {
             }
             None => self.overflow = true,
         }
+    }
+
+    /// Whether the work in flight on `qids` was read at the halted instant and none of it had
+    /// started: its start words were read and all were zero. Work that could not be read is
+    /// not proven unstarted.
+    pub(crate) fn never_started(&self, qids: [u8; 2]) -> bool {
+        let qids = mask(qids);
+        self.known & qids == qids && self.unstarted & qids == qids
     }
 
     /// The blame for a restart whose table read `entries`, the firmware having blamed `blamed`:
@@ -235,6 +249,22 @@ mod tests {
         let (attribution, culprit) = progress.attribute(&entries, Some(3));
         assert_eq!(attribution, Attribution::Queues(1 << 9));
         assert_eq!(culprit.map(|c| c.qid()), Some(9));
+    }
+
+    /// Measured twice (the desktop's pass never started, the spin's had; lane 14 had launched
+    /// nothing): only work read with no start is proven unstarted.
+    #[test]
+    fn only_work_read_with_no_start_is_proven_unstarted() {
+        let mut progress = Progress::default();
+        progress.note([3, 4], Work::Pass, 1836, None);
+        progress.note([11, 12], Work::Pass, 0, Some(0x4caa5e0d));
+        progress.note([10, 10], Work::Kick, 0x939, Some(0x5726df1b));
+        progress.note([14, 14], Work::Kick, 0xbba, None);
+        assert!(progress.never_started([3, 4]));
+        assert!(!progress.never_started([11, 12]));
+        assert!(!progress.never_started([5, 6]));
+        assert!(!progress.never_started([10, 10]));
+        assert!(progress.never_started([14, 14]));
     }
 
     /// A guilty queue whose work in flight was not read keeps the firmware's blame.

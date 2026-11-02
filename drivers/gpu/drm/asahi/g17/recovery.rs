@@ -103,6 +103,11 @@ pub(super) trait Queues {
     fn halted_progress(&self) -> Option<Progress> {
         None
     }
+    /// Hands each queue what the halted instant proved of its work in flight (`progress`), once
+    /// the table has been read (`listed`: its QIDs) and the work classified, before any
+    /// settlement: work proven never to have started is not failed with the restart. Called only
+    /// where [`Self::halted_progress`] read that evidence (M5).
+    fn hold_unstarted(&mut self, _progress: &Progress, _listed: u128) {}
     /// Copy every retained queue's live producer to its recovery target, then
     /// issue a full barrier. A failed graph must not skip subsequent queues.
     fn publish_recovery_targets(&self) -> Option<Error>;
@@ -310,7 +315,11 @@ pub(super) fn service<H: Host>(
         }
         (_, attribution) => (attribution, None),
     };
+    let listed_qids = entries.listed_qids;
     let (cancelled, blame) = classify(host, entries, request.blamed, attribution);
+    if let Some(progress) = &progress {
+        host.hold_unstarted(progress, listed_qids);
+    }
     if listed != 0 {
         pr_warn!(
             "G17: GPU recovery: {} commands were in flight ({} matched by stamp, {} by queue); they fail instead of completing\n",

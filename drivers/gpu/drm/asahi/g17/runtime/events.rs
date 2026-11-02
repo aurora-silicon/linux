@@ -306,6 +306,15 @@ impl recovery::Queues for Service<'_> {
         }
         Some(progress)
     }
+    fn hold_unstarted(&mut self, progress: &recovery::Progress, listed: u128) {
+        // M5 only: `halted_progress` read the evidence there alone.
+        if self.firmware.variant.submission != crate::g17::fw::variant::Submission::M5HostCommand {
+            return;
+        }
+        for pair in &mut self.firmware.queues.m5_render {
+            pair.hold_unstarted(progress, listed);
+        }
+    }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
         for queue in self
@@ -580,6 +589,7 @@ impl crate::g17::Shared {
         // Publication may service events but must never recurse into replay.
         firmware.replay_compute(deferred)?;
         firmware.replay_render(deferred)?;
+        firmware.replay_m5_render(deferred)?;
         drop(state);
         self.observe_renders(masks, deferred)?;
         let mut state = self.state.lock();
