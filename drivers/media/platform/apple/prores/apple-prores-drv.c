@@ -244,9 +244,10 @@ struct apr_dev {
 	struct apr_job jobs[APR_MAX_DEPTH];
 	struct apr_batch batch;
 	bool recovering;
+	bool quarantined;	/* reset failed: retain every DMA owner until reboot */
 	u32 head;		/* next free ring offset */
 	bool ring_ready;	/* engine registers programmed since power-up */
-	bool broken;		/* timed out with no way to reset */
+	bool broken;		/* machine reset required before further submission */
 	unsigned long started;	/* jiffies at submission */
 	struct delayed_work watchdog;
 };
@@ -464,7 +465,7 @@ static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err, u32 *status_
 	u32 status, tail;
 
 	*status_out = 0;
-	if (!ctx || apr->recovering)
+	if (!ctx || apr->recovering || apr->quarantined)
 		return NULL;
 	status = apr_read(apr, APR_REG_IRQ_STATUS);
 	if (!status)
@@ -537,7 +538,7 @@ static void apr_watchdog(struct work_struct *work)
 		return;
 	}
 	ctx = apr->active;
-	if (!ctx) {
+	if (!ctx || apr->quarantined) {
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
 		return;
 	}
@@ -561,12 +562,26 @@ static void apr_watchdog(struct work_struct *work)
 	apr->recovering = false;
 	/* No new job can start until this batch is finished below. */
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
+	/* A reload cannot repair the shared DART state after this reset. */
+	__module_get(THIS_MODULE);
+	get_device(apr->dev);
 	if (!apr->reset || reset_control_reset(apr->reset)) {
-		dev_err(apr->dev, "engine cannot be reset, refusing further jobs\n");
+		/*
+		 * MODE_OFF alone is not a DMA-stop fence. Keep the m2m slot,
+		 * ready buffers and PM reference; streamoff/close must not free
+		 * their mappings. Pin the fixed platform device and driver until
+		 * a machine reset. Manual unbind is disabled below for this case.
+		 */
 		spin_lock_irqsave(&apr->hw_lock, flags);
-		apr->broken = true;
+		apr->active = ctx;
+		apr->quarantined = true;
 		spin_unlock_irqrestore(&apr->hw_lock, flags);
+		dev_err(apr->dev, "reset failed: DMA buffers retained until machine reset\n");
+		vb2_queue_error(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx));
+		vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
+		return;
 	}
+	dev_err(apr->dev, "APR/DART domain reset: further jobs require a machine reset\n");
 	apr_finish_job(apr, ctx, err);
 }
 
@@ -1278,6 +1293,8 @@ static struct platform_driver apr_driver = {
 		.name = APR_NAME,
 		.of_match_table = apr_of_match,
 		.pm = pm_ptr(&apr_pm_ops),
+		/* A failed-reset quarantine must survive an attempted unbind. */
+		.suppress_bind_attrs = true,
 	},
 };
 module_platform_driver(apr_driver);

@@ -143,7 +143,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
                                    'offset-sign', 'event-bit', 'wrong-base'), out()),
     'prores-queue-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('tail-only', 'release-early', 'publish-batch'), out()),
+        + mutations('--mutation', ('tail-only', 'release-early', 'publish-batch', 'reset-free'), out()),
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
