@@ -14,6 +14,7 @@ properties:
     oneOf:
       - const: apple,t8015-nvme-ans2
       - const: apple,t6041-nvme-ans2
+      - const: apple,t6050-nvme-ans2
       - items:
           - enum:
               - apple,t6020-nvme-ans2
@@ -145,6 +146,7 @@ allOf:
           contains:
             enum:
               - apple,t6041-nvme-ans2
+              - apple,t6050-nvme-ans2
               - apple,t8132-nvme-ans2
     then:
       properties:
@@ -159,13 +161,29 @@ allOf:
         reg-names:
           maxItems: 2
 
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-nvme-ans2
+    then:
+      description:
+        The T6050 ANS is adopted running, its power stays with the firmware
+        and it is never reset through PMGR, so it names no power domain and
+        no reset.
+      properties:
+        power-domains: false
+        power-domain-names: false
+    else:
+      required:
+        - resets
+        - power-domains
+        - power-domain-names
+
 required:
   - compatible
   - reg
   - reg-names
-  - resets
-  - power-domains
-  - power-domain-names
   - mboxes
   - interrupts
   - apple,sart
