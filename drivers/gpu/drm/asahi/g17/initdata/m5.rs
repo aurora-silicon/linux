@@ -197,17 +197,20 @@ impl InitData {
             self.object_mut(self.bundle)?.bytes_mut(),
         )
         .map_err(|e| bad("policy", e))?;
-        // The policy controllers and the board's power model; Region C's budget with them.
+        // The policy controllers and the board's power model; Region C's budget and standby with
+        // them.
         m::encode_m5_board_power(
             &platform.board.power,
             self.object_mut(self.bundle)?.bytes_mut(),
         )
         .map_err(|e| bad("power policy", e))?;
-        m::set_m5_region_power_budget(
+        m::encode_m5_aon_sensors(platform, self.object_mut(self.bundle)?.bytes_mut())
+            .map_err(|e| bad("aon sensors", e))?;
+        m::set_m5_region_board_power(
             &platform.board.power,
             self.object_mut(self.region_c)?.bytes_mut(),
         )
-        .map_err(|e| bad("power budget", e))?;
+        .map_err(|e| bad("region power", e))?;
         for (index, role) in [m::InstanceRole::Primary, m::InstanceRole::Secondary]
             .into_iter()
             .enumerate()

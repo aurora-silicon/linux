@@ -289,6 +289,9 @@ pub(crate) const M5_BOARD: M5Board = M5Board {
         core_leakage: [0x44a8_c000; 8],
         sram_leakage: [0x424c_0000; 8],
         aux_leakage: [0x44a8_c000; 2],
+        idle_standby_us: 3500,
+        // The performance controllers run from P3.
+        perf_floor: 3,
         // Power-controller integral and proportional gains (0.08, 0.005), the second controller's
         // (0.01, 0.28), and the utilization thresholds 75 and 95.
         controller: &[
@@ -299,6 +302,10 @@ pub(crate) const M5_BOARD: M5Board = M5Board {
             (0xb44, 75),
             (0xb48, 95),
         ],
+        // The four GPU sensors g0TR-g3TR and the auxiliary domain's r0TR and r1TR, one pair per
+        // die.
+        gpu_sensors: &[0x6730_5452, 0x6731_5452, 0x6732_5452, 0x6733_5452],
+        aux_sensors: &[0x7230_5452, 0x7231_5452],
         // The 160 GPU and 8 auxiliary-domain channels of the two dies; the hotspot set is both.
         sensor_masks: [
             (

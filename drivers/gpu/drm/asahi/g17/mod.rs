@@ -1757,7 +1757,7 @@ impl Gpu {
             clusters,
             perf_states: M5_PERF_STATES as u32 - 1,
             perf,
-            relative: relative_frequency(&mhz),
+            relative: relative_frequency(&mhz, board.power.perf_floor),
             aux,
             aon,
         }, GFP_KERNEL)?)

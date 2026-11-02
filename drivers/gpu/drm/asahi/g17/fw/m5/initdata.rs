@@ -1485,12 +1485,14 @@ const J714_AUX_PERF_STATES: [(u32, u32, u32); 14] = [
 
 // Evaluate the frequency-only curve at compile time; no kernel FPU use.
 // Conversion uses Hz before the single-precision multiply and divide.
-pub(crate) fn relative_frequency(mhz: &[u32; M5_PERF_STATES]) -> [u32; 16] {
+// States below `floor` read 0: the controllers' range starts at `floor`
+// ([`M5BoardPower::perf_floor`]).
+pub(crate) fn relative_frequency(mhz: &[u32; M5_PERF_STATES], floor: usize) -> [u32; 16] {
     use crate::float::F32;
     let mut values = [0; 16];
-    let base = mhz[1] * 1_000_000;
+    let base = mhz[floor] * 1_000_000;
     let denominator = F32::from(mhz[M5_PERF_STATES - 1] * 1_000_000 - base);
-    for state in 2..M5_PERF_STATES {
+    for state in floor + 1..M5_PERF_STATES {
         let above = F32::from(mhz[state] * 1_000_000 - base);
         values[state] = (above * F32::from(100u32) / denominator).to_bits();
     }
@@ -1538,8 +1540,17 @@ pub(crate) struct M5BoardPower {
     pub(crate) core_leakage: [u32; M5_PLATFORM_LANES],
     pub(crate) sram_leakage: [u32; M5_PLATFORM_LANES],
     pub(crate) aux_leakage: [u32; 2],
+    /// How long the idle GPU waits before it goes to standby, us (Region C +0x7c8).
+    pub(crate) idle_standby_us: u32,
+    /// The lowest performance state the performance controllers run the GPU at, and the base of
+    /// HwData's relative-frequency tables (+0x1a24, +0x1aa4).
+    pub(crate) perf_floor: usize,
     /// Controller gains and utilization targets: (policy offset, word).
     pub(crate) controller: &'static [(usize, u32)],
+    /// Identifiers of the AON telemetry records the policy reads: the GPU's temperature sensors
+    /// and the auxiliary domain's ([`encode_m5_aon_sensors`]).
+    pub(crate) gpu_sensors: &'static [u32],
+    pub(crate) aux_sensors: &'static [u32],
     /// Temperature-sensor channel masks of the GPU, auxiliary-domain and hotspot controllers:
     /// (policy offset, five 64-bit words).
     pub(crate) sensor_masks: [(usize, [u64; 5]); 3],
@@ -2018,6 +2029,11 @@ const M5_POLICY_SRAM_LEAKAGE: usize = 0x12230;
 const M5_POLICY_AUX_LEAKAGE: usize = 0x12280;
 /// Region C's host power budget, mW.
 const M5_REGION_POWER_BUDGET: usize = 0x88;
+/// Region C's idle standby timer, us ([`M5BoardPower::idle_standby_us`]).
+const M5_REGION_IDLE_STANDBY: usize = 0x7c8;
+/// Policy words that hold [`M5BoardPower::perf_floor`] as performance state x 100; the last one
+/// sits at an odd offset inside a byte-packed block.
+const M5_POLICY_PERF_FLOOR_WORDS: [usize; 3] = [0xb94, 0xbd4, 0xbf9];
 
 /// The policy controllers' configuration for the board: the controller defaults, then the
 /// board's power model and controller values over them. `bundle` is the shared cluster (policy
@@ -2040,6 +2056,12 @@ pub(crate) fn encode_m5_board_power(power: &M5BoardPower, bundle: &mut [u8]) -> 
     for (index, &aux) in power.aux_leakage.iter().enumerate() {
         put_u32(policy, M5_POLICY_AUX_LEAKAGE + index * 4, aux);
     }
+    if power.perf_floor == 0 || power.perf_floor >= M5_PERF_STATES - 1 {
+        return Err(InitdataError::InterfaceMismatch);
+    }
+    for offset in M5_POLICY_PERF_FLOOR_WORDS {
+        put_u32(policy, offset, power.perf_floor as u32 * 100);
+    }
     for &(offset, value) in power.controller {
         put_u32(policy, offset, value);
     }
@@ -2051,11 +2073,39 @@ pub(crate) fn encode_m5_board_power(power: &M5BoardPower, bundle: &mut [u8]) -> 
     Ok(())
 }
 
-/// Region C's initial host power budget: the board's modeled maximum (`region_c` encoded).
-pub(crate) fn set_m5_region_power_budget(power: &M5BoardPower, region_c: &mut [u8]) -> Result<(), InitdataError> {
+/// The policy's AON telemetry state (at [`M5_POLICY_AON_PTD_PTR`], after the table pointer): the
+/// GPU's and the auxiliary domain's sensor identifiers, each list with a mask of the identifiers
+/// the platform's AON table holds.
+const M5_AON_GPU_SENSORS: (usize, usize, usize) = (0x11a24, 16, 0x11a64);
+const M5_AON_AUX_SENSORS: (usize, usize, usize) = (0x11a6c, 2, 0x11a74);
+
+/// The policy's AON sensor identifiers and masks for the board (`bundle` is the shared cluster).
+pub(crate) fn encode_m5_aon_sensors(platform: &M5Platform, bundle: &mut [u8]) -> Result<(), InitdataError> {
+    if bundle.len() < M5_SHARED_PREFIX_SIZE { return Err(InitdataError::BufferSize); }
+    let policy = &mut bundle[M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE];
+    let power = &platform.board.power;
+    for (ids, (offset, slots, mask_offset)) in
+        [(power.gpu_sensors, M5_AON_GPU_SENSORS), (power.aux_sensors, M5_AON_AUX_SENSORS)]
+    {
+        if ids.is_empty() || ids.len() > slots { return Err(InitdataError::InterfaceMismatch); }
+        policy[offset..offset + slots * 4].fill(0);
+        let mut mask = 0u64;
+        for (slot, &id) in ids.iter().enumerate() {
+            put_u32(policy, offset + slot * 4, id);
+            if platform.aon.iter().any(|record| record[0] == id) { mask |= 1 << slot; }
+        }
+        put_u64(policy, mask_offset, mask);
+    }
+    Ok(())
+}
+
+/// Region C's board power words (`region_c` encoded): the initial host power budget, the board's
+/// modeled maximum, and the idle standby timer.
+pub(crate) fn set_m5_region_board_power(power: &M5BoardPower, region_c: &mut [u8]) -> Result<(), InitdataError> {
     if region_c.len() < M5_REGION_C_ALLOCATION { return Err(InitdataError::BufferSize); }
-    if power.maximum_mw == 0 { return Err(InitdataError::InterfaceMismatch); }
+    if power.maximum_mw == 0 || power.idle_standby_us == 0 { return Err(InitdataError::InterfaceMismatch); }
     put_u32(region_c, M5_REGION_POWER_BUDGET, power.maximum_mw);
+    put_u32(region_c, M5_REGION_IDLE_STANDBY, power.idle_standby_us);
     Ok(())
 }
 
