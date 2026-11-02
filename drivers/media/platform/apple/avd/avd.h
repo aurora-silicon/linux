@@ -232,6 +232,9 @@ struct avd_dev {
 	void __iomem *code;
 	void __iomem *mbox;
 	void __iomem *ctrl;
+	void __iomem *piodma;
+	phys_addr_t sram_phys;
+	bool piodma_version_logged;
 
 	struct iommu_domain *domain;
 	struct iommu_domain *empty_domain;

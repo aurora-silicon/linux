@@ -575,6 +575,7 @@ static void avd_release_open_firmware(void *data)
 static int avd_probe(struct platform_device *pdev)
 {
 	struct avd_dev *avd;
+	struct resource *res;
 	const struct of_device_id *match;
 	int ret, irq;
 
@@ -631,6 +632,20 @@ static int avd_probe(struct platform_device *pdev)
 	ret = avd_pm_map_piodma(avd);
 	if (ret)
 		return ret;
+
+	/* Older device trees do not describe the PIODMA aperture. */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "piodma");
+	if (res) {
+		avd->piodma = devm_ioremap_resource(avd->dev, res);
+		if (IS_ERR(avd->piodma))
+			return PTR_ERR(avd->piodma);
+
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "sram");
+		if (!res)
+			return dev_err_probe(avd->dev, -EINVAL,
+					     "missing SRAM resource for PIODMA\n");
+		avd->sram_phys = res->start;
+	}
 
 	avd->domain = iommu_get_domain_for_dev(avd->dev);
 	if (avd->domain) {

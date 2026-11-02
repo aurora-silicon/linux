@@ -643,15 +643,16 @@
 		reg = <0x2 0x81080000 0x0 0x14000>,
 		      <0x2 0x81094000 0x0 0x14000>,
 		      <0x2 0x810a8000 0x0 0x4000>,
-		      <0x2 0x81100000 0x0 0x10000>;
-		reg-names = "code", "sram", "mbox", "ctrl";
+		      <0x2 0x81100000 0x0 0x10000>,
+		      <0x2 0x81070000 0x0 0x4000>;
+		reg-names = "code", "sram", "mbox", "ctrl", "piodma";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1442 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 1443 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
 		power-domain-names = "core", "perf";
 		resets = <&ps_avd_sys>;
-		iommus = <&avd_dart 0>;
+		iommus = <&avd_dart 0>, <&avd_dart 1>;
 	};
 
 	avd_dart: iommu@281020000 {

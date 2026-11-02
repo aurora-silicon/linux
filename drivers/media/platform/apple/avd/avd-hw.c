@@ -54,6 +54,16 @@ int avd_boot(struct avd_dev *avd)
 
 	memcpy_toio(avd->code, avd->fw->data, avd->fw->size);
 
+	if (avd->piodma) {
+		/* Program the AP SRAM address before releasing the CM3. */
+		writel(avd->sram_phys >> 4, avd->piodma + AVD_PIODMA_SRAM_BASE);
+		if (!avd->piodma_version_logged) {
+			dev_info(avd->dev, "PIODMA version: %08x\n",
+				 readl(avd->piodma + AVD_PIODMA_VERSION));
+			avd->piodma_version_logged = true;
+		}
+	}
+
 	writel_relaxed(AVD_MBOX_ENABLE, avd->mbox + AVD_REG_MBOX1_STATUS);
 	writel_relaxed(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
 	writel_relaxed(AVD_RUN_CTRL_UNK_RUN, avd->mbox + AVD_REG_RUN_CTRL);
