@@ -251,6 +251,7 @@
 	};
 
 	actuator {
+		apple,click-strength = <0xc0 0x6e>;
 	};
 
 	tp_accel {
@@ -261,9 +262,9 @@
 /*
  * Mesa fingerprint sensor on spi2. The J413 platform device tree
  * (/arm-io/spi2/mesa) describes it as J415's does: power on AP GPIO 178,
- * active high, data-ready on GPIO 177. As on J415, the data-ready line is
- * left out, so the driver polls until its trigger is confirmed. Native chip
- * select only. J413 is untested.
+ * active high, data-ready on AP GPIO 177. The data-ready edge only wakes the
+ * capture early; every frame is still gated on the sensor's SPI status.
+ * Native chip select only.
  */
 &spi2 {
 	status = "okay";
@@ -272,6 +273,8 @@
 &mesa {
 	status = "okay";
 	enable-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <177 IRQ_TYPE_EDGE_RISING>;
 	spi-cs-setup-delay-ns = <20>;
 	spi-cs-hold-delay-ns = <20>;
 	/* Per-device factory data from this Mac's own iBoot system container. */

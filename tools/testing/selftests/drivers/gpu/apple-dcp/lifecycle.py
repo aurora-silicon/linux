@@ -1694,7 +1694,7 @@ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMW
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
     DCP_FIRMWARE_V_26_6_DESKTOP };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing;
+    bool crashed, external, external_native, quiescing, main_display;
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
@@ -1730,6 +1730,9 @@ static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
 static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
     struct drm_atomic_commit *s)
 { (void)d; (void)c; (void)s; return 0; }
+/* The panel of a desktop 26.6 machine takes VRR_ENABLED live. */
+static bool dcp_vrr_live(struct apple_dcp *d)
+{ return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
 static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return -ENODEV; }
 static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
@@ -1788,33 +1791,36 @@ DESKTOP_VRR    dcp.crashed = true;
     return 0;
 }
 """
-    desktop = ''
-    if 'DCP_FIRMWARE_V_26_6_DESKTOP' in check:
-        # Desktop 26.6 applies adaptive sync with a mode set: a VRR_ENABLED
-        # change of an enabled CRTC must become one, nothing else may.
-        desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+    # Desktop 26.6 takes VRR_ENABLED live on the panel (main display), with
+    # the next frame: compositors toggle it in plain page flips, so there a
+    # VRR_ENABLED change must never become a mode set.  The external
+    # processors ignore a live minimum rate and still apply it with a mode set.
+    desktop = r"""    dcp.fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
     dcp.hw.iomfb_method_profile = 0;
     dcp.mode_state.valid = true;
     dcp.connector = &connector;
     connector.connected = true;
     state.crtc.modeset = false;
+    for (unsigned int panel = 0; panel < 2; panel++)
     for (unsigned int enable = 0; enable < 2; enable++)
     for (unsigned int old_vrr = 0; old_vrr < 3; old_vrr++)
     for (unsigned int vrr = 0; vrr < 2; vrr++) {
+        dcp.main_display = panel;
         state.crtc.enable = enable;
         state.crtc.vrr_enabled = vrr;
         state.crtc.mode_changed = false;
         state.no_old_crtc = old_vrr == 2;
         state.old_crtc.vrr_enabled = old_vrr == 1;
         assert(dcp_crtc_atomic_check(&crtc, &state) == 0);
-        bool expected = enable && old_vrr != 2 && (old_vrr == 1) != vrr;
+        bool expected = !panel && enable && old_vrr != 2 && (old_vrr == 1) != vrr;
         if (state.crtc.mode_changed != expected) {
-            fprintf(stderr, "desktop enable=%u old_vrr=%u vrr=%u: mode_changed=%d expected %d\n",
-                    enable, old_vrr, vrr, state.crtc.mode_changed, expected);
+            fprintf(stderr, "desktop panel=%u enable=%u old_vrr=%u vrr=%u: mode_changed=%d expected %d\n",
+                    panel, enable, old_vrr, vrr, state.crtc.mode_changed, expected);
             return 1;
         }
         cases++;
     }
+    dcp.main_display = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
     return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1)

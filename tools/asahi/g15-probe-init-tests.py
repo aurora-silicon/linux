@@ -77,6 +77,7 @@ thread_local! {
     static FAIL_REGISTRATION: Cell<u8> = const { Cell::new(0) };
     static COMPLETED_REGISTRATION: Cell<u8> = const { Cell::new(0) };
     static ACTIVATED: Cell<bool> = const { Cell::new(false) };
+    static BINDING_READY: Cell<bool> = const { Cell::new(false) };
     static ATTACH_ERROR: Cell<bool> = const { Cell::new(false) };
     static PROBE_ERROR: Cell<i32> = const { Cell::new(0) };
 }
@@ -140,6 +141,11 @@ pub trait ModuleMetadata { const NAME: &'static std::ffi::CStr; }
 pub trait InPlaceModule: Sized {
     fn init(module: &'static ThisModule) -> impl PinInit<Self, Error>;
 }
+// Registry synchronization is covered by binding-lifetime-tests; this adapter
+// verifies that the actual module initializer orders it before registration.
+mod binding {
+    pub unsafe fn init() { crate::BINDING_READY.set(true); }
+}
 mod cleanup {
     pub struct QueueOwner;
     impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
@@ -150,11 +156,12 @@ mod driver {
     pub struct Registration<T> { stage: u8, marker: PhantomData<T> }
     impl<T: 'static> Registration<T> {
         pub fn new(name: &'static std::ffi::CStr, _module: &'static ThisModule) -> impl PinInit<Self, Error> {
+            assert!(BINDING_READY.get(), "adapter registered before binding registry init");
             try_pin_init!(Self {
                 stage: {
                     let stage = match name.to_bytes() {
-                        b"asahi-g15" => 1,
-                        b"asahi-g16" => 3,
+                        b"aurora-g15" => 1,
+                        b"aurora-g16" => 3,
                         _ => 2,
                     };
                     // Model driver_attach and a late driver_add_groups failure. A deferred
@@ -198,6 +205,7 @@ fn callback<'bound, T: platform::Driver>(
 }
 fn reset(fail_alloc: bool, touch: bool, error: i32) {
     MODULE_READY.store(true, Ordering::Release);
+    BINDING_READY.set(false);
     FAIL_ALLOC.set(fail_alloc); TOUCH.set(touch); PROBE_ERROR.set(error);
     RETAINED.set(false); ALLOCS.set(0); PROBES.set(0);
 }
@@ -330,7 +338,7 @@ def main():
     g16_registration = aliases + "\n" + item(core, "fn register_g16(")
     module_struct = item(core, "#[pin_data]\nstruct DriverModule")
     module_init = item(core, "    fn init(module:")
-    module_code = module_struct + "\nimpl InPlaceModule for DriverModule {\n" + module_init + "\n}\nimpl ModuleMetadata for DriverModule { const NAME: &'static std::ffi::CStr = c\"asahi\"; }\n"
+    module_code = module_struct + "\nimpl InPlaceModule for DriverModule {\n" + module_init + "\n}\nimpl ModuleMetadata for DriverModule { const NAME: &'static std::ffi::CStr = c\"aurora\"; }\n"
     kbox = item(sources["rust/kernel/alloc/kbox.rs"], "    fn try_pin_init<E>(")
     assert "Box::<_, A>::new_uninit(flags)?.write_pin_init(init)" in kbox
     reprobe = item(sources["drivers/gpu/drm/asahi/g15/glue.c"], "void asahi_g15_reprobe(void)\n{")
@@ -400,7 +408,7 @@ int main(void) {
             if name == "activation-before-g16-registration" and not enable_g16:
                 continue
             # Macro definitions precede the fake registration, just as kernel prelude exports them.
-            source = macro + "\n" + PREFIX.replace("#![allow(dead_code, unused_variables)]\n", "").replace("    // SET_DRVDATA", set_data) + "\n" + ready + "\n" + driver + "\nimpl platform::Driver for Driver<'_> {\n    type IdInfo = &'static Config;\n    type Data<'bound> = Driver<'bound>;\n" + method + "\n}\nmod g15 { use super::*; pub type Driver<'a> = super::Driver<'a>; " + activate + "\n}\ntype G15Registration = driver::Registration<platform::Adapter<g15::Driver<'static>>>;\n" + "mod g16 { pub struct Driver; pub const DRIVER_NAME: &std::ffi::CStr = c\"asahi-g16\"; }\n" + g16_registration + "\n" + module_variant + "\n" + SUFFIX.replace("    // CALLBACK", callback)
+            source = macro + "\n" + PREFIX.replace("#![allow(dead_code, unused_variables)]\n", "").replace("    // SET_DRVDATA", set_data) + "\n" + ready + "\n" + driver + "\nimpl platform::Driver for Driver<'_> {\n    type IdInfo = &'static Config;\n    type Data<'bound> = Driver<'bound>;\n" + method + "\n}\nmod g15 { use super::*; pub type Driver<'a> = super::Driver<'a>; " + activate + "\n}\ntype G15Registration = driver::Registration<platform::Adapter<g15::Driver<'static>>>;\n" + "mod g16 { pub struct Driver; pub const DRIVER_NAME: &std::ffi::CStr = c\"aurora-g16\"; }\n" + g16_registration + "\n" + module_variant + "\n" + SUFFIX.replace("    // CALLBACK", callback)
             source = "#![allow(dead_code, unused_variables, private_bounds, private_interfaces)]\n" + source
             label = ("g16-" if enable_g16 else "") + name
             src = out / (label + ".rs"); src.write_text(source)

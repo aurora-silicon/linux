@@ -123,7 +123,11 @@ properties:
 
   apple,pciec-kernel-init:
     type: boolean
-    description: The kernel initializes the tunneled controller from reset.
+    description: |
+      The kernel initializes the tunneled controller when firmware has not
+      already initialized it. The compatible selects the initialization
+      sequence. T600x and T8112 use the Intr2AXI bridge and require tunables
+      for their associated DART before the tunnel children can be populated.
 
   apple,tunable-rc:
     $ref: '#/$defs/tunable'

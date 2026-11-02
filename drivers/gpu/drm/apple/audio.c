@@ -84,7 +84,7 @@ struct dcp_audio {
 #endif
 };
 
-/* The 14.7 external role's audio service (DRM_APPLE_DCP_T6030_AUDIO only). */
+/* Native external audio service (DRM_APPLE_DCP_T6030_AUDIO only). */
 static inline bool dcpaud_native_link(struct dcp_audio *dcpaud)
 {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
@@ -1057,7 +1057,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 	dcpaud->dcp_dev = &dcp_pdev->dev;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-	/* The 14.7 external role: its native links and element catalog. */
+	/* Native external roles share the link lifecycle and element catalog. */
 	if (dcp_audiosrv_native_link(dcpaud->dcp_dev)) {
 		void *elements = devm_kzalloc(dev, DCPAUD_ELEMENTS_V14_7, GFP_KERNEL);
 

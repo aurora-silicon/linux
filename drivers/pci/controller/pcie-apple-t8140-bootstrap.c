@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * J700 PIODMA diagnostic scaffolding, not a production DMA driver.
+ * T8140 radio PCIe bootstrap: one validated config read before native ECAM.
  *
- * Public Linux DMA/IOMMU APIs own the SID17 mappings. The register and
- * address-view contract is attributed in the accompanying provenance ledger
- * to the reviewed Aurora reference and fresh ADT observations.
- *
- * This built-in driver deliberately retains its coherent arena and device
- * power reference until a coordinator-controlled full hardware reset. There
- * is no unbind interface or hardware retry. Runtime guards cover host admission
- * and retained hardware ownership. Native ECAM is only
- * opened by the host after a successful bootstrap and typed read checks.
+ * The Linux DMA/IOMMU APIs own the SID17 mappings. See
+ * Documentation/PCI/controller/apple-t8140.rst for the public history and
+ * the retained-ownership contract. Completion does not establish DMA teardown.
+ * The arena, IRQ and power reference remain owned until full hardware reset.
  */
 #include <linux/bitfield.h>
 #include <linux/completion.h>
@@ -37,11 +32,9 @@
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
 
-#include "pcie-apple-piodma-diag.h"
+#include "pcie-apple-t8140-bootstrap.h"
+#include "pcie-apple-t8140-bootstrap-state.h"
 
-#define PIODMA_PACKET_MASK	DMA_BIT_MASK(36)
-#define PIODMA_POINTER_MASK	DMA_BIT_MASK(42)
-#define PIODMA_POINTER_PREFIX	BIT_ULL(40)
 #define PIODMA_SID		17
 #define PIODMA_REQUEST_COUNT	1
 #define PIODMA_SLOT_SIZE	(3 * PAGE_SIZE)
@@ -50,19 +43,13 @@
 #define PIODMA_COMPLETION_OFFSET	PAGE_SIZE
 #define PIODMA_CONFIG_BASE	0x1cb0000000ULL
 #define PIODMA_CONFIG_SIZE	SZ_256M
-#define PIODMA_IRQ_COMPLETE	(BIT(0) | BIT(6))
 #define PIODMA_IRQ_MASK		GENMASK(9, 0)
 #define PIODMA_FIFO_MASK		GENMASK(5, 0)
-#define PIODMA_IRQ_LIMIT		16
 
 /*
  * The board DT opts in by pointing the host's "apple,piodma" at this engine;
- * a host without that property stays root-port-only. enumerate=0 keeps every
- * host on its root-port-only path for diagnosis.
+ * a host without that property stays root-port-only.
  */
-static bool enumerate = true;
-module_param(enumerate, bool, 0400);
-MODULE_PARM_DESC(enumerate, "Prime once, validate native ECAM, and enumerate the two Neo functions (default: on)");
 
 struct apple_piodma_request {
 	u16 offset;
@@ -85,28 +72,22 @@ struct apple_piodma_slot {
 	bool observed;
 };
 
-struct apple_piodma_diag {
+struct apple_t8140_bootstrap {
 	struct device *dev;
 	struct iommu_domain *domain;
 	void __iomem *engine;
 	void __iomem *fabric;
 	struct apple_piodma_slot slots[PIODMA_REQUEST_COUNT];
 	atomic_t irq_count;
-	atomic_t attempted;
+	atomic_t state;
 	u32 active_tag;
 	u64 config_source;
-	u32 last_irq_status;
-	u32 last_irq_tag;
 	int irq;
 	bool irq_fault;
 	void *arena;
 	dma_addr_t dma;
 	u64 pointer_prefix;
 	u8 secondary_bus;
-	bool retained;
-	bool ready;
-	bool guarded;
-	bool radio_admitted;
 	struct notifier_block pm_notifier;
 	struct kexec_blocker kexec_blocker;
 	struct delayed_work admission_retry;
@@ -114,7 +95,24 @@ struct apple_piodma_diag {
 };
 
 /* A successful supplier probe owns its unpublished arena until full reset. */
-static struct apple_piodma_diag *active_diag;
+static struct apple_t8140_bootstrap *active_bootstrap;
+
+/* Host device_lock serializes transitions; IRQ faults are recorded separately. */
+static enum apple_piodma_state apple_piodma_state(struct apple_t8140_bootstrap *bootstrap)
+{
+	return atomic_read_acquire(&bootstrap->state);
+}
+
+static int apple_piodma_transition(struct apple_t8140_bootstrap *bootstrap,
+				   enum apple_piodma_event event)
+{
+	enum apple_piodma_state state = apple_piodma_state(bootstrap);
+	int next = apple_piodma_next(state, event);
+
+	if (next < 0)
+		return next;
+	return atomic_cmpxchg(&bootstrap->state, state, next) == state ? 0 : -EALREADY;
+}
 
 static bool apple_piodma_trylock_sleep(unsigned int *flags)
 {
@@ -137,7 +135,7 @@ static bool apple_piodma_trylock_sleep(unsigned int *flags)
 	return false;
 }
 
-static int apple_piodma_lock_transition(struct apple_piodma_diag *diag,
+static int apple_piodma_lock_transition(struct apple_t8140_bootstrap *bootstrap,
 					unsigned int *sleep_flags)
 {
 	unsigned int attempt;
@@ -146,7 +144,7 @@ static int apple_piodma_lock_transition(struct apple_piodma_diag *diag,
 	/* Probe cannot wait on either lock while holding its device lock. */
 	for (attempt = 0; attempt < 50; attempt++) {
 		if (apple_piodma_trylock_sleep(sleep_flags)) {
-			ret = kexec_block(&diag->kexec_blocker);
+			ret = kexec_block(&bootstrap->kexec_blocker);
 			if (!ret)
 				return 0;
 			unlock_system_sleep(*sleep_flags);
@@ -163,8 +161,8 @@ static int apple_piodma_lock_transition(struct apple_piodma_diag *diag,
 static int apple_piodma_pm_notify(struct notifier_block *nb,
 				  unsigned long action, void *unused)
 {
-	struct apple_piodma_diag *diag =
-		container_of(nb, struct apple_piodma_diag, pm_notifier);
+	struct apple_t8140_bootstrap *bootstrap =
+		container_of(nb, struct apple_t8140_bootstrap, pm_notifier);
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
@@ -178,7 +176,7 @@ static int apple_piodma_pm_notify(struct notifier_block *nb,
 		return NOTIFY_DONE;
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
-		dev_warn_ratelimited(diag->dev,
+		dev_warn_ratelimited(bootstrap->dev,
 				     "sleep refused: Neo guard active during radio admission or retained DMA lifetime\n");
 		return notifier_from_errno(-EOPNOTSUPP);
 	default:
@@ -188,13 +186,12 @@ static int apple_piodma_pm_notify(struct notifier_block *nb,
 
 static int apple_piodma_pm_prepare(struct device *dev)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
 
 	/* Acquire admission before either PCI children or DMA pointers escape. */
-	if (!diag || !smp_load_acquire(&diag->guarded))
+	if (!bootstrap || !apple_piodma_guarded(apple_piodma_state(bootstrap)))
 		return 0;
-	if (pm_suspend_no_platform() && READ_ONCE(diag->ready) &&
-	    smp_load_acquire(&diag->radio_admitted))
+	if (apple_piodma_sleep_allowed(apple_piodma_state(bootstrap), pm_suspend_no_platform()))
 		return 0;
 	/*
 	 * A /dev/snapshot file may have sent its PREPARE notifier before this
@@ -206,7 +203,7 @@ static int apple_piodma_pm_prepare(struct device *dev)
 	return -EOPNOTSUPP;
 }
 
-static int apple_piodma_diag_root(struct apple_piodma_diag *diag, struct pci_dev *root)
+static int apple_t8140_bootstrap_root(struct apple_t8140_bootstrap *bootstrap, struct pci_dev *root)
 {
 	int ret;
 
@@ -215,23 +212,23 @@ static int apple_piodma_diag_root(struct apple_piodma_diag *diag, struct pci_dev
 	    root->vendor != PCI_VENDOR_ID_APPLE || root->device != 0x100c ||
 	    root->class != PCI_CLASS_BRIDGE_PCI << 8)
 		return -ENODEV;
-	ret = pci_read_config_byte(root, PCI_SECONDARY_BUS, &diag->secondary_bus);
+	ret = pci_read_config_byte(root, PCI_SECONDARY_BUS, &bootstrap->secondary_bus);
 	if (ret)
 		return pcibios_err_to_errno(ret);
-	if (diag->secondary_bus != 1)
+	if (bootstrap->secondary_bus != 1)
 		return -EINVAL;
-	diag->config_source += (u64)diag->secondary_bus << 20;
+	bootstrap->config_source = PIODMA_CONFIG_BASE + ((u64)bootstrap->secondary_bus << 20);
 	return 0;
 }
 
-static int apple_piodma_diag_iommu(struct apple_piodma_diag *diag)
+static int apple_t8140_bootstrap_iommu(struct apple_t8140_bootstrap *bootstrap)
 {
 	struct of_phandle_args args;
 	u64 range[2];
 	int ret;
 
-	ret = of_parse_phandle_with_args(diag->dev->of_node, "iommus",
-					"#iommu-cells", 0, &args);
+	ret = of_parse_phandle_with_args(bootstrap->dev->of_node, "iommus",
+					 "#iommu-cells", 0, &args);
 	if (ret)
 		return ret;
 	if (args.args_count != 1 || args.args[0] != PIODMA_SID ||
@@ -244,66 +241,62 @@ static int apple_piodma_diag_iommu(struct apple_piodma_diag *diag)
 		ret = -EINVAL;
 		goto out;
 	}
-	diag->pointer_prefix = PIODMA_POINTER_PREFIX;
+	bootstrap->pointer_prefix = PIODMA_POINTER_PREFIX;
 	ret = of_property_read_u64_array(args.np, "apple,dma-range", range, 2);
 	if (ret)
 		goto out;
-	if (diag->pointer_prefix != PIODMA_POINTER_PREFIX || range[0] ||
+	if (bootstrap->pointer_prefix != PIODMA_POINTER_PREFIX || range[0] ||
 	    range[1] != BIT_ULL(36)) {
 		ret = -EINVAL;
 		goto out;
 	}
-	diag->domain = iommu_get_domain_for_dev(diag->dev);
-	if (!diag->domain ||
-	    (diag->domain->type != IOMMU_DOMAIN_DMA &&
-	     diag->domain->type != IOMMU_DOMAIN_DMA_FQ)) {
+	bootstrap->domain = iommu_get_domain_for_dev(bootstrap->dev);
+	if (!bootstrap->domain ||
+	    (bootstrap->domain->type != IOMMU_DOMAIN_DMA &&
+	     bootstrap->domain->type != IOMMU_DOMAIN_DMA_FQ)) {
 		ret = -ENODEV;
 		goto out;
 	}
-	ret = dma_set_mask_and_coherent(diag->dev, PIODMA_PACKET_MASK);
+	ret = dma_set_mask_and_coherent(bootstrap->dev, PIODMA_PACKET_MASK);
 out:
 	of_node_put(args.np);
 	return ret;
 }
 
-static int apple_piodma_diag_arena(struct apple_piodma_diag *diag)
+static int apple_t8140_bootstrap_arena(struct apple_t8140_bootstrap *bootstrap)
 {
-	u64 last, pointer;
 	int i;
 
-	diag->arena = dma_alloc_coherent(diag->dev, PIODMA_ARENA_SIZE, &diag->dma, GFP_KERNEL);
-	if (!diag->arena)
+	bootstrap->arena = dma_alloc_coherent(bootstrap->dev, PIODMA_ARENA_SIZE,
+					      &bootstrap->dma, GFP_KERNEL);
+	if (!bootstrap->arena)
 		return -ENOMEM;
-	if (!IS_ALIGNED(diag->dma, SZ_16K) ||
-	    check_add_overflow((u64)diag->dma, PIODMA_ARENA_SIZE - 1, &last) ||
-	    last > PIODMA_PACKET_MASK ||
-	    check_add_overflow(last, diag->pointer_prefix, &pointer) ||
-	    pointer > PIODMA_POINTER_MASK ||
-	    !diag->domain->geometry.force_aperture ||
-	    diag->domain->geometry.aperture_start != 0 ||
-	    diag->domain->geometry.aperture_end != PIODMA_PACKET_MASK)
+	if (!apple_piodma_arena_valid(bootstrap->dma, PIODMA_ARENA_SIZE,
+				      bootstrap->pointer_prefix,
+				      bootstrap->domain->geometry.force_aperture,
+				      bootstrap->domain->geometry.aperture_start,
+				      bootstrap->domain->geometry.aperture_end))
 		return -ERANGE;
-	memset(diag->arena, 0, PIODMA_ARENA_SIZE);
+	memset(bootstrap->arena, 0, PIODMA_ARENA_SIZE);
 	for (i = 0; i < PIODMA_REQUEST_COUNT; i++) {
-		void *slot = diag->arena + i * PIODMA_SLOT_SIZE;
-		u64 dma = diag->dma + i * PIODMA_SLOT_SIZE;
+		void *slot = bootstrap->arena + i * PIODMA_SLOT_SIZE;
+		u64 dma = bootstrap->dma + i * PIODMA_SLOT_SIZE;
 
 		memset(slot + PIODMA_DATA_OFFSET, 0xa5, PAGE_SIZE);
 		*(__le32 *)(slot + PIODMA_DATA_OFFSET) = cpu_to_le32(U32_MAX);
-		dev_info(diag->dev,
-			 "owned SID17 slot=%d dma=%#llx descriptor=%#llx completion=%#llx data=%#llx\n",
-			 i, dma, dma + diag->pointer_prefix,
-			 dma + diag->pointer_prefix + PIODMA_COMPLETION_OFFSET,
-			 dma + PIODMA_DATA_OFFSET);
+		dev_dbg(bootstrap->dev,
+			"owned SID17 slot=%d dma=%#llx descriptor=%#llx completion=%#llx data=%#llx\n",
+			i, dma, dma + bootstrap->pointer_prefix,
+			dma + bootstrap->pointer_prefix + PIODMA_COMPLETION_OFFSET,
+			dma + PIODMA_DATA_OFFSET);
 	}
 	dma_wmb();
 	return 0;
 }
 
 
-
-static int apple_piodma_diag_resources(struct platform_device *pdev,
-				      struct apple_piodma_diag *diag)
+static int apple_t8140_bootstrap_resources(struct platform_device *pdev,
+					   struct apple_t8140_bootstrap *bootstrap)
 {
 	static const struct {
 		const char *name;
@@ -322,7 +315,7 @@ static int apple_piodma_diag_resources(struct platform_device *pdev,
 		if (!res || res->start != regions[i].base || resource_size(res) != SZ_16K)
 			return -EINVAL;
 	}
-	host = of_parse_phandle(diag->dev->of_node, "apple,pcie-host", 0);
+	host = of_parse_phandle(bootstrap->dev->of_node, "apple,pcie-host", 0);
 	if (!host)
 		return -EINVAL;
 	ret = of_address_to_resource(host, 0, &ecam);
@@ -333,20 +326,20 @@ static int apple_piodma_diag_resources(struct platform_device *pdev,
 	of_node_put(host);
 	if (ret)
 		return ret;
-	diag->config_source = ecam.start;
-	if (diag->config_source + (1 << 12) + sizeof(u32) - 1 > ecam.end)
+	bootstrap->config_source = ecam.start;
+	if (bootstrap->config_source + (1 << 12) + sizeof(u32) - 1 > ecam.end)
 		return -ERANGE;
-	diag->engine = devm_platform_ioremap_resource_byname(pdev, "engine");
-	if (IS_ERR(diag->engine))
-		return PTR_ERR(diag->engine);
-	diag->fabric = devm_platform_ioremap_resource_byname(pdev, "fabric");
-	if (IS_ERR(diag->fabric))
-		return PTR_ERR(diag->fabric);
-	diag->irq = platform_get_irq(pdev, 0);
-	return diag->irq < 0 ? diag->irq : 0;
+	bootstrap->engine = devm_platform_ioremap_resource_byname(pdev, "engine");
+	if (IS_ERR(bootstrap->engine))
+		return PTR_ERR(bootstrap->engine);
+	bootstrap->fabric = devm_platform_ioremap_resource_byname(pdev, "fabric");
+	if (IS_ERR(bootstrap->fabric))
+		return PTR_ERR(bootstrap->fabric);
+	bootstrap->irq = platform_get_irq(pdev, 0);
+	return bootstrap->irq < 0 ? bootstrap->irq : 0;
 }
 
-static int apple_piodma_diag_idle(struct apple_piodma_diag *diag)
+static int apple_t8140_bootstrap_idle(struct apple_t8140_bootstrap *bootstrap)
 {
 	static const struct {
 		u32 offset;
@@ -360,45 +353,42 @@ static int apple_piodma_diag_idle(struct apple_piodma_diag *diag)
 	u32 value;
 
 	for (i = 0; i < ARRAY_SIZE(engine); i++) {
-		value = readl(diag->engine + engine[i].offset);
+		value = readl(bootstrap->engine + engine[i].offset);
 		if (value != engine[i].expected) {
-			dev_err(diag->dev, "idle mismatch engine[%#x]=%#x expected=%#x\n",
+			dev_err(bootstrap->dev, "idle mismatch engine[%#x]=%#x expected=%#x\n",
 				engine[i].offset, value, engine[i].expected);
 			return -EBUSY;
 		}
 	}
-	if (readl(diag->fabric) || readl(diag->fabric + 4))
+	if (readl(bootstrap->fabric) || readl(bootstrap->fabric + 4))
 		return -EBUSY;
 	return 0;
 }
 
-static irqreturn_t apple_piodma_diag_irq(int irq, void *data)
+static irqreturn_t apple_t8140_bootstrap_irq(int irq, void *data)
 {
-	struct apple_piodma_diag *diag = data;
+	struct apple_t8140_bootstrap *bootstrap = data;
 	struct apple_piodma_slot *slot;
 	u32 fabric, status, tag, active;
 	int count;
 
 	/* Acknowledge order follows the attributed prior controller contract. */
-	fabric = readl(diag->fabric);
-	writel(fabric, diag->fabric);
-	status = readl(diag->engine + 4);
-	writel(status, diag->engine + 4);
-	tag = readl(diag->engine + 0xdc) & 0xff;
-	active = READ_ONCE(diag->active_tag);
-	count = atomic_inc_return(&diag->irq_count);
-	WRITE_ONCE(diag->last_irq_status, status);
-	WRITE_ONCE(diag->last_irq_tag, tag);
-	dev_info(diag->dev, "irq=%d fabric=%#x status=%#x tag=%#x active=%#x\n",
-		 count, fabric, status, tag, active);
-	if (count >= PIODMA_IRQ_LIMIT || status & ~PIODMA_IRQ_COMPLETE ||
-	    (status && (!tag || tag > active))) {
-		WRITE_ONCE(diag->irq_fault, true);
+	fabric = readl(bootstrap->fabric);
+	writel(fabric, bootstrap->fabric);
+	status = readl(bootstrap->engine + 4);
+	writel(status, bootstrap->engine + 4);
+	tag = readl(bootstrap->engine + 0xdc) & 0xff;
+	active = READ_ONCE(bootstrap->active_tag);
+	count = atomic_inc_return(&bootstrap->irq_count);
+	dev_dbg(bootstrap->dev, "irq=%d fabric=%#x status=%#x tag=%#x active=%#x\n",
+		count, fabric, status, tag, active);
+	if (apple_piodma_irq_invalid(count, status, tag, active)) {
+		WRITE_ONCE(bootstrap->irq_fault, true);
 		disable_irq_nosync(irq);
 		if (active)
-			complete(&diag->slots[active - 1].event);
-	} else if (status & PIODMA_IRQ_COMPLETE && tag == active && active) {
-		slot = &diag->slots[active - 1];
+			complete(&bootstrap->slots[active - 1].event);
+	} else if (apple_piodma_irq_matches(status, tag, active)) {
+		slot = &bootstrap->slots[active - 1];
 		WRITE_ONCE(slot->matched_status, READ_ONCE(slot->matched_status) | status);
 		complete(&slot->event);
 	}
@@ -406,7 +396,7 @@ static irqreturn_t apple_piodma_diag_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int apple_piodma_diag_initialize(struct apple_piodma_diag *diag)
+static int apple_t8140_bootstrap_initialize(struct apple_t8140_bootstrap *bootstrap)
 {
 	static const struct {
 		u32 offset;
@@ -423,30 +413,28 @@ static int apple_piodma_diag_initialize(struct apple_piodma_diag *diag)
 	int i;
 	u32 value;
 
-	/* Publish validated root/bus fields; all later failures retain ownership. */
-	smp_store_release(&diag->retained, true);
-	writel(PIODMA_IRQ_MASK, diag->engine + 8);
-	writel(0, diag->fabric + 4);
+	writel(PIODMA_IRQ_MASK, bootstrap->engine + 8);
+	writel(0, bootstrap->fabric + 4);
 	for (i = 0; i < ARRAY_SIZE(tunables); i++) {
-		value = readl(diag->engine + tunables[i].offset);
+		value = readl(bootstrap->engine + tunables[i].offset);
 		value = (value & ~tunables[i].mask) | tunables[i].value;
-		writel(value, diag->engine + tunables[i].offset);
+		writel(value, bootstrap->engine + tunables[i].offset);
 	}
-	writel(readl(diag->engine) & ~BIT(0), diag->engine);
+	writel(readl(bootstrap->engine) & ~BIT(0), bootstrap->engine);
 	/* Exact prior bank values; their architectural meaning is unqualified. */
 	for (i = 0; i < 8; i++) {
-		writel(0, diag->engine + 0x24 + 4 * i);
-		writel(i == 1 ? 1 : 0, diag->engine + 0xf0 + 4 * i);
+		writel(0, bootstrap->engine + 0x24 + 4 * i);
+		writel(i == 1 ? 1 : 0, bootstrap->engine + 0xf0 + 4 * i);
 	}
 	/* Order the bank writes before their configuration readback. */
 	wmb();
-	if (readl(diag->engine) || readl(diag->engine + 8) != PIODMA_IRQ_MASK ||
-	    readl(diag->engine + 0xf4) != 1 || READ_ONCE(diag->irq_fault))
+	if (readl(bootstrap->engine) || readl(bootstrap->engine + 8) != PIODMA_IRQ_MASK ||
+	    readl(bootstrap->engine + 0xf4) != 1 || READ_ONCE(bootstrap->irq_fault))
 		return -EIO;
 	return 0;
 }
 
-static bool apple_piodma_diag_canary(const u8 *memory, size_t size, u8 value)
+static bool apple_t8140_bootstrap_canary(const u8 *memory, size_t size, u8 value)
 {
 	size_t i;
 
@@ -456,14 +444,14 @@ static bool apple_piodma_diag_canary(const u8 *memory, size_t size, u8 value)
 	return true;
 }
 
-static int apple_piodma_diag_check_slots(struct apple_piodma_diag *diag)
+static int apple_t8140_bootstrap_check_slots(struct apple_t8140_bootstrap *bootstrap)
 {
 	int i, j;
 
 	dma_rmb();
 	for (i = 0; i < PIODMA_REQUEST_COUNT; i++) {
-		struct apple_piodma_slot *slot = &diag->slots[i];
-		void *memory = diag->arena + i * PIODMA_SLOT_SIZE;
+		struct apple_piodma_slot *slot = &bootstrap->slots[i];
+		void *memory = bootstrap->arena + i * PIODMA_SLOT_SIZE;
 		__le32 *packet = memory;
 		__le32 *completion = memory + PIODMA_COMPLETION_OFFSET;
 		__le32 *result = memory + PIODMA_DATA_OFFSET;
@@ -476,42 +464,42 @@ static int apple_piodma_diag_check_slots(struct apple_piodma_diag *diag)
 		}
 		if ((slot->observed && le32_to_cpu(READ_ONCE(*result)) != slot->result) ||
 		    (!slot->submitted && le32_to_cpu(READ_ONCE(*result)) != U32_MAX) ||
-		    !apple_piodma_diag_canary(memory + sizeof(slot->packet),
+		    !apple_t8140_bootstrap_canary(memory + sizeof(slot->packet),
 					     PAGE_SIZE - sizeof(slot->packet), 0) ||
-		    !apple_piodma_diag_canary(memory + PIODMA_COMPLETION_OFFSET +
+		    !apple_t8140_bootstrap_canary(memory + PIODMA_COMPLETION_OFFSET +
 					     sizeof(slot->completion),
 					     PAGE_SIZE - sizeof(slot->completion), 0) ||
-		    !apple_piodma_diag_canary(memory + PIODMA_DATA_OFFSET + sizeof(u32),
+		    !apple_t8140_bootstrap_canary(memory + PIODMA_DATA_OFFSET + sizeof(u32),
 					     PAGE_SIZE - sizeof(u32), 0xa5))
 			goto changed;
 	}
 	return 0;
 
 changed:
-	dev_err(diag->dev, "slot=%d changed outside its permitted response; stop\n", i);
+	dev_err(bootstrap->dev, "slot=%d changed outside its permitted response; stop\n", i);
 	return -EIO;
 }
 
-static int apple_piodma_diag_submit(struct apple_piodma_diag *diag, unsigned int index)
+static int apple_t8140_bootstrap_submit(struct apple_t8140_bootstrap *bootstrap, unsigned int index)
 {
 	const struct apple_piodma_request *request = &requests[index];
-	struct apple_piodma_slot *slot = &diag->slots[index];
-	void *memory = diag->arena + index * PIODMA_SLOT_SIZE;
+	struct apple_piodma_slot *slot = &bootstrap->slots[index];
+	void *memory = bootstrap->arena + index * PIODMA_SLOT_SIZE;
 	__le32 *packet = memory;
 	__le32 *result = memory + PIODMA_DATA_OFFSET;
 	__le32 *completion = memory + PIODMA_COMPLETION_OFFSET;
-	u64 dma = diag->dma + index * PIODMA_SLOT_SIZE;
-	u64 source = diag->config_source + ((u64)request->function << 12) + request->offset;
+	u64 dma = bootstrap->dma + index * PIODMA_SLOT_SIZE;
+	u64 source = bootstrap->config_source + ((u64)request->function << 12) + request->offset;
 	u64 dst = dma + PIODMA_DATA_OFFSET;
 	u64 src = source & PIODMA_PACKET_MASK;
-	u64 descriptor = dma + diag->pointer_prefix;
+	u64 descriptor = dma + bootstrap->pointer_prefix;
 	u64 comp = descriptor + PIODMA_COMPLETION_OFFSET;
 	unsigned long waited;
 	u32 fifo, command, tag = index + 1;
 	int i, ret;
 
-	ret = apple_piodma_diag_check_slots(diag);
-	if (ret || READ_ONCE(diag->irq_fault))
+	ret = apple_t8140_bootstrap_check_slots(bootstrap);
+	if (ret || READ_ONCE(bootstrap->irq_fault))
 		return ret ?: -EIO;
 	/* Only these fixed, validated ECAM addresses use aperture1/low36. */
 	slot->packet[0] = cpu_to_le32(0xc007 | BIT(18) | ((src & 0xff) << 24));
@@ -520,67 +508,60 @@ static int apple_piodma_diag_submit(struct apple_piodma_diag *diag, unsigned int
 	slot->packet[3] = cpu_to_le32(sizeof(u32));
 	memcpy(packet, slot->packet, sizeof(slot->packet));
 	dma_wmb();
-	ret = readl_poll_timeout(diag->engine + 0x0c, fifo,
-				(fifo & PIODMA_FIFO_MASK) == 16, 10, 50000);
-	if (ret || READ_ONCE(diag->irq_fault))
+	ret = readl_poll_timeout(bootstrap->engine + 0x0c, fifo,
+				 (fifo & PIODMA_FIFO_MASK) == 16, 10, 50000);
+	if (ret || READ_ONCE(bootstrap->irq_fault))
 		return ret ?: -EIO;
 	slot->submitted = true;
-	WRITE_ONCE(diag->active_tag, tag);
-	dev_info(diag->dev,
-		 "request=%u function=%u offset=%#x source=%#llx packet=%08x:%08x:%08x:%08x tag=%u\n",
-		 index, request->function, request->offset, source,
-		 le32_to_cpu(packet[0]), le32_to_cpu(packet[1]),
-		 le32_to_cpu(packet[2]), le32_to_cpu(packet[3]), tag);
-	writel(tag, diag->engine + 0xd8);
-	writel(upper_32_bits(descriptor) & 0x3ff, diag->engine + 0x50);
-	writel(lower_32_bits(descriptor), diag->engine + 0x4c);
-	writel(upper_32_bits(comp) & 0x3ff, diag->engine + 0x48);
-	writel(lower_32_bits(comp), diag->engine + 0x44);
-	writel(0x411, diag->engine + 0x54);
+	WRITE_ONCE(bootstrap->active_tag, tag);
+	dev_dbg(bootstrap->dev,
+		"request=%u function=%u offset=%#x source=%#llx packet=%08x:%08x:%08x:%08x tag=%u\n",
+		index, request->function, request->offset, source,
+		le32_to_cpu(packet[0]), le32_to_cpu(packet[1]),
+		le32_to_cpu(packet[2]), le32_to_cpu(packet[3]), tag);
+	writel(tag, bootstrap->engine + 0xd8);
+	writel(upper_32_bits(descriptor) & 0x3ff, bootstrap->engine + 0x50);
+	writel(lower_32_bits(descriptor), bootstrap->engine + 0x4c);
+	writel(upper_32_bits(comp) & 0x3ff, bootstrap->engine + 0x48);
+	writel(lower_32_bits(comp), bootstrap->engine + 0x44);
+	writel(0x411, bootstrap->engine + 0x54);
 	waited = wait_for_completion_timeout(&slot->event, msecs_to_jiffies(50));
 	dma_rmb();
 	slot->result = le32_to_cpu(READ_ONCE(*result));
 	for (i = 0; i < ARRAY_SIZE(slot->completion); i++)
 		slot->completion[i] = READ_ONCE(completion[i]);
 	slot->observed = true;
-	dev_info(diag->dev,
-		 "response=%u waited=%lu matched_status=%#x word=%#x completion=%08x:%08x:%08x:%08x\n",
-		 index, waited, READ_ONCE(slot->matched_status), slot->result,
-		 le32_to_cpu(slot->completion[0]), le32_to_cpu(slot->completion[1]),
-		 le32_to_cpu(slot->completion[2]), le32_to_cpu(slot->completion[3]));
+	dev_dbg(bootstrap->dev,
+		"response=%u waited=%lu matched_status=%#x word=%#x completion=%08x:%08x:%08x:%08x\n",
+		index, waited, READ_ONCE(slot->matched_status), slot->result,
+		le32_to_cpu(slot->completion[0]), le32_to_cpu(slot->completion[1]),
+		le32_to_cpu(slot->completion[2]), le32_to_cpu(slot->completion[3]));
 	if (!waited)
 		return -ETIMEDOUT;
-	if (READ_ONCE(diag->irq_fault) || !READ_ONCE(slot->matched_status) ||
+	if (READ_ONCE(bootstrap->irq_fault) || !READ_ONCE(slot->matched_status) ||
 	    slot->result == U32_MAX ||
 	    (slot->result & request->mask) != request->expected)
 		return -EIO;
 	/* Admission observations only: all published memory remains retained. */
-	ret = readl_poll_timeout(diag->engine + 0x54, command, !(command & BIT(0)),
-				10, 50000);
+	ret = readl_poll_timeout(bootstrap->engine + 0x54, command, !(command & BIT(0)),
+				 10, 50000);
 	if (ret)
 		return ret;
-	ret = readl_poll_timeout(diag->engine + 0x0c, fifo,
-				(fifo & PIODMA_FIFO_MASK) == 16, 10, 50000);
+	ret = readl_poll_timeout(bootstrap->engine + 0x0c, fifo,
+				 (fifo & PIODMA_FIFO_MASK) == 16, 10, 50000);
 	if (ret)
 		return ret;
 	for (i = 0; i < 10; i++) {
 		usleep_range(1000, 2000);
-		ret = apple_piodma_diag_check_slots(diag);
-		if (ret || READ_ONCE(diag->irq_fault))
+		ret = apple_t8140_bootstrap_check_slots(bootstrap);
+		if (ret || READ_ONCE(bootstrap->irq_fault))
 			return ret ?: -EIO;
 	}
-	dev_info(diag->dev,
-		 "READ_VALIDATED request=%u word=%#x FIFO=%#x command=%#x; retained slots stable\n",
-		 index, slot->result, fifo, command);
+	dev_dbg(bootstrap->dev,
+		"READ_VALIDATED request=%u word=%#x FIFO=%#x command=%#x; retained slots stable\n",
+		index, slot->result, fifo, command);
 	return 0;
 }
-
-bool apple_piodma_bootstrap_enabled(void)
-{
-	return enumerate && of_machine_is_compatible("apple,j700") &&
-		of_machine_is_compatible("apple,t8140");
-}
-EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_enabled);
 
 static void apple_piodma_put_supplier(void *data)
 {
@@ -590,19 +571,19 @@ static void apple_piodma_put_supplier(void *data)
 int apple_piodma_bootstrap_get(struct device *host, struct device **supplier)
 {
 	struct device_node *node, *host_node;
-	struct apple_piodma_diag *diag;
+	struct apple_t8140_bootstrap *bootstrap;
 	struct platform_device *pdev;
 	struct device_link *link;
 	bool correct_host;
 	int ret;
 
-	if (!apple_piodma_bootstrap_enabled() ||
-	    !of_device_is_compatible(host->of_node, "apple,t8140-pcie"))
+	if (!of_device_is_compatible(host->of_node, "apple,t8140-pcie"))
 		return -ENODEV;
 	node = of_parse_phandle(host->of_node, "apple,piodma", 0);
 	if (!node)
 		return -EINVAL;
-	if (!of_device_is_compatible(node, "apple,t8140-piodma-diagnostic")) {
+	if (!of_device_is_compatible(node, "apple,t8140-pcie-bootstrap") &&
+	    !of_device_is_compatible(node, "apple,t8140-piodma-diagnostic")) {
 		of_node_put(node);
 		return -EINVAL;
 	}
@@ -615,8 +596,8 @@ int apple_piodma_bootstrap_get(struct device *host, struct device **supplier)
 		return -EINVAL;
 	if (!pdev)
 		return -EPROBE_DEFER;
-	diag = platform_get_drvdata(pdev);
-	if (!device_is_bound(&pdev->dev) || !diag) {
+	bootstrap = platform_get_drvdata(pdev);
+	if (!device_is_bound(&pdev->dev) || !bootstrap) {
 		put_device(&pdev->dev);
 		return -EPROBE_DEFER;
 	}
@@ -626,7 +607,7 @@ int apple_piodma_bootstrap_get(struct device *host, struct device **supplier)
 		return -ESHUTDOWN;
 	}
 	/* Host probe holds its device lock; never rebuild a consumed hierarchy. */
-	if (atomic_read(&diag->attempted)) {
+	if (apple_piodma_attempted(apple_piodma_state(bootstrap))) {
 		put_device(&pdev->dev);
 		return -EALREADY;
 	}
@@ -645,25 +626,25 @@ EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_get);
 
 static void apple_piodma_retry_admission(struct work_struct *work)
 {
-	struct apple_piodma_diag *diag =
-		container_of(to_delayed_work(work), struct apple_piodma_diag,
+	struct apple_t8140_bootstrap *bootstrap =
+		container_of(to_delayed_work(work), struct apple_t8140_bootstrap,
 			     admission_retry);
-	/* Acquire the matched host's permanent reference from the scheduler. */
-	struct device *host = smp_load_acquire(&diag->retry_host);
+	/* Pairs with the scheduler's cmpxchg of the boot-lifetime host reference. */
+	struct device *host = smp_load_acquire(&bootstrap->retry_host);
 	int ret;
 
 	if (system_state > SYSTEM_RUNNING || !host ||
-	    !device_is_registered(host) || atomic_read(&diag->attempted) ||
-	    READ_ONCE(diag->guarded))
+	    !device_is_registered(host) || apple_piodma_attempted(apple_piodma_state(bootstrap)) ||
+	    apple_piodma_guarded(apple_piodma_state(bootstrap)))
 		return;
 	/* The core rechecks registration and binding under the host device lock. */
 	ret = device_attach(host);
 	if (ret < 0)
-		dev_dbg(diag->dev, "deferred host attachment returned %d\n", ret);
+		dev_dbg(bootstrap->dev, "deferred host attachment returned %d\n", ret);
 	/* Only fresh pre-child guard contention can schedule another attempt. */
 }
 
-static void apple_piodma_schedule_admission(struct apple_piodma_diag *diag,
+static void apple_piodma_schedule_admission(struct apple_t8140_bootstrap *bootstrap,
 					    struct device *host)
 {
 	struct device *previous;
@@ -671,18 +652,18 @@ static void apple_piodma_schedule_admission(struct apple_piodma_diag *diag,
 	if (system_state > SYSTEM_RUNNING || !device_is_registered(host))
 		return;
 	/* Publish a boot-lifetime reference; this supplier has one matched host. */
-	previous = cmpxchg(&diag->retry_host, NULL, get_device(host));
+	previous = cmpxchg(&bootstrap->retry_host, NULL, get_device(host));
 	if (previous) {
 		put_device(host);
 		if (WARN_ON_ONCE(previous != host))
 			return;
 	}
-	mod_delayed_work(system_dfl_wq, &diag->admission_retry, HZ);
+	mod_delayed_work(system_dfl_wq, &bootstrap->admission_retry, HZ);
 }
 
 int apple_piodma_bootstrap_guard_begin(struct device *supplier, struct device *host)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(supplier);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
 	unsigned int sleep_flags;
 	int ret;
 
@@ -690,24 +671,25 @@ int apple_piodma_bootstrap_guard_begin(struct device *supplier, struct device *h
 	if (system_state > SYSTEM_RUNNING)
 		return -ESHUTDOWN;
 	/* A worker may have waited behind a host probe that consumed its attempt. */
-	if (atomic_read(&diag->attempted) || READ_ONCE(diag->guarded))
+	if (apple_piodma_attempted(apple_piodma_state(bootstrap)) ||
+	    apple_piodma_guarded(apple_piodma_state(bootstrap)))
 		return -EALREADY;
 	/* This is the last dependency admission before PCI children exist. */
-	ret = apple_piodma_lock_transition(diag, &sleep_flags);
+	ret = apple_piodma_lock_transition(bootstrap, &sleep_flags);
 	if (ret) {
 		if (ret == -EPROBE_DEFER)
-			apple_piodma_schedule_admission(diag, host);
+			apple_piodma_schedule_admission(bootstrap, host);
 		return ret;
 	}
 	/* Do not wait for a worker that may be waiting on this host device lock. */
-	cancel_delayed_work(&diag->admission_retry);
-	diag->pm_notifier.notifier_call = apple_piodma_pm_notify;
-	ret = register_pm_notifier(&diag->pm_notifier);
+	cancel_delayed_work(&bootstrap->admission_retry);
+	bootstrap->pm_notifier.notifier_call = apple_piodma_pm_notify;
+	ret = register_pm_notifier(&bootstrap->pm_notifier);
 	if (ret) {
-		kexec_unblock(&diag->kexec_blocker);
+		kexec_unblock(&bootstrap->kexec_blocker);
 	} else {
 		/* Publish both vetoes before permitting system sleep to proceed. */
-		smp_store_release(&diag->guarded, true);
+		WARN_ON_ONCE(apple_piodma_transition(bootstrap, PIODMA_GUARD));
 	}
 	unlock_system_sleep(sleep_flags);
 	return ret;
@@ -716,42 +698,47 @@ EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_guard_begin);
 
 void apple_piodma_bootstrap_guard_end(struct device *supplier)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(supplier);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
 
 	/* Post-publication ownership is irreversible until hardware reset. */
-	if (!READ_ONCE(diag->guarded) || smp_load_acquire(&diag->retained))
+	if (!apple_piodma_guarded(apple_piodma_state(bootstrap)) ||
+	    apple_piodma_retained(apple_piodma_state(bootstrap)))
 		return;
 	/* The host has removed every child before permitting sleep again. */
-	smp_store_release(&diag->guarded, false);
-	unregister_pm_notifier(&diag->pm_notifier);
-	kexec_unblock(&diag->kexec_blocker);
+	if (WARN_ON_ONCE(apple_piodma_transition(bootstrap, PIODMA_RELEASE)))
+		return;
+	unregister_pm_notifier(&bootstrap->pm_notifier);
+	kexec_unblock(&bootstrap->kexec_blocker);
 }
 EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_guard_end);
 
 int apple_piodma_bootstrap_prime(struct device *supplier, struct pci_dev *root)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(supplier);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
 	int ret;
 
 	/* Admission was completed before pci_host_common_init published children. */
-	if (!smp_load_acquire(&diag->guarded))
+	if (!apple_piodma_guarded(apple_piodma_state(bootstrap)))
 		return -EINVAL;
 	/* One hardware attempt, including permanent preflight failures. */
-	if (atomic_cmpxchg(&diag->attempted, 0, 1))
+	if (apple_piodma_transition(bootstrap, PIODMA_PRIME))
 		return -EALREADY;
-	ret = apple_piodma_diag_root(diag, root);
+	ret = apple_t8140_bootstrap_root(bootstrap, root);
 	if (!ret)
-		ret = apple_piodma_diag_idle(diag);
+		ret = apple_t8140_bootstrap_idle(bootstrap);
+	if (!ret) {
+		/* Ownership becomes irreversible before the first engine write. */
+		ret = apple_piodma_transition(bootstrap, PIODMA_PUBLISH);
+		if (!ret)
+			ret = apple_t8140_bootstrap_initialize(bootstrap);
+	}
 	if (!ret)
-		ret = apple_piodma_diag_initialize(diag);
-	if (!ret)
-		ret = apple_piodma_diag_submit(diag, 0);
+		ret = apple_t8140_bootstrap_submit(bootstrap, 0);
 	if (ret) {
-		dev_err(supplier, "bootstrap failure=%d; retained ownership; no retry\n", ret);
+		WARN_ON_ONCE(apple_piodma_transition(bootstrap, PIODMA_FAIL));
+		dev_err(supplier, "bootstrap failed: %d; full hardware reset required\n", ret);
 	} else {
-		WRITE_ONCE(diag->ready, true);
-		dev_info(supplier, "BOOTSTRAP_VALIDATED word=%#x; one retained slot\n",
-			 diag->slots[0].result);
+		WARN_ON_ONCE(apple_piodma_transition(bootstrap, PIODMA_COMPLETE));
 	}
 	return ret;
 }
@@ -759,187 +746,188 @@ EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_prime);
 
 bool apple_piodma_bootstrap_retained(struct device *supplier)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(supplier);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
 
 	/* Acquire the prime's irreversible publication and guard ownership. */
-	return smp_load_acquire(&diag->retained);
+	return apple_piodma_retained(apple_piodma_state(bootstrap));
 }
 EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_retained);
 
 void apple_piodma_bootstrap_admitted(struct device *supplier)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(supplier);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(supplier);
 
-	if (WARN_ON_ONCE(!diag || !diag->retained))
+	if (WARN_ON_ONCE(!bootstrap || !apple_piodma_retained(apple_piodma_state(bootstrap))))
 		return;
 	/* Publish the host's completed cold, resource and ASPM admission checks. */
-	smp_store_release(&diag->radio_admitted, true);
+	WARN_ON_ONCE(apple_piodma_transition(bootstrap, PIODMA_ADMIT));
 }
 EXPORT_SYMBOL_GPL(apple_piodma_bootstrap_admitted);
 
 int apple_piodma_radio_check(struct pci_dev *pdev)
 {
-	/* Acquire the supplier's permanent arena and PM/kexec guard ownership. */
-	struct apple_piodma_diag *diag = smp_load_acquire(&active_diag);
+	/* Pairs with probe's smp_store_release of the boot-lifetime supplier. */
+	struct apple_t8140_bootstrap *bootstrap = smp_load_acquire(&active_bootstrap);
 	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
 	struct device_node *host;
 	bool matches;
 
-	if (!apple_piodma_bootstrap_enabled() || !diag)
+	if (!bootstrap)
 		return -ENODEV;
 	/* A retained supplier alone does not prove that host admission succeeded. */
-	if (!smp_load_acquire(&diag->radio_admitted) || !bridge->dev.parent ||
+	if (apple_piodma_state(bootstrap) != PIODMA_ADMITTED || !bridge->dev.parent ||
 	    pdev->vendor != PCI_VENDOR_ID_MEDIATEK ||
-	    pci_domain_nr(pdev->bus) || pdev->bus->number != diag->secondary_bus ||
+	    pci_domain_nr(pdev->bus) || pdev->bus->number != bootstrap->secondary_bus ||
 	    PCI_SLOT(pdev->devfn) ||
 	    (pdev->devfn != PCI_DEVFN(0, 0) && pdev->devfn != PCI_DEVFN(0, 1)) ||
 	    pdev->device != (PCI_FUNC(pdev->devfn) ? 0x793b : 0x7932))
 		return -ENODEV;
 
-	host = of_parse_phandle(diag->dev->of_node, "apple,pcie-host", 0);
+	host = of_parse_phandle(bootstrap->dev->of_node, "apple,pcie-host", 0);
 	matches = host && host == bridge->dev.parent->of_node;
 	of_node_put(host);
 	return matches ? 0 : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(apple_piodma_radio_check);
 
-static int apple_piodma_diag_probe(struct platform_device *pdev)
+static int apple_t8140_bootstrap_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct apple_piodma_diag *diag;
+	struct apple_t8140_bootstrap *bootstrap;
 	int i, ret;
 
-	if (!apple_piodma_bootstrap_enabled() || PAGE_SIZE != SZ_16K)
+	if (PAGE_SIZE != SZ_16K)
 		return -ENODEV;
-	diag = kzalloc_obj(*diag);
-	if (!diag)
+	bootstrap = kzalloc_obj(*bootstrap);
+	if (!bootstrap)
 		return -ENOMEM;
-	diag->dev = dev;
-	INIT_DELAYED_WORK(&diag->admission_retry, apple_piodma_retry_admission);
-	diag->kexec_blocker.reason =
+	bootstrap->dev = dev;
+	INIT_DELAYED_WORK(&bootstrap->admission_retry, apple_piodma_retry_admission);
+	bootstrap->kexec_blocker.reason =
 		"Neo radio admission or retained DMA ownership";
 	for (i = 0; i < PIODMA_REQUEST_COUNT; i++)
-		init_completion(&diag->slots[i].event);
-	atomic_set(&diag->irq_count, 0);
-	atomic_set(&diag->attempted, 0);
-	ret = apple_piodma_diag_iommu(diag);
+		init_completion(&bootstrap->slots[i].event);
+	atomic_set(&bootstrap->irq_count, 0);
+	atomic_set(&bootstrap->state, PIODMA_IDLE);
+	ret = apple_t8140_bootstrap_iommu(bootstrap);
 	if (ret)
 		goto err_free;
 	pm_runtime_enable(dev);
 	ret = pm_runtime_resume_and_get(dev);
 	if (ret < 0)
 		goto err_pm;
-	ret = apple_piodma_diag_arena(diag);
+	ret = apple_t8140_bootstrap_arena(bootstrap);
 	if (ret)
 		goto err_arena;
-	ret = apple_piodma_diag_resources(pdev, diag);
+	ret = apple_t8140_bootstrap_resources(pdev, bootstrap);
 	if (ret)
 		goto err_arena;
-	ret = devm_request_irq(dev, diag->irq, apple_piodma_diag_irq, 0,
-			       dev_name(dev), diag);
+	ret = devm_request_irq(dev, bootstrap->irq, apple_t8140_bootstrap_irq, 0,
+			       dev_name(dev), bootstrap);
 	if (ret)
 		goto err_arena;
 	/* The supplier and unpublished arena keep their device alive. */
 	get_device(dev);
-	platform_set_drvdata(pdev, diag);
-	/* Publish the CPU-owned arena and permanent device reference together. */
-	smp_store_release(&active_diag, diag);
-	dev_info(dev, "bootstrap supplier ready; no command submitted during probe\n");
+	platform_set_drvdata(pdev, bootstrap);
+	/* Pairs with radio_check's smp_load_acquire of this boot-lifetime owner. */
+	smp_store_release(&active_bootstrap, bootstrap);
+	dev_dbg(dev, "bootstrap supplier ready; no command submitted during probe\n");
 	return 0;
 
 err_arena:
-	if (diag->arena)
-		dma_free_coherent(dev, PIODMA_ARENA_SIZE, diag->arena, diag->dma);
+	if (bootstrap->arena)
+		dma_free_coherent(dev, PIODMA_ARENA_SIZE, bootstrap->arena, bootstrap->dma);
 	pm_runtime_put_sync(dev);
 err_pm:
 	pm_runtime_disable(dev);
 err_free:
-	kfree(diag);
-	return dev_err_probe(dev, ret, "PIODMA diagnostic preflight failed\n");
+	kfree(bootstrap);
+	return dev_err_probe(dev, ret, "PCIe bootstrap preflight failed\n");
 }
 
-static void apple_piodma_diag_shutdown(struct platform_device *pdev)
+static void apple_t8140_bootstrap_shutdown(struct platform_device *pdev)
 {
-	struct apple_piodma_diag *diag = platform_get_drvdata(pdev);
+	struct apple_t8140_bootstrap *bootstrap = platform_get_drvdata(pdev);
 
 	/*
 	 * Shutdown holds supplier/parent locks: never join a host attachment
 	 * here. Admission rejects shutdown, and the supplier lifetime is retained.
 	 */
-	cancel_delayed_work(&diag->admission_retry);
-	if (READ_ONCE(diag->retained))
-		dev_warn(&pdev->dev, "diagnostic arena retained; require full hardware reset\n");
+	cancel_delayed_work(&bootstrap->admission_retry);
+	if (apple_piodma_retained(apple_piodma_state(bootstrap)))
+		dev_warn(&pdev->dev, "bootstrap arena retained; require full hardware reset\n");
 }
 
 /* No new request is permitted once the host has admitted its endpoints. */
-static int apple_piodma_diag_sleep_check(struct apple_piodma_diag *diag)
+static int apple_t8140_bootstrap_sleep_check(struct apple_t8140_bootstrap *bootstrap)
 {
-	if (!READ_ONCE(diag->ready) || READ_ONCE(diag->irq_fault))
+	if (!apple_piodma_ready(apple_piodma_state(bootstrap)) || READ_ONCE(bootstrap->irq_fault))
 		return -EIO;
-	if (readl(diag->engine + 0x54) & BIT(0))
+	if (readl(bootstrap->engine + 0x54) & BIT(0))
 		return -EBUSY;
-	if ((readl(diag->engine + 0x0c) & PIODMA_FIFO_MASK) != 16)
+	if ((readl(bootstrap->engine + 0x0c) & PIODMA_FIFO_MASK) != 16)
 		return -EBUSY;
-	return apple_piodma_diag_check_slots(diag);
+	return apple_t8140_bootstrap_check_slots(bootstrap);
 }
 
-static int apple_piodma_diag_suspend_noirq(struct device *dev)
+static int apple_t8140_bootstrap_suspend_noirq(struct device *dev)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
 
-	if (!diag->retained)
+	if (!apple_piodma_retained(apple_piodma_state(bootstrap)))
 		return 0;
 	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EOPNOTSUPP;
-	return apple_piodma_diag_sleep_check(diag);
+	return apple_t8140_bootstrap_sleep_check(bootstrap);
 }
 
-static int apple_piodma_diag_resume_noirq(struct device *dev)
+static int apple_t8140_bootstrap_resume_noirq(struct device *dev)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
 	int ret;
 
-	if (!diag->retained)
+	if (!apple_piodma_retained(apple_piodma_state(bootstrap)))
 		return 0;
-	if (!READ_ONCE(diag->ready) || READ_ONCE(diag->irq_fault))
+	if (!apple_piodma_ready(apple_piodma_state(bootstrap)) || READ_ONCE(bootstrap->irq_fault))
 		return -EIO;
 	/* Genpd may gate this island; restore configuration, never a command. */
-	ret = apple_piodma_diag_initialize(diag);
+	ret = apple_t8140_bootstrap_initialize(bootstrap);
 	if (ret)
 		return ret;
-	return apple_piodma_diag_sleep_check(diag);
+	return apple_t8140_bootstrap_sleep_check(bootstrap);
 }
 
-static int apple_piodma_diag_freeze(struct device *dev)
+static int apple_t8140_bootstrap_freeze(struct device *dev)
 {
-	struct apple_piodma_diag *diag = dev_get_drvdata(dev);
+	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
 
-	return diag->retained ? -EOPNOTSUPP : 0;
+	return apple_piodma_retained(apple_piodma_state(bootstrap)) ? -EOPNOTSUPP : 0;
 }
 
-static const struct dev_pm_ops apple_piodma_diag_pm_ops = {
+static const struct dev_pm_ops apple_t8140_bootstrap_pm_ops = {
 	.prepare = apple_piodma_pm_prepare,
-	.suspend_noirq = apple_piodma_diag_suspend_noirq,
-	.resume_noirq = apple_piodma_diag_resume_noirq,
-	.freeze = apple_piodma_diag_freeze,
-	.poweroff = apple_piodma_diag_freeze,
+	.suspend_noirq = apple_t8140_bootstrap_suspend_noirq,
+	.resume_noirq = apple_t8140_bootstrap_resume_noirq,
+	.freeze = apple_t8140_bootstrap_freeze,
+	.poweroff = apple_t8140_bootstrap_freeze,
 };
 
-static const struct of_device_id apple_piodma_diag_match[] = {
+static const struct of_device_id apple_t8140_bootstrap_match[] = {
+	{ .compatible = "apple,t8140-pcie-bootstrap" },
 	{ .compatible = "apple,t8140-piodma-diagnostic" },
 	{ }
 };
 
-static struct platform_driver apple_piodma_diag_driver = {
-	.probe = apple_piodma_diag_probe,
-	.shutdown = apple_piodma_diag_shutdown,
+static struct platform_driver apple_t8140_bootstrap_driver = {
+	.probe = apple_t8140_bootstrap_probe,
+	.shutdown = apple_t8140_bootstrap_shutdown,
 	.driver = {
-		.name = "apple-piodma-diag",
-		.of_match_table = apple_piodma_diag_match,
-		.pm = pm_sleep_ptr(&apple_piodma_diag_pm_ops),
+		.name = "apple-t8140-bootstrap",
+		.of_match_table = apple_t8140_bootstrap_match,
+		.pm = pm_sleep_ptr(&apple_t8140_bootstrap_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 };
-builtin_platform_driver(apple_piodma_diag_driver);
-MODULE_DESCRIPTION("T8140 retained one-read PCIe bootstrap experiment");
+builtin_platform_driver(apple_t8140_bootstrap_driver);
+MODULE_DESCRIPTION("Apple T8140 radio PCIe bootstrap");
 MODULE_LICENSE("GPL");

@@ -56,7 +56,7 @@ impl HrTimerCallback for Shared {
     }
 }
 
-/// The `asahi-g16/stats` debugfs file contents.
+/// The `aurora-g16/stats` debugfs file contents.
 fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let state = shared.state.lock();
     match state.as_deref() {
@@ -172,14 +172,14 @@ impl Shared {
             // Dropping the previous handle cancels a still pending expiry before the timer
             // is started again.
             drop(handle.take());
-            *handle = Some(self.clone().start(Delta::from_micros(us as i64)));
+            *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
         }
         self.mod_poll(1);
     }
 
-    /// Starts what the engine needs besides the firmware state: the `asahi-g16/stats` file.
+    /// Starts what the engine needs besides the firmware state: the `aurora-g16/stats` file.
     pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
-        let dir = debugfs::Dir::new(c_str!("asahi-g16"));
+        let dir = debugfs::Dir::new(c_str!("aurora-g16"));
         let file = KBox::pin_init(
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
@@ -572,8 +572,8 @@ impl Firmware {
         let s = &mut self.engine.stats;
         if result.is_ok() {
             s.jobs += 1;
-            s.job_cmds += p.count() as u64;
-            s.job_max = s.job_max.max(p.count() as u64);
+            s.job_cmds += u64::from(p.count());
+            s.job_max = s.job_max.max(u64::from(p.count()));
         }
         complete(done, &job, Ok(()));
         // The rest of a compute horizon, after the first job (fence order).
@@ -584,8 +584,8 @@ impl Firmware {
                 Err(error) => complete(done, j2, Err(error)),
                 Ok(()) => {
                     s.jobs += 1;
-                    s.job_cmds += p2.count() as u64;
-                    s.job_max = s.job_max.max(p2.count() as u64);
+                    s.job_cmds += u64::from(p2.count());
+                    s.job_max = s.job_max.max(u64::from(p2.count()));
                 }
             }
             complete(done, j2, Ok(()));
@@ -694,13 +694,24 @@ impl Firmware {
         let s = &mut self.engine.stats;
 
         // Add one stage interval read from internal timestamp cells (start, end).
-        let mut stage = |o: &super::object::FwObject, off: usize, sum: &mut u64| {
-            let rd = |x: usize| o.r32(x).unwrap_or(0) as u64;
-            let start = rd(off + 4) << 32 | rd(off);
-            let end = rd(off + 12) << 32 | rd(off + 8);
+        let mut stage = |o: &super::object::FwObject,
+                         off: usize,
+                         sum: &mut u64,
+                         engine: crate::usage::Engine| {
+            let (Ok(start_lo), Ok(start_hi), Ok(end_lo), Ok(end_hi)) =
+                (o.r32(off), o.r32(off + 4), o.r32(off + 8), o.r32(off + 12))
+            else {
+                return;
+            };
+            let start = u64::from(start_hi) << 32 | u64::from(start_lo);
+            let end = u64::from(end_hi) << 32 | u64::from(end_lo);
             if start == 0 || end < start {
                 return;
             }
+            f.job
+                .queue
+                .usage
+                .add(engine, start, end, super::hw::COMMAND_TIMESTAMP_HZ as u32);
             *sum = sum.saturating_add(end - start);
             lo = lo.min(start);
             hi = hi.max(end);
@@ -710,15 +721,25 @@ impl Firmware {
                 return;
             };
             let p = &arena.passes[f.claims.pass[k] as usize];
-            stage(&p.scene, 0x600, &mut s.ta_ticks);
-            stage(&p.scene, 0x620, &mut s.fs_ticks);
+            stage(
+                &p.scene,
+                0x600,
+                &mut s.ta_ticks,
+                crate::usage::Engine::Vertex,
+            );
+            stage(
+                &p.scene,
+                0x620,
+                &mut s.fs_ticks,
+                crate::usage::Engine::Fragment,
+            );
         }
         for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
             let Some(arena) = f.job.resources.compute.as_ref() else {
                 return;
             };
             let c = &arena.compute[f.claims.slot[k] as usize];
-            stage(&c.its, 0, &mut s.cdm_ticks);
+            stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
         }
         if hi > lo {
             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
@@ -740,8 +761,8 @@ impl Firmware {
             s.first_ns[kind] += first - f.published_ns;
             s.last_ns[kind] += last - f.published_ns;
         }
-        s.count[0] += f.computes as u64;
-        s.count[1] += f.renders as u64;
+        s.count[0] += u64::from(f.computes);
+        s.count[1] += u64::from(f.renders);
         if kind == 2 {
             s.count[2] += f.count as u64;
         }
@@ -813,7 +834,7 @@ impl Firmware {
         }
     }
 
-    /// The `asahi-g16/stats` contents. Scripts parse the keys: keep them stable.
+    /// The `aurora-g16/stats` contents. Scripts parse the keys: keep them stable.
     pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = &self.engine.stats;
         let slots = &self.slots.stats;
