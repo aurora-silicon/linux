@@ -5060,8 +5060,11 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || strcmp(compat_str, "27.0.0"))
+		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
+			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+				ret < 0 ? "missing" : compat_str);
 			return DCP_FIRMWARE_UNKNOWN;
+		}
 		return DCP_FIRMWARE_V_27_0;
 	}
 
@@ -6173,6 +6176,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			if (!dcp->panel_identity)
 				return -ENOMEM;
 		}
+	}
+	if (fw_compat == DCP_FIRMWARE_V_27_0) {
+		char compat_str[DCP_FW_VERSION_STR_LEN];
+
+		/* Checked by dcp_check_firmware_version(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		dcp->v27_methods = iomfb_v27_methods(compat_str);
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);

@@ -83,12 +83,12 @@ static void dcp_peer_started_on_owner(struct apple_dcp *owner, void *data, void 
 	dcp_peer_swap_armed_v27(owner, id);
 	trace_iomfb_swap_submit(owner, id);
 	trace_iomfb_swap_submit(peer, id);
-	dcp_push(owner, false, &dcp_methods[dcpep_swap_submit], sizeof(owner->present_v27),
+	dcp_push(owner, false, &owner->v27_methods[dcpep_swap_submit], sizeof(owner->present_v27),
 		 sizeof(struct dcp_swap_submit_resp_v27), &owner->present_v27,
 		 dcp_peer_submitted, owner);
 	if (READ_ONCE(owner->crashed))
 		return;
-	dcp_push(peer, false, &dcp_methods[dcpep_swap_submit], sizeof(owner->peer_present_v27),
+	dcp_push(peer, false, &peer->v27_methods[dcpep_swap_submit], sizeof(owner->peer_present_v27),
 		 sizeof(struct dcp_swap_submit_resp_v27), &owner->peer_present_v27,
 		 dcp_peer_submitted, owner);
 	if (READ_ONCE(peer->crashed))

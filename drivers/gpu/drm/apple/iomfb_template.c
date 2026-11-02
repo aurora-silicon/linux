@@ -1706,6 +1706,11 @@ static void boot_5(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_H17(DCP_FW_VER)
 	/* H17P expects A380 right before set_display_refresh_properties */
+	if (!dcp_methods[dcpep_dfb_ready_query].tag[0]) {
+		/* No tag is known for this firmware build: do not send one. */
+		boot_5b(dcp, out, cookie);
+		return;
+	}
 	dcp_dfb_ready_query(dcp, false, boot_5b, NULL);
 #else
 	boot_5b(dcp, out, cookie);
