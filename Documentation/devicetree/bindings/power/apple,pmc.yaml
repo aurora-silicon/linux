@@ -26,6 +26,7 @@ properties:
   compatible:
     enum:
       - apple,t6041-pmc
+      - apple,t6050-pmc
       - apple,t8132-pmc
       - apple,t8140-pmc
 
@@ -184,10 +185,14 @@ patternProperties:
 
     properties:
       compatible:
-        enum:
-          - apple,t6041-clpc
-          - apple,t8132-clpc
-          - apple,t8140-clpc
+        oneOf:
+          - enum:
+              - apple,t6041-clpc
+              - apple,t8132-clpc
+              - apple,t8140-clpc
+          - items:
+              - const: apple,t6050-clpc
+              - const: apple,t6041-clpc
 
       reg:
         maxItems: 1
