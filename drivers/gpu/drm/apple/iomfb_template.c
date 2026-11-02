@@ -2200,6 +2200,8 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 #endif
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
+	/* The firmware announces its compact services again after poweron. */
+	WRITE_ONCE(dcp->afk_power_gen, dcp->afk_power_gen + 1);
 
 #if DCP_FW_H17(DCP_FW_VER)
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
