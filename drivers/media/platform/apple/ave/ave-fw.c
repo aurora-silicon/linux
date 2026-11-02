@@ -29,6 +29,7 @@
 
 #include "ave.h"
 #include "ave-regs.h"
+#include "ave-dart-pte.h"
 
 /*
  * Legacy TEXT CRCs accepted at T8140 probe. Encoding separately requires
@@ -348,6 +349,135 @@ static void ave_6070_range(struct ave_dev *ave, const char *when, const char *na
 		 when, name, lo, hi, crc, nonzero, nonzero ? ":" : "", line);
 }
 
+/*
+ * Diagnostic only (SPEC-6070-hello r6 sections 6-7): walk SID 0 of both AVE
+ * DARTs from the live TTBR, read-only, over every 16 KiB page of the
+ * firmware TEXT and DATA spans, and compare with the backing ranges. No
+ * table, register or TLB is written and no transaction is issued. The DART
+ * driver owns the tables; this module decodes them only to report.
+ */
+#define AVE_6070_DART_PARAMS3	0x08
+#define AVE_6070_DART_TTBR0	0x1400
+#define AVE_6070_DART_TCR0	0x1000
+
+/* Leaf PTE for @iova, or 0; *@why says where the walk stopped */
+static u64 ave_6070_dart_leaf(void __iomem *r, unsigned int levels, u64 iova,
+			      const char **why)
+{
+	u32 ttbr = readl(r + AVE_6070_DART_TTBR0);
+	u64 table, pte = 0;
+
+	*why = "ok";
+	if (!(ttbr & AVE_DART_TTBR_VALID)) {
+		*why = "no ttbr";
+		return 0;
+	}
+	if (!ave_dart_iova_in_range(iova, levels)) {
+		*why = "out of range";
+		return 0;
+	}
+	table = ave_dart_ttbr_pa(ttbr);
+	for (int level = levels - 1; level >= 0; level--) {
+		const __le64 *t = memremap(table, SZ_16K, MEMREMAP_WB | MEMREMAP_WC);
+
+		if (!t) {
+			*why = "table not mappable";
+			return 0;
+		}
+		pte = le64_to_cpu(READ_ONCE(t[ave_dart_index(iova, level)]));
+		memunmap((void *)t);
+		if (!(pte & AVE_DART2_VALID)) {
+			*why = level ? "no table" : "no leaf";
+			return 0;
+		}
+		table = ave_dart2_entry_pa(pte);
+	}
+	return pte;
+}
+
+struct ave_6070_span {
+	const char *name;
+	u64 iova, phys;
+	size_t size;
+	bool want_w;
+};
+
+static void ave_fw_6070_dart_walk(struct ave_dev *ave, const char *when)
+{
+	const struct ave_6070_span spans[] = {
+		{ "TEXT", ave->text.iova, ave->text.phys, ave->text.size, false },
+		{ "DATA", ave->data.iova, ave->data.phys, ave->data.size, true },
+	};
+	static const u64 probe[] = { 0x8000e8000ULL, 0x8000ec000ULL, 0x8000f0000ULL };
+	unsigned int agree = 0, compared = 0, lv[2] = { 2, 2 };
+	u32 vaw[2] = {};
+
+	for (unsigned int d = 0; d < ave->n_darts; d++) {
+		vaw[d] = (readl(ave->dart_regs[d] + AVE_6070_DART_PARAMS3) >> 16) & 0x3f;
+		lv[d] = ave_dart_levels(vaw[d] ?: 36);
+	}
+	for (unsigned int d = 0; d < ave->n_darts; d++) {
+		void __iomem *r = ave->dart_regs[d];
+		unsigned int levels = lv[d];
+		char line[200];
+		int len = 0;
+
+		dev_info(ave->dev, "6070 %s: DART%u %pa sid %u tcr %#x ttbr %#x va %u levels %u\n",
+			 when, d, &ave->dart_phys[d], ave->dart_sid[d],
+			 readl(r + AVE_6070_DART_TCR0), readl(r + AVE_6070_DART_TTBR0),
+			 vaw[d], levels);
+		for (unsigned int s = 0; s < ARRAY_SIZE(spans); s++) {
+			const struct ave_6070_span *sp = &spans[s];
+			unsigned int pages = 0, valid = 0, linear = 0, nr = 0, nw = 0, nc = 0;
+			bool reported = false;
+
+			for (size_t off = 0; off < sp->size; off += SZ_16K) {
+				const char *why;
+				u64 pte = ave_6070_dart_leaf(r, levels, sp->iova + off, &why);
+				struct ave_dart_leaf l = ave_dart2_leaf(pte);
+				bool lin = l.valid && l.pa == sp->phys + off;
+
+				pages++;
+				valid += l.valid;
+				linear += lin;
+				nr += l.valid && l.r;
+				nw += l.valid && l.w;
+				nc += l.valid && l.cache;
+				if (!reported && (!lin || !l.r || (sp->want_w && !l.w))) {
+					reported = true;
+					dev_info(ave->dev,
+						 "6070 %s: DART%u %s first mismatch iova %#llx pa %#llx want %#llx r%u w%u c%u (%s)\n",
+						 when, d, sp->name, sp->iova + off, l.pa,
+						 (u64)(sp->phys + off), l.r, l.w, l.cache, why);
+				}
+				if (d == 1 && ave->n_darts == 2) {
+					const char *why0;
+
+					compared++;
+					agree += ave_6070_dart_leaf(ave->dart_regs[0], lv[0],
+								    sp->iova + off, &why0) == pte;
+				}
+			}
+			dev_info(ave->dev,
+				 "6070 %s: DART%u %s %#llx+%#zx -> %pa: %u pages, %u valid, %u linear, R %u W %u cache %u%s\n",
+				 when, d, sp->name, sp->iova, sp->size, &sp->phys, pages, valid,
+				 linear, nr, nw, nc, reported ? "" : ", all as expected");
+		}
+		for (unsigned int i = 0; i < ARRAY_SIZE(probe); i++) {
+			const char *why;
+			struct ave_dart_leaf l =
+				ave_dart2_leaf(ave_6070_dart_leaf(r, levels, probe[i], &why));
+
+			len += scnprintf(line + len, sizeof(line) - len, " %#llx->%#llx v%u r%u w%u c%u",
+					 probe[i], l.pa, l.valid, l.r, l.w, l.cache);
+		}
+		dev_info(ave->dev, "6070 %s: DART%u pages:%s\n", when, d, line);
+	}
+	if (compared)
+		dev_info(ave->dev, "6070 %s: DART0 and DART1 leaves agree on %u of %u pages\n",
+			 when, agree, compared);
+}
+
 static void ave_fw_6070_boot_snapshot(struct ave_dev *ave, const char *when,
 				      bool keep)
 {
@@ -389,6 +519,7 @@ static void ave_fw_6070_boot_snapshot(struct ave_dev *ave, const char *when,
 		 when, ave_6070_q(d, ds, 0x60358), ave_6070_q(d, ds, 0x1fff0),
 		 ave_6070_q(d, ds, 0x1fff8));
 	ave_6070_range(ave, when, "temp PTE", d, ds, 0x18000, 0x18080, 16);
+	ave_6070_range(ave, when, "temp table", d, ds, 0x18000, 0x20000, 16);
 	ave_6070_range(ave, when, "final PT", d, ds, AVE_6070_PT_START, AVE_6070_PT_END, 16);
 	ave_6070_range(ave, when, "MMU cfg", d, ds, 0x126fc0, 0x127068, 8);
 	/* 4.3 runtime, platform and channel milestones */
@@ -408,6 +539,8 @@ static void ave_fw_6070_boot_snapshot(struct ave_dev *ave, const char *when,
 		 when, ave_6070_q(d, ds, 0x126d58), ave_6070_l(d, ds, 0x60af8));
 	ave_6070_range(ave, when, "crash state", d, ds, 0x2b30, 0x2bc0, 0);
 	ave_6070_range(ave, when, "NMI state", d, ds, 0x1266a0, 0x1266c8, 5);
+	dev_info(ave->dev, "6070 %s: DATA+0x1266a0 %#llx +0x1266c0 %#llx\n", when,
+		 ave_6070_q(d, ds, 0x1266a0), ave_6070_q(d, ds, 0x1266c0));
 	crash = ave_6070_q(d, ds, 0x2b58);
 	if (crash >= AVE_6070_DATA_VA && crash < AVE_6070_DATA_VA_END) {
 		size_t off = crash - AVE_6070_DATA_VA;
@@ -415,6 +548,9 @@ static void ave_fw_6070_boot_snapshot(struct ave_dev *ave, const char *when,
 		ave_6070_range(ave, when, "crash buffer", d, ds, off,
 			       off + min_t(size_t, 0x400, ds > off ? ds - off : 0), 0);
 	}
+	/* The DART walk only before RUN and at the timeout (keep marks the latter) */
+	if (keep || !strcmp(when, "pre-run"))
+		ave_fw_6070_dart_walk(ave, when);
 	if (keep && ave->boot_capture && ave->boot_capture_size == ds)
 		memcpy(ave->boot_capture, d, ds);
 out:

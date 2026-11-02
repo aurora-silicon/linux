@@ -227,6 +227,11 @@ struct ave_dev {
 	/* debugfs last_6070_data: DATA as the 6070 hello timeout left it */
 	void *boot_capture;
 	size_t boot_capture_size;
+	/* The encoder's T8110-layout DARTs, mapped read-only for diagnostics */
+	void __iomem *dart_regs[2];
+	phys_addr_t dart_phys[2];
+	u32 dart_sid[2];
+	unsigned int n_darts;
 	struct dentry *debugfs;
 	void *dump[2][AVE_IMAGE_COUNT];
 
