@@ -349,6 +349,16 @@
 	 * GPU is powered off its sensors report placeholder values from -4 to
 	 * 4 C.
 	 *
+	 * Every zone runs the power allocator, which acts at any temperature
+	 * unless a zone has a second passive trip: the first one is then its
+	 * switch-on point, below which it resets and grants full power. So each
+	 * zone has one, 16 C below the die and CPU control trip (100/116 C) and
+	 * 11 C below the GPU one (90/101 C). Without them the GPU zones, whose
+	 * placeholder readings never warm up, held all 14 CPUs to about 7.5 W
+	 * (1.26/1.02/1.26 GHz) under any all-core load. The GPU zones also
+	 * carry the die's sustainable power rather than the allocator's
+	 * estimate from the lowest CPU states (about 2.6 W).
+	 *
 	 * The fans: left to themselves (SMC mode 3, with no OS asking for
 	 * cooling) they stay off, or switch on late and ramp slowly, while the
 	 * dies heat up under load. So the CPU die zone and the GPU zones also
@@ -411,6 +421,12 @@
 			trips {
 				J616S_FAN_TRIPS(cpu_die)
 
+				cpu_die_switch_on: cpu-die-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_die_passive: cpu-die-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -465,6 +481,12 @@
 			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
 
 			trips {
+				cpu_e0_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e0_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -497,6 +519,12 @@
 			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
 
 			trips {
+				cpu_e1_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e1_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -529,6 +557,12 @@
 			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
 
 			trips {
+				cpu_e2_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e2_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -561,6 +595,12 @@
 			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
 
 			trips {
+				cpu_e3_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e3_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -593,6 +633,12 @@
 			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
 
 			trips {
+				cpu_p00_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p00_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -626,6 +672,12 @@
 			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
 
 			trips {
+				cpu_p01_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p01_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -659,6 +711,12 @@
 			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
 
 			trips {
+				cpu_p02_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p02_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -692,6 +750,12 @@
 			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
 
 			trips {
+				cpu_p03_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p03_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -725,6 +789,12 @@
 			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
 
 			trips {
+				cpu_p04_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p04_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -758,6 +828,12 @@
 			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
 
 			trips {
+				cpu_p05_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p05_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -791,6 +867,12 @@
 			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
 
 			trips {
+				cpu_p10_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p10_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -824,6 +906,12 @@
 			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
 
 			trips {
+				cpu_p11_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p11_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -857,6 +945,12 @@
 			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
 
 			trips {
+				cpu_p12_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p12_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -890,6 +984,12 @@
 			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
 
 			trips {
+				cpu_p13_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p13_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -923,6 +1023,12 @@
 			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
 
 			trips {
+				cpu_p14_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p14_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -956,6 +1062,12 @@
 			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
 
 			trips {
+				cpu_p15_switch_on: trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p15_passive: trip-passive {
 					temperature = <116000>;
 					hysteresis = <5000>;
@@ -985,10 +1097,17 @@
 		gpu0-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 17>;	/* Tg05 */
 
 			trips {
 				J616S_FAN_TRIPS(gpu0)
+
+				gpu0_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu0_passive: trip-passive {
 					temperature = <101000>;
@@ -1040,10 +1159,17 @@
 		gpu1-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 18>;	/* Tg0S */
 
 			trips {
 				J616S_FAN_TRIPS(gpu1)
+
+				gpu1_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu1_passive: trip-passive {
 					temperature = <101000>;
@@ -1095,10 +1221,17 @@
 		gpu2-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 19>;	/* Tg0Y */
 
 			trips {
 				J616S_FAN_TRIPS(gpu2)
+
+				gpu2_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu2_passive: trip-passive {
 					temperature = <101000>;
@@ -1150,10 +1283,17 @@
 		gpu3-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 20>;	/* Tg0k */
 
 			trips {
 				J616S_FAN_TRIPS(gpu3)
+
+				gpu3_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu3_passive: trip-passive {
 					temperature = <101000>;
@@ -1205,10 +1345,17 @@
 		gpu4-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 21>;	/* Tg0z */
 
 			trips {
 				J616S_FAN_TRIPS(gpu4)
+
+				gpu4_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu4_passive: trip-passive {
 					temperature = <101000>;
@@ -1260,10 +1407,17 @@
 		gpu5-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 22>;	/* Tg1V */
 
 			trips {
 				J616S_FAN_TRIPS(gpu5)
+
+				gpu5_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu5_passive: trip-passive {
 					temperature = <101000>;
@@ -1315,10 +1469,17 @@
 		gpu6-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 23>;	/* Tg1l */
 
 			trips {
 				J616S_FAN_TRIPS(gpu6)
+
+				gpu6_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu6_passive: trip-passive {
 					temperature = <101000>;
