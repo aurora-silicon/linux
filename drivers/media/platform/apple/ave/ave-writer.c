@@ -261,7 +261,7 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 		fw->counted ?
 			0x10000 | (hevc ? (depth == 8 ? 0x41 : 0x40) : 0) |
 				(cq ? 0x10 : 0) :
-		hevc ? 1 :
+		hevc ? depth == 8 :
 		       0);
 	ave_start_put32(cmd, l->geometry_mode,
 			(hevc ? 0x40 : 0) | (cq ? 0 : 2));

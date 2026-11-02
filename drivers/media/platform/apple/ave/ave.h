@@ -227,7 +227,8 @@ struct ave_params {
 	enum ave_codec codec;
 	u32 width, height; /* visible picture */
 	u32 cw, ch; /* coded size, multiples of 16 */
-	u32 stride; /* NV12 line stride, both planes */
+	u32 stride; /* NV12 or P010 line stride in bytes, both planes */
+	u32 sample_bytes; /* 1 for NV12, 2 for P010 */
 	u32 mbs; /* 16x16 macroblocks */
 	u32 fps_num, fps_den; /* frames per second = num / den */
 	u32 fps_int; /* the same, rounded */
@@ -325,6 +326,7 @@ struct ave_ctx {
 	u32 h264_level;
 	u32 h264_min_qp;
 	u32 h264_max_qp;
+	u32 hevc_profile;
 	u32 hevc_level;
 	u32 hevc_min_qp;
 	u32 hevc_max_qp;

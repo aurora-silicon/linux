@@ -159,6 +159,72 @@ static void ave_9003_byte_equality(struct kunit *test)
 	}
 }
 
+/*
+ * HEVC Main 10 on 9003: compared with the same Main session, Start differs
+ * only in the fields the 10-30 capture showed changing with bit depth.
+ */
+static void ave_9003_hevc_main10(struct kunit *test)
+{
+	static const u32 changed[] = {
+		0x208, 0x298, 0x308, 0x2598, 0x2938, 0x293c, 0x2960,
+		0x5904, 0x5908, 0x592c, 0x5ad8, 0x5adc,
+	};
+	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+	u8 *main8 = kunit_kzalloc(test, 0x14000, GFP_KERNEL);
+	u8 *main10 = kunit_kzalloc(test, 0x14000, GFP_KERNEL);
+	size_t len;
+
+	KUNIT_ASSERT_NOT_NULL(test, ave);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, sess);
+	KUNIT_ASSERT_NOT_NULL(test, main8);
+	KUNIT_ASSERT_NOT_NULL(test, main10);
+	ave->layout = &ave_layout_9003_78_0;
+	ctx->ave = ave;
+	ctx->sess = sess;
+	len = ave->layout->bytes[AVE_CODEC_HEVC - 1][AVE_IMAGE_START];
+
+	ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+	sess->p.min_qp = 0;
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main8, len), 0);
+	ave_test_session(sess, AVE_CODEC_HEVC, 1920, 1080, true);
+	sess->p.min_qp = -12;
+	sess->p.profile = 2;
+	sess->p.bit_depth = 10;
+	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, main10, len), 0);
+	ave_stamp_command(ave->layout->abi, main8, 1, 2);
+	ave_stamp_command(ave->layout->abi, main10, 1, 2);
+
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main8 + 0x208), 1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x208), 0);
+	KUNIT_EXPECT_EQ(test, (s32)get_unaligned_le32(main10 + 0x298), -12);
+	KUNIT_EXPECT_EQ(test, (s32)get_unaligned_le32(main10 + 0x308), -12);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x2598), 10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x2938), 2);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x5904), 2);
+	KUNIT_EXPECT_EQ(test, main10[0x293d], 0);
+	KUNIT_EXPECT_EQ(test, main10[0x293e], 1);
+	KUNIT_EXPECT_EQ(test, main10[0x5909], 0);
+	KUNIT_EXPECT_EQ(test, main10[0x590a], 1);
+	KUNIT_EXPECT_EQ(test, main10[0x2962], 0);
+	KUNIT_EXPECT_EQ(test, main10[0x592e], 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x5ad8), 2);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(main10 + 0x5adc), 2);
+
+	for (size_t off = 0; off < len; off += 4) {
+		bool expected = false;
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(changed); i++)
+			expected |= off == changed[i];
+		if (!expected)
+			KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(main8 + off),
+					    get_unaligned_le32(main10 + off),
+					    "word +%#zx", off);
+	}
+}
+
 static void ave_6070_images(struct kunit *test)
 {
 	const struct ave_fw_abi *abi = &ave_abi_6070;
@@ -395,7 +461,8 @@ static void ave_6070_variants(struct kunit *test)
 }
 
 static struct kunit_case ave_abi_cases[] = {
-	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_6070_images),
+	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
+	KUNIT_CASE(ave_6070_images),
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_gate),	    KUNIT_CASE(ave_6070_channels),
 	KUNIT_CASE(ave_6070_variants),	    {}
