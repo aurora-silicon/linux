@@ -726,17 +726,33 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 #define APPLE_RTKIT_CRASHLOG_LATE_POLL_MS 250
 #define APPLE_RTKIT_CRASHLOG_LATE_POLLS 20
 
+/*
+ * Whether the crashlog buffer holds a log: an ordinary 'CLHE' log at its
+ * start, or a 'CLGH' container whose current record leads to a complete one.
+ */
 static bool apple_rtkit_crashlog_header_valid(struct apple_rtkit *rtk)
 {
 	struct apple_rtkit_crashlog_header header;
+	size_t size = rtk->crashlog_buffer.size, offset;
+	unsigned int depth;
+	u32 id;
 
-	if (rtk->crashlog_buffer.size < sizeof(header))
+	if (size < sizeof(header))
 		return false;
 	apple_rtkit_memcpy(rtk, &header, &rtk->crashlog_buffer, 0,
 			   sizeof(header));
+	if (header.fourcc == APPLE_RTKIT_CRASHLOG_CONTAINER_FOURCC) {
+		u8 *bfr __free(kfree) = kmalloc(size, GFP_KERNEL);
+
+		if (!bfr)
+			return false;
+		apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0, size);
+		return !apple_rtkit_crashlog_locate(bfr, size, &offset, &id,
+						    &depth);
+	}
 	return header.fourcc == APPLE_RTKIT_CRASHLOG_HEADER_FOURCC &&
 	       header.size >= sizeof(header) &&
-	       header.size <= rtk->crashlog_buffer.size;
+	       header.size <= size;
 }
 
 static void apple_rtkit_crashlog_late(struct work_struct *work)
