@@ -725,7 +725,11 @@ fn m5_zls(pass: &RenderPass) -> bool {
 }
 
 /// The M5 subset of a render pass, after the common checks, and the plan of its declarations.
-/// The admitted forms (widened by qualification): one layer; one sample, or 2, 4
+/// The admitted forms (widened by qualification): one layer, or a layered target of up to
+/// [`MAX_LAYERS`] whose tile holds at least one eight-byte sample (S's layered form: Honeykrisp's
+/// M5 tile buffer reserves that sample for a layered pass with no colour attachment, and the
+/// layered tiling words, layer metadata and per-layer depth/stencil strides are the common
+/// lowering's); one sample, or 2, 4
 /// or 8 (S's multisample form: at least 8 bytes per sample and at most 2048 samples per tile, so
 /// 8x needs 16x16 tiles), with the tile's storage within the render plan's bound
 /// ([`m5::compute::MAX_IMAGEBLOCK_BYTES`]); stored color, resolved or not (the resolve is the
@@ -742,7 +746,7 @@ fn m5_render(
 ) -> Result<m5::compute::RenderPlan> {
     let tile = u32::from(pass.utile_width) * u32::from(pass.utile_height);
     let samples = 1u32 << pass.samples_log2;
-    let storage = pass.layers == 1
+    let storage = (pass.layers == 1 || pass.sample_size != 0)
         && pass.sample_size % 8 == 0
         && (pass.samples_log2 == 0 || (pass.sample_size >= 8 && tile * samples <= 2048))
         && u32::from(pass.sample_size) * tile * samples <= m5::compute::MAX_IMAGEBLOCK_BYTES;
