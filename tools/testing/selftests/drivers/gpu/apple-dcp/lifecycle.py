@@ -28,6 +28,9 @@ def disconnect(root):
     held = [n for n in ('cd321x_mux_held', 'cd321x_mux_set', 'cd321x_mux_still_held',
                         'cd321x_retry_held_mux', 'cd321x_update_done')
             if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
+    # Whether a partner identity has been received, when the update checks that
+    late = [n for n in ('cd321x_identity_known',)
+            if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
     # The DisplayPort hotplug decisions live in cd321x-dp.h when present.
     dp_header = r / 'drivers/usb/typec/tipd/cd321x-dp.h'
     dp = ''
@@ -59,6 +62,7 @@ def disconnect(root):
         *((core, n) for n in held),
         *((core, n) for n in ('cd321x_uses_dp_sid', 'cd321x_dp_hpd',
                               'cd321x_dp_sid_replay', 'cd321x_dp_release_first')),
+        *((core, n) for n in late),
         (core, 'cd321x_update_work')))
     prefix = r'''
 #include <assert.h>
@@ -186,6 +190,8 @@ enum usb_role { USB_ROLE_NONE, USB_ROLE_HOST, USB_ROLE_DEVICE };
 enum typec_pwr_opmode { TYPEC_PWR_MODE_USB, TYPEC_PWR_MODE_PD };
 enum typec_orientation { TYPEC_ORIENTATION_NONE, TYPEC_ORIENTATION_NORMAL, TYPEC_ORIENTATION_REVERSE };
 struct usb_pd_identity { int id; };
+static void * __attribute__((unused)) memchr_inv(const void *p, int c, size_t n)
+{ const unsigned char *b = p; for (size_t i = 0; i < n; i++) if (b[i] != (unsigned char)c) return (void *)(b + i); return NULL; }
 struct typec_mux_state { void *alt, *data; int mode; };
 struct typec_thunderbolt_switch_data { int state; };
 struct typec_partner_desc { bool usb_pd; int accessory; struct usb_pd_identity *identity; };

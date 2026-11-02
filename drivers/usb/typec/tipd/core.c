@@ -1027,6 +1027,12 @@ static void cd321x_dp_notify(struct cd321x *cd321x,
 	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
 }
 
+/* An identity of all zeros has not been received from the partner yet. */
+static bool cd321x_identity_known(const struct usb_pd_identity *id)
+{
+	return memchr_inv(id, 0, sizeof(*id));
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1105,10 +1111,19 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	bool is_pd = pwr_opmode == TYPEC_PWR_MODE_PD;
+	/*
+	 * The partner can be registered before its Discover Identity response
+	 * arrives. An identity that was never received tells nothing about a
+	 * partner change: take the one the partner sent later instead.
+	 */
+	bool identity_late = old_connected && new_connected && is_pd &&
+		cd321x->cur_partner_is_pd &&
+		!cd321x_identity_known(&cd321x->cur_partner_identity);
 	bool new_partner = old_connected && new_connected &&
 		(is_pd != cd321x->cur_partner_is_pd ||
-		 (is_pd && memcmp(&st.partner_identity,
-				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
+		 (is_pd && !identity_late &&
+		  memcmp(&st.partner_identity, &cd321x->cur_partner_identity,
+			 sizeof(struct usb_pd_identity))));
 	bool partner_changed = new_partner ||
 		(old_connected && new_connected && was_disconnected);
 
@@ -1254,6 +1269,9 @@ static void cd321x_update_work(struct work_struct *work)
 
 		if (desc.identity)
 			typec_partner_set_identity(tps->partner);
+	} else if (identity_late && cd321x_identity_known(&st.partner_identity)) {
+		cd321x->cur_partner_identity = st.partner_identity;
+		typec_partner_set_identity(tps->partner);
 	}
 
 	/* The CD321x firmware owns VDM discovery and Enter Mode. Publish the
@@ -1661,11 +1679,14 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE) {
 		if (!tps->data->read_power_status(tps))
 			goto err_lost;
-		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
-			if (tps6598x_read_partner_identity(tps)) {
-				dev_err(tps->dev, "failed to read partner identity\n");
-				goto err_lost;
-			}
+	}
+	/* The identity can arrive after the contract, before a mode is entered. */
+	if ((event & (APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
+		      APPLE_CD_REG_INT_DATA_STATUS_UPDATE)) &&
+	    TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
+		if (tps6598x_read_partner_identity(tps)) {
+			dev_err(tps->dev, "failed to read partner identity\n");
+			goto err_lost;
 		}
 	}
 
