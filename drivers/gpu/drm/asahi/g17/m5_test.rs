@@ -353,6 +353,13 @@ impl Compute {
             return Err(EINVAL);
         }
         self.channel.install(&mut Self::host(firmware))?;
+        // The runtime's lane waits for the configuration's consumption before its first kick; so
+        // does this one, which holds the session and polls.
+        let crashed = &firmware.primary.state.shared.crashed;
+        let channel = &mut self.channel;
+        super::queue::m5::await_install(crashed, |expired| {
+            channel.install_consumed(crashed, expired)
+        })?;
         dev_info!(
             dev.as_ref(),
             "M5 compute queue installed: core power {:#x}, counters {:?}, power words {:x?}\n",

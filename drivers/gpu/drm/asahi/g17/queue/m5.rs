@@ -524,28 +524,6 @@ impl Lane {
         ring::idle_at(&self.graph, self.producer, target)
     }
 
-    /// Waits until `installed` holds for every lane's installation item.
-    pub(crate) fn await_install(
-        crashed: &AtomicBool,
-        lanes: &[&Lane],
-        installed: impl Fn(&Lane) -> Result<bool>,
-    ) -> Result {
-        for _ in 0..INSTALL_POLLS {
-            if crashed.load(Ordering::Acquire) {
-                return Err(EIO);
-            }
-            let mut done = true;
-            for lane in lanes {
-                done &= installed(lane)?;
-            }
-            if done {
-                return Ok(());
-            }
-            fsleep(Delta::from_millis(1));
-        }
-        Err(ETIMEDOUT)
-    }
-
     /// [`ring::stage_kick`] on this lane's QID.
     pub(crate) fn stage_kick(
         &mut self,
@@ -567,6 +545,26 @@ impl Lane {
     pub(crate) fn work_slot(&self, producer: u32, first: bool) -> Result<fw::channels::WorkSlot> {
         ring::work_slot(&self.graph, self.qid(), producer, first)
     }
+}
+
+/// Polls `consumed` every millisecond for [`INSTALL_WAIT_MS`] until an installation was consumed,
+/// where the caller holds the firmware session and cannot wait on the event worker (a render
+/// pair's installation, the boot-time compute qualification's). `consumed` is told when the wait
+/// expires, so [`Queue::install_consumed`] can quarantine the queue as the runtime's wait does.
+pub(crate) fn await_install(
+    crashed: &AtomicBool,
+    mut consumed: impl FnMut(bool) -> Result<bool>,
+) -> Result {
+    for poll in 1..=INSTALL_POLLS {
+        if crashed.load(Ordering::Acquire) {
+            return Err(EIO);
+        }
+        if consumed(poll == INSTALL_POLLS)? {
+            return Ok(());
+        }
+        fsleep(Delta::from_millis(1));
+    }
+    Err(ETIMEDOUT)
 }
 
 /// The client view of `pool` in `vm`: none while the pool is vacant.

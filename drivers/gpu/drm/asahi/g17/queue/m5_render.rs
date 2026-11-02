@@ -930,8 +930,10 @@ impl Pair {
                 lanes[TILING].set_producer(1)
             })
             .and_then(|_| {
-                Lane::await_install(host.crashed, &[&lanes[TILING], &lanes[FRAGMENT]], |lane| {
-                    lane.idle_at(1)
+                super::m5::await_install(host.crashed, |_| {
+                    let tiling = lanes[TILING].idle_at(1)?;
+                    let fragment = lanes[FRAGMENT].idle_at(1)?;
+                    Ok(tiling && fragment)
                 })
             });
         if let Err(error) = result {
