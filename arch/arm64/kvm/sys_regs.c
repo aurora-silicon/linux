@@ -20,6 +20,7 @@
 #include <linux/irqchip/arm-gic-v3.h>
 
 #include <asm/arm_pmuv3.h>
+#include <asm/apple_cpufeature.h>
 #include <asm/cacheflush.h>
 #include <asm/cputype.h>
 #include <asm/debug-monitors.h>
@@ -1008,6 +1009,10 @@ static u64 reset_amair_el1(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 static u64 reset_actlr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 {
 	u64 actlr = read_sysreg(actlr_el1);
+
+	/* The guest turns upper-lane preservation on itself, per thread */
+	if (cpus_have_final_cap(ARM64_HAS_PRSV_APPLE))
+		actlr &= ~ACTLR_APPLE_PRSV;
 	vcpu_write_sys_reg(vcpu, actlr, ACTLR_EL1);
 	return actlr;
 }
