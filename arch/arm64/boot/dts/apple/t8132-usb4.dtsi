@@ -12,7 +12,7 @@
  */
 
 &pinctrl_aop {
-	/* LSTX, handed to each router once it is up (ADT acioN.gpio-lstx). */
+	/* LSTX, handed to each router once it is up and held as a GPIO while it is off. */
 	usb4_0_lstx_pins: usb4-0-lstx-pins {
 		pinmux = <APPLE_PINMUX(17, 1)>;
 	};
@@ -63,6 +63,7 @@
 		resets = <&cio_reset 0>;
 		pinctrl-names = "lstx";
 		pinctrl-0 = <&usb4_0_lstx_pins>;
+		lstx-gpios = <&pinctrl_aop 17 GPIO_ACTIVE_HIGH>;
 
 		power-domains = <&ps_atc0_cio>,
 				<&ps_atc0_cio_pcie>,
@@ -178,6 +179,7 @@
 		resets = <&cio_reset 1>;
 		pinctrl-names = "lstx";
 		pinctrl-0 = <&usb4_1_lstx_pins>;
+		lstx-gpios = <&pinctrl_aop 19 GPIO_ACTIVE_HIGH>;
 
 		power-domains = <&ps_atc1_cio>,
 				<&ps_atc1_cio_pcie>,
