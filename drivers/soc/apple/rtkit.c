@@ -698,11 +698,39 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 						 len, DMA_FROM_DEVICE);
 }
 
+/*
+ * Whether the crashlog buffer holds a log: an ordinary 'CLHE' log at its
+ * start, or a 'CLGH' container whose current record leads to a complete one.
+ */
+static bool apple_rtkit_crashlog_header_valid(struct apple_rtkit *rtk)
+{
+	struct apple_rtkit_crashlog_header header;
+	size_t size = rtk->crashlog_buffer.size, offset;
+	unsigned int depth;
+	u32 id;
+
+	if (size < sizeof(header))
+		return false;
+	apple_rtkit_memcpy(rtk, &header, &rtk->crashlog_buffer, 0,
+			   sizeof(header));
+	if (header.fourcc == APPLE_RTKIT_CRASHLOG_CONTAINER_FOURCC) {
+		u8 *bfr __free(kfree) = kmalloc(size, GFP_KERNEL);
+
+		if (!bfr)
+			return false;
+		apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0, size);
+		return !apple_rtkit_crashlog_locate(bfr, size, &offset, &id,
+						    &depth);
+	}
+	return header.fourcc == APPLE_RTKIT_CRASHLOG_HEADER_FOURCC &&
+	       header.size >= sizeof(header) &&
+	       header.size <= size;
+}
+
 static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
 	u8 *bfr __free(kfree) = NULL;
-	struct apple_rtkit_crashlog_header header;
 	/*
 	 * An undiscovered crashlog endpoint was never started, so the
 	 * co-processor was never asked for a buffer and, as in an inherited
@@ -734,14 +762,10 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 			return;
 	}
 	if (reports_crash) {
-		if (rtk->crashlog_buffer.size < sizeof(header))
+		if (rtk->crashlog_buffer.size <
+		    sizeof(struct apple_rtkit_crashlog_header))
 			goto no_buffer;
-
-		apple_rtkit_memcpy(rtk, &header, &rtk->crashlog_buffer, 0,
-				   sizeof(header));
-		if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER_FOURCC ||
-		    header.size < sizeof(header) ||
-		    header.size > rtk->crashlog_buffer.size)
+		if (!apple_rtkit_crashlog_header_valid(rtk))
 			goto no_log;
 	}
 
