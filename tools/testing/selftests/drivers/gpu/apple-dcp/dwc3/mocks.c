@@ -74,6 +74,7 @@ struct dwc3 {
 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
 	struct reset_controller_dev *reset;
 	int dev, usb_psy, vbus_draw_work, dr_mode, current_dr_role;
+	bool dis_u3_susphy_quirk;
 	struct { void *notifier_call; } psy_nb;
 };
 struct dwc3_apple {
@@ -87,6 +88,7 @@ struct dwc3_apple {
 	bool rpm_held, host_only;
 	/* T8132 only: runtime PM before the first core probe; never set here. */
 	bool pre_core_rpm;
+	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };
 static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
