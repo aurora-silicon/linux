@@ -1246,6 +1246,20 @@ impl Gpu {
             );
             return Err(ENODEV);
         }
+        // The M5 operand buffer is laid out for the board's nominal topology.
+        if let Some(operand) = cfg.m5.map(|board| board.compute.operand) {
+            if (operand.clusters, operand.core_slots) != (id.num_clusters, id.num_cores) {
+                dev_err!(
+                    dev.as_ref(),
+                    "M5 operand layout for {}x{} core slots, GPU has {}x{}\n",
+                    operand.clusters,
+                    operand.core_slots,
+                    id.num_clusters,
+                    id.num_cores
+                );
+                return Err(ENODEV);
+            }
+        }
         let shared = Arc::pin_init(
             pin_init!(Shared {
                 drm <- new_mutex!(Some(dev.into()), "g17::Shared::drm"),

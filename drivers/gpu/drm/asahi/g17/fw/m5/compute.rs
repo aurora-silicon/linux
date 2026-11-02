@@ -17,7 +17,6 @@ use kernel::{prelude::*, uapi};
 pub(crate) const MAIN_COUNT: usize = 40;
 pub(crate) const ALTERNATE_COUNT: usize = 4;
 pub(crate) const PREEMPT_BYTES: usize = 0x4000;
-pub(crate) const OPERAND_BYTES: usize = 0x40000;
 /// Checkpoints of a program without scratch or matrix brackets.
 pub(crate) const CHECKPOINTS: [u16; 4] = [37, 39, 39, 40];
 
@@ -43,22 +42,87 @@ pub(crate) const COMPLETION_IDENTITY: u64 = 1;
 /// board ([`super::initdata::M5Board::compute`]), which the arithmetic qualification and DRM
 /// submission both encode through [`crate::g17::queue::m5::Channel`].
 ///
-/// J775D's are still the J714 tuple the qualification passes with (2321 exact dispatches); the
-/// operand layout and the dispatch control's more-than-four-clusters bits are topology terms
-/// still to be derived. S's normal-compute tuple (`0x1b80`, `0x1e000`,
+/// The operand layout follows the GPU's topology ([`OperandLayout::of`]); the rest is the J714
+/// tuple the qualification passes with. S's normal-compute tuple (`0x1b80`, `0x1e000`,
 /// `0x3d800`, `0x14c08a60`, 1) is not used: it is unqualified on this GPU.
 pub(crate) struct Profile {
     /// Start of the four eight-byte state words in the preemption buffer.
     pub(crate) preempt_state_offset: u32,
-    /// Size of one operand-state region; the program exchanges two regions.
-    pub(crate) operand_region_bytes: u32,
-    pub(crate) operand_aux_offset: u32,
+    pub(crate) operand: OperandLayout,
     /// Register 0x1a458.
     pub(crate) dispatch_control: u64,
     /// Register 0x0a731's first write.
     pub(crate) auxiliary_control: u64,
     /// What a dispatch without per-thread or workgroup storage needs ([`Self::plan`]).
     pub(crate) no_storage: Resources,
+}
+
+/// Operand bytes per core slot.
+const OPERAND_SLOT_BYTES: u32 = 0x1800;
+/// Core slots between clusters in the bank stride, whatever a cluster's own slot count.
+const OPERAND_CLUSTER_SPACING: u32 = 10;
+
+const fn align_up(value: u32, align: u32) -> u32 {
+    (value + align - 1) & !(align - 1)
+}
+
+/// The operand-state buffer of a compute queue: two banks the programs exchange, then one
+/// auxiliary record per cluster. It is sized from the GPU's topology, with nominal core
+/// slots, not enabled cores: J775D's eight clusters of ten slots give bank 0x78000, stride 0x78400,
+/// auxiliary 0xf4800 and 0xf8000 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OperandLayout {
+    pub(crate) clusters: u32,
+    /// Core slots per cluster (`ID_COUNTS_1[7:0]`).
+    pub(crate) core_slots: u32,
+    /// One bank: `L`, a slot's bytes for every nominal core.
+    pub(crate) bank_bytes: u32,
+    /// The second bank's offset: `D`.
+    pub(crate) bank_stride: u32,
+    /// The auxiliary records' offset: `U1`, after the shared record at `U0 = 2 D`.
+    pub(crate) aux_offset: u32,
+    /// The mapped backing: the extent `U1 + 0x400` in whole pages.
+    pub(crate) bytes: usize,
+}
+
+impl OperandLayout {
+    pub(crate) const fn of(clusters: u32, core_slots: u32) -> Self {
+        assert!(clusters > 0 && core_slots > 0 && core_slots <= OPERAND_CLUSTER_SPACING);
+        let bank_bytes = clusters * core_slots * OPERAND_SLOT_BYTES;
+        let bank_stride = align_up(
+            ((clusters - 1) * OPERAND_CLUSTER_SPACING + core_slots) * OPERAND_SLOT_BYTES
+                + clusters * 0x40,
+            0x400,
+        );
+        let aux_offset = 2 * bank_stride + clusters * 0x800;
+        Self {
+            clusters,
+            core_slots,
+            bank_bytes,
+            bank_stride,
+            aux_offset,
+            bytes: align_up(aux_offset + 0x400, 0x4000) as usize,
+        }
+    }
+}
+
+// J775D's measured layout, and S's J714 production one (two clusters of ten slots).
+const _: () = {
+    let j775d = OperandLayout::of(8, 10);
+    assert!(j775d.bank_bytes == 0x78000 && j775d.bank_stride == 0x78400);
+    assert!(j775d.aux_offset == 0xf4800 && j775d.bytes == 0xf8000);
+    let j714 = OperandLayout::of(2, 10);
+    assert!(j714.bank_bytes == 0x1e000 && j714.aux_offset == 0x3d800 && j714.bytes == 0x40000);
+};
+
+/// Register 0x1a458 for `clusters`: above four, it carries the topology term `0x9c`, the choice for
+/// feature bit 53 clear, which the configuration leaves clear.
+pub(crate) const fn dispatch_control(base: u64, clusters: u32) -> u64 {
+    if clusters > 4 {
+        base | 0x9c
+    } else {
+        base
+    }
 }
 
 /// The resource words of a compute kick and the queue pool they assume.
@@ -140,9 +204,7 @@ pub(crate) struct RegisterArgs {
     pub(crate) resource_policy: u64,
     /// Start of the four eight-byte state words in the preemption buffer.
     pub(crate) preempt_state_offset: u32,
-    /// Size of one operand-state region; the program exchanges two regions.
-    pub(crate) operand_region_bytes: u32,
-    pub(crate) operand_aux_offset: u32,
+    pub(crate) operand: OperandLayout,
     pub(crate) resource_control: u64,
     pub(crate) dispatch_control: u64,
     pub(crate) auxiliary_control: u64,
@@ -159,14 +221,10 @@ impl RegisterArgs {
             return Err(EINVAL);
         }
         offset_va(self.preempt_va, PREEMPT_BYTES as u64)?;
-        offset_va(self.operand_va, OPERAND_BYTES as u64)?;
+        offset_va(self.operand_va, self.operand.bytes as u64)?;
         if self.preempt_state_offset & 7 != 0
             || u64::from(self.preempt_state_offset) + 32 > PREEMPT_BYTES as u64
-            || self.operand_region_bytes == 0
-            || self.operand_region_bytes & 0xfff != 0
-            || u64::from(self.operand_region_bytes) * 2 + 0x808 > OPERAND_BYTES as u64
-            || self.operand_aux_offset & 7 != 0
-            || u64::from(self.operand_aux_offset) + 8 > OPERAND_BYTES as u64
+            || self.operand.aux_offset as usize + 0x400 > self.operand.bytes
         {
             return Err(EINVAL);
         }
@@ -181,7 +239,8 @@ pub(crate) fn main(args: &RegisterArgs) -> Result<[RegisterWrite; MAIN_COUNT]> {
     let operand = args.operand_va;
     let ids = args.object_ids;
     let state = u64::from(args.preempt_state_offset);
-    let region = u64::from(args.operand_region_bytes);
+    let bank = u64::from(args.operand.bank_bytes);
+    let stride = u64::from(args.operand.bank_stride);
     let key = work_key(args.context_id, args.work_state);
     Ok([
         RegisterWrite::new(0x1a510, preempt),
@@ -217,12 +276,13 @@ pub(crate) fn main(args: &RegisterArgs) -> Result<[RegisterWrite; MAIN_COUNT]> {
         RegisterWrite::new(0x10428, key),
         RegisterWrite::new(0x14028, args.free_list_slot.into()),
         RegisterWrite::new(0x14070, args.usage_va | 1),
-        RegisterWrite::new(0x10229, offset_va(operand, region * 2 + 0x800)?),
-        RegisterWrite::new(0x140a8, offset_va(operand, args.operand_aux_offset.into())?),
-        RegisterWrite::new(0x10099, offset_va(operand, region + 0x405)?),
-        RegisterWrite::new(0x10091, offset_va(operand, region * 2 + 0x400)?),
+        // Bank bases are 0x400 aligned; the low 5 are address flags.
+        RegisterWrite::new(0x10229, offset_va(operand, stride * 2)?),
+        RegisterWrite::new(0x140a8, offset_va(operand, args.operand.aux_offset.into())?),
+        RegisterWrite::new(0x10099, offset_va(operand, stride | 5)?),
+        RegisterWrite::new(0x10091, offset_va(operand, stride + bank)?),
         RegisterWrite::new(0x0a5c1, offset_va(operand, 5)?),
-        RegisterWrite::new(0x0a5c9, offset_va(operand, region)?),
+        RegisterWrite::new(0x0a5c9, offset_va(operand, bank)?),
         RegisterWrite::new(0x0a731, 0),
         RegisterWrite::new(0x1a440, 0x154024209),
         RegisterWrite::new(0x0a599, 0x6000400020),
@@ -233,12 +293,13 @@ pub(crate) fn main(args: &RegisterArgs) -> Result<[RegisterWrite; MAIN_COUNT]> {
 pub(crate) fn alternate(args: &RegisterArgs) -> Result<[RegisterWrite; ALTERNATE_COUNT]> {
     args.validate()?;
     let operand = args.operand_va;
-    let region = u64::from(args.operand_region_bytes);
+    let bank = u64::from(args.operand.bank_bytes);
+    let stride = u64::from(args.operand.bank_stride);
     Ok([
         RegisterWrite::new(0x10099, offset_va(operand, 5)?),
-        RegisterWrite::new(0x10091, offset_va(operand, region)?),
-        RegisterWrite::new(0x0a5c1, offset_va(operand, region + 0x405)?),
-        RegisterWrite::new(0x0a5c9, offset_va(operand, region * 2 + 0x400)?),
+        RegisterWrite::new(0x10091, offset_va(operand, bank)?),
+        RegisterWrite::new(0x0a5c1, offset_va(operand, stride | 5)?),
+        RegisterWrite::new(0x0a5c9, offset_va(operand, stride + bank)?),
     ])
 }
 

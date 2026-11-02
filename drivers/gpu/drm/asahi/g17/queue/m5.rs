@@ -221,7 +221,7 @@ impl Channel {
         let pool = M5ComputePool::new(alloc, id.qid(), profile.no_storage.pool_blocks)?;
         aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
         let operand = alloc.lower(
-            compute::OPERAND_BYTES,
+            profile.operand.bytes,
             PAGE as u64,
             mmu::PROT_GPU_SHARED_RW,
             cpu,
@@ -516,8 +516,7 @@ impl Channel {
                 object_ids: compute::OBJECT_IDS,
                 resource_policy: dispatch.resources.policy,
                 preempt_state_offset: self.profile.preempt_state_offset,
-                operand_region_bytes: self.profile.operand_region_bytes,
-                operand_aux_offset: self.profile.operand_aux_offset,
+                operand: self.profile.operand,
                 resource_control: dispatch.resources.control,
                 dispatch_control: self.profile.dispatch_control,
                 auxiliary_control: self.profile.auxiliary_control,

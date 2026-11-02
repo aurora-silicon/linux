@@ -226,22 +226,25 @@ const WINDOWS: [J714RegisterWindowSpec; 32] = [
     ),
 ];
 
+/// 2 dies x 4 clusters, ten core slots each (`ID_COUNTS_1`); 64 enabled, counted from the core
+/// masks at probe.
+const CLUSTERS: u32 = 8;
+const CORE_SLOTS: u32 = 10;
+
 /// The J775D board's fixed part of the M5 hardware data. Its performance, auxiliary and AON
 /// tables come from the device tree, which the boot loader fills from the ADT.
 pub(crate) const M5_BOARD: M5Board = M5Board {
     // Core type 0x1a (variant 6) and firmware revision 2 for raw revision 0x11.
     core_revision: (0x1a, 2),
-    // 2 dies x 4 clusters x 10 slots; 64 enabled, counted from the core masks at probe.
-    nominal_cores: 80,
+    nominal_cores: CLUSTERS * CORE_SLOTS,
     // One voltage lane per cluster.
     lanes: 8,
     windows: &WINDOWS,
-    // The J714 tuple the arithmetic qualification passes with on this GPU (see `Profile`).
+    // The operand layout follows the topology; the rest is the J714 tuple the arithmetic
+    // qualification passes with on this GPU (see `Profile`).
     compute: crate::g17::fw::m5::compute::Profile {
         preempt_state_offset: 0x1480,
-        // A two-cluster bank layout; the eight-cluster one is derived from the topology.
-        operand_region_bytes: 0xf000,
-        operand_aux_offset: 0x1f000,
+        operand: crate::g17::fw::m5::compute::OperandLayout::of(CLUSTERS, CORE_SLOTS),
         // Without the >4-cluster topology term.
         dispatch_control: 0x10c0_8860,
         auxiliary_control: 0,
