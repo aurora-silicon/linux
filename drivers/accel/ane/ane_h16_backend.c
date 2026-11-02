@@ -145,6 +145,21 @@ static int ane_h16_pin(void *ctx)
 	return 0;
 }
 
+/*
+ * System sleep callbacks of a bound H16 device, reached only through the
+ * generation dispatch of the ane_t6021 driver. A device whose engine was
+ * never started has nothing to save.
+ */
+int ane_h16_backend_suspend(struct device *dev)
+{
+	return 0;
+}
+
+int ane_h16_backend_resume(struct device *dev)
+{
+	return 0;
+}
+
 /* Nonblocking transmit queue. RTKit progress never gates scratch progress. */
 static int ane_h16_mailbox_send(void *ctx, u64 word0, u64 word1)
 {
