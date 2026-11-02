@@ -49,6 +49,8 @@
  * @update: update aperture base offset (8 bytes per entry)
  * @dvfs_first: first qualified SOC-DEV-DVFS entry
  * @dvfs_count: number of qualified SOC-DEV-DVFS entries
+ * @dvfs_allowed: if set, the qualified entries in that range, terminated by 0;
+ *	the others in the range belong to devices with no qualified request
  * @actual: power state acknowledgment
  * @status: PMP status; bit 0 is set while the PMP is running
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
@@ -76,6 +78,7 @@ struct apple_pmp_report_offsets {
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
+	const u16 *dvfs_allowed;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -1505,13 +1508,20 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
  * bytes per entry from base + 0x10000. macOS treats any set bit of
  * PMP-STATUS as running, and writes no request before the PMP starts.
  */
+/* T6041 SOC-DEV-DVFS entries (range 0x1f0, 48 entries) with a qualified request. */
+static const u16 apple_pmp_t6041_dvfs[] = {
+	0x1f4,	/* ANE0: soc-device record 14, DVFS ordinal 4 */
+	0x1fd,	/* AVD0: soc-device record 23, DVFS ordinal 13 */
+	0
+};
+
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t6041 = {
 	.tgt_read = 0x1e00,
 	.tgt_write = 0x10f00,
 	.update = 0x10000,
-	/* Only the qualified AVD0 SOC-DEV-DVFS entry. */
-	.dvfs_first = 0x1fd,
-	.dvfs_count = 1,
+	.dvfs_first = 0x1f4,
+	.dvfs_count = 10,
+	.dvfs_allowed = apple_pmp_t6041_dvfs,
 	.actual = 0x1e80,
 	.status = 0x10,
 	.fast_die = 0x2580,
@@ -1685,6 +1695,19 @@ static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry,
 	rep->dvfs_levels[index] = val & 0x1f;
 	rep->dvfs_known |= BIT_ULL(index);
 	spin_unlock_irqrestore(&rep->lock, flags);
+}
+
+static bool apple_pmp_report_dvfs_allowed(const struct apple_pmp_report_offsets *offs,
+					  u32 entry)
+{
+	const u16 *e;
+
+	if (!offs->dvfs_allowed)
+		return true;
+	for (e = offs->dvfs_allowed; *e; e++)
+		if (*e == entry)
+			return true;
+	return false;
 }
 
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
@@ -1872,7 +1895,8 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 		if (ret || !rep || !rep->offsets->update || dvfs[1] > 0x1f ||
 		    rep->offsets->dvfs_count > ARRAY_SIZE(rep->dvfs_levels) ||
 		    dvfs[0] < rep->offsets->dvfs_first ||
-		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count) {
+		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count ||
+		    !apple_pmp_report_dvfs_allowed(rep->offsets, dvfs[0])) {
 			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
 			goto err_free;
 		}
