@@ -2491,7 +2491,8 @@ modes_done:
 	 * resets display_info.
 	 */
 	if (vrr_capable && max_vfreq &&
-	    !connector->display_info.monitor_range.max_vfreq) {
+	    (physical_edid || !connector->display_info.monitor_range.max_vfreq)) {
+		/* H17P's sink EDID can exceed the current link's timing ceiling. */
 		connector->display_info.monitor_range.min_vfreq = min_vfreq;
 		connector->display_info.monitor_range.max_vfreq = max_vfreq;
 	}

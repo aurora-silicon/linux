@@ -34,6 +34,7 @@ import boot
 import m4
 import display
 import colorimetry
+import external_vrr
 
 
 def parking_unit(root):
@@ -56,6 +57,7 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('display', 'external-vrr-callbacks', external_vrr.callbacks, ((),), ()),
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
@@ -126,7 +128,7 @@ def main():
         ('lifecycle', 'resource-profile', lifecycle.profile, ((),), ('-Wno-sign-compare',)),
         ('lifecycle', 'firmware-provider', lifecycle.firmware, ((),), ()),
         ('lifecycle', 'readiness', lifecycle.readiness, ((),), ()),
-        ('lifecycle', 'vrr-rejection', lifecycle.vrr, ((),), ()),
+        ('lifecycle', 'vrr-admission', lifecycle.vrr, ((),), ()),
         ('lifecycle', 'power-reply', lifecycle.power_reply, ((),), ()),
         ('lifecycle', 'dispatcher-scope', lifecycle.dispatcher, ((),), ()),
     ]

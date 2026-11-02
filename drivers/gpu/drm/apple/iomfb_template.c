@@ -3649,6 +3649,45 @@ static void dcp_set_matrix_done(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_matrix_next(dcp, NULL, NULL);
 }
 
+#if DCP_FW_H17(DCP_FW_VER)
+/*
+ * Keep Variable mode armed across fullscreen transitions. The video power
+ * savings call is A450 on this firmware (A458 on newer firmware), rather
+ * than another adaptive-sync parameter and timing install on each flip.
+ */
+static void dcp_external_vrr_done(struct apple_dcp *dcp, void *data, void *cookie)
+{
+	dcp_callback_t next = dcp->external_vrr.next;
+	void *next_cookie = dcp->external_vrr.cookie;
+
+	dcp->external_vrr.savings_valid = data && !*(int *)data;
+	dcp->external_vrr.next = NULL;
+	dcp->external_vrr.cookie = NULL;
+	next(dcp, NULL, next_cookie);
+}
+
+static bool dcp_external_vrr_update(struct apple_dcp *dcp, bool enabled,
+				    dcp_callback_t next, void *cookie)
+{
+	u32 savings = !enabled;
+
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+	    !dcp->vrr_enabled)
+		return false;
+	if (dcp->external_vrr.savings_valid &&
+	    dcp->external_vrr.savings == savings)
+		return false;
+
+	dcp->external_vrr.savings = savings;
+	dcp->external_vrr.savings_valid = false;
+	dcp->external_vrr.next = next;
+	dcp->external_vrr.cookie = cookie;
+	dcp_enable_disable_video_power_savings(dcp, false, &savings,
+					       dcp_external_vrr_done, NULL);
+	return true;
+}
+#endif
+
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 					  void *cookie)
 {
@@ -3988,6 +4027,31 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	return ret;
 }
 #else
+#if DCP_FW_H17(DCP_FW_VER)
+static void dcp_external_modeset_complete(struct apple_dcp *dcp, void *data,
+					 void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete_set_digital_out_mode(dcp, wait->replied ? &wait->status : NULL,
+				      cookie);
+}
+
+static void dcp_on_external_modeset(struct apple_dcp *dcp, void *data,
+				    void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	if (data) {
+		wait->status = *(u32 *)data;
+		wait->replied = true;
+	}
+	if (!dcp_external_vrr_update(dcp, dcp->external_vrr.requested,
+				     dcp_external_modeset_complete, cookie))
+		dcp_external_modeset_complete(dcp, NULL, cookie);
+}
+#endif
+
 /* DCP applies Adaptive Sync changes when the display mode is reselected. */
 static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
 				     void *cookie)
@@ -4003,7 +4067,11 @@ static void dcp_on_set_adaptive_sync(struct apple_dcp *dcp, void *out,
 	}
 #endif
 	dcp_set_digital_out_mode(dcp, false, &dcp->mode,
+#if DCP_FW_H17(DCP_FW_VER)
+				 dcp_on_external_modeset, cookie);
+#else
 				 complete_set_digital_out_mode, cookie);
+#endif
 }
 
 static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
@@ -4097,6 +4165,14 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	dcp->swap_submit_timestamp = 0;
 
+#if DCP_FW_H17(DCP_FW_VER)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		dcp->vrr_enabled = mode->vrr;
+		dcp->external_vrr.requested = crtc_state->vrr_enabled;
+		dcp->external_vrr.savings_valid = false;
+	}
+#endif
+
 	if ((DCP_INHERIT_BOOT_MODE || DCP_FW_NAME(dcp_fw27_keep_panel_mode)(dcp)) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -4120,9 +4196,10 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #endif
-	if (mode->vrr &&
-		   dcp->hw.iomfb_method_profile !=
-		   DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		/* Arm once, also explicitly clear adaptive sync for a fixed timing. */
+		dcp_set_adaptive_sync(dcp, mode->vrr ? mode->min_vrr : 0, cookie);
+	else if (mode->vrr)
 		dcp_set_adaptive_sync(dcp,
 				      crtc_state->vrr_enabled ? mode->min_vrr : 0,
 				      cookie);
@@ -4179,7 +4256,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 				 READ_ONCE(cookie->status));
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
-	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
+	dcp->vrr_enabled = mode->vrr &&
+		(dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+		 crtc_state->vrr_enabled);
 	/* A firmware 27 pair took them on both engines (dcp_peer_finish_v27()). */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))
@@ -4225,6 +4304,19 @@ static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_st
 static void dcp_matrix_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	iomfb_set_matrix(dcp, false, &dcp->desktop->matrix, dcp_set_matrix_done, NULL);
+}
+#endif
+
+#if DCP_FW_H17(DCP_FW_VER)
+static void dcp_external_vrr_vblank(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	schedule_work(&dcp->vblank_wq);
+}
+
+static void dcp_external_vrr_matrix(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	iomfb_set_matrix(dcp, false, &dcp->external_vrr.matrix,
+			 dcp_set_matrix_done, NULL);
 }
 #endif
 
@@ -4342,6 +4434,12 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
 		if (crtc_state->enable && crtc_state->active &&
 		    !crtc_state->planes_changed) {
+#if DCP_FW_H17(DCP_FW_VER)
+			/* A CRTC-only toggle has no surface update, but still takes effect. */
+			if (dcp_external_vrr_update(dcp, crtc_state->vrr_enabled,
+					     dcp_external_vrr_vblank, NULL))
+				return;
+#endif
 			schedule_work(&dcp->vblank_wq);
 			return;
 		}
@@ -4362,7 +4460,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.timestamp[6] = deadline;
 	}
 #else
-	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
+	if (has_surface && (dcp->use_timestamps ||
+	    (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ?
+	     crtc_state->vrr_enabled && dcp->vrr_enabled : dcp->vrr_enabled))) {
 		u64 timestamp = dcp_swap_time();
 		u64 submit_timestamp =
 			dcp_swap_prev_time(timestamp, dcp->swap_submit_timestamp);
@@ -4438,6 +4538,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			return;
 		}
 #endif
+#if DCP_FW_H17(DCP_FW_VER)
+		/*
+		 * No-op unless this is the H17P external path: keep Variable mode
+		 * armed across the colour update before the matrix and swap.
+		 */
+		dcp->external_vrr.matrix = mat;
+		if (dcp_external_vrr_update(dcp, crtc_state->vrr_enabled,
+					    dcp_external_vrr_matrix, NULL))
+			return;
+#endif
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 		dcp->desktop->gamma_pending = dcp_gamma_update(dcp, crtc_state);
 		dcp->desktop->matrix = mat;
@@ -4446,6 +4556,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 		iomfb_set_matrix(dcp, false, &mat, dcp_set_matrix_done, NULL);
 	} else {
+#if DCP_FW_H17(DCP_FW_VER)
+		if (dcp_external_vrr_update(dcp, crtc_state->vrr_enabled, do_swap, NULL))
+			return;
+#endif
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 		if (dcp_vrr_update(dcp, crtc_state, do_swap))
 			return;
