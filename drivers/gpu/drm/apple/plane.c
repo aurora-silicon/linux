@@ -743,6 +743,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
 				   bool supports_xrgb2101010,
+				   bool xrgb_is_alpha,
 				   enum drm_plane_type type,
 				   bool interchange,
 				   bool premultiplied)
@@ -755,7 +756,16 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		if (supports_l10r && supports_xrgb2101010) {
+		if (xrgb_is_alpha) {
+			/*
+			 * The firmware blends the X byte as alpha and ignores the
+			 * opaque-X property: offer only formats with alpha, so that
+			 * compositors write it instead of leaving whatever the
+			 * renderer stored there.
+			 */
+			fmts = dcp_overlay_formats;
+			num_fmts = ARRAY_SIZE(dcp_overlay_formats);
+		} else if (supports_l10r && supports_xrgb2101010) {
 			fmts = dcp_primary_formats;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats);
 		} else if (supports_l10r) {
