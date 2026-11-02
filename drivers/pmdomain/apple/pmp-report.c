@@ -70,6 +70,9 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	u32 fast_die;
 	u32 fast_die_lanes;
+	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
+	u32 update;
+	u32 dvfs_first, dvfs_count;
 	bool running_any;
 	bool defer_requests;
 	bool starts_pmp;
@@ -1463,6 +1466,9 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 	.tgt_read = 0x1880,
 	.tgt_write = 0x10c40,
+	.update = 0x10000,
+	.dvfs_first = 0x190,
+	.dvfs_count = 16,
 	.actual = 0x18c0,
 	.status = 0x10,
 	.fast_die = 0x1c10,
@@ -1526,6 +1532,13 @@ struct apple_pmp_report_entry {
 	u32 id;
 	/* The PMP does not acknowledge this request (a started PMP only). */
 	bool no_ack;
+	/*
+	 * With @dvfs, the SOC-DEV-DVFS entry this soc-device's performance
+	 * request lives in, and the request word written while powered.
+	 */
+	bool dvfs;
+	u32 dvfs_entry;
+	u64 dvfs_on;
 	bool removed;
 };
 
@@ -1569,6 +1582,19 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		50000);
 }
 
+/* SOC-DEV-DVFS request words carry a valid bit; level 0 is the floor. */
+#define PMP_DVFS_VALID		BIT_ULL(61)
+
+/*
+ * One 64-bit store of the whole request word. Never read a request entry
+ * back after storing it: the read retires the pending PTD update before the
+ * PMP handles it, and the request is lost.
+ */
+static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val)
+{
+	writeq(val, rep->base + rep->offsets->update + 8 * entry);
+}
+
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
@@ -1580,10 +1606,15 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
-		if (rep->dev->of_node == ent->report_node) {
-			ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
-			break;
-		}
+		if (rep->dev->of_node != ent->report_node)
+			continue;
+		/* The device request is admitted first and the level dropped first. */
+		if (ent->dvfs && !enable)
+			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, PMP_DVFS_VALID);
+		ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
+		if (ent->dvfs && enable && !ret)
+			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_on);
+		break;
 	}
 	rcu_read_unlock();
 	return ret;
@@ -1660,6 +1691,20 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 			goto err_free;
 		}
 		ent->no_ack = of_property_read_bool(node, "apple,no-ack");
+	}
+	if (of_property_present(node, "apple,dvfs")) {
+		u32 dvfs[2];
+
+		ret = of_property_read_u32_array(node, "apple,dvfs", dvfs, 2);
+		if (ret || !rep || !rep->offsets->update || dvfs[1] > 0x1f ||
+		    dvfs[0] < rep->offsets->dvfs_first ||
+		    dvfs[0] >= rep->offsets->dvfs_first + rep->offsets->dvfs_count) {
+			ret = dev_err_probe(dev, -EINVAL, "invalid apple,dvfs\n");
+			goto err_free;
+		}
+		ent->dvfs = true;
+		ent->dvfs_entry = dvfs[0];
+		ent->dvfs_on = PMP_DVFS_VALID | dvfs[1];
 	}
 
 	ret = of_property_read_string(node, "label", &name);
