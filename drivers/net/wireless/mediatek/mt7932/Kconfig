@@ -14,7 +14,8 @@ config MT7932_FULLMAC
 	  WPA2-PSK, WPA3-SAE or OWE handshake. The driver is a cfg80211 station
 	  on 2.4 GHz, 5 GHz UNII-1/2/2e/3 and country-permitted 6 GHz UNII-5..8.
 	  6 GHz requires SAE-H2E or OWE, MFP and country VLP power data.
-	  Radar (DFS) channels are scanned passively but not joined. Other
+	  Radar (DFS) channels are scanned passively; an AP heard there may be
+	  joined, and is left when it announces a channel switch. Other
 	  MediaTek devices and other machines are not matched.
 
 	  The driver needs the original firmware, the unit's own calibration
@@ -47,4 +48,5 @@ config MT7932_KUNIT_TEST
 	  without radio hardware: receive descriptors, including frames the
 	  hardware did not decrypt, command replies, regulatory snapshots
 	  and country power packages. Also check connection admission, SAE
-	  request encoding and WPA passphrase derivation.
+	  request encoding, WPA passphrase derivation and what is reported
+	  when a move to another AP lands, fails or is cancelled.

@@ -388,6 +388,29 @@ bool dcp_audiosrv_link_on(struct device *dev, u64 gen)
 	return asrv->open_srv && asrv->open_gen == gen && asrv->link_gen == gen;
 }
 
+/* open_lock pins the client; the endpoint can replace its published instance. */
+static bool av_audiosrv_open_published(struct audiosrv_data *asrv)
+{
+	lockdep_assert_held(&asrv->open_lock);
+	guard(rwsem_read)(&asrv->srv_rwsem);
+	return asrv->open_srv && asrv->srv == asrv->open_srv &&
+	       asrv->gen == asrv->open_gen;
+}
+
+bool dcp_audiosrv_link_live(struct device *dev)
+{
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link_live, dev);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
+	if (!asrv)
+		return false;
+	guard(mutex)(&asrv->open_lock);
+	return asrv->link_gen == asrv->open_gen && av_audiosrv_open_published(asrv);
+}
+
 /*
  * The link commands of the 14.7 external role's audio service, the native
  * audio driver's: prepare, start, stop and complete all take the selected
@@ -433,6 +456,11 @@ int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 	scoped_guard(mutex, &asrv->open_lock) {
 		if (!asrv->open_srv)
 			return -ENODEV;
+		if (op == DCP_AUDIO_LINK_PREPARE) {
+			asrv->link_gen = 0;
+			if (!av_audiosrv_open_published(asrv))
+				return -ENODEV;
+		}
 		/* A link ends on the instance it was prepared on; one gone took it along. */
 		if (op != DCP_AUDIO_LINK_PREPARE && asrv->link_gen != asrv->open_gen)
 			return -ENODEV;
@@ -445,8 +473,11 @@ int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 			dev_err(dev, "audiosrv: link method %u answered %#x\n", command, status);
 			return -EIO;
 		}
-		if (op == DCP_AUDIO_LINK_PREPARE)
+		if (op == DCP_AUDIO_LINK_PREPARE) {
+			if (!av_audiosrv_open_published(asrv))
+				return -ENODEV;
 			asrv->link_gen = asrv->open_gen;
+		}
 	}
 	return 0;
 }
@@ -1010,9 +1041,28 @@ int avep_init(struct apple_dcp *dcp)
 #endif
 	}
 
+	/*
+	 * Only a processor whose port@0 links an audio device has DP/HDMI
+	 * audio to start. Look before the firmware: a processor without one
+	 * (an internal panel's, or one whose firmware has no audio service
+	 * here, such as H17P) stays as it is without hdmi_audio, quietly.
+	 */
+	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
+	if (endpoint) {
+		audio_node = of_graph_get_remote_port_parent(endpoint);
+		of_node_put(endpoint);
+	}
+	if (!audio_node || !of_device_is_available(audio_node)) {
+		of_node_put(audio_node);
+		dev_dbg(dev, "No audio support\n");
+		return 0;
+	}
+
 	audiosrv_data = devm_kzalloc(dcp->dev, sizeof(*audiosrv_data), GFP_KERNEL);
-	if (!audiosrv_data)
+	if (!audiosrv_data) {
+		of_node_put(audio_node);
 		return -ENOMEM;
+	}
 	init_rwsem(&audiosrv_data->srv_rwsem);
 	mutex_init(&audiosrv_data->plug_lock);
 
@@ -1037,6 +1087,7 @@ int avep_init(struct apple_dcp *dcp)
 			break;
 		}
 #endif
+		of_node_put(audio_node);
 		dev_err(dcp->dev, "Audio not supported for firmware\n");
 		return -ENODEV;
 	}
@@ -1048,17 +1099,6 @@ int avep_init(struct apple_dcp *dcp)
 #endif
 	audiosrv_data->works_live = true;
 	dcp->audiosrv = audiosrv_data;
-
-	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
-	if (endpoint) {
-		audio_node = of_graph_get_remote_port_parent(endpoint);
-		of_node_put(endpoint);
-	}
-	if (!audio_node || !of_device_is_available(audio_node)) {
-		of_node_put(audio_node);
-		dev_info(dev, "No audio support\n");
-		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
-	}
 
 	audio_pdev = of_find_device_by_node(audio_node);
 	of_node_put(audio_node);

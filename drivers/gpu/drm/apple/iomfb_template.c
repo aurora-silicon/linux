@@ -512,6 +512,68 @@ DCP_THUNK_INOUT(dcp_set_parameter_dcp, dcpep_set_parameter_dcp,
 DCP_THUNK_INOUT(dcp_enable_disable_video_power_savings,
 		dcpep_enable_disable_video_power_savings, u32, int);
 
+#if !DCP_FW_DESKTOP_26(DCP_FW_VER)
+static void dcp_external_hint_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	if (out) {
+		WRITE_ONCE(wait->status, *(u32 *)out);
+		WRITE_ONCE(wait->replied, true);
+	}
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/*
+ * After every mode set on an external display macOS sends IOMFB
+ * parameters 3 and 6 (16.16): 3 at 1.0, and 6 at 1.0 for an SDR colour
+ * mode or 2.0 for a PQ one.  Send the same, after the mode set.  Only the
+ * H17P external path does so for now: the desktop 26.x external processors
+ * have not been checked with an HDR display yet.
+ */
+static void dcp_external_hdr_hints(struct apple_dcp *dcp, bool pq)
+{
+	const u32 hints[][2] = {
+		{ 3, 0x10000 },
+		{ 6, pq ? 0x20000 : 0x10000 },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(hints); i++) {
+		struct dcp_set_parameter_dcp param = {
+			.param = hints[i][0],
+			.value = { hints[i][1] },
+			.count = 1,
+		};
+		struct dcp_wait_cookie *cookie;
+		unsigned long left;
+
+		cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
+		if (!cookie)
+			return;
+		init_completion(&cookie->done);
+		kref_init(&cookie->refcount);
+		kref_get(&cookie->refcount);
+		dcp_set_parameter_dcp(dcp, false, &param, dcp_external_hint_done,
+				      cookie);
+		left = wait_for_completion_timeout(&cookie->done,
+						   msecs_to_jiffies(500));
+		if (!left || !READ_ONCE(cookie->replied) ||
+		    READ_ONCE(cookie->status))
+			dev_warn(dcp->dev,
+				 "IOMFB parameter %u = %#x not taken (%s %u)\n",
+				 param.param, param.value[0],
+				 left ? "status" : "timeout",
+				 READ_ONCE(cookie->status));
+		else
+			dev_dbg(dcp->dev, "IOMFB parameter %u = %#x\n",
+				param.param, param.value[0]);
+		kref_put(&cookie->refcount, release_wait_cookie);
+	}
+}
+#endif
+
 DCP_THUNK_OUT(dcp_is_main_display, dcpep_is_main_display, u32);
 
 /* DCP callback handlers */
@@ -3544,6 +3606,8 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		dcp_external_hdr_hints(dcp, dcp->output_pq);
 
 	return 0;
 }
