@@ -92,6 +92,15 @@ enum ane_fw_sleep_path {
 	ANE_SLEEP_FW_BACKEND,
 };
 
+/*
+ * The device binds for the staged backend (H17): the engine is started by
+ * the backend, the bound device carries its power domain and sleep callbacks.
+ */
+static inline bool ane_fw_platform_staged(const struct ane_fw_platform *platform)
+{
+	return platform && platform->owner == ANE_FW_OWNER_EXCLAVE;
+}
+
 static inline enum ane_fw_sleep_path
 ane_fw_sleep_path(const struct ane_fw_platform *platform)
 {
@@ -105,6 +114,8 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 int ane_fw_platform_probe(struct platform_device *pdev,
 			  const struct ane_fw_platform *soc);
 void ane_fw_platform_remove(struct platform_device *pdev);
+int ane_fw_platform_suspend(struct device *dev);
+int ane_fw_platform_resume(struct device *dev);
 int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc);
 void ane_h16_backend_remove(struct platform_device *pdev);
