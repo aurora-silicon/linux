@@ -88,7 +88,8 @@ impl Attachments {
 // Commands stay inline in the submission plan, avoiding an allocation per render pass.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
-    Render(uapi::drm_asahi_cmd_render, [Attachments; 2], [RayQueryStage; 2]),
+    /// With the render storage declarations in force (`DRM_ASAHI_SET_RENDER_RESOURCES`), if any.
+    Render(uapi::drm_asahi_cmd_render, [Attachments; 2], [RayQueryStage; 2], Option<RenderDeclared>),
     /// With the storage declarations in force (`DRM_ASAHI_SET_COMPUTE_RESOURCES`), if any.
     Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables, Option<m5::compute::Declared>),
 }
@@ -108,6 +109,44 @@ pub(crate) struct Parser<'a> {
     /// Whether this submission path takes compute storage declarations (the M5 one).
     resources: bool,
     declared: Option<m5::compute::Declared>,
+    render_declared: Option<RenderDeclared>,
+}
+
+/// Render programs one SET_RENDER_RESOURCES record declares at most.
+pub(crate) const MAX_RENDER_PROGRAMS: usize = 64;
+
+/// A render pass's linked-program storage declarations (`DRM_ASAHI_SET_RENDER_RESOURCES`):
+/// every vertex and fragment program of the pass, background and end-of-tile included, planned
+/// together ([`m5::compute::Gpu::plan_render`]).
+#[derive(Clone, Copy)]
+pub(crate) struct RenderDeclared {
+    programs: [uapi::drm_asahi_render_program; MAX_RENDER_PROGRAMS],
+    count: usize,
+}
+
+impl RenderDeclared {
+    /// Parses a payload of 40-byte records, which need not be eight-byte aligned. Stages and
+    /// flags are checked by the plan.
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let size = size_of::<uapi::drm_asahi_render_program>();
+        let count = bytes.len() / size;
+        if bytes.len() % size != 0 || count > MAX_RENDER_PROGRAMS {
+            return Err(EINVAL);
+        }
+        let mut declared = Self {
+            programs: [uapi::drm_asahi_render_program::default(); MAX_RENDER_PROGRAMS],
+            count,
+        };
+        let mut reader = Reader::new(bytes);
+        for program in &mut declared.programs[..count] {
+            *program = reader.read()?;
+        }
+        Ok(declared)
+    }
+
+    pub(crate) fn programs(&self) -> &[uapi::drm_asahi_render_program] {
+        &self.programs[..self.count]
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -118,6 +157,7 @@ impl<'a> Parser<'a> {
             attachments: [Attachments::EMPTY; 3],
             resources: variant.submission == super::fw::variant::Submission::M5HostCommand,
             declared: None,
+            render_declared: None,
         }
     }
 
@@ -149,6 +189,7 @@ impl<'a> Parser<'a> {
                             payload(&bytes[..bytes.len().min(RENDER_BASE_SIZE)])?,
                             [self.attachments[0], self.attachments[1]],
                             RayQueryStage::parse_pair(bytes.get(RENDER_BASE_SIZE..).unwrap_or(&[]))?,
+                            self.render_declared,
                         )
                     } else {
                         self.counts[1] += 1;
@@ -178,6 +219,13 @@ impl<'a> Parser<'a> {
                         return Err(EINVAL);
                     }
                     self.declared = Some(declarations(bytes)?);
+                }
+                // Likewise for the renders that follow; it advances neither command index.
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_RENDER_RESOURCES if self.resources => {
+                    if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] {
+                        return Err(EINVAL);
+                    }
+                    self.render_declared = Some(RenderDeclared::parse(bytes)?);
                 }
                 _ => return Err(EINVAL),
             }
@@ -339,6 +387,9 @@ fn surface(
 pub(crate) enum Validated {
     Render {
         long_job: bool,
+        /// The plan of an M5 pass ([`m5::compute::Gpu::plan_render`]); `None` on the other
+        /// submission paths.
+        plan: Option<m5::compute::RenderPlan>,
         pass: RenderPass,
         ray_query: [RayQueryStage; 2],
         attachments: [Attachments; 2],
@@ -376,7 +427,7 @@ impl Validated {
 impl Payload {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
-            Self::Render(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Render(cmd, _, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
             Self::Compute(cmd, _, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
         }
     }
@@ -389,10 +440,14 @@ impl Payload {
         space: &impl AddressSpace,
     ) -> Result<Validated> {
         match self {
-            Self::Render(cmd, attachments, ray_query) => {
-                variant.submission.accepts(super::job::Engine::Render).inspect_err(|_| {
-                    kernel::pr_warn_once!("G17: render command refused: this firmware profile has no render encoding\n");
-                })?;
+            Self::Render(cmd, attachments, ray_query, declared) => {
+                // M5 render is new: name each refusal (the doorbell path keeps its silence).
+                let bad = |what: &str| {
+                    if m5.is_some() {
+                        pr_warn!("G17 M5: render command refused: {}\n", what);
+                    }
+                    EINVAL
+                };
                 if cmd.flags & !RENDER_FLAGS != 0
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -402,13 +457,15 @@ impl Payload {
                         (16, 16) | (32, 16) | (32, 32)
                     )
                 {
-                    return Err(EINVAL);
+                    return Err(bad("flags, size or tile"));
                 }
-                let samples_log2 = match cmd.samples {
-                    1 => 0,
-                    2 => 1,
-                    4 => 2,
-                    _ => return Err(EINVAL),
+                // M5 Mesa offers 8x (S's validator admits it); the M5 subset decides below.
+                let samples_log2 = match (cmd.samples, m5.is_some()) {
+                    (1, _) => 0,
+                    (2, _) => 1,
+                    (4, _) => 2,
+                    (8, true) => 3,
+                    _ => return Err(bad("sample count")),
                 };
                 if u64::from(cmd.sample_size_B)
                     * u64::from(cmd.utile_width_px)
@@ -420,32 +477,32 @@ impl Payload {
                     || cmd.isp_scissor_base == 0
                     || cmd.isp_scissor_base & 7 != 0
                 {
-                    return Err(EINVAL);
+                    return Err(bad("tile buffer, VDM stream or scissor"));
                 }
-                require_range(space, cmd.vdm_ctrl_stream_base, 4, Access::Read)?;
-                require_range(space, cmd.isp_scissor_base, 8, Access::Read)?;
+                require_range(space, cmd.vdm_ctrl_stream_base, 4, Access::Read).map_err(|_| bad("VDM stream mapping"))?;
+                require_range(space, cmd.isp_scissor_base, 8, Access::Read).map_err(|_| bad("scissor mapping"))?;
                 for (va, access) in [
                     (cmd.isp_dbias_base, Access::Read),
                     (cmd.isp_oclqry_base, Access::Write),
                 ] {
                     if va != 0 {
                         if va & 7 != 0 {
-                            return Err(EINVAL);
+                            return Err(bad("depth-bias or occlusion-query alignment"));
                         }
-                        require_range(space, va, 8, access)?;
+                        require_range(space, va, 8, access).map_err(|_| bad("depth-bias or occlusion-query mapping"))?;
                     }
                 }
-                let depth = surface(space, &cmd.depth, cmd.layers)?;
-                let stencil = surface(space, &cmd.stencil, cmd.layers)?;
-                sampler(space, cmd.sampler_heap, cmd.sampler_count.into())?;
+                let depth = surface(space, &cmd.depth, cmd.layers).map_err(|_| bad("depth surface"))?;
+                let stencil = surface(space, &cmd.stencil, cmd.layers).map_err(|_| bad("stencil surface"))?;
+                sampler(space, cmd.sampler_heap, cmd.sampler_count.into()).map_err(|_| bad("samplers"))?;
                 if !helper_is_empty(&cmd.vertex_helper) || !helper_is_empty(&cmd.fragment_helper) {
-                    return Err(EINVAL);
+                    return Err(bad("helper programs"));
                 }
                 for program in [&cmd.bg, &cmd.eot, &cmd.partial_bg, &cmd.partial_eot] {
-                    window.program(space, program.usc)?;
+                    window.program(space, program.usc).map_err(|_| bad("tile program"))?;
                 }
                 for list in attachments {
-                    list.validate(space)?;
+                    list.validate(space).map_err(|_| bad("attachments"))?;
                 }
                 let pass = RenderPass {
                     width: cmd.width_px.into(),
@@ -501,14 +558,21 @@ impl Payload {
                         return Err(refuse_ray_traversal());
                     }
                     if stage.intersection.enabled() {
-                        require_range(space, stage.intersection.pool, stage.intersection.pool_bytes, Access::Read)?;
+                        require_range(space, stage.intersection.pool, stage.intersection.pool_bytes, Access::Read)
+                            .map_err(|_| bad("intersection pool"))?;
                         let code = stage.intersection.default_program & 0x0000_ffff_ffff_ffff;
-                        if code != 0 { require_range(space, code, 64, Access::Read)?; }
+                        if code != 0 { require_range(space, code, 64, Access::Read).map_err(|_| bad("intersection program"))?; }
                     }
                 }
+                let plan = match m5 {
+                    Some(gpu) => Some(m5_render(&pass, ray_query, gpu, declared)?),
+                    None if declared.is_some() => return Err(bad("render declarations")),
+                    None => None,
+                };
                 Ok(Validated::Render {
                     long_job: super::timeout::select(false,
                         ray_query.map(|stage| stage.intersection.enabled()), false),
+                    plan,
                     pass,
                     ray_query: *ray_query,
                     attachments: *attachments,
@@ -516,7 +580,6 @@ impl Payload {
                 })
             }
             Self::Compute(cmd, attachments, intersection, declared) => {
-                variant.submission.accepts(super::job::Engine::Compute)?;
                 let as_build = super::timeout::as_build(cmd.flags).ok_or(EINVAL)?;
                 if cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
@@ -592,6 +655,40 @@ fn m5_compute(
         return Err(EOPNOTSUPP);
     }
     gpu.plan(declared.ok_or(EINVAL)?)
+}
+
+/// The M5 subset of a render pass, after the common checks, and the plan of its declarations.
+/// The first admitted form: one layer, one sample, stored color without depth or
+/// stencil, few or many primitives; no ray queries, scratch or helper programs. The fragment
+/// attachment list is validated and not yet encoded: the M5 kick carries no cache-maintenance
+/// table. Other forms are admitted as they qualify.
+fn m5_render(
+    pass: &RenderPass,
+    ray_query: &[RayQueryStage; 2],
+    gpu: &m5::compute::Gpu,
+    declared: &Option<RenderDeclared>,
+) -> Result<m5::compute::RenderPlan> {
+    let single_sample = pass.layers == 1
+        && pass.samples_log2 == 0
+        && pass.sample_size % 8 == 0
+        && u32::from(pass.sample_size) * u32::from(pass.utile_width) * u32::from(pass.utile_height)
+            <= m5::compute::MAX_IMAGEBLOCK_BYTES;
+    if !single_sample
+        || pass.zls_control != 0
+        || pass.depth.va != 0
+        || pass.stencil.va != 0
+        || ray_query.iter().any(|stage| stage.intersection.enabled() || stage.scratch.enabled())
+    {
+        kernel::pr_warn_once!("G17 M5: render form outside the M5 subset refused\n");
+        return Err(EOPNOTSUPP);
+    }
+    let declared = declared.as_ref().ok_or_else(|| {
+        pr_warn!("G17 M5: render command refused: no SET_RENDER_RESOURCES\n");
+        EINVAL
+    })?;
+    gpu.plan_render(declared.programs()).inspect_err(|error| {
+        pr_warn!("G17 M5: render command refused: plan of {} programs: {:?}\n", declared.programs().len(), error)
+    })
 }
 
 /// Ray-traversal work on a firmware build that does not run it ([`super::fw::Variant`]).

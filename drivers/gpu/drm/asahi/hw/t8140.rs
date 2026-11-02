@@ -196,6 +196,8 @@ pub(crate) mod dynamic {
         canonical: 0x70_0400_0000..0x70_8000_0000,
         // Client-private compute and render backing after the shared queue arena.
         private: 0x70_8000_0000..0x71_0000_0000,
+        // The user window the compact aliases of `resources` lie in.
+        compact: super::resources::USER_BASE..super::resources::USER_END,
         pre_run_tables: &[],
         pre_run_links: 0,
         clients: Clients::G17P,

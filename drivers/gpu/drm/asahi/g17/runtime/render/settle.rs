@@ -21,6 +21,13 @@ impl Backend {
             let Some(firmware) = (*state).as_deref_mut() else {
                 return Ok(());
             };
+            if self.shared.m5.is_some() {
+                // The M5 pair keeps a failed pass pinned (`queue::m5_render`).
+                firmware.queues.timeout_m5_render(self.owner, packet, &mut deferred)?;
+                drop(state);
+                deferred.finish();
+                return Ok(());
+            }
             if firmware.queues.defer_render_timeout(packet, ETIMEDOUT) {
                 return Ok(());
             }

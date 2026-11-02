@@ -633,6 +633,8 @@ unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render {}
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_compute {}
 unsafe impl AnyBitPattern for uapi::drm_asahi_attachment {}
 unsafe impl AnyBitPattern for uapi::drm_asahi_compute_program {}
+// SAFETY: The record contains only fixed-width unsigned integers.
+unsafe impl AnyBitPattern for uapi::drm_asahi_render_program {}
 
 fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::Attachments> {
     const STRIDE: usize = core::mem::size_of::<uapi::drm_asahi_attachment>();

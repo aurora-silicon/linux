@@ -129,6 +129,12 @@ pub(crate) struct Viewport {
     scale_z: u32,
 }
 impl Viewport {
+    /// With control word `control` (M5: 0x3000; S `with_control`).
+    pub(crate) fn with_control(mut self, control: u32) -> Self {
+        self.unk_0 = control;
+        self
+    }
+
     /// Refresh only defined words; firmware-owned gaps retain their contents.
     pub(crate) fn apply(&self, destination: &mut Self) {
         destination.unk_0 = self.unk_0;

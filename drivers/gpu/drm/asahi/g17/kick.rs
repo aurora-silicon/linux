@@ -398,7 +398,7 @@ mod accounting_tests {
 // Aliases drop before their backing. A compute queue is allocated low first;
 // a render queue is allocated high first.
 enum Backing {
-    Compute {
+    Lower {
         high: mmu::KernelMapping,
         low: KernelObject,
     },
@@ -512,8 +512,8 @@ pub(crate) struct PreparedKick<'a> {
 
 impl PreparedKick<'_> {
     /// Publish translation updates after the queue configuration pointer and before its entry.
-    pub(crate) fn prepare_compute_install(&self) -> Result {
-        self.queue.prepare_compute_install()
+    pub(crate) fn prepare_lower_install(&self) -> Result {
+        self.queue.prepare_lower_install()
     }
 
     /// Writes and fences the complete entry, then advances host state. The
@@ -535,10 +535,10 @@ impl PreparedKick<'_> {
 }
 
 impl Queue {
-    pub(crate) fn compute(alloc: &Allocator<'_>, id: Id) -> Result<Self> {
-        if id.engine != DataMaster::Compute {
-            return Err(EINVAL);
-        }
+    /// A ring in the canonical lower arena with an upper firmware alias: A18 compute queues
+    /// and every M5 queue (S `kick::Queue::compute`; an M5 render pair's queues are never
+    /// released, so their storage needs no stock).
+    pub(crate) fn lower(alloc: &Allocator<'_>, id: Id) -> Result<Self> {
         let low = alloc.lower(
             KICK_RING_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -553,7 +553,7 @@ impl Queue {
         )?;
         fence(Ordering::SeqCst);
         Ok(Self {
-            backing: Backing::Compute { high, low },
+            backing: Backing::Lower { high, low },
             id,
             timestamp: KickTimestamp::FIRST,
             previous: None,
@@ -654,19 +654,19 @@ impl Queue {
     }
     pub(crate) fn low_va(&self) -> u64 {
         match &self.backing {
-            Backing::Compute { low, .. } => low.gpu_va(),
+            Backing::Lower { low, .. } => low.gpu_va(),
             Backing::Render(ring) => ring.storage.low.iova(),
         }
     }
     pub(crate) fn firmware_va(&self) -> u64 {
         match &self.backing {
-            Backing::Compute { high, .. } => high.iova(),
+            Backing::Lower { high, .. } => high.iova(),
             Backing::Render(ring) => ring.storage.high.gpu_va(),
         }
     }
     fn object(&mut self) -> &mut KernelObject {
         match &mut self.backing {
-            Backing::Compute { low, .. } => low,
+            Backing::Lower { low, .. } => low,
             Backing::Render(ring) => &mut ring.storage.high,
         }
     }
@@ -679,7 +679,7 @@ impl Queue {
     /// Reuse a permanent client view only when every page names this ring.
     pub(crate) fn prepare_client_alias(&self, vm: &mmu::Vm) -> Result<Option<mmu::KernelMapping>> {
         let object = match &self.backing {
-            Backing::Compute { low, .. } => low,
+            Backing::Lower { low, .. } => low,
             Backing::Render(ring) => &ring.storage.high,
         };
         object.prepare_alias(vm, self.low_va(), mmu::PROT_GPU_SHARED_RW, true)
@@ -688,8 +688,8 @@ impl Queue {
     /// Both aliases are owned mappings of the same full ring. Publish their
     /// page-table updates to each live translation regime before installation:
     /// every context whose TTBAT names the canonical low or the firmware root.
-    pub(crate) fn prepare_compute_install(&self) -> Result {
-        let Backing::Compute { high, low } = &self.backing else {
+    pub(crate) fn prepare_lower_install(&self) -> Result {
+        let Backing::Lower { high, low } = &self.backing else {
             return Err(EINVAL);
         };
         low.publish_to_contexts()?;

@@ -536,7 +536,7 @@ pub(crate) struct Backing {
 impl Backing {
     pub(crate) fn new(alloc: &Allocator<'_>, backing: PoolBacking) -> Result<Self> {
         let PoolBacking { pool, id } = backing;
-        let kick = kick::Queue::compute(alloc, id)?;
+        let kick = kick::Queue::lower(alloc, id)?;
         Ok(Self { pool, kick })
     }
 }
@@ -2264,7 +2264,7 @@ impl Queue {
                 }
             }
             if first {
-                prepared_kick.prepare_compute_install()?;
+                prepared_kick.prepare_lower_install()?;
             }
             prepared_kick.commit();
             self.submitted = self.submitted.checked_add(1).ok_or(EOVERFLOW)?;

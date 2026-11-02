@@ -110,6 +110,7 @@ pub(crate) const LAYOUT: VmLayout = VmLayout {
     upper_offset: UPPER_OFFSET,
     canonical: CANONICAL,
     private: CLIENT_PRIVATE,
+    compact: COMPACT,
     pre_run_tables: &PRE_RUN_TABLES,
     pre_run_links: PRE_RUN_LINKS,
     clients: Clients::M5,

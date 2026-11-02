@@ -52,17 +52,11 @@ impl InitData {
             CpuMap::WriteCombined,
         )?)?;
         for index in 0..m::M5_25G76_COMPLETION_QUEUE_COUNT {
-            // After initialization the host only reads completion records; the compute ring
-            // is the one it scans.
-            let cpu = if index == 0 {
-                CpuMap::WriteBack
-            } else {
-                CpuMap::WriteCombined
-            };
+            // After initialization the host only reads completion records, from every ring.
             self.m5_completions[index] = self.add(lower(
                 COMPLETION_LOW + index as u64 * COMPLETION_STRIDE,
                 m::M5_25G76_COMPLETION_BACKING_SIZE,
-                cpu,
+                CpuMap::WriteBack,
             )?)?;
         }
         self.m5 = true;
@@ -267,10 +261,10 @@ impl InitData {
 }
 
 impl InitData {
-    /// Installs a fresh M5 compute pool's page-pool (UMA) descriptor row at `slot`, before any
+    /// Installs a fresh M5 pool's page-pool (UMA) descriptor row at `slot`, before any
     /// queue configuration names the pool. An installed row keeps its firmware-owned counters
     /// and must never be rewritten.
-    pub(in crate::g17) fn install_m5_compute_pool(&self, slot: u16, words: [u64; 8]) -> Result {
+    pub(in crate::g17) fn install_m5_pool(&self, slot: u16, words: [u64; 8]) -> Result {
         const ROW: usize = 64;
         if !self.m5 || slot == 0 || slot > u16::from(crate::g17::fw::kick::QID_MAX) + 1 {
             return Err(EINVAL);
@@ -281,6 +275,25 @@ impl InitData {
         for (index, word) in words.into_iter().enumerate() {
             object
                 .dword(offset + index * 8)?
+                .store(word, Ordering::Relaxed);
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Installs a parameter buffer's descriptor row (16 bytes; S `set_m5_pb`) at `slot`, the
+    /// buffer ID a tiling configuration names, before any configuration names it.
+    pub(in crate::g17) fn install_m5_pb(&self, slot: u8, words: [u32; 4]) -> Result {
+        const ROW: usize = 16;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let object = self.object(self.pb)?;
+        let offset = usize::from(slot) * ROW;
+        object.pointer(offset, ROW)?;
+        for (index, word) in words.into_iter().enumerate() {
+            object
+                .word(offset + index * 4)?
                 .store(word, Ordering::Relaxed);
         }
         fence(Ordering::SeqCst);

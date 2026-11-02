@@ -1563,3 +1563,80 @@ impl FragmentSlot {
         Ok(Some(table))
     }
 }
+
+impl Deflake {
+    /// M5: the sub-buffers at `+0xc0` and `+0x980` (S `g17/fw/m5/render_registers.rs`, as on
+    /// G17S); the viewport words lie at `+0x9c0`, written by the host.
+    pub(crate) const M5: Deflake = Deflake {
+        sub: [0xc0, 0x980],
+        viewport: false,
+    };
+}
+
+/// The A18 Pro's register programs without their SCS enable entries: the common lists the M5
+/// register adaptation starts from (S `RegisterPrograms`, `g17/fw/m5/render_registers.rs`). M5
+/// brackets SCS itself and binds its scratch words from the pass's plan. Keep this in the caller's
+/// heap workspace when constructing descriptors.
+pub(crate) struct CommonPrograms {
+    pub(crate) ta: [RegisterWrite; TA_REGISTERS],
+    pub(crate) fragment: [RegisterWrite; FRAGMENT_REGISTERS],
+    pub(crate) store: [RegisterWrite; PARTIAL_STORE_REGISTERS],
+    pub(crate) resume: [RegisterWrite; PARTIAL_RESUME_REGISTERS],
+    pub(crate) load: [RegisterWrite; PARTIAL_LOAD_REGISTERS],
+}
+// SAFETY: All members contain only integer register writes.
+unsafe impl Zeroable for CommonPrograms {}
+
+/// `list` without its entry at `index`, which must be the SCS enable.
+fn without_scs<const N: usize, const M: usize>(
+    list: &[RegisterWrite; N],
+    index: usize,
+) -> Result<[RegisterWrite; M]> {
+    if N != M + 1 || list[index].reg != SCS_ENABLE {
+        return Err(EINVAL);
+    }
+    let mut out = [RegisterWrite::new(0, 0); M];
+    for (slot, write) in out
+        .iter_mut()
+        .zip(list.iter().enumerate().filter(|(n, _)| *n != index).map(|(_, w)| w))
+    {
+        *slot = *write;
+    }
+    Ok(out)
+}
+
+impl CommonPrograms {
+    /// M5 partial phases add only their own depth/stencil direction while
+    /// preserving the pass's existing operations and surface layout bits.
+    pub(crate) fn write_m5(&mut self, args: &RenderArgs<'_>) -> Result {
+        if args.ray_query.iter().any(|stage| stage.scratch.enabled()) {
+            return Err(EINVAL);
+        }
+        let g = Geometry::new(args.pass)?;
+        let w = PassWords::new(args.pass)?;
+        self.ta = without_scs(&ta_registers(args, &g, &w)?, TA_SCS_ENABLE_INDEX)?;
+        self.fragment = without_scs(&fragment_registers(args, &g, &w), FRAGMENT_SCS_ENABLE_INDEX)?;
+        self.store = partial_store_registers(args.pass, &w);
+        self.resume = partial_resume_registers(args.pass, &w);
+        self.load = partial_load_registers(args.pass, &w);
+        const LOAD: u64 = (1 << 14) | (1 << 15);
+        const STORE: u64 = (1 << 18) | (1 << 19);
+        for register in &mut self.store {
+            if register.reg == 0x15319 {
+                register.value = (register.value & !LOAD) | (args.pass.zls_control & LOAD);
+            } else if register.reg == 0x10039
+                && (args.pass.depth.va != 0 || args.pass.stencil.va != 0)
+            {
+                // A partial store forces empty tiles when
+                // either stored ZLS address (descriptor 0x6a8/0x6b8) exists.
+                register.value |= TILE_CONFIG_PROCESS_EMPTY_TILES;
+            }
+        }
+        for register in &mut self.load {
+            if register.reg == 0x15319 {
+                register.value = (register.value & !STORE) | (args.pass.zls_control & STORE);
+            }
+        }
+        Ok(())
+    }
+}

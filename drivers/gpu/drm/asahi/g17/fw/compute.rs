@@ -62,6 +62,15 @@ impl ScratchRequest {
     /// Native tail reservation when enabled.
     const TAIL_ENABLED: u64 = 8;
 
+    /// No scratch: the disabled-scratch words.
+    pub(crate) const NONE: Self = Self {
+        pages: 0,
+        window: Self::WINDOW_DISABLED,
+        stack: Self::STACK_DISABLED,
+        driver: 0,
+        tail: 0,
+    };
+
     /// Payload-free layouts request no scratch even if depth/cliques are set.
     /// Otherwise derive the Gen1 end and round it up with the native two-page
     /// guard; the per-register words are the native formulas, so they are
@@ -125,7 +134,7 @@ impl ScratchRequest {
         self.stack
     }
 
-    fn driver_word(self) -> u64 {
+    pub(crate) fn driver_word(self) -> u64 {
         self.driver
     }
 

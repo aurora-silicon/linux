@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! M5 compute queue encodings (linux-aurora t6050-gpu's g17/fw/m5/queue.rs): the queue record,
-//! the current-kick notification and the host command port transaction. The configuration record
-//! itself is the common [`QueueConfig`](super::super::queue::QueueConfig).
+//! M5 queue encodings (linux-aurora t6050-gpu's g17/fw/m5/queue.rs): the queue record, the
+//! current-kick notification, the M5 meanings of the common [`QueueConfig`] and the host command
+//! port transaction, for compute queues and render pairs.
 
 use super::super::{
     kick::{KickTimestamp, QID_MAX},
-    queue::{DataMaster, KickPredecessor, Policy, QueueRecordArgs},
+    queue::{
+        DataMaster, KickPredecessor, Policy, QueueConfig, QueueConfigArgs, QueueConfigTarget,
+        QueueRecordArgs,
+    },
 };
 use kernel::prelude::*;
 
@@ -100,11 +103,36 @@ impl Notification {
     }
 }
 
-/// A compute queue transaction on the M5 host command port: configuration of the queue at its
-/// first use, then the advance that makes the new kick runnable.
+/// The M5 meanings of fields in the common configuration record (S `ConfigProfile`): soft faults
+/// enabled, the extended flag, and for a bound tiling queue the parameter manager's slot in
+/// place of the paired fragment QID.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ConfigProfile {
+    pub(crate) soft_fault_enabled: bool,
+    pub(crate) extended: bool,
+    pub(crate) parameter_manager: Option<u32>,
+}
+
+/// The configuration record of `args` with the M5 meanings of `profile`.
+pub(crate) fn config(args: &QueueConfigArgs, profile: ConfigProfile) -> Result<QueueConfig> {
+    if profile.parameter_manager.is_some() && !matches!(args.target, QueueConfigTarget::Tiling(_)) {
+        return Err(EINVAL);
+    }
+    let mut out = QueueConfig::new(args)?;
+    out.unk_66 = u16::from(profile.soft_fault_enabled);
+    out.unk_68[2..6].copy_from_slice(&u32::from(profile.extended).to_le_bytes());
+    if let Some(manager) = profile.parameter_manager {
+        out.fragment_qid = manager;
+    }
+    Ok(out)
+}
+
+/// A queue transaction on the M5 host command port: the configuration of each queue at its first
+/// use, then the advances that make the new kicks runnable. Compute queues run alone; a render
+/// pair configures and advances its fragment queue, then its tiling queue.
 #[derive(Clone, Copy)]
 pub(crate) struct HardwareSubmission {
-    writes: [(usize, u64); 8],
+    writes: [(usize, u64); 16],
     count: usize,
 }
 
@@ -121,40 +149,82 @@ impl HardwareSubmission {
     const ADVANCE: u64 = 0x10;
     const ADDRESS_MASK: u64 = 0x0000_07ff_ffff_ffe0;
 
-    /// The transaction of compute queue `qid`, whose kick ring is at `va`, at priority class
-    /// `priority`. With `configure` the queue is invalidated, configured and made valid first;
-    /// each validity mask is stored high before low.
-    pub(crate) fn compute(qid: u8, va: u64, priority: u8, configure: bool) -> Result<Self> {
+    fn push(&mut self, writes: &[(usize, u64)]) -> Result {
+        let end = self.count.checked_add(writes.len()).ok_or(EINVAL)?;
+        self.writes
+            .get_mut(self.count..end)
+            .ok_or(EINVAL)?
+            .copy_from_slice(writes);
+        self.count = end;
+        Ok(())
+    }
+
+    /// Invalidates queue `qid` of `engine`, whose kick ring is at `va`, configures it at
+    /// priority class `priority` and makes it valid; each validity mask is stored high before
+    /// low.
+    fn configure(&mut self, qid: u8, va: u64, engine: DataMaster, priority: u8) -> Result {
         let tag = Self::configuration_tag(qid)?;
         if priority >= Policy::PRIORITIES || va & !Self::ADDRESS_MASK != 0 {
             return Err(EINVAL);
         }
-        let mut writes = [(0, 0); 8];
-        let mut count = 0;
+        let (low, high) = if qid < 64 {
+            (1u64 << qid, 0)
+        } else {
+            (0, 1u64 << (qid - 64))
+        };
+        let completion = (3 * (4 - u64::from(priority)) + 0x3fe).wrapping_shl(54);
+        let payload = ((engine as u64 + 1) << 60) | va | completion;
+        self.push(&[
+            (Self::INVALID_HIGH, high),
+            (Self::INVALID_LOW, low),
+            (Self::TAG_PORT, tag),
+            (Self::DATA_PORT, payload),
+            (Self::VALID_HIGH, high),
+            (Self::VALID_LOW, low),
+        ])
+    }
+
+    fn advance(&mut self, qid: u8) -> Result {
+        let tag = Self::configuration_tag(qid)?;
+        self.push(&[(Self::TAG_PORT, tag + Self::ADVANCE), (Self::DATA_PORT, 1)])
+    }
+
+    /// The transaction of compute queue `qid`, whose kick ring is at `va`, at priority class
+    /// `priority`, configured first with `configure`.
+    pub(crate) fn compute(qid: u8, va: u64, priority: u8, configure: bool) -> Result<Self> {
+        let mut out = Self {
+            writes: [(0, 0); 16],
+            count: 0,
+        };
         if configure {
-            let (low, high) = if qid < 64 {
-                (1u64 << qid, 0)
-            } else {
-                (0, 1u64 << (qid - 64))
-            };
-            let completion = (3 * (4 - u64::from(priority)) + 0x3fe).wrapping_shl(54);
-            let payload = ((DataMaster::Compute as u64 + 1) << 60) | va | completion;
-            writes[..6].copy_from_slice(&[
-                (Self::INVALID_HIGH, high),
-                (Self::INVALID_LOW, low),
-                (Self::TAG_PORT, tag),
-                (Self::DATA_PORT, payload),
-                (Self::VALID_HIGH, high),
-                (Self::VALID_LOW, low),
-            ]);
-            count = 6;
+            out.configure(qid, va, DataMaster::Compute, priority)?;
         }
-        writes[count..count + 2]
-            .copy_from_slice(&[(Self::TAG_PORT, tag + Self::ADVANCE), (Self::DATA_PORT, 1)]);
-        Ok(Self {
-            writes,
-            count: count + 2,
-        })
+        out.advance(qid)?;
+        Ok(out)
+    }
+
+    /// The transaction of a render pair, `(qid, kick ring)` of its fragment and tiling queues,
+    /// both configured first with `configure` (S `HardwareSubmission::new`, `advance_pair`).
+    pub(crate) fn render(
+        fragment: (u8, u64),
+        tiling: (u8, u64),
+        priority: u8,
+        configure: bool,
+    ) -> Result<Self> {
+        if fragment.0 == tiling.0 {
+            return Err(EINVAL);
+        }
+        let mut out = Self {
+            writes: [(0, 0); 16],
+            count: 0,
+        };
+        if configure {
+            out.configure(fragment.0, fragment.1, DataMaster::Fragment, priority)?;
+            out.configure(tiling.0, tiling.1, DataMaster::Tiling, priority)?;
+        }
+        out.advance(fragment.0)?;
+        out.advance(tiling.0)?;
+        Ok(out)
     }
 
     /// The tag-port value selecting queue `qid`'s configuration word.

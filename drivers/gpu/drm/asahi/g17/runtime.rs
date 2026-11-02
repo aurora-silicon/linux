@@ -169,22 +169,26 @@ pub(super) struct Registry {
     pub(super) metrics: Arc<MetricsIds>,
     pub(super) qos_ids: Arc<QosIds>,
     pub(super) admission: Arc<admission::Pool>,
-    render: render::RenderState,
+    pub(super) render: render::RenderState,
     identities: queue::Identities,
     compute: KVec<Option<ComputeEntry>>,
     pub(super) compute_building: bool,
     compute_scheduler_building: bool,
     replay_outer_wait: Option<u64>,
     pub(super) observations: compute::retirement::Batch,
-    /// Completion-ring slot where the next compute scan starts.
-    completion_cursor: usize,
-    /// Control word of each completion-ring slot as of the last scan that read it.
+    /// Per compute completion ring, the slot where the next scan starts.
+    completion_cursor: [usize; super::initdata::COMPUTE_COMPLETION_RINGS],
+    /// Control word of each completion-ring slot as of the last scan that read it, ring after
+    /// ring ([`super::initdata::COMPUTE_COMPLETION_SLOTS`] each).
     completion_seen: KVVec<u64>,
     worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
     /// The M5 profile's compute channels, one per logical queue ever created, each retained
     /// from its installation to the end of the firmware session ([`queue::m5`]).
     m5: KVec<KBox<queue::m5::Channel>>,
+    /// Its render pairs, one per logical queue that rendered, retained the same way
+    /// ([`queue::m5_render`]).
+    m5_render: KVec<KBox<queue::m5_render::Pair>>,
 }
 
 impl Registry {
@@ -215,7 +219,11 @@ impl Registry {
                 qids.reserve_initial_render()
             }),
             buffers <- BufferIds::new(),
-            metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
+            // M5 scene metrics are 64 bytes per scene (`buffer::layout::Layout::m5`).
+            metrics: Arc::new(match variant.graph {
+                crate::g17::fw::variant::InitGraph::M5 => MetricsIds::with_stride(64)?,
+                _ => MetricsIds::new(),
+            }, GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
             admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues, renders)?,
             render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
@@ -231,9 +239,10 @@ impl Registry {
             compute_scheduler_building: false,
             replay_outer_wait: None,
             observations: compute::retirement::Batch::new()?,
-            completion_cursor: 0,
+            completion_cursor: [0; super::initdata::COMPUTE_COMPLETION_RINGS],
             completion_seen: {
-                let slots = super::initdata::COMPUTE_COMPLETION_SLOTS;
+                let slots = super::initdata::COMPUTE_COMPLETION_SLOTS
+                    * super::initdata::COMPUTE_COMPLETION_RINGS;
                 let mut seen = KVVec::with_capacity(slots, GFP_KERNEL)?;
                 for _ in 0..slots {
                     seen.push_within_capacity(0).map_err(|_| ENOMEM)?;
@@ -243,6 +252,7 @@ impl Registry {
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
             m5: KVec::new(),
+            m5_render: KVec::new(),
         })
     }
 
@@ -1688,17 +1698,25 @@ impl super::Firmware {
         // the previous scan. A request whose stamp already covers it has its record in the
         // ring; if the scan ended before finding one, read the whole ring once.
         if requested {
+            use super::initdata::{COMPUTE_COMPLETION_RINGS as RINGS, COMPUTE_COMPLETION_SLOTS as SLOTS};
             let observations = &mut registry.observations;
-            let seen = &mut registry.completion_seen;
-            registry.completion_cursor = self.init.fold_compute_completions(
-                registry.completion_cursor,
-                seen,
-                |record| observations.fold(record),
-            )?;
+            for ring in 0..RINGS {
+                let seen = registry.completion_seen.get_mut(ring * SLOTS..(ring + 1) * SLOTS).ok_or(EINVAL)?;
+                registry.completion_cursor[ring] = self.init.fold_compute_completions(
+                    ring,
+                    registry.completion_cursor[ring],
+                    seen,
+                    |record| observations.fold(record),
+                )?;
+            }
             if observations.covered_pending() {
-                registry.completion_cursor = self
-                    .init
-                    .resync_compute_completions(seen, |record| observations.fold_any(record))?;
+                for ring in 0..RINGS {
+                    let seen =
+                        registry.completion_seen.get_mut(ring * SLOTS..(ring + 1) * SLOTS).ok_or(EINVAL)?;
+                    registry.completion_cursor[ring] = self
+                        .init
+                        .resync_compute_completions(ring, seen, |record| observations.fold_any(record))?;
+                }
             }
         }
         let port = &self.port;

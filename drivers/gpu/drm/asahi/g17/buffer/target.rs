@@ -44,7 +44,20 @@ pub(crate) struct Layout {
     gtp: [Option<usize>; 8],
     /// Bytes of the TPC object the command uses.
     tpc_end: usize,
+    pub(crate) tilemap_size: usize,
+    /// M5: the target slices and cluster controls, and the client's compact window, in which the
+    /// target's objects lie ([`Self::with_m5_slices`]).
+    m5: Option<M5Target>,
 }
+
+#[derive(Copy, Clone, Debug)]
+struct M5Target {
+    slices: crate::g17::fw::m5::target::TargetSlices,
+    control: [u64; 3],
+    /// Start and end of the compact window.
+    compact: [u64; 2],
+}
+
 impl Layout {
     pub(crate) fn new(
         pass: &RenderPass,
@@ -136,9 +149,32 @@ impl Layout {
             tvb_blocks,
             gtp,
             tpc_end,
+            tilemap_size,
+            m5: None,
         })
     }
+    /// The M5 layout of this geometry: `groups` active tiling groups whose auxiliary tables have
+    /// `segments` segments, the topology's minimum parameter buffer of `minimum_pages` (the last
+    /// cluster-control word; S passes its auxiliary segment count, 64, there), a parameter
+    /// inventory of `parameter_bytes`, in the client's compact window `compact` (S
+    /// `with_m5_slices`).
+    pub(crate) fn with_m5_slices(mut self, pass: &RenderPass, groups: u32, segments: u32,
+        minimum_pages: u32, parameter_bytes: usize, compact: core::ops::Range<u64>) -> Result<Self> {
+        use crate::g17::fw::m5::target;
+        let slices = target::TargetSlices::new(
+            self.tilemap_size, self.tpc_size, pass.layers, groups, segments, parameter_bytes)
+            .ok_or(EINVAL)?;
+        let control = target::cluster_control(groups, u64::from(minimum_pages)).ok_or(EINVAL)?;
+        self.m5 = Some(M5Target { slices, control, compact: [compact.start, compact.end] });
+        Ok(self)
+    }
+    pub(crate) fn is_m5(&self) -> bool {
+        self.m5.is_some()
+    }
     pub(crate) fn tpc_capacity(&self) -> Result<usize> {
+        if let Some(m5) = &self.m5 {
+            return aligned(m5.slices.bytes, mmu::UAT_PGSZ);
+        }
         // TPC_MAX bounds the tail-pointer cache itself. On 25G83 this object
         // also contains GTP sub-buffers, notably 64 times the tile map. Applying
         // the cache limit to their combined extent rejects valid large targets.
@@ -152,7 +188,12 @@ impl Layout {
         Ok(aligned(self.tpc_end, mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
     }
     pub(crate) fn record_stride(&self) -> Result<usize> {
-        Ok(aligned(self.used, mmu::UAT_PGSZ)?.max(cfg::TARGET_RECORD_MIN))
+        let bytes = aligned(self.used, mmu::UAT_PGSZ)?;
+        Ok(if self.m5.is_some() { bytes } else { bytes.max(cfg::TARGET_RECORD_MIN) })
+    }
+    /// Where the target's objects are mapped: M5's compact window, else the A18 Pro's ranges.
+    fn compact(&self) -> Option<core::ops::Range<u64>> {
+        self.m5.as_ref().map(|m5| m5.compact[0]..m5.compact[1])
     }
 }
 
@@ -162,10 +203,14 @@ struct Object {
     backing: KernelObject,
 }
 impl Object {
-    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, size: usize) -> Result<Self> {
+    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, size: usize,
+        compact: Option<core::ops::Range<u64>>) -> Result<Self> {
         let backing = KernelObject::backing(dev, size, CpuMap::WriteCombined)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
-        let mapping = compact_alias(&backing, vm, 0..size, cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?;
+        let mapping = match compact {
+            Some(range) => backing.map_range(vm, 0..size, range, cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?,
+            None => compact_alias(&backing, vm, 0..size, cfg::TVB_PAGE, prot, mmu::UAT_PGSZ)?,
+        };
         Ok(Self {
             address: mapping.iova(),
             _mapping: mapping,
@@ -198,11 +243,11 @@ impl Target {
     pub(crate) fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, layout: &Layout) -> Result<KBox<Self>> {
         let tpc = layout.tpc_capacity()?;
         let stride = layout.record_stride()?;
-        if stride > cfg::TARGET_RECORD_MAX {
+        if layout.m5.is_none() && stride > cfg::TARGET_RECORD_MAX {
             return Err(ERANGE);
         }
-        let records = Object::new(dev, vm, stride * DEPTH)?;
-        let tpc = Object::new(dev, vm, tpc)?;
+        let records = Object::new(dev, vm, stride.checked_mul(DEPTH).ok_or(EOVERFLOW)?, layout.compact())?;
+        let tpc = Object::new(dev, vm, tpc, layout.compact())?;
         KBox::new(
             Self {
                 records,
@@ -217,6 +262,27 @@ impl Target {
     }
     pub(crate) fn tpc_va(&self) -> u64 {
         self.tpc.address
+    }
+
+    /// The M5 tiling words naming `layout`'s target slices in the TPC object, as compact
+    /// offsets, and its cluster controls (S `m5_extra`).
+    pub(crate) fn m5_extra(&self, layout: &Layout)
+        -> Result<crate::g17::fw::m5::render_registers::TaExtra> {
+        let m5 = layout.m5.as_ref().ok_or(EINVAL)?;
+        if m5.slices.bytes > self.tpc.backing.size() { return Err(ERANGE); }
+        let base = self.tpc.address.checked_sub(m5.compact[0]).ok_or(EINVAL)?;
+        let mut pointers = [0; 8];
+        for index in 0..8 {
+            if m5.slices.sizes[index] != 0 {
+                pointers[index] = base.checked_add(m5.slices.offsets[index] as u64).ok_or(EOVERFLOW)?;
+            }
+        }
+        let control = m5.control;
+        Ok(crate::g17::fw::m5::render_registers::TaExtra {
+            d11c8: pointers[1], d11d0: pointers[2], d11e8: pointers[4], d11f0: pointers[5],
+            d11f8: pointers[6], d1208: pointers[7], d1210: control[0], d1218: control[1],
+            d1220: control[2], d1590: 0, d1591: 0,
+        })
     }
 
     /// GPU addresses of the tiler parameter sub-buffers of `layout` (25G83), zero for an empty
@@ -282,11 +348,11 @@ impl Target {
         let stride = layout.record_stride()?;
         let mut grew = false;
         if tpc > self.tpc.backing.size() {
-            Self::replace(&mut self.retired, &mut self.tpc, dev, vm, tpc, owners)?;
+            Self::replace(&mut self.retired, &mut self.tpc, dev, vm, tpc, owners, layout.compact())?;
             grew = true;
         }
         if stride > self.stride {
-            if stride > cfg::TARGET_RECORD_MAX {
+            if layout.m5.is_none() && stride > cfg::TARGET_RECORD_MAX {
                 return Err(ERANGE);
             }
             Self::replace(
@@ -296,6 +362,7 @@ impl Target {
                 vm,
                 stride * DEPTH,
                 owners,
+                layout.compact(),
             )?;
             self.stride = stride;
             self.slots = [None; DEPTH];
@@ -310,12 +377,13 @@ impl Target {
         vm: &mmu::Vm,
         size: usize,
         owners: &[Option<u64>; DEPTH],
+        compact: Option<core::ops::Range<u64>>,
     ) -> Result {
         let retain = owners.iter().any(Option::is_some);
         if retain {
             retired.reserve(1, GFP_KERNEL)?;
         }
-        let new = Object::new(dev, vm, size)?;
+        let new = Object::new(dev, vm, size, compact)?;
         let previous = core::mem::replace(old, new);
         if retain {
             super::append_reserved(
@@ -327,6 +395,10 @@ impl Target {
             );
         }
         Ok(())
+    }
+    /// The passes whose records are live, by slot: an owner of replaced storage.
+    pub(crate) fn owners(&self) -> [Option<u64>; DEPTH] {
+        self.slots
     }
     pub(crate) fn retire(&mut self, ordinal: u64) -> Result {
         let slot = &mut self.slots[ordinal as usize % DEPTH];

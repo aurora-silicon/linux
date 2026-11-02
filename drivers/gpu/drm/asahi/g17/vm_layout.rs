@@ -25,6 +25,9 @@ pub(crate) enum Domain {
     /// Client-private aliases, placed independently in each client VM: they need not match
     /// across VMs and have no kernel-lower mapping.
     Private,
+    /// Compact driver resources of a client VM, which registers name by 32-bit offsets from the
+    /// driver base: parameter-buffer blocks, scene scratch, targets and per-pass state.
+    Compact,
 }
 
 /// How a client VM is constructed.
@@ -46,6 +49,8 @@ pub(crate) struct VmLayout {
     pub(crate) canonical: Range<u64>,
     /// [`Domain::Private`].
     pub(crate) private: Range<u64>,
+    /// [`Domain::Compact`].
+    pub(crate) compact: Range<u64>,
     /// Kernel-lower spans whose page tables, not leaves, are allocated before either firmware
     /// processor starts: the firmware samples the lower root's top-level entries only then.
     pub(crate) pre_run_tables: &'static [Range<u64>],
@@ -66,6 +71,7 @@ impl VmLayout {
             }
             Domain::Canonical => self.canonical.clone(),
             Domain::Private => self.private.clone(),
+            Domain::Compact => self.compact.clone(),
         }
     }
 

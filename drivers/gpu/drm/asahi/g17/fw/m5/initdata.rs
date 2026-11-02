@@ -1520,6 +1520,8 @@ pub(crate) struct M5Board {
 /// boot loader fills into the device tree from the ADT.
 pub(crate) struct M5Platform {
     pub(crate) board: &'static M5Board,
+    /// GPU clusters of the topology, as the G17 ID reports them.
+    pub(crate) clusters: u32,
     /// Runnable performance states, P0 excluded (+0x10e0).
     pub(crate) perf_states: u32,
     /// Main clock domain, P0 first: MHz, then core and SRAM mV per voltage lane.
@@ -1969,10 +1971,10 @@ pub(crate) fn encode_m5_hw_data(
     put_u32(out, 0x2660, 0);
     put_u32(out, 0x2728, 0);
     put_u32(out, 0x272c, 1);
-    // HW+0x26b0 is 0x00200000 on J714 (26A428). Firmware init
-    // copies it to 0x10a3a0; the tiling allocator shifts it by19.
-    // The inherited J813 word selected three groups instead of four.
-    put_u32(out, 0x26b0, 0x0020_0000);
+    // The minimum parameter buffer: firmware init copies it to 0x10a3a0; the tiling allocator
+    // shifts it by 19. J714's 0x00200000 is the two-cluster value of the topology's formula.
+    put_u32(out, 0x26b0, super::budget::minimum_parameter_bytes(platform.clusters)
+        .ok_or(InitdataError::BufferSize)?);
     Ok(())
 }
 

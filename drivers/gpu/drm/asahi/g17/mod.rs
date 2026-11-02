@@ -659,6 +659,9 @@ struct Firmware {
     _pm_metrics: Arc<KernelObject>,
     /// The M5 arithmetic qualification's queue graph, retained with the session it ran in.
     m5_compute: Option<KBox<m5_test::Compute>>,
+    /// M5: the scene metrics every parameter buffer leases an entry of
+    /// ([`buffer::MetricsIds`]), in the firmware's upper space; clients alias it.
+    m5_metrics: Option<Arc<KernelObject>>,
     uat: Arc<mmu::Uat>,
 }
 
@@ -1266,10 +1269,10 @@ impl Gpu {
         }
         let m5 = cfg
             .m5
-            .map(|board| fw::m5::compute::Gpu::new(&board.compute, &id.core_masks))
+            .map(|board| fw::m5::compute::Gpu::new(board, &id.core_masks))
             .transpose()?;
         if let Some(gpu) = &m5 {
-            dev_info!(dev.as_ref(), "M5 compute: {} pool blocks per queue\n", gpu.pool_blocks);
+            dev_info!(dev.as_ref(), "M5 compute: {} pool blocks of {} MiB per queue\n", gpu.pool_blocks, gpu.block_bytes() >> 20);
         }
         let shared = Arc::pin_init(
             pin_init!(Shared {
@@ -1499,6 +1502,7 @@ impl Gpu {
                 _render_global: render_global,
                 _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
                 m5_compute: None,
+                m5_metrics: None,
                 uat,
             }),
             GFP_KERNEL,
@@ -1591,8 +1595,20 @@ impl Gpu {
         root_entries: Option<[u64; 3]>,
         shared: &Arc<Shared>,
     ) -> Result {
-        let platform = Self::m5_platform(dev, cfg, cfg.m5.ok_or(EINVAL)?)?;
+        let platform = Self::m5_platform(dev, cfg, cfg.m5.ok_or(EINVAL)?, shared.clusters)?;
         session.init.build_m5(dev, &session.uat, &platform, shared.active_cores)?;
+        let metrics = object::Allocator {
+            dev,
+            uat: &session.uat,
+            layout: session.variant.vm_layout,
+        }
+        .kernel(
+            session.queues.metrics.storage_bytes()?,
+            mmu::UAT_PGSZ as u64,
+            mmu::PROT_GPU_FW_SHARED_RW,
+            CpuMap::WriteCombined,
+        )?;
+        session.m5_metrics = Some(Arc::new(metrics, GFP_KERNEL)?);
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
@@ -1626,6 +1642,7 @@ impl Gpu {
         dev: &AsahiDrmDevice,
         cfg: &'static Config,
         board: &'static fw::m5::initdata::M5Board,
+        clusters: u32,
     ) -> Result<KBox<fw::m5::initdata::M5Platform>> {
         use fw::m5::initdata::{relative_frequency, M5_PERF_STATES, M5_PLATFORM_LANES};
         let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
@@ -1721,6 +1738,7 @@ impl Gpu {
         // On the heap: boot_m5's frame stays small under the deep paths it calls.
         Ok(KBox::new(fw::m5::initdata::M5Platform {
             board,
+            clusters,
             perf_states: M5_PERF_STATES as u32 - 1,
             perf,
             relative: relative_frequency(&mhz),
@@ -1837,11 +1855,13 @@ impl gpu::Gpu for Gpu {
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         let variant = self.shared.variant;
         // Features belong to the submission path that implements them. The M5 profile submits
-        // compute alone, declared with SET_COMPUTE_RESOURCES ([`queue::m5`]); it advertises
-        // none of the doorbell path's barrier, sync or render features.
+        // compute declared with SET_COMPUTE_RESOURCES ([`queue::m5`]) and render passes declared
+        // with SET_RENDER_RESOURCES ([`queue::m5_render`]); it advertises none of the doorbell
+        // path's barrier or sync features, nor the versioned render declarations.
         if self.shared.m5.is_some() {
             params.features |=
-                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES);
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES);
         }
         if variant.submission == fw::variant::Submission::Doorbell {
             params.features |=
@@ -1917,11 +1937,9 @@ impl gpu::Gpu for Gpu {
         })
     }
 
-    /// The M5 host-command path reaches DRM queues for compute alone, on M5 channels with the
-    /// board's descriptor profile ([`queue::m5`]); its render command layouts are placeholders
-    /// (`Config::core_layout`, `Variant::programs`), so each command is refused per engine
-    /// ([`fw::variant::Submission::accepts`]). Its retirement witnesses report work done even
-    /// when workgroups were lost.
+    /// The M5 host-command path reaches DRM queues for compute and render when the GPU has its
+    /// M5 descriptor profile (`Shared::m5`): compute on M5 channels ([`queue::m5`]), render on M5
+    /// pairs (`queue::m5_render`). Without it, EOPNOTSUPP.
     fn submission(&self) -> Result {
         match (self.shared.variant.submission, self.shared.m5) {
             (fw::variant::Submission::Doorbell, _) => Ok(()),

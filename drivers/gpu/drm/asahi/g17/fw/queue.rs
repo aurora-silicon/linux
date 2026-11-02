@@ -388,6 +388,8 @@ pub(crate) struct TilingBinding {
 pub(crate) enum QueueConfigTarget {
     /// A tiling queue and its parameter-buffer binding.
     Tiling(TilingBinding),
+    /// M5: a tiling queue installed before any parameter buffer is bound to it.
+    TilingUnbound,
     /// A fragment queue.
     Fragment,
     /// A compute queue.
@@ -524,6 +526,9 @@ impl QueueConfig {
                     binding.pb_slot,
                     u32::from(binding.fragment_qid),
                 )
+            }
+            QueueConfigTarget::TilingUnbound => {
+                (DataMaster::Tiling, 0, u64::MAX, u32::MAX, u32::MAX)
             }
             QueueConfigTarget::Fragment => (DataMaster::Fragment, 0, u64::MAX, u32::MAX, u32::MAX),
             QueueConfigTarget::Compute => (DataMaster::Compute, 0, u64::MAX, u32::MAX, u32::MAX),

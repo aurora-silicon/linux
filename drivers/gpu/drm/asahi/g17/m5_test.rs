@@ -621,7 +621,10 @@ impl Compute {
         let observations = &mut self.observations;
         let next = firmware
             .init
-            .resync_compute_completions(&mut self.seen, |record| observations.fold_any(record))?;
+            // The qualification's queue is class 2 (MEDIUM), which completes into ring 0.
+            .resync_compute_completions(0, &mut self.seen, |record| {
+                observations.fold_any(record)
+            })?;
         self.laps.advance(Laps::COMPLETIONS, next.try_into()?);
         let mut retired = None;
         let port = &firmware.port;

@@ -284,6 +284,62 @@ impl Port {
         Ok(next)
     }
 
+    /// M5 render: exposes a render pair's two records (`records`: fragment, then tiling) in
+    /// two reserved compute-ring slots of one priority, in S's order (`submit_m5_render_pair`):
+    /// both records, the host command `submission` (none for an installation), the inner
+    /// producers (`inner`), then the outer producer and the compute notification. The ring lock
+    /// is held throughout, so no other record lands between the pair's. Returns the new producer.
+    pub(super) fn publish_m5_pair(
+        &self,
+        mut claims: [OuterClaim<'_>; 2],
+        records: &[WorkSlot; 2],
+        submission: Option<&super::fw::m5::queue::HardwareSubmission>,
+        inner: impl FnOnce() -> Result,
+    ) -> Result<u32> {
+        let priority = claims[0].priority;
+        if claims.iter().any(|claim| claim.priority != priority || !core::ptr::eq(claim.port, self))
+            || records.iter().any(|record| record.data_master != DataMaster::Compute as u32)
+        {
+            return Err(EINVAL);
+        }
+        let ring = self.views()?.compute[priority];
+        let mut reserved = self.rings.lock();
+        let [first, second, producer] = ring.cursors()?;
+        let next = (producer + 2) % WORK_RING_SLOTS;
+        let room = |consumer: u32| (consumer + WORK_RING_SLOTS - producer - 1) % WORK_RING_SLOTS;
+        if room(first) < 2 || room(second) < 2 {
+            return Err(EIO);
+        }
+        for (index, record) in records.iter().enumerate() {
+            let slot = (producer + index as u32) % WORK_RING_SLOTS;
+            // SAFETY: As in `publish_compute`: the claims prove firmware does not own these
+            // slots, and the ring lock excludes every other host writer.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref(record).cast::<u8>(),
+                    ring.slots.add(slot as usize * core::mem::size_of::<WorkSlot>()),
+                    core::mem::size_of::<WorkSlot>(),
+                );
+            }
+        }
+        fence(Ordering::SeqCst);
+        if let Some(submission) = submission {
+            self.host_command(|regs| regs.submit_m5_work(submission))?;
+        }
+        inner()?;
+        fence(Ordering::SeqCst);
+        // SAFETY: As for `RingView::cursors`.
+        unsafe { (*ring.producer).store(next, Ordering::Relaxed) };
+        fence(Ordering::SeqCst);
+        reserved[priority] = reserved[priority].saturating_sub(2);
+        for claim in &mut claims {
+            claim.armed = false;
+        }
+        drop(reserved);
+        self.notify((0x83 << super::MSG_TYPE_SHIFT) | DataMaster::Compute as u64 | (priority as u64) << 2)?;
+        Ok(next)
+    }
+
     /// Samples the M5 queue configuration words of `qids` through the host command port.
     pub(super) fn m5_queue_configurations(&self, qids: [u8; 2]) -> Result<[u64; 2]> {
         self.host_command(|regs| regs.m5_queue_configurations(qids))

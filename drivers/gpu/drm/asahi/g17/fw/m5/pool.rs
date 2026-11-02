@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! M5 private-memory pool encodings for compute queues (linux-aurora t6050-gpu's
-//! g17/fw/m5/pool.rs, its fixed-block G17S compute pool): the page directory, the block free
-//! list, the eight-word page-pool (UMA) descriptor row and the shared pool state.
+//! M5 private-memory pool encodings (linux-aurora t6050-gpu's g17/fw/m5/pool.rs, its
+//! fixed-block pools): the page directory, the block free list, the eight-word page-pool (UMA)
+//! descriptor row and the shared pool state, for compute and render queues alike.
 //!
 //! The pool spans a fixed address inventory, which sizes the directory, not physical memory:
-//! only the initial blocks are backed.
+//! only the initial blocks are backed. The block size is the product's
+//! ([`super::budget::Product::block_bytes`]).
 
-/// Bytes of one pool block.
-const BLOCK_BYTES: usize = 0x40_0000;
 /// USC pool pages are 4 KiB, independent of the UAT page size.
 const POOL_PAGE: usize = 0x1000;
 /// The pool's address inventory (G17S). J714 value.
@@ -32,11 +31,21 @@ pub(crate) enum PoolError {
     Buffer,
 }
 
-/// Sizes of one compute pool.
+/// The engine a pool serves: its shared state differs in two words (S
+/// `encode_g17s_compute_state`, `encode_g17s_render_state`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Engine {
+    Compute,
+    Render,
+}
+
+/// Sizes of one pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PoolGeometry {
     /// Backed blocks.
     pub(crate) blocks: usize,
+    /// Bytes of one block.
+    pub(crate) block_bytes: usize,
     /// Directory entries, one per pool page of the inventory.
     pub(crate) directory_entries: u32,
     /// Pool pages of the backed blocks.
@@ -53,16 +62,19 @@ fn round_page(bytes: usize) -> Result<usize, PoolError> {
 }
 
 impl PoolGeometry {
-    /// A compute pool of `blocks` backed blocks over the full inventory.
-    pub(crate) fn compute(blocks: usize) -> Result<Self, PoolError> {
+    /// A pool of `blocks` backed blocks of `block_bytes` over the full inventory.
+    pub(crate) fn of(blocks: usize, block_bytes: usize) -> Result<Self, PoolError> {
+        if block_bytes == 0 || block_bytes % POOL_PAGE != 0 {
+            return Err(PoolError::Geometry);
+        }
         let bytes =
-            INVENTORY_BYTES.min(RING_MAX_PAGES * POOL_PAGE as u64) & !(BLOCK_BYTES as u64 - 1);
-        Self::new(blocks, (bytes / POOL_PAGE as u64) as u32)
+            INVENTORY_BYTES.min(RING_MAX_PAGES * POOL_PAGE as u64) & !(block_bytes as u64 - 1);
+        Self::new(blocks, block_bytes, (bytes / POOL_PAGE as u64) as u32)
     }
 
-    fn new(blocks: usize, directory_entries: u32) -> Result<Self, PoolError> {
+    fn new(blocks: usize, block_bytes: usize, directory_entries: u32) -> Result<Self, PoolError> {
         let pages = blocks
-            .checked_mul(BLOCK_BYTES / POOL_PAGE)
+            .checked_mul(block_bytes / POOL_PAGE)
             .and_then(|n| u32::try_from(n).ok())
             .ok_or(PoolError::Geometry)?;
         if blocks == 0 || pages > directory_entries {
@@ -79,6 +91,7 @@ impl PoolGeometry {
         }
         Ok(Self {
             blocks,
+            block_bytes,
             directory_entries,
             pages,
             directory_bytes,
@@ -87,14 +100,14 @@ impl PoolGeometry {
     }
 
     pub(crate) const fn block_bytes(self) -> usize {
-        BLOCK_BYTES
+        self.block_bytes
     }
 
     /// Bytes of one allocation holding the directory, the free list and the blocks, in that
     /// order.
     pub(crate) fn backing_bytes(self) -> Result<usize, PoolError> {
         self.blocks
-            .checked_mul(BLOCK_BYTES)
+            .checked_mul(self.block_bytes)
             .and_then(|n| n.checked_add(self.directory_bytes))
             .and_then(|n| n.checked_add(self.freelist_bytes))
             .ok_or(PoolError::Geometry)
@@ -115,11 +128,13 @@ fn private_range(address: u64, bytes: usize) -> Result<(), PoolError> {
 }
 
 fn validate_blocks(g: PoolGeometry, blocks: &[u64]) -> Result<(), PoolError> {
-    if PoolGeometry::new(g.blocks, g.directory_entries)? != g || blocks.len() != g.blocks {
+    if PoolGeometry::new(g.blocks, g.block_bytes, g.directory_entries)? != g
+        || blocks.len() != g.blocks
+    {
         return Err(PoolError::Geometry);
     }
     for address in blocks {
-        private_range(*address, BLOCK_BYTES)?;
+        private_range(*address, g.block_bytes)?;
     }
     Ok(())
 }
@@ -133,7 +148,7 @@ pub(crate) fn encode_directory(
     validate_blocks(g, blocks)?;
     let out = out.get_mut(..g.directory_bytes).ok_or(PoolError::Buffer)?;
     out.fill(0);
-    let pages_per_block = BLOCK_BYTES / POOL_PAGE;
+    let pages_per_block = g.block_bytes / POOL_PAGE;
     for (block, address) in blocks.iter().enumerate() {
         for page in 0..pages_per_block {
             let offset = (block * pages_per_block + page) * 8;
@@ -170,7 +185,12 @@ pub(crate) struct PoolLayout {
 }
 
 fn validate_layout(p: PoolLayout) -> Result<(), PoolError> {
-    if PoolGeometry::new(p.geometry.blocks, p.geometry.directory_entries)? != p.geometry {
+    if PoolGeometry::new(
+        p.geometry.blocks,
+        p.geometry.block_bytes,
+        p.geometry.directory_entries,
+    )? != p.geometry
+    {
         return Err(PoolError::Geometry);
     }
     private_range(p.directory, p.geometry.directory_bytes)?;
@@ -187,17 +207,18 @@ pub(crate) fn initial_uma_descriptor(p: PoolLayout) -> Result<[u64; 8], PoolErro
         pages << 32,
         pages | (u64::from(p.geometry.directory_entries) << 32),
         0,
-        (p.freelist >> 6) | (((BLOCK_BYTES / POOL_PAGE) as u64) << 44),
+        (p.freelist >> 6) | (((p.geometry.block_bytes / POOL_PAGE) as u64) << 44),
         blocks,
         0,
         blocks,
     ])
 }
 
-/// Writes the shared state of a fresh compute pool whose host-submitted counter is at
+/// Writes the shared state of a fresh `engine` pool whose host-submitted counter is at
 /// `submitted`.
-pub(crate) fn encode_compute_state(
+pub(crate) fn encode_state(
     p: PoolLayout,
+    engine: Engine,
     submitted: u64,
     out: &mut [u8],
 ) -> Result<(), PoolError> {
@@ -218,11 +239,16 @@ pub(crate) fn encode_compute_state(
         (0x2c, p.geometry.pages),
         (0x38, blocks),
         (0x3c, blocks),
-        (0x40, (BLOCK_BYTES / POOL_PAGE) as u32),
+        (0x40, (p.geometry.block_bytes / POOL_PAGE) as u32),
         (0x68, blocks),
-        (0x7c, 1),
-        (0x80, 1),
     ] {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let engine_words: [u32; 2] = match engine {
+        Engine::Compute => [1, 1],
+        Engine::Render => [0, 4],
+    };
+    for (offset, value) in [(0x7c, engine_words[0]), (0x80, engine_words[1])] {
         out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     for (offset, value) in [
@@ -234,4 +260,52 @@ pub(crate) fn encode_compute_state(
         out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
     Ok(())
+}
+
+/// The parameter buffer's scene table: entries, their stride and the trailer after them.
+pub(crate) const SCENE_TABLE_ENTRIES: usize = 0x50;
+pub(crate) const SCENE_STRIDE: usize = 0x80;
+pub(crate) const SCENE_TRAILER_SIZE: usize = 0x40;
+
+/// Parameter-buffer capacity follows the memory budget and initial demand.
+/// Capacity is rounded to groups of 33 half-MiB blocks; it reserves list space,
+/// not physical backing for every possible block.
+pub(crate) fn parameter_capacity(
+    memory_bytes: u64,
+    initial_bytes: u64,
+) -> Result<usize, PoolError> {
+    const GROUP: u64 = 33 * 0x80000;
+    let scaled = memory_bytes.checked_mul(5).ok_or(PoolError::Geometry)? >> 2;
+    let budget = (((u128::from(scaled) * 0x28f5_c28f_5c28_f5c3) >> 64) as u64) >> 2;
+    let groups = |bytes: u64| {
+        bytes
+            .checked_add(GROUP - 1)
+            .map(|n| n / GROUP)
+            .ok_or(PoolError::Geometry)
+    };
+    let groups = groups(budget)?.max(groups(initial_bytes)?);
+    usize::try_from(groups.checked_mul(33).ok_or(PoolError::Geometry)?)
+        .map_err(|_| PoolError::Geometry)
+}
+
+/// Per-scene scratch covers the complete parameter-buffer inventory. Optional
+/// cluster entries are supplied by the dispatch policy, not the active draw's
+/// physical block count. Each entry and the header occupy eight bytes.
+pub(crate) fn parameter_scratch_stride(
+    capacity: usize,
+    cluster_entries: usize,
+) -> Result<usize, PoolError> {
+    if capacity == 0 {
+        return Err(PoolError::Geometry);
+    }
+    let pages = capacity.checked_mul(16).ok_or(PoolError::Geometry)?;
+    let entries = pages.checked_add(0x17ff).ok_or(PoolError::Geometry)? / 0x1800;
+    let entries = entries
+        .checked_add(cluster_entries)
+        .ok_or(PoolError::Geometry)?;
+    entries
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(8 + 63))
+        .map(|n| n & !63)
+        .ok_or(PoolError::Geometry)
 }

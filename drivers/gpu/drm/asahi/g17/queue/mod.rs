@@ -5,10 +5,11 @@
 
 pub(crate) mod compute;
 pub(crate) mod m5;
+pub(crate) mod m5_render;
 pub(crate) mod render;
 
 use super::{
-    command::{Parser, UscWindow, Validated},
+    command::{Parser, Payload, UscWindow, Validated},
     completion::{Completion, Destinations, PreparedPublication},
     context::Context,
     dependency::FailureRecord,
@@ -133,10 +134,7 @@ impl<B: Backend> Queue<B> {
             variant,
             m5,
         } = frontend;
-        let render = match variant.submission.accepts(Engine::Render) {
-            Ok(()) => Some(Scheduler::new(dev, backend.clone(), Engine::Render)?),
-            Err(_) => None,
-        };
+        let render = Some(Scheduler::new(dev, backend.clone(), Engine::Render)?);
         Ok(Self {
             dev: dev.into(),
             context,
@@ -397,7 +395,11 @@ impl<B: Backend> Queue<B> {
         let base = self.sequence;
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
-        while let Some(command) = parser.next()? {
+        while let Some(command) = parser.next().inspect_err(|error| {
+            if self.m5.is_some() {
+                pr_warn!("G17 M5: submission refused while parsing: {:?}\n", error);
+            }
+        })? {
             let payload = self.proof.validate(
                 self.context.vm(),
                 self.range.clone(),
@@ -405,7 +407,12 @@ impl<B: Backend> Queue<B> {
                 self.variant,
                 self.m5.as_ref(),
                 &command.payload,
-            )?;
+            ).inspect_err(|error| {
+                if self.m5.is_some() {
+                    pr_warn!("G17 M5: submission refused in validation of a {} command: {:?}\n",
+                        if matches!(command.payload, Payload::Render(..)) { "render" } else { "compute" }, error);
+                }
+            })?;
             let engine = match &payload {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
@@ -443,10 +450,6 @@ impl<B: Backend> Queue<B> {
 
 impl<B: Backend> crate::queue::Queue for Queue<B> {
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
-        if self.render.is_none() {
-            // No render scheduler (M5): nothing to size, and no layout to accept.
-            return if layouts == [0; 2] { Ok(()) } else { Err(EINVAL) };
-        }
         let pages = [super::fw::compute::ScratchRequest::new(layouts[0])?.pages(),
                      super::fw::compute::ScratchRequest::new(layouts[1])?.pages()];
         let blocks = self.backend.render_scs_blocks(pages)?;

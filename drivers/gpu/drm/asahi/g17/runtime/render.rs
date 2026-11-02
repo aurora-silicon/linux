@@ -70,7 +70,7 @@ pub(super) struct UnusedRenderSpare {
     _binding: Option<crate::g17::queue::render::RetiredBinding>,
 }
 
-pub(super) struct RenderState {
+pub(in crate::g17) struct RenderState {
     config: Config,
     entries: KVec<Option<Entry>>,
     pools: pools::Pools,
@@ -110,7 +110,7 @@ impl RenderState {
         })
     }
 
-    fn reserve_pm_generation(&mut self) -> Result<u64> {
+    pub(in crate::g17) fn reserve_pm_generation(&mut self) -> Result<u64> {
         let generation = self.next_pm_generation;
         self.next_pm_generation = generation.checked_add(1).ok_or(EOVERFLOW)?;
         Ok(generation)

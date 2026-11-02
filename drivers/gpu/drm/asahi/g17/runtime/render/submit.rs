@@ -38,6 +38,9 @@ impl Backend {
         packet: &Arc<Packet>,
         deferred: &mut DeferredBatch,
     ) -> Result {
+        if self.shared.m5.is_some() {
+            return self.m5_render_packet(packet);
+        }
         self.render_with_lease(packet, None, deferred)
     }
 
@@ -147,7 +150,9 @@ impl Backend {
     /// signals, so run_job finds both ready instead of waiting for them.
     /// Errors, and anything else publication may wait for, are left to it.
     pub(in crate::g17::runtime) fn admit_render(&self, packet: &Arc<Packet>) -> Option<kernel::dma_fence::Fence> {
-        if packet.early_result().is_some()
+        // M5 publication waits for its pair's room itself (`m5_render_packet`).
+        if self.shared.m5.is_some()
+            || packet.early_result().is_some()
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
             || self.admission_open().is_err()
@@ -472,7 +477,7 @@ impl Backend {
     }
 
     pub(in crate::g17) fn try_render_early(&self, packet: &Arc<Packet>) -> bool {
-        if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+        if self.shared.m5.is_some() || self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
         let admission = match self.admission.try_acquire_render(self.owner, Request::of(packet)) {

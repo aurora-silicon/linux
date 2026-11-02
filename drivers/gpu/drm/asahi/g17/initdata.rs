@@ -45,6 +45,17 @@ pub(super) const COMPUTE_COMPLETION_SLOTS: usize = {
     if slots < 0x800 { slots } else { 0x800 }
 };
 
+/// Completion rings of the Neo layout's bundle (its ring table).
+const NEO_COMPLETION_RINGS: usize = abi::bundle::COMPLETION_RINGS.len();
+/// Completion rings of the M5 graph.
+const M5_COMPLETION_RINGS: usize = super::fw::m5::initdata::M5_25G76_COMPLETION_QUEUE_COUNT;
+
+/// Completion rings the host scans for compute completions, each with its own cursor: every
+/// ring of the layout's ring table, so no ring the firmware posts to goes unread (on M5 it posts
+/// class 0's completions to ring 1). Sized for the larger table.
+pub(super) const COMPUTE_COMPLETION_RINGS: usize =
+    if M5_COMPLETION_RINGS > NEO_COMPLETION_RINGS { M5_COMPLETION_RINGS } else { NEO_COMPLETION_RINGS };
+
 /// Timestamp bits of a completion record's start and end words.
 const COMPLETION_TIME_MASK: u64 = 0x003f_ffff_ffff_ffff;
 
@@ -183,15 +194,15 @@ pub(super) struct InitData {
     compute_scheduler: Option<ComputeScheduler>,
     compute_active: core::cell::Cell<bool>,
     event_ring_checked: [core::cell::Cell<(u64, u64, u32)>; 2],
-    completion_rings: [usize; 2],
+    completion_rings: [usize; NEO_COMPLETION_RINGS],
     stamps: [usize; 2],
     render_pages: usize,
     render_runs: usize,
     render_blocks: core::ops::Range<usize>,
     /// Prepared by [`InitData::prepare_m5_lower`]: the M5 private and shared layouts apply.
     m5: bool,
-    /// The M5 graph's four completion-ring objects. Compute completes into the first.
-    m5_completions: [usize; 4],
+    /// The M5 graph's completion-ring objects, every one scanned.
+    m5_completions: [usize; M5_COMPLETION_RINGS],
 }
 
 /// Placement inputs shared by the build steps.
@@ -242,7 +253,7 @@ struct DescriptorTables {
 /// Object indices and ring addresses the firmware-object initialization needs from the bundle step.
 struct BundleObjects {
     zero: usize,
-    completion_rings: [abi::CompletionRing; 2],
+    completion_rings: [abi::CompletionRing; NEO_COMPLETION_RINGS],
     region_a: usize,
     qos: usize,
 }
@@ -274,13 +285,13 @@ impl InitData {
             compute_scheduler: None,
             compute_active: core::cell::Cell::new(false),
             event_ring_checked: [const { core::cell::Cell::new((0, 0, 0)) }; 2],
-            completion_rings: [0; 2],
+            completion_rings: [0; NEO_COMPLETION_RINGS],
             stamps: [0; 2],
             render_pages: 0,
             render_runs: 0,
             render_blocks: 0..0,
             m5: false,
-            m5_completions: [0; 4],
+            m5_completions: [0; M5_COMPLETION_RINGS],
         }
     }
 
@@ -744,7 +755,7 @@ impl InitData {
 
     /// Snapshot the shared compute completion ring once per service transaction. The queue
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
-    /// Folds the compute completion records the firmware appended since `start`, in ring
+    /// Folds the records the firmware appended to compute completion ring `ring` since `start`, in ring
     /// order. `seen` holds every slot's control word as of the previous pass over it: the
     /// first slot still holding it is where the firmware writes next, and the pass ends there
     /// instead of reading the rest of the ring. A pass also ends once `record` has found every
@@ -752,11 +763,14 @@ impl InitData {
     /// pass reads again. Returns the slot the next pass starts at.
     pub(super) fn fold_compute_completions(
         &self,
+        ring: usize,
         start: usize,
         seen: &mut [u64],
         mut record: impl FnMut(ComputeCompletion<'_>) -> Result<CompletionFold>,
     ) -> Result<usize> {
-        let object = self.compute_completions()?;
+        let Some(object) = self.compute_completions(ring)? else {
+            return Ok(start);
+        };
         if seen.len() != COMPUTE_COMPLETION_SLOTS {
             return Err(EINVAL);
         }
@@ -779,10 +793,13 @@ impl InitData {
     /// firmware writes next.
     pub(super) fn resync_compute_completions(
         &self,
+        ring: usize,
         seen: &mut [u64],
         mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
     ) -> Result<usize> {
-        let object = self.compute_completions()?;
+        let Some(object) = self.compute_completions(ring)? else {
+            return Ok(0);
+        };
         if seen.len() != COMPUTE_COMPLETION_SLOTS {
             return Err(EINVAL);
         }
@@ -806,17 +823,21 @@ impl InitData {
         Ok(newest.map_or(0, |(slot, _)| (slot + 1) % COMPUTE_COMPLETION_SLOTS))
     }
 
-    /// The completion ring compute work completes into, which spans at least
-    /// [`COMPUTE_COMPLETION_SLOTS`] records.
-    fn compute_completions(&self) -> Result<&KernelObject> {
-        let object = self.object(match self.m5 {
-            true => self.m5_completions[0],
-            false => self.completion_rings[0],
-        })?;
+    /// Completion ring `ring` of the layout's ring table (below [`COMPUTE_COMPLETION_RINGS`]),
+    /// which spans at least [`COMPUTE_COMPLETION_SLOTS`] records; `None` past this layout's table.
+    fn compute_completions(&self, ring: usize) -> Result<Option<&KernelObject>> {
+        if ring >= COMPUTE_COMPLETION_RINGS {
+            return Err(EINVAL);
+        }
+        let table: &[usize] = if self.m5 { &self.m5_completions } else { &self.completion_rings };
+        let Some(&index) = table.get(ring) else {
+            return Ok(None);
+        };
+        let object = self.object(index)?;
         if object.size() < COMPUTE_COMPLETION_SLOTS * 0x40 {
             return Err(EINVAL);
         }
-        Ok(object)
+        Ok(Some(object))
     }
 
     fn object(&self, index: usize) -> Result<&KernelObject> {
@@ -1110,7 +1131,7 @@ impl InitData {
         let mut completion_rings = [abi::CompletionRing {
             low_va: 0,
             high_va: 0,
-        }; 2];
+        }; NEO_COMPLETION_RINGS];
         for (slot, completion_ring) in completion_rings.iter_mut().enumerate() {
             let offset = high::BUNDLE + abi::bundle::COMPLETION_RINGS[slot] as u64;
             let ring = self.add(env.fixed(offset, abi::COMPLETION_RING_SIZE, FP, WB)?)?;

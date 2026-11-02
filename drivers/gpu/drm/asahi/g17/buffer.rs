@@ -8,7 +8,10 @@
 
 use super::fw::buffer as fw;
 use crate::hw::t8140::resources as cfg;
+mod geometry;
+mod layout;
 pub(crate) mod target;
+pub(crate) use geometry::BlockGeometry;
 
 use kernel::prelude::*;
 
@@ -338,36 +341,35 @@ pub(crate) struct TvbRelease {
     _extensions: KVec<KernelObject>,
 }
 
-/// Packed 128-KiB data blocks mapped at guarded 160-KiB virtual strides.
+/// Data blocks of the profile's geometry ([`BlockGeometry`]): the A18 Pro's packed 128-KiB
+/// blocks at guarded 160-KiB virtual strides, M5's 512-KiB ones at 544 KiB.
 /// Firmware owns their contents; CPU zeroing occurs only on fresh backing.
 pub(crate) struct Tvb {
+    geometry: BlockGeometry,
     addresses: KVec<u64>,
     // Retain sparse-block backing until the pool and its aliases retire.
     _primary: KernelObject,
     extensions: KVec<KernelObject>,
 }
 impl Tvb {
-    /// Blocks are packed in the backing; only their VA placement keeps the
-    /// stride and its trailing guard.
-    fn bytes(blocks: usize) -> Result<usize> {
-        blocks.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)
-    }
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
         relative: usize,
+        geometry: BlockGeometry,
     ) -> Result<mmu::KernelMapping> {
-        let start = relative.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
-        let source = start..start.checked_add(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
-        let mapping = compact_alias(
-            object,
-            vm,
-            source,
-            cfg::TVB_PAGE,
-            mmu::PROT_GPU_SHARED_RW,
-            cfg::TVB_BLOCK_STRIDE as usize - cfg::TVB_BLOCK_SIZE,
-        )?;
-        fw::compact_page(mapping.iova())?;
+        let start = relative.checked_mul(geometry.backing_stride).ok_or(EOVERFLOW)?;
+        let source = start..start.checked_add(geometry.block_bytes).ok_or(EOVERFLOW)?;
+        let guard = geometry.stride - geometry.block_bytes;
+        if geometry == BlockGeometry::NEO {
+            let mapping =
+                compact_alias(object, vm, source, cfg::TVB_PAGE, mmu::PROT_GPU_SHARED_RW, guard)?;
+            fw::compact_page(mapping.iova())?;
+            return Ok(mapping);
+        }
+        let mapping = object.map_range(vm, source, geometry.base..geometry.end,
+            BlockGeometry::PAGE as u64, mmu::PROT_GPU_SHARED_RW, guard)?;
+        geometry.compact_page(mapping.iova())?;
         Ok(mapping)
     }
     pub(crate) fn new(
@@ -375,19 +377,28 @@ impl Tvb {
         vm: &mmu::Vm,
         blocks: usize,
     ) -> Result<(Self, KVec<mmu::KernelMapping>)> {
-        if blocks == 0 || blocks > cfg::TVB_MAX_BLOCKS {
+        Self::with_geometry(dev, vm, blocks, BlockGeometry::NEO)
+    }
+    pub(crate) fn with_geometry(
+        dev: &AsahiDrmDevice,
+        vm: &mmu::Vm,
+        blocks: usize,
+        geometry: BlockGeometry,
+    ) -> Result<(Self, KVec<mmu::KernelMapping>)> {
+        if blocks == 0 || blocks > geometry.max_blocks() {
             return Err(ERANGE);
         }
-        let backing = KernelObject::backing(dev, Self::bytes(blocks)?, CpuMap::WriteCombined)?;
+        let backing = KernelObject::backing(dev, geometry.backing_bytes(blocks)?, CpuMap::WriteCombined)?;
         let mut mappings = KVec::with_capacity(blocks, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(blocks, GFP_KERNEL)?;
         for index in 0..blocks {
-            let mapping = Self::map_block(&backing, vm, index)?;
+            let mapping = Self::map_block(&backing, vm, index, geometry)?;
             addresses.push(mapping.iova(), GFP_KERNEL)?;
             mappings.push(mapping, GFP_KERNEL)?;
         }
         Ok((
             Self {
+                geometry,
                 addresses,
                 _primary: backing,
                 extensions: KVec::new(),
@@ -400,6 +411,9 @@ impl Tvb {
     }
     pub(crate) fn addresses(&self) -> &[u64] {
         &self.addresses
+    }
+    pub(crate) fn geometry(&self) -> BlockGeometry {
+        self.geometry
     }
     /// Blocks of each growth extension; extensions are packed like the primary.
     fn extension_blocks(extension: &KernelObject) -> usize {
@@ -423,17 +437,18 @@ impl Tvb {
         if target <= self.blocks() {
             return Ok(None);
         }
-        if target > cfg::TVB_MAX_BLOCKS {
+        // Growth is the A18 Pro's: M5 parameter buffers keep their initial blocks.
+        if self.geometry != BlockGeometry::NEO || target > cfg::TVB_MAX_BLOCKS {
             return Err(ERANGE);
         }
         let added = target - self.blocks();
         self.extensions.reserve(1, GFP_KERNEL)?;
         self.addresses.reserve(added, GFP_KERNEL)?;
-        let backing = KernelObject::backing(dev, Self::bytes(added)?, CpuMap::WriteCombined)?;
+        let backing = KernelObject::backing(dev, self.geometry.backing_bytes(added)?, CpuMap::WriteCombined)?;
         let mut mappings = KVec::with_capacity(added, GFP_KERNEL)?;
         let mut addresses = KVec::with_capacity(added, GFP_KERNEL)?;
         for relative in 0..added {
-            let mapping = Self::map_block(&backing, vm, relative)?;
+            let mapping = Self::map_block(&backing, vm, relative, self.geometry)?;
             addresses.push(mapping.iova(), GFP_KERNEL)?;
             mappings.push(mapping, GFP_KERNEL)?;
         }
@@ -453,15 +468,25 @@ use kernel::sync::Arc;
 /// An entry returns only when the graph and its firmware references retire.
 pub(crate) struct MetricsIds {
     used: [AtomicU64; 2],
+    scene_stride: usize,
 }
 impl MetricsIds {
     pub(crate) fn new() -> Self {
         Self {
-            used: [
-                AtomicU64::new(0),
-                AtomicU64::new(!((1u64 << (fw::METRICS_SLOTS - 64)) - 1)),
-            ],
+            used: [AtomicU64::new(0), AtomicU64::new(0)],
+            scene_stride: size_of::<u32>(),
         }
+    }
+    pub(crate) fn with_stride(scene_stride: usize) -> Result<Self> {
+        if scene_stride < 4 || scene_stride % 4 != 0 { return Err(EINVAL); }
+        scene_stride.checked_mul(fw::SCENES).ok_or(EOVERFLOW)?;
+        Ok(Self { scene_stride, ..Self::new() })
+    }
+    /// Backing required for every entry owned by this allocator.
+    pub(crate) fn storage_bytes(&self) -> Result<usize> {
+        self.scene_stride.checked_mul(fw::SCENES)
+            .and_then(|bytes| bytes.checked_mul(self.used.len() * u64::BITS as usize))
+            .ok_or(EOVERFLOW)
     }
 }
 
@@ -470,20 +495,31 @@ pub(crate) struct MetricsLease {
     allocator: Arc<MetricsIds>,
     slot: usize,
     addresses: fw::MetricsAddresses,
+    scene_stride: usize,
 }
 impl MetricsLease {
+    pub(crate) fn addresses(&self) -> fw::MetricsAddresses { self.addresses }
+    pub(crate) fn set_client_base(&mut self, base: u64) -> Result {
+        let offset = self.slot.checked_mul(self.scene_stride)
+            .and_then(|bytes| bytes.checked_mul(fw::SCENES)).ok_or(EOVERFLOW)?;
+        self.addresses.client = base.checked_add(offset as u64).ok_or(EOVERFLOW)?;
+        Ok(())
+    }
     /// Clears only the selected retired metrics entry before reusing it.
     pub(crate) fn new(
         ids: &Arc<MetricsIds>,
         object: &Arc<KernelObject>,
         bases: fw::MetricsAddresses,
     ) -> Result<Self> {
+        let scene_stride = ids.scene_stride;
+        let bytes = scene_stride.checked_mul(fw::SCENES).ok_or(EOVERFLOW)?;
+        let slots = (object.size() / bytes).min(ids.used.len() * 64);
         let mut selected = None;
         for (bank, used) in ids.used.iter().enumerate() {
             let mut value = used.load(Ordering::Acquire);
             loop {
                 let bit = value.trailing_ones();
-                if bit == 64 {
+                if bit == 64 || bank * 64 + bit as usize >= slots {
                     break;
                 }
                 match used.compare_exchange_weak(
@@ -511,15 +547,16 @@ impl MetricsLease {
             allocator: ids.clone(),
             slot,
             addresses: fw::MetricsAddresses::default(),
+            scene_stride,
         };
-        let offset = slot * fw::METRICS_STRIDE;
+        let offset = slot * bytes;
         lease.addresses = fw::MetricsAddresses {
             firmware: bases.firmware.checked_add(offset as u64).ok_or(EOVERFLOW)?,
             client: bases.client.checked_add(offset as u64).ok_or(EOVERFLOW)?,
         };
-        let words = object.pointer(offset, fw::METRICS_STRIDE)?.cast::<u32>();
+        let words = object.pointer(offset, bytes)?.cast::<u32>();
         object.word(offset)?;
-        for index in 0..fw::SCENES {
+        for index in 0..bytes / size_of::<u32>() {
             // SAFETY: The complete naturally aligned metrics entry is inside
             // the retained object; the exclusive lease excludes other owners.
             unsafe { words.add(index).write_volatile(0) };
@@ -548,6 +585,7 @@ pub(crate) struct ManagerArgs {
 pub(crate) struct Manager {
     _page_list: mmu::KernelMapping,
     graph: KernelObject,
+    layout: layout::Layout,
     tvb: Tvb,
     metrics: MetricsLease,
     scenes: Scenes,
@@ -616,34 +654,41 @@ impl Manager {
         metrics: MetricsLease,
         args: ManagerArgs,
     ) -> Result<Self> {
+        let geometry = tvb.geometry;
+        let neo = geometry == BlockGeometry::NEO;
+        let layout = if neo { layout::Layout::NEO } else { layout::Layout::m5(geometry)? };
+        if metrics.scene_stride != layout.metric_stride {
+            return Err(EINVAL);
+        }
         let mut graph = alloc.kernel(
-            fw::SIZE,
+            layout.bytes,
             cfg::TVB_PAGE,
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let source = fw::PAGE_LIST..fw::PAGE_LIST + fw::PAGE_LIST_BYTES;
-        let page_list = compact_alias(
-            &graph,
-            vm,
-            source,
-            cfg::TVB_PAGE,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            mmu::UAT_PGSZ,
-        )?;
+        let source = layout.pages..layout.pages + layout.page_bytes;
+        let page_list = if neo {
+            compact_alias(&graph, vm, source, cfg::TVB_PAGE, mmu::PROT_GPU_FW_SHARED_RW, mmu::UAT_PGSZ)?
+        } else {
+            graph.map_range(vm, source, geometry.base..geometry.end, cfg::TVB_PAGE,
+                mmu::PROT_GPU_FW_SHARED_RW, mmu::UAT_PGSZ)?
+        };
         let address = graph.gpu_va();
-        graph.initialize::<fw::Graph>(0, |view| {
-            view.init(&fw::GraphArgs {
-                fw_va: address,
-                page_list_client: page_list.iova(),
-                metrics: metrics.addresses,
-                blocks: tvb.addresses(),
-                scratch: args.scratch,
-                discard: args.discard,
-                buffer_id: args.buffer_id.into(),
-                generation: args.generation,
-            })
-        })?;
+        let graph_args = fw::GraphArgs {
+            fw_va: address,
+            page_list_client: page_list.iova(),
+            metrics: metrics.addresses,
+            blocks: tvb.addresses(),
+            scratch: args.scratch,
+            discard: args.discard,
+            buffer_id: args.buffer_id.into(),
+            generation: args.generation,
+        };
+        if neo {
+            graph.initialize::<fw::Graph>(0, |view| view.init(&graph_args))?;
+        } else {
+            layout.initialize(geometry, &graph_args, graph.bytes_mut())?;
+        }
         fence(Ordering::SeqCst);
         let mut scenes = Scenes::new();
         scenes.commit(args.first_ordinal, fw::FIRST_SCENE)?;
@@ -651,6 +696,7 @@ impl Manager {
         Ok(Self {
             _page_list: page_list,
             graph,
+            layout,
             tvb,
             metrics,
             scenes,
@@ -700,20 +746,38 @@ impl Manager {
         self.page_list_client
     }
     pub(crate) fn trailer_va(&self) -> u64 {
-        self.graph.gpu_va() + fw::SCENE_TABLE as u64 + (fw::SCENES * size_of::<fw::Scene>()) as u64
+        self.graph.gpu_va() + self.layout.scenes as u64 + (fw::SCENES * size_of::<fw::Scene>()) as u64
     }
     pub(crate) fn scene_va(&self, index: usize) -> Result<u64> {
         if index >= fw::SCENES {
             return Err(EINVAL);
         }
-        Ok(self.graph.gpu_va() + fw::SCENE_TABLE as u64 + (index * size_of::<fw::Scene>()) as u64)
+        Ok(self.graph.gpu_va() + self.layout.scenes as u64 + (index * size_of::<fw::Scene>()) as u64)
     }
+    pub(crate) fn graph(&self) -> &KernelObject {
+        &self.graph
+    }
+    /// The scene's scratch offset and metric pointer register values. M5's are offsets from the
+    /// compact window's base, the metric pointer tagged in bit 0.
     pub(crate) fn scene_registers(&self, index: usize) -> Result<(u64, u64)> {
-        fw::scene_registers(index, self.scratch, self.metrics.addresses.client)
+        let geometry = self.tvb.geometry;
+        if geometry == BlockGeometry::NEO {
+            return fw::scene_registers(index, self.scratch, self.metrics.addresses.client);
+        }
+        if index >= fw::SCENES { return Err(EINVAL); }
+        let scratch = self.scratch.checked_sub(geometry.base).ok_or(EINVAL)?
+            .checked_add((index % self.layout.scratch_slots * self.layout.scratch_stride) as u64)
+            .ok_or(EOVERFLOW)?;
+        let metric = self.metrics.addresses.client.checked_sub(geometry.base).ok_or(EINVAL)?
+            .checked_add((index * self.layout.metric_stride) as u64).ok_or(EOVERFLOW)?;
+        if scratch > u64::from(u32::MAX) || metric > u64::from(u32::MAX) || metric & 3 != 0 {
+            return Err(EINVAL);
+        }
+        Ok((scratch, metric | 1))
     }
     pub(crate) fn prepare_scene(&mut self, ordinal: u64) -> Result<usize> {
         let scene = self.scenes.select(ordinal)?;
-        let offset = fw::SCENE_TABLE + scene * size_of::<fw::Scene>();
+        let offset = self.layout.scenes + scene * size_of::<fw::Scene>();
         let used = self
             .graph
             .word(offset + core::mem::offset_of!(fw::Scene, used))?;
@@ -738,7 +802,7 @@ impl Manager {
         self.scenes.release(ordinal)
     }
     pub(crate) fn prepare_submission(&mut self) -> Result<Submitted<'_>> {
-        let word = self.graph.word(fw::COUNTER)?;
+        let word = self.graph.word(self.layout.counter)?;
         Ok(Submitted {
             word,
             next: word.load(Ordering::Relaxed).wrapping_add(1),
@@ -749,10 +813,10 @@ impl Manager {
     fn sample_max_pages(&mut self) -> Result<u32> {
         let max_pages = self
             .graph
-            .word(fw::CONTROL + core::mem::offset_of!(fw::Control, max_pages))?;
+            .word(self.layout.control + core::mem::offset_of!(fw::Control, max_pages))?;
         let reset = self
             .graph
-            .word(fw::CONTROL + core::mem::offset_of!(fw::Control, reset))?;
+            .word(self.layout.control + core::mem::offset_of!(fw::Control, reset))?;
         fence(Ordering::Acquire);
         let pages = max_pages.load(Ordering::Relaxed);
         fence(Ordering::Release);
@@ -836,9 +900,9 @@ impl Manager {
     }
     fn cursors(&self) -> Result<Cursors> {
         Ok(Cursors {
-            total: self.graph.word(fw::CONTROL)?.load(Ordering::Relaxed),
-            committed: self.graph.word(fw::CONTROL + 4)?.load(Ordering::Relaxed),
-            read: self.graph.word(fw::CONTROL + 8)?.load(Ordering::Relaxed),
+            total: self.graph.word(self.layout.control)?.load(Ordering::Relaxed),
+            committed: self.graph.word(self.layout.control + 4)?.load(Ordering::Relaxed),
+            read: self.graph.word(self.layout.control + 8)?.load(Ordering::Relaxed),
         })
     }
 }
@@ -1157,9 +1221,9 @@ impl BufferIds {
     }
 }
 impl MetricsIds {
+    /// Entries leased; the backing object bounds how many exist ([`MetricsLease::new`]).
     pub(crate) fn used(&self) -> u32 {
         self.used.iter().map(|bits| bits.load(Ordering::Acquire).count_ones()).sum::<u32>()
-            - (128 - fw::METRICS_SLOTS as u32)
     }
 }
 

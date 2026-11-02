@@ -652,11 +652,12 @@ impl ComputePool {
     }
 }
 
-/// The private-memory pool of an M5 compute queue, with the same QID-derived slot as
-/// [`ComputePool`]. The M5 firmware's pool is a page directory over a fixed address inventory
-/// and a block free list ([`super::fw::m5::pool`]), followed in one canonical low allocation by
-/// its backed blocks, and a shared state the firmware completes into. It is never vacated.
-pub(crate) struct M5ComputePool {
+/// The private-memory pool of an M5 compute queue or render pair, in the page-pool slot of its
+/// (tiling) QID, as for [`ComputePool`]. The M5 firmware's pool is a page directory over a fixed
+/// address inventory and a block free list ([`super::fw::m5::pool`]), followed in one canonical
+/// low allocation by its backed blocks, and a shared state the firmware completes into. It is
+/// never vacated.
+pub(crate) struct M5Pool {
     backing: KernelObject,
     layout: super::fw::m5::pool::PoolLayout,
     /// The shared pool state, which the queue configuration names.
@@ -665,15 +666,20 @@ pub(crate) struct M5ComputePool {
     state: KernelObject,
     id: u16,
 }
-impl M5ComputePool {
-    /// A pool of `blocks` backed blocks for queue `qid`, built without the device mutex.
-    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8, blocks: usize) -> Result<Self> {
+impl M5Pool {
+    /// A pool of `geometry` serving `engine` for queue `qid`, built without the device mutex.
+    pub(crate) fn new(
+        alloc: &Allocator<'_>,
+        qid: u8,
+        geometry: super::fw::m5::pool::PoolGeometry,
+        engine: super::fw::m5::pool::Engine,
+    ) -> Result<Self> {
         use super::fw::m5::pool;
         if qid > super::fw::kick::QID_MAX {
             return Err(EINVAL);
         }
         let id = u16::from(qid) + 1;
-        let geometry = pool::PoolGeometry::compute(blocks).map_err(|_| EINVAL)?;
+        let blocks = geometry.blocks;
         let size = geometry.backing_bytes().map_err(|_| EINVAL)?;
         let mut backing = place_lower(size, || {
             alloc.lower(
@@ -712,7 +718,7 @@ impl M5ComputePool {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        pool::encode_compute_state(layout, state.gpu_va(), control.bytes_mut())
+        pool::encode_state(layout, engine, state.gpu_va(), control.bytes_mut())
             .map_err(|_| EINVAL)?;
         fence(Ordering::SeqCst);
         Ok(Self {

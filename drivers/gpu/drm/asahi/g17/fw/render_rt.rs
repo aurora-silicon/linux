@@ -12,6 +12,10 @@ pub(crate) struct RayQueryStage {
 }
 
 impl RayQueryStage {
+    /// No ray queries in the stage.
+    pub(crate) const NONE: Self =
+        Self { intersection: IntersectionTables::NONE, scratch: ScratchRequest::NONE };
+
     fn parse(bytes: &[u8]) -> Result<Self> {
         let mut wire = [0u8; 56];
         wire[..bytes.len()].copy_from_slice(bytes);
