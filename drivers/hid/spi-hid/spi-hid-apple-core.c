@@ -285,13 +285,16 @@ static struct spihid_interface *spihid_get_iface(struct spihid_apple *spihid,
 
 static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 				u8 unk1, u8 unk2, u16 resp_len, u8 *buf,
-				    size_t len)
+				    size_t len, bool *bad_status)
 {
 	struct spihid_transfer_packet *pkt;
 	struct spihid_msg_hdr *hdr;
 	u16 crc;
-	bool bad_status;
+	bool status_mismatch;
 	int err;
+
+	if (bad_status)
+		*bad_status = false;
 
 	/* know reports are small enoug to fit in a single packet */
 	if (len > sizeof(pkt->data) - sizeof(*hdr) - sizeof(__le16))
@@ -346,16 +349,18 @@ static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 
 	err = spi_sync(spihid->spidev, &spihid->tx_msg);
 
-	bad_status = !err && memcmp(spihid->status_buf, spi_hid_apple_status_ok,
-				    sizeof(spi_hid_apple_status_ok));
-	if (bad_status) {
+	status_mismatch = !err && memcmp(spihid->status_buf, spi_hid_apple_status_ok,
+					 sizeof(spi_hid_apple_status_ok));
+	if (bad_status)
+		*bad_status = status_mismatch;
+	if (status_mismatch) {
 		u8 *b = spihid->status_buf;
 		dev_warn_ratelimited(&spihid->spidev->dev,
 				     "status message mismatch: %02x %02x %02x %02x (device %u request %02x report %02x id %u)\n",
 				     b[0], b[1], b[2], b[3], target, unk0, unk1, hdr->id);
 	}
 	/* Preserve best-effort SET/OUTPUT semantics; only GETs are replayable. */
-	if (bad_status && unk0 == 0x32)
+	if (status_mismatch && unk0 == 0x32)
 		err = -EPROTO;
 	mutex_unlock(&spihid->tx_lock);
 	if (err < 0)
@@ -423,7 +428,7 @@ static int spihid_get_report(struct spihid_apple *spihid,
 {
 	unsigned long flags;
 	int attempt, ret;
-	bool timed_out;
+	bool bad_status, timed_out;
 
 	ret = mutex_lock_interruptible(&spihid->get_report_lock);
 	if (ret)
@@ -432,7 +437,7 @@ static int spihid_get_report(struct spihid_apple *spihid,
 	for (attempt = 0; attempt < SPIHID_GET_REPORT_ATTEMPTS; attempt++) {
 		timed_out = false;
 		ret = spihid_apple_request(spihid, idev->id, 0x32, reportnum,
-					   0x00, len, NULL, 0);
+					   0x00, len, NULL, 0, &bad_status);
 		if (ret >= 0) {
 			ret = wait_event_interruptible_timeout(spihid->wait,
 							       READ_ONCE(idev->reply_len),
@@ -453,10 +458,13 @@ static int spihid_get_report(struct spihid_apple *spihid,
 
 		/*
 		 * RX CRC validation can discard a reply even after a valid
-		 * write status. Only retry that timeout, with a fresh ID.
-		 * Bad status and other transport errors are returned as-is.
+		 * write status. A valid GET can also receive a bad status,
+		 * including the first dimensions query after enabling MT.
+		 * Retry either with a fresh ID, sharing the attempt limit.
+		 * Keep SPI errors (even -EPROTO) and signals distinct from
+		 * status mismatches so they are never replayed.
 		 */
-		if (!timed_out)
+		if (!timed_out && !bad_status)
 			break;
 	}
 
@@ -492,7 +500,8 @@ static int apple_ll_raw_request(struct hid_device *hdev,
 		 * The report number is not the interface id: the keyboard's LED
 		 * report is 1 on interface 1, the actuator's is 0x21 on 3.
 		 */
-		return spihid_apple_request(spihid, idev->id, 0x52, reportnum, 0x00, 2, buf, len);
+		return spihid_apple_request(spihid, idev->id, 0x52, reportnum,
+					   0x00, 2, buf, len, NULL);
 	default:
 		return -EIO;
 	}
@@ -512,7 +521,8 @@ static int apple_ll_output_report(struct hid_device *hdev, __u8 *buf,
 	dev_dbg(&spihid->spidev->dev, "device:%u report:%u len:%zu",
 		idev->id, buf[0], len);
 	/* The request carries the report number, not the interface id. */
-	return spihid_apple_request(spihid, idev->id, 0x51, buf[0], 0x00, 0, buf, len);
+	return spihid_apple_request(spihid, idev->id, 0x51, buf[0],
+				   0x00, 0, buf, len, NULL);
 }
 
 static struct hid_ll_driver apple_hid_ll = {
@@ -1182,7 +1192,7 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 
 	/* request device information */
 	dev_dbg(dev, "request device info");
-	spihid_apple_request(spihid, 0xd0, 0x20, 0x01, 0xd0, 0, NULL, 0);
+	spihid_apple_request(spihid, 0xd0, 0x20, 0x01, 0xd0, 0, NULL, 0, NULL);
 	err = wait_event_interruptible_timeout(spihid->wait, spihid->vendor_id,
 					       SPIHID_DEF_WAIT);
 	if (err == 0)
@@ -1199,7 +1209,7 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 			continue;
 		dev_dbg(dev, "request interface info 0x%02x", i);
 		spihid_apple_request(spihid, 0xd0, 0x20, 0x02, i,
-				     SPIHID_DESC_MAX, NULL, 0);
+				     SPIHID_DESC_MAX, NULL, 0, NULL);
 		err = wait_event_interruptible_timeout(
 			spihid->wait, iface->max_input_report_len,
 			SPIHID_DEF_WAIT);
@@ -1212,7 +1222,7 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 			continue;
 		dev_dbg(dev, "request hid report desc 0x%02x", i);
 		spihid_apple_request(spihid, 0xd0, 0x20, 0x10, i,
-				     SPIHID_DESC_MAX, NULL, 0);
+				     SPIHID_DESC_MAX, NULL, 0, NULL);
 		wait_event_interruptible_timeout(
 			spihid->wait, iface->hid_desc_len, SPIHID_DEF_WAIT);
 	}

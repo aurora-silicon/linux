@@ -14,6 +14,7 @@ struct spihid_test {
 	unsigned int writes;
 	unsigned int bad_status;
 	unsigned int corrupt_replies;
+	int spi_error;
 	bool stale_first;
 };
 
@@ -51,6 +52,12 @@ static int spihid_test_transfer(struct spi_controller *ctlr,
 	struct spihid_msg_hdr *hdr = (void *)pkt->data;
 
 	ctx->writes++;
+	if (ctx->spi_error) {
+		msg->status = ctx->spi_error;
+		spi_finalize_current_message(ctlr);
+		return 0;
+	}
+
 	if (ctx->writes <= ctx->bad_status) {
 		static const u8 bad[] = { 0x9c, 0x17, 0xe5, 0xf8 };
 
@@ -154,13 +161,49 @@ static void spihid_test_bad_status(struct kunit *test)
 	u8 buf[32];
 	int ret;
 
-	ctx->bad_status = 1;
+	ctx->bad_status = SPIHID_GET_REPORT_ATTEMPTS;
 	memset(buf, 0xa5, sizeof(buf));
 	ret = spihid_get_report(ctx->spihid, &ctx->spihid->tp, 0xd9, buf, sizeof(buf));
 	KUNIT_EXPECT_EQ(test, ret, -EPROTO);
-	KUNIT_EXPECT_EQ(test, ctx->writes, 1);
+	KUNIT_EXPECT_EQ(test, ctx->writes, SPIHID_GET_REPORT_ATTEMPTS);
 	KUNIT_EXPECT_EQ(test, buf[0], 0xa5);
 	KUNIT_EXPECT_FALSE(test, ctx->spihid->tp.reply_pending);
+	/* A rejected attempt must not leave a waiter for a late reply. */
+	spihid_test_reply(ctx, SPIHID_DEVICE_ID_TP, ctx->spihid->msg_id - 1, 0xd9, false);
+	KUNIT_EXPECT_EQ(test, ctx->spihid->tp.reply_len, 0);
+}
+
+static void spihid_test_later_get_bad_status(struct kunit *test)
+{
+	struct spihid_test *ctx = test->priv;
+	struct spihid_apple *spihid = ctx->spihid;
+	u8 mt[] = { 0x02, 0x01 };
+	u8 buf[32];
+	int ret;
+
+	/* Earlier successful traffic must not prevent later GET recovery. */
+	spihid->msg_id = 9;
+	ret = spihid_get_report(spihid, &spihid->tp, 0xd9, buf, sizeof(buf));
+	KUNIT_ASSERT_EQ(test, ret, sizeof(spihid_test_dimensions));
+	KUNIT_ASSERT_EQ(test, ctx->writes, 1);
+
+	/* First input open sends the MT SET immediately before dimensions. */
+	ret = spihid_apple_request(spihid, SPIHID_DEVICE_ID_TP, 0x52,
+				   mt[0], 0, 2, mt, sizeof(mt), NULL);
+	KUNIT_ASSERT_EQ(test, ret, sizeof(mt));
+	KUNIT_ASSERT_EQ(test, ctx->writes, 2);
+
+	/* Reproduce report d9, id 11, status 9c 17 e5 f8, then succeed. */
+	ctx->bad_status = 3;
+	ctx->stale_first = true;
+	memset(buf, 0xa5, sizeof(buf));
+	ret = spihid_get_report(spihid, &spihid->tp, 0xd9, buf, sizeof(buf));
+	KUNIT_ASSERT_EQ(test, ret, sizeof(spihid_test_dimensions));
+	KUNIT_EXPECT_EQ(test, ctx->writes, 4);
+	KUNIT_EXPECT_EQ(test, spihid->msg_id, 13);
+	KUNIT_EXPECT_MEMEQ(test, buf, spihid_test_dimensions, ret);
+	KUNIT_EXPECT_EQ(test, buf[ret], 0xa5);
+	KUNIT_EXPECT_FALSE(test, spihid->tp.reply_pending);
 }
 
 static void spihid_test_crc_timeout_retry(struct kunit *test)
@@ -226,6 +269,43 @@ static void spihid_test_short_buffer(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, buf[sizeof(spihid_test_dimensions)], 0xa5);
 }
 
+static void spihid_test_mixed_retry_limit(struct kunit *test)
+{
+	struct spihid_test *ctx = test->priv;
+	u8 buf[32];
+	int ret;
+
+	/* Status rejection and lost replies share one bounded budget. */
+	ctx->bad_status = 1;
+	ctx->corrupt_replies = SPIHID_GET_REPORT_ATTEMPTS;
+	memset(buf, 0xa5, sizeof(buf));
+	ret = spihid_get_report(ctx->spihid, &ctx->spihid->tp, 0xd9, buf, sizeof(buf));
+	KUNIT_EXPECT_EQ(test, ret, -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, ctx->writes, SPIHID_GET_REPORT_ATTEMPTS);
+	KUNIT_EXPECT_EQ(test, buf[0], 0xa5);
+	KUNIT_EXPECT_FALSE(test, ctx->spihid->tp.reply_pending);
+}
+
+static void spihid_test_spi_error_no_retry(struct kunit *test)
+{
+	struct spihid_test *ctx = test->priv;
+	static const int errors[] = { -EIO, -EPROTO };
+	u8 buf[32];
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(errors); i++) {
+		ctx->writes = 0;
+		ctx->spi_error = errors[i];
+		memset(buf, 0xa5, sizeof(buf));
+		ret = spihid_get_report(ctx->spihid, &ctx->spihid->tp, 0xd9,
+					buf, sizeof(buf));
+		KUNIT_EXPECT_EQ(test, ret, errors[i]);
+		KUNIT_EXPECT_EQ(test, ctx->writes, 1);
+		KUNIT_EXPECT_EQ(test, buf[0], 0xa5);
+		KUNIT_EXPECT_FALSE(test, ctx->spihid->tp.reply_pending);
+	}
+}
+
 static void spihid_test_no_set_retry(struct kunit *test)
 {
 	struct spihid_test *ctx = test->priv;
@@ -234,17 +314,20 @@ static void spihid_test_no_set_retry(struct kunit *test)
 
 	ctx->bad_status = 1;
 	ret = spihid_apple_request(ctx->spihid, SPIHID_DEVICE_ID_AUX,
-				   0x52, buf[0], 0, 2, buf, sizeof(buf));
+				   0x52, buf[0], 0, 2, buf, sizeof(buf), NULL);
 	KUNIT_EXPECT_EQ(test, ret, sizeof(buf));
 	KUNIT_EXPECT_EQ(test, ctx->writes, 1);
 }
 
 static struct kunit_case spihid_test_cases[] = {
 	KUNIT_CASE(spihid_test_bad_status),
+	KUNIT_CASE(spihid_test_later_get_bad_status),
 	KUNIT_CASE(spihid_test_crc_timeout_retry),
 	KUNIT_CASE(spihid_test_stale_reply),
 	KUNIT_CASE(spihid_test_retry_limit),
 	KUNIT_CASE(spihid_test_short_buffer),
+	KUNIT_CASE(spihid_test_mixed_retry_limit),
+	KUNIT_CASE(spihid_test_spi_error_no_retry),
 	KUNIT_CASE(spihid_test_no_set_retry),
 	{}
 };
