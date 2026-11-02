@@ -958,6 +958,7 @@ int usb_hub_release_port(struct usb_device *hdev, unsigned port1,
 /* port power switching for a driver that moves the lanes behind a port */
 int usb_hub_port_power_off(struct usb_device *hdev, int port1);
 int usb_hub_port_power_on(struct usb_device *hdev, int port1);
+int usb_hub_port_retrain(struct usb_device *hdev, int port1);
 
 /**
  * usb_make_path - returns stable device path in the usb tree

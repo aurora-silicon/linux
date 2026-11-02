@@ -3210,6 +3210,10 @@ static void brcmf_convert_ratespec_to_rateinfo(u32 ratespec,
 		/* Fill in nothing */
 		break;
 	}
+	if ((BRCMF_RSPEC_ISHT(ratespec) || BRCMF_RSPEC_ISVHT(ratespec)) &&
+	    BRCMF_RSPEC_ISSGI(ratespec))
+		rateinfo->flags |= RATE_INFO_FLAGS_SHORT_GI;
+
 	if (BRCMF_RSPEC_ISHT(ratespec)) {
 		rateinfo->flags |= RATE_INFO_FLAGS_MCS;
 		rateinfo->mcs = ratespec & BRCMF_RSPEC_HT_MCS_MASK;

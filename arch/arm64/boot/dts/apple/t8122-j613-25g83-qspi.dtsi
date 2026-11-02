@@ -31,6 +31,7 @@
 				compatible = "jedec,spi-nor";
 				reg = <0>;
 				spi-max-frequency = <10000000>;
+				vcc-supply = <&nor_flash_vcc>;
 
 				partitions {
 					compatible = "fixed-partitions";

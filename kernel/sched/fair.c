@@ -6353,6 +6353,8 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 	    task_fits_cpu(p, cpu)) {
 
 		rq->misfit_task_load = 0;
+		if (p)
+			p->misfit_runtime = p->se.sum_exec_runtime;
 		return;
 	}
 
@@ -8219,6 +8221,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	unsigned long weight;
 	bool curr;
 
+	if (flags & ENQUEUE_WAKEUP)
+		p->misfit_runtime = se->sum_exec_runtime;
+
 	if (task_is_throttled(p) && enqueue_throttled_task(p))
 		return;
 
@@ -9997,6 +10002,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
 	struct sched_entity *se = &p->se;
+
+	p->misfit_runtime = se->sum_exec_runtime;
 
 	if (!task_on_rq_migrating(p)) {
 		remove_entity_load_avg(se);
@@ -15026,6 +15033,140 @@ static __latent_entropy void sched_balance_softirq(void)
 }
 
 /*
+ * Misfit rotation.
+ *
+ * Load balancing moves a misfit task to a bigger CPU only when a bigger CPU
+ * has spare capacity. When every bigger CPU runs one task of its own, the
+ * misfit task stays on its small CPU for as long as those tasks run, so
+ * equal tasks make unequal progress. Work split evenly across all CPUs then
+ * ends with a tail in which the tasks that started on small CPUs finish
+ * alone on big ones.
+ *
+ * Once a task has executed as a misfit for a few base slices, swap it with
+ * the task on a busy bigger CPU. Bigger CPUs are taken round robin, so each
+ * task on them takes its turn on a smaller CPU: the big CPUs are time
+ * shared, as one runqueue would share them. It only applies when every
+ * allowed bigger CPU runs exactly one fair task (an idle one pulls the
+ * misfit task through load balancing instead), and it never moves down a
+ * task with a higher weight or a higher uclamp_min than the misfit task.
+ */
+/* Serialize destination selection through completion of the swap. */
+static DEFINE_MUTEX(misfit_rotate_mutex);
+static int misfit_rotate_last_cpu;
+
+static bool misfit_rotate_candidate(struct task_struct *p)
+{
+	return p && p->sched_class == &fair_sched_class &&
+	       !(p->flags & (PF_EXITING | PF_KTHREAD)) &&
+	       p->nr_cpus_allowed > 1;
+}
+
+static void misfit_rotate_work(struct work_struct *work)
+{
+	struct rq *src_rq = container_of(work, struct rq, misfit_rotate_work);
+	int src_cpu = cpu_of(src_rq), dst_cpu = -1, cpu, start;
+	unsigned long src_cap = arch_scale_cpu_capacity(src_cpu);
+	struct task_struct *p, *t = NULL;
+	bool idle = false;
+	int ret = -EINVAL;
+
+	p = xchg(&src_rq->misfit_rotate_p, NULL);
+	if (!p)
+		return;
+
+	mutex_lock(&misfit_rotate_mutex);
+
+	if (!sched_feat(MISFIT_ROTATE)) {
+		ret = -ECANCELED;
+		goto out;
+	}
+
+	/* The task may have moved, slept or shrunk since the tick. */
+	if (task_cpu(p) != src_cpu || !task_on_rq_queued(p) ||
+	    !misfit_rotate_candidate(p) || task_fits_cpu(p, src_cpu))
+		goto out;
+
+	rcu_read_lock();
+	start = misfit_rotate_last_cpu;
+	for_each_cpu_wrap(cpu, p->cpus_ptr, start + 1) {
+		struct rq *rq = cpu_rq(cpu);
+		struct task_struct *c;
+
+		if (arch_scale_cpu_capacity(cpu) <= src_cap || !cpu_active(cpu))
+			continue;
+
+		if (!READ_ONCE(rq->nr_running)) {
+			idle = true;
+			break;
+		}
+
+		if (t || READ_ONCE(rq->nr_running) != 1)
+			continue;
+
+		c = rcu_dereference_all(rq->curr);
+		if (!misfit_rotate_candidate(c) ||
+		    !cpumask_test_cpu(src_cpu, c->cpus_ptr))
+			continue;
+
+		if (c->se.load.weight > p->se.load.weight ||
+		    uclamp_eff_value(c, UCLAMP_MIN) > uclamp_eff_value(p, UCLAMP_MIN))
+			continue;
+
+		t = c;
+		dst_cpu = cpu;
+	}
+
+	if (idle)
+		t = NULL;
+	if (t)
+		get_task_struct(t);
+	rcu_read_unlock();
+
+	ret = idle ? -EAGAIN : -EBUSY;
+	if (t) {
+		ret = migrate_swap(p, t, dst_cpu, src_cpu);
+		if (!ret)
+			misfit_rotate_last_cpu = dst_cpu;
+	}
+out:
+	trace_sched_misfit_rotate(p, t, src_cpu, dst_cpu, ret);
+	if (t)
+		put_task_struct(t);
+	mutex_unlock(&misfit_rotate_mutex);
+	put_task_struct(p);
+}
+
+/* Called from the tick on this CPU, so current is rq->curr. */
+static void misfit_rotate_trigger(struct rq *rq)
+{
+	struct task_struct *p = current;
+
+	if (!sched_feat(MISFIT_ROTATE) || !sched_asym_cpucap_active())
+		return;
+
+	if (!READ_ONCE(rq->misfit_task_load) ||
+	    READ_ONCE(rq->nr_running) != 1 || !misfit_rotate_candidate(p))
+		return;
+
+	/* Preemption must not restart a CPU-bound task's misfit interval. */
+	if (p->se.sum_exec_runtime - p->misfit_runtime <
+	    4ULL * sysctl_sched_base_slice)
+		return;
+
+	if (READ_ONCE(rq->misfit_rotate_p))
+		return;
+
+	get_task_struct(p);
+	if (cmpxchg(&rq->misfit_rotate_p, NULL, p)) {
+		put_task_struct(p);
+		return;
+	}
+	p->misfit_runtime = p->se.sum_exec_runtime;
+	trace_sched_misfit_rotate(p, NULL, cpu_of(rq), -1, -EINPROGRESS);
+	queue_work_on(cpu_of(rq), system_highpri_wq, &rq->misfit_rotate_work);
+}
+
+/*
  * Trigger the SCHED_SOFTIRQ if it is time to do periodic load balancing.
  */
 void sched_balance_trigger(struct rq *rq)
@@ -15036,6 +15177,8 @@ void sched_balance_trigger(struct rq *rq)
 	 */
 	if (unlikely(on_null_domain(rq) || !cpu_active(cpu_of(rq))))
 		return;
+
+	misfit_rotate_trigger(rq);
 
 	if (time_after_eq(jiffies, rq->next_balance))
 		raise_softirq(SCHED_SOFTIRQ);
@@ -15942,6 +16085,7 @@ __init void init_sched_fair_class(void)
 		zalloc_cpumask_var_node(&per_cpu(select_rq_mask,    i), GFP_KERNEL, cpu_to_node(i));
 		zalloc_cpumask_var_node(&per_cpu(should_we_balance_tmpmask, i),
 					GFP_KERNEL, cpu_to_node(i));
+		INIT_WORK(&cpu_rq(i)->misfit_rotate_work, misfit_rotate_work);
 
 #ifdef CONFIG_CFS_BANDWIDTH
 		INIT_CSD(&cpu_rq(i)->cfsb_csd, __cfsb_csd_unthrottle, cpu_rq(i));

@@ -10,6 +10,128 @@ use crate::sks::SKS_AUTH_TOKEN_LEN;
 use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
 
+struct EnrolPrerequisites {
+    lane: bool,
+    live_count: Option<usize>,
+    bag_bound: bool,
+    catacomb_readable: [bool; 3],
+    catacomb_writable: [bool; 3],
+    keybag_writable: bool,
+    host_store_capacity: bool,
+}
+
+fn admit_enrol(p: &EnrolPrerequisites) -> Result<()> {
+    if !p.lane { return Err(ENXIO); }
+    let count = p.live_count.ok_or(EIO)?;
+    if count >= 3 { return Err(ENOSPC); }
+    if !p.bag_bound || p.catacomb_readable.contains(&false) {
+        return Err(ENODATA);
+    }
+    if p.catacomb_writable.contains(&false) || !p.keybag_writable {
+        return Err(EROFS);
+    }
+    if !p.host_store_capacity { return Err(ENOSPC); }
+    Ok(())
+}
+
+fn catacomb_needed_for_enrol(kind: u8, live_count: Option<usize>) -> bool {
+    live_count != Some(0) || kind == PRIVATE_TYPE_CATACOMB_OWNER
+}
+
+fn admissible_orphan_target(
+    listed_linux: &[[u8; bio::UUID_LEN]],
+    uuid: &[u8; bio::UUID_LEN],
+) -> Result<()> {
+    if *uuid == [0; bio::UUID_LEN] { return Err(EINVAL); }
+    if !listed_linux.contains(uuid) { return Err(ENOENT); }
+    Ok(())
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_enrol_admission)]
+mod admission_tests {
+    use super::*;
+
+    fn ready() -> EnrolPrerequisites {
+        EnrolPrerequisites {
+            lane: true, live_count: Some(1), bag_bound: true,
+            catacomb_readable: [true; 3], catacomb_writable: [true; 3],
+            keybag_writable: true, host_store_capacity: true,
+        }
+    }
+
+    fn refused(p: &EnrolPrerequisites, expected: Error) {
+        assert_eq!(admit_enrol(p).unwrap_err().to_errno(), expected.to_errno());
+    }
+
+    #[test]
+    fn missing_os_identity() {
+        let mut p = ready(); p.lane = false; refused(&p, ENXIO);
+    }
+
+    #[test]
+    fn unavailable_enclave_list() {
+        let mut p = ready(); p.live_count = None; refused(&p, EIO);
+    }
+
+    #[test]
+    fn enclave_full() {
+        let mut p = ready(); p.live_count = Some(3); refused(&p, ENOSPC);
+    }
+
+    #[test]
+    fn missing_identity_bag_binding() {
+        let mut p = ready(); p.bag_bound = false; refused(&p, ENODATA);
+    }
+
+    #[test]
+    fn missing_catacomb() {
+        for i in 0..3 {
+            let mut p = ready(); p.catacomb_readable[i] = false; refused(&p, ENODATA);
+        }
+    }
+
+    #[test]
+    fn unwritable_catacomb_or_keybag() {
+        for i in 0..3 {
+            let mut p = ready(); p.catacomb_writable[i] = false; refused(&p, EROFS);
+        }
+        let mut p = ready(); p.keybag_writable = false; refused(&p, EROFS);
+    }
+
+    #[test]
+    fn host_store_full() {
+        let mut p = ready(); p.host_store_capacity = false; refused(&p, ENOSPC);
+    }
+
+    #[test]
+    fn ready_binding_is_admitted() {
+        assert!(admit_enrol(&ready()).is_ok());
+    }
+
+    #[test]
+    fn clean_lane_requires_prepared_owner_before_first_capture() {
+        assert!(catacomb_needed_for_enrol(PRIVATE_TYPE_CATACOMB_OWNER, Some(0)));
+        assert!(!catacomb_needed_for_enrol(PRIVATE_TYPE_CATACOMB_USER, Some(0)));
+        assert!(!catacomb_needed_for_enrol(PRIVATE_TYPE_CATACOMB_MASTER, Some(0)));
+        assert!(catacomb_needed_for_enrol(PRIVATE_TYPE_CATACOMB_USER, Some(1)));
+    }
+
+    #[test]
+    fn orphan_delete_requires_exact_linux_identity() {
+        let linux = [1u8; bio::UUID_LEN];
+        let other_lane = [2u8; bio::UUID_LEN];
+        assert!(admissible_orphan_target(&[linux], &linux).is_ok());
+        refused_orphan(&[linux], &other_lane, ENOENT);
+        refused_orphan(&[linux], &[0; bio::UUID_LEN], EINVAL);
+    }
+
+    fn refused_orphan(list: &[[u8; bio::UUID_LEN]], uuid: &[u8; bio::UUID_LEN], expected: Error) {
+        assert_eq!(admissible_orphan_target(list, uuid).unwrap_err().to_errno(),
+                   expected.to_errno());
+    }
+}
+
 impl SepData {
     fn sbio_enrol_step(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
         match self.sbio_call(op) {
@@ -348,6 +470,12 @@ impl SepData {
         let Some(proof) = crate::sbio::NoExistingCatacomb::from_zero_identities(listed) else {
             return self.enrol_into_existing_context(user);
         };
+
+        // PREPARE_ENROL may already have selected the empty Linux context in
+        // this boot. A file left from an earlier boot is not that proof.
+        if self.empty_context_prepared.xchg(false, Relaxed) {
+            return self.enrol_into_existing_context(user);
+        }
 
         self.open_fresh_context(user, &proof)
     }
@@ -1777,12 +1905,28 @@ impl SepData {
         };
 
         if !parsed.matches(user) {
+            // The enclave compared a usable capture and did not answer the
+            // Linux user. Usually no template matched (a different finger).
+            // Log the user it did answer, so a match in another user context
+            // can be told apart from a plain non-match.
+            dev_info!(
+                self.dev,
+                "verify: no enrolled finger matched the capture (enclave answered user {}, Linux enrolments use user {})\n",
+                parsed.user_id(),
+                user.value()
+            );
             return bio::VerifyOutcome::NoMatch;
         }
 
         // match result: user id groups templates, UUID at offset 0x04 identifies one
         let identity = *parsed.identity_uuid();
         let known = self.bio_index.lock().contains_uuid(&identity);
+
+        dev_info!(
+            self.dev,
+            "verify: enclave matched identity {} (host index {})\n",
+            Hex(&identity), if known { "present" } else { "absent" }
+        );
 
         if !known {
             dev_err!(
@@ -3404,12 +3548,145 @@ impl SepData {
         Some(bytes)
     }
 
+    fn require_linux_bio_lane(&self) -> Result<()> {
+        if !self.touchid_started.load(Relaxed) || self.xarm.lock().os_uuid.is_none() {
+            return Err(ENXIO);
+        }
+        if !self.keybag_designated.load(Relaxed)
+            || self.enrol_material.lock().is_none()
+            || !matches!(keybag::read(keybag::Slot::Identity),
+                         Ok(keybag::State::Present(_))) {
+            return Err(ENODATA);
+        }
+        Ok(())
+    }
+
+    /// Refuse before ENROL_START schedules work or sends BEGIN_ENROL. A
+    /// userspace passwd lookup proves the host account; these are the durable
+    /// Linux-lane bindings that only the kernel can inspect.
+    fn preflight_enrol(&self, live_count: Option<usize>) -> Result<()> {
+        let lane = self.touchid_started.load(Relaxed) && self.xarm.lock().os_uuid.is_some();
+        let bag_bound = self.keybag_designated.load(Relaxed) && self.enrol_material.lock()
+            .as_ref().is_some_and(|material| material.snapshot_identity.is_some());
+        let kinds = [PRIVATE_TYPE_CATACOMB_OWNER, PRIVATE_TYPE_CATACOMB_USER,
+                     PRIVATE_TYPE_CATACOMB_MASTER];
+        let readable = kinds.map(|kind| !catacomb_needed_for_enrol(kind, live_count)
+            || crate::catacomb::read(kind).is_some());
+        let writable = kinds.map(|kind| !catacomb_needed_for_enrol(kind, live_count)
+            || crate::catacomb::writable(kind));
+        let index = self.bio_index.lock();
+        let preconditions = EnrolPrerequisites {
+            lane,
+            live_count,
+            bag_bound,
+            catacomb_readable: readable,
+            catacomb_writable: writable,
+            keybag_writable: shim::StoreFile::open_writable_existing(
+                keybag::Slot::Identity.path()).is_ok(),
+            host_store_capacity: self.with_host_store(|store| index.can_persist_next(store))
+                .unwrap_or(false),
+        };
+        let result = admit_enrol(&preconditions);
+        if let Err(e) = &result {
+            dev_warn!(self.dev, "enrol: prerequisites failed before enclave capture: {:?}\n", e);
+        }
+        result
+    }
+
+    fn bio_list_enclave(&self, arg: usize) -> Result<bio::Handled> {
+        bio::require_admin()?;
+        self.require_linux_bio_lane()?;
+        let ids = self.enclave_identities_for(SBIO_PROBE_USER_ID).ok_or(EIO)?;
+        let mut out = bio::EnclaveList::new();
+        for uuid in ids.iter() {
+            out.push(*uuid)?;
+        }
+        kernel::uaccess::UserSlice::new(
+            kernel::uaccess::UserPtr::from_addr(arg), core::mem::size_of::<bio::EnclaveList>()
+        ).writer().write(&out)?;
+        bio::ok()
+    }
+
+    fn bio_delete_orphan(&self, arg: usize) -> Result<bio::Handled> {
+        bio::require_admin()?;
+        self.require_linux_bio_lane()?;
+        if !bio::idle_for_mutation(&self.bio_session.lock()) { return Err(EBUSY); }
+        let request: bio::Delete = kernel::uaccess::UserSlice::new(
+            kernel::uaccess::UserPtr::from_addr(arg), core::mem::size_of::<bio::Delete>()
+        ).reader().read()?;
+        // The exact SEP user and built-in selector are checked by the parser.
+        // The host index may still hold an orphan after fprintd lost its file,
+        // so that index cannot decide whether this exact-ID recovery is valid.
+        let ids = self.enclave_identities_for(SBIO_PROBE_USER_ID).ok_or(EIO)?;
+        admissible_orphan_target(&ids, &request.uuid)?;
+        bio::orphan_delete(crate::sbio::IdentityV1::from_index(
+            SBIO_PROBE_USER_ID, request.uuid))
+    }
+
+    fn bio_prepare_enrol(&self, arg: usize) -> Result<bio::Handled> {
+        bio::require_admin()?;
+        bio::validate_enrol_start_arg(arg)?;
+        self.require_linux_bio_lane()?;
+        if !bio::idle_for_mutation(&self.bio_session.lock()) { return Err(EBUSY); }
+        if !sensor::is_bound() { return Err(ENODEV); }
+        if !self.xart_writable() { return Err(EROFS); }
+        let ids = self.enclave_identities_for(SBIO_PROBE_USER_ID).ok_or(EIO)?;
+        if !ids.is_empty() {
+            // An existing identity must already have a durable owner file;
+            // selecting SYSTEM here could disturb its live context.
+            return if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_some() {
+                bio::ok()
+            } else { Err(ENODATA) };
+        }
+        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_some() {
+            return bio::ok();
+        }
+        if !self.keybag_designated.load(Relaxed)
+            || !self.enrol_material.lock().as_ref()
+                .is_some_and(|material| material.snapshot_identity.is_some()) {
+            return Err(ENODATA);
+        }
+        if shim::StoreFile::open_writable_existing(keybag::Slot::Identity.path()).is_err() {
+            return Err(EROFS);
+        }
+        let index = self.bio_index.lock();
+        if !self.with_host_store(|store| index.can_persist_next(store)).unwrap_or(false) {
+            return Err(ENOSPC);
+        }
+        drop(index);
+        let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
+        // The host must be able to create and sync the owner file before a
+        // system-context write. A pre-existing invalid file is left intact.
+        crate::catacomb::prepare_missing_owner()?;
+        loop {
+            self.wait_until_awake()?;
+            let _writer = self.catacomb_writer.lock();
+            if !self.capture_begin() { continue; }
+            let prepared = self.open_enrolment_context(user);
+            self.capture_end();
+            if !prepared { return Err(EIO); }
+            break;
+        }
+        if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none()
+            || !crate::catacomb::writable(PRIVATE_TYPE_CATACOMB_OWNER) {
+            return Err(EROFS);
+        }
+        self.empty_context_prepared.store(true, Relaxed);
+        bio::ok()
+    }
+
     pub(crate) fn bio_ioctl(&self, cmd: u32, arg: usize) -> Result<bio::Handled> {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
+        }
+        if cmd == bio::IOC_LIST_ENCLAVE {
+            return self.bio_list_enclave(arg);
+        }
+        if cmd == bio::IOC_PREPARE_ENROL {
+            return self.bio_prepare_enrol(arg);
         }
         // With xART writes off the enclave cannot persist what an enrolment or
         // a match changes. It saves anti-replay state after every match, and a
@@ -3435,14 +3712,21 @@ impl SepData {
         let live_identity_count = if (cmd == bio::IOC_GET_INFO || cmd == bio::IOC_ENROL_START)
             && self.touchid_started.load(Relaxed)
         {
-            self.enclave_identity_count()
+            self.enclave_identities_for(SBIO_PROBE_USER_ID).map(|ids| ids.len())
         } else {
             None
         };
+        if cmd == bio::IOC_ENROL_START {
+            bio::require_admin()?;
+            bio::validate_enrol_start_arg(arg)?;
+            self.preflight_enrol(live_identity_count)?;
+        }
         // The SPI probe may have deferred until its SMC power supplier bound.
         // A saved attach-time snapshot would incorrectly reject later ioctls.
         let sensor_present = sensor::is_bound();
-        let handled = {
+        let handled = if cmd == bio::IOC_DELETE_ORPHAN {
+            self.bio_delete_orphan(arg)?
+        } else {
             let mut session = self.bio_session.lock();
             if bio::starts_capture(cmd) {
                 self.wait_for_worker_exit(&mut session, false)?;
@@ -3479,7 +3763,7 @@ impl SepData {
                 if !self.capture_begin() {
                     continue;
                 }
-                let deleted = self.delete_and_persist(&handled);
+                let deleted = self.delete_and_persist(&handled, cmd == bio::IOC_DELETE_ORPHAN);
                 self.capture_end();
                 break deleted;
             };
@@ -3722,7 +4006,7 @@ impl SepData {
     /// Called with `catacomb_writer` held. A host index entry goes only once
     /// its deletion is saved: if the save fails, the entry stays, userspace
     /// still lists the fingerprint, and a retried deletion saves again.
-    fn delete_and_persist(&self, handled: &bio::Handled) -> Result<()> {
+    fn delete_and_persist(&self, handled: &bio::Handled, recovery: bool) -> Result<()> {
         let retry = self.deletion_unsaved.load(Relaxed);
         let wanted =
             Iterator::chain(handled.delete_identity.iter(), handled.delete_identities.iter());
@@ -3730,10 +4014,13 @@ impl SepData {
         let mut gone: KVec<[u8; bio::UUID_LEN]> =
             KVec::with_capacity(wanted.clone().count(), GFP_KERNEL)?;
         let mut delete_err: Option<Error> = None;
+        let mut orphan_removed = false;
         for identity in wanted {
-            match self.delete_identity(identity) {
+            let orphan = recovery || !self.bio_index.lock().contains_uuid(identity.uuid());
+            match self.delete_identity(identity, orphan) {
                 Ok(true) => {
                     let _ = gone.push_within_capacity(*identity.uuid());
+                    orphan_removed |= orphan;
                 }
                 Ok(false) => {}
                 Err(e) => delete_err = delete_err.or(Some(e)),
@@ -3741,7 +4028,7 @@ impl SepData {
         }
         // Save what was removed even if another deletion failed.
         if !gone.is_empty() {
-            match self.persist_deletion(retry) {
+            match self.persist_deletion(retry, orphan_removed) {
                 Ok(()) => {
                     self.deletion_unsaved.store(false, Relaxed);
                     for uuid in gone.iter() {
@@ -3766,7 +4053,7 @@ impl SepData {
 
     /// Returns whether the enclave no longer holds the identity and the host
     /// entry must wait for [`Self::persist_deletion`].
-    fn delete_identity(&self, identity: &crate::sbio::IdentityV1) -> Result<bool> {
+    fn delete_identity(&self, identity: &crate::sbio::IdentityV1, orphan: bool) -> Result<bool> {
         if self.enclave_lists(identity.uuid()) == Some(false) {
             // Unless an earlier deletion's save failed, which leaves the
             // enclave without an identity the saved Catacomb still holds.
@@ -3777,18 +4064,44 @@ impl SepData {
             return Ok(false);
         }
 
-        // 0x57 cannot be undone. Check first that its deletion can be saved.
+        // 0x57 cannot be undone. Ensure the host can save the affected user
+        // and master Catacombs before sending it. For an explicit recovery the
+        // owner Catacomb provides the recovery path even when the bag snapshot
+        // has no binding; export that owner first if this install lacks a file.
+        for kind in [PRIVATE_TYPE_CATACOMB_USER, PRIVATE_TYPE_CATACOMB_MASTER] {
+            if crate::catacomb::read(kind).is_none() || !crate::catacomb::writable(kind) {
+                dev_err!(
+                    self.dev,
+                    "bio: not deleting: user/master Catacomb is unavailable or unwritable\n"
+                );
+                return Err(EIO);
+            }
+        }
+        if orphan && crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none() {
+            let Some(reply) = self.read_component_states() else { return Err(EIO); };
+            let state = crate::sbio::ComponentStates::new(&reply)
+                .state_for(crate::sbio::CatacombUser::OWNER.value());
+            if !state.is_some_and(|s| s & crate::sbio::COMPONENT_STATE_ACTIVE != 0)
+                || !self.save_catacomb(crate::sbio::CatacombUser::OWNER,
+                                      PRIVATE_TYPE_CATACOMB_OWNER,
+                                      c"orphan-recovery owner Catacomb") {
+                dev_err!(self.dev, "bio: not deleting: owner Catacomb export failed\n");
+                return Err(EIO);
+            }
+        }
         if crate::catacomb::read(PRIVATE_TYPE_CATACOMB_OWNER).is_none()
-            || !self
-                .enrol_material
-                .lock()
-                .as_ref()
-                .is_some_and(|material| material.snapshot_identity.is_some())
+            || !crate::catacomb::writable(PRIVATE_TYPE_CATACOMB_OWNER)
         {
-            dev_err!(
-                self.dev,
-                "bio: not deleting: there is no owner Catacomb file or identity-bag binding to save the deletion with; nothing was changed\n"
-            );
+            return Err(EIO);
+        }
+        if !orphan && !self.enrol_material.lock().as_ref()
+            .is_some_and(|material| material.snapshot_identity.is_some()) {
+            dev_err!(self.dev, "bio: not deleting: indexed identity has no identity-bag binding\n");
+            return Err(EIO);
+        }
+        if orphan && !matches!(keybag::read(keybag::Slot::Identity),
+                               Ok(keybag::State::Present(_))) {
+            dev_err!(self.dev, "bio: not deleting: Linux identity bag file is unavailable\n");
             return Err(EIO);
         }
 
@@ -3811,10 +4124,11 @@ impl SepData {
     /// the enclave marks save-pending (a SAVE_CATACOMB of one that is not has
     /// been refused), the user before the master because saving the user can
     /// change the master, state re-read before each, then the lockout and the
-    /// identity bag, which must match the Catacombs. Safe to repeat after a
-    /// failure partway: a `retry` accepts a user Catacomb an earlier attempt
-    /// already saved.
-    fn persist_deletion(&self, retry: bool) -> Result<()> {
+    /// identity bag when a verified binding exists. An exact-ID orphan
+    /// recovery without that binding saves the Linux owner Catacomb instead.
+    /// Safe to repeat after a failure partway: a `retry` accepts a user
+    /// Catacomb an earlier attempt already saved.
+    fn persist_deletion(&self, retry: bool, orphan: bool) -> Result<()> {
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
             return Err(EIO);
         };
@@ -3828,6 +4142,11 @@ impl SepData {
                 crate::sbio::CatacombUser::MASTER,
                 PRIVATE_TYPE_CATACOMB_MASTER,
                 c"master Catacomb after deletion",
+            ),
+            (
+                crate::sbio::CatacombUser::OWNER,
+                PRIVATE_TYPE_CATACOMB_OWNER,
+                c"owner Catacomb after deletion",
             ),
         ] {
             let Some(reply) = self.read_component_states() else {
@@ -3844,7 +4163,8 @@ impl SepData {
                 dev_err!(self.dev, "bio: the {} is not active; the deletion cannot be saved\n", what);
                 return Err(EIO);
             }
-            if state & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0 {
+            if state & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0 ||
+                (orphan && who.value() == crate::sbio::CatacombUser::OWNER.value()) {
                 if !self.save_catacomb(who, kind, what) {
                     dev_err!(self.dev, "bio: saving the {} failed\n", what);
                     return Err(EIO);
@@ -3865,11 +4185,22 @@ impl SepData {
             dev_err!(self.dev, "bio: lockout persistence failed after the deletion\n");
             return Err(EIO);
         }
-        if !self.resnapshot_identity_keybag() {
-            dev_err!(
+        let bag_bound = self.enrol_material.lock().as_ref()
+            .is_some_and(|material| material.snapshot_identity.is_some());
+        if bag_bound {
+            if !self.resnapshot_identity_keybag() {
+                dev_err!(
+                    self.dev,
+                    "bio: Catacombs saved after the deletion but the identity-bag snapshot failed\n"
+                );
+                return Err(EIO);
+            }
+        } else if orphan {
+            dev_info!(
                 self.dev,
-                "bio: Catacombs saved after the deletion but the identity-bag snapshot failed\n"
+                "bio: orphan deletion saved via Linux user/master/owner Catacombs without a bag snapshot binding\n"
             );
+        } else {
             return Err(EIO);
         }
         Ok(())
@@ -4678,6 +5009,47 @@ impl<'a> IdentityRecords<'a> {
     }
 }
 
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_enclave_identity_scope)]
+mod identity_scope_tests {
+    use super::*;
+
+    #[test]
+    fn list_excludes_other_users_and_selectors() {
+        let mut reply = [0u8; 3 * IDENTITY_RECORD_LEN];
+        for (i, (user, selector, byte)) in [
+            (SBIO_PROBE_USER_ID, IR_SELECTOR_BUILTIN, 1u8),
+            (501, IR_SELECTOR_BUILTIN, 2u8),
+            (SBIO_PROBE_USER_ID, 2, 3u8),
+        ].iter().enumerate() {
+            let at = i * IDENTITY_RECORD_LEN;
+            reply[at..at + 4].copy_from_slice(&user.to_le_bytes());
+            reply[at + 4..at + IDENTITY_V1_LEN].fill(*byte);
+            reply[at + IR_SELECTOR..at + IR_SELECTOR + 4]
+                .copy_from_slice(&selector.to_le_bytes());
+        }
+        let records = IdentityRecords::new(&reply).unwrap();
+        let mut seen = 0;
+        records.each_built_in_for(SBIO_PROBE_USER_ID, |identity| {
+            seen += 1;
+            assert!(*identity.uuid() == [1u8; IDENTITY_UUID_LEN]);
+        });
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn match_result_carries_the_exact_enclave_identity() {
+        let mut reply = [0u8; SBIO_MATCH_RESULT_LEN];
+        reply[MR_USER_ID..MR_USER_ID + 4]
+            .copy_from_slice(&SBIO_PROBE_USER_ID.to_le_bytes());
+        reply[MR_IDENTITY..MR_IDENTITY + IDENTITY_UUID_LEN].fill(0xa5);
+        let result = MatchResult::parse(&reply).unwrap();
+        let user = UserId::new(SBIO_PROBE_USER_ID).unwrap();
+        assert!(result.matches(user));
+        assert!(*result.identity_uuid() == [0xa5; IDENTITY_UUID_LEN]);
+    }
+}
+
 const FIC_DEVICE_BUILTIN: u32 = 1;
 pub(crate) const SBIO_FREE_COUNT_LEN: usize = 4 + 20;
 static_assert!(SBIO_FREE_COUNT_LEN == SBIO_SAVE_SELECTOR_LEN);
@@ -4778,6 +5150,10 @@ impl MatchResult {
 
     pub(crate) fn identity_uuid(&self) -> &[u8; IDENTITY_UUID_LEN] {
         &self.identity
+    }
+
+    pub(crate) fn user_id(&self) -> i32 {
+        self.user_id
     }
 
     pub(crate) fn matches(&self, user: UserId) -> bool {

@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,jpeg.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Silicon JPEG codec
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Apple Silicon JPEG engines are directly programmed memory-to-memory codecs.
+  Each engine has a dedicated interrupt and DART stream. Multiple engines can
+  share a power domain. The power controller manages the gate; no separate
+  clock or firmware interface is required.
+
+  The DMA window reserves one 4 GiB slice of the DART high alias. The engine
+  has 32-bit buffer pointer registers; use of this alias for jobs still needs
+  hardware qualification on each compatible.
+
+properties:
+  compatible:
+    enum:
+      - apple,t6041-jpeg
+      - apple,t8140-jpeg
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    items:
+      - const: 0x10000000000
+      - const: 0x100000000
+    description: Device-visible DMA window, as a 64-bit base and size.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - iommus
+  - power-domains
+  - apple,dma-range
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        jpeg@487000000 {
+            compatible = "apple,t6041-jpeg";
+            reg = <0x4 0x87000000 0x0 0x4000>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1538 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&jpeg0_dart 0>;
+            power-domains = <&ps_jpg>;
+            apple,dma-range = /bits/ 64 <0x10000000000 0x100000000>;
+            status = "disabled";
+        };
+    };

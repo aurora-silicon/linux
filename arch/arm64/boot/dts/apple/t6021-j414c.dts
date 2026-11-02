@@ -46,3 +46,21 @@
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j414c.bin";
 };
+
+/*
+ * From the J414c platform device tree (/arm-io/spi2/mesa): the power line is
+ * gpio0 pin 122 (function-mesa_pwr, active high) and the data-ready line is
+ * pin 121, the same lines as J414s.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 122 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <121 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+};

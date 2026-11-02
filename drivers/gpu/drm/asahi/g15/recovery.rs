@@ -197,7 +197,7 @@ impl Firmware {
         self.recovery.armed.is_none() && !self.new_errors()
     }
 
-    /// `(recoveries, hang_kills)` for `asahi-g15/stats`.
+    /// `(recoveries, hang_kills)` for `aurora-g15/stats`.
     pub(crate) fn recovery_counts(&self) -> (u64, u64) {
         (self.recovery.recoveries, self.recovery.hang_kills)
     }

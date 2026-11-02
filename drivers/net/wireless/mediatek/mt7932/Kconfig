@@ -2,7 +2,7 @@
 config MT7932_FULLMAC
 	tristate "MediaTek MT7932 Wi-Fi on the Apple MacBook Neo (J700)"
 	depends on PCI && OF && ARM64 && IOMMU_DMA
-	depends on PCIE_APPLE_PIODMA_DIAG && CFG80211
+	depends on PCIE_APPLE_T8140_BOOTSTRAP && CFG80211
 	select FW_LOADER
 	select CRYPTO
 	select CRYPTO_HMAC

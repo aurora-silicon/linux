@@ -97,3 +97,11 @@
 &isp {
 	apple,platform-id = <16>;
 };
+
+&smc_hwmon {
+	/* M3-family die keys, not yet confirmed on J516s; absent keys are skipped. */
+	apple,soc-die-keys = "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D",
+			     "Tf0E", "Tf14", "Tf18", "Tf19", "Tf1A",
+			     "Tf24", "Tf25", "Tf2A", "Tf2B";
+	apple,thermal-pressure-key = "mTPL";
+};

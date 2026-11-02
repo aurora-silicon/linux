@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/types.h>
 
 #include "i2c-pasemi-core.h"
@@ -18,7 +19,52 @@
 struct pasemi_platform_i2c_data {
 	struct pasemi_smbus smbus;
 	struct clk *clk_ref;
+	int irq;
 };
+
+static int pasemi_platform_i2c_runtime_suspend(struct device *dev)
+{
+	struct pasemi_platform_i2c_data *data = dev_get_drvdata(dev);
+
+	if (data->smbus.use_irq)
+		disable_irq(data->irq);
+	clk_disable_unprepare(data->clk_ref);
+
+	return 0;
+}
+
+static int pasemi_platform_i2c_runtime_resume(struct device *dev)
+{
+	struct pasemi_platform_i2c_data *data = dev_get_drvdata(dev);
+	int error;
+
+	error = clk_prepare_enable(data->clk_ref);
+	if (error)
+		return error;
+
+	/* Restore the divider, enable bit and FIFOs after domain power loss. */
+	pasemi_i2c_init(&data->smbus);
+	if (data->smbus.use_irq)
+		enable_irq(data->irq);
+
+	return 0;
+}
+
+static DEFINE_RUNTIME_DEV_PM_OPS(pasemi_platform_i2c_pm_ops,
+				 pasemi_platform_i2c_runtime_suspend,
+				 pasemi_platform_i2c_runtime_resume, NULL);
+
+static void pasemi_platform_i2c_disable_pm(void *arg)
+{
+	struct device *dev = arg;
+
+	/* Registered before the adapter, after the IRQ: clients are gone now. */
+	pm_runtime_disable(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	if (!pm_runtime_status_suspended(dev))
+		pasemi_platform_i2c_runtime_suspend(dev);
+	pm_runtime_set_suspended(dev);
+}
 
 static int
 pasemi_platform_i2c_calc_clk_div(struct pasemi_platform_i2c_data *data,
@@ -66,7 +112,7 @@ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
 	if (of_property_read_u32(dev->of_node, "clock-frequency", &frequency))
 		frequency = I2C_MAX_STANDARD_MODE_FREQ;
 
-	data->clk_ref = devm_clk_get_enabled(dev, NULL);
+	data->clk_ref = devm_clk_get(dev, NULL);
 	if (IS_ERR(data->clk_ref))
 		return PTR_ERR(data->clk_ref);
 
@@ -74,22 +120,53 @@ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 
-	smbus->adapter.dev.of_node = pdev->dev.of_node;
-	error = pasemi_i2c_common_probe(smbus);
+	platform_set_drvdata(pdev, data);
+	error = clk_prepare_enable(data->clk_ref);
 	if (error)
 		return error;
 
-	irq_num = platform_get_irq(pdev, 0);
-	error = devm_request_irq(smbus->dev, irq_num, pasemi_irq_handler, 0, "pasemi_apple_i2c", (void *)smbus);
-
-	if (!error)
+	pasemi_i2c_init(smbus);
+	irq_num = platform_get_irq_optional(pdev, 0);
+	if (irq_num < 0 && irq_num != -ENXIO) {
+		error = irq_num;
+		goto disable_clk;
+	}
+	if (irq_num > 0) {
+		error = devm_request_irq(dev, irq_num, pasemi_irq_handler, 0,
+					 "pasemi_apple_i2c", smbus);
+		if (error)
+			goto disable_clk;
 		smbus->use_irq = 1;
-	platform_set_drvdata(pdev, data);
+		data->irq = irq_num;
+	}
 
-	return 0;
+	pm_runtime_get_noresume(dev);
+	error = pm_runtime_set_active(dev);
+	if (error) {
+		pm_runtime_put_noidle(dev);
+		goto disable_clk;
+	}
+	pm_runtime_set_autosuspend_delay(dev, 100);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
+	error = devm_add_action_or_reset(dev, pasemi_platform_i2c_disable_pm, dev);
+	if (error) {
+		pm_runtime_put_noidle(dev);
+		return error;
+	}
+
+	smbus->runtime_pm = true;
+	smbus->adapter.dev.of_node = dev->of_node;
+	error = pasemi_i2c_register_adapter(smbus);
+	pm_runtime_put_autosuspend(dev);
+	return error;
+
+disable_clk:
+	if (smbus->use_irq)
+		devm_free_irq(dev, data->irq, smbus);
+	clk_disable_unprepare(data->clk_ref);
+	return error;
 }
-
-static void pasemi_platform_i2c_remove(struct platform_device *pdev) { }
 
 static const struct of_device_id pasemi_platform_i2c_of_match[] = {
 	{ .compatible = "apple,t8103-i2c" },
@@ -102,9 +179,9 @@ static struct platform_driver pasemi_platform_i2c_driver = {
 	.driver	= {
 		.name			= "i2c-apple",
 		.of_match_table		= pasemi_platform_i2c_of_match,
+		.pm			= pm_ptr(&pasemi_platform_i2c_pm_ops),
 	},
 	.probe	= pasemi_platform_i2c_probe,
-	.remove = pasemi_platform_i2c_remove,
 };
 module_platform_driver(pasemi_platform_i2c_driver);
 
