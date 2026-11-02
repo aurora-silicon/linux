@@ -285,6 +285,9 @@ static void ane_cold_sleep_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(passed[i], true), NOTIFY_DONE);
 		KUNIT_EXPECT_EQ(test, ane_fw_sleep_event(passed[i], false), NOTIFY_DONE);
 	}
+	/* The device callback backstop: refuse with running firmware only. */
+	KUNIT_EXPECT_EQ(test, ane_fw_sleep_backstop(true), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ane_fw_sleep_backstop(false), 0);
 }
 
 static struct kunit_case ane_cold_cases[] = {

@@ -168,12 +168,19 @@ static int ane_h16_pin(void *ctx)
 
 /*
  * System sleep callbacks of a bound H16 device. While the firmware runs the
- * notifier has already refused the transition, so these only see a device
- * whose engine was never started, which has nothing to save.
+ * notifier normally refuses the transition first; refuse here too, as a
+ * backstop for firmware started after it ran (the start work item is not
+ * freezable) or a path that skipped the notifiers. A device whose engine
+ * was never started has nothing to save.
  */
 int ane_h16_backend_suspend(struct device *dev)
 {
-	return 0;
+	struct ane_h16_device *h = dev_get_drvdata(dev);
+	bool pinned = h && READ_ONCE(h->pinned);
+
+	if (pinned)
+		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_backstop(pinned);
 }
 
 int ane_h16_backend_resume(struct device *dev)
@@ -919,11 +926,15 @@ refuse:
 static void ane_h16_start_work(struct work_struct *work)
 {
 	struct ane_h16_device *h = container_of(work, struct ane_h16_device, start);
+	unsigned int flags;
 
+	/* Never start the firmware in the middle of a system sleep transition. */
+	flags = lock_system_sleep();
 	mutex_lock(&ane_h16_lock);
 	if (!h->acquired)
 		ane_h16_advance(h, ANE_H16_PROGRAM);
 	mutex_unlock(&ane_h16_lock);
+	unlock_system_sleep(flags);
 }
 
 /*

@@ -25,4 +25,13 @@ static inline int ane_fw_sleep_event(unsigned long event, bool retained)
 	return ane_fw_sleep_refused(event, retained) ? NOTIFY_BAD : NOTIFY_DONE;
 }
 
+/*
+ * The device suspend callback's answer: a backstop for firmware started
+ * after the notifier ran, or a sleep path that skipped the notifiers.
+ */
+static inline int ane_fw_sleep_backstop(bool retained)
+{
+	return retained ? -EBUSY : 0;
+}
+
 #endif /* __ANE_FW_SLEEP_H__ */
