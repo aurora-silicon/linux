@@ -11,9 +11,10 @@
 //!
 //! An installed lane (QID, kick ring, graph, descriptors, support page and pool) stays with its
 //! firmware session, as the firmware has no queue uninstall: a queue binds it
-//! to one logical queue, parks it once that queue closed, the lane is idle and its context's
-//! scheduler release was consumed ([`Queue::park_m5`]), and a later queue adopts it
-//! ([`Queue::adopt_m5`]), reconfiguring the hardware queue at its first kick. Kick timestamps and
+//! to one logical queue, detaches it in its compute entry once that queue closed, the lane is
+//! idle and its context's scheduler release was consumed ([`Queue::detach_m5`]), and a later
+//! queue binds it there (Neo's `Queue::bind_owner`, [`Queue::adopt_m5`]), reconfiguring the
+//! hardware queue at its first kick. Kick timestamps and
 //! stamps continue across owners. A quarantined lane is not reused, and a failed kick keeps its
 //! command pinned, until a witness ends the quarantine: a settled failure's exact drain returns
 //! the lane as it is, and a killed context's exact drain settles the kill and recycles it with
@@ -760,8 +761,8 @@ impl Graph {
 /// The M5 Ultra lane's own state in its compute queue (`compute::Queue::m5`), beside the Neo
 /// fields the lane shares: the profile; the adoption state (the class whose outer ring last
 /// carried the queue, `rebound` and `unmapped`), which stays the lane's while
-/// it parks and is adopted; and the pool count each descriptor slot's kick waits for. The rest of
-/// the lane's lifecycle is Neo's fields: `owner`, `binding`,
+/// it is detached and adopted; and the pool count each descriptor slot's kick waits for. The rest
+/// of the lane's lifecycle is Neo's fields: `owner`, `binding`,
 /// `retained_owner` (the previous owner's pages), `installed`, `ordinal`, `pool_state`, `active`
 /// (a quarantined lane's failed kicks stay there, `failure_deferred`), `quarantined` with
 /// `quarantine_error`, `released` (the logical queue closed), `fault_stamp` (the firmware failed
@@ -776,7 +777,7 @@ pub(crate) struct LaneState {
     /// Set by an adoption until the binding's first kick: whether the class (and so the outer
     /// work ring) changed.
     rebound: Option<bool>,
-    /// Set once this binding's client views are unmapped, after it parks.
+    /// Set once this binding's client views are unmapped, after it is detached.
     unmapped: Unmapped,
     /// The pool's submission count that covers the kick in each descriptor slot, beside the
     /// slots it belongs to: it runs across owners and kills, so no ticket field gives it.
@@ -798,97 +799,9 @@ impl LaneState {
     }
 }
 
-/// An installed compute lane without an owner: everything the
-/// firmware's installed queue still names, and the previous owner's scheduler page and work
-/// storage its record names until the next owner rewrites it. Never dropped while the session
-/// runs: its QID stays configured with this ring.
-pub(crate) struct ParkedLane {
-    gpu: Arc<Gpu>,
-    kick: kick::Queue,
-    graph: Graph,
-    /// The `m5` arm of Neo's compute pool.
-    pool: ComputePool,
-    class: u8,
-    pages: crate::g17::context::FirmwarePages,
-    unmapped: Unmapped,
-    pool_state: PoolState,
-    /// When it parked: the vacate pass releases the least recently parked pools first.
-    parked_at: u64,
-    /// Recycled after a kill (`Queue::recycle_killed`): adoptable only once its pool is
-    /// vacant, and vacated whatever the warm cap.
-    needs_fresh_backing: bool,
-}
-
-impl ParkedLane {
-    pub(crate) fn qid(&self) -> u8 {
-        self.kick.id().qid()
-    }
-    /// Its previous binding's client views are unmapped (a new owner in the same VM may map
-    /// the lane at the same addresses), and no release of its pool is in flight.
-    /// A recycled lane's pool must be vacant too: its next owner's first command backs it afresh
-    /// (as Neo's `queue::compute::Queue::reusable`).
-    pub(crate) fn adoptable(&self) -> bool {
-        self.unmapped.done()
-            && !self.pool_state.pending()
-            && (!self.needs_fresh_backing || self.pool_state.phase() == PoolPhase::Vacant)
-    }
-    /// Recycled after a kill and still holding the backing the killed work used: the vacate pass
-    /// releases it first and beyond the cap (`Registry::vacate_idle_pools`).
-    pub(crate) fn needs_fresh_backing(&self) -> bool {
-        self.needs_fresh_backing
-    }
-    /// Its pool is backed and kept: an adoption needs no fresh backing.
-    pub(crate) fn backed(&self) -> bool {
-        self.pool_state.phase() == PoolPhase::Populated && self.pool.populated()
-    }
-    /// An idle pool the vacate pass may give back (`Registry::vacate_idle_pools`), as for a
-    /// retained Neo compute queue (`queue::compute::Queue::vacate_candidate`).
-    pub(crate) fn vacate_candidate(&self) -> bool {
-        self.backed() && self.unmapped.done()
-    }
-    /// When the lane parked.
-    pub(crate) fn released_at(&self) -> u64 {
-        self.parked_at
-    }
-    /// Releases this parked lane's pool (the caller holds the device mutex and announces a
-    /// published record): the backing is freed once the firmware consumed the release
-    /// ([`Self::observe_vacancy`]). The lane, its QID, ring and stamps stay installed; the next
-    /// owner's first command backs the pool for its plan.
-    pub(crate) fn vacate(&mut self, init: &InitData) -> Result<bool> {
-        if !self.vacate_candidate() {
-            return Err(EBUSY);
-        }
-        // Generation 1, as every binding's configuration publishes it.
-        self.pool_state.release(init, self.pool.release_record(1))
-    }
-    /// The backing of a vacant pool no client maps any more, once the firmware consumed its
-    /// release; the caller frees it off the device mutex.
-    pub(crate) fn observe_vacancy(
-        &mut self,
-        consumer: u32,
-        producer: u32,
-    ) -> Result<Option<M5Backing>> {
-        self.pool_state.observe(consumer, producer)?;
-        if self.pool_state.phase() != PoolPhase::Vacant || !self.unmapped.done() {
-            return Ok(None);
-        }
-        Ok(self.pool.m5_mut()?.vacate())
-    }
-    pub(crate) fn pool_release_pending(&self) -> bool {
-        self.pool_state.pending()
-    }
-    pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
-        self.pool_state.stalled(now)
-    }
-    /// The class whose outer ring last carried this lane.
-    pub(crate) fn class(&self) -> u8 {
-        self.class
-    }
-}
-
-/// Whether a binding's client views are unmapped, shared by the binding and its parked lane:
-/// the lane is adoptable only once they are, since a new owner in the same VM maps the lane at
-/// the same addresses (the ring, command storage, pool and operand state sit at fixed VAs).
+/// Whether a binding's client views are unmapped, shared by the binding and its lane (or a render
+/// pair's): the lane is adoptable only once they are, since a new owner in the same VM maps the
+/// lane at the same addresses (the ring, command storage, pool and operand state sit at fixed VAs).
 #[derive(Clone)]
 pub(crate) struct Unmapped(Arc<AtomicBool>);
 
@@ -901,9 +814,9 @@ impl Unmapped {
     }
 }
 
-/// A parked lane's (or render pair's) former owner binding: its client views in that owner's
-/// VM, a pair's storage there, then its context. Dropped off the device mutex; its lane becomes
-/// adoptable once it is ([`ParkedLane::adoptable`]).
+/// A detached lane's (or parked render pair's) former owner binding: its client views in that
+/// owner's VM, a pair's storage there, then its context. Dropped off the device mutex; its lane
+/// becomes adoptable once it is ([`Queue::m5_reusable`]).
 pub(crate) struct Binding {
     aliases: KVec<mmu::KernelMapping>,
     /// A compute lane's binding: its client views and its context.
@@ -950,11 +863,11 @@ impl Drop for Binding {
     }
 }
 
-/// The M5 Ultra arms of Neo's compute queue: its lane's construction, adoption and parking,
+/// The M5 Ultra arms of Neo's compute queue: its lane's construction, adoption and detachment,
 /// installation, publication transaction, strict retirement, failure, drain, and the kill's
 /// candidate and settlement, on the lane's hardware (the `m5` arms of `compute::Graph` and
-/// `ComputePool`) and Neo's lifecycle fields ([`LaneState`] says which). Only [`Queue::new_m5`] and
-/// [`Queue::adopt_m5`] build a queue with `m5` set; Neo's queues never reach these.
+/// `ComputePool`) and Neo's lifecycle fields ([`LaneState`] says which). Only [`Queue::new_m5`]
+/// builds a queue with `m5` set; Neo's queues never reach these.
 impl Queue {
     /// Builds the M5 Ultra compute queue of QID `id` for `context` and maps it into the context's
     /// VM. Nothing is visible to the firmware yet, so a failure here frees everything; the caller
@@ -1039,75 +952,119 @@ impl Queue {
             .is_some_and(|bound| Arc::ptr_eq(bound, context))
     }
 
-    /// Adopts parked lane `index` for `context`'s logical queue `owner`: maps
-    /// the lane into the new VM and rewrites the record's host-owned words. The firmware's
-    /// queue is reconfigured at the binding's first kick ([`Self::publish_m5`]); the kick
-    /// timestamp and the stamps continue. On failure the lane stays parked.
-    pub(crate) fn adopt_m5(
-        parked: &mut KVec<ParkedLane>,
-        index: usize,
-        context: Arc<Context>,
-        owner: u64,
-    ) -> Result<KBox<Self>> {
-        let lane = parked.get_mut(index).ok_or(EINVAL)?;
-        if !lane.adoptable() {
+    /// The M5 Ultra arm of Neo's `Queue::reusable` (which adds Neo's rule that no reader holds
+    /// the queue's last command): a lane detached from its last owner at its
+    /// context's consumed release ([`Self::detach_m5`]), installed and healthy, whose previous
+    /// binding's client views are unmapped (a new owner in the same VM may map the lane at the
+    /// same addresses), and with no release of its pool in flight. A recycled lane's pool must be
+    /// vacant too: its next owner's first command backs it afresh, as Neo's rule has it.
+    pub(crate) fn m5_reusable(&self) -> bool {
+        self.m5_detached()
+            && self.m5.as_deref().is_some_and(|lane| lane.unmapped.done())
+            && !self.pool_state.pending()
+            && (!self.needs_fresh_backing || self.pool_state.phase() == PoolPhase::Vacant)
+    }
+
+    /// Detached from its last owner ([`Self::detach_m5`]) and not yet adopted: installed,
+    /// healthy, with no owner and no binding.
+    pub(crate) fn m5_detached(&self) -> bool {
+        self.m5.is_some()
+            && self.installed
+            && !self.quarantined
+            && self.owner.is_none()
+            && self.binding.is_none()
+    }
+
+    /// Its pool is backed and kept: an adoption needs no fresh backing.
+    pub(crate) fn m5_backed(&self) -> bool {
+        self.pool_state.phase() == PoolPhase::Populated && self.pool.populated()
+    }
+
+    /// A detached lane's idle pool the vacate pass may give back (`Registry::vacate_idle_pools`),
+    /// as for a retained Neo compute queue (`Queue::vacate_candidate`).
+    pub(crate) fn m5_vacate_candidate(&self) -> bool {
+        self.m5_detached()
+            && self.m5_backed()
+            && self.m5.as_deref().is_some_and(|lane| lane.unmapped.done())
+    }
+
+    /// Releases a detached lane's pool (the caller holds the device mutex and announces a
+    /// published record): the backing is freed once the firmware consumed the release
+    /// ([`Self::observe_m5_vacancy`]). The lane, its QID, ring and stamps stay installed; the next
+    /// owner's first command backs the pool for its plan.
+    pub(crate) fn vacate_m5(&mut self, init: &InitData) -> Result<bool> {
+        if !self.m5_vacate_candidate() {
+            return Err(EBUSY);
+        }
+        // Generation 1, as every binding's configuration publishes it.
+        self.pool_state.release(init, self.pool.release_record(1))
+    }
+
+    /// The backing of a detached lane's vacant pool no client maps any more, once the firmware
+    /// consumed its release; the caller frees it off the device mutex.
+    pub(crate) fn observe_m5_vacancy(
+        &mut self,
+        consumer: u32,
+        producer: u32,
+    ) -> Result<Option<M5Backing>> {
+        if !self.m5_detached() {
+            return Ok(None);
+        }
+        self.pool_state.observe(consumer, producer)?;
+        let unmapped = self.m5.as_deref().is_some_and(|lane| lane.unmapped.done());
+        if self.pool_state.phase() != PoolPhase::Vacant || !unmapped {
+            return Ok(None);
+        }
+        Ok(self.pool.m5_mut()?.vacate())
+    }
+
+    /// The M5 Ultra arm of Neo's `Queue::bind_owner`: binds this detached lane
+    /// ([`Self::m5_reusable`]) to `context`'s logical queue `owner` where it
+    /// stands, in its compute entry: maps the lane into the new VM, rewrites the record's
+    /// host-owned words, and returns every per-binding field to a fresh queue's
+    /// (`Queue::rebind_detached`). The firmware's queue is reconfigured at the binding's first
+    /// kick ([`Self::publish_m5`]); the kick timestamp and the stamps continue. On failure the
+    /// lane stays detached. Not inlined, so that Neo's `bind_owner` keeps its own frame.
+    #[inline(never)]
+    pub(crate) fn adopt_m5(&mut self, context: Arc<Context>, owner: u64) -> Result {
+        if !self.m5_reusable() {
             return Err(EAGAIN);
         }
         // A vacant pool's leftover backing (no registration, no client view) goes: the binding's
         // first command backs the pool for its plan ([`Self::grow`]).
-        if lane.pool_state.phase() == PoolPhase::Vacant {
-            drop(lane.pool.m5_mut()?.vacate());
+        if self.pool_state.phase() == PoolPhase::Vacant {
+            drop(self.pool.m5_mut()?.vacate());
         }
-        let recycled = lane.needs_fresh_backing;
-        let class_changed = lane.class != context.policy().priority();
-        let state = LaneState::new(lane.gpu.clone(), lane.class, Some(class_changed))?;
-        let kick_alias = lane.kick.map_client(context.vm())?;
-        let pool_alias = pool_view(lane.pool.m5()?, context.vm())?;
-        let binding = lane.graph.bind(context.clone(), kick_alias, pool_alias)?;
-        let readers = Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?;
-        let slot = KBox::<Self>::new_uninit(GFP_KERNEL)?;
+        let class_changed = self.lane()?.class != context.policy().priority();
+        let unmapped = Unmapped::new()?;
+        let kick_alias = self.kick.map_client(context.vm())?;
+        let pool_alias = pool_view(self.pool.m5()?, context.vm())?;
+        let binding = self.graph.bind(context.clone(), kick_alias, pool_alias)?;
         // The lane is idle and its owner's release consumed: no reader of the record remains.
-        lane.graph.set_owner(&context)?;
-        let lane = parked.remove(index).map_err(|_| EINVAL)?;
-        if recycled {
+        self.graph.set_owner(&context)?;
+        self.rebind_detached(owner, binding)?;
+        let lane = self.m5.as_deref_mut().ok_or(EINVAL)?;
+        lane.rebound = Some(class_changed);
+        lane.unmapped = unmapped;
+        lane.pool_targets = [0; DEPTH];
+        if self.needs_fresh_backing {
             pr_info!(
                 "G17 M5: lane {}: recycled after a kill, adopted by queue {} (context {})\n",
-                lane.qid(),
+                self.qid(),
                 owner,
                 context.id()
             );
         }
-        let ParkedLane {
-            kick,
-            graph,
-            pool,
-            pages,
-            pool_state,
-            ..
-        } = lane;
-        let Ok(mut queue) = slot.write_init(Self::assemble(
-            Some(owner),
-            Some(binding),
-            kick,
-            pool,
-            graph,
-            readers,
-            Some(state),
-        ));
-        queue.retained_owner = Some(pages);
-        queue.installed = true;
-        queue.pool_state = pool_state;
         // A recycled lane keeps needing its fresh backing until its reinstallation
-        // ([`Self::reinstall`]) publishes; parked before that, it is reinstalled by its next owner.
-        queue.needs_fresh_backing = recycled;
-        if let Err(error) = queue.publish_m5_mappings() {
-            let (lane, _binding) = queue.park_m5()?;
-            parked.push_within_capacity(lane).map_err(|_| ENOMEM)?;
+        // ([`Self::reinstall`]) publishes; detached before that, it is reinstalled by its next
+        // owner.
+        if let Err(error) = self.publish_m5_mappings() {
+            drop(self.detach_m5()?);
             return Err(error);
         }
         // The rewritten record names this context's scheduler page.
         context.mark_published();
-        Ok(queue)
+        Ok(())
     }
 
     /// The queue's logical queue closed and its lane is idle: no kick in flight or failed, the
@@ -1253,47 +1210,32 @@ impl Queue {
         Ok(())
     }
 
-    /// Splits a parked queue ([`Self::parkable`], its context's release consumed) into its lane
-    /// and its binding. The lane keeps the context's scheduler page and work storage, which the
-    /// record names until the next owner rewrites it.
-    pub(crate) fn park_m5(mut self: KBox<Self>) -> Result<(ParkedLane, Binding)> {
-        let (Some(lane), Some(binding), Some(owner)) =
-            (self.m5.take(), self.binding.take(), self.owner)
-        else {
-            // Not a bound M5 lane: kept, as an installed queue always is, never dropped here.
-            let _ = KBox::into_raw(self);
+    /// The M5 Ultra's `Queue::detach_exited_owner`: detaches this parkable queue
+    /// ([`Self::parkable`], its context's release consumed) from its owner where it stands, in its
+    /// compute entry, and returns the binding for the caller to drop off the device mutex. The
+    /// lane keeps the context's scheduler page and work storage, which the record names until the
+    /// next owner rewrites it, and becomes reusable ([`Self::m5_reusable`]) once the binding's
+    /// views are unmapped. A kill of the context still on it ends here, as the context's release
+    /// was consumed.
+    pub(crate) fn detach_m5(&mut self) -> Result<Binding> {
+        let (Some(lane), Some(owner)) = (self.m5.as_deref(), self.owner) else {
             return Err(EINVAL);
         };
-        let queue = KBox::into_inner(self);
-        let pages = binding.context.retain_firmware_pages();
-        let LaneState {
-            gpu,
-            class,
+        let unmapped = lane.unmapped.clone();
+        let binding = self.binding.take().ok_or(EINVAL)?;
+        self.retained_owner = Some(binding.context.retain_firmware_pages());
+        self.owner = None;
+        self.exit = None;
+        self.released = true;
+        self.released_at = crate::g17::now_ns();
+        Ok(Binding {
+            aliases: KVec::new(),
+            compute: Some(binding),
+            render: None,
+            context: None,
+            owner,
             unmapped,
-            ..
-        } = KBox::into_inner(lane);
-        Ok((
-            ParkedLane {
-                gpu,
-                kick: queue.kick,
-                graph: queue.graph,
-                pool: queue.pool,
-                class,
-                pages,
-                unmapped: unmapped.clone(),
-                pool_state: queue.pool_state,
-                parked_at: crate::g17::now_ns(),
-                needs_fresh_backing: queue.needs_fresh_backing,
-            },
-            Binding {
-                aliases: KVec::new(),
-                compute: Some(binding),
-                render: None,
-                context: None,
-                owner,
-                unmapped,
-            },
-        ))
+        })
     }
 
     /// An adopted lane whose class differs from its previous binding's, until its first kick.

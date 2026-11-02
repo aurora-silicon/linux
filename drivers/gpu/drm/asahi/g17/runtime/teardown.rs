@@ -138,15 +138,15 @@ struct Service<'a> {
     init: &'a InitData,
     primary: &'a mut Coprocessor,
     reclaim: &'a mut ReclaimBatch,
-    /// The M5 lanes besides the bound compute channels: parked compute lanes and render pairs
-    /// (`queue::m5`).
-    m5: Option<super::m5::Lanes<'a>>,
+    /// The M5 Ultra's lanes, in the compute entries and render slots above (`queue::m5`); None
+    /// on every other GPU.
+    m5: Option<super::m5::Lanes>,
 }
 
 impl Host for Service<'_> {
     fn render_idle(&mut self, context: &Arc<Context>) -> Result<bool> {
         if let Some(m5) = &self.m5 {
-            if !m5.render_idle(context) {
+            if !m5.render_idle(&self.render.m5, context) {
                 return Ok(false);
             }
         }
@@ -184,15 +184,20 @@ impl Host for Service<'_> {
         let mut retained = false;
         if let Some(m5) = &mut self.m5 {
             // Every compute lane of the context parks; its bindings drop off the device mutex.
-            let count = m5.parkable(self.compute, context)?;
+            let count = m5.parkable(self.compute, &self.render.m5, context)?;
             if !self.reclaim.m5_room(count) || !self.reclaim.has_room(0, 1) {
                 return Err(EBUSY);
             }
             let reclaim = &mut *self.reclaim;
-            m5.park(self.compute, context, self.buffers, &mut |binding| {
-                reclaim.m5_binding(binding)
-            })?;
-            retained = m5.retains(self.compute, context);
+            m5.park(
+                self.compute,
+                &mut self.render.m5,
+                self.admission,
+                context,
+                self.buffers,
+                &mut |binding| reclaim.m5_binding(binding),
+            )?;
+            retained = m5.retains(self.compute, &self.render.m5, context);
         }
         let linked = context.retain_linked_work(self.objects);
         let (_, _, slots) = self.render.exit_scope(context);
@@ -248,9 +253,6 @@ impl Firmware {
             compute,
             buffers,
             teardown,
-            m5_parked,
-            m5_parked_pairs,
-            m5_render,
             ..
         } = &mut self.queues;
         let mut service = Service {
@@ -262,11 +264,7 @@ impl Firmware {
             init: &self.init,
             primary: &mut self.primary,
             reclaim,
-            m5: m5.then_some(super::m5::Lanes {
-                parked: m5_parked,
-                pairs: m5_render,
-                parked_pairs: m5_parked_pairs,
-            }),
+            m5: m5.then_some(super::m5::Lanes),
         };
         teardown.publish_ready(&mut service, recovery, super::now_ns())?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);
@@ -296,7 +294,7 @@ impl Firmware {
                     service.control_backpressured(),
                 );
                 if let Some(m5) = &service.m5 {
-                    m5.report(service.compute, &context);
+                    m5.report(service.compute, &service.render.m5, &context);
                 }
             }
         }

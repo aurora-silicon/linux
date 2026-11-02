@@ -649,7 +649,7 @@ pub(crate) struct Queue {
     /// fresh before any owner binds it (set by `recycle_killed`, cleared by `rearm`).
     pub(in crate::g17::queue) needs_fresh_backing: bool,
     /// Monotonic time the last owner released this queue (vacate order).
-    released_at: u64,
+    pub(in crate::g17::queue) released_at: u64,
     /// Free-list generation of the last published configuration.
     free_list_generation: u64,
     /// `None` after an exited owner was detached; a new owner binds afresh.
@@ -796,6 +796,108 @@ impl Queue {
             source_hint: crate::g17::sync_input::ReaderHint::new(),
             m5,
         })
+    }
+
+    /// Binds a detached queue (no binding, no owner, nothing in flight) to `owner` through
+    /// `binding`, every per-binding field back at [`Self::assemble`]'s initial value: as a queue
+    /// built afresh around the same kick ring, pool and graph. The hardware's state stays: the
+    /// installation, the pool's registration and release state, a recycled queue's need for
+    /// fresh backing, the retained owner's pages its record names until the new owner's first
+    /// command rewrites it, the source readers (none: the queue is refused while a reader holds
+    /// its last command, as [`Self::bind_owner`] refuses one), and the variant's own state. Only
+    /// the M5 Ultra's adoption (`Queue::adopt_m5` in `queue::m5`) calls it. The fields are listed
+    /// without a rest pattern, so a new one must say here what a new binding does with it.
+    pub(in crate::g17::queue) fn rebind_detached(&mut self, owner: u64, binding: Binding) -> Result {
+        let Self {
+            owner: bound,
+            retained_owner: _,
+            pool_state: _,
+            growing,
+            growth_blocks,
+            needs_fresh_backing: _,
+            released_at,
+            free_list_generation,
+            binding: current,
+            previous,
+            unpublished_binding,
+            kick: _,
+            pool: _,
+            graph: _,
+            active,
+            replays,
+            replay_retirement,
+            replay_error,
+            replay_prepared,
+            exit,
+            kill_wait,
+            installed: _,
+            m5_install,
+            outer_started,
+            published_config,
+            config_cache,
+            ordinal,
+            submitted,
+            fault_stamp,
+            claims,
+            last_published,
+            last_end,
+            released,
+            retirement_ready,
+            quarantined,
+            retired_by_teardown,
+            retire_pending,
+            awaiting_witness,
+            spared_quarantine,
+            spared_deferred,
+            terminal,
+            quarantine_error,
+            failure_status_pending,
+            retirement_proved,
+            source_readers,
+            source_hint,
+            m5: _,
+        } = self;
+        if bound.is_some() || current.is_some() || *quarantined
+            || active.len != 0 || replays.len != 0 || previous.is_some()
+            || source_hint.has_readers(source_readers)
+        {
+            return Err(EBUSY);
+        }
+        *bound = Some(owner);
+        *growing = false;
+        *growth_blocks = 0;
+        *released_at = 0;
+        *free_list_generation = 0;
+        *current = Some(binding);
+        *unpublished_binding = true;
+        *replay_retirement = false;
+        *replay_error = None;
+        *replay_prepared = false;
+        *exit = None;
+        *kill_wait = None;
+        *m5_install = None;
+        *outer_started = 0;
+        *published_config = None;
+        *config_cache = None;
+        *ordinal = 0;
+        *submitted = 0;
+        *fault_stamp = None;
+        *claims = 0;
+        *last_published = 0;
+        *last_end = 0;
+        *released = false;
+        *retirement_ready = false;
+        *retired_by_teardown = false;
+        *retire_pending = false;
+        *awaiting_witness = false;
+        *spared_quarantine = false;
+        *spared_deferred = false;
+        *terminal = None;
+        *quarantine_error = None;
+        *failure_status_pending = false;
+        *retirement_proved = false;
+        *source_hint = crate::g17::sync_input::ReaderHint::new();
+        Ok(())
     }
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
     /// zero-duration completion record for it, which quarantines the queue, but stores no
@@ -1678,6 +1780,10 @@ impl Queue {
         Ok(true)
     }
     pub(crate) fn reusable(&self) -> bool {
+        // The M5 Ultra lane's arm: detached at its context's consumed release (`queue::m5`).
+        if self.m5.is_some() {
+            return self.m5_reusable() && !self.source_hint.has_readers(&self.source_readers);
+        }
         if self.growing { return false; }
         self.installed
             // A pool release in flight must be witnessed before any successor.
@@ -1699,6 +1805,10 @@ impl Queue {
             && !self.source_hint.has_readers(&self.source_readers)
     }
     pub(crate) fn bind_owner(&mut self, owner: u64, context: Arc<Context>) -> Result {
+        // The M5 Ultra lane's arm: it binds afresh into the new owner's VM (`queue::m5`).
+        if self.m5.is_some() {
+            return self.adopt_m5(context, owner);
+        }
         if !self.reusable() {
             return Err(EBUSY);
         }
@@ -1894,7 +2004,7 @@ impl Queue {
         self.replay_prepared = false;
         self.submitted = 0;
         self.kick.clear_parent_after_recovery();
-        // The M5 Ultra lane keeps its owner until its context's release parks it (`park_m5` in
+        // The M5 Ultra lane keeps its owner until its context's release detaches it (`detach_m5` in
         // `queue::m5`).
         if !self.graph.m5 {
             self.owner = None;

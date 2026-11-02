@@ -286,8 +286,8 @@ impl super::Registry {
         for channel in super::m5::channels(&self.compute) {
             visit(channel);
         }
-        for pair in &self.m5_render {
-            visit(&**pair);
+        for pair in super::m5::pairs(&self.render.m5) {
+            visit(pair);
         }
     }
 
@@ -309,8 +309,8 @@ impl super::Registry {
         for channel in super::m5::channels_mut(&mut self.compute) {
             failure = failure.or(settle(channel).err());
         }
-        for pair in &mut self.m5_render {
-            failure = failure.or(settle(&mut **pair).err());
+        for pair in super::m5::pairs_mut(&mut self.render.m5) {
+            failure = failure.or(settle(pair).err());
         }
         failure.map_or(Ok(()), Err)
     }

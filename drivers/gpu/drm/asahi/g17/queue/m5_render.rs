@@ -238,7 +238,7 @@ pub(crate) struct ParkedPair {
 
 impl ParkedPair {
     /// Its previous binding's client views are unmapped, and no release of its pool is in
-    /// flight ([`super::m5::ParkedLane::adoptable`]).
+    /// flight (`super::compute::Queue::m5_reusable`).
     pub(crate) fn adoptable(&self) -> bool {
         self.unmapped.done() && !self.pool_state.pending()
     }
@@ -246,8 +246,8 @@ impl ParkedPair {
     pub(crate) fn backed(&self) -> bool {
         self.pool_state.phase() == PoolPhase::Populated && !self.pool.vacant()
     }
-    /// An idle pool the vacate pass may give back (`Registry::vacate_idle_pools`), as a parked
-    /// lane's (`super::m5::ParkedLane::vacate_candidate`).
+    /// An idle pool the vacate pass may give back (`Registry::vacate_idle_pools`), as a detached
+    /// lane's (`super::compute::Queue::m5_vacate_candidate`).
     pub(crate) fn vacate_candidate(&self) -> bool {
         self.backed() && self.unmapped.done()
     }
@@ -256,7 +256,7 @@ impl ParkedPair {
         self.parked_at
     }
     /// Releases this parked pair's pool (the caller holds the device mutex and announces a
-    /// published record), as a parked lane's (`super::m5::ParkedLane::vacate`): the backing is
+    /// published record), as a detached lane's (`super::compute::Queue::vacate_m5`): the backing is
     /// freed once the firmware consumed the release ([`Self::observe_vacancy`]); the lanes stay
     /// installed, and the next binding's first pass backs the pool for its plan.
     pub(crate) fn vacate(&mut self, init: &crate::g17::initdata::InitData) -> Result<bool> {
@@ -287,9 +287,6 @@ impl ParkedPair {
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
         [self.lanes[TILING].qid(), self.lanes[FRAGMENT].qid()]
-    }
-    pub(crate) fn class(&self) -> u8 {
-        self.class
     }
 }
 
@@ -589,19 +586,19 @@ impl Pair {
         Ok(pair)
     }
 
-    /// Adopts parked pair `index` for `context`'s logical queue: builds
-    /// the binding's storage and client views in the new VM and rewrites both records'
-    /// host-owned words. The binding's first pass reconfigures both queues; the kick
-    /// timestamps, the stamps and the pass ordinal continue. The caller installs the binding's
-    /// parameter-buffer row ([`Self::install_pb`]). On failure the pair stays parked.
+    /// Adopts the parked pair in `parked` (its render slot's) for `context`'s logical queue
+    ///: builds the binding's storage and client views in the new VM and
+    /// rewrites both records' host-owned words. The binding's first pass reconfigures both
+    /// queues; the kick timestamps, the stamps and the pass ordinal continue. The caller
+    /// installs the binding's parameter-buffer row ([`Self::install_pb`]). On failure the pair
+    /// stays parked in `parked`.
     pub(crate) fn adopt(
         alloc: &Allocator<'_>,
-        parked: &mut KVec<ParkedPair>,
-        index: usize,
+        parked: &mut Option<ParkedPair>,
         context: Arc<Context>,
         binding: BindingArgs<'_>,
     ) -> Result<KBox<Self>> {
-        let lane = parked.get_mut(index).ok_or(EINVAL)?;
+        let lane = parked.as_mut().ok_or(EINVAL)?;
         if !lane.adoptable() {
             return Err(EAGAIN);
         }
@@ -637,7 +634,7 @@ impl Pair {
         for queue in &mut lane.lanes {
             queue.set_owner(&context)?;
         }
-        let lane = parked.remove(index).map_err(|_| EINVAL)?;
+        let lane = parked.take().ok_or(EINVAL)?;
         let class_changed = lane.class != context.policy().priority();
         let pair = KBox::write(
             slot,
@@ -675,7 +672,7 @@ impl Pair {
         );
         if let Err(error) = pair.publish_mappings() {
             let (lane, _binding) = pair.park();
-            parked.push_within_capacity(lane).map_err(|_| ENOMEM)?;
+            *parked = Some(lane);
             return Err(error);
         }
         // The rewritten records name this context's scheduler page.
@@ -1205,6 +1202,52 @@ impl Pair {
         Ok(grown)
     }
 
+    /// An idle bound pair's pool that backing pressure may give back, as Neo's
+    /// `Registry::reclaim_idle_render_pools` gives back an idle bound pair's
+    /// (`Registry::vacate_idle_pools` at cap 0): healthy and installed, no pass in flight, held
+    /// or awaiting its replay, no growth, the pool backed, and the firmware done with every
+    /// pass as for parking ([`Self::drained`]). The pair keeps its lanes, QIDs, binding and
+    /// owner; its next pass backs the pool again for its plan ([`Self::grow`]).
+    pub(crate) fn vacate_candidate(&self) -> bool {
+        self.installed
+            && self.quarantine_error.is_none()
+            && !self.in_flight()
+            && !self.growing
+            && !self.held
+            && self.pool_state.phase() == PoolPhase::Populated
+            && !self.pool.vacant()
+            && Self::drained(&self.lanes, &self.support, self.ordinal, &self.pool).unwrap_or(false)
+    }
+    /// Releases the bound pair's pool ([`Self::vacate_candidate`]; the caller holds the device
+    /// mutex and announces a published record), as a parked pair's
+    /// ([`ParkedPair::vacate`]).
+    pub(crate) fn vacate(&mut self, init: &crate::g17::initdata::InitData) -> Result<bool> {
+        if !self.vacate_candidate() {
+            return Err(EBUSY);
+        }
+        // Generation 1, as every binding's configuration publishes it.
+        self.pool_state.release(init, self.pool.release_record(1))
+    }
+    /// Once the firmware consumed the release of the bound pair's pool, its backing and the
+    /// client's view of it, which the caller drops off the device mutex, the view first. A
+    /// growth that backed the pool again first (`grow_pool`, which waits for the same
+    /// consumption) leaves nothing here.
+    pub(crate) fn observe_vacancy(
+        &mut self,
+        consumer: u32,
+        producer: u32,
+    ) -> Result<Option<(Option<mmu::KernelMapping>, M5Backing)>> {
+        self.pool_state.observe(consumer, producer)?;
+        if self.pool_state.phase() != PoolPhase::Vacant || self.pool.vacant() {
+            return Ok(None);
+        }
+        let va = self.pool.backing_va()?;
+        let view = match self.aliases.iter().position(|alias| alias.iova() == va) {
+            Some(index) => Some(self.aliases.remove(index).map_err(|_| EIO)?),
+            None => None,
+        };
+        Ok(self.pool.vacate().map(|backing| (view, backing)))
+    }
     /// A release of the pool is in flight (the event worker reports its consumption as
     /// progress).
     pub(crate) fn pool_release_pending(&self) -> bool {

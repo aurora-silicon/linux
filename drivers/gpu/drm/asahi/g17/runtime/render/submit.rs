@@ -279,8 +279,9 @@ impl Backend {
     }
 
     /// Gives idle render backing back under capacity pressure. Returns whether
-    /// anything was returned, in which case the caller retries at once.
-    fn reclaim_render_capacity(&self) -> Result<bool> {
+    /// anything was returned, in which case the caller retries at once. The M5
+    /// Ultra's publications call it when a pool's backing is refused.
+    pub(in crate::g17::runtime) fn reclaim_render_capacity(&self) -> Result<bool> {
         let mut deferred = DeferredBatch::publication()?;
         let result: Result<bool> = (|| {
             let lease = self.shared.preparations.try_enter()?;

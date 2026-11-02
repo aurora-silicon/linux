@@ -92,11 +92,18 @@ struct State {
     /// (`Variant::render_barriers`): a same-VM overlap of another owner is then
     /// ordered at publication instead of waited for (`hazard::plan`).
     barriers: bool,
+    /// Passes one pair takes at once: `cfg::RENDER_DEPTH`, or the M5 Ultra pair's
+    /// (`queue::m5_render::DEPTH`), whose next pass waits here for the slot's retirement.
+    depth: u8,
 }
 
 impl State {
     const MASK: u64 = (u64::MAX >> (64 - cfg::RENDER_SLOTS)) & !1;
+    #[cfg(CONFIG_KUNIT = "y")]
     const fn new(barriers: bool) -> Self {
+        Self::with_depth(barriers, cfg::RENDER_DEPTH)
+    }
+    const fn with_depth(barriers: bool, depth: u8) -> Self {
         Self {
             active: 0,
             refs: [0; cfg::RENDER_SLOTS],
@@ -114,6 +121,7 @@ impl State {
             footprints: KVec::new(),
             next_ticket: 1,
             barriers,
+            depth,
         }
     }
     fn exhausted(&self) -> bool {
@@ -188,7 +196,7 @@ impl State {
                     self.owners[*slot] == owner
                         && self.quarantined & (1u64 << slot) == 0
                         && self.active & (1u64 << slot) != 0
-                        && self.refs[*slot] < cfg::RENDER_DEPTH
+                        && self.refs[*slot] < self.depth
                 })
                 .min_by_key(|slot| (self.refs[*slot], u64::MAX - self.epochs[*slot]))?;
             self.refs[slot] += 1;
@@ -353,7 +361,7 @@ impl State {
         let usable = |slot: usize| {
             self.owners[slot] == owner
                 && (self.quarantined | self.kill_hold) & (1u64 << slot) == 0
-                && self.refs[slot] < cfg::RENDER_DEPTH
+                && self.refs[slot] < self.depth
         };
         match plan {
             Plan::Wait => false,
@@ -378,7 +386,7 @@ impl State {
                 let index = usize::from(slot);
                 if self.owners.get(index) != Some(&owner)
                     || (self.quarantined | self.kill_hold) & (1u64 << slot) != 0
-                    || self.refs[index] >= cfg::RENDER_DEPTH
+                    || self.refs[index] >= self.depth
                 {
                     return None;
                 }
@@ -458,20 +466,22 @@ pub(crate) struct Pool {
 impl Pool {
     #[cfg(CONFIG_KUNIT = "y")]
     pub(crate) fn new(max_queues: u32) -> Result<Arc<Self>> {
-        Self::with_waiters(max_queues, true, None, None)
+        Self::with_waiters(max_queues, true, cfg::RENDER_DEPTH, None, None)
     }
+    /// `depth`: the passes one pair takes at once (`State::depth`).
     pub(crate) fn with_waiters(
         max_queues: u32,
         barriers: bool,
+        depth: u8,
         waiters: Option<Arc<crate::g17::availability::Availability>>,
         renders: Option<Arc<crate::g17::availability::Availability>>,
     ) -> Result<Arc<Self>> {
-        if max_queues > MAX_EXECUTION_CONTEXTS {
+        if max_queues > MAX_EXECUTION_CONTEXTS || depth == 0 || depth > cfg::RENDER_DEPTH {
             return Err(EINVAL);
         }
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_mutex!(State::new(barriers), "G17 render admission"),
+                state <- new_mutex!(State::with_depth(barriers, depth), "G17 render admission"),
                 released <- new_condvar!("G17 render pair release"),
                 queues: AtomicU32::new(0),
                 max_queues,
@@ -686,6 +696,32 @@ impl Pool {
         for slot in 0..cfg::RENDER_SLOTS {
             if state.owners[slot] == owner {
                 state.released |= 1u64 << slot;
+            }
+        }
+        drop(state);
+        self.returned();
+    }
+    /// Closes `owner` where a slot keeps its pair across owners only parked there (the M5
+    /// Ultra's, `runtime::m5`): each slot of `owner` with a parked pair (`parked(slot)`) or a
+    /// lease still active is released, as by [`Self::release_owner`]; an idle one with nothing
+    /// in it goes back unowned, so a next owner leases a slot with a parked pair to adopt
+    /// before an empty one, where it would build a fresh pair.
+    pub(crate) fn close_owner(&self, owner: u64, parked: impl Fn(usize) -> bool) {
+        let mut state = self.state.lock();
+        for slot in 0..cfg::RENDER_SLOTS {
+            if state.owners[slot] != owner {
+                continue;
+            }
+            let bit = 1u64 << slot;
+            if parked(slot)
+                || state.refs[slot] != 0
+                || (state.quarantined | state.kill_hold) & bit != 0
+            {
+                state.released |= bit;
+            } else {
+                state.owners[slot] = 0;
+                state.released &= !bit;
+                state.epochs[slot] = 0;
             }
         }
         drop(state);

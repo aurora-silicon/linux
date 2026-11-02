@@ -111,7 +111,14 @@ impl Backend {
             .close(&self.context, super::now_ns())?;
         firmware.queues.release_compute(self.owner)?;
         firmware.queues.release_render(self.owner)?;
-        firmware.queues.admission.release_owner(self.owner);
+        // An M5 owner's render slot holds its pair until the pair parks there at the scheduler
+        // release armed above, and the park releases the slot then (`runtime::m5::Lanes::park`),
+        // so no next owner leases a slot whose pair is still this one's.
+        if self.shared.m5.is_some() {
+            firmware.queues.close_m5_render(self.owner);
+        } else {
+            firmware.queues.admission.release_owner(self.owner);
+        }
         drop(state);
         // Its idle channel, or its slot and never-published QID, is free.
         self.shared.channels.notify();

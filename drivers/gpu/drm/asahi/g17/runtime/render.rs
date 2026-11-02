@@ -80,6 +80,11 @@ pub(in crate::g17) struct RenderState {
     /// until the firmware stops, when this state is dropped.
     kept_graphs: KVec<crate::g17::queue::render::RetiredBinding>,
     next_pm_generation: u64,
+    /// The M5 Ultra's render pairs, each at the render slot its admission leases
+    /// (`queue::admission`), beside that slot's entry: an owner's passes all lease its one
+    /// slot (`RENDER_PAIRS_PER_OWNER`), so its pair is the one there. One cell per slot on the
+    /// M5 Ultra, empty elsewhere: Neo's walks over the entries never see an M5 pair.
+    pub(super) m5: KVec<Option<super::m5::PairCell>>,
 }
 
 impl RenderState {
@@ -87,6 +92,7 @@ impl RenderState {
         clusters: u32,
         deflake: crate::g17::fw::render::Deflake,
         descriptor_flags: [u32; 2],
+        m5: bool,
     ) -> Result<Self> {
         if clusters == 0 {
             return Err(EINVAL);
@@ -94,6 +100,13 @@ impl RenderState {
         let mut entries = KVec::with_capacity(RENDER_SLOTS, GFP_KERNEL)?;
         for _ in 0..RENDER_SLOTS {
             entries.push(None, GFP_KERNEL)?;
+        }
+        let mut m5_pairs = KVec::new();
+        if m5 {
+            m5_pairs.reserve(RENDER_SLOTS, GFP_KERNEL)?;
+            for _ in 0..RENDER_SLOTS {
+                m5_pairs.push_within_capacity(None).map_err(|_| ENOMEM)?;
+            }
         }
         Ok(Self {
             config: Config {
@@ -107,6 +120,7 @@ impl RenderState {
             retired: KVec::with_capacity(128, GFP_KERNEL)?,
             kept_graphs: KVec::new(),
             next_pm_generation: 1,
+            m5: m5_pairs,
         })
     }
 
