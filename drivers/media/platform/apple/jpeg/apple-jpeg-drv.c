@@ -16,6 +16,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -40,6 +41,7 @@ struct apple_jpeg {
 	struct device *dev;
 	void __iomem *regs;
 	const struct apple_jpeg_variant *variant;
+	struct dev_pm_domain_list *pd_list;
 	struct mutex lock;	/* serialises ioctls and queue state */
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
@@ -718,8 +720,23 @@ static int aj_probe(struct platform_device *pdev)
 
 	if (!device_iommu_mapped(dev))
 		return dev_err_probe(dev, -ENODEV, "no IOMMU\n");
-	if (!dev->pm_domain)
+	/*
+	 * A second power domain, "perf", is the SoC performance request the
+	 * engine needs for full speed; attach both with runtime PM links so it
+	 * is held exactly while the engine is runtime-active.
+	 */
+	if (of_count_phandle_with_args(dev->of_node, "power-domains",
+				       "#power-domain-cells") > 1) {
+		static const struct dev_pm_domain_attach_data pd_data = {
+			.pd_flags = PD_FLAG_DEV_LINK_ON,
+		};
+
+		ret = devm_pm_domain_attach_list(dev, &pd_data, &jpeg->pd_list);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "failed to attach power domains\n");
+	} else if (!dev->pm_domain) {
 		return dev_err_probe(dev, -ENODEV, "requires a power domain\n");
+	}
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res || resource_size(res) != APPLE_JPEG_REG_SIZE)
 		return -EINVAL;

@@ -29,6 +29,17 @@ static inline bool ane_fw_contains(u64 base, u64 bytes, u64 addr, u64 size)
 	       addr - base <= bytes - size;
 }
 
+/* The firmware's channel names, in the logical order of the driver. */
+static inline const char *ane_fw_channel_name(unsigned int ch)
+{
+	static const char * const names[ANE_FW_CHANNELS] = {
+		"TERMINAL", "IO", "DEBUG", "BUF_H2T", "BUF_T2H",
+		"SHAREDMALLOC", "IO_T2H", "DATA_CHAIN_H2T",
+	};
+
+	return ch < ANE_FW_CHANNELS ? names[ch] : "none";
+}
+
 /* Parse a host-owned descriptor snapshot; output indices are logical names. */
 static inline int
 ane_fw_channels_parse(const void *table, u64 ipc_dva, size_t ipc_size,
@@ -113,6 +124,22 @@ ane_fw_channels_host_init(void *ipc, const struct ane_fw_channel *channels)
 		}
 	}
 }
+
+/*
+ * H17 system sleep: leave the firmware's Exclave mode (SNE DM bus idle)
+ * before SUSPEND, on the control ring; 0x18 bytes, zero body.
+ */
+#define ANE_FW_CMD_EXCLAVE_MODE_STOP 0x31
+#define ANE_FW_MODE_STOP_SIZE 0x18
+
+/*
+ * SET_SNE_PMU_BASE2, 16 bytes on the control ring at startup, between START
+ * and CONFIG_GET: the u64 base of the ANE's PMGR/PMU aperture (the DT "pmgr"
+ * register range; J700 0x300700000, T6041 0x502280000). The 0x24 handler's
+ * DM-bus endpoint-0 idle query needs it (SPEC-ANE-SLEEP-H17-r2.md).
+ */
+#define ANE_FW_CMD_SET_PMU_BASE 0x29
+#define ANE_FW_PMU_BASE_SIZE 0x10
 
 /* H14 preserves its reserved word; H16 requires bytes 0..3 to be zero. */
 /*

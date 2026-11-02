@@ -124,6 +124,14 @@ struct ane_fw_transport {
 	size_t shared_bytes;
 	u32 shared_count;
 	int error;
+	/* ane_fw_transport.h line that raised error, for diagnosis. */
+	unsigned int error_line;
+	/*
+	 * The second host-to-firmware command ring, at table position 2: the
+	 * firmware's mode commands (EXCLAVE_MODE_STOP) go there, outside the
+	 * IO queue they must not wait behind. ANE_FW_CHANNELS when absent.
+	 */
+	u32 control_ch;
 	/* relax() calls made by every wait so far; callers diff it. */
 	u64 polls;
 	bool armed;
@@ -152,11 +160,35 @@ ane_fw_surfaces_overlap(const struct ane_fw_surface *a, const struct ane_fw_surf
 	return a->dva < b->dva + b->size && b->dva < a->dva + a->size;
 }
 
-static inline int ane_fw_transport_fail(struct ane_fw_transport *t, int error)
+/* The first error is kept, with the line of this file that raised it. */
+static inline int __ane_fw_transport_fail(struct ane_fw_transport *t, int error,
+					  unsigned int line)
 {
-	if (!t->error)
+	if (!t->error) {
 		t->error = error;
+		t->error_line = line;
+	}
 	return t->error;
+}
+
+#define ane_fw_transport_fail(t, error) __ane_fw_transport_fail(t, error, __LINE__)
+
+/*
+ * The command ring at table position 2 (macOS channel selector 2), when it
+ * is a host-to-firmware ring like IO and not one of the rings Linux already
+ * drives. ANE_FW_CHANNELS when the table has none.
+ */
+static inline u32 ane_fw_control_channel(const struct ane_fw_channel channels[ANE_FW_CHANNELS])
+{
+	u32 ch;
+
+	for (ch = 0; ch < ANE_FW_CHANNELS; ch++)
+		if (channels[ch].index == 2)
+			break;
+	if (ch == ANE_FW_CHANNELS || ch == ANE_FW_IO || ch == ANE_FW_DATA_CHAIN ||
+	    channels[ch].type != channels[ANE_FW_IO].type)
+		return ANE_FW_CHANNELS;
+	return ch;
 }
 
 /* pool_reserved protects the init record and any other boot-owned pool bytes. */
@@ -188,7 +220,31 @@ ane_fw_transport_init(struct ane_fw_transport *t, const struct ane_fw_platform *
 	ops->read_barrier(ctx);
 	memcpy(t->table, (u8 *)ipc.cpu + t->table_offset, sizeof(t->table));
 	ret = ane_fw_channels_parse(t->table, ipc.dva, ipc.size, table_dva, t->channels);
-	return ret ? ane_fw_transport_fail(t, ret) : 0;
+	if (ret)
+		return ane_fw_transport_fail(t, ret);
+	t->control_ch = ane_fw_control_channel(t->channels);
+	return 0;
+}
+
+/*
+ * After the firmware was booted again (ane_fw_transport_init() on the same
+ * IPC and pool), give the new transport the shared allocations of the old
+ * one, all retired: the new firmware owns none of them, and its SHAREDMALLOC
+ * requests of the same tag and size are served from them
+ * (ane_fw_shared_reusable()) instead of mapping new memory every cycle.
+ */
+static inline void ane_fw_transport_carry_shared(struct ane_fw_transport *t,
+						 const struct ane_fw_transport *old)
+{
+	unsigned int i;
+
+	t->shared_count = old->shared_count;
+	t->shared_bytes = old->shared_bytes;
+	for (i = 0; i < old->shared_count; i++) {
+		t->shared[i] = old->shared[i];
+		t->shared_tags[i] = old->shared_tags[i];
+		t->shared_retired[i] = true;
+	}
 }
 
 static inline int ane_fw_transport_check(struct ane_fw_transport *t)
@@ -294,8 +350,8 @@ static inline bool ane_fw_transport_switch_safe(const struct ane_fw_transport *t
 
 /* Commands are copied into a monotonic pool arena, never external DMA memory. */
 static inline int
-ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
-			 const void *command, size_t size, u64 deadline_ns)
+__ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
+			   const void *command, size_t size, u64 deadline_ns)
 {
 	struct ane_fw_transaction *tx;
 	size_t offset;
@@ -305,12 +361,9 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 
 	if (ret)
 		return ret;
-	if (!t->armed || (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN) ||
-	    !command || size < 8 || get_unaligned_le32(command) ||
+	if (!t->armed || !command || size < 8 || get_unaligned_le32(command) ||
 	    get_unaligned_le16((const u8 *)command + 6))
 		return -EINVAL;
-	if (ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
-		return -EPERM;
 	tx = &t->pending[ch];
 	if (tx->active)
 		return -EBUSY;
@@ -345,6 +398,52 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 	t->ops->write_barrier(t->ctx);
 	ane_fw_transport_doorbell(t, ch);
 	return 0;
+}
+
+/* IO and DATA_CHAIN; mode and ownership commands are refused. */
+static inline int
+ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
+			 const void *command, size_t size, u64 deadline_ns)
+{
+	if (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN)
+		return -EINVAL;
+	if (command && size >= 8 &&
+	    ane_fw_command_denied(get_unaligned_le16((const u8 *)command + 4)))
+		return -EPERM;
+	return __ane_fw_transport_publish(t, ch, command, size, deadline_ns);
+}
+
+/*
+ * The kernel's SET_SNE_PMU_BASE2 on the control ring (16 bytes, the u64 PMU
+ * aperture base). Nothing else from outside the kernel reaches that ring.
+ */
+static inline int
+ane_fw_transport_publish_pmu_base(struct ane_fw_transport *t, u64 base, u64 deadline_ns)
+{
+	u8 command[ANE_FW_PMU_BASE_SIZE] = {};
+
+	if (t->control_ch >= ANE_FW_CHANNELS)
+		return -ENODEV;
+	put_unaligned_le16(ANE_FW_CMD_SET_PMU_BASE, command + 4);
+	put_unaligned_le64(base, command + 8);
+	return __ane_fw_transport_publish(t, t->control_ch, command, sizeof(command),
+					  deadline_ns);
+}
+
+/*
+ * The kernel's own system-sleep step on the control ring: only the 24-byte
+ * EXCLAVE_MODE_STOP with a zero body. Every other mode command stays denied.
+ */
+static inline int
+ane_fw_transport_publish_mode_stop(struct ane_fw_transport *t, u64 deadline_ns)
+{
+	u8 command[ANE_FW_MODE_STOP_SIZE] = {};
+
+	if (t->control_ch >= ANE_FW_CHANNELS)
+		return -ENODEV;
+	put_unaligned_le16(ANE_FW_CMD_EXCLAVE_MODE_STOP, command + 4);
+	return __ane_fw_transport_publish(t, t->control_ch, command, sizeof(command),
+					  deadline_ns);
 }
 
 /* Command arena position, for ane_fw_transport_release(). */
@@ -382,7 +481,8 @@ static inline int ane_fw_transport_poll(struct ane_fw_transport *t, unsigned int
 
 	if (ret)
 		return ret;
-	if (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN)
+	if (ch != ANE_FW_IO && ch != ANE_FW_DATA_CHAIN &&
+	    (ch != t->control_ch || ch >= ANE_FW_CHANNELS))
 		return -EINVAL;
 	tx = &t->pending[ch];
 	if (!tx->active)
@@ -401,6 +501,13 @@ static inline int ane_fw_transport_poll(struct ane_fw_transport *t, unsigned int
 	t->ops->read_barrier(t->ctx);
 	length = t->ops->load64(t->ctx, p + 8);
 	result = t->ops->load64(t->ctx, p + 16);
+	/*
+	 * The control ring (DEBUG) completes with DVA|1 and the length, but
+	 * leaves the result word as published, the command size (H17 C6: 0x31
+	 * completed as 0x...581 0x18 0x18). The IO rings write zero there.
+	 */
+	if (ch == t->control_ch && result == tx->size)
+		result = 0;
 	ret = ane_fw_reply_status(header, length, result, tx->dva, tx->size,
 				  tx->id, (u8 *)t->pool.cpu + (tx->dva - t->pool.dva), true);
 	if (ret)

@@ -532,6 +532,32 @@ static void ane_h16_happy_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
 }
 
+/*
+ * A cold boot after sleep runs the boot again on the surfaces it mapped
+ * before: the same DVA and size is reused, cleared, with no new mapping;
+ * anything else is allocated.
+ */
+static void ane_h16_alloc_reuse_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	struct ane_fw_surface surface = {};
+	u64 dva = s->build.pool_dva;
+	void *cpu;
+	u32 allocations;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_alloc(&s->boot, dva, SZ_16K, &surface), 0);
+	cpu = surface.cpu;
+	memset(cpu, 0x5a, SZ_16K);
+	allocations = s->allocations;
+	KUNIT_ASSERT_EQ(test, ane_h16_alloc(&s->boot, dva, SZ_16K, &surface), 0);
+	KUNIT_EXPECT_EQ(test, s->allocations, allocations);
+	KUNIT_EXPECT_PTR_EQ(test, surface.cpu, cpu);
+	KUNIT_EXPECT_FALSE(test, memchr_inv(cpu, 0, SZ_16K));
+	surface.size = SZ_32K;
+	KUNIT_ASSERT_EQ(test, ane_h16_alloc(&s->boot, dva, SZ_16K, &surface), 0);
+	KUNIT_EXPECT_EQ(test, s->allocations, allocations + 1);
+}
+
 static void ane_h16_no_ready_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
@@ -874,6 +900,7 @@ static void ane_h16_foreign_free_test(struct kunit *test)
 }
 
 static struct kunit_case ane_h16_boot_cases[] = {
+	KUNIT_CASE(ane_h16_alloc_reuse_test),
 	KUNIT_CASE(ane_h16_happy_test),
 	KUNIT_CASE(ane_h16_locked_matching_test),
 	KUNIT_CASE(ane_h16_dapf_program_test),

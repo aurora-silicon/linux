@@ -149,6 +149,9 @@ struct ane_h16_boot {
 	u64 ranges[4][2];
 	u32 requests[5];
 	u32 tick;
+	/* The PMU aperture base for SET_SNE_PMU_BASE2 at startup; 0: not sent. */
+	u64 pmu_base;
+	bool pmu_base_set;
 	u8 resource_info[100];
 	int error;
 	enum ane_h16_stage stage;
@@ -459,7 +462,14 @@ static inline int ane_h16_wait(struct ane_h16_boot *b, u32 cell, u32 value,
 static inline int ane_h16_alloc(struct ane_h16_boot *b, u64 dva, size_t size,
 				struct ane_fw_surface *s)
 {
-	int ret = b->ops->alloc_at(b->ctx, dva, size, s);
+	int ret;
+
+	/* A cold boot after sleep reuses the surface it mapped before, cleared. */
+	if (s->cpu && s->dva == dva && s->size == size) {
+		memset(s->cpu, 0, size);
+		return 0;
+	}
+	ret = b->ops->alloc_at(b->ctx, dva, size, s);
 
 	if (ret)
 		return ret;
@@ -595,6 +605,18 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		ret = ane_h16_faults(b, false);
 		if (ret)
 			return ret;
+		/* macOS order: START, then SET_SNE_PMU_BASE2 on the control ring. */
+		if (f->startup[i].id == 0 && b->pmu_base) {
+			b->pmu_base_set = false;
+			ret = ane_fw_transport_publish_pmu_base(&b->transport, b->pmu_base,
+								deadline);
+			if (!ret)
+				ret = ane_fw_transport_wait(&b->transport, b->transport.control_ch);
+			b->ops->log(b->ctx, "SET_SNE_PMU_BASE2 base/result", b->pmu_base, (u64)ret);
+			if (ret)
+				return ret;
+			b->pmu_base_set = true;
+		}
 	}
 	return 0;
 }
