@@ -102,10 +102,22 @@ pub(super) struct ComputeReservation {
 struct ComputeEntry {
     reservation: ComputeReservation,
     queue: ComputeSlot,
-    /// The M5 Ultra's compute channel on this entry's QID ([`queue::m5`]), bound to the
-    /// reservation's owner; its cell stays empty. Set only by `Firmware::bind_m5_channel` and
+    /// The M5 Ultra's compute lane on this entry's QID, Neo's compute queue with its `m5` arms
+    /// ([`queue::m5`]), bound to the reservation's owner; its cell stays empty, so Neo's walks over
+    /// the cells do not see it. Set only by `Firmware::bind_m5_channel` and
     /// `Firmware::install_m5_channel`, so `None` on every other GPU.
-    m5: Option<KBox<queue::m5::Channel>>,
+    m5: Option<KBox<compute::Queue>>,
+}
+
+impl ComputeEntry {
+    /// Runs `f` on this entry's queue: its cell's, or else the M5 Ultra's lane beside the empty
+    /// cell ([`Self::m5`], `None` on every other GPU). Neo's closed-context kill reaches both.
+    fn with_queue<R>(&mut self, f: impl FnOnce(&mut compute::Queue) -> R) -> Option<R> {
+        if let Some(mut queue) = self.queue.as_deref_mut() {
+            return Some(f(&mut queue));
+        }
+        self.m5.as_deref_mut().map(f)
+    }
 }
 
 /// A physical compute queue behind its own lock. Publication into a bound queue takes only
@@ -1022,7 +1034,7 @@ impl Backend {
             }
             if let (false, Some(fresh), None) = (published, reservation, built.as_ref()) {
                 // Nothing of it is visible to the firmware until its installation.
-                let channel = queue::m5::Channel::new(alloc, context.clone(), fresh.id, owner, gpu,
+                let channel = compute::Queue::new_m5(alloc, context.clone(), fresh.id, owner, gpu,
                     &shared.variant.pointers).inspect_err(|error| {
                     dev_warn!(alloc.dev.as_ref(), "M5 channel of queue {}: construction failed: {:?}\n",
                         owner, error);
@@ -1050,7 +1062,7 @@ impl Backend {
                     }
                 }
                 if published {
-                    // An adopted recycled lane is reinstalled first (`Channel::reinstall`).
+                    // An adopted recycled lane is reinstalled first (`Queue::reinstall`).
                     match firmware.m5_reinstall(owner) {
                         Ok(()) => {}
                         Err(error) if error == EAGAIN && !expired => {}
@@ -2008,7 +2020,7 @@ impl super::Firmware {
             )?;
             freed |= busy && queue.channel_free();
         }
-        registry.retire_m5(port, state, deferred)?;
+        registry.retire_m5(port, masks, generation, state, deferred)?;
         // All compute observations in this batch are latched before a VM
         // failure can settle its render peers. Exact successes win first.
         for index in 0..self.queues.compute.len() {

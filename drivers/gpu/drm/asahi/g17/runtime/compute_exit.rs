@@ -135,7 +135,7 @@ impl super::Registry {
             }
         }
         // The M5 Ultra's compute lanes (none elsewhere) carry their kills as Neo's queues do.
-        if super::m5::channels_mut(&mut self.compute).any(|channel| channel.acknowledge_kill(cookie)) {
+        if super::m5::channels_mut(&mut self.compute).any(|channel| channel.acknowledge_exit(cookie)) {
             return;
         }
         if self.teardown.acknowledge_render_kill(cookie) {
@@ -150,20 +150,13 @@ impl Firmware {
         let recovery_closed = self.init.recovery_state()? == 0;
         let port = &self.port;
         for entry in self.queues.compute.iter_mut().flatten() {
-            if let Some(mut queue) = entry.queue.as_deref_mut() {
+            entry.with_queue(|queue| {
                 queue.settle_exit(
                     recovery_closed,
                     &mut |owner| port.qos_complete(&[owner]),
                     &mut |event| deferred.push(event),
-                )?;
-            }
-        }
-        let m5 = self.primary.state.shared.m5.is_some();
-        if m5 {
-            let now = now_ns();
-            for channel in super::m5::channels_mut(&mut self.queues.compute) {
-                channel.settle_kill(recovery_closed, now);
-            }
+                )
+            }).transpose()?;
         }
         if self.recovery.pending() || !recovery_closed {
             return Ok(());
@@ -171,18 +164,12 @@ impl Firmware {
         let now = now_ns();
         // Publication has already retained each kill. Retry only the doorbell;
         // failed attempts do not extend its bounded polling window.
-        for entry in self.queues.compute.iter_mut().flatten() {
-            if let Some(mut queue) = entry.queue.as_deref_mut() {
-                let _ = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY));
-            }
-        }
-        if m5 {
-            let primary = &mut self.primary;
-            for channel in super::m5::channels_mut(&mut self.queues.compute) {
-                let _ = channel.announce_kill(now, || primary.notify(MSG_CONTROL_NOTIFY));
-            }
-        }
         let primary = &mut self.primary;
+        for entry in self.queues.compute.iter_mut().flatten() {
+            entry.with_queue(|queue| {
+                let _ = queue.announce_exit(now, || primary.notify(MSG_CONTROL_NOTIFY));
+            });
+        }
         self.queues.teardown.announce_render_kills(|| primary.notify(MSG_CONTROL_NOTIFY));
         // Under memory pressure one kill skips the wait, at most one per interval.
         let last = PRESSED_KILL_NS.load(Ordering::Relaxed);
@@ -192,20 +179,8 @@ impl Firmware {
             let Some((context, age)) = self.queues.teardown.closed(index, now) else {
                 continue;
             };
-            // An M5 context's queues are its compute lane and render pair, which Neo's arms
-            // below do not see.
-            if m5 {
-                if let Err(error) = self.publish_m5_kill(&context, age, now) {
-                    dev_err!(
-                        self.primary.state.shared.dev.as_ref(),
-                        "Scheduler {} kill request failed: {:?}\n",
-                        context.id(),
-                        error
-                    );
-                }
-                continue;
-            }
-            if !self.queues.render.teardown_idle(&context)? {
+            // The M5 Ultra's render pairs (none elsewhere) settle before their context's kill too.
+            if !self.queues.render.teardown_idle(&context)? || !self.queues.m5_render_settled(&context) {
                 self.queues.teardown.clear_kill_wait(index);
                 continue;
             }
@@ -236,10 +211,11 @@ impl Firmware {
 
     fn publish_compute_exit(&mut self, context: &Arc<Context>, age: u64, now: u64, pressed: &mut bool) -> Result {
         let Some(index) = self.queues.compute.iter().position(|entry| {
-            entry
-                .as_ref()
-                .and_then(|entry| entry.queue.as_deref())
-                .is_some_and(|queue| queue.exit_candidate(context, age))
+            entry.as_ref().is_some_and(|entry| {
+                entry.queue.as_deref().is_some_and(|queue| queue.exit_candidate(context, age))
+                    // The M5 Ultra's lane beside the empty cell (`ComputeEntry::m5`).
+                    || entry.m5.as_deref().is_some_and(|lane| lane.exit_candidate(context, age))
+            })
         }) else {
             return Ok(());
         };
@@ -276,14 +252,14 @@ impl Firmware {
             return Ok(());
         }
         let (owner, target) = {
-            let queue = self.queues.compute[index]
-                .as_ref()
-                .and_then(|entry| entry.queue.as_deref())
+            let found = self.queues.compute[index]
+                .as_mut()
+                .and_then(|entry| entry.with_queue(|queue| queue.exit_owner(context).map(|owner| (owner, queue.qid()))))
                 .ok_or(EIO)?;
-            let Some(owner) = queue.exit_owner(context) else {
+            let Some(found) = found else {
                 return Ok(());
             };
-            (owner, queue.qid())
+            found
         };
         let (mut own, mut foreign, slots) = self.queues.render.exit_scope(context);
         for entry in self.queues.compute.iter().flatten() {
@@ -296,6 +272,10 @@ impl Firmware {
                 }
             }
         }
+        // The M5 Ultra's lanes and pairs (none elsewhere).
+        let (m5_own, m5_foreign) = self.queues.m5_exit_scope(context);
+        own |= m5_own;
+        foreign |= m5_foreign;
         let state = exit::State::read(context)?;
         let Some(qids) = state.scope(target, own, foreign) else {
             return Ok(());
@@ -325,85 +305,32 @@ impl Firmware {
         // stop, and the held render identities until this context's scheduler release
         // is consumed or processors stop.
         context.note_kill_published();
-        let mut queue = self.queues.compute[index]
+        let primary = &mut self.primary;
+        let announced = self.queues.compute[index]
             .as_mut()
-            .and_then(|entry| entry.queue.as_deref_mut())
+            .and_then(|entry| entry.with_queue(|queue| {
+                if failed {
+                    record_kill_wait(queue.take_kill_wait(now));
+                }
+                queue.record_exit(cookie, now);
+                if queue.is_m5() {
+                    pr_info!("G17 M5: kill of context {} published (lane {}, queues {:#x}, cookie {}), {} ms after its close\n",
+                        context.id(), queue.qid(), qids, cookie, age / 1_000_000);
+                }
+                crate::g17::trace::teardown(3, cookie, u64::from(context.id()), hold | u64::from(beside));
+                fence(Ordering::SeqCst);
+                queue.announce_exit(now, || primary.notify(MSG_CONTROL_NOTIFY))
+            }))
             .ok_or(EIO)?;
-        if failed {
-            record_kill_wait(queue.take_kill_wait(now));
-        }
         if beside {
             *pressed = false;
             PRESSED_KILLS.fetch_add(1, Ordering::Relaxed);
             PRESSED_KILL_NS.store(now.max(1), Ordering::Relaxed);
         }
-        queue.record_exit(cookie, now);
-        crate::g17::trace::teardown(3, cookie, u64::from(context.id()), hold | u64::from(beside));
-        fence(Ordering::SeqCst);
-        if let Err(error) = queue.announce_exit(now, || self.primary.notify(MSG_CONTROL_NOTIFY)) {
+        if let Err(error) = announced {
             dev_warn!(
                 self.primary.state.shared.dev.as_ref(),
                 "Scheduler {} exit announcement failed: {:?}\n",
-                context.id(),
-                error
-            );
-        }
-        Ok(())
-    }
-
-    /// Kills a closed M5 context whose compute lane holds failed kicks that the firmware may
-    /// still run (`Channel::kill_candidate`), with Neo's rules for a closed context's kill
-    /// (`publish_compute_exit`): after [`exit::QUARANTINED_DELAY_NS`], with its render pairs
-    /// settled, at a moment without other contexts' work in flight unless the GPU stopped
-    /// ([`Self::kill_unsafe`]), and only when its scheduler page names nothing outside the
-    /// context. The opcode, record and acknowledgement are Neo's (0x29, event 12).
-    fn publish_m5_kill(&mut self, context: &Arc<Context>, age: u64, now: u64) -> Result {
-        let Some(target) = super::m5::channels(&self.queues.compute)
-            .find(|channel| Arc::ptr_eq(channel.context(), context) && channel.kill_candidate())
-            .map(|channel| channel.qid())
-        else {
-            return Ok(());
-        };
-        if age < exit::QUARANTINED_DELAY_NS
-            || self.render_control_backpressured()
-            || !self.queues.m5_render_settled(context)
-            || self.kill_unsafe(context, now)
-        {
-            return Ok(());
-        }
-        let (own, foreign) = self.queues.m5_exit_scope(context);
-        let state = exit::State::read(context)?;
-        let Some(qids) = state.scope(target, own, foreign) else {
-            pr_warn!("G17 M5: context {} not killed: its scheduler page (slot {:#x}, queues {:#x}) is inactive or names queues outside it ({:#x}); lane {} stays quarantined\n",
-                context.id(), state.slot, state.qids, own, target);
-            self.queues.m5_lane_mut(target).ok_or(EIO)?.refuse_kill();
-            return Ok(());
-        };
-        let cookie = match exit::next_cookie() {
-            Ok(cookie) => cookie,
-            Err(error) => {
-                self.queues.m5_lane_mut(target).ok_or(EIO)?.refuse_kill();
-                return Err(error);
-            }
-        };
-        let record = ControlRecord::ContextKill(ContextKill::new(context.scheduler_va(), cookie));
-        if let Err(error) = Rings::publish_control(&self.init, &record) {
-            return if error == EAGAIN { Ok(()) } else { Err(error) };
-        }
-        // Publication is irrevocable even if its doorbell fails: record it first.
-        context.note_kill_published();
-        self.queues.m5_lane_mut(target).ok_or(EIO)?.record_kill(cookie, now);
-        crate::g17::trace::teardown(3, cookie, u64::from(context.id()), 0);
-        pr_info!("G17 M5: kill of context {} published (lane {}, queues {:#x}, cookie {}), {} ms after its close\n",
-            context.id(), target, qids, cookie, age / 1_000_000);
-        fence(Ordering::SeqCst);
-        let primary = &mut self.primary;
-        let lane = self.queues.m5_lane_mut(target).ok_or(EIO)?;
-        if let Err(error) = lane.announce_kill(now, || primary.notify(MSG_CONTROL_NOTIFY))
-        {
-            dev_warn!(
-                self.primary.state.shared.dev.as_ref(),
-                "Scheduler {} kill announcement failed: {:?}\n",
                 context.id(),
                 error
             );
@@ -578,7 +505,7 @@ impl Firmware {
         if self.queues.teardown.render_kill_polling(now, exit::POLL_NS) {
             return true;
         }
-        if super::m5::channels(&self.queues.compute).any(|channel| channel.kill_polling(now)) {
+        if super::m5::channels(&self.queues.compute).any(|channel| channel.exit_polling(now)) {
             return true;
         }
         (0..self.queues.teardown.len()).any(|index| {

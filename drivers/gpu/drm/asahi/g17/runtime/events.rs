@@ -212,16 +212,13 @@ impl Retained for crate::g17::queue::render::Pair {
 }
 
 impl Retained for crate::g17::queue::compute::Queue {
-    fn owns(&self, qid: u8) -> bool { self.qid() == qid }
-    fn oldest_spared(&self) -> Option<bool> { self.oldest_spared() }
-    fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted { self.note_interrupted(stamp) }
-    fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
-    fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
-}
-
-impl Retained for crate::g17::queue::m5::Channel {
+    /// The M5 Ultra's lane settles a guilty blame itself (`Queue::settle_blamed`); Neo's compute
+    /// queues settle through the firmware's compute-fault event.
     fn settle_blamed_compute(&mut self, error: Error, deferred: &mut DeferredBatch) -> Result {
-        self.settle_blamed(error, deferred)
+        if self.is_m5() {
+            return self.settle_blamed(error, deferred);
+        }
+        Ok(())
     }
     fn owns(&self, qid: u8) -> bool { self.qid() == qid }
     fn oldest_spared(&self) -> Option<bool> { self.oldest_spared() }

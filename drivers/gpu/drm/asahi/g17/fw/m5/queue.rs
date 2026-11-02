@@ -166,12 +166,35 @@ pub(crate) struct Notification {
 static_assert!(size_of::<Notification>() == 0x18);
 
 impl Notification {
-    /// Names `current`, the kick of queue `qid` being published.
-    pub(crate) fn new(qid: u8, current: KickTimestamp) -> Result<Self> {
-        Ok(Self {
-            record: KickPredecessor::new(qid, current)?,
-            reserved: [0; 6],
-        })
+    /// Names `current`, the kick of queue `qid` being published, with the gate that kick may
+    /// carry: only a written notification can open it ([`EntryGate`]).
+    pub(crate) fn new(qid: u8, current: KickTimestamp) -> Result<(Self, EntryGate)> {
+        Ok((
+            Self {
+                record: KickPredecessor::new(qid, current)?,
+                reserved: [0; 6],
+            },
+            EntryGate(()),
+        ))
+    }
+}
+
+/// The entry-signal gate of a kick that has a current-kick notification: event 254, which the
+/// firmware clears in the kick the notification names once it has handled the record. A kick
+/// carrying it is not eligible before then. Only [`Notification::new`] makes one, so a kick
+/// cannot wait on a gate that no notification opens.
+#[derive(Clone, Copy)]
+pub(crate) struct EntryGate(());
+
+impl EntryGate {
+    /// The gate's event: bit 62 of the event mask's fourth word.
+    const EVENT: u32 = 254;
+
+    /// The event mask with only the gate set.
+    pub(crate) const fn events(self) -> [u64; 4] {
+        let mut mask = [0; 4];
+        mask[(Self::EVENT / 64) as usize] = 1 << (Self::EVENT % 64);
+        mask
     }
 }
 

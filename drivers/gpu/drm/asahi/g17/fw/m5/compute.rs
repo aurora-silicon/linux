@@ -35,8 +35,26 @@ const NO_SCRATCH_WINDOW: u64 = 0xff_0000;
 pub(crate) const KICK_QOS_CLASS: u8 = 8;
 /// Completion class of a kick's implicit parent dependency. J714 value.
 pub(crate) const PARENT_DEPENDENCY: u8 = 2;
-/// Compute kick event mask. J714 value.
-pub(crate) const KICK_EVENT_MASK: [u64; 4] = [0, 0, 8, 0];
+/// Contexts per engine in the event space: a pool's event is 64 x its engine + its context.
+const POOL_EVENT_CONTEXTS: u32 = 64;
+/// The engine of a compute pool in the event space: the firmware's record of each compute pool
+/// names engine 2 beside the pool's context.
+const POOL_EVENT_ENGINE: u32 = 2;
+
+/// The event mask of a compute kick of context `context_id`, whose notification opened `gate`.
+/// The kick waits on its own context's pool event (64 x 2 + the context), which the firmware
+/// holds while it processes that pool's dependencies, and on its entry-signal gate, which the
+/// firmware clears once it has handled the kick's notification. One mask per kick, for the
+/// qualification and every DRM kick alike.
+pub(crate) fn kick_event_mask(context_id: u32, gate: super::queue::EntryGate) -> Result<[u64; 4]> {
+    if context_id >= POOL_EVENT_CONTEXTS {
+        return Err(EINVAL);
+    }
+    let event = POOL_EVENT_ENGINE * POOL_EVENT_CONTEXTS + context_id;
+    let mut mask = gate.events();
+    mask[(event / 64) as usize] |= 1 << (event % 64);
+    Ok(mask)
+}
 /// Predecessor and current object identifiers of every kick. J714 value.
 pub(crate) const OBJECT_IDS: u64 = 0x0000_0001_0000_0001;
 /// Descriptor completion identity. J714 value.
@@ -44,7 +62,8 @@ pub(crate) const COMPLETION_IDENTITY: u64 = 1;
 
 /// The descriptor parameters that follow the GPU rather than the command: one definition per
 /// board ([`super::initdata::M5Board::compute`]), which the arithmetic qualification and DRM
-/// submission both encode through [`crate::g17::queue::m5::Channel`].
+/// submission both encode through the lane's publication transaction
+/// ([`crate::g17::queue::compute::Queue::transact`]).
 ///
 /// The operand layout and the dispatch control's cluster bits follow the GPU's topology
 /// ([`OperandLayout::of`], [`dispatch_control`]); the rest is the J714

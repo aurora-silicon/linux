@@ -10,9 +10,11 @@
 //! policy. Work wakes the cores itself ([`super::port::Port::publish_m5_compute`]); no
 //! idle-policy control is sent.
 //!
-//! It is not DRM submission, but it runs on the channel DRM compute submission uses
-//! ([`super::queue::m5::Channel`]): the same construction, installation, publication and
-//! retirement predicate, with the descriptor profile of [`super::Config::m5`]. The fixture
+//! It is not DRM submission, but it runs on the lane DRM compute submission uses (Neo's compute
+//! queue with its `m5` arms, [`super::queue::m5`]): the same construction, installation,
+//! publication transaction and retirement predicate, with the descriptor profile of
+//! [`super::Config::m5`]. It keeps its one kick in flight itself, as it has no DRM command for the
+//! queue to hold. The fixture
 //! supplies the user pages (shader, pipeline, CDM stream, argument page and buffers) a client
 //! binds. The firmware session retains the whole graph once [`Compute::run`] started publishing.
 
@@ -24,7 +26,8 @@ use super::{
     m5_test_program as program, m5_vm,
     object::{Allocator, CpuMap, KernelObject, Placement},
     queue::compute::retirement::Batch,
-    queue::m5::{Channel, Dispatch, Host, Published},
+    queue::compute::Queue,
+    queue::m5::{Dispatch, Host, Kick},
     Firmware, Role, Shared,
 };
 use crate::{driver::AsahiDrmDevice, mmu};
@@ -90,7 +93,7 @@ const STREAM_BYTES: u64 = 48;
 /// channel's VM.
 pub(super) struct Compute {
     current_work: Option<Arc<WorkStateLease>>,
-    channel: KBox<Channel>,
+    channel: KBox<Queue>,
     objects: KVec<KernelObject>,
     buffers: usize,
     /// Added to every input of the buffers page now mapped: `7 * i + bias`.
@@ -201,14 +204,14 @@ impl Compute {
             .qids
             .reserve(owner, DataMaster::Compute, Some(QID))?;
         let channel =
-            match Channel::new(&alloc, context, id, owner, gpu, &firmware.variant.pointers) {
+            match Queue::new_m5(&alloc, context, id, owner, gpu, &firmware.variant.pointers) {
                 Ok(channel) => channel,
                 Err(error) => {
                     firmware.queues.qids.cancel_unpublished(id)?;
                     return Err(error);
                 }
             };
-        let vm = channel.context().vm();
+        let vm = channel.context().ok_or(EINVAL)?.vm();
         let cpu = CpuMap::WriteCombined;
         let mut objects = KVec::new();
         let mut buffers = None;
@@ -234,7 +237,7 @@ impl Compute {
         dev_info!(
             dev.as_ref(),
             "M5 compute graph: context {}, queue {}\n",
-            channel.context().id(),
+            channel.context().map_or(0, |context| context.id()),
             channel.qid()
         );
         Ok(KBox::new(
@@ -330,7 +333,7 @@ impl Compute {
     fn resources(&self) -> Result<compute::Resources> {
         let resources = self
             .channel
-            .gpu()
+            .gpu()?
             .plan(compute::Declared::threads(program::WORKGROUP_THREADS)?)?;
         if (resources.control, resources.policy) != (0x54b, 0xf5_0040_0020) {
             pr_err!(
@@ -521,7 +524,7 @@ impl Compute {
     ) -> Result<Outputs> {
         let stamp_target = generation.checked_mul(0x100).ok_or(EOVERFLOW)?;
         let cursors = self.channel.cursors()?;
-        if cursors.consumer != cursors.producer || self.channel.in_flight() {
+        if cursors.consumer != cursors.producer {
             return Err(EBUSY);
         }
         let buffers = &self.objects[self.buffers];
@@ -534,7 +537,7 @@ impl Compute {
             return Err(EBUSY);
         }
         let work = Arc::new(
-            WorkStateLease::deferred(self.channel.context().clone()),
+            WorkStateLease::deferred(self.channel.context().ok_or(EINVAL)?.clone()),
             GFP_KERNEL,
         )?;
         work.acquire(Engine::Compute)?;
@@ -545,7 +548,7 @@ impl Compute {
             resources: self.resources()?,
         };
         let published_power = Self::power_words(firmware)?;
-        let published = self.channel.publish(
+        let published = self.channel.transact(
             &mut Self::host(firmware),
             &dispatch,
             &work,
@@ -553,10 +556,11 @@ impl Compute {
             0,
             None,
         )?;
+        let outer = published.outer?;
         if published.pool_target != u64::from(generation) {
             return Err(EIO);
         }
-        self.laps.advance(Laps::OUTER, published.outer);
+        self.laps.advance(Laps::OUTER, outer);
         self.laps
             .advance(Laps::ITEMS, published.ticket.item_producer);
         firmware.note_submission()?;
@@ -615,7 +619,12 @@ impl Compute {
         // Qualify the completion decoder and the channel's retirement predicate with the same
         // publication, before reusing any descriptor.
         self.observations.clear();
-        if !self.channel.request(&mut self.observations)? || !self.observations.covered_pending() {
+        let ticket = published.ticket;
+        if !self
+            .channel
+            .stage(&mut self.observations, core::iter::once(&ticket))?
+            || !self.observations.covered_pending()
+        {
             return Err(EIO);
         }
         let observations = &mut self.observations;
@@ -626,24 +635,13 @@ impl Compute {
                 observations.fold_any(record)
             })?;
         self.laps.advance(Laps::COMPLETIONS, next.try_into()?);
-        let mut retired = None;
-        let port = &firmware.port;
-        self.channel.retire(
-            &mut self.observations,
-            0,
-            &mut |owner| port.qos_complete(&[owner]),
-            &mut |kick| {
-                retired = Some((kick.ticket, kick.result));
-                Ok(())
-            },
-        )?;
-        let Some((ticket, timestamps)) = retired else {
-            return Err(EIO);
-        };
-        if ticket != published.ticket || self.channel.in_flight() {
-            return Err(EIO);
-        }
-        let timestamps = timestamps?;
+        let observed = self.observations.take(&ticket)?;
+        let timestamps = self
+            .channel
+            .check(&ticket, observed, &work, 0)?
+            .ok_or(EIO)?;
+        firmware.port.qos_complete(&[self.channel.qos_owner()])?;
+        super::recovery::note_retired();
         if generation == 1 {
             dev_info!(
                 dev.as_ref(),
@@ -673,7 +671,7 @@ impl Compute {
         drop(current.take_mapping()?);
         let mut fresh = KernelObject::new(
             dev,
-            self.channel.context().vm(),
+            self.channel.context().ok_or(EINVAL)?.vm(),
             Placement::At(program::BUFFER_PAGE),
             PAGE,
             mmu::PROT_GPU_SHARED_RW,
@@ -742,7 +740,7 @@ impl Compute {
         dev: &AsahiDrmDevice,
         firmware: &mut Firmware,
         work: &WorkStateLease,
-        published: &Published,
+        published: &Kick,
     ) -> Result {
         let qid = self.channel.qid();
         dev_info!(

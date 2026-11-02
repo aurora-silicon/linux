@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! DRM compute on the M5 profile: each logical queue owns one M5 channel
-//! ([`crate::g17::queue::m5::Channel`]) from QUEUE_CREATE on, installed before the queue exists.
-//! A bound channel lives in a compute entry of the registry ([`ComputeEntry::m5`]), the table
-//! Neo's compute queues live in, on the QID it reserved.
+//! DRM compute on the M5 profile: each logical queue owns one M5 channel, a lane that is Neo's
+//! compute queue with its `m5` arms ([`crate::g17::queue::m5`]), from QUEUE_CREATE on, installed
+//! before the queue exists. A bound channel lives in a compute entry of the registry
+//! ([`ComputeEntry::m5`]), the table Neo's compute queues live in, on the QID it reserved.
 //! An installed lane (QID, kick ring, graph, support page and pool) stays with the firmware
 //! session; logical queues lease it: the 26A428 firmware has no queue uninstall.
 //! A closed queue's lane parks once its context's scheduler release (0x13) is consumed
 //! (`runtime::teardown`, [`Lanes`]), and the next QUEUE_CREATE adopts it. A quarantined lane is
 //! not reused until a witness ends its quarantine (a settled failure's drain, or a killed
-//! context's drain, which recycles it: `Channel::recycle_killed`); past [`LEAKED_LANES`] of them
-//! creation fails with ENOSPC. Every compute command,
-//! from the scheduler or published early from its ioctl, goes through [`Backend::m5_packet`] and
+//! context's drain, which recycles it: `Queue::settle_exit`, `Queue::recycle_killed`); past
+//! [`LEAKED_LANES`] of them creation fails with ENOSPC. Every compute command, from the scheduler
+//! or published early from its ioctl, goes through [`Backend::m5_packet`] and
 //! the channel's one publication transaction; the shared completion scan
 //! (`Firmware::scan_compute`) retires it with the channel's strict predicate.
 
@@ -27,8 +27,8 @@ use crate::g17::{
     object::Allocator,
     preparation::Admission,
     queue::{
-        compute::{retirement::Batch, Failure},
-        m5::{Channel, Dispatch, Host, Retired},
+        compute::{retirement::Batch, Failure, Queue},
+        m5::{Dispatch, Host},
         m5_render::{BindingArgs, Draw, Pair, PairArgs, PairGrowth, ParkedPair},
     },
     status::VmStatus,
@@ -40,12 +40,12 @@ use kernel::{prelude::*, sync::Arc};
 /// owner's execution context, so past this many a new logical queue is refused (ENOSPC) rather
 /// than losing its device at the first submission. A timed-out lane whose
 /// context was killed is recycled and does not count; what stays is a quarantine no witness
-/// ends (the release consumed before the drain, a refused kill, a timed-out render pass).
+/// ends (the release consumed before the drain, a timed-out render pass).
 pub(super) const LEAKED_LANES: usize = 8;
 
 /// The M5 compute channels of the compute entries `compute` ([`ComputeEntry::m5`]); none off
 /// the M5 Ultra.
-pub(super) fn channels(compute: &[Option<ComputeEntry>]) -> impl Iterator<Item = &Channel> {
+pub(super) fn channels(compute: &[Option<ComputeEntry>]) -> impl Iterator<Item = &Queue> {
     compute
         .iter()
         .flatten()
@@ -55,7 +55,7 @@ pub(super) fn channels(compute: &[Option<ComputeEntry>]) -> impl Iterator<Item =
 /// [`channels`], mutable.
 pub(super) fn channels_mut(
     compute: &mut [Option<ComputeEntry>],
-) -> impl Iterator<Item = &mut Channel> {
+) -> impl Iterator<Item = &mut Queue> {
     compute
         .iter_mut()
         .flatten()
@@ -63,10 +63,10 @@ pub(super) fn channels_mut(
 }
 
 /// Every compute channel of `context` among the compute entries is settled: closed and idle, or
-/// quarantined with the firmware idle on it (`Channel::settled`).
+/// quarantined with the firmware idle on it (`Queue::settled`).
 pub(super) fn compute_idle(compute: &[Option<ComputeEntry>], context: &Arc<Context>) -> bool {
     channels(compute)
-        .filter(|channel| Arc::ptr_eq(channel.context(), context))
+        .filter(|channel| channel.binds(context))
         .all(|channel| channel.settled().unwrap_or(false))
 }
 
@@ -114,7 +114,7 @@ impl Lanes<'_> {
         context: &Arc<Context>,
     ) -> Result<usize> {
         let mut count = 0;
-        for channel in channels(compute).filter(|channel| Arc::ptr_eq(channel.context(), context)) {
+        for channel in channels(compute).filter(|channel| channel.binds(context)) {
             match channel.quarantined() {
                 Some(_) if channel.settled()? => continue,
                 None if channel.parkable()? => count += 1,
@@ -137,7 +137,7 @@ impl Lanes<'_> {
 
     /// Logs each of `context`'s lanes' park witnesses (a stalled release's diagnostic).
     pub(super) fn report(&self, compute: &[Option<ComputeEntry>], context: &Arc<Context>) {
-        for channel in channels(compute).filter(|channel| Arc::ptr_eq(channel.context(), context)) {
+        for channel in channels(compute).filter(|channel| channel.binds(context)) {
             channel.report_park();
         }
         for pair in self
@@ -153,12 +153,11 @@ impl Lanes<'_> {
     /// execution context the firmware may still name, for the session (bounded by
     /// [`LEAKED_LANES`]).
     pub(super) fn retains(&self, compute: &[Option<ComputeEntry>], context: &Arc<Context>) -> bool {
-        channels(compute).any(|channel| {
-            Arc::ptr_eq(channel.context(), context) && channel.quarantined().is_some()
-        }) || self
-            .pairs
-            .iter()
-            .any(|pair| Arc::ptr_eq(pair.context(), context) && pair.quarantined().is_some())
+        channels(compute).any(|channel| channel.binds(context) && channel.quarantined().is_some())
+            || self
+                .pairs
+                .iter()
+                .any(|pair| Arc::ptr_eq(pair.context(), context) && pair.quarantined().is_some())
     }
 
     /// Parks every channel of `context`: its lane joins the parked lanes and leaves its compute
@@ -176,15 +175,13 @@ impl Lanes<'_> {
             let parks = slot
                 .as_ref()
                 .and_then(|entry| entry.m5.as_deref())
-                .is_some_and(|channel| {
-                    Arc::ptr_eq(channel.context(), context) && channel.quarantined().is_none()
-                });
+                .is_some_and(|channel| channel.binds(context) && channel.quarantined().is_none());
             if !parks {
                 continue;
             }
             self.parked.reserve(1, GFP_KERNEL)?;
             let channel = slot.take().and_then(|entry| entry.m5).ok_or(EIO)?;
-            let (lane, owner) = channel.park();
+            let (lane, owner) = channel.park_m5()?;
             if crate::module_parameters::m5_lane_trace.value() != 0 {
                 pr_info!(
                     "M5 lane {}: parked (owner {} closed, {} parked)\n",
@@ -223,9 +220,7 @@ impl Lanes<'_> {
         // What stays is quarantined. A drain it still awaited can no longer be witnessed: the
         // firmware, idle on its rings (`settled`), consumed the context's release. It stays
         // quarantined for good, counted toward the cap, as the old rule had it.
-        for channel in
-            channels_mut(compute).filter(|channel| Arc::ptr_eq(channel.context(), context))
-        {
+        for channel in channels_mut(compute).filter(|channel| channel.binds(context)) {
             channel.end_witness_wait();
         }
         for pair in self
@@ -287,7 +282,7 @@ impl Pair {
     }
 }
 
-impl Channel {
+impl Queue {
     /// The firmware's blame of this lane's QID was found guilty: its kicks fail with `error`, the
     /// oldest guilty unless an earlier recovery spared it, as the render twin does
     /// ([`Pair::settle_blamed`]). Neo leaves a blamed compute queue to the firmware's
@@ -298,45 +293,24 @@ impl Channel {
             return Ok(());
         };
         packet.completion.settle_blamed();
-        self.fail(error, Failure::Settled, &mut |retired| {
-            defer(deferred, retired)
-        })
+        self.fail(error, Failure::Settled, &mut |event| deferred.push(event))
     }
-}
-
-fn defer(deferred: &mut DeferredBatch, retired: Retired) -> Result {
-    let Some(packet) = retired.packet else {
-        return Ok(());
-    };
-    deferred.push(match (retired.result, retired.drained) {
-        (Ok(times), _) => {
-            Deferred::Retired(packet.completion.clone(), Ok([times[0], times[1], 0, 0]))
-        }
-        // A failed kick that drained: released as a quarantined Neo command is at its drain
-        // (`Deferred::Drained`), its fence failed if its failure never reached it.
-        (Err(error), true) => Deferred::Drained(packet.completion.clone(), Err(error)),
-        (Err(error), false) => Deferred::FailedOwned(packet.completion.clone(), error),
-    })
 }
 
 impl Registry {
     /// The M5 compute channels, each in its compute entry ([`channels`]).
-    pub(super) fn m5_channels(&self) -> impl Iterator<Item = &Channel> {
+    pub(super) fn m5_channels(&self) -> impl Iterator<Item = &Queue> {
         channels(&self.compute)
     }
 
     /// `owner`'s M5 compute channel.
-    pub(super) fn m5_channel(&self, owner: u64) -> Option<&Channel> {
-        self.m5_channels().find(|channel| channel.owner() == owner)
+    pub(super) fn m5_channel(&self, owner: u64) -> Option<&Queue> {
+        self.m5_channels()
+            .find(|channel| channel.owner() == Some(owner))
     }
 
-    /// The M5 compute channel on QID `qid`.
-    pub(super) fn m5_lane_mut(&mut self, qid: u8) -> Option<&mut Channel> {
-        channels_mut(&mut self.compute).find(|channel| channel.qid() == qid)
-    }
-
-    fn m5_channel_mut(&mut self, owner: u64) -> Option<&mut Channel> {
-        channels_mut(&mut self.compute).find(|channel| channel.owner() == owner)
+    fn m5_channel_mut(&mut self, owner: u64) -> Option<&mut Queue> {
+        channels_mut(&mut self.compute).find(|channel| channel.owner() == Some(owner))
     }
 
     /// Every M5 render pair of `context` is settled (`Pair::settled`): its kill waits for them,
@@ -357,7 +331,9 @@ impl Registry {
             false => foreign |= bits,
         };
         for channel in self.m5_channels() {
-            note(channel.context(), 1u128 << channel.qid());
+            if let Some(bound) = channel.context() {
+                note(bound, 1u128 << channel.qid());
+            }
         }
         for pair in self.m5_render.iter() {
             let [tiling, fragment] = pair.qids();
@@ -370,27 +346,24 @@ impl Registry {
     /// for a moment without it, as for Neo's queues (`Firmware::kill_unsafe`). None off the M5
     /// Ultra.
     pub(super) fn m5_foreign_in_flight(&self, context: &Arc<Context>) -> bool {
-        self.m5_channels().any(|channel| {
-            channel.in_flight()
-                && channel.quarantined().is_none()
-                && !Arc::ptr_eq(channel.context(), context)
-        }) || self
-            .m5_render
-            .iter()
-            .any(|pair| pair.polls() && !Arc::ptr_eq(pair.context(), context))
+        self.m5_channels()
+            .any(|channel| channel.in_flight() && !channel.binds(context))
+            || self
+                .m5_render
+                .iter()
+                .any(|pair| pair.polls() && !Arc::ptr_eq(pair.context(), context))
     }
 
     /// Whether any M5 kick or render pass is in flight: the event worker polls their retirement.
     /// Quarantined lanes and pairs are not in flight, as quarantined Neo queues are not
     /// (`queue::compute::Queue::in_flight`).
     pub(super) fn m5_in_flight(&self) -> bool {
-        self.m5_channels()
-            .any(|channel| channel.in_flight() && channel.quarantined().is_none())
+        self.m5_channels().any(|channel| channel.in_flight())
             || self.m5_render.iter().any(|pair| pair.polls())
     }
 
     /// Whether the event worker polls M5 retirement: a compute channel's finished kick ahead of
-    /// its witnesses (completion events cover the rest, `Channel::retirement_polling`), or a
+    /// its witnesses (completion events cover the rest, `Queue::retirement_polling`), or a
     /// render pass in flight on a healthy pair. A quarantined lane or pair awaiting its drain is
     /// not polled, as [`Self::m5_in_flight`] leaves it out; each event pass still checks it.
     pub(super) fn m5_polling(&self) -> bool {
@@ -488,7 +461,7 @@ impl Registry {
 
     /// Places a bound channel in the entry [`Self::m5_entry`] took, under the channel's QID and
     /// owner. The device mutex is held from that call on, so the entry is still free.
-    fn place_m5(&mut self, (slot, queue): (usize, ComputeSlot), channel: KBox<Channel>) -> Result {
+    fn place_m5(&mut self, (slot, queue): (usize, ComputeSlot), channel: KBox<Queue>) -> Result {
         let entry = self.compute.get_mut(slot).ok_or(EIO)?;
         if entry.is_some() {
             return Err(EIO);
@@ -496,7 +469,7 @@ impl Registry {
         let reservation = ComputeReservation {
             slot,
             id: channel.id(),
-            owner: channel.owner(),
+            owner: channel.owner().ok_or(EIO)?,
         };
         *entry = Some(ComputeEntry {
             reservation,
@@ -506,19 +479,25 @@ impl Registry {
         Ok(())
     }
 
-    /// Stages every M5 kick not yet observed into the shared completion scan.
+    /// Stages every M5 kick not yet observed into the shared completion scan, through Neo's
+    /// `Queue::request_observations` as `Firmware::scan_compute` stages a Neo queue's.
     pub(super) fn request_m5(&mut self) -> Result<bool> {
         let mut requested = false;
         for channel in channels(&self.compute) {
-            requested |= channel.request(&mut self.observations)?;
+            requested |= channel.request_observations(&mut self.observations)?;
         }
         Ok(requested)
     }
 
-    /// Retires the M5 kicks the shared scan completed.
+    /// Retires the M5 kicks the shared scan completed: each lane in `Firmware::scan_compute`'s
+    /// order for a Neo queue (its records latched, its retirement, then its quarantine's release
+    /// on the witness), through Neo's methods and their `m5` arms, with the scan's `masks` and
+    /// recovery generation `epoch`.
     pub(super) fn retire_m5(
         &mut self,
         port: &crate::g17::port::Port,
+        masks: Option<[u64; 2]>,
+        epoch: u64,
         state: u32,
         deferred: &mut DeferredBatch,
     ) -> Result {
@@ -528,12 +507,24 @@ impl Registry {
         let mut failure = None;
         let observations: &mut Batch = &mut self.observations;
         for channel in channels_mut(&mut self.compute) {
-            let result = channel.retire(
-                observations,
-                state,
-                &mut |owner| port.qos_complete(&[owner]),
-                &mut |retired| defer(deferred, retired),
-            );
+            let result = channel
+                .latch_observations(observations)
+                .and_then(|()| {
+                    channel.retire(
+                        masks,
+                        epoch,
+                        state,
+                        |owner| port.qos_complete(&[owner]),
+                        &mut |event| deferred.push(event),
+                    )
+                })
+                .and_then(|()| {
+                    channel.release_witnessed(
+                        state,
+                        |owner| port.qos_complete(&[owner]),
+                        &mut |event| deferred.push(event),
+                    )
+                });
             if let Err(error) = result {
                 // A channel already past its failure (Final or Ambiguous) is only reported once.
                 if channel.quarantined().is_none() || channel.awaiting_witness() {
@@ -542,9 +533,8 @@ impl Registry {
                         channel.qid(),
                         error
                     );
-                    let result = channel.fail(error, Failure::Ambiguous, &mut |retired| {
-                        defer(deferred, retired)
-                    });
+                    let result =
+                        channel.fail(error, Failure::Ambiguous, &mut |event| deferred.push(event));
                     failure = failure.or(result.err());
                 }
             }
@@ -622,10 +612,12 @@ impl Registry {
         deferred: &mut DeferredBatch,
     ) -> Result {
         for channel in channels_mut(&mut self.compute) {
-            if channel.in_flight() && Arc::ptr_eq(channel.context().status(), status) {
-                channel.fail(error, Failure::Final, &mut |retired| {
-                    defer(deferred, retired)
-                })?;
+            if channel.unfailed_kicks()
+                && channel
+                    .context()
+                    .is_some_and(|bound| Arc::ptr_eq(bound.status(), status))
+            {
+                channel.quarantine(error, &mut |event| deferred.push(event))?;
             }
         }
         for pair in &mut self.m5_render {
@@ -649,7 +641,7 @@ impl Registry {
                 channel.kicks(),
                 window
             );
-            channel.note_fault();
+            channel.note_fault(stamp);
         }
     }
 
@@ -702,9 +694,7 @@ impl Registry {
             channel.cursors(),
             channel.front_witnesses()
         );
-        channel.fail(ETIMEDOUT, Failure::Final, &mut |retired| {
-            defer(deferred, retired)
-        })?;
+        channel.quarantine(ETIMEDOUT, &mut |event| deferred.push(event))?;
         if let Some(pair) = self.m5_pair(owner) {
             pr_warn!(
                 "G17 M5: render pass of queue {} at that timeout: {:x?}\n",
@@ -813,7 +803,7 @@ impl crate::g17::Firmware {
                         .queues
                         .m5_render
                         .iter()
-                        .any(|pair| pair.owner() == channel.owner())
+                        .any(|pair| Some(pair.owner()) == channel.owner())
                 })
                 .count();
         if reach < waiting {
@@ -830,7 +820,7 @@ impl crate::g17::Firmware {
         };
         // The channel's compute entry first: once bound it must have a place.
         let entry = self.queues.m5_entry()?;
-        let channel = Channel::adopt(&mut self.queues.m5_parked, index, context, owner)
+        let channel = Queue::adopt_m5(&mut self.queues.m5_parked, index, context, owner)
             .map_err(|error| refused("adoption", error))?;
         if crate::module_parameters::m5_lane_trace.value() != 0 {
             pr_info!(
@@ -859,11 +849,11 @@ impl crate::g17::Firmware {
         &mut self,
         dev: &crate::driver::AsahiDrmDevice,
         reservation: ComputeReservation,
-        built: &mut Option<KBox<Channel>>,
+        built: &mut Option<KBox<Queue>>,
     ) -> Result {
         self.queues.reserved(reservation)?;
         let channel = built.as_mut().ok_or(EINVAL)?;
-        if channel.id() != reservation.id || channel.owner() != reservation.owner {
+        if channel.id() != reservation.id || channel.owner() != Some(reservation.owner) {
             return Err(EIO);
         }
         let result = channel.install(&mut Host {
@@ -894,11 +884,11 @@ impl crate::g17::Firmware {
     }
 
     /// Reinstalls `owner`'s adopted channel when its lane was recycled after a kill
-    /// ([`Channel::reinstall`]); nothing for any other channel. EAGAIN: no outer slot yet.
+    /// ([`Queue::reinstall`]); nothing for any other channel. EAGAIN: no outer slot yet.
     pub(super) fn m5_reinstall(&mut self, owner: u64) -> Result {
         let queues = &mut self.queues;
         let channel = channels_mut(&mut queues.compute)
-            .find(|channel| channel.owner() == owner)
+            .find(|channel| channel.owner() == Some(owner))
             .ok_or(EIO)?;
         channel.reinstall(&mut Host {
             init: &self.init,
@@ -909,7 +899,7 @@ impl crate::g17::Firmware {
     }
 
     /// Whether the firmware consumed the installation of `owner`'s channel
-    /// ([`Channel::install_consumed`]). EIO: the channel is gone (a recovery closed it).
+    /// ([`Queue::install_consumed`]). EIO: the channel is gone (a recovery closed it).
     pub(super) fn m5_install_consumed(&mut self, owner: u64, expired: bool) -> Result<bool> {
         let crashed = &self.primary.state.shared.crashed;
         let channel = self.queues.m5_channel_mut(owner).ok_or(EIO)?;
@@ -917,7 +907,7 @@ impl crate::g17::Firmware {
     }
 
     /// Publishes `packet` on `owner`'s channel, its pool grown first when the command's plan
-    /// needs more ([`Channel::grow`]; the old backing lands in `grown`, for the caller to drop
+    /// needs more ([`Queue::grow`]; the old backing lands in `grown`, for the caller to drop
     /// off the device mutex). EAGAIN: the channel has no room yet, or is not idle for a growth.
     fn publish_m5(
         &mut self,
@@ -930,7 +920,7 @@ impl crate::g17::Firmware {
         let work = packet.completion.work_state()?;
         let epoch = self.recovery.generation();
         let channel = channels_mut(&mut self.queues.compute)
-            .find(|channel| channel.owner() == owner)
+            .find(|channel| channel.owner() == Some(owner))
             .ok_or(EIO)?;
         if let Some(error) = channel.quarantined() {
             return Err(error);
@@ -953,18 +943,11 @@ impl crate::g17::Firmware {
                 dispatch.resources.pool_blocks,
             )?;
         }
-        let result = channel.publish(
-            &mut host,
-            dispatch,
-            &work,
-            packet.order.sequence,
-            epoch,
-            Some(packet.clone()),
-        );
+        let result = channel.publish_m5(&mut host, dispatch, &work, epoch, packet.clone());
         if packet.is_published() {
             self.note_submission()?;
         }
-        result.map(|_| ())
+        result
     }
 }
 

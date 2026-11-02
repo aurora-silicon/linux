@@ -11,6 +11,9 @@ pub(crate) const POLL_NS: u64 = 2_500_000_000;
 /// retirement goes first.
 pub(crate) const QUARANTINED_DELAY_NS: u64 = 250_000_000;
 const CANCELLED_DELAY_NS: u64 = 2_000_000_000;
+/// The M5 Ultra lane's kill settles only on its failed kicks' exact drain (`Queue::settle_exit_m5`
+/// in `queue::m5`): its acknowledgement's window, then the drain's, as long again.
+pub(crate) const M5_SETTLE_NS: u64 = 2 * POLL_NS;
 
 // Firmware-visible cookie namespace persists for the loaded module's lifetime.
 static NEXT_COOKIE: AtomicU32 = AtomicU32::new(1);
@@ -71,7 +74,7 @@ enum Phase {
 }
 
 /// One published kill of a closed context, from its publication to its settlement: Neo's compute
-/// queues and the M5 Ultra's compute lanes (`queue::m5::Channel`) each keep their own.
+/// queues and the M5 Ultra's compute lanes (`queue::m5`) each keep their own.
 pub(crate) struct Transaction {
     cookie: u64,
     published: u64,
@@ -118,6 +121,10 @@ impl Transaction {
         self.phase == Phase::Published
             && now.saturating_sub(self.announced.unwrap_or(self.published)) < POLL_NS
     }
+    /// Not yet settled, and published less than `window` ago.
+    pub(crate) fn open_within(&self, now: u64, window: u64) -> bool {
+        self.phase != Phase::Released && now.saturating_sub(self.published) < window
+    }
     /// Only this kill's exact nonzero cookie acknowledges it, once; `qid` is traced.
     pub(crate) fn acknowledge(&mut self, cookie: u64, qid: u8) -> bool {
         if cookie == 0 || self.cookie != cookie || self.phase != Phase::Published {
@@ -145,6 +152,9 @@ impl Queue {
         })
     }
     pub(crate) fn exit_candidate(&self, context: &Arc<Context>, age: u64) -> bool {
+        if self.graph.m5 {
+            return self.exit_candidate_m5(context, age);
+        }
         self.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
             && self.released
             && self.active.len != 0
@@ -205,7 +215,12 @@ impl Queue {
         }
     }
     pub(crate) fn exit_polling(&self, now: u64) -> bool {
-        self.exit.as_ref().is_some_and(|exit| exit.polling(now))
+        self.exit.as_ref().is_some_and(|exit| {
+            exit.polling(now)
+                // The M5 Ultra lane's kill settles on its failed kicks' exact drain, which the
+                // event worker polls for within the kill's window.
+                || (self.graph.m5 && exit.settling() && exit.open_within(now, M5_SETTLE_NS))
+        })
     }
     /// Event consumption and record_exit are serialized by the device mutex.
     /// A kill pins this exact queue transaction through its final witness;
@@ -220,6 +235,9 @@ impl Queue {
         complete_qos: &mut impl FnMut(crate::g17::qos::Owner) -> Result,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
+        if self.graph.m5 {
+            return self.settle_exit_m5(recovery_closed, complete_qos, defer);
+        }
         let Some(phase) = self.exit.as_ref().map(|exit| exit.phase) else {
             return Ok(());
         };
@@ -286,7 +304,7 @@ impl Queue {
 
 #[kernel::macros::kunit_tests(asahi_g17_exit_transaction)]
 mod transaction_tests {
-    use super::{Transaction, POLL_NS};
+    use super::{Transaction, M5_SETTLE_NS, POLL_NS};
 
     #[test]
     fn only_the_exact_cookie_acknowledges_a_kill_once() {
@@ -297,10 +315,12 @@ mod transaction_tests {
         assert!(kill.acknowledge(7, 9));
         assert!(!kill.acknowledge(7, 9));
         assert!(kill.settling() && !kill.polling(1_000));
+        assert!(kill.open_within(1_000 + M5_SETTLE_NS - 1, M5_SETTLE_NS));
+        assert!(!kill.open_within(1_000 + M5_SETTLE_NS, M5_SETTLE_NS));
         kill.mark_unproven();
         assert!(kill.settling() && !kill.released());
         kill.mark_released();
-        assert!(kill.released() && !kill.settling());
+        assert!(kill.released() && !kill.settling() && !kill.open_within(1_000, M5_SETTLE_NS));
     }
 
     #[test]

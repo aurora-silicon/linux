@@ -644,7 +644,7 @@ impl Payload {
 /// stay user programs: only the first span is known mapped. Start and end timestamps are
 /// accepted: every M5 kick retires with its completion record's firmware start and end, a
 /// stream without a dispatch included, and those are what the command's destinations receive
-/// (`Channel::check`, `Destination::write`).
+/// (`compute::Queue::check`, `Destination::write`).
 fn m5_compute(
     cmd: &uapi::drm_asahi_cmd_compute,
     attachments: &Attachments,

@@ -507,17 +507,145 @@ impl Submitted<'_> {
     }
 }
 
-/// A pool owned by one physical compute queue, with fixed QID-derived slot.
+/// Counts one more submission in a pool's host-submitted counter (`state`) before its
+/// publication; returns the new count. Neo's and the M5 Ultra's pools count alike.
+fn reserve_submission(state: &KernelObject) -> Result<u64> {
+    let counter = state.dword(0)?;
+    let next = counter
+        .load(Ordering::Relaxed)
+        .checked_add(1)
+        .ok_or(EOVERFLOW)?;
+    counter.store(next, Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    Ok(next)
+}
+
+/// The private pool of one physical compute queue, in the page-pool slot of its QID: Neo's
+/// ([`NeoPool`]), or the M5 Ultra's ([`M5Pool`], S's `ComputePool::m5`), which an M5 compute
+/// lane holds. Neo's arm runs [`NeoPool`]'s bodies. The M5 arm answers the methods whose meaning
+/// the two pools share (identity, control address, release record, backing, client view and
+/// submission count) from its [`M5Pool`]; Neo's free-list encodings (page list, page swap,
+/// cancellation) are refused there (EINVAL), and the M5 lane reaches the rest of its pool
+/// through [`Self::m5`].
+pub(crate) enum ComputePool {
+    Neo(NeoPool),
+    M5(M5Pool),
+}
+impl ComputePool {
+    pub(crate) fn new(alloc: &Allocator<'_>, qid: u8, blocks: usize) -> Result<Self> {
+        NeoPool::new(alloc, qid, blocks).map(Self::Neo)
+    }
+    /// The M5 Ultra compute lane's pool of `geometry` for queue `qid`, built without the device
+    /// mutex.
+    pub(crate) fn new_m5(
+        alloc: &Allocator<'_>,
+        qid: u8,
+        geometry: super::fw::m5::pool::PoolGeometry,
+    ) -> Result<Self> {
+        M5Pool::new(alloc, qid, geometry, super::fw::m5::pool::Engine::Compute).map(Self::M5)
+    }
+    /// The M5 arm's pool; EINVAL on Neo's.
+    pub(crate) fn m5(&self) -> Result<&M5Pool> {
+        match self {
+            Self::M5(pool) => Ok(pool),
+            Self::Neo(_) => Err(EINVAL),
+        }
+    }
+    pub(crate) fn m5_mut(&mut self) -> Result<&mut M5Pool> {
+        match self {
+            Self::M5(pool) => Ok(pool),
+            Self::Neo(_) => Err(EINVAL),
+        }
+    }
+    /// Backed with at least `blocks` blocks.
+    pub(crate) fn fits(&self, blocks: usize) -> bool {
+        match self {
+            Self::Neo(pool) => pool.fits(blocks),
+            Self::M5(pool) => !pool.vacant() && pool.blocks() >= blocks,
+        }
+    }
+    pub(crate) fn id(&self) -> u16 {
+        match self {
+            Self::Neo(pool) => pool.id(),
+            Self::M5(pool) => pool.id(),
+        }
+    }
+    pub(crate) fn page_list_va(&self) -> Result<u64> {
+        match self {
+            Self::Neo(pool) => pool.page_list_va(),
+            Self::M5(_) => Err(EINVAL),
+        }
+    }
+    pub(crate) fn control_va(&self) -> u64 {
+        match self {
+            Self::Neo(pool) => pool.control_va(),
+            Self::M5(pool) => pool.control_va(),
+        }
+    }
+    /// Backed: not vacant.
+    pub(crate) fn populated(&self) -> bool {
+        match self {
+            Self::Neo(pool) => pool.populated(),
+            Self::M5(pool) => !pool.vacant(),
+        }
+    }
+    pub(crate) fn release_record(&self, generation: u64) -> super::fw::channels::FreeListRelease {
+        match self {
+            Self::Neo(pool) => pool.release_record(generation),
+            Self::M5(pool) => pool.release_record(generation),
+        }
+    }
+    /// Neo's backing; the M5 arm's is taken through [`M5Pool::vacate`].
+    pub(crate) fn take_pages(&mut self) -> Option<Pages> {
+        match self {
+            Self::Neo(pool) => pool.take_pages(),
+            Self::M5(_) => None,
+        }
+    }
+    pub(crate) fn rearm(&mut self, pages: Pages) -> Result {
+        match self {
+            Self::Neo(pool) => pool.rearm(pages),
+            Self::M5(_) => Err(EINVAL),
+        }
+    }
+    pub(crate) fn replace_pages(&mut self, pages: &mut Option<Pages>) -> Result {
+        match self {
+            Self::Neo(pool) => pool.replace_pages(pages),
+            Self::M5(_) => Err(EINVAL),
+        }
+    }
+    pub(crate) fn map_client(&mut self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        match self {
+            Self::Neo(pool) => pool.map_client(vm),
+            Self::M5(pool) => pool.map_client(vm),
+        }
+    }
+    pub(crate) fn reserve_submission(&self) -> Result<u64> {
+        match self {
+            Self::Neo(pool) => pool.reserve_submission(),
+            Self::M5(pool) => pool.reserve_submission(),
+        }
+    }
+    pub(crate) fn cancel_unpublished(&self, target: u64) -> Result {
+        match self {
+            Self::Neo(pool) => pool.cancel_unpublished(target),
+            Self::M5(_) => Err(EINVAL),
+        }
+    }
+}
+
+/// Neo's compute pool ([`ComputePool::Neo`]), owned by one physical compute queue, with fixed
+/// QID-derived slot.
 /// Idle retained queues may give their USC backing back (`pages` is `None`)
 /// once the firmware consumed the pool's release; the control and state
 /// objects the queue record names stay until processor stop.
-pub(crate) struct ComputePool {
+pub(crate) struct NeoPool {
     pages: Option<Pages>,
     control: KernelObject,
     state: KernelObject,
     id: u16,
 }
-impl ComputePool {
+impl NeoPool {
     pub(crate) fn fits(&self, blocks: usize) -> bool {
         self.pages.as_ref().is_some_and(|pages| pages.blocks >= blocks)
     }
@@ -631,14 +759,7 @@ impl ComputePool {
             .map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)
     }
     pub(crate) fn reserve_submission(&self) -> Result<u64> {
-        let counter = self.state.dword(0)?;
-        let next = counter
-            .load(Ordering::Relaxed)
-            .checked_add(1)
-            .ok_or(EOVERFLOW)?;
-        counter.store(next, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        Ok(next)
+        reserve_submission(&self.state)
     }
     /// The caller has proved no pointer from this submission was published.
     pub(crate) fn cancel_unpublished(&self, target: u64) -> Result {
@@ -653,12 +774,13 @@ impl ComputePool {
 }
 
 /// The private-memory pool of an M5 compute queue or render pair, in the page-pool slot of its
-/// (tiling) QID, as for [`ComputePool`]. The M5 firmware's pool is a page directory over a fixed
-/// address inventory and a block free list ([`super::fw::m5::pool`]), followed in one canonical
-/// low allocation by its backed blocks, and a shared state the firmware completes into. A compute
-/// queue's pool grows, and a parked one is vacated: once the firmware released the pool's
-/// registration, fresh backing replaces the blocks ([`Self::rearm`]) or none does
-/// ([`Self::vacate`]); the shared state and the counters stay.
+/// (tiling) QID, as for Neo's [`NeoPool`]; a compute lane holds it as [`ComputePool::M5`]. The
+/// M5 firmware's pool is a page directory over a fixed address inventory and a block free list
+/// ([`super::fw::m5::pool`]), followed in one canonical low allocation by its backed blocks, and
+/// a shared state the firmware completes into. A compute queue's pool grows, and a parked one is
+/// vacated: once the firmware released the pool's registration, fresh backing replaces the
+/// blocks ([`Self::rearm`]) or none does ([`Self::vacate`]); the shared state and the counters
+/// stay.
 pub(crate) struct M5Pool {
     /// None while vacant.
     backing: Option<KernelObject>,
@@ -844,14 +966,7 @@ impl M5Pool {
     }
     /// Counts one more submission before its publication; returns the new count.
     pub(crate) fn reserve_submission(&self) -> Result<u64> {
-        let counter = self.state.dword(0)?;
-        let next = counter
-            .load(Ordering::Relaxed)
-            .checked_add(1)
-            .ok_or(EOVERFLOW)?;
-        counter.store(next, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        Ok(next)
+        reserve_submission(&self.state)
     }
     /// The host's submission count ([`Self::reserve_submission`]).
     pub(crate) fn submitted(&self) -> Result<u64> {

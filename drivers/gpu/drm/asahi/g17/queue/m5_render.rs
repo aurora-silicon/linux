@@ -68,8 +68,6 @@ const USAGE_BYTES: usize = 0x40;
 /// Each pass's four stage times (tiling start and end, fragment start and end).
 const TIMES: usize = 0x400;
 const _: () = assert!(USAGE + DEPTH * 2 * USAGE_BYTES <= TIMES && TIMES + DEPTH * 32 <= PAGE);
-/// The tiling kick's event mask (S's runtime).
-const TILING_EVENTS: [u64; 4] = [0, 0, 0, 1 << 62];
 /// Kick QoS classes and dependency types of the two stages (S `draw_one`).
 const QOS_CLASS: [u8; 2] = [12, 24];
 const STATE_AUXILIARY: usize = 0x8000;
@@ -148,7 +146,7 @@ pub(crate) struct Pair {
     support: KernelObject,
     pool: M5Pool,
     /// The pool as the firmware sees it, carried to the parked pair and the next binding, as a
-    /// compute lane's (`m5::Channel`).
+    /// compute lane's (`queue::m5`).
     pool_state: PoolState,
     /// The parameter buffer's ID and generation.
     pb: (u8, u64),
@@ -173,7 +171,7 @@ pub(crate) struct Pair {
     unmapped: super::m5::Unmapped,
     active: Option<Active>,
     /// Set once the pass failed or the pair's state became ambiguous. With `awaiting_witness`,
-    /// Neo's compute-queue quarantine fields under their names, as for a lane (`Channel`).
+    /// Neo's compute-queue quarantine fields under their names, as for a lane (`queue::m5`).
     quarantine_error: Option<Error>,
     /// The quarantine is a settled failure of the pass in flight (recovery blamed or cancelled
     /// it: the firmware restarted and resumed it): the pair's state is not in doubt, so the pass's
@@ -730,7 +728,7 @@ impl Pair {
 
     /// The pair needs nothing more before its context's release: parkable, or quarantined with
     /// the firmware idle on both rings. A drain still awaited does not hold the release back, as
-    /// for a compute lane (`Channel::settled`): the context's healthy lanes park, and this pair
+    /// for a compute lane (`Queue::settled`): the context's healthy lanes park, and this pair
     /// parks only if its pass drained before the release was consumed.
     pub(crate) fn settled(&self) -> Result<bool> {
         if self.growing {
@@ -1093,7 +1091,7 @@ impl Pair {
                 kick_ring_fw_va: lane.kick.firmware_va(),
                 qid: lane.qid(),
                 // An adopted pair whose class changed is reinstalled on its new class, as a
-                // compute lane is (`m5::Channel::config`).
+                // compute lane is (`Queue::config` in `queue::m5`).
                 install: self.rebound == Some(true),
                 completion_seed: Some(
                     lane.kick
@@ -1164,7 +1162,7 @@ impl Pair {
             pool: &mut self.pool,
             state: &mut self.pool_state,
             vm: self.context.vm(),
-            aliases: &mut self.aliases,
+            views: super::m5::PoolView::Aliases(&mut self.aliases),
             quarantine: &mut self.quarantine_error,
         };
         let grown = super::m5::grow_pool(
@@ -1408,7 +1406,7 @@ impl Pair {
         // pool and context.
         let first = self.unbound;
         // A later pass after a growth rebinds the grown pool with the same configurations, its
-        // completion value continuing, as a compute lane's next kick does (`m5::Channel::publish`).
+        // completion value continuing, as a compute lane's next kick does (`Queue::transact`).
         let bind = first || !self.pool_state.registered();
         for lane in &self.lanes {
             let cursors = lane.cursors()?;
@@ -1591,13 +1589,18 @@ impl Pair {
         let context = self.context.clone();
         let policy = context.policy();
         let mut targets = [0u32; 2];
+        let mut gates = [None; 2];
         for n in [TILING, FRAGMENT] {
             let lane = &mut self.lanes[n];
             let producer = lane.cursors()?.producer;
-            targets[n] = at!(
+            let (target, gate) = at!(
                 "stage",
                 lane.stage_kick(producer, configs[n], slot, timestamps[n])
             )?;
+            targets[n] = target;
+            // The tiling kick waits on its notification's gate (S's runtime); the fragment does
+            // not.
+            gates[n] = (n == TILING).then_some(gate);
         }
         let kick_args = |n: usize, lane: &Lane| KickArgs {
             qid: qids[n],
@@ -1618,7 +1621,7 @@ impl Pair {
                 class: QOS_CLASS[n],
             },
             mcache: None,
-            event_mask: if n == TILING { TILING_EVENTS } else { [0; 4] },
+            event_mask: gates[n].map_or([0; 4], m5queue::EntryGate::events),
             register_arrays: encoded.rce[n],
             scs_enabled: encoded.scs[n],
             priority: policy.priority(),
@@ -1879,7 +1882,7 @@ impl Pair {
     pub(crate) fn fail(&mut self, error: Error, failure: Failure) -> Option<Arc<Packet>> {
         self.held = false;
         let first = self.quarantine_error.is_none();
-        // The M5 Ultra's rule (`awaits_witness`), as for a lane (`Channel::fail`): the pass
+        // The M5 Ultra's rule (`awaits_witness`), as for a lane (`Queue::fail`): the pass
         // carries its stamp and targets from publication.
         self.awaiting_witness = awaits_witness(Some(failure), first, self.awaiting_witness, true);
         if let Some(packet) = self

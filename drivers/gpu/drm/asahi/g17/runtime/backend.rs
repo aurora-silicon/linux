@@ -316,7 +316,7 @@ impl job::Backend for Backend {
             .filter_map(|entry| entry.queue.as_deref())
             .any(|other| other.owner() != Some(self.owner) && other.long_job_running())
             || firmware.queues.m5_channels()
-                .any(|other| other.owner() != self.owner && other.long_job_running())
+                .any(|other| other.owner() != Some(self.owner) && other.long_job_running())
     }
 
     fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {

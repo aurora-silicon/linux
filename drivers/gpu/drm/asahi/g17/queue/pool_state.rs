@@ -2,7 +2,7 @@
 
 //! A retained compute pool's registration as the firmware sees it, carried across its owners: the
 //! release transaction Neo's compute queues (`queue::compute::Queue`) and M5 lanes
-//! (`queue::m5::Channel`) share for vacating and growing a pool.
+//! (`queue::m5`) share for vacating and growing a pool.
 //!
 //! Populated: backed; nothing in flight releases it. ReleaseSent: its FreeListRelease is published
 //! at that control cursor. Vacant: the firmware holds no registration, and any backing left is the

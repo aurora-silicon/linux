@@ -103,19 +103,24 @@ pub(crate) struct Vacated {
     _ring: Option<DescriptorRing>,
 }
 
+/// A physical queue's client views in its bound owner's VM, and that owner's context.
+/// The M5 Ultra's binding (`Graph::bind`'s `m5` arm) holds the same views: the kick ring, the
+/// descriptors' canonical low alias, the pool while backed, the operand state at its own address,
+/// and client-private preemption and usage views. It has no queue context (`_queue_context` is
+/// `None`), as S's M5 binding has none.
 pub(crate) struct Binding {
-    _kick_alias: mmu::KernelMapping,
+    pub(in crate::g17::queue) _kick_alias: mmu::KernelMapping,
     /// Client alias of the USC pool pages; dropped when the pool is vacated and
     /// recreated when an owner binds a re-armed pool (it pins the backing).
-    pool_alias: Option<mmu::KernelMapping>,
+    pub(in crate::g17::queue) pool_alias: Option<mmu::KernelMapping>,
     /// Client alias of the descriptor ring; dropped with the ring when the queue
     /// is vacated and recreated when an owner binds a re-armed queue.
-    descriptors: Option<mmu::KernelMapping>,
-    preempt: mmu::KernelMapping,
-    usage: mmu::KernelMapping,
-    operand: mmu::KernelMapping,
-    _queue_context: mmu::KernelMapping,
-    context: Arc<Context>,
+    pub(in crate::g17::queue) descriptors: Option<mmu::KernelMapping>,
+    pub(in crate::g17::queue) preempt: mmu::KernelMapping,
+    pub(in crate::g17::queue) usage: mmu::KernelMapping,
+    pub(in crate::g17::queue) operand: mmu::KernelMapping,
+    pub(in crate::g17::queue) _queue_context: Option<mmu::KernelMapping>,
+    pub(in crate::g17::queue) context: Arc<Context>,
 }
 
 /// The storage of a queue object: pool-retained until processor stop (Neo's graph and
@@ -314,12 +319,16 @@ impl Graph {
     }
 
     /// All fallible mapping work finishes before replacing a physical queue's logical owner.
-    fn bind(
+    /// `pool_alias` is `None` only on the M5 Ultra, for a vacant pool.
+    pub(in crate::g17::queue) fn bind(
         &mut self,
         context: Arc<Context>,
         kick_alias: mmu::KernelMapping,
-        pool_alias: mmu::KernelMapping,
+        pool_alias: Option<mmu::KernelMapping>,
     ) -> Result<Binding> {
+        if self.m5 {
+            return self.bind_m5(context, kick_alias, pool_alias);
+        }
         if !context.is_current() {
             return Err(EFAULT);
         }
@@ -335,12 +344,12 @@ impl Graph {
         let queue_context = self.context_low.as_ref().ok_or(EINVAL)?.alias_in(vm, private.clone(), page, prot)?;
         Ok(Binding {
             _kick_alias: kick_alias,
-            pool_alias: Some(pool_alias),
+            pool_alias,
             descriptors: Some(descriptors),
             preempt,
             usage,
             operand,
-            _queue_context: queue_context,
+            _queue_context: Some(queue_context),
             context,
         })
     }
@@ -467,10 +476,10 @@ use crate::g17::{
 };
 use retirement::{Batch, Observation, Recordless, Ticket, IN_FLIGHT};
 
-struct Fifo<T> {
+pub(in crate::g17::queue) struct Fifo<T> {
     entries: [Option<T>; IN_FLIGHT],
     head: usize,
-    len: usize,
+    pub(in crate::g17::queue) len: usize,
 }
 impl<T> Fifo<T> {
     fn new() -> Self {
@@ -480,24 +489,24 @@ impl<T> Fifo<T> {
             len: 0,
         }
     }
-    fn front(&self) -> Option<&T> {
+    pub(in crate::g17::queue) fn front(&self) -> Option<&T> {
         self.entries[self.head].as_ref()
     }
-    fn back(&self) -> Option<&T> {
+    pub(in crate::g17::queue) fn back(&self) -> Option<&T> {
         if self.len == 0 {
             None
         } else {
             self.entries[(self.head + self.len - 1) % IN_FLIGHT].as_ref()
         }
     }
-    fn back_mut(&mut self) -> Option<&mut T> {
+    pub(in crate::g17::queue) fn back_mut(&mut self) -> Option<&mut T> {
         if self.len == 0 {
             None
         } else {
             self.entries[(self.head + self.len - 1) % IN_FLIGHT].as_mut()
         }
     }
-    fn push(&mut self, value: T) -> core::result::Result<(), T> {
+    pub(in crate::g17::queue) fn push(&mut self, value: T) -> core::result::Result<(), T> {
         if self.len == IN_FLIGHT {
             return Err(value);
         }
@@ -505,7 +514,7 @@ impl<T> Fifo<T> {
         self.len += 1;
         Ok(())
     }
-    fn pop(&mut self) -> Option<T> {
+    pub(in crate::g17::queue) fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
         }
@@ -514,14 +523,14 @@ impl<T> Fifo<T> {
         self.len -= 1;
         value
     }
-    fn pop_back(&mut self) -> Option<T> {
+    pub(in crate::g17::queue) fn pop_back(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
         }
         self.len -= 1;
         self.entries[(self.head + self.len) % IN_FLIGHT].take()
     }
-    fn iter(&self) -> impl Iterator<Item = &T> {
+    pub(in crate::g17::queue) fn iter(&self) -> impl Iterator<Item = &T> {
         Iterator::chain(
             self.entries[self.head..].iter(),
             self.entries[..self.head].iter(),
@@ -529,7 +538,7 @@ impl<T> Fifo<T> {
         .take(self.len)
         .filter_map(Option::as_ref)
     }
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+    pub(in crate::g17::queue) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
         let (before, after) = self.entries.split_at_mut(self.head);
         Iterator::chain(after.iter_mut(), before.iter_mut())
             .take(self.len)
@@ -537,16 +546,16 @@ impl<T> Fifo<T> {
     }
 }
 
-struct Active {
-    packet: Arc<Packet>,
-    published: u64,
-    work: Arc<WorkStateLease>,
-    ticket: Option<Ticket>,
-    observed: Option<Observation>,
+pub(in crate::g17::queue) struct Active {
+    pub(in crate::g17::queue) packet: Arc<Packet>,
+    pub(in crate::g17::queue) published: u64,
+    pub(in crate::g17::queue) work: Arc<WorkStateLease>,
+    pub(in crate::g17::queue) ticket: Option<Ticket>,
+    pub(in crate::g17::queue) observed: Option<Observation>,
     /// Host time the completion record was first observed.
-    observed_at: Option<u64>,
-    failure_deferred: bool,
-    qos_pending: bool,
+    pub(in crate::g17::queue) observed_at: Option<u64>,
+    pub(in crate::g17::queue) failure_deferred: bool,
+    pub(in crate::g17::queue) qos_pending: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
     binding: Option<B>,
@@ -626,68 +635,75 @@ pub(crate) struct Growth {
 }
 
 pub(crate) struct Queue {
-    owner: Option<u64>,
+    pub(in crate::g17::queue) owner: Option<u64>,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
     /// the installed queue record still names them until the next owner binds.
-    retained_owner: Option<crate::g17::context::FirmwarePages>,
+    pub(in crate::g17::queue) retained_owner: Option<crate::g17::context::FirmwarePages>,
     /// Registered from the installation on: an installed queue's every release is published.
-    pool_state: PoolState,
+    pub(in crate::g17::queue) pool_state: PoolState,
     growing: bool,
     growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
     /// fresh before any owner binds it (set by `recycle_killed`, cleared by `rearm`).
-    needs_fresh_backing: bool,
+    pub(in crate::g17::queue) needs_fresh_backing: bool,
     /// Monotonic time the last owner released this queue (vacate order).
     released_at: u64,
     /// Free-list generation of the last published configuration.
     free_list_generation: u64,
     /// `None` after an exited owner was detached; a new owner binds afresh.
-    binding: Option<Binding>,
+    pub(in crate::g17::queue) binding: Option<Binding>,
     previous: Option<Previous>,
     /// This binding has never crossed the successor visibility boundary.
     unpublished_binding: bool,
-    kick: kick::Queue,
-    pool: ComputePool,
-    graph: Graph,
-    active: Fifo<Active>,
+    pub(in crate::g17::queue) kick: kick::Queue,
+    pub(in crate::g17::queue) pool: ComputePool,
+    pub(in crate::g17::queue) graph: Graph,
+    pub(in crate::g17::queue) active: Fifo<Active>,
     replays: Fifo<Arc<Packet>>,
     replay_retirement: bool,
     replay_error: Option<Error>,
     replay_prepared: bool,
-    exit: Option<exit::Transaction>,
+    pub(in crate::g17::queue) exit: Option<exit::Transaction>,
     /// Since when the kill of this failed queue's context waits for other contexts' compute,
     /// and whether that wait was reported.
     kill_wait: Option<(u64, bool)>,
-    installed: bool,
+    pub(in crate::g17::queue) installed: bool,
+    /// The M5 Ultra lane's installation or reinstallation in flight: the item-ring producer past
+    /// its configuration, until the firmware's consumer reaches it (`Queue::install_consumed` in
+    /// `queue::m5`). `None` on every other GPU.
+    pub(in crate::g17::queue) m5_install: Option<u32>,
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
     published_config: Option<ConfigIdentity>,
     /// Last configuration record the firmware consumed, and its recovery
     /// epoch. A command repeats the record only when it differs.
     config_cache: Option<(QueueConfig, u64)>,
-    ordinal: u32,
+    pub(in crate::g17::queue) ordinal: u32,
     submitted: u32,
     /// The stamp of the newest command the firmware reported failed ([`Self::note_fault`]),
     /// while it is newer than the stored stamp.
-    fault_stamp: Option<u32>,
+    pub(in crate::g17::queue) fault_stamp: Option<u32>,
     /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
     claims: u32,
     last_published: u64,
     last_end: u64,
-    released: bool,
+    pub(in crate::g17::queue) released: bool,
     retirement_ready: bool,
-    quarantined: bool,
+    pub(in crate::g17::queue) quarantined: bool,
     retired_by_teardown: bool,
-    retire_pending: bool,
-    awaiting_witness: bool,
+    pub(in crate::g17::queue) retire_pending: bool,
+    pub(in crate::g17::queue) awaiting_witness: bool,
     spared_quarantine: bool,
     spared_deferred: bool,
     terminal: Option<(Arc<VmStatus>, Error)>,
-    quarantine_error: Option<Error>,
+    pub(in crate::g17::queue) quarantine_error: Option<Error>,
     failure_status_pending: bool,
     retirement_proved: bool,
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
+    /// The M5 Ultra lane's own state ([`super::m5::LaneState`]); `None` on every other GPU, whose
+    /// queues `Queue::new` builds.
+    pub(in crate::g17::queue) m5: Option<KBox<super::m5::LaneState>>,
 }
 
 impl Queue {
@@ -706,12 +722,36 @@ impl Queue {
         let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
-        let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
+        let binding = graph.bind(context.clone(), kick_alias, Some(pool_alias))?;
         context.mark_published();
         context.note_compute_binding(true);
         crate::g17::trace::bind(crate::g17::trace::COMPUTE, kick.id().qid(), context.id(), 0);
-        Ok(Self {
-            owner: Some(owner),
+        Ok(Self::assemble(
+            Some(owner),
+            Some(binding),
+            kick,
+            pool,
+            graph,
+            Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
+            None,
+        ))
+    }
+
+    /// A queue of `kick`, `pool` and `graph` bound to `owner` through `binding`, in its initial
+    /// state: never published, healthy, no command in flight. [`Self::new`] builds Neo's (`m5`
+    /// `None`); the M5 Ultra's lane is built by `Queue::new_m5` and `Queue::adopt_m5`
+    /// (`queue::m5`).
+    pub(in crate::g17::queue) fn assemble(
+        owner: Option<u64>,
+        binding: Option<Binding>,
+        kick: kick::Queue,
+        pool: ComputePool,
+        graph: Graph,
+        source_readers: Arc<core::sync::atomic::AtomicU32>,
+        m5: Option<KBox<super::m5::LaneState>>,
+    ) -> Self {
+        Self {
+            owner,
             retained_owner: None,
             pool_state: PoolState::FRESH,
             growing: false,
@@ -719,7 +759,7 @@ impl Queue {
             needs_fresh_backing: false,
             released_at: 0,
             free_list_generation: 0,
-            binding: Some(binding),
+            binding,
             previous: None,
             unpublished_binding: true,
             kick,
@@ -733,6 +773,7 @@ impl Queue {
             exit: None,
             kill_wait: None,
             installed: false,
+            m5_install: None,
             outer_started: 0,
             published_config: None,
             config_cache: None,
@@ -754,9 +795,10 @@ impl Queue {
             quarantine_error: None,
             failure_status_pending: false,
             retirement_proved: false,
-            source_readers: Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
+            source_readers,
             source_hint: crate::g17::sync_input::ReaderHint::new(),
-        })
+            m5,
+        }
     }
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
     /// zero-duration completion record for it, which quarantines the queue, but stores no
@@ -849,13 +891,24 @@ impl Queue {
         !self.quarantined && self.owns_packet(packet)
     }
 
+    /// The commands in flight that recovery attributes: every one on Neo; on the M5 Ultra, those
+    /// its lane has not failed (`failure_deferred`), as its failed kicks wait apart for their
+    /// drain.
+    pub(in crate::g17::queue) fn live(&self) -> impl Iterator<Item = &Active> {
+        let m5 = self.graph.m5;
+        self.active.iter().filter(move |active| !m5 || !active.failure_deferred)
+    }
+    /// The M5 Ultra's lane: its graph is the `m5` arm.
+    pub(crate) fn is_m5(&self) -> bool {
+        self.graph.m5
+    }
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
-        self.active
-            .front()
+        self.live()
+            .next()
             .map(|a| a.packet.completion.spared() && a.packet.completion.replay_count() == 0)
     }
     pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
-        for active in self.active.iter() {
+        for active in self.live() {
             visit(active.packet.completion.status());
         }
     }
@@ -864,7 +917,7 @@ impl Queue {
     /// stamp match the oldest published command is marked.
     pub(crate) fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted {
         let sequence = stamp >> 8;
-        if let Some(active) = self.active.iter().find(|active| {
+        if let Some(active) = self.live().find(|active| {
             active
                 .ticket
                 .is_some_and(|ticket| (ticket.kick as u32) & 0xff_ffff == sequence)
@@ -872,7 +925,7 @@ impl Queue {
             active.packet.completion.note_interrupted();
             return recovery::Interrupted::Exact;
         }
-        match self.active.iter().find(|active| active.ticket.is_some()) {
+        match self.live().find(|active| active.ticket.is_some()) {
             Some(active) => {
                 active.packet.completion.note_interrupted();
                 recovery::Interrupted::Oldest
@@ -881,14 +934,14 @@ impl Queue {
         }
     }
     pub(crate) fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
-        for active in self.active.iter() {
+        for active in self.live() {
             active
                 .packet
                 .completion
                 .classify(class(active.packet.completion.status()));
         }
     }
-    fn qos_owner(&self) -> qos::Owner {
+    pub(crate) fn qos_owner(&self) -> qos::Owner {
         qos::Owner {
             qid: self.qid(),
             // Accounting completes only for bound owners; a detached queue has no
@@ -968,7 +1021,7 @@ impl Queue {
         }
         Ok(())
     }
-    fn front_finished(&self) -> bool {
+    pub(in crate::g17::queue) fn front_finished(&self) -> bool {
         self.active.front().is_some_and(|active| {
             active.observed.is_some()
                 || active.ticket.is_some_and(|ticket| {
@@ -1005,6 +1058,12 @@ impl Queue {
         error: Error,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result<Option<Arc<VmStatus>>> {
+        // The M5 Ultra's lane: a failure from outside its own retirement (a timeout, its VM's
+        // failure) is final there (`Queue::fail` in `queue::m5`, L1's rule), and fans out no VM
+        // failure of its own.
+        if self.graph.m5 {
+            return self.fail(error, Failure::Final, defer).map(|()| None);
+        }
         let first = !self.quarantined;
         if first {
             self.quarantined = true;
@@ -1055,6 +1114,11 @@ impl Queue {
         mut complete_qos: impl FnMut(qos::Owner) -> Result,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
+        // The M5 Ultra's lane retires strictly: no recordless retirement (`Queue::retire_strict`
+        // in `queue::m5`).
+        if self.graph.m5 {
+            return self.retire_strict(recovery_state, &mut complete_qos, defer);
+        }
         if self.quarantined || !self.selected(masks) {
             return Ok(());
         }
@@ -1193,6 +1257,11 @@ impl Queue {
     ) -> Result {
         if !self.awaiting_witness || recovery_state != 0 {
             return Ok(());
+        }
+        // The M5 Ultra's lane: a settled failure's exact drain returns it (`Queue::rehabilitate`
+        // in `queue::m5`); a kill's drain settles in `settle_exit`. It has no compute replay.
+        if self.graph.m5 {
+            return self.rehabilitate(&mut complete_qos, defer);
         }
         if !self.retirement_proved {
             for active in self.active.iter() {
@@ -1383,8 +1452,8 @@ fn release_pending(released: bool, quarantined: bool, active: usize, retiring: b
 }
 
 /// What a failure of a quarantined queue's work says of its state, on a variant whose retirement
-/// witness ends the quarantine (the M5 Ultra's lanes and render pairs, `queue::m5::Channel::fail`,
-/// `queue::m5_render::Pair::fail`). Neo's queues pass none to [`awaits_witness`].
+/// witness ends the quarantine (the M5 Ultra's lanes and render pairs, `Queue::fail` in
+/// `queue::m5`, `queue::m5_render::Pair::fail`). Neo's queues pass none to [`awaits_witness`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     /// Recovery settled it: the firmware restarted and resumed or failed the work, so its exact
@@ -1392,9 +1461,8 @@ pub(crate) enum Failure {
     Settled,
     /// The work failed with the firmware's view of it unknown (a timeout, its VM failed): the
     /// quarantine stays. After a settled failure it is a repeat and changes nothing. On the M5
-    /// Ultra a closed lane's held kicks are then stopped by its context's kill, whose settlement
-    /// awaits their exact drain (`queue::m5::Channel::settle_kill`); that drain recycles the lane
-    /// (`queue::m5::Channel::recycle_killed`).
+    /// Ultra a closed lane's held kicks are then stopped by its context's kill, which settles on
+    /// their exact drain (`settle_exit`'s `m5` arm), and the lane is recycled (`recycle_killed`).
     Final,
     /// A retirement witness could not be read: the quarantine stays, whatever came first.
     Ambiguous,
@@ -1412,12 +1480,12 @@ pub(crate) enum Failure {
 ///
 /// `Some` is the M5 Ultra's rule, a divergence for a measured need. There the witness of a
 /// settled failure also ends the quarantine: the lane or pair returns to its owner
-/// (`Channel::rehabilitate`, `Pair::retire`). So, as for Neo's spared work, the first failure
-/// decides; reassessed, a later failure could hand a lane back that the firmware may still run.
-/// On J775D a timed-out pass drained and the firmware restarted on its QID 1.5 s later, failing
-/// the next owner's pass, and a blamed pass failed again with its VM: a timeout or a VM failure
-/// is `Final`, and a repeat after a settled failure changes nothing. A later `Ambiguous` takes the
-/// witness away: an unreadable witness proves nothing.
+/// (`Queue::rehabilitate` in `queue::m5`, `Pair::retire`). So, as for Neo's spared work, the first
+/// failure decides; reassessed, a later failure could hand a lane back that the firmware may still
+/// run. On J775D a timed-out pass drained and the firmware restarted on its QID 1.5 s later,
+/// failing the next owner's pass, and a blamed pass failed again with its VM: a timeout or a VM
+/// failure is `Final`, and a repeat after a settled failure changes nothing. A later `Ambiguous`
+/// takes the witness away: an unreadable witness proves nothing.
 pub(crate) fn awaits_witness(
     failure: Option<Failure>,
     first: bool,
@@ -1664,7 +1732,7 @@ impl Queue {
         } else {
             let kick_alias = self.kick.map_client(context.vm())?;
             let pool_alias = self.pool.map_client(context.vm())?;
-            let binding = self.graph.bind(context.clone(), kick_alias, pool_alias)?;
+            let binding = self.graph.bind(context.clone(), kick_alias, Some(pool_alias))?;
             self.graph.set_owner(&context)?;
             let old_binding = self.binding.replace(binding);
             // A detached queue (exited owner already dropped) has nothing to supersede;
@@ -1807,6 +1875,11 @@ impl Queue {
     }
     fn recycle_settled(&mut self) -> Result {
         self.graph.reset_items()?;
+        // The M5 Ultra lane keeps its descriptor ring at its fixed low address: it is cleared in
+        // place, where a recycled Neo queue's ring is re-armed fresh.
+        if self.graph.m5 {
+            self.graph.clear_descriptors_m5()?;
+        }
         self.config_cache = None;
         self.exit = None;
         self.quarantined = false;
@@ -1824,7 +1897,11 @@ impl Queue {
         self.replay_prepared = false;
         self.submitted = 0;
         self.kick.clear_parent_after_recovery();
-        self.owner = None;
+        // The M5 Ultra lane keeps its owner until its context's release parks it (`park_m5` in
+        // `queue::m5`).
+        if !self.graph.m5 {
+            self.owner = None;
+        }
         self.released = true;
         self.retirement_ready = true;
         self.released_at = now_ns();
