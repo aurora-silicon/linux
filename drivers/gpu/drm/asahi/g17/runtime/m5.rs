@@ -21,7 +21,7 @@ use crate::g17::{
     preparation::Admission,
     queue::{
         compute::retirement::Batch,
-        m5::{Channel, Dispatch, Host, Retired},
+        m5::{Channel, Dispatch, Failure, Host, Retired},
         m5_render::{BindingArgs, Draw, Pair, PairArgs, ParkedPair},
     },
     status::VmStatus,
@@ -172,6 +172,23 @@ impl Lanes<'_> {
                 .map_err(|_| ENOMEM)?;
             binding(owner)?;
         }
+        // What stays is quarantined. A drain it still awaited can no longer be witnessed: the
+        // firmware, idle on its rings (`settled`), consumed the context's release. It stays
+        // quarantined for good, counted toward the cap, as the old rule had it.
+        for channel in self
+            .channels
+            .iter_mut()
+            .filter(|channel| Arc::ptr_eq(channel.context(), context))
+        {
+            channel.end_drain_wait();
+        }
+        for pair in self
+            .pairs
+            .iter_mut()
+            .filter(|pair| Arc::ptr_eq(pair.context(), context))
+        {
+            pair.end_drain_wait();
+        }
         Ok(())
     }
 }
@@ -189,13 +206,65 @@ fn refuse_firmware_waits(packet: &Packet) -> Result {
     Ok(())
 }
 
+/// Recovery's settlements of M5 work, as the queues' `Retained` methods
+/// (`runtime::events::Retained`): Neo's own queues settle through `Firmware::settle_blamed_render`,
+/// `settle_cancelled_renders` and the firmware's compute-fault events.
+impl Pair {
+    /// The firmware's blame of this pair's QID was found guilty: its pass in flight fails with
+    /// `error`, guilty unless an earlier recovery spared it, as on Neo
+    /// (`Firmware::settle_blamed_render`).
+    pub(super) fn settle_blamed(&mut self, error: Error, deferred: &mut DeferredBatch) -> Result {
+        let Some(packet) = self.oldest_packet() else {
+            return Ok(());
+        };
+        packet.completion.settle_blamed();
+        Registry::fail_pair(self, error, Failure::Settled, deferred)
+    }
+
+    /// The recovery table cancelled one of this pair's QIDs (`qids`): its spared pass in flight
+    /// fails with ECANCELED, as on Neo (`Firmware::settle_cancelled_renders`).
+    pub(super) fn settle_cancelled(&mut self, qids: u128, deferred: &mut DeferredBatch) -> Result {
+        if self
+            .qids()
+            .into_iter()
+            .any(|qid| qids & (1u128 << qid) != 0)
+            && self.oldest_spared() == Some(true)
+        {
+            return Registry::fail_pair(self, ECANCELED, Failure::Settled, deferred);
+        }
+        Ok(())
+    }
+}
+
+impl Channel {
+    /// The firmware's blame of this lane's QID was found guilty: its kicks fail with `error`, the
+    /// oldest guilty unless an earlier recovery spared it, as the render twin does
+    /// ([`Pair::settle_blamed`]). Neo leaves a blamed compute queue to the firmware's
+    /// compute-fault event; M5's restart is the only report a lost dispatch makes (no fault
+    /// event came), so the settlement is explicit (`recovery::Queues::settle_blamed_compute`).
+    pub(super) fn settle_blamed(&mut self, error: Error, deferred: &mut DeferredBatch) -> Result {
+        let Some(packet) = self.oldest_packet() else {
+            return Ok(());
+        };
+        packet.completion.settle_blamed();
+        self.fail(error, Failure::Settled, &mut |retired| {
+            defer(deferred, retired)
+        })
+    }
+}
+
 fn defer(deferred: &mut DeferredBatch, retired: Retired) -> Result {
     let Some(packet) = retired.packet else {
         return Ok(());
     };
-    deferred.push(match retired.result {
-        Ok(times) => Deferred::Retired(packet.completion.clone(), Ok([times[0], times[1], 0, 0])),
-        Err(error) => Deferred::FailedOwned(packet.completion.clone(), error),
+    deferred.push(match (retired.result, retired.drained) {
+        (Ok(times), _) => {
+            Deferred::Retired(packet.completion.clone(), Ok([times[0], times[1], 0, 0]))
+        }
+        // A failed kick that drained: released as a quarantined Neo command is at its drain
+        // (`Deferred::Drained`), its fence failed if its failure never reached it.
+        (Err(error), true) => Deferred::Drained(packet.completion.clone(), Err(error)),
+        (Err(error), false) => Deferred::FailedOwned(packet.completion.clone(), error),
     })
 }
 
@@ -208,9 +277,22 @@ impl Registry {
     }
 
     /// Whether any M5 kick or render pass is in flight: the event worker polls their retirement.
+    /// Quarantined lanes and pairs are not in flight, as quarantined Neo queues are not
+    /// (`queue::compute::Queue::in_flight`).
     pub(super) fn m5_in_flight(&self) -> bool {
-        self.m5.iter().any(|channel| channel.in_flight())
-            || self.m5_render.iter().any(|pair| pair.in_flight())
+        self.m5
+            .iter()
+            .any(|channel| channel.in_flight() && channel.quarantined().is_none())
+            || self.m5_render.iter().any(|pair| pair.polls())
+    }
+
+    /// Whether the event worker polls M5 retirement: a compute channel's finished kick ahead of
+    /// its witnesses (completion events cover the rest, `Channel::retirement_polling`), or a
+    /// render pass in flight on a healthy pair. A quarantined lane or pair awaiting its drain is
+    /// not polled, as [`Self::m5_in_flight`] leaves it out; each event pass still checks it.
+    pub(super) fn m5_polling(&self) -> bool {
+        self.m5.iter().any(|channel| channel.retirement_polling())
+            || self.m5_render.iter().any(|pair| pair.polls())
     }
 
     fn m5_pair(&mut self, owner: u64) -> Option<&mut Pair> {
@@ -233,55 +315,89 @@ impl Registry {
     pub(super) fn retire_m5(
         &mut self,
         port: &crate::g17::port::Port,
-        generation: u64,
         state: u32,
         deferred: &mut DeferredBatch,
     ) -> Result {
+        // Neo's rule for scans over every queue (`recovery::Queues::publish_recovery_targets`):
+        // a failed one must not skip the queues after it. A broken witness fails only its own
+        // lane or pair (Ambiguous); any error left over is returned once all were scanned.
+        let mut failure = None;
         let observations: &mut Batch = &mut self.observations;
         for channel in &mut self.m5 {
-            channel.retire(
+            let result = channel.retire(
                 observations,
-                generation,
                 state,
                 &mut |owner| port.qos_complete(&[owner]),
                 &mut |retired| defer(deferred, retired),
-            )?;
+            );
+            if let Err(error) = result {
+                // A channel already past its failure (Final or Ambiguous) is only reported once.
+                if channel.quarantined().is_none() || channel.awaiting_drain() {
+                    pr_warn!(
+                        "G17 M5: lane {} failed to retire: {:?}\n",
+                        channel.qid(),
+                        error
+                    );
+                    let result = channel.fail(error, Failure::Ambiguous, &mut |retired| {
+                        defer(deferred, retired)
+                    });
+                    failure = failure.or(result.err());
+                }
+            }
         }
         for pair in &mut self.m5_render {
-            match pair.retire(&mut |owners| port.qos_complete(owners)) {
-                Ok(Some(retired)) => {
-                    if let Some(packet) = retired.packet {
-                        deferred.push(Deferred::Retired(
-                            packet.completion.clone(),
-                            Ok(retired.times),
-                        ))?;
-                    }
-                }
-                Ok(None) => {}
-                // One pair's broken witness fails that pair, not every channel's retirement.
-                Err(error) => {
+            // A failed pass that drained is released with its error, in Neo's order for a
+            // quarantined command (`Deferred::Drained`): its fence signals that error if the
+            // failure never reached it.
+            let result = pair.retire(
+                state,
+                &mut |owners| port.qos_complete(owners),
+                &mut |retired| {
+                    let Some(packet) = retired.packet else {
+                        return Ok(());
+                    };
+                    deferred.push(match retired.failed {
+                        Some(error) => Deferred::Drained(packet.completion.clone(), Err(error)),
+                        None => Deferred::Retired(packet.completion.clone(), Ok(retired.times)),
+                    })
+                },
+            );
+            if let Err(error) = result {
+                if pair.quarantined().is_none() || pair.awaiting_drain() {
                     pr_warn!(
                         "G17 M5: render pair of queue {} failed to retire: {:?}: {:x?}\n",
                         pair.owner(),
                         error,
                         pair.report()
                     );
-                    Self::fail_pair(pair, error, deferred)?;
+                    failure =
+                        failure
+                            .or(Self::fail_pair(pair, error, Failure::Ambiguous, deferred).err());
                 }
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     /// Fails `pair`'s pass in flight with `error`: its fence errors while the pair keeps the
-    /// command pinned. Its render lease goes back now. An M5 admission slot names no physical
-    /// pair, so nothing it guards outlives the failure: the pair stays quarantined and refuses
-    /// its owner's later passes itself, and the failed pass no longer orders others (as a
-    /// quarantined lease does not on the other paths). A lease kept with the pinned command,
-    /// or quarantined, would never return: the pass never retires.
-    fn fail_pair(pair: &mut Pair, error: Error, deferred: &mut DeferredBatch) -> Result {
-        if let Some(packet) = pair.fail(error) {
-            drop(packet.completion.detach_render_lease());
+    /// command pinned with its render lease, quarantined (`Pair::fail`, Neo's
+    /// `Completion::quarantine_render`), and the pair refuses its owner's later passes. When the
+    /// pass retires, [`Self::retire_m5`] releases the command and the lease as Neo's exact drain
+    /// does (`Deferred::Drained`, `Completion::release_after_retirement`), and a settled failure
+    /// also ends the pair's quarantine: it parks rather than leaking.
+    /// Settled failures are recovery's (blame, cancellation): the firmware restarted and resumed
+    /// the pass. A timed-out pass is not one, nor is another pass of its failed VM: a 2.8 s
+    /// pass timed out and drained, and 1.5 s later the firmware restarted on that pair's QID,
+    /// failing the next owner's pass. Those pairs stay quarantined and count toward the cap
+    /// (`Failure::Final`). A repeat after a settled failure changes nothing: recoveries
+    /// failed the blamed pass, then its VM's failure failed it again.
+    pub(super) fn fail_pair(
+        pair: &mut Pair,
+        error: Error,
+        failure: Failure,
+        deferred: &mut DeferredBatch,
+    ) -> Result {
+        if let Some(packet) = pair.fail(error, failure) {
             deferred.push(Deferred::FailedOwned(packet.completion.clone(), error))?;
         }
         Ok(())
@@ -296,12 +412,14 @@ impl Registry {
     ) -> Result {
         for channel in &mut self.m5 {
             if channel.in_flight() && Arc::ptr_eq(channel.context().status(), status) {
-                channel.fail(error, &mut |retired| defer(deferred, retired))?;
+                channel.fail(error, Failure::Final, &mut |retired| {
+                    defer(deferred, retired)
+                })?;
             }
         }
         for pair in &mut self.m5_render {
             if pair.in_flight() && Arc::ptr_eq(pair.context().status(), status) {
-                Self::fail_pair(pair, error, deferred)?;
+                Self::fail_pair(pair, error, Failure::Final, deferred)?;
             }
         }
         Ok(())
@@ -342,7 +460,7 @@ impl Registry {
             owner,
             pair.report()
         );
-        Self::fail_pair(pair, ETIMEDOUT, deferred)?;
+        Self::fail_pair(pair, ETIMEDOUT, Failure::Final, deferred)?;
         Ok(true)
     }
 
@@ -373,7 +491,9 @@ impl Registry {
             channel.cursors(),
             channel.front_witnesses()
         );
-        channel.fail(ETIMEDOUT, &mut |retired| defer(deferred, retired))?;
+        channel.fail(ETIMEDOUT, Failure::Final, &mut |retired| {
+            defer(deferred, retired)
+        })?;
         if let Some(pair) = self.m5_pair(owner) {
             pr_warn!(
                 "G17 M5: render pass of queue {} at that timeout: {:x?}\n",
@@ -431,10 +551,16 @@ impl crate::g17::Firmware {
         // previous binding is unmapped.
         let class = context.policy().priority();
         let lanes = &self.queues.m5_parked;
-        let parked = lanes
-            .iter()
-            .position(|lane| lane.adoptable() && lane.class() == class)
-            .or_else(|| lanes.iter().position(|lane| lane.adoptable()));
+        // A lane whose pool is still backed before a vacated one (`Registry::vacate_idle_pools`).
+        let pick = |backed: bool, same: bool| {
+            lanes.iter().position(|lane| {
+                lane.adoptable() && (!backed || lane.backed()) && (!same || lane.class() == class)
+            })
+        };
+        let parked = pick(true, true)
+            .or_else(|| pick(true, false))
+            .or_else(|| pick(false, true))
+            .or_else(|| pick(false, false));
         // Quarantined lanes are leaked deliberately; past the cap no fresh lane is built, while
         // parked ones stay in use.
         let fresh = self.fresh_lanes_allowed();
@@ -537,7 +663,22 @@ impl crate::g17::Firmware {
         } else if self.queues.qids.can_cancel_unpublished(id) {
             self.queues.qids.cancel_unpublished(id)?;
         }
-        result.map_err(|error| refused("installation", error))
+        // EAGAIN (no outer slot yet, nothing published) is the caller's to wait out.
+        result.map_err(|error| {
+            if error == EAGAIN {
+                error
+            } else {
+                refused("installation", error)
+            }
+        })
+    }
+
+    /// Whether the firmware consumed the installation of `owner`'s channel
+    /// ([`Channel::install_consumed`]). EIO: the channel is gone (a recovery closed it).
+    pub(super) fn m5_install_consumed(&mut self, owner: u64, expired: bool) -> Result<bool> {
+        let crashed = &self.primary.state.shared.crashed;
+        let channel = self.queues.m5_channel(owner).ok_or(EIO)?;
+        channel.install_consumed(crashed, expired)
     }
 
     /// Publishes `packet` on `owner`'s channel, its pool grown first when the command's plan
@@ -571,7 +712,7 @@ impl crate::g17::Firmware {
             qids: &mut self.queues.qids,
             crashed: &self.primary.state.shared.crashed,
         };
-        if dispatch.resources.pool_blocks > channel.pool_blocks() {
+        if channel.needs_pool(dispatch.resources.pool_blocks) {
             let primary = &self.primary;
             *grown = channel.grow(
                 alloc,

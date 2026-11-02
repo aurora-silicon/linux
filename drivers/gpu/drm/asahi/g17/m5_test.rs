@@ -631,7 +631,6 @@ impl Compute {
         self.channel.retire(
             &mut self.observations,
             0,
-            0,
             &mut |owner| port.qos_complete(&[owner]),
             &mut |kick| {
                 retired = Some((kick.ticket, kick.result));

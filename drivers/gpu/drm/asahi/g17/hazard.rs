@@ -13,7 +13,8 @@
 //!
 //! A firmware whose render kicks encode no such wait (`Variant::render_barriers`
 //! off, M5) orders a same-VM overlap of another owner as a cross-VM one: the
-//! later render waits on the host for the earlier one's retirement.
+//! later render waits on the host for the earlier one's retirement, without the
+//! [`WAIT_MS`] fallback (`admission::Pool::acquire_render`).
 
 use super::job::Order;
 

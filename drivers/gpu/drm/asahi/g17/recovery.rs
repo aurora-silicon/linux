@@ -106,6 +106,10 @@ pub(super) trait Queues {
     /// Optional diagnostics only; absence cannot alter attribution or release.
     fn report_blamed_render(&self, _qid: u8) {}
     fn settle_blamed_render(&mut self, qid: u8, error: Error);
+    /// The blamed QID's compute work, as [`Self::settle_blamed_render`] settles its render. A
+    /// queue kind whose firmware reports its own compute faults (Neo) leaves this to that event;
+    /// one whose firmware only restarts (M5) fails the work here.
+    fn settle_blamed_compute(&mut self, qid: u8, error: Error);
     fn settle_cancelled_renders(&mut self, qids: u128);
     fn rescan_compute(&mut self) -> Result;
     fn release_retired_compute(&mut self);
@@ -300,6 +304,7 @@ pub(super) fn service<H: Host>(
         );
         if blame {
             host.settle_blamed_render(qid, EIO);
+            host.settle_blamed_compute(qid, EIO);
         }
     }
     if cancelled != 0 {
@@ -467,6 +472,7 @@ mod tests {
             assert_eq!(qid, 38);
             self.blamed = true;
         }
+        fn settle_blamed_compute(&mut self, _qid: u8, _error: Error) {}
         fn settle_cancelled_renders(&mut self, _qids: u128) {}
         fn rescan_compute(&mut self) -> Result { Ok(()) }
         fn release_retired_compute(&mut self) {}

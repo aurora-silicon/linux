@@ -33,6 +33,38 @@ use kernel::{prelude::*, sync::Arc};
 const QIDS: usize = 128;
 const FIRST_COMPUTE_QID: u8 = 4;
 const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
+/// How long a QUEUE_CREATE refused for capacity waits, from its start, for another queue to close.
+/// This was the wait for a retained execution context alone, while the other refusals (logical
+/// queues, render reach, QIDs) waited one job allowance (2 s); a holder that closes a little
+/// later than that (a client at 600 rounds: 2.4 s) lost the creation. One deadline for every
+/// refusal, since each clears the same way.
+/// The retry stays in the kernel.
+pub(super) const QUEUE_CREATE_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
+
+/// Blocks until `domain` is signalled after `observed`, the admission ends, or one admission
+/// slice passes: cancellation and logical close have no release to wait for.
+fn wait_release(
+    domain: &super::availability::Availability,
+    observed: u64,
+    admission: &Admission<'_>,
+) -> Result {
+    use kernel::dma_fence::RawDmaFence;
+    let slice = admission.slice_ms()?;
+    if let Some(fence) = domain.wait(observed)? {
+        // SAFETY: The owned fence keeps the raw DMA fence alive throughout the wait.
+        let waited = unsafe {
+            kernel::bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                false,
+                kernel::time::msecs_to_jiffies(slice) as isize,
+            )
+        };
+        if waited < 0 {
+            return Err(Error::from_errno(waited as i32));
+        }
+    }
+    admission.check()
+}
 
 /// Pending admission keeps exactly retired compute backing available for reuse.
 /// The guard spans retries and disappears on publication, cancellation or error.
@@ -280,6 +312,21 @@ impl Registry {
         self.compute(owner)
     }
 
+    /// The oldest unfinished work of every queue, both engines, for cross-VM timeout attribution
+    /// (`timeout::attribute`): Neo's compute queues and render pairs, and M5's compute channels.
+    /// An M5 render pair joins here with a `timeout_head` of its own, as Neo's pairs do. A
+    /// watchdog's own queue may be among them: `timeout::blocker` looks only at other VMs.
+    pub(in crate::g17) fn timeout_heads(&self) -> impl Iterator<Item = crate::g17::timeout::Head> + '_ {
+        let computes = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|queue| queue.timeout_head());
+        let m5 = self.m5.iter().filter_map(|channel| channel.timeout_head());
+        Iterator::chain(Iterator::chain(computes, self.render_timeout_heads()), m5)
+    }
+
     /// The cell of `owner`'s bound queue, which its publisher may lock without the device mutex.
     pub(super) fn compute_cell(&self, owner: u64) -> Option<Arc<ComputeCell>> {
         self.compute.iter().flatten().find_map(|entry| {
@@ -438,7 +485,9 @@ impl Registry {
     /// Publishes releases for the oldest idle retained pools beyond `cap` and
     /// for every pool released at least `expiry` before `now`, at most four
     /// per pass. Returns the number published and the delay until the next
-    /// retained pool expires or a retry is due.
+    /// retained pool expires or a retry is due. Parked M5 compute lanes are
+    /// candidates alongside the retained compute queues, under the same cap and
+    /// expiry (`queue::m5::ParkedLane::vacate`): their lanes stay installed.
     pub(super) fn vacate_idle_pools(
         &mut self,
         init: &super::initdata::InitData,
@@ -467,10 +516,21 @@ impl Registry {
                 next = Some(next.map_or(left, |next| next.min(left)));
             }
         }
+        for lane in self.m5_parked.iter().filter(|lane| lane.vacate_candidate()) {
+            count += 1;
+            let age = now.saturating_sub(lane.released_at());
+            if age >= expiry {
+                forced += 1;
+            } else {
+                let left = expiry - age;
+                next = Some(next.map_or(left, |next| next.min(left)));
+            }
+        }
         if count <= cap && forced == 0 {
             return Ok((0, next));
         }
-        let mut candidates: KVec<(u64, u8)> = KVec::with_capacity(count, GFP_KERNEL)?;
+        // (age key, QID, a parked M5 lane).
+        let mut candidates: KVec<(u64, u8, bool)> = KVec::with_capacity(count, GFP_KERNEL)?;
         for queue in self
             .compute
             .iter()
@@ -480,13 +540,26 @@ impl Registry {
         {
             // Recycled killed queues sort first (time 0) and count beyond the cap.
             let key = if queue.needs_fresh_backing() { 0 } else { queue.released_at() };
-            candidates.push((key, queue.qid()), GFP_KERNEL)?;
+            candidates.push((key, queue.qid(), false), GFP_KERNEL)?;
+        }
+        for lane in self.m5_parked.iter().filter(|lane| lane.vacate_candidate()) {
+            candidates.push((lane.released_at(), lane.qid(), true), GFP_KERNEL)?;
         }
         // Recycled and expired pools are the oldest keys and sort first.
         candidates.sort_unstable();
         let excess = candidates.len().saturating_sub(cap).max(forced);
         let mut published = 0;
-        for (_, qid) in candidates.iter().take(excess.min(4)) {
+        for &(_, qid, m5) in candidates.iter().take(excess.min(4)) {
+            if m5 {
+                let lane = self.m5_parked.iter_mut().find(|lane| lane.qid() == qid).ok_or(EIO)?;
+                match lane.vacate(init) {
+                    Err(error) if error == EAGAIN => break,
+                    result => { result?; }
+                }
+                published += 1;
+                continue;
+            }
+            let qid = &qid;
             let mut queue = self
                 .compute
                 .iter_mut()
@@ -526,6 +599,20 @@ impl Registry {
             if !deferred.vacated_room() { break; }
             if let Some(vacated) = queue.observe_vacancy(consumer, producer)? {
                 deferred.defer_vacated(vacated);
+                freed += 1;
+            }
+        }
+        for index in 0..self.m5_parked.len() {
+            if !deferred.m5_pool_room() { break; }
+            let lane = &mut self.m5_parked[index];
+            let qid = lane.qid();
+            if let Some(backing) = lane.observe_vacancy(consumer, producer)? {
+                if crate::module_parameters::m5_lane_trace.value() != 0 {
+                    pr_info!("M5 lane {}: pool vacated ({} blocks), {} parked pools backed\n",
+                        qid, backing.blocks(),
+                        self.m5_parked.iter().filter(|lane| lane.backed()).count());
+                }
+                deferred.defer_m5_pool(backing);
                 freed += 1;
             }
         }
@@ -744,66 +831,35 @@ impl Backend {
         sample: &mut u64,
         held: &mut Option<admission::QueueSlot>,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
-        // A closed queue keeps its application context until its scheduler
-        // release is consumed and the context is returned. When only such
-        // contexts block this one, wait (bounded) for the teardown instead of
-        // failing a live client; the preparation lease is not held while
-        // sleeping, and nothing of the new queue is visible yet.
-        const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
-        let started = now_ns();
-        let (lease, uat, pool, qos, execution) = loop {
-            *sample = shared.queues.observe();
-            let lease = shared.preparations.enter(true)?;
-            let mut state = shared.state.lock();
-            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-            if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
-                return Err(EIO);
+        // A refusal returns at once, with nothing of the new queue visible; the caller waits for
+        // capacity on the queue domain under one deadline (`Gpu::new_queue`).
+        *sample = shared.queues.observe();
+        let lease = shared.preparations.enter(true)?;
+        let mut state = shared.state.lock();
+        let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+        if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(EIO);
+        }
+        *held = Some(firmware.queues.admission.reserve_queue()?);
+        // Installed compute channels narrow render's QIDs: every open
+        // logical queue keeps a dedicated render pair within reach. M5
+        // queues have no render.
+        if shared.m5.is_none()
+            && !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize)
+        {
+            return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
+        }
+        // A closed queue keeps its application context until its scheduler release is consumed
+        // and the context is reclaimed; that reclaim wakes the queue domain.
+        let execution = firmware.uat.new_execution_context(vm).map_err(|error| match error {
+            error if error == ENOSPC => {
+                super::capacity::refused(super::capacity::Site::ExecutionContexts)
             }
-            *held = Some(firmware.queues.admission.reserve_queue()?);
-            // Installed compute channels narrow render's QIDs: every open
-            // logical queue keeps a dedicated render pair within reach. M5
-            // queues have no render.
-            if shared.m5.is_none()
-                && !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize)
-            {
-                return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
-            }
-            match firmware.uat.new_execution_context(vm) {
-                Ok(execution) => {
-                    break (
-                        lease,
-                        firmware.uat.clone(),
-                        firmware.pool.clone(),
-                        firmware.queues.qos_ids.clone(),
-                        execution,
-                    )
-                }
-                Err(error) if error == ENOSPC => {
-                    // Every open queue holds one context; this one is counted
-                    // in `queues()` already but holds none yet.
-                    let open = firmware.queues.admission.queues().saturating_sub(1);
-                    let closing = firmware.uat.execution_contexts_used().saturating_sub(open);
-                    if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
-                        return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
-                    }
-                    if let Some(slot) = held.take() {
-                        slot.rollback(sample);
-                    }
-                    drop(state);
-                    drop(lease);
-                    // Nothing is visible yet: a signalled creator restarts.
-                    if kernel::current!().signal_pending() {
-                        return Err(ERESTARTSYS);
-                    }
-                    shared.queue_events();
-                    // A closing queue returns its context when its release
-                    // is reclaimed; that reclaim wakes this creator.
-                    let left = RETAINED_CONTEXT_WAIT_NS.saturating_sub(now_ns().saturating_sub(started));
-                    shared.queues.block(*sample, left.div_ceil(1_000_000) as u32, true)?;
-                }
-                Err(error) => return Err(error),
-            }
-        };
+            error => error,
+        })?;
+        let (uat, pool, qos) =
+            (firmware.uat.clone(), firmware.pool.clone(), firmware.queues.qos_ids.clone());
+        drop(state);
         let dev = shared.drm()?;
         let alloc = super::object::Allocator {
             dev: &dev,
@@ -825,19 +881,12 @@ impl Backend {
             )?,
             GFP_KERNEL,
         )?;
-        let mut state = shared.state.lock();
-        if !lease.is_current() || state.is_none() {
+        if !lease.is_current() || shared.state.lock().is_none() {
             return Err(EAGAIN);
         }
         if let Some(gpu) = shared.m5 {
-            // The queue's channel is installed before the queue exists. A retry would
-            // build a second one: nothing here is retried.
-            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-            firmware
-                .create_m5_channel(&alloc, context.clone(), owner, gpu)
-                .map_err(|error| if error == EAGAIN { EBUSY } else { error })?;
+            Self::install_m5(shared, &lease, &alloc, &context, owner, gpu)?;
         }
-        drop(state);
         let admission = held.as_ref().ok_or(EINVAL)?.pool().clone();
         let bound = context.clone();
         let backend = Arc::pin_init(
@@ -868,6 +917,55 @@ impl Backend {
                     }
                 }
                 Err(error)
+            }
+        }
+    }
+
+    /// Builds or adopts the M5 channel of `owner` under the device mutex, then waits off it for
+    /// the firmware to consume a fresh channel's installation, on the event worker's progress as
+    /// a publication waits ([`wait_release`]); a full outer work ring (EAGAIN, nothing published
+    /// yet) is waited out the same way. The queue's channel is installed before the queue
+    /// exists, and once published it is retained whatever happens: nothing is retried after the
+    /// publication, and an installation still unconsumed after [`queue::m5::INSTALL_WAIT_MS`]
+    /// quarantines the channel. The preparation lease is held throughout, as it was when this
+    /// wait held the device mutex.
+    fn install_m5(
+        shared: &Arc<super::Shared>,
+        lease: &super::preparation::Lease,
+        alloc: &super::object::Allocator<'_>,
+        context: &Arc<Context>,
+        owner: u64,
+        gpu: super::fw::m5::compute::Gpu,
+    ) -> Result {
+        let deadline = now_ns().saturating_add(u64::from(queue::m5::INSTALL_WAIT_MS) * 1_000_000);
+        let open = || -> Result { Ok(()) };
+        let admission = Admission::new(deadline, &open);
+        let mut published = false;
+        loop {
+            let observed = shared.progress.observe();
+            let expired = now_ns() >= deadline;
+            {
+                let mut state = shared.state.lock();
+                let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+                if !published {
+                    if !lease.is_current() {
+                        return Err(EAGAIN);
+                    }
+                    match firmware.create_m5_channel(alloc, context.clone(), owner, gpu) {
+                        Ok(()) => published = true,
+                        Err(error) if error == EAGAIN && !expired => {}
+                        Err(error) if error == EAGAIN => return Err(EBUSY),
+                        Err(error) => return Err(error),
+                    }
+                }
+                if published && firmware.m5_install_consumed(owner, expired)? {
+                    return Ok(());
+                }
+            }
+            shared.queue_events();
+            match wait_release(&shared.progress, observed, &admission) {
+                Err(error) if error != EBUSY => return Err(error),
+                _ => {}
             }
         }
     }
@@ -1298,6 +1396,8 @@ pub(super) struct DeferredBatch {
     /// of vacated pools: unmapping and freeing happen in `finish`, off-lock.
     bindings: KVVec<super::queue::compute::Binding>,
     vacated: KVVec<super::queue::compute::Vacated>,
+    /// Backing of vacated M5 compute pools (`queue::m5::ParkedLane::observe_vacancy`).
+    m5_pools: KVVec<super::freelist::M5Backing>,
     /// Backing of render pools vacated for evicted idle clients.
     render: KVVec<super::freelist::RenderBacking>,
     /// Tiler-heap extensions removed from idle heaps, with their aliases.
@@ -1332,6 +1432,7 @@ impl DeferredBatch {
             values: KVVec::with_capacity(capacity, GFP_KERNEL)?,
             bindings: KVVec::with_capacity(detached, GFP_KERNEL)?,
             vacated: KVVec::with_capacity(detached, GFP_KERNEL)?,
+            m5_pools: KVVec::with_capacity(detached, GFP_KERNEL)?,
             render: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
             tvb: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
         })
@@ -1362,6 +1463,14 @@ impl DeferredBatch {
     }
     pub(super) fn vacated_room(&self) -> bool {
         self.vacated.len() < self.vacated.capacity()
+    }
+    pub(super) fn m5_pool_room(&self) -> bool {
+        self.m5_pools.len() < self.m5_pools.capacity()
+    }
+    pub(super) fn defer_m5_pool(&mut self, backing: super::freelist::M5Backing) {
+        if let Err(backing) = self.m5_pools.push_within_capacity(backing) {
+            drop(backing);
+        }
     }
     pub(super) fn defer_vacated(&mut self, vacated: super::queue::compute::Vacated) {
         if let Err(vacated) = self.vacated.push_within_capacity(vacated) {
@@ -1440,6 +1549,9 @@ impl DeferredBatch {
         }
         for vacated in self.vacated.drain_all() {
             drop(vacated);
+        }
+        for backing in self.m5_pools.drain_all() {
+            drop(backing);
         }
         for backing in self.render.drain_all() {
             drop(backing);
@@ -1785,7 +1897,7 @@ impl super::Firmware {
             )?;
             freed |= busy && queue.channel_free();
         }
-        registry.retire_m5(port, generation, state, deferred)?;
+        registry.retire_m5(port, state, deferred)?;
         // All compute observations in this batch are latched before a VM
         // failure can settle its render peers. Exact successes win first.
         for index in 0..self.queues.compute.len() {
@@ -2421,6 +2533,8 @@ impl super::Firmware {
             freed |= busy && queue.channel_free();
             releasing |= queue.pool_release_pending();
         }
+        releasing |= self.queues.m5.iter().any(|channel| channel.pool_release_pending())
+            || self.queues.m5_parked.iter().any(|lane| lane.pool_release_pending());
         freed |= self.queues.observe_pool_releases(&self.init, deferred)? != 0;
         let shared = &self.primary.state.shared;
         // Edge notifications cover the transitions this driver makes; every
@@ -2439,7 +2553,10 @@ impl super::Firmware {
             shared.progress.notify();
         }
         if self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
-            .any(|queue| queue.pool_release_stalled(now)) {
+            .any(|queue| queue.pool_release_stalled(now))
+            || self.queues.m5.iter().any(|channel| channel.pool_release_stalled(now))
+            || self.queues.m5_parked.iter().any(|lane| lane.pool_release_stalled(now))
+        {
             return Err(ETIMEDOUT);
         }
         if self.render_control_backpressured() {
@@ -2494,6 +2611,17 @@ impl Registry {
                  self.compute.iter().flatten().count(),
                  u8::from(self.qids.compute_fits(self.admission.queues() as usize)))?;
         writeln!(f, "scheduler_teardown pending={}", self.teardown.len())?;
+        // M5: bound and parked lanes and pairs, the quarantined ones and those awaiting a settled
+        // failure's drain, and whether any still needs the event worker's polling.
+        writeln!(f, "m5_lanes bound={} parked={} quarantined={} awaiting_drain={}",
+                 self.m5.len(), self.m5_parked.len(),
+                 self.m5.iter().filter(|channel| channel.quarantined().is_some()).count(),
+                 self.m5.iter().filter(|channel| channel.awaiting_drain()).count())?;
+        writeln!(f, "m5_pairs bound={} parked={} quarantined={} awaiting_drain={} polling={}",
+                 self.m5_render.len(), self.m5_parked_pairs.len(),
+                 self.m5_render.iter().filter(|pair| pair.quarantined().is_some()).count(),
+                 self.m5_render.iter().filter(|pair| pair.awaiting_drain()).count(),
+                 u8::from(self.m5_in_flight()))?;
         for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
             queue.write_capacity(f)?;
         }
@@ -2510,29 +2638,14 @@ impl Backend {
     }
 
     /// Blocks until `domain` is signalled after `observed`, this packet's admission ends, or one
-    /// admission slice passes: cancellation and logical close have no release to wait for.
+    /// admission slice passes ([`wait_release`]).
     fn wait_release(
         &self,
         domain: &super::availability::Availability,
         observed: u64,
         admission: &Admission<'_>,
     ) -> Result {
-        use kernel::dma_fence::RawDmaFence;
-        let slice = admission.slice_ms()?;
-        if let Some(fence) = domain.wait(observed)? {
-            // SAFETY: The owned fence keeps the raw DMA fence alive throughout the wait.
-            let waited = unsafe {
-                kernel::bindings::dma_fence_wait_timeout(
-                    fence.raw(),
-                    false,
-                    kernel::time::msecs_to_jiffies(slice) as isize,
-                )
-            };
-            if waited < 0 {
-                return Err(Error::from_errno(waited as i32));
-            }
-        }
-        admission.check()
+        wait_release(domain, observed, admission)
     }
 
     /// Reclaim steps of a capacity wait that never sleep: observe consumed pool releases and,

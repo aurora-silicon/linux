@@ -2022,24 +2022,26 @@ impl gpu::Gpu for Gpu {
             Some(_) => fw::m5::queue::scheduling_policy(priority)?,
             None => scheduling_policy(priority)?,
         };
-        let admission_started = now_ns();
+        let deadline = now_ns().saturating_add(runtime::QUEUE_CREATE_WAIT_NS);
         let (backend, slot) = loop {
             let mut observed = self.shared.queues.observe();
             match runtime::Backend::new(&self.shared, &vm, owner, policy, &mut observed) {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == ENOSPC => {
-                    // Closed logical queues can still own execution/QoS IDs
-                    // until the scheduler release is consumed and reclaimed.
-                    // Backend construction has rolled back all temporary leases.
-                    let waited = now_ns().saturating_sub(admission_started);
-                    let limit = job::TIMEOUT_MS as u64 * 1_000_000;
-                    if waited >= limit { return Err(EBUSY); }
+                    // Every capacity a creation can be refused (logical queues, render reach,
+                    // QIDs, execution contexts) comes back when another queue closes and its
+                    // release is reclaimed. Backend construction has rolled back all temporary
+                    // leases, so nothing of this queue exists: a signalled creator restarts.
+                    let left = deadline.saturating_sub(now_ns());
+                    if left == 0 { return Err(EBUSY); }
+                    if kernel::current!().signal_pending() {
+                        return Err(ERESTARTSYS);
+                    }
                     self.shared.queue_events();
                     // A returned queue slot or reclaimed context wakes this; this attempt's own
-                    // returned slot does not (`QueueSlot::rollback`).
-                    self.shared
-                        .queues
-                        .block(observed, (limit - waited).div_ceil(1_000_000) as u32, true)?;
+                    // returned slot does not (`QueueSlot::rollback`). Wakes never renew the
+                    // deadline.
+                    self.shared.queues.block(observed, left.div_ceil(1_000_000) as u32, true)?;
                 }
                 result => break result?,
             }

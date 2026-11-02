@@ -860,68 +860,13 @@ impl crate::g17::Firmware {
 }
 
 impl Registry {
-    pub(in crate::g17) fn render_oldest_spared(&self, qid: u8) -> Option<bool> {
-        self.render
-            .entries
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.pair.as_ref())
-            .find(|pair| pair.qids().contains(&qid))
-            .and_then(|pair| pair.oldest_spared())
+    /// The bound render pairs, for recovery attribution (`runtime::events::Retained`).
+    pub(in crate::g17::runtime) fn render_pairs(&self) -> impl Iterator<Item = &Pair> {
+        self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_deref())
     }
-    /// Marks the interrupted group of the pair that owns `qid`.
-    pub(in crate::g17) fn note_render_interrupted(
-        &self,
-        qid: u8,
-        stamp: u32,
-    ) -> crate::g17::recovery::Interrupted {
-        self.render
-            .entries
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.pair.as_ref())
-            .find(|pair| pair.qids().contains(&qid))
-            .map_or(crate::g17::recovery::Interrupted::None, |pair| {
-                pair.note_interrupted(stamp)
-            })
-    }
-    pub(in crate::g17) fn visit_render_owners(
-        &self,
-        qid: u8,
-        visit: &mut dyn FnMut(&Arc<crate::g17::status::VmStatus>),
-    ) {
-        for pair in self
-            .render
-            .entries
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.pair.as_ref())
-        {
-            if pair.qids().contains(&qid) {
-                pair.visit_owners(visit);
-            }
-        }
-    }
-    pub(in crate::g17) fn classify_render(
-        &self,
-        classify: &dyn Fn(&Arc<crate::g17::status::VmStatus>) -> crate::g17::recovery::Class,
-    ) -> u128 {
-        let mut spared = 0;
-        for pair in self
-            .render
-            .entries
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.pair.as_ref())
-        {
-            pair.classify(classify);
-            if pair.oldest_spared() == Some(true) {
-                for qid in pair.qids() {
-                    spared |= 1u128 << qid;
-                }
-            }
-        }
-        spared
+
+    pub(in crate::g17::runtime) fn render_pairs_mut(&mut self) -> impl Iterator<Item = &mut Pair> {
+        self.render.entries.iter_mut().flatten().filter_map(|entry| entry.pair.as_deref_mut())
     }
 
     pub(in crate::g17) fn render_scheduler_active(&self) -> bool {
@@ -1138,20 +1083,8 @@ impl Registry {
             .filter_map(|entry| entry.pair.as_ref())
             .find(|pair| pair.contains_packet(packet))
             .and_then(|pair| pair.timeout_head());
-        let computes = self
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .filter_map(|queue| queue.timeout_head());
         // Without a head of its own the timeout is its own.
-        own.map(|own| {
-            crate::g17::timeout::attribute(
-                own,
-                renewals,
-                Iterator::chain(self.render_timeout_heads(), computes),
-            )
-        })
+        own.map(|own| crate::g17::timeout::attribute(own, renewals, self.timeout_heads()))
     }
 }
 

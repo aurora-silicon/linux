@@ -70,6 +70,12 @@ struct State {
     /// Quarantined slots whose failed work is all spared (innocent): waiting publications fail
     /// their own fence with EBUSY instead of a device-loss error, so the VM stays usable.
     spared: u64,
+    /// Quarantined slots whose failed work the firmware goes on running: it resumes work a
+    /// recovery settled (M5: the restarted firmware runs the interrupted pass to its end,
+    /// as measured on J775D), so that work still owns its footprint until its drain rehabilitates
+    /// the slot. Quarantined work that the firmware stopped (every Neo quarantine) owns nothing
+    /// (`hazard::plan`).
+    resuming: u64,
     kill_hold: u64,
     /// Slots whose kill hold ended at their killed context's consumed scheduler release,
     /// and when. A new owner takes such a pair last, the one released longest ago first.
@@ -98,6 +104,7 @@ impl State {
             epochs: [0; cfg::RENDER_SLOTS],
             quarantined: 0,
             spared: 0,
+            resuming: 0,
             kill_hold: 0,
             killed: 0,
             killed_at: [0; cfg::RENDER_SLOTS],
@@ -333,9 +340,10 @@ impl State {
                 slot: entry.slot,
                 ticket: entry.ticket,
                 footprint: &entry.footprint,
+                // A quarantine releases the footprint only when the firmware stopped the work.
                 quarantined: entry
                     .slot
-                    .is_some_and(|slot| self.quarantined & (1u64 << slot) != 0),
+                    .is_some_and(|slot| self.quarantined & !self.resuming & (1u64 << slot) != 0),
             }),
         )
     }
@@ -513,7 +521,14 @@ impl Pool {
         }
         let mut state = self.state.lock();
         let started = crate::g17::now_ns();
-        let conflict_deadline = started.saturating_add(u64::from(hazard::WAIT_MS) * 1_000_000);
+        // An overlap wait that expires publishes unordered (`Plan::Any`). With render barriers
+        // that is a bounded fallback; without them (M5) it would reorder the overlap for real,
+        // so the wait has no expiry of its own: it ends when the other render retires or its
+        // pair fails, within the caller's deadline.
+        let conflict_deadline = match state.barriers {
+            true => started.saturating_add(u64::from(hazard::WAIT_MS) * 1_000_000),
+            false => u64::MAX,
+        };
         let quarantine_deadline = started.saturating_add(u64::from(QUARANTINE_WAIT_MS) * 1_000_000);
         let mut expired = false;
         let mut ticket = None;
@@ -690,6 +705,7 @@ impl Pool {
         state.released &= !released;
         state.quarantined &= !released;
         state.spared &= !released;
+        state.resuming &= !released;
         state.kill_hold = 0;
         state.killed = 0;
         drop(state);
@@ -846,7 +862,10 @@ impl RenderLease {
     }
     /// `spared`: the failing work is innocent. Any guilty failure makes the slot's quarantine
     /// guilty for good; only a quarantine that starts spared and stays spared is marked spared.
-    pub(crate) fn quarantine(&self, spared: bool) {
+    /// `resumes`: the firmware goes on running the failed work (a recovery settled it and the
+    /// firmware resumes it), so it keeps its footprint ([`State::resuming`]) until the drain or
+    /// a later quarantine without it.
+    pub(crate) fn quarantine(&self, spared: bool, resumes: bool) {
         let bit = 1u64 << self.slot;
         let mut state = self.pool.state.lock();
         if !spared {
@@ -855,6 +874,7 @@ impl RenderLease {
             state.spared |= bit;
         }
         state.quarantined |= bit;
+        state.resuming = (state.resuming & !bit) | if resumes { bit } else { 0 };
         drop(state);
         self.pool.returned();
     }
@@ -864,6 +884,7 @@ impl RenderLease {
         let mut state = self.pool.state.lock();
         state.quarantined &= !(1u64 << self.slot);
         state.spared &= !(1u64 << self.slot);
+        state.resuming &= !(1u64 << self.slot);
     }
     /// Requires the runtime's closed-recovery, exact pair-drain witness.
     pub(crate) fn rehabilitate_after_firmware_drain(&self) {

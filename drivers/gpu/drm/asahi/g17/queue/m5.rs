@@ -18,12 +18,14 @@
 //! Retirement is exact and strict: the completion record of this queue, kick and
 //! descriptor, the queue's stamp covering the kick, the inner consumer past the kick's items, the
 //! pool's completed count at the kick's target, the work-state node drained and the record's end
-//! time equal to the descriptor's, in the recovery generation the kick was published in, with
-//! recovery closed. There is no aged-record or recordless retirement. These witnesses prove that
-//! the firmware retired the kick, not that every workgroup ran: dispatches that lost workgroups
-//! retired with all of them.
+//! time equal to the descriptor's, with recovery closed. A kick may retire across a firmware
+//! restart, as on Neo (`retirement::poll`'s stamp rule): the restart's recovery table names
+//! every kick it interrupted, and recovery marks those (`Channel::note_interrupted`) so that
+//! they fail however their witnesses read. There is no aged-record or recordless retirement. These
+//! witnesses prove that the firmware retired the kick, not that every workgroup ran: dispatches
+//! that lost workgroups retired with all of them.
 
-use super::compute::{GRAPH_SIZE, ITEMS, POINTERS};
+use super::compute::{PoolPhase, GRAPH_SIZE, ITEMS, POINTERS};
 use crate::g17::{
     channel::Rings,
     context::{Context, WorkStateLease},
@@ -46,6 +48,8 @@ use crate::g17::{
     port::Port,
     qos,
     queue::compute::retirement::{self, Batch, Cursors, Observation, Recordless, Ticket},
+    recovery,
+    status::VmStatus,
     vm_layout::Domain,
 };
 use crate::{driver::AsahiDrmDevice, mmu};
@@ -89,6 +93,8 @@ const USAGE: usize = 0x1000;
 const SUPPORT_BYTES: usize = 0x4000;
 /// Polls of 1 ms for the installation to be consumed.
 const INSTALL_POLLS: u32 = 2000;
+/// How long an installation may take to be consumed, polled or awaited.
+pub(crate) const INSTALL_WAIT_MS: u32 = INSTALL_POLLS;
 
 /// What a channel uses of its firmware session, borrowed under the device mutex.
 pub(crate) struct Host<'a> {
@@ -129,8 +135,35 @@ impl Dispatch {
 /// A grown pool's old backing and the client's old view of it ([`Channel::grow`]), dropped off
 /// the device mutex: the view first.
 pub(crate) struct Grown {
-    _view: mmu::KernelMapping,
-    _backing: M5Backing,
+    _view: Option<mmu::KernelMapping>,
+    _backing: Option<M5Backing>,
+}
+
+/// What a failure of a lane's or pair's work says of its state ([`Channel::fail`],
+/// [`super::m5_render::Pair::fail`]). Only the first failure decides whether the failed work's
+/// drain can end the quarantine; a later one can only take that away, when it is `Ambiguous`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// Recovery settled it: the firmware restarted and resumed or failed the work, so its exact
+    /// retirement is the drain witness that ends the quarantine.
+    Settled,
+    /// The work failed with the firmware's view of it unknown (a timeout, its VM failed): the
+    /// quarantine stays. After a settled failure it is a repeat and changes nothing.
+    Final,
+    /// A retirement witness could not be read: the quarantine stays, whatever came first.
+    Ambiguous,
+}
+
+impl Failure {
+    /// Whether the failed work's drain ends the quarantine, given whether it did before this
+    /// failure (`awaiting`) and whether this is the first.
+    pub(crate) fn awaits_drain(self, first: bool, awaiting: bool) -> bool {
+        match (first, self) {
+            (true, kind) => kind == Self::Settled,
+            (false, Self::Ambiguous) => false,
+            (false, _) => awaiting,
+        }
+    }
 }
 
 /// A kick in flight.
@@ -144,6 +177,9 @@ struct Active {
     /// The DRM command; `None` for the qualification's own kicks.
     packet: Option<Arc<Packet>>,
     observed: Option<Observation>,
+    /// Its publication order across both engines (`Port::next_publication`), for cross-VM
+    /// timeout attribution.
+    published: u64,
 }
 
 /// A kick just published.
@@ -159,6 +195,9 @@ pub(crate) struct Retired {
     pub(crate) ticket: Ticket,
     pub(crate) packet: Option<Arc<Packet>>,
     pub(crate) result: Result<[u64; 2]>,
+    /// A failed kick that drained: its error (`result`) is reported again with the release, so
+    /// that a fence whose failure never reached it signals that error, not success.
+    pub(crate) drained: bool,
 }
 
 /// One M5 hardware queue: its graph ([`super::compute::initialize_m5_graph`]: the queue record,
@@ -379,9 +418,8 @@ pub(crate) struct Channel {
     usage_va: u64,
     installed: bool,
     ordinal: u32,
-    /// The pool grew since the lane's last kick ([`Self::grow`]): the next kick rebinds it with
-    /// its configuration update.
-    pool_rebind: bool,
+    /// The pool as the firmware sees it, carried to the parked lane and the next binding.
+    pool_state: PoolState,
     active: KVec<Active>,
     /// Set once a kick failed or the channel's state became ambiguous: nothing more is published,
     /// and every failed kick stays in `failed`, pinning its command.
@@ -391,6 +429,19 @@ pub(crate) struct Channel {
     closed: bool,
     /// The firmware reported a failed kick of this queue.
     faulted: bool,
+    /// The quarantine is a settled failure (the firmware faulted a kick or failed it across a
+    /// restart, both followed by recovery): the channel's state is not in doubt, so the failed
+    /// kicks' exact retirement ([`Self::drained`]) is the drain witness that releases them and ends
+    /// the quarantine, as a Neo compute queue's quarantine ends once its ring is proved retired
+    /// (`retirement::quarantined_retired`). A broken retirement witness, a timeout or the VM's
+    /// failure keeps the quarantine (`Registry::fail_pair` says why), as does the context's release
+    /// consumed before the drain ([`Self::end_drain_wait`]).
+    awaiting_drain: bool,
+    /// The oldest kick finished but is not retirable yet (`Self::retire`): its record or inner
+    /// item is visible ahead of the stamp, the pool counter or the work node. Its completion
+    /// event has been consumed, so the event worker polls until it retires, as for a Neo
+    /// compute queue (`queue::compute::Queue::retirement_polling`).
+    retire_pending: bool,
 }
 
 /// Maps a lane's client-visible storage into `vm`: the kick ring (unless `Lane::new` did), the
@@ -419,7 +470,9 @@ fn client_aliases(
         descriptors.map_alias(vm, descriptors_low, shared)?,
         GFP_KERNEL,
     )?;
-    aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
+    if !pool.vacant() {
+        aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
+    }
     aliases.push(operand.map_alias(vm, operand.gpu_va(), shared)?, GFP_KERNEL)?;
     // Kernel-owned buffers the GPU writes in the client's context: client-private views.
     let private = alloc.domain(Domain::Private);
@@ -450,16 +503,118 @@ pub(crate) struct ParkedLane {
     class: u8,
     pages: crate::g17::context::FirmwarePages,
     unmapped: Unmapped,
+    pool_state: PoolState,
+    /// When it parked: the vacate pass releases the least recently parked pools first.
+    parked_at: u64,
+}
+
+/// A lane's pool as the firmware sees it, carried across its bindings: Neo's retained compute
+/// queue phases (`queue::compute::PoolPhase`). Populated: backed, released by nothing in
+/// flight. ReleaseSent: its FreeListRelease is published at that control cursor. Vacant: the
+/// firmware holds no registration; any backing left is the host's to free or replace.
+#[derive(Clone, Copy)]
+pub(crate) struct PoolState {
+    phase: PoolPhase,
+    /// A kick's configuration update registered the pool since its last consumed release;
+    /// until then every kick carries the update.
+    registered: bool,
+    release_sent_ns: Option<u64>,
+}
+
+impl PoolState {
+    const FRESH: Self = Self {
+        phase: PoolPhase::Populated,
+        registered: false,
+        release_sent_ns: None,
+    };
+
+    /// Publishes the release of a registered pool, or marks an unregistered one vacant at once.
+    /// Returns whether a record was published (the caller announces it). EAGAIN: the control
+    /// ring is full.
+    fn release(&mut self, init: &InitData, pool: &M5Pool) -> Result<bool> {
+        if !self.registered {
+            self.phase = PoolPhase::Vacant;
+            return Ok(false);
+        }
+        // Generation 1, as every binding's configuration publishes it.
+        let cursor = Rings::publish_control(
+            init,
+            &ControlRecord::FreeListRelease(pool.release_record(1)),
+        )?;
+        self.phase = PoolPhase::ReleaseSent(cursor);
+        self.release_sent_ns = Some(crate::g17::now_ns());
+        fence(Ordering::SeqCst);
+        Ok(true)
+    }
+    /// Moves a release the firmware consumed (control cursors `consumer`, `producer`) to vacant.
+    fn observe(&mut self, consumer: u32, producer: u32) -> Result {
+        if let PoolPhase::ReleaseSent(cursor) = self.phase {
+            if control_consumed(consumer, producer, cursor)? {
+                self.phase = PoolPhase::Vacant;
+                self.registered = false;
+                self.release_sent_ns = None;
+            }
+        }
+        Ok(())
+    }
+    fn pending(&self) -> bool {
+        matches!(self.phase, PoolPhase::ReleaseSent(_))
+    }
+    fn stalled(&self, now: u64) -> bool {
+        self.pending() && crate::g17::timeout::background_stalled(self.release_sent_ns, now)
+    }
 }
 
 impl ParkedLane {
     pub(crate) fn qid(&self) -> u8 {
         self.lane.qid()
     }
-    /// Its previous binding's client views are unmapped: a new owner in the same VM may map
-    /// the lane at the same addresses.
+    /// Its previous binding's client views are unmapped (a new owner in the same VM may map
+    /// the lane at the same addresses), and no release of its pool is in flight.
     pub(crate) fn adoptable(&self) -> bool {
-        self.unmapped.done()
+        self.unmapped.done() && !self.pool_state.pending()
+    }
+    /// Its pool is backed and kept: an adoption needs no fresh backing.
+    pub(crate) fn backed(&self) -> bool {
+        self.pool_state.phase == PoolPhase::Populated && !self.pool.vacant()
+    }
+    /// An idle pool the vacate pass may give back (`Registry::vacate_idle_pools`), as for a
+    /// retained Neo compute queue (`queue::compute::Queue::vacate_candidate`).
+    pub(crate) fn vacate_candidate(&self) -> bool {
+        self.backed() && self.unmapped.done()
+    }
+    /// When the lane parked.
+    pub(crate) fn released_at(&self) -> u64 {
+        self.parked_at
+    }
+    /// Releases this parked lane's pool (the caller holds the device mutex and announces a
+    /// published record): the backing is freed once the firmware consumed the release
+    /// ([`Self::observe_vacancy`]). The lane, its QID, ring and stamps stay installed; the next
+    /// owner's first command backs the pool for its plan.
+    pub(crate) fn vacate(&mut self, init: &InitData) -> Result<bool> {
+        if !self.vacate_candidate() {
+            return Err(EBUSY);
+        }
+        self.pool_state.release(init, &self.pool)
+    }
+    /// The backing of a vacant pool no client maps any more, once the firmware consumed its
+    /// release; the caller frees it off the device mutex.
+    pub(crate) fn observe_vacancy(
+        &mut self,
+        consumer: u32,
+        producer: u32,
+    ) -> Result<Option<M5Backing>> {
+        self.pool_state.observe(consumer, producer)?;
+        if self.pool_state.phase != PoolPhase::Vacant || !self.unmapped.done() {
+            return Ok(None);
+        }
+        Ok(self.pool.vacate())
+    }
+    pub(crate) fn pool_release_pending(&self) -> bool {
+        self.pool_state.pending()
+    }
+    pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
+        self.pool_state.stalled(now)
     }
     /// The class whose outer ring last carried this lane.
     pub(crate) fn class(&self) -> u8 {
@@ -599,12 +754,14 @@ impl Channel {
                 usage_va,
                 installed: false,
                 ordinal: 0,
-                pool_rebind: false,
+                pool_state: PoolState::FRESH,
                 active: KVec::with_capacity(DEPTH, GFP_KERNEL)?,
                 quarantine: None,
                 failed: KVec::new(),
                 closed: false,
                 faulted: false,
+                awaiting_drain: false,
+                retire_pending: false,
             },
             GFP_KERNEL,
         )?;
@@ -646,6 +803,11 @@ impl Channel {
         let lane = parked.get_mut(index).ok_or(EINVAL)?;
         if !lane.adoptable() {
             return Err(EAGAIN);
+        }
+        // A vacant pool's leftover backing (no registration, no client view) goes: the binding's
+        // first command backs the pool for its plan ([`Self::grow`]).
+        if lane.pool_state.phase == PoolPhase::Vacant {
+            drop(lane.pool.vacate());
         }
         let unmapped = Unmapped::new()?;
         let mut aliases = KVec::with_capacity(8, GFP_KERNEL)?;
@@ -690,12 +852,14 @@ impl Channel {
                 usage_va,
                 installed: true,
                 ordinal: 0,
-                pool_rebind: false,
+                pool_state: lane.pool_state,
                 active,
                 quarantine: None,
                 failed: KVec::new(),
                 closed: false,
                 faulted: false,
+                awaiting_drain: false,
+                retire_pending: false,
             },
         );
         if let Err(error) = channel.publish_mappings() {
@@ -743,8 +907,11 @@ impl Channel {
         );
     }
 
-    /// The lane needs nothing more before its context's release: parkable, or quarantined
-    /// (leaked, never reused) with the firmware idle on its ring.
+    /// The lane needs nothing more before its context's release: parkable, or quarantined with
+    /// the firmware idle on its ring. A drain still awaited does not hold the release back, as a
+    /// quarantined Neo queue does not (`Queue::idle_for_context` waits for the firmware, not for
+    /// the witness): the healthy lanes of the context park, and this one parks only if it drained
+    /// before the release was consumed ([`Self::end_drain_wait`]).
     pub(crate) fn settled(&self) -> Result<bool> {
         if self.quarantine.is_none() {
             return self.parkable();
@@ -772,6 +939,7 @@ impl Channel {
             preempt,
             usage,
             unmapped,
+            pool_state,
             ..
         } = KBox::into_inner(self);
         let pages = context.retain_firmware_pages();
@@ -790,6 +958,8 @@ impl Channel {
                 class,
                 pages,
                 unmapped: unmapped.clone(),
+                pool_state,
+                parked_at: crate::g17::now_ns(),
             },
             Binding {
                 aliases,
@@ -833,6 +1003,31 @@ impl Channel {
     pub(crate) fn open(&self) -> bool {
         !self.closed
     }
+    /// A settled failure's drain is awaited ([`Self::rehabilitate`]). The event worker does not
+    /// poll for it: a quarantined channel has no kick in flight ([`Self::in_flight`]), as a
+    /// quarantined Neo queue is not in flight (`Queue::in_flight`); each event pass checks it.
+    pub(crate) fn awaiting_drain(&self) -> bool {
+        self.awaiting_drain
+    }
+    /// The context's scheduler release was consumed while this quarantined channel still awaited
+    /// its failed kicks' drain: the channel stays quarantined, leaked under the cap, its kicks
+    /// pinned. The firmware was idle on its ring (`Self::settled`) and no longer names the
+    /// context, and nothing else can witness the drain: on M5 neither a kill's acknowledgement nor
+    /// the scheduler page's killed state proves the firmware finished reading (S
+    /// `queue/compute/exit.rs` `settle_exit`). Returns whether a wait ended.
+    pub(crate) fn end_drain_wait(&mut self) -> bool {
+        if !self.awaiting_drain {
+            return false;
+        }
+        self.awaiting_drain = false;
+        pr_warn!("G17 M5: lane {}: its context was released before its {} failed kicks drained; the lane stays quarantined\n",
+            self.qid(), self.failed.len());
+        true
+    }
+    /// The oldest command in flight.
+    pub(crate) fn oldest_packet(&self) -> Option<Arc<Packet>> {
+        self.commands().next().map(|(_, packet)| packet.clone())
+    }
     /// Room for another kick: installed, healthy, open and below [`DEPTH`].
     pub(crate) fn has_room(&self) -> bool {
         self.installed && self.quarantine.is_none() && !self.closed && self.active.len() < DEPTH
@@ -851,6 +1046,74 @@ impl Channel {
     pub(crate) fn kicks(&self) -> u64 {
         self.lane.kick.timestamp().get() - KickTimestamp::FIRST.get()
     }
+    /// The oldest DRM kick still holding the GPU, for cross-VM timeout attribution
+    /// (`timeout::attribute`), as a Neo compute queue's (`queue::compute::Queue::timeout_head`):
+    /// a failed kick awaiting its drain holds the GPU and is marked failed; a quarantine with no
+    /// drain to await describes no live pipe order. The qualification's kicks carry no packet
+    /// and take no part.
+    pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
+        if self.quarantine.is_some() && !self.awaiting_drain {
+            return None;
+        }
+        Iterator::chain(self.failed.iter(), self.active.iter())
+            .filter_map(|active| Some((active, active.packet.as_ref()?)))
+            .min_by_key(|(active, _)| active.published)
+            .map(|(active, packet)| crate::g17::timeout::Head {
+                vm: packet.context.vm().id(),
+                published: active.published,
+                finished: active.observed.is_some(),
+                failed: self.quarantine.is_some(),
+            })
+    }
+
+    /// The watchdog of `packet` may classify this channel's work (Neo:
+    /// `queue::compute::Queue::can_classify_timeout`): it is healthy and `packet` is in flight.
+    pub(crate) fn can_classify_timeout(&self, packet: &Arc<Packet>) -> bool {
+        self.quarantine.is_none()
+            && self.active.iter().any(|active| {
+                active
+                    .packet
+                    .as_ref()
+                    .is_some_and(|own| Arc::ptr_eq(own, packet))
+            })
+    }
+
+    /// The oldest kick is a published long job (ray traversal or AS build) whose completion
+    /// record the driver has not seen yet (Neo: `queue::compute::Queue::long_job_running`).
+    pub(crate) fn long_job_running(&self) -> bool {
+        self.quarantine.is_none()
+            && self.active.first().is_some_and(|active| {
+                active.observed.is_none()
+                    && active
+                        .packet
+                        .as_ref()
+                        .is_some_and(|packet| packet.is_published() && packet.command.long_job())
+            })
+    }
+
+    /// The firmware posts a completion (stamp) event naming this queue's QID for every kick,
+    /// as for a Neo compute queue: measured on J775D, 2782 stamp events for 2782 kicks of one
+    /// queue, and 48237 for 48237 kicks of eight, 97% of them retired by the pass of their own
+    /// event. So the event worker polls a channel only while its oldest kick finished ahead of
+    /// its retirement witnesses ([`Self::retire_pending`]), not while any kick is in flight.
+    pub(crate) fn retirement_polling(&self) -> bool {
+        self.quarantine.is_none() && self.retire_pending
+    }
+
+    /// The oldest kick's completion record was seen, or the firmware consumed its inner items
+    /// (Neo: `queue::compute::Queue::front_finished`).
+    fn front_finished(&self) -> bool {
+        self.active.first().is_some_and(|active| {
+            active.observed.is_some()
+                || self
+                    .cursors()
+                    .and_then(|cursors| {
+                        cursors.consumed(active.ticket.item_producer, active.ticket.item_count)
+                    })
+                    .unwrap_or(false)
+        })
+    }
+
     /// The DRM command `packet` is in flight on this channel, or failed on it.
     pub(crate) fn owns_packet(&self, packet: &Arc<Packet>) -> bool {
         Iterator::chain(self.active.iter(), self.failed.iter()).any(|active| {
@@ -859,6 +1122,51 @@ impl Channel {
                 .as_ref()
                 .is_some_and(|own| Arc::ptr_eq(own, packet))
         })
+    }
+
+    /// The DRM commands in flight, oldest first, for recovery attribution (`recovery::Queues`);
+    /// the qualification's own kicks carry none and take no part.
+    fn commands(&self) -> impl Iterator<Item = (&Ticket, &Arc<Packet>)> {
+        self.active
+            .iter()
+            .filter_map(|active| Some((&active.ticket, active.packet.as_ref()?)))
+    }
+    pub(crate) fn oldest_spared(&self) -> Option<bool> {
+        self.commands()
+            .next()
+            .map(|(_, packet)| packet.completion.spared())
+    }
+    /// A recovery record names this queue and the completion stamp of the kick it interrupted,
+    /// `kick << 8` like the queue's stamp. Without a stamp match the oldest kick in flight is
+    /// marked, as on Neo (`queue::compute::Queue::note_interrupted`).
+    pub(crate) fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted {
+        let sequence = stamp >> 8;
+        if let Some((_, packet)) = self
+            .commands()
+            .find(|(ticket, _)| (ticket.kick as u32) & 0xff_ffff == sequence)
+        {
+            packet.completion.note_interrupted();
+            return recovery::Interrupted::Exact;
+        }
+        match self.commands().next() {
+            Some((_, packet)) => {
+                packet.completion.note_interrupted();
+                recovery::Interrupted::Oldest
+            }
+            None => recovery::Interrupted::None,
+        }
+    }
+    pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
+        for (_, packet) in self.commands() {
+            visit(packet.completion.status());
+        }
+    }
+    pub(crate) fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
+        for (_, packet) in self.commands() {
+            packet
+                .completion
+                .classify(class(packet.completion.status()));
+        }
     }
 
     /// The inner item ring's cursors.
@@ -951,9 +1259,10 @@ impl Channel {
     }
 
     /// Installs the queue: its pool row, the initial configuration, the QID, and the first outer
-    /// slot naming it, then waits for the firmware to consume the configuration. From the
-    /// publication on the channel is retained whatever happens; a failed installation leaves it
-    /// quarantined.
+    /// slot naming it. The firmware's consumption of the configuration is awaited off the device
+    /// mutex ([`Self::install_consumed`]). From the publication on the channel is retained
+    /// whatever happens; a failed installation leaves it quarantined. EAGAIN: no outer slot yet,
+    /// and nothing was published.
     pub(crate) fn install(&mut self, host: &mut Host<'_>) -> Result {
         if self.installed {
             return Err(EINVAL);
@@ -969,35 +1278,54 @@ impl Channel {
         // The installation names the context's scheduler page: its close releases it.
         self.context.mark_published();
         self.class = self.context.policy().priority();
-        let result = (|| {
-            self.lane.expose(host.port, claim, 1, true, None)?;
-            Lane::await_install(host.crashed, &[&self.lane], |lane| {
-                Ok(lane.cursors()?.consumer == 1)
-            })
-        })();
+        let result = self
+            .lane
+            .expose(host.port, claim, 1, true, None)
+            .map(|_| ());
         if let Err(error) = result {
             self.quarantine = Some(error);
         }
         result
     }
 
-    /// Backed blocks of the lane's pool.
-    pub(crate) fn pool_blocks(&self) -> usize {
-        self.pool.blocks()
+    /// Whether the firmware consumed the installation's configuration ([`Self::install`]); an
+    /// adopted lane's binding has none and is consumed at once. A crash, or the configuration
+    /// still unconsumed once the wait `expired` ([`INSTALL_WAIT_MS`]), quarantines the channel.
+    pub(crate) fn install_consumed(&mut self, crashed: &AtomicBool, expired: bool) -> Result<bool> {
+        if let Some(error) = self.quarantine {
+            return Err(error);
+        }
+        if self.rebound.is_some() || self.lane.cursors()?.consumer == 1 {
+            return Ok(true);
+        }
+        let error = match () {
+            _ if crashed.load(Ordering::Acquire) => EIO,
+            _ if expired => ETIMEDOUT,
+            _ => return Ok(false),
+        };
+        self.quarantine = Some(error);
+        Err(error)
     }
 
-    /// Grows the lane's pool to `blocks` before the command that needs them is published. A
-    /// kick queue whose private-memory pool changed is reconfigured at the submission, and
-    /// only on an empty queue; S grows an idle M5 queue's pool by releasing it
-    /// and re-arming fresh backing (S `begin_growth`, `finish_growth`). So: EAGAIN until the
-    /// lane is idle (the witnesses of [`Self::parkable`] but the close). Then the fresh backing
-    /// and its client view are built (ENOMEM if they cannot be, and nothing changed), the
-    /// firmware's registration of the pool is released (FreeListRelease) and its consumption
-    /// awaited, the backing installed with its page-pool row and the client's view replaced,
-    /// and the next kick rebinds the pool with its configuration update, as an adopted lane's
-    /// first kick does. A release the firmware does not consume quarantines the channel, as
-    /// does any failure after it. Returns the old backing and its view, which the caller drops
-    /// off the device mutex. A grown pool stays grown with its lane.
+    /// Whether a command whose plan needs `blocks` must back the pool first ([`Self::grow`]):
+    /// it is smaller, vacant, or being released.
+    pub(crate) fn needs_pool(&self, blocks: usize) -> bool {
+        self.pool_state.phase != PoolPhase::Populated || blocks > self.pool.blocks()
+    }
+
+    /// Backs the lane's pool for a command whose plan needs `blocks`, before that command is
+    /// published, through the release transaction of a Neo compute queue's growth
+    /// (`queue::compute::Queue::begin_growth`, `finish_growth`). A kick queue whose
+    /// private-memory pool changed is reconfigured at the submission, only on an empty queue
+    ///. So: EAGAIN until the lane is idle; then the pool's registration is
+    /// released (FreeListRelease, announced through `notify`) and EAGAIN again until the
+    /// firmware consumed it, the publication loop waiting on the event worker's progress, as
+    /// Neo's growth does. Once the pool is vacant, fresh backing for `blocks` (at least a fresh
+    /// pool's) and its client view are built (ENOMEM refuses this command only; the pool stays
+    /// vacant), installed with its page-pool row, and the next kick registers the pool with its
+    /// configuration update, as an adopted lane's first kick does. A failure after the release
+    /// quarantines the channel. Returns the old backing and view, which the caller drops off
+    /// the device mutex.
     pub(crate) fn grow(
         &mut self,
         alloc: &Allocator<'_>,
@@ -1011,64 +1339,42 @@ impl Channel {
         if !self.installed || self.closed || blocks > self.gpu.max_pool_blocks {
             return Err(EINVAL);
         }
-        if blocks <= self.pool.blocks() {
+        if !self.needs_pool(blocks) {
             return Ok(None);
         }
-        if self.faulted || !self.active.is_empty() || !self.failed.is_empty() {
+        if self.pool_state.phase == PoolPhase::Populated {
+            let next = self.lane.kick.timestamp();
+            if self.faulted
+                || !self.active.is_empty()
+                || !self.failed.is_empty()
+                || !self.lane.idle_at(self.lane.cursors()?.producer)?
+                || self.pool.completed_submissions()? != self.pool.submitted()?
+                || (next.get() != KickTimestamp::FIRST.get()
+                    && !retirement::stamp_covers(self.stamp()?, next.prev().get()))
+            {
+                return Err(EAGAIN);
+            }
+            if self.pool_state.release(host.init, &self.pool)? {
+                notify()?;
+                return Err(EAGAIN);
+            }
+        }
+        fence(Ordering::Acquire);
+        let consumer = host.init.control_consumer()?.load(Ordering::Relaxed);
+        let producer = host.init.control_producer()?.load(Ordering::Relaxed);
+        self.pool_state.observe(consumer, producer)?;
+        if self.pool_state.phase != PoolPhase::Vacant {
             return Err(EAGAIN);
         }
-        let next = self.lane.kick.timestamp();
-        if !self.lane.idle_at(self.lane.cursors()?.producer)?
-            || self.pool.completed_submissions()? != self.pool.submitted()?
-            || (next.get() != KickTimestamp::FIRST.get()
-                && !retirement::stamp_covers(self.stamp()?, next.prev().get()))
-        {
-            return Err(EAGAIN);
-        }
+        let target = blocks.max(self.gpu.pool_blocks);
         let geometry =
-            fw::m5::pool::PoolGeometry::of(blocks, self.gpu.block_bytes()).map_err(|_| EINVAL)?;
+            fw::m5::pool::PoolGeometry::of(target, self.gpu.block_bytes()).map_err(|_| EINVAL)?;
         let no_memory = |error: Error| if error == EINVAL { error } else { ENOMEM };
         let fresh = M5Backing::new(alloc, self.qid(), geometry).map_err(no_memory)?;
         let view = fresh.map_client(self.context.vm()).map_err(no_memory)?;
-        let old_va = self.pool.backing_va();
-        let index = self
-            .aliases
-            .iter()
-            .position(|alias| alias.iova() == old_va)
-            .ok_or(EIO)?;
-        // The firmware registered the pool with the lane's first kick: release that
-        // registration (generation 1, as every binding publishes it) before the backing moves.
-        if self.kicks() != 0 {
-            let cursor = Rings::publish_control(
-                host.init,
-                &ControlRecord::FreeListRelease(self.pool.release_record(1)),
-            )?;
-            let result = (|| {
-                notify()?;
-                for _ in 0..INSTALL_POLLS {
-                    if host.crashed.load(Ordering::Acquire) {
-                        return Err(EIO);
-                    }
-                    fence(Ordering::Acquire);
-                    let consumer = host.init.control_consumer()?.load(Ordering::Relaxed);
-                    let producer = host.init.control_producer()?.load(Ordering::Relaxed);
-                    if control_consumed(consumer, producer, cursor)? {
-                        return Ok(());
-                    }
-                    fsleep(Delta::from_millis(1));
-                }
-                Err(ETIMEDOUT)
-            })();
-            if let Err(error) = result {
-                pr_warn!(
-                    "G17 M5: lane {}: pool release not consumed: {:?}\n",
-                    self.qid(),
-                    error
-                );
-                self.quarantine = Some(error);
-                return Err(error);
-            }
-        }
+        self.aliases.reserve(1, GFP_KERNEL)?;
+        let old_va = self.pool.backing_va().ok();
+        let from = self.pool.blocks();
         let result = (|| {
             let old = self.pool.rearm(fresh)?;
             host.init
@@ -1084,19 +1390,37 @@ impl Channel {
                 return Err(error);
             }
         };
-        let old_view = core::mem::replace(&mut self.aliases[index], view);
-        self.pool_rebind = true;
+        let index = old_va.and_then(|va| self.aliases.iter().position(|alias| alias.iova() == va));
+        let old_view = match index {
+            Some(index) => Some(core::mem::replace(&mut self.aliases[index], view)),
+            None => {
+                self.aliases
+                    .push_within_capacity(view)
+                    .map_err(|_| ENOMEM)?;
+                None
+            }
+        };
+        self.pool_state.phase = PoolPhase::Populated;
         pr_info!(
-            "M5 lane {}: pool grew from {} to {} blocks for queue {}\n",
+            "M5 lane {}: pool backed with {} blocks (from {}) for queue {}\n",
             self.qid(),
-            old.blocks(),
-            blocks,
+            target,
+            from,
             self.owner
         );
         Ok(Some(Grown {
             _view: old_view,
             _backing: old,
         }))
+    }
+
+    /// A release of the pool is in flight (the event worker reports its consumption as
+    /// progress).
+    pub(crate) fn pool_release_pending(&self) -> bool {
+        self.pool_state.pending()
+    }
+    pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
+        self.pool_state.stalled(now)
     }
 
     /// The one M5 publication transaction: descriptor, notification and kick entry, the inner
@@ -1125,12 +1449,16 @@ impl Channel {
         let policy = self.context.policy();
         let cursors = self.cursors()?;
         let first = self.ordinal == 0;
-        let items = if first || self.pool_rebind { 2 } else { 1 };
+        let items = if first || !self.pool_state.registered {
+            2
+        } else {
+            1
+        };
         if (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count < items {
             return Err(EAGAIN);
         }
-        // A command that needs a larger pool grows it first ([`Self::grow`]).
-        if dispatch.resources.pool_blocks > self.pool.blocks() {
+        // A command that needs a larger pool, or a pool at all, backs it first ([`Self::grow`]).
+        if self.needs_pool(dispatch.resources.pool_blocks) {
             return Err(EINVAL);
         }
         let claim = host.port.reserve_compute(policy.priority())?;
@@ -1184,10 +1512,10 @@ impl Channel {
             })?;
         // The first kick binds the pool with the context; a later one rebinds a grown pool, the
         // queue's completion value continuing.
-        let update = match (first, self.pool_rebind) {
+        let update = match (first, self.pool_state.registered) {
             (true, _) => Some(self.config(false, Some(0))?),
-            (false, true) => Some(self.config(false, None)?),
-            (false, false) => None,
+            (false, false) => Some(self.config(false, None)?),
+            (false, true) => None,
         };
         let target = self
             .lane
@@ -1233,7 +1561,8 @@ impl Channel {
         // From here on the firmware may see this kick: the pool counter names it, and the
         // queue may be running earlier kicks that read the cursors.
         prepared.commit();
-        self.pool_rebind = false;
+        let published = host.port.next_publication();
+        self.pool_state.registered = true;
         if let Some(packet) = &packet {
             packet.mark_published();
         }
@@ -1284,6 +1613,7 @@ impl Channel {
                 work: work.clone(),
                 packet,
                 observed: None,
+                published,
             })
             .map_err(|_| ENOMEM)?;
         match result {
@@ -1324,23 +1654,22 @@ impl Channel {
     }
 
     /// Retires the kicks the scan of `batch` completed, oldest first, reporting each to
-    /// `retired`; `generation` and `state` are the device's recovery generation and state. A kick
-    /// whose witnesses are missing or disagree stays in flight, for the scheduler's bounded
-    /// timeout to fail. A zero-duration record (the firmware failed the kick) or a kick that
-    /// crossed a recovery quarantines the channel ([`Self::fail`]).
+    /// `retired`; `state` is the device's recovery state. A kick whose witnesses are missing or
+    /// disagree stays in flight, for the scheduler's bounded timeout to fail. A zero-duration
+    /// record (the firmware failed the kick) or a fault the firmware reported on this queue
+    /// quarantines the channel ([`Self::fail`]).
     pub(crate) fn retire(
         &mut self,
         batch: &mut Batch,
-        generation: u64,
         state: u32,
         complete_qos: &mut impl FnMut(qos::Owner) -> Result,
         retired: &mut impl FnMut(Retired) -> Result,
     ) -> Result {
         if self.quarantine.is_some() {
-            return Ok(());
+            return self.rehabilitate(state, retired);
         }
         if self.faulted {
-            return self.fail(EIO, retired);
+            return self.fail(EIO, Failure::Settled, retired);
         }
         for active in self
             .active
@@ -1349,11 +1678,23 @@ impl Channel {
         {
             active.observed = batch.take(&active.ticket)?;
         }
+        self.retire_pending = false;
         while let Some(front) = self.active.first() {
-            match self.check(front, generation, state) {
+            match self.check(front, state) {
                 Ok(Some(timestamps)) => {
                     complete_qos(self.qos_owner())?;
+                    // Reported before the channel gives the kick up, as Neo's release does
+                    // (`Pair::release_witnessed`): a refused report leaves it owned here.
+                    retired(Retired {
+                        ticket: front.ticket,
+                        packet: front.packet.clone(),
+                        result: Ok(timestamps),
+                        drained: false,
+                    })?;
                     let front = self.active.remove(0).map_err(|_| EINVAL)?;
+                    // The GPU is retiring work: a watchdog of a queue beside it renews
+                    // (`timeout::renew_shared`), as for a Neo compute queue's retirement.
+                    crate::g17::recovery::note_retired();
                     // DRM kicks only: the qualification's thousands of kicks carry no packet.
                     if front.packet.is_some()
                         && crate::module_parameters::m5_trace_completions.value() != 0
@@ -1367,14 +1708,21 @@ impl Channel {
                             timestamps[1],
                         );
                     }
-                    retired(Retired {
-                        ticket: front.ticket,
-                        packet: front.packet,
-                        result: Ok(timestamps),
-                    })?;
                 }
-                Ok(None) => break,
-                Err(error) => return self.fail(error, retired),
+                Ok(None) => {
+                    self.retire_pending = self.front_finished();
+                    break;
+                }
+                // A zero-duration record is the firmware's own failure of the kick (ENODATA,
+                // `retirement::poll`); any other error is a witness that cannot be read.
+                Err(error) => {
+                    let failure = if error == ENODATA {
+                        Failure::Settled
+                    } else {
+                        Failure::Ambiguous
+                    };
+                    return self.fail(error, failure, retired);
+                }
             }
         }
         Ok(())
@@ -1387,12 +1735,9 @@ impl Channel {
     /// launched work, which neither a flush-only stream nor a dispatch of an empty grid
     /// (CTS `indirect_dispatch.upload_buffer.empty_command`) does. Where it wrote them they are
     /// checked against the record as a diagnostic.
-    fn check(&self, active: &Active, generation: u64, state: u32) -> Result<Option<[u64; 2]>> {
+    fn check(&self, active: &Active, state: u32) -> Result<Option<[u64; 2]>> {
         if state != 0 {
             return Ok(None);
-        }
-        if generation != active.ticket.epoch {
-            return Err(EIO);
         }
         let stamp = self.stamp()?;
         let Some(timestamps) = retirement::poll(
@@ -1430,28 +1775,97 @@ impl Channel {
     }
 
     /// Quarantines the channel with `error` and fails every kick in flight. The kicks stay
-    /// owned by the channel, pinning their commands: no release of a failed M5 kick is
-    /// established, so its memory is never handed back while the session runs.
+    /// owned by the channel, pinning their commands, until they drain: a [`Failure::Settled`]
+    /// one ends there ([`Self::rehabilitate`]); others keep the kicks and the quarantine for the
+    /// session.
     pub(crate) fn fail(
         &mut self,
         error: Error,
+        failure: Failure,
         retired: &mut impl FnMut(Retired) -> Result,
     ) -> Result {
+        self.awaiting_drain = failure.awaits_drain(self.quarantine.is_none(), self.awaiting_drain);
         self.quarantine.get_or_insert(error);
         let error = self.quarantine.unwrap_or(error);
         self.failed.reserve(self.active.len(), GFP_KERNEL)?;
-        while !self.active.is_empty() {
-            let active = self.active.remove(0).map_err(|_| EINVAL)?;
-            let report = Retired {
-                ticket: active.ticket,
-                packet: active.packet.clone(),
+        while let Some(front) = self.active.first() {
+            // Reported before the kick moves to `failed`, as Neo reports before it gives a command
+            // up (`Pair::release_witnessed`); the channel owns it either way.
+            retired(Retired {
+                ticket: front.ticket,
+                packet: front.packet.clone(),
                 result: Err(error),
-            };
+                drained: false,
+            })?;
+            let active = self.active.remove(0).map_err(|_| EINVAL)?;
             self.failed
                 .push_within_capacity(active)
                 .map_err(|_| ENOMEM)?;
-            retired(report)?;
         }
+        Ok(())
+    }
+
+    /// Every failed kick retired exactly, with recovery closed (`state`): the stamp covers the
+    /// newest, the inner ring is consumed to its producer, the pool's count is complete and each
+    /// kick's work node drained. The firmware names nothing of them any more.
+    fn drained(&self, state: u32) -> Result<bool> {
+        if state != 0
+            || !self.lane.idle_at(self.lane.cursors()?.producer)?
+            || self.pool.completed_submissions()? != self.pool.submitted()?
+        {
+            return Ok(false);
+        }
+        if let Some(newest) = self.failed.last() {
+            if !retirement::stamp_covers(self.stamp()?, newest.ticket.kick) {
+                return Ok(false);
+            }
+        }
+        for failed in self.failed.iter() {
+            if !failed.work.drained()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Ends a settled failure's quarantine once its kicks drained ([`Self::drained`]), as a Neo
+    /// pair's exact drain ends its quarantine (`Pair::release_witnessed`): each kick is reported
+    /// drained with its error, in Neo's order (`Deferred::Drained`: the pinned command released,
+    /// then a fence the failure never reached failed), and only then given up; the channel is
+    /// healthy again and a closed one parks. Witnesses that cannot be read make the failure
+    /// Ambiguous: the quarantine stays, and so do the kicks, pinned.
+    fn rehabilitate(&mut self, state: u32, retired: &mut impl FnMut(Retired) -> Result) -> Result {
+        if !self.awaiting_drain {
+            return Ok(());
+        }
+        match self.drained(state) {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(error) => {
+                pr_warn!("G17 M5: lane {}: its failed kicks' drain witnesses unreadable ({:?}); the lane stays quarantined\n",
+                    self.qid(), error);
+                self.awaiting_drain = false;
+                return Ok(());
+            }
+        }
+        let error = self.quarantine.unwrap_or(EIO);
+        while let Some(front) = self.failed.first() {
+            retired(Retired {
+                ticket: front.ticket,
+                packet: front.packet.clone(),
+                result: Err(error),
+                drained: true,
+            })?;
+            self.failed.remove(0).map_err(|_| EINVAL)?;
+        }
+        self.quarantine = None;
+        self.awaiting_drain = false;
+        self.faulted = false;
+        pr_info!(
+            "G17 M5: lane {}: its failed kicks ({:?}) drained; the lane returns\n",
+            self.qid(),
+            error
+        );
         Ok(())
     }
 

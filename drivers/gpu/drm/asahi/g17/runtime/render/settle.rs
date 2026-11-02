@@ -146,14 +146,7 @@ impl crate::g17::Firmware {
             .find(|pair| pair.qids().contains(&qid))
             .and_then(|pair| pair.oldest_packet());
         if let Some(packet) = packet {
-            // Unclassified work counts as innocent, and a blamed group must never be replayed.
-            // Work an earlier recovery spared is collateral here (classify() blames before its
-            // collateral check) and stays spared, so its failure stays non-sticky; the blame
-            // itself is recorded apart from the class, and refuses any replay of it.
-            packet.completion.note_blamed();
-            if !packet.completion.spared() {
-                packet.completion.classify(crate::g17::recovery::Class::Guilty);
-            }
+            packet.completion.settle_blamed();
             self.fail_render_packet(&packet, error, deferred)?;
         }
         Ok(())

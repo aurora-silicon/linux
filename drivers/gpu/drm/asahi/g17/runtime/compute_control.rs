@@ -21,21 +21,27 @@ impl Backend {
             };
             firmware.scan_compute(None, &mut deferred)?;
             // Each queue is locked on its own: release this one before visiting the others.
-            let Some(own) = firmware.queues.compute(self.owner)
+            let own = firmware.queues.compute(self.owner)
                 .filter(|queue| queue.can_classify_timeout(packet))
-                .and_then(|queue| queue.timeout_head()) else {
+                .and_then(|queue| queue.timeout_head());
+            // An M5 queue's work runs on its channel.
+            let m5 = |queues: &super::Registry| queues.m5.iter()
+                .position(|channel| channel.owner() == self.owner);
+            let own = own.or_else(|| {
+                let channel = &firmware.queues.m5[m5(&firmware.queues)?];
+                channel.can_classify_timeout(packet).then(|| channel.timeout_head()).flatten()
+            });
+            let Some(own) = own else {
                 return Ok(Decision::Own);
             };
-            let computes = firmware.queues.compute.iter().flatten()
-                .filter_map(|entry| entry.queue.as_deref())
-                .filter(|other| other.owner() != Some(self.owner))
-                .filter_map(|other| other.timeout_head());
-            let others = Iterator::chain(computes, firmware.queues.render_timeout_heads());
-            let verdict = timeout::attribute(own, renewals, others);
+            let verdict = timeout::attribute(own, renewals, firmware.queues.timeout_heads());
             let decision = verdict.decision;
             if decision == Decision::Spare {
-                firmware.queues.compute(self.owner).ok_or(EIO)?
-                    .classify(&|_| Class::Spared);
+                match firmware.queues.compute(self.owner) {
+                    Some(queue) => queue.classify(&|_| Class::Spared),
+                    None => firmware.queues.m5[m5(&firmware.queues).ok_or(EIO)?]
+                        .classify(&|_| Class::Spared),
+                }
             }
             if let Some(blocker) = verdict.reported_blocker(renewals) {
                 dev_warn!(self.shared.dev.as_ref(),

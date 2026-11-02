@@ -18,7 +18,7 @@
 
 use super::{
     compute::retirement,
-    m5::{Host, Lane},
+    m5::{Failure, Host, Lane},
 };
 use crate::g17::{
     buffer::{self, target, BlockGeometry},
@@ -40,7 +40,8 @@ use crate::g17::{
     job::Packet,
     kick,
     object::{Allocator, CpuMap, KernelObject, Placement},
-    qos,
+    qos, recovery,
+    status::VmStatus,
     vm_layout::Domain,
 };
 use crate::{hw::t8140::resources as cfg, mmu};
@@ -165,6 +166,18 @@ pub(crate) struct Pair {
     unmapped: super::m5::Unmapped,
     active: Option<Active>,
     quarantine: Option<Error>,
+    /// The quarantine is a settled failure of the pass in flight (recovery blamed or cancelled
+    /// it: the firmware restarted and resumed it): the pair's state is not in doubt, so the pass's
+    /// exact retirement, every [`Self::retire`] witness holding, is the drain witness that ends the
+    /// quarantine, as a Neo pair's exact drain ends its slot's
+    /// (`Completion::release_after_retirement`). A quarantine from a failure after a
+    /// firmware-visible store, a timeout or another pass's VM failure stays, as does one whose
+    /// context's release was consumed before the drain ([`Self::end_drain_wait`]). The failed
+    /// pass keeps its render lease, quarantined, until it retires (Neo's
+    /// `Completion::quarantine_render`); while the drain is awaited the firmware is still running
+    /// the pass, so its footprint keeps ordering overlapping renders
+    /// (`Completion::quarantine_resumed_render`).
+    awaiting_drain: bool,
 }
 
 /// An installed render pair without an owner: both lanes, the storage they name across owners,
@@ -221,6 +234,9 @@ pub(crate) struct Draw<'a> {
 pub(crate) struct Retired {
     pub(crate) packet: Option<Arc<Packet>>,
     pub(crate) times: [u64; 4],
+    /// The pass had failed (`Pair::fail`): its error is reported again with the release, so that
+    /// a fence its failure never reached signals that error, not success.
+    pub(crate) failed: Option<Error>,
 }
 
 /// What one pair is built for: its queues and the GPU it runs on, and its first binding.
@@ -462,6 +478,7 @@ impl Pair {
                 unmapped: super::m5::Unmapped::new()?,
                 active: None,
                 quarantine: None,
+                awaiting_drain: false,
             },
             GFP_KERNEL,
         )?;
@@ -542,6 +559,7 @@ impl Pair {
                 unmapped,
                 active: None,
                 quarantine: None,
+                awaiting_drain: false,
             },
         );
         if let Err(error) = pair.publish_mappings() {
@@ -606,8 +624,10 @@ impl Pair {
         );
     }
 
-    /// The pair needs nothing more before its context's release: parkable, or quarantined
-    /// (leaked, never reused) with the firmware idle on both rings.
+    /// The pair needs nothing more before its context's release: parkable, or quarantined with
+    /// the firmware idle on both rings. A drain still awaited does not hold the release back, as
+    /// for a compute lane (`Channel::settled`): the context's healthy lanes park, and this pair
+    /// parks only if its pass drained before the release was consumed.
     pub(crate) fn settled(&self) -> Result<bool> {
         if self.quarantine.is_none() {
             return self.parkable();
@@ -985,6 +1005,13 @@ impl Pair {
     pub(crate) fn has_room(&self) -> bool {
         self.active.is_none()
     }
+    /// The event worker polls this pair's retirement: a healthy pass in flight. A quarantined
+    /// pair's pass is not in flight, as a quarantined Neo queue's commands are not
+    /// (`Queue::in_flight`): each event pass checks its drain ([`Self::retire`]) without keeping
+    /// the worker polling, so the idle check can reach idle.
+    pub(crate) fn polls(&self) -> bool {
+        self.active.is_some() && self.quarantine.is_none()
+    }
     pub(crate) fn in_flight(&self) -> bool {
         self.active.is_some()
     }
@@ -1315,14 +1342,21 @@ impl Pair {
 
     /// Retires the pass in flight once every witness holds (S's predicate): the work node
     /// drained, both stage stamps at the pass's stamp, both lanes idle at their targets and the
-    /// pool's completed count at the pass's target. `complete` closes the pass's QoS.
+    /// pool's completed count at the pass's target. `complete` closes the pass's QoS. Nothing
+    /// retires while a recovery runs (`state`, the device's recovery state): recovery marks the
+    /// passes it interrupted before the firmware resumes them (`Self::note_interrupted`).
     pub(crate) fn retire(
         &mut self,
+        state: u32,
         complete: &mut dyn FnMut(&[qos::Owner]) -> Result,
-    ) -> Result<Option<Retired>> {
+        retired: &mut dyn FnMut(Retired) -> Result,
+    ) -> Result {
         let Some(active) = self.active.as_ref() else {
-            return Ok(None);
+            return Ok(());
         };
+        if state != 0 {
+            return Ok(());
+        }
         fence(Ordering::Acquire);
         let support = &self.support;
         let stamps = [
@@ -1335,9 +1369,11 @@ impl Pair {
             && self.lanes[FRAGMENT].idle_at(active.targets[FRAGMENT])?
             && self.pool.completed_submissions()? == active.pool_target;
         if !done {
-            return Ok(None);
+            return Ok(());
         }
-        let active = self.active.take().ok_or(EINVAL)?;
+        // Neo's order (`Pair::account_drained`, `release_witnessed`): every fallible step and the
+        // report come before the pair gives the pass up and ends its quarantine; an error leaves
+        // the pass in flight, for `Registry::retire_m5` to fail (Ambiguous).
         complete(&active.qos)?;
         self.storage.manager.retire_scene(active.ordinal)?;
         self.storage.target.retire(active.ordinal)?;
@@ -1348,10 +1384,58 @@ impl Pair {
                 .dword(TIMES + slot * 32 + index * 8)?
                 .load(Ordering::Relaxed);
         }
-        Ok(Some(Retired {
-            packet: active.packet,
+        let failed = self.quarantine;
+        retired(Retired {
+            packet: active.packet.clone(),
             times,
-        }))
+            failed,
+        })?;
+        self.active = None;
+        if failed.is_none() {
+            // The GPU is retiring work: a watchdog of a queue beside it renews
+            // (`timeout::renew_shared`), as for a Neo render's retirement.
+            crate::g17::recovery::note_retired();
+        }
+        if self.awaiting_drain {
+            // The failed pass drained exactly: the firmware is done with the pair.
+            self.awaiting_drain = false;
+            self.quarantine = None;
+            pr_info!(
+                "G17 M5: render pair {:?}: its failed pass ({:?}) drained; the pair returns\n",
+                self.qids(),
+                failed
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a settled failure's drain is awaited.
+    pub(crate) fn awaiting_drain(&self) -> bool {
+        self.awaiting_drain
+    }
+
+    /// The context's scheduler release was consumed while this pair still awaited its failed
+    /// pass's drain, with the firmware idle on both rings ([`Self::settled`]): no witness of the
+    /// drain can come any more (on M5 a kill's acknowledgement does not prove the firmware
+    /// finished reading, S `queue/compute/exit.rs` `settle_exit`), so the pair stays quarantined,
+    /// leaked under the cap, the pass pinned with its lease, and the firmware no longer runs
+    /// the pass: its footprint stops ordering others (`Completion::quarantine_render`). Returns
+    /// whether a wait ended.
+    pub(crate) fn end_drain_wait(&mut self) -> bool {
+        if !self.awaiting_drain {
+            return false;
+        }
+        self.awaiting_drain = false;
+        if let Some(packet) = self
+            .active
+            .as_ref()
+            .and_then(|active| active.packet.as_ref())
+        {
+            packet.completion.quarantine_render();
+        }
+        pr_warn!("G17 M5: render pair {:?}: its context was released before its failed pass drained; the pair stays quarantined\n",
+            self.qids());
+        true
     }
 
     /// The witnesses of the pass in flight against what retirement waits for, for a
@@ -1378,9 +1462,25 @@ impl Pair {
     }
 
     /// Fails the pass in flight with `error` and quarantines the pair; its command stays pinned
-    /// by the pair. Returns that command the first time, for its fence.
-    pub(crate) fn fail(&mut self, error: Error) -> Option<Arc<Packet>> {
+    /// by the pair, with its render lease quarantined, as Neo quarantines a failed render before
+    /// deferring its error (`Completion::quarantine_render`). Returns that command the first
+    /// time, for its fence. A first [`Failure::Settled`] lets the pass's drain end the quarantine
+    /// ([`Self::awaiting_drain`]); until then the firmware runs the pass on, so its lease keeps
+    /// its footprint (`Completion::quarantine_resumed_render`). The lease goes at the drain
+    /// (`Completion::release_after_retirement`).
+    pub(crate) fn fail(&mut self, error: Error, failure: Failure) -> Option<Arc<Packet>> {
         let first = self.quarantine.is_none();
+        self.awaiting_drain = failure.awaits_drain(first, self.awaiting_drain);
+        if let Some(packet) = self
+            .active
+            .as_ref()
+            .and_then(|active| active.packet.as_ref())
+        {
+            match self.awaiting_drain {
+                true => packet.completion.quarantine_resumed_render(),
+                false => packet.completion.quarantine_render(),
+            }
+        }
         self.quarantine.get_or_insert(error);
         match first {
             true => self
@@ -1395,6 +1495,54 @@ impl Pair {
             .as_ref()
             .and_then(|active| active.packet.as_ref())
             .is_some_and(|own| Arc::ptr_eq(own, packet))
+    }
+}
+
+/// Recovery attribution (`recovery::Queues`), as a Neo render pair takes part in it. A pair
+/// runs one pass at a time, so its pass in flight is its oldest; the qualification's own
+/// passes carry no command and take no part.
+impl Pair {
+    fn command(&self) -> Option<&Arc<Packet>> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.packet.as_ref())
+    }
+    /// The DRM command of the pass in flight, which a blamed QID of this pair fails.
+    pub(crate) fn oldest_packet(&self) -> Option<Arc<Packet>> {
+        self.command().cloned()
+    }
+    pub(crate) fn oldest_spared(&self) -> Option<bool> {
+        self.command().map(|packet| packet.completion.spared())
+    }
+    /// A recovery record names one of this pair's queues and the completion stamp of the pass
+    /// it interrupted, `(ordinal + 1) << 8` like the pair's stamps. The firmware may resume
+    /// that pass after the restart and leave every retirement witness looking like success;
+    /// marked, it retires failed (`Completion::complete`). Without a stamp match the pass in
+    /// flight is marked anyway: it is the pair's only one.
+    pub(crate) fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted {
+        let Some(active) = self.active.as_ref() else {
+            return recovery::Interrupted::None;
+        };
+        let Some(packet) = active.packet.as_ref() else {
+            return recovery::Interrupted::None;
+        };
+        packet.completion.note_interrupted();
+        match active.stamp == stamp {
+            true => recovery::Interrupted::Exact,
+            false => recovery::Interrupted::Oldest,
+        }
+    }
+    pub(crate) fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
+        if let Some(packet) = self.command() {
+            visit(packet.completion.status());
+        }
+    }
+    pub(crate) fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
+        if let Some(packet) = self.command() {
+            packet
+                .completion
+                .classify(class(packet.completion.status()));
+        }
     }
 }
 

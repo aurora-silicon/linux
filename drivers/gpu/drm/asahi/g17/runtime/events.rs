@@ -161,6 +161,133 @@ impl recovery::Memory for Service<'_> {
     }
 }
 
+/// One queue's retained work as recovery attributes it ([`recovery::Queues`]). Every kind of
+/// queue that holds firmware-visible work implements it, and [`Registry::visit_retained`] walks
+/// them all, so attribution and the interrupted marks cannot miss a kind. (M5's lanes once did:
+/// a pass the firmware resumed after a restart retired as a success.)
+pub(super) trait Retained {
+    fn owns(&self, qid: u8) -> bool;
+    /// Whether its oldest work in flight is spared; None without any.
+    fn oldest_spared(&self) -> Option<bool>;
+    fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted;
+    fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>));
+    fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class);
+    /// A render pair's QIDs when its oldest work is spared, for `settle_cancelled_renders`.
+    fn spared_render(&self) -> u128 {
+        0
+    }
+    /// Recovery found the firmware's blame of this queue's render QID guilty
+    /// (`recovery::Queues::settle_blamed_render`). Neo's pairs settle through
+    /// `Firmware::settle_blamed_render`, which needs their render slot.
+    fn settle_blamed_render(&mut self, _error: Error, _deferred: &mut DeferredBatch) -> Result {
+        Ok(())
+    }
+    /// The same for a compute QID (`recovery::Queues::settle_blamed_compute`). Neo's compute
+    /// queues settle through the firmware's compute-fault event.
+    fn settle_blamed_compute(&mut self, _error: Error, _deferred: &mut DeferredBatch) -> Result {
+        Ok(())
+    }
+    /// The recovery table cancelled render QIDs `qids`
+    /// (`recovery::Queues::settle_cancelled_renders`). Neo's pairs settle through
+    /// `Firmware::settle_cancelled_renders`.
+    fn settle_cancelled_render(&mut self, _qids: u128, _deferred: &mut DeferredBatch) -> Result {
+        Ok(())
+    }
+}
+
+fn render_qids(qids: [u8; 2], spared: Option<bool>) -> u128 {
+    match spared {
+        Some(true) => qids.into_iter().fold(0, |mask, qid| mask | 1u128 << qid),
+        _ => 0,
+    }
+}
+
+impl Retained for crate::g17::queue::render::Pair {
+    fn owns(&self, qid: u8) -> bool { self.qids().contains(&qid) }
+    fn oldest_spared(&self) -> Option<bool> { self.oldest_spared() }
+    fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted { self.note_interrupted(stamp) }
+    fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
+    fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
+    fn spared_render(&self) -> u128 { render_qids(self.qids(), self.oldest_spared()) }
+}
+
+impl Retained for crate::g17::queue::compute::Queue {
+    fn owns(&self, qid: u8) -> bool { self.qid() == qid }
+    fn oldest_spared(&self) -> Option<bool> { self.oldest_spared() }
+    fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted { self.note_interrupted(stamp) }
+    fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
+    fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
+}
+
+impl Retained for crate::g17::queue::m5::Channel {
+    fn settle_blamed_compute(&mut self, error: Error, deferred: &mut DeferredBatch) -> Result {
+        self.settle_blamed(error, deferred)
+    }
+    fn owns(&self, qid: u8) -> bool { self.qid() == qid }
+    fn oldest_spared(&self) -> Option<bool> { self.oldest_spared() }
+    fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted { self.note_interrupted(stamp) }
+    fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
+    fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
+}
+
+impl Retained for crate::g17::queue::m5_render::Pair {
+    fn settle_blamed_render(&mut self, error: Error, deferred: &mut DeferredBatch) -> Result {
+        self.settle_blamed(error, deferred)
+    }
+    fn settle_cancelled_render(&mut self, qids: u128, deferred: &mut DeferredBatch) -> Result {
+        self.settle_cancelled(qids, deferred)
+    }
+    fn owns(&self, qid: u8) -> bool { self.qids().contains(&qid) }
+    fn oldest_spared(&self) -> Option<bool> { self.oldest_spared() }
+    fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted { self.note_interrupted(stamp) }
+    fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
+    fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
+    fn spared_render(&self) -> u128 { render_qids(self.qids(), self.oldest_spared()) }
+}
+
+impl super::Registry {
+    /// Every queue holding firmware-visible work: Neo render pairs and compute queues, M5
+    /// compute channels and render pairs (bound ones; a parked lane holds none).
+    pub(super) fn visit_retained(&self, visit: &mut dyn FnMut(&dyn Retained)) {
+        for pair in self.render_pairs() {
+            visit(pair);
+        }
+        for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
+            visit(&*queue);
+        }
+        for channel in &self.m5 {
+            visit(&**channel);
+        }
+        for pair in &self.m5_render {
+            visit(&**pair);
+        }
+    }
+
+    /// Settles every queue [`Self::visit_retained`] walks, in the same order, through `settle`.
+    /// A failed queue does not skip the ones after it
+    /// (`recovery::Queues::publish_recovery_targets`): the first error is returned once all were
+    /// visited.
+    pub(super) fn settle_retained(
+        &mut self,
+        settle: &mut dyn FnMut(&mut dyn Retained) -> Result,
+    ) -> Result {
+        let mut failure = None;
+        for pair in self.render_pairs_mut() {
+            failure = failure.or(settle(pair).err());
+        }
+        for mut queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
+            failure = failure.or(settle(&mut *queue).err());
+        }
+        for channel in &mut self.m5 {
+            failure = failure.or(settle(&mut **channel).err());
+        }
+        for pair in &mut self.m5_render {
+            failure = failure.or(settle(&mut **pair).err());
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
 impl recovery::Queues for Service<'_> {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.firmware.queues.render_pass_started(qid, stamp)
@@ -186,73 +313,65 @@ impl recovery::Queues for Service<'_> {
         self.firmware.queues.render_scheduler_active() || !self.firmware.queues.teardown.is_empty()
     }
     fn oldest_spared(&self, qid: u8) -> Option<bool> {
-        self.firmware.queues.render_oldest_spared(qid).or_else(|| {
-            self.firmware
-                .queues
-                .compute
-                .iter()
-                .flatten()
-                .filter_map(|entry| entry.queue.as_deref())
-                .find(|queue| queue.qid() == qid)
-                .and_then(|queue| queue.oldest_spared())
-        })
+        let mut spared = None;
+        self.firmware.queues.visit_retained(&mut |queue| {
+            if spared.is_none() && queue.owns(qid) {
+                spared = queue.oldest_spared();
+            }
+        });
+        spared
     }
     fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
-        self.firmware.queues.visit_render_owners(qid, visit);
-        for queue in self
-            .firmware
-            .queues
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-        {
-            if queue.qid() == qid {
+        self.firmware.queues.visit_retained(&mut |queue| {
+            if queue.owns(qid) {
                 queue.visit_owners(visit);
             }
-        }
+        });
     }
     fn classify_work(&mut self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) -> u128 {
-        for queue in self
-            .firmware
-            .queues
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-        {
+        let mut spared = 0;
+        self.firmware.queues.visit_retained(&mut |queue| {
             queue.classify(class);
-        }
-        self.firmware.queues.classify_render(class)
+            spared |= queue.spared_render();
+        });
+        spared
     }
     fn note_interrupted(&mut self, qid: u8, stamp: u32) -> recovery::Interrupted {
-        let render = self.firmware.queues.note_render_interrupted(qid, stamp);
-        if render != recovery::Interrupted::None {
-            return render;
-        }
-        self.firmware
-            .queues
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .find(|queue| queue.qid() == qid)
-            .map_or(recovery::Interrupted::None, |queue| {
-                queue.note_interrupted(stamp)
-            })
+        let mut interrupted = recovery::Interrupted::None;
+        self.firmware.queues.visit_retained(&mut |queue| {
+            if interrupted == recovery::Interrupted::None && queue.owns(qid) {
+                interrupted = queue.note_interrupted(stamp);
+            }
+        });
+        interrupted
     }
     fn report_blamed_render(&self, qid: u8) {
         self.firmware.queues.report_render_recovery(qid, &self.firmware.port);
     }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
-        let result = self
-            .firmware
-            .settle_blamed_render(qid, error, self.deferred);
+        // Disjoint QIDs: each settlement runs whatever the other's result; the first error stays.
+        let neo = self.firmware.settle_blamed_render(qid, error, self.deferred);
+        let deferred = &mut *self.deferred;
+        let rest = self.firmware.queues.settle_retained(&mut |queue| match queue.owns(qid) {
+            true => queue.settle_blamed_render(error, deferred),
+            false => Ok(()),
+        });
+        self.settlement_error = self.settlement_error.or(neo.err()).or(rest.err());
+    }
+    fn settle_blamed_compute(&mut self, qid: u8, error: Error) {
+        let deferred = &mut *self.deferred;
+        let result = self.firmware.queues.settle_retained(&mut |queue| match queue.owns(qid) {
+            true => queue.settle_blamed_compute(error, deferred),
+            false => Ok(()),
+        });
         self.settlement_error = self.settlement_error.or(result.err());
     }
     fn settle_cancelled_renders(&mut self, qids: u128) {
-        let result = self.firmware.settle_cancelled_renders(qids, self.deferred);
-        self.settlement_error = self.settlement_error.or(result.err());
+        let neo = self.firmware.settle_cancelled_renders(qids, self.deferred);
+        let deferred = &mut *self.deferred;
+        let rest = self.firmware.queues
+            .settle_retained(&mut |queue| queue.settle_cancelled_render(qids, deferred));
+        self.settlement_error = self.settlement_error.or(neo.err()).or(rest.err());
     }
     fn rescan_compute(&mut self) -> Result {
         self.firmware.scan_compute(None, self.deferred)
@@ -496,7 +615,7 @@ impl crate::g17::Shared {
             || firmware.queues.render.replay_polling()
             || firmware.queues.teardown.polling(now)
             || firmware.compute_exit_polling(now)
-            || firmware.queues.m5_in_flight()
+            || firmware.queues.m5_polling()
             || firmware
                 .queues
                 .compute

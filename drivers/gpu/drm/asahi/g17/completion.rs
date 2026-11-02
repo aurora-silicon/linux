@@ -521,6 +521,18 @@ impl Completion {
         self.blamed.store(true, Ordering::Release);
     }
 
+    /// Recovery found the firmware's blame of this command's queue guilty: the command is blamed,
+    /// and guilty unless an earlier recovery spared it. Unclassified work counts as innocent, and
+    /// a blamed command must never be replayed. Work an earlier recovery spared is collateral here
+    /// (classify() blames before its collateral check) and stays spared, so its failure stays
+    /// non-sticky; the blame itself is recorded apart from the class, and refuses any replay.
+    pub(crate) fn settle_blamed(&self) {
+        self.note_blamed();
+        if !self.spared() {
+            self.classify(Class::Guilty);
+        }
+    }
+
     pub(crate) fn blamed(&self) -> bool {
         self.blamed.load(Ordering::Acquire)
     }
@@ -593,8 +605,19 @@ impl Completion {
 
     /// Called under the device mutex before deferring the error signal.
     pub(crate) fn quarantine_render(&self) {
+        self.quarantine_render_with(false);
+    }
+
+    /// As [`Self::quarantine_render`], for failed work the firmware goes on running: a pass a
+    /// recovery settled, which M5's restarted firmware resumes. Its footprint keeps ordering
+    /// overlapping renders until its drain (`admission::State::resuming`).
+    pub(crate) fn quarantine_resumed_render(&self) {
+        self.quarantine_render_with(true);
+    }
+
+    fn quarantine_render_with(&self, resumes: bool) {
         if let Some(lease) = self.render.lock().as_ref() {
-            lease.quarantine(self.spared());
+            lease.quarantine(self.spared(), resumes);
         }
     }
 
