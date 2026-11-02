@@ -109,7 +109,15 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 						     args->hwx_size, &snapshot);
 	if (ret)
 		goto out;
-	mutex_lock(&a->lock);
+	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
+	if (ret)
+		goto out;
+	/* Lost across system sleep: release it, the caller is reloading. */
+	if (f->program && ane_h16_program_lost(a->session, f->program) &&
+	    !ane_h16_session_close(a->session, f->program)) {
+		ane_h16_session_put(a->session, f->program);
+		f->program = NULL;
+	}
 	if (f->program) {
 		ret = -EBUSY;
 	} else {
@@ -158,7 +166,9 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			   array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
 	start = ktime_get_ns();
-	mutex_lock(&a->lock);
+	ret = ane_h16_session_enter(a->session, file->filp->f_flags & O_NONBLOCK);
+	if (ret)
+		return ret;
 	locked = ktime_get_ns();
 	p = f->program;
 	if (!p || p->closed || args->count != p->resource_count) {
@@ -241,10 +251,21 @@ static void ane_h16_postclose(struct drm_device *drm, struct drm_file *file)
 
 	mutex_lock(&a->lock);
 	if (f->program) {
+		/* Quarantined before this close: nothing failed here. */
+		bool quarantined = a->session->quarantined;
+
 		ret = ane_h16_session_close(a->session, f->program);
-		if (ret)
+		/*
+		 * -EINPROGRESS: deferred to the end of system sleep. -EIO on an
+		 * already quarantined session: no firmware traffic was tried, and
+		 * the program's memory stays mapped with every other mapping
+		 * until reboot, since the quarantined firmware may still read it.
+		 */
+		if (ret == -EIO && quarantined)
+			drm_dbg(drm, "program kept until reboot: engine quarantined\n");
+		else if (ret && ret != -EINPROGRESS)
 			drm_err(drm, "program teardown failed %d; session quarantined\n", ret);
-		else
+		else if (!ret)
 			ane_h16_session_put(a->session, f->program);
 	}
 	mutex_unlock(&a->lock);
@@ -299,6 +320,8 @@ int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 	ret = drmm_mutex_init(&a->drm, &a->lock);
 	if (ret)
 		return ret;
+	/* The session's sleep gate serializes on the node lock. */
+	session->lock = &a->lock;
 	ret = drm_dev_register(&a->drm, 0);
 	if (ret)
 		return ret;
