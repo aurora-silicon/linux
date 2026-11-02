@@ -28,6 +28,10 @@ struct ane_h16_sim {
 	u32 pins;
 	u32 quarantines;
 	u32 allocations;
+	u32 timeout_slots;
+	u32 timeout_bodies;
+	u32 timeout_scratch;
+	u64 timeout_head;
 	u32 lock;
 	u32 fault;
 	u32 channel_request;
@@ -45,6 +49,7 @@ struct ane_h16_sim {
 	bool wrong_table;
 	bool stale_table;
 	bool no_clear;
+	bool no_startup_reply;
 	bool shared_pending;
 	bool shared_replied;
 	bool ce_timeout;
@@ -213,6 +218,8 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 			if (s->command_count < 4)
 				KUNIT_EXPECT_EQ(s->test, tx->id, f->startup[s->command_count].id);
 			s->command_count++;
+			if (s->no_startup_reply)
+				return;
 			if (tx->id == 3 && s->lifecycle_mode) {
 				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 				u64 dva = s->lifecycle_mode == 2 ? 0 : s->build.shared_dva;
@@ -362,6 +369,16 @@ static void sim_mailbox(void *ctx)
 
 static void sim_log(void *ctx, const char *item, u64 a, u64 b)
 {
+	struct ane_h16_sim *s = ctx;
+
+	if (!strcmp(item, "startup SHAREDMALLOC head/slots"))
+		s->timeout_head = a;
+	if (!strcmp(item, "startup SHAREDMALLOC slot/word0"))
+		s->timeout_slots++;
+	if (!strcmp(item, "startup SHAREDMALLOC word1/word2"))
+		s->timeout_bodies++;
+	if (!strcmp(item, "startup timeout scratch"))
+		s->timeout_scratch++;
 }
 
 static void sim_quarantine(void *ctx, int error)
@@ -696,6 +713,37 @@ static void ane_h16_scratch3_timeout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->command_count, 0U);
 }
 
+/* A timeout snapshots the ring without answering, moving it or trying again. */
+static void ane_h16_startup_timeout_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+	struct ane_fw_transport *t = &s->boot.transport;
+	u8 before[ANE_FW_SLOT_SIZE];
+	u8 *slot;
+
+	KUNIT_ASSERT_EQ(test, ane_h16_run(&s->boot, ANE_H16_BOOT), 0);
+	slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
+	/* An earlier reply still belongs to firmware; the host must leave it. */
+	put_unaligned_le64(s->build.shared_dva | 1, slot);
+	put_unaligned_le64(0, slot + 8);
+	put_unaligned_le64(1, slot + 16);
+	memcpy(before, slot, sizeof(before));
+	s->no_startup_reply = true;
+	s->build.command_timeout_ns = 2000000;
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, s->boot.quarantined);
+	KUNIT_EXPECT_EQ(test, s->command_count, 1U);
+	KUNIT_EXPECT_TRUE(test, t->pending[ANE_FW_IO].active);
+	KUNIT_EXPECT_EQ(test, t->head[ANE_FW_SHAREDMALLOC], 0U);
+	KUNIT_EXPECT_EQ(test, s->timeout_head, 0ULL);
+	KUNIT_EXPECT_EQ(test, s->timeout_slots, t->channels[ANE_FW_SHAREDMALLOC].slots);
+	KUNIT_EXPECT_EQ(test, s->timeout_bodies, s->timeout_slots);
+	KUNIT_EXPECT_EQ(test, s->timeout_scratch, 8U);
+	KUNIT_EXPECT_MEMEQ(test, before, slot, sizeof(before));
+	KUNIT_EXPECT_EQ(test, ane_h16_run(&s->boot, ANE_H16_STARTUP), -EBUSY);
+	KUNIT_EXPECT_EQ(test, s->command_count, 1U);
+}
+
 /* Stages advance one write at a time, each at most once, in one firmware session. */
 static void ane_h16_incremental_test(struct kunit *test)
 {
@@ -931,6 +979,7 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_ce_timeout_test),
 	KUNIT_CASE(ane_h16_zero_tick_test),
 	KUNIT_CASE(ane_h16_scratch3_timeout_test),
+	KUNIT_CASE(ane_h16_startup_timeout_test),
 	{}
 };
 
