@@ -25,6 +25,8 @@ static void init(void)
 	memset(mailbox, 0, sizeof(mailbox));
 	halts = closes = freed = suspends = resumes = schedules = polls = sleep_ms = 0;
 	halt_result = close_result = poll_result = 0;
+	irq_waits = 0;
+	irq_wait_max = 0;
 	map_fail = ctrl_sticky = stopped_for_sleep = false;
 	stop_seen = power_seen = dma_alloc_fail = dma_attach_fail = dma_map_fail = false;
 	mapping_frees = mapping_unmaps = mapping_detaches = 0;
@@ -217,6 +219,29 @@ static void recovery_failures(void)
 }
 
 static bool never_answered(struct ave_dev *dev, void *arg) { return false; }
+
+/*
+ * A quiet ring: the pump sleeps on the mailbox interrupt between polls, never
+ * longer than the deadline left or the recheck interval, and still gives up
+ * at the deadline.
+ */
+static void quiet_ring_deadline(void)
+{
+	init();
+	owners();
+	mutex_lock(&ave.hw_lock);
+	assert(ave_ipc_pump(&ave, 50, never_answered, NULL) == -ETIMEDOUT);
+	mutex_unlock(&ave.hw_lock);
+	assert(irq_waits > 0 && irq_waits == polls);
+	assert(irq_wait_max >= 1 && irq_wait_max <= 50);
+	assert(ave.fw_state == AVE_FW_BROKEN);
+	ave_poll_work(&ctx[0].poll_work.work);
+	ave_poll_work(&ctx[1].poll_work.work);
+	mutex_lock(&ave.hw_lock);
+	stop_seen = power_seen = true;
+	ave_sess_reap(&ave);
+	mutex_unlock(&ave.hw_lock);
+}
 static void busy_ring_deadline(void)
 {
 	init();
@@ -226,6 +251,7 @@ static void busy_ring_deadline(void)
 	assert(ave_ipc_pump(&ave, 5, never_answered, NULL) == -ETIMEDOUT);
 	mutex_unlock(&ave.hw_lock);
 	assert(polls < 10 && ave.fw_state == AVE_FW_BROKEN);
+	assert(!irq_waits); /* Each poll found an event: no wait in between. */
 	assert(ctx[0].poll_work.scheduled && ctx[1].poll_work.scheduled);
 	ave_poll_work(&ctx[0].poll_work.work);
 	ave_poll_work(&ctx[1].poll_work.work);
@@ -379,8 +405,9 @@ int main(void)
 	sleep_guarantees();
 	recovery_failures();
 	busy_ring_deadline();
+	quiet_ring_deadline();
 	restore_data();
 	puts("ok: recovery ownership, queues, quarantine, reset proof, rate limit, "
-	     "PM rollback, DATA, IPC deadline, MMAP/dma-buf release ordering");
+	     "PM rollback, DATA, IPC deadline and interrupt wait, MMAP/dma-buf release ordering");
 	return 0;
 }
