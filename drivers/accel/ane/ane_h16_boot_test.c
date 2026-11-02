@@ -11,6 +11,7 @@ struct ane_h16_sim {
 	struct ane_h16_mmio mmio;
 	struct ane_fw_platform soc;
 	u32 scratch[8];
+	u32 irq;
 	u32 dapf[SZ_16K / 4];
 	u32 dart_params;
 	u32 dapf_reads;
@@ -113,7 +114,7 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 		if (off >= s->soc.scratch && off < s->soc.scratch + 32)
 			return s->scratch[(off - s->soc.scratch) / 4];
 		if (off == s->soc.irq_status)
-			return 0;
+			return s->irq;
 	}
 	return 0xa5a5a5a5;
 }
@@ -172,6 +173,10 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 		return;
 	}
 	KUNIT_EXPECT_TRUE(s->test, w == ANE_H16_ENGINE || w == ANE_H16_XL);
+	if (w == ANE_H16_ENGINE && off == s->soc.irq_ack) {
+		s->irq &= ~value;
+		return;
+	}
 	if (w == ANE_H16_ENGINE && off == f->cpu_control) {
 		s->cpu = value;
 		if (value == f->run && s->fault_after_run)
@@ -231,6 +236,7 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 				put_unaligned_le64(0, slot + 8);
 				put_unaligned_le64(s->lifecycle_mode == 2 ? 1 : 0, slot + 16);
 				s->lifecycle_requested = true;
+				s->irq |= BIT(5);
 			} else if (!tx->id) {
 				u8 *slot = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 
@@ -238,6 +244,7 @@ static void sim_write32(void *ctx, enum ane_h16_window w, u32 off, u32 value)
 				put_unaligned_le64(SZ_16K, slot + 8);
 				put_unaligned_le64(0, slot + 16);
 				s->shared_pending = true;
+				s->irq |= BIT(5);
 			} else {
 				sim_reply(s);
 			}

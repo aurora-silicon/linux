@@ -92,6 +92,8 @@ static void ane_test_write32(void *ctx, u32 reg, u32 value)
 	f->last_reg = reg;
 	f->last_value = value;
 	ane_test_access(f, 'o', NULL, value);
+	if (reg == f->soc.irq_ack)
+		f->irq &= ~value;
 }
 
 static u64 ane_test_now(void *ctx)
@@ -255,6 +257,7 @@ static void ane_test_shared_request(struct ane_transport_test *f, u64 w0, u64 w1
 	put_unaligned_le64(w0, p);
 	put_unaligned_le64(w1, p + 8);
 	put_unaligned_le64(w2, p + 16);
+	f->irq |= BIT(f->t.channels[ANE_FW_SHAREDMALLOC].bit);
 }
 
 static unsigned int ane_test_writes(struct ane_transport_test *f)
@@ -720,6 +723,90 @@ static void ane_transport_shared_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
 	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, (size_t)(SZ_2M + SZ_16K));
 	KUNIT_EXPECT_EQ(test, f->t.shared_count, 2U);
+}
+
+/* The body of a fresh zero-header request is not its publication boundary. */
+static void ane_transport_shared_notification_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u32 bit = BIT(f->t.channels[ANE_FW_SHAREDMALLOC].bit);
+	u8 *slot;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_16K, 0x1234);
+	slot = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	/* Firmware filled the slot but has not published its notification yet. */
+	f->irq = 0;
+	f->count = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+	KUNIT_EXPECT_EQ(test, f->allocs, 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot), 0ULL);
+	/* An unrelated channel notification cannot authorize an answer either. */
+	f->irq = BIT(4);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, f->allocs, 0U);
+	f->irq = bit;
+	f->count = 0;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+	KUNIT_EXPECT_EQ(test, f->irq, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_ready, 0U);
+	/* A later request cannot borrow the first request's notification. */
+	ane_test_shared_request(f, 0, SZ_16K, 0x5678);
+	f->irq = 0;
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_SHAREDMALLOC], 1U);
+	f->irq = bit;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->allocs, 2U);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_SHAREDMALLOC], 0U);
+}
+
+/* One bit can announce a batch, including a batch that wraps the ring. */
+static void ane_transport_shared_batch_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *desc = (u8 *)f->ipc.cpu + ANE_FW_SHAREDMALLOC * ANE_FW_DESCRIPTOR_SIZE;
+	u32 pending, i, ack = 0, first_read = 0;
+	u8 *slot;
+
+	/* The descriptor, rather than logical channel 5, selects the IRQ bit. */
+	put_unaligned_le32(3, desc + 0x44);
+	KUNIT_ASSERT_EQ(test, ane_test_init_transport(f), 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->t.head[ANE_FW_SHAREDMALLOC] = 1;
+	for (i = 0; i < 2; i++) {
+		slot = (u8 *)f->ipc.cpu + f->t.channels[ANE_FW_SHAREDMALLOC].offset +
+		       i * ANE_FW_SLOT_SIZE;
+		put_unaligned_le64(SZ_16K, slot + 8);
+		put_unaligned_le64(0x1234 + i, slot + 16);
+	}
+	slot = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	f->irq = BIT(3);
+	f->count = 0;
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_irq(&f->t, &pending), 0);
+	KUNIT_EXPECT_EQ(test, pending, (u32)BIT(3));
+	KUNIT_EXPECT_EQ(test, f->t.shared_ready, 2U);
+	/* Exact IRQ acknowledgment and a DMA read barrier precede slot reads. */
+	for (i = 0; i < f->count; i++) {
+		if (f->access[i].kind == 'o')
+			ack = i;
+		if (f->access[i].kind == 'r' && f->access[i].p == slot)
+			first_read = i;
+	}
+	KUNIT_EXPECT_LT(test, ack, first_read);
+	KUNIT_EXPECT_EQ(test, f->access[ack].value, (u64)BIT(3));
+	KUNIT_EXPECT_EQ(test, f->access[ack + 1].kind, 'R');
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_SHAREDMALLOC], 0U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_ready, 1U);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_SHAREDMALLOC], 1U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_ready, 0U);
+	KUNIT_EXPECT_EQ(test, f->allocs, 2U);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EAGAIN);
 }
 
 static void ane_transport_shared_rejections_test(struct kunit *test)
@@ -1403,6 +1490,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_report_word2_test),
 	KUNIT_CASE(ane_transport_presence_test),
 	KUNIT_CASE(ane_transport_shared_test),
+	KUNIT_CASE(ane_transport_shared_notification_test),
+	KUNIT_CASE(ane_transport_shared_batch_test),
 	KUNIT_CASE(ane_transport_shared_rejections_test),
 	KUNIT_CASE(ane_transport_allocator_rejections_test),
 	KUNIT_CASE(ane_transport_shared_overlap_test),

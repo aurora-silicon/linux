@@ -118,6 +118,8 @@ struct ane_fw_transport {
 	struct ane_fw_channel channels[ANE_FW_CHANNELS];
 	struct ane_fw_transaction pending[ANE_FW_CHANNELS];
 	u32 head[ANE_FW_CHANNELS];
+	/* SHAREDMALLOC entries captured after acknowledging their notification. */
+	u32 shared_ready;
 	u8 table[ANE_FW_TABLE_SIZE];
 	size_t table_offset;
 	size_t pool_used;
@@ -266,6 +268,8 @@ static inline void *ane_fw_transport_slot(struct ane_fw_transport *t, unsigned i
 static inline void ane_fw_transport_advance(struct ane_fw_transport *t, unsigned int ch)
 {
 	t->head[ch] = (t->head[ch] + 1) % t->channels[ch].slots;
+	if (ch == ANE_FW_SHAREDMALLOC)
+		t->shared_ready--;
 }
 
 static inline void ane_fw_transport_doorbell(struct ane_fw_transport *t, unsigned int ch)
@@ -655,12 +659,15 @@ ane_fw_shared_reusable(const struct ane_fw_transport *t, size_t size, u64 tag)
 	return t->shared_count;
 }
 
+static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending);
+
 static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 {
 	struct ane_fw_surface s = {};
 	u64 word0, word1, word2;
 	size_t size;
 	unsigned int i;
+	u32 pending;
 	u8 *p;
 	int ret = ane_fw_transport_check(t);
 
@@ -668,6 +675,13 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 		return ret;
 	if (!t->armed)
 		return -EINVAL;
+	if (!t->shared_ready) {
+		ret = ane_fw_transport_irq(t, &pending);
+		if (ret)
+			return ret;
+		if (!t->shared_ready)
+			return -EAGAIN;
+	}
 	p = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 	word0 = t->ops->load64(t->ctx, p);
 	t->ops->read_barrier(t->ctx);
@@ -753,6 +767,35 @@ static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending)
 	*pending = value;
 	if (value)
 		t->ops->write32(t->ctx, t->soc->irq_ack, value);
+	if (t->armed && (value & BIT(t->channels[ANE_FW_SHAREDMALLOC].bit))) {
+		const struct ane_fw_channel *c = &t->channels[ANE_FW_SHAREDMALLOC];
+		u32 n;
+
+		/*
+		 * An allocation's header is zero, including on a never-used slot.
+		 * Its body can be visible before firmware posts the notification;
+		 * answering then races the producer's publication/wakeup sequence.
+		 * Capture the notified batch BEFORE replying to any entry. Draining
+		 * until empty after a reply could pick up the next unnotified request.
+		 * One pending bit may cover several already queued entries.
+		 */
+		t->ops->read_barrier(t->ctx);
+		for (n = 0; n < c->slots; n++) {
+			u32 slot = (t->head[ANE_FW_SHAREDMALLOC] + n) % c->slots;
+			u8 *p = (u8 *)t->ipc.cpu + c->offset + slot * ANE_FW_SLOT_SIZE;
+			u64 word0 = t->ops->load64(t->ctx, p);
+			u64 word1, word2;
+
+			if (word0 & 1)
+				break;
+			t->ops->read_barrier(t->ctx);
+			word1 = t->ops->load64(t->ctx, p + 8);
+			word2 = t->ops->load64(t->ctx, p + 16);
+			if (!word0 && !word1 && !word2)
+				break;
+		}
+		t->shared_ready = n;
+	}
 	return 0;
 }
 
