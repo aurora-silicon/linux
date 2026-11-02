@@ -1169,6 +1169,47 @@ static void ane_transport_mode_stop_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->t.error, 0);
 }
 
+/*
+ * The control ring completes without clearing the result word (H17 C6):
+ * DVA|1, length, and the published size still in word 2. Accepted there;
+ * the same completion on IO is still a protocol error.
+ */
+static void ane_transport_mode_stop_completion_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u32 ch = f->t.control_ch;
+	u8 *slot = ane_test_slot(f, ch);
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish_mode_stop(&f->t, TEST_DEADLINE), 0);
+	put_unaligned_le64(f->t.pending[ch].dva | 1, slot);
+	put_unaligned_le64(ANE_FW_MODE_STOP_SIZE, slot + 8);
+	put_unaligned_le64(ANE_FW_MODE_STOP_SIZE, slot + 16);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch), 0);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+
+	/* Any other result word is still refused. */
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_publish_mode_stop(&f->t, TEST_DEADLINE), 0);
+	slot = ane_test_slot(f, ch);
+	put_unaligned_le64(f->t.pending[ch].dva | 1, slot);
+	put_unaligned_le64(ANE_FW_MODE_STOP_SIZE, slot + 8);
+	put_unaligned_le64(1, slot + 16);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ch), -EPROTO);
+}
+
+static void ane_transport_io_result_size_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u8 *slot = ane_test_slot(f, ANE_FW_IO);
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	KUNIT_ASSERT_EQ(test, ane_test_publish(f, ANE_FW_IO), 0);
+	put_unaligned_le64(f->t.pending[ANE_FW_IO].dva | 1, slot);
+	put_unaligned_le64(16, slot + 8);
+	put_unaligned_le64(16, slot + 16);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_wait(&f->t, ANE_FW_IO), -EPROTO);
+}
+
 /* A table whose position 2 is not a host command ring has no control ring. */
 static void ane_transport_no_control_ring_test(struct kunit *test)
 {
@@ -1343,6 +1384,8 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_carry_shared_test),
 	KUNIT_CASE(ane_transport_mode_stop_test),
 	KUNIT_CASE(ane_transport_no_control_ring_test),
+	KUNIT_CASE(ane_transport_mode_stop_completion_test),
+	KUNIT_CASE(ane_transport_io_result_size_test),
 	KUNIT_CASE(ane_transport_free_refusal_test),
 	KUNIT_CASE(ane_transport_table_test),
 	KUNIT_CASE(ane_transport_table_roles_test),
