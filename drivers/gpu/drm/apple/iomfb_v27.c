@@ -329,6 +329,18 @@ static bool trampoline_tiling_state_v27(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+/*
+ * D113, about an hour after the firmware starts and periodically after: the
+ * analytics event. A zeroed reply crashes the firmware.
+ */
+static bool trampoline_analytics_event_v27(struct apple_dcp *dcp, int tag,
+					   void *out, void *in)
+{
+	trace_iomfb_callback(dcp, tag, "dcpep_cb_analytics_event");
+	dcp_dict_passthrough_reply(in, out);
+	return true;
+}
+
 /* Native D115: same16-byte input as D114, boolean/padded4 output. */
 static bool trampoline_set_tiling_state_v27(struct apple_dcp *dcp, int tag,
 					   void *out, void *in)
@@ -362,7 +374,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[110] = trampoline_true,
 	[111] = trampoline_create_backlight_service,
 	[112] = trampoline_true,
-	[113] = trampoline_zero,
+	[113] = trampoline_analytics_event_v27,
 	[116] = trampoline_nop,
 	[117] = trampoline_zero,
 	[118] = trampoline_zero,
@@ -449,7 +461,8 @@ static const struct {
 	[110] = { 0x0, 0x4 },
 	[111] = { 0x0, 0x4 },
 	[112] = { 0x0, 0x4 },
-	[113] = { 0x1044, 0x1004 },
+	[113] = { sizeof(struct dcp_dict_passthrough_req),
+		  sizeof(struct dcp_dict_passthrough_resp) },
 	[116] = { 0xc, 0x0 },
 	[117] = { 0x14, 0x4 },
 	[118] = { 0x3e88, 0x4 },

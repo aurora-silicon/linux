@@ -52,41 +52,15 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 
 #include "iomfb_template.c"
 
-struct dcp_dict_passthrough_req_v26_6 {
-	u8 key[0x40];
-	u8 value[0x1000];
-	u8 value_null;
-	u8 padding[3];
-} __packed;
-
-struct dcp_dict_passthrough_resp_v26_6 {
-	u8 value[0x1000];
-	u8 ret;
-	u8 padding[3];
-} __packed;
-
-static_assert(sizeof(struct dcp_dict_passthrough_req_v26_6) == 0x1044);
-static_assert(sizeof(struct dcp_dict_passthrough_resp_v26_6) == 0x1004);
-
 /*
- * D114 periodically publishes dictionary-valued statistics.  The value is an
- * in/out pointer, which the firmware deserializes again: the firmware's own
- * client returns the serialized buffer unchanged and reports false.  An
- * all-zero reply is not a harmless false.
+ * D114 periodically publishes dictionary-valued statistics: the analytics
+ * event, answered by dcp_dict_passthrough_reply().
  */
 static bool trampoline_passthrough_dict_v26_6(struct apple_dcp *dcp, int tag,
 					      void *out, void *in)
 {
-	const struct dcp_dict_passthrough_req_v26_6 *req = in;
-	struct dcp_dict_passthrough_resp_v26_6 *resp = out;
-
 	trace_iomfb_callback(dcp, tag, "dcpep_cb_passthrough_dict");
-
-	if (!req->value_null)
-		memcpy(resp->value, req->value, sizeof(resp->value));
-
-	resp->ret = false;
-	memset(resp->padding, 0, sizeof(resp->padding));
+	dcp_dict_passthrough_reply(in, out);
 
 	return true;
 }
