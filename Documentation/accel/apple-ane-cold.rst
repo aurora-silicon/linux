@@ -54,7 +54,10 @@ At module load (or initcall when built in), before the platform driver
 registers, the driver reads the hand-off without touching the engine: the
 marker, ``apple,firmware-preloaded``, both reservations enabled, ``no-map``,
 not reusable and outside System RAM at the exact sizes and DVAs, and TEXT
-against the pin. With all of it, a work item runs the stages below through
+against the pin. kexec copies ``/chosen``, marker included, from the running
+DT, so the driver also reads PMGR (safe whatever the power state) and starts
+only if the ANE CPU and sub-block are still off, and never in a kdump kernel.
+With all of it, a work item runs the stages below through
 ``program`` once the driver is registered, so ``/dev/accel/accel0`` exists on
 every boot. Without it, the driver logs which part was missing and leaves the
 engine alone; the platform probe refuses quietly with -ENODEV.

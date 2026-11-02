@@ -174,7 +174,11 @@ static void ane_cold_handoff_test(struct kunit *test)
 		.preload_dva = { 0x10000000000ULL, 0x100000c0000ULL },
 		.preload_size = { 0xc0000, 0x2ac000 },
 	};
+	static const struct ane_fw_cold_state cold = {
+		.sys = 0x23ff, .cpu = 0x0f000300, .subblock = 0x300,
+	};
 	const struct ane_fw_handoff good = {
+		.pmgr = &cold,
 		.marker = ANE_FW_COLD_BOOT_EVIDENCE,
 		.preloaded = true,
 		.regions_ok = true,
@@ -186,6 +190,9 @@ static void ane_cold_handoff_test(struct kunit *test)
 	struct ane_fw_handoff h;
 
 	KUNIT_EXPECT_TRUE(test, ane_fw_cold_handoff_valid(&good, &soc));
+	h = good;
+	h.pmgr = NULL;
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_handoff_valid(&h, &soc));
 	h = good;
 	h.marker = NULL;
 	KUNIT_EXPECT_FALSE(test, ane_fw_cold_handoff_valid(&h, &soc));
@@ -216,7 +223,46 @@ static void ane_cold_handoff_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ane_fw_cold_handoff_valid(&h, &soc));
 }
 
+/*
+ * kexec copies /chosen, so a kernel after one that ran the ANE still sees
+ * the raw-boot marker: the live PMGR state, not the marker, decides.
+ */
+static void ane_cold_handoff_warm_test(struct kunit *test)
+{
+	static const struct ane_fw_platform soc = {
+		.preload_dva = { 0x10000000000ULL, 0x100000c0000ULL },
+		.preload_size = { 0xc0000, 0x2ac000 },
+	};
+	struct ane_fw_cold_state warm = {
+		.sys = 0x23ff, .cpu = 0x0f00030f, .subblock = 0x300,
+	};
+	struct ane_fw_handoff h = {
+		.marker = ANE_FW_COLD_BOOT_EVIDENCE,
+		.preloaded = true,
+		.regions_ok = true,
+		.phys = { 0x10000768000ULL, 0x100019a0000ULL },
+		.size = { 0xc0000, 0x2ac000 },
+		.dva = { 0x10000000000ULL, 0x100000c0000ULL },
+		.text_ok = true,
+		.pmgr = &warm,
+	};
+
+	/* Marker present, ANE CPU powered: warm. */
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_handoff_loader_ok(&h, &soc));
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_handoff_valid(&h, &soc));
+	/* Sub-block on. */
+	warm.cpu = 0x0f000300;
+	warm.subblock = 0x30f;
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_handoff_valid(&h, &soc));
+	/* Cold PMGR but a kdump kernel. */
+	warm.subblock = 0x300;
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_handoff_valid(&h, &soc));
+	h.crash_kernel = true;
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_handoff_valid(&h, &soc));
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_handoff_warm_test),
 	KUNIT_CASE(ane_cold_handoff_test),
 	KUNIT_CASE(ane_cold_heap_tail_test),
 	KUNIT_CASE(ane_cold_evidence_test),

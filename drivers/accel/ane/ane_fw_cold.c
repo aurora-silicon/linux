@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Shared firmware backend. H17 is the first measured cold power provider. */
 #include <crypto/sha2.h>
+#include <linux/crash_dump.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
@@ -961,7 +962,7 @@ static DEVICE_ATTR_RW(firmware_stage);
  * and the TEXT segment against the driver's pin.
  */
 static bool ane_fw_handoff_present(struct platform_device *pdev,
-				   const struct ane_fw_platform *soc)
+				   const struct ane_fw_platform *soc, struct ane_fw_handoff *hp)
 {
 	struct device_node *np = pdev->dev.of_node;
 	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
@@ -992,7 +993,8 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 			h.text_ok = !memcmp(digest, ane_fw_text_pin, sizeof(digest));
 		}
 	}
-	if (ane_fw_cold_handoff_valid(&h, soc))
+	*hp = h;
+	if (ane_fw_cold_handoff_loader_ok(&h, soc))
 		return true;
 	dev_info(&pdev->dev, "H17 ANE: no loader hand-off (%s); leaving the engine alone\n",
 		 !h.marker || strcmp(h.marker, ANE_FW_COLD_BOOT_EVIDENCE) ? "raw-boot marker" :
@@ -1062,6 +1064,7 @@ static int ane_fw_window(struct ane_fw_backend *b, unsigned int index, void __io
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
 	struct device_node *np = pdev->dev.of_node;
+	struct ane_fw_handoff handoff;
 	struct ane_fw_backend *b;
 	unsigned int i;
 	u32 dart_phandles[ANE_FW_DARTS];
@@ -1070,7 +1073,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	if (ane_backend || soc->soc != 0x8140)
 		return -EOPNOTSUPP;
 	/* No hand-off (an older loader, a warm boot): leave the engine alone. */
-	if (!ane_fw_handoff_present(pdev, soc))
+	if (!ane_fw_handoff_present(pdev, soc, &handoff))
 		return -ENODEV;
 	b = kzalloc_obj(*b);
 	if (!b)
@@ -1145,6 +1148,20 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		ret = ane_fw_window(b, 2, b->gate, np, 2);
 	if (ret)
 		goto fail;
+	/*
+	 * The marker survives a kexec. Read PMGR (safe in any power state) and
+	 * start only if the ANE CPU and sub-block are still off, never in a
+	 * kdump kernel.
+	 */
+	ane_fw_snapshot_pmgr(b);
+	handoff.pmgr = &b->cold;
+	handoff.crash_kernel = is_kdump_kernel();
+	if (!ane_fw_cold_handoff_valid(&handoff, soc)) {
+		dev_info(&pdev->dev, "H17 ANE: engine not cold (%s); leaving it alone\n",
+			 handoff.crash_kernel ? "kdump kernel" : "CPU or sub-block powered");
+		ret = -ENODEV;
+		goto fail;
+	}
 	ane_backend = b;
 	ret = device_create_file(&pdev->dev, &dev_attr_firmware_stage);
 	if (ret) {
