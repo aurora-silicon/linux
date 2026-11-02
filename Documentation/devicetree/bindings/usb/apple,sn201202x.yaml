@@ -39,6 +39,8 @@ properties:
     minItems: 3
     maxItems: 4
 
+  wakeup-source: true
+
   connector:
     $ref: /schemas/connector/usb-connector.yaml#
 

@@ -79,8 +79,8 @@ static int devm_request_threaded_irq(struct device*d,int irq,int(*h)(int,void*),
  assert(h==dockchannel_rx_irq&&t==dockchannel_rx_irq_thread&&!strcmp(n,"apple-dockchannel-rx"));rx_irq_requested=irq;rx_flags=f;return 0;}
 enum dwc3_apple_state {DWC3_APPLE_PROBE_PENDING,DWC3_APPLE_NO_CABLE,DWC3_APPLE_HOST,DWC3_APPLE_DEVICE,DWC3_APPLE_SUSPENDED};
 #define DWC3_GCTL_PRTCAP_HOST 1
-struct dwc3 {int num_usb3_ports,num_usb2_ports;int usb3_generic_phy[2],usb2_generic_phy[2],usb3_phy,usb2_phy;int current_dr_role;};
-struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending;unsigned usb3_power_off_pending,usb2_power_off_pending;};
+struct dwc3 {int num_usb3_ports,num_usb2_ports;int usb3_generic_phy[2],usb2_generic_phy[2],usb3_phy,usb2_phy;int current_dr_role;bool dis_u3_susphy_quirk;};
+struct dwc3_apple {struct device*dev;struct dwc3 dwc;int lock,reset;enum dwc3_apple_state state;bool fixed_hub,host_only,rpm_held,core_active,core_exit_pending,reset_pending,dt_dis_u3_susphy;unsigned usb3_power_off_pending,usb2_power_off_pending;};
 static int core_error,host_error,gadget_error,reset_error,role_error,start_role;
 static unsigned rpm_puts;
 /* A started core holds the glue runtime PM reference until core_stop drops it. */
