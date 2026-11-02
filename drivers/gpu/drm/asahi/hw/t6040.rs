@@ -48,6 +48,7 @@ pub(crate) const CONFIG: Config = Config {
         page_tlbi: true,
         handoff_lock: false,
         handoff_slot: 0xffff_ffff,
+        handoff_unk2: 0,
         native_gpu_permissions: true,
     },
     region_c: &REGION_C,
@@ -108,6 +109,7 @@ pub(crate) const CONFIG: Config = Config {
         operand_state: fw::compute::OperandState::TWO_BY_TEN,
         deflake: fw::render::Deflake::TWO_CLUSTERS,
     },
+    m5: None,
 };
 
 /// Chip identifier written to the hardware data.

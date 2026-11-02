@@ -194,6 +194,9 @@ pub(crate) struct UatQuirks {
     pub(crate) handoff_lock: bool,
     /// Handoff "current slot" written at initialization.
     pub(crate) handoff_slot: u32,
+    /// Handoff byte after the flush records written at initialization. 26A428 takes 1 on
+    /// T6050, where the legacy flush protocol is also off.
+    pub(crate) handoff_unk2: u8,
     /// Store GPU-only mappings of client and kernel-lower tables as AP 0 with the access in
     /// PXN (read) and UXN (write), the form the firmware itself uses, instead of AP 2.
     pub(crate) native_gpu_permissions: bool,
@@ -207,6 +210,7 @@ impl UatQuirks {
         page_tlbi: false,
         handoff_lock: true,
         handoff_slot: 0,
+        handoff_unk2: 0,
         native_gpu_permissions: false,
     };
 }
@@ -1926,9 +1930,10 @@ impl Handoff {
     }
 
     /// Initialize the handoff region
-    fn init(&self, firmware: UatFirmware, slot: u32) -> Result {
+    fn init(&self, firmware: UatFirmware, slot: u32, unk2: u8) -> Result {
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(slot, Ordering::Relaxed);
+        self.unk2.store(unk2, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
         fence(Ordering::SeqCst);
 
@@ -3629,7 +3634,7 @@ impl Uat {
         inner.kernel_ttb1 = ttb1;
         inner.secondary_ttb1 = secondary_ttb1;
 
-        inner.handoff().init(firmware, quirks.handoff_slot)?;
+        inner.handoff().init(firmware, quirks.handoff_slot, quirks.handoff_unk2)?;
         if quirks.clean_tables {
             pgtable::clean_poc(inner.handoff() as *const Handoff as *const u8, HANDOFF_SIZE);
             pgtable::poc_barrier();

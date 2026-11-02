@@ -734,6 +734,19 @@ impl G17Resources {
         Ok(())
     }
 
+    /// The M5 firmware's preparation before its initialization: the PMGR boot control word
+    /// ([`Self::m5_match_pmgr_boot_control`]; it reads 0x30000 on a cold J775D as on J813), then
+    /// dynamic core power gating.
+    pub(crate) fn prepare_m5_firmware(&self) -> Result {
+        #[cfg(not(CONFIG_DRM_ASAHI_M5))]
+        return Err(ENODEV);
+        #[cfg(CONFIG_DRM_ASAHI_M5)]
+        {
+            self.m5_match_pmgr_boot_control()?;
+            self.enable_g17_gating()
+        }
+    }
+
     /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
     /// initialized.
     pub(crate) fn enable_g17_gating(&self) -> Result {

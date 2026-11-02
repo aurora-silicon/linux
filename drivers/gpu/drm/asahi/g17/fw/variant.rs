@@ -34,6 +34,9 @@ pub(crate) enum InitGraph {
     G17P,
     /// One instance carrying both roles, with the 25G83 layouts ([`super::initdata::v25g83`]).
     V25G83,
+    /// Two instances, as the M5 firmware (26A428) runs: a different interface word, policy,
+    /// hardware-data and allocation layout ([`super::m5::initdata`]).
+    M5,
 }
 
 /// The layouts and rules of one G17 firmware build.

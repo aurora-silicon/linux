@@ -201,6 +201,9 @@ pub(crate) struct Config {
     pub(crate) firmware: fw::variant::Firmware,
     /// Layouts of the command buffers that follow the GPU's core layout.
     pub(crate) core_layout: CoreLayout,
+    /// The platform of the M5 firmware graph ([`fw::variant::InitGraph::M5`]); `None` for the
+    /// others.
+    pub(crate) m5: Option<&'static fw::m5::initdata::M5Platform>,
 }
 
 /// Layouts of the firmware command buffers that follow a SoC's GPU core layout.
@@ -1151,6 +1154,10 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::G17Resources,
     ) -> Result<Arc<Gpu>> {
+        if cfg.m5.is_some() && !cfg!(CONFIG_DRM_ASAHI_M5) {
+            dev_info!(dev.as_ref(), "M5 GPU support is not built (CONFIG_DRM_ASAHI_M5)\n");
+            return Err(ENODEV);
+        }
         let calibration = if cfg.chip_id == crate::hw::t6040::CHIP_ID {
             Some(calibration::Calibration::read(dev).inspect_err(|_| {
                 dev_err!(dev.as_ref(), "Missing or invalid T6040 GPU calibration handoff\n");
@@ -1451,6 +1458,20 @@ impl Gpu {
             true => Some(session.uat.adopt_firmware_root_entries()?),
             false => None,
         };
+        if shared.variant.graph == fw::variant::InitGraph::M5 {
+            // Bootstrap only: whatever happened, keep the session. A stopped CPU is not proof that
+            // no engine still reads the graph, so nothing it was given is freed or unmapped.
+            let result = Self::boot_m5(dev, cfg, session, root_entries, shared.active_cores);
+            match &result {
+                Ok(()) => dev_info!(
+                    dev.as_ref(),
+                    "M5 bootstrap done; submission is not supported yet\n"
+                ),
+                Err(e) => dev_err!(dev.as_ref(), "M5 bootstrap failed: {:?}\n", e),
+            }
+            core::mem::forget(firmware);
+            return Err(ENODEV);
+        }
         session.init.build(
             dev,
             cfg,
@@ -1489,6 +1510,61 @@ impl Gpu {
             .uat
             .activate_render_context(&session._render_global)?;
         Ok(firmware)
+    }
+
+    /// The M5 firmware's initialization (linux-aurora t6050-gpu's M5 boot, on published roots):
+    /// the M5 graph, the M5 preparation, InitData to the primary and then the secondary, each
+    /// acknowledged, POWER_ON_DONE to both, and both opening records retired.
+    fn boot_m5(
+        dev: &AsahiDrmDevice,
+        cfg: &'static Config,
+        session: &mut Firmware,
+        root_entries: Option<[u64; 3]>,
+        active_cores: u32,
+    ) -> Result {
+        let platform = cfg.m5.ok_or(EINVAL)?;
+        Self::check_m5_opps(dev, cfg, platform)?;
+        session.init.build_m5(dev, &session.uat, platform, active_cores)?;
+        if let Some(root_entries) = root_entries {
+            session.uat.confirm_firmware_root_entries(root_entries)?;
+        }
+        session.uat.mirror_secondary_root()?;
+        session.bridge.regs.prepare_m5_firmware()?;
+        let ack = session.variant.init_ack;
+        session.primary.init(session.init.root_va(Role::Primary)?, ack)?;
+        dev_info!(dev.as_ref(), "M5 primary InitData acknowledged\n");
+        let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
+        secondary.init(session.init.root_va(Role::Secondary)?, ack)?;
+        dev_info!(dev.as_ref(), "M5 secondary InitData acknowledged\n");
+        session.primary.notify(MSG_POWER_ON_DONE)?;
+        secondary.notify(MSG_POWER_ON_DONE)?;
+        Self::wait_for_opening(dev, &session.init, &session.primary, Some(&*secondary))?;
+        dev_info!(dev.as_ref(), "M5 opening records retired\n");
+        Ok(())
+    }
+
+    /// The platform's performance table must be the device tree's operating points, which the boot
+    /// loader fills from the ADT: one source, checked here rather than trusted twice.
+    fn check_m5_opps(
+        dev: &AsahiDrmDevice,
+        cfg: &'static Config,
+        platform: &fw::m5::initdata::M5Platform,
+    ) -> Result {
+        let opps = initdata::InitData::opps(dev, cfg.opps, platform.lanes as u32)?;
+        for (index, (opp, (mhz, core, _))) in opps.iter().zip(platform.perf.iter()).enumerate() {
+            let volts = &opp.volt_uv[..platform.lanes];
+            if opp.freq_hz != u64::from(*mhz) * 1_000_000
+                || volts.iter().zip(core).any(|(uv, mv)| *uv != mv * 1000)
+            {
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU operating point {} differs from the M5 platform table\n",
+                    index
+                );
+                return Err(EINVAL);
+            }
+        }
+        Ok(())
     }
 
     /// Waits for a firmware that sends no acknowledgment message to accept its

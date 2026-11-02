@@ -16,6 +16,7 @@ use core::sync::atomic::{fence, AtomicU32, Ordering};
 use kernel::{c_str, prelude::*};
 use t8140::{kernel_window as high, low};
 
+mod m5;
 mod v25g83;
 
 const EVENT_RING_RECHECK: u32 = 256;
@@ -187,6 +188,10 @@ pub(super) struct InitData {
     render_pages: usize,
     render_runs: usize,
     render_blocks: core::ops::Range<usize>,
+    /// Built by [`InitData::build_m5`]: the M5 private and shared layouts apply.
+    m5: bool,
+    /// The M5 graph's four completion-ring objects.
+    m5_completions: [usize; 4],
 }
 
 /// Placement inputs shared by the build steps.
@@ -274,6 +279,8 @@ impl InitData {
             render_pages: 0,
             render_runs: 0,
             render_blocks: 0..0,
+            m5: false,
+            m5_completions: [0; 4],
         }
     }
 
@@ -1380,6 +1387,9 @@ impl InitData {
     }
 
     fn state_offset(&self, role: Role) -> usize {
+        if self.m5 {
+            return super::fw::m5::initdata::M5_PRIVATE_STATE_GRIDS[role as usize];
+        }
         match role {
             Role::Primary => abi::private::PRIMARY_STATE,
             Role::Secondary => abi::private::SECONDARY_STATE,
@@ -1387,6 +1397,9 @@ impl InitData {
     }
 
     fn status_offset(&self, role: Role) -> usize {
+        if self.m5 {
+            return super::fw::m5::initdata::M5_PRIVATE_STATUS_A[role as usize];
+        }
         match role {
             Role::Primary => self.status_a,
             Role::Secondary => abi::private::SECONDARY_STATUS_A,

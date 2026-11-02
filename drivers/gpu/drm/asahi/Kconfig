@@ -40,12 +40,17 @@ config DRM_ASAHI_G16
 	  Suspend, hibernation and kexec are blocked while native graphics owns DMA.
 
 config DRM_ASAHI_M5
-	bool "Apple M5 (G17G, T8142) support (experimental)"
+	bool "Apple M5 (G17G T8142, G17D T6050) support (experimental)"
 	depends on DRM_ASAHI && ARM64
 	help
 	  Backend for the M5 GPU (J813 MacBook Air) running the 25G76
 	  firmware (RTKit-3255.160.4), as loaded and published by the aura
 	  boot loader (/chosen/aurora,m5-gpu-firmware-profile).
+
+	  It also enables the M5 Ultra (T6050, G17D: J775D Mac Studio) on
+	  the 26A428 (macOS 27.0) firmware, driven natively as a firmware
+	  variant of the shared G17 code. Without it, such a board's GPU
+	  is not probed.
 
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"
