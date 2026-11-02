@@ -135,6 +135,9 @@ ASAHI_TESTS = {
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
     'pciec-policy-tests.py': [(out(), PASS)],
     'pmp-j613-hwmon-tests.py': [([], PASS)],
+    'pmu-rtc-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
+                                   'offset-sign', 'event-bit', 'wrong-base'), out()),
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),

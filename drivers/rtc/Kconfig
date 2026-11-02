@@ -2095,10 +2095,10 @@ config RTC_DRV_WILCO_EC
 	  be named "rtc_wilco_ec".
 
 config RTC_DRV_APPLE_PMU
-	tristate "Apple J700 Baku PMU RTC alarm"
+	tristate "Apple Baku/Abbey PMU RTC alarm"
 	depends on ARCH_APPLE && NVMEM_APPLE_SPMI && PM_SLEEP
 	help
-	  Read the Baku PMU clock and use its alarm to wake the system
+	  Read the Baku or Abbey PMU clock and use its alarm to wake the system
 	  from suspend-to-idle. Alarms are limited to one hour; deeper
 	  suspend states are not supported. Continue setting the shared
 	  clock through the SMC RTC.
