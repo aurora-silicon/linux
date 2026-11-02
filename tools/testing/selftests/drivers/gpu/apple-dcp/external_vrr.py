@@ -7,6 +7,8 @@ import rate
 
 def publication(root):
     unit = rate.publication(root)['unit']
+    unit = unit.replace('struct apple_dcp {',
+                        'struct apple_dcp { bool external_physically_absent;', 1)
     old = block(unit, 'static void drm_connector_set_vrr_capable_property(')
     unit = unit.replace(old, '''static bool vrr_reported;
 static void drm_connector_set_vrr_capable_property(struct drm_connector *c,bool capable)
@@ -41,6 +43,8 @@ def callbacks(root):
         'static void complete_set_digital_out_mode(',
         'static void dcp_external_modeset_complete(',
         'static void dcp_on_external_modeset(',
+        'static void dcp_on_set_adaptive_sync(',
+        'static void dcp_set_adaptive_sync(',
     ))
     return r'''
 #include <assert.h>
@@ -50,11 +54,18 @@ def callbacks(root):
 typedef uint32_t u32;
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define DCP_FW_VERSION(x,y,z) (((x)<<16)|((y)<<8)|(z))
+#define DCP_FW_VER DCP_FW_VERSION(26,6,0)
+#define DCP_FW_H17(x) 1
+#define IOMFBPARAM_ADAPTIVE_SYNC 14
+struct dcp_set_parameter_dcp { u32 param,value[8],count; };
+struct dcp_set_digital_out_mode_req { u32 color_mode_id,timing_mode_id; };
 struct apple_dcp;
 typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
     bool vrr_enabled;
+    struct dcp_set_digital_out_mode_req mode;
     struct { bool requested,savings_valid;u32 savings;dcp_callback_t next;void *cookie; } external_vrr;
 };
 struct dcp_wait_cookie { u32 status;bool replied;int done,refcount; };
@@ -65,6 +76,19 @@ static dcp_callback_t reply;
 static void *reply_cookie;
 static unsigned calls,continued;
 static u32 argument;
+static unsigned parameter_calls,mode_calls;
+static struct dcp_set_parameter_dcp parameter;
+static void dcp_set_parameter_dcp(struct apple_dcp *d,bool oob,
+    struct dcp_set_parameter_dcp *p,dcp_callback_t next,void *cookie)
+{
+    assert(!oob && !reply);parameter_calls++;parameter=*p;reply=next;reply_cookie=cookie;
+}
+static void dcp_set_digital_out_mode(struct apple_dcp *d,bool oob,
+    struct dcp_set_digital_out_mode_req *p,dcp_callback_t next,void *cookie)
+{
+    assert(!oob && !reply && p->color_mode_id==104 && p->timing_mode_id==39);
+    mode_calls++;reply=next;reply_cookie=cookie;
+}
 static void dcp_enable_disable_video_power_savings(struct apple_dcp *d,bool oob,
     u32 *savings,dcp_callback_t next,void *cookie)
 {
@@ -123,6 +147,21 @@ int main(void)
     dcp_on_external_modeset(&d,&result,&wait);assert(argument==1);
     kref_put(&wait.refcount,release_wait_cookie);
     respond(&d,&error);assert(wait.done==1 && wait.refcount==0 && wait.status==result);
+    /* Variable mode: parameter 14 precedes one timing install, then idle policy. */
+    wait=(struct dcp_wait_cookie){.status=~0U,.refcount=2};
+    d.mode=(struct dcp_set_digital_out_mode_req){104,39};
+    d.external_vrr.savings_valid=false;d.external_vrr.requested=false;
+    dcp_set_adaptive_sync(&d,48U<<16,&wait);
+    assert(parameter_calls==1 && !mode_calls && !wait.done);
+    assert(parameter.param==14 && parameter.count==3 && parameter.value[0]==48U<<16);
+    for(unsigned i=1;i<8;i++)assert(!parameter.value[i]);
+    respond(&d,&ok);assert(mode_calls==1 && !wait.done);
+    respond(&d,&ok);assert(argument==1 && !wait.done);
+    respond(&d,&ok);assert(wait.done==1 && wait.refcount==1);
+    /* Fullscreen changes only the policy RPC, never a parameter or a timing. */
+    assert(dcp_external_vrr_update(&d,true,after,&continued));respond(&d,&ok);
+    assert(dcp_external_vrr_update(&d,false,after,&continued));respond(&d,&ok);
+    assert(parameter_calls==1 && mode_calls==1);
     return 0;
 }
 '''
