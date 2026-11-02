@@ -988,6 +988,12 @@
 			trips {
 				J616S_FAN_TRIPS(gpu0)
 
+				trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "passive";
+				};
+
 				gpu0_passive: trip-passive {
 					temperature = <101000>;
 					hysteresis = <5000>;
@@ -1042,6 +1048,12 @@
 
 			trips {
 				J616S_FAN_TRIPS(gpu1)
+
+				trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "passive";
+				};
 
 				gpu1_passive: trip-passive {
 					temperature = <101000>;
@@ -1098,6 +1110,12 @@
 			trips {
 				J616S_FAN_TRIPS(gpu2)
 
+				trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "passive";
+				};
+
 				gpu2_passive: trip-passive {
 					temperature = <101000>;
 					hysteresis = <5000>;
@@ -1152,6 +1170,12 @@
 
 			trips {
 				J616S_FAN_TRIPS(gpu3)
+
+				trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "passive";
+				};
 
 				gpu3_passive: trip-passive {
 					temperature = <101000>;
@@ -1208,6 +1232,12 @@
 			trips {
 				J616S_FAN_TRIPS(gpu4)
 
+				trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "passive";
+				};
+
 				gpu4_passive: trip-passive {
 					temperature = <101000>;
 					hysteresis = <5000>;
@@ -1263,6 +1293,12 @@
 			trips {
 				J616S_FAN_TRIPS(gpu5)
 
+				trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "passive";
+				};
+
 				gpu5_passive: trip-passive {
 					temperature = <101000>;
 					hysteresis = <5000>;
@@ -1317,6 +1353,12 @@
 
 			trips {
 				J616S_FAN_TRIPS(gpu6)
+
+				trip-switch-on {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "passive";
+				};
 
 				gpu6_passive: trip-passive {
 					temperature = <101000>;
