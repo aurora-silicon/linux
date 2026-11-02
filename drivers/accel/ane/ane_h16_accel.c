@@ -109,7 +109,9 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 						     args->hwx_size, &snapshot);
 	if (ret)
 		goto out;
-	mutex_lock(&a->lock);
+	ret = ane_h16_session_enter(a->session);
+	if (ret)
+		goto out;
 	if (f->program) {
 		ret = -EBUSY;
 	} else {
@@ -158,7 +160,9 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 			   array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
 	start = ktime_get_ns();
-	mutex_lock(&a->lock);
+	ret = ane_h16_session_enter(a->session);
+	if (ret)
+		return ret;
 	locked = ktime_get_ns();
 	p = f->program;
 	if (!p || p->closed || args->count != p->resource_count) {
@@ -299,6 +303,8 @@ int ane_h16_accel_register(struct device *dev, struct ane_h16_session *session)
 	ret = drmm_mutex_init(&a->drm, &a->lock);
 	if (ret)
 		return ret;
+	/* The session's sleep gate serializes on the node lock. */
+	session->lock = &a->lock;
 	ret = drm_dev_register(&a->drm, 0);
 	if (ret)
 		return ret;
