@@ -27,6 +27,7 @@
 #include <linux/printk.h>
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
+#include <linux/spinlock.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -34,6 +35,7 @@
 #include "spi-hid-apple.h"
 
 #define SPIHID_DEF_WAIT msecs_to_jiffies(1000)
+#define SPIHID_GET_REPORT_ATTEMPTS 3
 
 #define SPIHID_MAX_INPUT_REPORT_SIZE 0x800
 
@@ -76,6 +78,9 @@ struct spihid_interface {
 	u8 name[32];
 	u8 reply_buf[SPIHID_DESC_MAX];
 	u32 reply_len;
+	u8 reply_id;
+	u8 reply_report;
+	bool reply_pending;
 	bool ready;
 };
 
@@ -99,6 +104,8 @@ struct spihid_apple {
 
 	wait_queue_head_t wait;
 	struct mutex tx_lock; //< protects against concurrent SPI writes
+	struct mutex get_report_lock; /* serializes synchronous GET_REPORTs */
+	spinlock_t reply_lock; /* protects reply state shared with the IRQ thread */
 
 	struct spi_message rx_msg;
 	struct spi_message tx_msg;
@@ -273,6 +280,9 @@ static void spihid_flush_led_reports(struct spihid_apple *spihid)
  */
 
 
+static struct spihid_interface *spihid_get_iface(struct spihid_apple *spihid,
+						 u32 iface);
+
 static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 				u8 unk1, u8 unk2, u16 resp_len, u8 *buf,
 				    size_t len)
@@ -280,6 +290,7 @@ static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 	struct spihid_transfer_packet *pkt;
 	struct spihid_msg_hdr *hdr;
 	u16 crc;
+	bool bad_status;
 	int err;
 
 	/* know reports are small enoug to fit in a single packet */
@@ -320,15 +331,32 @@ static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 
 	memset(spihid->status_buf, 0, sizeof(spi_hid_apple_status_ok));
 
+	if (unk0 == 0x32) {
+		struct spihid_interface *iface = spihid_get_iface(spihid, target);
+		unsigned long flags;
+
+		/* Arm before sending: the IRQ reply can precede spi_sync(). */
+		spin_lock_irqsave(&spihid->reply_lock, flags);
+		WRITE_ONCE(iface->reply_len, 0);
+		iface->reply_id = hdr->id;
+		iface->reply_report = unk1;
+		iface->reply_pending = true;
+		spin_unlock_irqrestore(&spihid->reply_lock, flags);
+	}
+
 	err = spi_sync(spihid->spidev, &spihid->tx_msg);
 
-	if (memcmp(spihid->status_buf, spi_hid_apple_status_ok,
-		   sizeof(spi_hid_apple_status_ok))) {
+	bad_status = !err && memcmp(spihid->status_buf, spi_hid_apple_status_ok,
+				    sizeof(spi_hid_apple_status_ok));
+	if (bad_status) {
 		u8 *b = spihid->status_buf;
-		dev_warn_ratelimited(&spihid->spidev->dev, "status message "
-				     "mismatch: %02x %02x %02x %02x\n",
-				     b[0], b[1], b[2], b[3]);
+		dev_warn_ratelimited(&spihid->spidev->dev,
+				     "status message mismatch: %02x %02x %02x %02x (device %u request %02x report %02x id %u)\n",
+				     b[0], b[1], b[2], b[3], target, unk0, unk1, hdr->id);
 	}
+	/* Preserve best-effort SET/OUTPUT semantics; only GETs are replayable. */
+	if (bad_status && unk0 == 0x32)
+		err = -EPROTO;
 	mutex_unlock(&spihid->tx_lock);
 	if (err < 0)
 		return err;
@@ -389,13 +417,62 @@ static int apple_ll_parse(struct hid_device *hdev)
 	return hid_parse_report(hdev, idev->hid_desc, idev->hid_desc_len);
 }
 
+static int spihid_get_report(struct spihid_apple *spihid,
+			     struct spihid_interface *idev, u8 reportnum,
+			     u8 *buf, size_t len)
+{
+	unsigned long flags;
+	int attempt, ret;
+	bool timed_out;
+
+	ret = mutex_lock_interruptible(&spihid->get_report_lock);
+	if (ret)
+		return ret;
+
+	for (attempt = 0; attempt < SPIHID_GET_REPORT_ATTEMPTS; attempt++) {
+		timed_out = false;
+		ret = spihid_apple_request(spihid, idev->id, 0x32, reportnum,
+					   0x00, len, NULL, 0);
+		if (ret >= 0) {
+			ret = wait_event_interruptible_timeout(spihid->wait,
+							       READ_ONCE(idev->reply_len),
+							       SPIHID_DEF_WAIT);
+			if (!ret) {
+				timed_out = true;
+				ret = -ETIMEDOUT;
+			}
+		}
+
+		spin_lock_irqsave(&spihid->reply_lock, flags);
+		idev->reply_pending = false;
+		if (ret > 0) {
+			ret = min_t(size_t, len, idev->reply_len);
+			memcpy(buf, idev->reply_buf, ret);
+		}
+		spin_unlock_irqrestore(&spihid->reply_lock, flags);
+
+		/*
+		 * RX CRC validation can discard a reply even after a valid
+		 * write status. Only retry that timeout, with a fresh ID.
+		 * Bad status and other transport errors are returned as-is.
+		 */
+		if (!timed_out)
+			break;
+	}
+
+	mutex_unlock(&spihid->get_report_lock);
+	if (ret < 0)
+		dev_err(&spihid->spidev->dev,
+			"get report %02x failed: %d\n", reportnum, ret);
+	return ret;
+}
+
 static int apple_ll_raw_request(struct hid_device *hdev,
 				unsigned char reportnum, __u8 *buf, size_t len,
 				unsigned char rtype, int reqtype)
 {
 	struct spihid_interface *idev = hdev->driver_data;
 	struct spihid_apple *spihid = spihid_get_data(idev);
-	int ret;
 
 	dev_dbg(&spihid->spidev->dev,
 		"apple_ll_raw_request: device:%u reportnum:%hhu rtype:%hhu",
@@ -406,21 +483,7 @@ static int apple_ll_raw_request(struct hid_device *hdev,
 		if (rtype != HID_FEATURE_REPORT)
 			return -EINVAL;
 
-		idev->reply_len = 0;
-		ret = spihid_apple_request(spihid, idev->id, 0x32, reportnum, 0x00, len, NULL, 0);
-		if (ret < 0)
-			return ret;
-
-		ret = wait_event_interruptible_timeout(spihid->wait, idev->reply_len,
-						       SPIHID_DEF_WAIT);
-		if (ret == 0)
-			ret = -ETIMEDOUT;
-		if (ret < 0) {
-			dev_err(&spihid->spidev->dev, "waiting for get report failed: %d", ret);
-			return ret;
-		}
-		memcpy(buf, idev->reply_buf, max_t(size_t, len, idev->reply_len));
-		return idev->reply_len;
+		return spihid_get_report(spihid, idev, reportnum, buf, len);
 
 	case HID_REQ_SET_REPORT:
 		if (!len || buf[0] != reportnum)
@@ -699,10 +762,11 @@ static bool spihid_process_iface_hid_report_desc(struct spihid_apple *spihid,
 }
 
 static bool spihid_process_iface_get_report(struct spihid_apple *spihid,
-					    u32 device, u8 report,
+					    u32 device, u8 report, u8 id,
 					    u8 *payload, size_t len)
 {
 	struct spihid_interface *iface = spihid_get_iface(spihid, device);
+	unsigned long flags;
 
 	if (!iface)
 		return false;
@@ -710,8 +774,16 @@ static bool spihid_process_iface_get_report(struct spihid_apple *spihid,
 	if (len > sizeof(iface->reply_buf) || len < 1)
 		return false;
 
+	spin_lock_irqsave(&spihid->reply_lock, flags);
+	if (!iface->reply_pending || iface->reply_id != id ||
+	    iface->reply_report != report) {
+		spin_unlock_irqrestore(&spihid->reply_lock, flags);
+		return false;
+	}
 	memcpy(iface->reply_buf, payload, len);
-	iface->reply_len = len;
+	WRITE_ONCE(iface->reply_len, len);
+	iface->reply_pending = false;
+	spin_unlock_irqrestore(&spihid->reply_lock, flags);
 
 	wake_up_interruptible(&spihid->wait);
 
@@ -739,7 +811,8 @@ static bool spihid_process_response(struct spihid_apple *spihid, u32 device,
 	}
 
 	if (hdr->unknown0 == 0x32) {
-		return spihid_process_iface_get_report(spihid, device, hdr->unknown1, payload, len);
+		return spihid_process_iface_get_report(spihid, device, hdr->unknown1,
+						 hdr->id, payload, len);
 	}
 
 	return false;
@@ -1083,6 +1156,8 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 	init_waitqueue_head(&spihid->wait);
 
 	mutex_init(&spihid->tx_lock);
+	mutex_init(&spihid->get_report_lock);
+	spin_lock_init(&spihid->reply_lock);
 
 	/* Init spi transfer buffers and power device on */
 	err = spihid_apple_setup_spi(spihid);
@@ -1318,3 +1393,7 @@ EXPORT_SYMBOL_GPL(spihid_apple_core_pm);
 MODULE_DESCRIPTION("Apple SPI HID transport driver");
 MODULE_AUTHOR("Janne Grunau <j@jannau.net>");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_SPI_HID_APPLE_KUNIT_TEST)
+#include "spi-hid-apple-test.c"
+#endif
