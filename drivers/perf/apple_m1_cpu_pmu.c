@@ -186,6 +186,26 @@ static const u16 m1_pmu_pmceid_map[ARMV8_PMUV3_MAX_COMMON_EVENTS] = {
 	M1_PMUV3_EVENT_MAP(BR_MIS_PRED_RETIRED,	BRANCH_MISPRED_NONSPEC),
 };
 
+/*
+ * A18 Pro (T8140) cores: PMC0 and PMC1 count cycles and instructions like
+ * the M1/M2 fixed counters, all ten counters are 64 bits wide and PMCR0 has
+ * the M2 layout (measured on hardware). The event numbers of the
+ * programmable counters are not known for these cores, so only the two fixed
+ * counters are offered. A single PMU instance covers both clusters so perf
+ * events (including KVM's backing events) keep counting when a task migrates.
+ * This does not establish compatibility for any programmable events.
+ */
+static const u16 tahiti_pmu_event_affinity[M1_PMU_PERFCTR_LAST + 1] = {
+	[M1_PMU_PERFCTR_CORE_ACTIVE_CYCLE]	= BIT(0),
+	[M1_PMU_PERFCTR_INST_ALL]		= BIT(1),
+};
+
+static const unsigned int tahiti_pmu_perf_map[PERF_COUNT_HW_MAX] = {
+	PERF_MAP_ALL_UNSUPPORTED,
+	[PERF_COUNT_HW_CPU_CYCLES]		= M1_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
+	[PERF_COUNT_HW_INSTRUCTIONS]		= M1_PMU_PERFCTR_INST_ALL,
+};
+
 /* sysfs definitions */
 static ssize_t m1_pmu_events_sysfs_show(struct device *dev,
 					struct device_attribute *attr,
@@ -493,11 +513,12 @@ static void m1_pmu_write_counter(struct perf_event *event, u64 value)
 	isb();
 }
 
-static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
-				struct perf_event *event)
+static int __m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
+				  struct perf_event *event,
+				  const u16 *event_affinity)
 {
 	unsigned long evtype = event->hw.config_base & M1_PMU_CFG_EVENT;
-	unsigned long affinity = m1_pmu_event_affinity[evtype];
+	unsigned long affinity = event_affinity[evtype];
 	int idx;
 
 	/*
@@ -514,6 +535,18 @@ static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
 	}
 
 	return -EAGAIN;
+}
+
+static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
+				struct perf_event *event)
+{
+	return __m1_pmu_get_event_idx(cpuc, event, m1_pmu_event_affinity);
+}
+
+static int tahiti_pmu_get_event_idx(struct pmu_hw_events *cpuc,
+				    struct perf_event *event)
+{
+	return __m1_pmu_get_event_idx(cpuc, event, tahiti_pmu_event_affinity);
 }
 
 static void m1_pmu_clear_event_idx(struct pmu_hw_events *cpuc,
@@ -565,6 +598,18 @@ static int m2_pmu_map_event(struct perf_event *event)
 	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
 }
 
+static int tahiti_pmu_map_event(struct perf_event *event)
+{
+	int ret;
+
+	event->hw.flags |= ARMPMU_EVT_63BIT;
+	ret = armpmu_map_event(event, &tahiti_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
+	if (ret >= 0 && !tahiti_pmu_event_affinity[ret])
+		return -ENOENT;
+
+	return ret;
+}
+
 static int m1_pmu_map_pmuv3_event(unsigned int eventsel)
 {
 	u16 m1_event = HW_OP_UNSUPPORTED;
@@ -573,6 +618,18 @@ static int m1_pmu_map_pmuv3_event(unsigned int eventsel)
 		m1_event = m1_pmu_pmceid_map[eventsel];
 
 	return m1_event == HW_OP_UNSUPPORTED ? -EOPNOTSUPP : m1_event;
+}
+
+static int tahiti_pmu_map_pmuv3_event(unsigned int eventsel)
+{
+	switch (eventsel) {
+	case ARMV8_PMUV3_PERFCTR_CPU_CYCLES:
+		return M1_PMU_PERFCTR_CORE_ACTIVE_CYCLE;
+	case ARMV8_PMUV3_PERFCTR_INST_RETIRED:
+		return M1_PMU_PERFCTR_INST_ALL;
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 static void m1_pmu_init_pmceid(struct arm_pmu *pmu)
@@ -679,7 +736,26 @@ static int m2_pmu_blizzard_init(struct arm_pmu *cpu_pmu)
 	return m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
 }
 
+static int tahiti_pmu_init(struct arm_pmu *cpu_pmu)
+{
+	int ret = m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
+
+	if (ret)
+		return ret;
+
+	/* Both clusters share only the verified fixed-counter interface. */
+	cpu_pmu->name		  = "apple_t8140_pmu";
+	cpu_pmu->get_event_idx	  = tahiti_pmu_get_event_idx;
+	cpu_pmu->map_event	  = tahiti_pmu_map_event;
+	cpu_pmu->map_pmuv3_event  = tahiti_pmu_map_pmuv3_event;
+	bitmap_zero(cpu_pmu->pmceid_bitmap, ARMV8_PMUV3_MAX_COMMON_EVENTS);
+	set_bit(ARMV8_PMUV3_PERFCTR_CPU_CYCLES, cpu_pmu->pmceid_bitmap);
+	set_bit(ARMV8_PMUV3_PERFCTR_INST_RETIRED, cpu_pmu->pmceid_bitmap);
+	return 0;
+}
+
 static const struct of_device_id m1_pmu_of_device_ids[] = {
+	{ .compatible = "apple,t8140-pmu",		.data = tahiti_pmu_init, },
 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },
