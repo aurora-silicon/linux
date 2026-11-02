@@ -57,6 +57,9 @@ struct prog_fw {
 	unsigned int execs;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
+	/* busy(true) and busy(false) calls, and the deepest nesting seen. */
+	unsigned int busy_on, busy_off;
+	int busy_depth, busy_max;
 	/* Cache maintenance calls, when the fake hands out cached surfaces. */
 	bool cached;
 	unsigned int syncs_device, syncs_cpu;
@@ -326,9 +329,23 @@ static void fw_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
 	f->last_sync_dva = s->dva;
 }
 
+static void fw_busy(void *ctx, bool busy)
+{
+	struct prog_fw *f = ctx;
+
+	if (busy) {
+		f->busy_on++;
+		f->busy_max = max(f->busy_max, ++f->busy_depth);
+	} else {
+		f->busy_off++;
+		f->busy_depth--;
+	}
+}
+
 static const struct ane_h16_session_ops fw_session_ops = {
 	.map = fw_map,
 	.log = fw_log,
+	.busy = fw_busy,
 	.sync = fw_sync,
 };
 
@@ -1773,10 +1790,44 @@ static void program_failed_close_keeps_test(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, p->surfaces[0]);
 }
 
+/*
+ * The busy hook brackets every EXECUTE that reaches the firmware, pass or
+ * fail, exactly once and never nested; a refused call never votes.
+ */
+static void program_busy_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test), *g = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 0);
+	for (i = 0; i < 5; i++)
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 5);
+	KUNIT_EXPECT_EQ(test, f->busy_off, 5);
+	KUNIT_EXPECT_EQ(test, f->busy_max, 1);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, NULL), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&g->s, p), -EINVAL);
+	KUNIT_EXPECT_EQ(test, f->busy_on + g->busy_on, 5);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+
+	/* A stalled request still releases the vote. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(g, &q), 0);
+	g->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_NE(test, ane_h16_session_execute(&g->s, q), 0);
+	KUNIT_EXPECT_EQ(test, g->busy_on, 1);
+	KUNIT_EXPECT_EQ(test, g->busy_off, 1);
+	KUNIT_EXPECT_EQ(test, g->busy_depth, 0);
+}
+
 static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_cycle_test),
 	KUNIT_CASE(program_h17_cycle_test),
 	KUNIT_CASE(program_failed_close_keeps_test),
+	KUNIT_CASE(program_busy_test),
 	KUNIT_CASE(program_cached_sync_test),
 	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),

@@ -44,6 +44,9 @@ struct ane_h16_device {
 	struct device *dev;
 	void __iomem *window[ANE_H16_WINDOWS];
 	struct device *power[5];
+	/* Optional "perf" floor, voted only while an EXECUTE is in flight. */
+	struct device *perf;
+	bool perf_held;
 	struct device *dart[3];
 	u32 powered;
 	u32 darts_powered;
@@ -501,9 +504,12 @@ static const struct ane_h16_boot_ops ane_h16_ops = {
 	.quarantine = ane_h16_quarantine,
 };
 
+static void ane_h16_busy(void *ctx, bool busy);
+
 static const struct ane_h16_session_ops ane_h16_session_ops = {
 	.map = ane_h16_program_map,
 	.log = ane_h16_log,
+	.busy = ane_h16_busy,
 };
 
 static const struct ane_fw_transport_ops ane_h16_transport_ops = {
@@ -566,6 +572,14 @@ static void ane_h16_release(struct ane_h16_device *h)
 			put_device(h->dart[i]);
 		h->dart[i] = NULL;
 	}
+	if (h->perf) {
+		if (h->perf_held)
+			pm_runtime_put_sync(h->perf);
+		h->perf_held = false;
+		pm_runtime_dont_use_autosuspend(h->perf);
+		dev_pm_domain_detach(h->perf, false);
+		h->perf = NULL;
+	}
 	while (h->powered) {
 		struct device *pd = h->power[--h->powered];
 
@@ -581,14 +595,57 @@ static irqreturn_t ane_h16_masked_irq(int irq, void *data)
 	return IRQ_NONE;
 }
 
+/*
+ * The optional "perf" domain is a performance floor (the PMC SoC-max floor
+ * on the M4 Pro): engine time roughly halves with the SoC and fabric at
+ * their highest state. Attached powered off, it is voted for each EXECUTE
+ * and released 100 ms after the last one ends (autosuspend), so a burst of
+ * requests keeps it and an idle engine does not hold the SoC up.
+ */
+#define ANE_H16_PERF_IDLE_MS 100
+
+static int ane_h16_attach_perf(struct ane_h16_device *h)
+{
+	struct device *pd = dev_pm_domain_attach_by_id(h->dev, 5);
+
+	if (IS_ERR_OR_NULL(pd))
+		return pd ? PTR_ERR(pd) : -ENODEV;
+	pm_runtime_set_autosuspend_delay(pd, ANE_H16_PERF_IDLE_MS);
+	pm_runtime_use_autosuspend(pd);
+	h->perf = pd;
+	dev_info(h->dev, "H16 perf floor attached, held per request (%u ms idle)\n",
+		 ANE_H16_PERF_IDLE_MS);
+	return 0;
+}
+
+static void ane_h16_busy(void *ctx, bool busy)
+{
+	struct ane_h16_device *h = ctx;
+
+	if (!h->perf)
+		return;
+	if (busy) {
+		/* Best effort: without the floor the request still runs, slower. */
+		if (!h->perf_held && pm_runtime_resume_and_get(h->perf) >= 0)
+			h->perf_held = true;
+	} else if (h->perf_held) {
+		pm_runtime_mark_last_busy(h->perf);
+		pm_runtime_put_autosuspend(h->perf);
+		h->perf_held = false;
+	}
+}
+
 static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *h)
 {
 	struct device_node *np = pdev->dev.of_node;
 	static const char * const names[] = { "engine", "pmgr", "aux-3" };
 	unsigned int i, j;
-	int ret, irq;
+	bool perf;
+	int ret, irq, n;
 
-	if (of_count_phandle_with_args(np, "power-domains", "#power-domain-cells") != 5)
+	n = of_count_phandle_with_args(np, "power-domains", "#power-domain-cells");
+	perf = n == 6 && of_property_match_string(np, "power-domain-names", "perf") == 5;
+	if (n != 5 && !perf)
 		return -EINVAL;
 	for (i = 0; i < 5; i++) {
 		struct device *pd = dev_pm_domain_attach_by_id(h->dev, i);
@@ -601,6 +658,11 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 			return ret;
 		}
 		h->power[h->powered++] = pd;
+	}
+	if (perf) {
+		ret = ane_h16_attach_perf(h);
+		if (ret)
+			return ret;
 	}
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
 		struct resource *r = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);

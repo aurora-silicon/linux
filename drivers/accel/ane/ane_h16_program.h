@@ -159,6 +159,12 @@ struct ane_h16_session_ops {
 	 * or for a surface without a handle, memory is coherent.
 	 */
 	void (*sync)(void *ctx, const struct ane_fw_surface *surface, bool for_device);
+	/*
+	 * Optional. Called with true before an EXECUTE touches the firmware
+	 * and with false after it ended, successful or not, so a backend can
+	 * hold a performance vote only while work is in flight.
+	 */
+	void (*busy)(void *ctx, bool busy);
 };
 
 struct ane_h16_program {
