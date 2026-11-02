@@ -68,14 +68,17 @@ struct DCP_FW_NAME(dcp_swap) {
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/*
 	 * The desktop 26.x firmware takes the panel level in nits, as an
-	 * IEEE-754 binary64 at +0x35e (unaligned), flagged by bl_flags[1].
-	 * The display EDR scale (SDR white over the current peak) is the
-	 * binary64 at +0x37e, flagged by bl_flags[2]; the headroom the frame
-	 * uses is the one at +0x3e6, flagged by bl_flags[4].
+	 * IEEE-754 binary64 at +0x35e (unaligned), flagged by bl_update.  The
+	 * brightness limit is the binary64 at +0x376, flagged by bl_flags[1]
+	 * (a zero limit clears it).  The display EDR scale is the binary64 at
+	 * +0x37e, flagged by bl_flags[2]; the headroom the frame uses is the
+	 * one at +0x3e6, flagged by bl_flags[4].  Each value is kept by the
+	 * firmware until a swap carries it again.
 	 */
 	u8 bl_flags[6];
 	__le64 bl_nits;
-	u8 unk_366[0x18];
+	u8 unk_366[0x10];
+	__le64 bl_limit;
 	__le64 edr_scale;
 	u8 unk_386[0xb];
 #else

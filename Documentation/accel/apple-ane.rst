@@ -329,27 +329,214 @@ produce a timeout. The loader pins both fixture hashes and uses ABI 1 ioctls dir
 shared libane library is needed. ``--check-fixtures`` validates the two containers without
 opening a device.
 
+H14 program lifetime
+--------------------
+
+Byte-identical sections share one program and one process. Every file holds
+a reference on each program it loaded, and ``PROC_CREATE`` and ``EXEC``
+refuse a program the file holds no reference on with ``-ENOENT``. A program's
+kernel IDs stay valid for as long as a file holds it; whether it is loaded in
+the firmware right now (resident) is managed by the driver:
+
+- When the last file holding a program closes, the driver sends
+  TERMINATE_PROCESS (0x203) for its process and then DESTROY_PROGRAM (0x201),
+  and only after both are acknowledged gives the section buffers back.
+- The firmware's L2 spill pool holds eight 2 MiB buffers; every
+  CREATE_PROCESS grows it while it holds fewer than eight. At most eight
+  programs are resident. Before each LOAD the least recently used program a
+  file still holds is unloaded for room; its next ``PROC_CREATE`` or ``EXEC``
+  loads it again and creates a new process, with the same IDs. The firmware's
+  program and process tables (240 and 496 advertised) are not the limit.
+- Only when every resident program is held (a load or unload whose outcome is
+  unknown) does the driver restart the firmware at that idle point (see
+  below). Programs that files still hold become non-resident and load again
+  on use.
+
+A program whose TD stream opens or closes on the wrong task is refused with
+``-EINVAL`` before the firmware sees it. Header word 2 of each TD block must
+be 0x08 on the first task, 0 between and 0x22 on the last (0x2a for a single
+task), as in every decoded Apple H14 program. A program with 0x2a on every
+task of several returned from its call on the M2 and then left the firmware
+unable to complete any further command until reboot.
+
+A failed load or unload keeps the program and its buffers until a verified
+firmware restart.
+
+The firmware asks for memory on the SHAREDMALLOC ring and gives it back with
+a FREE request, which carries the returned IOVA in the slot header and an
+empty body. It waits for the answer with its shared-memory lock held, and a
+FREE caused by a command can arrive after that command's acknowledgment. The
+driver serves the ring before each command, while a command or call is
+pending, and for 10 ms of quiet after each unload command. A FREE releases the
+buffer and its table slot, so the table and its byte count follow the live
+allocations rather than every allocation since boot.
+
+``fw_memory`` in the device's accel debugfs directory reports the live
+firmware allocations, their bytes, the table high-water mark, the known,
+held, resident and cached programs, the resident limit, the restarts for
+room and the firmware generation. A command timeout also logs the allocation ring and the
+target-to-host rings at the host cursors.
+
 H14 recovery lifecycle
 ----------------------
 
-The firmware path (``ane_t6021.ko``) uses one bounded deadline for the command
-acknowledgment and its finish event. H14 engine reset is not enabled by this
-change. Reusing only the H13 task-manager re-arm would leave the firmware and
-its program cache invalid. The corresponding recovery implementation needs to:
+The firmware path (``ane_t6021.ko``) gives the command acknowledgment and
+finish event one bounded deadline. A failed exchange quarantines submissions
+and attempts one reset under the firmware lock. Operator retry uses the same
+``wedged`` and ``reset`` attributes as H13.
 
-* Serialize firmware commands and stop the RX worker before releasing the
-  consumer's runtime-PM reference and synchronously suspending its suppliers.
-* Verify power-off for the CPU and engine partitions through their providers
-  before dropping boot pins or reclaiming firmware-visible allocations.
-* Retain metadata for every firmware-owned BO and boot allocation, including
-  objects whose last userspace reference disappeared. The current release
-  path discards some of this metadata while retaining the backing memory.
-* Restore the validated firmware image and run the existing fenced probe boot
-  sequence, including channel-table validation, host acknowledgment and
-  CONFIG_GET. A failed boot remains quarantined with its DMA backing held.
-* Invalidate the cached program/process IDs across the restart and prevent a
-  stale userspace ID from aliasing a newly allocated firmware ID. Clients must
-  reload their programs before resubmitting.
+The supported reset profile is the Linux-owned 13.5 legacy firmware path:
+the complete SoC power-domain binding, an owned staged image, and the fenced
+boot sequence. Borrowed firmware, RTKit mode, later generations and incomplete
+initial boots remain fenced. A second H14 binding is refused because the
+firmware cache and BO pool have one owner.
 
-Those ownership and identifier changes require their own H14 reset test.
-Quarantine must not be cleared solely because a power transition returned zero.
+A restart for room (planned) runs with the firmware idle under the firmware
+lock. It answers any pending SHAREDMALLOC request and posts POWER_DOWN
+(0x0b, the 8-byte header only). That command never completes: the firmware
+stops its timers and waits in WFI for good. The driver instead waits for the
+dispatcher to clear the completion field it marked, then for the ASC to report
+WFI on twenty reads 100 us apart, then clears CPU_CONTROL RUN (bit 4) and
+requires CPU_STATUS STOPPED (bit 1) with RUN clear. On T8112 an idle core reads 0x2c
+and a halted one 0x28, neither of which is stopped. After a command timeout
+the command worker is blocked and nothing can overtake the stuck command, so
+only the RUN clear is tried. If
+STOPPED is not seen, nothing is powered off: the device stays quarantined
+with its mappings, power claim and pin. Only after STOPPED does the restart
+suspend the consumer and suppliers through the shared PM transaction. This
+prevents firmware power-state writes from racing provider shutdown. It then
+verifies every domain and the CPU ACTUAL field off, resumes, repeats the probe
+power/PWGATE gates, and requires the CPU to be stopped before changing its
+image or boot state. It restores a cached, validated pristine image into the
+existing mappings; recovery does not fetch a replacement file or rebuild the
+entry aliases. The existing boot helper performs the READY/DONE handshake,
+then recovery validates ChMan, writes the host acknowledgment and requires a
+valid CONFIG_GET response. An enabled firmware performance property is
+restored through its existing command.
+
+Old boot pools, firmware MALLOC buffers and closed firmware-visible BOs keep
+their metadata and backing until the new boot is validated. Failed resets
+retain those records and any CPU lifetime pin needed by a running or uncertain
+CPU. Retired MALLOC arenas remain charged against the existing byte and record
+limits; at most two failed-boot arenas can accumulate. A successful restart
+reclaims retired arenas and closed BOs. Live old BO handles and mappings remain
+client-owned memory and can be reused for loading a program again.
+
+Program and process IDs are opaque kernel identifiers. The allocator survives
+firmware restarts and refuses exhaustion instead of wrapping. A restart drops
+every firmware wire ID; programs that files hold load again with new wire IDs
+on their next use, so an old wire ID never aliases a new one and clients keep
+their kernel IDs. The ``ane-fw-ids`` KUnit suite checks non-reuse and
+exhaustion boundaries, and ``ane-t6021-lifetime`` checks the task count, the
+never-terminate rule, the resident budget, eviction order, reload after a
+restart and the restart stop sequence.
+
+H14 keeps its existing domain-link lifetime reference and a reference for the
+currently running firmware CPU. Recovery releases the old CPU reference only
+after verified quiescence and acquires a new one before the first boot write;
+it does not accumulate one reference per failure. This change does not provide
+normal H14 module unload while firmware is active. H14 restart still requires
+silicon qualification; the H13 hang fixture must not be submitted through ABI 2.
+
+H14 system-sleep adapter
+=======================
+
+``ane_t6021_pm.h`` provides the system-sleep PM operations and submission
+fencing used by ane_t6021. Stop, firmware reload, channels, allocation ownership
+and program replay remain in the shared H14 lifetime implementation from
+https://github.com/aurora-silicon/linux/pull/737. System sleep and timeout
+recovery use one stop helper, one boot function and one transaction commit.
+The shutdown protocol is not implemented a second time by the PM adapter.
+
+The adapter contract is:
+
+* Embed ``struct ane_t6021_pm`` in the client, initialized once at probe with
+  its existing firmware mutex, lifetime callback table, client context and
+  ``ANE_T6021_PM_ACTIVE`` state.
+* Use ``DEFINE_ANE_T6021_SYSTEM_PM_OPS(name, getter)`` to define the device PM
+  operations. The getter returns the embedded adapter without replacing the
+  driver's own drvdata. The driver binds ``pm_sleep_ptr(&name)`` to
+  ``driver.pm`` and supplies the shared lifetime callbacks below.
+* Every external firmware-facing submission checks
+  ``ane_t6021_pm_submit_error()`` under that same firmware mutex. Suspend acquires the mutex, draining the current
+  synchronous command and its finish event, and fences queued submitters
+  before calling the shared stop callback.
+* The stop callback performs the validated firmware shutdown handshake, drains
+  RX and proves ASC STOPPED with RUN clear before returning success. Clearing
+  RUN or observing ordinary WFI/idle is insufficient. Failure must retain
+  power claims, DMA mappings, firmware backing and the module pin.
+* The restart callback is the same cold-start/handshake/program-replay path
+  used by timeout recovery. Supplier and DART system callbacks must restore
+  access first. Return success only after channels, CONFIG_GET and desired
+  firmware properties are restored and the lifetime owner has made public IDs
+  usable under its normal lazy-reload policy. RX and all firmware-owned
+  resources stay with this one lifetime implementation.
+
+System PM holds an additional consumer reference and disables runtime PM
+during the late/noirq phases. Suspend stops at ``ane_t6021_restart_stop()`` and
+keeps the shared restart transaction on the client across the system power
+boundary. Genpd and
+DART system callbacks perform that power transition. Resume checks provider
+access and the stopped-core predicate, then invokes the same boot and commit
+functions as runtime recovery. Runtime recovery still uses the shared runtime-PM
+cycle between stop and boot. No runtime-PM force/cycle helper is called by the
+system-sleep callbacks.
+
+Failure leaves submissions fenced with EHOSTDOWN and retains firmware-visible
+backing and pins. A verified explicit recovery can reopen the PM gate. The
+adapter never sends firmware power commands or duplicates the program/allocation
+cache. Internal shutdown/restart commands run through the shared lifetime owner
+while external work is fenced.
+
+Device-free tests
+-----------------
+
+The ``ane-h14-sleep`` KUnit suite invokes the generated device callbacks with a
+fake shared-lifetime backend. It checks three successive cycles, that callbacks
+hold the firmware mutex with submissions fenced, failed stop and restart
+propagation, unwind before suspend, and suspend/freeze/poweroff versus
+resume/thaw/restore callback mapping. Firmware stop predicates, shutdown command
+layouts and program replay are tested by the lifetime owner, not reimplemented
+here. Run the PM suites without hardware::
+
+  ./tools/testing/kunit/kunit.py run \
+    --kunitconfig=tools/testing/selftests/drivers/ane/pm.kunitconfig \
+    --jobs=8
+
+M2 validation plan
+------------------
+
+Runtime testing requires the shared lifetime implementation and this PM
+integration together. Do not infer a hardware pass from the adapter's KUnit
+results.
+Run on a T8112 with the candidate kernel and its matching ane_t6021 module,
+through the hardware controller with exclusive device ownership, bounded
+console capture and a tested boot fallback. Record the kernel/module revision,
+firmware identity, boot ID, initial kernel log and the smoke command. Use the
+same known-good H14 smoke and model/input fixtures for the baseline and every
+post-resume check. Verify the complete output, including its expected surface
+size, and vary inputs or poison outputs so retained output cannot pass.
+
+1. Run the smoke before suspend. Keep a client with a loaded program, process,
+   BO handles and mappings open for the duration of the test.
+2. Save the current pm_test setting. Repeat the following three times, capturing
+   the new kernel log and running the smoke after *each* cycle::
+
+     echo platform > /sys/power/pm_test
+     echo mem > /sys/power/state
+     # Run the recorded H14 smoke, checking its exit status and full output.
+
+   Require the shared stop proof and successful restart/handshake/replay receipts
+   each time. Exercise the surviving client's original handles with new inputs,
+   and a newly opened client, after each cycle. Require an unchanged boot ID,
+   correct nonempty outputs, and no LEGACY timeout, failed exchange, DART fault,
+   crash or PM failure. Confirm identical repeated cycles do not accumulate
+   module references or retained allocations.
+3. Set pm_test to ``none``. If ``/sys/power/mem_sleep`` advertises ``s2idle``,
+   select it, arrange a supported timed or external wake through the controller,
+   and run a real ``echo mem > /sys/power/state`` cycle. Run both smokes after
+   wake and apply the same checks. Record unsupported s2idle or wake support
+   explicitly; a platform test does not establish real-suspend behavior.
+4. Restore pm_test and mem_sleep selections. Preserve failure evidence before
+   using the approved known-good boot fallback. Do not force-unload retained
+   firmware memory or treat an unproven stop as permission to remove power.

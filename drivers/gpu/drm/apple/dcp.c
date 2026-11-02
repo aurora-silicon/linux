@@ -3323,6 +3323,7 @@ static void dcp_av_service_init(struct apple_epic_service *service,
 		old = d->av_service;
 		d->av_service = service;
 		d->hdr_sent_valid = false;
+		d->hdr_infoframe = false;
 	}
 	if (old)
 		afk_service_put(old);
@@ -3338,6 +3339,7 @@ static void dcp_av_service_teardown(struct apple_epic_service *service)
 		if (owned) {
 			d->av_service = NULL;
 			d->hdr_sent_valid = false;
+			d->hdr_infoframe = false;
 		}
 	}
 	if (owned)
@@ -3835,6 +3837,8 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_26_6_DESKTOP:
 		iomfb_poweroff_v26_6_desktop(dcp);
+		if (dcp->edr_hm)
+			dcp->edr_restart = true;
 		/* The link set up again starts without HDR10 metadata. */
 		dcp_hdr_metadata_forget(dcp);
 		break;

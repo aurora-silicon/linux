@@ -30,23 +30,29 @@ properties:
       - apple,t8140-pmc
 
   reg:
-    maxItems: 2
+    minItems: 2
+    maxItems: 3
     description: |
       The perf-state floor words of the voter agents ("voters"), and the
       per-agent words holding the floor the PMC honours for each agent with
-      the per-rail interface enable words ("rails").
+      the per-rail interface enable words ("rails"). Optionally, the cluster
+      enable control word followed by its status word ("clusters").
 
   reg-names:
     description: |
       The rails block may come first, so that the node's unit address does
       not collide with a node covering the voters block.
     oneOf:
-      - items:
+      - minItems: 2
+        items:
           - const: voters
           - const: rails
-      - items:
+          - const: clusters
+      - minItems: 2
+        items:
           - const: rails
           - const: voters
+          - const: clusters
 
   nonposted-mmio: true
 
@@ -112,6 +118,65 @@ patternProperties:
       - reg
       - '#power-domain-cells'
 
+  '^floor-[a-z0-9-]+$':
+    type: object
+    description: |
+      A rail floor, provided as a power domain. While the domain is powered,
+      the AP's voter agent holds the rail at least at the given performance
+      state. Floors on the same rail combine to the highest powered one. The
+      AP agent must be a static voter, and the DCS rail cannot have a floor.
+    additionalProperties: false
+
+    properties:
+      label:
+        description: Name of the power domain.
+
+      '#power-domain-cells':
+        const: 0
+
+      apple,rail:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: Rail index.
+
+      apple,level:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        maximum: 15
+        description: Performance state held while the domain is powered.
+
+    required:
+      - '#power-domain-cells'
+      - apple,rail
+      - apple,level
+
+  '^cluster-[a-z0-9-]+$':
+    type: object
+    description: |
+      A cluster enable bit in the "clusters" words, provided as a power
+      domain. The bit is set, and its status awaited, while the domain is
+      powered. The T8140 video encoder cluster must be enabled for the PMP to
+      raise the encoder's performance state.
+    additionalProperties: false
+
+    properties:
+      label:
+        description: Name of the power domain.
+
+      '#power-domain-cells':
+        const: 0
+
+      power-domains:
+        maxItems: 1
+
+      apple,cluster-bit:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        maximum: 31
+        description: Bit of the cluster in the control and status words.
+
+    required:
+      - '#power-domain-cells'
+      - apple,cluster-bit
+
   '^performance-controller@[0-9a-f]+$':
     type: object
     description: The host performance controller's voter agent.
@@ -169,6 +234,13 @@ examples:
                 reg = <2>;
                 label = "gfx";
                 #power-domain-cells = <0>;
+            };
+
+            floor-soc-max {
+                label = "soc-max";
+                #power-domain-cells = <0>;
+                apple,rail = <1>;
+                apple,level = <2>;
             };
         };
     };

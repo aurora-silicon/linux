@@ -409,6 +409,11 @@ def hdr_metadata(root):
     struct.pack_into('<I', msg, 0x50, len(obj))
     msg += obj
     expected = ','.join(map(str, msg))
+    # selector 0x14: a fixed 0x80-byte message clearing InfoFrame type 0x87
+    stop = bytearray(0x80)
+    struct.pack_into('<HHIII', stop, 0, 0, 0, 0x14, 0x40, 0x69706378)
+    stop[0x40] = 0x87
+    expected_stop = ','.join(map(str, stop))
     return r"""
 #include <assert.h>
 #include <errno.h>
@@ -437,6 +442,7 @@ struct hdr_output_metadata {
 };
 """ + header + r"""
 static const u8 expected[] = {""" + expected + r"""};
+static const u8 expected_stop[] = {""" + expected_stop + r"""};
 int main(void)
 {
     struct hdr_output_metadata hdr = { .metadata_type = 0, .hdmi_metadata_type1 = {
@@ -467,7 +473,25 @@ int main(void)
     assert(dcp_hdr_reply(0, 0, reply, 0x44) == 0);
     put_unaligned_le32(0xe00002c2, reply + 0x40);
     assert(dcp_hdr_reply(0, 0, reply, sizeof(reply)) == -EIO);
-    printf("PASS: HDR10 static metadata message (%zu bytes) and reply checks\n", sizeof(msg));
+    /* Ending HDR: the selector 0x14 stop message, DCP status at 0x70. */
+    {
+        u8 stop[DCP_HDR_STOP_SIZE], sreply[DCP_HDR_STOP_SIZE] = {0};
+
+        assert(sizeof(expected_stop) == DCP_HDR_STOP_SIZE);
+        memset(stop, 0xa5, sizeof(stop));
+        dcp_hdr_stop_message(stop);
+        assert(!memcmp(stop, expected_stop, sizeof(stop)));
+        assert(dcp_hdr_stop_reply(-EIO, 0, sreply, sizeof(sreply)) == -EIO);
+        assert(dcp_hdr_stop_reply(0, 3, sreply, sizeof(sreply)) == -EIO);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, 0x73) == -EPROTO);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, 0x74) == 0);
+        /* the 0x15 status offset does not count for a stop */
+        put_unaligned_le32(1, sreply + 0x40);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, sizeof(sreply)) == 0);
+        put_unaligned_le32(1, sreply + 0x70);
+        assert(dcp_hdr_stop_reply(0, 0, sreply, sizeof(sreply)) == -EIO);
+    }
+    printf("PASS: HDR10 static metadata message (%zu bytes), InfoFrame stop and reply checks\n", sizeof(msg));
     return 0;
 }
 """

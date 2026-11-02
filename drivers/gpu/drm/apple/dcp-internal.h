@@ -278,13 +278,16 @@ struct dcp_desktop_state {
 	struct iomfb_set_matrix_req matrix;
 	/*
 	 * HDR10 static metadata (external processors): the pinned
-	 * dcpav-service-epic service, and the Type 1 body last sent on this
-	 * link (taken or refused), if any.  hdr_lock protects both.
+	 * dcpav-service-epic service, the Type 1 body last sent on this link
+	 * (taken or refused), if any, and whether the firmware took one, so
+	 * that the link carries a Dynamic Range and Mastering InfoFrame.
+	 * hdr_lock protects all of them.
 	 */
 	spinlock_t hdr_lock;
 	struct apple_epic_service *av_service;
 	u8 hdr_sent[24];
 	bool hdr_sent_valid;
+	bool hdr_infoframe;
 	u32 present_id;
 	bool present_pending;
 	/*
@@ -569,6 +572,13 @@ struct apple_dcp {
 	bool output_pq;
 	bool output_edr;
 	bool edr_sent;
+	/*
+	 * EDR headroom the panel was last given, x1000 (0: not in use), and
+	 * a power off since, after which the ramp starts again from 1.0 (see
+	 * dcp_edr_prepare()).
+	 */
+	u32 edr_hm;
+	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */

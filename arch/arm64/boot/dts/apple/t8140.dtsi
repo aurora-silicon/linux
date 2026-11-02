@@ -531,6 +531,20 @@
 				power-domains = <&ps_gfx>;
 				apple,always-on;
 			};
+
+			/*
+			 * PMP soc-device 15 (AVE0): the encoder's power request
+			 * and, in SOC-DEV-DVFS entry 0x198, its VMAX performance
+			 * request. The PMP then votes the AVE rail up itself.
+			 */
+			pmp_report_ave0: report@f {
+				compatible = "apple,t8140-pmp-v2-report-entry";
+				reg = <0xf>;
+				label = "pmp-ave0";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_venc0_sys>, <&pmc_venc_cluster>;
+				apple,dvfs = <0x198 2>;
+			};
 		};
 
 		pmp: pmp@300500000 {
@@ -1043,8 +1057,10 @@
 				     <AIC_IRQ 954 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 953 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>,
-				       <&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>;
-			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+				       <&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>,
+				       <&pmp_report_ave0>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1",
+					     "perf";
 			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
 			status = "disabled";
 		};
@@ -1264,8 +1280,9 @@
 		pmc: power-management@302800000 {
 			compatible = "apple,t8140-pmc";
 			reg = <0x3 0x02800000 0x0 0x10000>,
-			      <0x3 0x028aa000 0x0 0x3000>;
-			reg-names = "voters", "rails";
+			      <0x3 0x028aa000 0x0 0x3000>,
+			      <0x3 0x028a9c18 0x0 0x8>;
+			reg-names = "voters", "rails", "clusters";
 			power-domains = <&ps_pmc>;
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -1273,6 +1290,13 @@
 			/* PMP, CLPC and AP agents */
 			apple,static-voters = <0 1 3>;
 			status = "disabled";
+
+			/* VENC-CLSTR-V: the video encoder cluster, bit 3. */
+			pmc_venc_cluster: cluster-venc {
+				label = "venc-cluster";
+				#power-domain-cells = <0>;
+				apple,cluster-bit = <3>;
+			};
 
 			clpc: performance-controller@1 {
 				compatible = "apple,t8140-clpc";
