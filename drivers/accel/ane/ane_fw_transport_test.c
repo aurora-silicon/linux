@@ -849,7 +849,9 @@ static void ane_transport_shared_rejections_test(struct kunit *test)
 		KUNIT_EXPECT_MEMEQ(test, f->refused, tuples[i], sizeof(f->refused));
 		KUNIT_EXPECT_EQ(test, f->refused_error, error);
 		KUNIT_EXPECT_EQ(test, f->allocs, 0U);
-		KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+		/* The notification is acknowledged; no ring reply is written. */
+		KUNIT_EXPECT_EQ(test, ane_test_writes(f), 1U);
+		KUNIT_EXPECT_EQ(test, f->last_reg, f->soc.irq_ack);
 	}
 }
 
@@ -867,7 +869,9 @@ static void ane_transport_allocator_rejections_test(struct kunit *test)
 		KUNIT_EXPECT_EQ_MSG(test, ane_fw_transport_shared(&f->t), -EPROTO,
 				    "allocator result %u", i);
 		KUNIT_EXPECT_EQ(test, f->t.shared_count, 0U);
-		KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+		/* The notification is acknowledged; no ring reply is written. */
+		KUNIT_EXPECT_EQ(test, ane_test_writes(f), 1U);
+		KUNIT_EXPECT_EQ(test, f->last_reg, f->soc.irq_ack);
 	}
 	KUNIT_ASSERT_EQ(test, ane_test_init_transport(f), 0);
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
@@ -1068,7 +1072,9 @@ static void ane_transport_free_test(struct kunit *test)
 	ane_test_shared_request(f, dva, 0, 0);
 	f->count = 0;
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOENT);
-	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+	/* The notification is acknowledged; no ring reply is written. */
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 1U);
+	KUNIT_EXPECT_EQ(test, f->last_reg, f->soc.irq_ack);
 }
 
 /*
@@ -1333,7 +1339,9 @@ static void ane_transport_free_refusal_test(struct kunit *test)
 	f->count = 0;
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, f->t.shared_retired[0]);
-	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
+	/* The notification is acknowledged; no ring reply is written. */
+	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 1U);
+	KUNIT_EXPECT_EQ(test, f->last_reg, f->soc.irq_ack);
 }
 
 /* Publish one EXECUTE on the data channel; return its flags word as copied. */
