@@ -113,11 +113,15 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 mod bind;
 mod context;
 mod lifetime;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+mod m5_context;
 mod ppl;
 mod residency;
 mod shared;
 pub(crate) use bind::PreparedUserBindBatch;
 pub(crate) use lifetime::VmJobGuard;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+pub(crate) use m5_context::M5ExecutionContext;
 pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 
 /// PPL magic number for the handoff region
