@@ -526,6 +526,20 @@
 			status = "disabled";
 		};
 
+		apr: video-codec@295000000 {
+			compatible = "apple,t8140-prores";
+			reg = <0x2 0x95000000 0x0 0x4000>,
+			      <0x2 0x94000000 0x0 0x8000>;
+			reg-names = "core", "wrapper";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1260 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1259 IRQ_TYPE_LEVEL_HIGH>;
+			iommus = <&apr_dart 0>;
+			power-domains = <&ps_prores>;
+			resets = <&ps_prores>;
+			status = "disabled";
+		};
+
 		pmp_dart: iommu@300300000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x3 0x00300000 0x0 0xc000>;
