@@ -560,6 +560,18 @@
 			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
 	};
 
+	pmu-e {
+		compatible = "apple,brava-e-pmu";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_FIQ AIC_CPU_PMU_E IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	pmu-p {
+		compatible = "apple,brava-p-pmu";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
+	};
+
 	/* The 24 MHz reference clock (ADT clock-ids 4) of the I2C, PWM and watchdog blocks */
 	clkref: clock-ref {
 		compatible = "fixed-clock";
@@ -1120,6 +1132,19 @@
 		reg = <0x5 0x02400000 0x0 0x184000>,
 		      <0x5 0x02440000 0x0 0x4>;
 		reg-names = "core", "event";
+
+		affinities {
+			e-core-pmu-affinity {
+				apple,fiq-index = <AIC_CPU_PMU_E>;
+				cpus = <&cpu_e0 &cpu_e1 &cpu_e2 &cpu_e3>;
+			};
+
+			p-core-pmu-affinity {
+				apple,fiq-index = <AIC_CPU_PMU_P>;
+				cpus = <&cpu_p00 &cpu_p01 &cpu_p02 &cpu_p03 &cpu_p04
+					&cpu_p10 &cpu_p11 &cpu_p12 &cpu_p13 &cpu_p14>;
+			};
+		};
 	};
 
 	pmgr_aux: power-management@502800000 {
