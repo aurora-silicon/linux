@@ -30,6 +30,7 @@
 #include "ave.h"
 #include "ave-regs.h"
 #include "ave-dart-pte.h"
+#include "ave-temp.h"
 
 /*
  * Legacy TEXT CRCs accepted at T8140 probe. Encoding separately requires
@@ -478,6 +479,89 @@ static void ave_fw_6070_dart_walk(struct ave_dev *ave, const char *when)
 			 when, agree, compared);
 }
 
+/*
+ * Uses only the snapshot's existing WC TEXT/DATA aliases. No IOVA operations.
+ * The core TCR is not host-readable: its temporary geometry is the qualified
+ * H14G reset constant (r7 section 4.1), not DATA+0x60000's final geometry.
+ * TTBR is the qualified DATA root, not a read of the core register.
+ */
+static void ave_fw_6070_walk_temp(struct ave_dev *ave, const char *when,
+				  const u8 *t, const u8 *d, unsigned int slot)
+{
+	struct ave_temp_evidence *e = ave->temp_capture;
+	struct ave_temp_inputs in = {
+		.tcr = AVE_TEMP_TCR,
+		.ttbr = ave->data.iova + AVE_TEMP_ROOT,
+		.text_iova = ave->text.iova,
+		.data_iova = ave->data.iova,
+		.text_size = ave->text.size,
+		.data_size = ave->data.size,
+	};
+	struct ave_temp_result result = {};
+	size_t ts = ave->text.size, ds = ave->data.size;
+	u64 pc_va = 0x574, store_va;
+
+	if (ave->variant != &ave_t8112 || ave->text_crc != 0x25bfd039)
+		return;
+	if (!e || ds < AVE_TEMP_HI) {
+		dev_info(ave->dev, "6070 %s: temp walk unavailable (snapshot storage)\n", when);
+		return;
+	}
+	in.data_link = (u64)ave_6070_l(t, ts, 0x4240) << 32 |
+		       ave_6070_l(t, ts, 0x423c);
+	in.page_shift = ave_6070_l(t, ts, 0xcdfd8);
+	in.page_size = ave_6070_l(t, ts, 0xcdfdc);
+	in.index_bits = ave_6070_l(t, ts, 0xcdfe0);
+	in.final_va_bits = ave_6070_q(d, ds, 0x60000);
+	in.final_mode = ave_6070_q(d, ds, 0x60008);
+	in.pt_phys = ave_6070_uq(d, ds, 0x3649);
+	in.pt_virt = ave_6070_uq(d, ds, 0x366b);
+	in.pt_size = ave_6070_uq(d, ds, 0x36bb);
+	/* The linked _rtk_page_tables starts at DATA+0x20000. Overrides
+	 * select another destination; do not pretend to model that regime.
+	 */
+	store_va = in.pt_virt ?: AVE_TEMP_DATA_VA + AVE_6070_PT_START;
+	for (u32 off = AVE_TEMP_LO; off < AVE_TEMP_HI; off += 8)
+		e->observed[slot][(off - AVE_TEMP_LO) / 8] =
+			cpu_to_le64(ave_6070_q(d, ds, off));
+	result.pc = ave_temp_walk(e->observed[slot], &in, pc_va,
+				  in.text_iova + pc_va, true);
+	result.store = ave_temp_walk(e->observed[slot], &in, store_va,
+				     in.data_iova + AVE_6070_PT_START, false);
+	if (!ave_temp_model_inputs(&in))
+		result.store.fault = AVE_TEMP_GEOMETRY;
+	ave_temp_compare(e->observed[slot], &in, &result);
+	memset(e->model, 0, sizeof(e->model));
+	if (result.model_valid)
+		for (u32 off = AVE_TEMP_LO; off < AVE_TEMP_HI; off += 8)
+			e->model[(off - AVE_TEMP_LO) / 8] =
+				cpu_to_le64(ave_temp_model_word(&in, off));
+	dev_info(ave->dev,
+		 "6070 %s: temp geometry TCR-low %#x TTBR %#llx (reset-derived), link %#llx page %u/%#x/%u final %#llx/%#llx overrides %#llx/%#llx/%#llx\n",
+		 when, (u32)in.tcr, in.ttbr, in.data_link, in.page_shift, in.page_size,
+		 in.index_bits, in.final_va_bits, in.final_mode,
+		 in.pt_phys, in.pt_virt, in.pt_size);
+	for (unsigned int i = 0; i < ave->n_darts; i++)
+		dev_info(ave->dev, "6070 %s: temp DART%u tcr %#x ttbr %#x\n",
+			 when, i, readl(ave->dart_regs[i] + AVE_6070_DART_TCR0),
+			 readl(ave->dart_regs[i] + AVE_6070_DART_TTBR0));
+	for (unsigned int i = 0; i < 2; i++) {
+		const struct ave_temp_walk *w = i ? &result.store : &result.pc;
+
+		dev_info(ave->dev,
+			 "6070 %s: temp %s VA %#llx -> %#llx want %#llx valid %u X %u W %u: %s L%u DATA+%#x desc %#llx\n",
+			 when, i ? "first-store" : "next-PC", w->va, w->output, w->expected,
+			 w->translated, w->executable, w->writable,
+			 ave_temp_fault_name(w->fault), w->level, w->offset, w->descriptor);
+	}
+	dev_info(ave->dev,
+		 "6070 %s: temp ledger model %s words %u mismatches %u first DATA+%#x got %#llx want %#llx crc %08x (private debugfs)\n",
+		 when, result.model_valid ? "linear-H14G" : "unsupported inputs",
+		 result.compared, result.mismatches, result.first_offset,
+		 result.first_observed, result.first_expected,
+		 crc32_le(~0U, (u8 *)e->observed[slot], sizeof(e->observed[slot])) ^ ~0U);
+}
+
 static void ave_fw_6070_boot_snapshot(struct ave_dev *ave, const char *when,
 				      bool keep)
 {
@@ -522,6 +606,12 @@ static void ave_fw_6070_boot_snapshot(struct ave_dev *ave, const char *when,
 	ave_6070_range(ave, when, "temp table", d, ds, 0x18000, 0x20000, 16);
 	ave_6070_range(ave, when, "final PT", d, ds, AVE_6070_PT_START, AVE_6070_PT_END, 16);
 	ave_6070_range(ave, when, "MMU cfg", d, ds, 0x126fc0, 0x127068, 8);
+	if (!strcmp(when, "50us"))
+		ave_fw_6070_walk_temp(ave, when, t, d, 0);
+	else if (!strcmp(when, "1ms"))
+		ave_fw_6070_walk_temp(ave, when, t, d, 1);
+	else if (keep)
+		ave_fw_6070_walk_temp(ave, when, t, d, 2);
 	/* 4.3 runtime, platform and channel milestones */
 	dev_info(ave->dev,
 		 "6070 %s: guard live %#llx patch %#llx (%s) env %#llx log %#llx gpr %#llx exc %#llx crashbuf %#llx/%#llx task %#llx gpio %#llx ipi %#llx\n",

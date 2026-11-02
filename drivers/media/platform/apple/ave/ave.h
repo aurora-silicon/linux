@@ -225,6 +225,7 @@ struct ave_dev {
 
 	/* debugfs: the last Start and first Process built, per codec */
 	/* debugfs last_6070_data: DATA as the 6070 hello timeout left it */
+	struct ave_temp_evidence *temp_capture;
 	void *boot_capture;
 	size_t boot_capture_size;
 	/* The encoder's T8110-layout DARTs, mapped read-only for diagnostics */

@@ -24,6 +24,7 @@
 #include <linux/vmalloc.h>
 
 #include "ave.h"
+#include "ave-temp.h"
 #include "ave-regs.h"
 
 #define AVE_AUTOSUSPEND_MS 2000
@@ -227,6 +228,33 @@ static void ave_vfree(void *p)
 	vfree(p);
 }
 
+/* Private, read-only descriptor ledgers for the three diagnostic snapshots. */
+static void ave_debugfs_6070_temp(struct ave_dev *ave)
+{
+	static const char * const names[] = {
+		"temp_6070_50us", "temp_6070_1ms", "temp_6070_timeout",
+		"temp_6070_model",
+	};
+	struct ave_temp_evidence *evidence;
+
+	if (ave->variant != &ave_t8112)
+		return;
+	evidence = vzalloc(sizeof(*evidence));
+	if (!evidence || devm_add_action_or_reset(ave->dev, ave_vfree, evidence))
+		return;
+	ave->temp_capture = evidence;
+	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
+		struct debugfs_blob_wrapper *blob;
+
+		blob = devm_kzalloc(ave->dev, sizeof(*blob), GFP_KERNEL);
+		if (!blob)
+			continue;
+		blob->data = i == 3 ? evidence->model : evidence->observed[i];
+		blob->size = AVE_TEMP_HI - AVE_TEMP_LO;
+		debugfs_create_blob(names[i], 0400, ave->debugfs, blob);
+	}
+}
+
 /* The read-only DATA image the 6070 hello timeout leaves (private evidence) */
 static void ave_debugfs_6070_capture(struct ave_dev *ave)
 {
@@ -262,6 +290,7 @@ static void ave_debugfs_init(struct ave_dev *ave)
 		debugfs_create_file("lifecycle_test", 0200, ave->debugfs, ave,
 				    &ave_lifecycle_fops);
 		ave_debugfs_6070_capture(ave);
+		ave_debugfs_6070_temp(ave);
 		return;
 	}
 	debugfs_create_file("inject_wedge", 0200, ave->debugfs, ave,

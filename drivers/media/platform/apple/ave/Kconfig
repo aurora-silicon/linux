@@ -40,3 +40,13 @@ config VIDEO_APPLE_AVE_CMD_KUNIT_TEST
 	  the pre-refactor builder. Test 6070 lifecycle envelopes, replies,
 	  split surface arrays, seven-channel discovery and encoding refusal.
 	  These tests run without firmware or encoder hardware.
+
+config VIDEO_APPLE_AVE_TEMP_KUNIT_TEST
+	tristate "KUnit tests for Apple AVE temporary stage-1 tables" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the read-only T8112/6070 temporary stage-1 decoder with synthetic
+	  tables: small root alignment, table bounds, address/permission faults,
+	  and the complete linear mapping ledger. No firmware or AVE needed.
+	  The tests can run independently of the AVE driver, including on UML.

@@ -148,3 +148,59 @@ Limits
 - Buffers are mapped through the encoder's 256 MiB DMA window, so both queues
   are limited to what fits next to the encoder's working memory (fewer
   buffers at larger sizes).
+
+T8112 temporary stage-1 diagnostics
+---------------------------------
+
+The 6070.11.1 lifecycle snapshots at 50 us, 1 ms and hello timeout include a
+read-only software walk for the next reset instruction (TEXT VA +0x574) and
+the first final-table store (linked DATA VA +0x20000). These diagnostics never
+decide whether to start or recover firmware. A successful walk is not a
+firmware hello, and an AP-visible zero after cache enable is not proof that
+firmware failed to retire a store.
+
+The temporary input geometry is the qualified reset TCR low word
+``0x40808126``: 16 KiB pages, 26-bit TTBR0 input and a two-entry level-2 root
+at DATA IOVA +0x1fff0. This is reset-derived geometry, not a host read of the
+core TCR or TTBR registers; the final geometry words at DATA +0x60000 and
++0x60008 must not be substituted for the temporary TCR. Child addresses are
+AVE output addresses (DART IOVAs), converted to offsets in the existing DATA
+snapshot. Only DATA +0x18000..+0x1ffff is readable by this decoder.
+
+Each access reports its translation, EL1 execute/write permissions and the
+first failing descriptor's level, DATA offset and value. The decoder checks
+validity, descriptor type, alignment, access flag, output address and
+hierarchical/leaf permissions. Unsupported geometry is reported explicitly.
+It issues no IOVA mapping operation, TLB invalidation, fault acknowledgment,
+mailbox transaction or descriptor write.
+
+The complete 4096-word temporary window is compared with a deterministic
+linear mapping model of the qualified H14G address contract: the two roots
+point to the temporary pages, TEXT is read-only and executable, DATA is
+writable, and holes are zero. Loader linkage, page geometry, final geometry
+and table overrides are captured independently. Nonzero table overrides or
+unsupported loader inputs mark the model unavailable rather than reporting
+a match. This mapping model is an expected address/attribute ledger, not an
+independent observation of the core's system registers or a hardware proof
+of the reset code's descriptor-generation algorithm.
+
+The copies are bounded reads, not atomic snapshots of firmware writes. An
+early partial table is evidence to compare with the later snapshots, never a
+reason to suppress RUN or recovery. The IPS field and actual core register
+contents are not independently captured by this diagnostic.
+
+Only bounded summaries enter the kernel log. Root-only debugfs blobs
+``temp_6070_50us``, ``temp_6070_1ms`` and ``temp_6070_timeout`` retain each
+observed window; ``temp_6070_model`` retains the expected window. Each is
+32768 bytes of little-endian 64-bit words, beginning at DATA +0x18000.
+``last_6070_data`` retains the existing timeout DATA capture. Keep these raw
+ledgers in private run evidence. They are replaced by the next lifecycle
+attempt; collect them before starting another attempt. Never unload the
+module after a firmware start; recovery/rollback requires the established
+lifecycle or a reboot.
+
+Synthetic decoder tests run independently of AVE hardware::
+
+  ./tools/testing/kunit/kunit.py run \
+    --kunitconfig=drivers/media/platform/apple/ave/.kunitconfig-temp \
+    --jobs=8 'apple-ave-temp*'
