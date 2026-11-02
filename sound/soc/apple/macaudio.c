@@ -2144,6 +2144,27 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 };
 
 /*
+ * J614s: the same amps and frame as the J616s, but its speakers have not
+ * been brought up and have no protection profile. Keep them off entirely
+ * until they get their own bring-up: the speaker link is not bound, so no
+ * stream ever reaches the amps.
+ */
+struct macaudio_platform_cfg macaudio_j614_cfg = {
+	.enable_speakers = false,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(0),
+};
+
+/*
  * The J614s and J616s headphone jack, a card of its own: a CS42L84 on the
  * AOP's "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
  * frame at 48 kHz (3.072 MHz, the primary front-end's ratio) with a
@@ -2226,8 +2247,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
-	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
-	{ .compatible = "apple,j614-macaudio", .data = &macaudio_j616_cfg },
+	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	{ .compatible = "apple,j614-macaudio", .data = &macaudio_j614_cfg },
 	/* j614    AID34   cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j614-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j616    AID35   sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
