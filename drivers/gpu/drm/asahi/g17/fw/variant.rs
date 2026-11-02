@@ -47,8 +47,8 @@ pub(crate) enum Submission {
     Doorbell,
     /// The work ring and its doorbell, then the M5 host command port (SGX `0x4090`/`0x4098`)
     /// that makes the queue runnable (`Port::publish_m5_compute`). Only the arithmetic
-    /// qualification submits this way; DRM submission is not supported yet, so the profile
-    /// advertises no submission features.
+    /// qualification submits this way: DRM queue creation and submission are refused
+    /// (`EOPNOTSUPP`), and the profile advertises no submission features.
     M5HostCommand,
 }
 
@@ -88,6 +88,10 @@ pub(crate) struct Variant {
     pub(crate) effort: u32,
     /// Where the driver places its objects and what a client VM reserves.
     pub(crate) vm_layout: &'static crate::g17::vm_layout::VmLayout,
+    /// A stopped session (device loss, unbind) keeps everything it gave the firmware allocated
+    /// and mapped until reboot: stopped coprocessors are not taken as proof that no engine still
+    /// reads it.
+    pub(crate) retain_stopped: bool,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -131,6 +135,7 @@ pub(crate) const V26A428: Variant = Variant {
     submission: Submission::Doorbell,
     effort: crate::g17::power::FULL_EFFORT,
     vm_layout: &crate::hw::t8140::dynamic::LAYOUT,
+    retain_stopped: false,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -162,11 +167,12 @@ pub(crate) const V25G83: Variant = Variant {
     submission: Submission::Doorbell,
     effort: crate::g17::power::FULL_EFFORT,
     vm_layout: &crate::hw::t8140::dynamic::LAYOUT,
+    retain_stopped: false,
 };
 
 /// The M5 firmware (26A428, macOS 27.0), native. Every field is this build's own: the A18 Pro
-/// build shares its firmware version but not its submission rules. Only the bootstrap graph
-/// and the arithmetic qualification run on it; DRM submission is not supported yet.
+/// build shares its firmware version but not its submission rules. The bootstrap graph and the
+/// arithmetic qualification run on it, and the DRM device registers; DRM submission is refused.
 pub(crate) const V26A428_M5: Variant = Variant {
     graph: InitGraph::M5,
     init_ack: InitAck::Message,
@@ -194,6 +200,8 @@ pub(crate) const V26A428_M5: Variant = Variant {
     effort: 0,
     // Mesa's M5 windows, not the A18 Pro's arenas, which lie in Mesa's read-only shadow.
     vm_layout: &crate::g17::m5_vm::LAYOUT,
+    // As a failed bootstrap does: the M5 engines' quiescence after a stop is not established.
+    retain_stopped: true,
 };
 
 const _: () = {

@@ -300,6 +300,15 @@ pub(crate) trait Gpu: Send + Sync {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         None
     }
+    /// Whether QUEUE_CREATE and SUBMIT reach this GPU's submission path: the error they fail
+    /// with where its firmware profile has none yet.
+    fn submission(&self) -> Result {
+        Ok(())
+    }
+    /// The VM_CREATE flags this GPU accepts: acknowledgements of the command ABI it reports.
+    fn vm_create_flags(&self) -> u32 {
+        0
+    }
     /// Shared GET_PARAMS additions, using this backend's feature-number assignments.
     fn feature_flags(&self) -> u64 {
         let mut flags = 0;

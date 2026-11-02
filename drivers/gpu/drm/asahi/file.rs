@@ -508,13 +508,7 @@ impl File {
         data: &mut uapi::drm_asahi_vm_create,
         file: &DrmFile,
     ) -> Result<u32> {
-        if reg_data.gpu.as_any().is::<crate::g17::Gpu>() {
-            // G17P reports HAL200; it accepts the acknowledgement but does not require it.
-            if data.flags & !uapi::drm_asahi_vm_create_flags_DRM_ASAHI_VM_CREATE_HAL200 != 0 {
-                return Err(EINVAL);
-            }
-        } else if data.flags != 0 {
-            // Every other runtime here reports DRM_ASAHI_GPU_HAL_LEGACY.
+        if data.flags & !reg_data.gpu.vm_create_flags() != 0 {
             return Err(EINVAL);
         }
 
@@ -1281,6 +1275,7 @@ impl File {
         file: &DrmFile,
     ) -> Result<u32> {
         let file_id = file.inner().id;
+        reg_data.gpu.submission()?;
 
         mod_dev_dbg!(
             device,
@@ -1371,6 +1366,8 @@ impl File {
         file: &DrmFile,
     ) -> Result<u32> {
         debug::update_debug_flags();
+        // Before any argument is read: a GPU without a submission path refuses every submission.
+        reg_data.gpu.submission()?;
 
         if data.flags != 0 || data.pad != 0 {
             cls_pr_debug!(Errors, "submit: Invalid arguments\n");

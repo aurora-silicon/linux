@@ -2254,7 +2254,10 @@ impl super::Shared {
         }
         self.forget_port();
         let firmware = self.state.lock().take();
-        if let Some(mut firmware) = firmware { firmware.finish_stopped_queues(); }
+        if let Some(mut firmware) = firmware {
+            firmware.finish_stopped_queues();
+            super::Firmware::retire(firmware);
+        }
     }
 
     /// Joins construction and complete host teardown, including RTKit drops.
@@ -2280,7 +2283,7 @@ impl super::Shared {
         if let Some(mut firmware) = firmware {
             firmware.finish_stopped_queues();
             // RTKit destruction still dereferences the mailbox provider.
-            drop(firmware);
+            super::Firmware::retire(firmware);
         }
     }
 }

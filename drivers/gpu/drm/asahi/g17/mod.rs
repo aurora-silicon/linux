@@ -673,6 +673,29 @@ impl Drop for Firmware {
 }
 
 impl Firmware {
+    /// Ends the power-on transition once every coprocessor is initialized, where the build
+    /// expects it ([`fw::variant::Variant::power_on_done`]).
+    fn end_power_on(&mut self) -> Result {
+        if self.variant.power_on_done {
+            self.primary.notify(MSG_POWER_ON_DONE)?;
+            if let Some(secondary) = self.secondary.as_mut() {
+                secondary.notify(MSG_POWER_ON_DONE)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends a session whose coprocessors are stopped and whose queues are settled: drops it, or
+    /// keeps it for good where the profile retains a stopped session
+    /// ([`fw::variant::Variant::retain_stopped`]).
+    fn retire(firmware: KBox<Self>) {
+        if firmware.variant.retain_stopped {
+            core::mem::forget(firmware);
+        } else {
+            drop(firmware);
+        }
+    }
+
     /// The firmware instances this GPU runs.
     fn roles(&self) -> &'static [Role] {
         if self.secondary.is_some() {
@@ -1480,18 +1503,16 @@ impl Gpu {
             false => None,
         };
         if shared.variant.graph == fw::variant::InitGraph::M5 {
-            // Bootstrap only: whatever happened, keep the session. A stopped CPU is not proof that
-            // no engine still reads the graph, so nothing it was given is freed or unmapped.
-            let result = Self::boot_m5(dev, cfg, session, root_entries, shared);
-            match &result {
-                Ok(()) => dev_info!(
-                    dev.as_ref(),
-                    "M5 bootstrap done; submission is not supported yet\n"
-                ),
-                Err(e) => dev_err!(dev.as_ref(), "M5 bootstrap failed: {:?}\n", e),
+            // A failed bootstrap keeps the session: a stopped CPU is not proof that no engine
+            // still reads the graph, so nothing it was given is freed or unmapped. A successful
+            // one is the device's session, as below.
+            if let Err(e) = Self::boot_m5(dev, cfg, session, root_entries, shared) {
+                dev_err!(dev.as_ref(), "M5 bootstrap failed: {:?}\n", e);
+                core::mem::forget(firmware);
+                return Err(e);
             }
-            core::mem::forget(firmware);
-            return Err(ENODEV);
+            dev_info!(dev.as_ref(), "M5 bootstrap done; DRM submission is not supported yet\n");
+            return Ok(firmware);
         }
         session.init.build(
             dev,
@@ -1520,12 +1541,7 @@ impl Gpu {
         if let Some(secondary) = session.secondary.as_mut() {
             secondary.init(session.init.root_va(Role::Secondary)?, ack)?;
         }
-        if shared.variant.power_on_done {
-            session.primary.notify(MSG_POWER_ON_DONE)?;
-            if let Some(secondary) = session.secondary.as_mut() {
-                secondary.notify(MSG_POWER_ON_DONE)?;
-            }
-        }
+        session.end_power_on()?;
         Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
         session
             .uat
@@ -1535,7 +1551,8 @@ impl Gpu {
 
     /// The M5 firmware's initialization (linux-aurora t6050-gpu's M5 boot, on published roots):
     /// the M5 graph, the M5 preparation, InitData to the primary and then the secondary, each
-    /// acknowledged, POWER_ON_DONE to both, and both opening records retired.
+    /// acknowledged, POWER_ON_DONE to both, and both opening records retired. Render contexts are
+    /// not activated: the M5 profile has none.
     fn boot_m5(
         dev: &AsahiDrmDevice,
         cfg: &'static Config,
@@ -1558,9 +1575,8 @@ impl Gpu {
         let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
         secondary.init(session.init.root_va(Role::Secondary)?, ack)?;
         dev_info!(dev.as_ref(), "M5 secondary InitData acknowledged\n");
-        session.primary.notify(MSG_POWER_ON_DONE)?;
-        secondary.notify(MSG_POWER_ON_DONE)?;
-        Self::wait_for_opening(dev, &session.init, &session.primary, Some(&*secondary))?;
+        session.end_power_on()?;
+        Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
         dev_info!(dev.as_ref(), "M5 opening records retired\n");
         Ok(())
     }
@@ -1783,7 +1799,7 @@ impl gpu::Gpu for Gpu {
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         let variant = self.shared.variant;
         // Features belong to the submission path that implements them: the M5 profile has no
-        // DRM submission yet, so it advertises none of them.
+        // DRM submission yet (`submission`), so it advertises none of them.
         if variant.submission == fw::variant::Submission::Doorbell {
             params.features |=
                 u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
@@ -1839,11 +1855,34 @@ impl gpu::Gpu for Gpu {
     }
 
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
+        // No queue exists to have limits, nor INDEPENDENT_QUEUES to advertise.
+        self.submission().ok()?;
         Some(uapi::drm_asahi_queue_limits {
             max_queues: kick::queue_limit(self.shared.variant.qid_floor),
             max_in_flight_per_queue: hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u32,
             ..Default::default()
         })
+    }
+
+    /// The M5 host-command path is not connected to DRM queues, fences or completion: its
+    /// command layouts are placeholders (`Config::core_layout`, `Variant::programs`), and its
+    /// retirement witnesses report work done even when workgroups were lost.
+    fn submission(&self) -> Result {
+        match self.shared.variant.submission {
+            fw::variant::Submission::Doorbell => Ok(()),
+            fw::variant::Submission::M5HostCommand => Err(EOPNOTSUPP),
+        }
+    }
+
+    /// G17P reports HAL200; it accepts the acknowledgement but does not require it. HAL300 has
+    /// none.
+    fn vm_create_flags(&self) -> u32 {
+        match self.cfg.identity.hal_generation {
+            uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_200 => {
+                uapi::drm_asahi_vm_create_flags_DRM_ASAHI_VM_CREATE_HAL200
+            }
+            _ => 0,
+        }
     }
 
     fn uat_geometry(&self) -> mmu::UatGeometry {
@@ -1878,6 +1917,7 @@ impl gpu::Gpu for Gpu {
         priority: u32,
         usc_exec_base: u64,
     ) -> Result<KBox<dyn crate::queue::Queue>> {
+        self.submission()?;
         let dev = self.shared.drm()?;
         let owner = self.ids.queue.next();
         let frontend = queue::Frontend::new(
