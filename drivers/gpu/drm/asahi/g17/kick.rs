@@ -152,6 +152,11 @@ impl QueueIds {
         self.render_ids() + (QID_COUNT - self.floor - self.leased) >= 2 * queues + 2
     }
 
+    /// Physical QIDs neither leased nor below the floor.
+    pub(crate) fn free(&self) -> usize {
+        QID_COUNT - self.floor - self.leased
+    }
+
     /// Whether a render pair not yet built can still reserve both of its identities.
     pub(crate) fn render_pair_fits(&self) -> bool {
         QID_COUNT - self.floor - self.leased >= 2

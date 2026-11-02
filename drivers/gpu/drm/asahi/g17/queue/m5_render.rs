@@ -9,8 +9,12 @@
 //!
 //! Installation follows S: both pool and parameter-buffer rows, both configurations, both QIDs,
 //! then the pair's two outer records in one publication (fragment first) and the wait for both
-//! queues to stand idle past their configuration. An installed pair stays with its firmware
-//! session, as an M5 channel does.
+//! queues to stand idle past their configuration. The installed lanes stay with their firmware
+//! session and are leased as a matched pair, as a compute channel's lane is:
+//! a pair binds them to one logical queue with that owner's storage ([`Storage`]: parameter
+//! buffer, target, tiling state, client views), parks once its context's scheduler release is
+//! consumed ([`Pair::park`]) and a later queue adopts it ([`Pair::adopt`]). Both lanes keep
+//! their kick timestamps, and the pair its pass ordinal, from which the stage stamps follow.
 
 use super::{
     compute::retirement,
@@ -92,15 +96,24 @@ fn memory_bytes() -> Result<u64> {
         .ok_or(EOVERFLOW)
 }
 
+/// `result`, naming the step of a pass's publication that refused it: the command fails with
+/// only its errno.
+macro_rules! at {
+    ($name:literal, $result:expr) => {
+        $result
+            .inspect_err(|error| pr_warn!("G17 M5: render pass {} refused: {:?}\n", $name, error))
+    };
+}
+
 /// `result`, naming `step` of a pair's construction when it failed: construction has many
 /// steps that refuse the same way.
 fn step<T>(step: &str, result: Result<T>) -> Result<T> {
     result.inspect_err(|error| pr_err!("G17 M5: render pair {} refused: {:?}\n", step, error))
 }
 
-/// The storage of a pair, retained with it. Field order drops every client view before its
-/// backing.
-struct Storage {
+/// One owner's storage of a pair, in that owner's VM: dropped with the binding
+/// ([`super::m5::Binding`]), off the device mutex.
+pub(crate) struct Storage {
     manager: buffer::Manager,
     target: KBox<target::Target>,
     layout: target::Layout,
@@ -109,17 +122,24 @@ struct Storage {
     state: KernelObject,
     scratch: KernelObject,
     discard: KernelObject,
-    descriptors: KernelObject,
-    descriptors_low: u64,
-    support: KernelObject,
 }
 
 pub(crate) struct Pair {
+    /// The binding's client views, in the owner's VM.
     aliases: KVec<mmu::KernelMapping>,
+    storage: KBox<Storage>,
     context: Arc<Context>,
     owner: u64,
+    /// The previous owner's scheduler page and work storage, which the records named until
+    /// this binding rewrote them.
+    _previous_pages: Option<crate::g17::context::FirmwarePages>,
     lanes: [Lane; 2],
-    storage: Storage,
+    /// Command storage of both stages and its canonical low view (the kernel's lower VM), and
+    /// the support page (stage stamps, usage, times): they stay with the lanes.
+    descriptors_lower: mmu::KernelMapping,
+    descriptors: KernelObject,
+    descriptors_low: u64,
+    support: KernelObject,
     pool: M5Pool,
     /// The parameter buffer's ID and generation.
     pb: (u8, u64),
@@ -130,10 +150,52 @@ pub(crate) struct Pair {
     programs: RegisterPrograms,
     compact: [u64; 2],
     installed: bool,
-    /// Passes published since installation.
+    /// Passes published on the lanes since installation, across owners: each pass's stage
+    /// stamp follows it, so a new owner's first pass never meets its predecessor's stamp.
     ordinal: u64,
+    /// The binding's first pass is still to come: it binds the parameter buffer, the pool and
+    /// the context's identity (S re-sends the configuration after a rebind).
+    unbound: bool,
+    /// Set by an adoption until the binding's first pass: whether the class (and so the outer
+    /// work rings) changed.
+    rebound: Option<bool>,
+    /// The class whose outer rings last carried the lanes' first slots.
+    class: u8,
+    /// Set once this binding's client views are unmapped, after it parks.
+    unmapped: super::m5::Unmapped,
     active: Option<Active>,
     quarantine: Option<Error>,
+}
+
+/// An installed render pair without an owner: both lanes, the storage they name across owners,
+/// and the previous owner's scheduler page and work storage the records name until the next
+/// owner rewrites them. Never dropped while the session runs.
+pub(crate) struct ParkedPair {
+    lanes: [Lane; 2],
+    descriptors_lower: mmu::KernelMapping,
+    descriptors: KernelObject,
+    descriptors_low: u64,
+    support: KernelObject,
+    pool: M5Pool,
+    pool_blocks: usize,
+    compact: [u64; 2],
+    ordinal: u64,
+    class: u8,
+    pages: crate::g17::context::FirmwarePages,
+    unmapped: super::m5::Unmapped,
+}
+
+impl ParkedPair {
+    /// Its previous binding's client views are unmapped ([`super::m5::ParkedLane::adoptable`]).
+    pub(crate) fn adoptable(&self) -> bool {
+        self.unmapped.done()
+    }
+    pub(crate) fn qids(&self) -> [u8; 2] {
+        [self.lanes[TILING].qid(), self.lanes[FRAGMENT].qid()]
+    }
+    pub(crate) fn class(&self) -> u8 {
+        self.class
+    }
 }
 
 /// A published pass, until its strict retirement.
@@ -161,13 +223,18 @@ pub(crate) struct Retired {
     pub(crate) times: [u64; 4],
 }
 
-/// What one pair is built for: its queues, owner and parameter buffer, the pass geometry its
-/// target is first sized for, and the GPU it runs on.
+/// What one pair is built for: its queues and the GPU it runs on, and its first binding.
 pub(crate) struct PairArgs<'a> {
     pub(crate) ids: [kick::Id; 2],
-    pub(crate) owner: u64,
     pub(crate) gpu: &'a Gpu,
     pub(crate) pointers: &'a PointerLayout,
+    pub(crate) binding: BindingArgs<'a>,
+}
+
+/// What one binding of a pair is built for: its owner and parameter buffer and the pass
+/// geometry its target is first sized for.
+pub(crate) struct BindingArgs<'a> {
+    pub(crate) owner: u64,
     pub(crate) metrics: buffer::MetricsLease,
     /// The context's view of the metrics object the lease names, retained with the pair.
     pub(crate) metrics_view: mmu::KernelMapping,
@@ -179,47 +246,30 @@ pub(crate) struct PairArgs<'a> {
     pub(crate) programs: RegisterPrograms,
 }
 
-impl Pair {
-    /// Builds the pair for `context` and maps it into the context's VM. Nothing is visible to
-    /// the firmware yet, so a failure here frees everything; the caller cancels the unpublished
-    /// QIDs and returns the parameter-buffer ID. Boxed, as a channel is.
-    pub(crate) fn new(
+impl Storage {
+    /// Builds one binding's storage in `context`'s VM, pushing its client views (the metrics
+    /// view, the command storage and the pool) to `aliases`. The parameter buffer's scenes
+    /// start at the pair's next pass, `first_ordinal`.
+    fn new(
         alloc: &Allocator<'_>,
-        context: Arc<Context>,
-        args: PairArgs<'_>,
+        context: &Context,
+        aliases: &mut KVec<mmu::KernelMapping>,
+        (descriptors, descriptors_low): (&KernelObject, u64),
+        pool: &M5Pool,
+        args: BindingArgs<'_>,
+        first_ordinal: u64,
     ) -> Result<KBox<Self>> {
-        let [tiling, fragment] = args.ids;
-        if tiling.engine() != DataMaster::Tiling || fragment.engine() != DataMaster::Fragment {
-            return Err(EINVAL);
-        }
         let dev = alloc.dev;
         let vm = context.vm();
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let cpu = CpuMap::WriteCombined;
         let compact = alloc.domain(Domain::Compact);
-        let (compact_start, compact_end) = (compact.start, compact.end);
-        let mut aliases = KVec::with_capacity(16, GFP_KERNEL)?;
         aliases.push(args.metrics_view, GFP_KERNEL)?;
-        let lanes = [
-            Lane::new(alloc, &context, tiling, args.pointers, &mut aliases)?,
-            Lane::new(alloc, &context, fragment, args.pointers, &mut aliases)?,
-        ];
-        // Command storage in the canonical low arena, at the same address in the VM, as a
-        // compute descriptor ring.
-        let descriptors = alloc.kernel(DEPTH * COMMAND_BYTES, PAGE as u64, prot, cpu)?;
-        let low = descriptors.alias_in(
-            alloc.uat.kernel_lower_vm(),
-            alloc.domain(Domain::Canonical),
-            PAGE as u64,
-            mmu::PROT_GPU_SHARED_RW,
-        )?;
-        let descriptors_low = low.iova();
-        aliases.push(low, GFP_KERNEL)?;
         aliases.push(
             descriptors.map_alias(vm, descriptors_low, mmu::PROT_GPU_SHARED_RW)?,
             GFP_KERNEL,
         )?;
-        let support = alloc.kernel(PAGE, PAGE as u64, prot, cpu)?;
+        aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
         // Target and parameter buffer, both in the client's compact window.
         let layout = step(
             "layout",
@@ -282,7 +332,7 @@ impl Pair {
                     discard: discard.gpu_va(),
                     buffer_id: args.pb.0,
                     generation: args.pm_generation,
-                    first_ordinal: 0,
+                    first_ordinal,
                 },
             ),
         )?;
@@ -308,6 +358,55 @@ impl Pair {
                 0,
             ),
         )?;
+        // Boxed: the parameter buffer's manager is large, and a pair is built on the probe's
+        // stack by the render qualification (by value, it overflowed that stack).
+        Ok(KBox::new(
+            Self {
+                manager,
+                target,
+                layout,
+                status_fw,
+                state,
+                scratch,
+                discard,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+}
+
+impl Pair {
+    /// Builds the pair for `context` and maps it into the context's VM. Nothing is visible to
+    /// the firmware yet, so a failure here frees everything; the caller cancels the unpublished
+    /// QIDs and returns the parameter-buffer ID. Boxed, as a channel is.
+    pub(crate) fn new(
+        alloc: &Allocator<'_>,
+        context: Arc<Context>,
+        args: PairArgs<'_>,
+    ) -> Result<KBox<Self>> {
+        let [tiling, fragment] = args.ids;
+        if tiling.engine() != DataMaster::Tiling || fragment.engine() != DataMaster::Fragment {
+            return Err(EINVAL);
+        }
+        let prot = mmu::PROT_GPU_FW_SHARED_RW;
+        let cpu = CpuMap::WriteCombined;
+        let compact = alloc.domain(Domain::Compact);
+        let mut aliases = KVec::with_capacity(16, GFP_KERNEL)?;
+        let lanes = [
+            Lane::new(alloc, &context, tiling, args.pointers, &mut aliases)?,
+            Lane::new(alloc, &context, fragment, args.pointers, &mut aliases)?,
+        ];
+        // Command storage in the canonical low arena, at the same address in the VM, as a
+        // compute descriptor ring.
+        let descriptors = alloc.kernel(DEPTH * COMMAND_BYTES, PAGE as u64, prot, cpu)?;
+        let descriptors_lower = descriptors.alias_in(
+            alloc.uat.kernel_lower_vm(),
+            alloc.domain(Domain::Canonical),
+            PAGE as u64,
+            mmu::PROT_GPU_SHARED_RW,
+        )?;
+        let descriptors_low = descriptors_lower.iova();
+        let support = alloc.kernel(PAGE, PAGE as u64, prot, cpu)?;
         // The pair's pool, at the tiling queue's pool ID, covers every pass the plan accepts.
         let pool_blocks = args.gpu.render_pool_blocks;
         let geometry = step(
@@ -318,34 +417,49 @@ impl Pair {
             "pool",
             M5Pool::new(alloc, tiling.qid(), geometry, pool::Engine::Render),
         )?;
-        aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
+        let binding = args.binding;
+        let (owner, pb, pm_generation, clusters, programs) = (
+            binding.owner,
+            binding.pb,
+            binding.pm_generation,
+            binding.clusters,
+            binding.programs,
+        );
+        let storage = Storage::new(
+            alloc,
+            &context,
+            &mut aliases,
+            (&descriptors, descriptors_low),
+            &pool,
+            binding,
+            0,
+        )?;
+        let class = context.policy().priority();
         let pair = KBox::new(
             Self {
                 aliases,
+                storage,
                 context,
-                owner: args.owner,
+                owner,
+                _previous_pages: None,
                 lanes,
-                storage: Storage {
-                    manager,
-                    target,
-                    layout,
-                    status_fw,
-                    state,
-                    scratch,
-                    discard,
-                    descriptors,
-                    descriptors_low,
-                    support,
-                },
+                descriptors_lower,
+                descriptors,
+                descriptors_low,
+                support,
                 pool,
-                pb: args.pb,
-                pm_generation: args.pm_generation,
+                pb,
+                pm_generation,
                 pool_blocks,
-                clusters: args.clusters,
-                programs: args.programs,
-                compact: [compact_start, compact_end],
+                clusters,
+                programs,
+                compact: [compact.start, compact.end],
                 installed: false,
                 ordinal: 0,
+                unbound: true,
+                rebound: None,
+                class,
+                unmapped: super::m5::Unmapped::new()?,
                 active: None,
                 quarantine: None,
             },
@@ -355,9 +469,214 @@ impl Pair {
         Ok(pair)
     }
 
+    /// Adopts parked pair `index` for `context`'s logical queue: builds
+    /// the binding's storage and client views in the new VM and rewrites both records'
+    /// host-owned words. The binding's first pass reconfigures both queues; the kick
+    /// timestamps, the stamps and the pass ordinal continue. The caller installs the binding's
+    /// parameter-buffer row ([`Self::install_pb`]). On failure the pair stays parked.
+    pub(crate) fn adopt(
+        alloc: &Allocator<'_>,
+        parked: &mut KVec<ParkedPair>,
+        index: usize,
+        context: Arc<Context>,
+        binding: BindingArgs<'_>,
+    ) -> Result<KBox<Self>> {
+        let lane = parked.get_mut(index).ok_or(EINVAL)?;
+        if !lane.adoptable() {
+            return Err(EAGAIN);
+        }
+        let unmapped = super::m5::Unmapped::new()?;
+        let mut aliases = KVec::with_capacity(16, GFP_KERNEL)?;
+        for queue in &mut lane.lanes {
+            aliases.push(queue.kick.map_client(context.vm())?, GFP_KERNEL)?;
+        }
+        let (owner, pb, pm_generation, clusters, programs) = (
+            binding.owner,
+            binding.pb,
+            binding.pm_generation,
+            binding.clusters,
+            binding.programs,
+        );
+        let storage = Storage::new(
+            alloc,
+            &context,
+            &mut aliases,
+            (&lane.descriptors, lane.descriptors_low),
+            &lane.pool,
+            binding,
+            lane.ordinal,
+        )?;
+        let slot = KBox::<Self>::new_uninit(GFP_KERNEL)?;
+        // Both lanes are idle and their owner's release consumed: no reader of the records
+        // remains.
+        for queue in &mut lane.lanes {
+            queue.set_owner(&context)?;
+        }
+        let lane = parked.remove(index).map_err(|_| EINVAL)?;
+        let class_changed = lane.class != context.policy().priority();
+        let pair = KBox::write(
+            slot,
+            Self {
+                aliases,
+                storage,
+                context,
+                owner,
+                _previous_pages: Some(lane.pages),
+                lanes: lane.lanes,
+                descriptors_lower: lane.descriptors_lower,
+                descriptors: lane.descriptors,
+                descriptors_low: lane.descriptors_low,
+                support: lane.support,
+                pool: lane.pool,
+                pb,
+                pm_generation,
+                pool_blocks: lane.pool_blocks,
+                clusters,
+                programs,
+                compact: lane.compact,
+                installed: true,
+                ordinal: lane.ordinal,
+                unbound: true,
+                rebound: Some(class_changed),
+                class: lane.class,
+                unmapped,
+                active: None,
+                quarantine: None,
+            },
+        );
+        if let Err(error) = pair.publish_mappings() {
+            let (lane, _binding) = pair.park();
+            parked.push_within_capacity(lane).map_err(|_| ENOMEM)?;
+            return Err(error);
+        }
+        // The rewritten records name this context's scheduler page.
+        pair.context.mark_published();
+        Ok(pair)
+    }
+
+    /// Installs the binding's parameter-buffer row, before its first pass names it.
+    pub(crate) fn install_pb(&self, init: &crate::g17::initdata::InitData) -> Result {
+        init.install_m5_pb(self.pb.0, self.pb_row()?)
+    }
+
+    /// The binding's parameter-buffer ID, returned when it parks.
+    pub(crate) fn buffer_id(&self) -> u8 {
+        self.pb.0
+    }
+
+    /// The pair is idle: healthy, no pass in flight, both lanes consumed to their producers,
+    /// both stage stamps at the last pass's and the pool's count complete.
+    pub(crate) fn parkable(&self) -> Result<bool> {
+        if !self.installed || self.quarantine.is_some() || self.active.is_some() {
+            return Ok(false);
+        }
+        for lane in &self.lanes {
+            if !lane.idle_at(lane.cursors()?.producer)? {
+                return Ok(false);
+            }
+        }
+        if self.pool.completed_submissions()? != self.pool.submitted()? {
+            return Ok(false);
+        }
+        if self.ordinal == 0 {
+            return Ok(true);
+        }
+        fence(Ordering::Acquire);
+        let stamp = stamp_of(self.ordinal - 1);
+        Ok(self.support.word(STAMPS)?.load(Ordering::Relaxed) == stamp
+            && self
+                .support
+                .word(STAMPS + STAGE_STRIDE)?
+                .load(Ordering::Relaxed)
+                == stamp)
+    }
+
+    /// Logs the park witnesses ([`Self::parkable`]) one by one, for a stalled release.
+    pub(crate) fn report_park(&self) {
+        let stamp = |offset| {
+            self.support
+                .word(offset)
+                .map(|word| word.load(Ordering::Relaxed))
+        };
+        pr_warn!(
+            "G17 M5: pair {:?}: quarantine {:?} active {} cursors {:x?}, pool {:?}/{:?}, stamps {:x?} {:x?} for pass {}\n",
+            self.qids(), self.quarantine, self.active.is_some(), self.cursors(),
+            self.pool.completed_submissions(), self.pool.submitted(),
+            stamp(STAMPS), stamp(STAMPS + STAGE_STRIDE), self.ordinal,
+        );
+    }
+
+    /// The pair needs nothing more before its context's release: parkable, or quarantined
+    /// (leaked, never reused) with the firmware idle on both rings.
+    pub(crate) fn settled(&self) -> Result<bool> {
+        if self.quarantine.is_none() {
+            return self.parkable();
+        }
+        for lane in &self.lanes {
+            if !lane.idle_at(lane.cursors()?.producer)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Splits a parked pair ([`Self::parkable`], its context's release consumed) into its lanes
+    /// and its binding. The lanes keep the context's scheduler page and work storage, which the
+    /// records name until the next owner rewrites them; the caller returns the binding's
+    /// parameter-buffer ID.
+    pub(crate) fn park(self: KBox<Self>) -> (ParkedPair, super::m5::Binding) {
+        let Self {
+            aliases,
+            storage,
+            context,
+            owner,
+            lanes,
+            descriptors_lower,
+            descriptors,
+            descriptors_low,
+            support,
+            pool,
+            pool_blocks,
+            compact,
+            ordinal,
+            class,
+            unmapped,
+            ..
+        } = KBox::into_inner(self);
+        let pages = context.retain_firmware_pages();
+        (
+            ParkedPair {
+                lanes,
+                descriptors_lower,
+                descriptors,
+                descriptors_low,
+                support,
+                pool,
+                pool_blocks,
+                compact,
+                ordinal,
+                class,
+                pages,
+                unmapped: unmapped.clone(),
+            },
+            super::m5::Binding::render(aliases, storage, context, owner, unmapped),
+        )
+    }
+
+    /// An adopted pair whose class differs from its previous binding's, until its first pass.
+    pub(crate) fn class_changed(&self) -> bool {
+        self.rebound == Some(true)
+    }
+
+    /// The pass ordinal the pair's next pass takes.
+    pub(crate) fn next_ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
     /// Publishes the complete mapping set to every context naming its roots, before any record
     /// names it.
     fn publish_mappings(&self) -> Result {
+        self.descriptors_lower.publish_to_contexts();
         for alias in &self.aliases {
             alias.publish_to_contexts();
         }
@@ -365,8 +684,8 @@ impl Pair {
         for object in [
             &self.lanes[TILING].graph,
             &self.lanes[FRAGMENT].graph,
-            &storage.descriptors,
-            &storage.support,
+            &self.descriptors,
+            &self.support,
             &storage.state,
             &storage.scratch,
             &storage.discard,
@@ -633,7 +952,9 @@ impl Pair {
                 kick_ring_va: lane.kick.low_va(),
                 kick_ring_fw_va: lane.kick.firmware_va(),
                 qid: lane.qid(),
-                install: false,
+                // An adopted pair whose class changed is reinstalled on its new class, as a
+                // compute lane is (`m5::Channel::config`).
+                install: self.rebound == Some(true),
                 completion_seed: Some(
                     lane.kick
                         .timestamp()
@@ -649,7 +970,7 @@ impl Pair {
                 scheduler_va: self.context.scheduler_va(),
                 policy: self.context.policy(),
                 qos_slot: self.context.qos_id(),
-                qos_update: false,
+                qos_update: self.rebound.is_some(),
                 owner_pid: self.context.owner_pid(),
                 context_update: true,
             },
@@ -692,14 +1013,16 @@ impl Pair {
         if draw.plan.pool_blocks > self.pool_blocks {
             return Err(EINVAL);
         }
-        let first = self.ordinal == 0;
+        // The binding's first pass, not the lanes': it binds this owner's parameter buffer,
+        // pool and context.
+        let first = self.unbound;
         for lane in &self.lanes {
             let cursors = lane.cursors()?;
             if !lane.idle_at(cursors.producer)? {
                 return Err(EAGAIN);
             }
         }
-        let layout = self.layout(draw.pass)?;
+        let layout = at!("layout", self.layout(draw.pass))?;
         if layout.tvb_blocks > self.storage.manager.blocks() {
             kernel::pr_warn_once!(
                 "G17 M5: a render pass needs a larger parameter buffer (growth not planned yet)\n"
@@ -714,17 +1037,20 @@ impl Pair {
         let ordinal = self.ordinal;
         let slot = (ordinal as usize) % DEPTH;
         let pair = self.lanes[TILING].qid();
-        let work_slot = work.render_slot(pair)?;
-        let payload = work.channel_payload(pair, ordinal)?;
+        let work_slot = at!("work slot", work.render_slot(pair))?;
+        let payload = at!("payload", work.channel_payload(pair, ordinal))?;
         let qids = self.qids();
         // The pass's storage: target records, tiling state, scene.
         let storage = &mut self.storage;
         // The target fits each pass, as on the other render queues; the pair's PB does not grow.
         let owners = storage.target.owners();
-        storage
-            .target
-            .ensure_capacity(dev, self.context.vm(), &layout, &owners)?;
-        let targets = storage.target.prepare(ordinal, &layout)?;
+        at!(
+            "target capacity",
+            storage
+                .target
+                .ensure_capacity(dev, self.context.vm(), &layout, &owners)
+        )?;
+        let targets = at!("target", storage.target.prepare(ordinal, &layout))?;
         let extra = storage.target.m5_extra(&layout)?;
         let viewport = fw::render::storage::Viewport::new(draw.pass.width, draw.pass.height)?
             .with_control(VIEWPORT_CONTROL);
@@ -743,21 +1069,21 @@ impl Pair {
         // SAFETY: The integer-only view is aligned, inside the retained mapping, and the pass's
         // tiling state is unpublished: the previous pass retired.
         unsafe { viewport.apply(&mut *view) };
-        let scene = storage.manager.prepare_scene(ordinal)?;
+        let scene = at!("scene", storage.manager.prepare_scene(ordinal))?;
         let (pm_scratch, pm_metric) = storage.manager.scene_registers(scene)?;
         let scene_va = storage.manager.scene_va(scene)?;
-        let support = storage.support.gpu_va();
+        let support = self.support.gpu_va();
         let usage = support + (USAGE + slot * 2 * USAGE_BYTES) as u64;
         let times = support + (TIMES + slot * 32) as u64;
-        storage.support.bytes_mut()[TIMES + slot * 32..TIMES + slot * 32 + 32].fill(0);
-        storage.support.bytes_mut()
+        self.support.bytes_mut()[TIMES + slot * 32..TIMES + slot * 32 + 32].fill(0);
+        self.support.bytes_mut()
             [USAGE + slot * 2 * USAGE_BYTES..USAGE + (slot + 1) * 2 * USAGE_BYTES]
             .fill(0);
         let state = storage.state.gpu_va();
-        let predecessor = crate::g17::ids::OBJECTS.object()?;
+        let predecessor = at!("object ids", crate::g17::ids::OBJECTS.object())?;
         let (fragment_ids, ta_ids): (ObjectIds, ObjectIds) =
             crate::g17::ids::OBJECTS.render_pair(predecessor)?;
-        let work_node = work.node_va()?;
+        let work_node = at!("work node", work.node_va())?;
         let resources = RenderResources {
             context_id: self.context.id().try_into()?,
             context_generation: self.context.generation(),
@@ -788,8 +1114,8 @@ impl Pair {
             unk_210c: 0,
         };
         let offset = slot * COMMAND_BYTES;
-        let low = storage.descriptors_low + offset as u64;
-        let high = storage.descriptors.gpu_va() + offset as u64;
+        let low = self.descriptors_low + offset as u64;
+        let high = self.descriptors.gpu_va() + offset as u64;
         let stage = |n: usize| RenderStage {
             qid: qids[n],
             descriptor_va: low + (n * assembly::FRAGMENT_OFFSET) as u64,
@@ -808,40 +1134,52 @@ impl Pair {
             deflake: Deflake::M5,
         };
         let controls = Self::controls(draw.pass, &draw.plan);
-        let mut inputs = Self::inputs(
-            &args,
-            [usage, usage + USAGE_BYTES as u64],
-            resources.context_id,
-            resources.context_generation,
+        let mut inputs = at!(
+            "inputs",
+            Self::inputs(
+                &args,
+                [usage, usage + USAGE_BYTES as u64],
+                resources.context_id,
+                resources.context_generation
+            )
         )?;
-        regs::apply_pass(&args, &controls, &mut inputs)?;
+        at!("registers", regs::apply_pass(&args, &controls, &mut inputs))?;
         let mut workspace = KBox::<regs::Workspace>::new_uninit(GFP_KERNEL)?;
         // SAFETY: The workspace is integer storage whose all-zero representation is valid.
         let mut workspace = unsafe {
             core::ptr::write_bytes(workspace.as_mut_ptr(), 0, 1);
             workspace.assume_init()
         };
-        let commands = storage
+        let commands = self
             .descriptors
             .bytes_mut()
             .get_mut(offset..offset + COMMAND_BYTES)
             .ok_or(EINVAL)?;
-        let encoded = assembly::encode_into(
-            commands,
-            low,
-            &args,
-            &controls,
-            extra,
-            regs::FragmentDispatch { words: [0; 2] },
-            &inputs,
-            &mut workspace,
+        let encoded = at!(
+            "encoding",
+            assembly::encode_into(
+                commands,
+                low,
+                &args,
+                &controls,
+                extra,
+                regs::FragmentDispatch { words: [0; 2] },
+                &inputs,
+                &mut workspace
+            )
         )?;
-        assembly::bind_work_slot(commands, work_slot)?;
+        at!(
+            "bind work slot",
+            assembly::bind_work_slot(commands, work_slot)
+        )?;
         let timestamps = [
             self.lanes[TILING].kick.timestamp(),
             self.lanes[FRAGMENT].kick.timestamp(),
         ];
-        assembly::link_completions(commands, timestamps, payload, false)?;
+        at!(
+            "completions",
+            assembly::link_completions(commands, timestamps, payload, false)
+        )?;
         // Configurations, kicks and items, still invisible.
         let configs = match first {
             true => [
@@ -850,14 +1188,20 @@ impl Pair {
             ],
             false => [None, None],
         };
-        let dependency = KickDependency::new(qids[TILING], timestamps[TILING]).ok_or(EINVAL)?;
+        let dependency = at!(
+            "dependency",
+            KickDependency::new(qids[TILING], timestamps[TILING]).ok_or(EINVAL)
+        )?;
         let context = self.context.clone();
         let policy = context.policy();
         let mut targets = [0u32; 2];
         for n in [TILING, FRAGMENT] {
             let lane = &mut self.lanes[n];
             let producer = lane.cursors()?.producer;
-            targets[n] = lane.stage_kick(producer, configs[n], slot, timestamps[n])?;
+            targets[n] = at!(
+                "stage",
+                lane.stage_kick(producer, configs[n], slot, timestamps[n])
+            )?;
         }
         let kick_args = |n: usize, lane: &Lane| KickArgs {
             qid: qids[n],
@@ -891,9 +1235,12 @@ impl Pair {
             policy.priority(),
             first,
         )?;
+        // A class's outer ring first naming these queues says so: an adopted pair whose class
+        // changed starts on its new rings.
+        let new_class = self.class != policy.priority();
         let records = [
-            self.lanes[FRAGMENT].work_slot(targets[FRAGMENT], false)?,
-            self.lanes[TILING].work_slot(targets[TILING], false)?,
+            self.lanes[FRAGMENT].work_slot(targets[FRAGMENT], new_class)?,
+            self.lanes[TILING].work_slot(targets[TILING], new_class)?,
         ];
         let owners = core::array::from_fn::<_, 2, _>(|n| qos::Owner {
             qid: qids[n],
@@ -910,7 +1257,7 @@ impl Pair {
                 kick.prepare_lower_install()?;
             }
         }
-        work.add_submitted_kicks(2)?;
+        at!("submitted kicks", work.add_submitted_kicks(2))?;
         let pool_target = match self
             .pool
             .reserve_submission()
@@ -926,7 +1273,10 @@ impl Pair {
         for kick in prepared {
             kick.commit();
         }
-        self.storage.manager.claim_scene(ordinal, scene)?;
+        at!(
+            "claim scene",
+            self.storage.manager.claim_scene(ordinal, scene)
+        )?;
         self.storage.manager.prepare_submission()?.commit();
         if let Some(packet) = &packet {
             packet.mark_published();
@@ -944,6 +1294,9 @@ impl Pair {
                 })
         })();
         self.ordinal = ordinal + 1;
+        self.unbound = false;
+        self.rebound = None;
+        self.class = policy.priority();
         self.active = Some(Active {
             ordinal,
             stamp: stamp_of(ordinal),
@@ -971,7 +1324,7 @@ impl Pair {
             return Ok(None);
         };
         fence(Ordering::Acquire);
-        let support = &self.storage.support;
+        let support = &self.support;
         let stamps = [
             support.word(STAMPS)?.load(Ordering::Relaxed),
             support.word(STAMPS + STAGE_STRIDE)?.load(Ordering::Relaxed),
@@ -1005,7 +1358,7 @@ impl Pair {
     /// diagnostic: each stamp, the work node's completed kicks, each lane's cursors and target,
     /// and the pool's completed count, each read on its own.
     pub(crate) fn report(&self) -> Report {
-        let support = &self.storage.support;
+        let support = &self.support;
         let stamp = |offset| {
             support
                 .word(offset)

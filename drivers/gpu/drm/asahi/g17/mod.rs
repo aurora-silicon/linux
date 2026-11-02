@@ -2024,8 +2024,8 @@ impl gpu::Gpu for Gpu {
         };
         let admission_started = now_ns();
         let (backend, slot) = loop {
-            let observed = self.shared.queues.observe();
-            match runtime::Backend::new(&self.shared, &vm, owner, policy) {
+            let mut observed = self.shared.queues.observe();
+            match runtime::Backend::new(&self.shared, &vm, owner, policy, &mut observed) {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == ENOSPC => {
                     // Closed logical queues can still own execution/QoS IDs
@@ -2035,7 +2035,8 @@ impl gpu::Gpu for Gpu {
                     let limit = job::TIMEOUT_MS as u64 * 1_000_000;
                     if waited >= limit { return Err(EBUSY); }
                     self.shared.queue_events();
-                    // A returned queue slot or reclaimed context wakes this.
+                    // A returned queue slot or reclaimed context wakes this; this attempt's own
+                    // returned slot does not (`QueueSlot::rollback`).
                     self.shared
                         .queues
                         .block(observed, (limit - waited).div_ceil(1_000_000) as u32, true)?;

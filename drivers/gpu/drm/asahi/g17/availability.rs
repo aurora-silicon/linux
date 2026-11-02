@@ -95,6 +95,26 @@ impl Availability {
         Ok(())
     }
 
+    /// Wakes every waiter of this domain, as [`Self::notify`], for a release by a caller that
+    /// will wait on `sample` itself: the caller's own release is not an event for it. When no
+    /// other notification came since the sample, the sample moves with the generation; when one
+    /// did, the sample stays stale and the caller's wait returns at once, as it should.
+    pub(crate) fn notify_own(&self, sample: &mut u64) {
+        let mut waiters = {
+            let mut state = self.state.lock();
+            let current = state.generation == *sample;
+            state.generation = state.generation.wrapping_add(1);
+            if current {
+                *sample = state.generation;
+            }
+            state.waiters.take()
+        };
+        while let Some(mut entry) = waiters {
+            waiters = entry.next.take();
+            entry.fence.signal();
+        }
+    }
+
     /// Wakes every waiter of this domain. Call after dropping the resource's own lock; fence
     /// callbacks run outside the domain lock.
     pub(crate) fn notify(&self) {

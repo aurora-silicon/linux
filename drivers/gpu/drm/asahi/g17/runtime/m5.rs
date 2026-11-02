@@ -22,7 +22,7 @@ use crate::g17::{
     queue::{
         compute::retirement::Batch,
         m5::{Channel, Dispatch, Host, Retired},
-        m5_render::{Draw, Pair, PairArgs},
+        m5_render::{BindingArgs, Draw, Pair, PairArgs, ParkedPair},
     },
     status::VmStatus,
 };
@@ -34,31 +34,37 @@ use kernel::{prelude::*, sync::Arc};
 /// than losing its device at the first submission.
 pub(super) const LEAKED_LANES: usize = 8;
 
-/// The M5 lanes as the scheduler-release teardown sees them (`runtime::teardown::Service`).
+/// The M5 lanes as the scheduler-release teardown sees them (`runtime::teardown::Service`):
+/// compute channels and render pairs, bound and parked. Both kinds park through the same
+/// release and are adopted by later queues.
 pub(super) struct Lanes<'a> {
     pub(super) channels: &'a mut KVec<KBox<Channel>>,
     pub(super) parked: &'a mut KVec<crate::g17::queue::m5::ParkedLane>,
     pub(super) pairs: &'a mut KVec<KBox<Pair>>,
+    pub(super) parked_pairs: &'a mut KVec<ParkedPair>,
 }
 
 impl Lanes<'_> {
-    /// Every compute channel of `context` is closed and its lane idle (`Channel::parkable`).
+    /// Every compute channel of `context` is settled: closed and idle, or quarantined with the
+    /// firmware idle on it (`Channel::settled`).
     pub(super) fn compute_idle(&self, context: &Arc<Context>) -> bool {
         self.channels
             .iter()
             .filter(|channel| Arc::ptr_eq(channel.context(), context))
-            .all(|channel| channel.parkable().unwrap_or(false))
+            .all(|channel| channel.settled().unwrap_or(false))
     }
 
-    /// No render pair of `context` has a pass in flight or failed.
+    /// Every render pair of `context` is settled (`Pair::settled`). A failed pair does not hold
+    /// back the release of the context's healthy lanes.
     pub(super) fn render_idle(&self, context: &Arc<Context>) -> bool {
         self.pairs
             .iter()
             .filter(|pair| Arc::ptr_eq(pair.context(), context))
-            .all(|pair| !pair.in_flight() && pair.quarantined().is_none())
+            .all(|pair| pair.settled().unwrap_or(false))
     }
 
-    /// The number of `context`'s channels that park at its release.
+    /// The number of `context`'s healthy channels and pairs that park at its release; its
+    /// quarantined ones stay.
     pub(super) fn parkable(&self, context: &Arc<Context>) -> Result<usize> {
         let mut count = 0;
         for channel in self
@@ -66,12 +72,54 @@ impl Lanes<'_> {
             .iter()
             .filter(|channel| Arc::ptr_eq(channel.context(), context))
         {
-            if !channel.parkable()? {
-                return Err(EBUSY);
+            match channel.quarantined() {
+                Some(_) if channel.settled()? => continue,
+                None if channel.parkable()? => count += 1,
+                _ => return Err(EBUSY),
             }
-            count += 1;
+        }
+        for pair in self
+            .pairs
+            .iter()
+            .filter(|pair| Arc::ptr_eq(pair.context(), context))
+        {
+            match pair.quarantined() {
+                Some(_) if pair.settled()? => continue,
+                None if pair.parkable()? => count += 1,
+                _ => return Err(EBUSY),
+            }
         }
         Ok(count)
+    }
+
+    /// Logs each of `context`'s lanes' park witnesses (a stalled release's diagnostic).
+    pub(super) fn report(&self, context: &Arc<Context>) {
+        for channel in self
+            .channels
+            .iter()
+            .filter(|channel| Arc::ptr_eq(channel.context(), context))
+        {
+            channel.report_park();
+        }
+        for pair in self
+            .pairs
+            .iter()
+            .filter(|pair| Arc::ptr_eq(pair.context(), context))
+        {
+            pair.report_park();
+        }
+    }
+
+    /// A quarantined lane of `context` remains: it keeps the context, and with it the
+    /// execution context the firmware may still name, for the session (bounded by
+    /// [`LEAKED_LANES`]).
+    pub(super) fn retains(&self, context: &Arc<Context>) -> bool {
+        self.channels.iter().any(|channel| {
+            Arc::ptr_eq(channel.context(), context) && channel.quarantined().is_some()
+        }) || self
+            .pairs
+            .iter()
+            .any(|pair| Arc::ptr_eq(pair.context(), context) && pair.quarantined().is_some())
     }
 
     /// Parks every channel of `context`: its lane joins the parked lanes, its binding goes to
@@ -80,13 +128,12 @@ impl Lanes<'_> {
     pub(super) fn park(
         &mut self,
         context: &Arc<Context>,
+        buffers: &mut crate::g17::buffer::BufferIds,
         binding: &mut impl FnMut(crate::g17::queue::m5::Binding) -> Result,
     ) -> Result {
-        while let Some(index) = self
-            .channels
-            .iter()
-            .position(|channel| Arc::ptr_eq(channel.context(), context))
-        {
+        while let Some(index) = self.channels.iter().position(|channel| {
+            Arc::ptr_eq(channel.context(), context) && channel.quarantined().is_none()
+        }) {
             self.parked.reserve(1, GFP_KERNEL)?;
             let channel = self.channels.remove(index).map_err(|_| EIO)?;
             let (lane, owner) = channel.park();
@@ -99,6 +146,30 @@ impl Lanes<'_> {
                 );
             }
             self.parked.push_within_capacity(lane).map_err(|_| ENOMEM)?;
+            binding(owner)?;
+        }
+        // Its render pair parks as a pair; the binding's parameter-buffer ID returns.
+        while let Some(index) = self
+            .pairs
+            .iter()
+            .position(|pair| Arc::ptr_eq(pair.context(), context) && pair.quarantined().is_none())
+        {
+            self.parked_pairs.reserve(1, GFP_KERNEL)?;
+            buffers.can_release(self.pairs[index].buffer_id())?;
+            let pair = self.pairs.remove(index).map_err(|_| EIO)?;
+            buffers.release(pair.buffer_id())?;
+            let (lane, owner) = pair.park();
+            if crate::module_parameters::m5_lane_trace.value() != 0 {
+                pr_info!(
+                    "M5 pair {:?}: parked (owner {} closed, {} parked)\n",
+                    lane.qids(),
+                    owner.owner(),
+                    self.parked_pairs.len() + 1
+                );
+            }
+            self.parked_pairs
+                .push_within_capacity(lane)
+                .map_err(|_| ENOMEM)?;
             binding(owner)?;
         }
         Ok(())
@@ -315,6 +386,27 @@ impl Registry {
 }
 
 impl crate::g17::Firmware {
+    /// Quarantined lanes, leaked deliberately: a compute channel's one, a
+    /// render pair's two.
+    fn quarantined_lanes(&self) -> usize {
+        self.queues
+            .m5
+            .iter()
+            .filter(|channel| channel.quarantined().is_some())
+            .count()
+            + 2 * self
+                .queues
+                .m5_render
+                .iter()
+                .filter(|pair| pair.quarantined().is_some())
+                .count()
+    }
+
+    /// Below the quarantine cap: a fresh lane or pair may be built.
+    fn fresh_lanes_allowed(&self) -> bool {
+        self.quarantined_lanes() < LEAKED_LANES
+    }
+
     /// Builds and installs the channel of logical queue `owner`, or adopts a parked lane. From
     /// its installation on the lane is retained whatever happens.
     pub(super) fn create_m5_channel(
@@ -335,30 +427,60 @@ impl crate::g17::Firmware {
             );
             error
         };
-        let leaked = self
+        // A parked lane of the same class first (no outer-ring change), else any, once its
+        // previous binding is unmapped.
+        let class = context.policy().priority();
+        let lanes = &self.queues.m5_parked;
+        let parked = lanes
+            .iter()
+            .position(|lane| lane.adoptable() && lane.class() == class)
+            .or_else(|| lanes.iter().position(|lane| lane.adoptable()));
+        // Quarantined lanes are leaked deliberately; past the cap no fresh lane is built, while
+        // parked ones stay in use.
+        let fresh = self.fresh_lanes_allowed();
+        if parked.is_none() && !fresh {
+            if self.queues.m5_refused != owner {
+                self.queues.m5_refused = owner;
+                dev_warn!(
+                    dev.as_ref(),
+                    "M5 queue {} refused: {} quarantined lanes (cap {}), no parked lane\n",
+                    owner,
+                    self.quarantined_lanes(),
+                    LEAKED_LANES
+                );
+            }
+            return Err(ENOSPC);
+        }
+        // Every open logical queue keeps a render pair within reach, as off M5
+        // (`Qids::render_fits`): one already built, a parked one, or two free QIDs. A queue
+        // refused here fails at QUEUE_CREATE, not at its first pass.
+        let free = match fresh {
+            true => self
+                .queues
+                .qids
+                .free()
+                .saturating_sub(usize::from(parked.is_none())),
+            false => 0,
+        };
+        let reach = self.queues.m5_parked_pairs.len() + free / 2;
+        let waiting = 1 + self
             .queues
             .m5
             .iter()
-            .filter(|channel| channel.quarantined().is_some())
+            .filter(|channel| channel.open() && channel.quarantined().is_none())
+            .filter(|channel| {
+                !self
+                    .queues
+                    .m5_render
+                    .iter()
+                    .any(|pair| pair.owner() == channel.owner())
+            })
             .count();
-        if leaked >= LEAKED_LANES {
-            dev_warn!(
-                dev.as_ref(),
-                "M5 queue {} refused: {} quarantined compute lanes (cap {})\n",
-                owner,
-                leaked,
-                LEAKED_LANES
-            );
-            return Err(ENOSPC);
+        if reach < waiting {
+            return Err(crate::g17::capacity::refused(
+                crate::g17::capacity::Site::PhysicalQids,
+            ));
         }
-        // A parked lane of the same class first (no outer-ring change), else any.
-        let class = context.policy().priority();
-        let parked = self
-            .queues
-            .m5_parked
-            .iter()
-            .position(|lane| lane.class() == class)
-            .or_else(|| (!self.queues.m5_parked.is_empty()).then_some(0));
         if let Some(index) = parked {
             self.queues.m5.reserve(1, GFP_KERNEL)?;
             let channel = Channel::adopt(alloc, &mut self.queues.m5_parked, index, context, owner)
@@ -591,6 +713,76 @@ impl crate::g17::Firmware {
                 client: view.iova(),
             },
         )?;
+        // A parked pair of the same class first (no outer-ring change), else any: its
+        // lanes, pool and command storage stay; this binding gets its own parameter
+        // buffer, target and tiling state.
+        let class = context.policy().priority();
+        let pairs = &self.queues.m5_parked_pairs;
+        let parked = pairs
+            .iter()
+            .position(|pair| pair.adoptable() && pair.class() == class)
+            .or_else(|| pairs.iter().position(|pair| pair.adoptable()));
+        if parked.is_none() && (!pairs.is_empty() || !self.fresh_lanes_allowed()) {
+            // A parked pair still unmapping its previous binding is adoptable shortly; past the
+            // quarantine cap no fresh pair is built.
+            return Err(if pairs.is_empty() { ENOSPC } else { EAGAIN });
+        }
+        if let Some(index) = parked {
+            self.queues.m5_render.reserve(1, GFP_KERNEL)?;
+            let pb = self.queues.buffers.allocate_render()?;
+            let binding = BindingArgs {
+                owner,
+                metrics: lease,
+                metrics_view: view,
+                pb,
+                pm_generation: self.queues.render.reserve_pm_generation()?,
+                pass,
+                clusters,
+                programs: self.variant.programs,
+            };
+            let pair = match Pair::adopt(
+                alloc,
+                &mut self.queues.m5_parked_pairs,
+                index,
+                context,
+                binding,
+            ) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    self.queues.buffers.release(pb.0)?;
+                    return Err(refused("adoption", error));
+                }
+            };
+            if let Err(error) = pair.install_pb(&self.init) {
+                // The lanes stay installed: back to the parked pairs, never dropped.
+                let (lane, _binding) = pair.park();
+                self.queues
+                    .m5_parked_pairs
+                    .push_within_capacity(lane)
+                    .map_err(|_| ENOMEM)?;
+                self.queues.buffers.release(pb.0)?;
+                return Err(refused("parameter buffer", error));
+            }
+            if crate::module_parameters::m5_lane_trace.value() != 0 {
+                pr_info!(
+                    "M5 pair {:?}: bound to queue {} class {} ({}), next pass {}\n",
+                    pair.qids(),
+                    owner,
+                    class,
+                    if pair.class_changed() {
+                        "class changed"
+                    } else {
+                        "same class"
+                    },
+                    pair.next_ordinal()
+                );
+            }
+            return self
+                .queues
+                .m5_render
+                .push_within_capacity(pair)
+                .map_err(|_| ENOMEM);
+        }
         let identities = [
             self.queues.reserve_identity()?,
             self.queues.reserve_identity()?,
@@ -613,16 +805,18 @@ impl crate::g17::Firmware {
             context,
             PairArgs {
                 ids: [tiling, fragment],
-                owner,
                 gpu,
                 pointers: &self.variant.pointers,
-                metrics: lease,
-                metrics_view: view,
-                pb,
-                pm_generation,
-                pass,
-                clusters,
-                programs: self.variant.programs,
+                binding: BindingArgs {
+                    owner,
+                    metrics: lease,
+                    metrics_view: view,
+                    pb,
+                    pm_generation,
+                    pass,
+                    clusters,
+                    programs: self.variant.programs,
+                },
             },
         );
         let mut pair = match built {
@@ -786,14 +980,23 @@ impl Backend {
                     uat: &uat,
                     layout: firmware.variant.vm_layout,
                 };
-                firmware.create_m5_pair(
+                match firmware.create_m5_pair(
                     &alloc,
                     self.context.clone(),
                     self.owner,
                     &gpu,
                     self.shared.clusters,
                     pass,
-                )?;
+                ) {
+                    // A parked pair is still unmapping its previous binding (`Pair::adopt`):
+                    // the reclaim that finishes it wakes this wait, bounded as a full ring's.
+                    Err(error) if error == EAGAIN => {
+                        drop(state);
+                        retry(lease)?;
+                        continue;
+                    }
+                    result => result?,
+                }
             }
             match firmware.publish_m5_render(&dev, self.owner, packet, &draw) {
                 Err(error) if error == EAGAIN && !packet.is_published() => {

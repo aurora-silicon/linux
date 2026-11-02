@@ -352,6 +352,8 @@ pub(crate) struct Channel {
     rebound: Option<bool>,
     /// The class whose outer work ring last carried this queue's first slot.
     class: u8,
+    /// Set once this binding's client views are unmapped, after it parks.
+    unmapped: Unmapped,
     gpu: Gpu,
     /// The descriptors' canonical low alias (the kernel's lower VM); it stays with the lane.
     descriptors_lower: mmu::KernelMapping,
@@ -435,11 +437,17 @@ pub(crate) struct ParkedLane {
     usage: KernelObject,
     class: u8,
     pages: crate::g17::context::FirmwarePages,
+    unmapped: Unmapped,
 }
 
 impl ParkedLane {
     pub(crate) fn qid(&self) -> u8 {
         self.lane.qid()
+    }
+    /// Its previous binding's client views are unmapped: a new owner in the same VM may map
+    /// the lane at the same addresses.
+    pub(crate) fn adoptable(&self) -> bool {
+        self.unmapped.done()
     }
     /// The class whose outer ring last carried this lane.
     pub(crate) fn class(&self) -> u8 {
@@ -447,16 +455,62 @@ impl ParkedLane {
     }
 }
 
-/// A parked lane's former owner binding: its aliases in that owner's VM, then its context.
+/// Whether a binding's client views are unmapped, shared by the binding and its parked lane:
+/// the lane is adoptable only once they are, since a new owner in the same VM maps the lane at
+/// the same addresses (the ring, command storage, pool and operand state sit at fixed VAs).
+#[derive(Clone)]
+pub(crate) struct Unmapped(Arc<AtomicBool>);
+
+impl Unmapped {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self(Arc::new(AtomicBool::new(false), GFP_KERNEL)?))
+    }
+    pub(crate) fn done(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// A parked lane's (or render pair's) former owner binding: its client views in that owner's
+/// VM, a pair's storage there, then its context. Dropped off the device mutex; its lane becomes
+/// adoptable once it is ([`ParkedLane::adoptable`]).
 pub(crate) struct Binding {
-    _aliases: KVec<mmu::KernelMapping>,
-    _context: Arc<Context>,
+    aliases: KVec<mmu::KernelMapping>,
+    render: Option<KBox<super::m5_render::Storage>>,
+    context: Option<Arc<Context>>,
     owner: u64,
+    unmapped: Unmapped,
 }
 
 impl Binding {
+    pub(crate) fn render(
+        aliases: KVec<mmu::KernelMapping>,
+        storage: KBox<super::m5_render::Storage>,
+        context: Arc<Context>,
+        owner: u64,
+        unmapped: Unmapped,
+    ) -> Self {
+        Self {
+            aliases,
+            render: Some(storage),
+            context: Some(context),
+            owner,
+            unmapped,
+        }
+    }
+
     pub(crate) fn owner(&self) -> u64 {
         self.owner
+    }
+}
+
+impl Drop for Binding {
+    fn drop(&mut self) {
+        // Every view first (each unmaps as it drops), then the storage behind a pair's, then
+        // the context; only then may a new owner map the lane.
+        drop(core::mem::replace(&mut self.aliases, KVec::new()));
+        drop(self.render.take());
+        drop(self.context.take());
+        self.unmapped.0.store(true, Ordering::Release);
     }
 }
 
@@ -516,6 +570,7 @@ impl Channel {
                 context,
                 owner,
                 _previous_pages: None,
+                unmapped: Unmapped::new()?,
                 rebound: None,
                 class: u8::MAX,
                 gpu,
@@ -576,6 +631,10 @@ impl Channel {
         owner: u64,
     ) -> Result<KBox<Self>> {
         let lane = parked.get_mut(index).ok_or(EINVAL)?;
+        if !lane.adoptable() {
+            return Err(EAGAIN);
+        }
+        let unmapped = Unmapped::new()?;
         let mut aliases = KVec::with_capacity(8, GFP_KERNEL)?;
         let (preempt_va, usage_va) = client_aliases(
             alloc,
@@ -601,6 +660,7 @@ impl Channel {
                 context,
                 owner,
                 _previous_pages: Some(lane.pages),
+                unmapped,
                 rebound: Some(class_changed),
                 class: lane.class,
                 gpu: lane.gpu,
@@ -657,6 +717,27 @@ impl Channel {
             || retirement::stamp_covers(self.stamp()?, next.prev().get()))
     }
 
+    /// Logs the park witnesses ([`Self::parkable`]) one by one, for a stalled release.
+    pub(crate) fn report_park(&self) {
+        let next = self.lane.kick.timestamp();
+        pr_warn!(
+            "G17 M5: lane {}: closed {} installed {} quarantine {:?} faulted {} active {} failed {}, cursors {:x?}, idle {:?}, pool {:?}/{:?}, stamp {:x?} for kick {:#x}\n",
+            self.qid(), self.closed, self.installed, self.quarantine, self.faulted, self.active.len(),
+            self.failed.len(), self.lane.cursors(),
+            self.lane.cursors().and_then(|cursors| self.lane.idle_at(cursors.producer)),
+            self.pool.completed_submissions(), self.pool.submitted(), self.stamp(), next.prev().get(),
+        );
+    }
+
+    /// The lane needs nothing more before its context's release: parkable, or quarantined
+    /// (leaked, never reused) with the firmware idle on its ring.
+    pub(crate) fn settled(&self) -> Result<bool> {
+        if self.quarantine.is_none() {
+            return self.parkable();
+        }
+        Ok(self.closed && self.lane.idle_at(self.lane.cursors()?.producer)?)
+    }
+
     /// Splits a parked channel ([`Self::parkable`], its context's release consumed) into its
     /// lane and its binding. The lane keeps the context's scheduler page and work storage, which
     /// the record names until the next owner rewrites it.
@@ -676,6 +757,7 @@ impl Channel {
             operand,
             preempt,
             usage,
+            unmapped,
             ..
         } = KBox::into_inner(self);
         let pages = context.retain_firmware_pages();
@@ -693,11 +775,14 @@ impl Channel {
                 usage,
                 class,
                 pages,
+                unmapped: unmapped.clone(),
             },
             Binding {
-                _aliases: aliases,
-                _context: context,
+                aliases,
+                render: None,
+                context: Some(context),
                 owner,
+                unmapped,
             },
         )
     }
@@ -729,6 +814,10 @@ impl Channel {
     }
     pub(crate) fn in_flight(&self) -> bool {
         !self.active.is_empty()
+    }
+    /// Its logical queue is open.
+    pub(crate) fn open(&self) -> bool {
+        !self.closed
     }
     /// Room for another kick: installed, healthy, open and below [`DEPTH`].
     pub(crate) fn has_room(&self) -> bool {
@@ -818,9 +907,11 @@ impl Channel {
             kick_ring_fw_va: self.lane.kick.firmware_va(),
             qid: self.qid(),
             install: install || rebound == Some(true),
+            // An adopted lane's completion value continues, unless no kick ever ran on it: then
+            // its first kick is the lane's first and takes the fresh lane's seed.
             completion_seed: match rebound {
-                Some(_) => None,
-                None => completion_seed,
+                Some(_) if self.lane.kick.timestamp().get() != KickTimestamp::FIRST.get() => None,
+                _ => completion_seed,
             },
             context_id: self.context.id().try_into()?,
             // The pool is bound with the first kick's context update.

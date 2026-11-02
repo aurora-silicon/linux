@@ -178,13 +178,18 @@ impl Host for Service<'_> {
         self.primary.notify(MSG_CONTROL_NOTIFY)
     }
     fn detach(&mut self, context: &Arc<Context>) -> Result {
+        let mut retained = false;
         if let Some(m5) = &mut self.m5 {
             // Every compute lane of the context parks; its bindings drop off the device mutex.
             let count = m5.parkable(context)?;
             if !self.reclaim.m5_room(count) || !self.reclaim.has_room(0, 1) {
                 return Err(EBUSY);
             }
-            m5.park(context, &mut |binding| self.reclaim.m5_binding(binding))?;
+            let reclaim = &mut *self.reclaim;
+            m5.park(context, self.buffers, &mut |binding| {
+                reclaim.m5_binding(binding)
+            })?;
+            retained = m5.retains(context);
         }
         let linked = context.retain_linked_work(self.objects);
         let (_, _, slots) = self.render.exit_scope(context);
@@ -195,6 +200,11 @@ impl Host for Service<'_> {
         // was acknowledged and its pairs went idle: it no longer names these pairs, so
         // their kill hold ends here rather than at the next processor stop.
         self.admission.release_killed_slots(slots);
+        if retained {
+            // A quarantined M5 lane keeps the context and its execution context: the firmware
+            // may still name them.
+            return Ok(());
+        }
         // detach_context preflights this slot together with every graph slot.
         // Retain it before Pending removes its reference under the device lock.
         self.reclaim.context(context)
@@ -237,6 +247,7 @@ impl Firmware {
             teardown,
             m5: channels,
             m5_parked,
+            m5_parked_pairs,
             m5_render,
             ..
         } = &mut self.queues;
@@ -253,6 +264,7 @@ impl Firmware {
                 channels,
                 parked: m5_parked,
                 pairs: m5_render,
+                parked_pairs: m5_parked_pairs,
             }),
         };
         teardown.publish_ready(&mut service, recovery, super::now_ns())?;
@@ -264,6 +276,28 @@ impl Firmware {
             .is_some()
         {
             consumed = true;
+        }
+        // An M5 context still closing 2 s after it was armed says once what holds it: every
+        // later queue's lanes depend on its release.
+        if m5 {
+            const STALL_NS: u64 = 2_000_000_000;
+            while let Some((context, target)) = teardown.take_stalled(super::now_ns(), STALL_NS) {
+                pr_warn!(
+                    "G17 M5: context {} still closing: release {:?} (control {}/{}), recovery {}, render idle {:?}, pools released {}, compute idle {}, backpressured {}\n",
+                    context.id(),
+                    target,
+                    consumer,
+                    producer,
+                    recovery,
+                    service.render_idle(&context),
+                    service.flists_released(&context),
+                    service.compute_idle(&context),
+                    service.control_backpressured(),
+                );
+                if let Some(m5) = &service.m5 {
+                    m5.report(&context);
+                }
+            }
         }
         if consumed {
             // A channel whose last scheduler release is consumed can change owner.

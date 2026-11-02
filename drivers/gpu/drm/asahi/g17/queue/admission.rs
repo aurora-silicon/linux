@@ -496,7 +496,7 @@ impl Pool {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(QueueSlot { pool: self.clone() }),
+                Ok(_) => return Ok(QueueSlot { pool: self.clone(), rolled_back: false }),
                 Err(current) => count = current,
             }
         }
@@ -786,15 +786,37 @@ mod accounting_tests {
 /// Counted once per userspace logical queue, independently of installed graphs.
 pub(crate) struct QueueSlot {
     pool: Arc<Pool>,
+    /// Returned by [`Self::rollback`]: its drop notifies no one.
+    rolled_back: bool,
 }
 impl QueueSlot {
     /// The device's admission pool, which lives as long as the firmware session.
     pub(crate) fn pool(&self) -> &Arc<Pool> {
         &self.pool
     }
+    /// Returns the slot of a creation that failed and will wait on the queue domain at `sample`.
+    /// The return is capacity only to a creation refused for the logical-queue bound
+    /// ([`Pool::reserve_queue`]), which can have happened only while the pool was full: then
+    /// the other waiters are woken as by a drop, and the creator's own wait does not count its
+    /// own return (`Availability::notify_own`). Otherwise it wakes no one: every other refusal
+    /// a creator waits on (render reach, QIDs, execution contexts) clears with a queue closing
+    /// or a lane parking, which notify. Refused creators otherwise woke each other in turn.
+    pub(crate) fn rollback(mut self, sample: &mut u64) {
+        self.rolled_back = true;
+        let counted = self.pool.queues.fetch_sub(1, Ordering::AcqRel);
+        if counted < self.pool.max_queues {
+            return;
+        }
+        if let Some(waiters) = &self.pool.waiters {
+            waiters.notify_own(sample);
+        }
+    }
 }
 impl Drop for QueueSlot {
     fn drop(&mut self) {
+        if self.rolled_back {
+            return;
+        }
         self.pool.queues.fetch_sub(1, Ordering::AcqRel);
         if let Some(waiters) = &self.pool.waiters {
             waiters.notify();

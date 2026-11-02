@@ -19,7 +19,7 @@ use super::{
     object::Allocator,
     queue::{
         m5::Host,
-        m5_render::{Pair, PairArgs},
+        m5_render::{BindingArgs, Pair, PairArgs},
     },
     Firmware, Shared,
 };
@@ -190,16 +190,18 @@ impl Render {
             context,
             PairArgs {
                 ids: [tiling, fragment],
-                owner,
                 gpu: &gpu,
                 pointers: &firmware.variant.pointers,
-                metrics: lease,
-                metrics_view: client,
-                pb,
-                pm_generation,
-                pass: &pass,
-                clusters: shared.clusters,
-                programs: firmware.variant.programs,
+                binding: BindingArgs {
+                    owner,
+                    metrics: lease,
+                    metrics_view: client,
+                    pb,
+                    pm_generation,
+                    pass: &pass,
+                    clusters: shared.clusters,
+                    programs: firmware.variant.programs,
+                },
             },
         );
         let pair = match built {

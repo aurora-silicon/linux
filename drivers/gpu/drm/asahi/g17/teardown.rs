@@ -30,6 +30,8 @@ struct Entry {
     kill_wait: Option<(u64, bool)>,
     /// A render-only kill of this context was refused (counted once per context).
     kill_refused: bool,
+    /// Its stall was reported ([`Pending::take_stalled`]).
+    stall_reported: bool,
 }
 
 /// The kill of a closed context whose compute side is clean, published so that its render
@@ -146,6 +148,7 @@ impl Pending {
             render_kill: None,
             kill_wait: None,
             kill_refused: false,
+            stall_reported: false,
         };
         self.entries.push(entry, GFP_KERNEL)?;
         Ok(())
@@ -243,6 +246,22 @@ impl Pending {
         }
         fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    /// One closed context not yet reported that has waited `after` ns since it was armed: its
+    /// context and, once its release is published, the control cursor that consumes it. Each
+    /// entry is reported once, for a diagnostic of what holds it.
+    pub(crate) fn take_stalled(&mut self, now: u64, after: u64) -> Option<(Arc<Context>, Option<u32>)> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| !entry.stall_reported && now.saturating_sub(entry.armed) >= after)?;
+        entry.stall_reported = true;
+        let target = match entry.phase {
+            Phase::Released(target) => Some(target),
+            _ => None,
+        };
+        Some((entry.context.clone(), target))
     }
 
     /// The caller snapshots both control cursors once for this settlement pass and repeatedly

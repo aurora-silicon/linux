@@ -189,6 +189,11 @@ pub(super) struct Registry {
     m5: KVec<KBox<queue::m5::Channel>>,
     /// Idle installed compute lanes without an owner: the next QUEUE_CREATE adopts one.
     m5_parked: KVec<queue::m5::ParkedLane>,
+    /// Idle installed render pairs without an owner: the next queue's first pass adopts one.
+    m5_parked_pairs: KVec<queue::m5_render::ParkedPair>,
+    /// The last logical queue refused for the quarantine cap: QUEUE_CREATE retries a refusal,
+    /// and each queue's is logged once.
+    m5_refused: u64,
     /// Its render pairs, one per logical queue that rendered, retained the same way
     /// ([`queue::m5_render`]).
     m5_render: KVec<KBox<queue::m5_render::Pair>>,
@@ -257,6 +262,8 @@ impl Registry {
             teardown: super::teardown::Pending::new()?,
             m5: KVec::new(),
             m5_parked: KVec::new(),
+            m5_parked_pairs: KVec::new(),
+            m5_refused: 0,
             m5_render: KVec::new(),
         })
     }
@@ -711,11 +718,31 @@ pub(super) struct Backend {
 }
 
 impl Backend {
+    /// Builds a logical queue's backend. `sample` is the caller's sample of the queue domain
+    /// (`Shared::queues`), on which it waits after a refusal: a failed build returns its queue
+    /// slot without waking that wait ([`admission::QueueSlot::rollback`]).
     pub(super) fn new(
         shared: &Arc<super::Shared>,
         vm: &crate::mmu::Vm,
         owner: u64,
         policy: super::fw::queue::Policy,
+        sample: &mut u64,
+    ) -> Result<(Arc<Self>, admission::QueueSlot)> {
+        let mut held = None;
+        let result = Self::build(shared, vm, owner, policy, sample, &mut held);
+        if let Some(slot) = held.take() {
+            slot.rollback(sample);
+        }
+        result
+    }
+
+    fn build(
+        shared: &Arc<super::Shared>,
+        vm: &crate::mmu::Vm,
+        owner: u64,
+        policy: super::fw::queue::Policy,
+        sample: &mut u64,
+        held: &mut Option<admission::QueueSlot>,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
         // A closed queue keeps its application context until its scheduler
         // release is consumed and the context is returned. When only such
@@ -724,15 +751,15 @@ impl Backend {
         // sleeping, and nothing of the new queue is visible yet.
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
-        let (lease, uat, pool, qos, execution, slot) = loop {
-            let observed = shared.queues.observe();
+        let (lease, uat, pool, qos, execution) = loop {
+            *sample = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if shared.crashed.load(core::sync::atomic::Ordering::Acquire) {
                 return Err(EIO);
             }
-            let slot = firmware.queues.admission.reserve_queue()?;
+            *held = Some(firmware.queues.admission.reserve_queue()?);
             // Installed compute channels narrow render's QIDs: every open
             // logical queue keeps a dedicated render pair within reach. M5
             // queues have no render.
@@ -749,7 +776,6 @@ impl Backend {
                         firmware.pool.clone(),
                         firmware.queues.qos_ids.clone(),
                         execution,
-                        slot,
                     )
                 }
                 Err(error) if error == ENOSPC => {
@@ -760,7 +786,9 @@ impl Backend {
                     if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
                         return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
                     }
-                    drop(slot);
+                    if let Some(slot) = held.take() {
+                        slot.rollback(sample);
+                    }
                     drop(state);
                     drop(lease);
                     // Nothing is visible yet: a signalled creator restarts.
@@ -771,7 +799,7 @@ impl Backend {
                     // A closing queue returns its context when its release
                     // is reclaimed; that reclaim wakes this creator.
                     let left = RETAINED_CONTEXT_WAIT_NS.saturating_sub(now_ns().saturating_sub(started));
-                    shared.queues.block(observed, left.div_ceil(1_000_000) as u32, true)?;
+                    shared.queues.block(*sample, left.div_ceil(1_000_000) as u32, true)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -810,12 +838,12 @@ impl Backend {
                 .map_err(|error| if error == EAGAIN { EBUSY } else { error })?;
         }
         drop(state);
-        let admission = slot.pool().clone();
-        Ok((
-            Arc::pin_init(
+        let admission = held.as_ref().ok_or(EINVAL)?.pool().clone();
+        let bound = context.clone();
+        let backend = Arc::pin_init(
                 pin_init!(Self {
                     shared: shared.clone(),
-                    context,
+                    context: bound,
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
                     compute_backlog: core::sync::atomic::AtomicU32::new(0),
@@ -826,9 +854,22 @@ impl Backend {
                     direct_slot: core::sync::atomic::AtomicU32::new(0),
                 }),
                 GFP_KERNEL,
-            )?,
-            slot,
-        ))
+            );
+        match backend {
+            Ok(backend) => Ok((backend, held.take().ok_or(EINVAL)?)),
+            Err(error) => {
+                // An installed M5 channel outlives this failure: it closes as a released queue's
+                // does and parks at its context's release.
+                if shared.m5.is_some() {
+                    let mut state = shared.state.lock();
+                    if let Some(firmware) = (*state).as_deref_mut() {
+                        firmware.queues.close_m5(owner);
+                        firmware.queues.teardown.close(&context, now_ns())?;
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     /// The shared aperture has exactly one builder. Other queues sleep without
