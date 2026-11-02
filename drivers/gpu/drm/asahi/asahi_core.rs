@@ -132,6 +132,10 @@ module! {
             default: 0,
             description: "Run the M5 arithmetic qualification after firmware startup (nonzero: on)",
         },
+        m5_trace_completions: u32 {
+            default: 0,
+            description: "M5: log every retired DRM compute kick's class and firmware start/end stamps (nonzero: on)",
+        },
         robust_isolation: u32 {
             default: 0,
             // permissions: 0o644,

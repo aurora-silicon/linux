@@ -787,6 +787,27 @@ impl InitData {
         )
     }
 
+    /// Diagnostic: per M5 completion ring, the slots whose control word is nonzero and the
+    /// newest end timestamp among them, for a timeout report.
+    pub(super) fn m5_completion_census(&self) -> Result<[(usize, u64); 4]> {
+        let mut census = [(0, 0); 4];
+        if !self.m5 {
+            return Ok(census);
+        }
+        fence(Ordering::Acquire);
+        for (index, entry) in census.iter_mut().enumerate() {
+            let object = self.object(self.m5_completions[index])?;
+            for slot in 0..object.size() / 0x40 {
+                let completion = ComputeCompletion { object, offset: slot * 0x40 };
+                if completion.read(0)? != 0 {
+                    entry.0 += 1;
+                    entry.1 = entry.1.max(completion.read(5)? & COMPLETION_TIME_MASK);
+                }
+            }
+        }
+        Ok(census)
+    }
+
     /// Folds every slot of the compute completion ring and records its control word in
     /// `seen`. For a pass that stopped before a record the firmware must already have
     /// written. Returns the slot after the newest record (latest end timestamp), where the

@@ -1291,25 +1291,21 @@ impl File {
             return Err(EINVAL);
         }
 
-        // REALTIME stays reserved. HIGH needs CAP_SYS_NICE or DRM master, as amdgpu and
-        // panthor require for raised queue priority; EACCES lets userspace fall back to MEDIUM.
-        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
-            cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
+        // HIGH and REALTIME are raised priorities. They have only been run on G17; G13 and G14
+        // keep refusing them, and the GPU refuses a class it has no profile for (EINVAL).
+        let raised = data.priority >= uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH;
+        if raised && !reg_data.gpu.as_any().is::<crate::g17::Gpu>() {
+            cls_pr_debug!(Errors, "queue_create: priority {} is not supported on this GPU\n", data.priority);
             return Err(EINVAL);
         }
-        // HIGH has only been run on G17; G13 and G14 keep refusing it.
-        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
-            && !reg_data.gpu.as_any().is::<crate::g17::Gpu>()
-        {
-            cls_pr_debug!(Errors, "queue_create: HIGH priority is not supported on this GPU\n");
-            return Err(EINVAL);
-        }
+        // A raised priority needs CAP_SYS_NICE or DRM master, as amdgpu and panthor require;
+        // EACCES lets userspace fall back to MEDIUM.
         // SAFETY: capable() only reads the calling task's credentials (ioctl process context).
-        if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
+        if raised
             && !unsafe { bindings::capable(bindings::CAP_SYS_NICE as _) }
             && !file.is_current_master()
         {
-            cls_pr_debug!(Errors, "queue_create: HIGH priority needs CAP_SYS_NICE or DRM master\n");
+            cls_pr_debug!(Errors, "queue_create: priority {} needs CAP_SYS_NICE or DRM master\n", data.priority);
             return Err(EACCES);
         }
 

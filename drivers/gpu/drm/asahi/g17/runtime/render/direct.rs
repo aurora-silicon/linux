@@ -107,7 +107,7 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
     /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2.
     fn notify_render(&mut self, priority: u8) -> Result {
         self.port
-            .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2)
+            .notify(crate::g17::fw::channels::work_notification(priority, crate::g17::fw::queue::DataMaster::Tiling))
     }
     fn note_submission(&mut self) -> Result {
         // Counted, with the submission effort witnessed, before the pair was lent.

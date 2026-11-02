@@ -485,6 +485,12 @@ pub(crate) const fn work_ring_index(priority: u8, data_master: DataMaster) -> Op
     Some(priority as usize * WORK_RINGS_PER_PRIORITY + data_master as usize)
 }
 
+/// The doorbell message announcing new work on the work ring of `data_master` at priority class
+/// `priority`: message type 0x83, the engine in bits 1:0 and the class in bits 3:2.
+pub(crate) const fn work_notification(priority: u8, data_master: DataMaster) -> u64 {
+    (0x83 << 48) | data_master as u64 | (priority as u64) << 2
+}
+
 /// One work-ring slot: a request to run a queue's newly published commands.
 #[repr(C)]
 #[derive(Debug)]

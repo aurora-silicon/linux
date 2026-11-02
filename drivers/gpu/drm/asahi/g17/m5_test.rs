@@ -189,7 +189,7 @@ impl Compute {
                 &firmware.queues.qos_ids,
                 execution,
                 0,
-                fw::m5::queue::POLICY,
+                fw::m5::queue::MEDIUM,
                 shared.renders.clone(),
                 shared.progress.clone(),
             )?,

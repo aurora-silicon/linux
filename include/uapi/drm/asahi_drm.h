@@ -922,7 +922,8 @@ enum drm_asahi_priority {
 	/**
 	 * @DRM_ASAHI_PRIORITY_REALTIME: Real-time priority queue.
 	 *
-	 * Reserved for future extension.
+	 * Requires CAP_SYS_NICE or DRM master; otherwise queue creation fails
+	 * with -EACCES. GPUs without a real-time class refuse it with -EINVAL.
 	 */
 	DRM_ASAHI_PRIORITY_REALTIME = 3,
 };

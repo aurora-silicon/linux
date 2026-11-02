@@ -63,6 +63,9 @@ impl Backend {
                 return Ok(None);
             };
             firmware.scan_compute(None, &mut deferred)?;
+            if let Ok(census) = firmware.init.m5_completion_census() {
+                pr_info!("G17 M5 timeout: completion rings (records, newest end) {:?}\n", census);
+            }
             if firmware.queues.timeout_m5(self.owner, packet, &mut deferred)? {
                 return Ok(Some(self.context.status().clone()));
             }

@@ -2006,11 +2006,10 @@ impl gpu::Gpu for Gpu {
                 dev_warn!(self.shared.dev.as_ref(), "M5 queue {}: frontend refused: {:?}\n", owner, error);
             }
         })?;
+        // One profile per queue, chosen here; the record, configuration, work ring, kick header,
+        // host command and QoS row all take it from the context.
         let policy = match self.shared.m5 {
-            // M5 accepts four (priority, policy) pairs (`QueueRecord::scheduling_words`), and
-            // T's HIGH and LOW profiles are none of them.
-            Some(_) if priority == 2 => fw::m5::queue::POLICY,
-            Some(_) => return Err(EOPNOTSUPP),
+            Some(_) => fw::m5::queue::scheduling_policy(priority)?,
             None => scheduling_policy(priority)?,
         };
         let admission_started = now_ns();
@@ -2077,9 +2076,9 @@ impl gpu::Gpu for Gpu {
     }
 }
 
-/// Scheduling profile of a new logical queue. `file.rs` passes
-/// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses REALTIME, so HIGH
-/// arrives as 1, MEDIUM as 2 and LOW as 3.
+/// Scheduling profile of a new logical queue off M5. `file.rs` passes
+/// `DRM_ASAHI_PRIORITY_REALTIME - priority`, so REALTIME arrives as 0 (refused
+/// here), HIGH as 1, MEDIUM as 2 and LOW as 3.
 fn scheduling_policy(priority: u32) -> Result<fw::queue::Policy> {
     match priority {
         1 => Ok(hw::t8140::scheduling::HIGH),

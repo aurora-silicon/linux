@@ -13,10 +13,58 @@ use super::super::{
 };
 use kernel::prelude::*;
 
-/// The one scheduling profile qualified on M5: priority class 2 (S's `scheduling_policy(2)`),
-/// which DRM's MEDIUM priority selects. The record's other classes have their own policy words
-/// ([`QueueRecord`]) and no qualified QoS class or share.
-pub(crate) const POLICY: Policy = Policy::new(2, 2, 4, 8192);
+/// One M5 scheduling class: the profile of a queue at that firmware priority class, and the
+/// class-specific record words stored for it and its QoS byte (the QoS byte
+/// is that of a queue registered alone, the
+/// full share of one isolated queue).
+struct Class {
+    policy: Policy,
+    reserved_30: [u8; 6],
+    sentinel_36: u16,
+    reserved_38: u32,
+}
+
+/// The four M5 classes, indexed by firmware priority class: DRM's `REALTIME - priority` as
+/// `file.rs` passes it, so REALTIME is class 0 (the high profile), HIGH class 1, MEDIUM
+/// class 2 (the default) and LOW class 3 (the background profile). Each class has
+/// its own work ring and completion class; nothing else varies with it.
+const CLASSES: [Class; Policy::PRIORITIES as usize] = [
+    Class {
+        policy: Policy::new(0, 1, 15, 8192),
+        reserved_30: [0, 0, 0xff, 0xff, 0xff, 0xff],
+        sentinel_36: u16::MAX,
+        reserved_38: 1,
+    },
+    Class {
+        policy: Policy::new(1, 0, 20, 8192),
+        reserved_30: [0, 0, 0, 0, 0xff, 0xff],
+        sentinel_36: u16::MAX,
+        reserved_38: 0,
+    },
+    Class {
+        policy: Policy::new(2, 2, 4, 8192),
+        reserved_30: [0; 6],
+        sentinel_36: u16::MAX,
+        reserved_38: 0,
+    },
+    Class {
+        policy: Policy::new(3, 0, 20, 8192),
+        reserved_30: [0; 6],
+        sentinel_36: 0,
+        reserved_38: 0,
+    },
+];
+
+/// The profile of firmware priority class `priority` (`REALTIME - priority` for a DRM queue).
+pub(crate) fn scheduling_policy(priority: u32) -> Result<Policy> {
+    Ok(CLASSES
+        .get(usize::try_from(priority)?)
+        .ok_or(EINVAL)?
+        .policy)
+}
+
+/// The default class, DRM's MEDIUM: the qualification's queues run at it.
+pub(crate) const MEDIUM: Policy = CLASSES[2].policy;
 
 /// The M5 queue record. The scheduler pointer moved from the Neo record's 0x9c to 0x70; the
 /// policy and owner fields also moved.
@@ -46,14 +94,12 @@ static_assert!(core::mem::offset_of!(QueueRecord, owner_pid) == 0x44);
 static_assert!(core::mem::offset_of!(QueueRecord, scheduler_va) == 0x70);
 
 impl QueueRecord {
-    /// The class-specific words stored on a queue's record, for the profiles
-    /// of its four priority classes.
+    /// The record words of `policy`'s class. Only the profiles of [`CLASSES`] are encodable.
     fn scheduling_words(policy: Policy) -> Result<([u8; 6], u16, u32)> {
-        match (policy.priority(), policy.policy()) {
-            (0, 1) => Ok(([0, 0, 0xff, 0xff, 0xff, 0xff], u16::MAX, 1)),
-            (1, 0) => Ok(([0, 0, 0, 0, 0xff, 0xff], u16::MAX, 0)),
-            (2, 2) => Ok(([0; 6], u16::MAX, 0)),
-            (3, 0) => Ok(([0; 6], 0, 0)),
+        match CLASSES.get(usize::from(policy.priority())) {
+            Some(class) if class.policy == policy => {
+                Ok((class.reserved_30, class.sentinel_36, class.reserved_38))
+            }
             _ => Err(EINVAL),
         }
     }
@@ -233,6 +279,11 @@ impl HardwareSubmission {
             return Err(EINVAL);
         }
         Ok(Self::CONFIG_TAG | (u64::from(qid) << Self::QID_SHIFT))
+    }
+
+    /// The queue configuration payload a configuring transaction stores, `None` for an advance.
+    pub(crate) fn configuration(&self) -> Option<u64> {
+        (self.count == 8).then_some(self.writes[3].1)
     }
 
     /// The 64-bit register writes, in order.

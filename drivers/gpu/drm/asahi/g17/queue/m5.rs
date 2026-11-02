@@ -736,9 +736,12 @@ impl Channel {
         if let Some(packet) = &packet {
             packet.mark_published();
         }
+        let mut qos_row = None;
         let result = (|| {
-            host.port
-                .qos_publish(self.qos_owner(), self.context.scheduler_va(), policy)?;
+            let publication =
+                host.port
+                    .qos_publish(self.qos_owner(), self.context.scheduler_va(), policy)?;
+            qos_row = Some(publication.record);
             self.context.mark_published();
             fence(Ordering::SeqCst);
             // The work ring names the queue and the firmware hears of it before the host
@@ -759,6 +762,9 @@ impl Channel {
             item_count: ITEM_RING_ENTRIES,
             epoch,
         };
+        if first && result.is_ok() {
+            self.log_class(policy, qos_row, &command);
+        }
         self.ordinal = self.ordinal.saturating_add(1);
         self.active
             .push_within_capacity(Active {
@@ -839,6 +845,19 @@ impl Channel {
                 Ok(Some(timestamps)) => {
                     complete_qos(self.qos_owner())?;
                     let front = self.active.remove(0).map_err(|_| EINVAL)?;
+                    // DRM kicks only: the qualification's thousands of kicks carry no packet.
+                    if front.packet.is_some()
+                        && crate::module_parameters::m5_trace_completions.value() != 0
+                    {
+                        pr_info!(
+                            "M5 retire q{} class {} kick {:#x}: fw start {} end {}\n",
+                            self.qid(),
+                            self.context.policy().priority(),
+                            front.ticket.kick,
+                            timestamps[0],
+                            timestamps[1],
+                        );
+                    }
                     retired(Retired {
                         ticket: front.ticket,
                         packet: front.packet,
@@ -935,6 +954,28 @@ impl Channel {
             }
         }
         Ok(end)
+    }
+
+    /// Logs what the queue's first publication handed the firmware for its class: the record's
+    /// scheduling words as stored (+0x28..+0x40: priority twice, the class words, the policy),
+    /// the QoS row written, the work ring and doorbell, and the host port's configuration.
+    fn log_class(&self, policy: Policy, qos_row: Option<[u8; 8]>, command: &HardwareSubmission) {
+        let record: [u32; 6] =
+            core::array::from_fn(|i| self.lane.word(0x28 + 4 * i).unwrap_or(u32::MAX));
+        let ring = fw::channels::work_ring_index(policy.priority(), DataMaster::Compute);
+        pr_info!(
+            "M5 queue {}: class {} policy {} QoS {}/{}: record +0x28 {:08x?}, QoS row {:02x?}, compute ring {:?}, notify {:#018x}, host config {:#018x?}\n",
+            self.qid(),
+            policy.priority(),
+            policy.policy(),
+            policy.qos_class(),
+            policy.qos_share(),
+            record,
+            qos_row,
+            ring,
+            fw::channels::work_notification(policy.priority(), DataMaster::Compute),
+            command.configuration(),
+        );
     }
 
     /// Logs the counters and nonzero stamp and status words of a kick that did not retire.

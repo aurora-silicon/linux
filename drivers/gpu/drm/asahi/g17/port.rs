@@ -274,9 +274,9 @@ impl Port {
         record: &WorkSlot,
         submission: Option<&super::fw::m5::queue::HardwareSubmission>,
     ) -> Result<u32> {
-        let priority = claim.priority as u64;
+        let message = super::fw::channels::work_notification(claim.priority.try_into()?, DataMaster::Compute);
         let next = self.publish_compute(claim, record)?;
-        self.notify((0x83 << super::MSG_TYPE_SHIFT) | DataMaster::Compute as u64 | priority << 2)?;
+        self.notify(message)?;
         if let Some(submission) = submission {
             fence(Ordering::SeqCst);
             self.host_command(|regs| regs.submit_m5_work(submission))?;
@@ -336,7 +336,7 @@ impl Port {
             claim.armed = false;
         }
         drop(reserved);
-        self.notify((0x83 << super::MSG_TYPE_SHIFT) | DataMaster::Compute as u64 | (priority as u64) << 2)?;
+        self.notify(super::fw::channels::work_notification(priority as u8, DataMaster::Compute))?;
         Ok(next)
     }
 
