@@ -382,15 +382,10 @@
 			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	pmu-e {
-		compatible = "apple,tahiti-e-pmu";
+	pmu {
+		compatible = "apple,t8140-pmu";
 		interrupt-parent = <&aic>;
-		interrupts = <AIC_FIQ AIC_CPU_PMU_E IRQ_TYPE_LEVEL_HIGH>;
-	};
-
-	pmu-p {
-		compatible = "apple,tahiti-p-pmu";
-		interrupt-parent = <&aic>;
+		/* The AIC raises both clusters' PMU FIQs as this one. */
 		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
 	};
 
@@ -816,18 +811,6 @@
 			      <0x00000003 0x01040000 0x00000000 0x4000>;
 			reg-names = "core", "event";
 			power-domains = <&ps_aic>;
-
-			affinities {
-				e-core-pmu-affinity {
-					apple,fiq-index = <AIC_CPU_PMU_E>;
-					cpus = <&cpu_e0 &cpu_e1 &cpu_e2 &cpu_e3>;
-				};
-
-				p-core-pmu-affinity {
-					apple,fiq-index = <AIC_CPU_PMU_P>;
-					cpus = <&cpu_p0 &cpu_p1>;
-				};
-			};
 		};
 
 		pmgr_mini: power-management@308280000 {
