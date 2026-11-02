@@ -46,6 +46,12 @@ const FULL_RENDER_RESERVE: usize = render_reserve(crate::mmu::MAX_EXECUTION_CONT
 /// Compute channels that stay reachable with every execution context open.
 #[cfg(CONFIG_KUNIT = "y")]
 pub(super) const COMPUTE_FLOOR: usize = QID_COUNT - FULL_RENDER_RESERVE;
+/// M5 compute channels a firmware session can install: the QIDs above the floor that
+/// [`QueueIds::reserve_for`] leaves compute beside the render reserve of no open queue (M5 opens
+/// no render pairs). An M5 channel is never released, so this bounds the session's queues.
+pub(super) const fn m5_channel_limit(floor: usize) -> u32 {
+    (QID_COUNT - floor - render_reserve(0)) as u32
+}
 /// Upper bound on distinct physical compute channels named by one kick.
 pub(super) const COMPUTE_CHANNELS: usize = QID_COUNT;
 /// Maximum logical queues after firmware-owned QIDs are excluded.

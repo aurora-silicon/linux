@@ -28,7 +28,7 @@ use crate::g17::now_ns;
 /// Descriptor slots per queue. A kick's descriptor is rewritten when the kick 32 slots later
 /// is published; with IN_FLIGHT kicks outstanding at most, that kick has completed by then.
 const DESCRIPTORS: usize = 32;
-const GRAPH_SIZE: usize = 0x8000;
+pub(in crate::g17) const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
 const NATIVE_WAIT_OFFSET: usize = 0x900;
@@ -40,12 +40,12 @@ const CACHED_RECORD_STRIDE: usize = (NATIVE_WAIT_OFFSET
 const CONFIG: usize = 0;
 const ANNOUNCE: usize = 0x800;
 const PREDECESSOR: usize = 0x400;
-const POINTERS: usize = 0x100;
+pub(in crate::g17) const POINTERS: usize = 0x100;
 /// Producer/consumer words live on their own uncached page after the graph,
 /// which the firmware reads through a cached mapping (queue record, job-list
 /// head and item ring), as native does.
 const CURSORS: usize = GRAPH_SIZE;
-const ITEMS: usize = 0x4000;
+pub(in crate::g17) const ITEMS: usize = 0x4000;
 const STAMP: usize = 0x300;
 
 #[repr(C)]

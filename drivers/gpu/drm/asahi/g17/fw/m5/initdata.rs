@@ -1512,6 +1512,8 @@ pub(crate) struct M5Board {
     pub(crate) lanes: usize,
     /// Register windows with their physical instances, in device-VA order.
     pub(crate) windows: &'static [J714RegisterWindowSpec],
+    /// The compute descriptor parameters that follow this GPU.
+    pub(crate) compute: super::compute::Profile,
 }
 
 /// What the M5 hardware data takes from the platform: the board's fixed part and the tables the

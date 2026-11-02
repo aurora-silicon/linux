@@ -467,14 +467,16 @@ struct drm_asahi_vm_status {
  * a hardware resource bound, shared by all files/VMs; it is not a promise that
  * all slots are currently free. QUEUE_CREATE reserves a queue's hardware state
  * and execution context, returning an allocation error if resources run out.
+ * On M5 a queue keeps its hardware queue and execution context for the rest of
+ * the firmware session, so this bounds the queues created, not those open.
  * @max_in_flight_per_queue: Hardware scheduler credits per queue. Software
  * may enqueue additional jobs, which wait behind preceding work/dependencies.
  * @flags: Reserved, zero.
  * @pad: Reserved, zero.
  *
  * The query is available only when DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES is
- * set, which only the G17P runtime does; otherwise it fails with EINVAL. A
- * query does not allocate or reset anything.
+ * set, which the G17P and M5 compute runtimes do; otherwise it fails with
+ * EINVAL. A query does not allocate or reset anything.
  */
 struct drm_asahi_queue_limits {
     __u32 max_queues;
@@ -879,8 +881,12 @@ enum drm_asahi_cmd_type {
 	DRM_ASAHI_SET_RENDER_RESOURCES = 5,
 
 	/**
-	 * @DRM_ASAHI_SET_COMPUTE_RESOURCES: Reserved for the M5 runtime
-	 * (DRM_ASAHI_FEATURE_COMPUTE_RESOURCES). This kernel rejects it.
+	 * @DRM_ASAHI_SET_COMPUTE_RESOURCES: Software command replacing the
+	 * storage declarations of subsequent compute commands in the same
+	 * submit. Followed by zero or more @drm_asahi_compute_program
+	 * payloads. It has no barriers and does not advance either command
+	 * index. Requires DRM_ASAHI_FEATURE_COMPUTE_RESOURCES; where that is
+	 * advertised, every compute command needs a preceding declaration.
 	 */
 	DRM_ASAHI_SET_COMPUTE_RESOURCES = 6,
 
@@ -1127,6 +1133,38 @@ struct drm_asahi_submit {
 
 	/** @pad: MBZ */
 	__u32 pad;
+};
+
+/**
+ * struct drm_asahi_compute_program - Storage of one linked compute dispatch.
+ *
+ * SET_COMPUTE_RESOURCES replaces the list for subsequent compute commands.
+ * Include each distinct dispatch profile in the command stream. The kernel
+ * combines their requirements before publishing work. All sizes are bytes.
+ *
+ * This struct is implicitly sized and therefore is not extensible.
+ */
+struct drm_asahi_compute_program {
+	/** @primary_bytes: Per-thread primary storage. */
+	__u32 primary_bytes;
+
+	/** @secondary_bytes: Per-thread secondary storage. */
+	__u32 secondary_bytes;
+
+	/** @linked_bytes: Additional primary storage after linking. */
+	__u32 linked_bytes;
+
+	/** @minimum_primary_bytes: Minimum primary storage across variants. */
+	__u32 minimum_primary_bytes;
+
+	/** @threadgroup_bytes: Storage shared by a workgroup. */
+	__u32 threadgroup_bytes;
+
+	/** @threads: Number of invocations in a workgroup. */
+	__u32 threads;
+
+	/** @flags: MBZ */
+	__u32 flags;
 };
 
 /**

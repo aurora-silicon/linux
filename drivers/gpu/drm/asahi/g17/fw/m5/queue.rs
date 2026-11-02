@@ -10,6 +10,11 @@ use super::super::{
 };
 use kernel::prelude::*;
 
+/// The one scheduling profile qualified on M5: priority class 2 (S's `scheduling_policy(2)`),
+/// which DRM's MEDIUM priority selects. The record's other classes have their own policy words
+/// ([`QueueRecord`]) and no qualified QoS class or share.
+pub(crate) const POLICY: Policy = Policy::new(2, 2, 4, 8192);
+
 /// The M5 queue record. The scheduler pointer moved from the Neo record's 0x9c to 0x70; the
 /// policy and owner fields also moved.
 #[repr(C, packed)]

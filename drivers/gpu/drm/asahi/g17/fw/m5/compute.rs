@@ -12,7 +12,7 @@ use super::super::{
     kick::{RegisterArray, RegisterArrayBinding, RegisterWrite},
     offset_va, work_key,
 };
-use kernel::prelude::*;
+use kernel::{prelude::*, uapi};
 
 pub(crate) const MAIN_COUNT: usize = 40;
 pub(crate) const ALTERNATE_COUNT: usize = 4;
@@ -27,6 +27,100 @@ const NO_SCRATCH_SIZE: u64 = 0;
 const NO_SCRATCH_STACK: u64 = 8;
 const NO_SCRATCH_DRIVER: u64 = 0;
 const NO_SCRATCH_WINDOW: u64 = 0xff_0000;
+
+/// Kick QoS class, distinct from the policy's queue class. J714 value.
+pub(crate) const KICK_QOS_CLASS: u8 = 8;
+/// Completion class of a kick's implicit parent dependency. J714 value.
+pub(crate) const PARENT_DEPENDENCY: u8 = 2;
+/// Compute kick event mask. J714 value.
+pub(crate) const KICK_EVENT_MASK: [u64; 4] = [0, 0, 8, 0];
+/// Predecessor and current object identifiers of every kick. J714 value.
+pub(crate) const OBJECT_IDS: u64 = 0x0000_0001_0000_0001;
+/// Descriptor completion identity. J714 value.
+pub(crate) const COMPLETION_IDENTITY: u64 = 1;
+
+/// The descriptor parameters that follow the GPU rather than the command: one definition per
+/// board ([`super::initdata::M5Board::compute`]), which the arithmetic qualification and DRM
+/// submission both encode through [`crate::g17::queue::m5::Channel`].
+///
+/// J775D's are still the J714 tuple the qualification passes with (2321 exact dispatches); the
+/// operand layout and the dispatch control's more-than-four-clusters bits are topology terms
+/// still to be derived. S's normal-compute tuple (`0x1b80`, `0x1e000`,
+/// `0x3d800`, `0x14c08a60`, 1) is not used: it is unqualified on this GPU.
+pub(crate) struct Profile {
+    /// Start of the four eight-byte state words in the preemption buffer.
+    pub(crate) preempt_state_offset: u32,
+    /// Size of one operand-state region; the program exchanges two regions.
+    pub(crate) operand_region_bytes: u32,
+    pub(crate) operand_aux_offset: u32,
+    /// Register 0x1a458.
+    pub(crate) dispatch_control: u64,
+    /// Register 0x0a731's first write.
+    pub(crate) auxiliary_control: u64,
+    /// What a dispatch without per-thread or workgroup storage needs ([`Self::plan`]).
+    pub(crate) no_storage: Resources,
+}
+
+/// The resource words of a compute kick and the queue pool they assume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Resources {
+    /// Register 0x0d4a1.
+    pub(crate) control: u64,
+    /// Pool target and resource policy of register 0x0a599's first write.
+    pub(crate) policy: u64,
+    /// Backed 4 MiB blocks of the queue's private pool.
+    pub(crate) pool_blocks: usize,
+}
+
+/// Workgroup size bound of the storage-free profile: two 32-thread warps. S's demand formulas
+/// (`render_demand.rs` `include_compute`) give the same resource control for every thread count
+/// without storage, and a pressure that differs only by warp rounding; 64 is the qualified one.
+const NO_STORAGE_THREADS: u32 = 64;
+
+/// A compute command's storage declarations (`DRM_ASAHI_SET_COMPUTE_RESOURCES`), merged over its
+/// dispatch profiles. Each record is checked on its own before it is merged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Declared {
+    pub(crate) programs: u32,
+    /// Some profile declares per-thread or workgroup storage.
+    pub(crate) storage: bool,
+    /// The largest workgroup.
+    pub(crate) threads: u32,
+}
+
+impl Declared {
+    /// Merges one record: zero flags and a nonzero workgroup, as the UAPI requires.
+    pub(crate) fn include(&mut self, program: &uapi::drm_asahi_compute_program) -> Result {
+        if program.flags != 0 || program.threads == 0 {
+            return Err(EINVAL);
+        }
+        self.programs = self.programs.checked_add(1).ok_or(EINVAL)?;
+        self.storage |= program.primary_bytes != 0
+            || program.secondary_bytes != 0
+            || program.linked_bytes != 0
+            || program.minimum_primary_bytes != 0
+            || program.threadgroup_bytes != 0;
+        self.threads = self.threads.max(program.threads);
+        Ok(())
+    }
+}
+
+impl Profile {
+    /// The resources of a command with `declared` storage. Only the storage-free subset is
+    /// planned: the stack frame, pool and pressure of declared storage are not derived for this
+    /// GPU, so such a command is refused rather than run with the subset's values. A command
+    /// with no declaration at all is refused too: no declaration is not a declaration of none.
+    pub(crate) fn plan(&self, declared: Declared) -> Result<Resources> {
+        if declared.programs == 0 {
+            return Err(EINVAL);
+        }
+        if declared.storage || declared.threads > NO_STORAGE_THREADS {
+            kernel::pr_warn_once!("G17 M5: compute storage outside the planned subset refused\n");
+            return Err(EOPNOTSUPP);
+        }
+        Ok(self.no_storage)
+    }
+}
 
 /// Addresses and policy owned by a queued compute command.
 pub(crate) struct RegisterArgs {

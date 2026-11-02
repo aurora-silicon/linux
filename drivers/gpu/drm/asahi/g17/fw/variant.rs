@@ -46,10 +46,23 @@ pub(crate) enum Submission {
     /// names. DRM compute and render submission use it.
     Doorbell,
     /// The work ring and its doorbell, then the M5 host command port (SGX `0x4090`/`0x4098`)
-    /// that makes the queue runnable (`Port::publish_m5_compute`). Only the arithmetic
-    /// qualification submits this way: DRM queue creation and submission are refused
-    /// (`EOPNOTSUPP`), and the profile advertises no submission features.
+    /// that makes the queue runnable (`Port::publish_m5_compute`). DRM compute submission and the
+    /// arithmetic qualification run through one channel type ([`crate::g17::queue::m5`]); render
+    /// has no M5 encoding and is refused ([`Self::accepts`]).
     M5HostCommand,
+}
+
+impl Submission {
+    /// Whether DRM submission reaches `engine` on this path: the one gate QUEUE_CREATE, SUBMIT
+    /// and command validation ask. `EOPNOTSUPP` for an engine the path has no encoding for.
+    pub(crate) fn accepts(self, engine: crate::g17::job::Engine) -> kernel::error::Result {
+        use crate::g17::job::Engine;
+        use kernel::error::code::EOPNOTSUPP;
+        match (self, engine) {
+            (Self::Doorbell, _) | (Self::M5HostCommand, Engine::Compute) => Ok(()),
+            (Self::M5HostCommand, Engine::Render) => Err(EOPNOTSUPP),
+        }
+    }
 }
 
 /// The layouts and rules of one G17 firmware build.
@@ -171,8 +184,8 @@ pub(crate) const V25G83: Variant = Variant {
 };
 
 /// The M5 firmware (26A428, macOS 27.0), native. Every field is this build's own: the A18 Pro
-/// build shares its firmware version but not its submission rules. The bootstrap graph and the
-/// arithmetic qualification run on it, and the DRM device registers; DRM submission is refused.
+/// build shares its firmware version but not its submission rules. The bootstrap graph, the
+/// arithmetic qualification and DRM compute submission run on it; DRM render is refused.
 pub(crate) const V26A428_M5: Variant = Variant {
     graph: InitGraph::M5,
     init_ack: InitAck::Message,

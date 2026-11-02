@@ -100,10 +100,16 @@ impl Backend {
         };
         // Retain a published scheduler before a never-kicked physical graph is
         // removed. The teardown entry owns its root until control consumption.
-        firmware
-            .queues
-            .teardown
-            .close(&self.context, super::now_ns())?;
+        if self.shared.m5.is_some() {
+            // No M5 scheduler release is established: the channel and its context stay with
+            // the firmware session (`queue::m5`).
+            firmware.queues.close_m5(self.owner);
+        } else {
+            firmware
+                .queues
+                .teardown
+                .close(&self.context, super::now_ns())?;
+        }
         firmware.queues.release_compute(self.owner)?;
         firmware.queues.release_render(self.owner)?;
         firmware.queues.admission.release_owner(self.owner);
@@ -174,6 +180,11 @@ impl job::Backend for Backend {
     }
 
     fn ensure_compute(&self, scs_pages: u16) -> Result {
+        if self.shared.m5.is_some() {
+            // M5 kicks carry no scratch (`command::m5_compute`); their resources are planned
+            // per command (`Profile::plan`), not from G17P's pool table.
+            return if scs_pages == 0 { Ok(()) } else { Err(EINVAL) };
+        }
         // A reverse timeline chain must be submitted before the host signal.
         // Validate here, but do not consume physical capacity behind unsignalled
         // DRM dependencies. compute_packet admits it when the job can run.

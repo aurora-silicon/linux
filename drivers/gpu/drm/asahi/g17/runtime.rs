@@ -14,6 +14,7 @@ mod compute_replay;
 mod compute_exit;
 mod events;
 mod feed;
+mod m5;
 mod render;
 pub(super) mod teardown;
 
@@ -181,6 +182,9 @@ pub(super) struct Registry {
     completion_seen: KVVec<u64>,
     worker_deferred: Option<DeferredBatch>,
     teardown: super::teardown::Pending,
+    /// The M5 profile's compute channels, one per logical queue ever created, each retained
+    /// from its installation to the end of the firmware session ([`queue::m5`]).
+    m5: KVec<KBox<queue::m5::Channel>>,
 }
 
 impl Registry {
@@ -238,6 +242,7 @@ impl Registry {
             },
             worker_deferred: Some(DeferredBatch::worker()?),
             teardown: super::teardown::Pending::new()?,
+            m5: KVec::new(),
         })
     }
 
@@ -516,7 +521,8 @@ impl Registry {
         }
     }
 
-    /// A fresh host identity for a physical channel outside the compute registry, whose QID it
+    /// A fresh host identity for a physical channel outside the compute registry: the retained
+    /// M5 diagnostic queue (`g17/m5_test.rs`) and each M5 channel (`queue::m5`), whose QID it
     /// then owns.
     pub(super) fn reserve_identity(&mut self) -> Result<u64> {
         Ok(self.identities.reserve(1)?.start)
@@ -713,8 +719,11 @@ impl Backend {
             }
             let slot = firmware.queues.admission.reserve_queue()?;
             // Installed compute channels narrow render's QIDs: every open
-            // logical queue keeps a dedicated render pair within reach.
-            if !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize) {
+            // logical queue keeps a dedicated render pair within reach. M5
+            // queues have no render.
+            if shared.m5.is_none()
+                && !firmware.queues.qids.render_fits(firmware.queues.admission.queues() as usize)
+            {
                 return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
             }
             match firmware.uat.new_execution_context(vm) {
@@ -773,9 +782,17 @@ impl Backend {
             )?,
             GFP_KERNEL,
         )?;
-        let state = shared.state.lock();
+        let mut state = shared.state.lock();
         if !lease.is_current() || state.is_none() {
             return Err(EAGAIN);
+        }
+        if let Some(profile) = shared.m5 {
+            // The queue's channel is installed before the queue exists. A retry would
+            // build a second one: nothing here is retried.
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            firmware
+                .create_m5_channel(&alloc, context.clone(), owner, profile)
+                .map_err(|error| if error == EAGAIN { EBUSY } else { error })?;
         }
         drop(state);
         let admission = slot.pool().clone();
@@ -1642,7 +1659,7 @@ impl Registry {
                 queue.quarantine(error, &mut |event| deferred.push(event))?;
             }
         }
-        Ok(())
+        self.fail_m5_vm(status, error, deferred)
     }
 }
 
@@ -1666,6 +1683,7 @@ impl super::Firmware {
         {
             requested |= queue.request_observations(&mut registry.observations)?;
         }
+        requested |= registry.request_m5()?;
         // Completion records are appended in order: fold only the records written since
         // the previous scan. A request whose stamp already covers it has its record in the
         // ring; if the scan ended before finding one, read the whole ring once.
@@ -1703,6 +1721,7 @@ impl super::Firmware {
             )?;
             freed |= busy && queue.channel_free();
         }
+        registry.retire_m5(port, generation, state, deferred)?;
         // All compute observations in this batch are latched before a VM
         // failure can settle its render peers. Exact successes win first.
         for index in 0..self.queues.compute.len() {
@@ -1844,6 +1863,10 @@ impl Backend {
         {
             return None;
         }
+        if self.shared.m5.is_some() {
+            // M5 publication waits for its channel's room itself (`m5_packet`).
+            return None;
+        }
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return None; };
         let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages()).ok()?;
         loop {
@@ -1964,9 +1987,13 @@ impl Backend {
                 return true;
             }
         };
-        let result = match self.compute_direct_packet(packet, &mut deferred) {
-            Some(result) => result,
-            None => self.compute_inline(packet, &mut deferred),
+        let result = if self.shared.m5.is_some() {
+            self.m5_packet(packet, false)
+        } else {
+            match self.compute_direct_packet(packet, &mut deferred) {
+                Some(result) => result,
+                None => self.compute_inline(packet, &mut deferred),
+            }
         };
         if matches!(result, Err(error) if error == render::FALLBACK) && !packet.is_published() {
             deferred.finish();
@@ -2078,6 +2105,9 @@ impl Backend {
         packet: &Arc<super::job::Packet>,
         deferred: &mut DeferredBatch,
     ) -> Result {
+        if self.shared.m5.is_some() {
+            return self.m5_packet(packet, true);
+        }
         packet.check_dependencies()?;
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
         let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages())?;

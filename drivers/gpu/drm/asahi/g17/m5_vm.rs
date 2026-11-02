@@ -33,7 +33,7 @@ pub(crate) const DRIVER_BASE: u64 = 0x10_0000_0000;
 /// client VM, never a user bind.
 pub(crate) const DRIVER_RESERVATION: Range<u64> = DRIVER_BASE..DRIVER_BASE + 0x8_0000_0000;
 /// Compact driver resources: their 32-bit offsets from [`DRIVER_BASE`] reach only the first 4 GiB
-/// (`AGX_M5_COMPACT_SIZE`). See [`compact_range`].
+/// (`AGX_M5_COMPACT_SIZE`).
 const COMPACT: Range<u64> = DRIVER_BASE..DRIVER_BASE + 0x1_0000_0000;
 /// Mesa's main data heap (`AGX_M5_DATA_START`) and its read-only shadow 0x20_0000_0000 above it,
 /// up to `AGX_M5_DATA_END`. Mesa binds the shadow of every memory allocation.
@@ -164,13 +164,6 @@ pub(crate) fn driver_reservation(requested: Range<u64>) -> Result<Range<u64>> {
         return Err(EINVAL);
     }
     Ok(requested)
-}
-
-/// Where compact driver resources may be placed in a VM with this driver reservation: its
-/// intersection with the compact envelope, so a smaller reservation never admits a compact
-/// allocation past its end.
-pub(crate) fn compact_range(reservation: &Range<u64>) -> Range<u64> {
-    COMPACT.start.max(reservation.start)..COMPACT.end.min(reservation.end)
 }
 
 /// Creates an M5 client VM: the one constructor of `Gpu::new_vm` and the arithmetic qualification

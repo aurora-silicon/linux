@@ -83,6 +83,7 @@ impl event::Queues for Service<'_> {
                 }
             }
         }
+        self.firmware.queues.m5_fault(qid);
     }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
@@ -434,7 +435,8 @@ impl crate::g17::Shared {
             .iter()
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
-            .any(|queue| queue.in_flight());
+            .any(|queue| queue.in_flight())
+            || firmware.queues.m5_in_flight();
         let in_flight = compute || firmware.queues.render_in_flight();
         let idle = firmware.idle_check(now, in_flight)?;
         // Expiries, drained pairs, exits, pool and heap trimming and teardown give back what
@@ -485,6 +487,7 @@ impl crate::g17::Shared {
             || firmware.queues.render.replay_polling()
             || firmware.queues.teardown.polling(now)
             || firmware.compute_exit_polling(now)
+            || firmware.queues.m5_in_flight()
             || firmware
                 .queues
                 .compute

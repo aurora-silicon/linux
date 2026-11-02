@@ -4,6 +4,7 @@
 //! independent engines behind user fences and explicit logical prefixes.
 
 pub(crate) mod compute;
+pub(crate) mod m5;
 pub(crate) mod render;
 
 use super::{
@@ -57,6 +58,8 @@ pub(crate) struct Frontend {
     range: Range<u64>,
     window: UscWindow,
     variant: &'static crate::g17::fw::Variant,
+    /// The board's M5 compute profile, on the M5 submission path.
+    m5: Option<&'static crate::g17::fw::m5::compute::Profile>,
 }
 
 impl Frontend {
@@ -65,8 +68,13 @@ impl Frontend {
         usc_base: u64,
         range: Range<u64>,
         variant: &'static crate::g17::fw::Variant,
+        m5: Option<&'static crate::g17::fw::m5::compute::Profile>,
     ) -> Result<Self> {
         if priority > 3 {
+            return Err(EINVAL);
+        }
+        // M5 programs run from Mesa's USC window: nothing the kernel encodes relocates them.
+        if m5.is_some() && usc_base != crate::g17::m5_vm::USC.start {
             return Err(EINVAL);
         }
         let window = UscWindow::new(usc_base, range.clone())?;
@@ -78,6 +86,7 @@ impl Frontend {
             range,
             window,
             variant,
+            m5,
         })
     }
 }
@@ -93,6 +102,7 @@ pub(crate) struct Queue<B: Backend> {
     range: Range<u64>,
     window: UscWindow,
     variant: &'static crate::g17::fw::Variant,
+    m5: Option<&'static crate::g17::fw::m5::compute::Profile>,
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
@@ -121,8 +131,12 @@ impl<B: Backend> Queue<B> {
             range,
             window,
             variant,
+            m5,
         } = frontend;
-        let render = Some(Scheduler::new(dev, backend.clone(), Engine::Render)?);
+        let render = match variant.submission.accepts(Engine::Render) {
+            Ok(()) => Some(Scheduler::new(dev, backend.clone(), Engine::Render)?),
+            Err(_) => None,
+        };
         Ok(Self {
             dev: dev.into(),
             context,
@@ -134,6 +148,7 @@ impl<B: Backend> Queue<B> {
             range,
             window,
             variant,
+            m5,
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
@@ -376,7 +391,7 @@ impl<B: Backend> Queue<B> {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result<ValidatedBatch> {
         let parse_guard = self.context.vm().retain_first_job()?;
-        let mut parser = Parser::new(bytes);
+        let mut parser = Parser::new(bytes, self.variant);
         // All historical ordinals use the same entry counters; publication
         // starts only after the entire ioctl has been validated and pinned.
         let base = self.sequence;
@@ -388,6 +403,7 @@ impl<B: Backend> Queue<B> {
                 self.range.clone(),
                 &self.window,
                 self.variant,
+                self.m5,
                 &command.payload,
             )?;
             let engine = match &payload {
@@ -427,6 +443,10 @@ impl<B: Backend> Queue<B> {
 
 impl<B: Backend> crate::queue::Queue for Queue<B> {
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
+        if self.render.is_none() {
+            // No render scheduler (M5): nothing to size, and no layout to accept.
+            return if layouts == [0; 2] { Ok(()) } else { Err(EINVAL) };
+        }
         let pages = [super::fw::compute::ScratchRequest::new(layouts[0])?.pages(),
                      super::fw::compute::ScratchRequest::new(layouts[1])?.pages()];
         let blocks = self.backend.render_scs_blocks(pages)?;

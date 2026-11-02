@@ -874,6 +874,9 @@ struct Shared {
     clusters: u32,
     active_cores: u32,
     variant: &'static fw::Variant,
+    /// The M5 descriptor profile ([`Config::m5`]): DRM compute runs on M5 channels
+    /// ([`queue::m5`]) where it is present.
+    m5: Option<&'static fw::m5::compute::Profile>,
     /// Layout of compute queues' operand-state buffers for this GPU's cores.
     operand_state: &'static fw::compute::OperandState,
     /// Layout of renders' deflake buffers for this GPU's cores.
@@ -1250,6 +1253,7 @@ impl Gpu {
                 clusters: id.num_clusters,
                 active_cores,
                 variant,
+                m5: cfg.m5.map(|board| &board.compute),
                 operand_state: &cfg.core_layout.operand_state,
                 deflake: cfg.core_layout.deflake,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
@@ -1511,7 +1515,7 @@ impl Gpu {
                 core::mem::forget(firmware);
                 return Err(e);
             }
-            dev_info!(dev.as_ref(), "M5 bootstrap done; DRM submission is not supported yet\n");
+            dev_info!(dev.as_ref(), "M5 bootstrap done; DRM submission: compute\n");
             return Ok(firmware);
         }
         session.init.build(
@@ -1798,8 +1802,13 @@ impl gpu::Gpu for Gpu {
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         let variant = self.shared.variant;
-        // Features belong to the submission path that implements them: the M5 profile has no
-        // DRM submission yet (`submission`), so it advertises none of them.
+        // Features belong to the submission path that implements them. The M5 profile submits
+        // compute alone, declared with SET_COMPUTE_RESOURCES ([`queue::m5`]); it advertises
+        // none of the doorbell path's barrier, sync or render features.
+        if self.shared.m5.is_some() {
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES);
+        }
         if variant.submission == fw::variant::Submission::Doorbell {
             params.features |=
                 u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
@@ -1857,6 +1866,16 @@ impl gpu::Gpu for Gpu {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         // No queue exists to have limits, nor INDEPENDENT_QUEUES to advertise.
         self.submission().ok()?;
+        if self.shared.m5.is_some() {
+            // Each queue holds its channel's QID and its execution context for the rest of the
+            // firmware session, and DEPTH kicks in flight.
+            let floor = self.shared.variant.qid_floor;
+            return Some(uapi::drm_asahi_queue_limits {
+                max_queues: kick::m5_channel_limit(floor).min(mmu::MAX_EXECUTION_CONTEXTS),
+                max_in_flight_per_queue: queue::m5::DEPTH as u32,
+                ..Default::default()
+            });
+        }
         Some(uapi::drm_asahi_queue_limits {
             max_queues: kick::queue_limit(self.shared.variant.qid_floor),
             max_in_flight_per_queue: hw::t8140::queues::RENDER_PAIRS_PER_OWNER as u32,
@@ -1864,13 +1883,16 @@ impl gpu::Gpu for Gpu {
         })
     }
 
-    /// The M5 host-command path is not connected to DRM queues, fences or completion: its
-    /// command layouts are placeholders (`Config::core_layout`, `Variant::programs`), and its
-    /// retirement witnesses report work done even when workgroups were lost.
+    /// The M5 host-command path reaches DRM queues for compute alone, on M5 channels with the
+    /// board's descriptor profile ([`queue::m5`]); its render command layouts are placeholders
+    /// (`Config::core_layout`, `Variant::programs`), so each command is refused per engine
+    /// ([`fw::variant::Submission::accepts`]). Its retirement witnesses report work done even
+    /// when workgroups were lost.
     fn submission(&self) -> Result {
-        match self.shared.variant.submission {
-            fw::variant::Submission::Doorbell => Ok(()),
-            fw::variant::Submission::M5HostCommand => Err(EOPNOTSUPP),
+        match (self.shared.variant.submission, self.shared.m5) {
+            (fw::variant::Submission::Doorbell, _) => Ok(()),
+            (fw::variant::Submission::M5HostCommand, Some(_)) => Ok(()),
+            (fw::variant::Submission::M5HostCommand, None) => Err(EOPNOTSUPP),
         }
     }
 
@@ -1925,8 +1947,20 @@ impl gpu::Gpu for Gpu {
             usc_exec_base,
             self.geometry.user_usable_range(),
             self.shared.variant,
-        )?;
-        let policy = scheduling_policy(priority)?;
+            self.shared.m5,
+        )
+        .inspect_err(|error| {
+            if self.shared.m5.is_some() {
+                dev_warn!(self.shared.dev.as_ref(), "M5 queue {}: frontend refused: {:?}\n", owner, error);
+            }
+        })?;
+        let policy = match self.shared.m5 {
+            // M5 accepts four (priority, policy) pairs (`QueueRecord::scheduling_words`), and
+            // T's HIGH and LOW profiles are none of them.
+            Some(_) if priority == 2 => fw::m5::queue::POLICY,
+            Some(_) => return Err(EOPNOTSUPP),
+            None => scheduling_policy(priority)?,
+        };
         let admission_started = now_ns();
         let (backend, slot) = loop {
             let observed = self.shared.queues.observe();

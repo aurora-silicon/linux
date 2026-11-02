@@ -63,6 +63,9 @@ impl Backend {
                 return Ok(None);
             };
             firmware.scan_compute(None, &mut deferred)?;
+            if firmware.queues.timeout_m5(self.owner, packet, &mut deferred)? {
+                return Ok(Some(self.context.status().clone()));
+            }
             let Some(mut queue) = firmware.queues.compute_mut(self.owner) else {
                 return Ok(None);
             };
