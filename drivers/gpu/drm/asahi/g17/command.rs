@@ -467,17 +467,27 @@ impl Payload {
                     (8, true) => 3,
                     _ => return Err(bad("sample count")),
                 };
+                // A tile's storage: on M5 the M5 subset's bound, which the render plan sizes its
+                // pool for ([`m5::compute::MAX_IMAGEBLOCK_BYTES`]; Honeykrisp lays M5 tiles out to
+                // it); elsewhere the G17 tile buffer.
+                let max_tile_buffer = match m5 {
+                    Some(_) => u64::from(m5::compute::MAX_IMAGEBLOCK_BYTES),
+                    None => MAX_TILE_BUFFER,
+                };
                 if u64::from(cmd.sample_size_B)
                     * u64::from(cmd.utile_width_px)
                     * u64::from(cmd.utile_height_px)
                     * u64::from(cmd.samples)
-                    > MAX_TILE_BUFFER
-                    || cmd.vdm_ctrl_stream_base == 0
+                    > max_tile_buffer
+                {
+                    return Err(bad("tile storage"));
+                }
+                if cmd.vdm_ctrl_stream_base == 0
                     || cmd.vdm_ctrl_stream_base & 3 != 0
                     || cmd.isp_scissor_base == 0
                     || cmd.isp_scissor_base & 7 != 0
                 {
-                    return Err(bad("tile buffer, VDM stream or scissor"));
+                    return Err(bad("VDM stream or scissor"));
                 }
                 require_range(space, cmd.vdm_ctrl_stream_base, 4, Access::Read).map_err(|_| bad("VDM stream mapping"))?;
                 require_range(space, cmd.isp_scissor_base, 8, Access::Read).map_err(|_| bad("scissor mapping"))?;

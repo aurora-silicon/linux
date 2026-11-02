@@ -830,7 +830,7 @@ impl crate::g17::Firmware {
         };
         // The channel's compute entry first: once bound it must have a place.
         let entry = self.queues.m5_entry()?;
-        let channel = Channel::adopt(alloc, &mut self.queues.m5_parked, index, context, owner)
+        let channel = Channel::adopt(&mut self.queues.m5_parked, index, context, owner)
             .map_err(|error| refused("adoption", error))?;
         if crate::module_parameters::m5_lane_trace.value() != 0 {
             pr_info!(

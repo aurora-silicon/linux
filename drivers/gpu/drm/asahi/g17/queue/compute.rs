@@ -118,12 +118,36 @@ pub(crate) struct Binding {
     context: Arc<Context>,
 }
 
+/// The storage of a queue object: pool-retained until processor stop (Neo's graph and
+/// descriptors), or an ordinary kernel object (the M5 Ultra's, whose lane the session retains).
+pub(in crate::g17::queue) enum Storage {
+    Pooled(PooledObject),
+    Kernel(KernelObject),
+}
+impl core::ops::Deref for Storage {
+    type Target = KernelObject;
+    fn deref(&self) -> &KernelObject {
+        match self {
+            Self::Pooled(object) => object,
+            Self::Kernel(object) => object,
+        }
+    }
+}
+impl core::ops::DerefMut for Storage {
+    fn deref_mut(&mut self) -> &mut KernelObject {
+        match self {
+            Self::Pooled(object) => object,
+            Self::Kernel(object) => object,
+        }
+    }
+}
+
 /// Descriptor ring of one compute QID with its kernel-VM alias. Built without
 /// the device mutex; installed into a vacant graph before an owner binds.
 pub(crate) struct DescriptorRing {
     // Drop the GPU alias before the retained storage returns to its pool.
-    low: mmu::KernelMapping,
-    object: PooledObject,
+    pub(in crate::g17::queue) low: mmu::KernelMapping,
+    pub(in crate::g17::queue) object: Storage,
 }
 
 impl DescriptorRing {
@@ -146,34 +170,41 @@ impl DescriptorRing {
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RW,
         )?;
-        Ok(Self { low, object })
+        Ok(Self { low, object: Storage::Pooled(object) })
     }
 }
 
 /// Firmware-shared storage of one compute QID, separate from its common kick ring.
 /// `ring` is `None` while the queue is vacant (idle, no owner, pool given back).
-struct Graph {
-    ring: Option<DescriptorRing>,
-    preempt: KernelObject,
-    usage: KernelObject,
-    operand: KernelObject,
-    support: KernelObject,
-    graph: PooledObject,
-    context_low: KernelObject,
-    context_high: KernelObject,
+///
+/// `m5` marks the M5 Ultra's graph (S's `Graph::m5`), built by `Graph::new_m5` in `queue::m5`: its
+/// queue record, cursors and item ring are the M5 lane's (`initialize_m5_graph`, the cursors
+/// inside the graph), its descriptors the M5 ones, and it has none of Neo's context and record
+/// objects, which are `None` there. Every M5 difference is an arm on `m5`; Neo's graph, built by
+/// [`Graph::new`], has `m5` false and every object.
+pub(in crate::g17::queue) struct Graph {
+    pub(in crate::g17::queue) m5: bool,
+    pub(in crate::g17::queue) ring: Option<DescriptorRing>,
+    pub(in crate::g17::queue) preempt: KernelObject,
+    pub(in crate::g17::queue) usage: KernelObject,
+    pub(in crate::g17::queue) operand: KernelObject,
+    pub(in crate::g17::queue) support: KernelObject,
+    pub(in crate::g17::queue) graph: Storage,
+    context_low: Option<KernelObject>,
+    context_high: Option<KernelObject>,
     /// Announcements, which stay uncached for the firmware.
-    records: KernelObject,
+    records: Option<KernelObject>,
     /// Configuration, predecessor and completion-wait records at the same
     /// offsets, which the firmware reads through a cached mapping.
-    cached_records: PooledObject,
+    cached_records: Option<PooledObject>,
     record_ends: [Option<u32>; RECORD_SLOTS],
     reclaimed: u32,
     /// Host words of the pointer block in this firmware build.
-    pointers: PointerLayout,
+    pub(in crate::g17::queue) pointers: PointerLayout,
     /// Layout of the operand-state buffer for the GPU's cores.
-    operand_state: &'static OperandState,
+    operand_state: Option<&'static OperandState>,
     /// Where the client-private aliases of each owner's VM go ([`Domain::Private`]).
-    private: core::ops::Range<u64>,
+    pub(in crate::g17::queue) private: core::ops::Range<u64>,
 }
 
 impl Graph {
@@ -235,22 +266,51 @@ impl Graph {
             cpu,
         )?;
         Ok(Self {
+            m5: false,
             ring: Some(ring),
             preempt,
             usage,
             operand,
             support,
-            graph,
-            context_low,
-            context_high,
-            records,
-            cached_records,
+            graph: Storage::Pooled(graph),
+            context_low: Some(context_low),
+            context_high: Some(context_high),
+            records: Some(records),
+            cached_records: Some(cached_records),
             record_ends: [None; RECORD_SLOTS],
             reclaimed: 0,
             pointers,
-            operand_state,
+            operand_state: Some(operand_state),
             private: alloc.domain(Domain::Private),
         })
+    }
+
+    /// The M5 Ultra's graph of `objects` (built by `Graph::new_m5` in `queue::m5`), which has none
+    /// of Neo's context and record objects.
+    pub(in crate::g17::queue) fn with_m5_objects(
+        ring: DescriptorRing,
+        [preempt, usage, operand, support, graph]: [KernelObject; 5],
+        pointers: PointerLayout,
+        private: core::ops::Range<u64>,
+    ) -> Self {
+        Self {
+            m5: true,
+            ring: Some(ring),
+            preempt,
+            usage,
+            operand,
+            support,
+            graph: Storage::Kernel(graph),
+            context_low: None,
+            context_high: None,
+            records: None,
+            cached_records: None,
+            record_ends: [None; RECORD_SLOTS],
+            reclaimed: 0,
+            pointers,
+            operand_state: None,
+            private,
+        }
     }
 
     /// All fallible mapping work finishes before replacing a physical queue's logical owner.
@@ -272,7 +332,7 @@ impl Graph {
         let preempt = self.preempt.alias_in(vm, private.clone(), page, prot)?;
         let usage = self.usage.alias_in(vm, private.clone(), page, prot)?;
         let operand = self.operand.alias_in(vm, private.clone(), page, prot)?;
-        let queue_context = self.context_low.alias_in(vm, private.clone(), page, prot)?;
+        let queue_context = self.context_low.as_ref().ok_or(EINVAL)?.alias_in(vm, private.clone(), page, prot)?;
         Ok(Binding {
             _kick_alias: kick_alias,
             pool_alias: Some(pool_alias),
@@ -286,7 +346,10 @@ impl Graph {
     }
 
     /// Caller has excluded publication and proved the retained graph idle.
-    fn set_owner(&mut self, context: &Context) -> Result {
+    pub(in crate::g17::queue) fn set_owner(&mut self, context: &Context) -> Result {
+        if self.m5 {
+            return super::m5::ring::set_owner(&self.graph, context);
+        }
         let pointer = self
             .graph
             .pointer(0, core::mem::size_of::<QueueRecord>())?
@@ -304,16 +367,25 @@ impl Graph {
         Ok(())
     }
 
-    fn cursors(&self) -> Result<Cursors> {
+    pub(in crate::g17::queue) fn cursors(&self) -> Result<Cursors> {
+        if self.m5 {
+            return super::m5::ring::cursors(&self.graph, self.pointers.producer);
+        }
         Ok(Cursors {
             producer: self.graph.word(CURSORS + self.pointers.producer)?.load(Ordering::Relaxed),
             consumer: self.graph.word(CURSORS)?.load(Ordering::Relaxed),
             count: self.graph.word(CURSORS + 0x60)?.load(Ordering::Relaxed),
         })
     }
-    fn stamp(&self) -> Result<u32> {
+    pub(in crate::g17::queue) fn stamp(&self) -> Result<u32> {
         fence(Ordering::Acquire);
-        Ok(self.support.word(STAMP)?.load(Ordering::Relaxed))
+        let stamp = if self.m5 { super::m5::STAMPS } else { STAMP };
+        Ok(self.support.word(stamp)?.load(Ordering::Relaxed))
+    }
+    /// The pointer-block word of the item-ring producer: on the separate cursor page, or, on the
+    /// M5 Ultra, inside the graph.
+    fn producer_word(&self) -> usize {
+        if self.m5 { POINTERS + self.pointers.producer } else { CURSORS + self.pointers.producer }
     }
     /// EAGAIN while the queue is vacant: the owner must re-arm it first.
     fn descriptor_vas(&self, slot: u8) -> Result<(u64, u64)> {
@@ -352,7 +424,7 @@ impl Graph {
     /// A killed queue's ring restarts empty at the firmware's consumer cursor: every
     /// item slot is cleared and the host producer is set to the consumer. Only
     /// valid after the firmware acknowledged the kill and no command is pending.
-    fn reset_items(&mut self) -> Result {
+    pub(in crate::g17::queue) fn reset_items(&mut self) -> Result {
         let cursors = self.cursors()?;
         if cursors.count != ITEM_RING_ENTRIES || cursors.consumer >= cursors.count {
             return Err(EIO);
@@ -362,7 +434,7 @@ impl Graph {
         }
         fence(Ordering::SeqCst);
         self.graph
-            .word(CURSORS + self.pointers.producer)?
+            .word(self.producer_word())?
             .store(cursors.consumer, Ordering::Relaxed);
         self.reclaimed = cursors.consumer;
         fence(Ordering::SeqCst);
@@ -2037,9 +2109,9 @@ impl Graph {
     ) -> Result<u64> {
         let (object, start) = if let Some(slot) = slot {
             let (object, stride): (&mut KernelObject, usize) = if offset == ANNOUNCE {
-                (&mut self.records, RECORD_STRIDE)
+                (self.records.as_mut().ok_or(EINVAL)?, RECORD_STRIDE)
             } else {
-                (&mut self.cached_records, CACHED_RECORD_STRIDE)
+                (self.cached_records.as_mut().ok_or(EINVAL)?, CACHED_RECORD_STRIDE)
             };
             (object, record_start(slot, offset, window, stride)?)
         } else {
@@ -2198,7 +2270,7 @@ impl Queue {
             kick: kick_timestamp,
             preempt_va: addresses.preempt,
             operand_state_va: addresses.operand,
-            operand: self.graph.operand_state,
+            operand: self.graph.operand_state.ok_or(EINVAL)?,
             usage_va: addresses.usage,
             usage_fw_va: self.graph.usage.gpu_va(),
             free_list_slot: u32::from(self.pool.id()),
@@ -2273,7 +2345,7 @@ impl Queue {
                     |descriptor| descriptor.write_zeroed(&args),
                 )?;
             if first {
-                self.graph.context_high.write(
+                self.graph.context_high.as_mut().ok_or(EINVAL)?.write(
                     0x200,
                     crate::g17::fw::compute::QueueContextItem::new(
                         descriptor_high,
@@ -2283,7 +2355,7 @@ impl Queue {
                 )?;
             } else {
                 // The retained context item remains at index one; only its descriptor changes.
-                self.graph.context_high.write(0x210, descriptor_high)?;
+                self.graph.context_high.as_mut().ok_or(EINVAL)?.write(0x210, descriptor_high)?;
                 let cursors = self.graph.cursors()?;
                 let _ = self.graph.recycle(cursors);
             }

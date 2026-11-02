@@ -28,7 +28,9 @@
 //! witnesses prove that the firmware retired the kick, not that every workgroup ran: dispatches
 //! that lost workgroups retired with all of them.
 
-use super::compute::{awaits_witness, exit, Failure, GRAPH_SIZE, ITEMS, POINTERS};
+use super::compute::{
+    awaits_witness, exit, DescriptorRing, Failure, Graph, Storage, GRAPH_SIZE, ITEMS, POINTERS,
+};
 use super::pool_state::{PoolPhase, PoolState};
 use crate::g17::{
     context::{Context, WorkStateLease},
@@ -89,7 +91,7 @@ const _: () = assert!(DESCRIPTOR_BYTES >= compute::DESCRIPTOR_PREFIX_BYTES);
 /// Firmware start and end timestamps in a descriptor.
 const DESCRIPTOR_TIMES: usize = 0xf2c;
 /// Support page: the completion stamps and status words, then the firmware usage record.
-const STAMPS: usize = 0;
+pub(super) const STAMPS: usize = 0;
 const STATUS: usize = 0x80;
 const USAGE: usize = 0x1000;
 const SUPPORT_BYTES: usize = 0x4000;
@@ -292,10 +294,162 @@ pub(crate) struct Retired {
     pub(crate) drained: bool,
 }
 
-/// One M5 hardware queue: its graph ([`super::compute::initialize_m5_graph`]: the queue record,
-/// cursors, job-list head and item ring, then the installation configuration, the first kick's
-/// update and the kick notifications) and its kick ring. A compute channel has one; a render
-/// pair ([`super::m5_render::Pair`]) a tiling and a fragment lane.
+/// The M5 lane's ring encodings over its graph object ([`super::compute::initialize_m5_graph`]:
+/// the queue record, the cursors at `POINTERS` and the item ring at `ITEMS`, then the
+/// installation configuration, the first kick's update and the kick notifications): one body
+/// for a compute queue's graph (the `m5` arm of `compute::Graph`) and a render pair's lanes
+/// ([`Lane`]). `producer` is the offset of the item-ring producer in the pointer block of this
+/// firmware build.
+pub(crate) mod ring {
+    use super::*;
+
+    pub(crate) fn word(graph: &KernelObject, offset: usize) -> Result<u32> {
+        Ok(graph.word(offset)?.load(Ordering::Acquire))
+    }
+
+    /// Rewrites the record's host-owned words for `context` ([`QueueRecord::set_owner`]). The
+    /// caller proved the lane idle with its previous owner's scheduler release consumed.
+    pub(crate) fn set_owner(graph: &KernelObject, context: &Context) -> Result {
+        let pointer = graph
+            .pointer(0, core::mem::size_of::<fw::m5::queue::QueueRecord>())?
+            .cast::<fw::m5::queue::QueueRecord>();
+        // SAFETY: The checked packed record (alignment 1, integer fields only) stays mapped
+        // with the graph; the device mutex and the idle proof exclude any other writer.
+        let result = unsafe {
+            (*pointer).set_owner(
+                context.work_head_va(),
+                context.scheduler_va(),
+                context.owner_pid(),
+                context.policy(),
+            )
+        };
+        fence(Ordering::SeqCst);
+        result
+    }
+
+    /// The inner item ring's cursors.
+    pub(crate) fn cursors(graph: &KernelObject, producer: usize) -> Result<Cursors> {
+        Ok(Cursors {
+            producer: word(graph, POINTERS + producer)?,
+            consumer: word(graph, POINTERS)?,
+            count: ITEM_RING_ENTRIES,
+        })
+    }
+
+    /// Stages the installation: `config` as the first item.
+    pub(crate) fn stage_install(graph: &mut KernelObject, config: QueueConfig) -> Result {
+        graph.write(CONFIG, config)?;
+        graph.write(ITEMS, graph.gpu_va() + CONFIG as u64)
+    }
+
+    /// Stages a reinstallation: `config` as item `producer`, the installation's record reused (its
+    /// item was consumed long ago). Returns the producer after it.
+    pub(crate) fn stage_reinstall(
+        graph: &mut KernelObject,
+        producer: u32,
+        config: QueueConfig,
+    ) -> Result<u32> {
+        graph.write(CONFIG, config)?;
+        graph.write(
+            ITEMS + producer as usize * 8,
+            graph.gpu_va() + CONFIG as u64,
+        )?;
+        Ok((producer + 1) % ITEM_RING_ENTRIES)
+    }
+
+    /// The firmware finished every item up to `target` and holds nothing else: `done`, its own
+    /// cursor (+0x30) and the producer all stand there, the host's idle condition
+    /// ([`PointerBlock`]).
+    pub(crate) fn idle_at(graph: &KernelObject, producer: usize, target: u32) -> Result<bool> {
+        Ok(word(graph, POINTERS)? == target
+            && word(graph, POINTERS + 0x30)? == target
+            && word(graph, POINTERS + producer)? == target)
+    }
+
+    /// Writes the records of a kick of QID `qid` from item `producer` on: `update`, the first
+    /// kick's configuration, and the notification of `timestamp` in notification slot `slot`.
+    /// Returns the producer after them. Nothing is visible until the producer moves.
+    pub(crate) fn stage_kick(
+        graph: &mut KernelObject,
+        qid: u8,
+        producer: u32,
+        update: Option<QueueConfig>,
+        slot: usize,
+        timestamp: KickTimestamp,
+    ) -> Result<u32> {
+        let announce = ANNOUNCES + slot * ANNOUNCE_STRIDE;
+        if slot >= DEPTH {
+            return Err(EINVAL);
+        }
+        graph.write(announce, Notification::new(qid, timestamp)?)?;
+        let mut target = producer;
+        let mut records = [0u64; 2];
+        let mut count = 0;
+        if let Some(update) = update {
+            graph.write(UPDATE, update)?;
+            records[0] = graph.gpu_va() + UPDATE as u64;
+            count = 1;
+        }
+        records[count] = graph.gpu_va() + announce as u64;
+        count += 1;
+        for &record in &records[..count] {
+            graph.write(ITEMS + target as usize * 8, record)?;
+            target = (target + 1) % ITEM_RING_ENTRIES;
+        }
+        Ok(target)
+    }
+
+    /// Moves the inner producer (at pointer-block offset `offset`) to `producer`.
+    pub(crate) fn set_producer(graph: &KernelObject, offset: usize, producer: u32) -> Result {
+        fence(Ordering::SeqCst);
+        graph
+            .word(POINTERS + offset)?
+            .store(producer, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The outer work slot naming QID `qid`'s items up to `producer`: M5 routes every engine's
+    /// pointer list through the common compute channel.
+    pub(crate) fn work_slot(
+        graph: &KernelObject,
+        qid: u8,
+        producer: u32,
+        first: bool,
+    ) -> Result<fw::channels::WorkSlot> {
+        fw::channels::WorkSlot::new(
+            DataMaster::Compute,
+            graph.gpu_va(),
+            qid,
+            producer.try_into()?,
+            first,
+        )
+    }
+
+    /// Exposes QID `qid`'s inner items up to `producer` through the claimed outer slot, then runs
+    /// `submission` (a kick's) through the host command port. Returns the outer producer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The ring, its QID, and the publication's own arguments."
+    )]
+    pub(crate) fn expose(
+        graph: &KernelObject,
+        offset: usize,
+        qid: u8,
+        port: &Port,
+        claim: crate::g17::port::OuterClaim<'_>,
+        producer: u32,
+        first: bool,
+        submission: Option<&HardwareSubmission>,
+    ) -> Result<u32> {
+        set_producer(graph, offset, producer)?;
+        port.publish_m5_compute(claim, &work_slot(graph, qid, producer, first)?, submission)
+    }
+}
+
+/// One M5 hardware queue of a render pair ([`super::m5_render::Pair`]), its tiling or fragment
+/// lane: its graph, on the [`ring`] encodings, and its kick ring. A compute queue's graph is the
+/// `m5` arm of `compute::Graph` (`Graph::new_m5`) on the same encodings.
 pub(crate) struct Lane {
     pub(crate) id: kick::Id,
     pub(crate) graph: KernelObject,
@@ -315,13 +469,7 @@ impl Lane {
     ) -> Result<Self> {
         let mut kick = kick::Queue::lower(alloc, id)?;
         aliases.push(kick.map_client(context.vm())?, GFP_KERNEL)?;
-        let mut graph = alloc.kernel(
-            GRAPH_BYTES,
-            PAGE as u64,
-            mmu::PROT_GPU_FW_SHARED_RW,
-            CpuMap::WriteCombined,
-        )?;
-        super::compute::initialize_m5_graph(&mut graph, context, pointers)?;
+        let graph = new_graph(alloc, context, pointers)?;
         Ok(Self {
             id,
             graph,
@@ -334,85 +482,24 @@ impl Lane {
         self.id.qid()
     }
 
-    /// Rewrites the record's host-owned words for `context` ([`QueueRecord::set_owner`]). The
-    /// caller proved the lane idle with its previous owner's scheduler release consumed.
+    /// [`ring::set_owner`].
     pub(crate) fn set_owner(&mut self, context: &Context) -> Result {
-        let pointer = self
-            .graph
-            .pointer(0, core::mem::size_of::<fw::m5::queue::QueueRecord>())?
-            .cast::<fw::m5::queue::QueueRecord>();
-        // SAFETY: The checked packed record (alignment 1, integer fields only) stays mapped
-        // with the graph; the device mutex and the idle proof exclude any other writer.
-        let result = unsafe {
-            (*pointer).set_owner(
-                context.work_head_va(),
-                context.scheduler_va(),
-                context.owner_pid(),
-                context.policy(),
-            )
-        };
-        fence(Ordering::SeqCst);
-        result
-    }
-
-    fn word(&self, offset: usize) -> Result<u32> {
-        Ok(self.graph.word(offset)?.load(Ordering::Acquire))
+        ring::set_owner(&self.graph, context)
     }
 
     /// The inner item ring's cursors.
     pub(crate) fn cursors(&self) -> Result<Cursors> {
-        Ok(Cursors {
-            producer: self.word(POINTERS + self.producer)?,
-            consumer: self.word(POINTERS)?,
-            count: ITEM_RING_ENTRIES,
-        })
+        ring::cursors(&self.graph, self.producer)
     }
 
     /// Stages the installation: `config` as the first item.
     pub(crate) fn stage_install(&mut self, config: QueueConfig) -> Result {
-        self.graph.write(CONFIG, config)?;
-        self.graph.write(ITEMS, self.graph.gpu_va() + CONFIG as u64)
+        ring::stage_install(&mut self.graph, config)
     }
 
-    /// Stages a reinstallation: `config` as item `producer`, the installation's record reused (its
-    /// item was consumed long ago). Returns the producer after it.
-    fn stage_reinstall(&mut self, producer: u32, config: QueueConfig) -> Result<u32> {
-        self.graph.write(CONFIG, config)?;
-        self.graph.write(
-            ITEMS + producer as usize * 8,
-            self.graph.gpu_va() + CONFIG as u64,
-        )?;
-        Ok((producer + 1) % ITEM_RING_ENTRIES)
-    }
-
-    /// The firmware finished every item up to `target` and holds nothing else: `done`, its own
-    /// cursor (+0x30) and the producer all stand there, the host's idle condition
-    /// ([`PointerBlock`]).
+    /// [`ring::idle_at`].
     pub(crate) fn idle_at(&self, target: u32) -> Result<bool> {
-        Ok(self.word(POINTERS)? == target
-            && self.word(POINTERS + 0x30)? == target
-            && self.word(POINTERS + self.producer)? == target)
-    }
-
-    /// A killed queue's item ring restarts empty at the firmware's consumer cursor, as Neo's
-    /// (`queue::compute` `Graph::reset_items`): every item slot is cleared and the producer set to
-    /// the consumer. Only once the ring is idle at its producer with nothing pending.
-    fn reset_items(&mut self) -> Result {
-        let cursors = self.cursors()?;
-        if cursors.count != ITEM_RING_ENTRIES || cursors.consumer >= cursors.count {
-            return Err(EIO);
-        }
-        for index in 0..ITEM_RING_ENTRIES as usize {
-            self.graph
-                .dword(ITEMS + index * 8)?
-                .store(0, Ordering::Relaxed);
-        }
-        fence(Ordering::SeqCst);
-        self.graph
-            .word(POINTERS + self.producer)?
-            .store(cursors.consumer, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        Ok(())
+        ring::idle_at(&self.graph, self.producer, target)
     }
 
     /// Waits until `installed` holds for every lane's installation item.
@@ -437,9 +524,7 @@ impl Lane {
         Err(ETIMEDOUT)
     }
 
-    /// Writes the records of a kick from item `producer` on: `update`, the first kick's
-    /// configuration, and the notification of `timestamp` in notification slot `slot`. Returns
-    /// the producer after them. Nothing is visible until the producer moves.
+    /// [`ring::stage_kick`] on this lane's QID.
     pub(crate) fn stage_kick(
         &mut self,
         producer: u32,
@@ -447,70 +532,200 @@ impl Lane {
         slot: usize,
         timestamp: KickTimestamp,
     ) -> Result<u32> {
-        let announce = ANNOUNCES + slot * ANNOUNCE_STRIDE;
-        if slot >= DEPTH {
-            return Err(EINVAL);
-        }
-        self.graph
-            .write(announce, Notification::new(self.qid(), timestamp)?)?;
-        let mut target = producer;
-        let mut records = [0u64; 2];
-        let mut count = 0;
-        if let Some(update) = update {
-            self.graph.write(UPDATE, update)?;
-            records[0] = self.graph.gpu_va() + UPDATE as u64;
-            count = 1;
-        }
-        records[count] = self.graph.gpu_va() + announce as u64;
-        count += 1;
-        for &record in &records[..count] {
-            self.graph.write(ITEMS + target as usize * 8, record)?;
-            target = (target + 1) % ITEM_RING_ENTRIES;
-        }
-        Ok(target)
+        let qid = self.qid();
+        ring::stage_kick(&mut self.graph, qid, producer, update, slot, timestamp)
     }
 
     /// Moves the inner producer to `producer`.
     pub(crate) fn set_producer(&self, producer: u32) -> Result {
-        fence(Ordering::SeqCst);
-        self.graph
-            .word(POINTERS + self.producer)?
-            .store(producer, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        Ok(())
+        ring::set_producer(&self.graph, self.producer, producer)
     }
 
-    /// The outer work slot naming this queue's items up to `producer`: M5 routes every engine's
-    /// pointer list through the common compute channel.
+    /// [`ring::work_slot`] on this lane's QID.
     pub(crate) fn work_slot(&self, producer: u32, first: bool) -> Result<fw::channels::WorkSlot> {
-        fw::channels::WorkSlot::new(
-            DataMaster::Compute,
-            self.graph.gpu_va(),
-            self.qid(),
-            producer.try_into()?,
-            first,
-        )
+        ring::work_slot(&self.graph, self.qid(), producer, first)
+    }
+}
+
+/// A lane's graph object for `context`, initialized ([`super::compute::initialize_m5_graph`]).
+fn new_graph(
+    alloc: &Allocator<'_>,
+    context: &Context,
+    pointers: &PointerLayout,
+) -> Result<KernelObject> {
+    let mut graph = alloc.kernel(
+        GRAPH_BYTES,
+        PAGE as u64,
+        mmu::PROT_GPU_FW_SHARED_RW,
+        CpuMap::WriteCombined,
+    )?;
+    super::compute::initialize_m5_graph(&mut graph, context, pointers)?;
+    Ok(graph)
+}
+
+/// The M5 Ultra arms of Neo's compute graph (S's `Graph::m5`): its objects are built here, on
+/// the M5 encodings, and the arms in `compute::Graph`'s methods (cursors, stamp, owner record,
+/// item-ring reset) read them; Neo's graph never reaches these.
+impl Graph {
+    /// Builds the M5 Ultra compute graph for `context` (the lane's graph, its descriptor slots
+    /// with their canonical low alias, support page, operand state, preemption buffer and usage
+    /// page) and, between the support page and the operand state as the lane always allocated
+    /// them, its pool (`pool`).
+    fn new_m5(
+        alloc: &Allocator<'_>,
+        context: &Context,
+        gpu: &Gpu,
+        pointers: &PointerLayout,
+        pool: impl FnOnce() -> Result<M5Pool>,
+    ) -> Result<(Self, M5Pool)> {
+        let prot = mmu::PROT_GPU_FW_SHARED_RW;
+        let cpu = CpuMap::WriteCombined;
+        let graph = new_graph(alloc, context, pointers)?;
+        let descriptors = alloc.kernel(DEPTH * DESCRIPTOR_BYTES, PAGE as u64, prot, cpu)?;
+        // The canonical low arena, as for every descriptor ring, and the same address in the VM.
+        let low = descriptors.alias_in(
+            alloc.uat.kernel_lower_vm(),
+            alloc.domain(Domain::Canonical),
+            PAGE as u64,
+            mmu::PROT_GPU_SHARED_RW,
+        )?;
+        let support = alloc.kernel(SUPPORT_BYTES, PAGE as u64, prot, cpu)?;
+        let pool = pool()?;
+        let operand = alloc.lower(
+            gpu.profile.operand.bytes,
+            PAGE as u64,
+            mmu::PROT_GPU_SHARED_RW,
+            cpu,
+        )?;
+        let preempt = alloc.kernel(compute::PREEMPT_BYTES, PAGE as u64, prot, cpu)?;
+        let usage = alloc.kernel(PAGE, PAGE as u64, prot, cpu)?;
+        let ring = DescriptorRing {
+            low,
+            object: Storage::Kernel(descriptors),
+        };
+        let graph = Self::with_m5_objects(
+            ring,
+            [preempt, usage, operand, support, graph],
+            *pointers,
+            alloc.domain(Domain::Private),
+        );
+        Ok((graph, pool))
     }
 
-    /// Exposes the inner items up to `producer` through the claimed outer slot, then runs
-    /// `submission` (a kick's) through the host command port. Returns the outer producer.
-    pub(crate) fn expose(
+    /// The descriptor slots, which an M5 graph always has.
+    fn descriptors(&self) -> Result<&KernelObject> {
+        self.ring.as_ref().map(|ring| &*ring.object).ok_or(EIO)
+    }
+    fn descriptors_mut(&mut self) -> Result<&mut KernelObject> {
+        self.ring.as_mut().map(|ring| &mut *ring.object).ok_or(EIO)
+    }
+    /// The descriptor of slot `slot`: its firmware (high) and canonical low addresses.
+    fn descriptor_slot_vas(&self, slot: usize) -> Result<(u64, u64)> {
+        let ring = self.ring.as_ref().ok_or(EIO)?;
+        let offset = (slot * DESCRIPTOR_BYTES) as u64;
+        Ok((ring.object.gpu_va() + offset, ring.low.iova() + offset))
+    }
+    /// The times the firmware wrote into descriptor slot `slot`.
+    fn descriptor_times<const N: usize>(&self, slot: usize) -> Result<[u32; N]> {
+        self.descriptors()?
+            .read_words::<N>(slot * DESCRIPTOR_BYTES + DESCRIPTOR_TIMES)
+    }
+
+    /// [`ring::idle_at`].
+    fn idle_at(&self, target: u32) -> Result<bool> {
+        ring::idle_at(&self.graph, self.pointers.producer, target)
+    }
+
+    /// [`ring::expose`] on QID `qid`.
+    fn expose(
         &self,
+        qid: u8,
         port: &Port,
         claim: crate::g17::port::OuterClaim<'_>,
         producer: u32,
         first: bool,
         submission: Option<&HardwareSubmission>,
     ) -> Result<u32> {
-        self.set_producer(producer)?;
-        port.publish_m5_compute(claim, &self.work_slot(producer, first)?, submission)
+        ring::expose(
+            &self.graph,
+            self.pointers.producer,
+            qid,
+            port,
+            claim,
+            producer,
+            first,
+            submission,
+        )
+    }
+
+    /// Maps the queue's client-visible storage into `vm`: the kick ring (`kick`, unless the
+    /// caller did), the descriptors and operand state at their canonical addresses, the pool, and
+    /// client-private views of the preemption buffer and the usage page. Returns those two
+    /// views' addresses.
+    fn client_aliases(
+        &self,
+        vm: &mmu::Vm,
+        aliases: &mut KVec<mmu::KernelMapping>,
+        kick: Option<&mut kick::Queue>,
+        pool: &M5Pool,
+    ) -> Result<(u64, u64)> {
+        let shared = mmu::PROT_GPU_SHARED_RW;
+        if let Some(kick) = kick {
+            aliases.push(kick.map_client(vm)?, GFP_KERNEL)?;
+        }
+        let ring = self.ring.as_ref().ok_or(EIO)?;
+        aliases.push(
+            ring.object.map_alias(vm, ring.low.iova(), shared)?,
+            GFP_KERNEL,
+        )?;
+        if !pool.vacant() {
+            aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
+        }
+        aliases.push(
+            self.operand.map_alias(vm, self.operand.gpu_va(), shared)?,
+            GFP_KERNEL,
+        )?;
+        // Kernel-owned buffers the GPU writes in the client's context: client-private views.
+        let preempt_alias = self
+            .preempt
+            .alias_in(vm, self.private.clone(), PAGE as u64, shared)?;
+        let preempt_va = preempt_alias.iova();
+        aliases.push(preempt_alias, GFP_KERNEL)?;
+        let usage_alias = self
+            .usage
+            .alias_in(vm, self.private.clone(), PAGE as u64, shared)?;
+        let usage_va = usage_alias.iova();
+        aliases.push(usage_alias, GFP_KERNEL)?;
+        Ok((preempt_va, usage_va))
+    }
+
+    /// Publishes the queue's mappings to every context naming their roots: the descriptors' low
+    /// alias, the binding's client `aliases`, then each object of the graph.
+    fn publish_m5_mappings(&self, aliases: &[mmu::KernelMapping]) -> Result {
+        let ring = self.ring.as_ref().ok_or(EIO)?;
+        ring.low.publish_to_contexts();
+        for alias in aliases {
+            alias.publish_to_contexts();
+        }
+        for object in [
+            &*self.graph,
+            &*ring.object,
+            &self.support,
+            &self.operand,
+            &self.preempt,
+            &self.usage,
+        ] {
+            object.publish_to_contexts()?;
+        }
+        Ok(())
     }
 }
 
-/// One M5 hardware compute queue: an installed lane (its QID, kick ring, graph, descriptors,
-/// support page, pool, operand and preemption storage), bound to one logical queue's context.
-/// The lane outlives the binding ([`Self::park`], [`Self::adopt`]). Field order drops every
-/// alias before its backing.
+/// One M5 hardware compute queue: an installed lane (its kick ring, which names its QID, its
+/// graph, the `m5` arm of Neo's compute graph with the descriptors, support page, operand and
+/// preemption storage, and its pool), bound to one logical queue's context. The lane outlives
+/// the binding ([`Self::park`], [`Self::adopt`]). Field order drops every alias before its
+/// backing.
 pub(crate) struct Channel {
     /// The client aliases of the binding: in the owner's VM.
     aliases: KVec<mmu::KernelMapping>,
@@ -529,16 +744,9 @@ pub(crate) struct Channel {
     /// Set once this binding's client views are unmapped, after it parks.
     unmapped: Unmapped,
     gpu: Gpu,
-    /// The descriptors' canonical low alias (the kernel's lower VM); it stays with the lane.
-    descriptors_lower: mmu::KernelMapping,
-    lane: Lane,
-    descriptors: KernelObject,
-    descriptors_low: u64,
-    support: KernelObject,
+    kick: kick::Queue,
+    graph: Graph,
     pool: M5Pool,
-    operand: KernelObject,
-    preempt: KernelObject,
-    usage: KernelObject,
     /// The client views of the preemption buffer and the usage (robustness) page.
     preempt_va: u64,
     usage_va: u64,
@@ -599,62 +807,15 @@ enum Reinstall {
     Published(u32),
 }
 
-/// Maps a lane's client-visible storage into `vm`: the kick ring (unless `Lane::new` did), the
-/// descriptors and operand state at their canonical addresses, the pool, and client-private
-/// views of the preemption buffer and the usage page. Returns those two views' addresses.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "One argument per lane object a binding maps."
-)]
-fn client_aliases(
-    alloc: &Allocator<'_>,
-    vm: &mmu::Vm,
-    aliases: &mut KVec<mmu::KernelMapping>,
-    kick: Option<&mut kick::Queue>,
-    (descriptors, descriptors_low): (&KernelObject, u64),
-    pool: &M5Pool,
-    operand: &KernelObject,
-    preempt: &KernelObject,
-    usage: &KernelObject,
-) -> Result<(u64, u64)> {
-    let shared = mmu::PROT_GPU_SHARED_RW;
-    if let Some(kick) = kick {
-        aliases.push(kick.map_client(vm)?, GFP_KERNEL)?;
-    }
-    aliases.push(
-        descriptors.map_alias(vm, descriptors_low, shared)?,
-        GFP_KERNEL,
-    )?;
-    if !pool.vacant() {
-        aliases.push(pool.map_client(vm)?, GFP_KERNEL)?;
-    }
-    aliases.push(operand.map_alias(vm, operand.gpu_va(), shared)?, GFP_KERNEL)?;
-    // Kernel-owned buffers the GPU writes in the client's context: client-private views.
-    let private = alloc.domain(Domain::Private);
-    let preempt_alias = preempt.alias_in(vm, private.clone(), PAGE as u64, shared)?;
-    let preempt_va = preempt_alias.iova();
-    aliases.push(preempt_alias, GFP_KERNEL)?;
-    let usage_alias = usage.alias_in(vm, private, PAGE as u64, shared)?;
-    let usage_va = usage_alias.iova();
-    aliases.push(usage_alias, GFP_KERNEL)?;
-    Ok((preempt_va, usage_va))
-}
-
 /// An installed compute lane without an owner: everything the
 /// firmware's installed queue still names, and the previous owner's scheduler page and work
 /// storage its record names until the next owner rewrites it. Never dropped while the session
 /// runs: its QID stays configured with this ring.
 pub(crate) struct ParkedLane {
     gpu: Gpu,
-    descriptors_lower: mmu::KernelMapping,
-    lane: Lane,
-    descriptors: KernelObject,
-    descriptors_low: u64,
-    support: KernelObject,
+    kick: kick::Queue,
+    graph: Graph,
     pool: M5Pool,
-    operand: KernelObject,
-    preempt: KernelObject,
-    usage: KernelObject,
     class: u8,
     pages: crate::g17::context::FirmwarePages,
     unmapped: Unmapped,
@@ -668,7 +829,7 @@ pub(crate) struct ParkedLane {
 
 impl ParkedLane {
     pub(crate) fn qid(&self) -> u8 {
-        self.lane.qid()
+        self.kick.id().qid()
     }
     /// Its previous binding's client views are unmapped (a new owner in the same VM may map
     /// the lane at the same addresses), and no release of its pool is in flight.
@@ -806,42 +967,15 @@ impl Channel {
         pointers: &PointerLayout,
     ) -> Result<KBox<Self>> {
         let vm = context.vm();
-        let prot = mmu::PROT_GPU_FW_SHARED_RW;
-        let cpu = CpuMap::WriteCombined;
         let mut aliases = KVec::with_capacity(8, GFP_KERNEL)?;
-        let lane = Lane::new(alloc, &context, id, pointers, &mut aliases)?;
-        let descriptors = alloc.kernel(DEPTH * DESCRIPTOR_BYTES, PAGE as u64, prot, cpu)?;
-        // The canonical low arena, as for every descriptor ring, and the same address in the VM.
-        let low = descriptors.alias_in(
-            alloc.uat.kernel_lower_vm(),
-            alloc.domain(Domain::Canonical),
-            PAGE as u64,
-            mmu::PROT_GPU_SHARED_RW,
-        )?;
-        let descriptors_low = low.iova();
-        let support = alloc.kernel(SUPPORT_BYTES, PAGE as u64, prot, cpu)?;
+        let mut kick = kick::Queue::lower(alloc, id)?;
+        aliases.push(kick.map_client(vm)?, GFP_KERNEL)?;
         let geometry = fw::m5::pool::PoolGeometry::of(gpu.pool_blocks, gpu.block_bytes())
             .map_err(|_| EINVAL)?;
-        let pool = M5Pool::new(alloc, id.qid(), geometry, fw::m5::pool::Engine::Compute)?;
-        let operand = alloc.lower(
-            gpu.profile.operand.bytes,
-            PAGE as u64,
-            mmu::PROT_GPU_SHARED_RW,
-            cpu,
-        )?;
-        let preempt = alloc.kernel(compute::PREEMPT_BYTES, PAGE as u64, prot, cpu)?;
-        let usage = alloc.kernel(PAGE, PAGE as u64, prot, cpu)?;
-        let (preempt_va, usage_va) = client_aliases(
-            alloc,
-            vm,
-            &mut aliases,
-            None,
-            (&descriptors, descriptors_low),
-            &pool,
-            &operand,
-            &preempt,
-            &usage,
-        )?;
+        let (graph, pool) = Graph::new_m5(alloc, &context, &gpu, pointers, || {
+            M5Pool::new(alloc, id.qid(), geometry, fw::m5::pool::Engine::Compute)
+        })?;
+        let (preempt_va, usage_va) = graph.client_aliases(vm, &mut aliases, None, &pool)?;
         let channel = KBox::new(
             Self {
                 aliases,
@@ -853,15 +987,9 @@ impl Channel {
                 reinstall: Reinstall::None,
                 class: u8::MAX,
                 gpu,
-                descriptors_lower: low,
-                lane,
-                descriptors,
-                descriptors_low,
-                support,
+                kick,
+                graph,
                 pool,
-                operand,
-                preempt,
-                usage,
                 preempt_va,
                 usage_va,
                 installed: false,
@@ -888,20 +1016,7 @@ impl Channel {
     /// Publishes the complete mapping set to every context naming its roots, before any record
     /// names it. The kick ring's own aliases are published when its first entry is installed.
     fn publish_mappings(&self) -> Result {
-        self.descriptors_lower.publish_to_contexts();
-        for alias in &self.aliases {
-            alias.publish_to_contexts();
-        }
-        for object in [
-            &self.lane.graph,
-            &self.descriptors,
-            &self.support,
-            &self.operand,
-            &self.preempt,
-            &self.usage,
-        ] {
-            object.publish_to_contexts()?;
-        }
+        self.graph.publish_m5_mappings(&self.aliases)?;
         self.pool.publish_to_contexts()
     }
 
@@ -910,7 +1025,6 @@ impl Channel {
     /// queue is reconfigured at the binding's first kick ([`Self::publish`]); the kick
     /// timestamp and the stamps continue. On failure the lane stays parked.
     pub(crate) fn adopt(
-        alloc: &Allocator<'_>,
         parked: &mut KVec<ParkedLane>,
         index: usize,
         context: Arc<Context>,
@@ -927,21 +1041,16 @@ impl Channel {
         }
         let unmapped = Unmapped::new()?;
         let mut aliases = KVec::with_capacity(8, GFP_KERNEL)?;
-        let (preempt_va, usage_va) = client_aliases(
-            alloc,
+        let (preempt_va, usage_va) = lane.graph.client_aliases(
             context.vm(),
             &mut aliases,
-            Some(&mut lane.lane.kick),
-            (&lane.descriptors, lane.descriptors_low),
+            Some(&mut lane.kick),
             &lane.pool,
-            &lane.operand,
-            &lane.preempt,
-            &lane.usage,
         )?;
         let active = KVec::with_capacity(DEPTH, GFP_KERNEL)?;
         let slot = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         // The lane is idle and its owner's release consumed: no reader of the record remains.
-        lane.lane.set_owner(&context)?;
+        lane.graph.set_owner(&context)?;
         let lane = parked.remove(index).map_err(|_| EINVAL)?;
         let recycled = lane.needs_fresh_backing;
         if recycled {
@@ -969,15 +1078,9 @@ impl Channel {
                 },
                 class: lane.class,
                 gpu: lane.gpu,
-                descriptors_lower: lane.descriptors_lower,
-                lane: lane.lane,
-                descriptors: lane.descriptors,
-                descriptors_low: lane.descriptors_low,
-                support: lane.support,
+                kick: lane.kick,
+                graph: lane.graph,
                 pool: lane.pool,
-                operand: lane.operand,
-                preempt: lane.preempt,
-                usage: lane.usage,
                 preempt_va,
                 usage_va,
                 installed: true,
@@ -1019,25 +1122,25 @@ impl Channel {
         {
             return Ok(false);
         }
-        if !self.lane.idle_at(self.lane.cursors()?.producer)?
+        if !self.graph.idle_at(self.graph.cursors()?.producer)?
             || self.pool.completed_submissions()? != self.pool.submitted()?
         {
             return Ok(false);
         }
-        let next = self.lane.kick.timestamp();
+        let next = self.kick.timestamp();
         Ok(next.get() == KickTimestamp::FIRST.get()
             || retirement::stamp_covers(self.stamp()?, next.prev().get()))
     }
 
     /// Logs the park witnesses ([`Self::parkable`]) one by one, for a stalled release.
     pub(crate) fn report_park(&self) {
-        let next = self.lane.kick.timestamp();
+        let next = self.kick.timestamp();
         pr_warn!(
             "G17 M5: lane {}: closed {} installed {} quarantine {:?} faulted {} active {} failed {}, kill: due {} published {} settled {} refused {}, cursors {:x?}, idle {:?}, pool {:?}/{:?}, stamp {:x?} for kick {:#x}\n",
             self.qid(), self.closed, self.installed, self.quarantine_error, self.faulted, self.active.len(),
             self.failed.len(), self.kill_candidate(), self.exit.is_some(), self.killed_at.is_some(),
-            self.kill_refused, self.lane.cursors(),
-            self.lane.cursors().and_then(|cursors| self.lane.idle_at(cursors.producer)),
+            self.kill_refused, self.graph.cursors(),
+            self.graph.cursors().and_then(|cursors| self.graph.idle_at(cursors.producer)),
             self.pool.completed_submissions(), self.pool.submitted(), self.stamp(), next.prev().get(),
         );
     }
@@ -1053,7 +1156,7 @@ impl Channel {
             return self.parkable();
         }
         Ok(self.closed
-            && self.lane.idle_at(self.lane.cursors()?.producer)?
+            && self.graph.idle_at(self.graph.cursors()?.producer)?
             && !self.kill_holds_release(crate::g17::now_ns()))
     }
 
@@ -1167,15 +1270,9 @@ impl Channel {
             owner,
             class,
             gpu,
-            descriptors_lower,
-            lane,
-            descriptors,
-            descriptors_low,
-            support,
+            kick,
+            graph,
             pool,
-            operand,
-            preempt,
-            usage,
             unmapped,
             pool_state,
             needs_fresh_backing,
@@ -1185,15 +1282,9 @@ impl Channel {
         (
             ParkedLane {
                 gpu,
-                descriptors_lower,
-                lane,
-                descriptors,
-                descriptors_low,
-                support,
+                kick,
+                graph,
                 pool,
-                operand,
-                preempt,
-                usage,
                 class,
                 pages,
                 unmapped: unmapped.clone(),
@@ -1218,15 +1309,15 @@ impl Channel {
 
     /// The timestamp the lane's next kick takes.
     pub(crate) fn next_kick(&self) -> u64 {
-        self.lane.kick.timestamp().get()
+        self.kick.timestamp().get()
     }
 
     pub(crate) fn qid(&self) -> u8 {
-        self.lane.qid()
+        self.kick.id().qid()
     }
     /// The QID and the host identity that reserved it: the compute entry's reservation.
     pub(crate) fn id(&self) -> kick::Id {
-        self.lane.id
+        self.kick.id()
     }
     pub(crate) fn gpu(&self) -> &Gpu {
         &self.gpu
@@ -1291,7 +1382,7 @@ impl Channel {
     }
     /// Kicks published since installation.
     pub(crate) fn kicks(&self) -> u64 {
-        self.lane.kick.timestamp().get() - KickTimestamp::FIRST.get()
+        self.kick.timestamp().get() - KickTimestamp::FIRST.get()
     }
     /// The oldest DRM kick still holding the GPU, for cross-VM timeout attribution
     /// (`timeout::attribute`), as a Neo compute queue's (`queue::compute::Queue::timeout_head`):
@@ -1409,9 +1500,7 @@ impl Channel {
     /// whole: a measured interrupted kick ran to its record's end and still left 64 workgroups
     /// wrong.
     fn report_interrupted(&self, front: &Active, outcome: core::result::Result<[u64; 2], Error>) {
-        let words = self
-            .descriptors
-            .read_words::<4>(front.slot * DESCRIPTOR_BYTES + DESCRIPTOR_TIMES);
+        let words = self.graph.descriptor_times::<4>(front.slot);
         let launched = match words.as_ref().is_ok_and(|w| w[0] != 0 || w[1] != 0) {
             true => "launched",
             false => "launched no work",
@@ -1447,10 +1536,7 @@ impl Channel {
         let mut running = None;
         fence(Ordering::Acquire);
         for active in self.active.iter().filter(|active| active.packet.is_some()) {
-            let Ok(words) = self
-                .descriptors
-                .read_words::<2>(active.slot * DESCRIPTOR_BYTES + DESCRIPTOR_TIMES)
-            else {
+            let Ok(words) = self.graph.descriptor_times::<2>(active.slot) else {
                 return;
             };
             let start = u64::from(words[0]) | (u64::from(words[1]) << 32);
@@ -1472,7 +1558,7 @@ impl Channel {
 
     /// The inner item ring's cursors.
     pub(crate) fn cursors(&self) -> Result<Cursors> {
-        self.lane.cursors()
+        self.graph.cursors()
     }
 
     /// The oldest kick's witnesses besides the stamp and cursors, for a diagnostic: its ticket,
@@ -1492,8 +1578,7 @@ impl Channel {
         Some((
             front.ticket,
             front.observed,
-            self.descriptors
-                .read_words::<4>(front.slot * DESCRIPTOR_BYTES + DESCRIPTOR_TIMES),
+            self.graph.descriptor_times::<4>(front.slot),
             front.pool_target,
             self.pool.completed_submissions(),
             front.work.drained(),
@@ -1502,8 +1587,7 @@ impl Channel {
 
     /// The queue's completion stamp.
     pub(crate) fn stamp(&self) -> Result<u32> {
-        fence(Ordering::Acquire);
-        Ok(self.support.word(STAMPS)?.load(Ordering::Relaxed))
+        self.graph.stamp()
     }
 
     pub(crate) fn completed_submissions(&self) -> Result<u64> {
@@ -1526,14 +1610,14 @@ impl Channel {
         let rebound = (!install).then_some(self.rebound).flatten();
         QueueConfig::new(&QueueConfigArgs {
             target: QueueConfigTarget::Compute,
-            kick_ring_va: self.lane.kick.low_va(),
-            kick_ring_fw_va: self.lane.kick.firmware_va(),
+            kick_ring_va: self.kick.low_va(),
+            kick_ring_fw_va: self.kick.firmware_va(),
             qid: self.qid(),
             install: install || rebound == Some(true),
             // An adopted lane's completion value continues, unless no kick ever ran on it: then
             // its first kick is the lane's first and takes the fresh lane's seed.
             completion_seed: match rebound {
-                Some(_) if self.lane.kick.timestamp().get() != KickTimestamp::FIRST.get() => None,
+                Some(_) if self.kick.timestamp().get() != KickTimestamp::FIRST.get() => None,
                 _ => completion_seed,
             },
             context_id: self.context.id().try_into()?,
@@ -1573,15 +1657,16 @@ impl Channel {
             .reserve_compute(self.context.policy().priority())?;
         host.init
             .install_m5_pool(self.pool.id(), self.pool.descriptor()?)?;
-        self.lane.stage_install(self.config(true, None)?)?;
-        host.qids.publish(self.lane.id)?;
+        let config = self.config(true, None)?;
+        ring::stage_install(&mut self.graph.graph, config)?;
+        host.qids.publish(self.kick.id())?;
         self.installed = true;
         // The installation names the context's scheduler page: its close releases it.
         self.context.mark_published();
         self.class = self.context.policy().priority();
         let result = self
-            .lane
-            .expose(host.port, claim, 1, true, None)
+            .graph
+            .expose(self.qid(), host.port, claim, 1, true, None)
             .map(|_| ());
         if let Err(error) = result {
             self.quarantine_error = Some(error);
@@ -1607,22 +1692,21 @@ impl Channel {
             return Err(error);
         }
         let priority = self.context.policy().priority();
-        let producer = self.lane.cursors()?.producer;
-        if !self.lane.idle_at(producer)? {
+        let producer = self.graph.cursors()?.producer;
+        if !self.graph.idle_at(producer)? {
             return Err(EIO);
         }
         let claim = host.port.reserve_compute(priority)?;
-        let target = self
-            .lane
-            .stage_reinstall(producer, self.config(true, None)?)?;
+        let config = self.config(true, None)?;
+        let target = ring::stage_reinstall(&mut self.graph.graph, producer, config)?;
         let first = self.class != priority;
         self.class = priority;
         self.rebound = Some(false);
         self.reinstall = Reinstall::Published(target);
         self.context.mark_published();
         let result = self
-            .lane
-            .expose(host.port, claim, target, first, None)
+            .graph
+            .expose(self.qid(), host.port, claim, target, first, None)
             .map(|_| ());
         if let Err(error) = result {
             self.quarantine_error = Some(error);
@@ -1638,9 +1722,9 @@ impl Channel {
             return Err(error);
         }
         let consumed = match self.reinstall {
-            Reinstall::Published(target) => self.lane.cursors()?.consumer == target,
+            Reinstall::Published(target) => self.graph.cursors()?.consumer == target,
             Reinstall::Due => false,
-            Reinstall::None => self.rebound.is_some() || self.lane.cursors()?.consumer == 1,
+            Reinstall::None => self.rebound.is_some() || self.graph.cursors()?.consumer == 1,
         };
         if consumed {
             if let Reinstall::Published(target) = self.reinstall {
@@ -1687,26 +1771,23 @@ impl Channel {
         if !self.installed || self.closed {
             return Err(EINVAL);
         }
-        let (lane, support, faulted) = (&self.lane, &self.support, self.faulted);
+        let (kick, graph, faulted) = (&self.kick, &self.graph, self.faulted);
         let (active, failed) = (&self.active, &self.failed);
         let idle = |pool: &M5Pool| -> Result<bool> {
-            let next = lane.kick.timestamp();
+            let next = kick.timestamp();
             // The queue's completion stamp ([`Self::stamp`]), read last, as the growth always did.
-            let stamp = || -> Result<u32> {
-                fence(Ordering::Acquire);
-                Ok(support.word(STAMPS)?.load(Ordering::Relaxed))
-            };
+            let stamp = || graph.stamp();
             let busy = faulted
                 || !active.is_empty()
                 || !failed.is_empty()
-                || !lane.idle_at(lane.cursors()?.producer)?
+                || !graph.idle_at(graph.cursors()?.producer)?
                 || pool.completed_submissions()? != pool.submitted()?
                 || (next.get() != KickTimestamp::FIRST.get()
                     && !retirement::stamp_covers(stamp()?, next.prev().get()));
             Ok(!busy)
         };
         let site = PoolSite {
-            qid: lane.qid(),
+            qid: kick.id().qid(),
             pool: &mut self.pool,
             state: &mut self.pool_state,
             vm: self.context.vm(),
@@ -1782,21 +1863,19 @@ impl Channel {
             return Err(EINVAL);
         }
         let claim = host.port.reserve_compute(policy.priority())?;
-        let timestamp = self.lane.kick.timestamp();
+        let timestamp = self.kick.timestamp();
         let slot = timestamp.slot() % DEPTH;
-        let offset = (slot * DESCRIPTOR_BYTES) as u64;
-        let high = self.descriptors.gpu_va() + offset;
-        let low = self.descriptors_low + offset;
+        let (high, low) = self.graph.descriptor_slot_vas(slot)?;
         let work_word = work.word();
         let work_node = work.node_va()?;
-        let stamps = self.support.gpu_va() + STAMPS as u64;
-        let status = self.support.gpu_va() + STATUS as u64;
+        let stamps = self.graph.support.gpu_va() + STAMPS as u64;
+        let status = self.graph.support.gpu_va() + STATUS as u64;
         let args = DescriptorArgs {
             registers: RegisterArgs {
                 auxiliary_allocation: 0,
                 preempt_va: self.preempt_va,
                 cdm_va: dispatch.cdm_va,
-                operand_va: self.operand.gpu_va(),
+                operand_va: self.graph.operand.gpu_va(),
                 usage_va: self.usage_va,
                 free_list_slot: u32::from(self.pool.id()),
                 context_id: self.context.id().try_into()?,
@@ -1822,11 +1901,12 @@ impl Channel {
             timestamp_va: [0; 2],
             shared_control_va: self.pool.control_va(),
             event_metadata: [0; 16],
-            usage_fw_va: self.support.gpu_va() + USAGE as u64,
+            usage_fw_va: self.graph.support.gpu_va() + USAGE as u64,
             completion_identity: compute::COMPLETION_IDENTITY,
         };
         // The slot's previous kick retired: firmware no longer reads its descriptor or record.
-        self.descriptors
+        self.graph
+            .descriptors_mut()?
             .initialize::<Descriptor>(slot * DESCRIPTOR_BYTES, |descriptor| {
                 descriptor.write(&args)
             })?;
@@ -1837,23 +1917,25 @@ impl Channel {
             (false, false) => Some(self.config(false, None)?),
             (false, true) => None,
         };
-        let target = self
-            .lane
-            .stage_kick(cursors.producer, update, slot, timestamp)?;
-        let command = HardwareSubmission::compute(
-            self.qid(),
-            self.lane.kick.low_va(),
-            policy.priority(),
-            first,
+        let qid = self.qid();
+        let target = ring::stage_kick(
+            &mut self.graph.graph,
+            qid,
+            cursors.producer,
+            update,
+            slot,
+            timestamp,
         )?;
+        let command =
+            HardwareSubmission::compute(self.qid(), self.kick.low_va(), policy.priority(), first)?;
         let kick_args = KickArgs {
             qid: self.qid(),
             timestamp,
-            parent: self.lane.kick.parent(),
+            parent: self.kick.parent(),
             barriers: &[],
             dependency_types: Some(&[compute::PARENT_DEPENDENCY]),
             descriptor_va: high,
-            queue_va: self.lane.graph.gpu_va(),
+            queue_va: self.graph.graph.gpu_va(),
             qos: KickQos {
                 slot: self.context.qos_id(),
                 class: compute::KICK_QOS_CLASS,
@@ -1865,7 +1947,7 @@ impl Channel {
             priority: policy.priority(),
         };
         self.active.reserve(1, GFP_KERNEL)?;
-        let prepared = self.lane.kick.prepare_entry(&kick_args)?;
+        let prepared = self.kick.prepare_entry(&kick_args)?;
         if first {
             prepared.prepare_lower_install()?;
         }
@@ -1898,7 +1980,8 @@ impl Channel {
             // command makes it runnable; whether the cores are powered is not a prerequisite.
             // The first slot naming the queue on a class's outer ring says so: an adopted lane
             // whose class changed starts on its new ring.
-            self.lane.expose(
+            self.graph.expose(
+                self.qid(),
                 host.port,
                 claim,
                 target,
@@ -1957,7 +2040,7 @@ impl Channel {
         if self.active.is_empty() || self.quarantine_error.is_some() {
             return Ok(false);
         }
-        batch.stage_frontier(self.qid(), self.lane.kick.timestamp().get())?;
+        batch.stage_frontier(self.qid(), self.kick.timestamp().get())?;
         let stamp = self.stamp()?;
         let mut requested = false;
         for active in self
@@ -2093,7 +2176,8 @@ impl Channel {
         }
         let offset = active.slot * DESCRIPTOR_BYTES;
         let words = self
-            .descriptors
+            .graph
+            .descriptors()?
             .read_words::<4>(offset + DESCRIPTOR_TIMES)?;
         let descriptor = [
             u64::from(words[0]) | (u64::from(words[1]) << 32),
@@ -2153,7 +2237,7 @@ impl Channel {
     /// kick's work node drained. The firmware names nothing of them any more.
     fn drained(&self, state: u32) -> Result<bool> {
         if state != 0
-            || !self.lane.idle_at(self.lane.cursors()?.producer)?
+            || !self.graph.idle_at(self.graph.cursors()?.producer)?
             || self.pool.completed_submissions()? != self.pool.submitted()?
         {
             return Ok(false);
@@ -2248,13 +2332,13 @@ impl Channel {
         {
             return Ok(());
         }
-        if let Err(reset) = self.lane.reset_items() {
+        if let Err(reset) = self.graph.reset_items() {
             pr_warn!("G17 M5: lane {}: its ring could not be reset after its context's kill ({:?}); the lane stays quarantined\n",
                 self.qid(), reset);
             return Ok(());
         }
-        self.lane.kick.clear_parent_after_recovery();
-        self.descriptors.bytes_mut().fill(0);
+        self.kick.clear_parent_after_recovery();
+        self.graph.descriptors_mut()?.bytes_mut().fill(0);
         fence(Ordering::SeqCst);
         self.exit = None;
         self.killed_at = None;
@@ -2273,7 +2357,8 @@ impl Channel {
         let mut end = 0;
         for offset in (0..DESCRIPTOR_BYTES).step_by(4) {
             if self
-                .descriptors
+                .graph
+                .descriptors()?
                 .word(base + offset)?
                 .load(Ordering::Relaxed)
                 != 0
@@ -2288,8 +2373,9 @@ impl Channel {
     /// scheduling words as stored (+0x28..+0x40: priority twice, the class words, the policy),
     /// the QoS row written, the work ring and doorbell, and the host port's configuration.
     fn log_class(&self, policy: Policy, qos_row: Option<[u8; 8]>, command: &HardwareSubmission) {
-        let record: [u32; 6] =
-            core::array::from_fn(|i| self.lane.word(0x28 + 4 * i).unwrap_or(u32::MAX));
+        let record: [u32; 6] = core::array::from_fn(|i| {
+            ring::word(&self.graph.graph, 0x28 + 4 * i).unwrap_or(u32::MAX)
+        });
         let ring = fw::channels::work_ring_index(policy.priority(), DataMaster::Compute);
         pr_info!(
             "M5 queue {}: class {} policy {} QoS {}/{}: record +0x28 {:08x?}, QoS row {:02x?}, compute ring {:?}, notify {:#018x}, host config {:#018x?}\n",
@@ -2320,6 +2406,7 @@ impl Channel {
         );
         for offset in (0..STATUS + 0x10).step_by(4) {
             if let Ok(value) = self
+                .graph
                 .support
                 .word(STAMPS + offset)
                 .map(|w| w.load(Ordering::Relaxed))
