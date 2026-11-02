@@ -322,6 +322,7 @@ impl M5Runtime {
         // never release UAT or transports beneath a running firmware CPU.
         // Keep callback code resident even if a failed stop retains owners.
         // This explicit RAM-boot experiment is released by reboot only.
+        #[cfg(CONFIG_MODULES)]
         unsafe { kernel::bindings::__module_get((*kernel::module::this_module::<crate::LocalModule>()).as_ptr()); }
         Ok(Self { session: Some(session), application: false, faulted: false,
             application_generation: 0, application_compute_generation: 0 })
