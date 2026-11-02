@@ -23,7 +23,8 @@ config APPLE_PMGR_PWRSTATE_KUNIT_TEST
 	  power management when it is powered on or when a failed power-off
 	  is undone, and that other domains still do. The tests run the
 	  driver's power callbacks against an emulated power state register
-	  and need no Apple hardware.
+	  and need no Apple hardware. Also check the T6000 GFX missing-parent
+	  wait, its timeout, and the separate actual-state acknowledgment.
 
 config APPLE_PMP_REPORT
 	bool "Apple PMP report control"

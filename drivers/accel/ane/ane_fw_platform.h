@@ -61,6 +61,22 @@ struct ane_fw_platform {
 	u16 stream_mask;
 	bool firmware_preloaded;
 	bool safe_reset;
+	/*
+	 * System sleep first takes the firmware out of Exclave mode
+	 * (EXCLAVE_MODE_STOP on the control ring) so that SUSPEND can run.
+	 */
+	bool exclave_mode_stop;
+	/*
+	 * System sleep keeps the firmware (EXCLAVE_MODE_STOP, SUSPEND, warm
+	 * boot); otherwise the engine is cycled cold and the programs replayed.
+	 */
+	bool sleep_warm;
+	/*
+	 * H16: system sleep cycles the engine cold (no firmware command, cold
+	 * boot and program replay after resume) when sleep_warm is off.
+	 * Without either, H16 refuses system sleep.
+	 */
+	bool sleep_cold;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */
@@ -81,6 +97,32 @@ ane_fw_preload_ranges_valid(const struct ane_fw_platform *soc, const u64 phys[2]
 	return end[0] <= phys[1] || end[1] <= phys[0];
 }
 
+/*
+ * The system sleep path of a device the ane_t6021 driver bound. Devices of
+ * the shared firmware platform (H16, H17) carry the backend's drvdata and
+ * must never reach the H13/H14 rtclient sleep path, which would read that
+ * drvdata as an rtclient.
+ */
+enum ane_fw_sleep_path {
+	ANE_SLEEP_RTCLIENT,
+	ANE_SLEEP_FW_BACKEND,
+};
+
+/*
+ * The device binds for the staged backend (H17): the engine is started by
+ * the backend, the bound device carries its power domain and sleep callbacks.
+ */
+static inline bool ane_fw_platform_staged(const struct ane_fw_platform *platform)
+{
+	return platform && platform->owner == ANE_FW_OWNER_EXCLAVE;
+}
+
+static inline enum ane_fw_sleep_path
+ane_fw_sleep_path(const struct ane_fw_platform *platform)
+{
+	return platform ? ANE_SLEEP_FW_BACKEND : ANE_SLEEP_RTCLIENT;
+}
+
 extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
@@ -88,8 +130,12 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 int ane_fw_platform_probe(struct platform_device *pdev,
 			  const struct ane_fw_platform *soc);
 void ane_fw_platform_remove(struct platform_device *pdev);
+int ane_fw_platform_suspend(struct device *dev);
+int ane_fw_platform_resume(struct device *dev);
 int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc);
 void ane_h16_backend_remove(struct platform_device *pdev);
+int ane_h16_backend_suspend(struct device *dev);
+int ane_h16_backend_resume(struct device *dev);
 
 #endif /* __ANE_FW_PLATFORM_H__ */

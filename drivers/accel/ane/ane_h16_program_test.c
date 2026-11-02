@@ -57,8 +57,18 @@ struct prog_fw {
 	unsigned int execs;
 	u8 load[ANE_H16_LOAD_SIZE];
 	unsigned int maps, writable_maps;
+	/* busy(true) and busy(false) calls, and the deepest nesting seen. */
+	unsigned int busy_on, busy_off;
+	int busy_depth, busy_max;
+	/* Cache maintenance calls, when the fake hands out cached surfaces. */
+	bool cached;
+	unsigned int syncs_device, syncs_cpu;
+	u64 last_sync_dva;
 	/* The EXECUTE failure trace lines, by step. */
 	u64 fail_step, fail_flags, fail_reports, fail_state, fail_other;
+	/* EXECUTE of a program or process this firmware never created fails. */
+	bool strict;
+	unsigned int replay_failed;
 };
 
 static u64 fw_load(void *ctx, const void *p)
@@ -142,11 +152,26 @@ static void fw_execute(struct prog_fw *f, const u8 *cmd)
 		fw_report(f, uuid, program, process, 3);
 		break;
 	default:
+		if (f->strict && (program - f->program >= 32 || process - f->process >= 32 ||
+				  !(f->programs_live & BIT(program - f->program)) ||
+				  !(f->processes_live & BIT(process - f->process)))) {
+			fw_report(f, uuid, program, process, 2);
+			break;
+		}
 		fw_report(f, uuid, program, process, 0);
 		fw_report(f, uuid, program, process, 3);
 		fw_report(f, uuid, program, process, 1);
 		break;
 	}
+}
+
+/* A firmware booted again from the preload: no program or process, new IDs. */
+static void fw_cold_boot(struct prog_fw *f)
+{
+	f->programs_live = 0;
+	f->processes_live = 0;
+	f->program += 0x10;
+	f->process += 0x10;
 }
 
 static u32 fw_take_id(u32 *live, u32 base)
@@ -285,6 +310,7 @@ static int fw_map(void *ctx, size_t size, bool write, struct ane_fw_surface *s)
 		.cpu = fw_zalloc(f->test, size),
 		.dva = f->next_dva,
 		.size = size,
+		.handle = f->cached ? f->next_dva : 0,
 	};
 	if (!s->cpu)
 		return -ENOMEM;
@@ -306,12 +332,41 @@ static void fw_log(void *ctx, const char *item, u64 a, u64 b)
 		f->fail_state = b;
 	} else if (!strcmp(item, "EXECUTE other reports")) {
 		f->fail_other = a;
+	} else if (!strcmp(item, "PROGRAM REPLAY FAILED")) {
+		f->replay_failed++;
+	}
+}
+
+static void fw_sync(void *ctx, const struct ane_fw_surface *s, bool for_device)
+{
+	struct prog_fw *f = ctx;
+
+	KUNIT_EXPECT_NE(f->test, s->handle, 0ULL);
+	if (for_device)
+		f->syncs_device++;
+	else
+		f->syncs_cpu++;
+	f->last_sync_dva = s->dva;
+}
+
+static void fw_busy(void *ctx, bool busy)
+{
+	struct prog_fw *f = ctx;
+
+	if (busy) {
+		f->busy_on++;
+		f->busy_max = max(f->busy_max, ++f->busy_depth);
+	} else {
+		f->busy_off++;
+		f->busy_depth--;
 	}
 }
 
 static const struct ane_h16_session_ops fw_session_ops = {
 	.map = fw_map,
 	.log = fw_log,
+	.busy = fw_busy,
+	.sync = fw_sync,
 };
 
 static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
@@ -358,6 +413,8 @@ static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
 	    ane_fw_transport_arm(&f->t) ||
 	    ane_h16_session_init(&f->s, &f->t, &fw_session_ops, f, 1000))
 		return NULL;
+	/* The fake clock moves 10 ns per poll; keep the post-UNLOAD settle short. */
+	f->s.settle_ns = 100;
 	return f;
 }
 
@@ -1632,7 +1689,462 @@ static void program_h17_no_custom_bar_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
+/*
+ * Cached program surfaces: LOAD writes back every mapping it filled, and
+ * the per-request sync writes back every surface before the engine and
+ * drops the output lines after it. Coherent surfaces (no handle) are never
+ * synced.
+ */
+static void program_cached_sync_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test), *g = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	f->cached = true;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	/* Every HWX region and every aux section, once. */
+	KUNIT_EXPECT_EQ(test, f->syncs_device, p->plan.count + ANE_H16_AUX_COUNT);
+	KUNIT_EXPECT_EQ(test, f->syncs_cpu, 0);
+	f->syncs_device = 0;
+	ane_h16_session_sync(&f->s, p, true);
+	KUNIT_EXPECT_EQ(test, f->syncs_device, p->resource_count);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	ane_h16_session_sync(&f->s, p, false);
+	/* One output: only its lines are dropped. */
+	KUNIT_EXPECT_EQ(test, f->syncs_cpu, 1);
+	KUNIT_EXPECT_EQ(test, f->last_sync_dva, p->surfaces[1]->dva);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+
+	/* Coherent memory: nothing to maintain. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(g, &q), 0);
+	ane_h16_session_sync(&g->s, q, true);
+	ane_h16_session_sync(&g->s, q, false);
+	KUNIT_EXPECT_EQ(test, g->syncs_device + g->syncs_cpu, 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&g->s, q), 0);
+}
+
+/*
+ * Fifty programs loaded, run and closed one after another (each close is
+ * what the last close of the accel file does) map memory only for the
+ * first: every later LOAD is served from the spares the previous program
+ * gave back, zeroed, and each closed program is freed.
+ */
+static void program_cycle_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p;
+	unsigned int i, maps = 0, spares = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (i = 0; i < 50; i++) {
+		p = NULL;
+		KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+		KUNIT_ASSERT_NOT_NULL(test, p);
+		if (!i)
+			maps = f->maps;
+		/* Reused memory comes back zeroed before LOAD fills it. */
+		KUNIT_EXPECT_FALSE(test, memchr_inv(p->surfaces[1]->cpu, 0,
+						    p->surfaces[1]->size));
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+		memset(p->surfaces[1]->cpu, 0x5a, p->surfaces[1]->size);
+		KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+		if (!i)
+			spares = f->s.spare_count;
+		ane_h16_session_put(&f->s, p);
+	}
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, spares);
+	KUNIT_EXPECT_GT(test, spares, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, f->s.program, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/* The same for H17 MobileNet, with its kernel-owned scratch. */
+static void program_h17_cycle_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create_family(test, 17);
+	struct ane_h16_hwx_snapshot *snapshot;
+	const void *aux[ANE_H16_AUX_COUNT];
+	size_t aux_size[ANE_H16_AUX_COUNT];
+	struct ane_h16_program *p;
+	unsigned int i, maps = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	mobilenet_sections(test, aux, aux_size);
+	for (i = 0; i < 50; i++) {
+		snapshot = mobilenet_snapshot(test);
+		KUNIT_ASSERT_NOT_NULL(test, snapshot);
+		p = NULL;
+		KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, aux, aux_size, &p), 0);
+		if (!i)
+			maps = f->maps;
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+		/* Every program's first request is queued, reused memory or not. */
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30),
+				ANE_H16_EXECUTE_FLAG_QUEUED);
+		KUNIT_ASSERT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+		ane_h16_session_put(&f->s, p);
+	}
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/* A program whose teardown failed keeps its memory and is never freed. */
+static void program_failed_close_keeps_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	f->s.quarantined = true;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EIO);
+	KUNIT_EXPECT_FALSE(test, p->released);
+	KUNIT_EXPECT_EQ(test, f->s.spare_count, 0U);
+	ane_h16_session_put(&f->s, p);
+	/* Still there: put refused a program that was not released. */
+	KUNIT_EXPECT_TRUE(test, p->closed);
+	KUNIT_EXPECT_NOT_NULL(test, p->surfaces[0]);
+}
+
+/*
+ * The busy hook brackets every EXECUTE that reaches the firmware, pass or
+ * fail, exactly once and never nested; a refused call never votes.
+ */
+static void program_busy_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test), *g = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, g);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 0);
+	for (i = 0; i < 5; i++)
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->busy_on, 5);
+	KUNIT_EXPECT_EQ(test, f->busy_off, 5);
+	KUNIT_EXPECT_EQ(test, f->busy_max, 1);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, NULL), -EINVAL);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&g->s, p), -EINVAL);
+	KUNIT_EXPECT_EQ(test, f->busy_on + g->busy_on, 5);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+
+	/* A stalled request still releases the vote. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(g, &q), 0);
+	g->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_NE(test, ane_h16_session_execute(&g->s, q), 0);
+	KUNIT_EXPECT_EQ(test, g->busy_on, 1);
+	KUNIT_EXPECT_EQ(test, g->busy_off, 1);
+	KUNIT_EXPECT_EQ(test, g->busy_depth, 0);
+}
+
+/*
+ * While the firmware is suspended for system sleep, requests wait at the
+ * gate and a close is deferred: no firmware traffic until the session
+ * reopens, then the normal TERMINATE and UNLOAD, and the program survives
+ * the sleep untouched until then (no LOAD or CREATE replay).
+ */
+static void program_sleep_gate_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int sent, spares;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+
+	ane_h16_session_sleep(&f->s, true);
+	KUNIT_EXPECT_TRUE(test, f->s.asleep);
+	sent = f->count;
+	spares = f->s.spare_count;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EINPROGRESS);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EINPROGRESS);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_FALSE(test, p->closed);
+
+	/* Reopen: the deferred close runs once, with its firmware traffic. */
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_FALSE(test, f->s.asleep);
+	KUNIT_EXPECT_GT(test, f->count, sent);
+	KUNIT_EXPECT_GT(test, f->s.spare_count, spares);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->s.deferred));
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+
+	/* The gate lets requests in again. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, false), 0);
+	mutex_unlock(lock);
+}
+
+/* A program survives a sleep: the same handle executes afterwards. */
+static void program_sleep_keeps_program_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int loads;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	loads = f->programs_live;
+	ane_h16_session_sleep(&f->s, true);
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_EQ(test, f->programs_live, loads);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	/* Same program on the engine: the direct path, no requeue. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
+/*
+ * A cold restart across system sleep: a program from before is lost
+ * (EXECUTE refuses it with no firmware traffic, close only releases its
+ * memory) and a new program loads into the spares it gave back, its first
+ * EXECUTE queued.
+ */
+static void program_sleep_restart_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int maps, sent;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	maps = f->maps;
+
+	ane_h16_session_sleep(&f->s, true);
+	ane_h16_session_restart(&f->s);
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_FALSE(test, f->s.asleep);
+	KUNIT_EXPECT_TRUE(test, ane_h16_program_lost(&f->s, p));
+	KUNIT_EXPECT_PTR_EQ(test, f->s.program, NULL);
+
+	sent = f->count;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_TRUE(test, p->released);
+	KUNIT_EXPECT_GT(test, f->s.spare_count, 0U);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	ane_h16_session_put(&f->s, p);
+
+	/* The gate lets requests in again; the new program reuses memory. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, false), 0);
+	mutex_unlock(lock);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &q), 0);
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_FALSE(test, ane_h16_program_lost(&f->s, q));
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, q), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, q), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
+ * A close deferred while the engine is powered off for a cold cycle runs
+ * at the reopen as a release only: the new firmware never knew the program.
+ */
+static void program_sleep_restart_deferred_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int sent, spares;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+
+	ane_h16_session_sleep(&f->s, true);
+	sent = f->count;
+	spares = f->s.spare_count;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EINPROGRESS);
+	ane_h16_session_restart(&f->s);
+	/* The reopen releases and frees it, with no TERMINATE or UNLOAD. */
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_GT(test, f->s.spare_count, spares);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->s.deferred));
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
+ * A cold cycle with replay is invisible to the application: the same handle
+ * runs after it, on new firmware IDs, the firmware got the identical program
+ * image (LOAD bytes, regions rewritten from the HWX) and the EXECUTE carries
+ * the identical buffer table, so the outputs are the same.
+ */
+static void program_sleep_replay_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	u8 *load = kunit_kzalloc(test, ANE_H16_LOAD_SIZE, GFP_KERNEL);
+	u8 *exec = kunit_kzalloc(test, sizeof(f->exec), GFP_KERNEL);
+	unsigned int replayed, i;
+	size_t exec_length;
+	u32 program, process;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	KUNIT_ASSERT_NOT_NULL(test, load);
+	KUNIT_ASSERT_NOT_NULL(test, exec);
+	mutex_init(lock);
+	f->s.lock = lock;
+	f->strict = true;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	memcpy(load, f->load, ANE_H16_LOAD_SIZE);
+	memcpy(exec, f->exec, sizeof(f->exec));
+	exec_length = f->exec_length;
+	program = p->key.program;
+	process = p->key.process;
+	/* The engine wrote into the program's memory while it ran. */
+	for (i = 0; i < p->plan.count; i++)
+		memset(p->regions[i].cpu, 0xa5, p->regions[i].size);
+
+	ane_h16_session_sleep(&f->s, true);
+	fw_cold_boot(f);
+	ane_h16_session_restart(&f->s);
+	KUNIT_EXPECT_TRUE(test, ane_h16_program_lost(&f->s, p));
+	KUNIT_ASSERT_EQ(test, ane_h16_session_replay(&f->s, &replayed, &first), 0);
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_EQ(test, replayed, 1U);
+	KUNIT_EXPECT_FALSE(test, ane_h16_program_lost(&f->s, p));
+	KUNIT_EXPECT_EQ(test, p->key.program, program + 0x10);
+	KUNIT_EXPECT_EQ(test, p->key.process, process + 0x10);
+	KUNIT_EXPECT_EQ(test, memcmp(f->load + 8, load + 8, ANE_H16_LOAD_SIZE - 8), 0);
+	for (i = 0; i < p->plan.count; i++) {
+		const struct ane_h16_hwx_region *r = &p->plan.regions[i];
+
+		KUNIT_EXPECT_EQ(test, memcmp(p->regions[i].cpu,
+					     (const u8 *)p->snapshot.bytes + r->file_offset,
+					     r->file_size), 0);
+		KUNIT_EXPECT_FALSE(test, memchr_inv((u8 *)p->regions[i].cpu + r->file_size, 0,
+						    p->regions[i].size - r->file_size));
+	}
+
+	/* The same handle runs on the new firmware IDs, queued first. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 8), program + 0x10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0xc), process + 0x10);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, f->exec_length, exec_length);
+	KUNIT_EXPECT_EQ(test, memcmp(f->exec + 0x34, exec + 0x34, exec_length - 0x34), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	ane_h16_session_put(&f->s, p);
+}
+
+/* Requests during the cycle wait at the gate; O_NONBLOCK gets -EAGAIN. */
+static void program_sleep_nonblock_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	ane_h16_session_sleep(&f->s, true);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_enter(&f->s, true), -EAGAIN);
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, true), 0);
+	mutex_unlock(lock);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s, false), 0);
+	mutex_unlock(lock);
+}
+
+/* A replay the new firmware refuses is reported loudly and quarantines. */
+static void program_sleep_replay_failure_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int replayed;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	ane_h16_session_sleep(&f->s, true);
+	fw_cold_boot(f);
+	f->mode = FW_LOAD_NAK;
+	ane_h16_session_restart(&f->s);
+	KUNIT_EXPECT_NE(test, ane_h16_session_replay(&f->s, &replayed, &first), 0);
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_EQ(test, replayed, 0U);
+	KUNIT_EXPECT_EQ(test, f->replay_failed, 1U);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_TRUE(test, ane_h16_program_lost(&f->s, p));
+}
+
+/* A program closed while asleep is not replayed, only released. */
+static void program_sleep_replay_deferred_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int replayed, sent;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	ane_h16_session_sleep(&f->s, true);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EINPROGRESS);
+	fw_cold_boot(f);
+	ane_h16_session_restart(&f->s);
+	sent = f->count;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_replay(&f->s, &replayed, &first), 0);
+	KUNIT_EXPECT_EQ(test, replayed, 0U);
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->s.programs));
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_sleep_replay_test),
+	KUNIT_CASE(program_sleep_nonblock_test),
+	KUNIT_CASE(program_sleep_replay_failure_test),
+	KUNIT_CASE(program_sleep_replay_deferred_test),
+	KUNIT_CASE(program_sleep_gate_test),
+	KUNIT_CASE(program_sleep_keeps_program_test),
+	KUNIT_CASE(program_sleep_restart_test),
+	KUNIT_CASE(program_sleep_restart_deferred_test),
+	KUNIT_CASE(program_cycle_test),
+	KUNIT_CASE(program_h17_cycle_test),
+	KUNIT_CASE(program_failed_close_keeps_test),
+	KUNIT_CASE(program_busy_test),
+	KUNIT_CASE(program_cached_sync_test),
 	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),

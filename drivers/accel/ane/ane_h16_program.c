@@ -2,7 +2,9 @@
 /* H16 program lifecycle on the shared firmware transport. */
 #include <linux/ctype.h>
 #include <linux/math64.h>
+#include <linux/freezer.h>
 #include <linux/module.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 
 #include "ane_h16_program.h"
@@ -482,6 +484,10 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	s->ctx = ctx;
 	s->timeout_ns = timeout_ns;
 	s->dsid = ANE_H16_MCACHE_DSID;
+	s->settle_ns = ANE_H16_SETTLE_QUIET_NS;
+	init_waitqueue_head(&s->wake);
+	INIT_LIST_HEAD(&s->deferred);
+	INIT_LIST_HEAD(&s->programs);
 	spin_lock_init(&s->stats_lock);
 	return 0;
 }
@@ -543,10 +549,74 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 	return 0;
 }
 
+static void h16_sync(struct ane_h16_session *s, const struct ane_fw_surface *surface,
+		     bool for_device)
+{
+	if (s->ops->sync && surface->handle)
+		s->ops->sync(s->ctx, surface, for_device);
+}
+
+/*
+ * Around each EXECUTE: inputs and the poisoned outputs reach memory before
+ * the doorbell (for_device), and the outputs are read fresh after the
+ * completion report (!for_device). Caller holds the node lock.
+ */
+void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,
+			  bool for_device)
+{
+	unsigned int i;
+
+	for (i = 0; i < p->resource_count; i++)
+		if (for_device || p->resources[i].permissions == 2)
+			h16_sync(s, p->surfaces[i], for_device);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_sync);
+
+static bool h16_take_spare(struct ane_h16_session *s, size_t size, bool write,
+			   struct ane_fw_surface *out)
+{
+	unsigned int i;
+
+	for (i = 0; i < s->spare_count; i++) {
+		if (s->spares[i].surface.size != size || s->spares[i].write != write)
+			continue;
+		*out = s->spares[i].surface;
+		s->spares[i] = s->spares[--s->spare_count];
+		/* Zeroed like new memory; LOAD writes it back after filling it. */
+		memset(out->cpu, 0, size);
+		return true;
+	}
+	return false;
+}
+
+static void h16_give_spare(struct ane_h16_session *s, struct ane_fw_surface *surface,
+			   bool write)
+{
+	/* A full table keeps the surface mapped and unused until reset. */
+	if (surface->cpu && s->spare_count < ANE_H16_SPARES)
+		s->spares[s->spare_count++] = (struct ane_h16_spare) {
+			.surface = *surface,
+			.write = write,
+		};
+	memset(surface, 0, sizeof(*surface));
+}
+
+static void h16_give_back(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < p->plan.count; i++)
+		h16_give_spare(s, &p->regions[i], p->plan.regions[i].permissions & 2);
+	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
+		h16_give_spare(s, &p->aux[i], false);
+	memset(p->surfaces, 0, sizeof(p->surfaces));
+	p->released = true;
+}
+
 static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 		   struct ane_fw_surface *out)
 {
-	int ret = s->ops->map(s->ctx, size, write, out);
+	int ret = h16_take_spare(s, size, write, out) ? 0 : s->ops->map(s->ctx, size, write, out);
 
 	if (ret)
 		return ret;
@@ -586,6 +656,8 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			return ret;
 		memcpy(p->regions[i].cpu, (const u8 *)p->snapshot.bytes + r->file_offset,
 		       r->file_size);
+		/* Weights, text and the zeroed scratch reach memory before LOAD. */
+		h16_sync(s, &p->regions[i], true);
 		layout->regions[i] = (struct ane_h16_load_mapping) {
 			.dva = p->regions[i].dva,
 			.size = p->regions[i].size,
@@ -598,6 +670,7 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 		if (ret)
 			return ret;
 		memcpy(p->aux[i].cpu, aux[i], aux_size[i]);
+		h16_sync(s, &p->aux[i], true);
 		layout->aux_dva[i] = p->aux[i].dva;
 		layout->aux_size[i] = aux_size[i];
 	}
@@ -716,6 +789,9 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	 * is never freed.
 	 */
 	p->generation = ++s->generation;
+	p->epoch = s->epoch;
+	INIT_LIST_HEAD(&p->deferred);
+	INIT_LIST_HEAD(&p->node);
 	memset(snapshot, 0, sizeof(*snapshot));
 	p->session = s;
 	s->program = p;
@@ -747,6 +823,7 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	/* Each validated program has exactly one procedure. */
 	p->key.procedure = 0;
 	p->created = true;
+	list_add_tail(&p->node, &s->programs);
 	s->ops->log(s->ctx, "CREATE process", p->key.program, p->key.process);
 	*program = p;
 out:
@@ -819,6 +896,13 @@ static unsigned int h16_dump_fwlog(struct ane_h16_session *s)
 	s->ops->log(s->ctx, "fwlog records printed", lines, log->dva);
 	return lines;
 }
+
+/* The firmware text log, for a backend diagnosing a command it sent. */
+unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s)
+{
+	return h16_dump_fwlog(s);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_dump_fwlog);
 
 /* Non-zero 16-byte rows of a command or reply, as two little-endian words. */
 static void h16_dump_rows(const char *what, const u8 *p, size_t length)
@@ -938,7 +1022,7 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
  * barrier before the caller reads outputs. Any uncertain outcome quarantines
  * the session and keeps every mapping.
  */
-int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
 	struct ane_h16_pending request = {};
@@ -1093,6 +1177,30 @@ fail:
 	kfree(command);
 	return h16_fail(s, ret);
 }
+
+/* Loaded before the firmware was booted again across system sleep. */
+bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p)
+{
+	return p->epoch != s->epoch;
+}
+EXPORT_SYMBOL_GPL(ane_h16_program_lost);
+
+int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	int ret;
+
+	if (!s || !p || p->session != s)
+		return -EINVAL;
+	/* The firmware that knew it is gone: no firmware traffic, reload. */
+	if (ane_h16_program_lost(s, p))
+		return -ENODEV;
+	if (s->ops->busy)
+		s->ops->busy(s->ctx, true);
+	ret = h16_execute(s, p);
+	if (s->ops->busy)
+		s->ops->busy(s->ctx, false);
+	return ret;
+}
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);
 
 const char *const ane_h16_exec_phase_names[ANE_H16_T_PHASES] = {
@@ -1166,6 +1274,47 @@ void ane_h16_session_stats(struct ane_h16_session *s, struct ane_h16_exec_stats 
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_stats);
 
+static void h16_us(struct seq_file *m, u64 ns)
+{
+	seq_printf(m, " %9llu.%u", div_u64(ns, 1000), (unsigned int)(div_u64(ns, 100) % 10));
+}
+
+/*
+ * Where the time of the successful EXECUTEs since the last reset went, per
+ * phase in microseconds (last, mean, min, max), and the poll sleeps per
+ * request. Backends expose it as <debugfs>/ane-h1x/<dev>/execute.
+ */
+int ane_h16_session_stats_show(struct seq_file *m, struct ane_h16_session *s)
+{
+	struct ane_h16_exec_stats *st;
+	unsigned int i;
+
+	st = kmalloc_obj(*st);
+	if (!st)
+		return -ENOMEM;
+	ane_h16_session_stats(s, st, false);
+	seq_printf(m, "executes %llu\n", st->count);
+	if (st->count) {
+		seq_printf(m, "%-12s %11s %11s %11s %11s\n", "phase", "last_us", "mean_us",
+			   "min_us", "max_us");
+		for (i = 0; i < ANE_H16_T_PHASES; i++) {
+			seq_printf(m, "%-12s", ane_h16_exec_phase_names[i]);
+			h16_us(m, st->last.ns[i]);
+			h16_us(m, div64_u64(st->sum.ns[i], st->count));
+			h16_us(m, st->min.ns[i]);
+			h16_us(m, st->max.ns[i]);
+			seq_putc(m, '\n');
+		}
+		seq_printf(m, "%-12s %11llu %9llu.%u %11llu %11llu\n", "polls", st->last.polls,
+			   div64_u64(st->sum.polls, st->count),
+			   (unsigned int)(div64_u64(st->sum.polls * 10, st->count) % 10),
+			   st->min.polls, st->max.polls);
+	}
+	kfree(st);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_stats_show);
+
 /* TERMINATE then UNLOAD. The mappings stay until reset; a new LOAD may follow. */
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 {
@@ -1177,7 +1326,28 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 		return -EINVAL;
 	if (p->closed || !p->created)
 		return 0;
+	/*
+	 * The firmware is suspended for system sleep and keeps this program:
+	 * tear it down when the session reopens. The session owns it until.
+	 */
+	if (s->asleep) {
+		if (list_empty(&p->deferred))
+			list_add_tail(&p->deferred, &s->deferred);
+		return -EINPROGRESS;
+	}
 	p->closed = true;
+	list_del_init(&p->node);
+	/*
+	 * The firmware that knew this program was powered off and booted again
+	 * from the preload: there is nothing to tear down, and nothing reads
+	 * its memory any more.
+	 */
+	if (ane_h16_program_lost(s, p)) {
+		h16_give_back(s, p);
+		s->ops->log(s->ctx, "program lost across sleep, released", p->key.program,
+			    p->key.process);
+		return 0;
+	}
 	if (s->quarantined)
 		return -EIO;
 	ret = ane_h16_terminate_encode(command, ANE_H16_TERMINATE_SIZE, p->key.program,
@@ -1195,9 +1365,182 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 	if (ret)
 		return h16_fail(s, ret);
 	s->ops->log(s->ctx, "TERMINATE and UNLOAD", p->key.program, p->key.process);
+	/* Answer the FREE of the process pool while the firmware waits for it. */
+	ret = ane_fw_transport_settle(s->transport, s->settle_ns,
+				      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
+	if (ret < 0)
+		return h16_fail(s, ret);
+	/*
+	 * The firmware acknowledged TERMINATE and UNLOAD, so it no longer
+	 * reads or writes this program's memory: later programs may reuse it.
+	 */
+	h16_give_back(s, p);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_close);
+
+/*
+ * Requests (LOAD, EXECUTE) wait here while the engine is cycled across
+ * system sleep, freezably so the freezer can stop their task, and enter with
+ * the session's serializing lock held.
+ */
+int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock)
+{
+	int ret;
+
+	for (;;) {
+		/* O_NONBLOCK: a clean -EAGAIN while the engine is cycled. */
+		if (nonblock && READ_ONCE(s->asleep))
+			return -EAGAIN;
+		ret = wait_event_freezable(s->wake, !READ_ONCE(s->asleep));
+		if (ret)
+			return ret;
+		mutex_lock(s->lock);
+		if (!s->asleep)
+			return 0;
+		mutex_unlock(s->lock);
+	}
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_enter);
+
+/*
+ * Close the session to new requests and wait for the one in flight
+ * (asleep), or reopen it. The caller cycles the firmware in between.
+ */
+void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep)
+{
+	struct ane_h16_program *p, *n;
+
+	mutex_lock(s->lock);
+	WRITE_ONCE(s->asleep, asleep);
+	/* Closes that came in while asleep, now that the firmware is back. */
+	if (!asleep) {
+		list_for_each_entry_safe(p, n, &s->deferred, deferred) {
+			list_del_init(&p->deferred);
+			if (!ane_h16_session_close(s, p))
+				ane_h16_session_put(s, p);
+		}
+	}
+	mutex_unlock(s->lock);
+	if (!asleep)
+		wake_up_all(&s->wake);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_sleep);
+
+/*
+ * The firmware was booted again from the preload (system sleep without
+ * firmware cooperation): every program loaded before is lost (EXECUTE
+ * refuses it with -ENODEV, close only releases its memory), no request is
+ * pending, and the next program starts a new BAR context. Called with the
+ * session asleep, before it reopens.
+ */
+void ane_h16_session_restart(struct ane_h16_session *s)
+{
+	s->epoch++;
+	s->program = NULL;
+	s->executed = 0;
+	memset(s->pending.slots, 0, sizeof(s->pending.slots));
+	s->pending.error = 0;
+	s->error = 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_restart);
+
+/*
+ * Put one program back on a firmware booted again from the preload, behind
+ * its existing handle: its regions are rewritten from the HWX snapshot as at
+ * its first LOAD (the aux sections and every mapping kept their DVAs), then
+ * LOAD and CREATE are sent again and the firmware's new program and process
+ * IDs replace the old ones. The firmware sees exactly the image it saw at
+ * the first LOAD, so the program computes the same outputs.
+ */
+static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	u8 *command;
+	const u8 *reply;
+	unsigned int i;
+	int ret;
+
+	ret = h16_pool_room(s, h16_load_sequence, 2);
+	if (ret)
+		return ret;
+	command = kzalloc(ANE_H16_CREATE_SIZE, GFP_KERNEL);
+	if (!command)
+		return -ENOMEM;
+	for (i = 0; i < p->plan.count; i++) {
+		const struct ane_h16_hwx_region *r = &p->plan.regions[i];
+
+		memset(p->regions[i].cpu, 0, p->regions[i].size);
+		memcpy(p->regions[i].cpu, (const u8 *)p->snapshot.bytes + r->file_offset,
+		       r->file_size);
+		h16_sync(s, &p->regions[i], true);
+	}
+	ret = ane_h16_load_encode(command, ANE_H16_LOAD_SIZE, p->slots);
+	if (!ret)
+		ret = h16_send(s, ANE_FW_IO, command, ANE_H16_LOAD_SIZE, &reply);
+	if (!ret)
+		ret = ane_h16_load_reply(reply, ANE_H16_LOAD_SIZE, command, &p->key.program);
+	if (!ret) {
+		memset(command, 0, ANE_H16_CREATE_SIZE);
+		ret = ane_h16_create_encode(command, ANE_H16_CREATE_SIZE, p->key.program);
+	}
+	if (!ret)
+		ret = h16_send(s, ANE_FW_IO, command, ANE_H16_CREATE_SIZE, &reply);
+	if (!ret)
+		ret = ane_h16_create_reply(reply, ANE_H16_CREATE_SIZE, p->key.program,
+					   &p->key.process);
+	kfree(command);
+	if (ret)
+		return h16_fail(s, ret);
+	p->epoch = s->epoch;
+	s->ops->log(s->ctx, "program replayed", p->key.program, p->key.process);
+	return 0;
+}
+
+/*
+ * After ane_h16_session_restart(): replay every program that was loaded and
+ * not closed, in load order, so that its handle runs again unchanged. A
+ * program closed while asleep is only released (it stays lost). A failed
+ * replay is a bug: it is logged loudly, quarantines the session (the
+ * firmware state is uncertain) and returns the error.
+ */
+int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
+			   u64 *first_ns)
+{
+	struct ane_h16_program *p;
+	int ret;
+
+	*replayed = 0;
+	*first_ns = 0;
+	list_for_each_entry(p, &s->programs, node) {
+		if (!list_empty(&p->deferred))
+			continue;
+		ret = h16_replay(s, p);
+		if (ret) {
+			s->ops->log(s->ctx, "PROGRAM REPLAY FAILED", p->key.program, (u64)-ret);
+			return ret;
+		}
+		if (!(*replayed)++)
+			*first_ns = h16_now(s);
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_replay);
+
+/*
+ * The caller's last reference: free a closed program and its HWX snapshot.
+ * A program whose teardown failed keeps everything until reset.
+ */
+void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	if (!s || !p || p->session != s || !p->released)
+		return;
+	if (s->program == p)
+		s->program = NULL;
+	list_del_init(&p->node);
+	ane_h16_hwx_snapshot_destroy(&p->snapshot);
+	kfree(p);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_put);
 
 MODULE_DESCRIPTION("H16 program load, execute and teardown on the shared transport");
 MODULE_LICENSE("Dual MIT/GPL");

@@ -9,6 +9,7 @@
  */
 #include <linux/delay.h>
 #include <linux/log2.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
@@ -54,6 +55,7 @@ static const u32 ave_coded_fmts[] = {
 
 static const u32 ave_raw_fmts[] = {
 	V4L2_PIX_FMT_NV12,
+	V4L2_PIX_FMT_P010,
 };
 
 static const struct v4l2_event ave_eos_event = {
@@ -87,17 +89,22 @@ static void ave_clamp_size(u32 coded, u32 *w, u32 *h)
 }
 
 /*
- * Raw NV12, one buffer: Y plane, then interleaved CbCr at half height.
- * @coded is the context's coded format, which limits the size.
+ * Raw NV12 or P010, one buffer: Y plane, then interleaved CbCr at half
+ * height. P010 holds 10-bit samples in the high bits of 16-bit words; it
+ * is the input for HEVC Main 10. @coded is the context's coded format,
+ * which limits the size.
  */
 static void ave_fill_raw(struct v4l2_pix_format_mplane *f, u32 coded)
 {
-	u32 stride, height;
+	u32 stride, height, bytes;
 
-	f->pixelformat = V4L2_PIX_FMT_NV12;
+	if (f->pixelformat != V4L2_PIX_FMT_P010 || coded != V4L2_PIX_FMT_HEVC)
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+	bytes = f->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
 	ave_clamp_size(coded, &f->width, &f->height);
 	/* Keep a client's stride, within reason, rounded to 64 bytes. */
-	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width, 2 * AVE_MAX_W),
+	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width * bytes,
+			       2 * AVE_MAX_W * bytes),
 		       AVE_STRIDE_ALIGN);
 	height = ALIGN(f->height, AVE_STEP);
 	f->num_planes = 1;
@@ -449,8 +456,10 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
 		ctx->hevc_max_qp = ctrl->val;
 		break;
-	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
+		ctx->hevc_profile = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
 	default:
@@ -510,8 +519,11 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 0, 51, 1, 51);
 
+	/* Main 10 takes P010 input; the profile is checked against it at STREAMON. */
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, 0,
+			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+			       ~(BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) |
+				 BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)),
 			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1, 0,
@@ -933,11 +945,12 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 /*
  * Jobs. A job delivers finished frames to CAPTURE buffers and sends at most
  * one new frame. Up to five frames are inside the firmware at once; their
- * answers are collected by the job and, while frames are outstanding, by a
- * short poller, since the firmware interrupt is not wired up.
+ * answers are collected by the job and, between jobs, by the poll work, which
+ * the mailbox interrupt queues. While frames are outstanding the poll work
+ * also runs every AVE_WATCH_MS to catch a stuck or starved session.
  */
 
-#define AVE_POLL_MS		2
+#define AVE_WATCH_MS		25
 
 static int ave_job_ready(void *priv)
 {
@@ -1193,14 +1206,17 @@ static void ave_run_work(struct work_struct *work)
 		ctx->stopped = true;
 		v4l2_event_queue_fh(&ctx->fh, &ave_eos_event);
 	} else if (poll) {
-		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
+		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_WATCH_MS));
 	}
 finish:
 	pm_runtime_mark_last_busy(ave->dev);
 	v4l2_m2m_job_finish(ave->m2m_dev, m2m);
 }
 
-/* Collect frame answers while frames are outstanding and no job runs. */
+/*
+ * Collect frame answers that came in while no job ran, and watch sessions
+ * with frames outstanding.
+ */
 static void ave_poll_work(struct work_struct *work)
 {
 	struct ave_ctx *ctx = container_of(to_delayed_work(work), struct ave_ctx, poll_work);
@@ -1244,7 +1260,25 @@ static void ave_poll_work(struct work_struct *work)
 	else if (atomic_read(&ctx->ready))
 		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
 	if (again)
-		queue_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
+		queue_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_WATCH_MS));
+}
+
+/*
+ * The mailbox interrupt came while no ring wait ran: take the event and let
+ * the sessions it may concern deliver. Jobs and poll work run on the same
+ * ordered queue, so none runs right now.
+ */
+static void ave_irq_work(struct work_struct *work)
+{
+	struct ave_dev *ave = container_of(work, struct ave_dev, irq_work);
+
+	mutex_lock(&ave->hw_lock);
+	if (ave->fw_state == AVE_FW_RUNNING)
+		ave_ipc_pump(ave, 0, NULL, NULL);
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i] && atomic_read(&ave->sessions[i]->ready))
+			mod_delayed_work(ave->wq, &ave->sessions[i]->poll_work, 0);
+	mutex_unlock(&ave->hw_lock);
 }
 
 static void ave_device_run(void *priv)
@@ -1335,10 +1369,16 @@ int ave_v4l2_register(struct ave_dev *ave)
 	ave->wq = alloc_ordered_workqueue("apple-ave", WQ_MEM_RECLAIM);
 	if (!ave->wq)
 		return -ENOMEM;
+	INIT_WORK(&ave->irq_work, ave_irq_work);
+	ret = ave_ipc_irq_init(ave, to_platform_device(ave->dev));
+	if (ret) {
+		dev_err_probe(ave->dev, ret, "cannot get the mailbox interrupt\n");
+		goto err_wq;
+	}
 
 	ret = v4l2_device_register(ave->dev, &ave->v4l2_dev);
 	if (ret)
-		goto err_wq;
+		goto err_irq;
 
 	ave->m2m_dev = v4l2_m2m_init(&ave_m2m_ops);
 	if (IS_ERR(ave->m2m_dev)) {
@@ -1365,6 +1405,9 @@ err_m2m:
 	v4l2_m2m_release(ave->m2m_dev);
 err_v4l2:
 	v4l2_device_unregister(&ave->v4l2_dev);
+err_irq:
+	free_irq(ave->irq, ave);
+	cancel_work_sync(&ave->irq_work);
 err_wq:
 	destroy_workqueue(ave->wq);
 	return ret;
@@ -1375,5 +1418,7 @@ void ave_v4l2_unregister(struct ave_dev *ave)
 	video_unregister_device(&ave->vdev);
 	v4l2_m2m_release(ave->m2m_dev);
 	v4l2_device_unregister(&ave->v4l2_dev);
+	free_irq(ave->irq, ave);
+	cancel_work_sync(&ave->irq_work);
 	destroy_workqueue(ave->wq);
 }

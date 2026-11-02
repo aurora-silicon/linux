@@ -3076,12 +3076,25 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
+	struct brcmf_if *ifp;
+	int ifidx;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 
+	/* Stop new packets and drain ndo_start_xmit before taking the bus down.
+	 * The BUS reason prevents completion flow control from waking the queue.
+	 */
+	for (ifidx = 0; bus->drvr && ifidx < BRCMF_MAX_IFS; ifidx++) {
+		ifp = bus->drvr->iflist[ifidx];
+		if (!ifp || !ifp->ndev)
+			continue;
+		brcmf_txflowblock_if(ifp, BRCMF_NETIF_STOP_REASON_BUS, true);
+		netif_tx_disable(ifp->ndev);
+	}
+	brcmf_msgbuf_suspend(bus->drvr);
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
@@ -3093,6 +3106,8 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (!devinfo->mbdata_completed) {
 		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		brcmf_msgbuf_resume(bus->drvr);
+		brcmf_pcie_fwcon_timer(devinfo, true);
 		return -EIO;
 	}
 
@@ -3124,9 +3139,10 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 			goto cleanup;
 		brcmf_dbg(PCIE, "Hot resume, continue....\n");
 		brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
-		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 		brcmf_pcie_intr_enable(devinfo);
 		brcmf_pcie_hostready(devinfo);
+		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		brcmf_msgbuf_resume(bus->drvr);
 		brcmf_pcie_fwcon_timer(devinfo, true);
 		return 0;
 	}
