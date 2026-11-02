@@ -89,6 +89,16 @@ struct ane_fw_backend {
 	/* Serialize stage changes, command publication and retained lifetimes. */
 	struct mutex lock;
 	struct notifier_block pm_notifier;
+	/*
+	 * genpd's own ANE_SYS power transitions, which during system sleep
+	 * happen only in the noirq phase: counted, with the PMGR state read
+	 * back at each, so a wake can say whether the domain really went off.
+	 */
+	struct notifier_block genpd_nb;
+	bool genpd_nb_added;
+	unsigned int sys_offs, sys_ons;
+	u32 sys_off_pmgr, sys_on_pmgr;
+	u64 sys_off_at, sys_off_ns;
 	struct ane_fw_cold_state cold;
 	u64 ranges[ANE_FW_DAPF_RANGES * 2];
 	u64 next_dva;
@@ -524,7 +534,13 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	 * (bits 7:4) reads 0 once genpd has really turned the domain off.
 	 */
 	sys = ane_rd32(b, b->pmgr + 0x290);
-	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep; ANE_SYS %s (%#x)\n",
+	/*
+	 * Here only requested: while other devices of the domain (the ANE
+	 * DARTs) are active, genpd turns it off in the noirq phase of the
+	 * system suspend; the genpd notifier records when it really does.
+	 */
+	dev_info(&b->pdev->dev,
+		 "H17 ANE: powered down for system sleep; ANE_SYS requested off, %s at the put (%#x)\n",
 		 sys & 0xf0 ? "still on" : "off", sys);
 	return 0;
 }
@@ -654,9 +670,15 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 	ret = ane_fw_power_up(b, true, false);
 	if (ret)
 		return ret;
-	dev_info(dev, "H17 ANE: cold cycle finds the engine %s\n",
+	/*
+	 * Whether the engine registers kept their values (DAPF, status 0x62)
+	 * although genpd really turned ANE_SYS off says whether they live in
+	 * an always-on block.
+	 */
+	dev_info(dev, "H17 ANE: cold cycle finds the engine %s after ANE_SYS %s (status %#x, DAPF0 %#x)\n",
 		 ane_fw_cold_engine_valid(&b->cold) ? "at its reset values" :
-		 "retained, stopped by its power state");
+		 "with registers kept", b->sys_offs ? "really went off" : "stayed on",
+		 b->cold.status, ane_rd32(b, b->engine + 0x1810000));
 	if (!ane_fw_cold_engine_restartable(&b->cold))
 		return -EPERM;
 	ret = ane_fw_rvbar_ready(b);
@@ -745,6 +767,12 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	if (b->stage != ANE_STAGE_PROGRAM)
 		return -EBUSY;
 	ane_h16_session_sleep(&b->session, true);
+	b->sys_offs = 0;
+	b->sys_ons = 0;
+	b->sys_off_ns = 0;
+	b->sys_off_at = 0;
+	b->sys_off_pmgr = 0;
+	b->sys_on_pmgr = 0;
 	if (!ane_fw_sleep_warm(b)) {
 		ret = ane_fw_cold_cycle_down(b);
 		if (ret == -EBUSY) {
@@ -770,6 +798,26 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	}
 	b->slept = true;
 	return 0;
+}
+
+/* Called by genpd under its lock, in the noirq phase too: record only. */
+static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, genpd_nb);
+	u64 now = ktime_get_boottime_ns();
+
+	if (action == GENPD_NOTIFY_OFF) {
+		b->sys_offs++;
+		b->sys_off_pmgr = ane_rd32(b, b->pmgr + 0x290);
+		b->sys_off_at = now;
+	} else if (action == GENPD_NOTIFY_ON) {
+		b->sys_ons++;
+		b->sys_on_pmgr = ane_rd32(b, b->pmgr + 0x290);
+		if (b->sys_off_at)
+			b->sys_off_ns += now - b->sys_off_at;
+		b->sys_off_at = 0;
+	}
+	return NOTIFY_OK;
 }
 
 static void ane_fw_sleep_resume(struct ane_fw_backend *b)
@@ -801,6 +849,11 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		b->session.quarantined = true;
 	}
 	ane_h16_session_sleep(&b->session, false);
+	/* genpd's record of the domain across this sleep (boot time, so it counts s2idle). */
+	dev_info(&b->pdev->dev,
+		 "H17 ANE: ANE_SYS while asleep: genpd off %u, on %u, off for %llu ms; PMGR %#x at off, %#x at on\n",
+		 b->sys_offs, b->sys_ons, div_u64(b->sys_off_ns, NSEC_PER_MSEC),
+		 b->sys_off_pmgr, b->sys_on_pmgr);
 	/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
 	ready = b->resume_ready_ns ? div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
 	first = b->resume_first_ns ? div_u64(b->resume_first_ns - start, NSEC_PER_MSEC) : -1;
@@ -1852,6 +1905,12 @@ int ane_fw_staged_bind(struct platform_device *pdev)
 		return ret;
 	}
 	ane_fw_bound_dev = dev;
+	if (handoff) {
+		b->genpd_nb.notifier_call = ane_fw_genpd_event;
+		b->genpd_nb_added = !dev_pm_genpd_add_notifier(dev, &b->genpd_nb);
+		if (!b->genpd_nb_added)
+			dev_info(dev, "H17 ANE: no genpd notifier; ANE_SYS transitions not recorded\n");
+	}
 	dev_info(dev, "H17 ANE: bound; %s\n", handoff ?
 		 "ANE_SYS held until the bring-up owns it" : "no hand-off, engine left off");
 	return 0;
@@ -1866,8 +1925,12 @@ void ane_fw_staged_unbind(struct platform_device *pdev)
 {
 	struct ane_fw_backend *b = ane_backend;
 
-	if (b && b->pdev == pdev)
+	if (b && b->pdev == pdev) {
 		ane_fw_bind_release(b);
+		if (b->genpd_nb_added)
+			dev_pm_genpd_remove_notifier(&pdev->dev);
+		b->genpd_nb_added = false;
+	}
 	ane_fw_bound_dev = NULL;
 }
 
