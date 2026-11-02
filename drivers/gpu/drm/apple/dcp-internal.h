@@ -896,6 +896,21 @@ static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
 	       dcp->hw.fw_14_7_endpoints;
 }
 
+/*
+ * Whether this DCP reads a surface's element geometry as the surface record
+ * defines it: bytes per element (pix_size, a linear plane's tile_size), the
+ * element's width and height in pixels, and compression information only for
+ * a compressed plane. Only firmware 27 (DCP_FIRMWARE_V_27_0, which only
+ * T6050's DCP hw data selects) is tested with it. Earlier firmware keeps the
+ * fixed 1/1/1 and has_compr_info 1 it has run on: before widening this,
+ * check a linear XRGB8888 and an NV12 swap, and the default framebuffer, on
+ * 12.x-26.x firmware.
+ */
+static inline bool dcp_surface_element_geometry(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
 #define DCP_AUDIO_MAX_CHANS 15
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

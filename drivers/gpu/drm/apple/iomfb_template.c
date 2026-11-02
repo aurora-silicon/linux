@@ -636,7 +636,8 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 	{
 		struct dcp_dfb_dimensions_h17p dim;
 		struct dcp_surface *surface = (void *)req->surface;
-		u32 format, allocation;
+		u32 format, allocation, bpe;
+		bool alpha_plane;
 		int ret = -EINVAL;
 
 		memcpy(&dim, in, sizeof(dim));
@@ -653,9 +654,11 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 			return true;
 		}
 
+		apple_dcp_dfb_format(dcp->dfb_format, dcp->dfb_compression,
+				     &format, &bpe, &alpha_plane);
 		surface->is_premultiplied = 1;
 		surface->format = format;
-		surface->pix_size = 1;
+		surface->pix_size = dcp_surface_element_geometry(dcp) ? bpe : 1;
 		surface->pel_w = 1;
 		surface->pel_h = 1;
 		surface->buf_size = allocation;
