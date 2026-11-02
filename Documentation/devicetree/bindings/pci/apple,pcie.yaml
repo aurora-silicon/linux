@@ -98,11 +98,11 @@ properties:
 
   reg:
     minItems: 3
-    maxItems: 11
+    maxItems: 14
 
   reg-names:
     minItems: 3
-    maxItems: 11
+    maxItems: 14
 
   ranges:
     minItems: 2
@@ -128,8 +128,7 @@ properties:
   apple,msi-vector-base:
     $ref: /schemas/types.yaml#/definitions/uint32
     description:
-      First vector of this PCIe-C controller's slice of the MSI window it
-      shares with the internal PCIe controller.
+      First global vector targeted by this controller's local MSI map.
 
   iommu-map: true
   iommu-map-mask: true
@@ -234,6 +233,48 @@ allOf:
         - apple,msi-vector-base
   - $ref: /schemas/pci/pci-host-bridge.yaml#
   - $ref: /schemas/interrupt-controller/msi-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-pcie
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 14
+        reg-names:
+          description:
+            config and rc, then port<n>, phy<n> and intr2axi<n> for each
+            bootloader-trained root port 00:<n>.0.
+          minItems: 5
+          maxItems: 14
+          items:
+            pattern: "^(config|rc|(port|phy|intr2axi)[0-3])$"
+        interrupts:
+          maxItems: 4
+        interrupt-names:
+          items:
+            pattern: "^port[0-3]$"
+        apple,msi-vector-base:
+          const: 64
+        power-domains: false
+      required:
+        - interrupt-names
+        - apple,msi-vector-base
+        - iommu-map
+      patternProperties:
+        "^pci@":
+          properties:
+            reset-gpios: false
+            pwren-gpios: false
+          required:
+            - apple,link-trained-by-bootloader
+    else:
+      patternProperties:
+        "^pci@":
+          properties:
+            apple,link-trained-by-bootloader: false
   - if:
       properties:
         compatible:
@@ -390,10 +431,10 @@ allOf:
               properties:
                 reg:
                   minItems: 5
-                  maxItems: 11
+                  maxItems: 14
                 reg-names:
                   minItems: 5
-                  maxItems: 11
+                  maxItems: 14
                   items:
                     enum: [config, rc, port0, phy0, intr2axi0, port1, phy1,
                            intr2axi1, port2, phy2, intr2axi2, port3, phy3,
@@ -420,6 +461,8 @@ allOf:
                     maxItems: 3
               else:
                 properties:
+                  reg:
+                    maxItems: 10
                   reg-names:
                     minItems: 3
                     items:
