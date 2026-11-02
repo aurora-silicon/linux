@@ -648,8 +648,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1442 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 1443 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>, <&pmc_soc_max>;
-		power-domain-names = "core", "perf";
+		power-domains = <&ps_avd_sys>, <&pmc_soc_max>, <&pmp_report_avd0>;
+		power-domain-names = "core", "perf", "dvfs";
 		resets = <&ps_avd_sys>;
 		iommus = <&avd_dart 0>;
 	};
@@ -1040,6 +1040,17 @@
 			label = "pmp-gfx";
 			#power-domain-cells = <0>;
 			power-domains = <&ps_gfx>;
+		};
+
+		/* AVD0: soc-device record 23, DVFS ordinal 13; state 2 is VMAX. */
+		pmp_report_avd0: report@17 {
+			compatible = "apple,t6041-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0x17>;
+			label = "pmp-avd0";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_avd_sys>;
+			apple,dvfs = <0x1fd 2>;
 		};
 	};
 
