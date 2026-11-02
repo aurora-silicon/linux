@@ -212,6 +212,8 @@ struct apple_nvme_hw {
 	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
 	bool cold_reset;
 	bool apif;
+	/* The ANS is never reset through PMGR here, so no reset is named. */
+	bool reset_optional;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -2405,7 +2407,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
-	anv->reset = anv->hw->apif ?
+	anv->reset = anv->hw->reset_optional ?
 		devm_reset_control_array_get_optional_exclusive(anv->dev) :
 		devm_reset_control_array_get_exclusive(anv->dev);
 	if (IS_ERR(anv->reset)) {
@@ -2764,6 +2766,7 @@ static const struct apple_nvme_hw apple_nvme_apif_hw = {
 	.has_lsq_nvmmu = true,
 	.needs_ioq_registers = true,
 	.apif = true,
+	.reset_optional = true,
 	.max_queue_depth = 64,
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
