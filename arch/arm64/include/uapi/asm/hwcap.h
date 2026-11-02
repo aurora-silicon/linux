@@ -156,4 +156,10 @@
 #define HWCAP3_F16F32MM		(1UL << 10)
 #define HWCAP3_SVE_LUT6		(1UL << 11)
 
+/*
+ * Aurora experimental: Apple IMPLEMENTATION DEFINED features, allocated from
+ * the top of AT_HWCAP3 down to stay clear of the architectural bits.
+ */
+#define HWCAP3_APPLE_PRSV	(1UL << 61)
+
 #endif /* _UAPI__ASM_HWCAP_H */

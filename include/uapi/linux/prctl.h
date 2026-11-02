@@ -442,4 +442,23 @@ struct prctl_mm_map {
 #define PR_AURORA_SET_DEFAULT_PAGE_SIZE 0x41555003
 #define PR_AURORA_GET_DEFAULT_PAGE_SIZE 0x41555004
 
+/*
+ * Aurora experimental ABI: Apple scalar FP upper-lane preservation (PRSV).
+ * With ON, scalar floating-point instructions of the calling thread keep
+ * the elements above the result in the destination vector register, as
+ * x86 SSE scalar instructions do: two-operand arithmetic such as FADD,
+ * FMUL, FDIV, FMAX and FCSEL takes them from the first source, FMADD-style
+ * instructions from the addend, compares from the second source. One-
+ * operand instructions, conversions, FMOV and loads still zero them.
+ * GET returns ON or OFF. Both fail with EINVAL on CPUs without PRSV.
+ * The setting is per thread, inherited by fork and clone, and reset to OFF
+ * by execve.
+ * HWCAP3_APPLE_PRSV in AT_HWCAP3 and "apple_prsv" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_FP_PRESERVE	0x41555009
+#define PR_AURORA_SET_FP_PRESERVE	0x4155500a
+# define PR_AURORA_FP_PRESERVE_OFF	0
+# define PR_AURORA_FP_PRESERVE_ON	1
+
 #endif /* _LINUX_PRCTL_H */

@@ -2445,6 +2445,16 @@ config ARM64_MEMORY_MODEL_CONTROL
 	  for the PR_SET_MEM_MODEL/PR_GET_MEM_MODEL prctl() calls on
 	  CPUs with this feature.
 
+config ARM64_APPLE_FP_PRESERVE
+	bool "Apple scalar FP upper-lane preservation (PRSV)"
+	default y
+	select ARM64_ACTLR_STATE
+	help
+	  Apple CPUs can make scalar floating-point instructions keep the
+	  rest of the destination vector register, as x86 SSE scalar
+	  instructions do. Say Y to let a thread enable this with the
+	  PR_AURORA_SET_FP_PRESERVE prctl().
+
 config RELOCATABLE
 	bool "Build a relocatable kernel image" if EXPERT
 	select ARCH_HAS_RELR

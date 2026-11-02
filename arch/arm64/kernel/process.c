@@ -773,6 +773,39 @@ int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+int apple_fp_preserve_get(void)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		return -EINVAL;
+
+	return read_sysreg(actlr_el1) & ACTLR_APPLE_PRSV ?
+		PR_AURORA_FP_PRESERVE_ON : PR_AURORA_FP_PRESERVE_OFF;
+}
+
+int apple_fp_preserve_set(unsigned long val)
+{
+	u64 actlr;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		return -EINVAL;
+	if (val != PR_AURORA_FP_PRESERVE_ON && val != PR_AURORA_FP_PRESERVE_OFF)
+		return -EINVAL;
+
+	/* The task switch saves the live ACTLR_EL1, so update it atomically */
+	preempt_disable();
+	actlr = read_sysreg(actlr_el1);
+	if (val == PR_AURORA_FP_PRESERVE_ON)
+		actlr |= ACTLR_APPLE_PRSV;
+	else
+		actlr &= ~ACTLR_APPLE_PRSV;
+	write_sysreg(actlr, actlr_el1);
+	current->thread.actlr = actlr;
+	preempt_enable();
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_ARM64_ACTLR_STATE
 /*
  * IMPDEF control register ACTLR_EL1 handling. Some CPUs use this to
@@ -968,6 +1001,10 @@ void arch_setup_new_exec(void)
 	ptrauth_thread_init_user();
 	mte_thread_init_user();
 	do_set_tsc_mode(PR_TSC_ENABLE);
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+	if (alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		apple_fp_preserve_set(PR_AURORA_FP_PRESERVE_OFF);
+#endif
 
 	if (task_spec_ssb_noexec(current)) {
 		arch_prctl_spec_ctrl_set(current, PR_SPEC_STORE_BYPASS,
