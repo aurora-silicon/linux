@@ -223,7 +223,7 @@ int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_plat
 	int ret;
 
 	/* H17: the staged backend owns the engine; the device binds for it. */
-	if (soc->owner == ANE_FW_OWNER_EXCLAVE)
+	if (ane_fw_platform_staged(soc))
 		return ane_fw_staged_bind(pdev);
 	ret = ane_fw_platform_preflight(pdev, soc);
 
