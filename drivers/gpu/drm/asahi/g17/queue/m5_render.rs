@@ -100,21 +100,35 @@ fn memory_bytes() -> Result<u64> {
         .ok_or(EOVERFLOW)
 }
 
-/// `result`, naming the step of a pass's publication that refused it: the command fails with
-/// only its errno.
+/// `result`'s value, or a return of its error naming the step of a pass's publication that
+/// refused it: the command fails with only its errno. It takes the `?` itself, matching the
+/// result where it was built: through `inspect_err` every step's value (the pass's command
+/// inputs among them, over a kilobyte) was copied in and out again on the ioctl's stack.
 macro_rules! at {
     ($name:literal, $result:expr) => {
-        $result
-            .inspect_err(|error| pr_warn!("G17 M5: render pass {} refused: {:?}\n", $name, error))
+        match $result {
+            Ok(value) => value,
+            Err(error) => {
+                pr_warn!("G17 M5: render pass {} refused: {:?}\n", $name, error);
+                return Err(::core::convert::From::from(error));
+            }
+        }
     };
 }
 
-/// `result`, naming `step` of a pair's construction when it failed: construction has many
-/// steps that refuse the same way. A macro, as [`at!`] is: a function took each step's value
-/// by value, the parameter buffer's manager among them, and copied it through its own frame.
+/// `result`'s value, or a return of its error naming `step` of a pair's construction that
+/// refused it: construction has many steps that refuse the same way. As [`at!`], it takes the
+/// `?` itself, so no step's value (the parameter buffer's manager among them) is copied
+/// through an adapter.
 macro_rules! step {
     ($name:literal, $result:expr) => {
-        $result.inspect_err(|error| pr_err!("G17 M5: render pair {} refused: {:?}\n", $name, error))
+        match $result {
+            Ok(value) => value,
+            Err(error) => {
+                pr_err!("G17 M5: render pair {} refused: {:?}\n", $name, error);
+                return Err(::core::convert::From::from(error));
+            }
+        }
     };
 }
 
@@ -375,14 +389,14 @@ impl Storage {
         let layout = step!(
             "layout",
             target::Layout::new(args.pass, args.clusters, args.programs)
-        )?;
+        );
         let blocks = layout.tvb_blocks;
         let initial = blocks.checked_mul(PB_BLOCK).ok_or(EOVERFLOW)?;
         let minimum = fw::m5::budget::minimum_parameter_pages(args.clusters).ok_or(EINVAL)?;
         let geometry = step!(
             "parameter geometry",
             BlockGeometry::m5(compact.clone(), memory_bytes()?, initial as u64)
-        )?;
+        );
         let layout = step!(
             "target slices",
             layout.with_m5_slices(
@@ -393,19 +407,19 @@ impl Storage {
                 Pair::grown_bytes(geometry)?,
                 compact.clone()
             )
-        )?;
-        let target = step!("target", target::Target::new(dev, vm, &layout))?;
+        );
+        let target = step!("target", target::Target::new(dev, vm, &layout));
         let (tvb, mappings) = step!(
             "parameter blocks",
             buffer::Tvb::with_geometry(dev, vm, blocks, geometry)
-        )?;
+        );
         for mapping in mappings {
             aliases.push(mapping, GFP_KERNEL)?;
         }
         let scratch_bytes = step!(
             "scratch size",
             pool::parameter_scratch_stride(geometry.capacity, 0).map_err(|_| EINVAL)
-        )?
+        )
         .checked_mul(pool::SCENE_TABLE_ENTRIES)
         .ok_or(EOVERFLOW)?;
         let in_compact = |size: usize| {
@@ -419,8 +433,8 @@ impl Storage {
                 cpu,
             )
         };
-        let scratch = step!("scratch", in_compact(scratch_bytes))?;
-        let discard = step!("discard", in_compact(DISCARD_BYTES))?;
+        let scratch = step!("scratch", in_compact(scratch_bytes));
+        let discard = step!("discard", in_compact(DISCARD_BYTES));
         let manager = step!(
             "parameter buffer",
             buffer::Manager::new(
@@ -436,7 +450,7 @@ impl Storage {
                     first_ordinal,
                 },
             )
-        )?;
+        );
         let state = step!(
             "tiling state",
             KernelObject::new(
@@ -447,7 +461,7 @@ impl Storage {
                 prot,
                 cpu
             )
-        )?;
+        );
         let status_fw = step!(
             "status view",
             state.map_range(
@@ -458,7 +472,7 @@ impl Storage {
                 mmu::PROT_FW_SHARED_RW,
                 0,
             )
-        )?;
+        );
         // Boxed: the parameter buffer's manager is large, and a pair is built on the probe's
         // stack by the render qualification (by value, it overflowed that stack).
         Ok(KBox::new(
@@ -514,11 +528,11 @@ impl Pair {
             "pool geometry",
             pool::PoolGeometry::of(args.gpu.render_pool_blocks, args.gpu.block_bytes())
                 .map_err(|_| EINVAL)
-        )?;
+        );
         let pool = step!(
             "pool",
             M5Pool::new(alloc, tiling.qid(), geometry, pool::Engine::Render)
-        )?;
+        );
         let binding = args.binding;
         let (owner, pb, pm_generation, clusters, programs) = (
             binding.owner,
@@ -1419,7 +1433,7 @@ impl Pair {
                 return Err(EAGAIN);
             }
         }
-        let layout = at!("layout", self.layout(draw.pass))?;
+        let layout = at!("layout", self.layout(draw.pass));
         // The caller pre-grows the buffer for the pass under the same hold of the device mutex
         // ([`Self::pregrowth`]): a pass larger than the buffer is never published.
         if layout.tvb_blocks > self.storage.manager.blocks() {
@@ -1435,8 +1449,8 @@ impl Pair {
         let ordinal = self.ordinal;
         let slot = (ordinal as usize) % DEPTH;
         let pair = self.lanes[TILING].qid();
-        let work_slot = at!("work slot", work.render_slot(pair))?;
-        let payload = at!("payload", work.channel_payload(pair, ordinal))?;
+        let work_slot = at!("work slot", work.render_slot(pair));
+        let payload = at!("payload", work.channel_payload(pair, ordinal));
         let qids = self.qids();
         // The pass's storage: target records, tiling state, scene.
         let storage = &mut self.storage;
@@ -1448,8 +1462,8 @@ impl Pair {
             storage
                 .target
                 .ensure_capacity(dev, self.context.vm(), &layout, &owners)
-        )?;
-        let targets = at!("target", storage.target.prepare(ordinal, &layout))?;
+        );
+        let targets = at!("target", storage.target.prepare(ordinal, &layout));
         let extra = storage.target.m5_extra(&layout)?;
         let viewport = fw::render::storage::Viewport::new(draw.pass.width, draw.pass.height)?
             .with_control(VIEWPORT_CONTROL);
@@ -1468,7 +1482,7 @@ impl Pair {
         // SAFETY: The integer-only view is aligned, inside the retained mapping, and the pass's
         // tiling state is unpublished: the previous pass retired.
         unsafe { viewport.apply(&mut *view) };
-        let scene = at!("scene", storage.manager.prepare_scene(ordinal))?;
+        let scene = at!("scene", storage.manager.prepare_scene(ordinal));
         let (pm_scratch, pm_metric) = storage.manager.scene_registers(scene)?;
         let scene_va = storage.manager.scene_va(scene)?;
         let support = self.support.gpu_va();
@@ -1479,10 +1493,10 @@ impl Pair {
             [USAGE + slot * 2 * USAGE_BYTES..USAGE + (slot + 1) * 2 * USAGE_BYTES]
             .fill(0);
         let state = storage.state.gpu_va();
-        let predecessor = at!("object ids", crate::g17::ids::OBJECTS.object())?;
+        let predecessor = at!("object ids", crate::g17::ids::OBJECTS.object());
         let (fragment_ids, ta_ids): (ObjectIds, ObjectIds) =
             crate::g17::ids::OBJECTS.render_pair(predecessor)?;
-        let work_node = at!("work node", work.node_va())?;
+        let work_node = at!("work node", work.node_va());
         let resources = RenderResources {
             context_id: self.context.id().try_into()?,
             context_generation: self.context.generation(),
@@ -1541,8 +1555,8 @@ impl Pair {
                 resources.context_id,
                 resources.context_generation
             )
-        )?;
-        at!("registers", regs::apply_pass(&args, &controls, &mut inputs))?;
+        );
+        at!("registers", regs::apply_pass(&args, &controls, &mut inputs));
         let mut workspace = KBox::<regs::Workspace>::new_uninit(GFP_KERNEL)?;
         // SAFETY: The workspace is integer storage whose all-zero representation is valid.
         let mut workspace = unsafe {
@@ -1566,11 +1580,11 @@ impl Pair {
                 &inputs,
                 &mut workspace
             )
-        )?;
+        );
         at!(
             "bind work slot",
             assembly::bind_work_slot(commands, work_slot)
-        )?;
+        );
         let timestamps = [
             self.lanes[TILING].kick.timestamp(),
             self.lanes[FRAGMENT].kick.timestamp(),
@@ -1578,7 +1592,7 @@ impl Pair {
         at!(
             "completions",
             assembly::link_completions(commands, timestamps, payload, false)
-        )?;
+        );
         // Configurations, kicks and items, still invisible.
         let configs = match bind {
             true => [
@@ -1590,7 +1604,7 @@ impl Pair {
         let dependency = at!(
             "dependency",
             KickDependency::new(qids[TILING], timestamps[TILING]).ok_or(EINVAL)
-        )?;
+        );
         let context = self.context.clone();
         let policy = context.policy();
         let mut targets = [0u32; 2];
@@ -1601,7 +1615,7 @@ impl Pair {
             let (target, gate) = at!(
                 "stage",
                 lane.stage_kick(producer, configs[n], slot, timestamps[n])
-            )?;
+            );
             targets[n] = target;
             // The tiling kick waits on its notification's gate (S's runtime); the fragment does
             // not.
@@ -1661,7 +1675,7 @@ impl Pair {
                 kick.prepare_lower_install()?;
             }
         }
-        at!("submitted kicks", work.add_submitted_kicks(2))?;
+        at!("submitted kicks", work.add_submitted_kicks(2));
         let pool_target = match self
             .pool
             .reserve_submission()
@@ -1681,7 +1695,7 @@ impl Pair {
         at!(
             "claim scene",
             self.storage.manager.claim_scene(ordinal, scene)
-        )?;
+        );
         self.storage.manager.prepare_submission()?.commit();
         if let Some(packet) = &packet {
             packet.mark_published();

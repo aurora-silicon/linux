@@ -85,19 +85,22 @@ impl Attachments {
     }
 }
 
-// Commands stay inline in the submission plan, avoiding an allocation per render pass.
+// Commands stay inline in the submission plan, avoiding an allocation per render pass. The
+// attachment lists and storage declarations in force are the parser's, borrowed until the
+// command is validated: copied into every command, they made each one kilobytes, moved through
+// every frame between the parser and validation on the submit ioctl's stack.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum Payload {
+pub(crate) enum Payload<'p> {
     /// With the render storage declarations in force (`DRM_ASAHI_SET_RENDER_RESOURCES`), if any.
-    Render(uapi::drm_asahi_cmd_render, [Attachments; 2], [RayQueryStage; 2], Option<RenderDeclared>),
+    Render(uapi::drm_asahi_cmd_render, [&'p Attachments; 2], [RayQueryStage; 2], Option<&'p RenderDeclared>),
     /// With the storage declarations in force (`DRM_ASAHI_SET_COMPUTE_RESOURCES`), if any.
-    Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables, Option<m5::compute::Declared>),
+    Compute(uapi::drm_asahi_cmd_compute, &'p Attachments, IntersectionTables, Option<&'p m5::compute::Declared>),
 }
 
-pub(crate) struct Command {
+pub(crate) struct Command<'p> {
     /// Render and compute prefix indices, before this command.
     pub(crate) barriers: [u16; 2],
-    pub(crate) payload: Payload,
+    pub(crate) payload: Payload<'p>,
 }
 
 /// Parser over the single userspace snapshot taken by the submit ioctl.
@@ -109,7 +112,7 @@ pub(crate) struct Parser<'a> {
     /// Whether this submission path takes compute storage declarations (the M5 one).
     resources: bool,
     declared: Option<m5::compute::Declared>,
-    render_declared: Option<RenderDeclared>,
+    render_declared: Option<KBox<RenderDeclared>>,
 }
 
 /// Render programs one SET_RENDER_RESOURCES record declares at most.
@@ -118,30 +121,33 @@ pub(crate) const MAX_RENDER_PROGRAMS: usize = 64;
 /// A render pass's linked-program storage declarations (`DRM_ASAHI_SET_RENDER_RESOURCES`):
 /// every vertex and fragment program of the pass, background and end-of-tile included, planned
 /// together ([`m5::compute::Gpu::plan_render`]).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Zeroable)]
 pub(crate) struct RenderDeclared {
     programs: [uapi::drm_asahi_render_program; MAX_RENDER_PROGRAMS],
     count: usize,
 }
 
 impl RenderDeclared {
-    /// Parses a payload of 40-byte records, which need not be eight-byte aligned. Stages and
-    /// flags are checked by the plan.
-    fn parse(bytes: &[u8]) -> Result<Self> {
+    /// Parses a payload of 40-byte records, which need not be eight-byte aligned, into `slot`:
+    /// the parser's one declaration of a submission, allocated by its first SET_RENDER_RESOURCES
+    /// and replaced in place by later ones (kilobytes, so never built on the submit ioctl's
+    /// stack). A refusal refuses the submission. Stages and flags are checked by the plan.
+    fn parse_into(slot: &mut Option<KBox<Self>>, bytes: &[u8]) -> Result {
         let size = size_of::<uapi::drm_asahi_render_program>();
         let count = bytes.len() / size;
         if bytes.len() % size != 0 || count > MAX_RENDER_PROGRAMS {
             return Err(EINVAL);
         }
-        let mut declared = Self {
-            programs: [uapi::drm_asahi_render_program::default(); MAX_RENDER_PROGRAMS],
-            count,
+        let declared = match slot {
+            Some(declared) => declared,
+            None => slot.insert(KBox::init(pin_init::init_zeroed(), GFP_KERNEL)?),
         };
+        declared.count = count;
         let mut reader = Reader::new(bytes);
         for program in &mut declared.programs[..count] {
             *program = reader.read()?;
         }
-        Ok(declared)
+        Ok(())
     }
 
     pub(crate) fn programs(&self) -> &[uapi::drm_asahi_render_program] {
@@ -161,7 +167,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(crate) fn next(&mut self) -> Result<Option<Command>> {
+    pub(crate) fn next(&mut self) -> Result<Option<Command<'_>>> {
         while !self.bytes.is_empty() {
             let mut reader = Reader::new(self.bytes);
             let header: uapi::drm_asahi_cmd_header = reader.read()?;
@@ -187,18 +193,18 @@ impl<'a> Parser<'a> {
                         no_timestamp_copies(bytes, RENDER_TIMESTAMP_COPIES)?;
                         Payload::Render(
                             payload(&bytes[..bytes.len().min(RENDER_BASE_SIZE)])?,
-                            [self.attachments[0], self.attachments[1]],
+                            [&self.attachments[0], &self.attachments[1]],
                             RayQueryStage::parse_pair(bytes.get(RENDER_BASE_SIZE..).unwrap_or(&[]))?,
-                            self.render_declared,
+                            self.render_declared.as_deref(),
                         )
                     } else {
                         self.counts[1] += 1;
                         no_timestamp_copies(bytes, COMPUTE_TIMESTAMP_COPIES)?;
                         Payload::Compute(
                             payload(&bytes[..bytes.len().min(COMPUTE_BASE_SIZE)])?,
-                            self.attachments[2],
+                            &self.attachments[2],
                             IntersectionTables::parse(bytes.get(COMPUTE_BASE_SIZE..).unwrap_or(&[]))?,
-                            self.declared,
+                            self.declared.as_ref(),
                         )
                     };
                     return Ok(Some(Command { barriers, payload }));
@@ -225,7 +231,7 @@ impl<'a> Parser<'a> {
                     if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2] {
                         return Err(EINVAL);
                     }
-                    self.render_declared = Some(RenderDeclared::parse(bytes)?);
+                    RenderDeclared::parse_into(&mut self.render_declared, bytes)?;
                 }
                 _ => return Err(EINVAL),
             }
@@ -424,7 +430,7 @@ impl Validated {
     }
 }
 
-impl Payload {
+impl Payload<'_> {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
             Self::Render(cmd, _, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
@@ -575,7 +581,7 @@ impl Payload {
                     }
                 }
                 let plan = match m5 {
-                    Some(gpu) => Some(m5_render(&pass, ray_query, gpu, declared)?),
+                    Some(gpu) => Some(m5_render(&pass, ray_query, gpu, *declared)?),
                     None if declared.is_some() => return Err(bad("render declarations")),
                     None => None,
                 };
@@ -585,7 +591,7 @@ impl Payload {
                     plan,
                     pass,
                     ray_query: *ray_query,
-                    attachments: *attachments,
+                    attachments: [*attachments[0], *attachments[1]],
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })
             }
@@ -651,7 +657,7 @@ fn m5_compute(
     intersection: &IntersectionTables,
     scratch: ScratchRequest,
     gpu: &m5::compute::Gpu,
-    declared: Option<m5::compute::Declared>,
+    declared: Option<&m5::compute::Declared>,
 ) -> Result<m5::compute::Resources> {
     if cmd.cdm_ctrl_stream_base & 7 != 0 {
         return Err(EINVAL);
@@ -666,7 +672,7 @@ fn m5_compute(
         kernel::pr_warn_once!("G17 M5: compute feature outside the M5 subset refused\n");
         return Err(EOPNOTSUPP);
     }
-    gpu.plan(declared.ok_or(EINVAL)?)
+    gpu.plan(*declared.ok_or(EINVAL)?)
 }
 
 /// ZLS control bits (Mesa's genxml "ZLS Control"; S `m5_render_submission.rs`). Each aspect has a
@@ -732,7 +738,7 @@ fn m5_render(
     pass: &RenderPass,
     ray_query: &[RayQueryStage; 2],
     gpu: &m5::compute::Gpu,
-    declared: &Option<RenderDeclared>,
+    declared: Option<&RenderDeclared>,
 ) -> Result<m5::compute::RenderPlan> {
     let tile = u32::from(pass.utile_width) * u32::from(pass.utile_height);
     let samples = 1u32 << pass.samples_log2;
@@ -757,7 +763,7 @@ fn m5_render(
         );
         return Err(EOPNOTSUPP);
     }
-    let declared = declared.as_ref().ok_or_else(|| {
+    let declared = declared.ok_or_else(|| {
         pr_warn!("G17 M5: render command refused: no SET_RENDER_RESOURCES\n");
         EINVAL
     })?;

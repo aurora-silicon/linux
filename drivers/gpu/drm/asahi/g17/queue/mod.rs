@@ -125,8 +125,8 @@ impl<B: Backend> Queue<B> {
         context: Arc<Context>,
         backend: Arc<B>,
         frontend: Frontend,
-        slot: admission::QueueSlot,
-    ) -> Result<Self> {
+        admission_slot: admission::QueueSlot,
+    ) -> Result<KBox<Self>> {
         let Frontend {
             fences,
             allocation_failure,
@@ -136,7 +136,9 @@ impl<B: Backend> Queue<B> {
             m5,
         } = frontend;
         let render = Some(Scheduler::new(dev, backend.clone(), Engine::Render)?);
-        Ok(Self {
+        // Built in its allocation: the queue is kilobytes (its validation proof most of it), and
+        // by value it was a stack temporary of the queue-creation ioctl's frames.
+        KBox::init(pin_init::init!(Self {
             dev: dev.into(),
             context,
             backend,
@@ -153,8 +155,8 @@ impl<B: Backend> Queue<B> {
             frontiers: core::array::from_fn(|_| KVec::new()),
             finished: KVec::new(),
             failures: [FailureRecord::new(), FailureRecord::new()],
-            _slot: slot,
-        })
+            _slot: admission_slot,
+        }), GFP_KERNEL)
     }
 
     fn ensure_compute(&mut self, scs_pages: u16) -> Result {
@@ -406,24 +408,36 @@ impl<B: Backend> Queue<B> {
         let base = self.sequence;
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
-        while let Some(command) = parser.next().inspect_err(|error| {
-            if self.m5.is_some() {
-                pr_warn!("G17 M5: submission refused while parsing: {:?}\n", error);
-            }
-        })? {
-            let payload = self.proof.validate(
+        // Each command and its validation are matched where they were built: through
+        // `inspect_err` both were copied in and out again on the ioctl's stack.
+        loop {
+            let command = match parser.next() {
+                Ok(Some(command)) => command,
+                Ok(None) => break,
+                Err(error) => {
+                    if self.m5.is_some() {
+                        pr_warn!("G17 M5: submission refused while parsing: {:?}\n", error);
+                    }
+                    return Err(error);
+                }
+            };
+            let payload = match self.proof.validate(
                 self.context.vm(),
                 self.range.clone(),
                 &self.window,
                 self.variant,
                 self.m5.as_deref(),
                 &command.payload,
-            ).inspect_err(|error| {
-                if self.m5.is_some() {
-                    pr_warn!("G17 M5: submission refused in validation of a {} command: {:?}\n",
-                        if matches!(command.payload, Payload::Render(..)) { "render" } else { "compute" }, error);
+            ) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    if self.m5.is_some() {
+                        pr_warn!("G17 M5: submission refused in validation of a {} command: {:?}\n",
+                            if matches!(command.payload, Payload::Render(..)) { "render" } else { "compute" }, error);
+                    }
+                    return Err(error);
                 }
-            })?;
+            };
             let engine = match &payload {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,

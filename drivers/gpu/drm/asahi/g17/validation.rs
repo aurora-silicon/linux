@@ -120,7 +120,7 @@ impl Proof {
                 .all(|&request| self.requests.covers(request))
     }
 
-    fn record(&mut self, epoch: Option<u64>, requests: Requests) {
+    fn record(&mut self, epoch: Option<u64>, requests: &Requests) {
         // Alternating in-flight buffers must not evict each other's proofs.
         if epoch.is_some() && self.epoch == epoch && !requests.overflow {
             for &request in requests.as_slice() {
@@ -148,13 +148,14 @@ impl Proof {
         window: &UscWindow,
         variant: &crate::g17::fw::Variant,
         m5: Option<&crate::g17::fw::m5::compute::Gpu>,
-        payload: &Payload,
+        payload: &Payload<'_>,
     ) -> Result<Validated> {
-        let requests = RefCell::new(Requests::new());
+        let mut requests = RefCell::new(Requests::new());
         let optimistic = payload.validate(window, variant, m5, &Space::Record(&range, &requests));
-        let requests = requests.into_inner();
+        // Borrowed where it was built: the table is kilobytes.
+        let requests = requests.get_mut();
         if optimistic.is_ok() && !requests.overflow {
-            if self.covers(vm.mapping_validation_epoch(), &requests) {
+            if self.covers(vm.mapping_validation_epoch(), requests) {
                 return optimistic;
             }
             let (covered, epoch) = vm.covers_ranges_batch(requests.as_slice());

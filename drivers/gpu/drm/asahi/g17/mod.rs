@@ -2065,7 +2065,7 @@ impl gpu::Gpu for Gpu {
                 return Err(error);
             }
         };
-        Ok(KBox::new(frontend, GFP_KERNEL)?)
+        Ok(frontend)
     }
 
     fn map_timestamp_buffer(
