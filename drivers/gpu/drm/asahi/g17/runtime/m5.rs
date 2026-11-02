@@ -282,21 +282,6 @@ impl Pair {
     }
 }
 
-impl Queue {
-    /// The firmware's blame of this lane's QID was found guilty: its kicks fail with `error`, the
-    /// oldest guilty unless an earlier recovery spared it, as the render twin does
-    /// ([`Pair::settle_blamed`]). Neo leaves a blamed compute queue to the firmware's
-    /// compute-fault event; M5's restart is the only report a lost dispatch makes (no fault
-    /// event came), so the settlement is explicit (`recovery::Queues::settle_blamed_compute`).
-    pub(super) fn settle_blamed(&mut self, error: Error, deferred: &mut DeferredBatch) -> Result {
-        let Some(packet) = self.oldest_packet() else {
-            return Ok(());
-        };
-        packet.completion.settle_blamed();
-        self.fail(error, Failure::Settled, &mut |event| deferred.push(event))
-    }
-}
-
 impl Registry {
     /// The M5 compute channels, each in its compute entry ([`channels`]).
     pub(super) fn m5_channels(&self) -> impl Iterator<Item = &Queue> {
@@ -626,23 +611,6 @@ impl Registry {
             }
         }
         Ok(())
-    }
-
-    /// The firmware failed a kick of `qid` ([`crate::g17::fw::channels::Event::ComputeFault`]).
-    /// `window` is the raw fault window read as the event was serviced (`regs.rs`
-    /// `m5_fault_registers`: 0xd800, the fault status 0xd8c0 and address 0xd8c8, 0xc078, 0xc008,
-    /// 0xc028), logged for each M5 fault: nothing else says what the GPU faulted on.
-    pub(super) fn m5_fault(&mut self, qid: u8, stamp: u32, window: Result<[u64; 6]>) {
-        for channel in channels_mut(&mut self.compute).filter(|channel| channel.qid() == qid) {
-            pr_warn!(
-                "G17 M5: compute fault on queue {} (stamp {:#x}, {} kicks published): fault window {:x?}\n",
-                qid,
-                stamp,
-                channel.kicks(),
-                window
-            );
-            channel.note_fault(stamp);
-        }
     }
 
     /// Fails `owner`'s render pass with ETIMEDOUT when `packet` is it. Returns whether it was.

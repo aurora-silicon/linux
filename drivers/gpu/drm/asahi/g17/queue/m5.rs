@@ -1357,6 +1357,22 @@ impl Queue {
     pub(crate) fn oldest_packet(&self) -> Option<Arc<Packet>> {
         self.live().next().map(|active| active.packet.clone())
     }
+    /// `Retained::settle_blamed_compute`'s `m5` arm (`runtime::events`): the firmware's blame of
+    /// this lane's QID was found guilty, so its kicks fail with `error`, the oldest guilty unless
+    /// an earlier recovery spared it, as the render twin does (`Pair::settle_blamed`). Neo leaves a
+    /// blamed compute queue to the firmware's compute-fault event; M5's restart is the only report
+    /// a lost dispatch makes (no fault event came), so the settlement is explicit.
+    pub(crate) fn settle_blamed_m5(
+        &mut self,
+        error: Error,
+        defer: &mut impl FnMut(Deferred) -> Result,
+    ) -> Result {
+        let Some(packet) = self.oldest_packet() else {
+            return Ok(());
+        };
+        packet.completion.settle_blamed();
+        self.fail(error, Failure::Settled, defer)
+    }
     /// Room for another kick: installed, healthy, open and below [`DEPTH`].
     pub(crate) fn has_room(&self) -> bool {
         self.installed && !self.quarantined && !self.released && self.active.len < DEPTH

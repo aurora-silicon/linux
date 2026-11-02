@@ -76,15 +76,23 @@ impl event::Queues for Service<'_> {
         self.firmware.queues.acknowledge_compute_exit(cookie);
     }
     fn compute_fault(&mut self, qid: u8, stamp: u32) {
+        let mut lane = None;
         for entry in self.firmware.queues.compute.iter_mut().flatten() {
-            if let Some(mut queue) = entry.queue.as_deref_mut() {
+            entry.with_queue(|queue| {
                 if queue.qid() == qid {
                     queue.note_fault(stamp);
+                    lane = lane.or(queue.is_m5().then(|| queue.kicks()));
                 }
-            }
+            });
         }
         let window = self.firmware.bridge.regs.m5_fault_registers();
-        self.firmware.queues.m5_fault(qid, stamp, window);
+        // The M5 Ultra's lane (none elsewhere) logs the raw fault window (`regs.rs`
+        // `m5_fault_registers`: 0xd800, the fault status 0xd8c0 and address 0xd8c8, 0xc078,
+        // 0xc008, 0xc028): nothing else says what the GPU faulted on.
+        if let Some(kicks) = lane {
+            pr_warn!("G17 M5: compute fault on queue {} (stamp {:#x}, {} kicks published): fault window {:x?}\n",
+                qid, stamp, kicks, window);
+        }
     }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
@@ -193,6 +201,14 @@ pub(super) trait Retained {
     fn settle_cancelled_render(&mut self, _qids: u128, _deferred: &mut DeferredBatch) -> Result {
         Ok(())
     }
+    /// Notes its work in flight and whether it started, at the halted instant
+    /// (`recovery::Queues::halted_progress`). Neo's queues are attributed by the fault sources.
+    fn note_progress(&self, _progress: &mut recovery::Progress) {}
+    /// Holds work the halted instant proved never started (`recovery::Queues::hold_unstarted`).
+    fn hold_unstarted(&mut self, _progress: &recovery::Progress, _listed: u128) {}
+    /// What kind of queue it is, for a recovery record's log line
+    /// (`recovery::Queues::report_record`).
+    fn kind(&self) -> &'static str;
 }
 
 fn render_qids(qids: [u8; 2], spared: Option<bool>) -> u128 {
@@ -209,14 +225,15 @@ impl Retained for crate::g17::queue::render::Pair {
     fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
     fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
     fn spared_render(&self) -> u128 { render_qids(self.qids(), self.oldest_spared()) }
+    fn kind(&self) -> &'static str { "render pair" }
 }
 
 impl Retained for crate::g17::queue::compute::Queue {
-    /// The M5 Ultra's lane settles a guilty blame itself (`Queue::settle_blamed`); Neo's compute
+    /// The M5 Ultra's lane settles a guilty blame itself (`Queue::settle_blamed_m5`); Neo's compute
     /// queues settle through the firmware's compute-fault event.
     fn settle_blamed_compute(&mut self, error: Error, deferred: &mut DeferredBatch) -> Result {
         if self.is_m5() {
-            return self.settle_blamed(error, deferred);
+            return self.settle_blamed_m5(error, &mut |event| deferred.push(event));
         }
         Ok(())
     }
@@ -225,6 +242,15 @@ impl Retained for crate::g17::queue::compute::Queue {
     fn note_interrupted(&self, stamp: u32) -> recovery::Interrupted { self.note_interrupted(stamp) }
     fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
     fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
+    /// The M5 Ultra's lane notes its kicks' start times (`Queue::note_progress` in `queue::m5`).
+    fn note_progress(&self, progress: &mut recovery::Progress) {
+        if self.is_m5() {
+            self.note_progress(progress);
+        }
+    }
+    fn kind(&self) -> &'static str {
+        if self.is_m5() { "compute lane" } else { "compute queue" }
+    }
 }
 
 impl Retained for crate::g17::queue::m5_render::Pair {
@@ -240,6 +266,11 @@ impl Retained for crate::g17::queue::m5_render::Pair {
     fn visit_owners(&self, visit: &mut dyn FnMut(&Arc<VmStatus>)) { self.visit_owners(visit) }
     fn classify(&self, class: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) { self.classify(class) }
     fn spared_render(&self) -> u128 { render_qids(self.qids(), self.oldest_spared()) }
+    fn note_progress(&self, progress: &mut recovery::Progress) { self.note_progress(progress) }
+    fn hold_unstarted(&mut self, progress: &recovery::Progress, listed: u128) {
+        self.hold_unstarted(progress, listed)
+    }
+    fn kind(&self) -> &'static str { "render pair" }
 }
 
 impl super::Registry {
@@ -295,12 +326,7 @@ impl recovery::Queues for Service<'_> {
             return None;
         }
         let mut progress = recovery::Progress::default();
-        for channel in super::m5::channels(&self.firmware.queues.compute) {
-            channel.note_progress(&mut progress);
-        }
-        for pair in &self.firmware.queues.m5_render {
-            pair.note_progress(&mut progress);
-        }
+        self.firmware.queues.visit_retained(&mut |queue| queue.note_progress(&mut progress));
         Some(progress)
     }
     fn hold_unstarted(&mut self, progress: &recovery::Progress, listed: u128) {
@@ -308,9 +334,10 @@ impl recovery::Queues for Service<'_> {
         if self.firmware.variant.submission != crate::g17::fw::variant::Submission::M5HostCommand {
             return;
         }
-        for pair in &mut self.firmware.queues.m5_render {
-            pair.hold_unstarted(progress, listed);
-        }
+        let _ = self.firmware.queues.settle_retained(&mut |queue| {
+            queue.hold_unstarted(progress, listed);
+            Ok(())
+        });
     }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
@@ -371,13 +398,13 @@ impl recovery::Queues for Service<'_> {
             return;
         }
         let qid = ((flags >> 4) & 0x7f) as u8;
-        let lane = super::m5::channels(&self.firmware.queues.compute).any(|channel| channel.qid() == qid);
-        let pair = self.firmware.queues.m5_render.iter().find(|pair| pair.qids().contains(&qid));
-        let kind = match (lane, pair.is_some()) {
-            (true, _) => "compute lane",
-            (false, true) => "render pair",
-            (false, false) => "no M5 queue",
-        };
+        let mut kind = None;
+        self.firmware.queues.visit_retained(&mut |queue| {
+            if kind.is_none() && queue.owns(qid) {
+                kind = Some(queue.kind());
+            }
+        });
+        let kind = kind.unwrap_or("no M5 queue");
         let guilty = match flags & 2 { 0 => "", _ => " guilty" };
         let cancelled = match flags & 4 { 0 => "", _ => " cancelled" };
         let now = crate::g17::qos::clock().0;
