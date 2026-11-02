@@ -995,7 +995,7 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
  * barrier before the caller reads outputs. Any uncertain outcome quarantines
  * the session and keeps every mapping.
  */
-int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
 	struct ane_h16_pending request = {};
@@ -1149,6 +1149,20 @@ fail:
 	s->fwlog_lines = h16_dump_fwlog(s);
 	kfree(command);
 	return h16_fail(s, ret);
+}
+
+int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p)
+{
+	int ret;
+
+	if (!s || !p || p->session != s)
+		return -EINVAL;
+	if (s->ops->busy)
+		s->ops->busy(s->ctx, true);
+	ret = h16_execute(s, p);
+	if (s->ops->busy)
+		s->ops->busy(s->ctx, false);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_execute);
 

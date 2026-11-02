@@ -85,7 +85,13 @@ properties:
     description:
       The power states the engine needs, five on T8103, six on T6000 with
       ANE level control (including PMP report SRAM), eight on
-      T602x, seven on T8112 and one system domain on T8140.
+      T602x, seven on T8112 and one system domain on T8140. T6041 may add
+      a sixth, "perf", a performance floor (such as the SoC rail floor)
+      that the driver holds only while requests are in flight.
+    minItems: 1
+    maxItems: 8
+
+  power-domain-names:
     minItems: 1
     maxItems: 8
 
@@ -277,7 +283,16 @@ allOf:
             - const: aux-4
         power-domains:
           minItems: 5
-          maxItems: 5
+          maxItems: 6
+        power-domain-names:
+          minItems: 5
+          items:
+            - const: sys
+            - const: cpu
+            - const: mpm
+            - const: td
+            - const: base
+            - const: perf
         apple,ane-type:
           const: 0x110
       required:
