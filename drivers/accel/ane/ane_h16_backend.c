@@ -78,6 +78,15 @@ struct ane_h16_device {
 	bool program_ready;
 	/* Firmware suspended and the engine power gated for system sleep. */
 	bool slept;
+	/* genpd's transitions of each of the five domains across a sleep. */
+	struct ane_h16_genpd {
+		struct notifier_block nb;
+		struct ane_h16_device *h;
+		bool added;
+		unsigned int offs, ons;
+		u64 off_at, off_ns;
+	} genpd[5];
+	u64 resume_ready_ns;
 	struct ane_h16_session session;
 	struct work_struct start;
 };
@@ -254,9 +263,40 @@ static int ane_h16_warm_boot(struct ane_h16_device *h)
 	if (ret)
 		return ret;
 	ret = ane_fw_transport_check(&b->transport);
+	h->resume_ready_ns = ktime_get_ns();
 	if (!ret)
 		dev_info(h->dev, "H16 ANE: firmware resumed (warm boot); programs kept\n");
 	return ret;
+}
+
+/* Called by genpd under its lock, in the noirq phase too: record only. */
+static int ane_h16_genpd_event(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct ane_h16_genpd *g = container_of(nb, struct ane_h16_genpd, nb);
+	u64 now = ktime_get_boottime_ns();
+
+	if (action == GENPD_NOTIFY_OFF) {
+		g->offs++;
+		g->off_at = now;
+	} else if (action == GENPD_NOTIFY_ON) {
+		g->ons++;
+		if (g->off_at)
+			g->off_ns += now - g->off_at;
+		g->off_at = 0;
+	}
+	return NOTIFY_OK;
+}
+
+static void ane_h16_genpd_record(struct ane_h16_device *h)
+{
+	char line[160];
+	int n = 0;
+
+	for (unsigned int i = 0; i < h->powered; i++)
+		n += scnprintf(line + n, sizeof(line) - n, "%s%u: off %u, on %u, %llu ms",
+			       i ? "; " : "", i, h->genpd[i].offs, h->genpd[i].ons,
+			       div_u64(h->genpd[i].off_ns, NSEC_PER_MSEC));
+	dev_info(h->dev, "H16 ANE: domains while asleep (genpd): %s\n", line);
 }
 
 static int ane_h16_sleep_prepare(struct ane_h16_device *h)
@@ -264,6 +304,12 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 	int ret;
 
 	guard(mutex)(&ane_h16_lock);
+	for (unsigned int i = 0; i < ARRAY_SIZE(h->genpd); i++) {
+		h->genpd[i].offs = 0;
+		h->genpd[i].ons = 0;
+		h->genpd[i].off_at = 0;
+		h->genpd[i].off_ns = 0;
+	}
 	if (!h->program_ready || h->boot.quarantined)
 		return -EBUSY;
 	ane_h16_session_sleep(&h->session, true);
@@ -283,20 +329,32 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 
 static void ane_h16_sleep_resume(struct ane_h16_device *h)
 {
+	u64 start;
 	int ret;
 
 	guard(mutex)(&ane_h16_lock);
 	if (!h->slept)
 		return;
+	start = ktime_get_ns();
 	ret = ane_h16_warm_boot(h);
 	WRITE_ONCE(h->slept, false);
 	if (ret) {
-		/* Every mapping and backing stays for diagnosis; no cold replay. */
+		/*
+		 * Every mapping and backing stays for diagnosis. No cold
+		 * fallback on H16 yet: its firmware runs from the preload in
+		 * place, so a cold boot needs a pristine DATA copy first.
+		 */
 		ane_h16_quarantine(h, ret);
 		h->boot.quarantined = true;
 		h->session.quarantined = true;
 	}
 	ane_h16_session_sleep(&h->session, false);
+	ane_h16_genpd_record(h);
+	/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
+	dev_info(h->dev, "H16 ANE: resume %s: warm, firmware ready %llu ms, node reopened %llu ms, programs kept\n",
+		 ret ? "FAILED" : "ok",
+		 h->resume_ready_ns > start ? div_u64(h->resume_ready_ns - start, NSEC_PER_MSEC) : 0,
+		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC));
 }
 
 static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
@@ -304,6 +362,12 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
 
+	/* Without the platform's warm path, every sleep is refused as before. */
+	if (!h->boot.soc->sleep_warm) {
+		if (ane_fw_sleep_refused(event, pinned))
+			dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
+		return ane_fw_sleep_event(event, pinned);
+	}
 	if (event == PM_POST_SUSPEND) {
 		ane_h16_sleep_resume(h);
 		return NOTIFY_DONE;
@@ -802,6 +866,9 @@ static void ane_h16_release(struct ane_h16_device *h)
 	while (h->powered) {
 		struct device *pd = h->power[--h->powered];
 
+		if (h->genpd[h->powered].added)
+			dev_pm_genpd_remove_notifier(pd);
+		h->genpd[h->powered].added = false;
 		pm_runtime_put_sync(pd);
 		dev_pm_domain_detach(pd, true);
 	}
@@ -876,6 +943,10 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 			dev_pm_domain_detach(pd, true);
 			return ret;
 		}
+		h->genpd[h->powered].h = h;
+		h->genpd[h->powered].nb.notifier_call = ane_h16_genpd_event;
+		h->genpd[h->powered].added =
+			!dev_pm_genpd_add_notifier(pd, &h->genpd[h->powered].nb);
 		h->power[h->powered++] = pd;
 	}
 	if (perf) {

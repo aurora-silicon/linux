@@ -64,6 +64,11 @@ const struct ane_fw_platform ane_h16_platform = {
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0) | BIT(11),
+	/*
+	 * J616s test build: SUSPEND (0x24) then a warm boot across system
+	 * sleep. macOS sends 0x24 directly on H16 (no Exclave clients).
+	 */
+	.sleep_warm = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 };
