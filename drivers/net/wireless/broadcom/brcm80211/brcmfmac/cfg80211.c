@@ -4401,7 +4401,8 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 		}
 	}
 	cfg->suspended = false;
-	return brcmf_cfg80211_update_country(cfg);
+	brcmf_cfg80211_update_country(cfg);
+	return 0;
 }
 
 static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,

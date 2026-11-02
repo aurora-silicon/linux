@@ -218,7 +218,9 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
  assert(!brcmf_pcie_pm_enter_D3(&device));hint("AU");hint("GB");
  assert(!country_gets && cfg.country_pending);
  assert(!brcmf_pcie_pm_leave_D3(&device));failure=fail;
- assert(brcmf_cfg80211_resume(&wiphy)==(fail?-EIO:0));
+  /* A regulatory error keeps its retry and existing diagnostics; it must
+   * not make cfg80211 shut down every interface from the PM callback. */
+  assert(!brcmf_cfg80211_resume(&wiphy));
  assert(!cfg.suspended && cfg.country_pending==!!fail && country_gets==1);
  if(!fail)assert(!memcmp(applied,"GB",2));cases++;
 }
