@@ -893,6 +893,13 @@ static unsigned int h16_dump_fwlog(struct ane_h16_session *s)
 	return lines;
 }
 
+/* The firmware text log, for a backend diagnosing a command it sent. */
+unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s)
+{
+	return h16_dump_fwlog(s);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_dump_fwlog);
+
 /* Non-zero 16-byte rows of a command or reply, as two little-endian words. */
 static void h16_dump_rows(const char *what, const u8 *p, size_t length)
 {

@@ -307,6 +307,7 @@ int ane_h16_session_execute(struct ane_h16_session *s, struct ane_h16_program *p
 int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p);
 void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_enter(struct ane_h16_session *s);
+unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
 
 void ane_h16_session_sync(struct ane_h16_session *s, struct ane_h16_program *p,

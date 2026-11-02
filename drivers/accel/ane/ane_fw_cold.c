@@ -251,10 +251,29 @@ static int ane_fw_scratch_wait(struct ane_fw_backend *b, unsigned int cell, u32 
 
 static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
 			  void *command, size_t size, u64 deadline);
+static u64 ane_fw_load64(void *ctx, const void *p);
+
+/* Scratch, wrapper status and the IO slot, around the sleep handshake. */
+static void ane_fw_sleep_trace(struct ane_fw_backend *b, const char *when, u8 *slot)
+{
+	void __iomem *scratch = b->engine + b->soc->scratch;
+
+	dev_info(&b->pdev->dev,
+		 "H17 ANE: %s: scratch %#x %#x %#x %#x %#x %#x %#x %#x wrapper %#x\n", when,
+		 ane_rd32(b, scratch), ane_rd32(b, scratch + 4), ane_rd32(b, scratch + 8),
+		 ane_rd32(b, scratch + 12), ane_rd32(b, scratch + 16), ane_rd32(b, scratch + 20),
+		 ane_rd32(b, scratch + 24), ane_rd32(b, scratch + 28),
+		 ane_rd32(b, b->engine + b->soc->wrapper + 0x48));
+	if (slot)
+		dev_info(&b->pdev->dev, "H17 ANE: %s: IO slot %#llx %#llx %#llx, IO head %u\n",
+			 when, ane_fw_load64(b, slot), ane_fw_load64(b, slot + 8),
+			 ane_fw_load64(b, slot + 16), b->transport.head[ANE_FW_IO]);
+}
 
 static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 {
 	u8 command[8] = {};
+	u8 *slot;
 	u32 status;
 	int ret;
 
@@ -268,10 +287,20 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	if (ret < 0)
 		return ret;
 	put_unaligned_le16(ANE_FW_CMD_SUSPEND, command + 4);
+	ane_fw_sleep_trace(b, "before SUSPEND", NULL);
+	slot = ane_fw_transport_slot(&b->transport, ANE_FW_IO);
+	dev_info(&b->pdev->dev, "H17 ANE: SUSPEND %*ph on IO head %u slot %#llx %#llx %#llx\n",
+		 (int)sizeof(command), command, b->transport.head[ANE_FW_IO],
+		 ane_fw_load64(b, slot), ane_fw_load64(b, slot + 8), ane_fw_load64(b, slot + 16));
 	ret = ane_fw_command(b, ANE_FW_IO, command, sizeof(command),
 			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	if (ret)
+	ane_fw_sleep_trace(b, ret ? "SUSPEND failed" : "SUSPEND done", slot);
+	if (ret) {
+		/* What the firmware made of it, if anything. */
+		ane_h16_session_dump_fwlog(&b->session);
 		return ret;
+	}
+	dev_info(&b->pdev->dev, "H17 ANE: SUSPEND reply %*ph\n", (int)sizeof(command), command);
 	if (get_unaligned_le16(command + 6))
 		return -EREMOTEIO;
 	dev_info(&b->pdev->dev, "H17 ANE: SUSPEND acknowledged, wrapper status %#x\n",
