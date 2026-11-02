@@ -1889,9 +1889,92 @@ static void program_sleep_keeps_program_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 }
 
+/*
+ * A cold restart across system sleep: a program from before is lost
+ * (EXECUTE refuses it with no firmware traffic, close only releases its
+ * memory) and a new program loads into the spares it gave back, its first
+ * EXECUTE queued.
+ */
+static void program_sleep_restart_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int maps, sent;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	maps = f->maps;
+
+	ane_h16_session_sleep(&f->s, true);
+	ane_h16_session_restart(&f->s);
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_FALSE(test, f->s.asleep);
+	KUNIT_EXPECT_TRUE(test, ane_h16_program_lost(&f->s, p));
+	KUNIT_EXPECT_PTR_EQ(test, f->s.program, NULL);
+
+	sent = f->count;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -ENODEV);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_TRUE(test, p->released);
+	KUNIT_EXPECT_GT(test, f->s.spare_count, 0U);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	ane_h16_session_put(&f->s, p);
+
+	/* The gate lets requests in again; the new program reuses memory. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_enter(&f->s), 0);
+	mutex_unlock(lock);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &q), 0);
+	KUNIT_EXPECT_EQ(test, f->maps, maps);
+	KUNIT_EXPECT_FALSE(test, ane_h16_program_lost(&f->s, q));
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, q), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, q), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
+ * A close deferred while the engine is powered off for a cold cycle runs
+ * at the reopen as a release only: the new firmware never knew the program.
+ */
+static void program_sleep_restart_deferred_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int sent, spares;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.lock = lock;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+
+	ane_h16_session_sleep(&f->s, true);
+	sent = f->count;
+	spares = f->s.spare_count;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), -EINPROGRESS);
+	ane_h16_session_restart(&f->s);
+	/* The reopen releases and frees it, with no TERMINATE or UNLOAD. */
+	ane_h16_session_sleep(&f->s, false);
+	KUNIT_EXPECT_EQ(test, f->count, sent);
+	KUNIT_EXPECT_GT(test, f->s.spare_count, spares);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->s.deferred));
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
 static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_sleep_gate_test),
 	KUNIT_CASE(program_sleep_keeps_program_test),
+	KUNIT_CASE(program_sleep_restart_test),
+	KUNIT_CASE(program_sleep_restart_deferred_test),
 	KUNIT_CASE(program_cycle_test),
 	KUNIT_CASE(program_h17_cycle_test),
 	KUNIT_CASE(program_failed_close_keeps_test),

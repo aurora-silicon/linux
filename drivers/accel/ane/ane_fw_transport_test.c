@@ -1100,6 +1100,39 @@ static void ane_transport_settle_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->t.error, 0);
 }
 
+/*
+ * A firmware booted again gets the old shared allocations, all retired: its
+ * startup requests of the same tag and size are served from them, zeroed.
+ */
+static void ane_transport_carry_shared_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	struct ane_fw_transport *old;
+	u64 dva;
+	u8 *slot;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_64K, 0x4c4f47);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	dva = f->t.shared[0].dva;
+	memset(f->t.shared[0].cpu, 0x5a, SZ_64K);
+	old = kunit_kmalloc(test, sizeof(*old), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, old);
+	*old = f->t;
+	/* What ane_fw_transport_init() leaves: no shared allocations. */
+	f->t.shared_count = 0;
+	f->t.shared_bytes = 0;
+	ane_fw_transport_carry_shared(&f->t, old);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+	KUNIT_EXPECT_TRUE(test, f->t.shared_retired[0]);
+	ane_test_shared_request(f, 0, SZ_64K, 0x4c4f47);
+	slot = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(slot), dva | 1);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+	KUNIT_EXPECT_FALSE(test, memchr_inv(f->t.shared[0].cpu, 0, SZ_64K));
+}
+
 static void ane_transport_free_refusal_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
@@ -1257,6 +1290,7 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_pool_reuse_native_test),
 	KUNIT_CASE(ane_transport_pool_no_free_test),
 	KUNIT_CASE(ane_transport_settle_test),
+	KUNIT_CASE(ane_transport_carry_shared_test),
 	KUNIT_CASE(ane_transport_free_refusal_test),
 	KUNIT_CASE(ane_transport_table_test),
 	KUNIT_CASE(ane_transport_table_roles_test),

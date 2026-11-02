@@ -63,7 +63,15 @@ struct ane_fw_backend {
 	/* Programs and their ABI 3 node, after the program stage. */
 	struct ane_h16_session session;
 	struct ane_fw_surface pool, ipc, heap;
-	/* Suspended and powered down for system sleep; a warm boot is due. */
+	/*
+	 * For the cold boot after system sleep: the private TEXT/DATA copies,
+	 * the reserved preload they came from (no-map and untouched, since the
+	 * firmware runs from the copies), the digest DATA had, the heap tail.
+	 */
+	struct ane_fw_surface preload[2], heap_tail;
+	u64 preload_phys[2];
+	u8 data_digest[SHA256_DIGEST_SIZE];
+	/* Powered down for system sleep; a (cold or warm) boot is due. */
 	bool slept;
 	struct list_head mappings;
 	/* Serialize stage changes, command publication and retained lifetimes. */
@@ -248,6 +256,17 @@ static int ane_fw_scratch_wait(struct ane_fw_backend *b, unsigned int cell, u32 
  */
 #define ANE_FW_CMD_SUSPEND 0x24
 #define ANE_FW_WARM_BOOT 1
+
+/*
+ * The warm path above is off. On the 26.6.2 H17 firmware the AP-direct
+ * SUSPEND is taken but never completed (C2, C3a and C3b: no completion in
+ * 3 s, idle or after work; the firmware logs a hand-off to its DM bus
+ * manager, which on macOS sits behind the Exclave proxy). Until that is
+ * understood the engine is cycled cold instead: no firmware cooperation,
+ * every program is lost, and the firmware is booted again from the
+ * kernel-held preload after resume (ane_fw_cold_cycle_boot()).
+ */
+static const bool ane_fw_sleep_warm;
 #define ANE_FW_SUSPEND_REPORT_MAX 0x100
 
 static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
@@ -389,6 +408,10 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	return ret;
 }
 
+static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE];
+static int ane_fw_boot(struct ane_fw_backend *b);
+static int ane_fw_startup(struct ane_fw_backend *b);
+
 /* Reverse of the proven power-up: sub-block, PWGATE, CPU, then ANE_SYS. */
 static int ane_fw_power_down(struct ane_fw_backend *b)
 {
@@ -465,17 +488,114 @@ static int ane_fw_warm_boot(struct ane_fw_backend *b)
 	return 0;
 }
 
+/* Copy one preload segment back from its reservation and check its digest. */
+static int ane_fw_reload_segment(struct ane_fw_backend *b, unsigned int i)
+{
+	struct ane_fw_surface *s = &b->preload[i];
+	u8 digest[SHA256_DIGEST_SIZE];
+	void *source;
+
+	if (!s->cpu || !b->preload_phys[i])
+		return -ENODATA;
+	source = memremap(b->preload_phys[i], s->size, MEMREMAP_WB);
+	if (!source)
+		return -ENOMEM;
+	memcpy(s->cpu, source, s->size);
+	memunmap(source);
+	dma_wmb();
+	sha256(s->cpu, s->size, digest);
+	return memcmp(digest, i ? b->data_digest : ane_fw_text_pin, sizeof(digest)) ?
+	       -EKEYREJECTED : 0;
+}
+
+/*
+ * After resume, the cold way: power up from the cold state with the same
+ * checks as at boot (the engine and DARTs must read their reset values),
+ * give SID0 its translation back and the DAPF records, put back pristine
+ * TEXT and DATA and clean heap, pool and IPC, then run the boot handshake
+ * and startup as start-at-boot does. The shared allocations are carried
+ * into the new transport and served again; programs loaded before are lost.
+ * Every wait is bounded (power polls, READY, ANE_FW_TIMEOUT_NS commands).
+ */
+static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
+{
+	struct device *dev = &b->pdev->dev;
+	struct ane_fw_transport *old;
+	u64 start = ktime_get_ns();
+	int ret;
+
+	/* We powered it down ourselves: the cold PMGR state is our evidence. */
+	ret = ane_fw_power_up(b, true, true);
+	if (ret)
+		return ret;
+	iommu_detach_device(b->domain, dev);
+	ret = iommu_attach_device(b->domain, dev);
+	if (ret)
+		return ret;
+	ret = ane_fw_dapf(b);
+	if (ret)
+		return ret;
+	ret = ane_fw_reload_segment(b, 0);
+	if (!ret)
+		ret = ane_fw_reload_segment(b, 1);
+	if (ret)
+		return ret;
+	memset(b->heap.cpu, 0, b->heap.size);
+	if (b->heap_tail.cpu)
+		memset(b->heap_tail.cpu, 0, b->heap_tail.size);
+	memset(b->pool.cpu, 0, b->pool.size);
+	memset(b->ipc.cpu, 0, b->ipc.size);
+	dma_wmb();
+	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
+	if (!old)
+		return -ENOMEM;
+	ret = ane_fw_boot(b);
+	if (!ret)
+		ane_fw_transport_carry_shared(&b->transport, old);
+	kfree(old);
+	if (!ret)
+		ret = ane_fw_startup(b);
+	if (ret)
+		return ret;
+	b->transport.allow_free = true;
+	ane_h16_session_restart(&b->session);
+	dev_info(dev, "H17 ANE: booted again from the preload after system sleep in %llu ms; earlier programs are lost\n",
+		 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC));
+	return 0;
+}
+
+/* The cold way down: nothing in flight, then power off under the firmware. */
+static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
+{
+	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++)
+		if (b->transport.pending[ch].active)
+			return -EBUSY;
+	return ane_fw_power_down(b);
+}
+
 static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 {
 	int ret;
 
 	guard(mutex)(&b->lock);
+	/* A quarantined engine already powered off has nothing to lose. */
+	if (b->stage == ANE_STAGE_QUARANTINED && !b->powered)
+		return 0;
 	if (b->stage != ANE_STAGE_PROGRAM)
 		return -EBUSY;
 	ane_h16_session_sleep(&b->session, true);
-	ret = ane_fw_suspend_firmware(b);
-	if (!ret)
-		ret = ane_fw_power_down(b);
+	if (!ane_fw_sleep_warm) {
+		ret = ane_fw_cold_cycle_down(b);
+		if (ret == -EBUSY) {
+			/* Nothing was written: refuse this sleep and keep running. */
+			ane_h16_session_sleep(&b->session, false);
+			return ret;
+		}
+	} else {
+		ret = ane_fw_suspend_firmware(b);
+		if (!ret)
+			ret = ane_fw_power_down(b);
+	}
 	if (ret) {
 		/*
 		 * Powered, maybe suspended: the firmware state is uncertain.
@@ -499,9 +619,9 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	if (!b->slept)
 		return;
 	b->slept = false;
-	ret = ane_fw_warm_boot(b);
+	ret = ane_fw_sleep_warm ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b);
 	if (ret) {
-		/* Every mapping and backing stays for diagnosis; no cold replay. */
+		/* Every mapping and backing stays for diagnosis. */
 		ane_fw_quarantine(b, ret);
 		b->session.quarantined = true;
 	}
@@ -878,8 +998,11 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 			sha256(source, size[i], data_pin);
 		ret = ane_fw_alloc_at(b, dva[i], size[i],
 				      IOMMU_READ | (i ? IOMMU_WRITE : 0), &snapshots[i]);
-		if (!ret)
+		if (!ret) {
 			memcpy(snapshots[i].cpu, source, size[i]);
+			b->preload[i] = snapshots[i];
+			b->preload_phys[i] = physical[i];
+		}
 		memunmap(source);
 		if (ret)
 			return ret;
@@ -891,11 +1014,14 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 	}
 	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
 	dma_wmb();
+	memcpy(b->data_digest, data_pin, sizeof(b->data_digest));
 	ret = ane_fw_heap_tail(dva, size, ANE_FW_POOL_DVA, &tail, &tail_size);
 	if (ret || !tail_size)
 		return ret;
 	/* Zeroed by the coherent allocation; kept until reset like the preload. */
 	ret = ane_fw_alloc_at(b, tail, tail_size, IOMMU_READ | IOMMU_WRITE, &heap_tail);
+	if (!ret)
+		b->heap_tail = heap_tail;
 	if (!ret)
 		dev_info(&b->pdev->dev, "ANE map: firmware heap tail at %#llx bytes %#llx\n",
 			 tail, tail_size);
