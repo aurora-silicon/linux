@@ -654,6 +654,9 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 			b->pmu_base_set = true;
 		}
 	}
+	/* How often a request body was seen before its notification and held. */
+	b->ops->log(b->ctx, "startup SHAREDMALLOC allocations/early polls held",
+		    b->transport.shared_count, b->transport.shared_early);
 	return 0;
 }
 

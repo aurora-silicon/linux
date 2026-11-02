@@ -121,6 +121,8 @@ struct ane_fw_transport {
 	u32 head[ANE_FW_CHANNELS];
 	/* SHAREDMALLOC entries captured after acknowledging their notification. */
 	u32 shared_ready;
+	/* Polls that saw a request body before its notification (held, not served). */
+	u32 shared_early;
 	u8 table[ANE_FW_TABLE_SIZE];
 	size_t table_offset;
 	size_t pool_used;
@@ -680,8 +682,15 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 		ret = ane_fw_transport_irq(t, &pending);
 		if (ret)
 			return ret;
-		if (!t->shared_ready)
+		if (!t->shared_ready) {
+			p = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
+			t->ops->read_barrier(t->ctx);
+			word0 = t->ops->load64(t->ctx, p);
+			if (!(word0 & 1) && (word0 || t->ops->load64(t->ctx, p + 8) ||
+					     t->ops->load64(t->ctx, p + 16)))
+				t->shared_early++;
 			return -EAGAIN;
+		}
 	}
 	p = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
 	word0 = t->ops->load64(t->ctx, p);
