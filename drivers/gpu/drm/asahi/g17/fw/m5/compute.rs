@@ -118,8 +118,8 @@ const _: () = {
     assert!(j714.bank_bytes == 0x1e000 && j714.aux_offset == 0x3d800 && j714.bytes == 0x40000);
 };
 
-/// Register 0x1a458 for `clusters`: above four, it carries the topology term `0x9c`, the choice for
-/// feature bit 53 clear, which the configuration leaves clear.
+/// A control word for `clusters`: above four, it carries the topology term `0x9c`.
+/// Used for compute's 0x1a458 and render's TA 0x1c8f8 and fragment 0x16138.
 pub(crate) const fn dispatch_control(base: u64, clusters: u32) -> u64 {
     if clusters > 4 {
         base | 0x9c

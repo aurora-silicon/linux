@@ -51,6 +51,8 @@ pub(crate) struct M5RenderControls {
     pub(crate) ta: M5RenderStageControls,
     pub(crate) fragment: M5RenderStageControls,
     pub(crate) ta_tile_control: u64,
+    /// Fragment 0x16138: the common list's 0x100b8 value with the cluster-topology term.
+    pub(crate) fragment_tile_control: u64,
 
     pub(crate) ta_dispatch_control: u64,
     pub(crate) fragment_raster_control: u64,
@@ -229,7 +231,10 @@ pub(crate) fn build_fragment_registers_into(
             0x0a301 | 0x15109 | 0x15101 | 0x160a8 | 0x0a5a9 | 0x0d429 => continue,
             0x100b1 => register.reg = 0x16469,
             0x100d9 => register.reg = 0x16471,
-            0x100b8 => register.reg = 0x16138,
+            0x100b8 => {
+                register.reg = 0x16138;
+                register.value = controls.fragment_tile_control;
+            }
             0x10791 => {
                 let scratch = controls.fragment.scs.scratch;
                 register.value = if scratch.enabled() {

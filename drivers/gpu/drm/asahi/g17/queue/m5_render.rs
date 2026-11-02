@@ -861,7 +861,8 @@ impl Pair {
 
     /// The pass's register controls (S `m5_render_submission::controls`) with the plan's stage
     /// words.
-    fn controls(pass: &RenderPass, plan: &RenderPlan) -> regs::M5RenderControls {
+    fn controls(pass: &RenderPass, plan: &RenderPlan, clusters: u32) -> regs::M5RenderControls {
+        let topology = |base| fw::m5::compute::dispatch_control(base, clusters);
         let stage = |plan: fw::m5::compute::StagePlan| regs::M5RenderStageControls {
             scs: regs::StageScratch::NONE,
             resource_flags: plan.resource_flags,
@@ -873,7 +874,8 @@ impl Pair {
             fragment_event_control: regs::fragment_event_control(true, 1),
             ta: stage(plan.stages[TILING]),
             fragment: stage(plan.stages[FRAGMENT]),
-            ta_tile_control: 0x10c0_8860,
+            ta_tile_control: topology(0x10c0_8860),
+            fragment_tile_control: topology(fw::UNK_1C8F8),
             ta_dispatch_control: 0x700,
             fragment_raster_control: 0x2000_00ff_0200,
             fragment_tile_flags: 0x20_0003_717f,
@@ -1160,7 +1162,7 @@ impl Pair {
             programs: self.programs,
             deflake: Deflake::M5,
         };
-        let controls = Self::controls(draw.pass, &draw.plan);
+        let controls = Self::controls(draw.pass, &draw.plan, self.clusters);
         let mut inputs = at!(
             "inputs",
             Self::inputs(
