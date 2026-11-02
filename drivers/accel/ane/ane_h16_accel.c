@@ -244,6 +244,8 @@ static void ane_h16_postclose(struct drm_device *drm, struct drm_file *file)
 		ret = ane_h16_session_close(a->session, f->program);
 		if (ret)
 			drm_err(drm, "program teardown failed %d; session quarantined\n", ret);
+		else
+			ane_h16_session_put(a->session, f->program);
 	}
 	mutex_unlock(&a->lock);
 	kfree(f);

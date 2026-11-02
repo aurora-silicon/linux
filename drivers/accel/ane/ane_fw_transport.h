@@ -650,6 +650,38 @@ static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending)
 }
 
 /* The original absolute command deadline survives every provider/IRQ service. */
+/*
+ * After a program is torn down the firmware posts FREE for its process pool,
+ * sometimes after the UNLOAD reply, and waits for the answer with its shared
+ * memory lock held. Serve the SHAREDMALLOC ring until it has been quiet for
+ * quiet_ns, for at most limit_ns. Returns the number of requests served.
+ */
+static inline int ane_fw_transport_settle(struct ane_fw_transport *t, u64 quiet_ns,
+					  u64 limit_ns)
+{
+	u64 start = t->ops->now_ns(t->ctx), last = start, now;
+	u32 pending;
+	int ret, served = 0;
+
+	for (;;) {
+		ret = ane_fw_transport_irq(t, &pending);
+		if (ret)
+			return ret;
+		ret = ane_fw_transport_shared(t);
+		now = t->ops->now_ns(t->ctx);
+		if (!ret) {
+			served++;
+			last = now;
+		} else if (ret != -EAGAIN) {
+			return ret;
+		}
+		if (now - last >= quiet_ns || now - start >= limit_ns)
+			return served;
+		t->polls++;
+		t->ops->relax(t->ctx, now - last);
+	}
+}
+
 static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int ch)
 {
 	u64 start = t->ops->now_ns(t->ctx), now;
