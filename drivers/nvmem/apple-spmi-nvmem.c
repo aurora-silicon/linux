@@ -59,7 +59,8 @@ static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
 	provider = devm_nvmem_register(&sdev->dev, &nvmem_cfg);
 	if (IS_ERR(provider))
 		return PTR_ERR(provider);
-	if (!of_device_is_compatible(sdev->dev.of_node, "apple,baku-pmic"))
+	if (!of_device_is_compatible(sdev->dev.of_node, "apple,baku-pmic") &&
+	    !of_device_is_compatible(sdev->dev.of_node, "apple,abbey-pmic"))
 		return 0;
 
 	return devm_of_platform_populate(&sdev->dev);

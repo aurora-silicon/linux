@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Apple Baku PMU clock and retained-power alarm. */
+/* Apple PMU clock and retained-power alarm. */
 
 #include <linux/bitops.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
-#include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/rtc.h>
@@ -14,17 +14,39 @@
 #include <linux/suspend.h>
 #include <linux/unaligned.h>
 
-#define BAKU_RTC_CONTROL	0xf800
-#define BAKU_RTC_COUNTER	0xf802
-#define BAKU_RTC_COMPARE	0xf808
-#define BAKU_RTC_EVENT		0xf80c
-#define BAKU_RTC_MASK		0xf80e
-#define BAKU_RTC_ARM		BIT(6)
-#define BAKU_RTC_ALARM		BIT(0)
-#define BAKU_RTC_HZ_SHIFT	16
-#define BAKU_RTC_MAX_DELAY	3600
+#define APPLE_PMU_RTC_CONTROL	0x0
+#define APPLE_PMU_RTC_COUNTER	0x2
+#define APPLE_PMU_RTC_COMPARE	0x8
+#define APPLE_PMU_RTC_MASK	0xe
+#define APPLE_PMU_RTC_ARM		BIT(6)
+#define APPLE_PMU_RTC_ALARM		BIT(0)
+#define APPLE_PMU_RTC_HZ_SHIFT	16
+#define APPLE_PMU_RTC_MAX_DELAY	3600
 
-struct baku_rtc {
+struct apple_pmu_rtc_hw {
+	u16 base;
+	u16 event;
+	u8 event_bit;
+	u8 monitor_bit;
+	bool offset_in_seconds;
+};
+
+static const struct apple_pmu_rtc_hw apple_pmu_rtc_baku = {
+	.base = 0xf800,
+	.event = 0xf80c,
+	.event_bit = BIT(0),
+	.offset_in_seconds = true,
+};
+
+static const struct apple_pmu_rtc_hw apple_pmu_rtc_abbey = {
+	.base = 0x2000,
+	.event = 0x2000,
+	.event_bit = BIT(1),
+	.monitor_bit = BIT(0),
+};
+
+struct apple_pmu_rtc {
+	const struct apple_pmu_rtc_hw *hw;
 	struct regmap *map;
 	struct nvmem_cell *offset;
 	struct rtc_device *clock;
@@ -34,212 +56,261 @@ struct baku_rtc {
 	bool io_failed;
 };
 
-static int baku_rtc_seconds(struct baku_rtc *baku, u64 *seconds)
+static int apple_pmu_rtc_counter(struct apple_pmu_rtc *rtc, u64 *ticks)
 {
 	u8 count[8] = {};
 	int error;
 
-	error = regmap_bulk_read(baku->map, BAKU_RTC_COUNTER, count, 6);
+	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COUNTER,
+				 count, 6);
 	if (error)
 		return error;
-	*seconds = get_unaligned_le64(count) >> BAKU_RTC_HZ_SHIFT;
+	*ticks = get_unaligned_le64(count);
 	return 0;
 }
 
-static int baku_rtc_offset(struct baku_rtc *baku, s64 *seconds)
+/* Return the offset in 1/65536 second units, matching the PMU counter. */
+static int apple_pmu_rtc_offset(struct apple_pmu_rtc *rtc, s64 *ticks)
 {
+	u64 offset = 0;
 	size_t bytes;
 	void *value;
 
 	/* The SMC RTC can update this cell, so do not cache it at probe. */
-	value = nvmem_cell_read(baku->offset, &bytes);
+	value = nvmem_cell_read(rtc->offset, &bytes);
 	if (IS_ERR(value))
 		return PTR_ERR(value);
-	if (bytes != sizeof(__le64)) {
+	if (bytes != (rtc->hw->offset_in_seconds ? 8 : 6)) {
 		kfree(value);
 		return -EINVAL;
 	}
-	*seconds = get_unaligned_le64(value);
+	memcpy(&offset, value, bytes);
 	kfree(value);
-	if (*seconds < 0 || *seconds > RTC_TIMESTAMP_END_9999 - U32_MAX)
-		return -ERANGE;
+	offset = le64_to_cpu(offset);
+	if (rtc->hw->offset_in_seconds) {
+		if (offset > RTC_TIMESTAMP_END_9999 - U32_MAX)
+			return -ERANGE;
+		*ticks = offset << APPLE_PMU_RTC_HZ_SHIFT;
+	} else {
+		/* Abbey stores a signed 48-bit offset in 1/32768 seconds. */
+		*ticks = sign_extend64(offset, 47) * 2;
+	}
 	return 0;
 }
 
-static int baku_rtc_read_time(struct device *dev, struct rtc_time *time)
+static int apple_pmu_rtc_read_time(struct device *dev, struct rtc_time *time)
 {
-	struct baku_rtc *baku = dev_get_drvdata(dev);
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 	u64 counter;
 	s64 epoch;
 	int error;
 
-	guard(mutex)(&baku->transaction);
-	error = baku_rtc_offset(baku, &epoch);
+	guard(mutex)(&rtc->transaction);
+	error = apple_pmu_rtc_offset(rtc, &epoch);
 	if (error)
 		return error;
-	error = baku_rtc_seconds(baku, &counter);
+	error = apple_pmu_rtc_counter(rtc, &counter);
 	if (error)
 		return error;
-	rtc_time64_to_tm(epoch + counter, time);
+	rtc_time64_to_tm(((s64)counter + epoch) >> APPLE_PMU_RTC_HZ_SHIFT, time);
 	return 0;
 }
 
 /* All comparator/control accesses are serialized with the IRQ thread. */
-static int baku_rtc_stop_alarm(struct baku_rtc *baku)
+static int apple_pmu_rtc_ack_alarm(struct apple_pmu_rtc *rtc)
 {
+	unsigned int control = 0;
 	int error;
 
-	error = regmap_update_bits(baku->map, BAKU_RTC_MASK,
-				   BAKU_RTC_ALARM, BAKU_RTC_ALARM);
-	if (error)
-		return error;
-	error = regmap_update_bits(baku->map, BAKU_RTC_CONTROL, BAKU_RTC_ARM, 0);
-	if (error)
-		return error;
-	return regmap_write(baku->map, BAKU_RTC_EVENT, BAKU_RTC_ALARM);
+	/*
+	 * The event is W1C. Abbey shares the byte with ARM and MONITOR,
+	 * unlike Baku's dedicated event register. Preserve the control bits
+	 * when acknowledging, rather than writing only the event bit.
+	 */
+	if (rtc->hw->event == rtc->hw->base + APPLE_PMU_RTC_CONTROL) {
+		error = regmap_read(rtc->map, rtc->hw->event, &control);
+		if (error)
+			return error;
+	}
+	return regmap_write(rtc->map, rtc->hw->event, control | rtc->hw->event_bit);
 }
 
-static int baku_rtc_start_alarm(struct baku_rtc *baku)
+static int apple_pmu_rtc_arm(struct apple_pmu_rtc *rtc, bool enable)
+{
+	unsigned int control;
+	int error;
+
+	error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, &control);
+	if (error)
+		return error;
+	/* Do not acknowledge a shared W1C event as a side effect of RMW. */
+	if (rtc->hw->event == rtc->hw->base + APPLE_PMU_RTC_CONTROL)
+		control &= ~rtc->hw->event_bit;
+	control &= ~APPLE_PMU_RTC_ARM;
+	if (enable)
+		control |= APPLE_PMU_RTC_ARM;
+	control |= rtc->hw->monitor_bit;
+	return regmap_write(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, control);
+}
+
+static int apple_pmu_rtc_stop_alarm(struct apple_pmu_rtc *rtc)
 {
 	int error;
 
-	error = regmap_write(baku->map, BAKU_RTC_EVENT, BAKU_RTC_ALARM);
-	if (!error)
-		error = regmap_update_bits(baku->map, BAKU_RTC_MASK, BAKU_RTC_ALARM, 0);
-	if (!error)
-		error = regmap_update_bits(baku->map, BAKU_RTC_CONTROL,
-					   BAKU_RTC_ARM, BAKU_RTC_ARM);
+	error = regmap_update_bits(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK,
+				   APPLE_PMU_RTC_ALARM, APPLE_PMU_RTC_ALARM);
 	if (error)
-		baku_rtc_stop_alarm(baku);
+		return error;
+	error = apple_pmu_rtc_arm(rtc, false);
+	if (error)
+		return error;
+	return apple_pmu_rtc_ack_alarm(rtc);
+}
+
+static int apple_pmu_rtc_start_alarm(struct apple_pmu_rtc *rtc)
+{
+	int error;
+
+	error = apple_pmu_rtc_ack_alarm(rtc);
+	if (!error)
+		error = regmap_update_bits(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK,
+					   APPLE_PMU_RTC_ALARM, 0);
+	if (!error)
+		error = apple_pmu_rtc_arm(rtc, true);
+	if (error)
+		apple_pmu_rtc_stop_alarm(rtc);
 	return error;
 }
 
-static int baku_rtc_validate_alarm(struct baku_rtc *baku, u64 comparator)
+static int apple_pmu_rtc_validate_alarm(struct apple_pmu_rtc *rtc, u64 comparator)
 {
 	u64 counter;
 	int error;
 
-	error = baku_rtc_seconds(baku, &counter);
+	error = apple_pmu_rtc_counter(rtc, &counter);
 	if (error)
 		return error;
+	counter >>= APPLE_PMU_RTC_HZ_SHIFT;
 	if (comparator <= counter)
 		return -ETIME;
-	if (comparator - counter > BAKU_RTC_MAX_DELAY)
+	if (comparator - counter > APPLE_PMU_RTC_MAX_DELAY)
 		return -ERANGE;
 	return 0;
 }
 
-static int baku_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alarm)
+static int apple_pmu_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alarm)
 {
-	struct baku_rtc *baku = dev_get_drvdata(dev);
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 	unsigned int control, event, mask;
 	__le32 comparator;
 	s64 epoch;
 	int error;
 
-	guard(mutex)(&baku->transaction);
-	error = baku_rtc_offset(baku, &epoch);
+	guard(mutex)(&rtc->transaction);
+	error = apple_pmu_rtc_offset(rtc, &epoch);
 	if (error)
 		return error;
-	error = regmap_bulk_read(baku->map, BAKU_RTC_COMPARE,
+	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
 				 &comparator, sizeof(comparator));
 	if (!error)
-		error = regmap_read(baku->map, BAKU_RTC_CONTROL, &control);
+		error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, &control);
 	if (!error)
-		error = regmap_read(baku->map, BAKU_RTC_EVENT, &event);
+		error = regmap_read(rtc->map, rtc->hw->event, &event);
 	if (!error)
-		error = regmap_read(baku->map, BAKU_RTC_MASK, &mask);
+		error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK, &mask);
 	if (error)
 		return error;
-	rtc_time64_to_tm(epoch + le32_to_cpu(comparator), &alarm->time);
-	alarm->enabled = (control & BAKU_RTC_ARM) && !(mask & BAKU_RTC_ALARM);
-	alarm->pending = !!(event & BAKU_RTC_ALARM);
+	rtc_time64_to_tm((epoch >> APPLE_PMU_RTC_HZ_SHIFT) +
+			le32_to_cpu(comparator), &alarm->time);
+	alarm->enabled = (control & APPLE_PMU_RTC_ARM) && !(mask & APPLE_PMU_RTC_ALARM);
+	alarm->pending = !!(event & rtc->hw->event_bit);
 	return 0;
 }
 
-static int baku_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alarm)
+static int apple_pmu_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alarm)
 {
-	struct baku_rtc *baku = dev_get_drvdata(dev);
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 	__le32 comparator, readback;
 	s64 epoch, deadline;
 	int error;
 
-	guard(mutex)(&baku->transaction);
-	if (baku->io_failed)
+	guard(mutex)(&rtc->transaction);
+	if (rtc->io_failed)
 		return -EIO;
-	error = baku_rtc_offset(baku, &epoch);
+	error = apple_pmu_rtc_offset(rtc, &epoch);
 	if (error)
 		return error;
-	deadline = rtc_tm_to_time64(&alarm->time) - epoch;
+	/* Rounding the offset down lets fractional offsets fire up to 1 s late. */
+	deadline = rtc_tm_to_time64(&alarm->time) - (epoch >> APPLE_PMU_RTC_HZ_SHIFT);
 	if (deadline < 0 || deadline > U32_MAX)
 		return -ERANGE;
-	error = baku_rtc_validate_alarm(baku, deadline);
+	error = apple_pmu_rtc_validate_alarm(rtc, deadline);
 	if (error)
 		return error;
-	error = baku_rtc_stop_alarm(baku);
+	error = apple_pmu_rtc_stop_alarm(rtc);
 	if (error)
 		return error;
 	comparator = cpu_to_le32(deadline);
-	error = regmap_bulk_write(baku->map, BAKU_RTC_COMPARE,
+	error = regmap_bulk_write(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
 				  &comparator, sizeof(comparator));
 	if (error)
 		return error;
-	error = regmap_bulk_read(baku->map, BAKU_RTC_COMPARE,
+	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
 				 &readback, sizeof(readback));
 	if (error)
 		return error;
 	if (readback != comparator)
 		return -EIO;
 	if (alarm->enabled)
-		return baku_rtc_start_alarm(baku);
+		return apple_pmu_rtc_start_alarm(rtc);
 	return 0;
 }
 
-static int baku_rtc_alarm_enable(struct device *dev, unsigned int enable)
+static int apple_pmu_rtc_alarm_enable(struct device *dev, unsigned int enable)
 {
-	struct baku_rtc *baku = dev_get_drvdata(dev);
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 	__le32 comparator;
 	int error;
 
-	guard(mutex)(&baku->transaction);
+	guard(mutex)(&rtc->transaction);
 	if (!enable)
-		return baku_rtc_stop_alarm(baku);
-	if (baku->io_failed)
+		return apple_pmu_rtc_stop_alarm(rtc);
+	if (rtc->io_failed)
 		return -EIO;
-	error = regmap_bulk_read(baku->map, BAKU_RTC_COMPARE,
+	error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
 				 &comparator, sizeof(comparator));
 	if (error)
 		return error;
-	error = baku_rtc_validate_alarm(baku, le32_to_cpu(comparator));
-	return error ?: baku_rtc_start_alarm(baku);
+	error = apple_pmu_rtc_validate_alarm(rtc, le32_to_cpu(comparator));
+	return error ?: apple_pmu_rtc_start_alarm(rtc);
 }
 
-static irqreturn_t baku_rtc_interrupt(int irq, void *context)
+static irqreturn_t apple_pmu_rtc_interrupt(int irq, void *context)
 {
 	struct device *dev = context;
-	struct baku_rtc *baku = dev_get_drvdata(dev);
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 	unsigned int event;
 	int error;
 
-	mutex_lock(&baku->transaction);
-	error = regmap_read(baku->map, BAKU_RTC_EVENT, &event);
-	if (!error && (event & BAKU_RTC_ALARM))
-		error = baku_rtc_stop_alarm(baku);
+	mutex_lock(&rtc->transaction);
+	error = regmap_read(rtc->map, rtc->hw->event, &event);
+	if (!error && (event & rtc->hw->event_bit))
+		error = apple_pmu_rtc_stop_alarm(rtc);
 	if (error) {
-		baku->io_failed = true;
+		rtc->io_failed = true;
 		disable_irq_nosync(irq);
 	}
-	mutex_unlock(&baku->transaction);
+	mutex_unlock(&rtc->transaction);
 	if (error) {
 		dev_err(dev, "cannot acknowledge RTC interrupt: %d\n", error);
 		pm_wakeup_dev_event(dev, 0, true);
 		return IRQ_HANDLED;
 	}
-	if (!(event & BAKU_RTC_ALARM))
+	if (!(event & rtc->hw->event_bit))
 		return IRQ_NONE;
 	if (device_may_wakeup(dev))
 		pm_wakeup_dev_event(dev, 0, true);
-	rtc_update_irq(baku->clock, 1, RTC_IRQF | RTC_AF);
+	rtc_update_irq(rtc->clock, 1, RTC_IRQF | RTC_AF);
 	return IRQ_HANDLED;
 }
 
@@ -249,87 +320,90 @@ static irqreturn_t baku_rtc_interrupt(int irq, void *context)
  * still pending within the supported range, so that the RTC core picks it
  * up at registration, and disarm anything else.
  */
-static int baku_rtc_init_alarm(struct baku_rtc *baku)
+static int apple_pmu_rtc_init_alarm(struct apple_pmu_rtc *rtc)
 {
 	unsigned int control, mask;
 	__le32 comparator;
 	int error;
 
-	error = regmap_read(baku->map, BAKU_RTC_CONTROL, &control);
+	error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_CONTROL, &control);
 	if (!error)
-		error = regmap_read(baku->map, BAKU_RTC_MASK, &mask);
+		error = regmap_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_MASK, &mask);
 	if (!error)
-		error = regmap_bulk_read(baku->map, BAKU_RTC_COMPARE,
+		error = regmap_bulk_read(rtc->map, rtc->hw->base + APPLE_PMU_RTC_COMPARE,
 					 &comparator, sizeof(comparator));
 	if (error)
 		return error;
-	if ((control & BAKU_RTC_ARM) && !(mask & BAKU_RTC_ALARM) &&
-	    !baku_rtc_validate_alarm(baku, le32_to_cpu(comparator)))
+	if ((control & APPLE_PMU_RTC_ARM) && !(mask & APPLE_PMU_RTC_ALARM) &&
+	    !apple_pmu_rtc_validate_alarm(rtc, le32_to_cpu(comparator)))
 		return 0;
-	return baku_rtc_stop_alarm(baku);
+	return apple_pmu_rtc_stop_alarm(rtc);
 }
 
-static const struct rtc_class_ops baku_rtc_ops = {
-	.read_time = baku_rtc_read_time,
-	.read_alarm = baku_rtc_read_alarm,
-	.set_alarm = baku_rtc_set_alarm,
-	.alarm_irq_enable = baku_rtc_alarm_enable,
+static const struct rtc_class_ops apple_pmu_rtc_ops = {
+	.read_time = apple_pmu_rtc_read_time,
+	.read_alarm = apple_pmu_rtc_read_alarm,
+	.set_alarm = apple_pmu_rtc_set_alarm,
+	.alarm_irq_enable = apple_pmu_rtc_alarm_enable,
 };
 
-static int baku_rtc_prepare(struct device *dev)
+static int apple_pmu_rtc_prepare(struct device *dev)
 {
-	struct baku_rtc *baku = dev_get_drvdata(dev);
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE || baku->io_failed)
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE || rtc->io_failed)
 		return -EBUSY;
 	return 0;
 }
 
-static const struct dev_pm_ops baku_rtc_pm = {
-	.prepare = baku_rtc_prepare,
+static const struct dev_pm_ops apple_pmu_rtc_pm = {
+	.prepare = apple_pmu_rtc_prepare,
 };
 
-static void baku_rtc_release(void *context)
+static void apple_pmu_rtc_release(void *context)
 {
 	struct device *dev = context;
-	struct baku_rtc *baku = dev_get_drvdata(dev);
+	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 
-	disable_irq(baku->interrupt);
-	mutex_lock(&baku->transaction);
-	if (baku_rtc_stop_alarm(baku))
+	disable_irq(rtc->interrupt);
+	mutex_lock(&rtc->transaction);
+	if (apple_pmu_rtc_stop_alarm(rtc))
 		dev_err(dev, "cannot disable RTC alarm on removal\n");
-	mutex_unlock(&baku->transaction);
+	mutex_unlock(&rtc->transaction);
 	device_init_wakeup(dev, false);
 }
 
-static int baku_rtc_probe(struct platform_device *pdev)
+static int apple_pmu_rtc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct baku_rtc *baku;
+	struct apple_pmu_rtc *rtc;
 	int error;
 
-	baku = devm_kzalloc(dev, sizeof(*baku), GFP_KERNEL);
-	if (!baku)
+	rtc = devm_kzalloc(dev, sizeof(*rtc), GFP_KERNEL);
+	if (!rtc)
 		return -ENOMEM;
-	baku->map = dev_get_regmap(dev->parent, NULL);
-	if (!baku->map)
+	rtc->hw = of_device_get_match_data(dev);
+	if (!rtc->hw)
+		return -EINVAL;
+	rtc->map = dev_get_regmap(dev->parent, NULL);
+	if (!rtc->map)
 		return dev_err_probe(dev, -EPROBE_DEFER, "PMIC regmap unavailable\n");
-	baku->offset = devm_nvmem_cell_get(dev, "rtc_offset");
-	if (IS_ERR(baku->offset))
-		return dev_err_probe(dev, PTR_ERR(baku->offset), "RTC offset unavailable\n");
-	baku->interrupt = platform_get_irq(pdev, 0);
-	if (baku->interrupt < 0)
-		return baku->interrupt;
-	mutex_init(&baku->transaction);
-	platform_set_drvdata(pdev, baku);
-	baku->clock = devm_rtc_allocate_device(dev);
-	if (IS_ERR(baku->clock))
-		return PTR_ERR(baku->clock);
-	baku->clock->ops = &baku_rtc_ops;
-	baku->clock->range_min = 0;
-	baku->clock->range_max = RTC_TIMESTAMP_END_9999;
-	baku->clock->alarm_offset_max = BAKU_RTC_MAX_DELAY;
-	clear_bit(RTC_FEATURE_UPDATE_INTERRUPT, baku->clock->features);
+	rtc->offset = devm_nvmem_cell_get(dev, "rtc_offset");
+	if (IS_ERR(rtc->offset))
+		return dev_err_probe(dev, PTR_ERR(rtc->offset), "RTC offset unavailable\n");
+	rtc->interrupt = platform_get_irq(pdev, 0);
+	if (rtc->interrupt < 0)
+		return rtc->interrupt;
+	mutex_init(&rtc->transaction);
+	platform_set_drvdata(pdev, rtc);
+	rtc->clock = devm_rtc_allocate_device(dev);
+	if (IS_ERR(rtc->clock))
+		return PTR_ERR(rtc->clock);
+	rtc->clock->ops = &apple_pmu_rtc_ops;
+	rtc->clock->range_min = 0;
+	rtc->clock->range_max = RTC_TIMESTAMP_END_9999;
+	rtc->clock->alarm_offset_max = APPLE_PMU_RTC_MAX_DELAY;
+	clear_bit(RTC_FEATURE_UPDATE_INTERRUPT, rtc->clock->features);
 	error = device_init_wakeup(dev, true);
 	if (error)
 		return error;
@@ -338,22 +412,22 @@ static int baku_rtc_probe(struct platform_device *pdev)
 	 * thread uses the parent PMIC's SPMI regmap to acknowledge the alarm.
 	 * Off-domain wake routing is not established by this driver.
 	 */
-	error = devm_request_threaded_irq(dev, baku->interrupt, NULL,
-					  baku_rtc_interrupt,
+	error = devm_request_threaded_irq(dev, rtc->interrupt, NULL,
+					  apple_pmu_rtc_interrupt,
 					  IRQF_NO_AUTOEN | IRQF_NO_SUSPEND | IRQF_ONESHOT,
 					  dev_name(dev), dev);
 	if (error)
 		goto disable_wakeup;
-	error = baku_rtc_init_alarm(baku);
+	error = apple_pmu_rtc_init_alarm(rtc);
 	if (error)
 		goto disable_wakeup;
-	error = devm_rtc_register_device(baku->clock);
+	error = devm_rtc_register_device(rtc->clock);
 	if (error)
 		goto disable_wakeup;
-	error = devm_add_action_or_reset(dev, baku_rtc_release, dev);
+	error = devm_add_action_or_reset(dev, apple_pmu_rtc_release, dev);
 	if (error)
 		return error;
-	enable_irq(baku->interrupt);
+	enable_irq(rtc->interrupt);
 	return 0;
 
 disable_wakeup:
@@ -361,22 +435,23 @@ disable_wakeup:
 	return error;
 }
 
-static const struct of_device_id baku_rtc_match[] = {
-	{ .compatible = "apple,j700-pmu-rtc" },
+static const struct of_device_id apple_pmu_rtc_match[] = {
+	{ .compatible = "apple,j700-pmu-rtc", .data = &apple_pmu_rtc_baku },
+	{ .compatible = "apple,t6041-pmu-rtc", .data = &apple_pmu_rtc_abbey },
 	{ }
 };
-MODULE_DEVICE_TABLE(of, baku_rtc_match);
+MODULE_DEVICE_TABLE(of, apple_pmu_rtc_match);
 
-static struct platform_driver baku_rtc_driver = {
-	.probe = baku_rtc_probe,
+static struct platform_driver apple_pmu_rtc_driver = {
+	.probe = apple_pmu_rtc_probe,
 	.driver = {
 		.name = "apple-pmu-rtc",
-		.of_match_table = baku_rtc_match,
-		.pm = &baku_rtc_pm,
+		.of_match_table = apple_pmu_rtc_match,
+		.pm = &apple_pmu_rtc_pm,
 	},
 };
-module_platform_driver(baku_rtc_driver);
+module_platform_driver(apple_pmu_rtc_driver);
 
 MODULE_AUTHOR("Eryk Wieliczko <github@wieliczko.ninja>");
-MODULE_DESCRIPTION("Apple Baku PMU RTC alarm with retained-power s2idle");
+MODULE_DESCRIPTION("Apple PMU RTC alarm with retained-power s2idle");
 MODULE_LICENSE("GPL");
