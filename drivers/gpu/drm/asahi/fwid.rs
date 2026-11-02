@@ -397,6 +397,46 @@ mod tests {
     }
 
     #[test]
+    fn t6050_admits_only_its_pinned_image() {
+        let crate::g17::fw::variant::Firmware::Identified(builds) =
+            crate::hw::t6050::CONFIG.firmware
+        else {
+            panic!("T6050 must identify its loaded firmware");
+        };
+        for build in builds {
+            for image in build.images {
+                // Both roles' records, inside TEXT.
+                assert_eq!(image.entropy.len(), 2);
+                assert!(image
+                    .entropy
+                    .iter()
+                    .flatten()
+                    .all(|&o| u64::from(o) + 16 <= image.text_size));
+                let admit = |text, data, at: &[[u32; 2]], digest| {
+                    lookup(build.images, text, data, |m| {
+                        (m.entropy == at).then_some(digest)
+                    })
+                };
+                // The header fields and both RTKit fill sections of each role.
+                assert_eq!(image.boot_filled.len(), 8);
+                let (t, d, e, h) = (
+                    image.text_size,
+                    image.data_size,
+                    image.entropy,
+                    image.text_sha256,
+                );
+                assert!(core::ptr::eq(admit(t, d, e, h).unwrap(), image));
+                let mut wrong = h;
+                wrong[31] ^= 1;
+                assert!(admit(t, d, e, wrong).is_none());
+                assert!(admit(t, d + 0x4000, e, h).is_none());
+                assert!(admit(t + 0x4000, d, e, h).is_none());
+                assert!(admit(t, d, &e[..1], h).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn t6040_accepts_all_loaded_images() {
         let crate::g17::fw::variant::Firmware::Identified(builds) =
             crate::hw::t6040::CONFIG.firmware

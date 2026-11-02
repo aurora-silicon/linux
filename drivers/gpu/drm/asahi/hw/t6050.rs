@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Hardware configuration for t6050 platforms: J775D (Mac Studio, M5 Ultra, two dies), on the
-//! macOS 27.0 (26A428) GPU firmware, native: no SPTM, so the firmware publishes its kernel roots
-//! (`UatFirmware::PublishedRoots`) as the A18 Pro's does, and the InitData graph is the M5 one
-//! ([`crate::g17::fw::m5`]).
+//! macOS 27.0 (26A428) GPU firmware, identified by its loaded image, native: no SPTM, so the
+//! firmware publishes its kernel roots (`UatFirmware::PublishedRoots`) as the A18 Pro's does, and
+//! the InitData graph is the M5 one ([`crate::g17::fw::m5`]).
 //!
 //! Values: the J775D ADT and live measurements. The performance tables are this ADT's; probe
 //! checks them against the device tree's operating points, which the boot loader fills from the
@@ -61,7 +61,40 @@ pub(crate) const CONFIG: Config = Config {
     fabric_bridge: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    firmware: crate::g17::fw::variant::Firmware::Fixed(&crate::g17::fw::variant::V26A428_M5),
+    // The boot loader loads both roles' 26A428 TEXT back to back into `fw-text`: GFX's 0x50000,
+    // then GFX1's 0x58000, each with its own GKTS/ECAP entropy records. Any other loaded image,
+    // such as a 27.2 stub's, is refused before anything is written to the GPU.
+    firmware: crate::g17::fw::variant::Firmware::Identified(&[crate::g17::fw::variant::Build {
+        os_version: [27, 0, 0],
+        name: "macOS 27.0 (26A428)",
+        images: &[crate::fwid::FirmwareBuild {
+            // The firmware's TEXT with the boot-filled ranges zeroed: GFX is the third image of
+            // armfw_g17x, GFX1 the third of armfw1_g17x; a loaded copy normalizes to the same
+            // digest.
+            name: "Apple GFX 26A428 for T6050, GFX then GFX1 (normalized image)",
+            text_size: 0xa8000,
+            data_size: 0x184000,
+            entropy: &[[0x49e60, 0x49f43], [0xa1918, 0xa19fb]],
+            // Per role: the header's two load fields (+0x224, and the DATA address at +0x23c),
+            // then `_rtk_tunables` and `_rtk_patchbay` (the boot arguments, entropy included).
+            boot_filled: &[
+                (0x224, 4),
+                (0x23c, 8),
+                (0x49720, 0x740),
+                (0x49e60, 0x231),
+                (0x50224, 4),
+                (0x5023c, 8),
+                (0xa11d8, 0x740),
+                (0xa1918, 0x231),
+            ],
+            text_sha256: [
+                0xc3, 0x53, 0x54, 0x40, 0x76, 0x02, 0x48, 0x44, 0x04, 0xaa, 0x6f, 0xc9, 0x46, 0xcd,
+                0xd2, 0x4c, 0xb8, 0x2c, 0x64, 0xa8, 0xbb, 0xd1, 0x07, 0xa4, 0x94, 0x79, 0xa0, 0x8c,
+                0xe9, 0xcc, 0x82, 0x51,
+            ],
+        }],
+        variant: &crate::g17::fw::variant::V26A428_M5,
+    }]),
     // Topology only; no M5 command-buffer layout is selected until submission is.
     core_layout: CoreLayout {
         cores: Some((8, 64)),
