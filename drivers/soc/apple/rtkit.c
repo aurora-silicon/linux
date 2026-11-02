@@ -272,6 +272,9 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
 
+	if (!test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints))
+		dev_info(rtk->dev, "RTKit: crashlog endpoint not in the endpoint map\n");
+
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		switch (ep) {
 		/* the management endpoint is started by default */
@@ -755,6 +758,7 @@ static void apple_rtkit_crashlog_late(struct work_struct *work)
 		return;
 	}
 
+	/* The crash was reported and the client told; only dump the log. */
 	dev_err(rtk->dev, "RTKit: co-processor crashed; crashlog written after %u ms\n",
 		(rtk->crashlog_late_polls + 1) * APPLE_RTKIT_CRASHLOG_LATE_POLL_MS);
 	bfr = kzalloc(rtk->crashlog_buffer.size, GFP_KERNEL);
@@ -769,7 +773,16 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
 	u8 *bfr __free(kfree) = NULL;
-	struct apple_rtkit_crashlog_header header;
+	/*
+	 * An undiscovered crashlog endpoint was never started, so the
+	 * co-processor was never asked for a buffer and, as in an inherited
+	 * session, a message there can only be a crash report. Firmware that
+	 * leaves this endpoint out of its map still reports crashes on it,
+	 * with a buffer of its own.
+	 */
+	bool reports_crash = rtk->crashlog_inherited ||
+			     !test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints);
+	bool await_log = false;
 
 	if (type != APPLE_RTKIT_CRASHLOG_CRASH) {
 		dev_warn(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
@@ -780,45 +793,23 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	if (!rtk->crashlog_buffer.size) {
 		if (apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						     APPLE_RTKIT_EP_CRASHLOG, msg))
-			goto unmapped;
+			goto no_buffer;
 		/*
 		 * In a session that went through the handshake, the first
-		 * message on this endpoint is the buffer request. Firmware may
-		 * place that buffer in memory which still holds the log of an
-		 * earlier crash, so only look for one in an inherited session.
+		 * message on a started crashlog endpoint is the buffer request.
+		 * Firmware may place that buffer in memory which still holds
+		 * the log of an earlier crash, so only look for one when the
+		 * message can only be a crash report.
 		 */
-		if (!rtk->crashlog_inherited)
+		if (!reports_crash)
 			return;
 	}
-	if (rtk->crashlog_inherited) {
-		if (rtk->crashlog_buffer.size < sizeof(header))
-			goto unmapped;
-
-		apple_rtkit_memcpy(rtk, &header, &rtk->crashlog_buffer, 0,
-				   sizeof(header));
-		if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER_FOURCC ||
-		    header.size < sizeof(header) ||
-		    header.size > rtk->crashlog_buffer.size) {
-			/*
-			 * On a started crashlog endpoint the first message
-			 * without a buffer is the normal boot-time buffer
-			 * request. A co-processor whose crashlog endpoint was
-			 * never discovered or started (a DCP adopted from the
-			 * bootloader) sends it only when it crashes, and writes
-			 * the log after receiving the buffer. Say so and read
-			 * the log once it is there, rather than dropping the
-			 * report.
-			 */
-			if (!test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints)) {
-				dev_err(rtk->dev,
-					"RTKit: co-processor reported a crash before its crashlog buffer was mapped\n");
-				rtk->crashlog_late_polls = 0;
-				queue_delayed_work(rtk->wq, &rtk->crashlog_late_work,
-					msecs_to_jiffies(APPLE_RTKIT_CRASHLOG_LATE_POLL_MS));
-				return;
-			}
-			goto unmapped;
-		}
+	if (reports_crash) {
+		if (rtk->crashlog_buffer.size <
+		    sizeof(struct apple_rtkit_crashlog_header))
+			goto no_buffer;
+		if (!apple_rtkit_crashlog_header_valid(rtk))
+			goto no_log;
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
@@ -855,14 +846,34 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		rtk->ops->crashed(rtk->cookie, bfr, bfr ? rtk->crashlog_buffer.size : 0);
 	return;
 
-unmapped:
-	/* An inherited session already negotiated its crash buffer. */
-	if (!rtk->crashlog_inherited)
+no_buffer:
+	/* Otherwise this was a buffer request that could not be served. */
+	if (!reports_crash)
 		return;
-	dev_err(rtk->dev, "RTKit: adopted co-processor crashed without a readable log\n");
+	dev_err(rtk->dev, "RTKit: co-processor crashed without a usable crashlog buffer\n");
+	goto crashed;
+
+no_log:
+	/* The buffer is mapped, but holds no valid log (yet). */
+	dev_err(rtk->dev, "RTKit: co-processor crashed without a readable log\n");
+	/*
+	 * A co-processor whose crashlog endpoint was never discovered or
+	 * started (the external DCP on T6050) requests the buffer only when
+	 * it crashes, and writes the log after receiving it. Read the log once
+	 * it is there, rather than dropping it.
+	 */
+	await_log = !test_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints);
+
+crashed:
 	rtk->crashed = true;
 	if (rtk->ops->crashed)
 		rtk->ops->crashed(rtk->cookie, NULL, 0);
+
+	if (await_log) {
+		rtk->crashlog_late_polls = 0;
+		queue_delayed_work(rtk->wq, &rtk->crashlog_late_work,
+			msecs_to_jiffies(APPLE_RTKIT_CRASHLOG_LATE_POLL_MS));
+	}
 }
 
 static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
@@ -1380,6 +1391,8 @@ static void apple_rtkit_detach_rx(struct apple_rtkit *rtk)
 static void apple_rtkit_stop_rx(struct apple_rtkit *rtk)
 {
 	apple_rtkit_detach_rx(rtk);
+	/* A crashlog message still being handled may queue the late read. */
+	flush_workqueue(rtk->wq);
 	cancel_delayed_work_sync(&rtk->crashlog_late_work);
 	destroy_workqueue(rtk->wq);
 }
@@ -1624,8 +1637,8 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 
 	/* make sure we don't handle any messages while reinitializing */
 	apple_rtkit_detach_rx(rtk);
-	cancel_delayed_work_sync(&rtk->crashlog_late_work);
 	flush_workqueue(rtk->wq);
+	cancel_delayed_work_sync(&rtk->crashlog_late_work);
 
 	apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
