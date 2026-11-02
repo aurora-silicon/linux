@@ -3563,14 +3563,14 @@ static bool ane_rtclient_is_platform(struct device *dev)
 static int __maybe_unused ane_rtclient_sleep_pm_suspend(struct device *dev)
 {
 	if (ane_rtclient_is_platform(dev))
-		return ane_h16_backend_suspend(dev);
+		return ane_fw_platform_suspend(dev);
 	return ane_t6021_pm_suspend(ane_rtclient_get_sleep_pm(dev));
 }
 
 static int __maybe_unused ane_rtclient_sleep_pm_resume(struct device *dev)
 {
 	if (ane_rtclient_is_platform(dev))
-		return ane_h16_backend_resume(dev);
+		return ane_fw_platform_resume(dev);
 	return ane_t6021_pm_resume(ane_rtclient_get_sleep_pm(dev));
 }
 

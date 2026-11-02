@@ -141,6 +141,10 @@ static inline bool ane_fw_cold_handoff_valid(const struct ane_fw_handoff *h,
 }
 
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc);
+int ane_fw_staged_bind(struct platform_device *pdev);
+bool ane_fw_staged_bound(struct device *dev);
+void ane_fw_staged_unbind(struct platform_device *pdev);
+int ane_fw_staged_suspend(struct device *dev);
 void ane_fw_staged_start(void);
 bool ane_fw_staged_exit(void);
 

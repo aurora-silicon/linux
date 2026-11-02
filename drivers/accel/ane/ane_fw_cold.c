@@ -76,12 +76,25 @@ struct ane_fw_backend {
 	struct work_struct start;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
+	/* The bound device holds ANE_SYS for a hand-off until the bring-up does. */
+	bool bind_held;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
  * the platform bus would otherwise resume genpd and attach DMA before probe.
  */
 static struct ane_fw_backend *ane_backend;
+/* The H17 platform device, bound by ane_fw_staged_bind(). */
+static struct device *ane_fw_bound_dev;
+
+/* The bring-up holds ANE_SYS itself now: drop the bind's hand-off reference. */
+static void ane_fw_bind_release(struct ane_fw_backend *b)
+{
+	if (!b->bind_held)
+		return;
+	b->bind_held = false;
+	pm_runtime_put(&b->pdev->dev);
+}
 
 /*
  * Every register access of this backend goes through these helpers, so a
@@ -430,10 +443,16 @@ static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
 	u64 ce;
 	int ret;
 
-	b->power = dev_pm_domain_attach_by_id(dev, 0);
-	if (IS_ERR_OR_NULL(b->power))
-		return b->power ? PTR_ERR(b->power) : -ENODEV;
+	/*
+	 * The bound device carries ANE_SYS itself: platform_probe attached it
+	 * to its single domain, so genpd sees the engine's own reference.
+	 */
+	if (!dev->pm_domain || dev != ane_fw_bound_dev)
+		return -ENODEV;
+	b->power = dev;
 	ret = pm_runtime_resume_and_get(b->power);
+	/* The bring-up holds ANE_SYS now (or failed and stops here). */
+	ane_fw_bind_release(b);
 	if (ret < 0)
 		return ret;
 	if ((ane_rd32(b, b->pmgr + 0x290) & 0xff) != 0xff)
@@ -1023,6 +1042,7 @@ static void ane_fw_start_work(struct work_struct *work)
 		if (ret < 0) {
 			dev_err(&b->pdev->dev, "H17 ANE: boot bring-up stopped at %s, error %zd\n",
 				steps[i], ret);
+			ane_fw_bind_release(b);
 			return;
 		}
 	}
@@ -1178,9 +1198,81 @@ fail:
 }
 
 /*
- * Start the bring-up once the platform driver is registered: its probe of
- * this device (refused, but with a genpd attach and detach) has finished by
- * then and cannot race the power sequence.
+ * Bind the H17 platform device. Left unbound, it is a fw_devlink consumer
+ * that never binds, so the PMGR power controller's sync_state never runs and
+ * genpd keeps every boot-on domain under it on (stay_on), ANE_SYS included,
+ * whatever the backend puts: the domain never powers off, at idle or across
+ * system sleep. Bound, the device carries ANE_SYS through its own runtime
+ * PM: platform_probe attached it to its single domain. With a loader
+ * hand-off the engine is powered as the loader left it, so the bind holds
+ * ANE_SYS until the bring-up takes its own reference (ane_fw_power()) or
+ * stops; without one the device is runtime suspended and the domain is
+ * free to go off.
+ */
+int ane_fw_staged_bind(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct ane_fw_backend *b = ane_backend;
+	bool handoff = b && b->pdev == pdev;
+	int ret;
+
+	if (ane_fw_bound_dev)
+		return -EBUSY;
+	if (handoff) {
+		ret = pm_runtime_set_active(dev);
+		if (ret)
+			return ret;
+		pm_runtime_get_noresume(dev);
+		b->bind_held = true;
+	}
+	ret = devm_pm_runtime_enable(dev);
+	if (ret) {
+		if (handoff) {
+			b->bind_held = false;
+			pm_runtime_put_noidle(dev);
+			pm_runtime_set_suspended(dev);
+		}
+		return ret;
+	}
+	ane_fw_bound_dev = dev;
+	dev_info(dev, "H17 ANE: bound; %s\n", handoff ?
+		 "ANE_SYS held until the bring-up owns it" : "no hand-off, engine left off");
+	return 0;
+}
+
+bool ane_fw_staged_bound(struct device *dev)
+{
+	return dev && dev == ane_fw_bound_dev;
+}
+
+void ane_fw_staged_unbind(struct platform_device *pdev)
+{
+	struct ane_fw_backend *b = ane_backend;
+
+	if (b && b->pdev == pdev)
+		ane_fw_bind_release(b);
+	ane_fw_bound_dev = NULL;
+}
+
+/*
+ * Device suspend of the bound H17 device: the PM notifier already refused
+ * system sleep while the firmware is retained; this is the backstop for a
+ * sleep path that skipped the notifiers.
+ */
+int ane_fw_staged_suspend(struct device *dev)
+{
+	struct ane_fw_backend *b = ane_backend;
+	bool retained = b && &b->pdev->dev == dev && READ_ONCE(b->retained);
+
+	if (retained)
+		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_backstop(retained);
+}
+
+/*
+ * Start the bring-up once the platform driver is registered: its probe has
+ * bound this device (ane_fw_staged_bind()) by then and cannot race the power
+ * sequence.
  */
 void ane_fw_staged_start(void)
 {
