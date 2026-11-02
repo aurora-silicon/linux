@@ -21,6 +21,8 @@ mod g15;
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 mod g16;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+mod m5;
 mod gpu;
 mod hw;
 mod initdata;
@@ -191,6 +193,10 @@ module! {
         oom_attribution: u8 {
             default: 1,
             description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
+        },
+        m5_fw_trace: u32 {
+            default: 0,
+            description: "M5: firmware trace classes (power bit 0, submission bit 1, recovery classifier bit 9)",
         },
         g16_deadline_ms: u32 {
             default: 5000,
