@@ -558,6 +558,27 @@ static void cd321x_stop_work(struct cd321x *c) {
     init_mux = block(core, 'VISIBLE_IF_KUNIT int cd321x_init_mux(')
     production += init_mux.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
     production += function(core, 'cd321x_register_port') + '\n' + function(core, 'cd321x_unregister_port')
+    # A port that probed without its USB4/Thunderbolt router keeps watching for it.
+    if 'cd321x_tbt_watch_late(' in core:
+        mocks = mocks.replace(' bool state_valid,tbt_notifier_registered;\n',
+                              ' bool state_valid,tbt_notifier_registered;\n'
+                              ' struct work tbt_attach_work;\n struct fwnode_handle *tbt_fwnode;\n'
+                              ' struct notifier_block tbt_watch;\n bool tbt_watch_registered;\n', 1)
+        mocks = mocks.replace('static void cd321x_stop_work(struct cd321x *c) {\n', r'''#define INIT_WORK(p,fn) ((p)->pending=false)
+#define dev_warn(...) ((void)0)
+static int watches, watch_error;
+/* Like the real watch, hold the port fwnode until the port is unregistered. */
+static int cd321x_tbt_watch_late(struct cd321x *c,struct fwnode_handle *f) {
+ if(watch_error)return watch_error;
+ f->refs++;c->tbt_fwnode=f;c->tbt_watch_registered=true;watches++;return 0;
+}
+static void cd321x_stop_work(struct cd321x *c) {
+ if(c->tbt_watch_registered){assert(watches>0);watches--;c->tbt_watch_registered=false;}
+''', 1)
+        assert 'cd321x_tbt_watch_late(struct cd321x' in mocks and 'tbt_watch_registered;' in mocks
+        late_watch = True
+    else:
+        late_watch = False
     controls = r'''
 static void reset(struct cd321x *c) {
  memset(c,0,sizeof(*c));connector.refs=0;
@@ -707,6 +728,29 @@ int main(void) {
 #endif
  puts("PASS actual held mux gives up after its retries until an event; other failures end the hold-up");
 ''')
+
+    if late_watch:
+        quiet = ' mux_error=notifier_error=switch_error=0;'
+        assert controls.count(quiet) == 1
+        controls = controls.replace(quiet, ' assert(!watches);watch_error=0;\n' + quiet, 1)
+        even = ' assert(!ports&&!altmodes&&!muxes&&!switches&&!notifiers&&!connector.refs);\n}'
+        assert controls.count(even) == 1
+        controls = controls.replace(even, even[:-2] + '\n assert(!watches);\n}', 1)
+        optional = ' assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);\n cd321x_unregister_port(&c.tps);balanced();\n'
+        assert controls.count(optional) == 1
+        controls = controls.replace(optional, r''' assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
+ /* ...and the port keeps watching for a router that binds later. */
+ assert(watches==1&&c.tbt_watch_registered&&c.tbt_fwnode==&connector);
+ cd321x_unregister_port(&c.tps);balanced();
+ /* A watch that cannot start leaves the port probed without it. */
+ reset(&c);switch_error=-EPROBE_DEFER;keep_waiting=false;watch_error=-ENOMEM;
+ assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
+ assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
+ cd321x_unregister_port(&c.tps);balanced();
+ /* A router present at probe needs no watch. */
+ reset(&c);assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch&&!watches);
+ cd321x_unregister_port(&c.tps);balanced();
+''', 1)
 
     return prefix + pm + mocks + production + '\n#define TEST_DEFER 1\n#define TEST_FWNODE 1\n' + controls
 
