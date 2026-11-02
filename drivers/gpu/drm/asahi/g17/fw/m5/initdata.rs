@@ -1470,6 +1470,8 @@ pub(crate) const COMMON26_HW_PERF_RELATIVE_A: usize = 0x19e4;
 pub(crate) const COMMON26_HW_PERF_RELATIVE_B: usize = 0x1a24;
 
 const M5_HW_AUX_RELATIVE_FREQUENCY: usize = 0x1aa4;
+/// Modeled auxiliary-domain power per performance state ([`M5BoardPower::relative_aux`]).
+const M5_HW_AUX_RELATIVE_POWER: usize = 0x1a64;
 const M5_HW_AUX_PERF_STATE: usize = 0x1cac;
 const M5_HW_AUX_PERF_STATE_SIZE: usize = 0x148;
 
@@ -1514,6 +1516,33 @@ pub(crate) struct M5Board {
     pub(crate) windows: &'static [J714RegisterWindowSpec],
     /// The compute descriptor parameters that follow this GPU.
     pub(crate) compute: super::compute::Profile,
+    /// The board's GPU power model and power-policy controller values.
+    pub(crate) power: M5BoardPower,
+}
+
+/// The board's GPU power model and the policy controller values that depend on the board. The
+/// policy's controllers start from [`encode_m5_policy_controller_defaults`]; these replace the
+/// board-dependent words in it ([`encode_m5_board_power`]).
+pub(crate) struct M5BoardPower {
+    /// Modeled GPU power at the highest performance state, mW: the policy's maximum power, the
+    /// controllers' power ceilings and the initial host power budget (Region C +0x88).
+    pub(crate) maximum_mw: u32,
+    /// Modeled main-domain power per performance state, percent of the maximum (binary32 bits),
+    /// P0 first (HwData +0x19e4).
+    pub(crate) relative_main: [u32; M5_PERF_STATES],
+    /// Modeled auxiliary-domain power per performance state, percent of its maximum (binary32
+    /// bits), P0 first (HwData +0x1a64).
+    pub(crate) relative_aux: [u32; M5_PERF_STATES],
+    /// Leakage inputs of the power estimate (binary32 bits): per cluster core and SRAM, per die
+    /// auxiliary domain.
+    pub(crate) core_leakage: [u32; M5_PLATFORM_LANES],
+    pub(crate) sram_leakage: [u32; M5_PLATFORM_LANES],
+    pub(crate) aux_leakage: [u32; 2],
+    /// Controller gains and utilization targets: (policy offset, word).
+    pub(crate) controller: &'static [(usize, u32)],
+    /// Temperature-sensor channel masks of the GPU, auxiliary-domain and hotspot controllers:
+    /// (policy offset, five 64-bit words).
+    pub(crate) sensor_masks: [(usize, [u64; 5]); 3],
 }
 
 /// What the M5 hardware data takes from the platform: the board's fixed part and the tables the
@@ -1939,13 +1968,12 @@ pub(crate) fn encode_m5_hw_data(
     put_u32(g18, 0x10dc, platform.board.nominal_cores);
     put_u32(g18, 0x283a, 1);
     put_u32(g18, 0x283e, 1);
-    let top = platform.perf[platform.perf.len() - 1].0;
     for (state, &(frequency, core, sram)) in platform.perf.iter().enumerate() {
         put_u32(g18, COMMON26_HW_PERF_FREQUENCY + state * 4, frequency);
         put_u32(g18, COMMON26_HW_PERF_SCALE + state * 4, COMMON26_PERF_SCALE_VALUE);
 
-        let relative = frequency * 100 / top;
-        put_u32(g18, COMMON26_HW_PERF_RELATIVE_A + state * 4, relative);
+        put_u32(g18, COMMON26_HW_PERF_RELATIVE_A + state * 4, platform.board.power.relative_main[state]);
+        put_u32(g18, M5_HW_AUX_RELATIVE_POWER + state * 4, platform.board.power.relative_aux[state]);
         // Lanes past the platform's repeat its last one, as S's J714 rows repeated lane 0.
         for lane in 0..COMMON26_HW_PERF_LANES {
             let row = state * COMMON26_HW_PERF_ROW_STRIDE + lane * 4;
@@ -1980,12 +2008,54 @@ pub(crate) fn encode_m5_hw_data(
 
 pub(crate) const M5_POLICY_MAXIMUM_POWER: usize = 0xa18;
 
-/// Apply the calibrated maximum shared by the policy and host power input.
-pub(crate) fn set_m5_region_maximum_power(out: &mut [u8], maximum: u32)
-    -> Result<(), InitdataError> {
-    if out.len() < M5_REGION_C_ALLOCATION { return Err(InitdataError::BufferSize); }
-    if maximum == 0 { return Err(InitdataError::InterfaceMismatch); }
-    put_u32(out, 0x88, maximum);
+/// Policy words that hold the modeled maximum power in mW, the first being
+/// [`M5_POLICY_MAXIMUM_POWER`], and those that hold it as binary32.
+const M5_POLICY_MAXIMUM_POWER_WORDS: [usize; 6] = [M5_POLICY_MAXIMUM_POWER, 0xad0, 0x44a4, 0x44a8, 0x44ac, 0x45e4];
+const M5_POLICY_MAXIMUM_POWER_FLOATS: [usize; 2] = [0x9f4, 0x45e0];
+/// The policy's leakage inputs: per cluster core and SRAM, per die auxiliary domain.
+const M5_POLICY_CORE_LEAKAGE: usize = 0x121b0;
+const M5_POLICY_SRAM_LEAKAGE: usize = 0x12230;
+const M5_POLICY_AUX_LEAKAGE: usize = 0x12280;
+/// Region C's host power budget, mW.
+const M5_REGION_POWER_BUDGET: usize = 0x88;
+
+/// The policy controllers' configuration for the board: the controller defaults, then the
+/// board's power model and controller values over them. `bundle` is the shared cluster (policy
+/// at its policy offset).
+pub(crate) fn encode_m5_board_power(power: &M5BoardPower, bundle: &mut [u8]) -> Result<(), InitdataError> {
+    if power.maximum_mw == 0 { return Err(InitdataError::InterfaceMismatch); }
+    encode_m5_policy_controller_defaults(bundle)?;
+    let policy = &mut bundle[M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE];
+    for offset in M5_POLICY_MAXIMUM_POWER_WORDS {
+        put_u32(policy, offset, power.maximum_mw);
+    }
+    let maximum = crate::float::F32::from(power.maximum_mw).to_bits();
+    for offset in M5_POLICY_MAXIMUM_POWER_FLOATS {
+        put_u32(policy, offset, maximum);
+    }
+    for (index, (&core, &sram)) in power.core_leakage.iter().zip(&power.sram_leakage).enumerate() {
+        put_u32(policy, M5_POLICY_CORE_LEAKAGE + index * 4, core);
+        put_u32(policy, M5_POLICY_SRAM_LEAKAGE + index * 4, sram);
+    }
+    for (index, &aux) in power.aux_leakage.iter().enumerate() {
+        put_u32(policy, M5_POLICY_AUX_LEAKAGE + index * 4, aux);
+    }
+    for &(offset, value) in power.controller {
+        put_u32(policy, offset, value);
+    }
+    for (offset, words) in power.sensor_masks {
+        for (index, &word) in words.iter().enumerate() {
+            put_u64(policy, offset + index * 8, word);
+        }
+    }
+    Ok(())
+}
+
+/// Region C's initial host power budget: the board's modeled maximum (`region_c` encoded).
+pub(crate) fn set_m5_region_power_budget(power: &M5BoardPower, region_c: &mut [u8]) -> Result<(), InitdataError> {
+    if region_c.len() < M5_REGION_C_ALLOCATION { return Err(InitdataError::BufferSize); }
+    if power.maximum_mw == 0 { return Err(InitdataError::InterfaceMismatch); }
+    put_u32(region_c, M5_REGION_POWER_BUDGET, power.maximum_mw);
     Ok(())
 }
 
@@ -2144,24 +2214,11 @@ pub(crate) fn encode_m5_bundle_policy(
     Ok(())
 }
 
-/// Initial controller inputs for J714 with the matched calibration.
+/// The policy controllers' configuration (S's J714 defaults), before the board's power values
+/// ([`encode_m5_board_power`]). The modeled power tables are HwData's, which
+/// [`encode_m5_hw_data`] writes from the board.
 pub(crate) fn encode_m5_policy_controller_defaults(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() < M5_SHARED_PREFIX_SIZE { return Err(InitdataError::BufferSize); }
-    // Both calibrated hardware curves are the values 26A428 reports on J714.
-    const RELATIVE_POWER_MAIN: [u32; 16] = [
-        0x00000000, 0x4106f651, 0x413ea3b9, 0x4180c1c6,
-        0x41b433fc, 0x41ccaf2d, 0x41f7a8ee, 0x42104b59,
-        0x4228d2f7, 0x424956c5, 0x426d29a9, 0x428da278,
-        0x42b4e595, 0x42c80000, 0x00000000, 0x00000000,
-    ];
-    for (index, &value) in RELATIVE_POWER_MAIN.iter().enumerate() { put_u32(out, 0x19e4 + index * 4, value); }
-    const RELATIVE_POWER_AUX: [u32; 16] = [
-        0x00000000, 0x4105a0ed, 0x414a36f5, 0x418b74a8,
-        0x41c1510d, 0x41df97fb, 0x420be387, 0x4223193c,
-        0x423cc4e6, 0x42604354, 0x427ef922, 0x42957243,
-        0x42b6ec22, 0x42c80000, 0x00000000, 0x00000000,
-    ];
-    for (index, &value) in RELATIVE_POWER_AUX.iter().enumerate() { put_u32(out, 0x1a64 + index * 4, value); }
     let policy = &mut out[M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE];
     const INITIAL: &[(usize, u32)] = &[
         (0xd4, 0x3f828f5c),

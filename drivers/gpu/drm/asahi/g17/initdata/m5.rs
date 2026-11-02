@@ -3,9 +3,10 @@
 //! The M5 (26A428) bootstrap graph: linux-aurora t6050-gpu's `build_m5` (g17/initdata/m5.rs) on
 //! this tree's objects, built after both coprocessors published their kernel roots
 //! ([`mmu::UatFirmware::PublishedRoots`]) instead of before an SPTM context bind, and with the
-//! platform's values ([`m::M5Platform`]) in place of J714's. No metrics alias and no J714
-//! power-controller calibration. The objects the GPU reaches through the kernel lower root are
-//! mapped there before the coprocessors start ([`InitData::prepare_m5_lower`]).
+//! platform's values ([`m::M5Platform`]) in place of J714's: the board's power model under the
+//! policy controllers' defaults, and no metrics alias. The objects the GPU reaches through the
+//! kernel lower root are mapped there before the coprocessors start
+//! ([`InitData::prepare_m5_lower`]).
 
 use super::*;
 use crate::g17::fw::m5::initdata as m;
@@ -193,6 +194,17 @@ impl InitData {
             self.object_mut(self.bundle)?.bytes_mut(),
         )
         .map_err(|e| bad("policy", e))?;
+        // The policy controllers and the board's power model; Region C's budget with them.
+        m::encode_m5_board_power(
+            &platform.board.power,
+            self.object_mut(self.bundle)?.bytes_mut(),
+        )
+        .map_err(|e| bad("power policy", e))?;
+        m::set_m5_region_power_budget(
+            &platform.board.power,
+            self.object_mut(self.region_c)?.bytes_mut(),
+        )
+        .map_err(|e| bad("power budget", e))?;
         for (index, role) in [m::InstanceRole::Primary, m::InstanceRole::Secondary]
             .into_iter()
             .enumerate()

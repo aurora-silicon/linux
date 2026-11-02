@@ -248,4 +248,80 @@ pub(crate) const M5_BOARD: M5Board = M5Board {
         dispatch_control: crate::g17::fw::m5::compute::dispatch_control(0x10c0_8860, CLUSTERS),
         auxiliary_control: 0,
     },
+    power: crate::g17::fw::m5::initdata::M5BoardPower {
+        // The power model over the main and auxiliary operating points of both dies (64 cores,
+        // 110 C), with the synthetic leakage inputs below: P13 sums to 345262 mW.
+        maximum_mw: 345_262,
+        relative_main: [
+            0x0000_0000,
+            0x4107_2435,
+            0x414b_7ecd,
+            0x4187_dfa6,
+            0x41be_759c,
+            0x41d6_f4a2,
+            0x41ff_340b,
+            0x4215_4139,
+            0x4226_cc22,
+            0x4247_2db8,
+            0x426b_3fa4,
+            0x428b_aed3,
+            0x42b6_c65b,
+            0x42c8_0000,
+        ],
+        relative_aux: [
+            0x0000_0000,
+            0x4106_2d7e,
+            0x4154_96b9,
+            0x4189_3d11,
+            0x41ba_e22e,
+            0x41d5_33ed,
+            0x4202_7bcd,
+            0x421c_12dd,
+            0x4230_6915,
+            0x4250_6a36,
+            0x427d_e40c,
+            0x4294_0cc0,
+            0x42bd_bd8e,
+            0x42c8_0000,
+        ],
+        // Synthetic leakage: 1350 per cluster core and per die auxiliary domain, 51 per cluster
+        // SRAM.
+        core_leakage: [0x44a8_c000; 8],
+        sram_leakage: [0x424c_0000; 8],
+        aux_leakage: [0x44a8_c000; 2],
+        // Power-controller integral and proportional gains (0.08, 0.005), the second controller's
+        // (0.01, 0.28), and the utilization thresholds 75 and 95.
+        controller: &[
+            (0xaa0, 0x3da3_d70b),
+            (0xab0, 0x3ba3_d70a),
+            (0x45b4, 0x3c23_d70b),
+            (0x45c4, 0x3e8f_5c29),
+            (0xb44, 75),
+            (0xb48, 95),
+        ],
+        // The 160 GPU and 8 auxiliary-domain channels of the two dies; the hotspot set is both.
+        sensor_masks: [
+            (
+                0x2324,
+                [
+                    0x6fcc_3fcc_0000_0000,
+                    0x6fcc_3fcc_6fcc_3fcc,
+                    0x6fcc_3fcc_6fcc_3fcc,
+                    0x6fcc_3fcc_6fcc_3fcc,
+                    0x0000_0000_6fcc_3fcc,
+                ],
+            ),
+            (0x2cfc, [0x0000_0000_0303_0303, 0, 0, 0, 0]),
+            (
+                0x4ba4,
+                [
+                    0x6fcc_3fcc_0303_0303,
+                    0x6fcc_3fcc_6fcc_3fcc,
+                    0x6fcc_3fcc_6fcc_3fcc,
+                    0x6fcc_3fcc_6fcc_3fcc,
+                    0x0000_0000_6fcc_3fcc,
+                ],
+            ),
+        ],
+    },
 };
