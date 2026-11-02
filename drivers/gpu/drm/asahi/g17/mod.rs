@@ -662,7 +662,7 @@ impl Drop for Firmware {
             secondary.stop();
         }
         self.primary.stop();
-        self.port.set_effort_full(false);
+        self.port.set_effort_streaming(false);
         self.pool.stop_after_firmware();
         // RTKit destruction releases the mailbox power references. Clear the bridge while
         // those references still keep the register block powered.
@@ -711,26 +711,27 @@ impl Firmware {
     fn note_submission(&mut self) -> Result {
         self.port.note_gpu_activity();
         self.effort.submit();
-        self.apply_effort(power::FULL_EFFORT)
+        self.apply_effort(true)
     }
 
-    fn apply_effort(&mut self, effort: u32) -> Result {
-        Self::apply_shared_effort(&self.init, &mut self.effort, &self.port, effort)
+    fn apply_effort(&mut self, streaming: bool) -> Result {
+        Self::apply_shared_effort(&self.init, &mut self.effort, &self.port, streaming)
     }
 
+    /// Publishes the firmware build's effort input for streaming work, or zero once idle.
     fn apply_shared_effort(
         init: &initdata::InitData,
         state: &mut power::Effort,
         port: &port::Port,
-        effort: u32,
+        streaming: bool,
     ) -> Result {
-        if state.applied() == effort && init.effort()? == effort {
-            return Ok(());
+        let effort = state.target(streaming);
+        if state.applied() != effort || init.effort()? != effort {
+            init.publish_effort(effort)?;
+            trace::message(trace::EFFORT, u64::from(effort));
+            state.did_apply(effort);
         }
-        init.publish_effort(effort)?;
-        trace::message(trace::EFFORT, u64::from(effort));
-        state.did_apply(effort);
-        port.set_effort_full(effort == power::FULL_EFFORT);
+        port.set_effort_streaming(streaming);
         Ok(())
     }
 
@@ -747,13 +748,13 @@ impl Firmware {
         let effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
-                self.port.set_effort_full(false);
+                self.port.set_effort_streaming(false);
                 if self.port.submissions() != submissions {
-                    self.port.set_effort_full(true);
+                    self.port.set_effort_streaming(true);
                     self.effort.submit();
                     return Ok(Some(power::IDLE_HOLD_NS));
                 }
-                self.apply_effort(0)?;
+                self.apply_effort(false)?;
                 None
             }
             power::IdleAction::Recheck(delay) => Some(delay),
@@ -1425,7 +1426,7 @@ impl Gpu {
                 seen_submissions: 0,
                 rings: channel::Rings::new()?,
                 recovery: recovery::State::new(),
-                effort: power::Effort::new(),
+                effort: power::Effort::new(shared.variant.effort),
                 hold: power::Hold::new(),
                 registration_power_release_pending: false,
                 variant: shared.variant,
@@ -1764,20 +1765,24 @@ impl gpu::Gpu for Gpu {
     }
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
-        params.features |=
-            u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
-                | sync_output::FEATURE_CUMULATIVE_SIGNALS;
         let variant = self.shared.variant;
-        if variant.few_primitives {
+        // Features belong to the submission path that implements them: the M5 profile has no
+        // DRM submission yet, so it advertises none of them.
+        if variant.submission == fw::variant::Submission::Doorbell {
             params.features |=
-                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
-        }
-        if variant.ray_traversal {
-            params.features |=
-                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
+                    | sync_output::FEATURE_CUMULATIVE_SIGNALS;
+            if variant.few_primitives {
+                params.features |=
+                    u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
+            }
+            if variant.ray_traversal {
+                params.features |=
+                    u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
+            }
         }
         params.gpu_generation = self.cfg.gpu_generation as u32;
         params.gpu_variant = self.cfg.identity.gpu_variant as u32;

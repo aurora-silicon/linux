@@ -603,7 +603,8 @@ impl G17Resources {
     }
 
     /// Publishes through the M5 host command port, including the kick that makes an idle queue
-    /// runnable. Core activity is not a prerequisite.
+    /// runnable. Core activity is not a prerequisite. The caller serializes the port's
+    /// transactions (`g17::port::Port`).
     pub(crate) fn submit_m5_work(
         &self,
         submission: &crate::g17::fw::m5::queue::HardwareSubmission,
@@ -616,8 +617,8 @@ impl G17Resources {
         Ok(())
     }
 
-    /// Samples the two owned queue configuration words through the host tag/data port. The
-    /// caller holds the device mutex and power hold.
+    /// Samples the two owned queue configuration words through the host tag/data port, which
+    /// the caller serializes (`g17::port::Port`). EAGAIN while SGX+0xe01000's low nibble is clear.
     pub(crate) fn m5_queue_configurations(&self, qids: [u8; 2]) -> Result<[u64; 2]> {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();

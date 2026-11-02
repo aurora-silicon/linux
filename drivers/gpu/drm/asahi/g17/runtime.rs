@@ -1413,12 +1413,13 @@ impl compute::Host for ComputeHost<'_> {
     }
     fn note_submission(&mut self) -> Result {
         self.effort.submit();
-        super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
+        super::Firmware::apply_shared_effort(self.init, self.effort, self.port, true)
     }
 }
 
 /// Publication into a bound, installed queue through the port alone. The caller checked the
-/// recovery state, full effort and the queue's binding; first installation never comes here.
+/// recovery state, the submission effort and the queue's binding; first installation never
+/// comes here.
 struct DirectHost<'a> {
     port: &'a super::port::Port,
     outer: Option<super::port::OuterClaim<'a>>,
@@ -1793,7 +1794,7 @@ impl Backend {
         if self.shared.crashed.load(Ordering::Acquire) || port.recovery_state().ok()? != 0 {
             return None;
         }
-        // Full effort is applied by the device-mutex path when it is not already.
+        // The submission effort is applied by the device-mutex path when it is not already.
         if !port.note_submission() {
             return None;
         }

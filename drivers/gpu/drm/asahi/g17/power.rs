@@ -5,6 +5,7 @@
 
 use core::sync::atomic::AtomicU32;
 
+/// The effort input of streaming work on the builds that publish one (`Variant::effort`).
 pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
 
@@ -40,16 +41,24 @@ pub(super) struct Effort {
     idle_since: Option<u64>,
     applied: u32,
     submissions: u64,
+    /// The effort input while work streams: the firmware build's (`Variant::effort`).
+    submission_effort: u32,
 }
 
 impl Effort {
-    pub(super) const fn new() -> Self {
+    pub(super) const fn new(submission_effort: u32) -> Self {
         Self {
             streaming: false,
             idle_since: None,
             applied: 0,
             submissions: 0,
+            submission_effort,
         }
+    }
+
+    /// The effort input to publish while work streams (`streaming`) or once it is idle.
+    pub(super) fn target(&self, streaming: bool) -> u32 {
+        if streaming { self.submission_effort } else { 0 }
     }
 
     pub(super) fn submit(&mut self) {

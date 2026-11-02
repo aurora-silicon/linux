@@ -92,8 +92,13 @@ unsafe impl Sync for Views {}
 #[pin_data]
 pub(super) struct Port {
     views: SetOnce<Views>,
-    /// Register access for tracing the core power state at the doorbell.
+    /// Register access: the M5 host command port, and the core power state for tracing at
+    /// the doorbell.
     regs: SetOnce<crate::regs::G17Resources>,
+    /// Serializes the M5 host command port, whose transactions write a tag to SGX `0x4090` and
+    /// then data to or from `0x4098`.
+    #[pin]
+    host: SpinLock<()>,
     /// Compute work-ring slots reserved by publishers that have not exposed them yet.
     #[pin]
     rings: SpinLock<[u32; PRIORITIES]>,
@@ -114,8 +119,9 @@ pub(super) struct Port {
     generation: AtomicU64,
     /// Device publication order shared by compute and render commands.
     publications: AtomicU64,
-    /// Full firmware effort is applied; cleared before an idle clear rechecks `submissions`.
-    effort_full: AtomicBool,
+    /// The submission effort is applied (`power::Effort`); cleared before an idle clear rechecks
+    /// `submissions`.
+    effort_streaming: AtomicBool,
     demand: super::power::Demand,
     last_submission_ns: AtomicU64,
     submissions: AtomicU64,
@@ -163,6 +169,7 @@ impl Port {
             pin_init!(Self {
                 views: SetOnce::new(),
                 regs: SetOnce::new(),
+                host <- new_spinlock!((), "g17::Port::host"),
                 rings <- new_spinlock!([0; PRIORITIES], "g17::Port::rings"),
                 qos <- new_spinlock!(qos::Accounting::new(), "g17::Port::qos"),
                 rx: SetOnce::new(),
@@ -171,7 +178,7 @@ impl Port {
                 render <- new_mutex!((), "g17::Port::render"),
                 generation: AtomicU64::new(0),
                 publications: AtomicU64::new(0),
-                effort_full: AtomicBool::new(false),
+                effort_streaming: AtomicBool::new(false),
                 demand,
                 last_submission_ns: AtomicU64::new(0),
                 submissions: AtomicU64::new(0),
@@ -254,6 +261,41 @@ impl Port {
         reserved[claim.priority] = reserved[claim.priority].saturating_sub(1);
         claim.armed = false;
         Ok(next)
+    }
+
+    /// M5: exposes `record` in its reserved slot and notifies the firmware of compute work at the
+    /// slot's priority, then runs `submission` through the host command port. The notification
+    /// comes first because an idle-policy hold alone does not wake gated cores (linux-aurora's
+    /// M5 compute publication); neither step needs the cores powered. `None` publishes work the
+    /// queue's existing configuration covers, such as its installation. Returns the new producer.
+    pub(super) fn publish_m5_compute(
+        &self,
+        claim: OuterClaim<'_>,
+        record: &WorkSlot,
+        submission: Option<&super::fw::m5::queue::HardwareSubmission>,
+    ) -> Result<u32> {
+        let priority = claim.priority as u64;
+        let next = self.publish_compute(claim, record)?;
+        self.notify((0x83 << super::MSG_TYPE_SHIFT) | DataMaster::Compute as u64 | priority << 2)?;
+        if let Some(submission) = submission {
+            fence(Ordering::SeqCst);
+            self.host_command(|regs| regs.submit_m5_work(submission))?;
+        }
+        Ok(next)
+    }
+
+    /// Samples the M5 queue configuration words of `qids` through the host command port.
+    pub(super) fn m5_queue_configurations(&self, qids: [u8; 2]) -> Result<[u64; 2]> {
+        self.host_command(|regs| regs.m5_queue_configurations(qids))
+    }
+
+    fn host_command<T>(
+        &self,
+        transaction: impl FnOnce(&crate::regs::G17Resources) -> Result<T>,
+    ) -> Result<T> {
+        let regs = self.regs.as_ref().ok_or(ENODEV)?;
+        let _host = self.host.lock();
+        transaction(regs)
     }
 
     /// Taken around every render publication; see `render`.
@@ -467,22 +509,22 @@ impl Port {
         self.publications.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// A publisher without the device mutex counts itself before it checks that full effort is
-    /// applied. The idle clear withdraws the flag before it rechecks the count, so either the
-    /// clear sees this submission or this submission sees the flag withdrawn.
+    /// A publisher without the device mutex counts itself before it checks that the submission
+    /// effort is applied. The idle clear withdraws the flag before it rechecks the count, so
+    /// either the clear sees this submission or this submission sees the flag withdrawn.
     pub(super) fn note_submission(&self) -> bool {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         self.note_gpu_activity();
-        self.effort_full.load(Ordering::SeqCst)
+        self.effort_streaming.load(Ordering::SeqCst)
     }
 
     pub(super) fn submissions(&self) -> u64 {
         self.submissions.load(Ordering::SeqCst)
     }
 
-    pub(super) fn set_effort_full(&self, full: bool) {
-        self.effort_full.store(full, Ordering::SeqCst);
-        self.demand.set_active(full);
+    pub(super) fn set_effort_streaming(&self, streaming: bool) {
+        self.effort_streaming.store(streaming, Ordering::SeqCst);
+        self.demand.set_active(streaming);
     }
 
     pub(super) fn note_gpu_activity(&self) {
@@ -491,8 +533,8 @@ impl Port {
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        writeln!(f, "effort_full={} direct_submissions={} last_submission_ns={}",
-            self.effort_full.load(Ordering::SeqCst), self.submissions(),
+        writeln!(f, "effort_streaming={} direct_submissions={} last_submission_ns={}",
+            self.effort_streaming.load(Ordering::SeqCst), self.submissions(),
             self.last_submission_ns.load(Ordering::Relaxed))
     }
 }

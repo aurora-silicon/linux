@@ -39,6 +39,19 @@ pub(crate) enum InitGraph {
     M5,
 }
 
+/// How the host makes published compute work runnable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Submission {
+    /// The work ring and its doorbell; the firmware wakes the cores for the work the ring
+    /// names. DRM compute and render submission use it.
+    Doorbell,
+    /// The work ring and its doorbell, then the M5 host command port (SGX `0x4090`/`0x4098`)
+    /// that makes the queue runnable (`Port::publish_m5_compute`). Only the arithmetic
+    /// qualification submits this way; DRM submission is not supported yet, so the profile
+    /// advertises no submission features.
+    M5HostCommand,
+}
+
 /// The layouts and rules of one G17 firmware build.
 pub(crate) struct Variant {
     /// The initialization graph.
@@ -68,6 +81,11 @@ pub(crate) struct Variant {
     pub(crate) lead_commands: bool,
     /// Register programs of the render descriptors.
     pub(crate) programs: super::render::RegisterPrograms,
+    /// How published compute work becomes runnable.
+    pub(crate) submission: Submission,
+    /// The performance effort the host publishes in Region C while submitted work streams
+    /// (`power::Effort`); idle publishes zero.
+    pub(crate) effort: u32,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -108,6 +126,8 @@ pub(crate) const V26A428: Variant = Variant {
     fragment_busy: true,
     lead_commands: false,
     programs: super::render::RegisterPrograms::G17P,
+    submission: Submission::Doorbell,
+    effort: crate::g17::power::FULL_EFFORT,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -136,14 +156,38 @@ pub(crate) const V25G83: Variant = Variant {
     fragment_busy: false,
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
+    submission: Submission::Doorbell,
+    effort: crate::g17::power::FULL_EFFORT,
 };
 
-/// The M5 firmware (26A428, macOS 27.0). Its submission rules are not established yet: only
-/// the bootstrap graph is built, and the queue fields are the A18 Pro build's until they are.
+/// The M5 firmware (26A428, macOS 27.0), native. Every field is this build's own: the A18 Pro
+/// build shares its firmware version but not its submission rules. Only the bootstrap graph
+/// and the arithmetic qualification run on it; DRM submission is not supported yet.
 pub(crate) const V26A428_M5: Variant = Variant {
     graph: InitGraph::M5,
+    init_ack: InitAck::Message,
+    power_on_done: true,
+    // The qualification's QID 11 is the host's; no lower firmware-owned range is known.
+    qid_floor: 0,
+    // As the A18 Pro's; the qualification's inner cursors follow this producer.
+    pointers: PointerLayout {
+        producer: 0x40,
+        recovery_target: Some(0x50),
+    },
     mmio_pair_registration: false,
-    ..V26A428
+    // No M5 render path exists, so none of its features do.
+    mcache: false,
+    few_primitives: false,
+    ray_traversal: false,
+    fragment_busy: false,
+    lead_commands: false,
+    // A placeholder: M5 render register programs are not established, and no M5 render
+    // descriptor is built.
+    programs: super::render::RegisterPrograms::G17P,
+    submission: Submission::M5HostCommand,
+    // linux-aurora publishes zero on M5 (its submission_effort), leaving performance to the
+    // firmware's own policy.
+    effort: 0,
 };
 
 const _: () = {

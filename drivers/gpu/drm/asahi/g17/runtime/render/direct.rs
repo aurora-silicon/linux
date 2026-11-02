@@ -110,7 +110,7 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
             .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2)
     }
     fn note_submission(&mut self) -> Result {
-        // Counted, with full effort witnessed, before the pair was lent.
+        // Counted, with the submission effort witnessed, before the pair was lent.
         Ok(())
     }
     fn complete_render(
@@ -277,7 +277,7 @@ impl Backend {
         if self.shared.crashed.load(Ordering::Acquire) || port.recovery_state().ok()? != 0 {
             return None;
         }
-        // Full effort is applied by the device-mutex path when it is not already.
+        // The submission effort is applied by the device-mutex path when it is not already.
         if !port.note_submission() {
             return None;
         }
