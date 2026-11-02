@@ -240,13 +240,12 @@ pub(crate) const M5_BOARD: M5Board = M5Board {
     // One voltage lane per cluster.
     lanes: 8,
     windows: &WINDOWS,
-    // The operand layout follows the topology; the rest is the J714 tuple the arithmetic
+    // The operand layout and dispatch control follow the topology; the rest is the J714 tuple the arithmetic
     // qualification passes with on this GPU (see `Profile`).
     compute: crate::g17::fw::m5::compute::Profile {
         preempt_state_offset: 0x1480,
         operand: crate::g17::fw::m5::compute::OperandLayout::of(CLUSTERS, CORE_SLOTS),
-        // Without the >4-cluster topology term.
-        dispatch_control: 0x10c0_8860,
+        dispatch_control: crate::g17::fw::m5::compute::dispatch_control(0x10c0_8860, CLUSTERS),
         auxiliary_control: 0,
         no_storage: crate::g17::fw::m5::compute::Resources {
             control: 0x54b,

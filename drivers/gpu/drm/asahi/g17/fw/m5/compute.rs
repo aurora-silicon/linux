@@ -42,7 +42,8 @@ pub(crate) const COMPLETION_IDENTITY: u64 = 1;
 /// board ([`super::initdata::M5Board::compute`]), which the arithmetic qualification and DRM
 /// submission both encode through [`crate::g17::queue::m5::Channel`].
 ///
-/// The operand layout follows the GPU's topology ([`OperandLayout::of`]); the rest is the J714
+/// The operand layout and the dispatch control's cluster bits follow the GPU's topology
+/// ([`OperandLayout::of`], [`dispatch_control`]); the rest is the J714
 /// tuple the qualification passes with. S's normal-compute tuple (`0x1b80`, `0x1e000`,
 /// `0x3d800`, `0x14c08a60`, 1) is not used: it is unqualified on this GPU.
 pub(crate) struct Profile {
