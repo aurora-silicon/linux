@@ -484,6 +484,13 @@ static inline int ane_fw_transport_poll(struct ane_fw_transport *t, unsigned int
 	t->ops->read_barrier(t->ctx);
 	length = t->ops->load64(t->ctx, p + 8);
 	result = t->ops->load64(t->ctx, p + 16);
+	/*
+	 * The control ring (DEBUG) completes with DVA|1 and the length, but
+	 * leaves the result word as published, the command size (H17 C6: 0x31
+	 * completed as 0x...581 0x18 0x18). The IO rings write zero there.
+	 */
+	if (ch == t->control_ch && result == tx->size)
+		result = 0;
 	ret = ane_fw_reply_status(header, length, result, tx->dva, tx->size,
 				  tx->id, (u8 *)t->pool.cpu + (tx->dva - t->pool.dva), true);
 	if (ret)
