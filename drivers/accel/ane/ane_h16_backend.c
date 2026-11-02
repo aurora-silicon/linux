@@ -479,6 +479,14 @@ static void ane_h16_refused(void *ctx, u64 w0, u64 w1, u64 w2, int error)
 		w0, w1, w2, error);
 }
 
+static void ane_h16_shared_note(void *ctx, const char *event, u64 dva, u64 size, u32 tag)
+{
+	struct ane_h16_device *h = ctx;
+
+	dev_info(h->dev, "H16 SHAREDMALLOC %s bytes %llx tag %08x DVA %llx\n",
+		 event, size, tag, dva);
+}
+
 static const struct ane_h16_boot_ops ane_h16_ops = {
 	.read32 = ane_h16_mmio_read32,
 	.read64 = ane_h16_mmio_read64,
@@ -509,6 +517,7 @@ static const struct ane_fw_transport_ops ane_h16_transport_ops = {
 	.relax = ane_h16_relax,
 	.alloc = ane_h16_alloc_shared,
 	.refused = ane_h16_refused,
+	.shared_note = ane_h16_shared_note,
 };
 
 /* Pre-RUN rollback of everything a stage acquired. h itself stays. */

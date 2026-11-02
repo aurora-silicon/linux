@@ -973,6 +973,115 @@ static void ane_transport_free_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_test_writes(f), 0U);
 }
 
+/*
+ * One program lifetime: the firmware asks for an EXPP pool at LOAD, then
+ * frees it. With late=true the FREE of each pool comes only after the next
+ * program asked for its own, as observed on H17. Returns the DVA served.
+ */
+static u64 ane_test_pool_cycle(struct ane_transport_test *f, u64 *pending)
+{
+	struct kunit *test = f->test;
+	u64 dva;
+	u8 *slot;
+	unsigned int i;
+
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	slot = ane_test_slot(f, ANE_FW_SHAREDMALLOC);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	dva = get_unaligned_le64(slot) & ~1ULL;
+	for (i = 0; i < f->t.shared_count; i++)
+		if (f->t.shared[i].dva == dva)
+			break;
+	KUNIT_ASSERT_LT(test, i, f->t.shared_count);
+	KUNIT_EXPECT_FALSE(test, f->t.shared_retired[i]);
+	/* Served memory is zero, whatever the previous program left. */
+	KUNIT_EXPECT_FALSE(test, memchr_inv(f->t.shared[i].cpu, 0, SZ_2M));
+	memset(f->t.shared[i].cpu, 0xa5, SZ_2M);
+	if (pending) {
+		if (*pending) {
+			ane_test_shared_request(f, *pending, 0, 0);
+			KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+		}
+		*pending = dva;
+	} else {
+		ane_test_shared_request(f, dva, 0, 0);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	}
+	return dva;
+}
+
+/* Twenty program lifetimes in one boot never run out of shared quota. */
+static void ane_transport_pool_reuse_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u64 first, pending = 0, dva[2];
+	size_t bytes;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_64K, 0x4c4f47);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	f->t.allow_free = true;
+	first = ane_test_pool_cycle(f, NULL);
+	bytes = f->t.shared_bytes;
+	for (i = 1; i < 20; i++)
+		KUNIT_EXPECT_EQ(test, ane_test_pool_cycle(f, NULL), first);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 2U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, bytes);
+	KUNIT_EXPECT_EQ(test, f->t.free_count, 20U);
+	KUNIT_EXPECT_EQ(test, f->refusals, 0U);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+
+	/* Late FREE: two pools alternate, still no growth after the second. */
+	for (i = 0; i < 20; i++) {
+		dva[i % 2] = ane_test_pool_cycle(f, &pending);
+		if (i >= 2)
+			KUNIT_EXPECT_NE(test, dva[0], dva[1]);
+	}
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 3U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, bytes + SZ_2M);
+	KUNIT_EXPECT_EQ(test, f->t.error, 0);
+
+	/* A retired pool never serves another tag or size. */
+	ane_test_shared_request(f, pending, 0, 0);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	ane_test_shared_request(f, 0, SZ_64K, 0x4c4f47);
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 4U);
+}
+
+/* H16 26A428 takes the native FREE reply 1; the pool is reused the same way. */
+static void ane_transport_pool_reuse_native_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	u64 first;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	f->t.native_free = true;
+	first = ane_test_pool_cycle(f, NULL);
+	for (i = 1; i < 20; i++)
+		KUNIT_EXPECT_EQ(test, ane_test_pool_cycle(f, NULL), first);
+	KUNIT_EXPECT_EQ(test, f->t.shared_count, 1U);
+	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, (size_t)SZ_2M);
+	KUNIT_EXPECT_EQ(test, f->refusals, 0U);
+}
+
+/* Without FREE the quota still runs out: nothing the firmware owns is reused. */
+static void ane_transport_pool_no_free_test(struct kunit *test)
+{
+	struct ane_transport_test *f = test->priv;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
+	for (i = 0; i < ANE_FW_SHARED_TOTAL / SZ_2M; i++) {
+		ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+		KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
+	}
+	ane_test_shared_request(f, 0, SZ_2M, ANE_FW_SHARED_EXPP);
+	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOSPC);
+}
+
 static void ane_transport_free_refusal_test(struct kunit *test)
 {
 	struct ane_transport_test *f = test->priv;
@@ -1126,6 +1235,9 @@ static struct kunit_case ane_transport_cases[] = {
 	KUNIT_CASE(ane_transport_bar_context_h16_test),
 	KUNIT_CASE(ane_transport_deny_test),
 	KUNIT_CASE(ane_transport_free_test),
+	KUNIT_CASE(ane_transport_pool_reuse_test),
+	KUNIT_CASE(ane_transport_pool_reuse_native_test),
+	KUNIT_CASE(ane_transport_pool_no_free_test),
 	KUNIT_CASE(ane_transport_free_refusal_test),
 	KUNIT_CASE(ane_transport_table_test),
 	KUNIT_CASE(ane_transport_table_roles_test),

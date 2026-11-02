@@ -86,6 +86,8 @@ struct ane_fw_transport_ops {
 	void (*relax)(void *ctx, u64 waited_ns);
 	int (*alloc)(void *ctx, size_t size, u32 tag, struct ane_fw_surface *surface);
 	void (*refused)(void *ctx, u64 word0, u64 word1, u64 word2, int error);
+	/* Optional: a shared allocation was freed ("FREE") or served again ("reuse"). */
+	void (*shared_note)(void *ctx, const char *event, u64 dva, u64 size, u32 tag);
 };
 
 struct ane_fw_transaction {
@@ -483,12 +485,21 @@ static inline int ane_fw_shared_size(u64 word0, u64 bytes, u64 tag, size_t *size
 	return 0;
 }
 
+static inline void ane_fw_shared_note(struct ane_fw_transport *t, const char *event,
+				      unsigned int i)
+{
+	if (t->ops->shared_note)
+		t->ops->shared_note(t->ctx, event, t->shared[i].dva, t->shared[i].size,
+				    t->shared_tags[i]);
+}
+
 /*
  * SHAREDMALLOC FREE of a live allocation. Backing storage, its mapping and
- * its quota stay until reset; FREE only retires the surface, so no later
- * report resolves into it. Reply before revoking authority. H16 26A428 (r5
- * section 6) takes the reply 1. H17 25G83 takes the observed DVA|1, and its
- * request carries zero length and handle.
+ * its quota stay until reset; FREE retires the surface, so no later report
+ * resolves into it, and makes it available to a later request of the same
+ * tag and size (ane_fw_shared_reusable()). Reply before revoking authority.
+ * H16 26A428 (r5 section 6) takes the reply 1. H17 25G83 takes the observed
+ * DVA|1, and its request carries zero length and handle.
  */
 static inline int
 ane_fw_transport_free(struct ane_fw_transport *t, void *slot, u64 dva, u64 bytes, u64 tag)
@@ -513,7 +524,28 @@ ane_fw_transport_free(struct ane_fw_transport *t, void *slot, u64 dva, u64 bytes
 	t->shared_retired[i] = true;
 	t->free_count++;
 	ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
+	ane_fw_shared_note(t, "FREE", i);
 	return 0;
+}
+
+/*
+ * A retired allocation that can serve a new request of this tag and size, or
+ * shared_count. Every program LOAD asks for a 2 MiB EXPP process pool and the
+ * firmware frees it after UNLOAD (often only during a later program), but the
+ * backing stays mapped until reset: without reuse the 12 MiB quota ran out at
+ * the sixth program of a boot. Only memory the firmware itself gave back by
+ * FREE is served again, and only for the same tag and size.
+ */
+static inline unsigned int
+ane_fw_shared_reusable(const struct ane_fw_transport *t, size_t size, u64 tag)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->shared_count; i++)
+		if (t->shared_retired[i] && t->shared[i].size == size &&
+		    t->shared_tags[i] == tag)
+			return i;
+	return t->shared_count;
 }
 
 static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
@@ -548,6 +580,21 @@ static inline int ane_fw_transport_shared(struct ane_fw_transport *t)
 	ret = ane_fw_shared_size(word0, word1, word2, &size);
 	if (ret)
 		goto refused;
+	i = ane_fw_shared_reusable(t, size, word2);
+	if (i < t->shared_count) {
+		/* Same DVA, same handle as when first served; zeroed like new memory. */
+		memset(t->shared[i].cpu, 0, size);
+		t->shared_retired[i] = false;
+		t->ops->store64(t->ctx, p + 8, 0);
+		t->ops->store64(t->ctx, p + 16, i + 1);
+		t->ops->write_barrier(t->ctx);
+		t->ops->store64(t->ctx, p, t->shared[i].dva | 1);
+		t->ops->write_barrier(t->ctx);
+		ane_fw_transport_doorbell(t, ANE_FW_SHAREDMALLOC);
+		ane_fw_transport_advance(t, ANE_FW_SHAREDMALLOC);
+		ane_fw_shared_note(t, "reuse", i);
+		return 0;
+	}
 	if (t->shared_count == ANE_FW_SHARED_MAX || size > ANE_FW_SHARED_TOTAL -
 	    t->shared_bytes) {
 		ret = -ENOSPC;
