@@ -300,7 +300,7 @@ class DiagSensorTest(unittest.TestCase):
             ((1, 1, unverified, 2, blocked), '2 1 loaded 2 blocked'),  # ... after refusals
             ((2, 1, unverified, 0, 0), '2 2 loaded 0 unverified'),
             ((1, 0, blocked, 0, 0), '2 1 unavailable 0 blocked'),   # no list
-            ((1, 1, blocked, 0, 0), '2 1 loaded 0 blocked'),        # cold boot, level 1
+            ((1, 1, blocked, 0, 0), '2 1 loaded 0 blocked'),        # blocked at probe
             ((0, 0, 0, 0, 0), '2 0 none 0 unknown'),                # never set
             ((0, 0, 7, 0, 0), '2 0 none 0 unknown'),                # out of range
         ]
