@@ -11,6 +11,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 
+#include "ane_fw_cold.h"
 #include "ane_fw_platform.h"
 #include "ane_h16_boot_data.h"
 
@@ -89,6 +90,8 @@ const struct ane_fw_platform ane_h17_platform = {
 	.stream_mask = BIT(0),
 	.firmware_preloaded = true,
 	.safe_reset = false,
+	/* 25G83 boots this firmware in Exclave mode (SPEC-ANE-SLEEP-H17.md). */
+	.exclave_mode_stop = true,
 	/* Cold AP-direct acquisition is staged before any power or DMA write.
 	 * The observer uses the measured H17 26.6.2 register layout.
 	 */
@@ -217,7 +220,12 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 
 int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
-	int ret = ane_fw_platform_preflight(pdev, soc);
+	int ret;
+
+	/* H17: the staged backend owns the engine; the device binds for it. */
+	if (soc->owner == ANE_FW_OWNER_EXCLAVE)
+		return ane_fw_staged_bind(pdev);
+	ret = ane_fw_platform_preflight(pdev, soc);
 
 	if (ret)
 		return ret;
@@ -226,5 +234,24 @@ int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_plat
 
 void ane_fw_platform_remove(struct platform_device *pdev)
 {
+	if (ane_fw_staged_bound(&pdev->dev)) {
+		ane_fw_staged_unbind(pdev);
+		return;
+	}
 	ane_h16_backend_remove(pdev);
+}
+
+/* System sleep callbacks of the bound H16 or H17 device. */
+int ane_fw_platform_suspend(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_suspend(dev);
+	return ane_h16_backend_suspend(dev);
+}
+
+int ane_fw_platform_resume(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return 0;
+	return ane_h16_backend_resume(dev);
 }

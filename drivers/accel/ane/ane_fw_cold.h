@@ -66,6 +66,41 @@ static inline bool ane_fw_cold_engine_valid(const struct ane_fw_cold_state *s)
 	return true;
 }
 
+/*
+ * After our own power-down for system sleep the engine may have kept power
+ * with its CPU stopped by its PMGR power state, so status, CE, scratch and
+ * DAPF are not judged; what must hold is no DART fault and no DART lock
+ * that blocks re-attaching SID0.
+ */
+static inline bool ane_fw_cold_engine_restartable(const struct ane_fw_cold_state *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < ANE_FW_DARTS; i++)
+		if ((s->dart[i].version & 0xffff) != 0x203 || (s->dart[i].protect & BIT(0)) ||
+		    (s->dart[i].lock & (BIT(0) | BIT(2))) || s->dart[i].error)
+			return false;
+	return true;
+}
+
+/*
+ * RVBAR (engine +0x1050000) and the TEXT entry: latched at TEXT (bit 0 set)
+ * is ready; with bit 0 clear the entry may be written; latched at any other
+ * entry is refused (never write RVBAR while bit 0 is set).
+ */
+enum ane_fw_rvbar {
+	ANE_FW_RVBAR_LATCHED,
+	ANE_FW_RVBAR_WRITABLE,
+	ANE_FW_RVBAR_FOREIGN,
+};
+
+static inline enum ane_fw_rvbar ane_fw_rvbar_check(u64 rvbar, u64 text)
+{
+	if (rvbar == (text | 1))
+		return ANE_FW_RVBAR_LATCHED;
+	return rvbar & 1 ? ANE_FW_RVBAR_FOREIGN : ANE_FW_RVBAR_WRITABLE;
+}
+
 static inline bool ane_fw_cold_valid(const struct ane_fw_cold_state *s, bool raw_boot)
 {
 	return ane_fw_cold_pmgr_valid(s, raw_boot) && ane_fw_cold_gate_valid(s) &&
@@ -141,6 +176,10 @@ static inline bool ane_fw_cold_handoff_valid(const struct ane_fw_handoff *h,
 }
 
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc);
+int ane_fw_staged_bind(struct platform_device *pdev);
+bool ane_fw_staged_bound(struct device *dev);
+void ane_fw_staged_unbind(struct platform_device *pdev);
+int ane_fw_staged_suspend(struct device *dev);
 void ane_fw_staged_start(void);
 bool ane_fw_staged_exit(void);
 

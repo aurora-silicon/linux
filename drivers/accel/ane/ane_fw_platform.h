@@ -61,6 +61,11 @@ struct ane_fw_platform {
 	u16 stream_mask;
 	bool firmware_preloaded;
 	bool safe_reset;
+	/*
+	 * System sleep first takes the firmware out of Exclave mode
+	 * (EXCLAVE_MODE_STOP on the control ring) so that SUSPEND can run.
+	 */
+	bool exclave_mode_stop;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */
@@ -105,6 +110,8 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 int ane_fw_platform_probe(struct platform_device *pdev,
 			  const struct ane_fw_platform *soc);
 void ane_fw_platform_remove(struct platform_device *pdev);
+int ane_fw_platform_suspend(struct device *dev);
+int ane_fw_platform_resume(struct device *dev);
 int ane_fw_preload_range(struct device_node *np, unsigned int index, u64 *phys, u64 *size);
 int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_platform *soc);
 void ane_h16_backend_remove(struct platform_device *pdev);

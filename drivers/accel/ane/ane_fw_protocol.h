@@ -114,6 +114,13 @@ ane_fw_channels_host_init(void *ipc, const struct ane_fw_channel *channels)
 	}
 }
 
+/*
+ * H17 system sleep: leave the firmware's Exclave mode (SNE DM bus idle)
+ * before SUSPEND, on the control ring; 0x18 bytes, zero body.
+ */
+#define ANE_FW_CMD_EXCLAVE_MODE_STOP 0x31
+#define ANE_FW_MODE_STOP_SIZE 0x18
+
 /* H14 preserves its reserved word; H16 requires bytes 0..3 to be zero. */
 /*
  * Commands that change engine mode or ownership: secure mode 0x27, 0x28 and

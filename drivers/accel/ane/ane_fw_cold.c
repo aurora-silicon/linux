@@ -73,6 +73,15 @@ struct ane_fw_backend {
 	u8 data_digest[SHA256_DIGEST_SIZE];
 	/* Powered down for system sleep; a (cold or warm) boot is due. */
 	bool slept;
+	/*
+	 * EXCLAVE_MODE_STOP completed in this firmware boot: the warm boots
+	 * keep the firmware out of Exclave mode. Cleared by every cold boot.
+	 */
+	bool exclave_mode_stopped;
+	/* The bound device holds ANE_SYS for a hand-off until the bring-up does. */
+	bool bind_held;
+	/* The engine's own ANE_SYS reference (b->power) is held. */
+	bool power_ref;
 	struct list_head mappings;
 	/* Serialize stage changes, command publication and retained lifetimes. */
 	struct mutex lock;
@@ -92,6 +101,17 @@ struct ane_fw_backend {
  * the platform bus would otherwise resume genpd and attach DMA before probe.
  */
 static struct ane_fw_backend *ane_backend;
+/* The H17 platform device, bound by ane_fw_staged_bind(). */
+static struct device *ane_fw_bound_dev;
+
+/* The bring-up holds ANE_SYS itself now: drop the bind's hand-off reference. */
+static void ane_fw_bind_release(struct ane_fw_backend *b)
+{
+	if (!b->bind_held)
+		return;
+	b->bind_held = false;
+	pm_runtime_put(&b->pdev->dev);
+}
 
 /*
  * Every register access of this backend goes through these helpers, so a
@@ -258,15 +278,15 @@ static int ane_fw_scratch_wait(struct ane_fw_backend *b, unsigned int cell, u32 
 #define ANE_FW_WARM_BOOT 1
 
 /*
- * The warm path above is off. On the 26.6.2 H17 firmware the AP-direct
- * SUSPEND is taken but never completed (C2, C3a and C3b: no completion in
- * 3 s, idle or after work; the firmware logs a hand-off to its DM bus
- * manager, which on macOS sits behind the Exclave proxy). Until that is
- * understood the engine is cycled cold instead: no firmware cooperation,
- * every program is lost, and the firmware is booted again from the
- * kernel-held preload after resume (ane_fw_cold_cycle_boot()).
+ * The warm path is the default. SUSPEND alone never completed on 26.6.2
+ * (C2, C3a, C3b): the firmware runs in Exclave mode and the 0x24 handler
+ * waits for the SNE DM bus to go idle. EXCLAVE_MODE_STOP (0x31) first takes
+ * it out of that mode (SPEC-ANE-SLEEP-H17.md). The cold cycle stays as the
+ * fallback when the warm boot fails after power-off, and as the whole path
+ * with ane_fw_sleep_warm false: no firmware cooperation, programs lost,
+ * the firmware booted again from the kernel-held preload.
  */
-static const bool ane_fw_sleep_warm;
+static const bool ane_fw_sleep_warm = true;
 #define ANE_FW_SUSPEND_REPORT_MAX 0x100
 
 static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
@@ -357,6 +377,35 @@ static int ane_fw_suspend_wait(struct ane_fw_backend *b)
 	return ret;
 }
 
+/*
+ * Leave the firmware's Exclave mode before SUSPEND, once per firmware boot:
+ * the 24-byte zero-body EXCLAVE_MODE_STOP on the control ring, with its
+ * normal completion. Linux has no Exclave state, so the warm wake never
+ * starts the mode again (no 0x30) and later cycles skip this step.
+ */
+static int ane_fw_exclave_mode_stop(struct ane_fw_backend *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	int ret;
+
+	if (!b->soc->exclave_mode_stop || b->exclave_mode_stopped)
+		return 0;
+	ret = ane_fw_transport_publish_mode_stop(t, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (!ret)
+		ret = ane_fw_transport_wait(t, t->control_ch);
+	if (ret) {
+		dev_err(&b->pdev->dev,
+			"H17 ANE: EXCLAVE_MODE_STOP (0x31) failed %d on %s; no SUSPEND, no power-off\n",
+			ret, t->control_ch < ANE_FW_CHANNELS ? "the control ring" :
+			"a table without one");
+		return ret;
+	}
+	b->exclave_mode_stopped = true;
+	dev_info(&b->pdev->dev, "H17 ANE: EXCLAVE_MODE_STOP (0x31) completed on channel %u\n",
+		 t->channels[t->control_ch].index);
+	return 0;
+}
+
 static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 {
 	u8 command[8] = {};
@@ -373,6 +422,11 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	ret = ane_fw_transport_settle(&b->transport, 2 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
 	if (ret < 0)
 		return ret;
+	ret = ane_fw_exclave_mode_stop(b);
+	if (ret) {
+		ane_h16_session_dump_fwlog(&b->session);
+		return ret;
+	}
 	put_unaligned_le16(ANE_FW_CMD_SUSPEND, command + 4);
 	ane_fw_sleep_trace(b, "before SUSPEND", NULL);
 	slot = ane_fw_transport_slot(&b->transport, ANE_FW_IO);
@@ -387,6 +441,8 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 		memcpy(command, b->pool.cpu + b->transport.pending[ANE_FW_IO].dva - b->pool.dva,
 		       sizeof(command));
 	ane_fw_sleep_trace(b, ret ? "SUSPEND failed" : "SUSPEND done", slot);
+	if (ret && ane_fw_load64(b, slot) == b->transport.pending[ANE_FW_IO].dva)
+		dev_err(&b->pdev->dev, "H17 ANE: 0x24 not consumed; Exclave mode suspected\n");
 	if (ret) {
 		/* What the firmware made of it, if anything. */
 		ane_h16_session_dump_fwlog(&b->session);
@@ -411,6 +467,7 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE];
 static int ane_fw_boot(struct ane_fw_backend *b);
 static int ane_fw_startup(struct ane_fw_backend *b);
+static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
 
 /* Reverse of the proven power-up: sub-block, PWGATE, CPU, then ANE_SYS. */
 static int ane_fw_power_down(struct ane_fw_backend *b)
@@ -431,6 +488,7 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
 	b->powered = false;
+	b->power_ref = false;
 	pm_runtime_put_sync(b->power);
 	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep\n");
 	return 0;
@@ -464,9 +522,10 @@ static int ane_fw_warm_boot(struct ane_fw_backend *b)
 	ret = ane_fw_dapf(b);
 	if (ret)
 		return ret;
-	/* RVBAR must still name the retained TEXT (read by the power-up). */
-	if (b->cold.rvbar != 0x10000000001ULL)
-		return -EIO;
+	/* RVBAR must name TEXT: retained, or written again after a real power-off. */
+	ret = ane_fw_rvbar_ready(b);
+	if (ret)
+		return ret;
 	for (i = 0; i < 8; i++)
 		ane_wr32(b, 0, scratch + i * 4);
 	ane_wr32(b, 1, scratch + 6 * 4);
@@ -486,6 +545,32 @@ static int ane_fw_warm_boot(struct ane_fw_backend *b)
 		return ret;
 	dev_info(dev, "H17 ANE: firmware resumed (warm boot); programs kept\n");
 	return 0;
+}
+
+/*
+ * RVBAR must name TEXT before the CPU is released. It keeps the latched
+ * entry while ANE_SYS stays on; if a real power-off cleared it, the entry
+ * is written again, which the RVBAR lifecycle allows only while bit 0
+ * (latched) is clear.
+ */
+static int ane_fw_rvbar_ready(struct ane_fw_backend *b)
+{
+	u64 text = b->soc->preload_dva[0];
+	u64 rvbar = ane_rd64(b, b->engine + 0x1050000);
+
+	switch (ane_fw_rvbar_check(rvbar, text)) {
+	case ANE_FW_RVBAR_LATCHED:
+		return 0;
+	case ANE_FW_RVBAR_WRITABLE:
+		ane_wr64(b, text, b->engine + 0x1050000);
+		dev_info(&b->pdev->dev, "H17 ANE: RVBAR was %#llx; wrote %#llx, reads %#llx\n",
+			 rvbar, text, ane_rd64(b, b->engine + 0x1050000));
+		rvbar = ane_rd64(b, b->engine + 0x1050000);
+		return rvbar == text || rvbar == (text | 1) ? 0 : -EIO;
+	default:
+		dev_err(&b->pdev->dev, "H17 ANE: RVBAR %#llx latched at another entry\n", rvbar);
+		return -EIO;
+	}
 }
 
 /* Copy one preload segment back from its reservation and check its digest. */
@@ -524,8 +609,22 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 	u64 start = ktime_get_ns();
 	int ret;
 
-	/* We powered it down ourselves: the cold PMGR state is our evidence. */
-	ret = ane_fw_power_up(b, true, true);
+	/*
+	 * We powered it down ourselves: the cold PMGR state is our evidence.
+	 * The engine either lost power (reset values) or kept it with the CPU
+	 * stopped by its power state (C4: status 0x62, CE 0x5, DAPF kept);
+	 * either boots from the preload once the DARTs are clean and RVBAR
+	 * names TEXT.
+	 */
+	ret = ane_fw_power_up(b, true, false);
+	if (ret)
+		return ret;
+	dev_info(dev, "H17 ANE: cold cycle finds the engine %s\n",
+		 ane_fw_cold_engine_valid(&b->cold) ? "at its reset values" :
+		 "retained, stopped by its power state");
+	if (!ane_fw_cold_engine_restartable(&b->cold))
+		return -EPERM;
+	ret = ane_fw_rvbar_ready(b);
 	if (ret)
 		return ret;
 	iommu_detach_device(b->domain, dev);
@@ -578,9 +677,28 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	int ret;
 
 	guard(mutex)(&b->lock);
-	/* A quarantined engine already powered off has nothing to lose. */
-	if (b->stage == ANE_STAGE_QUARANTINED && !b->powered)
+	/*
+	 * A quarantined engine that never came up has nothing to lose; give
+	 * back an ANE_SYS reference a failed power-up kept.
+	 */
+	if (b->stage == ANE_STAGE_QUARANTINED && !b->powered) {
+		if (b->power_ref) {
+			b->power_ref = false;
+			pm_runtime_put_sync(b->power);
+		}
 		return 0;
+	}
+	/*
+	 * Quarantined and still powered: its state was dumped when it was
+	 * quarantined. Power it off without the firmware so that the system
+	 * can sleep; it stays quarantined and is not booted again.
+	 */
+	if (b->stage == ANE_STAGE_QUARANTINED) {
+		ret = ane_fw_power_down(b);
+		dev_info(&b->pdev->dev, "H17 ANE: quarantined engine powered off for system sleep (%d)\n",
+			 ret);
+		return ret;
+	}
 	if (b->stage != ANE_STAGE_PROGRAM)
 		return -EBUSY;
 	ane_h16_session_sleep(&b->session, true);
@@ -620,6 +738,14 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		return;
 	b->slept = false;
 	ret = ane_fw_sleep_warm ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b);
+	if (ret && ane_fw_sleep_warm) {
+		/* Fall back to the cold cycle: off again, then boot from the preload. */
+		dev_warn(&b->pdev->dev, "H17 ANE: warm boot failed (%d); cold boot, programs lost\n",
+			 ret);
+		ret = b->powered ? ane_fw_power_down(b) : 0;
+		if (!ret)
+			ret = ane_fw_cold_cycle_boot(b);
+	}
 	if (ret) {
 		/* Every mapping and backing stays for diagnosis. */
 		ane_fw_quarantine(b, ret);
@@ -841,11 +967,19 @@ static const struct ane_fw_transport_ops ane_fw_ops = {
 static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
 {
 	struct device *dev = &b->pdev->dev;
+	int ret;
 
-	b->power = dev_pm_domain_attach_by_id(dev, 0);
-	if (IS_ERR_OR_NULL(b->power))
-		return b->power ? PTR_ERR(b->power) : -ENODEV;
-	return ane_fw_power_up(b, raw_boot, true);
+	/*
+	 * The bound device carries ANE_SYS itself (platform_probe attached it
+	 * to its single domain), so genpd sees the engine's own reference.
+	 */
+	if (!dev->pm_domain || !ane_fw_bound_dev)
+		return -ENODEV;
+	b->power = dev;
+	ret = ane_fw_power_up(b, raw_boot, true);
+	/* The bring-up holds ANE_SYS now (or keeps it, quarantined). */
+	ane_fw_bind_release(b);
+	return ret;
 }
 
 /*
@@ -859,9 +993,13 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 	u64 ce;
 	int ret;
 
-	ret = pm_runtime_resume_and_get(b->power);
-	if (ret < 0)
-		return ret;
+	/* Taken once; a failed attempt keeps it for the retry or the quarantine. */
+	if (!b->power_ref) {
+		ret = pm_runtime_resume_and_get(b->power);
+		if (ret < 0)
+			return ret;
+		b->power_ref = true;
+	}
 	if ((ane_rd32(b, b->pmgr + 0x290) & 0xff) != 0xff)
 		return -EIO;
 	/* The child state may not have moved since the probe stage. */
@@ -1101,6 +1239,8 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	unsigned int i;
 	int ret;
 
+	/* A cold boot starts the firmware in Exclave mode again. */
+	b->exclave_mode_stopped = false;
 	for (i = 0; i < 8; i++)
 		ane_wr32(b, 0, scratch + i * 4);
 	ane_wr32(b, 1, scratch + 6 * 4);
@@ -1456,6 +1596,7 @@ static void ane_fw_start_work(struct work_struct *work)
 		if (ret < 0) {
 			dev_err(&b->pdev->dev, "H17 ANE: boot bring-up stopped at %s, error %zd\n",
 				steps[i], ret);
+			ane_fw_bind_release(b);
 			return;
 		}
 	}
@@ -1611,9 +1752,81 @@ fail:
 }
 
 /*
+ * Bind the H17 platform device. Left unbound, it is a fw_devlink consumer
+ * that never binds, so the PMGR power controller's sync_state never runs and
+ * genpd keeps every boot-on domain under it on, ANE_SYS included, whatever
+ * the backend puts (C4: ANE_SYS stayed on across system sleep). Bound, the
+ * device carries ANE_SYS through its own runtime PM: platform_probe attached
+ * it to its single domain. With a loader hand-off, the engine is powered as
+ * the loader left it, so the bind holds ANE_SYS until the bring-up takes its
+ * own reference (ane_fw_power()) or stops; without one the device is
+ * runtime suspended and the domain is free to go off.
+ */
+int ane_fw_staged_bind(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct ane_fw_backend *b = ane_backend;
+	bool handoff = b && b->pdev == pdev;
+	int ret;
+
+	if (ane_fw_bound_dev)
+		return -EBUSY;
+	if (handoff) {
+		ret = pm_runtime_set_active(dev);
+		if (ret)
+			return ret;
+		pm_runtime_get_noresume(dev);
+		b->bind_held = true;
+	}
+	ret = devm_pm_runtime_enable(dev);
+	if (ret) {
+		if (handoff) {
+			b->bind_held = false;
+			pm_runtime_put_noidle(dev);
+			pm_runtime_set_suspended(dev);
+		}
+		return ret;
+	}
+	ane_fw_bound_dev = dev;
+	dev_info(dev, "H17 ANE: bound; %s\n", handoff ?
+		 "ANE_SYS held until the bring-up owns it" : "no hand-off, engine left off");
+	return 0;
+}
+
+bool ane_fw_staged_bound(struct device *dev)
+{
+	return dev && dev == ane_fw_bound_dev;
+}
+
+void ane_fw_staged_unbind(struct platform_device *pdev)
+{
+	struct ane_fw_backend *b = ane_backend;
+
+	if (b && b->pdev == pdev)
+		ane_fw_bind_release(b);
+	ane_fw_bound_dev = NULL;
+}
+
+/*
+ * Device suspend: the notifier already cycled the engine. A backstop for
+ * running firmware it did not reach (a sleep path that skipped notifiers).
+ */
+int ane_fw_staged_suspend(struct device *dev)
+{
+	struct ane_fw_backend *b = ane_backend;
+	bool running = b && &b->pdev->dev == dev && READ_ONCE(b->retained) &&
+		       READ_ONCE(b->powered) && !READ_ONCE(b->slept) &&
+		       READ_ONCE(b->stage) == ANE_STAGE_PROGRAM;
+
+	if (running)
+		dev_warn_once(dev, ANE_FW_SLEEP_REFUSED);
+	return ane_fw_sleep_backstop(running);
+}
+
+/*
  * Start the bring-up once the platform driver is registered: its probe of
- * this device (refused, but with a genpd attach and detach) has finished by
- * then and cannot race the power sequence.
+ * this device has bound it (ane_fw_staged_bind()) by then and cannot race
+ * the power sequence.
  */
 void ane_fw_staged_start(void)
 {

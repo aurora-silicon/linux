@@ -296,7 +296,50 @@ static void ane_cold_sleep_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_sleep_backstop(false), 0);
 }
 
+/*
+ * The cold cycle after our own power-down: the C4 state (ANE_SYS kept on,
+ * CPU stopped: status 0x62, CE 0x5, DAPF kept) restarts like reset values;
+ * a DART fault or lock does not.
+ */
+static void ane_cold_restartable_test(struct kunit *test)
+{
+	struct ane_fw_cold_state s, original = ane_cold_fixture();
+
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_restartable(&original));
+	s = original;
+	s.status = 0x62;
+	s.ce_state = 5;
+	s.scratch[6] = 9;
+	KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_valid(&s));
+	KUNIT_EXPECT_TRUE(test, ane_fw_cold_engine_restartable(&s));
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		s = original;
+		s.dart[i].error = 1;
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s));
+		s = original;
+		s.dart[i].lock |= BIT(2);
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s));
+		s = original;
+		s.dart[i].protect |= BIT(0);
+		KUNIT_EXPECT_FALSE(test, ane_fw_cold_engine_restartable(&s));
+	}
+}
+
+/* RVBAR: latched at TEXT is ready, unlatched is written, foreign refused. */
+static void ane_cold_rvbar_test(struct kunit *test)
+{
+	const u64 text = 0x10000000000ULL;
+
+	KUNIT_EXPECT_EQ(test, ane_fw_rvbar_check(text | 1, text), ANE_FW_RVBAR_LATCHED);
+	KUNIT_EXPECT_EQ(test, ane_fw_rvbar_check(0, text), ANE_FW_RVBAR_WRITABLE);
+	KUNIT_EXPECT_EQ(test, ane_fw_rvbar_check(text, text), ANE_FW_RVBAR_WRITABLE);
+	KUNIT_EXPECT_EQ(test, ane_fw_rvbar_check(1, text), ANE_FW_RVBAR_FOREIGN);
+	KUNIT_EXPECT_EQ(test, ane_fw_rvbar_check(0x20000000001ULL, text), ANE_FW_RVBAR_FOREIGN);
+}
+
 static struct kunit_case ane_cold_cases[] = {
+	KUNIT_CASE(ane_cold_restartable_test),
+	KUNIT_CASE(ane_cold_rvbar_test),
 	KUNIT_CASE(ane_cold_sleep_test),
 	KUNIT_CASE(ane_cold_handoff_warm_test),
 	KUNIT_CASE(ane_cold_handoff_test),

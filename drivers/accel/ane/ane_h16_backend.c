@@ -172,8 +172,18 @@ static int ane_h16_suspend_firmware(struct ane_h16_device *h)
 	put_unaligned_le16(ANE_H16_CMD_SUSPEND, command + 4);
 	ret = ane_fw_transport_publish(t, ANE_FW_IO, command, sizeof(command),
 				       ktime_get_ns() + 3 * NSEC_PER_SEC);
-	if (!ret)
+	if (!ret) {
+		u8 *slot = ane_fw_transport_slot(t, ANE_FW_IO);
+
 		ret = ane_fw_transport_wait(t, ANE_FW_IO);
+		/*
+		 * The H16 firmware is not expected to run in Exclave mode (the
+		 * J616s macOS power-off finds no Exclave clients), but an H17
+		 * style hang would look like this: the slot never taken.
+		 */
+		if (ret && t->ops->load64(t->ctx, slot) == t->pending[ANE_FW_IO].dva)
+			dev_err(h->dev, "H16 ANE: 0x24 not consumed; Exclave mode suspected\n");
+	}
 	if (ret)
 		return ret;
 	status = h->boot.ops->read32(h->boot.ctx, ANE_H16_ENGINE, f->cpu_control + 4);
