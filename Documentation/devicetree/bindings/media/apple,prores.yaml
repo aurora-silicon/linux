@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,prores.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Silicon ProRes codec (APR)
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  The APR is a directly programmed ProRes engine with its own DART. Jobs are
+  descriptors in a DMA ring; the engine signals completion with an
+  interrupt. It has no firmware. Its power domain also resets it.
+
+properties:
+  compatible:
+    const: apple,t8140-prores
+
+  reg:
+    items:
+      - description: Engine registers
+      - description: Wrapper registers
+
+  reg-names:
+    items:
+      - const: core
+      - const: wrapper
+
+  interrupts:
+    minItems: 1
+    maxItems: 2
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - iommus
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        video-codec@295000000 {
+            compatible = "apple,t8140-prores";
+            reg = <0x2 0x95000000 0x0 0x4000>,
+                  <0x2 0x94000000 0x0 0x8000>;
+            reg-names = "core", "wrapper";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1260 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 1259 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&apr_dart 0>;
+            power-domains = <&ps_prores>;
+            resets = <&ps_prores>;
+        };
+    };
