@@ -18,6 +18,7 @@ ARM64 Architecture
     aurora-apif-platform
     apple-j813
     apple-m6-cpu
+    apple-pmp
     arm-acpi
     arm-cca
     asymmetric-32bit
