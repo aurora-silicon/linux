@@ -454,6 +454,18 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 	if (!h->program_ready || h->boot.quarantined)
 		return -EBUSY;
 	ane_h16_session_sleep(&h->session, true);
+	if (!h->boot.soc->sleep_warm) {
+		/* Cold cycle: nothing in flight, then power off under the firmware. */
+		for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
+			if (h->boot.transport.pending[ch].active) {
+				ane_h16_session_sleep(&h->session, false);
+				return -EBUSY;
+			}
+		}
+		ane_h16_power_down(h);
+		WRITE_ONCE(h->slept, true);
+		return 0;
+	}
 	ret = ane_h16_suspend_firmware(h);
 	if (ret) {
 		/* Powered, maybe suspended: keep everything, refuse, close. */
@@ -481,13 +493,17 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	h->resume_ready_ns = 0;
 	h->resume_first_ns = 0;
 	h->resume_replayed = 0;
-	h->resume_cold = false;
-	ret = ane_h16_warm_boot(h);
-	if (ret) {
-		dev_warn(h->dev, "H16 ANE: warm boot failed (%d); cold boot and program replay\n",
-			 ret);
-		h->resume_cold = true;
+	h->resume_cold = !h->boot.soc->sleep_warm;
+	if (h->resume_cold) {
 		ret = ane_h16_cold_boot(h);
+	} else {
+		ret = ane_h16_warm_boot(h);
+		if (ret) {
+			dev_warn(h->dev, "H16 ANE: warm boot failed (%d); cold boot and program replay\n",
+				 ret);
+			h->resume_cold = true;
+			ret = ane_h16_cold_boot(h);
+		}
 	}
 	WRITE_ONCE(h->slept, false);
 	if (ret) {
@@ -512,8 +528,8 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
 
-	/* Without the platform's warm path, every sleep is refused as before. */
-	if (!h->boot.soc->sleep_warm) {
+	/* Without a sleep path on this platform, every sleep is refused as before. */
+	if (!h->boot.soc->sleep_warm && !h->boot.soc->sleep_cold) {
 		if (ane_fw_sleep_refused(event, pinned))
 			dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return ane_fw_sleep_event(event, pinned);
@@ -1265,7 +1281,7 @@ static int ane_h16_preload_identity(struct ane_h16_device *h)
 	}
 	/* Firmware DVA layout belongs to the build just selected. */
 	/* Warm-sleep builds keep the verified DATA for a cold boot after sleep. */
-	if (b->soc->sleep_warm) {
+	if (b->soc->sleep_warm || b->soc->sleep_cold) {
 		h->pristine_data = snap[1];
 		snap[1] = NULL;
 	}
