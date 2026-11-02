@@ -83,6 +83,8 @@ struct ane_fw_backend {
 	bool exclave_mode_stopped;
 	/* The bound device holds ANE_SYS for a hand-off until the bring-up does. */
 	bool bind_held;
+	/* SET_SNE_PMU_BASE2 completed in this firmware boot. */
+	bool pmu_base_set;
 	/* The engine's own ANE_SYS reference (b->power) is held. */
 	bool power_ref;
 	struct list_head mappings;
@@ -1420,6 +1422,28 @@ static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
 	return ret;
 }
 
+/*
+ * SET_SNE_PMU_BASE2 (0x29) on the control ring with the DT "pmgr" range
+ * base, once per cold firmware boot. Without it the 0x24 handler's DM-bus
+ * idle query never completes (C2-C7; SPEC-ANE-SLEEP-H17-r2.md).
+ */
+static int ane_fw_pmu_base(struct ane_fw_backend *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	u64 base = b->window[1].pa;
+	int ret;
+
+	b->pmu_base_set = false;
+	ret = ane_fw_transport_publish_pmu_base(t, base, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (!ret)
+		ret = ane_fw_transport_wait(t, t->control_ch);
+	dev_info(&b->pdev->dev, "H17 ANE: SET_SNE_PMU_BASE2 (0x29) %#llx on ring %s: %d\n",
+		 base, ane_fw_channel_name(t->control_ch), ret);
+	if (!ret)
+		b->pmu_base_set = true;
+	return ret;
+}
+
 static int ane_fw_startup(struct ane_fw_backend *b)
 {
 	static const struct { u16 id, size; } commands[] = {
@@ -1446,6 +1470,12 @@ static int ane_fw_startup(struct ane_fw_backend *b)
 				 get_unaligned_le32(command + 8));
 		if (commands[i].id == 0x22)
 			dev_info(&b->pdev->dev, "ANE RESOURCE_INFO: %*ph\n", 100, command);
+		/* macOS order: START, then SET_SNE_PMU_BASE2, then CONFIG_GET. */
+		if (commands[i].id == 0 && b->soc->sleep_warm) {
+			ret = ane_fw_pmu_base(b);
+			if (ret)
+				return ret;
+		}
 	}
 	return 0;
 }

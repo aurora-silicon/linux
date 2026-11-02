@@ -87,6 +87,8 @@ struct ane_h16_device {
 		u64 off_at, off_ns;
 	} genpd[5];
 	u64 resume_ready_ns;
+	/* EXCLAVE_MODE_STOP completed in this firmware boot (variant build). */
+	bool mode_stopped;
 	struct ane_h16_session session;
 	struct work_struct start;
 };
@@ -161,6 +163,7 @@ static void ane_h16_quarantine(void *ctx, int error)
 #define ANE_H16_WARM_BOOT 1
 
 static void ane_h16_busy(void *ctx, bool busy);
+static void ane_h16_sleep_trace(struct ane_h16_device *h, const char *when);
 
 static int ane_h16_suspend_firmware(struct ane_h16_device *h)
 {
@@ -178,6 +181,23 @@ static int ane_h16_suspend_firmware(struct ane_h16_device *h)
 	ret = ane_fw_transport_settle(t, 2 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
 	if (ret < 0)
 		return ret;
+	dev_info(h->dev, "H16 ANE: SET_SNE_PMU_BASE2 %s at startup (%#llx)\n",
+		 h->boot.pmu_base_set ? "completed" : "not sent", h->boot.pmu_base);
+	/* Variant: leave Exclave mode first, once per firmware boot. */
+	if (h->boot.soc->exclave_mode_stop && !h->mode_stopped) {
+		ret = ane_fw_transport_publish_mode_stop(t, ktime_get_ns() + 3 * NSEC_PER_SEC);
+		if (!ret)
+			ret = ane_fw_transport_wait(t, t->control_ch);
+		dev_info(h->dev, "H16 ANE: EXCLAVE_MODE_STOP (0x31) on ring %s: %d\n",
+			 ane_fw_channel_name(t->control_ch), ret);
+		if (ret) {
+			ane_h16_sleep_trace(h, "0x31 failed");
+			ane_h16_session_dump_fwlog(&h->session);
+			return ret;
+		}
+		h->mode_stopped = true;
+	}
+	ane_h16_sleep_trace(h, "before SUSPEND");
 	put_unaligned_le16(ANE_H16_CMD_SUSPEND, command + 4);
 	ret = ane_fw_transport_publish(t, ANE_FW_IO, command, sizeof(command),
 				       ktime_get_ns() + 3 * NSEC_PER_SEC);
@@ -193,8 +213,11 @@ static int ane_h16_suspend_firmware(struct ane_h16_device *h)
 		if (ret && t->ops->load64(t->ctx, slot) == t->pending[ANE_FW_IO].dva)
 			dev_err(h->dev, "H16 ANE: 0x24 not consumed; Exclave mode suspected\n");
 	}
-	if (ret)
+	if (ret) {
+		ane_h16_sleep_trace(h, "SUSPEND failed");
+		ane_h16_session_dump_fwlog(&h->session);
 		return ret;
+	}
 	status = h->boot.ops->read32(h->boot.ctx, ANE_H16_ENGINE, f->cpu_control + 4);
 	dev_info(h->dev, "H16 ANE: SUSPEND acknowledged, wrapper status %#x\n", status);
 	/*
@@ -921,6 +944,30 @@ static void ane_h16_busy(void *ctx, bool busy)
 	}
 }
 
+static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *h);
+
+/* Scratch, wrapper status and the rings around the sleep handshake. */
+static void ane_h16_sleep_trace(struct ane_h16_device *h, const char *when)
+{
+	struct ane_fw_transport *t = &h->boot.transport;
+	const struct ane_h16_build *f = h->boot.build;
+	u8 *io = ane_fw_transport_slot(t, ANE_FW_IO);
+	u8 *t2h = ane_fw_transport_slot(t, ANE_FW_IO_T2H);
+	u8 *shm = ane_fw_transport_slot(t, ANE_FW_SHAREDMALLOC);
+
+	dev_info(h->dev, "H16 ANE: %s: scratch %#x %#x %#x %#x %#x %#x %#x %#x wrapper %#x\n", when,
+		 ane_h16_read(&h->boot, 0), ane_h16_read(&h->boot, 1), ane_h16_read(&h->boot, 2),
+		 ane_h16_read(&h->boot, 3), ane_h16_read(&h->boot, 4), ane_h16_read(&h->boot, 5),
+		 ane_h16_read(&h->boot, 6), ane_h16_read(&h->boot, 7),
+		 h->boot.ops->read32(h->boot.ctx, ANE_H16_ENGINE, f->cpu_control + 4));
+	dev_info(h->dev, "H16 ANE: %s: IO head %u %#llx %#llx %#llx; T2H head %u %#llx %#llx; SHAREDMALLOC head %u %#llx %#llx; irq %#x; error %d at ane_fw_transport.h:%u\n",
+		 when, t->head[ANE_FW_IO], get_unaligned_le64(io), get_unaligned_le64(io + 8),
+		 get_unaligned_le64(io + 16), t->head[ANE_FW_IO_T2H], get_unaligned_le64(t2h),
+		 get_unaligned_le64(t2h + 8), t->head[ANE_FW_SHAREDMALLOC],
+		 get_unaligned_le64(shm), get_unaligned_le64(shm + 8),
+		 t->ops->read32(t->ctx, t->soc->irq_status), t->error, t->error_line);
+}
+
 static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *h)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -929,6 +976,12 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 	bool perf;
 	int ret, irq, n;
 
+	/* SET_SNE_PMU_BASE2 at startup, for the warm sleep path only. */
+	if (h->boot.soc->sleep_warm) {
+		struct resource *pmgr = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pmgr");
+
+		h->boot.pmu_base = pmgr ? pmgr->start : 0;
+	}
 	n = of_count_phandle_with_args(np, "power-domains", "#power-domain-cells");
 	perf = n == 6 && of_property_match_string(np, "power-domain-names", "perf") == 5;
 	if (n != 5 && !perf)

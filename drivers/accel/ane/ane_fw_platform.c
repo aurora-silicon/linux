@@ -101,7 +101,7 @@ const struct ane_fw_platform ane_h17_platform = {
 	 * Off: on 25G83 SUSPEND is still not taken after 0x31 (C7), so sleep
 	 * cycles the engine cold and replays every program behind its handle.
 	 */
-	.sleep_warm = false,
+	.sleep_warm = true,
 	/* Cold AP-direct acquisition is staged before any power or DMA write.
 	 * The observer uses the measured H17 26.6.2 register layout.
 	 */

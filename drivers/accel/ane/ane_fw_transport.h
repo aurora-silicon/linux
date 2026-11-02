@@ -414,6 +414,23 @@ ane_fw_transport_publish(struct ane_fw_transport *t, unsigned int ch,
 }
 
 /*
+ * The kernel's SET_SNE_PMU_BASE2 on the control ring (16 bytes, the u64 PMU
+ * aperture base). Nothing else from outside the kernel reaches that ring.
+ */
+static inline int
+ane_fw_transport_publish_pmu_base(struct ane_fw_transport *t, u64 base, u64 deadline_ns)
+{
+	u8 command[ANE_FW_PMU_BASE_SIZE] = {};
+
+	if (t->control_ch >= ANE_FW_CHANNELS)
+		return -ENODEV;
+	put_unaligned_le16(ANE_FW_CMD_SET_PMU_BASE, command + 4);
+	put_unaligned_le64(base, command + 8);
+	return __ane_fw_transport_publish(t, t->control_ch, command, sizeof(command),
+					  deadline_ns);
+}
+
+/*
  * The kernel's own system-sleep step on the control ring: only the 24-byte
  * EXCLAVE_MODE_STOP with a zero body. Every other mode command stays denied.
  */
