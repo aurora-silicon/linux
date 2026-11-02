@@ -2446,9 +2446,24 @@ impl Vm {
         prot: Prot,
         guard: bool,
     ) -> Result<KernelMapping> {
-        let reserved_size = size
-            .checked_add(if guard { UAT_PGSZ } else { 0 })
-            .ok_or(EOVERFLOW)?;
+        self.map_at_with_guard_size(addr, size, gem, prot, if guard { UAT_PGSZ } else { 0 })
+    }
+
+    /// Map a GEM object into this Vm at a specific address, followed by an unmapped guard of
+    /// `guard_size` bytes (a multiple of the page size).
+    #[inline(never)]
+    pub(crate) fn map_at_with_guard_size(
+        &self,
+        addr: u64,
+        size: usize,
+        gem: &gem::Object,
+        prot: Prot,
+        guard_size: usize,
+    ) -> Result<KernelMapping> {
+        if guard_size & UAT_PGMSK != 0 {
+            return Err(EINVAL);
+        }
+        let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
         // Pin and copy backing before taking BO or DMA reservation locks.
         let dev = unsafe { self.dev.as_bound() };
