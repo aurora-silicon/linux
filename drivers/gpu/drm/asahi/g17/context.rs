@@ -244,7 +244,9 @@ impl Context {
             work_base,
             render,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
-            compute_timestamps: super::completion::ComputeTimestampCache::new()?,
+            compute_timestamps: super::completion::ComputeTimestampCache::new(
+                alloc.domain(super::vm_layout::Domain::Private),
+            )?,
             policy,
         })
     }

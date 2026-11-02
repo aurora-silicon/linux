@@ -860,7 +860,7 @@ impl InitData {
             lower: uat.kernel_lower_vm(),
             render,
             base: range.start,
-            dynamic: range.start + t8140::dynamic::KERNEL_OFFSET..range.end,
+            dynamic: variant.vm_layout.range(uat.geometry(), super::vm_layout::Domain::Upper),
             clusters,
         };
         if variant.graph == super::fw::variant::InitGraph::V25G83 {

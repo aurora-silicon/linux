@@ -274,7 +274,7 @@ pub(crate) struct File {
 pub(crate) type DrmFile = drm::File<File>;
 
 /// Minimum reserved AS for kernel mappings
-const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
+pub(crate) const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
 
 impl drm::file::DriverFile for File {
     type Driver = driver::AsahiDrmDriver;

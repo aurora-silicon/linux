@@ -907,6 +907,26 @@ impl UatPageTable {
         self.with_pages(iova_range, true, false, |_, _| Ok(()))
     }
 
+    /// Returns which of the root's first 64 top-level entries link a table (bit `n` for entry
+    /// `n`), as a walker that starts now would see them.
+    pub(crate) fn root_links(&self) -> Result<u64> {
+        let count = ((self.ias_mask >> UAT_TOP_LEVEL_SHIFT) + 1).min(64) as usize;
+        // SAFETY: The root is owned or borrowed by this page table for its lifetime, in RAM or in
+        // a reserved region.
+        unsafe {
+            with_table(self.reserved.as_deref(), self.ttb, 0, count * PTE_SIZE, |p| {
+                // SAFETY: with_table() checked that `count` aligned entries are mapped.
+                let ptes = core::slice::from_raw_parts(p as *const Pte, count);
+                Ok(ptes.iter().enumerate().fold(0, |links, (index, pte)| {
+                    match pte.load(Ordering::Acquire) & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
+                        true => links | 1u64 << index,
+                        false => links,
+                    }
+                }))
+            })
+        }
+    }
+
     /// Reserve all tables for a fixed mapping before publishing any leaves.
     /// GPUVM and the fixed-address allocator may share a page table, so check
     /// that neither owns a destination leaf before allowing failure rollback.

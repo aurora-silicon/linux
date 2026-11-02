@@ -9,30 +9,19 @@
 
 use super::*;
 use crate::g17::fw::m5::initdata as m;
-
-const BASE: u64 = 0xffff_fc20_0000_0000;
-const PRIVATE: u64 = BASE + 0x2_0000;
-const REGION_C: u64 = BASE + 0x1a_0000;
-const ROOTS: u64 = BASE + 0x1a_8000;
-const REGION_A: u64 = BASE + 0x1b_8000;
-const FWCTL: u64 = BASE + 0x1c_0000;
-const QOS: u64 = BASE + 0x1c_8000;
-const AON: u64 = BASE + 0x1d_0000;
-const KICK_SHARED: u64 = BASE + 0x1d_8000;
-const BUNDLE: u64 = BASE + 0xc078_8000;
-const COMPLETION_HIGH: u64 = BASE + 0xc080_0000;
-const COMPLETION_LOW: u64 = 0x70_0184_8000;
-const COMPLETION_STRIDE: u64 = 0x2_8000;
-const PB: u64 = BASE + 0x15e_0000;
-const UMA: u64 = BASE + 0x15e_8000;
+use crate::g17::m5_vm::fixed::{
+    AON, BUNDLE, COMPLETION_LOWER as COMPLETION_LOW, COMPLETION_STRIDE,
+    COMPLETION_UPPER as COMPLETION_HIGH, FWCTL, KICK_SHARED, PB_UPPER as PB, PRIVATE, QOS,
+    REGION_A, REGION_C, ROOTS, SENTINEL, UMA_UPPER as UMA, WINDOW as BASE,
+};
 
 impl InitData {
     /// Maps the M5 graph's kernel-lower objects, before either coprocessor starts: the firmware
     /// samples the lower root's top-level entries only then. These are the parameter-buffer
-    /// and page-pool descriptor tables and the four completion rings; [`Self::build_m5`] adds
-    /// their firmware aliases once the firmware has published its kernel window. Their window
-    /// (`0x70_0000_0000..0x80_0000_0000`, one top-level entry) also holds the canonical low
-    /// arena of queues and clients ([`crate::hw::t8140::dynamic`]).
+    /// and page-pool descriptor tables and the four completion rings, in lower-root entry 7;
+    /// [`Self::build_m5`] adds their firmware aliases once the firmware has published its kernel
+    /// window. The canonical arena of queues and clients has its own entry, whose link the
+    /// layout prepares ([`crate::g17::m5_vm`]).
     pub(in crate::g17) fn prepare_m5_lower(
         &mut self,
         dev: &AsahiDrmDevice,
@@ -129,7 +118,7 @@ impl InitData {
         self.alias(self.pb, uat.kernel_vm(), PB, RW)?;
         self.alias(self.page_pool, uat.kernel_vm(), UMA, RW)?;
         // The primary-view sentinel needs zeroed backing.
-        self.add(fixed(BASE + 0xc07e_0000, mmu::UAT_PGSZ, RW)?)?;
+        self.add(fixed(SENTINEL, mmu::UAT_PGSZ, RW)?)?;
         let mut completions =
             [m::G17PKsmCompletionAliases { low: 0, high: 0 }; m::M5_25G76_COMPLETION_QUEUE_COUNT];
         for (index, pair) in completions.iter_mut().enumerate() {
@@ -193,7 +182,7 @@ impl InitData {
             hw_data_bundle_alloc: shared.total,
         };
         let views = m::PrimaryRegionViews {
-            sentinel_high: BASE + 0xc07e_0000,
+            sentinel_high: SENTINEL,
             alias_high: [PB, UMA],
         };
         let hw = &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE];

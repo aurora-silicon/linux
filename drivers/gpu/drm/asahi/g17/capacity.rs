@@ -69,11 +69,14 @@ impl kernel::debugfs::Writer for View {
         // locks. Never take a VM/TTBAT lock with the device mutex held here.
         // The retained UAT owns valid allocator metadata even during shutdown.
         writeln!(f, "execution_contexts used={} total={}", uat.execution_contexts_used(), crate::mmu::MAX_EXECUTION_CONTEXTS)?;
-        let mut upper = uat.geometry().kernel_range();
-        upper.start += crate::hw::t8140::dynamic::KERNEL_OFFSET;
+        let domain = |domain| self.0.variant.vm_layout.range(uat.geometry(), domain);
         for (name, vm, range) in [
-            ("dynamic_lower_bytes", uat.kernel_lower_vm(), crate::hw::t8140::dynamic::LOWER),
-            ("dynamic_upper_bytes", uat.kernel_vm(), upper),
+            (
+                "dynamic_lower_bytes",
+                uat.kernel_lower_vm(),
+                domain(super::vm_layout::Domain::Canonical),
+            ),
+            ("dynamic_upper_bytes", uat.kernel_vm(), domain(super::vm_layout::Domain::Upper)),
         ] {
             match vm.capacity(range.clone()) {
                 Ok((used, largest)) => writeln!(f, "{} used={} total={} largest_hole={}", name, used, range.end - range.start, largest)?,

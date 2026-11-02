@@ -86,6 +86,8 @@ pub(crate) struct Variant {
     /// The performance effort the host publishes in Region C while submitted work streams
     /// (`power::Effort`); idle publishes zero.
     pub(crate) effort: u32,
+    /// Where the driver places its objects and what a client VM reserves.
+    pub(crate) vm_layout: &'static crate::g17::vm_layout::VmLayout,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -128,6 +130,7 @@ pub(crate) const V26A428: Variant = Variant {
     programs: super::render::RegisterPrograms::G17P,
     submission: Submission::Doorbell,
     effort: crate::g17::power::FULL_EFFORT,
+    vm_layout: &crate::hw::t8140::dynamic::LAYOUT,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -158,6 +161,7 @@ pub(crate) const V25G83: Variant = Variant {
     programs: super::render::RegisterPrograms::V25G83,
     submission: Submission::Doorbell,
     effort: crate::g17::power::FULL_EFFORT,
+    vm_layout: &crate::hw::t8140::dynamic::LAYOUT,
 };
 
 /// The M5 firmware (26A428, macOS 27.0), native. Every field is this build's own: the A18 Pro
@@ -188,6 +192,8 @@ pub(crate) const V26A428_M5: Variant = Variant {
     // linux-aurora publishes zero on M5 (its submission_effort), leaving performance to the
     // firmware's own policy.
     effort: 0,
+    // Mesa's M5 windows, not the A18 Pro's arenas, which lie in Mesa's read-only shadow.
+    vm_layout: &crate::g17::m5_vm::LAYOUT,
 };
 
 const _: () = {

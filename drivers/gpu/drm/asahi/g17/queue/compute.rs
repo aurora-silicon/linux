@@ -16,8 +16,9 @@ use crate::g17::{
         variant::PointerLayout,
     },
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
+    vm_layout::Domain,
 };
-use crate::{hw::t8140::dynamic, mmu};
+use crate::mmu;
 use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 use retirement::{Cursors, RECORD_SLOTS};
@@ -143,7 +144,7 @@ impl DescriptorRing {
         )?;
         let low = object.alias_in(
             alloc.uat.kernel_lower_vm(),
-            dynamic::LOWER,
+            alloc.domain(Domain::Canonical),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RW,
         )?;
@@ -173,6 +174,8 @@ struct Graph {
     pointers: PointerLayout,
     /// Layout of the operand-state buffer for the GPU's cores.
     operand_state: &'static OperandState,
+    /// Where the client-private aliases of each owner's VM go ([`Domain::Private`]).
+    private: core::ops::Range<u64>,
 }
 
 impl Graph {
@@ -248,6 +251,7 @@ impl Graph {
             reclaimed: 0,
             pointers,
             operand_state,
+            private: alloc.domain(Domain::Private),
         })
     }
 
@@ -266,16 +270,11 @@ impl Graph {
         let descriptors = self.descriptor_alias(vm)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let page = mmu::UAT_PGSZ as u64;
-        let preempt = self
-            .preempt
-            .alias_in(vm, dynamic::CLIENT_LOWER, page, prot)?;
-        let usage = self.usage.alias_in(vm, dynamic::CLIENT_LOWER, page, prot)?;
-        let operand = self
-            .operand
-            .alias_in(vm, dynamic::CLIENT_LOWER, page, prot)?;
-        let queue_context = self
-            .context_low
-            .alias_in(vm, dynamic::CLIENT_LOWER, page, prot)?;
+        let private = &self.private;
+        let preempt = self.preempt.alias_in(vm, private.clone(), page, prot)?;
+        let usage = self.usage.alias_in(vm, private.clone(), page, prot)?;
+        let operand = self.operand.alias_in(vm, private.clone(), page, prot)?;
+        let queue_context = self.context_low.alias_in(vm, private.clone(), page, prot)?;
         Ok(Binding {
             _kick_alias: kick_alias,
             pool_alias: Some(pool_alias),

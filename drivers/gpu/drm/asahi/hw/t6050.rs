@@ -35,8 +35,8 @@ pub(crate) const CONFIG: Config = Config {
     // The M5 graph allocates its metrics itself; this is only the lower-root page the shared
     // boot path maps before the coprocessors start (the A18 Pro's address).
     pm_metrics: FixedBuffer {
-        va: 0x10_0008_0000,
-        size: 0x8000,
+        va: crate::g17::m5_vm::fixed::BOOT_METRICS,
+        size: crate::g17::m5_vm::fixed::BOOT_METRICS_SIZE,
     },
     // The M5 graph takes its windows from M5_BOARD.
     windows: &[],

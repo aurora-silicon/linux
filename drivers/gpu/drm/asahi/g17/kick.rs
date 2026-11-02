@@ -19,8 +19,9 @@ use kernel::{
 use super::{
     fw::{kick::*, queue::DataMaster},
     object::{Allocator, CpuMap, KernelObject},
+    vm_layout::Domain,
 };
-use crate::{hw::t8140, mmu};
+use crate::mmu;
 
 pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 
@@ -538,11 +539,9 @@ impl Queue {
             mmu::PROT_GPU_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let mut range = alloc.uat.geometry().kernel_range();
-        range.start += t8140::dynamic::KERNEL_OFFSET;
         let high = low.alias_in(
             alloc.uat.kernel_vm(),
-            range,
+            alloc.domain(Domain::Upper),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
         )?;
@@ -600,7 +599,7 @@ impl Queue {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let mut range = t8140::dynamic::LOWER;
+        let mut range = alloc.domain(Domain::Canonical);
         let (low, client) = loop {
             let low = high.alias_in(
                 alloc.uat.kernel_lower_vm(),

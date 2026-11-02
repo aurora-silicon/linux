@@ -756,6 +756,7 @@ impl Backend {
         let alloc = super::object::Allocator {
             dev: &dev,
             uat: &uat,
+            layout: shared.variant.vm_layout,
         };
         let owner_pid =
             u32::try_from(kernel::current!().group_leader().pid()).map_err(|_| EOVERFLOW)?;
@@ -835,6 +836,7 @@ impl Backend {
             let alloc = super::object::Allocator {
                 dev: &dev,
                 uat: &uat,
+                layout: self.shared.variant.vm_layout,
             };
             let mut built = Some(super::initdata::ComputeShared::new(&alloc));
             let result = {
@@ -955,7 +957,11 @@ impl Backend {
         let lease = self.shared.preparations.enter_until(admission)?;
         let dev = self.shared.drm()?;
         let uat = self.shared.state.lock().as_ref().ok_or(ENODEV)?.uat.clone();
-        let alloc = super::object::Allocator { dev: &dev, uat: &uat };
+        let alloc = super::object::Allocator {
+            dev: &dev,
+            uat: &uat,
+            layout: self.shared.variant.vm_layout,
+        };
         let mut pages = Some(super::freelist::Pages::compute_sized(&alloc, required)?);
         let mut alias = Some(pages.as_ref().ok_or(EIO)?.map_client(self.context.vm())?);
         let mut deferred = DeferredBatch::publication()?;
@@ -1097,6 +1103,7 @@ impl Backend {
             let alloc = super::object::Allocator {
                 dev: &dev,
                 uat: &uat,
+                layout: self.shared.variant.vm_layout,
             };
             let reservation = match reservation {
                 Ok(reservation) => reservation,

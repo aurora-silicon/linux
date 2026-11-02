@@ -181,15 +181,25 @@ pub(crate) mod kernel_window {
     pub(crate) const BUNDLE: u64 = 0xc078_8000;
 }
 
-/// Arenas used by dynamically allocated firmware objects.
+/// Arenas used by dynamically allocated firmware objects: the A18 Pro's address-space layout
+/// (`fw::variant::V26A428`, and the M4 Pro's, which has only run with it).
 pub(crate) mod dynamic {
-    /// First dynamic byte, relative to the upper kernel window.
-    pub(crate) const KERNEL_OFFSET: u64 = 0x168_4000;
-    /// Client-private compute and render backing after the shared queue arena.
-    pub(crate) const CLIENT_LOWER: core::ops::Range<u64> = 0x70_8000_0000..0x71_0000_0000;
-    /// Canonical low mappings shared by hardware queues and their clients.
-    /// Client-private allocations start after this arena.
-    pub(crate) const LOWER: core::ops::Range<u64> = 0x70_0400_0000..0x70_8000_0000;
+    use crate::g17::vm_layout::{Clients, VmLayout};
+
+    /// The A18 Pro layout. Its canonical and client-private arenas follow the fixed render and
+    /// compute pools (`super::low`) in one lower-root entry. No pre-RUN link is prepared or
+    /// checked: the A18 Pro has only run without.
+    pub(crate) const LAYOUT: VmLayout = VmLayout {
+        // First dynamic byte after the fixed graph.
+        upper_offset: 0x168_4000,
+        // Canonical low mappings shared by hardware queues and their clients.
+        canonical: 0x70_0400_0000..0x70_8000_0000,
+        // Client-private compute and render backing after the shared queue arena.
+        private: 0x70_8000_0000..0x71_0000_0000,
+        pre_run_tables: &[],
+        pre_run_links: 0,
+        clients: Clients::G17P,
+    };
 }
 
 /// Fixed addresses in the firmware's context-0 and context-1 address spaces.
@@ -281,7 +291,10 @@ pub(crate) mod resources {
 
     pub(crate) const UAT_PAGE: u64 = 0x4000;
     pub(crate) const USER_BASE: u64 = 0x10_0000_0000;
-    pub(crate) const TIMESTAMPS: Range<u64> = 0x70_0000_0000..0x71_0000_0000;
+    /// The lower arenas: the fixed render and compute pools, then the canonical and
+    /// client-private arenas of [`super::dynamic::LAYOUT`].
+    pub(crate) const TIMESTAMPS: Range<u64> =
+        super::low::RENDER_PAGE_LIST..super::dynamic::LAYOUT.private.end;
     pub(crate) const COMMAND_TIMESTAMP_HZ: u64 = 24_000_000;
     pub(crate) const USER_END: u64 = USER_BASE + (1 << 32);
     pub(crate) const FIXED_PAIRS: usize = 2;

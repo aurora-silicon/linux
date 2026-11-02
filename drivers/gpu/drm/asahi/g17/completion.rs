@@ -13,7 +13,8 @@ use super::{
     recovery::Class,
     status::VmStatus,
 };
-use crate::{driver::AsahiDrmDevice, file, hw::t8140::{dynamic, resources as cfg}, mmu};
+use crate::{driver::AsahiDrmDevice, file, hw::t8140::resources as cfg, mmu};
+use core::ops::Range;
 use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU8, Ordering};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
@@ -147,13 +148,13 @@ struct ComputeTimestamps {
 }
 
 impl ComputeTimestamps {
-    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm) -> Result<Self> {
+    fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, private: Range<u64>) -> Result<Self> {
         let object = KernelObject::backing(dev, mmu::UAT_PGSZ, CpuMap::WriteCombined)?;
         let mapping = object.alias_in(
             vm,
             // Canonical shared queue aliases may be installed in this VM later.
             // Private timestamp pages must never occupy their retained addresses.
-            dynamic::CLIENT_LOWER,
+            private,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_FW_SHARED_RW,
         )?;
@@ -172,17 +173,20 @@ impl ComputeTimestamps {
 pub(crate) struct ComputeTimestampCache {
     #[pin]
     pages: Mutex<KVec<ComputeTimestamps>>,
+    /// The client-private domain of the context's layout, where fresh pages are mapped.
+    private: Range<u64>,
 }
 
 impl ComputeTimestampCache {
     /// Pages retained per context; deeper pipelines allocate the rest.
     const RETAINED: usize = 8;
 
-    pub(crate) fn new() -> Result<Arc<Self>> {
+    pub(crate) fn new(private: Range<u64>) -> Result<Arc<Self>> {
         let pages = KVec::with_capacity(Self::RETAINED, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self {
                 pages <- new_mutex!(pages, "G17 compute timestamp pages"),
+                private,
             }),
             GFP_KERNEL,
         )
@@ -197,7 +201,7 @@ impl ComputeTimestampCache {
                 barrier(Ordering::SeqCst);
                 page
             }
-            None => ComputeTimestamps::new(dev, vm)?,
+            None => ComputeTimestamps::new(dev, vm, self.private.clone())?,
         };
         Ok(PooledTimestamps {
             page: Some(page),

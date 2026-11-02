@@ -47,6 +47,7 @@ mod initdata;
 mod job;
 mod capacity;
 mod kick;
+pub(crate) mod m5_vm;
 mod object;
 mod port;
 pub(crate) mod power;
@@ -61,6 +62,7 @@ pub(crate) mod status;
 mod teardown;
 mod timeout;
 mod validation;
+pub(crate) mod vm_layout;
 
 use core::any::Any;
 use core::ops::Range;
@@ -1453,6 +1455,20 @@ impl Gpu {
             // As for the metrics above: the M5 graph's lower objects precede the first start.
             session.init.prepare_m5_lower(dev, &session.uat)?;
         }
+        // Likewise every other lower-root link the profile names, such as the canonical arena's
+        // (table only: queues are placed there after the firmware runs).
+        let layout = shared.variant.vm_layout;
+        if let Some(links) = layout.prepare_lower_root(&session.uat)? {
+            dev_info!(
+                dev.as_ref(),
+                "Kernel lower root before RUN: top-level links {:#x}, required {:#x}\n",
+                links,
+                layout.pre_run_links
+            );
+            if links & layout.pre_run_links != layout.pre_run_links {
+                return Err(EINVAL);
+            }
+        }
         session.primary.boot()?;
         if let Some(secondary) = session.secondary.as_mut() {
             secondary.boot()?;
@@ -1838,10 +1854,11 @@ impl gpu::Gpu for Gpu {
         let mut state = self.shared.state.lock();
         let firmware = (*state).as_mut().ok_or(ENODEV)?;
         let firmware = &mut **firmware;
-        let vm = firmware
-            .uat
-            .new_vm(self.ids.vm.next(), kernel_range)?
-            .with_status()?;
+        let id = self.ids.vm.next();
+        if self.shared.variant.vm_layout.clients == vm_layout::Clients::M5 {
+            return m5_vm::client_vm(&firmware.uat, id, kernel_range);
+        }
+        let vm = firmware.uat.new_vm(id, kernel_range)?.with_status()?;
         let mappings = firmware.init.user_aliases(&vm, &firmware._pm_metrics)?;
         let ranges =
             hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.va).ok_or(EINVAL)?;
@@ -1915,8 +1932,11 @@ impl gpu::Gpu for Gpu {
         let mapping = {
             let state = self.shared.state.lock();
             let firmware = (*state).as_ref().ok_or(ENODEV)?;
-            let mut addresses = firmware.uat.geometry().kernel_range();
-            addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
+            let addresses = self
+                .shared
+                .variant
+                .vm_layout
+                .range(firmware.uat.geometry(), vm_layout::Domain::Upper);
             bo.map_range_into_range(
                 firmware.uat.kernel_vm(),
                 range,

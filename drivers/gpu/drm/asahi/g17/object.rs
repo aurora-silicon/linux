@@ -21,6 +21,7 @@ use kernel::{
     prelude::*, //
 };
 
+use super::vm_layout::{Domain, VmLayout};
 use crate::driver::AsahiDrmDevice;
 use crate::{
     gem,
@@ -66,7 +67,8 @@ unsafe impl Send for KernelObject {}
 unsafe impl Sync for KernelObject {}
 
 impl KernelObject {
-    /// Allocates a zeroed object of `size` bytes and maps it into `vm`.
+    /// Allocates a zeroed object of `size` bytes and maps it into `vm`. An exhausted range is
+    /// counted as an upper-VA refusal; [`Allocator::lower`] counts its own as lower VA.
     pub(crate) fn new(
         dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
@@ -75,16 +77,22 @@ impl KernelObject {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<Self> {
+        Self::new_at_site(dev, vm, placement, size, prot, cpu, super::capacity::Site::UpperVa)
+    }
+
+    fn new_at_site(
+        dev: &AsahiDrmDevice,
+        vm: &mmu::Vm,
+        placement: Placement,
+        size: usize,
+        prot: mmu::Prot,
+        cpu: CpuMap,
+        site: super::capacity::Site,
+    ) -> Result<Self> {
         let mut this = Self::backing(dev, size, cpu)?;
         let mapping = match placement {
             Placement::At(addr) => this.obj.map_at(vm, addr, prot, false)?,
             Placement::In(range, align) => {
-                let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
-                    && range.end <= crate::hw::t8140::dynamic::LOWER.end {
-                    super::capacity::Site::LowerVa
-                } else {
-                    super::capacity::Site::UpperVa
-                };
                 this.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
                     if error == ENOSPC { super::capacity::refused(site) } else { error }
                 })?
@@ -334,9 +342,16 @@ impl KernelObject {
 pub(crate) struct Allocator<'a> {
     pub(crate) dev: &'a AsahiDrmDevice,
     pub(crate) uat: &'a mmu::Uat,
+    /// The firmware profile's address-space layout ([`super::fw::Variant::vm_layout`]).
+    pub(crate) layout: &'static VmLayout,
 }
 
 impl Allocator<'_> {
+    /// Returns the range of `domain` in this allocator's layout.
+    pub(crate) fn domain(&self, domain: Domain) -> Range<u64> {
+        self.layout.range(self.uat.geometry(), domain)
+    }
+
     /// Allocates in the dynamic part of the firmware's upper address space.
     pub(crate) fn kernel(
         &self,
@@ -345,12 +360,10 @@ impl Allocator<'_> {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<KernelObject> {
-        let mut range = self.uat.geometry().kernel_range();
-        range.start += crate::hw::t8140::dynamic::KERNEL_OFFSET;
         KernelObject::new(
             self.dev,
             self.uat.kernel_vm(),
-            Placement::In(range, align),
+            Placement::In(self.domain(Domain::Upper), align),
             size,
             prot,
             cpu,
@@ -366,13 +379,14 @@ impl Allocator<'_> {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<KernelObject> {
-        KernelObject::new(
+        KernelObject::new_at_site(
             self.dev,
             self.uat.kernel_lower_vm(),
-            Placement::In(crate::hw::t8140::dynamic::LOWER, align),
+            Placement::In(self.domain(Domain::Canonical), align),
             size,
             prot,
             cpu,
+            super::capacity::Site::LowerVa,
         )
     }
 
@@ -391,7 +405,7 @@ impl Allocator<'_> {
             return Err(EINVAL);
         }
         let mut object = KernelObject::backing(self.dev, size, cpu)?;
-        let mut range = crate::hw::t8140::dynamic::LOWER;
+        let mut range = self.domain(Domain::Canonical);
         let mut searching = false;
         loop {
             // Keep ordinary best-fit placement on the uncontended path. A

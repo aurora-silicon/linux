@@ -307,6 +307,7 @@ impl Backend {
             let alloc = Allocator {
                 dev: &dev,
                 uat: &loan.uat,
+                layout: self.shared.variant.vm_layout,
             };
             pair.prepare(&alloc, packet, loan.addresses)?;
             let render = port.render_lock();

@@ -2204,6 +2204,29 @@ impl Vm {
         Ok(self)
     }
 
+    /// Drops the canonical context views of [`Self::with_status`] from a VM whose submission
+    /// profile presents none (M5): its binds are then never tracked or refused as views.
+    pub(crate) fn without_context_views(mut self) -> Self {
+        self.context_bindings = None;
+        self
+    }
+
+    /// Allocates the page tables that translate `range`, without installing a leaf: a table-only
+    /// link a walker that samples this root's top-level entries once (the firmware's kernel lower
+    /// root at RUN) can follow to mappings made later. The tables stay until the VM is dropped.
+    pub(crate) fn prepare_tables(&self, range: Range<u64>) -> Result {
+        let mut inner = lock_vm(&self.gpuvm, None, false)?;
+        if range.start < inner.va_range.start || range.end > inner.va_range.end {
+            return Err(EINVAL);
+        }
+        inner.page_table.alloc_pages(range)
+    }
+
+    /// Returns which top-level entries of this VM's root link a table (bit `n` for entry `n`).
+    pub(crate) fn root_links(&self) -> Result<u64> {
+        lock_vm(&self.gpuvm, None, false)?.page_table.root_links()
+    }
+
     /// Attach a status and job lifetime tracking before sharing a newly created user VM with
     /// queues, without the G17 canonical context views, shared-object footprints and idle
     /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.

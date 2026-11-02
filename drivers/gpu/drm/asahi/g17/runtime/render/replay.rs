@@ -80,6 +80,7 @@ impl Firmware {
         };
         let dev = self.primary.state.shared.drm()?;
         let uat = self.uat.clone();
+        let layout = self.variant.vm_layout;
         let prepared = self.with_render(slot, |pair, _| {
             if !pair.room() {
                 return Err(EBUSY);
@@ -87,6 +88,7 @@ impl Firmware {
             let alloc = Allocator {
                 dev: &dev,
                 uat: &uat,
+                layout,
             };
             pair.prepare(&alloc, &packet, addresses)
         });

@@ -12,9 +12,10 @@ use crate::g17::{
         render::{self as abi, storage},
     },
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
+    vm_layout::Domain,
 };
 use crate::{
-    hw::t8140::{dynamic, kernel_window, low, queues, resources as cfg},
+    hw::t8140::{kernel_window, low, queues, resources as cfg},
     mmu,
 };
 use core::sync::atomic::Ordering;
@@ -50,7 +51,7 @@ impl Aliases {
         vm: &mmu::Vm,
         source: core::ops::Range<usize>,
     ) -> Result<Self> {
-        let mut range = dynamic::LOWER;
+        let mut range = alloc.domain(Domain::Canonical);
         let size = (source.end - source.start) as u64;
         loop {
             // Descriptor aliases are read-only to GPU consumers; the canonical
@@ -278,7 +279,7 @@ impl Generation {
         KernelObject::new(
             alloc.dev,
             vm,
-            crate::g17::object::Placement::In(dynamic::CLIENT_LOWER, cfg::TVB_PAGE),
+            crate::g17::object::Placement::In(alloc.domain(Domain::Private), cfg::TVB_PAGE),
             storage::STATE_SIZE,
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
@@ -459,7 +460,7 @@ impl Memory {
         let registers = KernelObject::new(
             alloc.dev,
             vm,
-            crate::g17::object::Placement::In(dynamic::CLIENT_LOWER, mmu::UAT_PGSZ as u64),
+            crate::g17::object::Placement::In(alloc.domain(Domain::Private), mmu::UAT_PGSZ as u64),
             mmu::UAT_PGSZ,
             mmu::PROT_GPU_SHARED_RO,
             CpuMap::WriteCombined,
@@ -467,7 +468,7 @@ impl Memory {
         let fragment_view = graph.descriptors.map_range(
             vm,
             TA_BYTES..TA_BYTES + mmu::UAT_PGSZ,
-            dynamic::CLIENT_LOWER,
+            alloc.domain(Domain::Private),
             mmu::UAT_PGSZ as u64,
             mmu::PROT_GPU_SHARED_RO,
             0,

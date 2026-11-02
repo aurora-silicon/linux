@@ -139,6 +139,7 @@ impl super::super::Backend {
                             let alloc = Allocator {
                                 dev: &dev,
                                 uat: &resources.uat,
+                                layout: self.shared.variant.vm_layout,
                             };
                             return pool.ensure_backing(&alloc, &resources.global, self.context.vm());
                         }
@@ -206,6 +207,7 @@ impl super::super::Backend {
         let alloc = Allocator {
             dev: &dev,
             uat: &resources.uat,
+            layout: self.shared.variant.vm_layout,
         };
         let fresh_graph = match &build {
             Build::Fresh(..) | Build::Parked { .. } => true,
@@ -684,6 +686,7 @@ impl super::super::Backend {
         let alloc = Allocator {
             dev: &dev,
             uat: &uat,
+            layout: self.shared.variant.vm_layout,
         };
         let mut growth = None;
         let result = (|| {
