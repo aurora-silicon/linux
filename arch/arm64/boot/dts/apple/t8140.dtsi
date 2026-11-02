@@ -587,14 +587,17 @@
 			/*
 			 * ProRes is soc-device record 14, DVFS ordinal 7. Its VMAX
 			 * request votes the SOC rail through the PMP's static agent,
-			 * like AVD; it has no cluster-agent bit.
+			 * like AVD; it has no cluster-agent bit. The PMP votes no DCS
+			 * state for it, and with the CPUs idle the CLPC drops DCS to
+			 * state 0 during an encode: the DCS floor holds DRAM up while
+			 * frames are in the engine.
 			 */
 			pmp_report_prores: report@e {
 				compatible = "apple,t8140-pmp-v2-report-entry";
 				reg = <0xe>;
 				label = "pmp-prores";
 				#power-domain-cells = <0>;
-				power-domains = <&ps_prores>;
+				power-domains = <&ps_prores>, <&pmc_dcs_max>;
 				apple,dvfs = <0x197 2>;
 			};
 
@@ -1366,6 +1369,17 @@
 			/* PMP, CLPC and AP agents */
 			apple,static-voters = <0 1 3>;
 			status = "disabled";
+
+			/*
+			 * DCS (DRAM) at its highest state, through the AP's agent.
+			 * The DCS limit still caps it.
+			 */
+			pmc_dcs_max: floor-dcs-max {
+				label = "dcs-max";
+				#power-domain-cells = <0>;
+				apple,rail = <0>;
+				apple,level = <4>;
+			};
 
 			/* VENC-CLSTR-V: the video encoder cluster, bit 3. */
 			pmc_venc_cluster: cluster-venc {
