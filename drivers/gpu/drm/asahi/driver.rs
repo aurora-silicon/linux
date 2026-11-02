@@ -302,11 +302,19 @@ impl platform::Driver for AsahiPlatformDriver {
         gpu.init()?;
 
         let stats = gpu.stats_snapshot();
+        let debug_stats = gpu.raw_stats_snapshot();
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
 
         // SAFETY: `reg` is stored in `AsahiPlatformDriverData` and dropped when the driver is
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
+
+        // The DRM core created this card's debugfs directory when the device was registered;
+        // publish the raw firmware statistics in it. drm_dev_unregister() removes the file, and
+        // waits for its readers, before the registration data that owns the snapshot is dropped.
+        if let Some(snapshot) = debug_stats.as_ref() {
+            crate::stats_raw::register(reg.device(), snapshot);
+        }
 
         // Register the sysfs file on the platform device. Must happen after
         // the DRM device is registered so the device is fully bound.

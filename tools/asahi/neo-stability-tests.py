@@ -132,7 +132,7 @@ static void rtnl_lock(void){assert(!rtnl_depth++);}
 static void rtnl_unlock(void){assert(rtnl_depth--==1);}
 static void wiphy_lock(struct wiphy*w){assert(rtnl_depth&& !wiphy_depth++);}
 static void wiphy_unlock(struct wiphy*w){assert(wiphy_depth--==1);}
-struct mt7932 {struct ieee80211_channel channels[MT7932_CHANNELS_2G],channels5[MT7932_CHANNELS_5G],channels6[MT7932_CHANNELS_6G];struct wiphy*wiphy;struct net_device*netdev;struct {struct device dev;}*pdev;struct mt7932_reg_snapshot reg_desired,reg_deferred;unsigned reg_generation,response_lock,startup_work;bool reg_pending,stopping,interface_registered,connecting,connected,disconnecting,reg_deferral,data_ready,six_ap_valid;int data_lock;int connect_error,assoc_start,assoc_done,discovery_done;uint64_t policy_disabled[(MT7932_CHANNELS+63)/64];};
+struct mt7932 {struct ieee80211_channel channels[MT7932_CHANNELS_2G],channels5[MT7932_CHANNELS_5G],channels6[MT7932_CHANNELS_6G];struct wiphy*wiphy;struct net_device*netdev;struct {struct device dev;}*pdev;struct mt7932_reg_snapshot reg_desired,reg_deferred;unsigned reg_generation,response_lock,startup_work;bool reg_pending,stopping,interface_registered,connecting,connected,disconnecting,reg_deferral,data_ready,six_ap_valid,roam_moving;int data_lock;int connect_error,assoc_start,assoc_done,discovery_done;uint64_t policy_disabled[(MT7932_CHANNELS+63)/64];};
 #define spin_lock(l) ((void)(l))
 #define spin_unlock(l) ((void)(l))
 static void mt_data_kick_locked(struct mt7932*m){assert(0 && "unexpected TX boundary");}
@@ -245,6 +245,10 @@ int main(int argc,char**argv){
   assert(m.reg_generation==applied&&!m.reg_pending&&m.reg_deferral);
   assert(get_unaligned_le32(m.reg_desired.domain+16)==IEEE80211_CHAN_NO_IR);
   assert(get_unaligned_le32(m.reg_deferred.domain+16)==0);
+  /* A move to another AP carries the connection on: still deferred. */
+  m.connected=false;m.roam_moving=true;m.reg_deferral=false;mt_regulatory_notify(&w,&request);
+  assert(m.reg_generation==applied&&!m.reg_pending&&m.reg_deferral&&get_unaligned_le32(m.reg_desired.domain+16)==IEEE80211_CHAN_NO_IR);
+  m.roam_moving=false;
   m.stopping=true;unsigned n=m.reg_generation;request.alpha2[0]='U';mt_regulatory_notify(&w,&request);assert(m.reg_generation==n);
  }
  puts("PASS");return 0;

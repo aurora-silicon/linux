@@ -1532,6 +1532,9 @@ struct apple_pmp_report_entry {
 	u32 id;
 	/* The PMP does not acknowledge this request (a started PMP only). */
 	bool no_ack;
+	/* Withdrawn for system sleep (apple,release-for-sleep), and now so. */
+	bool sleep_release;
+	bool released;
 	/*
 	 * With @dvfs, the SOC-DEV-DVFS entry this soc-device's performance
 	 * request lives in, and the request word written while powered.
@@ -1582,6 +1585,61 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		50000);
 }
 
+/* Find and check the report before taking the GPU vote; optionally update it. */
+static int apple_pmp_report_t6030_gfx(struct device *supplier, const bool *enable)
+{
+	struct apple_pmp_report *rep, *found = NULL;
+	struct device_node *pmp;
+	const u8 *table;
+	int len = 0, ret = -ENODEV;
+
+	if (!IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK) ||
+	    !of_machine_is_compatible("apple,t6030") ||
+	    !of_device_is_compatible(supplier->of_node, "apple,t6030-pmp-v2"))
+		return -ENODEV;
+
+	/* T6030's ordered soc-device ID 5 is the acknowledged AGX request. */
+	table = of_get_property(supplier->of_node, "apple,tunable-soc-device", &len);
+	if (!apple_pmp_devices_valid(table, len, BIT_ULL(4), BIT_ULL(4), true) ||
+	    memcmp(table + 4 * PMP_SOC_DEVICE_SIZE + 116, "AGX\0\0\0\0\0", 8))
+		return -EINVAL;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->offsets != &apple_pmp_offsets_t6030)
+			continue;
+		pmp = of_parse_phandle(rep->dev->of_node, "apple,pmp", 0);
+		if (pmp == supplier->of_node) {
+			of_node_put(pmp);
+			if (found)
+				goto out;
+			found = rep;
+		} else {
+			of_node_put(pmp);
+		}
+	}
+	if (found) {
+		if (readq(found->base + found->offsets->status) != PMP_REPORT_READY)
+			ret = -EAGAIN;
+		else
+			ret = enable ? apple_pmp_report_set_state(found, 4, *enable, false) : 0;
+	}
+out:
+	rcu_read_unlock();
+	return ret;
+}
+int apple_pmp_report_check_t6030_gfx(struct device *supplier)
+{
+	return apple_pmp_report_t6030_gfx(supplier, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_check_t6030_gfx);
+
+/* The RTKit AGX vote alone does not enable PMP's GPU bandwidth controllers. */
+int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable)
+{
+	return apple_pmp_report_t6030_gfx(supplier, &enable);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
 /* SOC-DEV-DVFS request words carry a valid bit; level 0 is the floor. */
 #define PMP_DVFS_VALID		BIT_ULL(61)
 
@@ -1619,6 +1677,80 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	rcu_read_unlock();
 	return ret;
 }
+
+/*
+ * System sleep. An external display processor's request keeps the PMP's
+ * external display state up while nothing is shown, about 0.25 W in
+ * suspend-to-idle on J514S. By the noirq phase every display processor has
+ * suspended, its displays off and its links released or idle: withdraw such a
+ * request if it is acknowledged, with one replacement write as macOS releases
+ * its display requests, and assert it again before the processors resume.
+ */
+static int apple_pmp_report_entry_sleep(struct apple_pmp_report_entry *ent, bool release)
+{
+	struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != ent->report_node)
+			continue;
+		if (release && (!(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY) ||
+				!(readq(rep->base + rep->offsets->actual) & BIT_ULL(ent->id))))
+			ret = -EALREADY;
+		else
+			ret = apple_pmp_report_set_state(rep, ent->id, !release, ent->no_ack);
+		break;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+static int apple_pmp_report_entry_suspend_noirq(struct device *dev)
+{
+	struct apple_pmp_report_entry *ent = dev_get_drvdata(dev);
+	int ret;
+
+	if (!ent || !ent->sleep_release || READ_ONCE(ent->removed))
+		return 0;
+	ret = apple_pmp_report_entry_sleep(ent, true);
+	if (ret == -EALREADY)
+		return 0;
+	/* A withdrawal that was not acknowledged is asserted again all the same. */
+	if (ret)
+		dev_warn(dev, "request %u not withdrawn for sleep: %d\n", ent->id, ret);
+	ent->released = true;
+	return 0;
+}
+
+static int apple_pmp_report_entry_resume_noirq(struct device *dev)
+{
+	struct apple_pmp_report_entry *ent = dev_get_drvdata(dev);
+	int ret, tries = 0;
+
+	if (!ent || !ent->released)
+		return 0;
+	ent->released = false;
+	/*
+	 * Without the request the external display stays dark until reboot:
+	 * write it again, three times at most, while the PMP does not
+	 * acknowledge it in time.
+	 */
+	do {
+		ret = apple_pmp_report_entry_sleep(ent, false);
+	} while (ret == -ETIMEDOUT && ++tries < 3);
+	if (ret)
+		dev_err(dev, "request %u not asserted after sleep: %d\n", ent->id, ret);
+	else if (tries)
+		dev_warn(dev, "request %u asserted after sleep on write %d\n", ent->id,
+			 tries + 1);
+	return ret;
+}
+
+static const struct dev_pm_ops apple_pmp_report_entry_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmp_report_entry_suspend_noirq,
+				  apple_pmp_report_entry_resume_noirq)
+};
 
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 {
@@ -1692,6 +1824,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 		}
 		ent->no_ack = of_property_read_bool(node, "apple,no-ack");
 	}
+	ent->sleep_release = of_property_read_bool(node, "apple,release-for-sleep");
 	if (of_property_present(node, "apple,dvfs")) {
 		u32 dvfs[2];
 
@@ -1794,6 +1927,7 @@ static struct platform_driver apple_pmp_report_entry_driver = {
 	.driver = {
 		.name = "apple-pmp-report-entry",
 		.of_match_table = apple_pmp_report_entry_of_match,
+		.pm = pm_sleep_ptr(&apple_pmp_report_entry_pm_ops),
 		/* Power-domain providers are not intended for manual unbinding. */
 		.suppress_bind_attrs = true,
 	},

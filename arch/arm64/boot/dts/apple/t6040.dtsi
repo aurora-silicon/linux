@@ -2000,7 +2000,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		/* Include firmware identity MMIO pages below the preload DVAs. */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
 		status = "disabled";
 	};
 
@@ -2011,7 +2012,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		/* Include firmware identity MMIO pages below the preload DVAs. */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
 		status = "disabled";
 	};
 
@@ -2022,7 +2024,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1055 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_ane_sys>;
-		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		/* Include firmware identity MMIO pages below the preload DVAs. */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
 		status = "disabled";
 	};
 
@@ -2251,7 +2254,12 @@
 		status = "disabled";
 	};
 
-	/* Firmware interface support is required before enabling the ANE. */
+	/*
+	 * Disabled until the H16 firmware path is proven on hardware. The
+	 * loader fills the preload reservations and the firmware IOVAs from
+	 * the ADT, so enabling it then only takes status = "okay" here and on
+	 * the three DARTs.
+	 */
 	ane: ane@484000000 {
 		compatible = "apple,t6041-ane";
 		reg = <0x4 0x84000000 0x0 0x2000000>,
@@ -2265,13 +2273,20 @@
 			    "aux-3", "aux-4";
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1054 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>,
-			 <&ane0_dart0 11>, <&ane0_dart1 11>, <&ane0_dart2 11>;
+		/* Stream 0 only: the MPM stream 11 is not given to the host. */
+		iommus = <&ane0_dart0 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
 		power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
 				<&ps_ane_td>, <&ps_ane_base>;
 		apple,ane-type = <0x110>;
 		apple,firmware-preloaded;
-		/* TEXT/DATA reservations and IOVAs must come from iBoot. */
+		/* Inclusive DAPF bounds, in hardware record order. */
+		apple,dapf-ranges = /bits/ 64 <0x5022803c0 0x5022803c3>,
+				    /bits/ 64 <0x50228c000 0x50228c01b>,
+				    /bits/ 64 <0x581668000 0x581668003>,
+				    /bits/ 64 <0x28a668000 0x28a668003>;
+		/* Default firmware layout; the loader rewrites it from the ADT. */
+		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+		/* The bootloader supplies the physical TEXT/DATA reservations. */
 		status = "disabled";
 	};
 

@@ -94,6 +94,7 @@
 #include <crypto/sha2.h>
 
 #include "ane_fw_platform.h"
+#include "ane_fw_cold.h"
 #include "ane_h16_protocol.h"
 #include "ane_h16_pending.h"
 #include "ane_h16_resources.h"
@@ -4025,7 +4026,7 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 		return -ENODEV;
 	/* Later generations cannot enter H14 boot or parameter paths. */
 	if (soc->platform)
-		return ane_fw_platform_preflight(pdev, soc->platform);
+		return ane_fw_platform_probe(pdev, soc->platform);
 
 	mutex_lock(&ane_rtclient_probe_guard_lock);
 	if (ane_rtclient_probe_failed_dirty || ane_rtclient_active) {
@@ -4057,7 +4058,13 @@ static int ane_rtclient_probe(struct platform_device *pdev)
 
 static void ane_rtclient_remove(struct platform_device *pdev)
 {
+	const struct ane_t602x_soc *soc = of_device_get_match_data(&pdev->dev);
 	struct ane_rtclient *ane = platform_get_drvdata(pdev);
+
+	if (soc->platform) {
+		ane_fw_platform_remove(pdev);
+		return;
+	}
 
 	if (READ_ONCE(ane_t6021_perf_ane) == ane)
 		WRITE_ONCE(ane_t6021_perf_ane, NULL);
@@ -4137,8 +4144,12 @@ static struct attribute *ane_t6021_stats_attrs[] = {
 static umode_t ane_t6021_stats_is_visible(struct kobject *kobj,
 					  struct attribute *attr, int n)
 {
-	struct ane_rtclient *ane = dev_get_drvdata(kobj_to_dev(kobj));
+	struct device *dev = kobj_to_dev(kobj);
+	const struct ane_t602x_soc *soc = of_device_get_match_data(dev);
+	struct ane_rtclient *ane = dev_get_drvdata(dev);
 
+	if (soc->platform)
+		return 0;
 	if (attr == &dev_attr_ane_stats.attr && !ane->stats_slots)
 		return 0;
 	return attr->mode;
@@ -4184,20 +4195,23 @@ static int __init ane_rtclient_init(void)
 
 		if (!soc->platform)
 			continue;
-		if (soc->platform->owner == ANE_FW_OWNER_EXCLAVE) {
-			of_node_put(np);
-			pr_info("ane: H17 ANE: Linux exclave ownership handoff unavailable; refusing registration\n");
-			return -EOPNOTSUPP;
-		}
+		if (!of_device_is_available(np))
+			continue;
 		pdev = of_find_device_by_node(np);
 		of_node_put(np);
 		if (!pdev) {
 			pr_info("ane: H16 ANE: firmware transport unvalidated; keeping disabled\n");
 			return -EOPNOTSUPP;
 		}
-		ret = ane_fw_platform_preflight(pdev, soc->platform);
+		if (soc->platform->soc == 0x8140)
+			ret = ane_fw_staged_init(pdev, soc->platform);
+		else
+			ret = ane_fw_platform_preflight(pdev, soc->platform);
 		put_device(&pdev->dev);
-		return ret;
+		if (ret)
+			return ret;
+		ane_rtclient_driver.driver_managed_dma = true;
+		break;
 	}
 
 	WRITE_ONCE(ane_rtclient_probe_failed_dirty, false);
@@ -4211,6 +4225,8 @@ module_init(ane_rtclient_init);
 
 static void __exit ane_rtclient_exit(void)
 {
+	if (ane_fw_staged_exit())
+		return;
 	platform_driver_unregister(&ane_rtclient_driver);
 	ane_t6021_trace_free();
 }

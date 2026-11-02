@@ -18,6 +18,30 @@ use crate::module_parameters;
 /// updates); this bounds the kernel's staging allocation.
 pub(crate) const MAX_BINDS: u32 = 1 << 20;
 
+// At least one prefix of renders, so that the last prefix published outside the margin cannot
+// cross the wrap; at most half the stamp range.
+static_assert!(
+    hw::tuning::STAMP_RESEED_MARGIN >= hw::tuning::PREFIX_RENDERS as u64
+        && hw::tuning::STAMP_RESEED_MARGIN <= super::encode::RENDER_WRAP / 2
+);
+// At least one prefix of computes; at most half the stamp range.
+static_assert!(
+    hw::tuning::COMPUTE_RESEED_MARGIN >= hw::sizes::COMPUTE_SLOTS as u64
+        && hw::tuning::COMPUTE_RESEED_MARGIN <= super::encode::COMPUTE_WRAP / 2
+);
+
+/// Renders before the TA stamp wrap within which the TA/FS stamps are renumbered from their seeds,
+/// at the first moment with nothing in flight ([`hw::tuning::STAMP_RESEED_MARGIN`]).
+pub(crate) fn stamp_reseed_margin() -> u64 {
+    hw::tuning::STAMP_RESEED_MARGIN
+}
+
+/// Computes before the compute stamp wrap within which the compute stamp is renumbered from its
+/// seed, at the first moment with nothing in flight ([`hw::tuning::COMPUTE_RESEED_MARGIN`]).
+pub(crate) fn compute_reseed_margin() -> u64 {
+    hw::tuning::COMPUTE_RESEED_MARGIN
+}
+
 /// Host deadline of a published prefix without progress, ms (at least 100).
 pub(crate) fn deadline_ms() -> u32 {
     module_parameters::g15_deadline_ms.value().max(100)
@@ -64,11 +88,31 @@ pub(crate) fn accept_text_prefix() -> u64 {
 }
 
 /// The parameter for the PB growth maximum the firmware is given, in blocks, clamped to
-/// 64..=4095. [`super::pools::Pools::soft_max`] raises it to at least the initial 1024 blocks;
-/// the blocks above it, up to the 4095 posted at most, answer the synchronous requests of
-/// partial renders. It is read-only after boot and does not change the 512 MiB heap.
+/// 64..=4095. [`super::pools::Pools::soft_max`] raises it to at least the initial posting; the
+/// blocks above it, up to the 4095 posted at most, answer the synchronous requests of partial
+/// renders. It is read-only after boot and does not change the heap's backing.
 pub(crate) fn pb_max_blocks() -> u32 {
     module_parameters::g15_pb_max_blocks.value().clamp(64, super::hw::tuning::PB_MAX_BLOCKS)
+}
+
+/// The initial PB posting, in blocks: a fixed driver value, not a module parameter.
+pub(crate) fn pb_blocks() -> u32 {
+    super::hw::tuning::PB_BLOCKS
+}
+
+/// PB reclaim at idle: 0 never, 1 re-initialize, 2 re-initialize and free the backing.
+pub(crate) fn pb_reclaim() -> u32 {
+    super::hw::tuning::PB_RECLAIM
+}
+
+/// Idle time before a PB reclaim, ns.
+pub(crate) fn pb_idle_ns() -> u64 {
+    super::hw::tuning::PB_IDLE_MS as u64 * 1_000_000
+}
+
+/// Posted blocks above which an idle engine reclaims the PB.
+pub(crate) fn pb_reclaim_blocks() -> u32 {
+    super::hw::tuning::PB_RECLAIM_BLOCKS
 }
 
 /// Whether FRAGMENT_BARRIERS is advertised and mapped to early tiling.

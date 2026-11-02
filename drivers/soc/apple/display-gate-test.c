@@ -7,9 +7,11 @@
  *  - T6030 (t6030-gate-test.dtso): on by default, as before, and
  *    the T6031 switch does not change it. Run first: the T6031 and T8122
  *    trees describe a PMP, and the T6030 gate refuses to add a second one.
- *  - T6031 (t6031-gate-test.dtso): off by default, enabled only by
- *    apple_t6031_display.enable=1 with the full handoff, and nothing changed
- *    when a check fails.
+ *  - T6031 (t6031-gate-test.dtso): on by default only on the default board
+ *    (the J516C; the cases point it at the test tree's own root to run that
+ *    path), otherwise only with apple_t6031_display.enable=1, never with
+ *    apple_t6031_display.enable=0; always with the full handoff, and nothing
+ *    changed when a check fails.
  *  - T8122 (t8122-gate-test.dtso): on by default, with the full handoff,
  *    and nothing changed when a check of the handoff or of the reused PMP
  *    topology fails.
@@ -143,6 +145,8 @@ struct gate_test {
 	const struct gt_soc *s;
 	struct of_changeset cs;	/* this case's own edits to the test tree */
 	bool requested, t6031_requested;
+	int t6031_switch;
+	const char *t6031_board;
 };
 
 static struct device_node *__init gt_node(struct kunit *test, const char *path)
@@ -392,6 +396,8 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 	/* As the boot left them: the test kernel's command line sets neither. */
 	t->requested = gate_requested;
 	t->t6031_requested = gate_t6031_requested;
+	t->t6031_switch = gate_t6031_switch;
+	t->t6031_board = gate_t6031_board;
 	of_changeset_init(&t->cs);
 	gate_soc = s->soc;
 	gate_pmp_values = NULL;
@@ -399,6 +405,7 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 	gate_pmp_reused = false;
 	gate_requested = true;
 	gate_t6031_requested = false;
+	gate_t6031_switch = -1;
 	if (gt_live_soc)
 		kunit_skip(test, "the booted device tree has its own /soc");
 	return 0;
@@ -444,6 +451,8 @@ static void __init gt_exit(struct kunit *test)
 	gate_pmp_values = NULL;
 	gate_requested = t->requested;
 	gate_t6031_requested = t->t6031_requested;
+	gate_t6031_switch = t->t6031_switch;
+	gate_t6031_board = t->t6031_board;
 	gate_soc = NULL;
 }
 
@@ -455,29 +464,82 @@ static void __init gate_t6031_param(struct kunit *test)
 	struct gate_test *t = test->priv;
 
 	KUNIT_EXPECT_FALSE(test, t->t6031_requested);
+	KUNIT_EXPECT_EQ(test, t->t6031_switch, -1);
+	KUNIT_EXPECT_STREQ(test, t->t6031_board, "apple,j516c");
 	KUNIT_EXPECT_TRUE(test, t->requested);
 
 	KUNIT_EXPECT_EQ(test, gate_setup_t6031("1"), 0);
-	KUNIT_EXPECT_TRUE(test, gate_t6031_requested);
+	KUNIT_EXPECT_EQ(test, gate_t6031_switch, 1);
 	KUNIT_EXPECT_EQ(test, gate_setup_t6031("0"), 0);
-	KUNIT_EXPECT_FALSE(test, gate_t6031_requested);
+	KUNIT_EXPECT_EQ(test, gate_t6031_switch, 0);
+	/* A rejected value sets nothing: neither an explicit 1 nor a reset to unset. */
 	KUNIT_EXPECT_NE(test, gate_setup_t6031("maybe"), 0);
-	KUNIT_EXPECT_FALSE(test, gate_t6031_requested);
+	KUNIT_EXPECT_EQ(test, gate_t6031_switch, 0);
 	KUNIT_EXPECT_NE(test, gate_setup_t6031(NULL), 0);
-	KUNIT_EXPECT_FALSE(test, gate_t6031_requested);
+	KUNIT_EXPECT_EQ(test, gate_t6031_switch, 0);
+	gate_t6031_switch = -1;
+	KUNIT_EXPECT_NE(test, gate_setup_t6031("maybe"), 0);
+	KUNIT_EXPECT_EQ(test, gate_t6031_switch, -1);
 
 	/* The T6030 and T8122 escapes do not touch it, nor it them. */
 	KUNIT_EXPECT_EQ(test, gate_setup("0"), 0);
 	KUNIT_EXPECT_FALSE(test, gate_requested);
-	KUNIT_EXPECT_FALSE(test, gate_t6031_requested);
+	KUNIT_EXPECT_EQ(test, gate_t6031_switch, -1);
 	KUNIT_EXPECT_EQ(test, gate_setup_t6031("1"), 0);
 	KUNIT_EXPECT_FALSE(test, gate_requested);
 	KUNIT_EXPECT_EQ(test, gate_setup_t8122("1"), 0);
 	KUNIT_EXPECT_TRUE(test, gate_requested);
-	KUNIT_EXPECT_TRUE(test, gate_t6031_requested);
+	KUNIT_EXPECT_EQ(test, gate_t6031_switch, 1);
 }
 
-/* With a complete handoff and no command line switch, nothing changes. */
+/* An explicit 0 or 1 wins; unset, only the default board asks for it. */
+static void __init gate_t6031_resolution(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, gate_t6031_wanted(-1, true));
+	KUNIT_EXPECT_FALSE(test, gate_t6031_wanted(-1, false));
+	KUNIT_EXPECT_FALSE(test, gate_t6031_wanted(0, true));
+	KUNIT_EXPECT_FALSE(test, gate_t6031_wanted(0, false));
+	KUNIT_EXPECT_TRUE(test, gate_t6031_wanted(1, true));
+	KUNIT_EXPECT_TRUE(test, gate_t6031_wanted(1, false));
+}
+
+/* Points the default board at the test tree's root, so gate_run() takes that path. */
+static void __init gt_default_board(struct kunit *test)
+{
+	const char *root = NULL;
+
+	if (of_property_read_string(of_root, "compatible", &root) || !root)
+		kunit_skip(test, "the test tree's root has no compatible");
+	gate_t6031_board = root;
+}
+
+/* On the default board, the full handoff and no switch: enabled. */
+static void __init gate_t6031_default_board_on(struct kunit *test)
+{
+	gt_default_board(test);
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
+/* apple_t6031_display.enable=0 still wins on the default board. */
+static void __init gate_t6031_default_board_switched_off(struct kunit *test)
+{
+	gt_default_board(test);
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("0"), 0);
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+/* The default asks for the display; it does not stand in for the handoff. */
+static void __init gate_t6031_default_board_no_marker(struct kunit *test)
+{
+	gt_default_board(test);
+	gt_remove(test, gt_t6031.dcp, "apple,t6031-handoff");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+/* Off the default board, with a complete handoff and no switch, nothing changes. */
 static void __init gate_t6031_off_by_default(struct kunit *test)
 {
 	gt_run(test);
@@ -826,7 +888,11 @@ static void __init gate_t8122_enabled_again(struct kunit *test)
 /* The case and suite structs outlive init: only the functions are init code. */
 static struct kunit_case gate_t6031_cases[] __refdata = {
 	KUNIT_CASE(gate_t6031_param),
+	KUNIT_CASE(gate_t6031_resolution),
 	KUNIT_CASE(gate_t6031_off_by_default),
+	KUNIT_CASE(gate_t6031_default_board_on),
+	KUNIT_CASE(gate_t6031_default_board_switched_off),
+	KUNIT_CASE(gate_t6031_default_board_no_marker),
 	KUNIT_CASE(gate_t6031_switched_off),
 	KUNIT_CASE(gate_t6031_enabled),
 	KUNIT_CASE(gate_t6031_no_dcp_marker),
