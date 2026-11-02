@@ -319,11 +319,11 @@ impl job::Backend for Backend {
         let Some(firmware) = (*state).as_deref() else {
             return false;
         };
-        firmware.queues.compute.iter().flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .any(|other| other.owner() != Some(self.owner) && other.long_job_running())
-            || firmware.queues.m5_channels()
-                .any(|other| other.owner() != Some(self.owner) && other.long_job_running())
+        // Each entry's queue, Neo's or the M5 Ultra's lane.
+        firmware.queues.compute.iter().flatten().any(|entry| {
+            entry.inspect_queue(|other| other.owner() != Some(self.owner) && other.long_job_running())
+                .unwrap_or(false)
+        })
     }
 
     fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {

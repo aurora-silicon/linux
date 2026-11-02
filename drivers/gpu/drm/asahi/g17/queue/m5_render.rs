@@ -256,7 +256,7 @@ impl ParkedPair {
         self.parked_at
     }
     /// Releases this parked pair's pool (the caller holds the device mutex and announces a
-    /// published record), as a detached lane's (`super::compute::Queue::vacate_m5`): the backing is
+    /// published record), as a detached lane's (`super::compute::Queue::vacate`): the backing is
     /// freed once the firmware consumed the release ([`Self::observe_vacancy`]); the lanes stay
     /// installed, and the next binding's first pass backs the pool for its plan.
     pub(crate) fn vacate(&mut self, init: &crate::g17::initdata::InitData) -> Result<bool> {

@@ -103,6 +103,14 @@ pub(crate) struct Vacated {
     _ring: Option<DescriptorRing>,
 }
 
+/// What [`Queue::observe_vacancy`] detaches for the caller to free off the device mutex: a Neo
+/// queue's [`Vacated`], or a detached M5 Ultra lane's pool backing (its `m5` arm). Only the
+/// observation carries it, so Neo's `Vacated` and the growth paths that move one are unchanged.
+pub(crate) enum Vacancy {
+    Neo(Vacated),
+    M5(crate::g17::freelist::M5Backing),
+}
+
 /// A physical queue's client views in its bound owner's VM, and that owner's context.
 /// The M5 Ultra's binding (`Graph::bind`'s `m5` arm) holds the same views: the kick ring, the
 /// descriptors' canonical low alias, the pool while backed, the operand state at its own address,
@@ -643,8 +651,8 @@ pub(crate) struct Queue {
     pub(in crate::g17::queue) retained_owner: Option<crate::g17::context::FirmwarePages>,
     /// Registered from the installation on: an installed queue's every release is published.
     pub(in crate::g17::queue) pool_state: PoolState,
-    growing: bool,
-    growth_blocks: usize,
+    pub(in crate::g17::queue) growing: bool,
+    pub(in crate::g17::queue) growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
     /// fresh before any owner binds it (set by `recycle_killed`, cleared by `rearm`).
     pub(in crate::g17::queue) needs_fresh_backing: bool,
@@ -1920,8 +1928,12 @@ impl Queue {
         self.retained_owner = Some(binding.context.retain_firmware_pages());
         Some(binding)
     }
-    /// An idle retained queue whose USC backing may be given back.
+    /// An idle retained queue whose USC backing may be given back. The M5 Ultra lane's arm: a
+    /// detached lane's backed pool (`Queue::m5_vacate_candidate`).
     pub(crate) fn vacate_candidate(&self) -> bool {
+        if self.m5.is_some() {
+            return self.m5_vacate_candidate();
+        }
         self.pool_state.phase() == PoolPhase::Populated && self.pool.populated()
             && (self.reusable() || self.recycled_pending())
             && !self.source_hint.has_readers(&self.source_readers)
@@ -2027,8 +2039,11 @@ impl Queue {
         if !self.vacate_candidate() {
             return Err(EBUSY);
         }
-        // A candidate is installed, so its pool is registered and the release is published.
-        self.pool_state.release(init, self.pool.release_record(self.free_list_generation))?;
+        // A candidate is installed, so its pool is registered and the release is published. The
+        // M5 Ultra lane's record names generation 1, as every binding's configuration publishes
+        // it; the lane, its QID, ring and stamps stay installed.
+        let generation = if self.m5.is_some() { 1 } else { self.free_list_generation };
+        self.pool_state.release(init, self.pool.release_record(generation))?;
         Ok(())
     }
     /// Detaches the USC backing once the firmware's control consumer passed the
@@ -2038,7 +2053,11 @@ impl Queue {
         &mut self,
         consumer: u32,
         producer: u32,
-    ) -> Result<Option<Vacated>> {
+    ) -> Result<Option<Vacancy>> {
+        // The M5 Ultra lane's arm: a detached lane's vacant pool, once its views are unmapped.
+        if self.m5.is_some() {
+            return Ok(self.observe_vacancy_m5(consumer, producer)?.map(Vacancy::M5));
+        }
         if self.growing || !self.pool_state.observe(consumer, producer)? {
             return Ok(None);
         }
@@ -2048,12 +2067,12 @@ impl Queue {
         let pages = self.pool.take_pages();
         let descriptors = self.binding.as_mut().and_then(|binding| binding.descriptors.take());
         let ring = self.graph.vacate_ring();
-        Ok(Some(Vacated {
+        Ok(Some(Vacancy::Neo(Vacated {
             _alias: alias,
             _pages: pages,
             _descriptors: descriptors,
             _ring: ring,
-        }))
+        })))
     }
     /// Installs fresh backing into a vacant pool; returns the descriptor row data
     /// the caller writes before binding an owner.
@@ -2072,12 +2091,20 @@ impl Queue {
         Ok((self.pool.id(), self.pool.page_list_va()?))
     }
     pub(crate) fn pool_fits(&self, required: usize) -> bool {
+        // The M5 Ultra lane's arm: its pool is backed with at least `required` blocks.
+        if self.m5.is_some() {
+            return !self.growing && !self.needs_pool(required);
+        }
         !self.growing && self.pool_state.phase() == PoolPhase::Populated && self.pool.fits(required)
     }
 
     /// Only a capacity increase waits for this queue's previously published work.
     /// Other queues and ordinary submissions keep their existing concurrency.
     pub(crate) fn begin_growth(&mut self, init: &crate::g17::initdata::InitData, blocks: usize) -> Result<bool> {
+        // The M5 Ultra lane's arm (`queue::m5`); its finish is `finish_growth_m5`.
+        if self.m5.is_some() {
+            return self.begin_growth_m5(init, blocks);
+        }
         if self.growing { return Err(EAGAIN); }
         if self.quarantined || self.released || self.exit.is_some()
             || self.active.len != 0 || self.replays.len != 0 || self.previous.is_some()
@@ -2124,6 +2151,10 @@ impl Queue {
     /// revoke the published release or free backing here: vacancy still requires
     /// its exact control-consumer witness. A different transaction is untouched.
     pub(crate) fn abort_growth(&mut self, token: Growth) -> Result<Option<bool>> {
+        // The M5 Ultra lane's arm (`queue::m5`).
+        if self.m5.is_some() {
+            return Ok(self.abort_growth_m5(token.qid));
+        }
         if !self.growing || self.qid() != token.qid || self.pool_state.phase() != token.phase {
             return Ok(None);
         }

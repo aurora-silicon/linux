@@ -284,7 +284,7 @@ impl super::Registry {
             visit(&*queue);
         }
         for channel in super::m5::channels(&self.compute) {
-            visit(channel);
+            visit(&*channel);
         }
         for pair in super::m5::pairs(&self.render.m5) {
             visit(pair);
@@ -306,8 +306,8 @@ impl super::Registry {
         for mut queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
             failure = failure.or(settle(&mut *queue).err());
         }
-        for channel in super::m5::channels_mut(&mut self.compute) {
-            failure = failure.or(settle(channel).err());
+        for mut channel in super::m5::channels_mut(&mut self.compute) {
+            failure = failure.or(settle(&mut *channel).err());
         }
         for pair in super::m5::pairs_mut(&mut self.render.m5) {
             failure = failure.or(settle(pair).err());
@@ -624,13 +624,13 @@ impl crate::g17::Shared {
             return Err(EIO);
         }
         let now = super::now_ns();
+        // Each entry's queue, Neo's or the M5 Ultra's lane, then the M5 render pairs.
         let compute = firmware
             .queues
             .compute
             .iter()
             .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .any(|queue| queue.in_flight())
+            .any(|entry| entry.inspect_queue(|queue| queue.in_flight()).unwrap_or(false))
             || firmware.queues.m5_in_flight();
         let in_flight = compute || firmware.queues.render_in_flight();
         let idle = firmware.idle_check(now, in_flight)?;

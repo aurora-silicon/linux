@@ -117,22 +117,24 @@ pub(super) struct ComputeReservation {
 
 struct ComputeEntry {
     reservation: ComputeReservation,
+    /// The entry's queue: a Neo compute queue, or the M5 Ultra's compute lane on this entry's
+    /// QID (Neo's compute queue with its `m5` arms, [`queue::m5`]), placed only by
+    /// `Firmware::install_m5_channel`. Neo's walks see the cell through [`ComputeSlot::as_deref`],
+    /// which leaves the lane out; the M5 Ultra's through [`ComputeSlot::lane`].
     queue: ComputeSlot,
-    /// The M5 Ultra's compute lane on this entry's QID, Neo's compute queue with its `m5` arms
-    /// ([`queue::m5`]), bound to the reservation's owner; its cell stays empty, so Neo's walks over
-    /// the cells do not see it. Set only by `Firmware::bind_m5_channel` and
-    /// `Firmware::install_m5_channel`, so `None` on every other GPU.
-    m5: Option<KBox<compute::Queue>>,
 }
 
 impl ComputeEntry {
-    /// Runs `f` on this entry's queue: its cell's, or else the M5 Ultra's lane beside the empty
-    /// cell ([`Self::m5`], `None` on every other GPU). Neo's closed-context kill reaches both.
+    /// Runs `f` on this entry's queue, Neo's or the M5 Ultra's lane. Neo's closed-context kill
+    /// reaches both.
     fn with_queue<R>(&mut self, f: impl FnOnce(&mut compute::Queue) -> R) -> Option<R> {
-        if let Some(mut queue) = self.queue.as_deref_mut() {
-            return Some(f(&mut queue));
-        }
-        self.m5.as_deref_mut().map(f)
+        self.queue.0.lock().map(|mut queue| f(&mut queue))
+    }
+
+    /// [`Self::with_queue`], shared: the vacate pass reads Neo's queues and the M5 Ultra's lanes
+    /// through one walk.
+    fn inspect_queue<R>(&self, f: impl FnOnce(&compute::Queue) -> R) -> Option<R> {
+        self.queue.0.lock().map(|queue| f(&queue))
     }
 }
 
@@ -198,11 +200,17 @@ impl ComputeSlot {
     fn new() -> Result<Self> {
         Ok(Self(ComputeCell::new()?))
     }
+    /// Neo's view of the cell: its queue, unless it is the M5 Ultra's lane ([`Self::lane`]), which
+    /// Neo's walks over the cells leave to their M5 arms. On every other GPU, the queue.
     fn as_deref(&self) -> Option<QueueGuard<'_>> {
-        self.0.lock()
+        self.0.lock().filter(|queue| !queue.is_m5())
     }
     fn as_deref_mut(&mut self) -> Option<QueueGuard<'_>> {
-        self.0.lock()
+        self.as_deref()
+    }
+    /// The M5 Ultra's view of the cell: its lane; None on every other GPU.
+    fn lane(&self) -> Option<QueueGuard<'_>> {
+        self.0.lock().filter(|queue| queue.is_m5())
     }
     fn is_some(&self) -> bool {
         self.0.queue.lock().is_some()
@@ -331,18 +339,26 @@ impl Registry {
     }
 
     /// The oldest unfinished work of every queue, both engines, for cross-VM timeout attribution
-    /// (`timeout::attribute`): Neo's compute queues and render pairs, and M5's compute channels.
-    /// An M5 render pair joins here with a `timeout_head` of its own, as Neo's pairs do. A
+    /// (`timeout::attribute`): the compute queues (the M5 Ultra's lanes among them) and render
+    /// pairs. An M5 render pair joins here with a `timeout_head` of its own, as Neo's pairs do. A
     /// watchdog's own queue may be among them: `timeout::blocker` looks only at other VMs.
     pub(in crate::g17) fn timeout_heads(&self) -> impl Iterator<Item = crate::g17::timeout::Head> + '_ {
+        // Each entry's queue, Neo's or the M5 Ultra's lane (a detached lane holds no work).
         let computes = self
             .compute
             .iter()
             .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .filter_map(|queue| queue.timeout_head());
-        let m5 = self.m5_channels().filter_map(|channel| channel.timeout_head());
-        Iterator::chain(Iterator::chain(computes, self.render_timeout_heads()), m5)
+            .filter_map(|entry| entry.inspect_queue(|queue| queue.timeout_head()).flatten());
+        Iterator::chain(computes, self.render_timeout_heads())
+    }
+
+    /// `owner`'s compute queue, Neo's or the M5 Ultra's lane, locked: the watchdog's lookup.
+    pub(super) fn owner_queue(&self, owner: u64) -> Option<QueueGuard<'_>> {
+        self.compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.0.lock())
+            .find(|queue| queue.owner() == Some(owner))
     }
 
     /// The cell of `owner`'s bound queue, which its publisher may lock without the device mutex.
@@ -504,11 +520,11 @@ impl Registry {
     /// Publishes releases for the oldest idle retained pools beyond `cap` and
     /// for every pool released at least `expiry` before `now`, at most four
     /// per pass. Returns the number published and the delay until the next
-    /// retained pool expires or a retry is due. Parked M5 compute lanes and
-    /// render pairs are candidates alongside the retained compute queues, under
-    /// the same cap and expiry (`queue::compute::Queue::vacate_m5` for a lane
-    /// detached in its entry, `queue::m5_render::ParkedPair::vacate`): their
-    /// lanes stay installed.
+    /// retained pool expires or a retry is due. The M5 Ultra's detached compute
+    /// lanes are Neo's retained queues here (the `m5` arms of `Queue::vacate_candidate`
+    /// and `Queue::vacate`); parked M5 render pairs are candidates alongside them,
+    /// under the same cap and expiry (`queue::m5_render::ParkedPair::vacate`). Lanes
+    /// and pairs stay installed.
     pub(super) fn vacate_idle_pools(
         &mut self,
         init: &super::initdata::InitData,
@@ -520,32 +536,21 @@ impl Registry {
         let mut forced = 0;
         let mut count = 0;
         let mut next = None::<u64>;
-        for queue in self
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .filter(|queue| queue.vacate_candidate())
-        {
-            count += 1;
-            let released = queue.released_at();
-            let age = now.saturating_sub(released);
-            if queue.needs_fresh_backing() || (released != 0 && age >= expiry) {
-                forced += 1;
-            } else if released != 0 {
-                let left = expiry - age;
-                next = Some(next.map_or(left, |next| next.min(left)));
-            }
-        }
-        for lane in m5::detached(&self.compute).filter(|lane| lane.m5_vacate_candidate()) {
-            count += 1;
-            let age = now.saturating_sub(lane.released_at());
-            if lane.needs_fresh_backing() || age >= expiry {
-                forced += 1;
-            } else {
-                let left = expiry - age;
-                next = Some(next.map_or(left, |next| next.min(left)));
-            }
+        for entry in self.compute.iter().flatten() {
+            entry.inspect_queue(|queue| {
+                if !queue.vacate_candidate() {
+                    return;
+                }
+                count += 1;
+                let released = queue.released_at();
+                let age = now.saturating_sub(released);
+                if queue.needs_fresh_backing() || (released != 0 && age >= expiry) {
+                    forced += 1;
+                } else if released != 0 {
+                    let left = expiry - age;
+                    next = Some(next.map_or(left, |next| next.min(left)));
+                }
+            });
         }
         for pair in m5::parked_pairs(&self.render.m5).filter(|pair| pair.vacate_candidate()) {
             count += 1;
@@ -571,21 +576,15 @@ impl Registry {
         }
         // (age key, QID (a pair's tiling QID), which kind of pool).
         let mut candidates: KVec<(u64, u8, IdlePool)> = KVec::with_capacity(count, GFP_KERNEL)?;
-        for queue in self
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .filter(|queue| queue.vacate_candidate())
-        {
-            // Recycled killed queues sort first (time 0) and count beyond the cap.
-            let key = if queue.needs_fresh_backing() { 0 } else { queue.released_at() };
-            candidates.push((key, queue.qid(), IdlePool::Neo), GFP_KERNEL)?;
-        }
-        for lane in m5::detached(&self.compute).filter(|lane| lane.m5_vacate_candidate()) {
-            // A lane recycled after a kill sorts first, as a recycled Neo queue does.
-            let key = if lane.needs_fresh_backing() { 0 } else { lane.released_at() };
-            candidates.push((key, lane.qid(), IdlePool::Lane), GFP_KERNEL)?;
+        for entry in self.compute.iter().flatten() {
+            let candidate = entry.inspect_queue(|queue| {
+                // Recycled killed queues (and lanes) sort first (time 0) and count beyond the cap.
+                let key = if queue.needs_fresh_backing() { 0 } else { queue.released_at() };
+                queue.vacate_candidate().then(|| (key, queue.qid(), IdlePool::Neo))
+            });
+            if let Some(candidate) = candidate.flatten() {
+                candidates.push(candidate, GFP_KERNEL)?;
+            }
         }
         for pair in m5::pairs(&self.render.m5).filter(|pair| bound(self, pair)) {
             // After every pool no owner holds.
@@ -599,15 +598,6 @@ impl Registry {
         let excess = candidates.len().saturating_sub(cap).max(forced);
         let mut published = 0;
         for &(_, qid, kind) in candidates.iter().take(excess.min(4)) {
-            if kind == IdlePool::Lane {
-                let lane = m5::detached_mut(&mut self.compute).find(|lane| lane.qid() == qid).ok_or(EIO)?;
-                match lane.vacate_m5(init) {
-                    Err(error) if error == EAGAIN => break,
-                    result => { result?; }
-                }
-                published += 1;
-                continue;
-            }
             if kind == IdlePool::BoundPair {
                 let pair = m5::pairs_mut(&mut self.render.m5).find(|pair| pair.qids()[0] == qid).ok_or(EIO)?;
                 match pair.vacate(init) {
@@ -626,15 +616,13 @@ impl Registry {
                 published += 1;
                 continue;
             }
-            let qid = &qid;
-            let mut queue = self
+            let result = self
                 .compute
                 .iter_mut()
                 .flatten()
-                .filter_map(|entry| entry.queue.as_deref_mut())
-                .find(|queue| queue.qid() == *qid)
+                .find_map(|entry| entry.with_queue(|queue| (queue.qid() == qid).then(|| queue.vacate(init))).flatten())
                 .ok_or(EIO)?;
-            match queue.vacate(init) {
+            match result {
                 Err(error) if error == EAGAIN => break,
                 result => result?,
             }
@@ -657,33 +645,35 @@ impl Registry {
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);
         let mut freed = 0;
-        for mut queue in self
-            .compute
-            .iter_mut()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref_mut())
-        {
-            if !deferred.vacated_room() { break; }
-            if let Some(vacated) = queue.observe_vacancy(consumer, producer)? {
-                deferred.defer_vacated(vacated);
-                freed += 1;
-            }
-        }
+        // Neo's queues and the M5 Ultra's lanes (the `m5` arm of `Queue::observe_vacancy`). The
+        // M5 room is never short off the M5 Ultra: only M5 pools take it.
         for slot in 0..self.compute.len() {
-            if !deferred.m5_pool_room() { break; }
-            let Some(lane) = self.compute[slot].as_mut().and_then(|entry| entry.m5.as_deref_mut()) else {
+            if !deferred.vacated_room() || !deferred.m5_pool_room() { break; }
+            let Some(entry) = self.compute[slot].as_mut() else {
                 continue;
             };
-            let qid = lane.qid();
-            if let Some(backing) = lane.observe_m5_vacancy(consumer, producer)? {
-                if crate::module_parameters::m5_lane_trace.value() != 0 {
-                    pr_info!("M5 lane {}: pool vacated ({} blocks), {} detached pools backed\n",
-                        qid, backing.blocks(),
-                        m5::detached(&self.compute).filter(|lane| lane.m5_backed()).count());
+            // The entry's queue, Neo's or the M5 Ultra's lane, as `ComputeEntry::with_queue` has
+            // it (written out, so the walk keeps one frame).
+            let mut cell = entry.queue.0.lock();
+            let Some(queue) = cell.as_deref_mut() else {
+                continue;
+            };
+            let qid = queue.qid();
+            let vacancy = queue.observe_vacancy(consumer, producer)?;
+            drop(cell);
+            match vacancy {
+                None => continue,
+                Some(compute::Vacancy::Neo(vacated)) => deferred.defer_vacated(vacated),
+                Some(compute::Vacancy::M5(backing)) => {
+                    if crate::module_parameters::m5_lane_trace.value() != 0 {
+                        pr_info!("M5 lane {}: pool vacated ({} blocks), {} detached pools backed\n",
+                            qid, backing.blocks(),
+                            m5::detached(&self.compute).filter(|lane| lane.m5_backed()).count());
+                    }
+                    deferred.defer_m5_pool(None, backing);
                 }
-                deferred.defer_m5_pool(None, backing);
-                freed += 1;
             }
+            freed += 1;
         }
         for slot in 0..self.render.m5.len() {
             if !deferred.m5_pool_room() { break; }
@@ -721,10 +711,10 @@ impl Registry {
             || m5::parked_pairs(&self.render.m5).any(|pair| pair.pool_release_pending())
     }
 
-    /// An M5 pool's release in flight past the background poll's bound.
+    /// An M5 render pair's pool release in flight past the background poll's bound, bound or
+    /// parked (a compute lane's is its queue's, `Queue::pool_release_stalled`).
     fn m5_pool_release_stalled(&self, now: u64) -> bool {
-        m5::lanes(&self.compute).any(|lane| lane.pool_release_stalled(now))
-            || self.m5_pairs().any(|pair| pair.pool_release_stalled(now))
+        self.m5_pairs().any(|pair| pair.pool_release_stalled(now))
             || m5::parked_pairs(&self.render.m5).any(|pair| pair.pool_release_stalled(now))
     }
 
@@ -777,7 +767,6 @@ impl Registry {
         self.compute[slot] = Some(ComputeEntry {
             reservation,
             queue: ComputeSlot::new()?,
-            m5: None,
         });
         Ok(reservation)
     }
@@ -791,7 +780,6 @@ impl Registry {
         if entry.reservation.id != reservation.id
             || entry.reservation.owner != reservation.owner
             || entry.queue.is_some()
-            || entry.m5.is_some()
         {
             return Err(EIO);
         }
@@ -996,9 +984,8 @@ impl Backend {
         if !lease.is_current() || shared.state.lock().is_none() {
             return Err(EAGAIN);
         }
-        if let Some(gpu) = &shared.m5 {
-            Self::install_m5(shared, &lease, &alloc, &context, owner, gpu)?;
-        }
+        // The M5 Ultra's lane is leased at the queue's first command, as S's physical queue is
+        // claimed at preparation (`Backend::m5_lease_lane`): the queue holds none until then.
         let admission = held.as_ref().ok_or(EINVAL)?.pool().clone();
         let bound = context.clone();
         let backend = Arc::pin_init(
@@ -1033,15 +1020,16 @@ impl Backend {
         }
     }
 
-    /// Binds `owner` to its M5 channel, as `build_compute` binds a Neo queue: under the device
+    /// Binds `owner` to its M5 channel at its first command (`Backend::m5_lease_lane`), as
+    /// `build_compute` binds a Neo queue: under the device
     /// mutex a parked lane is adopted, or a compute entry and a fresh QID are reserved; a fresh
     /// channel is built off the mutex and installed into that entry under it. Then this waits off
     /// the mutex for the firmware to consume a fresh channel's installation, on the event
     /// worker's progress as a publication waits ([`wait_release`]); a full outer work ring
     /// (EAGAIN, nothing published yet) is waited out the same way, keeping the built channel. The
-    /// queue's channel is installed before the queue exists, and once published it is retained
-    /// whatever happens: nothing is retried after the publication, and an installation still
-    /// unconsumed after [`queue::m5::INSTALL_WAIT_MS`] quarantines the channel. A reservation
+    /// queue's channel is installed before its first command publishes, and once published it is
+    /// retained whatever happens: nothing is retried after the publication, and an installation
+    /// still unconsumed after [`queue::m5::INSTALL_WAIT_MS`] quarantines the channel. A reservation
     /// that never installed is returned in `finish_uninstalled_compute`'s order: the built
     /// channel's aliases go first, then the entry and its unpublished QID. The preparation lease
     /// is held throughout.
@@ -1560,7 +1548,8 @@ pub(super) struct DeferredBatch {
     bindings: KVVec<super::queue::compute::Binding>,
     vacated: KVVec<super::queue::compute::Vacated>,
     /// Backing of vacated M5 pools, each after the client view a bound render pair kept of it
-    /// (`queue::compute::Queue::observe_m5_vacancy`, `queue::m5_render::Pair::observe_vacancy`).
+    /// (`queue::compute::Queue::observe_vacancy`'s M5 arm,
+    /// `queue::m5_render::Pair::observe_vacancy`).
     m5_pools: KVVec<(Option<crate::mmu::KernelMapping>, super::freelist::M5Backing)>,
     /// Backing of render pools vacated for evicted idle clients.
     render: KVVec<super::freelist::RenderBacking>,
@@ -2209,12 +2198,13 @@ impl Backend {
         {
             return None;
         }
-        if self.shared.m5.is_some() {
-            // M5 publication waits for its channel's room itself (`m5_packet`).
-            return None;
-        }
-        let super::command::Validated::Compute { scratch, .. } = &packet.command else { return None; };
-        let required = super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages()).ok()?;
+        // The blocks the command's pool must back: an M5 Ultra command's plan names them.
+        let required = if self.shared.m5.is_some() {
+            super::queue::m5::Dispatch::of(&packet.command).ok()?.resources.pool_blocks
+        } else {
+            let super::command::Validated::Compute { scratch, .. } = &packet.command else { return None; };
+            super::fw::compute_pool::required_blocks(self.shared.active_cores, scratch.pages()).ok()?
+        };
         loop {
             let channels = self.shared.channels.observe();
             let progress = self.shared.progress.observe();
@@ -2238,8 +2228,9 @@ impl Backend {
             Err(_) => return Readiness::Ready,
             Ok(_) => {}
         }
-        // The steady state: this owner's channel is bound and installed.
-        if packet.completion.sources().is_none() {
+        // The steady state: this owner's channel is bound and installed. The M5 Ultra's lane is
+        // judged by its own arm below (`Registry::m5_readiness`).
+        if self.shared.m5.is_none() && packet.completion.sources().is_none() {
             if let Some(cell) = self.direct.lock().clone() {
                 let bound = cell.lock().is_some_and(|mut queue| {
                     let bound = queue.installed()
@@ -2274,6 +2265,9 @@ impl Backend {
             || super::recovery::Memory::recovery_state(&firmware.init).unwrap_or(0) != 0
         {
             return Readiness::Progress;
+        }
+        if self.shared.m5.is_some() {
+            return firmware.queues.m5_readiness(self.owner);
         }
         firmware.queues.compute_readiness(self.owner, Some(&self.context), required)
     }
@@ -2721,8 +2715,9 @@ impl super::Firmware {
         if releasing || shared.progress.has_waiters() {
             shared.progress.notify();
         }
-        if self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
-            .any(|queue| queue.pool_release_stalled(now))
+        // Each entry's queue, Neo's or the M5 Ultra's lane, then the M5 render pairs.
+        if self.queues.compute.iter().flatten()
+            .any(|entry| entry.inspect_queue(|queue| queue.pool_release_stalled(now)).unwrap_or(false))
             || self.queues.m5_pool_release_stalled(now)
         {
             return Err(ETIMEDOUT);
@@ -2774,7 +2769,7 @@ impl Registry {
         writeln!(f, "compute_slots used={} total={} reusable={} building={}",
                  self.compute.iter().flatten().count(), self.compute.len(),
                  self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).filter(|queue| queue.reusable()).count(),
-                 self.compute.iter().flatten().filter(|entry| entry.queue.is_none() && entry.m5.is_none()).count())?;
+                 self.compute.iter().flatten().filter(|entry| entry.queue.is_none()).count())?;
         writeln!(f, "compute_channels used={} fresh_fits={}",
                  self.compute.iter().flatten().count(),
                  u8::from(self.qids.compute_fits(self.admission.queues() as usize)))?;
@@ -2789,7 +2784,7 @@ impl Registry {
                  self.m5_pairs().count(), m5::parked_pairs(&self.render.m5).count(),
                  self.m5_pairs().filter(|pair| pair.quarantined().is_some()).count(),
                  self.m5_pairs().filter(|pair| pair.awaiting_witness()).count(),
-                 u8::from(self.m5_in_flight()))?;
+                 u8::from(self.m5_channels().any(|channel| channel.in_flight()) || self.m5_in_flight()))?;
         for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
             queue.write_capacity(f)?;
         }
@@ -2971,11 +2966,10 @@ impl Backend {
 }
 
 /// The kind of idle pool a vacate pass releases (`Registry::vacate_idle_pools`): a retained Neo
-/// compute queue's, a parked M5 compute lane's or a parked M5 render pair's.
+/// compute queue's (a detached M5 compute lane's among them) or a parked M5 render pair's.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum IdlePool {
     Neo,
-    Lane,
     Pair,
     /// An idle bound M5 render pair's, under backing pressure only (cap 0).
     BoundPair,

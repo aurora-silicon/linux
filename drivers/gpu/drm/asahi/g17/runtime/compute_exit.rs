@@ -127,16 +127,11 @@ impl super::Registry {
     /// ACK storage belongs to the already-retained transaction, so a full event
     /// batch cannot overflow a separate cache. No allocation or wait is needed.
     pub(super) fn acknowledge_compute_exit(&mut self, cookie: u64) {
+        // Each entry's queue, Neo's or the M5 Ultra's lane, which carries its kills as Neo's do.
         for entry in self.compute.iter_mut().flatten() {
-            if let Some(mut queue) = entry.queue.as_deref_mut() {
-                if queue.acknowledge_exit(cookie) {
-                    return;
-                }
+            if entry.with_queue(|queue| queue.acknowledge_exit(cookie)) == Some(true) {
+                return;
             }
-        }
-        // The M5 Ultra's compute lanes (none elsewhere) carry their kills as Neo's queues do.
-        if super::m5::channels_mut(&mut self.compute).any(|channel| channel.acknowledge_exit(cookie)) {
-            return;
         }
         if self.teardown.acknowledge_render_kill(cookie) {
             RENDER_KILLS[RENDER_KILL_ACKNOWLEDGED].fetch_add(1, Ordering::Relaxed);
@@ -211,11 +206,9 @@ impl Firmware {
 
     fn publish_compute_exit(&mut self, context: &Arc<Context>, age: u64, now: u64, pressed: &mut bool) -> Result {
         let Some(index) = self.queues.compute.iter().position(|entry| {
-            entry.as_ref().is_some_and(|entry| {
-                entry.queue.as_deref().is_some_and(|queue| queue.exit_candidate(context, age))
-                    // The M5 Ultra's lane beside the empty cell (`ComputeEntry::m5`).
-                    || entry.m5.as_deref().is_some_and(|lane| lane.exit_candidate(context, age))
-            })
+            // The entry's queue, Neo's or the M5 Ultra's lane (`ComputeEntry::inspect_queue`).
+            entry.as_ref().and_then(|entry| entry.inspect_queue(|queue| queue.exit_candidate(context, age)))
+                .unwrap_or(false)
         }) else {
             return Ok(());
         };
@@ -480,15 +473,15 @@ impl Firmware {
         }
         self.queues.render.foreign_in_flight(context)
             || self.queues.m5_foreign_in_flight(context)
+            // Each entry's queue, Neo's or the M5 Ultra's lane.
             || self
                 .queues
                 .compute
                 .iter()
                 .flatten()
-                .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| {
+                .any(|entry| entry.inspect_queue(|queue| {
                     queue.in_flight() && !queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
-                })
+                }).unwrap_or(false))
     }
 
     pub(in crate::g17) fn compute_exit_polling(&self, now: u64) -> bool {
@@ -497,15 +490,12 @@ impl Firmware {
             .compute
             .iter()
             .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .any(|queue| queue.exit_polling(now))
+            // Each entry's queue, Neo's or the M5 Ultra's lane.
+            .any(|entry| entry.inspect_queue(|queue| queue.exit_polling(now)).unwrap_or(false))
         {
             return true;
         }
         if self.queues.teardown.render_kill_polling(now, exit::POLL_NS) {
-            return true;
-        }
-        if super::m5::channels(&self.queues.compute).any(|channel| channel.exit_polling(now)) {
             return true;
         }
         (0..self.queues.teardown.len()).any(|index| {

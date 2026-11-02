@@ -21,25 +21,17 @@ impl Backend {
             };
             firmware.scan_compute(None, &mut deferred)?;
             // Each queue is locked on its own: release this one before visiting the others.
-            let own = firmware.queues.compute(self.owner)
+            // The owner's queue, Neo's or the M5 Ultra's lane.
+            let own = firmware.queues.owner_queue(self.owner)
                 .filter(|queue| queue.can_classify_timeout(packet))
                 .and_then(|queue| queue.timeout_head());
-            // An M5 queue's work runs on its channel.
-            let own = own.or_else(|| {
-                let channel = firmware.queues.m5_channel(self.owner)?;
-                channel.can_classify_timeout(packet).then(|| channel.timeout_head()).flatten()
-            });
             let Some(own) = own else {
                 return Ok(Decision::Own);
             };
             let verdict = timeout::attribute(own, renewals, firmware.queues.timeout_heads());
             let decision = verdict.decision;
             if decision == Decision::Spare {
-                match firmware.queues.compute(self.owner) {
-                    Some(queue) => queue.classify(&|_| Class::Spared),
-                    None => firmware.queues.m5_channel(self.owner).ok_or(EIO)?
-                        .classify(&|_| Class::Spared),
-                }
+                firmware.queues.owner_queue(self.owner).ok_or(EIO)?.classify(&|_| Class::Spared);
             }
             if let Some(blocker) = verdict.reported_blocker(renewals) {
                 dev_warn!(self.shared.dev.as_ref(),
