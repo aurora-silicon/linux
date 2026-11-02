@@ -46,7 +46,7 @@ def main():
         'ave-cmd.c': ('ave_cmd_start', 'ave_cmd_process'),
         'ave-drv.c': ('ave_runtime_resume', 'ave_runtime_suspend', 'ave_suspend', 'ave_resume', 'ave_inject_wedge'),
     }
-    code += '#define AVE_POLL_FAST_ROUNDS 20\n#define AVE_POLL_MS 2\n'
+    code += '#define AVE_IRQ_RECHECK_MS 100\n#define AVE_WATCH_MS 25\n'
     for filename, names in groups.items():
         text = (src / filename).read_text()
         for name in names:
