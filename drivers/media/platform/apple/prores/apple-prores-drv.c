@@ -20,6 +20,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/sizes.h>
@@ -195,6 +196,7 @@ struct apr_dev {
 	void __iomem *regs;
 	void __iomem *wrapper;
 	struct reset_control *reset;
+	struct dev_pm_domain_list *pd_list;
 	int irq[2];
 
 	struct v4l2_device v4l2_dev;
@@ -1070,6 +1072,22 @@ static int apr_probe(struct platform_device *pdev)
 	apr->wrapper = devm_platform_ioremap_resource_byname(pdev, "wrapper");
 	if (IS_ERR(apr->wrapper))
 		return PTR_ERR(apr->wrapper);
+	/*
+	 * A second power domain, "perf", is the SoC performance request the
+	 * engine needs for full speed. With more than one domain the core
+	 * attaches none, so attach both with runtime PM links: the request is
+	 * held exactly while the engine is runtime-active.
+	 */
+	if (of_count_phandle_with_args(dev->of_node, "power-domains",
+				       "#power-domain-cells") > 1) {
+		static const struct dev_pm_domain_attach_data pd_data = {
+			.pd_flags = PD_FLAG_DEV_LINK_ON,
+		};
+
+		ret = devm_pm_domain_attach_list(dev, &pd_data, &apr->pd_list);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "failed to attach power domains\n");
+	}
 	apr->reset = devm_reset_control_get_optional_exclusive(dev, NULL);
 	if (IS_ERR(apr->reset))
 		return dev_err_probe(dev, PTR_ERR(apr->reset), "reset\n");
