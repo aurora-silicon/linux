@@ -11,10 +11,10 @@
  * System sleep while the H16/H17 firmware runs. Hibernation and restore are
  * always refused while the firmware is retained: the image would carry a
  * firmware state the restored kernel cannot match. Suspend passes only for a
- * backend that cycles the engine across it (powers it off at prepare and
- * boots it again from the preload after resume, ane_fw_cold.c); otherwise it
- * is refused up front, before any device suspends. Without retained firmware
- * nothing is refused.
+ * backend that suspends the firmware and power gates the engine across it,
+ * then warm boots the same firmware after resume (ane_fw_cold.c, after
+ * SPEC-ANE-SLEEP.md); otherwise it is refused up front, before any device
+ * suspends. Without retained firmware nothing is refused.
  */
 static inline bool ane_fw_sleep_refused_cycle(unsigned long event, bool retained, bool cycles)
 {
