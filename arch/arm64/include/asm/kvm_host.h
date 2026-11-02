@@ -499,6 +499,7 @@ enum vcpu_sysreg {
 	TFSRE0_EL1,	/* Tag Fault Status Register (EL0) */
 
 	POR_EL0,	/* Permission Overlay Register 0 (EL0) */
+	APPLE_AFPCR_EL0, /* Apple x86 FP mode control (AFP: DAZ, FTZ) */
 
 	/* FP/SIMD/SVE */
 	SVCR,
