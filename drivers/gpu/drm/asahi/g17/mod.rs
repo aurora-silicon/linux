@@ -1275,7 +1275,7 @@ impl Gpu {
             .map(|board| fw::m5::compute::Gpu::new(board, &id.core_masks))
             .transpose()?;
         if let Some(gpu) = &m5 {
-            dev_info!(dev.as_ref(), "M5 compute: {} pool blocks of {} MiB per queue\n", gpu.pool_blocks, gpu.block_bytes() >> 20);
+            dev_info!(dev.as_ref(), "M5 compute: {} pool blocks of {} MiB per queue, growing to at most {}\n", gpu.pool_blocks, gpu.block_bytes() >> 20, gpu.max_pool_blocks);
         }
         let shared = Arc::pin_init(
             pin_init!(Shared {

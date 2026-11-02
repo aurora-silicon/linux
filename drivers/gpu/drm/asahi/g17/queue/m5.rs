@@ -25,10 +25,12 @@
 
 use super::compute::{GRAPH_SIZE, ITEMS, POINTERS};
 use crate::g17::{
+    channel::Rings,
     context::{Context, WorkStateLease},
-    freelist::M5Pool,
+    freelist::{control_consumed, M5Backing, M5Pool},
     fw::{
         self,
+        channels::ControlRecord,
         kick::{KickArgs, KickQos, KickTimestamp},
         m5::{
             compute::{self, Descriptor, DescriptorArgs, Gpu, RegisterArgs, Resources},
@@ -122,6 +124,13 @@ impl Dispatch {
             _ => Err(EINVAL),
         }
     }
+}
+
+/// A grown pool's old backing and the client's old view of it ([`Channel::grow`]), dropped off
+/// the device mutex: the view first.
+pub(crate) struct Grown {
+    _view: mmu::KernelMapping,
+    _backing: M5Backing,
 }
 
 /// A kick in flight.
@@ -370,6 +379,9 @@ pub(crate) struct Channel {
     usage_va: u64,
     installed: bool,
     ordinal: u32,
+    /// The pool grew since the lane's last kick ([`Self::grow`]): the next kick rebinds it with
+    /// its configuration update.
+    pool_rebind: bool,
     active: KVec<Active>,
     /// Set once a kick failed or the channel's state became ambiguous: nothing more is published,
     /// and every failed kick stays in `failed`, pinning its command.
@@ -587,6 +599,7 @@ impl Channel {
                 usage_va,
                 installed: false,
                 ordinal: 0,
+                pool_rebind: false,
                 active: KVec::with_capacity(DEPTH, GFP_KERNEL)?,
                 quarantine: None,
                 failed: KVec::new(),
@@ -677,6 +690,7 @@ impl Channel {
                 usage_va,
                 installed: true,
                 ordinal: 0,
+                pool_rebind: false,
                 active,
                 quarantine: None,
                 failed: KVec::new(),
@@ -967,6 +981,124 @@ impl Channel {
         result
     }
 
+    /// Backed blocks of the lane's pool.
+    pub(crate) fn pool_blocks(&self) -> usize {
+        self.pool.blocks()
+    }
+
+    /// Grows the lane's pool to `blocks` before the command that needs them is published. A
+    /// kick queue whose private-memory pool changed is reconfigured at the submission, and
+    /// only on an empty queue; S grows an idle M5 queue's pool by releasing it
+    /// and re-arming fresh backing (S `begin_growth`, `finish_growth`). So: EAGAIN until the
+    /// lane is idle (the witnesses of [`Self::parkable`] but the close). Then the fresh backing
+    /// and its client view are built (ENOMEM if they cannot be, and nothing changed), the
+    /// firmware's registration of the pool is released (FreeListRelease) and its consumption
+    /// awaited, the backing installed with its page-pool row and the client's view replaced,
+    /// and the next kick rebinds the pool with its configuration update, as an adopted lane's
+    /// first kick does. A release the firmware does not consume quarantines the channel, as
+    /// does any failure after it. Returns the old backing and its view, which the caller drops
+    /// off the device mutex. A grown pool stays grown with its lane.
+    pub(crate) fn grow(
+        &mut self,
+        alloc: &Allocator<'_>,
+        host: &mut Host<'_>,
+        notify: impl FnOnce() -> Result,
+        blocks: usize,
+    ) -> Result<Option<Grown>> {
+        if let Some(error) = self.quarantine {
+            return Err(error);
+        }
+        if !self.installed || self.closed || blocks > self.gpu.max_pool_blocks {
+            return Err(EINVAL);
+        }
+        if blocks <= self.pool.blocks() {
+            return Ok(None);
+        }
+        if self.faulted || !self.active.is_empty() || !self.failed.is_empty() {
+            return Err(EAGAIN);
+        }
+        let next = self.lane.kick.timestamp();
+        if !self.lane.idle_at(self.lane.cursors()?.producer)?
+            || self.pool.completed_submissions()? != self.pool.submitted()?
+            || (next.get() != KickTimestamp::FIRST.get()
+                && !retirement::stamp_covers(self.stamp()?, next.prev().get()))
+        {
+            return Err(EAGAIN);
+        }
+        let geometry =
+            fw::m5::pool::PoolGeometry::of(blocks, self.gpu.block_bytes()).map_err(|_| EINVAL)?;
+        let no_memory = |error: Error| if error == EINVAL { error } else { ENOMEM };
+        let fresh = M5Backing::new(alloc, self.qid(), geometry).map_err(no_memory)?;
+        let view = fresh.map_client(self.context.vm()).map_err(no_memory)?;
+        let old_va = self.pool.backing_va();
+        let index = self
+            .aliases
+            .iter()
+            .position(|alias| alias.iova() == old_va)
+            .ok_or(EIO)?;
+        // The firmware registered the pool with the lane's first kick: release that
+        // registration (generation 1, as every binding publishes it) before the backing moves.
+        if self.kicks() != 0 {
+            let cursor = Rings::publish_control(
+                host.init,
+                &ControlRecord::FreeListRelease(self.pool.release_record(1)),
+            )?;
+            let result = (|| {
+                notify()?;
+                for _ in 0..INSTALL_POLLS {
+                    if host.crashed.load(Ordering::Acquire) {
+                        return Err(EIO);
+                    }
+                    fence(Ordering::Acquire);
+                    let consumer = host.init.control_consumer()?.load(Ordering::Relaxed);
+                    let producer = host.init.control_producer()?.load(Ordering::Relaxed);
+                    if control_consumed(consumer, producer, cursor)? {
+                        return Ok(());
+                    }
+                    fsleep(Delta::from_millis(1));
+                }
+                Err(ETIMEDOUT)
+            })();
+            if let Err(error) = result {
+                pr_warn!(
+                    "G17 M5: lane {}: pool release not consumed: {:?}\n",
+                    self.qid(),
+                    error
+                );
+                self.quarantine = Some(error);
+                return Err(error);
+            }
+        }
+        let result = (|| {
+            let old = self.pool.rearm(fresh)?;
+            host.init
+                .install_m5_pool(self.pool.id(), self.pool.descriptor()?)?;
+            self.pool.publish_to_contexts()?;
+            view.publish_to_contexts();
+            Ok(old)
+        })();
+        let old = match result {
+            Ok(old) => old,
+            Err(error) => {
+                self.quarantine = Some(error);
+                return Err(error);
+            }
+        };
+        let old_view = core::mem::replace(&mut self.aliases[index], view);
+        self.pool_rebind = true;
+        pr_info!(
+            "M5 lane {}: pool grew from {} to {} blocks for queue {}\n",
+            self.qid(),
+            old.blocks(),
+            blocks,
+            self.owner
+        );
+        Ok(Some(Grown {
+            _view: old_view,
+            _backing: old,
+        }))
+    }
+
     /// The one M5 publication transaction: descriptor, notification and kick entry, the inner
     /// items, then the outer slot and the host command. `work` holds the kick's
     /// work-state node; `epoch` is the recovery generation the caller checked with recovery
@@ -993,12 +1125,12 @@ impl Channel {
         let policy = self.context.policy();
         let cursors = self.cursors()?;
         let first = self.ordinal == 0;
-        let items = if first { 2 } else { 1 };
+        let items = if first || self.pool_rebind { 2 } else { 1 };
         if (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count < items {
             return Err(EAGAIN);
         }
-        // The pool is sized for every accepted plan (`Gpu::new`); a larger one is a planning bug.
-        if dispatch.resources.pool_blocks > self.gpu.pool_blocks {
+        // A command that needs a larger pool grows it first ([`Self::grow`]).
+        if dispatch.resources.pool_blocks > self.pool.blocks() {
             return Err(EINVAL);
         }
         let claim = host.port.reserve_compute(policy.priority())?;
@@ -1050,9 +1182,12 @@ impl Channel {
             .initialize::<Descriptor>(slot * DESCRIPTOR_BYTES, |descriptor| {
                 descriptor.write(&args)
             })?;
-        let update = match first {
-            true => Some(self.config(false, Some(0))?),
-            false => None,
+        // The first kick binds the pool with the context; a later one rebinds a grown pool, the
+        // queue's completion value continuing.
+        let update = match (first, self.pool_rebind) {
+            (true, _) => Some(self.config(false, Some(0))?),
+            (false, true) => Some(self.config(false, None)?),
+            (false, false) => None,
         };
         let target = self
             .lane
@@ -1098,6 +1233,7 @@ impl Channel {
         // From here on the firmware may see this kick: the pool counter names it, and the
         // queue may be running earlier kicks that read the cursors.
         prepared.commit();
+        self.pool_rebind = false;
         if let Some(packet) = &packet {
             packet.mark_published();
         }

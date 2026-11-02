@@ -628,8 +628,9 @@ impl Payload {
 }
 
 /// The M5 subset of a compute command, after the common checks: what the M5 descriptor encodes
-/// (an eight-byte aligned CDM stream, no samplers, scratch, intersection tables, flags or
-/// attachment hints), and the resources its declarations plan. The user's stream and shaders
+/// (an eight-byte aligned CDM stream, no samplers, shader-context scratch (SCS), intersection
+/// tables, flags or attachment hints), and the resources its declarations plan, per-thread
+/// primary storage included ([`m5::compute::Gpu::plan`]). The user's stream and shaders
 /// stay user programs: only the first span is known mapped. Start and end timestamps are
 /// accepted: every M5 kick retires with its completion record's firmware start and end, a
 /// stream without a dispatch included, and those are what the command's destinations receive

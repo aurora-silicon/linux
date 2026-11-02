@@ -156,6 +156,14 @@ const RESOURCE_POLICY: u64 = 0x0040_0020;
 const MAX_THREADS: u32 = 1024;
 /// Threadgroup storage of one workgroup: Honeykrisp's `maxComputeSharedMemorySize`.
 const MAX_SHARED_BYTES: u32 = 32 * 1024;
+/// Primary storage per thread (the stack frame: Honeykrisp's spills and private arrays,
+/// `primary_bytes`) a compute command may declare. The firmware allocates each warp's frame
+/// from the queue's private pool, sized by the demand ([`RenderDemand::include_compute`]); no
+/// shader-context scratch (SCS) is involved. A queue's pool grows to the plan
+/// of the command that needs more (13 blocks of 16 MiB on J775D without primary storage, 31 at
+/// this bound). 1536 bytes covers the measured 1508/1512 boundary, where the frame grows to two
+/// 64 KiB pages.
+pub(crate) const MAX_PRIMARY_BYTES: u32 = 1536;
 /// Compute profiles one command may declare.
 const MAX_PROGRAMS: usize = 16;
 /// Tile storage of a pass in the M5 render subset (`command::m5_render`): bytes per sample times
@@ -180,8 +188,10 @@ pub(crate) fn ptc_target(pressure: u32, kicks: u32) -> u32 {
 pub(crate) struct Declared {
     programs: [ComputeStorage; MAX_PROGRAMS],
     count: usize,
-    /// Some profile declares per-thread (scratch) storage.
-    scratch: bool,
+    /// Why a profile is outside the planned subset: secondary, linked or minimum primary
+    /// storage (unqualified: Honeykrisp sends secondary storage only with ray traversal, the
+    /// other two never), or primary storage past [`MAX_PRIMARY_BYTES`].
+    unplanned: Option<&'static str>,
 }
 
 impl Declared {
@@ -203,10 +213,15 @@ impl Declared {
             threads: program.threads,
         };
         self.count += 1;
-        self.scratch |= program.primary_bytes != 0
-            || program.secondary_bytes != 0
-            || program.linked_bytes != 0
-            || program.minimum_primary_bytes != 0;
+        if program.secondary_bytes != 0 {
+            self.unplanned.get_or_insert("secondary storage");
+        } else if program.linked_bytes != 0 || program.minimum_primary_bytes != 0 {
+            self.unplanned
+                .get_or_insert("linked or minimum primary storage");
+        } else if program.primary_bytes > MAX_PRIMARY_BYTES {
+            self.unplanned
+                .get_or_insert("primary storage past the pool's bound");
+        }
         Ok(())
     }
 
@@ -381,12 +396,18 @@ impl Topology {
 }
 
 /// The board's descriptor profile on this GPU's topology: what M5 channels and command validation
-/// take. Each compute queue's pool covers every command the plan accepts.
+/// take. Each compute queue's pool starts covering every command without primary storage and
+/// grows to a command's plan before its publication (`queue::m5::Channel::grow`), up to what
+/// any accepted plan needs.
 #[derive(Clone, Copy)]
 pub(crate) struct Gpu {
     pub(crate) profile: &'static Profile,
     pub(crate) topology: Topology,
+    /// A compute queue's pool when it is built: what every declaration without primary storage
+    /// needs.
     pub(crate) pool_blocks: usize,
+    /// The largest pool an accepted plan needs ([`MAX_PRIMARY_BYTES`]).
+    pub(crate) max_pool_blocks: usize,
     /// Likewise each render pair's pool, over the subset's tile storage.
     pub(crate) render_pool_blocks: usize,
 }
@@ -398,17 +419,27 @@ impl Gpu {
     ) -> Result<Self> {
         let product = Product::of(board.core_revision.0).ok_or(ENODEV)?;
         let topology = Topology::of(core_masks, board.nominal_cores, product)?;
-        // The largest pool an accepted declaration needs: every warp count and threadgroup size
-        // in 64-byte steps (the demand rounds storage to them).
-        let mut blocks = 0;
-        for warps in 1..=MAX_THREADS / 32 {
-            for shared in (0..=MAX_SHARED_BYTES).step_by(64) {
-                let program = ComputeStorage {
-                    threads: warps * 32,
-                    threadgroup_bytes: shared,
-                    ..Default::default()
-                };
-                blocks = blocks.max(topology.compute(&[program])?.1);
+        // The largest pool a declaration needs: every warp count and threadgroup size in 64-byte
+        // steps (the demand rounds storage to them), without primary storage (a fresh pool) and
+        // with the most (every accepted plan). The demand only grows with primary storage (its
+        // frame pages enter the pressure and the tail with nonnegative weights), so the bound is
+        // the worst primary case.
+        let (mut blocks, mut max_blocks) = (0, 0);
+        for primary_bytes in [0, MAX_PRIMARY_BYTES] {
+            for warps in 1..=MAX_THREADS / 32 {
+                for shared in (0..=MAX_SHARED_BYTES).step_by(64) {
+                    let program = ComputeStorage {
+                        primary_bytes,
+                        threads: warps * 32,
+                        threadgroup_bytes: shared,
+                        ..Default::default()
+                    };
+                    let need = topology.compute(&[program])?.1;
+                    max_blocks = max_blocks.max(need);
+                    if primary_bytes == 0 {
+                        blocks = blocks.max(need);
+                    }
+                }
             }
         }
         // And the largest a render pass's tile record needs: every imageblock size in 64-byte
@@ -430,6 +461,7 @@ impl Gpu {
             profile: &board.compute,
             topology,
             pool_blocks: blocks,
+            max_pool_blocks: max_blocks,
             render_pool_blocks: render_blocks,
         })
     }
@@ -460,24 +492,49 @@ impl Gpu {
     /// The resources of a command with `declared` storage: register 0x0d4a1 packs the stack
     /// frame's and threadgroup storage's 64 KiB pages (S `resource_flags`), the PTC target is the
     /// pressure over the resident kicks, and the pool is what the demand needs on this topology.
-    /// Scratch is refused: its backing (the shader-context storage the scratch words name) is not
-    /// planned. An empty declaration (a flush-only stream, as for a barrier) plans the
-    /// storage-free minimum; a command with no declaration at all is refused by the parser's
-    /// caller (`command::m5_compute`): no declaration is not a declaration of none.
+    /// Primary storage (spills, private arrays) is part of that demand: the firmware allocates
+    /// the frames from the pool, so it has no other backing. Profiles outside the planned subset
+    /// ([`Declared::unplanned`]) are refused. An empty declaration (a flush-only stream, as for
+    /// a barrier) plans the storage-free minimum; a command with no declaration at all is refused
+    /// by the parser's caller (`command::m5_compute`): no declaration is not a declaration of
+    /// none.
     pub(crate) fn plan(&self, declared: Declared) -> Result<Resources> {
-        if declared.scratch {
-            kernel::pr_warn_once!("G17 M5: compute scratch storage refused (not planned yet)\n");
+        if let Some(what) = declared.unplanned {
+            kernel::pr_warn_once!("G17 M5: compute {} refused (not planned)\n", what);
             return Err(EOPNOTSUPP);
         }
         let (demand, pool_blocks) = self.topology.compute(declared.programs())?;
-        if pool_blocks > self.pool_blocks {
+        if pool_blocks > self.max_pool_blocks {
             return Err(EINVAL);
         }
-        Ok(Resources {
+        let resources = Resources {
             control: demand.resource_flags().map_err(|_| EINVAL)?,
             policy: u64::from(ptc_target(demand.pressure(), ACTIVE_KICKS)) << 32 | RESOURCE_POLICY,
             pool_blocks,
-        })
+        };
+        // Bring-up: plans with primary storage, each time the
+        // (primary, threads) shape changes, at most 64 lines.
+        use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        static PRIMARY_LOGS: AtomicU32 = AtomicU32::new(0);
+        static PRIMARY_LAST: AtomicU64 = AtomicU64::new(0);
+        if let Some(program) = declared
+            .programs()
+            .iter()
+            .find(|program| program.primary_bytes != 0)
+        {
+            let shape = u64::from(program.primary_bytes) << 32 | u64::from(program.threads);
+            if PRIMARY_LAST.swap(shape, Ordering::Relaxed) != shape
+                && PRIMARY_LOGS.fetch_add(1, Ordering::Relaxed) < 64
+            {
+                pr_info!(
+                    "G17 M5: compute plan of {} programs, primary {} B/thread x {} threads (shared {} B): control {:#x}, pressure {}, PTC {}, {} pool blocks (at most {})\n",
+                    declared.programs().len(), program.primary_bytes, program.threads,
+                    program.threadgroup_bytes, resources.control, demand.pressure(),
+                    resources.policy >> 32, pool_blocks, self.max_pool_blocks,
+                );
+            }
+        }
+        Ok(resources)
     }
 }
 

@@ -540,8 +540,17 @@ impl crate::g17::Firmware {
         result.map_err(|error| refused("installation", error))
     }
 
-    /// Publishes `packet` on `owner`'s channel. EAGAIN: the channel has no room yet.
-    fn publish_m5(&mut self, owner: u64, packet: &Arc<Packet>, dispatch: &Dispatch) -> Result {
+    /// Publishes `packet` on `owner`'s channel, its pool grown first when the command's plan
+    /// needs more ([`Channel::grow`]; the old backing lands in `grown`, for the caller to drop
+    /// off the device mutex). EAGAIN: the channel has no room yet, or is not idle for a growth.
+    fn publish_m5(
+        &mut self,
+        alloc: &Allocator<'_>,
+        owner: u64,
+        packet: &Arc<Packet>,
+        dispatch: &Dispatch,
+        grown: &mut Option<crate::g17::queue::m5::Grown>,
+    ) -> Result {
         let work = packet.completion.work_state()?;
         let epoch = self.recovery.generation();
         let channel = self
@@ -562,6 +571,15 @@ impl crate::g17::Firmware {
             qids: &mut self.queues.qids,
             crashed: &self.primary.state.shared.crashed,
         };
+        if dispatch.resources.pool_blocks > channel.pool_blocks() {
+            let primary = &self.primary;
+            *grown = channel.grow(
+                alloc,
+                &mut host,
+                || primary.notify(crate::g17::MSG_CONTROL_NOTIFY),
+                dispatch.resources.pool_blocks,
+            )?;
+        }
         let result = channel.publish(
             &mut host,
             dispatch,
@@ -645,6 +663,7 @@ impl Backend {
                     result?;
                 }
             }
+            let dev = self.shared.drm()?;
             let mut state = self.shared.state.lock();
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {
@@ -662,9 +681,18 @@ impl Backend {
                 retry(lease)?;
                 continue;
             }
-            match firmware.publish_m5(self.owner, packet, &dispatch) {
+            let uat = firmware.uat.clone();
+            let alloc = Allocator {
+                dev: &dev,
+                uat: &uat,
+                layout: firmware.variant.vm_layout,
+            };
+            let mut grown = None;
+            let result = firmware.publish_m5(&alloc, self.owner, packet, &dispatch, &mut grown);
+            drop(state);
+            drop(grown);
+            match result {
                 Err(error) if error == EAGAIN && !packet.is_published() => {
-                    drop(state);
                     retry(lease)?;
                 }
                 result => return result,

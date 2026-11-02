@@ -656,7 +656,9 @@ impl ComputePool {
 /// (tiling) QID, as for [`ComputePool`]. The M5 firmware's pool is a page directory over a fixed
 /// address inventory and a block free list ([`super::fw::m5::pool`]), followed in one canonical
 /// low allocation by its backed blocks, and a shared state the firmware completes into. It is
-/// never vacated.
+/// never vacated. A compute queue's pool grows: fresh backing replaces the blocks once the
+/// firmware released the old registration ([`Self::rearm`]); the shared state and the counters
+/// stay.
 pub(crate) struct M5Pool {
     backing: KernelObject,
     layout: super::fw::m5::pool::PoolLayout,
@@ -665,14 +667,21 @@ pub(crate) struct M5Pool {
     /// The host-submitted counter, which the shared state names.
     state: KernelObject,
     id: u16,
+    engine: super::fw::m5::pool::Engine,
 }
-impl M5Pool {
-    /// A pool of `geometry` serving `engine` for queue `qid`, built without the device mutex.
+
+/// The directory, free list and backed blocks of an M5 pool, in one canonical low allocation.
+pub(crate) struct M5Backing {
+    backing: KernelObject,
+    layout: super::fw::m5::pool::PoolLayout,
+}
+
+impl M5Backing {
+    /// Backing of `geometry` for the pool of queue `qid`, built without the device mutex.
     pub(crate) fn new(
         alloc: &Allocator<'_>,
         qid: u8,
         geometry: super::fw::m5::pool::PoolGeometry,
-        engine: super::fw::m5::pool::Engine,
     ) -> Result<Self> {
         use super::fw::m5::pool;
         if qid > super::fw::kick::QID_MAX {
@@ -706,6 +715,30 @@ impl M5Pool {
             freelist: base + geometry.directory_bytes as u64,
             hardware_id: u32::from(id),
         };
+        Ok(Self { backing, layout })
+    }
+
+    /// Maps the directory, free list and blocks into the client at their canonical addresses.
+    pub(crate) fn map_client(&self, vm: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        self.backing
+            .map_alias(vm, self.backing.gpu_va(), mmu::PROT_GPU_SHARED_RW)
+    }
+    /// Backed blocks.
+    pub(crate) fn blocks(&self) -> usize {
+        self.layout.geometry.blocks
+    }
+}
+impl M5Pool {
+    /// A pool of `geometry` serving `engine` for queue `qid`, built without the device mutex.
+    pub(crate) fn new(
+        alloc: &Allocator<'_>,
+        qid: u8,
+        geometry: super::fw::m5::pool::PoolGeometry,
+        engine: super::fw::m5::pool::Engine,
+    ) -> Result<Self> {
+        use super::fw::m5::pool;
+        let M5Backing { backing, layout } = M5Backing::new(alloc, qid, geometry)?;
+        let id = u16::from(qid) + 1;
         let mut control = alloc.kernel(
             CONTROL_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -727,13 +760,50 @@ impl M5Pool {
             control,
             state,
             id,
+            engine,
         })
     }
     pub(crate) fn id(&self) -> u16 {
         self.id
     }
+    /// Backed blocks.
+    pub(crate) fn blocks(&self) -> usize {
+        self.layout.geometry.blocks
+    }
+    /// The GPU address of the backing, where the client maps it ([`Self::map_client`]).
+    pub(crate) fn backing_va(&self) -> u64 {
+        self.backing.gpu_va()
+    }
+    /// Replaces the backing with `fresh` once the firmware consumed this pool's release (its
+    /// caller's proof): the shared state is rewritten for the new layout, with the firmware's
+    /// completed count carried over so it stays consistent with the host's submitted count (S
+    /// `M5Pool::rearm`). The caller then rewrites the page-pool row ([`Self::descriptor`]) and
+    /// rebinds the pool at the queue's next kick. Returns the old backing, which the caller
+    /// frees after the client's old view.
+    pub(crate) fn rearm(&mut self, fresh: M5Backing) -> Result<M5Backing> {
+        use super::fw::m5::pool;
+        if fresh.layout.hardware_id != u32::from(self.id) {
+            return Err(EINVAL);
+        }
+        let completed = self.completed_submissions()?;
+        let state = self.state.gpu_va();
+        let bytes = self.control.bytes_mut();
+        pool::encode_state(fresh.layout, self.engine, state, bytes).map_err(|_| EINVAL)?;
+        bytes[pool::COMPLETED..pool::COMPLETED + 8].copy_from_slice(&completed.to_le_bytes());
+        fence(Ordering::SeqCst);
+        let old = M5Backing {
+            backing: core::mem::replace(&mut self.backing, fresh.backing),
+            layout: core::mem::replace(&mut self.layout, fresh.layout),
+        };
+        Ok(old)
+    }
     pub(crate) fn control_va(&self) -> u64 {
         self.control.gpu_va()
+    }
+    /// The release of this pool's registration (its buffer slot) under the free-list
+    /// generation its queue's configuration published.
+    pub(crate) fn release_record(&self, generation: u64) -> super::fw::channels::FreeListRelease {
+        super::fw::channels::FreeListRelease::new(generation, u32::from(self.id))
     }
     /// The page-pool descriptor row the caller installs at [`Self::id`] before publishing any
     /// queue configuration that names this pool.
