@@ -501,8 +501,8 @@ DCP_THUNK_INOUT(dcp_pipe_cfg_414, dcpep_pipe_cfg_414, u64, u64);
 DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
-DCP_THUNK_INOUT(dcp_pipe_set_428, dcpep_pipe_set_428, u32, u32);
 #endif
+DCP_THUNK_INOUT(dcp_set_brightness_correction, iomfbep_set_brightness_correction, u32, u32);
 
 DCP_THUNK_VOID(dcp_first_client_open, dcpep_first_client_open);
 
@@ -3095,29 +3095,49 @@ static bool dcp_gamma_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_
 #endif
 
 #if DCP_FW_H17(DCP_FW_VER)
-/*
- * H17P expects A428 between set_matrix and swap_start, with 0x10000 (1.0 in
- * 16.16 fixed point), the same identity value the D006 reply carries.
- */
-#if DCP_FW_H17(DCP_FW_VER)
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
 {
 	do_swap(dcp, NULL, NULL);
 }
 #endif
 
-static void dcp_post_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
+/* After the colour matrix: the gamma table where there is one, then the swap. */
+static void dcp_matrix_next(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	do_swap(dcp, out, cookie);
-}
-
-static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
-{
-	u32 identity = 0x10000;
-
-	dcp_pipe_set_428(dcp, false, &identity, dcp_post_swap_a428, cookie);
-}
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+	dcp_gamma_then_swap(dcp, NULL, NULL);
+#else
+	do_swap(dcp, NULL, NULL);
 #endif
+}
+
+/*
+ * The colour matrix reply, then the rest of the colour update and the swap.
+ * A refused matrix leaves the previous one in place, so say so.
+ */
+static void dcp_set_matrix_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_set_matrix_resp *resp = out;
+
+	if (!resp || resp->ret)
+		dev_warn_ratelimited(dcp->dev, "colour matrix not applied (%s %u)\n",
+				     resp ? "status" : "no reply",
+				     resp ? resp->ret : 0);
+	/*
+	 * Every known working matrix update follows set_matrix with identity
+	 * brightness correction, 0x10000 (1.0 in 16.16), before the swap.
+	 * H17P requires it, and on 12.3/13.5 a location 9 matrix stays in
+	 * the firmware's cache without it. The reply is not a status.
+	 */
+	if (dcp_methods[iomfbep_set_brightness_correction].tag[0]) {
+		u32 identity = 0x10000;
+
+		dcp_set_brightness_correction(dcp, false, &identity,
+					      dcp_matrix_next, NULL);
+		return;
+	}
+	dcp_matrix_next(dcp, NULL, NULL);
+}
 
 static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 					  void *cookie)
@@ -3648,7 +3668,7 @@ static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_st
 /* After an adaptive sync update: the frame's colour matrix, gamma and swap. */
 static void dcp_matrix_then_swap(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	iomfb_set_matrix(dcp, false, &dcp->desktop->matrix, dcp_gamma_then_swap, NULL);
+	iomfb_set_matrix(dcp, false, &dcp->desktop->matrix, dcp_set_matrix_done, NULL);
 }
 #endif
 
@@ -3728,14 +3748,15 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->surf[l].base.surface_id = 0;
 #endif
 
-		/* Use sRGB colorspace only for internal panels. External
-		 * displays are expected to have EDID and user space can use
-		 * the contained colorimetry information to provide native
-		 * colors.
+		/* Internal panels: tag untagged RGB with the panel's own
+		 * primaries (P3-D65, as its EDID reports), so the firmware
+		 * shows the compositor's values unconverted. External
+		 * displays keep the unspecified tag; user space reads their
+		 * colorimetry from the EDID.
 		 */
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
-			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_UNSPECIFIED)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_P3_D65;
 
 		/*
 		 * On a PQ output the compositor has already encoded RGB
@@ -3744,20 +3765,21 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 */
 		if ((dcp->output_pq || dcp->output_edr) &&
 		    !new_state->fb->format->is_yuv) {
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_BT2020;
-			req->surf[l].base.xfer_func = DCP_XFER_FUNC_HDR;
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BT2020;
+			req->surf[l].base.xfer_func = DCP_XFER_FUNC_PQ;
 		}
 
 #if DCP_FW_H17(DCP_FW_VER)
-		/* H17P external SDR RGB needs an sRGB source tag. Native
-		 * tagging washes out the same pixel values on this profile.
+		/* H17P external SDR RGB needs the unspecified (sRGB) source
+		 * tag. P3-D65 tagging washes out the same pixel values on this
+		 * profile.
 		 * Keep YUV, other source spaces and other profiles unchanged.
 		 */
 		if (dcp->hw.iomfb_method_profile ==
 			    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		    !new_state->fb->format->is_yuv &&
-		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
-			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_P3_D65)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_UNSPECIFIED;
 #endif
 	}
 
@@ -3837,24 +3859,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			.location = 9,
 		};
 
-		if (crtc_state->ctm) {
-			struct drm_color_ctm *ctm = (struct drm_color_ctm *)crtc_state->ctm->data;
-			memcpy(mat.matrix, ctm->matrix, sizeof(mat.matrix));
-		} else {
-			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
-		}
+		dcp_ctm_to_fw(mat.matrix, crtc_state->ctm ?
+			      crtc_state->ctm->data : NULL);
 
-#if DCP_FW_H17(DCP_FW_VER)
-		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
-#elif DCP_FW_DESKTOP_26(DCP_FW_VER)
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
 		dcp->desktop->gamma_pending = dcp_gamma_update(dcp, crtc_state);
 		dcp->desktop->matrix = mat;
 		if (dcp_vrr_update(dcp, crtc_state, dcp_matrix_then_swap))
 			return;
-		iomfb_set_matrix(dcp, false, &mat, dcp_gamma_then_swap, NULL);
-#else
-		iomfb_set_matrix(dcp, false, &mat, do_swap, NULL);
 #endif
+		iomfb_set_matrix(dcp, false, &mat, dcp_set_matrix_done, NULL);
 	} else {
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 		if (dcp_vrr_update(dcp, crtc_state, do_swap))
