@@ -138,6 +138,14 @@ pub(crate) const V25G83: Variant = Variant {
     programs: super::render::RegisterPrograms::V25G83,
 };
 
+/// The M5 firmware (26A428, macOS 27.0). Its submission rules are not established yet: only
+/// the bootstrap graph is built, and the queue fields are the A18 Pro build's until they are.
+pub(crate) const V26A428_M5: Variant = Variant {
+    graph: InitGraph::M5,
+    mmio_pair_registration: false,
+    ..V26A428
+};
+
 const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
