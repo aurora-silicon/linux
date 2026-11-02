@@ -71,6 +71,12 @@ struct ane_fw_platform {
 	 * boot); otherwise the engine is cycled cold and the programs replayed.
 	 */
 	bool sleep_warm;
+	/*
+	 * H16: system sleep cycles the engine cold (no firmware command, cold
+	 * boot and program replay after resume) when sleep_warm is off.
+	 * Without either, H16 refuses system sleep.
+	 */
+	bool sleep_cold;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */

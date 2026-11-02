@@ -64,6 +64,13 @@ const struct ane_fw_platform ane_h16_platform = {
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0) | BIT(11),
+	/*
+	 * System sleep cycles the engine cold and replays every program.
+	 * The warm path stays off: on 25G83 the J616s firmware does not take
+	 * SUSPEND (0x24), bare or after SET_SNE_PMU_BASE2 and
+	 * EXCLAVE_MODE_STOP.
+	 */
+	.sleep_cold = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 };

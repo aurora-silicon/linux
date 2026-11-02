@@ -12,10 +12,11 @@
  * always refused while the firmware is retained: the image would carry a
  * firmware state the restored kernel cannot match. Suspend passes only for a
  * backend that cycles the engine across it: the H17 backend (ane_fw_cold.c)
- * powers it off and, after resume, boots the firmware again from the preload
- * and replays every open program behind its handle. Otherwise, as on H16,
- * suspend is refused up front, before any device suspends. Without retained
- * firmware nothing is refused.
+ * and the H16 backend (ane_h16_backend.c) power it off and, after resume,
+ * boot the firmware again from the preload and replay every open program
+ * behind its handle. A platform without a sleep path refuses suspend up
+ * front, before any device suspends. Without retained firmware nothing is
+ * refused.
  */
 static inline bool ane_fw_sleep_refused_cycle(unsigned long event, bool retained, bool cycles)
 {

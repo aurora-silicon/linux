@@ -132,6 +132,15 @@ ane_fw_channels_host_init(void *ipc, const struct ane_fw_channel *channels)
 #define ANE_FW_CMD_EXCLAVE_MODE_STOP 0x31
 #define ANE_FW_MODE_STOP_SIZE 0x18
 
+/*
+ * SET_SNE_PMU_BASE2, 16 bytes on the control ring at startup, between START
+ * and CONFIG_GET: the u64 base of the ANE's PMGR/PMU aperture (the DT "pmgr"
+ * register range; J700 0x300700000, T6041 0x502280000). The 0x24 handler's
+ * DM-bus endpoint-0 idle query needs it (SPEC-ANE-SLEEP-H17-r2.md).
+ */
+#define ANE_FW_CMD_SET_PMU_BASE 0x29
+#define ANE_FW_PMU_BASE_SIZE 0x10
+
 /* H14 preserves its reserved word; H16 requires bytes 0..3 to be zero. */
 /*
  * Commands that change engine mode or ownership: secure mode 0x27, 0x28 and

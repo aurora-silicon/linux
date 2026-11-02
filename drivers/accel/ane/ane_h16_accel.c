@@ -124,7 +124,8 @@ static int ane_h16_load_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		ret = ane_h16_session_load(a->session, &snapshot,
 					   (const void *const *)aux, aux_size, &program);
 		if (ret == -EBUSY)
-			drm_err(drm, "another program is still loaded; close it first\n");
+			/* The caller's own EBUSY, not a driver error. */
+			drm_dbg(drm, "another program is still loaded; close it first\n");
 		if (!ret)
 			f->program = program;
 	}
