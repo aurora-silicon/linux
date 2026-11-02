@@ -3,10 +3,11 @@
 Cold-acquired H17 firmware backend
 =================================
 
-This experimental backend shares the H16/H17 channel transport, LOAD and
-EXECUTE wire formats and UUID completion helpers. It does not take over a
-running Exclave engine. Production T8140 nodes remain disabled. The separate
-``t8140-j700-ane-test.dtb`` enables only the lead's one-shot test.
+This backend shares the H16/H17 channel transport, LOAD and EXECUTE wire
+formats and UUID completion helpers. It does not take over a running Exclave
+engine. The J700 board DT enables the ANE and its three DARTs; the driver
+starts the engine at boot only after a raw loader hand-off (below) and
+otherwise leaves it alone with one informational line.
 
 The staged observer is installed before platform driver registration. This
 avoids the platform bus's automatic genpd power-on and default DMA attachment
@@ -21,29 +22,53 @@ Loader contract
 The loader must publish ``/chosen/apple,ane-cold-boot`` with the exact string
 ``raw-no-xnu-ane-untouched-v1`` only when the reset path ran no XNU, SPTM,
 ExclaveCore or other ANE owner and left the engine untouched. This is boot
-evidence, not an operator opt-in. Neither the production nor test DTS supplies
-it. A warm handoff, kexec, unknown loader or missing evidence must refuse.
+evidence, not an operator opt-in, and no DTS supplies it. A warm handoff,
+kexec, unknown loader or missing evidence must omit it.
 
-The loader also supplies two ``no-map``, non-reusable reserved-memory nodes,
-referenced by ``memory-region`` and named ``firmware-text`` and
-``firmware-data``. Their sizes are 0xc0000 and 0x2ac000. Physical addresses
-come from that boot's preload records, never from compiled-in lab addresses.
-The DVA pair is 0x10000000000 and 0x100000c0000.
+``t8140.dtsi`` carries two disabled ``/reserved-memory`` placeholders,
+``ane_fw_text: ane-firmware-text@0`` and ``ane_fw_data: ane-firmware-data@0``
+(``compatible = "apple,asc-mem"``, ``reg = <0 0 0 0>``, ``no-map``), which
+the ANE node already references by ``memory-region`` with the names
+``firmware-text`` and ``firmware-data``, as on the T6041. The loader fills
+``reg`` from that boot's ADT ANE ``segment-ranges`` (TEXT 0xc0000 bytes,
+DATA 0x2ac000 bytes, 16 KiB aligned, never compiled-in addresses), renames
+each node to its physical address and sets ``status = "okay"``. Both stay
+``no-map``, never ``reusable``, and outside System RAM. The DVA pair in
+``apple,firmware-iovas`` is 0x10000000000 and 0x100000c0000; a loader that
+rewrites it from the ADT must produce exactly these values.
 
-TEXT must match the measured 26.6.2 H17 SHA-256 pin in the driver. The loader's
-``apple,preload-data-sha256`` is a digest of the full live DATA segment. The
-driver copies both reserved segments into private coherent RAM and preserves
-every iBoot-written DATA byte. The DATA digest establishes preservation of the
-loader's supplied segment; it is not a cross-build immutable-DATA manifest.
-A pinned manifest excluding only the individually documented mutable fields
-remains required before production enablement. No firmware image is shipped.
+TEXT must match the measured 26.6.2 H17 SHA-256 pin in the driver. A loader
+may add ``apple,preload-data-sha256``, the SHA-256 of the full live DATA
+segment it handed off; the driver then checks its private copy against it.
+Without it the driver checks the copy against the live DATA it copied. The
+driver copies both reserved segments into private memory and preserves every
+iBoot-written DATA byte. No firmware image is shipped.
+
+Nothing else comes from the loader: ``reg``, the DAPF ranges, the three DARTs
+(with their ``apple,dma-range``) and the node status are static DT.
+
+Start at boot
+-------------
+
+At module load (or initcall when built in), before the platform driver
+registers, the driver reads the hand-off without touching the engine: the
+marker, ``apple,firmware-preloaded``, both reservations enabled, ``no-map``,
+not reusable and outside System RAM at the exact sizes and DVAs, and TEXT
+against the pin. kexec copies ``/chosen``, marker included, from the running
+DT, so the driver also reads PMGR (safe whatever the power state) and starts
+only if the ANE CPU and sub-block are still off, and never in a kdump kernel.
+With all of it, a work item runs the stages below through
+``program`` once the driver is registered, so ``/dev/accel/accel0`` exists on
+every boot. Without it, the driver logs which part was missing and leaves the
+engine alone; the platform probe refuses quietly with -ENODEV.
 
 Stages and recovery
 -------------------
 
-Use the platform device's root-writable ``firmware_stage`` attribute. Reading
-it reports ``unverified``, ``probe``, ``map``, ``boot``, ``startup``,
-``program`` or ``quarantined``. Write these actions in order::
+The boot work item runs these stages. The platform device's
+``firmware_stage`` attribute reports ``unverified``, ``probe``, ``map``,
+``boot``, ``startup``, ``program`` or ``quarantined``; for diagnosis, with a
+hand-off present, the same actions can be written by root in order::
 
   echo probe > firmware_stage
   echo map > firmware_stage

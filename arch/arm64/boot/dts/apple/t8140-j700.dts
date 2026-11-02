@@ -1950,3 +1950,24 @@
 &dcpext0_dart {
 	apple,dma-range = <0x100 0x0 0x10 0x0>;
 };
+
+/*
+ * The ANE starts at boot only after a raw loader hand-off (the filled
+ * firmware preload reservations and /chosen/apple,ane-cold-boot); with an
+ * older loader its driver leaves the engine alone.
+ */
+&ane {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};

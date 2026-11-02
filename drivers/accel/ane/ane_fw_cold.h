@@ -96,7 +96,52 @@ static inline int ane_fw_heap_tail(const u64 dva[2], const u64 size[2], u64 limi
 	return 0;
 }
 
+/* The exact /chosen/apple,ane-cold-boot value a raw loader boot publishes. */
+#define ANE_FW_COLD_BOOT_EVIDENCE "raw-no-xnu-ane-untouched-v1"
+
+/*
+ * What the loader handed off, as read from the DT and the TEXT segment, and
+ * the live state of the engine. marker is /chosen/apple,ane-cold-boot or
+ * NULL; regions_ok says both preload reservations are enabled, no-map, not
+ * reusable and outside System RAM; text_ok that TEXT matches the driver's
+ * firmware pin; pmgr the PMGR words (the only engine-side state readable
+ * whatever the power state); crash_kernel that this is a kdump kernel.
+ */
+struct ane_fw_handoff {
+	const char *marker;
+	bool preloaded;
+	bool regions_ok;
+	u64 phys[2], size[2], dva[2];
+	bool text_ok;
+	const struct ane_fw_cold_state *pmgr;
+	bool crash_kernel;
+};
+
+/* The loader's part: raw-boot evidence, the filled reservations, the TEXT. */
+static inline bool ane_fw_cold_handoff_loader_ok(const struct ane_fw_handoff *h,
+						 const struct ane_fw_platform *soc)
+{
+	return h->marker && !strcmp(h->marker, ANE_FW_COLD_BOOT_EVIDENCE) &&
+	       h->preloaded && h->regions_ok &&
+	       ane_fw_preload_ranges_valid(soc, h->phys, h->size, h->dva) && h->text_ok;
+}
+
+/*
+ * Start at boot only with the whole hand-off and a cold engine. kexec copies
+ * /chosen, marker included, from the running DT, so the marker alone does
+ * not prove this boot's state: the ANE CPU and sub-block must still read off
+ * in PMGR (a kernel that ran the ANE keeps them on), and a kdump kernel is
+ * always warm. Anything less leaves the engine alone.
+ */
+static inline bool ane_fw_cold_handoff_valid(const struct ane_fw_handoff *h,
+					     const struct ane_fw_platform *soc)
+{
+	return ane_fw_cold_handoff_loader_ok(h, soc) && !h->crash_kernel && h->pmgr &&
+	       ane_fw_cold_pmgr_valid(h->pmgr, true);
+}
+
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc);
+void ane_fw_staged_start(void);
 bool ane_fw_staged_exit(void);
 
 #endif /* __ANE_FW_COLD_H__ */

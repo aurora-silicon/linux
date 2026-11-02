@@ -171,10 +171,13 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	/* No backend has acquired ownership, even if DT omits the marker.
 	 * Check before resources, firmware, power, IOMMU or engine access.
 	 */
-	if (soc->owner == ANE_FW_OWNER_EXCLAVE) {
-		dev_info(dev, "H17 ANE: cold acquisition requires staged preflight; refusing direct probe\n");
-		return -EOPNOTSUPP;
-	}
+	/*
+	 * H17 is started (or left alone) by the staged path before the driver
+	 * registers; the platform probe never acquires it. -ENODEV keeps the
+	 * driver core quiet; the staged path already said why.
+	 */
+	if (soc->owner == ANE_FW_OWNER_EXCLAVE)
+		return -ENODEV;
 	if (of_property_read_bool(np, "apple,exclave-assigned")) {
 		dev_info(dev, "ANE: exclave-assigned device has no Linux ownership provider\n");
 		return -EOPNOTSUPP;

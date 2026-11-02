@@ -8194,7 +8194,6 @@ F:	Documentation/ABI/testing/sysfs-driver-ane-performance
 F:	Documentation/accel/apple-ane-cold.rst
 F:	Documentation/accel/apple-ane.rst
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
-F:	arch/arm64/boot/dts/apple/t8140-j700-ane-test.dts
 F:	drivers/accel/ane/
 F:	include/uapi/drm/ane_accel.h
 F:	tools/accel/ane-bench.py

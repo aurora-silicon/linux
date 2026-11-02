@@ -426,6 +426,29 @@
 			reg = <0 0 0 0>;
 		};
 
+		/*
+		 * The ANE firmware preload. The loader must fill reg from the
+		 * ADT ANE node segment-ranges (TEXT 0xc0000 bytes, DATA 0x2ac000
+		 * bytes), rename each node to its physical address and enable
+		 * it, together with /chosen/apple,ane-cold-boot. Left disabled,
+		 * the ANE driver does not start the engine. Allocating
+		 * replacement memory would lose the personalized preload;
+		 * neither segment may be reclaimed before reboot.
+		 */
+		ane_fw_text: ane-firmware-text@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		ane_fw_data: ane-firmware-data@0 {
+			compatible = "apple,asc-mem";
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
 		/* Only reserved: the GPU node does not reference it */
 		uat_l2_pagetables: uat-l2-pagetables {
 			reg = <0 0 0 0>;
@@ -1809,6 +1832,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
+			/* The firmware DVAs reach 0x100_xxxx_xxxx. */
+			apple,dma-range = <0x0 0x0 0x400 0x0>;
 			status = "disabled";
 		};
 
@@ -1820,6 +1845,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
+			/* The firmware DVAs reach 0x100_xxxx_xxxx. */
+			apple,dma-range = <0x0 0x0 0x400 0x0>;
 			status = "disabled";
 		};
 
@@ -1831,10 +1858,12 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 656 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
+			/* The firmware DVAs reach 0x100_xxxx_xxxx. */
+			apple,dma-range = <0x0 0x0 0x400 0x0>;
 			status = "disabled";
 		};
 
-		/* Cold AP-direct is staged; production nodes remain disabled. */
+		/* Started at boot only after a raw loader hand-off; boards enable it. */
 		ane: ane@400000000 {
 			compatible = "apple,t8140-ane";
 			reg = <0x4 0x0 0x0 0x2000000>,
@@ -1846,6 +1875,8 @@
 				     <AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
 			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
 			power-domains = <&ps_ane_sys>;
+			memory-region = <&ane_fw_text>, <&ane_fw_data>;
+			memory-region-names = "firmware-text", "firmware-data";
 			apple,firmware-preloaded;
 			apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
 			/* Inclusive SID0 identity windows from the ADT. */

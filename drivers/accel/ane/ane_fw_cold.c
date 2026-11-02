@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Shared firmware backend. H17 is the first measured cold power provider. */
 #include <crypto/sha2.h>
+#include <linux/crash_dump.h>
 #include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
@@ -70,6 +71,8 @@ struct ane_fw_backend {
 	u64 next_dva;
 	enum ane_fw_stage stage;
 	bool retained;
+	/* Brings the engine up to the program stage after a loader hand-off. */
+	struct work_struct start;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
 };
@@ -152,7 +155,7 @@ static bool ane_fw_raw_boot(void)
 	const char *evidence;
 
 	return chosen && !of_property_read_string(chosen, "apple,ane-cold-boot", &evidence) &&
-	       !strcmp(evidence, "raw-no-xnu-ane-untouched-v1");
+	       !strcmp(evidence, ANE_FW_COLD_BOOT_EVIDENCE);
 }
 
 /*
@@ -498,8 +501,25 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 	return 0;
 }
 
+/*
+ * The measured 26.6.2 H17 TEXT. A different firmware build is refused before
+ * anything is powered or written.
+ */
+static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE] = {
+	0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
+	0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
+	0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
+	0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
+};
+
+/*
+ * The loader's preload hand-off. apple,preload-data-sha256 is optional: with
+ * it the private DATA copy must match the loader's digest of what it handed
+ * off; without it, the live DATA at copy time (ane_fw_preload()).
+ */
 static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
-				   u64 size[2], u64 dva[2], u8 data_pin[SHA256_DIGEST_SIZE])
+				   u64 size[2], u64 dva[2], u8 data_pin[SHA256_DIGEST_SIZE],
+				   bool *have_data_pin)
 {
 	struct device_node *np = b->pdev->dev.of_node;
 	unsigned int i;
@@ -507,10 +527,10 @@ static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
 
 	if (!of_property_read_bool(np, "apple,firmware-preloaded") ||
 	    of_property_count_u32_elems(np, "memory-region") != 2 ||
-	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2) ||
-	    of_property_read_u8_array(np, "apple,preload-data-sha256", data_pin,
-				      SHA256_DIGEST_SIZE))
+	    of_property_read_u64_array(np, "apple,firmware-iovas", dva, 2))
 		return -ENODATA;
+	*have_data_pin = !of_property_read_u8_array(np, "apple,preload-data-sha256",
+						     data_pin, SHA256_DIGEST_SIZE);
 	/* The same no-map, outside-System-RAM rule as the H16 preload. */
 	for (i = 0; i < 2; i++) {
 		const char *name;
@@ -529,19 +549,14 @@ static int ane_fw_preload_metadata(struct ane_fw_backend *b, u64 physical[2],
 
 static int ane_fw_preload(struct ane_fw_backend *b)
 {
-	static const u8 text_pin[SHA256_DIGEST_SIZE] = {
-		0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
-		0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
-		0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
-		0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
-	};
 	u64 physical[2], size[2], dva[2], tail, tail_size;
 	struct ane_fw_surface snapshots[2], heap_tail;
 	u8 digest[SHA256_DIGEST_SIZE], data_pin[SHA256_DIGEST_SIZE];
+	bool have_data_pin;
 	unsigned int i;
 	int ret;
 
-	ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin);
+	ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin, &have_data_pin);
 	if (ret)
 		return ret;
 	for (i = 0; i < 2; i++) {
@@ -550,6 +565,9 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 
 		if (!source)
 			return -ENOMEM;
+		/* Without a loader digest, the copy must match the live DATA. */
+		if (i && !have_data_pin)
+			sha256(source, size[i], data_pin);
 		ret = ane_fw_alloc_at(b, dva[i], size[i],
 				      IOMMU_READ | (i ? IOMMU_WRITE : 0), &snapshots[i]);
 		if (!ret)
@@ -560,7 +578,7 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		sha256_init(&hash);
 		sha256_update(&hash, snapshots[i].cpu, size[i]);
 		sha256_final(&hash, digest);
-		if (memcmp(digest, i ? data_pin : text_pin, sizeof(digest)))
+		if (memcmp(digest, i ? data_pin : ane_fw_text_pin, sizeof(digest)))
 			return -EKEYREJECTED;
 	}
 	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
@@ -898,15 +916,16 @@ static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t c
 	if (next == ANE_STAGE_MAPPED) {
 		u64 physical[2], size[2], dva[2];
 		u8 data_pin[SHA256_DIGEST_SIZE];
+		bool have_data_pin;
 
 		ane_fw_snapshot_pmgr(b);
 		if (!ane_fw_cold_pmgr_valid(&b->cold, ane_fw_raw_boot())) {
 			dev_info(dev, "H17 ANE: cold acquisition unproven (loader or child power state); refusing\n");
 			return -EPERM;
 		}
-		ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin);
+		ret = ane_fw_preload_metadata(b, physical, size, dva, data_pin, &have_data_pin);
 		if (ret) {
-			dev_info(dev, "H17 ANE: loader preload reservation or digest missing; refusing\n");
+			dev_info(dev, "H17 ANE: loader preload reservation missing; refusing\n");
 			return ret;
 		}
 		ret = ane_fw_retain(b);
@@ -936,6 +955,78 @@ static ssize_t firmware_stage_store(struct device *dev, struct device_attribute 
 	return ret;
 }
 static DEVICE_ATTR_RW(firmware_stage);
+
+/*
+ * Read the loader hand-off without touching the engine: the raw-boot marker,
+ * the preload reservations (disabled placeholders until a loader fills them)
+ * and the TEXT segment against the driver's pin.
+ */
+static bool ane_fw_handoff_present(struct platform_device *pdev,
+				   const struct ane_fw_platform *soc, struct ane_fw_handoff *hp)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
+	struct ane_fw_handoff h = {};
+	u8 digest[SHA256_DIGEST_SIZE];
+	unsigned int i;
+
+	if (chosen)
+		of_property_read_string(chosen, "apple,ane-cold-boot", &h.marker);
+	h.preloaded = of_property_read_bool(np, "apple,firmware-preloaded");
+	h.regions_ok = of_property_count_u32_elems(np, "memory-region") == 2 &&
+		       of_property_count_u64_elems(np, "apple,firmware-iovas") == 2 &&
+		       !of_property_read_u64_array(np, "apple,firmware-iovas", h.dva, 2);
+	for (i = 0; h.regions_ok && i < 2; i++) {
+		const char *name;
+
+		h.regions_ok = !of_property_read_string_index(np, "memory-region-names", i,
+							      &name) &&
+			       !strcmp(name, i ? "firmware-data" : "firmware-text") &&
+			       !ane_fw_preload_range(np, i, &h.phys[i], &h.size[i]);
+	}
+	if (h.regions_ok && ane_fw_preload_ranges_valid(soc, h.phys, h.size, h.dva)) {
+		void *text = memremap(h.phys[0], h.size[0], MEMREMAP_WB);
+
+		if (text) {
+			sha256(text, h.size[0], digest);
+			memunmap(text);
+			h.text_ok = !memcmp(digest, ane_fw_text_pin, sizeof(digest));
+		}
+	}
+	*hp = h;
+	if (ane_fw_cold_handoff_loader_ok(&h, soc))
+		return true;
+	dev_info(&pdev->dev, "H17 ANE: no loader hand-off (%s); leaving the engine alone\n",
+		 !h.marker || strcmp(h.marker, ANE_FW_COLD_BOOT_EVIDENCE) ? "raw-boot marker" :
+		 !h.preloaded || !h.regions_ok ? "preload reservations" :
+		 !h.text_ok ? "firmware TEXT pin" : "preload layout");
+	return false;
+}
+
+/*
+ * Run probe..program once, as the stage file would, so the accel node exists
+ * on every boot with a loader hand-off. A failure stops at that stage; after
+ * acquisition it quarantines, as from the stage file.
+ */
+static void ane_fw_start_work(struct work_struct *work)
+{
+	static const char *const steps[] = { "probe", "map", "boot", "startup", "program" };
+	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, start);
+	unsigned int i, flags;
+	ssize_t ret;
+
+	for (i = 0; i < ARRAY_SIZE(steps); i++) {
+		flags = lock_system_sleep();
+		ret = ane_fw_stage_action(&b->pdev->dev, steps[i], strlen(steps[i]));
+		unlock_system_sleep(flags);
+		if (ret < 0) {
+			dev_err(&b->pdev->dev, "H17 ANE: boot bring-up stopped at %s, error %zd\n",
+				steps[i], ret);
+			return;
+		}
+	}
+	dev_info(&b->pdev->dev, "H17 ANE: up at boot, accel node ready\n");
+}
 
 static void ane_fw_observer_free(struct ane_fw_backend *b)
 {
@@ -973,6 +1064,7 @@ static int ane_fw_window(struct ane_fw_backend *b, unsigned int index, void __io
 int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
 	struct device_node *np = pdev->dev.of_node;
+	struct ane_fw_handoff handoff;
 	struct ane_fw_backend *b;
 	unsigned int i;
 	u32 dart_phandles[ANE_FW_DARTS];
@@ -980,6 +1072,9 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 
 	if (ane_backend || soc->soc != 0x8140)
 		return -EOPNOTSUPP;
+	/* No hand-off (an older loader, a warm boot): leave the engine alone. */
+	if (!ane_fw_handoff_present(pdev, soc, &handoff))
+		return -ENODEV;
 	b = kzalloc_obj(*b);
 	if (!b)
 		return -ENOMEM;
@@ -1053,17 +1148,43 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		ret = ane_fw_window(b, 2, b->gate, np, 2);
 	if (ret)
 		goto fail;
+	/*
+	 * The marker survives a kexec. Read PMGR (safe in any power state) and
+	 * start only if the ANE CPU and sub-block are still off, never in a
+	 * kdump kernel.
+	 */
+	ane_fw_snapshot_pmgr(b);
+	handoff.pmgr = &b->cold;
+	handoff.crash_kernel = is_kdump_kernel();
+	if (!ane_fw_cold_handoff_valid(&handoff, soc)) {
+		dev_info(&pdev->dev, "H17 ANE: engine not cold (%s); leaving it alone\n",
+			 handoff.crash_kernel ? "kdump kernel" : "CPU or sub-block powered");
+		ret = -ENODEV;
+		goto fail;
+	}
 	ane_backend = b;
 	ret = device_create_file(&pdev->dev, &dev_attr_firmware_stage);
 	if (ret) {
 		ane_backend = NULL;
 		goto fail;
 	}
-	dev_info(&pdev->dev, "H17 ANE: read-only staged observer ready; IRQs 655/668 remain masked\n");
+	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
+	INIT_WORK(&b->start, ane_fw_start_work);
 	return 0;
 fail:
 	ane_fw_observer_free(b);
 	return ret;
+}
+
+/*
+ * Start the bring-up once the platform driver is registered: its probe of
+ * this device (refused, but with a genpd attach and detach) has finished by
+ * then and cannot race the power sequence.
+ */
+void ane_fw_staged_start(void)
+{
+	if (ane_backend)
+		schedule_work(&ane_backend->start);
 }
 
 bool ane_fw_staged_exit(void)
@@ -1072,6 +1193,7 @@ bool ane_fw_staged_exit(void)
 
 	if (!b)
 		return false;
+	cancel_work_sync(&b->start);
 	/* A retained backend pins the module. No unload or in-place retry. */
 	if (WARN_ON(b->retained))
 		return true;
