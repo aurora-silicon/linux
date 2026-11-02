@@ -41,6 +41,7 @@ struct ane_transport_test {
 	int refused_error;
 	int alloc_error;
 	int alloc_bad;
+	bool post_next_unnotified;
 };
 
 static void ane_test_access(struct ane_transport_test *f, char kind, const void *p, u64 value)
@@ -115,6 +116,17 @@ static int ane_test_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface
 
 	f->allocs++;
 	f->now += f->alloc_time;
+	if (f->post_next_unnotified) {
+		const struct ane_fw_channel *c = &f->t.channels[ANE_FW_SHAREDMALLOC];
+		u32 next = (f->t.head[ANE_FW_SHAREDMALLOC] + 1) % c->slots;
+		u8 *p = (u8 *)f->ipc.cpu + c->offset + next * ANE_FW_SLOT_SIZE;
+
+		/* Arrives after the batch snapshot, before the first reply. */
+		put_unaligned_le64(0, p);
+		put_unaligned_le64(SZ_16K, p + 8);
+		put_unaligned_le64(0x5678, p + 16);
+		f->post_next_unnotified = false;
+	}
 	if (f->alloc_error)
 		return f->alloc_error;
 	*s = (struct ane_fw_surface) {
@@ -748,13 +760,12 @@ static void ane_transport_shared_notification_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->allocs, 0U);
 	f->irq = bit;
 	f->count = 0;
+	f->post_next_unnotified = true;
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
 	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
 	KUNIT_EXPECT_EQ(test, f->irq, 0U);
 	KUNIT_EXPECT_EQ(test, f->t.shared_ready, 0U);
 	/* A later request cannot borrow the first request's notification. */
-	ane_test_shared_request(f, 0, SZ_16K, 0x5678);
-	f->irq = 0;
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -EAGAIN);
 	KUNIT_EXPECT_EQ(test, f->allocs, 1U);
 	KUNIT_EXPECT_EQ(test, f->t.head[ANE_FW_SHAREDMALLOC], 1U);
