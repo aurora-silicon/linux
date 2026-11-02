@@ -434,6 +434,11 @@ struct cd321x {
 	struct typec_thunderbolt_switch *tbt_switch;
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
+	/* Router that had not bound at probe: look it up when a switch registers */
+	struct fwnode_handle *tbt_fwnode;
+	struct notifier_block tbt_watch;
+	struct work_struct tbt_attach_work;
+	bool tbt_watch_registered;
 	atomic_t link_event;
 	atomic_t ready_event;
 	atomic_t restore_event;
@@ -491,9 +496,12 @@ static inline void tipd_debugfs_exit(void) { }
 #if IS_ENABLED(CONFIG_KUNIT)
 void cd321x_init_work(struct cd321x *cd321x);
 int cd321x_init_mux(struct cd321x *cd321x);
+void cd321x_stop_work(struct cd321x *cd321x);
 bool cd321x_tbt_switch_keep_waiting(struct device *dev);
 struct typec_thunderbolt_switch *
-cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode);
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
+		      bool *late);
+int cd321x_tbt_watch_late(struct cd321x *cd321x, struct fwnode_handle *fwnode);
 int sn201202x_suspend(struct device *dev);
 int sn201202x_resume(struct device *dev);
 #endif
