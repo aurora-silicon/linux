@@ -25,14 +25,13 @@
 //! witnesses prove that the firmware retired the kick, not that every workgroup ran: dispatches
 //! that lost workgroups retired with all of them.
 
-use super::compute::{PoolPhase, GRAPH_SIZE, ITEMS, POINTERS};
+use super::compute::{GRAPH_SIZE, ITEMS, POINTERS};
+use super::pool_state::{PoolPhase, PoolState};
 use crate::g17::{
-    channel::Rings,
     context::{Context, WorkStateLease},
-    freelist::{control_consumed, M5Backing, M5Pool},
+    freelist::{M5Backing, M5Pool},
     fw::{
         self,
-        channels::ControlRecord,
         kick::{KickArgs, KickQos, KickTimestamp},
         m5::{
             compute::{self, Descriptor, DescriptorArgs, Gpu, RegisterArgs, Resources},
@@ -508,63 +507,6 @@ pub(crate) struct ParkedLane {
     parked_at: u64,
 }
 
-/// A lane's pool as the firmware sees it, carried across its bindings: Neo's retained compute
-/// queue phases (`queue::compute::PoolPhase`). Populated: backed, released by nothing in
-/// flight. ReleaseSent: its FreeListRelease is published at that control cursor. Vacant: the
-/// firmware holds no registration; any backing left is the host's to free or replace.
-#[derive(Clone, Copy)]
-pub(crate) struct PoolState {
-    phase: PoolPhase,
-    /// A kick's configuration update registered the pool since its last consumed release;
-    /// until then every kick carries the update.
-    registered: bool,
-    release_sent_ns: Option<u64>,
-}
-
-impl PoolState {
-    const FRESH: Self = Self {
-        phase: PoolPhase::Populated,
-        registered: false,
-        release_sent_ns: None,
-    };
-
-    /// Publishes the release of a registered pool, or marks an unregistered one vacant at once.
-    /// Returns whether a record was published (the caller announces it). EAGAIN: the control
-    /// ring is full.
-    fn release(&mut self, init: &InitData, pool: &M5Pool) -> Result<bool> {
-        if !self.registered {
-            self.phase = PoolPhase::Vacant;
-            return Ok(false);
-        }
-        // Generation 1, as every binding's configuration publishes it.
-        let cursor = Rings::publish_control(
-            init,
-            &ControlRecord::FreeListRelease(pool.release_record(1)),
-        )?;
-        self.phase = PoolPhase::ReleaseSent(cursor);
-        self.release_sent_ns = Some(crate::g17::now_ns());
-        fence(Ordering::SeqCst);
-        Ok(true)
-    }
-    /// Moves a release the firmware consumed (control cursors `consumer`, `producer`) to vacant.
-    fn observe(&mut self, consumer: u32, producer: u32) -> Result {
-        if let PoolPhase::ReleaseSent(cursor) = self.phase {
-            if control_consumed(consumer, producer, cursor)? {
-                self.phase = PoolPhase::Vacant;
-                self.registered = false;
-                self.release_sent_ns = None;
-            }
-        }
-        Ok(())
-    }
-    fn pending(&self) -> bool {
-        matches!(self.phase, PoolPhase::ReleaseSent(_))
-    }
-    fn stalled(&self, now: u64) -> bool {
-        self.pending() && crate::g17::timeout::background_stalled(self.release_sent_ns, now)
-    }
-}
-
 impl ParkedLane {
     pub(crate) fn qid(&self) -> u8 {
         self.lane.qid()
@@ -576,7 +518,7 @@ impl ParkedLane {
     }
     /// Its pool is backed and kept: an adoption needs no fresh backing.
     pub(crate) fn backed(&self) -> bool {
-        self.pool_state.phase == PoolPhase::Populated && !self.pool.vacant()
+        self.pool_state.phase() == PoolPhase::Populated && !self.pool.vacant()
     }
     /// An idle pool the vacate pass may give back (`Registry::vacate_idle_pools`), as for a
     /// retained Neo compute queue (`queue::compute::Queue::vacate_candidate`).
@@ -595,7 +537,8 @@ impl ParkedLane {
         if !self.vacate_candidate() {
             return Err(EBUSY);
         }
-        self.pool_state.release(init, &self.pool)
+        // Generation 1, as every binding's configuration publishes it.
+        self.pool_state.release(init, self.pool.release_record(1))
     }
     /// The backing of a vacant pool no client maps any more, once the firmware consumed its
     /// release; the caller frees it off the device mutex.
@@ -605,7 +548,7 @@ impl ParkedLane {
         producer: u32,
     ) -> Result<Option<M5Backing>> {
         self.pool_state.observe(consumer, producer)?;
-        if self.pool_state.phase != PoolPhase::Vacant || !self.unmapped.done() {
+        if self.pool_state.phase() != PoolPhase::Vacant || !self.unmapped.done() {
             return Ok(None);
         }
         Ok(self.pool.vacate())
@@ -806,7 +749,7 @@ impl Channel {
         }
         // A vacant pool's leftover backing (no registration, no client view) goes: the binding's
         // first command backs the pool for its plan ([`Self::grow`]).
-        if lane.pool_state.phase == PoolPhase::Vacant {
+        if lane.pool_state.phase() == PoolPhase::Vacant {
             drop(lane.pool.vacate());
         }
         let unmapped = Unmapped::new()?;
@@ -1310,7 +1253,7 @@ impl Channel {
     /// Whether a command whose plan needs `blocks` must back the pool first ([`Self::grow`]):
     /// it is smaller, vacant, or being released.
     pub(crate) fn needs_pool(&self, blocks: usize) -> bool {
-        self.pool_state.phase != PoolPhase::Populated || blocks > self.pool.blocks()
+        self.pool_state.phase() != PoolPhase::Populated || blocks > self.pool.blocks()
     }
 
     /// Backs the lane's pool for a command whose plan needs `blocks`, before that command is
@@ -1342,7 +1285,7 @@ impl Channel {
         if !self.needs_pool(blocks) {
             return Ok(None);
         }
-        if self.pool_state.phase == PoolPhase::Populated {
+        if self.pool_state.phase() == PoolPhase::Populated {
             let next = self.lane.kick.timestamp();
             if self.faulted
                 || !self.active.is_empty()
@@ -1354,7 +1297,10 @@ impl Channel {
             {
                 return Err(EAGAIN);
             }
-            if self.pool_state.release(host.init, &self.pool)? {
+            if self
+                .pool_state
+                .release(host.init, self.pool.release_record(1))?
+            {
                 notify()?;
                 return Err(EAGAIN);
             }
@@ -1363,7 +1309,7 @@ impl Channel {
         let consumer = host.init.control_consumer()?.load(Ordering::Relaxed);
         let producer = host.init.control_producer()?.load(Ordering::Relaxed);
         self.pool_state.observe(consumer, producer)?;
-        if self.pool_state.phase != PoolPhase::Vacant {
+        if self.pool_state.phase() != PoolPhase::Vacant {
             return Err(EAGAIN);
         }
         let target = blocks.max(self.gpu.pool_blocks);
@@ -1400,7 +1346,7 @@ impl Channel {
                 None
             }
         };
-        self.pool_state.phase = PoolPhase::Populated;
+        self.pool_state.populate();
         pr_info!(
             "M5 lane {}: pool backed with {} blocks (from {}) for queue {}\n",
             self.qid(),
@@ -1449,7 +1395,7 @@ impl Channel {
         let policy = self.context.policy();
         let cursors = self.cursors()?;
         let first = self.ordinal == 0;
-        let items = if first || !self.pool_state.registered {
+        let items = if first || !self.pool_state.registered() {
             2
         } else {
             1
@@ -1512,7 +1458,7 @@ impl Channel {
             })?;
         // The first kick binds the pool with the context; a later one rebinds a grown pool, the
         // queue's completion value continuing.
-        let update = match (first, self.pool_state.registered) {
+        let update = match (first, self.pool_state.registered()) {
             (true, _) => Some(self.config(false, Some(0))?),
             (false, false) => Some(self.config(false, None)?),
             (false, true) => None,
@@ -1562,7 +1508,7 @@ impl Channel {
         // queue may be running earlier kicks that read the cursors.
         prepared.commit();
         let published = host.port.next_publication();
-        self.pool_state.registered = true;
+        self.pool_state.register();
         if let Some(packet) = &packet {
             packet.mark_published();
         }

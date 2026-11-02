@@ -7,10 +7,8 @@ pub(crate) mod exit;
 pub(crate) mod retirement;
 
 use crate::g17::{
-    channel::Rings,
     context::Context,
     fw::{
-        channels::ControlRecord,
         compute::{OperandState, COMPUTE_DESCRIPTOR_SIZE},
         queue::*,
         variant::PointerLayout,
@@ -543,14 +541,9 @@ impl Backing {
 
 /// Installed graph and its exact logical owner. A released idle graph may change owners only
 /// after a retirement witness. Failed work retains its pointers independently of fence state.
-/// USC pool backing of a retained queue. A release is published only for an idle
-/// queue without an owner; the backing is dropped once the firmware consumed it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PoolPhase {
-    Populated,
-    ReleaseSent(u32),
-    Vacant,
-}
+/// USC pool backing of a retained queue ([`PoolState`]). A release is published only for an
+/// idle queue without an owner; the backing is dropped once the firmware consumed it.
+pub(crate) use super::pool_state::{PoolPhase, PoolState};
 
 /// Builder ownership of one physical release transaction. The preparation
 /// lease pins this registry until abort/commit; owner close may remove lookups.
@@ -565,8 +558,8 @@ pub(crate) struct Queue {
     /// Scheduler/work pages of an exited last owner whose context was dropped;
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
-    pool_phase: PoolPhase,
-    release_sent_ns: Option<u64>,
+    /// Registered from the installation on: an installed queue's every release is published.
+    pool_state: PoolState,
     growing: bool,
     growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
@@ -648,8 +641,7 @@ impl Queue {
         Ok(Self {
             owner: Some(owner),
             retained_owner: None,
-            pool_phase: PoolPhase::Populated,
-            release_sent_ns: None,
+            pool_state: PoolState::FRESH,
             growing: false,
             growth_blocks: 0,
             needs_fresh_backing: false,
@@ -842,11 +834,11 @@ impl Queue {
     /// A release has no completion event: keep observing the control consumer
     /// until its witness lets the idle physical queue be re-armed.
     pub(crate) fn pool_release_pending(&self) -> bool {
-        matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
+        self.pool_state.pending()
     }
 
     pub(crate) fn pool_release_stalled(&self, now: u64) -> bool {
-        self.pool_release_pending() && crate::g17::timeout::background_stalled(self.release_sent_ns, now)
+        self.pool_state.stalled(now)
     }
 
     /// A closed owner can still retain its last commands or their completion
@@ -1420,9 +1412,9 @@ impl Queue {
         if self.growing { return false; }
         self.installed
             // A pool release in flight must be witnessed before any successor.
-            && !matches!(self.pool_phase, PoolPhase::ReleaseSent(_))
+            && !self.pool_state.pending()
             // A recycled killed queue is offered only once its backing is vacant (re-arm path).
-            && (!self.needs_fresh_backing || self.pool_phase == PoolPhase::Vacant)
+            && (!self.needs_fresh_backing || self.pool_state.phase() == PoolPhase::Vacant)
             // An issued kill still names this graph even if its commands retire
             // before the acknowledgement. It cannot acquire a successor owner.
             && self.exit.is_none()
@@ -1551,7 +1543,7 @@ impl Queue {
     }
     /// An idle retained queue whose USC backing may be given back.
     pub(crate) fn vacate_candidate(&self) -> bool {
-        self.pool_phase == PoolPhase::Populated && self.pool.populated()
+        self.pool_state.phase() == PoolPhase::Populated && self.pool.populated()
             && (self.reusable() || self.recycled_pending())
             && !self.source_hint.has_readers(&self.source_readers)
     }
@@ -1639,7 +1631,7 @@ impl Queue {
         self.released_at
     }
     pub(crate) fn pool_vacant(&self) -> bool {
-        self.pool_phase == PoolPhase::Vacant
+        self.pool_state.phase() == PoolPhase::Vacant
     }
     /// Publishes the release of this idle queue's free list. The caller holds the
     /// device mutex and rings the control doorbell afterwards.
@@ -1647,13 +1639,8 @@ impl Queue {
         if !self.vacate_candidate() {
             return Err(EBUSY);
         }
-        let record = ControlRecord::FreeListRelease(
-            self.pool.release_record(self.free_list_generation),
-        );
-        let cursor = Rings::publish_control(init, &record)?;
-        self.pool_phase = PoolPhase::ReleaseSent(cursor);
-        self.release_sent_ns = Some(crate::g17::now_ns());
-        fence(Ordering::SeqCst);
+        // A candidate is installed, so its pool is registered and the release is published.
+        self.pool_state.release(init, self.pool.release_record(self.free_list_generation))?;
         Ok(())
     }
     /// Detaches the USC backing once the firmware's control consumer passed the
@@ -1664,11 +1651,7 @@ impl Queue {
         consumer: u32,
         producer: u32,
     ) -> Result<Option<Vacated>> {
-        if self.growing { return Ok(None); }
-        let PoolPhase::ReleaseSent(cursor) = self.pool_phase else {
-            return Ok(None);
-        };
-        if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {
+        if self.growing || !self.pool_state.observe(consumer, producer)? {
             return Ok(None);
         }
         // The retained owner binding's client alias pins the backing: detach it
@@ -1677,7 +1660,6 @@ impl Queue {
         let pages = self.pool.take_pages();
         let descriptors = self.binding.as_mut().and_then(|binding| binding.descriptors.take());
         let ring = self.graph.vacate_ring();
-        self.pool_phase = PoolPhase::Vacant; self.release_sent_ns = None;
         Ok(Some(Vacated {
             _alias: alias,
             _pages: pages,
@@ -1695,13 +1677,14 @@ impl Queue {
         if !self.can_rearm() { return Err(EAGAIN); }
         self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
-        self.pool_phase = PoolPhase::Populated;
-        self.release_sent_ns = None;
+        // Only an installed queue re-arms (`reusable`, `recycled_pending`): registered again.
+        self.pool_state.populate();
+        self.pool_state.register();
         self.needs_fresh_backing = false;
         Ok((self.pool.id(), self.pool.page_list_va()?))
     }
     pub(crate) fn pool_fits(&self, required: usize) -> bool {
-        !self.growing && self.pool_phase == PoolPhase::Populated && self.pool.fits(required)
+        !self.growing && self.pool_state.phase() == PoolPhase::Populated && self.pool.fits(required)
     }
 
     /// Only a capacity increase waits for this queue's previously published work.
@@ -1711,26 +1694,23 @@ impl Queue {
         if self.quarantined || self.released || self.exit.is_some()
             || self.active.len != 0 || self.replays.len != 0 || self.previous.is_some()
             || (self.installed && !self.retirement_ready)
-            || self.pool_phase != PoolPhase::Populated { return Err(EAGAIN); }
-        if self.installed {
-            let record = ControlRecord::FreeListRelease(self.pool.release_record(self.free_list_generation));
-            let cursor = Rings::publish_control(init, &record)?;
-            self.pool_phase = PoolPhase::ReleaseSent(cursor);
-        self.release_sent_ns = Some(crate::g17::now_ns());
-        } else { self.pool_phase = PoolPhase::Vacant; self.release_sent_ns = None; }
+            || self.pool_state.phase() != PoolPhase::Populated { return Err(EAGAIN); }
+        // Registered exactly when installed: an installed queue publishes its release, another
+        // goes vacant at once.
+        let published = self.pool_state.release(init, self.pool.release_record(self.free_list_generation))?;
         self.growing = true;
         self.growth_blocks = blocks;
-        Ok(self.installed)
+        Ok(published)
     }
 
     pub(crate) fn finish_growth(&mut self, init: &crate::g17::initdata::InitData,
         pages: &mut Option<crate::g17::freelist::Pages>,
         alias: &mut Option<mmu::KernelMapping>, blocks: usize) -> Result<Vacated> {
         if !self.growing || blocks < self.growth_blocks { return Err(EAGAIN); }
-        if let PoolPhase::ReleaseSent(cursor) = self.pool_phase {
+        if self.pool_state.pending() {
             let consumer = init.control_consumer()?.load(Ordering::Acquire);
             let producer = init.control_producer()?.load(Ordering::Acquire);
-            if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {
+            if !self.pool_state.release_consumed(consumer, producer)? {
                 return Err(EAGAIN);
             }
         }
@@ -1742,22 +1722,21 @@ impl Queue {
         init.initialize_compute_pool_blocks(self.pool.id(), fresh.page_list_va(), blocks)?;
         self.pool.replace_pages(pages)?;
         let old_alias = core::mem::replace(&mut binding.pool_alias, alias.take());
-        self.pool_phase = PoolPhase::Populated;
-        self.release_sent_ns = None;
+        self.pool_state.populate();
         self.growing = false;
         self.growth_blocks = 0;
         Ok(Vacated { _alias: old_alias, _pages: pages.take(), _descriptors: None, _ring: None })
     }
 
     pub(crate) fn growth_token(&self) -> Option<Growth> {
-        self.growing.then_some(Growth { qid: self.qid(), phase: self.pool_phase })
+        self.growing.then_some(Growth { qid: self.qid(), phase: self.pool_state.phase() })
     }
 
     /// Transfer an abandoned builder's release back to the event worker. Do not
     /// revoke the published release or free backing here: vacancy still requires
     /// its exact control-consumer witness. A different transaction is untouched.
     pub(crate) fn abort_growth(&mut self, token: Growth) -> Result<Option<bool>> {
-        if !self.growing || self.qid() != token.qid || self.pool_phase != token.phase {
+        if !self.growing || self.qid() != token.qid || self.pool_state.phase() != token.phase {
             return Ok(None);
         }
         self.growing = false;
@@ -2293,6 +2272,7 @@ impl Queue {
             )?;
             self.outer_started |= ring;
             self.installed = true;
+            self.pool_state.register();
             self.published_config = Some(identity);
             if send_config {
                 self.config_cache = Some((config, epoch));
@@ -2455,7 +2435,7 @@ impl Queue {
         write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} awaiting_witness={} previous={} exit={} growing={} pool={:?} active={} total={} ",
                self.qid(), u8::from(self.owner.is_some()), u8::from(self.released), u8::from(self.reusable()),
                u8::from(self.quarantined), u8::from(self.awaiting_witness), u8::from(self.previous.is_some()),
-               u8::from(self.exit.is_some()), u8::from(self.growing), self.pool_phase, self.active.len, IN_FLIGHT)?;
+               u8::from(self.exit.is_some()), u8::from(self.growing), self.pool_state.phase(), self.active.len, IN_FLIGHT)?;
         match self.graph.cursors() {
             Ok(cursors) if cursors.count != 0 => writeln!(f, "items_used={} items_total={}",
                 cursors.producer.wrapping_sub(cursors.consumer) % cursors.count, cursors.count - 1),
@@ -2579,7 +2559,7 @@ impl Queue {
         self.claims == 0 && self.installed && self.owner.is_some() && self.retirement_ready
             && !self.growing && !self.quarantined && !self.awaiting_witness
             && self.exit.is_none() && self.active.len == 0 && self.replays.len == 0
-            && self.previous.is_none() && self.pool_phase == PoolPhase::Populated
+            && self.previous.is_none() && self.pool_state.phase() == PoolPhase::Populated
             && !self.source_hint.has_readers(&self.source_readers)
     }
 
@@ -2592,7 +2572,7 @@ impl Queue {
 
 impl Queue {
     pub(crate) fn can_rearm(&self) -> bool {
-        self.pool_phase == PoolPhase::Vacant && (self.reusable() || self.recycled_pending())
+        self.pool_state.phase() == PoolPhase::Vacant && (self.reusable() || self.recycled_pending())
             && !self.source_hint.has_readers(&self.source_readers)
     }
 }
@@ -2610,7 +2590,7 @@ impl Queue {
             || self.growing || self.quarantined || self.awaiting_witness
             || self.exit.is_some() || self.active.len != 0 || self.replays.len != 0
             || self.retire_pending || self.failure_status_pending
-            || self.pool_phase != PoolPhase::Populated
+            || self.pool_state.phase() != PoolPhase::Populated
             || self.previous.as_ref().is_some_and(|previous| previous.publication.is_some())
         {
             return Ok((false, None));

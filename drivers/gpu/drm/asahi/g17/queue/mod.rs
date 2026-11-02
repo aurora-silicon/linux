@@ -6,6 +6,7 @@
 pub(crate) mod compute;
 pub(crate) mod m5;
 pub(crate) mod m5_render;
+pub(crate) mod pool_state;
 pub(crate) mod render;
 
 use super::{
