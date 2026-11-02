@@ -15,6 +15,7 @@
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/bitfield.h>
+#include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/limits.h>
@@ -54,14 +55,18 @@
 /* SARTv3 registers */
 #define APPLE_SART3_CONFIG(idx) (0x00 + 4 * (idx))
 
-#define APPLE_SART3_PADDR(idx)	(0x40 + 4 * (idx))
+#define APPLE_SART3_PADDR	0x40
 #define APPLE_SART3_PADDR_SHIFT 12
 
-#define APPLE_SART3_SIZE(idx)  (0x80 + 4 * (idx))
+#define APPLE_SART3_SIZE       0x80
 #define APPLE_SART3_SIZE_SHIFT 12
 #define APPLE_SART3_SIZE_MAX   GENMASK(29, 0)
 
 #define APPLE_SART3_FLAGS_ALLOW 0xff
+
+/* SARTv4 (M5): SARTv3's entries, with the address and size arrays moved up */
+#define APPLE_SART4_PADDR 0x60
+#define APPLE_SART4_SIZE  0xc0
 
 struct apple_sart_ops {
 	void (*get_entry)(struct apple_sart *sart, int index, u8 *flags,
@@ -70,6 +75,9 @@ struct apple_sart_ops {
 			  phys_addr_t paddr_shifted, size_t size_shifted);
 	/* This is probably a bitfield but the exact meaning of each bit is unknown. */
 	unsigned int flags_allow;
+	/* SARTv3/v4: where the address and size arrays start */
+	unsigned int paddr_reg;
+	unsigned int size_reg;
 	unsigned int size_shift;
 	unsigned int paddr_shift;
 	size_t size_max;
@@ -179,8 +187,8 @@ static struct apple_sart_ops sart_ops_v2 = {
 static void sart3_get_entry(struct apple_sart *sart, int index, u8 *flags,
 			    phys_addr_t *paddr, size_t *size)
 {
-	phys_addr_t paddr_ = readl(sart->regs + APPLE_SART3_PADDR(index));
-	size_t size_ = readl(sart->regs + APPLE_SART3_SIZE(index));
+	phys_addr_t paddr_ = readl(sart->regs + sart->ops->paddr_reg + 4 * index);
+	size_t size_ = readl(sart->regs + sart->ops->size_reg + 4 * index);
 
 	*flags = readl(sart->regs + APPLE_SART3_CONFIG(index));
 	*size = size_ << APPLE_SART3_SIZE_SHIFT;
@@ -190,8 +198,8 @@ static void sart3_get_entry(struct apple_sart *sart, int index, u8 *flags,
 static void sart3_set_entry(struct apple_sart *sart, int index, u8 flags,
 			    phys_addr_t paddr_shifted, size_t size_shifted)
 {
-	writel(paddr_shifted, sart->regs + APPLE_SART3_PADDR(index));
-	writel(size_shifted, sart->regs + APPLE_SART3_SIZE(index));
+	writel(paddr_shifted, sart->regs + sart->ops->paddr_reg + 4 * index);
+	writel(size_shifted, sart->regs + sart->ops->size_reg + 4 * index);
 	writel(flags, sart->regs + APPLE_SART3_CONFIG(index));
 }
 
@@ -199,6 +207,19 @@ static struct apple_sart_ops sart_ops_v3 = {
 	.get_entry = sart3_get_entry,
 	.set_entry = sart3_set_entry,
 	.flags_allow = APPLE_SART3_FLAGS_ALLOW,
+	.paddr_reg = APPLE_SART3_PADDR,
+	.size_reg = APPLE_SART3_SIZE,
+	.size_shift = APPLE_SART3_SIZE_SHIFT,
+	.paddr_shift = APPLE_SART3_PADDR_SHIFT,
+	.size_max = APPLE_SART3_SIZE_MAX,
+};
+
+static struct apple_sart_ops sart_ops_v4 = {
+	.get_entry = sart3_get_entry,
+	.set_entry = sart3_set_entry,
+	.flags_allow = APPLE_SART3_FLAGS_ALLOW,
+	.paddr_reg = APPLE_SART4_PADDR,
+	.size_reg = APPLE_SART4_SIZE,
 	.size_shift = APPLE_SART3_SIZE_SHIFT,
 	.paddr_shift = APPLE_SART3_PADDR_SHIFT,
 	.size_max = APPLE_SART3_SIZE_MAX,
@@ -236,6 +257,7 @@ static int apple_sart_probe(struct platform_device *pdev)
 			i, flags, &paddr, size);
 		set_bit(i, &sart->protected_entries);
 	}
+	dev_dbg(dev, "%lu bootloader entries protected\n", hweight_long(sart->protected_entries));
 
 	platform_set_drvdata(pdev, sart);
 	return 0;
@@ -409,6 +431,10 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_sart_of_match[] = {
+	{
+		.compatible = "apple,t6050-sart",
+		.data = &sart_ops_v4,
+	},
 	{
 		.compatible = "apple,t6000-sart",
 		.data = &sart_ops_v3,
