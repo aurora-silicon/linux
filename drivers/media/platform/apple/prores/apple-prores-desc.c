@@ -205,9 +205,9 @@ EXPORT_SYMBOL_IF_KUNIT(apr_dc_scale_reg);
 #define D_FH_ALPHA		0x08c
 #define D_FH_FLAGS		0x08f
 #define D_FH_BYTES		0x94
-/* Coded window and rate control */
-#define D_MB_W			0x110
-#define D_MB_H			0x112
+/* Rate control: coefficient budgets in bytes per macroblock, Q3 */
+#define D_RC_TARGET		0x110
+#define D_RC_MAX		0x112
 #define D_RC_THRESHOLDS		0x114	/* six 7-bit macroblock class thresholds */
 #define D_RC_ALPHA		0x11c
 #define D_RC_ALPHA0		0x11d
@@ -218,11 +218,29 @@ EXPORT_SYMBOL_IF_KUNIT(apr_dc_scale_reg);
 
 /* Slices of eight macroblocks: log2 width 3 in the high nibble. */
 #define APR_SLICE_LOG2		3
-#define APR_QUANT_INDEX		2
 
 /*
- * Rate-control settings the engine is known to work with (m1n1). Their
- * per-profile tuning is not known yet.
+ * Per-profile policy, as macOS uses it: the size multiplier relative to
+ * 422 HQ (a fraction), and the starting quantiser. The engine refines the
+ * slice quantisers around the starting one to meet the byte budget.
+ */
+static const struct {
+	u8 num, den;
+	u8 quant_index;
+} apr_profile_policy[APR_PROFILES] = {
+	[APR_PROFILE_PROXY] = { 13, 63, 8 },
+	[APR_PROFILE_LT] = { 13, 28, 3 },
+	[APR_PROFILE_STANDARD] = { 2, 3, 2 },
+	[APR_PROFILE_HQ] = { 1, 1, 1 },
+	[APR_PROFILE_4444] = { 3, 2, 1 },
+	[APR_PROFILE_4444_XQ] = { 9, 4, 1 },
+};
+
+/*
+ * Fixed rate-control settings: macroblock class thresholds (with quantiser
+ * refinement off in bit 63), the alpha, alpha0 and gamma0 weights, four
+ * betas and sixteen correlation/quantiser thresholds. They do not depend on
+ * profile, size or input format.
  */
 #define APR_RC_THRESHOLDS	0x8000402015100c0cULL
 #define APR_RC_ALPHA		0x80
@@ -230,6 +248,70 @@ EXPORT_SYMBOL_IF_KUNIT(apr_dc_scale_reg);
 #define APR_RC_GAMMA0		0x2c
 static const u32 apr_rc_beta[4] = { 0x880080, 0x4e00c5, 0x9000d0, 0x200122 };
 #define APR_RC_QUANT		0x400200
+
+/*
+ * 422 HQ frame size for a picture of @pixels luma samples: fixed steps up
+ * to 2.36 Mpixel, then half a byte per pixel. Other profiles scale it.
+ */
+static u64 apr_hq_budget(u64 pixels)
+{
+	static const struct { u32 pixels, bytes; } steps[] = {
+		{ 349920, 294912 }, { 414720, 344064 }, { 691200, 442368 },
+		{ 921600, 516096 }, { 1555200, 884736 }, { 2073600, 1032192 },
+		{ 2359297, 1179648 },
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(steps); i++)
+		if (pixels <= steps[i].pixels)
+			return steps[i].bytes;
+	return pixels / 2;
+}
+
+/* Round n / 8 to a single-precision float, then down to an integer. */
+static u64 apr_eighths_f32_floor(u64 n)
+{
+	int shift;
+	u64 unit, q, r;
+
+	if (!n)
+		return 0;
+	/* 24 significant bits: the float's unit, in eighths, is 2^(fls - 24). */
+	shift = fls64(n) - 24;
+	if (shift <= 0)
+		return n / 8;
+	unit = 1ULL << shift;
+	q = n >> shift;
+	r = n & (unit - 1);
+	if (r > unit / 2 || (r == unit / 2 && (q & 1)))
+		q++;
+	return (q << shift) / 8;
+}
+
+/*
+ * Target and maximum frame sizes in bytes for a profile: the HQ budget
+ * scaled by the profile, in whole 4 KiB units, eight ninths of that as the
+ * target and nine eighths of the target as the maximum.
+ */
+void apr_frame_budget(enum apr_profile profile, u32 width, u32 height,
+		      u32 *target, u32 *max)
+{
+	u64 m = apr_hq_budget((u64)width * height) * apr_profile_policy[profile].num /
+		apr_profile_policy[profile].den;
+
+	m = round_down(max_t(u64, m, SZ_4K), SZ_4K);
+	*target = 8 * m / 9;
+	*max = apr_eighths_f32_floor(9ULL * *target);
+}
+EXPORT_SYMBOL_IF_KUNIT(apr_frame_budget);
+
+/* A frame budget as Q3 bytes per macroblock, after header and slice-table bytes. */
+static u16 apr_mb_budget(u32 bytes, u32 slices, u32 mbs)
+{
+	u32 overhead = 164 + 8 * slices;
+	u32 left = bytes > overhead ? bytes - overhead : 1;
+
+	return min(16383U, 8 * (left / mbs));
+}
 
 /* Slices per picture: full slices per row, then the remainder in powers of two. */
 u32 apr_slice_count(u32 width, u32 height, u32 log2_slice)
@@ -245,7 +327,7 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 	bool is444 = apr_input_is_444(f->input);
 	bool deep = f->input == APR_INPUT_422_16 || f->input == APR_INPUT_444_16;
 	enum apr_qtable table = apr_profile_qtable(f->profile);
-	u32 min_luma, min_chroma, cmd, slices;
+	u32 min_luma, min_chroma, cmd, slices, mbs, target, max;
 	unsigned int i;
 
 	if (f->profile >= APR_PROFILES || is444 != apr_profile_is_444(f->profile))
@@ -264,6 +346,8 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 	slices = apr_slice_count(f->width, f->height, APR_SLICE_LOG2);
 	if (slices > U16_MAX)
 		return -EINVAL;
+	mbs = DIV_ROUND_UP(f->width, 16) * DIV_ROUND_UP(f->height, 16);
+	apr_frame_budget(f->profile, f->width, f->height, &target, &max);
 
 	memset(desc, 0, APR_DESC_BYTES);
 
@@ -288,7 +372,7 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 
 	put_unaligned_be16(slices, desc + D_SLICES);
 	desc[D_SLICE_LOG2] = APR_SLICE_LOG2 << 4;
-	desc[D_QUANT_INDEX] = APR_QUANT_INDEX;
+	desc[D_QUANT_INDEX] = apr_profile_policy[f->profile].quant_index;
 
 	put_unaligned_be16(D_FH_BYTES, desc + D_FH_SIZE);
 	desc[D_FH_VERSION] = is444 ? 1 : 0;
@@ -304,8 +388,8 @@ int apr_build_desc(const struct apr_frame *f, u8 *desc)
 	/* Both quantisation matrices are carried in the frame header. */
 	desc[D_FH_FLAGS] = 0x03;
 
-	put_unaligned_le16(DIV_ROUND_UP(f->width, 16), desc + D_MB_W);
-	put_unaligned_le16(DIV_ROUND_UP(f->height, 16), desc + D_MB_H);
+	put_unaligned_le16(apr_mb_budget(target, slices, mbs), desc + D_RC_TARGET);
+	put_unaligned_le16(apr_mb_budget(max, slices, mbs), desc + D_RC_MAX);
 	put_unaligned_le64(APR_RC_THRESHOLDS, desc + D_RC_THRESHOLDS);
 	desc[D_RC_ALPHA] = APR_RC_ALPHA;
 	desc[D_RC_ALPHA0] = APR_RC_ALPHA0;

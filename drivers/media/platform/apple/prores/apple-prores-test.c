@@ -119,8 +119,10 @@ static void apr_test_desc_422(struct kunit *test)
 	/* 20 macroblocks per row: two 8-wide slices and one 4-wide. */
 	KUNIT_EXPECT_EQ(test, get_unaligned_be16(d + 0x78), 45);
 	KUNIT_EXPECT_EQ(test, d[0x7a], 0x30);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x110), 20);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x112), 15);
+	KUNIT_EXPECT_EQ(test, d[0x7b], 2);	/* 422 starting quantiser */
+	/* 320x240 422: 174762 and 196607 bytes over 300 macroblocks. */
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x110), 4640);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x112), 5224);
 	KUNIT_EXPECT_EQ(test, d[0x90], 0);	/* matrices live in the engine */
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x170), 0x23);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x174), 0);
@@ -168,6 +170,53 @@ static void apr_test_desc_rejects(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_build_desc(&f, d), -EINVAL);
 }
 
+static void apr_test_budgets(struct kunit *test)
+{
+	/* Target, maximum and the Q3 per-macroblock words for 1080p and 2160p. */
+	static const struct {
+		enum apr_profile profile;
+		u32 w, h, target, max;
+		u16 q_target, q_max;
+	} cases[] = {
+		{ APR_PROFILE_PROXY, 1920, 1080, 189326, 212991, 176, 200 },
+		{ APR_PROFILE_LT, 1920, 1080, 425984, 479232, 408, 456 },
+		{ APR_PROFILE_STANDARD, 1920, 1080, 611669, 688127, 584, 664 },
+		{ APR_PROFILE_HQ, 1920, 1080, 917504, 1032192, 888, 1000 },
+		{ APR_PROFILE_4444, 1920, 1080, 1376256, 1548288, 1336, 1504 },
+		{ APR_PROFILE_4444_XQ, 1920, 1080, 2064384, 2322432, 2008, 2264 },
+		{ APR_PROFILE_PROXY, 3840, 2160, 757304, 851967, 176, 200 },
+		{ APR_PROFILE_LT, 3840, 2160, 1711217, 1925119, 408, 464 },
+		{ APR_PROFILE_STANDARD, 3840, 2160, 2457600, 2764800, 592, 672 },
+		{ APR_PROFILE_HQ, 3840, 2160, 3684579, 4145151, 896, 1008 },
+		{ APR_PROFILE_4444, 3840, 2160, 5526869, 6217727, 1352, 1520 },
+		{ APR_PROFILE_4444_XQ, 3840, 2160, 8293944, 9330687, 2032, 2288 },
+	};
+	u8 *d = kunit_kzalloc(test, APR_DESC_BYTES, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, d);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct apr_frame f = apr_test_frame();
+		bool is444 = apr_profile_is_444(cases[i].profile);
+		u32 target, max;
+
+		apr_frame_budget(cases[i].profile, cases[i].w, cases[i].h, &target, &max);
+		KUNIT_EXPECT_EQ_MSG(test, target, cases[i].target, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, max, cases[i].max, "case %u", i);
+		f.profile = cases[i].profile;
+		f.input = is444 ? APR_INPUT_444_8 : APR_INPUT_422_8;
+		f.width = cases[i].w;
+		f.height = cases[i].h;
+		f.luma_stride = cases[i].w;
+		f.chroma_stride = cases[i].w * (is444 ? 2 : 1);
+		KUNIT_ASSERT_EQ(test, apr_build_desc(&f, d), 0);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le16(d + 0x110), cases[i].q_target,
+				    "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le16(d + 0x112), cases[i].q_max,
+				    "case %u", i);
+	}
+}
+
 static void apr_test_slices(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test, apr_slice_count(320, 240, 3), 45);
@@ -202,6 +251,7 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_desc_422),
 	KUNIT_CASE(apr_test_desc_444),
 	KUNIT_CASE(apr_test_desc_rejects),
+	KUNIT_CASE(apr_test_budgets),
 	KUNIT_CASE(apr_test_slices),
 	KUNIT_CASE(apr_test_output),
 	{}
