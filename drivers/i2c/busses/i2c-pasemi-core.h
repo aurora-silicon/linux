@@ -11,6 +11,8 @@
 
 #define PASEMI_HW_REV_PCI -1
 
+struct reset_control;
+
 struct pasemi_smbus {
 	struct device		*dev;
 	struct i2c_adapter	 adapter;
@@ -19,6 +21,8 @@ struct pasemi_smbus {
 	int			 hw_rev;
 	int			 use_irq;
 	struct completion	 irq_completion;
+	/* Resets a controller stuck in a transaction (optional) */
+	struct reset_control	*reset;
 };
 
 int pasemi_i2c_common_probe(struct pasemi_smbus *smbus);

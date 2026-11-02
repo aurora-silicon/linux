@@ -13,6 +13,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/reset.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
@@ -88,16 +89,44 @@ static void pasemi_reset(struct pasemi_smbus *smbus)
 	reinit_completion(&smbus->irq_completion);
 }
 
+static int pasemi_smb_wait_idle(struct pasemi_smbus *smbus, unsigned int *status)
+{
+	return readx_poll_timeout(ioread32, smbus->ioaddr + REG_SMSTA,
+				  *status, !(*status & (SMSTA_XIP | SMSTA_JAM)),
+				  USEC_PER_MSEC,
+				  USEC_PER_MSEC * PASEMI_TRANSFER_TIMEOUT_MS);
+}
+
+/*
+ * A controller can stay in a transaction that no CTL reset ends, for example
+ * after a system sleep. Only resetting the controller gets it out of there;
+ * its CTL is then back at the reset value and is written again.
+ */
+static bool pasemi_smb_recover(struct pasemi_smbus *smbus, unsigned int status)
+{
+	if (!smbus->reset)
+		return false;
+
+	dev_warn(smbus->dev, "Bus is stuck (status 0x%08x xfstatus 0x%08x), resetting the controller\n",
+		 status, reg_read(smbus, REG_XFSTA));
+	if (reset_control_reset(smbus->reset))
+		return false;
+
+	reg_write(smbus, REG_IMASK, 0);
+	pasemi_reset(smbus);
+	return true;
+}
+
 static int pasemi_smb_clear(struct pasemi_smbus *smbus)
 {
 	unsigned int status;
 	int ret;
 
 	/* First wait for the bus to go idle */
-	ret = readx_poll_timeout(ioread32, smbus->ioaddr + REG_SMSTA,
-				 status, !(status & (SMSTA_XIP | SMSTA_JAM)),
-				 USEC_PER_MSEC,
-				 USEC_PER_MSEC * PASEMI_TRANSFER_TIMEOUT_MS);
+	ret = pasemi_smb_wait_idle(smbus, &status);
+
+	if (ret < 0 && pasemi_smb_recover(smbus, status))
+		ret = pasemi_smb_wait_idle(smbus, &status);
 
 	if (ret < 0) {
 		dev_err(smbus->dev, "Bus is still stuck (status 0x%08x xfstatus 0x%08x)\n",
@@ -250,6 +279,19 @@ static int pasemi_i2c_xfer(struct i2c_adapter *adapter,
 
 	for (i = 0; i < num && !ret; i++)
 		ret = pasemi_i2c_xfer_msg(adapter, &msgs[i], (i == (num - 1)));
+
+	/*
+	 * A timed-out transfer can leave the controller in it. Reset it and let
+	 * the core retry; the retry sends the whole transfer again, including
+	 * what may already have reached the device. SMBus transfers have no
+	 * retry and recover at the start of their next transfer.
+	 */
+	if (ret == -ETIME) {
+		unsigned int status = reg_read(smbus, REG_SMSTA);
+
+		if (status & SMSTA_XIP && pasemi_smb_recover(smbus, status))
+			return -EAGAIN;
+	}
 
 	return ret ? ret : num;
 }
