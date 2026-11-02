@@ -499,6 +499,8 @@ enum vcpu_sysreg {
 	TFSRE0_EL1,	/* Tag Fault Status Register (EL0) */
 
 	POR_EL0,	/* Permission Overlay Register 0 (EL0) */
+	APPLE_ASPSR_EL1, /* Apple saved x86 parity/adjust flags (APFLG) */
+	APPLE_ASPSR_EL2, /* The same flags as of the guest's last exit */
 
 	/* FP/SIMD/SVE */
 	SVCR,
