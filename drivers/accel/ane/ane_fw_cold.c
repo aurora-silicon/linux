@@ -248,6 +248,7 @@ static int ane_fw_scratch_wait(struct ane_fw_backend *b, unsigned int cell, u32 
  */
 #define ANE_FW_CMD_SUSPEND 0x24
 #define ANE_FW_WARM_BOOT 1
+#define ANE_FW_SUSPEND_REPORT_MAX 0x100
 
 static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
 			  void *command, size_t size, u64 deadline);
@@ -257,6 +258,7 @@ static u64 ane_fw_load64(void *ctx, const void *p);
 static void ane_fw_sleep_trace(struct ane_fw_backend *b, const char *when, u8 *slot)
 {
 	void __iomem *scratch = b->engine + b->soc->scratch;
+	u8 *t2h, *shm;
 
 	dev_info(&b->pdev->dev,
 		 "H17 ANE: %s: scratch %#x %#x %#x %#x %#x %#x %#x %#x wrapper %#x\n", when,
@@ -268,6 +270,72 @@ static void ane_fw_sleep_trace(struct ane_fw_backend *b, const char *when, u8 *s
 		dev_info(&b->pdev->dev, "H17 ANE: %s: IO slot %#llx %#llx %#llx, IO head %u\n",
 			 when, ane_fw_load64(b, slot), ane_fw_load64(b, slot + 8),
 			 ane_fw_load64(b, slot + 16), b->transport.head[ANE_FW_IO]);
+	t2h = ane_fw_transport_slot(&b->transport, ANE_FW_IO_T2H);
+	shm = ane_fw_transport_slot(&b->transport, ANE_FW_SHAREDMALLOC);
+	dev_info(&b->pdev->dev,
+		 "H17 ANE: %s: T2H head %u %#llx %#llx %#llx, SHAREDMALLOC head %u %#llx %#llx %#llx, irq %#x\n",
+		 when, b->transport.head[ANE_FW_IO_T2H], ane_fw_load64(b, t2h),
+		 ane_fw_load64(b, t2h + 8), ane_fw_load64(b, t2h + 16),
+		 b->transport.head[ANE_FW_SHAREDMALLOC], ane_fw_load64(b, shm),
+		 ane_fw_load64(b, shm + 8), ane_fw_load64(b, shm + 16),
+		 ane_rd32(b, b->engine + b->soc->irq_status));
+}
+
+/*
+ * Wait for the SUSPEND reply. In C2 (boot 0d5a5af9) the firmware took the
+ * command: its log gained a task hand-off record at the SUSPEND time, but the
+ * IO slot never completed. ane_fw_transport_wait() serves SHAREDMALLOC only;
+ * here every T2H report the firmware posts meanwhile is also logged and
+ * acknowledged, the way the session pump does during EXECUTE.
+ */
+static int ane_fw_suspend_wait(struct ane_fw_backend *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	unsigned int reports = 0, shared = 0;
+	u64 start = ktime_get_ns(), now;
+	u32 pending, seen = 0;
+	size_t size;
+	u8 *report;
+	int ret;
+
+	report = kmalloc(ANE_FW_SUSPEND_REPORT_MAX, GFP_KERNEL);
+	if (!report)
+		return -ENOMEM;
+	for (;;) {
+		ret = ane_fw_transport_poll(t, ANE_FW_IO);
+		if (ret != -EAGAIN)
+			break;
+		ret = ane_fw_transport_consume(t, report, ANE_FW_SUSPEND_REPORT_MAX, &size);
+		if (!ret) {
+			reports++;
+			dev_info(&b->pdev->dev, "H17 ANE: report %u during SUSPEND (%zu bytes): %*ph\n",
+				 reports, size, (int)min_t(size_t, size, 64), report);
+			continue;
+		}
+		if (ret != -EAGAIN)
+			break;
+		ret = ane_fw_transport_irq(t, &pending);
+		if (ret)
+			break;
+		seen |= pending;
+		ret = ane_fw_transport_shared(t);
+		if (!ret)
+			shared++;
+		else if (ret != -EAGAIN)
+			break;
+		now = ktime_get_ns();
+		if (now >= t->pending[ANE_FW_IO].deadline_ns) {
+			ret = ane_fw_transport_fail(t, -ETIMEDOUT);
+			break;
+		}
+		t->polls++;
+		t->ops->relax(t->ctx, now - start);
+	}
+	dev_info(&b->pdev->dev,
+		 "H17 ANE: SUSPEND wait %d after %llu us: %u reports, %u allocations, irq seen %#x\n",
+		 ret, div_u64(ktime_get_ns() - start, NSEC_PER_USEC), reports, shared, seen);
+	kfree(report);
+	return ret;
 }
 
 static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
@@ -292,8 +360,13 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	dev_info(&b->pdev->dev, "H17 ANE: SUSPEND %*ph on IO head %u slot %#llx %#llx %#llx\n",
 		 (int)sizeof(command), command, b->transport.head[ANE_FW_IO],
 		 ane_fw_load64(b, slot), ane_fw_load64(b, slot + 8), ane_fw_load64(b, slot + 16));
-	ret = ane_fw_command(b, ANE_FW_IO, command, sizeof(command),
-			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	ret = ane_fw_transport_publish(&b->transport, ANE_FW_IO, command, sizeof(command),
+				       ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (!ret)
+		ret = ane_fw_suspend_wait(b);
+	if (!ret)
+		memcpy(command, b->pool.cpu + b->transport.pending[ANE_FW_IO].dva - b->pool.dva,
+		       sizeof(command));
 	ane_fw_sleep_trace(b, ret ? "SUSPEND failed" : "SUSPEND done", slot);
 	if (ret) {
 		/* What the firmware made of it, if anything. */
