@@ -503,6 +503,17 @@ static void isp_vb2_release_buffers(struct apple_isp *isp,
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 }
 
+/* Serialize error notification with the startup state transition. */
+void apple_isp_video_error(struct apple_isp *isp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	if (READ_ONCE(isp->ipc_error) && test_bit(ISP_STATE_STREAMING, &isp->state))
+		vb2_queue_error(&isp->vbq);
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+}
+
 static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 {
 	struct apple_isp *isp = vb2_get_drv_priv(vb->vb2_queue);
@@ -520,7 +531,7 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 	/* Restart an empty IMX958 queue when its last returned lease is queued. */
 	if (test_bit(ISP_STATE_STREAMING, &isp->state) &&
 	    (isp_supports_p010(isp) || !empty)) {
-		if (isp_submit_buffers(isp, false) && isp_is_p010(isp)) {
+		if (isp_submit_buffers(isp, false)) {
 			/*
 			 * After a timeout the leases stay owned until the
 			 * stream stops. Only firmware that did not answer at
@@ -581,7 +592,16 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 		}
 	}
 
-	set_bit(ISP_STATE_STREAMING, &isp->state);
+	/* Pair with the receive thread's error notification under buf_lock. */
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	err = READ_ONCE(isp->ipc_error);
+	if (!err)
+		set_bit(ISP_STATE_STREAMING, &isp->state);
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
+	if (err) {
+		apple_isp_stop_capture(isp);
+		goto stop_camera;
+	}
 
 	return 0;
 
