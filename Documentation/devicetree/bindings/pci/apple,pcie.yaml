@@ -247,16 +247,15 @@ allOf:
       properties:
         reg:
           minItems: 5
-          maxItems: 18
+          maxItems: 14
         reg-names:
           description:
             config and rc, then port<n>, phy<n> and intr2axi<n> for each
-            bootloader-trained root port 00:<n>.0, and perst<n> (its PERST#
-            pad) for a port whose endpoint needs a root-port reset.
+            bootloader-trained root port 00:<n>.0.
           minItems: 5
-          maxItems: 18
+          maxItems: 14
           items:
-            pattern: "^(config|rc|(port|phy|intr2axi|perst)[0-3])$"
+            pattern: "^(config|rc|(port|phy|intr2axi)[0-3])$"
         interrupts:
           maxItems: 4
         interrupt-names:
@@ -272,7 +271,11 @@ allOf:
       patternProperties:
         "^pci@":
           properties:
-            reset-gpios: false
+            reset-gpios:
+              description:
+                The PERST# line of a port whose endpoint needs a root-port
+                reset after the bootloader trained the link. Left as the
+                bootloader set it until that reset.
             pwren-gpios: false
           required:
             - apple,link-trained-by-bootloader
