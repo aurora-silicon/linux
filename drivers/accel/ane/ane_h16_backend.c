@@ -1296,6 +1296,14 @@ out:
 	return ret;
 }
 
+/*
+ * How long dynamic power gating stays off after the last EXECUTE. macOS 27.0
+ * on the J616s keeps it off across a run of back-to-back requests and turns
+ * it back on about 1 ms after the last one (two 0x002d per run, not per
+ * request); toggling it per request costs about 50 us of each EXECUTE ack.
+ */
+#define ANE_H16_GATE_HOLD_NS (2 * NSEC_PER_MSEC)
+
 /* After startup: one program session and the ABI 3 accel node. */
 static int ane_h16_program_stage(struct ane_h16_device *h)
 {
@@ -1303,8 +1311,10 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
 
 	ret = ane_h16_session_init(&h->session, &h->boot.transport, &ane_h16_session_ops, h,
 				   h->boot.build->command_timeout_ns);
-	if (!ret)
+	if (!ret) {
+		h->session.gate_hold_ns = ANE_H16_GATE_HOLD_NS;
 		ret = ane_h16_accel_register(h->dev, &h->session);
+	}
 	if (ret) {
 		dev_err(h->dev, "H16 program stage unavailable, error %d; held until reboot\n",
 			ret);
@@ -1554,6 +1564,8 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 		return;
 	/* Waits for the boot bring-up and any stage write in progress. */
 	cancel_work_sync(&h->start);
+	if (h->program_ready)
+		cancel_delayed_work_sync(&h->session.gate_work);
 	debugfs_remove_recursive(h->debugfs);
 	mutex_lock(&ane_h16_lock);
 	if (!--ane_h16_debugfs_users) {

@@ -471,6 +471,8 @@ int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 }
 EXPORT_SYMBOL_GPL(ane_h16_custom_bars);
 
+static void h16_gate_work(struct work_struct *work);
+
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
 			 const struct ane_h16_session_ops *ops, void *ctx,
 			 u64 timeout_ns)
@@ -489,6 +491,7 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	INIT_LIST_HEAD(&s->deferred);
 	INIT_LIST_HEAD(&s->programs);
 	spin_lock_init(&s->stats_lock);
+	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_init);
@@ -849,6 +852,47 @@ static int h16_gate(struct ane_h16_session *s, u32 value)
 	return ret;
 }
 
+/* Gating back on now if it is held off. Caller holds the session lock. */
+static int h16_gate_release(struct ane_h16_session *s)
+{
+	int ret;
+
+	if (!s->gate_held)
+		return 0;
+	s->gate_held = false;
+	if (s->quarantined)
+		return -EIO;
+	ret = h16_gate(s, 1);
+	return ret ? h16_fail(s, ret) : 0;
+}
+
+/*
+ * The idle end of the hold: gating goes back on once gate_hold_ns passed
+ * since the last EXECUTE ended. Caller holds the session lock. Returns 0
+ * when gating is on (or was never held off), -EAGAIN while a newer request
+ * keeps it off, or the error of the closing gate.
+ */
+int ane_h16_session_gate_expire(struct ane_h16_session *s)
+{
+	if (!s->gate_held)
+		return 0;
+	if (h16_now(s) - s->gate_last_ns < s->gate_hold_ns)
+		return -EAGAIN;
+	return h16_gate_release(s);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_gate_expire);
+
+static void h16_gate_work(struct work_struct *work)
+{
+	struct ane_h16_session *s = container_of(to_delayed_work(work),
+						 struct ane_h16_session, gate_work);
+
+	mutex_lock(s->lock);
+	if (!s->asleep && ane_h16_session_gate_expire(s) == -EAGAIN)
+		mod_delayed_work(system_dfl_wq, &s->gate_work, nsecs_to_jiffies(s->gate_hold_ns));
+	mutex_unlock(s->lock);
+}
+
 /*
  * One firmware log record: a 2-byte header, then NUL-terminated text in the
  * rest of the 0x80 bytes. Copies the printable text (other bytes become '.')
@@ -1087,9 +1131,12 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	polls = s->transport->polls;
 	trace.step = H16_STEP_GATE_OPEN;
 	t0 = h16_now(s);
-	ret = h16_gate(s, 0);
-	if (ret)
-		goto fail;
+	if (!s->gate_held) {
+		ret = h16_gate(s, 0);
+		if (ret)
+			goto fail;
+		s->gate_held = s->gate_hold_ns != 0;
+	}
 	gate_open = h16_now(s) - t0;
 	deadline = t0 + gate_open + s->timeout_ns;
 	request.key = p->key;
@@ -1136,10 +1183,19 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	}
 	trace.step = H16_STEP_GATE_CLOSE;
 	t3 = h16_now(s);
-	ret = h16_gate(s, 1);
-	if (ret)
-		goto fail;
+	if (!s->gate_held) {
+		ret = h16_gate(s, 1);
+		if (ret)
+			goto fail;
+	}
 	end = h16_now(s);
+	if (s->gate_held) {
+		/* Back-to-back requests find gating off; it goes on when idle. */
+		s->gate_last_ns = end;
+		if (s->lock)
+			mod_delayed_work(system_dfl_wq, &s->gate_work,
+					 nsecs_to_jiffies(s->gate_hold_ns));
+	}
 	s->transport->ops->read_barrier(s->transport->ctx);
 	memset(x, 0, sizeof(*x));
 	x->ns[ANE_H16_T_PREPARE] = t0 - entry;
@@ -1350,6 +1406,10 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 	}
 	if (s->quarantined)
 		return -EIO;
+	/* TERMINATE and UNLOAD run with gating on, as without the hold. */
+	ret = h16_gate_release(s);
+	if (ret)
+		return ret;
 	ret = ane_h16_terminate_encode(command, ANE_H16_TERMINATE_SIZE, p->key.program,
 				       p->key.process);
 	if (!ret)
@@ -1412,6 +1472,9 @@ void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep)
 	struct ane_h16_program *p, *n;
 
 	mutex_lock(s->lock);
+	/* The firmware is suspended or powered off with gating on. */
+	if (asleep && s->gate_held && h16_gate_release(s))
+		s->ops->log(s->ctx, "gate release before sleep failed", (u64)-s->error, 0);
 	WRITE_ONCE(s->asleep, asleep);
 	/* Closes that came in while asleep, now that the firmware is back. */
 	if (!asleep) {
@@ -1438,6 +1501,8 @@ void ane_h16_session_restart(struct ane_h16_session *s)
 {
 	s->epoch++;
 	s->program = NULL;
+	/* A firmware booted again from the preload starts with gating on. */
+	s->gate_held = false;
 	s->executed = 0;
 	memset(s->pending.slots, 0, sizeof(s->pending.slots));
 	s->pending.error = 0;
