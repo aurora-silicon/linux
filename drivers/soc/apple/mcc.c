@@ -30,8 +30,17 @@
 #define MCC_CACHE_FLUSH		0x2844
 #define MCC_CACHE_FLUSH_BUSY	BIT(0)
 
-#define MCC_MAX_PLANES		16
+/* T6050: eight AMCCs of four planes on each die, 64 planes on two dies. */
+#define MCC_MAX_PLANES		64
 #define MCC_FLUSH_TIMEOUT_US	100000
+
+struct apple_mcc_soc {
+	/*
+	 * Skip a boot-DMA device whose node is not enabled: it never binds, so
+	 * the cache would never allocate. Set where that was tested (T6050).
+	 */
+	bool skip_disabled_boot_dma;
+};
 
 struct apple_mcc {
 	struct device *dev;
@@ -89,14 +98,21 @@ static int apple_mcc_enable_t8132(struct apple_mcc *mcc)
 	return 0;
 }
 
-static int apple_mcc_wait_boot_dma(struct device *dev)
+static int apple_mcc_wait_boot_dma(struct device *dev,
+				   const struct apple_mcc_soc *soc)
 {
 	struct of_phandle_iterator it;
 	int ret;
 
 	of_for_each_phandle(&it, ret, dev->of_node, "apple,boot-dma-devices", NULL, 0) {
-		struct platform_device *pdev = of_find_device_by_node(it.node);
-		bool bound = pdev && device_is_bound(&pdev->dev);
+		struct platform_device *pdev;
+		bool bound;
+
+		if (soc && soc->skip_disabled_boot_dma &&
+		    !of_device_is_available(it.node))
+			continue;
+		pdev = of_find_device_by_node(it.node);
+		bound = pdev && device_is_bound(&pdev->dev);
 
 		if (pdev)
 			put_device(&pdev->dev);
@@ -205,7 +221,7 @@ static int apple_mcc_probe(struct platform_device *pdev)
 	if (!mcc->nr_planes)
 		return dev_err_probe(dev, -EINVAL, "no planes\n");
 
-	ret = apple_mcc_wait_boot_dma(dev);
+	ret = apple_mcc_wait_boot_dma(dev, of_device_get_match_data(dev));
 	if (ret)
 		return ret;
 
@@ -236,9 +252,15 @@ static void apple_mcc_shutdown(struct platform_device *pdev)
 		apple_mcc_quiesce(mcc);
 }
 
+/* J775D's display node is enabled only when the boot loader hands it over. */
+static const struct apple_mcc_soc apple_mcc_t6050 = {
+	.skip_disabled_boot_dma = true,
+};
+
 static const struct of_device_id apple_mcc_of_match[] = {
 	{ .compatible = "apple,t8132-mcc" },
 	{ .compatible = "apple,t8140-mcc" },
+	{ .compatible = "apple,t6050-mcc", .data = &apple_mcc_t6050 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_mcc_of_match);
