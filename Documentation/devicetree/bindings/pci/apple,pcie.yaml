@@ -391,9 +391,10 @@ allOf:
             if:
               properties:
                 compatible:
-                  contains:
-                    const: apple,t6050-pcie
-            else:
+                  not:
+                    contains:
+                      const: apple,t6050-pcie
+            then:
               properties:
                 reg:
                   maxItems: 10
@@ -413,9 +414,10 @@ allOf:
         - if:
             properties:
               compatible:
-                contains:
-                  const: apple,t6050-pcie
-          else:
+                not:
+                  contains:
+                    const: apple,t6050-pcie
+          then:
             patternProperties:
               "^pci@":
                 required:
