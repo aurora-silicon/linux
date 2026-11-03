@@ -3505,6 +3505,17 @@ static void dcp_link_recovery_work(struct work_struct *work)
 	dcp_dptx_connect_oob(pdev, 0);
 }
 
+/* The end of a stopped retrain window (dcp_hotplug_retrain_allowed()). */
+static void dcp_hotplug_retrain_retry_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     hotplug_retrain_retry_wq);
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	if (connector && READ_ONCE(connector->connected))
+		schedule_work(&connector->hotplug_wq);
+}
+
 static void dcp_typec_reconnect_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp =
@@ -6259,6 +6270,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 		dcp->tb_event_route = NULL;
 		dcp->tb_event_generation = 0;
 	}
+	disable_delayed_work_sync(&dcp->hotplug_retrain_retry_wq);
 	disable_delayed_work_sync(&dcp->hybrid_wq);
 }
 
@@ -6274,6 +6286,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	enable_delayed_work(&dcp->link_recovery_wq);
 	enable_work(&dcp->tb_event_work);
+	enable_delayed_work(&dcp->hotplug_retrain_retry_wq);
 	enable_delayed_work(&dcp->hybrid_wq);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
@@ -7514,6 +7527,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
 	mutex_init(&dcp->tb_event_lock);
 	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
+	INIT_DELAYED_WORK(&dcp->hotplug_retrain_retry_wq,
+			  dcp_hotplug_retrain_retry_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->typec_relink_wq, dcp_typec_relink_work);
@@ -7551,6 +7566,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->announce_wq);
 	disable_delayed_work(&dcp->link_recovery_wq);
 	disable_work(&dcp->tb_event_work);
+	disable_delayed_work(&dcp->hotplug_retrain_retry_wq);
 	dcp->announce.stopped = true;
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may
