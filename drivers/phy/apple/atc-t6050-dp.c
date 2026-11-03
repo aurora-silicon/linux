@@ -623,8 +623,9 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	dp->combo = of_device_is_compatible(dev->of_node, "apple,t6050-combo-phy");
 	if (dp->combo) {
 		u32 port;
+		/* Every Type-C port but 0, the debug port that carries the boot link. */
 		if (of_property_read_u32(dev->of_node, "apple,port-index", &port) ||
-		    (port != 1 && port != 2) ||
+		    port < 1 || port > 5 ||
 		    !of_property_present(dev->of_node, "apple,guest-port-reserved") ||
 		    !of_property_present(dev->of_node, "mode-switch"))
 			return -EINVAL;
