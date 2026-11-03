@@ -54,9 +54,11 @@ struct centauri_wifi {
 	u8 scan_sequence;
 	bool connecting, connected, connect_event, disconnect_event;
 	bool disconnect_pending;
-	u16 connect_status;
+	u16 connect_status, scan_status, disconnect_status;
+	struct ieee80211_channel *connect_channel;
 	u8 bssid[ETH_ALEN], connect_payload[1024], request_ie[256];
-	size_t connect_size, request_ie_size;
+	u8 ssid[IEEE80211_MAX_SSID_LEN];
+	size_t connect_size, request_ie_size, ssid_len;
 	u32 data_rx_received, data_rx_reposted, data_rx_bad;
 	struct sk_buff_head data_tx_queue;
 	u16 data_tx_length[DATA_TX_SLOTS];
@@ -512,15 +514,19 @@ static void drain(struct centauri_wifi *wifi)
 			} else if (command & BIT(31)) {
 				if (command == 0x80000030)
 					wifi->channels_seen++;
-				if (command == 0x80000005)
+				if (command == 0x80000005) {
 					wifi->scans_done++;
+					wifi->scan_status = status;
+				}
 				if (command == 0x80000000 && wifi->connecting) {
 					wifi->connect_event = true;
 					wifi->connect_status = status;
 				}
 				if (command == 0x80000003 ||
-				    command == 0x80000004)
+				    command == 0x80000004) {
 					wifi->disconnect_event = true;
+					wifi->disconnect_status = status;
+				}
 				if (command == 0x80000004)
 					wifi->disconnect_pending = false;
 
@@ -632,7 +638,12 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload,
 
 		if (wifi->reply_valid && wifi->reply_sequence == sequence &&
 		    (wifi->reply_command & ~BIT(30)) == id) {
-			return wifi->reply_status ? -EREMOTEIO : 0;
+			if (!wifi->reply_status)
+				return 0;
+			dev_dbg(&wifi->control->pdev->dev,
+				"Wi-Fi command %#x: firmware status %u\n", id,
+				wifi->reply_status);
+			return -EREMOTEIO;
 		}
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
@@ -640,6 +651,19 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload,
 		"Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
 	command_fault(wifi);
 	return -ETIMEDOUT;
+}
+
+/* Caller holds wifi->lock; ret is what command() returned for the request. */
+static void command_refused(struct centauri_wifi *wifi, const char *what,
+			    int ret)
+{
+	if (ret == -EREMOTEIO)
+		dev_warn(&wifi->control->pdev->dev,
+			 "Wi-Fi %s refused: firmware status %u\n", what,
+			 wifi->reply_status);
+	else
+		dev_warn(&wifi->control->pdev->dev, "Wi-Fi %s failed: %d\n",
+			 what, ret);
 }
 
 static int station_configure(struct centauri_wifi *wifi, const u8 *address)
@@ -762,8 +786,10 @@ static int scan_profile27(struct centauri_wifi *wifi)
 			size += 6 + ssid->ssid_len;
 		}
 		ret = command(wifi, 65551, scan, size);
-		if (ret)
+		if (ret) {
+			command_refused(wifi, "scan", ret);
 			return ret;
+		}
 		deadline = jiffies +
 			   msecs_to_jiffies(max(8000U, count * 220 + 2000));
 		do {
@@ -782,9 +808,16 @@ static int scan_profile27(struct centauri_wifi *wifi)
 			usleep_range(1000, 2000);
 		} while (time_before(jiffies, deadline));
 		if (wifi->scans_done == done) {
+			dev_warn(&wifi->control->pdev->dev,
+				 "Wi-Fi scan of %u channels: no completion event\n",
+				 count);
 			command(wifi, 65537, NULL, 0);
 			return -ETIMEDOUT;
 		}
+		if (wifi->scan_status && !abort_sent)
+			dev_warn(&wifi->control->pdev->dev,
+				 "Wi-Fi scan of %u channels ended with firmware status %u\n",
+				 count, wifi->scan_status);
 		if (READ_ONCE(wifi->scan_abort))
 			return -ECANCELED;
 	}
@@ -959,6 +992,13 @@ static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data,
 	*size += 4 + length;
 }
 
+/*
+ * The connect request names its target: nl80211 clients pass the BSSID and
+ * channel they chose from their own scan results. The kernel's scan entry for
+ * it may already be gone (a client's flushed scan expires every BSS its last
+ * channel subset did not see), so the entry is looked up only when the
+ * request names no target.
+ */
 static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			struct cfg80211_connect_params *params)
 {
@@ -973,13 +1013,14 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	};
 	struct centauri_wifi *wifi =
 		*(struct centauri_wifi **)wiphy_priv(wiphy);
+	const u8 *bssid = params->bssid ?: params->bssid_hint;
+	struct ieee80211_channel *channel =
+		params->channel ?: params->channel_hint;
 	struct cfg80211_bss *bss;
-	const struct cfg80211_bss_ies *ies;
-	const u8 *rsn, *ap_rsn;
+	const u8 *rsn;
 	u8 rsn_body[255], ssid[35], zero[20] = {}, pmf;
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size, rsn_prefix, rsn_tail;
-	u16 caps = 0;
 	int ret = 0, offset;
 
 	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
@@ -995,6 +1036,12 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	if (ret < 0)
 		return ret;
 	rsn_size = ret;
+	/* The station's own RSN capabilities go to the firmware; bit 7 is MFPC. */
+	offset = rsn_caps_offset(rsn_body, rsn_size);
+	if (offset < 0)
+		return -EINVAL;
+	pmf = !!(get_unaligned_le16(rsn_body + offset) &
+		 BIT(7));
 	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->stopping)) {
@@ -1007,43 +1054,34 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		goto out;
 	}
 
-	bss = cfg80211_get_bss(wiphy, params->channel, params->bssid,
-			       params->ssid, params->ssid_len,
-			       IEEE80211_BSS_TYPE_ESS, IEEE80211_PRIVACY_ON);
-	if (!bss) {
-		ret = -ENOENT;
-		goto out;
-	}
-
-	rcu_read_lock();
-	ies = rcu_dereference(bss->ies);
-	ap_rsn = ies ? cfg80211_find_ie(WLAN_EID_RSN, ies->data, ies->len) :
-		       NULL;
-	if (!ap_rsn) {
-		ret = -EINVAL;
+	if (bssid && channel) {
+		memcpy(wifi->bssid, bssid, ETH_ALEN);
 	} else {
-		ret = rsn_psk_offset(ap_rsn + 2, ap_rsn[1]);
-		if (ret >= 0) {
-			offset = rsn_caps_offset(ap_rsn + 2, ap_rsn[1]);
-			caps = get_unaligned_le16(ap_rsn + 2 + offset);
-			ret = 0;
+		bss = cfg80211_get_bss(wiphy, channel, bssid, params->ssid,
+				       params->ssid_len, IEEE80211_BSS_TYPE_ESS,
+				       IEEE80211_PRIVACY_ON);
+		if (!bss) {
+			ret = -ENOENT;
+			goto out;
 		}
-	}
-	rcu_read_unlock();
-	if (ret) {
+		memcpy(wifi->bssid, bss->bssid, ETH_ALEN);
+		channel = bss->channel;
 		cfg80211_put_bss(wiphy, bss);
+	}
+	if (channel->band != NL80211_BAND_2GHZ &&
+	    channel->band != NL80211_BAND_5GHZ) {
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
-	offset = rsn_caps_offset(rsn_body, rsn_size);
-	put_unaligned_le16(caps, rsn_body + offset);
-	pmf = !!(caps & BIT(7));
+	wifi->connect_channel = channel;
+	memcpy(wifi->ssid, params->ssid, params->ssid_len);
+	wifi->ssid_len = params->ssid_len;
 	memset(payload, 0, sizeof(wifi->connect_payload));
 	payload[0] = 1;
-	memcpy(payload + 1, bss->bssid, ETH_ALEN);
-	memcpy(wifi->bssid, bss->bssid, ETH_ALEN);
-	payload[7] = ieee80211_frequency_to_channel(bss->channel->center_freq);
+	memcpy(payload + 1, wifi->bssid, ETH_ALEN);
+	payload[7] = ieee80211_frequency_to_channel(channel->center_freq);
 
-	payload[8] = bss->channel->band == NL80211_BAND_2GHZ ? 0 : 1;
+	payload[8] = channel->band == NL80211_BAND_2GHZ ? 0 : 1;
 	payload[0x47] = 4;
 
 	put_unaligned_le16(4, payload + 0x48);
@@ -1077,11 +1115,35 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	wifi->connecting = true;
 	wifi->connect_status = 0;
 	wifi->connect_event = wifi->disconnect_event = false;
-	cfg80211_put_bss(wiphy, bss);
 	schedule_work(&wifi->connect_work);
 out:
 	mutex_unlock(&wifi->lock);
 	return ret;
+}
+
+/*
+ * cfg80211 records a connection against a BSS entry. When the client's scans
+ * have expired the target's, inform one from the request until its beacons
+ * (reported on ring 4 once associated) replace the elements.
+ */
+static struct cfg80211_bss *connected_bss(struct centauri_wifi *wifi)
+{
+	struct cfg80211_bss *bss;
+	u8 ie[2 + IEEE80211_MAX_SSID_LEN];
+
+	bss = cfg80211_get_bss(wifi->wiphy, wifi->connect_channel, wifi->bssid,
+			       NULL, 0, IEEE80211_BSS_TYPE_ESS,
+			       IEEE80211_PRIVACY_ANY);
+	if (bss)
+		return bss;
+	ie[0] = WLAN_EID_SSID;
+	ie[1] = wifi->ssid_len;
+	memcpy(ie + 2, wifi->ssid, wifi->ssid_len);
+	return cfg80211_inform_bss(wifi->wiphy, wifi->connect_channel,
+				   CFG80211_BSS_FTYPE_UNKNOWN, wifi->bssid, 0,
+				   WLAN_CAPABILITY_ESS | WLAN_CAPABILITY_PRIVACY,
+				   100, ie, 2 + wifi->ssid_len, -95 * 100,
+				   GFP_KERNEL);
 }
 
 static void connect_worker(struct work_struct *work)
@@ -1117,6 +1179,20 @@ static void connect_worker(struct work_struct *work)
 		ret = -ECANCELED;
 	else if (!ret && !wifi->connect_event)
 		ret = -ETIMEDOUT;
+	if (ret == -ENOTCONN)
+		dev_warn(&wifi->control->pdev->dev,
+			 "Wi-Fi connect to %pM: disconnect event, firmware status %u\n",
+			 wifi->bssid, wifi->disconnect_status);
+	else if (ret == -ETIMEDOUT)
+		dev_warn(&wifi->control->pdev->dev,
+			 "Wi-Fi connect to %pM: no connect event\n",
+			 wifi->bssid);
+	else if (ret && ret != -ECANCELED)
+		command_refused(wifi, "connect", ret);
+	else if (!ret && wifi->connect_status)
+		dev_warn(&wifi->control->pdev->dev,
+			 "Wi-Fi connect to %pM failed: firmware status %u\n",
+			 wifi->bssid, wifi->connect_status);
 	status = !ret && wifi->connect_status == 0 ?
 			 WLAN_STATUS_SUCCESS :
 			 WLAN_STATUS_UNSPECIFIED_FAILURE;
@@ -1140,9 +1216,13 @@ static void connect_worker(struct work_struct *work)
 					 wifi->request_ie_size, GFP_KERNEL,
 					 NL80211_TIMEOUT_UNSPECIFIED);
 	else
-		cfg80211_connect_result(wifi->netdev, wifi->bssid,
-					wifi->request_ie, wifi->request_ie_size,
-					NULL, 0, status, GFP_KERNEL);
+		cfg80211_connect_bss(wifi->netdev, wifi->bssid,
+				     status == WLAN_STATUS_SUCCESS ?
+					     connected_bss(wifi) :
+					     NULL,
+				     wifi->request_ie, wifi->request_ie_size,
+				     NULL, 0, status, GFP_KERNEL,
+				     NL80211_TIMEOUT_UNSPECIFIED);
 	if (status == WLAN_STATUS_SUCCESS && !READ_ONCE(wifi->stopping)) {
 		cfg80211_port_authorized(wifi->netdev, wifi->bssid, NULL, 0,
 					 GFP_KERNEL);
