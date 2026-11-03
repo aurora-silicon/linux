@@ -149,6 +149,8 @@ struct cpu_context {
 	unsigned long pc;
 };
 
+struct apple_amx_state;
+
 struct thread_struct {
 	struct cpu_context	cpu_context;	/* cpu context */
 
@@ -204,6 +206,9 @@ struct thread_struct {
 #endif
 #ifdef CONFIG_ARM64_ACTLR_STATE
 	u64			actlr;
+#endif
+#ifdef CONFIG_ARM64_APPLE_AMX
+	struct apple_amx_state	*amx;		/* NULL until first AMX use */
 #endif
 };
 
@@ -422,6 +427,11 @@ extern void __init minsigstksz_setup(void);
 #include <asm/fpsimd.h>
 
 /* Userspace interface for PR_S[MV]E_{SET,GET}_VL prctl()s: */
+#ifdef CONFIG_ARM64_APPLE_AMX
+int apple_amx_get(void);
+#define AURORA_GET_AMX()		apple_amx_get()
+#endif
+
 #define SVE_SET_VL(arg)	sve_set_current_vl(arg)
 #define SVE_GET_VL()	sve_get_current_vl()
 #define SME_SET_VL(arg)	sme_set_current_vl(arg)

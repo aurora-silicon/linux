@@ -2445,6 +2445,17 @@ config ARM64_MEMORY_MODEL_CONTROL
 	  for the PR_SET_MEM_MODEL/PR_GET_MEM_MODEL prctl() calls on
 	  CPUs with this feature.
 
+config ARM64_APPLE_AMX
+	bool "Apple AMX matrix coprocessor"
+	depends on ARCH_APPLE
+	default y
+	help
+	  Apple CPUs have a matrix coprocessor (AMX) that EL0 code drives
+	  with implementation-defined instructions. Say Y to let threads
+	  use it: AMX is enabled for a thread on its first AMX instruction
+	  and its 5 KiB register file is saved and restored across context
+	  switches. Boot with apple_amx=off to keep AMX disabled.
+
 config RELOCATABLE
 	bool "Build a relocatable kernel image" if EXPERT
 	select ARCH_HAS_RELR

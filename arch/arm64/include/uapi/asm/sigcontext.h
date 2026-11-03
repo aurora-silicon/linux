@@ -160,6 +160,22 @@ struct tpidr2_context {
 };
 
 /* FPMR context */
+/*
+ * Aurora: Apple AMX register file (8 X, 8 Y and 64 Z rows of 64 bytes) of a
+ * thread that was between AMX SET and CLR when the signal arrived. The
+ * handler starts with AMX clear and may use it; sigreturn reloads regs and
+ * leaves the thread SET again if APPLE_AMX_SIG_SET is in flags.
+ */
+#define APPLE_AMX_MAGIC		0x414d5831
+#define APPLE_AMX_SIG_SET	(1 << 0)
+
+struct apple_amx_context {
+	struct _aarch64_ctx head;
+	__u32 flags;
+	__u32 __reserved;
+	__u8 regs[5120];
+};
+
 #define FPMR_MAGIC	0x46504d52
 
 struct fpmr_context {
