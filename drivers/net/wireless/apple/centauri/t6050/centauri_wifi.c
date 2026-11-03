@@ -107,7 +107,7 @@ static struct ieee80211_rate rates[] = {
 	{ .bitrate = 360 }, { .bitrate = 480 }, { .bitrate = 540 },
 };
 
-static const u32 akm_suites[] = { WLAN_AKM_SUITE_PSK };
+static const u32 akm_suites[] = { WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE };
 
 static const u32 cipher_suites[] = {
 	WLAN_CIPHER_SUITE_CCMP,
@@ -1204,7 +1204,8 @@ static int rsn_caps_offset(const u8 *body, size_t size)
 	return offset + 2 <= size ? offset : -EINVAL;
 }
 
-static int rsn_psk_offset(const u8 *body, size_t size)
+/* The offset of the RSN element's AKM list when it offers akm. */
+static int rsn_akm_offset(const u8 *body, size_t size, u32 akm)
 {
 	size_t offset, end;
 	u16 count;
@@ -1223,25 +1224,25 @@ static int rsn_psk_offset(const u8 *body, size_t size)
 	if (!count || end + 2 > size)
 		return -EINVAL;
 	for (i = 0; i < count; i++)
-		if (get_unaligned_be32(body + offset + 2 + 4 * i) ==
-		    WLAN_AKM_SUITE_PSK)
+		if (get_unaligned_be32(body + offset + 2 + 4 * i) == akm)
 			return offset;
 	return -EOPNOTSUPP;
 }
 
-static int select_psk_rsn(const struct cfg80211_crypto_settings *crypto,
-			  const u8 *body, size_t size, u8 *selected)
+/* The station's RSN element with akm as its only AKM. */
+static int select_rsn(const struct cfg80211_crypto_settings *crypto, u32 akm,
+		      const u8 *body, size_t size, u8 *selected)
 {
 	size_t tail;
 	unsigned int i;
 	int offset;
 
 	for (i = 0; i < crypto->n_akm_suites; i++)
-		if (crypto->akm_suites[i] == WLAN_AKM_SUITE_PSK)
+		if (crypto->akm_suites[i] == akm)
 			break;
 	if (i == crypto->n_akm_suites)
 		return -EOPNOTSUPP;
-	offset = rsn_psk_offset(body, size);
+	offset = rsn_akm_offset(body, size, akm);
 	if (offset < 0)
 		return offset;
 
@@ -1252,9 +1253,36 @@ static int select_psk_rsn(const struct cfg80211_crypto_settings *crypto,
 	tail = offset + 2 + 4 * get_unaligned_le16(body + offset);
 	memcpy(selected, body, offset);
 	put_unaligned_le16(1, selected + offset);
-	put_unaligned_be32(WLAN_AKM_SUITE_PSK, selected + offset + 2);
+	put_unaligned_be32(akm, selected + offset + 2);
 	memcpy(selected + offset + 6, body + tail, size - tail);
 	return offset + 6 + size - tail;
+}
+
+/*
+ * The connect command carries one authentication and AKM pair, in the bytes
+ * at 0x46 and 0x47: WPA2-Personal is open authentication with AKM 4 and the
+ * PMK at 0x4c, WPA3-Personal is SAE authentication with AKM 8 and the
+ * password in TLV 313, which the firmware runs SAE from.
+ */
+#define CONNECT_AUTH_OPEN 0
+#define CONNECT_AUTH_SAE 3
+#define CONNECT_AKM_PSK 4
+#define CONNECT_AKM_SAE 8
+
+/* The AKM of the client's request whose credential it supplies, SAE first. */
+static u32 connect_akm(const struct cfg80211_crypto_settings *crypto)
+{
+	bool psk = false;
+	unsigned int i;
+
+	for (i = 0; i < crypto->n_akm_suites; i++) {
+		if (crypto->akm_suites[i] == WLAN_AKM_SUITE_SAE &&
+		    crypto->sae_pwd_len)
+			return WLAN_AKM_SUITE_SAE;
+		if (crypto->akm_suites[i] == WLAN_AKM_SUITE_PSK && crypto->psk)
+			psk = true;
+	}
+	return psk ? WLAN_AKM_SUITE_PSK : 0;
 }
 
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data,
@@ -1281,6 +1309,10 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		0xff, 0xff, 0xff, 0xff, 3,    0,    0,
 	};
 
+	/* TLV 304: the join mode, 5 for every join. */
+	static const u8 join_mode = 5;
+	/* TLV 316: no security roaming groups. */
+	static const u8 roaming;
 	static const __le32 connection_timeouts[] = {
 		cpu_to_le32(260),   cpu_to_le32(6000), cpu_to_le32(2000),
 		cpu_to_le32(15000), cpu_to_le32(300),
@@ -1292,12 +1324,16 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		params->channel ?: params->channel_hint;
 	struct cfg80211_bss *bss;
 	const u8 *rsn;
-	u8 rsn_body[255], ssid[35], zero[20] = {}, pmf;
+	u8 rsn_body[255], ssid[35];
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size, rsn_prefix, rsn_tail;
 	int ret = 0, offset, band;
+	u32 akm = connect_akm(&params->crypto);
+	bool sae = akm == WLAN_AKM_SUITE_SAE, mfpc;
+	u8 password[2 + SAE_PASSWORD_MAX_LEN];
 
-	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
+	if (!params->ssid_len || params->ssid_len > 32 || !akm ||
+	    params->crypto.sae_pwd_len > SAE_PASSWORD_MAX_LEN ||
 	    params->crypto.n_ciphers_pairwise != 1 ||
 	    params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
 	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
@@ -1306,16 +1342,18 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
 	if (!rsn)
 		return -EINVAL;
-	ret = select_psk_rsn(&params->crypto, rsn + 2, rsn[1], rsn_body);
+	ret = select_rsn(&params->crypto, akm, rsn + 2, rsn[1], rsn_body);
 	if (ret < 0)
 		return ret;
 	rsn_size = ret;
-	/* The station's own RSN capabilities go to the firmware; bit 7 is MFPC. */
+	/*
+	 * The station's own RSN element carries its management frame
+	 * protection to the firmware; bit 7 of its capabilities is MFPC.
+	 */
 	offset = rsn_caps_offset(rsn_body, rsn_size);
 	if (offset < 0)
 		return -EINVAL;
-	pmf = !!(get_unaligned_le16(rsn_body + offset) &
-		 BIT(7));
+	mfpc = get_unaligned_le16(rsn_body + offset) & BIT(7);
 	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->stopping)) {
@@ -1347,6 +1385,11 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		goto out;
 	band = ret;
 	ret = 0;
+	/* 6 GHz admits WPA3-Personal only with management frame protection. */
+	if (channel->band == NL80211_BAND_6GHZ && (!sae || !mfpc)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	wifi->connect_channel = channel;
 	memcpy(wifi->ssid, params->ssid, params->ssid_len);
 	wifi->ssid_len = params->ssid_len;
@@ -1356,13 +1399,16 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	payload[7] = ieee80211_frequency_to_channel(channel->center_freq);
 
 	payload[8] = band;
-	payload[0x47] = 4;
+	payload[0x46] = sae ? CONNECT_AUTH_SAE : CONNECT_AUTH_OPEN;
+	payload[0x47] = sae ? CONNECT_AKM_SAE : CONNECT_AKM_PSK;
 
 	put_unaligned_le16(4, payload + 0x48);
-	put_unaligned_le16(32, payload + 0x4a);
-	memcpy(payload + 0x4c, params->crypto.psk, 32);
+	if (!sae) {
+		put_unaligned_le16(32, payload + 0x4a);
+		memcpy(payload + 0x4c, params->crypto.psk, 32);
+	}
 
-	append_tlv(payload, &size, 304, zero, 1);
+	append_tlv(payload, &size, 304, &join_mode, 1);
 	append_tlv(payload, &size, 63763, connection_timeouts,
 		   sizeof(connection_timeouts));
 	ssid[0] = 1;
@@ -1371,8 +1417,16 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	memcpy(ssid + 3, params->ssid, params->ssid_len);
 	append_tlv(payload, &size, 342, ssid, 3 + params->ssid_len);
 	append_tlv(payload, &size, WLAN_EID_RSN, rsn_body, rsn_size);
+	if (sae) {
+		put_unaligned_le16(params->crypto.sae_pwd_len, password);
+		memcpy(password + 2, params->crypto.sae_pwd,
+		       params->crypto.sae_pwd_len);
+		append_tlv(payload, &size, 313, password,
+			   2 + params->crypto.sae_pwd_len);
+		memzero_explicit(password, sizeof(password));
+	}
 
-	append_tlv(payload, &size, 316, &pmf, 1);
+	append_tlv(payload, &size, 316, &roaming, 1);
 	append_tlv(payload, &size, 376, mld_defaults, sizeof(mld_defaults));
 	wifi->connect_size = size;
 
@@ -2000,6 +2054,7 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	wifi->wiphy->n_akm_suites = ARRAY_SIZE(akm_suites);
 	wiphy_ext_feature_set(wifi->wiphy,
 			      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
+	wiphy_ext_feature_set(wifi->wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);
 
 	ret = eth_platform_get_mac_address(&wifi->a.pdev->dev, address);
 	if (!ret) {
