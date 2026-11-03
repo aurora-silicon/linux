@@ -102,13 +102,16 @@
 			apple,soc-die-keys = "TCMb";
 		};
 
-		/* The PMU's legacy scratchpad (info-leg_scrpad 0xf800) cells, as on T6040. */
+		/*
+		 * The PMU's legacy scratchpad (info-leg_scrpad 0xf800) cells, as on T6040, and its
+		 * power-on policy byte (info-pm_setting 0x2001, as on T6030) for ac_power_mode.
+		 */
 		smc_reboot: reboot {
 			compatible = "apple,smc-reboot";
 			nvmem-cells = <&shutdown_flag>, <&boot_stage>,
-				      <&boot_error_count>, <&panic_count>;
+				      <&boot_error_count>, <&panic_count>, <&pm_setting>;
 			nvmem-cell-names = "shutdown_flag", "boot_stage",
-					   "boot_error_count", "panic_count";
+					   "boot_error_count", "panic_count", "pm_setting";
 		};
 
 		/*
@@ -216,6 +219,11 @@
 				compatible = "fixed-layout";
 				#address-cells = <1>;
 				#size-cells = <1>;
+
+				/* ADT info-pm_setting: bit 0 no restore, bit 5 no power-on at connect */
+				pm_setting: pm-setting@2001 {
+					reg = <0x2001 1>;
+				};
 
 				rtc_offset: rtc-offset@2100 {
 					reg = <0x2100 6>;	/* ADT info-clock_offset */
