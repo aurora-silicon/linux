@@ -22,6 +22,8 @@ pub(crate) struct VmStatus {
     client_closed: AtomicBool,
     /// A failure of this VM has been logged as a warning.
     warned: AtomicBool,
+    /// A GPU recovery found this VM's work guilty.
+    recovery_guilty: AtomicBool,
     /// The process that created the VM, named in the failure report.
     tgid: Pid,
     comm: [u8; 16],
@@ -55,6 +57,7 @@ impl VmStatus {
             reported_error: AtomicI32::new(0),
             client_closed: AtomicBool::new(false),
             warned: AtomicBool::new(false),
+            recovery_guilty: AtomicBool::new(false),
             tgid,
             comm,
             mirror <- new_mutex!(None, "Asahi VM status mirror"),
@@ -63,6 +66,16 @@ impl VmStatus {
 
     pub(crate) fn get(&self) -> i32 {
         self.error.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn note_recovery_guilty(&self) {
+        self.recovery_guilty.store(true, Ordering::Release);
+    }
+
+    /// A GPU recovery found this VM guilty: it hung or faulted the GPU, unlike a VM that
+    /// failed only for its own client.
+    pub(crate) fn recovery_guilty(&self) -> bool {
+        self.recovery_guilty.load(Ordering::Acquire)
     }
 
     /// Record permanent admission failure and report it to the client.
