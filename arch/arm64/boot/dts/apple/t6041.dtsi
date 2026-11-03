@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6041 "M4 Max" SoC
+ *
+ * The blocks t6040.dtsi describes sit at the same addresses, with the same
+ * interrupts, on T6041 (checked against a J616C ADT). The CPUs differ: two
+ * clusters of six P cores instead of five. Binned parts leave cores out of
+ * the ADT (the 14-core part has no cpu9 and no cpu15); the boot loader
+ * matches the DT's CPU nodes to the ADT's in order and disables those it
+ * does not find, so t6040.dtsi adds the sixth core of each cluster in place.
+ *
+ * The main PMIC is a Chapel at SPMI address 0xb (ADT nub-spmi0
+ * spmi-chapelL1-b), not T6040's Abbey at 0xe; its nvmem cells sit at the
+ * same offsets.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#define T6041_SIX_CORE_P_CLUSTERS
+#include "t6040.dtsi"
+
+/ {
+	cpus {
+		cpu-map {
+			cluster1 {
+				core5 {
+					cpu = <&cpu_p05>;
+				};
+			};
+
+			cluster2 {
+				core5 {
+					cpu = <&cpu_p15>;
+				};
+			};
+		};
+	};
+};
+
+&nub_spmi0 {
+	/delete-node/ pmic@e;
+
+	pmic@b {
+		compatible = "apple,chapel-pmic", "apple,spmi-nvmem";
+		reg = <0xb SPMI_USID>;
+
+		/* ADT pmu,chapel info-rtc_alarm_*: the Abbey layout at 0x2000 */
+		pmu_rtc: rtc {
+			compatible = "apple,t6041-pmu-rtc";
+			interrupt-parent = <&nub_spmi0>;
+			interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+			nvmem-cells = <&rtc_offset>;
+			nvmem-cell-names = "rtc_offset";
+			wakeup-source;
+		};
+
+		nvmem-layout {
+			compatible = "fixed-layout";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			rtc_offset: rtc-offset@2100 {
+				reg = <0x2100 0x6>;
+			};
+
+			boot_stage: boot-stage@f801 {
+				reg = <0xf801 0x1>;
+			};
+
+			boot_error_count: boot-error-count@f802,0 {
+				reg = <0xf802 0x1>;
+				bits = <0 4>;
+			};
+
+			panic_count: panic-count@f802,4 {
+				reg = <0xf802 0x1>;
+				bits = <4 4>;
+			};
+
+			shutdown_flag: shutdown-flag@f80f,3 {
+				reg = <0xf80f 0x1>;
+				bits = <3 1>;
+			};
+		};
+	};
+};
+
+/*
+ * Four cache planes per AMCC, eight AMCCs on the full part and six on the
+ * binned one (ADT amcc-enable-mask 0x3f). List the six every T6041 has.
+ */
+&mcc {
+	reg = <0x2 0x20000000 0x0 0x4000>,
+	      <0x2 0x20040000 0x0 0x4000>,
+	      <0x2 0x20080000 0x0 0x4000>,
+	      <0x2 0x200c0000 0x0 0x4000>,
+	      <0x2 0x22000000 0x0 0x4000>,
+	      <0x2 0x22040000 0x0 0x4000>,
+	      <0x2 0x22080000 0x0 0x4000>,
+	      <0x2 0x220c0000 0x0 0x4000>,
+	      <0x2 0x24000000 0x0 0x4000>,
+	      <0x2 0x24040000 0x0 0x4000>,
+	      <0x2 0x24080000 0x0 0x4000>,
+	      <0x2 0x240c0000 0x0 0x4000>,
+	      <0x2 0x26000000 0x0 0x4000>,
+	      <0x2 0x26040000 0x0 0x4000>,
+	      <0x2 0x26080000 0x0 0x4000>,
+	      <0x2 0x260c0000 0x0 0x4000>,
+	      <0x2 0x28000000 0x0 0x4000>,
+	      <0x2 0x28040000 0x0 0x4000>,
+	      <0x2 0x28080000 0x0 0x4000>,
+	      <0x2 0x280c0000 0x0 0x4000>,
+	      <0x2 0x2a000000 0x0 0x4000>,
+	      <0x2 0x2a040000 0x0 0x4000>,
+	      <0x2 0x2a080000 0x0 0x4000>,
+	      <0x2 0x2a0c0000 0x0 0x4000>;
+};
