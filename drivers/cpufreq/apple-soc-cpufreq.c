@@ -1059,6 +1059,14 @@ static void apple_fast_die_sample(struct apple_fast_die *fd)
 		fd->waiting = false;
 	} else {
 		limit = fd->fallback;
+		/*
+		 * The PMP stopped after it had run (a resume from disk restarts it):
+		 * the wait, and its warning, start over from now.
+		 */
+		if (!fd->waiting && fd->report) {
+			fd->start = jiffies;
+			fd->warned = false;
+		}
 		fd->waiting = true;
 		if (!fd->warned &&
 		    time_after(jiffies, fd->start + APPLE_FAST_DIE_WARN_S * HZ)) {
