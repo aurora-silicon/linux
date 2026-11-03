@@ -175,6 +175,36 @@ impl Graph {
             pointers,
         })
     }
+    /// Rewrites the queue records, pointer blocks and job list head of `qids` as
+    /// [`Self::new`] does, for `context` (the current owner), after zeroing the queue state:
+    /// item-ring cursors back at 0 for a cold-restarted firmware. Only with both queues idle.
+    pub(super) fn reset_after_cold_boot(&mut self, context: &Context, qids: [u8; 2]) -> Result {
+        let pointers = self.pointers;
+        self.queues.bytes_mut().fill(0);
+        let address = self.queues.gpu_va();
+        for stage in 0..2 {
+            self.queues.write(
+                qids[stage] as usize * size_of::<queue::QueueRecord>(),
+                queue::QueueRecord::new(&queue::QueueRecordArgs {
+                    pointers_va: address + POINTERS[stage] as u64,
+                    items_va: address + ITEMS[stage] as u64,
+                    job_list_va: context.work_head_va(),
+                    scheduler_va: context.scheduler_va(),
+                    owner_pid: context.owner_pid(),
+                    policy: context.policy(),
+                }),
+            )?;
+            self.queues.initialize::<queue::PointerBlock>(POINTERS[stage], |view| {
+                *view = queue::PointerBlock::new(&pointers)?;
+                Ok(())
+            })?;
+        }
+        self.queues
+            .write(JOB_LIST, queue::JobListHead::new(address + JOB_LIST as u64))?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     pub(super) fn offset(stage: usize, ordinal: u64) -> usize {
         let slot = ordinal as usize % RECORDS;
         if stage == 0 {

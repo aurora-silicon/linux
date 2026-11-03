@@ -253,6 +253,23 @@ impl CpuControl {
         to_result(unsafe { bindings::apple_mbox_ascwrap_v6_start_cpu(self.mbox) })
     }
 
+    /// The coprocessor's CPU control and status words, read through the provider. Bit
+    /// [`Self::CONTROL_RUN`] of the control word is the run request the provider sets in
+    /// [`Self::start`] and clears in [`Self::stop`].
+    pub(crate) fn state(&self) -> Result<(u32, u32)> {
+        let mut control = 0;
+        let mut status = 0;
+        // SAFETY: The constructor established the live, role-checked provider; both pointers
+        // name writable locals.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_cpu_state(self.mbox, &mut control, &mut status)
+        })?;
+        Ok((control, status))
+    }
+
+    /// Run request bit of the CPU control word (`APPLE_ASCWRAP_V6_CPU_RUN` in the provider).
+    pub(crate) const CONTROL_RUN: u32 = 1 << 4;
+
     /// Stop before releasing the transport or any firmware-visible memory.
     pub(crate) fn stop(&self) {
         // SAFETY: The provider remains live during consumer teardown. Removal

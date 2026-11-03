@@ -425,8 +425,11 @@ impl crate::g17::Shared {
         }
         // Replay only at this outer boundary, after recovery has settled.
         // Publication may service events but must never recurse into replay.
-        firmware.replay_compute(deferred)?;
-        firmware.replay_render(deferred)?;
+        // A device frozen for hibernation publishes nothing until it thaws.
+        if !firmware.frozen {
+            firmware.replay_compute(deferred)?;
+            firmware.replay_render(deferred)?;
+        }
         drop(state);
         self.observe_renders(masks, deferred)?;
         let mut state = self.state.lock();
@@ -445,7 +448,12 @@ impl crate::g17::Shared {
             .filter_map(|entry| entry.queue.as_deref())
             .any(|queue| queue.in_flight());
         let in_flight = compute || firmware.queues.render_in_flight();
-        let idle = firmware.idle_check(now, in_flight)?;
+        // Frozen for hibernation: no idle-policy or effort publication either.
+        let idle = if firmware.frozen {
+            None
+        } else {
+            firmware.idle_check(now, in_flight)?
+        };
         // Expiries, drained pairs, exits, pool and heap trimming and teardown give back what
         // retirement freed; a completion needs none of them to retire or to signal. While work
         // is in flight and nothing waits for capacity, a pass for firmware records alone skips
@@ -467,7 +475,7 @@ impl crate::g17::Shared {
         let mut lingers = None;
         let mut pools = None;
         let mut shrinking = false;
-        if housekeeping {
+        if housekeeping && !firmware.frozen {
             self.housekeeping_ns
                 .store(now, core::sync::atomic::Ordering::Relaxed);
             if !firmware.recovery.pending() {
