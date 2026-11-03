@@ -89,6 +89,9 @@ pub(crate) struct Build {
     pub(crate) images: &'static [crate::fwid::FirmwareBuild],
     /// Layouts and rules of the build.
     pub(crate) variant: &'static Variant,
+    /// The SoC configuration measured with this build, which replaces the probed one when
+    /// the build is identified; `None` keeps the probed configuration.
+    pub(crate) config: Option<&'static crate::g17::Config>,
 }
 
 /// How a SoC's firmware build is determined.

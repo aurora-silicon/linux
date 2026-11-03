@@ -42,30 +42,40 @@ pub(crate) const CONFIG: Config = Config {
     },
     region_c: &REGION_C,
     chip: Some(&CHIP),
+    captured: None,
     adopt_root_entries: false,
     fabric_bridge: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G16,
-    firmware: fw::variant::Firmware::Identified(&[fw::variant::Build {
-        os_version: [26, 5, 2],
-        name: "macOS 26.5.2 (25F84, iBoot mBoot-18000.121.3)",
-        images: &[crate::fwid::FirmwareBuild {
-            name: "Apple GFX 25F84 for T6041 (normalized loaded image)",
-            text_size: 0x60000,
-            data_size: 0x138000,
-            entropy: [0x5983a, 0x5991d],
-            text_sha256: [
-                0x6d, 0xa4, 0xd4, 0x42, 0x35, 0x35, 0x14, 0x44, 0xf6, 0xec, 0x00, 0x33, 0xf1, 0x9c,
-                0xbf, 0x98, 0xd3, 0x43, 0x91, 0x28, 0x83, 0xe4, 0xe2, 0x94, 0xc1, 0x8b, 0xb8, 0xb8,
-                0xa3, 0xc1, 0x83, 0xe8,
-            ],
-        }],
-        // macOS writes these tiler segment values on this machine, not the two-cluster ones.
-        variant: &fw::variant::Variant {
-            ta_mode_1: true,
-            ..fw::variant::V25F84
+    // 25F84 runs the static profile of this configuration; 25G83 runs the profile captured on
+    // the 32-core J616C ([`super::t6041_25g83::CONFIG`]).
+    firmware: fw::variant::Firmware::Identified(&[
+        fw::variant::Build {
+            os_version: [26, 5, 2],
+            name: "macOS 26.5.2 (25F84, iBoot mBoot-18000.121.3)",
+            images: &[crate::fwid::FirmwareBuild {
+                name: "Apple GFX 25F84 for T6041 (normalized loaded image)",
+                text_size: 0x60000,
+                data_size: 0x138000,
+                entropy: [0x5983a, 0x5991d],
+                text_sha256: [
+                    0x6d, 0xa4, 0xd4, 0x42, 0x35, 0x35, 0x14, 0x44, 0xf6, 0xec, 0x00, 0x33, 0xf1,
+                    0x9c, 0xbf, 0x98, 0xd3, 0x43, 0x91, 0x28, 0x83, 0xe4, 0xe2, 0x94, 0xc1, 0x8b,
+                    0xb8, 0xb8, 0xa3, 0xc1, 0x83, 0xe8,
+                ],
+            }],
+            // macOS writes these tiler segment values on this machine, not the two-cluster ones.
+            variant: &fw::variant::Variant {
+                ta_mode_1: true,
+                ..fw::variant::V25F84
+            },
+            config: None,
         },
-    }]),
+        fw::variant::Build {
+            config: Some(&super::t6041_25g83::CONFIG),
+            ..super::t6041_25g83::BUILD
+        },
+    ]),
     core_layout: CoreLayout {
         cores: Some((4, 40)),
         alternate_core_masks: None,
