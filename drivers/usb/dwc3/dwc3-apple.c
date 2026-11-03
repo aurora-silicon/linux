@@ -926,10 +926,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	/*
 	 * Until the first cable there is no core to keep powered: let the controller
 	 * runtime-suspend, and its DARTs with it, so that its power domain can drop.
-	 * Tested on T8132 only.
+	 * Tested on T8132; on the T6041 (M4 Max) the never-plugged ports are the usual case.
 	 */
 	if (appledwc->idle_rpm && !appledwc->fixed_hub &&
-	    of_device_is_compatible(dev->of_node, "apple,t8132-dwc3")) {
+	    (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
+	     of_machine_is_compatible("apple,t6041"))) {
 		pm_runtime_set_active(dev);
 		pm_runtime_enable(dev);
 		appledwc->pre_core_rpm = true;
