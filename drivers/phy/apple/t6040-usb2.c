@@ -2033,6 +2033,84 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	return PTR_ERR_OR_ZERO(provider);
 }
 
+#ifdef CONFIG_HIBERNATION
+static int t6040_phy_count(struct phy *phy)
+{
+	return IS_ERR_OR_NULL(phy) ? 0 : phy->power_count;
+}
+
+/*
+ * Resume from disk is a cold boot: the PHY, its coprocessor and the
+ * pipehandler come back reset, while this driver's state comes from the
+ * image.  Before the image its consumers gave it back: the sleep hook
+ * unbinds dwc3 (USB2/USB3 phys powered off, controller reset asserted),
+ * the DCP powers the DP phy off at hibernation prepare.  What is left set
+ * here describes hardware that no longer is: clear it to the state after
+ * probe, so that the next power-on programs the PHY afresh (with pin D,
+ * t6040_dp_power_on() otherwise takes the USB3 PHY for running).  What
+ * consumers hold (powered, usb3_on, usb3_pipe, dwc3_running and the PHY
+ * core counts, with their runtime PM reference) is theirs to release and
+ * is kept, so that every count stays balanced; a phy still held is only
+ * reported.  The port's Type-C state (orientation, DP alt mode, pin
+ * assignment) describes the partner, not the PHY, and stays for the next
+ * power-on.  Early, before any .restore: the Type-C controller's may set
+ * the mux again.  Nothing touches the hardware here.  s2idle is unchanged:
+ * only .restore_early is set.
+ */
+static int t6040_usb2_restore_early(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+
+	if (!tphy)
+		return 0;
+	guard(mutex)(&tphy->lock);
+	if (tphy->powered || tphy->usb3_on || tphy->dwc3_running ||
+	    t6040_phy_count(tphy->dp))
+		dev_warn(dev,
+			 "restore: still held across the image (usb2 %d, usb3 %d, dwc3 %d, dp %d/%d): its next power-on finds the PHY cold\n",
+			 tphy->powered, tphy->usb3_on, tphy->dwc3_running,
+			 t6040_phy_count(tphy->dp), tphy->dp_up);
+	dev_info(dev, "restore: PHY state reset (usb3 up %d, pipe %d, lent %d, dp up %d, 2-lane %d)\n",
+		 tphy->usb3_up, tphy->pipe_switched, tphy->usb3_lent, tphy->dp_up,
+		 tphy->dp_mode_two_lanes);
+	tphy->usb3_up = false;
+	tphy->pipe_switched = false;
+	tphy->usb3_lent = false;
+	tphy->dp_up = false;
+	tphy->dp_mode_two_lanes = false;
+	tphy->dp_mode_flip = false;
+	tphy->dp_rate = -1;
+	tphy->shutdown_failed = false;
+	return 0;
+}
+
+/*
+ * The coprocessor's RTKit session is reset with it.  Its host side is
+ * reset at power-down already (t6040_usb3_firmware_power_down()); one
+ * still running here (USB3 held across the image) is reset now, in the
+ * normal phase, after the DARTs its buffers live behind are restored.
+ */
+static int t6040_usb2_restore(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+	int ret;
+
+	if (!tphy || IS_ERR_OR_NULL(tphy->rtk))
+		return 0;
+	guard(mutex)(&tphy->lock);
+	if (!apple_rtkit_is_running(tphy->rtk))
+		return 0;
+	ret = apple_rtkit_reinit(tphy->rtk);
+	dev_info(dev, "restore: USB3 coprocessor RTKit reset: %d\n", ret);
+	return 0;
+}
+
+static const struct dev_pm_ops t6040_usb2_pm_ops = {
+	.restore_early = t6040_usb2_restore_early,
+	.restore = t6040_usb2_restore,
+};
+#endif
+
 static const struct of_device_id t6040_usb2_of_match[] = {
 	{ .compatible = "apple,t6040-atcphy" },
 	{}
@@ -2044,6 +2122,9 @@ static struct platform_driver t6040_usb2_driver = {
 	.driver = {
 		.name = "phy-apple-t6040-usb2",
 		.of_match_table = t6040_usb2_of_match,
+#ifdef CONFIG_HIBERNATION
+		.pm = &t6040_usb2_pm_ops,
+#endif
 	},
 };
 module_platform_driver(t6040_usb2_driver);
