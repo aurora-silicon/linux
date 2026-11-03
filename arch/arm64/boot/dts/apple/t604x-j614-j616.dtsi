@@ -4768,18 +4768,29 @@
 	};
 };
 
+/*
+ * The GL9755 SD reader. Its supply is the SMC's gP19 output, which the
+ * J614s and J616s firmware both describe as active high. Both CLKREQ pins
+ * go on the controller so that the Wi-Fi and SD ports do not claim the
+ * same pins.
+ */
+&apcie1_dart {
+	status = "okay";
+};
+
 &pcie0 {
 	interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
 		     <AIC_IRQ 1732 IRQ_TYPE_LEVEL_HIGH>;
-	/* Widen bus-range only with the SD power/port ownership handoff. */
+	bus-range = <0 2>;
+	pinctrl-0 = <&wifi_clkreq_pins &sd_clkreq_pins>;
 	iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie1_dart 1 1>;
 
 	port01: pci@1,0 {
 		device_type = "pci";
 		reg = <0x800 0 0 0 0>;
 		reset-gpios = <&pinctrl 5 GPIO_ACTIVE_LOW>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&sd_clkreq_pins>;
+		bus-range = <2 2>;
+		pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
 		#address-cells = <3>;
 		#size-cells = <2>;
 		ranges;
@@ -4790,8 +4801,14 @@
 				<0 0 0 2 &port01 0 0 0 1>,
 				<0 0 0 3 &port01 0 0 0 2>,
 				<0 0 0 4 &port01 0 0 0 3>;
-		/* The SD power switch needs an SMC service binding. */
-		status = "disabled";
+		status = "okay";
+
+		mmc@0,0 {
+			compatible = "pci17a0,9755";
+			reg = <0x20000 0 0 0 0>;
+			cd-inverted;
+			wp-inverted;
+		};
 	};
 };
 
