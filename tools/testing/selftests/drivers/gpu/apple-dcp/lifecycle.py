@@ -1387,6 +1387,21 @@ def readiness(root):
         function(drm, 'static bool apple_dcp_usable('),
         function(drm, 'static int add_dcp_components('),
         boot_display,
+        # The processors start concurrently: this work queue mock runs each
+        # start when it is queued, on whichever queue the driver names, and
+        # flush_work() has nothing left to wait for.
+        ('#include <stddef.h>\n'
+         'static void (*queued_start_fn)(struct work_struct *);\n'
+         '#define INIT_WORK_ONSTACK(w, f) ((void)(w), queued_start_fn = (f))\n'
+         '#define queue_work(wq, w) (queued_start_fn(w), true)\n'
+         '#define flush_work(w) ((void)(w))\n'
+         '#define destroy_work_on_stack(w) ((void)(w))\n'
+         '#ifndef container_of\n'
+         '#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))\n'
+         '#endif\n'
+         + function(drm, 'struct apple_dcp_start_work {') + ';\n'
+         + function(drm, 'static void apple_dcp_start_fn('))
+        if 'static void apple_dcp_start_fn(' in drm else '',
         function(drm, 'static int apple_drm_init_dcp('),
         'static int publish_provider(struct platform_device *pdev, struct apple_dcp *dcp)\n'
         '{\n\tstruct device *dev = &pdev->dev;\n\tint ret;\n'
