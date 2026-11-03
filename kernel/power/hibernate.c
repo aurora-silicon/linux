@@ -15,6 +15,7 @@
 #include <linux/blkdev.h>
 #include <linux/export.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/device.h>
@@ -112,7 +113,8 @@ bool hibernation_available(void)
 	return nohibernate == 0 &&
 		!security_locked_down(LOCKDOWN_HIBERNATION) &&
 		!secretmem_active() && !cxl_mem_active() &&
-		!of_machine_is_compatible("apple,arm-platform");
+		(!of_machine_is_compatible("apple,arm-platform") ||
+		 aura_hibernate_layout_fixed());
 }
 
 /**
