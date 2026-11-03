@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
@@ -15,6 +16,7 @@
 #define RING_SPAN 0x20000
 #define TX_BUFFER 0x600000
 #define BUFFER_SIZE 2048
+#define REPLY_SIZE (BUFFER_SIZE - 24)
 
 #define DATA_RX_BUFFER SZ_16M
 #define DATA_TX_BUFFER (SZ_16M + SZ_8M)
@@ -46,9 +48,11 @@ struct centauri_wifi {
 	u16 main_head, command_head, sequence;
 	u32 rx_seen[5];
 	u16 rx_next[5], rx_head[5];
-	u16 reply_sequence, reply_status;
+	u16 reply_sequence, reply_status, reply_capture;
 	u32 reply_command, channels_seen, scans_done, beacons_seen;
 	bool reply_valid, registered, configured;
+	u8 *reply_buffer;
+	size_t reply_capacity, reply_size;
 	bool stopping, command_failed;
 	bool scan_abort, connect_abort;
 	u8 scan_sequence;
@@ -69,12 +73,14 @@ struct centauri_wifi {
 	bool station_signal_valid;
 	unsigned long station_signal_at, connected_at;
 	struct net_device_stats station_start;
-	u8 country[3];
-	bool country_valid;
 	u32 data_rings_open;
 	bool data_failed;
 	struct ieee80211_supported_band bands[2];
 	struct ieee80211_channel channels[39];
+	/* The firmware's own reports, read at bring-up (system commands 19 and 8). */
+	u8 hw_channels[REPLY_SIZE], system_caps[REPLY_SIZE];
+	struct debugfs_blob_wrapper hw_channels_blob, system_caps_blob;
+	u8 link_status[REPLY_SIZE];
 };
 
 static int query_link_status(struct centauri_wifi *wifi);
@@ -462,9 +468,10 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		netif_wake_queue(wifi->netdev);
 }
 
+/* The interface status reply: 8 fixed bytes, then TLVs. */
 static bool link_signal_read(const u8 *packet, size_t size, s8 *signal)
 {
-	size_t pos = 32;
+	size_t pos = 8;
 
 	while (pos <= size && size - pos >= 4) {
 		u16 tag = get_unaligned_le16(packet + pos);
@@ -536,20 +543,12 @@ static void drain(struct centauri_wifi *wifi)
 				wifi->reply_status = status;
 
 				wifi->reply_command = wire_command;
-				if (command == 10) {
-					wifi->country_valid = !status &&
-							      size >= 27;
-					if (wifi->country_valid)
-						memcpy(wifi->country,
-						       packet + 24, 3);
-				}
-
-				if (command == 20 && !status) {
-					wifi->station_signal_valid =
-						link_signal_read(
-							packet, size,
-							&wifi->station_signal);
-					wifi->station_signal_at = jiffies;
+				if (wifi->reply_buffer &&
+				    sequence == wifi->reply_capture) {
+					wifi->reply_size = size - 24;
+					memcpy(wifi->reply_buffer, packet + 24,
+					       min(wifi->reply_size,
+						   wifi->reply_capacity));
 				}
 			}
 refill:
@@ -588,10 +587,17 @@ static bool command_payload_consumed(struct centauri_wifi *wifi, u16 slot)
 	return true;
 }
 
-static int command(struct centauri_wifi *wifi, u32 id, const void *payload,
-		   size_t size)
+/*
+ * Send one command and wait for its reply. With a reply buffer, the reply's
+ * payload is copied there (up to *reply_size bytes) and *reply_size becomes
+ * the payload's length.
+ */
+static int command_reply(struct centauri_wifi *wifi, u32 id,
+			 const void *payload, size_t size, void *reply,
+			 size_t *reply_size)
 {
 	u16 slot = wifi->command_head, sequence = ++wifi->sequence;
+	int ret;
 	u32 stage;
 	u8 *packet, *descriptor;
 	unsigned long deadline = jiffies + msecs_to_jiffies(1500);
@@ -618,13 +624,18 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload,
 	wifi->command_head = (slot + 1) % ring_size[1];
 	index_write(wifi, 3, 1, wifi->command_head);
 	wifi->reply_valid = false;
+	wifi->reply_buffer = reply;
+	wifi->reply_capacity = reply ? *reply_size : 0;
+	wifi->reply_capture = sequence;
+	wifi->reply_size = 0;
 	dma_wmb();
 	writel(1, wifi->a.bar + 0x1004);
 	do {
 		if (READ_ONCE(wifi->stopping) ||
 		    READ_ONCE(wifi->control->removing)) {
 			command_fault(wifi);
-			return -ECANCELED;
+			ret = -ECANCELED;
+			goto out;
 		}
 		drain(wifi);
 		stage = readl(wifi->a.bar + 8);
@@ -633,24 +644,38 @@ static int command(struct centauri_wifi *wifi, u32 id, const void *payload,
 				"Wi-Fi command %#x lost transport: stage=%#x sequence=%u rx=%u\n",
 				id, stage, sequence, wifi->rx_seen[2]);
 			command_fault(wifi);
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 
 		if (wifi->reply_valid && wifi->reply_sequence == sequence &&
 		    (wifi->reply_command & ~BIT(30)) == id) {
-			if (!wifi->reply_status)
-				return 0;
-			dev_dbg(&wifi->control->pdev->dev,
-				"Wi-Fi command %#x: firmware status %u\n", id,
-				wifi->reply_status);
-			return -EREMOTEIO;
+			ret = 0;
+			if (wifi->reply_status) {
+				dev_dbg(&wifi->control->pdev->dev,
+					"Wi-Fi command %#x: firmware status %u\n",
+					id, wifi->reply_status);
+				ret = -EREMOTEIO;
+			}
+			if (reply)
+				*reply_size = wifi->reply_size;
+			goto out;
 		}
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
 	dev_err(&wifi->control->pdev->dev,
 		"Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
 	command_fault(wifi);
-	return -ETIMEDOUT;
+	ret = -ETIMEDOUT;
+out:
+	wifi->reply_buffer = NULL;
+	return ret;
+}
+
+static int command(struct centauri_wifi *wifi, u32 id, const void *payload,
+		   size_t size)
+{
+	return command_reply(wifi, id, payload, size, NULL, NULL);
 }
 
 /* Caller holds wifi->lock; ret is what command() returned for the request. */
@@ -676,6 +701,46 @@ static int station_configure(struct centauri_wifi *wifi, const u8 *address)
 	if (!ret)
 		ret = command(wifi, 2, start, start_size);
 	return ret;
+}
+
+/*
+ * The firmware owns the radio's channel list and capabilities: system
+ * commands 19 (the channels the hardware supports) and 8 (the system
+ * capabilities) report them once the interface is configured. Kept as
+ * read, in debugfs.
+ */
+static void firmware_report(struct centauri_wifi *wifi, u32 id, u8 *buffer,
+			    struct debugfs_blob_wrapper *blob)
+{
+	size_t size = REPLY_SIZE;
+	int ret;
+
+	ret = command_reply(wifi, id, NULL, 0, buffer, &size);
+	if (ret) {
+		command_refused(wifi, id == 19 ? "channel list" : "capabilities",
+				ret);
+		size = 0;
+	} else if (size > REPLY_SIZE) {
+		dev_warn(&wifi->control->pdev->dev,
+			 "Wi-Fi command %u reply of %zu bytes truncated\n", id,
+			 size);
+		size = REPLY_SIZE;
+	}
+	blob->data = buffer;
+	blob->size = size;
+}
+
+static void firmware_reports(struct centauri_wifi *wifi)
+{
+	firmware_report(wifi, 19, wifi->hw_channels, &wifi->hw_channels_blob);
+	firmware_report(wifi, 8, wifi->system_caps, &wifi->system_caps_blob);
+	dev_info(&wifi->control->pdev->dev,
+		 "Wi-Fi firmware channel list: %lu bytes, capabilities: %lu bytes\n",
+		 wifi->hw_channels_blob.size, wifi->system_caps_blob.size);
+	debugfs_create_blob("hw_channels", 0400, wifi->wiphy->debugfsdir,
+			    &wifi->hw_channels_blob);
+	debugfs_create_blob("system_caps", 0400, wifi->wiphy->debugfsdir,
+			    &wifi->system_caps_blob);
 }
 
 static int radio_start(struct centauri_wifi *wifi)
@@ -704,8 +769,9 @@ static int radio_start(struct centauri_wifi *wifi)
 	if (ret)
 		return ret;
 	msleep(1000);
-	wifi->configured = true;
-	return 0;
+	firmware_reports(wifi);
+	wifi->configured = !wifi->command_failed;
+	return wifi->configured ? 0 : -EIO;
 }
 
 #define CEN_SCAN_CHANNELS_MAX 59
@@ -1669,7 +1735,19 @@ static int data_start(struct centauri_wifi *wifi)
 
 static int query_link_status(struct centauri_wifi *wifi)
 {
-	return wifi->configured ? command(wifi, 20, NULL, 0) : -ENETDOWN;
+	size_t size = sizeof(wifi->link_status);
+	int ret;
+
+	if (!wifi->configured)
+		return -ENETDOWN;
+	ret = command_reply(wifi, 20, NULL, 0, wifi->link_status, &size);
+	if (!ret)
+		wifi->station_signal_valid =
+			link_signal_read(wifi->link_status,
+					 min(size, sizeof(wifi->link_status)),
+					 &wifi->station_signal);
+	wifi->station_signal_at = jiffies;
+	return ret;
 }
 
 int centauri_wifi_register(struct centauri *c)
