@@ -243,6 +243,8 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 	err = isp_ipc_resync(isp);
 	if (err)
 		return err;
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
 
 	/* Clear what earlier commands and batches left in the reserved fields. */
 	memset(bl, 0, ISP_CMD_AREA_SIZE(isp_num_capmeta(isp)));

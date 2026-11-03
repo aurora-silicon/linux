@@ -396,6 +396,8 @@ struct apple_isp {
 	} fw;
 	/* changes under video_lock once the video device is registered */
 	enum isp_fw_state fw_state;
+	/* First IPC failure; cleared only after fresh channel initialization. */
+	int ipc_error;
 	/* the camera was detected; until then a deferred start is pending */
 	bool camera_detected;
 	/* configurations the firmware has, once a deferred start detected them */
