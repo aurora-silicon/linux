@@ -56,6 +56,7 @@
 #include <linux/limits.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
+#include <linux/syscore_ops.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/cputype.h>
 #include <asm/exception.h>
@@ -1083,6 +1084,46 @@ static void build_fiq_affinity(struct aic_irq_chip *ic, struct device_node *aff)
 	}
 }
 
+#ifdef CONFIG_HIBERNATION
+/*
+ * After a resume from disk the controller holds what the boot kernel left: its
+ * init masked every IRQ and it unmasked only the ones it used itself. The IRQ
+ * core disables lazily and unmasks only an IRQ it recorded as masked, so on
+ * its own it never unmasks the restored kernel's other IRQs again. Make every
+ * hardware mask match the restored descriptor: unmasked unless the core
+ * recorded it masked (a lazily disabled IRQ was unmasked in hardware when the
+ * image was taken), and masked when this kernel has no mapping for it. On the
+ * thaw path the masks already match and this rewrites the same values.
+ */
+static void aic_syscore_resume(void *data)
+{
+	struct aic_irq_chip *ic = data;
+	unsigned int die, i;
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++) {
+			irq_hw_number_t hwirq = AIC_IRQ_HWIRQ(die, i);
+			unsigned int virq = irq_find_mapping(ic->hw_domain, hwirq);
+			struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
+			u32 off = die * ic->info.die_stride;
+
+			if (d && !irqd_irq_masked(d))
+				aic_ic_write(ic, ic->info.mask_clr + off + MASK_REG(i), MASK_BIT(i));
+			else
+				aic_ic_write(ic, ic->info.mask_set + off + MASK_REG(i), MASK_BIT(i));
+		}
+	}
+}
+
+static const struct syscore_ops aic_syscore_ops = {
+	.resume = aic_syscore_resume,
+};
+
+static struct syscore aic_syscore = {
+	.ops = &aic_syscore_ops,
+};
+#endif
+
 static int __init aic_of_ic_init(struct device_node *node, struct device_node *parent)
 {
 	int i, die;
@@ -1235,6 +1276,11 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	}
 
 	vgic_set_kvm_info(&vgic_info);
+
+#ifdef CONFIG_HIBERNATION
+	aic_syscore.data = irqc;
+	register_syscore(&aic_syscore);
+#endif
 
 	pr_info("Initialized with %d/%d IRQs * %d/%d die(s), %d FIQs, %d vIPIs",
 		irqc->nr_irq, irqc->max_irq, irqc->nr_die, irqc->max_die, AIC_NR_FIQ, AIC_NR_SWIPI);
