@@ -1242,6 +1242,13 @@ void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 	dcp->swap_watchdog_retrains = 0;
 }
 
+/* A sink is attached: a Type-C route is claimed, or HDMI HPD is high. */
+bool dcp_external_has_sink(struct apple_dcp *dcp)
+{
+	return READ_ONCE(dcp->active_typec_route) ||
+	       (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0);
+}
+
 /*
  * The firmware reports that the DisplayPort sink stopped answering, or that
  * the link did not start.  On the external H17P display, the mode set
