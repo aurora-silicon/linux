@@ -57,6 +57,7 @@ static void put_unaligned_le32(u32 v,void *p){u8 *b=p;for(unsigned i=0;i<4;i++)b
 #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
 #define msecs_to_jiffies(x) (x)
+#define ktime_get_boottime_ns() 0ULL
 #define dev_dbg(...) ((void)0)
 static bool command_locked=true;
 #define mutex_unlock(l) do {assert(command_locked);command_locked=false;} while(0)
@@ -70,7 +71,7 @@ struct mt7932 {
  bool scan_aborted,disconnecting,connected,scan_finished,rf_ready;
  bool connect_cancelled,discovering,discovery_finished,link_failed;
  u8 scan_home_channel; enum nl80211_band scan_home_band;
- u64 six_legacy_channels;
+ u64 six_legacy_channels, connect_heard_since;
  unsigned connect_akm; int connect_error;
  struct ieee80211_supported_band band2,band5,band6;
  struct ieee80211_channel *connect_channel_req;
