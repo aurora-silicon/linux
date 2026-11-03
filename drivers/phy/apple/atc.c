@@ -5343,6 +5343,27 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
+	/*
+	 * T8132 runs no DisplayPort-only lanes, and DisplayPort beside USB3
+	 * only with its calibration. A partner that enters DP Alt Mode keeps
+	 * its USB on the other wires: USB2 next to four DP lanes (pin
+	 * assignments C and E), USB3 next to two (D). Serve that USB rather
+	 * than refuse the mode, which would leave the port without USB at all.
+	 */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
+		enum atcphy_mode usb_mode = target_mode;
+
+		if (target_mode == APPLE_ATCPHY_MODE_DP)
+			usb_mode = APPLE_ATCPHY_MODE_USB2;
+		else if (target_mode == APPLE_ATCPHY_MODE_USB3_DP && !atcphy->tunables.usb3_dp)
+			usb_mode = APPLE_ATCPHY_MODE_USB3;
+		if (usb_mode != target_mode) {
+			dev_warn(atcphy->dev,
+				 "DisplayPort is not available on this port: serving its USB only\n");
+			target_mode = usb_mode;
+		}
+	}
+
 	if (atcphy->hw->usb2_only &&
 	    (!atcphy->t8132_ss || !atcphy->ss_tunables) &&
 	    (target_mode == APPLE_ATCPHY_MODE_USB3 || target_mode == APPLE_ATCPHY_MODE_USB3_DP))
