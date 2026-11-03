@@ -230,7 +230,7 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 	struct isp_format *fmt = isp_get_current_format(isp);
 	struct isp_channel *chan = isp->chan_bh;
 	struct isp_message *req = &chan->req;
-	struct isp_buffer *buf, *tmp;
+	struct isp_buffer *buf;
 	unsigned int num_rendered = 0, num_buffers = 0;
 	unsigned long flags;
 	size_t offset;
@@ -325,10 +325,6 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 send:
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
-	/*
-	 * The firmware can write to the command area, so the error path below
-	 * goes by the count kept here rather than the one in the batch.
-	 */
 	bl->num_buffers = num_buffers;
 
 	req->arg0 = isp->cmd_iova;
@@ -337,49 +333,15 @@ send:
 	req->arg2 = ISP_IPC_BUFEXC_FLAG_COMMAND;
 
 	err = ipc_chan_send(isp, chan, ISP_BUFFER_TIMEOUT);
-	if (err) {
-		/*
-		 * The firmware may have taken the batch. Keep its leases owned
-		 * until the timeout is resolved, see apple_isp_stop_camera().
-		 */
-		if (isp_is_p010(isp))
-			return err;
-		/* If we fail, consider the buffer not submitted. */
-		dev_err(isp->dev,
-			"%s: failed to send bufs: [0x%llx, 0x%llx, 0x%llx]\n",
-			chan->name, req->arg0, req->arg1, req->arg2);
-
-		/*
-		 * Try to find the buffer in the list, and if it's
-		 * still there, move it back to the pending list.
-		 */
-		spin_lock_irqsave(&isp->buf_lock, flags);
-
-		bufd = &bl->buffers[0];
-		for (unsigned int i = 0; i < num_buffers; i++, bufd++) {
-			list_for_each_entry_safe_reverse(
-				buf, tmp, &isp->bufs_submitted, link) {
-				if (bufd->iovas[0] == buf->surfs[0].iova) {
-					list_move_tail(&buf->link,
-						       &isp->bufs_pending);
-				}
-			}
-			for (int j = 0; j < isp_num_meta(isp); j++) {
-				struct isp_surf *meta = isp->meta_surfs[j];
-				if (bufd->iovas[0] == meta->iova) {
-					meta->submitted = false;
-				}
-			}
-			for (int j = 0; j < isp_num_capmeta(isp); j++) {
-				struct isp_surf *meta = isp->capmeta_surfs[j];
-
-				if (bufd->iovas[0] == meta->iova)
-					meta->submitted = false;
-			}
-		}
-
-		spin_unlock_irqrestore(&isp->buf_lock, flags);
-	}
+	/*
+	 * The host lists and submitted flags are the ownership record. Once
+	 * published, the batch may be consumed even if its ACK never arrives.
+	 * Keep all outstanding buffers until return or coprocessor shutdown;
+	 * never recover their identity from the firmware-writable batch.
+	 */
+	if (err)
+		dev_err(isp->dev, "%s: failed to send buffers: %d\n",
+			chan->name, err);
 
 	return err;
 }
@@ -533,19 +495,16 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	}
 
 	/*
-	 * The channel's pools are configured again for every stream, by
-	 * resident firmware that kept running or by firmware that started
-	 * afresh. Metadata buffers still marked as submitted to the previous
-	 * pools, or to firmware that stopped, would never reach the new ones.
+	 * The channel's pools are configured again for every stream after
+	 * either a fresh boot or a successful resident stop. Metadata buffers still marked
+	 * as submitted to the previous pools would never reach the new ones.
 	 */
-	if (isp->hw->resident_fw || isp->hw->fw_restore) {
-		spin_lock_irqsave(&isp->buf_lock, flags);
-		for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
-			isp->meta_surfs[i]->submitted = false;
-		for (int i = 0; i < isp_num_capmeta(isp); i++)
-			isp->capmeta_surfs[i]->submitted = false;
-		spin_unlock_irqrestore(&isp->buf_lock, flags);
-	}
+	spin_lock_irqsave(&isp->buf_lock, flags);
+	for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
+		isp->meta_surfs[i]->submitted = false;
+	for (int i = 0; i < isp_num_capmeta(isp); i++)
+		isp->capmeta_surfs[i]->submitted = false;
+	spin_unlock_irqrestore(&isp->buf_lock, flags);
 
 	err = isp_submit_buffers(isp, true);
 	if (err) {
