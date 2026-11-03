@@ -38,8 +38,8 @@ properties:
 
   apple,port-index:
     $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [1, 2]
-    description: Native Type-C port; the debug/proxy port is excluded
+    enum: [1, 2, 3, 4, 5]
+    description: Type-C port; the debug port (0) is excluded
 
   apple,guest-port-reserved:
     type: boolean
