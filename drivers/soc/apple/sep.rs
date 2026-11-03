@@ -419,6 +419,13 @@ static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_UNFILED != ENROL_STATUS_TOO_MANY);
 
 const ENROL_STATUS_RETRY: u32 = 5;
+// 7 is SEP_BIO_STATUS_REJECTED in libfprint's aurora driver.
+// The enclave stopped matching after too many failed attempts. Only a
+// password authentication, through /dev/sep-bio-rearm, makes it match again.
+const ENROL_STATUS_LOCKOUT: u32 = 8;
+static_assert!(ENROL_STATUS_LOCKOUT != ENROL_STATUS_UNFILED);
+static_assert!(ENROL_STATUS_LOCKOUT != ENROL_STATUS_RETRY);
+static_assert!(ENROL_STATUS_LOCKOUT != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_TIMEOUT);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_ENCLAVE);
 static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);
@@ -721,6 +728,22 @@ struct SepData {
     #[pin]
     bio_dev: Mutex<Option<shim::BioChardev>>,
 
+    // /dev/sep-bio-rearm: reports the Touch ID lockout and clears it after a
+    // password authentication.
+    #[pin]
+    rearm_dev: Mutex<Option<shim::BioChardev>>,
+
+    // The enclave refused to match (MATCH_RESULT answered 0x1) after failed
+    // attempts, or the lockout survived a restart. Every verify is refused
+    // without a capture until a password authentication re-arms Touch ID.
+    bio_lockout: Atomic<bool>,
+
+    // The refusal of a verify during a lockout has been logged.
+    bio_lockout_logged: Atomic<bool>,
+
+    // Failed matches since the last match or re-arm, for the log.
+    bio_nomatch_streak: Atomic<u32>,
+
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
 
@@ -963,6 +986,10 @@ impl SepData {
                 bio_session <- new_mutex!(bio::Session::new()),
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
+                rearm_dev <- new_mutex!(None),
+                bio_lockout: Atomic::new(false),
+                bio_lockout_logged: Atomic::new(false),
+                bio_nomatch_streak: Atomic::new(0),
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
@@ -2377,6 +2404,8 @@ impl SepData {
 
         let dev = self.bio_dev.lock().take();
         drop(dev);
+        let dev = self.rearm_dev.lock().take();
+        drop(dev);
 
         self.rng_shutdown.store(true, Relaxed);
         self.control_wq.notify_all();
@@ -2502,6 +2531,36 @@ unsafe extern "C" fn bio_ready_trampoline(ctx: *mut c_void) -> c_int {
     // SAFETY: per the contract above.
     let this = unsafe { &*ctx.cast::<SepData>() };
     c_int::from(this.bio_ready())
+}
+
+// /dev/sep-bio-rearm has no session: any number of root openers, no poll.
+
+/// # Safety
+unsafe extern "C" fn rearm_open_trampoline(ctx: *mut c_void) -> c_int {
+    // SAFETY: per the contract above.
+    let this = unsafe { &*ctx.cast::<SepData>() };
+    if this.shutting_down.load(Relaxed) {
+        return ENODEV.to_errno();
+    }
+    0
+}
+
+/// # Safety
+unsafe extern "C" fn rearm_release_trampoline(_ctx: *mut c_void) {}
+
+/// # Safety
+unsafe extern "C" fn rearm_ioctl_trampoline(ctx: *mut c_void, cmd: c_uint, arg: c_ulong) -> c_long {
+    // SAFETY: per the contract above.
+    let this = unsafe { &*ctx.cast::<SepData>() };
+    match this.rearm_ioctl(cmd, arg) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno() as c_long,
+    }
+}
+
+/// # Safety
+unsafe extern "C" fn rearm_ready_trampoline(_ctx: *mut c_void) -> c_int {
+    0
 }
 
 /// # Safety

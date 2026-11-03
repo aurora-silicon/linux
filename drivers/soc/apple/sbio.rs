@@ -10,6 +10,56 @@ use crate::sks::SKS_AUTH_TOKEN_LEN;
 use kernel::prelude::*;
 use kernel::soc::apple::mailbox::Message;
 
+enum MatchStep {
+    Answer(KVec<u8>),
+    // 0x1: the match credential no longer holds; see `enter_lockout`.
+    LockedOut,
+    Refused,
+}
+
+/// The Touch ID lockout, kept across a restart. Labelled with the driver's
+/// other state files (aurora_sep_state_t).
+const LOCKOUT_RECORD: &CStr = c"/var/lib/aurora-sep-touchid-lockout.bin";
+const LOCKOUT_MAGIC: [u8; 8] = *b"SEPLOCK1";
+const LOCKOUT_RECORD_LEN: usize = 16;
+const LOCKOUT_LOCKED: u32 = 1;
+
+fn lockout_record(locked: bool) -> [u8; LOCKOUT_RECORD_LEN] {
+    let mut raw = [0u8; LOCKOUT_RECORD_LEN];
+    raw[..LOCKOUT_MAGIC.len()].copy_from_slice(&LOCKOUT_MAGIC);
+    let state = if locked { LOCKOUT_LOCKED } else { 0 };
+    raw[8..12].copy_from_slice(&state.to_le_bytes());
+    raw
+}
+
+fn lockout_record_locked(raw: &[u8; LOCKOUT_RECORD_LEN]) -> bool {
+    raw[..LOCKOUT_MAGIC.len()] == LOCKOUT_MAGIC
+        && u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) == LOCKOUT_LOCKED
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_touchid_lockout)]
+mod lockout_tests {
+    use super::*;
+
+    #[test]
+    fn record_round_trips() {
+        assert!(lockout_record_locked(&lockout_record(true)));
+        assert!(!lockout_record_locked(&lockout_record(false)));
+    }
+
+    #[test]
+    fn foreign_bytes_are_no_lockout() {
+        let mut raw = lockout_record(true);
+        raw[0] ^= 0xff;
+        assert!(!lockout_record_locked(&raw));
+        assert!(!lockout_record_locked(&[0u8; LOCKOUT_RECORD_LEN]));
+        let mut other = lockout_record(true);
+        other[8] = 2;
+        assert!(!lockout_record_locked(&other));
+    }
+}
+
 struct EnrolPrerequisites {
     lane: bool,
     live_count: Option<usize>,
@@ -1511,6 +1561,14 @@ impl SepData {
                 e
             );
         }
+        if let Err(e) = self.register_rearm() {
+            dev_err!(
+                self.dev,
+                "bringup: could not publish /dev/{}; a Touch ID lockout will last until a restart: {:?}\n",
+                bio::REARM_DEVICE_NAME,
+                e
+            );
+        }
     }
 
     fn activate_touchid(&self) -> Result<()> {
@@ -1610,6 +1668,7 @@ impl SepData {
         }
         self.probe_owner_export();
         self.refresh_match_credential();
+        self.restore_lockout_record();
         self.touchid_started.store(true, Relaxed);
         diag::touchid(true);
         Ok(())
@@ -1706,6 +1765,21 @@ impl SepData {
     }
 
     pub(crate) fn run_verify(&self) {
+        // A capture now would only be refused at MATCH_RESULT again, so do
+        // not ask the user to touch the sensor for it.
+        if self.bio_lockout.load(Relaxed) {
+            if !self.bio_lockout_logged.xchg(true, Relaxed) {
+                dev_info!(
+                    self.dev,
+                    "verify: Touch ID is locked after too many failed attempts; refusing without a capture until a password authentication re-arms it\n"
+                );
+            }
+            self.finish_verify(
+                bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT),
+                [0u8; bio::TOKEN_LEN],
+            );
+            return;
+        }
         self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
@@ -1744,6 +1818,13 @@ impl SepData {
         let _ = sensor::idle();
         sensor::power(false);
         self.note_capture_end();
+        match &outcome {
+            bio::VerifyOutcome::Matched(_) => self.bio_nomatch_streak.store(0, Relaxed),
+            bio::VerifyOutcome::NoMatch => {
+                self.bio_nomatch_streak.fetch_add(1, Relaxed);
+            }
+            bio::VerifyOutcome::Failed(_) => {}
+        }
 
         let definitive = matches!(
             &outcome,
@@ -1892,8 +1973,10 @@ impl SepData {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
         }
 
-        let Some(result) = self.sbio_verify_step(&crate::sbio::sbio_match_result()) else {
-            return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        let result = match self.sbio_match_step() {
+            MatchStep::Answer(result) => result,
+            MatchStep::LockedOut => return self.enter_lockout(),
+            MatchStep::Refused => return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
         };
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
             dev_err!(
@@ -3533,6 +3616,208 @@ impl SepData {
         if filed {
             self.bio_wake();
         }
+    }
+
+    /// MATCH_RESULT, with the lockout told apart from any other refusal.
+    fn sbio_match_step(&self) -> MatchStep {
+        let op = crate::sbio::sbio_match_result();
+        let done = match self.sbio_transfer(&op) {
+            Ok(done) => done,
+            Err(e) => {
+                dev_err!(self.dev, "verify: {} transfer failed ({:?})\n", op.name(), e);
+                return MatchStep::Refused;
+            }
+        };
+        match done.status.answered() {
+            Some(err) if err as u16 == crate::sbio::SBIO_STATUS_OK => MatchStep::Answer(done.payload),
+            Some(err) if err == u32::from(crate::sbio::SBIO_STATUS_PREREQUISITE) => {
+                MatchStep::LockedOut
+            }
+            _ => {
+                dev_err!(self.dev, "verify: {} answered status {}\n", op.name(), done.status);
+                MatchStep::Refused
+            }
+        }
+    }
+
+    // MATCH_RESULT answers 0x1 when the match credential no longer holds.
+    // After failed matches that is the enclave's lockout, which on macOS the
+    // passcode clears. The credential is set up again only after a password
+    // authentication, in `rearm_after_password`, never here: doing it on the
+    // enclave's refusal would undo the lockout.
+    fn enter_lockout(&self) -> bio::VerifyOutcome {
+        let failures = self.bio_nomatch_streak.load(Relaxed);
+        if failures > 0 {
+            dev_warn!(
+                self.dev,
+                "verify: the enclave stopped matching after {} failed attempts (MATCH_RESULT answered status 0x1); Touch ID is locked until a password authentication\n",
+                failures
+            );
+        } else {
+            dev_warn!(
+                self.dev,
+                "verify: MATCH_RESULT answered status 0x1 with no failed attempt since the last match; the match credential lapsed, and Touch ID is locked until a password authentication sets it up again\n"
+            );
+        }
+        self.bio_lockout.store(true, Relaxed);
+        self.bio_lockout_logged.store(true, Relaxed);
+        if !self.write_lockout_record(true) {
+            dev_warn!(
+                self.dev,
+                "verify: could not record the lockout in {}; it ends at the next restart\n",
+                LOCKOUT_RECORD
+            );
+        }
+        bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
+    }
+
+    /// Whether the record says Touch ID was locked. A missing or unreadable
+    /// record is no lockout: only root can remove it, and root can restart.
+    fn read_lockout_record(&self) -> bool {
+        let Ok(file) = shim::StoreFile::open_readonly(LOCKOUT_RECORD) else {
+            return false;
+        };
+        if file.size().ok() != Some(LOCKOUT_RECORD_LEN as u64) {
+            return false;
+        }
+        let mut raw = [0u8; LOCKOUT_RECORD_LEN];
+        if file.read_exact(0, &mut raw).is_err() {
+            return false;
+        }
+        lockout_record_locked(&raw)
+    }
+
+    fn write_lockout_record(&self, locked: bool) -> bool {
+        let Ok(file) = shim::StoreFile::open_trunc(LOCKOUT_RECORD) else {
+            return false;
+        };
+        file.write_all(0, &lockout_record(locked)).is_ok() && file.sync().is_ok()
+    }
+
+    // macOS asks for the passcode after a restart before Touch ID works
+    // again. Here Touch ID may unlock the login screen, so a lockout has to
+    // outlast the restart instead, or restarting would reset the attempts.
+    fn restore_lockout_record(&self) {
+        if self.read_lockout_record() {
+            self.bio_lockout.store(true, Relaxed);
+            dev_info!(
+                self.dev,
+                "Touch ID: the lockout from before the restart still holds; a password authentication re-arms it\n"
+            );
+        }
+    }
+
+    pub(crate) fn register_rearm(&self) -> Result<()> {
+        let mut guard = self.rearm_dev.lock();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let ctx = core::ptr::from_ref(self).cast_mut().cast::<c_void>();
+        // SAFETY: as in `register_bio`: `remove()` drops the registration
+        // before the `Arc` that keeps `ctx` alive, and the shim's unregister
+        // clears the stored context under the lock every callback takes.
+        let dev = unsafe {
+            shim::BioChardev::register(
+                bio::REARM_DEVICE_NAME,
+                bio::REARM_DEVICE_MODE,
+                ctx,
+                rearm_open_trampoline,
+                rearm_release_trampoline,
+                rearm_ioctl_trampoline,
+                rearm_ready_trampoline,
+            )
+        }?;
+        *guard = Some(dev);
+        Ok(())
+    }
+
+    pub(crate) fn rearm_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        match cmd {
+            bio::IOC_LOCKOUT_STATE => {
+                let locked = if self.touchid_started.load(Relaxed) {
+                    self.bio_lockout.load(Relaxed)
+                } else {
+                    self.read_lockout_record()
+                };
+                let state = bio::Lockout::new(locked, self.bio_nomatch_streak.load(Relaxed));
+                kernel::uaccess::UserSlice::new(
+                    kernel::uaccess::UserPtr::from_addr(arg),
+                    core::mem::size_of::<bio::Lockout>(),
+                )
+                .writer()
+                .write(&state)
+            }
+            bio::IOC_REARM => {
+                bio::require_admin()?;
+                self.rearm_after_password()
+            }
+            _ => Err(ENOTTY),
+        }
+    }
+
+    /// Userspace calls this only after the user's password was verified. The
+    /// node is root's alone and its SELinux label confines it to the re-arm
+    /// helper. As on macOS, where the passcode clears the lockout, the
+    /// enclave is shown the secret again: SKS verifies the stored keybag
+    /// secret into a new SCRD match context.
+    fn rearm_after_password(&self) -> Result<()> {
+        if !self.touchid_started.load(Relaxed) {
+            // Activation sets up a fresh match credential; only the record of
+            // a lockout from before the restart is left to clear.
+            if self.read_lockout_record() {
+                if !self.write_lockout_record(false) {
+                    dev_err!(self.dev, "Touch ID: could not clear the recorded lockout\n");
+                    return Err(EIO);
+                }
+                dev_info!(
+                    self.dev,
+                    "Touch ID: re-armed after a password authentication; cleared the lockout recorded before the restart\n"
+                );
+            }
+            return Ok(());
+        }
+        let user = crate::sbio::UserId::new(SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
+        // Under the same lock as verify, enrolment and deletion, so the
+        // credential never changes under a match.
+        let rearmed = loop {
+            self.wait_until_awake()?;
+            let _writer = self.catacomb_writer.lock();
+            if !self.bio_lockout.load(Relaxed) {
+                return Ok(());
+            }
+            if !self.capture_begin() {
+                continue;
+            }
+            let established = self.establish_scrd_match_context(user);
+            if established {
+                self.bio_nomatch_streak.store(0, Relaxed);
+                self.bio_lockout_logged.store(false, Relaxed);
+                self.bio_lockout.store(false, Relaxed);
+            }
+            self.capture_end();
+            break established;
+        };
+        if !rearmed {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arming after a password authentication failed; the match credential did not set up again, and Touch ID stays locked\n"
+            );
+            return Err(EIO);
+        }
+        if !self.write_lockout_record(false) {
+            dev_warn!(
+                self.dev,
+                "Touch ID: could not clear the recorded lockout; the next restart will ask for the password again\n"
+            );
+        }
+        dev_info!(
+            self.dev,
+            "Touch ID: re-armed after a password authentication; the enclave accepts matches again\n"
+        );
+        Ok(())
     }
 
     fn mint_token_bytes(&self) -> Option<[u8; bio::TOKEN_LEN]> {

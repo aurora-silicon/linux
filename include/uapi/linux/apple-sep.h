@@ -148,4 +148,27 @@ struct sep_bio_attest {
  */
 #define SEP_BIO_PREPARE_ENROL _IOW(SEP_BIO_IOC_MAGIC, 0x0d, struct sep_bio_enrol_start)
 
+/*
+ * A verify poll's 'status' when the enclave has stopped matching after too
+ * many failed attempts. Every verify then fails at once, without a capture,
+ * until a password authentication re-arms Touch ID through SEP_BIO_REARM.
+ * The lockout outlasts a restart.
+ */
+#define SEP_BIO_STATUS_LOCKOUT 8
+
+/* /dev/sep-bio-rearm, which any number of root callers may open. */
+struct sep_bio_lockout {
+	__u32 locked;    /* 1 while every verify is refused */
+	__u32 failures;  /* failed matches since the last match or re-arm */
+	__u32 reserved[2];
+};
+
+#define SEP_BIO_LOCKOUT_STATE _IOR(SEP_BIO_IOC_MAGIC, 0x0e, struct sep_bio_lockout)
+/*
+ * Ends a lockout. Call it only once the user's password has been verified:
+ * it shows the enclave the stored keybag secret, as macOS does with the
+ * passcode. Needs CAP_SYS_ADMIN. Without a lockout it does nothing.
+ */
+#define SEP_BIO_REARM         _IO(SEP_BIO_IOC_MAGIC, 0x0f)
+
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

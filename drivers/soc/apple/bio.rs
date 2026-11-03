@@ -22,6 +22,11 @@ const SEP_USER_CAPACITY: usize = 3;
 pub(crate) const DEVICE_NAME: &CStr = c"sep-bio";
 pub(crate) const DEVICE_MODE: u16 = 0o600;
 
+/// The Touch ID lockout's own node. fprintd holds `/dev/sep-bio` open, so
+/// a password authentication cannot reach the lockout through that node.
+pub(crate) const REARM_DEVICE_NAME: &CStr = c"sep-bio-rearm";
+pub(crate) const REARM_DEVICE_MODE: u16 = 0o600;
+
 #[derive(Clone, Copy, Default)]
 #[repr(u32)]
 enum State {
@@ -183,6 +188,27 @@ pub(crate) struct Attest {
     pub(crate) reserved: [u8; 3],
 }
 
+/// The Touch ID lockout, as `/dev/sep-bio-rearm` reports it.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct Lockout {
+    /// 1 while every verify is refused until a password authentication.
+    pub(crate) locked: u32,
+    /// Failed matches since the last match or re-arm.
+    pub(crate) failures: u32,
+    pub(crate) reserved: [u32; 2],
+}
+
+impl Lockout {
+    pub(crate) fn new(locked: bool, failures: u32) -> Lockout {
+        Lockout {
+            locked: u32::from(locked),
+            failures,
+            reserved: [0; 2],
+        }
+    }
+}
+
 // Sizes are baked into the ioctl numbers.
 static_assert!(core::mem::size_of::<Identity>() == 144);
 static_assert!(core::mem::size_of::<Info>() == 32);
@@ -194,6 +220,7 @@ static_assert!(core::mem::size_of::<VerifyStart>() == 40);
 static_assert!(core::mem::size_of::<VerifyPoll>() == 72);
 static_assert!(core::mem::size_of::<Delete>() == 16);
 static_assert!(core::mem::size_of::<Attest>() == 176);
+static_assert!(core::mem::size_of::<Lockout>() == 16);
 
 macro_rules! ioctl_pod {
     (to_user: $($t:ty),*; from_user: $($u:ty),*) => {
@@ -208,7 +235,7 @@ macro_rules! ioctl_pod {
     };
 }
 ioctl_pod! {
-    to_user: Info, List, EnclaveList, EnrolPoll, VerifyPoll, Attest;
+    to_user: Info, List, EnclaveList, EnrolPoll, VerifyPoll, Attest, Lockout;
     from_user: EnrolStart, VerifyStart, Delete, Attest
 }
 
@@ -227,6 +254,9 @@ pub(crate) const IOC_ATTEST: u32 = _IOWR::<Attest>(MAGIC, 0x0a);
 pub(crate) const IOC_LIST_ENCLAVE: u32 = _IOR::<EnclaveList>(MAGIC, 0x0b);
 pub(crate) const IOC_DELETE_ORPHAN: u32 = _IOW::<Delete>(MAGIC, 0x0c);
 pub(crate) const IOC_PREPARE_ENROL: u32 = _IOW::<EnrolStart>(MAGIC, 0x0d);
+// On /dev/sep-bio-rearm only.
+pub(crate) const IOC_LOCKOUT_STATE: u32 = _IOR::<Lockout>(MAGIC, 0x0e);
+pub(crate) const IOC_REARM: u32 = _IO(MAGIC, 0x0f);
 
 pub(crate) struct MatchEvidence {
     identity: [u8; UUID_LEN],
