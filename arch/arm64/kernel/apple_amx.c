@@ -32,6 +32,7 @@
 #include <asm/ptrace.h>
 #include <asm/sigcontext.h>
 #include <asm/sysreg.h>
+#include <asm/virt.h>
 
 /* 8 X and 8 Y registers and 64 Z rows, 64 bytes each */
 #define AMX_X_OFF	0
@@ -42,6 +43,7 @@
 struct apple_amx_state {
 	u8 regs[AMX_REGS_SIZE] __aligned(128);
 	bool live;		/* regs holds a SET register file */
+	bool parked;		/* a KVM guest borrowed the CPU (VMM thread) */
 };
 
 static struct kmem_cache *apple_amx_cache __ro_after_init;
@@ -383,6 +385,120 @@ int apple_amx_regset_set(struct task_struct *t, const struct user_apple_amx *u)
 	memcpy(st->regs, u->regs, sizeof(st->regs));
 	st->live = u->flags & USER_APPLE_AMX_SET;
 	return 0;
+}
+
+/*
+ * KVM guests. With the guest's AMX_CTL_EL1 in the EL1 copy and EN_EL1 in the
+ * EL2 copy, AMX works at guest EL1 and EL0, and a guest's AMX instruction
+ * with its own EN clear traps to the guest's EL1. The register file is the
+ * CPU's, so vcpu_load/vcpu_put move it like a context switch does, and park
+ * the VMM thread's own SET file meanwhile. Kernel AMX accesses need EN.
+ */
+static u64 amx_kernel_begin(void)
+{
+	u64 ctl = read_sysreg_s(SYS_IMP_APL_AMX_CTL_EL1);
+
+	if (!(ctl & AMX_CTL_APPLE_EN)) {
+		write_sysreg_s(ctl | AMX_CTL_APPLE_EN, SYS_IMP_APL_AMX_CTL_EL1);
+		isb();
+	}
+	return ctl;
+}
+
+static void amx_kernel_end(u64 ctl)
+{
+	write_sysreg_s(ctl, SYS_IMP_APL_AMX_CTL_EL1);
+	isb();
+}
+
+struct apple_amx_state *apple_amx_vcpu_alloc(void)
+{
+	if (!apple_amx_usable() || !is_kernel_in_hyp_mode())
+		return NULL;
+	return kmem_cache_zalloc(apple_amx_cache, GFP_KERNEL_ACCOUNT);
+}
+
+void apple_amx_vcpu_free(struct apple_amx_state *guest)
+{
+	if (guest)
+		kmem_cache_free(apple_amx_cache, guest);
+}
+
+void apple_amx_vcpu_reset(struct apple_amx_state *guest)
+{
+	if (guest)
+		guest->live = false;
+}
+
+/* Called with preemption disabled */
+void apple_amx_vcpu_load(struct apple_amx_state *guest, u64 guest_ctl)
+{
+	struct apple_amx_state *host = current->thread.amx;
+	u64 ctl;
+
+	if (!guest)
+		return;
+
+	ctl = amx_kernel_begin();
+	if (host && !host->parked && amx_active()) {
+		amx_save(host);
+		amx_clr();
+		host->parked = true;
+	}
+
+	write_sysreg_s(guest_ctl & AMX_CTL_APPLE_GUEST_BITS,
+		       SYS_IMP_APL_AMX_CTL_EL12);
+	if (guest->live) {
+		amx_set();
+		amx_load(guest);
+	}
+	amx_kernel_end(ctl | AMX_CTL_APPLE_EN_EL1);
+}
+
+/* Called with preemption disabled */
+void apple_amx_vcpu_put(struct apple_amx_state *guest)
+{
+	struct apple_amx_state *host = current->thread.amx;
+	u64 ctl;
+
+	if (!guest)
+		return;
+
+	ctl = amx_kernel_begin();
+	guest->live = amx_active();
+	if (guest->live) {
+		amx_save(guest);
+		amx_clr();
+	}
+
+	if (host && host->parked) {
+		amx_set();
+		amx_load(host);
+		host->parked = false;
+	}
+	amx_kernel_end(ctl & ~AMX_CTL_APPLE_EN_EL1);
+}
+
+/*
+ * The loaded guest wrote its AMX_CTL_EL1. Only the control changes: its
+ * register file is live on the CPU and must not be reloaded.
+ */
+void apple_amx_vcpu_set_ctl(struct apple_amx_state *guest, u64 guest_ctl)
+{
+	if (!guest)
+		return;
+
+	write_sysreg_s(guest_ctl & AMX_CTL_APPLE_GUEST_BITS,
+		       SYS_IMP_APL_AMX_CTL_EL12);
+	isb();
+}
+
+/* The guest's AMX_STATE_T: the CPU's while the vCPU is loaded */
+bool apple_amx_vcpu_active(struct apple_amx_state *guest, bool loaded)
+{
+	if (loaded)
+		return amx_active();
+	return guest && guest->live;
 }
 
 int apple_amx_get(void)

@@ -387,6 +387,9 @@ enum {
 /* Vendor hyper call function numbers 64-127 */
 #define KVM_REG_ARM_VENDOR_HYP_BMAP_2		KVM_REG_ARM_FW_FEAT_BMAP_REG(3)
 
+/* Aurora: KVM gives the guest Apple AMX (function 93) */
+#define KVM_REG_ARM_VENDOR_HYP_BIT_AURORA_APPLE_AMX	29
+
 enum {
 	KVM_REG_ARM_VENDOR_HYP_BIT_DISCOVER_IMPL_VER	= 0,
 	KVM_REG_ARM_VENDOR_HYP_BIT_DISCOVER_IMPL_CPUS	= 1,

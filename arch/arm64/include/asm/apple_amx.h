@@ -17,6 +17,11 @@
 #define AMX_CTL_APPLE_EN		BIT_ULL(63)
 /* SET while already SET faults (m1n1 leaves it set); a guest owns its copy */
 #define AMX_CTL_APPLE_SET_FAULT		BIT_ULL(8)
+#define AMX_CTL_APPLE_GUEST_BITS	(AMX_CTL_APPLE_EN | AMX_CTL_APPLE_SET_FAULT)
+/* In the EL2 copy: let EL1 (a guest kernel) use AMX as its own copy allows */
+#define AMX_CTL_APPLE_EN_EL1		BIT_ULL(62)
+/* The EL1 copy, from EL2 with HCR_EL2.E2H set */
+#define SYS_IMP_APL_AMX_CTL_EL12	sys_reg(3, 4, 15, 4, 6)
 
 /* Bit 0 is set on this CPU between the AMX SET and CLR instructions */
 #define SYS_IMP_APL_AMX_STATE_T		sys_reg(3, 4, 15, 1, 3)
@@ -46,10 +51,24 @@ int apple_amx_get(void);
 bool apple_amx_signal_needed(void);
 int apple_amx_preserve(struct apple_amx_context __user *ctx);
 int apple_amx_restore(struct apple_amx_context __user *ctx, u32 size);
+struct apple_amx_state *apple_amx_vcpu_alloc(void);
+void apple_amx_vcpu_free(struct apple_amx_state *guest);
+void apple_amx_vcpu_reset(struct apple_amx_state *guest);
+void apple_amx_vcpu_load(struct apple_amx_state *guest, u64 guest_ctl);
+void apple_amx_vcpu_put(struct apple_amx_state *guest);
+void apple_amx_vcpu_set_ctl(struct apple_amx_state *guest, u64 guest_ctl);
+bool apple_amx_vcpu_active(struct apple_amx_state *guest, bool loaded);
 bool apple_amx_regset_active(struct task_struct *t);
 int apple_amx_regset_get(struct task_struct *t, struct user_apple_amx *u);
 int apple_amx_regset_set(struct task_struct *t, const struct user_apple_amx *u);
 #else
+static inline struct apple_amx_state *apple_amx_vcpu_alloc(void) { return NULL; }
+static inline void apple_amx_vcpu_free(struct apple_amx_state *guest) { }
+static inline void apple_amx_vcpu_reset(struct apple_amx_state *guest) { }
+static inline void apple_amx_vcpu_load(struct apple_amx_state *guest, u64 guest_ctl) { }
+static inline void apple_amx_vcpu_put(struct apple_amx_state *guest) { }
+static inline void apple_amx_vcpu_set_ctl(struct apple_amx_state *guest, u64 guest_ctl) { }
+static inline bool apple_amx_vcpu_active(struct apple_amx_state *guest, bool loaded) { return false; }
 static inline bool apple_amx_signal_needed(void) { return false; }
 static inline int apple_amx_preserve(struct apple_amx_context __user *ctx) { return -EINVAL; }
 static inline int apple_amx_restore(struct apple_amx_context __user *ctx, u32 size) { return -EINVAL; }
