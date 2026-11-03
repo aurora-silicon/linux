@@ -24,7 +24,7 @@
 
 /*
  * DISPEXT1_SYS sits on FAB7_SOC (ADT pmgr device id2 134, pmgr_aux 0x488, parent
- * FAB6_SOC, off at boot), which t6040-pmgr.dtsi does not describe. m4.62 enabled
+ * FAB6_SOC, off at boot), which t604x-pmgr.dtsi does not describe. m4.62 enabled
  * DISPEXT1_SYS without it and the first DCPEXT1 register access (its DART) reset
  * the SoC. DISPEXT0_SYS's parent FAB2_SOC is on anyway through ATC0..2_COMMON.
  */
