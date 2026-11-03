@@ -12,6 +12,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/bitmap.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
 #include <linux/interrupt.h>
@@ -516,6 +517,53 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	return 0;
 }
 
+#ifdef CONFIG_HIBERNATION
+/*
+ * After a resume from disk the controller holds the boot kernel's masks and
+ * pending interrupts, not this kernel's: drop the pending ones and rewrite
+ * the masks from the cache the mask/unmask paths keep, notification IRQ
+ * included.
+ */
+static int apple_spmi_restore_noirq(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	if (spmi->irq < 0)
+		return 0;
+
+	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
+	/*
+	 * As at probe, drop what is latched: interrupts the boot kernel left
+	 * pending complete a register selection of a device restored now
+	 * before its own answer arrives. The devices read their state afresh.
+	 */
+	for (size_t offset = 0; offset < SPMI_NUM_IRQS / 8; offset += 4) {
+		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+	}
+	for (size_t offset = 0; offset < SPMI_NUM_IRQS / 8; offset += 4) {
+		u32 val = 0;
+
+		if (offset < SPMI_NUM_PERIPHERAL_IRQS / 8)
+			val = bitmap_read(spmi->irq_mask_cache, offset * 8, 32);
+		else if (spmi->notify_irq && offset == (SPMI_IRQ_NOTIFY / 32) * 4)
+			val = BIT(SPMI_IRQ_NOTIFY % 32);
+		writel(val, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+	}
+	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_spmi_pm_ops = {
+	.restore_noirq = apple_spmi_restore_noirq,
+};
+#define APPLE_SPMI_PM_OPS (&apple_spmi_pm_ops)
+#else
+#define APPLE_SPMI_PM_OPS NULL
+#endif
+
 static const struct of_device_id apple_spmi_match_table[] = {
 	{ .compatible = "apple,t8142-spmi", .data = &apple_spmi_gen4 },
 	{ .compatible = "apple,t8103-spmi", .data = &apple_spmi_gen1 },
@@ -529,6 +577,7 @@ static struct platform_driver apple_spmi_driver = {
 	.driver		= {
 		.name	= "apple-spmi",
 		.of_match_table = apple_spmi_match_table,
+		.pm	= APPLE_SPMI_PM_OPS,
 	},
 };
 module_platform_driver(apple_spmi_driver);

@@ -29,4 +29,6 @@ int apple_pmp_register(struct device *dev, const void *data);
 void apple_pmp_unregister(const void *data);
 int apple_pmp_send_power_command(const void *data, u8 command,
 				u16 device_id, u32 enabled);
+/* Rebuild the firmware session after a resume from disk (PM_POST_HIBERNATION). */
+int apple_pmp_restore(const void *data);
 #endif

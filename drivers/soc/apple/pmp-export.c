@@ -2,7 +2,9 @@
 #include <linux/device.h>
 #include <linux/export.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/pmp.h>
 #include <linux/soc/apple/pmp-report.h>
 
@@ -11,27 +13,68 @@ static DEFINE_MUTEX(pmp_lock);
 static const void *pmp_data;
 static struct device *pmp_device;
 
-int apple_pmp_register(struct device *dev, const void *data)
+/*
+ * After a hibernation restore the boot loader has cold-restarted the PMP
+ * (image resident in PMS_SRAM, ASC CPU halted) and nothing replays the
+ * probe-time bring-up, so the firmware stays down (the display gate and
+ * cpufreq both wait on a PMP that never reports running). The module cannot be
+ * reloaded (the power-vote bridge is retained until reboot), so rebuild the
+ * firmware session in place.
+ *
+ * The restored kernel resumes inside hibernate() with in_suspend == 0 and
+ * sends PM_POST_HIBERNATION, not PM_POST_RESTORE (that one only reaches the
+ * boot kernel when it fails to restore). PM_POST_HIBERNATION also ends an
+ * aborted hibernation, where the firmware never stopped: restore() reads the
+ * ASC CPU run bit and leaves a running firmware alone.
+ */
+static int apple_pmp_pm_notify(struct notifier_block *nb, unsigned long action,
+			       void *unused)
 {
-	int ret = 0;
-
+	if (action != PM_POST_HIBERNATION && action != PM_POST_RESTORE)
+		return NOTIFY_DONE;
+	/* Serialize against unregister in Drop, as the power-command path does. */
 	guard(mutex)(&pmp_lock);
 	if (pmp_data)
-		ret = -EBUSY;
-	else {
+		apple_pmp_restore(pmp_data);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block apple_pmp_pm_nb = {
+	.notifier_call = apple_pmp_pm_notify,
+	/* Ahead of every consumer's restore at priority 0 or below (ANE, DCP, GPU). */
+	.priority = 10,
+};
+
+int apple_pmp_register(struct device *dev, const void *data)
+{
+	scoped_guard(mutex, &pmp_lock) {
+		if (pmp_data)
+			return -EBUSY;
 		pmp_data = data;
 		pmp_device = dev;
 	}
-	return ret;
+	/*
+	 * Outside pmp_lock: the notifier chain's lock is taken around the
+	 * callback, which takes pmp_lock, so nesting them here would invert the
+	 * order. The callback re-checks pmp_data under the lock.
+	 */
+	register_pm_notifier(&apple_pmp_pm_nb);
+	return 0;
 }
 
 void apple_pmp_unregister(const void *data)
 {
-	guard(mutex)(&pmp_lock);
-	if (pmp_data == data) {
-		pmp_data = NULL;
-		pmp_device = NULL;
+	bool was_registered = false;
+
+	scoped_guard(mutex, &pmp_lock) {
+		if (pmp_data == data) {
+			pmp_data = NULL;
+			pmp_device = NULL;
+			was_registered = true;
+		}
 	}
+	if (was_registered)
+		unregister_pm_notifier(&apple_pmp_pm_nb);
 }
 
 int apple_pmp_link_device(struct device *consumer)

@@ -15,6 +15,7 @@
 #include <linux/pm.h>
 #include <linux/sched.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/utsname.h>
 
 #include <asm/barrier.h>
@@ -94,7 +95,7 @@ int pfn_is_nosave(unsigned long pfn)
 	unsigned long nosave_end_pfn = sym_to_pfn(&__nosave_end - 1);
 
 	return ((pfn >= nosave_begin_pfn) && (pfn <= nosave_end_pfn)) ||
-		crash_is_nosave(pfn);
+		crash_is_nosave(pfn) || aura_hibernate_pfn_nosave(pfn);
 }
 
 void notrace save_processor_state(void)

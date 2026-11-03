@@ -2254,6 +2254,9 @@ static void apple_nvme_free_rtkit(void *data)
 
 	apple_nvme_set_reset_ready(anv, false);
 	guard(mutex)(&anv->disable_lock);
+	/* A failed hibernation restore leaves no session behind. */
+	if (!anv->rtk)
+		return;
 	if (anv->hw->needs_ioq_registers)
 		apple_rtkit_free_retaining_buffers(anv->rtk);
 	else
@@ -2686,8 +2689,121 @@ static int apple_nvme_suspend(struct device *dev)
 	return ret;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_nvme_pm_ops, apple_nvme_suspend,
-				apple_nvme_resume);
+/*
+ * Hibernation restore on post-M4. The machine cold-booted since .freeze:
+ * the boot firmware restarted ANS, the boot stages kept it running, and the
+ * resume kernel adopted that session to read the image (its own queues, and
+ * its .freeze cleared CC.EN before jumping here). anv->rtk therefore
+ * describes a firmware instance that no longer exists, and the live session
+ * on the mailbox has never been adopted by this kernel. Unlike
+ * apple_nvme_can_adopt_rtkit(), accept a disabled controller: it was just
+ * disabled below, and RUN + BOOT_STATUS_OK + !CFS are what survive.
+ */
+static bool apple_nvme_can_adopt_restored_rtkit(struct apple_nvme *anv)
+{
+	u32 csts;
+
+	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+	      APPLE_ANS_COPROC_CPU_CONTROL_RUN) ||
+	    readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) != APPLE_ANS_BOOT_STATUS_OK)
+		return false;
+	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
+	if (csts & NVME_CSTS_CFS)
+		return false;
+	return !(readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE) &&
+	       !(csts & NVME_CSTS_RDY);
+}
+
+static int apple_nvme_restore_post_m4(struct apple_nvme *anv)
+{
+	struct apple_rtkit *rtk;
+	int ret;
+
+	guard(mutex)(&anv->disable_lock);
+	if (READ_ONCE(anv->quarantined))
+		return -EIO;
+	dev_dbg(anv->dev,
+		"hibernation restore: CPU_CONTROL=%#x BOOT_STATUS=%#x CC=%#x CSTS=%#x\n",
+		readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS),
+		readl(anv->mmio_nvme + NVME_REG_CC),
+		readl(anv->mmio_nvme + NVME_REG_CSTS));
+
+	/*
+	 * Stop the controller first: until CC.EN is clear the firmware may
+	 * still fetch from the resume kernel's queues, whose memory is now
+	 * this kernel's. This is the owned-session reset path.
+	 */
+	ret = apple_nvme_disable_locked(anv, false);
+	if (ret)
+		return ret;
+
+	/*
+	 * Our firmware instance ended with the power-off. No shutdown
+	 * handshake: the new instance would receive it. Shared buffers are
+	 * retained as in apple_nvme_free_rtkit().
+	 */
+	apple_nvme_set_reset_ready(anv, false);
+	apple_rtkit_free_retaining_buffers(anv->rtk);
+	anv->rtk = NULL;
+	anv->owns_rtkit = false;
+
+	if (!apple_nvme_can_adopt_restored_rtkit(anv)) {
+		dev_err(anv->dev, "hibernation restore: no adoptable ANS session\n");
+		apple_nvme_quarantine(anv, -EIO);
+		return -EIO;
+	}
+
+	/* Publish admission before the initializer enables mailbox RX. */
+	anv->inherited_rtkit = true;
+	rtk = apple_rtkit_init_adopted(anv->dev, anv, NULL, 0,
+				       &apple_nvme_rtkit_ops);
+	if (IS_ERR(rtk)) {
+		ret = PTR_ERR(rtk);
+		dev_err(anv->dev, "hibernation restore: RTKit init failed: %d\n", ret);
+		apple_nvme_quarantine(anv, ret);
+		return ret;
+	}
+	anv->rtk = rtk;
+	ret = apple_rtkit_adopt_running(rtk);
+	if (ret) {
+		dev_err(anv->dev, "hibernation restore: RTKit adoption failed: %d\n", ret);
+		apple_nvme_quarantine(anv, ret);
+		return ret;
+	}
+	/* Owned: reset_work takes the live-session path, as after s2idle. */
+	anv->owns_rtkit = true;
+	apple_nvme_set_reset_ready(anv, true);
+	dev_info(anv->dev,
+		 "hibernation restore: adopted the boot loader's ANS session\n");
+	return 0;
+}
+
+static int apple_nvme_restore(struct device *dev)
+{
+	struct apple_nvme *anv = dev_get_drvdata(dev);
+	int ret;
+
+	if (IS_ENABLED(CONFIG_HIBERNATION) && anv->hw->needs_ioq_registers) {
+		ret = apple_nvme_restore_post_m4(anv);
+		if (ret)
+			return ret;
+	}
+	return apple_nvme_resume(dev);
+}
+
+/*
+ * freeze and poweroff disable the controller and keep the session, like
+ * suspend; thaw (image not written) is a resume. Only restore differs.
+ */
+static const struct dev_pm_ops apple_nvme_pm_ops = {
+	.suspend = pm_sleep_ptr(apple_nvme_suspend),
+	.resume = pm_sleep_ptr(apple_nvme_resume),
+	.freeze = pm_sleep_ptr(apple_nvme_suspend),
+	.thaw = pm_sleep_ptr(apple_nvme_resume),
+	.poweroff = pm_sleep_ptr(apple_nvme_suspend),
+	.restore = pm_sleep_ptr(apple_nvme_restore),
+};
 
 static const struct apple_nvme_hw apple_nvme_t8015_hw = {
 	.has_lsq_nvmmu = false,

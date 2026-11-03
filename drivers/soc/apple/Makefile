@@ -32,6 +32,8 @@ DTC_FLAGS_t6030-gate-test := -Wno-interrupts_property -Wno-chosen_node_is_root \
 			     -Wno-avoid_unnecessary_addr_size
 DTC_FLAGS_t8122-gate-test := -Wno-interrupts_property -Wno-chosen_node_is_root
 
+obj-$(CONFIG_APPLE_AURA_HIBERNATE) += aura-hibernate.o
+
 obj-$(CONFIG_APPLE_TUNABLE) += apple-tunable.o
 apple-tunable-y = tunable.o
 
