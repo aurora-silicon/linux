@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/rtnetlink.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/cfg80211.h>
@@ -17,6 +19,8 @@
 #define TX_BUFFER 0x600000
 #define BUFFER_SIZE 2048
 #define REPLY_SIZE (BUFFER_SIZE - 24)
+/* The band plan: 2.4 GHz 1-14, 5 GHz 36-64, 100-144 and 149-177, 6 GHz 1-233. */
+#define CEN_CHANNELS (14 + 28 + 59)
 
 #define DATA_RX_BUFFER SZ_16M
 #define DATA_TX_BUFFER (SZ_16M + SZ_8M)
@@ -75,8 +79,9 @@ struct centauri_t6050_wifi {
 	struct net_device_stats station_start;
 	u32 data_rings_open;
 	bool data_failed;
-	struct ieee80211_supported_band bands[2];
-	struct ieee80211_channel channels[39];
+	struct ieee80211_supported_band bands[3];
+	struct ieee80211_channel channels[CEN_CHANNELS];
+	struct ieee80211_sband_iftype_data iftype_6ghz;
 	/* The firmware's own reports, read at bring-up (system commands 19 and 8). */
 	u8 hw_channels[REPLY_SIZE], system_caps[REPLY_SIZE];
 	struct debugfs_blob_wrapper hw_channels_blob, system_caps_blob;
@@ -87,9 +92,13 @@ static int query_link_status(struct centauri_t6050_wifi *wifi);
 
 static const u32 rx_buffer[5] = { 0, 0, 0x620000, 0x680000, 0x700000 };
 static const u16 ring_size[5] = { 0, 64, 192, 96, 192 };
-static const u16 five_ghz[] = {
-	36,  40,  44,  48,  52,	 56,  60,  64,	100, 104, 108, 112, 116,
-	120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+static const struct {
+	enum nl80211_band band;
+	u8 first, last, step;
+} band_plan[] = {
+	{ NL80211_BAND_2GHZ, 1, 14, 1 },    { NL80211_BAND_5GHZ, 36, 64, 4 },
+	{ NL80211_BAND_5GHZ, 100, 144, 4 }, { NL80211_BAND_5GHZ, 149, 177, 4 },
+	{ NL80211_BAND_6GHZ, 1, 233, 4 },
 };
 static struct ieee80211_rate rates[] = {
 	{ .bitrate = 10 },  { .bitrate = 20 },	{ .bitrate = 55 },
@@ -104,6 +113,21 @@ static const u32 cipher_suites[] = {
 	WLAN_CIPHER_SUITE_CCMP,
 	WLAN_CIPHER_SUITE_AES_CMAC,
 };
+
+/* The firmware's band numbers: 0 is 2.4 GHz, 1 is 5 GHz, 2 is 6 GHz. */
+static int firmware_band(enum nl80211_band band)
+{
+	switch (band) {
+	case NL80211_BAND_2GHZ:
+		return 0;
+	case NL80211_BAND_5GHZ:
+		return 1;
+	case NL80211_BAND_6GHZ:
+		return 2;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
 
 static u16 index_read(struct centauri_t6050_wifi *wifi, unsigned int array,
 		      unsigned int index)
@@ -196,7 +220,7 @@ static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 	struct cfg80211_bss *bss;
 	u16 frame_size;
 	int number = 0, frequency, signal;
-	enum nl80211_band band;
+	enum nl80211_band band = NL80211_BAND_2GHZ;
 
 	if (!wifi->registered || size < 0x60 + 36)
 		return;
@@ -211,12 +235,26 @@ static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 	     ie += 2 + ie[1]) {
 		if ((ie[0] == WLAN_EID_DS_PARAMS ||
 		     ie[0] == WLAN_EID_HT_OPERATION) &&
-		    ie[1])
+		    ie[1]) {
 			number = ie[2];
+			band = number <= 14 ? NL80211_BAND_2GHZ :
+					      NL80211_BAND_5GHZ;
+		} else if (ie[0] == WLAN_EID_EXTENSION && ie[1] > 1 &&
+			   ie[2] == WLAN_EID_EXT_HE_OPERATION &&
+			   ie[1] - 1 >= sizeof(struct ieee80211_he_operation) &&
+			   ie[1] >= ieee80211_he_oper_size(ie + 3)) {
+			/* 6 GHz beacons carry neither: the HE operation names the channel. */
+			const struct ieee80211_he_6ghz_oper *oper =
+				ieee80211_he_6ghz_oper((const void *)(ie + 3));
+
+			if (oper && !number) {
+				number = oper->primary;
+				band = NL80211_BAND_6GHZ;
+			}
+		}
 	}
 	if (!number)
 		return;
-	band = number <= 14 ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ;
 	frequency = ieee80211_channel_to_frequency(number, band);
 	channel = ieee80211_get_channel(wifi->wiphy, frequency);
 	if (!channel)
@@ -730,6 +768,137 @@ static void firmware_report(struct centauri_t6050_wifi *wifi, u32 id, u8 *buffer
 	blob->size = size;
 }
 
+/*
+ * The channel list: a count, then one 4-byte entry per channel the current
+ * country allows at each width: the channel number (the center channel for
+ * 40-160 MHz), then the band in bits 0-1, the width (20 << n MHz) in bits 2-3
+ * and the flags in bits 4-7, then two bytes this driver does not use (a
+ * width mask and, on 6 GHz, power-mode bits). Scan requests take the same
+ * band and flag bits.
+ */
+#define CHANNEL_PASSIVE BIT(4)
+#define CHANNEL_RADAR BIT(6)
+
+static const u8 *channel_entry(const u8 *list, size_t size, int band,
+			       unsigned int width, unsigned int number)
+{
+	unsigned int count = size ? list[0] : 0, i, span = 2 * (1 << width) - 2;
+
+	if (1 + 4 * count > size)
+		count = size ? (size - 1) / 4 : 0;
+	for (i = 0; i < count; i++) {
+		const u8 *entry = list + 1 + 4 * i;
+
+		if ((entry[1] & 3) != band || ((entry[1] >> 2) & 3) != width)
+			continue;
+		if (number + span >= entry[0] && number <= entry[0] + span)
+			return entry;
+	}
+	return NULL;
+}
+
+/*
+ * The firmware's list decides which channels exist and how: a band-plan
+ * channel it leaves out is disabled, its flags mark the rest, and a width no
+ * entry covers is not used. Applied over what cfg80211's regulatory domain
+ * set, after every change of it (the notifier) and at bring-up.
+ */
+static void channels_apply(struct centauri_t6050_wifi *wifi)
+{
+	const u8 *list = wifi->hw_channels;
+	size_t size = wifi->hw_channels_blob.size;
+	unsigned int counted[3] = {}, i;
+
+	if (!size)
+		return;
+	for (i = 0; i < CEN_CHANNELS; i++) {
+		struct ieee80211_channel *channel = &wifi->channels[i];
+		int band = firmware_band(channel->band);
+		const u8 *entry = channel_entry(list, size, band, 0,
+						channel->hw_value);
+
+		if (!entry) {
+			channel->flags |= IEEE80211_CHAN_DISABLED;
+			continue;
+		}
+		if (entry[1] & CHANNEL_PASSIVE)
+			channel->flags |= IEEE80211_CHAN_NO_IR;
+		if (entry[1] & CHANNEL_RADAR)
+			channel->flags |= IEEE80211_CHAN_RADAR;
+		if (!channel_entry(list, size, band, 1, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_NO_HT40;
+		if (!channel_entry(list, size, band, 2, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_NO_80MHZ;
+		if (!channel_entry(list, size, band, 3, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_NO_160MHZ;
+		if (!(channel->flags & IEEE80211_CHAN_DISABLED))
+			counted[band]++;
+	}
+	dev_info(&wifi->control->pdev->dev,
+		 "Wi-Fi firmware channels: 2.4 GHz %u, 5 GHz %u, 6 GHz %u (%u entries)\n",
+		 counted[0], counted[1], counted[2], list[0]);
+}
+
+/*
+ * 6 GHz needs HE: the station's HE capabilities element as the firmware
+ * reports it (capabilities TLV 0xff), with the 6 GHz band capabilities taken
+ * from its VHT element (TLV 0xbf). Without them the band is not registered.
+ */
+static bool he_6ghz_from_firmware(struct centauri_t6050_wifi *wifi)
+{
+	struct ieee80211_sband_iftype_data *data = &wifi->iftype_6ghz;
+	struct ieee80211_sta_he_cap *he = &data->he_cap;
+	const u8 *caps = wifi->system_caps, *he_elem = NULL, *vht = NULL;
+	size_t size = wifi->system_caps_blob.size, pos = 0, mcs;
+	u32 vht_cap = 0;
+
+	while (pos + 4 <= size) {
+		u16 tag = get_unaligned_le16(caps + pos);
+		u16 length = get_unaligned_le16(caps + pos + 2);
+		const u8 *value = caps + pos + 4;
+
+		if (length > size - pos - 4)
+			break;
+		if (tag == WLAN_EID_EXTENSION && length >= 3 + 6 + 11 + 4 &&
+		    value[0] == WLAN_EID_EXTENSION && value[1] == length - 2 &&
+		    value[2] == WLAN_EID_EXT_HE_CAPABILITY)
+			he_elem = value;
+		if (tag == WLAN_EID_VHT_CAPABILITY && length >= 2 + 12 &&
+		    value[0] == WLAN_EID_VHT_CAPABILITY)
+			vht = value;
+		pos += 4 + length;
+	}
+	if (!he_elem)
+		return false;
+	memcpy(&he->he_cap_elem, he_elem + 3, sizeof(he->he_cap_elem));
+	mcs = he_elem[1] - 1 - sizeof(he->he_cap_elem);
+	memcpy(&he->he_mcs_nss_supp, he_elem + 3 + sizeof(he->he_cap_elem),
+	       min(mcs, sizeof(he->he_mcs_nss_supp)));
+	if (mcs > sizeof(he->he_mcs_nss_supp))
+		memcpy(he->ppe_thres,
+		       he_elem + 3 + sizeof(he->he_cap_elem) +
+			       sizeof(he->he_mcs_nss_supp),
+		       min(mcs - sizeof(he->he_mcs_nss_supp),
+			   sizeof(he->ppe_thres)));
+	he->has_he = true;
+	if (vht)
+		vht_cap = get_unaligned_le32(vht + 2);
+	data->he_6ghz_capa.capa = cpu_to_le16(
+		u16_encode_bits(u32_get_bits(vht_cap,
+					     IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK),
+				IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP) |
+		u16_encode_bits(vht_cap & IEEE80211_VHT_CAP_MAX_MPDU_MASK,
+				IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN) |
+		u16_encode_bits(WLAN_HT_CAP_SM_PS_DISABLED,
+				IEEE80211_HE_6GHZ_CAP_SM_PS) |
+		(vht_cap & IEEE80211_VHT_CAP_RX_ANTENNA_PATTERN ?
+			 IEEE80211_HE_6GHZ_CAP_RX_ANTPAT_CONS : 0) |
+		(vht_cap & IEEE80211_VHT_CAP_TX_ANTENNA_PATTERN ?
+			 IEEE80211_HE_6GHZ_CAP_TX_ANTPAT_CONS : 0));
+	data->types_mask = BIT(NL80211_IFTYPE_STATION);
+	return true;
+}
+
 static void firmware_reports(struct centauri_t6050_wifi *wifi)
 {
 	firmware_report(wifi, 19, wifi->hw_channels, &wifi->hw_channels_blob);
@@ -737,10 +906,45 @@ static void firmware_reports(struct centauri_t6050_wifi *wifi)
 	dev_info(&wifi->control->pdev->dev,
 		 "Wi-Fi firmware channel list: %lu bytes, capabilities: %lu bytes\n",
 		 wifi->hw_channels_blob.size, wifi->system_caps_blob.size);
-	debugfs_create_blob("hw_channels", 0400, wifi->wiphy->debugfsdir,
-			    &wifi->hw_channels_blob);
-	debugfs_create_blob("system_caps", 0400, wifi->wiphy->debugfsdir,
-			    &wifi->system_caps_blob);
+}
+
+/* The band plan, with the firmware's legacy rates (CCK on 2.4 GHz only). */
+static void bands_init(struct centauri_t6050_wifi *wifi)
+{
+	unsigned int i, n = 0, c;
+
+	for (i = 0; i < ARRAY_SIZE(band_plan); i++) {
+		enum nl80211_band band = band_plan[i].band;
+		struct ieee80211_supported_band *sband =
+			&wifi->bands[firmware_band(band)];
+
+		if (!sband->channels)
+			sband->channels = wifi->channels + n;
+		for (c = band_plan[i].first; c <= band_plan[i].last;
+		     c += band_plan[i].step) {
+			wifi->channels[n].band = band;
+			wifi->channels[n].hw_value = c;
+			wifi->channels[n].center_freq =
+				ieee80211_channel_to_frequency(c, band);
+			sband->n_channels++;
+			n++;
+		}
+		sband->band = band;
+		sband->bitrates = band == NL80211_BAND_2GHZ ? rates : rates + 4;
+		sband->n_bitrates = band == NL80211_BAND_2GHZ ?
+					    ARRAY_SIZE(rates) :
+					    ARRAY_SIZE(rates) - 4;
+	}
+	wifi->wiphy->bands[NL80211_BAND_2GHZ] = &wifi->bands[0];
+	wifi->wiphy->bands[NL80211_BAND_5GHZ] = &wifi->bands[1];
+	if (he_6ghz_from_firmware(wifi)) {
+		_ieee80211_set_sband_iftype_data(&wifi->bands[2],
+						 &wifi->iftype_6ghz, 1);
+		wifi->wiphy->bands[NL80211_BAND_6GHZ] = &wifi->bands[2];
+	} else {
+		dev_warn(&wifi->control->pdev->dev,
+			 "Wi-Fi: no HE capabilities from the firmware; no 6 GHz band\n");
+	}
 }
 
 static int radio_start(struct centauri_t6050_wifi *wifi)
@@ -809,21 +1013,25 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 			struct ieee80211_channel *channel =
 				request->channels[next++];
 			unsigned int number;
+			int band;
 
-			/* The passive-scan wire mode is not established for this profile. */
-			if (channel->flags &
-			    (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR))
+			if (channel->flags & IEEE80211_CHAN_DISABLED)
 				continue;
-			if (channel->band != NL80211_BAND_2GHZ &&
-			    channel->band != NL80211_BAND_5GHZ)
-				return -EOPNOTSUPP;
+			band = firmware_band(channel->band);
+			if (band < 0)
+				return band;
 			number = ieee80211_frequency_to_channel(
 				channel->center_freq);
 			if (!number || number > 255)
 				return -EINVAL;
 			channels[1 + 4 * count] = number;
-			channels[2 + 4 * count] = channel->band ==
-						  NL80211_BAND_5GHZ;
+			channels[2 + 4 * count] = band;
+			/* Flagged as in the firmware's channel list: listen only. */
+			if (channel->flags &
+			    (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR))
+				channels[2 + 4 * count] |= CHANNEL_PASSIVE;
+			if (channel->flags & IEEE80211_CHAN_RADAR)
+				channels[2 + 4 * count] |= CHANNEL_RADAR;
 			count++;
 		}
 		if (!count)
@@ -1087,7 +1295,7 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	u8 rsn_body[255], ssid[35], zero[20] = {}, pmf;
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size, rsn_prefix, rsn_tail;
-	int ret = 0, offset;
+	int ret = 0, offset, band;
 
 	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
 	    params->crypto.n_ciphers_pairwise != 1 ||
@@ -1134,11 +1342,11 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		channel = bss->channel;
 		cfg80211_put_bss(wiphy, bss);
 	}
-	if (channel->band != NL80211_BAND_2GHZ &&
-	    channel->band != NL80211_BAND_5GHZ) {
-		ret = -EOPNOTSUPP;
+	ret = firmware_band(channel->band);
+	if (ret < 0)
 		goto out;
-	}
+	band = ret;
+	ret = 0;
 	wifi->connect_channel = channel;
 	memcpy(wifi->ssid, params->ssid, params->ssid_len);
 	wifi->ssid_len = params->ssid_len;
@@ -1147,7 +1355,7 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	memcpy(payload + 1, wifi->bssid, ETH_ALEN);
 	payload[7] = ieee80211_frequency_to_channel(channel->center_freq);
 
-	payload[8] = channel->band == NL80211_BAND_2GHZ ? 0 : 1;
+	payload[8] = band;
 	payload[0x47] = 4;
 
 	put_unaligned_le16(4, payload + 0x48);
@@ -1415,18 +1623,22 @@ static void wifi_regulatory(struct wiphy *wiphy,
 	struct centauri_t6050_wifi *wifi =
 		*(struct centauri_t6050_wifi **)wiphy_priv(wiphy);
 	u8 country[3] = { request->alpha2[0], request->alpha2[1], 1 };
+	bool named = country[0] >= 'A' && country[0] <= 'Z' &&
+		     country[1] >= 'A' && country[1] <= 'Z';
 	int ret;
 
-	if (country[0] < 'A' || country[0] > 'Z' || country[1] < 'A' ||
-	    country[1] > 'Z')
-		return;
 	mutex_lock(&wifi->lock);
-	if (wifi->configured) {
+	if (wifi->configured && named) {
 		ret = command(wifi, 9, country, sizeof(country));
 		if (ret)
 			dev_err(&wifi->control->pdev->dev,
 				"firmware country update failed: %d\n", ret);
+		else
+			firmware_report(wifi, 19, wifi->hw_channels,
+					&wifi->hw_channels_blob);
 	}
+	/* cfg80211 has just recomputed the channel flags from its own rules. */
+	channels_apply(wifi);
 	mutex_unlock(&wifi->lock);
 }
 
@@ -1754,7 +1966,6 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_wifi *wifi;
 	u8 address[ETH_ALEN];
-	unsigned int i;
 	int ret;
 
 	wifi = kzalloc_obj(*wifi);
@@ -1789,31 +2000,6 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	wifi->wiphy->n_akm_suites = ARRAY_SIZE(akm_suites);
 	wiphy_ext_feature_set(wifi->wiphy,
 			      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
-	for (i = 0; i < 13; i++) {
-		wifi->channels[i].band = NL80211_BAND_2GHZ;
-		wifi->channels[i].hw_value = i + 1;
-		wifi->channels[i].center_freq = ieee80211_channel_to_frequency(
-			i + 1, NL80211_BAND_2GHZ);
-		wifi->channels[i].max_power = 20;
-	}
-	for (i = 0; i < ARRAY_SIZE(five_ghz); i++) {
-		wifi->channels[13 + i].band = NL80211_BAND_5GHZ;
-		wifi->channels[13 + i].hw_value = five_ghz[i];
-		wifi->channels[13 + i].center_freq =
-			ieee80211_channel_to_frequency(five_ghz[i],
-						       NL80211_BAND_5GHZ);
-		wifi->channels[13 + i].max_power = 20;
-	}
-	wifi->bands[0].channels = wifi->channels;
-	wifi->bands[0].n_channels = 13;
-	wifi->bands[0].bitrates = rates;
-	wifi->bands[0].n_bitrates = ARRAY_SIZE(rates);
-	wifi->bands[1].channels = wifi->channels + 13;
-	wifi->bands[1].n_channels = ARRAY_SIZE(five_ghz);
-	wifi->bands[1].bitrates = rates + 4;
-	wifi->bands[1].n_bitrates = ARRAY_SIZE(rates) - 4;
-	wifi->wiphy->bands[NL80211_BAND_2GHZ] = &wifi->bands[0];
-	wifi->wiphy->bands[NL80211_BAND_5GHZ] = &wifi->bands[1];
 
 	ret = eth_platform_get_mac_address(&wifi->a.pdev->dev, address);
 	if (!ret) {
@@ -1827,10 +2013,25 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 			&wifi->a.pdev->dev,
 			"No valid factory MAC property; using a random address\n");
 	}
+	/* The bands come from the firmware's reports: start the radio first. */
+	ret = radio_start(wifi);
+	if (ret) {
+		dev_err(&c->pdev->dev,
+			"Wi-Fi ring/interface setup failed: %d\n", ret);
+		goto failed;
+	}
+	bands_init(wifi);
 	ret = wiphy_register(wifi->wiphy);
 	if (ret)
 		goto failed;
 	wifi->registered = true;
+	debugfs_create_blob("hw_channels", 0400, wifi->wiphy->debugfsdir,
+			    &wifi->hw_channels_blob);
+	debugfs_create_blob("system_caps", 0400, wifi->wiphy->debugfsdir,
+			    &wifi->system_caps_blob);
+	rtnl_lock();
+	channels_apply(wifi);
+	rtnl_unlock();
 	wifi->wdev.wiphy = wifi->wiphy;
 	wifi->wdev.iftype = NL80211_IFTYPE_STATION;
 	wifi->wdev.netdev = wifi->netdev;
@@ -1840,12 +2041,6 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
 	wifi->netdev->max_mtu = ETH_DATA_LEN;
 
-	ret = radio_start(wifi);
-	if (ret) {
-		dev_err(&c->pdev->dev,
-			"Wi-Fi ring/interface setup failed: %d\n", ret);
-		goto failed;
-	}
 	ret = register_netdev(wifi->netdev);
 	if (ret)
 		goto failed;
