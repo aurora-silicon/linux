@@ -334,6 +334,18 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
 
+	/*
+	 * Until resume the handler can neither read nor clear the latches: the
+	 * regmap goes cache-only below, and the I2C controller suspends after
+	 * the card. A fault latched meanwhile, such as the clock fault when the
+	 * bus clock stops, would hold the shared level-low line asserted and
+	 * run every amp's handler in a loop. Keep the line masked until the
+	 * cache is live again; disable_irq() nests across the amps sharing it.
+	 * ASoC resumes every suspended component, even after a failed suspend.
+	 */
+	if (tas2764->irq_requested)
+		disable_irq(tas2764->irq);
+
 	tas2764_flush_shutdown(tas2764);
 
 	ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
@@ -368,7 +380,7 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 		ret = tas2764->sdz_reg ? regulator_enable(tas2764->sdz_reg) : 0;
 		if (ret) {
 			dev_err(tas2764->dev, "Failed to enable regulator\n");
-			return ret;
+			goto out_irq;
 		}
 
 		if (tas2764->sdz_gpio)
@@ -380,10 +392,14 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	regcache_cache_only(tas2764->regmap, false);
 
 	ret = regcache_sync(tas2764->regmap);
-	if (ret < 0)
-		return ret;
+	if (ret >= 0)
+		ret = tas2764_update_pwr_ctrl(tas2764);
 
-	return tas2764_update_pwr_ctrl(tas2764);
+out_irq:
+	/* Balance the suspend; a fault latched in sleep is handled now. */
+	if (tas2764->irq_requested)
+		enable_irq(tas2764->irq);
+	return ret;
 }
 #else
 #define tas2764_codec_suspend NULL
