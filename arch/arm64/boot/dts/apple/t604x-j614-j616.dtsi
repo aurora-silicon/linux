@@ -357,9 +357,11 @@
 	 * ADT temp-sensor table gives next to the 110 C target for the PMP's
 	 * sensors (the sochot level). The SMC sensors read a few degrees above
 	 * the PMP's, so Linux shuts down at or before the hardware's own limit.
-	 * A hot trip at 120 C only reports. Under any load the per-core
-	 * excursions have peaked at 116.5-118 C, which the former 118 C
-	 * critical trip turned into a shutdown.
+	 * A hot trip at 120 C only reports, and the critical trip acts only
+	 * after three consecutive samples at or above it (critical-samples),
+	 * so one excursion cannot shut the machine down. Under any load the
+	 * per-core excursions have peaked at 116.5-118 C, which the former
+	 * 118 C critical trip turned into a shutdown.
 	 *
 	 * The GPU has no cooling device of its own: its firmware sets the GPU
 	 * performance state and starts limiting at 101 C. So when a GPU die
@@ -406,6 +408,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
@@ -471,6 +474,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
 
@@ -516,6 +520,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
 
@@ -561,6 +566,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
 
@@ -606,6 +612,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
 
@@ -651,6 +658,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
 
@@ -697,6 +705,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
 
@@ -743,6 +752,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
 
@@ -789,6 +799,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
 
@@ -835,6 +846,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
 
@@ -881,6 +893,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
 
@@ -927,6 +940,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
 
@@ -973,6 +987,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
 
@@ -1019,6 +1034,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
 
@@ -1065,6 +1081,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
 
@@ -1111,6 +1128,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
 
@@ -1157,6 +1175,7 @@
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
 			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
 

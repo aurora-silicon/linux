@@ -210,6 +210,8 @@ static void thermal_of_parameters_init(struct device_node *np,
 	of_property_read_u32(np, "integral-time-constant-ms",
 			     &tzp->integral_time_constant_ms);
 
+	of_property_read_u32(np, "critical-samples", &tzp->critical_samples);
+
 	/*
 	 * For now, the thermal framework supports only one sensor per
 	 * thermal zone. Thus, we are considering only the first two
