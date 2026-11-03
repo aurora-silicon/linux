@@ -5,10 +5,12 @@
 #include <linux/align.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
+#include <linux/cacheflush.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/crc32.h>
 #include <linux/delay.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
 #include <linux/kref.h>
@@ -21,6 +23,7 @@
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
+#include <linux/vmalloc.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -3597,6 +3600,10 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (READ_ONCE(dcp->t6040_relinking))
 		return 0;
 
+	/* Resume from disk: the restart sets the mode (see dcp_hib_recommit()). */
+	if (dcp_hib_gated(dcp))
+		return 0;
+
 	/* Disconnect cannot pass the admission check before these RPCs finish. */
 	guard(mutex)(&dcp->external_lock);
 	if (dcp_is_retained_external(dcp) &&
@@ -4420,6 +4427,16 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		return;
 	}
 
+	/*
+	 * Resume from disk: the firmware session the flip would go to is gone
+	 * and the new one is not up yet (or never came up).  Complete the
+	 * flip without a swap; the restart re-commits the mode and the frame.
+	 */
+	if (dcp_hib_gated(dcp)) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
+
 	dcp_desktop_ext_repower(dcp, crtc, commit);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		iomfb_v14_7_flush(dcp, crtc, commit);
@@ -4586,6 +4603,34 @@ void iomfb_ext26_start(struct apple_dcp *dcp)
 	iomfb_queue_advance(dcp);
 }
 
+/*
+ * Resume from disk: the image restore wrote the arena's pages through the
+ * cacheable linear map and cleaned them only to the PoU
+ * (arch/arm64/kernel/hibernate-asm.S).  The DCP is not DMA-coherent (no
+ * dma-coherent in its node), its arena is mapped non-cacheable, and a dirty
+ * line of the linear alias could be written back over what the host writes
+ * through that mapping, or hold what the firmware should read.  Clean the
+ * linear alias to the PoC before the arena is cleared and handed over.
+ */
+static void iomfb_hib_clean_shmem(struct apple_dcp *dcp)
+{
+	size_t off;
+
+	if (dev_is_dma_coherent(dcp->dev))
+		return;
+	for (off = 0; off < DCP_SHMEM_SIZE; off += PAGE_SIZE) {
+		void *va = dcp->shmem + off;
+		struct page *page = is_vmalloc_addr(va) ? vmalloc_to_page(va) :
+							  virt_to_page(va);
+		unsigned long lin;
+
+		if (!page)
+			continue;
+		lin = (unsigned long)page_address(page);
+		dcache_clean_poc(lin, lin + PAGE_SIZE);
+	}
+}
+
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
@@ -4633,10 +4678,27 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 			return ret;
 	}
 
+	/*
+	 * Firmware restarted in place after a resume from disk: the arena and
+	 * its mapping are in the restored image, only the firmware's binding
+	 * is gone.  Give it the same arena, cleared as a new one would be.
+	 */
+	if (IS_ENABLED(CONFIG_HIBERNATION) && dcp->shmem &&
+	    READ_ONCE(dcp->hib_phase) == DCP_HIB_RESTARTING) {
+		iomfb_hib_clean_shmem(dcp);
+		memset(dcp->shmem, 0, DCP_SHMEM_SIZE);
+		/* The firmware reads the arena only after set_shmem. */
+		wmb();
+		dcp_send_message(dcp, IOMFB_ENDPOINT,
+				 dcpep_set_shmem(dcp->shmem_iova));
+		return 0;
+	}
+
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
 					GFP_KERNEL);
 	if (!dcp->shmem)
 		return -ENOMEM;
+	dcp->shmem_iova = shmem_iova;
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(shmem_iova));
 
