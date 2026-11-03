@@ -25,6 +25,7 @@
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/ioport.h>
 #include <linux/kexec.h>
 #include <linux/minmax.h>
 #include <linux/mm.h>
@@ -259,6 +260,21 @@ struct apple_dart_fw_root {
 };
 
 /*
+ * The subtrees behind the slots firmware holds in a four-level locked root
+ * (fw_mirror), recorded when the root is mapped: per slot, the root entry and
+ * a mapping of its mid-level table, and per mid entry the entry and a mapping
+ * of its leaf table. Leaf entries are read live. A table entry that no longer
+ * matches what was recorded resolves nothing. Only lookups use it: Linux
+ * still never publishes into those slots.
+ */
+struct apple_dart_fw_tree {
+	u64 *entry;
+	u64 **mid;
+	u64 **mid_entry;
+	u64 ***leaf;
+};
+
+/*
  * Private structure associated with each DART device.
  *
  * @dev: device struct
@@ -298,6 +314,15 @@ struct apple_dart {
 	u32 power_retained : 1;
 	/* Locked roots may hold firmware slots that mirror Linux mappings. */
 	u32 fw_mirror : 1;
+	/*
+	 * fw_mirror's four-level locked roots hold firmware's own subtrees, which
+	 * are recorded and reserved (apple_dart_snapshot_fw_tree()). Set only for
+	 * apple,t6050-dart, where it was tested (the DCP's log and crash log). Before
+	 * widening it, check on T6041/T8140/T8142 whether any locked stream is
+	 * four-level and what its foreign slots hold: the reservation moves DMA
+	 * placement for every client of that stream.
+	 */
+	u32 fw_tree : 1;
 	u32 fw_handoff : 1;
 	u32 tunnel_state_saved : 1;
 	u32 tunnel_state_restored : 1;
@@ -339,6 +364,8 @@ struct apple_dart {
 	u64 *locked_owned[DART_MAX_STREAMS][DART_MAX_TTBR];
 	/* Leaf tables behind the root slots firmware held when we attached. */
 	struct apple_dart_fw_root *locked_fw[DART_MAX_STREAMS][DART_MAX_TTBR];
+	/* Firmware's subtrees in a four-level locked root (TTBR 0 only). */
+	struct apple_dart_fw_tree *locked_fw_tree[DART_MAX_STREAMS];
 	/*
 	 * First DVA of the window of the domain using each locked stream.  The
 	 * window can be the client's own (apple,dma-range on the client node)
@@ -804,15 +831,22 @@ static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 		handoff == 1;
 }
 
+/* A 16K table page, aligned and inside the output address space. */
+static bool apple_dart_fw_table_page(const struct apple_dart *dart,
+				     phys_addr_t phys, phys_addr_t *end)
+{
+	return dart->pgsize == SZ_16K && IS_ALIGNED(phys, dart->pgsize) &&
+	       !check_add_overflow(phys, (phys_addr_t)dart->pgsize - 1, end) &&
+	       dart->oas < 64 && *end < BIT_ULL(dart->oas);
+}
+
 static bool apple_dart_fw_table_ram(const struct apple_dart *dart,
 				   phys_addr_t phys)
 {
 	unsigned long first, last, pfn;
 	phys_addr_t end;
 
-	if (dart->pgsize != SZ_16K || !IS_ALIGNED(phys, dart->pgsize) ||
-	    check_add_overflow(phys, (phys_addr_t)dart->pgsize - 1, &end) ||
-	    dart->oas >= 64 || end >= BIT_ULL(dart->oas))
+	if (!apple_dart_fw_table_page(dart, phys, &end))
 		return false;
 	first = PHYS_PFN(phys);
 	last = PHYS_PFN(end);
@@ -822,14 +856,41 @@ static bool apple_dart_fw_table_ram(const struct apple_dart *dart,
 	return true;
 }
 
-static bool apple_dart_fw_table_decode(const struct apple_dart *dart,
-				      u64 pte, phys_addr_t *phys)
+/* A valid table entry with no bits but the next table's address. */
+static bool apple_dart_fw_table_pte(const struct apple_dart *dart, u64 pte,
+				    phys_addr_t *phys)
 {
 	if (!(pte & APPLE_DART_PTE_VALID) ||
 	    (pte & ~(GENMASK_ULL(37, 10) | APPLE_DART_PTE_VALID)))
 		return false;
 	*phys = apple_dart_pte_to_paddr(dart, pte);
-	return apple_dart_fw_table_ram(dart, *phys);
+	return true;
+}
+
+static bool apple_dart_fw_table_decode(const struct apple_dart *dart,
+				      u64 pte, phys_addr_t *phys)
+{
+	return apple_dart_fw_table_pte(dart, pte, phys) &&
+	       apple_dart_fw_table_ram(dart, *phys);
+}
+
+/*
+ * A table page of firmware's four-level subtrees, which is mapped write-back:
+ * reserved RAM as for apple_dart_fw_table_ram(), or memory no resource
+ * claims. T6050's boot loader places these tables outside the memory node,
+ * so they are not RAM to Linux. An entry naming Linux's own RAM or a
+ * device's registers is refused, and its DVAs resolve nothing.
+ */
+static bool apple_dart_fw_tree_table(const struct apple_dart *dart,
+				     phys_addr_t phys)
+{
+	phys_addr_t end;
+
+	if (apple_dart_fw_table_ram(dart, phys))
+		return true;
+	return apple_dart_fw_table_page(dart, phys, &end) &&
+	       region_intersects(phys, dart->pgsize, IORESOURCE_MEM,
+				 IORES_DESC_NONE) == REGION_DISJOINT;
 }
 
 static bool apple_dart_fw_slot_owned(const struct apple_dart_fw_root *fw,
@@ -1056,6 +1117,116 @@ apple_dart_snapshot_fw_root(struct apple_dart *dart, int sid, const u64 *live)
 	return fw;
 }
 
+static void apple_dart_free_fw_tree(struct apple_dart *dart,
+				    struct apple_dart_fw_tree *tree)
+{
+	size_t i, j, entries = dart->pgsize / sizeof(u64);
+
+	if (!tree)
+		return;
+	/* Any of the four arrays may be missing after a failed allocation. */
+	for (i = 0; i < entries; i++) {
+		if (tree->leaf && tree->leaf[i]) {
+			for (j = 0; j < entries; j++)
+				if (tree->leaf[i][j])
+					memunmap(tree->leaf[i][j]);
+			kfree(tree->leaf[i]);
+		}
+		if (tree->mid_entry)
+			kfree(tree->mid_entry[i]);
+		if (tree->mid && tree->mid[i])
+			memunmap(tree->mid[i]);
+	}
+	kfree(tree->leaf);
+	kfree(tree->mid_entry);
+	kfree(tree->mid);
+	kfree(tree->entry);
+	kfree(tree);
+}
+
+/*
+ * Record firmware's subtrees in the four-level root @live of @sid, so that
+ * firmware-placed buffers (an RTKit co-processor's shared segments, which
+ * it asks the AP to map at its own DVA) resolve through iova_to_phys. A
+ * table that cannot be mapped, or that apple_dart_fw_tree_table() refuses,
+ * is left out; its DVAs resolve nothing. A slot can map up to one leaf table
+ * per mid-level entry (2048 with 16K pages); firmware holds a few slots.
+ */
+static struct apple_dart_fw_tree *
+apple_dart_snapshot_fw_tree(struct apple_dart *dart, int sid, const u64 *live)
+{
+	size_t i, j, entries = dart->pgsize / sizeof(u64);
+	struct apple_dart_fw_tree *tree;
+
+	if (!dart->fw_tree || !dart->fw_mirror || dart->fw_handoff ||
+	    dart->hw->fmt != APPLE_DART2 ||
+	    !dart->hw->tcr_4level ||
+	    !(apple_dart_readl(dart, DART_TCR(dart, sid)) & dart->hw->tcr_4level))
+		return NULL;
+
+	tree = kzalloc(sizeof(*tree), GFP_KERNEL);
+	if (!tree)
+		return NULL;
+	tree->entry = kcalloc(entries, sizeof(*tree->entry), GFP_KERNEL);
+	tree->mid = kcalloc(entries, sizeof(*tree->mid), GFP_KERNEL);
+	tree->mid_entry = kcalloc(entries, sizeof(*tree->mid_entry), GFP_KERNEL);
+	tree->leaf = kcalloc(entries, sizeof(*tree->leaf), GFP_KERNEL);
+	if (!tree->entry || !tree->mid || !tree->mid_entry || !tree->leaf) {
+		apple_dart_free_fw_tree(dart, tree);
+		return NULL;
+	}
+
+	for (i = 0; i < entries; i++) {
+		u64 pte = READ_ONCE(live[i]);
+		phys_addr_t phys;
+
+		if (!apple_dart_fw_table_pte(dart, pte, &phys) ||
+		    !apple_dart_fw_tree_table(dart, phys))
+			continue;
+		tree->mid_entry[i] = kcalloc(entries, sizeof(u64), GFP_KERNEL);
+		tree->leaf[i] = kcalloc(entries, sizeof(u64 *), GFP_KERNEL);
+		tree->mid[i] = memremap(phys, dart->pgsize, MEMREMAP_WB);
+		if (!tree->mid_entry[i] || !tree->leaf[i] || !tree->mid[i])
+			continue;
+		tree->entry[i] = pte;
+		for (j = 0; j < entries; j++) {
+			u64 mid = READ_ONCE(tree->mid[i][j]);
+
+			if (!apple_dart_fw_table_pte(dart, mid, &phys) ||
+			    !apple_dart_fw_tree_table(dart, phys))
+				continue;
+			tree->leaf[i][j] = memremap(phys, dart->pgsize, MEMREMAP_WB);
+			if (tree->leaf[i][j])
+				tree->mid_entry[i][j] = mid;
+		}
+	}
+	return tree;
+}
+
+/* What firmware's recorded four-level subtree translates @addr to, or 0. */
+static phys_addr_t apple_dart_fw_tree_phys(const struct apple_dart *dart,
+					   const struct apple_dart_fw_tree *tree,
+					   const u64 *live, u64 addr)
+{
+	u32 pgshift = ilog2(dart->pgsize);
+	u32 bits = ilog2(dart->pgsize / sizeof(u64));
+	u64 mask = BIT_ULL(bits) - 1;
+	u64 slot = addr >> (pgshift + 2 * bits);
+	u64 mid = (addr >> (pgshift + bits)) & mask;
+	u64 page = (addr >> pgshift) & mask;
+	phys_addr_t phys;
+	int prot;
+
+	if (!tree || !live || slot > mask || !tree->entry[slot] ||
+	    READ_ONCE(live[slot]) != tree->entry[slot] ||
+	    !tree->mid_entry[slot][mid] ||
+	    READ_ONCE(tree->mid[slot][mid]) != tree->mid_entry[slot][mid] ||
+	    !apple_dart_fw_leaf_decode(READ_ONCE(tree->leaf[slot][mid][page]),
+				       addr, &phys, &prot))
+		return 0;
+	return phys;
+}
+
 static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 				    u64 lo, u64 hi);
 
@@ -1066,6 +1237,7 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 	int sid;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		struct apple_dart_fw_tree *tree = NULL;
 		struct apple_dart_fw_root *fw;
 		unsigned long flags;
 		u32 ttbr;
@@ -1112,10 +1284,14 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 			devm_memunmap(dart->dev, l1_tbl);
 			return PTR_ERR(fw);
 		}
+		if (!idx)
+			tree = apple_dart_snapshot_fw_tree(dart, sid, l1_tbl);
 		spin_lock_irqsave(&dart->lock, flags);
 		dart->locked_owned[sid][idx] = owned;
 		dart->locked_ttbr[sid][idx] = l1_tbl;
 		dart->locked_fw[sid][idx] = fw;
+		if (!idx)
+			dart->locked_fw_tree[sid] = tree;
 		spin_unlock_irqrestore(&dart->lock, flags);
 	}
 
@@ -1137,6 +1313,7 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u64 *live = dart->locked_ttbr[sid][idx];
 		u64 *owned = dart->locked_owned[sid][idx];
+		struct apple_dart_fw_tree *tree = NULL;
 		struct apple_dart_fw_root *fw;
 		unsigned long flags;
 		bool first = false;
@@ -1161,6 +1338,10 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 		fw = dart->locked_fw[sid][idx];
 		dart->locked_fw[sid][idx] = NULL;
 		dart->locked_ttbr[sid][idx] = NULL;
+		if (!idx) {
+			tree = dart->locked_fw_tree[sid];
+			dart->locked_fw_tree[sid] = NULL;
+		}
 		spin_unlock_irqrestore(&dart->lock, flags);
 		/* Once per stream: the error is never cleared. */
 		if (first)
@@ -1168,6 +1349,7 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 				 "stream %d: TLB invalidate failed retiring its root (%d); keeping the page tables of its domains until reboot\n",
 				 sid, err);
 		apple_dart_free_fw_root(dart, fw);
+		apple_dart_free_fw_tree(dart, tree);
 		devm_memunmap(dart->dev, live);
 		devm_kfree(dart->dev, owned);
 		dart->locked_owned[sid][idx] = NULL;
@@ -2178,21 +2360,29 @@ apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
 		size_t page = (address / dart->pgsize) % entries;
 		size_t slot = address / dart->pgsize / entries;
 
-		if (!dart->locked || (!dart->fw_handoff && !dart->fw_mirror) || slot >= entries)
+		if (!dart->locked || (!dart->fw_handoff && !dart->fw_mirror))
 			return 0;
 		spin_lock_irqsave(&dart->lock, flags);
 		for (sid = 0; sid < dart->num_streams; sid++) {
+			const struct apple_dart_fw_tree *tree;
 			struct apple_dart_fw_root *fw;
-			phys_addr_t phys;
+			phys_addr_t phys = 0;
 			int prot;
 
 			if (!apple_dart_domain_uses_fw(domain, i, map, sid))
 				continue;
+			tree = dart->locked_fw_tree[sid];
 			fw = dart->locked_fw[sid][0];
-			if (!apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
-			    !apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][page]),
-						       address, &phys, &prot) ||
-			    (result && result != phys)) {
+			if (tree)
+				phys = apple_dart_fw_tree_phys(dart, tree,
+							       dart->locked_ttbr[sid][0],
+							       address);
+			else if (slot >= entries ||
+				 !apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
+				 !apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][page]),
+							    address, &phys, &prot))
+				phys = 0;
+			if (!phys || (result && result != phys)) {
 				spin_unlock_irqrestore(&dart->lock, flags);
 				return 0;
 			}
@@ -2222,7 +2412,7 @@ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 	if (phys)
 		return phys;
 	cfg = &io_pgtable_ops_to_pgtable(ops)->cfg;
-	if (cfg->apple_dart_cfg.n_levels != 3)
+	if (cfg->apple_dart_cfg.n_levels != 3 && cfg->apple_dart_cfg.n_levels != 4)
 		return 0;
 	/* Existing firmware translations need no replacement software mapping. */
 	return apple_dart_inherited_phys(dart_domain, address);
@@ -3406,7 +3596,12 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
 		struct apple_dart *dart = stream->dart;
 		size_t entries = dart->pgsize / sizeof(u64);
 
-		if (!dart->fw_handoff || entries > DART_MAX_ROOT_ENTRIES)
+		/*
+		 * Only the handoff and fw_tree reserve anything: leave the other
+		 * fw_mirror DARTs (T6041, T8140, T8142) untouched, TCR reads included.
+		 */
+		if ((!dart->fw_handoff && !dart->fw_tree) ||
+		    entries > DART_MAX_ROOT_ENTRIES)
 			continue;
 		for_each_set_bit(sid, stream->sidmap, dart->num_streams) {
 			for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
@@ -3430,6 +3625,13 @@ static void apple_dart_get_fw_resv_regions(struct device *dev,
 						__set_bit(slot, slots);
 				spin_unlock_irqrestore(&dart->lock, flags);
 
+				/*
+				 * A three-level fw_mirror slot may repeat firmware's
+				 * pages (apple_dart_check_fw_map()); a four-level one
+				 * is firmware's alone, so keep the allocator out of it.
+				 */
+				if (!dart->fw_handoff && !(four && dart->fw_tree))
+					continue;
 				if (!four && check_add_overflow(window,
 					((u64)idx << (ilog2(dart->pgsize) + 2 * ilog2(entries))),
 					&window))
@@ -4283,6 +4485,8 @@ params_done:
 		 of_device_is_compatible(dev->of_node, "apple,t6050-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
+	dart->fw_tree = dart->fw_mirror &&
+		of_device_is_compatible(dev->of_node, "apple,t6050-dart");
 	if (of_machine_is_compatible("apple,j713") &&
 	    of_machine_is_compatible("apple,t8132") &&
 	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
