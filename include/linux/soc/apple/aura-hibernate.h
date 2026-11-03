@@ -4,6 +4,22 @@
 
 #include <linux/types.h>
 
+struct device_node;
+
+/* A firmware memory-region of a device as this boot's device tree gives it. */
+struct aura_fw_region {
+	u64 phys;
+	u64 iova;
+	u64 size;
+};
+
+/*
+ * Declared unconditionally so that Rust drivers can bind to it; without
+ * CONFIG_APPLE_AURA_HIBERNATE they must not call it.
+ */
+int aura_hibernate_boot_fw_regions(struct device_node *np, struct aura_fw_region *out,
+				   unsigned int max);
+
 #ifdef CONFIG_APPLE_AURA_HIBERNATE
 bool aura_hibernate_layout_fixed(void);
 bool aura_hibernate_pfn_nosave(unsigned long pfn);

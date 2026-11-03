@@ -11,7 +11,8 @@ use core::{
     marker::Unpin,
     mem,
     ptr::{self, NonNull},
-    slice, //
+    slice,
+    sync::atomic::{AtomicI32, AtomicU64, Ordering}, //
 };
 
 use kernel::{
@@ -1173,6 +1174,33 @@ const RETIRED_DRIVER_OVERRIDE: &CStr = c_str!("apple-aop-retired");
 /// before a reboot.
 static RETIRED: Atomic<bool> = Atomic::new(false);
 
+/// Set by unbind when the ASC CPU run bit reads 0: the co-processor was
+/// halted underneath this instance, as the boot loader leaves it after a
+/// resume from disk (a cold boot; the restored kernel still holds the session
+/// of the instance that probed before the image). A halted CPU neither
+/// answers nor DMAs, so the teardown sends nothing and frees everything, and
+/// the next probe starts the firmware the boot loader staged, as at boot.
+static HALTED_AT_UNBIND: Atomic<bool> = Atomic::new(false);
+
+/// Set by unbind with [`HALTED_AT_UNBIND`], cleared by the next successful
+/// probe: the next probe starts firmware staged on a boot that is not the one
+/// this kernel was started on, so its DRAM segments are taken from that boot
+/// (see [`AopData::remap_fw_regions_cold`]).
+static COLD_REPROBE: Atomic<bool> = Atomic::new(false);
+
+/// Set with [`COLD_REPROBE`] when [`RETIRED`] was already set at that halted
+/// unbind: the failed shutdown predates the restaging, so the cold probe may
+/// bring the co-processor up again.
+static RETIRED_BEFORE_HALT: Atomic<bool> = Atomic::new(false);
+
+/// The firmware regions mapped in the default domain now (phys, IOVA,
+/// size): -1 until the first probe takes them from the DT; a cold probe
+/// replaces them with the resuming boot's.
+const FW_SET_MAX: usize = 8;
+static FW_CUR_LEN: AtomicI32 = AtomicI32::new(-1);
+static FW_CUR: [[AtomicU64; 3]; FW_SET_MAX] =
+    [const { [const { AtomicU64::new(0) }; 3] }; FW_SET_MAX];
+
 impl ChildDevice {
     /// Keeps the child from binding to any driver again; it stays registered.
     fn retire(&self) {
@@ -1723,26 +1751,9 @@ impl AopData {
         Ok((phys, iova, size))
     }
 
-    /// Checks the firmware segments the AOP runs from DRAM (T6040). The
-    /// bootloader reserves them and lists them in `memory-region`, and each
-    /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
-    /// IOMMU core maps them in the default domain when the device is added
-    /// (one to one when the IOVA is the physical address, translated
-    /// otherwise), so they are only checked here. Every page has to be mapped
-    /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
-    /// other segment (`__OS_LOG`) at its physical address.
-    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
-        // SAFETY: `dev` is a live device being probed.
-        let np = unsafe { (*dev.as_raw()).of_node };
-        if np.is_null() {
-            return Err(ENODEV);
-        }
-        // SAFETY: `np` is the device's node, valid while it is bound.
-        let count = unsafe { bindings::of_reserved_mem_region_count(np) };
-        if count <= 0 {
-            dev_err!(dev, "No firmware memory-region from the bootloader");
-            return Err(ENOENT);
-        }
+    /// The device's translated IOMMU domain, which the firmware segments are
+    /// mapped in.
+    fn fw_domain(dev: &device::Device) -> Result<*mut bindings::iommu_domain> {
         // SAFETY: `dev` is a live device being probed.
         let domain = unsafe { bindings::iommu_get_domain_for_dev(dev.as_raw()) };
         let ty = if domain.is_null() {
@@ -1755,59 +1766,331 @@ impl AopData {
             dev_err!(dev, "No translated IOMMU domain for the firmware");
             return Err(ENODEV);
         }
-        let mut etext = false;
-        for idx in 0..count {
-            let (phys, iova, size) = Self::fw_region(np, idx).inspect_err(|e| {
-                dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
-            })?;
-            if phys % FW_REGION_PAGE != 0
-                || size % FW_REGION_PAGE != 0
-                || size > FW_REGION_MAX_SIZE
-                || iova % FW_REGION_PAGE != 0
-                || iova.checked_add(size).is_none()
-                || phys.checked_add(size).is_none()
-            {
-                dev_err!(dev, "Invalid firmware memory-region {}", idx);
+        Ok(domain)
+    }
+
+    /// The device's node and its number of firmware memory-regions.
+    fn fw_node(dev: &device::Device) -> Result<(*mut bindings::device_node, c_int)> {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        if np.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        let count = unsafe { bindings::of_reserved_mem_region_count(np) };
+        if count <= 0 {
+            dev_err!(dev, "No firmware memory-region from the bootloader");
+            return Err(ENOENT);
+        }
+        Ok((np, count))
+    }
+
+    /// The layout rules of one firmware memory-region: 16K pages, at most
+    /// [`FW_REGION_MAX_SIZE`], the IOVA either `ec0p` (at most one region,
+    /// counted in `etext`) or the physical address.
+    fn check_fw_region_layout(
+        dev: &device::Device,
+        ec0p: u64,
+        idx: c_int,
+        (phys, iova, size): (u64, u64, u64),
+        etext: &mut bool,
+    ) -> Result<()> {
+        if phys % FW_REGION_PAGE != 0
+            || size % FW_REGION_PAGE != 0
+            || size > FW_REGION_MAX_SIZE
+            || iova % FW_REGION_PAGE != 0
+            || iova.checked_add(size).is_none()
+            || phys.checked_add(size).is_none()
+        {
+            dev_err!(dev, "Invalid firmware memory-region {}", idx);
+            return Err(EINVAL);
+        }
+        if iova == ec0p {
+            if *etext {
+                dev_err!(dev, "Two firmware memory-regions at EC0p {:#x}", ec0p);
                 return Err(EINVAL);
             }
-            if iova == ec0p {
-                if etext {
-                    dev_err!(dev, "Two firmware memory-regions at EC0p {:#x}", ec0p);
-                    return Err(EINVAL);
-                }
-                etext = true;
-            } else if iova != phys {
+            *etext = true;
+        } else if iova != phys {
+            dev_err!(
+                dev,
+                "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
+                idx,
+                iova,
+                ec0p
+            );
+            return Err(EINVAL);
+        }
+        Ok(())
+    }
+
+    /// Every page of a firmware memory-region has to be mapped at its IOVA.
+    fn check_fw_region_mapped(
+        dev: &device::Device,
+        domain: *mut bindings::iommu_domain,
+        idx: c_int,
+        (phys, iova, size): (u64, u64, u64),
+    ) -> Result<()> {
+        let mut off = 0;
+        while off < size {
+            // SAFETY: `domain` is the device's domain, live while it is
+            // bound.
+            let back = unsafe { bindings::iommu_iova_to_phys(domain, iova + off) };
+            if back != phys + off {
                 dev_err!(
                     dev,
-                    "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
+                    "Firmware memory-region {} is not mapped at IOVA {:#x} (region phys {:#x} iova {:#x} size {:#x}, domain gives {:#x})",
                     idx,
+                    iova + off,
+                    phys,
                     iova,
-                    ec0p
+                    size,
+                    back
                 );
-                return Err(EINVAL);
+                return Err(EIO);
             }
-            let mut off = 0;
-            while off < size {
-                // SAFETY: `domain` is the device's domain, live while it is
-                // bound.
-                let back = unsafe { bindings::iommu_iova_to_phys(domain, iova + off) };
-                if back != phys + off {
-                    dev_err!(
-                        dev,
-                        "Firmware memory-region {} is not mapped at IOVA {:#x}",
-                        idx,
-                        iova + off
-                    );
-                    return Err(EIO);
-                }
-                off += FW_REGION_PAGE;
+            off += FW_REGION_PAGE;
+        }
+        Ok(())
+    }
+
+    /// The firmware regions the default domain maps now: the DT's until a
+    /// resume from disk replaced them with those of the boot that resumed.
+    fn fw_set_load(dev: &device::Device) -> Result<KVec<(u64, u64, u64)>> {
+        let mut set = KVec::new();
+        let len = FW_CUR_LEN.load(Ordering::Acquire);
+        if len >= 0 {
+            for r in FW_CUR.iter().take(len as usize) {
+                set.push(
+                    (
+                        r[0].load(Ordering::Relaxed),
+                        r[1].load(Ordering::Relaxed),
+                        r[2].load(Ordering::Relaxed),
+                    ),
+                    GFP_KERNEL,
+                )?;
             }
+            return Ok(set);
+        }
+        let (np, count) = Self::fw_node(dev)?;
+        for idx in 0..count {
+            let region = Self::fw_region(np, idx).inspect_err(|e| {
+                dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
+            })?;
+            set.push(region, GFP_KERNEL)?;
+        }
+        Ok(set)
+    }
+
+    fn fw_set_store(set: &[(u64, u64, u64)]) -> Result<()> {
+        if set.len() > FW_SET_MAX {
+            return Err(E2BIG);
+        }
+        for (slot, r) in FW_CUR.iter().zip(set.iter()) {
+            slot[0].store(r.0, Ordering::Relaxed);
+            slot[1].store(r.1, Ordering::Relaxed);
+            slot[2].store(r.2, Ordering::Relaxed);
+        }
+        FW_CUR_LEN.store(set.len() as i32, Ordering::Release);
+        Ok(())
+    }
+
+    /// The layout rules and the mappings of a whole set: every region valid,
+    /// exactly one at `ec0p`, every page mapped.
+    fn check_fw_set(
+        dev: &device::Device,
+        domain: *mut bindings::iommu_domain,
+        ec0p: u64,
+        set: &[(u64, u64, u64)],
+    ) -> Result<()> {
+        let mut etext = false;
+        for (idx, r) in set.iter().enumerate() {
+            Self::check_fw_region_layout(dev, ec0p, idx as c_int, *r, &mut etext)?;
+            Self::check_fw_region_mapped(dev, domain, idx as c_int, *r)?;
         }
         if !etext {
             dev_err!(dev, "No firmware memory-region at EC0p {:#x}", ec0p);
             return Err(ENOENT);
         }
         Ok(())
+    }
+
+    /// Checks the firmware segments the AOP runs from DRAM (T6040). The
+    /// bootloader reserves them and lists them in `memory-region`, and each
+    /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
+    /// IOMMU core maps them in the default domain when the device is added
+    /// (one to one when the IOVA is the physical address, translated
+    /// otherwise), so they are only checked here. Every page has to be mapped
+    /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
+    /// other segment (`__OS_LOG`) at its physical address. After a resume
+    /// from disk the set checked is the one [`Self::remap_fw_regions_cold`]
+    /// mapped.
+    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
+        let set = Self::fw_set_load(dev)?;
+        let domain = Self::fw_domain(dev)?;
+        Self::check_fw_set(dev, domain, ec0p, &set)?;
+        Self::fw_set_store(&set)
+    }
+
+    /// The firmware segments after a resume from disk (T6040 under aura).
+    ///
+    /// The resume is a cold boot: the boot firmware staged the AOP firmware anew and
+    /// placed some of its DRAM segments elsewhere than on the boot the
+    /// current mappings come from (the `__OS_LOG` moves on every boot,
+    /// `__ETEXT` has stayed in place so far). This boot's regions come from
+    /// the device tree aura handed over this time, at its fixed address; the
+    /// previous set's mappings that this boot does not have are removed, this
+    /// boot's are mapped (IOVA as the device tree says), checked as at boot,
+    /// and become the current set. Nothing is copied: the old physical ranges
+    /// may hold other firmware on this boot. Without aura's device tree slot
+    /// the current set is only checked, as before.
+    #[cfg(CONFIG_APPLE_AURA_HIBERNATE)]
+    fn remap_fw_regions_cold(dev: &device::Device, ec0p: u64) -> Result<()> {
+        let (np, _) = Self::fw_node(dev)?;
+        let prev = Self::fw_set_load(dev)?;
+        let domain = Self::fw_domain(dev)?;
+        let mut raw = [bindings::aura_fw_region {
+            phys: 0,
+            iova: 0,
+            size: 0,
+        }; FW_SET_MAX];
+        // SAFETY: `np` is the device's node and `raw` has room for
+        // `FW_SET_MAX` entries.
+        let n = unsafe {
+            bindings::aura_hibernate_boot_fw_regions(np, raw.as_mut_ptr(), FW_SET_MAX as u32)
+        };
+        if n == -(bindings::ENODEV as c_int) {
+            dev_warn!(
+                dev,
+                "resume from disk: no device tree of this boot from aura; checking the current firmware regions"
+            );
+            return Self::check_fw_regions(dev, ec0p);
+        }
+        if n < 0 {
+            dev_err!(
+                dev,
+                "This boot's firmware memory-regions are not available ({}); the firmware cannot be mapped",
+                n
+            );
+            return Err(Error::from_errno(n));
+        }
+        let boot: KVec<(u64, u64, u64)> = {
+            let mut v = KVec::new();
+            for r in &raw[..n as usize] {
+                v.push((r.phys, r.iova, r.size), GFP_KERNEL)?;
+            }
+            v
+        };
+        let mut etext = false;
+        for (idx, r) in boot.iter().enumerate() {
+            Self::check_fw_region_layout(dev, ec0p, idx as c_int, *r, &mut etext)?;
+        }
+        if !etext {
+            dev_err!(dev, "No firmware memory-region at EC0p {:#x} on this boot", ec0p);
+            return Err(ENOENT);
+        }
+        // Mapped like the IOMMU core maps a direct region of this device.
+        // SAFETY: `np` is a valid node.
+        let coherent = unsafe { bindings::of_dma_is_coherent(np) };
+        let mut prot = (bindings::IOMMU_READ | bindings::IOMMU_WRITE) as c_int;
+        if coherent {
+            prot |= bindings::IOMMU_CACHE as c_int;
+        }
+
+        // The previous set's regions that this boot moved: unmap only pages
+        // that still map the old physical range, never anything else at that
+        // IOVA. Repeating it after a partial failure is harmless.
+        for (idx, &(phys, iova, size)) in prev.iter().enumerate() {
+            if boot.iter().any(|r| *r == (phys, iova, size)) {
+                continue;
+            }
+            let mut off = 0;
+            let mut unmapped = 0;
+            while off < size {
+                // SAFETY: `domain` is the device's domain, live while it is
+                // bound.
+                let back = unsafe { bindings::iommu_iova_to_phys(domain, iova + off) };
+                if back == phys + off {
+                    // SAFETY: As above; the page was mapped for this region.
+                    let done = unsafe {
+                        bindings::iommu_unmap(domain, (iova + off) as usize, FW_REGION_PAGE as usize)
+                    };
+                    if done != FW_REGION_PAGE as usize {
+                        dev_err!(dev, "Could not unmap IOVA {:#x} of the old boot", iova + off);
+                        return Err(EIO);
+                    }
+                    unmapped += 1;
+                }
+                off += FW_REGION_PAGE;
+            }
+            dev_info!(
+                dev,
+                "resume from disk: old firmware region {} [{:#x}, +{:#x}) at IOVA {:#x} dropped ({} pages unmapped)",
+                idx,
+                phys,
+                size,
+                iova,
+                unmapped
+            );
+        }
+
+        // This boot's regions: map what is missing, refuse what is taken.
+        for (idx, &(phys, iova, size)) in boot.iter().enumerate() {
+            let mut off = 0;
+            let mut mapped = 0;
+            while off < size {
+                // SAFETY: `domain` is the device's domain, live while it is
+                // bound.
+                let back = unsafe { bindings::iommu_iova_to_phys(domain, iova + off) };
+                if back != phys + off {
+                    if back != 0 {
+                        dev_err!(
+                            dev,
+                            "IOVA {:#x} for this boot's firmware region {} is in use ({:#x})",
+                            iova + off,
+                            idx,
+                            back
+                        );
+                        return Err(EBUSY);
+                    }
+                    // SAFETY: As above; the IOVA page is free and the physical
+                    // page is this boot's firmware segment, which Linux does
+                    // not own (checked by the helper).
+                    let err = unsafe {
+                        bindings::iommu_map(
+                            domain,
+                            (iova + off) as usize,
+                            phys + off,
+                            FW_REGION_PAGE as usize,
+                            prot,
+                            bindings::GFP_KERNEL,
+                        )
+                    };
+                    if err != 0 {
+                        dev_err!(dev, "Could not map IOVA {:#x} ({})", iova + off, err);
+                        return Err(Error::from_errno(err));
+                    }
+                    mapped += 1;
+                }
+                off += FW_REGION_PAGE;
+            }
+            dev_info!(
+                dev,
+                "resume from disk: firmware region {} [{:#x}, +{:#x}) at IOVA {:#x} ({} pages mapped)",
+                idx,
+                phys,
+                size,
+                iova,
+                mapped
+            );
+        }
+        Self::check_fw_set(dev, domain, ec0p, &boot)?;
+        Self::fw_set_store(&boot)
+    }
+
+    #[cfg(not(CONFIG_APPLE_AURA_HIBERNATE))]
+    fn remap_fw_regions_cold(dev: &device::Device, ec0p: u64) -> Result<()> {
+        Self::check_fw_regions(dev, ec0p)
     }
 
     /// Leaks every allocation the firmware may still access. Called when the
@@ -2009,6 +2292,16 @@ impl AOP for AopData {
         // No registration is queued after this point, so once the queue is
         // empty the list of children is complete.
         self.registration_queue.drain();
+        let halted = HALTED_AT_UNBIND.xchg(false, Acquire) && self.cpu_started.load(Acquire);
+        if halted {
+            // Nobody answers: the children's unbind calls fail at once
+            // instead of each waiting for a reply.
+            self.transport_closing.store(true, Release);
+            dev_info!(
+                self.dev,
+                "co-processor halted underneath (resume from disk): releasing the old session without a shutdown"
+            );
+        }
         // Unbind the children while the transport still works, so that their
         // unbind can talk to their services. Then drop any listener a child
         // left behind: no report may reach a driver that is going away.
@@ -2019,8 +2312,10 @@ impl AOP for AopData {
         self.hid_listeners.lock().clear();
         self.report_listeners.lock().clear();
         self.transport_closing.store(true, Release);
-        if let Err(e) = self.stop() {
-            dev_err!(self.dev, "Failed to stop AOP {:?}", e);
+        if !halted {
+            if let Err(e) = self.stop() {
+                dev_err!(self.dev, "Failed to stop AOP {:?}", e);
+            }
         }
         // Take the handle out of the shared state before dropping it: the
         // drop waits for the RTKit receive worker, which takes the same lock.
@@ -2028,7 +2323,7 @@ impl AOP for AopData {
         let rtkit = self.rtkit.lock().take();
         let mut quiesced = true;
         if let Some(mut rtkit) = rtkit {
-            if self.quiesce_on_unbind && self.cpu_started.load(Acquire) {
+            if self.quiesce_on_unbind && self.cpu_started.load(Acquire) && !halted {
                 // The co-processor DMAs into the shared buffers until it has
                 // acknowledged the shutdown. If it does not, nothing it may
                 // still write to can be freed.
@@ -2647,7 +2942,15 @@ impl platform::Driver for AopDriver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cfg = info.ok_or(ENODEV)?;
-        if RETIRED.load(Acquire) {
+        let cold = COLD_REPROBE.load(Acquire);
+        if cold && RETIRED.load(Acquire) && RETIRED_BEFORE_HALT.load(Acquire) {
+            // The boot loader halted and restaged the co-processor since the
+            // shutdown failed: nothing runs on the retained buffers anymore.
+            dev_warn!(
+                pdev.as_ref(),
+                "an earlier instance could not be shut down, but the co-processor was restaged since (resume from disk)"
+            );
+        } else if RETIRED.load(Acquire) {
             dev_err!(
                 pdev.as_ref(),
                 "an earlier instance could not be shut down; reboot before probing again"
@@ -2663,7 +2966,19 @@ impl platform::Driver for AopDriver {
         let asc_mmio = asc_mmio.as_view().relaxed();
         if cfg.fw_regions {
             // Before anything is written to the AOP: no mapping, no start.
-            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
+            if cold {
+                // Remapping is only safe while the firmware does not run.
+                if asc_mmio.read(ASC_CPU_CONTROL).cpu_run() != 0 {
+                    dev_err!(
+                        pdev.as_ref(),
+                        "resume from disk: the co-processor runs, its firmware regions are left alone"
+                    );
+                    return Err(EBUSY);
+                }
+                AopData::remap_fw_regions_cold(pdev.as_ref(), cfg.ec0p)?;
+            } else {
+                AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
+            }
         }
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
@@ -2688,6 +3003,14 @@ impl platform::Driver for AopDriver {
         }
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.cpu_started.store(true, Release);
+        if cold {
+            // The firmware runs from here on: a later unbind sees it running
+            // and the next probe is an ordinary one, whatever happens below.
+            COLD_REPROBE.store(false, Release);
+            if RETIRED_BEFORE_HALT.xchg(false, Acquire) {
+                RETIRED.store(false, Release);
+            }
+        }
         let started = if cfg.setup_port {
             // The RTKit handshake up to AP power on comes first, then the
             // setup port's own power state and endpoint buffers, and only
@@ -2725,11 +3048,31 @@ impl platform::Driver for AopDriver {
         Ok(Self(data))
     }
 
-    fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+    fn unbind(dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        let halted = asc_cpu_halted(dev);
+        HALTED_AT_UNBIND.store(halted, Release);
+        if halted {
+            RETIRED_BEFORE_HALT.store(RETIRED.load(Acquire), Release);
+            COLD_REPROBE.store(true, Release);
+        }
         // The device is still bound here, which the DMA allocations the
         // teardown frees require. Drop only repeats it as a no-op.
         this.0.remove();
     }
+}
+
+/// Reads the ASC CPU run bit. Probe sets it; only the boot loader clears it
+/// (the co-processor is staged halted at every boot, including the one a
+/// resume from disk starts with). Any failure to read it counts as running,
+/// which keeps the full shutdown.
+fn asc_cpu_halted(pdev: &platform::Device<Core<'_>>) -> bool {
+    let Some(req) = pdev.io_request_by_index(1) else {
+        return false;
+    };
+    let Ok(asc) = req.iomap_sized::<ASC_MMIO_SIZE>() else {
+        return false;
+    };
+    asc.as_view().relaxed().read(ASC_CPU_CONTROL).cpu_run() == 0
 }
 
 impl Drop for AopDriver {
