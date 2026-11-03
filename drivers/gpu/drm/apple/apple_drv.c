@@ -1293,7 +1293,7 @@ static int apple_drm_init_dcp(struct device *dev)
 		connector_type[i] = dcp_get_connector_type(dcp[i]);
 		start[i].dcp = dcp[i];
 		INIT_WORK_ONSTACK(&start[i].work, apple_dcp_start_fn);
-		queue_work(system_unbound_wq, &start[i].work);
+		queue_work(system_dfl_wq, &start[i].work);
 	}
 	for (i = 0; i < num_dcp; i++) {
 		flush_work(&start[i].work);
