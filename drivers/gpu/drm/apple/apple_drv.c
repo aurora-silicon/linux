@@ -901,7 +901,7 @@ static int apple_probe_per_dcp(struct device *dev,
 							supports_l10r,
 							supports_xrgb2101010,
 							plane_type, interchange,
-							supports_premultiplied);
+							supports_premultiplied, dcp_is_ext26(dcp_data));
 		}
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);

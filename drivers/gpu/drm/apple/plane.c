@@ -6,6 +6,7 @@
 #include "plane.h"
 #include "dcp.h"
 
+#include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb_internal.h"
 
@@ -231,6 +232,27 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 	crtc_state = drm_atomic_get_crtc_state(commit, new_plane_state->crtc);
 	if (IS_ERR(crtc_state))
 		return PTR_ERR(crtc_state);
+
+	{
+		struct platform_device *pdev = to_apple_crtc(new_plane_state->crtc)->dcp;
+		struct apple_dcp *target = pdev ? platform_get_drvdata(pdev) : NULL;
+		struct drm_framebuffer *fb = new_plane_state->fb;
+
+		if (target && dcp_is_ext26(target) && fb && !iomfb_ext26_backing_fresh(target, fb))
+			return -EINVAL;
+		if (target && dcp_is_ext26(target) && fb &&
+		    (plane->type != DRM_PLANE_TYPE_PRIMARY || fb->format->format != DRM_FORMAT_XRGB8888 ||
+		     fb->modifier != DRM_FORMAT_MOD_LINEAR || fb->offsets[0] ||
+		     crtc_state->vrr_enabled || new_plane_state->rotation != DRM_MODE_ROTATE_0 ||
+		     new_plane_state->src_x || new_plane_state->src_y ||
+		     new_plane_state->src_w != ((u32)crtc_state->mode.hdisplay << 16) ||
+		     new_plane_state->src_h != ((u32)crtc_state->mode.vdisplay << 16) ||
+		     new_plane_state->crtc_x || new_plane_state->crtc_y ||
+		     new_plane_state->crtc_w != crtc_state->mode.hdisplay ||
+		     new_plane_state->crtc_h != crtc_state->mode.vdisplay ||
+		     fb->width != crtc_state->mode.hdisplay || fb->height != crtc_state->mode.vdisplay))
+			return -EINVAL;
+	}
 
 	/*
 	 * DCP limits downscaling to 2x and upscaling to 4x. Attempting to
@@ -745,8 +767,9 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   bool supports_xrgb2101010,
 				   enum drm_plane_type type,
 				   bool interchange,
-				   bool premultiplied)
+				   bool premultiplied, bool native26)
 {
+	static const u32 native_formats[] = { DRM_FORMAT_XRGB8888 };
 	struct apple_plane *plane;
 	unsigned int blend_modes;
 	const u32 *fmts;
@@ -755,7 +778,10 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		if (supports_l10r && supports_xrgb2101010) {
+		if (native26) {
+			fmts = native_formats;
+			num_fmts = ARRAY_SIZE(native_formats);
+		} else if (supports_l10r && supports_xrgb2101010) {
 			fmts = dcp_primary_formats;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats);
 		} else if (supports_l10r) {
