@@ -109,9 +109,12 @@ static const struct apple_rtkit_ops apple_rtkit_helper_ops = {
 	.shmem_destroy = apple_rtkit_helper_shmem_destroy,
 };
 
-static void apple_rtkit_helper_release(void *rtk)
+static void apple_rtkit_helper_release(void *data)
 {
-	apple_rtkit_free_retaining_buffers(rtk);
+	struct apple_rtkit_helper *helper = data;
+
+	/* The current session object: a hibernation restore may have replaced it. */
+	apple_rtkit_free_retaining_buffers(helper->rtk);
 }
 
 /*
@@ -329,7 +332,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 					     "Failed to adopt RTKit\n");
 
 		ret = devm_add_action_or_reset(dev, apple_rtkit_helper_release,
-					       helper->rtk);
+					       helper);
 		if (ret)
 			return ret;
 
@@ -367,6 +370,18 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	if (helper->adopted || helper->preserved)
 		return;
 
+	/*
+	 * After a resume from disk the boot loader left the coprocessor halted
+	 * with fresh firmware loaded, while the restored host session still
+	 * believes it runs: nothing would answer the quiesce. Drop the session
+	 * without a handshake so that the next probe starts the CPU again.
+	 */
+	if (!(readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
+	      APPLE_ASC_CPU_CONTROL_RUN)) {
+		dev_info(&pdev->dev, "co-processor halted underneath (resume from disk): removed without quiesce\n");
+		return;
+	}
+
 	if (apple_rtkit_is_running(helper->rtk))
 		apple_rtkit_quiesce(helper->rtk);
 
@@ -383,18 +398,94 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
+#ifdef CONFIG_HIBERNATION
+/*
+ * Hibernation of an adopted session. The image is written while the firmware
+ * keeps running; its buffers live in SRAM or in no-map reserved RAM, so they
+ * are not part of the image and the host side has nothing to quiesce. The
+ * restore re-adopts the instance the boot loader started for the resume boot,
+ * exactly as probe adopted the first one.
+ */
+static int apple_rtkit_helper_freeze(struct device *dev)
+{
+	return 0;
+}
+
+static int apple_rtkit_helper_thaw(struct device *dev)
+{
+	return 0;
+}
+
+static int apple_rtkit_helper_restore(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	struct apple_rtkit_inherited_buffer buffers[APPLE_RTKIT_HELPER_MAX_BUFFERS] = {};
+	struct apple_rtkit *old, *rtk;
+	int count, live;
+
+	if (!helper->adopted) {
+		/*
+		 * A session this driver started itself: the resume boot left the
+		 * coprocessor in whatever state the loader chose. Starting it
+		 * again blind is not safe; keep the stale session until userspace
+		 * reloads the driver after the restore (e.g. from a sleep hook).
+		 */
+		dev_info(dev, "resume from disk: self-started RTKit session left for a reload\n");
+		return 0;
+	}
+
+	/*
+	 * The restored tree still carries the handoff the image's boot stage
+	 * wrote. The resume boot's loader hands the same firmware over at the
+	 * same SRAM and no-map addresses (the inventory comes from the firmware
+	 * carveouts, not from the kernel allocator), so re-read it and check
+	 * that a CPU is running behind it.
+	 */
+	live = apple_rtkit_helper_live(helper);
+	if (live < 0)
+		return dev_err_probe(dev, live, "hibernation restore: invalid live RTKit handoff\n");
+	if (!live)
+		return dev_err_probe(dev, -ENODEV,
+				     "hibernation restore: no live RTKit session to re-adopt\n");
+	count = apple_rtkit_helper_inherit_buffers(helper, buffers);
+	if (count < 0)
+		return dev_err_probe(dev, count,
+				     "hibernation restore: invalid inherited RTKit buffers\n");
+
+	rtk = apple_rtkit_init_adopted_with_buffers(dev, helper, NULL, 0,
+						    &apple_rtkit_helper_ops, buffers, count);
+	if (IS_ERR(rtk))
+		return dev_err_probe(dev, PTR_ERR(rtk),
+				     "hibernation restore: failed to re-adopt RTKit\n");
+
+	/* The old object described an instance that no longer exists. */
+	old = helper->rtk;
+	helper->rtk = rtk;
+	helper->strict_buffers = count > 0 ||
+		of_device_is_compatible(dev->of_node, "apple,t8132-mtp");
+	apple_rtkit_free_retaining_buffers(old);
+	dev_info(dev, "re-adopted the running RTKit session after hibernation (%d retained buffers)\n",
+		 count);
+	return 0;
+}
+#else
+static int apple_rtkit_helper_freeze(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
 
 	/* A hibernation image cannot recreate the firmware's live DMA ownership. */
 	return helper->adopted ? -EBUSY : 0;
 }
+#endif
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
 	.suspend = pm_sleep_ptr(apple_rtkit_helper_suspend),
 	.freeze = pm_sleep_ptr(apple_rtkit_helper_freeze),
 	.poweroff = pm_sleep_ptr(apple_rtkit_helper_freeze),
+#ifdef CONFIG_HIBERNATION
+	.thaw = apple_rtkit_helper_thaw,
+	.restore = apple_rtkit_helper_restore,
+#endif
 };
 
 static const struct of_device_id apple_rtkit_helper_of_match[] = {
