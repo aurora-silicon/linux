@@ -18,6 +18,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/workqueue.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/display.h>
 
@@ -1197,6 +1198,28 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 	drm_connector_list_iter_end(&iter);
 }
 
+/*
+ * Each display processor runs its own RTKit firmware, and starting one waits
+ * for its firmware: a T6041 external processor takes 0.6 to 1.6 s to bring up
+ * its endpoints. Started one after another, the internal panel waited for
+ * every external processor before the DRM device registered. Start them all
+ * at once and wait for each; shared routes and crossbars are claimed through
+ * the display fabric's locking, as they are when processors hotplug.
+ */
+struct apple_dcp_start_work {
+	struct work_struct work;
+	struct platform_device *dcp;
+	int ret;
+};
+
+static void apple_dcp_start_fn(struct work_struct *work)
+{
+	struct apple_dcp_start_work *w =
+		container_of(work, struct apple_dcp_start_work, work);
+
+	w->ret = dcp_start(w->dcp);
+}
+
 static int apple_drm_init_dcp(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
@@ -1205,6 +1228,7 @@ static int apple_drm_init_dcp(struct device *dev)
 	u32 crtc_mask[MAX_COPROCESSORS] = {};
 	int connector_type[MAX_COPROCESSORS];
 	bool started[MAX_COPROCESSORS] = {};
+	struct apple_dcp_start_work start[MAX_COPROCESSORS];
 	bool ready[MAX_COPROCESSORS] = {};
 	struct device_node *np;
 	u64 timeout;
@@ -1267,7 +1291,14 @@ static int apple_drm_init_dcp(struct device *dev)
 
 	for (i = 0; i < num_dcp; i++) {
 		connector_type[i] = dcp_get_connector_type(dcp[i]);
-		ret = dcp_start(dcp[i]);
+		start[i].dcp = dcp[i];
+		INIT_WORK_ONSTACK(&start[i].work, apple_dcp_start_fn);
+		queue_work(system_unbound_wq, &start[i].work);
+	}
+	for (i = 0; i < num_dcp; i++) {
+		flush_work(&start[i].work);
+		destroy_work_on_stack(&start[i].work);
+		ret = start[i].ret;
 		started[i] = !ret;
 		if (ret)
 			dev_warn(dev, "DCP[%d] failed to start: %d\n", i, ret);
