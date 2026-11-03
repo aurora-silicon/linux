@@ -458,7 +458,7 @@ struct apple_pcie_port {
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
-	/* PERST# of a conventional port with a single reset line. */
+	/* PERST# of a conventional or adopted port with a single reset line. */
 	struct gpio_desc	*perst;
 	struct irq_domain	*domain;
 	struct list_head	entry;
@@ -477,7 +477,6 @@ struct apple_pcie_port {
 	void __iomem		*intr2axi;	/* adopt_link: this port's */
 	u8			adopted_bus;	/* adopt_link: the secondary bus */
 	unsigned long		adopted_slots;	/* adopt_link: RID2SID slots routed (slot == SID) */
-	void __iomem		*perst;		/* adopt_link: the PERST# pad, for a root-port reset */
 };
 
 static int apple_pcie_managed_admit(struct apple_pcie_port *port);
@@ -1777,12 +1776,18 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 	port->intr2axi = devm_platform_ioremap_resource_byname(pdev, name);
 	if (IS_ERR(port->intr2axi))
 		return PTR_ERR(port->intr2axi);
-	/* Only a port whose endpoint needs a root-port reset names its PERST# pad */
-	snprintf(name, sizeof(name), "perst%d", port->idx);
-	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, name)) {
-		port->perst = devm_platform_ioremap_resource_byname(pdev, name);
-		if (IS_ERR(port->perst))
+	/*
+	 * Only a port whose endpoint needs a root-port reset names its PERST# line
+	 * (reset-gpios, on the port node as on every other Apple host). The pin
+	 * controller owns the pad; the line is taken as the bootloader left it,
+	 * released, and driven only by the reset.
+	 */
+	port->perst = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(port->np), "reset",
+					    GPIOD_ASIS, "PERST#");
+	if (IS_ERR(port->perst)) {
+		if (PTR_ERR(port->perst) != -ENOENT)
 			return PTR_ERR(port->perst);
+		port->perst = NULL;
 	}
 
 	/* The currently qualified handoff is Gen3 x1, with no retrain in progress. */
@@ -1940,20 +1945,14 @@ static int apple_pcie_t6050_tune(struct apple_pcie_port *port, struct pci_dev *r
 	return 0;
 }
 
-/* PERST# through its pad: a GPIO output (function bits cleared) at the level asked for */
+/*
+ * PERST# through the pin controller: the pad as a GPIO output (its function bits
+ * cleared, mode output) at the line's logical level, which the DT's
+ * GPIO_ACTIVE_LOW turns into the pad level.
+ */
 static int apple_pcie_t6050_perst(struct apple_pcie_port *port, bool asserted)
 {
-	u32 old, value;
-
-	old = readl(port->perst);
-	if (old & BIT(21))
-		return -EIO;
-	value = (old & ~0x27f) | 0x202 | !asserted;
-	/* The input enable (bit 9) goes on after the rest */
-	writel((value & ~0x200) | (old & 0x200), port->perst);
-	if (!(old & 0x200))
-		writel(value, port->perst);
-	return (readl(port->perst) ^ value) & 0x27f ? -EIO : 0;
+	return gpiod_direction_output(port->perst, asserted);
 }
 
 /* Let the link go idle, hold the endpoint in reset and stop the port and its lane clocks */
@@ -3817,9 +3816,19 @@ static int apple_pcie_probe(struct platform_device *pdev)
 			if (of_property_read_u32(child, "reg", &reg) || reg & ~0xf800 ||
 			    (reg >> 11) > 3 ||
 			    !of_property_read_bool(child, "apple,link-trained-by-bootloader") ||
-			    of_property_present(child, "reset-gpios") ||
 			    of_property_present(child, "pwren-gpios"))
 				return -EINVAL;
+			/*
+			 * A port whose endpoint needs a root-port reset names its PERST#
+			 * line: probe waits for the line's controller before any port is
+			 * touched (a failed adoption would otherwise swallow the deferral).
+			 */
+			if (of_property_present(child, "reset-gpios")) {
+				ret = apple_pcie_probe_port(child);
+				if (ret)
+					return dev_err_probe(dev, ret, "Port %pOF probe fail\n",
+							     child);
+			}
 		}
 	} else if (!hw->tunneled) {
 		/* Check for probe dependencies for all ports first */
