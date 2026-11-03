@@ -398,6 +398,8 @@ struct apple_isp {
 	enum isp_fw_state fw_state;
 	/* First IPC failure; cleared only after fresh channel initialization. */
 	int ipc_error;
+	/* End the current receive invocation before resident reclamation. */
+	bool ipc_quiescing;
 	/* the camera was detected; until then a deferred start is pending */
 	bool camera_detected;
 	/* configurations the firmware has, once a deferred start detected them */

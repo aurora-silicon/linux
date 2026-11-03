@@ -157,12 +157,15 @@ static inline bool chan_rx_done(struct apple_isp *isp, struct isp_channel *chan)
 
 int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
-	unsigned int budget = isp_is_p010(isp) ? chan->num : UINT_MAX;
-	int err = 0;
+	int err = -EAGAIN;
 
 	mutex_lock(&chan->lock);
-	/* A busy producer must not starve the other completion/control rings. */
-	while (budget--) {
+	/* One ring per turn, even if the producer refills acknowledged slots. */
+	for (u32 i = 0; i < chan->num; i++) {
+		if (READ_ONCE(isp->ipc_error)) {
+			err = READ_ONCE(isp->ipc_error);
+			break;
+		}
 		chan_read_msg(isp, chan, &chan->req);
 		if (chan_rx_done(isp, chan)) {
 			err = 0;
@@ -170,8 +173,11 @@ int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan)
 		}
 		err = chan_handle_once(isp, chan);
 		if (err < 0) {
+			cmpxchg(&isp->ipc_error, 0, err);
+			wake_up_all(&isp->wait);
 			break;
 		}
+		err = -EAGAIN;
 	}
 	mutex_unlock(&chan->lock);
 
