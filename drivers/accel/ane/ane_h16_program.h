@@ -3,6 +3,7 @@
 #define __ANE_H16_PROGRAM_H__
 
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <linux/spinlock.h>
 
 #include "ane_fw_transport.h"
@@ -300,6 +301,17 @@ struct ane_h16_session {
 	/* Firmware log lines printed after the last failed EXECUTE. */
 	unsigned int fwlog_lines;
 	bool quarantined;
+	/*
+	 * Dynamic power gating (0x002d) held off across back-to-back requests.
+	 * With gate_hold_ns zero every EXECUTE opens and closes the gate itself.
+	 * Otherwise the first EXECUTE opens it, later ones find it open, and it
+	 * closes gate_hold_ns after the last one ended (gate_work, serialized on
+	 * lock), before TERMINATE, and before system sleep.
+	 */
+	u64 gate_hold_ns;
+	bool gate_held;
+	u64 gate_last_ns;
+	struct delayed_work gate_work;
 	/* Firmware phases of the last successful EXECUTE. */
 	struct ane_h16_exec_sample timing;
 	/* Accounted EXECUTEs; the lock lets a reader snapshot them. */
@@ -321,6 +333,7 @@ void ane_h16_session_put(struct ane_h16_session *s, struct ane_h16_program *p);
 int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock);
 unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
+int ane_h16_session_gate_expire(struct ane_h16_session *s);
 void ane_h16_session_restart(struct ane_h16_session *s);
 int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
 			   u64 *first_ns);

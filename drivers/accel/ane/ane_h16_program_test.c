@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 
 #include "ane_h16_boot.h"
 #include "ane_h16_program.h"
@@ -1056,6 +1057,65 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, second), 0);
 	/* Closing the first program's file late is harmless. */
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
+ * Gating held off across back-to-back requests: one 0x002d 0 for a run of
+ * EXECUTEs, 0x002d 1 once the hold expired, again before TERMINATE, and
+ * before system sleep. Without a hold every EXECUTE gates itself.
+ */
+static void program_gate_hold_test(struct kunit *test)
+{
+	static const u16 expected[] = {
+		0x200, 0x202, 0x2d, 0x20c, 0x20c, 0x20c, 0x2d,
+		0x2d, 0x20c, 0x2d, 0x203, 0x201,
+		0x200, 0x202, 0x2d, 0x20c, 0x2d,
+	};
+	static const u32 gates[] = { 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1 };
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+	/* Stands in for the accel node lock the sleep gate takes. */
+	struct mutex lock;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->s.gate_hold_ns = 1000;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	for (i = 0; i < 3; i++)
+		KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_TRUE(test, f->s.gate_held);
+	/* Held requests report no gate phases. */
+	KUNIT_EXPECT_EQ(test, f->s.timing.ns[ANE_H16_T_GATE_OPEN], 0);
+	KUNIT_EXPECT_EQ(test, f->s.timing.ns[ANE_H16_T_GATE_CLOSE], 0);
+	/* Too soon after the last request: still held, no traffic. */
+	i = f->count;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_gate_expire(&f->s), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, f->count, i);
+	f->now += 1000;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_gate_expire(&f->s), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.gate_held);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_gate_expire(&f->s), 0);
+	/* The next request opens it again; close turns gating on first. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.gate_held);
+	/* System sleep turns gating on before the firmware is suspended. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &q), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, q), 0);
+	mutex_init(&lock);
+	f->s.lock = &lock;
+	ane_h16_session_sleep(&f->s, true);
+	KUNIT_EXPECT_FALSE(test, f->s.gate_held);
+	ane_h16_session_sleep(&f->s, false);
+	f->s.lock = NULL;
+	KUNIT_ASSERT_EQ(test, f->count, ARRAY_SIZE(expected));
+	for (i = 0; i < ARRAY_SIZE(expected); i++) {
+		KUNIT_EXPECT_EQ(test, f->ids[i], expected[i]);
+		if (f->ids[i] == 0x2d)
+			KUNIT_EXPECT_EQ(test, f->values[i], gates[i]);
+	}
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, q), 0);
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
@@ -2153,6 +2213,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_deny_list_test),
 	KUNIT_CASE(program_custom_bar_test),
 	KUNIT_CASE(program_session_test),
+	KUNIT_CASE(program_gate_hold_test),
 	KUNIT_CASE(program_scratch_test),
 	KUNIT_CASE(program_bad_load_test),
 	KUNIT_CASE(program_bad_report_test),
