@@ -483,11 +483,27 @@ static int flush_swap_writer(struct swap_map_handle *handle)
 static int swap_writer_finish(struct swap_map_handle *handle,
 		unsigned int flags, int error)
 {
+	int flush;
+
 	if (!error) {
 		pr_info("S");
 		error = mark_swapfiles(handle, flags);
 		pr_cont("|\n");
 		flush_swap_writer(handle);
+		/*
+		 * Make the image durable now: otherwise the device cache is
+		 * flushed only by the device shutdown in the power-off that
+		 * follows, and a platform whose power-off does not get that far
+		 * loses the image. A failed flush leaves no durable image: drop
+		 * the signature durably (unlike swsusp_unmark()) so that no
+		 * later boot resumes from freed swap.
+		 */
+		flush = blkdev_issue_flush(file_bdev(hib_resume_bdev_file));
+		if (!error && flush) {
+			if (swsusp_invalidate_sig())
+				pr_err("image flush failed and the signature could not be dropped\n");
+			error = flush;
+		}
 	}
 
 	if (error)
@@ -1583,8 +1599,13 @@ int swsusp_check(bool exclusive)
 		if (!memcmp(HIBERNATE_SIG, swsusp_header->sig, 10)) {
 			memcpy(swsusp_header->sig, swsusp_header->orig_sig, 10);
 			swsusp_header_flags = swsusp_header->flags;
-			/* Reset swap signature now */
-			error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC,
+			/*
+			 * Reset swap signature now. FUA: a REQ_SYNC write
+			 * can sit in a volatile device cache, and a hard
+			 * power-off of a hung restore then loses it and the
+			 * next boot resumes the same image again.
+			 */
+			error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC | REQ_FUA,
 						swsusp_resume_block,
 						swsusp_header);
 		} else {
@@ -1623,6 +1644,39 @@ void swsusp_close(void)
 	}
 
 	fput(hib_resume_bdev_file);
+}
+
+/*
+ * Clear the on-disk image signature without freeing the swap pages.
+ * Called on the resume path right after the image is read into memory and
+ * before the device restore, so a restore that hangs (a co-processor that does
+ * not come back after a cold boot) cannot leave a valid image that the next
+ * boot resumes into the same hang. Unlike swsusp_unmark() this keeps the swap
+ * pages: the resuming kernel is about to jump into the restored image, and
+ * freeing swap here would desync the restored kernel's swap accounting.
+ */
+int swsusp_invalidate_sig(void)
+{
+	int error;
+
+	error = hib_submit_io_sync(REQ_OP_READ, swsusp_resume_block, swsusp_header);
+	if (error)
+		return error;
+	/*
+	 * swsusp_check() normally reset the signature already; that write may
+	 * still be in the device's volatile cache, so rewrite the header with
+	 * FUA either way and make the reset durable before the restore.
+	 */
+	if (!memcmp(HIBERNATE_SIG, swsusp_header->sig, 10))
+		memcpy(swsusp_header->sig, swsusp_header->orig_sig, 10);
+	else if (memcmp(swsusp_header->sig, swsusp_header->orig_sig, 10))
+		return -ENODEV;
+	error = hib_submit_io_sync(REQ_OP_WRITE | REQ_SYNC | REQ_FUA,
+				   swsusp_resume_block, swsusp_header);
+	/* A device that ignores FUA still honours an explicit cache flush. */
+	if (!error)
+		error = blkdev_issue_flush(file_bdev(hib_resume_bdev_file));
+	return error;
 }
 
 /**

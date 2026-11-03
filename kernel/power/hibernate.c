@@ -744,6 +744,18 @@ static int load_image_and_restore(void)
 	}
 
 	error = swsusp_read(&flags);
+	if (!error) {
+		/*
+		 * The image is in memory now. Clear its on-disk signature
+		 * before the device restore, so that a restore which hangs
+		 * (for example a co-processor that does not come back after
+		 * the cold boot) cannot leave a valid image for the next boot
+		 * to resume into the same hang. swsusp_close() releases the
+		 * resume device, so do it while that is still open.
+		 */
+		if (swsusp_invalidate_sig())
+			pr_warn("could not invalidate the image signature; a failed restore may repeat\n");
+	}
 	swsusp_close();
 	if (!error)
 		error = hibernation_restore(flags & SF_PLATFORM_MODE);
