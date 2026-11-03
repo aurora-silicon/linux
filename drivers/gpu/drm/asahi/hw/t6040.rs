@@ -53,6 +53,7 @@ pub(crate) const CONFIG: Config = Config {
     },
     region_c: &REGION_C,
     chip: None,
+    captured: None,
     adopt_root_entries: false,
     fabric_bridge: false,
     // The firmware's per-slot recovery keys are not known for this build; recovery relies on
@@ -100,6 +101,7 @@ pub(crate) const CONFIG: Config = Config {
             },
         ],
         variant: &fw::variant::V25G83,
+        config: None,
     }]),
     // Measured on the 20-core M4 Pro; other core counts are refused at probe.
     core_layout: CoreLayout {

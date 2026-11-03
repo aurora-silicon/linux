@@ -2,7 +2,7 @@
 
 
 use super::{
-    fill_words, perf_states, CompletionRingDescriptor, HwDataArgs, Opp, PerfGroup,
+    fill_words, perf_states, CompletionRingDescriptor, HwDataArgs, Opp, PerfGroup, RegionC,
     RegisterMapEntry, Words, COMPLETION_RING_ENTRIES, COMPLETION_RING_ENTRY_SIZE,
     COMPLETION_RING_INDEX, PERF_STATES, REGISTER_MAP_SLOTS,
 };
@@ -356,17 +356,7 @@ impl HwData25G83 {
         self.unk_25fc = 1;
         self.unk_2614 = 1;
         self.unk_261c = 0x100;
-        for (ring, index) in args.completion_rings.iter().zip(COMPLETION_RING_INDEX) {
-            self.completion_rings[index as usize] = CompletionRingDescriptor {
-                low_va: ring.low_va,
-                high_va: ring.high_va,
-                entries: COMPLETION_RING_ENTRIES,
-                entry_size: COMPLETION_RING_ENTRY_SIZE,
-                index,
-                unk_1c: 0,
-            };
-        }
-        self.qos_va = args.qos_va;
+        self.set_runtime_words(args);
         self.unk_26c0 = 1;
         self.unk_26c4 = 1;
         self.unk_26f4 = 1;
@@ -379,6 +369,95 @@ impl HwData25G83 {
             overlay_words(bytes, chip.hw_data_words)?;
         }
         Ok(())
+    }
+
+    /// Writes the words the host sets at every boot: the completion-ring descriptors and the
+    /// QoS pointer.
+    fn set_runtime_words(&mut self, args: &HwDataArgs<'_>) {
+        for (ring, index) in args.completion_rings.iter().zip(COMPLETION_RING_INDEX) {
+            self.completion_rings[index as usize] = CompletionRingDescriptor {
+                low_va: ring.low_va,
+                high_va: ring.high_va,
+                entries: COMPLETION_RING_ENTRIES,
+                entry_size: COMPLETION_RING_ENTRY_SIZE,
+                index,
+                unk_1c: 0,
+            };
+        }
+        self.qos_va = args.qos_va;
+    }
+
+    /// Initializes the hardware data from captured contents, then writes the runtime words.
+    ///
+    /// The captured chip identifier and register map must be the ones `args` names: the
+    /// firmware finds its register windows through the map, and the driver maps exactly
+    /// `args.windows`.
+    pub(crate) fn init_captured(&mut self, captured: &Captured, args: &HwDataArgs<'_>) -> Result {
+        fill_words(self.bytes_mut(), captured.hw_data);
+        if !args.reserved_slots.is_empty() || { self.chip_id } != args.chip_id {
+            return Err(EINVAL);
+        }
+        let mut expected = [[0u8; size_of::<RegisterMapEntry>()]; REGISTER_MAP_SLOTS];
+        let mut used = [false; REGISTER_MAP_SLOTS];
+        for window in args.windows {
+            match used.get_mut(window.slot) {
+                Some(used) if !*used => *used = true,
+                _ => return Err(EINVAL),
+            }
+            expected[window.slot] = RegisterMapEntry::window(window).to_bytes();
+        }
+        let map = core::mem::offset_of!(Self, register_map);
+        let bytes = self.bytes_mut();
+        for (slot, entry) in expected.iter().enumerate() {
+            let at = map + slot * entry.len();
+            if bytes[at..at + entry.len()] != entry[..] {
+                return Err(EINVAL);
+            }
+        }
+        self.set_runtime_words(args);
+        Ok(())
+    }
+
+    /// The runtime words, which [`Self::hash_captured`] leaves out.
+    const RUNTIME: [(usize, usize); 2] = [(COMPLETION_DESCRIPTORS, 0x80), (QOS_POINTER, 8)];
+
+    /// Hash of captured contents: everything but the runtime words.
+    pub(crate) fn hash_captured(&self) -> u64 {
+        hash_without(self.bytes(), &Self::RUNTIME)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `HwData25G83` consists of integers only and has no padding.
+        unsafe {
+            core::slice::from_raw_parts((self as *const Self).cast::<u8>(), size_of::<Self>())
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `HwData25G83` consists of integers only and has no padding, so every byte is
+        // initialized and any byte pattern is a valid value.
+        unsafe {
+            core::slice::from_raw_parts_mut((self as *mut Self).cast::<u8>(), size_of::<Self>())
+        }
+    }
+}
+
+impl RegisterMapEntry {
+    /// The entry as the firmware reads it.
+    fn to_bytes(&self) -> [u8; size_of::<RegisterMapEntry>()] {
+        let mut bytes = [0; size_of::<RegisterMapEntry>()];
+        for (at, field) in [
+            (0x0, &self.phys.to_le_bytes()[..]),
+            (0x8, &self.va.to_le_bytes()[..]),
+            (0x10, &self.total_size.to_le_bytes()[..]),
+            (0x14, &self.element_size.to_le_bytes()[..]),
+            (0x18, &self.unk_18.to_le_bytes()[..]),
+            (0x20, &self.unk_20.to_le_bytes()[..]),
+            (0x24, &self.unk_24.to_le_bytes()[..]),
+        ] {
+            bytes[at..at + field.len()].copy_from_slice(field);
+        }
+        bytes
     }
 }
 
@@ -617,15 +696,90 @@ impl PowerConfig25G83 {
         for offset in [0x9e0, 0x2a04] {
             self.0[offset..offset + 4].copy_from_slice(&power.to_le_bytes());
         }
+        self.set_runtime_words(config_va, aon_va, entropy);
+    }
+
+    pub(crate) fn apply_chip(&mut self, chip: &Chip) -> Result {
+        overlay_words(&mut self.0, chip.power_config_words)
+    }
+
+    /// Initializes the power configuration from captured contents, then writes the runtime
+    /// words.
+    pub(crate) fn init_captured(
+        &mut self,
+        words: Words,
+        config_va: u64,
+        aon_va: u64,
+        entropy: u32,
+    ) {
+        fill_words(&mut self.0, words);
+        self.set_runtime_words(config_va, aon_va, entropy);
+    }
+
+    /// Writes the pointers and the random word ([`Self::RUNTIME`]).
+    fn set_runtime_words(&mut self, config_va: u64, aon_va: u64, entropy: u32) {
         self.0[CONFIG_STATUS_POINTER..CONFIG_STATUS_POINTER + 8]
             .copy_from_slice(&(config_va + 0x80).to_le_bytes());
         self.0[AON_POINTER..AON_POINTER + 8].copy_from_slice(&aon_va.to_le_bytes());
         self.0[ENTROPY..ENTROPY + 4].copy_from_slice(&entropy.to_le_bytes());
     }
 
-    pub(crate) fn apply_chip(&mut self, chip: &Chip) -> Result {
-        overlay_words(&mut self.0, chip.power_config_words)
+    /// The pointers and the random word, which [`Self::hash`] leaves out.
+    const RUNTIME: [(usize, usize); 3] =
+        [(CONFIG_STATUS_POINTER, 8), (AON_POINTER, 8), (ENTROPY, 4)];
+
+    /// Hash of the contents without the pointers and the random word.
+    pub(crate) fn hash(&self) -> u64 {
+        hash_without(&self.0, &Self::RUNTIME)
     }
+}
+
+/// 25G83 initialization contents captured on one unit, which a configuration whose device
+/// tree has no inputs for the builders above applies instead of what they produce. Only the
+/// runtime words are written over them.
+pub(crate) struct Captured {
+    /// The [`HwData25G83`], without its runtime words.
+    pub(crate) hw_data: Words,
+    /// The [`PowerConfig25G83`] and its auxiliary data, without the runtime words.
+    pub(crate) power_config: Words,
+    /// Region C.
+    pub(crate) region_c: Words,
+    /// The AON temperature-source rows.
+    pub(crate) aon_table: &'static [u32],
+    /// Enabled GPU cores the contents were captured with. The captured performance tables
+    /// are that unit's binned operating points; another core count is another part.
+    pub(crate) active_cores: u32,
+    /// Hashes ([`hash_without`]) of the captured hardware data without its runtime words
+    /// ([`HwData25G83::hash_captured`]), power configuration ([`PowerConfig25G83::hash`]) and
+    /// region C, which what the driver wrote must equal.
+    pub(crate) expected: [u64; 3],
+}
+
+impl RegionC {
+    /// Initializes region C from captured contents.
+    pub(crate) fn init_captured(&mut self, words: Words) {
+        // SAFETY: `RegionC` consists of integers only and is packed, so every byte is
+        // initialized and any byte pattern is a valid value.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut((self as *mut Self).cast::<u8>(), size_of::<Self>())
+        };
+        fill_words(bytes, words);
+    }
+}
+
+/// FNV-1a 64 of `bytes` with the `(offset, length)` ranges in `skip` left out.
+pub(crate) fn hash_without(bytes: &[u8], skip: &[(usize, usize)]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for (offset, byte) in bytes.iter().enumerate() {
+        if skip
+            .iter()
+            .any(|&(at, len)| (at..at + len).contains(&offset))
+        {
+            continue;
+        }
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 pub(crate) const AON_TABLE: [u32; 9] = [

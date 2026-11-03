@@ -1589,13 +1589,32 @@ mod ta_mode_tests {
         }
     }
 
+    /// The variants of the builds T6041 admits: 25F84, then 25G83.
+    fn t6041_variants() -> [&'static Variant; 2] {
+        let Firmware::Identified(builds) = crate::hw::t6041::CONFIG.firmware else {
+            panic!("T6041 must identify its loaded firmware");
+        };
+        assert_eq!(builds.len(), 2);
+        [builds[0].variant, builds[1].variant]
+    }
+
+    /// The TA mode of every admitted T6041 build.
+    fn t6041_ta_mode_1() -> bool {
+        let [f84, g83] = t6041_variants();
+        assert_eq!(f84.ta_mode_1, g83.ta_mode_1);
+        f84.ta_mode_1
+    }
+
     #[test]
-    fn policy_is_local_to_the_admitted_t6041_build() {
-        let max = selected(&crate::hw::t6041::CONFIG.firmware);
+    fn policy_is_local_to_the_admitted_t6041_builds() {
+        let [f84, g83] = t6041_variants();
         let pro = selected(&crate::hw::t6040::CONFIG.firmware);
-        assert!(max.is_25f84());
-        assert_eq!(max.programs, RegisterPrograms::V25G83);
-        assert!(max.ta_mode_1);
+        assert!(f84.is_25f84());
+        assert!(!g83.is_25f84());
+        for max in [f84, g83] {
+            assert_eq!(max.programs, RegisterPrograms::V25G83);
+            assert!(max.ta_mode_1);
+        }
         assert!(!pro.ta_mode_1);
         assert!(!V25F84.ta_mode_1);
         assert!(!V25G83.ta_mode_1);
@@ -1664,7 +1683,7 @@ mod ta_mode_tests {
             for scs in [false, true] {
                 let mut args = args(&pass, &resources, scs);
                 let (before, count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
-                args.ta_mode_1 = selected(&crate::hw::t6041::CONFIG.firmware).ta_mode_1;
+                args.ta_mode_1 = t6041_ta_mode_1();
                 let (after, new_count) = ta_registers_25g83(&args, &geometry, &words).unwrap();
                 assert_eq!(count, 83 + usize::from(scs));
                 assert_eq!(new_count, count);

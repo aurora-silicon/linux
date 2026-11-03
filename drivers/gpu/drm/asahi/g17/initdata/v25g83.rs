@@ -98,7 +98,10 @@ impl InitData {
         let status_a_va = cluster_va + v::private::STATUS_A as u64;
         let status_b_va = cluster_va + v::private::STATUS_B as u64;
         let chip = cfg.chip;
-        let aon_table = chip.map_or(v::AON_TABLE.as_slice(), |chip| chip.aon_table);
+        let aon_table = match cfg.captured {
+            Some(captured) => captured.aon_table,
+            None => chip.map_or(v::AON_TABLE.as_slice(), |chip| chip.aon_table),
+        };
         let aon_va = match aon_table.is_empty() {
             true => 0,
             false => self.object(objects.aon)?.gpu_va(),
@@ -114,61 +117,65 @@ impl InitData {
             *va = self.object(index)?.gpu_va();
         }
 
-        let opps = Self::opps(env.dev, cfg.opps, env.clusters)?;
-        let cs_opps = Self::opp_table(env.dev, c_str!("apple,cs-opp"))?;
-        let afr_opps = Self::opp_table(env.dev, c_str!("apple,afr-opp"))?;
-        let calibration = if chip.is_none() {
-            let calibration = Calibration::read(env.dev)?;
-            calibration.check_opps(&opps)?;
-            Some(calibration)
+        if let Some(captured) = cfg.captured {
+            self.write_captured_25g83(env, cfg, captured, active_cores, bundle, config_va, aon_va)?;
         } else {
-            None
-        };
-        let (perf, max_power_mw, leakage) = match (calibration.as_ref(), chip) {
-            (Some(calibration), None) => (
-                &calibration.perf,
-                calibration.max_power_mw,
-                &calibration.leakage,
-            ),
-            (None, Some(chip)) => (cfg.perf, chip.max_power_mw, &chip.leakage),
-            _ => return Err(EINVAL),
-        };
-        let hw_args = abi::HwDataArgs {
-            chip_id: cfg.chip_id,
-            windows: cfg.windows,
-            reserved_slots: cfg.reserved_slots,
-            opps: &opps,
-            perf,
-            completion_rings: bundle.completion_rings,
-            qos_va: self.object(bundle.qos)?.gpu_va(),
-        };
-        let hw_args_25g83 = v::HwDataArgs25G83 {
-            active_cores,
-            cs_opps: &cs_opps,
-            afr_opps: &afr_opps,
-            chip,
-        };
-        // SAFETY: Plain C entropy source.
-        let entropy = unsafe { kernel::bindings::get_random_u32() };
-        self.object_mut(self.bundle)?
-            .initialize::<v::HwData25G83>(0, |hw| {
-                hw.init(&hw_args, &hw_args_25g83)?;
-                Ok(())
-            })?;
-        self.object_mut(self.bundle)?
-            .initialize::<v::PowerConfig25G83>(v::POWER_CONFIG, |power| {
-                power.init(config_va, aon_va, entropy, max_power_mw, leakage);
-                if let Some(chip) = chip {
-                    power.apply_chip(chip)?;
-                }
-                Ok(())
-            })?;
-        self.object_mut(self.region_c)?
-            .initialize::<abi::RegionC>(0, |region| {
-                region.init(cfg.region_c);
-                region.max_power_mw = max_power_mw;
-                Ok(())
-            })?;
+            let opps = Self::opps(env.dev, cfg.opps, env.clusters)?;
+            let cs_opps = Self::opp_table(env.dev, c_str!("apple,cs-opp"))?;
+            let afr_opps = Self::opp_table(env.dev, c_str!("apple,afr-opp"))?;
+            let calibration = if chip.is_none() {
+                let calibration = Calibration::read(env.dev)?;
+                calibration.check_opps(&opps)?;
+                Some(calibration)
+            } else {
+                None
+            };
+            let (perf, max_power_mw, leakage) = match (calibration.as_ref(), chip) {
+                (Some(calibration), None) => (
+                    &calibration.perf,
+                    calibration.max_power_mw,
+                    &calibration.leakage,
+                ),
+                (None, Some(chip)) => (cfg.perf, chip.max_power_mw, &chip.leakage),
+                _ => return Err(EINVAL),
+            };
+            let hw_args = abi::HwDataArgs {
+                chip_id: cfg.chip_id,
+                windows: cfg.windows,
+                reserved_slots: cfg.reserved_slots,
+                opps: &opps,
+                perf,
+                completion_rings: bundle.completion_rings,
+                qos_va: self.object(bundle.qos)?.gpu_va(),
+            };
+            let hw_args_25g83 = v::HwDataArgs25G83 {
+                active_cores,
+                cs_opps: &cs_opps,
+                afr_opps: &afr_opps,
+                chip,
+            };
+            // SAFETY: Plain C entropy source.
+            let entropy = unsafe { kernel::bindings::get_random_u32() };
+            self.object_mut(self.bundle)?
+                .initialize::<v::HwData25G83>(0, |hw| {
+                    hw.init(&hw_args, &hw_args_25g83)?;
+                    Ok(())
+                })?;
+            self.object_mut(self.bundle)?
+                .initialize::<v::PowerConfig25G83>(v::POWER_CONFIG, |power| {
+                    power.init(config_va, aon_va, entropy, max_power_mw, leakage);
+                    if let Some(chip) = chip {
+                        power.apply_chip(chip)?;
+                    }
+                    Ok(())
+                })?;
+            self.object_mut(self.region_c)?
+                .initialize::<abi::RegionC>(0, |region| {
+                    region.init(cfg.region_c);
+                    region.max_power_mw = max_power_mw;
+                    Ok(())
+                })?;
+        }
         for (index, word) in aon_table.iter().enumerate() {
             self.object_mut(objects.aon)?.write(index * 4, *word)?;
         }
@@ -261,6 +268,76 @@ impl InitData {
                 .store(value, Ordering::Relaxed);
         }
         fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Writes the hardware data, power configuration and region C captured on one unit, with
+    /// this boot's runtime words over them, and checks the result against the capture's hashes.
+    /// No operating points are read from the device tree: the captured tables hold the unit's.
+    fn write_captured_25g83(
+        &mut self,
+        env: &BuildEnv<'_>,
+        cfg: &Config,
+        captured: &v::Captured,
+        active_cores: u32,
+        bundle: &BundleObjects,
+        config_va: u64,
+        aon_va: u64,
+    ) -> Result {
+        if active_cores != captured.active_cores {
+            dev_err!(
+                env.dev.as_ref(),
+                "25G83 initialization data was captured with {} cores, the GPU has {}\n",
+                captured.active_cores,
+                active_cores
+            );
+            return Err(EINVAL);
+        }
+        let hw_args = abi::HwDataArgs {
+            chip_id: cfg.chip_id,
+            windows: cfg.windows,
+            reserved_slots: cfg.reserved_slots,
+            opps: &[],
+            perf: cfg.perf,
+            completion_rings: bundle.completion_rings,
+            qos_va: self.object(bundle.qos)?.gpu_va(),
+        };
+        // SAFETY: Plain C entropy source.
+        let entropy = unsafe { kernel::bindings::get_random_u32() };
+        let mut hashes = [0; 3];
+        self.object_mut(self.bundle)?
+            .initialize::<v::HwData25G83>(0, |hw| {
+                hw.init_captured(captured, &hw_args).inspect_err(|_| {
+                    dev_err!(
+                        env.dev.as_ref(),
+                        "Captured 25G83 hardware data does not match chip {:#x} and its register windows\n",
+                        cfg.chip_id
+                    );
+                })?;
+                hashes[0] = hw.hash_captured();
+                Ok(())
+            })?;
+        self.object_mut(self.bundle)?
+            .initialize::<v::PowerConfig25G83>(v::POWER_CONFIG, |power| {
+                power.init_captured(captured.power_config, config_va, aon_va, entropy);
+                hashes[1] = power.hash();
+                Ok(())
+            })?;
+        self.object_mut(self.region_c)?
+            .initialize::<abi::RegionC>(0, |region| {
+                region.init_captured(captured.region_c);
+                Ok(())
+            })?;
+        hashes[2] = v::hash_without(self.object_mut(self.region_c)?.bytes_mut(), &[]);
+        if hashes != captured.expected {
+            dev_err!(
+                env.dev.as_ref(),
+                "25G83 initialization data differs from its capture: {:#x?}, expected {:#x?}\n",
+                hashes,
+                captured.expected
+            );
+            return Err(EINVAL);
+        }
         Ok(())
     }
 }
