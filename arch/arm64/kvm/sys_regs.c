@@ -4131,11 +4131,11 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 
 	EL2_REG(SP_EL2, NULL, reset_unknown, 0),
 
-	{ SYS_DESC(SYS_IMP_APL_ASPSR_EL1), access_apple_aspsr, reset_val,
-	  APPLE_ASPSR_EL1, 0, .visibility = apple_aspsr_visibility },
-
 	{ SYS_DESC(SYS_IMP_APL_AFPCR_EL0), access_apple_afpcr, reset_val,
 	  APPLE_AFPCR_EL0, 0, .visibility = apple_afpcr_visibility },
+
+	{ SYS_DESC(SYS_IMP_APL_ASPSR_EL1), access_apple_aspsr, reset_val,
+	  APPLE_ASPSR_EL1, 0, .visibility = apple_aspsr_visibility },
 };
 
 static bool handle_at_s1e01(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
