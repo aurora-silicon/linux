@@ -202,6 +202,7 @@
 };
 
 &avd {
+	compatible = "apple,t6041-max-avd", "apple,t6041-avd", "apple,t8132-avd";
 	power-domains = <&ps_avd_sys>;
 	/delete-property/ power-domain-names;
 };
