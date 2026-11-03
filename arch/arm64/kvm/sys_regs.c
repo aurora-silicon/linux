@@ -22,6 +22,7 @@
 #include <asm/arm_pmuv3.h>
 #include <asm/apple_cpufeature.h>
 #include <asm/apple_cpufeature.h>
+#include <asm/apple_cpufeature.h>
 #include <asm/cacheflush.h>
 #include <asm/cputype.h>
 #include <asm/debug-monitors.h>
@@ -1018,6 +1019,10 @@ static u64 reset_actlr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 	/* The guest turns the x86 FP mode on itself, per thread */
 	if (cpus_have_final_cap(ARM64_HAS_AFP_APPLE))
 		actlr &= ~ACTLR_APPLE_AFP;
+
+	/* The guest turns upper-lane preservation on itself, per thread */
+	if (cpus_have_final_cap(ARM64_HAS_PRSV_APPLE))
+		actlr &= ~ACTLR_APPLE_PRSV;
 	vcpu_write_sys_reg(vcpu, actlr, ACTLR_EL1);
 	return actlr;
 }

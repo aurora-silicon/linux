@@ -442,6 +442,13 @@ void apple_afp_write_afpcr(struct task_struct *t, u64 afpcr);
 #define AURORA_SET_X86_FP(arg)		apple_x86_fp_set(arg)
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+int apple_fp_preserve_get(void);
+int apple_fp_preserve_set(unsigned long val);
+#define AURORA_GET_FP_PRESERVE()	apple_fp_preserve_get()
+#define AURORA_SET_FP_PRESERVE(arg)	apple_fp_preserve_set(arg)
+#endif
+
 #define SVE_SET_VL(arg)	sve_set_current_vl(arg)
 #define SVE_GET_VL()	sve_get_current_vl()
 #define SME_SET_VL(arg)	sme_set_current_vl(arg)

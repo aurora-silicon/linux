@@ -52,4 +52,15 @@
 #define AFPCR_APPLE_DAZ		BIT(0)
 #define AFPCR_APPLE_FTZ		BIT(1)
 
+/*
+ * PRSV: with ACTLR_EL1.EnPRSV set, scalar floating-point instructions keep
+ * the upper elements of the destination vector, as x86 SSE scalar
+ * instructions do, instead of zeroing them. AIDR_EL1 spells it PSRV.
+ */
+#define AIDR_APPLE_PRSV_SHIFT	20
+#define AIDR_APPLE_PRSV		BIT(20)
+
+#define ACTLR_APPLE_PRSV_SHIFT	6
+#define ACTLR_APPLE_PRSV	BIT(6)
+
 #endif

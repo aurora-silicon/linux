@@ -914,6 +914,39 @@ static inline void apple_afp_thread_switch(struct task_struct *next)
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+int apple_fp_preserve_get(void)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		return -EINVAL;
+
+	return read_sysreg(actlr_el1) & ACTLR_APPLE_PRSV ?
+		PR_AURORA_FP_PRESERVE_ON : PR_AURORA_FP_PRESERVE_OFF;
+}
+
+int apple_fp_preserve_set(unsigned long val)
+{
+	u64 actlr;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		return -EINVAL;
+	if (val != PR_AURORA_FP_PRESERVE_ON && val != PR_AURORA_FP_PRESERVE_OFF)
+		return -EINVAL;
+
+	/* The task switch saves the live ACTLR_EL1, so update it atomically */
+	preempt_disable();
+	actlr = read_sysreg(actlr_el1);
+	if (val == PR_AURORA_FP_PRESERVE_ON)
+		actlr |= ACTLR_APPLE_PRSV;
+	else
+		actlr &= ~ACTLR_APPLE_PRSV;
+	write_sysreg(actlr, actlr_el1);
+	current->thread.actlr = actlr;
+	preempt_enable();
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_ARM64_ACTLR_STATE
 /*
  * IMPDEF control register ACTLR_EL1 handling. Some CPUs use this to
@@ -1117,6 +1150,10 @@ void arch_setup_new_exec(void)
 #ifdef CONFIG_ARM64_APPLE_X86_FP
 	if (alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
 		apple_x86_fp_set(PR_AURORA_X86_FP_OFF);
+#endif
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+	if (alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		apple_fp_preserve_set(PR_AURORA_FP_PRESERVE_OFF);
 #endif
 
 	if (task_spec_ssb_noexec(current)) {

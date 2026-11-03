@@ -960,7 +960,8 @@ static __always_inline bool system_has_actlr_state(void)
 	return IS_ENABLED(CONFIG_ARM64_ACTLR_STATE) &&
 		(alternative_has_cap_unlikely(ARM64_HAS_TSO_APPLE) ||
 		 alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE) ||
-		 alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE));
+		 alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE) ||
+		 alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE));
 }
 
 s64 arm64_ftr_safe_value(const struct arm64_ftr_bits *ftrp, s64 new, s64 cur);

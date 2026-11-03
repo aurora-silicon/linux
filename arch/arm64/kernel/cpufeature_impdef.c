@@ -154,6 +154,43 @@ static void cpu_enable_apple_afp(const struct arm64_cpu_capabilities *entry)
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+static bool has_apple_prsv(const struct arm64_cpu_capabilities *entry, int scope)
+{
+	u64 val;
+
+	WARN_ON(scope == SCOPE_LOCAL_CPU && preemptible());
+
+	if (read_cpuid_implementor() != ARM_CPU_IMP_APPLE ||
+	    !cpufeature_matches(read_sysreg(aidr_el1), entry))
+		return false;
+
+	/*
+	 * As with TSO, a hypervisor may advertise the AIDR_EL1 bit but ignore
+	 * ACTLR_EL1 writes. Only use the extension if the enable bit sticks.
+	 */
+	val = read_sysreg(actlr_el1);
+	write_sysreg(val ^ ACTLR_APPLE_PRSV, actlr_el1);
+	isb();
+	if (!((val ^ read_sysreg(actlr_el1)) & ACTLR_APPLE_PRSV)) {
+		pr_info_once("CPU advertises Apple PRSV but it is broken, ignoring\n");
+		return false;
+	}
+
+	write_sysreg(val, actlr_el1);
+	isb();
+	return true;
+}
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+/* Tell userspace through AT_HWCAP3 and /proc/cpuinfo */
+static void cpu_enable_apple_prsv(const struct arm64_cpu_capabilities *entry)
+{
+	cpu_set_named_feature(APPLE_PRSV);
+}
+#endif
+
 static bool has_apple_actlr_virt_impdef(const struct arm64_cpu_capabilities *entry, int scope)
 {
 	u64 midr = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
@@ -210,6 +247,20 @@ static const struct arm64_cpu_capabilities arm64_impdef_features[] = {
 		.cpu_enable = cpu_enable_apple_afp,
 		.matches = has_apple_afp,
 		.field_pos = AIDR_APPLE_AFP_SHIFT,
+		.field_width = 1,
+		.sign = FTR_UNSIGNED,
+		.min_field_value = 1,
+		.max_field_value = 1,
+	},
+#endif
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+	{
+		.desc = "Scalar FP upper-lane preservation (Apple PRSV)",
+		.capability = ARM64_HAS_PRSV_APPLE,
+		.type = ARM64_CPUCAP_EARLY_LOCAL_CPU_FEATURE,
+		.cpu_enable = cpu_enable_apple_prsv,
+		.matches = has_apple_prsv,
+		.field_pos = AIDR_APPLE_PRSV_SHIFT,
 		.field_width = 1,
 		.sign = FTR_UNSIGNED,
 		.min_field_value = 1,
