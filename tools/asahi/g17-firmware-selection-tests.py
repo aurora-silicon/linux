@@ -34,6 +34,7 @@ struct AsahiDrmDevice {
     image: u32,
     checked: std::cell::RefCell<Vec<u32>>,
 }
+pub struct Config(pub u32);
 mod fw {
     pub struct Variant(pub u32);
     pub mod variant {
@@ -43,6 +44,7 @@ mod fw {
             pub name: &'static str,
             pub image: u32,
             pub variant: &'static Variant,
+            pub config: Option<&'static crate::Config>,
         }
         pub enum Firmware { Fixed(&'static Variant), Identified(&'static [Build]) }
     }
@@ -60,9 +62,11 @@ TESTS = r'''
 }
 static FIRST: fw::Variant = fw::Variant(1);
 static SECOND: fw::Variant = fw::Variant(2);
+static SECOND_CONFIG: Config = Config(2);
 static BUILDS: [fw::variant::Build; 2] = [
-    fw::variant::Build { os_version: [26,6,2], name: "first", image: 1, variant: &FIRST },
-    fw::variant::Build { os_version: [27,0,0], name: "second", image: 2, variant: &SECOND },
+    fw::variant::Build { os_version: [26,6,2], name: "first", image: 1, variant: &FIRST, config: None },
+    fw::variant::Build { os_version: [27,0,0], name: "second", image: 2, variant: &SECOND,
+                         config: Some(&SECOND_CONFIG) },
 ];
 fn device(version: Option<[u32; 3]>, image: u32) -> AsahiDrmDevice {
     AsahiDrmDevice { version, image, checked: std::cell::RefCell::new(Vec::new()) }
@@ -71,18 +75,28 @@ fn main() {
     use fw::variant::Firmware;
     for version in [None, Some([26,6,2]), Some([26,7,0]), Some([99,0,0])] {
         let dev = device(version, 1);
-        assert_eq!(Gpu::firmware_variant(&dev, &Firmware::Identified(&BUILDS)).unwrap().0, 1);
+        let (variant, config) = Gpu::firmware_variant(&dev, &Firmware::Identified(&BUILDS)).unwrap();
+        assert_eq!(variant.0, 1);
+        assert!(config.is_none(), "a build without a configuration keeps the probed one");
     }
+    let dev = device(None, 2);
+    let (variant, config) = Gpu::firmware_variant(&dev, &Firmware::Identified(&BUILDS)).unwrap();
+    assert_eq!(variant.0, 2);
+    assert_eq!(config.unwrap().0, 2, "the configuration follows the identified image");
     let dev = device(Some([27,0,0]), 1);
-    assert_eq!(Gpu::firmware_variant(&dev, &Firmware::Identified(&BUILDS)).unwrap().0, 1);
+    let (variant, config) = Gpu::firmware_variant(&dev, &Firmware::Identified(&BUILDS)).unwrap();
+    assert_eq!(variant.0, 1);
+    assert!(config.is_none(), "the OS hint does not pick a configuration");
     assert_eq!(*dev.checked.borrow(), [2,1], "the OS version only orders the candidates");
     let dev = device(Some([26,6,2]), 9);
     assert!(Gpu::firmware_variant(&dev, &Firmware::Identified(&BUILDS)).is_err());
     assert_eq!(*dev.checked.borrow(), [1,2]);
     let dev = device(None, 9);
-    assert_eq!(Gpu::firmware_variant(&dev, &Firmware::Fixed(&SECOND)).unwrap().0, 2);
+    let (variant, config) = Gpu::firmware_variant(&dev, &Firmware::Fixed(&SECOND)).unwrap();
+    assert_eq!(variant.0, 2);
+    assert!(config.is_none());
     assert!(dev.checked.borrow().is_empty(), "fixed Neo admission is unchanged");
-    println!("PASS G17 selection: exact image required, OS hint optional, fixed Neo unchanged");
+    println!("PASS G17 selection: exact image required, OS hint optional, fixed Neo unchanged, configuration follows the image");
 }
 '''
 
