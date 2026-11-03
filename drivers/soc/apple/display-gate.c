@@ -74,8 +74,9 @@
  * complete: the device tree describes it and its own driver starts it. The
  * gate checks the handoff and the running DCP, enables the internal display
  * nodes, and powers up the external display chain in stages once the PMP is
- * bound (see gate_t6041_run()). This part was a driver of its own,
- * t6041-display-gate.c, by Ryan Murray and František Balázsy.
+ * bound, even long after the boot (see gate_t6041_run()). This part was a
+ * driver of its own, t6041-display-gate.c, by Ryan Murray and František
+ * Balázsy.
  */
 
 #define pr_fmt(fmt) fmt
@@ -90,9 +91,11 @@
 #include <linux/io.h>
 #include <linux/kstrtox.h>
 #include <linux/memblock.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_graph.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/printk.h>
@@ -2186,6 +2189,18 @@ static const char *staged_prefix = "";
  * whose acknowledgement the DISPEXT domains need: HDMI chain, Type-C chain,
  * then both processors and the display subsystem together, so the display
  * master is created once with every DART in its iommus.
+ *
+ * The PMP can bind long after the boot: on an encrypted root its driver
+ * (apple-pmp.ko) loads only after the passphrase. Nothing that drives a
+ * display can come up before it, as appledrm needs apple-pmp's symbols, so
+ * the display subsystem stays held back until the PMP binds, however late,
+ * and then the whole chain comes up. Only the Type-C ports cannot wait for
+ * it: after STAGED_PMP_WAIT_MS their controllers are let go with the USB
+ * muxes only, and they take the display routes after a late power-up (see
+ * below). The internal panel alone, for the rest of the boot, is left for a
+ * PMP whose probe failed and that is still unbound at the deadline, or
+ * STAGED_PMP_WAIT_MS after a failure past it (a deferral looks the same, so
+ * it gets that long to bind), and for a power-up that fails.
  */
 
 /*
@@ -2439,7 +2454,7 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
 /*
  * The Type-C core passes over a mode switch inside a disabled node, so a port
  * controller that probes before dcpext1 is enabled only takes the USB muxes.
- * Taking the display ones afterwards meant probing it again, and that tears
+ * Taking the display ones afterwards means probing it again, and that tears
  * its USB host down while the devices behind it are being enumerated. Instead,
  * each port controller wired to a route waits for the processor that registers
  * the route: a supplier link from the controller to that processor makes it
@@ -2459,9 +2474,35 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
  * defers in the Type-C core, which never gives up on a mux. A processor that
  * gives up on its routes disables them (dcp_typec_routes_disable()), and its
  * controllers then probe without them.
+ *
+ * The wait ends at STAGED_PMP_WAIT_MS, PMP or not: USB must work while the
+ * PMP driver is still on an encrypted root, behind its passphrase prompt.
+ * The routes are disabled again and the controllers probe with the USB
+ * muxes only. A PMP that binds later enables the routes again, together with
+ * the processors. Once every processor that still has an enabled route is
+ * bound, so that every route mode switch is registered, staged_take_routes()
+ * gives each released controller that is still wired to an enabled route
+ * the managed link it would have had, and probes it again, and only those.
+ * That takes their USB hosts down once, after the PMP has bound, and the
+ * devices behind them enumerate again. A controller whose routes its
+ * processor gave up on keeps its USB-only probe.
  */
-static struct fwnode_handle *staged_port_ctrls[ARRAY_SIZE(t6041_usbc_nodes)];
-static unsigned int staged_nr_port_ctrls;
+
+/* A port controller and the processor whose routes it is wired to. */
+struct staged_port_ctrl {
+	struct fwnode_handle *ctrl, *dcp;
+};
+
+/* Guards the port controller lists, staged_routes_off and staged_late's writers. */
+static DEFINE_MUTEX(staged_lock);
+/* Held by a fwnode link until the processors are bound or the deadline. */
+static struct staged_port_ctrl staged_held[ARRAY_SIZE(t6041_usbc_nodes)];
+static unsigned int staged_nr_held;
+/* Let go at the deadline with the USB muxes only, for a late power-up. */
+static struct staged_port_ctrl staged_released[ARRAY_SIZE(t6041_usbc_nodes)];
+static unsigned int staged_nr_released;
+static bool staged_routes_off;	/* the deadline disabled the routes */
+static bool staged_late;	/* a late power-up waits for the processors */
 
 /* The port controller wired to a route (the parent of the connector at its far end). */
 static struct device_node *staged_route_port_ctrl(struct device_node *route)
@@ -2492,62 +2533,200 @@ static void __init staged_hold_port_controllers(void)
 		ctrl = staged_route_port_ctrl(route);
 		of_node_put(routes);
 		of_node_put(route);
-		for (k = 0; ctrl && k < staged_nr_port_ctrls; k++)
-			if (staged_port_ctrls[k] == of_fwnode_handle(ctrl))
+		for (k = 0; ctrl && k < staged_nr_held; k++)
+			if (staged_held[k].ctrl == of_fwnode_handle(ctrl))
 				break;
 		/*
 		 * A disabled port controller never gets a device: a link from it
 		 * would land on its bound bus controller as a sync-state-only
 		 * link, which the device core refuses.
 		 */
-		if (ctrl && dcp && k == staged_nr_port_ctrls && of_device_is_available(ctrl) &&
-		    !fwnode_link_add(of_fwnode_handle(ctrl), of_fwnode_handle(dcp), 0))
-			staged_port_ctrls[staged_nr_port_ctrls++] =
-				fwnode_handle_get(of_fwnode_handle(ctrl));
+		if (ctrl && dcp && k == staged_nr_held && of_device_is_available(ctrl) &&
+		    !fwnode_link_add(of_fwnode_handle(ctrl), of_fwnode_handle(dcp), 0)) {
+			staged_held[k].ctrl = fwnode_handle_get(of_fwnode_handle(ctrl));
+			staged_held[k].dcp = fwnode_handle_get(of_fwnode_handle(dcp));
+			staged_nr_held++;
+		}
 		of_node_put(dcp);
 		of_node_put(ctrl);
 	}
 }
 
+static void staged_forget(struct staged_port_ctrl *list, unsigned int *nr)
+{
+	while (*nr) {
+		struct staged_port_ctrl *pc = &list[--*nr];
+
+		fwnode_handle_put(pc->dcp);
+		fwnode_handle_put(pc->ctrl);
+	}
+}
+
 /*
- * The processors stay off: drop the wait, so that the port controllers probe
- * now, with the USB muxes only. By this time the controllers' other suppliers
- * are device links; what is left are links to nodes without a device.
+ * The processors are not on (yet): drop the wait, so that the port
+ * controllers probe now, with the USB muxes only, and keep them for a late
+ * power-up. By this time the controllers' other suppliers are device links;
+ * what is left are links to nodes without a device.
  */
 static void staged_release_port_controllers(void)
 {
 	struct device *dev;
 
-	while (staged_nr_port_ctrls) {
-		struct fwnode_handle *fwnode = staged_port_ctrls[--staged_nr_port_ctrls];
+	lockdep_assert_held(&staged_lock);
+	while (staged_nr_held) {
+		struct staged_port_ctrl *pc = &staged_held[--staged_nr_held];
 
-		fwnode_links_purge(fwnode);
-		dev = get_device(READ_ONCE(fwnode->dev));
+		fwnode_links_purge(pc->ctrl);
+		dev = get_device(READ_ONCE(pc->ctrl->dev));
 		if (dev && !READ_ONCE(dev->driver) && device_attach(dev) < 0)
 			dev_err(dev, "probe without the display routes failed\n");
 		put_device(dev);
-		fwnode_handle_put(fwnode);
+		staged_released[staged_nr_released++] = *pc;
 	}
 }
 
-/* The processors are bound: the port controllers probe through their supplier links. */
-static void staged_forget_port_controllers(void)
+/* @ctrl is wired to a route of dcpext1 that is still enabled. */
+static bool staged_ctrl_routed(struct fwnode_handle *ctrl)
 {
-	while (staged_nr_port_ctrls)
-		fwnode_handle_put(staged_port_ctrls[--staged_nr_port_ctrls]);
+	struct device_node *route, *np;
+	bool routed = false;
+	unsigned int i;
+
+	for (i = 0; !routed && i < ARRAY_SIZE(t6041_usbc_nodes); i++) {
+		if (!staged_is_route(t6041_usbc_nodes[i]))
+			continue;
+		route = of_find_node_by_path(t6041_usbc_nodes[i]);
+		np = route && of_device_is_available(route) ? staged_route_port_ctrl(route) : NULL;
+		routed = np && of_fwnode_handle(np) == ctrl;
+		of_node_put(np);
+		of_node_put(route);
+	}
+	return routed;
+}
+
+static struct device_node *staged_dcps[ARRAY_SIZE(t6041_stages)];
+
+/* Every processor with an enabled route is bound: all route mode switches are registered. */
+static bool staged_processors_bound(void)
+{
+	struct device_node *routes, *route;
+	struct device *dev;
+	bool bound = true;
+	unsigned int i;
+
+	for (i = 0; bound && i < ARRAY_SIZE(staged_dcps); i++) {
+		routes = of_get_child_by_name(staged_dcps[i], "typec-routes");
+		route = routes ? of_get_next_available_child(routes, NULL) : NULL;
+		dev = route ? READ_ONCE(staged_dcps[i]->fwnode.dev) : NULL;
+		bound = !route || (dev && device_is_bound(dev));
+		of_node_put(route);
+		of_node_put(routes);
+	}
+	return bound;
+}
+
+/* After a late power-up: the released port controllers take the display routes. */
+static void staged_take_routes(struct work_struct *work)
+{
+	struct device *ctrl, *dcp;
+	unsigned int n = 0;
+
+	mutex_lock(&staged_lock);
+	if (!staged_late || !staged_processors_bound()) {
+		mutex_unlock(&staged_lock);
+		return;
+	}
+	WRITE_ONCE(staged_late, false);
+	while (staged_nr_released) {
+		struct staged_port_ctrl *pc = &staged_released[--staged_nr_released];
+
+		ctrl = get_device(READ_ONCE(pc->ctrl->dev));
+		dcp = get_device(READ_ONCE(pc->dcp->dev));
+		if (ctrl && dcp && staged_ctrl_routed(pc->ctrl)) {
+			/* What fw_devlink makes of a held controller's fwnode link. */
+			if (!device_link_add(ctrl, dcp, DL_FLAG_AUTOPROBE_CONSUMER))
+				dev_warn(ctrl, "no link to %s, keeping the USB muxes only\n",
+					 dev_name(dcp));
+			else if (device_reprobe(ctrl))
+				dev_err(ctrl, "probe with the display routes failed\n");
+			else
+				n++;
+		}
+		put_device(dcp);
+		put_device(ctrl);
+		fwnode_handle_put(pc->dcp);
+		fwnode_handle_put(pc->ctrl);
+	}
+	mutex_unlock(&staged_lock);
+	if (n)
+		staged_info("%u Type-C port controllers probed again with the display routes\n", n);
+}
+static DECLARE_WORK(staged_take_routes_work, staged_take_routes);
+
+/*
+ * Where the power-up is. Only staged_move() changes it, so each step is
+ * taken once: the first of the PMP's bind, its failure and, before either,
+ * the deadline wins.
+ */
+enum staged_state {
+	STAGED_WAITING,		/* routes on, port controllers held, display subsystem off */
+	STAGED_RELEASED,	/* past the deadline: routes off, port controllers on USB only */
+	STAGED_STARTED,		/* the PMP is bound: the power-up runs or has run */
+	STAGED_FALLBACK,	/* internal panel only, for the rest of the boot */
+};
+
+enum staged_event {
+	STAGED_PMP_BOUND,
+	STAGED_DEADLINE,
+	STAGED_PMP_FAILED,
+};
+
+static enum staged_state staged_next(enum staged_state state, enum staged_event event)
+{
+	if (state != STAGED_WAITING && state != STAGED_RELEASED)
+		return state;
+	switch (event) {
+	case STAGED_PMP_BOUND:
+		return STAGED_STARTED;
+	case STAGED_DEADLINE:
+		return STAGED_RELEASED;
+	case STAGED_PMP_FAILED:
+		return STAGED_FALLBACK;
+	}
+	return state;
 }
 
 static struct device_node *staged_display;
 static struct device_node *staged_pmp;
-static atomic_t staged_started = ATOMIC_INIT(0);
+static atomic_t staged_state = ATOMIC_INIT(STAGED_WAITING);
+static atomic_t staged_pmp_tried = ATOMIC_INIT(0);
+
+/* Take the step @event leads to; false if it leads nowhere from here. */
+static bool staged_move(enum staged_event event)
+{
+	int from = atomic_read(&staged_state);
+	int to;
+
+	do {
+		to = staged_next(from, event);
+		if (to == from)
+			return false;
+	} while (!atomic_try_cmpxchg(&staged_state, &from, to));
+	return true;
+}
 
 /* Internal panel only: the routes go again, so the port controllers probe without mode switches. */
 static void staged_fallback(const char *why)
 {
 	int ret = staged_set(staged_display, false, NULL, true, "disabled", "okay");
 
+	atomic_set(&staged_state, STAGED_FALLBACK);
 	staged_err("%s: external displays stay off, internal panel only (%d)\n", why, ret);
+	mutex_lock(&staged_lock);
+	WRITE_ONCE(staged_late, false);
 	staged_release_port_controllers();
+	staged_forget(staged_released, &staged_nr_released);
+	mutex_unlock(&staged_lock);
 }
 
 /*
@@ -2597,10 +2776,21 @@ static void staged_wait_for_drivers(void)
 		path);
 }
 
+static void staged_timeout(struct work_struct *work);
+static DECLARE_DELAYED_WORK(staged_timeout_work, staged_timeout);
+
 static void staged_power_up(struct work_struct *work)
 {
 	unsigned int i;
+	bool late;
 	int ret = 0;
+
+	/* Let a deadline that is letting the port controllers go finish first. */
+	cancel_delayed_work_sync(&staged_timeout_work);
+	mutex_lock(&staged_lock);
+	late = staged_routes_off || staged_nr_released;
+	WRITE_ONCE(staged_late, late);
+	mutex_unlock(&staged_lock);
 
 	for (i = 0; !ret && i < ARRAY_SIZE(t6041_stages); i++) {
 		ret = staged_apply(&t6041_stages[i], staged_display);
@@ -2609,37 +2799,103 @@ static void staged_power_up(struct work_struct *work)
 	}
 	if (!ret)
 		staged_wait_for_drivers();
-	/* Both processors and the display subsystem together: the master binds once, with all DCPs. */
+	/*
+	 * Both processors and the display subsystem together: the master binds
+	 * once, with all DCPs. Past the deadline the routes come back in the
+	 * same changeset, so each processor finds them when it probes.
+	 */
 	if (!ret)
-		ret = staged_set(staged_display, true, "okay", false, NULL, "okay");
+		ret = staged_set(staged_display, true, "okay", late, "okay", "okay");
 	if (ret) {
 		staged_fallback("could not enable the external displays");
 		return;
 	}
 	staged_info("processors and display subsystem enabled\n");
-	staged_forget_port_controllers();
+	mutex_lock(&staged_lock);
+	staged_routes_off = false;
+	/* Held ones probe through their supplier links. */
+	staged_forget(staged_held, &staged_nr_held);
+	mutex_unlock(&staged_lock);
+	if (late)
+		queue_work(system_long_wq, &staged_take_routes_work);
 }
 static DECLARE_WORK(staged_power_up_work, staged_power_up);
 
+/* The PMP's probe failed, as a deferral's does too, and it is neither bound nor probing now. */
+static bool staged_pmp_failed(void)
+{
+	struct platform_device *pdev;
+	bool failed;
+
+	if (!atomic_read(&staged_pmp_tried))
+		return false;
+	pdev = of_find_device_by_node(staged_pmp);
+	failed = pdev && !READ_ONCE(pdev->dev.driver);
+	platform_device_put(pdev);
+	return failed;
+}
+
 static void staged_timeout(struct work_struct *work)
 {
-	if (!atomic_xchg(&staged_started, 1))
-		staged_fallback("no PMP within " __stringify(STAGED_PMP_WAIT_MS) " ms");
-}
-static DECLARE_DELAYED_WORK(staged_timeout_work, staged_timeout);
+	int ret;
 
-/* The PMP's driver is bound: DISPEXT can be acknowledged now. */
-static int staged_pmp_bound(struct notifier_block *nb, unsigned long action, void *data)
+	if (staged_pmp_failed() && staged_move(STAGED_PMP_FAILED)) {
+		staged_fallback("the PMP did not bind");
+		return;
+	}
+	if (!staged_move(STAGED_DEADLINE))
+		return;
+	mutex_lock(&staged_lock);
+	ret = staged_set(staged_display, false, NULL, true, "disabled", NULL);
+	staged_routes_off = !ret;
+	staged_release_port_controllers();
+	mutex_unlock(&staged_lock);
+	staged_info("no PMP within " __stringify(STAGED_PMP_WAIT_MS) " ms: Type-C ports on USB only, external displays wait for it (%d)\n",
+		    ret);
+}
+
+static bool staged_is_processor(const struct device_node *np)
+{
+	unsigned int i;
+
+	for (i = 0; np && i < ARRAY_SIZE(staged_dcps); i++)
+		if (np == staged_dcps[i])
+			return true;
+	return false;
+}
+
+/*
+ * The PMP's driver is bound: DISPEXT can be acknowledged now, before or after
+ * the deadline. A failed probe of the PMP (a deferral too) past the deadline
+ * gives it STAGED_PMP_WAIT_MS more before the internal panel fallback; before
+ * the deadline, the deadline decides. After a late power-up, each processor's
+ * probe may be the last the port controllers wait for.
+ */
+static int staged_bus_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
 	struct device *dev = data;
 
-	if (action != BUS_NOTIFY_BOUND_DRIVER || dev->of_node != staged_pmp || atomic_xchg(&staged_started, 1))
+	if (action != BUS_NOTIFY_BOUND_DRIVER && action != BUS_NOTIFY_DRIVER_NOT_BOUND)
 		return NOTIFY_DONE;
-	cancel_delayed_work(&staged_timeout_work);
-	queue_work(system_long_wq, &staged_power_up_work);
-	return NOTIFY_OK;
+	if (dev->of_node == staged_pmp) {
+		if (action == BUS_NOTIFY_BOUND_DRIVER) {
+			if (!staged_move(STAGED_PMP_BOUND))
+				return NOTIFY_DONE;
+			cancel_delayed_work(&staged_timeout_work);
+			queue_work(system_long_wq, &staged_power_up_work);
+			return NOTIFY_OK;
+		}
+		atomic_set(&staged_pmp_tried, 1);
+		if (atomic_read(&staged_state) == STAGED_RELEASED)
+			schedule_delayed_work(&staged_timeout_work,
+					      msecs_to_jiffies(STAGED_PMP_WAIT_MS));
+		return NOTIFY_DONE;
+	}
+	if (READ_ONCE(staged_late) && staged_is_processor(dev->of_node))
+		queue_work(system_long_wq, &staged_take_routes_work);
+	return NOTIFY_DONE;
 }
-static struct notifier_block staged_pmp_nb = { .notifier_call = staged_pmp_bound };
+static struct notifier_block staged_nb = { .notifier_call = staged_bus_notify };
 
 static void __init gate_t6041_staged(void)
 {
@@ -2659,6 +2915,12 @@ static void __init gate_t6041_staged(void)
 		staged_err("no display subsystem or PMP, nothing enabled\n");
 		return;
 	}
+	/* staged_ready() found them. */
+	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++) {
+		const struct gate_staged *st = &t6041_stages[i];
+
+		staged_dcps[i] = of_find_node_by_path(st->nodes[st->nr - 1]);
+	}
 
 	/* No device exists yet: routes on, display subsystem held back until the power-up. */
 	ret = staged_set(staged_display, false, NULL, true, "okay", "disabled");
@@ -2667,7 +2929,7 @@ static void __init gate_t6041_staged(void)
 		return;
 	}
 	staged_hold_port_controllers();
-	ret = bus_register_notifier(&platform_bus_type, &staged_pmp_nb);
+	ret = bus_register_notifier(&platform_bus_type, &staged_nb);
 	if (ret) {
 		staged_fallback("no bus notifier");
 		return;
