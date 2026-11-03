@@ -823,6 +823,17 @@ struct apple_dcp {
 	struct delayed_work link_recovery_wq;
 	unsigned int link_recovery_tries;
 	unsigned int link_recovery_snap;
+	/*
+	 * Kernel retrains of an active CRTC from the hotplug worker in the
+	 * current window (dcp_hotplug_retrain_allowed()): a sink that answers
+	 * every retrain with IRQ_HPD would otherwise loop forever.
+	 */
+	unsigned long hotplug_retrain_since;
+	unsigned long hotplug_disconnect_at;
+	unsigned int hotplug_retrains;
+	bool hotplug_retrain_stopped;
+	/* One retrain at the end of a stopped window, see dcp_hotplug(). */
+	struct delayed_work hotplug_retrain_retry_wq;
 	atomic_t modesets_done;
 	unsigned long hdmi_edge_jiffies;
 	bool hdmi_edge_seen;

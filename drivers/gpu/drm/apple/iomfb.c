@@ -1277,6 +1277,74 @@ void dcp_route_failure_notify(struct apple_connector *connector)
 	schedule_work(&connector->hotplug_wq);
 }
 
+/*
+ * A sink that drops its link and raises IRQ_HPD after every training (seen
+ * with a dual-pipe monitor after a modeset from the kernel console during a
+ * hibernation entry) turns each hotplug into a retrain and each
+ * retrain into a hotplug, every 0.4-1.2 s, until the Type-C controller gives
+ * up on the cable.  The worker retrains at most DCP_HOTPLUG_RETRAIN_MAX times
+ * in a DCP_HOTPLUG_RETRAIN_WINDOW that starts with its first retrain and is
+ * not extended by refused requests, so a storm is bounded to that rate and
+ * never stops the retrains for good.  Past the limit the link status stays
+ * BAD (userspace still gets every hotplug event and may set a mode); when the
+ * window ends, one more retrain is tried if the sink is still connected.
+ *
+ * A disconnect lasting DCP_HOTPLUG_REPLUG_GAP or longer is a real replug and
+ * starts a fresh window.  A completed modeset does not: in the storm every
+ * compositor modeset completed before the sink dropped the link again.
+ */
+#define DCP_HOTPLUG_RETRAIN_MAX		5
+#define DCP_HOTPLUG_RETRAIN_WINDOW	(30 * HZ)
+#define DCP_HOTPLUG_REPLUG_GAP		(3 * HZ)
+
+static void dcp_hotplug_retrain_reset(struct apple_dcp *dcp, const char *why)
+{
+	if (dcp->hotplug_retrain_stopped)
+		dev_info(dcp->dev, "hotplug: link retrains resumed (%s)\n", why);
+	dcp->hotplug_retrain_stopped = false;
+	dcp->hotplug_retrains = 0;
+}
+
+/* Called from the connector's hotplug work only, which serializes it. */
+static void dcp_hotplug_retrain_note(struct apple_dcp *dcp, bool connected)
+{
+	unsigned long now = jiffies;
+
+	if (!connected) {
+		if (!dcp->hotplug_disconnect_at)
+			dcp->hotplug_disconnect_at = now ?: 1;
+		return;
+	}
+	if (dcp->hotplug_disconnect_at &&
+	    time_after_eq(now, dcp->hotplug_disconnect_at + DCP_HOTPLUG_REPLUG_GAP))
+		dcp_hotplug_retrain_reset(dcp, "replug");
+	dcp->hotplug_disconnect_at = 0;
+}
+
+static bool dcp_hotplug_retrain_allowed(struct apple_dcp *dcp)
+{
+	unsigned long now = jiffies;
+
+	if (dcp->hotplug_retrains &&
+	    time_after_eq(now, dcp->hotplug_retrain_since + DCP_HOTPLUG_RETRAIN_WINDOW))
+		dcp_hotplug_retrain_reset(dcp, "window over");
+	if (dcp->hotplug_retrain_stopped)
+		return false;
+	if (!dcp->hotplug_retrains)
+		dcp->hotplug_retrain_since = now;
+	if (++dcp->hotplug_retrains > DCP_HOTPLUG_RETRAIN_MAX) {
+		dcp->hotplug_retrain_stopped = true;
+		dev_warn(dcp->dev,
+			 "hotplug: %u link retrains within %u s, the sink keeps dropping the link; next kernel retrain when the window ends\n",
+			 DCP_HOTPLUG_RETRAIN_MAX,
+			 jiffies_to_msecs(DCP_HOTPLUG_RETRAIN_WINDOW) / 1000);
+		mod_delayed_work(system_freezable_wq, &dcp->hotplug_retrain_retry_wq,
+				 dcp->hotplug_retrain_since + DCP_HOTPLUG_RETRAIN_WINDOW - now);
+		return false;
+	}
+	return true;
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
@@ -1316,6 +1384,7 @@ void dcp_hotplug(struct work_struct *work)
 		if (!READ_ONCE(connector->connected))
 			dcp_clear_connector_edid(connector);
 	}
+	dcp_hotplug_retrain_note(dcp, READ_ONCE(connector->connected));
 
 	gated = dcp_announce_gated(dcp, connector);
 	if (gated) {
@@ -1364,7 +1433,8 @@ void dcp_hotplug(struct work_struct *work)
 		 * link.  Re-apply the active CRTC state once the DPTX link-config
 		 * callback has completed.
 		 */
-		ret = dcp_retrain_active_crtc(connector);
+		ret = dcp_hotplug_retrain_allowed(dcp) ?
+		      dcp_retrain_active_crtc(connector) : 0;
 		if (ret) {
 			dev_warn(dcp->dev,
 				 "failed to retrain active CRTC after hotplug: %d\n",
