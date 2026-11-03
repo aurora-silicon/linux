@@ -162,8 +162,14 @@ const UTILE_CONFIG_HEIGHT_SHIFT: u32 = 14;
 const UTILE_CONFIG_SIZE_MASK: u64 = 0xf000;
 /// The partial-render phases load and store every attached depth and stencil
 /// surface.
-const ZLS_PARTIAL_DEPTH: u64 = 1 << 15 | 1 << 19;
-const ZLS_PARTIAL_STENCIL: u64 = 1 << 14 | 1 << 18;
+const ZLS_STORE_DEPTH: u64 = 1 << 19;
+const ZLS_STORE_STENCIL: u64 = 1 << 18;
+const ZLS_LOAD_DEPTH: u64 = 1 << 15;
+const ZLS_LOAD_STENCIL: u64 = 1 << 14;
+const ZLS_COMPRESS_DEPTH: u64 = 1 << 6;
+const ZLS_COMPRESS_STENCIL: u64 = 1 << 8;
+/// Bits of the main word a partial render sets for itself.
+const ZLS_PARTIAL_CLEAR: u64 = ZLS_COMPRESS_DEPTH | ZLS_COMPRESS_STENCIL | 0xf << 56;
 const STENCIL_CLEAR_BASE: u32 = 0x300;
 /// Value of the ZLS swizzle registers and descriptor field.
 const ZLS_SWIZZLE: u32 = 0x0404_0404;
@@ -443,6 +449,7 @@ struct PassWords {
     layer_mode: u64,
     tib_blocks: u64,
     partial_zls_control: u64,
+    partial_zls_reload: u64,
     aux_fb_flags: u64,
     bg_rsrc_spec: u64,
     bg_va: u64,
@@ -478,12 +485,27 @@ impl PassWords {
             tile_config |= TILE_CONFIG_PROCESS_EMPTY_TILES;
         }
 
-        let mut partial_zls_control = pass.zls_control;
+        // The partial store keeps the main word, loads included, and stores and compresses each
+        // plane it has. The reload arrays add the loads, which a clearing pass doesn't have.
+        let mut partial_zls_control = pass.zls_control & !ZLS_PARTIAL_CLEAR;
         if pass.depth.va != 0 {
-            partial_zls_control |= ZLS_PARTIAL_DEPTH;
+            partial_zls_control |= ZLS_STORE_DEPTH;
+        }
+        if pass.depth.compression_va != 0 {
+            partial_zls_control |= ZLS_COMPRESS_DEPTH;
         }
         if pass.stencil.va != 0 {
-            partial_zls_control |= ZLS_PARTIAL_STENCIL;
+            partial_zls_control |= ZLS_STORE_STENCIL;
+        }
+        if pass.stencil.compression_va != 0 {
+            partial_zls_control |= ZLS_COMPRESS_STENCIL;
+        }
+        let mut partial_zls_reload = partial_zls_control;
+        if pass.depth.va != 0 {
+            partial_zls_reload |= ZLS_LOAD_DEPTH;
+        }
+        if pass.stencil.va != 0 {
+            partial_zls_reload |= ZLS_LOAD_STENCIL;
         }
 
         let mut aux_fb_flags = AUX_FB_FLAGS_BASE;
@@ -511,6 +533,7 @@ impl PassWords {
                 * samples)
                 .div_ceil(TIB_BLOCK_SIZE),
             partial_zls_control,
+            partial_zls_reload,
             aux_fb_flags,
             bg_rsrc_spec: rsrc_spec(pass.bg.rsrc_spec),
             bg_va: usc(pass.bg.offset)?,
@@ -636,6 +659,13 @@ fn ta_registers(
     ])
 }
 
+/// Tiler segment control of a two-cluster pass, what macOS writes.
+const VDM_SEGMENT_CONTROL: u64 = 0x20_0440;
+const VDM_SEGMENT_INDEX: u64 = 4;
+/// Pages the tiler keeps out of a partial render's segments: without them the pages a pass
+/// returns shrink to none and the tiler can't advance. Fifteen blocks, macOS's minimum heap.
+const MIN_FREE_TVB_PAGES: u64 = 0x3c;
+
 /// The 25G83 tiling array: the A18 Pro's without 0x1748 and 0x1740 (and 0x17d9 unless the stage
 /// has SCS), with the tiler parameter sub-buffer registers and 0x10131 = 0x88, in the order the
 /// M4 Pro has run with. Returns the array and its used entry count.
@@ -686,15 +716,15 @@ fn ta_registers_25g83(
     push(find(0x1c880, 0)?);
     push(RegisterWrite::new(0x1c948, gtp(4)?));
     push(RegisterWrite::new(0x1c888, gtp(5)?));
-    push(RegisterWrite::new(0x1c890, 0));
-    push(RegisterWrite::new(0x1c918, 0));
+    push(RegisterWrite::new(0x1c890, VDM_SEGMENT_CONTROL));
+    push(RegisterWrite::new(0x1c918, VDM_SEGMENT_INDEX));
     push(find(0x1c079, 0)?);
     push(find(0x1c9d8, 0)?);
     push(RegisterWrite::new(0x1c089, gtp2));
     push(RegisterWrite::new(0x1c9e0, gtp2));
     push(RegisterWrite::new(0x16c41, gtp6));
     push(RegisterWrite::new(0x1ca40, gtp6));
-    push(RegisterWrite::new(0x1c9a8, 0));
+    push(RegisterWrite::new(0x1c9a8, MIN_FREE_TVB_PAGES));
     push(RegisterWrite::new(0x1c920, gtp(7)?));
     for reg in [0x10151, 0x1c199, 0x1c1a1, 0x1c1a9, 0x1c1b1, 0x1c1b9, 0x1c8f8, 0x1c0b1, 0x1c850] {
         push(find(reg, 0)?);
@@ -930,7 +960,7 @@ fn partial_resume_registers(
         RegisterWrite::new(0x153c1, p.depth.compression_va),
         RegisterWrite::new(0x15339, p.stencil.va),
         RegisterWrite::new(0x153d1, p.stencil.compression_va),
-        RegisterWrite::new(0x15319, w.partial_zls_control),
+        RegisterWrite::new(0x15319, w.partial_zls_reload),
         RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
     ]
 }
@@ -942,13 +972,15 @@ fn partial_load_registers(
     [
         RegisterWrite::new(0x15369, w.partial_bg_rsrc_spec),
         RegisterWrite::new(0x15371, w.partial_bg_va),
-        RegisterWrite::new(0x10039, w.tile_config & !TILE_CONFIG_PROCESS_EMPTY_TILES),
+        // Only the main end-of-tile program resolves, and it has to reach tiles that only
+        // earlier segments drew to. Without this their resolve target is never written.
+        RegisterWrite::new(0x10039, w.tile_config | TILE_CONFIG_PROCESS_EMPTY_TILES),
         RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
         RegisterWrite::new(0x15329, p.depth.va),
         RegisterWrite::new(0x153c1, p.depth.compression_va),
         RegisterWrite::new(0x15339, p.stencil.va),
         RegisterWrite::new(0x153d1, p.stencil.compression_va),
-        RegisterWrite::new(0x15319, w.partial_zls_control),
+        RegisterWrite::new(0x15319, w.partial_zls_reload),
         RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
     ]
 }
@@ -1076,7 +1108,6 @@ unsafe impl Zeroable for TaDescriptor {}
 impl TaDescriptor {
     const ARRAY_OFFSET: u64 = core::mem::offset_of!(Self, registers) as u64;
     const UNK_876: u32 = u32::MAX;
-    const UNK_892: u32 = 1;
     const UNK_932: u8 = 0x44;
     const UNK_93C: u8 = 1;
     const UNK_93E_FIRST_KICK: [u8; 2] = [0xd0, 0x91];
@@ -1125,7 +1156,9 @@ impl TaDescriptor {
         self.sampler_heap_va = pass.sampler_heap_va;
         self.sampler_count = pass.sampler_count;
         self.sampler_max = sampler_max;
-        self.unk_892 = Self::UNK_892;
+        // Asks the firmware to grow the heap. macOS keeps that for memoryless passes, which can't
+        // partial-render, and Honeykrisp has none. 26A428 keeps it: untested there.
+        self.unk_892 = u32::from(args.programs != RegisterPrograms::V25G83);
         self.stamp_va = args.ta.stamp_va;
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
