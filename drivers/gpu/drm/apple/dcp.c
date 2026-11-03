@@ -5153,10 +5153,22 @@ static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
 	struct resource resource;
 	int clocks, index, ret;
 
+	/*
+	 * The framebuffer region is the one the boot loader scanned out of; it
+	 * backs the firmware's default framebuffer.  An external processor the
+	 * boot loader drove no display from (T6050's dcpext4, the HDMI port's)
+	 * has none: it binds without one, and its default-framebuffer requests
+	 * are refused (dfb_region_size 0).
+	 */
 	index = of_property_match_string(dev->of_node, "memory-region-names",
 					 "framebuffer");
+	if (index == -ENODATA || index == -EINVAL) {
+		dcp->dfb_region_size = 0;
+		dev_info(dev, "no boot framebuffer\n");
+		goto clocks;
+	}
 	if (index < 0)
-		return -EINVAL;
+		return index;
 	fb = of_parse_phandle(dev->of_node, "memory-region", index);
 	if (!fb)
 		return -EINVAL;
@@ -5168,6 +5180,7 @@ static int dcp_firmware_metadata_v27(struct apple_dcp *dcp)
 	if (!dcp->dfb_region_size)
 		return -EINVAL;
 
+clocks:
 	clocks = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
 	if (clocks == -ENODATA &&
 	    of_property_present(dev->of_node, "apple,clock-ids"))
