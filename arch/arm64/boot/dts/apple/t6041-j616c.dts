@@ -85,13 +85,64 @@
 	status = "disabled";
 };
 
-/* The GPU (ADT gpu,t6041) is not described yet. */
+/*
+ * The GPU (ADT gpu,t6041) has four clusters: one opp-microvolt cell per
+ * cluster (ADT /arm-io/sgx perf-states to perf-states3). The loader fills
+ * these placeholders, the CS and AFR tables and the memory regions.
+ */
 &gpu {
-	status = "disabled";
+	compatible = "apple,agx-t6041";
 };
 
-&gfx_mbox {
-	status = "disabled";
+&gpu_opp {
+	opp00 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp01 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp02 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp03 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp04 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp05 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp06 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp07 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp08 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp09 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp10 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp11 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp12 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp13 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp14 {
+		opp-microvolt = <0 0 0 0>;
+	};
+	opp15 {
+		opp-microvolt = <0 0 0 0>;
+	};
 };
 
 /*
