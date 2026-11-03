@@ -290,6 +290,8 @@ struct dcp_desktop_state {
 struct dcpext_scanout;
 struct dcp_hdmi;
 
+struct dcp_call_history;
+
 struct apple_dcp {
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
 	struct iomfb_m4 *v26_6;
@@ -404,6 +406,9 @@ struct apple_dcp {
 
 	/* DCP has crashed */
 	bool crashed;
+
+	/* T6050: the last AP-link messages, printed at a crash (dcp_call_history_start()) */
+	struct dcp_call_history *call_history;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

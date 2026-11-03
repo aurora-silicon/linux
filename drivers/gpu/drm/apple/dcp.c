@@ -28,6 +28,7 @@
 #include <linux/of_platform.h>
 #include <linux/property.h>
 #include <linux/random.h>
+#include <linux/sched/clock.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
@@ -998,12 +999,270 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	afk_receive_message(ep, message);
 }
 
+/*
+ * T6050: the AP-link traffic that led to a DCP crash. A crashed DCP needs a
+ * reboot to show anything again, so the record has to reach the kernel log,
+ * beside the firmware's own crash log. Each T6050 DCP keeps its last
+ * DCP_CALL_HISTORY_LEN IOMFB calls, callbacks, swaps and mailbox messages in
+ * a small ring of its own, fed by this driver's tracepoints (a probe per DCP
+ * that takes only that DCP's events), and prints it once when it crashes.
+ */
+#define DCP_CALL_HISTORY_LEN 256U
+
+static bool call_history = true;
+module_param(call_history, bool, 0444);
+MODULE_PARM_DESC(call_history,
+		 "T6050: print each DCP's last AP-link messages when it crashes (default: on)");
+
+enum dcp_call_kind {
+	DCP_CALL_SEND,
+	DCP_CALL_RECV,
+	DCP_CALL_PUSH,
+	DCP_CALL_CALLBACK,
+	DCP_CALL_SWAP_SUBMIT,
+	DCP_CALL_SWAP_COMPLETE,
+};
+
+struct dcp_call_record {
+	u64 time;		/* local_clock(), as the kernel log's stamps */
+	u64 value;		/* the message, or the swap ID */
+	const char *name;	/* method or callback name, static */
+	u16 number;		/* callback number, or method context */
+	u8 kind;
+	u8 endpoint;
+	char tag[4];		/* method tag */
+};
+
+struct dcp_call_history {
+	raw_spinlock_t lock;
+	bool frozen;
+	unsigned int count;
+	struct dcp_call_record rec[DCP_CALL_HISTORY_LEN];
+};
+
+static bool dcp_is_t6050(struct device *dev)
+{
+	return of_device_is_compatible(dev->of_node, "apple,t6050-dcpext") ||
+	       of_device_is_compatible(dev->of_node, "apple,t6050-dcp");
+}
+
+static void dcp_call_record(struct apple_dcp *dcp, const struct dcp_call_record *in)
+{
+	struct dcp_call_history *h = dcp->call_history;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&h->lock, flags);
+	if (!h->frozen) {
+		struct dcp_call_record *r = &h->rec[h->count++ % DCP_CALL_HISTORY_LEN];
+
+		*r = *in;
+		r->time = local_clock();
+	}
+	raw_spin_unlock_irqrestore(&h->lock, flags);
+}
+
+/* Each probe is registered with its DCP as data and drops the others' events. */
+static void dcp_call_history_send(void *data, struct apple_dcp *dcp,
+				  u8 endpoint, u64 message)
+{
+	if (dcp == data)
+		dcp_call_record(dcp, &(struct dcp_call_record){
+			.kind = DCP_CALL_SEND, .endpoint = endpoint,
+			.value = message });
+}
+
+static void dcp_call_history_recv(void *data, struct apple_dcp *dcp,
+				  u8 endpoint, u64 message)
+{
+	if (dcp == data)
+		dcp_call_record(dcp, &(struct dcp_call_record){
+			.kind = DCP_CALL_RECV, .endpoint = endpoint,
+			.value = message });
+}
+
+static void dcp_call_history_push(void *data, struct apple_dcp *dcp,
+				  const struct dcp_method_entry *method,
+				  int context, int offset, int depth)
+{
+	struct dcp_call_record r = {
+		.kind = DCP_CALL_PUSH, .name = method->name, .number = context,
+	};
+
+	if (dcp != data)
+		return;
+	memcpy(r.tag, method->tag, sizeof(r.tag));
+	dcp_call_record(dcp, &r);
+}
+
+static void dcp_call_history_callback(void *data, struct apple_dcp *dcp,
+				      int tag, const char *name)
+{
+	if (dcp == data)
+		dcp_call_record(dcp, &(struct dcp_call_record){
+			.kind = DCP_CALL_CALLBACK, .number = tag, .name = name });
+}
+
+static void dcp_call_history_submit(void *data, struct apple_dcp *dcp,
+				    u32 swap_id)
+{
+	if (dcp == data)
+		dcp_call_record(dcp, &(struct dcp_call_record){
+			.kind = DCP_CALL_SWAP_SUBMIT, .value = swap_id });
+}
+
+static void dcp_call_history_complete(void *data, struct apple_dcp *dcp,
+				      u32 swap_id)
+{
+	if (dcp == data)
+		dcp_call_record(dcp, &(struct dcp_call_record){
+			.kind = DCP_CALL_SWAP_COMPLETE, .value = swap_id });
+}
+
+static void dcp_call_history_release(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	unregister_trace_iomfb_swap_complete(dcp_call_history_complete, dcp);
+	unregister_trace_iomfb_swap_submit(dcp_call_history_submit, dcp);
+	unregister_trace_iomfb_callback(dcp_call_history_callback, dcp);
+	unregister_trace_iomfb_push(dcp_call_history_push, dcp);
+	unregister_trace_dcp_recv_msg(dcp_call_history_recv, dcp);
+	unregister_trace_dcp_send_msg(dcp_call_history_send, dcp);
+	tracepoint_synchronize_unregister();
+	dcp->call_history = NULL;
+}
+
+static int dcp_call_history_register(struct apple_dcp *dcp)
+{
+	int ret;
+
+	ret = register_trace_dcp_send_msg(dcp_call_history_send, dcp);
+	if (ret)
+		return ret;
+	ret = register_trace_dcp_recv_msg(dcp_call_history_recv, dcp);
+	if (ret)
+		goto err_send;
+	ret = register_trace_iomfb_push(dcp_call_history_push, dcp);
+	if (ret)
+		goto err_recv;
+	ret = register_trace_iomfb_callback(dcp_call_history_callback, dcp);
+	if (ret)
+		goto err_push;
+	ret = register_trace_iomfb_swap_submit(dcp_call_history_submit, dcp);
+	if (ret)
+		goto err_callback;
+	ret = register_trace_iomfb_swap_complete(dcp_call_history_complete, dcp);
+	if (ret)
+		goto err_submit;
+	return 0;
+
+err_submit:
+	unregister_trace_iomfb_swap_submit(dcp_call_history_submit, dcp);
+err_callback:
+	unregister_trace_iomfb_callback(dcp_call_history_callback, dcp);
+err_push:
+	unregister_trace_iomfb_push(dcp_call_history_push, dcp);
+err_recv:
+	unregister_trace_dcp_recv_msg(dcp_call_history_recv, dcp);
+err_send:
+	unregister_trace_dcp_send_msg(dcp_call_history_send, dcp);
+	tracepoint_synchronize_unregister();
+	return ret;
+}
+
+static void dcp_call_history_start(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct dcp_call_history *h;
+	int ret;
+
+	/* The tracepoints are built with CONFIG_TRACING (trace.o). */
+	if (!IS_ENABLED(CONFIG_TRACING) || !call_history || !dcp ||
+	    !dcp_is_t6050(dev))
+		return;
+	h = devm_kzalloc(dev, sizeof(*h), GFP_KERNEL);
+	if (!h)
+		return;
+	raw_spin_lock_init(&h->lock);
+	dcp->call_history = h;
+	ret = dcp_call_history_register(dcp);
+	if (ret) {
+		dcp->call_history = NULL;
+		dev_warn(dev, "call history: tracepoint probes not registered: %d\n",
+			 ret);
+		return;
+	}
+	if (devm_add_action_or_reset(dev, dcp_call_history_release, dcp))
+		return;
+	dev_info(dev, "call history: keeping the last %u AP-link messages\n",
+		 DCP_CALL_HISTORY_LEN);
+}
+
+static void dcp_call_record_print(struct apple_dcp *dcp,
+				  const struct dcp_call_record *r)
+{
+	u64 sec = r->time;
+	u32 usec = do_div(sec, NSEC_PER_SEC) / NSEC_PER_USEC;
+
+	switch (r->kind) {
+	case DCP_CALL_SEND:
+	case DCP_CALL_RECV:
+		dev_info(dcp->dev, "call history: [%5llu.%06u] %s ep 0x%02x 0x%016llx\n",
+			 sec, usec, r->kind == DCP_CALL_SEND ? "send" : "recv",
+			 r->endpoint, r->value);
+		break;
+	case DCP_CALL_PUSH:
+		dev_info(dcp->dev, "call history: [%5llu.%06u] call %.4s %s (context %u)\n",
+			 sec, usec, r->tag, r->name, r->number);
+		break;
+	case DCP_CALL_CALLBACK:
+		dev_info(dcp->dev, "call history: [%5llu.%06u] callback D%03u %s\n",
+			 sec, usec, r->number, r->name);
+		break;
+	case DCP_CALL_SWAP_SUBMIT:
+	case DCP_CALL_SWAP_COMPLETE:
+		dev_info(dcp->dev, "call history: [%5llu.%06u] swap %llu %s\n",
+			 sec, usec, r->value,
+			 r->kind == DCP_CALL_SWAP_SUBMIT ? "submitted" : "completed");
+		break;
+	}
+}
+
+/* Once, at the crash, before the crash handling adds traffic of its own. */
+static void dcp_call_history_freeze(struct apple_dcp *dcp)
+{
+	struct dcp_call_history *h = dcp->call_history;
+	unsigned int count, n, i;
+	unsigned long flags;
+
+	if (!h)
+		return;
+	raw_spin_lock_irqsave(&h->lock, flags);
+	if (h->frozen) {
+		raw_spin_unlock_irqrestore(&h->lock, flags);
+		return;
+	}
+	h->frozen = true;
+	count = h->count;
+	raw_spin_unlock_irqrestore(&h->lock, flags);
+
+	/* Frozen: nothing writes the ring any more. */
+	n = min(count, DCP_CALL_HISTORY_LEN);
+	dev_err(dcp->dev, "call history: the last %u of %u AP-link messages before the crash:\n",
+		n, count);
+	for (i = count - n; i != count; i++)
+		dcp_call_record_print(dcp, &h->rec[i % DCP_CALL_HISTORY_LEN]);
+}
+
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
 {
 	struct apple_dcp *dcp = cookie;
 
 	if (READ_ONCE(dcp->quiescing))
 		return;
+
+	/* Before the crash handling adds traffic of its own. */
+	dcp_call_history_freeze(dcp);
 
 	/*
 	 * A failed T8122 dcpext: its start never ran (start_done is not set
@@ -5730,6 +5989,8 @@ fixed_done:
 			iomfb_v14_7_external_refuse(dcp, "its Type-C display routes did not register");
 	}
 
+	/* Before the bind, which can start the firmware session. */
+	dcp_call_history_start(&pdev->dev);
 	ret = component_add(&pdev->dev, &dcp_comp_ops);
 	if (ret && dcp->external_prepared) {
 		dcp_disable_typec_work(dcp, true);
