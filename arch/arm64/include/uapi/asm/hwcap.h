@@ -162,4 +162,6 @@
  */
 #define HWCAP3_APPLE_APFLG	(1UL << 63)
 
+#define HWCAP3_APPLE_AFP	(1UL << 62)
+
 #endif /* _UAPI__ASM_HWCAP_H */

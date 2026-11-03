@@ -123,6 +123,12 @@
 #ifndef AURORA_SET_X86_FLAGS
 # define AURORA_SET_X86_FLAGS(a)	(-EINVAL)
 #endif
+#ifndef AURORA_GET_X86_FP
+# define AURORA_GET_X86_FP()		(-EINVAL)
+#endif
+#ifndef AURORA_SET_X86_FP
+# define AURORA_SET_X86_FP(a)		(-EINVAL)
+#endif
 #ifndef SVE_SET_VL
 # define SVE_SET_VL(a)		(-EINVAL)
 #endif
@@ -2626,6 +2632,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg3 || arg4 || arg5)
 			return -EINVAL;
 		error = AURORA_SET_X86_FLAGS(arg2);
+		break;
+	case PR_AURORA_GET_X86_FP:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = AURORA_GET_X86_FP();
+		break;
+	case PR_AURORA_SET_X86_FP:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+		error = AURORA_SET_X86_FP(arg2);
 		break;
 	case PR_SET_PDEATHSIG:
 		if (!valid_signal(arg2)) {

@@ -112,6 +112,48 @@ static void cpu_enable_apple_apflg(const struct arm64_cpu_capabilities *entry)
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+static bool has_apple_afp(const struct arm64_cpu_capabilities *entry, int scope)
+{
+	u64 val;
+
+	WARN_ON(scope == SCOPE_LOCAL_CPU && preemptible());
+
+	if (read_cpuid_implementor() != ARM_CPU_IMP_APPLE ||
+	    !cpufeature_matches(read_sysreg(aidr_el1), entry))
+		return false;
+
+	/*
+	 * The kernel switches AFPCR_EL0 between threads. Below EL2 a hypervisor
+	 * traps that IMPDEF register (KVM through HCR_EL2.TIDCP) and would
+	 * inject an UNDEF, so require it to say that it emulates AFPCR.
+	 */
+	if (!is_kernel_in_hyp_mode() &&
+	    !kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_AURORA_APPLE_AFPCR))
+		return false;
+
+	val = read_sysreg(actlr_el1);
+	write_sysreg(val ^ ACTLR_APPLE_AFP, actlr_el1);
+	isb();
+	if (!((val ^ read_sysreg(actlr_el1)) & ACTLR_APPLE_AFP)) {
+		pr_info_once("CPU advertises Apple AFP but it is broken, ignoring\n");
+		return false;
+	}
+
+	write_sysreg(val, actlr_el1);
+	isb();
+	return true;
+}
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+/* Tell userspace through AT_HWCAP3 and /proc/cpuinfo */
+static void cpu_enable_apple_afp(const struct arm64_cpu_capabilities *entry)
+{
+	cpu_set_named_feature(APPLE_AFP);
+}
+#endif
+
 static bool has_apple_actlr_virt_impdef(const struct arm64_cpu_capabilities *entry, int scope)
 {
 	u64 midr = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
@@ -154,6 +196,20 @@ static const struct arm64_cpu_capabilities arm64_impdef_features[] = {
 		.cpu_enable = cpu_enable_apple_apflg,
 		.matches = has_apple_apflg,
 		.field_pos = AIDR_APPLE_APFLG_SHIFT,
+		.field_width = 1,
+		.sign = FTR_UNSIGNED,
+		.min_field_value = 1,
+		.max_field_value = 1,
+	},
+#endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	{
+		.desc = "x86 floating-point mode (Apple AFP)",
+		.capability = ARM64_HAS_AFP_APPLE,
+		.type = ARM64_CPUCAP_EARLY_LOCAL_CPU_FEATURE,
+		.cpu_enable = cpu_enable_apple_afp,
+		.matches = has_apple_afp,
+		.field_pos = AIDR_APPLE_AFP_SHIFT,
 		.field_width = 1,
 		.sign = FTR_UNSIGNED,
 		.min_field_value = 1,

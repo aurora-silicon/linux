@@ -17,12 +17,18 @@
 	GENMASK(KVM_REG_ARM_VENDOR_HYP_BMAP_BIT_COUNT - 1, 0)
 #define KVM_ARM_SMCCC_VENDOR_HYP_FEATURES_2			\
 	(GENMASK(KVM_REG_ARM_VENDOR_HYP_BMAP_2_BIT_COUNT - 1, 0) |	\
-	 KVM_ARM_SMCCC_AURORA_APPLE_APFLG_FEATURES)
+	 KVM_ARM_SMCCC_AURORA_APPLE_APFLG_FEATURES |		\
+	 KVM_ARM_SMCCC_AURORA_APPLE_AFP_FEATURES)
 
 /* Aurora feature bits: what KVM emulates for this host, never callable */
 #define KVM_ARM_SMCCC_AURORA_APPLE_APFLG_FEATURES			\
 	(IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) ?		\
 	 BIT(KVM_REG_ARM_VENDOR_HYP_BIT_AURORA_APPLE_ASPSR) : 0)
+
+/* Aurora feature bit: KVM emulates AFPCR_EL0 on this host, never callable */
+#define KVM_ARM_SMCCC_AURORA_APPLE_AFP_FEATURES			\
+	(IS_ENABLED(CONFIG_ARM64_APPLE_X86_FP) ?		\
+	 BIT(KVM_REG_ARM_VENDOR_HYP_BIT_AURORA_APPLE_AFPCR) : 0)
 
 static void kvm_ptp_get_time(struct kvm_vcpu *vcpu, u64 *val)
 {
@@ -414,6 +420,9 @@ void kvm_arm_init_hypercalls(struct kvm *kvm)
 	if (cpus_have_final_cap(ARM64_HAS_APFLG_APPLE))
 		smccc_feat->vendor_hyp_bmap_2 |=
 			KVM_ARM_SMCCC_AURORA_APPLE_APFLG_FEATURES;
+	if (cpus_have_final_cap(ARM64_HAS_AFP_APPLE))
+		smccc_feat->vendor_hyp_bmap_2 |=
+			KVM_ARM_SMCCC_AURORA_APPLE_AFP_FEATURES;
 
 	mt_init(&kvm->arch.smccc_filter);
 }

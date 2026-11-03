@@ -2455,6 +2455,17 @@ config ARM64_APPLE_X86_FLAGS
 	  this with the PR_AURORA_SET_X86_FLAGS prctl() and to keep both
 	  flags across exceptions, context switches and signal delivery.
 
+config ARM64_APPLE_X86_FP
+	bool "Apple x86 floating-point mode (AFP)"
+	default y
+	select ARM64_ACTLR_STATE
+	help
+	  Apple CPUs have an alternate floating-point mode that follows x86
+	  SSE rules for NaNs, FMAX/FMIN and denormals, with its own control
+	  register (AFPCR_EL0) for the DAZ and FTZ modes. Say Y to let a
+	  thread enable it with the PR_AURORA_SET_X86_FP prctl() and to
+	  give each thread its own AFPCR_EL0.
+
 config RELOCATABLE
 	bool "Build a relocatable kernel image" if EXPERT
 	select ARCH_HAS_RELR

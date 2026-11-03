@@ -21,6 +21,7 @@
 
 #include <asm/arm_pmuv3.h>
 #include <asm/apple_cpufeature.h>
+#include <asm/apple_cpufeature.h>
 #include <asm/cacheflush.h>
 #include <asm/cputype.h>
 #include <asm/debug-monitors.h>
@@ -1013,6 +1014,10 @@ static u64 reset_actlr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 	/* The guest turns the x86 flags on itself, per thread */
 	if (cpus_have_final_cap(ARM64_HAS_APFLG_APPLE))
 		actlr &= ~ACTLR_APPLE_APFLG;
+
+	/* The guest turns the x86 FP mode on itself, per thread */
+	if (cpus_have_final_cap(ARM64_HAS_AFP_APPLE))
+		actlr &= ~ACTLR_APPLE_AFP;
 	vcpu_write_sys_reg(vcpu, actlr, ACTLR_EL1);
 	return actlr;
 }
@@ -1043,6 +1048,38 @@ static unsigned int apple_aspsr_visibility(const struct kvm_vcpu *vcpu,
 {
 	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) && has_vhe() &&
 	    cpus_have_final_cap(ARM64_HAS_APFLG_APPLE))
+		return 0;
+	return REG_HIDDEN;
+}
+
+/*
+ * AFPCR_EL0 is the guest's DAZ/FTZ control for the x86 FP mode.
+ * HCR_EL2.TIDCP traps its accesses, from guest EL1 and EL0; while the vCPU
+ * is loaded the hardware register is the live one.
+ */
+static bool access_apple_afpcr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+			       const struct sys_reg_desc *r)
+{
+	bool loaded = vcpu_get_flag(vcpu, SYSREGS_ON_CPU);
+
+	if (p->is_write) {
+		u64 val = p->regval & (AFPCR_APPLE_DAZ | AFPCR_APPLE_FTZ);
+
+		__vcpu_assign_sys_reg(vcpu, APPLE_AFPCR_EL0, val);
+		if (loaded)
+			write_sysreg_s(val, SYS_IMP_APL_AFPCR_EL0);
+	} else {
+		p->regval = loaded ? read_sysreg_s(SYS_IMP_APL_AFPCR_EL0) :
+			__vcpu_sys_reg(vcpu, APPLE_AFPCR_EL0);
+	}
+	return true;
+}
+
+static unsigned int apple_afpcr_visibility(const struct kvm_vcpu *vcpu,
+					   const struct sys_reg_desc *rd)
+{
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FP) && has_vhe() &&
+	    cpus_have_final_cap(ARM64_HAS_AFP_APPLE))
 		return 0;
 	return REG_HIDDEN;
 }
@@ -4013,6 +4050,9 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 
 	{ SYS_DESC(SYS_IMP_APL_ASPSR_EL1), access_apple_aspsr, reset_val,
 	  APPLE_ASPSR_EL1, 0, .visibility = apple_aspsr_visibility },
+
+	{ SYS_DESC(SYS_IMP_APL_AFPCR_EL0), access_apple_afpcr, reset_val,
+	  APPLE_AFPCR_EL0, 0, .visibility = apple_afpcr_visibility },
 };
 
 static bool handle_at_s1e01(struct kvm_vcpu *vcpu, struct sys_reg_params *p,

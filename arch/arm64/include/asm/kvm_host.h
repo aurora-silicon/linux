@@ -501,6 +501,7 @@ enum vcpu_sysreg {
 	POR_EL0,	/* Permission Overlay Register 0 (EL0) */
 	APPLE_ASPSR_EL1, /* Apple saved x86 parity/adjust flags (APFLG) */
 	APPLE_ASPSR_EL2, /* The same flags as of the guest's last exit */
+	APPLE_AFPCR_EL0, /* Apple x86 FP mode control (AFP: DAZ, FTZ) */
 
 	/* FP/SIMD/SVE */
 	SVCR,

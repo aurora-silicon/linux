@@ -390,6 +390,9 @@ enum {
 /* Aurora: KVM emulates Apple ASPSR_EL1 for the guest (function 94) */
 #define KVM_REG_ARM_VENDOR_HYP_BIT_AURORA_APPLE_ASPSR	30
 
+/* Aurora: KVM emulates Apple AFPCR_EL0 for the guest (function 95) */
+#define KVM_REG_ARM_VENDOR_HYP_BIT_AURORA_APPLE_AFPCR	31
+
 enum {
 	KVM_REG_ARM_VENDOR_HYP_BIT_DISCOVER_IMPL_VER	= 0,
 	KVM_REG_ARM_VENDOR_HYP_BIT_DISCOVER_IMPL_CPUS	= 1,
