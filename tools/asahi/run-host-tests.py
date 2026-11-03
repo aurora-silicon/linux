@@ -53,6 +53,10 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'dcpext26-startup-tests.py': [([], PASS)],
+    'dcpext26-wire-tests.py': [([], PASS)],
+    'pmp-native26-tests.py': [([], PASS)],
+
     'test-m3-power.py': [([], PASS)],
     'test-m3-uapi.py': [([], PASS)],
     'test-m3-mailbox.py': [([], PASS)],

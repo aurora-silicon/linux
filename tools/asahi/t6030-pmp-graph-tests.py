@@ -36,7 +36,7 @@ def main():
                         'apple,irq-safe;' in node))
     assert len(entries) == 4
     entry_data = ',\n'.join('{%d, %d, %d, %d, %d}' % e for e in entries)
-    names = ['static int apple_pmp_report_bit(', 'static int apple_pmp_start_check_layout(',
+    names = ['static int apple_pmp_report_record(', 'static int apple_pmp_report_bit(', 'static int apple_pmp_start_check_layout(',
              'static int apple_pmp_start_describe(', 'static void apple_pmp_start_finish(',
              'static bool apple_pmp_start_stopping(', 'static void apple_pmp_start_work(',
              'static void apple_pmp_start_drain(', 'static int apple_pmp_start_init(',

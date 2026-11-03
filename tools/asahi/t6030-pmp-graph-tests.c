@@ -162,6 +162,8 @@ struct apple_pmp_report {
 	unsigned int polls;
 	struct delayed_work ready_work;
 	struct apple_pmp_ane ane;
+	struct device_node *native_pmp;
+	u64 native_claimed;
 };
 struct completion {
 	bool done;
@@ -200,6 +202,7 @@ struct apple_pmp_report_entry {
 	bool sleep_release, released;
 	u32 dvfs_entry;
 	u64 dvfs_on;
+	struct apple_pmp_report *native_owner;
 };
 #define PMP_DVFS_VALID BIT_ULL(61)
 #define genpd_to_apple_pmp_report_entry(p) \
@@ -728,6 +731,13 @@ static const struct apple_pmp_start_ops apple_pmp_start_hw_ops = { hw_check,
 								   hw_bound };
 static const struct apple_pmp_start_timing apple_pmp_start_timing = { 2, 0, 2,
 								      2 };
+/* Native26 table admission is exercised by its separate actual-body fixture. */
+static int apple_pmp_native_records(struct apple_pmp_report *rep)
+{
+	assert(!rep->native_pmp);
+	return 0;
+}
+
 #include "production.h"
 #if HOST_HAS_DRAM
 static int devm_device_add_group(struct device *dev, const struct attribute_group *group)
