@@ -325,7 +325,10 @@ int main(void)
 		.fmt = { .num_planes = 2, .plane_size = { 4096, 2048 } },
 	};
 
-	for (unsigned int caps = 0; caps < 2; caps++) {
+	for (unsigned int mode = 0; mode < 4; mode++) {
+		unsigned int caps = mode & 1;
+		bool pre_start = mode & 2;
+
 		for (unsigned int fail = 0; fail < 2; fail++) {
 			for (unsigned int change = 0; change < 2; change++) {
 				INIT_LIST_HEAD(&isp.bufs_pending);
@@ -359,29 +362,38 @@ int main(void)
 				mutate = change;
 				unsigned int locks_before = acquisitions;
 
-				CHECK(isp_submit_buffers(&isp, false) ==
+				CHECK(isp_submit_buffers(&isp, pre_start) ==
 				      send_error);
 				CHECK(acquisitions == locks_before + 1);
 				CHECK(isp.bufs_pending.next ==
-				      &rendered[ISP_MAX_BUFFERS].link);
+				      &rendered[caps && pre_start ?
+							0 :
+							ISP_MAX_BUFFERS]
+					       .link);
 				CHECK(isp.bufs_pending.prev ==
 				      &rendered[ISP_MAX_BUFFERS].link);
 				CHECK(isp.bufs_submitted.next ==
-				      &rendered[0].link);
+				      (caps && pre_start ? &isp.bufs_submitted :
+							   &rendered[0].link));
 				CHECK(isp.bufs_submitted.prev ==
-				      &rendered[ISP_MAX_BUFFERS - 1].link);
+				      (caps && pre_start ?
+					       &isp.bufs_submitted :
+					       &rendered[ISP_MAX_BUFFERS - 1]
+							.link));
 				for (unsigned int i = 0;
 				     i < ARRAY_SIZE(metadata); i++)
 					CHECK(metadata[i].submitted);
 				for (unsigned int i = 0;
 				     i < ARRAY_SIZE(capmeta); i++)
-					CHECK(capmeta[i].submitted == !!caps);
+					CHECK(capmeta[i].submitted ==
+					      !!(caps && !pre_start));
 				if (fail) {
 					unsigned int before = sends;
 					unsigned char saved[sizeof(area)];
 
 					memcpy(saved, area, sizeof(area));
-					CHECK(isp_submit_buffers(&isp, false) ==
+					CHECK(isp_submit_buffers(&isp,
+								 pre_start) ==
 					      -ETIME);
 					CHECK(sends == before &&
 					      !memcmp(saved, area,
