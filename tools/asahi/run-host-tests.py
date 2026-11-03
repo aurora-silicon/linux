@@ -53,6 +53,9 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'isp-preview-tests.py': [([], PASS)],
+    'isp-preview-flow-tests.py': [([], PASS)],
+    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']],
     'aop-als-channel-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
