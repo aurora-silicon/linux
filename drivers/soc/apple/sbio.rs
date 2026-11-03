@@ -3795,6 +3795,8 @@ impl SepData {
             // The order macOS follows after the passcode: the bag unlock ends
             // the enclave's lockout, a new match credential follows, and the
             // enclave's lockout record is saved again.
+            let relocked = self.lock_special_bag();
+            dev_info!(self.dev, "Touch ID: re-arm: key bag lock before the unlock {}\n", relocked);
             let unlocked = self.unlock_special_bag();
             let established = unlocked && self.establish_scrd_match_context(user);
             let saved = established && self.save_lockout();
@@ -4127,6 +4129,21 @@ impl SepData {
             self.sks_req_unlock_special(special, stored.secret(), healthy)
         })
         .is_some()
+    }
+
+    fn lock_special_bag(&self) -> bool {
+        if !self.keybag_designated.load(Relaxed) {
+            return false;
+        }
+        let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        let special = user.special_handle();
+        let label = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => c"DEVICE_STATE_TRANSITION",
+            profile::KeyStore::Variant5 => crate::sks::SKS_LOCK_STATE_NAME,
+        };
+        self.sks_step(label, |healthy| self.sks_req_lock_special(special, healthy)).is_some()
     }
 
     fn ensure_restored_after(&self, prepared: bool) {
