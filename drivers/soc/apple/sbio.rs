@@ -3760,9 +3760,10 @@ impl SepData {
 
     /// Userspace calls this only after the user's password was verified. The
     /// node is root's alone and its SELinux label confines it to the re-arm
-    /// helper. As on macOS, where the passcode clears the lockout, the
-    /// enclave is shown the secret again: SKS verifies the stored keybag
-    /// secret into a new SCRD match context.
+    /// helper. As on macOS, where unlocking the user's key bag with the
+    /// passcode ends the lockout, the designated bag is unlocked with the
+    /// stored secret, a new SCRD match context is set up, and the enclave's
+    /// lockout record is saved.
     fn rearm_after_password(&self) -> Result<()> {
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
@@ -3791,7 +3792,17 @@ impl SepData {
             if !self.capture_begin() {
                 continue;
             }
-            let established = self.establish_scrd_match_context(user);
+            // The order macOS follows after the passcode: the bag unlock ends
+            // the enclave's lockout, a new match credential follows, and the
+            // enclave's lockout record is saved again.
+            let unlocked = self.unlock_special_bag();
+            let established = unlocked && self.establish_scrd_match_context(user);
+            let saved = established && self.save_lockout();
+            if !unlocked {
+                dev_err!(self.dev, "Touch ID: re-arm: the key bag did not unlock with the stored secret\n");
+            } else if established && !saved {
+                dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
+            }
             if established {
                 self.bio_nomatch_streak.store(0, Relaxed);
                 self.bio_lockout_logged.store(false, Relaxed);
@@ -4093,30 +4104,36 @@ impl SepData {
         })
     }
 
+    /// Unlocks the designated user's key bag with the stored secret, as
+    /// macOS unlocks the user's bag with the passcode. The enclave ends a
+    /// biometric lockout when the bag is unlocked with its secret, not
+    /// when a match credential is set up.
+    fn unlock_special_bag(&self) -> bool {
+        if !self.keybag_designated.load(Relaxed) {
+            return false;
+        }
+        let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        let special = user.special_handle();
+        let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) else {
+            return false;
+        };
+        let label = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => c"DEVICE_STATE_TRANSITION",
+            profile::KeyStore::Variant5 => crate::sks::SKS_LOCK_STATE_NAME,
+        };
+        self.sks_step(label, |healthy| {
+            self.sks_req_unlock_special(special, stored.secret(), healthy)
+        })
+        .is_some()
+    }
+
     fn ensure_restored_after(&self, prepared: bool) {
         // Probe credential ordering without assuming it fixes cold restore.
         // J414s still answered 0x8002 and listed zero identities with this
         // credential established, so the identity proof below remains required.
-        let mut unlocked = false;
-        if self.keybag_designated.load(Relaxed) {
-            if let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) {
-                let special = user.special_handle();
-                if let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) {
-                    unlocked = match self.profile.key_store {
-                        profile::KeyStore::Sepos13 { .. } => self
-                            .sks_step(c"DEVICE_STATE_TRANSITION", |healthy| {
-                                self.sks_req_unlock_special(special, stored.secret(), healthy)
-                            })
-                            .is_some(),
-                        profile::KeyStore::Variant5 => self
-                            .sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
-                                self.sks_req_unlock_special(special, stored.secret(), healthy)
-                            })
-                            .is_some(),
-                    };
-                }
-            }
-        }
+        let unlocked = self.unlock_special_bag();
         let match_context = crate::sbio::UserId::new(SBIO_PROBE_USER_ID)
             .map(|user| self.establish_scrd_match_context(user))
             .unwrap_or(false);
