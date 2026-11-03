@@ -442,4 +442,22 @@ struct prctl_mm_map {
 #define PR_AURORA_SET_DEFAULT_PAGE_SIZE 0x41555003
 #define PR_AURORA_GET_DEFAULT_PAGE_SIZE 0x41555004
 
+/*
+ * Aurora experimental ABI: Apple x86 parity and adjust flags (APFLG).
+ * With ON, flag-setting integer instructions of the calling thread also
+ * compute the x86 parity flag (set for an even number of one bits in the
+ * low byte of the result) into NZCV bit 26 and the x86 adjust flag (carry
+ * or borrow out of bit 3) into NZCV bit 27, and MRS/MSR NZCV read and write
+ * both. Signal frames and ptrace carry them in the same pstate bits.
+ * GET returns ON or OFF. Both fail with EINVAL on CPUs without APFLG.
+ * The setting is per thread, inherited by fork and clone, and reset to OFF
+ * by execve.
+ * HWCAP3_APPLE_APFLG in AT_HWCAP3 and "apple_apflg" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_X86_FLAGS		0x41555005
+#define PR_AURORA_SET_X86_FLAGS		0x41555006
+# define PR_AURORA_X86_FLAGS_OFF	0
+# define PR_AURORA_X86_FLAGS_ON		1
+
 #endif /* _LINUX_PRCTL_H */

@@ -2445,6 +2445,16 @@ config ARM64_MEMORY_MODEL_CONTROL
 	  for the PR_SET_MEM_MODEL/PR_GET_MEM_MODEL prctl() calls on
 	  CPUs with this feature.
 
+config ARM64_APPLE_X86_FLAGS
+	bool "Apple x86 parity and adjust flags (APFLG)"
+	default y
+	select ARM64_ACTLR_STATE
+	help
+	  Apple CPUs can compute the x86 parity (PF) and adjust (AF) flags
+	  alongside NZCV for x86 emulators. Say Y to let a thread enable
+	  this with the PR_AURORA_SET_X86_FLAGS prctl() and to keep both
+	  flags across exceptions, context switches and signal delivery.
+
 config RELOCATABLE
 	bool "Build a relocatable kernel image" if EXPERT
 	select ARCH_HAS_RELR

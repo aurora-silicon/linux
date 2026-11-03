@@ -422,6 +422,13 @@ extern void __init minsigstksz_setup(void);
 #include <asm/fpsimd.h>
 
 /* Userspace interface for PR_S[MV]E_{SET,GET}_VL prctl()s: */
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+int apple_x86_flags_get(void);
+int apple_x86_flags_set(unsigned long val);
+#define AURORA_GET_X86_FLAGS()		apple_x86_flags_get()
+#define AURORA_SET_X86_FLAGS(arg)	apple_x86_flags_set(arg)
+#endif
+
 #define SVE_SET_VL(arg)	sve_set_current_vl(arg)
 #define SVE_GET_VL()	sve_get_current_vl()
 #define SME_SET_VL(arg)	sme_set_current_vl(arg)

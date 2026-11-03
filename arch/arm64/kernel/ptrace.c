@@ -30,6 +30,7 @@
 #include <linux/elf.h>
 #include <linux/rseq.h>
 
+#include <asm/apple_cpufeature.h>
 #include <asm/compat.h>
 #include <asm/cpufeature.h>
 #include <asm/debug-monitors.h>
@@ -2547,7 +2548,14 @@ static int valid_compat_regs(struct user_pt_regs *regs)
 
 static int valid_native_regs(struct user_pt_regs *regs)
 {
-	regs->pstate &= ~SPSR_EL1_AARCH64_RES0_BITS;
+	u64 res0 = SPSR_EL1_AARCH64_RES0_BITS;
+
+	/* Apple's x86 parity and adjust flags live in bits 27:26 */
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) &&
+	    alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		res0 &= ~(PSR_APPLE_PF_BIT | PSR_APPLE_AF_BIT);
+
+	regs->pstate &= ~res0;
 
 	if (user_mode(regs) && !(regs->pstate & PSR_MODE32_BIT) &&
 	    (regs->pstate & PSR_D_BIT) == 0 &&

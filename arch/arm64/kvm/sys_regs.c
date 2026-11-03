@@ -20,6 +20,7 @@
 #include <linux/irqchip/arm-gic-v3.h>
 
 #include <asm/arm_pmuv3.h>
+#include <asm/apple_cpufeature.h>
 #include <asm/cacheflush.h>
 #include <asm/cputype.h>
 #include <asm/debug-monitors.h>
@@ -1008,8 +1009,42 @@ static u64 reset_amair_el1(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 static u64 reset_actlr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 {
 	u64 actlr = read_sysreg(actlr_el1);
+
+	/* The guest turns the x86 flags on itself, per thread */
+	if (cpus_have_final_cap(ARM64_HAS_APFLG_APPLE))
+		actlr &= ~ACTLR_APPLE_APFLG;
 	vcpu_write_sys_reg(vcpu, actlr, ACTLR_EL1);
 	return actlr;
+}
+
+/*
+ * ASPSR_EL1 holds the guest's x86 parity/adjust flags across its exceptions.
+ * HCR_EL2.TIDCP traps its accesses; while the vCPU is loaded the hardware
+ * copy is the live one, since the guest's ERET restores the flags from it.
+ */
+static bool access_apple_aspsr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
+			       const struct sys_reg_desc *r)
+{
+	bool loaded = vcpu_get_flag(vcpu, SYSREGS_ON_CPU);
+
+	if (p->is_write) {
+		__vcpu_assign_sys_reg(vcpu, APPLE_ASPSR_EL1, p->regval);
+		if (loaded)
+			write_sysreg_s(p->regval, SYS_IMP_APL_ASPSR_EL12);
+	} else {
+		p->regval = loaded ? read_sysreg_s(SYS_IMP_APL_ASPSR_EL12) :
+			__vcpu_sys_reg(vcpu, APPLE_ASPSR_EL1);
+	}
+	return true;
+}
+
+static unsigned int apple_aspsr_visibility(const struct kvm_vcpu *vcpu,
+					   const struct sys_reg_desc *rd)
+{
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) && has_vhe() &&
+	    cpus_have_final_cap(ARM64_HAS_APFLG_APPLE))
+		return 0;
+	return REG_HIDDEN;
 }
 
 static u64 reset_mpidr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
@@ -3975,6 +4010,9 @@ static const struct sys_reg_desc sys_reg_descs[] = {
 	{ SYS_DESC(SYS_CNTV_CVAL_EL02), access_arch_timer },
 
 	EL2_REG(SP_EL2, NULL, reset_unknown, 0),
+
+	{ SYS_DESC(SYS_IMP_APL_ASPSR_EL1), access_apple_aspsr, reset_val,
+	  APPLE_ASPSR_EL1, 0, .visibility = apple_aspsr_visibility },
 };
 
 static bool handle_at_s1e01(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
