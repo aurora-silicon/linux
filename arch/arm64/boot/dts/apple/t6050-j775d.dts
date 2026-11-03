@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Mac Studio (M5 Ultra, 2026)
+ *
+ * target-type: J775D
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6050.dtsi"
+
+/ {
+	compatible = "apple,j775d", "apple,t6050", "apple,arm-platform";
+	model = "Apple Mac Studio (M5 Ultra, 2026)";
+	chassis-type = "desktop";
+
+	aliases {
+		serial0 = &dockchannel;
+		/* the boot loader fills in the MAC address through this alias */
+		ethernet0 = &ethernet0;
+	};
+
+	/*
+	 * No stdout-path: the boot loader passes the console on the command
+	 * line when it wants one.
+	 */
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+
+	/*
+	 * PCIe ports 2 (the onboard 10 Gb Ethernet) and 3 (the rear USB-A
+	 * xHCI). The boot loader powers and trains both links and keeps power,
+	 * clocks, the PHYs and PERST; Linux owns the routing, MSI and the
+	 * DARTs. The boot loader disables a port, and its DART, whose link did
+	 * not come up.
+	 */
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6050-pcie";
+		device_type = "pci";
+		reg = <0x1c 0xb0000000 0x0 0x10000000>,
+		      <0x4 0x14000000 0x0 0x4000>,
+		      <0x4 0x12028000 0x0 0x8000>,
+		      <0x4 0x17018000 0x0 0x4000>,
+		      <0x4 0x12024000 0x0 0x4000>,
+		      <0x4 0x13028000 0x0 0x8000>,
+		      <0x4 0x1701c000 0x0 0x4000>,
+		      <0x4 0x13024000 0x0 0x4000>;
+		reg-names = "config", "rc", "port2", "phy2", "intr2axi2",
+			    "port3", "phy3", "intr2axi3";
+		nonposted-mmio;
+		interrupts = <AIC_IRQ 0 1539 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1547 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "port2", "port3";
+
+		/* One MSI domain for both ports: vectors 64-127 */
+		msi-controller;
+		msi-parent = <&pcie0>;
+		msi-ranges = <&aic AIC_IRQ 0 1888 IRQ_TYPE_EDGE_RISING 64>;
+		apple,msi-vector-base = <64>;
+
+		/* The boot loader numbers port 2's secondary bus 1 and port 3's 2 */
+		iommu-map = <0x100 &dart_apcie2 1 1>,
+			    <0x200 &dart_apcie3 1 1>;
+		iommu-map-mask = <0xffff>;
+		dma-coherent;
+		linux,pci-domain = <0>;
+		bus-range = <0 2>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges = <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>,
+			 <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>;
+
+		port02: pci@2,0 {
+			device_type = "pci";
+			reg = <0x1000 0 0 0 0>;
+			bus-range = <1 1>;
+			apple,link-trained-by-bootloader;
+
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+					<0 0 0 2 &port02 0 0 0 1>,
+					<0 0 0 3 &port02 0 0 0 2>,
+					<0 0 0 4 &port02 0 0 0 3>;
+
+			/* The RTL8127A keeps no MAC address of its own */
+			ethernet0: ethernet@0,0 {
+				reg = <0x10000 0x0 0x0 0x0 0x0>;
+				/* To be filled by the loader */
+				local-mac-address = [00 00 00 00 00 00];
+			};
+		};
+
+		port03: pci@3,0 {
+			device_type = "pci";
+			reg = <0x1800 0 0 0 0>;
+			bus-range = <2 2>;
+			apple,link-trained-by-bootloader;
+
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &port03 0 0 0 0>,
+					<0 0 0 2 &port03 0 0 0 1>,
+					<0 0 0 3 &port03 0 0 0 2>,
+					<0 0 0 4 &port03 0 0 0 3>;
+		};
+	};
+};
+
+/*
+ * The console is on the USB debug link, which drains only while a host reads
+ * it; the machine also boots with nothing attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&dart_apcie3 {
+	status = "okay";
+};

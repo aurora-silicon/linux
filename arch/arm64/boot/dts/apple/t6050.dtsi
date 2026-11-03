@@ -1,0 +1,413 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6050 "M5 Ultra" SoC
+ *
+ * Two dies. Die 0's MMIO window is 0x2_00000000 and die 1's 0x42_00000000
+ * (die stride 0x40_00000000); each has its own simple-bus, which the boot
+ * loader looks up by unit address. Unit addresses are CPU physical
+ * addresses. The boot loader starts the secondary CPUs and fills in their
+ * release addresses, the memory node and its own reservations.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "apple,t6050", "apple,arm-platform";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+
+	/* The boot loader replaces reg with the usable RAM. */
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0x0 0x0 0x0>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* The boot loader adds its own reservations. */
+	};
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		/*
+		 * Die d, cluster c, core n has MPIDR Aff2 4 for the two M-tier
+		 * (apple,sawtooth) clusters and 1 for the P-tier (apple,everest)
+		 * cluster, Aff1 0x10 * d + c and Aff0 n. Labels number the cores
+		 * 18 * d + 6 * c + n. Die 0 comes first, so nr_cpus= brings the
+		 * CPUs up in that order. The boot loader removes the nodes of the
+		 * cores it did not start.
+		 */
+		cpu0: cpu@40000 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40000>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* to be filled by the loader */
+		};
+
+		cpu1: cpu@40001 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40001>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu2: cpu@40002 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40002>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu3: cpu@40003 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40003>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu4: cpu@40004 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40004>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu6: cpu@40100 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu7: cpu@40101 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu8: cpu@40102 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu9: cpu@40103 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu10: cpu@40104 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x40104>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu12: cpu@10200 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x10200>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu13: cpu@10201 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x10201>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu14: cpu@10202 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x10202>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu15: cpu@10203 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x10203>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu16: cpu@10204 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x10204>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu18: cpu@41000 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41000>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu19: cpu@41001 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41001>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu20: cpu@41002 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41002>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu21: cpu@41003 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41003>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu22: cpu@41004 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41004>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu24: cpu@41100 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu25: cpu@41101 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu26: cpu@41102 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu27: cpu@41103 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu28: cpu@41104 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0x0 0x41104>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu30: cpu@11200 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x11200>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu31: cpu@11201 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x11201>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu32: cpu@11202 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x11202>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu33: cpu@11203 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x11203>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+
+		cpu34: cpu@11204 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0x0 0x11204>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+	};
+
+	/* The 24 MHz reference clock of the watchdog */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <AIC_FIQ 0 AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ 0 AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ 0 AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ 0 AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/* Die 0 MMIO */
+	soc@200000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x2 0x0 0x2 0x0 0x3 0xc0000000>;
+		nonposted-mmio;
+
+		/* One AIC3 for both dies, 3104 interrupts each */
+		aic: interrupt-controller@280400000 {
+			compatible = "apple,t6050-aic3", "apple,t8122-aic3";
+			interrupt-controller;
+			#interrupt-cells = <4>;
+			reg = <0x2 0x80400000 0x0 0x1cc000>,
+			      <0x2 0x80440000 0x0 0x4000>;
+			reg-names = "core", "event";
+		};
+
+		/*
+		 * DockChannel channel 1, the one the USB debug link carries.
+		 * Its FIFO raises no interrupt on receive, so it is drained in
+		 * software.
+		 */
+		dockchannel: serial@288e3c000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <0x2 0x88e3c000 0x0 0x30>,
+			      <0x2 0x88e38000 0x0 0x8>,
+			      <0x2 0x88e0c000 0x0 0x18>;
+			reg-names = "data", "config", "irq";
+			interrupts = <AIC_IRQ 0 360 IRQ_TYPE_LEVEL_HIGH>;
+			apple,channel = <1>;
+			apple,sw-drain;
+			status = "disabled";
+		};
+
+		wdt: watchdog@28836c000 {
+			compatible = "apple,t6050-wdt", "apple,t8103-wdt";
+			reg = <0x2 0x8836c000 0x0 0x4000>;
+			clocks = <&clkref>;
+			interrupts = <AIC_IRQ 0 721 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/*
+		 * The storage SART. The boot loader's entries (outside the
+		 * kernel's memory) stay in place.
+		 */
+		ans_sart: iommu@41dc50000 {
+			compatible = "apple,t6050-sart";
+			reg = <0x4 0x1dc50000 0x0 0xc000>;
+		};
+
+		ans_mbox: mailbox@419608000 {
+			compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x4 0x19608000 0x0 0x4000>;
+			interrupts = <AIC_IRQ 0 1347 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 1348 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 1349 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 1350 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		/*
+		 * The boot loader leaves ANS running with the controller shut
+		 * down. Its power stays with the firmware, and post-M4 ANS is
+		 * never reset through PMGR, so the node names no power domain
+		 * and no reset.
+		 */
+		nvme: nvme@45dcc0000 {
+			compatible = "apple,t6050-nvme-ans2";
+			reg = <0x4 0x5dcc0000 0x0 0x10000>,
+			      <0x4 0x19600000 0x0 0x4000>,
+			      <0x4 0x1dcc0000 0x0 0x60000>;
+			reg-names = "nvme", "ans", "nvmmu";
+			interrupts = <AIC_IRQ 0 2338 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&ans_sart>;
+		};
+
+		/* The DARTs of PCIe ports 2 and 3 */
+		dart_apcie2: iommu@412000000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x4 0x12000000 0x0 0x20000>;
+			interrupts = <AIC_IRQ 0 1540 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		dart_apcie3: iommu@413000000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x4 0x13000000 0x0 0x20000>;
+			interrupts = <AIC_IRQ 0 1548 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+	};
+
+	/* Die 1 MMIO. The boot loader needs each die's bus. */
+	soc@4200000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x42 0x0 0x42 0x0 0x3 0xc0000000>;
+		nonposted-mmio;
+	};
+};
