@@ -32,14 +32,12 @@ impl Registry {
     /// See `recovery::Queues::render_culprit`.
     pub(in crate::g17::runtime) fn render_culprit(&self, blamed: u8) -> Option<u128> {
         let pairs = || self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref());
-        if pairs().find(|pair| pair.qids().contains(&blamed))?.front_untouched() != Some(true) {
-            return None;
-        }
+        let untouched = pairs().find(|pair| pair.qids().contains(&blamed))?.front_untouched() == Some(true);
         let running = pairs().filter_map(|pair| {
             let qids = pair.qids().into_iter().fold(0, |mask, qid| mask | 1u128 << qid);
             Some((qids, pair.running_owner()?))
         });
-        culprit(running, |culprit| {
+        culprit(running, untouched, |culprit| {
             let mut foreign = false;
             for queue in self.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()) {
                 queue.visit_owners(&mut |owner| foreign |= !Arc::ptr_eq(owner, culprit));
@@ -62,11 +60,13 @@ impl Registry {
 }
 
 /// Picks the QIDs to blame from each pair's running owner. A VM an earlier recovery found guilty
-/// comes first: its groups queued before that keep hanging the GPU one per restart, while
-/// bystanders' renders whose tiler started wait behind them, and it has already failed.
-/// Otherwise exactly one VM may be running, and `foreign` must find no other VM's compute work.
+/// comes first, even when the blamed render had started: its groups queued before that keep
+/// hanging the GPU one per restart, while bystanders' renders whose tiler started wait behind
+/// them, and that recovery failed its interrupted work. Otherwise the blamed render must be
+/// `untouched`, exactly one VM may be running, and `foreign` must find no other VM's compute work.
 fn culprit<'a>(
     running: impl Iterator<Item = (u128, &'a Arc<VmStatus>)>,
+    untouched: bool,
     foreign: impl FnOnce(&Arc<VmStatus>) -> bool,
 ) -> Option<u128> {
     let (mut guilty, mut qids, mut several) = (0u128, 0u128, false);
@@ -82,7 +82,7 @@ fn culprit<'a>(
     if guilty != 0 {
         return Some(guilty);
     }
-    let culprit = culprit.filter(|_| !several)?;
+    let culprit = culprit.filter(|_| untouched && !several)?;
     (!foreign(culprit)).then_some(qids)
 }
 
@@ -101,17 +101,21 @@ mod tests {
         // Two VMs running and no earlier guilt: the firmware's blame stands, even when one of
         // them failed only for its own client.
         bystander.record(EIO);
-        assert_eq!(culprit(running(), |_| false), None);
+        assert_eq!(culprit(running(), true, |_| false), None);
         spinner.note_recovery_guilty();
-        assert_eq!(culprit(running(), |_| panic!("compute is not consulted")), Some(0b1100));
+        assert_eq!(culprit(running(), true, |_| panic!("compute is not consulted")), Some(0b1100));
+        // The bystander's blamed render whose tiler started is starved too.
+        assert_eq!(culprit(running(), false, |_| panic!("compute is not consulted")), Some(0b1100));
     }
 
     #[test]
     fn one_running_vm_is_blamed_only_without_foreign_compute() {
         let (a, b) = (vm(), vm());
-        assert_eq!(culprit([(0b11, &a), (0b1100, &a)].into_iter(), |_| false), Some(0b1111));
-        assert_eq!(culprit([(0b11, &a)].into_iter(), |_| true), None);
-        assert_eq!(culprit([(0b11, &a), (0b1100, &b)].into_iter(), |_| false), None);
-        assert_eq!(culprit(core::iter::empty(), |_| false), None);
+        assert_eq!(culprit([(0b11, &a), (0b1100, &a)].into_iter(), true, |_| false), Some(0b1111));
+        // A blamed render that had started may be the hang itself.
+        assert_eq!(culprit([(0b11, &a), (0b1100, &a)].into_iter(), false, |_| false), None);
+        assert_eq!(culprit([(0b11, &a)].into_iter(), true, |_| true), None);
+        assert_eq!(culprit([(0b11, &a), (0b1100, &b)].into_iter(), true, |_| false), None);
+        assert_eq!(culprit(core::iter::empty(), true, |_| false), None);
     }
 }
