@@ -26,6 +26,7 @@
 #include <asm/debug-monitors.h>
 #include <asm/elf.h>
 #include <asm/exception.h>
+#include <asm/apple_amx.h>
 #include <asm/cacheflush.h>
 #include <asm/gcs.h>
 #include <asm/ucontext.h>
@@ -64,6 +65,7 @@ struct rt_sigframe_user_layout {
 	unsigned long fpmr_offset;
 	unsigned long poe_offset;
 	unsigned long afpcr_offset;
+	unsigned long amx_offset;
 	unsigned long extra_offset;
 	unsigned long end_offset;
 };
@@ -274,6 +276,8 @@ struct user_ctxs {
 	u32 poe_size;
 	struct apple_afpcr_context __user *afpcr;
 	u32 afpcr_size;
+	struct apple_amx_context __user *amx;
+	u32 amx_size;
 	struct gcs_context __user *gcs;
 	u32 gcs_size;
 };
@@ -435,6 +439,12 @@ static bool system_supports_apple_afp(void)
 {
 	return IS_ENABLED(CONFIG_ARM64_APPLE_X86_FP) &&
 		alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE);
+}
+
+static bool system_supports_apple_amx(void)
+{
+	return IS_ENABLED(CONFIG_ARM64_APPLE_AMX) &&
+		alternative_has_cap_unlikely(ARM64_HAS_AMX_APPLE);
 }
 
 #ifdef CONFIG_ARM64_SVE
@@ -853,6 +863,7 @@ static int parse_user_sigframe(struct user_ctxs *user,
 	user->zt = NULL;
 	user->fpmr = NULL;
 	user->afpcr = NULL;
+	user->amx = NULL;
 	user->poe = NULL;
 	user->gcs = NULL;
 
@@ -980,6 +991,17 @@ static int parse_user_sigframe(struct user_ctxs *user,
 
 			user->afpcr = (struct apple_afpcr_context __user *)head;
 			user->afpcr_size = size;
+			break;
+
+		case APPLE_AMX_MAGIC:
+			if (!system_supports_apple_amx())
+				goto invalid;
+
+			if (user->amx)
+				goto invalid;
+
+			user->amx = (struct apple_amx_context __user *)head;
+			user->amx_size = size;
 			break;
 
 		case GCS_MAGIC:
@@ -1135,6 +1157,9 @@ static int restore_sigframe(struct pt_regs *regs,
 
 	if (err == 0 && system_supports_apple_afp() && user.afpcr)
 		err = restore_afpcr_context(&user);
+
+	if (err == 0 && system_supports_apple_amx() && user.amx)
+		err = apple_amx_restore(user.amx, user.amx_size);
 
 	return err;
 }
@@ -1341,6 +1366,14 @@ static int setup_sigframe_layout(struct rt_sigframe_user_layout *user,
 			return err;
 	}
 
+	if (system_supports_apple_amx() &&
+	    (add_all || apple_amx_signal_needed())) {
+		err = sigframe_alloc(user, &user->amx_offset,
+				     sizeof(struct apple_amx_context));
+		if (err)
+			return err;
+	}
+
 	return sigframe_alloc_end(user);
 }
 
@@ -1422,6 +1455,13 @@ static int setup_sigframe(struct rt_sigframe_user_layout *user,
 			apply_user_offset(user, user->afpcr_offset);
 
 		err |= preserve_afpcr_context(afpcr_ctx);
+	}
+
+	if (system_supports_apple_amx() && err == 0 && user->amx_offset) {
+		struct apple_amx_context __user *amx_ctx =
+			apply_user_offset(user, user->amx_offset);
+
+		err |= apple_amx_preserve(amx_ctx);
 	}
 
 	/* ZA state if present */

@@ -47,6 +47,7 @@
 #include <linux/memory_ordering_model.h>
 
 #include <asm/alternative.h>
+#include <asm/apple_amx.h>
 #include <asm/apple_cpufeature.h>
 #include <asm/arch_timer.h>
 #include <asm/compat.h>
@@ -348,6 +349,7 @@ void flush_thread(void)
 void arch_release_task_struct(struct task_struct *tsk)
 {
 	fpsimd_release_task(tsk);
+	apple_amx_release(tsk);
 }
 
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
@@ -380,6 +382,11 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 	dst->thread.sme_state = NULL;
 	clear_tsk_thread_flag(dst, TIF_SME);
 	dst->thread.svcr &= ~SVCR_ZA_MASK;
+
+#ifdef CONFIG_ARM64_APPLE_AMX
+	/* Drop the copied reference; copy_thread() makes the child its own */
+	dst->thread.amx = NULL;
+#endif
 
 	/* clear any pending asynchronous tag fault raised by the parent */
 	clear_tsk_thread_flag(dst, TIF_MTE_ASYNC_FAULT);
@@ -459,6 +466,10 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 		    (p->thread.actlr & ACTLR_APPLE_AFP))
 			p->thread.afpcr = read_sysreg_s(SYS_IMP_APL_AFPCR_EL0);
 #endif
+
+		ret = apple_amx_copy_thread(p);
+		if (ret)
+			return ret;
 
 		if (stack_start) {
 			if (is_compat_thread(task_thread_info(p)))
@@ -989,6 +1000,7 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	gcs_thread_switch(next);
 	apple_afp_thread_switch(next);
 	actlr_thread_switch(next);
+	apple_amx_thread_switch(next);
 
 	/*
 	 * Complete any pending TLB or cache maintenance on this CPU in case the
@@ -1155,6 +1167,7 @@ void arch_setup_new_exec(void)
 	if (alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
 		apple_fp_preserve_set(PR_AURORA_FP_PRESERVE_OFF);
 #endif
+	apple_amx_exec();
 
 	if (task_spec_ssb_noexec(current)) {
 		arch_prctl_spec_ctrl_set(current, PR_SPEC_STORE_BYPASS,

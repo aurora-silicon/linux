@@ -500,4 +500,21 @@ struct prctl_mm_map {
 # define PR_AURORA_FP_PRESERVE_OFF	0
 # define PR_AURORA_FP_PRESERVE_ON	1
 
+/*
+ * Aurora experimental ABI: Apple AMX matrix coprocessor.
+ * Threads may use AMX directly: the first AMX instruction of a thread enables
+ * it for that thread, and its register file then follows the thread across
+ * context switches and CPU migration. fork and clone copy it; execve drops it.
+ * GET returns AVAILABLE before the calling thread has used AMX and IN_USE
+ * after; it fails with EINVAL where AMX is absent or disabled (apple_amx=off).
+ * A signal handler starts with AMX clear; the interrupted register file is
+ * in the frame (APPLE_AMX_MAGIC) and sigreturn reloads it. ptrace and core
+ * dumps carry it as the NT_AURORA_APPLE_AMX regset.
+ * HWCAP3_APPLE_AMX in AT_HWCAP3 and "apple_amx" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_AMX		0x4155500b
+# define PR_AURORA_AMX_AVAILABLE	0
+# define PR_AURORA_AMX_IN_USE		1
+
 #endif /* _LINUX_PRCTL_H */

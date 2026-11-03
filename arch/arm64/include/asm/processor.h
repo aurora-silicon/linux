@@ -149,6 +149,8 @@ struct cpu_context {
 	unsigned long pc;
 };
 
+struct apple_amx_state;
+
 struct thread_struct {
 	struct cpu_context	cpu_context;	/* cpu context */
 
@@ -207,6 +209,9 @@ struct thread_struct {
 #endif
 #ifdef CONFIG_ARM64_APPLE_X86_FP
 	u64			afpcr;		/* AFPCR_EL0 while EnAFP is set */
+#endif
+#ifdef CONFIG_ARM64_APPLE_AMX
+	struct apple_amx_state	*amx;		/* NULL until first AMX use */
 #endif
 };
 
@@ -447,6 +452,11 @@ int apple_fp_preserve_get(void);
 int apple_fp_preserve_set(unsigned long val);
 #define AURORA_GET_FP_PRESERVE()	apple_fp_preserve_get()
 #define AURORA_SET_FP_PRESERVE(arg)	apple_fp_preserve_set(arg)
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_AMX
+int apple_amx_get(void);
+#define AURORA_GET_AMX()		apple_amx_get()
 #endif
 
 #define SVE_SET_VL(arg)	sve_set_current_vl(arg)

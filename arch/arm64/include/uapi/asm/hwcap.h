@@ -166,4 +166,6 @@
 
 #define HWCAP3_APPLE_PRSV	(1UL << 61)
 
+#define HWCAP3_APPLE_AMX	(1UL << 60)
+
 #endif /* _UAPI__ASM_HWCAP_H */

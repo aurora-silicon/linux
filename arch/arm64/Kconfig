@@ -2476,6 +2476,17 @@ config ARM64_APPLE_FP_PRESERVE
 	  instructions do. Say Y to let a thread enable this with the
 	  PR_AURORA_SET_FP_PRESERVE prctl().
 
+config ARM64_APPLE_AMX
+	bool "Apple AMX matrix coprocessor"
+	depends on ARCH_APPLE
+	default y
+	help
+	  Apple CPUs have a matrix coprocessor (AMX) that EL0 code drives
+	  with implementation-defined instructions. Say Y to let threads
+	  use it: AMX is enabled for a thread on its first AMX instruction
+	  and its 5 KiB register file is saved and restored across context
+	  switches. Boot with apple_amx=off to keep AMX disabled.
+
 config RELOCATABLE
 	bool "Build a relocatable kernel image" if EXPERT
 	select ARCH_HAS_RELR
