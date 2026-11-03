@@ -214,6 +214,8 @@ struct tb_nhi_ops {
  * PCIe host kept its link up: the tunnels are still active on resume.
  */
 #define QUIRK_KEEP_TUNNELS				BIT(7)
+/* The links of the host router must not enter CL states. */
+#define QUIRK_NO_HOST_CLX				BIT(8)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)
