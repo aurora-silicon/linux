@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (16-inch, M4 Max)
+ *
+ * target-type: J616C
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6041.dtsi"
+#include "t604x-j614-j616.dtsi"
+
+/ {
+	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M4 Max)";
+};
+
+/* ADT /arm-io/wlan module-instance */
+&wifi0 {
+	brcm,board-type = "apple,hostomel";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,hostomel";
+};
+
+&panel {
+	compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
+	width-mm = <345>;
+	height-mm = <223>;
+	adj-height-mm = <216>;
+};
+
+&aop_audio {
+	apple,chassis-name = "J616";
+};
+
+&sound {
+	compatible = "apple,j616-macaudio", "apple,macaudio";
+	model = "MacBook Pro J616";
+};
+
+&sound_jack {
+	compatible = "apple,j616-macaudio-jack", "apple,macaudio";
+	model = "MacBook Pro J616 Jack";
+};
+
+&mtp_mt {
+	firmware-name = "apple/tpmtfw-j616c.bin";
+};
+
+/*
+ * Per-device factory data from this Mac's own iBoot system container: the
+ * sealed calibration and the sealed root key.
+ */
+&mesa {
+	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
+};
+
+/*
+ * The other NUB SPMI buses hold a Chapel at 0xb and a Spitfire at 0x9
+ * (nub-spmi1), and Portiers at 0xa and 0xb (nub-spmi2), not the J616s's
+ * Abbeys at 0xe.
+ */
+&nub_spmi1 {
+	/delete-node/ pmic@e;
+
+	pmic@b {
+		compatible = "apple,chapel-pmic", "apple,spmi-nvmem";
+		reg = <0xb SPMI_USID>;
+	};
+};
+
+/* Nothing on nub-spmi2 has a binding yet. */
+/delete-node/ &nub_spmi2;
+
+/*
+ * iBoot moves the ISP firmware from boot to boot on this machine, so the
+ * J616s placement does not hold. Keep the camera off until the boot loader
+ * fills it in.
+ */
+&isp {
+	status = "disabled";
+};
+
+/* The GPU (ADT gpu,t6041) is not described yet. */
+&gpu {
+	status = "disabled";
+};
+
+&gfx_mbox {
+	status = "disabled";
+};
+
+/*
+ * The per-unit USB3 PHY values of this machine's ADT (auspll, cio4pll,
+ * aus40cmn-shm); every other tunable is the J616s's.
+ */
+
+&atcphy0 {
+	apple,tunable-auspll =
+		<0x3224 0x00000c00 0x00000800>,
+		<0x3230 0x0000001f 0x0000000f>,
+		<0x3240 0x07d8007f 0x04000049>,
+		<0x32b0 0x0b800000 0x01800000>,
+		<0x32e8 0x00060001 0x00040001>,
+		<0x3338 0x0f800000 0x07800000>;
+
+	apple,tunable-cio4pll =
+		<0x3a30 0x0000001f 0x0000000f>,
+		<0x3a4c 0x0000fe7f 0x00005421>,
+		<0x3ab0 0x00700000 0x00300000>,
+		<0x3ae8 0x00060000 0x00020000>;
+};
+
+&atcphy1 {
+	apple,tunable-cio4pll =
+		<0x3a30 0x0000001f 0x0000000f>,
+		<0x3a4c 0x0000fe7f 0x00005421>,
+		<0x3ab0 0x00700000 0x00300000>,
+		<0x3ae8 0x00060000 0x00020000>;
+};
+
+&atcphy2 {
+	apple,tunable-aus40cmn-shm =
+		<0xa04 0x0000007c 0x00000050>;
+
+	apple,tunable-cio4pll =
+		<0x3a30 0x0000001f 0x0000000f>,
+		<0x3a4c 0x0000fe7f 0x00005420>,
+		<0x3ab0 0x00700000 0x00300000>,
+		<0x3ae8 0x00060000 0x00020000>;
+};
