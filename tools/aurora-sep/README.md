@@ -102,6 +102,26 @@ and starts a match again by itself. When the kernel ends an enrolment because
 too many captures in a row were unusable (`SEP_BIO_STATUS_REJECTED`), the
 enrolment fails with that reason in fprintd's log, and fprintd reports
 `enroll-unknown-error`. Kernels from before these statuses never send them.
+
+Interface version 5 requires a resolved Unix uid, a known finger, the selected
+Linux SEP OS identity, a live identity count below three, a bound identity bag,
+and readable, writable owner/user/master Catacomb files before ENROL_START can
+schedule enclave capture. On an empty Linux lane, the driver prepares the owner
+context after libfprint validates the account; the user/master Catacombs are
+saved at the first completed enrolment. The matching aurora libfprint build
+rejects a missing passwd entry before either ioctl. A missing persistence file
+for an existing identity is an admission error; repair the binding rather than
+retrying a capture against unbound state.
+
+`sep-bio-identities` is the recovery interface for a print with no fprintd
+record. As root, run `sep-bio-identities` to list only the selected Linux OS
+identity's built-in SEP user context. Use `sep-bio-identities --delete-orphan
+UUID --keep GOOD_UUID` when another identity must remain. The kernel index may
+still hold a UUID whose fprintd record was lost, so compare the IDs carefully.
+The utility does not expose DELETE_ALL. Record the list and
+backup of any known-good print before deletion, and confirm the deleted UUID
+stays absent after a reboot. This path must be tested on the affected hardware
+before treating a deletion as a successful recovery.
 The device-specific `apple/mesa_calibration.bin` on m2 was recovered using
 the bundled [`extract-mesa-calibration.py`](extract-mesa-calibration.py), copied
 from [Gist revision `eb079a8007985d04e75182f20994f1a1c496f12e`](https://gist.github.com/DjDeveloperr/867a1961b861c570442724f48f770158/eb079a8007985d04e75182f20994f1a1c496f12e),
@@ -161,6 +181,17 @@ make -f /usr/share/selinux/devel/Makefile aurora_sep.pp
 semodule -i aurora_sep.pp
 restorecon /dev/sep-bio
 ```
+
+The module also lets fprintd read input event devices. libfprint follows the
+lid through their SW_LID switch to hide the reader while the lid is closed;
+without it fprintd logs "Permission denied" for `/dev/input/event*` and keeps
+offering Touch ID in clamshell. The device type, `aurora_sep_device_t`, is the
+one the distribution packages use for the same module, so moving between
+them keeps `/dev/sep-bio` labelled.
+
+`semodule -i` installs at priority 400, above the packages' 200, so a module
+loaded by hand keeps winning after a package is installed. Remove it then with
+`semodule -X 400 -r aurora_sep`.
 
 On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
@@ -304,17 +335,18 @@ and serves the copy to the login screen's shell alone through a GResource
 overlay. When the check is not exactly as expected, for example after a
 GNOME update, it changes nothing. The enable key above still applies.
 
-The login screen asks fprintd for the reader once, as it comes up, so the
-same unit also holds it back until `aurora-sep-ready.service` has finished:
-a few seconds on a healthy boot, but as long as the enclave takes when it is
-slow, up to 90 s after boot. Without fingerprint at the login screen that
-wait buys nothing, which is why both are one switch, off by default. It
-needs `gresource` from glib2-devel. With the packages, or after installing
-it by hand, turn it on with `systemctl enable`:
+The login screen asks fprintd for the reader once, as it comes up, and the
+enclave can take most of a minute after boot. The login screen does not wait
+for it: `aurora-sep-greeter-refresh.service` runs once both are up, and when
+Touch ID came up later and nobody has logged in, it shows the login screen
+again so it offers fingerprint. With automatic login, or once someone has
+logged in, it changes nothing. Both are one switch, off by default. It needs
+`gresource` from glib2-devel. With the packages, or after installing it by
+hand, turn it on with `systemctl enable`:
 
 ```sh
 install -Dm755 aurora-sep-greeter-fingerprint /usr/local/sbin/aurora-sep-greeter-fingerprint
-install -Dm644 aurora-sep-greeter-fingerprint.service /etc/systemd/system/
+install -Dm644 aurora-sep-greeter-fingerprint.service aurora-sep-greeter-refresh.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable aurora-sep-greeter-fingerprint.service
 ```

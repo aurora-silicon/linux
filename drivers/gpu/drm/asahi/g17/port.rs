@@ -113,14 +113,10 @@ pub(super) struct Port {
     generation: AtomicU64,
     /// Device publication order shared by compute and render commands.
     publications: AtomicU64,
-    /// Compute work slots written per priority class.
-    compute_written: [AtomicU64; PRIORITIES],
-    /// `compute_written` as read before the latest compute doorbell of each class: every slot
-    /// counted there was in its ring when the firmware handled that doorbell.
-    compute_announced: [AtomicU64; PRIORITIES],
     /// Full firmware effort is applied; cleared before an idle clear rechecks `submissions`.
     effort_full: AtomicBool,
     demand: super::power::Demand,
+    statistics_epoch: AtomicU64,
     last_submission_ns: AtomicU64,
     submissions: AtomicU64,
 }
@@ -176,10 +172,9 @@ impl Port {
                 render <- new_mutex!((), "g17::Port::render"),
                 generation: AtomicU64::new(0),
                 publications: AtomicU64::new(0),
-                compute_written: [const { AtomicU64::new(0) }; PRIORITIES],
-                compute_announced: [const { AtomicU64::new(0) }; PRIORITIES],
                 effort_full: AtomicBool::new(false),
                 demand,
+                statistics_epoch: AtomicU64::new(0),
                 last_submission_ns: AtomicU64::new(0),
                 submissions: AtomicU64::new(0),
             }),
@@ -253,7 +248,11 @@ impl Port {
 
     /// Exposes `record` in its reserved slot. Inner queue records must be visible first. Returns
     /// the new producer, the retained consumer witness for this slot.
-    pub(super) fn publish_compute(&self, mut claim: OuterClaim<'_>, record: &WorkSlot) -> Result<u32> {
+    pub(super) fn publish_compute(
+        &self,
+        mut claim: OuterClaim<'_>,
+        record: &WorkSlot,
+    ) -> Result<u32> {
         if record.data_master != DataMaster::Compute as u32 || !core::ptr::eq(claim.port, self) {
             return Err(EINVAL);
         }
@@ -270,7 +269,8 @@ impl Port {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 core::ptr::from_ref(record).cast::<u8>(),
-                ring.slots.add(producer as usize * core::mem::size_of::<WorkSlot>()),
+                ring.slots
+                    .add(producer as usize * core::mem::size_of::<WorkSlot>()),
                 core::mem::size_of::<WorkSlot>(),
             );
         }
@@ -279,33 +279,8 @@ impl Port {
         unsafe { (*ring.producer).store(next, Ordering::Relaxed) };
         fence(Ordering::SeqCst);
         reserved[claim.priority] = reserved[claim.priority].saturating_sub(1);
-        self.compute_written[claim.priority].fetch_add(1, Ordering::AcqRel);
         claim.armed = false;
         Ok(next)
-    }
-
-    /// Compute work slots written at `priority` so far.
-    pub(super) fn compute_written(&self, priority: u8) -> u64 {
-        self.compute_written
-            .get(usize::from(priority))
-            .map_or(u64::MAX, |written| written.load(Ordering::Acquire))
-    }
-
-    /// Compute work slots at `priority` that a doorbell has announced.
-    pub(super) fn compute_announced(&self, priority: u8) -> u64 {
-        self.compute_announced
-            .get(usize::from(priority))
-            .map_or(0, |announced| announced.load(Ordering::Acquire))
-    }
-
-    /// Rings the compute doorbell `message` of `priority`, after noting which slots it
-    /// announces.
-    pub(super) fn notify_compute(&self, priority: u8, message: u64) -> Result {
-        let index = usize::from(priority);
-        let written = self.compute_written.get(index).ok_or(EINVAL)?.load(Ordering::Acquire);
-        self.notify(message)?;
-        self.compute_announced[index].fetch_max(written, Ordering::AcqRel);
-        Ok(())
     }
 
     /// Taken around every render publication; see `render`.
@@ -333,13 +308,16 @@ impl Port {
         let (fragment, tiling) = self.render_rings(priority)?;
         let cursors = [fragment.cursors()?, tiling.cursors()?];
         let room = |[first, second, producer]: [u32; 3]| {
-            let room = |consumer: u32| (consumer + WORK_RING_SLOTS - producer - 1) % WORK_RING_SLOTS;
+            let room =
+                |consumer: u32| (consumer + WORK_RING_SLOTS - producer - 1) % WORK_RING_SLOTS;
             room(first).min(room(second))
         };
-        Ok((room(cursors[0]) > 0 && room(cursors[1]) > 0).then_some(RenderRoom {
-            priority,
-            producers: [cursors[0][2], cursors[1][2]],
-        }))
+        Ok(
+            (room(cursors[0]) > 0 && room(cursors[1]) > 0).then_some(RenderRoom {
+                priority,
+                producers: [cursors[0][2], cursors[1][2]],
+            }),
+        )
     }
 
     /// Copies a render pair's fragment, then tiling record into the slots after the producers
@@ -365,7 +343,10 @@ impl Port {
                 return Err(EINVAL);
             }
             // SAFETY: The ring view spans WORK_RING_SLOTS records; `producer` is in range.
-            let slot = unsafe { ring.slots.add(producer as usize * core::mem::size_of::<WorkSlot>()) };
+            let slot = unsafe {
+                ring.slots
+                    .add(producer as usize * core::mem::size_of::<WorkSlot>())
+            };
             Ok((slot, (producer + 1) % WORK_RING_SLOTS))
         };
         let (fragment_slot, fragment_next) = slot(&fragment_ring, room.producers[0])?;
@@ -438,7 +419,10 @@ impl Port {
         policy: Policy,
     ) -> Result<qos::Publication> {
         let view = self.qos_view()?;
-        let publication = self.qos.lock().publish(&view, owner, scheduler, policy, qos::clock)?;
+        let publication = self
+            .qos
+            .lock()
+            .publish(&view, owner, scheduler, policy, qos::clock)?;
         self.rx_update();
         Ok(publication)
     }
@@ -452,7 +436,9 @@ impl Port {
     ) -> Result<[qos::Publication; 2]> {
         let view = self.qos_view()?;
         let publications =
-            self.qos.lock().publish_owners(&view, owners, scheduler, policy, qos::clock)?;
+            self.qos
+                .lock()
+                .publish_owners(&view, owners, scheduler, policy, qos::clock)?;
         self.rx_update();
         Ok(publications)
     }
@@ -537,14 +523,33 @@ impl Port {
         self.demand.set_active(full);
     }
 
+    pub(super) fn statistics_epoch(&self) -> u64 {
+        self.statistics_epoch.load(Ordering::Acquire)
+    }
+
     pub(super) fn note_gpu_activity(&self) {
-        self.last_submission_ns.store(super::now_ns(), Ordering::Relaxed);
+        // Observe gating before activity can wake the cores. A lockless
+        // publisher cannot clear the decoder under the device mutex; this
+        // epoch makes both the next drain and the next reader discard it.
+        if self
+            .regs
+            .as_ref()
+            .is_some_and(|regs| regs.g17_core_power() & 0xf == 0)
+        {
+            self.statistics_epoch.fetch_add(1, Ordering::Release);
+        }
+        self.last_submission_ns
+            .store(super::now_ns(), Ordering::Relaxed);
         self.demand.set_active(true);
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        writeln!(f, "effort_full={} direct_submissions={} last_submission_ns={}",
-            self.effort_full.load(Ordering::SeqCst), self.submissions(),
-            self.last_submission_ns.load(Ordering::Relaxed))
+        writeln!(
+            f,
+            "effort_full={} direct_submissions={} last_submission_ns={}",
+            self.effort_full.load(Ordering::SeqCst),
+            self.submissions(),
+            self.last_submission_ns.load(Ordering::Relaxed)
+        )
     }
 }

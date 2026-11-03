@@ -47,6 +47,12 @@ impl DriverMappings {
     }
 }
 
+struct ClosedObject {
+    gem: ARef<gem::Object>,
+    /// Highest binding sequence covered by the close or merged closes.
+    bind_sequence: u64,
+}
+
 struct State {
     active: usize,
     commits: usize,
@@ -57,7 +63,7 @@ struct State {
     cleanup_failed: bool,
     close_ranges: Option<(Range<u64>, Range<u64>)>,
     unmaps: KVec<super::bind::PreparedUserUnmap>,
-    objects: KVec<ARef<gem::Object>>,
+    objects: KVec<ClosedObject>,
 }
 
 #[pin_data]
@@ -578,18 +584,22 @@ impl Vm {
             return self.drop_mappings_now(gem);
         };
         let mut state = lifetime.state.lock();
-        if !state
-            .objects
-            .iter()
-            .any(|object| core::ptr::eq(&**object, gem))
-        {
-            state.objects.push(gem.into(), GFP_KERNEL)?;
+        let bind_sequence = self.current_bind_sequence();
+        if let Some(object) = state.objects.iter_mut().find(|object| {
+            core::ptr::eq(&*object.gem, gem)
+        }) {
+            object.bind_sequence = object.bind_sequence.max(bind_sequence);
+        } else {
+            state.objects.push(ClosedObject {
+                gem: gem.into(),
+                bind_sequence,
+            }, GFP_KERNEL)?;
         }
         if state.active != 0 || state.draining {
             // Stop new jobs from selecting this accepted cleanup candidate.
             // The queued object retains its GEM while the candidate is removed.
-            // Actual unmap repeats this under exec to order any intervening bind.
-            self.untrack_context_object(gem);
+            // Preserve a context view installed by a later bind.
+            self.untrack_context_object_before(gem, bind_sequence);
             return Ok(());
         }
         state.draining = true;
@@ -674,7 +684,7 @@ impl Vm {
                 }
             }
             for object in objects {
-                if let Err(error) = self.drop_mappings_now(&object) {
+                if let Err(error) = self.drop_mappings_before(&object.gem, object.bind_sequence) {
                     failure.get_or_insert(error);
                     pr_err!("MMU: deferred object unmap failed\n");
                 }

@@ -4,13 +4,13 @@
 $id: http://devicetree.org/schemas/mailbox/apple,ascwrap-v6.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple ASCWrap v6 GPU mailbox
+title: Apple ASCWrap v6 mailbox
 
 maintainers:
   - Ryan Murray <ryan@aurorasilicon.org>
 
 description:
-  Mailbox interface of the GPU coprocessors of the T8140 and T6040. The
+  Mailbox interface of the GPU coprocessors of the T8140, T6040 and T6050. The
   wrapper resource contains the coprocessor control registers and mailbox
   FIFOs. A separate resource provides the coprocessor vector-base register.
   The firmware role identifies which GPU firmware instance uses the mailbox;
@@ -21,6 +21,9 @@ properties:
     enum:
       - apple,t6040-ascwrap-v6
       - apple,t8140-ascwrap-v6
+      - apple,t6050-apif-ascwrap-v6
+      - apple,t6050-ascwrap-v6
+      - apple,t6050-x1n1-ascwrap-v6
 
   reg:
     items:

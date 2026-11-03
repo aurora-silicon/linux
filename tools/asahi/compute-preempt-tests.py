@@ -29,7 +29,9 @@ def main():
         return (root / path).read_text()
     def policy(text):
         start = text.index('        let mut prio = *raw::PRIORITY.get(priority as usize).ok_or(EINVAL)?;')
-        end = text.index('        let inner = WorkQueueInner::ver {', start)
+        # The policy ends with the compute priority override; queue allocation follows.
+        tail = '            prio.5 = 1;\n        }\n'
+        end = text.index(tail, start) + len(tail)
         return text[start:end]
     queue = read('drivers/gpu/drm/asahi/workqueue.rs', args.ref)
     macro = read('rust/macros/versions.rs', args.ref)

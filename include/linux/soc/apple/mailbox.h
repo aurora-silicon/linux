@@ -87,8 +87,8 @@ struct apple_mbox {
 
 	/*
 	 * Protected by tx_lock: set while irq_send_empty is unmasked, so that
-	 * the IRQ handler, a failed send and provider removal mask it exactly
-	 * once between them.
+	 * the IRQ handler and provider removal mask it exactly once between
+	 * them.
 	 */
 	bool tx_irq_unmasked;
 };
@@ -120,5 +120,7 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox);
+int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
+				     u32 *control, u32 *status);
 
 #endif

@@ -28,6 +28,24 @@ pub(crate) fn is_kind(kind: u8) -> bool {
     path_for(kind).is_some()
 }
 
+pub(crate) fn writable(kind: u8) -> bool {
+    path_for(kind)
+        .and_then(|path| shim::StoreFile::open_writable_existing(path).ok())
+        .is_some()
+}
+
+/// Reserve a missing Linux owner file before SELECT_CONTEXT changes SEP state.
+/// A corrupt existing file is never truncated here: it is failure evidence.
+pub(crate) fn prepare_missing_owner() -> Result<()> {
+    let path = path_for(crate::PRIVATE_TYPE_CATACOMB_OWNER).ok_or(EINVAL)?;
+    let (file, created) = shim::StoreFile::open_host(path)?;
+    if !created {
+        return Err(ENODATA);
+    }
+    file.sync()?;
+    file.sync_parent()
+}
+
 pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
     let path = path_for(kind).ok_or(EINVAL)?;
     if blob.len() > MAX_CATACOMB {

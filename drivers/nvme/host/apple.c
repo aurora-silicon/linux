@@ -14,6 +14,7 @@
 #include <linux/blk-crypto-profile.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmapool.h>
@@ -24,6 +25,7 @@
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/kref.h>
+#include <linux/ktime.h>
 #include <linux/mempool.h>
 #include <linux/mm.h>
 #include <linux/overflow.h>
@@ -227,6 +229,7 @@ struct apple_nvme {
 	bool abort_reset;
 	bool recover_to_live;
 	bool suspended;
+	bool final_shutdown;
 	unsigned long recovery_flags;
 
 	void __iomem *mmio_coproc;
@@ -990,22 +993,54 @@ static bool apple_nvme_handle_cq(struct apple_nvme_queue *q, bool force)
 	return found;
 }
 
+static bool apple_nvme_handle_queues(struct apple_nvme *anv)
+{
+	bool found = apple_nvme_handle_cq(&anv->ioq, false);
+
+	found |= apple_nvme_handle_cq(&anv->adminq, false);
+	return found;
+}
+
+/*
+ * ANS raises one completion interrupt per posted entry, and the interrupt can
+ * reach the CPU before the entry is visible in the completion queue. On T6040
+ * the entry showed up 2-16 us after an interrupt that found both queues
+ * empty. No second interrupt follows, so returning at that point leaves the
+ * command waiting for the I/O timeout. Give a late entry time to land.
+ */
+#define APPLE_NVME_LATE_CQE_US	100
+
+static bool apple_nvme_wait_late_cqe(struct apple_nvme *anv)
+{
+	ktime_t end;
+
+	if (!apple_nvme_queue_enabled(&anv->ioq) &&
+	    !apple_nvme_queue_enabled(&anv->adminq))
+		return false;
+
+	end = ktime_add_us(ktime_get(), APPLE_NVME_LATE_CQE_US);
+	do {
+		udelay(1);
+		if (apple_nvme_handle_queues(anv))
+			return true;
+	} while (ktime_before(ktime_get(), end));
+
+	return false;
+}
+
 static irqreturn_t apple_nvme_irq(int irq, void *data)
 {
 	struct apple_nvme *anv = data;
-	bool handled = false;
 	unsigned long flags;
+	bool handled;
 
 	spin_lock_irqsave(&anv->lock, flags);
-	if (apple_nvme_handle_cq(&anv->ioq, false))
-		handled = true;
-	if (apple_nvme_handle_cq(&anv->adminq, false))
-		handled = true;
+	handled = apple_nvme_handle_queues(anv);
+	if (!handled)
+		handled = apple_nvme_wait_late_cqe(anv);
 	spin_unlock_irqrestore(&anv->lock, flags);
 
-	if (handled)
-		return IRQ_HANDLED;
-	return IRQ_NONE;
+	return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static int apple_nvme_create_cq(struct apple_nvme *anv)
@@ -1314,7 +1349,18 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 	 * CFS and firmware crashes are not DMA fences. Post-M4 does not use
 	 * Delete SQ/CQ, SHN or RTKit sleep; only a completed CC.EN clear makes
 	 * the queue and request mappings eligible for release.
+	 *
+	 * The final system shutdown is the exception for SHN: without it the
+	 * controller counts every Linux shutdown as unsafe (SMART
+	 * unsafe_shutdowns) and recovers on the next start, which slows the
+	 * loader and the first seconds of I/O. A failed SHN changes nothing:
+	 * the CC.EN clear below still runs.
 	 */
+	if (READ_ONCE(anv->final_shutdown) && !apple_rtkit_is_crashed(anv->rtk)) {
+		ret = nvme_disable_ctrl(&anv->ctrl, true);
+		if (ret)
+			dev_warn(anv->dev, "shutdown notification failed: %d\n", ret);
+	}
 	ret = nvme_disable_ctrl(&anv->ctrl, false);
 	if (ret) {
 		apple_nvme_quarantine(anv, ret);
@@ -2544,6 +2590,7 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	struct apple_nvme *anv = platform_get_drvdata(pdev);
 
 	WRITE_ONCE(anv->removing, true);
+	WRITE_ONCE(anv->final_shutdown, true);
 	apple_nvme_set_reset_ready(anv, false);
 	flush_delayed_work(&anv->flush_dwork);
 	if (apple_nvme_disable(anv, true))

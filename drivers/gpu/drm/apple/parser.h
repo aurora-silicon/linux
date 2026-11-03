@@ -131,6 +131,8 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr_444;
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
+	/* The timing's PQ BT.2020 element, usable without DSC (score -1 if none) */
+	struct dcp_color_mode pq;
 	bool vrr;
 	/* ProMotion fixed timings still need presentation deadlines. */
 	bool needs_timestamps;
@@ -138,6 +140,12 @@ struct dcp_display_mode {
 	bool preferred;
 	bool metadata_timing_valid;
 	bool automatic_rgb8_quirk;
+	/* IsPreferred on every path; an external display's native resolution */
+	bool firmware_preferred;
+	/* An SDR color element that is neither unsafe nor DSC only */
+	bool sdr_usable;
+	/* The firmware score of the timing */
+	s64 score;
 	/* The sync polarity flags of the timing, if it reports them */
 	u32 metadata_sync_flags;
 	/*
@@ -173,6 +181,8 @@ struct dimension {
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
 bool dcp_property_complete(const void *blob, size_t received, size_t advertised);
 #if IS_ENABLED(CONFIG_KUNIT)
+bool dcp_mode_default_above(const struct dcp_display_mode *mode, s64 score,
+			    const struct dcp_display_mode *best, s64 best_score);
 bool dcp_mode_ranks_above(bool preferred, s64 score, bool best_preferred,
 			  s64 best_score);
 #endif

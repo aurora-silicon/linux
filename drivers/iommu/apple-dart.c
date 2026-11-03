@@ -40,6 +40,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/tunable.h>
+#include <linux/string.h>
 #include <linux/swab.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
@@ -313,6 +314,8 @@ struct apple_dart {
 	/* Resources reachable by a retained domain outlive device removal. */
 	bool retained;
 	bool retained_mtp;
+	/* Cold ANE owns SID0 only; all other streams remain inherited. */
+	bool cold_ane;
 	u16 managed_sids;
 	bool managed_failed;
 	/* Serialize owned TCR publication against IRQ quarantine. */
@@ -342,6 +345,15 @@ struct apple_dart {
 	 * rather than the DART's.
 	 */
 	u64 locked_window[DART_MAX_STREAMS];
+	/*
+	 * First error of a TLB invalidate that failed while retiring a locked
+	 * root, per stream. The hardware may still cache translations through
+	 * the retired page tables, so apple_dart_domain_free() keeps the page
+	 * tables of every domain on such a stream. It is never cleared: only
+	 * the hardware could show that the TLB no longer holds those entries.
+	 * The first error of each stream is logged.
+	 */
+	int locked_retire_err[DART_MAX_STREAMS];
 };
 
 #ifndef MODULE
@@ -1110,17 +1122,25 @@ apple_dart_hw_map_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 	return 0;
 }
 
+/*
+ * Retire the locked roots @idx of @stream_map's streams. Returns the first
+ * error of the TLB invalidate that retiring needs, which is also remembered
+ * per stream for apple_dart_domain_free(): a consumer release or an attach
+ * rollback can retire the root before the domain is freed.
+ */
 static int
 apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx)
 {
 	struct apple_dart *dart = stream_map->dart;
-	int sid;
+	int sid, ret = 0;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u64 *live = dart->locked_ttbr[sid][idx];
 		u64 *owned = dart->locked_owned[sid][idx];
 		struct apple_dart_fw_root *fw;
 		unsigned long flags;
+		bool first = false;
+		int err = 0;
 
 		if (!live)
 			continue;
@@ -1130,19 +1150,46 @@ apple_dart_hw_unmap_locked_ttbr(struct apple_dart_stream_map *stream_map, u8 idx
 			struct apple_dart_stream_map stream = { .dart = dart };
 
 			__set_bit(sid, stream.sidmap);
-			(void)apple_dart_fw_invalidate(&stream, 0, U64_MAX);
+			err = apple_dart_fw_invalidate(&stream, 0, U64_MAX);
+			ret = ret ?: err;
 		}
 		spin_lock_irqsave(&dart->lock, flags);
+		if (err && !dart->locked_retire_err[sid]) {
+			dart->locked_retire_err[sid] = err;
+			first = true;
+		}
 		fw = dart->locked_fw[sid][idx];
 		dart->locked_fw[sid][idx] = NULL;
 		dart->locked_ttbr[sid][idx] = NULL;
 		spin_unlock_irqrestore(&dart->lock, flags);
+		/* Once per stream: the error is never cleared. */
+		if (first)
+			dev_warn(dart->dev,
+				 "stream %d: TLB invalidate failed retiring its root (%d); keeping the page tables of its domains until reboot\n",
+				 sid, err);
 		apple_dart_free_fw_root(dart, fw);
 		devm_memunmap(dart->dev, live);
 		devm_kfree(dart->dev, owned);
 		dart->locked_owned[sid][idx] = NULL;
 	}
-	return 0;
+	return ret;
+}
+
+/* The remembered retire-time invalidate error of @stream_map's streams, or 0. */
+static int apple_dart_retire_error(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	unsigned long flags;
+	int sid, ret = 0;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		ret = dart->locked_retire_err[sid];
+		if (ret)
+			break;
+	}
+	spin_unlock_irqrestore(&dart->lock, flags);
+	return ret;
 }
 
 static int
@@ -1883,7 +1930,7 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	struct apple_dart_stream_map stream_map;
 	int i;
 
-	if (dart->managed_sids)
+	if (dart->managed_sids || dart->cold_ane)
 		return -EBUSY;
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
@@ -2097,7 +2144,7 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 					continue;
 				/*
 				 * All pages of an inherited slot remain firmware's;
-				 * only a page its snapshotted leaf already maps the
+				 * only a page its firmware leaf already maps the
 				 * same way may be repeated.
 				 */
 				fw = dart->locked_fw[sid][idx];
@@ -2240,7 +2287,13 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	struct io_pgtable_cfg *pgtbl_cfg =
 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
 
-	if (dart->managed_sids) {
+	if (dart->cold_ane) {
+		if (bitmap_weight(stream_map->sidmap, dart->num_streams) != 1 ||
+		    !test_bit(0, stream_map->sidmap))
+			return -EPERM;
+		apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->enable_streams) | BIT(0),
+				  dart->hw->enable_streams);
+	} else if (dart->managed_sids) {
 		/* Admission owns only ordinary SIDs 1/2, both in the first word. */
 		apple_dart_writel(dart, stream_map->sidmap[0] & dart->managed_sids,
 				  dart->hw->enable_streams);
@@ -2540,9 +2593,11 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 			spin_unlock_irqrestore(&dart->managed_lock, flags);
 			if (ret)
 				goto err;
-		} else if (!stream_map->dart->locked)
-			apple_dart_setup_translation(dart_domain, stream_map);
-		else {
+		} else if (!stream_map->dart->locked) {
+			ret = apple_dart_setup_translation(dart_domain, stream_map);
+			if (ret)
+				goto err;
+		} else {
 			ret = apple_dart_setup_translation_locked(dart_domain, stream_map);
 			if (ret)
 				goto err;
@@ -2715,7 +2770,7 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 	struct apple_dart_atomic_stream_map *map;
 	struct apple_dart_stream_map stream;
-	int i, j, idx;
+	int i, j, idx, ret;
 
 	if (dart_domain->dcp) {
 		/* Registration rollback: no consumer could publish host DMA yet. */
@@ -2743,14 +2798,22 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 				"retaining page tables after power failure: %d\n", j);
 			return;
 		}
-		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++)
-			apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+		ret = 0;
+		for (idx = 0; idx < stream.dart->hw->ttbr_count; idx++) {
+			j = apple_dart_hw_unmap_locked_ttbr(&stream, idx);
+			ret = ret ?: j;
+		}
 		j = stream.dart->hw->invalidate_tlb(&stream);
+		ret = ret ?: j;
 		pm_runtime_put(stream.dart->dev);
-		/* Do not free page tables that hardware may still cache. */
-		if (j) {
+		/*
+		 * Do not free page tables that hardware may still cache, also
+		 * when a consumer release or an attach rollback retired the root.
+		 */
+		ret = ret ?: apple_dart_retire_error(&stream);
+		if (ret) {
 			dev_err_ratelimited(stream.dart->dev,
-				"retaining page tables after TLB invalidation failure: %d\n", j);
+				"retaining page tables after TLB invalidation failure: %d\n", ret);
 			return;
 		}
 	}
@@ -2827,6 +2890,8 @@ static int apple_dart_of_xlate(struct device *dev,
 		return i;
 
 	sid = args->args[0];
+	if (dart->cold_ane && sid != 0)
+		return -EPERM;
 	if (dart->managed_sids &&
 	    (sid <= 0 || sid >= 16 || !(dart->managed_sids & BIT(sid))))
 		return -EINVAL;
@@ -2866,7 +2931,7 @@ static int apple_dart_of_xlate(struct device *dev,
 			return -EINVAL;
 	}
 
-	cfg->supports_bypass &= dart->supports_bypass && !dart->managed_sids;
+	cfg->supports_bypass &= dart->supports_bypass && !dart->managed_sids && !dart->cold_ane;
 	cfg->locked |= dart->locked;
 
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
@@ -3227,6 +3292,52 @@ static bool apple_dart_capable(struct device *dev, enum iommu_cap cap)
 	}
 }
 
+/*
+ * Media and ML engines (video decode and encode, neural engine, camera ISP)
+ * are run by their own coprocessor firmware, which can still have DMA in
+ * flight after the host driver has given up on a job: a timeout, a reset,
+ * a stream torn down mid-frame. With deferred flushing the DART keeps
+ * translating a freed buffer's addresses until the flush queue drains, so
+ * such a late write lands silently in pages that already went back to the
+ * allocator. Strict flushing makes it fault at the DART instead. These
+ * engines map their buffers once per stream or model, so the per-unmap
+ * invalidate is not on any hot path.
+ *
+ * The client is identified by its device tree compatible, "apple,<soc>-avd"
+ * and so on, so every SoC generation is covered without a per-SoC table.
+ */
+static const char * const apple_dart_strict_engines[] = {
+	"avd", "ave", "ane", "isp",
+};
+
+static bool apple_dart_compat_is_strict_engine(const char *compat)
+{
+	const char *engine;
+	unsigned int i;
+
+	if (!str_has_prefix(compat, "apple,"))
+		return false;
+	engine = strrchr(compat, '-');
+	engine = engine ? engine + 1 : compat + strlen("apple,");
+	for (i = 0; i < ARRAY_SIZE(apple_dart_strict_engines); i++)
+		if (!strcmp(engine, apple_dart_strict_engines[i]))
+			return true;
+	return false;
+}
+
+static bool apple_dart_master_needs_strict(struct device *dev)
+{
+	struct property *prop;
+	const char *compat;
+
+	if (!dev->of_node)
+		return false;
+	of_property_for_each_string(dev->of_node, "compatible", prop, compat)
+		if (apple_dart_compat_is_strict_engine(compat))
+			return true;
+	return false;
+}
+
 static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
@@ -3245,6 +3356,8 @@ static int apple_dart_def_domain_type(struct device *dev)
 	if (!cfg->supports_bypass)
 		return IOMMU_DOMAIN_DMA;
 	if (cfg->locked)
+		return IOMMU_DOMAIN_DMA;
+	if (apple_dart_master_needs_strict(dev))
 		return IOMMU_DOMAIN_DMA;
 
 	return 0;
@@ -3895,6 +4008,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart");
+	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
+		return -EOPNOTSUPP;
 	dart->per_stream = of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 			   of_device_is_compatible(dev->of_node, "apple,t8142-dart");
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
@@ -3935,7 +4051,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (tunneled)
 		dart->regs = apple_dart_platform_ioremap_np_resource(pdev, 0,
 							      &res);
-	else if (dart->managed_sids || dart->preserve_display)
+	else if (dart->managed_sids || dart->preserve_display || dart->cold_ane)
 		dart->regs = apple_dart_retained_ioremap(dart, res);
 	else
 		dart->regs = devm_platform_get_and_ioremap_resource(pdev, 0,
@@ -4182,7 +4298,21 @@ params_done:
 		if (ret)
 			goto err_clk_disable;
 	}
-	if (dart->managed_sids) {
+	if (dart->cold_ane) {
+		/* No reset, TCR/TTBR clear, global enable, remap or IRQ ACK.
+		 * Cold acquisition is checked by the staged ANE backend before
+		 * it attaches a private SID0 domain. Even bypass SIDs stay intact.
+		 */
+		if (dart->locked || dart->version != 0x203 || dart->num_streams != 16 ||
+		    !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {
+			ret = -EPERM;
+			goto err_clk_disable;
+		}
+		dart->irq = -1;
+		dart->retained = true;
+		get_device(dev);
+		dev_info(dev, "cold ANE DART: inherited streams preserved; SID0 only\n");
+	} else if (dart->managed_sids) {
 		bool init_bypass = false;
 
 		ret = apple_dart_fault_pending(dart) ? -EBUSY :
@@ -4276,7 +4406,8 @@ params_done:
 		goto err_sysfs_remove;
 
 	/* Retain supplier references; generic suspend/resume is not applicable. */
-	if (!dart->retained_mtp && !dart->managed_sids && !apple_dart_has_borrowed(dart))
+	if (!dart->retained_mtp && !dart->managed_sids && !dart->cold_ane &&
+	    !apple_dart_has_borrowed(dart))
 		pm_runtime_put(dev);
 
 	dev_dbg(
@@ -4412,6 +4543,10 @@ static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
+	if (dart->cold_ane) {
+		dev_warn(&pdev->dev, "cold ANE DART retained until reset\n");
+		return;
+	}
 	if (dart->managed_sids) {
 		apple_dart_managed_quarantine(dart);
 		if (dart->irq >= 0)
@@ -4591,6 +4726,13 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	dart->tunnel_state_restored = false;
 	if (READ_ONCE(dart->commands_gated))
 		return 0;
+	/*
+	 * The cold ANE DARTs belong to the ANE backend, which refuses system
+	 * sleep up front while it runs the firmware. Otherwise they hold
+	 * nothing to keep: neither save nor reset them.
+	 */
+	if (dart->cold_ane)
+		return 0;
 	/* Neither retained radio nor display has a qualified suspend boundary. */
 	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
 		return -EBUSY;
@@ -4680,6 +4822,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
+	/* No reset or restore: see apple_dart_suspend(). */
+	if (dart->cold_ane)
+		return 0;
 	if (dart->managed_sids || dart->preserve_display || apple_dart_has_borrowed(dart))
 		return -EBUSY;
 

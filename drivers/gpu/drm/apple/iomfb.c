@@ -34,6 +34,7 @@
 #include <drm/drm_vblank.h>
 
 #include "dcp.h"
+#include "dcp-hdr-metadata.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
@@ -871,6 +872,19 @@ bool dcp_crtc_can_retrain(struct drm_crtc *crtc, struct apple_connector *connect
 	return to_apple_crtc(crtc)->dcp == pdev;
 }
 
+/*
+ * A Type-C port whose pipelines do not follow their CRTC is driven by the
+ * pipeline its route is on; @crtc belonging to another one has lost it.
+ */
+static bool dcp_crtc_lost_route(struct drm_crtc *crtc, struct apple_connector *connector)
+{
+	struct platform_device *pdev = READ_ONCE(connector->dcp);
+
+	return connector->port_encoder && pdev &&
+	       !dcp_typec_follows_crtc(platform_get_drvdata(pdev)) &&
+	       to_apple_crtc(crtc)->dcp != pdev;
+}
+
 static int dcp_retrain_active_crtc(struct apple_connector *connector)
 {
 	struct drm_device *dev = connector->base.dev;
@@ -882,10 +896,24 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector)
 
 	crtc = connector->base.state ? connector->base.state->crtc : NULL;
 	if (crtc && crtc->state && crtc->state->active &&
-	    dcp_crtc_can_retrain(crtc, connector))
+	    dcp_crtc_lost_route(crtc, connector)) {
+		/*
+		 * The port's route moved to another pipeline (an HDMI display
+		 * took the hybrid): this CRTC cannot drive the display any
+		 * more, and a reset would only be refused.  Release it, so the
+		 * hotplug that follows lets the compositor pair the display
+		 * with the pipeline that now drives it, and this pipeline's
+		 * own display with this CRTC.
+		 */
+		struct drm_mode_set set = { .crtc = crtc };
+
+		ret = drm_atomic_helper_set_config(&set, &ctx);
+	} else if (crtc && crtc->state && crtc->state->active &&
+		   dcp_crtc_can_retrain(crtc, connector)) {
 		ret = drm_atomic_helper_reset_crtc(crtc, &ctx);
-	else
+	} else {
 		ret = 0;
+	}
 
 	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
 
@@ -2112,6 +2140,10 @@ modes_done:
 	if (apple_connector->drm_edid)
 		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
 
+	/* EDID updates clear display_info even for panels without an EDID. */
+	if (published && dcp_has_panel(dcp))
+		dcp_update_connector_dimensions(dcp, connector);
+
 	/*
 	 * An internal panel has no EDID, so nothing fills in the refresh range
 	 * that userspace needs before it will drive VRR. Supply the range DCP
@@ -2144,7 +2176,8 @@ static int dcp_desktop_modeset(struct apple_dcp *dcp,
 
 	if (d->trial_modeset_ok) {
 		d->trial_modeset_ok = false;
-		if (!crtc_state->vrr_enabled && d->mode_live &&
+		/* The trial installed a VRR timing variable too (see the mode set). */
+		if (d->mode_live &&
 		    lookup_mode(dcp, &crtc_state->mode, &matched) &&
 		    matched.timing_mode_id == d->trial_timing_mode_id &&
 		    matched.color_mode_id == d->trial_color_mode_id) {
@@ -2195,7 +2228,11 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 		*reason = "not-connected";
 		return -ENODEV;
 	}
-	/* The boot-like mode first, then the preferred one. */
+	/*
+	 * The preferred mode first, the one the firmware ranks highest (the
+	 * panel's native refresh), then the boot-like one: the mode that works
+	 * stays the preferred one, which is also what a desktop picks.
+	 */
 	mutex_lock(&dcp->modes_lock);
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
@@ -2214,13 +2251,11 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 	}
 	if (pref == UINT_MAX)
 		pref = 0;
+	cand[n++] = dcp->modes[pref].mode;
 	/* Only a mode within 1% of the boot loader's clock counts as boot-like. */
-	if (boot != UINT_MAX && best <= DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ / 100)
+	if (boot != UINT_MAX && best <= DCP_DESKTOP_BOOT_PIXEL_CLOCK_KHZ / 100 &&
+	    boot != pref)
 		cand[n++] = dcp->modes[boot].mode;
-	else
-		boot = UINT_MAX;
-	if (pref != boot)
-		cand[n++] = dcp->modes[pref].mode;
 	mutex_unlock(&dcp->modes_lock);
 
 	st = kzalloc_obj(*st);
@@ -2277,6 +2312,241 @@ int dcp_takeover_trial(struct platform_device *pdev, const char **reason)
 out:
 	kfree(st);
 	return ret;
+}
+
+/*
+ * PQ output goes through the IOMFB template's mode set, which picks the
+ * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware
+ * and the external H17P processor.  The other processors keep SDR.
+ */
+static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
+{
+	if (iomfb_is_m4(dcp))
+		return false;
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+}
+
+/*
+ * A desktop 26.x panel keeps its SDR link and shows PQ content as EDR, with
+ * the peak the firmware reports for it (see res_max_panel_brightness()).
+ */
+static bool dcp_panel_edr_supported(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       dcp_has_panel(dcp) && READ_ONCE(dcp->panel.peak_nits);
+}
+
+/* The state of the connector on @crtc that @commit sets up. */
+static const struct drm_connector_state *
+dcp_crtc_connector_state(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			 struct drm_atomic_commit *commit)
+{
+	const struct drm_connector_state *conn_state = NULL;
+	struct drm_connector_state *state;
+	struct drm_connector *connector;
+	int i;
+
+	for_each_new_connector_in_state(commit, connector, state, i)
+		if (state->crtc == crtc)
+			conn_state = state;
+	/* A mode set the driver starts itself keeps the connector's state. */
+	if (!conn_state && dcp->connector && dcp->connector->base.state &&
+	    dcp->connector->base.state->crtc == crtc)
+		conn_state = dcp->connector->base.state;
+	return conn_state;
+}
+
+/* The EOTF the compositor asks of the display on @crtc, an HDMI_EOTF_* value. */
+u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		 struct drm_atomic_commit *commit)
+{
+	const struct drm_connector_state *conn_state =
+		dcp_crtc_connector_state(dcp, crtc, commit);
+	const struct hdr_output_metadata *hdr;
+
+	if (!conn_state || !conn_state->hdr_output_metadata)
+		return HDMI_EOTF_TRADITIONAL_GAMMA_SDR;
+	hdr = conn_state->hdr_output_metadata->data;
+	return hdr->hdmi_metadata_type1.eotf;
+}
+
+/*
+ * A panel shows PQ content as EDR only while BT.2020 RGB is asked for too.
+ * Hyprland 0.56, going from HDR to a wide-gamut SDR mode, sets Colorspace back
+ * to Default but leaves the PQ metadata; on that alone the panel showed SDR
+ * frames as PQ at its peak.
+ */
+static bool dcp_crtc_bt2020(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			    struct drm_atomic_commit *commit)
+{
+	const struct drm_connector_state *conn_state =
+		dcp_crtc_connector_state(dcp, crtc, commit);
+
+	return conn_state && conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB;
+}
+
+/*
+ * HDR10 static metadata is link state on the external processors: a link
+ * set up again (mode set, power off) starts without it.
+ */
+void dcp_hdr_metadata_forget(struct apple_dcp *dcp)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+
+	if (!d)
+		return;
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		d->hdr_sent_valid = false;
+		d->hdr_infoframe = false;
+	}
+}
+
+/*
+ * Clear the Dynamic Range and Mastering InfoFrame of a live link before it
+ * leaves PQ, as macOS does: DCPAV selector 0x14 first, then the SDR colour
+ * mode.  Setting the SDR colour mode alone would leave the sink an HDR
+ * InfoFrame for an SDR signal.
+ */
+static void dcp_hdr_infoframe_stop(struct apple_dcp *dcp)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	struct apple_epic_service *service = NULL;
+	u8 msg[DCP_HDR_STOP_SIZE], reply[DCP_HDR_STOP_SIZE] = {};
+	size_t received = 0;
+	u32 retcode = 0;
+	int ret;
+
+	if (!d || READ_ONCE(dcp->crashed))
+		return;
+	scoped_guard(spinlock_irqsave, &d->hdr_lock)
+		if (d->hdr_infoframe)
+			service = afk_service_get(d->av_service);
+	if (!service)
+		return;
+
+	dcp_hdr_stop_message(msg);
+	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
+					      msg, sizeof(msg), reply, sizeof(reply),
+					      &retcode, &received);
+	ret = dcp_hdr_stop_reply(ret, retcode, reply, received);
+	if (ret)
+		dev_warn(dcp->dev, "HDR InfoFrame not stopped: %d\n", ret);
+	else
+		dev_dbg(dcp->dev, "HDR InfoFrame stopped\n");
+	scoped_guard(spinlock_irqsave, &d->hdr_lock)
+		if (d->av_service == service)
+			d->hdr_infoframe = false;
+	afk_service_put(service);
+}
+
+/* Whether @pdev takes a change of HDR_OUTPUT_METADATA without a mode set. */
+bool dcp_hdr_metadata_live(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	       !dcp_has_panel(dcp);
+}
+
+/*
+ * Send the connector's HDR10 static metadata to the DCPAV service once the
+ * link carries PQ: after the mode set that selected a PQ colour mode, and
+ * whenever the metadata changes on it.  Never per frame, and never on an
+ * SDR link (the firmware would build a DRM InfoFrame with the SDR EOTF).
+ * Going back to SDR is a mode set that first stops the InfoFrame
+ * (dcp_hdr_infoframe_stop()).
+ */
+static void dcp_hdr_metadata_sync(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				  struct drm_atomic_commit *commit)
+{
+	struct dcp_desktop_state *d = dcp->desktop;
+	const struct drm_connector_state *conn_state = NULL;
+	struct drm_connector_state *state;
+	struct drm_connector *connector;
+	struct apple_epic_service *service;
+	u8 data[DCP_HDR_DATA_SIZE], msg[DCP_HDR_MSG_SIZE];
+	u8 reply[DCP_HDR_MSG_SIZE] = {};
+	size_t received = 0;
+	u32 retcode = 0;
+	bool same;
+	int i, ret;
+
+	if (!d || !dcp->output_pq || READ_ONCE(dcp->crashed) ||
+	    !dcp_hdr_metadata_live(to_apple_crtc(crtc)->dcp))
+		return;
+	for_each_new_connector_in_state(commit, connector, state, i)
+		if (state->crtc == crtc)
+			conn_state = state;
+	if (!conn_state && dcp->connector && dcp->connector->base.state &&
+	    dcp->connector->base.state->crtc == crtc)
+		conn_state = dcp->connector->base.state;
+	if (!conn_state || !conn_state->hdr_output_metadata ||
+	    conn_state->hdr_output_metadata->length != sizeof(struct hdr_output_metadata))
+		return;
+	if (((const struct hdr_output_metadata *)conn_state->hdr_output_metadata->data)
+		    ->hdmi_metadata_type1.eotf != HDMI_EOTF_SMPTE_ST2084 ||
+	    dcp_hdr_data(data, conn_state->hdr_output_metadata->data))
+		return;
+
+	/* Most frames change nothing: compare before pinning the service. */
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		same = d->hdr_sent_valid && !memcmp(d->hdr_sent, data, sizeof(data));
+		service = same ? NULL : afk_service_get(d->av_service);
+	}
+	if (!service)
+		return;
+
+	dcp_hdr_message(msg, data);
+	ret = afk_send_command_with_reply_len(service, EPIC_SUBTYPE_STD_SERVICE,
+					      msg, sizeof(msg), reply, sizeof(reply),
+					      &retcode, &received);
+	ret = dcp_hdr_reply(ret, retcode, reply, received);
+	/*
+	 * A block the firmware refused is not sent again on every frame (the
+	 * command is synchronous): only a new block, a new mode set or a new
+	 * service instance retries.
+	 */
+	if (ret)
+		dev_warn_ratelimited(dcp->dev, "HDR static metadata not taken: %d\n", ret);
+	else
+		dev_dbg(dcp->dev, "HDR static metadata: MaxCLL %u MaxFALL %u mastering %u/%u\n",
+			get_unaligned_le16(data + 20), get_unaligned_le16(data + 22),
+			get_unaligned_le16(data + 16), get_unaligned_le16(data + 18));
+	scoped_guard(spinlock_irqsave, &d->hdr_lock) {
+		if (d->av_service == service) {
+			memcpy(d->hdr_sent, data, sizeof(data));
+			d->hdr_sent_valid = true;
+			if (!ret)
+				d->hdr_infoframe = true;
+		}
+	}
+	afk_service_put(service);
+}
+
+/* Only an SDR or a PQ signal, and PQ only where the timing has an element. */
+int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		       struct drm_atomic_commit *commit)
+{
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	struct dcp_display_mode mode;
+
+	if (!crtc_state || !crtc_state->enable ||
+	    !drm_atomic_crtc_needs_modeset(crtc_state))
+		return 0;
+	switch (dcp_crtc_eotf(dcp, crtc, commit)) {
+	case HDMI_EOTF_TRADITIONAL_GAMMA_SDR:
+		return 0;
+	case HDMI_EOTF_SMPTE_ST2084:
+		if (dcp_panel_edr_supported(dcp))
+			return 0;
+		if (dcp_hdr_output_supported(dcp) &&
+		    lookup_mode(dcp, &crtc_state->mode, &mode) && mode.pq.score >= 0)
+			return 0;
+		fallthrough;
+	default:
+		return -EINVAL;
+	}
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
@@ -2414,6 +2684,13 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (crtc_state->mode.hdisplay == 0 && crtc_state->mode.vdisplay == 0)
 		return 0;
 
+	dcp->pq_requested = dcp_crtc_eotf(dcp, crtc, commit) == HDMI_EOTF_SMPTE_ST2084;
+	dcp->output_edr = dcp->pq_requested && dcp_panel_edr_supported(dcp) &&
+			  dcp_crtc_bt2020(dcp, crtc, commit);
+	dcp->pq_requested &= dcp_hdr_output_supported(dcp);
+	if (!dcp->pq_requested)
+		dcp_hdr_infoframe_stop(dcp);
+	dcp_hdr_metadata_forget(dcp);
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -2960,6 +3237,11 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 		iomfb_v14_7_flush(dcp, crtc, commit);
 		return;
 	}
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
+	    READ_ONCE(dcp->mode_state.valid) && dcp->connector &&
+	    READ_ONCE(dcp->connector->connected))
+		dcp_hdr_metadata_sync(dcp, crtc, commit);
 
 	if (iomfb_uses_queue(dcp)) {
 		iomfb_queue_atomic(dcp, crtc, commit);

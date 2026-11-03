@@ -70,7 +70,7 @@ impl UatPageTable{fn new()->Self{Self{retained:false,ttb_owned:true,ttb:0x804000
 bindings=r'''
 #[derive(Clone,Copy)]struct Token(u32);impl Token{fn last_slot(&self)->u32{self.0}}
 struct Slot;impl Slot{fn changed(&self)->bool{true}fn slot(&self)->u32{3}fn token(&self)->Token{Token(3)}}
-struct Allocator;impl Allocator{fn set_limit(&self,_l:Option<NonZeroUsize>){}fn get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}}
+struct Allocator;impl Allocator{fn set_limit(&self,_l:Option<NonZeroUsize>){}fn get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}fn try_get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}}
 struct VmBinding{active_users:usize,bind_token:Option<Token>,binding:Option<Slot>,generation:u8,ttb:u64}
 #[derive(Clone)]struct Vm{id:u64,binding:Rc<Mutex<VmBinding>>}
 struct VmBind(Vm,u32);
@@ -78,7 +78,8 @@ struct Uat{inner:Rc<UatInner>,slots:Allocator}
 mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->u32{0}}pub static robust_isolation:Param=Param;}
 '''
 helpers='\n'.join(body(mm,m) for m in ['const fn binding_wire_generation(', 'const fn application_ttb1('])
-bind='impl Uat{'+body(mm,'pub(crate) fn bind(&self, vm: &Vm)')+'}\n'
+# bind() is the waiting form of bind_inner(); G15's try_bind() is the other.
+bind='impl Uat{'+body(mm,'pub(crate) fn bind(&self, vm: &Vm)')+'\n'+body(mm,'fn bind_inner(&self, vm: &Vm, wait: bool)')+'}\n'
 vm=r'''
 struct VmInner{id:u64,binding:Rc<Mutex<VmBinding>>,uat_inner:Rc<UatInner>,page_table:UatPageTable}
 impl VmInner{fn ttb(&self)->u64{self.page_table.ttb}}

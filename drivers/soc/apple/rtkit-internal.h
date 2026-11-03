@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) AND GPL-2.0-only */
 /*
  * Apple RTKit IPC library
  * Copyright (C) The Asahi Linux Contributors
@@ -70,6 +70,8 @@ struct apple_rtkit {
 	struct apple_rtkit_shmem oslog_buffer;
 	struct apple_rtkit_shmem kdebug_buffer0;
 	struct apple_rtkit_shmem kdebug_buffer1;
+	struct apple_rtkit_shmem pmp_aux_buffer;
+	bool pmp_registry_v2;
 
 	struct apple_rtkit_shmem syslog_buffer;
 	char *syslog_msg_buffer;

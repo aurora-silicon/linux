@@ -25,6 +25,8 @@
 /delete-node/ &ane0_dart0;
 /delete-node/ &ane0_dart1;
 /delete-node/ &ane0_dart2;
+/delete-node/ &jpeg0;
+/delete-node/ &jpeg1;
 /delete-node/ &jpeg0_dart;
 /delete-node/ &jpeg1_dart;
 /delete-node/ &scaler0_dart;
@@ -212,6 +214,83 @@
 /delete-node/ &nub_spmi4;
 /delete-node/ &aop_spmi0;
 /delete-node/ &ave;
+
+/delete-node/ &aop_accel;
+/delete-node/ &aop_gyro;
+/delete-node/ &pmc_soc_max;
+/delete-node/ &pmu_rtc;
+
+/ {
+	/delete-node/ pmu;
+};
+
+&avd {
+	power-domains = <&ps_avd_sys>;
+	/delete-property/ power-domain-names;
+};
+
+&nub_spmi0 {
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupt-parent;
+	/delete-property/ interrupts;
+};
+
+&usb_drd0_dart_0 {
+	/delete-property/ apple,dma-range;
+};
+
+&usb_drd0_dart_1 {
+	/delete-property/ apple,dma-range;
+};
+
+&usb_drd1_dart_0 {
+	/delete-property/ apple,dma-range;
+};
+
+&usb_drd1_dart_1 {
+	/delete-property/ apple,dma-range;
+};
+
+&usb_drd2_dart_0 {
+	/delete-property/ apple,dma-range;
+};
+
+&usb_drd2_dart_1 {
+	/delete-property/ apple,dma-range;
+};
+
+&mtp_dart {
+	/delete-property/ apple,dma-range;
+};
+
+&{/opp-table-e/opp01} {
+	/delete-property/ opp-microwatt;
+};
+
+&{/opp-table-e/opp02} {
+	/delete-property/ opp-microwatt;
+};
+
+&{/opp-table-e/opp03} {
+	/delete-property/ opp-microwatt;
+};
+
+&{/opp-table-e/opp04} {
+	/delete-property/ opp-microwatt;
+};
+
+&{/opp-table-e/opp05} {
+	/delete-property/ opp-microwatt;
+};
+
+&{/opp-table-e/opp06} {
+	/delete-property/ opp-microwatt;
+};
+
+&{/opp-table-e/opp07} {
+	/delete-property/ opp-microwatt;
+};
 
 &ps_avd_sys {
 	/delete-property/ power-domains;

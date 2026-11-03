@@ -79,7 +79,7 @@ pub(crate) struct Variant {
     pub(crate) lead_commands: bool,
     /// Register programs of the render descriptors.
     pub(crate) programs: super::render::RegisterPrograms,
-    /// Use 0x1c890 = 1 in V25G83-format tiling arrays (device/build policy).
+    /// Use 0x1c890 = 1, 0x1c918 = 0 in V25G83-format tiling arrays (device/build policy).
     pub(crate) ta_mode_1: bool,
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
@@ -154,8 +154,7 @@ pub(crate) const V25G83: Variant = Variant {
     mcache: false,
     // A fragment stage with the few-primitives flag hangs.
     few_primitives: false,
-    // A stalled ray traversal wedges the GPU without a firmware recovery.
-    ray_traversal: false,
+    ray_traversal: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.
     fragment_busy: false,

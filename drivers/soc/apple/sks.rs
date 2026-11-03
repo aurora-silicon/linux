@@ -15,8 +15,12 @@ struct KeybagCreateIntent<'a> {
 }
 
 impl<'a> KeybagCreateIntent<'a> {
-    fn new(dev: &'a device::Device, slot: keybag::Slot) -> Option<Self> {
-        if let Err(e) = keybag::write_intent(slot) {
+    fn new(
+        dev: &'a device::Device,
+        slot: keybag::Slot,
+        unfinished: crate::xart_guard::Unfinished,
+    ) -> Option<Self> {
+        if let Err(e) = keybag::write_intent(slot, unfinished) {
             dev_err!(dev, "sks: cannot persist keybag-create intent: {:?}\n", e);
             return None;
         }
@@ -626,10 +630,41 @@ impl SepData {
         }
     }
 
+    /// The no-bag proof for an unfinished create, if Linux's list shows it
+    /// left nothing behind.
+    fn sks_retry_unfinished_create(&self, slot: keybag::Slot) -> Option<keybag::NoStoredKeyBag> {
+        let unfinished = keybag::unfinished(slot).ok()?;
+        let listed = self
+            .with_store(|store| store.guard_listed_at_load())
+            .flatten();
+        if !crate::xart_guard::may_retry_create(unfinished, listed) {
+            dev_err!(
+                self.dev,
+                "sks: an earlier CREATE_KEYBAG never completed and may have left a bag (intent {:?}, xART guard list {:?}); not creating another\n",
+                unfinished,
+                listed
+            );
+            return None;
+        }
+        let proof = keybag::retry_unfinished(slot, unfinished).ok()?;
+        dev_notice!(
+            self.dev,
+            "sks: an earlier CREATE_KEYBAG never completed and left no record; creating the identity keybag again\n"
+        );
+        Some(proof)
+    }
+
     pub(crate) fn sks_provision_identity_keybag(&self) -> bool {
-        let proof = match keybag::read(keybag::Slot::Identity) {
+        let identity = keybag::Slot::Identity;
+        let proof = match keybag::read(identity) {
             Ok(keybag::State::Present(_)) => return true,
-            Ok(keybag::State::Absent(proof)) => proof,
+            Ok(keybag::State::Absent(proof)) => Ok(proof),
+            // An intent: a create was sent and never committed.
+            Err(e) if e == EEXIST => self.sks_retry_unfinished_create(identity).ok_or(e),
+            Err(e) => Err(e),
+        };
+        let proof = match proof {
+            Ok(proof) => proof,
             Err(e) => {
                 dev_err!(
                     self.dev,
@@ -640,7 +675,13 @@ impl SepData {
             }
         };
         let slot = proof.slot();
-        let mut intent = match KeybagCreateIntent::new(&self.dev, slot) {
+        // A later boot compares this with Linux's list to tell whether the
+        // create left anything.
+        let unfinished = match self.with_store(|store| store.guard_listed_now()).flatten() {
+            Some(entries) => crate::xart_guard::Unfinished::Guarded(entries),
+            None => crate::xart_guard::Unfinished::Unguarded,
+        };
+        let mut intent = match KeybagCreateIntent::new(&self.dev, slot, unfinished) {
             Some(intent) => intent,
             None => return false,
         };
@@ -670,7 +711,18 @@ impl SepData {
             }
         };
         intent.sending();
-        let Some(out) = self.sks_exchange(request.name, request.msg, &request.img) else {
+        // The window's host writes and flushes land inside this exchange, so
+        // it gets the 13.5 key store's longer wait.
+        let exchanged = crate::xart_guard::keybag_create_window(|| {
+            self.sks_exchange_patient(
+                request.name,
+                request.msg,
+                &request.img,
+                SKS_TIMEOUT_13_MS,
+                true,
+            )
+        });
+        let Some(out) = exchanged else {
             dev_err!(
                 self.dev,
                 "sks: CREATE_KEYBAG exchange did not complete (buffers unregistered, wedged, or OOL write failed)\n"

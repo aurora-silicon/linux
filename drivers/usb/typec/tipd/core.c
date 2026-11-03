@@ -998,10 +998,11 @@ static void cd321x_retry_held_mux(struct cd321x *cd321x)
 	if (!cd321x->pm.mux_retry_ms)
 		dev_info(cd321x->tps.dev, "Type-C mux held up, retrying\n");
 	delay = cd321x_pm_mux_held(&cd321x->pm, now_ms);
-	if (delay)
+	/* Probe records the hold, but ready() must enable the workers first. */
+	if (delay && cd321x->pm.phase != CD321X_PM_INITIALIZING)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(delay));
-	else
+	else if (!delay)
 		dev_warn(cd321x->tps.dev,
 			 "Type-C mux still held up after %u retries in %u s, waiting for the next event\n",
 			 retries, held_ms / 1000);
@@ -2080,15 +2081,24 @@ static void cd321x_ready(struct tps6598x *tps)
 	guard(mutex)(&tps->lock);
 	/* Include failures reported while the port was still being initialized. */
 	if (cd321x_pm_ready(&cd321x->pm)) {
+		dev_dbg(tps->dev, "Type-C probe ready: held=%u\n",
+			!!cd321x->pm.mux_retry_ms);
 		cd321x->state_valid = false;
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 	}
 }
 
-static void cd321x_stop_work(struct cd321x *cd321x)
+VISIBLE_IF_KUNIT void cd321x_stop_work(struct cd321x *cd321x)
 {
 	scoped_guard(mutex, &cd321x->tps.lock)
 		cd321x_pm_remove(&cd321x->pm);
+
+	/* A router that binds from now on must not hand this port its switch. */
+	if (cd321x->tbt_watch_registered) {
+		typec_thunderbolt_switch_unwatch(&cd321x->tbt_watch);
+		cd321x->tbt_watch_registered = false;
+	}
+	cancel_work_sync(&cd321x->tbt_attach_work);
 
 	/* Drain producers before cancelling work, including on probe rollback. */
 	if (cd321x->tbt_notifier_registered) {
@@ -2099,6 +2109,7 @@ static void cd321x_stop_work(struct cd321x *cd321x)
 	cancel_delayed_work_sync(&cd321x->resume_work);
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
+EXPORT_SYMBOL_IF_KUNIT(cd321x_stop_work);
 
 /* Separate so that the KUnit tests can choose the driver core's answer. */
 VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
@@ -2111,30 +2122,109 @@ EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
 
 /*
  * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
- * comes up. If its driver is not built or never binds, do not leave power
+ * comes up. If its driver is not built or has not bound yet, do not leave power
  * delivery, USB and DisplayPort on this port without a driver as well: stop
  * waiting for the router when the driver core stops waiting for missing
- * dependencies.
+ * dependencies. The router can still bind later, so set @late to take it then.
  */
 VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *
-cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode)
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
+		      bool *late)
 {
 	struct typec_thunderbolt_switch *sw;
 
+	*late = false;
 	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
 	if (sw != ERR_PTR(-EPROBE_DEFER) || cd321x_tbt_switch_keep_waiting(dev))
 		return sw;
 
-	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it\n");
+	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it until it binds\n");
+	*late = true;
 	return NULL;
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
+
+/*
+ * Take a router that bound after the port gave up on it. An attached cable
+ * raises no new event, so reapply it through the router as after system sleep.
+ */
+static void cd321x_tbt_attach_work(struct work_struct *work)
+{
+	struct cd321x *cd321x = container_of(work, struct cd321x,
+					    tbt_attach_work);
+	struct tps6598x *tps = &cd321x->tps;
+	struct typec_thunderbolt_switch *sw;
+	int ret;
+
+	scoped_guard(mutex, &tps->lock) {
+		if (cd321x->tbt_switch || cd321x->pm.phase == CD321X_PM_REMOVED)
+			return;
+	}
+
+	/* Another port's router, or this one is not usable yet: keep watching. */
+	sw = fwnode_typec_thunderbolt_switch_get(cd321x->tbt_fwnode);
+	if (IS_ERR_OR_NULL(sw))
+		return;
+
+	ret = typec_thunderbolt_switch_register_notifier(sw,
+							 &cd321x->tbt_notifier);
+	if (ret) {
+		typec_thunderbolt_switch_put(sw);
+		dev_warn(tps->dev,
+			 "failed to watch the USB4/Thunderbolt router: %d\n", ret);
+		return;
+	}
+
+	scoped_guard(mutex, &tps->lock) {
+		cd321x->tbt_switch = sw;
+		cd321x->tbt_notifier_registered = true;
+	}
+	dev_info(tps->dev, "USB4/Thunderbolt router bound, reapplying the cable state\n");
+	atomic_set(&cd321x->restore_event, 1);
+	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+}
+
+/* Runs under the registering router's locks, so only queue the lookup. */
+static int cd321x_tbt_watch(struct notifier_block *nb, unsigned long event,
+			    void *data)
+{
+	struct cd321x *cd321x = container_of(nb, struct cd321x, tbt_watch);
+
+	if (event != TYPEC_THUNDERBOLT_SWITCH_ADDED)
+		return NOTIFY_DONE;
+
+	queue_work(system_freezable_wq, &cd321x->tbt_attach_work);
+	return NOTIFY_OK;
+}
+
+/* Watch for the router of a port that had to probe without it. */
+VISIBLE_IF_KUNIT int cd321x_tbt_watch_late(struct cd321x *cd321x,
+					   struct fwnode_handle *fwnode)
+{
+	int ret;
+
+	cd321x->tbt_fwnode = fwnode_handle_get(fwnode);
+	cd321x->tbt_watch.notifier_call = cd321x_tbt_watch;
+	ret = typec_thunderbolt_switch_watch(&cd321x->tbt_watch);
+	if (ret) {
+		fwnode_handle_put(cd321x->tbt_fwnode);
+		cd321x->tbt_fwnode = NULL;
+		return ret;
+	}
+	cd321x->tbt_watch_registered = true;
+
+	/* The router may have registered since the lookup at probe. */
+	queue_work(system_freezable_wq, &cd321x->tbt_attach_work);
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_watch_late);
 
 /* Separate so that the KUnit tests can drive the workers without a port. */
 VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 {
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
 	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
+	INIT_WORK(&cd321x->tbt_attach_work, cd321x_tbt_attach_work);
 	atomic_set(&cd321x->link_event, 0);
 	atomic_set(&cd321x->ready_event, 0);
 	atomic_set(&cd321x->restore_event, 0);
@@ -2142,11 +2232,33 @@ VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_init_work);
 
+/* Use the same handle as the worker: timeout provenance belongs to the handle. */
+VISIBLE_IF_KUNIT int cd321x_init_mux(struct cd321x *cd321x)
+{
+	bool held;
+	int ret;
+
+	guard(mutex)(&cd321x->tps.lock);
+	cd321x->state.alt = NULL;
+	cd321x->state.mode = TYPEC_STATE_SAFE;
+	cd321x->state.data = NULL;
+	ret = cd321x_mux_set(cd321x, &held);
+	cd321x->state_valid = !ret;
+	if (ret == -EAGAIN)
+		return -EPROBE_DEFER;
+	if (held)
+		cd321x_retry_held_mux(cd321x);
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_init_mux);
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
 	struct fwnode_handle *connector_fwnode;
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	bool tbt_late;
 	int ret;
 
 	cd321x_init_work(cd321x);
@@ -2172,26 +2284,20 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (!IS_ERR_OR_NULL(connector_fwnode))
 		cd321x->connector_fwnode = connector_fwnode;
 
-	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode);
+	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode, &tbt_late);
 	if (IS_ERR(cd321x->tbt_switch)) {
 		ret = PTR_ERR(cd321x->tbt_switch);
 		goto err_put_mux;
 	}
 
-	cd321x->state.alt = NULL;
-	cd321x->state.mode = TYPEC_STATE_SAFE;
-	cd321x->state.data = NULL;
-	ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
-	cd321x->state_valid = !ret;
 	/*
 	 * A fixed host can register its SuperSpeed root after the mux provider.
 	 * Wait for that consumer at probe instead of exhausting the cable retry
 	 * budget before it exists. Host startup does not depend on this port.
 	 */
-	if (ret == -EAGAIN) {
-		ret = -EPROBE_DEFER;
+	ret = cd321x_init_mux(cd321x);
+	if (ret)
 		goto err_put_switch;
-	}
 
 	cd321x->tbt_notifier.notifier_call = cd321x_tbt_notify;
 	ret = typec_thunderbolt_switch_register_notifier(cd321x->tbt_switch,
@@ -2199,6 +2305,10 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (ret)
 		goto err_put_switch;
 	cd321x->tbt_notifier_registered = true;
+
+	/* Keep the port without the router rather than fail it: see above. */
+	if (tbt_late && cd321x_tbt_watch_late(cd321x, fwnode))
+		dev_warn(tps->dev, "cannot watch for the USB4/Thunderbolt router\n");
 
 	return 0;
 
@@ -2234,6 +2344,8 @@ cd321x_unregister_port(struct tps6598x *tps)
 	cd321x_stop_work(cd321x);
 	fwnode_handle_put(cd321x->connector_fwnode);
 	cd321x->connector_fwnode = NULL;
+	fwnode_handle_put(cd321x->tbt_fwnode);
+	cd321x->tbt_fwnode = NULL;
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 	typec_mux_put(cd321x->mux);
@@ -2712,6 +2824,7 @@ int tipd_init(struct tps6598x *tps)
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
 
+	dev_dbg(tps->dev, "Type-C probe start\n");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(tps->reset))
 		return dev_err_probe(tps->dev, PTR_ERR(tps->reset),

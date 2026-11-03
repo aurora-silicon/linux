@@ -248,8 +248,7 @@ impl Pair {
         let layout = target::Layout::new(pass, clusters, variant.programs)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
-        let (fragment, fragment_alias) =
-            kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
+        let (fragment, fragment_alias) = kick::Queue::render(alloc, ids[1], context.vm(), rings)?;
         let (memory, aliases) = memory::Memory::new(
             alloc,
             pool,
@@ -336,7 +335,11 @@ impl Pair {
         self.replay.front().cloned()
     }
     pub(crate) fn finish_replay(&mut self, packet: &Arc<Packet>) -> Result {
-        if !self.replay.front().is_some_and(|front| Arc::ptr_eq(front, packet)) {
+        if !self
+            .replay
+            .front()
+            .is_some_and(|front| Arc::ptr_eq(front, packet))
+        {
             return Err(EIO);
         }
         self.replay.pop();
@@ -363,14 +366,20 @@ impl Pair {
         addresses: RenderAddresses,
     ) -> Result {
         if !self.room()
-            || self.replay.front().is_some_and(|front| !Arc::ptr_eq(front, packet))
+            || self
+                .replay
+                .front()
+                .is_some_and(|front| !Arc::ptr_eq(front, packet))
             || !Arc::ptr_eq(&self.memory.context, &packet.context)
             || !packet.context.is_current()
         {
             return Err(EBUSY);
         }
         let Validated::Render {
-            pass, attachments, ray_query, ..
+            pass,
+            attachments,
+            ray_query,
+            ..
         } = &packet.command
         else {
             return Err(EINVAL);
@@ -466,11 +475,9 @@ impl Pair {
             true => attachments[1].as_slice(),
             false => &[][..],
         };
-        let result = self.memory.write_descriptors(
-            &args,
-            attachments,
-            packet.context.id().try_into()?,
-        );
+        let result =
+            self.memory
+                .write_descriptors(&args, attachments, packet.context.id().try_into()?);
         let mcache = match result {
             Ok(mcache) => mcache,
             Err(error) => {
@@ -670,7 +677,9 @@ impl Pair {
             .filter(|_| self.recovery_generation == epoch);
         let present = [0, 1].map(|stage| {
             let mut config = configs[stage];
-            let reload = kicks[stage].prev().completion_value(payload.wrapping_sub(1));
+            let reload = kicks[stage]
+                .prev()
+                .completion_value(payload.wrapping_sub(1));
             if config.completion_seed_valid != 0
                 && self.installed[stage]
                 && held.is_some_and(|held| held[stage] == reload)
@@ -688,7 +697,10 @@ impl Pair {
             self.memory.graph.queues.gpu_va()
                 + u64::from(qid) * size_of::<queue::QueueRecord>() as u64
         });
-        let Validated::Render { pass, ray_query, .. } = &packet.command else {
+        let Validated::Render {
+            pass, ray_query, ..
+        } = &packet.command
+        else {
             return Err(EINVAL);
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
@@ -791,10 +803,7 @@ impl Pair {
             windows[0].target().try_into()?,
             self.outer_started & ring == 0,
         )?;
-        let event_slot = memory
-            .graph
-            .support
-            .word(abi::storage::EVENT_SLOTS + 4)?;
+        let event_slot = memory.graph.support.word(abi::storage::EVENT_SLOTS + 4)?;
         let next_event = event_slot.load(Ordering::Relaxed).wrapping_add(1);
         let inner = memory.graph.support.word(0x28000)?;
         let next_inner = (next_ordinal as u32).wrapping_mul(2);
@@ -949,7 +958,11 @@ impl Pair {
         let policy = packet.context.policy();
         // A registration of another class can only follow a rebind, which
         // requires the pair to have drained.
-        if self.registered.is_some_and(|class| class != policy.priority()) && self.in_flight() {
+        if self
+            .registered
+            .is_some_and(|class| class != policy.priority())
+            && self.in_flight()
+        {
             return Err(EIO);
         }
         Ok((epoch, prepared.mcache, policy))
@@ -987,8 +1000,12 @@ impl Pair {
             host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
             host.notify_render(priority)?;
-            crate::g17::trace::publish(crate::g17::trace::RENDER, self.qids()[1], self.ordinal as u32,
-                packet);
+            crate::g17::trace::publish(
+                crate::g17::trace::RENDER,
+                self.qids()[1],
+                self.ordinal as u32,
+                packet,
+            );
             host.note_submission()
         })();
         if let Err(error) = publish {
@@ -1054,9 +1071,14 @@ impl Pair {
                     active.ticket.ordinal, pass.width, pass.height, pass.layers,
                     target::Layout::new(pass, self.clusters, self.variant.programs));
             }
-            pr_warn!("G17: recovery render ordinal={} published={} ctx={} seq={} snapshot={:?}\n",
-                active.ticket.ordinal, active.outer_published, active.packet.context.id(),
-                active.packet.order.sequence, observation::snapshot(&self.memory, active.ticket.ordinal));
+            pr_warn!(
+                "G17: recovery render ordinal={} published={} ctx={} seq={} snapshot={:?}\n",
+                active.ticket.ordinal,
+                active.outer_published,
+                active.packet.context.id(),
+                active.packet.order.sequence,
+                observation::snapshot(&self.memory, active.ticket.ordinal)
+            );
         }
     }
 
@@ -1064,7 +1086,12 @@ impl Pair {
     /// `stamps` still lag it, and reports whether that has held for
     /// [`retirement::STAMP_FALLBACK_NS`] (`now`, host ns). The observation scan then retires it
     /// on its pass record instead of waiting for stamps no later event will move.
-    pub(crate) fn note_stamp_wait(&mut self, stamps: [u32; 2], state: u32, now: u64) -> Result<bool> {
+    pub(crate) fn note_stamp_wait(
+        &mut self,
+        stamps: [u32; 2],
+        state: u32,
+        now: u64,
+    ) -> Result<bool> {
         if self.quarantined || self.prepared.is_some() || state != 0 {
             return Ok(false);
         }
@@ -1075,7 +1102,10 @@ impl Pair {
             return Ok(false);
         }
         let published = front.ticket.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
-        if stamps.into_iter().all(|stamp| retirement::stamp_covers(stamp, published)) {
+        if stamps
+            .into_iter()
+            .all(|stamp| retirement::stamp_covers(stamp, published))
+        {
             front.stamp_wait_since = None;
             return Ok(false);
         }
@@ -1085,20 +1115,54 @@ impl Pair {
             return Ok(false);
         }
         let since = *front.stamp_wait_since.get_or_insert(now);
-        Ok(now.saturating_sub(since) >= retirement::STAMP_FALLBACK_NS)
+        Ok(Self::stamp_wait_expired(front, since, now))
+    }
+
+    /// Whether the front's stamp wait latched at `since` has run out by `now`. While other kicks
+    /// of the group's ioctl still run, its stamps are not late: the wait restarts and the pair
+    /// stays latched for the rescan.
+    fn stamp_wait_expired(front: &mut Active, since: u64, now: u64) -> bool {
+        let drained = || {
+            // A node that cannot be read keeps the bound from the latch.
+            front
+                .packet
+                .completion
+                .work_state()
+                .and_then(|work| work.drained())
+                .unwrap_or(true)
+        };
+        match retirement::stamp_wait(since, now, drained) {
+            retirement::StampWait::Waiting => false,
+            retirement::StampWait::Restart(now) => {
+                front.stamp_wait_since = Some(now);
+                false
+            }
+            retirement::StampWait::Expired => true,
+        }
     }
 
     /// Whether the front group's stamp wait is latched: the observation scan rechecks the pair
     /// without a completion notification, which may never come for such a group.
     pub(crate) fn stamp_waiting(&self) -> bool {
-        self.active.front().is_some_and(|front| front.stamp_wait_since.is_some())
+        self.active
+            .front()
+            .is_some_and(|front| front.stamp_wait_since.is_some())
     }
 
     /// The watchdog of `packet` expired while it is this pair's front: if the firmware executed
     /// it and consumed its ring entries while the stamps lag, it retires on its pass record now
     /// instead of failing. Failing would give up on the stamps as well.
-    pub(crate) fn expire_stamp_wait(&mut self, packet: &Arc<Packet>, stamps: [u32; 2], state: u32) -> Result<bool> {
-        if !self.active.front().is_some_and(|front| Arc::ptr_eq(&front.packet, packet)) {
+    pub(crate) fn expire_stamp_wait(
+        &mut self,
+        packet: &Arc<Packet>,
+        stamps: [u32; 2],
+        state: u32,
+    ) -> Result<bool> {
+        if !self
+            .active
+            .front()
+            .is_some_and(|front| Arc::ptr_eq(&front.packet, packet))
+        {
             return Ok(false);
         }
         if !self.note_stamp_wait(stamps, state, crate::g17::now_ns())? && !self.stamp_waiting() {
@@ -1161,7 +1225,9 @@ impl Pair {
             return Err(EINVAL);
         };
         let required = target::Layout::new(pass, self.clusters, self.variant.programs)?.tvb_blocks;
-        self.memory.manager.note_required(required, crate::g17::now_ns());
+        self.memory
+            .manager
+            .note_required(required, crate::g17::now_ns());
         if self.in_flight() {
             return Ok(None);
         }
@@ -1224,7 +1290,10 @@ impl Pair {
     /// A slot stamp must name retained work before its execution markers are meaningful.
     pub(crate) fn pass_started(&self, stamp: u64) -> Option<bool> {
         const MASK: u64 = (1 << 40) - 1;
-        let ordinal = self.active.iter().map(|active| active.ticket.ordinal)
+        let ordinal = self
+            .active
+            .iter()
+            .map(|active| active.ticket.ordinal)
             .find(|ordinal| ordinal.wrapping_add(1) & MASK == stamp & MASK)?;
         Some(observation::snapshot(&self.memory, ordinal).ok()?.pass[0] != 0)
     }
@@ -1256,7 +1325,11 @@ impl Pair {
         self.quarantined = true;
         // Successors published after recovery can still fail behind its spared
         // head. Classify the whole failing group before any fence can settle.
-        if self.active.iter().any(|active| active.packet.completion.spared()) {
+        if self
+            .active
+            .iter()
+            .any(|active| active.packet.completion.spared())
+        {
             for active in self.active.iter() {
                 active.packet.completion.classify(recovery::Class::Spared);
             }
@@ -1323,9 +1396,9 @@ impl Pair {
         {
             return Err(EIO);
         }
-        let stampless = front.stamp_wait_since.is_some_and(|since| {
-            crate::g17::now_ns().saturating_sub(since) >= retirement::STAMP_FALLBACK_NS
-        });
+        let stampless = front
+            .stamp_wait_since
+            .is_some_and(|since| Self::stamp_wait_expired(front, since, crate::g17::now_ns()));
         let mut observer = Observer {
             memory: &self.memory,
             qids,
@@ -1372,8 +1445,13 @@ impl Pair {
             front.flist_completed = true;
         }
         crate::g17::recovery::note_retired();
-        crate::g17::trace::complete(crate::g17::trace::RENDER, qids[1], ordinal as u32,
-            &front.packet, [timestamps[0], timestamps[3]]);
+        crate::g17::trace::complete(
+            crate::g17::trace::RENDER,
+            qids[1],
+            ordinal as u32,
+            &front.packet,
+            [timestamps[0], timestamps[3]],
+        );
         defer(Deferred::Retired(
             front.packet.completion.clone(),
             Ok(timestamps),
@@ -1433,7 +1511,13 @@ impl Pair {
                     // A torn sample is no proof; a later poll or the timeout looks again.
                     let witness = |executed| {
                         matches!(
-                            retirement::abandoned(&active.ticket, snapshot, stamps, state, executed),
+                            retirement::abandoned(
+                                &active.ticket,
+                                snapshot,
+                                stamps,
+                                state,
+                                executed
+                            ),
                             Ok(true)
                         )
                     };
@@ -1442,7 +1526,11 @@ impl Pair {
                     // another queue waited on never: the wait ended when firmware retired it.
                     let lost = (active.packet.completion.interrupted() && !snapshot.untouched())
                         || active.packet.completion.has_firmware_consumer();
-                    Ok((unexecuted && !lost, !unexecuted && witness(true), unexecuted && lost))
+                    Ok((
+                        unexecuted && !lost,
+                        !unexecuted && witness(true),
+                        unexecuted && lost,
+                    ))
                 })()
                 .unwrap_or_else(|error: Error| {
                     failure = Some(error);
@@ -1706,7 +1794,8 @@ impl Pair {
     /// The firmware acknowledged a kill of this pair's context (scheduler page): it no longer
     /// walks that context's work list, so the commands it never unlinked can be released.
     fn context_killed(&self) -> bool {
-        crate::g17::queue::compute::exit::State::read(&self.memory.context).is_ok_and(|state| state.killed != 0)
+        crate::g17::queue::compute::exit::State::read(&self.memory.context)
+            .is_ok_and(|state| state.killed != 0)
     }
 
     /// The pair's context may be killed although its commands were not retired: they all ran
@@ -1845,15 +1934,13 @@ impl Pair {
         // own even with successors queued, so the pair is not quarantined into a sticky EIO. It
         // fails with ECANCELED, which spared work never reports as device loss; consecutive
         // abandoned spared successors are retired the same way.
-        let front_spared = self.active.front().is_some_and(|a| {
-            Arc::ptr_eq(&a.packet, packet) && a.packet.completion.spared()
-        });
+        let front_spared = self
+            .active
+            .front()
+            .is_some_and(|a| Arc::ptr_eq(&a.packet, packet) && a.packet.completion.spared());
         if !self.quarantined && (self.active.len() == 1 || front_spared) {
             let mut retired = false;
-            loop {
-                let Some(active) = self.active.front() else {
-                    break;
-                };
+            while let Some(active) = self.active.front() {
                 let spared = active.packet.completion.spared();
                 if retired && !spared {
                     break;
@@ -2124,12 +2211,25 @@ impl Pair {
     }
     /// The render prefix of `packet` on this pair, as the registry collects it
     /// for an owner whose only pair this is.
-    pub(crate) fn own_dependencies(&self, owner: u64, packet: &Arc<Packet>) -> Result<RenderDependencies> {
+    pub(crate) fn own_dependencies(
+        &self,
+        owner: u64,
+        packet: &Arc<Packet>,
+    ) -> Result<RenderDependencies> {
         let mut dependencies = RenderDependencies::EMPTY;
         let mut frontier = crate::g17::dependency::Frontier::new();
-        self.collect_dependencies(owner, packet.completion.status(), packet.order.wait_through[0], &mut frontier, false)?;
+        self.collect_dependencies(
+            owner,
+            packet.completion.status(),
+            packet.order.wait_through[0],
+            &mut frontier,
+            false,
+        )?;
         for dependency in frontier.as_slice() {
-            *dependencies.render.get_mut(dependencies.render_count).ok_or(EOVERFLOW)? = *dependency;
+            *dependencies
+                .render
+                .get_mut(dependencies.render_count)
+                .ok_or(EOVERFLOW)? = *dependency;
             dependencies.render_count += 1;
         }
         if dependencies.render_count != 0
@@ -2143,7 +2243,10 @@ impl Pair {
                 &mut tiling,
             )?;
             for dependency in tiling.as_slice() {
-                *dependencies.tiling.get_mut(dependencies.tiling_count).ok_or(EOVERFLOW)? = *dependency;
+                *dependencies
+                    .tiling
+                    .get_mut(dependencies.tiling_count)
+                    .ok_or(EOVERFLOW)? = *dependency;
                 dependencies.tiling_count += 1;
             }
         }
@@ -2156,8 +2259,12 @@ impl Pair {
     /// not left the pair yet.
     pub(crate) fn switch_in_flight(&self) -> Option<u64> {
         let (from, first) = self.switch?;
-        (self.replay.len() != 0 || self.active.iter().any(|active| active.ticket.ordinal == first))
-            .then_some(from)
+        (self.replay.len() != 0
+            || self
+                .active
+                .iter()
+                .any(|active| active.ticket.ordinal == first))
+        .then_some(from)
     }
     pub(crate) fn take_retired_binding(&mut self) -> Option<RetiredBinding> {
         if self.displaced.is_some() {
@@ -2322,7 +2429,9 @@ impl Pair {
         self.memory.context = binding.context.clone();
         self.owner = Some(binding.owner);
         self.initial_packet = binding.initial_packet;
-        if foreign { self.graph_started = false; }
+        if foreign {
+            self.graph_started = false;
+        }
         self.context_update = true;
         if foreign {
             self.cursors = [0; 2];
@@ -2373,4 +2482,3 @@ mod completion_noted_tests {
         assert!(completion_noted([3, 68], both));
     }
 }
-

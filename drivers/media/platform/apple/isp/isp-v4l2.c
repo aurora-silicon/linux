@@ -3,6 +3,7 @@
 
 #include <linux/math.h>
 #include <linux/module.h>
+#include <linux/unaligned.h>
 
 #include <media/media-device.h>
 #include <media/v4l2-common.h>
@@ -23,6 +24,8 @@
 #define ISP_MAX_PLANES 4
 #define ISP_BUFFER_TIMEOUT msecs_to_jiffies(1500)
 #define ISP_STRIDE_ALIGNMENT 64
+
+static void isp_vb2_set_min_buffers(struct apple_isp *isp);
 
 /* Capture rates offered to userspace, in frames per second */
 static const unsigned int isp_frame_rates[] = { 30, 25, 24, 20, 15 };
@@ -64,6 +67,45 @@ static bool isp_p010_buffer_matches(const struct isp_format *fmt,
 	return desc->num_planes == 2 &&
 	       desc->pool_type == CISP_POOL_TYPE_RENDERED_SCL1 && (full || low) &&
 	       !desc->iovas[2] && !desc->iovas[3] && desc->tag == buf->tag;
+}
+
+/*
+ * A metadata buffer starts with a table of section offsets. On H17 firmware
+ * the fourth section opens with the frame's exposure: the integration time in
+ * microseconds (le32 at 0) and the total sensor gain in 1/256 steps, 256 for
+ * unity (le16 at 6). Observed on T6040 and T8140 with AE converging under a
+ * fixed scene and with the frame rate capping the integration time.
+ */
+#define ISP_META_SECTIONS		0x10
+#define ISP_META_SECTION_EXPOSURE	3
+#define ISP_META_EXPOSURE_TIME		0x0
+#define ISP_META_EXPOSURE_GAIN		0x6
+#define ISP_META_EXPOSURE_SIZE		0x8
+
+static void isp_meta_read_exposure(struct apple_isp *isp,
+				   const struct isp_surf *meta)
+{
+	const u8 *virt = meta->virt;
+	u32 offset, time;
+	u16 gain;
+
+	if (!isp->hw->meta_exposure || !virt)
+		return;
+
+	offset = get_unaligned_le32(virt + ISP_META_SECTIONS +
+				    4 * ISP_META_SECTION_EXPOSURE);
+	if (offset < ISP_META_SECTIONS || offset > meta->size ||
+	    meta->size - offset < ISP_META_EXPOSURE_SIZE)
+		return;
+
+	time = get_unaligned_le32(virt + offset + ISP_META_EXPOSURE_TIME);
+	gain = get_unaligned_le16(virt + offset + ISP_META_EXPOSURE_GAIN);
+	/* An unwritten section or one this layout does not describe */
+	if (!time || !gain)
+		return;
+
+	WRITE_ONCE(isp->frame_exposure_us, time);
+	WRITE_ONCE(isp->frame_gain, gain);
 }
 
 void ipc_bt_complete(struct apple_isp *isp)
@@ -126,6 +168,7 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 				struct isp_surf *meta = isp->meta_surfs[j];
 				if ((u32)bufd->iovas[0] == (u32)meta->iova) {
 					WARN_ON(!meta->submitted);
+					isp_meta_read_exposure(isp, meta);
 					if (isp_is_p010(isp))
 						__set_bit(j, &isp->meta_returned);
 					else
@@ -195,6 +238,11 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 
 	struct isp_buflist *bl = isp->cmd_virt;
 	struct isp_buflist_buffer *bufd = &bl->buffers[0];
+
+	/* Before the command area is overwritten */
+	err = isp_ipc_resync(isp);
+	if (err)
+		return err;
 
 	/* Clear what earlier commands and batches left in the reserved fields. */
 	memset(bl, 0, ISP_CMD_AREA_SIZE(isp_num_capmeta(isp)));
@@ -288,11 +336,12 @@ send:
 
 	err = ipc_chan_send(isp, chan, ISP_BUFFER_TIMEOUT);
 	if (err) {
-		if (isp_is_p010(isp)) {
-			/* Keep leases owned until stop_camera halts the coprocessor. */
-			isp->ipc_failed = true;
+		/*
+		 * The firmware may have taken the batch. Keep its leases owned
+		 * until the timeout is resolved, see apple_isp_stop_camera().
+		 */
+		if (isp_is_p010(isp))
 			return err;
-		}
 		/* If we fail, consider the buffer not submitted. */
 		dev_err(isp->dev,
 			"%s: failed to send bufs: [0x%llx, 0x%llx, 0x%llx]\n",
@@ -455,8 +504,16 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
 	if (test_bit(ISP_STATE_STREAMING, &isp->state) &&
 	    (isp_supports_p010(isp) || !empty)) {
 		if (isp_submit_buffers(isp, false) && isp_is_p010(isp)) {
-			apple_isp_firmware_halt(isp);
-			isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
+			/*
+			 * After a timeout the leases stay owned until the
+			 * stream stops. Only firmware that did not answer at
+			 * all is stopped here, before its leases are released.
+			 */
+			if (isp->ipc_failed) {
+				apple_isp_firmware_halt(isp);
+				isp_vb2_release_buffers(isp,
+							VB2_BUF_STATE_ERROR);
+			}
 			vb2_queue_error(&isp->vbq);
 		}
 	}
@@ -535,12 +592,14 @@ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	isp->sequence = 0;
 
-	/* The exposure priority is applied when the stream starts. */
+	/* The exposure controls are applied when the stream starts. */
 	v4l2_ctrl_grab(isp->exposure_priority, true);
+	v4l2_ctrl_grab(isp->power_line_frequency, true);
 
 	err = apple_isp_start_streaming(isp);
 	if (err) {
 		v4l2_ctrl_grab(isp->exposure_priority, false);
+		v4l2_ctrl_grab(isp->power_line_frequency, false);
 		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
 	}
 
@@ -554,6 +613,7 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 	apple_isp_stop_streaming(isp);
 	isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
 	v4l2_ctrl_grab(isp->exposure_priority, false);
+	v4l2_ctrl_grab(isp->power_line_frequency, false);
 }
 
 int apple_isp_video_suspend(struct apple_isp *isp)
@@ -835,6 +895,7 @@ static int isp_vidioc_set_format(struct file *file, void *fh,
 	isp_get_sp_pix_format(isp, f, fmt);
 
 	isp->vbq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	isp_vb2_set_min_buffers(isp);
 
 	return 0;
 }
@@ -1025,6 +1086,22 @@ static void isp_free_meta_surfaces(struct apple_isp *isp)
 	}
 }
 
+/*
+ * vb2 allocates at least min_queued_buffers + 1 buffers, and the queue may
+ * hold no more than the rendered pool (isp_vb2_queue_setup()). The P010 pool
+ * has two slots, so a P010 stream starts with one queued buffer; otherwise
+ * REQBUFS can never get the three buffers vb2 asks for and fails with ENOMEM.
+ * Only called while the queue has no buffers.
+ */
+static void isp_vb2_set_min_buffers(struct apple_isp *isp)
+{
+	struct vb2_queue *vbq = &isp->vbq;
+
+	vbq->min_queued_buffers = min_t(unsigned int, ISP_MIN_FRAMES,
+					 isp_num_rendered(isp) - 1);
+	vbq->min_reqbufs_allocation = vbq->min_queued_buffers + 1;
+}
+
 static int isp_vb2_queue_init(struct apple_isp *isp)
 {
 	struct vb2_queue *vbq = &isp->vbq;
@@ -1041,6 +1118,53 @@ static int isp_vb2_queue_init(struct apple_isp *isp)
 	vbq->lock = &isp->video_lock;
 
 	return vb2_queue_init(vbq);
+}
+
+static int isp_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct apple_isp *isp =
+		container_of(ctrl->handler, struct apple_isp, ctrl_handler);
+
+	switch (ctrl->id) {
+	case V4L2_CID_GAIN:
+		ctrl->val = READ_ONCE(isp->frame_gain);
+		return 0;
+	case V4L2_CID_EXPOSURE_ABSOLUTE:
+		/* in 100 us units */
+		ctrl->val = DIV_ROUND_CLOSEST(READ_ONCE(isp->frame_exposure_us),
+					      100);
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static const struct v4l2_ctrl_ops isp_exposure_ctrl_ops = {
+	.g_volatile_ctrl = isp_g_volatile_ctrl,
+};
+
+/*
+ * Auto exposure picks the gain and exposure of each frame. Report the last
+ * frame's values read-only, so that userspace can follow the scene light, for
+ * example to decide when to denoise. The gain is the firmware's total sensor
+ * gain in 1/256 steps.
+ */
+static void isp_init_exposure_ctrls(struct apple_isp *isp)
+{
+	isp->frame_gain = 256;
+	isp->gain = v4l2_ctrl_new_std(&isp->ctrl_handler,
+				      &isp_exposure_ctrl_ops, V4L2_CID_GAIN,
+				      0, U16_MAX, 1, 256);
+	isp->exposure = v4l2_ctrl_new_std(&isp->ctrl_handler,
+					  &isp_exposure_ctrl_ops,
+					  V4L2_CID_EXPOSURE_ABSOLUTE,
+					  0, 10000, 1, 0);
+	if (isp->gain)
+		isp->gain->flags |= V4L2_CTRL_FLAG_READ_ONLY |
+				    V4L2_CTRL_FLAG_VOLATILE;
+	if (isp->exposure)
+		isp->exposure->flags |= V4L2_CTRL_FLAG_READ_ONLY |
+					V4L2_CTRL_FLAG_VOLATILE;
 }
 
 int apple_isp_setup_video(struct apple_isp *isp)
@@ -1097,10 +1221,24 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	 * Auto exposure is always on. By default it holds the frame rate, as
 	 * V4L2 specifies; with exposure priority it may slow down in low light.
 	 */
-	v4l2_ctrl_handler_init(&isp->ctrl_handler, 1);
+	v4l2_ctrl_handler_init(&isp->ctrl_handler, 4);
 	isp->exposure_priority =
 		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
 				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
+	/*
+	 * The H17 firmware's auto exposure avoids mains flicker at the given
+	 * frequency. 50 Hz is the default, as on macOS when it does not know
+	 * the country; userspace sets 60 Hz where the mains runs at 60 Hz.
+	 */
+	if (isp->hw->fw_abi == ISP_FW_ABI_H17)
+		isp->power_line_frequency =
+			v4l2_ctrl_new_std_menu(&isp->ctrl_handler, NULL,
+					       V4L2_CID_POWER_LINE_FREQUENCY,
+					       V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
+					       BIT(V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
+					       V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
+	if (isp->hw->meta_exposure)
+		isp_init_exposure_ctrls(isp);
 	if (isp->ctrl_handler.error) {
 		err = isp->ctrl_handler.error;
 		dev_err(isp->dev, "failed to create controls: %d\n", err);

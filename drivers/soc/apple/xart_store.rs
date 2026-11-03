@@ -353,6 +353,9 @@ impl Store {
 
         if let Some(guard) = self.guard.as_mut() {
             guard.check(key, true)?;
+            if let Some(why) = guard.take_save_previous() {
+                self.save_previous(key, why)?;
+            }
         }
 
         let old = self.find(key);
@@ -390,6 +393,34 @@ impl Store {
         }
         self.valid_records = self.slots.iter().filter(|slot| slot.used).count();
         Ok(())
+    }
+
+    /// Saves the current value of `key` before the guard lets the enclave
+    /// rewrite it, and logs the rewrite. Refuses it when that fails.
+    fn save_previous(&mut self, key: &Key, why: crate::xart_guard::Rewrite) -> Result<()> {
+        let saved = match self.read(key) {
+            Ok(Some(value)) => crate::xart_guard::save_previous(key, &value),
+            Ok(None) => Err(ENOENT),
+            Err(e) => Err(e),
+        };
+        match saved {
+            Ok(()) => {
+                pr_notice!(
+                    "xART guard: allowed one rewrite of kind-{} record {} {}; its previous value is in {}\n",
+                    key.kind,
+                    crate::xart_guard::Id(&key.uuid),
+                    why.describe(),
+                    crate::xart_guard::PREVIOUS_PATH
+                );
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(guard) = self.guard.as_mut() {
+                    guard.refuse_unsaved(key, why, e);
+                }
+                Err(EPERM)
+            }
+        }
     }
 
     pub(crate) fn delete(&mut self, key: &Key) -> Result<bool> {
@@ -432,6 +463,16 @@ impl Store {
         let keys = self.live_keys()?;
         self.guard = Some(crate::xart_guard::Guard::open(level, keys));
         Ok(())
+    }
+
+    /// Entries in the guard's list now, or `None` without a guarded list.
+    pub(crate) fn guard_listed_now(&self) -> Option<u64> {
+        self.guard.as_ref().and_then(|guard| guard.listed_now())
+    }
+
+    /// Entries in the guard's list at load, or `None` without a guarded list.
+    pub(crate) fn guard_listed_at_load(&self) -> Option<u64> {
+        self.guard.as_ref().and_then(|guard| guard.listed_at_load())
     }
 
     /// The guard's effective level and whether its list was loaded, or

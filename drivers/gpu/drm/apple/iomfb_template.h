@@ -68,11 +68,19 @@ struct DCP_FW_NAME(dcp_swap) {
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/*
 	 * The desktop 26.x firmware takes the panel level in nits, as an
-	 * IEEE-754 binary64 at +0x35e (unaligned), flagged by bl_flags[1].
+	 * IEEE-754 binary64 at +0x35e (unaligned), flagged by bl_update.  The
+	 * brightness limit is the binary64 at +0x376, flagged by bl_flags[1]
+	 * (a zero limit clears it).  The display EDR scale is the binary64 at
+	 * +0x37e, flagged by bl_flags[2]; the headroom the frame uses is the
+	 * one at +0x3e6, flagged by bl_flags[4].  Each value is kept by the
+	 * firmware until a swap carries it again.
 	 */
 	u8 bl_flags[6];
 	__le64 bl_nits;
-	u8 unk_366[0x2b];
+	u8 unk_366[0x10];
+	__le64 bl_limit;
+	__le64 edr_scale;
+	u8 unk_386[0xb];
 #else
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
@@ -88,8 +96,14 @@ struct DCP_FW_NAME(dcp_swap) {
 	u8  bl_power; // constant 0x40 for on
 	u8 unk_2f3[0x2d];
 #endif
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+	u8 unk_391[0x55];
+	__le64 edr_headroom;
+	u8 unk_3ee[0xe2];
+#elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unk_320[0x13f];
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 #if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	u8 unk_14_7_2[0x30];
 #endif
@@ -192,11 +206,10 @@ struct DCP_FW_NAME(dcp_swap_submit_resp) {
 } __packed;
 
 /*
- * A406 swap_start / A473 set_power_state.  H17P shrank both requests: the
- * 0x10-byte struct dcp_iouserclient became a bare u64 handle and the
- * swap_start response no longer echoes it.  swap_start is 0x10 in / 0x8 out,
- * set_power_state 0x10 in.  The desktop 26.x firmware made the same
- * swap_start change; its set_power_state carries four transition flags.
+ * A406 swap_start.  From the 14.7 layout on, the 0x10-byte struct
+ * dcp_iouserclient is a bare u64 handle and the response no longer echoes
+ * it: 0x10 in, 8 out.  H17P made the same change.  The desktop 26.x firmware
+ * names the trailing null byte for the swap ID.
  */
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 struct DCP_FW_NAME(dcp_swap_start_req) {
@@ -205,45 +218,23 @@ struct DCP_FW_NAME(dcp_swap_start_req) {
 	u8 swap_id_null;
 	u8 padding[3];
 } __packed;
-
-struct DCP_FW_NAME(dcp_swap_start_resp) {
-	u32 swap_id;
-	u32 ret;
-} __packed;
-
-struct DCP_FW_NAME(dcp_set_power_state_req) {
-	u64 unklong;			/* the power state */
-	u8 flags[4];			/* independent transition flags */
-	u8 result_null;
-	u8 padding[3];
-} __packed;
-
-static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_req)) == 0x10);
-static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_resp)) == 0x8);
-static_assert(sizeof(struct DCP_FW_NAME(dcp_set_power_state_req)) == 0x10);
-#elif DCP_FW_H17(DCP_FW_VER)
+#elif DCP_FW_H17(DCP_FW_VER) || DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 struct DCP_FW_NAME(dcp_swap_start_req) {
 	u32 swap_id;
 	u64 client;			/* IOUserClient kernel VA */
 	u8 client_null;
 	u8 padding[3];
 } __packed;
+#endif
 
+#if DCP_FW_H17(DCP_FW_VER) || DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 struct DCP_FW_NAME(dcp_swap_start_resp) {
 	u32 swap_id;
 	u32 ret;
 } __packed;
 
-struct DCP_FW_NAME(dcp_set_power_state_req) {
-	u64 unklong;
-	u32 unkint;			/* widened from u8 on H17P */
-	u8 unkint_null;
-	u8 padding[3];
-} __packed;
-
 static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_req)) == 0x10);
 static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_resp)) == 0x8);
-static_assert(sizeof(struct DCP_FW_NAME(dcp_set_power_state_req)) == 0x10);
 #else
 struct DCP_FW_NAME(dcp_swap_start_req) {
 	u32 swap_id;
@@ -258,7 +249,32 @@ struct DCP_FW_NAME(dcp_swap_start_resp) {
 	struct dcp_iouserclient client;
 	u32 ret;
 } __packed;
+#endif
 
+/*
+ * A473 set_power_state.  H17P widened the request to 0x10 bytes; the desktop
+ * 26.x firmware carries four transition flags in it.  The 14.7 layout keeps
+ * the earlier request.
+ */
+#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+struct DCP_FW_NAME(dcp_set_power_state_req) {
+	u64 unklong;			/* the power state */
+	u8 flags[4];			/* independent transition flags */
+	u8 result_null;
+	u8 padding[3];
+} __packed;
+
+static_assert(sizeof(struct DCP_FW_NAME(dcp_set_power_state_req)) == 0x10);
+#elif DCP_FW_H17(DCP_FW_VER)
+struct DCP_FW_NAME(dcp_set_power_state_req) {
+	u64 unklong;
+	u32 unkint;			/* widened from u8 on H17P */
+	u8 unkint_null;
+	u8 padding[3];
+} __packed;
+
+static_assert(sizeof(struct DCP_FW_NAME(dcp_set_power_state_req)) == 0x10);
+#else
 struct DCP_FW_NAME(dcp_set_power_state_req) {
 	u64 unklong;
 	u8 unkbool;

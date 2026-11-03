@@ -158,11 +158,12 @@ pub(crate) fn build(
             continue;
         }
         let offset = entry.pa & (wire::PAGE - 1);
-        let at = objects.reserve_io((offset + entry.length as u64).next_multiple_of(wire::PAGE))?;
+        let at =
+            objects.reserve_io((offset + u64::from(entry.length)).next_multiple_of(wire::PAGE))?;
         input.loader_va[slot] = at + offset;
         for bank in 0..if slot == 3 { 2 } else { 1 } {
-            let (pa, size, delta) = wire::loader_span(slot, bank).map_err(|_| EINVAL)?;
-            objects.map_mmio_class(at + delta as u64, pa, size as u64, entry.attrs)?;
+            let (pa, size, delta) = wire::loader_span(slot, bank).map_err(|()| EINVAL)?;
+            objects.map_mmio_class(at + u64::from(delta), pa, u64::from(size), entry.attrs)?;
         }
     }
     input.scratch = objects.reserve_io(0x8000)?;
@@ -183,7 +184,7 @@ pub(crate) fn build(
         }
         let array: &mut [&mut [u8]; wire::OBJECT_COUNT] =
             (&mut slices[..]).try_into().map_err(|_| EINVAL)?;
-        wire::encode(array, &input, 9).map_err(|_| EINVAL)?;
+        wire::encode(array, &input, 9).map_err(|()| EINVAL)?;
     }
     let mut loader = [0u8; wire::LOADER_BYTES];
     loader.copy_from_slice(&images[id::MAIN][0x640..0x640 + wire::LOADER_BYTES]);

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <linux/err.h>
+#include <linux/int_log.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/string.h>
@@ -88,26 +89,14 @@ static s64 dcp_metadata_side(const u32 *a, const u32 *b, const u32 *point)
 	       ((s64)b[1] - a[1]) * ((s64)point[0] - a[0]);
 }
 
-/* Build only a base block: the authoritative firmware mode list stays separate. */
-static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metadata *metadata,
-			      const struct drm_display_mode *mode)
+/* Validate the complete colour description before changing any EDID bytes. */
+static int dcp_metadata_color(struct edid *edid, const struct dcp_display_metadata *metadata)
 {
-	u32 coordinate[8], manufacturer = 0, gamma;
-	u8 checksum = 0;
-	int ret;
+	u32 coordinate[8], gamma;
 
-	if (!metadata->width_cm || metadata->width_cm > 255 ||
-	    !metadata->height_cm || metadata->height_cm > 255 ||
-	    metadata->product > U16_MAX || metadata->week > 53 ||
-	    metadata->year < 1990 || metadata->year > 2245 ||
-	    metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100 ||
-	    strnlen(metadata->manufacturer, 4) != 3)
+	if (metadata->gamma &&
+	    (metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100))
 		return -EINVAL;
-	for (unsigned int i = 0; i < 3; i++) {
-		if (metadata->manufacturer[i] < 'A' || metadata->manufacturer[i] > 'Z')
-			return -EINVAL;
-		manufacturer = manufacturer << 5 | (metadata->manufacturer[i] - '@');
-	}
 	for (unsigned int i = 0; i < 8; i++) {
 		u32 value = i < 6 ? metadata->chromaticity[i / 2][i % 2] : metadata->white[i - 6];
 
@@ -116,7 +105,7 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 		coordinate[i] = DIV_ROUND_CLOSEST(value, 64);
 		if (!coordinate[i] || coordinate[i] > 1023)
 			return -EINVAL;
-		if ((i & 1) && coordinate[i - 1] + coordinate[i] > 1024)
+		if (i == 7 && coordinate[6] + coordinate[7] > 1024)
 			return -EINVAL;
 	}
 	/* Degenerate primaries or a white point outside their triangle are not usable. */
@@ -133,9 +122,47 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 				return -EINVAL;
 		}
 	}
-	gamma = DIV_ROUND_CLOSEST(metadata->gamma * 100, 65536) - 100;
-	if (gamma > 254)
+	gamma = metadata->gamma ?
+		DIV_ROUND_CLOSEST(metadata->gamma * 100, 65536) - 100 : 255;
+	if (metadata->gamma && gamma > 254)
 		return -EINVAL;
+
+	edid->gamma = gamma;
+	edid->red_green_lo = (coordinate[0] & 3) << 6 | (coordinate[1] & 3) << 4 |
+			     (coordinate[2] & 3) << 2 | (coordinate[3] & 3);
+	edid->blue_white_lo = (coordinate[4] & 3) << 6 | (coordinate[5] & 3) << 4 |
+			      (coordinate[6] & 3) << 2 | (coordinate[7] & 3);
+	edid->red_x = coordinate[0] >> 2;
+	edid->red_y = coordinate[1] >> 2;
+	edid->green_x = coordinate[2] >> 2;
+	edid->green_y = coordinate[3] >> 2;
+	edid->blue_x = coordinate[4] >> 2;
+	edid->blue_y = coordinate[5] >> 2;
+	edid->white_x = coordinate[6] >> 2;
+	edid->white_y = coordinate[7] >> 2;
+	return 0;
+}
+
+/* Build only a base block: the authoritative firmware mode list stays separate. */
+static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metadata *metadata,
+			      const struct drm_display_mode *mode)
+{
+	u32 manufacturer = 0;
+	u8 checksum = 0;
+	int ret;
+
+	if (!metadata->width_cm || metadata->width_cm > 255 ||
+	    !metadata->height_cm || metadata->height_cm > 255 ||
+	    metadata->product > U16_MAX || metadata->week > 53 ||
+	    metadata->year < 1990 || metadata->year > 2245 ||
+	    metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100 ||
+	    strnlen(metadata->manufacturer, 4) != 3)
+		return -EINVAL;
+	for (unsigned int i = 0; i < 3; i++) {
+		if (metadata->manufacturer[i] < 'A' || metadata->manufacturer[i] > 'Z')
+			return -EINVAL;
+		manufacturer = manufacturer << 5 | (metadata->manufacturer[i] - '@');
+	}
 
 	memset(edid, 0, sizeof(*edid));
 	memcpy(edid->header, "\x00\xff\xff\xff\xff\xff\xff\x00", 8);
@@ -150,20 +177,10 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 	edid->input = DRM_EDID_INPUT_DIGITAL;
 	edid->width_cm = metadata->width_cm;
 	edid->height_cm = metadata->height_cm;
-	edid->gamma = gamma;
+	ret = dcp_metadata_color(edid, metadata);
+	if (ret)
+		return ret;
 	edid->features = DRM_EDID_FEATURE_PREFERRED_TIMING | DRM_EDID_FEATURE_RGB;
-	edid->red_green_lo = (coordinate[0] & 3) << 6 | (coordinate[1] & 3) << 4 |
-			     (coordinate[2] & 3) << 2 | (coordinate[3] & 3);
-	edid->blue_white_lo = (coordinate[4] & 3) << 6 | (coordinate[5] & 3) << 4 |
-			      (coordinate[6] & 3) << 2 | (coordinate[7] & 3);
-	edid->red_x = coordinate[0] >> 2;
-	edid->red_y = coordinate[1] >> 2;
-	edid->green_x = coordinate[2] >> 2;
-	edid->green_y = coordinate[3] >> 2;
-	edid->blue_x = coordinate[4] >> 2;
-	edid->blue_y = coordinate[5] >> 2;
-	edid->white_x = coordinate[6] >> 2;
-	edid->white_y = coordinate[7] >> 2;
 	memset(edid->standard_timings, 1, sizeof(edid->standard_timings));
 	ret = dcp_metadata_timing(&edid->detailed_timings[0], mode, metadata);
 	if (!ret)
@@ -186,16 +203,77 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 	return 0;
 }
 
-const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
-					 const struct drm_display_mode *mode)
+/* CTA-861.3 luminance code value: 50 * 2^(cv / 32) cd/m2. */
+static u8 dcp_metadata_luminance_code(u32 luminance)
 {
-	struct edid block;
-	const struct drm_edid *edid;
-	int ret = dcp_metadata_block(&block, metadata, mode);
+	s64 log;
 
-	if (ret)
-		return ERR_PTR(ret);
-	edid = drm_edid_alloc(&block, sizeof(block));
+	if (luminance <= 50U << 16)
+		return 0;
+	log = (s64)intlog2(luminance) - intlog2(50U << 16);
+	return min(DIV_ROUND_CLOSEST_ULL(32 * log, 1U << 24), 255ULL);
+}
+
+/*
+ * A CTA-861 extension carrying what an HDR compositor looks for: the
+ * colorimetry and HDR static metadata data blocks.  It describes only what
+ * the driver can output, an SDR or a PQ BT.2020 signal, and the sink's
+ * own luminance range.
+ */
+static void dcp_metadata_cta(u8 *cta, const struct dcp_display_metadata *metadata)
+{
+	u8 *db = cta + 4, checksum = 0;
+
+	memset(cta, 0, EDID_LENGTH);
+	cta[0] = 0x02;		/* CTA extension tag */
+	cta[1] = 0x03;		/* revision 3 */
+	if (metadata->bt2020_rgb) {
+		*db++ = 7 << 5 | 3;	/* extended tag, three bytes */
+		*db++ = 0x05;		/* colorimetry data block */
+		*db++ = 0x80;		/* BT.2020 RGB */
+		*db++ = 0;
+	}
+	*db++ = 7 << 5 | (metadata->max_luminance ? 6 : 3);
+	*db++ = 0x06;			/* HDR static metadata data block */
+	*db++ = 0x05;		/* traditional SDR and SMPTE ST 2084 */
+	*db++ = metadata->static_metadata_type1;	/* static metadata type 1 */
+	if (metadata->max_luminance) {
+		unsigned long square, code;
+
+		*db++ = dcp_metadata_luminance_code(metadata->max_luminance);
+		*db++ = dcp_metadata_luminance_code(metadata->max_fall);
+		/* min = max * (cv / 255)^2 / 100, cv rounded to the nearest */
+		square = div_u64((u64)metadata->min_luminance * 100 * 255 * 255,
+				 metadata->max_luminance);
+		code = int_sqrt(square);
+		if (square - code * code > code)
+			code++;
+		*db++ = min(code, 255UL);
+	}
+	cta[2] = db - cta;	/* no detailed timings follow */
+	for (unsigned int i = 0; i < EDID_LENGTH - 1; i++)
+		checksum += cta[i];
+	cta[EDID_LENGTH - 1] = -checksum;
+}
+
+/* A base block, followed by the HDR capability when the firmware reports PQ. */
+static const struct drm_edid *dcp_metadata_edid_alloc(const struct edid *base,
+						      const struct dcp_display_metadata *metadata)
+{
+	struct {
+		struct edid base;
+		u8 cta[EDID_LENGTH];
+	} block = { .base = *base };
+	const struct drm_edid *edid;
+	size_t size = sizeof(block.base);
+
+	if (metadata->pq) {
+		block.base.extensions = 1;
+		block.base.checksum -= 1;
+		dcp_metadata_cta(block.cta, metadata);
+		size = sizeof(block);
+	}
+	edid = drm_edid_alloc(&block, size);
 	if (!edid)
 		return ERR_PTR(-ENOMEM);
 	if (!drm_edid_valid(edid)) {
@@ -203,6 +281,17 @@ const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *meta
 		return ERR_PTR(-EINVAL);
 	}
 	return edid;
+}
+
+const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
+					 const struct drm_display_mode *mode)
+{
+	struct edid block;
+	int ret = dcp_metadata_block(&block, metadata, mode);
+
+	if (ret)
+		return ERR_PTR(ret);
+	return dcp_metadata_edid_alloc(&block, metadata);
 }
 
 /*
@@ -252,7 +341,6 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	struct dcp_display_metadata dimensions = *metadata;
 	struct detailed_non_pixel *limits = &block.detailed_timings[3].data.other_data;
 	struct detailed_data_monitor_range *range = &limits->data.range;
-	const struct drm_edid *edid;
 	char serial[14], name[14];
 	u32 min_v = U32_MAX, max_v = 0, min_h = U32_MAX, max_h = 0, clock = 0;
 	u16 manufacturer = 0;
@@ -328,6 +416,8 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	block.white_x = 320 >> 2;
 	block.white_y = 337 >> 2;
 	block.blue_white_lo = (320 & 3) << 2 | (337 & 3);
+	/* Missing or malformed optional colour data leaves the identity usable. */
+	dcp_metadata_color(&block, metadata);
 	block.features = DRM_EDID_FEATURE_PREFERRED_TIMING;
 	memset(block.standard_timings, 1, sizeof(block.standard_timings));
 	snprintf(name, sizeof(name), "%.3s %04x", metadata->manufacturer, metadata->product);
@@ -361,12 +451,5 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	for (unsigned int i = 0; i < sizeof(block) - 1; i++)
 		sum += ((const u8 *)&block)[i];
 	block.checksum = -sum;
-	edid = drm_edid_alloc(&block, sizeof(block));
-	if (!edid)
-		return ERR_PTR(-ENOMEM);
-	if (!drm_edid_valid(edid)) {
-		drm_edid_free(edid);
-		return ERR_PTR(-EINVAL);
-	}
-	return edid;
+	return dcp_metadata_edid_alloc(&block, metadata);
 }

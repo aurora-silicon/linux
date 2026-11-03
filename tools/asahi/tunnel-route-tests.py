@@ -16,6 +16,11 @@ FUNCTIONS = {
     'drivers/gpu/drm/apple/dcp-fabric.c': [
         'dcp_fabric_snapshot_port', 'dcp_typec_tunnel_ctl'],
 }
+# Each must make the fixture fail.
+MUTATIONS = {
+    'clock-ignored': ('& BIT(dpin)))', '& 0))'),
+    'snapshot-ignores-yield': ('port->dp_wanted && !port->typec_yielded;', 'port->dp_wanted;'),
+}
 
 
 def function(source, name):
@@ -45,12 +50,21 @@ def main():
         code = (ROOT / 'tools/asahi/tunnel-route/fixture.c').read_text().replace(
             '/* CORE_HEADER */', header).replace(
             '/* PRODUCTION_FUNCTIONS */', '\n'.join(bodies))
-        source = out / 'production.c'
-        source.write_text(code)
-        binary = out / 'production'
-        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Werror',
-                        str(source), '-o', str(binary)], check=True)
-        run = subprocess.run([str(binary)], capture_output=True, text=True)
+
+        def build(name, text):
+            source = out / (name + '.c')
+            source.write_text(text)
+            binary = out / name
+            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Werror',
+                            str(source), '-o', str(binary)], check=True)
+            return subprocess.run([str(binary)], capture_output=True, text=True)
+
+        for name, (old, new) in MUTATIONS.items():
+            assert code.count(old) == 1, 'stale mutation: ' + name
+            mutant = build(name, code.replace(old, new))
+            assert mutant.returncode, 'mutation survived: ' + name
+            print('PASS negative control:', name)
+        run = build('production', code)
         receipt = {
             'bodies': {name: hashlib.sha256(body.encode()).hexdigest()
                        for name, body in zip(

@@ -121,6 +121,14 @@ struct macaudio_platform_cfg {
 	 */
 	bool fe_cpu_is_platform;
 	/*
+	 * Front-ends (bits by link index) whose CPU DAI only completes the
+	 * fixed DAPM routes and can never carry a stream on this machine.
+	 * Their links are not bound, so the card has no PCM device for them
+	 * that userspace could probe and fail to open. The CPU component
+	 * keeps the other front-ends on their link numbers.
+	 */
+	unsigned int route_only_fes;
+	/*
 	 * The highest headphone volume, a "Jack DAC Playback Volume" value
 	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
 	 */
@@ -862,6 +870,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 		memcpy(link_props, &macaudio_fe_link_props[i], sizeof(struct macaudio_link_props));
 		if (ma->cfg->fe_dai_names[i])
 			link->cpus[0].dai_name = ma->cfg->fe_dai_names[i];
+		if (ma->cfg->route_only_fes & BIT(i))
+			link->ignore = 1;
 		if (ma->cfg->dai_fmt && !link_props->is_sense)
 			link->dai_fmt = ma->cfg->dai_fmt;
 		if (i == 0 && ma->cfg->primary_bclk_ratio)
@@ -1879,8 +1889,18 @@ static int macaudio_slk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	long val = uvalue->value.integer.value[0];
 
-	if (uvalue->value.integer.value[0] != SPEAKER_MAGIC_VALUE)
+	/*
+	 * Reads return the lock state (0 or 1), so a saved mixer state holds
+	 * one of those. Writing it back changes nothing: only the lock owner's
+	 * magic value renews the lease. Accept it as a no-op so that restoring
+	 * a saved state before the daemon has taken the lock is not an error.
+	 */
+	if (val == 0 || val == 1)
+		return 0;
+
+	if (val != SPEAKER_MAGIC_VALUE)
 		return -EINVAL;
 
 	mutex_lock(&ma->volume_lock_mutex);
@@ -2101,12 +2121,14 @@ struct macaudio_platform_cfg macaudio_j493_cfg = {
 };
 
 /*
- * J616s (T6040, MacBook Pro 16" M4 Pro): the AOP firmware runs MCA cluster
- * 0, so the CPU component is the AOP audio driver (front-ends j616-pcm-N,
- * back-end spkr). One serializer carries all six SN012776 amps in a 250-bit
- * frame at 12 MHz: six 32-bit playback slots, twelve 16-bit sense slots. The
- * amps take I2S with an inverted frame clock and a normal bit clock, as on
- * the J713 (T8132: the same amp and frame).
+ * J614s and J616s (T6040, MacBook Pro 14" and 16" M4 Pro): the AOP firmware
+ * runs MCA cluster 0, so the CPU component is the AOP audio driver
+ * (front-ends j616-pcm-N, back-end spkr). One serializer carries all six
+ * SN012776 amps in a 250-bit frame at 12 MHz: six 32-bit playback slots,
+ * twelve 16-bit sense slots. The amps take I2S with an inverted frame clock
+ * and a normal bit clock, as on the J713 (T8132: the same amp and frame).
+ * Apple's device trees for the two boards describe the same amps, slots and
+ * sense layout; only the speakers and their tuning differ.
  */
 struct macaudio_platform_cfg macaudio_j616_cfg = {
 	.enable_speakers = true,
@@ -2120,11 +2142,34 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
 	.secondary_bclk_ratio = 250,
 	.fe_cpu_is_platform = true,
+	/* No headphone codec on this card: the jack is a card of its own. */
+	.route_only_fes = BIT(0),
 };
 
 /*
- * The J616s headphone jack, a card of its own: a CS42L84 on the AOP's
- * "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
+ * J614s: the same amps and frame as the J616s, but its speakers have not
+ * been brought up and have no protection profile. Keep them off entirely
+ * until they get their own bring-up: the speaker link is not bound, so no
+ * stream ever reaches the amps.
+ */
+struct macaudio_platform_cfg macaudio_j614_cfg = {
+	.enable_speakers = false,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(0),
+};
+
+/*
+ * The J614s and J616s headphone jack, a card of its own: a CS42L84 on the
+ * AOP's "jack" back-end, which the firmware runs on MCA cluster 2 as a 64-SCLK
  * frame at 48 kHz (3.072 MHz, the primary front-end's ratio) with a
  * one-SCLK FSYNC pulse, two 32-bit slots and data launched on the rising
  * SCLK edge: DSP_A with an inverted bit clock, as on the J700. A card binds
@@ -2136,6 +2181,7 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
 	.fe_dai_names = { "j616-jack-pcm-0", "j616-jack-pcm-1" },
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
 	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(1),
 	/*
 	 * Above 0 dB the DAC only adds digital gain, which clips a full-scale
 	 * signal. The 6 dB below that are margin: the analog full scale of
@@ -2204,6 +2250,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
+	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	{ .compatible = "apple,j614-macaudio", .data = &macaudio_j614_cfg },
+	/* j614    AID34   cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j614-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j616    AID35   sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j616-macaudio", .data = &macaudio_j616_cfg },
 	/* j616    AID35   cs42l84     -       the jack, a card of its own (AOP-fed) */

@@ -50,7 +50,7 @@ struct apple_dcp_typec_port {
 	struct apple_dcp_typec_route *routes, *owner, *secondary_owner,
 		*preferred_route;
 	struct apple_connector *connector, *secondary_connector;
-	bool dp_wanted, dp_hpd;
+	bool dp_wanted, dp_hpd, typec_yielded;
 };
 static bool t6030;
 static bool of_machine_is_compatible(const char *compatible)
@@ -128,6 +128,25 @@ int main(void)
 			       &chip.mux[1]);
 		}
 	}
-	puts("PASS: DCP snapshot, named/legacy controls, invalid DP IN, stale snapshot");
+	/* T6030 has no display-engine clock for a tunnel on source 1. */
+	struct apple_dcp_typec_route source1 = {
+		.dcp = &dcp,
+		.xbar = &chip.mux[0],
+		.mux_index = 1,
+	};
+	for (unsigned int soc = 0; soc < 2; soc++) {
+		t6030 = soc;
+		for (unsigned int dpin = 0; dpin < 2; dpin++)
+			assert(dcp_typec_tunnel_ctl(&source1, dpin) ==
+			       (soc ? NULL : &chip.mux[1 + dpin]));
+	}
+	/* A display that yielded both pipes to an HDMI display wants none. */
+	for (unsigned int yielded = 0; yielded < 2; yielded++) {
+		port.dp_wanted = true;
+		port.typec_yielded = yielded;
+		dcp_fabric_snapshot_port(&port, true);
+		assert(port.core.wanted == !yielded);
+	}
+	puts("PASS: DCP snapshot, named/legacy controls, invalid DP IN, stale snapshot, yielded port");
 	return 0;
 }

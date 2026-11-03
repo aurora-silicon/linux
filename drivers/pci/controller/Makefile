@@ -67,4 +67,5 @@ obj-$(CONFIG_ARM64) += pci-xgene.o
 endif
 endif
 
-obj-$(CONFIG_PCIE_APPLE_PIODMA_DIAG) += pcie-apple-piodma-diag.o
+obj-$(CONFIG_PCIE_APPLE_T8140_BOOTSTRAP) += pcie-apple-t8140-bootstrap.o
+obj-$(CONFIG_PCIE_APPLE_T8140_BOOTSTRAP_KUNIT_TEST) += pcie-apple-t8140-bootstrap-test.o
