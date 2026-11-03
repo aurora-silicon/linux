@@ -10,8 +10,8 @@ description:
   SIO is a coprocessor on Apple M1 and later chips (and maybe also on earlier
   chips). Its role is to offload SPI, UART and DisplayPort audio transfers,
   being a pretend DMA controller. The SoC-specific compatible selects the
-  firmware protocol and channel configuration. In particular, apple,t6030-sio
-  requires protocol-10 boot tables before the coprocessor can be started.
+  firmware protocol and channel configuration. In particular, apple,t6030-sio and apple,t6041-sio
+  require protocol-10 boot tables before the coprocessor can be started.
 
 maintainers:
   - Martin Povišer <povik+lin@cutebit.org>
@@ -28,7 +28,7 @@ properties:
               - apple,t6030-sio
               - apple,t8103-sio
           - const: apple,sio
-      - description: T6041 firmware requires a generation-specific backend.
+      - description: T6041 uses protocol-10 tables and a 24-byte channel configuration.
         const: apple,t6041-sio
 
   reg:

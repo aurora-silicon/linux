@@ -16,13 +16,13 @@
 struct sio_t6030_layout {
 	u32 params[SIO_TEST_PARAMS];
 	unsigned int nparams;
-	struct sio_t6030_window windows[SIO_T6030_WINDOWS_MAX];
+	struct sio_v10_window windows[SIO_V10_WINDOWS_MAX];
 	unsigned int nwindows;
 };
 
 static void sio_t6030_add(struct sio_t6030_layout *l, u32 key, u32 size)
 {
-	struct sio_t6030_window *last = l->nwindows ? &l->windows[l->nwindows - 1] : NULL;
+	struct sio_v10_window *last = l->nwindows ? &l->windows[l->nwindows - 1] : NULL;
 	u64 iova;
 
 	if (last && ALIGN(last->size, SZ_16K) >= last->size + size) {
@@ -59,7 +59,7 @@ static void sio_t6030_build(struct sio_t6030_layout *l, u32 shims, u32 types)
 
 static int sio_t6030_check(const struct sio_t6030_layout *l)
 {
-	return sio_t6030_check_params(l->params, l->nparams, l->windows, l->nwindows);
+	return sio_v10_check_params(l->params, l->nparams, l->windows, l->nwindows);
 }
 
 static u32 *sio_t6030_value(struct sio_t6030_layout *l, u32 key)
@@ -122,12 +122,12 @@ static void sio_t6030_malformed_test(struct kunit *test)
 	unsigned int i;
 
 	sio_t6030_build(&l, 6 * 36, 9 * 8);
-	KUNIT_EXPECT_EQ(test, sio_t6030_check_params(l.params, 0, l.windows, l.nwindows), -EINVAL);
-	KUNIT_EXPECT_EQ(test, sio_t6030_check_params(l.params, l.nparams - 1, l.windows,
+	KUNIT_EXPECT_EQ(test, sio_v10_check_params(l.params, 0, l.windows, l.nwindows), -EINVAL);
+	KUNIT_EXPECT_EQ(test, sio_v10_check_params(l.params, l.nparams - 1, l.windows,
 						     l.nwindows), -EINVAL);
 	/* Truncated after any pair: the last table's size is always lost */
 	for (i = 2; i < l.nparams; i += 2)
-		KUNIT_EXPECT_EQ_MSG(test, sio_t6030_check_params(l.params, i, l.windows,
+		KUNIT_EXPECT_EQ_MSG(test, sio_v10_check_params(l.params, i, l.windows,
 								 l.nwindows),
 				    -EINVAL, "cut at %u", i);
 	/* A key twice, even with the same value, for a table or any other parameter */
@@ -150,16 +150,16 @@ static void sio_t6030_malformed_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sio_t6030_check(&l), -EINVAL);
 	/* More pairs than the controller takes */
 	{
-		static u32 many[2 * (SIO_T6030_PARAMS_MAX + 1)];
+		static u32 many[2 * (SIO_V10_PARAMS_MAX + 1)];
 
 		sio_t6030_build(&l, 6 * 36, 9 * 8);
 		memset(many, 0, sizeof(many));
 		memcpy(many, l.params, l.nparams * sizeof(u32));
 		for (i = l.nparams; i < ARRAY_SIZE(many); i += 2)
 			many[i] = 0x1000 + i;
-		KUNIT_EXPECT_EQ(test, sio_t6030_check_params(many, ARRAY_SIZE(many), l.windows,
+		KUNIT_EXPECT_EQ(test, sio_v10_check_params(many, ARRAY_SIZE(many), l.windows,
 							     l.nwindows), -EINVAL);
-		KUNIT_EXPECT_EQ(test, sio_t6030_check_params(many, ARRAY_SIZE(many) - 2,
+		KUNIT_EXPECT_EQ(test, sio_v10_check_params(many, ARRAY_SIZE(many) - 2,
 							     l.windows, l.nwindows), 0);
 	}
 }
@@ -212,7 +212,7 @@ static void sio_t6030_spans_test(struct kunit *test)
 	struct sio_t6030_layout l;
 
 	sio_t6030_build(&l, 6 * 36, 9 * 8);
-	KUNIT_EXPECT_EQ(test, sio_t6030_check_params(l.params, l.nparams, l.windows, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, sio_v10_check_params(l.params, l.nparams, l.windows, 0), -EINVAL);
 	/* The shims' page outside every window */
 	*sio_t6030_value(&l, 0x22) = 0x80;
 	KUNIT_EXPECT_EQ(test, sio_t6030_check(&l), -EINVAL);
@@ -273,7 +273,7 @@ static void sio_t6030_device_tree_test(struct kunit *test)
 		int ret;
 
 		KUNIT_ASSERT_NOT_NULL_MSG(test, np, "%s", nodes[i][0]);
-		ret = sio_t6030_check_node(np);
+		ret = sio_v10_check_node(np);
 		if (!strcmp(nodes[i][1], "admitted"))
 			KUNIT_EXPECT_EQ_MSG(test, ret, 0, "%s", nodes[i][0]);
 		else

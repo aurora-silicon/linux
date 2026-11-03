@@ -21,6 +21,10 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	aliases {
+		sio = &sio;
+	};
+
 	cpuidle: cpuidle {
 		compatible = "apple,t6041-cpuidle";
 		status = "disabled";
