@@ -209,6 +209,16 @@ impl Lockout {
     }
 }
 
+pub(crate) const REARM_SECRET_MAX: usize = 1024;
+
+/// A password which userspace has already verified for the requesting user.
+#[repr(C)]
+pub(crate) struct Rearm {
+    pub(crate) secret_len: u32,
+    pub(crate) reserved: u32,
+    pub(crate) secret: [u8; REARM_SECRET_MAX],
+}
+
 // Sizes are baked into the ioctl numbers.
 static_assert!(core::mem::size_of::<Identity>() == 144);
 static_assert!(core::mem::size_of::<Info>() == 32);
@@ -221,6 +231,7 @@ static_assert!(core::mem::size_of::<VerifyPoll>() == 72);
 static_assert!(core::mem::size_of::<Delete>() == 16);
 static_assert!(core::mem::size_of::<Attest>() == 176);
 static_assert!(core::mem::size_of::<Lockout>() == 16);
+static_assert!(core::mem::size_of::<Rearm>() == 1032);
 
 macro_rules! ioctl_pod {
     (to_user: $($t:ty),*; from_user: $($u:ty),*) => {
@@ -236,7 +247,7 @@ macro_rules! ioctl_pod {
 }
 ioctl_pod! {
     to_user: Info, List, EnclaveList, EnrolPoll, VerifyPoll, Attest, Lockout;
-    from_user: EnrolStart, VerifyStart, Delete, Attest
+    from_user: EnrolStart, VerifyStart, Delete, Attest, Rearm
 }
 
 const MAGIC: u32 = 0xB1;
@@ -256,7 +267,7 @@ pub(crate) const IOC_DELETE_ORPHAN: u32 = _IOW::<Delete>(MAGIC, 0x0c);
 pub(crate) const IOC_PREPARE_ENROL: u32 = _IOW::<EnrolStart>(MAGIC, 0x0d);
 // On /dev/sep-bio-rearm only.
 pub(crate) const IOC_LOCKOUT_STATE: u32 = _IOR::<Lockout>(MAGIC, 0x0e);
-pub(crate) const IOC_REARM: u32 = _IO(MAGIC, 0x0f);
+pub(crate) const IOC_REARM: u32 = _IOW::<Rearm>(MAGIC, 0x0f);
 
 pub(crate) struct MatchEvidence {
     identity: [u8; UUID_LEN],

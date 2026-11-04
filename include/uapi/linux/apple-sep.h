@@ -166,9 +166,17 @@ struct sep_bio_lockout {
 #define SEP_BIO_LOCKOUT_STATE _IOR(SEP_BIO_IOC_MAGIC, 0x0e, struct sep_bio_lockout)
 /*
  * Ends a lockout. Call it only once the user's password has been verified:
- * it shows the enclave the stored keybag secret, as macOS does with the
- * passcode. Needs CAP_SYS_ADMIN. Without a lockout it does nothing.
+ * the password is used once to unwrap the Linux-owned FV re-arm record and is
+ * wiped after the request. Needs CAP_SYS_ADMIN. Without a lockout it does
+ * nothing.
  */
-#define SEP_BIO_REARM         _IO(SEP_BIO_IOC_MAGIC, 0x0f)
+#define SEP_BIO_REARM_SECRET_MAX 1024
+struct sep_bio_rearm {
+	__u32 secret_len;
+	__u32 reserved;
+	__u8  secret[SEP_BIO_REARM_SECRET_MAX];
+};
+
+#define SEP_BIO_REARM _IOW(SEP_BIO_IOC_MAGIC, 0x0f, struct sep_bio_rearm)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_H */

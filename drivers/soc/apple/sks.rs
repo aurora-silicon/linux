@@ -1230,8 +1230,14 @@ pub(crate) const SKS_NEW_PFK_NAME: &CStr = c"NEW_PFK";
 const OP_SKS_UNWRAP_MEDIA_KEY: u8 = 0x32;
 pub(crate) const SKS_UNWRAP_MEDIA_KEY_NAME: &CStr = c"UNWRAP_MEDIA_KEY";
 
+const OP_SKS_NEW_VEK: u8 = 0x40;
+pub(crate) const SKS_NEW_VEK_NAME: &CStr = c"FV_NEW_VEK";
+
 const OP_SKS_UNWRAP_VEK: u8 = 0x41;
 pub(crate) const SKS_UNWRAP_VEK_NAME: &CStr = c"FV_UNWRAP_VEK";
+
+const OP_SKS_NEW_KEK: u8 = 0x42;
+pub(crate) const SKS_NEW_KEK_NAME: &CStr = c"FV_NEW_KEK";
 
 const OP_SKS_SET_PROTECTION: u8 = 0x47;
 pub(crate) const SKS_SET_PROTECTION_NAME: &CStr = c"FV_SET_PROTECTION";
@@ -1255,6 +1261,14 @@ pub(crate) fn encode_sks_unwrap_media_key(seq: Sequence, len: ImageLen) -> Optio
 pub(crate) fn encode_sks_unwrap_vek(seq: Sequence, len: ImageLen) -> Option<Message> {
     let msg = encode_sks_raw(OP_SKS_UNWRAP_VEK, seq.value(), len.value());
     Some(msg)
+}
+
+pub(crate) fn encode_sks_new_vek(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_NEW_VEK, seq.value(), len.value())
+}
+
+pub(crate) fn encode_sks_new_kek(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_NEW_KEK, seq.value(), len.value())
 }
 
 pub(crate) fn encode_sks_unwrap_pfk(seq: Sequence, len: ImageLen) -> Message {

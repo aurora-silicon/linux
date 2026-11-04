@@ -3752,7 +3752,22 @@ impl SepData {
             }
             bio::IOC_REARM => {
                 bio::require_admin()?;
-                self.rearm_after_password()
+                let mut request: bio::Rearm = kernel::uaccess::UserSlice::new(
+                    kernel::uaccess::UserPtr::from_addr(arg),
+                    core::mem::size_of::<bio::Rearm>(),
+                )
+                .reader()
+                .read()?;
+                let len = request.secret_len as usize;
+                if request.reserved != 0 || len == 0 || len > request.secret.len() {
+                    image::wipe(&mut request.secret);
+                    return Err(EINVAL);
+                }
+                let mut bytes = KVec::new();
+                let copied = bytes.extend_from_slice(&request.secret[..len], GFP_KERNEL);
+                image::wipe(&mut request.secret);
+                copied?;
+                self.rearm_after_password(crate::Secret(bytes))
             }
             _ => Err(ENOTTY),
         }
@@ -3761,10 +3776,10 @@ impl SepData {
     /// Userspace calls this only after the user's password was verified. The
     /// node is root's alone and its SELinux label confines it to the re-arm
     /// helper. As on macOS, where unlocking the user's key bag with the
-    /// passcode ends the lockout, the designated bag is unlocked with the
-    /// stored secret, a new SCRD match context is set up, and the enclave's
-    /// lockout record is saved.
-    fn rearm_after_password(&self) -> Result<()> {
+    /// passcode ends the lockout, the Linux FV records are unwrapped with the
+    /// verified password, a new SCRD match context is set up, and the
+    /// enclave's lockout record is saved.
+    fn rearm_after_password(&self, password: crate::Secret) -> Result<()> {
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
             // a lockout from before the restart is left to clear.
@@ -3792,14 +3807,19 @@ impl SepData {
             if !self.capture_begin() {
                 continue;
             }
-            // The order macOS follows after the passcode: the bag unlock ends
-            // the enclave's lockout, a new match credential follows, and the
-            // enclave's lockout record is saved again.
-            let unlocked = self.unlock_special_bag();
-            let established = unlocked && self.establish_scrd_match_context(user);
+            // A successful password unwrap of the Linux-owned FV records is
+            // the authorization event. It must precede the designated-bag
+            // credential refresh; a bag unlock is not a substitute for it.
+            let unwrapped = match keybag::read(keybag::Slot::Identity) {
+                Ok(keybag::State::Present(stored)) => {
+                    self.rearm_touchid_fv(&password, stored.secret()).is_ok()
+                }
+                _ => false,
+            };
+            let established = unwrapped && self.establish_scrd_match_context(user);
             let saved = established && self.save_lockout();
-            if !unlocked {
-                dev_err!(self.dev, "Touch ID: re-arm: the key bag did not unlock with the stored secret\n");
+            if !unwrapped {
+                dev_err!(self.dev, "Touch ID: re-arm: the password did not unwrap the Linux FV record pair\n");
             } else if established && !saved {
                 dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
             }
@@ -3814,7 +3834,7 @@ impl SepData {
         if !rearmed {
             dev_err!(
                 self.dev,
-                "Touch ID: re-arming after a password authentication failed; the match credential did not set up again, and Touch ID stays locked\n"
+                "Touch ID: re-arming after a password authentication failed; the FV unwrap or match credential failed, and Touch ID stays locked\n"
             );
             return Err(EIO);
         }
