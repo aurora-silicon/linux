@@ -24,9 +24,13 @@
 
 #include <linux/module.h>
 #include <linux/atomic.h>
+#include <linux/capability.h>
 #include <linux/gpio/consumer.h>
+#include <linux/hrtimer.h>
+#include <linux/kthread.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <sound/core.h>
@@ -36,6 +40,7 @@
 #include <sound/soc.h>
 #include <sound/soc-jack.h>
 #include <uapi/linux/input-event-codes.h>
+#include <uapi/linux/sched/types.h>
 
 #define DRIVER_NAME "snd-soc-macaudio"
 
@@ -64,6 +69,13 @@
 /* The speaker protection lease an owner may ask for, in milliseconds */
 #define SPEAKER_LEASE_MIN_MS	10
 #define SPEAKER_LEASE_MAX_MS	100
+/*
+ * The withdrawal's workers run SCHED_FIFO above the audio server's data
+ * threads (PipeWire's default is 88) and the protection supervisor: a
+ * spinning real-time thread on one CPU cannot hold them off, as they wake
+ * on another.
+ */
+#define SPEAKER_WORKER_PRIO	90
 #define MACAUDIO_MAX_SPEAKER_ID_GPIOS 8
 
 enum macaudio_amp_type {
@@ -195,8 +207,14 @@ struct macaudio_snd_data {
 	struct mutex spk_mutex;
 	struct snd_kcontrol *spk_kctl;
 	struct snd_ctl_file *spk_owner;
-	/* Read without spk_mutex by the speaker back-end's trigger */
+	/*
+	 * Speaker playback may start (macaudio_spk_admitted()). Set under
+	 * spk_mutex; cleared under it or by the lease timer, in hard IRQ
+	 * context, at the lease's end. Read without spk_mutex.
+	 */
 	bool spk_granted;
+	/* The amps are at the operating gain (spk_mutex) */
+	bool spk_active;
 	/* A safe level that did not take: speaker playback refused until reload */
 	bool spk_floor_failed;
 	/* The lease ran out: the owner's next write is refused with -ETIMEDOUT */
@@ -205,9 +223,15 @@ struct macaudio_snd_data {
 	bool pm_quiesced;
 	/* The card is being removed: no grant, no amp access */
 	bool spk_dead;
+	/* Written under spk_mutex, read without it */
 	ktime_t spk_lease_end;
-	struct delayed_work spk_lease_work;
-	struct work_struct spk_stop_work;
+	struct hrtimer spk_lease_timer;
+	/* The floor after a lease ran out; takes spk_mutex */
+	struct kthread_worker *spk_worker;
+	struct kthread_work spk_expire_work;
+	/* Stops the speaker streams; never takes spk_mutex (see macaudio_spk_grant()) */
+	struct kthread_worker *spk_stop_worker;
+	struct kthread_work spk_stop_work;
 	struct notifier_block pm_nb;
 	/* The speaker volume controls, the driver's alone */
 	struct snd_kcontrol **spk_vols;
@@ -315,16 +339,22 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
  * holds from the card's registration on.
  *
  * The owner is the control file that holds SNDRV_CTL_IOCTL_ELEM_LOCK on
- * "Speaker Protection". Writing a lease length in milliseconds
+ * "Speaker Protection", taken by a CAP_SYS_ADMIN process: the speakers are
+ * not a seat user's to own. Writing a lease length in milliseconds
  * (SPEAKER_LEASE_MIN_MS to SPEAKER_LEASE_MAX_MS) to it grants protection
  * for that long: the amps go to their fixed operating gain and speaker
  * playback may start. The owner renews it by writing again before it runs
- * out. Writing 0, unlocking the control or closing the file ends it at once.
- * A lease that runs out stops speaker playback and puts the amps at the safe
- * level; the owner's next write then fails with -ETIMEDOUT and grants
- * nothing, so an owner that stalled learns of it before it plays again.
- * Reads return 1 while protection is granted, 0 otherwise, and every change
- * is notified.
+ * out; every write needs CAP_SYS_ADMIN too. Writing 0, unlocking the control
+ * or closing the file ends it at once.
+ *
+ * A lease that runs out closes the start gate at its end, from a hard
+ * hrtimer that no thread can delay, and every start checks the lease's end
+ * itself as well. Two SCHED_FIFO workers then stop speaker playback and put
+ * the amps at the safe level. The owner's next write fails with -ETIMEDOUT
+ * and grants nothing, so an owner that stalled learns of it before it plays
+ * again; so does an owner that was frozen across a system sleep. Reads
+ * return 1 while protection is granted, 0 otherwise, and every change is
+ * notified.
  *
  * The speaker volume controls belong to the driver: userspace can read them
  * but never write them. While protection is granted they hold the amps at a
@@ -435,12 +465,28 @@ static void macaudio_stop_speaker_playback(struct macaudio_snd_data *ma)
 	}
 }
 
-static void macaudio_spk_floor_work(struct work_struct *work)
+static void macaudio_spk_stop_work(struct kthread_work *work)
 {
 	struct macaudio_snd_data *ma = container_of(work, struct macaudio_snd_data,
 						  spk_stop_work);
 
 	macaudio_stop_speaker_playback(ma);
+}
+
+/*
+ * Speaker playback may start: protection is granted and its lease has not
+ * run out. Every start checks this (the front-end's and the back-end's
+ * trigger), so a lease that ends refuses the next start at once, whether or
+ * not the lease timer has run.
+ *
+ * Context: any, the stream lock held.
+ */
+static bool macaudio_spk_admitted(struct macaudio_snd_data *ma)
+{
+	/* Pairs with the release in macaudio_spk_grant(): the lease end is set */
+	if (!smp_load_acquire(&ma->spk_granted) || READ_ONCE(ma->spk_floor_failed))
+		return false;
+	return ktime_before(ktime_get(), READ_ONCE(ma->spk_lease_end));
 }
 
 /*
@@ -453,16 +499,18 @@ static void macaudio_spk_floor_work(struct work_struct *work)
  */
 static void macaudio_spk_floor(struct macaudio_snd_data *ma, const char *reason)
 {
-	bool was = ma->spk_granted;
+	bool was = ma->spk_active;
 
 	lockdep_assert_held(&ma->spk_mutex);
 
 	WRITE_ONCE(ma->spk_granted, false);
+	ma->spk_active = false;
 	if (ma->spk_dead)
 		return;
-	cancel_delayed_work(&ma->spk_lease_work);
+	/* The callback never takes spk_mutex */
+	hrtimer_cancel(&ma->spk_lease_timer);
 	/* A trigger refuses the start from here on; stop what already runs. */
-	queue_work(system_highpri_wq, &ma->spk_stop_work);
+	kthread_queue_work(ma->spk_stop_worker, &ma->spk_stop_work);
 
 	if (macaudio_spk_set_gain(ma, false) < 0) {
 		WRITE_ONCE(ma->spk_floor_failed, true);
@@ -477,8 +525,12 @@ static void macaudio_spk_floor(struct macaudio_snd_data *ma, const char *reason)
 	}
 }
 
-/* Context: spk_mutex held, an owner present and protection not granted. */
-static int macaudio_spk_grant(struct macaudio_snd_data *ma)
+/*
+ * Grant protection for @ms from now.
+ *
+ * Context: spk_mutex held, an owner present and protection not granted.
+ */
+static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 {
 	int ret;
 
@@ -487,48 +539,139 @@ static int macaudio_spk_grant(struct macaudio_snd_data *ma)
 	if (READ_ONCE(ma->spk_floor_failed))
 		return -EIO;
 
+	/*
+	 * A withdrawal queued the stop of every speaker stream: it must have
+	 * run before the amps go back to the operating gain, or a stream it
+	 * was meant to stop would play on. The stop worker runs nothing that
+	 * takes spk_mutex or the card's controls_rwsem, so it cannot wait for
+	 * this caller.
+	 */
+	kthread_flush_work(&ma->spk_stop_work);
+
 	ret = macaudio_spk_set_gain(ma, true);
 	if (ret < 0) {
 		macaudio_spk_floor(ma, "operating gain not set");
 		return ret;
 	}
 
-	WRITE_ONCE(ma->spk_granted, true);
+	ma->spk_active = true;
+	WRITE_ONCE(ma->spk_lease_end, ktime_add_ms(ktime_get(), ms));
+	/* Pairs with the acquire in macaudio_spk_admitted() */
+	smp_store_release(&ma->spk_granted, true);
+	hrtimer_start(&ma->spk_lease_timer, ms_to_ktime(ms), HRTIMER_MODE_REL_HARD);
 	dev_info(ma->card.dev, "Speaker protection granted\n");
 	if (ma->spk_kctl)
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &ma->spk_kctl->id);
 	return 0;
 }
 
-static void macaudio_spk_lease_work(struct work_struct *wrk)
+/*
+ * The lease's end, in hard IRQ context: no thread, however it is scheduled,
+ * can hold off the closing of the start gate. The stop and the safe level
+ * follow from the workers.
+ */
+static enum hrtimer_restart macaudio_spk_lease_timer(struct hrtimer *timer)
 {
-	struct macaudio_snd_data *ma = container_of(to_delayed_work(wrk),
-						    struct macaudio_snd_data, spk_lease_work);
-	ktime_t now;
+	struct macaudio_snd_data *ma = container_of(timer, struct macaudio_snd_data,
+						    spk_lease_timer);
+	ktime_t end = READ_ONCE(ma->spk_lease_end);
+
+	/* Renewed while the timer was already firing */
+	if (ktime_before(ktime_get(), end)) {
+		hrtimer_set_expires(timer, end);
+		return HRTIMER_RESTART;
+	}
+	if (!READ_ONCE(ma->spk_granted))
+		return HRTIMER_NORESTART;
+
+	WRITE_ONCE(ma->spk_granted, false);
+	kthread_queue_work(ma->spk_stop_worker, &ma->spk_stop_work);
+	kthread_queue_work(ma->spk_worker, &ma->spk_expire_work);
+	return HRTIMER_NORESTART;
+}
+
+static void macaudio_spk_expire_work(struct kthread_work *work)
+{
+	struct macaudio_snd_data *ma = container_of(work, struct macaudio_snd_data,
+						    spk_expire_work);
 
 	mutex_lock(&ma->spk_mutex);
-	if (!ma->spk_granted)
-		goto out;
-
-	/* Renewed while this work was already running */
-	now = ktime_get();
-	if (ktime_before(now, ma->spk_lease_end)) {
-		mod_delayed_work(system_highpri_wq, &ma->spk_lease_work,
-				 usecs_to_jiffies(ktime_us_delta(ma->spk_lease_end, now)));
-		goto out;
+	/*
+	 * Only the timer clears the gate with the amps still at the operating
+	 * gain; a release, a new owner or the owner's own late write may
+	 * have dealt with it since.
+	 */
+	if (ma->spk_active && !READ_ONCE(ma->spk_granted)) {
+		ma->spk_lapsed = true;
+		macaudio_spk_floor(ma, "lease expired");
 	}
-
-	ma->spk_lapsed = true;
-	macaudio_spk_floor(ma, "lease expired");
-out:
 	mutex_unlock(&ma->spk_mutex);
+}
+
+static struct kthread_worker *macaudio_spk_worker(const char *what)
+{
+	struct sched_attr attr = {
+		.size = sizeof(attr),
+		.sched_policy = SCHED_FIFO,
+		.sched_priority = SPEAKER_WORKER_PRIO,
+	};
+	struct kthread_worker *worker;
+	int ret;
+
+	worker = kthread_run_worker(0, "macaudio-%s", what);
+	if (IS_ERR(worker))
+		return worker;
+	ret = sched_setattr_nocheck(worker->task, &attr);
+	if (ret) {
+		kthread_destroy_worker(worker);
+		return ERR_PTR(ret);
+	}
+	return worker;
+}
+
+static void macaudio_spk_fini(void *data)
+{
+	struct macaudio_snd_data *ma = data;
+
+	hrtimer_cancel(&ma->spk_lease_timer);
+	/* The expiry may queue a stop: its worker goes first */
+	if (!IS_ERR_OR_NULL(ma->spk_worker))
+		kthread_destroy_worker(ma->spk_worker);
+	if (!IS_ERR_OR_NULL(ma->spk_stop_worker))
+		kthread_destroy_worker(ma->spk_stop_worker);
+	ma->spk_worker = NULL;
+	ma->spk_stop_worker = NULL;
+}
+
+/* The lease timer and the workers, until macaudio_spk_fini() */
+static int macaudio_spk_init(struct macaudio_snd_data *ma)
+{
+	hrtimer_setup(&ma->spk_lease_timer, macaudio_spk_lease_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_HARD);
+	kthread_init_work(&ma->spk_expire_work, macaudio_spk_expire_work);
+	kthread_init_work(&ma->spk_stop_work, macaudio_spk_stop_work);
+
+	ma->spk_worker = macaudio_spk_worker("spk-floor");
+	if (IS_ERR(ma->spk_worker))
+		return PTR_ERR(ma->spk_worker);
+	ma->spk_stop_worker = macaudio_spk_worker("spk-stop");
+	if (IS_ERR(ma->spk_stop_worker)) {
+		int ret = PTR_ERR(ma->spk_stop_worker);
+
+		ma->spk_stop_worker = NULL;
+		macaudio_spk_fini(ma);
+		return ret;
+	}
+	return 0;
 }
 
 /*
  * System sleep: userspace is frozen long before the card suspends, and an
  * owner's lease must not run out under a stream that is still playing.
- * Withdraw protection before the freeze; the owner grants it again after
- * the resume.
+ * Withdraw protection before the freeze. The owner was frozen with the
+ * rest of userspace, so the state of its engine is unknown: its first write
+ * after the resume fails with -ETIMEDOUT, as after any stall, and the one
+ * after it grants.
  */
 static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 			      void *data)
@@ -548,6 +691,8 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 	case PM_POST_RESTORE:
 		mutex_lock(&ma->spk_mutex);
 		ma->pm_quiesced = false;
+		if (ma->spk_owner)
+			ma->spk_lapsed = true;
 		mutex_unlock(&ma->spk_mutex);
 		return NOTIFY_OK;
 	default:
@@ -569,7 +714,7 @@ static int macaudio_spk_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 
-	uvalue->value.integer.value[0] = READ_ONCE(ma->spk_granted) ? 1 : 0;
+	uvalue->value.integer.value[0] = macaudio_spk_admitted(ma) ? 1 : 0;
 	return 0;
 }
 
@@ -582,6 +727,9 @@ static int macaudio_spk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 
 	if (ms != 0 && (ms < SPEAKER_LEASE_MIN_MS || ms > SPEAKER_LEASE_MAX_MS))
 		return -EINVAL;
+	/* The owner's file may have been handed on: each write is checked */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	mutex_lock(&ma->spk_mutex);
 
@@ -597,6 +745,12 @@ static int macaudio_spk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 		goto out;
 	}
 
+	/* Before the stall report, which a resume sets: it must reach the owner */
+	if (ma->pm_quiesced) {
+		ret = -EBUSY;
+		goto out;
+	}
+
 	/* The owner stalled past its lease: tell it once, grant nothing */
 	if (ma->spk_lapsed) {
 		ma->spk_lapsed = false;
@@ -604,17 +758,27 @@ static int macaudio_spk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 		goto out;
 	}
 
-	if (ma->pm_quiesced) {
-		ret = -EBUSY;
+	if (!ma->spk_active) {
+		ret = macaudio_spk_grant(ma, ms);
 		goto out;
 	}
 
-	ma->spk_lease_end = ktime_add_ms(ktime_get(), ms);
-	if (!ma->spk_granted)
-		ret = macaudio_spk_grant(ma);
-	if (!ret)
-		mod_delayed_work(system_highpri_wq, &ma->spk_lease_work,
-				 msecs_to_jiffies(ms));
+	/*
+	 * A renewal. A lease that has already run out is not renewed, whether
+	 * the timer has closed the gate yet or not: the owner stalled.
+	 */
+	if (!macaudio_spk_admitted(ma)) {
+		macaudio_spk_floor(ma, "lease expired");
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+	WRITE_ONCE(ma->spk_lease_end, ktime_add_ms(ktime_get(), ms));
+	hrtimer_start(&ma->spk_lease_timer, ms_to_ktime(ms), HRTIMER_MODE_REL_HARD);
+	/* The old lease ran out between the check and the new end */
+	if (!READ_ONCE(ma->spk_granted)) {
+		macaudio_spk_floor(ma, "lease expired");
+		ret = -ETIMEDOUT;
+	}
 out:
 	mutex_unlock(&ma->spk_mutex);
 	return ret;
@@ -624,6 +788,10 @@ static int macaudio_spk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+
+	/* The protection supervisor, not whoever has the seat's control device */
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	mutex_lock(&ma->spk_mutex);
 	/* A new owner starts without protection and grants it itself */
@@ -1230,8 +1398,40 @@ static int macaudio_be_hw_free(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+static bool macaudio_trigger_starts(int cmd)
+{
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 /*
  * The speakers start only while protection is granted (macaudio_spk_put()).
+ * DPCM triggers a back-end only for the first front-end that starts on it,
+ * so every front-end that drives the speakers is checked as well, before
+ * its DMA and its back-ends (see macaudio_fe_links): one that would join a
+ * speaker back-end left running across a withdrawal is refused too.
+ */
+static int macaudio_fe_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+
+	if (!ma->has_speakers || substream->stream != SNDRV_PCM_STREAM_PLAYBACK ||
+	    !macaudio_trigger_starts(cmd))
+		return 0;
+	if (macaudio_fe_drives_speakers(ma, rtd, substream->stream) &&
+	    !macaudio_spk_admitted(ma))
+		return -EPERM;
+	return 0;
+}
+
+/*
  * The back-end's link trigger runs before its DAIs: a refused start starts
  * nothing. A grant withdrawn after this check stops the stream through
  * macaudio_stop_speaker_playback(), under the same stream lock.
@@ -1249,9 +1449,7 @@ static int macaudio_be_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		if (!READ_ONCE(ma->spk_granted) || READ_ONCE(ma->spk_floor_failed))
-			return -EPERM;
-		return 0;
+		return macaudio_spk_admitted(ma) ? 0 : -EPERM;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -1265,6 +1463,7 @@ static const struct snd_soc_ops macaudio_fe_ops = {
 	.startup	= macaudio_fe_startup,
 	.shutdown	= macaudio_dpcm_shutdown,
 	.hw_params	= macaudio_fe_hw_params,
+	.trigger	= macaudio_fe_trigger,
 };
 
 static const struct snd_soc_ops macaudio_be_ops = {
@@ -1609,20 +1808,34 @@ static int macaudio_card_remove(struct snd_soc_card *card)
 	WRITE_ONCE(ma->spk_granted, false);
 	mutex_unlock(&ma->spk_mutex);
 	/*
-	 * No back-end can trigger any more, but a lock update it queued takes
-	 * the card's controls_rwsem: finish it while the snd_card still exists.
+	 * Nothing queues a withdrawal's work any more but a lease timer that
+	 * is firing: stop it first. The works walk the card's runtimes and
+	 * controls: finish them while those still exist.
 	 */
-	cancel_delayed_work_sync(&ma->spk_lease_work);
-	cancel_work_sync(&ma->spk_stop_work);
+	hrtimer_cancel(&ma->spk_lease_timer);
+	kthread_cancel_work_sync(&ma->spk_expire_work);
+	kthread_cancel_work_sync(&ma->spk_stop_work);
 	return 0;
+}
+
+/* Userspace may read the controls matching @name but never write them. */
+static void macaudio_deny_write(struct snd_soc_card *card, const char *name)
+{
+	struct snd_kcontrol *kctl;
+	unsigned int i;
+
+	list_for_each_entry(kctl, &card->snd_card->controls, list) {
+		if (!snd_soc_control_matches(kctl, name))
+			continue;
+		for (i = 0; i < kctl->count; i++)
+			kctl->vd[i].access &= ~SNDRV_CTL_ELEM_ACCESS_WRITE;
+	}
 }
 
 /* Called during control fixup, before the card is exposed to userspace. */
 static int macaudio_set_fixed_enum(struct snd_soc_card *card, const char *name,
 				   const char *value)
 {
-	struct snd_kcontrol *kctl;
-	unsigned int i;
 	int ret;
 
 	ret = snd_soc_set_enum_kctl(card, name, value);
@@ -1634,14 +1847,50 @@ static int macaudio_set_fixed_enum(struct snd_soc_card *card, const char *name,
 		return ret;
 
 	/* INACTIVE only hides controls; direct ALSA writes require WRITE. */
+	macaudio_deny_write(card, name);
+	return ret;
+}
+
+/*
+ * Hold the volumes matching @name at @value, their maximum, and take them
+ * away from userspace: a fixed operating point, as the protection engine's
+ * tuning assumes. Returns the number of controls, as snd_soc_limit_volume().
+ *
+ * Called during control fixup, before the card is exposed to userspace.
+ */
+static int macaudio_set_fixed_volume(struct snd_soc_card *card, const char *name,
+				     int value)
+{
+	struct snd_ctl_elem_value *uval;
+	struct snd_kcontrol *kctl;
+	int ret, hits;
+
+	hits = snd_soc_limit_volume(card, name, value);
+	if (hits < 0)
+		return hits;
+
+	uval = kzalloc_obj(*uval);
+	if (!uval)
+		return -ENOMEM;
 	list_for_each_entry(kctl, &card->snd_card->controls, list) {
 		if (!snd_soc_control_matches(kctl, name))
 			continue;
-		for (i = 0; i < kctl->count; i++)
-			kctl->vd[i].access &= ~SNDRV_CTL_ELEM_ACCESS_WRITE;
+		memset(uval, 0, sizeof(*uval));
+		uval->id = kctl->id;
+		uval->value.integer.value[0] = value;
+		uval->value.integer.value[1] = value;
+		ret = kctl->put(kctl, uval);
+		if (ret < 0) {
+			hits = ret;
+			break;
+		}
 	}
+	kfree(uval);
+	if (hits < 0)
+		return hits;
 
-	return ret;
+	macaudio_deny_write(card, name);
+	return hits;
 }
 
 #define CHECK(call, pattern, value, min)                                       \
@@ -1677,13 +1926,13 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 		if (ma->cfg->stereo)
 			CHECK_CONCAT(macaudio_set_fixed_enum, "ASI1 Sel", "Left");
 
-		CHECK_CONCAT(snd_soc_limit_volume, "Amp Gain Volume", ma->cfg->amp_gain);
+		CHECK_CONCAT(macaudio_set_fixed_volume, "Amp Gain Volume", ma->cfg->amp_gain);
 		break;
 	case AMP_SN012776:
 		if (ma->cfg->stereo)
 			CHECK_CONCAT(macaudio_set_fixed_enum, "ASI1 Sel", "Left");
 
-		CHECK_CONCAT(snd_soc_limit_volume, "Amp Gain Volume", ma->cfg->amp_gain);
+		CHECK_CONCAT(macaudio_set_fixed_volume, "Amp Gain Volume", ma->cfg->amp_gain);
 		CHECK_CONCAT(macaudio_set_fixed_enum, "HPF Corner Frequency",
 			     tweeter ? "800 Hz" : "2 Hz");
 
@@ -2156,8 +2405,12 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 		}
 	}
 
-	INIT_DELAYED_WORK(&data->spk_lease_work, macaudio_spk_lease_work);
-	INIT_WORK(&data->spk_stop_work, macaudio_spk_floor_work);
+	ret = macaudio_spk_init(data);
+	if (ret)
+		return dev_err_probe(dev, ret, "speaker protection workers not started\n");
+	ret = devm_add_action_or_reset(dev, macaudio_spk_fini, data);
+	if (ret)
+		return ret;
 
 	data->pm_nb.notifier_call = macaudio_pm_notify;
 	return snd_soc_register_card(card);
@@ -2167,10 +2420,8 @@ static void macaudio_snd_platform_remove(struct platform_device *pdev)
 {
 	struct macaudio_snd_data *ma = dev_get_drvdata(&pdev->dev);
 
-	/* Unregister first: a grant or a withdrawal queues the works */
+	/* The card's removal stops the lease timer and its works; devm frees them */
 	snd_soc_unregister_card(&ma->card);
-	cancel_delayed_work_sync(&ma->spk_lease_work);
-	cancel_work_sync(&ma->spk_stop_work);
 }
 
 static struct platform_driver macaudio_snd_driver = {

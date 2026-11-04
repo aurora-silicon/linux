@@ -7,6 +7,8 @@
  */
 #include <kunit/device.h>
 #include <kunit/test.h>
+#include <linux/completion.h>
+#include <linux/cred.h>
 #include <linux/delay.h>
 
 struct macaudio_test_vol {
@@ -52,13 +54,11 @@ static void macaudio_test_free_kctl(void *kctl)
 	snd_ctl_free_one(kctl);
 }
 
-/* Last in, so first out: before the controls go */
-static void macaudio_test_spk_cleanup(void *data)
+/* Every withdrawal the lease timer started has run */
+static void macaudio_test_settle(struct macaudio_snd_data *ma)
 {
-	struct macaudio_snd_data *ma = data;
-
-	cancel_delayed_work_sync(&ma->spk_lease_work);
-	cancel_work_sync(&ma->spk_stop_work);
+	kthread_flush_worker(ma->spk_worker);
+	kthread_flush_worker(ma->spk_stop_worker);
 }
 
 static const char *const macaudio_test_vol_names[] = {
@@ -135,8 +135,7 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 	ma->cfg = cfg;
 	ma->has_speakers = true;
 	mutex_init(&ma->spk_mutex);
-	INIT_DELAYED_WORK(&ma->spk_lease_work, macaudio_spk_lease_work);
-	INIT_WORK(&ma->spk_stop_work, macaudio_spk_floor_work);
+	KUNIT_ASSERT_EQ(test, macaudio_spk_init(ma), 0);
 
 	t->ma = ma;
 	t->spk = macaudio_test_add_kctl(test, card, &spk, &ma->card);
@@ -161,7 +160,8 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 		t->vols[i] = macaudio_test_add_kctl(test, card, &tmpl, NULL);
 	}
 
-	ret = kunit_add_action_or_reset(test, macaudio_test_spk_cleanup, ma);
+	/* Last in, so first out: before the controls go */
+	ret = kunit_add_action_or_reset(test, macaudio_spk_fini, ma);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 
 	/* As macaudio_late_probe() does */
@@ -288,11 +288,11 @@ static void macaudio_spk_lease_expires(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MIN_MS), 0);
 
 	/* Not before the lease ends */
-	flush_delayed_work(&t.ma->spk_lease_work);
+	macaudio_test_settle(t.ma);
 	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
 
 	msleep(3 * SPEAKER_LEASE_MIN_MS);
-	flush_delayed_work(&t.ma->spk_lease_work);
+	macaudio_test_settle(t.ma);
 	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
 	macaudio_test_expect_vols(test, &t, 0);
 
@@ -315,7 +315,7 @@ static void macaudio_spk_renewal_extends_lease(struct kunit *test)
 	for (i = 0; i < 6; i++) {
 		KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 4 * SPEAKER_LEASE_MIN_MS), 0);
 		msleep(SPEAKER_LEASE_MIN_MS);
-		flush_delayed_work(&t.ma->spk_lease_work);
+		macaudio_test_settle(t.ma);
 		KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
 	}
 }
@@ -335,9 +335,20 @@ static void macaudio_spk_system_sleep(struct kunit *test)
 
 	macaudio_pm_notify(&t.ma->pm_nb, PM_POST_SUSPEND, NULL);
 	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+	/* The owner was frozen: it learns of it before it plays again */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+	macaudio_test_expect_vols(test, &t, 0);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
 	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
 	macaudio_test_expect_vols(test, &t, SN012776_0DB);
+
+	/* A sleep with no owner reports nothing to the next one */
+	macaudio_spk_unlock(t.spk);
+	macaudio_pm_notify(&t.ma->pm_nb, PM_SUSPEND_PREPARE, NULL);
+	macaudio_pm_notify(&t.ma->pm_nb, PM_POST_SUSPEND, NULL);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
 }
 
 static void macaudio_spk_failed_floor_is_permanent(struct kunit *test)
@@ -387,6 +398,311 @@ static void macaudio_spk_j700_levels(struct kunit *test)
 	macaudio_test_expect_vols(test, &t, MAX98360A_DB(-20));
 }
 
+/* Every start checks the lease's end itself, whether the timer has run or not */
+static void macaudio_spk_gate_follows_lease_end(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_admitted(t.ma));
+
+	/* The lease ends before its timer could close the gate */
+	hrtimer_cancel(&t.ma->spk_lease_timer);
+	WRITE_ONCE(t.ma->spk_lease_end, ktime_sub_ms(ktime_get(), 1));
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(t.ma->spk_granted));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+
+	/* A renewal that comes too late is a stall: floor, -ETIMEDOUT, nothing granted */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_admitted(t.ma));
+	macaudio_test_expect_vols(test, &t, SN012776_0DB);
+}
+
+/* The gate closes at the lease's end even while the floor cannot run */
+static void macaudio_spk_timer_beats_a_blocked_worker(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MIN_MS), 0);
+
+	mutex_lock(&t.ma->spk_mutex);
+	msleep(3 * SPEAKER_LEASE_MIN_MS);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(t.ma->spk_granted));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+	/* The floor waits for the mutex */
+	KUNIT_EXPECT_TRUE(test, t.ma->spk_active);
+	mutex_unlock(&t.ma->spk_mutex);
+
+	macaudio_test_settle(t.ma);
+	KUNIT_EXPECT_FALSE(test, t.ma->spk_active);
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+}
+
+struct macaudio_test_spinner {
+	struct macaudio_snd_data *ma;
+	ktime_t deadline;
+	ktime_t closed;
+	struct completion done;
+};
+
+/* A stuck real-time thread: it never sleeps until the gate closes or the deadline */
+static int macaudio_test_spin(void *data)
+{
+	struct macaudio_test_spinner *s = data;
+	ktime_t now;
+
+	for (;;) {
+		now = ktime_get();
+		if (!READ_ONCE(s->ma->spk_granted)) {
+			s->closed = now;
+			break;
+		}
+		if (!ktime_before(now, s->deadline))
+			break;
+		cpu_relax();
+	}
+	complete(&s->done);
+	return 0;
+}
+
+#define MACAUDIO_TEST_MAX_SPINNERS 8
+
+/*
+ * SCHED_FIFO 99 spinners on every CPU, the lease timer's among them: the
+ * gate still closes at the lease's end, and the floor follows once a CPU is
+ * free again.
+ */
+static void macaudio_spk_timer_beats_a_fifo_spinner(struct kunit *test)
+{
+	struct sched_attr attr = {
+		.size = sizeof(attr),
+		.sched_policy = SCHED_FIFO,
+		.sched_priority = MAX_RT_PRIO - 1,
+	};
+	struct task_struct *tasks[MACAUDIO_TEST_MAX_SPINNERS];
+	struct macaudio_test_spinner *s;
+	struct macaudio_test_spk t;
+	unsigned int cpu, n = 0, i;
+	ktime_t end;
+	s64 late;
+
+	s = kunit_kcalloc(test, MACAUDIO_TEST_MAX_SPINNERS, sizeof(*s), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+
+	/* Ready before the lease starts: once they run, nothing else does */
+	for_each_online_cpu(cpu) {
+		if (n == MACAUDIO_TEST_MAX_SPINNERS)
+			break;
+		s[n].ma = t.ma;
+		init_completion(&s[n].done);
+		tasks[n] = kthread_create(macaudio_test_spin, &s[n], "spk-spin/%u", cpu);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(tasks[n]));
+		kthread_bind(tasks[n], cpu);
+		KUNIT_ASSERT_EQ(test, sched_setattr_nocheck(tasks[n], &attr), 0);
+		n++;
+	}
+
+	KUNIT_ASSERT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MIN_MS), 0);
+	end = READ_ONCE(t.ma->spk_lease_end);
+	for (i = 0; i < n; i++)
+		s[i].deadline = ktime_add_ms(end, 200);
+	/* All at once: the one on this CPU would hold off the others' wakeup */
+	preempt_disable();
+	for (i = 0; i < n; i++)
+		wake_up_process(tasks[i]);
+	preempt_enable();
+
+	for (i = 0; i < n; i++) {
+		wait_for_completion(&s[i].done);
+		late = ktime_to_us(ktime_sub(s[i].closed, end));
+		/* Closed at the lease's end plus timer slack, not at the spinner's deadline */
+		KUNIT_EXPECT_NE(test, s[i].closed, (ktime_t)0);
+		KUNIT_EXPECT_GE(test, late, 0LL);
+		KUNIT_EXPECT_LT(test, late, 10000LL);
+		kunit_info(test, "spinner %u saw the gate close %lld us after the lease's end\n",
+			   i, late);
+	}
+
+	macaudio_test_settle(t.ma);
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -ETIMEDOUT);
+}
+
+static void macaudio_spk_workers_are_fifo(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_worker->task->policy, SCHED_FIFO);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_worker->task->rt_priority, SPEAKER_WORKER_PRIO);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_stop_worker->task->policy, SCHED_FIFO);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_stop_worker->task->rt_priority, SPEAKER_WORKER_PRIO);
+}
+
+/* Only a CAP_SYS_ADMIN process owns the speakers or writes the lease */
+static void macaudio_spk_ownership_needs_cap_sys_admin(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+	const struct cred *old;
+	struct cred *seat;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	seat = prepare_creds();
+	KUNIT_ASSERT_NOT_NULL(test, seat);
+	cap_lower(seat->cap_effective, CAP_SYS_ADMIN);
+
+	old = override_creds(seat);
+	KUNIT_EXPECT_EQ(test, macaudio_spk_lock(t.spk, t.owner), -EPERM);
+	revert_creds(old);
+	KUNIT_EXPECT_NULL(test, t.ma->spk_owner);
+
+	/* The supervisor's file, handed on to a process without the capability */
+	macaudio_test_take(test, &t);
+	old = override_creds(seat);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), -EPERM);
+	revert_creds(old);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+	macaudio_test_expect_vols(test, &t, 0);
+
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
+	put_cred(seat);
+}
+
+struct macaudio_test_blocker {
+	struct kthread_work work;
+	struct completion started;
+	struct completion release;
+};
+
+static void macaudio_test_block(struct kthread_work *work)
+{
+	struct macaudio_test_blocker *b = container_of(work, struct macaudio_test_blocker, work);
+
+	complete(&b->started);
+	wait_for_completion(&b->release);
+}
+
+struct macaudio_test_regrant {
+	struct macaudio_test_spk *t;
+	struct snd_ctl_elem_value *uval;
+	int ret;
+	struct completion done;
+};
+
+static int macaudio_test_regrant(void *data)
+{
+	struct macaudio_test_regrant *r = data;
+
+	r->ret = macaudio_spk_put(r->t->spk, r->uval);
+	complete(&r->done);
+	return 0;
+}
+
+/* A grant waits for the stop a withdrawal queued before the amps go up */
+static void macaudio_spk_regrant_waits_for_the_stop(struct kunit *test)
+{
+	struct macaudio_test_blocker b;
+	struct macaudio_test_regrant r;
+	struct macaudio_test_spk t;
+	struct task_struct *task;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+
+	/* Hold the stop worker, as a starved one would be */
+	kthread_init_work(&b.work, macaudio_test_block);
+	init_completion(&b.started);
+	init_completion(&b.release);
+	kthread_queue_work(t.ma->spk_stop_worker, &b.work);
+	wait_for_completion(&b.started);
+
+	/* The release queues its stop behind the held one */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+
+	r.t = &t;
+	r.uval = kunit_kzalloc(test, sizeof(*r.uval), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, r.uval);
+	r.uval->value.integer.value[0] = 30;
+	init_completion(&r.done);
+	task = kthread_run(macaudio_test_regrant, &r, "spk-regrant");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+
+	msleep(2 * SPEAKER_LEASE_MIN_MS);
+	KUNIT_EXPECT_FALSE(test, completion_done(&r.done));
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+
+	complete(&b.release);
+	wait_for_completion(&r.done);
+	KUNIT_EXPECT_EQ(test, r.ret, 0);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_admitted(t.ma));
+	macaudio_test_expect_vols(test, &t, SN012776_0DB);
+}
+
+/* "Amp Gain Volume": held at the configured gain, readable, not writable */
+static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
+{
+	static const char *const names[] = {
+		"Left Woofer Amp Gain Volume",
+		"Right Woofer Amp Gain Volume",
+	};
+	struct macaudio_test_vol *vols[ARRAY_SIZE(names)];
+	struct snd_kcontrol *kctls[ARRAY_SIZE(names)];
+	struct macaudio_test_spk t;
+	unsigned int i;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct snd_kcontrol_new tmpl = {
+			.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+			.name = names[i],
+			.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+			.info = macaudio_test_vol_info,
+			.get = macaudio_test_vol_get,
+			.put = macaudio_test_vol_put,
+		};
+
+		vols[i] = kunit_kzalloc(test, sizeof(*vols[i]), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, vols[i]);
+		vols[i]->mc.max = 20;
+		tmpl.private_value = (unsigned long)&vols[i]->mc;
+		kctls[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
+	}
+	/* Above the configured gain, and below it */
+	vols[0]->value = 20;
+	vols[1]->value = 5;
+
+	KUNIT_EXPECT_EQ(test, macaudio_set_fixed_volume(&t.ma->card, "* Amp Gain Volume",
+							macaudio_j316_cfg.amp_gain), 2);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		KUNIT_EXPECT_EQ(test, vols[i]->value, (long)macaudio_j316_cfg.amp_gain);
+		KUNIT_EXPECT_EQ(test, vols[i]->mc.platform_max, macaudio_j316_cfg.amp_gain);
+		KUNIT_EXPECT_TRUE(test, kctls[i]->vd[0].access & SNDRV_CTL_ELEM_ACCESS_READ);
+		KUNIT_EXPECT_FALSE(test, kctls[i]->vd[0].access & SNDRV_CTL_ELEM_ACCESS_WRITE);
+	}
+	/* The speaker volumes and the headphone volume are not amp gains */
+	KUNIT_EXPECT_TRUE(test, t.vols[MACAUDIO_TEST_NR_SPK]->vd[0].access &
+			  SNDRV_CTL_ELEM_ACCESS_WRITE);
+	KUNIT_EXPECT_EQ(test, macaudio_set_fixed_volume(&t.ma->card, "* Missing Volume", 15),
+			-EINVAL);
+}
+
 static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_floor_from_binding),
 	KUNIT_CASE(macaudio_spk_grant_needs_owner_and_valid_lease),
@@ -397,6 +713,13 @@ static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_failed_floor_is_permanent),
 	KUNIT_CASE(macaudio_spk_failed_grant_floors),
 	KUNIT_CASE(macaudio_spk_j700_levels),
+	KUNIT_CASE(macaudio_spk_gate_follows_lease_end),
+	KUNIT_CASE(macaudio_spk_timer_beats_a_blocked_worker),
+	KUNIT_CASE(macaudio_spk_timer_beats_a_fifo_spinner),
+	KUNIT_CASE(macaudio_spk_workers_are_fifo),
+	KUNIT_CASE(macaudio_spk_ownership_needs_cap_sys_admin),
+	KUNIT_CASE(macaudio_spk_regrant_waits_for_the_stop),
+	KUNIT_CASE(macaudio_spk_amp_gain_is_fixed),
 	{}
 };
 

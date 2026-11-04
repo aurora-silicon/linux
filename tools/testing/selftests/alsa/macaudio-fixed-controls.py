@@ -18,7 +18,7 @@ import tempfile
 
 
 def function(source, name):
-    match = re.search(r"^(?:static (?:inline )?)?(?:int|bool) " + name +
+    match = re.search(r"^(?:static (?:inline )?)?(?:int|bool|void) " + name +
                       r"\(.*?^\}", source, re.M | re.S)
     if not match:
         raise ValueError("missing source function: " + name)
@@ -89,8 +89,8 @@ static struct snd_soc_component *snd_kcontrol_chip(struct snd_kcontrol *k) { ret
 static unsigned int snd_soc_enum_item_to_val(struct soc_enum *e, unsigned int item) { return item; }
 static int snd_soc_component_update_bits(struct snd_soc_component *c, unsigned int r, unsigned int m, unsigned int v)
 { unsigned int old = c->reg; c->writes++; c->reg = (old & ~m) | (v & m); return old != c->reg; }
-/* Amp gain is volume-limited separately, not a fixed enum. */
-static int snd_soc_limit_volume(struct snd_soc_card *c, const char *n, int v) { return 1; }
+/* Amp gain is a fixed volume (KUnit apple-speaker-protection), not a fixed enum. */
+static int macaudio_set_fixed_volume(struct snd_soc_card *c, const char *n, int v) { return 1; }
 static int enum_info(struct snd_kcontrol *k, struct snd_ctl_elem_info *i)
 {
  struct soc_enum *e = (void *)k->private_value;
@@ -195,6 +195,8 @@ def main():
              function(core, "snd_ctl_elem_write"),
              function(ops, "snd_soc_deactivate_kctl"),
              function(ops, "soc_set_enum_kctl"), function(ops, "snd_soc_set_enum_kctl")]
+    if "static void macaudio_deny_write(" in ma:
+        parts.append(function(ma, "macaudio_deny_write"))
     if "static int macaudio_set_fixed_enum(" in ma:
         parts.append(function(ma, "macaudio_set_fixed_enum"))
     parts += [ma[ma.index("#define CHECK(call,"):ma.index("static int macaudio_set_speaker(")],
