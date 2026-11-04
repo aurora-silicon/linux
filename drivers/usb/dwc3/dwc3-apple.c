@@ -671,8 +671,10 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		 * success, and its errors leave the PIPE without a known producer.
 		 */
 		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
-		    of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3"))
+		    of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3")) {
+			dev_err(appledwc->dev, "USB3 PHY setup failed, err=%d\n", ret);
 			return ret;
+		}
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 	} else if (host && appledwc->usb3_phy &&
 		   of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3")) {

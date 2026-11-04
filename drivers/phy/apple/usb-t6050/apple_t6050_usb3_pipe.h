@@ -36,6 +36,11 @@ apple_t6050_usb3_pipe_cold_dummy(const struct apple_t6050_usb_io *io)
     return (io->read(io->context, 44, 0x0c) & 0x73) == 0x42 ? 0 : -1;
 }
 
+/*
+ * Returns 0, or the failing step: -2 the PIPE was not parked on a known producer, -3 the lock was
+ * not acknowledged, -4..-6 the BIST, -7 the mux did not read back USB3, -8 the BIST did not stop,
+ * -9 the lock release was not acknowledged. Up to -6 the mux is untouched.
+ */
 static inline int
 apple_t6050_usb3_pipe_switch(const struct apple_t6050_usb_io *io)
 {
@@ -48,22 +53,26 @@ apple_t6050_usb3_pipe_switch(const struct apple_t6050_usb_io *io)
     mux = io->read(io->context, 44, 0x0c) & 0x73;
     /* Never reroute an active USB4 producer or guess an unknown state. */
     if (!(aon & 1) || (mux != 0x42 && mux != 0x10))
-        return -1;
+        return -2;
 
     /* Native T8142 xHCI USB3 mode switch, native27 T6050-compatible path. */
     apple_t6050_usb_mask(io, 44, 0x04, 0x0e, 0);
     apple_t6050_usb_mask(io, 44, 0x00, 1, 1);
     apple_t6050_usb_mask(io, 44, 0x10, 1, 1);
     locked = 1;
+    result = -3;
     if (io->poll(io->context, 44, 0x14, 1, 1, 6000))
         goto out;
 
     bist = 1;
+    result = -4;
     if (apple_t6050_usb_bist_on(io))
         goto out;
     apple_t6050_usb_mask(io, 44, 0x20, 0x100f, 3);
+    result = -5;
     if (io->poll(io->context, 44, 0x20, 0xf, 3, 1000))
         goto out;
+    result = -6;
     if (apple_t6050_usb_bist_off(io))
         goto out;
     bist = 0;
@@ -73,16 +82,16 @@ apple_t6050_usb3_pipe_switch(const struct apple_t6050_usb_io *io)
     io->delay(io->context, 5);
     apple_t6050_usb_mask(io, 44, 0x0c, 0x73, 0);
     apple_t6050_usb_mask(io, 44, 0x0c, 0x73, 0x10);
-    result = (io->read(io->context, 44, 0x0c) & 0x73) == 0x10 ? 0 : -1;
+    result = (io->read(io->context, 44, 0x0c) & 0x73) == 0x10 ? 0 : -7;
 
 out:
     if (bist && apple_t6050_usb_bist_off(io))
-        result = -1;
+        result = -8;
     apple_t6050_usb_mask(io, 44, 0x00, 5, 0);
     if (locked) {
         apple_t6050_usb_mask(io, 44, 0x10, 1, 0);
-        if (io->poll(io->context, 44, 0x14, 1, 0, 6000))
-            result = -1;
+        if (io->poll(io->context, 44, 0x14, 1, 0, 6000) && !result)
+            result = -9;
     }
     return result;
 }
