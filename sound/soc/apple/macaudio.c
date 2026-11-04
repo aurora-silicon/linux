@@ -195,8 +195,6 @@ struct macaudio_snd_data {
 	struct macaudio_link_props {
 		/* frontend props */
 		unsigned int bclk_ratio;
-		/* The PCM trigger that macaudio_fe_pcm_trigger() stands in front of */
-		int (*pcm_trigger)(struct snd_pcm_substream *substream, int cmd);
 		bool is_sense;
 
 		/* backend props */
@@ -1508,56 +1506,37 @@ static bool macaudio_fe_refuses(struct macaudio_snd_data *ma, struct snd_soc_pcm
 	       !macaudio_spk_admitted(ma);
 }
 
+/* A refused speaker start: counted (debugfs speaker_starts_refused), never logged */
+static int macaudio_spk_refuse(struct macaudio_snd_data *ma)
+{
+	atomic_inc(&ma->spk_refused);
+	atomic_inc(&ma->spk_refused_since_grant);
+	return -EPERM;
+}
+
+/*
+ * A refused start is the floor doing its job, not a failure, and an audio
+ * server retries it from its data loop: dozens to hundreds of times per
+ * withdrawal. The links are marked quiet_trigger_eperm (see
+ * macaudio_quiet_refusals()), so ASoC fails these triggers without logging
+ * them; each refusal is counted instead, and the next grant reports the run.
+ */
 static int macaudio_fe_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
 
-	return macaudio_fe_refuses(ma, rtd, substream, cmd) ? -EPERM : 0;
+	return macaudio_fe_refuses(ma, rtd, substream, cmd) ? macaudio_spk_refuse(ma) : 0;
 }
 
-/*
- * A refused speaker start is the floor doing its job, not a DAI failure,
- * and an audio server retries it from its data loop: dozens to hundreds of
- * times per withdrawal. So the front-end PCM's own trigger refuses it,
- * with the same -EPERM, before ASoC's DPCM trigger runs and logs every
- * failure as an error. Nothing has been touched by then. Each refusal is
- * counted (debugfs speaker_starts_refused). macaudio_fe_trigger() and
- * macaudio_be_trigger() stay behind it.
- */
-static int macaudio_fe_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+/* The gate's -EPERM on every link of a card with speakers is a quiet refusal */
+static void macaudio_quiet_refusals(struct snd_soc_card *card)
 {
-	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
-	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+	struct snd_soc_dai_link *link;
+	int i;
 
-	if (macaudio_fe_refuses(ma, rtd, substream, cmd)) {
-		atomic_inc(&ma->spk_refused);
-		atomic_inc(&ma->spk_refused_since_grant);
-		return -EPERM;
-	}
-	return ma->link_props[rtd->dai_link->id].pcm_trigger(substream, cmd);
-}
-
-/*
- * Put macaudio_fe_pcm_trigger() in front of every front-end PCM's trigger.
- * Its PCMs exist by the card's late probe and are not yet registered, so no
- * stream can be triggering.
- */
-static void macaudio_gate_fe_pcms(struct macaudio_snd_data *ma)
-{
-	struct macaudio_link_props *props;
-	struct snd_soc_pcm_runtime *rtd;
-
-	for_each_card_rtds(&ma->card, rtd) {
-		if (!rtd->pcm || rtd->dai_link->no_pcm ||
-		    !rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream)
-			continue;
-		props = &ma->link_props[rtd->dai_link->id];
-		if (!rtd->ops.trigger || rtd->ops.trigger == macaudio_fe_pcm_trigger)
-			continue;
-		props->pcm_trigger = rtd->ops.trigger;
-		rtd->ops.trigger = macaudio_fe_pcm_trigger;
-	}
+	for_each_card_prelinks(card, i, link)
+		link->quiet_trigger_eperm = 1;
 }
 
 /*
@@ -1578,7 +1557,7 @@ static int macaudio_be_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		return macaudio_spk_admitted(ma) ? 0 : -EPERM;
+		return macaudio_spk_admitted(ma) ? 0 : macaudio_spk_refuse(ma);
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -1910,7 +1889,6 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		mutex_unlock(&ma->spk_mutex);
 		if (ret)
 			return dev_err_probe(card->dev, ret, "speaker safe level not set\n");
-		macaudio_gate_fe_pcms(ma);
 #ifdef CONFIG_DEBUG_FS
 		debugfs_create_atomic_t("speaker_starts_refused", 0444, card->debugfs_card_root,
 					&ma->spk_refused);
@@ -2527,6 +2505,8 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	/* Admitted speakers always have a safe level (macaudio_speakers_allowed()) */
 	if (!data->has_speakers)
 		card->num_controls -= MACAUDIO_NUM_SPEAKER_CONTROLS;
+	else
+		macaudio_quiet_refusals(card);
 
 	for_each_card_prelinks(card, i, link) {
 		if (link->no_pcm) {

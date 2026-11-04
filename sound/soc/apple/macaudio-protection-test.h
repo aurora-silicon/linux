@@ -808,25 +808,14 @@ static void macaudio_spk_sleep_skips_a_card_without_speakers(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_pm_notify(&ma->pm_nb, PM_POST_SUSPEND, NULL), NOTIFY_DONE);
 }
 
-/* A front-end PCM driving the speaker back-end, as DPCM connects them */
+/* A front-end driving the speaker back-end, as DPCM connects them */
 struct macaudio_test_fe {
 	struct snd_soc_dai_link fe_link, be_link;
 	struct snd_soc_pcm_runtime *fe, *be;
 	struct snd_soc_dpcm dpcm;
-	struct snd_pcm pcm;
-	struct snd_pcm_substream play, cap;
+	struct snd_pcm_substream play, cap, be_play;
 	struct macaudio_link_props props[2];
-	int calls, last_cmd;
 };
-
-static struct macaudio_test_fe *macaudio_test_cur_fe;
-
-static int macaudio_test_dpcm_trigger(struct snd_pcm_substream *substream, int cmd)
-{
-	macaudio_test_cur_fe->calls++;
-	macaudio_test_cur_fe->last_cmd = cmd;
-	return 0;
-}
 
 static void macaudio_test_fe_setup(struct kunit *test, struct macaudio_test_spk *t,
 				   struct macaudio_test_fe *f)
@@ -843,7 +832,6 @@ static void macaudio_test_fe_setup(struct kunit *test, struct macaudio_test_spk 
 	f->be->card = &t->ma->card;
 	INIT_LIST_HEAD(&f->fe->dpcm[SNDRV_PCM_STREAM_PLAYBACK].be_clients);
 	INIT_LIST_HEAD(&f->fe->dpcm[SNDRV_PCM_STREAM_CAPTURE].be_clients);
-	INIT_LIST_HEAD(&f->fe->list);
 	f->props[1].is_speakers = true;
 	t->ma->link_props = f->props;
 	f->dpcm.fe = f->fe;
@@ -853,65 +841,68 @@ static void macaudio_test_fe_setup(struct kunit *test, struct macaudio_test_spk 
 	f->play.private_data = f->fe;
 	f->cap.stream = SNDRV_PCM_STREAM_CAPTURE;
 	f->cap.private_data = f->fe;
-	f->pcm.streams[SNDRV_PCM_STREAM_PLAYBACK].substream = &f->play;
-	f->fe->pcm = &f->pcm;
-	f->fe->ops.trigger = macaudio_test_dpcm_trigger;
-	macaudio_test_cur_fe = f;
+	f->be_play.stream = SNDRV_PCM_STREAM_PLAYBACK;
+	f->be_play.private_data = f->be;
 }
 
-/* A refused start never reaches ASoC's DPCM trigger, which would log it */
-static void macaudio_spk_refused_start_is_quiet(struct kunit *test)
+/* Refused starts: -EPERM as before, each one counted, reported at the next grant */
+static void macaudio_spk_refused_starts_are_counted(struct kunit *test)
 {
 	struct macaudio_test_fe *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	struct macaudio_test_spk t;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
-	macaudio_test_settle(t.ma);
 	macaudio_test_fe_setup(test, &t, f);
 
-	/* Put in front of the PCM's trigger, once */
-	list_add_tail(&f->fe->list, &t.ma->card.rtd_list);
-	macaudio_gate_fe_pcms(t.ma);
-	macaudio_gate_fe_pcms(t.ma);
-	list_del_init(&f->fe->list);
-	KUNIT_EXPECT_TRUE(test, f->fe->ops.trigger == macaudio_fe_pcm_trigger);
-	KUNIT_EXPECT_TRUE(test, f->props[0].pcm_trigger == macaudio_test_dpcm_trigger);
-
-	/* No grant: every start refused with -EPERM and counted, nothing passed on */
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->play, SNDRV_PCM_TRIGGER_START), -EPERM);
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->play, SNDRV_PCM_TRIGGER_RESUME), -EPERM);
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->play, SNDRV_PCM_TRIGGER_PAUSE_RELEASE),
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->play, SNDRV_PCM_TRIGGER_START), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->play, SNDRV_PCM_TRIGGER_RESUME), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->play, SNDRV_PCM_TRIGGER_PAUSE_RELEASE),
 			-EPERM);
-	KUNIT_EXPECT_EQ(test, f->calls, 0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 3);
-	/* Stops, and the capture side, always pass */
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->play, SNDRV_PCM_TRIGGER_STOP), 0);
-	KUNIT_EXPECT_EQ(test, f->last_cmd, SNDRV_PCM_TRIGGER_STOP);
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->cap, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_EQ(test, f->calls, 2);
+	/* The back-end behind it refuses the same way */
+	KUNIT_EXPECT_EQ(test, macaudio_be_trigger(&f->be_play, SNDRV_PCM_TRIGGER_START), -EPERM);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 4);
+	/* Stops, and the capture side, always pass and are not counted */
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->play, SNDRV_PCM_TRIGGER_STOP), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_be_trigger(&f->be_play, SNDRV_PCM_TRIGGER_STOP), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->cap, SNDRV_PCM_TRIGGER_START), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 4);
 
-	/* Granted: the start goes through; the grant reports and resets the run */
+	/* Granted: starts pass; the grant reports and resets the run */
 	macaudio_test_take(test, &t);
-	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused_since_grant), 3);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused_since_grant), 4);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused_since_grant), 0);
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->play, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_EQ(test, f->last_cmd, SNDRV_PCM_TRIGGER_START);
-	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 3);
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->play, SNDRV_PCM_TRIGGER_START), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_be_trigger(&f->be_play, SNDRV_PCM_TRIGGER_START), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 4);
 
 	/* A lease past its end refuses again, timer or not */
 	hrtimer_cancel(&t.ma->spk_lease_timer);
 	WRITE_ONCE(t.ma->spk_lease_end, ktime_sub_ms(ktime_get(), 1));
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->play, SNDRV_PCM_TRIGGER_START), -EPERM);
-	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 4);
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->play, SNDRV_PCM_TRIGGER_START), -EPERM);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 5);
 
 	/* A front-end not connected to the speakers is never refused */
 	list_del_init(&f->dpcm.list_be);
-	KUNIT_EXPECT_EQ(test, macaudio_fe_pcm_trigger(&f->play, SNDRV_PCM_TRIGGER_START), 0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 4);
-	macaudio_test_cur_fe = NULL;
+	KUNIT_EXPECT_EQ(test, macaudio_fe_trigger(&f->play, SNDRV_PCM_TRIGGER_START), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&t.ma->spk_refused), 5);
 	t.ma->link_props = NULL;
+}
+
+/* Every link of a card with speakers marks the gate's -EPERM as a quiet refusal */
+static void macaudio_spk_refusals_are_quiet(struct kunit *test)
+{
+	struct snd_soc_dai_link links[3] = {};
+	struct snd_soc_card card = { .dai_link = links, .num_links = ARRAY_SIZE(links) };
+	unsigned int i;
+
+	macaudio_quiet_refusals(&card);
+	for (i = 0; i < ARRAY_SIZE(links); i++) {
+		KUNIT_EXPECT_TRUE(test, links[i].quiet_trigger_eperm);
+		KUNIT_EXPECT_TRUE(test, snd_soc_link_trigger_refused(&links[i], -EPERM));
+		KUNIT_EXPECT_FALSE(test, snd_soc_link_trigger_refused(&links[i], -EIO));
+	}
 }
 
 static struct kunit_case macaudio_protection_cases[] = {
@@ -935,7 +926,8 @@ static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_hibernation_floors),
 	KUNIT_CASE(macaudio_spk_sleep_notifier_is_first),
 	KUNIT_CASE(macaudio_spk_sleep_skips_a_card_without_speakers),
-	KUNIT_CASE(macaudio_spk_refused_start_is_quiet),
+	KUNIT_CASE(macaudio_spk_refused_starts_are_counted),
+	KUNIT_CASE(macaudio_spk_refusals_are_quiet),
 	{}
 };
 
