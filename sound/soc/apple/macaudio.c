@@ -219,12 +219,21 @@ struct macaudio_snd_data {
 	bool spk_floor_failed;
 	/* The lease ran out: the owner's next write is refused with -ETIMEDOUT */
 	bool spk_lapsed;
-	/* Between PM_SUSPEND_PREPARE and PM_POST_SUSPEND: no grant */
+	/*
+	 * Between PM_SUSPEND_PREPARE and PM_POST_SUSPEND: no grant. Set
+	 * without spk_mutex (macaudio_pm_notify()), cleared under it.
+	 */
 	bool pm_quiesced;
 	/* The card is being removed: no grant, no amp access */
 	bool spk_dead;
 	/* Written under spk_mutex, read without it */
 	ktime_t spk_lease_end;
+	/*
+	 * When and why the start gate was last closed ahead of the floor (the
+	 * lease timer, or system sleep), for the withdrawal's log line.
+	 */
+	ktime_t spk_gate_closed_at;
+	const char *spk_gate_reason;
 	struct hrtimer spk_lease_timer;
 	/* The floor after a lease ran out; takes spk_mutex */
 	struct kthread_worker *spk_worker;
@@ -500,6 +509,8 @@ static bool macaudio_spk_admitted(struct macaudio_snd_data *ma)
 static void macaudio_spk_floor(struct macaudio_snd_data *ma, const char *reason)
 {
 	bool was = ma->spk_active;
+	/* The lease timer or a system sleep closed the gate before this */
+	bool closed_ahead = was && !READ_ONCE(ma->spk_granted);
 
 	lockdep_assert_held(&ma->spk_mutex);
 
@@ -519,10 +530,33 @@ static void macaudio_spk_floor(struct macaudio_snd_data *ma, const char *reason)
 	}
 
 	if (was && ma->spk_kctl) {
-		dev_info(ma->card.dev, "Speaker protection withdrawn: %s\n", reason);
+		if (closed_ahead)
+			dev_info(ma->card.dev,
+				 "Speaker protection withdrawn: %s (start gate closed by %s %lld us before)\n",
+				 reason, READ_ONCE(ma->spk_gate_reason) ?: "?",
+				 ktime_us_delta(ktime_get(), READ_ONCE(ma->spk_gate_closed_at)));
+		else
+			dev_info(ma->card.dev, "Speaker protection withdrawn: %s\n", reason);
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 			       &ma->spk_kctl->id);
 	}
+}
+
+/*
+ * Close the start gate and stop the speaker streams, ahead of the floor
+ * that follows under spk_mutex: from the lease timer and from system sleep,
+ * which must not wait for anything first.
+ *
+ * Context: any, including hard IRQ.
+ */
+static void macaudio_spk_close_gate(struct macaudio_snd_data *ma, const char *why)
+{
+	if (READ_ONCE(ma->spk_granted)) {
+		WRITE_ONCE(ma->spk_gate_closed_at, ktime_get());
+		WRITE_ONCE(ma->spk_gate_reason, why);
+	}
+	WRITE_ONCE(ma->spk_granted, false);
+	kthread_queue_work(ma->spk_stop_worker, &ma->spk_stop_work);
 }
 
 /*
@@ -552,6 +586,11 @@ static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 	if (ret < 0) {
 		macaudio_spk_floor(ma, "operating gain not set");
 		return ret;
+	}
+	/* A system sleep began while the amps went up: it closed the gate already */
+	if (READ_ONCE(ma->pm_quiesced)) {
+		macaudio_spk_floor(ma, "system sleep");
+		return -EBUSY;
 	}
 
 	ma->spk_active = true;
@@ -584,8 +623,7 @@ static enum hrtimer_restart macaudio_spk_lease_timer(struct hrtimer *timer)
 	if (!READ_ONCE(ma->spk_granted))
 		return HRTIMER_NORESTART;
 
-	WRITE_ONCE(ma->spk_granted, false);
-	kthread_queue_work(ma->spk_stop_worker, &ma->spk_stop_work);
+	macaudio_spk_close_gate(ma, "the lease's end");
 	kthread_queue_work(ma->spk_worker, &ma->spk_expire_work);
 	return HRTIMER_NORESTART;
 }
@@ -643,13 +681,19 @@ static void macaudio_spk_fini(void *data)
 	ma->spk_stop_worker = NULL;
 }
 
-/* The lease timer and the workers, until macaudio_spk_fini() */
+static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
+			      void *data);
+
+/* The lease timer, the workers and the sleep notifier, until macaudio_spk_fini() */
 static int macaudio_spk_init(struct macaudio_snd_data *ma)
 {
 	hrtimer_setup(&ma->spk_lease_timer, macaudio_spk_lease_timer, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_REL_HARD);
 	kthread_init_work(&ma->spk_expire_work, macaudio_spk_expire_work);
 	kthread_init_work(&ma->spk_stop_work, macaudio_spk_stop_work);
+	/* First in the chain: no other driver's sleep preparation goes before the floor */
+	ma->pm_nb.notifier_call = macaudio_pm_notify;
+	ma->pm_nb.priority = INT_MAX;
 
 	ma->spk_worker = macaudio_spk_worker("spk-floor");
 	if (IS_ERR(ma->spk_worker))
@@ -666,23 +710,46 @@ static int macaudio_spk_init(struct macaudio_snd_data *ma)
 }
 
 /*
- * System sleep: userspace is frozen long before the card suspends, and an
- * owner's lease must not run out under a stream that is still playing.
- * Withdraw protection before the freeze. The owner was frozen with the
- * rest of userspace, so the state of its engine is unknown: its first write
- * after the resume fails with -ETIMEDOUT, as after any stall, and the one
- * after it grants.
+ * System sleep: protection is withdrawn at PM_SUSPEND_PREPARE (and
+ * PM_HIBERNATION_PREPARE), first in the notifier chain and before any task
+ * freezes, not in a device suspend callback: a sleep that stops short of
+ * the devices (pm_test=freezer) withdraws it too. The gate closes and the
+ * streams stop before anything can wait; the safe level follows under
+ * spk_mutex. The lease timer is never stopped without that floor, so a
+ * lease still ends at its deadline while the floor waits.
+ *
+ * The owner was frozen with the rest of userspace, so the state of its
+ * engine is unknown: its first write after the resume fails with
+ * -ETIMEDOUT, as after any stall, and the one after it grants.
  */
 static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 			      void *data)
 {
 	struct macaudio_snd_data *ma = container_of(nb, struct macaudio_snd_data, pm_nb);
+	ktime_t t0;
+	s64 waited;
+
+	/* A card without speakers (the J616s jack) has nothing to floor */
+	if (!ma->has_speakers)
+		return NOTIFY_DONE;
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
+		/*
+		 * Before anything that can wait, spk_mutex included: a writer
+		 * that holds it may be stuck behind the sleep itself. No grant
+		 * and no start from here on, and the running streams stop.
+		 */
+		WRITE_ONCE(ma->pm_quiesced, true);
+		macaudio_spk_close_gate(ma, "system sleep");
+		t0 = ktime_get();
 		mutex_lock(&ma->spk_mutex);
-		ma->pm_quiesced = true;
+		waited = ktime_ms_delta(ktime_get(), t0);
+		if (waited > 50)
+			dev_warn(ma->card.dev,
+				 "speaker floor for system sleep waited %lld ms for the protection lock\n",
+				 waited);
 		macaudio_spk_floor(ma, "system sleep");
 		mutex_unlock(&ma->spk_mutex);
 		return NOTIFY_OK;
@@ -690,7 +757,7 @@ static int macaudio_pm_notify(struct notifier_block *nb, unsigned long action,
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 		mutex_lock(&ma->spk_mutex);
-		ma->pm_quiesced = false;
+		WRITE_ONCE(ma->pm_quiesced, false);
 		if (ma->spk_owner)
 			ma->spk_lapsed = true;
 		mutex_unlock(&ma->spk_mutex);
@@ -746,7 +813,7 @@ static int macaudio_spk_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	}
 
 	/* Before the stall report, which a resume sets: it must reach the owner */
-	if (ma->pm_quiesced) {
+	if (READ_ONCE(ma->pm_quiesced)) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -2412,7 +2479,6 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	data->pm_nb.notifier_call = macaudio_pm_notify;
 	return snd_soc_register_card(card);
 }
 

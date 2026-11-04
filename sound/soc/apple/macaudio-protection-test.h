@@ -703,6 +703,111 @@ static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 			-EINVAL);
 }
 
+struct macaudio_test_sleep {
+	struct macaudio_snd_data *ma;
+	int ret;
+	struct completion done;
+};
+
+static int macaudio_test_sleep_prepare(void *data)
+{
+	struct macaudio_test_sleep *z = data;
+
+	z->ret = macaudio_pm_notify(&z->ma->pm_nb, PM_SUSPEND_PREPARE, NULL);
+	complete(&z->done);
+	return 0;
+}
+
+/*
+ * PM_SUSPEND_PREPARE closes the gate before it waits for anything: here a
+ * writer holds spk_mutex across the sleep's start, as a supervisor stuck
+ * in a write would.
+ */
+static void macaudio_spk_sleep_closes_the_gate_first(struct kunit *test)
+{
+	struct macaudio_test_sleep z;
+	struct macaudio_test_spk t;
+	struct task_struct *task;
+	unsigned int i;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MAX_MS), 0);
+
+	z.ma = t.ma;
+	init_completion(&z.done);
+	mutex_lock(&t.ma->spk_mutex);
+	task = kthread_run(macaudio_test_sleep_prepare, &z, "spk-sleep");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	for (i = 0; i < 100 && !READ_ONCE(t.ma->pm_quiesced); i++)
+		usleep_range(500, 1000);
+
+	/* Closed at once, with the floor still waiting for the lock */
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(t.ma->pm_quiesced));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(t.ma->spk_granted));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+	KUNIT_EXPECT_STREQ(test, t.ma->spk_gate_reason, "system sleep");
+	KUNIT_EXPECT_FALSE(test, completion_done(&z.done));
+	macaudio_test_expect_vols(test, &t, SN012776_0DB);
+	mutex_unlock(&t.ma->spk_mutex);
+
+	wait_for_completion(&z.done);
+	KUNIT_EXPECT_EQ(test, z.ret, NOTIFY_OK);
+	KUNIT_EXPECT_FALSE(test, t.ma->spk_active);
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EBUSY);
+
+	/* After the resume: the stall first, then a grant */
+	KUNIT_EXPECT_EQ(test, macaudio_pm_notify(&t.ma->pm_nb, PM_POST_SUSPEND, NULL), NOTIFY_OK);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
+}
+
+/* Hibernation takes the same path, and the lease never outlives a floor */
+static void macaudio_spk_hibernation_floors(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_pm_notify(&t.ma->pm_nb, PM_HIBERNATION_PREPARE, NULL),
+			NOTIFY_OK);
+	KUNIT_EXPECT_FALSE(test, hrtimer_active(&t.ma->spk_lease_timer));
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_pm_notify(&t.ma->pm_nb, PM_POST_RESTORE, NULL), NOTIFY_OK);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+}
+
+/* The floor runs first in the sleep notifier chain */
+static void macaudio_spk_sleep_notifier_is_first(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	KUNIT_EXPECT_TRUE(test, t.ma->pm_nb.notifier_call == macaudio_pm_notify);
+	KUNIT_EXPECT_EQ(test, t.ma->pm_nb.priority, INT_MAX);
+}
+
+/* A card without speakers (the J616s jack) leaves sleep alone */
+static void macaudio_spk_sleep_skips_a_card_without_speakers(struct kunit *test)
+{
+	struct macaudio_snd_data *ma = kunit_kzalloc(test, sizeof(*ma), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, ma);
+	mutex_init(&ma->spk_mutex);
+	ma->has_speakers = false;
+	KUNIT_EXPECT_EQ(test, macaudio_pm_notify(&ma->pm_nb, PM_SUSPEND_PREPARE, NULL),
+			NOTIFY_DONE);
+	KUNIT_EXPECT_FALSE(test, ma->spk_floor_failed);
+	KUNIT_EXPECT_FALSE(test, ma->pm_quiesced);
+	KUNIT_EXPECT_EQ(test, macaudio_pm_notify(&ma->pm_nb, PM_POST_SUSPEND, NULL), NOTIFY_DONE);
+}
+
 static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_floor_from_binding),
 	KUNIT_CASE(macaudio_spk_grant_needs_owner_and_valid_lease),
@@ -720,6 +825,10 @@ static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_ownership_needs_cap_sys_admin),
 	KUNIT_CASE(macaudio_spk_regrant_waits_for_the_stop),
 	KUNIT_CASE(macaudio_spk_amp_gain_is_fixed),
+	KUNIT_CASE(macaudio_spk_sleep_closes_the_gate_first),
+	KUNIT_CASE(macaudio_spk_hibernation_floors),
+	KUNIT_CASE(macaudio_spk_sleep_notifier_is_first),
+	KUNIT_CASE(macaudio_spk_sleep_skips_a_card_without_speakers),
 	{}
 };
 
