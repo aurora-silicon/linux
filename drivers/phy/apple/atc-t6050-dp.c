@@ -97,6 +97,7 @@ struct t6050_dp {
 	struct apple_rtkit *rtkit;
 	void __iomem *fw_data;
 	bool fw_running;
+	void *fw_data_saved;	/* the firmware data SRAM as the first start found it */
 };
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
@@ -183,6 +184,20 @@ static int atc_firmware(struct t6050_dp *dp, bool start)
 	if (dp->fw_running == start)
 		return 0;
 	if (start) {
+		/*
+		 * The firmware is the boot loader's, preloaded with its data segment, and keeps
+		 * its state there: restarted on the state its last run left, it never finishes
+		 * calibrating the lanes (UC_TNBL_DONE). Give every start the data segment the
+		 * first one found. The PHY's domains are on here, so the SRAM is accessible.
+		 */
+		if (!dp->fw_data_saved) {
+			dp->fw_data_saved = devm_kmalloc(dp->dev, 0x10000, GFP_KERNEL);
+			if (!dp->fw_data_saved)
+				return -ENOMEM;
+			memcpy_fromio(dp->fw_data_saved, dp->fw_data, 0x10000);
+		} else {
+			memcpy_toio(dp->fw_data, dp->fw_data_saved, 0x10000);
+		}
 		/* Native coprocessor run, after its +0x40 firmware enable. */
 		writel(BIT(4), dp->banks[38] + 0x28);
 		ret = apple_rtkit_wake(dp->rtkit);
