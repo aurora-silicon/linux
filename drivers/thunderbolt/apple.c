@@ -909,14 +909,21 @@ static void apple_cio_of_node_put(void *data)
 	of_node_put(data);
 }
 
+/* The PCIe-C host among the children of an ACIO's PCIe tunnel node */
+static bool apple_cio_is_pciec(struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8103-pciec") ||
+	       of_device_is_compatible(np, "apple,t6000-pciec") ||
+	       of_device_is_compatible(np, "apple,t6050-pciec");
+}
+
 static bool
 apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 {
 	for_each_available_child_of_node_scoped(parent, child) {
 		u32 status;
 
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_is_pciec(child))
 			continue;
 
 		if (!of_property_read_u32(child, "apple,pciec-preinit-status",
@@ -945,8 +952,7 @@ static int apple_cio_get_pcie_reset(struct apple_cio *acio)
 	struct reset_control *rst = NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_is_pciec(child))
 			continue;
 		if (!of_property_read_bool(child, "apple,pciec-kernel-init"))
 			break;
@@ -978,8 +984,7 @@ static int apple_cio_map_pcie_intr2axi(struct apple_cio *acio)
 	int index, ret;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_is_pciec(child))
 			continue;
 
 		index = of_property_match_string(child, "reg-names", "intr2axi");
@@ -2490,8 +2495,7 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 		return NULL;
 
 	for_each_available_child_of_node_scoped(acio->pcie_tunnel_np, child) {
-		if (!of_device_is_compatible(child, "apple,t8103-pciec") &&
-		    !of_device_is_compatible(child, "apple,t6000-pciec"))
+		if (!apple_cio_is_pciec(child))
 			continue;
 
 		pdev = of_find_device_by_node(child);
