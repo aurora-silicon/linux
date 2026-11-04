@@ -80,6 +80,7 @@
 #include <linux/bitfield.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -276,6 +277,9 @@ struct apple_cio {
 	const struct apple_dpin_policy *dp;
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *lstx_pins;
+	struct gpio_desc *lstx_gpio;
+	bool lstx_hold;
+	bool lstx_high;
 	void __iomem *cpu_base;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
@@ -2483,6 +2487,61 @@ static void apple_cio_remove_children(struct apple_cio *acio)
 	}
 }
 
+/*
+ * While the router is off, the AP holds LSTX at the level the router last
+ * drove. The pin goes back to the router once it is up again.
+ */
+static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
+{
+	struct gpio_desc *gpio;
+
+	if (!acio->lstx_hold)
+		return;
+	acio->lstx_high = high;
+
+	/* The pin controller is strict: release the router's mux first. */
+	if (acio->pinctrl) {
+		devm_pinctrl_put(acio->pinctrl);
+		acio->pinctrl = NULL;
+		acio->lstx_pins = NULL;
+	}
+	gpio = devm_gpiod_get(acio->dev, "lstx",
+			      high ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW);
+	if (IS_ERR(gpio)) {
+		acio->lstx_high = false;
+		dev_warn(acio->dev, "failed to take the LSTX pin back: %ld\n",
+			 PTR_ERR(gpio));
+		return;
+	}
+	acio->lstx_gpio = gpio;
+}
+
+static int apple_cio_lstx_release(struct apple_cio *acio)
+{
+	writel(APPLE_CIO_LSTX_CTRL_ENABLE |
+	       (acio->lstx_high ? APPLE_CIO_LSTX_CTRL_LEVEL : 0),
+	       acio->rc_base + APPLE_CIO_M3_CTRL);
+	if (acio->lstx_gpio) {
+		devm_gpiod_put(acio->dev, acio->lstx_gpio);
+		acio->lstx_gpio = NULL;
+	}
+	if (!acio->pinctrl) {
+		struct pinctrl *pinctrl = devm_pinctrl_get(acio->dev);
+		struct pinctrl_state *state;
+
+		if (IS_ERR(pinctrl))
+			return PTR_ERR(pinctrl);
+		acio->pinctrl = pinctrl;
+		state = pinctrl_lookup_state(pinctrl, "lstx");
+		if (IS_ERR(state))
+			return PTR_ERR(state);
+		acio->lstx_pins = state;
+	}
+	if (!acio->lstx_pins)
+		return 0;
+	return pinctrl_select_state(acio->pinctrl, acio->lstx_pins);
+}
+
 /**
  * apple_cio_stop - Stop and power down the ACIO complex
  * @acio: ACIO complex to stop
@@ -2507,6 +2566,12 @@ static void apple_cio_stop(struct apple_cio *acio)
 			 "Failed to shutdown M3 RTKit, continuing ACIO shutdown anyway\n");
 	apple_rtkit_free(acio->rtk);
 	acio->rtk = NULL;
+
+	/* High only if the router left it driven high with the cable still in */
+	if (acio->hw->lstx_after_boot)
+		apple_cio_lstx_hold(acio, acio->target_cable_info &&
+				    (readl(acio->rc_base + APPLE_CIO_M3_CTRL) &
+				     APPLE_CIO_LSTX_CTRL_LEVEL));
 
 	/* Finally, remove the links to the PD domains to power everything off */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
@@ -2673,13 +2738,10 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * cold start, and then gets its pin back from the AOP GPIO controller.
 	 */
 	if (acio->hw->lstx_after_boot) {
-		writel(APPLE_CIO_LSTX_CTRL_ENABLE, acio->rc_base + APPLE_CIO_M3_CTRL);
-		if (acio->lstx_pins) {
-			ret = pinctrl_select_state(acio->pinctrl, acio->lstx_pins);
-			if (ret) {
-				dev_err(acio->dev, "failed to hand over the LSTX pin: %d\n", ret);
-				goto err_shutdown_rtkit;
-			}
+		ret = apple_cio_lstx_release(acio);
+		if (ret) {
+			dev_err(acio->dev, "failed to hand over the LSTX pin: %d\n", ret);
+			goto err_shutdown_rtkit;
 		}
 	}
 
@@ -2744,6 +2806,8 @@ err_depopulate:
 err_shutdown_rtkit:
 	/* Ignore errors here since we're about to cut power to the entire block anyway */
 	apple_rtkit_poweroff(acio->rtk);
+	if (acio->hw->lstx_after_boot)
+		apple_cio_lstx_hold(acio, false);
 err_free_rtkit:
 	apple_rtkit_free(acio->rtk);
 remove_links:
@@ -3194,6 +3258,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 		acio->lstx_pins = pinctrl_lookup_state(acio->pinctrl, "lstx");
 		if (IS_ERR(acio->lstx_pins))
 			acio->lstx_pins = NULL;
+		acio->lstx_hold = acio->lstx_pins &&
+				  of_property_present(dev->of_node, "lstx-gpios");
 	}
 	acio->pcie_tunnel_np =
 		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);

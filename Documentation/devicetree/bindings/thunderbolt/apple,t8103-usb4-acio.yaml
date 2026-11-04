@@ -83,6 +83,11 @@ properties:
       Marks this root complex as the USB4/Thunderbolt switch that the Type-C
       PD controller hands cable information to, so the Type-C mux can find it.
 
+  lstx-gpios:
+    maxItems: 1
+    description:
+      GPIO on the pin that carries the router's LSTX sideband signal.
+
   apple,pcie-tunnel:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -193,6 +198,12 @@ allOf:
           minItems: 4
         reg-names:
           minItems: 4
+        pinctrl-names:
+          items:
+            - const: lstx
+    else:
+      properties:
+        lstx-gpios: false
 
 additionalProperties: false
 
