@@ -15,6 +15,20 @@
 / {
 	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
 	model = "Apple MacBook Pro (16-inch, M4 Max)";
+
+	/* aura opens a co-processor's DAPF only if it finds its alias here. */
+	aliases {
+		aop = &aop;
+		mtp = &mtp;
+	};
+};
+
+&smc {
+	smc_gpio_low: gpio@67700000 {
+		compatible = "apple,smc-low-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
 };
 
 /* ADT /arm-io/wlan module-instance */
@@ -47,8 +61,20 @@
 	model = "MacBook Pro J616 Jack";
 };
 
+/*
+ * The AFE and STM resets are SMC GPIOs here, not the J616s's gp1c sequence, and
+ * the MTP works without the J616s's ring transport.
+ */
+&mtp_hid {
+	/delete-property/ apple,afe-smc;
+	compatible = "apple,dockchannel-hid";
+	apple,afe-reset-gpios = <&smc_gpio_low 0x19 GPIO_ACTIVE_LOW>;
+	apple,stm-reset-gpios = <&smc_gpio_low 0x1a GPIO_ACTIVE_LOW>;
+};
+
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j616c.bin";
+	apple,power-method = <2>;
 };
 
 /*
