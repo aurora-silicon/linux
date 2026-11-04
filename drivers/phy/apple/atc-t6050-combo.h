@@ -277,6 +277,11 @@ static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 		return (readl(dp->banks[44] + 0xc) & 0x73) == 0x10 ? 0 : -EIO;
 	apple_tunable_apply(dp->banks[44], dp->pipe_default);
 	ret = apple_t6050_usb3_pipe_switch(&dp->usb_io);
+	if (ret >= -6 && ret < 0 && (readl(dp->banks[44] + 0xc) & 0x73) == 0x42) {
+		/* The PIPE never left its dummy producer: the port stays USB2, as with four DP lanes. */
+		dev_warn(dp->dev, "USB3 PIPE switch failed (%d), the port runs USB2 only\n", ret);
+		return 0;
+	}
 	if (ret)
 		combo_pipe_fault(dp, "USB3 PIPE switch", ret);
 	else
