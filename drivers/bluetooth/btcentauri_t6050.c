@@ -619,16 +619,36 @@ static int cen_hci_post_init(struct hci_dev *hdev)
 	return 0;
 }
 
+/*
+ * The factory address in network byte order, for the firmware's provisioning command: from
+ * the standard local-bd-address (least significant byte first, as boot loaders fill it from
+ * the bluetooth0 alias), else from local-mac-address (already in network order).
+ */
+static int cen_bt_address(struct device *dev, u8 address[6])
+{
+	u8 bd[6];
+	int i, ret;
+
+	if (device_property_count_u8(dev, "local-bd-address") == 6) {
+		ret = device_property_read_u8_array(dev, "local-bd-address", bd, sizeof(bd));
+		if (ret)
+			return ret;
+		for (i = 0; i < 6; i++)
+			address[i] = bd[5 - i];
+		return 0;
+	}
+	if (device_property_count_u8(dev, "local-mac-address") != 6)
+		return -EINVAL;
+	return device_property_read_u8_array(dev, "local-mac-address", address, 6);
+}
+
 static int cen_hci_setup(struct hci_dev *hdev)
 {
 	struct cen_bt *bt = hci_get_drvdata(hdev);
 	u8 address[6], init_done[16], seed[24];
 	int ret;
 
-	if (device_property_count_u8(&bt->pdev->dev, "local-mac-address") != 6)
-		return -EINVAL;
-	ret = device_property_read_u8_array(&bt->pdev->dev, "local-mac-address",
-					    address, sizeof(address));
+	ret = cen_bt_address(&bt->pdev->dev, address);
 	if (ret)
 		return ret;
 	if (is_zero_ether_addr(address) || is_broadcast_ether_addr(address))
