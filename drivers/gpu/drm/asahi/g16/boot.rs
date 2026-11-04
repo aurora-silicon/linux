@@ -60,7 +60,7 @@ pub(crate) mod glue {
         ) -> core::ffi::c_int;
     }
 
-    /// A qualified J713/T8132 board.
+    /// A qualified T8132 board (J713, J773g).
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g16_board() }
