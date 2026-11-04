@@ -247,15 +247,16 @@ allOf:
       properties:
         reg:
           minItems: 5
-          maxItems: 14
+          maxItems: 18
         reg-names:
           description:
             config and rc, then port<n>, phy<n> and intr2axi<n> for each
-            bootloader-trained root port 00:<n>.0.
+            bootloader-trained root port 00:<n>.0, and perst<n> (its PERST#
+            pad) for a port whose endpoint needs a root-port reset.
           minItems: 5
-          maxItems: 14
+          maxItems: 18
           items:
-            pattern: "^(config|rc|(port|phy|intr2axi)[0-3])$"
+            pattern: "^(config|rc|(port|phy|intr2axi|perst)[0-3])$"
         interrupts:
           maxItems: 4
         interrupt-names:
