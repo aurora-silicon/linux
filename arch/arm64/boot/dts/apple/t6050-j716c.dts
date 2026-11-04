@@ -13,6 +13,7 @@
 
 /dts-v1/;
 
+#define T6050_J716C
 #include "t6050-max.dtsi"
 
 / {
@@ -220,5 +221,124 @@
 	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
 };
 
-#define T6050_J716C
 #include "t6050-peripherals.dtsi"
+
+/*
+ * ==== The right USB-C port (ATC2) ====
+ *
+ * ADT /arm-io/nub-spmi-a1/hpm2 (SN201202x, SPMI address 0xc, port-number 3, port-location
+ * "right", acio-parent acio2), atc-phy2, usb-drd2 and dart-usb2. The HPM is on its own bus,
+ * nub-spmi-a1, and nothing hands the port off, so the chain is enabled outright. Aura's
+ * kboot_setup_atc() fills the PHY's tunables through the atcphy2 alias.
+ */
+/ {
+	aliases {
+		atcphy2 = &atc2_phy;
+	};
+};
+
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_phymxwrap {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&atc2_phy_mbox {
+	status = "okay";
+};
+
+&atc2_phy {
+	status = "okay";
+
+	port {
+		atc2_phy_ep: endpoint {
+			remote-endpoint = <&hpm2_ss>;
+		};
+	};
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	port {
+		usb_drd2_hs: endpoint {
+			remote-endpoint = <&hpm2_hs>;
+		};
+	};
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+/*
+ * dcpext0's Type-C route stays off with dcpext0: a mode-switch endpoint whose mux is never
+ * registered would defer the PD controller forever.
+ */
+&dcpext0 {
+	typec-routes {
+		route@0 {
+			status = "disabled";
+
+			port {
+				dcpext0_typec: endpoint {
+					remote-endpoint = <&hpm2_dp>;
+				};
+			};
+		};
+	};
+};
+
+&nub_spmi_a1 {
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm2_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm2_ss: endpoint {
+						remote-endpoint = <&atc2_phy_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					hpm2_dp: endpoint {
+						remote-endpoint = <&dcpext0_typec>;
+					};
+				};
+			};
+		};
+	};
+};

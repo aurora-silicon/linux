@@ -1319,7 +1319,7 @@
 	};
 #endif
 
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
+#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
 	nub_spmi_a1: spmi@28a1a8000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
 		reg = <0x2 0x8a1a8000 0x0 0x4000>,
