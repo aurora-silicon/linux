@@ -23,7 +23,9 @@ apple_t6050_usb3_pipe_cold_dummy(const struct apple_t6050_usb_io *io)
     if (io->read(io->context, 44, 0x1c) & 1)
         return -1;
     mux = io->read(io->context, 44, 0x0c) & 0x73;
-    if (mux != 0 && mux != 2 && mux != 0x42)
+    /* Unset, or already on the dummy producer (1:0 = 2) with any clock: when nothing
+     * has reset the controller domain since boot, the mux can read 0x22. */
+    if (mux != 0 && (mux & 3) != 2)
         return -1;
     if (mux == 0x42)
         return 0;
