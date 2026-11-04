@@ -478,6 +478,13 @@ static inline bool apple_t8132_firmware_path(void)
 {
 	return apple_t8132_air();
 }
+
+/* Production: <linux/soc/apple/pmp-display.h>. */
+static inline bool apple_pmp_t8132_retained_board(void)
+{
+	return apple_t8132_firmware_path() &&
+	       of_machine_is_compatible("apple,t8132");
+}
 static bool of_property_read_bool(const struct device_node *n, const char *p)
 {
 	if (!strcmp(p, "apple,always-on"))
