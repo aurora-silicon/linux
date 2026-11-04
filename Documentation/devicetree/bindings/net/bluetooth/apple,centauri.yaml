@@ -24,15 +24,25 @@ properties:
     maxItems: 1
     description: Standard five-cell PCI function address
 
+  local-bd-address:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 6
+    maxItems: 6
+    description: Factory Bluetooth public address, least significant byte
+      first (the standard Bluetooth property a boot loader fills)
+
   local-mac-address:
     $ref: /schemas/types.yaml#/definitions/uint8-array
     minItems: 6
     maxItems: 6
     description: Factory Bluetooth public address in network byte order
 
+oneOf:
+  - required: [local-bd-address]
+  - required: [local-mac-address]
+
 required:
   - compatible
   - reg
-  - local-mac-address
 
 additionalProperties: false
