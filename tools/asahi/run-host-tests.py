@@ -82,7 +82,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
     'brcmf-join-retry-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('repeat', 'rejection', 'constraints'), out()),
+        + mutations('--mutation', ('repeat', 'rejection', 'constraints', 'stale-auth'), out()),
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],

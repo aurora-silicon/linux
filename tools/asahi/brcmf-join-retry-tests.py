@@ -102,6 +102,8 @@ static bool check_vif_up(struct brcmf_cfg80211_vif *v){(void)v;return true;}
 static int brcmf_fil_bsscfg_data_set(struct brcmf_if *i,const char *s,void *p,u32 n){
  assert(!strcmp(s,"join")&&p&&n&&i->drvr->bus_if->state==BRCMF_BUS_UP);
  assert(!i->vif->join_retry&&!i->vif->join_retry_size);
+ assert(!test_bit(BRCMF_VIF_STATUS_EAP_SUCCESS,&i->vif->sme_state));
+ assert(!test_bit(BRCMF_VIF_STATUS_ASSOC_SUCCESS,&i->vif->sme_state));
  assert(pthread_mutex_trylock(&i->vif->connect_sync)==EBUSY);
  commands++;return command_failure;
 }
@@ -170,7 +172,7 @@ int main(void){
   bool retry=(!p.bssid&&p.bssid_hint)||(!p.channel&&p.channel_hint);
   assert(!!vif.join_retry==retry);assert(!memcmp(&p,&before,sizeof(p)));
   if(retry)check_payload(vif.join_retry,version,p.bssid,p.channel);
-  vif.sme_state=BIT(BRCMF_VIF_STATUS_CONNECTING);commands=0;
+  vif.sme_state=BIT(BRCMF_VIF_STATUS_CONNECTING)|BIT(BRCMF_VIF_STATUS_EAP_SUCCESS)|BIT(BRCMF_VIF_STATUS_ASSOC_SUCCESS);commands=0;
   assert(brcmf_retry_join(&ifp,&missing)==retry);assert(commands==retry);
   assert(!brcmf_retry_join(&ifp,&missing)&&commands==retry);
   assert(!vif.join_retry&&!vif.join_retry_size&&allocations==0);cases++;
@@ -219,7 +221,7 @@ int main(void){
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=Path)
-    parser.add_argument('--mutation', choices=['repeat', 'rejection', 'constraints'])
+    parser.add_argument('--mutation', choices=['repeat', 'rejection', 'constraints', 'stale-auth'])
     args = parser.parse_args()
     cfg = (DRIVER / 'cfg80211.c').read_text()
     join = (DRIVER / 'join_param.c').read_text()
@@ -253,6 +255,13 @@ def main():
     elif args.mutation == 'constraints':
         body = body.replace('retry.bssid_hint = NULL;', 'retry.bssid = NULL; retry.bssid_hint = NULL;')
         body = body.replace('retry.channel_hint = NULL;', 'retry.channel = NULL; retry.channel_hint = NULL;')
+    elif args.mutation == 'stale-auth':
+        start = body.index('static bool brcmf_retry_join(')
+        end = body.index('static s32', start)
+        retry = body[start:end]
+        retry = retry.replace('clear_bit(BRCMF_VIF_STATUS_EAP_SUCCESS, &vif->sme_state);', '')
+        retry = retry.replace('clear_bit(BRCMF_VIF_STATUS_ASSOC_SUCCESS, &vif->sme_state);', '')
+        body = body[:start] + retry + body[end:]
     code = PREFIX + constants + '\n' + structs + body + MAIN
 
     def run(out):

@@ -6949,6 +6949,8 @@ static bool brcmf_retry_join(struct brcmf_if *ifp,
 		/* Consume before submitting: another failure is terminal. */
 		vif->join_retry = NULL;
 		vif->join_retry_size = 0;
+		clear_bit(BRCMF_VIF_STATUS_EAP_SUCCESS, &vif->sme_state);
+		clear_bit(BRCMF_VIF_STATUS_ASSOC_SUCCESS, &vif->sme_state);
 		brcmf_dbg(CONN, "Retrying join without BSS hints\n");
 		err = brcmf_fil_bsscfg_data_set(ifp, "join", params, size);
 		kfree(params);
