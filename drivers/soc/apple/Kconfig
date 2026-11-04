@@ -283,7 +283,7 @@ config APPLE_DISPLAY_GATE
 	  not come up, also keeps the GPU off for that boot. It is not a
 	  display-only switch.
 
-	  On T6041 (M4 Pro) device trees it enables the internal display nodes
+	  On T6041 (M4 Pro and M4 Max) device trees it enables the internal display nodes
 	  only when the boot loader has handed the running display coprocessor
 	  over (apple,t6041-handoff, 26.6.2 display firmware), and powers up
 	  the J616s external display chain (HDMI, Type-C DisplayPort) once the
@@ -296,7 +296,7 @@ config APPLE_DISPLAY_GATE
 	  meanwhile, and take the display routes once the chain is up.
 
 	  Say 'y' if you want the native display on M3 Pro, M3 Max, M3 and
-	  M4 Pro Macs.
+	  M4 Pro and M4 Max Macs.
 
 config APPLE_T6030_GPU_PMP_LINK
 	bool

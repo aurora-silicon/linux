@@ -67,7 +67,8 @@
  * T6031 boot the gate also logs what the boot loader handed over, so that
  * a boot without the option already records what the next one needs.
  *
- * On T6041 (the display coprocessor of the M4 Pro, apple,t6040) m1n1 hands
+ * On T6041 (the display coprocessor of the M4 Pro, apple,t6040, and of the
+ * M4 Max, apple,t6041) m1n1 hands
  * over the DCP that iBoot leaves running. It marks the DCP, the display
  * subsystem and the DCP's piodma child with apple,t6041-handoff and names
  * the display firmware in apple,firmware-compat. There is no PMP to add or
@@ -327,11 +328,23 @@ static const struct gate_soc gate_t6041 __initconst = {
 	.run = gate_t6041_run,
 };
 
+/* The same display block on the M4 Max: root compatible apple,t6041. */
+static const struct gate_soc gate_t6041_max __initconst = {
+	.machine = "apple,t6041",
+	.prefix = "apple-t6041-display: ",
+	.name = "T6041",
+	.dcp_compat = "apple,t6041-dcp",
+	.display_compat = "apple,display-subsystem",
+	.marker = "apple,t6041-handoff",
+	.run = gate_t6041_run,
+};
+
 static const struct gate_soc *const gate_socs[] __initconst = {
 	&gate_t6030,
 	&gate_t8122,
 	&gate_t6031,
 	&gate_t6041,
+	&gate_t6041_max,
 };
 
 /* The SoC this boot runs on, if the gate serves it. */
