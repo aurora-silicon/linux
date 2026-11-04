@@ -1665,15 +1665,26 @@ static int brcmf_set_pmk(struct brcmf_if *ifp, const u8 *pmk_data, u16 pmk_len)
 	return brcmf_set_wsec(ifp, pmk_data, pmk_len, 0);
 }
 
+/* Caller holds connect_sync, or has quiesced the interface event handler. */
+static void brcmf_clear_join_retry(struct brcmf_cfg80211_vif *vif)
+{
+	kfree(vif->join_retry);
+	vif->join_retry = NULL;
+	vif->join_retry_size = 0;
+}
+
 static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
 			    bool locally_generated)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(vif->wdev.wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
-	bool bus_up = drvr->bus_if->state == BRCMF_BUS_UP;
+	bool bus_up;
 	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
+	mutex_lock(&vif->connect_sync);
+	bus_up = drvr->bus_if->state == BRCMF_BUS_UP;
+	brcmf_clear_join_retry(vif);
 
 	if (test_and_clear_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state)) {
 		if (bus_up) {
@@ -1700,6 +1711,7 @@ static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
 			brcmf_set_pmk(vif->ifp, NULL, 0);
 		vif->profile.use_fwsup = BRCMF_PROFILE_FWSUP_NONE;
 	}
+	mutex_unlock(&vif->connect_sync);
 	brcmf_dbg(TRACE, "Exit\n");
 }
 
@@ -2437,6 +2449,27 @@ static void brcmf_set_join_pref(struct brcmf_if *ifp,
 		bphy_err(drvr, "Set join_pref error (%d)\n", err);
 }
 
+static int brcmf_prepare_join_retry(struct brcmf_if *ifp,
+				    struct cfg80211_connect_params *params)
+{
+	struct brcmf_cfg80211_vif *vif = ifp->vif;
+	struct cfg80211_connect_params retry = *params;
+	struct brcmf_pub *drvr = ifp->drvr;
+
+	/* Only relax recommendations, never an explicitly selected AP/channel. */
+	if ((!params->bssid_hint || params->bssid) &&
+	    (!params->channel_hint || params->channel))
+		return 0;
+
+	retry.bssid_hint = NULL;
+	retry.channel_hint = NULL;
+	vif->join_retry =
+		drvr->join_param_handler.get_struct_for_connect(drvr->config,
+						       &vif->join_retry_size,
+						       &retry);
+	return vif->join_retry ? 0 : -ENOMEM;
+}
+
 static s32
 brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		       struct cfg80211_connect_params *params)
@@ -2465,11 +2498,11 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		return -EOPNOTSUPP;
 	}
 
-	if (params->channel_hint)
-		chan = params->channel_hint;
+	mutex_lock(&ifp->vif->connect_sync);
+	brcmf_clear_join_retry(ifp->vif);
 
-	if (params->bssid_hint)
-		params->bssid = params->bssid_hint;
+	if (!chan && params->channel_hint)
+		chan = params->channel_hint;
 
 	if (ifp->vif == cfg->p2p.bss_idx[P2PAPI_BSSCFG_PRIMARY].vif) {
 		/* A normal (non P2P) connection request setup. */
@@ -2595,6 +2628,15 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 			  params->ssid_len);
 	join_params = drvr->join_param_handler.get_struct_for_connect(
 		cfg, &join_params_size, params);
+	if (!join_params) {
+		err = -ENOMEM;
+		goto done;
+	}
+	err = brcmf_prepare_join_retry(ifp, params);
+	if (err) {
+		kfree(join_params);
+		goto done;
+	}
 
 	if (join_params) {
 		err = brcmf_fil_bsscfg_data_set(ifp, "join", join_params,
@@ -2607,6 +2649,8 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 			/* This is it. join command worked, we are done */
 			goto done;
 		}
+		/* A legacy SET_SSID fallback cannot retry the join iovar. */
+		brcmf_clear_join_retry(ifp->vif);
 		/* For versions >= 1, this should have worked, so report the error */
 		if (drvr->join_param_handler.version >= 1) {
 			bphy_err(drvr, "Failed to use join iovar to join: %d\n",
@@ -2632,8 +2676,11 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		bphy_err(drvr, "BRCMF_C_SET_SSID failed (%d)\n", err);
 
 done:
-	if (err)
+	if (err) {
+		brcmf_clear_join_retry(ifp->vif);
 		clear_bit(BRCMF_VIF_STATUS_CONNECTING, &ifp->vif->sme_state);
+	}
+	mutex_unlock(&ifp->vif->connect_sync);
 	brcmf_dbg(TRACE, "Exit\n");
 	return err;
 }
@@ -2653,6 +2700,8 @@ brcmf_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	if (!check_vif_up(ifp->vif))
 		return -EIO;
 
+	mutex_lock(&ifp->vif->connect_sync);
+	brcmf_clear_join_retry(ifp->vif);
 	clear_bit(BRCMF_VIF_STATUS_CONNECTED, &ifp->vif->sme_state);
 	clear_bit(BRCMF_VIF_STATUS_CONNECTING, &ifp->vif->sme_state);
 	clear_bit(BRCMF_VIF_STATUS_EAP_SUCCESS, &ifp->vif->sme_state);
@@ -2666,6 +2715,7 @@ brcmf_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	if (err)
 		bphy_err(drvr, "error (%d)\n", err);
 
+	mutex_unlock(&ifp->vif->connect_sync);
 	brcmf_dbg(TRACE, "Exit\n");
 	return err;
 }
@@ -6316,6 +6366,7 @@ struct brcmf_cfg80211_vif *brcmf_alloc_vif(struct brcmf_cfg80211_info *cfg,
 	vif->wdev.wiphy = cfg->wiphy;
 	vif->wdev.iftype = type;
 	init_completion(&vif->mgmt_tx);
+	mutex_init(&vif->connect_sync);
 
 	brcmf_init_prof(&vif->profile);
 
@@ -6338,6 +6389,7 @@ struct brcmf_cfg80211_vif *brcmf_alloc_vif(struct brcmf_cfg80211_info *cfg,
 void brcmf_free_vif(struct brcmf_cfg80211_vif *vif)
 {
 	list_del(&vif->list);
+	brcmf_clear_join_retry(vif);
 	kfree(vif);
 }
 
@@ -6829,6 +6881,8 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 	bool authorized;
 
 	brcmf_dbg(TRACE, "Enter\n");
+	mutex_lock(&ifp->vif->connect_sync);
+	brcmf_clear_join_retry(ifp->vif);
 
 	if (test_and_clear_bit(BRCMF_VIF_STATUS_CONNECTING,
 			       &ifp->vif->sme_state)) {
@@ -6863,8 +6917,45 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		brcmf_dbg(CONN, "Report connect result - connection %s\n",
 			  completed ? "succeeded" : "failed");
 	}
+	mutex_unlock(&ifp->vif->connect_sync);
 	brcmf_dbg(TRACE, "Exit\n");
 	return 0;
+}
+
+static bool brcmf_retry_join(struct brcmf_if *ifp,
+			     const struct brcmf_event_msg *e)
+{
+	struct brcmf_cfg80211_vif *vif = ifp->vif;
+	struct brcmf_cfg80211_info *cfg = ifp->drvr->config;
+	void *params;
+	u32 size;
+	int err = -ENOENT;
+
+	/* A failed directed scan says nothing about other BSSes in the ESS.
+	 * Retry once without hints before exposing a failure to userspace.
+	 * Authentication failures and AP rejections must not take this path.
+	 */
+	if ((e->event_code != BRCMF_E_SET_SSID &&
+	     e->event_code != BRCMF_E_LINK) ||
+	    e->status != BRCMF_E_STATUS_NO_NETWORKS)
+		return false;
+
+	mutex_lock(&vif->connect_sync);
+	if (vif->join_retry && !cfg->suspended &&
+	    ifp->drvr->bus_if->state == BRCMF_BUS_UP &&
+	    test_bit(BRCMF_VIF_STATUS_CONNECTING, &vif->sme_state)) {
+		params = vif->join_retry;
+		size = vif->join_retry_size;
+		/* Consume before submitting: another failure is terminal. */
+		vif->join_retry = NULL;
+		vif->join_retry_size = 0;
+		brcmf_dbg(CONN, "Retrying join without BSS hints\n");
+		err = brcmf_fil_bsscfg_data_set(ifp, "join", params, size);
+		kfree(params);
+	}
+	mutex_unlock(&vif->connect_sync);
+
+	return !err;
 }
 
 static s32
@@ -6933,6 +7024,8 @@ brcmf_notify_connect_status(struct brcmf_if *ifp,
 
 	if (brcmf_is_apmode(ifp->vif)) {
 		err = brcmf_notify_connect_status_ap(cfg, ndev, e, data);
+	} else if (brcmf_retry_join(ifp, e)) {
+		return 0;
 	} else if (brcmf_is_linkup(ifp->vif, e)) {
 		brcmf_dbg(CONN, "Linkup\n");
 		if (brcmf_is_ibssmode(ifp->vif)) {

@@ -153,8 +153,9 @@ brcmf_get_struct_for_connect_v0(struct brcmf_cfg80211_info *cfg,
 				struct cfg80211_connect_params *params)
 {
 	struct brcmf_ext_join_params_le *ext_v0;
+	struct ieee80211_channel *chan = params->channel ?: params->channel_hint;
 	u32 join_params_size =
-		struct_size(ext_v0, assoc_le.chanspec_list, cfg->channel != 0);
+		struct_size(ext_v0, assoc_le.chanspec_list, !!chan);
 
 	*struct_size = join_params_size;
 	ext_v0 = kzalloc(join_params_size, GFP_KERNEL);
@@ -167,12 +168,10 @@ brcmf_get_struct_for_connect_v0(struct brcmf_cfg80211_info *cfg,
 	brcmf_joinscan_set_ssid(&ext_v0->ssid_le, params->ssid,
 				params->ssid_len);
 	brcmf_joinscan_set_common_v0v1_params(&ext_v0->scan_le,
-					      cfg->channel != 0);
-	brcmf_joinscan_set_bssid(ext_v0->assoc_le.bssid, params->bssid);
-	if (cfg->channel) {
-		struct ieee80211_channel *chan = params->channel_hint ?
-							 params->channel_hint :
-							 params->channel;
+					      !!chan);
+	brcmf_joinscan_set_bssid(ext_v0->assoc_le.bssid,
+				 params->bssid ?: params->bssid_hint);
+	if (chan) {
 		brcmf_joinscan_set_single_chanspec_from_channel(
 			cfg, chan, &ext_v0->assoc_le.chanspec_num,
 			&ext_v0->assoc_le.chanspec_list);
@@ -186,8 +185,9 @@ brcmf_get_struct_for_connect_v1(struct brcmf_cfg80211_info *cfg,
 				struct cfg80211_connect_params *params)
 {
 	struct brcmf_ext_join_params_v1_le *ext_v1;
+	struct ieee80211_channel *chan = params->channel ?: params->channel_hint;
 	u32 join_params_size =
-		struct_size(ext_v1, assoc_le.chanspec_list, cfg->channel != 0);
+		struct_size(ext_v1, assoc_le.chanspec_list, !!chan);
 
 	*struct_size = join_params_size;
 	ext_v1 = kzalloc(join_params_size, GFP_KERNEL);
@@ -202,12 +202,10 @@ brcmf_get_struct_for_connect_v1(struct brcmf_cfg80211_info *cfg,
 	brcmf_joinscan_set_ssid(&ext_v1->ssid_le, params->ssid,
 				params->ssid_len);
 	brcmf_joinscan_set_common_v0v1_params(&ext_v1->scan_le,
-					      cfg->channel != 0);
-	brcmf_joinscan_set_bssid(ext_v1->assoc_le.bssid, params->bssid);
-	if (cfg->channel) {
-		struct ieee80211_channel *chan = params->channel_hint ?
-							 params->channel_hint :
-							 params->channel;
+					      !!chan);
+	brcmf_joinscan_set_bssid(ext_v1->assoc_le.bssid,
+				 params->bssid ?: params->bssid_hint);
+	if (chan) {
 		brcmf_joinscan_set_single_chanspec_from_channel(
 			cfg, chan, &ext_v1->assoc_le.chanspec_num,
 			&ext_v1->assoc_le.chanspec_list);

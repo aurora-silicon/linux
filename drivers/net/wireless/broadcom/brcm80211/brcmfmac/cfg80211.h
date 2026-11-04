@@ -231,6 +231,9 @@ struct vif_saved_ie {
  * @wdev: wireless device.
  * @profile: profile information.
  * @sme_state: SME state using enum brcmf_vif_status bits.
+ * @connect_sync: serializes join submission, retry and cancellation.
+ * @join_retry: join parameters without optional BSS hints, or NULL.
+ * @join_retry_size: size of join_retry.
  * @saved_ie: saved IE info for a vif.
  * @list: linked list.
  * @mgmt_tx: completion for management frame transmit.
@@ -248,6 +251,10 @@ struct brcmf_cfg80211_vif {
 	struct wireless_dev wdev;
 	struct brcmf_cfg80211_profile profile;
 	unsigned long sme_state;
+	/* Protects join submission, retry ownership and cancellation. */
+	struct mutex connect_sync;
+	void *join_retry;
+	u32 join_retry_size;
 	struct vif_saved_ie saved_ie;
 	struct list_head list;
 	struct completion mgmt_tx;
