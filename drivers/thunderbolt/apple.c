@@ -93,6 +93,7 @@
 #include <linux/of_platform.h>
 #include <linux/notifier.h>
 #include <linux/pci-apple.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -132,6 +133,10 @@
 struct apple_cio_hw {
 	bool mxwrap;
 	bool lstx_explicit;
+	/* Leave MxWrap RUN alone: the CIO reconfig restarts the CPU. */
+	bool skip_run;
+	/* Hand LSTX to the router after RTKit boot, not before it. */
+	bool lstx_after_boot;
 	bool strict_fw_ready;
 	const struct apple_dpin_policy *dp;
 };
@@ -149,6 +154,21 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.lstx_explicit = true,
 	.strict_fw_ready = true,
 	.dp = &apple_dpin_m3,
+};
+
+/*
+ * T8132 has the T6030 ACIO layout and MxWrap CPU block, but the CIO reconfig
+ * already starts the CPU from its preloaded SRAM: RUN is never written. LSTX
+ * is handed over once RTKit is up, followed by the LSTX pin. It has no
+ * qualified DP route yet.
+ */
+static const struct apple_cio_hw apple_cio_t8132_hw = {
+	.mxwrap = true,
+	.lstx_explicit = true,
+	.skip_run = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.dp = &apple_dpin_disabled,
 };
 
 /* Type 7 uses its existing ready-state check and has no qualified DP route. */
@@ -254,6 +274,8 @@ struct apple_cio {
 	struct device_node *np;
 	const struct apple_cio_hw *hw;
 	const struct apple_dpin_policy *dp;
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *lstx_pins;
 	void __iomem *cpu_base;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
@@ -2615,7 +2637,9 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * remaining fields are undocumented, so preserve them rather than clearing
 	 * them with a bare store.
 	 */
-	if (acio->hw->lstx_explicit) {
+	if (acio->hw->lstx_after_boot) {
+		/* Written below, once RTKit is up. */
+	} else if (acio->hw->lstx_explicit) {
 		writel(APPLE_CIO_LSTX_CTRL_ENABLE | APPLE_CIO_LSTX_CTRL_LEVEL,
 		       acio->rc_base + APPLE_CIO_M3_CTRL);
 	} else {
@@ -2623,7 +2647,7 @@ static int apple_cio_start(struct apple_cio *acio)
 		writel(val | APPLE_CIO_M3_CTRL_START, acio->rc_base + APPLE_CIO_M3_CTRL);
 	}
 
-	if (acio->hw->mxwrap) {
+	if (acio->hw->mxwrap && !acio->hw->skip_run) {
 		apple_cio_log_state(acio, "before RUN");
 		val = readl(acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
 		writel(val | APPLE_MXWRAP_CPU_CTRL_RUN,
@@ -2642,6 +2666,21 @@ static int apple_cio_start(struct apple_cio *acio)
 		dev_err(acio->dev, "M3 RTKit failed to boot: %d\n", ret);
 		apple_cio_log_state(acio, "RTKit boot failed");
 		goto err_free_rtkit;
+	}
+
+	/*
+	 * The router takes LSTX over at the level it last drove, low after a
+	 * cold start, and then gets its pin back from the AOP GPIO controller.
+	 */
+	if (acio->hw->lstx_after_boot) {
+		writel(APPLE_CIO_LSTX_CTRL_ENABLE, acio->rc_base + APPLE_CIO_M3_CTRL);
+		if (acio->lstx_pins) {
+			ret = pinctrl_select_state(acio->pinctrl, acio->lstx_pins);
+			if (ret) {
+				dev_err(acio->dev, "failed to hand over the LSTX pin: %d\n", ret);
+				goto err_shutdown_rtkit;
+			}
+		}
 	}
 
 	if (acio->hw->strict_fw_ready)
@@ -3147,6 +3186,15 @@ static int apple_cio_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, PTR_ERR(acio->cpu_base),
 					     "Unable to map MxWrap cpu regs\n");
 	}
+	if (acio->hw->lstx_after_boot) {
+		acio->pinctrl = devm_pinctrl_get(dev);
+		if (IS_ERR(acio->pinctrl))
+			return dev_err_probe(dev, PTR_ERR(acio->pinctrl),
+					     "Unable to get the LSTX pin\n");
+		acio->lstx_pins = pinctrl_lookup_state(acio->pinctrl, "lstx");
+		if (IS_ERR(acio->lstx_pins))
+			acio->lstx_pins = NULL;
+	}
 	acio->pcie_tunnel_np =
 		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
 	if (acio->pcie_tunnel_np) {
@@ -3326,6 +3374,10 @@ static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t8142-usb4-acio",
 		.data = &apple_cio_t8142_hw,
+	},
+	{
+		.compatible = "apple,t8132-usb4-acio",
+		.data = &apple_cio_t8132_hw,
 	},
 	{
 		.compatible = "apple,t6030-usb4-acio",

@@ -860,6 +860,7 @@
 };
 
 #include "t8132-pmgr.dtsi"
+#include "t8132-usb4.dtsi"
 
 /* Shared controller resources; board files select the qualified devices. */
 &soc {
