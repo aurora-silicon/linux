@@ -151,6 +151,12 @@ struct mca_cluster {
 	int tdm_slot_width;
 	unsigned int tdm_tx_mask;
 	unsigned int tdm_rx_mask;
+
+	/*
+	 * Capture: the byte offset in the buffer up to which the CPU's view
+	 * has been synced with what the DMA wrote (see mca_capture_sync()).
+	 */
+	size_t capture_synced;
 };
 
 struct mca_data {
@@ -1010,13 +1016,65 @@ static int mca_close(struct snd_soc_component *component,
 	return snd_dmaengine_pcm_close(substream);
 }
 
+/*
+ * The capture buffers are cacheable (SNDRV_DMA_TYPE_NONCOHERENT): reading
+ * them through an uncached mapping costs the reader several times the
+ * copy itself. The CPU's view of what the DMA wrote is made current here,
+ * before the position that covers it is returned and so before ALSA
+ * publishes it as hw_ptr: no reader can look at a frame before its cache
+ * lines were invalidated after the DMA wrote it. A line that is still being
+ * written at the reported position is invalidated again with the next
+ * range, which starts on it. The CPU never writes a capture buffer, so no
+ * dirty line can be written back over the DMA's data.
+ */
+static bool mca_capture_noncoherent(struct snd_pcm_substream *substream)
+{
+	return substream->stream == SNDRV_PCM_STREAM_CAPTURE && substream->runtime &&
+	       substream->runtime->dma_buffer_p &&
+	       substream->runtime->dma_buffer_p->dev.type == SNDRV_DMA_TYPE_NONCOHERENT;
+}
+
+static void mca_capture_sync(struct mca_cluster *cl, struct snd_pcm_substream *substream,
+			     size_t to)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct device *dev = runtime->dma_buffer_p->dev.dev;
+	size_t bytes = snd_pcm_lib_buffer_bytes(substream);
+	size_t from = cl->capture_synced;
+
+	if (to >= bytes)
+		return;
+	if (to < from) {
+		dma_sync_single_for_cpu(dev, runtime->dma_addr + from, bytes - from,
+					DMA_FROM_DEVICE);
+		from = 0;
+	}
+	if (to > from)
+		dma_sync_single_for_cpu(dev, runtime->dma_addr + from, to - from,
+					DMA_FROM_DEVICE);
+	cl->capture_synced = to;
+}
+
 static int mca_trigger(struct snd_soc_component *component,
 		       struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct mca_cluster *cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(rtd, 0));
 
 	if (rtd->dai_link->no_pcm)
 		return 0;
+
+	/*
+	 * The DMA starts again at the buffer's start: hand the whole buffer to
+	 * it, with no line the CPU may have cached from the previous run.
+	 */
+	if (cmd == SNDRV_PCM_TRIGGER_START && mca_capture_noncoherent(substream)) {
+		dma_sync_single_for_device(substream->runtime->dma_buffer_p->dev.dev,
+					   substream->runtime->dma_addr,
+					   snd_pcm_lib_buffer_bytes(substream),
+					   DMA_FROM_DEVICE);
+		cl->capture_synced = 0;
+	}
 
 	/*
 	 * Before we do the PCM trigger proper, insert an opportunity
@@ -1031,11 +1089,16 @@ static snd_pcm_uframes_t mca_pointer(struct snd_soc_component *component,
 				     struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	snd_pcm_uframes_t pos;
 
 	if (rtd->dai_link->no_pcm)
 		return -ENOTSUPP;
 
-	return snd_dmaengine_pcm_pointer(substream);
+	pos = snd_dmaengine_pcm_pointer(substream);
+	if (mca_capture_noncoherent(substream))
+		mca_capture_sync(mca_dai_to_cluster(snd_soc_rtd_to_cpu(rtd, 0)), substream,
+				 frames_to_bytes(substream->runtime, pos));
+	return pos;
 }
 
 static struct dma_chan *mca_request_dma_channel(struct mca_cluster *cl, unsigned int stream)
@@ -1109,9 +1172,18 @@ static int mca_pcm_new(struct snd_soc_component *component,
 		}
 
 		cl->dma_chans[i] = chan;
-		snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
-					   chan->device->dev, 512 * 1024 * 6,
-					   SIZE_MAX);
+		/*
+		 * Capture is read by the CPU: cacheable, synced in mca_pointer().
+		 * Allocated at hw_params to the buffer's own size, as ALSA syncs
+		 * the whole allocation on every read.
+		 */
+		if (i == SNDRV_PCM_STREAM_CAPTURE)
+			snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_NONCOHERENT,
+						   chan->device->dev, 0, SIZE_MAX);
+		else
+			snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
+						   chan->device->dev, 512 * 1024 * 6,
+						   SIZE_MAX);
 	}
 
 	return 0;
