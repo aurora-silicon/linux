@@ -190,6 +190,26 @@
 #define DART_T8110_ENABLE_STREAMS  0xc00
 #define DART_T8110_DISABLE_STREAMS 0xc20
 
+/*
+ * Revision 2.2 and later moved the error mask; 2.4 also moved the error
+ * status, the error interrupt enable and the per-stream error enables.
+ */
+#define DART_T8110_V2_ERROR_MASK 0x4060
+#define DART_T8110_ERR_IRQ_STATUS 0x704
+#define DART_T8110_ERR_IRQ_ENABLE 0x700
+#define DART_T8110_ERR_SID_ENABLE(i) (0x720 + 4 * (i))
+#define DART_T8110_V24_ERR_IRQ_STATUS 0x4204
+#define DART_T8110_V24_ERR_IRQ_ENABLE 0x4200
+#define DART_T8110_V24_ERR_SID_ENABLE(i) (0x4220 + 4 * (i))
+
+/* PARAMS1 bit 29: client partitions (the 0x800.. registers) exist. */
+#define DART_T8110_PARAMS1_CLIENT_PARTITIONS BIT(29)
+#define DART_T8110_CLIENT_PARTITION_BASE 0x800
+#define DART_T8110_CLIENT_PARTITION_END 0x1000
+/* PARAMS2 bit 4: a translation context cache that a full flush leaves alone. */
+#define DART_T8110_PARAMS2_CTC BIT(4)
+#define DART_T8110_CTC_FLUSH 0x600
+
 #define DART_T8110_TCR                  0x1000
 #define DART_T8110_TCR_REMAP            GENMASK(11, 8)
 #define DART_T8110_TCR_REMAP_ENABLE     BIT(7)
@@ -310,6 +330,16 @@ struct apple_dart {
 	bool reset_incomplete;
 	struct apple_tunable *tunables;
 	u16 version;
+
+	/*
+	 * Set up from the device tree for a DART nothing else initialised:
+	 * tunables applied at every reset, streams kept in static bypass, every
+	 * error reported, and the context cache flushed after a full TLB flush.
+	 */
+	DECLARE_BITMAP(static_bypass, DART_MAX_STREAMS);
+	bool full_errors;
+	bool ctc_flush;
+	bool client_partitions;
 
 	/* J713 internal display DARTs, borrowed from the running DCP. */
 	struct apple_dart_dcp *dcp;
@@ -1377,6 +1407,10 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 		if (ret)
 			break;
 	}
+	/* A V2 flush leaves the context cache alone: flush all of it after. */
+	if (!ret && dart->ctc_flush && dart->version >= 0x0202 &&
+	    command == DART_T8110_TLB_CMD_OP_FLUSH_SID)
+		apple_dart_writel(dart, 0, DART_T8110_CTC_FLUSH);
 	spin_unlock_irqrestore(&dart->lock, flags);
 	if (ret)
 		dev_err_ratelimited(dart->dev,
@@ -1750,6 +1784,59 @@ apple_dart_t8110_hw_enable_remap(struct apple_dart *dart, int sid, int remap_to)
  * acknowledge the errors latched so far, unlock a DART that locks on errors,
  * unmask the error interrupt and flush the TLBs.
  */
+/*
+ * Unmask every error and enable its interrupt for each stream, with the
+ * registers of this revision: the T8110 reset value leaves them masked on
+ * 2.2 and later, where the error mask is no longer at ERROR_MASK.
+ */
+static void apple_dart_t8110_enable_errors(struct apple_dart *dart)
+{
+	bool v24 = dart->version >= 0x0204;
+	unsigned int i;
+
+	apple_dart_writel(dart, 0, dart->version >= 0x0202 ?
+			  DART_T8110_V2_ERROR_MASK : DART_T8110_ERROR_MASK);
+	apple_dart_readl(dart, dart->version >= 0x0202 ?
+			 DART_T8110_V2_ERROR_MASK : DART_T8110_ERROR_MASK);
+	apple_dart_writel(dart, U32_MAX, v24 ? DART_T8110_V24_ERR_IRQ_STATUS :
+			  DART_T8110_ERR_IRQ_STATUS);
+	apple_dart_writel(dart, U32_MAX, v24 ? DART_T8110_V24_ERR_IRQ_ENABLE :
+			  DART_T8110_ERR_IRQ_ENABLE);
+	for (i = 0; i < DIV_ROUND_UP(dart->num_streams, 32); i++) {
+		u32 sids = dart->num_streams >= 32 * (i + 1) ? U32_MAX :
+			   GENMASK(dart->num_streams - 32 * i - 1, 0);
+
+		apple_dart_writel(dart, sids, v24 ? DART_T8110_V24_ERR_SID_ENABLE(i) :
+				  DART_T8110_ERR_SID_ENABLE(i));
+	}
+	/* No lock on error: the driver acknowledges and carries on. */
+	apple_dart_writel(dart, 0, DART_T8110_DIAG_LOCK);
+}
+
+/*
+ * Apply the DART's own tunables. Client partition registers exist only where
+ * PARAMS1 says so; a write to one that does not exist is skipped.
+ */
+static void apple_dart_apply_own_tunables(struct apple_dart *dart)
+{
+	size_t i;
+
+	for (i = 0; i < dart->tunables->sz; ++i) {
+		u32 offset = dart->tunables->values[i].offset;
+		u32 old_value, value;
+
+		if (offset >= DART_T8110_CLIENT_PARTITION_BASE &&
+		    offset < DART_T8110_CLIENT_PARTITION_END &&
+		    !dart->client_partitions)
+			continue;
+		old_value = apple_dart_readl(dart, offset);
+		value = old_value & ~dart->tunables->values[i].mask;
+		value |= dart->tunables->values[i].value;
+		if (value != old_value)
+			apple_dart_writel(dart, value, offset);
+	}
+}
+
 static int apple_dart_hw_finish_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map = { .dart = dart };
@@ -1794,6 +1881,9 @@ static int apple_dart_hw_finish_reset(struct apple_dart *dart)
 	ret = dart->hw->invalidate_tlb(&stream_map);
 	if (ret)
 		dev_err(dart->dev, "failed to flush the TLBs after reset: %d\n", ret);
+
+	if (dart->full_errors)
+		apple_dart_t8110_enable_errors(dart);
 
 	return ret;
 }
@@ -2012,9 +2102,17 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 
+	/* Before the first stream is configured. */
+	if (!dart->tunneled && dart->tunables)
+		apple_dart_apply_own_tunables(dart);
+
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 	apple_dart_hw_apply_remaps(dart);
+
+	/* Streams that bypass translation for good, outside any domain. */
+	for_each_set_bit(i, dart->static_bypass, dart->num_streams)
+		apple_dart_writel(dart, DART_T8110_TCR_BYPASS_DART, DART_TCR(dart, i));
 
 	/* enable all streams globally since TCR is used to control isolation */
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
@@ -3855,6 +3953,17 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 		readl(dart->regs + DART_T8110_EXCEPTION(0));
 	}
 
+	/* With every error enabled, 2.4 latches the rest in its own status. */
+	if (dart->full_errors && dart->version >= 0x0204) {
+		u32 status = readl(dart->regs + DART_T8110_V24_ERR_IRQ_STATUS);
+
+		if (status) {
+			dev_err_ratelimited(dart->dev, "error status: 0x%08x\n", status);
+			writel(status, dart->regs + DART_T8110_V24_ERR_IRQ_STATUS);
+			ret = IRQ_HANDLED;
+		}
+	}
+
 	if (dart->version >= 0x0203) {
 		block_error = readl(dart->regs + DART_T8110_BLOCK_ERROR);
 		if (apple_dart_t8110_v2_block_pending(dart->version, block_error)) {
@@ -4125,6 +4234,56 @@ static bool apple_dart_has_live_rtkit_client(struct device_node *np)
 		}
 	}
 	return false;
+}
+
+/*
+ * The setup a T8110 DART needs when nothing initialised it before Linux:
+ * apple,tunable (applied at every reset), apple,bypass-sids (streams kept in
+ * static bypass), apple,full-error-reporting and apple,ctc-flush. Log the
+ * identification registers of such a DART.
+ */
+static int apple_dart_parse_own_setup(struct apple_dart *dart, struct resource *res,
+				      const u32 *params)
+{
+	struct device *dev = dart->dev;
+	struct device_node *np = dev->of_node;
+	int count, i;
+	u32 sid;
+
+	dart->full_errors = of_property_read_bool(np, "apple,full-error-reporting");
+	dart->ctc_flush = of_property_read_bool(np, "apple,ctc-flush") &&
+			  (params[1] & DART_T8110_PARAMS2_CTC);
+	dart->client_partitions = params[0] & DART_T8110_PARAMS1_CLIENT_PARTITIONS;
+
+	if (of_property_present(np, "apple,tunable")) {
+		dart->tunables = devm_apple_tunable_parse(dev, np, "apple,tunable", res);
+		if (IS_ERR(dart->tunables))
+			return dev_err_probe(dev, PTR_ERR(dart->tunables),
+					     "failed to parse DART tunables\n");
+	}
+
+	count = of_property_count_u32_elems(np, "apple,bypass-sids");
+	for (i = 0; i < count; i++) {
+		if (of_property_read_u32_index(np, "apple,bypass-sids", i, &sid) ||
+		    sid >= dart->num_streams)
+			return dev_err_probe(dev, -EINVAL, "invalid bypass stream\n");
+		__set_bit(sid, dart->static_bypass);
+	}
+
+	if (dart->tunables || count > 0 || dart->full_errors ||
+	    of_property_read_bool(np, "apple,ctc-flush"))
+		dev_info(dev,
+			 "params %08x %08x %08x %08x, version %04x, %u streams, AS %u -> %u, protect %08x/%08x, diag lock %08x; %zu tunables%s, %d bypass streams, CTC flush %s\n",
+			 params[0], params[1], params[2], params[3], dart->version,
+			 dart->num_streams, dart->ias, dart->oas,
+			 apple_dart_readl(dart, DART_T8110_PROTECT),
+			 apple_dart_readl(dart, DART_T8110_PROTECT_LOCK),
+			 apple_dart_readl(dart, DART_T8110_DIAG_LOCK),
+			 dart->tunables ? dart->tunables->sz : 0,
+			 dart->tunables && !dart->client_partitions ?
+				" (no client partitions)" : "",
+			 max(count, 0), dart->ctc_flush ? "on" : "off");
+	return 0;
 }
 
 static int apple_dart_probe(struct platform_device *pdev)
@@ -4433,6 +4592,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 	}
 
 params_done:
+	if (!tunneled && dart->hw->type == DART_T8110) {
+		ret = apple_dart_parse_own_setup(dart, res, dart_params);
+		if (ret)
+			goto err_clk_disable;
+	}
+
 	dart->dma_min = 0;
 	dart->dma_max = DMA_BIT_MASK(dart->ias);
 	dart->dma_offset = 0;
