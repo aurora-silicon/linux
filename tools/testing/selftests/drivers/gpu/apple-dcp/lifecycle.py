@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -1087,7 +1087,7 @@ def teardown(root):
     names = {n: tuple(name for name in group if re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', files[n], re.M))
              for n, group in names.items()}
     context = (fn('atc', 'core_read32') + '\n' + fn('atc', 'atcphy_get_mode_config') + '\n' + fn('atc', 'j700_field_update') + '\n' + files['dp'][files['dp'].index('/* Masks are the union'):files['dp'].index('/* Retry only the idle operations')])
-    functions = '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
+    functions = atc_cio_helpers(files['atc']) + '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
     definitions = []
     lines = iter(files['atc'].splitlines())
     for line in lines:
