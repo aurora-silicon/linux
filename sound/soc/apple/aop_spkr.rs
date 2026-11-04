@@ -400,9 +400,11 @@ impl Service {
 }
 
 const SENSE_FRAME_BYTES: usize = SENSE_CHANNELS as usize * 2;
-/// 10 ms periods, eight of them: whole frames, so ring offsets on period edges stay on frames.
-const SENSE_RING_PERIOD_BYTES: usize = 480 * SENSE_FRAME_BYTES;
-const SENSE_RING_BYTES: usize = 8 * SENSE_RING_PERIOD_BYTES;
+/// 2.5 ms periods (120 frames at 48 kHz), 32 of them: the same 80 ms ring, delivered in chunks
+/// small enough that a 512-frame front-end period completes within 2.5 ms of its last frame.
+/// Whole frames, so ring offsets on period edges stay on frames.
+const SENSE_RING_PERIOD_BYTES: usize = 120 * SENSE_FRAME_BYTES;
+const SENSE_RING_BYTES: usize = 32 * SENSE_RING_PERIOD_BYTES;
 /// SNDRV_PCM_STATE_RUNNING (a cast macro the bindings do not carry).
 const PCM_STATE_RUNNING: bindings::snd_pcm_state_t = 3;
 
@@ -634,7 +636,7 @@ impl SenseRing {
             // Once per completed period, as ALSA's interrupt accounting expects: it treats a call
             // that advanced less than a period, some jiffies after the last one, as a missed
             // buffer wrap (and the sense front-end's rate is 0 until a playback sets it, which
-            // makes that window two jiffies), so a period longer than the ring's 10 ms overran.
+            // makes that window two jiffies), so a period longer than one ring chunk overran.
             if first / period.max(1) != pos / period.max(1) {
                 // SAFETY: a running, attached front-end, under its stream lock.
                 unsafe { bindings::snd_pcm_period_elapsed_under_stream_lock(sub) };
