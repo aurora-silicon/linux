@@ -139,6 +139,8 @@ struct apple_cio_hw {
 	/* Hand LSTX to the router after RTKit boot, not before it. */
 	bool lstx_after_boot;
 	bool strict_fw_ready;
+	/* Keep the links of the host router out of CL states. */
+	bool no_host_clx;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -160,8 +162,9 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 /*
  * T8132 has the T6030 ACIO layout and MxWrap CPU block, but the CIO reconfig
  * already starts the CPU from its preloaded SRAM: RUN is never written. LSTX
- * is handed over once RTKit is up, followed by the LSTX pin. It has no
- * qualified DP route yet.
+ * is handed over once RTKit is up, followed by the LSTX pin. Its links can
+ * retrain shortly after CL states are enabled, so they stay in CL0. It has
+ * no qualified DP route yet.
  */
 static const struct apple_cio_hw apple_cio_t8132_hw = {
 	.mxwrap = true,
@@ -169,6 +172,7 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
 	.skip_run = true,
 	.lstx_after_boot = true,
 	.strict_fw_ready = true,
+	.no_host_clx = true,
 	.dp = &apple_dpin_disabled,
 };
 
@@ -2102,6 +2106,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	anhi->nhi.quirks = QUIRK_NO_DMA_PORT | QUIRK_NO_USB3_BW_ALLOC;
 	if (anhi->nhi.host_dp_policy)
 		anhi->nhi.quirks |= QUIRK_HOST_DP_NFC_CREDITS;
+	if (acio->hw->no_host_clx)
+		anhi->nhi.quirks |= QUIRK_NO_HOST_CLX;
 
 	anhi->nhi.hop_count = readl(anhi->nhi_base + APPLE_CIO_NHI_HOP_COUNT) &
 			      APPLE_CIO_NHI_HOP_COUNT_MASK;
