@@ -6,12 +6,13 @@ const HOST: u64 = wire::HOST_START;
 fn emit<T>(out:&mut Vec<u8>, value:Result<T,()>)->Option<T> { out.push(u8::from(value.is_err()));value.ok() }
 fn input()->wire::Input {
     wire::Input {
-        // Independently pinned qualified C/J713 bin for this immutable byte fixture.
+        // J713 frequencies with synthetic voltage bins.
         performance: wire::Performance {
-            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470],
-            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326],
-            voltage: [125,610,645,680,725,780,825,865,895,970],
-            sram: [780,780,780,780,780,780,825,865,895,970],
+            count: 10,
+            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470,0],
+            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326,0],
+            voltage: [100,600,650,700,750,800,850,900,950,1000,0],
+            sram: [800,800,800,800,800,800,850,900,950,1000,0],
         },
         va: core::array::from_fn(|i|HOST+0x100000+i as u64*0x100000),
         channel_state:core::array::from_fn(|i|HOST+0x4000000+i as u64*0x10000),
