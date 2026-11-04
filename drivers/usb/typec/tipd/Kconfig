@@ -69,12 +69,13 @@ config TYPEC_TIPD_KUNIT_TEST
 
 config TYPEC_SN201202X_KUNIT_TEST
 	tristate "KUnit tests for SN201202x" if !KUNIT_ALL_TESTS
-	depends on KUNIT && TYPEC_SN201202X
+	depends on KUNIT && TYPEC_SN201202X && SUSPEND
 	select REGMAP
 	default KUNIT_ALL_TESTS
 	help
 	  Test that the SN201202x events are not handled while the controller
-	  sleeps, and that a system suspend that fails leaves the controller
-	  awake. Also test which data status and status count as a link
-	  that wakes the system from suspend-to-idle. These tests run on a simulated SPMI bus, without accessing a
-	  physical Type-C controller.
+	  sleeps, that a system suspend that fails leaves the controller awake,
+	  and that an idle controller sleeps and wakes for register access and
+	  for system suspend. Also test which data status and status count as
+	  a link that wakes the system from suspend-to-idle. These tests run on
+	  a simulated SPMI bus, without accessing a physical Type-C controller.
