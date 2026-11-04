@@ -1315,6 +1315,13 @@ const OP_SKS_LOAD_KEYBAG: u8 = 0x03;
 
 pub(crate) const SKS_LOAD_NAME: &CStr = c"LOAD_KEYBAG";
 
+const OP_SKS_CHANGE_SECRET: u8 = 0x07;
+pub(crate) const SKS_CHANGE_SECRET_NAME: &CStr = c"CHANGE_SECRET";
+
+pub(crate) fn encode_sks_change_secret(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_CHANGE_SECRET, seq.value(), len.value())
+}
+
 const OP_SKS_CHANGE_LOCK_STATE: u8 = 0x04;
 
 pub(crate) const SKS_LOCK_STATE_NAME: &CStr = c"CHANGE_LOCK_STATE";
@@ -1324,6 +1331,27 @@ pub(crate) const SKS_DEVICE_STATE_NAME: &CStr = c"DEVICE_STATE_TRANSITION";
 
 pub(crate) fn encode_sks_device_state_transition(seq: Sequence, len: ImageLen) -> Message {
     encode_sks_raw(OP_SKS_DEVICE_STATE_TRANSITION, seq.value(), len.value())
+}
+
+const OP_SKS_GET_DEVICE_STATE: u8 = 0x19;
+pub(crate) const SKS_GET_DEVICE_STATE_NAME: &CStr = c"GET_DEVICE_STATE";
+
+pub(crate) fn encode_sks_get_device_state(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_GET_DEVICE_STATE, seq.value(), len.value())
+}
+
+const OP_SKS_GET_CONFIGURATION: u8 = 0x23;
+pub(crate) const SKS_GET_CONFIGURATION_NAME: &CStr = c"GET_CONFIGURATION";
+
+pub(crate) fn encode_sks_get_configuration(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_GET_CONFIGURATION, seq.value(), len.value())
+}
+
+const OP_SKS_HANDLE_TIMER_FIRE: u8 = 0x2f;
+pub(crate) const SKS_HANDLE_TIMER_FIRE_NAME: &CStr = c"HANDLE_TIMER_FIRE";
+
+pub(crate) fn encode_sks_handle_timer_fire(seq: Sequence, len: ImageLen) -> Message {
+    encode_sks_raw(OP_SKS_HANDLE_TIMER_FIRE, seq.value(), len.value())
 }
 
 const OP_SKS_VERIFY_SECRET: u8 = 0x21;

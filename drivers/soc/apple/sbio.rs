@@ -3679,6 +3679,9 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
+        if crate::userbag::is_ioctl(cmd) {
+            return self.userbag_ioctl(cmd, arg);
+        }
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
         }

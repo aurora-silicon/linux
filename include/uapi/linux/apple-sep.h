@@ -158,7 +158,7 @@ struct sep_bio_attest {
 
 struct sep_keybag_unlock {      /* UNLOCK and CREATE */
 	__u32 uid;
-	__u32 secret_len;
+	__u32 secret_len;          /* UNLOCK permits zero to cancel pending lock */
 	__u8  secret[SEP_KEYBAG_SECRET_MAX];
 };
 
@@ -191,8 +191,8 @@ struct sep_keybag_state {
 	__u32 failed_matches;
 	__u64 since_password_s;   /* ~0 when none since boot */
 	__u64 since_unlock_s;
-	__u32 enclave_lock_state; /* raw enclave word; 0 until it can be read */
-	__u32 reserved;
+	__u32 enclave_lock_state; /* raw enclave state word */
+	__u32 lock_phase;         /* enclave lock phase */
 };
 
 struct sep_keybag_change {
