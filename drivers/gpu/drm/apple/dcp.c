@@ -6400,9 +6400,17 @@ static int dcp_platform_suspend(struct device *dev)
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
 
-	/* The retained T8132 session has no qualified system-sleep handshake. */
-	if (iomfb_is_m4(dcp))
-		return -EBUSY;
+	/*
+	 * T8132: setPowerState powers the display down; the coprocessor keeps
+	 * running and its power domains stay on, as below.
+	 */
+	if (iomfb_is_m4(dcp)) {
+		int ret = iomfb_m4_suspend(dcp);
+
+		if (!ret)
+			device_set_wakeup_path(dev);
+		return ret;
+	}
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 	iomfb_v14_7_backlight_suspend(dcp);
@@ -6483,7 +6491,7 @@ static int dcp_platform_resume(struct device *dev)
 		return 0;
 
 	if (iomfb_is_m4(dcp))
-		return iomfb_m4_health(dcp);
+		return iomfb_m4_resume(dcp);
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 
@@ -6506,10 +6514,26 @@ static int dcp_platform_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * Hibernation: the T8132 power-down keeps the retained session, which a
+ * hibernation image cannot carry across the boot that restores it.
+ */
+static int dcp_platform_freeze(struct device *dev)
+{
+	if (iomfb_is_m4(dev_get_drvdata(dev)))
+		return -EBUSY;
+	return dcp_platform_suspend(dev);
+}
+
 static const struct dev_pm_ops dcp_platform_pm_ops = {
 	.prepare = pm_sleep_ptr(dcp_platform_prepare),
 	.complete = pm_sleep_ptr(dcp_platform_complete),
-	SYSTEM_SLEEP_PM_OPS(dcp_platform_suspend, dcp_platform_resume)
+	.suspend = pm_sleep_ptr(dcp_platform_suspend),
+	.resume = pm_sleep_ptr(dcp_platform_resume),
+	.freeze = pm_sleep_ptr(dcp_platform_freeze),
+	.thaw = pm_sleep_ptr(dcp_platform_resume),
+	.poweroff = pm_sleep_ptr(dcp_platform_freeze),
+	.restore = pm_sleep_ptr(dcp_platform_resume),
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6020 = {

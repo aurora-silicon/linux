@@ -341,7 +341,7 @@ def probe(root):
     unit = quiesce.make_unit(root)
     unit = unit.replace(block(unit, 'int main('), block(unit, 'int main(').replace('int main(', 'int __attribute__((unused)) prior_main(', 1), 1)
     unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); bool (*read_power_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
-    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup; u32 status;')
+    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup; u32 status; bool (*sleep_event)(struct tps6598x *);')
     helpers = r"""
 #undef dev_err
 #define dev_err(...) ((void)0)
@@ -359,6 +359,7 @@ def probe(root):
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define IRQF_SHARED 0
 #define IRQF_ONESHOT 0
+#define IRQF_NO_SUSPEND 0
 #define POLL_INTERVAL 1000
 #define INIT_DELAYED_WORK(...) ((void)0)
 #define tps6598x_poll_work 0

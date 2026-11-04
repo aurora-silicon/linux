@@ -14,6 +14,8 @@
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/unaligned.h>
+#include <linux/usb/pd.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -46,6 +48,7 @@
 #define TPS_REG_SYSTEM_CONF		0x28
 #define TPS_REG_CTRL_CONF		0x29
 #define TPS_REG_BOOT_STATUS		0x2D
+#define TPS_REG_RX_SOURCE_CAPS		0x30
 #define TPS_REG_POWER_STATUS		0x3f
 #define TPS_REG_PD_STATUS		0x40
 #define TPS_REG_RX_IDENTITY_SOP		0x48
@@ -1027,6 +1030,12 @@ static void cd321x_dp_notify(struct cd321x *cd321x,
 	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
 }
 
+/* An identity of all zeros has not been received from the partner yet. */
+static bool cd321x_identity_known(const struct usb_pd_identity *id)
+{
+	return memchr_inv(id, 0, sizeof(*id));
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1105,10 +1114,19 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	bool is_pd = pwr_opmode == TYPEC_PWR_MODE_PD;
+	/*
+	 * The partner can be registered before its Discover Identity response
+	 * arrives. An identity that was never received tells nothing about a
+	 * partner change: take the one the partner sent later instead.
+	 */
+	bool identity_late = old_connected && new_connected && is_pd &&
+		cd321x->cur_partner_is_pd &&
+		!cd321x_identity_known(&cd321x->cur_partner_identity);
 	bool new_partner = old_connected && new_connected &&
 		(is_pd != cd321x->cur_partner_is_pd ||
-		 (is_pd && memcmp(&st.partner_identity,
-				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
+		 (is_pd && !identity_late &&
+		  memcmp(&st.partner_identity, &cd321x->cur_partner_identity,
+			 sizeof(struct usb_pd_identity))));
 	bool partner_changed = new_partner ||
 		(old_connected && new_connected && was_disconnected);
 
@@ -1254,6 +1272,9 @@ static void cd321x_update_work(struct work_struct *work)
 
 		if (desc.identity)
 			typec_partner_set_identity(tps->partner);
+	} else if (identity_late && cd321x_identity_known(&st.partner_identity)) {
+		cd321x->cur_partner_identity = st.partner_identity;
+		typec_partner_set_identity(tps->partner);
 	}
 
 	/* The CD321x firmware owns VDM discovery and Enter Mode. Publish the
@@ -1514,10 +1535,11 @@ static void cd321x_resume_work(struct work_struct *work)
 
 	if (!tps6598x_read_status(tps, &status))
 		goto retry;
+	/* Without a plug too, or a power supply removed in sleep stays online */
+	if (!tps6598x_read_power_status(tps))
+		goto retry;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
-		if (!tps6598x_read_power_status(tps))
-			goto retry;
 		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD &&
 		    tps6598x_read_partner_identity(tps))
 			goto retry;
@@ -1627,6 +1649,46 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 	return 0;
 }
 
+/**
+ * cd321x_sleep_events - Acknowledge the events of a controller in system sleep
+ * @tps: The controller, woken for this
+ * @st: Its data status and status, and for a power sink whether its source is
+ *	capable of USB communication
+ *
+ * The resume revalidates the whole port state, so nothing else is read.
+ *
+ * Context: tps->lock held.
+ * Return: 0, or a negative error code.
+ */
+int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st)
+{
+	/* The PDO count, then the first PDO, vSafe5V, which carries the flags */
+	u8 caps[1 + sizeof(u32)];
+	u64 event;
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	st->usb_comm = false;
+	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
+	if (!ret && event)
+		ret = tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+	if (ret)
+		return ret;
+	/* A controller that was reset is set up again on resume */
+	cd321x_check_setup(container_of(tps, struct cd321x, tps), event);
+
+	ret = tps6598x_read32(tps, TPS_REG_DATA_STATUS, &st->data_status);
+	if (!ret)
+		ret = tps6598x_read32(tps, TPS_REG_STATUS, &st->status);
+	if (!ret && !(st->status & TPS_STATUS_PORTROLE)) {
+		ret = tps6598x_block_read(tps, TPS_REG_RX_SOURCE_CAPS, caps, sizeof(caps));
+		if (!ret && (caps[0] & GENMASK(2, 0)))
+			st->usb_comm = get_unaligned_le32(&caps[1]) & PDO_FIXED_USB_COMM;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cd321x_sleep_events);
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -1634,6 +1696,9 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	u64 event = 0;
 	u32 status;
 	int ret;
+
+	if (tps->sleep_event && tps->sleep_event(tps))
+		return IRQ_HANDLED;
 
 	mutex_lock(&tps->lock);
 
@@ -1661,11 +1726,14 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE) {
 		if (!tps->data->read_power_status(tps))
 			goto err_lost;
-		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
-			if (tps6598x_read_partner_identity(tps)) {
-				dev_err(tps->dev, "failed to read partner identity\n");
-				goto err_lost;
-			}
+	}
+	/* The identity can arrive after the contract, before a mode is entered. */
+	if ((event & (APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
+		      APPLE_CD_REG_INT_DATA_STATUS_UPDATE)) &&
+	    TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
+		if (tps6598x_read_partner_identity(tps)) {
+			dev_err(tps->dev, "failed to read partner identity\n");
+			goto err_lost;
 		}
 	}
 
@@ -2930,10 +2998,17 @@ int tipd_init(struct tps6598x *tps)
 		}
 	}
 
+	tps->wakeup = device_property_read_bool(tps->dev, "wakeup-source");
 	if (tps->irq) {
+		/*
+		 * A variant that filters its events in system sleep keeps the
+		 * interrupt live and decides itself whether to wake the system.
+		 */
 		ret = devm_request_threaded_irq(tps->dev, tps->irq, NULL,
 						tps->data->irq_handler,
-						IRQF_SHARED | IRQF_ONESHOT,
+						IRQF_SHARED | IRQF_ONESHOT |
+						(tps->wakeup && tps->sleep_event ?
+						 IRQF_NO_SUSPEND : 0),
 						dev_name(tps->dev), tps);
 	} else {
 		dev_dbg(tps->dev, "no IRQ specified, using polling mode\n");
@@ -2947,10 +3022,10 @@ int tipd_init(struct tps6598x *tps)
 
 	fwnode_handle_put(fwnode);
 
-	tps->wakeup = device_property_read_bool(tps->dev, "wakeup-source");
 	if (tps->wakeup && tps->irq) {
 		devm_device_init_wakeup(tps->dev);
-		enable_irq_wake(tps->irq);
+		if (!tps->sleep_event)
+			enable_irq_wake(tps->irq);
 	}
 
 	tipd_debugfs_register(tps);
@@ -3019,8 +3094,10 @@ EXPORT_SYMBOL_GPL(tipd_remove);
 int tipd_suspend(struct tps6598x *tps)
 {
 	if (tps->wakeup) {
-		disable_irq(tps->irq);
-		enable_irq_wake(tps->irq);
+		if (!tps->sleep_event) {
+			disable_irq(tps->irq);
+			enable_irq_wake(tps->irq);
+		}
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 1);
 	}
@@ -3050,8 +3127,10 @@ int tipd_resume(struct tps6598x *tps)
 	}
 
 	if (tps->wakeup) {
-		disable_irq_wake(tps->irq);
-		enable_irq(tps->irq);
+		if (!tps->sleep_event) {
+			disable_irq_wake(tps->irq);
+			enable_irq(tps->irq);
+		}
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 0);
 		msleep(TPS_SETUP_MS);

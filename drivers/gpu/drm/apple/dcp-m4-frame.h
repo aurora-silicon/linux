@@ -253,6 +253,22 @@ static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_
 	return 0;
 }
 
+/* Swap intent that registers surface 0 as the idle-cache surface. */
+#define DCP_M4_SWAP_INTENT_IDLE_CACHE	8
+
+/*
+ * Retarget an encoded present: the DCP registers rather than presents its
+ * sole surface, which must be a distinct object (surface_id other than
+ * the primary's 1) from every surface on screen.
+ */
+static inline void dcp_m4_swap_set_intent(void *output, u32 intent, u32 surface_id)
+{
+	u8 *data = output;
+
+	put_unaligned_le32(intent, data + dcp_m4_pf->swap_intent);
+	put_unaligned_le32(surface_id, data + 0x9c);
+}
+
 static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,
 					     const struct dcp_m4_frame *frame,
 					     bool brightness_change, u32 nits,

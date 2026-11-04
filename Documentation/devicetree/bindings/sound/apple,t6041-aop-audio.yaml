@@ -4,21 +4,21 @@
 $id: http://devicetree.org/schemas/sound/apple,t6041-aop-audio.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T6041 AOP audio
+title: Apple T6041 and T8132 AOP audio
 
 maintainers:
   - Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
 
 description: |
-  The Always-On Processor on Apple T6041 SoCs runs the machine's audio
+  The Always-On Processor on Apple T6041 and T8132 SoCs runs the machine's audio
   streams in its firmware: the microphone array, the internal speakers with
   their voltage and current sense, and the 3.5 mm headset jack in both
   directions. This node is a child of the AOP node and names the ADMAC
   channels the host moves each stream's data over while the firmware runs
   its serializer. The parent AOP binding describes the firmware transport.
 
-  The headset jack's channels are optional: a node without them has no jack
-  streams.
+  The speaker and headset jack channels are optional: a node without them has
+  no speaker or jack streams.
 
 # Only select T6041 nodes: other AOP audio nodes carry the
 # apple,t6030-aop-audio fallback too and have a different set of streams.
@@ -35,27 +35,46 @@ allOf:
 
 properties:
   compatible:
-    items:
-      - const: apple,t6041-aop-audio
-      - const: apple,t6030-aop-audio
+    oneOf:
+      - items:
+          - const: apple,t6041-aop-audio
+          - const: apple,t6030-aop-audio
+      - items:
+          - const: apple,t8132-aop-audio
+          - const: apple,t6041-aop-audio
+          - const: apple,t6030-aop-audio
 
   dmas:
-    minItems: 3
-    items:
-      - description: Microphone array input
-      - description: Internal speaker output
-      - description: Speaker voltage and current sense input
-      - description: Headset jack output
-      - description: Headset microphone input
+    description:
+      The ADMAC channels named in dma-names, in that order. "dma" is the
+      microphone array input, "spkr" the internal speaker output, "sense" the
+      speakers' voltage and current sense input, "cout" the headset jack output
+      and "cin" the headset microphone input.
+    minItems: 1
+    maxItems: 5
 
   dma-names:
-    minItems: 3
-    items:
-      - const: dma
-      - const: spkr
-      - const: sense
-      - const: cout
-      - const: cin
+    oneOf:
+      - description: The microphones only
+        items:
+          - const: dma
+      - description: The microphones and the headset jack
+        items:
+          - const: dma
+          - const: cout
+          - const: cin
+      - description: The microphones and the speakers
+        items:
+          - const: dma
+          - const: spkr
+          - const: sense
+      - description: The microphones, the speakers and the headset jack
+        items:
+          - const: dma
+          - const: spkr
+          - const: sense
+          - const: cout
+          - const: cin
 
   "#sound-dai-cells":
     const: 1

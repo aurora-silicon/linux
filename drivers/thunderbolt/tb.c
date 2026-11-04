@@ -3211,6 +3211,10 @@ static int tb_start(struct tb *tb, bool reset)
 	 * on these machines.
 	 */
 	tb->root_switch->no_usb3_bw_alloc = tb->nhi->quirks & QUIRK_NO_USB3_BW_ALLOC;
+	if (tb->nhi->quirks & QUIRK_NO_HOST_CLX) {
+		tb->root_switch->quirks |= QUIRK_NO_CLX;
+		tb_sw_dbg(tb->root_switch, "disabling CL states\n");
+	}
 
 	ret = tb_switch_configure(tb->root_switch);
 	if (ret) {
