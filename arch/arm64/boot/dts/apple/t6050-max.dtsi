@@ -113,4 +113,15 @@
 		interrupt-controller;
 		#interrupt-cells = <2>;
 	};
+
+	/*
+	 * /arm-io/nub-spmi-a1: reg[0] 0x8a1a8000, generation 4, a bus of USB-C PD controllers (the
+	 * board's). They are polled, as on nub-spmi-a0, so the bus takes no interrupt.
+	 */
+	nub_spmi_a1: spmi@28a1a8000 {
+		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
+		reg = <0x2 0x8a1a8000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+	};
 };
