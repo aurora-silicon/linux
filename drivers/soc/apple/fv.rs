@@ -178,24 +178,27 @@ impl Drop for RearmKey {
     }
 }
 
-fn fv_new_kek_body(password: &[u8]) -> Result<image::Body> {
+fn fv_new_kek_body(secret: &[u8]) -> Result<image::Body> {
     let mut body = image::Body::new();
     body.put_u32(FV_UNWRAP_VERSION)?;
     body.put_u64(SYSTEM_CLIENT)?;
     body.put_blob(&FV_PARAMS_DER)?;
     body.put_u32(FV_NEW_KEK_OPTIONS)?;
-    body.put_blob(password)?;
+    body.put_blob(secret)?;
     body.put_blob(&FV_REARM_BINDING)?;
     Ok(body)
 }
 
-fn fv_new_vek_body(kek: &[u8], bag_secret: &[u8]) -> Result<image::Body> {
+fn fv_new_vek_body(secret: &[u8], kek: &[u8]) -> Result<image::Body> {
     let mut body = image::Body::new();
     body.put_u32(FV_UNWRAP_VERSION)?;
     body.put_u64(SYSTEM_CLIENT)?;
     body.put_blob(&FV_PARAMS_DER)?;
+    // FV_NEW_VEK takes the same credential used for NEW_KEK first, and that
+    // operation's returned KEK record second. The final fixed-size blob is
+    // the same FV domain identifier used by NEW_KEK.
+    body.put_blob(secret)?;
     body.put_blob(kek)?;
-    body.put_blob(bag_secret)?;
     body.put_blob(&FV_REARM_BINDING)?;
     Ok(body)
 }
@@ -281,46 +284,47 @@ mod rearm_tests {
     }
 
     #[test]
-    fn new_kek_layout_binds_password() {
-        let body = fv_new_kek_body(b"pwd").unwrap();
+    fn new_kek_layout_binds_secret() {
+        let body = fv_new_kek_body(b"secret").unwrap();
         let bytes = common(&body);
         assert_eq!(le32(bytes, 52), FV_NEW_KEK_OPTIONS);
-        assert_eq!(le32(bytes, 56), 3);
-        assert_eq!(&bytes[60..63], b"pwd");
-        assert_eq!(bytes[63], 0);
-        assert_eq!(le32(bytes, 64), FV_REARM_BINDING.len() as u32);
-        assert_eq!(&bytes[68..84], &FV_REARM_BINDING);
-        assert_eq!(bytes.len(), 84);
-    }
-
-    #[test]
-    fn new_vek_layout_binds_kek_and_bag_secret() {
-        let body = fv_new_vek_body(b"kk", b"bag").unwrap();
-        let bytes = common(&body);
-        assert_eq!(le32(bytes, 52), 2);
-        assert_eq!(&bytes[56..58], b"kk");
-        assert_eq!(&bytes[58..60], &[0, 0]);
-        assert_eq!(le32(bytes, 60), 3);
-        assert_eq!(&bytes[64..67], b"bag");
-        assert_eq!(bytes[67], 0);
+        assert_eq!(le32(bytes, 56), 6);
+        assert_eq!(&bytes[60..66], b"secret");
+        assert_eq!(&bytes[66..68], &[0, 0]);
         assert_eq!(le32(bytes, 68), FV_REARM_BINDING.len() as u32);
         assert_eq!(&bytes[72..88], &FV_REARM_BINDING);
         assert_eq!(bytes.len(), 88);
     }
 
     #[test]
-    fn unwrap_layout_uses_option_two_and_empty_auxiliary_blob() {
-        let body = fv_unwrap_vek_body(b"pwd", b"kk", b"vek").unwrap();
+    fn new_vek_layout_uses_secret_then_kek() {
+        let body = fv_new_vek_body(b"secret", b"kk").unwrap();
         let bytes = common(&body);
-        assert_eq!(le32(bytes, 52), FV_UNWRAP_OPTIONS);
-        assert_eq!(le32(bytes, 56), 3);
-        assert_eq!(&bytes[60..63], b"pwd");
+        assert_eq!(le32(bytes, 52), 6);
+        assert_eq!(&bytes[56..62], b"secret");
+        assert_eq!(&bytes[62..64], &[0, 0]);
         assert_eq!(le32(bytes, 64), 2);
         assert_eq!(&bytes[68..70], b"kk");
-        assert_eq!(le32(bytes, 72), 3);
-        assert_eq!(&bytes[76..79], b"vek");
-        assert_eq!(le32(bytes, 80), 0);
-        assert_eq!(bytes.len(), 84);
+        assert_eq!(&bytes[70..72], &[0, 0]);
+        assert_eq!(le32(bytes, 72), FV_REARM_BINDING.len() as u32);
+        assert_eq!(&bytes[76..92], &FV_REARM_BINDING);
+        assert_eq!(bytes.len(), 92);
+    }
+
+    #[test]
+    fn unwrap_layout_uses_option_two_and_empty_auxiliary_blob() {
+        let body = fv_unwrap_vek_body(b"secret", b"kk", b"vek").unwrap();
+        let bytes = common(&body);
+        assert_eq!(le32(bytes, 52), FV_UNWRAP_OPTIONS);
+        assert_eq!(le32(bytes, 56), 6);
+        assert_eq!(&bytes[60..66], b"secret");
+        assert_eq!(&bytes[66..68], &[0, 0]);
+        assert_eq!(le32(bytes, 68), 2);
+        assert_eq!(&bytes[72..74], b"kk");
+        assert_eq!(le32(bytes, 76), 3);
+        assert_eq!(&bytes[80..83], b"vek");
+        assert_eq!(le32(bytes, 84), 0);
+        assert_eq!(bytes.len(), 88);
     }
 
     #[test]
@@ -674,8 +678,8 @@ impl SepData {
         Ok(VolumeKey { opaque })
     }
 
-    fn sks_req_new_rearm_kek(&self, password: &[u8]) -> Result<SksRequest> {
-        let body = fv_new_kek_body(password)?;
+    fn sks_req_new_rearm_kek(&self, secret: &[u8]) -> Result<SksRequest> {
+        let body = fv_new_kek_body(secret)?;
         let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
         Ok(SksRequest {
@@ -685,8 +689,8 @@ impl SepData {
         })
     }
 
-    fn sks_req_new_rearm_vek(&self, kek: &[u8], bag_secret: &[u8]) -> Result<SksRequest> {
-        let body = fv_new_vek_body(kek, bag_secret)?;
+    fn sks_req_new_rearm_vek(&self, secret: &[u8], kek: &[u8]) -> Result<SksRequest> {
+        let body = fv_new_vek_body(secret, kek)?;
         let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
         Ok(SksRequest {
@@ -720,23 +724,23 @@ impl SepData {
         Ok(owned)
     }
 
-    fn new_rearm_kek(&self, password: &[u8]) -> Result<KVec<u8>> {
+    fn new_rearm_kek(&self, secret: &[u8]) -> Result<KVec<u8>> {
         let out = self
-            .sks_send(self.sks_req_new_rearm_kek(password))
+            .sks_send(self.sks_req_new_rearm_kek(secret))
             .ok_or(EIO)?;
         self.fv_record_from_reply(crate::sks::SKS_NEW_KEK_NAME, out)
     }
 
-    fn new_rearm_vek(&self, kek: &[u8], bag_secret: &[u8]) -> Result<KVec<u8>> {
+    fn new_rearm_vek(&self, secret: &[u8], kek: &[u8]) -> Result<KVec<u8>> {
         let out = self
-            .sks_send(self.sks_req_new_rearm_vek(kek, bag_secret))
+            .sks_send(self.sks_req_new_rearm_vek(secret, kek))
             .ok_or(EIO)?;
         self.fv_record_from_reply(crate::sks::SKS_NEW_VEK_NAME, out)
     }
 
-    fn unwrap_rearm_vek(&self, password: &[u8], kek: &[u8], vek: &[u8]) -> Result<RearmKey> {
+    fn unwrap_rearm_vek(&self, secret: &[u8], kek: &[u8], vek: &[u8]) -> Result<RearmKey> {
         let out = self
-            .sks_send(self.sks_req_unwrap_vek(password, kek, vek))
+            .sks_send(self.sks_req_unwrap_vek(secret, kek, vek))
             .ok_or(EIO)?;
         if out.reply.status != 0 {
             let status: i32 = out.reply.status.into();
@@ -768,14 +772,14 @@ impl SepData {
     /// lockout. The returned key is deliberately opaque and is wiped unused.
     /// The Linux-owned record pair is created once and committed atomically to
     /// the host-state store only after it has completed a successful unwrap.
-    pub(crate) fn rearm_touchid_fv(&self, password: &[u8], bag_secret: &[u8]) -> Result<()> {
+    pub(crate) fn rearm_touchid_fv(&self, secret: &[u8]) -> Result<()> {
         self.fv_ready()?;
         let stored = self
             .with_host_store(|store| store.read(&FV_REARM_STORE_KEY))
             .ok_or(ENODEV)??;
         if let Some(raw) = stored {
             let records = decode_rearm_records(&raw)?;
-            let _key = self.unwrap_rearm_vek(password, records.kek, records.vek)?;
+            let _key = self.unwrap_rearm_vek(secret, records.kek, records.vek)?;
             return Ok(());
         }
 
@@ -787,9 +791,9 @@ impl SepData {
             return Err(ENOSPC);
         }
 
-        let kek = self.new_rearm_kek(password)?;
-        let vek = self.new_rearm_vek(&kek, bag_secret)?;
-        let _key = self.unwrap_rearm_vek(password, &kek, &vek)?;
+        let kek = self.new_rearm_kek(secret)?;
+        let vek = self.new_rearm_vek(secret, &kek)?;
+        let _key = self.unwrap_rearm_vek(secret, &kek, &vek)?;
         let raw = encode_rearm_records(&kek, &vek)?;
         self.with_host_store(|store| store.write(&FV_REARM_STORE_KEY, &raw))
             .ok_or(ENODEV)??;

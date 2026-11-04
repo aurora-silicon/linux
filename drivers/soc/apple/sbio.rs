@@ -3775,11 +3775,10 @@ impl SepData {
 
     /// Userspace calls this only after the user's password was verified. The
     /// node is root's alone and its SELinux label confines it to the re-arm
-    /// helper. As on macOS, where unlocking the user's key bag with the
-    /// passcode ends the lockout, the Linux FV records are unwrapped with the
-    /// verified password, a new SCRD match context is set up, and the
-    /// enclave's lockout record is saved.
-    fn rearm_after_password(&self, password: crate::Secret) -> Result<()> {
+    /// helper. The verified password authorizes an unwrap of the Linux FV
+    /// records with their stable stored secret. A new SCRD match context is
+    /// then set up and the enclave's lockout record is saved.
+    fn rearm_after_password(&self, _password: crate::Secret) -> Result<()> {
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
             // a lockout from before the restart is left to clear.
@@ -3807,19 +3806,20 @@ impl SepData {
             if !self.capture_begin() {
                 continue;
             }
-            // A successful password unwrap of the Linux-owned FV records is
-            // the authorization event. It must precede the designated-bag
+            // Userspace has already verified the password. The Linux-owned FV
+            // pair is provisioned and unwrapped with one stable credential:
+            // the stored identity-bag secret. It must precede the SCRD
             // credential refresh; a bag unlock is not a substitute for it.
             let unwrapped = match keybag::read(keybag::Slot::Identity) {
                 Ok(keybag::State::Present(stored)) => {
-                    self.rearm_touchid_fv(&password, stored.secret()).is_ok()
+                    self.rearm_touchid_fv(stored.secret()).is_ok()
                 }
                 _ => false,
             };
             let established = unwrapped && self.establish_scrd_match_context(user);
             let saved = established && self.save_lockout();
             if !unwrapped {
-                dev_err!(self.dev, "Touch ID: re-arm: the password did not unwrap the Linux FV record pair\n");
+                dev_err!(self.dev, "Touch ID: re-arm: the stored secret did not unwrap the Linux FV record pair\n");
             } else if established && !saved {
                 dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
             }
