@@ -14,6 +14,8 @@
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/unaligned.h>
+#include <linux/usb/pd.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -46,6 +48,7 @@
 #define TPS_REG_SYSTEM_CONF		0x28
 #define TPS_REG_CTRL_CONF		0x29
 #define TPS_REG_BOOT_STATUS		0x2D
+#define TPS_REG_RX_SOURCE_CAPS		0x30
 #define TPS_REG_POWER_STATUS		0x3f
 #define TPS_REG_PD_STATUS		0x40
 #define TPS_REG_RX_IDENTITY_SOP		0x48
@@ -1027,6 +1030,12 @@ static void cd321x_dp_notify(struct cd321x *cd321x,
 	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
 }
 
+/* An identity of all zeros has not been received from the partner yet. */
+static bool cd321x_identity_known(const struct usb_pd_identity *id)
+{
+	return memchr_inv(id, 0, sizeof(*id));
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -1105,10 +1114,19 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	bool is_pd = pwr_opmode == TYPEC_PWR_MODE_PD;
+	/*
+	 * The partner can be registered before its Discover Identity response
+	 * arrives. An identity that was never received tells nothing about a
+	 * partner change: take the one the partner sent later instead.
+	 */
+	bool identity_late = old_connected && new_connected && is_pd &&
+		cd321x->cur_partner_is_pd &&
+		!cd321x_identity_known(&cd321x->cur_partner_identity);
 	bool new_partner = old_connected && new_connected &&
 		(is_pd != cd321x->cur_partner_is_pd ||
-		 (is_pd && memcmp(&st.partner_identity,
-				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
+		 (is_pd && !identity_late &&
+		  memcmp(&st.partner_identity, &cd321x->cur_partner_identity,
+			 sizeof(struct usb_pd_identity))));
 	bool partner_changed = new_partner ||
 		(old_connected && new_connected && was_disconnected);
 
@@ -1254,6 +1272,9 @@ static void cd321x_update_work(struct work_struct *work)
 
 		if (desc.identity)
 			typec_partner_set_identity(tps->partner);
+	} else if (identity_late && cd321x_identity_known(&st.partner_identity)) {
+		cd321x->cur_partner_identity = st.partner_identity;
+		typec_partner_set_identity(tps->partner);
 	}
 
 	/* The CD321x firmware owns VDM discovery and Enter Mode. Publish the
@@ -1514,10 +1535,11 @@ static void cd321x_resume_work(struct work_struct *work)
 
 	if (!tps6598x_read_status(tps, &status))
 		goto retry;
+	/* Without a plug too, or a power supply removed in sleep stays online */
+	if (!tps6598x_read_power_status(tps))
+		goto retry;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
-		if (!tps6598x_read_power_status(tps))
-			goto retry;
 		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD &&
 		    tps6598x_read_partner_identity(tps))
 			goto retry;
@@ -1627,6 +1649,46 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 	return 0;
 }
 
+/**
+ * cd321x_sleep_events - Acknowledge the events of a controller in system sleep
+ * @tps: The controller, woken for this
+ * @st: Its data status and status, and for a power sink whether its source is
+ *	capable of USB communication
+ *
+ * The resume revalidates the whole port state, so nothing else is read.
+ *
+ * Context: tps->lock held.
+ * Return: 0, or a negative error code.
+ */
+int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st)
+{
+	/* The PDO count, then the first PDO, vSafe5V, which carries the flags */
+	u8 caps[1 + sizeof(u32)];
+	u64 event;
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	st->usb_comm = false;
+	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
+	if (!ret && event)
+		ret = tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+	if (ret)
+		return ret;
+	/* A controller that was reset is set up again on resume */
+	cd321x_check_setup(container_of(tps, struct cd321x, tps), event);
+
+	ret = tps6598x_read32(tps, TPS_REG_DATA_STATUS, &st->data_status);
+	if (!ret)
+		ret = tps6598x_read32(tps, TPS_REG_STATUS, &st->status);
+	if (!ret && !(st->status & TPS_STATUS_PORTROLE)) {
+		ret = tps6598x_block_read(tps, TPS_REG_RX_SOURCE_CAPS, caps, sizeof(caps));
+		if (!ret && (caps[0] & GENMASK(2, 0)))
+			st->usb_comm = get_unaligned_le32(&caps[1]) & PDO_FIXED_USB_COMM;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cd321x_sleep_events);
+
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
@@ -1634,6 +1696,9 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	u64 event = 0;
 	u32 status;
 	int ret;
+
+	if (tps->sleep_event && tps->sleep_event(tps))
+		return IRQ_HANDLED;
 
 	mutex_lock(&tps->lock);
 
@@ -1661,11 +1726,14 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE) {
 		if (!tps->data->read_power_status(tps))
 			goto err_lost;
-		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
-			if (tps6598x_read_partner_identity(tps)) {
-				dev_err(tps->dev, "failed to read partner identity\n");
-				goto err_lost;
-			}
+	}
+	/* The identity can arrive after the contract, before a mode is entered. */
+	if ((event & (APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
+		      APPLE_CD_REG_INT_DATA_STATUS_UPDATE)) &&
+	    TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
+		if (tps6598x_read_partner_identity(tps)) {
+			dev_err(tps->dev, "failed to read partner identity\n");
+			goto err_lost;
 		}
 	}
 
@@ -2088,10 +2156,17 @@ static void cd321x_ready(struct tps6598x *tps)
 	}
 }
 
-static void cd321x_stop_work(struct cd321x *cd321x)
+VISIBLE_IF_KUNIT void cd321x_stop_work(struct cd321x *cd321x)
 {
 	scoped_guard(mutex, &cd321x->tps.lock)
 		cd321x_pm_remove(&cd321x->pm);
+
+	/* A router that binds from now on must not hand this port its switch. */
+	if (cd321x->tbt_watch_registered) {
+		typec_thunderbolt_switch_unwatch(&cd321x->tbt_watch);
+		cd321x->tbt_watch_registered = false;
+	}
+	cancel_work_sync(&cd321x->tbt_attach_work);
 
 	/* Drain producers before cancelling work, including on probe rollback. */
 	if (cd321x->tbt_notifier_registered) {
@@ -2102,6 +2177,7 @@ static void cd321x_stop_work(struct cd321x *cd321x)
 	cancel_delayed_work_sync(&cd321x->resume_work);
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
+EXPORT_SYMBOL_IF_KUNIT(cd321x_stop_work);
 
 /* Separate so that the KUnit tests can choose the driver core's answer. */
 VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
@@ -2114,30 +2190,109 @@ EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
 
 /*
  * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
- * comes up. If its driver is not built or never binds, do not leave power
+ * comes up. If its driver is not built or has not bound yet, do not leave power
  * delivery, USB and DisplayPort on this port without a driver as well: stop
  * waiting for the router when the driver core stops waiting for missing
- * dependencies.
+ * dependencies. The router can still bind later, so set @late to take it then.
  */
 VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *
-cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode)
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
+		      bool *late)
 {
 	struct typec_thunderbolt_switch *sw;
 
+	*late = false;
 	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
 	if (sw != ERR_PTR(-EPROBE_DEFER) || cd321x_tbt_switch_keep_waiting(dev))
 		return sw;
 
-	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it\n");
+	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it until it binds\n");
+	*late = true;
 	return NULL;
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
+
+/*
+ * Take a router that bound after the port gave up on it. An attached cable
+ * raises no new event, so reapply it through the router as after system sleep.
+ */
+static void cd321x_tbt_attach_work(struct work_struct *work)
+{
+	struct cd321x *cd321x = container_of(work, struct cd321x,
+					    tbt_attach_work);
+	struct tps6598x *tps = &cd321x->tps;
+	struct typec_thunderbolt_switch *sw;
+	int ret;
+
+	scoped_guard(mutex, &tps->lock) {
+		if (cd321x->tbt_switch || cd321x->pm.phase == CD321X_PM_REMOVED)
+			return;
+	}
+
+	/* Another port's router, or this one is not usable yet: keep watching. */
+	sw = fwnode_typec_thunderbolt_switch_get(cd321x->tbt_fwnode);
+	if (IS_ERR_OR_NULL(sw))
+		return;
+
+	ret = typec_thunderbolt_switch_register_notifier(sw,
+							 &cd321x->tbt_notifier);
+	if (ret) {
+		typec_thunderbolt_switch_put(sw);
+		dev_warn(tps->dev,
+			 "failed to watch the USB4/Thunderbolt router: %d\n", ret);
+		return;
+	}
+
+	scoped_guard(mutex, &tps->lock) {
+		cd321x->tbt_switch = sw;
+		cd321x->tbt_notifier_registered = true;
+	}
+	dev_info(tps->dev, "USB4/Thunderbolt router bound, reapplying the cable state\n");
+	atomic_set(&cd321x->restore_event, 1);
+	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+}
+
+/* Runs under the registering router's locks, so only queue the lookup. */
+static int cd321x_tbt_watch(struct notifier_block *nb, unsigned long event,
+			    void *data)
+{
+	struct cd321x *cd321x = container_of(nb, struct cd321x, tbt_watch);
+
+	if (event != TYPEC_THUNDERBOLT_SWITCH_ADDED)
+		return NOTIFY_DONE;
+
+	queue_work(system_freezable_wq, &cd321x->tbt_attach_work);
+	return NOTIFY_OK;
+}
+
+/* Watch for the router of a port that had to probe without it. */
+VISIBLE_IF_KUNIT int cd321x_tbt_watch_late(struct cd321x *cd321x,
+					   struct fwnode_handle *fwnode)
+{
+	int ret;
+
+	cd321x->tbt_fwnode = fwnode_handle_get(fwnode);
+	cd321x->tbt_watch.notifier_call = cd321x_tbt_watch;
+	ret = typec_thunderbolt_switch_watch(&cd321x->tbt_watch);
+	if (ret) {
+		fwnode_handle_put(cd321x->tbt_fwnode);
+		cd321x->tbt_fwnode = NULL;
+		return ret;
+	}
+	cd321x->tbt_watch_registered = true;
+
+	/* The router may have registered since the lookup at probe. */
+	queue_work(system_freezable_wq, &cd321x->tbt_attach_work);
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_watch_late);
 
 /* Separate so that the KUnit tests can drive the workers without a port. */
 VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 {
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
 	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
+	INIT_WORK(&cd321x->tbt_attach_work, cd321x_tbt_attach_work);
 	atomic_set(&cd321x->link_event, 0);
 	atomic_set(&cd321x->ready_event, 0);
 	atomic_set(&cd321x->restore_event, 0);
@@ -2171,6 +2326,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
 	struct fwnode_handle *connector_fwnode;
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+	bool tbt_late;
 	int ret;
 
 	cd321x_init_work(cd321x);
@@ -2196,7 +2352,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (!IS_ERR_OR_NULL(connector_fwnode))
 		cd321x->connector_fwnode = connector_fwnode;
 
-	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode);
+	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode, &tbt_late);
 	if (IS_ERR(cd321x->tbt_switch)) {
 		ret = PTR_ERR(cd321x->tbt_switch);
 		goto err_put_mux;
@@ -2217,6 +2373,10 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (ret)
 		goto err_put_switch;
 	cd321x->tbt_notifier_registered = true;
+
+	/* Keep the port without the router rather than fail it: see above. */
+	if (tbt_late && cd321x_tbt_watch_late(cd321x, fwnode))
+		dev_warn(tps->dev, "cannot watch for the USB4/Thunderbolt router\n");
 
 	return 0;
 
@@ -2252,6 +2412,8 @@ cd321x_unregister_port(struct tps6598x *tps)
 	cd321x_stop_work(cd321x);
 	fwnode_handle_put(cd321x->connector_fwnode);
 	cd321x->connector_fwnode = NULL;
+	fwnode_handle_put(cd321x->tbt_fwnode);
+	cd321x->tbt_fwnode = NULL;
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 	typec_mux_put(cd321x->mux);
@@ -2836,10 +2998,17 @@ int tipd_init(struct tps6598x *tps)
 		}
 	}
 
+	tps->wakeup = device_property_read_bool(tps->dev, "wakeup-source");
 	if (tps->irq) {
+		/*
+		 * A variant that filters its events in system sleep keeps the
+		 * interrupt live and decides itself whether to wake the system.
+		 */
 		ret = devm_request_threaded_irq(tps->dev, tps->irq, NULL,
 						tps->data->irq_handler,
-						IRQF_SHARED | IRQF_ONESHOT,
+						IRQF_SHARED | IRQF_ONESHOT |
+						(tps->wakeup && tps->sleep_event ?
+						 IRQF_NO_SUSPEND : 0),
 						dev_name(tps->dev), tps);
 	} else {
 		dev_dbg(tps->dev, "no IRQ specified, using polling mode\n");
@@ -2853,10 +3022,10 @@ int tipd_init(struct tps6598x *tps)
 
 	fwnode_handle_put(fwnode);
 
-	tps->wakeup = device_property_read_bool(tps->dev, "wakeup-source");
 	if (tps->wakeup && tps->irq) {
 		devm_device_init_wakeup(tps->dev);
-		enable_irq_wake(tps->irq);
+		if (!tps->sleep_event)
+			enable_irq_wake(tps->irq);
 	}
 
 	tipd_debugfs_register(tps);
@@ -2925,8 +3094,10 @@ EXPORT_SYMBOL_GPL(tipd_remove);
 int tipd_suspend(struct tps6598x *tps)
 {
 	if (tps->wakeup) {
-		disable_irq(tps->irq);
-		enable_irq_wake(tps->irq);
+		if (!tps->sleep_event) {
+			disable_irq(tps->irq);
+			enable_irq_wake(tps->irq);
+		}
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 1);
 	}
@@ -2956,8 +3127,10 @@ int tipd_resume(struct tps6598x *tps)
 	}
 
 	if (tps->wakeup) {
-		disable_irq_wake(tps->irq);
-		enable_irq(tps->irq);
+		if (!tps->sleep_event) {
+			disable_irq_wake(tps->irq);
+			enable_irq(tps->irq);
+		}
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 0);
 		msleep(TPS_SETUP_MS);

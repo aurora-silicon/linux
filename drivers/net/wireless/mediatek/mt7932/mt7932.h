@@ -159,6 +159,10 @@ struct mt7932 {
 	struct completion discovery_done;
 	struct completion scan_done;
 	struct ieee80211_channel *connect_channel_req, *connect_channel_hint;
+	/* Boot time after which a radar or no-IR candidate must have been
+	 * heard; set when an attempt starts listening, under command_mutex.
+	 */
+	u64 connect_heard_since;
 	u8 connect_bssid_req[ETH_ALEN], connect_bssid_hint[ETH_ALEN];
 	bool discovering, discovery_finished, connect_cancelled;
 	u8 connect_ssid[32], connect_pmk[32], connect_bssid[6];

@@ -728,33 +728,40 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 		 const struct apple_epic_service_ops *ops,
 		 const char *name, s64 unit)
 {
+	u32 gen = READ_ONCE(ep->dcp->afk_power_gen);
 	struct apple_epic_service *service;
 	unsigned long flags;
-	bool free;
+	bool hotplug, free;
 	u32 i;
 
 	/*
-	 * The DPDEV, DPAVSERV and AV services are announced again under a
-	 * fresh interface after every external hotplug, without a teardown
-	 * for the previous one: replace the same logical service in place.
-	 * Other endpoints (DPAVCTRL) announce several services with the same
-	 * name and no unit, so the name is no key there.
+	 * The firmware announces every compact service again under a fresh
+	 * interface after a DCP poweron, on every endpoint, without closing
+	 * the previous one. The DPDEV, DPAVSERV and AV endpoints (0x27-0x29)
+	 * also do so after an external hotplug without a poweron. Replace an
+	 * enabled service with the same binding, name and unit in place when
+	 * it comes from an earlier poweron, or from any announcement on the
+	 * hotplug endpoints. Services announced since the latest poweron stay:
+	 * DPAVCTRL announces several services with the same name and no unit
+	 * in one generation, and those are siblings, not replacements.
 	 */
-	if (ep->endpoint >= 0x27 && ep->endpoint <= 0x29) {
-		for (i = 0; i < ep->num_channels; i++) {
-			service = &ep->services[i];
-			if (service->enabled && service->ops == ops &&
-			    service->unit == unit && !strcmp(service->name, name)) {
-				dev_info(ep->dcp->dev,
-					 "AFK[ep:%02x]: replacing compact service %s interface %u\n",
-					 ep->endpoint, name, service->channel);
-				afk_remove_service_debugfs(service);
-				afk_service_retire(service);
-				if (service->ops->teardown)
-					service->ops->teardown(service);
-				return service;
-			}
-		}
+	hotplug = ep->endpoint >= 0x27 && ep->endpoint <= 0x29;
+	for (i = 0; i < ep->num_channels; i++) {
+		service = &ep->services[i];
+		if (!service->enabled || service->ops != ops ||
+		    service->unit != unit || strcmp(service->name, name))
+			continue;
+		if (!hotplug && service->power_gen == gen)
+			continue;
+		dev_info(ep->dcp->dev,
+			 "AFK[ep:%02x]: replacing compact service %s interface %u\n",
+			 ep->endpoint, name, service->channel);
+		afk_remove_service_debugfs(service);
+		afk_service_retire(service);
+		if (service->ops->teardown)
+			service->ops->teardown(service);
+		service->power_gen = gen;
+		return service;
 	}
 
 	for (i = 0; i < ep->num_channels; i++) {
@@ -763,13 +770,17 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 		free = !service->enabled && !service->users &&
 		       bitmap_empty(service->cmd_map, MAX_PENDING_CMDS);
 		spin_unlock_irqrestore(&service->lock, flags);
-		if (free)
+		if (free) {
+			service->power_gen = gen;
 			return service;
+		}
 	}
 
 	if (ep->num_channels >= AFK_MAX_CHANNEL)
 		return NULL;
-	return &ep->services[ep->num_channels++];
+	service = &ep->services[ep->num_channels++];
+	service->power_gen = gen;
+	return service;
 }
 
 static void afk_recv_handle_compact_init(struct apple_dcp_afkep *ep,

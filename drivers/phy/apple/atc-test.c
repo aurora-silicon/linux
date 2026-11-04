@@ -87,6 +87,18 @@ static void atcphy_test_target_mode_t8132(struct kunit *test)
 	state.alt = &dp;
 	state.mode = TYPEC_DP_STATE_D;
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	/* No DisplayPort-only lanes: the USB2 beside them still runs. */
+	state.mode = TYPEC_DP_STATE_C;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.mode = TYPEC_DP_STATE_E;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	/* SuperSpeed without the DP calibration: pin assignment D runs USB3. */
+	atcphy->t8132_ss = true;
+	atcphy->ss_tunables = true;
+	state.mode = TYPEC_DP_STATE_D;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB3);
+	state.mode = TYPEC_DP_STATE_C;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
 	state.alt = NULL;
 	state.mode = TYPEC_STATE_SAFE;
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
@@ -1158,6 +1170,41 @@ static void atcphy_test_t8132_rpm_busy(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
 }
 
+#ifdef CONFIG_SUSPEND
+/* An epoch with a host survives suspend-to-idle only; without one, or incomplete, never. */
+static void atcphy_test_t8132_system_suspend(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+	suspend_state_t target = pm_suspend_target_state;
+
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->t8132_ss = true;
+	dev_set_drvdata(atcphy->dev, atcphy);
+
+	pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+	atcphy->mode_dirty = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	atcphy->mode_dirty = false;
+
+	/* Without a host, as in a USB3 device role, nothing holds the domain */
+	atcphy->t8132_common_owned = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	atcphy->host_active = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy->t8132_suspended);
+	KUNIT_EXPECT_EQ(test, atcphy_resume(atcphy->dev), 0);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	pm_suspend_target_state = PM_SUSPEND_MEM;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	pm_suspend_target_state = target;
+}
+#endif
+
 /* The hold follows the busy state, with one reference at most. */
 static void atcphy_test_t8132_rpm_hold(struct kunit *test)
 {
@@ -1356,6 +1403,9 @@ static struct kunit_case atcphy_t8132_pm_test_cases[] = {
 	KUNIT_CASE(atcphy_test_t8132_rpm_hold),
 	KUNIT_CASE(atcphy_test_t8132_restore_idle),
 	KUNIT_CASE(atcphy_test_t8132_restore_mode),
+#ifdef CONFIG_SUSPEND
+	KUNIT_CASE(atcphy_test_t8132_system_suspend),
+#endif
 	{}
 };
 

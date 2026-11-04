@@ -11,12 +11,15 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
+#include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
+#include <linux/wait.h>
 #include <linux/unaligned.h>
 
 #include "ave.h"
@@ -521,6 +524,62 @@ static int ave_ipc_dispatch(struct ave_dev *ave)
 }
 
 /*
+ * The firmware raises the mailbox interrupt, the first one in the DT, when it
+ * posts to a ring: an ack on IO or a message on IO_T2H. The line stays high
+ * until the host clears the mailbox status, which only the ring poll below
+ * does, under hw_lock. So the handler masks the line and hands over: it wakes
+ * a ring wait (ave_ipc_pump()) and queues irq_work for the answers no one
+ * waits for, such as frames that finish between jobs. The next ring poll
+ * clears the status and unmasks the line. The status is cleared before the
+ * rings are read, and the firmware fills a ring slot before it raises the
+ * status, so no event is missed in between.
+ */
+static irqreturn_t ave_ipc_irq(int irq, void *data)
+{
+	struct ave_dev *ave = data;
+
+	spin_lock(&ave->irq_lock);
+	if (!ave->irq_masked) {
+		disable_irq_nosync(irq);
+		ave->irq_masked = true;
+	}
+	spin_unlock(&ave->irq_lock);
+	WRITE_ONCE(ave->irq_kick, true);
+	wake_up(&ave->irq_wait);
+	queue_work(ave->wq, &ave->irq_work);
+	return IRQ_HANDLED;
+}
+
+static void ave_ipc_unmask(struct ave_dev *ave)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ave->irq_lock, flags);
+	if (ave->irq_masked) {
+		ave->irq_masked = false;
+		enable_irq(ave->irq);
+	}
+	spin_unlock_irqrestore(&ave->irq_lock, flags);
+}
+
+/*
+ * Request the mailbox interrupt. ave->wq and ave->irq_work must be set up and
+ * must outlive it: the line can only rise once the firmware runs, but from
+ * then on the handler queues work. Free it with free_irq().
+ */
+int ave_ipc_irq_init(struct ave_dev *ave, struct platform_device *pdev)
+{
+	int irq = platform_get_irq(pdev, 0);
+
+	if (irq < 0)
+		return irq;
+	spin_lock_init(&ave->irq_lock);
+	init_waitqueue_head(&ave->irq_wait);
+	ave->irq = irq;
+	return request_irq(irq, ave_ipc_irq, 0, dev_name(ave->dev), ave);
+}
+
+/*
  * Poll both rings once. Returns 1 when an event (ack or message) was
  * handled, 0 when nothing was pending.
  */
@@ -533,6 +592,8 @@ static int ave_ipc_poll_once(struct ave_dev *ave)
 	pending = readl(ave->mbox + AVE_MBOX_STATUS);
 	if (pending)
 		writel(pending, ave->mbox + AVE_MBOX_STATUS);
+	/* The status is clear: a ring event from now on raises the line again. */
+	ave_ipc_unmask(ave);
 
 	ret = ave_ring_recv(ave, &ave->ring[0], &addr, &len);
 	if (!ret) {
@@ -579,18 +640,19 @@ static int ave_ipc_poll_once(struct ave_dev *ave)
  * @cond, handle whatever is pending and return. Running out of time means
  * the firmware is stuck: it is marked broken. Caller holds hw_lock.
  *
- * Which interrupt line signals the rings is not known, so this polls. It
- * sleeps between polls: briefly at first (commands are acknowledged within
- * microseconds), then for up to a millisecond, so a long wait for a frame
- * costs next to no CPU time.
+ * Between ring polls it sleeps until the mailbox interrupt. The firmware
+ * starts its next queued frame only once the host has taken the answer of
+ * the previous one, so the answer must be taken at once: a sleeping poll
+ * (0.5 to 1 ms) cost about 0.5 ms per frame, 9% at 1080p. The wait still
+ * looks at the rings every AVE_IRQ_RECHECK_MS in case an edge is ever lost.
  */
-#define AVE_POLL_FAST_ROUNDS 20
+#define AVE_IRQ_RECHECK_MS 100
 
 int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		 bool (*cond)(struct ave_dev *ave, void *arg), void *arg)
 {
 	ktime_t deadline = ktime_add_ms(ktime_get(), wait_ms);
-	unsigned int idle = 0;
+	s64 left_ms;
 	int ret;
 
 	lockdep_assert_held(&ave->hw_lock);
@@ -606,21 +668,21 @@ int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 					    ave->fw_state);
 			return -EIO;
 		}
+		/* Clear the kick before the rings are read; see ave_ipc_irq(). */
+		WRITE_ONCE(ave->irq_kick, false);
+		smp_mb();
 		ret = ave_ipc_poll_once(ave);
 		if (ret < 0) {
 			ave_fw_mark_broken(ave, ret, "ring error");
 			return ret;
 		}
-		if (ret) {
-			idle = 0;
+		if (ret)
 			continue;
-		}
 		if (!cond)
 			return 0;
-		if (idle++ < AVE_POLL_FAST_ROUNDS)
-			usleep_range(50, 100);
-		else
-			usleep_range(500, 1000);
+		left_ms = ktime_ms_delta(deadline, ktime_get());
+		wait_event_timeout(ave->irq_wait, READ_ONCE(ave->irq_kick),
+				   msecs_to_jiffies(clamp_t(s64, left_ms, 1, AVE_IRQ_RECHECK_MS)));
 	}
 }
 

@@ -62,6 +62,8 @@ ASAHI_TESTS = {
     'binding-lifetime-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('no-close', 'no-join'), out()),
     'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
+    'apple-m4-pmu-tests.py': [([], PASS)]
+        + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
@@ -82,6 +84,9 @@ ASAHI_TESTS = {
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-suspend-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
+                                   'resume-order', 'tx-drain'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.
@@ -134,7 +139,11 @@ ASAHI_TESTS = {
                                    'usb-rpm', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
     'pciec-policy-tests.py': [(out(), PASS)],
+    'pmgr-bus-tests.py': [([], PASS)],
     'pmp-j613-hwmon-tests.py': [([], PASS)],
+    'pmu-rtc-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
+                                   'offset-sign', 'event-bit', 'wrong-base'), out()),
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),

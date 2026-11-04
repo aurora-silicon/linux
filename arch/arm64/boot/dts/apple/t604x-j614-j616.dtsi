@@ -23,6 +23,8 @@
 		keyboard = &keyboard;
 		nvram = &nvram;
 		spi0 = &qspi;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
 		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
 		/* used by the loader to hand over the display */
@@ -322,21 +324,44 @@
 
 	/*
 	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
-	 * smc_hwmon. The PMP's fast die-temperature limit regulates: its loop
-	 * holds its own hot-spot sensors at 110 C (ADT fast-die-ctrl-loop),
-	 * and under a sustained all-core load TCMz then settles at 113.4 to
-	 * 114.7 C with the fans running. This zone is the backstop above that:
-	 * passive at 116 C, critical (orderly shutdown) at 118 C, polled once a
-	 * second as the SMC refreshes TCMz. The cpufreq cooling device sits on a
-	 * cluster's policy CPU, so each map lists every CPU of its cluster.
+	 * smc_hwmon, polled once a second as the SMC refreshes it. Per-cluster
+	 * and GPU zones follow, one per SMC die-maximum sensor (smc_hwmon
+	 * channels 1-23, in the order of the temperature nodes below): Tex0-3
+	 * throttle the E cluster, Tpx0-5 the first P cluster and Tpx8-D the
+	 * second. The die zone throttles all three. The cpufreq cooling device
+	 * sits on a cluster's policy CPU, so each map lists every CPU of its
+	 * cluster.
 	 *
-	 * Per-cluster and GPU zones follow, one per SMC die-maximum sensor
-	 * (smc_hwmon channels 1-23, in the order of the temperature nodes
-	 * below): Tex0-3 throttle the E cluster, Tpx0-5 the first P cluster
-	 * and Tpx8-D the second, with the same 116/118 C backstop as TCMz.
-	 * Unlike the fanless J700, this machine has two SMC-driven fans and
-	 * the PMP regulates the dies itself, so these zones only catch a
-	 * failure of that loop; they never act in normal use.
+	 * The fast control is the PMP's, as on macOS: its loop holds its own
+	 * hot-spot sensors at the ADT fast-die-ctrl-loop target of 110 C and
+	 * cpufreq enforces its effort as a frequency limit within milliseconds.
+	 * Under a sustained all-core build TCMz then settles at 113 to 114 C.
+	 * The CPU zones are the slower backstop above that point: the power
+	 * allocator switches on at 75 C and controls at 115 C, so it leaves the
+	 * PMP's operating point alone and only trims what the PMP lets through.
+	 *
+	 * The PMP's sensors do not see every hot spot. Under mixed SIMD,
+	 * memory and GPU load the per-core Tpx sensors follow a core's power
+	 * within a second and jump by 9-10 C (one standard deviation) between
+	 * 1 s samples while the PMP's effort stays at zero. A controller on
+	 * these samples cannot stop single excursions, and a proportional one
+	 * swings between no limit and full cooling every second, so the zones
+	 * are integral-led: the wide 40 C switch-on window keeps the
+	 * proportional gains low and integral-time-constant-ms sets the
+	 * integral term. Each zone throttles only the cluster its sensor sits
+	 * on: the allocator divides a zone's budget by requested power, so a
+	 * zone that throttled every cluster left a hot core's own cluster
+	 * nearly at full speed.
+	 *
+	 * Critical (orderly shutdown) is at 125 C, the per-sensor maximum the
+	 * ADT temp-sensor table gives next to the 110 C target for the PMP's
+	 * sensors (the sochot level). The SMC sensors read a few degrees above
+	 * the PMP's, so Linux shuts down at or before the hardware's own limit.
+	 * A hot trip at 120 C only reports, and the critical trip acts only
+	 * after three consecutive samples at or above it (critical-samples),
+	 * so one excursion cannot shut the machine down. Under any load the
+	 * per-core excursions have peaked at 116.5-118 C, which the former
+	 * 118 C critical trip turned into a shutdown.
 	 *
 	 * The GPU has no cooling device of its own: its firmware sets the GPU
 	 * performance state and starts limiting at 101 C. So when a GPU die
@@ -347,13 +372,20 @@
 	 * GPU is powered off its sensors report placeholder values from -4 to
 	 * 4 C.
 	 *
-	 * The fans: left to themselves (SMC mode 3, with no OS asking for
-	 * cooling) they stay off, or switch on late and ramp slowly, while the
-	 * dies heat up under load. So the CPU die zone and the GPU zones also
-	 * run both fans through a ladder of active trips; a fan takes the
-	 * highest state any zone asks for and goes back to the SMC once no
-	 * zone asks for anything. States 1-8 of a fan run it from its minimum
-	 * (1350 rpm) to its maximum (5777 rpm) in even steps.
+	 * Every zone runs the power allocator, which acts at any temperature
+	 * unless a zone has a second passive trip: the first one is then its
+	 * switch-on point, below which it resets and grants full power. So each
+	 * zone has one: 75 C under the 115 C die and CPU control trip and 90 C
+	 * under the GPU zones' 101 C one. Without them the GPU zones, whose
+	 * placeholder readings never warm up, held all 14 CPUs to about 7.5 W
+	 * (1.26/1.02/1.26 GHz) under any all-core load. The GPU zones also
+	 * carry the die's sustainable power rather than the allocator's
+	 * estimate from the lowest CPU states (about 2.6 W).
+	 *
+	 * The fans stay with the SMC, as on macOS: macOS writes no SMC key at
+	 * runtime and its fans run in the SMC's own mode, which ramps them
+	 * under sustained load. No zone has active trips; the hwmon fans stay
+	 * cooling devices for userspace and manual control.
 	 *
 	 * sustainable-power is what the CPUs dissipate with the die held at
 	 * its operating point: 720 s of all-core load (10 P, 4 E busy loops),
@@ -369,62 +401,44 @@
 	 * All of these values were measured on the J616s. The J614s inherits
 	 * them until it is measured: Apple's package power limits for it are
 	 * about 78% (CPU) and 90% (GPU) of the J616s ones, so its budgets are
-	 * generous here, but these zones are a backstop behind the PMP.
+	 * generous here, and these zones are a backstop behind the PMP.
 	 */
-#define J616S_FAN_TRIP(label, node, temp, hyst)	\
-	label: node {					\
-		temperature = <temp>;			\
-		hysteresis = <hyst>;			\
-		type = "active";			\
-	};
-
-#define J616S_FAN_TRIPS(zone)					\
-	J616S_FAN_TRIP(zone##_fan1, trip-fan1, 75000, 10000)	\
-	J616S_FAN_TRIP(zone##_fan2, trip-fan2, 80000, 5000)	\
-	J616S_FAN_TRIP(zone##_fan3, trip-fan3, 85000, 5000)	\
-	J616S_FAN_TRIP(zone##_fan4, trip-fan4, 90000, 5000)	\
-	J616S_FAN_TRIP(zone##_fan5, trip-fan5, 95000, 5000)
-
-#define J616S_FAN_MAP(trip_label, node, state)			\
-	node {							\
-		trip = <&trip_label>;				\
-		cooling-device = <&smc_hwmon 0 state state>,	\
-				 <&smc_hwmon 1 state state>;	\
-	};
-
-#define J616S_FAN_MAPS(zone)				\
-	J616S_FAN_MAP(zone##_fan1, map-fan1, 1)		\
-	J616S_FAN_MAP(zone##_fan2, map-fan2, 2)		\
-	J616S_FAN_MAP(zone##_fan3, map-fan3, 3)		\
-	J616S_FAN_MAP(zone##_fan4, map-fan4, 5)		\
-	J616S_FAN_MAP(zone##_fan5, map-fan5, 8)
-
 	thermal-zones {
 		cpu-die-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
 
 			trips {
-				J616S_FAN_TRIPS(cpu_die)
+				cpu_die_switch_on: cpu-die-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				cpu_die_passive: cpu-die-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				cpu-die-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				cpu-die-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(cpu_die)
-
 				map-e {
 					trip = <&cpu_die_passive>;
 					cooling-device =
@@ -459,18 +473,32 @@
 		cpu-e0-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 1>;	/* Tex0 */
 
 			trips {
+				cpu_e0_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e0_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -491,18 +519,32 @@
 		cpu-e1-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 2>;	/* Tex1 */
 
 			trips {
+				cpu_e1_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e1_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -523,18 +565,32 @@
 		cpu-e2-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 3>;	/* Tex2 */
 
 			trips {
+				cpu_e2_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e2_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -555,18 +611,32 @@
 		cpu-e3-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <2100>;
 			thermal-sensors = <&smc_hwmon 4>;	/* Tex3 */
 
 			trips {
+				cpu_e3_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_e3_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -587,18 +657,32 @@
 		cpu-p00-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 5>;	/* Tpx0 */
 
 			trips {
+				cpu_p00_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p00_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -620,18 +704,32 @@
 		cpu-p01-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 6>;	/* Tpx1 */
 
 			trips {
+				cpu_p01_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p01_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -653,18 +751,32 @@
 		cpu-p02-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 7>;	/* Tpx2 */
 
 			trips {
+				cpu_p02_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p02_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -686,18 +798,32 @@
 		cpu-p03-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 8>;	/* Tpx3 */
 
 			trips {
+				cpu_p03_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p03_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -719,18 +845,32 @@
 		cpu-p04-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 9>;	/* Tpx4 */
 
 			trips {
+				cpu_p04_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p04_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -752,18 +892,32 @@
 		cpu-p05-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <25300>;
 			thermal-sensors = <&smc_hwmon 10>;	/* Tpx5 */
 
 			trips {
+				cpu_p05_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p05_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -785,18 +939,32 @@
 		cpu-p10-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 11>;	/* Tpx8 */
 
 			trips {
+				cpu_p10_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p10_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -818,18 +986,32 @@
 		cpu-p11-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 12>;	/* Tpx9 */
 
 			trips {
+				cpu_p11_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p11_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -851,18 +1033,32 @@
 		cpu-p12-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 13>;	/* TpxA */
 
 			trips {
+				cpu_p12_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p12_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -884,18 +1080,32 @@
 		cpu-p13-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 14>;	/* TpxB */
 
 			trips {
+				cpu_p13_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p13_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -917,18 +1127,32 @@
 		cpu-p14-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 15>;	/* TpxC */
 
 			trips {
+				cpu_p14_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p14_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -950,18 +1174,32 @@
 		cpu-p15-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			integral-time-constant-ms = <20000>;
+			critical-samples = <3>;
 			sustainable-power = <23900>;
 			thermal-sensors = <&smc_hwmon 16>;	/* TpxD */
 
 			trips {
+				cpu_p15_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
 				cpu_p15_passive: trip-passive {
-					temperature = <116000>;
+					temperature = <115000>;
 					hysteresis = <5000>;
 					type = "passive";
 				};
 
+				trip-hot {
+					temperature = <120000>;
+					hysteresis = <2000>;
+					type = "hot";
+				};
+
 				trip-critical {
-					temperature = <118000>;
+					temperature = <125000>;
 					hysteresis = <0>;
 					type = "critical";
 				};
@@ -983,10 +1221,15 @@
 		gpu0-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 17>;	/* Tg05 */
 
 			trips {
-				J616S_FAN_TRIPS(gpu0)
+				gpu0_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu0_passive: trip-passive {
 					temperature = <101000>;
@@ -1002,8 +1245,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu0)
-
 				map-e {
 					trip = <&gpu0_passive>;
 					cooling-device =
@@ -1038,10 +1279,15 @@
 		gpu1-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 18>;	/* Tg0S */
 
 			trips {
-				J616S_FAN_TRIPS(gpu1)
+				gpu1_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu1_passive: trip-passive {
 					temperature = <101000>;
@@ -1057,8 +1303,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu1)
-
 				map-e {
 					trip = <&gpu1_passive>;
 					cooling-device =
@@ -1093,10 +1337,15 @@
 		gpu2-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 19>;	/* Tg0Y */
 
 			trips {
-				J616S_FAN_TRIPS(gpu2)
+				gpu2_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu2_passive: trip-passive {
 					temperature = <101000>;
@@ -1112,8 +1361,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu2)
-
 				map-e {
 					trip = <&gpu2_passive>;
 					cooling-device =
@@ -1148,10 +1395,15 @@
 		gpu3-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 20>;	/* Tg0k */
 
 			trips {
-				J616S_FAN_TRIPS(gpu3)
+				gpu3_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu3_passive: trip-passive {
 					temperature = <101000>;
@@ -1167,8 +1419,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu3)
-
 				map-e {
 					trip = <&gpu3_passive>;
 					cooling-device =
@@ -1203,10 +1453,15 @@
 		gpu4-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 21>;	/* Tg0z */
 
 			trips {
-				J616S_FAN_TRIPS(gpu4)
+				gpu4_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu4_passive: trip-passive {
 					temperature = <101000>;
@@ -1222,8 +1477,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu4)
-
 				map-e {
 					trip = <&gpu4_passive>;
 					cooling-device =
@@ -1258,10 +1511,15 @@
 		gpu5-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 22>;	/* Tg1V */
 
 			trips {
-				J616S_FAN_TRIPS(gpu5)
+				gpu5_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu5_passive: trip-passive {
 					temperature = <101000>;
@@ -1277,8 +1535,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu5)
-
 				map-e {
 					trip = <&gpu5_passive>;
 					cooling-device =
@@ -1313,10 +1569,15 @@
 		gpu6-thermal {
 			polling-delay-passive = <1000>;
 			polling-delay = <1000>;
+			sustainable-power = <51300>;
 			thermal-sensors = <&smc_hwmon 23>;	/* Tg1l */
 
 			trips {
-				J616S_FAN_TRIPS(gpu6)
+				gpu6_switch_on: trip-switch-on {
+					temperature = <90000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
 
 				gpu6_passive: trip-passive {
 					temperature = <101000>;
@@ -1332,8 +1593,6 @@
 			};
 
 			cooling-maps {
-				J616S_FAN_MAPS(gpu6)
-
 				map-e {
 					trip = <&gpu6_passive>;
 					cooling-device =
@@ -4605,18 +4864,29 @@
 	};
 };
 
+/*
+ * The GL9755 SD reader. Its supply is the SMC's gP19 output, which the
+ * J614s and J616s firmware both describe as active high. Both CLKREQ pins
+ * go on the controller so that the Wi-Fi and SD ports do not claim the
+ * same pins.
+ */
+&apcie1_dart {
+	status = "okay";
+};
+
 &pcie0 {
 	interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
 		     <AIC_IRQ 1732 IRQ_TYPE_LEVEL_HIGH>;
-	/* Widen bus-range only with the SD power/port ownership handoff. */
+	bus-range = <0 2>;
+	pinctrl-0 = <&wifi_clkreq_pins &sd_clkreq_pins>;
 	iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie1_dart 1 1>;
 
 	port01: pci@1,0 {
 		device_type = "pci";
 		reg = <0x800 0 0 0 0>;
 		reset-gpios = <&pinctrl 5 GPIO_ACTIVE_LOW>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&sd_clkreq_pins>;
+		bus-range = <2 2>;
+		pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
 		#address-cells = <3>;
 		#size-cells = <2>;
 		ranges;
@@ -4627,120 +4897,16 @@
 				<0 0 0 2 &port01 0 0 0 1>,
 				<0 0 0 3 &port01 0 0 0 2>,
 				<0 0 0 4 &port01 0 0 0 3>;
-		/* The SD power switch needs an SMC service binding. */
-		status = "disabled";
-	};
-};
+		status = "okay";
 
-/*
- * The SMC owns automatic fan policy. Drop the host fan trip/map instances
- * after the board's thermal descriptions, retaining all passive and critical
- * protection. Keep this final policy separate from ladder descriptions so
- * independent ladder updates cannot restore autonomous SMC writes.
- */
-
-#define J616S_DELETE_FAN_TRIPS \
-	/delete-node/ trip-fan1; \
-	/delete-node/ trip-fan2; \
-	/delete-node/ trip-fan3; \
-	/delete-node/ trip-fan4; \
-	/delete-node/ trip-fan5;
-
-/* Some CPU ladders also map full fan speed to the passive trip. */
-#define J616S_DELETE_FAN_MAPS \
-	/delete-node/ map-fan1; \
-	/delete-node/ map-fan2; \
-	/delete-node/ map-fan3; \
-	/delete-node/ map-fan4; \
-	/delete-node/ map-fan5; \
-	/delete-node/ map-fan6;
-
-/ {
-	thermal-zones {
-		cpu-die-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
-		};
-
-		gpu0-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
-		};
-
-		gpu1-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
-		};
-
-		gpu2-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
-		};
-
-		gpu3-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
-		};
-
-		gpu4-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
-		};
-
-		gpu5-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
-		};
-
-		gpu6-thermal {
-			trips {
-				J616S_DELETE_FAN_TRIPS
-			};
-
-			cooling-maps {
-				J616S_DELETE_FAN_MAPS
-			};
+		mmc@0,0 {
+			compatible = "pci17a0,9755";
+			reg = <0x20000 0 0 0 0>;
+			cd-inverted;
+			wp-inverted;
 		};
 	};
 };
-
-#undef J616S_DELETE_FAN_TRIPS
-#undef J616S_DELETE_FAN_MAPS
 
 /*
  * Proven on the J616s (MobileNetV1 top-1 16/16). The ANE stays idle until
@@ -4761,5 +4927,12 @@
 &ane {
 	memory-region = <&ane_fw_text>, <&ane_fw_data>;
 	memory-region-names = "firmware-text", "firmware-data";
+	/*
+	 * The SoC rail floor, held only while ANE requests are in flight:
+	 * MobileNet engine time 0.87 -> 0.54 ms on an idle system.
+	 */
+	power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+			<&ps_ane_td>, <&ps_ane_base>, <&pmc_soc_max>;
+	power-domain-names = "sys", "cpu", "mpm", "td", "base", "perf";
 	status = "okay";
 };

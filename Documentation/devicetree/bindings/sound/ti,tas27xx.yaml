@@ -66,6 +66,15 @@ properties:
       down, and no member enables it again until the driver is reloaded.
       A member needs its fault interrupt.
 
+  apple,deferred-shutdown:
+    type: boolean
+    description:
+      The amplifier's TDM bus keeps running for a while after its playback
+      stream stops, as on an AOP-fed speaker stream, and its current and
+      voltage sense slots are still sampled in that time. The amplifier
+      must not enter software shutdown until the bus has stopped. One shut
+      down while the bus still runs can leave garbage in its sense slots.
+
   ti,imon-slot-no:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: TDM TX current sense time slot.

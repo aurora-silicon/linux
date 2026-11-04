@@ -36,6 +36,7 @@ def main():
         'static bool apple_clpc_gpu_dense(',
         'static bool apple_clpc_gpu_limited(',
         'static void apple_clpc_gpu_floor_count(',
+        'static bool apple_clpc_gpu_input_demand(',
         'static void apple_clpc_sample('])
     code = r'''
 #include <assert.h>
@@ -103,21 +104,34 @@ static int apple_pmc_floor_update(void *pmc, unsigned int agent, u32 mask, u32 f
 }
 static void apple_clpc_queue(struct apple_clpc *c, bool idle) { (void)c; queued_idle=idle; }
 ''' + dense_samples + '\n' + tables + '\n' + methods + r'''
+// T8132's G16 firmware keeps graphics powered while the GPU idles: the
+// M5/F3 floor follows the work the GPU driver reports, as on T6040.
 static void check_t8132(void) {
- struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
- read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=0;
- apple_clpc_sample(&c); assert(published==0 && queued_idle);
- jiffies=100; pmgr_status=0xf0;
- apple_clpc_sample(&c); assert(published==0x35 && c.last_reason==4);
- jiffies=131; pmgr_status=0; apple_clpc_sample(&c);
+ struct apple_clpc_gpu gpu={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.agent=1,.mask=3,.gpu=&gpu};
+ assert(!c.hw->gpu_demand);
+ read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; jiffies=0; published=~0u;
+ apple_clpc_sample(&c); assert(published==0 && queued_idle && c.last_reason==0);
+ gpu.active=true; jiffies=100;
+ apple_clpc_sample(&c); assert(published==0x35 && c.last_reason==2);
+ gpu.active=false; jiffies=131; apple_clpc_sample(&c);
  assert(published==0x35 && c.last_reason==16);
  jiffies=132; apple_clpc_sample(&c); assert(published==0 && queued_idle);
- // A failed power-state read still protects an active graphics consumer.
- jiffies=200; pmgr_status=0xe0; read_error=-EIO; warned=0;
- apple_clpc_sample(&c); assert(published==0x35);
+}
+
+// A failed power-state read still protects an active graphics consumer.
+static void check_read_error(void) {
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
+ read_error=vote_error=0; pmp_floor=4; pmgr_status=0xf0; warned=0;
+ for (jiffies=100; jiffies<=164; jiffies+=4) apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==4);
+ jiffies=168; pmgr_status=0; read_error=-EIO;
+ apple_clpc_sample(&c); assert(published==0x34 && c.last_reason==4);
  // The failure is counted for debugfs and warned about once.
  assert(c.gpu_read_errors==1 && warned==1);
- jiffies=232; read_error=0; apple_clpc_sample(&c); assert(published==0);
+ jiffies=172; read_error=0; apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==16);
+ jiffies=204; apple_clpc_sample(&c); assert(published==0);
  assert(c.gpu_read_errors==1);
 }
 
@@ -188,9 +202,10 @@ int main(void) {
  c.clusters[0].request[0]=c.clusters[0].request[1]=0;
  jiffies=264; apple_clpc_sample(&c); assert(published==0);
  check_t8132();
+ check_read_error();
  check_t8140();
  check_t8140_dense();
- puts("PASS: T6040 host demand; T8132 powered floor; T8140 streaming, dense work and PMP backoff; idle release");
+ puts("PASS: T6040 and T8132 host demand; T8140 streaming, dense work, read errors and PMP backoff; idle release");
 }
 '''
     code = code.replace('#define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)', rail_shift)
@@ -198,8 +213,8 @@ int main(void) {
         root = Path(tmp)
         for name, text in [
             ('fixed', code),
-            ('omit-host-demand', code.replace('if (clpc->gpu && !clpc->hw->gpu_demand) {', 'if (false) {')),
-            ('omit-streaming-demand', code.replace('bool streaming = apple_clpc_gpu_streaming(clpc, now);',
+            ('omit-host-demand', code.replace('if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))',
+                                              'if (false && apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))')),            ('omit-streaming-demand', code.replace('bool streaming = apple_clpc_gpu_streaming(clpc, now);',
                                                    'bool streaming = (apple_clpc_gpu_streaming(clpc, now), false);')),
             ('omit-dense-demand', code.replace('if (streaming || dense) {', 'if (streaming || (dense && false)) {')),
             ('dense-ignores-late', code.replace('if (!threshold || late || submissions < threshold)',

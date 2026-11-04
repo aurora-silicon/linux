@@ -149,6 +149,9 @@ struct ane_h16_boot {
 	u64 ranges[4][2];
 	u32 requests[5];
 	u32 tick;
+	/* The PMU aperture base for SET_SNE_PMU_BASE2 at startup; 0: not sent. */
+	u64 pmu_base;
+	bool pmu_base_set;
 	u8 resource_info[100];
 	int error;
 	enum ane_h16_stage stage;
@@ -459,7 +462,14 @@ static inline int ane_h16_wait(struct ane_h16_boot *b, u32 cell, u32 value,
 static inline int ane_h16_alloc(struct ane_h16_boot *b, u64 dva, size_t size,
 				struct ane_fw_surface *s)
 {
-	int ret = b->ops->alloc_at(b->ctx, dva, size, s);
+	int ret;
+
+	/* A cold boot after sleep reuses the surface it mapped before, cleared. */
+	if (s->cpu && s->dva == dva && s->size == size) {
+		memset(s->cpu, 0, size);
+		return 0;
+	}
+	ret = b->ops->alloc_at(b->ctx, dva, size, s);
 
 	if (ret)
 		return ret;
@@ -558,6 +568,40 @@ static inline int ane_h16_scratch_boot(struct ane_h16_boot *b)
 	return ret;
 }
 
+/* Read-only evidence: never acknowledge an IRQ or change a cursor on timeout. */
+static inline void ane_h16_startup_timeout(struct ane_h16_boot *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	const struct ane_fw_channel *c = &t->channels[ANE_FW_SHAREDMALLOC];
+	unsigned int i;
+	u8 *p;
+
+	b->ops->log(b->ctx, "startup timeout IRQ/polls",
+		    t->ops->read32(t->ctx, t->soc->irq_status), t->polls);
+	b->ops->log(b->ctx, "startup SHAREDMALLOC head/slots",
+		    t->head[ANE_FW_SHAREDMALLOC], c->slots);
+	b->ops->log(b->ctx, "startup SHAREDMALLOC ready/allocations",
+		    t->shared_ready, t->shared_count);
+	/* Geometry was validated before startup; include slots behind the cursor. */
+	for (i = 0; i < c->slots; i++) {
+		p = (u8 *)t->ipc.cpu + c->offset + i * ANE_FW_SLOT_SIZE;
+		t->ops->read_barrier(t->ctx);
+		b->ops->log(b->ctx, "startup SHAREDMALLOC slot/word0", i,
+			    t->ops->load64(t->ctx, p));
+		b->ops->log(b->ctx, "startup SHAREDMALLOC word1/word2",
+			    t->ops->load64(t->ctx, p + 8),
+			    t->ops->load64(t->ctx, p + 16));
+	}
+	p = ane_fw_transport_slot(t, ANE_FW_IO);
+	t->ops->read_barrier(t->ctx);
+	b->ops->log(b->ctx, "startup IO head/word0", t->head[ANE_FW_IO],
+		    t->ops->load64(t->ctx, p));
+	b->ops->log(b->ctx, "startup IO word1/word2", t->ops->load64(t->ctx, p + 8),
+		    t->ops->load64(t->ctx, p + 16));
+	for (i = 0; i < 8; i++)
+		b->ops->log(b->ctx, "startup timeout scratch", i, ane_h16_read(b, i));
+}
+
 static inline int ane_h16_startup(struct ane_h16_boot *b)
 {
 	const struct ane_h16_build *f = b->build;
@@ -578,6 +622,8 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		reply = (u8 *)b->pool.cpu +
 			(b->transport.pending[ANE_FW_IO].dva - b->pool.dva);
 		if (ret) {
+			if (ret == -ETIMEDOUT)
+				ane_h16_startup_timeout(b);
 			if (ret == -EREMOTEIO)
 				b->ops->log(b->ctx, "startup refusal ID/ack",
 					    f->startup[i].id, get_unaligned_le16(reply + 6));
@@ -595,7 +641,22 @@ static inline int ane_h16_startup(struct ane_h16_boot *b)
 		ret = ane_h16_faults(b, false);
 		if (ret)
 			return ret;
+		/* macOS order: START, then SET_SNE_PMU_BASE2 on the control ring. */
+		if (f->startup[i].id == 0 && b->pmu_base) {
+			b->pmu_base_set = false;
+			ret = ane_fw_transport_publish_pmu_base(&b->transport, b->pmu_base,
+								deadline);
+			if (!ret)
+				ret = ane_fw_transport_wait(&b->transport, b->transport.control_ch);
+			b->ops->log(b->ctx, "SET_SNE_PMU_BASE2 base/result", b->pmu_base, (u64)ret);
+			if (ret)
+				return ret;
+			b->pmu_base_set = true;
+		}
 	}
+	/* How often a request body was seen before its notification and held. */
+	b->ops->log(b->ctx, "startup SHAREDMALLOC allocations/early polls held",
+		    b->transport.shared_count, b->transport.shared_early);
 	return 0;
 }
 

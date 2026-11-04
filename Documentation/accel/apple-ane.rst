@@ -334,7 +334,12 @@ cannot distinguish a control request; its lookup request layout remains
 unproved. No control reply is invented.
 
 IRQ service reads pending once, rejects bits above 7 and writes the exact
-nonzero snapshot to acknowledge. The wait helper services one allocation at
+nonzero snapshot to acknowledge. Only a SHAREDMALLOC notification authorizes
+allocation service: a fresh slot and an allocation request both have a zero
+header, so the body becoming visible does not establish publication. After
+acknowledging, the transport captures the number of queued entries before
+answering any of them. This handles coalesced notifications without admitting
+a later request using an earlier notification. The wait helper services one allocation at
 a time and checks the original absolute monotonic deadline, including time
 spent inside the allocation callback. Servicing never starts a new timeout.
 

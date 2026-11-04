@@ -15,6 +15,9 @@
  *  - T8122 (t8122-gate-test.dtso): on by default, with the full handoff,
  *    and nothing changed when a check of the handoff or of the reused PMP
  *    topology fails.
+ *  - T6041: no test tree; a PMP that binds after the deadline still
+ *    starts the external display power-up, and only a failed PMP or power-up
+ *    leaves the internal panel alone.
  * Included at the end of display-gate.c.
  *
  * The test trees are applied once and stay: the gate gives some properties
@@ -970,5 +973,49 @@ static struct kunit_suite gate_t8122_suite __refdata = {
 	.test_cases = gate_t8122_cases,
 };
 
+/*
+ * T6041: the steps of the external display power-up. No test tree here: the
+ * steps are what decides between a late power-up and the internal panel.
+ */
+static void __init gate_t6041_staged_steps(struct kunit *test)
+{
+	static const struct {
+		enum staged_state from;
+		enum staged_event event;
+		enum staged_state to;
+	} steps[] = {
+		{ STAGED_WAITING, STAGED_PMP_BOUND, STAGED_STARTED },
+		{ STAGED_WAITING, STAGED_DEADLINE, STAGED_RELEASED },
+		{ STAGED_WAITING, STAGED_PMP_FAILED, STAGED_FALLBACK },
+		/* A PMP from an encrypted root, bound after the deadline. */
+		{ STAGED_RELEASED, STAGED_PMP_BOUND, STAGED_STARTED },
+		{ STAGED_RELEASED, STAGED_DEADLINE, STAGED_RELEASED },
+		{ STAGED_RELEASED, STAGED_PMP_FAILED, STAGED_FALLBACK },
+		/* Started and fallen back are for the rest of the boot. */
+		{ STAGED_STARTED, STAGED_PMP_BOUND, STAGED_STARTED },
+		{ STAGED_STARTED, STAGED_DEADLINE, STAGED_STARTED },
+		{ STAGED_STARTED, STAGED_PMP_FAILED, STAGED_STARTED },
+		{ STAGED_FALLBACK, STAGED_PMP_BOUND, STAGED_FALLBACK },
+		{ STAGED_FALLBACK, STAGED_DEADLINE, STAGED_FALLBACK },
+		{ STAGED_FALLBACK, STAGED_PMP_FAILED, STAGED_FALLBACK },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(steps); i++)
+		KUNIT_EXPECT_EQ_MSG(test, staged_next(steps[i].from, steps[i].event), steps[i].to,
+				    "step %u", i);
+}
+
+static struct kunit_case gate_t6041_cases[] __refdata = {
+	KUNIT_CASE(gate_t6041_staged_steps),
+	{}
+};
+
+static struct kunit_suite gate_t6041_suite __refdata = {
+	.name = "apple-display-gate-t6041",
+	.test_cases = gate_t6041_cases,
+};
+
 /* T6030 first: the T6031 and T8122 trees describe a PMP, which it refuses. */
-kunit_test_init_section_suites(&gate_t6030_suite, &gate_t6031_suite, &gate_t8122_suite);
+kunit_test_init_section_suites(&gate_t6030_suite, &gate_t6031_suite, &gate_t8122_suite,
+			       &gate_t6041_suite);

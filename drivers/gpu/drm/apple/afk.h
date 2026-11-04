@@ -76,6 +76,8 @@ struct apple_epic_service {
 	/* Compact EPIC (desktop 26.x): the announced identity and OPEN state. */
 	char name[33];
 	s64 unit;
+	/* DCP poweron generation that announced this compact service. */
+	u32 power_gen;
 	bool defer_start;
 	bool started;
 

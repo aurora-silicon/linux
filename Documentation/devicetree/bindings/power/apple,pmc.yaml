@@ -124,7 +124,8 @@ patternProperties:
       A rail floor, provided as a power domain. While the domain is powered,
       the AP's voter agent holds the rail at least at the given performance
       state. Floors on the same rail combine to the highest powered one. The
-      AP agent must be a static voter, and the DCS rail cannot have a floor.
+      AP agent must be a static voter. A floor on the DCS rail shares the AP
+      agent's DCS vote with the DCS limit, which caps it.
     additionalProperties: false
 
     properties:

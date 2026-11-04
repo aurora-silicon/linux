@@ -89,6 +89,8 @@ struct ave_dev {
 	void *data_pristine;
 	struct ave_ring ring[2];
 	u64 ipc_fw_base;
+	bool irq_kick;
+	int irq_wait;
 };
 
 static void *test_ctrl_addr;
@@ -110,6 +112,23 @@ static void msleep(unsigned int ms)
 }
 
 static void usleep_range(unsigned int lo, unsigned int hi) { }
+
+/* Ring waits: the mailbox interrupt never comes, so each wait times out. */
+static unsigned int irq_waits;
+static unsigned long irq_wait_max;
+#define smp_mb() __sync_synchronize()
+#define clamp_t(t, v, lo, hi) ((t)(v) < (t)(lo) ? (t)(lo) : (t)(v) > (t)(hi) ? (t)(hi) : (t)(v))
+static s64 ktime_ms_delta(ktime_t a, ktime_t b)
+{
+	return (s64)(a - b);
+}
+#define wait_event_timeout(wq, cond, timeout) ({			\
+	unsigned long __t = (timeout);					\
+	irq_waits++;							\
+	if (__t > irq_wait_max)						\
+		irq_wait_max = __t;					\
+	(cond) ? 1 : 0;							\
+})
 
 static u32 readl(const void *p)
 {

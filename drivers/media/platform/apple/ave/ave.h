@@ -8,11 +8,13 @@
 #define _APPLE_AVE_H_
 
 #include <linux/atomic.h>
+#include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
@@ -220,6 +222,18 @@ struct ave_dev {
 	/* The video device's ioctl and queue lock. */
 	struct mutex vdev_lock;
 	struct workqueue_struct *wq;
+
+	/*
+	 * The mailbox interrupt: masked by its handler until the next ring
+	 * poll has cleared the mailbox status (irq_lock). irq_kick wakes a
+	 * waiting ave_ipc_pump(); irq_work handles events nobody waits for.
+	 */
+	int irq;
+	spinlock_t irq_lock;
+	bool irq_masked;
+	bool irq_kick;
+	wait_queue_head_t irq_wait;
+	struct work_struct irq_work;
 };
 
 /* Encoding parameters, fixed for the lifetime of a session. */
@@ -227,7 +241,8 @@ struct ave_params {
 	enum ave_codec codec;
 	u32 width, height; /* visible picture */
 	u32 cw, ch; /* coded size, multiples of 16 */
-	u32 stride; /* NV12 line stride, both planes */
+	u32 stride; /* NV12 or P010 line stride in bytes, both planes */
+	u32 sample_bytes; /* 1 for NV12, 2 for P010 */
 	u32 mbs; /* 16x16 macroblocks */
 	u32 fps_num, fps_den; /* frames per second = num / den */
 	u32 fps_int; /* the same, rounded */
@@ -325,6 +340,7 @@ struct ave_ctx {
 	u32 h264_level;
 	u32 h264_min_qp;
 	u32 h264_max_qp;
+	u32 hevc_profile;
 	u32 hevc_level;
 	u32 hevc_min_qp;
 	u32 hevc_max_qp;
@@ -382,6 +398,7 @@ int ave_ipc_submit(struct ave_dev *ave, unsigned int buf, size_t len,
 int ave_ipc_pump(struct ave_dev *ave, unsigned int wait_ms,
 		 bool (*cond)(struct ave_dev *ave, void *arg), void *arg);
 int ave_ipc_settle(struct ave_dev *ave, unsigned int wait_ms);
+int ave_ipc_irq_init(struct ave_dev *ave, struct platform_device *pdev);
 
 /* ave-writer.c: pure command builders, also exercised by KUnit. */
 u32 ave_session_arg2(struct ave_ctx *ctx);

@@ -11,6 +11,7 @@
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 
+#include "ane_fw_cold.h"
 #include "ane_fw_platform.h"
 #include "ane_h16_boot_data.h"
 
@@ -63,6 +64,13 @@ const struct ane_fw_platform ane_h16_platform = {
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0) | BIT(11),
+	/*
+	 * System sleep cycles the engine cold and replays every program.
+	 * The warm path stays off: on 25G83 the J616s firmware does not take
+	 * SUSPEND (0x24), bare or after SET_SNE_PMU_BASE2 and
+	 * EXCLAVE_MODE_STOP.
+	 */
+	.sleep_cold = true,
 	.firmware_preloaded = true,
 	.safe_reset = false,
 };
@@ -89,6 +97,13 @@ const struct ane_fw_platform ane_h17_platform = {
 	.stream_mask = BIT(0),
 	.firmware_preloaded = true,
 	.safe_reset = false,
+	/* 25G83 boots this firmware in Exclave mode (SPEC-ANE-SLEEP-H17.md). */
+	.exclave_mode_stop = true,
+	/*
+	 * Off: on 25G83 SUSPEND is still not taken after 0x31 (C7), so sleep
+	 * cycles the engine cold and replays every program behind its handle.
+	 */
+	.sleep_warm = false,
 	/* Cold AP-direct acquisition is staged before any power or DMA write.
 	 * The observer uses the measured H17 26.6.2 register layout.
 	 */
@@ -171,10 +186,13 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 	/* No backend has acquired ownership, even if DT omits the marker.
 	 * Check before resources, firmware, power, IOMMU or engine access.
 	 */
-	if (soc->owner == ANE_FW_OWNER_EXCLAVE) {
-		dev_info(dev, "H17 ANE: cold acquisition requires staged preflight; refusing direct probe\n");
-		return -EOPNOTSUPP;
-	}
+	/*
+	 * H17 is started (or left alone) by the staged path before the driver
+	 * registers; the platform probe never acquires it. -ENODEV keeps the
+	 * driver core quiet; the staged path already said why.
+	 */
+	if (soc->owner == ANE_FW_OWNER_EXCLAVE)
+		return -ENODEV;
 	if (of_property_read_bool(np, "apple,exclave-assigned")) {
 		dev_info(dev, "ANE: exclave-assigned device has no Linux ownership provider\n");
 		return -EOPNOTSUPP;
@@ -214,7 +232,12 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 
 int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_platform *soc)
 {
-	int ret = ane_fw_platform_preflight(pdev, soc);
+	int ret;
+
+	/* H17: the staged backend owns the engine; the device binds for it. */
+	if (ane_fw_platform_staged(soc))
+		return ane_fw_staged_bind(pdev);
+	ret = ane_fw_platform_preflight(pdev, soc);
 
 	if (ret)
 		return ret;
@@ -223,5 +246,24 @@ int ane_fw_platform_probe(struct platform_device *pdev, const struct ane_fw_plat
 
 void ane_fw_platform_remove(struct platform_device *pdev)
 {
+	if (ane_fw_staged_bound(&pdev->dev)) {
+		ane_fw_staged_unbind(pdev);
+		return;
+	}
 	ane_h16_backend_remove(pdev);
+}
+
+/* System sleep callbacks of the bound H16 or H17 device. */
+int ane_fw_platform_suspend(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return ane_fw_staged_suspend(dev);
+	return ane_h16_backend_suspend(dev);
+}
+
+int ane_fw_platform_resume(struct device *dev)
+{
+	if (ane_fw_staged_bound(dev))
+		return 0;
+	return ane_h16_backend_resume(dev);
 }
