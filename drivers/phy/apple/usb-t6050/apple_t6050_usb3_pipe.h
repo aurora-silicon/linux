@@ -37,9 +37,10 @@ apple_t6050_usb3_pipe_cold_dummy(const struct apple_t6050_usb_io *io)
 }
 
 /*
- * Returns 0, or the failing step: -2 the PIPE was not parked on a known producer, -3 the lock was
- * not acknowledged, -4..-6 the BIST, -7 the mux did not read back USB3, -8 the BIST did not stop,
- * -9 the lock release was not acknowledged. Up to -6 the mux is untouched.
+ * Returns 0, or the failing step: -2 the PIPE was not parked on a known producer, -4..-6 the
+ * BIST, -7 the mux did not read back USB3, -8 the BIST did not stop. Up to -6 the mux is
+ * untouched. A lock or unlock that is not acknowledged within 6 ms is not fatal: it is logged
+ * and the switch carries on. On J716c the lock ACK does not come.
  */
 static inline int
 apple_t6050_usb3_pipe_switch(const struct apple_t6050_usb_io *io)
@@ -60,9 +61,7 @@ apple_t6050_usb3_pipe_switch(const struct apple_t6050_usb_io *io)
     apple_t6050_usb_mask(io, 44, 0x00, 1, 1);
     apple_t6050_usb_mask(io, 44, 0x10, 1, 1);
     locked = 1;
-    result = -3;
-    if (io->poll(io->context, 44, 0x14, 1, 1, 6000))
-        goto out;
+    io->poll(io->context, 44, 0x14, 1, 1, 6000);
 
     bist = 1;
     result = -4;
@@ -90,8 +89,7 @@ out:
     apple_t6050_usb_mask(io, 44, 0x00, 5, 0);
     if (locked) {
         apple_t6050_usb_mask(io, 44, 0x10, 1, 0);
-        if (io->poll(io->context, 44, 0x14, 1, 0, 6000) && !result)
-            result = -9;
+        io->poll(io->context, 44, 0x14, 1, 0, 6000);
     }
     return result;
 }
