@@ -25,6 +25,7 @@
 #include <linux/module.h>
 #include <linux/atomic.h>
 #include <linux/capability.h>
+#include <linux/debugfs.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hrtimer.h>
 #include <linux/kthread.h>
@@ -194,6 +195,8 @@ struct macaudio_snd_data {
 	struct macaudio_link_props {
 		/* frontend props */
 		unsigned int bclk_ratio;
+		/* The PCM trigger that macaudio_fe_pcm_trigger() stands in front of */
+		int (*pcm_trigger)(struct snd_pcm_substream *substream, int cmd);
 		bool is_sense;
 
 		/* backend props */
@@ -226,6 +229,12 @@ struct macaudio_snd_data {
 	bool pm_quiesced;
 	/* The card is being removed: no grant, no amp access */
 	bool spk_dead;
+	/*
+	 * Speaker starts refused because protection was not granted: every
+	 * one (debugfs speaker_starts_refused), and since the last grant.
+	 */
+	atomic_t spk_refused;
+	atomic_t spk_refused_since_grant;
 	/* Written under spk_mutex, read without it */
 	ktime_t spk_lease_end;
 	/*
@@ -566,7 +575,7 @@ static void macaudio_spk_close_gate(struct macaudio_snd_data *ma, const char *wh
  */
 static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 {
-	int ret;
+	int ret, refused;
 
 	lockdep_assert_held(&ma->spk_mutex);
 
@@ -598,7 +607,12 @@ static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 	/* Pairs with the acquire in macaudio_spk_admitted() */
 	smp_store_release(&ma->spk_granted, true);
 	hrtimer_start(&ma->spk_lease_timer, ms_to_ktime(ms), HRTIMER_MODE_REL_HARD);
-	dev_info(ma->card.dev, "Speaker protection granted\n");
+	refused = atomic_xchg(&ma->spk_refused_since_grant, 0);
+	if (refused)
+		dev_info(ma->card.dev, "Speaker protection granted (%d speaker starts refused before)\n",
+			 refused);
+	else
+		dev_info(ma->card.dev, "Speaker protection granted\n");
 	if (ma->spk_kctl)
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &ma->spk_kctl->id);
 	return 0;
@@ -1484,18 +1498,66 @@ static bool macaudio_trigger_starts(int cmd)
  * its DMA and its back-ends (see macaudio_fe_links): one that would join a
  * speaker back-end left running across a withdrawal is refused too.
  */
+static bool macaudio_fe_refuses(struct macaudio_snd_data *ma, struct snd_soc_pcm_runtime *rtd,
+				struct snd_pcm_substream *substream, int cmd)
+{
+	if (!ma->has_speakers || substream->stream != SNDRV_PCM_STREAM_PLAYBACK ||
+	    !macaudio_trigger_starts(cmd))
+		return false;
+	return macaudio_fe_drives_speakers(ma, rtd, substream->stream) &&
+	       !macaudio_spk_admitted(ma);
+}
+
 static int macaudio_fe_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
 
-	if (!ma->has_speakers || substream->stream != SNDRV_PCM_STREAM_PLAYBACK ||
-	    !macaudio_trigger_starts(cmd))
-		return 0;
-	if (macaudio_fe_drives_speakers(ma, rtd, substream->stream) &&
-	    !macaudio_spk_admitted(ma))
+	return macaudio_fe_refuses(ma, rtd, substream, cmd) ? -EPERM : 0;
+}
+
+/*
+ * A refused speaker start is the floor doing its job, not a DAI failure,
+ * and an audio server retries it from its data loop: dozens to hundreds of
+ * times per withdrawal. So the front-end PCM's own trigger refuses it,
+ * with the same -EPERM, before ASoC's DPCM trigger runs and logs every
+ * failure as an error. Nothing has been touched by then. Each refusal is
+ * counted (debugfs speaker_starts_refused). macaudio_fe_trigger() and
+ * macaudio_be_trigger() stay behind it.
+ */
+static int macaudio_fe_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+
+	if (macaudio_fe_refuses(ma, rtd, substream, cmd)) {
+		atomic_inc(&ma->spk_refused);
+		atomic_inc(&ma->spk_refused_since_grant);
 		return -EPERM;
-	return 0;
+	}
+	return ma->link_props[rtd->dai_link->id].pcm_trigger(substream, cmd);
+}
+
+/*
+ * Put macaudio_fe_pcm_trigger() in front of every front-end PCM's trigger.
+ * Its PCMs exist by the card's late probe and are not yet registered, so no
+ * stream can be triggering.
+ */
+static void macaudio_gate_fe_pcms(struct macaudio_snd_data *ma)
+{
+	struct macaudio_link_props *props;
+	struct snd_soc_pcm_runtime *rtd;
+
+	for_each_card_rtds(&ma->card, rtd) {
+		if (!rtd->pcm || rtd->dai_link->no_pcm ||
+		    !rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream)
+			continue;
+		props = &ma->link_props[rtd->dai_link->id];
+		if (!rtd->ops.trigger || rtd->ops.trigger == macaudio_fe_pcm_trigger)
+			continue;
+		props->pcm_trigger = rtd->ops.trigger;
+		rtd->ops.trigger = macaudio_fe_pcm_trigger;
+	}
 }
 
 /*
@@ -1848,6 +1910,11 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		mutex_unlock(&ma->spk_mutex);
 		if (ret)
 			return dev_err_probe(card->dev, ret, "speaker safe level not set\n");
+		macaudio_gate_fe_pcms(ma);
+#ifdef CONFIG_DEBUG_FS
+		debugfs_create_atomic_t("speaker_starts_refused", 0444, card->debugfs_card_root,
+					&ma->spk_refused);
+#endif
 	}
 
 	/* Append identity metadata without renumbering the existing controls. */
