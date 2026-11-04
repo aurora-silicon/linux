@@ -4302,6 +4302,19 @@ params_done:
 		goto err_clk_disable;
 	}
 
+	/*
+	 * v2.2 moved the exception bitmap to 0x4000 and the per-stream
+	 * exception records to 0x8000. A node whose reg stops short of them
+	 * would fault on the first exception read during reset.
+	 */
+	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202 &&
+	    resource_size(res) < DART_T8110_ERR_SID(dart->num_streams)) {
+		ret = dev_err_probe(dev, -EINVAL,
+				    "MMIO region %pR too small for v2.2 exception records (need %#x); fix the DT reg\n",
+				    res, DART_T8110_ERR_SID(dart->num_streams));
+		goto err_clk_disable;
+	}
+
 	ret = apple_dart_read_remaps(dart);
 	if (ret)
 		goto err_clk_disable;
