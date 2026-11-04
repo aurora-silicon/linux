@@ -25,6 +25,8 @@
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_clk.h>
@@ -154,9 +156,11 @@ struct mca_cluster {
 
 	/*
 	 * Capture: the byte offset in the buffer up to which the CPU's view
-	 * has been synced with what the DMA wrote (see mca_capture_sync()).
+	 * has been synced with what the DMA wrote, and when (see
+	 * mca_capture_sync()).
 	 */
 	size_t capture_synced;
+	ktime_t capture_synced_at;
 };
 
 struct mca_data {
@@ -943,6 +947,17 @@ static int mca_set_runtime_hwparams(struct snd_soc_component *component,
 
 	hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		  SNDRV_PCM_INFO_INTERLEAVED;
+	/*
+	 * No SNDRV_PCM_INFO_EXPLICIT_SYNC for the cacheable capture buffer
+	 * (see mca_pcm_new()), though the core would set it for a managed
+	 * buffer allocated before the open. hw_ptr only ever moves through
+	 * mca_pointer(), which invalidates everything up to the position it
+	 * returns, and the whole buffer when the DMA may have lapped
+	 * (mca_capture_sync()). So a reader of the mmapped status page never
+	 * sees a frame before its lines were invalidated. The flag would add
+	 * a whole-buffer sync to every status query, which on a J316 costs
+	 * about 16% more CPU per 512-frame period of mmap capture.
+	 */
 	hw.periods_min = 2;
 	hw.periods_max = UINT_MAX;
 	hw.period_bytes_min = 256;
@@ -1034,25 +1049,72 @@ static bool mca_capture_noncoherent(struct snd_pcm_substream *substream)
 	       substream->runtime->dma_buffer_p->dev.type == SNDRV_DMA_TYPE_NONCOHERENT;
 }
 
+/*
+ * The DMA may have gone once or more round the buffer in @elapsed_ns: the
+ * position alone cannot tell a lap from no advance, or two laps from one.
+ * It runs at the stream's rate, and its reported position lags it by less
+ * than a period, so a lap needs at least a buffer's time less a period.
+ */
+static bool mca_capture_may_lap(unsigned int rate, snd_pcm_uframes_t buffer_size,
+				snd_pcm_uframes_t period_size, s64 elapsed_ns)
+{
+	u64 lap_ns, slack_ns;
+
+	if (!rate || elapsed_ns < 0)
+		return true;
+	lap_ns = div_u64((u64)buffer_size * NSEC_PER_SEC, rate);
+	slack_ns = div_u64((u64)period_size * NSEC_PER_SEC, rate);
+	return (u64)elapsed_ns + slack_ns >= lap_ns;
+}
+
+/*
+ * The byte ranges of a @bytes buffer to sync when the DMA has moved from
+ * @from to @to: none, one, or two where it wrapped; the whole buffer when it
+ * may have lapped. Returns how many it put in @off and @len.
+ */
+static unsigned int mca_capture_ranges(size_t from, size_t to, size_t bytes, bool lap,
+				       size_t off[2], size_t len[2])
+{
+	unsigned int n = 0;
+
+	if (lap) {
+		off[0] = 0;
+		len[0] = bytes;
+		return 1;
+	}
+	if (to < from) {
+		off[n] = from;
+		len[n++] = bytes - from;
+		from = 0;
+	}
+	if (to > from) {
+		off[n] = from;
+		len[n++] = to - from;
+	}
+	return n;
+}
+
 static void mca_capture_sync(struct mca_cluster *cl, struct snd_pcm_substream *substream,
 			     size_t to)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct device *dev = runtime->dma_buffer_p->dev.dev;
 	size_t bytes = snd_pcm_lib_buffer_bytes(substream);
-	size_t from = cl->capture_synced;
+	ktime_t now = ktime_get();
+	size_t off[2], len[2];
+	unsigned int i, n;
+	bool lap;
 
 	if (to >= bytes)
 		return;
-	if (to < from) {
-		dma_sync_single_for_cpu(dev, runtime->dma_addr + from, bytes - from,
-					DMA_FROM_DEVICE);
-		from = 0;
-	}
-	if (to > from)
-		dma_sync_single_for_cpu(dev, runtime->dma_addr + from, to - from,
+	lap = mca_capture_may_lap(runtime->rate, runtime->buffer_size, runtime->period_size,
+				  ktime_to_ns(ktime_sub(now, cl->capture_synced_at)));
+	n = mca_capture_ranges(cl->capture_synced, to, bytes, lap, off, len);
+	for (i = 0; i < n; i++)
+		dma_sync_single_for_cpu(dev, runtime->dma_addr + off[i], len[i],
 					DMA_FROM_DEVICE);
 	cl->capture_synced = to;
+	cl->capture_synced_at = now;
 }
 
 static int mca_trigger(struct snd_soc_component *component,
@@ -1074,6 +1136,7 @@ static int mca_trigger(struct snd_soc_component *component,
 					   snd_pcm_lib_buffer_bytes(substream),
 					   DMA_FROM_DEVICE);
 		cl->capture_synced = 0;
+		cl->capture_synced_at = ktime_get();
 	}
 
 	/*
@@ -1406,3 +1469,7 @@ module_platform_driver(apple_mca_driver);
 MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
 MODULE_DESCRIPTION("ASoC Apple MCA driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include "mca-test.h"
+#endif
