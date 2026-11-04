@@ -3797,6 +3797,12 @@ impl SepData {
             // enclave's lockout record is saved again.
             let relocked = self.lock_special_bag();
             dev_info!(self.dev, "Touch ID: re-arm: key bag lock before the unlock {}\n", relocked);
+            // macOS's bag reports locked about 10 s after the lock request
+            // (its grace period). Wait past it before the unlock.
+            if relocked {
+                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(11_000));
+                dev_info!(self.dev, "Touch ID: re-arm: waited 11 s after the lock\n");
+            }
             let unlocked = self.unlock_special_bag();
             let established = unlocked && self.establish_scrd_match_context(user);
             let saved = established && self.save_lockout();
