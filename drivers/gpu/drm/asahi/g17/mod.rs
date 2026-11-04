@@ -207,9 +207,10 @@ pub(crate) struct Config {
 
 /// Layouts of the firmware command buffers that follow a SoC's GPU core layout.
 pub(crate) struct CoreLayout {
-    /// The cluster and enabled core counts the layouts were measured on, which the GPU must
-    /// report at probe; `None` where the layouts hold for every configuration of the SoC.
+    /// The measured cluster and enabled core counts; `None` admits every configuration.
     pub(crate) cores: Option<(u32, u32)>,
+    /// An experimental layout: core slots and enabled cores per cluster.
+    pub(crate) alternate_core_masks: Option<(u32, u32)>,
     /// A compute queue's operand-state buffer.
     pub(crate) operand_state: fw::compute::OperandState,
     /// A render's deflake buffer.
@@ -1208,10 +1209,20 @@ impl Gpu {
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
+        let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
+            clusters == id.num_clusters
+                && cores != active_cores
+                && cfg.core_layout.alternate_core_masks.is_some_and(|(slots, enabled)| {
+                    id.num_cores == slots
+                        && id.core_masks.len() == clusters as usize
+                        && id.core_masks.iter().all(|mask| mask.count_ones() == enabled)
+                })
+        });
         if cfg
             .core_layout
             .cores
             .is_some_and(|cores| cores != (id.num_clusters, active_cores))
+            && !alternate
         {
             dev_err!(
                 dev.as_ref(),
@@ -1220,6 +1231,12 @@ impl Gpu {
                 active_cores
             );
             return Err(ENODEV);
+        }
+        if alternate {
+            dev_warn!(
+                dev.as_ref(),
+                "Experimental GPU topology admission: command-buffer offsets are not yet validated\n"
+            );
         }
         let shared = Arc::pin_init(
             pin_init!(Shared {

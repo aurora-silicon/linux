@@ -99,9 +99,12 @@ pub(crate) const CONFIG: Config = Config {
         ],
         variant: &fw::variant::V25G83,
     }]),
-    // Measured on the 20-core M4 Pro; other core counts are refused at probe.
+    // Measured on the 20-core M4 Pro; the alternative below remains experimental.
     core_layout: CoreLayout {
         cores: Some((2, 20)),
+        // Admit two clusters of ten slots with eight enabled cores in each cluster.
+        // Reusing the measured 20-core buffers on it remains experimental.
+        alternate_core_masks: Some((10, 8)),
         operand_state: fw::compute::OperandState::TWO_BY_TEN,
         deflake: fw::render::Deflake::TWO_CLUSTERS,
     },
