@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (16-inch, M5 Max, 2026)
+ *
+ * target-type: J716c
+ *
+ * The M5 Max is one T6050 die, die 0 (t6050-max.dtsi). This file enables
+ * and configures what has been brought up on this board; the SoC's other
+ * ports and buses stay disabled until each is described for it.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6050-max.dtsi"
+
+/ {
+	compatible = "apple,j716c", "apple,t6050", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M5 Max, 2026)";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &dockchannel;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Normally replaced by the loader */
+		bootargs = "maxcpus=1";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by the loader */
+			/* Format properties will be added by the loader */
+			status = "disabled";
+		};
+	};
+};
+
+/* The internal PCIe host: none of its ports is described yet */
+&pcie0 {
+	status = "disabled";
+};
+
+/* ATC1, ATC3 and the PD controller buses nub-spmi-a0 and -a2: not yet described for this board */
+&nub_spmi_a0 {
+	status = "disabled";
+};
+
+&nub_spmi_a2 {
+	status = "disabled";
+};
+
+&atc1_phy_mbox {
+	status = "disabled";
+};
+
+&atc1_phy {
+	status = "disabled";
+};
+
+&usb_drd1 {
+	status = "disabled";
+};
+
+&usb_drd1_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd1_dart_1 {
+	status = "disabled";
+};
+
+&atc3_phy_mbox {
+	status = "disabled";
+};
+
+&atc3_phy {
+	status = "disabled";
+};
+
+&usb_drd3 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_1 {
+	status = "disabled";
+};
+
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
+};
+
+/*
+ * Reading pin 112's register (0x29c0001c0) takes an SError at probe; nothing in
+ * this file names a pin yet.
+ */
+&pinctrl_ap {
+	status = "disabled";
+};
+
+/* This board's SMC fan and power keys are not yet checked */
+&smc_hwmon {
+	status = "disabled";
+};
+
+/*
+ * The console is on the USB debug link, which drains only while a host reads
+ * it; the machine also boots with nothing attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
+/* The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO */
+&mtp_dockchannel {
+	mtp_hid: input@8000 {
+		compatible = "apple,dockchannel-hid";
+		reg = <0x8000 0x1000>, <0xc000 0x1000>,
+		      <0x0 0x1000>, <0x4000 0x1000>;
+		reg-names = "config", "data", "rmt-config", "rmt-data";
+		iommus = <&mtp_dart 0>;
+		interrupt-parent = <&mtp_dockchannel>;
+		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+			     <3 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "tx", "rx";
+		apple,fifo-size = <0x800>;
+		apple,helper-cpu = <&mtp>;
+		apple,afe-reset-gpios = <&smc_pcio 2 GPIO_ACTIVE_HIGH>;
+
+		multi-touch {
+			apple,power-method = <2>;
+			firmware-name = "apple/tpmtfw-j716c.bin";
+		};
+
+		keyboard {
+		};
+
+		stm {
+		};
+	};
+};
+
+/* This board's PCIO outputs, the trackpad AFE reset (2) among them */
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
+};
