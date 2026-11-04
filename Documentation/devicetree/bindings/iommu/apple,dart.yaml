@@ -151,9 +151,25 @@ properties:
     items:
       maximum: 255
     description:
-      Reserved streams of a USB4 PCIe tunnel DART that its PCIe-C port issues
+      Streams set to bypass after every reset of the DART, outside any domain.
+      On a USB4 PCIe tunnel DART, the reserved streams its PCIe-C port issues
       its own writes on, such as the interrupt controller writes its MSIs
-      turn into. They are set to bypass after every reset of the DART.
+      turn into. On a T8110 DART that nothing initialises before Linux, such
+      as a USB4 router's, the streams its co-processor uses without
+      translation.
+
+  apple,full-error-reporting:
+    type: boolean
+    description:
+      Unmask every error and enable the error interrupt for every stream,
+      with the registers of the DART's revision, and leave the DART unlocked
+      on error. For a T8110 DART that nothing initialises before Linux.
+
+  apple,ctc-flush:
+    type: boolean
+    description:
+      Flush the DART's context cache after a stream flush, where the DART
+      has one. For a T8110 DART that nothing initialises before Linux.
 
   apple,remap-streams:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
