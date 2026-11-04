@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6050 "M5 Max" SoC: one die
+ *
+ * Die 0 alone: t6050-die0.dtsi and one instance of the per-die template
+ * (t6050-dieX.dtsi), then the blocks described so far for this part only.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
+
+#include "multi-die-cpp.h"
+
+#include "t6050-base.dtsi"
+
+/ {
+	/*
+	 * Six cores in each cluster. The sixth of each comes after the others, so that the
+	 * first fifteen CPUs are numbered as on a part with five cores in each cluster.
+	 */
+	cpus {
+		T6050_M_CPU(cpu0, 40000, cpufreq_mc0);
+		T6050_M_CPU(cpu1, 40001, cpufreq_mc0);
+		T6050_M_CPU(cpu2, 40002, cpufreq_mc0);
+		T6050_M_CPU(cpu3, 40003, cpufreq_mc0);
+		T6050_M_CPU(cpu4, 40004, cpufreq_mc0);
+		T6050_M_CPU(cpu6, 40100, cpufreq_mc1);
+		T6050_M_CPU(cpu7, 40101, cpufreq_mc1);
+		T6050_M_CPU(cpu8, 40102, cpufreq_mc1);
+		T6050_M_CPU(cpu9, 40103, cpufreq_mc1);
+		T6050_M_CPU(cpu10, 40104, cpufreq_mc1);
+		T6050_P_CPU(cpu12, 10200, cpufreq_pc);
+		T6050_P_CPU(cpu13, 10201, cpufreq_pc);
+		T6050_P_CPU(cpu14, 10202, cpufreq_pc);
+		T6050_P_CPU(cpu15, 10203, cpufreq_pc);
+		T6050_P_CPU(cpu16, 10204, cpufreq_pc);
+
+		/* The sixth core of each cluster */
+		T6050_M_CPU(cpu5, 40005, cpufreq_mc0);
+		T6050_M_CPU(cpu11, 40105, cpufreq_mc1);
+		T6050_P_CPU(cpu17, 10205, cpufreq_pc);
+	};
+};
+
+#define DIE
+#define DIE_NO 0
+#define DIE_UNIT_PREFIX
+#define DIE_ATC1 atc1
+#define SOC_NODE die0
+
+#include "t6050-dieX.dtsi"
+#include "t6050-die0.dtsi"
+
+#undef DIE
+#undef DIE_NO
+#undef DIE_UNIT_PREFIX
+#undef DIE_ATC1
+#undef SOC_NODE
+
+/*
+ * The MTP coprocessor (the keyboard and trackpad's), which iBoot leaves running with its
+ * firmware, behind its DART, and the DockChannel FIFO its HID transport uses; the board adds
+ * that transport. From the ADT: /arm-io/mtp reg[0] 0x294600000 (the ASC, its v4 mailbox at
+ * +0x8000; interrupts [677, 676, 679, 678]: 676..679 in send-empty, send-not-empty, recv-empty,
+ * recv-not-empty order), dart-mtp 0x294800000 (interrupt 659, SID 0, vm-base 0x100_00004000),
+ * dockchannel-mtp 0x294b14000 for its interrupts (660) and 0x294b28000.. for the FIFOs.
+ */
+&die0 {
+	mtp_mbox: mailbox@294608000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x94608000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 676 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 677 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 678 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 679 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp_dart: iommu@294800000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x2 0x94800000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 0 659 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+	};
+
+	mtp: mtp@294600000 {
+		compatible = "apple,t6050-mtp", "apple,mtp", "apple,rtk-helper-asc4";
+		reg = <0x2 0x94600000 0x0 0x4000>,
+		      <0x2 0x94c00000 0x0 0xc4000>;
+		reg-names = "asc", "sram";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+		#helper-cells = <0>;
+	};
+
+	mtp_dockchannel: fifo@294b14000 {
+		compatible = "apple,t6050-dockchannel", "apple,dockchannel";
+		reg = <0x2 0x94b14000 0x0 0x1000>;
+		reg-names = "irq";
+		interrupts = <AIC_IRQ 0 660 IRQ_TYPE_LEVEL_HIGH>;
+		ranges = <0 0x2 0x94b28000 0x10000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+};
