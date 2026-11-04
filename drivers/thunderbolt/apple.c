@@ -935,7 +935,8 @@ static bool apple_cio_pciec_eligible(const struct device_node *np)
 {
 	return of_device_is_compatible(np, "apple,t6040-pciec") ||
 	       of_device_is_compatible(np, "apple,t8103-pciec") ||
-	       of_device_is_compatible(np, "apple,t6000-pciec");
+	       of_device_is_compatible(np, "apple,t6000-pciec") ||
+	       of_device_is_compatible(np, "apple,t6050-pciec");
 }
 
 static bool
