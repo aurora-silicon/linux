@@ -103,13 +103,9 @@
 /* Nothing on nub-spmi2 has a binding yet. */
 /delete-node/ &nub_spmi2;
 
-/*
- * iBoot moves the ISP firmware from boot to boot on this machine, so the
- * J616s placement does not hold. Keep the camera off until the boot loader
- * fills it in.
- */
+/* iBoot moves the ISP firmware each boot: the loader fills the regions. */
 &isp {
-	status = "disabled";
+	status = "okay";
 };
 
 /* The GPU (ADT gpu,t6041) is not described yet. */
