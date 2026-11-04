@@ -96,6 +96,46 @@ out:
     return result;
 }
 
+/*
+ * Move a running DWC3 from the dummy producer (0x42) to a USB4 router's USB3 tunnel (0x21: PIPE mode 1,
+ * clock 2), once the tunnel is active. As for native USB3, the PIPE is locked only when DWC3 is out of
+ * reset, and a lock that is not acknowledged within 6 ms is not fatal.
+ * Returns 0, -2 if the PIPE is on another producer, or -7 if the mux did not read back the tunnel.
+ */
+static inline int
+apple_t6050_usb3_pipe_tunnel(const struct apple_t6050_usb_io *io)
+{
+    unsigned int mux;
+    int locked;
+
+    if (!io || !io->read || !io->write || !io->poll || !io->delay)
+        return -1;
+    mux = io->read(io->context, 44, 0x0c) & 0x73;
+    if (mux == 0x21)
+        return 0;
+    if (mux != 0x42)
+        return -2;
+    locked = io->read(io->context, 44, 0x1c) & 1;
+
+    apple_t6050_usb_mask(io, 44, 0x04, 0x0e, 0);
+    apple_t6050_usb_mask(io, 44, 0x00, 1, 1);
+    if (locked) {
+        apple_t6050_usb_mask(io, 44, 0x10, 1, 1);
+        io->poll(io->context, 44, 0x14, 1, 1, 6000);
+    }
+    apple_t6050_usb_mask(io, 44, 0x0c, 0x70, 0);
+    io->delay(io->context, 5);
+    apple_t6050_usb_mask(io, 44, 0x0c, 3, 1);
+    apple_t6050_usb_mask(io, 44, 0x0c, 0x70, 0x20);
+    apple_t6050_usb_mask(io, 44, 0x00, 1, 0);
+    apple_t6050_usb_mask(io, 44, 0x00, 4, 0);
+    if (locked) {
+        apple_t6050_usb_mask(io, 44, 0x10, 1, 0);
+        io->poll(io->context, 44, 0x14, 1, 0, 6000);
+    }
+    return (io->read(io->context, 44, 0x0c) & 0x73) == 0x21 ? 0 : -7;
+}
+
 /* The native close() call quiesces the ACIO PHY while PIPE is locked,
  * before selecting the dummy producer. The caller supplies that lifecycle
  * operation; merely changing MUX is not a complete disconnect sequence.
@@ -110,7 +150,7 @@ apple_t6050_usb3_pipe_stop(const struct apple_t6050_usb_io *io,
     if (!io || !io->read || !io->write || !io->poll || !io->delay || !quiesce)
         return -1;
     mux = io->read(io->context, 44, 0x0c) & 0x73;
-    if (mux != 0x10 && mux != 0x42)
+    if (mux != 0x10 && mux != 0x21 && mux != 0x42)
         return -1;
     apple_t6050_usb_mask(io, 44, 0x04, 0x0e, 0);
     apple_t6050_usb_mask(io, 44, 0x00, 1, 1);

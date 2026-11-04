@@ -298,6 +298,34 @@ static int combo_usb2_reset(struct phy *phy)
 	return ret ? -EIO : 0;
 }
 
+/* A tunnelled PIPE leaves the CIO PHY to the router: nothing to quiesce on the PHY side. */
+static int combo_pipe_keep(void *ctx)
+{
+	return 0;
+}
+
+/*
+ * In CIO mode the lanes carry USB4/TBT and USB3 reaches DWC3 through the router's USB3 adapter:
+ * move DWC3 from its dummy PIPE producer to the tunnel producer, as is done on the older PHYs.
+ */
+static int combo_pipe_tunnel(struct t6050_dp *dp)
+{
+	int ret;
+
+	lockdep_assert_held(&dp->lock);
+	if (dp->pipe_active)
+		return dp->pipe_tunnel ? 0 : -EBUSY;
+	ret = apple_t6050_usb3_pipe_tunnel(&dp->usb_io);
+	if (ret) {
+		combo_pipe_fault(dp, "USB3 tunnel PIPE switch", ret);
+		return -EIO;
+	}
+	dp->pipe_active = true;
+	dp->pipe_tunnel = true;
+	dev_info(dp->dev, "USB3 PIPE on the USB4 tunnel\n");
+	return 0;
+}
+
 static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct t6050_dp *dp = phy_get_drvdata(phy);
@@ -314,10 +342,8 @@ static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 	 * uses its independent D+/D- PHY. Do not switch USB3 onto DP lanes. */
 	if (dp->combo_mode == COMBO_DP4 && dp->enabled)
 		return 0;
-	/* In CIO the lanes carry USB4/TBT. DWC3 keeps its dummy PIPE until a
-	 * USB3 tunnel hands PIPE to the router; native USB3 mode is 0 too. */
 	if (dp->combo_mode == COMBO_CIO && dp->cio_prepared)
-		return 0;
+		return combo_pipe_tunnel(dp);
 	if (!dp->usb_prepared && !(dp->combo_mode == COMBO_DP2 && dp->enabled))
 		return -ENOLINK;
 	if (dp->pipe_active)
@@ -347,7 +373,10 @@ static int combo_usb3_poweroff(struct phy *phy)
 	/* DWC3 calls power_off only after host/gadget shutdown and SUSPHY.
 	 * PIPE must select its dummy producer before the controller is reset. */
 	if (dp->pipe_active) {
-		ret = apple_t6050_usb3_pipe_stop(&dp->usb_io, combo_quiesce, dp);
+		ret = apple_t6050_usb3_pipe_stop(&dp->usb_io,
+						 dp->pipe_tunnel ? combo_pipe_keep : combo_quiesce, dp);
+		if (!ret)
+			dp->pipe_tunnel = false;
 		if (!ret)
 			dp->pipe_active = false;
 	}
@@ -491,3 +520,4 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 	}
 	return 0;
 }
+
