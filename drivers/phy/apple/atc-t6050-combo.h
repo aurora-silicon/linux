@@ -18,9 +18,19 @@ static int combo_poll(void *ctx, unsigned int bank, unsigned int offset,
 {
 	struct t6050_dp *dp = ctx;
 	u32 value;
-	return readl_poll_timeout(dp->banks[bank] + offset, value,
+	int ret = readl_poll_timeout(dp->banks[bank] + offset, value,
 		(value & mask) == expected,
 		(bank == 44 || bank == 35 || usec <= 1000) ? 1 : 1000, usec);
+
+	/* The PIPE switch carries on without the lock ACK; say so. */
+	if (ret && bank == 44 && offset == 0x14 && usec == 6000)
+		dev_warn(dp->dev,
+			 "PIPE %slock not acknowledged; continuing (override=%x values=%x mux=%x req=%x ack=%x aon=%x nonsel=%x)\n",
+			 expected ? "" : "un", readl(dp->banks[44]),
+			 readl(dp->banks[44] + 4), readl(dp->banks[44] + 0xc),
+			 readl(dp->banks[44] + 0x10), value,
+			 readl(dp->banks[44] + 0x1c), readl(dp->banks[44] + 0x20));
+	return ret;
 }
 static void combo_delay(void *ctx, unsigned int usec) { udelay(usec); }
 static void combo_pause(void *ctx, unsigned int nsec) { ndelay(nsec); }
