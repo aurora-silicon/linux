@@ -251,7 +251,7 @@ static void apr_test_batch_fence(struct kunit *test)
 		struct apr_batch batch = { .start = 0x600, .count = depth };
 
 		for (unsigned int i = 0; i < depth; i++) {
-			u32 head = 0x600 + (i + 1) * APR_DESC_BYTES;
+			u32 head = 0x600 + depth * APR_DESC_BYTES;
 
 			KUNIT_EXPECT_EQ(test, apr_batch_head(&batch), head);
 			KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, 0, head), -EAGAIN);
@@ -260,6 +260,17 @@ static void apr_test_batch_fence(struct kunit *test)
 					i + 1 == depth ? 1 : 0);
 		}
 	}
+}
+
+static void apr_test_batch_coalesced(struct kunit *test)
+{
+	struct apr_batch batch = { .start = 0x600, .count = 4 };
+	u32 head = apr_batch_head(&batch);
+
+	KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, APR_IRQ_DONE, head), 0);
+	for (unsigned int i = 0; i < 4; i++)
+		KUNIT_EXPECT_EQ(test, apr_batch_complete(&batch, 0, head), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, batch.done, 1U);
 }
 
 static void apr_test_batch_errors(struct kunit *test)
@@ -288,6 +299,7 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_output),
 	KUNIT_CASE(apr_test_batch_fence),
 	KUNIT_CASE(apr_test_batch_errors),
+	KUNIT_CASE(apr_test_batch_coalesced),
 	{}
 };
 

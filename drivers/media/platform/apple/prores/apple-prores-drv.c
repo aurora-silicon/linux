@@ -2,8 +2,8 @@
 /*
  * Apple ProRes (APR) V4L2 memory-to-memory encoder.
  *
- * Up to four jobs are prepared in a 128 KiB DMA ring. Only one descriptor
- * is published at a time; its completion interrupt publishes the next job.
+ * Publish a bounded batch of up to four descriptors in a 128 KiB DMA ring.
+ * Keep the batch mapped until each descriptor has an acknowledged DONE.
  * Raw frames come in on the OUTPUT queue as semi-planar 4:2:2 or 4:4:4 (8 or
  * 16 bits per sample) and complete ProRes frames go out on CAPTURE.
  *
@@ -69,7 +69,7 @@ static const struct kernel_param_ops apr_depth_ops = {
 	.get = param_get_uint,
 };
 module_param_cb(depth, &apr_depth_ops, &apr_depth, 0644);
-MODULE_PARM_DESC(depth, "Prepared jobs per batch (1-4); one descriptor executes at a time");
+MODULE_PARM_DESC(depth, "Hardware descriptors per batch (1-4, default 1); requires one DONE per job");
 
 struct apr_job {
 	struct vb2_v4l2_buffer *src, *dst;
@@ -472,7 +472,7 @@ static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err, u32 *status_
 		return NULL;
 	*status_out = status;
 	apr_write(apr, APR_REG_IRQ_STATUS, status);
-	/* Read back after ACK before an immediate next-head publication. */
+	/* Flush the posted ACK before another status observation can count DONE. */
 	tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;
 	*err = apr_batch_complete(&apr->batch, status, tail);
 	if (*err < 0) {
@@ -486,12 +486,11 @@ static struct apr_ctx *apr_take_done(struct apr_dev *apr, int *err, u32 *status_
 		mod_delayed_work(system_wq, &apr->watchdog, 0);
 		return NULL;
 	}
+	dev_dbg(apr->dev, "completion: done %u/%u head %#x tail %#x status %#x\n",
+		apr->batch.done, apr->batch.count, apr->head, tail, status);
 	if (!*err) {
-		/* No buffer or PM reference is released at an intermediate IRQ. */
-		apr->head = apr_batch_head(&apr->batch);
+		/* Keep the whole batch mapped, including completed frames. */
 		apr->started = jiffies;
-		dma_wmb();
-		writel(apr->head, apr->regs + APR_REG_RING_HEAD);
 		return NULL;
 	}
 	*err = 0;
@@ -585,11 +584,25 @@ static void apr_watchdog(struct work_struct *work)
 	apr_finish_job(apr, ctx, err);
 }
 
+/* Called with hw_lock held, after all descriptors and outputs are prepared. */
+static void apr_publish_batch(struct apr_dev *apr, struct apr_ctx *ctx)
+{
+	apr->head = apr_batch_head(&apr->batch);
+	apr->active = ctx;
+	apr->started = jiffies;
+	dev_dbg(apr->dev, "publish: count %u start %#x head %#x\n",
+		apr->batch.count, apr->batch.start, apr->head);
+	dma_wmb();
+	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
+}
+
 /*
  * Keep the m2m job slot for a whole batch, including buffer callbacks. This
  * lets m2m cancellation and system suspend wait for DMA ownership to end.
- * The fetch tail alone is not a completion fence. Stage descriptors ahead,
- * but publish only the next descriptor after DONE for the current head.
+ * Publish the entire bounded batch. The fetch tail is not a completion
+ * fence: retain every buffer until a separate acknowledged DONE has been
+ * observed for every descriptor. Coalesced interrupts fail closed through
+ * the watchdog; never infer missing completions from the fetch cursor.
  */
 static void apr_device_run(void *priv)
 {
@@ -664,11 +677,7 @@ static void apr_device_run(void *priv)
 			goto finish;
 	}
 	spin_lock_irqsave(&apr->hw_lock, flags);
-	apr->head = apr_batch_head(&apr->batch);
-	apr->active = ctx;
-	apr->started = jiffies;
-	dma_wmb();
-	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
+	apr_publish_batch(apr, ctx);
 	spin_unlock_irqrestore(&apr->hw_lock, flags);
 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
 	return;

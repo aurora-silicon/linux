@@ -24,8 +24,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument('--out', type=Path)
-    parser.add_argument('--mutation', choices=('tail-only', 'release-early', 'publish-batch',
-                                             'reset-free', 'ack-order'))
+    parser.add_argument('--mutation', choices=('tail-only', 'release-early', 'tail-completes-batch',
+                                             'reset-free', 'ack-order', 'stage-only'))
     args = parser.parse_args()
     driver = args.root / 'drivers/media/platform/apple/prores'
     header = (driver / 'apple-prores.h').read_text()
@@ -34,14 +34,15 @@ def main():
     take = function(source, 'apr_take_done')
     irq = function(source, 'apr_irq')
     watch = function(source, 'apr_watchdog')
+    publish = function(source, 'apr_publish_batch')
     if args.mutation == 'tail-only':
         take = take.replace('if (!status)\n\t\treturn NULL;', '')
         batch = batch.replace('if (!status)\n\t\treturn -EAGAIN;', '')
         batch = batch.replace('status != APR_IRQ_DONE', '(status && status != APR_IRQ_DONE)')
     elif args.mutation == 'release-early':
         take = take.replace('if (!*err) {', 'if (0) {')
-    elif args.mutation == 'publish-batch':
-        batch = batch.replace('(batch->done + 1)', 'batch->count')
+    elif args.mutation == 'tail-completes-batch':
+        batch = batch.replace('batch->done++;', 'batch->done = batch->count;')
     elif args.mutation == 'reset-free':
         watch = watch.replace('vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));',
                               'vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));\n'
@@ -51,6 +52,9 @@ def main():
         take = take.replace('tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;',
                             'tail = apr_read(apr, APR_REG_RING_TAIL) & APR_RING_PTR_MASK;\n'
                             '\tapr_write(apr, APR_REG_IRQ_STATUS, status);')
+    elif args.mutation == 'stage-only':
+        publish = publish.replace('apr_batch_head(&apr->batch)',
+                                  'apr->batch.start + APR_DESC_BYTES')
     # Keep register values shared with the driver, without host Linux headers.
     defines = '\n'.join(line for line in header.splitlines() if
                         line.startswith('#define APR_') and
@@ -81,6 +85,7 @@ typedef int irqreturn_t;
 #define spin_lock(p) ((void)(p))
 #define spin_unlock(p) ((void)(p))
 #define dev_err_ratelimited(...) ((void)0)
+#define dev_dbg(...) ((void)0)
 #define dma_wmb() ((void)0)
 #define system_wq NULL
 ''' + defines + '\n' + batch + r'''
@@ -141,7 +146,7 @@ static void apr_finish_job(struct apr_dev *a, struct apr_ctx *ctx, int err) {
     pm_puts++;
     slots_finished++;
 }
-''' + take + '\n' + irq + '\n' + watch + r'''
+''' + take + '\n' + irq + '\n' + watch + '\n' + publish + r'''
 static struct v4l2_m2m_ctx m2m;
 static struct apr_ctx owner = { .owner = 42, .fh = { .m2m_ctx = &m2m } };
 static struct apr_dev begin(unsigned int depth, u32 base) {
@@ -156,9 +161,9 @@ static struct apr_dev begin(unsigned int depth, u32 base) {
     m2m.src.error = m2m.dst.error = false;
     jiffies = 100;
     for (unsigned int i = 0; i < sizeof(mmio)/sizeof(mmio[0]); i++) mmio[i] = 0;
-    a.head = apr_batch_head(&a.batch);
-    assert(a.head == base + APR_DESC_BYTES);
-    mmio[APR_REG_RING_HEAD / 4] = a.head;
+    apr_publish_batch(&a, &owner);
+    assert(a.head == base + depth * APR_DESC_BYTES);
+    assert(mmio[APR_REG_RING_HEAD / 4] == a.head);
     return a;
 }
 int main(void) {
@@ -167,10 +172,9 @@ int main(void) {
         u32 base = (0x20000 / APR_DESC_BYTES - depth) * APR_DESC_BYTES;
         struct apr_dev a = begin(depth, base);
         for (unsigned int i = 0; i < depth; i++) {
-            u32 expected = base + (i + 1) * APR_DESC_BYTES;
-            assert(a.head == expected);
+            assert(a.head == base + depth * APR_DESC_BYTES);
             /* Fetch finishes first. Repeated watchdog/IRQ reads must retain ownership. */
-            mmio[APR_REG_RING_TAIL / 4] = expected;
+            mmio[APR_REG_RING_TAIL / 4] = a.head;
             for (unsigned int poll = 0; poll < 20; poll++) {
                 assert(apr_irq(0, &a) == IRQ_NONE);
                 assert(a.batch.done == i && a.active == &owner);
@@ -181,7 +185,7 @@ int main(void) {
             assert(mmio[APR_REG_IRQ_STATUS / 4] == 0);
             if (i + 1 < depth) {
                 assert(a.active == &owner);
-                assert(mmio[APR_REG_RING_HEAD / 4] == expected + APR_DESC_BYTES);
+                assert(mmio[APR_REG_RING_HEAD / 4] == a.head);
                 assert(!released && !pm_puts && !slots_finished);
             }
         }
@@ -189,6 +193,23 @@ int main(void) {
         assert(!resets_queued && !last_err);
         assert(apr_irq(0, &a) == IRQ_NONE);
         assert(released == depth && pm_puts == 1);
+    }
+    /* One coalesced DONE at tail==head must not retire a depth-4 batch. */
+    {
+        struct apr_dev a = begin(4, 0);
+        a.watchdog.work.owner = &a;
+        mmio[APR_REG_RING_TAIL / 4] = a.head;
+        mmio[APR_REG_IRQ_STATUS / 4] = APR_IRQ_DONE;
+        assert(apr_irq(0, &a) == IRQ_HANDLED);
+        assert(a.batch.done == 1 && a.active == &owner && !released);
+        for (unsigned int poll = 0; poll < 20; poll++) {
+            assert(apr_irq(0, &a) == IRQ_NONE);
+            assert(a.batch.done == 1 && !released);
+        }
+        jiffies = 2000;
+        apr_watchdog(&a.watchdog.work);
+        assert(reset_calls == 1 && a.broken && !a.active);
+        assert(released == 4 && last_err == -ETIMEDOUT);
     }
     for (unsigned int fault = 0; fault < 4; fault++) {
         struct apr_dev a = begin(4, 0);
@@ -225,7 +246,7 @@ int main(void) {
             assert(!released && !pm_puts && !slots_finished);
         }
     }
-    puts("PASS: fetch-ahead ownership, IRQ handoff, depths 1-4, ring end, reset quarantine");
+    puts("PASS: fetch-ahead ownership, counted DONEs, hardware depths 1-4, ring end, reset quarantine");
 }
 '''
     with tempfile.TemporaryDirectory(prefix='prores-queue-') as tmp:
