@@ -209,9 +209,11 @@
 		reg-names = "rc", "sram", "pcie-adapter", "cpu", "router-ap-fw";
 		mboxes = <&acio2_mbox>;
 		resets = <&cio_reconfig0 2>;
+		/* ATC2_PCIE last: the PCIe tunnel root port, set up before it is populated */
 		power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
-				<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>;
+				<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>, <&ps_atc2_pcie>;
 		thunderbolt-switch;
+		apple,pcie-tunnel = <&acio2_pcie_tunnel>;
 		pinctrl-0 = <&acio2_lstx_pins>;
 		pinctrl-names = "lstx";
 		lstx-gpios = <&pinctrl_aop 81 GPIO_ACTIVE_HIGH>;
@@ -302,3 +304,101 @@
 	};
 };
 
+/*
+ * ATC2's PCIe tunnel: /arm-io/apciec2 and dart-apciec2, the PCIe-C root port behind the router's
+ * PCIe down adapter, and its DART. The router populates both once it has enabled a PCIe tunnel,
+ * after the kernel has cold-initialized the port: no boot loader sets it up, and it has no reset
+ * line of its own. Both sit in ATC2_PCIE, which the router powers with its own domains and the
+ * host keeps on once it is bound.
+ *
+ * The container is not a usb4-pcie-tunnel-N node, whose DART would get the fixed 64-stream
+ * topology of the earlier tunnel DARTs: this one is read like any T8110 DART. Nothing
+ * initialises it before Linux, so like the router's it carries every error reported and its
+ * bypass streams, 253 and 255, which carry the port's own writes (MSIs); the board gives its
+ * tunables, and the port's.
+ *
+ * MSIs use the bridge's 32-vector slice (192-223) of the window shared with the internal host.
+ */
+&pmgr0 {
+	/* With the ATC2 USB always-on clock gate, which has no state register of its own */
+	ps_atc2_pcie: power-controller@2f0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2f0 4>;
+		label = "atc2_pcie";
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
+	};
+};
+
+/ {
+	acio2_pcie_tunnel: pcie-tunnel-2 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+
+		apciec2_dart: iommu@384000000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x3 0x84000000 0x0 0x20000>;
+			interrupts = <AIC_IRQ 0 1470 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc2_pcie>;
+			#iommu-cells = <1>;
+			apple,bypass-sids = <253 255>;
+			apple,full-error-reporting;
+			apple,ctc-flush;
+		};
+
+		apciec2: pcie@1c70000000 {
+			compatible = "apple,t6050-pciec";
+			device_type = "pci";
+			reg = <0x1c 0x70000000 0x0 0x10000000>,
+			      <0x3 0x84034000 0x0 0x4000>,
+			      <0x3 0x84020000 0x0 0x8000>,
+			      <0x3 0x84038000 0x0 0x4000>,
+			      <0x3 0x84060000 0x0 0x4000>,
+			      <0x3 0x8402c000 0x0 0x4000>,
+			      <0x3 0x84028000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric", "debug", "ltssm", "intr2axi";
+			/* The port's: link events and INTx */
+			interrupts = <AIC_IRQ 0 1469 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "port0";
+			power-domains = <&ps_atc2_pcie>;
+			/* No boot loader hands the port over: the kernel cold-initializes it. */
+			apple,pciec-kernel-init;
+
+			msi-controller;
+			msi-parent = <&apciec2>;
+			msi-ranges = <&aic AIC_IRQ 0 2016 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-vector-base = <192>;
+
+			iommu-map = <0x0 &apciec2_dart 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+			linux,pci-domain = <3>;
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x10 0x0 0x10 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x00100000 0x12 0x00100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000 0x12 0x40000000 0x0 0x40000000>;
+
+			apciec2_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &apciec2_port 0 0 0 0>,
+						<0 0 0 2 &apciec2_port 0 0 0 1>,
+						<0 0 0 3 &apciec2_port 0 0 0 2>,
+						<0 0 0 4 &apciec2_port 0 0 0 3>;
+			};
+		};
+	};
+};
