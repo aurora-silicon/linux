@@ -1553,6 +1553,16 @@ apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 
 static const char *apple_dart_t8110_v2_fault_name(u32 exception);
 
+/*
+ * Exceptions can latch on any stream the hardware has. A tunnel DART runs with
+ * a fixed 64-stream topology, but a PCIe-C port also uses its reserved streams
+ * 253..255 (for example for MSIs), so scan all of them there.
+ */
+static unsigned int apple_dart_exception_sids(struct apple_dart *dart)
+{
+	return dart->tunneled ? DART_MAX_STREAMS : dart->num_streams;
+}
+
 static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 {
 	unsigned int i, drained = 0;
@@ -1560,7 +1570,7 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 	if (dart->hw->type != DART_T8110 || dart->version < 0x0202)
 		return;
 
-	for (i = 0; i < DIV_ROUND_UP(dart->num_streams, 32) && i < 8; i++) {
+	for (i = 0; i < DIV_ROUND_UP(apple_dart_exception_sids(dart), 32) && i < 8; i++) {
 		u32 pending = readl(dart->regs + DART_T8110_EXCEPTION(i));
 		unsigned long bits = pending;
 		unsigned int bit;
@@ -1573,7 +1583,7 @@ static void apple_dart_drain_stale_exceptions(struct apple_dart *dart)
 			u32 status;
 			u64 addr;
 
-			if (sid >= dart->num_streams)
+			if (sid >= apple_dart_exception_sids(dart))
 				break;
 
 			status = readl(dart->regs +
@@ -1716,6 +1726,24 @@ static int apple_dart_hw_finish_reset(struct apple_dart *dart)
 
 	if (dart->hw->type == DART_T8110)
 		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
+
+	/*
+	 * A PCIe-C port issues its own writes, such as MSIs turned into
+	 * interrupt controller writes, on reserved streams outside the
+	 * translated ones. Those must bypass.
+	 */
+	if (dart->tunneled && dart->hw->type == DART_T8110) {
+		u32 sid;
+
+		of_property_for_each_u32(dart->dev->of_node, "apple,bypass-sids", sid) {
+			if (sid >= DART_MAX_STREAMS)
+				continue;
+			apple_dart_writel(dart, dart->hw->tcr_bypass,
+					  dart->hw->tcr + 4 * sid);
+			apple_dart_writel(dart, BIT(sid % 32),
+					  dart->hw->enable_streams + 4 * (sid / 32));
+		}
+	}
 
 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 	ret = dart->hw->invalidate_tlb(&stream_map);
@@ -3351,10 +3379,16 @@ static int apple_dart_def_domain_type(struct device *dev)
 		return IOMMU_DOMAIN_DMA;
 	if (cfg->stream_maps[0].dart->retained_mtp)
 		return IOMMU_DOMAIN_IDENTITY;
+	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
+		return IOMMU_DOMAIN_IDENTITY;
+	/*
+	 * Tunneled PCIe is untrusted, and the PCIe-C DART bypasses only its
+	 * reserved streams: translate everything behind a USB4 port.
+	 */
+	if (cfg->stream_maps[0].dart->tunneled)
+		return IOMMU_DOMAIN_DMA;
 	if (dev_is_pci(dev) && of_machine_is_compatible("apple,j713") &&
 	    cfg->supports_bypass && !cfg->locked)
-		return IOMMU_DOMAIN_IDENTITY;
-	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
 		return IOMMU_DOMAIN_DMA;
@@ -3659,7 +3693,7 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
 	irqreturn_t ret = IRQ_NONE;
-	unsigned int words = DIV_ROUND_UP(dart->num_streams, 32);
+	unsigned int words = DIV_ROUND_UP(apple_dart_exception_sids(dart), 32);
 	unsigned int i;
 	u32 block_error;
 
@@ -3685,7 +3719,7 @@ static irqreturn_t apple_dart_t8110_v2_irq(int irq, void *dev)
 			u32 status;
 			u64 addr;
 
-			if (sid >= dart->num_streams)
+			if (sid >= apple_dart_exception_sids(dart))
 				break;
 
 			status = readl(dart->regs +
@@ -4146,6 +4180,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 			dart->oas = DART_PCIEC_ADDR_WIDTH;
 			dart->num_streams = DART_PCIEC_STREAMS;
 			dart->four_level = true;
+			/* T8132 PCIe-C DARTs keep per-stream exception records. */
+			if (of_device_is_compatible(dev->of_node, "apple,t8132-dart"))
+				dart->version = 0x0202;
 		} else {
 			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
 			dart->supports_bypass = false;

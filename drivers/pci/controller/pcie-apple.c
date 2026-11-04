@@ -192,6 +192,7 @@ struct hw_info {
 	u32 port_perst;
 	u32 port_rid2sid;
 	u32 port_msimap;
+	u32 port_tunctrl;
 	u32 max_rid2sid;
 	u32 pwren_off_ms;
 	u32 pwren_on_ms;
@@ -200,6 +201,8 @@ struct hw_info {
 	bool root_bus_only;
 	bool tunneled;
 	bool tunnel_intr2axi;
+	bool t8132_reset;
+	bool msimap_by_vector;
 };
 
 static const struct hw_info t8103_hw = {
@@ -273,6 +276,28 @@ static const struct hw_info t8122_pciec_hw = {
 	.port_msimap		= PORT_T602X_MSIMAP,
 	.max_rid2sid		= 64,
 	.tunneled		= true,
+};
+
+/*
+ * T8132 PCIe-C has 256 RID2SID entries, which run over the old tunnel reset
+ * block: TUNCTRL/TUNSTAT move to 0x1088/0x108c. The MSI address takes its
+ * high word at 0x16c.
+ *
+ * apple,pciec-kernel-init brings its ports up with the t8103 sequence, the
+ * oe-fabric tunables included, so it is not a tunnel_intr2axi controller:
+ * its Intr2AXI bridge is only pulsed, by ACIO and around the port enable.
+ */
+static const struct hw_info t8132_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_msiaddr_hi	= PORT_MSIADDR + 4,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_tunctrl		= 0x1088,
+	.max_rid2sid		= 256,
+	.tunneled		= true,
+	.t8132_reset		= true,
+	.msimap_by_vector	= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -481,9 +506,14 @@ static void apple_pcie_tunnel_apply_tunable(void __iomem *base,
 
 static void apple_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
 {
+	struct apple_pcie *pcie = data->domain->host_data;
+
 	msg->address_hi = upper_32_bits(DOORBELL_ADDR);
 	msg->address_lo = lower_32_bits(DOORBELL_ADDR);
 	msg->data = data->hwirq;
+	/* T8132 indexes its MSI map by the shared-window vector. */
+	if (pcie->hw->msimap_by_vector)
+		msg->data += pcie->msi_vector_base;
 }
 
 static struct irq_chip apple_msi_bottom_chip = {
@@ -721,7 +751,8 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 			apple_pcie_port_writel(port,
 				FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
 				PORT_MSIMAP_ENABLE,
-				pcie->hw->port_msimap + 4 * i);
+				pcie->hw->port_msimap + 4 * (i +
+				(pcie->hw->msimap_by_vector ? pcie->msi_vector_base : 0)));
 	} else {
 		apple_pcie_port_writel(port, 0, PORT_MSIBASE);
 		val = ilog2(pcie->nvecs) << PORT_MSICFG_L2MSINUM_SHIFT;
@@ -853,6 +884,16 @@ static void apple_pcie_port_enable_irq(struct apple_pcie_port *port)
 static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 				    int idx, u32 val);
 
+static u32 apple_pcie_port_tunctrl(struct apple_pcie_port *port)
+{
+	return port->pcie->hw->port_tunctrl ?: PORT_TUNCTRL;
+}
+
+static u32 apple_pcie_port_tunstat(struct apple_pcie_port *port)
+{
+	return apple_pcie_port_tunctrl(port) + PORT_TUNSTAT - PORT_TUNCTRL;
+}
+
 static int apple_pcie_tunnel_release_reset(struct apple_pcie_port *port)
 {
 	u32 stat;
@@ -863,12 +904,12 @@ static int apple_pcie_tunnel_release_reset(struct apple_pcie_port *port)
 	 * Releasing it means writing zero to PORT_TUNCTRL, waiting for the
 	 * reset-active indication to clear, and only then enabling the LTSSM.
 	 */
-	apple_pcie_port_writel(port, 0, PORT_TUNCTRL);
+	apple_pcie_port_writel(port, 0, apple_pcie_port_tunctrl(port));
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       !(stat & PORT_TUNSTAT_PERST_ON),
 				       1000,
 				       port->pcie->kernel_init ? 250000 : 100000,
-				       false, port, PORT_TUNSTAT);
+				       false, port, apple_pcie_port_tunstat(port));
 	if (ret)
 		dev_err(port->pcie->dev,
 			"port %pOF tunnel reset release timed out\n", port->np);
@@ -920,11 +961,28 @@ static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 		if (port->pcie->kernel_init &&
 		    apple_pcie_tunnel_reset_regs[i].offset == 0x130)
 			value = 0;
+		if (port->pcie->hw->t8132_reset) {
+			/* T8132 has no 0x128 or 0x810, and new 0x124/0x130 values. */
+			switch (apple_pcie_tunnel_reset_regs[i].offset) {
+			case 0x128:
+			case 0x810:
+				continue;
+			case 0x124:
+				value = 0x100;
+				break;
+			case 0x130:
+				value = 0x03020208;
+				break;
+			}
+		}
 		apple_pcie_port_writel(port, value, apple_pcie_tunnel_reset_regs[i].offset);
 	}
 
 	for (i = 0; i < port->pcie->hw->max_rid2sid; i++)
 		apple_pcie_rid2sid_write(port, i, 0);
+	if (port->pcie->hw->t8132_reset)
+		for (i = 0; i < 256; i++)
+			apple_pcie_port_writel(port, 0, PORT_T602X_MSIMAP + 4 * i);
 }
 
 static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
@@ -1073,7 +1131,7 @@ static int apple_pcie_tunnel_cold_init(struct apple_pcie_port *port)
 		 port->np,
 		 apple_pcie_port_readl(port, PORT_STATUS),
 		 apple_pcie_port_readl(port, PORT_LINKSTS),
-		 apple_pcie_port_readl(port, PORT_TUNSTAT));
+		 apple_pcie_port_readl(port, apple_pcie_port_tunstat(port)));
 	return 0;
 }
 
@@ -1097,7 +1155,8 @@ static void apple_pcie_tunnel_restore_irq_hw(struct apple_pcie_port *port)
 			apple_pcie_port_writel(port,
 				FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
 				PORT_MSIMAP_ENABLE,
-				pcie->hw->port_msimap + 4 * i);
+				pcie->hw->port_msimap + 4 * (i +
+				(pcie->hw->msimap_by_vector ? pcie->msi_vector_base : 0)));
 	} else {
 		apple_pcie_port_writel(port, 0, PORT_MSIBASE);
 		value = ilog2(pcie->nvecs) << PORT_MSICFG_L2MSINUM_SHIFT;
@@ -1289,10 +1348,12 @@ static bool apple_pcie_tunnel_transactions_idle(struct apple_pcie_port *port)
 	value = apple_pcie_port_readl(port, PORT_OUTS_NPREQS);
 	if (value & (PORT_OUTS_NPREQS_REQ | PORT_OUTS_NPREQS_CPL))
 		return false;
-	if (apple_pcie_port_readl(port, PORT_OUTS_PREQS_HDR) &
+	if (apple_pcie_port_readl(port, apple_pcie_port_tunctrl(port) -
+				  PORT_TUNCTRL + PORT_OUTS_PREQS_HDR) &
 	    PORT_OUTS_PREQS_HDR_MASK)
 		return false;
-	if (apple_pcie_port_readl(port, PORT_OUTS_PREQS_DATA) &
+	if (apple_pcie_port_readl(port, apple_pcie_port_tunctrl(port) -
+				  PORT_TUNCTRL + PORT_OUTS_PREQS_DATA) &
 	    PORT_OUTS_PREQS_DATA_MASK)
 		return false;
 	if (apple_pcie_port_readl(port, PORT_RXWR_FIFO) &
@@ -1333,10 +1394,11 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	 * tunneled reset request, and the root port must acknowledge it before
 	 * ACIO loses power. A cable disconnect requires that same ordering.
 	 */
-	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ON, PORT_TUNCTRL);
+	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ON, apple_pcie_port_tunctrl(port));
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       stat & PORT_TUNSTAT_PERST_ON,
-				       1000, 100000, false, port, PORT_TUNSTAT);
+				       1000, 100000, false, port,
+				       apple_pcie_port_tunstat(port));
 	if (ret)
 		dev_warn(pcie->dev, "port %pOF tunnel reset assertion timed out\n",
 			 port->np);
@@ -1355,13 +1417,13 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	if (ret && !err)
 		err = ret;
 
-	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ACK_REQ, PORT_TUNCTRL);
+	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ACK_REQ, apple_pcie_port_tunctrl(port));
 	/* M1 reports an outstanding acknowledgment until ACK_PEND clears. */
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       pcie->kernel_init ?
 				       !(stat & PORT_TUNSTAT_PERST_ACK_PEND) :
 				       stat & PORT_TUNSTAT_PERST_ACK_PEND,
-				       1000, 1000000, false, port, PORT_TUNSTAT);
+				       1000, 1000000, false, port, apple_pcie_port_tunstat(port));
 	if (ret) {
 		dev_warn(pcie->dev,
 			 "port %pOF tunnel reset acknowledgment timed out\n",
@@ -1377,7 +1439,7 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 			err = ret;
 	}
 	apple_pcie_port_rmw_clear(port, PORT_TUNCTRL_PERST_ACK_REQ,
-				  PORT_TUNCTRL);
+				  apple_pcie_port_tunctrl(port));
 	WRITE_ONCE(port->started, false);
 	port->needs_stop = err || (apple_pcie_port_readl(port, PORT_STATUS) &
 				  PORT_STATUS_READY);
@@ -1858,10 +1920,11 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 };
 
 /* T6030 has one shared AIC MSI window, partitioned by its ADT bridges. */
-static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq)
+static bool apple_t6030_msi_slice_valid(u32 base, u32 count, u32 aic_irq,
+					u32 aic_base)
 {
-	return (base == 0x20 || base == 0x40 || base == 0x60) &&
-	       count == 32 && aic_irq == 1342 + base;
+	return base >= 0x20 && !(base & 0x1f) && base + count <= 256 &&
+	       count == 32 && aic_irq == aic_base + base;
 }
 
 static int apple_msi_init(struct apple_pcie *pcie)
@@ -1894,25 +1957,42 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	 * 32-vector slice. Keep endpoint MSI data local, and route its table
 	 * entry to the corresponding shared-window vector.
 	 */
-	if (pcie->hw == &t8122_pciec_hw) {
+	if (pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw) {
 		struct resource ecam;
-		u32 expected_base;
+		u32 expected_base, aic_base;
 
-		/* These ECAM apertures identify the three T6030 ADT bridges. */
-		if (!of_machine_is_compatible("apple,t6030") ||
-		    of_address_to_resource(to_of_node(fwnode), 0, &ecam))
+		if (of_address_to_resource(to_of_node(fwnode), 0, &ecam))
 			goto invalid_slice;
-		switch (ecam.start) {
-		case 0x730000000ULL:
-			expected_base = 0x20;
-			break;
-		case 0xb30000000ULL:
-			expected_base = 0x40;
-			break;
-		case 0xf30000000ULL:
-			expected_base = 0x60;
-			break;
-		default:
+		/* These ECAM apertures identify the ADT bridges of each SoC. */
+		if (of_machine_is_compatible("apple,t6030")) {
+			aic_base = 1342;
+			switch (ecam.start) {
+			case 0x730000000ULL:
+				expected_base = 0x20;
+				break;
+			case 0xb30000000ULL:
+				expected_base = 0x40;
+				break;
+			case 0xf30000000ULL:
+				expected_base = 0x60;
+				break;
+			default:
+				goto invalid_slice;
+			}
+		} else if (of_machine_is_compatible("apple,t8132")) {
+			aic_base = 1506;
+			switch (ecam.start) {
+			/* The internal port's bridges own vectors 0..95. */
+			case 0x1c50000000ULL:
+				expected_base = 0x60;
+				break;
+			case 0x1c60000000ULL:
+				expected_base = 0x80;
+				break;
+			default:
+				goto invalid_slice;
+			}
+		} else {
 			goto invalid_slice;
 		}
 		if (args.args_count != 3 || args.args[0] != 0 ||
@@ -1923,7 +2003,7 @@ static int apple_msi_init(struct apple_pcie *pcie)
 					   &pcie->msi_vector_base);
 		if (!of_find_property(to_of_node(fwnode),
 				      "apple,msi-vector-base", NULL) &&
-		    args.args[1] == 1342 && pcie->nvecs == 512) {
+		    aic_base == 1342 && args.args[1] == 1342 && pcie->nvecs == 512) {
 			/*
 			 * Old experimental boot DTs exposed the global window to
 			 * each host. Correct it here so old recovery kernels can
@@ -1939,12 +2019,12 @@ static int apple_msi_init(struct apple_pcie *pcie)
 		}
 		if (pcie->msi_vector_base != expected_base ||
 		    !apple_t6030_msi_slice_valid(pcie->msi_vector_base,
-					pcie->nvecs, args.args[1]))
+					pcie->nvecs, args.args[1], aic_base))
 			goto invalid_slice;
 	}
 
 	/* Keep map targets within the supported 8-bit range. */
-	if (pcie->hw == &t8122_pciec_hw &&
+	if ((pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw) &&
 	    (!pcie->nvecs || pcie->nvecs > 256 ||
 	     pcie->msi_vector_base >
 	     FIELD_MAX(PORT_MSIMAP_TARGET) + 1 - pcie->nvecs)) {
@@ -3672,13 +3752,14 @@ static int apple_pcie_reset_for_resume(struct apple_pcie *pcie)
 
 		/* A failed cold setup still owns partially enabled hardware. */
 		port->needs_stop = true;
-		apple_pcie_port_writel(port, PORT_TUNCTRL_PERST_ON, PORT_TUNCTRL);
+		apple_pcie_port_writel(port, PORT_TUNCTRL_PERST_ON, apple_pcie_port_tunctrl(port));
 		ret = apple_pcie_tunnel_cold_init(port);
 		if (ret)
 			return ret;
 		ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 					       stat & PORT_TUNSTAT_PERST_ON,
-					       1000, 100000, false, port, PORT_TUNSTAT);
+					       1000, 100000, false, port,
+				       apple_pcie_port_tunstat(port));
 		if (ret)
 			return ret;
 		apple_pcie_tunnel_restore_irq_hw(port);
@@ -3773,6 +3854,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 };
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t8132-pciec",	.data = &t8132_pciec_hw },
 	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
 	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },
 	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },

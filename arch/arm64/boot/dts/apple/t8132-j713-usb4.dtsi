@@ -17,6 +17,14 @@
 };
 
 /* ACIO is the consumer that owns these domains while a cable is up. */
+&ps_atc0_pcie {
+	status = "okay";
+};
+
+&ps_atc1_pcie {
+	status = "okay";
+};
+
 &ps_atc0_cio {
 	status = "okay";
 };

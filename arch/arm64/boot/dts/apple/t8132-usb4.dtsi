@@ -267,3 +267,207 @@
 		};
 	};
 };
+
+/*
+ * The USB4 PCIe tunnels: one PCIe-C root port per host router, with the DART
+ * beside it. ACIO populates each container once the router has a PCIe tunnel,
+ * and the kernel cold-initializes the port (apple,pciec-kernel-init).
+ *
+ * apple,tunable-rc, -fabric, -debug and the port's apple,tunable come from the
+ * board, which a bootloader may fill in instead. The oe-fabric
+ * block and its tunable belong to the port's PIO-DMA engine in the ADT, which
+ * no bootloader passes on, so they are described here.
+ */
+/ {
+	usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+		/* Preserve the SoC DMA window after moving the virtual container. */
+		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
+
+		usb4_0_pcie_dart: iommu@404000000 {
+			compatible = "apple,t8132-dart", "apple,t8110-dart";
+			reg = <0x4 0x04000000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1268 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			/* The port's own writes, MSIs included, use these streams. */
+			apple,bypass-sids = <253 255>;
+			/* No bootloader fills this one; the tunnel's cold init needs it. */
+			apple,tunable =
+				<0x20c 0x80000121 0x80000121>,
+				<0x220 0xf0f0f 0xf0f0f>,
+				<0x224 0xffffff 0x80808>,
+				<0x300 0x1f31 0x1>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>;
+		};
+
+		usb4_0_pcie: pcie@1c50000000 {
+			compatible = "apple,t8132-pciec", "apple,t8122-pciec",
+				     "apple,t8103-pciec";
+			device_type = "pci";
+			reg = <0x1c 0x50000000 0x0 0x10000000>,
+			      <0x4 0x04034000 0x0 0x4000>,
+			      <0x4 0x04020000 0x0 0x8000>,
+			      <0x4 0x04038000 0x0 0x4000>,
+			      <0x4 0x04060000 0x0 0x4000>,
+			      <0x4 0x00020000 0x0 0x4000>,
+			      <0x4 0x0402c000 0x0 0x4000>,
+			      <0x4 0x04028000 0x0 0x4000>,
+			      <0x4 0x0403c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ioa", "ltssm", "intr2axi",
+				    "oe-fabric";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1267 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_cio_pcie>;
+			resets = <&ps_atc0_pcie>;
+			apple,pciec-kernel-init;
+			apple,tunable-oe-fabric =
+				<0x4 0x70007 0x40004>,
+				<0xc 0x1 0x1>,
+				<0x10 0x1 0x1>,
+				<0x14 0x801f 0x4>,
+				<0x1c 0x801f 0x4>,
+				<0x24 0x801f 0x4>;
+			msi-controller;
+			msi-parent = <&usb4_0_pcie>;
+			/* The ADT bridge's 32-vector slice of the window shared with apcie. */
+			msi-ranges = <&aic AIC_IRQ 1602 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-vector-base = <0x60>;
+			iommu-map = <0x0 &usb4_0_pcie_dart 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x8 0x0
+				  0x8 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x100000
+				  0xa 0x100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0xa 0x40000000 0x0 0x40000000>;
+
+			usb4_0_pcie_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+				/* apple,tunable is filled by the bootloader */
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &usb4_0_pcie_port 0 0 0 0>,
+						<0 0 0 2 &usb4_0_pcie_port 0 0 0 1>,
+						<0 0 0 3 &usb4_0_pcie_port 0 0 0 2>,
+						<0 0 0 4 &usb4_0_pcie_port 0 0 0 3>;
+			};
+		};
+	};
+
+	usb4_1_pcie_tunnel: usb4-pcie-tunnel-1 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+		/* Preserve the SoC DMA window after moving the virtual container. */
+		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
+
+		usb4_1_pcie_dart: iommu@40c000000 {
+			compatible = "apple,t8132-dart", "apple,t8110-dart";
+			reg = <0x4 0x0c000000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1330 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			/* The port's own writes, MSIs included, use these streams. */
+			apple,bypass-sids = <253 255>;
+			/* No bootloader fills this one; the tunnel's cold init needs it. */
+			apple,tunable =
+				<0x20c 0x80000121 0x80000121>,
+				<0x220 0xf0f0f 0xf0f0f>,
+				<0x224 0xffffff 0x80808>,
+				<0x300 0x1f31 0x1>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>;
+		};
+
+		usb4_1_pcie: pcie@1c60000000 {
+			compatible = "apple,t8132-pciec", "apple,t8122-pciec",
+				     "apple,t8103-pciec";
+			device_type = "pci";
+			reg = <0x1c 0x60000000 0x0 0x10000000>,
+			      <0x4 0x0c034000 0x0 0x4000>,
+			      <0x4 0x0c020000 0x0 0x8000>,
+			      <0x4 0x0c038000 0x0 0x4000>,
+			      <0x4 0x0c060000 0x0 0x4000>,
+			      <0x4 0x08020000 0x0 0x4000>,
+			      <0x4 0x0c02c000 0x0 0x4000>,
+			      <0x4 0x0c028000 0x0 0x4000>,
+			      <0x4 0x0c03c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ioa", "ltssm", "intr2axi",
+				    "oe-fabric";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1329 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc1_cio_pcie>;
+			resets = <&ps_atc1_pcie>;
+			apple,pciec-kernel-init;
+			apple,tunable-oe-fabric =
+				<0x4 0x70007 0x40004>,
+				<0xc 0x1 0x1>,
+				<0x10 0x1 0x1>,
+				<0x14 0x801f 0x4>,
+				<0x1c 0x801f 0x4>,
+				<0x24 0x801f 0x4>;
+			msi-controller;
+			msi-parent = <&usb4_1_pcie>;
+			/* The ADT bridge's 32-vector slice of the window shared with apcie. */
+			msi-ranges = <&aic AIC_IRQ 1634 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-vector-base = <0x80>;
+			iommu-map = <0x0 &usb4_1_pcie_dart 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0xc 0x0
+				  0xc 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x100000
+				  0xe 0x100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0xe 0x40000000 0x0 0x40000000>;
+
+			usb4_1_pcie_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+				/* apple,tunable is filled by the bootloader */
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &usb4_1_pcie_port 0 0 0 0>,
+						<0 0 0 2 &usb4_1_pcie_port 0 0 0 1>,
+						<0 0 0 3 &usb4_1_pcie_port 0 0 0 2>,
+						<0 0 0 4 &usb4_1_pcie_port 0 0 0 3>;
+			};
+		};
+	};
+};
+
+&usb4_0_acio {
+	power-domains = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
+			<&ps_atc0_cio_usb>, <&ps_atc0_pcie>;
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
+			<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
