@@ -79,6 +79,17 @@ static int combo_quiesce(void *ctx)
 	return ret;
 }
 
+/* The pipehandler bank is the controller's: read it only while the controller holds its domain. */
+static void combo_pipe_fault(struct t6050_dp *dp, const char *what, int ret)
+{
+	dev_err(dp->dev, "%s failed (%d): pipe 00=%08x 04=%08x 0c=%08x 10=%08x 14=%08x 1c=%08x 20=%08x\n",
+		what, ret, readl(dp->banks[44]), readl(dp->banks[44] + 0x4),
+		readl(dp->banks[44] + 0xc), readl(dp->banks[44] + 0x10),
+		readl(dp->banks[44] + 0x14), readl(dp->banks[44] + 0x1c),
+		readl(dp->banks[44] + 0x20));
+	dp->faulted = true;
+}
+
 static int combo_stop(struct t6050_dp *dp)
 {
 	int ret;
@@ -101,6 +112,7 @@ static int combo_stop(struct t6050_dp *dp)
 	if (!ret)
 		ret = atc_domain_set(&dp->domain[0], false);
 	if (ret) {
+		dev_err(dp->dev, "stop failed (%d)\n", ret);
 		dp->faulted = true;
 		return ret < 0 ? ret : -EIO;
 	}
@@ -142,6 +154,7 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 	}
 	if (ret) {
 		/* A partial shared transition has no cold-start ownership proof. */
+		dev_err(dp->dev, "start of mode %d failed (%d)\n", mode, ret);
 		dp->faulted = true;
 		return ret < 0 ? ret : -EIO;
 	}
@@ -217,10 +230,12 @@ static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
 	if (dp->usb2_active)
 		return 0;
 	ret = APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_usb2_host);
-	if (ret)
+	if (ret) {
+		dev_err(dp->dev, "USB2 host start failed (%d)\n", ret);
 		dp->faulted = true;
-	else
+	} else {
 		dp->usb2_active = true;
+	}
 	return ret;
 }
 
@@ -233,8 +248,10 @@ static int combo_usb2_reset(struct phy *phy)
 	if (dp->faulted || !dp->usb2_active)
 		return -ENOLINK;
 	ret = apple_t6050_usb2_port_reset(&dp->usb_io, dp, combo_sleep);
-	if (ret)
+	if (ret) {
+		dev_err(dp->dev, "USB2 port reset failed (%d)\n", ret);
 		dp->faulted = true;
+	}
 	return ret ? -EIO : 0;
 }
 
@@ -261,7 +278,7 @@ static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 	apple_tunable_apply(dp->banks[44], dp->pipe_default);
 	ret = apple_t6050_usb3_pipe_switch(&dp->usb_io);
 	if (ret)
-		dp->faulted = true;
+		combo_pipe_fault(dp, "USB3 PIPE switch", ret);
 	else
 		dp->pipe_active = true;
 	return ret ? -EIO : 0;
@@ -287,8 +304,10 @@ static int combo_usb3_poweroff(struct phy *phy)
 		if (!ret)
 			dp->usb2_active = false;
 	}
-	if (ret)
+	if (ret) {
+		dev_err(dp->dev, "USB3 power-off failed (%d)\n", ret);
 		dp->faulted = true;
+	}
 	return ret ? -EIO : 0;
 }
 static const struct phy_ops combo_usb2_ops = {
@@ -312,7 +331,7 @@ static int combo_reset_assert(struct reset_controller_dev *reset, unsigned long 
 	apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 0x10, 0x10);
 	ret = apple_t6050_usb3_pipe_cold_dummy(&dp->usb_io);
 	if (ret)
-		dp->faulted = true;
+		combo_pipe_fault(dp, "dummy PIPE park", ret);
 	else
 		dp->controller_active = false;
 	return ret ? -EIO : 0;
@@ -326,6 +345,12 @@ static int combo_reset_deassert(struct reset_controller_dev *reset, unsigned lon
 		return -EINVAL;
 	if (dp->faulted || !dp->usb2_active)
 		return -ENOLINK;
+	/*
+	 * The PIPE lock that starts the USB3 handoff is acknowledged only while the dummy PHY
+	 * behind the mux is enabled (NONSELECTED_OVERRIDE bit 15), as on the earlier ATC PHYs.
+	 * The bit resets to clear with the controller's domain, so set it for every session.
+	 */
+	apple_t6050_usb_mask(&dp->usb_io, 44, 0x20, BIT(15), BIT(15));
 	apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 0x10, 0);
 	apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 1, 1);
 	dp->controller_active = true;
