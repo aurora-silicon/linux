@@ -126,6 +126,28 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     description: Offset, mask and value tuples within the named bank
 
+  apple,tunable-uc-regs-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Offset, mask and value tuples for the PHY firmware's registers in CIO
+      (USB4/Thunderbolt) mode. Optional; an absent CIO tunable is skipped.
+
+  apple,tunable-lane0-rx-top-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: As apple,tunable-uc-regs-cio, for lane 0's receiver top bank
+
+  apple,tunable-lane1-rx-top-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: As apple,tunable-uc-regs-cio, for lane 1's receiver top bank
+
+  apple,tunable-lane0-rx-eq-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: As apple,tunable-uc-regs-cio, for lane 0's receiver equalizer
+
+  apple,tunable-lane1-rx-eq-cio:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: As apple,tunable-uc-regs-cio, for lane 1's receiver equalizer
+
 patternProperties:
   '^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$':
     $ref: /schemas/types.yaml#/definitions/uint32-array
