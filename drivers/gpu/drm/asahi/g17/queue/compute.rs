@@ -27,6 +27,9 @@ use crate::g17::now_ns;
 /// Descriptor slots per queue. A kick's descriptor is rewritten when the kick 32 slots later
 /// is published; with IN_FLIGHT kicks outstanding at most, that kick has completed by then.
 const DESCRIPTORS: usize = 32;
+// Descriptors and cached records are reused by slot, so both must outlast the in-flight window.
+const _: () =
+    assert!(retirement::IN_FLIGHT <= DESCRIPTORS && retirement::IN_FLIGHT <= RECORD_SLOTS);
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;

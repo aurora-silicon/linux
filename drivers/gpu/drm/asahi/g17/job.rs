@@ -18,7 +18,7 @@ pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
 /// `RENDER_DEPTH` commands. A deeper scheduler would only park run_job in
 /// admission until a retirement; the scheduler waits for the credit instead.
 const RENDER_CREDITS: u32 = crate::hw::t8140::queues::RENDER_DEPTH as u32;
-const COMPUTE_CREDITS: u32 = 16;
+const COMPUTE_CREDITS: u32 = crate::hw::t8140::queues::COMPUTE_DEPTH as u32;
 /// drm_sched deduplicates a job's dependencies by fence context with a scan of
 /// all earlier ones per add. Completion fences each own a context, so a command
 /// behind a long frontier (about 120 of them under Astro Bot) made every submit
