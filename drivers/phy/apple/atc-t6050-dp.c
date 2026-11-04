@@ -14,6 +14,7 @@
 #include "usb-t6050/apple_t6050_usb_phy.h"
 #include "usb-t6050/apple_t6050_usb3_pipe.h"
 #include "usb-t6050/apple_t6050_usb2_reset.h"
+#include "usb-t6050/apple_t6050_cio_phy.h"
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/tunable.h>
@@ -23,6 +24,7 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_altmode.h>
+#include <linux/usb/typec_tbt.h>
 
 enum atc_operation { ATC_MASK, ATC_TUNABLE, ATC_DELAY, ATC_POLL, ATC_POWER, ATC_FIRMWARE };
 struct atc_op {
@@ -68,9 +70,9 @@ struct atc_domain {
 	struct device *dev;
 	bool active;
 };
-enum combo_mode { COMBO_SAFE, COMBO_USB, COMBO_DP4, COMBO_DP2 };
+enum combo_mode { COMBO_SAFE, COMBO_USB, COMBO_DP4, COMBO_DP2, COMBO_CIO };
 struct t6050_dp {
-	bool combo, usb_prepared, usb2_active, pipe_active, controller_active;
+	bool combo, usb_prepared, usb2_active, pipe_active, controller_active, cio_prepared;
 	enum combo_mode combo_mode;
 	enum typec_orientation orientation;
 	struct phy *combo_phy[3];
@@ -78,6 +80,7 @@ struct t6050_dp {
 	struct apple_t6050_usb_io usb_io;
 	struct apple_t6050_usb_platform usb_platform;
 	struct apple_tunable *usb2_default, *usb2_host, *pipe_default;
+	struct apple_tunable *cio_tunables[5]; /* optional; empty on J716c except RX_TOP */
 	struct device *dev;
 	struct mutex lock;
 	void __iomem *banks[45];
