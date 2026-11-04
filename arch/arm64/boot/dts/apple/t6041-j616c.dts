@@ -19,6 +19,7 @@
 	/* aura opens a co-processor's DAPF only if it finds its alias here. */
 	aliases {
 		aop = &aop;
+		isp = &isp;
 		mtp = &mtp;
 	};
 };
