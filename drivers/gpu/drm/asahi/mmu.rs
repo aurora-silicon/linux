@@ -116,8 +116,15 @@ mod lifetime;
 mod ppl;
 mod residency;
 mod shared;
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+mod t8152;
 pub(crate) use bind::PreparedUserBindBatch;
 pub(crate) use lifetime::VmJobGuard;
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+pub(crate) use t8152::M5ExecutionContext;
+/// The module-1134 name of the job guard G18 holds while a job uses a VM.
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+pub(crate) type T8140VmJobGuard = VmJobGuard;
 pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 
 /// PPL magic number for the handoff region
@@ -164,6 +171,28 @@ pub(crate) enum UatFirmware {
         /// Offset of the secondary instance's kernel root in the `pagetables` region.
         secondary_root_offset: Option<u64>,
     },
+    /// Two coprocessor instances that never touch the handoff region and publish their roots like
+    /// [`UatFirmware::PublishedRoots`], without the context-1 kernel alias (T8152/G18G, 26A428).
+    ///
+    /// A live firmware peer in the handoff region is refused, and the high roots are prepared,
+    /// confirmed and mirrored by `mmu::t8152`.
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    NoPeerRoots {
+        /// Offset of the secondary instance's kernel root in the `pagetables` region.
+        secondary_root_offset: u64,
+    },
+}
+
+impl UatFirmware {
+    /// Whether this is the T8152 no-peer firmware.
+    #[inline(always)]
+    const fn is_no_peer(&self) -> bool {
+        #[cfg(CONFIG_DRM_ASAHI_G18)]
+        if let UatFirmware::NoPeerRoots { .. } = self {
+            return true;
+        }
+        false
+    }
 }
 
 /// UAT policy of a SoC where it differs from the A18 Pro's.
@@ -581,6 +610,14 @@ impl gpuvm::DriverGpuVm for VmInner {
         if ctx.dev.is_none() {
             return Err(ENODEV);
         }
+        // T8152 (module 1134): GPUVM cannot see driver-owned KernelMappings, and G18 places
+        // driver aliases in user VMs outside the VM_CREATE kernel range. Preflight the full
+        // object range in the authoritative page table (EBUSY on any populated leaf) and
+        // allocate every intermediate table before the first scatterlist leaf is written.
+        if self.uat_inner.firmware.is_no_peer() {
+            self.page_table
+                .prepare_map(map_addr..map_addr.checked_add(map_length as u64).ok_or(EOVERFLOW)?)?;
+        }
         // Bind preparation retained the table's backing before taking the VM reservation.
         // Never acquire the object reservation from inside the GPUVM map callback.
         let segments = op.vm_bo().data().segments.lock();
@@ -874,6 +911,9 @@ impl VmInner {
             UatFirmware::PublishedRoots { .. } => {
                 mem::tlbi_range_or_asid(asid, iova as usize, size)
             }
+            // T8152: the per-page range encoding module 1134 issues.
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            UatFirmware::NoPeerRoots { .. } => mem::tlbi_range(asid, iova as usize, size),
         }
     }
 
@@ -906,9 +946,14 @@ impl VmInner {
         if contexts == 0 {
             return;
         }
+        let no_peer = self.uat_inner.firmware.is_no_peer();
         for ctx in 0..UAT_NUM_CTX {
             if contexts & (1 << ctx) != 0 {
-                mem::tlbi_range_or_asid(ctx as u8, iova as usize, size);
+                if no_peer {
+                    mem::tlbi_range(ctx as u8, iova as usize, size);
+                } else {
+                    mem::tlbi_range_or_asid(ctx as u8, iova as usize, size);
+                }
             }
         }
         mem::sync();
@@ -1043,6 +1088,9 @@ pub(crate) struct Vm {
     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
+    /// The kernel range this VM was created with (`t8152::Vm::kernel_range`).
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    kernel_range: Range<u64>,
 }
 no_debug!(Vm);
 
@@ -1298,13 +1346,13 @@ impl TimestampVmap {
 
 /// Prepared CPU timestamp access with its own vmap; destruction happens after completion
 /// signalling.
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 pub(crate) struct TimestampMapping {
     mapping: TimestampVmap,
     offset: usize,
 }
 
-#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
 impl TimestampMapping {
     /// Prepare one bounded CPU timestamp destination on retained GEM backing.
     pub(crate) fn new(gem: &gem::Object, offset: usize) -> Result<Self> {
@@ -1355,7 +1403,7 @@ impl KernelMapping {
     /// use a complete atomic store; byte stores support unaligned destinations without
     /// creating mutable aliases. An unaligned complete timestamp is not atomic.
     /// Retain CPU access before this destination's completion fence is published.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[cfg(any(CONFIG_DRM_ASAHI_G16, CONFIG_DRM_ASAHI_G18))]
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<TimestampMapping> {
         let gem = self.0._gem.as_ref().ok_or(EINVAL)?;
         TimestampMapping::new(gem, self.timestamp_offset(offset)?)
@@ -1399,6 +1447,7 @@ impl KernelMapping {
         let mut mutated = false;
         let result = (|| {
             if self.0.uat_inner.firmware == UatFirmware::Handoff
+                || self.0.uat_inner.firmware.is_no_peer()
                 || prefix == 0
                 || prefix > self.size()
                 || (prefix | self.size()) & UAT_PGMSK != 0
@@ -1447,6 +1496,27 @@ impl KernelMapping {
             Ok([after[0], after[cached_pages.min(pages - 1)]])
         })();
         (result, mutated)
+    }
+
+    /// Downgrade this mapping's PTEs to uncached, without a firmware cache flush (T8152).
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    fn remap_uncached_only(&mut self) {
+        let mut owner = self.0.owner.lock_inner();
+        let prot = self.0.prot.as_uncached();
+        let _mutation = owner.mapping_mutation();
+        if owner
+            .page_table
+            .reprot_pages(self.iova_range(), prot)
+            .is_err()
+        {
+            dev_err!(
+                owner.dev.as_ref(),
+                "MMU: remap {:#x}:{:#x} failed\n",
+                self.iova(),
+                self.size()
+            );
+        }
+        mem::sync();
     }
 
     /// Remap a cached mapping as uncached, then synchronously flush that range of VAs from the
@@ -1630,6 +1700,12 @@ impl Drop for KernelMapping {
                 self.size()
             );
             self.remap_uncached_and_flush();
+        }
+        // T8152 (module 1134): downgrade the PTEs to uncached before the unmap. The firmware
+        // cache flush is never armed for this firmware, so no flush request follows.
+        #[cfg(CONFIG_DRM_ASAHI_G18)]
+        if self.0.prot.is_cached_noncoherent() && self.0.uat_inner.firmware.is_no_peer() {
+            self.remap_uncached_only();
         }
 
         // Only VM page tables/binding state are touched here. The shared
@@ -1972,6 +2048,14 @@ impl Handoff {
 
     /// Initialize the handoff region
     fn init(&self, firmware: UatFirmware, slot: u32) -> Result {
+        #[cfg(CONFIG_DRM_ASAHI_G18)]
+        if firmware.is_no_peer()
+            && (self.magic_fw.load(Ordering::Acquire) != 0
+                || self.lock_fw.load(Ordering::Acquire) != 0)
+        {
+            pr_err!("T8152 handoff: unexpected firmware peer; refusing no-peer mode\n");
+            return Err(ENODEV);
+        }
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(slot, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
@@ -2154,6 +2238,8 @@ impl Vm {
             None
         };
         let bind_sequence = Arc::new(AtomicU64::new(0), GFP_KERNEL)?;
+        #[cfg(CONFIG_DRM_ASAHI_G18)]
+        let vm_kernel_range = kernel_range.clone();
         let unique_gpuvm = gpuvm::GpuVm::new::<Error, _>(
             c"Asahi::GpuVm",
             &dev,
@@ -2191,6 +2277,8 @@ impl Vm {
             status: None,
             dummy_obj: dummy_obj.gem.clone(),
             binding,
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            kernel_range: vm_kernel_range,
         })
     }
 
@@ -3341,6 +3429,11 @@ impl Uat {
 
     /// Binds a `Vm` to a slot, preferring the last used one.
     pub(crate) fn bind(&self, vm: &Vm) -> Result<VmBind> {
+        // T8152 uses the module-1134 M5 execution-context leases (`mmu::t8152`); the slot
+        // allocator would claim contexts the leases own.
+        if self.inner.firmware.is_no_peer() {
+            return Err(ENOTSUPP);
+        }
         self.bind_inner(vm, true)
     }
 
@@ -3458,7 +3551,9 @@ impl Uat {
     /// Allocates a stable application context without changing the VM bind slot.
     /// Both roots and the generation remain unchanged for the lease's lifetime.
     pub(crate) fn new_execution_context(&self, vm: &Vm) -> Result<Arc<ExecutionContext>> {
-        if self.inner.firmware == UatFirmware::Handoff {
+        // NoPeerRoots: T8152 publishes `t8152::M5ExecutionContext` leases (private empty upper
+        // root) instead of kernel-root upper halves.
+        if self.inner.firmware == UatFirmware::Handoff || self.inner.firmware.is_no_peer() {
             return Err(EINVAL);
         }
         {
@@ -3689,7 +3784,13 @@ impl Uat {
                 shared <- new_mutex!(
                     UatShared {
                         kernel_ttb1: 0,
-                        execution_contexts: !EXECUTION_CONTEXT_MASK,
+                        // NoPeerRoots: contexts 3..63 are the M5 execution-context leases of
+                        // `mmu::t8152`; 0..2 belong to the driver and the firmware.
+                        execution_contexts: if firmware.is_no_peer() {
+                            0b111
+                        } else {
+                            !EXECUTION_CONTEXT_MASK
+                        },
                         context_generations: [0; UAT_NUM_CTX],
                         binding_generations: [0; UAT_NUM_CTX],
                         binding_published: [false; UAT_NUM_CTX],
@@ -3747,6 +3848,13 @@ impl Uat {
             UatFirmware::PublishedRoots {
                 secondary_root_offset: None,
             } => (UAT_PGSZ, None),
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            UatFirmware::NoPeerRoots {
+                secondary_root_offset,
+            } => (
+                secondary_root_offset as usize + UAT_PGSZ,
+                Some(ttb1 + secondary_root_offset),
+            ),
         };
         if ttb1size < pagetables_size {
             dev_err!(dev.as_ref(), "MMU: Pagetables region is too small\n");

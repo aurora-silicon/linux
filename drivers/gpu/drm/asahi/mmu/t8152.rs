@@ -85,7 +85,7 @@ impl Uat {
         dev: &driver::AsahiDevice,
         crash_views: Option<[u64; 2]>,
     ) -> Result<Self> {
-        let node = dev.as_ref().of_node().ok_or(EINVAL)?;
+        let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
         let mut regions = [(0u64, 0u64); 4];
         for (index, (name, size)) in Iterator::chain(
             T8152_FIRMWARE_DATA.into_iter(),
@@ -121,13 +121,16 @@ impl Uat {
         if crash_views.is_some() {
             return Err(ENOTSUPP);
         }
+        // The A18 Pro policy is the one module 1134 ran this UAT with: no
+        // table cleaning, range TLBIs, the handoff lock and slot 0.
         Self::new(
-            dev,
+            dev.clone(),
             T8152_GEOMETRY,
             false,
             UatFirmware::NoPeerRoots {
                 secondary_root_offset: T8152_SECONDARY_ROOT_OFFSET,
             },
+            UatQuirks::DEFAULT,
         )
     }
 
@@ -150,8 +153,8 @@ impl Uat {
         if !self.is_t8152_geometry() {
             return Err(EINVAL);
         }
-        let primary_phys = self.kernel_vm.ttb()?;
-        let secondary_phys = self.inner.lock()?.secondary_ttb1.ok_or(EIO)?;
+        let primary_phys = self.kernel_vm.ttb();
+        let secondary_phys = self.inner.lock().secondary_ttb1.ok_or(EIO)?;
         // SAFETY: both roots are pages of the bootloader-reserved `pagetables`
         // region, which outlives this Uat.
         let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
@@ -183,7 +186,7 @@ impl Uat {
             Ok(())
         })?;
         {
-            let node = self.dev.as_ref().of_node().ok_or(EINVAL)?;
+            let node = self.dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
             let shared_l2 = node.reserved_mem_region_to_resource_byname(c_str!("shared-l2"))?;
             let mask = ((1u64 << self.geometry.oas) - 1) & !(UAT_PGMSK as u64);
             if shared_l2.size() != UAT_PGSZ as u64
@@ -235,7 +238,7 @@ impl Uat {
         if !self.is_t8152_geometry() {
             return Err(EINVAL);
         }
-        let primary_phys = self.kernel_vm.ttb()?;
+        let primary_phys = self.kernel_vm.ttb();
         // SAFETY: the root is a page of the bootloader-reserved `pagetables` region.
         let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
         let mut current = [0u64; T8140_FIRMWARE_SHARED_ROOT_ENTRIES];
@@ -272,8 +275,8 @@ impl Uat {
         if !self.is_t8152_geometry() {
             return Err(EINVAL);
         }
-        let primary_phys = self.kernel_vm.ttb()?;
-        let secondary_phys = self.inner.lock()?.secondary_ttb1.ok_or(EIO)?;
+        let primary_phys = self.kernel_vm.ttb();
+        let secondary_phys = self.inner.lock().secondary_ttb1.ok_or(EIO)?;
         // SAFETY: both roots are pages of the bootloader-reserved `pagetables` region.
         let primary = unsafe { Page::borrow_phys(&primary_phys) }.ok_or(EIO)?;
         // SAFETY: as above.
@@ -332,7 +335,7 @@ impl Uat {
             return Err(ENODEV);
         }
         {
-            let owner = vm.inner.exec_lock(None, false)?;
+            let owner = vm.gpuvm.lock_inner();
             if owner.is_kernel || !core::ptr::eq(
                 Arc::as_ptr(&owner.uat_inner), Arc::as_ptr(&self.inner),
             ) {
@@ -343,7 +346,7 @@ impl Uat {
         // its own bitmap; here the same bitmap is the shared execution-context
         // set, seeded with 0..2 for NoPeerRoots and taken under the UAT lock.
         let context = {
-            let mut inner = self.inner.lock()?;
+            let mut inner = self.inner.lock();
             let free = !inner.execution_contexts & !0b111u64;
             if free == 0 {
                 return Err(ENOSPC);
@@ -373,7 +376,7 @@ impl Drop for M5ContextSlot {
     fn drop(&mut self) {
         // An unexpected published root is not ours to retract or recycle.
         // Keep its bit quarantined rather than hand it to another client.
-        let Ok(mut inner) = self.inner.lock() else { return; };
+        let mut inner = self.inner.lock();
         let slot = &inner.ttbs()[self.context];
         let empty = slot.ttb0.load(Ordering::Acquire) == 0
             && slot.ttb1.load(Ordering::Acquire) == 0;
@@ -402,7 +405,7 @@ pub(crate) struct M5ExecutionContext {
 
 fn context_roots(context: usize, low: &Vm, high: &Vm) -> Result<[u64; 2]> {
     let tag = (context as u64) << TTBR_ASID_SHIFT | TTBR_VALID;
-    Ok([low.ttb()? | tag, high.ttb()? | tag])
+    Ok([low.ttb() | tag, high.ttb() | tag])
 }
 
 impl M5ExecutionContext {
@@ -411,7 +414,7 @@ impl M5ExecutionContext {
     pub(crate) fn context_id(&self) -> u8 { self.slot.context as u8 }
 
     pub(crate) fn matches(&self, vm: &Vm) -> bool {
-        core::ptr::eq(&*self.low.inner, &*vm.inner)
+        core::ptr::eq(&*self.low.gpuvm, &*vm.gpuvm)
     }
 
     pub(crate) fn roots(&self) -> [u64; 2] {
@@ -424,7 +427,7 @@ impl M5ExecutionContext {
         if self.published { return Err(EBUSY); }
         let roots = self.roots();
         {
-            let inner = self.slot.inner.lock()?;
+            let inner = self.slot.inner.lock();
             let slot = &inner.ttbs()[self.slot.context];
             if slot.ttb0.load(Ordering::Acquire) != 0
                 || slot.ttb1.load(Ordering::Acquire) != 0 {
@@ -443,7 +446,7 @@ impl M5ExecutionContext {
     pub(crate) fn is_current(&self) -> bool {
         if !self.published { return false; }
         let roots = self.roots();
-        let Ok(inner) = self.slot.inner.lock() else { return false; };
+        let inner = self.slot.inner.lock();
         let slot = &inner.ttbs()[self.slot.context];
         slot.ttb0.load(Ordering::Acquire) == roots[0]
             && slot.ttb1.load(Ordering::Acquire) == roots[1]
@@ -456,7 +459,7 @@ impl M5ExecutionContext {
     /// lower root is explicit again, once the new owner's graph is prepared.
     pub(crate) fn rebind(&mut self, vm: &Vm) -> Result {
         {
-            let owner = vm.inner.exec_lock(None, false)?;
+            let owner = vm.gpuvm.lock_inner();
             if owner.is_kernel || !core::ptr::eq(
                 Arc::as_ptr(&owner.uat_inner), Arc::as_ptr(&self.slot.inner),
             ) {
@@ -473,7 +476,8 @@ impl M5ExecutionContext {
     fn retract(&mut self) {
         if !self.published { return; }
         let roots = self.roots();
-        if let Ok(inner) = self.slot.inner.lock() {
+        {
+            let inner = self.slot.inner.lock();
             let slot = &inner.ttbs()[self.slot.context];
             // Only our exact pair may be retracted. VM owners remain alive
             // through root invalidation and the final ASID synchronization.
@@ -541,47 +545,23 @@ impl Vm {
         &self,
         addr: u64,
         size: usize,
-        gem: ARef<gem::Object>,
+        gem: &gem::Object,
         prot: Prot,
         guard_pages: usize,
     ) -> Result<KernelMapping> {
-        let reserved = guard_pages.checked_mul(UAT_PGSZ)
-            .and_then(|guard| size.checked_add(guard)).ok_or(EOVERFLOW)?;
-        self.map_at_reserving(addr, size, gem, prot, reserved)
+        if size != gem.size() {
+            return Err(EINVAL);
+        }
+        let guard = guard_pages.checked_mul(UAT_PGSZ).ok_or(EOVERFLOW)?;
+        let reserved = size.checked_add(guard).ok_or(EOVERFLOW)?;
+        let end = addr.checked_add(reserved as u64).ok_or(EOVERFLOW)?;
+        // The range holds exactly one placement, so this is a fixed-address
+        // mapping of the whole object followed by its guard reservation.
+        self.map_in_range_lowest(gem, 0..size, UAT_PGSZ as u64, addr..end, prot, guard)
     }
 }
 
 impl KernelMapping {
-    /// Borrow the mapped GEM subrange through a temporary CPU mapping.
-    ///
-    /// The caller must serialize CPU access with firmware or GPU writes. This
-    /// helper only owns the kernel VMap lifetime and applies the object offset
-    /// carried by this mapping.
-    pub(crate) fn with_cpu_bytes<R>(
-        &self,
-        f: impl FnOnce(&mut [u8]) -> Result<R>,
-    ) -> Result<R> {
-        let gem: &gem::Object = self.0._gem.as_deref().ok_or(EINVAL)?;
-        let end = self
-            .0
-            .offset
-            .checked_add(self.0.mapped_size)
-            .ok_or(EOVERFLOW)?;
-        if end > gem.size() {
-            return Err(ERANGE);
-        }
-        let vmap = gem.vmap::<u8>()?;
-        // SAFETY: the VMap covers the complete GEM allocation and the checked
-        // subrange is retained by this KernelMapping.
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                vmap.as_mut_ptr().add(self.0.offset),
-                self.0.mapped_size,
-            )
-        };
-        f(bytes)
-    }
-
     /// Map this shared GEM subrange into the end of another mapping's guards.
     /// The caller must keep GPU work quiescent until the complete resource
     /// update is published. Existing mappings are never removed or relocated.
@@ -598,43 +578,56 @@ impl KernelMapping {
         }
         let available = anchor.0.size().checked_sub(anchor.size() as u64).ok_or(EINVAL)?;
         if size as u64 > available { return Err(ENOSPC); }
-        let sgt = Arc::new(gem.owned_sg_table()?, GFP_KERNEL)?;
         let owner_ref = anchor.0.owner.clone();
-        let mut owner = owner_ref.exec_lock(Some(gem), false)?;
-        let vm_bo = owner_ref.obtain_bo(gem)?;
-        {
-            let mut guard = vm_bo.inner().inner.lock();
-            if guard.sgt.is_none() { guard.sgt.replace(sgt); }
-        }
+        // As in Vm::map_at_reserving: hold the backing and prepare the VM BO
+        // outside the VM reservation, and end the bound-device lease first.
+        let (_bind_lease, vm_bo) = {
+            let gate = crate::binding::lookup(&owner_ref.lock_inner().dev)?;
+            let binding = gate.enter()?;
+            let dev = binding.device();
+            let lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
+            let bo = owner_ref.obtain(
+                gem,
+                pin_init!(VmBoData {
+                    newest_bind: AtomicU64::new(0),
+                    segments <- new_mutex!(None),
+                }),
+            )?;
+            prepare_sgt_segments(dev, gem, &bo, &lease)?;
+            (lease, bo)
+        };
+        // SAFETY: no other UniqRefGpuVm exists, as in Vm::map_at_reserving.
+        let mut vm_exec = unsafe { owner_ref.exec_lock_vm(None, false)? };
+        let inner = vm_exec.unique_gpuvm.data();
         let mut vm_bo = Some(MappingBo::new(vm_bo, owner_ref.clone()));
         // As in map_at_with_guards, the fallible allocator operation must not
         // own DMA-reservation references whose Drop would reacquire this lock.
         let node = anchor.0.as_mut().split_tail(size as u64, KernelMappingInner {
-            owner: owner_ref.clone(), uat_inner: owner.uat_inner.clone(), prot,
+            owner: owner_ref.clone(), uat_inner: inner.uat_inner.clone(), prot,
             bo: None, _gem: None, offset: self.0.offset, mapped_size: size,
         });
         let mut node = match node {
             Ok(node) => node,
-            Err(error) => { drop(owner); return Err(error); }
+            Err(error) => { drop(vm_exec); return Err(error); }
         };
         {
-            let inner = node.as_mut().inner_mut();
-            inner.bo = vm_bo.take();
-            inner._gem = Some(gem::KernelMappingPin::new(gem));
+            let payload = node.as_mut().inner_mut();
+            payload.bo = vm_bo.take();
+            payload._gem = Some(gem::KernelMappingPin::new(gem));
         }
-        let mapped = owner.map_node(&node, prot);
+        let mapped = inner.map_node(&node, prot);
         if let Err(error) = mapped {
             // Restore reservation coverage before the temporary mapping is
             // dropped. Its normal Drop unmaps partial PTEs and invalidates
             // every live context; the detached node cannot free the guard.
             let rollback = anchor.0.as_mut().rejoin_tail(node.as_mut());
-            drop(owner);
-            drop(KernelMapping::new(node));
+            drop(vm_exec);
+            drop(KernelMapping(ManuallyDrop::new(node)));
             rollback?;
             return Err(error);
         }
-        drop(owner);
-        Ok(KernelMapping::new(node))
+        drop(vm_exec);
+        Ok(KernelMapping(ManuallyDrop::new(node)))
     }
 
     /// Undo a staged guard-tail alias before publication. Consume tails in
