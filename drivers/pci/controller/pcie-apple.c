@@ -177,6 +177,20 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define PORT_MSIMAP_ENABLE	BIT(31)
 #define PORT_MSIMAP_TARGET	GENMASK(7, 0)
 
+/* T6050: the root port's port logic, laid out as DesignWare's */
+#define RC_T6050_PORT_LINK_CTRL		0x710
+#define   RC_T6050_LINK_MODE		GENMASK(21, 16)
+#define RC_T6050_PORT_DEBUG0		0x728
+#define   RC_T6050_LTSSM_STATE		GENMASK(5, 0)
+#define   RC_T6050_LTSSM_L1_IDLE	0x14
+#define RC_T6050_LINK_WIDTH_SPEED_CTRL	0x80c
+#define   RC_T6050_LINK_WIDTH		GENMASK(12, 8)
+#define   RC_T6050_SPEED_CHANGE		BIT(17)
+#define RC_T6050_GEN3_RELATED		0x890
+#define   RC_T6050_RATE_SHADOW_SEL	GENMASK(25, 24)
+#define RC_T6050_MISC_CONTROL_1		0x8bc
+#define   RC_T6050_DBI_RO_WR_EN		BIT(0)
+
 /*
  * The doorbell address must be in the bottom 4GB because the base register
  * is only 32 bits wide. Exclude it from the IOVA range and share the same
@@ -422,6 +436,7 @@ struct apple_pcie_port {
 	void __iomem		*intr2axi;	/* adopt_link: this port's */
 	u16			adopted_rid;	/* adopt_link: secondary bus << 8 */
 	u32			adopted_sid;
+	void __iomem		*perst;		/* adopt_link: the PERST# pad, for a root-port reset */
 };
 
 static int apple_pcie_managed_admit(struct apple_pcie_port *port);
@@ -1721,6 +1736,331 @@ static int apple_pcie_adopt_link(struct apple_pcie_port *port)
 		return -EIO;
 	dev_info(pcie->dev, "adopted port %d, RID %04x -> SID %u, slot %u\n",
 		 port->idx, port->adopted_rid, port->adopted_sid, port->adopted_sid);
+	return 0;
+}
+
+/*
+ * T6050 port bring-up, for an adopted port whose endpoint must come back on a
+ * retrained link: port disable, the port reset table, port enable, root complex
+ * configuration for Gen3 x1, then the lane PHY, PERST# and the LTSSM. The port's
+ * registers are its port<n>, phy<n> and intr2axi<n> blocks; the root complex's
+ * are the root port's config space. The boot loader copies the port's tunables
+ * onto its node.
+ */
+static const struct apple_pcie_reset_reg apple_pcie_t6050_reset_regs[] = {
+	{ 0x088, 0x00000110 },
+	{ 0x100, 0xffffffff },
+	{ 0x148, 0xffffffff },
+	{ 0x210, 0xffffffff },
+	{ 0x080, 0x00000000 },
+	{ 0x084, 0x00000000 },
+	{ 0x104, 0xfffffff0 },
+	{ 0x124, 0x00000100 },
+	{ 0x16c, 0x00000000 },
+	{ 0x13c, 0x00000000 },
+	{ 0x800, 0x00100100 },
+	{ 0x808, 0x001001ff },
+	{ 0x82c, 0x00010000 },
+};
+
+/* Written after the RID2SID and MSI map tables are cleared */
+static const struct apple_pcie_reset_reg apple_pcie_t6050_reset_regs_late[] = {
+	{ 0x130, 0x03020000 },
+	{ 0x140, 0x00000010 },
+	{ 0x144, 0x00253770 },
+	{ 0x21c, 0x00000000 },
+	{ 0x834, 0x00000000 },
+	{ 0x83c, 0x00000000 },
+};
+
+static void apple_pcie_t6050_rmw(void __iomem *addr, u32 clear, u32 set)
+{
+	writel((readl(addr) & ~clear) | set, addr);
+}
+
+static int apple_pcie_t6050_rc_rmw(struct pci_dev *rp, int where, u32 clear, u32 set)
+{
+	u32 value;
+	int ret;
+
+	ret = pci_read_config_dword(rp, where, &value);
+	if (!ret)
+		ret = pci_write_config_dword(rp, where, (value & ~clear) | set);
+	return pcibios_err_to_errno(ret);
+}
+
+static int apple_pcie_t6050_wait(struct apple_pcie_port *port, void __iomem *base,
+				 u32 offset, u32 mask, u32 value, unsigned int timeout_us)
+{
+	u32 stat;
+	int ret;
+
+	ret = readl_poll_timeout(base + offset, stat, (stat & mask) == value, 1, timeout_us);
+	if (ret)
+		dev_err(port->pcie->dev, "port %d: %#x = %#x, waiting for %#x/%#x\n",
+			port->idx, offset, stat, value, mask);
+	return ret;
+}
+
+/*
+ * A tunable list the boot loader copies onto the root port node, groups of
+ * (offset, 4, mask, value): for the port's registers, or with @rp for the root
+ * port's config space. A list it did not copy is skipped.
+ */
+static int apple_pcie_t6050_tune(struct apple_pcie_port *port, struct pci_dev *rp,
+				 const char *name)
+{
+	u32 cells[64];
+	int count, ret, i;
+
+	if (!of_property_present(port->np, name))
+		return 0;
+	count = of_property_count_u32_elems(port->np, name);
+	if (count <= 0 || count > ARRAY_SIZE(cells) || count % 4)
+		return -EINVAL;
+	ret = of_property_read_u32_array(port->np, name, cells, count);
+	if (ret)
+		return ret;
+	for (i = 0; i < count; i += 4)
+		if (cells[i + 1] != 4 || (cells[i] & 3) ||
+		    cells[i] >= (rp ? PCI_CFG_SPACE_EXP_SIZE : SZ_16K))
+			return -EINVAL;
+
+	for (i = 0; i < count; i += 4) {
+		if (!rp) {
+			apple_pcie_t6050_rmw(port->base + cells[i], cells[i + 2], cells[i + 3]);
+			continue;
+		}
+		ret = apple_pcie_t6050_rc_rmw(rp, cells[i], cells[i + 2], cells[i + 3]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/* PERST# through its pad: a GPIO output (function bits cleared) at the level asked for */
+static int apple_pcie_t6050_perst(struct apple_pcie_port *port, bool asserted)
+{
+	u32 old, value;
+
+	old = readl(port->perst);
+	if (old & BIT(21))
+		return -EIO;
+	value = (old & ~0x27f) | 0x202 | !asserted;
+	/* The input enable (bit 9) goes on after the rest */
+	writel((value & ~0x200) | (old & 0x200), port->perst);
+	if (!(old & 0x200))
+		writel(value, port->perst);
+	return (readl(port->perst) ^ value) & 0x27f ? -EIO : 0;
+}
+
+/* Let the link go idle, hold the endpoint in reset and stop the port and its lane clocks */
+static int apple_pcie_t6050_port_disable(struct apple_pcie_port *port, struct pci_dev *rp)
+{
+	void __iomem *perst = port->base + PORT_T602X_PERST;
+	void __iomem *lane = port->phy + PHY_LANE_CFG;
+	u32 stat;
+	int ret, err;
+
+	if (!(readl(port->base + PORT_STATUS) & BIT(2))) {
+		ret = apple_pcie_t6050_wait(port, port->base, 0x820, BIT(2), BIT(2), 10000);
+		if (ret)
+			return ret;
+	}
+	ret = readl_poll_timeout_atomic(port->base + 0x820, stat,
+					!(stat & GENMASK(8, 0)) || !(stat & GENMASK(23, 16)),
+					1, 10000);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(port->base + 0x13c, 0, BIT(8));
+
+	/* The link out of L1 */
+	ret = read_poll_timeout_atomic(pci_read_config_dword, err,
+				       err || FIELD_GET(RC_T6050_LTSSM_STATE, stat) !=
+					      RC_T6050_LTSSM_L1_IDLE,
+				       5, 5000, false, rp, RC_T6050_PORT_DEBUG0, &stat);
+	if (ret || err)
+		return ret ?: pcibios_err_to_errno(err);
+
+	ret = apple_pcie_t6050_wait(port, port->base, 0xa8, BIT(0), BIT(0), 10000);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(perst, 0, BIT(24));
+	ret = apple_pcie_t6050_wait(port, port->base, 0xa8, BIT(16), BIT(16), 2000);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(perst, 0, BIT(16));
+	udelay(1);
+	apple_pcie_t6050_rmw(perst, PORT_PERST_OFF, 0);
+	udelay(1);
+	apple_pcie_t6050_rmw(perst, BIT(24), 0);
+	apple_pcie_t6050_rmw(port->base + 0x13c, BIT(8), 0);
+
+	apple_pcie_t6050_rmw(lane, BIT(31), 0);
+	apple_pcie_t6050_rmw(lane, BIT(10), 0);
+	apple_pcie_t6050_rmw(lane, BIT(9), 0);
+	apple_pcie_t6050_rmw(lane, 0, BIT(4));
+	apple_pcie_t6050_rmw(lane, PHY_LANE_CFG_REFCLK0REQ, 0);
+	apple_pcie_t6050_rmw(lane, PHY_LANE_CFG_REFCLK1REQ, 0);
+
+	writel(~0, port->base + PORT_INTSTAT);
+	apple_pcie_t6050_rmw(port->base + PORT_APPCLK, PORT_APPCLK_EN, 0);
+	return apple_pcie_t6050_wait(port, port->base, PORT_STATUS, PORT_STATUS_READY, 0,
+				     250000);
+}
+
+/* The port reset table, then the port clocked and out of reset, ready to train */
+static int apple_pcie_t6050_port_enable(struct apple_pcie_port *port)
+{
+	void __iomem *perst = port->base + PORT_T602X_PERST;
+	u32 stat;
+	int ret, i;
+
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_t6050_reset_regs); i++)
+		writel(apple_pcie_t6050_reset_regs[i].value,
+		       port->base + apple_pcie_t6050_reset_regs[i].offset);
+	for (i = 0; i < port->pcie->hw->max_rid2sid; i++)
+		writel(0, port->base + port_rid2sid_offset(port, i));
+	for (i = 0; i < 256; i++)
+		writel(0, port->base + PORT_T602X_MSIMAP + 4 * i);
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_t6050_reset_regs_late); i++)
+		writel(apple_pcie_t6050_reset_regs_late[i].value,
+		       port->base + apple_pcie_t6050_reset_regs_late[i].offset);
+
+	if (!(readl(perst) & BIT(16)))
+		return -EIO;
+	ret = apple_pcie_t6050_tune(port, NULL, "apple,apcie-config-tunables");
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(port->base + PORT_APPCLK, 0, PORT_APPCLK_EN);
+
+	ret = readl_poll_timeout_atomic(port->base + 0xa8, stat,
+					(stat & (BIT(16) | BIT(0))) != (BIT(16) | BIT(0)),
+					1, 10000);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(perst, 0, PORT_PERST_OFF);
+	ret = apple_pcie_t6050_wait(port, port->base, 0xa8, BIT(0), BIT(0), 20000);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(perst, BIT(16), 0);
+	ret = apple_pcie_t6050_wait(port, port->base, PORT_STATUS, PORT_STATUS_READY,
+				    PORT_STATUS_READY, 250000);
+	if (ret)
+		return ret;
+
+	apple_pcie_t6050_rmw(port->base + PORT_APPCLK, 0, PORT_APPCLK_CGDIS);
+	return apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, PORT_LINKSTS_BUSY, 0,
+				     250000);
+}
+
+/* Root complex tunables and a Gen3 x1 link, with the read-only registers opened for it */
+static int apple_pcie_t6050_port_configure(struct apple_pcie_port *port, struct pci_dev *rp)
+{
+	static const char * const shadow[] = {
+		"apple,pcie-rc-gen3-shadow-tunables",
+		"apple,pcie-rc-gen4-shadow-tunables",
+		"apple,pcie-rc-gen5-shadow-tunables",
+	};
+	static const u32 shadow_sel[] = { 0, BIT(24), 0 };
+	int cap = pci_pcie_cap(rp);
+	u32 value;
+	u16 ctl2;
+	int ret, err, i;
+
+	if (!cap)
+		return -EIO;
+	ret = apple_pcie_t6050_rc_rmw(rp, RC_T6050_MISC_CONTROL_1, 0, RC_T6050_DBI_RO_WR_EN);
+	if (ret)
+		return ret;
+	ret = apple_pcie_t6050_tune(port, rp, "apple,pcie-rc-tunables");
+	if (ret)
+		goto lock;
+	for (i = 0; i < ARRAY_SIZE(shadow); i++) {
+		ret = apple_pcie_t6050_rc_rmw(rp, RC_T6050_GEN3_RELATED,
+					      RC_T6050_RATE_SHADOW_SEL, shadow_sel[i]) ?:
+		      apple_pcie_t6050_tune(port, rp, shadow[i]);
+		if (ret)
+			goto lock;
+	}
+	ret = apple_pcie_t6050_rc_rmw(rp, 0x194, 0, BIT(0));
+	if (ret)
+		goto lock;
+
+	ret = pcibios_err_to_errno(pci_read_config_dword(rp, cap + PCI_EXP_LNKCAP2, &value));
+	if (ret)
+		goto lock;
+	if (!(value & PCI_EXP_LNKCAP2_SLS_8_0GB)) {
+		ret = -EIO;
+		goto lock;
+	}
+	ret = pcibios_err_to_errno(pci_read_config_word(rp, cap + PCI_EXP_LNKCTL2, &ctl2)) ?:
+	      pcibios_err_to_errno(pci_write_config_word(rp, cap + PCI_EXP_LNKCTL2,
+							 (ctl2 & ~PCI_EXP_LNKCTL2_TLS) |
+							 PCI_EXP_LNKCTL2_TLS_8_0GT)) ?:
+	      apple_pcie_t6050_rc_rmw(rp, RC_T6050_PORT_LINK_CTRL, RC_T6050_LINK_MODE,
+				      FIELD_PREP(RC_T6050_LINK_MODE, 1)) ?:
+	      apple_pcie_t6050_rc_rmw(rp, RC_T6050_LINK_WIDTH_SPEED_CTRL, RC_T6050_LINK_WIDTH,
+				      FIELD_PREP(RC_T6050_LINK_WIDTH, 1)) ?:
+	      apple_pcie_t6050_rc_rmw(rp, cap + PCI_EXP_LNKCAP, PCI_EXP_LNKCAP_MLW,
+				      FIELD_PREP(PCI_EXP_LNKCAP_MLW, 1));
+lock:
+	err = apple_pcie_t6050_rc_rmw(rp, RC_T6050_MISC_CONTROL_1, RC_T6050_DBI_RO_WR_EN, 0);
+	ret = ret ?: err;
+	if (ret)
+		return ret;
+
+	ret = apple_pcie_t6050_rc_rmw(rp, cap + PCI_EXP_LNKCTL, 0, PCI_EXP_LNKCTL_LBMIE) ?:
+	      apple_pcie_t6050_rc_rmw(rp, RC_T6050_LINK_WIDTH_SPEED_CTRL, 0, RC_T6050_SPEED_CHANGE);
+	if (ret)
+		return ret;
+	writel(PCIEC_INTR2AXI_ENABLE, port->intr2axi + PCIEC_INTR2AXI_CTRL);
+	return 0;
+}
+
+/* Disable, reset, enable and configure an adopted port whose endpoint is held in PERST# */
+static int __maybe_unused apple_pcie_t6050_port_restart(struct apple_pcie_port *port,
+							struct pci_dev *rp)
+{
+	return apple_pcie_t6050_port_disable(port, rp) ?:
+	       apple_pcie_t6050_port_enable(port) ?:
+	       apple_pcie_t6050_port_configure(port, rp);
+}
+
+/* Lane clocks, PERST# released, then the LTSSM to link up */
+static int __maybe_unused apple_pcie_t6050_port_train(struct apple_pcie_port *port)
+{
+	void __iomem *lane = port->phy + PHY_LANE_CFG;
+	int ret;
+
+	apple_pcie_t6050_rmw(lane, 0, PHY_LANE_CFG_REFCLK0REQ);
+	ret = apple_pcie_t6050_wait(port, port->phy, PHY_LANE_CFG, PHY_LANE_CFG_REFCLK0ACK,
+				    PHY_LANE_CFG_REFCLK0ACK, 500000);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(lane, 0, PHY_LANE_CFG_REFCLK1REQ);
+	ret = apple_pcie_t6050_wait(port, port->phy, PHY_LANE_CFG, PHY_LANE_CFG_REFCLK1ACK,
+				    PHY_LANE_CFG_REFCLK1ACK, 500000);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(lane, BIT(4), 0);
+	udelay(1);
+	apple_pcie_t6050_rmw(lane, 0, BIT(9));
+	apple_pcie_t6050_rmw(lane, 0, BIT(10));
+
+	/* Tperst-clk is at least 100 us (PCIe CEM r5.0, 2.9.2) */
+	usleep_range(100, 110);
+	ret = apple_pcie_t6050_perst(port, false);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_rmw(port->base + PORT_LTSSMCTL, 0, PORT_LTSSMCTL_START);
+	ret = apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, PORT_LINKSTS_UP,
+				    PORT_LINKSTS_UP, 500000);
+	if (ret)
+		return ret;
+
+	/* Wait for 100ms after the link trains (PCIe r5.0, 6.6.1) */
+	msleep(100);
 	return 0;
 }
 
