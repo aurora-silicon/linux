@@ -28,6 +28,17 @@ static inline bool dcp_fabric_callback_valid(u64 route, u64 admitted)
 	return admitted && admitted == route;
 }
 
+/*
+ * T8132 dcpext: whether its tunnel pixel clock stands refused after a
+ * SetLinkRate of @rate that returned @ret, @refused before it. A stop (rate
+ * 0), failed or not, is no usable clock and leaves a refusal as it is; only
+ * a nonzero rate taken clears one. The route's release clears it apart.
+ */
+static inline bool dcp_fabric_clock_refused(bool refused, u32 rate, int ret)
+{
+	return rate ? ret != 0 : refused;
+}
+
 struct dcp_fabric_drain_ops {
 	void (*reserve_revoke)(void *ctx);
 	void (*invalidate)(void *ctx);
