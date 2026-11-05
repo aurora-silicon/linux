@@ -372,8 +372,11 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active) {
 		ret = dcp_crtc_atomic_modeset(crtc, commit);
-		if (ret)
+		if (ret) {
+			if (dcp_is_ext26(dcp))
+				goto failed;
 			dcp_drm_crtc_error(apple_crtc, crtc_state, ret);
+		}
 	}
 	dcp_typec_follow_done(locked);
 	return;

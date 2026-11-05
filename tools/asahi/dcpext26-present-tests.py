@@ -19,6 +19,8 @@ typedef uint32_t u32;typedef uint64_t u64;
 #define WRITE_ONCE(x,y) ((x)=(y))
 #define DCP_FW_NAME(n) n
 #define DCP_FW_UNION(x) ((x).h17p)
+#define DCP_FW_SWAP(d) ((d)->swap.h17p)
+#define DCP_FW_DESKTOP_26(x) 0
 #define dev_err(...) ((void)0)
 #define trace_iomfb_swap_submit(...) ((void)0)
 struct dc_swap_complete_resp { u32 swap_id; };

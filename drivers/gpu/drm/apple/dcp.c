@@ -5241,6 +5241,36 @@ static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 	return 0;
 }
 
+static int dcp_ext26_start_resident(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	u32 control;
+	int ret;
+
+	ret = dcp_pin_live_session(dcp);
+	if (ret)
+		return ret;
+	control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
+	if (IS_ERR(dcp->rtk))
+		return dev_err_probe(dev, PTR_ERR(dcp->rtk), "native26 RTKit mailbox initialization failed\n");
+	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
+	if (ret)
+		return ret;
+	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN)) {
+		writel(control | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		dev_dbg(dev, "native26 resident ASC started once after RTKit mailbox initialization\n");
+	}
+	ret = control & APPLE_DCP_COPROC_CPU_CONTROL_RUN ?
+		apple_rtkit_wake(dcp->rtk) : apple_rtkit_boot(dcp->rtk);
+	dev_dbg(dev, "native26 initial RTKit %s result=%d control=%#x status=%#x\n",
+		 control & APPLE_DCP_COPROC_CPU_CONTROL_RUN ? "warm INIT" : "resident boot",
+		 ret, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
+		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+	return ret;
+}
+
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;

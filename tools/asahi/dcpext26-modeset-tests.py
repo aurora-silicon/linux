@@ -75,6 +75,8 @@ static struct drm_crtc_state *drm_atomic_get_new_crtc_state(struct drm_atomic_co
 static unsigned drm_crtc_mask(struct drm_crtc *c){return 1;}
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static unsigned done,woken,notified,invalidated,powered,programmed;
+static unsigned classic_errors;
+static void dcp_drm_crtc_error(struct apple_crtc *c, struct drm_crtc_state *s, int error){assert(error);classic_errors++;}
 static int mode_error;
 static int dcp_typec_follow_crtc(struct drm_crtc *c,struct drm_atomic_commit *a,bool *locked){*locked=true;return 0;}
 static void dcp_typec_follow_done(bool locked){assert(locked);done++;}
@@ -104,7 +106,7 @@ int main(void){
  apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated);
  // Existing non-native error policy is preserved.
  d.native=false;done=woken=notified=invalidated=0;mode_error=-EIO;
- apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated);
+ apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&classic_errors==1);
 }
 '''
 with tempfile.TemporaryDirectory() as t:
