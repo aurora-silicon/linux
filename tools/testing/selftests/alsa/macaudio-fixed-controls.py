@@ -18,7 +18,7 @@ import tempfile
 
 
 def function(source, name):
-    match = re.search(r"^(?:static (?:inline )?)?(?:int|bool|void) " + name +
+    match = re.search(r"^(?:static (?:inline )?)?(?:(?:int|bool|void) |const char \*)" + name +
                       r"\(.*?^\}", source, re.M | re.S)
     if not match:
         raise ValueError("missing source function: " + name)
@@ -62,7 +62,7 @@ struct snd_kcontrol {
 };
 struct snd_card { int controls_rwsem; struct snd_kcontrol *controls; };
 enum { AMP_NONE, AMP_TAS5770, AMP_SN012776, AMP_SSM3515, AMP_MAX98360A };
-struct macaudio_platform_cfg { int amp, amp_gain; bool stereo; };
+struct macaudio_platform_cfg { int amp, amp_gain; bool stereo; const char *tweeter_hpf_granted; };
 struct macaudio_snd_data { bool has_speakers; struct macaudio_platform_cfg *cfg; };
 struct snd_soc_card { struct snd_card *snd_card; struct macaudio_snd_data *data; };
 static int please_blow_up_my_speakers;
@@ -199,6 +199,9 @@ def main():
         parts.append(function(ma, "macaudio_deny_write"))
     if "static int macaudio_set_fixed_enum(" in ma:
         parts.append(function(ma, "macaudio_set_fixed_enum"))
+    if "static const char *macaudio_speaker_hpf(" in ma:
+        parts += re.findall(r"^#define MACAUDIO_\w*HPF\w*\s.*$", ma, re.M)
+        parts.append(function(ma, "macaudio_speaker_hpf"))
     parts += [ma[ma.index("#define CHECK(call,"):ma.index("static int macaudio_set_speaker(")],
               function(ma, "macaudio_set_speaker"), MAIN]
     with tempfile.TemporaryDirectory(prefix="macaudio-fixed-") as temp:
