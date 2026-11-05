@@ -251,8 +251,6 @@ pub(crate) struct VmShrinker {
 // SAFETY: shrinker core serializes registration lifetime; callback VM operations
 // use its residency/reservation locks. raw is never dereferenced after free.
 unsafe impl Send for VmShrinker {}
-// SAFETY: Shared callbacks use the VM's residency/reservation locks. The
-// registration remains live until shrinker_free has drained all callbacks.
 unsafe impl Sync for VmShrinker {}
 
 impl VmShrinker {
@@ -266,7 +264,7 @@ impl VmShrinker {
         )?;
         // SAFETY: The format is static and has no format arguments.
         let raw =
-            unsafe { kernel::bindings::shrinker_alloc(0, c_str!("aurora-idle-vm").as_char_ptr()) };
+            unsafe { kernel::bindings::shrinker_alloc(0, c_str!("asahi-idle-vm").as_char_ptr()) };
         if raw.is_null() {
             return Err(ENOMEM);
         }
@@ -275,7 +273,7 @@ impl VmShrinker {
         unsafe {
             (*raw).count_objects = Some(Self::count);
             (*raw).scan_objects = Some(Self::scan);
-            (*raw).private_data = core::ptr::from_ref(&*owner).cast_mut().cast();
+            (*raw).private_data = (&*owner as *const Self).cast_mut().cast();
             (*raw).seeks = 2;
             (*raw).batch = 256;
             kernel::bindings::shrinker_register(raw);
@@ -283,36 +281,23 @@ impl VmShrinker {
         Ok(owner)
     }
 
-    /// Count reclaimable pages.
-    ///
-    /// # Safety
-    ///
-    /// `raw` must be this owner's live registered shrinker. The core must
-    /// retain its private data until the callback returns.
     unsafe extern "C" fn count(
         raw: *mut kernel::bindings::shrinker,
         _sc: *mut kernel::bindings::shrink_control,
     ) -> kernel::ffi::c_ulong {
         // SAFETY: The registration owns this stable allocation until callbacks drain.
         let owner = unsafe { &*((*raw).private_data as *const Self) };
-        owner.vm.idle_reclaim_count()
+        owner.vm.idle_reclaim_count() as _
     }
 
-    /// Reclaim idle pages.
-    ///
-    /// # Safety
-    ///
-    /// `raw` must be this owner's live registered shrinker, and `sc` must
-    /// point to the initialized control supplied by the shrinker core.
     unsafe extern "C" fn scan(
         raw: *mut kernel::bindings::shrinker,
         sc: *mut kernel::bindings::shrink_control,
     ) -> kernel::ffi::c_ulong {
         // SAFETY: Both pointers are supplied by the registered shrinker core.
         let owner = unsafe { &*((*raw).private_data as *const Self) };
-        // SAFETY: The shrinker core supplies a live initialized control.
-        let target = unsafe { (*sc).nr_to_scan };
-        owner.vm.reclaim_idle_pages(target)
+        let target = unsafe { (*sc).nr_to_scan } as usize;
+        owner.vm.reclaim_idle_pages(target) as _
     }
 }
 
@@ -363,7 +348,7 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .is_none_or(|status| status.get() != 0)
+            .map_or(true, |status| status.get() != 0)
         {
             return 0;
         }
@@ -376,17 +361,11 @@ impl Vm {
         // this reservation; linked aliases retain their borrowed BO and GEM.
         let _ = unsafe { inner.for_each_private_bo(|_, bo| {
             let object = bo.obj();
-            // Count retained backing on idle VMs, and purgeable contents even if idle
-            // reclaim already released the table. Never wait on the BO mutex under resv.
-            let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
-            let advised = object.madv_locked() > 0;
-            let releasable = if segments.is_some() {
-                object.sole_sg_lease_releasable_locked()
-            } else {
-                (advised || object.has_sg_table_locked())
-                    && object.unleased_pages_releasable_locked()
-            };
-            if object.idle_reclaim_candidate() && (advised || idle) && releasable {
+            // Purgeable objects count on busy VMs too; idle backing only on idle ones.
+            if object.idle_reclaim_candidate()
+                && (object.madv_locked() > 0 || idle)
+                && object.sole_sg_lease_releasable_locked()
+            {
                 pages = pages.saturating_add(object.size() / kernel::page::PAGE_SIZE);
             }
             Ok(true)
@@ -406,7 +385,7 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .is_none_or(|status| status.get() != 0)
+            .map_or(true, |status| status.get() != 0)
         {
             return 0;
         }
@@ -417,7 +396,7 @@ impl Vm {
         let Some(shared) = uat.shared.try_lock() else {
             return 0;
         };
-        let contexts = shared.contexts_naming_root(inner.ttb(), inner.uat_inner.m4_adopted);
+        let contexts = shared.contexts_naming_root(inner.ttb());
         let mut purged = 0usize;
         // SAFETY: The private reservation excludes binding edits and restoration.
         // Callbacks change PTEs/flags only; all aliases stay linked.
@@ -429,12 +408,9 @@ impl Vm {
             }
             {
                 let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
-                let releasable = if segments.is_some() {
-                    object.sole_sg_lease_releasable_locked()
-                } else {
-                    object.unleased_pages_releasable_locked()
-                };
-                if !releasable { return Ok(true); }
+                if segments.is_some() && !object.sole_sg_lease_releasable_locked() {
+                    return Ok(true);
+                }
             }
             // Any mutation that does not end in a completed purge leaves
             // INVALIDATED aliases with cleared PTEs while madv stays >= 0, so
@@ -491,7 +467,7 @@ impl Vm {
         if self
             .status
             .as_ref()
-            .is_none_or(|status| status.get() != 0)
+            .map_or(true, |status| status.get() != 0)
             || !self
                 .lifetime
                 .as_ref()
@@ -506,7 +482,7 @@ impl Vm {
         let Some(shared) = uat.shared.try_lock() else {
             return purged;
         };
-        let contexts = shared.contexts_naming_root(inner.ttb(), inner.uat_inner.m4_adopted);
+        let contexts = shared.contexts_naming_root(inner.ttb());
         let mut unpinned = 0usize;
         // SAFETY: Exclusive residency and the private reservation exclude jobs,
         // binding edits and retirement. Callbacks change PTEs/flags only; all
@@ -518,14 +494,9 @@ impl Vm {
             {
                 // Avoid inversion against preparation (VmBoInner -> resv).
                 let Some(segments) = bo.data().segments.try_lock() else { return Ok(true); };
-                let releasable = if segments.is_some() {
-                    object.sole_sg_lease_releasable_locked()
-                } else {
-                    // A competing lease may have made the previous release fail after we
-                    // dropped our segments. Retry that table, but do not count empty backing.
-                    object.has_sg_table_locked() && object.unleased_pages_releasable_locked()
-                };
-                if !releasable { return Ok(true); }
+                if segments.is_none() || !object.sole_sg_lease_releasable_locked() {
+                    return Ok(true);
+                }
             }
             // The association retains SG backing until *all* aliases have
             // been invalidated and their device translations flushed. A

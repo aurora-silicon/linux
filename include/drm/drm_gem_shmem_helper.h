@@ -38,13 +38,6 @@ struct drm_gem_shmem_object {
 	bool reclaimable_cpu_mappings;
 
 	/**
-	 * @pages_no_reclaim: Disable direct reclaim during backing population.
-	 * Set before drm_gem_shmem_init(). Drivers that can fail a large pin
-	 * request cheaply may opt in; background reclaim remains enabled.
-	 */
-	bool pages_no_reclaim;
-
-	/**
 	 * @cpu_pages: Pages populated one at a time by CPU faults on revocable
 	 * VMAs while no device mapping holds @pages. Sparse; under base.resv.
 	 */
@@ -152,9 +145,7 @@ int drm_gem_shmem_madvise_locked(struct drm_gem_shmem_object *shmem, int madv);
 static inline bool drm_gem_shmem_is_purgeable(struct drm_gem_shmem_object *shmem)
 {
 	return (shmem->madv > 0) &&
-		!refcount_read(&shmem->pages_pin_count) &&
-		!refcount_read(&shmem->vmap_use_count) &&
-		refcount_read(&shmem->pages_use_count) == !!shmem->sgt &&
+		!refcount_read(&shmem->pages_pin_count) && shmem->sgt &&
 		!shmem->base.dma_buf && !drm_gem_is_imported(&shmem->base);
 }
 
@@ -167,10 +158,6 @@ struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_shmem_object *shmem)
 
 void drm_gem_shmem_print_info(const struct drm_gem_shmem_object *shmem,
 			      struct drm_printer *p, unsigned int indent);
-
-int drm_gem_shmem_create_with_handle(struct drm_file *file_priv,
-				     struct drm_device *dev, size_t size,
-				     uint32_t *handle);
 
 extern const struct vm_operations_struct drm_gem_shmem_vm_ops;
 

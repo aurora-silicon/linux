@@ -11,11 +11,7 @@ use kernel::{dma_fence::RawDmaFence, prelude::*, sync::Arc};
 
 impl Backend {
     pub(in crate::g17) fn timeout_render(&self, packet: &Arc<Packet>) -> Result {
-        // Without a collector the watchdog expires again and retries: memory
-        // pressure must not stop the runtime for every client.
-        let Ok(mut deferred) = DeferredBatch::worker() else {
-            return Ok(());
-        };
+        let mut deferred = DeferredBatch::worker()?;
         let result = {
             let mut state = self.shared.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
@@ -37,7 +33,7 @@ impl Backend {
             kernel::bindings::dma_fence_wait_timeout(
                 fence.raw(),
                 false,
-                kernel::time::msecs_to_jiffies(2000) as isize,
+                kernel::time::msecs_to_jiffies(2000) as _,
             )
         };
         if completed > 0 {
@@ -79,20 +75,6 @@ impl crate::g17::Firmware {
             }
             let generation = self.recovery.generation();
             let state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
-            if error == ETIMEDOUT {
-                let qids = pair.qids();
-                let stamps = [
-                    self.init.stamp(qids[0])?.load(core::sync::atomic::Ordering::Relaxed),
-                    self.init.stamp(qids[1])?.load(core::sync::atomic::Ordering::Relaxed),
-                ];
-                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-                if let Some(pair) = self.queues.render.entries[slot]
-                    .as_mut()
-                    .and_then(|entry| entry.pair.as_mut())
-                {
-                    pair.expire_stamp_wait(packet, stamps, state)?;
-                }
-            }
             let progressed = self.with_render(slot, |pair, host| {
                 pair.retire(None, generation, state, host, &mut |event| {
                     deferred.push(event)
@@ -139,14 +121,6 @@ impl crate::g17::Firmware {
             .find(|pair| pair.qids().contains(&qid))
             .and_then(|pair| pair.oldest_packet());
         if let Some(packet) = packet {
-            // Unclassified work counts as innocent, and a blamed group must never be replayed.
-            // Work an earlier recovery spared is collateral here (classify() blames before its
-            // collateral check) and stays spared, so its failure stays non-sticky; the blame
-            // itself is recorded apart from the class, and refuses any replay of it.
-            packet.completion.note_blamed();
-            if !packet.completion.spared() {
-                packet.completion.classify(crate::g17::recovery::Class::Guilty);
-            }
             self.fail_render_packet(&packet, error, deferred)?;
         }
         Ok(())

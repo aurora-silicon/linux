@@ -4,7 +4,6 @@
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
 
 mod alloc;
-mod binding;
 mod buffer;
 mod channel;
 mod cleanup;
@@ -14,20 +13,19 @@ mod event;
 mod file;
 mod float;
 mod fw;
-mod fwid;
+mod gem;
+mod g17;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 mod g15;
-mod g17;
-mod gem;
-
-#[cfg(CONFIG_DRM_ASAHI_G16)]
-mod g16;
+// Without the G15 backend, only the UAT adoption the T8122 runtime shares with it.
+#[cfg(all(CONFIG_DRM_ASAHI_UAT_ADOPTION, not(CONFIG_DRM_ASAHI_G15)))]
+#[path = "g15/adopt.rs"]
+mod g15;
 mod gpu;
 mod hw;
 mod initdata;
-mod m3;
 mod mem;
-mod memacct;
+mod m3;
 mod microseq;
 mod mmu;
 mod object;
@@ -36,10 +34,7 @@ mod queue;
 mod regs;
 mod slotalloc;
 mod stats;
-mod stats_raw;
 mod sysfs_exports;
-mod timestamp;
-mod usage;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
@@ -51,33 +46,12 @@ use kernel::prelude::*;
 type G15Registration =
     kernel::driver::Registration<kernel::platform::Adapter<g15::Driver<'static>>>;
 
-#[cfg(CONFIG_DRM_ASAHI_G16)]
-type G16Registration = kernel::driver::Registration<kernel::platform::Adapter<g16::Driver>>;
-#[cfg(not(CONFIG_DRM_ASAHI_G16))]
-type G16Registration = ();
-
-fn register_g16(module: &'static kernel::ThisModule) -> Result<Option<Pin<KBox<G16Registration>>>> {
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    {
-        Ok(Some(KBox::pin_init(
-            kernel::driver::Registration::new(g16::DRIVER_NAME, module),
-            GFP_KERNEL,
-        )?))
-    }
-    #[cfg(not(CONFIG_DRM_ASAHI_G16))]
-    {
-        let _ = module;
-        Ok(None)
-    }
-}
-
 #[pin_data]
 struct DriverModule {
     #[cfg(CONFIG_DRM_ASAHI_G15)]
     #[pin]
     _g15: G15Registration,
     // Field drop order unregisters/joins driver producers before queue teardown.
-    _g16: Option<Pin<KBox<G16Registration>>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
     _cleanup: cleanup::QueueOwner,
@@ -87,18 +61,15 @@ struct DriverModule {
 
 impl kernel::InPlaceModule for DriverModule {
     fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
-        // SAFETY: Module init runs once, before either adapter is registered below.
-        unsafe { binding::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
             #[cfg(CONFIG_DRM_ASAHI_G15)]
-            _g15 <- kernel::driver::Registration::new(c"aurora-g15", module),
+            _g15 <- kernel::driver::Registration::new(c"asahi-g15", module),
             _driver <- kernel::driver::Registration::new(
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
             ),
-            _g16: register_g16(module)?,
             // All fallible fields are initialized. This final unit initializer cannot fail.
             #[cfg(CONFIG_DRM_ASAHI_G15)]
             _g15_ready: g15::activate(),
@@ -108,10 +79,9 @@ impl kernel::InPlaceModule for DriverModule {
 
 module! {
     type: DriverModule,
-    name: "aurora",
+    name: "asahi",
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
-    alias: ["asahi"],
     params: {
         debug_flags: u64 {
             default: 0,
@@ -173,6 +143,22 @@ module! {
             default: 3072,
             description: "G15: PB growth maximum given to the firmware, 128 KiB blocks (64..4095)",
         },
+        g15_pb_blocks: u32 {
+            default: 64,
+            description: "G15: PB blocks posted at (re)initialization, 128 KiB each (64..4095)",
+        },
+        g15_pb_reclaim: u32 {
+            default: 2,
+            description: "G15: PB reclaim when idle: 0 never, 1 re-initialize, 2 also free backing",
+        },
+        g15_pb_idle_ms: u32 {
+            default: 1000,
+            description: "G15: idle time before a PB reclaim, ms (at least 100)",
+        },
+        g15_pb_reclaim_blocks: u32 {
+            default: 1024,
+            description: "G15: PB blocks posted above which an idle engine reclaims the PB",
+        },
         g15_early_tiling: u32 {
             default: 0,
             description: "G15: advertise FRAGMENT_BARRIERS, mapped to early tiling (slower on 2419)",
@@ -185,42 +171,6 @@ module! {
             default: 1,
             // permissions: 0,
             description: "Export AGX firmware stats to sysfs (1 = on, 0 = off)",
-        },
-        mem_limit_pct: u32 {
-            default: 67,
-            description: "Device-wide GPU memory limit in percent of RAM (0 or >= 100: none)",
-        },
-        client_mem_limit_pct: u32 {
-            default: 50,
-            description: "Per-client GPU memory limit in percent of RAM (0: the device limit)",
-        },
-        oom_attribution: u8 {
-            default: 1,
-            description: "Count held GPU memory in its creator's RSS for the OOM killer (1 = on)",
-        },
-        g16_deadline_ms: u32 {
-            default: 5000,
-            description: "G16: administrative completion-stamp deadline, ms (0 disables; long running work can exceed it)",
-        },
-        g16_compute_deadline_ms: u32 {
-            default: 5000,
-            description: "G16: compute completion-stamp deadline, ms (0 permits unbounded compute; firmware recovery stays active)",
-        },
-        g16_repoll_us: u32 {
-            default: 15,
-            description: "G16: repoll interval while publication waits for record consumption, us",
-        },
-        g16_resnap_us: u32 {
-            default: 100,
-            description: "G16: completion repoll interval, us",
-        },
-        g16_recovery: u32 {
-            default: 1,
-            description: "G16: answer qualified firmware recovery handshakes",
-        },
-        g16_stream_gate: u32 {
-            default: 1,
-            description: "G16: validate CDM/VDM stream records",
         },
     },
 }

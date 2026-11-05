@@ -19,7 +19,7 @@ fn identity(mut config: QueueConfig) -> QueueConfig {
     config.qos_update = 0;
     config
 }
-pub(in crate::g17::queue) fn required(previous: Option<QueueConfig>, config: QueueConfig) -> bool {
+pub(super) fn required(previous: Option<QueueConfig>, config: QueueConfig) -> bool {
     config.install != 0
         || config.context_update != 0
         || config.completion_seed_valid != 0
@@ -28,9 +28,9 @@ pub(in crate::g17::queue) fn required(previous: Option<QueueConfig>, config: Que
 }
 
 pub(super) struct Lane<'a> {
-    items: [&'a AtomicU64; 4],
+    items: [&'a AtomicU64; 3],
     producer: &'a AtomicU32,
-    values: [u64; 4],
+    values: [u64; 3],
     config: QueueConfig,
     config_destination: *mut u64,
     config_present: bool,
@@ -41,10 +41,6 @@ pub(super) struct Lane<'a> {
     pub(super) window: Window,
 }
 impl<'a> Lane<'a> {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The publication lane describes independent fields of the firmware wire record."
-    )]
     pub(super) fn new(
         graph: &'a memory::Graph,
         stage: usize,
@@ -53,9 +49,8 @@ impl<'a> Lane<'a> {
         config: QueueConfig,
         present: bool,
         timestamp: KickTimestamp,
-        lead: bool,
     ) -> Result<Self> {
-        let count = 2 + u32::from(present) + u32::from(lead);
+        let count = 2 + u32::from(present);
         let window = Window::new(base, count, ITEM_RING_ENTRIES)?;
         let offset = ordinal as usize % memory::RECORDS;
         let config_offset = memory::CONFIG[stage] + offset * memory::CONFIG_STRIDE;
@@ -77,30 +72,21 @@ impl<'a> Lane<'a> {
             graph.queues.dword(index(0))?,
             graph.queues.dword(index(1))?,
             graph.queues.dword(index(2))?,
-            graph.queues.dword(index(3))?,
         ];
         let announce_va = graph.queues.gpu_va() + announce_offset as u64;
         let descriptor = graph.descriptor_va(stage, ordinal);
-        // Item order: [lead command], descriptor, [configuration], announcement.
-        let mut values = [0; 4];
-        let mut n = 0;
-        let mut push = |value: u64| {
-            values[n] = value;
-            n += 1;
+        let values = if present {
+            [
+                descriptor,
+                graph.config.gpu_va() + config_offset as u64,
+                announce_va,
+            ]
+        } else {
+            [descriptor, announce_va, 0]
         };
-        if lead {
-            push(graph.config.gpu_va() + (config_offset + memory::LEAD) as u64);
-        }
-        push(descriptor);
-        if present {
-            push(graph.config.gpu_va() + config_offset as u64);
-        }
-        push(announce_va);
         Ok(Self {
             items,
-            producer: graph
-                .queues
-                .word(memory::POINTERS[stage] + graph.pointers.producer)?,
+            producer: graph.queues.word(memory::POINTERS[stage] + 0x40)?,
             values,
             config,
             config_destination,
@@ -130,7 +116,7 @@ impl<'a> Lane<'a> {
         if !self.config_present {
             return;
         }
-        let source = core::ptr::from_ref(&self.config).cast::<u64>();
+        let source = (&self.config as *const QueueConfig).cast::<u64>();
         for index in 0..size_of::<QueueConfig>() / 8 {
             // SAFETY: QueueConfig is packed integer storage with no padding;
             // every source qword is read unaligned. The destination is a

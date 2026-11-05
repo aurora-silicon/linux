@@ -25,10 +25,8 @@
 //! [`clean_lower`] for the context-0 lower tree. (The cleaning in `pgtable.rs` makes these
 //! redundant but harmless.)
 //!
-//! Jobs acquire exclusive TTBAT slots without waiting at publication (`mmu::Uat::try_bind`)
-//! and return them after successful retirement. Failed published jobs retain their slots until
-//! their last reference drops (until reboot for jobs retained after a fail-stop).
-//! The shared layer writes TTBAT `(root | 1 | slot << 48, TABLES | 1 |
+//! User VMs are bound to exclusive TTBAT slots for their lifetime through `mmu::Uat::bind`
+//! (`vm.rs`); the shared layer writes TTBAT `(root | 1 | slot << 48, TABLES | 1 |
 //! slot << 48)` under the PPL lock and invalidates the slot's ASID.
 
 use core::ops::Range;
@@ -38,12 +36,14 @@ use kernel::{
     bindings, device,
     io::Io,
     prelude::*,
-    sync::Arc,
     time::{delay::fsleep, Delta, Instant, Monotonic},
 };
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+use kernel::sync::Arc;
 
 use super::hw;
 use super::regs::{mb, rmb, wmb, Mapping};
+#[cfg(CONFIG_DRM_ASAHI_G15)]
 use crate::driver::AsahiDrmDevice as AsahiDevice;
 use crate::{mmu, pgtable};
 
@@ -69,6 +69,7 @@ const fn indices(va: u64) -> [usize; 3] {
 }
 
 /// Creates the adopted UAT over the ADT regions (step 2 above).
+#[cfg(CONFIG_DRM_ASAHI_G15)]
 pub(crate) fn adopt(
     dev: &AsahiDevice,
     cfg: &'static super::Config,
@@ -98,7 +99,7 @@ fn with_table<R>(
     // SAFETY: Every table walked here is a page the shared page-table code allocated in RAM
     // (`Page::alloc_page`) and never frees while the firmware runs (tables are not freed on
     // unmap, and these VMs are retained until reboot).
-    unsafe { pgtable::with_root_entries(None, pa, count, f) }
+    unsafe { pgtable::with_root_entries(pa, count, f) }
 }
 
 /// Cleans `len` bytes of the RAM table page at `pa`, from entry `first`, to the point of
@@ -201,6 +202,7 @@ pub(crate) struct Window {
 
 impl Window {
     /// Maps the UAT handoff regions ([`Mapping::region`]).
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn new(adt: &super::adt::GpuAdt) -> Result<Self> {
         Self::from_regions(adt.handoff.start, adt.ttbs.start, adt.tables.start, adt.shared_l2.start)
     }

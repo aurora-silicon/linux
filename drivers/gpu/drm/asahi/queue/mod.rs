@@ -67,9 +67,7 @@ mod render;
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
-        if layouts != [0; 2] {
-            return Err(EINVAL);
-        }
+        if layouts != [0; 2] { return Err(EINVAL); }
         Ok(())
     }
 
@@ -153,7 +151,6 @@ pub(crate) struct QueueInner {
     notifier_list: Arc<GpuObject<fw::event::NotifierList>>,
     notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
     usc_exec_base: u64,
-    usage: Arc<crate::usage::Client>,
     id: u64,
     #[ver(V >= V13_0B4)]
     counter: AtomicU64,
@@ -194,7 +191,7 @@ impl JobFence::ver {
 #[vtable]
 impl dma_fence::FenceOps for JobFence::ver {
     fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
-        c_str!("aurora")
+        c_str!("asahi")
     }
     fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr {
         c_str!("queue")
@@ -265,14 +262,10 @@ impl QueueJob::ver {
 #[versions(AGX)]
 impl sched::JobImpl for QueueJob::ver {
     type TimeoutData = QueueTimeout;
-    const MODULE: Option<&'static kernel::ThisModule> =
-        Some(kernel::module::this_module::<crate::LocalModule>());
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
 
     fn timeout_data(&self) -> QueueTimeout {
-        QueueTimeout {
-            dev: self.dev.clone(),
-            id: self.id,
-        }
+        QueueTimeout { dev: self.dev.clone(), id: self.id }
     }
 
     fn prepare(job: &mut Self) -> Option<Fence> {
@@ -364,7 +357,7 @@ impl sched::JobImpl for QueueJob::ver {
             return Err(ENODEV);
         };
 
-        guard.registration_data_with(|reg_data| {
+        return guard.registration_data_with(|reg_data| {
             let gpu = match reg_data
                 .gpu
                 .clone()
@@ -439,7 +432,7 @@ impl sched::JobImpl for QueueJob::ver {
             core::mem::drop(frag_job);
 
             Ok(Some(Fence::from_fence(&job.fence)))
-        })
+        });
     }
 
     fn timed_out(job: &mut QueueTimeout, _finished: bool) -> sched::Status {
@@ -468,7 +461,7 @@ impl Drop for QueueJob::ver {
     }
 }
 
-static QUEUE_NAME: &CStr = c_str!("aurora_fence");
+static QUEUE_NAME: &CStr = c_str!("asahi_fence");
 static QUEUE_CLASS_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 
 #[versions(AGX)]
@@ -488,7 +481,6 @@ impl Queue::ver {
         id: u64,
         priority: u32,
         usc_exec_base: u64,
-        usage: Arc<crate::usage::Client>,
     ) -> Result<Queue::ver> {
         mod_dev_dbg!(dev, "[Queue {}] Creating queue\n", id);
 
@@ -526,20 +518,11 @@ impl Queue::ver {
             WQ_SIZE,
             0,
             100000,
-            c_str!("aurora_sched"),
+            c_str!("asahi_sched"),
         )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
         let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
-
-        let gpu_context = Arc::new(
-            workqueue::GpuContext::new(dev.clone(), alloc, buffer.any_ref())?,
-            GFP_KERNEL,
-        )?;
-        // Every command of this queue points the firmware at the notifier, and the notifier links
-        // into the notifier list of the work queues. Keep it as long as they are kept, until the
-        // context is invalidated, instead of freeing it with the last command.
-        gpu_context.retain(KBox::new(notifier.clone(), GFP_KERNEL)?)?;
 
         let mut ret = Queue::ver {
             dev: dev.clone(),
@@ -554,12 +537,15 @@ impl Queue::ver {
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
-                gpu_context,
+                gpu_context: Arc::new(
+                    workqueue::GpuContext::new(dev.clone(), alloc, buffer.any_ref())?,
+                    GFP_KERNEL,
+                )?,
+
                 buffer,
                 notifier_list: Arc::new(notifier_list, GFP_KERNEL)?,
                 notifier,
                 usc_exec_base,
-                usage,
                 id,
                 #[ver(V >= V13_0B4)]
                 counter: AtomicU64::new(0),
@@ -567,7 +553,7 @@ impl Queue::ver {
         };
 
         // Rendering structures
-        let tvb_blocks = module_parameters::initial_tvb_size.value();
+        let tvb_blocks = *module_parameters::initial_tvb_size.value();
 
         ret.inner.buffer.ensure_blocks(tvb_blocks)?;
 
@@ -637,11 +623,8 @@ const COMPUTE_SUPPORTED_SIZE: usize =
 
 // SAFETY: All bit patterns are valid by construction.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_header {}
-// SAFETY: This UAPI record consists of integer fields and nested integer records.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_render {}
-// SAFETY: This UAPI record consists of integer fields and nested integer records.
 unsafe impl AnyBitPattern for uapi::drm_asahi_cmd_compute {}
-// SAFETY: This UAPI record consists of integer fields and nested integer records.
 unsafe impl AnyBitPattern for uapi::drm_asahi_attachment {}
 
 fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::Attachments> {
@@ -652,10 +635,8 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         return Err(EINVAL);
     }
 
-    let mut attachments = microseq::Attachments {
-        count: count as u32,
-        ..Default::default()
-    };
+    let mut attachments: microseq::Attachments = Default::default();
+    attachments.count = count as u32;
 
     for i in 0..count {
         let att: uapi::drm_asahi_attachment = reader.read()?;
@@ -669,7 +650,7 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
         let unk_e = 1;
 
         let cache_lines = (att.size + 127) >> 7;
-        attachments.list[i] = microseq::Attachment {
+        attachments.list[i as usize] = microseq::Attachment {
             address: U64(att.pointer),
             size: cache_lines.try_into()?,
             unk_c: 0x17,
@@ -773,33 +754,10 @@ impl Queue for Queue::ver {
 
         while !cmdbuf.is_empty() {
             let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
-            let payload_size = header.size as usize;
-            match u32::from(header.cmd_type) {
-                uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
-                    let render: uapi::drm_asahi_cmd_render = cmdbuf.read_up_to(payload_size)?;
-                    if render
-                        .ts_frag_end_copies
-                        .iter()
-                        .any(|ts| ts.handle != 0 || ts.offset != 0)
-                    {
-                        return Err(EINVAL);
-                    }
-                }
-                uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => {
-                    let compute: uapi::drm_asahi_cmd_compute = cmdbuf.read_up_to(payload_size)?;
-                    if compute
-                        .ts_end_copies
-                        .iter()
-                        .any(|ts| ts.handle != 0 || ts.offset != 0)
-                    {
-                        return Err(EINVAL);
-                    }
-                }
-                _ => cmdbuf.skip(payload_size),
-            }
+            cmdbuf.skip(header.size as usize);
             nr_commands += 1;
 
-            match u32::from(header.cmd_type) {
+            match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     last_render = nr_commands;
                     nr_render += 1;
@@ -891,7 +849,7 @@ impl Queue for Queue::ver {
                     EINVAL
                 })? {
                     let mut alloc = gpu.alloc();
-                    let queue_job = match u32::from(header.cmd_type) {
+                    let queue_job = match header.cmd_type as u32 {
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => job.get_vtx()?,
                         uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE => job.get_comp()?,
                         _ => return Err(EINVAL),
@@ -921,7 +879,7 @@ impl Queue for Queue::ver {
                 }
             }
 
-            match u32::from(header.cmd_type) {
+            match header.cmd_type as u32 {
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_RENDER => {
                     let render: uapi::drm_asahi_cmd_render = cmdbuf
                         .read_supported(header_size, RENDER_SUPPORTED_SIZE)

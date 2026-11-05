@@ -30,8 +30,6 @@
 
 #include <linux/acpi.h>
 #include <linux/gpu_buddy.h>
-#include <drm/drm_auth.h>
-#include <drm/drm_debugfs.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -39,7 +37,6 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_gpuvm.h>
 #include <drm/drm_ioctl.h>
-#include <drm/drm_print.h>
 #include <drm/drm_syncobj.h>
 #include <drm/gpu_scheduler.h>
 #include <kunit/test.h>
@@ -67,12 +64,9 @@
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/firmware.h>
-#include <linux/fwctl.h>
 #include <linux/fs.h>
 #include <linux/i2c.h>
-#include <linux/iio/buffer.h>
 #include <linux/iio/iio.h>
-#include <linux/iio/kfifo_buf.h>
 #include <linux/iio/types.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
@@ -99,18 +93,13 @@
 #include <linux/pwm.h>
 #include <linux/random.h>
 #include <linux/refcount.h>
-#include <linux/reboot.h>
 #include <linux/regulator/consumer.h>
 #include <linux/sched.h>
 #include <linux/security.h>
-#include <linux/serdev.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/mailbox.h>
-#include <linux/soc/apple/pmp-telemetry.h>
-#include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp.h>
-#include <linux/suspend.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
 #include <linux/tracepoint.h>
@@ -124,8 +113,6 @@
 #include <linux/pm_runtime.h>
 #include <sound/jack.h>
 #include <sound/pcm.h>
-#include <net/genetlink.h>
-#include <net/netlink.h>
 #include <sound/soc.h>
 #include <sound/soc-dpcm.h>
 #include <sound/tlv.h>
@@ -146,7 +133,6 @@
 const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
 const size_t RUST_CONST_HELPER_ARCH_KMALLOC_MINALIGN = ARCH_KMALLOC_MINALIGN;
 const size_t RUST_CONST_HELPER_PAGE_SIZE = PAGE_SIZE;
-const size_t RUST_CONST_HELPER_GENLMSG_DEFAULT_SIZE = GENLMSG_DEFAULT_SIZE;
 const gfp_t RUST_CONST_HELPER_GFP_ATOMIC = GFP_ATOMIC;
 const gfp_t RUST_CONST_HELPER_GFP_KERNEL = GFP_KERNEL;
 const gfp_t RUST_CONST_HELPER_GFP_KERNEL_ACCOUNT = GFP_KERNEL_ACCOUNT;
@@ -157,7 +143,6 @@ const gfp_t RUST_CONST_HELPER___GFP_NOWARN = ___GFP_NOWARN;
 const blk_features_t RUST_CONST_HELPER_BLK_FEAT_ROTATIONAL = BLK_FEAT_ROTATIONAL;
 const fop_flags_t RUST_CONST_HELPER_FOP_UNSIGNED_OFFSET = FOP_UNSIGNED_OFFSET;
 const u32 RUST_CONST_HELPER_APPLE_RTKIT_COPROC_PLACES_BUFFERS = APPLE_RTKIT_COPROC_PLACES_BUFFERS;
-const u32 RUST_CONST_HELPER_APPLE_RTKIT_NEEDS_COREANALYTICS = APPLE_RTKIT_NEEDS_COREANALYTICS;
 
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE = SNDRV_PCM_FMTBIT_FLOAT_LE;
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_S32_LE = SNDRV_PCM_FMTBIT_S32_LE;
@@ -167,17 +152,8 @@ const snd_ctl_elem_iface_t BINDINGS_SNDRV_CTL_ELEM_IFACE_MIXER = SNDRV_CTL_ELEM_
 
 const u32 BINDINGS_IIO_CHAN_INFO_RAW = IIO_CHAN_INFO_RAW;
 const u32 BINDINGS_IIO_CHAN_INFO_PROCESSED = IIO_CHAN_INFO_PROCESSED;
-const u32 BINDINGS_IIO_CHAN_INFO_SCALE = IIO_CHAN_INFO_SCALE;
 const u32 BINDINGS_IIO_ANGL = IIO_ANGL;
 const u32 BINDINGS_IIO_LIGHT = IIO_LIGHT;
-const u32 BINDINGS_IIO_COLORTEMP = IIO_COLORTEMP;
-const u32 BINDINGS_IIO_ACCEL = IIO_ACCEL;
-const u32 BINDINGS_IIO_ANGL_VEL = IIO_ANGL_VEL;
-const u32 BINDINGS_IIO_TIMESTAMP = IIO_TIMESTAMP;
-const u32 BINDINGS_IIO_MOD_X = IIO_MOD_X;
-const u32 BINDINGS_IIO_MOD_Y = IIO_MOD_Y;
-const u32 BINDINGS_IIO_MOD_Z = IIO_MOD_Z;
-const u32 BINDINGS_IIO_CHAN_INFO_SAMP_FREQ = IIO_CHAN_INFO_SAMP_FREQ;
 
 const xa_mark_t RUST_CONST_HELPER_XA_PRESENT = XA_PRESENT;
 

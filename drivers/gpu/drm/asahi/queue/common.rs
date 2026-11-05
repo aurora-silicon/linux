@@ -33,7 +33,7 @@ pub(super) fn get_timestamp_object(
             return Err(ERANGE);
         }
         Ok(Some(UserTimestamp {
-            mapping: mapping.firmware_mapping()?,
+            mapping: mapping.clone(),
             offset: offset as usize,
         }))
     } else {

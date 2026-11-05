@@ -87,16 +87,8 @@ static int __drm_gem_shmem_init(struct drm_device *dev, struct drm_gem_shmem_obj
 		 * why this is required _and_ expected if you're
 		 * going to pin these pages.
 		 */
-		gfp_t gfp = GFP_HIGHUSER | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
-
-		/* A bulk pin must not run direct reclaim once per folio when
-		 * the driver can instead return an allocation failure. Clearing
-		 * DIRECT_RECLAIM also makes memcg charges fail without reclaim
-		 * or invoking the OOM killer. Preserve placement and kswapd.
-		 */
-		if (shmem->pages_no_reclaim)
-			gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_RETRY_MAYFAIL);
-		mapping_set_gfp_mask(obj->filp->f_mapping, gfp);
+		mapping_set_gfp_mask(obj->filp->f_mapping, GFP_HIGHUSER |
+				     __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
 	}
 
 	return 0;
@@ -491,23 +483,10 @@ void drm_gem_shmem_vunmap_locked(struct drm_gem_shmem_object *shmem,
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_vunmap_locked);
 
-/**
- * drm_gem_shmem_create_with_handle - Allocate an object with the given size and
- *	returns a GEM handle
- * @file_priv: DRM file structure to create the dumb buffer for
- * @dev: DRM device
- * @size: Size of the object to allocate
- * @handle: Returns the GEM handle on success
- *
- * Allocates an shmem GEM buffer using drm_gem_shmem_create() and returns
- * a GEM handle to it.
- *
- * Returns:
- * Zero on success, or an error code otherwise.
- */
-int drm_gem_shmem_create_with_handle(struct drm_file *file_priv,
-				     struct drm_device *dev, size_t size,
-				     uint32_t *handle)
+static int
+drm_gem_shmem_create_with_handle(struct drm_file *file_priv,
+				 struct drm_device *dev, size_t size,
+				 uint32_t *handle)
 {
 	struct drm_gem_shmem_object *shmem;
 	int ret;
@@ -526,7 +505,6 @@ int drm_gem_shmem_create_with_handle(struct drm_file *file_priv,
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(drm_gem_shmem_create_with_handle);
 
 /* Update madvise status, returns true if not purged, else
  * false or -errno.
@@ -634,10 +612,10 @@ bool drm_gem_shmem_idle_pages_releasable_locked(struct drm_gem_shmem_object *shm
 	struct drm_gem_object *obj = &shmem->base;
 
 	dma_resv_assert_held(obj->resv);
-	return !drm_gem_is_imported(obj) && !obj->dma_buf &&
+	return shmem->sgt && !drm_gem_is_imported(obj) && !obj->dma_buf &&
 		shmem->madv >= 0 && !refcount_read(&shmem->pages_pin_count) &&
 		!refcount_read(&shmem->vmap_use_count) &&
-		refcount_read(&shmem->pages_use_count) == !!shmem->sgt &&
+		refcount_read(&shmem->pages_use_count) == 1 &&
 		dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP);
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_idle_pages_releasable_locked);
@@ -1002,7 +980,7 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 		return ret;
 	}
 
-	if (vma_is_cow_mapping(vma))
+	if (is_cow_mapping(vma->vm_flags))
 		return -EINVAL;
 
 #ifdef CONFIG_MM_SUBPAGE
@@ -1037,7 +1015,7 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 		return ret;
 
 	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-	vma->vm_page_prot = vma_get_page_prot(vma);
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 	if (shmem->map_wc)
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
@@ -1096,10 +1074,6 @@ static struct sg_table *drm_gem_shmem_get_pages_sgt_locked(struct drm_gem_shmem_
 
 	if (shmem->sgt)
 		return shmem->sgt;
-
-	/* Purged contents cannot be restored by rebuilding an empty table. */
-	if (shmem->madv < 0)
-		return ERR_PTR(-EINVAL);
 
 	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
 

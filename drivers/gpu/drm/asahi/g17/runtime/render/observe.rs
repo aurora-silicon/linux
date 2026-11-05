@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Event-driven render snapshots. A pair's completion memory is read and the
-//! pair retired in one device-mutex hold, inside the preparation epoch.
+//! Event-driven render snapshots outside the device mutex. The preparation
+//! epoch and exact pair owner survive every read, cancellation and retry.
 
 use super::super::DeferredBatch;
+use crate::g17::queue::render::Pair;
 use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
 
 impl crate::g17::Firmware {
-    /// The first slot from `start` whose pair has news to observe: published work in flight, the
-    /// fragment queue's notification seen (`completion_noted`), and an observation the pair accepts.
-    fn next_render_observation(&mut self, start: usize) -> Result<Option<usize>> {
+    fn take_render_observation(&mut self, start: usize) -> Result<Option<(usize, KBox<Pair>)>> {
         if self.recovery.pending() {
             return Ok(None);
         }
         let state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
         for slot in start..self.queues.render.entries.len() {
-            let Some(entry) = self.queues.render.entries[slot].as_ref() else {
+            let Some(entry) = self.queues.render.entries[slot].as_mut() else {
                 continue;
             };
             if entry.preparing.is_some() || entry.growing {
@@ -27,8 +26,9 @@ impl crate::g17::Firmware {
             };
             let qids = pair.qids();
             if !pair.published_in_flight()
-                || (!crate::g17::queue::render::completion_noted(qids, entry.event_masks)
-                    && !pair.stamp_waiting())
+                || !qids
+                    .into_iter()
+                    .all(|qid| entry.event_masks[usize::from(qid) / 64] & (1u64 << (qid % 64)) != 0)
             {
                 continue;
             }
@@ -37,20 +37,31 @@ impl crate::g17::Firmware {
                 self.init.stamp(qids[1])?.load(Ordering::Relaxed),
             ];
             core::sync::atomic::fence(Ordering::Acquire);
-            if pair.observation_packet(entry.event_masks, stamps, state)?.is_some() {
-                return Ok(Some(slot));
-            }
-            // The stamps gate this pair out. If its front executed and was consumed anyway, the
-            // stamps may never move: after the bound, observe it and retire it on its record.
-            let pair = self.queues.render.entries[slot]
-                .as_mut()
-                .and_then(|entry| entry.pair.as_mut())
-                .ok_or(EIO)?;
-            if pair.note_stamp_wait(stamps, state, crate::g17::now_ns())? {
-                return Ok(Some(slot));
-            }
+            let Some(packet) = pair.observation_packet(entry.event_masks, stamps, state)? else {
+                continue;
+            };
+            entry.borrowed_active = pair.published_in_flight();
+            entry.borrowed_dependencies = Some(pair.dependency_snapshot());
+            entry.preparing = Some(packet);
+            return Ok(Some((slot, entry.pair.take().ok_or(EIO)?)));
         }
         Ok(None)
+    }
+
+    fn return_render_observation(&mut self, slot: usize, pair: &mut Option<KBox<Pair>>) -> Result {
+        let returning = pair.as_ref().ok_or(EINVAL)?;
+        let entry = self.queues.render.entry_mut(slot as u8)?;
+        if entry.pair.is_some()
+            || entry.preparing.is_none()
+            || returning.slot() as usize != slot
+            || returning.qids() != entry.reservation.ids.map(crate::g17::kick::Id::qid)
+        {
+            return Err(EIO);
+        }
+        entry.pair = pair.take();
+        entry.borrowed_dependencies = None;
+        entry.preparing = None;
+        Ok(())
     }
 
     pub(super) fn settle_render_terminal(
@@ -109,36 +120,57 @@ impl crate::g17::Shared {
                 Err(error) if error == EAGAIN || error == ENODEV => break,
                 result => result?,
             };
-            // Selecting, reading and retiring the front share one hold: a
-            // separate hold for the read would let publishers and the
-            // retirement contend twice per observed pair.
-            let mut state = self.state.lock();
-            let Some(firmware) = (*state).as_deref_mut() else {
-                return Ok(());
+            let loan = {
+                let mut state = self.state.lock();
+                let Some(firmware) = (*state).as_deref_mut() else {
+                    return Ok(());
+                };
+                if !epoch.is_current() || self.crashed.load(Ordering::Acquire) {
+                    break;
+                }
+                firmware.take_render_observation(cursor)?
             };
-            if !epoch.is_current()
-                || firmware.recovery.pending()
-                || self.crashed.load(Ordering::Acquire)
-            {
-                break;
-            }
-            let Some(slot) = firmware.next_render_observation(cursor)? else {
+            let Some((slot, pair)) = loan else {
                 break;
             };
             if slot != cursor {
                 remaining = crate::hw::t8140::queues::RENDER_DEPTH;
                 retries = 0;
             }
-            let observed = firmware.queues.render.entries[slot]
-                .as_ref()
-                .and_then(|entry| entry.pair.as_ref())
-                .ok_or(EIO)?
-                .observe_front();
-            // Publishers waiting for render capacity recheck once this hold ends.
-            self.note_changed();
-            if firmware.render_grow_pending() || firmware.queues.render.take_missed_event(slot as u8) {
-                // Observation and the growth check run on every pass.
-                self.queue_event_records();
+            let observed = pair.observe_front();
+            let mut pair = Some(pair);
+            let mut state = self.state.lock();
+            // Return installed ownership before examining read errors or epoch.
+            let restored = (*state)
+                .as_deref_mut()
+                .ok_or(ENODEV)
+                .and_then(|firmware| firmware.return_render_observation(slot, &mut pair));
+            if let Err(error) = restored {
+                // A failed invariant must not drop firmware-owned storage. Join
+                // the other preparers only after releasing our own epoch, and
+                // keep this detached owner until both processors have stopped.
+                drop(state);
+                drop(epoch);
+                self.lose_device_quietly();
+                self.stop_queues();
+                if let Some(mut pair) = pair {
+                    pair.stopped(&mut |event| {
+                        event.finish();
+                        Ok(())
+                    })?;
+                }
+                return Err(error);
+            }
+            let firmware = (*state).as_deref_mut().ok_or(EIO)?;
+            self.changed.notify_all();
+            if firmware.render_grow_pending() {
+                self.queue_events();
+            }
+            if !epoch.is_current()
+                || firmware.recovery.pending()
+                || self.crashed.load(Ordering::Acquire)
+            {
+                break;
             }
             let result = (|| {
                 let state = crate::g17::recovery::Memory::recovery_state(&firmware.init)?;

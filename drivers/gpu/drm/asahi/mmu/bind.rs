@@ -17,7 +17,6 @@ pub(crate) struct PreparedUserMap {
     single_page: bool,
     context: context::PreparedBinding,
     _residency: Option<residency::Lease>,
-    _sg_lease: kernel::drm::gem::shmem::SGLease<gem::AsahiObject>,
 }
 
 pub(crate) struct PreparedUserUnmap {
@@ -58,7 +57,7 @@ impl PreparedUserBindBatch {
 }
 
 impl Vm {
-    /// Prepares host state before taking the GPUVM exec lock or changing any leaf.
+    /// Prepares host state without taking DMA reservations or changing any leaf.
     pub(crate) fn prepare_bind_object(
         &self,
         gem: &gem::Object,
@@ -81,20 +80,24 @@ impl Vm {
         // SAFETY: As in `Vm::bind_object()`, the device is bound while its file can issue binds.
         let dev = unsafe { self.dev.as_bound() };
         // Populate the scatter-gather table before any GPUVM lock is taken.
-        let sg_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
+        crate::gem::held_sg_table(gem, dev)?;
         let vm_bo = self
             .gpuvm
             .obtain(gem, pin_init!(VmBoData {
                 newest_bind: AtomicU64::new(0),
                 segments <- new_mutex!(None),
             }))?;
-        prepare_sgt_segments(dev, gem, &vm_bo, &sg_lease)?;
+        {
+            let mut segments = vm_bo.data().segments.lock();
+            if segments.is_none() {
+                segments.replace(prefetch_sgt_segments(dev, gem)?);
+            }
+        }
         if (addr | size | offset) & UAT_PGMSK as u64 != 0 {
             return Err(EINVAL);
         }
         Ok(PreparedUserMap {
             _residency: residency,
-            _sg_lease: sg_lease,
             gem: gem.into(),
             vm_bo,
             resources,
@@ -135,7 +138,7 @@ impl Vm {
                 PreparedUserBindOp::Map(map) => {
                     // SAFETY: See `lock_vm()`. As in `Vm::bind_object()`, the object itself is
                     // not locked: the map step may still populate its pages.
-                    let mut inner = unsafe { self.gpuvm.exec_lock_vm(None, true)? };
+                    let mut inner = unsafe { self.gpuvm.exec_lock(None, true)? };
                     match self.mapping_commit() {
                         Ok(commit) => {
                             let (flags, repeat) = if map.single_page {
@@ -185,7 +188,7 @@ impl Vm {
                 }
                 PreparedUserBindOp::Unmap(unmap) => {
                     // SAFETY: See `lock_vm()`.
-                    let mut inner = unsafe { self.gpuvm.exec_lock_vm(None, true)? };
+                    let mut inner = unsafe { self.gpuvm.exec_lock(None, true)? };
                     match self.mapping_commit() {
                         Ok(commit) => {
                             let mut ctx =

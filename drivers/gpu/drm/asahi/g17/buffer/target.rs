@@ -6,7 +6,7 @@
 
 use super::compact_alias;
 use crate::g17::{
-    fw::render::{RegisterPrograms, RenderPass},
+    fw::render::RenderPass,
     object::{CpuMap, KernelObject},
 };
 use crate::{
@@ -25,17 +25,6 @@ fn aligned(value: usize, alignment: usize) -> Result<usize> {
         .ok_or(EOVERFLOW)
 }
 
-/// The 25G83 tiler parameter block: the TPC and seven sub-buffers the tiling registers name, at
-/// the default parameter-buffer sizes. Sizes are
-/// [TPC, tile map × 64, 0x4000 for layered targets, 0, 0xc00, 0xa00, 0x600, 0x80].
-const GTP_ALIGNMENTS: [usize; 8] = [0x40, 0x40, 0x100, 1, 0x20, 0x20, 0x80, 0x40];
-const GTP_FIXED_SIZES: [usize; 4] = [0xc00, 0xa00, GTP6_SIZE, 0x80];
-/// Room for the tiler's records across a partial render. macOS uses 0x1c00, so this is a superset,
-/// and the size every partial-render test ran with.
-const GTP_SLOTS: usize = 64;
-const GTP6_SIZE: usize = GTP_SLOTS
-    * (((cfg::TVB_MAX_BLOCKS * cfg::TVB_BLOCK_SIZE).div_ceil(0x8000) + 0x17ff) / 24 * 8 + 8);
-
 /// Per-command geometry, independent of the capacity already allocated.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Layout {
@@ -44,18 +33,9 @@ pub(crate) struct Layout {
     pub(crate) used: usize,
     pub(crate) tpc_size: usize,
     pub(crate) tvb_blocks: usize,
-    /// Offsets of the tiler parameter sub-buffers in the TPC object (25G83), `None` for an
-    /// empty one; the TPC is entry 0.
-    gtp: [Option<usize>; 8],
-    /// Bytes of the TPC object the command uses.
-    tpc_end: usize,
 }
 impl Layout {
-    pub(crate) fn new(
-        pass: &RenderPass,
-        clusters: u32,
-        programs: RegisterPrograms,
-    ) -> Result<Self> {
+    pub(crate) fn new(pass: &RenderPass, clusters: u32) -> Result<Self> {
         let width = pass.width as usize;
         let height = pass.height as usize;
         let layers = pass.layers as usize;
@@ -110,51 +90,16 @@ impl Layout {
             );
         }
         tvb_blocks = tvb_blocks.max(cfg::TVB_INITIAL_PAGES.len());
-        let mut gtp = [None; 8];
-        let mut tpc_end = tpc_size;
-        if programs == RegisterPrograms::V25G83 {
-            let sizes = [
-                tpc_size,
-                tilemap_size.checked_mul(64).ok_or(EOVERFLOW)?,
-                if layers > 1 { 0x4000 } else { 0 },
-                0,
-                GTP_FIXED_SIZES[0],
-                GTP_FIXED_SIZES[1],
-                GTP_FIXED_SIZES[2],
-                GTP_FIXED_SIZES[3],
-            ];
-            let mut position = 0;
-            for ((offset, size), alignment) in gtp.iter_mut().zip(sizes).zip(GTP_ALIGNMENTS) {
-                position = aligned(position, alignment)?;
-                if size != 0 {
-                    *offset = Some(position);
-                }
-                position = position.checked_add(size).ok_or(EOVERFLOW)?;
-            }
-            tpc_end = position;
-        }
         Ok(Self {
             layer_offset,
             heap_offset,
             used,
             tpc_size,
             tvb_blocks,
-            gtp,
-            tpc_end,
         })
     }
     pub(crate) fn tpc_capacity(&self) -> Result<usize> {
-        // TPC_MAX bounds the tail-pointer cache itself. On 25G83 this object
-        // also contains GTP sub-buffers, notably 64 times the tile map. Applying
-        // the cache limit to their combined extent rejects valid large targets.
-        // Keep the original cache and tile-record limits; they also bound the
-        // derived auxiliary extent before any backing allocation or replacement.
-        if aligned(self.tpc_size, mmu::UAT_PGSZ)?.max(cfg::TPC_MIN) > cfg::TPC_MAX
-            || self.record_stride()? > cfg::TARGET_RECORD_MAX
-        {
-            return Err(ERANGE);
-        }
-        Ok(aligned(self.tpc_end, mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
+        Ok(aligned(self.tpc_size, mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
     }
     pub(crate) fn record_stride(&self) -> Result<usize> {
         Ok(aligned(self.used, mmu::UAT_PGSZ)?.max(cfg::TARGET_RECORD_MIN))
@@ -203,7 +148,7 @@ impl Target {
     pub(crate) fn new(dev: &AsahiDrmDevice, vm: &mmu::Vm, layout: &Layout) -> Result<KBox<Self>> {
         let tpc = layout.tpc_capacity()?;
         let stride = layout.record_stride()?;
-        if stride > cfg::TARGET_RECORD_MAX {
+        if tpc > cfg::TPC_MAX || stride > cfg::TARGET_RECORD_MAX {
             return Err(ERANGE);
         }
         let records = Object::new(dev, vm, stride * DEPTH)?;
@@ -222,21 +167,6 @@ impl Target {
     }
     pub(crate) fn tpc_va(&self) -> u64 {
         self.tpc.address
-    }
-
-    /// GPU addresses of the tiler parameter sub-buffers of `layout` (25G83), zero for an empty
-    /// or absent one. The TPC object holds them after the TPC.
-    pub(crate) fn gtp_va(&self, layout: &Layout) -> Result<[u64; 8]> {
-        if layout.tpc_end > self.tpc.backing.size() {
-            return Err(ERANGE);
-        }
-        let mut addresses = [0; 8];
-        for (address, offset) in addresses.iter_mut().zip(layout.gtp) {
-            if let Some(offset) = offset {
-                *address = self.tpc.address.checked_add(offset as u64).ok_or(EOVERFLOW)?;
-            }
-        }
-        Ok(addresses)
     }
 
     /// Only the span consumed by this render is cleared. A small render does
@@ -287,6 +217,9 @@ impl Target {
         let stride = layout.record_stride()?;
         let mut grew = false;
         if tpc > self.tpc.backing.size() {
+            if tpc > cfg::TPC_MAX {
+                return Err(ERANGE);
+            }
             Self::replace(&mut self.retired, &mut self.tpc, dev, vm, tpc, owners)?;
             grew = true;
         }
@@ -360,61 +293,5 @@ impl Target {
         if *slot == Some(ordinal) {
             *slot = None;
         }
-    }
-}
-
-
-#[kernel::macros::kunit_tests(asahi_g17_target_capacity)]
-mod tests {
-    use super::*;
-
-    fn pass(size: u32, utile: u8) -> RenderPass {
-        // SAFETY: RenderPass and its nested surfaces/programs contain only
-        // integers and bools, for which the all-zero representation is valid.
-        let mut pass: RenderPass = unsafe { core::mem::zeroed() };
-        pass.width = size;
-        pass.height = size;
-        pass.layers = 1;
-        pass.utile_width = utile;
-        pass.utile_height = utile;
-        pass
-    }
-
-    #[test]
-    fn t6040_auxiliary_tiler_storage_is_not_tail_pointer_cache() {
-        // CTS point_size_10000 renders to 10240 squared. Its GTP sub-buffer
-        // is required by the existing 25G83 program, not a larger cache.
-        for utile in [16, 32] {
-            let layout = Layout::new(&pass(10240, utile), 2, RegisterPrograms::V25G83).unwrap();
-            assert!(layout.tpc_size < cfg::TPC_MAX);
-            assert!(layout.record_stride().unwrap() < cfg::TARGET_RECORD_MAX);
-            assert!(layout.tpc_end > cfg::TPC_MAX);
-            assert!(layout.tpc_capacity().unwrap() >= layout.tpc_end);
-            assert_eq!(layout.gtp[0], Some(0));
-            assert!(layout.gtp[1].unwrap() >= layout.tpc_size);
-        }
-    }
-
-    #[test]
-    fn core_and_tile_record_limits_still_reject_oversized_targets() {
-        let mut layout = Layout::new(&pass(10240, 32), 2, RegisterPrograms::V25G83).unwrap();
-        layout.tpc_size = cfg::TPC_MAX + 1;
-        assert_eq!(layout.tpc_capacity(), Err(ERANGE));
-        let mut layered = pass(16384, 16);
-        layered.layers = 2;
-        let layout = Layout::new(&layered, 2, RegisterPrograms::V25G83).unwrap();
-        assert!(layout.record_stride().unwrap() > cfg::TARGET_RECORD_MAX);
-        assert_eq!(layout.tpc_capacity(), Err(ERANGE));
-    }
-
-    #[test]
-    fn neo_keeps_the_same_cache_extent_and_limit() {
-        let mut layout = Layout::new(&pass(10240, 32), 1, RegisterPrograms::G17P).unwrap();
-        assert!(layout.gtp.iter().all(Option::is_none));
-        assert_eq!(layout.tpc_capacity().unwrap(),
-            aligned(layout.tpc_size, mmu::UAT_PGSZ).unwrap().max(cfg::TPC_MIN));
-        layout.tpc_size = cfg::TPC_MAX + 1;
-        layout.tpc_end = layout.tpc_size;
-        assert_eq!(layout.tpc_capacity(), Err(ERANGE));
     }
 }

@@ -15,9 +15,6 @@ use kernel::{prelude::*, sync::Arc};
 
 /// Wake interval while a tiler heap may still shrink: the native check period.
 const SHRINK_WAKE_NS: u64 = 1_000_000_000;
-/// Longest interval between two event passes that run every housekeeping step while
-/// completion records alone keep the worker busy.
-const HOUSEKEEPING_NS: u64 = 1_000_000;
 
 struct Service<'a> {
     firmware: &'a mut Firmware,
@@ -27,30 +24,24 @@ struct Service<'a> {
 }
 
 impl event::Transport for Service<'_> {
-    fn roles(&self) -> &'static [Role] {
-        self.firmware.roles()
-    }
     fn trace(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
+        let firmware = &mut self.firmware;
         firmware
             .rings
             .drain_trace(&firmware.primary.state.shared.dev, &firmware.init, role);
     }
     fn statistics(&mut self, role: Role) {
-        let firmware = &mut *self.firmware;
-        firmware.observe_statistics_power();
+        let firmware = &mut self.firmware;
         firmware
             .rings
             .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
-        firmware.observe_statistics_power();
     }
     fn drain(
         &mut self,
         role: Role,
         mut consume: impl FnMut(&mut Self, Event) -> Result<bool>,
     ) -> Result {
-        let mut events =
-            channel::Events::new(role, self.firmware.primary.state.shared.variant.graph);
+        let mut events = channel::Events::new(role);
         while let Some(event) =
             events.next(&self.firmware.primary.state.shared.dev, &self.firmware.init)?
         {
@@ -77,15 +68,6 @@ impl event::Host for Service<'_> {
 impl event::Queues for Service<'_> {
     fn context_killed(&mut self, cookie: u64) {
         self.firmware.queues.acknowledge_compute_exit(cookie);
-    }
-    fn compute_fault(&mut self, qid: u8, stamp: u32) {
-        for entry in self.firmware.queues.compute.iter_mut().flatten() {
-            if let Some(mut queue) = entry.queue.as_deref_mut() {
-                if queue.qid() == qid {
-                    queue.note_fault(stamp);
-                }
-            }
-        }
     }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
@@ -146,8 +128,8 @@ impl recovery::Memory for Service<'_> {
     fn clear_timestamps(&self) -> Result {
         self.firmware.init.clear_timestamps()
     }
-    fn entry(&self, index: usize) -> Result<(u32, u32)> {
-        self.firmware.init.entry(index)
+    fn entries(&self) -> Result<recovery::Entries> {
+        self.firmware.init.entries()
     }
     fn wait_tick(&self) {
         self.firmware.init.wait_tick();
@@ -218,27 +200,6 @@ impl recovery::Queues for Service<'_> {
         }
         self.firmware.queues.classify_render(class)
     }
-    fn note_interrupted(&mut self, qid: u8, stamp: u32) -> recovery::Interrupted {
-        let render = self.firmware.queues.note_render_interrupted(qid, stamp);
-        if render != recovery::Interrupted::None {
-            return render;
-        }
-        self.firmware
-            .queues
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .find(|queue| queue.qid() == qid)
-            .map_or(recovery::Interrupted::None, |queue| {
-                queue.note_interrupted(stamp)
-            })
-    }
-    fn report_blamed_render(&self, qid: u8) {
-        self.firmware
-            .queues
-            .report_render_recovery(qid, &self.firmware.port);
-    }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self
             .firmware
@@ -261,17 +222,19 @@ impl recovery::Queues for Service<'_> {
 impl Firmware {
     fn release_compute_witnesses(&mut self, deferred: &mut DeferredBatch) -> Result {
         let state = recovery::Memory::recovery_state(&self.init)?;
-        let port = &self.port;
+        let view = crate::g17::qos::View::new(self.init.qos()?)?;
         let registry = &mut self.queues;
-        for mut queue in registry
+        for queue in registry
             .compute
             .iter_mut()
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
-            queue.release_witnessed(state, |owner| port.qos_complete(&[owner]), &mut |event| {
-                deferred.push(event)
-            })?;
+            queue.release_witnessed(
+                state,
+                |owner| registry.accounting.complete(&view, &[owner]),
+                &mut |event| deferred.push(event),
+            )?;
         }
         Ok(())
     }
@@ -300,11 +263,6 @@ impl Firmware {
 
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
-        self.rings.invalidate_statistics();
-        if self.recovery.restart_limit(super::now_ns()) {
-            pr_warn!("G17: restart storm limit reached\n");
-            return Err(ETIMEDOUT);
-        }
         let shared = self.primary.state.shared.clone();
         let mut service = Service {
             firmware: self,
@@ -314,15 +272,7 @@ impl Firmware {
         };
         let result = recovery::service(&mut service, || {
             shared.crashed.load(core::sync::atomic::Ordering::Acquire)
-        });
-        // Publishers without the device mutex stamp their tickets with this
-        // mirror; they rejoin only after preparation admission reopens.
-        service
-            .firmware
-            .port
-            .set_generation(service.firmware.recovery.generation());
-        service.firmware.rings.invalidate_statistics();
-        let result = result?;
+        })?;
         if let Some(error) = result.target_error {
             dev_warn!(
                 shared.dev.as_ref(),
@@ -350,7 +300,7 @@ impl crate::g17::Shared {
     /// boundary; the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
-            self.stop_runtime();
+            self.stop_queues();
             return;
         }
         let mut deferred = {
@@ -365,10 +315,8 @@ impl crate::g17::Shared {
             };
             deferred
         };
-        crate::g17::trace::event(0);
         let result = self.runtime_event_turn(&mut deferred);
         deferred.finish();
-        crate::g17::trace::event(2);
         self.queue_feed();
         if let Some(firmware) = (*self.state.lock()).as_deref_mut() {
             firmware.queues.worker_deferred = Some(deferred);
@@ -376,15 +324,11 @@ impl crate::g17::Shared {
         if let Err(error) = result {
             dev_err!(self.dev.as_ref(), "GPU event service failed: {:?}\n", error);
             self.lose_device_quietly();
-            self.stop_runtime();
+            self.stop_queues();
         }
     }
 
     fn runtime_event_turn(self: &Arc<Self>, deferred: &mut DeferredBatch) -> Result {
-        // Taken before consuming records: a request made during this pass gets the next one.
-        let requested = self
-            .housekeeping
-            .swap(false, core::sync::atomic::Ordering::AcqRel);
         let (recover, masks) = {
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
@@ -400,10 +344,8 @@ impl crate::g17::Shared {
             (recover, masks)
         };
         deferred.finish();
-        crate::g17::trace::event(1);
         if recover {
-            self.preparations
-                .wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
+            self.preparations.wait_drained();
         }
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
@@ -446,44 +388,19 @@ impl crate::g17::Shared {
             .any(|queue| queue.in_flight());
         let in_flight = compute || firmware.queues.render_in_flight();
         let idle = firmware.idle_check(now, in_flight)?;
-        // Expiries, drained pairs, exits, pool and heap trimming and teardown give back what
-        // retirement freed; a completion needs none of them to retire or to signal. While work
-        // is in flight and nothing waits for capacity, a pass for firmware records alone skips
-        // them. Any requested pass, recovery, teardown, a waiter, the last retirement and, at
-        // the latest, the first pass after HOUSEKEEPING_NS run them all.
-        let housekeeping = requested
-            || recover
-            || !in_flight
-            || firmware.recovery.pending()
-            || !firmware.queues.teardown.is_empty()
-            || self.channels.has_waiters()
-            || self.progress.has_waiters()
-            || self.queues.has_waiters()
-            || self.renders.has_waiters()
-            || now.saturating_sub(
-                self.housekeeping_ns
-                    .load(core::sync::atomic::Ordering::Relaxed),
-            ) >= HOUSEKEEPING_NS;
-        let mut lingers = None;
-        let mut pools = None;
+        firmware.reclaim_drained_renders(deferred)?;
+        firmware.service_compute_exit(deferred)?;
+        let pools = firmware.service_compute_pools(deferred, now)?;
         let mut shrinking = false;
-        if housekeeping {
-            self.housekeeping_ns
-                .store(now, core::sync::atomic::Ordering::Relaxed);
-            if !firmware.recovery.pending() {
-                lingers = firmware.expire_render_lingers(now)?;
-            }
-            firmware.reclaim_drained_renders(deferred)?;
-            firmware.service_compute_exit(deferred)?;
-            pools = firmware.service_compute_pools(deferred, now)?;
-            if !firmware.recovery.pending() {
-                firmware
-                    .queues
-                    .vacate_evicted_render_pools(&firmware.init, deferred)?;
-                shrinking = firmware
-                    .queues
-                    .shrink_render_heaps(&firmware.init, now, deferred);
-            }
+        if !firmware.recovery.pending() {
+            firmware
+                .queues
+                .vacate_evicted_render_pools(&firmware.init, deferred)?;
+            shrinking = firmware
+                .queues
+                .shrink_render_heaps(&firmware.init, now, deferred);
+        }
+        {
             let mut reclaim = self.reclaim.lock();
             firmware.service_teardown(&mut reclaim)?;
             if !reclaim.is_empty() {
@@ -502,7 +419,7 @@ impl crate::g17::Shared {
                 .iter()
                 .flatten()
                 .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.retirement_polling() || queue.pool_release_pending());
+                .any(|queue| queue.retirement_polling());
         if polling {
             self.queue_poll();
         }
@@ -513,14 +430,11 @@ impl crate::g17::Shared {
         } else {
             idle
         };
-        // A retained compute pool gives its backing back when it expires, and
-        // so does an idle render free-list registration.
-        let idle = [pools, lingers]
-            .into_iter()
-            .fold(idle, |idle, expiry| match (idle, expiry) {
-                (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
-                (delay, expiry) => delay.or(expiry),
-            });
+        // A retained compute pool gives its backing back when it expires.
+        let idle = match (idle, pools) {
+            (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
+            (delay, expiry) => delay.or(expiry),
+        };
         if let Some(delay) = idle {
             self.queue_idle(delay);
         }
@@ -530,22 +444,16 @@ impl crate::g17::Shared {
         } else if !recover
             && !polling
             && (channel::Events::pending(&firmware.init, Role::Primary)?
-                || (firmware.secondary.is_some()
-                    && channel::Events::pending(&firmware.init, Role::Secondary)?))
+                || channel::Events::pending(&firmware.init, Role::Secondary)?)
         {
             // A full bounded pass must not depend on a fresh notification for
             // records that arrived while it was consuming the same ring.
-            self.queue_event_records();
+            self.queue_events();
         }
         let grow_ready = firmware.render_grow_ready();
         drop(state);
         if grow_ready {
             self.queue_grow();
-        }
-        // Firmware ring room, consumed releases and teardown steps have no
-        // event of their own: recheck render publishers' conditions every pass.
-        if self.renders.has_waiters() {
-            self.renders.notify();
         }
         Ok(())
     }

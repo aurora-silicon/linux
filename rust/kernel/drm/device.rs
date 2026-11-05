@@ -192,7 +192,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         dumb_create: T::Object::ALLOC_OPS.dumb_create,
         dumb_map_offset: T::Object::ALLOC_OPS.dumb_map_offset,
 
-        show_fdinfo: Some(drm::File::<T::File>::show_fdinfo_callback),
+        show_fdinfo: None,
         fbdev_probe: None,
 
         major: T::INFO.major,
@@ -207,8 +207,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         fops: &Self::GEM_FOPS,
     };
 
-    const GEM_FOPS: bindings::file_operations =
-        drm::gem::create_fops(crate::module::this_module::<T::OwnerModule>().as_ptr());
+    const GEM_FOPS: bindings::file_operations = drm::gem::create_fops(T::MODULE);
 
     /// Create a new `UnregisteredDevice` for a `drm::Driver`.
     ///
@@ -252,7 +251,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         // SAFETY:
         // - `raw_data` is a valid pointer to uninitialized memory.
         // - `raw_data` will not move until it is dropped.
-        unsafe { pin_init::raw_try_init(raw_data, data) }.inspect_err(|_| {
+        unsafe { data.__pinned_init(raw_data) }.inspect_err(|_| {
             // SAFETY: `__drm_dev_alloc()` was successful, hence `drm_dev` must be valid and the
             // refcount must be non-zero.
             unsafe { bindings::drm_dev_put(drm_dev) };
@@ -299,26 +298,6 @@ pub struct Device<T: drm::Driver, C: DeviceContext = Normal> {
 impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     pub(crate) fn as_raw(&self) -> *mut bindings::drm_device {
         self.dev.get()
-    }
-
-    /// Reports that device execution is unavailable and the recovery method is unknown.
-    ///
-    /// May sleep: call in task context outside fence signalling and driver locks.
-    /// A registration guard keeps the parent bound throughout event delivery; a device
-    /// still being probed or already unplugged cannot deliver the event.
-    pub fn report_wedged(&self) -> Result {
-        // SAFETY: Every device context satisfies the weaker Normal context invariants.
-        let normal = unsafe { self.assume_ctx::<Normal>() };
-        let _registration = normal.registration_guard().ok_or(ENODEV)?;
-        let raw = self.as_raw();
-        // SAFETY: The referenced device and its registered primary node remain live under
-        // the registration guard. A probe failure has already been rejected above.
-        if unsafe { (*raw).primary.is_null() } {
-            return Err(ENODEV);
-        }
-        // SAFETY: The device/node are live, 0 asks DRM to report an unknown recovery method,
-        // and a NULL task means no userspace task is attributed as guilty.
-        crate::error::to_result(unsafe { bindings::drm_dev_wedged_event(raw, 0, ptr::null_mut()) })
     }
 
     /// # Safety

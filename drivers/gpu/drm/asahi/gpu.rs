@@ -11,6 +11,7 @@
 //! are unified, so that the top level of the driver itself (in `driver`) does not have to concern
 //! itself with version dependence.
 
+use crate::module_parameters;
 use core::any::Any;
 use core::ops::Range;
 use core::slice;
@@ -35,7 +36,6 @@ use kernel::{
     },
     macros::versions,
     new_mutex,
-    new_spinlock,
     prelude::*,
     soc::apple::rtkit,
     sync::{
@@ -45,7 +45,6 @@ use kernel::{
         },
         Arc,
         Mutex,
-        SpinLock,
         UniqueArc, //
     },
     time::{
@@ -86,7 +85,6 @@ use crate::{
     queue,
     regs,
     stats,
-    stats_raw,
     workqueue, //
 };
 
@@ -261,29 +259,17 @@ pub(crate) struct GpuManager {
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
     stats: Arc<stats::StatsSnapshot>,
-    /// Last raw firmware statistics of this device, exported read-only
-    /// through `stats_raw`.
-    raw_stats: Arc<SpinLock<stats_raw::RawStatsSnapshot>>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
+    #[allow(clippy::vec_box)]
     #[pin]
-    garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+    garbage_contexts: Mutex<KVec<KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>>>,
 }
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
-    /// Admission bound checked before copying the userspace command stream.
-    fn max_cmdbuf_size(&self) -> usize {
-        usize::MAX
-    }
-
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
-
-    /// The raw firmware statistics snapshot of this GPU, if its firmware reports any.
-    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
-        None
-    }
 
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
@@ -299,10 +285,6 @@ pub(crate) trait Gpu: Send + Sync {
     fn is_crashed(&self) -> bool;
     /// Fill in the hardware description reported to userspace.
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result;
-    /// Whether unmapped GPU reads return zero (fault_control programmed into the firmware).
-    fn supports_soft_faults(&self) -> bool {
-        crate::module_parameters::fault_control.value() == 0xb
-    }
     /// Whether user VMs retain a sticky error and support a userspace mirror.
     fn supports_vm_status(&self) -> bool {
         false
@@ -315,14 +297,14 @@ pub(crate) trait Gpu: Send + Sync {
     fn feature_flags(&self) -> u64 {
         let mut flags = 0;
         if self.supports_vm_status() {
-            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
+            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS as u64
+                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR as u64;
         }
         if self.queue_limits().is_some() {
-            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
+            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES as u64;
         }
-        if self.soft_faults() && self.supports_soft_faults() {
-            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
+        if self.soft_faults() && *module_parameters::fault_control.value() == 0xb {
+            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
         flags
     }
@@ -330,38 +312,35 @@ pub(crate) trait Gpu: Send + Sync {
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         None
     }
-    /// The VA range that user VMs may use (`vm_start..vm_end` of GET_PARAMS).
-    fn user_range(&self) -> Range<u64> {
-        self.uat_geometry().user_usable_range()
-    }
-    /// Whether this GPU uses the tracked submission model of `file.rs` (besides G17, which
-    /// `file.rs` recognizes by type): VM_BIND batches are validated as a whole against
-    /// driver-reserved ranges before any change, and SUBMIT copies the command buffer before
-    /// resolving syncs because the queue installs a fence in every output sync even on failure.
-    fn tracked_submission(&self) -> bool {
-        false
-    }
-    /// Whether SOFT_FAULTS may be advertised when `fault_control` selects soft faults.
-    fn soft_faults(&self) -> bool {
-        true
-    }
-    /// Whether new user objects must be populated, cleaned to the point of coherency and pinned
-    /// at creation, before any CPU view exists (GPUs whose device is not DMA-coherent and whose
-    /// default CPU mappings are write-combined).
-    fn prepare_new_objects(&self) -> bool {
-        false
-    }
-    /// The largest VM_BIND batch, if the GPU's UAPI contract bounds it; with a bound, a batch also
-    /// needs at least one operation, a non-null pointer and a stride that is a multiple of 8 and at
-    /// most a page (EINVAL otherwise). `None` keeps the shared rules.
-    fn bind_batch_limit(&self) -> Option<u32> {
-        None
-    }
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
-    /// Admit a client's parameter ABI before creating its VM.
+    /// Backend-specific user address aperture; other GPUs keep their geometry's range.
+    fn user_range(&self) -> Range<u64> {
+        self.uat_geometry().user_usable_range()
+    }
+    /// Use tracked command publication and sticky VM status on this backend.
+    fn tracked_submission(&self) -> bool {
+        false
+    }
+    /// Whether faults may be reported as recoverable to userspace.
+    fn soft_faults(&self) -> bool {
+        true
+    }
+    /// Populate and clean fresh object backing before any WC CPU mapping.
+    fn prepare_new_objects(&self) -> bool {
+        false
+    }
+    /// Optional backend-specific upper bound for a VM_BIND batch.
+    fn bind_batch_limit(&self) -> Option<u32> {
+        None
+    }
+    /// A userspace VM handle was closed; release backend-only registry references.
+    fn vm_closed(&self) {}
+    /// Whether a file may create a VM: `params_size` is the largest size it asked GET_PARAMS
+    /// for the global parameters with, `flags` its VM_CREATE flags. Every GPU but the M3
+    /// T8122 runtime admits any client.
     fn admit_vm(&self, _dev: &kernel::device::Device, _params_size: u64, _flags: u32) -> Result {
         Ok(())
     }
@@ -371,13 +350,6 @@ pub(crate) trait Gpu: Send + Sync {
     }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
-    /// Create a VM charged to a DRM file when the backend bounds retained bindings.
-    fn new_vm_for_file(&self, kernel_range: Range<u64>, _file_id: u64) -> Result<mmu::Vm> {
-        self.new_vm(kernel_range)
-    }
-    /// Release the backend's handle owner after closing user mapping admission.
-    /// Accepted jobs and firmware resource leases retain their own references.
-    fn vm_closed(&self, _vm: &mmu::Vm) {}
     /// Create a new user command queue.
     fn new_queue(
         &self,
@@ -386,14 +358,13 @@ pub(crate) trait Gpu: Send + Sync {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
-        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>>;
-    /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
+    /// Map a BO as a timestamp buffer
     fn map_timestamp_buffer(
         &self,
         bo: gem::ObjectRef,
         range: Range<usize>,
-    ) -> Result<crate::timestamp::Buffer>;
+    ) -> Result<mmu::KernelMapping>;
 }
 
 /// Trait used to abstract the firmware/GPU-dependent variants of the GpuManager.
@@ -435,8 +406,8 @@ pub(crate) trait GpuManager: Send + Sync {
     fn get_cfg(&self) -> &'static hw::HwConfig;
     /// Get the dynamic GPU configuration for this SoC.
     fn get_dyncfg(&self) -> &hw::DynConfig;
-    /// Register an unused context, with the objects it retains, for invalidation.
-    fn free_context(&self, ctx: workqueue::RetiredContext);
+    /// Register an unused context as garbage
+    fn free_context(&self, data: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>);
 }
 
 /// Private generic trait for functions that don't need to escape this module.
@@ -781,7 +752,6 @@ impl GpuManager::ver {
                 },
                 map_kernel_to_user,
                 mmu::UatFirmware::Handoff,
-                mmu::UatQuirks::DEFAULT,
             )?,
             GFP_KERNEL,
         )?)
@@ -846,12 +816,6 @@ impl GpuManager::ver {
         let buffer_mgr_clone = buffer_mgr.clone();
         let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
         let stats_snap_clone = stats_snap.clone();
-        // Per-device raw statistics snapshot, shared with the debugfs export.
-        let raw_stats_snap = Arc::pin_init(
-            new_spinlock!(stats_raw::RawStatsSnapshot::default(), "asahi_stats_raw"),
-            GFP_KERNEL,
-        )?;
-        let raw_stats_snap_clone = raw_stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -867,7 +831,6 @@ impl GpuManager::ver {
                     dev.into(),
                     alloc_ref,
                     stats_snap_clone,
-                    raw_stats_snap_clone,
                     u64::from(cfg.base_clock_hz),
                 )?,
             }),
@@ -895,7 +858,6 @@ impl GpuManager::ver {
                 crashed: AtomicBool::new(false),
                 event_manager,
                 stats: stats_snap.clone(),
-                raw_stats: raw_stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
@@ -1127,7 +1089,7 @@ impl GpuManager::ver {
                     virt_addr: U64(iova + off as u64),
                     total_size: (map.size * map.count * dies) as u32,
                     element_size: map.size as u32,
-                    readwrite: U64(u64::from(map.writable)),
+                    readwrite: U64(map.writable as u64),
                 };
             });
 
@@ -1177,14 +1139,20 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let guard = self.dev.registration_guard()?;
+        let Some(guard) = self.dev.registration_guard() else {
+            return None;
+        };
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if let Some(fault) = &info {
-                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
+            if info.is_some() {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "  Fault info: {:#x?}\n",
+                    info.as_ref().unwrap()
+                );
             }
             info
         })
@@ -1351,10 +1319,6 @@ impl Gpu for GpuManager::ver {
         Some(self.stats.clone())
     }
 
-    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
-        Some(self.raw_stats.clone())
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1437,7 +1401,6 @@ impl Gpu for GpuManager::ver {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
-        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>> {
         let mut kalloc = self.alloc();
         let id = self.ids.queue.next();
@@ -1455,7 +1418,6 @@ impl Gpu for GpuManager::ver {
                 id,
                 priority,
                 usc_exec_base,
-                usage,
             )?,
             GFP_KERNEL,
         )?)
@@ -1465,15 +1427,15 @@ impl Gpu for GpuManager::ver {
         &self,
         mut bo: gem::ObjectRef,
         range: Range<usize>,
-    ) -> Result<crate::timestamp::Buffer> {
-        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
+    ) -> Result<mmu::KernelMapping> {
+        bo.map_range_into_range(
             self.uat.kernel_vm(),
             range,
             IOVA_KERN_TIMESTAMP_RANGE,
             mmu::UAT_PGSZ as u64,
             mmu::PROT_FW_SHARED_RW,
             false,
-        )?)
+        )
     }
 }
 
@@ -1498,7 +1460,7 @@ impl GpuManager for GpuManager::ver {
         core::mem::swap(&mut *self.garbage_contexts.lock(), &mut garbage_ctx);
 
         for ctx in garbage_ctx {
-            if self.invalidate_context(&ctx.data).is_err() {
+            if self.invalidate_context(&ctx).is_err() {
                 dev_err!(
                     self.dev.as_ref(),
                     "GpuContext: Failed to invalidate GPU context!\n"
@@ -1507,9 +1469,6 @@ impl GpuManager for GpuManager::ver {
                     panic!("GPU firmware timed out");
                 }
             }
-            // The firmware no longer knows the context's queues, so their structures may go now,
-            // ahead of the context data they point to.
-            core::mem::drop(ctx.retained);
         }
 
         let mut guard = self.alloc.lock();
@@ -1778,7 +1737,7 @@ impl GpuManager for GpuManager::ver {
         &self.dyncfg
     }
 
-    fn free_context(&self, ctx: workqueue::RetiredContext) {
+    fn free_context(&self, ctx: KBox<fw::types::GpuObject<fw::workqueue::GpuContextData>>) {
         let mut garbage = self.garbage_contexts.lock();
 
         if garbage.push(ctx, GFP_KERNEL).is_err() {

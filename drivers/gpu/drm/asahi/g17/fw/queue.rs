@@ -20,8 +20,6 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel::prelude::*;
 
-use super::variant::PointerLayout;
-
 use super::kick::{KickTimestamp, QID_MAX};
 
 /// Firmware scheduling profile of a queue.
@@ -96,8 +94,6 @@ pub(crate) enum CommandTag {
     QueueConfig = 0x0f,
     /// [`KickPredecessor`].
     KickPredecessor = 0x10,
-    /// [`InitBufferManager`] (25G83 firmware).
-    InitBufferManager = 5,
 }
 
 /// The engine that executes a queue's work.
@@ -119,29 +115,26 @@ pub(crate) enum DataMaster {
 ///
 /// - creation: the whole block, [`PointerBlock::new`], before the queue is
 ///   first published;
-/// - publication: the producer, with one aligned 32-bit store per publication
+/// - publication: `producer`, with one aligned 32-bit store per publication
 ///   step, after a barrier that orders the work pointers and commands before
 ///   it;
 /// - reuse of a render queue for a new owner: [`PointerBlock::rebase`].
-///
-/// Where the producer and the recovery target live depends on the firmware
-/// build ([`PointerLayout`]).
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct PointerBlock {
     /// Item-ring position up to which the firmware has finished commands.
-    /// Free ring space is measured from it, so it bounds the producer.
+    /// Free ring space is measured from it, so it bounds `producer`.
     pub(crate) done: AtomicU32,
     pub(crate) unk_04: [u32; 11],
     /// Written by the firmware. The host treats the queue as idle only when
-    /// this cursor, `done` and the producer are equal.
+    /// this cursor, `done` and `producer` are equal.
     pub(crate) unk_30: AtomicU32,
     pub(crate) unk_34: [u32; 3],
-    /// 26A428: item-ring position after the last work pointer the host published.
-    word_40: AtomicU32,
+    /// Item-ring position after the last work pointer the host published.
+    pub(crate) producer: AtomicU32,
     pub(crate) unk_44: [u32; 3],
-    /// 26A428: on recovery, the host copies the producer here before acknowledging resume.
-    word_50: AtomicU32,
+    /// On recovery, the host copies producer here before acknowledging resume.
+    pub(crate) recovery_target: u32,
     pub(crate) unk_54: [u32; 3],
     /// Number of entries in the item ring.
     pub(crate) entries: u32,
@@ -150,62 +143,29 @@ pub(crate) struct PointerBlock {
 
 static_assert!(size_of::<PointerBlock>() == 0x80);
 static_assert!(core::mem::offset_of!(PointerBlock, unk_30) == 0x30);
-static_assert!(core::mem::offset_of!(PointerBlock, word_40) == 0x40);
-static_assert!(core::mem::offset_of!(PointerBlock, word_50) == 0x50);
+static_assert!(core::mem::offset_of!(PointerBlock, producer) == 0x40);
 static_assert!(core::mem::offset_of!(PointerBlock, entries) == 0x60);
 
 // SAFETY: PointerBlock contains only integers and integer atomics.
 unsafe impl Zeroable for PointerBlock {}
 
 impl PointerBlock {
-    /// Offsets of the two host words a [`PointerLayout`] may name.
-    const WORD_40: usize = core::mem::offset_of!(Self, word_40);
-    const WORD_50: usize = core::mem::offset_of!(Self, word_50);
-
-    /// Whether `offset` is one of the host words a [`PointerLayout`] may name.
-    const fn is_host_word(offset: usize) -> bool {
-        offset == Self::WORD_40 || offset == Self::WORD_50
-    }
-
-    /// Whether `layout` names host words of the block, and two different ones when it has a
-    /// recovery target. Every firmware variant's layout is checked at build time.
-    pub(crate) const fn valid_layout(layout: &PointerLayout) -> bool {
-        match layout.recovery_target {
-            None => Self::is_host_word(layout.producer),
-            Some(target) => {
-                Self::is_host_word(layout.producer)
-                    && Self::is_host_word(target)
-                    && target != layout.producer
-            }
-        }
-    }
+    pub(crate) const PRODUCER: usize = core::mem::offset_of!(Self, producer);
+    pub(crate) const RECOVERY_TARGET: usize = core::mem::offset_of!(Self, recovery_target);
 
     /// Returns the cursors of an empty item ring.
-    pub(crate) fn new(layout: &PointerLayout) -> Result<Self> {
-        let block = Self {
+    pub(crate) const fn new() -> Self {
+        Self {
             done: AtomicU32::new(0),
             unk_04: [0; 11],
             unk_30: AtomicU32::new(0),
             unk_34: [0; 3],
-            word_40: AtomicU32::new(0),
+            producer: AtomicU32::new(0),
             unk_44: [0; 3],
-            word_50: AtomicU32::new(0),
+            recovery_target: u32::MAX,
             unk_54: [0; 3],
             entries: ITEM_RING_ENTRIES,
             unk_64: [0; 7],
-        };
-        if let Some(target) = layout.recovery_target {
-            block.word(target)?.store(u32::MAX, Ordering::Relaxed);
-        }
-        Ok(block)
-    }
-
-    /// The host word at `offset`, which must be one a [`PointerLayout`] may name.
-    fn word(&self, offset: usize) -> Result<&AtomicU32> {
-        match offset {
-            Self::WORD_40 => Ok(&self.word_40),
-            Self::WORD_50 => Ok(&self.word_50),
-            _ => Err(EINVAL),
         }
     }
 
@@ -214,14 +174,12 @@ impl PointerBlock {
     /// Used when a render queue pair that was kicked before is handed to a new
     /// owner, with `base` the position the host tracks for the new owner's
     /// queues. Only valid while the firmware does not run the queue, with all
-    /// three cursors zero. Writes `done`, `unk_30` and the producer, in this
+    /// three cursors zero. Writes `done`, `unk_30` and `producer`, in this
     /// order, with single stores; the caller issues a full barrier afterwards.
-    pub(crate) fn rebase(&self, layout: &PointerLayout, base: u32) -> Result {
-        let producer = self.word(layout.producer)?;
+    pub(crate) fn rebase(&self, base: u32) {
         self.done.store(base, Ordering::Relaxed);
         self.unk_30.store(base, Ordering::Relaxed);
-        producer.store(base, Ordering::Relaxed);
-        Ok(())
+        self.producer.store(base, Ordering::Relaxed);
     }
 }
 
@@ -313,12 +271,12 @@ impl QueueRecord {
             job_list_va: args.job_list_va,
             unk_18: [0; 0xc],
             unk_24: u32::MAX,
-            priority: [u32::from(args.policy.priority()); 2],
+            priority: [args.policy.priority() as u32; 2],
             unk_30: [0; 6],
             unk_36: u16::MAX,
             unk_38: 0,
             unk_3c: 0,
-            policy: u32::from(args.policy.policy()),
+            policy: args.policy.policy() as u32,
             unk_44: u32::MAX,
             owner_pid: args.owner_pid,
             unk_4c: [0; 0x50],
@@ -349,12 +307,12 @@ impl QueueRecord {
     /// Replaces the priority and policy words of an idle queue's record when they differ
     /// from `policy`.
     pub(crate) fn set_policy(&mut self, policy: Policy) {
-        let priority = [u32::from(policy.priority()); 2];
+        let priority = [policy.priority() as u32; 2];
         if { self.priority } != priority {
             self.priority = priority;
         }
-        if { self.policy } != u32::from(policy.policy()) {
-            self.policy = u32::from(policy.policy());
+        if { self.policy } != policy.policy() as u32 {
+            self.policy = policy.policy() as u32;
         }
     }
 }
@@ -522,7 +480,7 @@ impl QueueConfig {
                     binding.pb_va,
                     binding.pb_token,
                     binding.pb_slot,
-                    u32::from(binding.fragment_qid),
+                    binding.fragment_qid as u32,
                 )
             }
             QueueConfigTarget::Fragment => (DataMaster::Fragment, 0, u64::MAX, u32::MAX, u32::MAX),
@@ -533,14 +491,14 @@ impl QueueConfig {
             unk_04: 0,
             kick_ring_va: args.kick_ring_va,
             kick_ring_fw_va: args.kick_ring_fw_va,
-            qid: u16::from(args.qid),
-            install: u16::from(args.install),
+            qid: args.qid as u16,
+            install: args.install as u16,
             unk_1c: 0,
-            priority: u16::from(args.policy.priority()),
+            priority: args.policy.priority() as u16,
             unk_20: 0,
             data_master: data_master as u16,
             unk_24: 0,
-            completion_seed_valid: u32::from(args.completion_seed.is_some()),
+            completion_seed_valid: args.completion_seed.is_some() as u32,
             completion_seed: args.completion_seed.unwrap_or(0),
             context_id: args.context_id,
             unk_34: 0,
@@ -548,13 +506,13 @@ impl QueueConfig {
             free_list_generation: args.free_list.generation,
             free_list_slot: args.free_list.slot,
             scheduler_va: args.scheduler_va,
-            qos_update: u32::from(args.qos_update),
-            qos_slot: u16::from(args.qos_slot),
+            qos_update: args.qos_update as u32,
+            qos_slot: args.qos_slot as u16,
             unk_58: 0,
             owner_pid: args.owner_pid,
             policy: args.policy.policy(),
             unk_60: 0,
-            context_update: u16::from(args.context_update),
+            context_update: args.context_update as u16,
             unk_64: 0,
             unk_66: Self::UNK_66,
             unk_68: [0; 6],
@@ -564,37 +522,6 @@ impl QueueConfig {
             fragment_qid,
             unk_86: [0; 0x3a],
         })
-    }
-}
-
-/// The 25G83 firmware's buffer-manager initialization (tag 5), before the first tiling
-/// descriptor that uses a parameter buffer. The block count is read from the manager.
-#[repr(C, packed)]
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct InitBufferManager {
-    /// [`CommandTag::InitBufferManager`].
-    pub(crate) tag: u32,
-    /// UAT context of the pass.
-    pub(crate) context_id: u32,
-    /// Buffer slot of the parameter buffer.
-    pub(crate) pb_slot: u32,
-    /// GPU address of the parameter-buffer state object.
-    pub(crate) pb_va: u64,
-    /// Tiling stamp value of the pass.
-    pub(crate) stamp_value: u32,
-}
-
-static_assert!(size_of::<InitBufferManager>() == 0x18);
-
-impl InitBufferManager {
-    pub(crate) fn new(context_id: u32, pb_slot: u32, pb_va: u64, stamp_value: u32) -> Self {
-        Self {
-            tag: CommandTag::InitBufferManager as u32,
-            context_id,
-            pb_slot,
-            pb_va,
-            stamp_value,
-        }
     }
 }
 
@@ -637,7 +564,7 @@ impl KickAnnounce {
         }
         Ok(Self {
             tag: CommandTag::KickAnnounce as u32,
-            qid: u16::from(qid),
+            qid: qid as u16,
             count: 1,
             priority,
             timestamp: timestamp.get(),
@@ -676,7 +603,7 @@ impl KickPredecessor {
         }
         Ok(Self {
             tag: CommandTag::KickPredecessor as u32,
-            qid: u16::from(qid),
+            qid: qid as u16,
             previous: previous.get(),
             unk_0e: Self::UNK_0E,
         })
