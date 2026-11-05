@@ -5587,8 +5587,24 @@ err_piodma:
 static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when);
 
 /*
- * The T8122 dcpext boots its firmware here. If that fails, it must not take
- * the internal panel's DRM device down with it: keep it as an unusable pipe.
+ * The external processors whose failure must not take the DRM device down:
+ * T8122's, T6041's and T6050's dcpext. One that fails to probe or bind joins
+ * as an unusable pipe (ext_dead), and the other displays go on without it.
+ * With every processor failed the DRM device has no pipe and does not bind.
+ */
+static bool dcp_ext_is_failsafe(struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8122-dcpext") ||
+	       of_device_is_compatible(np, "apple,t6041-dcpext") ||
+	       of_device_is_compatible(np, "apple,t6050-dcpext");
+}
+
+/*
+ * A failsafe dcpext (dcp_ext_is_failsafe()) boots its firmware here. If that
+ * fails, it must not take the other displays' DRM device down with it: keep
+ * it as an unusable pipe. Its routes have registered by now and cannot be
+ * taken back, so a deferral here would be final as well: probe waits for the
+ * suppliers bind looks up (dcp_ext_bind_suppliers()) so that none comes here.
  */
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
@@ -6023,8 +6039,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp->desktop->client = GENMASK_ULL(63, 48) |
 				       (get_random_u64() & GENMASK_ULL(47, 4));
 	}
-	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext") ||
-			    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
+	dcp->ext_failsafe = dcp_ext_is_failsafe(dev->of_node);
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp_external_audio_init(dcp);
@@ -6408,7 +6423,7 @@ fixed_done:
 static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when)
 {
 	WRITE_ONCE(dcp->ext_dead, true);
-	dev_err(dcp->dev, "external display processor unusable (%s failed: %d); the internal display goes on without it\n",
+	dev_err(dcp->dev, "external display processor unusable (%s failed: %d); the other displays go on without it\n",
 		when, err);
 	dcp_typec_routes_disable(dcp);
 }
@@ -6451,6 +6466,46 @@ static int dcp_ext_route_suppliers(struct device *dev)
 	return 0;
 }
 
+/* -EPROBE_DEFER while the device of available node @np has not bound. */
+static int dcp_ext_supplier_bound(struct device_node *np)
+{
+	struct platform_device *pdev;
+	int ret = 0;
+
+	if (!np || !of_device_is_available(np))
+		return 0;
+	pdev = of_find_device_by_node(np);
+	if (!pdev || !device_is_bound(&pdev->dev))
+		ret = -EPROBE_DEFER;
+	if (pdev)
+		put_device(&pdev->dev);
+	return ret;
+}
+
+/*
+ * Whether the suppliers that component bind looks up, and that probe does not
+ * otherwise wait for, are there: the PIODMA child's DART (a child node's
+ * supplier does not hold up the parent's probe) and the mailbox. Bind runs
+ * after the Type-C routes registered, where a deferral can only leave the
+ * dcpext unusable for the boot (dcp_comp_bind()). Returns -EPROBE_DEFER until
+ * they have bound; a missing one is left to bind, which reports it.
+ */
+static int dcp_ext_bind_suppliers(struct device *dev)
+{
+	struct device_node *piodma __free(device_node) =
+		of_get_child_by_name(dev->of_node, "piodma");
+	struct device_node *dart __free(device_node) =
+		piodma ? of_parse_phandle(piodma, "iommus", 0) : NULL;
+	struct device_node *mbox __free(device_node) =
+		of_parse_phandle(dev->of_node, "mboxes", 0);
+	int ret;
+
+	ret = dcp_ext_supplier_bound(dart);
+	if (!ret)
+		ret = dcp_ext_supplier_bound(mbox);
+	return ret;
+}
+
 /*
  * A T8132 dcpext's Type-C routes are only enabled for one the boot
  * loader handed over (see the display gate), and its USB-C port controllers
@@ -6479,10 +6534,11 @@ static int dcp_platform_probe_t8132_ext(struct platform_device *pdev)
 }
 
 /*
- * The T8122 dcpext is a component of the panel's DRM device, so it must
- * always register one, or the panel stays on the boot framebuffer. Keep
- * deferring while its suppliers may still appear (bounded by the deferred
- * probe timeout); on any other failure join as an unusable pipe.
+ * A failsafe dcpext (dcp_ext_is_failsafe()) is a component of the other
+ * displays' DRM device, so it must always register one, or they stay on the
+ * boot framebuffer. Keep deferring while its suppliers, its routes' and its
+ * bind's, may still appear (bounded by the deferred probe timeout); on any
+ * other failure join as an unusable pipe.
  */
 static int dcp_platform_probe(struct platform_device *pdev)
 {
@@ -6500,11 +6556,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
 		return dcp_platform_probe_t8132_ext(pdev);
-	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext") &&
-	    !of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
+	if (!dcp_ext_is_failsafe(dev->of_node))
 		return dcp_platform_probe_pipe(pdev);
 
 	ret = dcp_ext_route_suppliers(dev);
+	if (!ret)
+		ret = dcp_ext_bind_suppliers(dev);
 	if (ret)
 		goto unusable;
 
