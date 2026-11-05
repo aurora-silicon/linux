@@ -45,13 +45,10 @@ pub(crate) struct AsahiPlatformDriver;
 
 // #[pin_data(PinnedDrop)]
 pub(crate) struct AsahiPlatformDriverData<'bound> {
-    binding: crate::binding::Owner,
     _device: ARef<AsahiDrmDevice>,
     _reg: drm::Registration<'bound, AsahiDrmDriver>,
     /// The G17 GPU, whose coprocessors must be stopped when the driver is unbound.
     g17: Option<Arc<g17::Gpu>>,
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    pub(crate) g16: Option<Arc<crate::g16::Gpu>>,
     /// Raw `struct device *` of the platform device. Stored once at probe
     /// time so the `Drop` impl can find the sysfs file on unregister.
     raw_dev: *mut bindings::device,
@@ -79,18 +76,12 @@ pub(crate) type AsahiDevRef = ARef<AsahiDrmDevice>;
 pub(crate) type AsahiRegData<'drm> = AsahiDrmRegistrationData<'drm>;
 
 /// DRM Driver metadata
-///
-/// The major version names the UAPI generation in include/uapi/drm/asahi_drm.h
-/// and only changes if that ABI ever breaks. The minor version goes up with
-/// each new ioctl, flag or feature bit, so userspace can tell what a kernel
-/// accepts without probing. The patch level marks fixes userspace may need to
-/// detect.
 const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
-    major: 1,
+    major: 0,
     minor: 0,
     patchlevel: 0,
-    name: c"aurora",
-    desc: c"Aurora GPU for Apple AGX",
+    name: c"asahi",
+    desc: c"Apple AGX Graphics",
 };
 
 /// DRM Driver implementation for `AsahiDriver`.
@@ -105,6 +96,7 @@ impl drm::driver::Driver for AsahiDrmDriver {
     type ParentDevice<Ctx: DeviceContext> = platform::Device<Ctx>;
 
     const INFO: drm::driver::DriverInfo = INFO;
+    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
     const FEAT_RENDER: bool = true;
     const FEAT_SYNCOBJ: bool = true;
     const FEAT_SYNCOBJ_TIMELINE: bool = true;
@@ -144,82 +136,68 @@ pub(crate) enum ProbeConfig {
     M3(crate::m3::Chip),
 }
 
-// OF Device ID table. Linux 7.3's of_device_table!() takes no attributes on
-// its entries, so the entries that the native G15 backend owns when it is
-// built are passed in by configuration.
-macro_rules! asahi_of_device_table {
-    ($($g15_owned:tt)*) => {
-        kernel::of_device_table!(
-            OF_TABLE,
-            <AsahiPlatformDriver as platform::Driver>::IdInfo,
-            [
-                (
-                    of::DeviceId::new(c"apple,agx-t8140"),
-                    ProbeConfig::G17(&hw::t8140::CONFIG)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t6040"),
-                    ProbeConfig::G17(&hw::t6040::CONFIG)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t8103"),
-                    ProbeConfig::Legacy(&hw::t8103::HWCONFIG)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t8112"),
-                    ProbeConfig::Legacy(&hw::t8112::HWCONFIG)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t6000"),
-                    ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6000)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t6001"),
-                    ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6001)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t6002"),
-                    ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6002)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t6020"),
-                    ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6020)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t6021"),
-                    ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6021)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t6022"),
-                    ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6022)
-                ),
-                (
-                    of::DeviceId::new(c"apple,agx-t8122"),
-                    ProbeConfig::M3(crate::m3::Chip::T8122)
-                ),
-                $($g15_owned)*
-                (
-                    of::DeviceId::new(c"apple,agx-t6032"),
-                    ProbeConfig::M3(crate::m3::Chip::T6032)
-                ),
-            ]
-        );
-    };
-}
-
-#[cfg(not(CONFIG_DRM_ASAHI_G15))]
-asahi_of_device_table!(
-    (
-        of::DeviceId::new(c"apple,agx-t6030"),
-        ProbeConfig::M3(crate::m3::Chip::T6030)
-    ),
-    (
-        of::DeviceId::new(c"apple,agx-t6031"),
-        ProbeConfig::M3(crate::m3::Chip::T6031)
-    ),
+// OF Device ID table.
+kernel::of_device_table!(
+    OF_TABLE,
+    MODULE_OF_TABLE,
+    <AsahiPlatformDriver as platform::Driver>::IdInfo,
+    [
+        (
+            of::DeviceId::new(c"apple,agx-t8140"),
+            ProbeConfig::G17(&hw::t8140::CONFIG)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t8103"),
+            ProbeConfig::Legacy(&hw::t8103::HWCONFIG)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t8112"),
+            ProbeConfig::Legacy(&hw::t8112::HWCONFIG)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6000"),
+            ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6000)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6001"),
+            ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6001)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6002"),
+            ProbeConfig::Legacy(&hw::t600x::HWCONFIG_T6002)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6020"),
+            ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6020)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6021"),
+            ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6021)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6022"),
+            ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6022)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t8122"),
+            ProbeConfig::M3(crate::m3::Chip::T8122)
+        ),
+        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+        (
+            of::DeviceId::new(c"apple,agx-t6030"),
+            ProbeConfig::M3(crate::m3::Chip::T6030)
+        ),
+        #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+        (
+            of::DeviceId::new(c"apple,agx-t6031"),
+            ProbeConfig::M3(crate::m3::Chip::T6031)
+        ),
+        (
+            of::DeviceId::new(c"apple,agx-t6032"),
+            ProbeConfig::M3(crate::m3::Chip::T6032)
+        ),
+    ]
 );
-#[cfg(CONFIG_DRM_ASAHI_G15)]
-asahi_of_device_table!();
 
 /// Platform Driver implementation for `AsahiDriver`.
 impl platform::Driver for AsahiPlatformDriver {
@@ -227,12 +205,14 @@ impl platform::Driver for AsahiPlatformDriver {
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
     type Data<'bound> = AsahiPlatformDriverData<'bound>;
 
-    fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+    fn unbind<'bound>(
+        _pdev: &'bound platform::Device<Core<'_>>,
+        this: Pin<&Self::Data<'bound>>,
+    ) {
         if let Some(gpu) = this.g17.as_ref() {
             // Driver data is dropped after devres, so CPU control must happen in unbind.
             gpu.shutdown();
         }
-        this.close_binding();
     }
 
     /// Device probe function.
@@ -241,7 +221,6 @@ impl platform::Driver for AsahiPlatformDriver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         debug::update_debug_flags();
-        crate::memacct::LEDGER.configure();
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
@@ -251,7 +230,6 @@ impl platform::Driver for AsahiPlatformDriver {
             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
         };
 
-        // SAFETY: The selected SoC's UAT output width bounds all device DMA.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
 
         let resources = regs::Resources::new(pdev)?;
@@ -268,9 +246,6 @@ impl platform::Driver for AsahiPlatformDriver {
             .required_by(pdev.as_ref())?;
 
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
-        // SAFETY: Every adapter calls close_binding in unbind before devres;
-        // probe errors drop this local owner while the bound callback is live.
-        let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
 
         let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
             (hw::GpuGen::G13, _, &[12, 3, 0]) => {
@@ -302,19 +277,11 @@ impl platform::Driver for AsahiPlatformDriver {
         gpu.init()?;
 
         let stats = gpu.stats_snapshot();
-        let debug_stats = gpu.raw_stats_snapshot();
         let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
 
         // SAFETY: `reg` is stored in `AsahiPlatformDriverData` and dropped when the driver is
         // unbound; it is never forgotten.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
-
-        // The DRM core created this card's debugfs directory when the device was registered;
-        // publish the raw firmware statistics in it. drm_dev_unregister() removes the file, and
-        // waits for its readers, before the registration data that owns the snapshot is dropped.
-        if let Some(snapshot) = debug_stats.as_ref() {
-            crate::stats_raw::register(reg.device(), snapshot);
-        }
 
         // Register the sysfs file on the platform device. Must happen after
         // the DRM device is registered so the device is fully bound.
@@ -323,16 +290,13 @@ impl platform::Driver for AsahiPlatformDriver {
         let raw_stats = crate::sysfs_exports::register(
             raw_dev,
             snapshot,
-            stats.is_some() && module_parameters::stats_export.value() != 0,
+            stats.is_some() && *module_parameters::stats_export.value() != 0,
         )?;
 
         let driver = AsahiPlatformDriverData {
-            binding,
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
-            g16: None,
             raw_dev,
             raw_stats,
             stats,
@@ -352,9 +316,6 @@ impl AsahiPlatformDriver {
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
         let resources = regs::Resources::new(pdev)?;
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
-        // SAFETY: Every adapter calls close_binding in unbind before devres;
-        // probe errors drop this local owner while the bound callback is live.
-        let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
         let gpu = crate::g15::Gpu::new(pdev, &drm, cfg)?;
         let data = try_pin_init!(AsahiDrmRegistrationData {
             gpu: gpu as Arc<dyn gpu::Gpu>,
@@ -364,12 +325,9 @@ impl AsahiPlatformDriver {
         // G15 retains its firmware-visible state independently until reboot, even on error.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
         Ok(AsahiPlatformDriverData {
-            binding,
             _device: reg.device().into(),
             _reg: reg,
             g17: None,
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
-            g16: None,
             raw_dev: core::ptr::null_mut(),
             raw_stats: core::ptr::null_mut(),
             stats: None,
@@ -385,9 +343,6 @@ impl AsahiPlatformDriver {
         let resources = regs::Resources::new(pdev)?;
         let res = regs::G17Resources::new(pdev)?;
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
-        // SAFETY: Every adapter calls close_binding in unbind before devres;
-        // probe errors drop this local owner while the bound callback is live.
-        let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
         let gpu = g17::Gpu::new(pdev, &drm, cfg, res)?;
         let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
         let data = try_pin_init!(AsahiDrmRegistrationData {
@@ -403,73 +358,19 @@ impl AsahiPlatformDriver {
                 return Err(error);
             }
         };
-        let stats = gpu::Gpu::stats_snapshot(&*gpu);
+        // G17's firmware channel format has no supported stats decoder yet.
         let raw_dev = pdev.as_ref().as_raw();
-        let snapshot = stats.as_ref().map_or(core::ptr::null(), Arc::as_ptr);
-        let raw_stats = match crate::sysfs_exports::register_g17(
-            raw_dev,
-            snapshot,
-            module_parameters::stats_export.value() != 0,
-        ) {
+        let raw_stats = match crate::sysfs_exports::register(raw_dev, core::ptr::null(), false) {
             Ok(handle) => handle,
             Err(error) => {
                 gpu.shutdown();
                 return Err(error);
             }
         };
-        if let Err(error) =
-            crate::sysfs_exports::register_idle(raw_dev, crate::g17::power::IDLE_HOLD_MS.as_ptr())
-        {
-            dev_warn!(
-                pdev.as_ref(),
-                "idle_off_delay_ms not registered: {:?}\n",
-                error
-            );
-        }
         Ok(AsahiPlatformDriverData {
-            binding,
             _device: reg.device().into(),
             _reg: reg,
             g17: Some(gpu),
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
-            g16: None,
-            raw_dev,
-            raw_stats,
-            stats,
-        })
-    }
-}
-
-#[cfg(CONFIG_DRM_ASAHI_G16)]
-impl AsahiPlatformDriver {
-    pub(crate) fn probe_g16<'bound>(
-        pdev: &'bound platform::Device<Core<'_>>,
-        cfg: &'static crate::g16::Config,
-    ) -> Result<AsahiPlatformDriverData<'bound>> {
-        // SAFETY: the qualified UAT output width constrains this device's DMA.
-        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
-        let resources = regs::Resources::new(pdev)?;
-        let res = regs::G16Resources::new(pdev)?;
-        let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
-        // SAFETY: Every adapter calls close_binding in unbind before devres;
-        // probe errors drop this local owner while the bound callback is live.
-        let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
-        let gpu = crate::g16::Gpu::new(pdev, &drm, cfg, res)?;
-        let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
-        let data = try_pin_init!(AsahiDrmRegistrationData {
-            gpu: data_gpu,
-            resources,
-        });
-        // SAFETY: registration is stored in bound platform data and never forgotten.
-        let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
-        let raw_dev = pdev.as_ref().as_raw();
-        let raw_stats = crate::sysfs_exports::register(raw_dev, core::ptr::null(), false)?;
-        Ok(AsahiPlatformDriverData {
-            binding,
-            _device: reg.device().into(),
-            _reg: reg,
-            g17: None,
-            g16: Some(gpu),
             raw_dev,
             raw_stats,
             stats: None,
@@ -477,16 +378,9 @@ impl AsahiPlatformDriver {
     }
 }
 
-impl AsahiPlatformDriverData<'_> {
-    pub(crate) fn close_binding(&self) {
-        self.binding.close();
-    }
-}
-
 impl Drop for AsahiPlatformDriverData<'_> {
     fn drop(&mut self) {
-        self.binding.close();
-        // `self.raw_dev` was set in `probe` from the platform
+        // SAFETY: `self.raw_dev` was set in `probe` from the platform
         // device's `as_raw()`, valid for the lifetime of the bound driver.
         if !self.raw_dev.is_null() {
             crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);

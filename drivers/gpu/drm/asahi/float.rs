@@ -44,11 +44,6 @@ struct F32U {
 }
 
 impl F32 {
-    /// Return the IEEE-754 binary32 representation.
-    pub(crate) const fn to_bits(self) -> u32 {
-        self.0
-    }
-
     /// Convert a raw 32-bit representation into an F32
     pub(crate) const fn from_bits(u: u32) -> F32 {
         F32(u)
@@ -140,12 +135,12 @@ macro_rules! from_ints {
     ($u:ty, $i:ty) => {
         impl From<$i> for F32 {
             fn from(v: $i) -> F32 {
-                F32U::from_i64(i64::from(v)).pack()
+                F32U::from_i64(v as i64).pack()
             }
         }
         impl From<$u> for F32 {
             fn from(v: $u) -> F32 {
-                F32U::from_u64(u64::from(v)).pack()
+                F32U::from_u64(v as u64).pack()
             }
         }
     };
