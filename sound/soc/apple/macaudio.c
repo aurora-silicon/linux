@@ -91,6 +91,7 @@ struct macaudio_platform_cfg {
 	enum macaudio_amp_type amp;
 	enum macaudio_spkr_config speakers;
 	bool stereo;
+	/* The amps' highest gain ("Amp Gain Volume"); not for the SN012776 */
 	int amp_gain;
 	int safe_vol;
 	/*
@@ -130,11 +131,6 @@ struct macaudio_platform_cfg {
 	 */
 	unsigned int route_only_fes;
 	/*
-	 * The highest headphone volume, a "Jack DAC Playback Volume" value
-	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
-	 */
-	int jack_max_vol;
-	/*
 	 * The speaker front-end's channel count where the CPU component's
 	 * stream has more slots than amps (0: one channel per amp). The amps
 	 * keep the first slots in codec order; the others carry silence.
@@ -164,7 +160,6 @@ static const char *volume_control_names[] = {
 
 /* CS42L84 DAC: 0.5 dB steps from -128 dB, 256 = 0 dB, up to +12 dB */
 #define CS42L84_DAC_0DB 256
-#define CS42L84_DAC_DB(x) (CS42L84_DAC_0DB + 2 * (x))
 
 struct ma_codec_idle {
 	int idle_mode;
@@ -849,6 +844,82 @@ static bool macaudio_speakers_allowed(const struct macaudio_platform_cfg *cfg)
 		 cfg->amp == AMP_MAX98360A);
 }
 
+/*
+ * An SN012776's operating level: the second byte of its apple,speaker-config,
+ * the amp's row of its group's speaker-config in the Mac's ADT, which the
+ * boot loader copies to the amp's node. Only its low five bits are the level.
+ */
+#define SN012776_ROW_LEN	4
+#define SN012776_ROW_LEVEL	1
+#define SN012776_LEVEL_MASK	0x1f
+/* The highest level the amp's "Amp Gain Volume" takes */
+#define SN012776_LEVEL_MAX	0x14
+
+static int macaudio_sn012776_level(struct device_node *amp)
+{
+	u8 row[SN012776_ROW_LEN];
+	int level;
+
+	if (of_property_count_u8_elems(amp, "apple,speaker-config") != SN012776_ROW_LEN ||
+	    of_property_read_u8_array(amp, "apple,speaker-config", row, SN012776_ROW_LEN))
+		return -ENOENT;
+
+	level = row[SN012776_ROW_LEVEL] & SN012776_LEVEL_MASK;
+	return level <= SN012776_LEVEL_MAX ? level : -ERANGE;
+}
+
+/*
+ * Speakers on SN012776 amps run only when every amp has its level from the
+ * Mac; a boot loader that does not pass it leaves them off.
+ */
+static bool macaudio_sn012776_levels_present(struct device *dev,
+					     struct device_node *codec)
+{
+	struct of_phandle_args args;
+	int i, n, level;
+
+	n = of_count_phandle_with_args(codec, "sound-dai", "#sound-dai-cells");
+	for (i = 0; i < n; i++) {
+		if (of_parse_phandle_with_args(codec, "sound-dai",
+					       "#sound-dai-cells", i, &args))
+			return false;
+		level = macaudio_sn012776_level(args.np);
+		if (level < 0)
+			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
+				level == -ENOENT ? "no" : "out-of-range");
+		of_node_put(args.np);
+		if (level < 0)
+			return false;
+	}
+	return n > 0;
+}
+
+/* Every SN012776's "Amp Gain Volume" ends at its own level */
+static int macaudio_limit_sn012776_levels(struct snd_soc_card *card)
+{
+	struct snd_soc_component *component;
+	char name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
+	int level, ret;
+
+	for_each_card_components(card, component) {
+		struct device_node *np = component->dev->of_node;
+
+		if (!np || !of_device_is_compatible(np, "ti,sn012776"))
+			continue;
+		level = macaudio_sn012776_level(np);
+		if (level < 0)
+			return dev_err_probe(card->dev, level, "%pOF: no amp level\n", np);
+		snprintf(name, sizeof(name), "%s%sAmp Gain Volume",
+			 component->name_prefix ?: "",
+			 component->name_prefix ? " " : "");
+		ret = snd_soc_limit_volume(card, name, level);
+		if (ret != 1)
+			return dev_err_probe(card->dev, ret < 0 ? ret : -EINVAL,
+					     "limit on '%s': %d\n", name, ret);
+	}
+	return 0;
+}
+
 static int macaudio_parse_of_component(struct device_node *node, int index,
 				struct snd_soc_dai_link_component *comp)
 {
@@ -1050,6 +1121,17 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			if (!macaudio_speakers_allowed(ma->cfg)) {
 				dev_err(card->dev, "driver can't assure safety on this model, disabling speakers\n");
 				continue;
+			}
+			if (ma->cfg->amp == AMP_SN012776) {
+				struct device_node *spk_codec = of_get_child_by_name(np, "codec");
+				bool levels = spk_codec &&
+					macaudio_sn012776_levels_present(card->dev, spk_codec);
+
+				of_node_put(spk_codec);
+				if (!levels) {
+					dev_err(card->dev, "the boot loader passed no amp levels, disabling speakers\n");
+					continue;
+				}
 			}
 			ma->has_speakers = 1;
 			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0)
@@ -1831,9 +1913,12 @@ static int macaudio_set_fixed_enum(struct snd_soc_card *card, const char *name,
 	unsigned int i;
 	int ret;
 
-	ret = snd_soc_set_enum_kctl(card, name, value);
-	if (ret < 0)
-		return ret;
+	/* NULL: keep the value the control has */
+	if (value) {
+		ret = snd_soc_set_enum_kctl(card, name, value);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = snd_soc_deactivate_kctl(card, name, 0);
 	if (ret < 0)
@@ -1889,9 +1974,13 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 		if (ma->cfg->stereo)
 			CHECK_CONCAT(macaudio_set_fixed_enum, "ASI1 Sel", "Left");
 
-		CHECK_CONCAT(snd_soc_limit_volume, "Amp Gain Volume", ma->cfg->amp_gain);
+		/*
+		 * The tweeters' playback high-pass stays at 800 Hz, the
+		 * protection floor; the woofers keep the corner the amps were
+		 * given from the Mac's ADT.
+		 */
 		CHECK_CONCAT(macaudio_set_fixed_enum, "HPF Corner Frequency",
-			     tweeter ? "800 Hz" : "2 Hz");
+			     tweeter ? "800 Hz" : NULL);
 
 		CHECK_CONCAT(macaudio_set_fixed_enum, "OCE Handling", "Retry");
 		break;
@@ -1923,13 +2012,28 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 			 "Apple%s", p + 1);
 	}
 
-	/* Before the card registers: userspace never sees the codec's full range */
-	if (ma->cfg->jack_max_vol)
+	/*
+	 * Before the card registers, so userspace never sees the codec's full
+	 * range: a CS42L84 jack stops at the DAC's 0 dB. Above it the DAC only
+	 * adds digital gain, which clips a full-scale signal, and macOS's own
+	 * headphone volume ends at 0 dB on every machine (the "Built-in
+	 * Headphone" OutputVolumeMax of the machine's audio configuration).
+	 * The same for every board; a card without a CS42L84 jack (the
+	 * speaker-only cards) has no such control.
+	 */
+	if (snd_soc_card_get_kcontrol(card, "Jack DAC Playback Volume"))
 		CHECK(snd_soc_limit_volume, "Jack DAC Playback Volume",
-		      ma->cfg->jack_max_vol, 1);
+		      CS42L84_DAC_0DB, 1);
 
 	if (!ma->has_speakers)
 		return 0;
+
+	if (ma->cfg->amp == AMP_SN012776) {
+		int ret = macaudio_limit_sn012776_levels(card);
+
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * This needs some care to avoid matches against cs42l84's
@@ -2203,9 +2307,14 @@ static const struct snd_soc_dapm_route macaudio_dapm_routes[] = {
 	{ "PCM2 RX", NULL, "Speaker Sense Capture" },
 };
 
-/*	enable	amp		speakers	stereo	gain	safe_vol */
+/*
+ *	enable	amp		speakers	stereo	gain	safe_vol
+ *
+ * An SN012776's gain is not here: each amp's operating level comes from the
+ * Mac's ADT, through the amp's apple,speaker-config.
+ */
 struct macaudio_platform_cfg macaudio_j180_cfg = {
-	false,	AMP_SN012776,	SPKR_1W1T,	false,	10,	-20,
+	false,	AMP_SN012776,	SPKR_1W1T,	false,	0,	-20,
 };
 struct macaudio_platform_cfg macaudio_j274_cfg = {
 	true,	AMP_TAS5770,	SPKR_1W,	false,	20,	-20,
@@ -2245,23 +2354,23 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 };
 
 struct macaudio_platform_cfg macaudio_j314_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j316_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j37x_j47x_cfg = {
-	true,	AMP_SN012776,	SPKR_1W,	false,	20,	-20,
+	true,	AMP_SN012776,	SPKR_1W,	false,	0,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j413_cfg = {
-	true,	AMP_SN012776,	SPKR_1W1T,	true,	15,	-20,
+	true,	AMP_SN012776,	SPKR_1W1T,	true,	0,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j415_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j45x_cfg = {
@@ -2269,7 +2378,7 @@ struct macaudio_platform_cfg macaudio_j45x_cfg = {
 };
 
 struct macaudio_platform_cfg macaudio_j493_cfg = {
-	true,	AMP_SN012776,	SPKR_2W,	true,	15,	-20,
+	true,	AMP_SN012776,	SPKR_2W,	true,	0,	-20,
 };
 
 /*
@@ -2287,7 +2396,6 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
 	.stereo = true,
-	.amp_gain = 15,
 	.safe_vol = -20,
 	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
 	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
@@ -2309,7 +2417,6 @@ struct macaudio_platform_cfg macaudio_j614_cfg = {
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
 	.stereo = true,
-	.amp_gain = 15,
 	.safe_vol = -20,
 	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
 	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
@@ -2331,7 +2438,6 @@ struct macaudio_platform_cfg macaudio_j713_cfg = {
 	.amp = AMP_SN012776,
 	.speakers = SPKR_1W1T,
 	.stereo = true,
-	.amp_gain = 15,
 	.safe_vol = -20,
 	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
 	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
@@ -2358,13 +2464,6 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
 	.fe_cpu_is_platform = true,
 	.route_only_fes = BIT(1),
-	/*
-	 * Above 0 dB the DAC only adds digital gain, which clips a full-scale
-	 * signal. The 6 dB below that are margin: the analog full scale of
-	 * this board's headphone output is unmeasured, and macOS adapts it to
-	 * the impedance it detects, which this driver does not.
-	 */
-	.jack_max_vol = CS42L84_DAC_DB(-6),
 };
 
 struct macaudio_platform_cfg macaudio_fallback_cfg = {
@@ -2438,7 +2537,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
-	/* The J713 jack runs on the AOP like the J616s one, with the same cap. */
+	/* The J713 jack runs on the AOP like the J616s one. */
 	{ .compatible = "apple,j713-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
@@ -2576,4 +2675,7 @@ MODULE_LICENSE("GPL");
 #if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
 #include "macaudio-admission-test.h"
 #include "macaudio-pm-volumes-test.h"
+#if IS_ENABLED(CONFIG_OF_OVERLAY)
+#include "macaudio-amp-level-test.h"
+#endif
 #endif
