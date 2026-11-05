@@ -45,6 +45,10 @@ jobs:
           python3 -O -m unittest tools/aurora-sep/tests/test_store_open_errors.py -v
           python3 -m unittest tools/aurora-sep/tests/test_identity_preservation.py -v
           python3 -O -m unittest tools/aurora-sep/tests/test_identity_preservation.py -v
+      - name: Test selected-policy diagnostics
+        run: |
+          python3 -m unittest tools/aurora-sep/tests/test_diag_policy.py tools/aurora-sep/tests/test_diag_sensor.py -v
+          python3 -O -m unittest tools/aurora-sep/tests/test_diag_policy.py tools/aurora-sep/tests/test_diag_sensor.py -v
       - name: Test recovery utility and package sources
         run: |
           python3 -m unittest tools/aurora-sep/tests/test_sep_bio_identities.py -v
