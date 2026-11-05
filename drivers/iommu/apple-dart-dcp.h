@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
-/* Included by apple-dart.c. J713 internal DCP only; foreign tables stay live. */
+/*
+ * Included by apple-dart.c. J713 display coprocessors: the internal DCP's
+ * firmware and frontend DARTs, and the external DCPs' firmware DARTs.
+ * Foreign tables stay live.
+ */
 #include <linux/mm.h>
 #include <linux/of_reserved_mem.h>
 #include "apple-dart-dcp-format.h"
@@ -128,7 +132,7 @@ static int apple_dart_dcp_read_adt(struct apple_dart *dart, struct dcp_adt_table
 		goto out_node;
 	}
 	ret = frontend ? dcp_adt_parse_frontend(data, resource_size(&res), tables, frontend) :
-		dcp_adt_parse(data, resource_size(&res), tables);
+		dcp_adt_parse_instance(data, resource_size(&res), dart->dcp_instance, tables);
 	memunmap(data);
 out_node:
 	of_node_put(found);
@@ -223,7 +227,7 @@ static int apple_dart_dcp_arena(struct apple_dart_dcp *dcp)
 static int apple_dart_dcp_leaf_regions(struct apple_dart_dcp *dcp)
 {
 	struct device_node *consumer, *node;
-	const char *alias = dcp->sid == 23 ? "dcp" :
+	const char *alias = dcp->sid == 23 ? dcp->dart->dcp_instance->dcp :
 		dcp->sid == 0 ? "disp0" : "disp0_piodma";
 	int count, ret = 0;
 
@@ -721,7 +725,9 @@ static int apple_dart_dcp_validate(struct apple_dart_dcp *dcp, struct device *de
 		return ret;
 	}
 
-	if (!of_device_is_compatible(dev->of_node, "apple,t8132-dcp") ||
+	if (!of_device_is_compatible(dev->of_node,
+				     dcp->dart->dcp_instance == &dcp_adt_internal ?
+				     "apple,t8132-dcp" : "apple,t8132-dcpext") ||
 	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
 	    strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E") ||
 	    (dcp->owner && dcp->owner != dev))

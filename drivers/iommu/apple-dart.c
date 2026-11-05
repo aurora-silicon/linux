@@ -311,6 +311,8 @@ struct apple_dart {
 	/* J713 internal display DARTs, borrowed from the running DCP. */
 	struct apple_dart_dcp *dcp;
 	struct apple_dart_dcp *frontend[2];
+	/* The display coprocessor whose firmware DART (SID23) this is. */
+	const struct dcp_adt_instance *dcp_instance;
 	bool preserve_display;
 	/* Retained radio/display state left in place across suspend-to-idle. */
 	bool s2idle_kept;
@@ -4009,7 +4011,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	bool tunneled = dev->of_node->parent &&
 			 of_node_name_prefix(dev->of_node->parent,
 					     "usb4-pcie-tunnel-");
-	bool j713_display, j713_radio;
+	bool j713_display, j713_dcpext, j713_radio;
 
 	/*
 	 * The J713 internal display DARTs are live: DCP firmware (SID23) and
@@ -4020,6 +4022,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 	j713_display = res && !tunneled && of_machine_is_compatible("apple,j713") &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x30a300000ULL || res->start == 0x30a340000ULL);
+	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
+	j713_dcpext = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
 	/* The J713 radio DART's fault interrupt is not described by its loader. */
 	j713_radio = res && !tunneled && of_machine_is_compatible("apple,j713") &&
 		of_machine_is_compatible("apple,t8132") &&
@@ -4033,6 +4039,21 @@ static int apple_dart_probe(struct platform_device *pdev)
 	     (res->start == 0x30a340000ULL && !READ_ONCE(apple_dart_dcp_enabled)))) {
 		dev_info(dev, "Leaving inherited display DART untouched; explicit guarded probe required\n");
 		return -ENODEV;
+	}
+	if (j713_dcpext) {
+		/* Its block is powered only if the loader handed the DCP over. */
+		struct device_node *owner =
+			of_find_node_by_path(res->start == 0x48a340000ULL ? "dcpext1" : "dcpext0");
+		u32 ready = 0;
+		bool handed_over = owner &&
+			!of_property_read_u32(owner, "apple,t8132-dcpext-firmware-ready", &ready) &&
+			ready == 1;
+
+		of_node_put(owner);
+		if (!IS_ENABLED(CONFIG_APPLE_DART_J713_DCP) || !handed_over) {
+			dev_info(dev, "Leaving inherited external display DART untouched\n");
+			return -ENODEV;
+		}
 	}
 
 	dart = kzalloc(sizeof(*dart), GFP_KERNEL);
@@ -4064,7 +4085,11 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->managed_sids = BIT(1) | BIT(2);
 	}
 	spin_lock_init(&dart->managed_lock);
-	dart->preserve_display = j713_display;
+	dart->preserve_display = j713_display || j713_dcpext;
+	if (j713_dcpext)
+		dart->dcp_instance = &dcp_adt_external[res->start == 0x48a340000ULL];
+	else if (j713_display)
+		dart->dcp_instance = &dcp_adt_internal;
 	if (tunneled) {
 		pd_np = of_parse_phandle(dev->of_node, "power-domains", 0);
 		if (pd_np) {
@@ -4121,7 +4146,13 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 	}
 
-	if (dart->preserve_display || j713_radio) {
+	if (j713_dcpext) {
+		/*
+		 * Its fault IRQ is shared with the external display DART, which is
+		 * not admitted: never enable that level IRQ for one block alone.
+		 */
+		dart->irq = -1;
+	} else if (dart->preserve_display || j713_radio) {
 		dart->irq = platform_get_irq_optional(pdev, 0);
 		if (dart->irq == -ENXIO)
 			dart->irq = -1;
@@ -4365,8 +4396,8 @@ params_done:
 		}
 		dev_info(dev, "J713 display DART version %04x, locked %d\n",
 			 dart->version, dart->locked);
-		ret = res->start == 0x30a340000ULL ? apple_dart_dcp_prepare(dart) :
-			apple_dart_frontend_prepare(dart);
+		ret = res->start == 0x30a340000ULL || j713_dcpext ?
+			apple_dart_dcp_prepare(dart) : apple_dart_frontend_prepare(dart);
 		if (ret)
 			goto err_clk_disable;
 	}
