@@ -89,9 +89,9 @@ static int powerlog_report(struct apple_epic_service *service, enum epic_subtype
 	if (ret) {
 		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 		    !parse_system_log_mnits_pairs(data, data_size, &mnits)) {
-			dev_info(dcp->dev, "systemep: powerlog mNits %u.%03u iDAC %u\n",
-				 mnits.millinits / 1000, mnits.millinits % 1000,
-				 mnits.idac);
+			dev_dbg(dcp->dev, "systemep: powerlog mNits %u.%03u iDAC %u\n",
+				mnits.millinits / 1000, mnits.millinits % 1000,
+				mnits.idac);
 			goto have_mnits;
 		}
 		dev_warn(service->ep->dcp->dev, "systemep: failed to parse report: %d\n", ret);
