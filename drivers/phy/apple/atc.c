@@ -530,6 +530,8 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_NONSELECTED_OVERRIDE 0x20
 #define PIPEHANDLER_NATIVE_RESET BIT(12)
 #define PIPEHANDLER_DUMMY_PHY_EN BIT(15)
+/* Boot-owned PIPE hold, released before selecting the dummy backend. */
+#define PIPEHANDLER_NONSELECTED_BOOT_HOLD BIT(16)
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
 #define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
@@ -687,6 +689,7 @@ struct apple_atcphy;
  *                     generation has none) and the SuperSpeed tunables; USB2
  *                     still works without the latter
  * @park_pipe_unlocked: A stopped controller may park without a PIPE handshake
+ * @clear_boot_hold: Release the boot PIPE hold before dummy backend selection
  * @dp_banked_tunables: DisplayPort requires separate LIOA/common calibration
  * @dp_t8122: DisplayPort runs the T8122 AUX, AUSPLL and lane sequences
  * @park_dummy_phy: Enable the dummy PIPE backend whenever the PIPE is parked on
@@ -718,6 +721,7 @@ struct atcphy_hw {
 	bool dp_banked_tunables;
 	bool park_pipe_unlocked;
 	bool park_dummy_phy;
+	bool clear_boot_hold;
 	bool restore_after_pd_off;
 	bool idle_power_off;
 };
@@ -1814,6 +1818,9 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
  */
 static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 {
+	if (atcphy->hw->clear_boot_hold)
+		clear32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+			PIPEHANDLER_NONSELECTED_BOOT_HOLD);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_DUMMY_PHY_EN);
 }
@@ -7608,6 +7615,7 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 	.dp_banked_tunables = true,
 	.park_dummy_phy = true,
 	.restore_after_pd_off = true,
+	.clear_boot_hold = true,
 };
 
 static const struct of_device_id atcphy_match[] = {
