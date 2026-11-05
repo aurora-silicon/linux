@@ -82,6 +82,8 @@ properties:
       describe the stream ID followed by the 64-bit base and length of its
       device-visible DMA window.
 
+  nonposted-mmio: true
+
   power-domains:
     maxItems: 1
 
