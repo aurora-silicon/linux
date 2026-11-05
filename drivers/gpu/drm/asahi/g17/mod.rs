@@ -27,6 +27,9 @@ mod calibration;
 mod channel;
 mod command;
 pub(crate) use command::Attachments;
+// M5 render encodings, reached only once the M5 render runtime is wired.
+#[allow(dead_code)]
+mod render_resources;
 mod completion;
 pub(crate) mod context;
 mod data_segment;
@@ -1789,9 +1792,12 @@ impl gpu::Gpu for Gpu {
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
                 | sync_output::FEATURE_CUMULATIVE_SIGNALS;
         let variant = self.shared.variant;
+        // The M5 command set has no AS-build flag: its validation refuses one.
+        if !variant.m5_commands {
+            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
+        }
         if variant.few_primitives {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
         }
