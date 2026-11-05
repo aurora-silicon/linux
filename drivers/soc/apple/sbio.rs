@@ -3811,15 +3811,34 @@ impl SepData {
             // the stored identity-bag secret. It must precede the SCRD
             // credential refresh; a bag unlock is not a substitute for it.
             let unwrapped = match keybag::read(keybag::Slot::Identity) {
-                Ok(keybag::State::Present(stored)) => {
-                    self.rearm_touchid_fv(stored.secret()).is_ok()
+                Ok(keybag::State::Present(stored)) => match self.rearm_touchid_fv(stored.secret()) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        dev_err!(
+                            self.dev,
+                            "Touch ID: re-arm: the Linux FV record pair did not unwrap: {:?}\n",
+                            e
+                        );
+                        false
+                    }
+                },
+                Ok(keybag::State::Absent(_)) => {
+                    dev_err!(self.dev, "Touch ID: re-arm: there is no stored identity key bag secret\n");
+                    false
                 }
-                _ => false,
+                Err(e) => {
+                    dev_err!(
+                        self.dev,
+                        "Touch ID: re-arm: the identity key bag record is unreadable: {:?}\n",
+                        e
+                    );
+                    false
+                }
             };
             let established = unwrapped && self.establish_scrd_match_context(user);
             let saved = established && self.save_lockout();
-            if !unwrapped {
-                dev_err!(self.dev, "Touch ID: re-arm: the stored secret did not unwrap the Linux FV record pair\n");
+            if unwrapped && !established {
+                dev_err!(self.dev, "Touch ID: re-arm: the FV unwrap succeeded but the SCRD match credential was not re-established\n");
             } else if established && !saved {
                 dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
             }
