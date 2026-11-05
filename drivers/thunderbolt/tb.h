@@ -1145,6 +1145,8 @@ static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
 	return tb->nhi->host_dp_policy & TB_HOST_DP_NOTIFY;
 }
 
+bool tb_has_apple_host_dp_tunnel(struct tb *tb);
+
 static inline bool tb_port_needs_host_dp_credits(const struct tb_port *port)
 {
 	const struct tb *tb = port->sw->tb;

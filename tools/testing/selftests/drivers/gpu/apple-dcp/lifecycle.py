@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, firmware_lineage, atc_restore_helpers, atc_cio_helpers
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -716,6 +716,18 @@ int main(void)
                      '/* Never reached: the H17P external link passes no session. */\n'
                      'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable)\n'
                      '{ (void)d; (void)s; (void)cable; assert(!"session check for a sessionless link"); return false; }\n')
+    if 'dcp_is_t8132_ext(' in raw:
+        # An H17P display is not a T8132 dcpext: no compact teardown answers to wait for.
+        swap(' struct { bool active; } split;',
+             ' struct { bool active; } split;\n struct apple_dcp_afkep *dptxep; bool t8132_release_late;')
+        firmware += ('struct apple_dcp_afkep;\nstruct dcp_fabric_session;\n'
+                     'static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }\n'
+                     'static bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep)\n'
+                     '{ (void)ep; assert(!"T8132 dcpext teardown in an H17P scenario"); return false; }\n'
+                     'static int dcp_t8132_wait_teardown_answers(struct apple_dcp *d, u32 port,\n'
+                     '\tconst struct dcp_fabric_session *s, bool cable, bool recovery)\n'
+                     '{ (void)d; (void)port; (void)s; (void)cable; (void)recovery;\n'
+                     '  assert(!"T8132 dcpext teardown in an H17P scenario"); return -ENODEV; }\n')
     if 'static unsigned long jiffies;' not in unit:
         firmware += '\nstatic unsigned long jiffies;\n'
     # unless the update work already needed the clock
@@ -1087,7 +1099,7 @@ def teardown(root):
     names = {n: tuple(name for name in group if re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', files[n], re.M))
              for n, group in names.items()}
     context = (fn('atc', 'core_read32') + '\n' + fn('atc', 'atcphy_get_mode_config') + '\n' + fn('atc', 'j700_field_update') + '\n' + files['dp'][files['dp'].index('/* Masks are the union'):files['dp'].index('/* Retry only the idle operations')])
-    functions = '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
+    functions = atc_cio_helpers(files['atc']) + '\n\n'.join(fn(n, name) for n, group in names.items() for name in group)
     definitions = []
     lines = iter(files['atc'].splitlines())
     for line in lines:
@@ -1475,6 +1487,8 @@ static void __attribute__((unused)) iomfb_v14_7_external_refuse(struct apple_dcp
 { (void)d; (void)why; assert(!"T6030 external processor in a J700 scenario"); }
 struct drm_device { int unused; };
 struct drm_encoder { int unused; };
+/* Not a J713: production registers no T8132 external outputs and returns 0. */
+static int __attribute__((unused)) t8132_ext_drm_init(struct drm_device *drm) { (void)drm; return 0; }
 struct apple_drm_private { struct drm_device drm; };
 struct component_match { bool includes[2]; };
 static struct device_node nodes[2];
