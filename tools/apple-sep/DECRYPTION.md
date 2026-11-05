@@ -177,8 +177,9 @@ loop. A UI may offer an explicit new operation.
 
 Biometric-gated decryption, saved-key warm-reboot use, modified-tag rejection
 without plaintext, fresh-request refusal without a new scan, single-use delivery
-and signing regression passed on J293/M1. Independent abandoned-result expiry
-has a focused source test; it was not separately observed on hardware. Cold
-power-cycle, suspend, other hardware, biometric enrollment-set invalidation,
+and signing regression passed on J293/M1. Autonomous expiry of an undelivered
+result and cancellation before delivery also passed on hardware, in addition
+to the focused source tests. Cold power-cycle, suspend, other hardware,
+biometric enrollment-set invalidation,
 native private-key import and production broker isolation are not established.
 No production vault migration is implied by these primitive tests.
