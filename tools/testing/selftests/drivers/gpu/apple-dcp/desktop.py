@@ -765,8 +765,12 @@ def adt_identity(root):
         return bytes(out)+b''.join(children)
     panel=node({'product-id':42,'vendor-id':0x5274,'width-mm':345,'height-mm':223,
                 'serial-number':b'SYNTHETIC-PANEL','name':b'panel\0'})
+    # A synthetic potential headroom of 6.5; a nested node of that name is no
+    # panel backlight and must not override it.
+    backlight=node({'name':b'backlight\0','EDRPotentialHeadroom':0x68000},
+                   [node({'name':b'backlight\0','EDRPotentialHeadroom':0x10000})])
     data=node({'name':b'device-tree\0'},[node({'name':b'product\0'},[panel]),
-              node({'name':b'chosen\0','serial-number':b'PRIVATE-MACHINE'})])
+              node({'name':b'chosen\0','serial-number':b'PRIVATE-MACHINE'}),backlight])
     base=root/'drivers/gpu/drm/apple'
     source=(base/'dcp-panel-adt.c').read_text()
     source='\n'.join(l for l in source.splitlines() if not l.startswith('#include'))
@@ -798,6 +802,7 @@ int main(void)
     assert(panel.found && panel.width_mm==345 && panel.height_mm==223);
     assert(!strcmp(panel.identity.manufacturer,"TST") && panel.identity.product==42);
     assert(panel.identity.serial && panel.identity.serial==dcp_adt_serial((const u8 *)"SYNTHETIC-PANEL",15));
+    assert(panel.edr_potential_headroom==0x68000);
     for(unsigned n=0;n<sizeof(fixture);n++) {
         struct dcp_panel_adt old=panel;
         assert(dcp_panel_adt_parse(fixture,n,&panel)<0);
