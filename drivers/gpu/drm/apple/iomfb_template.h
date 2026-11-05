@@ -384,7 +384,7 @@ struct drm_plane_state;
 
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 			       , struct drm_plane_state *primary
 #endif
 			       );
