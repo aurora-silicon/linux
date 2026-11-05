@@ -77,6 +77,12 @@
  * bound, even long after the boot (see gate_t6041_run()). This part was a
  * driver of its own, t6041-display-gate.c, by Ryan Murray and František
  * Balázsy.
+ *
+ * On the M4 Max (J616c, apple,t6041) the PMP never runs: iBoot leaves the
+ * external chains powered and the boot loader fills each external display
+ * processor's firmware memory. The gate enables a chain once its processor has
+ * that memory, before any device exists (see gate_t6041_max_run()), and never
+ * touches the internal display.
  */
 
 #define pr_fmt(fmt) fmt
@@ -327,11 +333,22 @@ static const struct gate_soc gate_t6041 __initconst = {
 	.run = gate_t6041_run,
 };
 
+static void __init gate_t6041_max_run(void);
+
+/* T6041 (M4 Max): no PMP; the external chains follow the boot loader's firmware memory. */
+static const struct gate_soc gate_t6041_max __initconst = {
+	.machine = "apple,t6041",
+	.prefix = "apple-t6041-display: ",
+	.name = "T6041",
+	.run = gate_t6041_max_run,
+};
+
 static const struct gate_soc *const gate_socs[] __initconst = {
 	&gate_t6030,
 	&gate_t8122,
 	&gate_t6031,
 	&gate_t6041,
+	&gate_t6041_max,
 };
 
 /* The SoC this boot runs on, if the gate serves it. */
@@ -2944,6 +2961,110 @@ static void __init gate_t6041_run(void)
 		return;
 	gate_t6041_internal();
 	gate_t6041_staged();
+}
+
+/*
+ * J616c's external chains. No PMP, so no DISPEXT power domain is described and
+ * nothing is requested or waited for: the domains are on as iBoot left them.
+ */
+static const char *const t6041_max_hdmi_nodes[] = {
+	/* ATC3 power, AOP pins, PHY, crossbar, DARTs, mailbox, dcpext0 */
+	"/power-management@502800000/power-controller@408",
+	"/power-management@508300000/power-controller@e0",
+	"/power-management@508300000/power-controller@168",
+	"/power-management@508300000/power-controller@b8",
+	"/power-management@508300000/power-controller@148",
+	"/pinctrl@510824000",
+	"/mailbox@39b148000",
+	"/phy@39aa90000",
+	"/mux@39b24c000",
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
+static const char *const t6041_max_usbc_nodes[] = {
+	/* ATC1 mailbox and crossbar, DARTs, mailbox, route, dcpext1 */
+	"/mailbox@38b148000",
+	"/mux@38b24c000",
+	"/iommu@602340000",
+	"/iommu@602300000",
+	"/mailbox@602e08000",
+	"/dcp@602e00000/typec-routes/route@1",
+	"/dcp@602e00000",
+};
+
+static const struct gate_staged t6041_max_stages[] = {
+	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
+	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+};
+
+/* Applied, they stay: the live tree refers to them. Only the KUnit test reverts them. */
+static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
+
+/* Enable every node of stage @i and put its display DART into the display subsystem's iommus. */
+static int __init t6041_max_apply(unsigned int i, struct device_node *display)
+{
+	const struct gate_staged *st = &t6041_max_stages[i];
+	struct of_changeset *cs = &t6041_max_cs[i];
+	struct device_node *np;
+	unsigned int n;
+	int ret;
+
+	of_changeset_init(cs);
+	np = of_find_node_by_path(st->dart);
+	ret = np ? gate_iommus_append(cs, display, np) : -ENODEV;
+	of_node_put(np);
+	for (n = 0; !ret && n < st->nr; n++) {
+		np = of_find_node_by_path(st->nodes[n]);
+		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
+		of_node_put(np);
+	}
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret)
+		of_changeset_destroy(cs);
+	return ret;
+}
+
+/*
+ * Each chain is enabled in one changeset, once its processor has firmware
+ * memory. A chain that has none, or is not all there and disabled (a boot
+ * loader that enabled it itself), stays as it is, and the other chain does not
+ * depend on it. The display subsystem only gains the DART of an enabled chain:
+ * its status is never written, so the internal display stays as the boot
+ * loader left it whatever happens here.
+ */
+static void __init gate_t6041_max_run(void)
+{
+	struct device_node *display;
+	unsigned int i;
+	int ret;
+
+	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
+		return;
+
+	staged_prefix = gate_soc->prefix;
+	display = of_find_node_by_path("/display-subsystem");
+	if (!display || !of_device_is_available(display)) {
+		staged_err("no display subsystem, nothing enabled\n");
+		of_node_put(display);
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(t6041_max_stages); i++) {
+		const struct gate_staged *st = &t6041_max_stages[i];
+		const char *dcp = st->nodes[st->nr - 1];
+
+		if (!staged_ready(st))
+			continue;
+		ret = t6041_max_apply(i, display);
+		if (ret)
+			staged_err("%s: could not enable the chain: %d\n", dcp, ret);
+		else
+			staged_info("%s enabled\n", dcp);
+	}
+	of_node_put(display);
 }
 
 /* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
