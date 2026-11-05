@@ -38,6 +38,7 @@ mod object;
 mod pgtable;
 mod queue;
 mod regs;
+mod retain;
 mod slotalloc;
 mod stats;
 mod stats_raw;

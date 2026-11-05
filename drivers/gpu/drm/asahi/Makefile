@@ -7,3 +7,5 @@ CFLAGS_g17/trace.o := -I$(src)/g17
 aurora-$(CONFIG_DRM_ASAHI_G15) += g15/glue.o
 
 aurora-$(CONFIG_DRM_ASAHI_G16) += g16/glue.o
+
+aurora-y += retain.o
