@@ -2712,6 +2712,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
 /// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
 const HW_CFG_T8152: AopHwConfig = AopHwConfig {
     ec0p: 0,
+    ncal: 0,
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
@@ -2721,6 +2722,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: false,
+    bootargs_word_access: false,
     halt_on_failed_start: false,
 };
 
@@ -2731,6 +2733,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
 /// firmware runs with the boot arguments iBoot left.
 const HW_CFG_T8142: AopHwConfig = AopHwConfig {
     ec0p: 0,
+    ncal: 0,
     aopt: 0,
     alig: 0,
     patch_bootargs: false,
@@ -2740,6 +2743,7 @@ const HW_CFG_T8142: AopHwConfig = AopHwConfig {
     quiesce_on_unbind: true,
     required_endpoints: &[],
     fw_regions: false,
+    bootargs_word_access: false,
     halt_on_failed_start: false,
 };
 
