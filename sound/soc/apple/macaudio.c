@@ -149,16 +149,17 @@ struct macaudio_platform_cfg {
 	 */
 	unsigned int speaker_fe_channels;
 	/*
-	 * The tweeter amps' playback high-pass corner, an "HPF Corner
-	 * Frequency" item; "800 Hz" unless set. Machines whose speaker
-	 * protection runs in the graph and measures every voice coil with a
-	 * low-frequency pilot tone set it to the woofers' corner: the
-	 * crossover that keeps program bass off the tweeters comes before the
-	 * protection stage there, and an 800 Hz playback filter after it
-	 * removes the pilot, which leaves the tweeters without a closed-loop
-	 * temperature.
+	 * The tweeter amps' playback high-pass corner while protection is
+	 * granted, an "HPF Corner Frequency" item; unset, the tweeters stay at
+	 * the safe 800 Hz throughout. Machines whose protection engine runs
+	 * the crossover that keeps program bass off the tweeters ahead of its
+	 * protection stage, and measures every voice coil with a
+	 * low-frequency pilot tone, set it to the woofers' corner: an 800 Hz
+	 * filter after that stage removes the pilot and leaves the tweeters
+	 * without a closed-loop temperature. Every withdrawal of protection
+	 * puts the 800 Hz corner back, with the safe level.
 	 */
-	const char *tweeter_hpf;
+	const char *tweeter_hpf_granted;
 };
 
 static const char *volume_control_names[] = {
@@ -264,6 +265,14 @@ struct macaudio_snd_data {
 	struct snd_kcontrol **spk_vols;
 	unsigned int spk_nr_vols;
 	struct snd_ctl_elem_value *spk_uval;
+	/*
+	 * The tweeter amps' playback high-pass corners, the driver's too, and
+	 * their items at the safe level and while granted (cfg->tweeter_hpf_granted)
+	 */
+	struct snd_kcontrol **spk_hpfs;
+	unsigned int spk_nr_hpfs;
+	unsigned int spk_hpf_safe;
+	unsigned int spk_hpf_granted;
 };
 
 
@@ -400,6 +409,60 @@ static long macaudio_spk_gain(const struct macaudio_snd_data *ma, bool granted)
 	default:
 		return -EINVAL;
 	}
+}
+
+#define MACAUDIO_WOOFER_HPF		"2 Hz"
+#define MACAUDIO_TWEETER_HPF_SAFE	"800 Hz"
+#define MACAUDIO_TWEETER_HPF_NAME	"* Tweeter HPF Corner Frequency"
+
+/* The playback high-pass corner of one speaker amp, as an enum item */
+static const char *macaudio_speaker_hpf(const struct macaudio_platform_cfg *cfg,
+					bool tweeter, bool granted)
+{
+	if (!tweeter)
+		return MACAUDIO_WOOFER_HPF;
+	if (granted && cfg->tweeter_hpf_granted)
+		return cfg->tweeter_hpf_granted;
+	return MACAUDIO_TWEETER_HPF_SAFE;
+}
+
+/*
+ * Set every tweeter's playback high-pass corner to its granted or its safe
+ * item. Returns 0, or a negative error if any write failed.
+ *
+ * Context: spk_mutex held.
+ */
+static int macaudio_spk_set_hpf(struct macaudio_snd_data *ma, bool granted)
+{
+	struct snd_ctl_elem_value *uval = ma->spk_uval;
+	unsigned int item = granted ? ma->spk_hpf_granted : ma->spk_hpf_safe;
+	struct snd_kcontrol *kctl;
+	int ret, err = 0;
+	unsigned int i;
+
+	lockdep_assert_held(&ma->spk_mutex);
+
+	if (!ma->spk_nr_hpfs)
+		return 0;
+	if (!uval)
+		return -EINVAL;
+
+	for (i = 0; i < ma->spk_nr_hpfs; i++) {
+		kctl = ma->spk_hpfs[i];
+		memset(uval, 0, sizeof(*uval));
+		uval->id = kctl->id;
+		uval->value.enumerated.item[0] = item;
+		ret = kctl->put(kctl, uval);
+		if (ret < 0) {
+			dev_err(ma->card.dev, "Failed to set %s to item %u: %d\n",
+				kctl->id.name, item, ret);
+			err = ret;
+		} else if (ret > 0) {
+			snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &kctl->id);
+		}
+	}
+	return err;
 }
 
 /*
@@ -546,6 +609,12 @@ static void macaudio_spk_floor(struct macaudio_snd_data *ma, const char *reason)
 		dev_crit(ma->card.dev,
 			 "speaker safe level not set on every amp: speaker playback refused\n");
 	}
+	/* The amps are down first: the tweeters' safe filter goes back after */
+	if (macaudio_spk_set_hpf(ma, false) < 0) {
+		WRITE_ONCE(ma->spk_floor_failed, true);
+		dev_crit(ma->card.dev,
+			 "tweeter safe high-pass not set on every amp: speaker playback refused\n");
+	}
 
 	if (was && ma->spk_kctl) {
 		if (closed_ahead)
@@ -600,6 +669,12 @@ static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 	 */
 	kthread_flush_work(&ma->spk_stop_work);
 
+	/* The tweeters' filter opens before the amps go up, never after */
+	ret = macaudio_spk_set_hpf(ma, true);
+	if (ret < 0) {
+		macaudio_spk_floor(ma, "tweeter high-pass not set");
+		return ret;
+	}
 	ret = macaudio_spk_set_gain(ma, true);
 	if (ret < 0) {
 		macaudio_spk_floor(ma, "operating gain not set");
@@ -937,6 +1012,81 @@ static int macaudio_spk_take_volumes(struct macaudio_snd_data *ma)
 		for (i = 0; i < kctl->count; i++)
 			kctl->vd[i].access &= ~SNDRV_CTL_ELEM_ACCESS_WRITE;
 		ma->spk_vols[ma->spk_nr_vols++] = kctl;
+	}
+	return 0;
+}
+
+/* The item of enum control @kctl named @text, or a negative error */
+static int macaudio_enum_item(struct snd_kcontrol *kctl, const char *text)
+{
+	struct snd_ctl_elem_info *uinfo;
+	unsigned int i, items;
+	int ret;
+
+	uinfo = kzalloc_obj(*uinfo);
+	if (!uinfo)
+		return -ENOMEM;
+	uinfo->id = kctl->id;
+	ret = kctl->info(kctl, uinfo);
+	if (!ret && uinfo->type != SNDRV_CTL_ELEM_TYPE_ENUMERATED)
+		ret = -EINVAL;
+	items = ret ? 0 : uinfo->value.enumerated.items;
+	ret = -ENOENT;
+	for (i = 0; i < items; i++) {
+		uinfo->value.enumerated.item = i;
+		if (kctl->info(kctl, uinfo))
+			break;
+		if (!strcmp(uinfo->value.enumerated.name, text)) {
+			ret = i;
+			break;
+		}
+	}
+	kfree(uinfo);
+	return ret;
+}
+
+/*
+ * The tweeters' playback high-pass corners are the driver's where the
+ * machine opens them while granted: keep them, with both their items.
+ *
+ * Context: before the card registers, or with the card's controls held.
+ */
+static int macaudio_spk_take_hpfs(struct macaudio_snd_data *ma)
+{
+	struct device *dev = ma->card.dev;
+	struct snd_kcontrol *kctl;
+	unsigned int i, nr = 0;
+	int safe, granted;
+
+	if (!ma->cfg->tweeter_hpf_granted)
+		return 0;
+
+	list_for_each_entry(kctl, &ma->card.snd_card->controls, list)
+		if (snd_soc_control_matches(kctl, MACAUDIO_TWEETER_HPF_NAME))
+			nr++;
+	if (!nr)
+		return -ENOENT;
+
+	ma->spk_hpfs = devm_kcalloc(dev, nr, sizeof(*ma->spk_hpfs), GFP_KERNEL);
+	if (!ma->spk_hpfs)
+		return -ENOMEM;
+
+	list_for_each_entry(kctl, &ma->card.snd_card->controls, list) {
+		if (!snd_soc_control_matches(kctl, MACAUDIO_TWEETER_HPF_NAME))
+			continue;
+		safe = macaudio_enum_item(kctl, MACAUDIO_TWEETER_HPF_SAFE);
+		granted = macaudio_enum_item(kctl, ma->cfg->tweeter_hpf_granted);
+		if (safe < 0 || granted < 0)
+			return safe < 0 ? safe : granted;
+		/* One codec: every tweeter has the same items */
+		if (ma->spk_nr_hpfs &&
+		    (safe != ma->spk_hpf_safe || granted != ma->spk_hpf_granted))
+			return -EINVAL;
+		ma->spk_hpf_safe = safe;
+		ma->spk_hpf_granted = granted;
+		for (i = 0; i < kctl->count; i++)
+			kctl->vd[i].access &= ~SNDRV_CTL_ELEM_ACCESS_WRITE;
+		ma->spk_hpfs[ma->spk_nr_hpfs++] = kctl;
 	}
 	return 0;
 }
@@ -1894,6 +2044,9 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		ret = macaudio_spk_take_volumes(ma);
 		if (ret)
 			return dev_err_probe(card->dev, ret, "speaker volumes missing\n");
+		ret = macaudio_spk_take_hpfs(ma);
+		if (ret)
+			return dev_err_probe(card->dev, ret, "tweeter high-pass controls missing\n");
 		mutex_lock(&ma->spk_mutex);
 		macaudio_spk_floor(ma, "card bound");
 		ret = ma->spk_floor_failed ? -EIO : 0;
@@ -2036,18 +2189,6 @@ static int macaudio_set_fixed_volume(struct snd_soc_card *card, const char *name
 		CHECK(call, buf, value, 1); \
 	}
 
-#define MACAUDIO_WOOFER_HPF		"2 Hz"
-#define MACAUDIO_TWEETER_HPF_DEFAULT	"800 Hz"
-
-/* The playback high-pass corner of one speaker amp, as an enum item */
-static const char *macaudio_speaker_hpf(const struct macaudio_platform_cfg *cfg,
-					bool tweeter)
-{
-	if (!tweeter)
-		return MACAUDIO_WOOFER_HPF;
-	return cfg->tweeter_hpf ?: MACAUDIO_TWEETER_HPF_DEFAULT;
-}
-
 static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, bool tweeter)
 {
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
@@ -2069,7 +2210,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 
 		CHECK_CONCAT(macaudio_set_fixed_volume, "Amp Gain Volume", ma->cfg->amp_gain);
 		CHECK_CONCAT(macaudio_set_fixed_enum, "HPF Corner Frequency",
-			     macaudio_speaker_hpf(ma->cfg, tweeter));
+			     macaudio_speaker_hpf(ma->cfg, tweeter, false));
 
 		CHECK_CONCAT(macaudio_set_fixed_enum, "OCE Handling", "Retry");
 		break;
@@ -2261,18 +2402,20 @@ struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
 
+/* Granted, the tweeters take the woofers' corner (see tweeter_hpf_granted) */
 struct macaudio_platform_cfg macaudio_j316_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
+	.tweeter_hpf_granted = MACAUDIO_WOOFER_HPF,
 };
 
 struct macaudio_platform_cfg macaudio_j37x_j47x_cfg = {
 	true,	AMP_SN012776,	SPKR_1W,	false,	20,	-20,
 };
 
-/* In-graph protection, with a pilot tone on the tweeters as well */
+/* Granted, the tweeters take the woofers' corner (see tweeter_hpf_granted) */
 struct macaudio_platform_cfg macaudio_j413_cfg = {
 	true,	AMP_SN012776,	SPKR_1W1T,	true,	15,	-20,
-	.tweeter_hpf = MACAUDIO_WOOFER_HPF,
+	.tweeter_hpf_granted = MACAUDIO_WOOFER_HPF,
 };
 
 struct macaudio_platform_cfg macaudio_j415_cfg = {
@@ -2311,8 +2454,8 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 	.fe_cpu_is_platform = true,
 	/* No headphone codec on this card: the jack is a card of its own. */
 	.route_only_fes = BIT(0),
-	/* In-graph protection, with a pilot tone on the tweeters as well */
-	.tweeter_hpf = MACAUDIO_WOOFER_HPF,
+	/* Granted, the tweeters take the woofers' corner */
+	.tweeter_hpf_granted = MACAUDIO_WOOFER_HPF,
 };
 
 /*
