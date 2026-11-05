@@ -471,6 +471,9 @@ pub struct SchedulerInner<T: JobImpl> {
 // SchedulerInner instead, so outstanding work cannot prevent finalization.
 struct SchedulerOwner<T: JobImpl> {
     allocation: Arc<SchedulerInner<T>>,
+    /// The driver's submission queue, if it supplied one. Fields drop after `Drop::drop`, so the
+    /// queue is destroyed only after `drm_sched_fini` has stopped the scheduler's work on it.
+    _submit_wq: Option<crate::workqueue::OwnedQueue>,
 }
 
 impl<T: JobImpl> Drop for SchedulerOwner<T> {
@@ -527,6 +530,36 @@ impl<T: JobImpl> Scheduler<T> {
             hang_limit,
             timeout_ms,
             name,
+            None,
+        )
+    }
+
+    /// Creates a new DRM Scheduler object whose run and free work goes to `submit_wq`.
+    ///
+    /// The scheduler owns the queue and destroys it after it has been finalized. Like the queue
+    /// drm_sched allocates itself, it must be ordered and usable for memory reclaim (see
+    /// [`OwnedQueue::new_ordered_reclaim`]), so that one scheduler's jobs run and are freed one at a
+    /// time.
+    ///
+    /// [`OwnedQueue::new_ordered_reclaim`]: crate::workqueue::OwnedQueue::new_ordered_reclaim
+    pub fn new_with_submit_wq(
+        device: &device::Device,
+        num_rqs: u32,
+        credit_limit: u32,
+        hang_limit: u32,
+        timeout_ms: time::Msecs,
+        name: &'static CStr,
+        submit_wq: crate::workqueue::OwnedQueue,
+    ) -> Result<Scheduler<T>> {
+        Self::init(
+            UniqueArc::new_uninit(GFP_KERNEL)?,
+            device,
+            num_rqs,
+            credit_limit,
+            hang_limit,
+            timeout_ms,
+            name,
+            Some(submit_wq),
         )
     }
 
@@ -539,6 +572,7 @@ impl<T: JobImpl> Scheduler<T> {
         hang_limit: u32,
         timeout_ms: time::Msecs,
         name: &'static CStr,
+        submit_wq: Option<crate::workqueue::OwnedQueue>,
     ) -> Result<Scheduler<T>> {
         // Allocate the owner before starting C workers: no fallible allocation
         // may abandon an initialized scheduler without running drm_sched_fini.
@@ -556,7 +590,7 @@ impl<T: JobImpl> Scheduler<T> {
 
         let init_ops = bindings::drm_sched_init_args {
             ops: &Self::OPS,
-            submit_wq: core::ptr::null_mut(),
+            submit_wq: submit_wq.as_ref().map_or(core::ptr::null_mut(), |queue| queue.as_raw()),
             timeout_wq: core::ptr::null_mut(),
             num_rqs,
             credit_limit,
@@ -579,7 +613,14 @@ impl<T: JobImpl> Scheduler<T> {
         // SAFETY: C initialized sched and PhantomData has no stored state.
         // No fallible operation follows successful initialization.
         let allocation = unsafe { sched.assume_init() }.into();
-        Ok(Scheduler(owner.write(SchedulerOwner { allocation }).into()))
+        Ok(Scheduler(
+            owner
+                .write(SchedulerOwner {
+                    allocation,
+                    _submit_wq: submit_wq,
+                })
+                .into(),
+        ))
     }
 }
 
@@ -684,6 +725,7 @@ mod tests {
             0,
             TIMEOUT_MS,
             c"rust-drm-sched-kunit",
+            None,
         )
     }
 
