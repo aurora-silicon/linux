@@ -56,7 +56,9 @@ ASAHI_TESTS = {
     # The old revision reports a DART fault that clears before the second latch read as success.
     'ane-tm-transient-fault-tests.py': [([], PASS),
                                         (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
+    'test-m3-uapi.py': [([], PASS)],
     'test-m3-mailbox.py': [([], PASS)],
+    'test-j613-dcp-power.py': [([], PASS)],
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
@@ -177,6 +179,7 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST.append('g17-telemetry-tests.rs')
+ASAHI_RUST.append('m3-firmware-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).
