@@ -2482,7 +2482,6 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_connect(dcp, port);
 
-	if (!dcp_is_external_h17p(dcp)) {
 	if (!dcp_is_retained_external(dcp)) {
 		if (dcp_typec_sessionless(dcp)) {
 			ret = dcp_dptx_connect_raw(dcp, port, NULL, NULL, false, false);
