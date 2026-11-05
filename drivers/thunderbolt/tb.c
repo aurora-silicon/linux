@@ -1510,7 +1510,8 @@ tb_recalc_estimated_bandwidth_for_group(struct tb_bandwidth_group *group)
 			      estimated_bw + group->reserved);
 
 		if (usb4_dp_port_set_estimated_bandwidth(in,
-				estimated_bw + group->reserved))
+				tb_dp_cap_bandwidth(tunnel,
+						    estimated_bw + group->reserved)))
 			tb_tunnel_warn(tunnel,
 				       "failed to update estimated bandwidth\n");
 	}
@@ -2147,6 +2148,23 @@ err_rpm_put:
 	pm_runtime_put_autosuspend(&out->sw->dev);
 	pm_runtime_mark_last_busy(&in->sw->dev);
 	pm_runtime_put_autosuspend(&in->sw->dev);
+}
+
+/*
+ * The link rate (Mb/s per lane) another DP tunnel from @tunnel's host router
+ * was given under TB_HOST_DP_HBR2_MAX, 0 if there is none. Called with the
+ * domain lock held, from the tunnel's activation.
+ */
+u32 tb_dp_host_shared_rate(const struct tb_tunnel *tunnel)
+{
+	struct tb_cm *tcm = tb_priv(tunnel->tb);
+	struct tb_tunnel *t;
+
+	list_for_each_entry(t, &tcm->tunnel_list, list)
+		if (t != tunnel && tb_tunnel_is_dp(t) && t->host_rate &&
+		    t->src_port->sw == tunnel->src_port->sw)
+			return t->host_rate;
+	return 0;
 }
 
 static void tb_tunnel_dp(struct tb *tb)
