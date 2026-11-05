@@ -22,6 +22,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
@@ -46,6 +47,22 @@ struct dcp_identity_trace {
 	struct apple_dcp *dcp;
 	atomic_t *count;
 };
+
+/*
+ * set_matrix coefficients for @ctm, the identity when @ctm is NULL. DRM
+ * carries S31.32 sign-magnitude; the firmware takes signed (two's
+ * complement) Q32.32, so positive values are identical and only negative
+ * coefficients need converting.
+ */
+void dcp_ctm_to_fw(u64 fw[9], const struct drm_color_ctm *ctm)
+{
+	for (unsigned int i = 0; i < 9; i++) {
+		if (ctm)
+			fw[i] = drm_color_ctm_s31_32_to_qm_n(ctm->matrix[i], 32, 32);
+		else
+			fw[i] = (i % 4 == 0) ? 1ULL << 32 : 0;
+	}
+}
 
 static void dcp_identity_key_log(void *data, const char *key, u32 key_len,
 				 u32 type, u32 size, u32 depth)
