@@ -127,12 +127,14 @@ impl Graph {
         let cpu = if m5 { CpuMap::WriteCombined } else { CpuMap::WriteBack };
         let bytes = if m5 { RECORDS * fw::m5::render_assembly::COMMAND_STORAGE_BYTES }
             else { TA_BYTES + FRAGMENT_BYTES };
+        // The GPU reads command storage only through the read-only aliases below. On M5 the
+        // kernel mapping, in the upper half every execution context includes, is firmware-only.
         let descriptors = pool.allocate(
             alloc,
             Family::Descriptor,
             bytes,
             bytes,
-            prot,
+            if m5 { mmu::PROT_FW_SHARED_RW } else { prot },
             cpu,
         )?;
         let ta = Aliases::new(&descriptors, alloc, context.vm(),
