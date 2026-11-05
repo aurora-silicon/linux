@@ -3161,7 +3161,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_connect(dcp, port);
 
-	
+
 	if (dcp_is_retained_external(dcp)) {
 		bool new_cable;
 
@@ -4219,7 +4219,7 @@ void dcp_poweron(struct platform_device *pdev)
 		return;
 	}
 
-	
+
 	if (dcp_is_ext26(dcp))
 		flush_work(&dcp->ext26_blank_work);
 	if (dcp_is_retained_external(dcp)) {
@@ -4364,7 +4364,7 @@ void dcp_poweroff(struct platform_device *pdev)
 		return;
 	}
 
-	
+
 	if (dcp_is_ext26(dcp)) {
 		if (!READ_ONCE(dcp->ext26_pm_preparing) && !READ_ONCE(dcp->external_stopped))
 			queue_work(system_unbound_wq, &dcp->ext26_blank_work);
