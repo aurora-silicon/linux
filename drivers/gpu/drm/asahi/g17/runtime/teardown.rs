@@ -111,7 +111,7 @@ struct Service<'a> {
 
 impl Host for Service<'_> {
     fn render_idle(&mut self, context: &Arc<Context>) -> Result<bool> {
-        self.render.teardown_idle(context)
+        self.render.release_idle(context)
     }
     fn compute_idle(&self, context: &Arc<Context>) -> bool {
         self.compute
