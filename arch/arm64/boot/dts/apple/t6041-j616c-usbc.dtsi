@@ -62,10 +62,6 @@
 	};
 };
 
-&atcphy1_xbar {
-	power-domains = <&ps_atc1_usb>;
-};
-
 &typec1 {
 	ports {
 		port@1 {
