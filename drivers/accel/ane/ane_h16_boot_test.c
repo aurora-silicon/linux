@@ -35,6 +35,7 @@ struct ane_h16_sim {
 	u64 timeout_head;
 	u32 lock;
 	u32 fault;
+	u32 fault_address_reads;
 	u32 channel_request;
 	u32 ipc_request;
 	u32 heap_request;
@@ -99,6 +100,8 @@ static u32 sim_read32(void *ctx, enum ane_h16_window w, u32 off)
 			return s->lock;
 		if (off == s->mmio.dart_fault)
 			return s->fault;
+		if (off == s->mmio.dart_address_lo || off == s->mmio.dart_address_hi)
+			s->fault_address_reads++;
 		return 0;
 	}
 	if (w == ANE_H16_DAPF) {
@@ -832,6 +835,21 @@ static void ane_h16_dart_fault_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->quarantines, 1U);
 }
 
+static void ane_h16_fault_address_on_demand_test(struct kunit *test)
+{
+	struct ane_h16_sim *s = test->priv;
+
+	s->boot.mmio = &s->mmio;
+	KUNIT_EXPECT_EQ(test, ane_h16_faults(&s->boot, false), 0);
+	KUNIT_EXPECT_EQ(test, s->fault_address_reads, 0U);
+	s->fault = BIT(31);
+	KUNIT_EXPECT_EQ(test, ane_h16_faults(&s->boot, false), -EIO);
+	KUNIT_EXPECT_EQ(test, s->fault_address_reads, 6U);
+	s->fault = 0;
+	KUNIT_EXPECT_EQ(test, ane_h16_faults(&s->boot, true), 0);
+	KUNIT_EXPECT_EQ(test, s->fault_address_reads, 12U);
+}
+
 static void ane_h16_map_failure_test(struct kunit *test)
 {
 	struct ane_h16_sim *s = test->priv;
@@ -972,6 +990,7 @@ static struct kunit_case ane_h16_boot_cases[] = {
 	KUNIT_CASE(ane_h16_power_actual_test),
 	KUNIT_CASE(ane_h16_rvbar_test),
 	KUNIT_CASE(ane_h16_dart_fault_test),
+	KUNIT_CASE(ane_h16_fault_address_on_demand_test),
 	KUNIT_CASE(ane_h16_map_failure_test),
 	KUNIT_CASE(ane_h16_no_ready_test),
 	KUNIT_CASE(ane_h16_wrong_table_test),
