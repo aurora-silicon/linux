@@ -6,7 +6,9 @@ import subprocess,tempfile
 R=Path(__file__).resolve().parents[2];s=(R/'drivers/gpu/drm/apple/iomfb_template.c').read_text();caller=(R/'drivers/gpu/drm/apple/iomfb.c').read_text()
 a=s.index('\tif (dcp_is_ext26(dcp)) {',s.index('int DCP_FW_NAME(iomfb_modeset)'))
 b=s.index('\n\tif (!lookup_mode',a)
-a=s.rfind('#if DCP_FW_VER',0,a)
+a=s.rfind('#if DCP_FW_',0,a)
+if a < 0:
+ raise RuntimeError('native modeset preprocessor guard not found')
 body=s[a:b]
 assert 'crtc_state->state' not in body
 assert 'drm_atomic_get_new_plane_state(commit, crtc->primary)' in caller
@@ -18,6 +20,8 @@ pre=r'''
 typedef uint32_t u32;
 #define DCP_FW_VERSION(a,b,c) ((a)*10000+(b)*100+(c))
 #define DCP_FW_VER DCP_FW_VERSION(26,6,0)
+/* This fixture selects the native H17 template instance. */
+#define DCP_FW_H17(x) 1
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 struct mode {int id;};
