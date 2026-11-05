@@ -906,7 +906,58 @@ static void macaudio_spk_refusals_are_quiet(struct kunit *test)
 	}
 }
 
+static void macaudio_sense_controls_are_protected(struct kunit *test)
+{
+	static const char *const names[] = {
+		"Left Woofer ISENSE Switch", "Left Woofer VSENSE Switch",
+		"Right Tweeter ISENSE Switch", "Right Tweeter VSENSE Switch",
+		"ISENSE Switch", "VSENSE Switch", "Jack Switch",
+	};
+	struct macaudio_test_spk t = {};
+	struct snd_kcontrol *sense[ARRAY_SIZE(names)];
+	unsigned int i;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j413_cfg, SN012776_0DB);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct snd_kcontrol_new tmpl = {
+			.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+			.name = names[i],
+			.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+			.info = snd_ctl_boolean_mono_info,
+		};
+
+		sense[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
+	}
+	macaudio_protect_sense(&t.ma->card);
+	for (i = 0; i < ARRAY_SIZE(names) - 1; i++)
+		KUNIT_EXPECT_TRUE(test, sense[i]->write_check == macaudio_sense_write_check);
+	KUNIT_EXPECT_NULL(test, sense[ARRAY_SIZE(names) - 1]->write_check);
+}
+
+static void macaudio_sense_owned_writes(struct kunit *test)
+{
+	struct macaudio_test_spk t = {};
+	struct snd_ctl_file other = {};
+
+	macaudio_test_spk_card(test, &t, &macaudio_j413_cfg, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), 0);
+	macaudio_test_take(test, &t);
+	/* Ownership alone excludes every other file, even before a grant. */
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, t.owner), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, NULL), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, t.owner), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), -EPERM);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), -EPERM);
+	macaudio_spk_unlock(t.spk);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), 0);
+}
+
 static struct kunit_case macaudio_protection_cases[] = {
+	KUNIT_CASE(macaudio_sense_owned_writes),
+	KUNIT_CASE(macaudio_sense_controls_are_protected),
 	KUNIT_CASE(macaudio_spk_floor_from_binding),
 	KUNIT_CASE(macaudio_spk_grant_needs_owner_and_valid_lease),
 	KUNIT_CASE(macaudio_spk_release_and_owner_gone),
