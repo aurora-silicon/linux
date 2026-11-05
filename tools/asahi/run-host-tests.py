@@ -191,6 +191,9 @@ SUITES = [
 def jobs(work, conf, dtc):
     found = {p.name for p in ASAHI.iterdir()
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
+    # This Rust fixture is compiled and executed by the paired-header wrapper.
+    if 'test-m3-uapi.py' in ASAHI_TESTS:
+        found.discard('m3-uapi-tests.rs')
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
     missing = sorted(found - known)
     gone = sorted(name for name in known if not (ASAHI / name).is_file())
