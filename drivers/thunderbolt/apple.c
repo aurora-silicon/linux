@@ -163,8 +163,8 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
  * T8132 has the T6030 ACIO layout and MxWrap CPU block, but the CIO reconfig
  * already starts the CPU from its preloaded SRAM: RUN is never written. LSTX
  * is handed over once RTKit is up, followed by the LSTX pin. Its links can
- * retrain shortly after CL states are enabled, so they stay in CL0. It has
- * no qualified DP route yet.
+ * retrain shortly after CL states are enabled, so they stay in CL0. Its
+ * DP IN adapters take the M4 policy, see apple_dpin_m4.
  */
 static const struct apple_cio_hw apple_cio_t8132_hw = {
 	.mxwrap = true,
@@ -173,7 +173,7 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
 	.lstx_after_boot = true,
 	.strict_fw_ready = true,
 	.no_host_clx = true,
-	.dp = &apple_dpin_disabled,
+	.dp = &apple_dpin_m4,
 };
 
 /* Type 7 uses its existing ready-state check and has no qualified DP route. */
@@ -358,6 +358,7 @@ struct apple_cio {
 		struct apple_dpin_state state;
 		struct apple_dpin_tokens tokens;
 		struct apple_dpin_binding *binding; /* worker-owned, handed to DCP */
+		bool dcp_touched;	/* DCP ran the handshake on this mapping */
 	} dpin[2];
 };
 
@@ -406,6 +407,7 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{ .compatible = "apple,t6020" },
 	{ .compatible = "apple,t6021" },
 	{ .compatible = "apple,t6030" },
+	{ .compatible = "apple,t8132" },
 	{},
 };
 
@@ -527,12 +529,19 @@ static void apple_dpin_request_inactive(void *data)
 {
 	struct apple_dpin_ctx *c = data;
 
+	/* Never woken by DCP: the block is still as the tunnel found it. */
+	if (c->acio->dp->lazy_idle && !c->dcp_touched)
+		return;
 	apple_dpin_set_active(c->acio, c->regs, c->idx, false);
 }
 
 static void apple_dpin_request_mask_irqs(void *data)
 {
 	struct apple_dpin_ctx *c = data;
+
+	/* Nothing to mask where the interrupts were never enabled. */
+	if (c->acio->dp->lazy_idle && !c->acio->dp->setup_irqs)
+		return;
 
 	writel(readl(c->regs + APPLE_DPIN_IRQ_ENABLE) & ~3,
 	       c->regs + APPLE_DPIN_IRQ_ENABLE);
@@ -563,6 +572,7 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	/* the tunnel is being torn down: the block may already be off */
 	if (!c->state.alive || !c->regs)
 		return -ENODEV;
+	c->dcp_touched = true;
 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
 }
 
@@ -735,6 +745,7 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
 	scoped_guard(mutex, &c->lock) {
 		regs = c->regs;
 		c->regs = NULL;
+		c->dcp_touched = false;
 		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED, false, 0);
 	}
 	if (regs)
