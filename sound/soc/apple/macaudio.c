@@ -131,11 +131,6 @@ struct macaudio_platform_cfg {
 	 */
 	unsigned int route_only_fes;
 	/*
-	 * The highest headphone volume, a "Jack DAC Playback Volume" value
-	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
-	 */
-	int jack_max_vol;
-	/*
 	 * The speaker front-end's channel count where the CPU component's
 	 * stream has more slots than amps (0: one channel per amp). The amps
 	 * keep the first slots in codec order; the others carry silence.
@@ -165,7 +160,6 @@ static const char *volume_control_names[] = {
 
 /* CS42L84 DAC: 0.5 dB steps from -128 dB, 256 = 0 dB, up to +12 dB */
 #define CS42L84_DAC_0DB 256
-#define CS42L84_DAC_DB(x) (CS42L84_DAC_0DB + 2 * (x))
 
 struct ma_codec_idle {
 	int idle_mode;
@@ -2018,10 +2012,18 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 			 "Apple%s", p + 1);
 	}
 
-	/* Before the card registers: userspace never sees the codec's full range */
-	if (ma->cfg->jack_max_vol)
+	/*
+	 * Before the card registers, so userspace never sees the codec's full
+	 * range: a CS42L84 jack stops at the DAC's 0 dB. Above it the DAC only
+	 * adds digital gain, which clips a full-scale signal, and macOS's own
+	 * headphone volume ends at 0 dB on every machine (the "Built-in
+	 * Headphone" OutputVolumeMax of the machine's audio configuration).
+	 * The same for every board; a card without a CS42L84 jack (the
+	 * speaker-only cards) has no such control.
+	 */
+	if (snd_soc_card_get_kcontrol(card, "Jack DAC Playback Volume"))
 		CHECK(snd_soc_limit_volume, "Jack DAC Playback Volume",
-		      ma->cfg->jack_max_vol, 1);
+		      CS42L84_DAC_0DB, 1);
 
 	if (!ma->has_speakers)
 		return 0;
@@ -2462,13 +2464,6 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
 	.fe_cpu_is_platform = true,
 	.route_only_fes = BIT(1),
-	/*
-	 * Above 0 dB the DAC only adds digital gain, which clips a full-scale
-	 * signal. The 6 dB below that are margin: the analog full scale of
-	 * this board's headphone output is unmeasured, and macOS adapts it to
-	 * the impedance it detects, which this driver does not.
-	 */
-	.jack_max_vol = CS42L84_DAC_DB(-6),
 };
 
 struct macaudio_platform_cfg macaudio_fallback_cfg = {
@@ -2542,7 +2537,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
-	/* The J713 jack runs on the AOP like the J616s one, with the same cap. */
+	/* The J713 jack runs on the AOP like the J616s one. */
 	{ .compatible = "apple,j713-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
