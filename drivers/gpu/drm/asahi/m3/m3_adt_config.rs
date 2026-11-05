@@ -920,27 +920,17 @@ fn build_images(
     for &(at, value) in hwdata_words {
         write(&mut hwdata, at, &value.to_le_bytes())?;
     }
-    // T8122 with the G15 14.8.3 firmware (the only image the runtime accepts there): the 20
-    // words of crate::m3::t8122_hwdata at HwDataA +0x418c, unless asahi.t8122_hwdata_418c=0.
+    // T8122's exact chip/firmware identity selects this block on Aurora; keep the
+    // existing constant model instead of restoring omacom's diagnostic opt-out.
     if crate::m3::t8122_start::is_t8122(soc)
         && core::ptr::eq(firmware.layout, &crate::m3::m3_firmware::T8122_LAYOUT)
         && cfg.gpu_gen == hw::GpuGen::G15
     {
-        if m3_params::t8122_hwdata_418c() {
-            let a = hwdata
-                .get_mut(HWDATA_A..HWDATA_A + size_of::<raw::HwDataAG15V14_8_3>())
-                .ok_or(EINVAL)?;
-            t8122_hwdata::write(a).map_err(|()| EINVAL)?;
-            dev_info!(
-                dev,
-                "M3 G15G: HwDataA +0x418c..+0x41db: wrote the 20 words (asahi.t8122_hwdata_418c=0 leaves them 0)\n"
-            );
-        } else {
-            dev_info!(
-                dev,
-                "M3 G15G: HwDataA +0x418c..+0x41db left 0 (asahi.t8122_hwdata_418c=0)\n"
-            );
-        }
+        let a = hwdata
+            .get_mut(HWDATA_A..HWDATA_A + size_of::<raw::HwDataAG15V14_8_3>())
+            .ok_or(EINVAL)?;
+        t8122_hwdata::write(a).map_err(|()| EINVAL)?;
+        dev_info!(dev, "M3 G15G: wrote identity-selected HwDataA +0x418c block\n");
     }
     // On T8122, log and require the two HwDataB words the firmware's power management depends
     // on: it powers the GPU cores up for a job only when +0xa38 and +0xa40 are both nonzero.
