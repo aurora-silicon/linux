@@ -1184,6 +1184,10 @@ u32 lane_count, link_rate;''')
 #define LINK_RATE_HBR2 0x14
 #define PHY_MODE_DP 1
 #define trace_dptxport_call_set_link_rate(...) ((void)0)
+/* Not a T8132 dcpext: its DRM outputs never follow this link. */
+static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }
+struct device;
+static void t8132_ext_drm_hotplug(struct device *dcpext) { (void)dcpext; assert(!"T8132 dcpext hotplug in an H17P scenario"); }
 static unsigned phy_capacity=2, phy_calls, hardware_rate, hardware_lanes;
 static int validate_error;
 static int phy_validate(void *phy,int mode,int submode,union phy_configure_opts *o) {

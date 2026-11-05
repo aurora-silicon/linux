@@ -38,8 +38,20 @@ struct dcp_m4_transaction {
 static inline int dcp_m4_transaction_decode(const struct dcp_m4_transaction *state, u64 word,
 					    struct dcp_m4_packet *packet)
 {
-	if (state->external)
+	if (state->external) {
+		/*
+		 * An out-of-band call's reply comes on stream 1; callbacks may
+		 * name any stream in this profile anyway.
+		 */
+		if (state->oob && (word & 0x40) && ((word >> 10) & 3) == 1) {
+			int ret = dcp_m4_decode_word_ext(word & ~0x400ULL, packet);
+
+			if (!ret)
+				packet->stream = 1;
+			return ret;
+		}
 		return dcp_m4_decode_word_ext(word, packet);
+	}
 	return state->oob ? dcp_m4_decode_word_oob(word, packet) :
 			    dcp_m4_decode_word(word, packet);
 }
@@ -81,7 +93,8 @@ static inline int dcp_m4_call_begin_stream(struct dcp_m4_transaction *state, voi
 	if (!rpc || rpc_size != DCP_M4_RPC_SIZE || !word || (input_size && !input) ||
 	    !dcp_m4_tag(tag, 'A') || state->calls >= DCP_M4_CALL_DEPTH)
 		return dcp_m4_transaction_fail(state, -EINVAL);
-	if (stream > 1 || (stream && (state->calls || state->callbacks || state->external)))
+	/* Out of band (stream 1) on the external profile too: top-level only. */
+	if (stream > 1 || (stream && (state->calls || state->callbacks)))
 		return dcp_m4_transaction_fail(state, -EINVAL);
 	if (state->calls) {
 		struct dcp_m4_call *pending = &state->call[state->calls - 1];
