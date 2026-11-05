@@ -582,6 +582,7 @@ def powerlog_framing(root):
     prefix += block(afkh, 'struct epic_compact_desc {') + ';\n'
     prefix += '#undef kfree\n#define kfree(p) free((void *)(p))\n#define pr_err(...) ((void)0)\n'
     prefix += block(parser, 'int parse_system_log_mnits(')
+    prefix += block(parser, 'int parse_system_log_mnits_pairs(')
     prefix += r'''
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
@@ -589,6 +590,7 @@ def powerlog_framing(root):
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define __le64 u64
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
@@ -640,6 +642,20 @@ int main(void)
     memcpy(wire+16,report,8);
     afk_recv_compact_message(&ep,3,wire,23);
     assert(hints==2 && !service.users);
+    /* Headerless pairs, after the descriptor, on the desktop firmware only. */
+    struct dcp_system_ev_mnits mnits;
+    assert(!parse_system_log_mnits_pairs(report+8,sizeof(report)-8,&mnits));
+    assert(mnits.millinits==123000 && mnits.idac==42 && mnits.timestamp==1234);
+    hint=0;memset(wire+16,0,8);memcpy(wire+24,report+8,sizeof(report)-8);
+    afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
+    assert(hints==3 && hint==123000 && !service.users);
+    d.fw_compat=DCP_FIRMWARE_H17P;
+    afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
+    assert(hints==3 && !service.users);
+    d.fw_compat=DCP_FIRMWARE_V_26_6_DESKTOP;
+    /* The first key without its value gives no reading. */
+    afk_recv_compact_message(&ep,3,wire,24+12);
+    assert(hints==3 && !service.users);
     return 0;
 }
 '''
