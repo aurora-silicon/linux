@@ -1046,6 +1046,8 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 			if (ret == -EAGAIN)
 				ret = 0;
 		}
+		if (!ret)
+			ret = ane_fw_transport_terminal(t);
 		if (ret)
 			break;
 		now = h16_now(s);
