@@ -125,6 +125,8 @@
 #define TAS2764_INT_CLK_CFG_IRQZ_CLR    BIT(2)
 
 #define TAS2764_BOP_CFG0                TAS2764_REG(0X0, 0x1d)
+/* BOP_CFG0 to BOP_CFG24, page 0 0x1d to 0x34 */
+#define TAS2764_BOP_CFG_LEN		24
 
 #define TAS2764_SDOUT_HIZ_1            TAS2764_REG(0x1, 0x3d)
 #define TAS2764_SDOUT_HIZ_2            TAS2764_REG(0x1, 0x3e)

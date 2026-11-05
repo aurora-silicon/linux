@@ -76,6 +76,10 @@ struct tas2764_priv {
 		unsigned int tx_mask;
 	} idle_slot_config;
 
+	/* apple,bop-config: the SN012776 brownout prevention block */
+	u8 bop_config[TAS2764_BOP_CFG_LEN];
+	bool have_bop_config;
+
 	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
 	bool deferred_shutdown;
 	/* Muted at a stream's end, until the next one: the bus clock may stop */
@@ -908,12 +912,6 @@ static struct snd_soc_dai_driver tas2764_dai_driver[] = {
 	},
 };
 
-static uint8_t sn012776_bop_presets[] = {
-	0x01, 0x32, 0x02, 0x22, 0x83, 0x2d, 0x80, 0x02, 0x06,
-	0x32, 0x46, 0x30, 0x02, 0x06, 0x38, 0x40, 0x30, 0x02,
-	0x06, 0x3e, 0x37, 0x30, 0xff, 0xe6
-};
-
 static const struct regmap_config tas2764_i2c_regmap;
 
 static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764)
@@ -1091,19 +1089,22 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 	switch (tas2764->devid) {
 	case DEVID_SN012776:
-		ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
-					TAS2764_PWR_CTRL_BOP_SRC,
-					TAS2764_PWR_CTRL_BOP_SRC);
-		if (ret < 0)
-			goto err_sdz;
-
-		for (i = 0; i < ARRAY_SIZE(sn012776_bop_presets); i++) {
-			ret = snd_soc_component_write(component,
-						TAS2764_BOP_CFG0 + i,
-						sn012776_bop_presets[i]);
-
+		/* The brownout prevention block, as the Mac's boot ADT gives it */
+		if (tas2764->have_bop_config) {
+			ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
+						TAS2764_PWR_CTRL_BOP_SRC,
+						TAS2764_PWR_CTRL_BOP_SRC);
 			if (ret < 0)
 				goto err_sdz;
+
+			for (i = 0; i < TAS2764_BOP_CFG_LEN; i++) {
+				ret = snd_soc_component_write(component,
+							TAS2764_BOP_CFG0 + i,
+							tas2764->bop_config[i]);
+
+				if (ret < 0)
+					goto err_sdz;
+			}
 		}
 
 		/* Apply all enabled Apple quirks */
@@ -1265,6 +1266,38 @@ static const struct regmap_config tas2764_i2c_regmap = {
 	.max_register = 0xffff,
 };
 
+/*
+ * The SN012776's brownout prevention block (BOP_CFG0 on, TAS2764_BOP_CFG_LEN
+ * registers), from the device tree's apple,bop-config: the boot loader copies
+ * it from the amp group's configuration in the Mac's ADT, which macOS programs
+ * into every amp of the group. Without it the block stays at its reset values.
+ * A property of the wrong length is a broken device tree, not a reason to
+ * guess.
+ */
+static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	int len;
+
+	tas2764->have_bop_config = false;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,bop-config");
+	if (len == -EINVAL) {
+		dev_info(dev, "no brownout configuration in the device tree\n");
+		return 0;
+	}
+	if (len != TAS2764_BOP_CFG_LEN)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,bop-config: %d bytes, the block has %d\n",
+				     len, TAS2764_BOP_CFG_LEN);
+
+	of_property_read_u8_array(dev->of_node, "apple,bop-config",
+				  tas2764->bop_config, TAS2764_BOP_CFG_LEN);
+	tas2764->have_bop_config = true;
+	return 0;
+}
+
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
 	int ret = 0;
@@ -1312,6 +1345,10 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 
 	tas2764->deferred_shutdown = of_property_read_bool(dev->of_node,
 							   "apple,deferred-shutdown");
+
+	ret = tas2764_parse_bop_config(dev, tas2764);
+	if (ret)
+		return ret;
 
 	return tas2764_group_join(dev, tas2764);
 }
@@ -1400,3 +1437,7 @@ module_i2c_driver(tas2764_i2c_driver);
 MODULE_AUTHOR("Dan Murphy <dmurphy@ti.com>");
 MODULE_DESCRIPTION("TAS2764 I2C Smart Amplifier driver");
 MODULE_LICENSE("GPL v2");
+
+#if IS_ENABLED(CONFIG_SND_SOC_TAS2764_KUNIT_TEST)
+#include "tas2764-bop-test.h"
+#endif
