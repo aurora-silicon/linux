@@ -57,19 +57,24 @@ pub(crate) struct Variant {
     pub(crate) few_primitives: bool,
     /// The firmware runs ray-traversal work (ray queries and intersection programs).
     pub(crate) ray_traversal: bool,
+    /// Tiling descriptors report whether the fragment queue still had earlier kicks
+    /// outstanding (`fragment_busy`).
+    pub(crate) fragment_busy: bool,
     /// Render item rings carry lead commands: InitBufferManager before the first tiling pass
-    /// of a buffer manager, and FragmentBarrier before every fragment descriptor.
+    /// of a buffer manager.
     pub(crate) lead_commands: bool,
     /// Register programs of the render descriptors.
     pub(crate) programs: super::render::RegisterPrograms,
 }
 
-/// A firmware build a SoC supports, identified by the macOS release it ships with.
+/// A firmware build a SoC supports, identified by its loaded TEXT.
 pub(crate) struct Build {
-    /// macOS version (major, minor, patch).
+    /// macOS version (major, minor, patch), used to order image candidates.
     pub(crate) os_version: [u32; 3],
     /// Name, for the log.
     pub(crate) name: &'static str,
+    /// The admitted loaded images, measured from the `fw-text` region.
+    pub(crate) images: &'static [crate::fwid::FirmwareBuild],
     /// Layouts and rules of the build.
     pub(crate) variant: &'static Variant,
 }
@@ -78,9 +83,8 @@ pub(crate) struct Build {
 pub(crate) enum Firmware {
     /// The SoC runs a single build, which is not identified (A18 Pro).
     Fixed(&'static Variant),
-    /// One of these builds, selected by the macOS version that the boot loader reports in
-    /// `apple,firmware-version`: the release whose boot firmware loaded the GPU firmware, and
-    /// with it this firmware build. Any other version is refused.
+    /// One of these exact loaded images. The loader's `apple,firmware-version` is only
+    /// a candidate-ordering hint because multiple OS releases can share an iBoot string.
     Identified(&'static [Build]),
 }
 
@@ -98,6 +102,7 @@ pub(crate) const V26A428: Variant = Variant {
     mcache: true,
     few_primitives: true,
     ray_traversal: true,
+    fragment_busy: true,
     lead_commands: false,
     programs: super::render::RegisterPrograms::G17P,
 };
@@ -121,8 +126,10 @@ pub(crate) const V25G83: Variant = Variant {
     mcache: false,
     // A fragment stage with the few-primitives flag hangs.
     few_primitives: false,
-    // A stalled ray traversal wedges the GPU without a firmware recovery.
-    ray_traversal: false,
+    ray_traversal: true,
+    // When a tiling pass runs out of memory with this set, the firmware resumes it without
+    // adding memory and the tiler stops silently; macOS always writes 0.
+    fragment_busy: false,
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
 };

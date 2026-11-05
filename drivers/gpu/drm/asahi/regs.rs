@@ -17,9 +17,11 @@ use kernel::{
     c_str,
     device::Core,
     error::{from_err_ptr, to_result},
-    devres::Devres,
     io::{
-        mem::IoMem,
+        mem::{
+            DevresIoMem,
+            IoMem, //
+        },
         Io,
         IoBase, //
     },
@@ -564,7 +566,7 @@ impl Resources<'_> {
 #[derive(Clone)]
 pub(crate) struct G17Resources {
     dev: ARef<platform::Device>,
-    sgx: Arc<Devres<IoMem<'static, SGX_SIZE>>>,
+    sgx: Arc<DevresIoMem<SGX_SIZE>>,
 }
 
 impl G17Resources {
@@ -707,6 +709,11 @@ impl G17Resources {
         self.sgx_read32::<G17_CORE_POWER>() & 0xf != 0
     }
 
+    /// Raw core power state, for tracing only.
+    pub(crate) fn g17_core_power(&self) -> u32 {
+        self.sgx_read32::<G17_CORE_POWER>()
+    }
+
     /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
     /// initialized.
     pub(crate) fn enable_g17_gating(&self) -> Result {
@@ -775,7 +782,7 @@ fn gpu_revision(
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 #[derive(Clone)]
 pub(crate) struct G16Resources {
-    sgx: Arc<Devres<IoMem<'static, SGX_SIZE>>>,
+    sgx: Arc<DevresIoMem<SGX_SIZE>>,
 }
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]

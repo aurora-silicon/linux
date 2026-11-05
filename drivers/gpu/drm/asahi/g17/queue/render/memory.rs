@@ -31,8 +31,8 @@ pub(super) const ANNOUNCE: [usize; 2] = [0x17000, 0x1b000];
 pub(super) const JOB_LIST: usize = 0xa000;
 pub(super) const CONFIG: [usize; 2] = [0, 0x4000];
 pub(super) const CONFIG_STRIDE: usize = 0x180;
-/// The lead command of a stage (InitBM before tiling, the barrier before fragment), after the
-/// stage's configuration record in its slot ([`crate::g17::fw::Variant::lead_commands`]).
+/// The lead command of a stage (InitBM before tiling), after the stage's configuration record
+/// in its slot ([`crate::g17::fw::Variant::lead_commands`]).
 pub(super) const LEAD: usize = 0xc0;
 const DEPTH: usize = queues::RENDER_DEPTH as usize;
 /// Offsets of the priority pair and the policy word in a queue record.
@@ -528,15 +528,44 @@ impl Memory {
 }
 
 const _: () = {
+    // Every unretired render of a pair holds its own command record.
+    assert!(DEPTH <= RECORDS);
     assert!(abi::TA_DESCRIPTOR_SIZE * RECORDS <= TA_BYTES);
     assert!(abi::FRAGMENT_SLOT_SIZE * RECORDS <= FRAGMENT_BYTES);
     assert!(RECORDS * CONFIG_STRIDE <= 0x4000);
     assert!(size_of::<queue::QueueConfig>() <= LEAD);
-    assert!(LEAD + size_of::<queue::FragmentBarrier>() <= CONFIG_STRIDE);
     assert!(LEAD + size_of::<queue::InitBufferManager>() <= CONFIG_STRIDE);
 };
 
 impl Memory {
+    /// Requests the tiling descriptor slot and both queue configuration records of
+    /// `ordinal` for writing. The firmware accessed them for the command that used them
+    /// last, so the host no longer holds their lines; requesting them before the rest of
+    /// the preparation overlaps those transfers with it instead of stalling the writes one
+    /// line at a time.
+    pub(super) fn prefetch_descriptors(&self, ordinal: u64) {
+        let record = ordinal as usize % RECORDS;
+        let config = size_of::<queue::QueueConfig>();
+        let ranges = [
+            (&self.graph.descriptors, Graph::offset(0, ordinal), size_of::<abi::TaDescriptor>()),
+            (&self.graph.config, CONFIG[0] + record * CONFIG_STRIDE, config),
+            (&self.graph.config, CONFIG[1] + record * CONFIG_STRIDE, config),
+        ];
+        for (object, offset, size) in ranges {
+            let Ok(base) = object.pointer(offset, size) else {
+                continue;
+            };
+            for line in (0..size).step_by(64) {
+                // SAFETY: A prefetch hint inside the retained mapping; it has no
+                // architectural effect on memory.
+                unsafe {
+                    core::arch::asm!("prfm pstl1keep, [{0}]", in(reg) base.add(line),
+                        options(nostack, preserves_flags, readonly));
+                }
+            }
+        }
+    }
+
     pub(super) fn write_descriptors(
         &mut self,
         args: &abi::RenderArgs<'_>,
@@ -571,21 +600,10 @@ impl Memory {
             (&mut *tiling).write(args)?;
             let fragment = &mut *fragment;
             fragment.write(args)?;
-            self.registers.bytes_mut().fill(0);
-            for (index, array) in fragment.descriptor.arrays.iter().enumerate() {
-                for (entry, value) in array
-                    .entries
-                    .get(..(array.size & 0xffff) as usize)
-                    .ok_or(EINVAL)?
-                    .iter()
-                    .enumerate()
-                {
-                    self.registers.write(
-                        index * size_of::<fw::kick::RegisterArray>()
-                            + entry * size_of::<fw::kick::RegisterWrite>(),
-                        *value,
-                    )?;
-                }
+            // Kick entries bind the arrays embedded in this descriptor
+            // (register_bindings); the client register page is never read.
+            for array in &fragment.descriptor.arrays {
+                array.entries.get(..(array.size & 0xffff) as usize).ok_or(EINVAL)?;
             }
             fragment.set_mcache(
                 args.fragment.descriptor_va,
@@ -629,14 +647,8 @@ impl Memory {
     }
 
     /// Writes the lead commands of `ordinal` from its linked descriptors: InitBM before the
-    /// tiling descriptor when `init_manager`, and the fragment barrier. Returns which stages
-    /// have one.
-    pub(super) fn write_leads(
-        &mut self,
-        ordinal: u64,
-        tiling_kick: fw::kick::KickTimestamp,
-        init_manager: bool,
-    ) -> Result<[bool; 2]> {
+    /// tiling descriptor when `init_manager`. Returns which stages have one.
+    pub(super) fn write_leads(&mut self, ordinal: u64, init_manager: bool) -> Result<[bool; 2]> {
         if !self.owns(ordinal) {
             return Err(EIO);
         }
@@ -645,23 +657,10 @@ impl Memory {
             .descriptors
             .pointer(Graph::offset(0, ordinal), size_of::<abi::TaDescriptor>())?
             .cast::<abi::TaDescriptor>();
-        let fragment = self
-            .graph
-            .descriptors
-            .pointer(Graph::offset(1, ordinal), size_of::<abi::FragmentSlot>())?
-            .cast::<abi::FragmentSlot>();
-        // SAFETY: Both views were checked during preparation and the ordinal still owns them;
-        // only integer fields are read.
-        let (ta, fragment_id) = unsafe { (&*ta, (*fragment).descriptor.current_id) };
+        // SAFETY: The view was checked during preparation and the ordinal still owns it; only
+        // integer fields are read.
+        let ta = unsafe { &*ta };
         let slot = ordinal as usize % RECORDS * CONFIG_STRIDE + LEAD;
-        let barrier = queue::FragmentBarrier::new(
-            ta.stamp_va,
-            tiling_kick,
-            ta.qid,
-            ta.stamp_value,
-            fragment_id,
-        );
-        self.graph.config.write(CONFIG[1] + slot, barrier)?;
         if init_manager {
             let init = queue::InitBufferManager::new(
                 ta.context_id,
@@ -671,7 +670,7 @@ impl Memory {
             );
             self.graph.config.write(CONFIG[0] + slot, init)?;
         }
-        Ok([init_manager, true])
+        Ok([init_manager, false])
     }
 }
 

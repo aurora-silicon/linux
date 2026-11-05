@@ -14,8 +14,8 @@ use kernel::prelude::*;
 const RETRY_LIMIT: u16 = 1000;
 
 pub(super) struct Grow {
-    requests: KVec<TvbGrowRequest>,
-    active: Option<TvbGrowRequest>,
+    pub(super) requests: KVec<TvbGrowRequest>,
+    pub(super) active: Option<TvbGrowRequest>,
     pub(super) reply: Option<(TvbGrowRequest, bool, u16)>,
     release_attempts: u16,
 }
@@ -280,7 +280,7 @@ impl crate::g17::Shared {
                 return Err(EIO);
             }
             firmware.queues.render.grow.active = None;
-            self.changed.notify_all();
+            self.note_changed();
             if !lease.is_current() || request.halt_count != firmware.recovery.generation() {
                 continue;
             }

@@ -670,9 +670,17 @@ pub(crate) struct Owner {
 enum LeasePhase {
     Preparing,
     Ready,
+    /// No reference since the given time. The registration stays live so that
+    /// the owner's next render reuses it without a control-ring release; the
+    /// release becomes pending when the linger ends.
+    Lingering(u64),
     ReleaseSent(u32),
     Released,
 }
+
+/// How long an idle registration of an open owner may stay live: the
+/// firmware's effort idle hold.
+pub(crate) const LINGER_NS: u64 = 16_000_000;
 
 /// References to one prepopulated owner: preparation and two engine commands
 /// per render. Published releases do not gate reacquisition; their consumption
@@ -707,10 +715,14 @@ impl Lease {
         }
         let generation = previous.generation.checked_add(1).ok_or(EOVERFLOW)?;
         let same_owner = previous.owner == owner;
+        // A lingering registration was never released: it continues like an
+        // overlap of the owner's previous render.
         let overlapping = same_owner
-            && previous.phase == LeasePhase::Ready
-            && previous.references >= 2
-            && previous.commands >= 2;
+            && match previous.phase {
+                LeasePhase::Ready => previous.references >= 2 && previous.commands >= 2,
+                LeasePhase::Lingering(_) => true,
+                _ => false,
+            };
         let reacquire = previous.reacquirable();
         if !overlapping && !reacquire {
             return Err(EBUSY);
@@ -772,15 +784,34 @@ impl Lease {
         Err(EIO)
     }
     /// Both engines have retired this render's exact retained submission.
+    /// With `linger`, a registration left without references stays live
+    /// instead of making its final release pending.
     pub(crate) fn complete_render(
         &mut self,
+        linger: bool,
     ) -> Result<Option<super::fw::channels::FreeListRelease>> {
         if self.phase != LeasePhase::Ready || self.references < 2 || self.commands < 2 {
             return Err(EINVAL);
         }
         self.references -= 2;
         self.commands -= 2;
+        if self.references == 0 && linger {
+            self.phase = LeasePhase::Lingering(super::now_ns().max(1));
+        }
         Ok(self.pending_release())
+    }
+    /// The time since which an idle registration lingers, if it does.
+    pub(crate) fn lingering(&self) -> Option<u64> {
+        match self.phase {
+            LeasePhase::Lingering(since) => Some(since),
+            _ => None,
+        }
+    }
+    /// Ends a linger; the final release becomes pending.
+    pub(crate) fn end_linger(&mut self) {
+        if matches!(self.phase, LeasePhase::Lingering(_)) {
+            self.phase = LeasePhase::Ready;
+        }
     }
     pub(crate) fn pending_release(&self) -> Option<super::fw::channels::FreeListRelease> {
         (self.phase == LeasePhase::Ready && self.references == 0).then(|| {

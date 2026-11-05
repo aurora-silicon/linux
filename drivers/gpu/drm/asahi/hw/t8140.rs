@@ -57,6 +57,7 @@ pub(crate) const CONFIG: Config = Config {
     // The layouts the A18 Pro has always run with.
     core_layout: crate::g17::CoreLayout {
         cores: None,
+        alternate_core_masks: None,
         operand_state: crate::g17::fw::compute::OperandState::ONE_BY_SIX,
         deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
     },
@@ -417,9 +418,10 @@ pub(crate) mod scheduling {
 pub(crate) mod queues {
     pub(crate) const RENDER_SLOTS: usize = 64;
     // One physical pair per logical owner leaves room for every execution
-    // context in the shared 128-QID namespace. Commands queue at RENDER_DEPTH.
+    // context in the shared 128-QID namespace. Commands queue at RENDER_DEPTH,
+    // as many as a pair has command records (the render memory's RECORDS).
     pub(crate) const RENDER_PAIRS_PER_OWNER: usize = 1;
-    pub(crate) const RENDER_DEPTH: u8 = 16;
+    pub(crate) const RENDER_DEPTH: u8 = 32;
     pub(crate) const COMPUTE_DEPTH: usize = 16;
 }
 

@@ -96,6 +96,13 @@ pub(crate) fn gcd(in_n: u64, in_m: u64) -> u64 {
     m
 }
 
+/// A value that can be populated from an untrusted byte record.
+///
+/// # Safety
+///
+/// Every bit pattern must be valid for Self. Its byte representation must
+/// contain no uninitialized bytes (including padding) when produced by Default,
+/// since Reader temporarily views that storage as a byte slice.
 pub(crate) unsafe trait AnyBitPattern: Default + Sized + Copy + 'static {}
 
 pub(crate) struct Reader<'a> {
@@ -117,7 +124,9 @@ impl<'a> Reader<'a> {
 
         // SAFETY: The output pointer is valid, and the size does not exceed
         // the type size, and all bit patterns are valid.
-        let dst = unsafe { core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, size) };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut obj).cast::<u8>(), size)
+        };
 
         dst.copy_from_slice(&src[..size]);
         self.offset = end;
@@ -216,18 +225,4 @@ mod tests {
         let mut reader = Reader::new(&raw);
         assert!(reader.read_supported::<Pair>(8, 8).is_err());
     }
-}
-
-/// Fallibly initializes `slot` with `init` (`pin_init::raw_try_init` of later pin-init releases).
-///
-/// # Safety
-///
-/// - `slot` is a valid pointer to uninitialized memory.
-/// - the caller does not touch `slot` when `Err` is returned, they are only permitted to
-///   deallocate.
-/// - `slot` will not move until it is dropped, i.e. it will be pinned.
-#[inline(always)]
-pub(crate) unsafe fn raw_try_init<T, E>(slot: *mut T, init: impl PinInit<T, E>) -> Result<(), E> {
-    // SAFETY: Per safety requirement.
-    unsafe { init.__pinned_init(slot) }
 }

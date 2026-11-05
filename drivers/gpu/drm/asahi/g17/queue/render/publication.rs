@@ -19,7 +19,7 @@ fn identity(mut config: QueueConfig) -> QueueConfig {
     config.qos_update = 0;
     config
 }
-pub(super) fn required(previous: Option<QueueConfig>, config: QueueConfig) -> bool {
+pub(in crate::g17::queue) fn required(previous: Option<QueueConfig>, config: QueueConfig) -> bool {
     config.install != 0
         || config.context_update != 0
         || config.completion_seed_valid != 0
@@ -41,6 +41,10 @@ pub(super) struct Lane<'a> {
     pub(super) window: Window,
 }
 impl<'a> Lane<'a> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The publication lane describes independent fields of the firmware wire record."
+    )]
     pub(super) fn new(
         graph: &'a memory::Graph,
         stage: usize,
@@ -94,7 +98,9 @@ impl<'a> Lane<'a> {
         push(announce_va);
         Ok(Self {
             items,
-            producer: graph.queues.word(memory::POINTERS[stage] + graph.pointers.producer)?,
+            producer: graph
+                .queues
+                .word(memory::POINTERS[stage] + graph.pointers.producer)?,
             values,
             config,
             config_destination,

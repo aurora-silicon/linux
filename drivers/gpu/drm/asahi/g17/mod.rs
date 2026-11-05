@@ -12,12 +12,18 @@
 //!
 //! # Locking
 //!
-//! `Shared::state` is the device lock. It serializes all firmware-visible publication and all
-//! firmware-shared state, including the bounded waits for the firmware that publication needs.
-//! Completions are signalled after dropping it. Lock order: `Shared::state` -> UAT shared state
-//! -> VM exec lock -> GEM reservation. `RoleState::ack` nests inside nothing.
+//! `Shared::state` is the device lock. It serializes binding, recovery, the event worker and all
+//! firmware-shared state that has no narrower owner. Steady-state compute publication into a
+//! bound queue takes only that queue's cell lock and the port's locks ([`port`]), reached under
+//! a preparation lease. Completions are signalled after dropping the device lock. Lock order:
+//! `Shared::state` -> compute queue cell (one at a time) -> port locks -> availability domains;
+//! `Shared::state` -> UAT shared state -> VM exec lock -> GEM reservation. `RoleState::ack`
+//! nests inside nothing. Capacity waits block on an availability domain signalled by the
+//! release that provides the capacity, never on a sleep.
 
+mod availability;
 mod buffer;
+mod calibration;
 mod channel;
 mod command;
 pub(crate) use command::Attachments;
@@ -25,29 +31,36 @@ mod completion;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
+mod sync_input;
+pub(crate) mod sync_output;
+mod trace;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 pub(crate) use dependency::inherited_error;
+mod capacity;
 mod event;
 mod feed;
 mod fence;
 mod freelist;
 pub(crate) mod fw;
-mod ids;
 pub(crate) mod hazard;
+mod ids;
 mod initdata;
 mod job;
-mod capacity;
 mod kick;
 mod object;
+mod port;
 pub(crate) mod power;
 mod preparation;
 mod qos;
 mod queue;
 mod recovery;
 mod replay;
+mod reports;
 mod runtime;
+pub(crate) mod stats;
 pub(crate) mod status;
 mod teardown;
+pub(crate) mod telemetry;
 mod timeout;
 mod validation;
 
@@ -55,6 +68,8 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU32,
+    AtomicU64,
     Ordering, //
 };
 
@@ -62,12 +77,12 @@ use kernel::{
     c_str,
     device::{self, Core},
     drm::gem::shmem,
+    impl_has_delayed_work, impl_has_work,
     io::{
         IoBase,
         IoSysMap,
         Region, //
     },
-    impl_has_delayed_work, impl_has_work,
     new_condvar, new_delayed_work, new_mutex, new_work, platform,
     prelude::*,
     soc::apple::rtkit,
@@ -192,9 +207,10 @@ pub(crate) struct Config {
 
 /// Layouts of the firmware command buffers that follow a SoC's GPU core layout.
 pub(crate) struct CoreLayout {
-    /// The cluster and enabled core counts the layouts were measured on, which the GPU must
-    /// report at probe; `None` where the layouts hold for every configuration of the SoC.
+    /// The measured cluster and enabled core counts; `None` admits every configuration.
     pub(crate) cores: Option<(u32, u32)>,
+    /// An experimental layout: core slots and enabled cores per cluster.
+    pub(crate) alternate_core_masks: Option<(u32, u32)>,
     /// A compute queue's operand-state buffer.
     pub(crate) operand_state: fw::compute::OperandState,
     /// A render's deflake buffer.
@@ -359,7 +375,7 @@ impl rtkit::Operations for RoleOps {
         if !is_events_message(ep, msg) {
             return false;
         }
-        data.shared.queue_events();
+        data.shared.queue_event_records();
         true
     }
 
@@ -394,13 +410,58 @@ impl rtkit::Operations for RoleOps {
     }
 }
 
+/// The RTKit of one coprocessor. The mailbox driver serializes its own register writes; this
+/// lock only serializes the exclusive borrows the RTKit API takes, so that publishers holding
+/// different locks can ring the same doorbell.
+#[pin_data]
+struct Mailbox {
+    #[pin]
+    lock: Mutex<()>,
+    rtkit: core::cell::UnsafeCell<rtkit::RtKit<RoleOps>>,
+}
+
+// SAFETY: Every access to the RTKit goes through `with`, which holds the lock.
+unsafe impl Sync for Mailbox {}
+
+impl Mailbox {
+    fn new(rtkit: rtkit::RtKit<RoleOps>) -> Result<Pin<KBox<Self>>> {
+        KBox::pin_init(
+            pin_init!(Self {
+                lock <- new_mutex!((), "g17::Mailbox::lock"),
+                rtkit: core::cell::UnsafeCell::new(rtkit),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    fn with<R>(&self, f: impl FnOnce(Pin<&mut rtkit::RtKit<RoleOps>>) -> R) -> R {
+        let _guard = self.lock.lock();
+        // SAFETY: The lock excludes every other borrow of the RTKit.
+        f(Pin::new(unsafe { &mut *self.rtkit.get() }))
+    }
+
+    fn send(&self, endpoint: u8, message: u64) -> Result {
+        self.with(|rtkit| rtkit.send_message(endpoint, message))
+    }
+
+    /// A handle on the receive thread's minimum utilization, usable from any context.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not use the handle after this mailbox is dropped.
+    unsafe fn rx_util_min_handle(&self) -> rtkit::RxUtilMin {
+        // SAFETY: The caller's obligation is the handle's.
+        self.with(|rtkit| unsafe { rtkit.rx_util_min_handle() })
+    }
+}
+
 /// A running firmware coprocessor.
 ///
 /// Dropping it stops the CPU before RTKit and the crash log buffer go away.
 struct Coprocessor {
     cpu: regs::CpuControl,
     running: bool,
-    rtkit: rtkit::RtKit<RoleOps>,
+    rtkit: Pin<KBox<Mailbox>>,
     state: Arc<RoleState>,
     _crash_buffer: Option<KernelObject>,
 }
@@ -455,7 +516,7 @@ impl Coprocessor {
         Ok(Coprocessor {
             cpu: regs::CpuControl::new(pdev, index)?,
             running: false,
-            rtkit: Self::receiver(dev, index, &state)?,
+            rtkit: Mailbox::new(Self::receiver(dev, index, &state)?)?,
             state,
             _crash_buffer: crash_buffer,
         })
@@ -484,19 +545,20 @@ impl Coprocessor {
     fn boot(&mut self) -> Result {
         self.cpu.start()?;
         self.running = true;
-        Pin::new(&mut self.rtkit).boot()
+        self.rtkit.with(|rtkit| rtkit.boot())
     }
 
     /// Starts the firmware endpoints and hands the firmware its initialization root. An
     /// acknowledgment message is awaited here; one in status A is the caller's to poll.
     fn init(&mut self, root_va: u64, ack: fw::variant::InitAck) -> Result {
-        let mut rtkit = Pin::new(&mut self.rtkit);
-        rtkit.as_mut().start_endpoint(EP_FIRMWARE)?;
-        rtkit.as_mut().start_endpoint(EP_DOORBELL)?;
-        rtkit.send_message(
-            EP_FIRMWARE,
-            MSG_INITDATA | (root_va & MSG_INITDATA_ADDR_MASK),
-        )?;
+        self.rtkit.with(|mut rtkit| {
+            rtkit.as_mut().start_endpoint(EP_FIRMWARE)?;
+            rtkit.as_mut().start_endpoint(EP_DOORBELL)?;
+            rtkit.send_message(
+                EP_FIRMWARE,
+                MSG_INITDATA | (root_va & MSG_INITDATA_ADDR_MASK),
+            )
+        })?;
         match ack {
             fw::variant::InitAck::Message => self.state.wait_for_ack(),
             fw::variant::InitAck::Status => Ok(()),
@@ -504,8 +566,9 @@ impl Coprocessor {
     }
 
     /// Sends a host notification to the firmware.
-    fn notify(&mut self, msg: u64) -> Result {
-        Pin::new(&mut self.rtkit).send_message(EP_DOORBELL, msg)
+    fn notify(&self, msg: u64) -> Result {
+        trace::message(trace::MAILBOX, msg);
+        self.rtkit.send(EP_DOORBELL, msg)
     }
 
     /// Stops the CPU. The firmware keeps its state, but no longer runs.
@@ -572,6 +635,10 @@ struct Firmware {
     secondary: Option<Coprocessor>,
     primary: Coprocessor,
     bridge: Bridge,
+    /// Publication state shared with publishers that do not hold the device mutex.
+    port: Arc<port::Port>,
+    /// Fast-path submissions already accounted by the idle check.
+    seen_submissions: u64,
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
@@ -595,6 +662,7 @@ impl Drop for Firmware {
             secondary.stop();
         }
         self.primary.stop();
+        self.port.set_effort_full(false);
         self.pool.stop_after_firmware();
         // RTKit destruction releases the mailbox power references. Clear the bridge while
         // those references still keep the register block powered.
@@ -641,42 +709,71 @@ impl Firmware {
 
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
+        self.port.note_gpu_activity();
         self.effort.submit();
         self.apply_effort(power::FULL_EFFORT)
     }
 
     fn apply_effort(&mut self, effort: u32) -> Result {
-        Self::apply_shared_effort(&self.init, &mut self.effort, effort)
+        Self::apply_shared_effort(&self.init, &mut self.effort, &self.port, effort)
     }
 
     fn apply_shared_effort(
         init: &initdata::InitData,
         state: &mut power::Effort,
+        port: &port::Port,
         effort: u32,
     ) -> Result {
         if state.applied() == effort && init.effort()? == effort {
             return Ok(());
         }
         init.publish_effort(effort)?;
+        trace::message(trace::EFFORT, u64::from(effort));
         state.did_apply(effort);
+        port.set_effort_full(effort == power::FULL_EFFORT);
         Ok(())
     }
 
     /// Returns the delay in ns for a follow-up idle check. Queue owners report only submitted,
-    /// unretired work; quarantined work retaining mappings is excluded.
+    /// unretired work; quarantined work retaining mappings is excluded. Submissions published
+    /// without the device mutex count as activity, and a clear that races one is abandoned.
+    fn observe_statistics_power(&mut self) {
+        if self.rings.statistics_suspended() {
+            return;
+        }
+        self.rings.observe_statistics_power(
+            self.bridge.regs.g17_core_power() & 0xf != 0,
+            self.port.statistics_epoch(),
+        );
+    }
+
     fn idle_check(&mut self, now_ns: u64, in_flight: bool) -> Result<Option<u64>> {
-        let effort = match self.effort.idle(now_ns, in_flight) {
+        let submissions = self.port.submissions();
+        let submitted = submissions != self.seen_submissions;
+        self.seen_submissions = submissions;
+        if submitted {
+            self.effort.submit();
+        }
+        let effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
+                self.port.set_effort_full(false);
+                if self.port.submissions() != submissions {
+                    self.port.set_effort_full(true);
+                    self.effort.submit();
+                    return Ok(Some(power::IDLE_HOLD_NS));
+                }
                 self.apply_effort(0)?;
                 None
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
-        Ok(match (effort, self.idle_hold(now_ns, in_flight)) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        })
+        Ok(
+            match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+        )
     }
 
     /// Drives the idle hold (see power::Hold); returns the delay in ns for its next check. A
@@ -685,7 +782,10 @@ impl Firmware {
         const RETRY_NS: u64 = 1_000_000;
         let hold_ms = power::IDLE_HOLD_MS.load(Ordering::Relaxed);
         for _ in 0..2 {
-            match self.hold.step(now_ns, in_flight, self.effort.submissions(), hold_ms) {
+            match self
+                .hold
+                .step(now_ns, in_flight, self.effort.submissions(), hold_ms)
+            {
                 power::HoldAction::None => return None,
                 power::HoldAction::Recheck(delay) => return Some(delay),
                 power::HoldAction::Assert => {
@@ -773,8 +873,28 @@ struct Shared {
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
     preparations: Arc<preparation::Gate>,
+    /// Compute admission waiting for a physical channel: signalled when a channel becomes
+    /// reusable or shareable, a QID or slot is returned, or a pool vacancy is witnessed.
+    channels: Arc<availability::Availability>,
+    /// Compute admission waiting for retirement-bound capacity (work states, ring and
+    /// in-flight room, drain witnesses, pool releases) or for publication to reopen.
+    progress: Arc<availability::Availability>,
+    /// Logical-queue creation waiting for a returned queue slot or execution context.
+    queues: Arc<availability::Availability>,
+    /// Render publication waiting for render capacity, a pair on loan, a work
+    /// state or firmware room: signalled when a pair, lease or work state
+    /// returns, an owner closes, a teardown parks, and on every event pass
+    /// while a render publisher waits (firmware consumption has no event).
+    renders: Arc<availability::Availability>,
+    /// Unbound compute publishers which can reuse a retired channel.
+    compute_demand: AtomicU32,
     #[pin]
     work: Work<Shared, EVENT_WORK>,
+    /// The next event pass runs every housekeeping step: set by every [`Self::queue_events`]
+    /// request, not by the firmware's event notification ([`Self::queue_event_records`]).
+    housekeeping: AtomicBool,
+    /// When an event pass last ran every housekeeping step, in ns.
+    housekeeping_ns: AtomicU64,
     #[pin]
     poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
@@ -795,6 +915,8 @@ struct Shared {
     state: Mutex<Option<KBox<Firmware>>>,
     #[pin]
     changed: CondVar,
+    /// The port of the session in `state`; null before boot and once detachment begins.
+    port: core::sync::atomic::AtomicPtr<port::Port>,
 }
 
 impl_has_work! {
@@ -884,8 +1006,37 @@ impl Shared {
         drop(retired);
     }
 
-    /// Queues the event worker. Callable from any context.
+    /// Wakes the waiters for a returned pair, binding or capacity change.
+    fn note_changed(&self) {
+        self.changed.notify_all();
+        self.renders.notify();
+    }
+
+    /// The session's port, valid while `lease` is held: shutdown and device loss join every
+    /// lease before they detach the session.
+    fn port<'a>(&self, lease: &'a preparation::Lease) -> Option<&'a port::Port> {
+        let _ = lease;
+        // SAFETY: The pointer is published before the session becomes reachable and cleared
+        // only after every lease has been joined, so it names a live port for 'a.
+        unsafe { self.port.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// Called after joining every preparation lease, before the session is detached.
+    fn forget_port(&self) {
+        self.port.store(core::ptr::null_mut(), Ordering::Release);
+    }
+
+    /// Queues the event worker for a pass that runs every housekeeping step. Callable from any
+    /// context.
     fn queue_events(self: &Arc<Self>) {
+        self.housekeeping.store(true, Ordering::Release);
+        self.queue_event_records();
+    }
+
+    /// Queues the event worker for firmware records alone: completions, or records that arrived
+    /// during a pass. The pass skips the housekeeping that nothing needs (see
+    /// `runtime_event_turn`). Callable from any context.
+    fn queue_event_records(self: &Arc<Self>) {
         // Already queued if this fails, which is just as good.
         let _ = workqueue::system_highpri().enqueue::<Arc<Shared>, EVENT_WORK>(self.clone());
     }
@@ -912,6 +1063,7 @@ impl Shared {
             // Context release returns its execution root off-lock. The next
             // device pass can now detach idle compute aliases and their QoS
             // leases, without depending on a new client's submission/event.
+            self.queues.notify();
             self.queue_events();
         }
     }
@@ -991,7 +1143,10 @@ pub(crate) struct Gpu {
     geometry: mmu::UatGeometry,
     ids: gpu::SequenceIDs,
     shared: Arc<Shared>,
+    stats: Arc<crate::stats::StatsSnapshot>,
     _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
+    _reports: Pin<KBox<kernel::debugfs::File<reports::View>>>,
+    _power: Pin<KBox<kernel::debugfs::File<reports::PowerView>>>,
 }
 
 impl Gpu {
@@ -1002,8 +1157,22 @@ impl Gpu {
         cfg: &'static Config,
         regs: regs::G17Resources,
     ) -> Result<Arc<Gpu>> {
+        let calibration = if cfg.chip_id == crate::hw::t6040::CHIP_ID {
+            Some(calibration::Calibration::read(dev).inspect_err(|_| {
+                dev_err!(
+                    dev.as_ref(),
+                    "Missing or invalid T6040 GPU calibration handoff\n"
+                );
+            })?)
+        } else {
+            None
+        };
         let variant = Self::firmware_variant(dev, &cfg.firmware)?;
         let id = regs.get_g17_id()?;
+        if let Some(calibration) = calibration {
+            calibration.check_cores(&id.core_masks)?;
+            calibration.check_opps(&initdata::InitData::opps(dev, cfg.opps, id.num_clusters)?)?;
+        }
         if id.family != cfg.identity.family
             || id.variant != cfg.identity.variant
             || id.num_dies != cfg.identity.num_dies
@@ -1023,14 +1192,37 @@ impl Gpu {
             oas: cfg.uat_oas,
         };
         let max_frequency_khz = Self::max_frequency_khz(dev)?;
-        let preparations = preparation::Gate::new()?;
+        let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
+        let idle_delay =
+            power::idle_delay(node.get_opt_property(c_str!("apple,idle-off-delay-ms"))?)?;
+        power::IDLE_HOLD_MS.store(idle_delay, Ordering::Relaxed);
+        dev_info!(
+            dev.as_ref(),
+            "GPU idle power-off delay: {} ms\n",
+            idle_delay
+        );
+        let channels = availability::Availability::new()?;
+        let progress = availability::Availability::new()?;
+        let queues = availability::Availability::new()?;
+        let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
+        let renders = availability::Availability::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
+        let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
+            clusters == id.num_clusters
+                && cores != active_cores
+                && cfg.core_layout.alternate_core_masks.is_some_and(|(slots, enabled)| {
+                    id.num_cores == slots
+                        && id.core_masks.len() == clusters as usize
+                        && id.core_masks.iter().all(|mask| mask.count_ones() == enabled)
+                })
+        });
         if cfg
             .core_layout
             .cores
             .is_some_and(|cores| cores != (id.num_clusters, active_cores))
+            && !alternate
         {
             dev_err!(
                 dev.as_ref(),
@@ -1039,6 +1231,12 @@ impl Gpu {
                 active_cores
             );
             return Err(ENODEV);
+        }
+        if alternate {
+            dev_warn!(
+                dev.as_ref(),
+                "Experimental GPU topology admission: command-buffer offsets are not yet validated\n"
+            );
         }
         let shared = Arc::pin_init(
             pin_init!(Shared {
@@ -1054,7 +1252,14 @@ impl Gpu {
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
+                channels,
+                progress,
+                queues,
+                renders,
+                compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
+                housekeeping: AtomicBool::new(true),
+                housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
                 grow <- new_work!("g17::Shared::grow"),
@@ -1063,13 +1268,29 @@ impl Gpu {
                 stop <- new_mutex!((), "g17::Shared::stop"),
                 state <- new_mutex!(None, "g17::Shared::state"),
                 changed <- new_condvar!("g17::Shared::changed"),
+                port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             }),
             GFP_KERNEL,
         )?;
 
-        let directory = kernel::debugfs::Dir::new(c"asahi-g17");
+        let directory = kernel::debugfs::Dir::new(c"aurora-g17");
         let capacity = KBox::pin_init(
             directory.read_only_file(c"capacity", capacity::View(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let reports = KBox::pin_init(
+            directory.read_only_file(c"firmware_reports", reports::View(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let power = KBox::pin_init(
+            directory.read_only_file(c"power", reports::PowerView(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let stats = Arc::new(
+            crate::stats::StatsSnapshot {
+                g17_reader: Some(stats::Reader(shared.clone())),
+                ..Default::default()
+            },
             GFP_KERNEL,
         )?;
         let gpu = Arc::new(
@@ -1080,11 +1301,17 @@ impl Gpu {
                 geometry,
                 ids: Default::default(),
                 shared,
+                stats,
                 _capacity: capacity,
+                _reports: reports,
+                _power: power,
             },
             GFP_KERNEL,
         )?;
         let firmware = Self::boot(pdev, dev, cfg, regs, geometry, &gpu.shared)?;
+        gpu.shared
+            .port
+            .store(Arc::as_ptr(&firmware.port).cast_mut(), Ordering::Release);
         *gpu.shared.state.lock() = Some(firmware);
         gpu.shared.queue_events();
         Ok(gpu)
@@ -1101,19 +1328,41 @@ impl Gpu {
             fw::variant::Firmware::Identified(builds) => builds,
         };
         let version = Self::os_firmware_version(dev);
-        if let Some(build) = builds.iter().find(|build| Some(build.os_version) == version) {
-            dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
-            return Ok(build.variant);
+        // iBoot strings can be shared by OS releases. Prefer the reported release's
+        // candidate, but admit only an exact loaded image, regardless of that hint.
+        let preferred = builds
+            .iter()
+            .filter(|build| Some(build.os_version) == version);
+        let others = builds
+            .iter()
+            .filter(|build| Some(build.os_version) != version);
+        for build in Iterator::chain(preferred, others) {
+            if Self::identify_image(dev, build).is_ok() {
+                dev_info!(dev.as_ref(), "GPU firmware: {}\n", build.name);
+                return Ok(build.variant);
+            }
         }
         dev_err!(
             dev.as_ref(),
-            "Unsupported GPU firmware: macOS version {:?} (apple,firmware-version)\n",
+            "Unsupported GPU firmware image (reported macOS version {:?})\n",
             version
         );
-        for build in builds.iter() {
-            dev_err!(dev.as_ref(), "Supported GPU firmware: {}\n", build.name);
-        }
         Err(ENODEV)
+    }
+
+    /// Checks that the loaded TEXT (the `fw-text` region) is one of `build`'s images, with the DATA size
+    /// of the `fw-data` region. The version property is only a selection hint.
+    fn identify_image(dev: &AsahiDrmDevice, build: &'static fw::variant::Build) -> Result {
+        let node = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?;
+        let text = node.reserved_mem_region_to_resource_byname(c_str!("fw-text"))?;
+        let data = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
+        let start = text.start();
+        let end = start.checked_add(text.size()).ok_or(EINVAL)?;
+        crate::fwid::identify(dev.as_ref().as_ref(), start..end, data.size(), build.images)
+            .inspect_err(|e| {
+                dev_err!(dev.as_ref(), "GPU firmware image not admitted: {:?}\n", e)
+            })?;
+        Ok(())
     }
 
     /// The macOS version the boot loader reports for the boot firmware that loaded the GPU
@@ -1172,13 +1421,21 @@ impl Gpu {
             mmu::PROT_GPU_FW_SHARED_RW,
             CpuMap::WriteCombined,
         )?;
-        let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
-            .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
+        let primary =
+            Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary).inspect_err(|e| {
+                dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e)
+            })?;
         let secondary = match cfg.secondary_root_offset {
             Some(_) => Some(
-                Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary).inspect_err(|e| {
-                    dev_err!(dev.as_ref(), "Secondary coprocessor setup failed: {:?}\n", e)
-                })?,
+                Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary).inspect_err(
+                    |e| {
+                        dev_err!(
+                            dev.as_ref(),
+                            "Secondary coprocessor setup failed: {:?}\n",
+                            e
+                        )
+                    },
+                )?,
             ),
             None => None,
         };
@@ -1196,17 +1453,24 @@ impl Gpu {
                 secondary,
                 primary,
                 bridge,
-                rings: channel::Rings::new(),
+                port: port::Port::new(
+                    power::Demand::new(pdev.as_ref().as_raw())?,
+                    shared.feed.clone(),
+                )?,
+                seen_submissions: 0,
+                rings: channel::Rings::new(shared.variant.graph)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
                 registration_power_release_pending: false,
                 variant: shared.variant,
-                queues <- runtime::Registry::new(
+                queues <- runtime::Registry::with_waiters(
                     shared.clusters,
                     shared.deflake,
                     shared.descriptor_flags,
                     shared.variant,
+                    Some(shared.queues.clone()),
+                    Some(shared.renders.clone()),
                 ),
                 pool: object::Pool::new()?,
                 render_rings: kick::RenderRings::new()?,
@@ -1242,12 +1506,19 @@ impl Gpu {
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
+        let mailbox: *const Mailbox = &*session.primary.rtkit;
+        session.port.attach(
+            session.init.port_views(mailbox)?,
+            session.bridge.regs.clone(),
+        )?;
         session.uat.mirror_secondary_root()?;
         if cfg.fabric_bridge {
             session.bridge.regs.enable_g17_gating()?;
         }
         let ack = shared.variant.init_ack;
-        session.primary.init(session.init.root_va(Role::Primary)?, ack)?;
+        session
+            .primary
+            .init(session.init.root_va(Role::Primary)?, ack)?;
         if ack == fw::variant::InitAck::Status {
             Self::wait_for_init_accepted(dev, &session.init, &session.primary)?;
         }
@@ -1260,7 +1531,12 @@ impl Gpu {
                 secondary.notify(MSG_POWER_ON_DONE)?;
             }
         }
-        Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
+        Self::wait_for_opening(
+            dev,
+            &session.init,
+            &session.primary,
+            session.secondary.as_ref(),
+        )?;
         session
             .uat
             .activate_render_context(&session._render_global)?;
@@ -1353,7 +1629,7 @@ impl gpu::Gpu for Gpu {
     }
 
     fn stats_snapshot(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
-        None
+        Some(self.stats.clone())
     }
 
     fn manager(&self) -> Option<&dyn gpu::GpuManager> {
@@ -1377,11 +1653,11 @@ impl gpu::Gpu for Gpu {
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
+                | sync_output::FEATURE_CUMULATIVE_SIGNALS;
         let variant = self.shared.variant;
         if variant.few_primitives {
-            params.features |=
-                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
+            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
         }
         if variant.ray_traversal {
             params.features |=
@@ -1463,6 +1739,7 @@ impl gpu::Gpu for Gpu {
         _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn crate::queue::Queue>> {
         let dev = self.shared.drm()?;
         let owner = self.ids.queue.next();
@@ -1475,16 +1752,25 @@ impl gpu::Gpu for Gpu {
         let policy = scheduling_policy(priority)?;
         let admission_started = now_ns();
         let (backend, slot) = loop {
+            let observed = self.shared.queues.observe();
             match runtime::Backend::new(&self.shared, &vm, owner, policy) {
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == ENOSPC => {
                     // Closed logical queues can still own execution/QoS IDs
                     // until the scheduler release is consumed and reclaimed.
                     // Backend construction has rolled back all temporary leases.
-                    if now_ns().saturating_sub(admission_started)
-                        >= job::TIMEOUT_MS as u64 * 1_000_000 { return Err(EBUSY); }
+                    let waited = now_ns().saturating_sub(admission_started);
+                    let limit = u64::from(job::TIMEOUT_MS) * 1_000_000;
+                    if waited >= limit {
+                        return Err(EBUSY);
+                    }
                     self.shared.queue_events();
-                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                    // A returned queue slot or reclaimed context wakes this.
+                    self.shared.queues.block(
+                        observed,
+                        (limit - waited).div_ceil(1_000_000) as u32,
+                        true,
+                    )?;
                 }
                 result => break result?,
             }
@@ -1495,6 +1781,7 @@ impl gpu::Gpu for Gpu {
             backend.clone(),
             frontend,
             slot,
+            usage,
         ) {
             Ok(frontend) => frontend,
             Err(error) => {
@@ -1510,18 +1797,22 @@ impl gpu::Gpu for Gpu {
         mut bo: gem::ObjectRef,
         range: Range<usize>,
     ) -> Result<crate::timestamp::Buffer> {
-        let state = self.shared.state.lock();
-        let firmware = (*state).as_ref().ok_or(ENODEV)?;
-        let mut addresses = firmware.uat.geometry().kernel_range();
-        addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
-        crate::timestamp::Buffer::firmware(bo.map_range_into_range(
-            firmware.uat.kernel_vm(),
-            range,
-            addresses,
-            mmu::UAT_PGSZ as u64,
-            mmu::PROT_FW_SHARED_RW,
-            false,
-        )?)
+        let mapping = {
+            let state = self.shared.state.lock();
+            let firmware = (*state).as_ref().ok_or(ENODEV)?;
+            let mut addresses = firmware.uat.geometry().kernel_range();
+            addresses.start += hw::t8140::dynamic::KERNEL_OFFSET;
+            bo.map_range_into_range(
+                firmware.uat.kernel_vm(),
+                range,
+                addresses,
+                mmu::UAT_PGSZ as u64,
+                mmu::PROT_FW_SHARED_RW,
+                false,
+            )?
+        };
+        // The buffer's CPU mapping takes the reservation lock: not under the device mutex.
+        crate::timestamp::Buffer::firmware(mapping)
     }
 }
 

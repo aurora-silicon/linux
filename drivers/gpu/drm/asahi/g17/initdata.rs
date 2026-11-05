@@ -38,6 +38,30 @@ pub(crate) struct ComputeCompletion<'a> {
     offset: usize,
 }
 
+/// Records in the compute completion ring that the host scans.
+pub(super) const COMPUTE_COMPLETION_SLOTS: usize = {
+    let slots = abi::COMPLETION_RING_SIZE / 0x40;
+    if slots < 0x800 {
+        slots
+    } else {
+        0x800
+    }
+};
+
+/// Timestamp bits of a completion record's start and end words.
+const COMPLETION_TIME_MASK: u64 = 0x003f_ffff_ffff_ffff;
+
+/// What one completion-ring slot gave a scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionFold {
+    /// No new observation of a pending request; the scan continues.
+    Passed,
+    /// Every request now has an observation.
+    Done,
+    /// A pending request's record whose payload the firmware is still writing.
+    Incomplete,
+}
+
 impl ComputeCompletion<'_> {
     pub(crate) fn read(&self, word: usize) -> Result<u64> {
         if word >= 8 {
@@ -129,14 +153,6 @@ impl WorkPublication<'_> {
             );
         }
     }
-
-    fn commit(self) -> u32 {
-        self.copy_record();
-        fence(Ordering::SeqCst);
-        self.producer.store(self.next, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        self.next
-    }
 }
 
 /// Session-long storage and mappings. Aliases are released before their backing objects.
@@ -191,7 +207,13 @@ struct BuildEnv<'a> {
 
 impl BuildEnv<'_> {
     /// An object at a fixed offset of the kernel window.
-    fn fixed(&self, offset: u64, size: usize, prot: mmu::Prot, cpu: CpuMap) -> Result<KernelObject> {
+    fn fixed(
+        &self,
+        offset: u64,
+        size: usize,
+        prot: mmu::Prot,
+        cpu: CpuMap,
+    ) -> Result<KernelObject> {
         KernelObject::new(
             self.dev,
             self.vm,
@@ -203,7 +225,13 @@ impl BuildEnv<'_> {
     }
 
     /// An object placed in the dynamic part of the kernel window.
-    fn dynamic(&self, size: usize, align: u64, prot: mmu::Prot, cpu: CpuMap) -> Result<KernelObject> {
+    fn dynamic(
+        &self,
+        size: usize,
+        align: u64,
+        prot: mmu::Prot,
+        cpu: CpuMap,
+    ) -> Result<KernelObject> {
         KernelObject::new(
             self.dev,
             self.vm,
@@ -308,7 +336,12 @@ impl InitData {
     /// Initialize a fresh physical compute QID's row before exposing its queue. An installed
     /// or rebound queue keeps the row's firmware-owned counters and must never call this again.
     /// Called for a fresh row or after its free-list release was consumed.
-    pub(super) fn initialize_compute_pool_blocks(&self, slot: u16, page_list_va: u64, blocks: usize) -> Result {
+    pub(super) fn initialize_compute_pool_blocks(
+        &self,
+        slot: u16,
+        page_list_va: u64,
+        blocks: usize,
+    ) -> Result {
         if slot == 0 || slot > u16::from(super::fw::kick::QID_MAX) + 1 {
             return Err(EINVAL);
         }
@@ -392,6 +425,12 @@ impl InitData {
         fence(Ordering::SeqCst);
         self.compute_shared = Some(shared);
         Ok(())
+    }
+
+    pub(super) fn compute_vm_cached(&self, vm: &mmu::Vm) -> bool {
+        self.compute_shared
+            .as_ref()
+            .is_some_and(|shared| vm.compute_pool_mappings_match(shared.id))
     }
 
     pub(super) fn cache_compute_vm(&self, vm: &mmu::Vm) -> Result {
@@ -510,7 +549,7 @@ impl InitData {
         let engine = match record.data_master {
             0 => DataMaster::Tiling,
             1 => DataMaster::Fragment,
-            2 => DataMaster::Compute,
+            // Compute publications reserve their slots through the port.
             _ => return Err(EINVAL),
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
@@ -561,16 +600,6 @@ impl InitData {
             return Err(EINVAL);
         }
         Ok(values)
-    }
-
-    /// Inner queue records must be visible before this outer publication. The returned
-    /// producer is the retained consumer witness for this slot.
-    pub(super) fn publish_work(
-        &self,
-        priority: u8,
-        record: &super::fw::channels::WorkSlot,
-    ) -> Result<u32> {
-        Ok(self.work_publication(priority, record)?.commit())
     }
 
     /// Validate both destinations before exposing fragment, then tiling. The accounting token
@@ -671,21 +700,117 @@ impl InitData {
         Ok(())
     }
 
+    /// Raw views of the memory publishers share without the device mutex: every work ring,
+    /// the completion stamps, the QoS table and the recovery state word. They stay valid for
+    /// this session.
+    pub(super) fn port_views(&self, mailbox: *const super::Mailbox) -> Result<super::port::Views> {
+        use super::fw::{
+            channels,
+            queue::{DataMaster, Policy},
+        };
+        let ring_of = |priority: u8, engine: DataMaster| -> Result<super::port::RingView> {
+            let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
+            let base = self.state_offset(Role::Primary) + abi::work_state_offset(channel);
+            let state = self.object(self.cluster)?;
+            let word =
+                |offset: usize| -> Result<*const AtomicU32> { Ok(state.word(base + offset)?) };
+            Ok(super::port::RingView {
+                slots: self.object(self.bundle)?.pointer(
+                    abi::work_ring_offset(channel),
+                    channels::WORK_RING_SLOTS as usize * core::mem::size_of::<channels::WorkSlot>(),
+                )?,
+                consumers: [
+                    word(abi::ChannelState::CONSUMER)?,
+                    word(abi::ChannelState::UNK_10)?,
+                ],
+                producer: word(abi::ChannelState::PRODUCER)?,
+            })
+        };
+        let rings =
+            |engine: DataMaster| -> Result<[super::port::RingView; Policy::PRIORITIES as usize]> {
+                let mut views = [ring_of(0, engine)?; Policy::PRIORITIES as usize];
+                for (priority, view) in views.iter_mut().enumerate().skip(1) {
+                    *view = ring_of(priority as u8, engine)?;
+                }
+                Ok(views)
+            };
+        Ok(super::port::Views {
+            compute: rings(DataMaster::Compute)?,
+            tiling: rings(DataMaster::Tiling)?,
+            fragment: rings(DataMaster::Fragment)?,
+            stamps: self.object(self.stamps[0])?.word(0)?,
+            qos: self
+                .qos()?
+                .pointer(0, core::mem::size_of::<super::fw::qos::Qos>())?,
+            recovery: self
+                .object(self.cluster)?
+                .word(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_STATE)?,
+            mailbox,
+        })
+    }
+
     /// Snapshot the shared compute completion ring once per service transaction. The queue
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
-    pub(super) fn scan_compute_completions(
+    /// Folds the compute completion records the firmware appended since `start`, in ring
+    /// order. `seen` holds every slot's control word as of the previous pass over it: the
+    /// first slot still holding it is where the firmware writes next, and the pass ends there
+    /// instead of reading the rest of the ring. A pass also ends once `record` has found every
+    /// request, or at a requested record whose payload is still being written, which the next
+    /// pass reads again. Returns the slot the next pass starts at.
+    pub(super) fn fold_compute_completions(
         &self,
-        mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
-    ) -> Result {
+        start: usize,
+        seen: &mut [u64],
+        mut record: impl FnMut(ComputeCompletion<'_>) -> Result<CompletionFold>,
+    ) -> Result<usize> {
         let object = self.object(self.completion_rings[0])?;
+        if seen.len() != COMPUTE_COMPLETION_SLOTS {
+            return Err(EINVAL);
+        }
         fence(Ordering::Acquire);
-        for slot in 0..(abi::COMPLETION_RING_SIZE / 0x40).min(0x800) {
-            record(ComputeCompletion {
+        let completion = |slot: usize| ComputeCompletion {
+            object,
+            offset: slot * 0x40,
+        };
+        super::queue::compute::retirement::walk_completions(
+            start,
+            seen,
+            |slot| completion(slot).read(0),
+            |slot| record(completion(slot)),
+        )
+    }
+
+    /// Folds every slot of the compute completion ring and records its control word in
+    /// `seen`. For a pass that stopped before a record the firmware must already have
+    /// written. Returns the slot after the newest record (latest end timestamp), where the
+    /// firmware writes next.
+    pub(super) fn resync_compute_completions(
+        &self,
+        seen: &mut [u64],
+        mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
+    ) -> Result<usize> {
+        let object = self.object(self.completion_rings[0])?;
+        if seen.len() != COMPUTE_COMPLETION_SLOTS {
+            return Err(EINVAL);
+        }
+        fence(Ordering::Acquire);
+        let mut newest = None;
+        for (slot, seen_control) in seen.iter_mut().enumerate() {
+            let completion = ComputeCompletion {
                 object,
                 offset: slot * 0x40,
-            })?;
+            };
+            let control = completion.read(0)?;
+            *seen_control = control;
+            if control != 0 {
+                let end = completion.read(5)? & COMPLETION_TIME_MASK;
+                if newest.is_none_or(|(_, latest)| end > latest) {
+                    newest = Some((slot, end));
+                }
+            }
+            record(completion)?;
         }
-        Ok(())
+        Ok(newest.map_or(0, |(slot, _)| (slot + 1) % COMPUTE_COMPLETION_SLOTS))
     }
 
     fn object(&self, index: usize) -> Result<&KernelObject> {
@@ -709,6 +834,10 @@ impl InitData {
     }
 
     /// Constructs the graph after the firmware has published the high-root entries.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The firmware graph builder keeps its independent input objects explicit."
+    )]
     pub(super) fn build(
         &mut self,
         dev: &AsahiDrmDevice,
@@ -786,7 +915,8 @@ impl InitData {
                 table.init();
                 Ok(())
             })?;
-        let page_pool = self.add(env.fixed(high::PAGE_POOL_DESCRIPTORS, mmu::UAT_PGSZ, FS, WC)?)?;
+        let page_pool =
+            self.add(env.fixed(high::PAGE_POOL_DESCRIPTORS, mmu::UAT_PGSZ, FS, WC)?)?;
         self.object_mut(page_pool)?
             .initialize::<abi::PagePoolDescriptorTable>(0, |table| {
                 table.init(low::RENDER_PAGE_LIST, low::COMPUTE_POOL_PAGE_LIST);
@@ -870,7 +1000,11 @@ impl InitData {
     fn build_render_pool(&mut self, env: &BuildEnv<'_>) -> Result<usize> {
         use mmu::PROT_GPU_SHARED_RW as GS;
         use CpuMap::WriteBack as WB;
-        let pages = self.add(KernelObject::backing(env.dev, low::RENDER_PAGE_LIST_SIZE, WB)?)?;
+        let pages = self.add(KernelObject::backing(
+            env.dev,
+            low::RENDER_PAGE_LIST_SIZE,
+            WB,
+        )?)?;
         self.object_mut(pages)?
             .initialize::<[u64; low::RENDER_PAGE_LIST_SIZE / 8]>(0, |list| {
                 abi::fill_page_list(
@@ -878,10 +1012,18 @@ impl InitData {
                     (0..low::RENDER_BLOCKS_INITIAL as usize).map(low::render_block),
                 )
             })?;
-        let runs = self.add(KernelObject::backing(env.dev, low::RENDER_RUN_LIST_SIZE, WB)?)?;
+        let runs = self.add(KernelObject::backing(
+            env.dev,
+            low::RENDER_RUN_LIST_SIZE,
+            WB,
+        )?)?;
         let first_block = self.objects.len();
         for _ in 0..low::RENDER_BLOCKS_ALLOCATED {
-            self.add(KernelObject::backing(env.dev, abi::FREE_LIST_BLOCK_SIZE, WB)?)?;
+            self.add(KernelObject::backing(
+                env.dev,
+                abi::FREE_LIST_BLOCK_SIZE,
+                WB,
+            )?)?;
         }
         self.render_pages = pages;
         self.render_runs = runs;
@@ -889,7 +1031,12 @@ impl InitData {
         self.alias(pages, env.render, low::RENDER_PAGE_LIST, GS)?;
         self.alias(runs, env.render, low::RENDER_RUN_LIST, GS)?;
         for block in 0..low::RENDER_BLOCKS_MAPPED {
-            self.alias(first_block + block, env.render, low::render_block(block), GS)?;
+            self.alias(
+                first_block + block,
+                env.render,
+                low::render_block(block),
+                GS,
+            )?;
         }
         Ok(first_block)
     }
@@ -926,12 +1073,8 @@ impl InitData {
             .initialize::<[abi::FreeListRunSlot; mmu::UAT_PGSZ / 0x40]>(0, |list| {
                 abi::fill_run_list(list, low::COMPUTE_FREE_LIST_BLOCKS)
             })?;
-        let ready = self.add(env.fixed(
-            high::COMPUTE_READY_FREE_LIST,
-            mmu::UAT_PGSZ,
-            GFS,
-            WC,
-        )?)?;
+        let ready =
+            self.add(env.fixed(high::COMPUTE_READY_FREE_LIST, mmu::UAT_PGSZ, GFS, WC)?)?;
         self.object_mut(ready)?.write(
             0,
             abi::FreeListControl::new(&abi::FreeListArgs {
@@ -1223,7 +1366,11 @@ impl InitData {
 
     /// The GPU's operating points: `count` of them, each with one voltage cell for the whole
     /// GPU or one per cluster.
-    fn opps(dev: &AsahiDrmDevice, count: usize, clusters: u32) -> Result<KVec<abi::Opp>> {
+    pub(super) fn opps(
+        dev: &AsahiDrmDevice,
+        count: usize,
+        clusters: u32,
+    ) -> Result<KVec<abi::Opp>> {
         let opps = Self::opp_table(dev, c_str!("operating-points-v2"))?;
         if opps.len() != count {
             return Err(EINVAL);
@@ -1318,15 +1465,15 @@ impl InitData {
 
     /// Whether a firmware that acknowledges in status A accepted the graph (`+0x14` = 1).
     pub(super) fn init_accepted(&self) -> Result<bool> {
-        Ok(self.status_word(Role::Primary, 0x14)?.load(Ordering::Acquire) == 1)
+        Ok(self
+            .status_word(Role::Primary, 0x14)?
+            .load(Ordering::Acquire)
+            == 1)
     }
 
     pub(super) fn status_word(&self, role: Role, offset: usize) -> Result<&AtomicU32> {
-        self.object(self.cluster)?.word(
-            self.status_offset(role)
-                .checked_add(offset)
-                .ok_or(EINVAL)?,
-        )
+        self.object(self.cluster)?
+            .word(self.status_offset(role).checked_add(offset).ok_or(EINVAL)?)
     }
 
     pub(super) fn status_read_words<const N: usize>(
@@ -1334,11 +1481,8 @@ impl InitData {
         role: Role,
         offset: usize,
     ) -> Result<[u32; N]> {
-        self.object(self.cluster)?.read_words(
-            self.status_offset(role)
-                .checked_add(offset)
-                .ok_or(EINVAL)?,
-        )
+        self.object(self.cluster)?
+            .read_words(self.status_offset(role).checked_add(offset).ok_or(EINVAL)?)
     }
 
     pub(super) fn control_counters(&self) -> Result<[u32; 3]> {
@@ -1431,13 +1575,15 @@ impl InitData {
             Some(views) => (self.object(*views.get(view).ok_or(EINVAL)?)?, 0),
             None => (bundle, *abi::bundle::VIEWS.get(view).ok_or(EINVAL)?),
         };
-        let end = offset.checked_add(N.checked_mul(size_of::<u32>()).ok_or(EOVERFLOW)?)
+        let end = offset
+            .checked_add(N.checked_mul(size_of::<u32>()).ok_or(EOVERFLOW)?)
             .ok_or(EOVERFLOW)?;
         if end > extent {
             return Err(EINVAL);
         }
         let pointer_at = abi::bundle::MAIN_CONFIG[Role::Primary as usize]
-            + core::mem::offset_of!(abi::MainConfig, view_va) + view * size_of::<u64>();
+            + core::mem::offset_of!(abi::MainConfig, view_va)
+            + view * size_of::<u64>();
         fence(Ordering::Acquire);
         let pointer = bundle.read_words::<2>(pointer_at)?;
         let actual = u64::from(pointer[0]) | u64::from(pointer[1]) << 32;
@@ -1450,18 +1596,28 @@ impl InitData {
 
 impl super::recovery::Memory for InitData {
     fn fault_sources(&self) -> Result<super::recovery::Sources> {
-        let mask = self.object(self.cluster)?
+        let mask = self
+            .object(self.cluster)?
             .dword(self.status_b + abi::PrimaryStatusB::RECOVERY_SLOT_MASK)?
             .load(Ordering::Relaxed);
         let mut sources = super::recovery::Sources::sample(mask as u32, |slot| {
-            let key = super::recovery::slot_key(slot, self.recovery_slot_keys)?;
-            let monitor = self.recovery_view_words::<6>(abi::recovery::PROGRESS_VIEW,
-                abi::recovery::PROGRESS_START + slot * abi::recovery::PROGRESS_STRIDE)
-                .ok().map(|words| words[0])?;
+            // Progress is independently available even when this firmware's key
+            // address is unknown. Zero keeps ownership unknown and cannot override
+            // firmware blame, but preserves the progress evidence for diagnostics.
+            let key = super::recovery::slot_key(slot, self.recovery_slot_keys).unwrap_or(0);
+            let monitor = self
+                .recovery_view_words::<6>(
+                    abi::recovery::PROGRESS_VIEW,
+                    abi::recovery::PROGRESS_START + slot * abi::recovery::PROGRESS_STRIDE,
+                )
+                .ok()
+                .map(|words| words[0])?;
             Some((key, monitor))
         });
-        sources.reason = self.recovery_view_words::<1>(abi::recovery::REPORT_VIEW, abi::recovery::REASON)
-            .ok().map(|words| words[0]);
+        sources.reason = self
+            .recovery_view_words::<1>(abi::recovery::REPORT_VIEW, abi::recovery::REASON)
+            .ok()
+            .map(|words| words[0]);
         Ok(sources)
     }
 
@@ -1517,17 +1673,22 @@ impl super::recovery::Memory for InitData {
         Ok(())
     }
 
-    fn entries(&self) -> Result<super::recovery::Entries> {
-        let cluster = self.object(self.cluster)?;
-        let base = self.status_b + abi::PrimaryStatusB::RECOVERY_INFO;
-        fence(Ordering::Acquire);
-        let mut entries = super::recovery::Entries::default();
-        for index in 0..256 {
-            let offset = base + index * core::mem::size_of::<abi::RecoveryInfoEntry>();
-            let flags = cluster.word(offset)?.load(Ordering::Relaxed);
-            entries.include(flags);
+    fn entry(&self, index: usize) -> Result<(u32, u32)> {
+        if index >= super::recovery::RECOVERY_RECORDS {
+            return Err(EINVAL);
         }
-        Ok(entries)
+        let cluster = self.object(self.cluster)?;
+        let offset = self.status_b
+            + abi::PrimaryStatusB::RECOVERY_INFO
+            + index * core::mem::size_of::<abi::RecoveryInfoEntry>();
+        fence(Ordering::Acquire);
+        let flags = cluster
+            .word(offset + core::mem::offset_of!(abi::RecoveryInfoEntry, flags))?
+            .load(Ordering::Relaxed);
+        let stamp = cluster
+            .word(offset + core::mem::offset_of!(abi::RecoveryInfoEntry, stamp))?
+            .load(Ordering::Relaxed);
+        Ok((flags, stamp))
     }
 
     fn wait_tick(&self) {

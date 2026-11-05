@@ -131,7 +131,7 @@ fn try_add_within(counter: &AtomicU64, bytes: u64, limit: u64, extra: u64) -> bo
 fn sub(counter: &AtomicU64, bytes: u64) {
     let prev = counter.fetch_sub(bytes, Ordering::AcqRel);
     if prev < bytes {
-        pr_warn!("asahi: GPU memory accounting underflow ({} < {})\n", prev, bytes);
+        pr_warn!("GPU memory accounting underflow ({} < {})\n", prev, bytes);
         counter.store(0, Ordering::Relaxed);
     }
 }
@@ -157,12 +157,12 @@ impl Ledger {
         let total = (info.totalram as u64).saturating_mul(u64::from(info.mem_unit));
         let limits = limits_for(
             total,
-            *module_parameters::mem_limit_pct.value(),
-            *module_parameters::client_mem_limit_pct.value(),
+            module_parameters::mem_limit_pct.value(),
+            module_parameters::client_mem_limit_pct.value(),
         );
         self.set_limits(limits);
         pr_info!(
-            "asahi: GPU memory limits: device {} MiB, per client {} MiB (0 = none)\n",
+            "GPU memory limits: device {} MiB, per client {} MiB (0 = none)\n",
             limits.device >> 20,
             limits.client >> 20
         );
@@ -300,7 +300,7 @@ impl Charge {
     /// A user object admitted by `commit`, attributed to `mm` if there is one.
     pub(crate) fn user(commit: Commit, mm: Option<ARef<Mm>>) -> Self {
         let bytes = commit.bytes;
-        let mm = if *module_parameters::oom_attribution.value() != 0 {
+        let mm = if module_parameters::oom_attribution.value() != 0 {
             mm
         } else {
             None

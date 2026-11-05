@@ -41,9 +41,7 @@ use crate::{
         AsahiDrmDevice,
         AsahiDrmDriver, //
     },
-    file,
-    memacct,
-    mmu,
+    file, memacct, mmu,
 };
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::Gem;
@@ -132,9 +130,6 @@ pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
     }
     Ok(())
 }
-
-unsafe impl Send for AsahiObject {}
-unsafe impl Sync for AsahiObject {}
 
 /// A shared reference to a GEM object for this driver.
 pub(crate) struct ObjectRef {
@@ -410,6 +405,23 @@ impl AsahiObject {
     }
 }
 
+/// Populates and pins a new user object through its DMA mapping, before any CPU view exists.
+///
+/// On a device that is not DMA-coherent, the DMA mapping cleans the cacheable kernel alias of the
+/// freshly zeroed pages to the point of coherency, so that no dirty line can later overwrite data
+/// written through a write-combined view. The pin keeps reclaim from creating a new cacheable
+/// alias. Only used when the GPU asks for it ([`crate::gpu::Gpu::prepare_new_objects`]).
+///
+pub(crate) fn prepare_new_object(
+    gem: &Object,
+    dev: &kernel::device::Device<kernel::device::Bound>,
+) -> Result {
+    // The native backend requires a non-coherent DMA device. Use its DMA mapping
+    // rather than interpreting DMA addresses as CPU physical addresses.
+    let _sgt = held_sg_table(gem, dev)?;
+    Ok(())
+}
+
 /// Purge advice for a VM-private, non-exportable object. Returns whether the
 /// contents are retained (0 once purged).
 pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
@@ -417,6 +429,26 @@ pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
         return Err(EINVAL);
     }
     Ok(u32::from(gem.madvise(i32::from(dontneed))))
+}
+
+/// Large user BOs have a cheap ENOMEM fallback instead of per-folio reclaim.
+/// Keep ordinary resource allocations and kernel-owned backing on their existing
+/// policy. 256 MiB also matches Mesa's maximum reusable BO-cache footprint.
+pub(crate) fn user_pages_no_reclaim(size: usize, g17: bool) -> bool {
+    g17 && size >= 256 * 1024 * 1024
+}
+
+#[kernel::macros::kunit_tests(asahi_gem_allocation_policy)]
+mod allocation_policy_tests {
+    use super::*;
+
+    #[test]
+    fn large_user_backing() {
+        assert!(!user_pages_no_reclaim(256 * 1024 * 1024 - 1, true));
+        assert!(user_pages_no_reclaim(256 * 1024 * 1024, true));
+        assert!(user_pages_no_reclaim(3_257_113_344, true));
+        assert!(!user_pages_no_reclaim(3_257_113_344, false));
+    }
 }
 
 /// Populates and pins a new user object through its DMA mapping, before any CPU view exists.
@@ -429,7 +461,7 @@ pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
 /// The DMA mapping only cleans if the device is not marked DMA-coherent (G15's synthesized node
 /// has no `dma-coherent`). Should it ever be marked so, the pages are cleaned here instead.
 #[cfg(CONFIG_DRM_ASAHI_G15)]
-pub(crate) fn prepare_new_object(gem: &Object) -> Result {
+pub(crate) fn prepare_new_object_g15(gem: &Object) -> Result {
     // SAFETY: G15 objects belong to the retained bound platform device; user object
     // creation occurs only after registration and before a file can outlive its device.
     let dev: &kernel::device::Device = gem.dev().as_ref().as_ref();
@@ -466,28 +498,7 @@ pub(crate) fn prepare_new_object(gem: &Object) -> Result {
     Ok(())
 }
 
-
 #[cfg(CONFIG_DRM_ASAHI_G15)]
-extern "C" { fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool; }
-
-#[cfg(not(CONFIG_DRM_ASAHI_G15))]
-pub(crate) fn prepare_new_object(_gem: &Object) -> Result { Err(EINVAL) }
-/// Large user BOs have a cheap ENOMEM fallback instead of per-folio reclaim.
-/// Keep ordinary resource allocations and kernel-owned backing on their existing
-/// policy. 256 MiB also matches Mesa's maximum reusable BO-cache footprint.
-pub(crate) fn user_pages_no_reclaim(size: usize, g17: bool) -> bool {
-    g17 && size >= 256 * 1024 * 1024
-}
-
-#[kernel::macros::kunit_tests(asahi_gem_allocation_policy)]
-mod allocation_policy_tests {
-    use super::*;
-
-    #[test]
-    fn large_user_backing() {
-        assert!(!user_pages_no_reclaim(256 * 1024 * 1024 - 1, true));
-        assert!(user_pages_no_reclaim(256 * 1024 * 1024, true));
-        assert!(user_pages_no_reclaim(3_257_113_344, true));
-        assert!(!user_pages_no_reclaim(3_257_113_344, false));
-    }
+extern "C" {
+    fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool;
 }

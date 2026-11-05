@@ -6,15 +6,27 @@
 use core::sync::atomic::AtomicU32;
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
-const IDLE_HOLD_NS: u64 = 16_000_000;
+pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
 
 /// The firmware's idle power-off delay as measured on T6040/25G83: the cores power off 2 ms after
 /// the last job. Not measured on other firmware; at or below it the hold stays off.
 pub(crate) const FIRMWARE_IDLE_OFF_MS: u32 = 2;
 
-/// The `idle_off_delay_ms` sysfs knob. Above [`FIRMWARE_IDLE_OFF_MS`] the driver keeps the GPU
-/// cores powered until the GPU has been idle this long ([`Hold`]).
+/// Idle policy initialized from the existing DT `apple,idle-off-delay-ms` property.
+/// The existing `idle_off_delay_ms` sysfs attribute may override it. Above
+/// [`FIRMWARE_IDLE_OFF_MS`] the driver keeps the GPU cores powered until it has been idle
+/// this long ([`Hold`]).
 pub(crate) static IDLE_HOLD_MS: AtomicU32 = AtomicU32::new(FIRMWARE_IDLE_OFF_MS);
+
+/// Use the same bounds as the existing idle-delay attribute. Missing DT policy
+/// preserves the native delay; malformed or out-of-range values fail probe.
+pub(super) fn idle_delay(requested: Option<u32>) -> kernel::error::Result<u32> {
+    let delay = requested.unwrap_or(FIRMWARE_IDLE_OFF_MS);
+    if !(FIRMWARE_IDLE_OFF_MS..=1000).contains(&delay) {
+        return Err(kernel::error::code::EINVAL);
+    }
+    Ok(delay)
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum IdleAction {
@@ -238,6 +250,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dt_idle_delay_is_bounded_and_absence_preserves_native_policy() {
+        assert_eq!(idle_delay(None), Ok(FIRMWARE_IDLE_OFF_MS));
+        for delay in [2, 16, 1000] {
+            assert_eq!(idle_delay(Some(delay)), Ok(delay));
+        }
+        for delay in [0, 1, 1001, u32::MAX] {
+            assert!(idle_delay(Some(delay)).is_err());
+        }
+    }
+
+    #[test]
+    fn frame_hold_survives_depth_one_gaps_but_releases_at_idle() {
+        let mut hold = Hold::new();
+        assert_eq!(hold.step(0, true, 1, 16), HoldAction::Assert);
+        hold.asserted();
+        for submission in 1..=8 {
+            // A completed depth-one dispatch followed by another short gap.
+            let now = submission * 3_000_000;
+            assert_eq!(hold.step(now, false, submission, 16), HoldAction::Recheck(16_000_000));
+            assert!(hold.active());
+        }
+        assert_eq!(hold.step(39_999_999, false, 8, 16), HoldAction::Recheck(1));
+        assert_eq!(hold.step(40_000_000, false, 8, 16), HoldAction::Release);
+        hold.released();
+        assert!(!hold.active());
+    }
+
+    #[test]
     fn holds_until_idle_for_the_delay_then_releases() {
         let mut hold = Hold::new();
         assert_eq!(hold.step(0, true, 1, 10), HoldAction::Assert);
@@ -258,5 +298,45 @@ mod tests {
         assert_eq!(hold.step(0, true, 2, 10), HoldAction::Assert);
         hold.asserted();
         assert_eq!(hold.step(1, false, 2, FIRMWARE_IDLE_OFF_MS), HoldAction::Release);
+    }
+}
+
+unsafe extern "C" {
+    fn asahi_clpc_gpu_get(dev: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> core::ffi::c_int;
+    fn asahi_clpc_gpu_set_active(gpu: *mut core::ffi::c_void, active: bool);
+    fn asahi_clpc_gpu_put(gpu: *mut core::ffi::c_void);
+}
+
+/// DT-selected memory-demand provider. Its independent allocation outlives a
+/// detached provider; a device link orders supplier removal and suspend.
+pub(super) struct Demand(*mut core::ffi::c_void);
+
+// SAFETY: the provider's leaf spinlock serializes all access; no GPU callback.
+unsafe impl Send for Demand {}
+// SAFETY: shared access only changes that locked request, never its lifetime.
+unsafe impl Sync for Demand {}
+
+impl Demand {
+    pub(super) fn new(dev: *mut kernel::bindings::device) -> kernel::error::Result<Self> {
+        let mut out = core::ptr::null_mut();
+        // SAFETY: live platform device and writable result; C returns an owned reference.
+        let ret = unsafe { asahi_clpc_gpu_get(dev.cast(), &mut out) };
+        if ret < 0 {
+            Err(kernel::error::Error::from_errno(ret))
+        } else {
+            Ok(Self(out))
+        }
+    }
+
+    pub(super) fn set_active(&self, active: bool) {
+        // SAFETY: the retained reference is live; NULL denotes no DT provider.
+        unsafe { asahi_clpc_gpu_set_active(self.0, active) };
+    }
+}
+
+impl Drop for Demand {
+    fn drop(&mut self) {
+        // SAFETY: releases exactly the reference returned by get, clearing demand first.
+        unsafe { asahi_clpc_gpu_put(self.0) };
     }
 }

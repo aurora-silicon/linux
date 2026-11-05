@@ -13,10 +13,20 @@ use kernel::{prelude::*, sync::Arc};
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 use kernel::{uapi, xarray};
 
+/// A firmware-mapped timestamp buffer with a kernel CPU mapping of its backing, kept for the
+/// buffer's lifetime so that commands need no mapping of their own.
+pub(crate) struct FirmwareBuffer {
+    mapping: Arc<mmu::KernelMapping>,
+    cpu: mmu::TimestampVmap,
+}
+
 /// A bound timestamp destination. Only backends which publish firmware writes need a UAT alias.
 /// CPU-retired timestamps retain their backing without consuming global firmware address space.
 pub(crate) enum Buffer {
-    Firmware(Arc<mmu::KernelMapping>),
+    /// The last reference may be a command's, dropped where fence producers run, while
+    /// releasing the CPU mapping takes the reservation lock: the deferral runs the release
+    /// on the cleanup queue.
+    Firmware(crate::cleanup::Deferred<FirmwareBuffer>),
     #[cfg(CONFIG_DRM_ASAHI_G16)]
     Cpu {
         // The GEM pin keeps the object's held SG table alive through CPU publication.
@@ -27,7 +37,11 @@ pub(crate) enum Buffer {
 
 impl Buffer {
     pub(crate) fn firmware(mapping: mmu::KernelMapping) -> Result<Self> {
-        Ok(Self::Firmware(Arc::new(mapping, GFP_KERNEL)?))
+        let cpu = mapping.timestamp_vmap()?;
+        Ok(Self::Firmware(crate::cleanup::Deferred::new(FirmwareBuffer {
+            mapping: Arc::new(mapping, GFP_KERNEL)?,
+            cpu,
+        })?))
     }
 
     /// Retain a CPU-written byte range without publishing any firmware address.
@@ -46,15 +60,16 @@ impl Buffer {
 
     pub(crate) fn size(&self) -> usize {
         match self {
-            Self::Firmware(mapping) => mapping.size(),
+            Self::Firmware(buffer) => buffer.mapping.size(),
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             Self::Cpu { range, .. } => range.end - range.start,
         }
     }
 
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn timestamp_mapping(&self, offset: usize) -> Result<mmu::TimestampMapping> {
         match self {
-            Self::Firmware(mapping) => mapping.timestamp_mapping(offset),
+            Self::Firmware(buffer) => buffer.mapping.timestamp_mapping(offset),
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             Self::Cpu { gem, range, .. } => {
                 if offset.checked_add(size_of::<u64>()).ok_or(EOVERFLOW)? > self.size() {
@@ -65,10 +80,30 @@ impl Buffer {
         }
     }
 
+    /// The object offset of the timestamp at `offset` of a firmware buffer, for
+    /// [`Self::write_timestamp`].
+    pub(crate) fn timestamp_offset(&self, offset: usize) -> Result<usize> {
+        match self {
+            Self::Firmware(buffer) => buffer.mapping.timestamp_offset(offset),
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            Self::Cpu { .. } => Err(EINVAL),
+        }
+    }
+
+    /// Writes a timestamp at an object offset returned by [`Self::timestamp_offset`],
+    /// through the buffer's own CPU mapping.
+    pub(crate) fn write_timestamp(&self, offset: usize, value: u64) {
+        match self {
+            Self::Firmware(buffer) => buffer.cpu.write(offset, value),
+            #[cfg(CONFIG_DRM_ASAHI_G16)]
+            Self::Cpu { .. } => {}
+        }
+    }
+
     /// Legacy command encoders publish firmware pointers and must never accept a CPU-only buffer.
     pub(crate) fn firmware_mapping(&self) -> Result<Arc<mmu::KernelMapping>> {
         match self {
-            Self::Firmware(mapping) => Ok(mapping.clone()),
+            Self::Firmware(buffer) => Ok(buffer.mapping.clone()),
             #[cfg(CONFIG_DRM_ASAHI_G16)]
             Self::Cpu { .. } => Err(EINVAL),
         }

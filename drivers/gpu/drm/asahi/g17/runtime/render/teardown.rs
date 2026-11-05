@@ -38,12 +38,20 @@ impl RenderState {
                 return Ok(false);
             }
             if let Some(pair) = entry.pair.as_ref() {
-                if !pair.idle_for_context(context)? {
+                if !pair.idle_for_context(context)? && !pair.executed_for_kill(context) {
                     return Ok(false);
                 }
             }
         }
         Ok(true)
+    }
+
+    /// Some render pair runs another context's commands.
+    pub(in crate::g17::runtime) fn foreign_in_flight(&self, context: &Arc<Context>) -> bool {
+        self.entries.iter().flatten().any(|entry| {
+            !entry.context.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, context))
+                && entry.pair.as_ref().is_some_and(|pair| pair.in_flight())
+        })
     }
 
     pub(in crate::g17::runtime) fn teardown_pools_released(&self, context: &Arc<Context>) -> bool {
@@ -115,6 +123,7 @@ impl RenderState {
         if !out.has_room(count, 1) {
             return Err(EBUSY);
         }
+        let linked = context.firmware_may_link();
         for entry in self.entries.iter_mut().flatten() {
             if !entry
                 .context
@@ -132,7 +141,14 @@ impl RenderState {
             let (mut parked, retired) = KBox::into_inner(pair).park();
             // This park follows the consumed release of `context`.
             parked.release_consumed(context.scheduler_va());
-            *target = Some(retired);
+            if linked {
+                // Guard (kill before free): the firmware may still walk this context's work
+                // list into the graph, so it is not freed or recycled before the firmware stops.
+                kernel::pr_warn_once!("G17: keeping render graphs of an unkilled context that still links work\n");
+                keep_graph(&mut self.kept_graphs, retired);
+            } else {
+                *target = Some(retired);
+            }
             entry.parked = Some(parked);
             // Detached backing retains these references until the worker runs.
             entry.context = None;
@@ -147,8 +163,12 @@ impl RenderState {
             if let Some(id) = self.retired[index].buffer_id() {
                 buffers.unreserve_owner(id)?;
             }
-            let target = out.binding_slot()?;
-            *target = Some(self.retired.remove(index).map_err(|_| EIO)?);
+            let retired = self.retired.remove(index).map_err(|_| EIO)?;
+            if linked {
+                keep_graph(&mut self.kept_graphs, retired);
+            } else {
+                *out.binding_slot()? = Some(retired);
+            }
         }
         Ok(())
     }
@@ -171,5 +191,25 @@ impl Registry {
             }
         }
         Ok(())
+    }
+}
+
+/// Graphs that could not be recorded in `kept_graphs` and were leaked instead, for debugfs.
+pub(super) static LEAKED_GRAPHS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Keeps `graph` until the firmware stops; if even that cannot be recorded, it is leaked
+/// rather than freed.
+fn keep_graph(
+    kept: &mut KVec<crate::g17::queue::render::RetiredBinding>,
+    graph: crate::g17::queue::render::RetiredBinding,
+) {
+    if kept.reserve(1, GFP_KERNEL).is_ok() {
+        if let Err(error) = kept.push_within_capacity(graph) {
+            LEAKED_GRAPHS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            core::mem::forget(error.0);
+        }
+    } else {
+        LEAKED_GRAPHS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        core::mem::forget(graph);
     }
 }
