@@ -379,7 +379,8 @@ static bool dcpep_cb_core_analytics_v27(struct apple_dcp *dcp, int tag,
 		print_hex_dump(KERN_INFO, "dcp analytics: ", DUMP_PREFIX_OFFSET,
 			       32, 1, event, len, true);
 	}
-	memcpy(out, event + DCP_ANALYTICS_NAME_SIZE, DCP_ANALYTICS_DICT_SIZE);
+	/* The same record and answer as desktop 26.6's analytics event. */
+	dcp_dict_passthrough_reply(in, out);
 	return true;
 }
 
