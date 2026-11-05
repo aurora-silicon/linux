@@ -109,6 +109,8 @@ impl DescriptorRing {
     /// Firmware reads every descriptor through a cached kernel mapping, as it
     /// does for render. The pool keeps that mapping until processor stop; the
     /// hardware reads the same pages through an uncached canonical low alias.
+    /// On M5 the kernel mapping, in the upper half every execution context
+    /// includes, is firmware-only.
     pub(crate) fn new(alloc: &Allocator<'_>, objects: &Arc<Pool>) -> Result<Self> {
         let size = DESCRIPTORS * COMPUTE_DESCRIPTOR_SIZE;
         let object = objects.allocate(
@@ -116,7 +118,7 @@ impl DescriptorRing {
             Family::Descriptor,
             size,
             size,
-            mmu::PROT_GPU_FW_SHARED_RW,
+            if alloc.uat.is_m5() { mmu::PROT_FW_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW },
             CpuMap::WriteCombined,
         )?;
         let low = object.alias_in(
