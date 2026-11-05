@@ -41,6 +41,8 @@
 #include "version_utils.h"
 
 #define DCP_MAX_PLANES 4
+/* Bounds the CRTC power cycles a rebuilt T6020 tunnel may trigger. */
+#define DCP_TUNNEL_POWER_CYCLES 2
 
 struct apple_dcp;
 struct iomfb_m4;
@@ -548,6 +550,8 @@ struct apple_dcp {
 
 	/* Current display mode */
 	struct dcp_mode_state mode_state;
+	/* hotplug worker: power cycles since the mode was last valid */
+	unsigned int tunnel_power_cycles;
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
