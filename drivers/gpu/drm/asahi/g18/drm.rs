@@ -6,27 +6,23 @@
 //! publication guard. It differs where G18 differs:
 //! - render commands go through `g18_application` to a job sink the G18
 //!   runtime implements, not through a captured reference profile;
-//! - `map_timestamp_buffer` is implemented (contract K8), so Mesa's G18G
-//!   screen exposes timer queries and with them GL 3.3-4.6;
+//! - `map_timestamp_buffer` is implemented (contract K8) with the shared
+//!   CPU-written timestamp buffers, so Mesa's G18G screen exposes timer
+//!   queries and with them GL 3.3-4.6;
 //! - compute is refused unless the adapter is built with `admit_compute`.
 //!
-//! The adapter holds no firmware state. Everything it needs from the live
-//! G18 session goes through [`G18DrmRuntime`].
-//!
-//! [`asahi_gem_prime_import`] is the driver's `drm_driver.gem_prime_import`
-//! hook. On the G18 device it stops foreign dma-bufs from becoming bare
-//! shmem objects which asahi ioctls then misread (module 1134); every other
-//! device keeps the DRM core's default import, as on t6050-gpu.
+//! Commands use the shared command layout (`include/uapi/drm/asahi_drm.h`);
+//! `g18::uapi::command` parses it. The adapter holds no firmware state.
+//! Everything it needs from the live G18 session goes through
+//! [`G18DrmRuntime`].
 
 use core::ops::Range;
-use core::sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering};
-use kernel::{bindings, c_str, macros::vtable, new_mutex, prelude::*, static_lock_class,
+use kernel::{bindings, macros::vtable, new_mutex, prelude::*, static_lock_class,
     dma_fence::{Fence, FenceContexts, FenceObject, FenceOps, RawDmaFence, UserFence},
-    sync::{Arc, Mutex}, uapi, xarray};
-use crate::{alloc, file, g18::uapi::command as g17_uapi, g18::hw,
-    g18::address_map as va,
+    sync::{Arc, Mutex, SpinLock}, uapi, xarray};
+use crate::{alloc, driver::AsahiRegData, file, g18::uapi::command as g17_uapi, g18::hw,
     g18::uapi::application::{self as g18_application, G18ApplicationRefusal, G18RenderJobSink, G18RenderRetirement},
-    gem, gpu, g18::fw::vm_layout as m5_vm, mmu, queue};
+    gem, gpu, g18::fw::vm_layout as m5_vm, mmu, queue, stats, stats_raw, timestamp};
 
 const USER_END: u64 = (1 << 42) - 2 * mmu::UAT_PGSZ as u64;
 /// Largest compute control stream admitted, in bytes. The kernel does not read
@@ -37,10 +33,36 @@ const USER_END: u64 = (1 << 42) - 2 * mmu::UAT_PGSZ as u64;
 pub(crate) const G18_COMPUTE_STREAM_BYTES: u64 = 64 * 1024;
 /// `DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE`: the dispatch binds texture or image
 /// state, so the command takes the native texture compute mode (d62a,
-/// `g18_application_compute_resources.rs`). The only compute flag G18 admits.
-/// Spelled as its value, `(1 << 1)` in include/uapi/drm/asahi_drm.h, because
-/// the incremental module build reuses pinned bindgen output that predates it.
-const G18_COMPUTE_TEXTURE_STATE: u32 = 1 << 1;
+/// `g18_application_compute_resources.rs`).
+const G18_COMPUTE_TEXTURE_STATE: u32 =
+    uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE as u32;
+
+// `g18::uapi::command` parses by byte offset (it is also built on the host);
+// keep its constants equal to the UAPI header.
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(g17_uapi::UAPI_RENDER_SIZE == size_of::<uapi::drm_asahi_cmd_render>());
+    assert!(g17_uapi::UAPI_COMPUTE_SIZE == size_of::<uapi::drm_asahi_cmd_compute>());
+    assert!(g17_uapi::UAPI_G18_RENDER_SIZE == size_of::<uapi::drm_asahi_cmd_render_g18>());
+    assert!(g17_uapi::UAPI_G18_COMPUTE_SIZE == size_of::<uapi::drm_asahi_cmd_compute_g18>());
+    assert!(offset_of!(uapi::drm_asahi_cmd_render_g18, resources) == g17_uapi::UAPI_RENDER_SIZE);
+    assert!(offset_of!(uapi::drm_asahi_cmd_compute_g18, resources) == g17_uapi::UAPI_COMPUTE_SIZE);
+    assert!(size_of::<uapi::drm_asahi_g18_render_resources>() == 80);
+    assert!(size_of::<uapi::drm_asahi_g18_compute_resources>() == 64);
+    assert!(offset_of!(uapi::drm_asahi_cmd_render, ray_query) == 0x150);
+    assert!(offset_of!(uapi::drm_asahi_cmd_compute, prior_vdm) == 0x88);
+    assert!(offset_of!(uapi::drm_asahi_cmd_render, ts_frag_end_copies) == 0x100);
+    assert!(offset_of!(uapi::drm_asahi_cmd_render, prior_vdm) == 0x140);
+    assert!(offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) == 0x148);
+    assert!(offset_of!(uapi::drm_asahi_cmd_compute, ts_end_copies) == 0x40);
+    assert!(offset_of!(uapi::drm_asahi_cmd_compute, scs_layout) == 0x80);
+    assert!(offset_of!(uapi::drm_asahi_cmd_compute, prior_cdm) == 0x90);
+    assert!(offset_of!(uapi::drm_asahi_cmd_compute, cdm_auxiliary_allocation) == 0x98);
+    assert!(g17_uapi::RENDER_G18_RESOURCES
+        == uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_G18_RESOURCES as u32);
+    assert!(g17_uapi::COMPUTE_G18_RESOURCES
+        == uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_G18_RESOURCES as u32);
+};
 
 // Identity Mesa's G18G bring-up gate accepts (`agx_chip.c:471-477`) and the
 // drm-shim `g18g` profile publishes (`asahi_noop.c:129-147`), measured on
@@ -55,29 +77,9 @@ const G18_USC_GENERATION: u32 = 3;
 const G18_REVISION_B1: u32 = hw::GpuRevision::B1 as u32;
 /// `DRM_ASAHI_GPU_HAL_300`: the UAPI has no HAL400 value yet and Mesa's
 /// G18G gate requires 300. Apple's kext is PI_400.
-const G18_UAPI_HAL_GENERATION: u32 = 300;
+const G18_UAPI_HAL_GENERATION: u32 = uapi::drm_asahi_gpu_hal_generation_DRM_ASAHI_GPU_HAL_300 as u32;
 
-/// Kernel-VM window for K8 timestamp buffers. It must stay outside every
-/// fixed G18 reservation; the assertion below re-checks that whenever the
-/// address map changes.
-pub(crate) const G18_TIMESTAMP_KERNEL_RANGE: Range<u64> =
-    (va::KERNEL_BASE + 0xc600_0000)..(va::KERNEL_BASE + 0xc700_0000);
-
-const fn timestamp_range_is_free() -> bool {
-    let (start, end) = (G18_TIMESTAMP_KERNEL_RANGE.start, G18_TIMESTAMP_KERNEL_RANGE.end);
-    let mut i = 0;
-    while i < va::REGIONS.len() {
-        let region = va::REGIONS[i];
-        if start < region.base + region.bytes && region.base < end {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-const _: () = assert!(timestamp_range_is_free());
-
-static QUEUE_NAME: &CStr = c_str!("g18_queue");
+static QUEUE_NAME: &CStr = c"g18_queue";
 static QUEUE_CLASS_KEY: Pin<&'static kernel::sync::LockClassKey> = static_lock_class!();
 
 /// What the adapter needs from the live G18 session. The conductor
@@ -89,26 +91,11 @@ pub(crate) trait G18DrmRuntime: G18RenderJobSink {
     /// VM_CREATE: a user VM in the session UAT. The adapter has already
     /// checked `kernel_range` against the M5/Mesa compact contract.
     fn new_user_vm(&self, id: u64, kernel_range: Range<u64>) -> Result<mmu::Vm>;
-    /// K8: map a timestamp BO range. [`map_timestamp_buffer_in`] is the
-    /// intended implementation.
-    fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>)
-        -> Result<mmu::KernelMapping>;
     /// Compute (K1). Only called when the adapter admits compute.
     fn submit_compute(&self, _vm: &mmu::Vm, _command: &g17_uapi::TranslatedComputeCommand)
         -> Result<G18RenderRetirement> {
         Err(ENOTSUPP)
     }
-}
-
-/// K8 mapping for [`G18DrmRuntime::map_timestamp_buffer`]: the G17P manager
-/// body (`g17_manager.rs:3949-3962`) in the G18 kernel VM, inside
-/// [`G18_TIMESTAMP_KERNEL_RANGE`]. The adapter writes timestamps through the
-/// mapping's CPU view; the firmware-shared GPU view is what the file layer
-/// retains and what firmware-written timestamps will use later.
-pub(crate) fn map_timestamp_buffer_in(uat: &mmu::Uat, mut bo: gem::ObjectRef,
-    range: Range<usize>) -> Result<mmu::KernelMapping> {
-    bo.map_range_into_range(uat.kernel_vm(), range, G18_TIMESTAMP_KERNEL_RANGE,
-        mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW, false)
 }
 
 /// Adapter options fixed at registration.
@@ -162,11 +149,12 @@ impl G18DrmGpu {
 
 // Module 1134 reached G18 through its `DrmGpu` trait (drm_gpu.rs) and
 // computed GET_PARAMS in file.rs from `DrmGpu::params`; here the same facts
-// fill `drm_asahi_params_global` through `gpu::Gpu::get_params`. file.rs
-// adds VM_STATUS (supports_vm_status), leaves out VM_STATUS_MIRROR
-// (supports_vm_status_mirror is false, as in 1134) and INDEPENDENT_QUEUES
-// (no queue limits), and adds SOFT_FAULTS when fault_control is 0xb.
+// fill `drm_asahi_params_global` through `gpu::Gpu::get_params`. The shared
+// file layer adds VM_STATUS and VM_STATUS_MIRROR (supports_vm_status) and
+// SOFT_FAULTS when fault_control is 0xb; there are no queue limits.
 impl gpu::Gpu for G18DrmGpu {
+    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> { None }
+    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> { None }
     fn as_any(&self) -> &dyn core::any::Any { self }
     fn arc_as_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send> { self }
     fn manager(&self) -> Option<&dyn gpu::GpuManager> { None }
@@ -196,28 +184,15 @@ impl gpu::Gpu for G18DrmGpu {
         if self.config.admit_graphics_scratch {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_G18_GRAPHICS_SCRATCH as u64;
         }
-        params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES as u64;
+        params.features |= uapi::DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES as u64;
         Ok(())
     }
     fn supports_vm_status(&self) -> bool { true }
-    fn supports_vm_status_mirror(&self) -> bool { false }
-    /// Module 1134 validated and resolved every VM_BIND op before committing.
-    fn batched_vm_bind(&self) -> bool { true }
-    /// Module 1134 recorded `submission_error()` (EIO once crashed) on every VM_STATUS query.
-    fn submission_error(&self) -> Option<Error> { self.is_crashed().then_some(EIO) }
-    /// Module 1134 copied the command buffer before it parsed the syncs.
-    fn copy_commands_before_syncs(&self) -> bool { true }
-    /// Module 1134 refused HIGH and REALTIME queues with EINVAL.
-    fn allows_elevated_queue_priority(&self) -> bool { false }
-    /// Module 1134 had no GEM_MADVISE ioctl.
-    fn supports_gem_madvise(&self) -> bool { false }
-    /// Module 1134 refused bind flag bit 4 with EINVAL, and the T8152 UAT maps no
-    /// sparse tiles: a failed tile bind would clear the whole range, driver aliases
-    /// included.
-    fn supports_sparse_tiles(&self) -> bool { false }
-    /// `DRM_IOCTL_ASAHI_GET_TIME` scales CNTPCT_EL0 by this rate
-    /// (`file.rs:1225-1241`); report the counter's own frequency, as G17P
-    /// does (`g17_drm.rs:1209-1222`). J873 runs it at 24 MHz.
+    /// VM_BIND validates every op before committing any, and SUBMIT copies
+    /// the command buffer before it resolves the syncs (module 1134 did both).
+    fn tracked_submission(&self) -> bool { true }
+    /// `DRM_IOCTL_ASAHI_GET_TIME` scales CNTPCT_EL0 by this rate; report the
+    /// counter's own frequency, as G17P does. J873 runs it at 24 MHz.
     fn base_clock_hz(&self) -> u32 { counter_frequency() as u32 }
     /// 42-bit T8152 user space: user range UAT_PGSZ..USER_END with the dummy
     /// page at USER_END, as in module 1134.
@@ -228,7 +203,7 @@ impl gpu::Gpu for G18DrmGpu {
         let vm = self.runtime.new_user_vm(self.ids.vm.next(), kernel_range)?;
         // Module 1134 VM_CREATE: a simplefb alias is T8140-only; any other
         // GPU refuses the VM when the diagnostic parameter is set.
-        if *crate::module_parameters::g17p_simplefb_iova.value() != 0 {
+        if crate::g18::params::g17p_simplefb_iova.value() != 0 {
             return Err(ENOTSUPP);
         }
         Ok(vm)
@@ -236,7 +211,8 @@ impl gpu::Gpu for G18DrmGpu {
     fn new_queue(&self, vm: mmu::Vm,
         _ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
-        priority: u32, usc_exec_base: u64) -> Result<KBox<dyn queue::Queue>> {
+        priority: u32, usc_exec_base: u64,
+        _usage: Arc<crate::usage::Client>) -> Result<KBox<dyn queue::Queue>> {
         if priority > 3 { return Err(EINVAL); }
         let window = g17_uapi::QueueUscWindow {
             base: usc_exec_base, user_start: m5_vm::DRIVER_BASE, user_end: USER_END,
@@ -249,13 +225,15 @@ impl gpu::Gpu for G18DrmGpu {
         };
         Ok(KBox::new(queue, GFP_KERNEL)?)
     }
-    /// K8. Mesa binds `128 * sizeof(struct agx_timestamps)` of a WRITEBACK
-    /// BO at screen creation and enables timer queries only if this works.
+    /// K8. Mesa binds `128 * sizeof(struct agx_timestamps)` of a WRITEBACK BO
+    /// at screen creation and enables timer queries only if this works. G18
+    /// publishes timestamps from the CPU after retirement, so the buffer needs
+    /// no firmware mapping.
     fn map_timestamp_buffer(&self, bo: gem::ObjectRef, range: Range<usize>)
-        -> Result<mmu::KernelMapping> {
+        -> Result<timestamp::Buffer> {
         if self.is_crashed() { return Err(ENODEV); }
         if range.is_empty() { return Err(EINVAL); }
-        self.runtime.map_timestamp_buffer(bo, range)
+        timestamp::Buffer::cpu(bo, range)
     }
 }
 
@@ -276,21 +254,11 @@ fn counter_ticks() -> u64 {
     ticks
 }
 
-/// GET_TIME's conversion (`file.rs:1225-1241`): floor(ticks * 1e9 / f), the
-/// same rational as its gcd-reduced form. Split at whole seconds so no step
-/// overflows (the remainder term is below f * 1e9 < 2^64 for any u32 rate)
-/// and no 128-bit division (`__udivti3`) reaches the module.
-fn ticks_to_ns(ticks: u64, frequency: u64) -> u64 {
-    const NSEC_PER_SEC: u64 = 1_000_000_000;
-    (ticks / frequency).wrapping_mul(NSEC_PER_SEC)
-        .wrapping_add(ticks % frequency * NSEC_PER_SEC / frequency)
-}
-
 struct G18SubmissionFence;
 #[vtable]
 impl FenceOps for G18SubmissionFence {
-    fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr { c_str!("asahi") }
-    fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr { c_str!("g18-submit") }
+    fn get_driver_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr { c"aurora" }
+    fn get_timeline_name<'a>(self: &'a FenceObject<Self>) -> &'a CStr { c"g18-submit" }
 }
 
 /// Keep the original sync vector: creating a second output list would add an
@@ -328,58 +296,18 @@ impl g17_uapi::GpuAddressSpace for UserAddressSpace<'_> {
     }
 }
 
-/// One UAPI timestamp destination inside a bound timestamp buffer.
-struct TimestampSlot {
-    mapping: Arc<mmu::KernelMapping>,
-    offset: usize,
-}
-
-impl TimestampSlot {
-    /// Resolve before any GPU work, so a bad handle fails the submit cleanly.
-    fn resolve(objects: Pin<&xarray::XArray<KBox<file::Object>>>,
-        timestamp: g17_uapi::UapiTimestamp) -> Result<Option<Self>> {
-        if timestamp.handle == 0 {
-            return if timestamp.offset == 0 { Ok(None) } else { Err(EINVAL) };
-        }
-        let guard = objects.lock();
-        let object = guard.get(timestamp.handle.try_into()?).ok_or(ENOENT)?.clone();
-        core::mem::drop(guard);
-        match object {
-            file::Object::TimestampBuffer(mapping) => {
-                let offset: usize = timestamp.offset.try_into()?;
-                if offset.checked_add(8).ok_or(EINVAL)? > mapping.size() {
-                    return Err(ERANGE);
-                }
-                Ok(Some(Self { mapping, offset }))
-            }
-        }
+/// A parsed timestamp pair in the UAPI's own type, for the shared resolver.
+fn uapi_timestamps(timestamps: g17_uapi::UapiTimestamps) -> uapi::drm_asahi_timestamps {
+    uapi::drm_asahi_timestamps {
+        start: uapi::drm_asahi_timestamp {
+            handle: timestamps.start.handle,
+            offset: timestamps.start.offset,
+        },
+        end: uapi::drm_asahi_timestamp {
+            handle: timestamps.end.handle,
+            offset: timestamps.end.offset,
+        },
     }
-
-    /// Publish one timestamp in the UAPI unit, GET_TIME nanoseconds.
-    fn write(&self, ticks: u64, frequency: u64) -> Result {
-        let value = ticks_to_ns(ticks, frequency);
-        self.mapping.with_cpu_bytes(|bytes| {
-            let end = self.offset.checked_add(8).ok_or(EINVAL)?;
-            bytes.get_mut(self.offset..end).ok_or(EINVAL)?
-                .copy_from_slice(&value.to_le_bytes());
-            Ok(())
-        }).inspect_err(|error| pr_err!(
-            "G18 timestamp not published: {:?} offset={:#x} mapping={:#x}\n",
-            error, self.offset, self.mapping.size()))?;
-        fence(Ordering::Release);
-        Ok(())
-    }
-}
-
-/// Write the requested stage timestamps after retirement. Without job stage
-/// ticks, the CPU bracket `[t0, t1]` around the synchronous job bounds every
-/// stage: starts get t0, ends get t1.
-fn publish_timestamps(slots: &[Option<TimestampSlot>], stage_ticks: &[u64]) -> Result {
-    let frequency = counter_frequency();
-    for (slot, &ticks) in slots.iter().zip(stage_ticks) {
-        if let Some(slot) = slot { slot.write(ticks, frequency)?; }
-    }
-    Ok(())
 }
 
 struct G18Queue {
@@ -392,7 +320,8 @@ struct G18Queue {
 }
 
 impl queue::Queue for G18Queue {
-    fn submit(&mut self, _submission_id: u64, syncs: KVec<file::SyncItem>,
+    fn submit(&mut self, _reg_data: &AsahiRegData<'_>, _submission_id: u64,
+        syncs: KVec<file::SyncItem>,
         in_sync_count: usize, cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>) -> Result {
         if in_sync_count > syncs.len() { return Err(EINVAL); }
@@ -447,18 +376,21 @@ impl G18Queue {
         // any earlier submission) has completed when its waiter begins.
         for command in admitted {
             if self.runtime.is_crashed() { return Err(ENODEV); }
+            // Without job stage ticks, the CPU bracket `[t0, t1]` around the
+            // synchronous job bounds every stage: starts get t0, ends get t1.
             let t0 = counter_ticks();
             match command {
                 Admitted::Render(render, slots) => {
                     let retired = self.runtime.submit_render(&self.vm, &render)?;
                     let t1 = counter_ticks();
-                    publish_timestamps(&slots, &retired.stage_ticks.unwrap_or([t0, t1, t0, t1]))?;
+                    slots.publish(retired.stage_ticks.unwrap_or([t0, t1, t0, t1]),
+                        counter_frequency());
                 }
                 Admitted::Compute(command, slots) => {
                     let retired = self.runtime.submit_compute(&self.vm, &command)?;
                     let t1 = counter_ticks();
                     let [start, _, _, end] = retired.stage_ticks.unwrap_or([t0, t1, t0, t1]);
-                    publish_timestamps(&slots, &[start, end])?;
+                    slots.publish([start, end, 0, 0], counter_frequency());
                 }
             }
         }
@@ -519,12 +451,10 @@ impl G18Queue {
             pr_err!("G18 render admission rejected: job-owned fields set\n");
             return Err(EINVAL);
         }
-        let slots = [
-            TimestampSlot::resolve(objects, payload.vertex_timestamps.start)?,
-            TimestampSlot::resolve(objects, payload.vertex_timestamps.end)?,
-            TimestampSlot::resolve(objects, payload.fragment_timestamps.start)?,
-            TimestampSlot::resolve(objects, payload.fragment_timestamps.end)?,
-        ];
+        let slots = timestamp::Destinations::resolve_unaligned(objects, &[
+            uapi_timestamps(payload.vertex_timestamps),
+            uapi_timestamps(payload.fragment_timestamps),
+        ])?;
         Ok(Admitted::Render(render, slots))
     }
 
@@ -629,18 +559,16 @@ impl G18Queue {
             })?;
         translated.g18_texture_state = payload.flags & G18_COMPUTE_TEXTURE_STATE != 0;
         translated.g18_resource_descriptor = resource_descriptor;
-        let slots = [
-            TimestampSlot::resolve(objects, payload.timestamps.start)?,
-            TimestampSlot::resolve(objects, payload.timestamps.end)?,
-        ];
+        let slots = timestamp::Destinations::resolve_unaligned(objects,
+            &[uapi_timestamps(payload.timestamps)])?;
         Ok(Admitted::Compute(KBox::new(translated, GFP_KERNEL)?, slots))
     }
 }
 
 /// An admitted command, heap-held so the submit frame stays small.
 enum Admitted {
-    Render(KBox<g18_application::G18ApplicationRender>, [Option<TimestampSlot>; 4]),
-    Compute(KBox<g17_uapi::TranslatedComputeCommand>, [Option<TimestampSlot>; 2]),
+    Render(KBox<g18_application::G18ApplicationRender>, timestamp::Destinations),
+    Compute(KBox<g17_uapi::TranslatedComputeCommand>, timestamp::Destinations),
 }
 
 /// Log a render refusal with the fields that decided it and map it to the
@@ -652,58 +580,4 @@ fn refuse_render(payload: &g17_uapi::UapiRenderCommand, refusal: G18ApplicationR
         payload.zls_control, payload.depth.base, payload.depth.compression_base,
         payload.stencil.base, payload.stencil_clear, payload.sampler_count);
     if refusal.is_invalid() { EINVAL } else { ENOTSUPP }
-}
-
-static FOREIGN_IMPORT_REPORTED: AtomicBool = AtomicBool::new(false);
-
-/// Parent `struct device` of the G18 DRM device, set before it registers.
-static G18_PARENT: AtomicPtr<bindings::device> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Record the platform device of the G18 DRM device, so that
-/// [`asahi_gem_prime_import`] applies module 1134's import rule to it alone.
-pub(crate) fn note_g18_parent(parent: *mut bindings::device) {
-    G18_PARENT.store(parent, Ordering::Release);
-}
-
-/// `drm_driver.gem_prime_import` for asahi. A device other than G18 gets the
-/// DRM core's default import, exactly what the core does without this hook
-/// (t6050-gpu has none). The G18 device re-imports only dma-bufs that it
-/// exported. Anything else is refused with EINVAL, the DRM
-/// core's answer for a driver without import support
-/// (`drm_prime.c:987-988`).
-///
-/// Without this hook the core's default import builds a bare C
-/// `drm_gem_shmem_object` (no `gem_create_object`, `shmem.rs:335-339`),
-/// and every asahi ioctl that looks a handle up reads it as an
-/// `Object<AsahiObject>` (`file.rs:989`, `shmem.rs:320-327`).
-///
-/// # Safety
-///
-/// The DRM core calls this with a valid `drm_device` and a dma-buf it holds
-/// a reference on, for the duration of the call.
-pub(crate) unsafe extern "C" fn asahi_gem_prime_import(
-    dev: *mut bindings::drm_device,
-    dma_buf: *mut bindings::dma_buf,
-) -> *mut bindings::drm_gem_object {
-    // SAFETY: `dev` is a valid drm_device (caller contract); its parent is
-    // set at allocation and does not change while the device exists.
-    let parent = unsafe { (*dev).dev };
-    if parent.is_null() || parent != G18_PARENT.load(Ordering::Acquire) {
-        // SAFETY: caller contract; this is the call the DRM core makes
-        // itself when a driver has no gem_prime_import hook.
-        return unsafe { bindings::drm_gem_prime_import(dev, dma_buf) };
-    }
-    // SAFETY: both pointers are valid (caller contract). The helper compares
-    // `dma_buf->ops` with DRM's own PRIME ops before it reads `priv` as a GEM
-    // object (`drm_prime.c:945-951`).
-    if unsafe { bindings::drm_gem_is_prime_exported_dma_buf(dev, dma_buf) } {
-        // SAFETY: for a dma-buf this device exported, the helper only takes
-        // a reference on the existing GEM object (`drm_prime.c:977-983`),
-        // which is an `Object<AsahiObject>` created by this driver.
-        return unsafe { bindings::drm_gem_prime_import(dev, dma_buf) };
-    }
-    if !FOREIGN_IMPORT_REPORTED.swap(true, Ordering::Relaxed) {
-        pr_warn!("asahi: refusing a dma-buf another driver exported; only asahi's own buffers can be imported\n");
-    }
-    EINVAL.to_ptr()
 }

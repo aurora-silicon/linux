@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use crate::{g18::queue::scheduler::G18SchedulerBinding, g18::buffer::object::MappedObject};
-use crate::{driver::AsahiDevice, g18::fw::compute::*, g18::fw::compute_memory::*, mmu};
+use crate::{driver::AsahiDrmDevice, g18::fw::compute::*, g18::fw::compute_memory::*, mmu};
 use core::ops::Range;
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
@@ -99,7 +99,7 @@ impl G18ComputeMemory {
     }
 
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         uat: &mmu::Uat,
         high_range: Range<u64>,
         clusters: u32,
@@ -178,7 +178,7 @@ impl G18ComputeMemory {
     /// Bind the payload VM while retaining both aliases and the context lease.
     /// A failure leaves the original command/channel and firmware roots intact.
     pub(crate) fn bind_process(
-        &mut self, dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
+        &mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat, vm: &mmu::Vm,
     ) -> Result<u32> {
         if !self.unpublished_idle() { return Err(EBUSY); }
         let context = uat.prepare_t8152_execution_context(vm)?;

@@ -8,8 +8,7 @@
 use kernel::{
     c_str,
     device::Core,
-    devres::Devres,
-    io::{mem::IoMem, Io},
+    io::{mem::DevresIoMem, Io, IoBase},
     platform,
     prelude::*,
     sync::aref::ARef,
@@ -40,7 +39,7 @@ const CORE_MASKS_G14X: usize = 0xe01500;
 /// Device resources for this GPU instance.
 pub(crate) struct Resources {
     dev: ARef<platform::Device>,
-    sgx: Pin<KBox<Devres<IoMem<0>>>>,
+    sgx: DevresIoMem,
     // The G17P SKSM FIFO lock and deferred SKSM writes are not carried: on
     // T8152 the firmware owns KSMFE queue setup (hwdata+0x2724 = 0) and the
     // host performs no SKSM MMIO.
@@ -49,13 +48,13 @@ pub(crate) struct Resources {
 impl Resources {
 
     /// Map the required resources given our platform device.
-    pub(crate) fn new(pdev: &platform::Device<Core>) -> Result<Resources> {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<Resources> {
         // The pinned host maps accelerator device-memory index 0 and stores
         // it at accelerator+0x348 before every SKSM scratch access. That range
         // is the J700 GPU block exposed to Linux by the named `sgx` resource
         // (the second platform `reg` tuple, after `asc`).
         let sgx_req = pdev.io_request_by_name(c_str!("sgx")).ok_or(EINVAL)?;
-        let sgx_iomem = KBox::pin_init(sgx_req.iomap(), GFP_KERNEL)?;
+        let sgx_iomem = sgx_req.iomap()?.into_devres()?;
 
         Ok(Resources {
             // SAFETY: This device does DMA via the UAT IOMMU.
@@ -73,7 +72,7 @@ impl Resources {
     pub(crate) fn m5_match_pmgr_boot_control(&self) -> Result {
         const OFFSET: usize = 0xe90000;
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
-        let res = sgx.relaxed();
+        let res = (&*sgx).as_view().relaxed();
         let before = res.try_read32(OFFSET)?;
         if before != 0x30000 && before != 0x30001 {
             dev_err!(self.dev.as_ref(), "M5_INIT unexpected PMGR control {:#x}\n", before);
@@ -397,7 +396,7 @@ impl T8152SgxPowered {
 /// The block is mapped for this call alone and never claimed, so a later
 /// power owner can map the same service block.
 pub(crate) fn t8152_read_psd(
-    pdev: &platform::Device<Core>,
+    pdev: &platform::Device<Core<'_>>,
     service: T8152PsdService,
 ) -> Result<T8152PsdSample> {
     let resource = pdev
@@ -417,7 +416,7 @@ pub(crate) fn t8152_read_psd(
     let request = pdev
         .io_request_by_name(service.resource_name())
         .ok_or(ENODEV)?;
-    let iomem = KBox::pin_init(request.iomap(), GFP_KERNEL)?;
+    let iomem = request.iomap()?.into_devres()?;
     let io = iomem.try_access().ok_or(ENODEV)?;
     // STATE consumes the transition ACK; preserve it in the snapshot first.
     let ack = io.try_read32(T8152_PSD_ACK)?;
@@ -433,7 +432,7 @@ pub(crate) fn t8152_read_psd(
 /// (state 0). Otherwise log the sample and return [`t8152_not_powered`], so
 /// the caller skips every SGX read.
 pub(crate) fn t8152_prove_sgx_powered(
-    pdev: &platform::Device<Core>,
+    pdev: &platform::Device<Core<'_>>,
 ) -> Result<T8152SgxPowered> {
     let sample = t8152_read_psd(pdev, T8152PsdService::Sgx)?;
     if !sample.powered() {

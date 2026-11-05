@@ -177,7 +177,7 @@ pub(crate) fn g18_stage_config(
 #[cfg(not(test))]
 use crate::g18::buffer::object::MappedObject;
 #[cfg(not(test))]
-use crate::{driver::AsahiDevice, mmu};
+use crate::{driver::AsahiDrmDevice, mmu};
 #[cfg(not(test))]
 use core::sync::atomic::{fence, Ordering};
 #[cfg(not(test))]
@@ -214,8 +214,8 @@ unsafe impl Sync for DataView {}
 
 #[cfg(not(test))]
 impl DataView {
-    fn new(dev: &AsahiDevice) -> Result<Self> {
-        let resource = dev.as_ref().of_node().ok_or(EINVAL)?
+    fn new(dev: &AsahiDrmDevice) -> Result<Self> {
+        let resource = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?
             .reserved_mem_region_to_resource_byname(c_str!("gfx-data"))?;
         if resource.size() != DATA_SIZE as u64 || resource.start() < 0x100_0000_0000
             || resource.start() & 0x3fff != 0
@@ -293,7 +293,7 @@ impl G18GraphicsQueues {
     /// 0xfffffe0008bdd178), the shared job list and the shared control
     /// (AGXCommandQueueReclaimableState::init 0xfffffe0008bf9014). Nothing is
     /// published: all inner producers stay 0.
-    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, a: G18GraphicsQueueAddresses) -> Result<Self> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, uat: &mmu::Uat, a: G18GraphicsQueueAddresses) -> Result<Self> {
         if !uat.is_t8152_geometry() { return Err(ENODEV); }
         let mut entries = KVec::new();
         let mut aliases = KVec::new();
@@ -458,7 +458,7 @@ impl G18GraphicsQueues {
 
     /// Compare the retained command records to the shared pure encoders and
     /// print their actual bytes' digest before producer 6 can be published.
-    pub(crate) fn audit_prepared_pass(&mut self, dev: &AsahiDevice, pass: &G18QueuedPass) -> Result {
+    pub(crate) fn audit_prepared_pass(&mut self, dev: &AsahiDrmDevice, pass: &G18QueuedPass) -> Result {
         if self.step != 4 || self.counters()? != [[3; 3]; 2] { return Err(EBUSY); }
         let a = self.addresses;
         for stage in 0..2 {
@@ -736,7 +736,7 @@ impl G18ParameterBuffer {
     /// firmware: the PB-table row is written separately by `load_row`, and
     /// the tag15 that names the PB comes later still.
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         uat: &mmu::Uat,
         low_vm: &mmu::Vm,
         a: G18PbAddresses,
@@ -1034,7 +1034,7 @@ impl G18ParameterBuffer {
         Ok(pages)
     }
 
-    pub(crate) fn print_h1_digests(&mut self, dev: &AsahiDevice, row: &[u8;16]) -> Result {
+    pub(crate) fn print_h1_digests(&mut self, dev: &AsahiDrmDevice, row: &[u8;16]) -> Result {
         // Context +8 is firmware-owned and separately checked. Normalize only
         // that field and the unwritten +1c word for host reproducibility.
         self.state.with_bytes_mut(|out| {

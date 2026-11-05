@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Retained G18GFX01 v2 pages. Construction never publishes roots or work.
 use crate::g18::buffer::object::MappedObject;
-use crate::{driver::AsahiDevice, g18::address_map as va, g18::fw::graphics_payload as payload, mmu};
+use crate::{driver::AsahiDrmDevice, g18::address_map as va, g18::fw::graphics_payload as payload, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::{firmware::Firmware, prelude::*};
 
@@ -21,7 +21,7 @@ pub(crate) struct G18GraphicsMemory {
 }
 
 impl G18GraphicsMemory {
-    pub(crate) fn load_payload(dev: &AsahiDevice, uat: &mmu::Uat, profile: u32) -> Result<Self> {
+    pub(crate) fn load_payload(dev: &AsahiDrmDevice, uat: &mmu::Uat, profile: u32) -> Result<Self> {
         let name = match profile {
             1 => c"asahi/g18-26a428-color-a-v2.bin",
             2 => c"asahi/g18-26a428-color-b-v2.bin",
@@ -30,7 +30,7 @@ impl G18GraphicsMemory {
             _ => return Err(EINVAL),
         };
         if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != payload::PAGE_BYTES { return Err(ENODEV); }
-        let firmware = Firmware::request(name, dev.as_ref())?;
+        let firmware = Firmware::request(name, dev.as_ref().as_ref())?;
         let input = payload::GraphicsPayload::parse(firmware.data()).map_err(|_| EINVAL)?;
         if input.capture() as u32 != profile { return Err(EINVAL); }
         let vm = uat.new_t8152_compute_fixture_vm()?;

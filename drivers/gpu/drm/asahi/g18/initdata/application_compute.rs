@@ -7,7 +7,7 @@ use core::sync::atomic::Ordering;
 // Application-compute-only knobs K1-K5 (compute diagnostics) and
 // g18_app_d62a (case 10). Unlike
 // kernel::module! parameters (perm 0, set once at load), these are 0644 with
-// the C uint ops, so /sys/module/asahi/parameters/g18_app_* may be changed
+// the C uint ops, so /sys/module/aurora/parameters/g18_app_* may be changed
 // between submissions. prepare_application_compute reads each exactly once
 // per submission; nothing else reads them, so graphics and the stage8 fixture
 // are unaffected. Registration otherwise follows g18_render_policy.rs.
@@ -22,7 +22,7 @@ macro_rules! app_knob {
             static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
                 name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
                     kernel::c_str!($name)
-                } else { kernel::c_str!(concat!("asahi.", $name)) }),
+                } else { kernel::c_str!(concat!("aurora.", $name)) }),
                 // Module lifetime and parameter serialization are managed by the
                 // kernel, identically to the kernel::module! registration. A raw
                 // address avoids a reference to the mutable extern static.
@@ -130,7 +130,7 @@ impl ApplicationComputeKnobs {
     }
 
     fn apply_plan(&mut self, plan: crate::g18::uapi::compute_plan::G18ComputePlan,
-        dev: &AsahiDevice) -> Result {
+        dev: &AsahiDrmDevice) -> Result {
         // Fixed knobs remain available for legacy diagnostics. Never combine
         // them with shader-derived ownership or silently ignore an override.
         if self.sma_pair != 0x6_0010 || self.sma_units != 0 {
@@ -145,7 +145,7 @@ impl ApplicationComputeKnobs {
 
     /// Refuse, before any owner changes, values that would make the command
     /// inconsistent. Nothing is published for a refused submission.
-    fn validate(&self, dev: &AsahiDevice) -> Result {
+    fn validate(&self, dev: &AsahiDrmDevice) -> Result {
         let refusal = if self.a731 > 1 {
             Some(("g18_app_a731", self.a731, "admitted 0 (fixture) or 1 (native)"))
         } else if !SMA_PAIRS.contains(&self.pair()) {
@@ -199,7 +199,7 @@ pub(super) struct ApplicationCompute {
 }
 
 impl G18FirmwareMemory {
-    pub(crate) fn prepare_application_compute(&mut self, dev: &AsahiDevice,
+    pub(crate) fn prepare_application_compute(&mut self, dev: &AsahiDrmDevice,
         vm: &mmu::Vm, command: &TranslatedComputeCommand)
         -> Result<(G18PreparedComputeCommand, G18UmaPoolBinding, u32, ApplicationComputeKnobs)> {
         if command.sampler_heap != 0 || command.sampler_count != 0
@@ -307,7 +307,7 @@ impl G18FirmwareMemory {
         Ok(prepared)
     }
 
-    fn prepare_application_compute_attempt(&mut self, dev: &AsahiDevice,
+    fn prepare_application_compute_attempt(&mut self, dev: &AsahiDrmDevice,
         vm: &mmu::Vm, command: &TranslatedComputeCommand,
         mut knobs: ApplicationComputeKnobs, fail_checkpoint: u32,
         replacement: Option<crate::g18::uapi::compute_plan::G18ComputePlan>)
@@ -475,7 +475,7 @@ impl G18FirmwareMemory {
 
     /// Called only after the session checked the old firmware binding and the
     /// retired scheduler. Both views remain owned if any later step fails.
-    pub(crate) fn install_application_compute_pool(&mut self, dev: &AsahiDevice) -> Result {
+    pub(crate) fn install_application_compute_pool(&mut self, dev: &AsahiDrmDevice) -> Result {
         let job = &mut **self.application_compute.as_mut().ok_or(EIO)?;
         if let Some(previous) = job.previous_pool.as_mut() {
             let old = job.previous_binding.ok_or(EIO)?;

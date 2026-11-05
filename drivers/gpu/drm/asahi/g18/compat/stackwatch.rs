@@ -140,7 +140,7 @@ static SW_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static SW_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_stack_watch"
-    } else { c"asahi.g17p_stack_watch" }),
+    } else { c"aurora.g17p_stack_watch" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]

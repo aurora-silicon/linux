@@ -9,7 +9,7 @@ mod recovery;
 use recovery::{Failure, JobEnd, JobFailure, JobPath};
 use core::{ops::Range,sync::atomic::AtomicI32};
 use crate::{g18::uapi::application::{G18ApplicationRender,G18RenderJobSink,G18RenderRetirement},
-    g18::drm::{self as g18_drm,G18DrmRuntime},gem,
+    g18::drm::G18DrmRuntime,
     g18::runtime::graphics_job::application::ApplicationJob};
 
 pub(crate) struct ApplicationOwner {
@@ -131,10 +131,6 @@ impl G18DrmRuntime for ApplicationOwner {
         if self.failed.load(Ordering::Acquire) {return Err(EIO);}
         self.session.lock().0.as_ref().ok_or(EIO)?.uat.new_vm(id,kernel_range)?.with_t8152_lifetime()
     }
-    fn map_timestamp_buffer(&self,bo:gem::ObjectRef,range:Range<usize>)->Result<mmu::KernelMapping> {
-        if self.failed.load(Ordering::Acquire) {return Err(EIO);}
-        g18_drm::map_timestamp_buffer_in(&self.session.lock().0.as_ref().ok_or(EIO)?.uat,bo,range)
-    }
 }
 impl G18RenderJobSink for ApplicationOwner {
     fn submit_render(&self,vm:&mmu::Vm,render:&G18ApplicationRender)->Result<G18RenderRetirement> {
@@ -147,7 +143,7 @@ impl G18RenderJobSink for ApplicationOwner {
     }
 }
 
-pub(crate) fn start_drm(pdev:&platform::Device<Core>,probe:T8152Probe)
+pub(crate) fn start_drm(pdev:&platform::Device<Core<'_>>,probe:T8152Probe)
     ->Result<(Arc<dyn G18Runtime>,Arc<dyn G18DrmRuntime>)> {
     if probe.stage!=STAGE_DRM {return Err(EINVAL);}
     let retained=prepare_firmware_session(pdev,probe)?;
@@ -216,7 +212,7 @@ impl G18Session {
         job.job.queues().prepare_application_pass(&self.dev,&pass,frame)?;
         self.poll_idle_faults("application pre-kick")?;
         let job=self.application_job.as_mut().ok_or(EIO)?;
-        let traced=job.traced() || *crate::module_parameters::g18_graphics_stall_trace.value()!=0;
+        let traced=job.traced() || crate::g18::params::g18_graphics_stall_trace.value()!=0;
         let roots=job.publish()?;
         let records=job.job.queues().publish_application_pass(frame)?;
         let outer_after=self.memory.as_mut().ok_or(EIO)?.publish_application_outer(&records,frame)?;

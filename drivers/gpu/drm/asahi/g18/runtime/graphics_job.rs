@@ -6,7 +6,7 @@ use crate::{g18::buffer::object::MappedObject, g18::runtime::graphics_memory::G1
     g18::queue::scheduler::{G18SchedulerMemory, G18SchedulerSnapshot},
     g18::queue::graphics::{G18GraphicsQueues, G18GraphicsQueueAddresses,
         G18ParameterBuffer, G18PbAddresses, G18PbPolicy, G18QueuedPass, G18PbReadback}};
-use crate::{driver::AsahiDevice, g18::fw::render_params::G17pRenderParameters,
+use crate::{driver::AsahiDrmDevice, g18::fw::render_params::G17pRenderParameters,
     g18::address_map as va, g18::fw::render as regs, g18::fw::render_command as cmd,
     g18::fw::render_assembly::{self as assembly, EncodedJob, RenderVariant}, mmu};
 use core::sync::atomic::{fence, Ordering};
@@ -31,7 +31,7 @@ pub(crate) struct G18GraphicsJob {
 
 impl G18GraphicsJob {
     #[inline(never)]
-    pub(crate) fn from_payload(dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn from_payload(dev: &AsahiDrmDevice, uat: &mmu::Uat,
         profile: u32, variant: RenderVariant) -> Result<KBox<Self>> {
         if (variant == RenderVariant::GearsThreeFrames) != (profile == 3) { return Err(EINVAL); }
         let mut program = G18GraphicsMemory::load_payload(dev, uat, profile)?;
@@ -42,19 +42,19 @@ impl G18GraphicsJob {
             crate::g18::fw::graphics_payload::Capture::FragmentWitness => regs::G18Capture::FragmentWitness,
         };
         let (mut p, mut controls) = regs::g18_capture_parameters(capture);
-        if *crate::module_parameters::g18_vdm_high_alias.value() == 1 {
+        if crate::g18::params::g18_vdm_high_alias.value() == 1 {
             let source = p.encoder;
             p.encoder = program.alias_vdm_for_address_probe(source)?;
-            dev_info!(dev, "G18_VDM_ADDRESS_CONTROL source={:#x} alias={:#x} compact={:#x} bytes=16384 contents=unchanged\n",
+            dev_info!(dev.as_ref(), "G18_VDM_ADDRESS_CONTROL source={:#x} alias={:#x} compact={:#x} bytes=16384 contents=unchanged\n",
                 source, va::GRAPHICS_HIGH_VDM, p.encoder);
-            dev_info!(dev, "G18_RENDER_OBJECT name=vdm-address-control va={:#x} bytes={:#x} context={}\n",
+            dev_info!(dev.as_ref(), "G18_RENDER_OBJECT name=vdm-address-control va={:#x} bytes={:#x} context={}\n",
                 va::GRAPHICS_HIGH_VDM, va::PAGE, program.context_id());
         }
-        if *crate::module_parameters::g18_ppp_high_alias.value() == 1 {
+        if crate::g18::params::g18_ppp_high_alias.value() == 1 {
             program.alias_ppp_for_address_probe()?;
-            dev_info!(dev, "G18_PPP_ADDRESS_CONTROL records=14 pages=4 contents=unchanged vdm_changes=ppp-pointers-only\n");
+            dev_info!(dev.as_ref(), "G18_PPP_ADDRESS_CONTROL records=14 pages=4 contents=unchanged vdm_changes=ppp-pointers-only\n");
             for source in va::GRAPHICS_HIGH_PPP_PAGES {
-                dev_info!(dev, "G18_RENDER_OBJECT name=ppp-address-control-{:x} va={:#x} bytes={:#x} context={}\n",
+                dev_info!(dev.as_ref(), "G18_RENDER_OBJECT name=ppp-address-control-{:x} va={:#x} bytes={:#x} context={}\n",
                     source, va::GRAPHICS_HIGH_PPP_BASE - 0x58000 + source, va::PAGE, program.context_id());
             }
         }
@@ -78,7 +78,7 @@ impl G18GraphicsJob {
             targets.push(target, GFP_KERNEL)?;
         }
         assembly::apply_target_plan(&mut p, &plan);
-        if *crate::module_parameters::g18_usc_statistics.value() != 0 {
+        if crate::g18::params::g18_usc_statistics.value() != 0 {
             if variant != RenderVariant::Color || program.context_id() >= 64 {
                 return Err(EINVAL);
             }
@@ -93,10 +93,10 @@ impl G18GraphicsJob {
             };
             controls.ta.usc_statistics = encode(p.ta_status)?;
             controls.fragment.usc_statistics = encode(p.fragment_status)?;
-            dev_info!(dev, "G18_USC_STATISTICS context={} ta={:#x} fragment={:#x} backing=16384-each\n",
+            dev_info!(dev.as_ref(), "G18_USC_STATISTICS context={} ta={:#x} fragment={:#x} backing=16384-each\n",
                 program.context_id(), controls.ta.usc_statistics, controls.fragment.usc_statistics);
         }
-        dev_info!(dev, "G18_RENDER_TARGET kind={} primary={:#x} tpc-allocation={:#x} native={:?}\n",
+        dev_info!(dev.as_ref(), "G18_RENDER_TARGET kind={} primary={:#x} tpc-allocation={:#x} native={:?}\n",
             crate::g18::uapi::render_policy::target_kind(), plan.sizes[0], plan.sizes[1], plan.native);
         let mut parameter_buffer = G18ParameterBuffer::new(dev, uat, program.vm(), G18PbAddresses {
             state_high: va::GRAPHICS_PB_HIGH, graph_high: va::PB_GRAPH,
@@ -141,7 +141,7 @@ impl G18GraphicsJob {
     pub(crate) fn queues(&mut self) -> &mut G18GraphicsQueues { &mut self.queues }
     pub(crate) fn parameter_buffer(&mut self) -> &mut G18ParameterBuffer { &mut self.parameter_buffer }
     #[inline(never)]
-    pub(crate) fn encode_h1(&mut self, dev: &AsahiDevice) -> Result {
+    pub(crate) fn encode_h1(&mut self, dev: &AsahiDrmDevice) -> Result {
         let inputs = self.h1_policy()?;
         self.encode(dev, &inputs)
     }
@@ -163,7 +163,7 @@ impl G18GraphicsJob {
             event_generation: [0;2], ta_barrier_flag: crate::g18::uapi::render_policy::ta_barrier_flag() })
     }
 
-    pub(crate) fn audit_h1(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn audit_h1(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         pb: &G18PbReadback, uma: &[u64;16]) -> Result {
         let pass = self.pass()?;
         self.queues.audit_before_pass(uat, &pass)?;
@@ -288,7 +288,7 @@ impl G18GraphicsJob {
     /// Caller has allocated/retained PB and pool owners and filled all native
     /// fields. In particular a default resource word is not an admitted policy.
     #[inline(never)]
-    pub(crate) fn encode(&mut self, dev: &AsahiDevice, inputs: &cmd::G18RenderCommandInputs) -> Result {
+    pub(crate) fn encode(&mut self, dev: &AsahiDrmDevice, inputs: &cmd::G18RenderCommandInputs) -> Result {
         if self.encoded.is_some() || self.controls.ta.resource_word == 0
             || self.controls.fragment.resource_word == 0
             || inputs.context_id != u32::from(self.context_id())
@@ -337,7 +337,7 @@ impl G18GraphicsJob {
     pub(crate) fn scheduler_snapshot(&mut self) -> Result<G18SchedulerSnapshot> { self.scheduler.snapshot(0) }
     pub(crate) fn output(&mut self) -> Result<(u64, u32)> { self.program.output() }
 
-    fn log_objects(&self, dev: &AsahiDevice) {
+    fn log_objects(&self, dev: &AsahiDrmDevice) {
         for (i, target) in self.targets.iter().enumerate() {
             dev_info!(dev.as_ref(), "G18_RENDER_OBJECT name={} va={:#x} bytes={:#x} context={}\n",
                 assembly::TARGET_NAMES[i], target.iova(), target.logical_size, self.context_id());

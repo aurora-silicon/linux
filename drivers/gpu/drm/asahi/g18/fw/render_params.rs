@@ -1516,7 +1516,7 @@ fn apply_g17p_fragment_oracle(raw: &mut [u8]) {
 /// FRG captures hold 0. Diagnostic parameter `g17p_frg_hwdsid_clear`.
 #[cfg(not(test))]
 fn g17p_frg_hwdsid_mode() -> u8 {
-    u8::from(*crate::module_parameters::g17p_frg_hwdsid_clear.value() == 0
+    u8::from(crate::g18::params::g17p_frg_hwdsid_clear.value() == 0
         && !crate::g18::compat::timing_buffer::diag_knob(crate::g18::compat::timing_buffer::DIAG_FRG_222D_CLEAR))
 }
 

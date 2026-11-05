@@ -2718,7 +2718,7 @@ pub(crate) fn encode_main_config_for_profile(
     // records are plain ASCII. Shipping macOS provisions the whole facility
     // and then throws the messages away (drainFirmwareLogRing is `bti c; ret`),
     // which is why the captured value is zero.
-    if *crate::module_parameters::g17p_fw_log.value() != 0 {
+    if crate::g18::params::g17p_fw_log.value() != 0 {
         put_u32(out, MAIN_FIRMWARE_LOG_ENABLE, 1);
     }
     let bundle = shared.hw_data_bundle;

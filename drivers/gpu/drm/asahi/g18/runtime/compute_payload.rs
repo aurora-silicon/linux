@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use crate::g18::buffer::object::MappedObject;
-use crate::{driver::AsahiDevice, g18::fw::compute::*, g18::fixture::compute_payload as payload,
+use crate::{driver::AsahiDrmDevice, g18::fw::compute::*, g18::fixture::compute_payload as payload,
     g18::fixture::compute_triangle::{TrianglePatch, TriangleResult, PATCH_COUNT},
     g18::fw::compute_state::{G18ComputeState, G18_COMPUTE_STATE_BYTES}, mmu};
 use core::sync::atomic::{fence, Ordering};
@@ -35,11 +35,11 @@ pub(crate) struct G18ComputePayloadMemory {
 }
 
 impl G18ComputePayloadMemory {
-    pub(crate) fn load(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+    pub(crate) fn load(dev: &AsahiDrmDevice, uat: &mmu::Uat) -> Result<Self> {
         if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != payload::PAGE_BYTES {
             return Err(ENODEV);
         }
-        let firmware = Firmware::request(c"asahi/g18-26a428-compute-add.bin", dev.as_ref())?;
+        let firmware = Firmware::request(c"asahi/g18-26a428-compute-add.bin", dev.as_ref().as_ref())?;
         let reference = payload::ComputePayload::parse(firmware.data()).map_err(|_| EINVAL)?;
         let vm = uat.new_t8152_compute_fixture_vm()?;
         let mut pages = KVec::new();
@@ -69,7 +69,7 @@ impl G18ComputePayloadMemory {
         if initial.checked != 4096 || initial.untouched != 4096 || initial.correct != 0 {
             return Err(EIO);
         }
-        match *crate::module_parameters::g18_compute_variant.value() {
+        match crate::g18::params::g18_compute_variant.value() {
             0 => {}
             1 => owner.empty_cdm_stream(dev)?,
             2 => owner.triangle_shader(dev, payload::fnv64(&firmware.data()[payload::HEADER_BYTES..]))?,
@@ -104,7 +104,7 @@ impl G18ComputePayloadMemory {
     /// barrier and terminate at +0/+4, zero +8..+0x2f (the old launch,
     /// barrier and terminate) and point command +0xee0 at the new terminate.
     /// Every other byte, page and register is unchanged; nothing is published.
-    fn empty_cdm_stream(&mut self, dev: &AsahiDevice) -> Result {
+    fn empty_cdm_stream(&mut self, dev: &AsahiDrmDevice) -> Result {
         let mut command = G18ComputeCommandInputs::default();
         let mut registers = G18ComputeRegisterInputs::default();
         self.apply_state(&mut command, &mut registers);
@@ -142,8 +142,8 @@ impl G18ComputePayloadMemory {
 
     /// Validate every original site before mutating any page. All pages and
     /// roots are still private; failure cannot publish a partial program.
-    fn triangle_shader(&mut self, dev: &AsahiDevice, base_fnv: u64) -> Result {
-        let firmware = Firmware::request(c"asahi/g18-26a428-compute-triangle.bin", dev.as_ref())?;
+    fn triangle_shader(&mut self, dev: &AsahiDrmDevice, base_fnv: u64) -> Result {
+        let firmware = Firmware::request(c"asahi/g18-26a428-compute-triangle.bin", dev.as_ref().as_ref())?;
         let patch = TrianglePatch::parse(firmware.data(), base_fnv).ok_or(EINVAL)?;
         let mut indices = [0usize; PATCH_COUNT];
         for (i, index) in indices.iter_mut().enumerate() {

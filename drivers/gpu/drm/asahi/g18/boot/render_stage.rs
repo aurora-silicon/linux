@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! H1 admission and retained-owner construction. H2 is deliberately excluded.
 //! The caller must execute every runtime readback gate before publication.
-use crate::{driver::AsahiDevice, g18::runtime::graphics_job::G18GraphicsJob,
+use crate::{driver::AsahiDrmDevice, g18::runtime::graphics_job::G18GraphicsJob,
     g18::fw::render_assembly::RenderVariant, mmu};
 use kernel::prelude::*;
 
@@ -33,9 +33,9 @@ pub(crate) fn admit(dev: &kernel::device::Device, variant: u32, profile: u32) ->
 }
 
 #[inline(never)]
-pub(crate) fn prepare(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<KBox<G18GraphicsJob>> {
-    let variant = *crate::module_parameters::g18_render_variant.value();
-    let profile = *crate::module_parameters::g18_render_profile.value();
+pub(crate) fn prepare(dev: &AsahiDrmDevice, uat: &mmu::Uat) -> Result<KBox<G18GraphicsJob>> {
+    let variant = crate::g18::params::g18_render_variant.value();
+    let profile = crate::g18::params::g18_render_profile.value();
     let options = options(variant, profile)?;
     G18GraphicsJob::from_payload(dev, uat, profile, options)
 }

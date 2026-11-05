@@ -45,7 +45,7 @@ use crate::g18::buffer::pool::{G18UmaPoolBinding, G18UmaPoolMemory};
 use crate::g18::queue::scheduler::G18SchedulerMemory;
 use crate::g18::runtime::compute::{G18ComputeMemory, G18PreparedComputeCommand};
 use crate::g18::runtime::compute_payload::G18ComputePayloadMemory;
-use crate::{driver::AsahiDevice, g18::fw::initdata as init, mmu};
+use crate::{driver::AsahiDrmDevice, g18::fw::initdata as init, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 use kernel::sync::Arc;
@@ -218,7 +218,7 @@ impl G18FirmwareMemory {
     /// until both processors stop, including when this construction fails.
     #[inline(never)]
     pub(crate) fn new_with_uat(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         uat: Arc<mmu::Uat>,
         boot_timestamp: u64,
         render: bool,
@@ -226,7 +226,7 @@ impl G18FirmwareMemory {
         if !uat.is_t8152_geometry() {
             return Err(ENODEV);
         }
-        match *crate::module_parameters::g18_compute_owner_test.value() {
+        match crate::g18::params::g18_compute_owner_test.value() {
             0 => {},
             1 => G18UmaPoolMemory::verify_shared_compute_owner(dev, &uat)?,
             _ => return Err(EINVAL),
@@ -247,7 +247,7 @@ impl G18FirmwareMemory {
             };
             // Page-table writes only. No register contents are accessed.
             registers.push(
-                uat.kernel_vm().map_io(virtual_address, physical.try_into()?, span.try_into()?,
+                uat.kernel_vm().map_io(dev.as_ref().as_ref(), virtual_address, physical.try_into()?, span.try_into()?,
                                        protection)?,
                 GFP_KERNEL,
             )?;
@@ -418,7 +418,7 @@ impl G18FirmwareMemory {
 
     pub(crate) fn uma_pool(&self) -> &G18UmaPoolMemory { &self.uma_pool }
 
-    pub(crate) fn prepare_render(&mut self, dev: &AsahiDevice,
+    pub(crate) fn prepare_render(&mut self, dev: &AsahiDrmDevice,
         job: &mut crate::g18::runtime::graphics_job::G18GraphicsJob) -> Result<G18UmaPoolBinding> {
         self.uma_pool.prepare_render_backing(dev, &self.uat, job.vm())?;
         let pool = self.uma_pool.prepare_binding()?;
@@ -428,7 +428,7 @@ impl G18FirmwareMemory {
         Ok(pool)
     }
 
-    pub(crate) fn audit_render(&mut self, dev: &AsahiDevice,
+    pub(crate) fn audit_render(&mut self, dev: &AsahiDrmDevice,
         job: &mut crate::g18::runtime::graphics_job::G18GraphicsJob) -> Result {
         let pb = job.parameter_buffer().verify_before_kick(&mut self.pbdesc)?;
         if pb.counter != 1 { return Err(EIO); }
@@ -484,7 +484,7 @@ impl G18FirmwareMemory {
     /// 0x12cdc..0x12de8 skips tag15 hardware queue setup when it is nonzero.
     /// Native macOS uses host queue programming. This first Linux submission
     /// sends tag15/tag14 and performs no host KSMFE MMIO, so choose one owner.
-    pub(crate) fn use_firmware_queue_programming(&mut self, dev: &AsahiDevice) -> Result {
+    pub(crate) fn use_firmware_queue_programming(&mut self, dev: &AsahiDrmDevice) -> Result {
         let policy = SHARED_BASE + 0x2724;
         let trace = PRIVATE_BASE + init::G18G_26A428_PRIVATE_STATUS_A[0] as u64;
         let progress = REGION_C_BASE + 0x9ac;
@@ -499,7 +499,7 @@ impl G18FirmwareMemory {
         // exact branches. Opt-in graphics diagnosis additionally enables
         // bit9 (global 0x1093e5 bit1), the native stall diagnostic category.
         // audit-g18-graphics-stall.py executes that original predicate.
-        let graphics_stall_trace = *crate::module_parameters::g18_graphics_stall_trace.value() == 1;
+        let graphics_stall_trace = crate::g18::params::g18_graphics_stall_trace.value() == 1;
         let trace_mask = if graphics_stall_trace { 0x203 } else { 3 };
         self.private.write_u32(trace, trace_mask)?;
         // b000 refresh 0x352c/0x3688 copies region-C+0x9ac into
@@ -524,7 +524,7 @@ impl G18FirmwareMemory {
 
     /// Retain a private shader/input/output VM. This does not select a process
     /// context or make its roots visible to firmware, and never queues work.
-    pub(crate) fn prepare_compute_payload(&mut self, dev: &AsahiDevice)
+    pub(crate) fn prepare_compute_payload(&mut self, dev: &AsahiDrmDevice)
         -> Result<&mut G18ComputePayloadMemory> {
         if self.compute_payload.is_some() { return Err(EBUSY); }
         self.compute_payload = Some(G18ComputePayloadMemory::load(dev, &self.uat)?);
@@ -533,14 +533,14 @@ impl G18FirmwareMemory {
 
     /// Connect the retained payload VM to the command/channel owner. Context
     /// roots remain unpublished until the complete command has been prepared.
-    pub(crate) fn bind_compute_process(&mut self, dev: &AsahiDevice) -> Result<u32> {
+    pub(crate) fn bind_compute_process(&mut self, dev: &AsahiDrmDevice) -> Result<u32> {
         let payload = self.compute_payload.as_ref().ok_or(EINVAL)?;
         self.compute.bind_process(dev, &self.uat, payload.vm())
     }
 
     /// Allocate the captured job's scratch pool while its state is unpublished.
     /// The returned register inputs are valid only with this retained owner.
-    pub(crate) fn prepare_compute_scratch(&mut self, dev: &AsahiDevice)
+    pub(crate) fn prepare_compute_scratch(&mut self, dev: &AsahiDrmDevice)
         -> Result<crate::g18::fw::uma::G18ComputeScratchPlan> {
         let plan = self.compute_payload.as_ref().ok_or(EINVAL)?.scratch_plan()?;
         self.uma_pool.prepare_compute_backing(dev, &self.uat, DYNAMIC_START..DYNAMIC_END, plan)?;
@@ -551,7 +551,7 @@ impl G18FirmwareMemory {
     /// Every step is still unpublished: the caller must subsequently bind the
     /// pool, publish the process roots, encode the owned SKSM entry and only
     /// then publish a kick. Errors leave any partial owners retained here.
-    pub(crate) fn prepare_addition(&mut self, dev: &AsahiDevice)
+    pub(crate) fn prepare_addition(&mut self, dev: &AsahiDrmDevice)
         -> Result<(G18PreparedComputeCommand, G18UmaPoolBinding)> {
         use crate::g18::fw::compute::G18ComputeCompletionState;
         use crate::g18::queue::probe::QUEUE_ID;
@@ -835,7 +835,7 @@ impl G18FirmwareMemory {
     /// rings. Records are copied before their slot is released; each drain is
     /// bounded. Returns whether an event record of the J813 recovery type was
     /// seen. This is the milestone-1 heartbeat (plan step 1.8, stage 4).
-    pub(crate) fn drain_reports(&mut self, dev: &AsahiDevice) -> Result<bool> {
+    pub(crate) fn drain_reports(&mut self, dev: &AsahiDrmDevice) -> Result<bool> {
         let mut recovery = false;
         for (role, status_a) in init::G18G_26A428_PRIVATE_STATUS_A.into_iter().enumerate() {
             for channel in 0..2 {
@@ -914,7 +914,7 @@ impl G18FirmwareMemory {
 
     /// Export after the transaction and stop requests, never while polling a
     /// GPU job. Completeness covers consumed records, not a possibly live producer.
-    pub(crate) fn log_trace_journal(&self, dev: &AsahiDevice) {
+    pub(crate) fn log_trace_journal(&self, dev: &AsahiDrmDevice) {
         for role in 0..2 {
             let journal = &self.trace_journal[role];
             let consumed = self.report_counts[role][1];
@@ -937,7 +937,7 @@ impl G18FirmwareMemory {
     }
 
     /// One-line construction summary for the bring-up log.
-    pub(crate) fn log_summary(&self, dev: &AsahiDevice) {
+    pub(crate) fn log_summary(&self, dev: &AsahiDrmDevice) {
         dev_info!(dev.as_ref(),
             "G18G initdata: roots {:#x}/{:#x} version {:#x}; shared {:#x}+{:#x}; private {:#x}+{:#x}; {} register windows; {} unproven fields\n",
             self.root(false), self.root(true), init::G18G_26A428_INITDATA_VERSION_WORD,

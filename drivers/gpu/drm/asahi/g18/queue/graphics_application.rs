@@ -4,7 +4,7 @@ use super::*;
 use crate::g18::uapi::application_runtime::Frame;
 
 impl G18GraphicsQueues {
-    pub(crate) fn prepare_application_pass(&mut self, dev: &AsahiDevice,
+    pub(crate) fn prepare_application_pass(&mut self, dev: &AsahiDrmDevice,
         pass: &G18QueuedPass, frame: Frame) -> Result {
         let before = frame.inner_before();
         if self.counters()? != [[before;3];2]

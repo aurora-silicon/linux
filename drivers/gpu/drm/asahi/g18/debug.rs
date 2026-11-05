@@ -6,7 +6,7 @@
 //! the port's extraction ledger); only module paths
 //! are rewritten.
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::module_parameters;
+use crate::g18::params;
 
 /// Set once the G18 application DRM node is live (`G18_DRM_READY`).
 static G18_DRM_LIVE: AtomicBool = AtomicBool::new(false);
@@ -21,7 +21,7 @@ pub(crate) fn g18_mark_drm_live() {
 /// recovery, refusal, wait, stall and admission lines never consult this.
 #[inline(always)]
 pub(crate) fn g18_kick_log() -> bool {
-    *module_parameters::g18_kick_log.value() != 0 || !G18_DRM_LIVE.load(Ordering::Relaxed)
+    params::g18_kick_log.value() != 0 || !G18_DRM_LIVE.load(Ordering::Relaxed)
 }
 
 /// dev_info!() for a G18 per-kick, frame-pass or per-job resource line

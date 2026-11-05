@@ -20,7 +20,7 @@ mod shared_compute;
 mod owner_probe;
 
 use crate::g18::buffer::object::MappedObject;
-use crate::{driver::AsahiDevice, g18::fw::uma as g18_uma, mmu};
+use crate::{driver::AsahiDrmDevice, g18::fw::uma as g18_uma, mmu};
 use core::ops::Range;
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
@@ -92,7 +92,7 @@ impl G18UmaPoolMemory {
     /// Separate application compute pool. The four native gallery compute
     /// captures use four two-MiB blocks; reserve their maximum observed result
     /// pair/counter for the initial bounded, non-spilling dispatch path.
-    pub(crate) fn new_application_compute(dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn new_application_compute(dev: &AsahiDrmDevice, uat: &mmu::Uat,
         high_range: Range<u64>) -> Result<Self> {
         let mut pool = Self::new_layout(dev, uat, high_range.clone(), 12,
             true, false, 0x40000000, 1, 0x200000)?;
@@ -103,7 +103,7 @@ impl G18UmaPoolMemory {
         Ok(pool)
     }
 
-    pub(crate) fn compute_application_aliases(&mut self, dev: &AsahiDevice,
+    pub(crate) fn compute_application_aliases(&mut self, dev: &AsahiDrmDevice,
         uat: &mmu::Uat, vm: &mmu::Vm) -> Result<KVec<mmu::KernelMapping>> {
         if self.render || ![0x40000000, 0x2_4000_0000, 0x3_4000_0000].contains(&self.low_bias)
             || !self.process_aliases.is_empty() {
@@ -123,7 +123,7 @@ impl G18UmaPoolMemory {
     }
 
     pub(crate) fn new(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         uat: &mmu::Uat,
         high_range: Range<u64>,
         uscs: u32,
@@ -137,7 +137,7 @@ impl G18UmaPoolMemory {
     /// which has no room for guards: with them the directory pages alone
     /// exhaust the window (stage33 H1, ENOSPC). Compute keeps its guards.
     fn new_with_guard(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         uat: &mmu::Uat,
         high_range: Range<u64>,
         uscs: u32,
@@ -147,7 +147,7 @@ impl G18UmaPoolMemory {
         Self::new_layout(dev, uat, high_range, uscs, guard, ideal, 0, 0, 0x100000)
     }
 
-    fn new_layout(dev: &AsahiDevice, uat: &mmu::Uat, high_range: Range<u64>,
+    fn new_layout(dev: &AsahiDrmDevice, uat: &mmu::Uat, high_range: Range<u64>,
         uscs: u32, guard: bool, ideal: bool, low_bias: u64, hardware_slot: u32,
         block_bytes: u64) -> Result<Self> {
         if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != 0x4000 {
@@ -289,7 +289,7 @@ impl G18UmaPoolMemory {
     /// Separate deterministic owner for H1. The firmware-memory constructor
     /// selects this INSTEAD OF the compute pool; their low windows cannot
     /// coexist. All compute constructor and backing policy remain unchanged.
-    pub(crate) fn new_render(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+    pub(crate) fn new_render(dev: &AsahiDrmDevice, uat: &mmu::Uat) -> Result<Self> {
         use crate::g18::address_map as va;
         let mut owner = Self::new_with_guard(dev, uat,
             va::GRAPHICS_UMA_HIGH..va::GRAPHICS_UMA_HIGH + 0x40000, 12, false,
@@ -301,7 +301,7 @@ impl G18UmaPoolMemory {
         Ok(owner)
     }
 
-    pub(crate) fn prepare_render_backing(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn prepare_render_backing(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         vm: &mmu::Vm) -> Result {
         use crate::{g18::address_map as va, g18::uapi::render_policy as policy};
         let blocks = policy::uma_blocks();
@@ -352,7 +352,7 @@ impl G18UmaPoolMemory {
     /// A failed allocation/alias check leaves the prior empty pool untouched.
     /// No firmware command, process root or hardware pool binding is published.
     pub(crate) fn prepare_compute_backing(
-        &mut self, dev: &AsahiDevice, uat: &mmu::Uat, high_range: Range<u64>,
+        &mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat, high_range: Range<u64>,
         plan: g18_uma::G18ComputeScratchPlan,
     ) -> Result<()> {
         if self.encoded || self.scratch_plan.is_some() { return Err(EBUSY); }
@@ -425,7 +425,7 @@ impl G18UmaPoolMemory {
     /// while these existed only in the kernel lower VM. Holes stay unmapped.
     /// Call after the backing exists and before the job's roots are published.
     pub(crate) fn alias_into_process(
-        &mut self, dev: &AsahiDevice, uat: &mmu::Uat, vm: &mmu::Vm,
+        &mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat, vm: &mmu::Vm,
     ) -> Result<()> {
         let plan = self.scratch_plan.ok_or(EINVAL)?;
         if !self.process_aliases.is_empty() { return Err(EBUSY); }
@@ -542,7 +542,7 @@ impl G18UmaPoolMemory {
     /// foreign binding or a second load.
     pub(crate) fn load_hardware_descriptor(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         table: &mut MappedObject,
         binding: G18UmaPoolBinding,
         device_config: [u64; 4],
@@ -554,7 +554,7 @@ impl G18UmaPoolMemory {
     /// Requires the caller's retired scheduler and old firmware binding check.
     /// This only replaces our own still-retained descriptor; it cannot reclaim
     /// an arbitrary occupied slot or reset an already encoded view in place.
-    pub(crate) fn replace_hardware_descriptor(&mut self, dev: &AsahiDevice,
+    pub(crate) fn replace_hardware_descriptor(&mut self, dev: &AsahiDrmDevice,
         table: &mut MappedObject, binding: G18UmaPoolBinding,
         previous: &mut Self, old: G18UmaPoolBinding, device_config: [u64; 4])
         -> Result<[u64; 16]>
@@ -572,7 +572,7 @@ impl G18UmaPoolMemory {
         self.write_hardware_descriptor(dev, table, binding, device_config, expected, true)
     }
 
-    fn write_hardware_descriptor(&mut self, dev: &AsahiDevice, table: &mut MappedObject,
+    fn write_hardware_descriptor(&mut self, dev: &AsahiDrmDevice, table: &mut MappedObject,
         binding: G18UmaPoolBinding, device_config: [u64; 4], expected: [u64; 16],
         retired_view: bool)
         -> Result<[u64; 16]>

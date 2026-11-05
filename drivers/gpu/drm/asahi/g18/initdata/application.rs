@@ -8,7 +8,7 @@ impl G18FirmwareMemory {
         self.uma_pool.application_aliases(&self.uat,vm)
     }
 
-    pub(crate) fn audit_application(&mut self, dev: &AsahiDevice, job: &mut ApplicationJob) -> Result {
+    pub(crate) fn audit_application(&mut self, dev: &AsahiDrmDevice, job: &mut ApplicationJob) -> Result {
         let frame=job.frame();let context=u32::from(job.job.context_id());
         let pb=job.job.parameter_buffer().verify_resident(&mut self.pbdesc,context,frame.generation)?;
         let uma=self.uma_pool.verify_application_descriptor(&mut self.uma,j873_sma_device_words(2,6)?,frame.generation==1)?;

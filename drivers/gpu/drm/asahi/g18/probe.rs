@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! T8152 probe: parameter gates, device preparation and the stage-10 DRM path.
+//! T8152 probe: the G18 platform driver, its parameter gates, device
+//! preparation and the stage-10 DRM path.
 //!
 //! Items copied from the J873 module-1134 driver.rs (provenance in
-//! the port's extraction ledger), then adapted to
-//! this driver's core: the DRM device is allocated with
-//! `Device::new_uninit` and its data published with `init_data` (module 1134
-//! used a no-op initializer the release path skipped), `AsahiData` is this
-//! driver's (no G17 work items, no SGX resources) and the G18 adapter is a
-//! `gpu::Gpu`. The parameter gates and every log line are unchanged.
+//! the port's extraction ledger), then adapted to this driver's core: G18 is
+//! its own platform driver, like G16; the shared probe body
+//! ([`AsahiPlatformDriver::probe_g18`]) owns the DRM device and its
+//! registration, and the G18 adapter is a `gpu::Gpu`. The parameter gates and
+//! every log line are unchanged.
 
 use kernel::{
-    c_str,
     device::Core,
     dma::{Device, DmaMask},
-    drm,
     of,
     platform,
     prelude::*,
@@ -24,9 +22,68 @@ use kernel::{
 use crate::g18::boot as g18_live_boot;
 use crate::g18::{hw, identity, regs};
 use crate::{
-    driver::{AsahiData, AsahiDevice},
+    driver::{AsahiDrmDevice, AsahiPlatformDriver, AsahiPlatformDriverData},
     gpu,
 };
+
+/// Name of the G18 platform driver.
+pub(crate) const DRIVER_NAME: &CStr = c"aurora-g18";
+
+kernel::of_device_table!(
+    OF_TABLE,
+    <Driver as platform::Driver>::IdInfo,
+    [(of::DeviceId::new(c"apple,agx-t8152"), &crate::hw::t8152::T8152)]
+);
+
+/// The G18 platform driver: the shared [`AsahiPlatformDriver`] probed through
+/// [`AsahiPlatformDriver::probe_g18`].
+pub(crate) struct Driver;
+
+/// What a bound G18 device holds until unbind.
+pub(crate) struct G18Bound<'bound> {
+    /// The firmware owner, shut down on unbind before devres releases its resources.
+    pub(crate) runtime: Arc<dyn G18Runtime>,
+    /// The DMA binding of a diagnostic stage, which has no DRM device.
+    pub(crate) binding: Option<crate::binding::Owner>,
+    /// The shared driver data of the application stage's render node.
+    pub(crate) driver: Option<AsahiPlatformDriverData<'bound>>,
+}
+
+impl platform::Driver for Driver {
+    type IdInfo = &'static crate::hw::t8152::SocConfig;
+    type Data<'bound> = G18Bound<'bound>;
+    const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    /// The firmware session is retained until reboot once started.
+    fn suppress_bind_attrs() -> bool {
+        true
+    }
+
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        let soc = *info.ok_or(ENODEV)?;
+        AsahiPlatformDriver::probe_g18(pdev, soc)
+    }
+
+    fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        this.runtime.shutdown();
+        if let Some(binding) = &this.binding {
+            binding.close();
+        }
+        if let Some(driver) = &this.driver {
+            driver.close_binding();
+        }
+    }
+}
+
+/// A started G18 session: its owner and, for the application stage, the GPU
+/// the render node is registered over.
+pub(crate) struct G18Started {
+    pub(crate) runtime: Arc<dyn G18Runtime>,
+    pub(crate) gpu: Option<Arc<dyn gpu::Gpu>>,
+}
 
 /// Owner object returned by the G18 live-boot module.
 ///
@@ -68,9 +125,9 @@ pub(crate) struct T8152Probe {
     pub(crate) registers: regs::Resources,
     /// Hardware identity, only when the SGX PSD proved the block powered.
     pub(crate) observed: Option<hw::GpuIdConfig>,
-    /// Unregistered DRM device whose data slot is still uninitialized, as
-    /// on M5. The live-boot module initializes it before any registration.
-    pub(crate) drm: ARef<AsahiDevice>,
+    /// The DRM device, not yet registered. The live-boot module allocates
+    /// its kernel objects on it; the shared probe registers it at stage 10.
+    pub(crate) drm: ARef<AsahiDrmDevice>,
 }
 
 /// Loader receipt the G18G firmware stages require. The loader writes it
@@ -84,11 +141,8 @@ const G18G_FIRMWARE_PROFILE: &[u8] = b"G18G-RTKit-3514.0.15.release\0";
 /// default. Unlike the M5 default it also skips the read-only SGX identity
 /// probe, because J873 cold-boots with the GPU PSD services idle, where an
 /// SGX read can raise an SError.
-pub(crate) fn probe_t8152(
-    pdev: &platform::Device<Core>,
-    soc: &'static hw::agx3::SocConfig,
-) -> Result<Arc<dyn G18Runtime>> {
-    let stage = *crate::module_parameters::g18_initdata_test.value();
+pub(crate) fn admit_t8152(pdev: &platform::Device<Core<'_>>) -> Result {
+    let stage = crate::g18::params::g18_initdata_test.value();
     if stage == 0 {
         dev_info!(
             pdev.as_ref(),
@@ -104,7 +158,7 @@ pub(crate) fn probe_t8152(
         );
         return Err(EINVAL);
     }
-    let variant = *crate::module_parameters::g18_compute_variant.value();
+    let variant = crate::g18::params::g18_compute_variant.value();
     if variant > 2 || (variant != 0 && stage != g18_live_boot::STAGE_COMPUTE_ADD) {
         dev_err!(
             pdev.as_ref(),
@@ -113,11 +167,11 @@ pub(crate) fn probe_t8152(
         );
         return Err(EINVAL);
     }
-    let render_variant = *crate::module_parameters::g18_render_variant.value();
-    let render_profile = *crate::module_parameters::g18_render_profile.value();
-    let sma_minimum = *crate::module_parameters::g18_sma_minimum.value();
-    let sma_ideal = *crate::module_parameters::g18_sma_ideal.value();
-    let native_barrier = *crate::module_parameters::g18_native_barrier.value();
+    let render_variant = crate::g18::params::g18_render_variant.value();
+    let render_profile = crate::g18::params::g18_render_profile.value();
+    let sma_minimum = crate::g18::params::g18_sma_minimum.value();
+    let sma_ideal = crate::g18::params::g18_sma_ideal.value();
+    let native_barrier = crate::g18::params::g18_native_barrier.value();
     if native_barrier > 1 || (native_barrier != 0 && (sma_ideal != 1 || sma_minimum != 0 ||
         stage != crate::g18::boot::render_stage::STAGE_RENDER || render_variant != 0 || render_profile != 4)) {
         dev_err!(pdev.as_ref(), "G18G: native barrier probe requires ideal SMA stage9 variant0 profile4; refused before MMIO\n");
@@ -133,19 +187,19 @@ pub(crate) fn probe_t8152(
     let minimum_probe = render_variant == 0 &&
         ((stage == crate::g18::boot::render_stage::STAGE_RENDER && render_profile == 4) ||
          (stage == g18_live_boot::STAGE_DRM && render_profile == 1));
-    let stall_trace = *crate::module_parameters::g18_graphics_stall_trace.value();
+    let stall_trace = crate::g18::params::g18_graphics_stall_trace.value();
     if stall_trace > 1 || (stall_trace != 0 && !minimum_probe) {
         dev_err!(pdev.as_ref(), "G18G: graphics stall tracing requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
         return Err(EINVAL);
     }
-    let high_vdm = *crate::module_parameters::g18_vdm_high_alias.value();
+    let high_vdm = crate::g18::params::g18_vdm_high_alias.value();
     if high_vdm > 1 || (high_vdm != 0 &&
         (stage != crate::g18::boot::render_stage::STAGE_RENDER || render_variant != 0 ||
          render_profile != 4 || sma_minimum != 1 || sma_ideal != 0 || stall_trace != 1)) {
         dev_err!(pdev.as_ref(), "G18G: high VDM alias requires stage9/profile4/variant0, minimum SMA and stall tracing; refused before MMIO\n");
         return Err(EINVAL);
     }
-    let high_ppp = *crate::module_parameters::g18_ppp_high_alias.value();
+    let high_ppp = crate::g18::params::g18_ppp_high_alias.value();
     if high_ppp > 1 || (high_ppp != 0 && high_vdm != 1) {
         dev_err!(pdev.as_ref(), "G18G: high PPP aliases require the bounded high VDM control; refused before MMIO\n");
         return Err(EINVAL);
@@ -154,7 +208,7 @@ pub(crate) fn probe_t8152(
         dev_err!(pdev.as_ref(), "G18G: SMA minimum probe requires stage9/profile4 or stage10/profile1, variant0; refused before MMIO\n");
         return Err(EINVAL);
     }
-    let usc_statistics = *crate::module_parameters::g18_usc_statistics.value();
+    let usc_statistics = crate::g18::params::g18_usc_statistics.value();
     if usc_statistics > 1 || (usc_statistics != 0 &&
         (stage != crate::g18::boot::render_stage::STAGE_RENDER || render_variant != 0)) {
         dev_err!(pdev.as_ref(), "G18G: USC statistics require the stage9 colour fixture; refused before MMIO\n");
@@ -165,52 +219,58 @@ pub(crate) fn probe_t8152(
     } else if render_variant != 0 || render_profile != 1 {
         return Err(EINVAL);
     }
-    let admit_msaa4 = *crate::module_parameters::g18_admit_msaa4.value();
+    let admit_msaa4 = crate::g18::params::g18_admit_msaa4.value();
     if admit_msaa4 > 1 || (admit_msaa4 != 0 && stage != g18_live_boot::STAGE_DRM) {
         dev_err!(pdev.as_ref(), "G18G: g18_admit_msaa4={} needs 0, or 1 with g18_initdata_test=10; refused before MMIO\n", admit_msaa4);
         return Err(EINVAL);
     }
-    if stage == g18_live_boot::STAGE_DRM {
-        if *crate::module_parameters::g18_admit_compute.value() > 1 {return Err(EINVAL);}
-        return probe_t8152_drm(pdev, soc, stage);
+    if stage == g18_live_boot::STAGE_DRM && crate::g18::params::g18_admit_compute.value() > 1 {
+        return Err(EINVAL);
     }
-    let probe = prepare_t8152_device(pdev, soc, stage)?;
-    g18_live_boot_start(pdev, probe)
+    Ok(())
 }
 
-/// Register the G18 DRM render node over a started G18 session.
+/// Start the stage that [`admit_t8152`] admitted, on the unregistered `drm`.
+pub(crate) fn probe_t8152(
+    pdev: &platform::Device<Core<'_>>,
+    drm: &AsahiDrmDevice,
+    soc: &'static hw::agx3::SocConfig,
+) -> Result<G18Started> {
+    let stage = crate::g18::params::g18_initdata_test.value();
+    if stage == g18_live_boot::STAGE_DRM {
+        return probe_t8152_drm(pdev, drm, soc, stage);
+    }
+    let probe = prepare_t8152_device(pdev, drm, soc, stage)?;
+    Ok(G18Started { runtime: g18_live_boot_start(pdev, probe)?, gpu: None })
+}
+
+/// Start the G18 session the render node is registered over.
 fn probe_t8152_drm(
-    pdev: &platform::Device<Core>,
+    pdev: &platform::Device<Core<'_>>,
+    drm: &AsahiDrmDevice,
     soc: &'static hw::agx3::SocConfig,
     stage: u32,
-) -> Result<Arc<dyn G18Runtime>> {
-    let mut probe = prepare_t8152_device(pdev, soc, stage)?;
-    let drm = probe.drm.clone();
+) -> Result<G18Started> {
+    let mut probe = prepare_t8152_device(pdev, drm, soc, stage)?;
     let observed = probe.observed.take();
     let (owner, runtime) = g18_live_boot::start_drm(pdev, probe)?;
     let config = crate::g18::drm::G18DrmConfig {
-        admit_compute: *crate::module_parameters::g18_admit_compute.value() != 0,
-        admit_msaa4: *crate::module_parameters::g18_admit_msaa4.value() != 0,
+        admit_compute: crate::g18::params::g18_admit_compute.value() != 0,
+        admit_msaa4: crate::g18::params::g18_admit_msaa4.value() != 0,
         admit_graphics_scratch:
-            *crate::module_parameters::g18_admit_graphics_scratch.value() != 0,
+            crate::g18::params::g18_admit_graphics_scratch.value() != 0,
     };
     let gpu: Arc<dyn gpu::Gpu> = Arc::new(
         crate::g18::drm::G18DrmGpu::new(runtime, observed.as_ref(), config)?,
         GFP_KERNEL,
     )?;
-    let data = try_pin_init!(AsahiData { gpu, pdev: pdev.into(), resources: None });
-    // SAFETY: prepare_t8152_device leaves this data slot uninitialized. This
-    // is its sole initialization, before registration exposes file operations.
-    unsafe { drm.init_data(data)? };
-    (*drm).gpu.init()?;
-    crate::g18::drm::note_g18_parent(pdev.as_ref().as_raw());
-    drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
-    dev_info!(pdev.as_ref(), "G18_DRM registered render node (asahi, apple,agx-t8152)\n");
-    Ok(owner)
+    gpu.init()?;
+    Ok(G18Started { runtime: owner, gpu: Some(gpu) })
 }
 
 fn prepare_t8152_device(
-    pdev: &platform::Device<Core>,
+    pdev: &platform::Device<Core<'_>>,
+    drm: &AsahiDrmDevice,
     soc: &'static hw::agx3::SocConfig,
     stage: u32,
 ) -> Result<T8152Probe> {
@@ -240,7 +300,7 @@ fn prepare_t8152_device(
     let firmware_profile_admitted = match of::chosen() {
         Some(chosen) => {
             let profile: Result<KVec<u8>> =
-                chosen.get_property(c_str!("aurora,g18g-gpu-firmware-profile"));
+                chosen.get_property(c"aurora,g18g-gpu-firmware-profile");
             matches!(profile, Ok(profile) if profile.as_slice() == G18G_FIRMWARE_PROFILE)
         }
         None => false,
@@ -299,11 +359,9 @@ fn prepare_t8152_device(
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(soc.uat_oas)?)? };
     }
 
-    // This device is deliberately unregistered and its data slot stays
-    // uninitialized until the stage-10 DRM path calls `init_data`; the DRM
-    // release path drops only initialized data.
-    // SAFETY: nothing reads the data slot before `init_data`.
-    let drm: ARef<AsahiDevice> = unsafe { drm::device::Device::new_uninit(pdev.as_ref())? };
+    // The device stays unregistered until the shared probe registers it at
+    // stage 10; diagnostic stages never register it.
+    let drm: ARef<AsahiDrmDevice> = drm.into();
     Ok(T8152Probe {
         soc,
         identity,
@@ -332,7 +390,7 @@ fn prepare_t8152_device(
 /// On success the driver keeps the owner and calls
 /// [`G18Runtime::shutdown`] on unbind.
 fn g18_live_boot_start(
-    pdev: &platform::Device<Core>,
+    pdev: &platform::Device<Core<'_>>,
     probe: T8152Probe,
 ) -> Result<Arc<dyn G18Runtime>> {
     g18_live_boot::start(pdev, probe)

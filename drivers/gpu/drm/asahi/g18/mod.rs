@@ -18,6 +18,7 @@ pub(crate) mod fixture;
 pub(crate) mod fw;
 #[allow(dead_code)]
 pub(crate) mod initdata;
+pub(crate) mod params;
 pub(crate) mod queue;
 pub(crate) mod runtime;
 pub(crate) mod uapi;

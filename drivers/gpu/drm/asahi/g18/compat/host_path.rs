@@ -718,7 +718,7 @@ static PCT_E_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static MASK_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_host_path"
-    } else { c"asahi.g17p_host_path" }),
+    } else { c"aurora.g17p_host_path" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -731,7 +731,7 @@ static MASK_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
 static PCT_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_feed_perf_pct"
-    } else { c"asahi.g17p_feed_perf_pct" }),
+    } else { c"aurora.g17p_feed_perf_pct" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -744,7 +744,7 @@ static PCT_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
 static DEPTH_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_early_depth"
-    } else { c"asahi.g17p_early_depth" }),
+    } else { c"aurora.g17p_early_depth" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -757,7 +757,7 @@ static DEPTH_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
 static PCT_P_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_feed_perf_pct_p"
-    } else { c"asahi.g17p_feed_perf_pct_p" }),
+    } else { c"aurora.g17p_feed_perf_pct_p" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -770,7 +770,7 @@ static PCT_P_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
 static PCT_E_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_feed_perf_pct_e"
-    } else { c"asahi.g17p_feed_perf_pct_e" }),
+    } else { c"aurora.g17p_feed_perf_pct_e" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]

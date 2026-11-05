@@ -142,8 +142,8 @@ unsafe extern "C" fn set(value: *const core::ffi::c_char, _: *const bindings::ke
     let arg = &command[..len];
     match arg {
         b"1" | b"1\n" => {
-            if *crate::module_parameters::g17p_completion_trace.value() != 0
-                || *crate::module_parameters::g17p_trace_depth.value() != 0 { return -22; }
+            if crate::g18::params::g17p_completion_trace.value() != 0
+                || crate::g18::params::g17p_trace_depth.value() != 0 { return -22; }
             if STATE.load(Ordering::Relaxed) != 0 { return -16; }
             NEXT.store(0, Ordering::Relaxed);
             STATE.store(1, Ordering::Relaxed);
@@ -179,7 +179,7 @@ static OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_timing_buffer"
-    } else { c"asahi.g17p_timing_buffer" }),
+    } else { c"aurora.g17p_timing_buffer" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -292,7 +292,7 @@ static COMPLETION_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static COMPLETION_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_completion_buffer"
-    } else { c"asahi.g17p_completion_buffer" }),
+    } else { c"aurora.g17p_completion_buffer" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -472,7 +472,7 @@ static PEEK_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static PEEK_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_fw_peek"
-    } else { c"asahi.g17p_fw_peek" }),
+    } else { c"aurora.g17p_fw_peek" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -527,7 +527,7 @@ static GRID_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static GRID_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_grid_peek"
-    } else { c"asahi.g17p_grid_peek" }),
+    } else { c"aurora.g17p_grid_peek" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -596,7 +596,7 @@ static GPC_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static GPC_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_gpc_sample"
-    } else { c"asahi.g17p_gpc_sample" }),
+    } else { c"aurora.g17p_gpc_sample" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -612,7 +612,7 @@ static DIAG_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static DIAG_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_diag_knobs"
-    } else { c"asahi.g17p_diag_knobs" }),
+    } else { c"aurora.g17p_diag_knobs" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -731,7 +731,7 @@ static MSGLOG_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static MSGLOG_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_msglog"
-    } else { c"asahi.g17p_msglog" }),
+    } else { c"aurora.g17p_msglog" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]
@@ -919,7 +919,7 @@ static PSTATE_OPS: bindings::kernel_param_ops = bindings::kernel_param_ops {
 static PSTATE_PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
     name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
         c"g17p_stats_pstate"
-    } else { c"asahi.g17p_stats_pstate" }),
+    } else { c"aurora.g17p_stats_pstate" }),
     #[cfg(MODULE)]
     mod_: unsafe { core::ptr::from_ref(&bindings::__this_module).cast_mut() },
     #[cfg(not(MODULE))]

@@ -9,7 +9,7 @@
 use crate::g18::buffer::object::MappedObject;
 use crate::g18::buffer::pool::G18UmaPoolBinding;
 use crate::g18::runtime::compute::G18PreparedComputeCommand;
-use crate::{driver::AsahiDevice, mmu};
+use crate::{driver::AsahiDrmDevice, mmu};
 use core::sync::atomic::{fence, Ordering};
 use kernel::{c_str, io, prelude::*};
 
@@ -44,8 +44,8 @@ unsafe impl Send for FirmwareDataView {}
 unsafe impl Sync for FirmwareDataView {}
 
 impl FirmwareDataView {
-    fn new(dev: &AsahiDevice) -> Result<Self> {
-        let resource = dev.as_ref().of_node().ok_or(EINVAL)?
+    fn new(dev: &AsahiDrmDevice) -> Result<Self> {
+        let resource = dev.as_ref().as_ref().of_node().ok_or(EINVAL)?
             .reserved_mem_region_to_resource_byname(c_str!("gfx-data"))?;
         if resource.size() != DATA_SIZE as u64 || resource.start() < 0x100_0000_0000
             || resource.start() & 0x3fff != 0
@@ -109,7 +109,7 @@ fn put64(out: &mut [u8], offset: usize, value: u64) {
 }
 
 impl G18QueueProbe {
-    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, bind_scheduler: bool) -> Result<Self> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, uat: &mmu::Uat, bind_scheduler: bool) -> Result<Self> {
         if !uat.is_t8152_geometry() { return Err(ENODEV); }
         let mut entry = MappedObject::new_wc_at(dev, uat.kernel_vm(), ENTRY_HIGH,
             ENTRY_SIZE, mmu::PROT_FW_PRIV_RW)?;

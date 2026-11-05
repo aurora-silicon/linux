@@ -42,7 +42,7 @@ impl ApplicationJob {
     pub(crate) fn traced(&self) -> bool {self.client_frames<=3}
 
     #[inline(never)]
-    pub(crate) fn prepare(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn prepare(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         vm: &mmu::Vm, render: &G18ApplicationRender) -> Result {
         if !self.retired {return Err(EBUSY);}
         let frame=Frame::new(self.generation.checked_add(1).ok_or(EOVERFLOW)?).ok_or(EOVERFLOW)?;
@@ -120,7 +120,7 @@ impl ApplicationJob {
     }
 
     #[inline(never)]
-    fn encode_application(&mut self, dev: &AsahiDevice, frame: Frame) -> Result {
+    fn encode_application(&mut self, dev: &AsahiDrmDevice, frame: Frame) -> Result {
         let inputs=self.application_policy(frame)?;
         self.job.encode(dev,&inputs)
     }
@@ -154,7 +154,7 @@ impl ApplicationJob {
         let mut pass=self.job.pass()?;pass.stamps=[self.frame().stamp();2];Ok(pass)
     }
 
-    pub(crate) fn audit(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn audit(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         pb: &G18PbReadback, uma: &[u64;16], mut pages: usize) -> Result {
         let frame=self.frame();let pass=self.pass()?;
         if frame.generation==1 {self.job.queues.audit_before_pass(uat,&pass)?;}

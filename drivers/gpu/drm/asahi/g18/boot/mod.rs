@@ -5,7 +5,7 @@
 //! Plan milestone M1 step 1.8 plus the M0 probes. Derived from
 //! `m5_live_boot.rs`; the M5 (T8142) path is not touched by anything here.
 //!
-//! The stage comes from `asahi.g18_initdata_test`. The driver's T8152 probe
+//! The stage comes from `aurora.g18_initdata_test`. The driver's T8152 probe
 //! gate ([`crate::driver`]) has already sampled the three GPU PSD services,
 //! mapped SGX and, only if the sgx PSD proved the block powered, read the ID
 //! registers. It hands everything over in a [`T8152Probe`].
@@ -59,7 +59,7 @@
 //!   crashlog header and dumps what it finds.
 
 use crate::{
-    driver::AsahiDevice,
+    driver::AsahiDrmDevice,
     g18::probe::{G18Runtime, T8152Probe},
     g18::initdata::G18FirmwareMemory,
     g18::runtime::compute::G18PreparedComputeCommand,
@@ -76,10 +76,8 @@ use core::{
 use kernel::{
     bindings, c_str,
     device::Core,
-    devres::Devres,
     error::{from_err_ptr, to_result},
-    io::{mem::IoMem, Io, Mmio, MmioRaw},
-    iosys_map::IoSysMapRef,
+    io::{mem::DevresIoMem, Io, IoSysMap, Mmio, MmioRaw, Region},
     macros::vtable,
     new_mutex, platform,
     prelude::*,
@@ -395,11 +393,11 @@ const fn psd_resource_name(service: regs::T8152PsdService) -> &'static CStr {
 /// 90..93 call it.
 struct PsdBlock {
     service: regs::T8152PsdService,
-    io: Pin<KBox<Devres<IoMem<0>>>>,
+    io: DevresIoMem,
 }
 
 impl PsdBlock {
-    fn map(pdev: &platform::Device<Core>, service: regs::T8152PsdService) -> Result<Self> {
+    fn map(pdev: &platform::Device<Core<'_>>, service: regs::T8152PsdService) -> Result<Self> {
         let name = psd_resource_name(service);
         let resource = pdev.resource_by_name(name).ok_or(ENODEV)?;
         if resource.start() != service.physical_base() || resource.size() != PSD_BLOCK_SIZE {
@@ -415,7 +413,7 @@ impl PsdBlock {
             return Err(EINVAL);
         }
         let request = pdev.io_request_by_name(name).ok_or(ENODEV)?;
-        let io = KBox::pin_init(request.iomap(), GFP_KERNEL)?;
+        let io = request.iomap()?.into_devres()?;
         Ok(Self { service, io })
     }
 
@@ -463,7 +461,7 @@ fn psd_line(sample: &regs::T8152PsdSample) -> (u32, u32, u32, u32, &'static str)
     )
 }
 
-fn log_psd(pdev: &platform::Device<Core>, label: &str, sample: &regs::T8152PsdSample) {
+fn log_psd(pdev: &platform::Device<Core<'_>>, label: &str, sample: &regs::T8152PsdSample) {
     let (id, state, power, ack, verdict) = psd_line(sample);
     dev_info!(
         pdev.as_ref(),
@@ -478,7 +476,7 @@ fn log_psd(pdev: &platform::Device<Core>, label: &str, sample: &regs::T8152PsdSa
 }
 
 /// Fresh read-only samples of all three GPU services.
-fn read_all_psd(pdev: &platform::Device<Core>) -> Result<[regs::T8152PsdSample; 3]> {
+fn read_all_psd(pdev: &platform::Device<Core<'_>>) -> Result<[regs::T8152PsdSample; 3]> {
     let mut samples = [regs::T8152PsdSample {
         service: regs::T8152PsdService::Sgx,
         state: 0,
@@ -613,7 +611,7 @@ impl G18Provider {
     /// word when the block is not powered. Call only after [`Self::validate`].
     fn postoffice_status(
         &self,
-        pdev: &platform::Device<Core>,
+        pdev: &platform::Device<Core<'_>>,
     ) -> Result<(regs::T8152PsdSample, Option<u32>)> {
         let psd = regs::t8152_read_psd(pdev, self.role.psd())?;
         if !psd.powered() {
@@ -629,10 +627,10 @@ impl G18Provider {
         if window == 0 || removing {
             return Err(ENODEV);
         }
-        let raw = MmioRaw::<POSTOFFICE_STATUS_WINDOW>::new(window, POSTOFFICE_STATUS_WINDOW)?;
+        let raw = MmioRaw::<Region<POSTOFFICE_STATUS_WINDOW>>::new_region(window, POSTOFFICE_STATUS_WINDOW)?;
         // SAFETY: `raw` lies inside the provider's 0x80-byte window and
         // covers exactly the single status read below.
-        let status = unsafe { Mmio::from_raw(&raw) }.relaxed().read32(POSTOFFICE_STATUS);
+        let status = unsafe { Mmio::from_raw(raw) }.relaxed().read32(POSTOFFICE_STATUS);
         Ok((psd, Some(status)))
     }
 }
@@ -877,7 +875,7 @@ impl Drop for PhysMap {
 
 /// Per-role callback state. Callbacks only publish atomics and log.
 struct G18RoleState {
-    dev: ARef<AsahiDevice>,
+    dev: ARef<AsahiDrmDevice>,
     role: G18Role,
     /// The role's `__DATA` reservation (physical base, size).
     data: (u64, u64),
@@ -915,7 +913,7 @@ impl G18RoleState {
     /// Scan one reservation every CRASHLOG_SCAN_STEP for a `CLHE` crashlog
     /// and dump what it finds. Read-only mapping. Returns the count found.
     fn scan_crashlog(&self, label: &str, region: (u64, u64), reason: &str) -> u32 {
-        let dev: &kernel::device::Device = self.dev.as_ref();
+        let dev: &kernel::device::Device = self.dev.as_ref().as_ref();
         let name = self.role.name();
         let (base, size) = region;
         let Ok(size) = usize::try_from(size) else {
@@ -970,7 +968,7 @@ impl rtkit::Buffer for G18NoRtkitBuffer {
         Err(ENOTSUPP)
     }
 
-    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>> {
+    fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
         Err(ENOTSUPP)
     }
 }
@@ -1028,7 +1026,7 @@ impl rtkit::Operations for G18RtkitOps {
         match crashlog {
             Some(bytes) if !bytes.is_empty() => {
                 data.crash_dumped.store(true, Ordering::Release);
-                dump_crashlog(data.dev.as_ref(), data.role.name(), "rtkit", bytes);
+                dump_crashlog(data.dev.as_ref().as_ref(), data.role.name(), "rtkit", bytes);
             }
             // Firmware-owned buffer: the RTKit core logged its DVA.
             _ => data.dump_data_crashlog("rtkit crash callback, firmware-owned buffer"),
@@ -1056,7 +1054,7 @@ struct G18Session {
     application_job: Option<KBox<crate::g18::runtime::graphics_job::application::ApplicationJob>>,
     uat: Arc<mmu::Uat>,
     _registers: regs::Resources,
-    dev: ARef<AsahiDevice>,
+    dev: ARef<AsahiDrmDevice>,
     stage: u32,
 }
 
@@ -1072,7 +1070,7 @@ fn cntvct() -> u64 {
 
 impl G18Session {
     fn device(&self) -> &kernel::device::Device {
-        self.dev.as_ref()
+        self.dev.as_ref().as_ref()
     }
 
     fn any_crashed(&self) -> bool {
@@ -1116,7 +1114,7 @@ impl G18Session {
                     Err(error) => failure = Some(error),
                 }
             }
-            log_cpu_state(self.dev.as_ref(), role, "after-stop", &self.roles[role.index()].provider);
+            log_cpu_state(self.dev.as_ref().as_ref(), role, "after-stop", &self.roles[role.index()].provider);
         }
         failure.map_or(Ok(()), Err)
     }
@@ -1145,8 +1143,8 @@ impl G18Session {
         // Defense in depth for any future caller that bypasses driver probe.
         if self.stage == STAGE_RENDER {
             crate::g18::boot::render_stage::admit(self.device(),
-                *crate::module_parameters::g18_render_variant.value(),
-                *crate::module_parameters::g18_render_profile.value())?;
+                crate::g18::params::g18_render_variant.value(),
+                crate::g18::params::g18_render_profile.value())?;
         }
         self.boot_rtkit()?;
         if self.stage == STAGE_RTKIT {
@@ -1188,7 +1186,7 @@ impl G18Session {
         for role in G18Role::START_ORDER {
             let dev = self.dev.clone();
             let slot = &mut self.roles[role.index()];
-            log_cpu_state(dev.as_ref(), role, "before-start", &slot.provider);
+            log_cpu_state(dev.as_ref().as_ref(), role, "before-start", &slot.provider);
             // The provider re-reads the role's PSD block and refuses an
             // unpowered block; it refuses without the CPU-control approval.
             let (control, _) = slot.provider.cpu_state()?;
@@ -1198,7 +1196,7 @@ impl G18Session {
                 dev_info!(dev.as_ref(), "G18_ASC {} adopted: RUN already set, start skipped\n", role.name());
             }
             slot.started = true;
-            log_cpu_state(dev.as_ref(), role, "after-start", &slot.provider);
+            log_cpu_state(dev.as_ref().as_ref(), role, "after-start", &slot.provider);
             let started = Instant::<Monotonic>::now();
             let booted = Pin::new(&mut slot.rtkit).boot();
             let elapsed = started.elapsed().as_micros_ceil();
@@ -1241,7 +1239,7 @@ impl G18Session {
             fsleep(Delta::from_millis(10));
         }
         for role in G18Role::ALL {
-            log_cpu_state(self.dev.as_ref(), role, "after-syslog-window", &self.roles[role.index()].provider);
+            log_cpu_state(self.dev.as_ref().as_ref(), role, "after-syslog-window", &self.roles[role.index()].provider);
             dev_info!(
                 self.device(),
                 "G18_STAGE2 role={} non-system messages={}\n",
@@ -1266,7 +1264,7 @@ impl G18Session {
                 self.render_job.as_mut().ok_or(EIO)?)?;
         }
         if matches!(self.stage, STAGE_QUEUE_REGISTER | STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD)
-            || (self.stage == STAGE_DRM && *crate::module_parameters::g18_admit_compute.value() == 1) {
+            || (self.stage == STAGE_DRM && crate::g18::params::g18_admit_compute.value() == 1) {
             self.queue_probe = Some(G18QueueProbe::new(&self.dev, &self.uat,
                 matches!(self.stage, STAGE_SCHEDULER_BIND | STAGE_POOL_BIND | STAGE_COMPUTE_ADD | STAGE_DRM))?);
         }
@@ -1511,7 +1509,7 @@ impl G18Session {
                 dev_info!(self.dev.as_ref(),
                     "G18_COMPUTE completion outer={:?} inner={:?} stamps={:x?} times={:x?} event_masks={:x?} scheduler={:?} output={:?}\n",
                     outer, inner, completion.stamps, completion.timestamps, masks, scheduler, output);
-                if *crate::module_parameters::g18_compute_variant.value() == 2 {
+                if crate::g18::params::g18_compute_variant.value() == 2 {
                     let pixels = memory.triangle_output()?;
                     dev_info!(self.dev.as_ref(), "G18_COMPUTE_TRIANGLE output={:?}\n", pixels);
                     if !pixels.passed() { return Err(EIO); }
@@ -1520,7 +1518,7 @@ impl G18Session {
                     return Ok(());
                 }
                 // g18_compute_variant=1 dispatches nothing: every output must stay poisoned.
-                let empty = *crate::module_parameters::g18_compute_variant.value() == 1;
+                let empty = crate::g18::params::g18_compute_variant.value() == 1;
                 let expected = if empty { (0, 4096) } else { (4096, 0) };
                 if output.checked != 4096 || (output.correct, output.untouched) != expected {
                     if empty {
@@ -1608,7 +1606,7 @@ impl G18Session {
                 dev_info!(self.dev.as_ref(), "G18_RENDER_PIXELS sha256={:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x} background={} poison={}\n",
                     pixels.0[0],pixels.0[1],pixels.0[2],pixels.0[3],pixels.0[4],pixels.0[5],pixels.0[6],pixels.0[7],pixels.1,pixels.2);
                 self.check_faults("render pixels")?;
-                dev_info!(self.device(), "G18_RENDER_H1_PASS variant={} completion=independent pixels=exact owners=retained\n",*crate::module_parameters::g18_render_variant.value());
+                dev_info!(self.device(), "G18_RENDER_H1_PASS variant={} completion=independent pixels=exact owners=retained\n",crate::g18::params::g18_render_variant.value());
                 return Ok(());
             }
             if step%1000==999 {
@@ -1686,8 +1684,8 @@ impl G18Runtime for G18Owner {
 // Stage 1: read-only probe
 // ---------------------------------------------------------------------------
 
-fn stage_read_only(pdev: &platform::Device<Core>, probe: &T8152Probe) {
-    let dev: &kernel::device::Device<Core> = pdev.as_ref();
+fn stage_read_only(pdev: &platform::Device<Core<'_>>, probe: &T8152Probe) {
+    let dev: &kernel::device::Device<Core<'_>> = pdev.as_ref();
     for sample in probe.psd.iter() {
         log_psd(pdev, "stage1 (probe sample)", sample);
     }
@@ -1740,7 +1738,7 @@ fn stage_read_only(pdev: &platform::Device<Core>, probe: &T8152Probe) {
 
 /// Native PSD::getPsdAck order: poll ACK, then read STATE once. STATE
 /// clears ACK on J873; reading it while waiting loses the acknowledgement.
-fn wait_psd_state(pdev: &platform::Device<Core>, block: &PsdBlock, target: u32) -> Result<regs::T8152PsdSample> {
+fn wait_psd_state(pdev: &platform::Device<Core<'_>>, block: &PsdBlock, target: u32) -> Result<regs::T8152PsdSample> {
     let started = Instant::<Monotonic>::now();
     for poll in 0..PSD_POLLS {
         if let Some(sample) = block.acknowledged_sample()? {
@@ -1776,7 +1774,7 @@ fn claim_psd_request(dev: &kernel::device::Device, bit: u32) -> Result {
     Ok(())
 }
 
-fn map_psd_blocks(pdev: &platform::Device<Core>) -> Result<KVec<PsdBlock>> {
+fn map_psd_blocks(pdev: &platform::Device<Core<'_>>) -> Result<KVec<PsdBlock>> {
     let mut blocks = KVec::new();
     for service in regs::T8152PsdService::ALL {
         blocks.push(PsdBlock::map(pdev, service)?, GFP_KERNEL)?;
@@ -1793,8 +1791,8 @@ fn map_psd_blocks(pdev: &platform::Device<Core>) -> Result<KVec<PsdBlock>> {
 /// left as requested and the power state is reported UNKNOWN, to be
 /// restored by stage 93 under its own approval. The SGX ID is read only if
 /// sgx then proves powered.
-fn stage_psd_power_on(pdev: &platform::Device<Core>, probe: &T8152Probe, service: regs::T8152PsdService) -> Result {
-    let dev: &kernel::device::Device<Core> = pdev.as_ref();
+fn stage_psd_power_on(pdev: &platform::Device<Core<'_>>, probe: &T8152Probe, service: regs::T8152PsdService) -> Result {
+    let dev: &kernel::device::Device<Core<'_>> = pdev.as_ref();
     dev_warn!(dev, "G18_PSD stage {}: PMGR2 PSD power-on of service {} only (REQUIRES USER APPROVAL)\n",
         probe.stage, service.service_id());
     let blocks = map_psd_blocks(pdev)?;
@@ -1855,8 +1853,8 @@ fn stage_psd_power_on(pdev: &platform::Device<Core>, probe: &T8152Probe, service
 /// polling ACK before STATE. Refuses if a service is neither active nor
 /// idle, or if a firmware stage ran this boot. Stops at the first
 /// failure and reports the power state UNKNOWN.
-fn stage_psd_restore_idle(pdev: &platform::Device<Core>) -> Result {
-    let dev: &kernel::device::Device<Core> = pdev.as_ref();
+fn stage_psd_restore_idle(pdev: &platform::Device<Core<'_>>) -> Result {
+    let dev: &kernel::device::Device<Core<'_>> = pdev.as_ref();
     dev_warn!(dev, "G18_PSD stage 93: PMGR2 PSD idle restore (REQUIRES USER APPROVAL)\n");
     let blocks = map_psd_blocks(pdev)?;
     let mut samples = [regs::T8152PsdSample { service: regs::T8152PsdService::Sgx, state: 0, ack: 0 }; 3];
@@ -1901,8 +1899,8 @@ fn stage_psd_restore_idle(pdev: &platform::Device<Core>) -> Result {
 // Stages 2..6
 // ---------------------------------------------------------------------------
 
-fn prepare_firmware_session(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Retained> {
-    let dev: &kernel::device::Device<Core> = pdev.as_ref();
+fn prepare_firmware_session(pdev: &platform::Device<Core<'_>>, probe: T8152Probe) -> Result<Retained> {
+    let dev: &kernel::device::Device<Core<'_>> = pdev.as_ref();
     let stage = probe.stage;
     dev_warn!(dev, "G18 stage {}: starts the GPU ASC CPUs (REQUIRES USER APPROVAL)\n", stage);
     if !probe.firmware_profile_admitted {
@@ -1997,7 +1995,7 @@ fn prepare_firmware_session(pdev: &platform::Device<Core>, probe: T8152Probe) ->
             crash_dumped: AtomicBool::new(false),
             messages: AtomicU32::new(0),
         }, GFP_KERNEL)?;
-        let rtkit = rtkit::RtKit::<G18RtkitOps>::new_g17p(drm.as_ref(), None, role.index(), state.clone())
+        let rtkit = rtkit::RtKit::<G18RtkitOps>::new_g17p(drm.as_ref().as_ref(), None, role.index(), state.clone())
             .map_err(|error| no_probe_defer(dev, role.name(), "RTKit mailbox", error))?;
         let provider = providers.next().ok_or(EINVAL)?;
         slots.push(G18RoleSlot { role, provider, rtkit, started: false }, GFP_KERNEL)?;
@@ -2027,12 +2025,16 @@ fn prepare_firmware_session(pdev: &platform::Device<Core>, probe: T8152Probe) ->
     // module stays loaded so RTKit callbacks keep valid code until reboot.
     G18_FIRMWARE_ATTEMPTED.store(true, Ordering::Release);
     // SAFETY: THIS_MODULE is this module; the reference is never dropped.
-    unsafe { bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
+    unsafe {
+        bindings::__module_get(
+            <crate::DriverModule as kernel::ModuleMetadata>::THIS_MODULE.as_ptr(),
+        )
+    };
     Ok(Retained(Some(session)))
 }
 
-fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Arc<dyn G18Runtime>> {
-    let dev: &kernel::device::Device<Core> = pdev.as_ref();
+fn stage_firmware(pdev: &platform::Device<Core<'_>>, probe: T8152Probe) -> Result<Arc<dyn G18Runtime>> {
+    let dev: &kernel::device::Device<Core<'_>> = pdev.as_ref();
     let stage = probe.stage;
     let mut retained = prepare_firmware_session(pdev, probe)?;
     if stage == STAGE_RENDER {
@@ -2107,7 +2109,7 @@ fn stage_firmware(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Ar
 
 /// Entry point called by the driver's T8152 probe gate for
 /// `g18_initdata_test >= 1`.
-pub(crate) fn start(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<Arc<dyn G18Runtime>> {
+pub(crate) fn start(pdev: &platform::Device<Core<'_>>, probe: T8152Probe) -> Result<Arc<dyn G18Runtime>> {
     let result = match probe.stage {
         STAGE_READ_ONLY => {
             stage_read_only(pdev, &probe);
@@ -2125,6 +2127,6 @@ pub(crate) fn start(pdev: &platform::Device<Core>, probe: T8152Probe) -> Result<
         _ => Err(EINVAL),
     };
     // Belt and braces: no stage may ever defer the GPU probe.
-    let dev: &kernel::device::Device<Core> = pdev.as_ref();
+    let dev: &kernel::device::Device<Core<'_>> = pdev.as_ref();
     result.map_err(|error| no_probe_defer(dev, "GPU", "stage", error))
 }

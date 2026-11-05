@@ -16,7 +16,17 @@ use core::ops::Range;
 use kernel::prelude::*;
 
 use super::live::g17p_live_write_u32;
-use crate::{driver::AsahiDevice, gem, mmu};
+use crate::{driver::AsahiDrmDevice, gem, mmu};
+
+/// Zero a new kernel object through its cached CPU mapping.
+fn zero_object(object: &mut gem::ObjectRef) -> Result {
+    let size = object.size();
+    let vmap = object.vmap()?;
+    // SAFETY: the VMap covers the object's complete allocation of `size` bytes,
+    // and the new object is not yet visible to the GPU or another CPU user.
+    unsafe { core::ptr::write_bytes(vmap.addr.cast::<u8>(), 0, size) };
+    Ok(())
+}
 
 pub(crate) struct MappedObject {
     /// Present for an owning GPU mapping and absent for a subview retained by
@@ -33,11 +43,11 @@ pub(crate) struct MappedObject {
 
 impl MappedObject {
     pub(crate) fn new_wc_in_range_with_guards(
-        dev: &AsahiDevice, vm: &mmu::Vm, range: Range<u64>, size: usize,
+        dev: &AsahiDrmDevice, vm: &mmu::Vm, range: Range<u64>, size: usize,
         alignment: u64, prot: mmu::Prot, guard_pages: usize,
     ) -> Result<Self> {
         let mut object = gem::new_kernel_object_wc(dev, size)?;
-        object.vmap()?.memset(0);
+        zero_object(&mut object)?;
         let mapping = vm.map_in_range_with_guards(&object.gem, 0..object.size(),
             alignment, range, prot, guard_pages)?;
         let iova = mapping.iova();
@@ -53,7 +63,7 @@ impl MappedObject {
 
 
     pub(crate) fn new_wc_in_range(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         range: Range<u64>,
         size: usize,
@@ -61,7 +71,7 @@ impl MappedObject {
         prot: mmu::Prot,
     ) -> Result<Self> {
         let mut object = gem::new_kernel_object_wc(dev, size)?;
-        object.vmap()?.memset(0);
+        zero_object(&mut object)?;
         let mapping = object.map_into_range(vm, range, alignment, prot, true)?;
         let iova = mapping.iova();
         Ok(Self {
@@ -75,14 +85,14 @@ impl MappedObject {
     }
 
     pub(crate) fn new_wc_at(
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         address: u64,
         size: usize,
         prot: mmu::Prot,
     ) -> Result<Self> {
         let mut object = gem::new_kernel_object_wc(dev, size)?;
-        object.vmap()?.memset(0);
+        zero_object(&mut object)?;
         let mapping = object.map_at(vm, address, prot, false)?;
         let iova = mapping.iova();
         Ok(Self {
@@ -103,7 +113,7 @@ impl MappedObject {
     /// backing; this helper does not synchronize.
     pub(crate) fn regrow_wc_at(
         &mut self,
-        dev: &AsahiDevice,
+        dev: &AsahiDrmDevice,
         vm: &mmu::Vm,
         address: u64,
         size: usize,
@@ -112,7 +122,7 @@ impl MappedObject {
             return Ok(());
         }
         let mut object = gem::new_kernel_object_wc(dev, size)?;
-        object.vmap()?.memset(0);
+        zero_object(&mut object)?;
         self.mapping = None;
         let mapping = object.map_at(vm, address, mmu::PROT_GPU_FW_SHARED_RW, false)?;
         self.iova = mapping.iova();
@@ -134,7 +144,7 @@ impl MappedObject {
             // SAFETY: the VMap covers this object's complete, page-rounded
             // allocation; construction bounds-checks the view offset and size.
             core::slice::from_raw_parts_mut(
-                vmap.as_mut_ptr().add(self.object_offset),
+                vmap.addr.cast::<u8>().add(self.object_offset),
                 self.logical_size,
             )
         };

@@ -80,7 +80,7 @@ impl G18UmaPoolMemory {
     /// E2E injection at the last allocation boundary: a complete replacement
     /// is discarded before descriptor publication. Compare every old mapping,
     /// state byte and list entry, then let the real preparation reuse the bank.
-    pub(crate) fn verify_replacement_rollback(&mut self, dev: &AsahiDevice,
+    pub(crate) fn verify_replacement_rollback(&mut self, dev: &AsahiDrmDevice,
         uat: &mmu::Uat, plan: G18ComputePlan) -> Result {
         use crate::g18::address_map as va;
         let before = self.owner_snapshot(uat)?;
@@ -103,7 +103,7 @@ impl G18UmaPoolMemory {
     }
 
     #[inline(never)]
-    pub(crate) fn verify_shared_compute_owner(dev: &AsahiDevice, uat: &mmu::Uat) -> Result {
+    pub(crate) fn verify_shared_compute_owner(dev: &AsahiDrmDevice, uat: &mmu::Uat) -> Result {
         use crate::g18::address_map as va;
         let high = va::DYNAMIC_HIGH_START..va::DYNAMIC_HIGH_END;
         let mut words = [48,12,0,0,2304,24,0,0,2,1,0,0,0,0,0,0,1,0,0,128,4,0,0];
@@ -200,7 +200,7 @@ impl G18UmaPoolMemory {
     }
 
     #[inline(never)]
-    fn verify_guard_tiers(dev: &AsahiDevice, uat: &mmu::Uat, high: Range<u64>) -> Result {
+    fn verify_guard_tiers(dev: &AsahiDrmDevice, uat: &mmu::Uat, high: Range<u64>) -> Result {
         let low = DIRECTORY_BASE + 0x40000000;
         let mut anchor_object = MappedObject::new_wc_in_range(dev, uat.kernel_vm(), high.clone(),
             mmu::UAT_PGSZ, mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW)?;

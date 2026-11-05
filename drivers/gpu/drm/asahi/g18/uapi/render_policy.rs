@@ -30,11 +30,11 @@ pub(crate) const IDEAL_GROWTH_OFFSET: u64 = 0x158000 - IDEAL_GROWTH_BYTES;
 pub(crate) static HOST_SMA_IDEAL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn ideal_enabled() -> bool {
-    #[cfg(CONFIG_RUST)] { *crate::module_parameters::g18_sma_ideal.value() == 1 }
+    #[cfg(CONFIG_RUST)] { crate::g18::params::g18_sma_ideal.value() == 1 }
     #[cfg(not(CONFIG_RUST))] { HOST_SMA_IDEAL.load(core::sync::atomic::Ordering::Relaxed) }
 }
 pub(crate) fn ta_barrier_flag() -> u32 {
-    #[cfg(CONFIG_RUST)] { *crate::module_parameters::g18_native_barrier.value() }
+    #[cfg(CONFIG_RUST)] { crate::g18::params::g18_native_barrier.value() }
     #[cfg(not(CONFIG_RUST))] { 0 }
 }
 pub(crate) fn uma_blocks() -> u32 { if ideal_enabled() { 40 } else { UMA_BLOCKS } }
@@ -52,7 +52,7 @@ pub(crate) fn usc_required() -> [u64; 2] { if ideal_enabled() { [9 * 0x100000, 2
 
 pub(crate) fn resource_pairs() -> [[u64; 2]; 2] {
     #[cfg(CONFIG_RUST)]
-    let minimum = *crate::module_parameters::g18_sma_minimum.value() == 1;
+    let minimum = crate::g18::params::g18_sma_minimum.value() == 1;
     #[cfg(not(CONFIG_RUST))]
     let minimum = HOST_SMA_MINIMUM.load(core::sync::atomic::Ordering::Relaxed);
     if ideal_enabled() { NATIVE_IDEAL_PAIRS } else if minimum { NATIVE_MINIMUM_PAIRS } else { [RESOURCE_PAIR; 2] }
@@ -71,7 +71,7 @@ mod parameter {
     static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
         name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
             c"g18_render_target_kind"
-        } else { c"asahi.g18_render_target_kind" }),
+        } else { c"aurora.g18_render_target_kind" }),
         // SAFETY: module lifetime and parameter serialization are managed by
         // the kernel, identically to the kernel::module! registration.
         #[cfg(MODULE)]
@@ -109,7 +109,7 @@ mod msaa4_fragment {
     static PARAM: KernelParam = KernelParam::new(bindings::kernel_param {
         name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
             c"g18_msaa4_fragment_word"
-        } else { c"asahi.g18_msaa4_fragment_word" }),
+        } else { c"aurora.g18_msaa4_fragment_word" }),
         #[cfg(MODULE)]
         mod_: &raw mut bindings::__this_module,
         #[cfg(not(MODULE))]
@@ -140,7 +140,7 @@ pub(crate) fn msaa4_fragment_word() -> u64 {
 }
 
 pub(crate) fn target_kind() -> u32 {
-    #[cfg(CONFIG_RUST)] { *parameter::VALUE.value() }
+    #[cfg(CONFIG_RUST)] { parameter::VALUE.value() }
     #[cfg(not(CONFIG_RUST))] { HOST_TARGET_KIND.load(core::sync::atomic::Ordering::Relaxed) }
 }
 

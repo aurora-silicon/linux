@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use crate::g18::buffer::object::MappedObject;
-use crate::{driver::AsahiDevice, g18::fw::scheduler::*, mmu};
+use crate::{driver::AsahiDrmDevice, g18::fw::scheduler::*, mmu};
 use core::ops::Range;
 use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
@@ -37,7 +37,7 @@ pub(crate) struct G18SchedulerMemory {
 }
 
 impl G18SchedulerMemory {
-    pub(crate) fn print_render_digests(&mut self, dev: &AsahiDevice) -> Result {
+    pub(crate) fn print_render_digests(&mut self, dev: &AsahiDrmDevice) -> Result {
         for (name, object) in [("scheduler", &mut self.records), ("submitted-pre-kick", &mut self.counters)] {
             object.with_bytes_mut(|bytes| {
                 dev_info!(dev.as_ref(), "G18_RENDER_DIGEST name={} fnv={:#018x}\n",name,crate::g18::fw::graphics_payload::fnv64(bytes));
@@ -48,7 +48,7 @@ impl G18SchedulerMemory {
     }
     /// Runtime's deterministic reservation, separate from the legacy compute
     /// scheduler. Counters and records are independent uncached FW mappings.
-    pub(crate) fn new_render(dev: &AsahiDevice, uat: &mmu::Uat) -> Result<Self> {
+    pub(crate) fn new_render(dev: &AsahiDrmDevice, uat: &mmu::Uat) -> Result<Self> {
         use crate::g18::address_map::GRAPHICS_SCHEDULER_START as BASE;
         if !uat.is_t8152_geometry() { return Err(ENODEV); }
         let counters = MappedObject::new_wc_at(dev, uat.kernel_vm(), BASE,
@@ -62,7 +62,7 @@ impl G18SchedulerMemory {
             sequences: [0; G18_SCHEDULER_RECORD_COUNT], submitted: [0; G18_SCHEDULER_RECORD_COUNT] })
     }
 
-    pub(crate) fn new(dev: &AsahiDevice, uat: &mmu::Uat, high_range: Range<u64>) -> Result<Self> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, uat: &mmu::Uat, high_range: Range<u64>) -> Result<Self> {
         if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != 0x4000 {
             return Err(ENODEV);
         }

@@ -47,7 +47,7 @@ impl Drop for DirectoryTransaction<'_> {
 }
 
 impl G18UmaPoolMemory {
-    pub(crate) fn new_shared_compute(dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn new_shared_compute(dev: &AsahiDrmDevice, uat: &mmu::Uat,
         high: Range<u64>, plan: G18ComputePlan) -> Result<Self>
     {
         let mut pool = Self::new_layout(dev, uat, high.clone(), 12,
@@ -59,7 +59,7 @@ impl G18UmaPoolMemory {
     /// A fresh FList view, retaining the previous scratch GEM objects while
     /// giving the directory, list, state and counter independent ownership.
     /// The caller must keep the old view until a verified firmware rebind.
-    pub(crate) fn replacement_shared_compute(&self, dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn replacement_shared_compute(&self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         high: Range<u64>, plan: G18ComputePlan) -> Result<Self>
     {
         if self.render || !self.encoded || !self.descriptor_loaded
@@ -76,13 +76,13 @@ impl G18UmaPoolMemory {
     /// Increase an unpublished pool without moving any existing mapping.
     /// Every backing object, alias and list entry is staged. A failure restores
     /// all directory guards and leaves the previous plan and block list intact.
-    pub(crate) fn prepare_shared_compute(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
+    pub(crate) fn prepare_shared_compute(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         high: Range<u64>, plan: G18ComputePlan) -> Result
     {
         self.prepare_shared_compute_retaining(dev, uat, high, plan, None)
     }
 
-    fn prepare_shared_compute_retaining(&mut self, dev: &AsahiDevice, uat: &mmu::Uat,
+    fn prepare_shared_compute_retaining(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
         high: Range<u64>, plan: G18ComputePlan, retained: Option<&Self>) -> Result
     {
         if self.encoded || self.descriptor_loaded || !self.process_aliases.is_empty() {
