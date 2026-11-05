@@ -1943,7 +1943,13 @@ struct drm_asahi_cmd_compute {
 	 */
 	__u64 prior_cdm;
 
-	/** @cdm_auxiliary_allocation: G17P auxiliary allocation, zero or 8..32. */
+	/**
+	 * @cdm_auxiliary_allocation: M5: the per-core page count of the
+	 * dispatch's shader-context scratch storage, which the hardware is
+	 * given as is and the scratch pool covers. Zero, or 8..32 with
+	 * @intersection_pool and shader-context scratch (@scs_layout). Other
+	 * GPUs require zero.
+	 */
 	__u32 cdm_auxiliary_allocation;
 	/** @reserved: MBZ. */
 	__u32 reserved;
