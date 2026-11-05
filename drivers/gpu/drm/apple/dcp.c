@@ -1639,6 +1639,8 @@ int dcp_get_connector_type(struct platform_device *pdev)
 #define DPTX_TUNNEL_CONNECT_TIMEOUT msecs_to_jiffies(8000)
 #define DPTX_RECONNECT_DELAY msecs_to_jiffies(1000)
 #define DPTX_RECONNECT_RETRIES 5
+/* How long a T8132 dcpext's connect waits for late teardown answers. */
+#define DCP_T8132_ORPHAN_WAIT msecs_to_jiffies(15000)
 
 /*
  * The connection a DPTX connect or queued reconnect belongs to: the Type-C
@@ -1718,6 +1720,35 @@ void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
 }
 
 /*
+ * Before a T8132 dcpext connects, wait for the late answers of an
+ * earlier teardown's timed-out calls, in short slices so that a cable that
+ * goes meanwhile ends the wait: its release drains this connect under the
+ * fabric lock. Answers still missing after DCP_T8132_ORPHAN_WAIT are given up.
+ */
+static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
+					   const struct dcp_fabric_session *session,
+					   bool cable, bool recovery)
+{
+	unsigned long deadline = jiffies + DCP_T8132_ORPHAN_WAIT;
+
+	dev_dbg(dcp->dev, "DPTX port %u connect waits for late teardown answers\n", port);
+	while (!afk_compact_orphans_wait(dcp->dptxep, msecs_to_jiffies(50))) {
+		/* A revoked session's release drains this work under the fabric lock. */
+		if (!READ_ONCE(dcp->typec_cable_connected) ||
+		    !dcp_connect_session_valid(dcp, session, cable, recovery)) {
+			dev_dbg(dcp->dev, "DPTX port %u connect abandoned: the tunnel went\n",
+				port);
+			return -ESTALE;
+		}
+		if (time_after_eq(jiffies, deadline)) {
+			afk_compact_orphans_drop(dcp->dptxep);
+			return 0;
+		}
+	}
+	return 0;
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
@@ -1731,6 +1762,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 {
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
+	bool t8132 = dcp_is_t8132_ext(dcp);
 	bool compact;
 	unsigned long timeout;
 	u64 generation;
@@ -1746,6 +1778,21 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* A native external processor starts here; its start retries this. */
 	if (dcp->external_native && !iomfb_v14_7_external_ready(dcp))
 		return -EAGAIN;
+	/*
+	 * A T8132 dcpext connects only once the firmware has answered
+	 * the calls of an earlier teardown that timed out, so that none of its
+	 * late callbacks lands in this connection.
+	 */
+	if (t8132 && dcp->dptxep) {
+		if (afk_compact_orphans_pending(dcp->dptxep)) {
+			ret = dcp_t8132_wait_teardown_answers(dcp, port, session, cable,
+							      recovery);
+			if (ret)
+				return ret;
+		}
+		/* Nothing of an earlier teardown is outstanding any more. */
+		WRITE_ONCE(dcp->t8132_release_late, false);
+	}
 	/* @port selects the upstream RemotePort service/core. dptx_dfp_port
 	 * is the downstream address: dpphy=0, dpin0=1, dpin1=2.
 	 */
@@ -1944,6 +1991,17 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
+	/*
+	 * A T8132 dcpext's release lowers only the HPD of a connected port, so
+	 * a withdrawn one lowers its HPD here.
+	 */
+	if (t8132 && dcp_is_typec_output(dcp) &&
+	    dptx_service_available(&dcp->dptxport[port])) {
+		err = dptxport_set_hpd(dcp->dptxport[port].service, false);
+		if (err)
+			dev_warn(dcp->dev, "DPTX port %u withdrawn: set_hpd(0) failed: %d\n",
+				 port, err);
+	}
 	if (!dcp_is_retained_external(dcp)) {
 		dcp->dptxport[port].connected = false;
 		goto out_release;
@@ -2866,6 +2924,8 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		ret = dcp_dptx_connect_raw(dcp, 0, NULL, &session, true, false);
 		if (!ret)
 			ret = dcp_dptx_connect_tile(dcp);
+		if (dcp_is_t8132_ext(dcp) && ret && ret != -ESTALE)
+			dev_warn(dcp->dev, "DPTX connect for the DP tunnel failed: %d\n", ret);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			if (!dcp_session_valid_locked(dcp, session, true))
 				return;
@@ -2879,8 +2939,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	if (READ_ONCE(dcp->external_error))
 		dcp_announce_kick(dcp);
 
+	/* A T8132 dcpext connects once per tunnel. */
 	if (++dcp->typec_reconnect_tries <
-	    (dcp_uses_t6020_tunnel_flow(dcp) ?
+	    (dcp_uses_t6020_tunnel_flow(dcp) || dcp_is_t8132_ext(dcp) ?
 	     1 : DPTX_RECONNECT_RETRIES)) {
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
 				 DPTX_RECONNECT_DELAY);
@@ -3107,6 +3168,28 @@ static void disconnected_hpd_event(struct apple_connector *con)
 	schedule_work(&con->bl_sync_wq);
 }
 
+/*
+ * A T8132 dcpext's teardown call of DPTX port @port returned @ret. For a
+ * timed-out call, also the endpoint's ring pointers (receive: firmware to
+ * host, transmit: host to firmware).
+ */
+static void dcp_t8132_dptx_teardown_log(struct apple_dcp *dcp, u32 port,
+					const char *what, int ret)
+{
+	struct apple_dcp_afkep *ep = dcp->dptxep;
+
+	if (!ret)
+		return;
+	if (ret != -ETIMEDOUT || !ep || !ep->rxbfr.ready || !ep->txbfr.ready) {
+		dev_warn(dcp->dev, "DPTX port %u %s: %d\n", port, what, ret);
+		return;
+	}
+	dev_warn(dcp->dev, "DPTX port %u %s: %d; EP %#x rx rptr %#x wptr %#x, tx rptr %#x wptr %#x\n",
+		 port, what, ret, ep->endpoint,
+		 le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr)), le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr)),
+		 le32_to_cpu(READ_ONCE(*ep->txbfr.rptr)), le32_to_cpu(READ_ONCE(*ep->txbfr.wptr)));
+}
+
 static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 {
 	int ret;
@@ -3117,7 +3200,34 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 		dcpext_scanout_invalidate(dcp);
 	}
 	if (dptx_service_available(&dcp->dptxport[port]) && dcp->dptxport[port].connected) {
+		/*
+		 * A T8132 dcpext's DRM swaps stop with the route, before
+		 * the release, which can take the firmware a while to answer.
+		 */
+		if (dcp_is_t8132_ext(dcp))
+			iomfb_m4_external_link_gone(dcp);
 		ret = dptxport_release_display(dcp->dptxport[port].service);
+		/*
+		 * A T8132 dcpext's display is released even if the
+		 * firmware refuses or has not answered in time: the route of a
+		 * tunnel that is gone must not stay owned, or the next tunnel's
+		 * setup fails on the same release. A timed-out call stays as an
+		 * orphan until the firmware answers it; until then the
+		 * firmware's Activate/Deactivate are not acted on, and the next
+		 * connect waits for it (afk_compact_orphans_wait()).
+		 */
+		if (dcp_is_t8132_ext(dcp)) {
+			dcp_t8132_dptx_teardown_log(dcp, port, "release_display", ret);
+			if (ret == -ETIMEDOUT)
+				WRITE_ONCE(dcp->t8132_release_late, true);
+			if (ret)
+				dev_info(dcp->dev, "DPTX port %u taken as released (%s: %d)\n",
+					 port, ret == -ETIMEDOUT ?
+					 "the firmware answers late" : "release failed", ret);
+			ret = 0;
+			/* Its next sink starts from scratch. */
+			iomfb_m4_external_link_gone(dcp);
+		}
 		if (ret)
 			return ret;
 		dcp->dptxport[port].connected = false;
@@ -3229,7 +3339,22 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 
-	if (dptx_service_available(&dcp->dptxport[port])) {
+	/*
+	 * A T8132 dcpext lowers only the HPD its connect raised, and, as
+	 * desktop 26.x compact DPTX does, still releases the display when the
+	 * firmware refuses: a refusal must not keep a released tunnel's route.
+	 * An answer that comes after the call timed out is the call's orphan's
+	 * (see dcp_dptx_release_locked()).
+	 */
+	if (dcp_is_t8132_ext(dcp)) {
+		if (dptx_service_available(&dcp->dptxport[port]) &&
+		    READ_ONCE(dcp->dptxport[port].connected)) {
+			ret = dptxport_set_hpd(dcp->dptxport[port].service, false);
+			dcp_t8132_dptx_teardown_log(dcp, port, "set_hpd(0)", ret);
+			if (ret == -ETIMEDOUT)
+				WRITE_ONCE(dcp->t8132_release_late, true);
+		}
+	} else if (dptx_service_available(&dcp->dptxport[port])) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, false);
 		if (ret)
 			return ret;
@@ -5877,6 +6002,44 @@ static int dcp_desktop_probe_routes(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * An adopted T8132 dcpext offers its Type-C routes. It is no component of
+ * the DRM device (its outputs are added by t8132_ext_drm.c): the routes
+ * follow the port modes, refuse DP alt mode and get no apple_connector (see
+ * dcp_typec_route_set() and dcp_typec_port_unusable()). Its route suppliers were there before the
+ * adoption, see dcp_platform_probe_t8132_ext(). A failure leaves the routes
+ * disabled, so the port controllers do not wait for them; the adopted
+ * session stays.
+ */
+static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
+{
+	struct device_node *routes __free(device_node) =
+		of_get_child_by_name(dcp->dev->of_node, "typec-routes");
+	int ret;
+
+	if (!routes || !of_get_available_child_count(routes)) {
+		dev_info(dcp->dev, "no Type-C display routes enabled\n");
+		return;
+	}
+	/*
+	 * A Thunderbolt DP tunnel's DPTX connect runs from the Type-C reconnect
+	 * work, which component bind would otherwise enable (as for the manual
+	 * T6030 external path). Enabled before the routes are, since a tunnel
+	 * can claim one as soon as it is registered; disabled again on remove.
+	 */
+	enable_delayed_work(&dcp->typec_reconnect_wq);
+	ret = dcp_register_typec_routes(dcp);
+	if (ret) {
+		dev_err(dcp->dev, "Type-C display routes not registered: %d; USB goes on without them\n",
+			ret);
+		disable_delayed_work_sync(&dcp->typec_reconnect_wq);
+		dcp_typec_routes_disable(dcp);
+		return;
+	}
+	dev_info(dcp->dev, "%u Type-C display route(s) registered, no DP alt mode\n",
+		 dcp->nr_typec_routes);
+}
+
 static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
@@ -6062,6 +6225,18 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		ret = iomfb_m4_init(dcp);
 		if (ret)
 			return ret;
+		/*
+		 * An external DCP is no component of the DRM device. Once
+		 * adoption starts, its session outlives the device.
+		 */
+		if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
+			ret = dcp_pin_live_session(dcp);
+			if (!ret)
+				ret = iomfb_m4_adopt_external(dcp);
+			if (!ret)
+				dcp_t8132_ext_routes(dcp);
+			return ret;
+		}
 		return component_add(dev, &dcp_comp_ops);
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6) {
@@ -6385,6 +6560,33 @@ static int dcp_ext_route_suppliers(struct device *dev)
 }
 
 /*
+ * A T8132 dcpext's Type-C routes are only enabled for one the boot
+ * loader handed over (see the display gate), and its USB-C port controllers
+ * wait for them. Wait for the route suppliers before adopting, so that no
+ * deferral comes after the adoption, and disable the routes on every
+ * failure that leaves them unregistered, so USB on the ports goes on.
+ */
+static int dcp_platform_probe_t8132_ext(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	int ret;
+
+	ret = dcp_ext_route_suppliers(dev);
+	if (!ret)
+		ret = dcp_platform_probe_pipe(pdev);
+	if (ret == -EPROBE_DEFER) {
+		int state = driver_deferred_probe_check_state(dev);
+
+		if (state == -EPROBE_DEFER)
+			return ret;
+		ret = state;
+	}
+	if (ret)
+		dcp_typec_routes_disable_dev(dev);
+	return ret;
+}
+
+/*
  * The T8122 dcpext is a component of the panel's DRM device, so it must
  * always register one, or the panel stays on the boot framebuffer. Keep
  * deferring while its suppliers may still appear (bounded by the deferred
@@ -6404,6 +6606,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
+		return dcp_platform_probe_t8132_ext(pdev);
 	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext") &&
 	    !of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
 		return dcp_platform_probe_pipe(pdev);
@@ -6468,6 +6672,13 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	 */
 	if (dcp)
 		av_audiosrv_quiesce(dcp);
+	/* An adopted external DCP never joined the DRM device. */
+	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext")) {
+		/* Enabled with its Type-C routes, see dcp_t8132_ext_routes(). */
+		if (dcp)
+			disable_delayed_work_sync(&dcp->typec_reconnect_wq);
+		return;
+	}
 	component_del(&pdev->dev, &dcp_comp_ops);
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);
@@ -6527,6 +6738,9 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 		return;
 	}
 
+	/* An adopted external DCP never joined the DRM device. */
+	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext"))
+		return;
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
@@ -6661,6 +6875,22 @@ static int dcp_platform_prepare(struct device *dev)
 		cancel_work_sync(&dcp->ext26_blank_work);
 		dcp_disable_typec_work(dcp, false);
 		dcp->ext26_pm_work_off = true;
+		return 0;
+	}
+	/*
+	 * J713: a T8132 external DCP refuses system sleep only for what cannot
+	 * go down with it (see iomfb_m4_ext_sleep_veto()): prepare runs before
+	 * any freezing, so nothing is frozen or suspended yet and the sleep
+	 * simply fails. An attached display goes down before the freeze and
+	 * comes back after the thaw (t8132_ext_drm.c).
+	 */
+	if (dcp_is_t8132_ext(dcp)) {
+		why = iomfb_m4_ext_sleep_veto(dcp);
+		if (why) {
+			dev_warn(dev, "refusing system sleep: external display attached (T8132): %s\n",
+				 why);
+			return -EBUSY;
+		}
 		return 0;
 	}
 	if (!dcp->external)
@@ -6956,6 +7186,13 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132 = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_M4,
 };
+
+/* An external DCP: two DPTX port services, dcpdptx-port-epic units 0 and 1. */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext = {
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_M4,
+	.num_dptx_ports = 2,
+};
 #endif
 
 /* T6041 (M4 Pro/Max), desktop 26.6 firmware */
@@ -6979,6 +7216,8 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132, },
+	/* Same firmware as the internal DCP; adopted from the boot loader. */
+	{ .compatible = "apple,t8132-dcpext", .data = &apple_dcp_hw_t8132_dcpext, },
 #endif
 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030, },
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },

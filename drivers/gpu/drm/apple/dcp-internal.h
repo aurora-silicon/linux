@@ -343,6 +343,11 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
+	/*
+	 * Allocates AFK rings where the DMA API cannot, on an adopted
+	 * J713 external DCP whose DART only takes the retained allocator.
+	 */
+	void *(*afk_alloc)(struct apple_dcp *dcp, size_t size, dma_addr_t *dva);
 	bool quiescing;
 	bool drm_retained;
 	/* vblank_wq and swap_watchdog_wq disabled by the last unbind */
@@ -729,6 +734,11 @@ struct apple_dcp {
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
+	/*
+	 * T8132 dcpext: a teardown call timed out; the firmware's late
+	 * Activate/Deactivate belong to it until its answer is in.
+	 */
+	bool t8132_release_late;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
@@ -744,6 +754,12 @@ struct apple_dcp {
 	 */
 	struct mutex tb_lock;
 	bool tb_clock_ok;
+	/*
+	 * T8132 dcpext: its tunnel pixel clock was refused (the PHY runs the
+	 * other DP IN at another link rate), so the tunnel cannot show.
+	 * tb_lock to set; read anywhere.
+	 */
+	bool tb_clock_refused;
 	/* tb_lock: the direct DP PHY crossbar output whose clocks run (T6030). */
 	struct mux_control *direct_xbar_up;
 	/*
