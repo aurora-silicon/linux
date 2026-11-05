@@ -33,7 +33,9 @@
 #include <linux/string.h>
 #include <linux/types.h>
 
+#include <asm/cacheflush.h>
 #include <asm/ctxr_execmem.h>
+#include <asm/virt.h>
 #include <asm/memory.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable-hwdef.h>
@@ -140,11 +142,14 @@ static void __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
 	}
 }
 
+/* Read by cores entering with the MMU off: see init_kernel_el. */
+u32 ctxr_stay_el2 __section(".mmuoff.data.read");
+
 void __init ctxr_exec_reserve(void)
 {
 	phys_addr_t base = 0, size = 0, img_start, img_end;
 	phys_addr_t dram_start, dram_end;
-	bool enforce = true;
+	bool enforce = true, armed;
 
 	if (!ctxr_parse_cmdline(&base, &size, &enforce) &&
 	    !ctxr_parse_dt(&base, &size, &enforce))
@@ -152,6 +157,9 @@ void __init ctxr_exec_reserve(void)
 
 	if (!size)
 		return;
+
+	/* A base means firmware armed this window; none means software only. */
+	armed = base;
 
 	img_start = __pa_symbol(_text);
 	img_end = __pa_symbol(_end);
@@ -195,6 +203,12 @@ void __init ctxr_exec_reserve(void)
 	ctxr_base = base;
 	ctxr_size = size;
 	ctxr_enforce = enforce;
+
+	if (armed && is_kernel_in_hyp_mode()) {
+		ctxr_stay_el2 = 1;
+		dcache_clean_inval_poc((unsigned long)&ctxr_stay_el2,
+				       (unsigned long)&ctxr_stay_el2 + sizeof(ctxr_stay_el2));
+	}
 	ctxr_active = true;
 
 	pr_info("reserved exec window [%pa, +%llu MiB), %s\n",

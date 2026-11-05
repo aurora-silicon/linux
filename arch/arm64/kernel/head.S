@@ -307,6 +307,38 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	msr	vbar_el2, x0
 	isb
 
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	/*
+	 * Kernel text inside an armed CTXR window can't execute at EL1, so a
+	 * core entering after the window is known goes straight to VHE here
+	 * instead of dropping to EL1 and coming back through finalise_el2.
+	 */
+	adr_l	x0, ctxr_stay_el2
+	ldr	w0, [x0]
+	cbz	w0, 1f
+
+	finalise_el2_state
+
+	mov_q	x0, HCR_HOST_VHE_FLAGS
+	msr_hcr_el2 x0
+	isb
+
+	mrs	x0, mdcr_el2
+	bic	x0, x0, #MDCR_EL2_E2PB_MASK
+	bic	x0, x0, #MDCR_EL2_E2TB_MASK
+	msr	mdcr_el2, x0
+
+	mov_q	x0, INIT_SCTLR_EL1_MMU_OFF
+	pre_disable_mmu_workaround
+	msr	sctlr_el1, x0
+	isb
+
+	mov	w0, #BOOT_CPU_MODE_EL2
+	orr	x0, x0, #BOOT_CPU_FLAG_E2H
+	ret
+1:
+#endif
+
 	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF
 
 	mrs	x0, hcr_el2
