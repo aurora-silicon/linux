@@ -24,6 +24,14 @@ const LOCKOUT_MAGIC: [u8; 8] = *b"SEPLOCK1";
 const LOCKOUT_RECORD_LEN: usize = 16;
 const LOCKOUT_LOCKED: u32 = 1;
 
+/// Message tag of the enclave's unsolicited biometric lock-state notification.
+const SBIO_NOTIFY_LOCK_STATE: u8 = 0x01;
+/// The lock-state bit that is set while the enclave refuses matches.
+const LOCK_STATE_LOCKOUT: u16 = 0x40;
+/// How long a re-arm waits for the enclave to announce the cleared state.
+const LOCK_STATE_WAIT_MS: u32 = 1000;
+const LOCK_STATE_POLL_MS: u32 = 10;
+
 fn lockout_record(locked: bool) -> [u8; LOCKOUT_RECORD_LEN] {
     let mut raw = [0u8; LOCKOUT_RECORD_LEN];
     raw[..LOCKOUT_MAGIC.len()].copy_from_slice(&LOCKOUT_MAGIC);
@@ -57,6 +65,20 @@ mod lockout_tests {
         let mut other = lockout_record(true);
         other[8] = 2;
         assert!(!lockout_record_locked(&other));
+    }
+
+    #[test]
+    fn verify_password_reply_shape() {
+        let mut body = [0u8; crate::sks::SKS_VERIFY_SECRET_REPLY_LEN];
+        body[0] = 1;
+        assert_eq!(crate::sks::verify_secret_reply_flags(&body), Some(0));
+        body[4] = 3;
+        assert_eq!(crate::sks::verify_secret_reply_flags(&body), Some(3));
+        let mut wrong_variant = body;
+        wrong_variant[0] = 0;
+        assert_eq!(crate::sks::verify_secret_reply_flags(&wrong_variant), None);
+        assert_eq!(crate::sks::verify_secret_reply_flags(&body[..8]), None);
+        assert_eq!(crate::sks::verify_secret_reply_flags(&[1u8; 16]), None);
     }
 }
 
@@ -3164,6 +3186,13 @@ impl SepData {
         let f = proto::decode(&msg);
         let marker = f.tag;
 
+        // An unsolicited lock-state notification carries everything in the
+        // message word and nothing in the out-of-line buffer.
+        if marker == SBIO_NOTIFY_LOCK_STATE {
+            self.on_lock_state_notification(msg.msg0);
+            return;
+        }
+
         if !self.sbio_ready.load(Relaxed) {
             return;
         }
@@ -3226,6 +3255,47 @@ impl SepData {
             transfer::Progress::Failed => {
                 self.sbio_wq.notify_all();
             }
+        }
+    }
+
+    // The enclave announces each change of a user's biometric lock state:
+    // the state in bits 16-31, the user in bits 32-63. Only this metadata is
+    // logged; the lockout is bit `LOCK_STATE_LOCKOUT` of the state.
+    fn on_lock_state_notification(&self, word: u64) {
+        let state = (word >> proto::MSG_TYPE_SHIFT) as u16;
+        let user = (word >> proto::MSG_DATA_SHIFT) as u32;
+        self.bio_lock_state
+            .store(u64::from(state) | (u64::from(user) << 16), Relaxed);
+        self.bio_lock_state_seq.fetch_add(1, Relaxed);
+        let lockout = if state & LOCK_STATE_LOCKOUT != 0 { "set" } else { "clear" };
+        dev_info!(
+            self.dev,
+            "sbio: lock state of user {} is {:#06x} (lockout {})\n",
+            user,
+            state,
+            lockout
+        );
+        self.sbio_wq.notify_all();
+    }
+
+    /// Waits up to `timeout_ms` for a lock-state notification for `user`
+    /// newer than `since` (a `bio_lock_state_seq` value). Returns its state.
+    fn await_lock_state(&self, user: u32, since: u32, timeout_ms: u32) -> Option<u16> {
+        let mut waited = 0;
+        loop {
+            if self.bio_lock_state_seq.load(Relaxed) != since {
+                let last = self.bio_lock_state.load(Relaxed);
+                if (last >> 16) as u32 == user {
+                    return Some(last as u16);
+                }
+            }
+            if waited >= timeout_ms {
+                return None;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(
+                LOCK_STATE_POLL_MS,
+            )));
+            waited += LOCK_STATE_POLL_MS;
         }
     }
 
@@ -3775,9 +3845,10 @@ impl SepData {
 
     /// Userspace calls this only after the user's password was verified. The
     /// node is root's alone and its SELinux label confines it to the re-arm
-    /// helper. The verified password authorizes an unwrap of the Linux FV
-    /// records with their stable stored secret. A new SCRD match context is
-    /// then set up and the enclave's lockout record is saved.
+    /// helper. The verified password authorizes a password-mode verification
+    /// of the designated user's key bag with its stored secret, which is what
+    /// ends the enclave's lockout. A new SCRD match context is then set up and
+    /// the enclave's lockout record is saved.
     fn rearm_after_password(&self, _password: crate::Secret) -> Result<()> {
         if !self.touchid_started.load(Relaxed) {
             // Activation sets up a fresh match credential; only the record of
@@ -3806,68 +3877,116 @@ impl SepData {
             if !self.capture_begin() {
                 continue;
             }
-            // Userspace has already verified the password. The Linux-owned FV
-            // pair is provisioned and unwrapped with one stable credential:
-            // the stored identity-bag secret. It must precede the SCRD
-            // credential refresh; a bag unlock is not a substitute for it.
-            let unwrapped = match keybag::read(keybag::Slot::Identity) {
-                Ok(keybag::State::Present(stored)) => match self.rearm_touchid_fv(stored.secret()) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        dev_err!(
-                            self.dev,
-                            "Touch ID: re-arm: the Linux FV record pair did not unwrap: {:?}\n",
-                            e
-                        );
-                        false
-                    }
-                },
-                Ok(keybag::State::Absent(_)) => {
-                    dev_err!(self.dev, "Touch ID: re-arm: there is no stored identity key bag secret\n");
-                    false
-                }
-                Err(e) => {
-                    dev_err!(
-                        self.dev,
-                        "Touch ID: re-arm: the identity key bag record is unreadable: {:?}\n",
-                        e
-                    );
-                    false
-                }
-            };
-            let established = unwrapped && self.establish_scrd_match_context(user);
-            let saved = established && self.save_lockout();
-            if unwrapped && !established {
-                dev_err!(self.dev, "Touch ID: re-arm: the FV unwrap succeeded but the SCRD match credential was not re-established\n");
-            } else if established && !saved {
-                dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
-            }
-            if established {
+            let outcome = self.clear_enclave_lockout(user);
+            if outcome.is_some() {
                 self.bio_nomatch_streak.store(0, Relaxed);
                 self.bio_lockout_logged.store(false, Relaxed);
                 self.bio_lockout.store(false, Relaxed);
             }
             self.capture_end();
-            break established;
+            break outcome;
         };
-        if !rearmed {
+        let Some(confirmed) = rearmed else {
             dev_err!(
                 self.dev,
-                "Touch ID: re-arming after a password authentication failed; the FV unwrap or match credential failed, and Touch ID stays locked\n"
+                "Touch ID: re-arming after a password authentication failed; Touch ID stays locked\n"
             );
             return Err(EIO);
-        }
+        };
         if !self.write_lockout_record(false) {
             dev_warn!(
                 self.dev,
                 "Touch ID: could not clear the recorded lockout; the next restart will ask for the password again\n"
             );
         }
+        if confirmed {
+            dev_info!(
+                self.dev,
+                "Touch ID: re-armed after a password authentication; the enclave reported the lockout cleared\n"
+            );
+        } else {
+            dev_warn!(
+                self.dev,
+                "Touch ID: re-armed after a password authentication, but the enclave announced no lock state; whether it matches again is unconfirmed\n"
+            );
+        }
+        Ok(())
+    }
+
+    /// The enclave side of a re-arm. `Some(true)` when the enclave announced
+    /// the user's lock state with the lockout bit clear, `Some(false)` when
+    /// it accepted the password verification but announced nothing, `None`
+    /// on any failure or when it still reports the lockout.
+    fn clear_enclave_lockout(&self, user: crate::sbio::UserId) -> Option<bool> {
+        let du = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID)?;
+        if !self.keybag_designated.load(Relaxed) || self.enrol_material.lock().is_none() {
+            dev_err!(self.dev, "Touch ID: re-arm: no user key bag is designated\n");
+            return None;
+        }
+        let stored = match keybag::read(keybag::Slot::Identity) {
+            Ok(keybag::State::Present(stored)) => stored,
+            Ok(keybag::State::Absent(_)) => {
+                dev_err!(self.dev, "Touch ID: re-arm: there is no stored identity key bag secret\n");
+                return None;
+            }
+            Err(e) => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: the identity key bag record is unreadable: {:?}\n",
+                    e
+                );
+                return None;
+            }
+        };
+        let notify_user = user.value() as u32;
+        let since = self.bio_lock_state_seq.load(Relaxed);
+        let Some(out) = self.sks_send(self.sks_req_verify_password(du.special_handle(), stored.secret()))
+        else {
+            dev_err!(self.dev, "Touch ID: re-arm: the password verification did not answer\n");
+            return None;
+        };
+        if out.reply.status != 0 {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm: the password verification answered SKS status {}\n",
+                out.reply.status
+            );
+            return None;
+        }
+        let body = self.sks_report_response(crate::sks::SKS_VERIFY_SECRET_NAME, &out);
+        let Some(flags) = body.and_then(crate::sks::verify_secret_reply_flags) else {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm: the password verification reply is malformed ({} body bytes)\n",
+                body.map_or(0, |b| b.len())
+            );
+            return None;
+        };
         dev_info!(
             self.dev,
-            "Touch ID: re-armed after a password authentication; the enclave accepts matches again\n"
+            "Touch ID: re-arm: password verification of the designated bag answered status 0, returned flags {:#x}\n",
+            flags
         );
-        Ok(())
+        let confirmed = match self.await_lock_state(notify_user, since, LOCK_STATE_WAIT_MS) {
+            Some(state) if state & LOCK_STATE_LOCKOUT != 0 => {
+                dev_err!(
+                    self.dev,
+                    "Touch ID: re-arm: the enclave still reports the lockout (state {:#06x})\n",
+                    state
+                );
+                return None;
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if !self.establish_scrd_match_context(user) {
+            dev_err!(self.dev, "Touch ID: re-arm: the SCRD match credential was not re-established\n");
+            return None;
+        }
+        if !self.save_lockout() {
+            dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
+        }
+        Some(confirmed)
     }
 
     fn mint_token_bytes(&self) -> Option<[u8; bio::TOKEN_LEN]> {

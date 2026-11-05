@@ -744,6 +744,13 @@ struct SepData {
     // Failed matches since the last match or re-arm, for the log.
     bio_nomatch_streak: Atomic<u32>,
 
+    // The enclave's most recent biometric lock-state notification: the
+    // state in bits 0-15 and the user in bits 16-47, or 0 before the first.
+    // `bio_lock_state_seq` counts them, so a waiter can tell a fresh one
+    // from a stale one.
+    bio_lock_state: Atomic<u64>,
+    bio_lock_state_seq: Atomic<u32>,
+
     #[pin]
     store: Mutex<Option<xart_store::Store>>,
 
@@ -990,6 +997,8 @@ impl SepData {
                 bio_lockout: Atomic::new(false),
                 bio_lockout_logged: Atomic::new(false),
                 bio_nomatch_streak: Atomic::new(0),
+                bio_lock_state: Atomic::new(0),
+                bio_lock_state_seq: Atomic::new(0),
                 store <- new_mutex!(store),
                 host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
