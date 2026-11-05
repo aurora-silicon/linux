@@ -1192,6 +1192,9 @@ pub(crate) struct Vm {
     context_bindings: Option<Arc<context::ContextBindings>>,
     shared_bindings: Option<Arc<shared::SharedBindings>>,
     status: Option<Arc<crate::g17::status::VmStatus>>,
+    /// The memory accounting of the client that created this VM, which kernel memory sized
+    /// by that client's requests is charged to. `None` for kernel VMs.
+    memory: Option<Arc<crate::memacct::Client>>,
     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
@@ -2432,6 +2435,7 @@ impl Vm {
             context_bindings: None,
             shared_bindings: None,
             status: None,
+            memory: None,
             dummy_obj: dummy_obj.gem.clone(),
             binding,
         })
@@ -2526,6 +2530,17 @@ impl Vm {
     }
 
     /// Status shared by every queue using this VM, if enabled by its GPU.
+    /// Charges kernel memory sized by this VM's client to `client` ([`Self::memory_client`]).
+    pub(crate) fn with_memory_client(mut self, client: Arc<crate::memacct::Client>) -> Self {
+        self.memory = Some(client);
+        self
+    }
+
+    /// The memory accounting of the client that created this VM, if it is a client VM.
+    pub(crate) fn memory_client(&self) -> Option<&Arc<crate::memacct::Client>> {
+        self.memory.as_ref()
+    }
+
     pub(crate) fn status(&self) -> Option<&Arc<crate::g17::status::VmStatus>> {
         self.status.as_ref()
     }
