@@ -708,7 +708,9 @@ struct Firmware {
 }
 
 /// Set once this module is pinned until reboot for a session that is never freed: an M5
-/// session once a role has run. Its RTKit and mailbox callbacks run this module's code.
+/// session once a role has run, which no engine retirement witness releases
+/// ([`initdata::InitData::has_engine_retirement_witness`]). Its RTKit and mailbox callbacks
+/// run this module's code.
 static SESSION_RETAINED: AtomicBool = AtomicBool::new(false);
 
 /// Pins this module until reboot for a session that is never freed, once

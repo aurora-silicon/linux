@@ -2388,6 +2388,17 @@ impl super::Shared {
             state.take()
         };
         if let Some(mut firmware) = firmware {
+            if !firmware.init.has_engine_retirement_witness() {
+                // Engines may still write into the session's pages after the processors
+                // stop, and nothing here proves they have stopped: keep the session. Its
+                // callbacks run this module's code: the start pinned the module, so this
+                // only confirms the pin.
+                if super::retain_session().is_err() {
+                    dev_err!(self.dev.as_ref(), "GPU session kept without a module pin\n");
+                }
+                core::mem::forget(firmware);
+                return;
+            }
             firmware.finish_stopped_queues();
             // RTKit destruction still dereferences the mailbox provider.
             drop(firmware);
