@@ -72,15 +72,18 @@
 };
 
 &ps_dispext0_sys {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext0_fe {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext0_cpu {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_scodec {
@@ -368,15 +371,18 @@
 };
 
 &ps_dispext1_sys {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext1_fe {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext1_cpu {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 /* No camera driver yet; genpd powers the ISP down as an unused domain. */

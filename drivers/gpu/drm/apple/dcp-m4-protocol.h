@@ -89,7 +89,8 @@ static inline int dcp_m4_decode_word(u64 word, struct dcp_m4_packet *packet)
 
 /*
  * External (DCPEXT) profile: incoming callbacks may use streams 0..3 and any
- * remote/bit-9 route; AP replies stay on stream 0 and carry routing only.
+ * remote/bit-9 route; AP replies come on stream 0 and carry routing only,
+ * except the reply to an out-of-band call, see dcp_m4_transaction_decode().
  */
 static inline int dcp_m4_decode_word_ext(u64 word, struct dcp_m4_packet *packet)
 {
