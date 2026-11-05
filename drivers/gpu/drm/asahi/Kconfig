@@ -9,7 +9,7 @@ config RUST_DRM_GPUVM
 	select DRM_GPUVM
 
 config DRM_ASAHI
-	tristate "Asahi (DRM support for Apple AGX GPUs)"
+	tristate "Aurora (DRM support for Apple AGX GPUs)"
 	depends on RUST
 	depends on DRM=y
 	depends on (ARM64 && ARCH_APPLE) || (COMPILE_TEST && !GENERIC_ATOMIC64)
@@ -21,8 +21,27 @@ config DRM_ASAHI
 	select RUST_DRM_GEM_SHMEM_HELPER
 	select RUST_DRM_GPUVM
 	select RUST_APPLE_RTKIT
+	select CRYPTO_LIB_SHA256
 	help
-	  DRM driver for Apple AGX GPUs (G13x, found in the M1 SoC family)
+	  DRM driver for Apple AGX GPUs, from the M1 family onwards.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called aurora. It keeps "asahi" as a module alias.
+
+config DRM_ASAHI_G16
+	bool "Apple M4 (G16G) support (experimental)"
+	depends on DRM_ASAHI && ARM64
+	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
+	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
+	depends on THERMAL_OF
+	help
+	  Rust backend for the qualified J713/T8132 GPU firmware.
+	  Load aurora explicitly after the native display and GFX TVM supplier
+	  are ready. Firmware-visible storage remains retained until a verified
+	  retirement or reboot. Keep the working kernel available during bring-up.
+	  A rendering VM pins about 0.7 GiB; memory-cgroup limits are advisable.
+	  An aborted receipt disables that command class until reboot.
+	  Suspend, hibernation and kexec are blocked while native graphics owns DMA.
 
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"
@@ -36,21 +55,11 @@ config DRM_ASAHI_DEBUG_ALLOCATOR
 	  Say N unless you are debugging firmware structures or porting to a
 	  new firmware version.
 
-config DRM_ASAHI_UAT_ADOPTION
-	bool
-	help
-	  The firmware UAT handoff adoption shared by the G15 backend and the
-	  T8122 runtime (g15/uat.rs, g15/regs.rs).
-
 config DRM_ASAHI_M3_T8122
 	bool "M3 MacBook Air GPU runtime (T8122, 14.8.3 firmware)"
 	depends on DRM_ASAHI
-	# The runtime adopts the firmware's UAT as the G15 backend does, without
-	# needing that backend: M3 Pro/Max keep their own setting.
-	# Its PMP votes call apple-pmp directly (m3_device.rs).
-	depends on APPLE_PMP=y || (APPLE_PMP=m && DRM_ASAHI=m)
-	select DRM_ASAHI_UAT_ADOPTION
-	select APPLE_T8122_GPU_PMP_LINK
+	# The runtime adopts the firmware's UAT through the G15 backend's handoff helpers.
+	depends on DRM_ASAHI_G15
 	select CRYPTO_LIB_SHA256
 	default n
 	help
@@ -68,8 +77,6 @@ config DRM_ASAHI_G15
 	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
 	select APPLE_T6030_GPU_PMP_LINK
 	select CRYPTO_LIB_SHA256
-	select RUST_FW_LOADER_ABSTRACTIONS
-	select DRM_ASAHI_UAT_ADOPTION
 	default n
 	help
 	  Enable the native G15 backend for explicitly admitted M3 Pro/Max
