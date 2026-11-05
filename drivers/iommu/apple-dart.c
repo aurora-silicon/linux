@@ -4494,9 +4494,14 @@ params_done:
 		dart->locked = apple_dart_is_locked(dart);
 	/* Reserved table-page lifetime requires the matched three-level loader. */
 	dart->fw_handoff = apple_dart_fw_handoff_enabled(dart);
-	/* Preserve our retained-root path when no reserved-table handoff exists. */
+	/*
+	 * Preserve our retained-root path when no reserved-table handoff exists.
+	 * T6050's boot loader leaves every display DART locked on four-level
+	 * roots of its own (dart-dcpextN SID 23, dart-dispextN SIDs 0 and 16).
+	 */
 	dart->fw_mirror = dart->locked && !dart->fw_handoff &&
 		(of_device_is_compatible(dev->of_node, "apple,t6041-dart") ||
+		 of_device_is_compatible(dev->of_node, "apple,t6050-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
 	/*
