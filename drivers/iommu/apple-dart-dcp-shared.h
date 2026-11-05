@@ -521,6 +521,29 @@ static struct apple_dart_dcp *apple_dart_dcp_dispext_pio(struct device *piodma)
 }
 
 /*
+ * The SID0 frontend of an external display DART, from its PIODMA
+ * child, once that child's check (registers, roots, ownership) passed; a
+ * failed check retires the whole DART.
+ */
+static struct apple_dart_dcp *apple_dart_dcp_dispext_sid0(struct device *piodma)
+{
+	struct apple_dart_dcp *pio = apple_dart_dcp_dispext_pio(piodma);
+	int ret;
+
+	if (!pio)
+		return NULL;
+	/* Unconfirmed power since sleep (-EAGAIN) retires nothing: it waits. */
+	ret = __apple_dart_dcp_check(piodma);
+	if (ret == -EAGAIN)
+		return NULL;
+	if (ret) {
+		apple_dart_dcp_dispext_fail(pio->dart, "the PIODMA check failed: %d", ret);
+		return NULL;
+	}
+	return pio->dart->frontend[0];
+}
+
+/*
  * J713 external DCP: with the DART's power confirmed on by the caller
  * (its firmware last powered it up, under the lock that serialises that), both
  * frontends as adopted and no fault pending; else the whole DART is retired.
@@ -544,6 +567,192 @@ static int __apple_dart_dcp_dispext_qualify(struct device *piodma)
 		return -EIO;
 	}
 	return 0;
+}
+
+/*
+ * J713 external DCP: claim a free SID0 arena slice (one not yet used
+ * by a surface, firmware-owned or holding a table) as a remappable host
+ * window at *@dva, until reboot. -ENOSPC without one.
+ */
+static int __apple_dart_dcp_dispext_window_claim(struct device *piodma, u64 *dva)
+{
+	struct apple_dart_dcp *dcp = apple_dart_dcp_dispext_sid0(piodma);
+	unsigned int root;
+	unsigned long flags;
+	int ret = -ENOSPC;
+
+	if (!dcp || !dva)
+		return -ENODEV;
+	mutex_lock(&dcp->alloc_lock);
+	/* A register mismatch retires the whole DART, see apple_dart_dcp_registers(). */
+	if (apple_dart_dispext_retired(dcp->dart) || !apple_dart_dcp_registers(dcp)) {
+		ret = -EIO;
+		goto unlock;
+	}
+	spin_lock_irqsave(&dcp->lock, flags);
+	for (root = 0; root < DCP_DART_ENTRIES; root++)
+		if (test_bit(root, dcp->arena) && !test_bit(root, dcp->claimed) &&
+		    !test_bit(root, dcp->foreign) && !dcp->entry[root] &&
+		    !READ_ONCE(dcp->root[root]))
+			break;
+	if (root != DCP_DART_ENTRIES) {
+		set_bit(root, dcp->claimed);
+		set_bit(root, dcp->shared_roots); /* Private map only, never generic unmap. */
+		set_bit(root, dcp->window);
+		*dva = DCP_DART_ALIAS + root * DCP_DART_SLICE;
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&dcp->lock, flags);
+unlock:
+	mutex_unlock(&dcp->alloc_lock);
+	return ret;
+}
+
+/* The window slice at @dva, or -1 if it is none. */
+static int apple_dart_dcp_window_root(struct apple_dart_dcp *dcp, u64 dva)
+{
+	unsigned int root = (dva >> 25) & 2047;
+
+	if (!apple_dart_dcp_iova(dva) || (dva & (DCP_DART_SLICE - 1)) ||
+	    dva != DCP_DART_ALIAS + root * DCP_DART_SLICE || !test_bit(root, dcp->window) ||
+	    !test_bit(root, dcp->claimed) || !test_bit(root, dcp->arena) ||
+	    test_bit(root, dcp->foreign))
+		return -1;
+	return root;
+}
+
+/*
+ * J713 external DCP: map @count caller-owned pages (@phys, 16 KiB each)
+ * at the start of the empty window @dva; TLB flush, then every PTE read back.
+ * On any error the window and the pages stay as they are: the caller keeps
+ * the pages until reboot.
+ */
+static int __apple_dart_dcp_dispext_window_map(struct device *piodma, u64 dva,
+					       const phys_addr_t *phys, unsigned int count)
+{
+	struct apple_dart_dcp *dcp = apple_dart_dcp_dispext_sid0(piodma);
+	int root, ret;
+
+	if (!dcp)
+		return -ENODEV;
+	if (!phys || !count || count > DCP_DART_ENTRIES)
+		return -EINVAL;
+	for (unsigned int i = 0; i < count; i++)
+		if ((phys[i] & (DCP_DART_PAGE - 1)) || phys[i] >> 42)
+			return -EINVAL;
+	mutex_lock(&dcp->alloc_lock);
+	root = apple_dart_dcp_window_root(dcp, dva);
+	ret = -EINVAL;
+	if (root < 0)
+		goto unlock;
+	ret = -EIO;
+	if (apple_dart_dispext_retired(dcp->dart))
+		goto unlock;
+	if (!apple_dart_dcp_registers(dcp) || apple_dart_fault_pending(dcp->dart))
+		goto failed;
+	ret = -EBUSY;
+	for (unsigned int i = 0; dcp->expected[root] && i < DCP_DART_ENTRIES; i++)
+		if (dcp->expected[root][i])
+			goto unlock;
+	for (unsigned int i = 0; i < count; i++) {
+		size_t mapped = 0;
+
+		ret = apple_dart_dcp_map_owned(dcp, dva + (u64)i * DCP_DART_PAGE, phys[i],
+					       DCP_DART_PAGE, 1, IOMMU_READ | IOMMU_WRITE,
+					       GFP_KERNEL, &mapped, true);
+		if (!ret && mapped != DCP_DART_PAGE)
+			ret = -EIO;
+		if (ret)
+			goto failed;
+	}
+	ret = apple_dart_dcp_flush(dcp);
+	if (!ret)
+		ret = __apple_dart_dcp_check(piodma);
+	for (unsigned int i = 0; !ret && i < count; i++) {
+		u64 pte = READ_ONCE(dcp->table[root][i]);
+
+		if (apple_dart_dcp_translate(dcp, dva + (u64)i * DCP_DART_PAGE) != phys[i] ||
+		    pte != dcp->expected[root][i] || !dcp_dart_pte_frontend(pte))
+			ret = -EIO;
+	}
+	if (READ_ONCE(dcp->root[root]) != dcp->entry[root])
+		ret = -EIO;
+	if (!ret)
+		goto unlock;
+failed:
+	apple_dart_dcp_dispext_fail(dcp->dart, "window map at %#llx failed: %d", dva, ret);
+	dev_err(piodma, "SID0 window %#llx: mapping %u pages failed: %d; pages retained\n",
+		dva, count, ret);
+unlock:
+	mutex_unlock(&dcp->alloc_lock);
+	return ret;
+}
+
+/*
+ * J713 external DCP: clear every PTE of the window @dva, TLB flush,
+ * then read every one back as invalid. The number of pages unmapped, or an
+ * error, after which the window's pages must be kept until reboot (a stale
+ * translation may survive).
+ */
+static int __apple_dart_dcp_dispext_window_unmap(struct device *piodma, u64 dva)
+{
+	struct apple_dart_dcp *dcp = apple_dart_dcp_dispext_sid0(piodma);
+	unsigned long flags;
+	int root, ret, cleared = 0;
+
+	if (!dcp)
+		return -ENODEV;
+	mutex_lock(&dcp->alloc_lock);
+	root = apple_dart_dcp_window_root(dcp, dva);
+	ret = -EINVAL;
+	if (root < 0)
+		goto unlock;
+	ret = 0;
+	if (!dcp->table[root])
+		goto unlock;
+	ret = -EIO;
+	if (apple_dart_dispext_retired(dcp->dart))
+		goto unlock;
+	if (!apple_dart_dcp_registers(dcp) || apple_dart_fault_pending(dcp->dart))
+		goto failed;
+	spin_lock_irqsave(&dcp->lock, flags);
+	if (READ_ONCE(dcp->root[root]) != dcp->entry[root]) {
+		spin_unlock_irqrestore(&dcp->lock, flags);
+		goto failed;
+	}
+	for (unsigned int i = 0; i < DCP_DART_ENTRIES; i++)
+		if (READ_ONCE(dcp->table[root][i]) != dcp->expected[root][i]) {
+			spin_unlock_irqrestore(&dcp->lock, flags);
+			goto failed;
+		}
+	for (unsigned int i = 0; i < DCP_DART_ENTRIES; i++) {
+		if (!dcp->expected[root][i])
+			continue;
+		WRITE_ONCE(dcp->table[root][i], 0);
+		dcp->expected[root][i] = 0;
+		cleared++;
+	}
+	dma_wmb();
+	spin_unlock_irqrestore(&dcp->lock, flags);
+	ret = apple_dart_dcp_flush(dcp);
+	if (!ret)
+		ret = __apple_dart_dcp_check(piodma);
+	for (unsigned int i = 0; !ret && i < DCP_DART_ENTRIES; i++)
+		if (READ_ONCE(dcp->table[root][i]) ||
+		    apple_dart_dcp_translate(dcp, dva + (u64)i * DCP_DART_PAGE))
+			ret = -EIO;
+	if (!ret) {
+		ret = cleared;
+		goto unlock;
+	}
+failed:
+	if (!ret)
+		ret = -EIO;
+	apple_dart_dcp_dispext_fail(dcp->dart, "window unmap at %#llx failed: %d", dva, ret);
+	dev_err(piodma, "SID0 window %#llx: unmap failed: %d; pages retained\n", dva, ret);
+unlock:
+	mutex_unlock(&dcp->alloc_lock);
+	return ret;
 }
 
 static int __apple_dart_dcp_shared_map(struct device *dev, struct device *piodma,
@@ -668,3 +877,23 @@ int apple_dart_dcp_dispext_qualify(struct device *piodma)
 	return APPLE_DART_DISPEXT_GATED(piodma, __apple_dart_dcp_dispext_qualify(piodma));
 }
 EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_qualify);
+
+int apple_dart_dcp_dispext_window_claim(struct device *piodma, u64 *dva)
+{
+	return APPLE_DART_DISPEXT_GATED(piodma, __apple_dart_dcp_dispext_window_claim(piodma, dva));
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_window_claim);
+
+int apple_dart_dcp_dispext_window_map(struct device *piodma, u64 dva, const phys_addr_t *phys,
+				      unsigned int count)
+{
+	return APPLE_DART_DISPEXT_GATED(piodma,
+		__apple_dart_dcp_dispext_window_map(piodma, dva, phys, count));
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_window_map);
+
+int apple_dart_dcp_dispext_window_unmap(struct device *piodma, u64 dva)
+{
+	return APPLE_DART_DISPEXT_GATED(piodma, __apple_dart_dcp_dispext_window_unmap(piodma, dva));
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_dispext_window_unmap);
