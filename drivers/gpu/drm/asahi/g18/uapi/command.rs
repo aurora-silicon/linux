@@ -31,15 +31,40 @@ use g17_submission::{
 };
 
 pub(crate) const UAPI_COMMAND_HEADER_SIZE: usize = 8;
-pub(crate) const UAPI_RENDER_SIZE: usize = 272;
-pub(crate) const UAPI_COMPUTE_SIZE: usize = 88;
-pub(crate) const UAPI_G18_COMPUTE_SIZE: usize = 136;
-pub(crate) const COMPUTE_G18_RESOURCES: u32 = 1 << 2;
-/// `drm_asahi_cmd_render_g18`: the render payload plus its 80-byte suffix.
+/// `sizeof(struct drm_asahi_cmd_render)`. Shorter payloads are zero-extended.
+pub(crate) const UAPI_RENDER_SIZE: usize = 448;
+/// `drm_asahi_cmd_render::ts_frag_end_copies`, which G18 does not implement:
+/// the words must be zero.
+const RENDER_TIMESTAMP_COPIES: core::ops::Range<usize> = 0x100..0x140;
+/// `drm_asahi_cmd_render::prior_vdm` and `prior_cdm`.
+const RENDER_PRIOR_VDM: usize = 0x140;
+const RENDER_PRIOR_CDM: usize = 0x148;
+/// `drm_asahi_cmd_render::ray_query`. G18 has no ray queries: the words
+/// must be zero.
+const RENDER_RAY_QUERY: core::ops::Range<usize> = 0x150..UAPI_RENDER_SIZE;
+/// `sizeof(struct drm_asahi_cmd_render_g18)`: the complete render payload
+/// followed by the 80-byte `drm_asahi_g18_render_resources`.
 pub(crate) const UAPI_G18_RENDER_SIZE: usize = UAPI_RENDER_SIZE + 80;
+/// `sizeof(struct drm_asahi_cmd_compute)`. Shorter payloads are zero-extended.
+pub(crate) const UAPI_COMPUTE_SIZE: usize = 200;
+/// `drm_asahi_cmd_compute::ts_end_copies`, which G18 does not implement.
+const COMPUTE_TIMESTAMP_COPIES: core::ops::Range<usize> = 0x40..0x80;
+/// `drm_asahi_cmd_compute::scs_layout`.
+const COMPUTE_SCS_LAYOUT: usize = 0x80;
+/// `drm_asahi_cmd_compute::prior_vdm` and `prior_cdm`.
+const COMPUTE_PRIOR_VDM: usize = 0x88;
+const COMPUTE_PRIOR_CDM: usize = 0x90;
+/// `cdm_auxiliary_allocation` through `intersection_default_control`, which
+/// G18 does not implement: the words must be zero.
+const COMPUTE_UNSUPPORTED: core::ops::Range<usize> = 0x98..UAPI_COMPUTE_SIZE;
+/// `sizeof(struct drm_asahi_cmd_compute_g18)`: the complete compute payload
+/// followed by the 64-byte `drm_asahi_g18_compute_resources`.
+pub(crate) const UAPI_G18_COMPUTE_SIZE: usize = UAPI_COMPUTE_SIZE + 64;
+/// `DRM_ASAHI_COMPUTE_G18_RESOURCES`.
+pub(crate) const COMPUTE_G18_RESOURCES: u32 = 1 << 19;
 /// `DRM_ASAHI_RENDER_G18_RESOURCES`. Only the G18 adapter may consume and
 /// strip it; the shared translator's RENDER_FLAGS keeps refusing it.
-pub(crate) const RENDER_G18_RESOURCES: u32 = 1 << 21;
+pub(crate) const RENDER_G18_RESOURCES: u32 = 1 << 25;
 pub(crate) const UAPI_ATTACHMENT_SIZE: usize = 24;
 pub(crate) const UAPI_MAX_ATTACHMENTS: usize = 16;
 pub(crate) const UAPI_MAX_HARDWARE_COMMANDS: u32 = 64;
@@ -371,18 +396,21 @@ pub(crate) struct UapiRenderCommand {
 
 impl UapiRenderCommand {
     fn parse(raw: &[u8]) -> Result<Self, UapiTranslateError> {
-        // Legacy payloads are zero-extended exactly as before. A flagged G18
-        // suffix must be complete; padding could hide a truncated field.
+        // Shorter payloads are zero-extended. A flagged G18 suffix must be
+        // complete; padding could hide a truncated field. Words G18 does not
+        // implement (timestamp copies, ray queries) must be zero, as must
+        // anything after the structure or, when flagged, its suffix.
         let has_resources = raw.len() >= 4 && get_u32(raw, 0) & RENDER_G18_RESOURCES != 0;
         if has_resources && raw.len() < UAPI_G18_RENDER_SIZE {
             return Err(UapiTranslateError::PayloadTruncated);
         }
-        if !has_resources && raw.len() > UAPI_RENDER_SIZE
-            && raw[UAPI_RENDER_SIZE..].iter().any(|byte| *byte != 0)
+        let raw = padded_payload::<UAPI_G18_RENDER_SIZE>(raw)?;
+        let unused_tail = if has_resources { UAPI_G18_RENDER_SIZE } else { UAPI_RENDER_SIZE };
+        if raw[RENDER_TIMESTAMP_COPIES].iter().chain(&raw[RENDER_RAY_QUERY])
+            .chain(&raw[unused_tail..]).any(|byte| *byte != 0)
         {
             return Err(UapiTranslateError::PayloadTail);
         }
-        let raw = padded_payload::<UAPI_G18_RENDER_SIZE>(raw)?;
         let mut g18_resources = [0; 20];
         if has_resources {
             for (i, word) in g18_resources.iter_mut().enumerate() {
@@ -422,8 +450,8 @@ impl UapiRenderCommand {
             stencil_clear: get_u32(&raw, 0xcc),
             vertex_timestamps: timestamps(&raw, 0xd0),
             fragment_timestamps: timestamps(&raw, 0xe0),
-            prior_vdm: get_u64(&raw, 0x100),
-            prior_cdm: get_u64(&raw, 0x108),
+            prior_vdm: get_u64(&raw, RENDER_PRIOR_VDM),
+            prior_cdm: get_u64(&raw, RENDER_PRIOR_CDM),
             g18_resources,
         })
     }
@@ -446,23 +474,27 @@ pub(crate) struct UapiComputeCommand {
 
 impl UapiComputeCommand {
     fn parse(raw: &[u8]) -> Result<Self, UapiTranslateError> {
-        // Legacy compute payloads are zero-extended as before. A flagged
-        // metadata payload must be complete; padding it could hide truncation
-        // of a valid zero-valued field or reserved word.
+        // Shorter compute payloads are zero-extended. A flagged metadata
+        // payload must be complete; padding it could hide truncation of a
+        // valid zero-valued field or reserved word. Words G18 does not
+        // implement (timestamp copies, the auxiliary allocation, intersection
+        // tables) must be zero, as must anything after the structure or,
+        // when flagged, its suffix.
         let has_resources = raw.len() >= 4 && get_u32(raw, 0) & COMPUTE_G18_RESOURCES != 0;
         if has_resources && raw.len() < UAPI_G18_COMPUTE_SIZE {
             return Err(UapiTranslateError::PayloadTruncated);
         }
-        if !has_resources && raw.len() > UAPI_COMPUTE_SIZE
-            && raw[UAPI_COMPUTE_SIZE..].iter().any(|byte| *byte != 0)
+        let raw = padded_payload::<UAPI_G18_COMPUTE_SIZE>(raw)?;
+        let unused_tail = if has_resources { UAPI_G18_COMPUTE_SIZE } else { UAPI_COMPUTE_SIZE };
+        if raw[COMPUTE_TIMESTAMP_COPIES].iter().chain(&raw[COMPUTE_UNSUPPORTED])
+            .chain(&raw[unused_tail..]).any(|byte| *byte != 0)
         {
             return Err(UapiTranslateError::PayloadTail);
         }
-        let raw = padded_payload::<UAPI_G18_COMPUTE_SIZE>(raw)?;
         let mut g18_resources = [0; 16];
         if has_resources {
             for (i, word) in g18_resources.iter_mut().enumerate() {
-                *word = get_u32(&raw, 72 + i * 4);
+                *word = get_u32(&raw, UAPI_COMPUTE_SIZE + i * 4);
             }
         }
         Ok(Self {
@@ -473,10 +505,10 @@ impl UapiComputeCommand {
             sampler_heap: get_u64(&raw, 0x18),
             helper: helper(&raw, 0x20),
             timestamps: timestamps(&raw, 0x30),
-            scs_layout: get_u64(&raw, 0x40),
+            scs_layout: get_u64(&raw, COMPUTE_SCS_LAYOUT),
             g18_resources,
-            prior_vdm: if has_resources { 0 } else { get_u64(&raw, 0x48) },
-            prior_cdm: if has_resources { 0 } else { get_u64(&raw, 0x50) },
+            prior_vdm: get_u64(&raw, COMPUTE_PRIOR_VDM),
+            prior_cdm: get_u64(&raw, COMPUTE_PRIOR_CDM),
         })
     }
 }
