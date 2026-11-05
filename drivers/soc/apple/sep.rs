@@ -2143,11 +2143,17 @@ impl SepData {
                 ),
             }
             let a = answer?;
-            if status != 0
-                || a.satisfied
-                || a.requirement != Some((crate::scrd::SCRD_REQUIREMENT_BIOMETRY_MATCHED, 1, 0))
-            {
+            // A biometric match must be outstanding. Flags bit 0 is opaque
+            // mechanism metadata the backend may set; nothing else may be.
+            let admitted = matches!(
+                a.requirement,
+                Some((ty, 1, flags)) if ty == crate::scrd::SCRD_REQUIREMENT_BIOMETRY_MATCHED && flags & !1 == 0
+            );
+            if status != 0 || a.satisfied || !admitted {
                 return None;
+            }
+            if a.requirement.is_some_and(|(_, _, flags)| flags & 1 != 0) {
+                dev_info!(self.dev, "scrd: unlock preflight: requirement carries acm-mechanism-bit0\n");
             }
             Some(())
         })();
