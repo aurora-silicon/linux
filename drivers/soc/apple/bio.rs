@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
 
+pub(crate) mod key;
+pub(crate) use key::worker_done;
+
 use crate::store::{Key, Store};
 use kernel::ioctl::{_IO, _IOR, _IOW, _IOWR};
 use kernel::prelude::*;
@@ -383,6 +386,7 @@ impl IdentityIndex {
 
 enum Op {
     Idle,
+    Key(key::Operation),
     Enrol {
         label: [u8; LABEL_LEN],
         stage: u32,
@@ -406,6 +410,7 @@ impl Op {
     fn is_terminal(&self) -> bool {
         match self {
             Op::Idle => false,
+            Op::Key(operation) => operation.is_terminal(),
             Op::Enrol { terminal, .. } => terminal.is_some(),
             Op::Verify { terminal, .. } => terminal.is_some(),
         }
@@ -418,6 +423,7 @@ impl Op {
 
 pub(crate) struct Session {
     open: bool,
+    worker_active: bool,
     op: Op,
     unseen: bool,
     enrol_stage_unseen: bool,
@@ -428,6 +434,7 @@ impl Session {
     pub(crate) fn new() -> Session {
         Session {
             open: false,
+            worker_active: false,
             op: Op::Idle,
             unseen: false,
             enrol_stage_unseen: false,
@@ -443,6 +450,10 @@ impl Session {
         self.token = None;
     }
 
+    pub(crate) fn available(&self) -> bool {
+        !self.worker_active && self.op.may_start()
+    }
+
     pub(crate) fn ready(&self) -> bool {
         self.unseen
     }
@@ -453,6 +464,7 @@ pub(crate) struct Context<'a> {
     pub(crate) index: &'a IdentityIndex,
     pub(crate) sensor_present: bool,
     pub(crate) live_identity_count: Option<usize>,
+    pub(crate) biometric_keys_supported: bool,
 }
 
 pub(crate) struct Handled {
@@ -519,7 +531,7 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         // when SEP itself successfully answered LIST_IDENTITIES; older
         // kernels and unavailable SEP contexts leave this flag clear.
         reserved: [
-            u32::from(ctx.live_identity_count.is_some()),
+            u32::from(ctx.live_identity_count.is_some()) | key::capabilities(ctx.biometric_keys_supported),
             ctx.live_identity_count.unwrap_or(0) as u32,
             0,
         ],
@@ -560,7 +572,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
     require_sensor(ctx.sensor_present)?;
 
-    if !ctx.session.op.may_start() {
+    if !ctx.session.available() {
         return Err(EBUSY);
     }
     if matches!(ctx.live_identity_count, Some(count) if count >= SEP_USER_CAPACITY)
@@ -569,6 +581,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         return Err(ENOSPC);
     }
 
+    ctx.session.worker_active = true;
     ctx.session.op = Op::Enrol {
         label: request.label,
         stage: 0,
@@ -632,6 +645,7 @@ pub(crate) fn capture_guide(session: &mut Session, guide: Guidance) -> bool {
                 false
             }
         }
+        Op::Key(operation) => operation.capture_guide(guide),
         Op::Idle => false,
     };
     if changed {
@@ -682,7 +696,7 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
-        Op::Verify { .. } => return Err(EBUSY),
+        Op::Verify { .. } | Op::Key(_) => return Err(EBUSY),
         Op::Enrol {
             stage,
             terminal,
@@ -732,7 +746,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
     require_sensor(ctx.sensor_present)?;
 
-    if !ctx.session.op.may_start() {
+    if !ctx.session.available() {
         return Err(EBUSY);
     }
 
@@ -755,6 +769,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
 
     ctx.session.token = None;
+    ctx.session.worker_active = true;
     ctx.session.op = Op::Verify {
         nonce: request.nonce,
         terminal: None,
@@ -798,7 +813,7 @@ pub(crate) fn verify_is_live(session: &Session) -> bool {
 }
 
 pub(crate) fn capture_is_live(session: &Session) -> bool {
-    enrol_is_live(session) || verify_is_live(session)
+    enrol_is_live(session) || verify_is_live(session) || key::key_is_live(session)
 }
 
 fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
@@ -808,7 +823,7 @@ fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
-        Op::Enrol { .. } => return Err(EBUSY),
+        Op::Enrol { .. } | Op::Key(_) => return Err(EBUSY),
         Op::Verify { nonce, terminal, guidance } => {
             out.guidance = *guidance;
             match terminal {
@@ -858,7 +873,10 @@ fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 }
 
 fn cancel(ctx: &mut Context<'_>) -> Result<Handled> {
-    if ctx.session.op.is_terminal() {
+    if ctx.session.op.is_terminal()
+        && !matches!(&ctx.session.op, Op::Key(operation)
+            if operation.can_cancel())
+    {
         return Err(ENOENT);
     }
 
@@ -866,6 +884,7 @@ fn cancel(ctx: &mut Context<'_>) -> Result<Handled> {
         Op::Idle => return Err(ENOENT),
         Op::Enrol { terminal, .. } => *terminal = Some(EnrolOutcome::Failed(STATUS_LOCAL)),
         Op::Verify { terminal, .. } => *terminal = Some(VerifyOutcome::Failed(STATUS_LOCAL)),
+        Op::Key(operation) => operation.cancel(),
     }
 
     ctx.session.token = None;
@@ -892,6 +911,7 @@ pub(crate) fn abort_capture(session: &mut Session) -> bool {
         Op::Verify { terminal, .. } if terminal.is_none() => {
             *terminal = Some(VerifyOutcome::Failed(STATUS_LOCAL))
         }
+        Op::Key(operation) if operation.can_cancel() => operation.cancel(),
         _ => return false,
     }
     session.token = None;
@@ -906,6 +926,7 @@ pub(crate) fn starts_capture(cmd: u32) -> bool {
 
 fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     require_admin()?;
+    if !ctx.session.available() { return Err(EBUSY); }
     let request: Delete = UserSlice::new(user, core::mem::size_of::<Delete>())
         .reader()
         .read()?;
@@ -935,6 +956,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
 fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
     require_admin()?;
+    if !ctx.session.available() { return Err(EBUSY); }
 
     if ctx.index.total() == 0 {
         pr_info!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
@@ -963,7 +985,7 @@ fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
 }
 
 pub(crate) fn open(session: &mut Session) -> Result<()> {
-    if session.open {
+    if session.open || session.worker_active {
         return Err(EBUSY);
     }
     session.reset();
