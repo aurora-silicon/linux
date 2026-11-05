@@ -267,9 +267,16 @@ static void dcpib_announce(struct dcpib_ep *ep, u16 interface,
 
 	dev_info(ep->dcp->dev, "AFK[%02x]: opening %s on interface %u\n",
 		 ep->ep, service->name, interface);
-	if (dcpib_tx_v2(ep, interface, &open, sizeof(open)))
+	if (dcpib_tx_v2(ep, interface, &open, sizeof(open))) {
 		dev_err(ep->dcp->dev, "AFK[%02x]: failed to open %s\n", ep->ep,
 			service->name);
+	} else if (strstr(service->name, "dcpav-video-interface")) {
+		/*
+		 * The AV service powers the display on with this interface and
+		 * starts its idle power off timer: SET_MODE again once it is up.
+		 */
+		dcpib_av_started(ep->dcp);
+	}
 	if (ep->nr_services == ep->expected)
 		complete_all(&ep->services_done);
 }
