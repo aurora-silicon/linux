@@ -3604,8 +3604,51 @@ static void tb_test_apple_right_dpin_wiring(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tb_apple_nhi_needs_bw_grant(&missing));
 }
 
+/*
+ * TB_HOST_DP_HBR2_MAX: a second DP tunnel keeps the rate of the first and
+ * gives up lanes instead; alone, lanes go before the rate.
+ */
+static void tb_test_dp_reduce_bandwidth_shared(struct kunit *test)
+{
+	u32 rate, lanes;
+
+	/* Room for HBR2 x4: nothing reduced. */
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(20000, 5400, 4, 5400, 4, 0,
+							    &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(20000, 5400, 4, 5400, 4, 5400,
+							    &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	/* 10000 Mb/s: HBR2 x2, never HBR x4. */
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(10000, 5400, 4, 5400, 4, 5400,
+							    &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 2);
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(10000, 5400, 4, 5400, 4, 0,
+							    &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 2);
+	/* 4000 Mb/s: alone, a lower rate; next to an HBR2 tunnel, nothing. */
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(4000, 5400, 4, 5400, 4, 0,
+							    &rate, &lanes), 0);
+	KUNIT_EXPECT_LT(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(4000, 5400, 4, 5400, 4, 5400,
+							    &rate, &lanes), -ENOSR);
+	/* The other tunnel's rate, lower than this one's: taken, at x4. */
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(20000, 5400, 4, 5400, 4, 2700,
+							    &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 2700);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	/* A rate this sink cannot run: refused. */
+	KUNIT_EXPECT_EQ(test, tb_dp_reduce_bandwidth_shared(20000, 5400, 4, 2700, 4, 5400,
+							    &rate, &lanes), -ENOSR);
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_apple_right_dpin_wiring),
+	KUNIT_CASE(tb_test_dp_reduce_bandwidth_shared),
 	KUNIT_CASE(tb_test_dp_generation),
 	KUNIT_CASE(tb_test_dp_dprx_deferred_first),
 	KUNIT_CASE(tb_test_dp_dprx_cancel),
