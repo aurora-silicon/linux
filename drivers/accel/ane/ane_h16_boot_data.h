@@ -315,6 +315,20 @@ static const struct ane_h16_preload_rule ane_h16_preload_25g83 = {
 	},
 };
 
+/* 26.5.2 keeps the 25G83 DATA layout around a different resident image. */
+static const struct ane_h16_preload_rule ane_h16_preload_25f84 = {
+	.cells = ane_h16_patchbay_25g83,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_25g83),
+	.zero_start = 0x1bc00,
+	.zero_end = 0x1c2a0,
+	.digest = {
+		0x17, 0xc3, 0xef, 0x19, 0x6b, 0x89, 0xe4, 0xf5,
+		0x94, 0x9a, 0xc7, 0x77, 0x76, 0x0e, 0x5b, 0x05,
+		0x80, 0x1f, 0xf5, 0xaa, 0x3b, 0x9f, 0x93, 0x77,
+		0x57, 0xfb, 0xd4, 0xee, 0xf5, 0x6b, 0x00, 0x45,
+	},
+};
+
 /* Every supported H16 firmware build, matched against the live preload. */
 static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	{
@@ -325,6 +339,11 @@ static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	{
 		.identity = "H16 26.6.2 25G83",
 		.preload = &ane_h16_preload_25g83,
+		.build = &ane_h16_build_26a428,
+	},
+	{
+		.identity = "H16 26.5.2 25F84",
+		.preload = &ane_h16_preload_25f84,
 		.build = &ane_h16_build_26a428,
 	},
 };

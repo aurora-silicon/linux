@@ -8,6 +8,7 @@
 #include "ane_fw_protocol.h"
 #include "ane_h16_execute.h"
 
+#define ANE_FW_TERMINAL 0
 #define ANE_FW_IO 1
 #define ANE_FW_SHAREDMALLOC 5
 #define ANE_FW_IO_T2H 6
@@ -128,6 +129,8 @@ struct ane_fw_transport {
 	size_t pool_used;
 	size_t shared_bytes;
 	u32 shared_count;
+	u64 terminal_messages;
+	u64 terminal_bytes;
 	int error;
 	/* ane_fw_transport.h line that raised error, for diagnosis. */
 	unsigned int error_line;
@@ -809,6 +812,39 @@ static inline int ane_fw_transport_irq(struct ane_fw_transport *t, u32 *pending)
 	return 0;
 }
 
+/*
+ * The firmware's text log on a unidirectional type 2 ring: a slot is ready when
+ * bit 0 of its header is clear, and the consumer returns it by storing 1, with
+ * no doorbell. The text is discarded. An unserved ring fills and the firmware's
+ * printf blocks behind it.
+ */
+static inline int ane_fw_transport_terminal(struct ane_fw_transport *t)
+{
+	const struct ane_fw_channel *c = &t->channels[ANE_FW_TERMINAL];
+	unsigned int i;
+
+	if (c->type != 2)
+		return 0;
+	for (i = 0; i < c->slots; i++) {
+		u8 *slot = ane_fw_transport_slot(t, ANE_FW_TERMINAL);
+		u64 header = t->ops->load64(t->ctx, slot), bytes;
+
+		t->ops->read_barrier(t->ctx);
+		if (header & 1)
+			break;
+		bytes = t->ops->load64(t->ctx, slot + 8);
+		if (bytes && !ane_fw_transport_report(t, header & ~3ULL, bytes))
+			return ane_fw_transport_fail(t, -EPROTO);
+		t->terminal_messages++;
+		t->terminal_bytes += bytes;
+		t->ops->write_barrier(t->ctx);
+		t->ops->store64(t->ctx, slot, 1);
+		t->ops->write_barrier(t->ctx);
+		ane_fw_transport_advance(t, ANE_FW_TERMINAL);
+	}
+	return 0;
+}
+
 /* The original absolute command deadline survives every provider/IRQ service. */
 /*
  * After a program is torn down the firmware posts FREE for its process pool,
@@ -835,6 +871,9 @@ static inline int ane_fw_transport_settle(struct ane_fw_transport *t, u64 quiet_
 		} else if (ret != -EAGAIN) {
 			return ret;
 		}
+		ret = ane_fw_transport_terminal(t);
+		if (ret)
+			return ret;
 		if (now - last >= quiet_ns || now - start >= limit_ns)
 			return served;
 		t->polls++;
@@ -857,6 +896,9 @@ static inline int ane_fw_transport_wait(struct ane_fw_transport *t, unsigned int
 			return ret;
 		ret = ane_fw_transport_shared(t);
 		if (ret && ret != -EAGAIN)
+			return ret;
+		ret = ane_fw_transport_terminal(t);
+		if (ret)
 			return ret;
 		/* Recheck before sleeping, including time spent in alloc(). */
 		now = t->ops->now_ns(t->ctx);
