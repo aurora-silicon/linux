@@ -87,11 +87,16 @@ mod lockout_tests {
         let handle = [0xa5u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
         let op = sbio_image_processing_init(ImagePurpose::Matching, true, true, 0, user, 0, Some(&handle));
         assert_eq!(&op.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &SBIO_MATCH_MODE_UNLOCK.to_le_bytes());
-        assert_eq!(&op.payload[IPI_ACM_HANDLE..IPI_ACM_HANDLE + handle.len()], &handle);
         assert_eq!(&op.payload[IPI_USER_ID..IPI_USER_ID + 4], &1000i32.to_le_bytes());
+        assert_eq!(&op.payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4], &16u32.to_le_bytes());
+        assert_eq!(&op.payload[0x97..0xa7], &handle);
+        assert_eq!(op.payload().len(), 0xa7);
+        // The fixed token slot belongs to another mode and stays empty.
+        assert!(op.payload[0x83..0x93].iter().all(|b| *b == 0));
         let plain = sbio_image_processing_init(ImagePurpose::Enrolment, true, false, 0, user, 0, None);
         assert_eq!(&plain.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &[0u8; 4]);
-        assert!(plain.payload[IPI_ACM_HANDLE..IPI_ACM_HANDLE + handle.len()].iter().all(|b| *b == 0));
+        assert_eq!(&plain.payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4], &[0u8; 4]);
+        assert_eq!(plain.payload().len(), 0x97);
     }
 }
 
@@ -1915,9 +1920,11 @@ impl SepData {
         };
         dev_info!(
             self.dev,
-            "verify: match mode {:#x}, user {}, match context generation {}\n",
+            "verify: match mode {:#x}, user {}, credential length {}, image init length {:#x}, match context generation {}\n",
             crate::sbio::SBIO_MATCH_MODE_UNLOCK,
             user.value(),
+            scope.len(),
+            crate::sbio::SBIO_IMAGE_INIT_LEN + scope.len(),
             self.match_context_generation.load(Relaxed)
         );
 
@@ -4937,8 +4944,10 @@ pub(crate) struct SbioOp {
     name: &'static CStr,
 }
 
-const SBIO_MAX_PAYLOAD: usize = 0x97;
+/// The largest request: an image init with its credential-context blob.
+const SBIO_MAX_PAYLOAD: usize = SBIO_IMAGE_INIT_LEN + crate::scrd::SCRD_ACM_HANDLE_LEN;
 
+/// The image init without a credential context.
 pub(crate) const SBIO_IMAGE_INIT_LEN: usize = 0x97;
 static_assert!(SBIO_IMAGE_INIT_LEN <= SBIO_MAX_PAYLOAD);
 
@@ -5794,15 +5803,20 @@ const IPI_DEVICE_KIND: usize = 0x4f;
 const IPI_USER_ID: usize = 0x67;
 
 const IPI_DEVICE_BUILTIN: u32 = 1;
-/// The match mode word and the ACM handle of an authenticated match.
+/// The match mode word of an authenticated match.
 const IPI_MATCH_MODE: usize = 0x00;
-const IPI_ACM_HANDLE: usize = 0x83;
-/// Match mode of an authenticated unlock match of a positive user.
+/// Match mode of an authenticated unlock match of a positive user. It
+/// includes the credential-set bit, which makes the request carry the ACM
+/// context as a length-prefixed blob after the base structure.
 pub(crate) const SBIO_MATCH_MODE_UNLOCK: u32 = 0x89;
+/// The length word of the credential-set blob; its bytes follow the base.
+const IPI_CREDENTIAL_LEN: usize = 0x93;
+const IPI_CREDENTIAL: usize = SBIO_IMAGE_INIT_LEN;
 
 static_assert!(IPI_MATCH_MODE + 4 <= IPI_FIRST_IMAGE);
-static_assert!(IPI_ACM_HANDLE > IPI_USER_ID + 4);
-static_assert!(IPI_ACM_HANDLE + crate::scrd::SCRD_ACM_HANDLE_LEN <= SBIO_IMAGE_INIT_LEN);
+static_assert!(IPI_CREDENTIAL_LEN > IPI_USER_ID + 4);
+static_assert!(IPI_CREDENTIAL_LEN + 4 == SBIO_IMAGE_INIT_LEN);
+static_assert!(IPI_CREDENTIAL + crate::scrd::SCRD_ACM_HANDLE_LEN <= SBIO_MAX_PAYLOAD);
 
 static_assert!(IPI_USER_ID + 4 <= SBIO_MAX_PAYLOAD);
 static_assert!(IPI_DEVICE_KIND + 4 <= SBIO_MAX_PAYLOAD);
@@ -5833,13 +5847,17 @@ pub(crate) fn sbio_image_processing_init(
 ) -> SbioOp {
     let mut payload = [0u8; SBIO_MAX_PAYLOAD];
 
-    // An authenticated match names its mode and carries the live ACM handle;
-    // without them the enclave matches in a scope with its own small limit.
+    // An authenticated match names its mode and appends the live ACM handle
+    // as a length-prefixed blob; without it the enclave matches in a scope
+    // with its own small limit.
+    let mut payload_len = SBIO_IMAGE_INIT_LEN;
     if let Some(handle) = scope {
         payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4]
             .copy_from_slice(&SBIO_MATCH_MODE_UNLOCK.to_le_bytes());
-        payload[IPI_ACM_HANDLE..IPI_ACM_HANDLE + crate::scrd::SCRD_ACM_HANDLE_LEN]
-            .copy_from_slice(handle);
+        payload[IPI_CREDENTIAL_LEN..IPI_CREDENTIAL_LEN + 4]
+            .copy_from_slice(&(handle.len() as u32).to_le_bytes());
+        payload[IPI_CREDENTIAL..IPI_CREDENTIAL + handle.len()].copy_from_slice(handle);
+        payload_len += handle.len();
     }
 
     if first_image {
@@ -5862,7 +5880,7 @@ pub(crate) fn sbio_image_processing_init(
     SbioOp {
         opcode: OP_SBIO_IMAGE_INIT,
         payload,
-        payload_len: SBIO_IMAGE_INIT_LEN,
+        payload_len,
         name: c"IMAGE_PROCESSING_INIT",
     }
 }
