@@ -2157,6 +2157,11 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		ret = macaudio_spk_take_volumes(ma);
 		if (ret)
 			return dev_err_probe(card->dev, ret, "speaker volumes missing\n");
+		/* Save codec-loaded DT corners before the floor and PM notifier. */
+		ret = macaudio_spk_take_hpfs(ma);
+		if (ret)
+			return dev_err_probe(card->dev, ret,
+					     "tweeter high-pass controls missing\n");
 		mutex_lock(&ma->spk_mutex);
 		macaudio_spk_floor(ma, "card bound");
 		ret = ma->spk_floor_failed ? -EIO : 0;
@@ -2383,10 +2388,6 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 
 		if (ret)
 			return ret;
-		ret = macaudio_spk_take_hpfs(ma);
-		if (ret)
-			return dev_err_probe(card->dev, ret,
-					     "tweeter high-pass controls missing\n");
 	}
 
 	/*
