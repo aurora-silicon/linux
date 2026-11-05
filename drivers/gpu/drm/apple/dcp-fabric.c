@@ -624,7 +624,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		dcp_peer_release_26_6(dcp);
 
 	guard(mutex)(&dcp->external_lock);
-	if (dcp_is_external_h17p(dcp) &&
+	if (dcp_is_retained_external(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
 		return dcp->external_error ?: -EAGAIN;
 
@@ -686,7 +686,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		if (sel && sel != -EOPNOTSUPP)
 			dev_warn(dcp->dev, "DP tunnel source reset failed: %d\n", sel);
 	}
-	if (dcp_is_external_h17p(dcp))
+	if (dcp_is_retained_external(dcp))
 		dpavservep_detach(dcp);
 	route->selected = false;
 	ended_attachment = dcp_modes_end_typec(dcp, route);
@@ -1536,7 +1536,7 @@ static bool dcp_rebalance_deactivate(void *data, void *entry)
 	    (dcp->typec_connector && dcp->typec_connector->connected)) {
 		ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 		/* H17P external pipes keep their own stop recovery, as before. */
-		if (ret && !dcp_is_external_h17p(dcp))
+		if (ret && !dcp_is_retained_external(dcp))
 			return true;
 	}
 	port->hpd = false;
@@ -1668,7 +1668,7 @@ static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
 	port->dp_wanted = false;
 	port->dp_hpd = false;
 	/* HPD absence alone is not proof of a completed firmware shutdown. */
-	if (dcp_is_external_h17p(dcp)) {
+	if (dcp_is_retained_external(dcp)) {
 		scoped_guard(mutex, &dcp->external_lock) {
 			if (dcp->external_error)
 				return dcp->external_error;
@@ -1810,7 +1810,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		    (dcp->typec_connector && dcp->typec_connector->connected)) {
 			ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 			/* H17P external pipes keep their own stop recovery, as before. */
-			if (ret && !dcp_is_external_h17p(dcp))
+			if (ret && !dcp_is_retained_external(dcp))
 				return ret;
 		}
 		/*
@@ -2290,7 +2290,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	struct mux_control *xbar = NULL;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,t6030"))
+	if (!of_machine_is_compatible("apple,t6030") && !dcp_is_ext26(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
 	route = dcp->active_typec_route;
@@ -2301,7 +2301,7 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	/* A deselected output went idle, and its clocks with it. */
 	if (dcp->direct_xbar_up && dcp->direct_xbar_up != xbar)
 		dcp->direct_xbar_up = NULL;
-	if (!xbar || !!dcp->direct_xbar_up == up)
+	if (!xbar || (!!dcp->direct_xbar_up == up && (up || !dcp_is_ext26(dcp))))
 		return 0;
 	ret = dcp_dpxbar_link(xbar, up);
 	if (ret) {
@@ -4005,7 +4005,7 @@ static void dcp_typec_route_unregister(void *data)
 		if (port->hpd || dcp->typec_cable_connected)
 			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 		port->hpd = false;
-		if (dcp_typec_route_deactivate(route) && dcp_is_external_h17p(dcp))
+		if (dcp_typec_route_deactivate(route) && dcp_is_retained_external(dcp))
 			return;
 		port->owner = NULL;
 	}
@@ -4016,7 +4016,7 @@ static void dcp_typec_route_unregister(void *data)
 			dcp_tb_binding_retire(dcp, route);
 		if (port->hpd || dcp->typec_cable_connected)
 			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
-		if (dcp_typec_route_deactivate(route) && dcp_is_external_h17p(dcp))
+		if (dcp_typec_route_deactivate(route) && dcp_is_retained_external(dcp))
 			return;
 		port->secondary_owner = NULL;
 	}

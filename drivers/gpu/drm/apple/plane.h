@@ -39,7 +39,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   bool supports_xrgb2101010,
 				   enum drm_plane_type type,
 				   bool interchange,
-				   bool premultiplied);
+				   bool premultiplied, bool native26);
 struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
 					 unsigned long possible_crtcs,
 					 u32 iomfb_surf,
