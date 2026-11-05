@@ -464,6 +464,9 @@ impl AsahiPlatformDriver {
         let resources = regs::Resources::new(pdev)?;
         let res = regs::G17Resources::new(pdev)?;
         let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
+        // SAFETY: Every adapter calls close_binding in unbind before devres;
+        // probe errors drop this local owner while the bound callback is live.
+        let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
         let gpu = crate::m5::probe(pdev, &drm, res)?;
         let data = try_pin_init!(AsahiDrmRegistrationData {
             gpu: gpu as Arc<dyn gpu::Gpu>,
@@ -473,6 +476,7 @@ impl AsahiPlatformDriver {
         // The M5 firmware session retains its firmware-visible state until reboot.
         let reg = unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0)? };
         Ok(AsahiPlatformDriverData {
+            binding,
             _device: reg.device().into(),
             _reg: reg,
             g17: None,

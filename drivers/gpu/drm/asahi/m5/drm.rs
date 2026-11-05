@@ -167,7 +167,8 @@ impl gpu::Gpu for M5DrmGpu {
     fn new_queue(&self, vm: mmu::Vm,
         _ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
         _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
-        priority: u32, usc_exec_base: u64) -> Result<KBox<dyn queue::Queue>> {
+        priority: u32, usc_exec_base: u64,
+        _usage: Arc<crate::usage::Client>) -> Result<KBox<dyn queue::Queue>> {
         if priority > 3 { return Err(EINVAL); }
         let window = command::QueueUscWindow {
             base: usc_exec_base, user_start: vm_layout::DRIVER_BASE, user_end: USER_END,
