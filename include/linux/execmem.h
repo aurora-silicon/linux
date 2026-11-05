@@ -48,10 +48,16 @@ enum execmem_type {
  * enum execmem_range_flags - options for executable memory allocations
  * @EXECMEM_KASAN_SHADOW:	allocate kasan shadow
  * @EXECMEM_ROX_CACHE:		allocations should use ROX cache of huge pages
+ * @EXECMEM_CONFINE:		back allocations for this range with physical
+ *				pages drawn from the confined executable window
+ *				(see CONFIG_EXECMEM_CONFINE). The virtual range
+ *				is still taken from [start, end); only the
+ *				physical backing is restricted.
  */
 enum execmem_range_flags {
 	EXECMEM_KASAN_SHADOW	= (1 << 0),
 	EXECMEM_ROX_CACHE	= (1 << 1),
+	EXECMEM_CONFINE		= (1 << 2),
 };
 
 #ifdef CONFIG_ARCH_HAS_EXECMEM_ROX
@@ -203,5 +209,64 @@ void execmem_init(void);
 #else
 static inline void execmem_init(void) {}
 #endif
+
+#ifdef CONFIG_EXECMEM_CONFINE
+struct gen_pool;
+struct execmem_range;
+
+/**
+ * execmem_confine_init - register the confined executable physical window
+ * @base:	physical base of the window
+ * @size:	size of the window in bytes
+ * @pool:	gen_pool that hands out page-aligned chunks of the window
+ *		(entries added with linear-map virtual addresses)
+ * @enforce:	if true, a confinement violation found by the verifier is
+ *		fatal; if false it is only reported
+ *
+ * Must be called before the first confined allocation, i.e. before
+ * execmem_arch_setup() marks any range with EXECMEM_CONFINE.
+ *
+ * Return: 0 on success, negative errno otherwise.
+ */
+int execmem_confine_init(phys_addr_t base, phys_addr_t size,
+			 struct gen_pool *pool, bool enforce);
+
+/* True once a window has been registered. */
+bool execmem_confine_active(void);
+
+/* True if confinement violations are fatal. */
+bool execmem_confine_enforced(void);
+
+/* Window bounds, valid only when execmem_confine_active(). */
+void execmem_confine_window(phys_addr_t *base, phys_addr_t *size);
+
+/*
+ * Internal backing allocator/free used by mm/execmem.c for EXECMEM_CONFINE
+ * ranges. Not for general use.
+ */
+void *execmem_confine_alloc(struct execmem_range *range, size_t size,
+			    pgprot_t pgprot, unsigned long vm_flags);
+bool execmem_confine_free(void *ptr);
+
+/*
+ * Verify that no EL1-executable mapping resolves to a physical page outside
+ * the window. Returns the number of violations; fills in the number of
+ * executable leaf mappings inspected when @nr_exec is non-NULL. Implemented
+ * generically for the confined allocations; the page-table sweep is provided
+ * per-architecture by execmem_confine_arch_verify().
+ */
+unsigned long execmem_confine_verify(unsigned long *nr_exec);
+
+/*
+ * Architecture page-table sweep. Walk the kernel page tables and, for every
+ * privileged-executable leaf entry, add 1 to *@nr_exec and, if its output
+ * physical address lies outside [base, base + size), add 1 to the return
+ * value. A weak default returns 0 (no sweep available).
+ */
+unsigned long execmem_confine_arch_verify(phys_addr_t base, phys_addr_t size,
+					  unsigned long *nr_exec);
+#else
+static inline bool execmem_confine_active(void) { return false; }
+#endif /* CONFIG_EXECMEM_CONFINE */
 
 #endif /* _LINUX_EXECMEM_ALLOC_H */
