@@ -61,8 +61,10 @@ def main():
         bodies['ipc_chan_send'] = bodies['ipc_chan_send'].replace(
             'int err = READ_ONCE(isp->ipc_error);', 'int err = 0;')
     elif args.control == 'overwrite':
-        bodies['isp_cmd_send'] = bodies['isp_cmd_send'].replace(
-            'int err = READ_ONCE(isp->ipc_error);', 'int err = 0;')
+        guard = 'if (READ_ONCE(isp->ipc_error))\n\t\treturn READ_ONCE(isp->ipc_error);'
+        if guard not in bodies['isp_cmd_send']:
+            raise RuntimeError('overwrite negative control no longer matches its guard')
+        bodies['isp_cmd_send'] = bodies['isp_cmd_send'].replace(guard, '')
     elif args.control == 'stop':
         bodies['apple_isp_stop_capture'] = bodies['apple_isp_stop_capture'].replace(
             'if (!isp_cmd_ch_stop(isp, 0)) /* TODO channel mask */',

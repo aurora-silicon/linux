@@ -39,7 +39,7 @@ KILL = 'kill'
 
 # A killed mutant shows the failing control: a C assertion or abort (-6), or
 # a Rust panic (exit 101). A Python traceback means the harness itself broke.
-KILL_SIGN = re.compile(r'Assertion|": -6\b|"exit": 101\b|panicked at')
+KILL_SIGN = re.compile(r'FAIL line [0-9]+|Assertion|": -6\b|"exit": 101\b|panicked at')
 BROKEN_SIGN = re.compile(r'Traceback \(most recent call last\)')
 
 
@@ -55,7 +55,7 @@ def mutations(flag, names, base, expect=KILL):
 ASAHI_TESTS = {
     'isp-preview-tests.py': [([], PASS)],
     'isp-preview-flow-tests.py': [([], PASS)],
-    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']],
+    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']] + [(['--suite', suite, '--control', control] + out(), KILL) for suite, controls in [('session', ['send', 'overwrite', 'stop', 'reset']), ('buffers', ['rollback']), ('receive', ['drain']), ('returns', ['address', 'pool', 'duplicate', 'snapshot']), ('queue', ['queue-error'])] for control in controls],
     'aop-als-channel-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
