@@ -212,6 +212,7 @@ pre4=pre[:pre.index('struct device {')]+r'''
 #define DCP_FW_VERSION(a,b,c) ((a)*10000+(b)*100+(c))
 #define DCP_FW_VER DCP_FW_VERSION(26,6,0)
 #define DCP_FW_NAME(n) n
+#define DCP_FW_H17(x) 1
 #define round_down(x,a) ((x)&~((__typeof__(x))(a)-1))
 #define check_add_overflow(a,b,p) __builtin_add_overflow((a),(b),(p))
 #define dev_warn(...) ((void)0)
