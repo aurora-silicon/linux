@@ -87,6 +87,8 @@ struct macaudio_test_spk {
 	struct macaudio_snd_data *ma;
 	struct snd_kcontrol *spk;
 	struct snd_kcontrol *vols[MACAUDIO_TEST_NR_VOLS];
+	/* "Speaker Protection Crossover" */
+	struct snd_kcontrol *xover;
 	struct snd_ctl_file *owner;
 };
 
@@ -159,6 +161,7 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 		tmpl.private_value = (unsigned long)&vol->mc;
 		t->vols[i] = macaudio_test_add_kctl(test, card, &tmpl, NULL);
 	}
+	t->xover = macaudio_test_add_kctl(test, card, &macaudio_spk_xover_control, &ma->card);
 
 	/* Last in, so first out: before the controls go */
 	ret = kunit_add_action_or_reset(test, macaudio_spk_fini, ma);
@@ -166,6 +169,7 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 
 	/* As macaudio_late_probe() does */
 	ma->spk_kctl = t->spk;
+	ma->spk_xover_kctl = t->xover;
 	KUNIT_ASSERT_EQ(test, macaudio_spk_take_volumes(ma), 0);
 	mutex_lock(&ma->spk_mutex);
 	macaudio_spk_floor(ma, "card bound");
@@ -193,6 +197,39 @@ static long macaudio_test_read(struct kunit *test, struct macaudio_test_spk *t)
 static void macaudio_test_take(struct kunit *test, struct macaudio_test_spk *t)
 {
 	KUNIT_ASSERT_EQ(test, macaudio_spk_lock(t->spk, t->owner), 0);
+}
+
+static int macaudio_test_xover_write(struct kunit *test, struct macaudio_test_spk *t, long val)
+{
+	struct snd_ctl_elem_value *uval = kunit_kzalloc(test, sizeof(*uval), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, uval);
+	uval->value.integer.value[0] = val;
+	return macaudio_spk_xover_put(t->xover, uval);
+}
+
+static long macaudio_test_xover_read(struct kunit *test, struct macaudio_test_spk *t)
+{
+	struct snd_ctl_elem_value *uval = kunit_kzalloc(test, sizeof(*uval), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, uval);
+	KUNIT_EXPECT_EQ(test, macaudio_spk_xover_get(t->xover, uval), 0);
+	return uval->value.integer.value[0];
+}
+
+/* The owner locks the crossover control, as SNDRV_CTL_IOCTL_ELEM_LOCK does */
+static void macaudio_test_lock_xover(struct kunit *test, struct macaudio_test_spk *t)
+{
+	KUNIT_ASSERT_EQ(test, macaudio_spk_xover_lock(t->xover, t->owner), 0);
+	t->xover->vd[0].owner = t->owner;
+}
+
+/* Take the speakers and declare the crossover in the engine */
+static void macaudio_test_take_with_xover(struct kunit *test, struct macaudio_test_spk *t)
+{
+	macaudio_test_take(test, t);
+	macaudio_test_lock_xover(test, t);
+	KUNIT_ASSERT_EQ(test, macaudio_test_xover_write(test, t, 1), 1);
 }
 
 /* Every speaker volume at @want, the headphone volume never touched */

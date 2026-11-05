@@ -148,7 +148,9 @@ struct macaudio_platform_cfg {
 	 * Restore the amp's DT playback corner on grant, where protection
 	 * supplies the crossover ahead of the low-frequency thermal pilot.
 	 * The 800 Hz policy floor would remove that pilot from the tweeters.
-	 * Every withdrawal restores the floor along with the safe level.
+	 * Only an owner that declares the crossover gets it (see
+	 * "Speaker Protection Crossover"). Every withdrawal restores the floor
+	 * along with the safe level.
 	 */
 	bool tweeter_hpf_granted;
 };
@@ -263,6 +265,12 @@ struct macaudio_snd_data {
 	unsigned int spk_nr_hpfs;
 	unsigned int spk_hpf_safe;
 	unsigned int *spk_hpf_granted;
+	/*
+	 * The owner's engine runs the crossover ahead of the amps, so a grant
+	 * may open the tweeters' high-pass. Written under spk_mutex.
+	 */
+	struct snd_kcontrol *spk_xover_kctl;
+	bool spk_xover;
 };
 
 
@@ -381,6 +389,18 @@ static struct macaudio_link_props macaudio_fe_link_props[] = {
  * again; so does an owner that was frozen across a system sleep. Reads
  * return 1 while protection is granted, 0 otherwise, and every change is
  * notified.
+ *
+ * On machines that open the tweeters' playback high-pass while granted, a
+ * grant opens it only for an owner that has declared, on the boolean
+ * "Speaker Protection Crossover", that its engine passes every speaker
+ * channel through the machine's own crossover and high-pass ahead of the
+ * amps. Without that declaration the tweeters stay at their safe corner
+ * while granted. The owner writes it with CAP_SYS_ADMIN, through its own
+ * ELEM_LOCK on that control (taken while it owns "Speaker Protection"),
+ * and only while protection is not granted: a grant latches it, and a
+ * write meanwhile fails with -EBUSY. Any other write fails with -EPERM.
+ * The declaration goes back to 0 when the owner unlocks "Speaker
+ * Protection" or closes its file, and when a new owner takes it.
  *
  * The speaker volume controls belong to the driver: userspace can read them
  * but never write them. While protection is granted they hold the amps at a
@@ -648,8 +668,11 @@ static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 	 */
 	kthread_flush_work(&ma->spk_stop_work);
 
-	/* The tweeters' filter opens before the amps go up, never after */
-	ret = macaudio_spk_set_hpf(ma, true);
+	/*
+	 * The tweeters' filter opens before the amps go up, never after, and
+	 * only for an engine that runs the crossover ahead of them.
+	 */
+	ret = macaudio_spk_set_hpf(ma, ma->spk_xover);
 	if (ret < 0) {
 		macaudio_spk_floor(ma, "tweeter high-pass not set");
 		return ret;
@@ -676,6 +699,9 @@ static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 			 refused);
 	else
 		dev_info(ma->card.dev, "Speaker protection granted\n");
+	if (ma->spk_nr_hpfs && !ma->spk_xover)
+		dev_info(ma->card.dev,
+			 "No crossover declared: tweeter high-pass stays at the safe corner\n");
 	if (ma->spk_kctl)
 		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &ma->spk_kctl->id);
 	return 0;
@@ -928,6 +954,23 @@ out:
 	return ret;
 }
 
+/*
+ * The crossover declaration lapses with the ownership that made it.
+ *
+ * Context: spk_mutex held.
+ */
+static void macaudio_spk_xover_clear(struct macaudio_snd_data *ma)
+{
+	lockdep_assert_held(&ma->spk_mutex);
+
+	if (!ma->spk_xover)
+		return;
+	WRITE_ONCE(ma->spk_xover, false);
+	if (ma->spk_xover_kctl && !ma->spk_dead)
+		snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
+			       &ma->spk_xover_kctl->id);
+}
+
 static int macaudio_spk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file *owner)
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
@@ -941,6 +984,7 @@ static int macaudio_spk_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file 
 	/* A new owner starts without protection and grants it itself */
 	ma->spk_owner = owner;
 	ma->spk_lapsed = false;
+	macaudio_spk_xover_clear(ma);
 	macaudio_spk_floor(ma, "new owner");
 	mutex_unlock(&ma->spk_mutex);
 	return 0;
@@ -954,9 +998,81 @@ static void macaudio_spk_unlock(struct snd_kcontrol *kcontrol)
 	mutex_lock(&ma->spk_mutex);
 	ma->spk_owner = NULL;
 	ma->spk_lapsed = false;
+	macaudio_spk_xover_clear(ma);
 	macaudio_spk_floor(ma, "owner gone");
 	mutex_unlock(&ma->spk_mutex);
 }
+
+static int macaudio_spk_xover_get(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *uvalue)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+
+	uvalue->value.integer.value[0] = READ_ONCE(ma->spk_xover);
+	return 0;
+}
+
+/*
+ * The owner declares, or withdraws, the crossover in its engine. ALSA
+ * serializes this with every lock and unlock, file close included, and has
+ * refused a write from any file but the one holding this control's lock.
+ */
+static int macaudio_spk_xover_put(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *uvalue)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	long val = uvalue->value.integer.value[0];
+	int ret;
+
+	if (val != 0 && val != 1)
+		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	mutex_lock(&ma->spk_mutex);
+	if (!ma->spk_owner || ma->spk_dead || kcontrol->vd[0].owner != ma->spk_owner) {
+		ret = -EPERM;
+	} else if (ma->spk_active || READ_ONCE(ma->spk_granted)) {
+		/* The grant latched it: the next one after the floor takes a change */
+		ret = -EBUSY;
+	} else {
+		ret = ma->spk_xover != !!val;
+		WRITE_ONCE(ma->spk_xover, !!val);
+	}
+	mutex_unlock(&ma->spk_mutex);
+	return ret;
+}
+
+/* Only the owner of "Speaker Protection" may hold the declaration's lock. */
+static int macaudio_spk_xover_lock(struct snd_kcontrol *kcontrol, struct snd_ctl_file *owner)
+{
+	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
+	int ret = 0;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	mutex_lock(&ma->spk_mutex);
+	if (!owner || owner != ma->spk_owner || ma->spk_dead)
+		ret = -EPERM;
+	mutex_unlock(&ma->spk_mutex);
+	return ret;
+}
+
+#define MACAUDIO_SPK_XOVER_NAME	"Speaker Protection Crossover"
+
+static const struct snd_kcontrol_new macaudio_spk_xover_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = MACAUDIO_SPK_XOVER_NAME,
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = macaudio_spk_xover_get,
+	.put = macaudio_spk_xover_put,
+	.lock = macaudio_spk_xover_lock,
+};
 
 /* ALSA serializes this with protection lock/unlock, including file close. */
 static int macaudio_sense_owner_check(struct macaudio_snd_data *ma, struct snd_ctl_file *file)
@@ -2179,6 +2295,16 @@ static int macaudio_late_probe(struct snd_soc_card *card)
 		ret = snd_soc_add_card_controls(card, &macaudio_speaker_id_control, 1);
 		if (ret)
 			return ret;
+	}
+
+	/* After it, for the same reason */
+	if (ma->has_speakers) {
+		ret = snd_soc_add_card_controls(card, &macaudio_spk_xover_control, 1);
+		if (ret)
+			return ret;
+		ma->spk_xover_kctl = snd_soc_card_get_kcontrol(card, MACAUDIO_SPK_XOVER_NAME);
+		if (!ma->spk_xover_kctl)
+			return -EINVAL;
 	}
 
 	/* The notifier walks the card's controls: only while the card is bound */
