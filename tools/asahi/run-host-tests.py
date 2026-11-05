@@ -188,7 +188,7 @@ def jobs(work, conf, dtc):
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
     missing = sorted(found - known)
-    gone = sorted(known - found)
+    gone = sorted(name for name in known if not (ASAHI / name).is_file())
     if missing or gone:
         for name in missing:
             print(f'not registered in {Path(__file__).name}: tools/asahi/{name}', file=sys.stderr)
