@@ -56,7 +56,7 @@ impl Vm {
             return Err(EINVAL);
         }
         // SAFETY: As in `map_io`, the exec lock is only used for this mapping.
-        let mut vm_exec = unsafe { self.gpuvm.exec_lock(None, false)? };
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
         let inner = vm_exec.unique_gpuvm.data();
         let payload = KernelMappingInner {
             owner: self.gpuvm.clone(),
@@ -82,18 +82,35 @@ impl Vm {
         let iova = node.start();
         let end = iova.checked_add(size as u64).ok_or(EOVERFLOW)?;
         inner.page_table.prepare_map(iova..end)?;
+        let transaction_uat = inner.uat_inner.clone();
+        let handoff = transaction_uat.lock_m4_upper(inner.is_kernel)?;
         let mutation = inner.mapping_mutation();
         let ret = inner
             .page_table
             .map_pages(iova..end, phys as PhysicalAddr, prot, false);
+        let discard = if ret.is_err() {
+            inner.page_table.discard_partial_map(iova..end)
+        } else {
+            Ok(())
+        };
+        drop(handoff);
         if ret.is_err() {
-            inner.rollback_failed_map(iova, size as u64);
+            inner.finish_failed_map(iova, size);
+        } else {
+            inner.tlbi_contexts_naming_root(iova, size);
         }
-        // Drop the exec lock before the node, as in `map_io`.
+        let retain = discard.is_err() && inner.uat_inner.m4_adopted;
+        if retain {
+            inner.uat_inner.failed.store(true, Ordering::Release);
+        }
         drop(mutation);
-        let _ = inner;
+        drop(vm_exec);
+        if retain {
+            core::mem::forget(node);
+            return Err(ret.err().unwrap_or(EIO));
+        }
         ret?;
-        Ok(KernelMapping(node))
+        Ok(KernelMapping(ManuallyDrop::new(node)))
     }
 
     /// [`Vm::map_io`] at `iova`, without the per-mapping log line.
