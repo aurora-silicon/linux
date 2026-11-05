@@ -923,6 +923,7 @@ static void macaudio_sense_controls_are_protected(struct kunit *test)
 			.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 			.name = names[i],
 			.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+			.info = snd_ctl_boolean_mono_info,
 		};
 
 		sense[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
