@@ -33,6 +33,22 @@ const struct apple_dpin_policy apple_dpin_m3 = {
 	.host_policy = TB_HOST_DP_NOTIFY,
 };
 
+/*
+ * M4 (T8132): the M3 flow. The DP IN handshake is the t8103 one, which
+ * writes only DPTX_INACTIVE (+0x0c bit 0) and polls its ACK (+0x10 bit 0),
+ * gated on HPD. The DP IN interrupts are not set up (nothing handles them),
+ * and a tunnel that DCP never activated is torn down without touching the
+ * block at all. Both DP IN streams of an ATC PHY need one link rate, so
+ * every tunnel gets HBR2 at most.
+ */
+const struct apple_dpin_policy apple_dpin_m4 = {
+	.flow = APPLE_DPIN_CHANGED,
+	.capacity_retry = true,
+	.defer_new_bringup = true,
+	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_HBR2_MAX,
+	.lazy_idle = true,
+};
+
 enum apple_dpin_flow apple_dpin_hooks(const struct apple_dpin_policy *policy,
 				      bool queue_present, bool display_enabled)
 {
