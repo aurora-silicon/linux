@@ -50,7 +50,43 @@ static inline int apple_dp_tunnel_t6030_pclk(unsigned int source, unsigned int d
 	return dpin < 2 && (source == 0 || source == 2) ? (int)dpin : -EOPNOTSUPP;
 }
 
-/* T6030: keep the source owning the pixel clock across rate changes and stop. */
+/*
+ * T8132's external pipes are crossbar sources 2 (dcpext0) and 4 (dcpext1).
+ * Either feeds DP IN0 through DPTX PCLK1 and DP IN1 through PCLK2.
+ */
+static inline int apple_dp_tunnel_t8132_pclk(unsigned int source, unsigned int dpin)
+{
+	return dpin < 2 && (source == 2 || source == 4) ? (int)dpin : -EOPNOTSUPP;
+}
+
+/*
+ * T6030 and T8132 tunnel pixel clocks: the TX_DP_CTRL0 gates the DP IN
+ * streams in @users (bit n: DP IN n) need. DP IN 0 runs on PCLK1; DP IN 1 on
+ * PCLK2, and needs PCLK1 at its own rate as well: without it its video stops.
+ */
+#define APPLE_DP_TUNNEL_PCLK1	BIT(0)
+#define APPLE_DP_TUNNEL_PCLK2	BIT(1)
+
+static inline unsigned int apple_dp_tunnel_pclks(unsigned int users)
+{
+	return (users & 3 ? APPLE_DP_TUNNEL_PCLK1 : 0) |
+	       (users & 2 ? APPLE_DP_TUNNEL_PCLK2 : 0);
+}
+
+/*
+ * T8132: both DP IN streams of a PHY must run at one link rate, or the
+ * DP IN 1 stream stays dark. 0 if a stream may run at link rate code @rate
+ * next to the other stream's @other (0: none running), -EBUSY if not.
+ */
+static inline int apple_dp_tunnel_t8132_rate_ok(u8 rate, u8 other)
+{
+	return !rate || !other || rate == other ? 0 : -EBUSY;
+}
+
+/*
+ * T6030 and T8132: keep the source owning the pixel clock across rate changes
+ * and stop.
+ */
 int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 				    unsigned int dpin, u8 rate);
 
