@@ -7,8 +7,10 @@
  */
 
 #include <linux/delay.h>
+#include <kunit/static_stub.h>
 #include <kunit/test.h>
 #include <linux/idr.h>
+#include <linux/suspend.h>
 
 #include "tb.h"
 #include "tunnel.h"
@@ -3605,8 +3607,8 @@ static void tb_test_apple_right_dpin_wiring(struct kunit *test)
 }
 
 /*
- * TB_HOST_DP_HBR2_MAX: a second DP tunnel keeps the rate of the first and
- * gives up lanes instead; alone, lanes go before the rate.
+ * TB_HOST_DP_SHARED_RATE: a second DP tunnel keeps the rate of the first and
+ * gives up lanes instead; alone at HBR2, lanes go before the rate.
  */
 static void tb_test_dp_reduce_bandwidth_shared(struct kunit *test)
 {
@@ -3646,9 +3648,333 @@ static void tb_test_dp_reduce_bandwidth_shared(struct kunit *test)
 							    &rate, &lanes), -ENOSR);
 }
 
+/*
+ * TB_HOST_DP_SHARED_RATE: one DP tunnel on the host router may offer HBR3,
+ * more offer HBR2. Alone, a reduction keeps the most bandwidth; held at
+ * HBR2 or next to another tunnel, the lanes go first.
+ */
+static void tb_test_dp_shared_rate_single(struct kunit *test)
+{
+	u32 rate, lanes;
+
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_for(0), 8100);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_for(1), 8100);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_for(2), 5400);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_for(3), 5400);
+
+	/* Alone, the dock's 34650 Mb/s: HBR3 x4 (25920 Mb/s) */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(34650, 8100, 4, 8100, 4, 0, 8100,
+							  &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 8100);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	/* Alone, 20000 Mb/s: HBR2 x4 (17280), not HBR3 x2 (12960, too little for 4K60) */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(20000, 8100, 4, 8100, 4, 0, 8100,
+							  &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	/* Alone, a sink side that takes HBR2 at most: HBR2 x4 */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(34650, 8100, 4, 5400, 4, 0, 8100,
+							  &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	/* Held at HBR2 for a second tunnel, 10000 Mb/s: HBR2 x2, lanes first */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(10000, 5400, 4, 5400, 4, 0, 5400,
+							  &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 2);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: with two DP tunnels the second takes the first
+ * one's rate, lanes first; a first one up above HBR2 is set up again at HBR2.
+ */
+static void tb_test_dp_shared_rate_second(struct kunit *test)
+{
+	u32 rate, lanes;
+
+	/* A second one wanted next to one at HBR3: re-link it now */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(8100, 2, false), TB_DP_RELINK_NOW);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(8100, 3, false), TB_DP_RELINK_NOW);
+	/* Alone: kept */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(8100, 1, false), TB_DP_RELINK_NONE);
+	/* At HBR2 or below: kept, the second one takes its rate */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(5400, 2, false), TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(2700, 2, false), TB_DP_RELINK_NONE);
+
+	/*
+	 * The first one, held at HBR2 between adapters that take HBR3, is
+	 * counted at HBR2 whatever its DP IN adapter reports: 34650 - 17280
+	 * left for the second, not 34650 - 25920 (HBR2 x2 at most)
+	 */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_counted_bandwidth(5400, 8100, 4), 17280);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_counted_bandwidth(5400, 5400, 2), 8640);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_counted_bandwidth(8100, 8100, 4), 25920);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_counted_bandwidth(0, 8100, 4), 25920);
+
+	/* Two HBR2 x4 tunnels fit the dock: 34650 - 17280 left for the second */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(17370, 5400, 4, 5400, 4, 5400, 5400,
+							  &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	/* Less room: the second gives up lanes, never its rate */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(12000, 5400, 4, 8100, 4, 5400, 5400,
+							  &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 2);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(4000, 5400, 4, 5400, 4, 5400, 5400,
+							  &rate, &lanes), -ENOSR);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: no re-link while system sleep is in progress, from
+ * the PREPARE event until the transition is over, also when it is refused.
+ */
+static void tb_test_dp_shared_rate_sleep(struct kunit *test)
+{
+	struct tb_dp_pm_state s = {};
+
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(8100, 2, true), TB_DP_RELINK_WAIT);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(5400, 2, true), TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(8100, 1, true), TB_DP_RELINK_NONE);
+
+	/* Suspend: closed at PREPARE, open only once the transition is over */
+	KUNIT_EXPECT_FALSE(test, tb_dp_pm_event(&s, PM_SUSPEND_PREPARE));
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+	KUNIT_EXPECT_TRUE(test, tb_dp_pm_event(&s, PM_POST_SUSPEND));
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_FALSE(test, s.sleeping);
+	/* Refused: still closed during the POST replay, until the reopen */
+	tb_dp_pm_event(&s, PM_SUSPEND_PREPARE);
+	KUNIT_EXPECT_TRUE(test, tb_dp_pm_event(&s, PM_POST_SUSPEND));
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_FALSE(test, s.sleeping);
+	/* No reopen without a POST event: closed until it comes */
+	tb_dp_pm_event(&s, PM_SUSPEND_PREPARE);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+	tb_dp_pm_event(&s, PM_POST_SUSPEND);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_FALSE(test, s.sleeping);
+	/*
+	 * The reopen asked for by one transition runs after the next one began
+	 * (the snapshot device drops the lock in between): closed until that
+	 * transition's POST and the reopen after it
+	 */
+	tb_dp_pm_event(&s, PM_HIBERNATION_PREPARE);
+	tb_dp_pm_event(&s, PM_POST_HIBERNATION);
+	tb_dp_pm_event(&s, PM_HIBERNATION_PREPARE);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+	KUNIT_EXPECT_TRUE(test, tb_dp_pm_event(&s, PM_POST_HIBERNATION));
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_FALSE(test, s.sleeping);
+	/* Two transitions before the reopen runs: one reopen, at the end */
+	tb_dp_pm_event(&s, PM_HIBERNATION_PREPARE);
+	tb_dp_pm_event(&s, PM_POST_HIBERNATION);
+	tb_dp_pm_event(&s, PM_RESTORE_PREPARE);
+	tb_dp_pm_event(&s, PM_POST_RESTORE);
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_FALSE(test, s.sleeping);
+	tb_dp_pm_reopen(&s);
+	KUNIT_EXPECT_FALSE(test, s.sleeping);
+	/* Other events change nothing */
+	tb_dp_pm_event(&s, PM_SUSPEND_PREPARE);
+	KUNIT_EXPECT_FALSE(test, tb_dp_pm_event(&s, 0));
+	KUNIT_EXPECT_TRUE(test, s.sleeping);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: re-link work that cannot runtime resume the domain
+ * tries again, a few times and later each time; then the request waits for
+ * the next resume, thaw or plug event.
+ */
+static void tb_test_dp_shared_rate_retry(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(0), 2500);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(1), 5000);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(4), 40000);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(5), 0);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(100), 0);
+}
+
+/*
+ * A domain with the software connection manager, a host router whose DP IN
+ * adapters share one link rate (TB_HOST_DP_SHARED_RATE) and a USB4 device
+ * router with two DP OUT adapters. Adapter registers (TB_CFG_PORT, from the
+ * adapter capability) are read from @regs: [0] host, [1] device router.
+ */
+struct tb_test_cm {
+	struct tb_nhi nhi;
+	struct tb *tb;
+	struct tb_switch *host, *dev;
+	u32 regs[2][20][16];
+};
+
+#define TB_TEST_CM_CAP		0x10
+#define TB_TEST_CM_HBR3_X4	(DP_COMMON_CAP_RATE_HBR3 << DP_COMMON_CAP_RATE_SHIFT | \
+				 DP_COMMON_CAP_4_LANES << DP_COMMON_CAP_LANES_SHIFT)
+
+static int tb_test_cm_cfg_read(struct tb_ctl *ctl, void *buffer, u64 route, u32 port,
+			       enum tb_cfg_space space, u32 offset, u32 length)
+{
+	struct tb_test_cm *cm = kunit_get_current_test()->priv;
+	u32 (*regs)[16] = cm->regs[route ? 1 : 0];
+
+	if (space != TB_CFG_PORT || port >= ARRAY_SIZE(cm->regs[0]) ||
+	    offset < TB_TEST_CM_CAP || offset - TB_TEST_CM_CAP + length > ARRAY_SIZE(regs[0]))
+		return -EIO;
+	memcpy(buffer, &regs[port][offset - TB_TEST_CM_CAP], length * sizeof(u32));
+	return 0;
+}
+
+static struct tb_test_cm *tb_test_cm_alloc(struct kunit *test)
+{
+	struct tb_test_cm *cm;
+	struct tb *tb;
+
+	cm = kunit_kzalloc(test, sizeof(*cm), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cm);
+	tb = kunit_kzalloc(test, sizeof(*tb) + tb_test_cm_size(), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	cm->nhi.host_dp_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_SHARED_RATE;
+	tb->nhi = &cm->nhi;
+	device_initialize(&tb->dev);
+	tb->dev.release = tb_test_dprx_release;
+	mutex_init(&tb->lock);
+	tb_test_cm_init(tb);
+	cm->tb = tb;
+
+	cm->host = alloc_host_usb4(test);
+	KUNIT_ASSERT_NOT_NULL(test, cm->host);
+	cm->dev = alloc_dev_usb4(test, cm->host, 0x1, true);
+	KUNIT_ASSERT_NOT_NULL(test, cm->dev);
+	cm->host->tb = tb;
+	cm->dev->tb = tb;
+	cm->host->config.thunderbolt_version = FIELD_PREP(USB4_VERSION_MAJOR_MASK, 1);
+	cm->dev->config.thunderbolt_version = FIELD_PREP(USB4_VERSION_MAJOR_MASK, 1);
+	cm->host->ports[5].cap_adap = TB_TEST_CM_CAP;
+	cm->host->ports[6].cap_adap = TB_TEST_CM_CAP;
+	cm->dev->ports[13].cap_adap = TB_TEST_CM_CAP;
+	cm->dev->ports[14].cap_adap = TB_TEST_CM_CAP;
+
+	test->priv = cm;
+	kunit_activate_static_stub(test, tb_cfg_read, tb_test_cm_cfg_read);
+	return cm;
+}
+
+/*
+ * What the DP IN adapter @in reports once its DPRX is done: HBR3 x4, the
+ * rate both adapters take, in its caps or (@bw_mode) as its allocated
+ * bandwidth (26000 Mb/s at a granularity of 250 Mb/s).
+ */
+static void tb_test_cm_reports(struct tb_test_cm *cm, struct tb_port *in, bool bw_mode)
+{
+	u32 *regs = cm->regs[0][in->port];
+
+	regs[DP_LOCAL_CAP] = TB_TEST_CM_HBR3_X4;
+	regs[DP_COMMON_CAP] = TB_TEST_CM_HBR3_X4 | DP_COMMON_CAP_DPRX_DONE;
+	regs[ADP_DP_CS_2] = 0;
+	regs[ADP_DP_CS_8] = bw_mode ? ADP_DP_CS_8_DPME : 0;
+	regs[DP_STATUS] = bw_mode ? 104 << DP_STATUS_ALLOCATED_BW_SHIFT : 0;
+}
+
+/*
+ * A host DP tunnel from @in to @out as the capabilities exchange leaves it:
+ * capped at @rate_limit (Mb/s per lane), up at @rate. Listed by the
+ * connection manager, its adapters enabled.
+ */
+static struct tb_tunnel *tb_test_cm_dp_tunnel(struct kunit *test, struct tb_test_cm *cm,
+					      struct tb_port *in, struct tb_port *out,
+					      u32 rate_limit, u32 rate)
+{
+	struct tb_tunnel *tunnel;
+	int i;
+
+	tunnel = tb_tunnel_alloc_dp(cm->tb, in, out, 1, 0, 0, tb_test_dp_tunnel_active, NULL);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	tunnel->host_rate_limit = rate_limit;
+	tunnel->max_rate = min(rate_limit, rate);
+	tunnel->host_rate = rate;
+	tunnel->state = TB_TUNNEL_ACTIVE;
+	for (i = 0; i < tunnel->npaths; i++)
+		tunnel->paths[i]->activated = true;
+	list_add_tail(&tunnel->list, tb_test_cm_tunnels(cm->tb));
+	cm->regs[0][in->port][ADP_DP_CS_0] = ADP_DP_CS_0_VE | ADP_DP_CS_0_AE;
+	cm->regs[1][out->port][ADP_DP_CS_0] = ADP_DP_CS_0_VE | ADP_DP_CS_0_AE;
+	return tunnel;
+}
+
+static void tb_test_cm_dp_tunnel_put(struct tb_tunnel *tunnel)
+{
+	int i;
+
+	list_del(&tunnel->list);
+	for (i = 0; i < tunnel->npaths; i++)
+		tunnel->paths[i]->activated = false;
+	tunnel->state = TB_TUNNEL_INACTIVE;
+	tb_tunnel_put(tunnel);
+}
+
+/*
+ * The DP bandwidth the connection manager counts on the host router's lane
+ * adapter for a new tunnel from host DP IN 6 to device DP OUT 14.
+ */
+static int tb_test_cm_counted(struct kunit *test, struct tb_test_cm *cm)
+{
+	int up, down;
+
+	KUNIT_EXPECT_EQ(test, tb_consumed_dp_bandwidth(cm->tb, &cm->host->ports[6],
+						       &cm->dev->ports[14], &cm->host->ports[1],
+						       &up, &down), 0);
+	KUNIT_EXPECT_EQ(test, up, 0);
+	return down;
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE, through the connection manager's DP bandwidth
+ * accounting: a tunnel capped at HBR2 whose DP IN adapter reports HBR3 x4
+ * once its DPRX is done is counted at HBR2 x4, from its caps and from its
+ * allocated bandwidth; capped at HBR3, at HBR3 x4.
+ */
+static void tb_test_dp_shared_rate_counted(struct kunit *test)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct tb_port *in = &cm->host->ports[5];
+	struct tb_tunnel *a;
+
+	a = tb_test_cm_dp_tunnel(test, cm, in, &cm->dev->ports[13], 5400, 5400);
+	KUNIT_ASSERT_TRUE(test, tb_tunnel_port_on_path(a, &cm->host->ports[1]));
+
+	/* Caps: HBR2 x4, not the HBR3 x4 reported */
+	tb_test_cm_reports(cm, in, false);
+	KUNIT_EXPECT_EQ(test, tb_test_cm_counted(test, cm), 17280);
+	a->max_rate = 8100;
+	KUNIT_EXPECT_EQ(test, tb_test_cm_counted(test, cm), 25920);
+
+	/* Allocated bandwidth: HBR2 x4, not the 26000 Mb/s reported */
+	tb_test_cm_reports(cm, in, true);
+	a->bw_mode = true;
+	a->max_rate = 5400;
+	KUNIT_EXPECT_EQ(test, tb_test_cm_counted(test, cm), 17280);
+	a->max_rate = 8100;
+	KUNIT_EXPECT_EQ(test, tb_test_cm_counted(test, cm), 25920);
+
+	tb_test_cm_dp_tunnel_put(a);
+	put_device(&cm->tb->dev);
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_apple_right_dpin_wiring),
 	KUNIT_CASE(tb_test_dp_reduce_bandwidth_shared),
+	KUNIT_CASE(tb_test_dp_shared_rate_single),
+	KUNIT_CASE(tb_test_dp_shared_rate_second),
+	KUNIT_CASE(tb_test_dp_shared_rate_sleep),
+	KUNIT_CASE(tb_test_dp_shared_rate_retry),
+	KUNIT_CASE(tb_test_dp_shared_rate_counted),
 	KUNIT_CASE(tb_test_dp_generation),
 	KUNIT_CASE(tb_test_dp_dprx_deferred_first),
 	KUNIT_CASE(tb_test_dp_dprx_cancel),

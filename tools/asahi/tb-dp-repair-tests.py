@@ -45,7 +45,7 @@ struct tb_nhi {unsigned long quirks;};
 #define BIT(n) (1UL<<(n))
 #define QUIRK_NO_SYSTEM_SLEEP BIT(5)
 struct tb {int lock;struct device dev;void*wq;struct tb_switch*root_switch;struct tb_nhi*nhi;};
-struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;};
+struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;struct work_struct dp_relink_run;};
 struct domain {struct tb tb;struct tb_cm cm;};
 _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private storage adjacency");
 #define INIT_WORK(w,handler) ((w)->fn=(handler))
@@ -114,6 +114,8 @@ static struct tb*tb_domain_get(struct tb*t){CHECK(domain_refs>=1);domain_refs++;
 static void tb_domain_put(struct tb*t){CHECK(domain_refs>1);domain_refs--;}
 static bool queue_work(void*wq,struct work_struct*w){if(w->pending)return false;w->pending=true;return true;}
 static void tb_queue_dp_tunnels(struct tb*tb);
+/* The TB_HOST_DP_SHARED_RATE re-link work is not queued in these cases. */
+static void tb_dp_relink_run(struct work_struct*w){CHECK(0);}
 static void tb_tunnel_dp(struct tb*t){
  CHECK(lock_depth==1 && domain.cm.hotplug_active && t->root_switch);
  alloc_calls++;if(occupied)alloc_failures++;else alloc_successes++;
@@ -298,7 +300,7 @@ def main():
         raise ValueError('DPRX reference-release order changed; review extraction')
     production = '\n'.join(parts.values())
     probe = (ROOT / 'drivers/thunderbolt/tb.c').read_text()
-    probe = probe[probe.index('struct tb *tb_probe(struct tb_nhi *nhi)'):]
+    probe = probe[probe.index('static void tb_cm_init(struct tb_cm *tcm)'):]
     initializers = re.findall(r'INIT_WORK\(&tcm->\w+,\s*\w+\);', probe)
     production += '\nstatic void init_fixture(struct tb_cm*tcm){\n' + '\n'.join(initializers) + '\n}\n'
     results = {}
