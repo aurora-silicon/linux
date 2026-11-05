@@ -32,11 +32,18 @@ use kernel::{
 pub(crate) struct QosIds {
     #[pin]
     used: Mutex<u128>,
+    /// IDs released whose rows in the firmware's QoS table were not cleared yet
+    /// (`forget_released`). Locked after `used`.
+    #[pin]
+    released: Mutex<u128>,
 }
 impl QosIds {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
-            pin_init!(Self { used <- new_mutex!(3, "G17 QoS IDs") }),
+            pin_init!(Self {
+                used <- new_mutex!(3, "G17 QoS IDs"),
+                released <- new_mutex!(0, "G17 released QoS IDs"),
+            }),
             GFP_KERNEL,
         )
     }
@@ -47,6 +54,8 @@ impl QosIds {
             return Err(super::capacity::refused(super::capacity::Site::QosIds));
         }
         *used |= 1u128 << id;
+        // A new owner writes its own scheduler row at its first publication.
+        *self.released.lock() &= !(1u128 << id);
         Ok(QosLease {
             ids: self.clone(),
             id: id as u8,
@@ -59,7 +68,9 @@ struct QosLease {
 }
 impl Drop for QosLease {
     fn drop(&mut self) {
-        *self.ids.used.lock() &= !(1u128 << self.id);
+        let mut used = self.ids.used.lock();
+        *used &= !(1u128 << self.id);
+        *self.ids.released.lock() |= 1u128 << self.id;
     }
 }
 
@@ -678,6 +689,25 @@ impl QosIds {
     pub(crate) fn used(&self) -> u32 {
         (*self.used.lock() & !3u128).count_ones()
     }
+    /// Clears, with `forget`, the firmware QoS rows of the IDs released and not taken again:
+    /// they still name the released context's scheduler page. The IDs `forget` returns, whose
+    /// rows still have work in flight (or all, if it fails), stay released for the next call.
+    pub(crate) fn forget_released(&self, forget: impl FnOnce(u128) -> Result<u128>) {
+        let ids = {
+            let used = self.used.lock();
+            let mut released = self.released.lock();
+            let ids = *released & !*used;
+            *released = 0;
+            ids
+        };
+        if ids == 0 {
+            return;
+        }
+        let left = forget(ids).unwrap_or(ids);
+        let used = self.used.lock();
+        // An ID taken again meanwhile has a new owner, which writes its own row.
+        *self.released.lock() |= left & !*used;
+    }
 }
 
 /// Memory a context's work list may lead the firmware to stays allocated: a linked node (or
@@ -714,6 +744,38 @@ mod capacity_tests {
             assert_eq!(ids.used(), 0);
             assert_eq!(*ids.used.lock(), 3);
         }
+    }
+
+    #[test]
+    fn a_released_qos_row_still_in_use_is_cleared_later() {
+        let ids = QosIds::new().unwrap();
+        let (first, second) = (ids.acquire().unwrap(), ids.acquire().unwrap());
+        let both = (1u128 << first.id) | (1u128 << second.id);
+        drop((first, second));
+        // Work still runs on both rows: neither is cleared, and both stay released.
+        ids.forget_released(|released| {
+            assert_eq!(released, both);
+            Ok(released)
+        });
+        // A failed clear keeps them too.
+        ids.forget_released(|released| {
+            assert_eq!(released, both);
+            Err(EIO)
+        });
+        // One is taken again meanwhile: its new owner writes its own row.
+        let mut again = None;
+        ids.forget_released(|released| {
+            again = Some(ids.acquire().unwrap());
+            Ok(released)
+        });
+        let again = again.unwrap();
+        let rest = both & !(1u128 << again.id);
+        ids.forget_released(|released| {
+            assert_eq!(released, rest);
+            Ok(0)
+        });
+        ids.forget_released(|_| panic!("nothing left to clear"));
+        drop(again);
     }
 }
 
