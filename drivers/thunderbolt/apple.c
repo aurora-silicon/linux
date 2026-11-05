@@ -83,6 +83,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -2034,6 +2035,20 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	if (acio->type7 !=
 	    !!of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
 		ret = dev_err_probe(&pdev->dev, -EINVAL, "ACIO/NHI generation mismatch\n");
+		goto err;
+	}
+
+	/*
+	 * The rings must never run untranslated. The DART is populated with
+	 * the NHI, so it is normally bound first; but once the driver core
+	 * has stopped waiting for missing suppliers (DART driver not loaded
+	 * yet), the NHI would probe without its IOMMU. Defer, and fail the
+	 * ACIO start now instead of letting it wait for the NHI to time out.
+	 */
+	if (of_property_present(pdev->dev.of_node, "iommus") &&
+	    !device_iommu_mapped(&pdev->dev)) {
+		dev_warn(&pdev->dev, "DART not bound yet, not starting the NHI\n");
+		ret = -EPROBE_DEFER;
 		goto err;
 	}
 
