@@ -65,6 +65,24 @@ static int vdso_mremap(const struct vm_special_mapping *sm,
 	return 0;
 }
 
+/*
+ * The kernel image sits in the CTXR window, where EL0 can't execute on a core
+ * the window is enforced on, so EL0 gets a copy in ordinary memory.
+ */
+static struct page * __init vdso_code_page(unsigned long pfn)
+{
+	struct page *page;
+
+	if (!IS_ENABLED(CONFIG_ARM64_CTXR_EXECMEM))
+		return pfn_to_page(pfn);
+
+	page = alloc_page(GFP_KERNEL);
+	if (page)
+		copy_page(page_address(page), pfn_to_kaddr(pfn));
+
+	return page;
+}
+
 static int __init __vdso_init(enum vdso_abi abi)
 {
 	int i;
@@ -88,8 +106,11 @@ static int __init __vdso_init(enum vdso_abi abi)
 	/* Grab the vDSO code pages. */
 	pfn = sym_to_pfn(vdso_info[abi].vdso_code_start);
 
-	for (i = 0; i < vdso_info[abi].vdso_pages; i++)
-		vdso_pagelist[i] = pfn_to_page(pfn + i);
+	for (i = 0; i < vdso_info[abi].vdso_pages; i++) {
+		vdso_pagelist[i] = vdso_code_page(pfn + i);
+		if (!vdso_pagelist[i])
+			return -ENOMEM;
+	}
 
 	vdso_info[abi].cm->pages = vdso_pagelist;
 
