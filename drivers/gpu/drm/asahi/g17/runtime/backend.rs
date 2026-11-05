@@ -185,6 +185,10 @@ impl job::Backend for Backend {
             Validated::Render { resources, plan, .. } => {
                 let programs = resources.as_deref().ok_or(EINVAL)?;
                 *plan = Some(policy.plan(programs, priority)?);
+                // The M5 target layout refuses the passes the M5 path cannot run. Derive it
+                // here, so that SUBMIT returns the refusal before anything is queued.
+                crate::g17::queue::render::m5_render_submission::layout(
+                    command, self.shared.clusters, self.shared.variant.programs)?;
             }
             Validated::Compute { resources, plan, m5_scratch, .. } => {
                 if let Some(programs) = resources {
