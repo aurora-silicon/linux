@@ -80,6 +80,19 @@ mod lockout_tests {
         assert_eq!(crate::sks::verify_secret_reply_flags(&body[..8]), None);
         assert_eq!(crate::sks::verify_secret_reply_flags(&[1u8; 16]), None);
     }
+
+    #[test]
+    fn authenticated_match_carries_mode_and_context() {
+        let user = UserId::new(1000).unwrap();
+        let handle = [0xa5u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
+        let op = sbio_image_processing_init(ImagePurpose::Matching, true, true, 0, user, 0, Some(&handle));
+        assert_eq!(&op.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &SBIO_MATCH_MODE_UNLOCK.to_le_bytes());
+        assert_eq!(&op.payload[IPI_ACM_HANDLE..IPI_ACM_HANDLE + handle.len()], &handle);
+        assert_eq!(&op.payload[IPI_USER_ID..IPI_USER_ID + 4], &1000i32.to_le_bytes());
+        let plain = sbio_image_processing_init(ImagePurpose::Enrolment, true, false, 0, user, 0, None);
+        assert_eq!(&plain.payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4], &[0u8; 4]);
+        assert!(plain.payload[IPI_ACM_HANDLE..IPI_ACM_HANDLE + handle.len()].iter().all(|b| *b == 0));
+    }
 }
 
 struct EnrolPrerequisites {
@@ -1802,6 +1815,11 @@ impl SepData {
             );
             return;
         }
+        if self.enclave_reports_lockout() {
+            let outcome = self.enter_lockout();
+            self.finish_verify(outcome, [0u8; bio::TOKEN_LEN]);
+            return;
+        }
         self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
             dev_err!(
@@ -1847,6 +1865,14 @@ impl SepData {
             }
             bio::VerifyOutcome::Failed(_) => {}
         }
+        // The enclave announces its lockout with the no-match that causes it;
+        // the next verify must not ask for another touch.
+        if matches!(outcome, bio::VerifyOutcome::NoMatch)
+            && self.enclave_reports_lockout()
+            && !self.bio_lockout.load(Relaxed)
+        {
+            let _ = self.enter_lockout();
+        }
 
         let definitive = matches!(
             &outcome,
@@ -1879,6 +1905,21 @@ impl SepData {
             dev_err!(self.dev, "verify: invalid probe user id\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
+        // Never fall back to an unauthenticated match scope.
+        let Some(scope) = *self.match_context.lock() else {
+            dev_err!(
+                self.dev,
+                "verify: no authenticated match context; refusing before the capture. This is not a non-matching finger\n"
+            );
+            return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        };
+        dev_info!(
+            self.dev,
+            "verify: match mode {:#x}, user {}, match context generation {}\n",
+            crate::sbio::SBIO_MATCH_MODE_UNLOCK,
+            user.value(),
+            self.match_context_generation.load(Relaxed)
+        );
 
         if let Err(e) = sensor::start_capture() {
             dev_err!(self.dev, "verify: could not start the capture ({:?})\n", e);
@@ -1960,6 +2001,7 @@ impl SepData {
             0,
             user,
             crate::shim::monotonic_ns(),
+            Some(&scope),
         );
         if self.sbio_verify_step(&init).is_none() {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -3043,6 +3085,7 @@ impl SepData {
             counter,
             user,
             crate::shim::monotonic_ns(),
+            None,
         );
         if self.sbio_enrol_step(&init).is_none() {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -3715,8 +3758,32 @@ impl SepData {
     // passcode clears. The credential is set up again only after a password
     // authentication, in `rearm_after_password`, never here: doing it on the
     // enclave's refusal would undo the lockout.
+    /// Whether the enclave's latest lock-state notification for the Linux
+    /// user has the lockout bit set.
+    fn enclave_reports_lockout(&self) -> bool {
+        let last = self.bio_lock_state.load(Relaxed);
+        self.bio_lock_state_seq.load(Relaxed) != 0
+            && (last >> 16) as u32 == SBIO_PROBE_USER_ID as u32
+            && (last as u16) & LOCK_STATE_LOCKOUT != 0
+    }
+
     fn enter_lockout(&self) -> bio::VerifyOutcome {
         let failures = self.bio_nomatch_streak.load(Relaxed);
+        if !self.enclave_reports_lockout() {
+            // A refusal with the user's lockout bit clear is the match
+            // scope's own limit, not the user's biometric lockout: it lasts
+            // until a new authenticated context, and a restart ends it, so it
+            // is not recorded across restarts.
+            dev_warn!(
+                self.dev,
+                "verify: MATCH_RESULT refused after {} failed attempts while the enclave reports user {} unlocked: a match-scope refusal; Touch ID needs a password authentication for a new match context\n",
+                failures,
+                SBIO_PROBE_USER_ID
+            );
+            self.bio_lockout.store(true, Relaxed);
+            self.bio_lockout_logged.store(true, Relaxed);
+            return bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT);
+        }
         if failures > 0 {
             dev_warn!(
                 self.dev,
@@ -5727,6 +5794,15 @@ const IPI_DEVICE_KIND: usize = 0x4f;
 const IPI_USER_ID: usize = 0x67;
 
 const IPI_DEVICE_BUILTIN: u32 = 1;
+/// The match mode word and the ACM handle of an authenticated match.
+const IPI_MATCH_MODE: usize = 0x00;
+const IPI_ACM_HANDLE: usize = 0x83;
+/// Match mode of an authenticated unlock match of a positive user.
+pub(crate) const SBIO_MATCH_MODE_UNLOCK: u32 = 0x89;
+
+static_assert!(IPI_MATCH_MODE + 4 <= IPI_FIRST_IMAGE);
+static_assert!(IPI_ACM_HANDLE > IPI_USER_ID + 4);
+static_assert!(IPI_ACM_HANDLE + crate::scrd::SCRD_ACM_HANDLE_LEN <= SBIO_IMAGE_INIT_LEN);
 
 static_assert!(IPI_USER_ID + 4 <= SBIO_MAX_PAYLOAD);
 static_assert!(IPI_DEVICE_KIND + 4 <= SBIO_MAX_PAYLOAD);
@@ -5753,8 +5829,18 @@ pub(crate) fn sbio_image_processing_init(
     capture_counter: u32,
     user: UserId,
     monotonic_ns: u64,
+    scope: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
 ) -> SbioOp {
     let mut payload = [0u8; SBIO_MAX_PAYLOAD];
+
+    // An authenticated match names its mode and carries the live ACM handle;
+    // without them the enclave matches in a scope with its own small limit.
+    if let Some(handle) = scope {
+        payload[IPI_MATCH_MODE..IPI_MATCH_MODE + 4]
+            .copy_from_slice(&SBIO_MATCH_MODE_UNLOCK.to_le_bytes());
+        payload[IPI_ACM_HANDLE..IPI_ACM_HANDLE + crate::scrd::SCRD_ACM_HANDLE_LEN]
+            .copy_from_slice(handle);
+    }
 
     if first_image {
         payload[IPI_FIRST_IMAGE] = 1;

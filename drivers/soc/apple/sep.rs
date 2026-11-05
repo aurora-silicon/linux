@@ -671,6 +671,14 @@ struct SepData {
     #[pin]
     enrol_material: Mutex<Option<EnrolMaterial>>,
 
+    // The SCRD context whose handle every match carries, so the enclave
+    // matches in the authenticated unlock scope of the Linux user. Replaced
+    // by each successful SCRD verification of the designated bag (boot and
+    // password re-arm); `match_context_generation` numbers them for the log.
+    #[pin]
+    match_context: Mutex<Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
+    match_context_generation: Atomic<u32>,
+
     #[pin]
     enrol_identity_candidates: Mutex<KVec<[u8; bio::UUID_LEN]>>,
 
@@ -971,6 +979,8 @@ impl SepData {
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
+                match_context <- new_mutex!(None),
+                match_context_generation: Atomic::new(0),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
                 sensor_power_ns: Atomic::new(0),
@@ -2062,11 +2072,26 @@ impl SepData {
             if out.reply.status != 0 {
                 return None;
             }
-            self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+            let (status, out) =
+                self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle))?;
+            let satisfied = out.len() >= 4 && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
+            if status != 0 || !satisfied {
+                return None;
+            }
             Some(acm_handle)
-        })().is_some();
-        dev_info!(self.dev, "scrd: cold-match credential established {}\n", established);
-        established
+        })();
+        let Some(handle) = established else {
+            dev_info!(self.dev, "scrd: cold-match credential established false\n");
+            return false;
+        };
+        *self.match_context.lock() = Some(handle);
+        let generation = self.match_context_generation.fetch_add(1, Relaxed).wrapping_add(1);
+        dev_info!(
+            self.dev,
+            "scrd: cold-match credential established true; match context generation {}\n",
+            generation
+        );
+        true
     }
 
 
