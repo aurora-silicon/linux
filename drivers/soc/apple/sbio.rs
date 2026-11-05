@@ -82,6 +82,22 @@ mod lockout_tests {
     }
 
     #[test]
+    fn protected_config_unlock_words() {
+        let mut raw = [0u8; SBIO_PROTECTED_CONFIG_LEN];
+        raw[0..4].copy_from_slice(&1i32.to_le_bytes());
+        raw[0x10..0x14].copy_from_slice(&(-1i32).to_le_bytes());
+        let config = ProtectedConfig::parse(&raw).unwrap();
+        assert_eq!(config.unlock_set, 1);
+        assert_eq!(config.unlock_effective, -1);
+        assert!(!config.allows_unlock());
+        raw[0x10..0x14].copy_from_slice(&1i32.to_le_bytes());
+        assert!(ProtectedConfig::parse(&raw).unwrap().allows_unlock());
+        assert!(ProtectedConfig::parse(&raw[..31]).is_none());
+        assert_eq!(ProtectedConfig::describe(-1), "unspecified");
+        assert_eq!(ProtectedConfig::describe(0), "disabled");
+    }
+
+    #[test]
     fn authenticated_match_carries_mode_and_context() {
         let user = UserId::new(1000).unwrap();
         let handle = [0xa5u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
@@ -659,6 +675,35 @@ impl SepData {
         }
 
         true
+    }
+
+    /// Reads the Linux user's protected configuration once and logs whether
+    /// it allows unlock. Only the two symbolic states are logged.
+    fn log_protected_unlock(&self) {
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        let Some(raw) = self.sbio_expect_ok(&crate::sbio::sbio_protected_config(user)) else {
+            dev_warn!(self.dev, "sbio: PROTECTED_CONFIG for user {} did not answer\n", user.value());
+            return;
+        };
+        match crate::sbio::ProtectedConfig::parse(&raw) {
+            Some(config) => dev_info!(
+                self.dev,
+                "sbio: protected unlock for user {}: set={}, effective={}, admits an unlock match {}\n",
+                user.value(),
+                crate::sbio::ProtectedConfig::describe(config.unlock_set),
+                crate::sbio::ProtectedConfig::describe(config.unlock_effective),
+                config.allows_unlock()
+            ),
+            None => dev_warn!(
+                self.dev,
+                "sbio: PROTECTED_CONFIG for user {} answered {} bytes, expected {}\n",
+                user.value(),
+                raw.len(),
+                crate::sbio::SBIO_PROTECTED_CONFIG_LEN
+            ),
+        }
     }
 
     fn activate_protected_config(&self, user: crate::sbio::UserId) -> bool {
@@ -2735,6 +2780,7 @@ impl SepData {
             dev_info!(self.dev, "sbio: restore-ready after device-view proof {}\n", self.templates_restored.load(Relaxed));
             if self.templates_restored.load(Relaxed) {
                 self.reconcile_identities();
+                self.log_protected_unlock();
             }
         } else if !listed {
             dev_warn!(self.dev, "sbio: device-view synchronisation or match policy unavailable\n");
@@ -5098,6 +5144,45 @@ pub(crate) fn sbio_select_context(scope: ContextScope, proof: &NoExistingCatacom
 }
 
 pub(crate) const SBIO_PROTECTED_CONFIG_LEN: usize = 32;
+
+/// The PROTECTED_CONFIG answer: eight signed words, the set unlock,
+/// identification, login and payment settings, then the effective ones.
+/// Each is 0 (disabled), 1 (enabled) or -1 (unspecified).
+pub(crate) struct ProtectedConfig {
+    pub(crate) unlock_set: i32,
+    pub(crate) unlock_effective: i32,
+}
+
+const PC_UNLOCK_SET: usize = 0x00;
+const PC_UNLOCK_EFFECTIVE: usize = 0x10;
+static_assert!(PC_UNLOCK_EFFECTIVE + 4 <= SBIO_PROTECTED_CONFIG_LEN);
+
+impl ProtectedConfig {
+    pub(crate) fn parse(raw: &[u8]) -> Option<ProtectedConfig> {
+        if raw.len() != SBIO_PROTECTED_CONFIG_LEN {
+            return None;
+        }
+        let word = |at: usize| i32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        Some(ProtectedConfig {
+            unlock_set: word(PC_UNLOCK_SET),
+            unlock_effective: word(PC_UNLOCK_EFFECTIVE),
+        })
+    }
+
+    pub(crate) fn describe(value: i32) -> &'static str {
+        match value {
+            0 => "disabled",
+            1 => "enabled",
+            -1 => "unspecified",
+            _ => "unknown",
+        }
+    }
+
+    /// The macOS admission rule for an unlock match.
+    pub(crate) fn allows_unlock(&self) -> bool {
+        self.unlock_set == 1 && self.unlock_effective != -1
+    }
+}
 
 const OP_SBIO_PROTECTED_CONFIG: u16 = 0x2b;
 pub(crate) fn sbio_protected_config(id: UserId) -> SbioOp {
