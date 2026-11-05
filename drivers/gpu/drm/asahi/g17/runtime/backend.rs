@@ -195,9 +195,10 @@ impl job::Backend for Backend {
                 crate::g17::queue::render::m5_render_submission::layout(
                     command, self.shared.clusters, self.shared.variant.programs)?;
             }
-            Validated::Compute { resources, plan, m5_scratch, .. } => {
+            Validated::Compute { resources, plan, m5_scratch, cdm_auxiliary_allocation, .. } => {
                 if let Some(programs) = resources {
-                    *plan = Some(policy.plan_compute_scs(programs, priority, m5_scratch.layout())?);
+                    *plan = Some(policy.plan_compute_scs(programs, priority, m5_scratch.layout(),
+                        *cdm_auxiliary_allocation)?);
                 } else if m5_scratch.enabled() {
                     // SCS needs the dispatch storage declarations to size its pool.
                     return Err(EINVAL);
