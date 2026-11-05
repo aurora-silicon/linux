@@ -37,6 +37,7 @@ mod mmu;
 mod object;
 mod pgtable;
 mod queue;
+mod queue_share;
 mod regs;
 mod retain;
 mod slotalloc;
@@ -97,6 +98,8 @@ impl kernel::InPlaceModule for DriverModule {
     fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { binding::init() };
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { queue_share::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,

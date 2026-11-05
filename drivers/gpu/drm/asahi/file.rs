@@ -20,6 +20,7 @@ use crate::{
     memacct,
     mmu,
     queue,
+    queue_share,
     util::{
         align,
         align_down,
@@ -30,7 +31,7 @@ use crate::{
     }, //
 };
 use core::mem::MaybeUninit;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use core::ops::Range;
 use core::ptr::addr_of_mut;
 use kernel::bindings;
@@ -326,6 +327,27 @@ pub(crate) enum Object {
     TimestampBuffer(Arc<crate::timestamp::Buffer>),
 }
 
+/// A queue in a file's table. Its count in the creating process's share of the device's
+/// queues is given back once the queue itself is gone.
+pub(crate) struct TableQueue {
+    queue: KBox<dyn queue::Queue>,
+    _share: Option<queue_share::Share>,
+}
+
+impl Deref for TableQueue {
+    type Target = dyn queue::Queue;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.queue
+    }
+}
+
+impl DerefMut for TableQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.queue
+    }
+}
+
 /// State associated with a client.
 // #[pin_data]
 pub(crate) struct File {
@@ -335,7 +357,7 @@ pub(crate) struct File {
     // #[pin]
     vms: xarray::XArray<KBox<Vm>>,
     // #[pin]
-    queues: xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>,
+    queues: xarray::XArray<Arc<Mutex<TableQueue>>>,
     // #[pin]
     objects: xarray::XArray<KBox<Object>>,
     /// GPU memory this client created and holds.
@@ -419,7 +441,7 @@ impl File {
                 let raw_queues = addr_of_mut!((*slot).queues);
                 pin_init::raw_try_init(
                     raw_queues,
-                    xarray::XArray::<Arc<Mutex<KBox<dyn queue::Queue>>>>::new(
+                    xarray::XArray::<Arc<Mutex<TableQueue>>>::new(
                         xarray::AllocKind::Alloc1,
                     ),
                 )?;
@@ -446,7 +468,7 @@ impl File {
     }
 
     #[allow(clippy::type_complexity)]
-    fn queues(self: Pin<&Self>) -> Pin<&xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>> {
+    fn queues(self: Pin<&Self>) -> Pin<&xarray::XArray<Arc<Mutex<TableQueue>>>> {
         // SAFETY: Structural pinned projection for queues.
         // We never move out of this field.
         unsafe { self.map_unchecked(|s| &s.queues) }
@@ -1426,6 +1448,15 @@ impl File {
             return Err(EACCES);
         }
 
+        // The queue counts against the creating process's share of the device's independent
+        // queues, whichever of its files it is created on, so no process can take every
+        // execution context and leave the others, the compositor included, unable to create
+        // one (see [`queue_share`]); a refusal fails with EBUSY.
+        let share = reg_data
+            .gpu
+            .queue_limits()
+            .map(|limits| queue_share::Share::take_current(limits.max_queues))
+            .transpose()?;
         let queues_xa = file.inner().queues();
         let resv = queues_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
         let vms_xa = file.inner().vms();
@@ -1451,7 +1482,13 @@ impl File {
         queue.reserve_render_scs(data.render_scs_layout)?;
 
         data.queue_id = resv.index().try_into()?;
-        resv.fill(Arc::pin_init(new_mutex!(queue), GFP_KERNEL)?)?;
+        resv.fill(Arc::pin_init(
+            new_mutex!(TableQueue {
+                queue,
+                _share: share,
+            }),
+            GFP_KERNEL,
+        )?)?;
 
         Ok(0)
     }
@@ -1495,7 +1532,7 @@ impl File {
         }
 
         // Upgrade to Arc<T> to drop the XArray lock early
-        let queue: Arc<Mutex<KBox<dyn queue::Queue>>> = file
+        let queue: Arc<Mutex<TableQueue>> = file
             .inner()
             .queues()
             .lock()
