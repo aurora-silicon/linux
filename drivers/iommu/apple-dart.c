@@ -1234,7 +1234,7 @@ apple_dart_snapshot_fw_tree(struct apple_dart *dart, int sid, const u64 *live)
 /* What firmware's recorded four-level subtree translates @addr to, or 0. */
 static phys_addr_t apple_dart_fw_tree_phys(const struct apple_dart *dart,
 					   const struct apple_dart_fw_tree *tree,
-					   const u64 *live, u64 addr)
+					   const u64 *live, u64 addr, int *prot_out)
 {
 	u32 pgshift = ilog2(dart->pgsize);
 	u32 bits = ilog2(dart->pgsize / sizeof(u64));
@@ -1252,6 +1252,8 @@ static phys_addr_t apple_dart_fw_tree_phys(const struct apple_dart *dart,
 	    !apple_dart_fw_leaf_decode(READ_ONCE(tree->leaf[slot][mid][page]),
 				       addr, &phys, &prot))
 		return 0;
+	if (prot_out)
+		*prot_out = prot;
 	return phys;
 }
 
@@ -2439,11 +2441,18 @@ static int apple_dart_check_fw_map(struct apple_dart_domain *domain, u64 dva,
 	return 0;
 }
 
+/*
+ * What firmware's own retained translations in @domain map @address to, or 0.
+ * With @prot_out, also the protection every stream grants (IOMMU_READ and
+ * IOMMU_WRITE as the leaves say).
+ */
 static phys_addr_t
-apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
+apple_dart_inherited_phys_prot(struct apple_dart_domain *domain, dma_addr_t address,
+			       int *prot_out)
 {
 	struct apple_dart_atomic_stream_map *map;
 	phys_addr_t result = 0;
+	int granted = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
 	int i, sid;
 
 	for_each_stream_map(i, domain, map) {
@@ -2466,10 +2475,11 @@ apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
 				continue;
 			tree = dart->locked_fw_tree[sid];
 			fw = dart->locked_fw[sid][0];
+			prot = 0;
 			if (tree)
 				phys = apple_dart_fw_tree_phys(dart, tree,
 							       dart->locked_ttbr[sid][0],
-							       address);
+							       address, &prot);
 			else if (slot >= entries ||
 				 !apple_dart_fw_slot_owned(fw, dart->locked_ttbr[sid][0], slot) ||
 				 !apple_dart_fw_leaf_decode(READ_ONCE(fw->leaf[slot][page]),
@@ -2480,11 +2490,61 @@ apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
 				return 0;
 			}
 			result = phys;
+			granted &= prot;
 		}
 		spin_unlock_irqrestore(&dart->lock, flags);
 	}
+	if (prot_out)
+		*prot_out = result ? granted : 0;
 	return result;
 }
+
+static phys_addr_t
+apple_dart_inherited_phys(struct apple_dart_domain *domain, dma_addr_t address)
+{
+	return apple_dart_inherited_phys_prot(domain, address, NULL);
+}
+
+/*
+ * Resolves a DVA a co-processor's firmware names in a request of its own, for
+ * a host copy to or from that buffer. Only firmware's retained mappings count:
+ * a DVA Linux mapped itself (a framebuffer, an imported or DMA_TO_DEVICE
+ * buffer) is refused, so the host never writes what the device may only read.
+ * @write requires the leaf to grant writes. -EACCES when refused, -ENXIO when
+ * unmapped.
+ */
+int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write,
+			 phys_addr_t *phys)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct apple_dart_domain *dart_domain;
+	struct io_pgtable_ops *ops;
+	struct io_pgtable_cfg *cfg;
+	dma_addr_t address;
+	phys_addr_t result;
+	int prot;
+
+	if (!domain || domain->owner != &apple_dart_iommu_ops)
+		return -ENODEV;
+	dart_domain = to_dart_domain(domain);
+	ops = dart_domain->pgtbl_ops;
+	if (dart_domain->dcp || !ops)
+		return -ENODEV;
+	address = (iova + dart_domain->dma_offset) & dart_domain->mask;
+	if (ops->iova_to_phys(ops, address))
+		return -EACCES;
+	cfg = &io_pgtable_ops_to_pgtable(ops)->cfg;
+	if (cfg->apple_dart_cfg.n_levels != 3 && cfg->apple_dart_cfg.n_levels != 4)
+		return -ENXIO;
+	result = apple_dart_inherited_phys_prot(dart_domain, address, &prot);
+	if (!result)
+		return -ENXIO;
+	if (!(prot & IOMMU_READ) || (write && !(prot & IOMMU_WRITE)))
+		return -EACCES;
+	*phys = result;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_fw_remote);
 
 static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
 					   dma_addr_t iova)

@@ -17,6 +17,8 @@
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
+#include <linux/ioport.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/rtkit.h>
 
 #include <kunit/visibility.h>
@@ -1884,37 +1886,55 @@ static void afk_v2_status(struct apple_dcp_afkep *ep,
 		dev_warn(ep->dcp->dev, "AFKV2 error reply failed: %d\n", ret);
 }
 
+/*
+ * A buffer the DCP firmware names that is none of the host's pending command
+ * buffers. Only the firmware's own retained mappings are followed, with the
+ * permission they grant: a reply is written only where the firmware's leaf
+ * allows writes, and a DVA that Linux mapped itself, or that names Linux's RAM,
+ * a claimed resource or anything below DRAM (a device's registers, claimed or
+ * not), is refused. The copy goes through a write-combined mapping, as the
+ * RTKit buffers in the same firmware segments are mapped (dcp_rtk_shmem_setup()):
+ * the DCP is not described as DMA-coherent, so a cacheable alias could see
+ * stale data.
+ */
 static int afk_v27_access_remote(struct apple_dcp_afkep *ep, u64 dva, void *buffer,
 			   size_t size, bool to_remote, bool copy)
 {
-	struct iommu_domain *domain = iommu_get_domain_for_dev(ep->dcp->dev);
 	size_t off = 0;
 
-	if (!domain || !dva || size > SZ_1M || size > U64_MAX - dva)
+	if (!dva || size > SZ_1M || size > U64_MAX - dva)
 		return -EINVAL;
 	while (off < size) {
-		phys_addr_t pa = iommu_iova_to_phys(domain, dva + off);
+		phys_addr_t pa = 0;
 		size_t chunk = min_t(size_t, size - off,
 				    PAGE_SIZE - ((dva + off) & ~PAGE_MASK));
+		int ret = apple_dart_fw_remote(ep->dcp->dev, dva + off, to_remote, &pa);
 		void *cpu;
 
-		if (!pa) {
+		if (!ret && (!dcp_fw_phys_in_dram(pa) ||
+			     region_intersects(pa, chunk, IORESOURCE_MEM,
+					       IORES_DESC_NONE) != REGION_DISJOINT))
+			ret = -EACCES;
+		if (ret) {
 			dev_err_ratelimited(ep->dcp->dev,
-				"AFK[ep:%02x]: unmapped remote buffer %#llx + %#zx (%s)\n",
-				ep->endpoint, dva, off, to_remote ? "reply" : "request");
-			return -ENXIO;
+				"AFK[ep:%02x]: refused remote buffer %#llx + %#zx (%s): %d\n",
+				ep->endpoint, dva, off, to_remote ? "reply" : "request", ret);
+			return ret;
 		}
 		if (!copy) {
 			off += chunk;
 			continue;
 		}
-		cpu = memremap(pa, chunk, MEMREMAP_WB);
+		cpu = memremap(pa, chunk, MEMREMAP_WC);
 		if (!cpu)
 			return -ENOMEM;
-		if (to_remote)
+		if (to_remote) {
 			memcpy(cpu, buffer + off, chunk);
-		else
+			dma_wmb();
+		} else {
+			dma_rmb();
 			memcpy(buffer + off, cpu, chunk);
+		}
 		memunmap(cpu);
 		off += chunk;
 	}

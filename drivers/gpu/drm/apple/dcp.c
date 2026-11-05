@@ -1401,6 +1401,13 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		phy_addr = iommu_iova_to_phys(domain, bfr->iova);
 		if (!phy_addr)
 			return -ENOMEM;
+		/* Firmware 27's DVAs resolve through its own retained mappings. */
+		if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		    !dcp_fw_phys_in_dram(phy_addr)) {
+			dev_err(dcp->dev, "shmem_setup: iova %pad is not in DRAM\n",
+				&bfr->iova);
+			return -EACCES;
+		}
 
 		/* memremap() below needs the whole buffer physically contiguous */
 		ret = dcp_check_iova_contiguous(domain, bfr->iova, bfr->size,

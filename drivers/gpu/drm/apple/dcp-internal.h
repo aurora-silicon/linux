@@ -10,6 +10,7 @@
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
@@ -1082,6 +1083,18 @@ static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
 static inline bool dcp_surface_element_geometry(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
+/*
+ * Whether @pa, a physical address the DCP firmware placed a buffer at, can be
+ * DRAM. On Apple SoCs every device register window lies below DRAM, so an
+ * address below all of Linux's RAM may be a device's registers and is never
+ * mapped as memory. The firmware's own segments lie in DRAM beside Linux's RAM.
+ */
+static inline bool dcp_fw_phys_in_dram(phys_addr_t pa)
+{
+	return pa && region_intersects(0, pa, IORESOURCE_SYSTEM_RAM,
+				       IORES_DESC_NONE) != REGION_DISJOINT;
 }
 
 #define DCP_AUDIO_MAX_CHANS 15
