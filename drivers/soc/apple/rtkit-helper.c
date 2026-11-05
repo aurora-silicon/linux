@@ -13,6 +13,8 @@
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
 #include <linux/string.h>
@@ -383,9 +385,29 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
 
-	/* Only suspend-to-idle has a verified live-session retention contract. */
 	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
+	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+		return 0;
+	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN))
+		return -EHOSTDOWN;
+	/* mtp-live-v1 cannot be restarted: keep its ASC suppliers awake. */
+	device_set_awake_path(dev);
+	dev_dbg(dev, "adopted MTP s2idle: retaining ASC RUN and firmware session\n");
+	return 0;
+}
+
+static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+		return 0;
+	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN)) {
+		dev_err(dev, "adopted MTP lost ASC RUN; refusing firmware restart\n");
+		return -EHOSTDOWN;
+	}
+	dev_dbg(dev, "adopted MTP s2idle: ASC RUN retained, no INIT\n");
 	return 0;
 }
 
@@ -393,12 +415,12 @@ static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
 
-	/* A hibernation image cannot recreate the firmware's live DMA ownership. */
 	return helper->adopted ? -EBUSY : 0;
 }
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
 	.suspend = pm_sleep_ptr(apple_rtkit_helper_suspend),
+	.resume = pm_sleep_ptr(apple_rtkit_helper_resume),
 	.freeze = pm_sleep_ptr(apple_rtkit_helper_freeze),
 	.poweroff = pm_sleep_ptr(apple_rtkit_helper_freeze),
 };
@@ -414,6 +436,7 @@ MODULE_DEVICE_TABLE(of, apple_rtkit_helper_of_match);
 static struct platform_driver apple_rtkit_helper_driver = {
 	.driver = {
 		.name = "rtkit-helper",
+		.pm = pm_sleep_ptr(&apple_rtkit_helper_pm_ops),
 		.of_match_table = apple_rtkit_helper_of_match,
 		/* The live MTP input session is announced only once per boot. */
 		.suppress_bind_attrs = true,
