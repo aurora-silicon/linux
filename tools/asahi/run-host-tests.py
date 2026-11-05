@@ -54,6 +54,7 @@ def mutations(flag, names, base, expect=KILL):
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
     'aop-als-channel-tests.py': [([], PASS)],
+    'aop-bootargs-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
     'ave-pm-tests.py': [(out(), PASS),
@@ -124,6 +125,7 @@ ASAHI_TESTS = {
     'g17-pool-release-tests.py': [([], PASS)],
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
+    'g17-t6041-initdata-tests.py': [([], PASS)],
     'g17-uninstalled-cleanup-tests.py': [([], PASS)],
     'g17-unpublished-tests.py': [([], PASS)],
     'mt7932-association-events-tests.py': [(out(), PASS)],
@@ -156,6 +158,7 @@ ASAHI_TESTS = {
     't6030-wiring-tests.py': [(out(), PASS), (out() + ['--old-classifier', 'tb'], PASS),
                               (out() + ['--old-classifier', 'dcp'], PASS)],
     't6040-calibration-tests.py': [([], PASS)],
+    't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-dp-repair-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'tbnet-refill-tests.py': [(out(), PASS)]
         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
