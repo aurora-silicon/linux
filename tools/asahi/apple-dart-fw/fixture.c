@@ -102,7 +102,7 @@ static void pm_runtime_put(struct device*d){pm_puts++;}
 static void free_io_pgtable_ops(void*ops){assert(ops);pgtable_frees++;}
 /* No borrowed display roots here; the DCP paths are covered elsewhere. */
 static bool apple_dart_has_borrowed(struct apple_dart*d){return false;}
-static int apple_dart_dcp_invalidate_tlb(struct apple_dart_stream_map*m){abort();}
+static int apple_dart_dcp_invalidate_tlb_gated(struct apple_dart_stream_map*m){abort();}
 #define dev_info(d,...) ((void)0)
 /* PRODUCTION */
 #define IOMMU_RESV_DIRECT 1
