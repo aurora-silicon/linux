@@ -554,9 +554,10 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 }
 
 /*
- * A desktop 26.x external processor does not hand out the sink's EDID through
- * its DCPAV service, but exports the TimingElements and DisplayAttributes
- * of every sink it drives, on HDMI and Type-C alike.
+ * A desktop 26.x external processor, and T6050's on firmware 27, does not
+ * hand out the sink's EDID through its DCPAV service, but exports the
+ * TimingElements and DisplayAttributes of every sink it drives, on HDMI and
+ * Type-C alike.
  */
 static bool dcp_sink_metadata(struct apple_dcp *dcp)
 {
@@ -7052,6 +7053,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
 	.num_dptx_ports = 2,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.sink_metadata_edid = true,
 };
 
 static const struct of_device_id of_match[] = {
