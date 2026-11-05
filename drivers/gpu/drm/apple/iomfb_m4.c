@@ -20,6 +20,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
@@ -747,6 +748,25 @@ struct dcp_m4_runtime {
 	 */
 	unsigned int ext_local_calls;
 	int ext_call_epoch;
+	/*
+	 * The display down for a system sleep (from PM_SUSPEND_PREPARE to
+	 * PM_POST_SUSPEND: frames refused, enables and disables no-ops; the DRM
+	 * state is replayed after it, t8132_ext_drm.c)
+	 */
+	bool ext_sleeping;
+	/*
+	 * The replay after a sleep, from its wake to
+	 * iomfb_m4_ext_restore_result() or iomfb_m4_ext_restore_end(): whether
+	 * a D572(1) confirmed the display DART since (cleared by a D572(0)),
+	 * and whether a frame was shown since; the PM epoch at the sleep's
+	 * PREPARE, and the link and sink generations at the wake
+	 */
+	bool ext_restore_pending;
+	bool ext_restore_dart;
+	bool ext_restore_frame;
+	int ext_restore_epoch;
+	int ext_restore_link_gen;
+	int ext_restore_sink_gen;
 	u32 head, count, callbacks;
 	unsigned long deadline;
 	bool done;
@@ -1360,7 +1380,16 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 				return 0;
 			}
 		}
+		/*
+		 * For a replay under way, a D572(1) taken (after a suspend
+		 * only a nested one, above) confirms the DART, a D572(0) undoes it.
+		 */
+		if (r->ext_restore_pending)
+			WRITE_ONCE(r->ext_restore_dart, on);
 		WRITE_ONCE(r->dcp->ext_dart_down, !on);
+		/* A sleep's preparation may wait for it (iomfb_m4_ext_sleep_prepare()). */
+		if (!on)
+			wake_up_all(&r->dcp->ext_settle_wq);
 		if (on)
 			r->dcp->ext_dart_since_sleep = false;
 		dev_dbg(r->dcp->dev, "D572 powerUpDART(%u)\n", on);
@@ -3463,6 +3492,15 @@ int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *
 		return -ENODEV;
 	mutex_lock(&dcp->lock);
 	r = dcp->runtime;
+	/*
+	 * During a sleep (the DRM helper's resume) no call goes out: the DRM
+	 * state is replayed after it (t8132_ext_drm.c).
+	 */
+	if (r && r->ext_sleeping) {
+		ret = 0;
+		why = "during sleep: replayed after it";
+		goto out;
+	}
 	/* Pairs with the release store of r->done in startup. */
 	if (!r || !smp_load_acquire(&r->done) || !dcp_m4_ext_route_ready(dcp, r))
 		goto out;
@@ -3473,6 +3511,11 @@ int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *
 	ret = dcp_m4_ext_settle(dcp, r, "enable");
 	if (ret)
 		goto out;
+	/* A sleep that began during the wait has the display down: no call. */
+	if (r->ext_sleeping) {
+		why = "a sleep began meanwhile: replayed after it";
+		goto out;
+	}
 	/*
 	 * After the wait, the same link and sink, still ready, and the
 	 * mode one of this sink's: else no call goes out, the output is stale.
@@ -3640,7 +3683,8 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	if (r->ext_mode_stale)
 		goto out;
 	ret = -EBUSY;
-	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start || r->ext_async_id)
+	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
+	    r->ext_async_id || r->ext_sleeping)
 		goto out;
 	r->ext_hold_probe = false;
 	/*
@@ -3716,6 +3760,9 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	dcp_m4_ext_retired(r, back);
 	r->ext_buf_stale[back] = false;
 	r->ext_prev_damage = cur;
+	/* A frame shown, for the replay after a sleep. */
+	if (r->ext_restore_pending)
+		WRITE_ONCE(r->ext_restore_frame, true);
 out:
 	mutex_unlock(&dcp->lock);
 	return ret;
@@ -3938,6 +3985,9 @@ static void dcp_m4_ext_async_done(struct dcp_m4_runtime *r)
 	r->ext_async_id = 0;
 	r->ext_async_win = -1;
 	wake_up_all(&r->dcp->ext_settle_wq);
+	/* A frame shown, for the replay after a sleep. */
+	if (r->ext_restore_pending)
+		WRITE_ONCE(r->ext_restore_frame, true);
 	t8132_ext_drm_flip_done(r->dcp->dev);
 }
 
@@ -4032,7 +4082,8 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
 	if (r->ext_mode_stale)
 		goto out;
 	ret = -EBUSY;
-	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start || r->ext_async_id)
+	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
+	    r->ext_async_id || r->ext_sleeping)
 		goto out;
 	ret = -EOPNOTSUPP;
 	need = PAGE_ALIGN((size_t)fb->pitch * fb->height);
@@ -4094,6 +4145,11 @@ int iomfb_m4_ext_blank(struct apple_dcp *owner)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);
 	r = dcp->runtime;
+	/* During a sleep the display is down already. */
+	if (r && r->ext_sleeping) {
+		mutex_unlock(&dcp->lock);
+		return 0;
+	}
 	/* Never refused: a direct swap in flight ends first. */
 	/* Pairs with the release store of r->done in startup. */
 	if (r && smp_load_acquire(&r->done)) {
@@ -4101,6 +4157,11 @@ int iomfb_m4_ext_blank(struct apple_dcp *owner)
 		int sink_gen = atomic_read(&dcp->ext_sink_gen);
 
 		ret = dcp_m4_ext_settle(dcp, r, "disable");
+		/* A sleep that began during the wait has the display down. */
+		if (!ret && r->ext_sleeping) {
+			mutex_unlock(&dcp->lock);
+			return 0;
+		}
 		/* A link or sink gone meanwhile is not blanked: nothing to send to. */
 		if (!ret && (atomic_read(&r->ext_link_gen) != link_gen ||
 			     atomic_read(&dcp->ext_sink_gen) != sink_gen ||
@@ -4133,9 +4194,238 @@ int iomfb_m4_ext_blank(struct apple_dcp *owner)
 }
 
 /*
- * J713: whether an external DCP's display is in use for system sleep: a
- * sink attached, its output on (power or a mode), a swap in flight or held.
- * Sleep goes on only with the firmware's last word on the display DART off.
+ * PM_SUSPEND_PREPARE, under every modeset lock with no commit on its CRTC
+ * pending (t8132_ext_drm.c): the output enters a system sleep: frames are
+ * refused from now on (their flips sent a frame later), enables and disables
+ * do nothing until iomfb_m4_ext_sleep_wake(). True if it did (an external DCP
+ * with a live session).
+ */
+bool iomfb_m4_ext_sleep_mark(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	struct dcp_m4_runtime *r;
+	bool entered = false;
+
+	if (!dcp || !dcp->external)
+		return false;
+	mutex_lock(&dcp->lock);
+	r = dcp->runtime;
+	/* Pairs with the release store of r->done in startup. */
+	if (r && smp_load_acquire(&r->done) && !READ_ONCE(dcp->error)) {
+		r->ext_sleeping = true;
+		/* Whether any suspend comes before the wake (the replay's DART). */
+		r->ext_restore_epoch = atomic_read(&dcp->ext_pm_epoch);
+		entered = true;
+	}
+	mutex_unlock(&dcp->lock);
+	return entered;
+}
+
+/*
+ * PM_SUSPEND_PREPARE, before the tasks freeze, every worker running, after
+ * iomfb_m4_ext_sleep_mark(): the display down for the sleep: the swap in flight
+ * settles (its D590, or its give-up); a surfaceless swap; every window let go
+ * of; the display powered off (A473 0) and its firmware's D572(0) waited for
+ * (1 s), so that the DCP's suspend finds the display DART off, else it refuses
+ * the sleep. The DRM state replayed after the sleep powers on and sets the
+ * mode from scratch.
+ */
+void iomfb_m4_ext_sleep_down(struct apple_dcp *owner)
+{
+	struct dcp_m4_power_state_req req = { .state = cpu_to_le64(0) };
+	struct dcp_m4_power_state_reply reply = {};
+	struct iomfb_m4 *dcp = owner->v26_6;
+	struct dcp_m4_runtime *r;
+	int ret = 0, mapped = 0, left = 0;
+
+	if (!dcp || !dcp->external)
+		return;
+	mutex_lock(&dcp->lock);
+	r = dcp->runtime;
+	if (!r || !r->ext_sleeping) {
+		mutex_unlock(&dcp->lock);
+		return;
+	}
+	dev_dbg(dcp->dev, "sleep: display going down (display DART %s, swap in flight %u)\n",
+		READ_ONCE(dcp->ext_dart_down) ? "off" : "on", r->ext_async_id);
+	/* The workers run: the swap in flight completes or is given up as ever. */
+	ret = dcp_m4_ext_settle(dcp, r, "sleep");
+	if (!ret && dcp_m4_ext_route_ready(dcp, r) && READ_ONCE(r->ext_cur_timing)) {
+		r->ext_swap_surface = -1;
+		ret = r->ext_hold_id || r->ext_orphan_start ? -EBUSY :
+			dcp_m4_runtime_swap_full(r, true, NULL, NULL, 0, false, 0, 0, 0);
+		if (ret)
+			dev_warn(dcp->dev, "sleep: surfaceless swap failed: %d\n", ret);
+		if (!ret) {
+			dcp_m4_ext_retired(r, -1);
+			for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
+				mapped += !!r->ext_win[i].key;
+			if (dcp_m4_ext_win_release_idle(r, 0))
+				dev_dbg(dcp->dev, "sleep: idle windows not let go of\n");
+			for (int i = 0; i < DCP_M4_EXT_WINDOWS; i++)
+				left += !!r->ext_win[i].key;
+			dev_dbg(dcp->dev, "sleep: windows released: %d of %d\n",
+				mapped - left, mapped);
+		}
+		r->ext_buf_stale[0] = true;
+		r->ext_buf_stale[1] = true;
+	}
+	if (!ret && READ_ONCE(r->ext_powered) && r->ext_connected) {
+		ret = dcp_m4_ext_call(r, 473, 1, &req, sizeof(req), &reply, sizeof(reply), 5000);
+		dev_dbg(dcp->dev, "sleep: A473 power state 0: %d, value %u, status %#x\n",
+			ret, le32_to_cpu(reply.value), le32_to_cpu(reply.status));
+		/* Its D572(0), nested in it or after it (the idle worker), 1 s at most. */
+		if (!ret && !READ_ONCE(dcp->ext_dart_down)) {
+			mutex_unlock(&dcp->lock);
+			wait_event_timeout(dcp->ext_settle_wq,
+					   READ_ONCE(dcp->ext_dart_down) || READ_ONCE(dcp->error),
+					   msecs_to_jiffies(1000));
+			mutex_lock(&dcp->lock);
+		}
+		if (!READ_ONCE(dcp->ext_dart_down))
+			dev_warn(dcp->dev, "sleep: the display DART not powered down within 1 s of the power-off (%d): the DCP refuses to suspend\n",
+				 ret);
+	}
+	/* After the sleep the display is powered on and its mode set from scratch. */
+	WRITE_ONCE(r->ext_powered, false);
+	WRITE_ONCE(r->ext_cur_timing, 0);
+	mutex_unlock(&dcp->lock);
+}
+
+/*
+ * PM_POST_SUSPEND, under every modeset lock, before the DRM state is
+ * replayed: the output leaves the sleep; its next enable
+ * powers on and sets the mode, its next frames go out again.
+ */
+void iomfb_m4_ext_sleep_wake(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (!dcp || !dcp->external)
+		return;
+	mutex_lock(&dcp->lock);
+	if (dcp->runtime && dcp->runtime->ext_sleeping) {
+		struct dcp_m4_runtime *r = dcp->runtime;
+		/*
+		 * The replay starts, no frame of it shown yet. Without any
+		 * suspend since PREPARE (a sleep refused or aborted before the
+		 * DCPs), the DART never left confirmation: on as it is now.
+		 */
+		bool kept = atomic_read(&dcp->ext_pm_epoch) == r->ext_restore_epoch &&
+			    !dcp->ext_dart_since_sleep && !READ_ONCE(dcp->ext_dart_down);
+
+		r->ext_sleeping = false;
+		r->ext_restore_pending = true;
+		WRITE_ONCE(r->ext_restore_dart, kept);
+		WRITE_ONCE(r->ext_restore_frame, false);
+		r->ext_restore_link_gen = atomic_read(&r->ext_link_gen);
+		r->ext_restore_sink_gen = atomic_read(&dcp->ext_sink_gen);
+		if (kept)
+			dev_dbg(dcp->dev, "sleep: no suspend since it began: the display DART stays confirmed\n");
+	}
+	mutex_unlock(&dcp->lock);
+}
+
+/* A replay ends unchecked (it failed, or nothing to replay). */
+void iomfb_m4_ext_restore_end(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+
+	if (!dcp || !dcp->external)
+		return;
+	mutex_lock(&dcp->lock);
+	if (dcp->runtime)
+		dcp->runtime->ext_restore_pending = false;
+	mutex_unlock(&dcp->lock);
+}
+
+/*
+ * PM_POST_SUSPEND, after the replay's commit of an output that is on (its
+ * flips are done or given up by then): whether the
+ * replay restored the output, its enable kept (not stale), a D572(1)
+ * confirmed the display DART and a frame was shown since the wake; and,
+ * now, the session alive, the DART on as of the last D572, its streams
+ * confirmed and not retired nor its state lost, the link and the sink the
+ * wake's. What is still missing is polled for @timeout_ms at most; the
+ * replay ends here. 0, else why not, logged.
+ */
+int iomfb_m4_ext_restore_result(struct apple_dcp *owner, unsigned int timeout_ms)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	const char *why;
+	int ret;
+
+	if (!dcp || !dcp->external)
+		return -ENODEV;
+	for (;;) {
+		struct dcp_m4_runtime *r;
+		bool done;
+
+		mutex_lock(&dcp->lock);
+		r = dcp->runtime;
+		ret = -EAGAIN;
+		why = "";
+		if (!r || !r->ext_restore_pending) {
+			ret = -ENOLINK;
+			why = ": no replay under way (the session went meanwhile)";
+		} else if (READ_ONCE(dcp->error)) {
+			ret = -EIO;
+			why = ": the session failed";
+		} else if (atomic_read(&r->ext_link_gen) != r->ext_restore_link_gen ||
+			   atomic_read(&dcp->ext_sink_gen) != r->ext_restore_sink_gen) {
+			ret = -ENOLINK;
+			why = ": the link or sink changed since the wake";
+		} else if (r->ext_mode_stale) {
+			ret = -ESTALE;
+			why = ": the enable failed";
+		} else if (READ_ONCE(dcp->ext_dart_lost) || !dcp->piodma ||
+			   apple_dart_dcp_dispext_stream_ok(&dcp->piodma->dev, 0) == -EIO) {
+			ret = -EIO;
+			why = ": the display DART is retired or its state lost";
+		} else if (!READ_ONCE(r->ext_restore_dart) || READ_ONCE(dcp->ext_dart_down) ||
+			   apple_dart_dcp_dispext_stream_ok(&dcp->piodma->dev, 0)) {
+			why = ": the display DART not confirmed on since the wake";
+		} else if (!READ_ONCE(r->ext_restore_frame)) {
+			why = ": no frame shown";
+		} else {
+			ret = 0;
+		}
+		done = ret != -EAGAIN || time_after(jiffies, deadline);
+		if (done && r)
+			r->ext_restore_pending = false;
+		mutex_unlock(&dcp->lock);
+		if (done)
+			break;
+		msleep(20);
+	}
+	if (ret == -EAGAIN)
+		ret = -ETIMEDOUT;
+	if (ret)
+		dev_warn(dcp->dev, "resume: restore not confirmed%s: %d\n", why, ret);
+	else
+		dev_info(dcp->dev, "resume: display restored\n");
+	return ret;
+}
+
+/* Whether the last enable failed (no frame until one succeeds). */
+bool iomfb_m4_ext_stale(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	bool stale;
+
+	if (!dcp || !dcp->external)
+		return false;
+	mutex_lock(&dcp->lock);
+	stale = dcp->runtime && dcp->runtime->ext_mode_stale;
+	mutex_unlock(&dcp->lock);
+	return stale;
+}
+
+/*
+ * J713: why an external DCP's display cannot go down for system sleep, or
+ * NULL: swaps held or a start orphaned (a stuck pipe), or a lost display
+ * DART state. Anything else goes down before the freeze (t8132_ext_drm.c).
  */
 const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *owner)
 {
@@ -4147,15 +4437,10 @@ const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *owner)
 		return NULL;
 	mutex_lock(&dcp->lock);
 	r = dcp->runtime;
-	if (READ_ONCE(dcp->ext_sink))
-		why = "a sink is attached";
-	else if (r && (r->ext_async_id || r->ext_hold_id || r->ext_orphan_start))
-		why = "a swap is in flight or held";
-	else if (r && (READ_ONCE(r->ext_powered) || READ_ONCE(r->ext_cur_timing) ||
-		       r->ext_connected))
-		why = "the output is on";
-	else if (!READ_ONCE(dcp->ext_dart_down))
-		why = "the display DART is on (last D572 was 1)";
+	if (r && (r->ext_hold_id || r->ext_orphan_start))
+		why = "swaps are held or a start is orphaned";
+	else if (READ_ONCE(dcp->ext_dart_lost))
+		why = "the display DART state was lost";
 	mutex_unlock(&dcp->lock);
 	return why;
 }
@@ -4166,6 +4451,25 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 	struct iomfb_m4 *dcp = owner->v26_6;
 	int ret;
 
+	/*
+	 * An external DCP with a session suspends only with its display DART
+	 * off (the firmware's last D572 was 0) and nothing in flight; else the
+	 * sleep is refused, and the outputs are restored after it.
+	 */
+	if (dcp && dcp->external && dcp->runtime && smp_load_acquire(&dcp->runtime->done)) {
+		const char *why = NULL;
+
+		mutex_lock(&dcp->lock);
+		if (!READ_ONCE(dcp->ext_dart_down))
+			why = "the display DART is on (last D572 was 1)";
+		else if (dcp->runtime->ext_async_id)
+			why = "a swap is under way";
+		mutex_unlock(&dcp->lock);
+		if (why) {
+			dev_warn(dcp->dev, "refusing system sleep: %s\n", why);
+			return -EBUSY;
+		}
+	}
 	if (dcp && dcp->external) {
 		/*
 		 * Every message RTKit received so far is dispatched, and stamped

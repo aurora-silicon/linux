@@ -63,6 +63,13 @@ int iomfb_m4_ext_blank(struct apple_dcp *dcp);
 int iomfb_m4_ext_present_direct(struct apple_dcp *dcp, const struct iomfb_m4_ext_fb *fb);
 /* Why an external DCP's display refuses system sleep, or NULL. */
 const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp);
+/* An external output through a system sleep. */
+bool iomfb_m4_ext_sleep_mark(struct apple_dcp *dcp);
+void iomfb_m4_ext_sleep_down(struct apple_dcp *dcp);
+void iomfb_m4_ext_sleep_wake(struct apple_dcp *dcp);
+bool iomfb_m4_ext_stale(struct apple_dcp *dcp);
+int iomfb_m4_ext_restore_result(struct apple_dcp *dcp, unsigned int timeout_ms);
+void iomfb_m4_ext_restore_end(struct apple_dcp *dcp);
 
 /* The caller has waited for the producer fence before publishing the DMA GEM. */
 int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
@@ -123,6 +130,16 @@ static inline int iomfb_m4_ext_present_direct(struct apple_dcp *dcp,
 }
 
 static inline const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp) { return NULL; }
+static inline bool iomfb_m4_ext_sleep_mark(struct apple_dcp *dcp) { return false; }
+static inline void iomfb_m4_ext_sleep_down(struct apple_dcp *dcp) { }
+static inline void iomfb_m4_ext_sleep_wake(struct apple_dcp *dcp) { }
+static inline bool iomfb_m4_ext_stale(struct apple_dcp *dcp) { return false; }
+static inline int iomfb_m4_ext_restore_result(struct apple_dcp *dcp, unsigned int timeout_ms)
+{
+	return 0;
+}
+
+static inline void iomfb_m4_ext_restore_end(struct apple_dcp *dcp) { }
 
 static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 				  dma_addr_t dva, size_t mapped)

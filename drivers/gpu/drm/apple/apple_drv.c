@@ -1492,6 +1492,8 @@ static int apple_drm_init(struct device *dev)
 			if (!t8132_ext_crtc(crtc))
 				dcp_takeover_aborted(to_apple_crtc(crtc)->dcp);
 		apple->aborted = true;
+		/* No sleep handling for outputs of a device never registered. */
+		t8132_ext_drm_fini(&apple->drm);
 		return 0;
 	}
 
@@ -1515,6 +1517,7 @@ static int apple_drm_init(struct device *dev)
 			ret = dcp_activate(to_apple_crtc(crtc)->dcp);
 			if (ret) {
 				drm_modeset_unlock_all(&apple->drm);
+				t8132_ext_drm_fini(&apple->drm);
 				drm_dev_unregister(&apple->drm);
 				goto err_unbind;
 			}
@@ -1536,6 +1539,7 @@ static int apple_drm_init(struct device *dev)
 	/* A subsequent successful platform probe retries deferred GPU probes. */
 	ret = apple_g15_display_publish(dev);
 	if (ret) {
+		t8132_ext_drm_fini(&apple->drm);
 		drm_dev_unregister(&apple->drm);
 		goto err_unbind;
 	}
@@ -1546,6 +1550,7 @@ err_unlock:
 	if (retained_modeset)
 		drm_modeset_unlock_all(&apple->drm);
 err_unbind:
+	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
 	dcp_unlink(&apple->drm);
@@ -1562,6 +1567,8 @@ static void apple_drm_uninit(struct device *dev)
 	if (apple->aborted)
 		return;
 
+	/* Before anything of the DRM device is torn down. */
+	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);

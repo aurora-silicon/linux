@@ -24,6 +24,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_modeset_lock.h>
@@ -75,6 +76,18 @@ struct t8132_ext_out {
 	/* The held flip event, sent with its swap's D590 or later (drm->event_lock) */
 	struct drm_pending_vblank_event *event;
 	struct delayed_work flip_work;
+	/* The DRM device suspends before this DCP and resumes after it */
+	struct device_link *pm_link;
+	/*
+	 * Whether the output entered the system sleep under way (the layer's
+	 * PM_POST_SUSPEND then always brings it back)
+	 */
+	bool sleep_entered;
+	/*
+	 * Torn down (t8132_ext_drm_fini()): its work is not queued again
+	 * (t8132_ext_lock to set; read anywhere)
+	 */
+	bool dying;
 	bool first_frame;
 	/* A frame was not shown, so the next one goes whole */
 	bool frame_lost;
@@ -87,6 +100,21 @@ struct t8132_ext_out {
 static DEFINE_SPINLOCK(t8132_ext_lock);
 /* Registered outputs, for t8132_ext_drm_hotplug() (t8132_ext_lock) */
 static struct t8132_ext_out *t8132_ext_live[T8132_EXT_MAX];
+/*
+ * Every output initialised, for the layer's one PM notifier, all of one DRM
+ * device (t8132_ext_pm_drm, the first to init; a second one's outputs get no
+ * sleep handling): set up by its t8132_ext_drm_init(), the notifier registered
+ * after them; its t8132_ext_drm_fini() unregisters it before anything is torn
+ * down. All under t8132_ext_reg_lock, which the notifier holds throughout:
+ * outermost, before any modeset lock, and never held to (un)register the
+ * notifier.
+ */
+static DEFINE_MUTEX(t8132_ext_reg_lock);
+static struct drm_device *t8132_ext_pm_drm;
+static struct t8132_ext_out *t8132_ext_outs[T8132_EXT_MAX];
+static unsigned int t8132_ext_nouts;
+static bool t8132_ext_pm_registered;
+
 static const u32 t8132_ext_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
@@ -488,8 +516,14 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 	 * frame later. A direct frame's comes with its D590 (or when its swap
 	 * is given up).
 	 */
-	if (event && ret != 2)
-		mod_delayed_work(system_wq, &out->flip_work, ret >= 0 ? 0 : msecs_to_jiffies(16));
+	if (event && ret != 2) {
+		/* Torn down: no work queued again, the event now. */
+		if (READ_ONCE(out->dying))
+			t8132_ext_send_event(out);
+		else
+			mod_delayed_work(system_wq, &out->flip_work,
+					 ret >= 0 ? 0 : msecs_to_jiffies(16));
+	}
 }
 
 /* A modeset only to a mode the sink offered, within the link. */
@@ -526,6 +560,8 @@ static void t8132_ext_crtc_destroy(struct drm_crtc *crtc)
 	cancel_delayed_work_sync(&out->flip_work);
 	cancel_work_sync(&out->hotplug_work);
 	drm_crtc_cleanup(crtc);
+	if (out->pm_link)
+		device_link_del(out->pm_link);
 	put_device(&out->pdev->dev);
 	kfree(out);
 }
@@ -718,16 +754,242 @@ void t8132_ext_drm_hotplug(struct device *dcpext)
 
 	spin_lock_irqsave(&t8132_ext_lock, flags);
 	for (unsigned int i = 0; i < T8132_EXT_MAX; i++)
-		if (t8132_ext_live[i] && &t8132_ext_live[i]->pdev->dev == dcpext)
+		if (t8132_ext_live[i] && &t8132_ext_live[i]->pdev->dev == dcpext &&
+		    !t8132_ext_live[i]->dying)
 			schedule_work(&t8132_ext_live[i]->hotplug_work);
 	spin_unlock_irqrestore(&t8132_ext_lock, flags);
+}
+
+/* The last commit on @crtc done (hardware and flip), @timeout at most each. */
+static int t8132_ext_wait_commit(struct drm_crtc *crtc, unsigned long timeout)
+{
+	struct drm_crtc_commit *commit;
+	int ret = 0;
+
+	spin_lock(&crtc->commit_lock);
+	commit = list_first_entry_or_null(&crtc->commit_list, struct drm_crtc_commit,
+					  commit_entry);
+	if (commit)
+		drm_crtc_commit_get(commit);
+	spin_unlock(&crtc->commit_lock);
+	if (!commit)
+		return 0;
+	if (!wait_for_completion_timeout(&commit->hw_done, timeout) ||
+	    !wait_for_completion_timeout(&commit->flip_done, timeout))
+		ret = -ETIMEDOUT;
+	drm_crtc_commit_put(commit);
+	return ret;
+}
+
+/*
+ * PM_SUSPEND_PREPARE, before the tasks freeze: under every modeset lock,
+ * with the CRTC's last commit done (3 s at most, else the sleep is refused),
+ * the output enters the sleep (its frames refused, its enables and disables
+ * no-ops), then its display goes down with every worker running
+ * (iomfb_m4_ext_sleep_down()). A commit after this one finds the output
+ * asleep; none can be under way inside it.
+ */
+static int t8132_ext_sleep_prepare(struct t8132_ext_out *out)
+{
+	struct apple_dcp *owner = t8132_ext_owner(out);
+	struct drm_device *drm = out->crtc.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	bool entered = false;
+	int ret;
+
+	if (!owner)
+		return 0;
+	DRM_MODESET_LOCK_ALL_BEGIN(drm, ctx, 0, ret);
+	ret = t8132_ext_wait_commit(&out->crtc, msecs_to_jiffies(3000));
+	if (!ret)
+		entered = iomfb_m4_ext_sleep_mark(owner);
+	DRM_MODESET_LOCK_ALL_END(drm, ctx, ret);
+	if (ret) {
+		dev_warn(&out->pdev->dev, "refusing system sleep: a commit on %s does not finish: %d\n",
+			 out->crtc.name, ret);
+		return ret;
+	}
+	out->sleep_entered = entered;
+	if (entered)
+		iomfb_m4_ext_sleep_down(owner);
+	return 0;
+}
+
+/*
+ * PM_POST_SUSPEND (the tasks thawed, every device resumed, the display
+ * DARTs included; also after an aborted sleep): the
+ * output leaves the sleep and its current DRM state is replayed, the
+ * compositor's latest (a mode set or a disable meanwhile included), by a
+ * commit of our own under every lock it needs: a modeset of the CRTC if it
+ * is on (power-on and mode from scratch, whose nested D572(1) confirms the
+ * display DART), with its plane, so that the framebuffer on it goes out
+ * again. A replay that fails, that fails before the CRTC's state is known
+ * (then read under its lock), or that is not confirmed afterwards (the
+ * display DART and a frame shown, iomfb_m4_ext_restore_result()) sets the
+ * connector's link status BAD and sends a hotplug event: the compositor has
+ * to set the mode again.
+ */
+static void t8132_ext_sleep_restore(struct t8132_ext_out *out)
+{
+	struct apple_dcp *owner = t8132_ext_owner(out);
+	struct drm_device *drm = out->crtc.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_commit *state;
+	struct drm_crtc_state *cs;
+	bool active = false, known = false;
+	int ret, restore = 0;
+
+	out->sleep_entered = false;
+	if (!owner)
+		return;
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_atomic_commit_alloc(drm);
+	if (!state) {
+		ret = -ENOMEM;
+		goto fini;
+	}
+	state->acquire_ctx = &ctx;
+retry:
+	cs = drm_atomic_get_crtc_state(state, &out->crtc);
+	ret = PTR_ERR_OR_ZERO(cs);
+	if (!ret) {
+		active = cs->active;
+		known = true;
+		/* Out of the sleep under the CRTC's lock: the commit does the work. */
+		iomfb_m4_ext_sleep_wake(owner);
+		if (active) {
+			cs->mode_changed = true;
+			ret = drm_atomic_add_affected_connectors(state, &out->crtc) ?:
+			      drm_atomic_add_affected_planes(state, &out->crtc);
+			if (!ret)
+				ret = drm_atomic_commit(state);
+		}
+	}
+	if (ret == -EDEADLK) {
+		drm_atomic_commit_clear(state);
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+	drm_atomic_commit_put(state);
+fini:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	/* Out of the sleep in any case. */
+	iomfb_m4_ext_sleep_wake(owner);
+	/* Failed before the CRTC's state was known: whether it is on, now. */
+	if (!known) {
+		drm_modeset_lock(&out->crtc.mutex, NULL);
+		active = out->crtc.state && out->crtc.state->active;
+		drm_modeset_unlock(&out->crtc.mutex);
+	}
+	dev_info(&out->pdev->dev, "resume: %s %s: %d\n", out->crtc.name,
+		 !known ? (active ? "on, not replayed" : "off, not replayed") :
+		 active ? "replayed (modeset with its framebuffer)" : "off, nothing to replay",
+		 ret);
+	/* The commit's flips are done or given up: the rest of it bounded (1 s). */
+	if (active && !ret)
+		restore = iomfb_m4_ext_restore_result(owner, 1000);
+	else
+		iomfb_m4_ext_restore_end(owner);
+	if (active && (ret || restore || iomfb_m4_ext_stale(owner))) {
+		drm_connector_set_link_status_property(&out->connector, DRM_MODE_LINK_STATUS_BAD);
+		dev_warn(&out->pdev->dev, "resume: %s not restored (replay %d, restore %d): link status BAD, hotplug sent\n",
+			 out->crtc.name, ret, restore);
+		if (!READ_ONCE(out->dying))
+			schedule_work(&out->hotplug_work);
+	}
+}
+
+/*
+ * The layer's one PM notifier, for every output. A refused sleep gets
+ * no PM_POST_SUSPEND here (the chain rolls back only the notifiers before
+ * this one): the outputs already prepared come back at once.
+ */
+static int t8132_ext_pm_notify(struct notifier_block *nb, unsigned long event, void *unused)
+{
+	unsigned int i;
+	int ret = 0;
+
+	mutex_lock(&t8132_ext_reg_lock);
+	if (event == PM_SUSPEND_PREPARE) {
+		for (i = 0; i < t8132_ext_nouts && !ret; i++)
+			ret = t8132_ext_sleep_prepare(t8132_ext_outs[i]);
+		for (i = 0; ret && i < t8132_ext_nouts; i++)
+			if (t8132_ext_outs[i]->sleep_entered)
+				t8132_ext_sleep_restore(t8132_ext_outs[i]);
+		mutex_unlock(&t8132_ext_reg_lock);
+		return notifier_from_errno(ret);
+	}
+	/* An output that entered the sleep comes back. */
+	if (event == PM_POST_SUSPEND)
+		for (i = 0; i < t8132_ext_nouts; i++)
+			if (t8132_ext_outs[i]->sleep_entered)
+				t8132_ext_sleep_restore(t8132_ext_outs[i]);
+	mutex_unlock(&t8132_ext_reg_lock);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block t8132_ext_pm_nb = {
+	.notifier_call = t8132_ext_pm_notify,
+};
+
+/*
+ * First in the DRM device's unbind (and its probe's failure paths),
+ * before drm_dev_unregister() and any DRM object is torn down: the PM
+ * notifier unregistered (a call of it under way finishes first), then every
+ * output dying, its work cancelled, and one left in a sleep (no
+ * PM_POST_SUSPEND will come) out of it. Only for the DRM device whose
+ * outputs these are; called again, nothing.
+ */
+void t8132_ext_drm_fini(struct drm_device *drm)
+{
+	struct t8132_ext_out *outs[T8132_EXT_MAX];
+	unsigned int n = 0;
+	unsigned long flags;
+	bool mine, reg;
+
+	mutex_lock(&t8132_ext_reg_lock);
+	mine = drm && t8132_ext_pm_drm == drm;
+	reg = mine && t8132_ext_pm_registered;
+	mutex_unlock(&t8132_ext_reg_lock);
+	if (!mine)
+		return;
+	/* Not under the registry lock: a call under way holds it. */
+	if (reg)
+		unregister_pm_notifier(&t8132_ext_pm_nb);
+	mutex_lock(&t8132_ext_reg_lock);
+	t8132_ext_pm_registered = false;
+	for (n = 0; n < t8132_ext_nouts; n++) {
+		outs[n] = t8132_ext_outs[n];
+		t8132_ext_outs[n] = NULL;
+	}
+	t8132_ext_nouts = 0;
+	t8132_ext_pm_drm = NULL;
+	mutex_unlock(&t8132_ext_reg_lock);
+	for (unsigned int i = 0; i < n; i++) {
+		struct t8132_ext_out *out = outs[i];
+		struct apple_dcp *owner;
+
+		spin_lock_irqsave(&t8132_ext_lock, flags);
+		WRITE_ONCE(out->dying, true);
+		spin_unlock_irqrestore(&t8132_ext_lock, flags);
+		cancel_work_sync(&out->hotplug_work);
+		cancel_delayed_work_sync(&out->flip_work);
+		owner = t8132_ext_owner(out);
+		if (out->sleep_entered && owner) {
+			iomfb_m4_ext_sleep_wake(owner);
+			iomfb_m4_ext_restore_end(owner);
+		}
+		out->sleep_entered = false;
+	}
 }
 
 /*
  * One output, all of it or nothing: a failure unwinds what was initialised,
  * so that the DRM device goes on without that output.
  */
-static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pdev)
+static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pdev, bool mine)
 {
 	struct t8132_ext_out *out = kzalloc(sizeof(*out), GFP_KERNEL);
 	int ret;
@@ -736,6 +998,13 @@ static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pd
 		return -ENOMEM;
 	/* Dropped with @out, by the CRTC's destroy. */
 	out->pdev = to_platform_device(get_device(&pdev->dev));
+	/*
+	 * The DRM device as a consumer of this DCP, for system sleep: the DRM
+	 * device suspends before the DCP, and resumes after it.
+	 */
+	out->pm_link = device_link_add(drm->dev, &pdev->dev, DL_FLAG_STATELESS);
+	if (!out->pm_link)
+		dev_warn(&pdev->dev, "no PM link to the DRM device\n");
 	INIT_WORK(&out->hotplug_work, t8132_ext_hotplug_work);
 	INIT_DELAYED_WORK(&out->flip_work, t8132_ext_flip_work);
 	/* The CRTC this plane may use is the next one initialised. */
@@ -773,6 +1042,11 @@ static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pd
 	ret = drm_connector_attach_encoder(&out->connector, &out->encoder);
 	if (ret)
 		goto err_connector;
+	/* Its system sleep, through the layer's PM notifier (its DRM device's). */
+	mutex_lock(&t8132_ext_reg_lock);
+	if (mine && t8132_ext_pm_drm == drm && t8132_ext_nouts < T8132_EXT_MAX)
+		t8132_ext_outs[t8132_ext_nouts++] = out;
+	mutex_unlock(&t8132_ext_reg_lock);
 	dev_dbg(&pdev->dev, "DRM output: CRTC %u, connector %s\n",
 		drm_crtc_index(&out->crtc), out->connector.name);
 	return 0;
@@ -787,6 +1061,8 @@ err_crtc:
 err_plane:
 	drm_plane_cleanup(&out->plane);
 err_free:
+	if (out->pm_link)
+		device_link_del(out->pm_link);
 	put_device(&pdev->dev);
 	kfree(out);
 	return ret;
@@ -801,10 +1077,19 @@ int t8132_ext_drm_init(struct drm_device *drm)
 	struct device_node *np;
 	unsigned int count = 0;
 	int err;
+	bool mine, reg;
 	int ret = 0;
 
 	if (!of_machine_is_compatible("apple,j713"))
 		return 0;
+	/* Sleep handling for the outputs of one DRM device only. */
+	mutex_lock(&t8132_ext_reg_lock);
+	mine = !t8132_ext_pm_drm || t8132_ext_pm_drm == drm;
+	if (mine)
+		t8132_ext_pm_drm = drm;
+	mutex_unlock(&t8132_ext_reg_lock);
+	if (!mine)
+		drm_warn(drm, "T8132 external outputs: sleep handled for another DRM device: none for these\n");
 	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
 		struct platform_device *pdev;
 		u32 ready;
@@ -817,7 +1102,7 @@ int t8132_ext_drm_init(struct drm_device *drm)
 		pdev = of_find_device_by_node(np);
 		if (!pdev)
 			continue;
-		err = t8132_ext_out_init(drm, pdev);
+		err = t8132_ext_out_init(drm, pdev, mine);
 		/* The panel and the other output go on without this one. */
 		if (err)
 			dev_err(&pdev->dev, "no DRM output: %d\n", err);
@@ -825,6 +1110,18 @@ int t8132_ext_drm_init(struct drm_device *drm)
 			count++;
 		put_device(&pdev->dev);
 		ret = ret ?: err;
+	}
+	/*
+	 * After the outputs, not under the registry lock (see there);
+	 * unregistered first by t8132_ext_drm_fini().
+	 */
+	mutex_lock(&t8132_ext_reg_lock);
+	reg = mine && t8132_ext_nouts && !t8132_ext_pm_registered;
+	mutex_unlock(&t8132_ext_reg_lock);
+	if (reg && !register_pm_notifier(&t8132_ext_pm_nb)) {
+		mutex_lock(&t8132_ext_reg_lock);
+		t8132_ext_pm_registered = true;
+		mutex_unlock(&t8132_ext_reg_lock);
 	}
 	if (count || ret)
 		drm_info(drm, "%u T8132 external output(s): %d\n", count, ret);
