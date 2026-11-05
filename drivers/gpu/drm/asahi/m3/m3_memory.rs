@@ -68,7 +68,7 @@ impl Buffer {
         // diagnostic; all mappings retire before normal DMA allocation Drop.
         let object=kernel::dma::Coherent::zeroed_slice_with_attrs(unsafe {dev.as_ref().as_ref().as_bound()},allocated,GFP_KERNEL,
             kernel::dma::attrs::DMA_ATTR_NO_WARN).inspect_err(|_| dev_err!(dev.as_ref(),"M3: cannot allocate {} KiB of GPU memory\n",allocated/1024))?;
-        let pa:usize=object.dma_handle().try_into()?;
+        let pa:usize=object.dma_address().try_into()?;
         let mapping=if let Some(a)=address {fw.map_io_m3(a&!0x3fff,pa,allocated,protection)?}
             else {fw.map_io_in_range(0xffff_fc2d_0000_0000..0xffff_fc2e_0000_0000,pa,allocated,protection)?};
         let gpu_mapping=if let Some((vm,a))=gpu {Some(vm.map_io_m3(a&!0x3fff,pa,allocated,gpu_protection)?)} else {None};
@@ -100,7 +100,7 @@ impl Buffer {
     pub(crate) fn map_gpu_view(&mut self,vm:&mmu::Vm)->Result<mmu::KernelMapping> {
         let address=self.gpu_va()?&!0x3fff;
         match &mut self.object {
-            Backing::Coherent(object)=>vm.map_io_m3(address,object.dma_handle().try_into()?,object.size(),self.gpu_protection),
+            Backing::Coherent(object)=>vm.map_io_m3(address,object.dma_address().try_into()?,object.size(),self.gpu_protection),
             Backing::Paged(object)=>object.map_at(vm,address,self.gpu_protection,true),
         }
     }
