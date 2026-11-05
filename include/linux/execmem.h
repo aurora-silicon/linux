@@ -241,6 +241,12 @@ bool execmem_confine_enforced(void);
 void execmem_confine_window(phys_addr_t *base, phys_addr_t *size);
 
 /*
+ * True if @pfn is in the window. Userspace can't execute from the window, so
+ * such a page must never reach the page allocator.
+ */
+bool execmem_confine_pfn_in_window(unsigned long pfn);
+
+/*
  * Internal backing allocator/free used by mm/execmem.c for EXECMEM_CONFINE
  * ranges. Not for general use.
  */
@@ -250,10 +256,11 @@ bool execmem_confine_free(void *ptr);
 
 /*
  * Verify that no EL1-executable mapping resolves to a physical page outside
- * the window. Returns the number of violations; fills in the number of
- * executable leaf mappings inspected when @nr_exec is non-NULL. Implemented
- * generically for the confined allocations; the page-table sweep is provided
- * per-architecture by execmem_confine_arch_verify().
+ * the window and that no window page reached the page allocator. Returns the
+ * number of violations; fills in the number of executable leaf mappings
+ * inspected when @nr_exec is non-NULL. Implemented generically for the confined
+ * allocations; the page-table sweep is provided per-architecture by
+ * execmem_confine_arch_verify().
  */
 unsigned long execmem_confine_verify(unsigned long *nr_exec);
 
@@ -267,6 +274,7 @@ unsigned long execmem_confine_arch_verify(phys_addr_t base, phys_addr_t size,
 					  unsigned long *nr_exec);
 #else
 static inline bool execmem_confine_active(void) { return false; }
+static inline bool execmem_confine_pfn_in_window(unsigned long pfn) { return false; }
 #endif /* CONFIG_EXECMEM_CONFINE */
 
 #endif /* _LINUX_EXECMEM_ALLOC_H */

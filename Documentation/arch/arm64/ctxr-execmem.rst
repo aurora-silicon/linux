@@ -55,6 +55,20 @@ How it works
   CTXR fault would prevent executing from outside the window; there is no buddy
   fallback.
 
+Userspace
+=========
+
+On a core that enforces the window, EL0 can't execute from it either. The fetch
+takes a permission fault that the page tables don't explain, so the kernel
+retries it forever. Anything EL0 can execute therefore lives outside the window:
+
+* The vDSO's code is part of the image, so userspace gets a copy in ordinary
+  memory.
+* No window page reaches the page allocator. ``free_reserved_area()`` skips them,
+  so freed ``__init`` memory stays reserved, as does an initrd in the window. RAM
+  in the window that the pool doesn't use is not available to the rest of the
+  system, so a window should be no larger than the executable code needs.
+
 Verifying confinement
 =====================
 
@@ -63,9 +77,11 @@ fault when testing in a VM:
 
 * At ``late_initcall`` the kernel sweeps its page tables and reports the number
   of EL1-executable leaf mappings and how many resolve outside the window. When
-  the window is enforcing, a non-zero count is fatal.
+  the window is enforcing, a non-zero count is fatal. It also counts window
+  pages that reached the page allocator as violations.
 * ``/sys/kernel/debug/execmem_confine`` re-runs the sweep on read and reports
-  window bounds, pool usage and ``PASS``/``FAIL``.
+  window bounds, pool usage and ``PASS``/``FAIL``. Init memory is freed after
+  ``late_initcall``, and an initrd can be, so this is the check that covers them.
 * Booting with ``ctxr_exec_selftest`` runs two extra checks: that a confined
   allocation is physically inside the window, and that the sweep actually
   detects an executable mapping placed *outside* it (proving the verifier is

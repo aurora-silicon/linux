@@ -103,6 +103,25 @@ static bool phys_in_window(phys_addr_t pa)
 	return pa >= confine_base && pa < confine_base + confine_size;
 }
 
+bool execmem_confine_pfn_in_window(unsigned long pfn)
+{
+	return confine_ready && phys_in_window(PFN_PHYS(pfn));
+}
+
+/* Window pages stay reserved for good, so one that isn't went to the allocator. */
+static unsigned long confine_count_freed_pages(void)
+{
+	unsigned long pfn, nr = 0;
+
+	for_each_valid_pfn(pfn, PFN_DOWN(confine_base),
+			   PFN_DOWN(confine_base + confine_size)) {
+		if (!PageReserved(pfn_to_page(pfn)))
+			nr++;
+	}
+
+	return nr;
+}
+
 void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 			    pgprot_t pgprot, unsigned long vm_flags)
 {
@@ -262,7 +281,7 @@ unsigned long __weak execmem_confine_arch_verify(phys_addr_t base,
 
 unsigned long execmem_confine_verify(unsigned long *nr_exec_out)
 {
-	unsigned long nr_exec = 0, violations = 0;
+	unsigned long nr_exec = 0, violations = 0, freed;
 	struct confine_chunk *ck;
 	unsigned long idx;
 
@@ -270,6 +289,12 @@ unsigned long execmem_confine_verify(unsigned long *nr_exec_out)
 		if (nr_exec_out)
 			*nr_exec_out = 0;
 		return 0;
+	}
+
+	freed = confine_count_freed_pages();
+	if (freed) {
+		pr_err("%lu window page(s) reached the page allocator\n", freed);
+		violations += freed;
 	}
 
 	/*
