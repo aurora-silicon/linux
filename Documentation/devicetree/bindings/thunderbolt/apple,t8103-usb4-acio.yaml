@@ -38,6 +38,7 @@ properties:
               - apple,t6031-usb4-acio
               - apple,t8112-usb4-acio
               - apple,t8122-usb4-acio
+              - apple,t8132-usb4-acio
           - const: apple,t8103-usb4-acio
 
   reg:
@@ -49,6 +50,7 @@ properties:
           PCIe adapter configuration space of the USB4 router. Present where
           the root complex exposes the adapter separately, so that the tunnel
           can be configured before a PCIe-C link is brought up.
+      - description: MxWrap co-processor control registers, on T8132
 
   reg-names:
     minItems: 2
@@ -56,6 +58,7 @@ properties:
       - const: rc
       - const: sram
       - const: pcie-adapter
+      - const: cpu
 
   mboxes:
     maxItems: 1
@@ -79,6 +82,11 @@ properties:
     description:
       Marks this root complex as the USB4/Thunderbolt switch that the Type-C
       PD controller hands cable information to, so the Type-C mux can find it.
+
+  lstx-gpios:
+    maxItems: 1
+    description:
+      GPIO on the pin that carries the router's LSTX sideband signal.
 
   apple,pcie-tunnel:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -179,6 +187,23 @@ required:
 
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-usb4-acio
+    then:
+      properties:
+        reg:
+          minItems: 4
+        reg-names:
+          minItems: 4
+        pinctrl-names:
+          items:
+            - const: lstx
+    else:
+      properties:
+        lstx-gpios: false
 
 additionalProperties: false
 

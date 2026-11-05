@@ -855,6 +855,9 @@ impl Firmware {
         if !self.engine.chan_wait {
             self.recovery.publication_wait_deadline = None;
         }
+        // Polling retires before it publishes, so this sees work start and
+        // drain; a fail-stop reports from fail_flights().
+        self.power.report_work(!self.engine.flights.is_empty());
         result
     }
 
@@ -1358,5 +1361,7 @@ impl Firmware {
             s.starved_ns += s.pub_ns.wrapping_sub(s.starve_from_ns);
         }
         s.starve_from_ns = 0;
+        let now = s.pub_ns;
+        self.power.utilization.busy(now);
     }
 }
