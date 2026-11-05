@@ -111,10 +111,17 @@ struct tb_tunnel {
 	int max_bw;
 	/*
 	 * Under TB_HOST_DP_SHARED_RATE (Mb/s per lane): the highest link rate
-	 * the connection manager allows, and the one the DPTX was offered.
+	 * the connection manager allows, the one the DPTX was offered, and the
+	 * one both adapters take without the policy. @host_relink: to be set
+	 * up again at a higher rate once the debounce is over (alone now);
+	 * @host_relinked_up: set up so, and set up at HBR2 again if it does
+	 * not come up.
 	 */
 	u32 host_rate_limit;
 	u32 host_rate;
+	u32 host_max_rate;
+	bool host_relink;
+	bool host_relinked_up;
 	bool dprx_started;
 	bool dprx_canceled;
 	u64 host_dp_generation;
@@ -178,6 +185,14 @@ enum tb_dp_relink {
 #define TB_DP_RELINK_POLL_MS	500
 #define TB_DP_RELINK_RETRIES	5
 
+/*
+ * A re-link to a higher rate waits TB_DP_RELINK_DELAY_MS (the debounce),
+ * doubled up to TB_DP_RELINK_DELAY_MAX_MS while a second DP tunnel takes
+ * the rate back down within TB_DP_RELINK_CALM_MS of such a re-link.
+ */
+#define TB_DP_RELINK_DELAY_MAX_MS	40000
+#define TB_DP_RELINK_CALM_MS		60000
+
 /**
  * struct tb_dp_pm_state - System sleep transitions, for host DP re-links
  * @sleeping: From the start of a transition (its PREPARE event, before any
@@ -195,6 +210,14 @@ enum tb_dp_relink tb_dp_relink_down(u32 rate, unsigned int tunnels, bool sleepin
 bool tb_dp_pm_event(struct tb_dp_pm_state *s, unsigned long event);
 void tb_dp_pm_reopen(struct tb_dp_pm_state *s);
 unsigned int tb_dp_relink_retry_delay(unsigned int tries);
+u32 tb_dp_host_rate_after(unsigned int tunnels, bool recovering);
+bool tb_dp_relink_up_wanted(unsigned int tunnels, u32 rate, u32 max_rate, bool sleeping);
+enum tb_dp_relink tb_dp_relink_up(bool marked, unsigned int tunnels, u32 rate, u32 max_rate,
+				  bool pairable, bool sleeping, unsigned long now,
+				  unsigned long due);
+unsigned int tb_dp_relink_backoff(unsigned int delay_ms, bool flapping);
+enum tb_dp_relink tb_dp_relink_activation(bool relinked_up, bool active);
+bool tb_dp_host_drop_relink_up(struct tb_tunnel *tunnel);
 
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,

@@ -1030,6 +1030,7 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 	tunnel->max_rate = tb_dp_host_rate_cap(tunnel, in);
 	tunnel->max_bw = 0;
 	tunnel->host_rate = 0;
+	tunnel->host_max_rate = 0;
 
 	/*
 	 * Copy DP_LOCAL_CAP register to DP_REMOTE_CAP register for
@@ -1056,6 +1057,11 @@ static int tb_dp_xchg_caps(struct tb_tunnel *tunnel)
 			   out->cap_adap + DP_LOCAL_CAP, 1);
 	if (ret)
 		return ret;
+
+	/* What the tunnel could get alone on the host router: HBR3 at most. */
+	if (tunnel->max_rate)
+		tunnel->host_max_rate = min(tb_dp_cap_get_rate(in_dp_cap),
+					    tb_dp_cap_get_rate(out_dp_cap));
 
 	/*
 	 * Both sides see the capped rate: the DP OUT through its remote caps,

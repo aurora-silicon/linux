@@ -3726,6 +3726,67 @@ static void tb_test_dp_shared_rate_second(struct kunit *test)
 }
 
 /*
+ * TB_HOST_DP_SHARED_RATE: when the other DP tunnel goes, the one left at
+ * HBR2 is re-linked at HBR3 once the debounce is over, unless another one
+ * comes by then; once per unplug, and the debounce backs off while it flaps.
+ */
+static void tb_test_dp_shared_rate_relink_up(struct kunit *test)
+{
+	const unsigned long due = 1000;
+
+	/* Alone at HBR2, HBR3 possible: marked */
+	KUNIT_EXPECT_TRUE(test, tb_dp_relink_up_wanted(1, 5400, 8100, false));
+	/* Still two, none left, already at its best, or an HBR2-only sink side: not */
+	KUNIT_EXPECT_FALSE(test, tb_dp_relink_up_wanted(2, 5400, 8100, false));
+	KUNIT_EXPECT_FALSE(test, tb_dp_relink_up_wanted(0, 0, 0, false));
+	KUNIT_EXPECT_FALSE(test, tb_dp_relink_up_wanted(1, 8100, 8100, false));
+	KUNIT_EXPECT_FALSE(test, tb_dp_relink_up_wanted(1, 5400, 5400, false));
+
+	/* Within the debounce: wait; after it: re-link */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(true, 1, 5400, 8100, false, false, due - 1, due),
+			TB_DP_RELINK_WAIT);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(true, 1, 5400, 8100, false, false, due, due),
+			TB_DP_RELINK_NOW);
+	/* Not marked (the re-linked tunnel itself): once only */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(false, 1, 5400, 8100, false, false, due, due),
+			TB_DP_RELINK_NONE);
+	/* Another one came, or could be paired: dropped */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(true, 2, 5400, 8100, false, false, due, due),
+			TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(true, 1, 5400, 8100, true, false, due, due),
+			TB_DP_RELINK_NONE);
+	/* At HBR3 by now: nothing to do */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(true, 1, 8100, 8100, false, false, due, due),
+			TB_DP_RELINK_NONE);
+
+	/* Back-off: doubled while it flaps, at most 40 s; reset when calm */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_backoff(2500, false), 2500);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_backoff(2500, true), 5000);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_backoff(20000, true), 40000);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_backoff(40000, true), 40000);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_backoff(40000, false), 2500);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE: a tunnel re-linked at HBR3 that does not come up
+ * is set up again at HBR2, once and without a new re-link up; any other
+ * tunnel that does not come up is torn down as before.
+ */
+static void tb_test_dp_shared_rate_recover(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_activation(true, false), TB_DP_RELINK_NOW);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_activation(true, true), TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_activation(false, false), TB_DP_RELINK_NONE);
+	/* The recovery: HBR2 at most even alone; afterwards HBR3 alone again */
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_after(1, true), 5400);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_after(1, false), 8100);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_after(2, false), 5400);
+	/* The tunnel set up so (no re-link mark) is never re-linked up again */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(false, 1, 5400, 8100, false, false, 1000, 1000),
+			TB_DP_RELINK_NONE);
+}
+
+/*
  * TB_HOST_DP_SHARED_RATE: no re-link while system sleep is in progress, from
  * the PREPARE event until the transition is over, also when it is refused.
  */
@@ -3785,6 +3846,12 @@ static void tb_test_dp_shared_rate_sleep(struct kunit *test)
 	tb_dp_pm_event(&s, PM_SUSPEND_PREPARE);
 	KUNIT_EXPECT_FALSE(test, tb_dp_pm_event(&s, 0));
 	KUNIT_EXPECT_TRUE(test, s.sleeping);
+
+	/* Tunnels going during the sleep mark nothing */
+	KUNIT_EXPECT_FALSE(test, tb_dp_relink_up_wanted(1, 5400, 8100, true));
+	/* A re-link to HBR3 due during the sleep waits for its end */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(true, 1, 5400, 8100, false, true, 1001, 1000),
+			TB_DP_RELINK_WAIT);
 }
 
 /*
@@ -3799,6 +3866,199 @@ static void tb_test_dp_shared_rate_retry(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(4), 40000);
 	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(5), 0);
 	KUNIT_EXPECT_EQ(test, tb_dp_relink_retry_delay(100), 0);
+}
+
+/* The dock's link: what is left there for DP tunnels (Mb/s) */
+#define TB_TEST_DOCK_DP_BW	34650
+
+/*
+ * Set @t up as pairing and the capabilities exchange do under
+ * TB_HOST_DP_SHARED_RATE, between adapters that take HBR3 x4: capped at
+ * @rate_limit, next to a tunnel at @shared_rate (0: alone), with @room Mb/s
+ * left on the link. The lanes it takes in @lanes.
+ */
+static void tb_test_host_dp_up(struct kunit *test, struct tb_tunnel *t, u32 rate_limit,
+			       u32 shared_rate, int room, u32 *lanes)
+{
+	u32 rate;
+	int ret;
+
+	memset(t, 0, sizeof(*t));
+	t->host_rate_limit = rate_limit;
+	t->max_rate = rate_limit;
+	t->host_max_rate = TB_DP_HOST_RATE_ALONE;
+	ret = tb_dp_host_reduce_bandwidth(room, rate_limit, 4, rate_limit, 4, shared_rate,
+					  rate_limit, &rate, lanes);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	t->max_rate = min(t->max_rate, rate);
+	t->host_rate = rate;
+}
+
+/*
+ * What @t, up at @lanes, leaves on the dock's link for another DP tunnel,
+ * its DP IN adapter reporting the rate both adapters take (HBR3).
+ */
+static int tb_test_host_dp_room(const struct tb_tunnel *t, u32 lanes)
+{
+	return TB_TEST_DOCK_DP_BW -
+	       tb_dp_host_counted_bandwidth(t->max_rate, TB_DP_HOST_RATE_ALONE, lanes);
+}
+
+/*
+ * A at HBR2 x4 next to B: B is wanted while A is up at HBR3, so A is set up
+ * again at HBR2 first, alone on the link, then B takes its rate.
+ */
+static void tb_test_host_dp_two_up(struct kunit *test, struct tb_tunnel *a, u32 *a_lanes,
+				   struct tb_tunnel *b, u32 *b_lanes)
+{
+	tb_test_host_dp_up(test, a, tb_dp_host_rate_for(1), 0, TB_TEST_DOCK_DP_BW, a_lanes);
+	KUNIT_ASSERT_EQ(test, tb_dp_relink_down(a->host_rate, 2, false), TB_DP_RELINK_NOW);
+	tb_test_host_dp_up(test, a, tb_dp_host_rate_for(2), 0, TB_TEST_DOCK_DP_BW, a_lanes);
+	tb_test_host_dp_up(test, b, tb_dp_host_rate_for(2), a->host_rate,
+			   tb_test_host_dp_room(a, *a_lanes), b_lanes);
+}
+
+/* TB_HOST_DP_SHARED_RATE, one display: HBR3 x4, counted so, nothing to re-link. */
+static void tb_test_dp_shared_rate_lone(struct kunit *test)
+{
+	struct tb_tunnel *a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
+	u32 lanes;
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	tb_test_host_dp_up(test, a, tb_dp_host_rate_for(1), 0, TB_TEST_DOCK_DP_BW, &lanes);
+	KUNIT_EXPECT_EQ(test, a->host_rate, 8100);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	KUNIT_EXPECT_EQ(test, tb_test_host_dp_room(a, lanes), 34650 - 25920);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(a->host_rate, 1, false), TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_FALSE(test, tb_dp_relink_up_wanted(1, a->host_rate, a->host_max_rate, false));
+}
+
+/* TB_HOST_DP_SHARED_RATE, a second display comes: both HBR2 x4. */
+static void tb_test_dp_shared_rate_two(struct kunit *test)
+{
+	struct tb_tunnel *a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
+	struct tb_tunnel *b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
+	u32 a_lanes, b_lanes;
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	tb_test_host_dp_two_up(test, a, &a_lanes, b, &b_lanes);
+	KUNIT_EXPECT_EQ(test, a->host_rate, 5400);
+	KUNIT_EXPECT_EQ(test, a_lanes, 4);
+	KUNIT_EXPECT_EQ(test, b->host_rate, 5400);
+	KUNIT_EXPECT_EQ(test, b_lanes, 4);
+	/* At HBR2 both: neither is set up again */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(a->host_rate, 2, false), TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(b->host_rate, 2, false), TB_DP_RELINK_NONE);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE, the second display goes: the one left is marked,
+ * stays capped and counted at HBR2 through the debounce, and is set up again
+ * at HBR3 x4 once it is over.
+ */
+static void tb_test_dp_shared_rate_leave(struct kunit *test)
+{
+	struct tb_tunnel *a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
+	struct tb_tunnel *b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
+	const unsigned long due = 1000 + TB_DP_RELINK_DELAY_MS;
+	u32 a_lanes, b_lanes;
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	tb_test_host_dp_two_up(test, a, &a_lanes, b, &b_lanes);
+
+	/* B goes at 1000 */
+	KUNIT_ASSERT_TRUE(test, tb_dp_relink_up_wanted(1, a->host_rate, a->host_max_rate, false));
+	a->host_relink = true;
+	/* Waiting: still capped at HBR2 and counted so */
+	KUNIT_EXPECT_EQ(test, a->max_rate, 5400);
+	KUNIT_EXPECT_EQ(test, tb_test_host_dp_room(a, a_lanes), 34650 - 17280);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, due - 1, due), TB_DP_RELINK_WAIT);
+
+	/* Debounce over: set up again, alone, at HBR3 x4 and counted so */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, due, due), TB_DP_RELINK_NOW);
+	tb_test_host_dp_up(test, a, TB_DP_HOST_RATE_ALONE, 0, TB_TEST_DOCK_DP_BW, &a_lanes);
+	KUNIT_EXPECT_EQ(test, a->host_rate, 8100);
+	KUNIT_EXPECT_EQ(test, a_lanes, 4);
+	KUNIT_EXPECT_EQ(test, tb_test_host_dp_room(a, a_lanes), 34650 - 25920);
+	/* Once: the tunnel set up again is not marked */
+	KUNIT_EXPECT_FALSE(test, a->host_relink);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, due + 1, due), TB_DP_RELINK_NONE);
+	KUNIT_EXPECT_FALSE(test, tb_dp_host_drop_relink_up(a));
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE, a second display that comes and goes quickly: no
+ * re-link while it flaps within the debounce, the debounce starts again at
+ * each unplug, and a second display soon after a re-link up doubles it.
+ */
+static void tb_test_dp_shared_rate_flap(struct kunit *test)
+{
+	struct tb_tunnel *a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
+	struct tb_tunnel *b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
+	unsigned int delay = TB_DP_RELINK_DELAY_MS;
+	u32 a_lanes, b_lanes;
+	unsigned long due;
+
+	KUNIT_ASSERT_NOT_NULL(test, a);
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	tb_test_host_dp_two_up(test, a, &a_lanes, b, &b_lanes);
+
+	/* B goes at 1000 */
+	a->host_relink = tb_dp_relink_up_wanted(1, a->host_rate, a->host_max_rate, false);
+	KUNIT_ASSERT_TRUE(test, a->host_relink);
+	due = 1000 + delay;
+	/* ... is back at 1500: A held at HBR2, B HBR2 x4 */
+	KUNIT_EXPECT_TRUE(test, tb_dp_host_drop_relink_up(a));
+	tb_test_host_dp_up(test, b, tb_dp_host_rate_for(2), a->host_rate,
+			   tb_test_host_dp_room(a, a_lanes), &b_lanes);
+	KUNIT_EXPECT_EQ(test, b->host_rate, 5400);
+	KUNIT_EXPECT_EQ(test, b_lanes, 4);
+	/* ... goes again at 2000: a new debounce, the first one's end changes nothing */
+	a->host_relink = tb_dp_relink_up_wanted(1, a->host_rate, a->host_max_rate, false);
+	KUNIT_ASSERT_TRUE(test, a->host_relink);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, due, 2000 + delay), TB_DP_RELINK_WAIT);
+	due = 2000 + delay;
+	/* ... is back at 3000, gone again at 3200 */
+	KUNIT_EXPECT_TRUE(test, tb_dp_host_drop_relink_up(a));
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 2, a->host_rate, a->host_max_rate,
+					      false, false, due, due), TB_DP_RELINK_NONE);
+	a->host_relink = tb_dp_relink_up_wanted(1, a->host_rate, a->host_max_rate, false);
+	due = 3200 + delay;
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, due - 1, due), TB_DP_RELINK_WAIT);
+
+	/* Calm until the debounce is over: A set up again at HBR3 x4 */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, due, due), TB_DP_RELINK_NOW);
+	tb_test_host_dp_up(test, a, TB_DP_HOST_RATE_ALONE, 0, TB_TEST_DOCK_DP_BW, &a_lanes);
+	KUNIT_EXPECT_EQ(test, a->host_rate, 8100);
+
+	/* B is back within a minute: A set up again at HBR2, the next debounce doubled */
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_down(a->host_rate, 2, false), TB_DP_RELINK_NOW);
+	delay = tb_dp_relink_backoff(delay, true);
+	KUNIT_EXPECT_EQ(test, delay, 5000);
+	tb_test_host_dp_up(test, a, tb_dp_host_rate_for(2), 0, TB_TEST_DOCK_DP_BW, &a_lanes);
+	tb_test_host_dp_up(test, b, tb_dp_host_rate_for(2), a->host_rate,
+			   tb_test_host_dp_room(a, a_lanes), &b_lanes);
+	KUNIT_EXPECT_EQ(test, a->host_rate, 5400);
+	KUNIT_EXPECT_EQ(test, a_lanes, 4);
+	KUNIT_EXPECT_EQ(test, b->host_rate, 5400);
+	KUNIT_EXPECT_EQ(test, b_lanes, 4);
+
+	/* B goes once more at 10000: HBR3 again only after the doubled debounce */
+	a->host_relink = tb_dp_relink_up_wanted(1, a->host_rate, a->host_max_rate, false);
+	due = 10000 + delay;
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, 10000 + TB_DP_RELINK_DELAY_MS, due),
+			TB_DP_RELINK_WAIT);
+	KUNIT_EXPECT_EQ(test, tb_dp_relink_up(a->host_relink, 1, a->host_rate, a->host_max_rate,
+					      false, false, due, due), TB_DP_RELINK_NOW);
 }
 
 /*
@@ -3967,11 +4227,108 @@ static void tb_test_dp_shared_rate_counted(struct kunit *test)
 	put_device(&cm->tb->dev);
 }
 
+/*
+ * TB_HOST_DP_SHARED_RATE, through the connection manager: A (host DP IN 5 to
+ * device DP OUT 13) is left alone at HBR2 when B (DP IN 6 to DP OUT 14) goes,
+ * and C is plugged into DP OUT 14 during the debounce. Pairing drops A's
+ * re-link up and holds A at HBR2 before C's bandwidth is worked out, and the
+ * debounce timer is stopped unless deferred pairing (@deferred) needs the
+ * re-link work. A's DP IN adapter reports HBR3 x4, in its caps or (@bw_mode)
+ * as its allocated bandwidth; it is counted at HBR2 x4 and C gets HBR2 x4.
+ */
+static void tb_test_dp_shared_rate_arrival(struct kunit *test, bool bw_mode, bool deferred)
+{
+	struct tb_test_cm *cm = tb_test_cm_alloc(test);
+	struct list_head *resources = tb_test_cm_dp_resources(cm->tb);
+	struct tb_port *in = &cm->host->ports[5];
+	struct tb_tunnel *a;
+	u32 rate, lanes;
+	int counted;
+
+	/*
+	 * The debounce timer is real: should it expire before the end, its
+	 * work runs on this queue and stops at the missing root switch.
+	 */
+	cm->tb->wq = alloc_ordered_workqueue("tb-cm-test", 0);
+	KUNIT_ASSERT_NOT_NULL(test, cm->tb->wq);
+
+	a = tb_test_cm_dp_tunnel(test, cm, in, &cm->dev->ports[13], 5400, 5400);
+	a->host_max_rate = 8100;
+	a->bw_mode = bw_mode;
+	tb_test_cm_reports(cm, in, bw_mode);
+	list_add_tail(&cm->host->ports[5].list, resources);
+	list_add_tail(&cm->host->ports[6].list, resources);
+	list_add_tail(&cm->dev->ports[13].list, resources);
+
+	mutex_lock(&cm->tb->lock);
+	/* B went (two were up): A is marked, the debounce armed */
+	tb_dp_host_tunnel_gone(cm->tb, 2);
+	KUNIT_EXPECT_TRUE(test, a->host_relink);
+	KUNIT_EXPECT_TRUE(test, tb_test_cm_relink_armed(cm->tb));
+	KUNIT_EXPECT_EQ(test, kref_read(&cm->tb->dev.kobj.kref), 2U);
+	tb_test_cm_set_relink_deferred(cm->tb, deferred);
+
+	/* C comes on DP OUT 14: pairing takes HBR2 for it, A's re-link dropped */
+	list_add_tail(&cm->dev->ports[14].list, resources);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_rate_limit(cm->tb), 5400U);
+	KUNIT_EXPECT_FALSE(test, a->host_relink);
+	KUNIT_EXPECT_EQ(test, a->host_rate_limit, 5400U);
+	KUNIT_EXPECT_EQ(test, a->max_rate, 5400U);
+	KUNIT_EXPECT_EQ(test, tb_test_cm_relink_armed(cm->tb), deferred);
+	KUNIT_EXPECT_EQ(test, kref_read(&cm->tb->dev.kobj.kref), deferred ? 2U : 1U);
+
+	/* C's bandwidth: A counted at HBR2 x4, C at A's rate gets x4 */
+	counted = tb_test_cm_counted(test, cm);
+	KUNIT_EXPECT_EQ(test, counted, 17280);
+	KUNIT_EXPECT_EQ(test, tb_dp_host_reduce_bandwidth(TB_TEST_DOCK_DP_BW - counted, 5400, 4,
+							  5400, 4, a->host_rate, 5400,
+							  &rate, &lanes), 0);
+	KUNIT_EXPECT_EQ(test, rate, 5400);
+	KUNIT_EXPECT_EQ(test, lanes, 4);
+	mutex_unlock(&cm->tb->lock);
+
+	/* Outside the domain lock, which the work takes: drain it, then the queue */
+	tb_test_cm_stop(cm->tb);
+	destroy_workqueue(cm->tb->wq);
+	KUNIT_EXPECT_EQ(test, kref_read(&cm->tb->dev.kobj.kref), 1U);
+	INIT_LIST_HEAD(resources);
+	tb_test_cm_dp_tunnel_put(a);
+	put_device(&cm->tb->dev);
+}
+
+/*
+ * TB_HOST_DP_SHARED_RATE, a second display comes during the debounce: it
+ * gets HBR2 x4 and the debounce timer is stopped, whether the tunnel left
+ * alone is counted from its caps or from its allocated bandwidth.
+ */
+static void tb_test_dp_shared_rate_debounce(struct kunit *test)
+{
+	tb_test_dp_shared_rate_arrival(test, false, false);
+	tb_test_dp_shared_rate_arrival(test, true, false);
+}
+
+/*
+ * As tb_test_dp_shared_rate_debounce(), with pairing deferred for a system
+ * sleep transition: the re-link up is dropped, the re-link work kept armed.
+ */
+static void tb_test_dp_shared_rate_debounce_deferred(struct kunit *test)
+{
+	tb_test_dp_shared_rate_arrival(test, false, true);
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_apple_right_dpin_wiring),
 	KUNIT_CASE(tb_test_dp_reduce_bandwidth_shared),
 	KUNIT_CASE(tb_test_dp_shared_rate_single),
 	KUNIT_CASE(tb_test_dp_shared_rate_second),
+	KUNIT_CASE(tb_test_dp_shared_rate_relink_up),
+	KUNIT_CASE(tb_test_dp_shared_rate_recover),
+	KUNIT_CASE(tb_test_dp_shared_rate_lone),
+	KUNIT_CASE(tb_test_dp_shared_rate_two),
+	KUNIT_CASE(tb_test_dp_shared_rate_leave),
+	KUNIT_CASE(tb_test_dp_shared_rate_debounce),
+	KUNIT_CASE(tb_test_dp_shared_rate_debounce_deferred),
+	KUNIT_CASE(tb_test_dp_shared_rate_flap),
 	KUNIT_CASE(tb_test_dp_shared_rate_sleep),
 	KUNIT_CASE(tb_test_dp_shared_rate_retry),
 	KUNIT_CASE(tb_test_dp_shared_rate_counted),
