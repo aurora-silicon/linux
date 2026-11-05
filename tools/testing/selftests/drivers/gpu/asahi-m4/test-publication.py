@@ -103,8 +103,11 @@ mod boundary {
     }
 }
 struct Stage{result:Result,visible:bool}
+// Record the CLPC work boundary without running the power governor or transport.
+#[derive(Default)]struct Power{work:Vec<bool>}
+impl Power{fn report_work(&mut self,in_flight:bool){self.work.push(in_flight);}}
 struct Firmware{
-    session:Checks,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,
+    session:Checks,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
     unavailable:Vec<(usize,Error)>,stages:VecDeque<Stage>,retained:Vec<u32>,attempted:Vec<u32>,fail_stops:u32,
 }
 impl Firmware {
@@ -144,7 +147,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
 fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
     Firmware{session:Checks,objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
         engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
-        slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},
+        slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},power:Power::default(),
         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
         retained:vec![],attempted:vec![],fail_stops:0}
 }
@@ -154,6 +157,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         let mut f=firmware(vec![job(1,false,0,Ok(())),job(2,true,0,Ok(()))],vec![(Err(EIO),false),(Ok(()),true)]);
         let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));
         assert_eq!(done,[(1,Err(EIO))]);assert_eq!(f.attempted,[1,2]);assert_eq!(f.fail_stops,0);assert!(f.retained.is_empty());assert_eq!(f.slots.releases,1);
+        assert_eq!(f.power.work,[true]);
     }
     #[test]fn ordinary_capacity_failure_after_retired_command_does_not_stop_other_jobs(){
         let mut f=firmware(vec![job(1,true,1,Ok(())),job(2,false,0,Ok(()))],vec![(Err(E2BIG),false),(Ok(()),true)]);
@@ -188,6 +192,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         assert!(done.is_empty());assert!(f.attempted.is_empty());assert!(!waiting.terminal_marked.load(Ordering::Relaxed));
         f.engine.flights.clear();assert_eq!(f.publish(&mut done),Ok(()));
         assert_eq!(done,[(1,Err(EIO))]);assert!(waiting.terminal_marked.load(Ordering::Relaxed));
+        assert_eq!(f.power.work,[true,false]);
     }
     #[test]fn pending_exact_predecessor_does_not_block_ready_job(){
         let mut f=firmware(vec![job(1,false,0,Err(EAGAIN)),job(2,true,0,Ok(()))],vec![(Ok(()),true)]);
@@ -210,6 +215,7 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
         let mut f=firmware(vec![job(1,false,0,Ok(()))],vec![(Err(EAGAIN),false),(Err(EAGAIN),false)]);
         let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));
         assert!(f.engine.chan_wait && f.engine.flights.is_empty());
+        assert_eq!(f.power.work,[false]);
         let deadline=f.recovery.publication_wait_deadline.unwrap();
         CLOCK.with(|clock|clock.set(deadline+1));
         assert_eq!(f.publish(&mut done),Err(ETIMEDOUT));
