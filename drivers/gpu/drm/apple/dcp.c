@@ -3067,6 +3067,12 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 		dcpext_scanout_invalidate(dcp);
 	}
 	if (dptx_service_available(&dcp->dptxport[port]) && dcp->dptxport[port].connected) {
+		/*
+		 * A T8132 dcpext's DRM swaps stop with the route, before
+		 * the release, which can take the firmware a while to answer.
+		 */
+		if (dcp_is_t8132_ext(dcp))
+			iomfb_m4_external_link_gone(dcp);
 		ret = dptxport_release_display(dcp->dptxport[port].service);
 		/*
 		 * A T8132 dcpext's display is released even if the
@@ -3086,6 +3092,8 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 					 port, ret == -ETIMEDOUT ?
 					 "the firmware answers late" : "release failed", ret);
 			ret = 0;
+			/* Its next sink starts from scratch. */
+			iomfb_m4_external_link_gone(dcp);
 		}
 		if (ret)
 			return ret;
@@ -5713,9 +5721,9 @@ static int dcp_desktop_probe_routes(struct apple_dcp *dcp)
 
 /*
  * An adopted T8132 dcpext offers its Type-C routes. It is no component of
- * the DRM device: the routes follow the port modes, refuse DP alt mode and
- * get no connector (see dcp_typec_route_set() and
- * dcp_typec_port_unusable()). Its route suppliers were there before the
+ * the DRM device (its outputs are added by t8132_ext_drm.c): the routes
+ * follow the port modes, refuse DP alt mode and get no apple_connector (see
+ * dcp_typec_route_set() and dcp_typec_port_unusable()). Its route suppliers were there before the
  * adoption, see dcp_platform_probe_t8132_ext(). A failure leaves the routes
  * disabled, so the port controllers do not wait for them; the adopted
  * session stays.

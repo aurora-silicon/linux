@@ -30,6 +30,7 @@
 #include "dcp-internal.h"
 #include "iomfb_m4.h"
 #include "parser.h"
+#include "t8132_ext_drm.h"
 
 static bool tiled_split = true;
 module_param(tiled_split, bool, 0644);
@@ -192,7 +193,7 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
 /*
  * A route of an adopted T8132 dcpext. Its PHY has no DP alt mode, so the
  * crossbar's DP PHY output has nothing behind it, and the dcpext is no
- * pipeline of the DRM device (no CRTC, no connector).
+ * apple_crtc pipeline: its DRM objects are its own (t8132_ext_drm.c).
  */
 static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
 {
@@ -1311,9 +1312,11 @@ static void dcp_typec_plan(struct drm_device *drm,
 	}
 	*port_tail = NULL;
 	drm_for_each_crtc(crtc, drm) {
-		struct apple_dcp *dcp =
-			platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+		struct apple_dcp *dcp;
 
+		if (t8132_ext_crtc(crtc))
+			continue;
+		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
 		if (!dcp->nr_typec_routes)
 			continue;
 		*pipeline_tail = &dcp->fabric;
@@ -2319,6 +2322,7 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			u32 link_rate)
 {
 	struct apple_dcp_typec_route *route;
+	bool refused;
 	int ret;
 
 	guard(mutex)(&dcp->tb_lock);
@@ -2352,11 +2356,15 @@ int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 		/*
 		 * The firmware is told the rate is set, as on every path but
 		 * T6030 14.7: the crossbar link then stays down, and the output
-		 * reads as unusable until a nonzero rate is taken again.
+		 * reads as unusable until a nonzero rate is taken again. Its
+		 * connector hears of real changes only.
 		 */
-		WRITE_ONCE(dcp->tb_clock_refused,
-			   dcp_fabric_clock_refused(READ_ONCE(dcp->tb_clock_refused),
-						    link_rate, ret));
+		refused = dcp_fabric_clock_refused(READ_ONCE(dcp->tb_clock_refused),
+						   link_rate, ret);
+		if (refused != READ_ONCE(dcp->tb_clock_refused)) {
+			WRITE_ONCE(dcp->tb_clock_refused, refused);
+			t8132_ext_drm_hotplug(dcp->dev);
+		}
 		return ret;
 	}
 	if (of_machine_is_compatible("apple,t6030") &&
@@ -3654,6 +3662,8 @@ int dcp_typec_follow_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	for_each_new_connector_in_state(state, conn, conn_state, i) {
 		struct apple_connector *connector = to_apple_connector(conn);
 
+		if (t8132_ext_connector(conn))
+			continue;
 		if (conn_state->crtc != crtc || !connector->port_encoder ||
 		    READ_ONCE(connector->dcp) == to_platform_device(dcp->dev))
 			continue;
@@ -3716,9 +3726,13 @@ static bool dcp_typec_direct_commit(struct drm_crtc *crtc,
 
 	for_each_new_connector_in_state(state, conn, conn_state, i) {
 		struct apple_connector *connector = to_apple_connector(conn);
-		struct platform_device *pdev = READ_ONCE(connector->dcp);
 		struct apple_dcp_typec_route *route;
+		struct platform_device *pdev;
 		struct apple_dcp *source;
+
+		if (t8132_ext_connector(conn))
+			continue;
+		pdev = READ_ONCE(connector->dcp);
 
 		if (conn_state->crtc != crtc || !connector->port_encoder || !pdev)
 			continue;
@@ -3745,8 +3759,12 @@ static void dcp_follow_fail_commit(struct drm_crtc *crtc, struct drm_atomic_comm
 	to_apple_atomic_state(state)->failed_routes |= drm_crtc_mask(crtc);
 	for_each_new_connector_in_state(state, conn, conn_state, i) {
 		struct apple_connector *connector = to_apple_connector(conn);
-		struct platform_device *pdev = READ_ONCE(connector->dcp);
+		struct platform_device *pdev;
 		struct apple_dcp *source;
+
+		if (t8132_ext_connector(conn))
+			continue;
+		pdev = READ_ONCE(connector->dcp);
 
 		if (conn_state->crtc != crtc || !connector->port_encoder || !pdev)
 			continue;
@@ -3779,6 +3797,8 @@ int dcp_typec_follow_crtc(struct drm_crtc *crtc, struct drm_atomic_commit *state
 	for_each_new_connector_in_state(state, conn, conn_state, i) {
 		struct apple_connector *connector = to_apple_connector(conn);
 
+		if (t8132_ext_connector(conn))
+			continue;
 		if (conn_state->crtc != crtc || !connector->port_encoder ||
 		    READ_ONCE(connector->dcp) == pdev)
 			continue;
@@ -3900,9 +3920,9 @@ bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev
 
 /*
  * Is every pipeline that can drive port @idx unusable (a failed T8122
- * dcpext, or a T8132 dcpext, which is no pipeline of the DRM device)? Such a
- * port gets no connector, rather than failing the DRM device of the internal
- * panel.
+ * dcpext, or a T8132 dcpext, whose DRM outputs are its own, see
+ * t8132_ext_drm.c)? Such a port gets no connector, rather than failing the
+ * DRM device of the internal panel.
  */
 bool dcp_typec_port_unusable(unsigned int idx)
 {
@@ -4868,7 +4888,7 @@ void dcp_unlink(struct drm_device *drm)
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 		struct apple_dcp *dcp;
 
-		if (!apple_crtc->dcp)
+		if (t8132_ext_crtc(crtc) || !apple_crtc->dcp)
 			continue;
 		dcp = platform_get_drvdata(apple_crtc->dcp);
 		if (dcp->crtc != apple_crtc)

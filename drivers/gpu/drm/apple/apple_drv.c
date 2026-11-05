@@ -49,6 +49,7 @@
 #include "dcp.h"
 #include "plane.h"
 #include "iomfb_m4.h"
+#include "t8132_ext_drm.h"
 
 #define DRIVER_NAME     "apple"
 #define DRIVER_DESC     "Apple display controller DRM driver"
@@ -165,6 +166,8 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 	drm_for_each_crtc(crtc, helper->dev) {
 		struct apple_dcp *dcp;
 
+		if (t8132_ext_crtc(crtc))
+			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
 		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
@@ -562,9 +565,13 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
 
 	/* Retain displaced scanout even when the CRTC stays inactive. */
 	for_each_oldnew_plane_in_state(state, plane, old, new, i) {
-		struct apple_plane_state *apple_state = to_apple_plane_state(new);
-		struct dcp_fb_reference *entry = apple_state->retirement;
+		struct apple_plane_state *apple_state;
+		struct dcp_fb_reference *entry;
 
+		if (t8132_ext_plane(plane))
+			continue;
+		apple_state = to_apple_plane_state(new);
+		entry = apple_state->retirement;
 		if (!entry)
 			continue;
 
@@ -1187,6 +1194,9 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 	drm_for_each_connector_iter(connector, &iter) {
 		struct apple_connector *apple_connector = to_apple_connector(connector);
 
+		/* A T8132 external output quiesces on its own. */
+		if (t8132_ext_connector(connector))
+			continue;
 		/* DCP callbacks can still enqueue these until component unbind
 		 * has drained RTKit. Stop their users before releasing endpoints,
 		 * clocks and IOMMUs, and reject enqueues during that release.
@@ -1288,6 +1298,11 @@ static int apple_drm_init_dcp(struct device *dev)
 	ret = apple_probe_typec_ports(&apple->drm, dcp, crtc_mask, num_dcp);
 	if (ret)
 		return ret;
+
+	/* The J713 external outputs; the panel goes on without them. */
+	ret = t8132_ext_drm_init(&apple->drm);
+	if (ret)
+		dev_warn(dev, "T8132 external outputs not all registered: %d\n", ret);
 
 	for (i = 0; i < num_dcp; i++) {
 		connector_type[i] = dcp_get_connector_type(dcp[i]);
@@ -1420,7 +1435,8 @@ static int apple_drm_init(struct device *dev)
 	drm_mode_config_reset(&apple->drm);
 	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
 		drm_for_each_crtc(crtc, &apple->drm) {
-			if (iomfb_is_m4(platform_get_drvdata(to_apple_crtc(crtc)->dcp))) {
+			if (!t8132_ext_crtc(crtc) &&
+			    iomfb_is_m4(platform_get_drvdata(to_apple_crtc(crtc)->dcp))) {
 				retained_modeset = true;
 				break;
 			}
@@ -1441,6 +1457,8 @@ static int apple_drm_init(struct device *dev)
 	drm_for_each_crtc(crtc, &apple->drm) {
 		const char *reason = "none";
 
+		if (t8132_ext_crtc(crtc))
+			continue;
 		ret = dcp_takeover_trial(to_apple_crtc(crtc)->dcp, &reason);
 		if (!ret)
 			continue;
@@ -1454,7 +1472,8 @@ static int apple_drm_init(struct device *dev)
 		__module_get(THIS_MODULE);
 		drm_dev_get(&apple->drm);
 		drm_for_each_crtc(crtc, &apple->drm)
-			dcp_takeover_aborted(to_apple_crtc(crtc)->dcp);
+			if (!t8132_ext_crtc(crtc))
+				dcp_takeover_aborted(to_apple_crtc(crtc)->dcp);
 		apple->aborted = true;
 		return 0;
 	}
@@ -1474,6 +1493,8 @@ static int apple_drm_init(struct device *dev)
 		goto err_unlock;
 	if (retained_modeset) {
 		drm_for_each_crtc(crtc, &apple->drm) {
+			if (t8132_ext_crtc(crtc))
+				continue;
 			ret = dcp_activate(to_apple_crtc(crtc)->dcp);
 			if (ret) {
 				drm_modeset_unlock_all(&apple->drm);
@@ -1490,7 +1511,8 @@ static int apple_drm_init(struct device *dev)
 
 	/* A panel that publishes no level registers its backlight now. */
 	drm_for_each_crtc(crtc, &apple->drm)
-		dcp_backlight_takeover_registered(to_apple_crtc(crtc)->dcp);
+		if (!t8132_ext_crtc(crtc))
+			dcp_backlight_takeover_registered(to_apple_crtc(crtc)->dcp);
 
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
 
@@ -1649,7 +1671,7 @@ static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 cr
 	bool held = true;
 
 	drm_for_each_crtc(crtc, &apple->drm) {
-		if (crtcs & drm_crtc_mask(crtc))
+		if ((crtcs & drm_crtc_mask(crtc)) && !t8132_ext_crtc(crtc))
 			held &= dcp_hold_resume_event(to_apple_crtc(crtc)->dcp);
 	}
 	return held;

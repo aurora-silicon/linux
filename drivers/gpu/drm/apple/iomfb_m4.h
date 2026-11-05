@@ -9,9 +9,17 @@
 struct apple_dcp;
 struct device;
 struct dentry;
+struct drm_connector;
 struct drm_display_mode;
+struct drm_rect;
+struct iosys_map;
 struct drm_framebuffer;
 struct iomfb_m4;
+
+/* The firmware's IDs of an external mode (bootstrap 0: none). */
+struct iomfb_m4_ext_ids {
+	u32 timing, color, bootstrap;
+};
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 
@@ -24,6 +32,18 @@ int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *mode);
 int iomfb_m4_health(struct apple_dcp *dcp);
 int iomfb_m4_error(struct apple_dcp *dcp);
 bool iomfb_m4_external_ready(struct apple_dcp *dcp);
+void iomfb_m4_external_link_gone(struct apple_dcp *dcp);
+/* An adopted external DCP's sink, for its DRM connector (t8132_ext_drm.c). */
+int iomfb_m4_ext_detect(struct apple_dcp *dcp);
+int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector);
+/* DRM drives the external output: modeset, copied frames, disable. */
+int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+			  struct iomfb_m4_ext_ids *ids);
+int iomfb_m4_ext_enable(struct apple_dcp *dcp, const struct iomfb_m4_ext_ids *ids,
+			u32 width, u32 height);
+int iomfb_m4_ext_present(struct apple_dcp *dcp, const struct iosys_map *src, u32 pitch,
+			 const struct drm_rect *damage);
+int iomfb_m4_ext_blank(struct apple_dcp *dcp);
 /* Why an external DCP's display refuses system sleep, or NULL. */
 const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp);
 
@@ -52,6 +72,33 @@ static inline int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mo
 static inline int iomfb_m4_health(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_error(struct apple_dcp *dcp) { return -ENODEV; }
 static inline bool iomfb_m4_external_ready(struct apple_dcp *dcp) { return false; }
+static inline void iomfb_m4_external_link_gone(struct apple_dcp *dcp) { }
+static inline int iomfb_m4_ext_detect(struct apple_dcp *dcp) { return -ENODEV; }
+static inline int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector)
+{
+	return 0;
+}
+
+static inline int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp,
+					const struct drm_display_mode *mode,
+					struct iomfb_m4_ext_ids *ids)
+{
+	return -ENODEV;
+}
+
+static inline int iomfb_m4_ext_enable(struct apple_dcp *dcp, const struct iomfb_m4_ext_ids *ids,
+				      u32 width, u32 height)
+{
+	return -ENODEV;
+}
+
+static inline int iomfb_m4_ext_present(struct apple_dcp *dcp, const struct iosys_map *src,
+				       u32 pitch, const struct drm_rect *damage)
+{
+	return -ENODEV;
+}
+
+static inline int iomfb_m4_ext_blank(struct apple_dcp *dcp) { return -ENODEV; }
 
 static inline const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp) { return NULL; }
 

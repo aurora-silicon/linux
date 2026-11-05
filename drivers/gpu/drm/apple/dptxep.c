@@ -22,6 +22,7 @@
 #include "dptx-service.h"
 #include "parser.h"
 #include "trace.h"
+#include "t8132_ext_drm.h"
 
 #include "dptx-j700-training.h"
 
@@ -412,6 +413,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 	struct apple_dcp *dcp = service->ep->dcp;
 	const struct dptxport_apcall_set_active_lane_count *request = data;
 	struct dptxport_apcall_set_active_lane_count *reply = reply_;
+	bool changed;
 	int ret = 0;
 	int retcode = 0;
 
@@ -457,8 +459,12 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 			if (ret)
 				return ret;
 		}
+		changed = dptx->lane_count != lane_count;
 		dptx->phy_ops.dp.set_lanes = 0;
 		dptx->lane_count = lane_count;
+		/* A T8132 external output's DRM modes follow its link (published above). */
+		if (changed && dcp_is_t8132_ext(dcp))
+			t8132_ext_drm_hotplug(dcp->dev);
 	}
 
 	reply->retcode = cpu_to_le32(retcode);
@@ -546,6 +552,7 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 	const struct dptxport_apcall_link_rate *request = data;
 	struct dptxport_apcall_link_rate *reply = reply_;
+	bool changed;
 	u32 link_rate, phy_link_rate;
 	bool phy_set_rate = false;
 	int ret;
@@ -616,7 +623,11 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 				return ret;
 		}
 
+		changed = dptx->link_rate != link_rate;
 		dptx->link_rate = dptx->pending_link_rate = link_rate;
+		/* A T8132 external output's DRM modes follow its link (published above). */
+		if (changed && dcp_is_t8132_ext(service->ep->dcp))
+			t8132_ext_drm_hotplug(service->ep->dcp->dev);
 	}
 
 	//dptx->pending_link_rate = link_rate;
