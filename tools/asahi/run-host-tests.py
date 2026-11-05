@@ -144,6 +144,7 @@ ASAHI_TESTS = {
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
                                    'offset-sign', 'event-bit', 'wrong-base'), out()),
+    'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
