@@ -80,6 +80,8 @@ struct iomfb_m4_ext_mode {
 	/* The timing's IsPreferred and firmware score */
 	bool fw_preferred;
 	s64 score;
+	/* Its colour element is one the timing lists as needing DSC */
+	bool dsc;
 };
 
 struct iomfb_m4 {
@@ -2568,6 +2570,16 @@ static u64 dcp_m4_ext_capacity(struct apple_dcp *owner)
 }
 
 /*
+ * Whether a cached mode fits the link: at 24 bpp uncompressed, at 8 bpp (the
+ * lowest DSC target) with a colour that needs DSC, whose rate the firmware
+ * picks itself.
+ */
+static bool dcp_m4_ext_fits(const struct iomfb_m4_ext_mode *e, u64 capacity)
+{
+	return !capacity || (u64)e->mode.clock * (e->dsc ? 8 : 24) <= capacity;
+}
+
+/*
  * The firmware's IDs of a mode iomfb_m4_ext_get_modes()
  * offered: -ENOENT for any other mode, -ENOSPC for one over the link.
  */
@@ -2587,23 +2599,21 @@ int iomfb_m4_ext_mode_ids(struct apple_dcp *owner, const struct drm_display_mode
 		if (!drm_mode_match(&e->mode, mode, DRM_MODE_MATCH_TIMINGS |
 				    DRM_MODE_MATCH_CLOCK | DRM_MODE_MATCH_FLAGS))
 			continue;
-		if (capacity && (u64)e->mode.clock * 24 > capacity) {
+		if (!dcp_m4_ext_fits(e, capacity)) {
 			ret = -ENOSPC;
 			continue;
 		}
 		ids->timing = e->timing;
 		ids->color = e->color;
 		ids->bootstrap = e->bootstrap;
+		dev_dbg(dcp->dev, "mode %ux%u@%d: timing %u, colour %u%s\n",
+			e->mode.hdisplay, e->mode.vdisplay, drm_mode_vrefresh(&e->mode),
+			e->timing, e->color, e->dsc ? " (DSC)" : "");
 		ret = 0;
 		break;
 	}
 	mutex_unlock(&dcp->ext_modes_lock);
 	return ret;
-}
-
-static bool dcp_m4_ext_fits(const struct drm_display_mode *m, u64 capacity)
-{
-	return !capacity || (u64)m->clock * 24 <= capacity;
 }
 
 /* A mode's refresh rate in mHz, to compare 59.94 with 60 Hz. */
@@ -2634,7 +2644,8 @@ static bool dcp_m4_ext_sink_preferred(const struct iomfb_m4 *dcp,
 
 /*
  * The cached mode to mark preferred, -1 for none (the
- * 1920x1080 fallback), with the rule that chose it in @why:
+ * 1920x1080 fallback), never one that needs DSC (the user picks those), with
+ * the rule that chose it in @why:
  * 1. the native size is the largest (pixel area) of the sink's preferred
  *    timings: its PreferredTimingElements (their own sizes too) and its
  *    IsPreferred timings;
@@ -2670,8 +2681,8 @@ static int dcp_m4_ext_pick_preferred(struct iomfb_m4 *dcp, u64 capacity, const c
 		u64 mhz = dcp_m4_ext_mhz(&e[i].mode), best_mhz;
 		bool pref, best_pref;
 
-		if (!dcp_m4_ext_same_size(&e[i].mode, width, height) ||
-		    !dcp_m4_ext_fits(&e[i].mode, capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
+		if (!dcp_m4_ext_same_size(&e[i].mode, width, height) || e[i].dsc ||
+		    !dcp_m4_ext_fits(&e[i], capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
 			continue;
 		if (best < 0) {
 			best = i;
@@ -2692,8 +2703,8 @@ static int dcp_m4_ext_pick_preferred(struct iomfb_m4 *dcp, u64 capacity, const c
 		u64 a = (u64)e[i].mode.hdisplay * e[i].mode.vdisplay, b;
 		u64 mhz = dcp_m4_ext_mhz(&e[i].mode);
 
-		if (!dcp_m4_ext_sink_preferred(dcp, &e[i]) ||
-		    !dcp_m4_ext_fits(&e[i].mode, capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
+		if (!dcp_m4_ext_sink_preferred(dcp, &e[i]) || e[i].dsc ||
+		    !dcp_m4_ext_fits(&e[i], capacity) || mhz < DCP_M4_EXT_MIN_MHZ)
 			continue;
 		b = best < 0 ? 0 : (u64)e[best].mode.hdisplay * e[best].mode.vdisplay;
 		if (best < 0 || a > b || (a == b && mhz > dcp_m4_ext_mhz(&e[best].mode)))
@@ -2724,7 +2735,7 @@ int iomfb_m4_ext_get_modes(struct apple_dcp *owner, struct drm_connector *connec
 		const struct drm_display_mode *m = &dcp->ext_modes[i].mode;
 		struct drm_display_mode *mode;
 
-		if (capacity && (u64)m->clock * 24 > capacity) {
+		if (!dcp_m4_ext_fits(&dcp->ext_modes[i], capacity)) {
 			skipped++;
 			continue;
 		}
@@ -2736,8 +2747,10 @@ int iomfb_m4_ext_get_modes(struct apple_dcp *owner, struct drm_connector *connec
 			mode->type |= DRM_MODE_TYPE_PREFERRED;
 			preferred = mode;
 		}
-		if (!fallback || (mode->hdisplay == 1920 && mode->vdisplay == 1080 &&
-				  drm_mode_vrefresh(mode) == 60))
+		/* A DSC mode is never the fallback either: the user picks one. */
+		if (!dcp->ext_modes[i].dsc &&
+		    (!fallback || (mode->hdisplay == 1920 && mode->vdisplay == 1080 &&
+				   drm_mode_vrefresh(mode) == 60)))
 			fallback = mode;
 		drm_mode_probed_add(connector, mode);
 		added++;
@@ -3040,9 +3053,10 @@ static_assert(sizeof(struct dcp_m4_mode_info_req) == 0x7c);
 
 /*
  * The colour element of a timing: RGB with the SDR gamma EOTF, not virtual,
- * not unsafe or needing DSC for the timing; the lowest depth offered (8 bpc
- * if there is one); then sRGB/BT.709 colorimetry and full range over
- * others, then the higher score. Never PQ or HLG.
+ * not unsafe for the timing, at 8 bpc if the timing lists it as needing DSC;
+ * the lowest depth offered (8 bpc if there is one); at that depth one that
+ * needs no DSC over one that does, then sRGB/BT.709 colorimetry and full
+ * range over others, then the higher score. Never PQ or HLG.
  */
 struct dcp_m4_ext_pick {
 	struct dcp_color_element best;
@@ -3061,16 +3075,18 @@ static void dcp_m4_ext_pick_color(void *data, const struct dcp_color_element *e)
 	struct dcp_m4_ext_pick *p = data;
 	unsigned int rank, best_rank;
 
-	if (e->is_virtual || e->restricted || e->id < 0 || e->id > U32_MAX || e->score < 0 ||
+	if (e->is_virtual || e->unsafe || e->id < 0 || e->id > U32_MAX || e->score < 0 ||
 	    e->depth <= 0 || e->encoding != DCP_COLOR_FORMAT_RGB ||
-	    e->eotf != DCP_EOTF_SDR_GAMMA)
+	    e->eotf != DCP_EOTF_SDR_GAMMA || (e->dsc_required && e->depth != 8))
 		return;
 	rank = dcp_m4_ext_color_rank(e);
 	best_rank = p->found ? dcp_m4_ext_color_rank(&p->best) : 0;
 	if (p->found && (e->depth > p->best.depth ||
 			 (e->depth == p->best.depth &&
-			  (rank < best_rank ||
-			   (rank == best_rank && e->score <= p->best.score)))))
+			  (e->dsc_required > p->best.dsc_required ||
+			   (e->dsc_required == p->best.dsc_required &&
+			    (rank < best_rank ||
+			     (rank == best_rank && e->score <= p->best.score)))))))
 		return;
 	p->best = *e;
 	p->found = true;
@@ -3094,7 +3110,8 @@ static bool dcp_m4_ext_timing_color(const void *blob, u32 size, u32 timing,
 /*
  * The timings of the sink's TimingElements @blob with an
  * 8-bpc RGB SDR colour element (see dcp_m4_ext_pick_color()), not
- * interlaced, for its DRM connector. Replaces the previous list and starts
+ * interlaced, for its DRM connector; those whose only such element needs DSC
+ * are marked so. Replaces the previous list and starts
  * the sink's catalog (no PreferredTimingElements yet); not if received in
  * sink generation @gen, before a released route (stale). True if cached.
  */
@@ -3136,6 +3153,11 @@ static bool dcp_m4_ext_cache_modes(struct iomfb_m4 *dcp, const void *blob, u32 s
 		list[kept].bootstrap = m->has_bootstrap ? m->bootstrap_color_id : 0;
 		list[kept].fw_preferred = m->firmware_preferred;
 		list[kept].score = m->score;
+		list[kept].dsc = color.dsc_required;
+		if (color.dsc_required)
+			dev_dbg(dcp->dev, "timing %u %ux%u@%d: DSC colour %u\n",
+				m->timing_mode_id, m->mode.hdisplay, m->mode.vdisplay,
+				drm_mode_vrefresh(&m->mode), (u32)color.id);
 		kept++;
 	}
 	kfree(modes);
@@ -3439,8 +3461,7 @@ static bool dcp_m4_ext_ids_current(struct iomfb_m4 *dcp, const struct iomfb_m4_e
 
 		found = e->timing == ids->timing && e->color == ids->color &&
 			e->bootstrap == ids->bootstrap && e->mode.hdisplay == width &&
-			e->mode.vdisplay == height &&
-			(!capacity || (u64)e->mode.clock * 24 <= capacity);
+			e->mode.vdisplay == height && dcp_m4_ext_fits(e, capacity);
 	}
 	mutex_unlock(&dcp->ext_modes_lock);
 	return found;
