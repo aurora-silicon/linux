@@ -72,15 +72,18 @@
 };
 
 &ps_dispext0_sys {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext0_fe {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext0_cpu {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_scodec {
@@ -125,16 +128,18 @@
 	status = "disabled";
 };
 
+/* The CS42L84 headphone codec. */
 &ps_i2c1 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_i2c2 {
 	status = "disabled";
 };
 
+/* The SN012776 speaker amps. */
 &ps_i2c3 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_i2c4 {
@@ -194,7 +199,7 @@
 };
 
 &ps_spi2 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_spi3 {
@@ -366,15 +371,18 @@
 };
 
 &ps_dispext1_sys {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext1_fe {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 &ps_dispext1_cpu {
-	status = "disabled";
+	status = "okay";
+	apple,firmware-owned;
 };
 
 /* No camera driver yet; genpd powers the ISP down as an unused domain. */

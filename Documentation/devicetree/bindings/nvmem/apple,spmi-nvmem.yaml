@@ -20,7 +20,6 @@ properties:
       - enum:
           - apple,abbey-pmic
           - apple,baku-pmic
-          - apple,chapel-pmic
           - apple,maverick-pmic
           - apple,sera-pmic
           - apple,stowe-pmic

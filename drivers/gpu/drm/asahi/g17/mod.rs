@@ -193,6 +193,7 @@ pub(crate) struct Config {
     pub(crate) fabric_bridge: bool,
     /// The SoC's values of region C.
     pub(crate) region_c: &'static fw::initdata::RegionCConfig,
+    pub(crate) chip: Option<&'static fw::initdata::v25g83::Chip>,
     /// Physical address of the firmware's per-slot recovery keys, read while the firmware is
     /// halted to attribute a fault; `None` where it is unknown (recovery then relies on the
     /// firmware's own blame).
@@ -207,13 +208,15 @@ pub(crate) struct Config {
 
 /// Layouts of the firmware command buffers that follow a SoC's GPU core layout.
 pub(crate) struct CoreLayout {
-    /// The cluster and enabled core counts the layouts were measured on, which the GPU must
-    /// report at probe; `None` where the layouts hold for every configuration of the SoC.
+    /// The measured cluster and enabled core counts; `None` admits every configuration.
     pub(crate) cores: Option<(u32, u32)>,
+    /// An experimental layout: core slots and enabled cores per cluster.
+    pub(crate) alternate_core_masks: Option<(u32, u32)>,
     /// A compute queue's operand-state buffer.
     pub(crate) operand_state: fw::compute::OperandState,
     /// A render's deflake buffer.
     pub(crate) deflake: fw::render::Deflake,
+    pub(crate) compute_blocks: usize,
 }
 
 /// Where a G17 target's crash log buffers live.
@@ -866,6 +869,7 @@ struct Shared {
     operand_state: &'static fw::compute::OperandState,
     /// Layout of renders' deflake buffers for this GPU's cores.
     deflake: fw::render::Deflake,
+    compute_blocks: usize,
     descriptor_flags: [u32; 2],
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
@@ -1124,8 +1128,9 @@ impl Shared {
         self.crashed.store(true, Ordering::Release);
         dev_err!(
             self.dev.as_ref(),
-            "GPU firmware ({:?}) crashed, device lost\n",
-            role
+            "GPU firmware ({:?}) crashed, device lost (crash log {} bytes)\n",
+            role,
+            crashlog.map_or(0, |log| log.len())
         );
 
         // The GPU dev coredump support this used is gone; the crash log is not published.
@@ -1208,10 +1213,20 @@ impl Gpu {
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
         let active_cores = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
+        let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
+            clusters == id.num_clusters
+                && cores != active_cores
+                && cfg.core_layout.alternate_core_masks.is_some_and(|(slots, enabled)| {
+                    id.num_cores == slots
+                        && id.core_masks.len() == clusters as usize
+                        && id.core_masks.iter().all(|mask| mask.count_ones() == enabled)
+                })
+        });
         if cfg
             .core_layout
             .cores
             .is_some_and(|cores| cores != (id.num_clusters, active_cores))
+            && !alternate
         {
             dev_err!(
                 dev.as_ref(),
@@ -1220,6 +1235,12 @@ impl Gpu {
                 active_cores
             );
             return Err(ENODEV);
+        }
+        if alternate {
+            dev_warn!(
+                dev.as_ref(),
+                "Experimental GPU topology admission: command-buffer offsets are not yet validated\n"
+            );
         }
         let shared = Arc::pin_init(
             pin_init!(Shared {
@@ -1230,6 +1251,7 @@ impl Gpu {
                 variant,
                 operand_state: &cfg.core_layout.operand_state,
                 deflake: cfg.core_layout.deflake,
+                compute_blocks: cfg.core_layout.compute_blocks,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
                 crashed: AtomicBool::new(false),
                 feed,
@@ -1493,18 +1515,24 @@ impl Gpu {
         session.port.attach(
             session.init.port_views(mailbox)?,
             session.bridge.regs.clone(),
+            shared.variant.registration,
         )?;
         session.uat.mirror_secondary_root()?;
         if cfg.fabric_bridge {
             session.bridge.regs.enable_g17_gating()?;
         }
         let ack = shared.variant.init_ack;
-        session
-            .primary
-            .init(session.init.root_va(Role::Primary)?, ack)?;
+        let root_va = session.init.root_va(Role::Primary)?;
+        dev_dbg!(
+            dev.as_ref(),
+            "bring-up: initialization data built, publishing root {:#x}\n",
+            root_va
+        );
+        session.primary.init(root_va, ack)?;
         if ack == fw::variant::InitAck::Status {
             Self::wait_for_init_accepted(dev, &session.init, &session.primary)?;
         }
+        dev_dbg!(dev.as_ref(), "bring-up: initialization data accepted\n");
         if let Some(secondary) = session.secondary.as_mut() {
             secondary.init(session.init.root_va(Role::Secondary)?, ack)?;
         }
@@ -1514,15 +1542,25 @@ impl Gpu {
                 secondary.notify(MSG_POWER_ON_DONE)?;
             }
         }
-        Self::wait_for_opening(
-            dev,
-            &session.init,
-            &session.primary,
-            session.secondary.as_ref(),
-        )?;
+        if shared.variant.opening_record {
+            Self::wait_for_opening(
+                dev,
+                &session.init,
+                &session.primary,
+                session.secondary.as_ref(),
+            )?;
+            dev_dbg!(dev.as_ref(), "bring-up: opening record retired\n");
+        } else {
+            dev_dbg!(
+                dev.as_ref(),
+                "bring-up: no opening record staged; device-control counters {:?}\n",
+                session.init.control_counters()?
+            );
+        }
         session
             .uat
             .activate_render_context(&session._render_global)?;
+        dev_dbg!(dev.as_ref(), "bring-up: firmware running\n");
         Ok(firmware)
     }
 

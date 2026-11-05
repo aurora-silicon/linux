@@ -28,7 +28,7 @@ properties:
   reg:
     description: Per-plane blocks on T8140, or the two multicast apertures on T8132.
     minItems: 1
-    maxItems: 16
+    maxItems: 32
 
   nonposted-mmio: true
 

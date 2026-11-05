@@ -145,7 +145,8 @@ static void scenario(int amp, const char *prefix, bool tweeter, bool stereo)
   bool fixed = false;
   if (i != 8) {
    if ((amp == AMP_TAS5770 || amp == AMP_SN012776) && stereo && which == 0) { fixed = true; expected = 1; }
-   if (amp == AMP_SN012776 && which == 1) { fixed = true; expected = tweeter ? 3 : 2; }
+   /* Tweeters: the 800 Hz floor; woofers keep the corner the amp holds (from the ADT) */
+   if (amp == AMP_SN012776 && which == 1) { fixed = true; expected = tweeter ? 3 : 6; }
    if (amp == AMP_SN012776 && which == 2) { fixed = true; expected = 4; }
    if (amp == AMP_SSM3515 && which == 3) { fixed = true; expected = 5; }
   }

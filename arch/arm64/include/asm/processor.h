@@ -445,6 +445,11 @@ u64 apple_afp_read_afpcr(struct task_struct *t);
 void apple_afp_write_afpcr(struct task_struct *t, u64 afpcr);
 #define AURORA_GET_X86_FP()		apple_x86_fp_get()
 #define AURORA_SET_X86_FP(arg)		apple_x86_fp_set(arg)
+#else
+static inline bool apple_afp_enabled(struct task_struct *t)
+{
+	return false;
+}
 #endif
 
 #ifdef CONFIG_ARM64_APPLE_FP_PRESERVE

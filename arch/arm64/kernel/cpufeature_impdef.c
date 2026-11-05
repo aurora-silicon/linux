@@ -70,6 +70,21 @@ static bool has_tso_fixed(const struct arm64_cpu_capabilities *entry, int scope)
 }
 #endif
 
+/*
+ * Below EL2 a hypervisor traps IMPLEMENTATION DEFINED registers (KVM through
+ * HCR_EL2.TIDCP) and injects an UNDEF unless it emulates them, which it says
+ * through an Aurora vendor hypervisor feature. KVM guests call it through
+ * HVC. Anything else isn't a hypervisor to ask: aura's EL2 monitor, which
+ * enters the OS at EL1 on M4 machines with PSCI over SMC, does not trap these
+ * registers.
+ */
+static bool __maybe_unused apple_impdef_reg_usable(u32 feature)
+{
+	return is_kernel_in_hyp_mode() ||
+	       arm_smccc_1_1_get_conduit() != SMCCC_CONDUIT_HVC ||
+	       kvm_arm_hyp_service_available(feature);
+}
+
 #ifdef CONFIG_ARM64_APPLE_X86_FLAGS
 static bool has_apple_apflg(const struct arm64_cpu_capabilities *entry, int scope)
 {
@@ -81,13 +96,8 @@ static bool has_apple_apflg(const struct arm64_cpu_capabilities *entry, int scop
 	    !cpufeature_matches(read_sysreg(aidr_el1), entry))
 		return false;
 
-	/*
-	 * Exception entry and return access ASPSR_EL1. Below EL2 a hypervisor
-	 * traps that IMPDEF register (KVM through HCR_EL2.TIDCP) and would
-	 * inject an UNDEF, so require it to say that it emulates ASPSR.
-	 */
-	if (!is_kernel_in_hyp_mode() &&
-	    !kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_AURORA_APPLE_ASPSR))
+	/* Exception entry and return access ASPSR_EL1. */
+	if (!apple_impdef_reg_usable(ARM_SMCCC_KVM_FUNC_AURORA_APPLE_ASPSR))
 		return false;
 
 	/*
@@ -127,13 +137,8 @@ static bool has_apple_afp(const struct arm64_cpu_capabilities *entry, int scope)
 	    !cpufeature_matches(read_sysreg(aidr_el1), entry))
 		return false;
 
-	/*
-	 * The kernel switches AFPCR_EL0 between threads. Below EL2 a hypervisor
-	 * traps that IMPDEF register (KVM through HCR_EL2.TIDCP) and would
-	 * inject an UNDEF, so require it to say that it emulates AFPCR.
-	 */
-	if (!is_kernel_in_hyp_mode() &&
-	    !kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_AURORA_APPLE_AFPCR))
+	/* The kernel switches AFPCR_EL0 between threads. */
+	if (!apple_impdef_reg_usable(ARM_SMCCC_KVM_FUNC_AURORA_APPLE_AFPCR))
 		return false;
 
 	val = read_sysreg(actlr_el1);

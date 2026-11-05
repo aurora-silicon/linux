@@ -41,6 +41,8 @@
 #include "version_utils.h"
 
 #define DCP_MAX_PLANES 4
+/* Bounds the CRTC power cycles a rebuilt T6020 tunnel may trigger. */
+#define DCP_TUNNEL_POWER_CYCLES 2
 
 struct apple_dcp;
 struct iomfb_m4;
@@ -177,6 +179,16 @@ struct dcp_brightness {
 	bool update;
 	/* A level was written through the backlight device (desktop 26.x). */
 	bool requested;
+	/*
+	 * Fade between levels where the firmware takes a DAC value in each
+	 * swap.  level is the one set last, in nits; crtc mutex.
+	 */
+	struct delayed_work fade_work;
+	unsigned long fade_start;
+	u32 level;
+	u32 fade_from;
+	u32 fade_to;
+	bool fading;
 };
 
 struct audiosrv_data;
@@ -191,6 +203,8 @@ struct dcp_panel {
 	bool has_mini_led;
 	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
 	u32 peak_nits;
+	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	u32 edr_ceiling;
 };
 
 enum dcp_iomfb_method_profile {
@@ -341,6 +355,11 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
+	/*
+	 * Allocates AFK rings where the DMA API cannot, on an adopted
+	 * J713 external DCP whose DART only takes the retained allocator.
+	 */
+	void *(*afk_alloc)(struct apple_dcp *dcp, size_t size, dma_addr_t *dva);
 	bool quiescing;
 	bool drm_retained;
 	/* vblank_wq and swap_watchdog_wq disabled by the last unbind */
@@ -548,6 +567,8 @@ struct apple_dcp {
 
 	/* Current display mode */
 	struct dcp_mode_state mode_state;
+	/* hotplug worker: power cycles since the mode was last valid */
+	unsigned int tunnel_power_cycles;
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
@@ -575,11 +596,12 @@ struct apple_dcp {
 	bool output_edr;
 	bool edr_sent;
 	/*
-	 * EDR headroom the panel was last given, x1000 (0: not in use), and
-	 * a power off since, after which the ramp starts again from 1.0 (see
-	 * dcp_edr_prepare()).
+	 * EDR headroom the panel was last given, x1000 (0: not in use), the
+	 * SDR white in nits it was given for, and a power off since, after
+	 * which the ramp starts again from 1.0 (see dcp_edr_prepare()).
 	 */
 	u32 edr_hm;
+	u32 edr_sdr;
 	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
 
@@ -692,6 +714,11 @@ struct apple_dcp {
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
+	/*
+	 * T8132 dcpext: a teardown call timed out; the firmware's late
+	 * Activate/Deactivate belong to it until its answer is in.
+	 */
+	bool t8132_release_late;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
@@ -707,6 +734,12 @@ struct apple_dcp {
 	 */
 	struct mutex tb_lock;
 	bool tb_clock_ok;
+	/*
+	 * T8132 dcpext: its tunnel pixel clock was refused (the PHY runs the
+	 * other DP IN at another link rate), so the tunnel cannot show.
+	 * tb_lock to set; read anywhere.
+	 */
+	bool tb_clock_refused;
 	/* tb_lock: the direct DP PHY crossbar output whose clocks run (T6030). */
 	struct mux_control *direct_xbar_up;
 	/*

@@ -1510,7 +1510,8 @@ tb_recalc_estimated_bandwidth_for_group(struct tb_bandwidth_group *group)
 			      estimated_bw + group->reserved);
 
 		if (usb4_dp_port_set_estimated_bandwidth(in,
-				estimated_bw + group->reserved))
+				tb_dp_cap_bandwidth(tunnel,
+						    estimated_bw + group->reserved)))
 			tb_tunnel_warn(tunnel,
 				       "failed to update estimated bandwidth\n");
 	}
@@ -2147,6 +2148,23 @@ err_rpm_put:
 	pm_runtime_put_autosuspend(&out->sw->dev);
 	pm_runtime_mark_last_busy(&in->sw->dev);
 	pm_runtime_put_autosuspend(&in->sw->dev);
+}
+
+/*
+ * The link rate (Mb/s per lane) another DP tunnel from @tunnel's host router
+ * was given under TB_HOST_DP_HBR2_MAX, 0 if there is none. Called with the
+ * domain lock held, from the tunnel's activation.
+ */
+u32 tb_dp_host_shared_rate(const struct tb_tunnel *tunnel)
+{
+	struct tb_cm *tcm = tb_priv(tunnel->tb);
+	struct tb_tunnel *t;
+
+	list_for_each_entry(t, &tcm->tunnel_list, list)
+		if (t != tunnel && tb_tunnel_is_dp(t) && t->host_rate &&
+		    t->src_port->sw == tunnel->src_port->sw)
+			return t->host_rate;
+	return 0;
 }
 
 static void tb_tunnel_dp(struct tb *tb)
@@ -3211,6 +3229,10 @@ static int tb_start(struct tb *tb, bool reset)
 	 * on these machines.
 	 */
 	tb->root_switch->no_usb3_bw_alloc = tb->nhi->quirks & QUIRK_NO_USB3_BW_ALLOC;
+	if (tb->nhi->quirks & QUIRK_NO_HOST_CLX) {
+		tb->root_switch->quirks |= QUIRK_NO_CLX;
+		tb_sw_dbg(tb->root_switch, "disabling CL states\n");
+	}
 
 	ret = tb_switch_configure(tb->root_switch);
 	if (ret) {
@@ -3270,6 +3292,27 @@ static int tb_start(struct tb *tb, bool reset)
 	tcm->hotplug_active = true;
 	return 0;
 }
+
+/*
+ * Whether a DP tunnel from an Apple host router's DP IN adapter (an external
+ * display through a dock) is up. Takes the domain lock.
+ */
+bool tb_has_apple_host_dp_tunnel(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+	bool found = false;
+
+	mutex_lock(&tb->lock);
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list)
+		if (tb_tunnel_is_dp(tunnel) && tb_port_is_apple_host_dpin(tunnel->src_port)) {
+			found = true;
+			break;
+		}
+	mutex_unlock(&tb->lock);
+	return found;
+}
+EXPORT_SYMBOL_FOR_MODULES(tb_has_apple_host_dp_tunnel, "thunderbolt_apple");
 
 static int tb_suspend_noirq(struct tb *tb)
 {

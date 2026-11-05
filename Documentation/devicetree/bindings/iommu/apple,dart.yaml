@@ -82,6 +82,8 @@ properties:
       describe the stream ID followed by the 64-bit base and length of its
       device-visible DMA window.
 
+  nonposted-mmio: true
+
   power-domains:
     maxItems: 1
 
@@ -122,6 +124,17 @@ properties:
       List of (register offset, mask, value) tuples copied from Apple's Device
       Tree by the bootloader and required to initialize dynamically powered
       DART instances.
+
+  apple,bypass-sids:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 8
+    items:
+      maximum: 255
+    description:
+      Reserved streams of a USB4 PCIe tunnel DART that its PCIe-C port issues
+      its own writes on, such as the interrupt controller writes its MSIs
+      turn into. They are set to bypass after every reset of the DART.
 
   apple,remap-streams:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
