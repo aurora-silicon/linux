@@ -4720,19 +4720,19 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	ret = dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
 
 	/*
-	 * T6041 (M4 Pro/Max) is driven only with the 26.6.2 firmware its
-	 * desktop IOMFB instance was written for: both the boot firmware and
-	 * its compatibility version must be exactly that release.
+	 * T6041 (M4 Pro/Max) is driven only with the 26.5.2 and 26.6.2 firmware
+	 * its desktop IOMFB instance was written for: the boot firmware and its
+	 * compatibility version must both be exactly the same one of those.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcp") ||
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
 		int compat_ret = dcp_read_fw_version(dev, "apple,firmware-compat",
 						     compat_str);
 
-		if (ret >= 0 && compat_ret >= 0 && !strcmp(fw_str, "26.6.2") &&
-		    !strcmp(compat_str, "26.6.2"))
+		if (ret >= 0 && compat_ret >= 0 && !strcmp(fw_str, compat_str) &&
+		    (!strcmp(fw_str, "26.5.2") || !strcmp(fw_str, "26.6.2")))
 			return DCP_FIRMWARE_V_26_6_DESKTOP;
-		dev_err(dev, "T6041 display not started: DCP firmware %s (compat %s) is not 26.6.2\n",
+		dev_err(dev, "T6041 display not started: DCP firmware %s (compat %s) is not 26.5.2 or 26.6.2\n",
 			ret >= 0 ? fw_str : "missing",
 			compat_ret >= 0 ? compat_str : "missing");
 		return DCP_FIRMWARE_UNKNOWN;

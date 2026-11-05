@@ -321,7 +321,10 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 	  before, whatever the T6031 option says. On T8122: on by default,
 	  and nothing changed when the handoff or the device tree's own PMP
 	  topology does not check out. On T6041: a power management processor
-	  that binds late still powers the external displays up.
+	  that binds late still powers the external displays up. On the
+	  J616c: each external display chain is enabled without a PMP once
+	  its processor has firmware memory, and the display subsystem's
+	  status is never written.
 
 endmenu
 

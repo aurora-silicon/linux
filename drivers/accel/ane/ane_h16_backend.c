@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -787,6 +788,8 @@ static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, in
 	struct ane_h16_mapping *m;
 	u32 i, j, pages_per_block = SZ_16K / PAGE_SIZE;
 	unsigned int order = get_order(SZ_16K);
+	struct sg_table sgt;
+	ssize_t mapped;
 	int ret;
 
 	if (!dev_is_dma_coherent(h->dev)) {
@@ -818,15 +821,15 @@ static int ane_h16_alloc_prot(struct ane_h16_device *h, u64 dva, size_t size, in
 	m->cpu = vmap(m->pages, size / PAGE_SIZE, VM_MAP, PAGE_KERNEL);
 	if (!m->cpu)
 		return -ENOMEM;
-	memset(m->cpu, 0, size);
-	for (i = 0; i < m->blocks; i++) {
-		ret = iommu_map(h->domain, dva + i * SZ_16K,
-				page_to_phys(m->pages[i * pages_per_block]), SZ_16K,
-				prot, GFP_KERNEL);
-		if (ret)
-			return ret;
-		m->mapped += SZ_16K;
-	}
+	ret = sg_alloc_table_from_pages(&sgt, m->pages, size / PAGE_SIZE, 0, size, GFP_KERNEL);
+	if (ret)
+		return ret;
+	/* A failed call has already unmapped what it mapped. */
+	mapped = iommu_map_sgtable(h->domain, dva, &sgt, prot);
+	sg_free_table(&sgt);
+	if (mapped < 0)
+		return mapped;
+	m->mapped = mapped;
 	*out = (struct ane_fw_surface) { .cpu = m->cpu, .dva = dva, .size = size };
 	return 0;
 }
