@@ -140,6 +140,7 @@ pub mod error {
     impl Error { pub fn from_errno(n: i32) -> Self { Self(n) } }
     pub type Result<T = ()> = core::result::Result<T, Error>;
     pub const EIO: Error = Error(-5);
+    pub const EROFS: Error = Error(-30);
     pub const ENODEV: Error = Error(-19);
     pub fn to_result(n: i32) -> Result { if n < 0 { Err(Error(n)) } else { Ok(()) } }
     pub unsafe fn from_err_ptr<T>(p: *mut T) -> Result<*mut T> {
@@ -148,7 +149,7 @@ pub mod error {
 }
 pub mod prelude {
     pub use core::ffi::{c_char,c_int,c_void,c_long,c_uint,c_ulong};
-    pub use crate::error::{Error, Result, EIO, ENODEV};
+    pub use crate::error::{Error, Result, EIO, EROFS, ENODEV};
     pub struct CStr(pub &'static [u8]);
     impl CStr { pub fn as_char_ptr(&self) -> *const c_char { self.0.as_ptr().cast() } }
 }
