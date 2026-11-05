@@ -21,6 +21,21 @@ struct iomfb_m4_ext_ids {
 	u32 timing, color, bootstrap;
 };
 
+/*
+ * A framebuffer for direct scanout (XRGB8888/ARGB8888, linear, from its first
+ * byte), by its @key: @pages gives the 16 KiB pages behind it (an array the
+ * callee frees) for its first mapping; @get and @put take and drop the
+ * reference a window holds on it while it may be scanned out (@put never under
+ * the session lock).
+ */
+struct iomfb_m4_ext_fb {
+	void *key;
+	u32 width, height, pitch;
+	int (*pages)(void *key, phys_addr_t **phys, unsigned int *count);
+	void (*get)(void *key);
+	void (*put)(void *key);
+};
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 
 /* Probe is inert; start adopts firmware after the common component is pinned. */
@@ -44,6 +59,8 @@ int iomfb_m4_ext_enable(struct apple_dcp *dcp, const struct iomfb_m4_ext_ids *id
 int iomfb_m4_ext_present(struct apple_dcp *dcp, const struct iosys_map *src, u32 pitch,
 			 const struct drm_rect *damage);
 int iomfb_m4_ext_blank(struct apple_dcp *dcp);
+/* 0 once submitted; the flip comes with its D590. */
+int iomfb_m4_ext_present_direct(struct apple_dcp *dcp, const struct iomfb_m4_ext_fb *fb);
 /* Why an external DCP's display refuses system sleep, or NULL. */
 const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp);
 
@@ -99,6 +116,11 @@ static inline int iomfb_m4_ext_present(struct apple_dcp *dcp, const struct iosys
 }
 
 static inline int iomfb_m4_ext_blank(struct apple_dcp *dcp) { return -ENODEV; }
+static inline int iomfb_m4_ext_present_direct(struct apple_dcp *dcp,
+					      const struct iomfb_m4_ext_fb *fb)
+{
+	return -ENODEV;
+}
 
 static inline const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp) { return NULL; }
 

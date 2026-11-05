@@ -6,9 +6,10 @@
  * DCPs are adopted outside the DRM device: these objects read as
  * disconnected until a DCP has a session and a sink.
  *
- * A modeset powers the display and sets the mode. Each frame is copied into
- * a SID0 surface of the DCP's display DART and swapped in, its flip
- * completed with the swap (D590).
+ * A modeset powers the display and sets the mode. A frame is scanned out
+ * directly from its framebuffer where it can be (mapped in a SID0 window of
+ * the DCP's display DART), else copied into a SID0 surface; either way it is
+ * swapped in, its flip completed with the swap (D590).
  */
 #include <linux/device.h>
 #include <linux/dma-buf.h>
@@ -77,6 +78,10 @@ struct t8132_ext_out {
 	bool first_frame;
 	/* A frame was not shown, so the next one goes whole */
 	bool frame_lost;
+	/* The last framebuffers copied instead of scanned out, and why */
+	struct drm_framebuffer *refused_fb[8];
+	const char *refused_why[8];
+	unsigned int refused_next;
 };
 
 static DEFINE_SPINLOCK(t8132_ext_lock);
@@ -194,10 +199,194 @@ static void t8132_ext_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_comm
 }
 
 /*
- * Copy the primary plane's new frame into the DCP and swap it in; 1 if the
- * commit has no new frame (no plane state), so nothing was tried. The
- * framebuffer is read through its kernel mapping (dma-buf vmap for an
- * imported one) inside CPU access.
+ * Whether @sgt is exactly @size bytes of whole 16 KiB pages on the
+ * CPU side: every entry with a page behind it (an imported, DMA-only table
+ * may have none), offset and length in whole pages, the entries together
+ * the object's pages, no more and no less. Before any CPU-side use of it.
+ */
+static bool t8132_ext_sgt_pages_ok(struct sg_table *sgt, size_t size)
+{
+	unsigned int want = size / PAGE_SIZE, n = 0, i;
+	struct scatterlist *sg;
+
+	if (!sgt || size % PAGE_SIZE || PAGE_SIZE != SZ_16K)
+		return false;
+	for_each_sgtable_sg(sgt, sg, i) {
+		if (!sg_page(sg) || sg->offset % PAGE_SIZE || sg->length % PAGE_SIZE ||
+		    sg->length / PAGE_SIZE > want - n)
+			return false;
+		n += sg->length / PAGE_SIZE;
+	}
+	return n == want;
+}
+
+/*
+ * The 16 KiB pages behind a GEM DMA framebuffer, in order, for its SID0
+ * window: an own buffer's from its sg table; an imported dma-buf's from the
+ * sg table of its attachment to this device (CPU side, which the import
+ * keeps mapped, and so its pages pinned, as long as the object lives).
+ * Every DART page must be one 16 KiB page, 16 KiB aligned: any other
+ * layout, or an entry without a page, is copied instead.
+ */
+static int t8132_ext_fb_pages(void *key, phys_addr_t **phys, unsigned int *count)
+{
+	struct drm_framebuffer *fb = key;
+	struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+	struct drm_gem_dma_object *dma;
+	struct scatterlist *sg;
+	struct sg_table *sgt;
+	unsigned int n = 0, i, want;
+	bool own;
+	int ret = 0;
+
+	if (!obj || obj->size % PAGE_SIZE || PAGE_SIZE != SZ_16K)
+		return -EOPNOTSUPP;
+	dma = to_drm_gem_dma_obj(obj);
+	own = !drm_gem_is_imported(obj);
+	sgt = own ? drm_gem_dma_get_sg_table(dma) : dma->sgt;
+	if (IS_ERR_OR_NULL(sgt))
+		return sgt ? PTR_ERR(sgt) : -EOPNOTSUPP;
+	want = obj->size / PAGE_SIZE;
+	if (!t8132_ext_sgt_pages_ok(sgt, obj->size)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	*phys = kcalloc(want, sizeof(**phys), GFP_KERNEL);
+	if (!*phys) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* Exactly the object's pages: no entry may go past them, none may be missing. */
+	for_each_sgtable_sg(sgt, sg, i) {
+		if (!sg_page(sg) || sg->offset % PAGE_SIZE || sg->length % PAGE_SIZE ||
+		    sg->length / PAGE_SIZE > want - n) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		for (unsigned int off = 0; off < sg->length; off += PAGE_SIZE)
+			(*phys)[n++] = page_to_phys(sg_page(sg)) + sg->offset + off;
+	}
+	if (!ret && n != want)
+		ret = -EOPNOTSUPP;
+	if (ret) {
+		kfree(*phys);
+		*phys = NULL;
+	} else {
+		*count = n;
+	}
+out:
+	if (own) {
+		sg_free_table(sgt);
+		kfree(sgt);
+	}
+	return ret;
+}
+
+static void t8132_ext_fb_get(void *key)
+{
+	drm_framebuffer_get(key);
+}
+
+static void t8132_ext_fb_put(void *key)
+{
+	drm_framebuffer_put(key);
+}
+
+static const char t8132_ext_pages_refused[] =
+	"its pages are not 16 KiB pages each (or not all there)";
+
+/* Say once per framebuffer (of the last few) why it is copied. */
+static void t8132_ext_direct_refused(struct t8132_ext_out *out, struct drm_framebuffer *fb,
+				     const char *why)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(out->refused_fb); i++)
+		if (out->refused_fb[i] == fb && out->refused_why[i] == why)
+			return;
+	out->refused_fb[out->refused_next] = fb;
+	out->refused_why[out->refused_next] = why;
+	out->refused_next = (out->refused_next + 1) % ARRAY_SIZE(out->refused_fb);
+	dev_dbg(&out->pdev->dev, "%s: framebuffer %u (%ux%u %p4cc, pitch %u, modifier %#llx, %s) copied, not scanned out: %s\n",
+		out->crtc.name, fb->base.id, fb->width, fb->height, &fb->format->format,
+		fb->pitches[0], fb->modifier,
+		drm_gem_is_imported(drm_gem_fb_get_obj(fb, 0)) ? "imported" : "own", why);
+}
+
+/*
+ * The frame scanned out directly from @fb: 2 once its swap is
+ * submitted (the flip comes with its D590), -ENOSPC or -EOPNOTSUPP to copy
+ * it instead, else the error (the frame lost). A linear XRGB8888 or
+ * ARGB8888 GEM DMA buffer, own or imported, from its first byte, at the
+ * mode's size, the pitch a multiple of 64 bytes, at most 32 MiB, and every
+ * 16 KiB of it one 16 KiB page (t8132_ext_fb_pages()).
+ *
+ * An imported buffer is cleaned out of the CPU caches for the display every
+ * frame, its fences already waited for: its exporter may map it cached
+ * (aurora-g16 WRITEBACK objects), no importer can tell, PRIME maps it with
+ * DMA_ATTR_SKIP_CPU_SYNC and the exporter has no end_cpu_access, while the
+ * display reads memory uncached. A sync for the attached device (this one,
+ * dma-noncoherent) on the import's own sg table does it, whatever window it is
+ * in. The GPU's rendering fence is waited for before the commit gets here (the
+ * plane's default GEM prepare_fb, then drm_atomic_helper_wait_for_fences() in
+ * the commit tail, blocking or not).
+ */
+static int t8132_ext_present_direct(struct t8132_ext_out *out, struct apple_dcp *owner,
+				    struct drm_framebuffer *fb, struct drm_gem_object *obj)
+{
+	const struct drm_display_mode *mode = &out->crtc.state->mode;
+	struct iomfb_m4_ext_fb d = {
+		.key = fb, .width = fb->width, .height = fb->height, .pitch = fb->pitches[0],
+		.pages = t8132_ext_fb_pages, .get = t8132_ext_fb_get, .put = t8132_ext_fb_put,
+	};
+	const char *why = NULL;
+	int ret;
+
+	if (fb->modifier != DRM_FORMAT_MOD_LINEAR)
+		why = "not linear";
+	else if (fb->format->format != DRM_FORMAT_XRGB8888 &&
+		 fb->format->format != DRM_FORMAT_ARGB8888)
+		why = "not XRGB8888 or ARGB8888";
+	else if (fb->offsets[0])
+		why = "not from its first byte";
+	else if (fb->width != mode->hdisplay || fb->height != mode->vdisplay)
+		why = "not the mode's size";
+	else if (fb->pitches[0] % 64 || fb->pitches[0] < fb->width * 4)
+		why = "the pitch is not a multiple of 64 bytes";
+	else if ((u64)fb->pitches[0] * fb->height > SZ_32M || obj->size > SZ_32M)
+		why = "over 32 MiB";
+	if (why) {
+		t8132_ext_direct_refused(out, fb, why);
+		return -EOPNOTSUPP;
+	}
+	if (drm_gem_is_imported(obj)) {
+		struct drm_gem_dma_object *dma = to_drm_gem_dma_obj(obj);
+
+		if (!dma->sgt || !obj->import_attach) {
+			t8132_ext_direct_refused(out, fb, "no import mapping to clean");
+			return -EOPNOTSUPP;
+		}
+		/*
+		 * Its pages first, every frame (a walk of its entries, a few
+		 * microseconds; not cached per framebuffer, whose address may be
+		 * a freed one's): the sync goes through each entry's page.
+		 */
+		if (!t8132_ext_sgt_pages_ok(dma->sgt, obj->size)) {
+			t8132_ext_direct_refused(out, fb, t8132_ext_pages_refused);
+			return -EOPNOTSUPP;
+		}
+		dma_sync_sgtable_for_device(obj->import_attach->dev, dma->sgt, DMA_TO_DEVICE);
+	}
+	ret = iomfb_m4_ext_present_direct(owner, &d);
+	if (ret == -EOPNOTSUPP)
+		t8132_ext_direct_refused(out, fb, t8132_ext_pages_refused);
+	return ret ?: 2;
+}
+
+/*
+ * Present the primary plane's new frame: scanned out directly where it can
+ * be, else copied into the DCP and swapped in; 2 once a direct frame's swap
+ * is submitted, 1 if the commit has no new frame (no plane state), so
+ * nothing was tried. A copied framebuffer is read through its kernel
+ * mapping (dma-buf vmap for an imported one) inside CPU access.
  */
 static int t8132_ext_present(struct t8132_ext_out *out, struct drm_atomic_commit *state)
 {
@@ -223,6 +412,10 @@ static int t8132_ext_present(struct t8132_ext_out *out, struct drm_atomic_commit
 	obj = drm_gem_fb_get_obj(fb, 0);
 	if (!obj)
 		return -EINVAL;
+	/* Scanned out directly where it can be, else copied below. */
+	ret = t8132_ext_present_direct(out, owner, fb, obj);
+	if (ret != -ENOSPC && ret != -EOPNOTSUPP)
+		return ret;
 	if (!drm_gem_is_imported(obj)) {
 		struct drm_gem_dma_object *dma = to_drm_gem_dma_obj(obj);
 
@@ -273,11 +466,16 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 	struct drm_pending_vblank_event *event;
 	int ret;
 
+	/*
+	 * The event is held before the frame goes out: its swap's D590 may come
+	 * at any time from then on (t8132_ext_drm_flip_done()).
+	 */
+	event = t8132_ext_hold_event(out, cs);
 	ret = t8132_ext_present(out, state);
 	/* Its damage is lost with it: whole frames until one is shown. */
 	if (ret <= 0)
 		out->frame_lost = !!ret;
-	if (fb && !out->first_frame && ret <= 0) {
+	if (fb && !out->first_frame && (ret <= 0 || ret == 2)) {
 		out->first_frame = true;
 		dev_dbg(&out->pdev->dev, "%s: first frame %ux%u %p4cc, modifier %#llx: %d\n",
 			crtc->name, fb->width, fb->height, &fb->format->format, fb->modifier, ret);
@@ -285,9 +483,12 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
 		dev_info_ratelimited(&out->pdev->dev, "%s: frame not shown: %d\n",
 				     crtc->name, ret);
 	}
-	/* A shown frame's swap has completed (D590): its flip now, else a frame later. */
-	event = t8132_ext_hold_event(out, cs);
-	if (event)
+	/*
+	 * A copied frame's swap has completed (D590): its flip now, else a
+	 * frame later. A direct frame's comes with its D590 (or when its swap
+	 * is given up).
+	 */
+	if (event && ret != 2)
 		mod_delayed_work(system_wq, &out->flip_work, ret >= 0 ? 0 : msecs_to_jiffies(16));
 }
 
@@ -456,6 +657,59 @@ bool t8132_ext_connector(const struct drm_connector *connector)
 bool t8132_ext_plane(const struct drm_plane *plane)
 {
 	return plane && plane->funcs == &t8132_ext_plane_funcs;
+}
+
+bool t8132_ext_drm_in_commit(struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *cs;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, cs, i)
+		if (t8132_ext_crtc(crtc))
+			return true;
+	return false;
+}
+
+/*
+ * Every flip of these CRTCs in @state, before its old planes are cleaned up:
+ * a frame's flip comes with its swap's D590, or when the swap is given up
+ * (5 s, or at once when the link goes), so 6 s bound it. Until then the
+ * old framebuffer may still be scanned out: blocking commits return, and
+ * DRM lets go of it, only after.
+ */
+void t8132_ext_drm_wait_flips(struct drm_atomic_commit *state)
+{
+	/*
+	 * Called after drm_atomic_helper_commit_hw_done(): the CRTC states
+	 * belong to the next commit by then. Only the commit references this
+	 * state holds itself are used, as drm_atomic_helper_wait_for_flip_done().
+	 */
+	for (int i = 0; i < state->dev->mode_config.num_crtc; i++) {
+		struct drm_crtc_commit *commit = state->crtcs[i].commit;
+		struct drm_crtc *crtc = state->crtcs[i].ptr;
+
+		if (!crtc || !commit || !t8132_ext_crtc(crtc))
+			continue;
+		if (!wait_for_completion_timeout(&commit->flip_done, msecs_to_jiffies(6000)))
+			drm_err(crtc->dev, "[CRTC:%d:%s] flip not done in 6 s\n",
+				crtc->base.id, crtc->name);
+	}
+}
+
+/*
+ * The swap of @dcpext's last direct frame completed (D590) or was
+ * given up: its held flip event now. Any context but hard IRQ.
+ */
+void t8132_ext_drm_flip_done(struct device *dcpext)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&t8132_ext_lock, flags);
+	for (unsigned int i = 0; i < T8132_EXT_MAX; i++)
+		if (t8132_ext_live[i] && &t8132_ext_live[i]->pdev->dev == dcpext)
+			t8132_ext_send_event(t8132_ext_live[i]);
+	spin_unlock_irqrestore(&t8132_ext_lock, flags);
 }
 
 void t8132_ext_drm_hotplug(struct device *dcpext)
