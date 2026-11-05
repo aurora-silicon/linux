@@ -268,4 +268,24 @@ int parse_system_log_mnits(struct dcp_parse_ctx *handle,
 int parse_system_log_mnits_pairs(const void *blob, size_t size,
 				 struct dcp_system_ev_mnits *entry);
 
+/* One colour element as the firmware lists it; -1 for an absent field. */
+struct dcp_color_element {
+	s64 id, depth, range, eotf, encoding, colorimetry, score;
+	bool is_virtual;
+	/* The timing lists it as unsafe or as needing DSC (timing walks only). */
+	bool restricted;
+};
+
+typedef void (*dcp_color_element_fn)(void *data, const struct dcp_color_element *element);
+int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
+			    dcp_color_element_fn emit, void *data, bool *interlaced);
+
+/* A timing entry's ID and active size (0 where not given) */
+struct dcp_timing_id {
+	u32 id, width, height;
+};
+
+int dcp_parse_timing_ids(const void *blob, size_t len, struct dcp_timing_id *out,
+			 unsigned int max);
+
 #endif

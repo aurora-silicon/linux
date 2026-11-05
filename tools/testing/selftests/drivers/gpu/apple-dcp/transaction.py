@@ -37,7 +37,7 @@ def controls(ROOT):
     actual=actual.replace('struct typec_mux_state { void *alt;', 'struct typec_altmode { unsigned svid; };\nstruct typec_mux_state { struct typec_altmode *alt;',1)
     actual=actual.replace('struct connector { bool connected; };','struct encoder { unsigned possible_crtcs; };\nstruct connector { bool connected,edid_live,edid_invalidation_pending; void *dcp; struct encoder *port_encoder; unsigned candidate_crtcs; int bl_sync_wq; };\n#define apple_connector connector\nstruct mux_control { int unused; };',1)
     actual=actual.replace('struct apple_dcp { int external_lock,external_error;', '''struct apple_dcp { int external_lock,external_error;
-     bool external_power_attempted,dptx_tunnel,tb_clock_ok,fixed_route_selected;
+     bool external_power_attempted,dptx_tunnel,tb_clock_ok,tb_clock_refused,fixed_route_selected;
      int tb_lock; unsigned typec_generation,dptx_dfp_port,dptx_phy,fixed_dptx_phy,fixed_mux_index;
      void *tb_dpin_set_active,*tb_dpin_ctx,*phy,*fixed_phy;
      struct mux_control *xbar,*fixed_xbar;
@@ -60,6 +60,10 @@ def controls(ROOT):
     extra=r'''
     /* actual DCP leaves */
     #define WRITE_ONCE(x,v) ((x)=(v))
+    /* No T8132 dcpext here: every route has DP alt mode (production: the dcpext compatible). */
+    struct apple_dcp_typec_route;
+    static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route) { (void)route; return false; }
+    #define dev_info_once(...) ((void)0)
     #define USB_TYPEC_DP_SID 0xff01
     #define TYPEC_DP_STATE_A 10
     #define TYPEC_DP_STATE_F 15

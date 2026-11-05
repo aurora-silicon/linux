@@ -35,6 +35,7 @@
 #include <linux/pci-apple.h>
 #include <linux/soc/apple/pci-apple-piodma.h>
 #include <linux/pci-ecam.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
@@ -203,6 +204,11 @@ struct hw_info {
 	bool tunnel_intr2axi;
 	bool t8132_reset;
 	bool msimap_by_vector;
+	/*
+	 * In suspend-to-idle a tunnel host whose power domain is not always-on
+	 * keeps its link while the domain stays on, see apple_pcie_hold_domain().
+	 */
+	bool s2idle_hold_domain;
 };
 
 static const struct hw_info t8103_hw = {
@@ -298,6 +304,7 @@ static const struct hw_info t8132_pciec_hw = {
 	.tunneled		= true,
 	.t8132_reset		= true,
 	.msimap_by_vector	= true,
+	.s2idle_hold_domain	= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -362,6 +369,10 @@ struct apple_pcie {
 	bool			bus_stopped;
 	bool			reset_on_resume;
 	bool			link_kept;
+	/* a power domain that is not always-on, held on for this sleep */
+	struct notifier_block	pd_nb;
+	bool			pd_held;
+	unsigned int		pd_vetoed;
 	bool			resume_failed; /* cleared only by teardown and reprobe */
 	struct reset_control	*reset;
 	u16			managed_sids;
@@ -3660,20 +3671,87 @@ static bool apple_pcie_tunnel_link_healthy(struct apple_pcie *pcie)
 }
 
 /*
+ * genpd powers a domain off for system sleep once every device in it is
+ * through its noirq suspend. A host that keeps its link refuses that for
+ * the sleep: the domain stays on, and its parents with it. IRQ-safe domains
+ * call this in atomic context, so it only counts.
+ */
+static int apple_pcie_pd_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_pcie *pcie = container_of(nb, struct apple_pcie, pd_nb);
+
+	if (action != GENPD_NOTIFY_PRE_OFF)
+		return NOTIFY_OK;
+	pcie->pd_vetoed++;
+	return notifier_from_errno(-EBUSY);
+}
+
+/*
+ * Hold a power domain that is not always-on through this sleep. ACIO keeps
+ * the domain of its PCIe-C host on for as long as a cable is connected (its
+ * power-domain devices are syscore devices, which system sleep leaves
+ * alone), so a host with a link up finds its domain on here, and the veto
+ * makes sure it stays on. A domain that is already off has no link to keep.
+ */
+static int apple_pcie_hold_domain(struct apple_pcie *pcie)
+{
+	int ret;
+
+	pcie->pd_vetoed = 0;
+	pcie->pd_nb.notifier_call = apple_pcie_pd_notify;
+	ret = dev_pm_genpd_add_notifier(pcie->dev, &pcie->pd_nb);
+	if (ret)
+		return ret;
+	if (!dev_pm_genpd_is_on(pcie->dev)) {
+		dev_pm_genpd_remove_notifier(pcie->dev);
+		return -ENODEV;
+	}
+	pcie->pd_held = true;
+	return 0;
+}
+
+static void apple_pcie_release_domain(struct apple_pcie *pcie)
+{
+	if (!pcie->pd_held)
+		return;
+	dev_pm_genpd_remove_notifier(pcie->dev);
+	pcie->pd_held = false;
+	dev_dbg(pcie->dev, "PCIe-C power domain released after suspend-to-idle (%u power-offs refused)\n",
+		pcie->pd_vetoed);
+}
+
+/*
  * In suspend-to-idle ACIO and the router links stay powered, so an up
  * tunnel can simply be left running. The functions below keep their state
  * and resume like any other PCIe device; nothing has to be re-trained.
+ * The host's power domain must stay on for that: an always-on one does;
+ * on a host that opts in (s2idle_hold_domain), any other is held on for the
+ * sleep (apple_pcie_hold_domain()).
  */
 static bool apple_pcie_keep_link(struct apple_pcie *pcie)
 {
+	int ret;
+
 	if (!READ_ONCE(s2idle_keep_link) || !pm_suspend_no_platform())
 		return false;
-	if (!(pcie->kernel_init || pcie->tunnel_cold_init) ||
-	    !pcie->power_retained)
+	if (!(pcie->kernel_init || pcie->tunnel_cold_init))
 		return false;
 	if (pcie->bus_stopped || pcie->resume_failed)
 		return false;
-	return apple_pcie_tunnel_link_healthy(pcie);
+	if (!pcie->power_retained) {
+		if (!pcie->hw->s2idle_hold_domain)
+			return false;
+		ret = apple_pcie_hold_domain(pcie);
+		if (ret) {
+			dev_dbg(pcie->dev, "PCIe-C power domain not held (%d): link not kept\n",
+				ret);
+			return false;
+		}
+	}
+	if (apple_pcie_tunnel_link_healthy(pcie))
+		return true;
+	apple_pcie_release_domain(pcie);
+	return false;
 }
 
 static void apple_pcie_stop_for_sleep(struct device *dev)
@@ -3782,6 +3860,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 
 	if (!pcie->hw->tunneled)
 		return 0;
+	/* The domain's hold for the sleep ends first, whatever follows. */
+	apple_pcie_release_domain(pcie);
 	if (pcie->resume_failed)
 		return -EIO;
 	/*
