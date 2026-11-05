@@ -106,6 +106,11 @@ struct tb_tunnel {
 	int allocated_up;
 	int allocated_down;
 	bool bw_mode;
+	/* host cap of a DP tunnel's link rate (Mb/s per lane, 0 none), and its bandwidth */
+	u32 max_rate;
+	int max_bw;
+	/* under TB_HOST_DP_HBR2_MAX: the link rate the DPTX was offered (Mb/s per lane) */
+	u32 host_rate;
 	bool dprx_started;
 	bool dprx_canceled;
 	u64 host_dp_generation;
@@ -134,6 +139,10 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
 					void *callback_data);
 void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel);
 bool tb_apple_nhi_needs_bw_grant(struct tb_nhi *nhi);
+int tb_dp_cap_bandwidth(struct tb_tunnel *tunnel, int bw);
+int tb_dp_reduce_bandwidth_shared(int max_bw, u32 in_rate, u32 in_lanes, u32 out_rate,
+				  u32 out_lanes, u32 shared_rate, u32 *new_rate, u32 *new_lanes);
+u32 tb_dp_host_shared_rate(const struct tb_tunnel *tunnel);
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,
 				     int max_up, int max_down,

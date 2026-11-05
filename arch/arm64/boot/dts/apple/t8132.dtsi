@@ -1020,6 +1020,18 @@
 
 	};
 
+	/*
+	 * The ATC's display crossbar. Boards enable it with the external
+	 * display coprocessors whose Type-C routes use it.
+	 */
+	atc0_dpxbar: mux@40304c000 {
+		compatible = "apple,t8132-display-crossbar";
+		reg = <0x4 0x0304c000 0x0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
+		status = "disabled";
+	};
+
 	dwc3_0_dart_0: iommu@402f00000 {
 		status = "disabled";
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
@@ -1077,6 +1089,18 @@
 		mode-switch;
 
 
+	};
+
+	/*
+	 * The ATC's display crossbar. Boards enable it with the external
+	 * display coprocessors whose Type-C routes use it.
+	 */
+	atc1_dpxbar: mux@40b04c000 {
+		compatible = "apple,t8132-display-crossbar";
+		reg = <0x4 0x0b04c000 0x0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
+		status = "disabled";
 	};
 
 	dwc3_1_dart_0: iommu@40af00000 {
