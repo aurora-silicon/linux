@@ -66,6 +66,23 @@ properties:
       down, and no member enables it again until the driver is reloaded.
       A member needs its fault interrupt.
 
+  apple,bop-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 24
+    maxItems: 24
+    description:
+      SN012776 only. The brownout prevention registers BOP_CFG0 to BOP_CFG24,
+      in register order, as the Mac's boot ADT gives them for the amplifier's
+      group (its bop-config). The boot loader copies it into the device tree;
+      without it the block keeps its reset values.
+
+  apple,amp-dcblocker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description:
+      SN012776 only. The DC blocker setting of the amplifier's group, as the
+      Mac's boot ADT gives it (its amp-dcblocker-config), copied by the boot
+      loader. Absent when the ADT has none.
+
   apple,deferred-shutdown:
     type: boolean
     description:
