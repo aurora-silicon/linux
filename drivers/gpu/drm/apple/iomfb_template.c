@@ -1387,7 +1387,7 @@ static void iomfbep_cb_enable_backlight_message_ap_gated(struct apple_dcp *dcp,
 /* Chunked data transfer for property dictionaries */
 static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 {
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp))
 		return ext26_prop_start(dcp, *length);
 #endif
@@ -2259,7 +2259,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	u32 handle;
 #endif
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp))
 		return; /* Native26 publishes A473 only after a successful A413. */
 #endif
@@ -3574,7 +3574,7 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 			       , struct drm_plane_state *primary
 #endif
 			       )
@@ -3584,7 +3584,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
 
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp)) {
 		u32 pitch = primary && primary->fb ? primary->fb->pitches[0] : dcp->ext26_stride;
 
@@ -3674,7 +3674,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	kref_get(&cookie->refcount);
 
 	dcp->swap_submit_timestamp = 0;
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp)) {
 		ret = ext26_open_client(dcp);
 		if (ret) {
@@ -3740,7 +3740,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			dev_info(dcp->dev, "set_digital_out_mode returned %#x\n",
 				 READ_ONCE(cookie->status));
 	}
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_H17(DCP_FW_VER)
 	if (dcp_is_ext26(dcp)) {
 		ret = READ_ONCE(cookie->replied) && !READ_ONCE(cookie->status) ? 0 : -EREMOTEIO;
 		kref_put(&cookie->refcount, release_wait_cookie);
