@@ -2032,7 +2032,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	int ret = 0;
 
 	if (acio->type7 !=
-	    of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
+	    !!of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
 		ret = dev_err_probe(&pdev->dev, -EINVAL, "ACIO/NHI generation mismatch\n");
 		goto err;
 	}
