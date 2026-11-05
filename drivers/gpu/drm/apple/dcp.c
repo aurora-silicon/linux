@@ -1793,14 +1793,13 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	/* a tiled display's second half comes in on the port's dpin1 */
 	dfp_port = port && READ_ONCE(dcp->split.active) ? 2 : dcp->dptx_dfp_port;
-	/* Compact DPTX (desktop 26.x) has no connection validation call. */
-	if (!dcp_ext_dptx_607(dcp) && !compact) {
 	if (dcp_is_ext26(dcp)) {
 		ret = dcp_direct_crossbar_link(dcp, false);
 		if (ret)
 			goto out_unlock;
 	}
-	if (!dcp_ext_dptx_607(dcp)) {
+	/* Compact DPTX (desktop 26.x) has no connection validation call. */
+	if (!dcp_ext_dptx_607(dcp) && !compact) {
 		ret = dptxport_validate_connection(dcp->dptxport[port].service,
 						   dfp_port,
 						   dcp->dptx_phy, dcp->dptx_die);
