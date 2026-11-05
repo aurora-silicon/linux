@@ -207,11 +207,56 @@
 	/delete-property/ power-domain-names;
 };
 
+/*
+ * The main PMIC is a Chapel at 0xb (ADT nub-spmi0 spmi-chapelL1-b), not the
+ * J616s's Abbey at 0xe. Its nvmem cells and RTC alarm registers are at the
+ * Abbey offsets (ADT info-rtc_alarm_*).
+ */
 &nub_spmi0 {
-	/delete-property/ interrupt-controller;
-	/delete-property/ #interrupt-cells;
-	/delete-property/ interrupt-parent;
-	/delete-property/ interrupts;
+	/delete-node/ pmic@e;
+
+	pmic@b {
+		compatible = "apple,chapel-pmic", "apple,spmi-nvmem";
+		reg = <0xb SPMI_USID>;
+
+		pmu_rtc: rtc {
+			compatible = "apple,t6041-pmu-rtc";
+			interrupt-parent = <&nub_spmi0>;
+			interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+			nvmem-cells = <&rtc_offset>;
+			nvmem-cell-names = "rtc_offset";
+			wakeup-source;
+		};
+
+		nvmem-layout {
+			compatible = "fixed-layout";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			rtc_offset: rtc-offset@2100 {
+				reg = <0x2100 0x6>;
+			};
+
+			boot_stage: boot-stage@f801 {
+				reg = <0xf801 0x1>;
+			};
+
+			boot_error_count: boot-error-count@f802,0 {
+				reg = <0xf802 0x1>;
+				bits = <0 4>;
+			};
+
+			panic_count: panic-count@f802,4 {
+				reg = <0xf802 0x1>;
+				bits = <4 4>;
+			};
+
+			shutdown_flag: shutdown-flag@f80f,3 {
+				reg = <0xf80f 0x1>;
+				bits = <3 1>;
+			};
+		};
+	};
 };
 
 &usb_drd0_dart_0 {
