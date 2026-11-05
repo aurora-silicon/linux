@@ -180,6 +180,8 @@ struct isp_buffer {
 	} vb;
 	struct list_head link;
 	struct isp_surf surfs[4];
+	u64 tag;
+	int return_state;
 };
 
 struct isp_message {
@@ -207,14 +209,18 @@ struct apple_isp {
 	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];
 	struct isp_surf *capmeta_surfs[ISP_CAPMETA_BUFFERS];
 	struct isp_surf *bt_surf;
-	struct list_head bufs_pending, bufs_submitted;
+	struct list_head bufs_pending, bufs_submitted, bufs_returned;
 	void *cmd_virt;
 	u64 cmd_iova, fw_iova_mask;
 	int ipc_error, buf_lock, video_lock;
 	unsigned int current_ch;
 	struct vb2_queue vbq;
 	unsigned long state;
-	void *exposure_priority;
+	void *exposure_priority, *power_line_frequency;
+	bool ipc_failed;
+	int fw_state;
+	u64 buffer_tag;
+	unsigned long meta_returned;
 	unsigned int sequence;
 };
 
@@ -293,6 +299,17 @@ static void apple_isp_wdt_stop(struct apple_isp *isp)
 
 static void apple_isp_stop_capture(struct apple_isp *isp);
 
+/* These fixtures exercise the non-P010/J613 path. P010 has kernel KUnit coverage. */
+#define ISP_FW_DEAD 3
+#define __set_bit set_bit
+static bool isp_is_p010(struct apple_isp *isp) { return false; }
+static bool isp_supports_p010(struct apple_isp *isp) { return false; }
+static unsigned int isp_num_meta(struct apple_isp *isp) { return ISP_MAX_BUFFERS; }
+static unsigned int isp_num_rendered(struct apple_isp *isp) { return ISP_MAX_BUFFERS; }
+static int isp_ipc_resync(struct apple_isp *isp) { return 0; }
+static void isp_meta_read_exposure(struct apple_isp *isp, struct isp_surf *surf) { }
+static bool isp_p010_buffer_matches(struct isp_format *fmt, struct isp_buffer *buf, const struct isp_buflist_buffer *desc) { return false; }
+static void apple_isp_firmware_halt(struct apple_isp *isp) { quiescent = true; }
 /* DRIVER FUNCTIONS */
 int main(void)
 {

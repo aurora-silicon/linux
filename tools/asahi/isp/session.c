@@ -42,11 +42,13 @@ static void check(bool ok, int line)
 #define CHECK(x) check((x), __LINE__)
 
 struct isp_message {
-	u64 arg0, arg1, arg2;
+	u64 arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7;
 };
 
 struct isp_channel {
-	struct isp_message req;
+	struct isp_message req, rsp;
+	unsigned long deadline;
+	bool deadline_active;
 	unsigned int doorbell, num, cursor, remaining;
 	int lock;
 };
@@ -58,7 +60,8 @@ struct hardware {
 struct apple_isp {
 	int ipc_error, wait, fw_state, irq, vbq, buf_lock;
 	unsigned long state;
-	bool ipc_quiescing;
+	bool ipc_quiescing, ipc_failed;
+	struct isp_channel *ipc_stale;
 	struct isp_channel *chan_io, *chan_sm, *chan_tm, *chan_bt;
 	const struct hardware *hw;
 	void *dev, *wq, *cmd_virt;
@@ -283,6 +286,11 @@ static void isp_free_released_surfaces(struct apple_isp *isp)
 	freed_released++;
 }
 
+static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, sizeof(v)); return v; }
+#define IS_ENABLED(x) 0
+#define jiffies 0
+static bool isp_is_p010(struct apple_isp *isp) { return false; }
+static int isp_ipc_resync(struct apple_isp *isp) { return 0; }
 /* DRIVER FUNCTIONS */
 int main(void)
 {
