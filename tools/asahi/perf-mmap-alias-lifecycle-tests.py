@@ -10,9 +10,11 @@ and the internal.h inline helpers) into a host harness and drives full
 lifecycles through it:
 
   - duplicate aliases of the normal ring: charge per alias, uncharge once at
-    final close (user-reported leak),
+    final close (user-reported leak), in both close orders -- aliases first
+    and the original mapping first while every alias is still live,
   - duplicate aliases of the AUX area: charge per alias, uncharge once at the
-    last AUX close (user-reported leak),
+    last AUX close (user-reported leak), in both close orders -- AUX first
+    and the normal ring VMA first while the AUX area stays live,
   - failed aliases: AUX first-map failures (-EPERM limit check, rb_alloc_aux
     failure, early -EINVAL), and map_range() failures through the real
     perf_mmap() dispatcher error path, both for a first mapping (minimal
@@ -30,7 +32,9 @@ hardware or a booted kernel; it is evidence about the source's charge/
 uncharge/refcount behaviour.
 
 Assertions encode the desired invariant (every counter and refcount returns
-to its initial value when a lifecycle completes).  A scenario that ends with
+to its initial value when a lifecycle completes; perf_mlock and locked_vm
+are checked individually, so a transfer between them cannot mask a leak).
+A scenario that ends with
 a nonzero counter therefore FAILS and prints the exact leaked page count --
 leaks are reported, not hidden.  The tool exits nonzero if any invariant
 broke: a tree that charges every alias fails the duplicate-alias scenarios;
@@ -303,6 +307,7 @@ static struct mutex *h_mutex_guard_fn(struct mutex *m)
 #define RING_BUFFER_WRITABLE 0x01
 #define atomic_long_sub(v, p) (*(p) -= (v))
 #define atomic_long_add(v, p) (*(p) += (v))
+#define atomic_long_set(p, v) (*(p) = (v))
 #define atomic_long_read(p) (*(p))
 #define atomic64_sub(v, p) (*(p) -= (v))
 #define atomic64_add(v, p) (*(p) += (v))
@@ -367,7 +372,10 @@ struct perf_event {
 	int state;
 	struct perf_event_attr attr;
 	struct perf_event_context *ctx;
-	refcount_t refcount;
+	/* atomic_long_t as in the tree: the rb->event_list walk in
+	 * perf_mmap_close() takes a ref on every event, so the stub must
+	 * hold list-sized counts */
+	atomic_long_t refcount;
 	refcount_t mmap_count;
 	struct mutex mmap_mutex;
 	struct perf_buffer *rb;
@@ -531,7 +539,7 @@ static void reset_all(unsigned int mm_shift)
 	ev.ctx = &ctx;
 	ev.state = 0;
 	mutex_init(&ev.mmap_mutex);
-	refcount_set(&ev.refcount, 2);
+	atomic_long_set(&ev.refcount, 2);
 	mm.page_shift = mm_shift;
 	file.private_data = &ev;
 	test_user.perf_mlock = 0;
@@ -582,9 +590,27 @@ static void dump(const char *tag)
 	       rb_allocs, rb_frees, aux_allocs, aux_frees, warn_count);
 }
 
-static long user_leaked(void)
+static long user_perf_mlock(void) { return test_user.perf_mlock; }
+static long user_locked_vm(void) { return test_user.locked_vm; }
+
+/* The tree charges exactly one user counter ($charge_counter) and must
+ * leave the other ($spare_counter) untouched: assert both individually,
+ * so a transfer between them cannot pose as unchanged or balanced. */
+static int user_charge_broken(const char *what, long want)
 {
-	return test_user.perf_mlock + test_user.locked_vm;
+	int bad = 0;
+
+	if (user_$charge_counter() != want) {
+		printf("    OBSERVED %s: $charge_counter %ld, expected %ld\n",
+		       what, user_$charge_counter(), want);
+		bad = 1;
+	}
+	if (user_$spare_counter() != 0) {
+		printf("    OBSERVED %s: $spare_counter nonzero (%ld), expected 0\n",
+		       what, user_$spare_counter());
+		bad = 1;
+	}
+	return bad;
 }
 
 static int invariants_broken(const char *what)
@@ -592,9 +618,16 @@ static int invariants_broken(const char *what)
 	int bad = 0;
 	struct perf_buffer *rb = ev.rb;
 
-	if (user_leaked()) {
-		printf("    OBSERVED %s: user counter leaked %ld pages\n",
-		       what, user_leaked());
+	/* each user counter individually: a +leak on one and a -leak on
+	 * the other would hide behind a summed total */
+	if (user_perf_mlock()) {
+		printf("    OBSERVED %s: perf_mlock leaked %ld pages\n",
+		       what, user_perf_mlock());
+		bad = 1;
+	}
+	if (user_locked_vm()) {
+		printf("    OBSERVED %s: locked_vm leaked %ld pages\n",
+		       what, user_locked_vm());
 		bad = 1;
 	}
 	if (mm.pinned_vm) {
@@ -619,22 +652,17 @@ static int invariants_broken(const char *what)
 	return bad;
 }
 
-/* Assert the user counter and pinned_vm individually at an intermediate
+/* Assert the user counters and pinned_vm individually at an intermediate
  * step, so a charge/uncharge mismatch on either counter is reported on
  * its own instead of only via the final zero check. */
 static int check_split(const char *what, long want_user, long want_pinned)
 {
-	int bad = 0;
+	int bad = user_charge_broken(what, want_user);
 
-	if (user_leaked() != want_user) {
-		printf("    OBSERVED %s: user counter %ld, expected %ld\n",
-		       what, user_leaked(), want_user);
-		bad = 1;
-	}
 	if (mm.pinned_vm != want_pinned) {
 		printf("    OBSERVED %s: pinned_vm %ld, expected %ld\n",
 		       what, (long)mm.pinned_vm, want_pinned);
-		bad = 1;
+		bad |= 1;
 	}
 	return bad;
 }
@@ -687,7 +715,11 @@ static int sc_rb_baseline(unsigned long vma_pages, unsigned long mm_shift, long 
 	return invariants_broken("baseline ring lifecycle");
 }
 
-static int sc_rb_duplicate(unsigned long vma_pages, unsigned long mm_shift, long split)
+/* One duplicate-ring-alias lifecycle.  Close order: aliases first when
+ * orig_first is 0; the original mapping first, while every alias is
+ * still live, when orig_first is 1. */
+static int rb_dup_cycle(unsigned long vma_pages, unsigned long mm_shift,
+			long split, int orig_first)
 {
 	struct vm_area_struct v[4];	/* 0 = ring, 1..3 = aliases */
 	int i, bad = 0;
@@ -716,17 +748,46 @@ static int sc_rb_duplicate(unsigned long vma_pages, unsigned long mm_shift, long
 		/* an alias shares the already-locked pages: no new charge */
 		bad |= check_split("after alias mmap", user_first, pinned_first);
 	}
-	for (i = 1; i < 4; i++) {
-		perf_mmap_close(&v[i]);
-		dump("after alias close");
-		bad |= check_split("after alias close", user_first, pinned_first);
+	if (orig_first) {
+		/* alternate order: the original mapping closes while all
+		 * three aliases are still live; the charge must stay put
+		 * until the last alias closes */
+		perf_mmap_close(&v[0]);
+		dump("after original close");
+		bad |= check_split("after original close", user_first,
+				   pinned_first);
+		for (i = 1; i < 4; i++) {
+			perf_mmap_close(&v[i]);
+			dump(i == 3 ? "after final close" : "after alias close");
+			/* the last close completes the lifecycle: its zero
+			 * check is invariants_broken() below */
+			if (i < 3)
+				bad |= check_split("after alias close",
+						   user_first, pinned_first);
+		}
+	} else {
+		for (i = 1; i < 4; i++) {
+			perf_mmap_close(&v[i]);
+			dump("after alias close");
+			bad |= check_split("after alias close", user_first,
+					   pinned_first);
+		}
+		perf_mmap_close(&v[0]);
+		dump("after final close");
 	}
-	perf_mmap_close(&v[0]);
-	dump("after final close");
-	bad |= invariants_broken("duplicate ring aliases (3)");
+	bad |= invariants_broken(orig_first
+				 ? "duplicate ring aliases (3), original closed first"
+				 : "duplicate ring aliases (3)");
 	printf("    expected first charge: %ld user + %ld pinned; aliases add no charge\n",
 	       user_first, pinned_first);
 	return bad;
+}
+
+static int sc_rb_duplicate(unsigned long vma_pages, unsigned long mm_shift, long split)
+{
+	/* both close orders must balance */
+	return rb_dup_cycle(vma_pages, mm_shift, split, 0) |
+	       rb_dup_cycle(vma_pages, mm_shift, split, 1);
 }
 
 static int sc_rb_alias_map_range_fail(long split)
@@ -838,7 +899,10 @@ static int sc_aux_baseline(void)
 	return bad;
 }
 
-static int sc_aux_duplicate(long split)
+/* One duplicate-AUX-alias lifecycle.  Close order: AUX aliases then the
+ * normal ring VMA when ring_first is 0; the normal ring VMA first,
+ * while the AUX area stays live, when ring_first is 1. */
+static int aux_dup_cycle(long split, int ring_first)
 {
 	struct vm_area_struct vring, vaux[4];
 	int i, bad = 0;
@@ -882,6 +946,15 @@ static int sc_aux_duplicate(long split)
 		bad |= check_split("after aux alias mmap", ring_chg + aux_user,
 				   aux_pinned);
 	}
+	if (ring_first) {
+		/* alternate order: the normal ring VMA closes while the
+		 * AUX area stays live; the AUX mappings still hold
+		 * rb->mmap_count, so neither charge may uncharge yet */
+		perf_mmap_close(&vring);
+		dump("after ring close (aux live)");
+		bad |= check_split("after ring close (aux live)",
+				   ring_chg + aux_user, aux_pinned);
+	}
 	for (i = 1; i < 4; i++) {
 		perf_mmap_close(&vaux[i]);
 		dump("after aux alias close");
@@ -889,11 +962,25 @@ static int sc_aux_duplicate(long split)
 				   aux_pinned);
 	}
 	perf_mmap_close(&vaux[0]);
-	dump("after last aux close (aux uncharge)");
-	perf_mmap_close(&vring);
-	dump("after ring close");
-	bad |= invariants_broken("duplicate aux aliases (3)");
+	if (ring_first) {
+		/* the last AUX close empties rb->mmap_count: the ring and
+		 * AUX charges uncharge together here */
+		dump("after last aux close (all uncharge)");
+	} else {
+		dump("after last aux close (aux uncharge)");
+		perf_mmap_close(&vring);
+		dump("after ring close");
+	}
+	bad |= invariants_broken(ring_first
+				 ? "duplicate aux aliases (3), ring closed first"
+				 : "duplicate aux aliases (3)");
 	return bad;
+}
+
+static int sc_aux_duplicate(long split)
+{
+	/* both close orders must balance */
+	return aux_dup_cycle(split, 0) | aux_dup_cycle(split, 1);
 }
 
 static int sc_aux_limit_fail(void)
@@ -919,12 +1006,12 @@ static int sc_aux_limit_fail(void)
 		return 1;
 	}
 	dump("after REJECTED aux mmap (-EPERM)");
-	if (user_leaked() != charge_expect || ev.rb->mmap_count.refs != 1 ||
-	    ev.rb->aux_mmap_count.refs != 0 || ev.mmap_count.refs != 1 ||
-	    aux_allocs != 0) {
+	bad |= user_charge_broken("after REJECTED aux mmap (-EPERM)",
+				  charge_expect);
+	if (ev.rb->mmap_count.refs != 1 || ev.rb->aux_mmap_count.refs != 0 ||
+	    ev.mmap_count.refs != 1 || aux_allocs != 0) {
 		printf("    UNEXPECTED unwound state after -EPERM aux "
-		       "(leak=%ld charge=%ld rbmc=%d auxmc=%d evmc=%d auxa=%d)\n",
-		       user_leaked(), charge_expect,
+		       "(rbmc=%d auxmc=%d evmc=%d auxa=%d)\n",
 		       ev.rb->mmap_count.refs, ev.rb->aux_mmap_count.refs,
 		       ev.mmap_count.refs, aux_allocs);
 		bad = 1;
@@ -958,12 +1045,12 @@ static int sc_aux_alloc_fail(void)
 	}
 	rb_alloc_aux_fail = 0;
 	dump("after FAILED aux mmap (rb_alloc_aux)");
-	if (user_leaked() != charge_expect || ev.rb->mmap_count.refs != 1 ||
-	    ev.rb->aux_mmap_count.refs != 0 || ev.mmap_count.refs != 1 ||
-	    aux_allocs != 0) {
+	bad |= user_charge_broken("after FAILED aux mmap (rb_alloc_aux)",
+				  charge_expect);
+	if (ev.rb->mmap_count.refs != 1 || ev.rb->aux_mmap_count.refs != 0 ||
+	    ev.mmap_count.refs != 1 || aux_allocs != 0) {
 		printf("    UNEXPECTED unwound state after rb_alloc_aux failure "
-		       "(leak=%ld charge=%ld rbmc=%d auxmc=%d evmc=%d auxa=%d)\n",
-		       user_leaked(), charge_expect,
+		       "(rbmc=%d auxmc=%d evmc=%d auxa=%d)\n",
 		       ev.rb->mmap_count.refs, ev.rb->aux_mmap_count.refs,
 		       ev.mmap_count.refs, aux_allocs);
 		bad = 1;
@@ -978,7 +1065,7 @@ static int sc_aux_alias_size_reject(void)
 	struct vm_area_struct vring, vaux, vbad;
 	struct perf_buffer *rb;
 	int bad = 0;
-	long before;
+	long before_mlock, before_locked;
 
 	reset_all(PAGE_SHIFT);
 	vring = make_vma_bytes(17 << PAGE_SHIFT, 0);
@@ -993,7 +1080,8 @@ static int sc_aux_alias_size_reject(void)
 		printf("    UNEXPECTED aux mmap failed\n");
 		return 1;
 	}
-	before = user_leaked();
+	before_mlock = user_perf_mlock();
+	before_locked = user_locked_vm();
 
 	/* A wrong-size alias must be rejected before any refcount or charge. */
 	vbad = make_vma_bytes(4 << PAGE_SHIFT, aux_pgoff_target);
@@ -1002,7 +1090,9 @@ static int sc_aux_alias_size_reject(void)
 		return 1;
 	}
 	dump("after REJECTED wrong-size aux alias");
-	if (user_leaked() != before || rb->mmap_count.refs != 2 ||
+	if (user_perf_mlock() != before_mlock ||
+	    user_locked_vm() != before_locked ||
+	    rb->mmap_count.refs != 2 ||
 	    rb->aux_mmap_count.refs != 1 || ev.mmap_count.refs != 2) {
 		printf("    UNEXPECTED state after rejected alias\n");
 		bad = 1;
@@ -1093,13 +1183,15 @@ static int sc_aux_first_map_range_fail(void)
 	/* perf_mmap_close() must have unwound the whole AUX allocation:
 	 * the ring keeps its own charge, the AUX charge and allocation
 	 * are gone again, each counter checked individually */
-	if (user_leaked() != charge_expect || mm.pinned_vm != 0 ||
+	bad |= user_charge_broken("after FAILED first aux mmap (map_range)",
+				  charge_expect);
+	if (mm.pinned_vm != 0 ||
 	    ev.rb->mmap_count.refs != 1 || ev.rb->aux_mmap_count.refs != 0 ||
 	    ev.mmap_count.refs != 1 || aux_allocs != aux_frees) {
 		printf("    UNEXPECTED unwound state after failed first aux "
-		       "(leak=%ld pinned=%ld rbmc=%d auxmc=%d evmc=%d "
+		       "(pinned=%ld rbmc=%d auxmc=%d evmc=%d "
 		       "auxa=%d auxf=%d)\n",
-		       user_leaked(), (long)mm.pinned_vm,
+		       (long)mm.pinned_vm,
 		       ev.rb->mmap_count.refs, ev.rb->aux_mmap_count.refs,
 		       ev.mmap_count.refs, aux_allocs, aux_frees);
 		bad = 1;
@@ -1363,6 +1455,9 @@ def build(tree, out):
         'rb_data_shift': ('\trb->data_page_shift = %s;' % data_shift_expr)
                          if data_shift_expr else '\t/* none */',
         'rb_init': init or '\t/* tree leaves mmap_count at 0 */',
+        'charge_counter': counter,
+        'spare_counter': 'locked_vm' if counter == 'perf_mlock'
+                         else 'perf_mlock',
     })
     path = out / (tree.name + '.c')
     path.write_text(source)
