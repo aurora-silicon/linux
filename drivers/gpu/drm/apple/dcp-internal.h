@@ -444,7 +444,8 @@ struct apple_dcp {
 	u32 afk_power_gen;
 	bool external;
 	/*
-	 * T8122 dcpext: the panel's DRM device never waits on this processor.
+	 * A failsafe dcpext (dcp_ext_is_failsafe(): T8122's, T6041's, T6050's):
+	 * the DRM device of the other displays never waits on this processor.
 	 * A probe or bind failure leaves it in the device as an unusable pipe
 	 * (ext_dead): no CRTC, Type-C routes disabled or ignored, RTKit
 	 * messages dropped. See dcp_platform_probe().
