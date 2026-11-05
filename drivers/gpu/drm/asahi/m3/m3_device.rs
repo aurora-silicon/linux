@@ -7,10 +7,9 @@
 use kernel::{
     bindings, c_str,
     device::Core,
-    devres::Devres,
     error::to_result,
     io::{
-        mem::IoMem,
+        mem::DevresIoMem,
         Io,
         IoBase,
     },
@@ -28,8 +27,8 @@ const ASC_CPU_RUN: u32 = 1 << 4;
 
 pub(crate) struct Device {
     dev: ARef<platform::Device>,
-    asc: Devres<IoMem<'static, 0x4000>>,
-    sgx: Devres<IoMem<'static>>,
+    asc: DevresIoMem<0x4000>,
+    sgx: DevresIoMem,
     firmware: Firmware,
     core_mask: u64,
     soc: &'static Soc,

@@ -991,7 +991,7 @@ static FIRMWARE_START: policy::StartLatch = policy::StartLatch::new();
 fn pin_module() -> bool {
     // SAFETY: THIS_MODULE is this module, whose code is running; try_module_get fails once
     // removal has begun instead of reviving the reference count.
-    unsafe { kernel::bindings::try_module_get(crate::THIS_MODULE.as_ptr()) }
+    unsafe { kernel::bindings::try_module_get(kernel::module::this_module::<crate::LocalModule>().as_ptr()) }
 }
 /// Without module unloading there is no removal to race.
 #[cfg(not(CONFIG_MODULE_UNLOAD))]
@@ -1000,7 +1000,7 @@ fn pin_module() -> bool { true }
 #[cfg(CONFIG_MODULE_UNLOAD)]
 fn unpin_module() {
     // SAFETY: called only to drop a reference pin_module took.
-    unsafe { kernel::bindings::module_put(crate::THIS_MODULE.as_ptr()) };
+    unsafe { kernel::bindings::module_put(kernel::module::this_module::<crate::LocalModule>().as_ptr()) };
 }
 #[cfg(not(CONFIG_MODULE_UNLOAD))]
 fn unpin_module() {}
@@ -1074,7 +1074,7 @@ impl Runtime {
                 crate::m3::t8122_start::prepare_verdict(pdev.as_ref(),device.soc(),started,e);
                 state.health.mark_failed();
                 if device.stop_asc().is_err() {
-                    unsafe {kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr())};
+                    unsafe {kernel::bindings::__module_get(kernel::module::this_module::<crate::LocalModule>().as_ptr())};
                     core::mem::forget(transport);core::mem::forget(state);
                     core::mem::forget(adopted);
                     core::mem::forget(drm);core::mem::forget(device);
@@ -1342,7 +1342,7 @@ impl Drop for Runtime {
         for batch in self.inner.active.iter() {Inner::finish_all(&batch.entries,Err(ENODEV));}
         if policy::retain_runtime(self.inner.device.stop_asc().is_err(),self.inner.gpu_pending) {
             // SAFETY: a live module reference pins callbacks with retained DMA.
-            unsafe { kernel::bindings::__module_get(crate::THIS_MODULE.as_ptr()) };
+            unsafe { kernel::bindings::__module_get(kernel::module::this_module::<crate::LocalModule>().as_ptr()) };
             return;
         }
         // SAFETY: no GPU command is pending and ASC is stopped. Field order
