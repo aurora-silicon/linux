@@ -84,6 +84,9 @@ struct iomfb_m4_ext_mode {
 	bool dsc;
 };
 
+/* A scratch-only realtime bandwidth mailbox (D003) is this long */
+#define DCP_M4_BW_MAILBOX_SIZE	8
+
 struct iomfb_m4 {
 	struct apple_dcp *owner;
 	struct device *dev;
@@ -91,6 +94,8 @@ struct iomfb_m4 {
 	struct iommu_group *scanout_group;
 	resource_size_t coproc_phys;
 	size_t coproc_size;
+	/* The realtime bandwidth mailbox from the DT (0: none), see dcp_m4_bw_mailbox() */
+	u64 bw_mailbox;
 	struct work_struct backlight_work;
 	void __iomem *coproc;
 	struct apple_rtkit *rtkit;
@@ -1172,6 +1177,27 @@ static int dcp_m4_runtime_idle_cache(void *cookie, unsigned int method,
 	return -EOPNOTSUPP;
 }
 
+/*
+ * D003 rt_bandwidth_setup_ap, answered as macOS answers it for a T8132
+ * external pipe: the DCP's 8-byte bandwidth request slot as the mailbox,
+ * whose length (8) selects the scratch-only protocol, with no doorbell. The
+ * firmware then writes its realtime bandwidth requests there. Without a
+ * mailbox from the DT (the internal panel) the service is declined.
+ */
+static int dcp_m4_runtime_bandwidth(void *cookie, void *output)
+{
+	struct dcp_m4_runtime *r = cookie;
+	u8 *out = output;
+
+	if (!r->dcp->bw_mailbox) {
+		put_unaligned_le32(1, out + 0x38);	/* status: declined */
+		return 0;
+	}
+	put_unaligned_le64(r->dcp->bw_mailbox, out + 0x08);
+	put_unaligned_le32(DCP_M4_BW_MAILBOX_SIZE, out + 0x2c);
+	return 0;
+}
+
 static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
 	.call = dcp_m4_runtime_call,
 	.property = dcp_m4_runtime_property,
@@ -1179,6 +1205,7 @@ static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
 	.event = dcp_m4_runtime_event,
 	.swap_done = dcp_m4_runtime_swap_done,
 	.idle = dcp_m4_runtime_idle_cache,
+	.bandwidth = dcp_m4_runtime_bandwidth,
 };
 
 static void dcp_m4_runtime_bad_word(struct dcp_m4_runtime *r, u64 word, int error)
@@ -1334,6 +1361,9 @@ static int dcp_m4_external_shape(u32 tag, u32 input, u32 output)
 
 	if (method == 134)
 		return !input && output == 4 ? method : -EMSGSIZE;
+	/* D411 mapDeviceMemoryWithIndex, see dcp_m4_external_callback(). */
+	if (method == 411)
+		return input == 0x10 && output == 0x1c ? method : -EMSGSIZE;
 	cb = method < 0 ? NULL : dcp_m4_ext_cb(method);
 	if (!cb)
 		return -EOPNOTSUPP;
@@ -1442,6 +1472,43 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 		if (output_size != 4)
 			return -EMSGSIZE;
 		put_unaligned_le32(0, output);
+		return 0;
+	}
+	/*
+	 * D411 mapDeviceMemoryWithIndex, which the firmware asks for its register
+	 * windows (the one holding the bandwidth mailbox among them): "VORP", the
+	 * display register index and flags in; the window's DVA, address and
+	 * length, then a u32 status out. Only a disp-N window the DT describes is
+	 * given. As on the desktop 26.x firmware, the DVA is the physical address:
+	 * the firmware reaches its register windows on its DART-bypass stream.
+	 * Any other index gets status 1.
+	 */
+	if (method == 411) {
+		struct resource *res = NULL;
+		u8 *o = output;
+		char name[16];
+		u32 index;
+
+		if (input_size != 0x10 || output_size != 0x1c)
+			return -EMSGSIZE;
+		index = get_unaligned_le32(input + 4);
+		if (!memcmp(input, "VORP", 4) && index < MAX_DISP_REGISTERS) {
+			snprintf(name, sizeof(name), "disp-%u", index);
+			res = platform_get_resource_byname(to_platform_device(r->dcp->dev),
+							   IORESOURCE_MEM, name);
+		}
+		memset(o, 0, 0x1c);
+		if (!res) {
+			put_unaligned_le32(1, o + 24);
+			dev_warn(r->dcp->dev, "D411: register index %u is not described: refused\n",
+				 index);
+			return 0;
+		}
+		put_unaligned_le64(res->start, o);
+		put_unaligned_le64(res->start, o + 8);
+		put_unaligned_le64(resource_size(res), o + 16);
+		dev_dbg(r->dcp->dev, "D411: register index %u (flags %#x) mapped: %pR\n", index,
+			get_unaligned_le32(input + 8), res);
 		return 0;
 	}
 	/*
@@ -2189,6 +2256,44 @@ static bool iomfb_m4_firmware_property(struct device_node *np, const char *name)
 	       version[0] == 26 && version[1] == 6 && version[2] == 2;
 }
 
+/*
+ * The realtime bandwidth mailbox the DT gives @dev, or 0: apple,bw-scratch
+ * names the provider's reg range, the firmware's display register index and
+ * an offset into the range. The mailbox is DCP_M4_BW_MAILBOX_SIZE bytes, and
+ * must lie inside display register window 4, through which the firmware
+ * reaches a scratch-only mailbox.
+ */
+static u64 dcp_m4_bw_mailbox(struct device *dev)
+{
+	struct of_phandle_args args;
+	struct resource range, *win = NULL;
+	u64 slot = 0;
+	int ret;
+
+	ret = of_parse_phandle_with_args(dev->of_node, "apple,bw-scratch",
+					 "#apple,bw-scratch-cells", 0, &args);
+	if (ret == -ENOENT)
+		return 0;
+	if (ret) {
+		dev_warn(dev, "apple,bw-scratch: %d: realtime bandwidth declined\n", ret);
+		return 0;
+	}
+	if (args.args_count == 3 && args.args[1] == 4 &&
+	    !of_address_to_resource(args.np, args.args[0], &range) &&
+	    resource_size(&range) >= DCP_M4_BW_MAILBOX_SIZE &&
+	    args.args[2] <= resource_size(&range) - DCP_M4_BW_MAILBOX_SIZE) {
+		win = platform_get_resource_byname(to_platform_device(dev), IORESOURCE_MEM,
+						   "disp-4");
+		slot = range.start + args.args[2];
+	}
+	of_node_put(args.np);
+	if (!win || slot < win->start || slot + DCP_M4_BW_MAILBOX_SIZE - 1 > win->end) {
+		dev_warn(dev, "apple,bw-scratch: no mailbox inside disp-4: realtime bandwidth declined\n");
+		return 0;
+	}
+	return slot;
+}
+
 int iomfb_m4_init(struct apple_dcp *owner)
 {
 	struct platform_device *pdev = to_platform_device(owner->dev);
@@ -2232,6 +2337,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 		return -ENOMEM;
 	dcp->owner = owner;
 	dcp->dev = dev;
+	dcp->bw_mailbox = dcp_m4_bw_mailbox(dev);
 	mutex_init(&dcp->lock);
 	mutex_init(&dcp->ext_modes_lock);
 	spin_lock_init(&dcp->state_lock);
