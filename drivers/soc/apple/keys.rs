@@ -189,14 +189,6 @@ pub(crate) enum Output {
     Consumed,
 }
 
-pub(crate) struct KeyOperation {
-    pub(crate) request: Option<KeyRequest>,
-    pub(crate) deadline_ns: u64,
-    pub(crate) terminal: Option<Result<Output>>,
-    pub(crate) decrypt: bool,
-    pub(crate) guidance: bio::Guidance,
-}
-
 #[repr(C)]
 struct Create {
     flags: u32,
@@ -275,10 +267,10 @@ impl SepData {
         use kernel::uaccess::{UserPtr, UserSlice};
         let user = UserPtr::from_addr(arg);
         if cmd == IOC_SIGN_POLL {
-            return bio::poll_sign(&mut self.bio_session.lock(), user);
+            return bio::key::poll_sign(&mut self.bio_session.lock(), user);
         }
         if cmd == IOC_DECRYPT_POLL {
-            let result = bio::poll_decrypt(&mut self.bio_session.lock(), user);
+            let result = bio::key::poll_decrypt(&mut self.bio_session.lock(), user);
             self.key_result_changed.notify_all();
             return result;
         }
@@ -340,7 +332,7 @@ impl SepData {
                 if Self::refkey_pub(&blob).is_none() { return Err(EINVAL); }
                 let deadline_ns = crate::shim::monotonic_ns()
                     .saturating_add(u64::from(request.timeout_ms) * 1_000_000);
-                bio::start_key(&mut self.bio_session.lock(), KeyRequest {
+                bio::key::start_key(&mut self.bio_session.lock(), KeyRequest {
                     blob,
                     input: Input::Sign(request.digest),
                     deadline_ns,
@@ -368,7 +360,7 @@ impl SepData {
                 if sealed[0] != 4 { return Err(EINVAL); }
                 let deadline_ns = crate::shim::monotonic_ns()
                     .saturating_add(u64::from(request.timeout_ms) * 1_000_000);
-                bio::start_key(&mut self.bio_session.lock(), KeyRequest {
+                bio::key::start_key(&mut self.bio_session.lock(), KeyRequest {
                     blob,
                     input: Input::Decrypt(sealed),
                     deadline_ns,
@@ -380,11 +372,11 @@ impl SepData {
 
     pub(crate) fn run_key_operation(&self, request: KeyRequest) {
         let result = (|| {
-            if !bio::key_is_live(&self.bio_session.lock()) { return Err(ECANCELED); }
+            if !bio::key::key_is_live(&self.bio_session.lock()) { return Err(ECANCELED); }
             let credential = self.key_credential()?;
             let result = match self.verify_capture(Some(credential.handle())) {
                 bio::VerifyOutcome::Matched(_) => {
-                    if !bio::key_is_live(&self.bio_session.lock()) { Err(ECANCELED) }
+                    if !bio::key::key_is_live(&self.bio_session.lock()) { Err(ECANCELED) }
                     else {
                         match &request.input {
                             Input::Sign(digest) => self.sign_biometric_key(&request.blob, digest, &credential)
@@ -402,12 +394,12 @@ impl SepData {
             if self.key_api_failed.load(Relaxed) { return Err(EIO); }
             result
         })();
-        if bio::finish_key(&mut self.bio_session.lock(), result) { self.bio_wake(); }
+        if bio::key::finish_key(&mut self.bio_session.lock(), result) { self.bio_wake(); }
         // Wait on the session predicate so a consumed/canceled result releases
         // ownership promptly, and an abandoned result is wiped at its deadline.
         {
             let mut session = self.bio_session.lock();
-            while let Some(remaining) = bio::key_plaintext_wait_ns(&mut session, crate::shim::monotonic_ns()) {
+            while let Some(remaining) = bio::key::key_plaintext_wait_ns(&mut session, crate::shim::monotonic_ns()) {
                 let timeout = kernel::time::msecs_to_jiffies(remaining.div_ceil(1_000_000) as u32);
                 if matches!(self.key_result_changed.wait_interruptible_timeout(&mut session, timeout),
                     kernel::sync::CondVarTimeoutResult::Signal { .. })

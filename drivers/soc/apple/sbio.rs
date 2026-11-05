@@ -1304,9 +1304,9 @@ impl SepData {
     }
 
     pub(crate) fn run_verify(&self) {
-        let signing = bio::is_key_operation(&self.bio_session.lock());
+        let signing = bio::key::is_key_operation(&self.bio_session.lock());
         if signing {
-            let request = bio::take_key_request(&mut self.bio_session.lock());
+            let request = bio::key::take_key_request(&mut self.bio_session.lock());
             if let Some(request) = request { self.run_key_operation(request); }
             return;
         }
@@ -2698,8 +2698,8 @@ impl SepData {
             .enqueue::<Arc<SepData>, VERIFY_WORK_ID>(this.clone())
             .is_err()
         {
-            if bio::is_key_operation(&this.bio_session.lock()) {
-                bio::finish_key(&mut this.bio_session.lock(), Err(EIO));
+            if bio::key::is_key_operation(&this.bio_session.lock()) {
+                bio::key::finish_key(&mut this.bio_session.lock(), Err(EIO));
                 this.bio_wake();
             } else {
                 this.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), [0; bio::TOKEN_LEN]);
