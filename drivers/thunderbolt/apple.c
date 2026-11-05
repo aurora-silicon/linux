@@ -2351,6 +2351,18 @@ static bool apple_nhi_pcie_link_kept(struct apple_cio *acio)
 	return kept;
 }
 
+/* Whether this port has a PCIe-C tunnel host at all. */
+static bool apple_nhi_has_pcie_tunnel(struct apple_cio *acio)
+{
+	struct platform_device *pcie_pdev;
+
+	guard(mutex)(&acio->pcie_tunnel_lock);
+	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
+	if (pcie_pdev)
+		put_device(&pcie_pdev->dev);
+	return pcie_pdev;
+}
+
 static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
@@ -2361,6 +2373,27 @@ static int apple_nhi_suspend_noirq(struct device *dev)
 		/* PCIe-C suspends first; its tunnel must then survive resume. */
 		if (apple_nhi_pcie_link_kept(anhi->acio))
 			anhi->nhi.quirks |= QUIRK_KEEP_TUNNELS;
+		/*
+		 * A DP tunnel to an external display behind a dock is never
+		 * released here: that would have its DCP release the route (its
+		 * locks, AFK calls and waits) with the DCP already suspended. With
+		 * the routers awake every tunnel stays as it is: keep them all,
+		 * unless a PCIe-C tunnel's link is not kept (it is then rebuilt at
+		 * resume, which tears down the others too): refuse the sleep.
+		 */
+		if (!(anhi->nhi.quirks & QUIRK_KEEP_TUNNELS) &&
+		    tb_has_apple_host_dp_tunnel(anhi->tb)) {
+			if (apple_nhi_has_pcie_tunnel(anhi->acio)) {
+				dev_warn(dev, "refusing system sleep: a DP tunnel to an external display cannot be kept (the PCIe-C link is not kept)\n");
+				return -EBUSY;
+			}
+			anhi->nhi.quirks |= QUIRK_KEEP_TUNNELS;
+			dev_dbg(dev, "tunnels kept across sleep for an external display\n");
+		}
+	} else if (tb_has_apple_host_dp_tunnel(anhi->tb)) {
+		/* The routers sleep: the DP tunnels would go here, see above. */
+		dev_warn(dev, "refusing system sleep: a DP tunnel to an external display is up and router_sleep is set\n");
+		return -EBUSY;
 	}
 
 	return tb_domain_suspend_noirq(anhi->tb);

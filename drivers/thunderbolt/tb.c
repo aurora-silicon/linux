@@ -3293,6 +3293,27 @@ static int tb_start(struct tb *tb, bool reset)
 	return 0;
 }
 
+/*
+ * Whether a DP tunnel from an Apple host router's DP IN adapter (an external
+ * display through a dock) is up. Takes the domain lock.
+ */
+bool tb_has_apple_host_dp_tunnel(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+	bool found = false;
+
+	mutex_lock(&tb->lock);
+	list_for_each_entry(tunnel, &tcm->tunnel_list, list)
+		if (tb_tunnel_is_dp(tunnel) && tb_port_is_apple_host_dpin(tunnel->src_port)) {
+			found = true;
+			break;
+		}
+	mutex_unlock(&tb->lock);
+	return found;
+}
+EXPORT_SYMBOL_FOR_MODULES(tb_has_apple_host_dp_tunnel, "thunderbolt_apple");
+
 static int tb_suspend_noirq(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
