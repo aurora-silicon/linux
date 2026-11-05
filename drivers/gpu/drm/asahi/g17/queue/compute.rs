@@ -610,6 +610,8 @@ pub(crate) struct Queue {
     needs_fresh_backing: bool,
     /// Monotonic time the last owner released this queue (vacate order).
     released_at: u64,
+    /// Monotonic time the watchdog quarantined this queue, zero otherwise.
+    timed_out_at: u64,
     /// Free-list generation of the last published configuration.
     free_list_generation: u64,
     /// `None` after an exited owner was detached; a new owner binds afresh.
@@ -701,6 +703,7 @@ impl Queue {
             growth: None,
             needs_fresh_backing: false,
             released_at: 0,
+            timed_out_at: 0,
             free_list_generation: 0,
             binding: Some(binding),
             previous: None,
@@ -1306,6 +1309,7 @@ impl Queue {
         if self.spared_quarantine {
             self.spared_quarantine = false;
             self.quarantine_error = None;
+            self.timed_out_at = 0;
             self.submitted = 0;
             self.kick.clear_parent_after_recovery();
             self.quarantined = false;
@@ -1895,6 +1899,7 @@ impl Queue {
         self.exit = None;
         self.quarantined = false;
         self.quarantine_error = None;
+        self.timed_out_at = 0;
         self.failure_status_pending = false;
         self.retired_by_teardown = false;
         self.spared_quarantine = false;
@@ -2135,6 +2140,7 @@ impl Queue {
         let result = self.quarantine(ETIMEDOUT, defer);
         if fresh {
             self.spared_quarantine = return_spared;
+            self.timed_out_at = now_ns().max(1);
         }
         result
     }
