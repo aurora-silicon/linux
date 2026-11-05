@@ -241,7 +241,8 @@ struct backlight_device {struct backlight_properties props;void *data;bool ops_l
 struct apple_dcp {
     int fw_compat;bool quiescing;
     struct {int iomfb_method_profile;} hw;
-    struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;} brightness;
+    struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;
+        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;} brightness;
     struct {bool lock;struct dcp_backlight_state state;unsigned long fade_start;
         int fade_work;void (*kick)(struct apple_dcp *);} backlight;
     struct {bool inherited_brightness_valid;u32 inherited_brightness;} *desktop;
@@ -288,6 +289,10 @@ static u32 calculate_dac(struct apple_dcp *d,int nits) {(void)d;(void)nits;asser
 static int drm_modeset_lock_single_interruptible(int *p) {(void)p;assert(false);return 0;}
 static void drm_modeset_unlock(int *p) {(void)p;assert(false);}
 static int dcp_backlight_update(struct apple_dcp *d) {(void)d;assert(false);return 0;}
+/* The DAC fade (M1/M2 firmware) never runs on the desktop panel. */
+#define system_freezable_wq NULL
+static bool dcp_dac_fade_starts(struct apple_dcp *d,u32 nits) {(void)d;(void)nits;assert(false);return false;}
+static void mod_delayed_work(void *q,int *w,unsigned delay) {(void)q;(void)w;(void)delay;assert(false);}
 ''' + functions + r'''
 int main(void)
 {
@@ -840,7 +845,7 @@ struct work_struct {int unused;};
 struct backlight_device {struct {int kobj;} dev;struct {u32 brightness;} props;};
 struct apple_dcp {
     int fw_compat;bool quiescing,crashed;
-    struct {struct backlight_device *bl_dev;} brightness;
+    struct {struct backlight_device *bl_dev;int fade_work;} brightness;
     struct {bool lock;struct dcp_backlight_state state;struct work_struct notify_work;int fade_work,retry_work;} backlight;
     struct {struct dcp_backlight_swap backlight;} *desktop;
 };
@@ -876,10 +881,10 @@ int main(void)
     dcp_backlight_desktop_finish(&d,9,true,false);assert(events==1);
     d.quiescing=true;dcp_backlight_notify(&d);assert(events==1);
     d.quiescing=false;d.fw_compat=1;dcp_backlight_notify(&d);assert(events==1);
-    dcp_backlight_stop(&d);assert(!cancelled && delayed_cancelled==2);
+    dcp_backlight_stop(&d);assert(!cancelled && delayed_cancelled==3);
     d.fw_compat=5;dcp_backlight_notify_release(&d);
     assert(!d.brightness.bl_dev && cancelled==1);dcp_backlight_notify(&d);assert(events==1);
-    dcp_backlight_stop(&d);assert(cancelled==2 && delayed_cancelled==4);
+    dcp_backlight_stop(&d);assert(cancelled==2 && delayed_cancelled==6);
     return 0;
 }
 '''
