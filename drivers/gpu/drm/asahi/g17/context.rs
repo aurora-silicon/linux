@@ -31,6 +31,8 @@ const QOS_IDS: usize = 128;
 
 struct QosState {
     used: u128,
+    /// Released IDs whose firmware QoS rows still need clearing.
+    released: u128,
     /// When each ID was last returned; reuse takes the one returned longest ago.
     returns: [u64; QOS_IDS],
     /// Firmware progress a returned ID waits for (see `channel::control_fence`).
@@ -51,7 +53,7 @@ impl QosIds {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(
-                    QosState { used: 3, returns: [0; QOS_IDS], fences: [0; QOS_IDS], clock: 0 },
+                    QosState { used: 3, released: 0, returns: [0; QOS_IDS], fences: [0; QOS_IDS], clock: 0 },
                     "G17 QoS IDs"
                 )
             }),
@@ -69,6 +71,8 @@ impl QosIds {
                 return Err(super::capacity::refused(super::capacity::Site::QosIds));
             };
             state.used |= 1u128 << id;
+            // A new owner writes its own scheduler row at its first publication.
+            state.released &= !(1u128 << id);
             id
         };
         // Drop returns the ID if the allocation fails.
@@ -102,6 +106,7 @@ impl Drop for QosLease {
         state.returns[id] = state.clock;
         state.fences[id] = fence;
         state.used &= !(1u128 << id);
+        state.released |= 1u128 << id;
     }
 }
 
@@ -731,6 +736,24 @@ impl QosIds {
     pub(crate) fn used(&self) -> u32 {
         (self.state.lock().used & !3u128).count_ones()
     }
+    /// Clears, with `forget`, the firmware QoS rows of the IDs released and not taken again:
+    /// they still name the released context's scheduler page. The IDs `forget` returns, whose
+    /// rows still have work in flight (or all, if it fails), stay released for the next call.
+    pub(crate) fn forget_released(&self, forget: impl FnOnce(u128) -> Result<u128>) {
+        let ids = {
+            let mut state = self.state.lock();
+            let ids = state.released & !state.used;
+            state.released = 0;
+            ids
+        };
+        if ids == 0 {
+            return;
+        }
+        let left = forget(ids).unwrap_or(ids);
+        let mut state = self.state.lock();
+        // An ID taken again meanwhile has a new owner, which writes its own row.
+        state.released |= left & !state.used;
+    }
 }
 
 /// Memory a context's work list may lead the firmware to stays allocated: a linked node (or
@@ -767,6 +790,44 @@ mod capacity_tests {
             assert_eq!(ids.used(), 0);
             assert_eq!(ids.state.lock().used, 3);
         }
+    }
+
+    #[test]
+    fn a_released_qos_row_still_in_use_is_cleared_later() {
+        let ids = QosIds::new().unwrap();
+        let (first, second) = (ids.acquire().unwrap(), ids.acquire().unwrap());
+        let both = (1u128 << first.id) | (1u128 << second.id);
+        // Occupy fresh IDs so the callback must reuse one of the returned IDs.
+        let mut others = KVec::with_capacity(QOS_IDS - 4, GFP_KERNEL).unwrap();
+        for _ in 0..QOS_IDS - 4 {
+            others.push(ids.acquire().unwrap(), GFP_KERNEL).unwrap();
+        }
+        drop((first, second));
+        // Work still runs on both rows: neither is cleared, and both stay released.
+        ids.forget_released(|released| {
+            assert_eq!(released, both);
+            Ok(released)
+        });
+        // A failed clear keeps them too.
+        ids.forget_released(|released| {
+            assert_eq!(released, both);
+            Err(EIO)
+        });
+        // One is taken again meanwhile: its new owner writes its own row.
+        let mut again = None;
+        ids.forget_released(|released| {
+            again = Some(ids.acquire().unwrap());
+            Ok(released)
+        });
+        let again = again.unwrap();
+        assert_ne!(both & (1u128 << again.id), 0);
+        let rest = both & !(1u128 << again.id);
+        ids.forget_released(|released| {
+            assert_eq!(released, rest);
+            Ok(0)
+        });
+        ids.forget_released(|_| panic!("nothing left to clear"));
+        drop(again);
     }
 }
 

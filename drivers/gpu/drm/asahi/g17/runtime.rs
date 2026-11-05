@@ -790,6 +790,8 @@ impl Backend {
             {
                 return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
             }
+            // The new context may reuse a pooled scheduler page: clear released QoS rows first.
+            firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
             let attempt = if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
                 // Creators hold the device mutex, so neither check above can
                 // have changed; the slot only fails on a broken invariant.
