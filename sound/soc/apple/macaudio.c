@@ -148,6 +148,17 @@ struct macaudio_platform_cfg {
 	 * keep the first slots in codec order; the others carry silence.
 	 */
 	unsigned int speaker_fe_channels;
+	/*
+	 * The tweeter amps' playback high-pass corner, an "HPF Corner
+	 * Frequency" item; "800 Hz" unless set. Machines whose speaker
+	 * protection runs in the graph and measures every voice coil with a
+	 * low-frequency pilot tone set it to the woofers' corner: the
+	 * crossover that keeps program bass off the tweeters comes before the
+	 * protection stage there, and an 800 Hz playback filter after it
+	 * removes the pilot, which leaves the tweeters without a closed-loop
+	 * temperature.
+	 */
+	const char *tweeter_hpf;
 };
 
 static const char *volume_control_names[] = {
@@ -2025,6 +2036,18 @@ static int macaudio_set_fixed_volume(struct snd_soc_card *card, const char *name
 		CHECK(call, buf, value, 1); \
 	}
 
+#define MACAUDIO_WOOFER_HPF		"2 Hz"
+#define MACAUDIO_TWEETER_HPF_DEFAULT	"800 Hz"
+
+/* The playback high-pass corner of one speaker amp, as an enum item */
+static const char *macaudio_speaker_hpf(const struct macaudio_platform_cfg *cfg,
+					bool tweeter)
+{
+	if (!tweeter)
+		return MACAUDIO_WOOFER_HPF;
+	return cfg->tweeter_hpf ?: MACAUDIO_TWEETER_HPF_DEFAULT;
+}
+
 static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, bool tweeter)
 {
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
@@ -2046,7 +2069,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 
 		CHECK_CONCAT(macaudio_set_fixed_volume, "Amp Gain Volume", ma->cfg->amp_gain);
 		CHECK_CONCAT(macaudio_set_fixed_enum, "HPF Corner Frequency",
-			     tweeter ? "800 Hz" : "2 Hz");
+			     macaudio_speaker_hpf(ma->cfg, tweeter));
 
 		CHECK_CONCAT(macaudio_set_fixed_enum, "OCE Handling", "Retry");
 		break;
@@ -2246,8 +2269,10 @@ struct macaudio_platform_cfg macaudio_j37x_j47x_cfg = {
 	true,	AMP_SN012776,	SPKR_1W,	false,	20,	-20,
 };
 
+/* In-graph protection, with a pilot tone on the tweeters as well */
 struct macaudio_platform_cfg macaudio_j413_cfg = {
 	true,	AMP_SN012776,	SPKR_1W1T,	true,	15,	-20,
+	.tweeter_hpf = MACAUDIO_WOOFER_HPF,
 };
 
 struct macaudio_platform_cfg macaudio_j415_cfg = {
@@ -2286,6 +2311,8 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 	.fe_cpu_is_platform = true,
 	/* No headphone codec on this card: the jack is a card of its own. */
 	.route_only_fes = BIT(0),
+	/* In-graph protection, with a pilot tone on the tweeters as well */
+	.tweeter_hpf = MACAUDIO_WOOFER_HPF,
 };
 
 /*
@@ -2555,4 +2582,5 @@ MODULE_LICENSE("GPL");
 #if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
 #include "macaudio-admission-test.h"
 #include "macaudio-protection-test.h"
+#include "macaudio-hpf-test.h"
 #endif
