@@ -95,6 +95,16 @@ properties:
       slots from slot 0, a set bit driving zeros in that idle slot. It
       replaces the sound card's TDM idle masks for this amplifier.
 
+  apple,speaker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description:
+      SN012776 only. This amplifier's row of its group's speaker-config in
+      the Mac's boot ADT, copied by the boot loader. Its second byte is the
+      amplifier's operating level (AMP_LEVEL, low five bits); the others are
+      its receive and sense slots.
+
   apple,deferred-shutdown:
     type: boolean
     description:
