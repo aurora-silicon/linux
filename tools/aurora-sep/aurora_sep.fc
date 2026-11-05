@@ -1,1 +1,3 @@
 /dev/sep-bio	-c	gen_context(system_u:object_r:aurora_sep_device_t,s0)
+/usr/local/sbin/aurora-sep-load	--	gen_context(system_u:object_r:aurora_sep_load_exec_t,s0)
+/usr/libexec/aurora-sep-load	--	gen_context(system_u:object_r:aurora_sep_load_exec_t,s0)
