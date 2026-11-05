@@ -179,6 +179,16 @@ struct dcp_brightness {
 	bool update;
 	/* A level was written through the backlight device (desktop 26.x). */
 	bool requested;
+	/*
+	 * Fade between levels where the firmware takes a DAC value in each
+	 * swap.  level is the one set last, in nits; crtc mutex.
+	 */
+	struct delayed_work fade_work;
+	unsigned long fade_start;
+	u32 level;
+	u32 fade_from;
+	u32 fade_to;
+	bool fading;
 };
 
 struct audiosrv_data;
