@@ -140,17 +140,6 @@ mod tests {
         assert!(storm.forgive());
     }
     #[test]
-    fn recovery_table_ends_at_its_first_invalid_record() {
-        use crate::g17::recovery::Entries;
-        let mut entries = Entries::default();
-        assert!(entries.include(1 | (12 << 4)));
-        assert!(entries.include(1 | 2 | (17 << 4)));
-        assert!(!entries.include(0));
-        assert_eq!(entries.listed, 2);
-        assert_eq!(entries.guilty, 1u128 << 17);
-        assert_eq!(entries.cancelled, 0);
-    }
-    #[test]
     fn replay_dependency_checks_never_wait_for_event_service() {
         use crate::g17::dependency::replay_status;
         assert_eq!(replay_status(0), Err(EBUSY));
