@@ -223,6 +223,8 @@ struct apple_nvme {
 	bool handoff_disabled;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
+	/* The linear SQ doorbells are in the NVMMU block. */
+	bool lsq_in_nvmmu;
 	bool quarantined;
 	bool detached;
 	bool removing;
@@ -1784,7 +1786,7 @@ rtkit_ready:
 		 * since T6000. Where the linear SQ registers live in the NVMMU
 		 * block, the firmware has already enabled them.
 		 */
-		if (!anv->hw->lsq_in_nvmmu) {
+		if (!anv->lsq_in_nvmmu) {
 			writel(APPLE_ANS_LINEAR_SQ_EN,
 			       anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
 			if (anv->hw->needs_ioq_registers) {
@@ -2372,8 +2374,18 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
+	/*
+	 * Newer ANS firmware moves the linear submission queue registers into
+	 * the NVMMU block and ends the "nvme" block before them (T6040, and
+	 * T8142 booting the macOS 27.0 stub: 0x10000, ADT ans reg[9]). A
+	 * window that does not reach the doorbells means that layout.
+	 */
+	anv->lsq_in_nvmmu = anv->hw->lsq_in_nvmmu ||
+		(anv->hw->has_lsq_nvmmu && anv->hw->has_separate_nvmmu &&
+		 resource_size(resource) < APPLE_ANS_LINEAR_IOSQ_DB + sizeof(u32));
+
 	if (anv->hw->has_lsq_nvmmu) {
-		void __iomem *lsq = anv->hw->lsq_in_nvmmu ? anv->mmio_nvmmu : anv->mmio_nvme;
+		void __iomem *lsq = anv->lsq_in_nvmmu ? anv->mmio_nvmmu : anv->mmio_nvme;
 
 		anv->adminq.sq_db = lsq + APPLE_ANS_LINEAR_ASQ_DB;
 		anv->adminq.cq_db = anv->mmio_nvme + APPLE_ANS_ACQ_DB;
