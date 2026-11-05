@@ -31,6 +31,8 @@ struct apple_dart_dcp {
 	DECLARE_BITMAP(claimed, DCP_DART_ENTRIES);
 	DECLARE_BITMAP(shared_roots, DCP_DART_ENTRIES);
 	DECLARE_BITMAP(arena, DCP_DART_ENTRIES); /* SID0 retained surfaces only. */
+	/* SID0 arena slices claimed as remappable host windows. */
+	DECLARE_BITMAP(window, DCP_DART_ENTRIES);
 	unsigned long retained; /* SID0 pages pinned after an uncertain unmap. */
 	u32 ttbr;
 	unsigned int sid;
@@ -159,6 +161,8 @@ struct apple_dart_dcp_allocation {
 
 /* SID0 slices for the retained copy surfaces; generic DMA gets the other free ones. */
 #define DCP_DART_SCANOUT_SLOTS	4
+/* An external display DART's SID0 arena: the surfaces and host windows. */
+#define DCP_DART_DISPEXT_SLOTS	10
 
 static bool apple_dart_has_borrowed(struct apple_dart *dart)
 {
@@ -342,18 +346,28 @@ static int apple_dart_dcp_excluded(struct apple_dart *dart, u64 start, u64 end)
 						"J713 DCP inherited tables");
 }
 
-/* Fixed at admission, so every reservation query reports the same SID0 slices. */
+/*
+ * Fixed at admission, so every reservation query reports the same SID0 slices.
+ * An external display DART takes up to DCP_DART_DISPEXT_SLOTS, for its host
+ * windows (direct scanout) besides the retained surfaces; it needs only
+ * DCP_DART_SCANOUT_SLOTS.
+ */
 static int apple_dart_dcp_arena(struct apple_dart_dcp *dcp)
 {
+	unsigned int want = dcp->dart->dispext ? DCP_DART_DISPEXT_SLOTS :
+			    DCP_DART_SCANOUT_SLOTS;
 	unsigned int slots = 0;
 
-	for (unsigned int i = 0; i < DCP_DART_ENTRIES && slots < DCP_DART_SCANOUT_SLOTS; i++) {
+	for (unsigned int i = 0; i < DCP_DART_ENTRIES && slots < want; i++) {
 		if (dcp->entry[i] || test_bit(i, dcp->foreign))
 			continue;
 		set_bit(i, dcp->arena);
 		slots++;
 	}
-	return slots == DCP_DART_SCANOUT_SLOTS ? 0 : -ENOSPC;
+	if (dcp->dart->dispext)
+		dev_dbg(dcp->dart->dev, "SID0 arena: %u of %u slices (%u for surfaces)\n",
+			slots, want, DCP_DART_SCANOUT_SLOTS);
+	return slots >= DCP_DART_SCANOUT_SLOTS ? 0 : -ENOSPC;
 }
 
 /* Snapshot only this consumer's real no-map reservations, before table admission. */
@@ -1350,8 +1364,8 @@ static size_t apple_dart_dcp_unmap(struct apple_dart_dcp *dcp, u64 iova,
 	 * the caller would take the IOVA as unmapped and reuse it, or free
 	 * pages still mapped. It is unreachable here: this generic path serves
 	 * only SID23 and SID0 DMA domains, and an external display DART's SID0
-	 * has no generic DMA user (its host mappings are the private scanout
-	 * APIs, which never come through here).
+	 * has no generic DMA user (its host mappings are the private window and
+	 * scanout APIs, which never come through here).
 	 */
 	if (!apple_dart_dispext_get(dcp->dart)) {
 		dev_err_ratelimited(dcp->dart->dev, "SID%u unmap at %llx while unconfirmed since sleep: refused\n",
