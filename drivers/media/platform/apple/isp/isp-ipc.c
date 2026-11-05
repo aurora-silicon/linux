@@ -282,6 +282,12 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 			"%s: timed out on request [0x%llx, 0x%llx, 0x%llx]\n",
 			chan->name, chan->req.arg0, chan->req.arg1,
 			chan->req.arg2);
+		/*
+		 * P010 resolves a late full-payload ACK before reusing the ring.
+		 * Keep that recoverable timeout path; compact sessions stay poisoned.
+		 */
+		if (isp_is_p010(isp))
+			return -ETIME;
 		cmpxchg(&isp->ipc_error, 0, -ETIME);
 		wake_up_all(&isp->wait);
 		return READ_ONCE(isp->ipc_error);
