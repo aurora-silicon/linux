@@ -277,7 +277,7 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	if (service->ep->wire_v2) {
+	if (dcp_is_external_h17p(service->ep->dcp)) {
 		memset(reply, 0, reply_size);
 		put_unaligned_le32(3, reply_ + 20);
 		put_unaligned_le32(3, reply_ + 24);
@@ -431,7 +431,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 
 	u64 lane_count = le64_to_cpu(request->lane_count);
 
-	if (service->ep->wire_v2) {
+	if (dcp_is_external_h17p(dcp)) {
 		ret = dptx_j700_validate_lanes(dptx, lane_count);
 		if (ret)
 			return ret;
@@ -451,7 +451,8 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		dptx->phy_ops.dp.lanes = lane_count;
 		/* USB4 DP IN has no ATC PHY; still accept the lane count. */
 		dptx->phy_ops.dp.set_lanes =
-			service->ep->wire_v2 || dcp_is_usb4_output(dcp) || (dcp->dptx_phy > 3);
+			dcp_is_external_h17p(dcp) || dcp_is_usb4_output(dcp) ||
+			(dcp->dptx_phy > 3);
 		break;
 	default:
 		dev_err(dcp->dev, "set_active_lane_count: invalid lane count:%llu\n", lane_count);
@@ -1031,7 +1032,7 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	    (!class || !class[0] || !strcmp(class, "AppleDCPDPTXRemotePort")))
 		port = unit >= 0 && unit < 2 ? unit : -EINVAL;
 	else
-		port = dptx_service_port(name, class, unit, service->ep->wire_v2,
+		port = dptx_service_port(name, class, unit, dcp_is_external_h17p(dcp),
 					 dcp->index, dcp->hw.num_dptx_ports);
 
 	if (port < 0)
@@ -1128,8 +1129,12 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 {
 	struct dptx_port *dptx = service->cookie;
 
-	/* Keep native AFK-v2 training and its refusal policy distinct. */
-	if (service->ep->wire_v2)
+	/*
+	 * Keep the T8140 external (J700) training and its refusal policy
+	 * distinct. It keys on that profile, not on the AFK v2 codec, which
+	 * firmware 27 speaks with the common DPTX calls.
+	 */
+	if (dcp_is_external_h17p(service->ep->dcp))
 		return dptxport_v2_group_call(service, group, command, data,
 					     size, reply, room);
 
