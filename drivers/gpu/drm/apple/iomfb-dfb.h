@@ -54,39 +54,56 @@ static inline u64 apple_dcp_dfb_plane_size(u32 width, u32 height, u32 bpe,
 	return data + ALIGN(2 * roundup_pow_of_two(cols) * roundup_pow_of_two(rows), 128);
 }
 
+/*
+ * The DFB's surface format and bytes per element (the surface record's pix_size)
+ * for the firmware's format and compression; *alpha_plane for a separate alpha plane.
+ */
+static inline int apple_dcp_dfb_format(u32 format, u32 compression,
+				       u32 *surface_format, u32 *bpe,
+				       bool *alpha_plane)
+{
+	*alpha_plane = false;
+	switch (format) {
+	case 0x62336138:
+		if (compression == 2) {
+			format = 0x77343061;
+			*bpe = 8;
+		} else {
+			*bpe = 4;
+			*alpha_plane = true;
+		}
+		break;
+	case 0x77343061:
+		*bpe = 8;
+		break;
+	case 0x42475241:
+	case 0x77333072:
+	case 0x6c313072:
+		*bpe = 4;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	*surface_format = format;
+	return 0;
+}
+
 static inline int apple_dcp_dfb_allocation(u32 width, u32 height, u32 format,
 					 u32 compression, u64 region_size,
 					 u32 *surface_format, u32 *allocation)
 {
 	u32 bpe;
 	u64 size;
-	bool alpha_plane = false;
+	bool alpha_plane;
+	int ret;
 
 	if (!width || !height || width > 16384 || height > 16384 || !region_size)
 		return -EINVAL;
 	if (compression != 0 && compression != 2 && compression != 3)
 		return -EOPNOTSUPP;
-	switch (format) {
-	case 0x62336138:
-		if (compression == 2) {
-			format = 0x77343061;
-			bpe = 8;
-		} else {
-			bpe = 4;
-			alpha_plane = true;
-		}
-		break;
-	case 0x77343061:
-		bpe = 8;
-		break;
-	case 0x42475241:
-	case 0x77333072:
-	case 0x6c313072:
-		bpe = 4;
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
+	ret = apple_dcp_dfb_format(format, compression, &format, &bpe, &alpha_plane);
+	if (ret)
+		return ret;
 	size = apple_dcp_dfb_plane_size(width, height, bpe, compression);
 	if (alpha_plane)
 		size += apple_dcp_dfb_plane_size(width, height, 1, compression);
