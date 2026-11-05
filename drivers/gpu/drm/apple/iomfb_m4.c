@@ -7,6 +7,7 @@
  * Firmware can keep every published DMA address until an exact successor
  * completion; an uncertain transaction stays pinned until reboot.
  */
+#include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
@@ -102,6 +103,26 @@ struct iomfb_m4 {
 	struct dcp_m4_frame active_frame;
 	u64 flips, blanks, brightness_swaps;
 	struct delayed_work idle_cache;
+	/*
+	 * The firmware switched its display DART off (D572 powerUpDART(0)) and
+	 * not on again: nothing may touch that DART meanwhile.
+	 */
+	bool ext_dart_down;
+	/* ... since a system sleep (no D572(1) since) */
+	bool ext_dart_since_sleep;
+	/* The external PIODMA child, kept once created; ->piodma once usable */
+	struct platform_device *ext_piodma;
+	/* The display DART's state was found lost after a D572(1) */
+	bool ext_dart_lost;
+	/* The DVAs of D451 buffers reserved in SID16 too (pair) */
+	u64 ext_pair_dva[64];
+	unsigned int ext_pairs;
+	/*
+	 * The PM epoch, which every system suspend and resume moves on: a
+	 * message received in an earlier one is stale for power (a D572(1) from
+	 * before a sleep confirms nothing).
+	 */
+	atomic_t ext_pm_epoch;
 };
 
 static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp);
@@ -398,10 +419,62 @@ out:
 	return ret;
 }
 
+static int dcp_m4_create_piodma_ext(struct iomfb_m4 *dcp);
+
+/*
+ * An external DCP's PIODMA device, created or checked when the firmware first
+ * needs it (D451, D201), and only while the firmware has its display DART on
+ * (the last D572, at the time of the access): it powers that DART only once the
+ * display is being powered on. 0 if usable.
+ */
+static int dcp_m4_ext_piodma(struct iomfb_m4 *dcp, const char *why)
+{
+	int ret;
+
+	if (READ_ONCE(dcp->ext_dart_down)) {
+		dev_dbg(dcp->dev, "%s: the display DART is off: no PIODMA\n", why);
+		return -EAGAIN;
+	}
+	if (dcp->piodma)
+		return 0;
+	ret = dcp_m4_create_piodma_ext(dcp);
+	dev_dbg(dcp->dev, "%s: PIODMA created on demand: %d\n", why, ret);
+	return ret;
+}
+
 static int dcp_m4_shared_alloc(void *cookie, u32 size, u64 *phys, u64 *dva)
 {
 	struct iomfb_m4 *dcp = cookie;
+	int ret;
 
+	/*
+	 * D451 maps through the coprocessor's own DART (SID23). An
+	 * external DCP with a usable PIODMA consumer also reserves the slot in
+	 * its display DART's SID16, so that D201 maps it there at the same DVA;
+	 * without one the buffer is SID23-only, and a D201 maps it in SID16 at
+	 * a DVA of its own.
+	 */
+	if (dcp->external) {
+		/*
+		 * The display DART's own readiness too (its power confirmed since
+		 * sleep), not only PIODMA's: else, or if the paired allocation
+		 * finds it unconfirmed before publishing anything (-EAGAIN), the
+		 * buffer is SID23-only.
+		 */
+		if (dcp_m4_ext_piodma(dcp, "D451") ||
+		    apple_dart_dcp_dispext_stream_ok(&dcp->piodma->dev, 16))
+			return apple_dart_dcp_shared_alloc_link(dcp->dev, size, phys, dva);
+		ret = apple_dart_dcp_shared_alloc(dcp->dev, &dcp->piodma->dev, size, phys, dva);
+		if (ret == -EAGAIN) {
+			dev_dbg(dcp->dev, "D451: the display DART is not confirmed: SID23 only\n");
+			return apple_dart_dcp_shared_alloc_link(dcp->dev, size, phys, dva);
+		}
+		if (!ret && dcp->ext_pairs < ARRAY_SIZE(dcp->ext_pair_dva))
+			dcp->ext_pair_dva[dcp->ext_pairs++] = *dva;
+		return ret;
+	}
+	if (!dcp->piodma)
+		return -ENODEV;
 	return apple_dart_dcp_shared_alloc(dcp->dev, &dcp->piodma->dev, size, phys, dva);
 }
 
@@ -409,12 +482,76 @@ static int dcp_m4_shared_map(void *cookie, u64 phys, u64 dva, u32 size)
 {
 	struct iomfb_m4 *dcp = cookie;
 
+	if (!dcp->piodma)
+		return -ENODEV;
 	return apple_dart_dcp_shared_map(dcp->dev, &dcp->piodma->dev, phys, dva, size);
+}
+
+/*
+ * Whether an external DCP's display DART stream for a D201 flag may be
+ * used now: the firmware has the DART on (its last D572), its state was not
+ * found lost since, and PIODMA is usable (created on demand).
+ */
+static int dcp_m4_ext_usable(void *cookie, unsigned int flag)
+{
+	struct iomfb_m4 *dcp = cookie;
+	int ret;
+
+	if (!dcp->external)
+		return -EOPNOTSUPP;
+	if (READ_ONCE(dcp->ext_dart_lost))
+		ret = -EIO;
+	else
+		ret = dcp_m4_ext_piodma(dcp, flag ? "D201 (SID16)" : "D201 (SID0)");
+	/* The selected stream itself, cached mappings included: not retired. */
+	if (!ret)
+		ret = apple_dart_dcp_dispext_stream_ok(&dcp->piodma->dev, flag ? 16 : 0);
+	if (ret)
+		dev_dbg(dcp->dev, "D201 flag %u refused: %d%s\n", flag, ret,
+			READ_ONCE(dcp->ext_dart_lost) ? " (display DART state lost)" : "");
+	return ret;
+}
+
+/* An external DCP's D201 with flag 0: the backing in its display DART's SID0. */
+static int dcp_m4_shared_map_sid0(void *cookie, u64 phys, u32 size, u64 *dva)
+{
+	struct iomfb_m4 *dcp = cookie;
+	int ret = apple_dart_dcp_dispext_map(&dcp->piodma->dev, 0, phys, size, dva);
+
+	dev_dbg(dcp->dev, "D201 flag 0: %#x bytes in SID0 at IOVA %#llx: %d\n",
+		size, ret ? 0 : *dva, ret);
+	return ret;
+}
+
+/*
+ * An external DCP's D201 with flag 1: a buffer paired at D451 is
+ * mapped in SID16 at its D451 DVA, any other at a DVA of its own.
+ */
+static int dcp_m4_shared_map_sid16(void *cookie, u64 phys, u64 dva, u32 size, u64 *out)
+{
+	struct iomfb_m4 *dcp = cookie;
+	bool paired = false;
+	int ret;
+
+	for (unsigned int i = 0; i < dcp->ext_pairs; i++)
+		paired |= dcp->ext_pair_dva[i] == dva;
+	if (paired) {
+		ret = apple_dart_dcp_shared_map(dcp->dev, &dcp->piodma->dev, phys, dva, size);
+		*out = dva;
+	} else {
+		ret = apple_dart_dcp_dispext_map(&dcp->piodma->dev, 16, phys, size, out);
+	}
+	dev_dbg(dcp->dev, "D201 flag 1: %#x bytes in SID16 at IOVA %#llx (%s): %d\n",
+		size, ret ? 0 : *out, paired ? "D451 DVA" : "own DVA", ret);
+	return ret;
 }
 
 static const struct dcp_m4_memory_ops dcp_m4_memory_ops = {
 	.alloc = dcp_m4_shared_alloc,
 	.map = dcp_m4_shared_map,
+	.map_sid0 = dcp_m4_shared_map_sid0,
+	.map_sid16 = dcp_m4_shared_map_sid16,
+	.usable = dcp_m4_ext_usable,
 };
 
 static int dcp_m4_create_piodma(struct iomfb_m4 *dcp)
@@ -449,6 +586,80 @@ out:
 	return ret;
 }
 
+/*
+ * An external DCP's PIODMA device, the piodma child of its node on SID16 of its
+ * display DART (adopted once the boot loader has handed the DCP over), as the
+ * internal display's. Disabled in the device tree, it is enabled here for this
+ * one consumer. Kept once created.
+ */
+static int dcp_m4_create_piodma_ext(struct iomfb_m4 *dcp)
+{
+	struct device_node *node = of_get_child_by_name(dcp->dev->of_node, "piodma");
+	struct platform_device *existing;
+	int ret = 0;
+
+	/* Its display DART is read here: not while the firmware has it off. */
+	if (READ_ONCE(dcp->ext_dart_down)) {
+		of_node_put(node);
+		return -EAGAIN;
+	}
+	if (dcp->piodma) {
+		of_node_put(node);
+		return dcp_m4_dart_check(&dcp->piodma->dev);
+	}
+	if (!node)
+		return -ENODEV;
+	/* A child that did not attach yet (its DART probed later) attaches again. */
+	if (dcp->ext_piodma)
+		goto configure;
+	if (!of_device_is_available(node)) {
+		struct of_changeset *cs = kzalloc(sizeof(*cs), GFP_KERNEL);
+
+		if (!cs) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		of_changeset_init(cs);
+		ret = of_changeset_update_prop_string(cs, node, "status", "okay");
+		if (!ret)
+			ret = of_changeset_apply(cs);
+		/* Applied, it stays: the live tree refers to it. */
+		if (ret) {
+			of_changeset_destroy(cs);
+			kfree(cs);
+			goto out;
+		}
+	}
+	existing = of_find_device_by_node(node);
+	if (existing) {
+		put_device(&existing->dev);
+		ret = -EBUSY;
+		goto out;
+	}
+	dcp->ext_piodma = of_platform_device_create(node, NULL, dcp->dev);
+	if (!dcp->ext_piodma) {
+		ret = -ENODEV;
+		goto out;
+	}
+configure:
+	/*
+	 * Keep the child even on failure: retained-domain attachment can have
+	 * begun. Only a checked one serves the firmware's buffers.
+	 */
+	ret = dma_set_mask_and_coherent(&dcp->ext_piodma->dev, DMA_BIT_MASK(42));
+	if (!ret)
+		ret = of_dma_configure(&dcp->ext_piodma->dev, node, true);
+	if (!ret)
+		ret = dcp_m4_dart_check(&dcp->ext_piodma->dev);
+	if (!ret)
+		dcp->piodma = dcp->ext_piodma;
+out:
+	if (ret && ret != -EAGAIN)
+		dev_warn(dcp->dev, "PIODMA on the display DART's SID16: %d\n", ret);
+	of_node_put(node);
+	return ret;
+}
+
 struct dcp_m4_runtime {
 	struct iomfb_m4 *dcp;
 	struct dcp_m4_properties *properties;
@@ -458,6 +669,16 @@ struct dcp_m4_runtime {
 	struct workqueue_struct *wq;
 	struct work_struct idle;
 	u64 queue[32];
+	/* The PM epoch each queued word was received in (ext_pm_epoch) */
+	int queue_pm[32];
+	/* ... of the word last taken, and of the callback being handled */
+	int word_pm, cb_pm;
+	/*
+	 * Host calls of our own (not remote: not made inside an async callback)
+	 * outstanding, and the PM epoch the innermost one was sent in
+	 */
+	unsigned int ext_local_calls;
+	int ext_call_epoch;
 	u32 head, count, callbacks;
 	unsigned long deadline;
 	bool done;
@@ -502,6 +723,8 @@ static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word)
 		dcp->error = ret = -ENOSPC;
 		dcp->ready = false;
 	} else {
+		r->queue_pm[(r->head + r->count) % ARRAY_SIZE(r->queue)] =
+			atomic_read(&dcp->ext_pm_epoch);
 		r->queue[(r->head + r->count++) % ARRAY_SIZE(r->queue)] = word;
 		complete(&r->received);
 	}
@@ -532,6 +755,7 @@ static int dcp_m4_runtime_next(struct dcp_m4_runtime *r, u64 *word, bool wait)
 	spin_lock_irqsave(&dcp->state_lock, flags);
 	ret = dcp->error ? dcp->error : !r->count ? -EPROTO : 0;
 	if (!ret) {
+		r->word_pm = r->queue_pm[r->head % ARRAY_SIZE(r->queue)];
 		*word = r->queue[r->head++ % ARRAY_SIZE(r->queue)];
 		r->count--;
 	}
@@ -594,8 +818,16 @@ static int dcp_m4_runtime_memory(void *cookie, unsigned int method,
 {
 	struct dcp_m4_runtime *r = cookie;
 	struct iomfb_m4 *dcp = r->dcp;
+	const u8 *out = output;
+	int ret;
 
-	return dcp_m4_memory_callback(dcp->memory, &dcp_m4_memory_ops, dcp, method, input, output);
+	ret = dcp_m4_memory_callback(dcp->memory, &dcp_m4_memory_ops, dcp, method, input, output);
+	if (dcp->external && ret)
+		dev_warn(dcp->dev, "D%03u failed: %d (PIODMA %s)\n", method, ret,
+			 dcp->piodma ? "present" : "absent");
+	else if (dcp->external && method == 201 && get_unaligned_le32(out + 12))
+		dev_dbg(dcp->dev, "D201 refused: status %u\n", get_unaligned_le32(out + 12));
+	return ret;
 }
 
 static int dcp_m4_runtime_event(void *cookie, const char *name, const void *dict, size_t size)
@@ -710,13 +942,16 @@ static const struct dcp_m4_external_nested dcp_m4_external_nested[] = {
  * get the answer the desktop 26.x external pipes give (the tiling state of
  * an unpaired pipe, false, or an acknowledgment); the others, which the
  * desktop path does not handle either, are notifications or a false
- * (D124). D593 (a swap aborted) is only acknowledged. -1: any size up to
- * 4 KiB.
+ * (D124). D593 (a swap aborted) is only acknowledged: a swap whose D590
+ * does not come is given up by the host (dcp_m4_ext_swap_give_up()).
+ * D202 (unmap) is acknowledged and the mapping retained, see
+ * dcp_m4_ext_memdesc(). -1: any size up to 4 KiB.
  */
 enum dcp_m4_ext_answer {
 	DCP_M4_EXT_ACK,		/* a notification: no output */
 	DCP_M4_EXT_ZERO,	/* false, zero or nothing: a zeroed output */
 	DCP_M4_EXT_TILING,	/* get_tiling_state of an unpaired pipe: value 0, ret 1 */
+	DCP_M4_EXT_MEMDESC,	/* D450/D452/D453 on a D451 record, see below */
 };
 
 static const struct dcp_m4_ext_cb {
@@ -740,8 +975,59 @@ static const struct dcp_m4_ext_cb {
 	{ 595, 0x4, 0, DCP_M4_EXT_ACK, "setSystemConsoleMode" },
 	{ 596, 0x4, 0, DCP_M4_EXT_ACK, "setSystemConsoleMode_gated" },
 	{ 598, -1, -1, DCP_M4_EXT_ZERO, "D598" },
+	{ 450, 0x8, 0x1c, DCP_M4_EXT_MEMDESC, "from_id" },
+	{ 452, 0x8, 0x4, DCP_M4_EXT_MEMDESC, "prepare" },
+	{ 453, 0x8, 0x4, DCP_M4_EXT_MEMDESC, "complete" },
 	{ 585, 0xe4, 0xe0, DCP_M4_EXT_ZERO, "swap_info_notify_dispatch" },
+	{ 202, 0x18, 0, DCP_M4_EXT_MEMDESC, "unmap_buf" },
 };
+
+/*
+ * D450 from_id (a D451 record's addresses again: paddr, DVA, length,
+ * ok; its NULL output flags honoured), D452 prepare and D453 complete (0,
+ * the buffer being wired already; 14, not found, for an unknown ID).
+ */
+static void dcp_m4_ext_memdesc(struct dcp_m4_runtime *r, int method, const u8 *in, u8 *out)
+{
+	struct dcp_m4_memory *memory = r->dcp->memory;
+	u32 id = get_unaligned_le32(in);
+	const struct dcp_m4_memory_object *object =
+		memory && id && id <= memory->count && !memory->object[id - 1].retired ?
+		&memory->object[id - 1] : NULL;
+
+	/*
+	 * D202 unmap_buf: +0 the buffer, +8 the map ID, +0xc the DVA, +0x14 the
+	 * flag. The mapping is retained (never unmapped under the firmware) and
+	 * answered again by a later D201.
+	 */
+	if (method == 202) {
+		u32 map_id = get_unaligned_le32(in + 8);
+		u8 flag = in[0x14];
+		u64 dva = get_unaligned_le64(in + 0xc);
+		bool match = object && map_id == (id << 1 | flag) && flag <= 1 &&
+			     dva == (flag ? object->dva : object->dva0);
+
+		dev_dbg(r->dcp->dev, "D202 unmap_buf: id %u map %u SID%u IOVA %#llx: %s\n",
+			id, map_id, flag ? 16 : 0, dva,
+			match ? "kept mapped (retained)" : "no such mapping");
+		return;
+	}
+	if (method == 450) {
+		if (object) {
+			if (!in[4])
+				put_unaligned_le64(object->phys, out);
+			if (!in[5])
+				put_unaligned_le64(object->dva, out + 8);
+			if (!in[6])
+				put_unaligned_le64(object->size, out + 16);
+			out[24] = 1;
+		}
+	} else {
+		put_unaligned_le32(object ? 0 : 14, out);
+	}
+	dev_dbg(r->dcp->dev, "D%03d (id %u): %s\n", method, id,
+		object ? "known" : "unknown ID");
+}
 
 static const struct dcp_m4_ext_cb *dcp_m4_ext_cb(int method)
 {
@@ -779,6 +1065,59 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 	u8 one[4], out[4];
 	int ret;
 
+	/*
+	 * D572 powerUpDART(on): the firmware switches its display DART
+	 * on or off, which the host does nothing for but must not touch the
+	 * DART while it is off. Answered with success, as the internal DCP's.
+	 */
+	if (method == 572 && input_size == 4 && output_size == 4) {
+		/* A bool in a 4-byte slot: its padding is not cleared. */
+		bool on = input[0] & 1;
+
+		/*
+		 * After a system sleep a D572(1) confirms power only as a callback
+		 * nested in a host call of our own sent after resume: such a
+		 * callback (remote 0, on the command callback ring) is only ever
+		 * sent while the firmware handles that call, and its reply comes
+		 * after it, whatever the transport held. An async one (remote 1),
+		 * one nested in a call sent earlier, or during sleep (an odd
+		 * epoch) is acknowledged as any other, but confirms nothing: the
+		 * DART counts as off still, and its state is not read.
+		 */
+		if (on) {
+			int now = atomic_read(&r->dcp->ext_pm_epoch);
+			bool fresh = !remote && r->ext_local_calls && r->ext_call_epoch == now &&
+				     r->cb_pm == now && !(now & 1);
+
+			if (now && !fresh) {
+				dev_dbg(r->dcp->dev, "D572 powerUpDART(1) after sleep %s: acknowledged, no power confirmed\n",
+					remote ? "as an async callback" :
+					!r->ext_local_calls ? "outside any call of ours" :
+					"in a call sent before resume");
+				return 0;
+			}
+		}
+		WRITE_ONCE(r->dcp->ext_dart_down, !on);
+		if (on)
+			r->dcp->ext_dart_since_sleep = false;
+		dev_dbg(r->dcp->dev, "D572 powerUpDART(%u)\n", on);
+		/* Did the display DART keep its state? Reads only. */
+		if (on) {
+			struct device_node *node =
+				of_get_child_by_name(r->dcp->dev->of_node, "piodma");
+
+			int state = apple_dart_dcp_dispext_state(node);
+
+			/* Lost: every later D201 is refused, cached mappings too. */
+			if (state == -EIO && !READ_ONCE(r->dcp->ext_dart_lost)) {
+				WRITE_ONCE(r->dcp->ext_dart_lost, true);
+				dev_err(r->dcp->dev, "display DART state lost after its power-up (see the DART's log): SID0 not used again\n");
+			}
+			dev_dbg(r->dcp->dev, "display DART state check: %d\n", state);
+			of_node_put(node);
+		}
+		return 0;
+	}
 	/* The external-only callbacks above; the output is zeroed already. */
 	{
 		const struct dcp_m4_ext_cb *cb = dcp_m4_ext_cb(method);
@@ -789,9 +1128,12 @@ static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remo
 				put_unaligned_le32(0, output);
 				put_unaligned_le32(1, (u8 *)output + 4);
 			}
+			if (cb->answer == DCP_M4_EXT_MEMDESC)
+				dcp_m4_ext_memdesc(r, method, input, output);
 			dev_dbg(r->dcp->dev, "D%03d (%s, %u/%u): %s\n",
 				method, cb->name, input_size, output_size,
 				cb->answer == DCP_M4_EXT_ACK ? "acknowledged" :
+				cb->answer == DCP_M4_EXT_MEMDESC ? "answered from its D451 record" :
 				cb->answer == DCP_M4_EXT_TILING ? "answered as an unpaired pipe" :
 				"answered zero/false");
 			return 0;
@@ -860,7 +1202,7 @@ static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
 	u8 *input, *snapshot;
 	u64 ack;
 	const char *stage = "offset";
-	int ret, offset;
+	int ret, offset, pm;
 
 	dma_rmb();
 	ret = dcp_m4_callback_begin(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE, word, &packet);
@@ -901,6 +1243,9 @@ static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
 		dev_dbg(dcp->dev, "Flagged D006 header=%12ph null-byte=%02x; ACK route=342\n",
 			 (u8 *)dcp->rpc + offset, input[80]);
 	stage = "dispatch";
+	/* This callback's word's PM epoch, across nested calls. */
+	pm = r->cb_pm;
+	r->cb_pm = r->word_pm;
 	ret = -ENOENT;
 	if (dcp->external)
 		ret = dcp_m4_external_callback(r, packet.tag, packet.remote, snapshot,
@@ -910,6 +1255,7 @@ static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
 		ret = dcp_m4_callback_dispatch(&dcp_m4_runtime_ops, r, packet.tag,
 					       packet.remote, snapshot, packet.input_size,
 					       input + packet.input_size, packet.output_size);
+	r->cb_pm = pm;
 	kfree(snapshot);
 	if (ret)
 		goto failed;
@@ -935,6 +1281,7 @@ static int dcp_m4_runtime_call_stream(struct dcp_m4_runtime *r, unsigned int met
 {
 	struct iomfb_m4 *dcp = r->dcp;
 	unsigned long previous = r->deadline;
+	int previous_epoch = r->ext_call_epoch;
 	struct dcp_m4_packet message;
 	u64 word;
 	u32 tag;
@@ -942,6 +1289,11 @@ static int dcp_m4_runtime_call_stream(struct dcp_m4_runtime *r, unsigned int met
 
 	if (method > 999)
 		return -EINVAL;
+	/* The epoch our own call goes out in, for its nested callbacks. */
+	if (!remote) {
+		r->ext_local_calls++;
+		r->ext_call_epoch = atomic_read(&dcp->ext_pm_epoch);
+	}
 	if (!r->deadline)
 		r->deadline = jiffies + msecs_to_jiffies(5000);
 	if (time_after_eq(jiffies, r->deadline)) {
@@ -974,6 +1326,10 @@ static int dcp_m4_runtime_call_stream(struct dcp_m4_runtime *r, unsigned int met
 	}
 finished:
 	r->deadline = previous;
+	if (!remote) {
+		r->ext_local_calls--;
+		r->ext_call_epoch = previous_epoch;
+	}
 	if (ret) {
 		dcp_m4_transaction_fail(&dcp->transaction, ret);
 		dcp_m4_failed(dcp, ret);
@@ -1177,6 +1533,10 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 		ret = -ENOMEM;
 		goto failed;
 	}
+	/* An external firmware's D451 requests are not qualified as such. */
+	dcp->memory->relaxed = dcp->external;
+	/* An external display DART counts as off until a D572(1). */
+	WRITE_ONCE(dcp->ext_dart_down, dcp->external);
 	r->properties = kzalloc(sizeof(*r->properties), GFP_KERNEL);
 	if (!r->properties) {
 		ret = -ENOMEM;
@@ -1185,7 +1545,13 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 	r->dcp = dcp;
 	init_completion(&r->received);
 	INIT_WORK(&r->idle, dcp_m4_runtime_idle);
-	r->wq = alloc_ordered_workqueue("iomfb-v26-6", WQ_MEM_RECLAIM);
+	/*
+	 * An external DCP's callbacks (D572, D201, D451 among them) are
+	 * not handled across system sleep: its queue is frozen with the tasks,
+	 * before the DARTs suspend and until after they resume.
+	 */
+	r->wq = alloc_ordered_workqueue("iomfb-v26-6",
+					WQ_MEM_RECLAIM | (dcp->external ? WQ_FREEZABLE : 0));
 	if (!r->wq) {
 		ret = -ENOMEM;
 		goto failed;
@@ -1212,6 +1578,8 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 		ret = dcp_m4_runtime_health(r);
 		if (ret)
 			goto failed;
+		/* PIODMA now if possible, else on demand. */
+		dcp_m4_ext_piodma(dcp, "startup");
 		/* Pairs with the acquires in iomfb_m4_external_ready() and the ext_ calls. */
 		smp_store_release(&r->done, true);
 		dev_info(dev, "IOMFB startup complete: %u callbacks; external\n", r->callbacks);
@@ -1915,15 +2283,45 @@ static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on)
 	return ret;
 }
 
+/*
+ * J713: whether an external DCP's display is in use for system sleep: sleep
+ * goes on only with the firmware's last word on the display DART off.
+ */
+const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	const char *why = NULL;
+
+	if (!dcp || !dcp->external)
+		return NULL;
+	mutex_lock(&dcp->lock);
+	if (!READ_ONCE(dcp->ext_dart_down))
+		why = "the display DART is on (last D572 was 1)";
+	mutex_unlock(&dcp->lock);
+	return why;
+}
+
 /* apple-drm, a consumer of this device, has blanked the panel before this. */
 int iomfb_m4_suspend(struct apple_dcp *owner)
 {
 	struct iomfb_m4 *dcp = owner->v26_6;
 	int ret;
 
-	/* An external DCP displays nothing yet: nothing to release for sleep. */
-	if (dcp && dcp->external)
+	if (dcp && dcp->external) {
+		/*
+		 * Every message RTKit received so far is dispatched, and stamped
+		 * with the old epoch, before the epoch moves on: its receive work
+		 * takes no lock held here (only state_lock, then queue_work).
+		 */
+		if (dcp->rtkit)
+			apple_rtkit_flush_rx(dcp->rtkit);
+		mutex_lock(&dcp->lock);
+		atomic_inc(&dcp->ext_pm_epoch);
+		WRITE_ONCE(dcp->ext_dart_down, true);
+		dcp->ext_dart_since_sleep = true;
+		mutex_unlock(&dcp->lock);
 		return 0;
+	}
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);
@@ -1948,8 +2346,16 @@ int iomfb_m4_resume(struct apple_dcp *owner)
 	struct iomfb_m4 *dcp = owner->v26_6;
 	int ret;
 
-	if (dcp && dcp->external)
+	/*
+	 * Messages received from now on are of this epoch (see suspend);
+	 * every one RTKit received before is dispatched with the old one first.
+	 */
+	if (dcp && dcp->external) {
+		if (dcp->rtkit)
+			apple_rtkit_flush_rx(dcp->rtkit);
+		atomic_inc(&dcp->ext_pm_epoch);
 		return 0;
+	}
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);

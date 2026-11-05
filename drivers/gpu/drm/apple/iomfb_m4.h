@@ -24,6 +24,8 @@ int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *mode);
 int iomfb_m4_health(struct apple_dcp *dcp);
 int iomfb_m4_error(struct apple_dcp *dcp);
 bool iomfb_m4_external_ready(struct apple_dcp *dcp);
+/* Why an external DCP's display refuses system sleep, or NULL. */
+const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp);
 
 /* The caller has waited for the producer fence before publishing the DMA GEM. */
 int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
@@ -50,6 +52,8 @@ static inline int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mo
 static inline int iomfb_m4_health(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_error(struct apple_dcp *dcp) { return -ENODEV; }
 static inline bool iomfb_m4_external_ready(struct apple_dcp *dcp) { return false; }
+
+static inline const char *iomfb_m4_ext_sleep_veto(struct apple_dcp *dcp) { return NULL; }
 
 static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 				  dma_addr_t dva, size_t mapped)

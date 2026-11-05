@@ -6557,12 +6557,15 @@ static int dcp_platform_prepare(struct device *dev)
 	const char *why;
 
 	/*
-	 * J713: a T8132 external DCP refuses system sleep while a route is
-	 * attached: prepare runs before any freezing, so nothing is frozen or
-	 * suspended yet and the sleep simply fails.
+	 * J713: a T8132 external DCP refuses system sleep while its display is
+	 * in use (an attached route, a sink, the output on, a swap in flight
+	 * or held): prepare runs before any freezing, so nothing is frozen or
+	 * suspended yet and the sleep simply fails. With nothing attached and
+	 * the output off, sleep goes on.
 	 */
 	if (dcp_is_t8132_ext(dcp)) {
-		why = dcp->dptxport[0].connected ? "a route is attached" : NULL;
+		why = dcp->dptxport[0].connected ? "a route is attached" :
+		      iomfb_m4_ext_sleep_veto(dcp);
 		if (why) {
 			dev_warn(dev, "refusing system sleep: external display attached (T8132): %s\n",
 				 why);
