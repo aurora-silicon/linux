@@ -8,7 +8,7 @@ root=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('isp',root/'tools/asahi/isp-tests.py')
 mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
 body=mod.function((root/'drivers/media/platform/apple/isp/isp-cam.c').read_text(),'isp_ch_configure_capture')
-names=sorted(set(re.findall(r'\b(isp_(?:cmd_\w+|ch_configure_frame_rate|ch_configure_pools|ch_load_setfile))\(',body)))
+names=sorted(set(re.findall(r'\b(isp_(?:cmd_\w+|ch_configure_frame_rate|ch_configure_pools|ch_load_setfile|ch_configure_power_line))\(',body)))
 code='''
 #include <stdbool.h>
 #include <stdio.h>
@@ -34,6 +34,8 @@ for name in names:
   code+='static int '+name+'(struct apple_isp *i,u32 ch,int a,int mode,int b){mbnr_mode=mode;return 0;}\n';continue
  effect={'isp_cmd_apple_ch_temporal_filter_start':'temporal_start++;','isp_cmd_apple_ch_motion_history_start':'history++;','isp_cmd_apple_ch_temporal_filter_enable':'enable++;','isp_cmd_apple_ch_temporal_filter_disable':'disable++;if(fail_disable)return -EIO;','isp_ch_configure_pools':'pools++;'}.get(name,'')
  code+='static int '+name+'(struct apple_isp *i,...){'+effect+'return 0;}\n'
+code += 'static bool isp_is_p010(struct apple_isp *i){return false;}\n'
+code += 'static int isp_ch_configure_temporal_filter(struct apple_isp *i,u32 ch){temporal_start++;history++;enable++;return 0;}\n'
 code+=body+r'''
 int main(void){
  struct hw hw={0};struct apple_isp isp={.hw=&hw};

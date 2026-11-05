@@ -309,7 +309,7 @@ int main(void)
 	for (unsigned int i = 0; i < 3; i++) {
 		CHECK(ipc_chan_send(&isp, &ch, 1) == -ETIME);
 		CHECK(ipc_chan_send(&isp, &ch, 0) == -ETIME);
-		CHECK(cisp_send(&isp, args, sizeof(args), 0, 1) == -ETIME);
+		CHECK(isp_cmd_send(&isp, args, sizeof(args), 0, 1) == -ETIME);
 	}
 	CHECK(writes == 1 && bells == 1 && cursors == 0);
 	CHECK(area[0] == 1 && area[1] == 2 && area[2] == 3 && area[3] == 4);

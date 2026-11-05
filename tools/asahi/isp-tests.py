@@ -44,7 +44,7 @@ def main():
               ['isp-ipc.c', 'isp-cmd.c', 'isp-cam.c', 'isp-fw.c']}
     groups = {
         'isp-ipc.c': ['ipc_chan_send'],
-        'isp-cmd.c': ['cisp_send'],
+        'isp-cmd.c': ['isp_cmd_send'],
         'isp-cam.c': ['apple_isp_stop_capture'],
         'isp-fw.c': ['isp_firmware_stop', 'isp_firmware_shutdown',
                      'apple_isp_firmware_halt', 'isp_firmware_boot',
@@ -61,7 +61,7 @@ def main():
         bodies['ipc_chan_send'] = bodies['ipc_chan_send'].replace(
             'int err = READ_ONCE(isp->ipc_error);', 'int err = 0;')
     elif args.control == 'overwrite':
-        bodies['cisp_send'] = bodies['cisp_send'].replace(
+        bodies['isp_cmd_send'] = bodies['isp_cmd_send'].replace(
             'int err = READ_ONCE(isp->ipc_error);', 'int err = 0;')
     elif args.control == 'stop':
         bodies['apple_isp_stop_capture'] = bodies['apple_isp_stop_capture'].replace(
