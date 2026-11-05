@@ -11,10 +11,12 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = {
-    'include/linux/soc/apple/dp-tunnel.h': ['apple_dp_tunnel_t6030_pclk'],
+    'include/linux/soc/apple/dp-tunnel.h': ['apple_dp_tunnel_t6030_pclk',
+                                            'apple_dp_tunnel_t8132_pclk'],
     'drivers/gpu/drm/apple/dcp-fabric-core.c': ['dcp_fabric_tunnel_clock_blocked'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
-        'dcp_fabric_snapshot_port', 'dcp_typec_tunnel_ctl'],
+        'dcp_route_tunnel_clock_blocked', 'dcp_fabric_snapshot_port',
+        'dcp_typec_tunnel_ctl'],
 }
 # Each must make the fixture fail.
 MUTATIONS = {

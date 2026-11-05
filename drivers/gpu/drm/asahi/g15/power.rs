@@ -13,7 +13,7 @@
 //! - +0x2c idle decision enabled (template 1, unchanged).
 //!
 //! DVFS is firmware-run on the ADT tables. The state it runs at is read back by
-//! `asahi-g15/pstate` ([`pstate`], [`super::Firmware::write_pstate`]): the newest power-state
+//! `aurora-g15/pstate` ([`pstate`], [`super::Firmware::write_pstate`]): the newest power-state
 //! record of the stats ring, and HardwareDataA's state words.
 
 mod idle;
@@ -50,7 +50,7 @@ impl Firmware {
         })
     }
 
-    /// The `asahi-g15/pstate` file ([`pstate::write`]): the stats ring's records so far, those
+    /// The `aurora-g15/pstate` file ([`pstate::write`]): the stats ring's records so far, those
     /// it holds unconsumed (read, not consumed), HardwareDataA's words and table A of the
     /// device tree's operating points. Read-only: nothing firmware-visible is written.
     pub(crate) fn write_pstate(&self, f: &mut impl fmt::Write) -> fmt::Result {

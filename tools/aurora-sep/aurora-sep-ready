@@ -16,8 +16,7 @@
 #
 # Restored is not enough to match: a match rewrites xART session records,
 # and the xART guard (apple_sep xart_guard) refuses that where it is known
-# to, for instance on a cold-boot Mac whose Touch ID was set up with the
-# guard off. So, from diag "matching":
+# to, for instance once it has refused a write. So, from diag "matching":
 #   usable      ready: no guard runs and xART is writable;
 #   blocked     NOT ready, with the reason and, for the guard, the
 #               documented xart_guard=0 opt-out and what it gives up;
@@ -111,8 +110,6 @@ blocked_reason() {
         echo "the xART guard (level $(attr xart_guard)) refused $refusals write(s) of records this Linux install did not create. $optout"
     elif [ "$(attr xart_guard_list)" = unavailable ]; then
         echo "the xART guard could not load its list of Linux's records, so it refuses every session write. $optout"
-    elif [ "$(attr boot)" = cold ]; then
-        echo "on this cold-boot Mac the keybag can only be created with the xART guard off, so the session records a match rewrites are not on the guard's list. $optout"
     else
         echo "the xART guard refuses a match's write. $optout"
     fi

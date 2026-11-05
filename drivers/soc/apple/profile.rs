@@ -450,6 +450,13 @@ pub(crate) const T6040: PlatformProfile = PlatformProfile {
     ..T8140
 };
 
+/// MacBook Pro 16" M4 Max (J616c). Its ADT describes the SEP and the sensor as
+/// J616s's does.
+pub(crate) const T6041: PlatformProfile = PlatformProfile {
+    name: "T6041/J616c",
+    ..T6040
+};
+
 /// MacBook Air M4 (J713). The J713 ADT (26.6.2, 25G83) puts the Mesa sensor
 /// on spi2 at `0x3ad108000`, 8 MHz, chip select 0, with power on the NUB GPIO
 /// controller (pin 28) and data-ready on AP GPIO 199. The SEP is
@@ -649,10 +656,12 @@ fn select(
     if has(b"apple,t8122") && (has(b"apple,j613") || has(b"apple,j615")) {
         return Ok(&T8122);
     }
-    // Only the board whose ADT was read: J616s. The other T6040 Macs share
-    // the SoC but their sensor wiring is unchecked.
-    if has(b"apple,t6040") && has(b"apple,j616s") {
+    // The T6040 profile is tested on J614s and J616s.
+    if has(b"apple,t6040") && (has(b"apple,j616s") || has(b"apple,j614s")) {
         return Ok(&T6040);
+    }
+    if has(b"apple,t6041") && has(b"apple,j616c") {
+        return Ok(&T6041);
     }
     // Only J713: the other T8132 Macs are unread.
     if has(b"apple,t8132") && has(b"apple,j713") {
@@ -731,6 +740,9 @@ mod tests {
         assert_eq!(picked(&[b"apple,j700", b"apple,t8140"]), Some(T8140.name));
         assert_eq!(picked(&[b"apple,j616s", b"apple,t6040"]), Some(T6040.name));
         assert_eq!(picked(&[b"apple,t6040"]), None);
+        assert_eq!(picked(&[b"apple,j614s", b"apple,t6040"]), Some(T6040.name));
+        assert_eq!(picked(&[b"apple,j616c", b"apple,t6041"]), Some(T6041.name));
+        assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
     }
 
     #[test]
@@ -779,6 +791,7 @@ mod dart_window_tests {
             &T6020_SEPOS13,
             &T8122,
             &T6040,
+            &T6041,
             &T8132,
         ] {
             assert_eq!(offset(profile.dart_window), 1 << 40);

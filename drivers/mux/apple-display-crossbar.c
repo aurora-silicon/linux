@@ -18,6 +18,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
 
 /*
@@ -99,6 +100,8 @@ struct apple_dpxbar_hw {
 	bool t6030_flow;
 	/* no UNK_TUNABLE write at probe */
 	bool no_tunable;
+	/* power domain held only while an output is selected */
+	bool runtime_pm;
 };
 
 struct apple_dpxbar {
@@ -108,6 +111,8 @@ struct apple_dpxbar {
 	int selected_dispext[MUX_MAX];
 	/* T6030 programs all its outputs itself, see apple_dpxbar_t6030_link() */
 	bool t6030_dpin;
+	/* outputs holding a runtime PM reference (runtime_pm crossbars) */
+	unsigned long rpm_held;
 	bool tunnel_link_up[MUX_MAX];
 	spinlock_t lock;
 };
@@ -326,6 +331,30 @@ static int apple_dpxbar_t6030_dpin_set(struct mux_control *mux, int state)
 	return 0;
 }
 
+/*
+ * A crossbar in an ATC power domain that switches off at runtime (T8132): the
+ * domain is held on while an output is selected, and only then are its
+ * registers touched. The mux core serialises the calls for one output.
+ */
+static int apple_dpxbar_rpm_set(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	int ret;
+
+	if (state >= 0 && !test_bit(index, &xbar->rpm_held)) {
+		ret = pm_runtime_resume_and_get(xbar->dev);
+		if (ret)
+			return ret;
+		set_bit(index, &xbar->rpm_held);
+	}
+	ret = apple_dpxbar_t6030_dpin_set(mux, state);
+	if (xbar->selected_dispext[index] < 0 &&
+	    test_and_clear_bit(index, &xbar->rpm_held))
+		pm_runtime_put(xbar->dev);
+	return ret;
+}
+
 static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 {
 	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
@@ -342,6 +371,8 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
 
 	if (index >= MUX_MAX)
 		return -EINVAL;
+	if (dpxbar->hw->runtime_pm)
+		return apple_dpxbar_rpm_set(mux, state);
 	/* T6030 routes every output on select and clocks it on link up. */
 	if (dpxbar->t6030_dpin)
 		return apple_dpxbar_t6030_dpin_set(mux, state);
@@ -836,6 +867,9 @@ int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 	if (xbar->selected_dispext[index] >= 0 &&
 	    xbar->selected_dispext[index] != state) {
 		ret = -EBUSY;
+	} else if (xbar->hw->runtime_pm && xbar->selected_dispext[index] < 0) {
+		/* Its power domain may be off; the selection routes it anyway. */
+		ret = -EOPNOTSUPP;
 	} else {
 		dpxbar_mask32(xbar, T602X_REG_030, t602x_mux_mask(index),
 			      state < 0 ? 0 : t602x_mux_set(index, state));
@@ -1011,6 +1045,12 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
+	if (hw->runtime_pm) {
+		/* Left suspended: the ATC domain may go off until a selection. */
+		ret = devm_pm_runtime_enable(dev);
+		if (ret)
+			return ret;
+	}
 
 	if (!hw->no_tunable &&
 	    !of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
@@ -1121,6 +1161,22 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6041 = {
 	.no_tunable = true,
 };
 
+/*
+ * T8132 (M4): one crossbar per ATC, 0x4000 bytes in the ATC core window,
+ * the T602X map and T6030 flow. There is no tunable and no cycle-slip
+ * workaround.
+ * UFP mux selectors are (endpoint << 1) | port: dcpext0 is 2, dcpext1 is 4.
+ * The ATC USB domain switches off at runtime, so it is only held while an
+ * output is selected; probe touches no register.
+ */
+static const struct apple_dpxbar_hw apple_dpxbar_hw_t8132 = {
+	.n_ufp = 9,
+	.ops = &apple_dpxbar_t602x_ops,
+	.t6030_flow = true,
+	.no_tunable = true,
+	.runtime_pm = true,
+};
+
 static const struct of_device_id apple_dpxbar_ids[] = {
 	{
 		.compatible = "apple,t8103-display-crossbar",
@@ -1141,6 +1197,10 @@ static const struct of_device_id apple_dpxbar_ids[] = {
 	{
 		.compatible = "apple,t6041-display-crossbar",
 		.data = &apple_dpxbar_hw_t6041,
+	},
+	{
+		.compatible = "apple,t8132-display-crossbar",
+		.data = &apple_dpxbar_hw_t8132,
 	},
 	{}
 };

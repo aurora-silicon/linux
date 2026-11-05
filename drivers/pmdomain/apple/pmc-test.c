@@ -185,13 +185,112 @@ static void apple_pmc_test_pending_floor(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_pmc_floor_update(&dev, 4, 0xff, 0x35), -EINVAL);
 }
 
+static struct apple_pmc_domain *apple_pmc_test_floor(struct kunit *test,
+						     struct apple_pmc *pmc,
+						     unsigned int rail,
+						     unsigned int level)
+{
+	struct apple_pmc_domain *dom = kunit_kzalloc(test, sizeof(*dom), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dom);
+	dom->pmc = pmc;
+	dom->floor = true;
+	dom->rail = rail;
+	dom->level = level;
+	list_add_tail(&dom->list, &pmc->domains);
+	return dom;
+}
+
+static u32 apple_pmc_test_ap_floor(struct apple_pmc *pmc)
+{
+	return readl(pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride);
+}
+
+/*
+ * Floors on one rail combine to the highest one held, leave other rails and
+ * the AP's DCS vote alone, and are gone once the last one is released.
+ */
+static void apple_pmc_test_floor_aggregate(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain *mid, *max, *other;
+	u32 soc = APPLE_PMC_RAIL_MASK(1);
+
+	INIT_LIST_HEAD(&pmc->domains);
+	pmc->hw = &apple_pmc_hw_t6040;
+	apple_pmc_test_set_dcs_vote(pmc, pmc->hw->ap_agent, 3);
+	mid = apple_pmc_test_floor(test, pmc, 1, 1);
+	max = apple_pmc_test_floor(test, pmc, 1, 2);
+	other = apple_pmc_test_floor(test, pmc, 3, 1);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(mid, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 1U << 4);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(max, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 2U << 4);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(max, false), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 1U << 4);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(mid, false), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc), 3U);
+	KUNIT_EXPECT_FALSE(test, other->on);
+}
+
+/* A floor that the PMC does not take back is not left marked as held. */
+static void apple_pmc_test_floor_pending_timeout(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct apple_pmc_domain *dom;
+	void __iomem *reg;
+
+	INIT_LIST_HEAD(&pmc->domains);
+	pmc->hw = &apple_pmc_hw_t8132;
+	reg = pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride;
+	writel(BIT(pmc->hw->ap_agent), reg + 4);
+	dom = apple_pmc_test_floor(test, pmc, 1, 2);
+	KUNIT_EXPECT_EQ(test, apple_pmc_floor_set(dom, true), -ETIMEDOUT);
+	KUNIT_EXPECT_FALSE(test, dom->on);
+}
+
+/*
+ * A DCS floor raises the AP's DCS vote above its inherited vote while held,
+ * yields to the DCS limit, and gives the inherited vote back when released.
+ */
+static void apple_pmc_test_dcs_floor(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	const struct apple_pmc_hw *hw = pmc->hw;
+	struct apple_pmc_domain *dom;
+
+	INIT_LIST_HEAD(&pmc->domains);
+	apple_pmc_test_set_dcs_vote(pmc, hw->ap_agent, 1);
+	pmc->ap_dcs_vote = apple_pmc_ap_dcs_read(pmc);
+	pmc->enable[hw->dcs_rail] = BIT(1) | BIT(hw->ap_agent);
+	dom = apple_pmc_test_floor(test, pmc, hw->dcs_rail, hw->dcs_max);
+
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(dom, true), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max);
+	/* The limit caps the floor; the other agents ask for nothing. */
+	pmc->dcs_state = 3;
+	apple_pmc_dcs_vote(pmc);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max - 3);
+	pmc->dcs_state = 0;
+	apple_pmc_dcs_vote(pmc);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), hw->dcs_max);
+	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(dom, false), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmc_ap_dcs_read(pmc), 1);
+	/* Other rails of the AP's floor word are untouched. */
+	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & ~APPLE_PMC_RAIL_MASK(hw->dcs_rail), 0U);
+}
+
 static struct kunit_case apple_pmc_test_cases[] = {
+	KUNIT_CASE(apple_pmc_test_dcs_floor),
 	KUNIT_CASE(apple_pmc_test_partial_enable),
 	KUNIT_CASE(apple_pmc_test_release_restores_ap_vote),
 	KUNIT_CASE(apple_pmc_test_pending_floor),
 	KUNIT_CASE(apple_pmc_test_agent_enable),
 	KUNIT_CASE(apple_pmc_test_agent_rails),
 	KUNIT_CASE(apple_pmc_test_dcs_limit_restores_ap_vote),
+	KUNIT_CASE(apple_pmc_test_floor_aggregate),
+	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
 	{}
 };
 
