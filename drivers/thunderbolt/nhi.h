@@ -224,6 +224,12 @@ struct tb_nhi_ops {
 #define TB_HOST_DP_KEEP_DPRX_TIMEOUT	BIT(3)
 #define TB_HOST_DP_ADAPTER_QUIRKS		BIT(4)
 #define TB_HOST_DP_INITIAL_BW_GRANT	BIT(5)
+/*
+ * Both DP IN streams of a host PHY must run at one link rate: DP tunnels
+ * from the host's DP IN adapters offer at most HBR2, at which two 4K60
+ * streams still fit.
+ */
+#define TB_HOST_DP_HBR2_MAX		BIT(6)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel
