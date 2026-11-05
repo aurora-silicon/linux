@@ -4520,8 +4520,29 @@ static const struct phy_ops apple_atc_usb3_phy_ops = {
 	.set_mode = atcphy_rpm_usb3_set_mode,
 };
 
+/*
+ * The T8132 PHY has no DisplayPort alternate mode: its DP PHY only exists so
+ * that a DisplayPort tunnel can get its pixel clock, see
+ * apple_atc_dp_tunnel_rate_source(). DCP's DPTX Activate and Deactivate
+ * name a DP mode or none while a tunnel runs; that is a no-op as long as the
+ * PHY is in USB4/Thunderbolt mode. Anything else is refused, and nothing here
+ * touches a register.
+ */
+static int atcphy_dpphy_set_mode_t8132(struct apple_atcphy *atcphy, enum phy_mode mode)
+{
+	guard(mutex)(&atcphy->lock);
+	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) &&
+	    (atcphy->mode == APPLE_ATCPHY_MODE_USB4 || atcphy->mode == APPLE_ATCPHY_MODE_TBT))
+		return 0;
+	return -EOPNOTSUPP;
+}
+
 static int atcphy_dpphy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
+	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
+		return atcphy_dpphy_set_mode_t8132(atcphy, mode);
 	/* Nothing to do here since the setup already happened in mux_set */
 	if (mode == PHY_MODE_DP && submode == 0)
 		return 0;
@@ -4579,6 +4600,9 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 	enum atcphy_dp_link_rate link_rate;
 
+	/* No DP alternate mode: a tunnel sets its rate through its own call. */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
+		return -EOPNOTSUPP;
 	if (atcphy->hw->has_t8140_dp)
 		return j700_dp_configure(atcphy, opts);
 
@@ -4804,10 +4828,14 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
 		{ &atcphy->phys.dp, &apple_atc_dp_phy_ops },
 	};
 
+	/*
+	 * A T8132 PHY with its USB3/USB4 banks gets a DP PHY for DisplayPort
+	 * tunnels only (see atcphy_dpphy_set_mode_t8132()); creating it does
+	 * not touch the hardware.
+	 */
 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
 		if ((atcphy->dp_only && phys[i].phy != &atcphy->phys.dp) ||
-		    (atcphy_usb2_only(atcphy) && i != 0) ||
-		    (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && i == 2))
+		    (atcphy_usb2_only(atcphy) && i != 0))
 			continue;
 		*phys[i].phy = devm_phy_create(atcphy->dev, NULL, phys[i].ops);
 		if (IS_ERR(*phys[i].phy))
