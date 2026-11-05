@@ -383,6 +383,7 @@ impl IdentityIndex {
 
 enum Op {
     Idle,
+    Sign(crate::keys::Signing),
     Enrol {
         label: [u8; LABEL_LEN],
         stage: u32,
@@ -406,6 +407,7 @@ impl Op {
     fn is_terminal(&self) -> bool {
         match self {
             Op::Idle => false,
+            Op::Sign(signing) => signing.terminal.is_some(),
             Op::Enrol { terminal, .. } => terminal.is_some(),
             Op::Verify { terminal, .. } => terminal.is_some(),
         }
@@ -418,6 +420,7 @@ impl Op {
 
 pub(crate) struct Session {
     open: bool,
+    worker_active: bool,
     op: Op,
     unseen: bool,
     enrol_stage_unseen: bool,
@@ -428,6 +431,7 @@ impl Session {
     pub(crate) fn new() -> Session {
         Session {
             open: false,
+            worker_active: false,
             op: Op::Idle,
             unseen: false,
             enrol_stage_unseen: false,
@@ -443,6 +447,10 @@ impl Session {
         self.token = None;
     }
 
+    pub(crate) fn available(&self) -> bool {
+        !self.worker_active && self.op.may_start()
+    }
+
     pub(crate) fn ready(&self) -> bool {
         self.unseen
     }
@@ -453,6 +461,7 @@ pub(crate) struct Context<'a> {
     pub(crate) index: &'a IdentityIndex,
     pub(crate) sensor_present: bool,
     pub(crate) live_identity_count: Option<usize>,
+    pub(crate) biometric_keys_supported: bool,
 }
 
 pub(crate) struct Handled {
@@ -519,7 +528,7 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         // when SEP itself successfully answered LIST_IDENTITIES; older
         // kernels and unavailable SEP contexts leave this flag clear.
         reserved: [
-            u32::from(ctx.live_identity_count.is_some()),
+            u32::from(ctx.live_identity_count.is_some()) | (u32::from(ctx.biometric_keys_supported) << 1),
             ctx.live_identity_count.unwrap_or(0) as u32,
             0,
         ],
@@ -560,7 +569,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
     require_sensor(ctx.sensor_present)?;
 
-    if !ctx.session.op.may_start() {
+    if !ctx.session.available() {
         return Err(EBUSY);
     }
     if matches!(ctx.live_identity_count, Some(count) if count >= SEP_USER_CAPACITY)
@@ -569,6 +578,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         return Err(ENOSPC);
     }
 
+    ctx.session.worker_active = true;
     ctx.session.op = Op::Enrol {
         label: request.label,
         stage: 0,
@@ -632,6 +642,14 @@ pub(crate) fn capture_guide(session: &mut Session, guide: Guidance) -> bool {
                 false
             }
         }
+        Op::Sign(signing) => {
+            if signing.terminal.is_none() && signing.guidance != guide {
+                signing.guidance = guide;
+                true
+            } else {
+                false
+            }
+        }
         Op::Idle => false,
     };
     if changed {
@@ -682,7 +700,7 @@ fn enrol_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
-        Op::Verify { .. } => return Err(EBUSY),
+        Op::Verify { .. } | Op::Sign(_) => return Err(EBUSY),
         Op::Enrol {
             stage,
             terminal,
@@ -732,7 +750,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
     require_sensor(ctx.sensor_present)?;
 
-    if !ctx.session.op.may_start() {
+    if !ctx.session.available() {
         return Err(EBUSY);
     }
 
@@ -755,6 +773,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     }
 
     ctx.session.token = None;
+    ctx.session.worker_active = true;
     ctx.session.op = Op::Verify {
         nonce: request.nonce,
         terminal: None,
@@ -798,7 +817,7 @@ pub(crate) fn verify_is_live(session: &Session) -> bool {
 }
 
 pub(crate) fn capture_is_live(session: &Session) -> bool {
-    enrol_is_live(session) || verify_is_live(session)
+    enrol_is_live(session) || verify_is_live(session) || sign_is_live(session)
 }
 
 fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
@@ -808,7 +827,7 @@ fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
-        Op::Enrol { .. } => return Err(EBUSY),
+        Op::Enrol { .. } | Op::Sign(_) => return Err(EBUSY),
         Op::Verify { nonce, terminal, guidance } => {
             out.guidance = *guidance;
             match terminal {
@@ -866,6 +885,7 @@ fn cancel(ctx: &mut Context<'_>) -> Result<Handled> {
         Op::Idle => return Err(ENOENT),
         Op::Enrol { terminal, .. } => *terminal = Some(EnrolOutcome::Failed(STATUS_LOCAL)),
         Op::Verify { terminal, .. } => *terminal = Some(VerifyOutcome::Failed(STATUS_LOCAL)),
+        Op::Sign(signing) => signing.terminal = Some(Err(ECANCELED)),
     }
 
     ctx.session.token = None;
@@ -892,6 +912,9 @@ pub(crate) fn abort_capture(session: &mut Session) -> bool {
         Op::Verify { terminal, .. } if terminal.is_none() => {
             *terminal = Some(VerifyOutcome::Failed(STATUS_LOCAL))
         }
+        Op::Sign(signing) if signing.terminal.is_none() => {
+            signing.terminal = Some(Err(ECANCELED));
+        }
         _ => return false,
     }
     session.token = None;
@@ -906,6 +929,7 @@ pub(crate) fn starts_capture(cmd: u32) -> bool {
 
 fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     require_admin()?;
+    if !ctx.session.available() { return Err(EBUSY); }
     let request: Delete = UserSlice::new(user, core::mem::size_of::<Delete>())
         .reader()
         .read()?;
@@ -935,6 +959,7 @@ fn delete(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 
 fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
     require_admin()?;
+    if !ctx.session.available() { return Err(EBUSY); }
 
     if ctx.index.total() == 0 {
         pr_info!("sep_bio: DELETE_ALL on empty index; reporting success (nothing to delete)\n");
@@ -963,7 +988,7 @@ fn delete_all(ctx: &mut Context<'_>) -> Result<Handled> {
 }
 
 pub(crate) fn open(session: &mut Session) -> Result<()> {
-    if session.open {
+    if session.open || session.worker_active {
         return Err(EBUSY);
     }
     session.reset();
@@ -973,4 +998,120 @@ pub(crate) fn open(session: &mut Session) -> Result<()> {
 
 pub(crate) fn release(session: &mut Session) {
     session.reset();
+}
+
+/// Reserve the same ownership for synchronous key operations as capture work.
+pub(crate) fn reserve_worker(session: &mut Session) -> Result<()> {
+    if !session.available() { return Err(EBUSY); }
+    session.worker_active = true;
+    Ok(())
+}
+
+pub(crate) fn worker_done(session: &mut Session) {
+    session.worker_active = false;
+}
+
+pub(crate) fn start_sign(session: &mut Session, request: crate::keys::SignRequest) -> Result<Handled> {
+    if !session.available() {
+        return Err(EBUSY);
+    }
+    session.op = Op::Sign(crate::keys::Signing {
+        deadline_ns: request.deadline_ns,
+        request: Some(request),
+        terminal: None,
+        guidance: Guidance::Place,
+    });
+    session.token = None;
+    session.worker_active = true;
+    session.unseen = false;
+    Ok(Handled { start_verify: true, ..ok()? })
+}
+
+pub(crate) fn is_sign(session: &Session) -> bool {
+    matches!(session.op, Op::Sign(_))
+}
+
+pub(crate) fn take_sign_request(session: &mut Session) -> Option<crate::keys::SignRequest> {
+    let Op::Sign(signing) = &mut session.op else { return None; };
+    if signing.terminal.is_some() || !session.open { return None; }
+    signing.request.take()
+}
+
+pub(crate) fn sign_is_live(session: &Session) -> bool {
+    let Op::Sign(signing) = &session.op else { return false; };
+    session.open && signing.terminal.is_none() && crate::shim::monotonic_ns() < signing.deadline_ns
+}
+
+pub(crate) fn finish_sign(session: &mut Session, result: Result<crate::keys::Signature>) -> bool {
+    let Op::Sign(signing) = &mut session.op else { return false; };
+    if !session.open || signing.terminal.is_some() { return false; }
+    signing.terminal = Some(if crate::shim::monotonic_ns() >= signing.deadline_ns {
+        Err(ETIMEDOUT)
+    } else {
+        result
+    });
+    session.unseen = true;
+    true
+}
+
+pub(crate) fn poll_sign(session: &mut Session, user: UserPtr) -> Result<Handled> {
+    let Op::Sign(signing) = &session.op else { return Err(ENOENT); };
+    let mut out = crate::keys::SignPoll {
+        state: State::Pending as u32,
+        status: 0,
+        guidance: signing.guidance as u32,
+        sig_len: 0,
+        signature: [0; ATTEST_SIG_MAX],
+    };
+    match &signing.terminal {
+        Some(Ok(signature)) => {
+            out.state = State::Done as u32;
+            out.sig_len = signature.len;
+            out.signature = signature.bytes;
+        }
+        Some(Err(error)) => {
+            out.state = State::Failed as u32;
+            out.status = error.to_errno();
+        }
+        None => {},
+    }
+    UserSlice::new(user, core::mem::size_of_val(&out)).writer().write(&out)?;
+    session.unseen = false;
+    ok()
+}
+
+#[kernel::macros::kunit_tests(apple_sep_sign_lifecycle)]
+mod sign_tests {
+    use super::*;
+
+    fn request(deadline_ns: u64) -> crate::keys::SignRequest {
+        crate::keys::SignRequest { blob: KVec::new(), digest: [0; 32], deadline_ns }
+    }
+
+    #[test]
+    fn canceled_or_closed_worker_cannot_complete_a_new_request() -> Result {
+        for close in [false, true] {
+            let mut session = Session::new();
+            open(&mut session)?;
+            reserve_worker(&mut session)?;
+            assert!(start_sign(&mut session, request(u64::MAX)).is_err());
+            worker_done(&mut session);
+            start_sign(&mut session, request(u64::MAX))?;
+            assert!(take_sign_request(&mut session).is_some());
+            assert!(take_sign_request(&mut session).is_none());
+            if close { release(&mut session); } else { abort_capture(&mut session); }
+            assert!(!sign_is_live(&session));
+            assert!(!finish_sign(&mut session, Err(EIO)));
+            assert!(!session.available());
+            assert!(open(&mut session).is_err());
+            worker_done(&mut session);
+            if close { open(&mut session)?; }
+            start_sign(&mut session, request(0))?;
+            assert!(!sign_is_live(&session));
+            assert!(finish_sign(&mut session, Err(EIO)));
+            let Op::Sign(signing) = &session.op else { return Err(EINVAL); };
+            assert!(matches!(signing.terminal, Some(Err(ETIMEDOUT))));
+        }
+        Ok(())
+    }
 }

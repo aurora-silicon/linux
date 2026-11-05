@@ -16,6 +16,7 @@ mod dt;
 mod fv;
 mod hwrng;
 mod image;
+mod keys;
 mod keybag;
 mod keybag_identity;
 mod pm;
@@ -641,6 +642,7 @@ struct SepData {
 
     #[pin]
     bio_session: Mutex<bio::Session>,
+    key_api_failed: Atomic<bool>,
 
     #[pin]
     bio_index: Mutex<bio::IdentityIndex>,
@@ -845,6 +847,7 @@ impl SepData {
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
                 sbio_ready: Atomic::new(false),
                 bio_session <- new_mutex!(bio::Session::new()),
+                key_api_failed: Atomic::new(false),
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
                 store <- new_mutex!(store),
@@ -1669,6 +1672,7 @@ impl SepData {
         }
         let mut acm_handle = [0u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
         acm_handle.copy_from_slice(&out[..crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        let credential = keys::Credential::new(self, acm_handle);
 
         let Some((status, _)) = self.scrd_command(&crate::scrd::scrd_context_externalize(&acm_handle)) else {
             dev_err!(self.dev, "enrol: SCRD context externalize did not answer\n");
@@ -1699,7 +1703,7 @@ impl SepData {
             return None;
         }
 
-        Some(acm_handle)
+        Some(credential.into_handle())
     }
 
     fn establish_scrd_match_context(&self, user: crate::sbio::UserId) -> bool {
@@ -2198,10 +2202,12 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         if this.shutting_down.load(Relaxed) || !this.capture_begin() {
+            bio::worker_done(&mut this.bio_session.lock());
             return;
         }
         this.run_enrolment();
         this.capture_end();
+        bio::worker_done(&mut this.bio_session.lock());
     }
 }
 
@@ -2210,10 +2216,12 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         if this.shutting_down.load(Relaxed) || !this.capture_begin() {
+            bio::worker_done(&mut this.bio_session.lock());
             return;
         }
         this.run_verify();
         this.capture_end();
+        bio::worker_done(&mut this.bio_session.lock());
     }
 }
 

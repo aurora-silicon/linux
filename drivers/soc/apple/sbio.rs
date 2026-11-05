@@ -40,13 +40,17 @@ impl SepData {
     // answer has to be recorded here or nowhere. Success is decided as in
     // `sbio_call`.
     fn sbio_verify_step(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
-        let done = match self.sbio_transfer(op) {
+        self.sbio_verify_payload(op.opcode(), op.name(), op.payload())
+    }
+
+    fn sbio_verify_payload(&self, opcode: u16, name: &'static CStr, payload: &[u8]) -> Option<KVec<u8>> {
+        let done = match self.sbio_transfer_raw(opcode, name, payload) {
             Ok(done) => done,
             Err(e) => {
                 dev_err!(
                     self.dev,
                     "verify: {} transfer failed ({:?})\n",
-                    op.name(),
+                    name,
                     e
                 );
                 return None;
@@ -58,7 +62,7 @@ impl SepData {
                 dev_err!(
                     self.dev,
                     "verify: {} answered status {}\n",
-                    op.name(),
+                    name,
                     done.status
                 );
                 None
@@ -285,7 +289,7 @@ impl SepData {
         self.bio_wake();
     }
 
-    fn bio_wake(&self) {
+    pub(crate) fn bio_wake(&self) {
         if let Some(dev) = self.bio_dev.lock().as_ref() {
             dev.wake();
         }
@@ -1299,19 +1303,13 @@ impl SepData {
     }
 
     pub(crate) fn run_verify(&self) {
-        self.retry_restore_proof();
-        if !self.templates_restored.load(Relaxed) {
-            dev_err!(
-                self.dev,
-                "verify: refusing before touching the sensor; cold-match prep, restore, or device-view identity proof did not complete. This is not a non-matching finger\n"
-            );
-            self.finish_verify(
-                bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
-                [0u8; bio::TOKEN_LEN],
-            );
+        let signing = bio::is_sign(&self.bio_session.lock());
+        if signing {
+            let request = bio::take_sign_request(&mut self.bio_session.lock());
+            if let Some(request) = request { self.run_key_sign(request); }
             return;
         }
-
+        if !bio::verify_is_live(&self.bio_session.lock()) { return; }
         let Some(token_bytes) = self.mint_token_bytes() else {
             dev_err!(self.dev, "verify: could not draw a result token\n");
             self.finish_verify(
@@ -1320,20 +1318,28 @@ impl SepData {
             );
             return;
         };
+        let outcome = self.verify_capture(None);
+        self.finish_verify(outcome, token_bytes);
+    }
 
+    pub(crate) fn verify_capture(&self, context: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>) -> bio::VerifyOutcome {
+        self.retry_restore_proof();
+        if !self.templates_restored.load(Relaxed) {
+            dev_err!(self.dev, "verify: refusing before touching the sensor; cold-match prep, restore, or device-view identity proof did not complete. This is not a non-matching finger\n");
+            return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        }
         self.settle_before_capture();
 
         // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
         if !self.bring_sensor_online() {
             dev_err!(self.dev, "verify: the sensor did not come back online\n");
-            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
-            return;
+            return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
         }
 
-        // The match uses the plain 0x23->0x06->0x65 pipeline, with no SCRD step.
+        // Identification and credential matches share the capture pipeline.
 
-        let outcome = self.verify_one_image();
+        let outcome = self.verify_one_image(context);
         let _ = sensor::idle();
         sensor::power(false);
         self.note_capture_end();
@@ -1344,27 +1350,19 @@ impl SepData {
         );
         if definitive {
             let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
-                self.finish_verify(
-                    bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
-                    token_bytes,
-                );
-                return;
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
             };
             if !self.save_after_match(user) {
-                self.finish_verify(
-                    bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
-                    token_bytes,
-                );
-                return;
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
             }
         }
-        self.finish_verify(outcome, token_bytes);
+        outcome
     }
 
     // Every exit that fails a live verify logs why: userspace sees only a bare
     // "unspecified error", which cannot tell a sensor fault from a refused
     // match step.
-    fn verify_one_image(&self) -> bio::VerifyOutcome {
+    fn verify_one_image(&self, context: Option<&[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>) -> bio::VerifyOutcome {
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
             dev_err!(self.dev, "verify: invalid probe user id\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
@@ -1449,7 +1447,15 @@ impl SepData {
             user,
             crate::shim::monotonic_ns(),
         );
-        if self.sbio_verify_step(&init).is_none() {
+        let accepted = if let Some(context) = context {
+            match crate::sbio::sbio_credential_image_init(&init, context) {
+                Ok(payload) => self.sbio_verify_payload(init.opcode(), init.name(), &payload).is_some(),
+                Err(_) => false,
+            }
+        } else {
+            self.sbio_verify_step(&init).is_some()
+        };
+        if !accepted {
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
@@ -2684,6 +2690,7 @@ impl SepData {
             .is_err()
         {
             this.finish_enrolment(Err(ENROL_STATUS_SENSOR));
+            bio::worker_done(&mut this.bio_session.lock());
         }
     }
 
@@ -2692,10 +2699,13 @@ impl SepData {
             .enqueue::<Arc<SepData>, VERIFY_WORK_ID>(this.clone())
             .is_err()
         {
-            this.finish_verify(
-                bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR),
-                [0u8; bio::TOKEN_LEN],
-            );
+            if bio::is_sign(&this.bio_session.lock()) {
+                bio::finish_sign(&mut this.bio_session.lock(), Err(EIO));
+                this.bio_wake();
+            } else {
+                this.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), [0; bio::TOKEN_LEN]);
+            }
+            bio::worker_done(&mut this.bio_session.lock());
         }
     }
 
@@ -2720,8 +2730,14 @@ impl SepData {
     }
 
     pub(crate) fn bio_ioctl(&self, cmd: u32, arg: usize) -> Result<bio::Handled> {
+        if cmd == crate::keys::IOC_CREATE || cmd == crate::keys::IOC_SIGN_START || cmd == crate::keys::IOC_SIGN_POLL {
+            return self.key_ioctl(cmd, arg);
+        }
         if cmd == bio::IOC_ATTEST {
-            return self.bio_attest(arg);
+            bio::reserve_worker(&mut self.bio_session.lock())?;
+            let result = self.bio_attest(arg);
+            bio::worker_done(&mut self.bio_session.lock());
+            return result;
         }
         // With xART writes off the enclave cannot persist what an enrolment or
         // a match changes. It saves anti-replay state after every match, and a
@@ -2762,6 +2778,7 @@ impl SepData {
                 index: &index,
                 sensor_present,
                 live_identity_count,
+                biometric_keys_supported: self.biometric_keys_supported(),
             };
             bio::ioctl(&mut ctx, cmd, arg)?
         };
