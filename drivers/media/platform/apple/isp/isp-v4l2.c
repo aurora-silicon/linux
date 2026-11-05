@@ -1152,6 +1152,9 @@ static const struct v4l2_ctrl_ops isp_exposure_ctrl_ops = {
  */
 static void isp_init_exposure_ctrls(struct apple_isp *isp)
 {
+	if (!isp->hw->meta_exposure)
+		return;
+
 	isp->frame_gain = 256;
 	isp->gain = v4l2_ctrl_new_std(&isp->ctrl_handler,
 				      &isp_exposure_ctrl_ops, V4L2_CID_GAIN,
