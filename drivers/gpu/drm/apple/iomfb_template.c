@@ -29,6 +29,7 @@
 
 #include "dcp.h"
 #include "dcp-internal.h"
+#include "dcp-edr.h"
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "parser.h"
@@ -160,10 +161,12 @@ static u64 dcp_binary64_ratio(u64 num, u64 den)
  * PQ 100 lands at SDR white and highlights reach the panel peak.  H rises
  * in steps linear in stops, one per swap, about 1 s when EDR starts, with
  * a brightness limit of 1.3 x the brightness in the middle of the ramp.
+ * H never exceeds the panel's potential headroom from the ADT, as on
+ * macOS: below the SDR white at which the peak needs more, H stays at that
+ * ceiling and the panel level follows SDR white.
  * When EDR ends, headroom used drops to 1.0 and H returns to 1.0.
  * Unchanged values are left out: the firmware keeps them.
  */
-#define DCP_EDR_STEP_UP		1047	/* x1000 per swap */
 
 #define dcp_swap_set_ratio(swap, field, flag, num, den)				\
 	do {								\
@@ -184,7 +187,8 @@ static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) 
 {
 	u32 peak = READ_ONCE(dcp->panel.peak_nits);
 	u32 sdr = carries ? nits : dcp_backlight_desktop_nits(dcp);
-	u32 cur = dcp->edr_hm ?: 1000, target = 1000, next, bri;
+	u32 cur = dcp->edr_hm ?: DCP_EDR_UNITY, target = DCP_EDR_UNITY, next, bri;
+	u32 prev_sdr = dcp->edr_sdr;
 	bool restart = dcp->edr_restart;
 
 	dcp->edr_restart = false;
@@ -192,10 +196,13 @@ static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) 
 		return;		/* no EDR, and none to wind down */
 	if (!sdr)
 		return;
-	if (dcp->output_edr && peak > sdr)
-		target = peak * 1000 / sdr;
-	if (restart && dcp->output_edr)
-		cur = 1000;
+	if (dcp->output_edr)
+		target = dcp_edr_target(peak, sdr, dcp->panel.edr_ceiling);
+	if (restart && dcp->output_edr) {
+		cur = DCP_EDR_UNITY;
+		prev_sdr = sdr;
+	}
+	dcp->edr_sdr = sdr;
 	if (cur == target && !carries && !restart && dcp->edr_sent == dcp->output_edr)
 		return;
 
@@ -205,13 +212,9 @@ static void dcp_edr_prepare(struct apple_dcp *dcp, struct DCP_FW_NAME(dcp_swap) 
 	 * no further swap, and a ramp stuck partway leaves SDR content dimmed
 	 * by the scale (headroom used is already 1.0).
 	 */
-	next = cur;
-	if (target > cur)
-		next = min(cur * DCP_EDR_STEP_UP / 1000 + 1, target);
-	else if (target < cur)
-		next = target;
+	next = dcp_edr_next(cur, target, prev_sdr, sdr);
 
-	bri = (u64)sdr * next / 1000;
+	bri = (u64)sdr * next / DCP_EDR_UNITY;
 	dcp_swap_set_brightness(swap, bri);
 	dcp_swap_set_ratio(swap, edr_scale, 2, 1000, next);
 	if (dcp->output_edr) {
