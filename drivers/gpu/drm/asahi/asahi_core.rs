@@ -22,6 +22,8 @@ mod gem;
 
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 mod g16;
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+mod g18;
 mod gpu;
 mod hw;
 mod initdata;
@@ -78,6 +80,9 @@ struct DriverModule {
     _g15: G15Registration,
     // Field drop order unregisters/joins driver producers before queue teardown.
     _g16: Option<Pin<KBox<G16Registration>>>,
+    #[cfg(CONFIG_DRM_ASAHI_G18)]
+    #[pin]
+    _g18: kernel::driver::Registration<kernel::platform::Adapter<g18::probe::Driver>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
     _cleanup: cleanup::QueueOwner,
@@ -99,6 +104,8 @@ impl kernel::InPlaceModule for DriverModule {
                 module,
             ),
             _g16: register_g16(module)?,
+            #[cfg(CONFIG_DRM_ASAHI_G18)]
+            _g18 <- kernel::driver::Registration::new(g18::probe::DRIVER_NAME, module),
             // All fallible fields are initialized. This final unit initializer cannot fail.
             #[cfg(CONFIG_DRM_ASAHI_G15)]
             _g15_ready: g15::activate(),
