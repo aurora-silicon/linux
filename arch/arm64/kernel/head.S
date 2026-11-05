@@ -309,13 +309,14 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 
 #ifdef CONFIG_ARM64_CTXR_EXECMEM
 	/*
-	 * Kernel text inside an armed CTXR window can't execute at EL1, so a
-	 * core entering after the window is known goes straight to VHE here
-	 * instead of dropping to EL1 and coming back through finalise_el2.
+	 * Kernel text inside an armed CTXR window can't execute at EL1, and
+	 * the window isn't known this early. Apple cores are VHE only, so they
+	 * go straight to VHE here on every entry and never run at EL1.
 	 */
-	adr_l	x0, ctxr_stay_el2
-	ldr	w0, [x0]
-	cbz	w0, 1f
+	mrs	x0, midr_el1
+	ubfx	x0, x0, #MIDR_IMPLEMENTOR_SHIFT, #8
+	cmp	x0, #ARM_CPU_IMP_APPLE
+	b.ne	.Lctxr_not_apple
 
 	finalise_el2_state
 
@@ -329,14 +330,18 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	msr	mdcr_el2, x0
 
 	mov_q	x0, INIT_SCTLR_EL1_MMU_OFF
+	msr_s	SYS_SCTLR_EL12, x0
 	pre_disable_mmu_workaround
 	msr	sctlr_el1, x0
 	isb
 
+	mov	x0, #(PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT | PSR_MODE_EL2h)
+	msr	spsr_el2, x0
+
 	mov	w0, #BOOT_CPU_MODE_EL2
 	orr	x0, x0, #BOOT_CPU_FLAG_E2H
-	ret
-1:
+	eret
+.Lctxr_not_apple:
 #endif
 
 	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF
