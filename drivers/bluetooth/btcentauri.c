@@ -580,7 +580,6 @@ static int cen_vendor_command(struct hci_dev *hdev, u16 opcode,
 
 static int cen_hci_reset_dup_filter(struct hci_dev *hdev)
 {
-	struct cen_bt *bt = hci_get_drvdata(hdev);
 	static const u8 flags;
 	int ret;
 
