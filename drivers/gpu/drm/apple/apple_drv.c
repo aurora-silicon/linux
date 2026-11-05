@@ -43,6 +43,7 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
+#include <linux/pm.h>
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
@@ -1634,18 +1635,29 @@ static int apple_platform_probe(struct platform_device *pdev)
 {
 	struct device *mdev = &pdev->dev;
 	struct component_match *match = NULL;
-	int num_dcp;
+	int num_dcp, ret;
 
 	/* add DCP components, handle less than 1 as probe error */
 	num_dcp = add_dcp_components(mdev, &match);
 	if (num_dcp < 1)
 		return -ENODEV;
 
-	return component_master_add_with_match(mdev, &apple_drm_ops, match);
+	ret = component_master_add_with_match(mdev, &apple_drm_ops, match);
+	if (ret)
+		return ret;
+
+	/*
+	 * The display restores its own state across system sleep, so the PM
+	 * core need not switch to the text console first (which flashes the
+	 * kernel log on screen on every suspend and resume).
+	 */
+	pm_vt_switch_required(mdev, false);
+	return 0;
 }
 
 static void apple_platform_remove(struct platform_device *pdev)
 {
+	pm_vt_switch_unregister(&pdev->dev);
 	component_master_del(&pdev->dev, &apple_drm_ops);
 }
 
