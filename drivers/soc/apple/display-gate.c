@@ -2946,10 +2946,57 @@ static void __init gate_t6041_run(void)
 	gate_t6041_staged();
 }
 
+/*
+ * J713: the dcpext Type-C routes are disabled in the device tree, as on
+ * J613, because a USB-C port controller waits for the mode switch of every
+ * available route. Enable them only for a dcpext the boot loader handed
+ * over (apple,t8132-dcpext-firmware-ready = 1). A handed-over dcpext that is
+ * not adopted then disables them again, see dcp_platform_probe_t8132_ext().
+ * Only the device tree changes here; no register is touched.
+ */
+static void __init gate_j713_dcpext_routes(void)
+{
+	struct of_changeset *cs = gate_cs_alloc();
+	struct device_node *np;
+	unsigned int n = 0;
+	u32 ready;
+	int ret = 0;
+
+	if (!cs)
+		return;
+	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
+		if (!of_device_is_available(np) ||
+		    of_property_read_u32(np, "apple,t8132-dcpext-firmware-ready", &ready) ||
+		    ready != 1)
+			continue;
+		ret = gate_ext_routes(cs, np, "okay");
+		if (ret) {
+			of_node_put(np);
+			break;
+		}
+		n++;
+	}
+	if (!ret && n)
+		ret = of_changeset_apply(cs);
+	if (ret)
+		pr_err("apple-j713-display: dcpext Type-C routes left disabled: %d\n", ret);
+	else if (n)
+		pr_info("apple-j713-display: Type-C routes enabled for %u handed-over dcpext(s)\n",
+			n);
+	/* Applied, it stays: the live tree refers to it. */
+	if (ret || !n)
+		gate_cs_free(cs);
+}
+
 /* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
 static int __init apple_display_gate(void)
 {
 	int i;
+
+	if (of_machine_is_compatible("apple,j713")) {
+		gate_j713_dcpext_routes();
+		return 0;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(gate_socs) && !gate_soc; i++)
 		if (of_machine_is_compatible(gate_socs[i]->machine))
