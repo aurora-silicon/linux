@@ -403,6 +403,17 @@ struct RenderStorage {
     // The lower alias drops before its backing.
     low: mmu::KernelMapping,
     high: KernelObject,
+    /// The client VM the storage was created for, whose alias of it lasts as long as that VM.
+    vm: u64,
+    /// That VM's status, which tells when its client closed it.
+    status: Option<Arc<super::status::VmStatus>>,
+}
+
+impl RenderStorage {
+    /// The client closed the VM this storage was created for.
+    fn closed(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| status.client_closed())
+    }
 }
 
 /// Render ring storage outlives its rings for the life of the device.
@@ -442,12 +453,27 @@ impl RenderRings {
         )
     }
 
-    fn take(&self) -> Option<RenderStorage> {
+    /// Reusable storage created for `client`, else storage whose VM its client has closed,
+    /// which then belongs to `client`. Storage of another open VM is never handed out: that VM
+    /// keeps its read-write alias of the pages, so it could read and write the new ring.
+    fn take(&self, client: &mmu::Vm) -> Option<RenderStorage> {
+        let vm = client.id();
         let mut stock = self.stock.lock();
-        let index = stock.retired.iter().rposition(|(reusable, _)| *reusable)?;
+        let reusable = |own: bool| {
+            stock.retired.iter().rposition(|(reusable, storage)| {
+                *reusable && if own { storage.vm == vm } else { storage.closed() }
+            })
+        };
+        let index = reusable(true).or_else(|| reusable(false))?;
         let last = stock.retired.len() - 1;
         stock.retired.swap(index, last);
-        stock.retired.pop().map(|(_, storage)| storage)
+        let (_, mut storage) = stock.retired.pop()?;
+        drop(stock);
+        if storage.vm != vm {
+            storage.vm = vm;
+            storage.status = client.status().cloned();
+        }
+        Some(storage)
     }
 
     /// Reserves the return of one more, just created storage.
@@ -567,7 +593,7 @@ impl Queue {
         if id.engine == DataMaster::Compute {
             return Err(EINVAL);
         }
-        if let Some(storage) = rings.take() {
+        if let Some(storage) = rings.take(client) {
             let mut ring = RenderRing {
                 storage: ManuallyDrop::new(storage),
                 rings: rings.clone(),
@@ -594,6 +620,7 @@ impl Queue {
                 ));
             }
         }
+        let (vm, status) = (client.id(), client.status().cloned());
         let high = alloc.kernel(
             KICK_RING_SIZE,
             mmu::UAT_PGSZ as u64,
@@ -621,7 +648,7 @@ impl Queue {
                 Err(error) => return Err(error),
             }
         };
-        let storage = RenderStorage { low, high };
+        let storage = RenderStorage { low, high, vm, status };
         // Count the storage only once it exists. Without room to return it,
         // nothing has aliased it but `client`, which drops first.
         if let Err(error) = rings.admit() {
@@ -669,6 +696,30 @@ impl Queue {
         let address = self.low_va();
         self.object()
             .map_alias(vm, address, mmu::PROT_GPU_SHARED_RW)
+    }
+
+    /// Clears an idle compute ring before another VM is given a view of it, so the new owner
+    /// cannot read the entries the previous owner's commands left. The firmware has consumed
+    /// every entry; the host's position in the ring is kept.
+    pub(crate) fn clear_ring(&mut self) -> Result {
+        let Backing::Compute { low, .. } = &mut self.backing else {
+            return Err(EINVAL);
+        };
+        low.bytes_mut().fill(0);
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Clears an idle render ring before a context of another VM is given a view of it, so the
+    /// new owner cannot read the entries earlier owners' commands left. The firmware has
+    /// consumed every entry; the host's position in the ring is kept.
+    pub(crate) fn clear_render_ring(&mut self) -> Result {
+        let Backing::Render(ring) = &mut self.backing else {
+            return Err(EINVAL);
+        };
+        ring.storage.high.bytes_mut().fill(0);
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Reuse a permanent client view only when every page names this ring.
