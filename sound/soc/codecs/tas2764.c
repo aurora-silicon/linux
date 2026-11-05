@@ -76,6 +76,16 @@ struct tas2764_priv {
 		unsigned int tx_mask;
 	} idle_slot_config;
 
+	/* apple,bop-config: the SN012776 brownout prevention block */
+	u8 bop_config[TAS2764_BOP_CFG_LEN];
+	bool have_bop_config;
+	/* apple,amp-dcblocker-config: the SN012776 DC_BLK0 and DC_BLK1 */
+	u8 dc_blk[2];
+	bool have_dc_blk;
+	/* apple,amp-tx-zd-config: the SN012776's SDOUT idle slots, driven to zero */
+	u32 tx_zd_mask;
+	bool have_tx_zd;
+
 	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
 	bool deferred_shutdown;
 	/* Muted at a stream's end, until the next one: the bus clock may stop */
@@ -824,6 +834,10 @@ static int tas2764_set_dai_tdm_idle(struct snd_soc_dai *dai,
 	if (rx_mode)
 		return -EOPNOTSUPP;
 
+	/* The idle slots the Mac's ADT gives were set at probe and stay */
+	if (tas2764->have_tx_zd)
+		return 0;
+
 	if (tas2764->idle_slot_config.tx_mask == tx_mask &&
 	    tas2764->idle_slot_config.tx_mode == tx_mode)
 		return 0;
@@ -921,12 +935,6 @@ static struct snd_soc_dai_driver tas2764_dai_driver[] = {
 		.ops = &tas2764_dai_ops,
 		.symmetric_rate = 1,
 	},
-};
-
-static uint8_t sn012776_bop_presets[] = {
-	0x01, 0x32, 0x02, 0x22, 0x83, 0x2d, 0x80, 0x02, 0x06,
-	0x32, 0x46, 0x30, 0x02, 0x06, 0x38, 0x40, 0x30, 0x02,
-	0x06, 0x3e, 0x37, 0x30, 0xff, 0xe6
 };
 
 static const struct regmap_config tas2764_i2c_regmap;
@@ -1106,19 +1114,49 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 	switch (tas2764->devid) {
 	case DEVID_SN012776:
+		/*
+		 * PVDD is the brownout source on every SN012776, and the
+		 * brownout prevention block is the one the Mac's boot ADT
+		 * gives, when it gives one.
+		 */
 		ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
 					TAS2764_PWR_CTRL_BOP_SRC,
 					TAS2764_PWR_CTRL_BOP_SRC);
 		if (ret < 0)
 			goto err_sdz;
 
-		for (i = 0; i < ARRAY_SIZE(sn012776_bop_presets); i++) {
+		for (i = 0; tas2764->have_bop_config && i < TAS2764_BOP_CFG_LEN; i++) {
 			ret = snd_soc_component_write(component,
 						TAS2764_BOP_CFG0 + i,
-						sn012776_bop_presets[i]);
-
+						tas2764->bop_config[i]);
 			if (ret < 0)
 				goto err_sdz;
+		}
+
+		/* The DC blockers (the playback and sense high-pass corners) */
+		if (tas2764->have_dc_blk) {
+			ret = snd_soc_component_write(component, TAS2764_DC_BLK0,
+						      tas2764->dc_blk[0]);
+			if (ret < 0)
+				goto err_sdz;
+			ret = snd_soc_component_write(component, TAS2764_DC_BLK1,
+						      tas2764->dc_blk[1]);
+			if (ret < 0)
+				goto err_sdz;
+		}
+
+		/* The SDOUT idle slots that drive zeros, from the ADT */
+		if (tas2764->have_tx_zd && tas2764->tx_zd_mask) {
+			ret = tas2764_write_sdout_idle_mask(tas2764, tas2764->tx_zd_mask);
+			if (ret < 0)
+				goto err_sdz;
+			ret = snd_soc_component_update_bits(component, TAS2764_SDOUT_HIZ_9,
+						TAS2764_SDOUT_HIZ_9_FORCE_0_EN,
+						TAS2764_SDOUT_HIZ_9_FORCE_0_EN);
+			if (ret < 0)
+				goto err_sdz;
+			tas2764->idle_slot_config.tx_mask = tas2764->tx_zd_mask;
+			tas2764->idle_slot_config.tx_mode = SND_SOC_DAI_TDM_IDLE_ZERO;
 		}
 
 		/* Apply all enabled Apple quirks */
@@ -1315,6 +1353,110 @@ static const struct regmap_config tas2764_i2c_regmap = {
 	.max_register = 0xffff,
 };
 
+/*
+ * The SN012776's brownout prevention block (BOP_CFG0 on, TAS2764_BOP_CFG_LEN
+ * registers), from the device tree's apple,bop-config: the boot loader copies
+ * it from the amp group's configuration in the Mac's ADT, which macOS programs
+ * into every amp of the group. Without it the block stays at its reset values.
+ * A property of the wrong length is a broken device tree, not a reason to
+ * guess.
+ */
+static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	int len;
+
+	tas2764->have_bop_config = false;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,bop-config");
+	if (len == -EINVAL) {
+		dev_info(dev, "no brownout configuration in the device tree\n");
+		return 0;
+	}
+	if (len != TAS2764_BOP_CFG_LEN)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,bop-config: %d bytes, the block has %d\n",
+				     len, TAS2764_BOP_CFG_LEN);
+
+	of_property_read_u8_array(dev->of_node, "apple,bop-config",
+				  tas2764->bop_config, TAS2764_BOP_CFG_LEN);
+	tas2764->have_bop_config = true;
+	return 0;
+}
+
+/*
+ * The SN012776's DC blockers, DC_BLK0 and DC_BLK1, from the device tree's
+ * apple,amp-dcblocker-config: the boot loader copies it from the amp group's
+ * configuration in the Mac's ADT, whose first two bytes are the two registers
+ * (the rest is padding), the same for every amp of the group. Without it the
+ * registers keep their reset values.
+ */
+static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	int len, ret;
+
+	tas2764->have_dc_blk = false;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,amp-dcblocker-config");
+	if (len == -EINVAL)
+		return 0;
+	if (len < 2)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,amp-dcblocker-config: %d bytes, need 2\n", len);
+
+	ret = of_property_read_u8_array(dev->of_node, "apple,amp-dcblocker-config",
+					tas2764->dc_blk, 2);
+	if (ret)
+		return ret;
+	tas2764->have_dc_blk = true;
+	return 0;
+}
+
+/*
+ * The SN012776's SDOUT idle slots that drive zeros (SDOUT_HIZ_1..), from the
+ * device tree's apple,amp-tx-zd-config: the boot loader copies this amp's row
+ * of its group's amp-tx-zd-config in the Mac's ADT, eight bytes, one mask
+ * byte per eight slots from slot 0. Like the device tree's TDM idle masks,
+ * this driver drives slots 0 to 31 only. With the property, it replaces the
+ * idle masks of the sound card's device tree; an all-zero row leaves every
+ * idle slot in high impedance.
+ */
+#define TAS2764_TX_ZD_ROW	8
+
+static int tas2764_parse_tx_zd_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	u8 row[TAS2764_TX_ZD_ROW];
+	int len, ret, i;
+
+	tas2764->have_tx_zd = false;
+	tas2764->tx_zd_mask = 0;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,amp-tx-zd-config");
+	if (len == -EINVAL)
+		return 0;
+	if (len != TAS2764_TX_ZD_ROW)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,amp-tx-zd-config: %d bytes, the row has %d\n",
+				     len, TAS2764_TX_ZD_ROW);
+
+	ret = of_property_read_u8_array(dev->of_node, "apple,amp-tx-zd-config",
+					row, TAS2764_TX_ZD_ROW);
+	if (ret)
+		return ret;
+	for (i = 4; i < TAS2764_TX_ZD_ROW; i++) {
+		if (row[i])
+			dev_warn(dev, "idle slots from %d on are not supported\n", i * 8);
+	}
+	tas2764->tx_zd_mask = row[0] | row[1] << 8 | row[2] << 16 | (u32)row[3] << 24;
+	tas2764->have_tx_zd = true;
+	return 0;
+}
+
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
 	int ret = 0;
@@ -1362,6 +1504,18 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 
 	tas2764->deferred_shutdown = of_property_read_bool(dev->of_node,
 							   "apple,deferred-shutdown");
+
+	ret = tas2764_parse_bop_config(dev, tas2764);
+	if (ret)
+		return ret;
+
+	ret = tas2764_parse_dcblocker_config(dev, tas2764);
+	if (ret)
+		return ret;
+
+	ret = tas2764_parse_tx_zd_config(dev, tas2764);
+	if (ret)
+		return ret;
 
 	return tas2764_group_join(dev, tas2764);
 }
@@ -1450,3 +1604,7 @@ module_i2c_driver(tas2764_i2c_driver);
 MODULE_AUTHOR("Dan Murphy <dmurphy@ti.com>");
 MODULE_DESCRIPTION("TAS2764 I2C Smart Amplifier driver");
 MODULE_LICENSE("GPL v2");
+
+#if IS_ENABLED(CONFIG_SND_SOC_TAS2764_KUNIT_TEST)
+#include "tas2764-bop-test.h"
+#endif

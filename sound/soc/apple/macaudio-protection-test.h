@@ -665,6 +665,7 @@ static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 	struct macaudio_test_vol *vols[ARRAY_SIZE(names)];
 	struct snd_kcontrol *kctls[ARRAY_SIZE(names)];
 	struct macaudio_test_spk t;
+	const int level = 15;
 	unsigned int i;
 
 	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
@@ -684,15 +685,15 @@ static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 		tmpl.private_value = (unsigned long)&vols[i]->mc;
 		kctls[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
 	}
-	/* Above the configured gain, and below it */
+	/* Above the amp level (any level the ADT gives), and below it */
 	vols[0]->value = 20;
 	vols[1]->value = 5;
 
 	KUNIT_EXPECT_EQ(test, macaudio_set_fixed_volume(&t.ma->card, "* Amp Gain Volume",
-							macaudio_j316_cfg.amp_gain), 2);
+							level), 2);
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		KUNIT_EXPECT_EQ(test, vols[i]->value, (long)macaudio_j316_cfg.amp_gain);
-		KUNIT_EXPECT_EQ(test, vols[i]->mc.platform_max, macaudio_j316_cfg.amp_gain);
+		KUNIT_EXPECT_EQ(test, vols[i]->value, (long)level);
+		KUNIT_EXPECT_EQ(test, vols[i]->mc.platform_max, level);
 		KUNIT_EXPECT_TRUE(test, kctls[i]->vd[0].access & SNDRV_CTL_ELEM_ACCESS_READ);
 		KUNIT_EXPECT_FALSE(test, kctls[i]->vd[0].access & SNDRV_CTL_ELEM_ACCESS_WRITE);
 	}
