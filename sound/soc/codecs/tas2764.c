@@ -1390,7 +1390,7 @@ static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas
  * apple,amp-dcblocker-config: the boot loader copies it from the amp group's
  * configuration in the Mac's ADT, whose first two bytes are the two registers
  * (the rest is padding), the same for every amp of the group. Without it the
- * registers keep their reset values.
+ * SN012776 uses DC_BLK0 = 0x01 and DC_BLK1 = 0x00 on every amp.
  */
 static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_priv *tas2764)
 {
@@ -1401,8 +1401,12 @@ static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_pri
 		return 0;
 
 	len = of_property_count_u8_elems(dev->of_node, "apple,amp-dcblocker-config");
-	if (len == -EINVAL)
+	if (len == -EINVAL) {
+		tas2764->dc_blk[0] = 0x01;
+		tas2764->dc_blk[1] = 0x00;
+		tas2764->have_dc_blk = true;
 		return 0;
+	}
 	if (len < 2)
 		return dev_err_probe(dev, -EINVAL,
 				     "apple,amp-dcblocker-config: %d bytes, need 2\n", len);
