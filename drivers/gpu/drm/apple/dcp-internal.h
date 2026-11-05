@@ -697,6 +697,11 @@ struct apple_dcp {
 	u32 nr_typec_routes;
 	bool phy_managed_by_typec;
 	bool typec_cable_connected;
+	/*
+	 * T8132 dcpext: a teardown call timed out; the firmware's late
+	 * Activate/Deactivate belong to it until its answer is in.
+	 */
+	bool t8132_release_late;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
@@ -712,6 +717,12 @@ struct apple_dcp {
 	 */
 	struct mutex tb_lock;
 	bool tb_clock_ok;
+	/*
+	 * T8132 dcpext: its tunnel pixel clock was refused (the PHY runs the
+	 * other DP IN at another link rate), so the tunnel cannot show.
+	 * tb_lock to set; read anywhere.
+	 */
+	bool tb_clock_refused;
 	/* tb_lock: the direct DP PHY crossbar output whose clocks run (T6030). */
 	struct mux_control *direct_xbar_up;
 	/*

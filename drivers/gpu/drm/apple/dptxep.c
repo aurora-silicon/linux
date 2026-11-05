@@ -179,6 +179,10 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 	if (ret)
 		return ret;
 
+	dev_dbg(service->ep->dcp->dev,
+		"DPTX connect: sent target 0x%x attrs 0x%x, reply target 0x%x attrs 0x%x\n",
+		target, unk_field, le32_to_cpu(resp.target), le32_to_cpu(resp.unk));
+
 	if (le32_to_cpu(resp.target) != target) {
 		dev_warn(service->ep->dcp->dev,
 			 "connect: target reply 0x%x (sent 0x%x)\n",
@@ -422,9 +426,15 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		ret = dptx_j700_validate_lanes(dptx, lane_count);
 		if (ret)
 			return ret;
-	} else if (dptx->lane_count < lane_count)
+	} else if (dptx->lane_count < lane_count &&
+		   !(dcp_is_t8132_ext(dcp) && dcp_is_usb4_output(dcp))) {
+		/*
+		 * A T8132 tunnel has no PHY lanes to check: its lane count
+		 * is the tunnel's, and lane_count holds the previous active one.
+		 */
 		dev_err(dcp->dev, "set_active_lane_count: unexpected lane "
 			"count:%llu phy: %d\n", lane_count, dptx->lane_count);
+	}
 
 	switch (lane_count) {
 	case 0 ... 2:
@@ -818,7 +828,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	trace_dptxport_apcall(dptx, 0, idx, data_size);
 	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
 		 idx, data_size);
-	if (service->ep->dcp->external)
+	if (service->ep->dcp->external && !dcp_is_t8132_ext(service->ep->dcp))
 		dev_info(service->ep->dcp->dev, "DPTX callback %u size %zu reply %zu\n",
 			 idx, data_size, reply_size);
 	if (data_size && service->ep->dcp->hw.iomfb_method_profile !=
@@ -1169,6 +1179,9 @@ static int dptxport_compact_call(struct apple_epic_service *service, u16 group,
 				 u32 command, const void *data, size_t size,
 				 void *reply, size_t room)
 {
+	if (group)
+		dev_dbg(service->ep->dcp->dev, "DPTX callback group %u command %u size %zu reply %zu\n",
+			group, command, size, room);
 	if (group == 1)
 		return dptxport_compact_group1(command, data, size, reply, room);
 	if (group)
@@ -1213,6 +1226,12 @@ int dptxep_init_desktop(struct apple_dcp *dcp, u32 endpoint)
 	ep = afk_init(dcp, endpoint, dptxep_compact_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
+	/*
+	 * A T8132 dcpext's firmware can answer a teardown call after it
+	 * timed out; keep such a call until its answer, see
+	 * dcp_dptx_release_locked().
+	 */
+	ep->compact_keep_orphans = dcp_is_t8132_ext(dcp);
 	/* Routed by its endpoint number: set before the start replies arrive. */
 	dcp->dptxep = ep;
 
