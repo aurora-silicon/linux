@@ -300,6 +300,16 @@ unsigned long execmem_confine_verify(unsigned long *nr_exec_out)
 }
 
 #ifdef CONFIG_DEBUG_FS
+static void confine_show_chunk(struct gen_pool *pool,
+			       struct gen_pool_chunk *chunk, void *data)
+{
+	struct seq_file *m = data;
+	phys_addr_t start = chunk->phys_addr;
+	phys_addr_t end = start + (chunk->end_addr - chunk->start_addr + 1);
+
+	seq_printf(m, "pool-range:     [%pa, %pa)\n", &start, &end);
+}
+
 static int confine_debug_show(struct seq_file *m, void *v)
 {
 	unsigned long nr_exec = 0, violations;
@@ -313,6 +323,7 @@ static int confine_debug_show(struct seq_file *m, void *v)
 			   gen_pool_size(confine_pool) >> 10);
 		seq_printf(m, "pool-available: %zu KiB\n",
 			   gen_pool_avail(confine_pool) >> 10);
+		gen_pool_for_each_chunk(confine_pool, confine_show_chunk, m);
 	}
 
 	violations = execmem_confine_verify(&nr_exec);

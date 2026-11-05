@@ -49,6 +49,20 @@ static phys_addr_t ctxr_size __initdata;
 static bool ctxr_enforce __initdata = true;
 static bool ctxr_active __initdata;
 
+/*
+ * Free, linear-mapped RAM inside the window, snapshotted just before the
+ * window is reserved. Anything already reserved at that point (the kernel
+ * image, the device tree, an initrd, /reserved-memory and memreserve entries,
+ * firmware or loader regions) and any hole or no-map region is excluded, so
+ * the executable pool can never hand out memory something else owns.
+ */
+#define CTXR_MAX_FREE		64
+static struct {
+	phys_addr_t start;
+	phys_addr_t end;
+} ctxr_free[CTXR_MAX_FREE] __initdata;
+static int ctxr_nr_free __initdata;
+
 static bool __init ctxr_parse_cmdline(phys_addr_t *base, phys_addr_t *size,
 				      bool *enforce)
 {
@@ -101,9 +115,35 @@ static bool __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
 	return *size != 0;
 }
 
+static void __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
+{
+	phys_addr_t start, end, wend = base + size;
+	u64 i;
+
+	ctxr_nr_free = 0;
+	for_each_free_mem_range(i, NUMA_NO_NODE, MEMBLOCK_NONE, &start, &end,
+				NULL) {
+		if (start >= wend)
+			break;
+		start = max(start, base);
+		end = min(end, wend);
+		if (start >= end)
+			continue;
+		if (ctxr_nr_free == CTXR_MAX_FREE) {
+			pr_warn("more than %d free ranges in the window; ignoring the rest\n",
+				CTXR_MAX_FREE);
+			break;
+		}
+		ctxr_free[ctxr_nr_free].start = start;
+		ctxr_free[ctxr_nr_free].end = end;
+		ctxr_nr_free++;
+	}
+}
+
 void __init ctxr_exec_reserve(void)
 {
 	phys_addr_t base = 0, size = 0, img_start, img_end;
+	phys_addr_t dram_start, dram_end;
 	bool enforce = true;
 
 	if (!ctxr_parse_cmdline(&base, &size, &enforce) &&
@@ -115,9 +155,20 @@ void __init ctxr_exec_reserve(void)
 
 	img_start = __pa_symbol(_text);
 	img_end = __pa_symbol(_end);
+	dram_start = memblock_start_of_DRAM();
+	dram_end = memblock_end_of_DRAM();
 
-	if (!base)
+	if (!base) {
+		/*
+		 * No base given: anchor the window on the image. If that would run
+		 * past the end of DRAM (the image is within @size of the top), slide
+		 * it down so it ends at DRAM's end while still covering the image.
+		 */
 		base = round_down(img_start, CTXR_WINDOW_ALIGN);
+		if (base + size > dram_end && dram_end - dram_start >= size)
+			base = max(round_down(dram_end - size, CTXR_WINDOW_ALIGN),
+				   round_up(dram_start, CTXR_WINDOW_ALIGN));
+	}
 
 	if (img_start < base || img_end > base + size) {
 		pr_err("kernel image [%pa, %pa) does not fit window [%pa, +%llu MiB)\n",
@@ -126,12 +177,14 @@ void __init ctxr_exec_reserve(void)
 		goto fail;
 	}
 
-	if (base < memblock_start_of_DRAM() ||
-	    base + size > memblock_end_of_DRAM()) {
+	if (base < dram_start || base + size > dram_end) {
 		pr_err("window [%pa, +%llu MiB) is not within DRAM\n",
 		       &base, (unsigned long long)(size >> 20));
 		goto fail;
 	}
+
+	/* Must run before the window is reserved, or every range looks taken. */
+	ctxr_snapshot_free(base, size);
 
 	if (memblock_reserve(base, size)) {
 		pr_err("failed to reserve window [%pa, +%llu MiB)\n",
@@ -171,7 +224,7 @@ static void __init ctxr_pool_add_gap(struct gen_pool *pool, phys_addr_t from,
 bool __init ctxr_exec_execmem_setup(void)
 {
 	struct gen_pool *pool;
-	phys_addr_t img_start, img_end;
+	int i;
 
 	if (!ctxr_active)
 		return false;
@@ -182,11 +235,12 @@ bool __init ctxr_exec_execmem_setup(void)
 		goto fail;
 	}
 
-	/* The image occupies part of the window; the rest becomes the pool. */
-	img_start = __pa_symbol(_text);
-	img_end = __pa_symbol(_end);
-	ctxr_pool_add_gap(pool, ctxr_base, img_start);
-	ctxr_pool_add_gap(pool, img_end, ctxr_base + ctxr_size);
+	/*
+	 * Only memory that was free before the window was reserved joins the
+	 * pool; the image and everything else already reserved stays out.
+	 */
+	for (i = 0; i < ctxr_nr_free; i++)
+		ctxr_pool_add_gap(pool, ctxr_free[i].start, ctxr_free[i].end);
 
 	if (!gen_pool_size(pool)) {
 		pr_err("window has no free space for executable allocations\n");
@@ -198,9 +252,10 @@ bool __init ctxr_exec_execmem_setup(void)
 		goto fail_pool;
 	}
 
-	pr_info("executable pool: %zu MiB usable in a %llu MiB window\n",
-		gen_pool_size(pool) >> 20,
-		(unsigned long long)(ctxr_size >> 20));
+	pr_info("executable pool: %zu MiB usable in %d range(s) of a %llu MiB window (%llu MiB already reserved)\n",
+		gen_pool_size(pool) >> 20, ctxr_nr_free,
+		(unsigned long long)(ctxr_size >> 20),
+		(unsigned long long)((ctxr_size - gen_pool_size(pool)) >> 20));
 	return true;
 
 fail_pool:
