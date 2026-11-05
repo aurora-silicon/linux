@@ -22,6 +22,7 @@ mod pm;
 mod profile;
 mod proto;
 mod refkey;
+mod refkey_policy;
 mod refkey_seal;
 mod rxring;
 mod sbio;
