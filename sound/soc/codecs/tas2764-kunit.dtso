@@ -12,11 +12,13 @@
 		apple,bop-config = [00 01 02 03 04 05 06 07 08 09 0a 0b
 				    0c 0d 0e 0f 10 11 12 13 14 15 16 17];
 		apple,amp-dcblocker-config = [5a a5 00 00];
+		apple,amp-tx-zd-config = [f0 0f a5 5a 00 00 00 00];
 	};
 
 	tas2764-kunit-bop-short {
 		compatible = "test,tas2764-kunit";
 		apple,amp-dcblocker-config = [5a];
+		apple,amp-tx-zd-config = [f0 0f a5 5a 00 00 00];
 		apple,bop-config = [00 01 02 03 04 05 06 07 08 09 0a 0b
 				    0c 0d 0e 0f 10 11 12 13 14 15 16];
 	};

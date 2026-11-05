@@ -82,6 +82,9 @@ struct tas2764_priv {
 	/* apple,amp-dcblocker-config: the SN012776 DC_BLK0 and DC_BLK1 */
 	u8 dc_blk[2];
 	bool have_dc_blk;
+	/* apple,amp-tx-zd-config: the SN012776's SDOUT idle slots, driven to zero */
+	u32 tx_zd_mask;
+	bool have_tx_zd;
 
 	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
 	bool deferred_shutdown;
@@ -816,6 +819,10 @@ static int tas2764_set_dai_tdm_idle(struct snd_soc_dai *dai,
 	if (rx_mode)
 		return -EOPNOTSUPP;
 
+	/* The idle slots the Mac's ADT gives were set at probe and stay */
+	if (tas2764->have_tx_zd)
+		return 0;
+
 	if (tas2764->idle_slot_config.tx_mask == tx_mask &&
 	    tas2764->idle_slot_config.tx_mode == tx_mode)
 		return 0;
@@ -1123,6 +1130,20 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 				goto err_sdz;
 		}
 
+		/* The SDOUT idle slots that drive zeros, from the ADT */
+		if (tas2764->have_tx_zd && tas2764->tx_zd_mask) {
+			ret = tas2764_write_sdout_idle_mask(tas2764, tas2764->tx_zd_mask);
+			if (ret < 0)
+				goto err_sdz;
+			ret = snd_soc_component_update_bits(component, TAS2764_SDOUT_HIZ_9,
+						TAS2764_SDOUT_HIZ_9_FORCE_0_EN,
+						TAS2764_SDOUT_HIZ_9_FORCE_0_EN);
+			if (ret < 0)
+				goto err_sdz;
+			tas2764->idle_slot_config.tx_mask = tas2764->tx_zd_mask;
+			tas2764->idle_slot_config.tx_mode = SND_SOC_DAI_TDM_IDLE_ZERO;
+		}
+
 		/* Apply all enabled Apple quirks */
 		ret = tas2764_apply_init_quirks(tas2764);
 
@@ -1344,6 +1365,48 @@ static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_pri
 	return 0;
 }
 
+/*
+ * The SN012776's SDOUT idle slots that drive zeros (SDOUT_HIZ_1..), from the
+ * device tree's apple,amp-tx-zd-config: the boot loader copies this amp's row
+ * of its group's amp-tx-zd-config in the Mac's ADT, eight bytes, one mask
+ * byte per eight slots from slot 0. Like the device tree's TDM idle masks,
+ * this driver drives slots 0 to 31 only. With the property, it replaces the
+ * idle masks of the sound card's device tree; an all-zero row leaves every
+ * idle slot in high impedance.
+ */
+#define TAS2764_TX_ZD_ROW	8
+
+static int tas2764_parse_tx_zd_config(struct device *dev, struct tas2764_priv *tas2764)
+{
+	u8 row[TAS2764_TX_ZD_ROW];
+	int len, ret, i;
+
+	tas2764->have_tx_zd = false;
+	tas2764->tx_zd_mask = 0;
+	if (tas2764->devid != DEVID_SN012776)
+		return 0;
+
+	len = of_property_count_u8_elems(dev->of_node, "apple,amp-tx-zd-config");
+	if (len == -EINVAL)
+		return 0;
+	if (len != TAS2764_TX_ZD_ROW)
+		return dev_err_probe(dev, -EINVAL,
+				     "apple,amp-tx-zd-config: %d bytes, the row has %d\n",
+				     len, TAS2764_TX_ZD_ROW);
+
+	ret = of_property_read_u8_array(dev->of_node, "apple,amp-tx-zd-config",
+					row, TAS2764_TX_ZD_ROW);
+	if (ret)
+		return ret;
+	for (i = 4; i < TAS2764_TX_ZD_ROW; i++) {
+		if (row[i])
+			dev_warn(dev, "idle slots from %d on are not supported\n", i * 8);
+	}
+	tas2764->tx_zd_mask = row[0] | row[1] << 8 | row[2] << 16 | (u32)row[3] << 24;
+	tas2764->have_tx_zd = true;
+	return 0;
+}
+
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
 	int ret = 0;
@@ -1397,6 +1460,10 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 		return ret;
 
 	ret = tas2764_parse_dcblocker_config(dev, tas2764);
+	if (ret)
+		return ret;
+
+	ret = tas2764_parse_tx_zd_config(dev, tas2764);
 	if (ret)
 		return ret;
 

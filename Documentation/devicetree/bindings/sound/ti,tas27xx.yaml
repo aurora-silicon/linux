@@ -85,6 +85,16 @@ properties:
       loader; its first two bytes are DC_BLK0 and DC_BLK1. Absent when the
       ADT has none, and the registers then keep their reset values.
 
+  apple,amp-tx-zd-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 8
+    description:
+      SN012776 only. This amplifier's row of its group's amp-tx-zd-config in
+      the Mac's boot ADT, copied by the boot loader - one byte per eight SDOUT
+      slots from slot 0, a set bit driving zeros in that idle slot. It
+      replaces the sound card's TDM idle masks for this amplifier.
+
   apple,deferred-shutdown:
     type: boolean
     description:
