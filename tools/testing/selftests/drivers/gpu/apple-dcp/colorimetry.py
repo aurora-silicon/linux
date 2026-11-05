@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Synthetic firmware colour data through the production parser and EDID builder."""
 import copy
+from common import apple_function, block
 import struct
 import desktop
 import rate
@@ -114,3 +115,54 @@ int main(int argc, char **argv)
 }
 '''
     return unit, ((str(output/'panel-display-p3.edid'), str(output/'panel-srgb.edid')),)
+
+
+def ctm(root):
+    """The DRM CTM as the firmware's set_matrix coefficients (shared helper)."""
+    core = (root / 'drivers/gpu/drm/drm_color_mgmt.c').read_text()
+    unit = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+typedef uint64_t u64;
+typedef int64_t s64;
+typedef uint32_t u32;
+#define BIT_ULL(n) (1ULL << (n))
+#define WARN_ON(x) ((void)(x))
+#define clamp_val(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
+struct drm_color_ctm { u64 matrix[9]; };
+'''
+    unit += block(core, 'u64 drm_color_ctm_s31_32_to_qm_n(') + '\n'
+    unit += apple_function(root, 'dcp_ctm_to_fw')
+    unit += r'''
+#define NEG (1ULL << 63)
+int main(void)
+{
+    u64 fw[9];
+    /* NULL: identity, 1.0 is 1 << 32 on the diagonal. */
+    dcp_ctm_to_fw(fw, NULL);
+    for (int i = 0; i < 9; i++)
+        assert(fw[i] == (i % 4 == 0 ? 1ULL << 32 : 0));
+    /* Positive coefficients are the same in both encodings. */
+    struct drm_color_ctm pos = {{ 1ULL << 32, 0x40000000, 0, 3ULL << 31, 1, 0x7fffffffffffffffULL,
+                                  0, 0x123456789ULL, 2ULL << 32 }};
+    dcp_ctm_to_fw(fw, &pos);
+    for (int i = 0; i < 9; i++)
+        assert(fw[i] == pos.matrix[i]);
+    /* Negative coefficients become two's complement Q32.32. */
+    struct drm_color_ctm neg = {{ NEG | 0x40000000, NEG | 1ULL << 32, NEG, NEG | 1,
+                                  NEG | 0x7fffffffffffffffULL, NEG | 3ULL << 31, 0, 0, 0 }};
+    dcp_ctm_to_fw(fw, &neg);
+    assert(fw[0] == 0xffffffffc0000000ULL);   /* -0.25 */
+    assert((s64)fw[1] == -(s64)(1LL << 32));  /* -1.0 */
+    assert(fw[2] == 0);                       /* negative zero */
+    assert((s64)fw[3] == -1);                 /* smallest step */
+    assert((s64)fw[4] == -0x7fffffffffffffffLL);
+    assert((s64)fw[5] == -(s64)(3LL << 31));  /* -1.5 */
+    for (int i = 0; i < 6; i++)
+        assert(i == 2 || (s64)fw[i] < 0);
+    return 0;
+}
+'''
+    return unit

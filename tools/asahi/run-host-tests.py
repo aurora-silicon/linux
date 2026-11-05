@@ -54,6 +54,9 @@ def mutations(flag, names, base, expect=KILL):
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
     'j613-mtp-s2idle-tests.py': [([], PASS)],
+    # The old revision reports a DART fault that clears before the second latch read as success.
+    'ane-tm-transient-fault-tests.py': [([], PASS),
+                                        (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
