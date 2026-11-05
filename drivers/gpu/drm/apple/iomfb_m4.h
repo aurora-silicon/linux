@@ -17,11 +17,13 @@ struct iomfb_m4;
 
 /* Probe is inert; start adopts firmware after the common component is pinned. */
 int iomfb_m4_init(struct apple_dcp *dcp);
+int iomfb_m4_adopt_external(struct apple_dcp *dcp);
 int iomfb_m4_start(struct apple_dcp *dcp, struct device *scanout);
 int iomfb_m4_activate(struct apple_dcp *dcp);
 int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *mode);
 int iomfb_m4_health(struct apple_dcp *dcp);
 int iomfb_m4_error(struct apple_dcp *dcp);
+bool iomfb_m4_external_ready(struct apple_dcp *dcp);
 
 /* The caller has waited for the producer fence before publishing the DMA GEM. */
 int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
@@ -35,6 +37,7 @@ void iomfb_m4_debugfs_init(struct apple_dcp *dcp, struct dentry *root);
 
 #else
 static inline int iomfb_m4_init(struct apple_dcp *dcp) { return -ENODEV; }
+static inline int iomfb_m4_adopt_external(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_start(struct apple_dcp *dcp, struct device *scanout)
 {
 	return -ENODEV;
@@ -46,6 +49,8 @@ static inline int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mo
 }
 static inline int iomfb_m4_health(struct apple_dcp *dcp) { return -ENODEV; }
 static inline int iomfb_m4_error(struct apple_dcp *dcp) { return -ENODEV; }
+static inline bool iomfb_m4_external_ready(struct apple_dcp *dcp) { return false; }
+
 static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
 				  dma_addr_t dva, size_t mapped)
 {

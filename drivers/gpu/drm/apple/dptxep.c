@@ -975,7 +975,8 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	 * without a class.  Unit 0 is opened last, see dptxep_init_desktop().
 	 */
 	if (READ_ONCE(service->ep->compact)) {
-		if (unit != 0 && unit != 1)
+		/* Bind by name: another service on this endpoint is not a port. */
+		if ((unit != 0 && unit != 1) || !name || strcmp(name, "dcpdptx-port-epic"))
 			return -EINVAL;
 		if (!unit)
 			service->defer_start = true;

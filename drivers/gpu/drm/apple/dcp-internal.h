@@ -341,6 +341,11 @@ struct apple_dcp {
 	struct iomfb_m4 *v26_6;
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
+	/*
+	 * Allocates AFK rings where the DMA API cannot, on an adopted
+	 * J713 external DCP whose DART only takes the retained allocator.
+	 */
+	void *(*afk_alloc)(struct apple_dcp *dcp, size_t size, dma_addr_t *dva);
 	bool quiescing;
 	bool drm_retained;
 	/* vblank_wq and swap_watchdog_wq disabled by the last unbind */

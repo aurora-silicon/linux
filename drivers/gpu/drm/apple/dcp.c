@@ -5762,6 +5762,14 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		ret = iomfb_m4_init(dcp);
 		if (ret)
 			return ret;
+		/*
+		 * An external DCP is no component of the DRM device. Once
+		 * adoption starts, its session outlives the device.
+		 */
+		if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
+			ret = dcp_pin_live_session(dcp);
+			return ret ?: iomfb_m4_adopt_external(dcp);
+		}
 		return component_add(dev, &dcp_comp_ops);
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6) {
@@ -6164,6 +6172,9 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	 */
 	if (dcp)
 		av_audiosrv_quiesce(dcp);
+	/* An adopted external DCP never joined the DRM device. */
+	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext"))
+		return;
 	component_del(&pdev->dev, &dcp_comp_ops);
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);
@@ -6223,6 +6234,9 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 		return;
 	}
 
+	/* An adopted external DCP never joined the DRM device. */
+	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext"))
+		return;
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
@@ -6609,6 +6623,13 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132 = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_M4,
 };
+
+/* An external DCP: two DPTX port services, dcpdptx-port-epic units 0 and 1. */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext = {
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_M4,
+	.num_dptx_ports = 2,
+};
 #endif
 
 /* T6041 (M4 Pro/Max), desktop 26.6 firmware */
@@ -6632,6 +6653,8 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132, },
+	/* Same firmware as the internal DCP; adopted from the boot loader. */
+	{ .compatible = "apple,t8132-dcpext", .data = &apple_dcp_hw_t8132_dcpext, },
 #endif
 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030, },
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },

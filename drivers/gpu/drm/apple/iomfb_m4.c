@@ -36,7 +36,9 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-display.h>
 
+#include "afk.h"
 #include "dcp.h"
+#include "dptxep.h"
 #include "iomfb_m4.h"
 
 #include "dcp-m4-profile.h"
@@ -88,6 +90,9 @@ struct iomfb_m4 {
 	int error;
 	bool started, init_sent, ready, startup_started;
 	bool powered_off; /* setPowerState(0) for system sleep */
+	bool external; /* an adopted external DCP: no panel */
+	/* AFK endpoints started on an adopted external DCP, by endpoint - 0x20. */
+	struct apple_dcp_afkep *probe_ep[0x20];
 	bool display_off; /* setPowerState(0) while blanked, until the next frame */
 	u64 display_off_cycles;
 	s64 display_off_us, display_off_us_max, display_on_us, display_on_us_max;
@@ -266,6 +271,16 @@ static void dcp_m4_receive(void *cookie, u8 endpoint, u64 message)
 
 	dev_dbg(dcp->dev, "RTKit EP%02x word %016llx\n", endpoint, message);
 	if (endpoint != DCP_M4_ENDPOINT) {
+		struct apple_dcp_afkep *ep = NULL;
+
+		if (dcp->external && endpoint == DPTX_ENDPOINT)
+			ep = READ_ONCE(dcp->owner->dptxep);
+		else if (dcp->external && endpoint >= 0x20 && endpoint < 0x40)
+			ep = READ_ONCE(dcp->probe_ep[endpoint - 0x20]);
+		if (ep) {
+			afk_receive_message(ep, message);
+			return;
+		}
 		dcp_m4_failed(dcp, -EPROTO);
 		return;
 	}
@@ -382,6 +397,7 @@ fail:
 out:
 	return ret;
 }
+
 static int dcp_m4_shared_alloc(void *cookie, u32 size, u64 *phys, u64 *dva)
 {
 	struct iomfb_m4 *dcp = cookie;
@@ -528,8 +544,8 @@ static int dcp_m4_runtime_health(struct dcp_m4_runtime *r)
 	struct iomfb_m4 *dcp = r->dcp;
 	int ret = READ_ONCE(dcp->error);
 
-	if (!ret && (!(readl(dcp->coproc + 0x44) & BIT(4)) ||
-	    dcp_m4_dart_check(dcp->dev) || dcp_m4_dart_check(&dcp->piodma->dev)))
+	if (!ret && (!(readl(dcp->coproc + 0x44) & BIT(4)) || dcp_m4_dart_check(dcp->dev) ||
+		     (!dcp->external && dcp_m4_dart_check(&dcp->piodma->dev))))
 		ret = -EIO;
 	if (!ret && r->power_done)
 		ret = dcp_m4_pmp_check(dcp->dev);
@@ -663,6 +679,180 @@ static void dcp_m4_runtime_bad_word(struct dcp_m4_runtime *r, u64 word, int erro
 	}
 }
 
+/*
+ * Callbacks whose internal-panel answer does not hold on an external DCP.
+ * -ENOENT leaves the callback to the shared dispatcher.
+ */
+struct dcp_m4_external_nested {
+	u16 callback;
+	u8 count;
+	u16 method[6];	/* the nested calls, in order */
+	u8 input_one;	/* bit n: call n takes the u32 input 1 */
+	u8 no_output;	/* bit n: call n has no output */
+	bool reply_one;	/* the callback answers a u32 1 */
+};
+
+/* The internal-panel sequences of dcp_m4_callback_dispatch(), answers logged, not checked. */
+static const struct dcp_m4_external_nested dcp_m4_external_nested[] = {
+	{ 599, 1, { 412 } },
+	{ 100, 1, { 390 } },
+	{ 206, 1, { 131 }, .reply_one = true },
+	{ 207, 1, { 132 }, .reply_one = true },
+	{ 121, 6, { 389, 446, 29, 468, 0, 465 }, .input_one = BIT(3) | BIT(4),
+	  .no_output = BIT(0) | BIT(2) | BIT(3), .reply_one = true },
+};
+
+/*
+ * Callbacks only an external DCP makes, and their shapes: D134, the
+ * firmware's is-display-X1 query (no input, a u32 answer), asked once the
+ * external video interface is up, and those an external pipe makes around a
+ * modeset, power-on and swap. D115, D116, D208, D581, D593, D595 and D598
+ * get the answer the desktop 26.x external pipes give (the tiling state of
+ * an unpaired pipe, false, or an acknowledgment); the others, which the
+ * desktop path does not handle either, are notifications or a false
+ * (D124). D593 (a swap aborted) is only acknowledged. -1: any size up to
+ * 4 KiB.
+ */
+enum dcp_m4_ext_answer {
+	DCP_M4_EXT_ACK,		/* a notification: no output */
+	DCP_M4_EXT_ZERO,	/* false, zero or nothing: a zeroed output */
+	DCP_M4_EXT_TILING,	/* get_tiling_state of an unpaired pipe: value 0, ret 1 */
+};
+
+static const struct dcp_m4_ext_cb {
+	u16 method;
+	s16 input, output;
+	u8 answer;
+	const char *name;
+} dcp_m4_ext_cbs[] = {
+	{ 115, 0x10, 0x8, DCP_M4_EXT_TILING, "get_tiling_state" },
+	{ 116, 0x10, 0x4, DCP_M4_EXT_ZERO, "set_tiling_state" },
+	{ 124, 0, 0x4, DCP_M4_EXT_ZERO, "detect_fastsim" },
+	{ 131, 0x8, 0, DCP_M4_EXT_ACK, "update_ext_pipe_count" },
+	{ 133, 0x4, 0, DCP_M4_EXT_ACK, "apply_suppress" },
+	{ 208, 0x4, 0, DCP_M4_EXT_ACK, "update_backlight_factor_prop" },
+	{ 577, -1, 0, DCP_M4_EXT_ACK, "need_swap_notify" },
+	{ 581, 0xc, 0, DCP_M4_EXT_ACK, "swap_complete_head_of_line" },
+	{ 584, 0x18, 0, DCP_M4_EXT_ACK, "swap_notify_gated" },
+	{ 586, 0x14, 0, DCP_M4_EXT_ACK, "relbufinfo_notify_dispatch" },
+	{ 589, 0x8, 0, DCP_M4_EXT_ACK, "update_ap_hdcp_encryption_status" },
+	{ 593, 0x4, 0, DCP_M4_EXT_ACK, "abort_swap_ap_gated" },
+	{ 595, 0x4, 0, DCP_M4_EXT_ACK, "setSystemConsoleMode" },
+	{ 596, 0x4, 0, DCP_M4_EXT_ACK, "setSystemConsoleMode_gated" },
+	{ 598, -1, -1, DCP_M4_EXT_ZERO, "D598" },
+	{ 585, 0xe4, 0xe0, DCP_M4_EXT_ZERO, "swap_info_notify_dispatch" },
+};
+
+static const struct dcp_m4_ext_cb *dcp_m4_ext_cb(int method)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(dcp_m4_ext_cbs); i++)
+		if (dcp_m4_ext_cbs[i].method == method)
+			return &dcp_m4_ext_cbs[i];
+	return NULL;
+}
+
+static bool dcp_m4_ext_size(s16 want, u32 size)
+{
+	return want < 0 ? size <= SZ_4K : size == (u32)want;
+}
+
+static int dcp_m4_external_shape(u32 tag, u32 input, u32 output)
+{
+	int method = dcp_m4_callback_method(tag);
+	const struct dcp_m4_ext_cb *cb;
+
+	if (method == 134)
+		return !input && output == 4 ? method : -EMSGSIZE;
+	cb = method < 0 ? NULL : dcp_m4_ext_cb(method);
+	if (!cb)
+		return -EOPNOTSUPP;
+	return dcp_m4_ext_size(cb->input, input) && dcp_m4_ext_size(cb->output, output) ?
+	       method : -EMSGSIZE;
+}
+
+static int dcp_m4_external_callback(struct dcp_m4_runtime *r, u32 tag, bool remote,
+				    const u8 *input, u32 input_size,
+				    void *output, u32 output_size)
+{
+	int method = dcp_m4_callback_method(tag);
+	const struct dcp_m4_external_nested *n = NULL;
+	u8 one[4], out[4];
+	int ret;
+
+	/* The external-only callbacks above; the output is zeroed already. */
+	{
+		const struct dcp_m4_ext_cb *cb = dcp_m4_ext_cb(method);
+
+		if (cb && dcp_m4_ext_size(cb->input, input_size) &&
+		    dcp_m4_ext_size(cb->output, output_size)) {
+			if (cb->answer == DCP_M4_EXT_TILING) {
+				put_unaligned_le32(0, output);
+				put_unaligned_le32(1, (u8 *)output + 4);
+			}
+			dev_dbg(r->dcp->dev, "D%03d (%s, %u/%u): %s\n",
+				method, cb->name, input_size, output_size,
+				cb->answer == DCP_M4_EXT_ACK ? "acknowledged" :
+				cb->answer == DCP_M4_EXT_TILING ? "answered as an unpaired pipe" :
+				"answered zero/false");
+			return 0;
+		}
+	}
+	/*
+	 * D134, is the sink a display X1: 0, the answer for an external
+	 * non-Apple sink (1 only for two Apple display products), as the
+	 * desktop 26.x and J700 external pipes already answer it.
+	 */
+	if (method == 134) {
+		if (output_size != 4)
+			return -EMSGSIZE;
+		put_unaligned_le32(0, output);
+		return 0;
+	}
+	/*
+	 * D575, the hotplug report: the connection state and a 76-byte
+	 * tiled-display record (its null flag at 84) in, a 76-byte record out.
+	 * An external pipe with no peer answers it as the desktop 26.x external
+	 * pipes do: zeros, and 0xffffffff at 0x47 while connected.
+	 */
+	if (method == 575) {
+		u64 connected;
+
+		if (input_size != 88 || output_size != 76)
+			return -EMSGSIZE;
+		connected = get_unaligned_le64(input);
+		dev_dbg(r->dcp->dev, "D575 hotplug: connected %llu, record %s\n",
+			connected, (input[84] & 1) ? "absent" : "present");
+		memset(output, 0, 76);
+		if (connected)
+			put_unaligned_le32(0xffffffff, (u8 *)output + 0x47);
+		return 0;
+	}
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(dcp_m4_external_nested); i++)
+		if (dcp_m4_external_nested[i].callback == method)
+			n = &dcp_m4_external_nested[i];
+	if (!n)
+		return -ENOENT;
+	if (output_size != (n->reply_one ? 4 : 0))
+		return -EMSGSIZE;
+	put_unaligned_le32(1, one);
+	for (unsigned int i = 0; i < n->count; i++) {
+		bool in = n->input_one & BIT(i), has_out = !(n->no_output & BIT(i));
+
+		memset(out, 0, sizeof(out));
+		ret = dcp_m4_runtime_call(r, n->method[i], remote, in ? one : NULL, in ? 4 : 0,
+					  has_out ? out : NULL, has_out ? 4 : 0);
+		if (ret)
+			return ret;
+		if (has_out)
+			dev_dbg(r->dcp->dev, "D%03d: A%03u returned %u\n", method, n->method[i],
+				get_unaligned_le32(out));
+	}
+	if (n->reply_one)
+		put_unaligned_le32(1, output);
+	return 0;
+}
+
 static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
 {
 	struct iomfb_m4 *dcp = r->dcp;
@@ -685,8 +875,14 @@ static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
 	}
 	input = (u8 *)dcp->rpc + offset + DCP_M4_PACKET_HEADER;
 	ret = dcp_m4_callback_shape(packet.tag, packet.input_size, packet.output_size);
-	if (ret < 0)
+	if (ret == -EOPNOTSUPP && dcp->external)
+		ret = dcp_m4_external_shape(packet.tag, packet.input_size, packet.output_size);
+	if (ret < 0) {
+		if (dcp->external)
+			print_hex_dump(KERN_INFO, "dcpext callback: ", DUMP_PREFIX_OFFSET, 16, 1,
+				       input, min(packet.input_size, 256U), false);
 		goto failed;
+	}
 	/* Each nested callback owns its snapshot; validation and property/string
 	 * consumers must not fetch shared firmware bytes a second time. Exact
 	 * callback shapes bound this allocation to 4168 bytes.
@@ -705,8 +901,15 @@ static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
 		dev_dbg(dcp->dev, "Flagged D006 header=%12ph null-byte=%02x; ACK route=342\n",
 			 (u8 *)dcp->rpc + offset, input[80]);
 	stage = "dispatch";
-	ret = dcp_m4_callback_dispatch(&dcp_m4_runtime_ops, r, packet.tag, packet.remote,
-		snapshot, packet.input_size, input + packet.input_size, packet.output_size);
+	ret = -ENOENT;
+	if (dcp->external)
+		ret = dcp_m4_external_callback(r, packet.tag, packet.remote, snapshot,
+					       packet.input_size, input + packet.input_size,
+					       packet.output_size);
+	if (ret == -ENOENT)
+		ret = dcp_m4_callback_dispatch(&dcp_m4_runtime_ops, r, packet.tag,
+					       packet.remote, snapshot, packet.input_size,
+					       input + packet.input_size, packet.output_size);
 	kfree(snapshot);
 	if (ret)
 		goto failed;
@@ -962,10 +1165,10 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 	if (!READ_ONCE(dcp->ready) || READ_ONCE(dcp->error) || dcp->startup_started)
 		goto out;
 	dcp->startup_started = true;
-	ret = dcp_m4_boot_framebuffer_check();
+	ret = dcp->external ? 0 : dcp_m4_boot_framebuffer_check();
 	if (ret)
 		goto failed;
-	ret = dcp_m4_create_piodma(dcp);
+	ret = dcp->external ? 0 : dcp_m4_create_piodma(dcp);
 	if (ret)
 		goto failed;
 	r = kzalloc(sizeof(*r), GFP_KERNEL);
@@ -990,6 +1193,8 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 	spin_lock_irqsave(&dcp->state_lock, flags);
 	smp_store_release(&dcp->runtime, r);
 	spin_unlock_irqrestore(&dcp->state_lock, flags);
+	/* An external DCP's callbacks may use streams 0..3. */
+	dcp->transaction.external = dcp->external;
 	/* Fresh session only: A401, then the first client open A457. */
 	ret = dcp_m4_runtime_call(r, 401, false, NULL, 0, output, sizeof(output));
 	if (!ret && get_unaligned_le32(output) != 1)
@@ -1003,6 +1208,15 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
 		ret = -E2BIG;
 	if (ret)
 		goto failed;
+	if (dcp->external) {
+		ret = dcp_m4_runtime_health(r);
+		if (ret)
+			goto failed;
+		/* Pairs with the acquires in iomfb_m4_external_ready() and the ext_ calls. */
+		smp_store_release(&r->done, true);
+		dev_info(dev, "IOMFB startup complete: %u callbacks; external\n", r->callbacks);
+		goto out;
+	}
 	slot = dcp_m4_raw_slot(r->properties, 0, "PreferredTimingElements", false);
 	ret = slot < 0 ? slot : dcp_m4_parse_timing(r->properties->raw[slot].data,
 					       r->properties->raw[slot].size, &r->timing);
@@ -1135,10 +1349,17 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	struct iomfb_m4 *dcp;
 	struct resource *res;
 	const char *uuid;
+	u32 ready = 0;
 	int ret;
+	/* An external DCP the boot loader handed over: same firmware, no panel. */
+	bool external = of_device_is_compatible(dev->of_node, "apple,t8132-dcpext");
 
+	if (external &&
+	    (of_property_read_u32(dev->of_node, "apple,t8132-dcpext-firmware-ready", &ready) ||
+	     ready != 1))
+		return dev_err_probe(dev, -ENODEV, "external DCP not handed over\n");
 	if (!of_machine_is_compatible("apple,j713") ||
-	    !of_device_is_compatible(dev->of_node, "apple,t8132-dcp") ||
+	    (!external && !of_device_is_compatible(dev->of_node, "apple,t8132-dcp")) ||
 	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-version") ||
 	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-compat") ||
 	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
@@ -1151,10 +1372,12 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	if (ret)
 		return ret;
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
-	if (!res || res->start != 0x30ae00000ULL || resource_size(res) != SZ_16K)
+	if (!res || resource_size(res) != SZ_16K ||
+	    (external ? res->start != 0x286e00000ULL && res->start != 0x48ae00000ULL :
+			res->start != 0x30ae00000ULL))
 		return -ENODEV;
 	/* Resolve the fallible supplier before creating a mailbox owner. */
-	ret = apple_pmp_j713_display_prepare(dev);
+	ret = external ? 0 : apple_pmp_j713_display_prepare(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "PMP supplier not ready\n");
 	dcp = kzalloc(sizeof(*dcp), GFP_KERNEL);
@@ -1192,6 +1415,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
 	ret = devm_add_action_or_reset(dev, iomfb_m4_release, dcp);
 	if (ret)
 		return ret;
+	dcp->external = external;
 	owner->v26_6 = dcp;
 	owner->rtk = dcp->rtkit;
 	owner->coproc_reg = dcp->coproc;
@@ -1201,6 +1425,102 @@ int iomfb_m4_init(struct apple_dcp *owner)
 release:
 	iomfb_m4_release(dcp);
 	return dev_err_probe(dev, ret, "cannot prepare retained firmware 26.6.2 backend\n");
+}
+
+/*
+ * The auxiliary endpoints of an external DCP are started so that the
+ * firmware finds them up, but none of their services is used: each one
+ * announced is only noted.
+ */
+static void dcp_m4_probe_init(struct apple_epic_service *service, const char *name,
+			      const char *class, s64 unit)
+{
+	dev_dbg(service->ep->dcp->dev,
+		"ep %02x channel %u announces service \"%s\" class \"%s\" unit %lld\n",
+		service->ep->endpoint, service->channel, name ?: "", class ?: "", unit);
+}
+
+static const struct apple_epic_service_ops dcp_m4_probe_ops[] = {
+	{
+		.name = "*",
+		.init = dcp_m4_probe_init,
+	},
+	{},
+};
+
+/* AFK rings come from the retained DART allocator; they are never freed. */
+static void *dcp_m4_afk_alloc(struct apple_dcp *owner, size_t size, dma_addr_t *dva)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	void *buf = dcp_m4_dma_alloc(dcp->dev, size, dva);
+
+	if (!IS_ERR(buf))
+		dcp->allocated += size;
+	return buf;
+}
+
+/* Start an external DCP's endpoints, those it advertises, in a fixed order. */
+static void dcp_m4_probe_endpoints(struct iomfb_m4 *dcp)
+{
+	static const u8 eps[] = { 0x27, 0x24, 0x26, 0x29, 0x2b, 0x2d, 0x28, 0x22, 0x25 };
+	unsigned int i;
+	int ret;
+
+	dcp->owner->afk_alloc = dcp_m4_afk_alloc;
+	for (i = 0; i < ARRAY_SIZE(eps); i++) {
+		struct apple_dcp_afkep *ep;
+
+		if (!apple_rtkit_has_endpoint(dcp->rtkit, eps[i]))
+			continue;
+		ep = afk_init(dcp->owner, eps[i], dcp_m4_probe_ops);
+		if (IS_ERR(ep)) {
+			dev_warn(dcp->dev, "endpoint %02x init failed: %ld\n", eps[i],
+				 PTR_ERR(ep));
+			continue;
+		}
+		WRITE_ONCE(dcp->probe_ep[eps[i] - 0x20], ep);
+		ret = afk_start(ep);
+		if (ret)
+			dev_warn(dcp->dev, "endpoint %02x start failed: %d\n", eps[i], ret);
+	}
+
+	/* The DPTX port services live on EP 0x2a on this firmware. */
+	ret = dptxep_init_desktop(dcp->owner, DPTX_ENDPOINT);
+	if (ret)
+		dev_err(dcp->dev, "DPTX ports on EP %#x: %d\n", DPTX_ENDPOINT, ret);
+	dev_dbg(dcp->dev, "DPTX port0 %s, port1 %s\n",
+		dcp->owner->dptxport[0].service ? "bound" : "absent",
+		dcp->owner->dptxport[1].service ? "bound" : "absent");
+}
+
+int iomfb_m4_adopt_external(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	int ret;
+
+	if (!dcp)
+		return -ENODEV;
+	mutex_lock(&dcp->lock);
+	ret = dcp_m4_adopt(dcp);
+	mutex_unlock(&dcp->lock);
+	if (!ret) {
+		char eps[3 * 224 + 1] = "";
+		size_t len = 0;
+		unsigned int ep;
+
+		/* Which application endpoints this firmware advertises. */
+		for (ep = 0x20; ep < 0x100; ep++)
+			if (apple_rtkit_has_endpoint(dcp->rtkit, ep))
+				len += scnprintf(eps + len, sizeof(eps) - len, " %02x", ep);
+		dev_info(dcp->dev, "external DCP adopted\n");
+		dev_dbg(dcp->dev, "endpoints:%s\n", eps);
+		dcp_m4_probe_endpoints(dcp);
+		/* A failed startup quarantines the session; the device stays bound. */
+		mutex_lock(&dcp->lock);
+		dcp_m4_startup(dcp);
+		mutex_unlock(&dcp->lock);
+	}
+	return ret;
 }
 
 int iomfb_m4_start(struct apple_dcp *owner, struct device *scanout)
@@ -1331,6 +1651,26 @@ int iomfb_m4_get_mode(struct apple_dcp *owner, struct drm_display_mode *mode)
 int iomfb_m4_error(struct apple_dcp *owner)
 {
 	return owner->v26_6 ? READ_ONCE(owner->v26_6->error) : -ENODEV;
+}
+
+/*
+ * An adopted external DCP whose IOMFB session opened (A401, open, drain
+ * and a healthy runtime) and has not failed since. Lock-free: the runtime is
+ * published once and the session is retained until reboot.
+ */
+bool iomfb_m4_external_ready(struct apple_dcp *owner)
+{
+	struct iomfb_m4 *dcp = owner->v26_6;
+	struct dcp_m4_runtime *r;
+
+	if (!dcp || !dcp->external || READ_ONCE(dcp->error))
+		return false;
+	/* Pairs with the release store of dcp->runtime in startup. */
+	r = smp_load_acquire(&dcp->runtime);
+	if (!r)
+		return false;
+	/* Pairs with the release store of r->done in startup. */
+	return smp_load_acquire(&r->done);
 }
 
 int iomfb_m4_health(struct apple_dcp *owner)
@@ -1581,6 +1921,9 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
 	struct iomfb_m4 *dcp = owner->v26_6;
 	int ret;
 
+	/* An external DCP displays nothing yet: nothing to release for sleep. */
+	if (dcp && dcp->external)
+		return 0;
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);
@@ -1605,6 +1948,8 @@ int iomfb_m4_resume(struct apple_dcp *owner)
 	struct iomfb_m4 *dcp = owner->v26_6;
 	int ret;
 
+	if (dcp && dcp->external)
+		return 0;
 	if (!dcp || !dcp->runtime)
 		return -ENODEV;
 	mutex_lock(&dcp->lock);

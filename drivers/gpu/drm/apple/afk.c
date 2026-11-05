@@ -277,10 +277,15 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 	}
 
 	/* An unstopped adopted session owns this ring until the machine resets. */
-	if (READ_ONCE(ep->dcp->retain_dma))
+	if (ep->dcp->afk_alloc) {
+		ep->bfr = ep->dcp->afk_alloc(ep->dcp, size, &ep->bfr_dma);
+		if (IS_ERR(ep->bfr))
+			ep->bfr = NULL;
+	} else if (READ_ONCE(ep->dcp->retain_dma)) {
 		ep->bfr = dma_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
-	else
+	} else {
 		ep->bfr = dmam_alloc_coherent(ep->dcp->dev, size, &ep->bfr_dma, GFP_KERNEL);
+	}
 	if (!ep->bfr) {
 		dev_err(ep->dcp->dev, "Failed to allocate %d bytes buffer\n",
 			size);
@@ -451,7 +456,9 @@ struct afk_compact_cmd {
 
 static bool afk_compact_capable(struct apple_dcp_afkep *ep)
 {
-	return ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	/* An adopted J713 external DCP runs compact EPIC on its auxiliary endpoints too. */
+	return ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       (ep->dcp->fw_compat == DCP_FIRMWARE_M4 && ep->dcp->afk_alloc);
 }
 
 static u32 afk_compact_next_status(struct apple_epic_service *service)
