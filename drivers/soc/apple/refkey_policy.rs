@@ -7,11 +7,7 @@ use kernel::prelude::*;
 /// Bind private-key use to this biometric credential set. Enrollment changes
 /// within the set are permitted; this is not a current-enrollment-set policy.
 pub(crate) fn biometric_signing_policy(binding: &[u8; 16]) -> Result<KVec<u8>> {
-    if binding.iter().all(|v| *v == 0) {
-        return Err(EINVAL);
-    }
-    let credential = encode_refkey_set(&[(b"pbioc", V::Octets(binding))])?;
-    let biometric = encode_refkey_set(&[(b"cbio", V::Der(&credential))])?;
+    let biometric = biometric_constraint(binding)?;
     let acl = encode_refkey_set(&[
         (b"oa", V::Boolean(true)),
         (b"ock", V::Der(&biometric)),
@@ -20,6 +16,27 @@ pub(crate) fn biometric_signing_policy(binding: &[u8; 16]) -> Result<KVec<u8>> {
         (b"osgn", V::Der(&biometric)),
     ])?;
     encode_refkey_set(&[(b"acl", V::Der(&acl))])
+}
+
+pub(crate) fn biometric_combined_policy(binding: &[u8; 16]) -> Result<KVec<u8>> {
+    let biometric = biometric_constraint(binding)?;
+    let acl = encode_refkey_set(&[
+        (b"oa", V::Boolean(true)),
+        (b"ock", V::Der(&biometric)),
+        (b"okd", V::Der(&biometric)),
+        (b"osgn", V::Der(&biometric)),
+        (b"od", V::Der(&biometric)),
+        (b"oecd", V::Der(&biometric)),
+        (b"oe", V::Boolean(true)),
+        (b"odel", V::Boolean(true)),
+    ])?;
+    encode_refkey_set(&[(b"acl", V::Der(&acl))])
+}
+
+fn biometric_constraint(binding: &[u8; 16]) -> Result<KVec<u8>> {
+    if binding.iter().all(|v| *v == 0) { return Err(EINVAL); }
+    let credential = encode_refkey_set(&[(b"pbioc", V::Octets(binding))])?;
+    encode_refkey_set(&[(b"cbio", V::Der(&credential))])
 }
 
 #[kernel::macros::kunit_tests(apple_sep_refkey_policy)]

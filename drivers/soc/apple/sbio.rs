@@ -290,6 +290,7 @@ impl SepData {
     }
 
     pub(crate) fn bio_wake(&self) {
+        self.key_result_changed.notify_all();
         if let Some(dev) = self.bio_dev.lock().as_ref() {
             dev.wake();
         }
@@ -1303,10 +1304,10 @@ impl SepData {
     }
 
     pub(crate) fn run_verify(&self) {
-        let signing = bio::is_sign(&self.bio_session.lock());
+        let signing = bio::is_key_operation(&self.bio_session.lock());
         if signing {
-            let request = bio::take_sign_request(&mut self.bio_session.lock());
-            if let Some(request) = request { self.run_key_sign(request); }
+            let request = bio::take_key_request(&mut self.bio_session.lock());
+            if let Some(request) = request { self.run_key_operation(request); }
             return;
         }
         if !bio::verify_is_live(&self.bio_session.lock()) { return; }
@@ -2603,9 +2604,7 @@ impl SepData {
 
     pub(crate) fn bio_release(&self) {
         bio::release(&mut self.bio_session.lock());
-        if let Some(dev) = self.bio_dev.lock().as_ref() {
-            dev.wake();
-        }
+        self.bio_wake();
     }
 
     /// Called by the enrol and verify work items before they touch the sensor.
@@ -2699,8 +2698,8 @@ impl SepData {
             .enqueue::<Arc<SepData>, VERIFY_WORK_ID>(this.clone())
             .is_err()
         {
-            if bio::is_sign(&this.bio_session.lock()) {
-                bio::finish_sign(&mut this.bio_session.lock(), Err(EIO));
+            if bio::is_key_operation(&this.bio_session.lock()) {
+                bio::finish_key(&mut this.bio_session.lock(), Err(EIO));
                 this.bio_wake();
             } else {
                 this.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), [0; bio::TOKEN_LEN]);
@@ -2730,7 +2729,9 @@ impl SepData {
     }
 
     pub(crate) fn bio_ioctl(&self, cmd: u32, arg: usize) -> Result<bio::Handled> {
-        if cmd == crate::keys::IOC_CREATE || cmd == crate::keys::IOC_SIGN_START || cmd == crate::keys::IOC_SIGN_POLL {
+        if matches!(cmd, crate::keys::IOC_CREATE | crate::keys::IOC_SIGN_START | crate::keys::IOC_SIGN_POLL
+            | crate::keys::IOC_DECRYPT_START | crate::keys::IOC_DECRYPT_POLL)
+        {
             return self.key_ioctl(cmd, arg);
         }
         if cmd == bio::IOC_ATTEST {

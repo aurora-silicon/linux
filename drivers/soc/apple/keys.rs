@@ -93,7 +93,7 @@ impl SepData {
             _ => return Err(EIO),
         }
         let blob = fields.blob().ok_or(EIO)?;
-        if blob.is_empty() || blob.len() > MAX_BLOB {
+        if blob.len() > MAX_BLOB {
             return Err(EIO);
         }
         let mut owned = KVec::new();
@@ -101,7 +101,7 @@ impl SepData {
         Ok(owned)
     }
 
-    pub(crate) fn create_biometric_key(&self) -> Result<(KVec<u8>, [u8; bio::ATTEST_PUB_LEN])> {
+    pub(crate) fn create_biometric_key(&self, policy_kind: u32) -> Result<(KVec<u8>, [u8; bio::ATTEST_PUB_LEN])> {
         let credential = self.key_credential()?;
         let result = (|| {
             let user = sbio::UserId::new(crate::SBIO_PROBE_USER_ID).ok_or(EINVAL)?;
@@ -109,14 +109,19 @@ impl SepData {
                 return Err(EIO);
             };
             let binding: &[u8; 16] = binding.as_slice().try_into().map_err(|_| EIO)?;
-            let policy = crate::refkey_policy::biometric_signing_policy(binding)?;
-            let blob = self.application_refkey_op(&[
-                (b"o", V::Utf8(b"oc")),
-                (b"bc", V::Integer(9)),
-                (b"kt", V::Integer(4)),
-                (b"ed", V::Der(&policy)),
-                (b"acmh", V::Octets(credential.handle())),
-            ])?;
+            let policy = if policy_kind == 1 {
+                crate::refkey_policy::biometric_combined_policy(binding)?
+            } else {
+                crate::refkey_policy::biometric_signing_policy(binding)?
+            };
+            let items = [
+                (b"o".as_slice(), V::Utf8(b"oc")),
+                (b"bc".as_slice(), V::Integer(9)),
+                (b"kt".as_slice(), V::Integer(4)),
+                (b"ed".as_slice(), V::Der(&policy)),
+                (b"acmh".as_slice(), V::Octets(credential.handle())),
+            ];
+            let blob = self.application_refkey_op(&items)?;
             let mut public = [0; bio::ATTEST_PUB_LEN];
             public.copy_from_slice(Self::refkey_pub(&blob).ok_or(EIO)?);
             Ok((blob, public))
@@ -146,6 +151,20 @@ impl SepData {
         signature.bytes[..bytes.len()].copy_from_slice(bytes);
         Ok(signature)
     }
+
+    fn decrypt_biometric_key(
+        &self,
+        blob: &[u8],
+        sealed: &[u8],
+        credential: &Credential<'_>,
+    ) -> Result<crate::Secret> {
+        let mut items = KVec::new();
+        items.push((b"o".as_slice(), V::Utf8(b"oecd")), GFP_KERNEL)?;
+        items.push((b"d".as_slice(), V::Octets(sealed)), GFP_KERNEL)?;
+        items.push((b"rk".as_slice(), V::Der(blob)), GFP_KERNEL)?;
+        items.push((b"acmh".as_slice(), V::Octets(credential.handle())), GFP_KERNEL)?;
+        self.application_refkey_op(&items).map(crate::Secret)
+    }
 }
 
 pub(crate) struct Signature {
@@ -153,16 +172,28 @@ pub(crate) struct Signature {
     pub(crate) bytes: [u8; bio::ATTEST_SIG_MAX],
 }
 
-pub(crate) struct SignRequest {
+pub(crate) struct KeyRequest {
     pub(crate) blob: KVec<u8>,
-    pub(crate) digest: [u8; 32],
+    pub(crate) input: Input,
     pub(crate) deadline_ns: u64,
 }
 
-pub(crate) struct Signing {
-    pub(crate) request: Option<SignRequest>,
+pub(crate) enum Input {
+    Sign([u8; 32]),
+    Decrypt(KVec<u8>),
+}
+
+pub(crate) enum Output {
+    Signature(Signature),
+    Plaintext(crate::Secret),
+    Consumed,
+}
+
+pub(crate) struct KeyOperation {
+    pub(crate) request: Option<KeyRequest>,
     pub(crate) deadline_ns: u64,
-    pub(crate) terminal: Option<Result<Signature>>,
+    pub(crate) terminal: Option<Result<Output>>,
+    pub(crate) decrypt: bool,
     pub(crate) guidance: bio::Guidance,
 }
 
@@ -194,9 +225,30 @@ pub(crate) struct SignPoll {
     pub(crate) signature: [u8; bio::ATTEST_SIG_MAX],
 }
 
+#[repr(C)]
+struct DecryptStart {
+    flags: u32,
+    timeout_ms: u32,
+    blob_len: u32,
+    sealed_len: u32,
+    blob_ptr: u64,
+    sealed_ptr: u64,
+}
+
+#[repr(C)]
+pub(crate) struct DecryptPoll {
+    pub(crate) state: u32,
+    pub(crate) status: i32,
+    pub(crate) guidance: u32,
+    pub(crate) plain_len: u32,
+    pub(crate) plain_ptr: u64,
+}
+
 static_assert!(core::mem::size_of::<Create>() == 88);
 static_assert!(core::mem::size_of::<SignStart>() == 56);
 static_assert!(core::mem::size_of::<SignPoll>() == 88);
+static_assert!(core::mem::size_of::<DecryptStart>() == 32);
+static_assert!(core::mem::size_of::<DecryptPoll>() == 24);
 // SAFETY: these repr(C) structures contain only integers/bytes and no padding.
 unsafe impl kernel::transmute::AsBytes for Create {}
 // SAFETY: every bit pattern is valid for all fields.
@@ -205,10 +257,18 @@ unsafe impl kernel::transmute::FromBytes for Create {}
 unsafe impl kernel::transmute::FromBytes for SignStart {}
 // SAFETY: repr(C), all fields initialized, no padding.
 unsafe impl kernel::transmute::AsBytes for SignPoll {}
+// SAFETY: every bit pattern is valid for all integer fields; no padding.
+unsafe impl kernel::transmute::FromBytes for DecryptStart {}
+// SAFETY: every bit pattern is valid for all integer fields; no padding.
+unsafe impl kernel::transmute::FromBytes for DecryptPoll {}
+// SAFETY: repr(C), initialized integer fields, no padding.
+unsafe impl kernel::transmute::AsBytes for DecryptPoll {}
 
 pub(crate) const IOC_CREATE: u32 = kernel::ioctl::_IOWR::<Create>(0xb1, 0x0b);
 pub(crate) const IOC_SIGN_START: u32 = kernel::ioctl::_IOW::<SignStart>(0xb1, 0x0c);
 pub(crate) const IOC_SIGN_POLL: u32 = kernel::ioctl::_IOR::<SignPoll>(0xb1, 0x0d);
+pub(crate) const IOC_DECRYPT_START: u32 = kernel::ioctl::_IOW::<DecryptStart>(0xb1, 0x0e);
+pub(crate) const IOC_DECRYPT_POLL: u32 = kernel::ioctl::_IOWR::<DecryptPoll>(0xb1, 0x0f);
 
 impl SepData {
     pub(crate) fn key_ioctl(&self, cmd: u32, arg: usize) -> Result<bio::Handled> {
@@ -216,6 +276,11 @@ impl SepData {
         let user = UserPtr::from_addr(arg);
         if cmd == IOC_SIGN_POLL {
             return bio::poll_sign(&mut self.bio_session.lock(), user);
+        }
+        if cmd == IOC_DECRYPT_POLL {
+            let result = bio::poll_decrypt(&mut self.bio_session.lock(), user);
+            self.key_result_changed.notify_all();
+            return result;
         }
         if !self.biometric_keys_supported() {
             return Err(Error::from_errno(-(kernel::bindings::EOPNOTSUPP as i32)));
@@ -230,14 +295,14 @@ impl SepData {
             IOC_CREATE => {
                 let request: Create = UserSlice::new(user, core::mem::size_of::<Create>())
                     .reader().read()?;
-                if request.flags != 0 || request.reserved != [0; 7]
+                if request.flags > 1 || request.reserved != [0; 7]
                     || request.blob_len as usize != MAX_BLOB
                 {
                     return Err(EINVAL);
                 }
                 bio::reserve_worker(&mut self.bio_session.lock())?;
                 let result = if self.capture_begin() {
-                    let result = self.create_biometric_key();
+                    let result = self.create_biometric_key(request.flags);
                     self.capture_end();
                     result
                 } else {
@@ -275,9 +340,37 @@ impl SepData {
                 if Self::refkey_pub(&blob).is_none() { return Err(EINVAL); }
                 let deadline_ns = crate::shim::monotonic_ns()
                     .saturating_add(u64::from(request.timeout_ms) * 1_000_000);
-                bio::start_sign(&mut self.bio_session.lock(), SignRequest {
+                bio::start_key(&mut self.bio_session.lock(), KeyRequest {
                     blob,
-                    digest: request.digest,
+                    input: Input::Sign(request.digest),
+                    deadline_ns,
+                })
+            }
+            IOC_DECRYPT_START => {
+                let request: DecryptStart = UserSlice::new(user, core::mem::size_of::<DecryptStart>())
+                    .reader().read()?;
+                // P-256 ephemeral point, authenticated ciphertext, 16-byte tag.
+                if request.flags != 0 || !(1..=120_000).contains(&request.timeout_ms)
+                    || request.blob_len == 0 || request.blob_len as usize > MAX_BLOB
+                    || !(81..=MAX_BLOB).contains(&(request.sealed_len as usize))
+                {
+                    return Err(EINVAL);
+                }
+                let mut blob = KVec::new();
+                blob.resize(request.blob_len as usize, 0, GFP_KERNEL)?;
+                UserSlice::new(UserPtr::from_addr(request.blob_ptr as usize), blob.len())
+                    .reader().read_slice(&mut blob)?;
+                if Self::refkey_pub(&blob).is_none() { return Err(EINVAL); }
+                let mut sealed = KVec::new();
+                sealed.resize(request.sealed_len as usize, 0, GFP_KERNEL)?;
+                UserSlice::new(UserPtr::from_addr(request.sealed_ptr as usize), sealed.len())
+                    .reader().read_slice(&mut sealed)?;
+                if sealed[0] != 4 { return Err(EINVAL); }
+                let deadline_ns = crate::shim::monotonic_ns()
+                    .saturating_add(u64::from(request.timeout_ms) * 1_000_000);
+                bio::start_key(&mut self.bio_session.lock(), KeyRequest {
+                    blob,
+                    input: Input::Decrypt(sealed),
                     deadline_ns,
                 })
             }
@@ -285,14 +378,21 @@ impl SepData {
         }
     }
 
-    pub(crate) fn run_key_sign(&self, request: SignRequest) {
+    pub(crate) fn run_key_operation(&self, request: KeyRequest) {
         let result = (|| {
-            if !bio::sign_is_live(&self.bio_session.lock()) { return Err(ECANCELED); }
+            if !bio::key_is_live(&self.bio_session.lock()) { return Err(ECANCELED); }
             let credential = self.key_credential()?;
             let result = match self.verify_capture(Some(credential.handle())) {
                 bio::VerifyOutcome::Matched(_) => {
-                    if !bio::sign_is_live(&self.bio_session.lock()) { Err(ECANCELED) }
-                    else { self.sign_biometric_key(&request.blob, &request.digest, &credential) }
+                    if !bio::key_is_live(&self.bio_session.lock()) { Err(ECANCELED) }
+                    else {
+                        match &request.input {
+                            Input::Sign(digest) => self.sign_biometric_key(&request.blob, digest, &credential)
+                                .map(Output::Signature),
+                            Input::Decrypt(sealed) => self.decrypt_biometric_key(&request.blob, sealed, &credential)
+                                .map(Output::Plaintext),
+                        }
+                    }
                 }
                 bio::VerifyOutcome::NoMatch => Err(EACCES),
                 bio::VerifyOutcome::Failed(crate::ENROL_STATUS_TIMEOUT) => Err(ETIMEDOUT),
@@ -302,6 +402,21 @@ impl SepData {
             if self.key_api_failed.load(Relaxed) { return Err(EIO); }
             result
         })();
-        if bio::finish_sign(&mut self.bio_session.lock(), result) { self.bio_wake(); }
+        if bio::finish_key(&mut self.bio_session.lock(), result) { self.bio_wake(); }
+        // Wait on the session predicate so a consumed/canceled result releases
+        // ownership promptly, and an abandoned result is wiped at its deadline.
+        {
+            let mut session = self.bio_session.lock();
+            while let Some(remaining) = bio::key_plaintext_wait_ns(&mut session, crate::shim::monotonic_ns()) {
+                let timeout = kernel::time::msecs_to_jiffies(remaining.div_ceil(1_000_000) as u32);
+                if matches!(self.key_result_changed.wait_interruptible_timeout(&mut session, timeout),
+                    kernel::sync::CondVarTimeoutResult::Signal { .. })
+                {
+                    bio::abort_capture(&mut session);
+                    break;
+                }
+            }
+        }
+        self.bio_wake();
     }
 }

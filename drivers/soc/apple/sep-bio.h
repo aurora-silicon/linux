@@ -56,6 +56,7 @@ struct sep_bio_info {
 /* reserved[0] flags; reserved[1] is a live SEP identity count only when valid. */
 #define SEP_BIO_INFO_LIVE_COUNT_VALID 1u
 #define SEP_BIO_INFO_BIOMETRIC_KEYS   2u
+#define SEP_BIO_INFO_BIOMETRIC_DECRYPT 4u
 
 struct sep_bio_list {
   __u32 count;
@@ -132,9 +133,11 @@ struct sep_bio_attest {
 
 /* Application-owned P-256 keys with biometric private-key-use policy. */
 #define SEP_BIO_KEY_BLOB_MAX 4096
+/* Also constrain ECIES private-key use to biometry. */
+#define SEP_BIO_KEY_CREATE_DECRYPT 1u
 
 struct sep_bio_key_create {
-  __u32 flags;              /* must be zero */
+  __u32 flags;              /* zero or SEP_BIO_KEY_CREATE_DECRYPT */
   __u32 blob_len;           /* in: KEY_BLOB_MAX capacity; out: actual size */
   __aligned_u64 blob_ptr;   /* userspace output buffer, persist with public */
   __u8 public[SEP_BIO_ATTEST_PUB_LEN];
@@ -162,3 +165,24 @@ struct sep_bio_key_sign_poll {
 #define SEP_BIO_KEY_CREATE     _IOWR(SEP_BIO_IOC_MAGIC, 0x0b, struct sep_bio_key_create)
 #define SEP_BIO_KEY_SIGN_START _IOW (SEP_BIO_IOC_MAGIC, 0x0c, struct sep_bio_key_sign_start)
 #define SEP_BIO_KEY_SIGN_POLL  _IOR (SEP_BIO_IOC_MAGIC, 0x0d, struct sep_bio_key_sign_poll)
+
+/* ECIES: ephemeral P-256 point (65), ciphertext, AES-GCM tag (16). */
+struct sep_bio_key_decrypt_start {
+  __u32 flags;              /* must be zero */
+  __u32 timeout_ms;         /* 1..120000, CLOCK_MONOTONIC */
+  __u32 blob_len;           /* 1..KEY_BLOB_MAX */
+  __u32 sealed_len;         /* 81..KEY_BLOB_MAX */
+  __aligned_u64 blob_ptr;   /* copied before START returns */
+  __aligned_u64 sealed_ptr; /* copied before START returns */
+};
+
+struct sep_bio_key_decrypt_poll {
+  __u32 state;
+  __s32 status;            /* negative errno when FAILED */
+  __u32 guidance;
+  __u32 plain_len;         /* in: capacity; out: required/actual plaintext size */
+  __aligned_u64 plain_ptr; /* plaintext is host-visible; consumed on success */
+};
+
+#define SEP_BIO_KEY_DECRYPT_START _IOW (SEP_BIO_IOC_MAGIC, 0x0e, struct sep_bio_key_decrypt_start)
+#define SEP_BIO_KEY_DECRYPT_POLL  _IOWR(SEP_BIO_IOC_MAGIC, 0x0f, struct sep_bio_key_decrypt_poll)

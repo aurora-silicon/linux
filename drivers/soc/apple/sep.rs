@@ -645,6 +645,9 @@ struct SepData {
     key_api_failed: Atomic<bool>,
 
     #[pin]
+    key_result_changed: CondVar,
+
+    #[pin]
     bio_index: Mutex<bio::IdentityIndex>,
 
     #[pin]
@@ -848,6 +851,7 @@ impl SepData {
                 sbio_ready: Atomic::new(false),
                 bio_session <- new_mutex!(bio::Session::new()),
                 key_api_failed: Atomic::new(false),
+                key_result_changed <- new_condvar!("SepData::key_result_changed"),
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
                 store <- new_mutex!(store),
@@ -2032,6 +2036,7 @@ impl SepData {
         self.sbio_wq.notify_all();
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
+        self.key_result_changed.notify_all();
         if let Some(mut handle) = self.rng.lock().take() {
             handle.unregister();
         }
