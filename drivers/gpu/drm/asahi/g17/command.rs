@@ -330,7 +330,13 @@ impl UscWindow {
     }
 }
 
-fn sampler(space: &impl AddressSpace, heap: u64, count: u32) -> Result {
+/// A command's sampler heap. The M5 command set has none: its render and compute
+/// programs carry no sampler-heap state, so M5 refuses a heap here, before anything is
+/// queued, rather than run the command without it.
+fn sampler(space: &impl AddressSpace, heap: u64, count: u32, m5: bool) -> Result {
+    if m5 && (heap != 0 || count != 0) {
+        return Err(EOPNOTSUPP);
+    }
     if count > MAX_SAMPLERS || (heap == 0) != (count == 0) || heap & (SAMPLER_SIZE - 1) != 0 {
         return Err(EINVAL);
     }
@@ -514,7 +520,7 @@ impl Payload {
                 }
                 let depth = surface(space, &cmd.depth, cmd.layers)?;
                 let stencil = surface(space, &cmd.stencil, cmd.layers)?;
-                sampler(space, cmd.sampler_heap, cmd.sampler_count.into())?;
+                sampler(space, cmd.sampler_heap, cmd.sampler_count.into(), m5)?;
                 if !helper_is_empty(&cmd.vertex_helper) || !helper_is_empty(&cmd.fragment_helper) {
                     return Err(EINVAL);
                 }
@@ -632,7 +638,7 @@ impl Payload {
                     cmd.cdm_ctrl_stream_end - cmd.cdm_ctrl_stream_base,
                     Access::Read,
                 )?;
-                sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
+                sampler(space, cmd.sampler_heap, cmd.sampler_count, m5)?;
                 attachments.validate(space)?;
                 // M5 shader-context scratch has its own (Gen2) layout; G17P's stays disabled.
                 let scratch = ScratchRequest::new(if m5 { 0 } else { cmd.scs_layout })?;
