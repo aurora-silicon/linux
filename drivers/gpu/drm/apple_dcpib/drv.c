@@ -361,6 +361,14 @@ int dcpib_wait_hpd(struct dcpib *dcp)
 	return hpd < 0 ? hpd : -ENODEV;
 }
 
+static void dcpib_av_work(struct work_struct *work)
+{
+	struct dcpib *dcp = container_of(to_delayed_work(work), struct dcpib,
+					 av_work);
+
+	dcpib_reset_mode(dcp);
+}
+
 static int dcpib_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -388,6 +396,7 @@ static int dcpib_probe(struct platform_device *pdev)
 	dcp->dev = dev;
 	platform_set_drvdata(pdev, dcp);
 	mutex_init(&dcp->lock);
+	INIT_DELAYED_WORK(&dcp->av_work, dcpib_av_work);
 	of_property_read_u32(dev->of_node, "apple,die", &dcp->die);
 
 	dcp->wq = devm_alloc_ordered_workqueue(dev, "dcpib", WQ_MEM_RECLAIM);
