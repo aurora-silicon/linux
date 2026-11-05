@@ -141,6 +141,8 @@ impl drm::driver::Driver for AsahiDrmDriver {
 pub(crate) enum ProbeConfig {
     Legacy(&'static hw::HwConfig),
     G17(&'static g17::Config),
+    /// M5 Pro, Max and Ultra: the ID registers select the configuration.
+    G17M5,
     M3(crate::m3::Chip),
     /// The M5 (T8142) backend, refused unless it is built.
     M5,
@@ -170,6 +172,14 @@ macro_rules! asahi_of_device_table {
                 (
                     of::DeviceId::new(c"apple,agx-t8142"),
                     ProbeConfig::M5
+                ),
+                (
+                    of::DeviceId::new(c"gpu,t6050"),
+                    ProbeConfig::G17M5
+                ),
+                (
+                    of::DeviceId::new(c"apple,agx-t6050"),
+                    ProbeConfig::G17M5
                 ),
                 (
                     of::DeviceId::new(c"apple,agx-t8103"),
@@ -258,6 +268,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Legacy(cfg) => *cfg,
             ProbeConfig::G17(cfg) => return AsahiPlatformDriver::probe_g17(pdev, cfg),
+            ProbeConfig::G17M5 => return AsahiPlatformDriver::probe_g17_m5(pdev),
             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
             #[cfg(CONFIG_DRM_ASAHI_M5)]
             ProbeConfig::M5 => return AsahiPlatformDriver::probe_m5(pdev),
@@ -388,6 +399,17 @@ impl AsahiPlatformDriver {
             raw_stats: core::ptr::null_mut(),
             stats: None,
         })
+    }
+
+    fn probe_g17_m5<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+    ) -> Result<AsahiPlatformDriverData<'bound>> {
+        let cfg = &hw::t6050::CONFIG;
+        if let g17::FirmwareProfile::M5NoBareMetalTables = cfg.profile {
+            dev_err!(pdev.as_ref(), "M5 Pro/Max bare-metal GPU tables not yet available\n");
+            return Err(ENODEV);
+        }
+        Self::probe_g17(pdev, cfg)
     }
 
     fn probe_g17<'bound>(
