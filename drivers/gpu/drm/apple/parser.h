@@ -265,5 +265,7 @@ struct dcp_system_ev_mnits {
 
 int parse_system_log_mnits(struct dcp_parse_ctx *handle,
 			   struct dcp_system_ev_mnits *entry);
+int parse_system_log_mnits_pairs(const void *blob, size_t size,
+				 struct dcp_system_ev_mnits *entry);
 
 #endif
