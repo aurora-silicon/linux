@@ -104,8 +104,58 @@ static void atc_tunnel_t6030_clock_sources(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t6030_pclk(0, ~0U), -EOPNOTSUPP);
 }
 
+static void atc_tunnel_t8132_clock_sources(struct kunit *test)
+{
+	/* dcpext0 (2) and dcpext1 (4): PCLK1 for DP IN 0, PCLK2 for DP IN 1 */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(2, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(4, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(2, 1), 1);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(4, 1), 1);
+	/* No other source, and no third DP IN */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(0, 0), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(3, 0), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(2, 2), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_pclk(~0U, 0), -EOPNOTSUPP);
+}
+
+static void atc_tunnel_pclk_gates(struct kunit *test)
+{
+	/* DP IN 0 alone: PCLK1 */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_pclks(BIT(0)), APPLE_DP_TUNNEL_PCLK1);
+	/* DP IN 1 alone: PCLK2, and PCLK1 at its rate */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_pclks(BIT(1)),
+			APPLE_DP_TUNNEL_PCLK1 | APPLE_DP_TUNNEL_PCLK2);
+	/* both: both */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_pclks(BIT(0) | BIT(1)),
+			APPLE_DP_TUNNEL_PCLK1 | APPLE_DP_TUNNEL_PCLK2);
+	/* DP IN 0 released with DP IN 1 up: PCLK1 stays */
+	KUNIT_EXPECT_TRUE(test, apple_dp_tunnel_pclks((BIT(0) | BIT(1)) & ~BIT(0)) &
+			  APPLE_DP_TUNNEL_PCLK1);
+	/* DP IN 1 released with DP IN 0 up: PCLK2 goes, PCLK1 stays */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_pclks((BIT(0) | BIT(1)) & ~BIT(1)),
+			APPLE_DP_TUNNEL_PCLK1);
+	/* all released: neither */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_pclks(0), 0U);
+}
+
+static void atc_tunnel_t8132_one_rate(struct kunit *test)
+{
+	/* HBR2 (0x14) next to HBR2, or alone: allowed */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_rate_ok(0x14, 0x14), 0);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_rate_ok(0x14, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_rate_ok(0x0a, 0), 0);
+	/* a stop is never refused */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_rate_ok(0, 0x14), 0);
+	/* another rate next to a running stream: refused */
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_rate_ok(0x0a, 0x14), -EBUSY);
+	KUNIT_EXPECT_EQ(test, apple_dp_tunnel_t8132_rate_ok(0x1e, 0x0a), -EBUSY);
+}
+
 static struct kunit_case atc_tunnel_cases[] = {
 	KUNIT_CASE(atc_tunnel_t6030_clock_sources),
+	KUNIT_CASE(atc_tunnel_t8132_clock_sources),
+	KUNIT_CASE(atc_tunnel_t8132_one_rate),
+	KUNIT_CASE(atc_tunnel_pclk_gates),
 	KUNIT_CASE(atc_tunnel_soc_qualification),
 	KUNIT_CASE(atc_tunnel_core_qualification),
 	KUNIT_CASE(atc_tunnel_wiring_gate),
