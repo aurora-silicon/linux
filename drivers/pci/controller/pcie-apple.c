@@ -192,6 +192,21 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   RC_T6050_DBI_RO_WR_EN		BIT(0)
 
 /*
+ * T6050 PCIe-C: the 256-entry RID2SID table runs over the T8103 tunnel block,
+ * which moves up by 0x700 (posted request counters, TUNCTRL and TUNSTAT).
+ */
+#define PORT_T6050_TUNCTRL	0x1088
+
+/* T6050 PCIe-C root port config space: the MPS-dependent link timers */
+#define PCIEC_RP_DEVCAP		0x074
+#define PCIEC_RP_DEVCTL		0x078
+#define PCIEC_RP_ACK_LATENCY	0x700
+#define PCIEC_RP_FC_TIMER	0x73c
+#define   PCIEC_RP_FC_TIMER_KEEP	0x6000ffff
+#define   PCIEC_RP_FC_TIMER_LIMIT	GENMASK(28, 16)
+#define   PCIEC_RP_FC_TIMER_EN		BIT(31)
+
+/*
  * The doorbell address must be in the bottom 4GB because the base register
  * is only 32 bits wide. Exclude it from the IOVA range and share the same
  * configured address with the DART driver.
@@ -218,6 +233,8 @@ struct hw_info {
 	bool tunnel_intr2axi;
 	bool t8132_reset;
 	bool msimap_by_vector;
+	bool no_port_reset;
+	bool mps_timers;
 };
 
 static const struct hw_info t8103_hw = {
@@ -331,6 +348,32 @@ static const struct hw_info t8132_pciec_hw = {
 	.tunneled		= true,
 	.t8132_reset		= true,
 	.msimap_by_vector	= true,
+};
+
+/*
+ * T6050 PCIe-C keeps the t8103 doorbell, PERST and RID2SID registers, with
+ * the doorbell's high word at 0x16c and 256 RID2SID entries. MSIs go through
+ * the t602x map, indexed by the vector the endpoint sends: the bridge's slice
+ * of the shared window, not a local index. The port has no reset sequence of
+ * its own, and the root port's ACK latency and flow control timers follow
+ * the max payload size.
+ *
+ * Nothing hands the port over: apple,pciec-kernel-init brings it up with the
+ * T600x Intr2AXI sequence.
+ */
+static const struct hw_info t6050_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_msiaddr_hi	= PORT_MSIADDR + 4,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_tunctrl		= PORT_T6050_TUNCTRL,
+	.max_rid2sid		= 256,
+	.tunneled		= true,
+	.tunnel_intr2axi	= true,
+	.no_port_reset		= true,
+	.msimap_by_vector	= true,
+	.mps_timers		= true,
 };
 
 static const struct of_device_id apple_pcie_of_match[];
@@ -1020,6 +1063,10 @@ static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 {
 	int i;
 
+	/* T6050 has no such sequence: only its RID2SID table is cleared. */
+	if (port->pcie->hw->no_port_reset)
+		goto clear_rid2sid;
+
 	for (i = 0; i < ARRAY_SIZE(apple_pcie_tunnel_reset_regs); i++) {
 		u32 value = apple_pcie_tunnel_reset_regs[i].value;
 
@@ -1047,6 +1094,7 @@ static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 		apple_pcie_port_writel(port, value, apple_pcie_tunnel_reset_regs[i].offset);
 	}
 
+clear_rid2sid:
 	for (i = 0; i < port->pcie->hw->max_rid2sid; i++)
 		apple_pcie_rid2sid_write(port, i, 0);
 	if (port->pcie->hw->t8132_reset)
@@ -1119,8 +1167,8 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 
 /*
  * Bring up a port selected by apple,pciec-kernel-init that no firmware
- * handoff left running: tunables and the reset table, then PERST and APPCLK,
- * and only then the root-port config-space
+ * handoff left running: tunables and the reset table (T6050 has none),
+ * then PERST and APPCLK, and only then the root-port config-space
  * tunables. Stop before releasing the tunnel reset or starting link
  * training.
  */
@@ -1245,10 +1293,48 @@ static void apple_pcie_tunnel_restore_irq_hw(struct apple_pcie_port *port)
  */
 #define APPLE_PCIE_TUNNEL_READY_MS	1000
 
+/*
+ * The T6050 PCIe-C root port's ACK latency limit (0x700, low half) and flow
+ * control update timer (0x73c, bits 28:16) are sized for the max payload
+ * size. Each word holds both, for MPS 128, 256 and 512.
+ */
+static const u32 apple_pcie_mps_timers[] = {
+	0x003c003c, 0x005a005a, 0x006b006b,
+};
+
+static void apple_pcie_update_mps_timers(struct apple_pcie *pcie, u32 mps)
+{
+	void __iomem *rp = pcie->cfg->win;
+	u32 cap, word, val;
+
+	cap = apple_pcie_tunnel_readl(rp, PCIEC_RP_DEVCAP) & PCI_EXP_DEVCAP_PAYLOAD;
+	if (mps > cap || mps >= ARRAY_SIZE(apple_pcie_mps_timers)) {
+		dev_warn(pcie->dev, "no link timers for a %u-byte MPS\n", 128 << mps);
+		return;
+	}
+
+	word = apple_pcie_mps_timers[mps];
+	writew_relaxed(lower_16_bits(word), rp + PCIEC_RP_ACK_LATENCY);
+	/* Complete the write, as apple_pcie_tunnel_writel() does. */
+	mb();
+	isb();
+	val = apple_pcie_tunnel_readl(rp, PCIEC_RP_FC_TIMER);
+	val &= PCIEC_RP_FC_TIMER_KEEP;
+	val |= FIELD_PREP(PCIEC_RP_FC_TIMER_LIMIT, upper_16_bits(word)) |
+	       PCIEC_RP_FC_TIMER_EN;
+	apple_pcie_tunnel_writel(rp, val, PCIEC_RP_FC_TIMER);
+}
+
+/* Process context: the link of a tunnel came up. */
 static void apple_pcie_tunnel_link_up(struct apple_pcie *pcie)
 {
 	WRITE_ONCE(pcie->tunnel_ready_at,
 		   jiffies + msecs_to_jiffies(APPLE_PCIE_TUNNEL_READY_MS));
+	if (pcie->hw->mps_timers)
+		apple_pcie_update_mps_timers(pcie,
+			FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD,
+				  apple_pcie_tunnel_readl(pcie->cfg->win,
+							  PCIEC_RP_DEVCTL)));
 }
 
 /* Call before scanning the bus behind a tunnel; elapsed time counts. */
@@ -2636,6 +2722,23 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	}
 
 	/*
+	 * T6050's PCIe hosts share one MSI window, vector n at AIC 1824 + n.
+	 * The internal host's bridges own vectors 0..127 and each PCIe-C
+	 * bridge a 32-vector slice of the rest.
+	 */
+	if (pcie->hw == &t6050_pciec_hw) {
+		ret = of_property_read_u32(to_of_node(fwnode), "apple,msi-vector-base",
+					   &pcie->msi_vector_base);
+		if (ret || pcie->msi_vector_base < 128 || pcie->msi_vector_base % 32 ||
+		    pcie->nvecs != 32 ||
+		    pcie->msi_vector_base + pcie->nvecs > FIELD_MAX(PORT_MSIMAP_TARGET) + 1 ||
+		    args.args_count != 4 || args.args[0] != 0 || args.args[1] != 0 ||
+		    args.args[2] != 1824 + pcie->msi_vector_base ||
+		    args.args[3] != IRQ_TYPE_EDGE_RISING || DOORBELL_ADDR != 0xfffff000)
+			goto invalid_slice;
+	}
+
+	/*
 	 * The controller-wide ADT count (512) is not a per-host allocation.
 	 * Internal PCIe owns vectors 0..31. Each PCIe-C bridge owns a distinct
 	 * 32-vector slice. Keep endpoint MSI data local, and route its table
@@ -3134,11 +3237,17 @@ static int apple_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 	int ret;
 
 	ret = pci_generic_config_write(bus, devfn, where, size, val);
-	if (ret || !pcie || !pcie->kernel_init)
+	if (ret || !pcie)
 		return ret;
-	/* Root-port prefetchable window. The port block has to be told too. */
 	if (bus->number != cfg->busr.start || devfn)
 		return ret;
+	/* The root port's link timers follow its max payload size. */
+	if (pcie->hw->mps_timers && where == PCIEC_RP_DEVCTL)
+		apple_pcie_update_mps_timers(pcie,
+					     FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD, val));
+	if (!pcie->kernel_init)
+		return ret;
+	/* Root-port prefetchable window. The port block has to be told too. */
 	if (where < 0x24 || where >= 0x30)
 		return ret;
 
@@ -4600,6 +4709,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 };
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t6050-pciec",	.data = &t6050_pciec_hw },
 	{ .compatible = "apple,t8132-pciec",	.data = &t8132_pciec_hw },
 	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
 	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },

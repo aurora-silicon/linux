@@ -23,7 +23,9 @@ apple_t6050_usb3_pipe_cold_dummy(const struct apple_t6050_usb_io *io)
     if (io->read(io->context, 44, 0x1c) & 1)
         return -1;
     mux = io->read(io->context, 44, 0x0c) & 0x73;
-    if (mux != 0 && mux != 2 && mux != 0x42)
+    /* Unset, or already on the dummy producer (1:0 = 2) with any clock: when nothing
+     * has reset the controller domain since boot, the mux can read 0x22. */
+    if (mux != 0 && (mux & 3) != 2)
         return -1;
     if (mux == 0x42)
         return 0;
@@ -37,9 +39,10 @@ apple_t6050_usb3_pipe_cold_dummy(const struct apple_t6050_usb_io *io)
 }
 
 /*
- * Returns 0, or the failing step: -2 the PIPE was not parked on a known producer, -3 the lock was
- * not acknowledged, -4..-6 the BIST, -7 the mux did not read back USB3, -8 the BIST did not stop,
- * -9 the lock release was not acknowledged. Up to -6 the mux is untouched.
+ * Returns 0, or the failing step: -2 the PIPE was not parked on a known producer, -4..-6 the
+ * BIST, -7 the mux did not read back USB3, -8 the BIST did not stop. Up to -6 the mux is
+ * untouched. A lock or unlock that is not acknowledged within 6 ms is not fatal: it is logged
+ * and the switch carries on. On J716c the lock ACK does not come.
  */
 static inline int
 apple_t6050_usb3_pipe_switch(const struct apple_t6050_usb_io *io)
@@ -60,9 +63,7 @@ apple_t6050_usb3_pipe_switch(const struct apple_t6050_usb_io *io)
     apple_t6050_usb_mask(io, 44, 0x00, 1, 1);
     apple_t6050_usb_mask(io, 44, 0x10, 1, 1);
     locked = 1;
-    result = -3;
-    if (io->poll(io->context, 44, 0x14, 1, 1, 6000))
-        goto out;
+    io->poll(io->context, 44, 0x14, 1, 1, 6000);
 
     bist = 1;
     result = -4;
@@ -90,10 +91,49 @@ out:
     apple_t6050_usb_mask(io, 44, 0x00, 5, 0);
     if (locked) {
         apple_t6050_usb_mask(io, 44, 0x10, 1, 0);
-        if (io->poll(io->context, 44, 0x14, 1, 0, 6000) && !result)
-            result = -9;
+        io->poll(io->context, 44, 0x14, 1, 0, 6000);
     }
     return result;
+}
+
+/*
+ * Move a running DWC3 from the dummy producer (0x42) to a USB4 router's USB3 tunnel (0x21: PIPE mode 1,
+ * clock 2), once the tunnel is active. As for native USB3, the PIPE is locked only when DWC3 is out of
+ * reset, and a lock that is not acknowledged within 6 ms is not fatal.
+ * Returns 0, -2 if the PIPE is on another producer, or -7 if the mux did not read back the tunnel.
+ */
+static inline int
+apple_t6050_usb3_pipe_tunnel(const struct apple_t6050_usb_io *io)
+{
+    unsigned int mux;
+    int locked;
+
+    if (!io || !io->read || !io->write || !io->poll || !io->delay)
+        return -1;
+    mux = io->read(io->context, 44, 0x0c) & 0x73;
+    if (mux == 0x21)
+        return 0;
+    if (mux != 0x42)
+        return -2;
+    locked = io->read(io->context, 44, 0x1c) & 1;
+
+    apple_t6050_usb_mask(io, 44, 0x04, 0x0e, 0);
+    apple_t6050_usb_mask(io, 44, 0x00, 1, 1);
+    if (locked) {
+        apple_t6050_usb_mask(io, 44, 0x10, 1, 1);
+        io->poll(io->context, 44, 0x14, 1, 1, 6000);
+    }
+    apple_t6050_usb_mask(io, 44, 0x0c, 0x70, 0);
+    io->delay(io->context, 5);
+    apple_t6050_usb_mask(io, 44, 0x0c, 3, 1);
+    apple_t6050_usb_mask(io, 44, 0x0c, 0x70, 0x20);
+    apple_t6050_usb_mask(io, 44, 0x00, 1, 0);
+    apple_t6050_usb_mask(io, 44, 0x00, 4, 0);
+    if (locked) {
+        apple_t6050_usb_mask(io, 44, 0x10, 1, 0);
+        io->poll(io->context, 44, 0x14, 1, 0, 6000);
+    }
+    return (io->read(io->context, 44, 0x0c) & 0x73) == 0x21 ? 0 : -7;
 }
 
 /* The native close() call quiesces the ACIO PHY while PIPE is locked,
@@ -110,7 +150,7 @@ apple_t6050_usb3_pipe_stop(const struct apple_t6050_usb_io *io,
     if (!io || !io->read || !io->write || !io->poll || !io->delay || !quiesce)
         return -1;
     mux = io->read(io->context, 44, 0x0c) & 0x73;
-    if (mux != 0x10 && mux != 0x42)
+    if (mux != 0x10 && mux != 0x21 && mux != 0x42)
         return -1;
     apple_t6050_usb_mask(io, 44, 0x04, 0x0e, 0);
     apple_t6050_usb_mask(io, 44, 0x00, 1, 1);
