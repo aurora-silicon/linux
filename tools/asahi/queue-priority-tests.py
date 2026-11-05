@@ -24,7 +24,7 @@ mod uapi {
  pub const drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH:u32=2;
 }
 mod bindings { pub const CAP_SYS_NICE:u32=23;
- pub unsafe fn capable(_:u32)->bool { CAP.with(|c|c.get()) }
+ pub unsafe fn capable(_:i32)->bool { CAP.with(|c|c.get()) }
  thread_local! {pub static CAP:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};}
 }
 mod g17 {pub struct Gpu;}
