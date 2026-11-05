@@ -199,7 +199,7 @@
 };
 
 &ps_spi2 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_spi3 {
