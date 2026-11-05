@@ -2735,10 +2735,8 @@ impl SepData {
             return self.key_ioctl(cmd, arg);
         }
         if cmd == bio::IOC_ATTEST {
-            bio::reserve_worker(&mut self.bio_session.lock())?;
-            let result = self.bio_attest(arg);
-            bio::worker_done(&mut self.bio_session.lock());
-            return result;
+            if !self.bio_session.lock().available() { return Err(EBUSY); }
+            return self.bio_attest(arg);
         }
         // With xART writes off the enclave cannot persist what an enrolment or
         // a match changes. It saves anti-replay state after every match, and a

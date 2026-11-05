@@ -300,7 +300,8 @@ impl SepData {
                 {
                     return Err(EINVAL);
                 }
-                bio::reserve_worker(&mut self.bio_session.lock())?;
+                // The character-device mutex serializes synchronous ioctls.
+                if !self.bio_session.lock().available() { return Err(EBUSY); }
                 let result = if self.capture_begin() {
                     let result = self.create_biometric_key(request.flags);
                     self.capture_end();
@@ -308,7 +309,6 @@ impl SepData {
                 } else {
                     Err(EBUSY)
                 };
-                bio::worker_done(&mut self.bio_session.lock());
                 let (blob, public) = result?;
                 UserSlice::new(UserPtr::from_addr(request.blob_ptr as usize), MAX_BLOB)
                     .writer().write_slice(&blob)?;

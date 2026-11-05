@@ -1012,13 +1012,6 @@ pub(crate) fn release(session: &mut Session) {
     session.reset();
 }
 
-/// Reserve the same ownership for synchronous key operations as capture work.
-pub(crate) fn reserve_worker(session: &mut Session) -> Result<()> {
-    if !session.available() { return Err(EBUSY); }
-    session.worker_active = true;
-    Ok(())
-}
-
 pub(crate) fn worker_done(session: &mut Session) {
     session.worker_active = false;
 }
@@ -1149,10 +1142,8 @@ mod sign_tests {
         for (close, decrypt) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut session = Session::new();
             open(&mut session)?;
-            reserve_worker(&mut session)?;
-            assert!(start_key(&mut session, request(u64::MAX, decrypt)).is_err());
-            worker_done(&mut session);
             start_key(&mut session, request(u64::MAX, decrypt))?;
+            assert!(start_key(&mut session, request(u64::MAX, decrypt)).is_err());
             assert!(take_key_request(&mut session).is_some());
             assert!(take_key_request(&mut session).is_none());
             if close { release(&mut session); } else { abort_capture(&mut session); }
