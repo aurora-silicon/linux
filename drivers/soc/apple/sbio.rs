@@ -82,6 +82,56 @@ mod lockout_tests {
     }
 
     #[test]
+    fn unlock_evaluation_wire() {
+        use crate::scrd::*;
+        let handle = [0x5au8; SCRD_ACM_HANDLE_LEN];
+        let pre = scrd_verify_unlock_policy(&handle, 1000, true);
+        let p = pre.payload();
+        assert_eq!(p.len(), 0x55);
+        assert_eq!(&p[0..4], b"DRCS");
+        assert_eq!(p[4], 3);
+        assert_eq!(&p[8..24], &handle);
+        assert_eq!(&p[24..63], b"DeviceOwnerAuthenticationWithBiometrics");
+        assert_eq!(p[63], 0);
+        assert_eq!(p[64], 1);
+        assert_eq!(&p[65..69], &[0u8; 4]);
+        assert_eq!(&p[69..73], &1u32.to_le_bytes());
+        assert_eq!(&p[73..77], &4u32.to_le_bytes());
+        assert_eq!(&p[77..81], &4u32.to_le_bytes());
+        assert_eq!(&p[81..85], &1000u32.to_le_bytes());
+        let fin = scrd_verify_unlock_policy(&handle, 1000, false);
+        assert_eq!(fin.payload()[64], 0);
+        assert_eq!(fin.payload().len(), 0x55);
+        assert_eq!(scrd_verify_touchid_enrollment(&handle).payload().len(), 0x33);
+        let del = scrd_context_delete(&handle);
+        assert_eq!(del.payload().len(), 24);
+        assert_eq!(del.payload()[4], 2);
+
+        let mut created = [0u8; SCRD_TRACKED_CREATE_REPLY_LEN];
+        created[..16].copy_from_slice(&handle);
+        created[20] = 1;
+        assert_eq!(tracked_create_reference(&created), Some(handle));
+        created[20] = 2;
+        assert_eq!(tracked_create_reference(&created), None);
+        assert_eq!(tracked_create_reference(&created[..16]), None);
+
+        let mut answer = [0u8; 20];
+        answer[4..8].copy_from_slice(&3u32.to_le_bytes());
+        answer[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            parse_policy_answer(&answer),
+            Some(PolicyAnswer { satisfied: false, requirement: Some((3, 1, 0)) })
+        );
+        assert_eq!(
+            parse_policy_answer(&1u32.to_le_bytes()),
+            Some(PolicyAnswer { satisfied: true, requirement: None })
+        );
+        assert_eq!(parse_policy_answer(&2u32.to_le_bytes()), None);
+        answer[16] = 1;
+        assert_eq!(parse_policy_answer(&answer), None);
+    }
+
+    #[test]
     fn protected_config_unlock_words() {
         let mut raw = [0u8; SBIO_PROTECTED_CONFIG_LEN];
         raw[0..4].copy_from_slice(&1i32.to_le_bytes());
@@ -675,6 +725,25 @@ impl SepData {
         }
 
         true
+    }
+
+    /// Opens and closes one unlock evaluation at boot, before any touch, so
+    /// the log shows whether its preflight leaves a biometric match open.
+    fn probe_unlock_evaluation(&self) {
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        match self.open_unlock_evaluation(user) {
+            Some(handle) => {
+                dev_info!(self.dev, "Touch ID: unlock preflight gate passed for user {}\n", user.value());
+                self.close_unlock_evaluation(&handle);
+            }
+            None => dev_err!(
+                self.dev,
+                "Touch ID: unlock preflight gate failed for user {}; verifies will be refused\n",
+                user.value()
+            ),
+        }
     }
 
     /// Reads the Linux user's protected configuration once and logs whether
@@ -1902,9 +1971,34 @@ impl SepData {
             return;
         }
 
-        // The match uses the plain 0x23->0x06->0x65 pipeline, with no SCRD step.
+        // Each verify matches under its own unlock evaluation: a context whose
+        // preflight leaves a biometric match outstanding, carried in the image
+        // init and completed after an enrolled match.
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+            return;
+        };
+        let Some(evaluation) = self.open_unlock_evaluation(user) else {
+            dev_err!(
+                self.dev,
+                "verify: the unlock evaluation did not open; refusing before the capture. This is not a non-matching finger\n"
+            );
+            let _ = sensor::idle();
+            sensor::power(false);
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+            return;
+        };
+        *self.match_context.lock() = Some(evaluation);
 
-        let outcome = self.verify_one_image();
+        let mut outcome = self.verify_one_image();
+        if matches!(outcome, bio::VerifyOutcome::Matched(_))
+            && !self.complete_unlock_evaluation(&evaluation, user)
+        {
+            dev_err!(self.dev, "verify: the enclave matched but the unlock policy was not satisfied\n");
+            outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+        }
+        *self.match_context.lock() = None;
+        self.close_unlock_evaluation(&evaluation);
         let _ = sensor::idle();
         sensor::power(false);
         self.note_capture_end();
@@ -2781,6 +2875,7 @@ impl SepData {
             if self.templates_restored.load(Relaxed) {
                 self.reconcile_identities();
                 self.log_protected_unlock();
+                self.probe_unlock_evaluation();
             }
         } else if !listed {
             dev_warn!(self.dev, "sbio: device-view synchronisation or match policy unavailable\n");
@@ -4099,10 +4194,9 @@ impl SepData {
             Some(_) => true,
             None => false,
         };
-        if !self.establish_scrd_match_context(user) {
-            dev_err!(self.dev, "Touch ID: re-arm: the SCRD match credential was not re-established\n");
-            return None;
-        }
+        // The next verify opens a fresh unlock evaluation; nothing of the old
+        // one is carried over.
+        *self.match_context.lock() = None;
         if !self.save_lockout() {
             dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
         }

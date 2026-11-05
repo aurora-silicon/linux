@@ -2080,18 +2080,114 @@ impl SepData {
             }
             Some(acm_handle)
         })();
-        let Some(handle) = established else {
-            dev_info!(self.dev, "scrd: cold-match credential established false\n");
-            return false;
+        let ok = established.is_some();
+        dev_info!(self.dev, "scrd: cold-match credential established {}\n", ok);
+        ok
+    }
+
+    /// Opens the evaluation one verify matches under: a fresh tracked
+    /// context for `user`, externalised, whose unlock policy preflight leaves
+    /// exactly a biometric match outstanding. The context is not satisfied in
+    /// advance; the match satisfies it. Logs metadata only.
+    pub(crate) fn open_unlock_evaluation(
+        &self,
+        user: crate::sbio::UserId,
+    ) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        if !self.scrd_ready() {
+            dev_err!(self.dev, "scrd: unlock evaluation: endpoint not ready\n");
+            return None;
+        }
+        let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize())?;
+        if status != 0 {
+            dev_err!(self.dev, "scrd: unlock evaluation: initialize answered {}\n", status);
+            return None;
+        }
+        let (status, out) =
+            self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value()))?;
+        let Some(handle) = crate::scrd::tracked_create_reference(&out).filter(|_| status == 0) else {
+            dev_err!(
+                self.dev,
+                "scrd: unlock evaluation: tracked create answered {} with {} reply bytes\n",
+                status,
+                out.len()
+            );
+            return None;
         };
-        *self.match_context.lock() = Some(handle);
-        let generation = self.match_context_generation.fetch_add(1, Relaxed).wrapping_add(1);
+        let opened = (|| -> Option<()> {
+            let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&handle))?;
+            if status != 0 {
+                dev_err!(self.dev, "scrd: unlock evaluation: externalize answered {}\n", status);
+                return None;
+            }
+            let cmd = crate::scrd::scrd_verify_unlock_policy(&handle, user.value(), true);
+            let request_len = cmd.payload().len();
+            let (status, out) = self.scrd_command(&cmd)?;
+            let answer = crate::scrd::parse_policy_answer(&out);
+            let generation = self.match_context_generation.load(Relaxed).wrapping_add(1);
+            match answer {
+                Some(a) => dev_info!(
+                    self.dev,
+                    "scrd: unlock preflight: policy device-owner-biometry, user {}, request {:#x}, parameters 1, status {}, satisfied {}, requirement {:?}, generation {}\n",
+                    user.value(),
+                    request_len,
+                    status,
+                    a.satisfied,
+                    a.requirement,
+                    generation
+                ),
+                None => dev_err!(
+                    self.dev,
+                    "scrd: unlock preflight: status {}, malformed answer of {} bytes\n",
+                    status,
+                    out.len()
+                ),
+            }
+            let a = answer?;
+            if status != 0
+                || a.satisfied
+                || a.requirement != Some((crate::scrd::SCRD_REQUIREMENT_BIOMETRY_MATCHED, 1, 0))
+            {
+                return None;
+            }
+            Some(())
+        })();
+        if opened.is_none() {
+            self.close_unlock_evaluation(&handle);
+            return None;
+        }
+        self.match_context_generation.fetch_add(1, Relaxed);
+        Some(handle)
+    }
+
+    /// The final, non-preflight unlock policy after an enrolled match. Only a
+    /// satisfied answer completes the evaluation.
+    pub(crate) fn complete_unlock_evaluation(
+        &self,
+        handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN],
+        user: crate::sbio::UserId,
+    ) -> bool {
+        let answer = self
+            .scrd_command(&crate::scrd::scrd_verify_unlock_policy(handle, user.value(), false))
+            .map(|(status, out)| (status, crate::scrd::parse_policy_answer(&out)));
+        let satisfied = matches!(answer, Some((0, Some(a))) if a.satisfied);
         dev_info!(
             self.dev,
-            "scrd: cold-match credential established true; match context generation {}\n",
-            generation
+            "scrd: unlock policy after the match: satisfied {}, generation {}\n",
+            satisfied,
+            self.match_context_generation.load(Relaxed)
         );
-        true
+        satisfied
+    }
+
+    pub(crate) fn close_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
+            Some((0, _)) => {}
+            other => dev_warn!(
+                self.dev,
+                "scrd: deleting the unlock evaluation answered {:?}\n",
+                other.map(|(status, _)| status)
+            ),
+        }
     }
 
 
