@@ -619,6 +619,29 @@ int dcpib_set_boot_mode(struct dcpib *dcp)
 	return ret;
 }
 
+/*
+ * The DCPAV service starts the firmware's idle power off timer when its video
+ * interface comes up: until a SET_MODE follows, it counts the powered-on
+ * display as idle and takes the link down 30 s later. The probe's SET_MODE
+ * comes before the interface starts, so one follows it here.
+ */
+void dcpib_reset_mode(struct dcpib *dcp)
+{
+	const struct dcpib_color_mode *c;
+
+	mutex_lock(&dcp->lock);
+	c = dcpib_find_color(dcp);
+	if (c && dcp->powered && dcp->mode_set)
+		dcpib_set_mode_locked(dcp, &dcp->cur_mode, c);
+	mutex_unlock(&dcp->lock);
+}
+
+void dcpib_av_started(struct dcpib *dcp)
+{
+	/* Let the firmware finish opening the interface before the SET_MODE. */
+	queue_delayed_work(system_percpu_wq, &dcp->av_work, msecs_to_jiffies(1000));
+}
+
 static void dcpib_crtc_atomic_enable(struct drm_crtc *crtc,
 				     struct drm_atomic_commit *state)
 {

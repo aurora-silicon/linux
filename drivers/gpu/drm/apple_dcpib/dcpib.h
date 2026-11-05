@@ -256,6 +256,11 @@ struct dcpib {
 	/* USB-C: re-enter DP alt mode when the sink stopped answering */
 	struct work_struct pd_reset_work;
 	unsigned long pd_reset_time;
+	/*
+	 * The DCPAV video interface started: SET_MODE again, or the
+	 * firmware's idle power off timer takes the link down 30 s later.
+	 */
+	struct delayed_work av_work;
 
 	struct drm_plane plane;
 	struct drm_crtc crtc;
@@ -330,5 +335,7 @@ int dcpib_pd_reconnect(struct dcpib *dcp);
 int dcpib_kms_init(struct dcpib *dcp);
 int dcpib_set_boot_mode(struct dcpib *dcp);
 void dcpib_update_edid(struct dcpib *dcp);
+void dcpib_reset_mode(struct dcpib *dcp);
+void dcpib_av_started(struct dcpib *dcp);
 
 #endif
