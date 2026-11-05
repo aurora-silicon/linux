@@ -2288,6 +2288,221 @@ static int parse_identity_tree(struct dcp_parse_ctx *ctx, dcp_identity_key_fn em
 	return 0;
 }
 
+/* Read one colour element dictionary. */
+static int parse_color_element(struct dcp_parse_ctx *handle, struct dcp_color_element *e)
+{
+	struct iterator it;
+	int ret = iterator_begin(handle, &it, true);
+
+	*e = (struct dcp_color_element) {
+		.id = -1, .depth = -1, .range = -1, .eotf = -1, .encoding = -1,
+		.colorimetry = -1, .score = -1, .is_virtual = true, .restricted = false,
+	};
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		char *key = parse_string(it.handle);
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "ID"))
+			ret = parse_int(it.handle, &e->id);
+		else if (!strcmp(key, "Depth"))
+			ret = parse_int(it.handle, &e->depth);
+		else if (!strcmp(key, "DynamicRange"))
+			ret = parse_int(it.handle, &e->range);
+		else if (!strcmp(key, "EOTF"))
+			ret = parse_int(it.handle, &e->eotf);
+		else if (!strcmp(key, "PixelEncoding"))
+			ret = parse_int(it.handle, &e->encoding);
+		else if (!strcmp(key, "Colorimetry"))
+			ret = parse_int(it.handle, &e->colorimetry);
+		else if (!strcmp(key, "Score"))
+			ret = parse_int(it.handle, &e->score);
+		else if (!strcmp(key, "IsVirtual"))
+			ret = parse_bool(it.handle, &e->is_virtual);
+		else
+			ret = skip(it.handle);
+		kfree(key);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+#define DCP_TIMING_RESTRICTED_MAX 64
+
+/* Append the integers of an array to @ids (at most DCP_TIMING_RESTRICTED_MAX). */
+static int parse_id_list(struct dcp_parse_ctx *handle, s64 *ids, unsigned int *count)
+{
+	struct iterator it;
+	int ret = iterator_begin(handle, &it, false);
+
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		s64 id;
+
+		ret = parse_int(it.handle, &id);
+		if (ret)
+			return ret;
+		if (*count < DCP_TIMING_RESTRICTED_MAX)
+			ids[(*count)++] = id;
+	}
+	return 0;
+}
+
+/*
+ * Each colour element (virtual ones too) of the timing @timing_id in a
+ * TimingElements catalog, flagged if the timing lists it as unsafe or as
+ * needing DSC; whether the timing is interlaced. A malformed timing entry is
+ * skipped. -ENOENT if the catalog has no such timing.
+ */
+int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
+			    dcp_color_element_fn emit, void *data, bool *interlaced)
+{
+	struct dcp_parse_ctx ctx;
+	struct iterator timings;
+	s64 *restricted;
+	int ret = parse(blob, len, &ctx);
+
+	if (!ret)
+		ret = iterator_begin(&ctx, &timings, false);
+	if (ret)
+		return ret;
+	restricted = kcalloc(DCP_TIMING_RESTRICTED_MAX, sizeof(*restricted), GFP_KERNEL);
+	if (!restricted)
+		return -ENOMEM;
+	ret = -ENOENT;
+	for (; timings.idx < timings.len; ++timings.idx) {
+		struct dcp_parse_ctx entry_start = ctx, colors = {};
+		struct iterator entry, it;
+		bool match = false, have_colors = false, is_interlaced = false;
+		unsigned int nr_restricted = 0;
+		int err;
+
+		/* ColorModes may come before the ID: find both, then walk the colours. */
+		err = iterator_begin(&ctx, &entry, true);
+		for (; !err && entry.idx < entry.len; ++entry.idx) {
+			char *key = parse_string(&ctx);
+			s64 id;
+
+			if (IS_ERR(key)) {
+				err = PTR_ERR(key);
+				break;
+			}
+			if (!strcmp(key, "ID")) {
+				err = parse_int(&ctx, &id);
+				match |= !err && id == timing_id;
+			} else if (!strcmp(key, "ColorModes")) {
+				colors = ctx;
+				have_colors = true;
+				err = skip(&ctx);
+			} else if (!strcmp(key, "UnsafeColorElementIDs") ||
+				   !strcmp(key, "DSCRequiredColorElementIDs")) {
+				err = parse_id_list(&ctx, restricted, &nr_restricted);
+			} else if (!strcmp(key, "IsInterlaced")) {
+				err = parse_bool(&ctx, &is_interlaced);
+			} else {
+				err = skip(&ctx);
+			}
+			kfree(key);
+		}
+		if (err) {
+			/* As enumerate_modes(): a malformed entry is skipped. */
+			ctx = entry_start;
+			ret = skip(&ctx);
+			if (ret)
+				goto out;
+			ret = -ENOENT;
+			continue;
+		}
+		if (!match)
+			continue;
+		if (interlaced)
+			*interlaced = is_interlaced;
+		ret = 0;
+		if (!have_colors)
+			goto out;
+		ret = iterator_begin(&colors, &it, false);
+		for (; !ret && it.idx < it.len; ++it.idx) {
+			struct dcp_color_element e;
+
+			ret = parse_color_element(it.handle, &e);
+			if (ret)
+				break;
+			for (unsigned int i = 0; i < nr_restricted; i++)
+				e.restricted |= restricted[i] == e.id;
+			emit(data, &e);
+		}
+		goto out;
+	}
+out:
+	kfree(restricted);
+	return ret;
+}
+
+/*
+ * The ID and active size of each timing entry of a TimingElements-
+ * shaped catalog (PreferredTimingElements, whose entries have no colour
+ * elements of their own), the first @max of them. A malformed entry is
+ * skipped. The number found, or a negative error.
+ */
+int dcp_parse_timing_ids(const void *blob, size_t len, struct dcp_timing_id *out,
+			 unsigned int max)
+{
+	struct dcp_parse_ctx ctx;
+	struct iterator timings;
+	unsigned int found = 0;
+	int ret = parse(blob, len, &ctx);
+
+	if (!ret)
+		ret = iterator_begin(&ctx, &timings, false);
+	if (ret)
+		return ret;
+	for (; timings.idx < timings.len; ++timings.idx) {
+		struct dcp_parse_ctx entry_start = ctx;
+		struct dimension horiz = { .active = -1 }, vert = { .active = -1 };
+		struct iterator entry;
+		s64 id = -1;
+		int err = iterator_begin(&ctx, &entry, true);
+
+		for (; !err && entry.idx < entry.len; ++entry.idx) {
+			char *key = parse_string(&ctx);
+
+			if (IS_ERR(key)) {
+				err = PTR_ERR(key);
+				break;
+			}
+			if (!strcmp(key, "ID"))
+				err = parse_int_bound(&ctx, &id, 0, U32_MAX);
+			else if (!strcmp(key, "HorizontalAttributes"))
+				err = parse_dimension(&ctx, &horiz, false);
+			else if (!strcmp(key, "VerticalAttributes"))
+				err = parse_dimension(&ctx, &vert, false);
+			else
+				err = skip(&ctx);
+			kfree(key);
+		}
+		if (err) {
+			/* As enumerate_modes(): a malformed entry is skipped. */
+			ctx = entry_start;
+			ret = skip(&ctx);
+			if (ret)
+				return ret;
+			continue;
+		}
+		if (id < 0 || found >= max)
+			continue;
+		out[found++] = (struct dcp_timing_id) {
+			.id = id,
+			.width = horiz.active > 0 ? horiz.active : 0,
+			.height = vert.active > 0 ? vert.active : 0,
+		};
+	}
+	return found;
+}
+
 int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data)
 {
 	struct dcp_parse_ctx ctx, root;
