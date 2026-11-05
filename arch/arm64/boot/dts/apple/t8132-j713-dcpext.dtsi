@@ -152,3 +152,157 @@
 		};
 	};
 };
+
+/*
+ * The display crossbars of both ATCs, for the dcpexts' Type-C routes. Probe
+ * touches no register; an output is only programmed once it is selected.
+ */
+&atc0_dpxbar {
+	status = "okay";
+};
+
+&atc1_dpxbar {
+	status = "okay";
+};
+
+/*
+ * dcpext0's Type-C routes, UFP mux selector 2 on both ATC crossbars
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
+ * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
+ * routes are disabled here; the display gate enables them only for a dcpext
+ * the boot loader handed over, since a USB-C port controller waits for every
+ * available route.
+ */
+&dcpext0 {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc0_dpxbar 0>, <&atc1_dpxbar 0>,
+		       <&atc0_dpxbar 1>, <&atc0_dpxbar 2>,
+		       <&atc1_dpxbar 1>, <&atc1_dpxbar 2>;
+	mux-control-names = "typec0", "typec1",
+			    "typec0-dpin0", "typec0-dpin1",
+			    "typec1-dpin0", "typec1-dpin1";
+	apple,typec-mux-indices = <2 2>;
+	apple,typec-dptx-phys = <0 1>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * dcpext1's Type-C routes, UFP mux selector 4 on both ATC crossbars
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
+ * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
+ * routes are disabled here; the display gate enables them only for a dcpext
+ * the boot loader handed over, since a USB-C port controller waits for every
+ * available route.
+ */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc0_dpxbar 0>, <&atc1_dpxbar 0>,
+		       <&atc0_dpxbar 1>, <&atc0_dpxbar 2>,
+		       <&atc1_dpxbar 1>, <&atc1_dpxbar 2>;
+	mux-control-names = "typec0", "typec1",
+			    "typec0-dpin0", "typec0-dpin1",
+			    "typec1-dpin0", "typec1-dpin1";
+	apple,typec-mux-indices = <4 4>;
+	apple,typec-dptx-phys = <0 1>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext1>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext1>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_typec0>;
+			};
+
+			typec0_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_typec1>;
+			};
+
+			typec1_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
