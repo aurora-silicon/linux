@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess,tempfile
 R=Path(__file__).resolve().parents[2]
 def fn(s,n):
- a=s.index('static int '+n+'(');b=s.index('\n}',a)+2;return s[a:b]
+ normalized=s.replace('static int __maybe_unused ', 'static int ');a=normalized.index('static int '+n+'(');b=normalized.index('\n}',a)+2;return normalized[a:b]
 s=(R/'drivers/iommu/apple-dart.c').read_text();h=(R/'drivers/soc/apple/rtkit-helper.c').read_text()
 assert 'if (dart->live_mtp)\n\t\treturn -EBUSY;' in s
 pre=r'''
