@@ -75,9 +75,13 @@ impl KernelObject {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<Self> {
-        let mut this = Self::backing(dev, size, cpu)?;
+        Self::backing(dev, size, cpu)?.placed(vm, placement, prot)
+    }
+
+    /// Maps fresh backing into `vm`.
+    fn placed(mut self, vm: &mmu::Vm, placement: Placement, prot: mmu::Prot) -> Result<Self> {
         let mapping = match placement {
-            Placement::At(addr) => this.obj.map_at(vm, addr, prot, false)?,
+            Placement::At(addr) => self.obj.map_at(vm, addr, prot, false)?,
             Placement::In(range, align) => {
                 let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
                     && range.end <= crate::hw::t8140::dynamic::LOWER.end {
@@ -85,21 +89,24 @@ impl KernelObject {
                 } else {
                     super::capacity::Site::UpperVa
                 };
-                this.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
+                self.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
                     if error == ENOSPC { super::capacity::refused(site) } else { error }
                 })?
             }
         };
-        this.mapping = Some(mapping);
-        Ok(this)
+        self.mapping = Some(mapping);
+        Ok(self)
     }
 
     /// Allocates CPU-accessible backing whose GPU mappings will be installed later.
     pub(crate) fn backing(dev: &AsahiDrmDevice, size: usize, cpu: CpuMap) -> Result<Self> {
-        let mut obj = match cpu {
+        Self::with_object(match cpu {
             CpuMap::WriteBack => gem::new_kernel_object(dev, size)?,
             CpuMap::WriteCombined => gem::new_kernel_object_wc(dev, size)?,
-        };
+        }, size)
+    }
+
+    fn with_object(mut obj: gem::ObjectRef, size: usize) -> Result<Self> {
         let vmap = obj.vmap()?;
         let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
         // SAFETY: The mapping covers the whole object.
@@ -373,6 +380,22 @@ impl Allocator<'_> {
             prot,
             cpu,
         )
+    }
+
+    /// [`Self::lower`] write-combined backing that is not counted as kernel memory: the
+    /// caller charges it to a client ([`crate::memacct::Charge::user`]).
+    pub(crate) fn lower_user_charged(
+        &self,
+        size: usize,
+        align: u64,
+        prot: mmu::Prot,
+    ) -> Result<KernelObject> {
+        KernelObject::with_object(gem::new_kernel_object_wc_user_charged(self.dev, size)?, size)?
+            .placed(
+                self.uat.kernel_lower_vm(),
+                Placement::In(self.uat.kernel_lower_dynamic_range(), align),
+                prot,
+            )
     }
 
     /// Place fresh backing at one address in the canonical and both alias VMs.
