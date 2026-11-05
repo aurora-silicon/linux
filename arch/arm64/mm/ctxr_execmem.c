@@ -42,7 +42,7 @@
 /* Window granularity when the base is derived rather than given. */
 #define CTXR_WINDOW_ALIGN	SZ_2M
 /* Default size if only "ctxr_exec_window" with no value is given. */
-#define CTXR_WINDOW_DEFAULT	SZ_1G
+#define CTXR_WINDOW_DEFAULT	SZ_128M
 
 static phys_addr_t ctxr_base __initdata;
 static phys_addr_t ctxr_size __initdata;

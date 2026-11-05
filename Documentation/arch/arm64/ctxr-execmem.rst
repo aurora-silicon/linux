@@ -32,7 +32,7 @@ Device tree (production)
 Command line (bring-up / VM)
     ::
 
-        ctxr_exec_window=<size>[@<base>]   e.g. ctxr_exec_window=1G
+        ctxr_exec_window=<size>[@<base>]   e.g. ctxr_exec_window=128M
         ctxr_exec_enforce=0                 (default: enforcing)
 
     The command line overrides the device tree. ``size`` accepts the usual
