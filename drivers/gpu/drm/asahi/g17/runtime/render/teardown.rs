@@ -16,7 +16,21 @@ impl RenderState {
         self.pools.observe(init)
     }
 
+    /// Nothing of `context` still runs on its render pairs, so a kill of it may be published.
+    /// A pair whose commands all ran unstamped (`Pair::executed_for_kill`) counts as idle: only
+    /// that kill releases it.
     pub(in crate::g17::runtime) fn teardown_idle(&self, context: &Arc<Context>) -> Result<bool> {
+        self.idle_for(context, false)
+    }
+
+    /// As [`Self::teardown_idle`], for releasing `context`'s scheduler: a pair whose commands ran
+    /// unstamped counts only once a kill of the context has been published, since until then
+    /// the firmware still links that work.
+    pub(in crate::g17::runtime) fn release_idle(&self, context: &Arc<Context>) -> Result<bool> {
+        self.idle_for(context, true)
+    }
+
+    fn idle_for(&self, context: &Arc<Context>, release: bool) -> Result<bool> {
         // A pair that changed owner keeps running this scheduler's queues until
         // the new owner's first command leaves it, whichever context owns it now.
         let scheduler = Some(context.scheduler_va());
@@ -38,7 +52,9 @@ impl RenderState {
                 return Ok(false);
             }
             if let Some(pair) = entry.pair.as_ref() {
-                if !pair.idle_for_context(context)? && !pair.executed_for_kill(context) {
+                if !pair.idle_for_context(context)?
+                    && !((!release || context.kill_published()) && pair.executed_for_kill(context))
+                {
                     return Ok(false);
                 }
             }
