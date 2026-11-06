@@ -222,7 +222,9 @@ properties:
     additionalProperties: false
     description:
       The touchscreen of the MacBook Pros with a PROLED XDR display, an
-      interface of the same coprocessor as the trackpad.
+      interface of the same coprocessor as the trackpad. Its HID reports are
+      raw sensor frames and are exposed unchanged through hidraw; contact
+      extraction and calibration belong in user space.
 
     properties:
       firmware-name:
@@ -230,6 +232,9 @@ properties:
         description:
           Name of the touchscreen firmware that the host sends to the
           coprocessor when the interface is first opened.
+
+    required:
+      - firmware-name
 
   mtp:
     type: object
