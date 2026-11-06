@@ -145,12 +145,6 @@ properties:
       containing 16 KiB pages in its private domain. These are MMIO ranges,
       not allocatable DMA memory or additional preload segments.
 
-  apple,dapf-ranges:
-    $ref: /schemas/types.yaml#/definitions/uint64-array
-    minItems: 8
-    maxItems: 8
-    description: Four inclusive SID0 physical MMIO start/end pairs
-
   apple,preload-data-sha256:
     $ref: /schemas/types.yaml#/definitions/uint8-array
     minItems: 32
