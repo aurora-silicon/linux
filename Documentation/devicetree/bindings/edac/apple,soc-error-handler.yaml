@@ -35,11 +35,10 @@ properties:
     maxItems: 89
 
   reg:
-    minItems: 29
-    maxItems: 29
+    minItems: 25
+    maxItems: 25
     description: |
-      T6041 AMCC0 through AMCC3 apertures, followed by the per-source NI0
-      through NI6 apertures in interrupt order.
+      T6041 per-source NI0 through NI6 status apertures, in interrupt order.
 
 required:
   - compatible
