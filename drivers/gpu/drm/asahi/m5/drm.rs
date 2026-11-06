@@ -369,8 +369,12 @@ impl queue::Queue for M5Queue {
     }
 }
 
-/// Admit the captured M5 single-layer render-state envelope. A sampler heap
-/// is admitted: translate range-checks it and the descriptor carries it
+/// Admit the captured M5 single-layer render-state envelope. An occlusion
+/// (visibility) buffer is admitted: translate range-checks it and it is
+/// written to 0x15311 and the descriptor, and Apple's visibility renders move
+/// only the ISP control and query-index words beside it
+/// (gpu/g17g-witness/ppp/statedump.m occl=1/2). A sampler heap is admitted:
+/// translate range-checks it and the descriptor carries it
 /// (+0x87a/+0x882/+0x886 as on G17P). This is an experimental first-job ABI
 /// path, not an assertion that arbitrary Vulkan programs are supported.
 fn admit_reference_render(command: &command::UapiRenderCommand) -> Result {
@@ -390,7 +394,6 @@ fn admit_reference_render(command: &command::UapiRenderCommand) -> Result {
         || !(1..=command::M5_MAX_RENDER_DIMENSION).contains(&u32::from(command.height))
         || command.layers != 1
         || !sample_layout
-        || command.occlusion_query_base != 0
         || timestamps.iter().any(|timestamp| timestamp.handle != 0 || timestamp.offset != 0) {
         return Err(ENOTSUPP);
     }
