@@ -205,7 +205,7 @@ struct dcp_panel {
 	u32 peak_nits;
 	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
 	u32 edr_ceiling;
-	/// calibrated colour target from apple,color-gamut; NULL if not given
+	/// calibrated colour target from the raw ADT; NULL if not given
 	const struct dcp_color_space *color_target;
 };
 

@@ -850,7 +850,7 @@ void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_
  * keep per-display settings such as its brightness.  The identity state is
  * allocated at probe (bind may fail and run again); bind fills it in.
  */
-static void dcp_panel_adt_identity(struct apple_dcp *dcp)
+static void dcp_panel_read_adt(struct apple_dcp *dcp)
 {
 	bool desktop = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	struct dcp_panel_adt panel = {
@@ -890,9 +890,10 @@ static void dcp_panel_adt_identity(struct apple_dcp *dcp)
 		dcp->panel.height_mm = panel.height_mm;
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
+	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
 	if (desktop)
 		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
-	dev_info(dcp->dev, "panel identity fallback: ADT %s, panel node %s, dimensions %ux%u mm\n",
+	dev_info(dcp->dev, "panel ADT: %s, panel node %s, dimensions %ux%u mm\n",
 		 ret ? "unavailable" : "parsed", panel.found ? "present" : "absent",
 		 dcp->panel.width_mm, dcp->panel.height_mm);
 	if (dcp->panel.edr_ceiling)
@@ -1070,29 +1071,6 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 		return ERR_PTR(-ESTALE);
 	}
 	return edid;
-}
-
-/*
- * The panel's calibrated colour target, for an EDID when the firmware
- * publishes no chromaticities. An unknown name is ignored, not guessed.
- */
-int dcp_panel_read_color_target(struct apple_dcp *dcp, struct device_node *panel_np)
-{
-	const struct dcp_color_space *target;
-	const char *name;
-	int ret;
-
-	dcp->panel.color_target = NULL;
-	ret = of_property_read_string(panel_np, "apple,color-gamut", &name);
-	if (ret == -EINVAL)
-		return 0;
-	if (ret)
-		return ret;
-	target = dcp_color_space_lookup(name);
-	if (IS_ERR(target))
-		return PTR_ERR(target);
-	dcp->panel.color_target = target;
-	return 0;
 }
 
 void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation)
@@ -5265,9 +5243,6 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		panel_np = of_get_compatible_child(dev->of_node, "apple,panel");
 
 	if (panel_np) {
-		/* Every internal panel, whichever firmware drives it. */
-		if (dcp_panel_read_color_target(dcp, panel_np))
-			dev_warn(dev, "ignoring invalid panel apple,color-gamut\n");
 		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 			/*
 			 * Desktop 26.x swaps carry nits, and the panel node
@@ -5287,9 +5262,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 		dcp_panel_read_dimensions(dcp, panel_np);
 		of_node_put(panel_np);
-		/* The M4 IOMFB reports its fixed mode without an EDID. */
-		if (!iomfb_is_m4(dcp))
-			dcp_panel_adt_identity(dcp);
+		/* Read target metadata for H17P and desktop firmware alike. */
+		dcp_panel_read_adt(dcp);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 	}
