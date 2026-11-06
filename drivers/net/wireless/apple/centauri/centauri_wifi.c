@@ -1259,6 +1259,8 @@ static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 r
 	put_unaligned_le16(reason, payload);
 	put_unaligned_le16(328, payload + 8);
 	put_unaligned_le16(4, payload + 10);
+	/* Preserve the firmware's default disconnect budget. */
+	put_unaligned_le32(500, payload + 12);
 	ret = command(wifi, 131073, payload, sizeof(payload));
 	connected = wifi->connected;
 	wifi->connected = false;
