@@ -25,7 +25,6 @@ pub(super) struct PowerWords {
     pub(super) max_power_mw: *mut u32,
     pub(super) ppm_enabled: *mut u32,
     pub(super) ppm_target_mw: *mut u32,
-    pub(super) ppm_writeback: bool,
 }
 
 fn required(dev: &device::Device) -> Result<bool> {

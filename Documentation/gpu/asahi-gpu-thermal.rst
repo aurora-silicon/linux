@@ -47,8 +47,8 @@ before reopening consumption. Teardown drains debugfs, sysfs and thermal
 callbacks before stopping processors or freeing mappings.
 
 RegionC is CPU write-back memory, so publication includes a clean to the point
-of coherency. G17P PowerState also needs cleaning; G16S 25G83 PowerState is
-write-combined. Store ordering is completed before host publication is
+of coherency. Both admitted PowerState mappings are write-combined and use
+store ordering rather than cache cleaning. Ordering is completed before publication is
 reported. There is no firmware mailbox, doorbell or acknowledgement for these
 inputs. Shared-memory readback proves publication, not achieved GPU power.
 
