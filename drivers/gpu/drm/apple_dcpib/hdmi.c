@@ -282,10 +282,27 @@ static void __iomem *hdmi_map(struct device *dev, struct device_node *np,
 	return devm_of_iomap(dev, np, index, NULL);
 }
 
+static bool hdmi_power_active(struct device_node *np, const char *name)
+{
+	int index = of_property_match_string(np, "reg-names", name);
+	void __iomem *regs;
+	u32 state;
+
+	if (index < 0)
+		return false;
+	regs = of_iomap(np, index);
+	if (!regs)
+		return false;
+	state = readl(regs);
+	iounmap(regs);
+	/* Both the requested and actual PMGR states must be active. */
+	return (state & GENMASK(7, 0)) == GENMASK(7, 0);
+}
+
 /*
  * The DCP the bootloader wired to the phy (aura writes its DCP index: 0 for
  * the main DCP on the HDMI-only route, 1 for DCPEXT0 next to a USB-C
- * display), or -ENODEV if it left the PLL unlocked.
+ * display), or -ENODEV if it left the PHY off or the PLL unlocked.
  */
 int dcpib_hdmi_source(struct device_node *np)
 {
@@ -294,7 +311,8 @@ int dcpib_hdmi_source(struct device_node *np)
 	void __iomem *core_regs, *apb_regs;
 	int ret = -ENODEV;
 
-	if (core < 0 || apb < 0)
+	/* The PHY aperture aborts while gated, including on a USB-C-only boot. */
+	if (core < 0 || apb < 0 || !hdmi_power_active(np, "phy-ps"))
 		return -ENODEV;
 	core_regs = of_iomap(np, core);
 	apb_regs = of_iomap(np, apb);
@@ -304,6 +322,10 @@ int dcpib_hdmi_source(struct device_node *np)
 		iounmap(apb_regs);
 	if (core_regs)
 		iounmap(core_regs);
+	if (ret == 1 && !hdmi_power_active(np, "coproc-ps"))
+		return -ENODEV;
+	if (ret != 0 && ret != 1)
+		return -ENODEV;
 	return ret;
 }
 

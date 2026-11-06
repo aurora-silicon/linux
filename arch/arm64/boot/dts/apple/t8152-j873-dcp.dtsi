@@ -465,9 +465,13 @@
 			      <0x3 0x1a740000 0x0 0x10000>,
 			      <0x3 0x1a700000 0x0 0x4000>,
 			      <0x3 0x1a764000 0x0 0x4000>,
-			      <0x3 0x00700480 0x0 0x4>;
+			      <0x3 0x00700480 0x0 0x4>,
+			      <0x3 0x007016c0 0x0 0x4>,
+			      <0x3 0x00700e00 0x0 0x4>;
 			/* aux: ADT dptx1-aux, aux-ps: PMGR GLOBAL_AUX_CTRL1 */
-			reg-names = "coproc", "phy-core", "phy-apb", "aux", "aux-ps";
+			/* Read-only PMGR DPTX_PHY and DISPEXT0_CPU admission checks. */
+			reg-names = "coproc", "phy-core", "phy-apb", "aux", "aux-ps",
+				    "phy-ps", "coproc-ps";
 			mboxes = <&dcpext_mbox>;
 			iommus = <&dcpext_dart 23>;
 			dma-coherent;
