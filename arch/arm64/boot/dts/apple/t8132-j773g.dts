@@ -24,3 +24,19 @@
 &framebuffer0 {
 	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
 };
+
+/*
+ * CPU DVFS and deep idle, as on the J713. This machine has a fan, so
+ * it does not need the board thermal owner the fanless Airs wait for.
+ */
+&cpufreq_e {
+	status = "okay";
+};
+
+&cpufreq_p {
+	status = "okay";
+};
+
+&cpuidle {
+	status = "okay";
+};
