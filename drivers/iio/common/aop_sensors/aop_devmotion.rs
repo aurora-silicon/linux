@@ -8,36 +8,49 @@
 //! IIO exposes them in its standard W, X, Y, Z order as signed Q30 values.
 
 use core::{
+    arch::asm,
     ffi::{c_int, c_void},
     marker::PhantomPinned,
-    ptr,
+    mem, ptr,
 };
 
 use kernel::{
     bindings, c_str,
     device::{self, Core},
-    module_platform_driver, new_spinlock, of, platform,
+    dma::Coherent,
+    module_platform_driver, new_delayed_work, new_mutex, new_spinlock, of, platform,
     prelude::*,
-    soc::apple::aop::{EPICService, FakehidListener, FakehidRegistration, AOP},
+    soc::apple::aop::{EPICService, AOP},
     sync::{
         aref::ARef,
-        atomic::{Atomic, Relaxed},
-        Arc, SpinLock,
+        atomic::{Acquire, Atomic, Relaxed, Release},
+        Arc, Mutex, SpinLock,
     },
+    time,
     types::{ForeignOwnable, Opaque},
+    workqueue::{self, impl_has_delayed_work, DelayedWork, Work, WorkItem},
 };
 
+const SUBTYPE_GET_PROPERTY: u16 = 10;
 const SUBTYPE_SET_PROPERTY: u16 = 4;
+const SUBTYPE_CLIENT_OPEN: u16 = 25;
+const SUBTYPE_CLIENT_CLOSE: u16 = 26;
 const PROP_INTERVAL: u32 = 0;
-/// Selects the firmware's built-in calibration. AppleSPUHIDDriver writes this
-/// even though devmotion6 has no service-specific calibration packets.
+/// Selects the firmware's built-in calibration. devmotion6 has no
+/// service-specific calibration packets; this generic write is harmless.
 const PROP_CALIBRATION_STATE: u32 = 61;
 const CALIBRATION_DEFAULT: u32 = 1;
-/// The status a calibration-state write is answered with when the service
-/// already holds a state from an earlier start in the same AOP session (a
-/// rebind, a resume, or a warm reboot); the stream can be started as is.
+/// The "unsupported" status some firmware returns for the calibration-state
+/// write on this service. The stream does not depend on that property:
+/// opening the report client is the operation that arms it.
 const STATUS_UNSUPPORTED: u32 = 0xe000_02c7;
+const PROP_FASTPATH_PAYLOAD_SIZE: u32 = 81;
 const INTERVAL_US: u32 = 20_000;
+const FASTPATH_COMMAND_LEN: usize = 84;
+const FASTPATH_HEADER_LEN: usize = 64;
+const FASTPATH_PAGE_SIZE: usize = 4096;
+const MAX_REPORT_LEN: usize = 108;
+const POLL_MS: u32 = 5;
 const Q_FRAC_BITS: i32 = 30;
 
 /// The latest quaternion, in the IIO-defined W, X, Y, Z order.
@@ -56,6 +69,10 @@ struct Scan {
 
 fn le_u32(data: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn le_u64(data: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(data.get(at..at + 8)?.try_into().ok()?))
 }
 
 /// Converts a finite IEEE-754 single to signed Q30 without using FP in the
@@ -133,10 +150,33 @@ impl Control {
         Ok(())
     }
 
-    /// Selects the default calibration before the first enable after probe.
-    fn initialize(&self) -> Result {
-        self.set_allowing(PROP_CALIBRATION_STATE, CALIBRATION_DEFAULT, STATUS_UNSUPPORTED)?;
-        self.enable()
+    fn get(&self, prop: u32, len: usize) -> Result<KVec<u8>> {
+        let mut msg = KVec::new();
+        msg.resize(8, 0, GFP_KERNEL)?;
+        msg[4..8].copy_from_slice(&prop.to_le_bytes());
+        let (status, value) =
+            self.aop
+                .epic_call_ret(&self.service, SUBTYPE_GET_PROPERTY, &msg, len)?;
+        if status != 0 {
+            dev_err!(
+                self.dev,
+                "property {} read refused: status {:#x}\n",
+                prop,
+                status
+            );
+            return Err(EIO);
+        }
+        Ok(value)
+    }
+
+    /// Writes the generic calibration state. Unsupported is normal for a
+    /// service whose actual enable operation is ClientOpen.
+    fn calibrate(&self) -> Result {
+        self.set_allowing(
+            PROP_CALIBRATION_STATE,
+            CALIBRATION_DEFAULT,
+            STATUS_UNSUPPORTED,
+        )
     }
 
     fn enable(&self) -> Result {
@@ -148,35 +188,240 @@ impl Control {
     }
 }
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 struct State {
     iio: IioPtr,
+    control: Arc<Control>,
+    payload_len: usize,
+    stride: usize,
+    #[pin]
+    ring: Mutex<Option<Coherent<[u8]>>>,
     #[pin]
     sample: SpinLock<Sample>,
+    active: Atomic<bool>,
+    opened: Atomic<bool>,
+    retain_ring: Atomic<bool>,
+    client_id: Atomic<u64>,
+    next_client_id: Atomic<u64>,
+    last_aop_timestamp: Atomic<u64>,
+    #[pin]
+    poll_work: DelayedWork<State>,
 }
 
 struct IioPtr(*mut bindings::iio_dev);
 
-// SAFETY: The IIO device may be used from any thread. The listener only calls
-// IIO helpers that are valid from the AOP receive worker.
+// SAFETY: The IIO device may be used from any thread. The polling worker only
+// calls IIO helpers that are valid from process context.
 unsafe impl Send for IioPtr {}
 // SAFETY: As above.
 unsafe impl Sync for IioPtr {}
 
-impl FakehidListener for State {
-    fn process_fakehid_report(&self, data: &[u8]) -> Result<()> {
+impl_has_delayed_work! {
+    impl HasDelayedWork<Self> for State { self.poll_work }
+}
+
+impl State {
+    fn publish(&self, data: &[u8]) {
         let Some(quat) = decode(data) else {
             // State-only reports are expected and leave the sample unchanged.
-            return Ok(());
+            return;
         };
         *self.sample.lock() = Sample { quat, valid: true };
-        // SAFETY: The listener is removed before the IIO device is freed.
+        // SAFETY: The polling work is disabled before the IIO device is freed.
         let timestamp = unsafe { bindings::iio_get_time_ns(self.iio.0) };
         let scan = Scan { quat, timestamp };
         // SAFETY: `scan` contains the complete only data channel followed by
         // the timestamp, and the IIO core copies it synchronously.
         unsafe { bindings::iio_push_to_buffers(self.iio.0, ptr::from_ref(&scan).cast()) };
+    }
+
+    fn open_fastpath(&self) -> Result {
+        if self.opened.load(Acquire) {
+            return Ok(());
+        }
+        let id = self.next_client_id.fetch_add(1, Relaxed);
+        let ring = self.ring.lock();
+        let ring = ring.as_ref().ok_or(ENODEV)?;
+        let mut msg = KVec::new();
+        // EPIC reserves the first word. The 84-byte ClientOpen body is:
+        // client id, flags, IOVA, allocation size, payload size, then zeroes.
+        msg.resize(4 + FASTPATH_COMMAND_LEN, 0, GFP_KERNEL)?;
+        msg[4..12].copy_from_slice(&id.to_le_bytes());
+        msg[16..24].copy_from_slice(&ring.dma_address().to_le_bytes());
+        msg[24..28].copy_from_slice(&(ring.size() as u32).to_le_bytes());
+        msg[28..32].copy_from_slice(&(self.payload_len as u32).to_le_bytes());
+        let status =
+            match self
+                .control
+                .aop
+                .epic_call(&self.control.service, SUBTYPE_CLIENT_OPEN, &msg)
+            {
+                Ok(status) => status,
+                Err(e) => {
+                    // A timed-out open may already have handed the IOVA to the
+                    // firmware. Keep the mapping for the rest of the boot.
+                    self.retain_ring.store(true, Release);
+                    return Err(e);
+                }
+            };
+        if status != 0 {
+            dev_err!(
+                self.control.dev,
+                "fast-path open refused: status {:#x}\n",
+                status
+            );
+            return Err(EIO);
+        }
+        self.client_id.store(id, Relaxed);
+        self.opened.store(true, Release);
         Ok(())
+    }
+
+    fn close_fastpath(&self) -> Result {
+        if !self.opened.load(Acquire) {
+            return Ok(());
+        }
+        let mut msg = KVec::new();
+        msg.resize(12, 0, GFP_KERNEL)?;
+        msg[4..12].copy_from_slice(&self.client_id.load(Relaxed).to_le_bytes());
+        let status =
+            match self
+                .control
+                .aop
+                .epic_call(&self.control.service, SUBTYPE_CLIENT_CLOSE, &msg)
+            {
+                Ok(status) => status,
+                Err(e) => {
+                    self.retain_ring.store(true, Release);
+                    return Err(e);
+                }
+            };
+        if status != 0 {
+            self.retain_ring.store(true, Release);
+            dev_err!(
+                self.control.dev,
+                "fast-path close refused: status {:#x}\n",
+                status
+            );
+            return Err(EIO);
+        }
+        self.opened.store(false, Release);
+        Ok(())
+    }
+
+    fn start(self: &Arc<Self>) -> Result {
+        self.open_fastpath()?;
+        if let Err(e) = self.control.enable() {
+            if self.close_fastpath().is_err() {
+                self.retain_ring.store(true, Release);
+            }
+            return Err(e);
+        }
+        self.active.store(true, Release);
+        self.queue_poll();
+        Ok(())
+    }
+
+    fn stop(&self) -> Result {
+        self.active.store(false, Release);
+        let interval = self.control.disable();
+        let close = self.close_fastpath();
+        interval.and(close)
+    }
+
+    fn queue_poll(self: &Arc<Self>) {
+        let _ =
+            workqueue::system_dfl().enqueue_delayed(self.clone(), time::msecs_to_jiffies(POLL_MS));
+    }
+
+    fn poll(&self) {
+        let guard = self.ring.lock();
+        let Some(ring) = guard.as_ref() else {
+            return;
+        };
+        let base = ring.as_ptr().cast::<u8>();
+        // SAFETY: the allocation is at least one page. The firmware publishes
+        // one of the two aligned slot offsets in the first word.
+        let slot = unsafe { u32::from_le(ptr::read_volatile(base.cast::<u32>())) as usize };
+        if slot != FASTPATH_HEADER_LEN && slot != FASTPATH_HEADER_LEN + self.stride {
+            return;
+        }
+        // SAFETY: the barrier touches no memory and orders the slot body after
+        // the firmware's selector publication.
+        unsafe { asm!("dmb oshld", options(nostack, preserves_flags)) };
+        // SAFETY: both allowed slots are aligned and fit in the allocation.
+        let (aop_timestamp, len) = unsafe {
+            (
+                u64::from_le(ptr::read_volatile(base.add(slot).cast::<u64>())),
+                u32::from_le(ptr::read_volatile(base.add(slot + 8).cast::<u32>())) as usize,
+            )
+        };
+        if aop_timestamp == 0
+            || aop_timestamp == self.last_aop_timestamp.load(Relaxed)
+            || len > self.payload_len
+            || len > MAX_REPORT_LEN
+            || slot + 12 + len > ring.size()
+        {
+            return;
+        }
+        let mut report = [0u8; MAX_REPORT_LEN];
+        // SAFETY: the bounds above keep the source inside the coherent ring;
+        // the published slot is not reused until the other slot is published.
+        unsafe {
+            ptr::copy_nonoverlapping(base.add(slot + 12), report.as_mut_ptr(), len);
+            asm!("dmb oshld", options(nostack, preserves_flags));
+        }
+        // If publication changed while copying, consume the newer slot on the
+        // next tick rather than risk a slot that has already been recycled.
+        // SAFETY: as for the first selector read.
+        if unsafe { u32::from_le(ptr::read_volatile(base.cast::<u32>())) as usize } != slot {
+            return;
+        }
+        self.last_aop_timestamp.store(aop_timestamp, Relaxed);
+        self.publish(&report[..len]);
+    }
+
+    fn disable_poll(self: &Arc<Self>) {
+        self.active.store(false, Release);
+        // SAFETY: `poll_work` is initialized and pinned in this `Arc`. The
+        // call prevents requeue, cancels pending work and joins a callback.
+        let cancelled = unsafe {
+            let work = Work::raw_get(DelayedWork::raw_as_work(ptr::addr_of!(self.poll_work)));
+            let delayed = kernel::container_of!(work, bindings::delayed_work, work);
+            bindings::disable_delayed_work_sync(delayed)
+        };
+        if cancelled {
+            // SAFETY: a cancelled pending callback owned exactly one Arc
+            // transferred by `enqueue_delayed`.
+            drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
+        }
+    }
+}
+
+impl WorkItem for State {
+    type Pointer = Arc<State>;
+
+    fn run(this: Arc<State>) {
+        if !this.active.load(Acquire) {
+            return;
+        }
+        this.poll();
+        if this.active.load(Acquire) {
+            this.queue_poll();
+        }
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for State {
+    fn drop(self: Pin<&mut Self>) {
+        if self.retain_ring.load(Acquire) {
+            if let Some(ring) = self.ring.lock().take() {
+                // The outcome of ClientOpen/ClientClose is unknown, so the
+                // firmware may retain this IOVA until the AOP reboots.
+                mem::forget(ring);
+            }
+        }
     }
 }
 
@@ -274,8 +519,18 @@ struct MotionIio {
 }
 
 impl MotionIio {
-    fn new(pdev: &platform::Device<Core<'_>>) -> Result<(Self, Arc<State>)> {
+    fn new(pdev: &platform::Device<Core<'_>>, control: Arc<Control>) -> Result<(Self, Arc<State>)> {
         let dev = pdev.as_ref();
+        let payload = control.get(PROP_FASTPATH_PAYLOAD_SIZE, 8)?;
+        let payload_len = usize::try_from(le_u64(&payload, 0).ok_or(EIO)?).map_err(|_| EINVAL)?;
+        if !(5..=MAX_REPORT_LEN).contains(&payload_len) {
+            dev_err!(dev, "invalid fast-path payload size {}\n", payload_len);
+            return Err(EINVAL);
+        }
+        let stride = (payload_len + 75) & !63;
+        let required = FASTPATH_HEADER_LEN + 2 * stride;
+        let ring_size = (required + FASTPATH_PAGE_SIZE - 1) & !(FASTPATH_PAGE_SIZE - 1);
+        let ring = Coherent::<u8>::zeroed_slice(dev, ring_size, GFP_KERNEL)?;
         let spec = KBox::pin(
             Spec {
                 channels: [quaternion_channel(), timestamp_channel()],
@@ -295,7 +550,18 @@ impl MotionIio {
         let state = match Arc::pin_init(
             pin_init!(State {
                 iio: IioPtr(indio_dev),
+                control,
+                payload_len,
+                stride,
+                ring <- new_mutex!(Some(ring)),
                 sample <- new_spinlock!(Sample::default()),
+                active: Atomic::new(false),
+                opened: Atomic::new(false),
+                retain_ring: Atomic::new(false),
+                client_id: Atomic::new(0),
+                next_client_id: Atomic::new(1),
+                last_aop_timestamp: Atomic::new(0),
+                poll_work <- new_delayed_work!("State::poll_work"),
             }),
             GFP_KERNEL,
         ) {
@@ -377,7 +643,7 @@ unsafe impl Sync for MotionIio {}
 #[repr(C)]
 struct PmHook {
     nb: Opaque<bindings::notifier_block>,
-    control: Arc<Control>,
+    state: Arc<State>,
     registered: Atomic<bool>,
 }
 
@@ -392,17 +658,13 @@ unsafe extern "C" fn pm_event(
     // SAFETY: By the callback contract above.
     let hook = unsafe { &*nb.cast::<PmHook>() };
     let ret = match action as u32 {
-        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => {
-            hook.control.disable()
-        }
-        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => {
-            hook.control.enable()
-        }
+        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => hook.state.stop(),
+        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => hook.state.start(),
         _ => return bindings::NOTIFY_DONE as c_int,
     };
     if let Err(e) = ret {
         dev_warn!(
-            hook.control.dev,
+            hook.state.control.dev,
             "reports not switched for sleep: {:?}\n",
             e
         );
@@ -448,7 +710,7 @@ unsafe impl Send for PmHook {}
 unsafe impl Sync for PmHook {}
 
 impl PmHook {
-    fn new(control: Arc<Control>) -> Result<Pin<KBox<Self>>> {
+    fn new(state: Arc<State>) -> Result<Pin<KBox<Self>>> {
         let hook = KBox::pin(
             Self {
                 nb: Opaque::new(bindings::notifier_block {
@@ -456,7 +718,7 @@ impl PmHook {
                     next: ptr::null_mut(),
                     priority: 0,
                 }),
-                control,
+                state,
                 registered: Atomic::new(false),
             },
             GFP_KERNEL,
@@ -486,8 +748,7 @@ impl Drop for PmHook {
 
 struct IIOAopDevMotionDriver {
     pm: Pin<KBox<PmHook>>,
-    listener: FakehidRegistration,
-    control: Arc<Control>,
+    state: Arc<State>,
     _iio: MotionIio,
 }
 
@@ -525,26 +786,22 @@ impl platform::Driver for IIOAopDevMotionDriver {
             },
             GFP_KERNEL,
         )?;
-        let (mut iio, state) = MotionIio::new(pdev)?;
-        let listener = FakehidRegistration::new(aop, service, state)?;
-        let pm = PmHook::new(control.clone())?;
-        control.initialize()?;
-        if let Err(e) = iio.register() {
-            let _ = control.disable();
-            return Err(e);
-        }
+        control.calibrate()?;
+        let (mut iio, state) = MotionIio::new(pdev, control)?;
+        iio.register()?;
+        let pm = PmHook::new(state.clone())?;
+        state.start()?;
         Ok(IIOAopDevMotionDriver {
             pm,
-            listener,
-            control,
+            state,
             _iio: iio,
         })
     }
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.pm.unregister();
-        let _ = this.control.disable();
-        this.listener.unregister();
+        let _ = this.state.stop();
+        this.state.disable_poll();
     }
 }
 

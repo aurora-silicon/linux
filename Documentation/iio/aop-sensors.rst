@@ -5,11 +5,10 @@ Apple AOP sensors
 =================
 
 The AOP firmware announces sensor services over EPIC. The AOP core matches
-each service to a child node in the device tree and forwards its fake-HID
-reports to the corresponding IIO driver. Ambient light (``als``), lid
-angle (``las``), acceleration (``accel``), angular rate (``gyro``), fused
-device motion (``devmotion6``) and board temperature (``als-temp``) use this
-same transport; no HID bus device is created.
+each service to a child node in the device tree. Most sensors send fake-HID
+reports over EPIC; fused device motion (``devmotion6``) instead writes a
+shared fast-path buffer opened by its IIO driver. No HID bus device is
+created.
 
 Lid angle
 =========
@@ -76,13 +75,19 @@ The service's current report has a type byte followed by a versioned fixed
 layout. Type 2 is 108 bytes and carries little-endian IEEE-754 X, Y, Z and W
 at offset 28. Types 3 and 4 are 60 bytes and carry the same fields at offset
 12. Type 1 is a five-byte state report and does not update the IIO sample.
-The driver first selects the firmware's built-in calibration by writing value
-1 to property 61, then writes a non-zero interval in microseconds to property
-0. The order matters: setting the interval alone is accepted but does not
-start the fusion stream. The driver requests 50 Hz, writes a zero interval
-around system sleep, and restores that interval after resume; the calibration
-state persists across this power transition. This fused stream needs no
-separate calibration blob.
+The driver writes value 1 to property 61 first. Some firmware answers status
+0xe00002c7 (unsupported) for this service, which is harmless. The stream is
+armed by the consumer registration: the driver reads property 81 for the
+report size, allocates a coherent two-slot ping-pong buffer, and opens it
+with EPIC command 25. Only then does the driver write the non-zero interval in microseconds to
+property 0. Reports are polled from the published shared-memory slot rather
+than received as fake-HID subtype 0xc4 messages.
+
+The driver requests 50 Hz. Around system sleep it writes a zero interval and
+closes the fast path with command 26; after resume it opens the fast path
+before restoring the interval. A failed or timed-out close retains the DMA
+mapping because the firmware may still hold its address. This fused stream
+needs no separate calibration blob.
 
 Board temperature
 =================
