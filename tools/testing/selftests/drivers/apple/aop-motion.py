@@ -29,7 +29,9 @@ def main():
     motion = (root / "drivers/iio/common/aop_sensors/aop_motion.rs").read_text()
     parts = [const(motion, "REPORT_LEN"), const(motion, "XYZ_OFFSET"),
              block(motion, "fn decode("), block(motion, "fn le_u32("),
-             block(motion, "fn location0_packet("), r'''
+             block(motion, "fn location0_packet("),
+             const(motion, "STATUS_UNSUPPORTED"),
+             block(motion, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum CalStatus"), block(motion, "fn cal_status("), r'''
 fn report(prefix: u8, xyz: [i32; 3], suffix: u8) -> Vec<u8> {
     let mut r = vec![prefix; 6];
     for v in xyz {
@@ -67,6 +69,15 @@ fn container(entries: &[(u32, &[u8])]) -> Vec<u8> {
         c.extend_from_slice(packet);
     }
     c
+}
+#[test]
+fn calibration_status() {
+    assert_eq!(cal_status(0), CalStatus::Taken);
+    // Answered once the service holds a calibration from an earlier start.
+    assert_eq!(cal_status(0xe000_02c7), CalStatus::Held);
+    for status in [1, 0xe000_02bc, 0xe000_02c2, 0xe000_02e2, 0xe000_02c6, u32::MAX] {
+        assert_eq!(cal_status(status), CalStatus::Refused, "{status:#x}");
+    }
 }
 #[test]
 fn selects_location_zero() {

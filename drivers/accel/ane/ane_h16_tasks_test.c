@@ -19,6 +19,9 @@ static void ane_h16_dense_task_test(struct kunit *test)
 	put_unaligned_le32(0x419c / 4 | (1 << 15), text + 16 + 9 * 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
 	put_unaligned_le32(0x4100 / 4, text + 16 + 9 * 4);
+	/* The last task may end the stream without padding (16 + 44 bytes). */
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, 16 + 11 * 4, 1), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, 16 + 10 * 4, 1), -ENOEXEC);
 	text[63] = 1;
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
 }
@@ -115,8 +118,26 @@ static void ane_h16_relocation_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
 }
 
+/* H17 streams open with 0, and the last task may end the section unpadded. */
+static void ane_h17_prologue_test(struct kunit *test)
+{
+	u8 text[60] = {};
+
+	put_unaligned_le32(11 << 16, text + 16);
+	put_unaligned_le32(0x4100 / 4, text + 16 + 9 * 4);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_validate(text, sizeof(text), 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_validate(text, sizeof(text), 1, 1), -ENOEXEC);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
+	put_unaligned_le32(1, text);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), 0);
+	/* A task that overruns the section is still refused. */
+	put_unaligned_le32(12 << 16, text + 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
+}
+
 static struct kunit_case ane_h16_task_cases[] = {
 	KUNIT_CASE(ane_h16_prologue_test),
+	KUNIT_CASE(ane_h17_prologue_test),
 	KUNIT_CASE(ane_h16_dense_task_test),
 	KUNIT_CASE(ane_h16_scatter_task_test),
 	KUNIT_CASE(ane_h16_extra_header_test),

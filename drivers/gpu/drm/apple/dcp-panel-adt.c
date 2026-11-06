@@ -76,7 +76,7 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 	size_t props_start, props_end;
 	u32 props, children;
 	char node_name[33] = {};
-	bool product, selected;
+	bool product, selected, backlight;
 
 	if (IS_ERR(header))
 		return PTR_ERR(header);
@@ -106,6 +106,7 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 	product = depth == 1 && !strcmp(node_name, "product");
 	selected = (depth == 1 && !strcmp(node_name, "panel")) ||
 		   (product_parent && !strcmp(node_name, "panel"));
+	backlight = depth == 1 && !strcmp(node_name, "backlight");
 	/* /product carries raw-panel-serial-number on machines without /panel. */
 	c->pos = props_start;
 	for (u32 i = 0; i < props; i++) {
@@ -115,6 +116,8 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 
 		if (selected || (product && !strcmp(name, "raw-panel-serial-number")))
 			dcp_adt_panel_property(panel, name, prop + 36, size);
+		else if (backlight && !strcmp(name, "EDRPotentialHeadroom") && size == 4)
+			panel->edr_potential_headroom = get_unaligned_le32(prop + 36);
 		c->pos += 36 + ALIGN((size_t)size, 4);
 	}
 	/* A valid ADT may have neither panel node; retain the OF defaults. */

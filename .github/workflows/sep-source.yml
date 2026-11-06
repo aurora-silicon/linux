@@ -3,6 +3,9 @@ name: SEP source checks
 on:
   pull_request:
     paths:
+      - 'Makefile'
+      - 'rust/**'
+      - 'tools/aurora-bindgen/**'
       - 'drivers/soc/apple/**'
       - 'include/uapi/linux/apple-sep.h'
       - 'tools/aurora-sep/**'

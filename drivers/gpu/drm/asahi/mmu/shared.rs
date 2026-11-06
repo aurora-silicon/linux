@@ -14,6 +14,7 @@ struct Binding {
     end: u64,
     object: usize,
     offset: u64,
+    bind_sequence: u64,
 }
 
 #[pin_data]
@@ -43,6 +44,7 @@ impl Vm {
         size: u64,
         offset: u64,
         single_page: bool,
+        bind_sequence: u64,
     ) {
         let Some(shared) = &self.shared_bindings else {
             return;
@@ -63,6 +65,7 @@ impl Vm {
                     end,
                     object: core::ptr::from_ref(gem) as usize,
                     offset,
+                    bind_sequence,
                 },
                 GFP_KERNEL,
             );
@@ -86,6 +89,10 @@ impl Vm {
     }
 
     pub(crate) fn untrack_shared_object(&self, gem: &gem::Object) {
+        self.untrack_shared_object_before(gem, u64::MAX);
+    }
+
+    pub(super) fn untrack_shared_object_before(&self, gem: &gem::Object, sequence: u64) {
         let Some(shared) = &self.shared_bindings else {
             return;
         };
@@ -94,7 +101,7 @@ impl Vm {
         }
         let object = core::ptr::from_ref(gem) as usize;
         let mut bindings = shared.bindings.lock();
-        bindings.retain(|entry| entry.object != object);
+        bindings.retain(|entry| entry.object != object || entry.bind_sequence > sequence);
         shared.count.store(bindings.len() as u32, Ordering::Relaxed);
     }
 

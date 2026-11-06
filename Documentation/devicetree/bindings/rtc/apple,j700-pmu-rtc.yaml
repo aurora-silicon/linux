@@ -4,15 +4,16 @@
 $id: http://devicetree.org/schemas/rtc/apple,j700-pmu-rtc.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple J700 Baku PMU real-time clock
+title: Apple Baku and Abbey PMU real-time clocks
 
 maintainers:
   - Ryan Murray <ryan@aurorasilicon.org>
 
 description: |
-  Baku exposes a 65536 Hz counter and an alarm comparator over SPMI.
-  The clock's whole-second offset is shared with the SMC RTC through an
-  eight-byte little-endian NVMEM cell. This function is a child of the
+  The PMU exposes a 65536 Hz counter and an alarm comparator over SPMI.
+  The clock's offset is shared with the SMC RTC through a little-endian
+  NVMEM cell: eight bytes of whole seconds on Baku, or six bytes of signed
+  33.15 fixed-point seconds on Abbey. This function is a child of the
   PMIC NVMEM provider and uses that provider's SPMI register map.
 
 allOf:
@@ -20,14 +21,16 @@ allOf:
 
 properties:
   compatible:
-    const: apple,j700-pmu-rtc
+    enum:
+      - apple,j700-pmu-rtc
+      - apple,t6041-pmu-rtc
 
   interrupts:
     maxItems: 1
 
   nvmem-cells:
     maxItems: 1
-    description: The shared eight-byte whole-second RTC offset.
+    description: The shared RTC offset, in the format described above.
 
   nvmem-cell-names:
     items:

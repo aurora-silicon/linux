@@ -48,6 +48,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define GFP_ATOMIC 0
 #define IEEE80211_CHAN_DISABLED 1
 #define IEEE80211_CHAN_RADAR 2
+#define IEEE80211_CHAN_NO_IR 4
 #define NL80211_CHAN_WIDTH_20 0
 #define NL80211_CHAN_WIDTH_40 1
 #define NL80211_CHAN_WIDTH_80 2

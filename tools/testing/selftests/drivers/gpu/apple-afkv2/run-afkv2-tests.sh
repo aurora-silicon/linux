@@ -83,7 +83,9 @@ $afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
     "$afkv2_root/drivers/gpu/drm/apple/afk.c" "$afkv2_tmp/ring.c"
 "$afkv2_python" "$afkv2_dir/extract-notify.py" \
     "$afkv2_root/drivers/gpu/drm/apple/epic/dpavservep.c" "$afkv2_tmp/notify.c"
-for afkv2_test in ring notify; do
+"$afkv2_python" "$afkv2_dir/extract-compact.py" \
+    "$afkv2_root/drivers/gpu/drm/apple/afk.c" "$afkv2_tmp/compact.c"
+for afkv2_test in ring notify compact; do
     # shellcheck disable=SC2086
     $afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
         -I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \

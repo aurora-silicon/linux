@@ -36,7 +36,7 @@ static void mutex_unlock(struct mutex *m)
 #define spin_lock_irqsave(p, flags) do { (flags) = 0; mutex_lock(p); } while (0)
 #define spin_unlock_irqrestore(p, flags) do { (void)(flags); mutex_unlock(p); } while (0)
 struct ave_dev;
-struct device { struct ave_dev *drvdata; unsigned int refs; };
+struct device { struct ave_dev *drvdata; unsigned int refs, dma_refs; };
 
 static void *dev_get_drvdata(struct device *dev)
 {
@@ -45,7 +45,11 @@ static void *dev_get_drvdata(struct device *dev)
 
 struct vb2_queue { unsigned int type; bool error, streaming; void *priv; };
 
-struct vb2_buffer { struct vb2_queue *vb2_queue; void *priv; };
+struct vb2_buffer {
+	struct vb2_queue *vb2_queue;
+	void *priv;
+	struct { void *mem_priv; } planes[1];
+};
 
 struct vb2_v4l2_buffer { struct vb2_buffer vb2_buf; unsigned int completions; int state; };
 
@@ -85,8 +89,11 @@ struct ave_dev {
 	void *data_pristine;
 	struct ave_ring ring[2];
 	u64 ipc_fw_base;
+	bool irq_kick;
+	int irq_wait;
 };
 
+static void *test_ctrl_addr;
 static int halt_result, close_result;
 static unsigned int halts, closes, freed, suspends, resumes, schedules, barriers;
 static unsigned int polls, sleep_ms;
@@ -106,6 +113,23 @@ static void msleep(unsigned int ms)
 
 static void usleep_range(unsigned int lo, unsigned int hi) { }
 
+/* Ring waits: the mailbox interrupt never comes, so each wait times out. */
+static unsigned int irq_waits;
+static unsigned long irq_wait_max;
+#define smp_mb() __sync_synchronize()
+#define clamp_t(t, v, lo, hi) ((t)(v) < (t)(lo) ? (t)(lo) : (t)(v) > (t)(hi) ? (t)(hi) : (t)(v))
+static s64 ktime_ms_delta(ktime_t a, ktime_t b)
+{
+	return (s64)(a - b);
+}
+#define wait_event_timeout(wq, cond, timeout) ({			\
+	unsigned long __t = (timeout);					\
+	irq_waits++;							\
+	if (__t > irq_wait_max)						\
+		irq_wait_max = __t;					\
+	(cond) ? 1 : 0;							\
+})
+
 static u32 readl(const void *p)
 {
 	return *(const u32 *)p;
@@ -118,8 +142,11 @@ static u64 readq(const void *p)
 
 static void writel(u32 v, void *p)
 {
-	if (!ctrl_sticky)
+	if (!ctrl_sticky) {
 		*(u32 *)p = v;
+		if (p == test_ctrl_addr)
+			stop_seen = !v;
+	}
 }
 
 static void *memremap(phys_addr_t p, size_t size, unsigned int mode)
@@ -193,9 +220,13 @@ static bool ave_sess_stalled(struct ave_session *sess)
 	return false;
 }
 
-static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
+static void ave_free(struct ave_dev *ave, struct ave_buf *buf)
 {
-	freed++;
+	if (buf->cpu) {
+		assert(stop_seen && power_seen);
+		freed++;
+		buf->cpu = NULL;
+	}
 }
 
 static void pm_runtime_mark_last_busy(struct device *dev) { }

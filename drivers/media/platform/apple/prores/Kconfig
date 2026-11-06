@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_PRORES
+	tristate "Apple Silicon ProRes encoder"
+	depends on VIDEO_DEV
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+	depends on OF && IOMMU_API && PM
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  V4L2 memory-to-memory driver for the ProRes encoder engine (APR)
+	  in Apple A18 Pro (T8140) SoCs. It encodes 8 and 16 bit 4:2:2 and
+	  4:4:4 frames to ProRes 422 Proxy, LT, 422, HQ, 4444 and 4444 XQ.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-prores.
+
+config VIDEO_APPLE_PRORES_KUNIT_TEST
+	tristate "KUnit tests for the Apple ProRes encoder" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_APPLE_PRORES
+	default KUNIT_ALL_TESTS
+	help
+	  Check the quantisation tables, the DC scale table and job
+	  descriptors the ProRes driver builds against values the engine is
+	  known to run with. No hardware is needed.

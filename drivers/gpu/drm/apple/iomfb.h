@@ -190,7 +190,7 @@ enum dcpep_method {
 	dcpep_pipe_query_478,
 	dcpep_pipe_query_474,
 	dcpep_pipe_set_476,
-	dcpep_pipe_set_428,
+	iomfbep_set_brightness_correction,
 	dcpep_num_methods
 };
 
@@ -390,6 +390,9 @@ struct iomfb_set_matrix_req {
 	u8 matrix_null;
 	u8 padding[3];
 } __packed;
+
+struct drm_color_ctm;
+void dcp_ctm_to_fw(u64 fw[9], const struct drm_color_ctm *ctm);
 
 struct iomfb_set_matrix_resp {
 	u32 ret;

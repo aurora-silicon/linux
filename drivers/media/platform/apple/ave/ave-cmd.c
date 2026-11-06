@@ -158,11 +158,12 @@ int ave_cmd_start(struct ave_ctx *ctx)
 		return ret;
 	ave_debugfs_save(ave, p->codec, AVE_IMAGE_START, cmd, len);
 
+	/* A failed submission may already have exposed the Start buffers. */
+	sess->handed = true;
 	ret = ave_ipc_submit(ave, AVE_BUF_CMD, len, AVE_CMD_SESSION_TIMEOUT_US,
 			     true);
 	if (ret)
 		return ret;
-	sess->handed = true;
 	return ave_ipc_settle(ave, AVE_START_WAIT_MS);
 }
 
@@ -198,6 +199,8 @@ int ave_cmd_process(struct ave_ctx *ctx, unsigned int slot,
 	if (!sess->frames)
 		ave_debugfs_save(ave, p->codec, AVE_IMAGE_PROCESS, cmd, len);
 
+	/* Pin before publishing the command, including an uncertain send failure. */
+	s->input_mem = ave_vb2_get(&src->vb2_buf);
 	ret = ave_ipc_submit(ave, buf, len, fw->process_timeout_us, false);
 	if (ret)
 		return ret;

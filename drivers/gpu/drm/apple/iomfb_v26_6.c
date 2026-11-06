@@ -1527,22 +1527,16 @@ static int dcp_v26_ctm_locked(struct apple_dcp_v26 *v26,
 {
 	u8 request[80] = {}, readback[76] = {};
 	__le32 status = 0;
-	const struct drm_color_ctm *ctm;
+	u64 coefficient[9];
 	int i, ret;
 
 	if (!state || (v26->ctm_valid && !state->color_mgmt_changed &&
 		       !state->mode_changed && !state->active_changed))
 		return 0;
-	ctm = state->ctm ? state->ctm->data : NULL;
+	dcp_ctm_to_fw(coefficient, state->ctm ? state->ctm->data : NULL);
 	put_unaligned_le32(9, request);
-	for (i = 0; i < 9; i++) {
-		u64 coefficient = ctm ? ctm->matrix[i] :
-				  ((i == 0 || i == 4 || i == 8) ? 1ULL << 32 : 0);
-		u64 magnitude = coefficient & ~(1ULL << 63);
-		u64 signed_q32 = coefficient & (1ULL << 63) ? -magnitude : magnitude;
-
-		put_unaligned_le64(signed_q32, request + 4 + 8 * i);
-	}
+	for (i = 0; i < 9; i++)
+		put_unaligned_le64(coefficient[i], request + 4 + 8 * i);
 	ret = dcp_v26_call(v26, A(423), request, sizeof(request),
 		       &status, sizeof(status), 0);
 	v26->ctm_calls++;

@@ -59,6 +59,8 @@ def main():
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
+        ('display', 'hdr-static-metadata', display.hdr_metadata, ((),), ()),
+        ('display', 'ctm-encoding', colorimetry.ctm, ((),), ()),
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),
         ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
@@ -90,6 +92,7 @@ def main():
         ('edid', 'ordered-rx', edid.rx_progress, ((),), ('-pthread',)),
         ('rate', 'parser-policy', lambda r: rate.policy(r)['unit'], ((),), ()),
         ('rate', 'publication-hpd', rate.hotplug, ((),), ()),
+        ('rate', 'panel-dimensions', rate.panel_dimensions, ((),), ()),
         ('rate', 'metadata-decoder', lambda r: rate.metadata(r, output), ((),), ('-Wno-sign-compare',)),
         ('rate', 'bounded-retry', rate.retry, ((),), ()),
         ('phy', 'pm-ownership', pm.ownership, ((),), ()),
@@ -142,7 +145,7 @@ def main():
             elif isinstance(unit, tuple):
                 unit, cases = unit
             if unit is not None and name in ('provider-admission', 'ordered-rx',
-                    'publication-hpd', 'stale-crtc-poweroff', 'readiness'):
+                    'publication-hpd', 'panel-dimensions', 'stale-crtc-poweroff', 'readiness'):
                 # These fixtures select older external-display backends. The M4
                 # transport is covered by the separate m4 group, not mocked here.
                 prefix = ('#include <stdbool.h>\n#include <assert.h>\n'

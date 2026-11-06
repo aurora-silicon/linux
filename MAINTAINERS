@@ -2097,6 +2097,7 @@ F:	Documentation/devicetree/bindings/iio/imu/apple,aop-motion.yaml
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
+F:	Documentation/devicetree/bindings/media/apple,t8132-isp.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
 F:	Documentation/devicetree/bindings/mux/apple,display-crossbar.yaml
 F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
@@ -2695,6 +2696,7 @@ F:	drivers/dma/apple-sio-probe-test.dtso
 F:	drivers/dma/apple-sio-t6030-test.dtso
 F:	drivers/dma/apple-sio-test.c
 F:	drivers/dma/apple-sio.c
+F:	include/linux/dma/apple-sio.h
 F:	sound/soc/apple/*
 F:	sound/soc/codecs/cs42l83-i2c.c
 F:	sound/soc/codecs/cs42l84.*
@@ -2764,6 +2766,7 @@ F:	drivers/gpio/gpio-macsmc.c
 F:	drivers/hwmon/macsmc-hwmon*.c
 F:	drivers/pmdomain/apple/
 F:	drivers/pmdomain/apple/.kunitconfig.apple-pmp
+F:	drivers/pmdomain/apple/.kunitconfig.pmgr-pwrstate
 F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c
@@ -2820,6 +2823,14 @@ F:	Documentation/admin-guide/media/apple-ave.rst
 F:	Documentation/devicetree/bindings/media/apple,t8140-ave.yaml
 F:	drivers/media/platform/apple/ave/
 F:	tools/asahi/ave*-tests.py
+
+ARM/APPLE PRORES VIDEO ENCODER DRIVER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+L:	linux-media@vger.kernel.org
+S:	Maintained
+W:	https://aurora-silicon.github.io
+F:	Documentation/devicetree/bindings/media/apple,prores.yaml
+F:	drivers/media/platform/apple/prores/
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
@@ -8190,6 +8201,7 @@ L:	dri-devel@lists.freedesktop.org
 S:	Maintained
 F:	Documentation/ABI/testing/sysfs-class-accel-ane
 F:	Documentation/ABI/testing/sysfs-driver-ane-performance
+F:	Documentation/accel/apple-ane-cold.rst
 F:	Documentation/accel/apple-ane.rst
 F:	Documentation/devicetree/bindings/npu/apple,ane.yaml
 F:	drivers/accel/ane/

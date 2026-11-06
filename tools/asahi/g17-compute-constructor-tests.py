@@ -27,14 +27,16 @@ def fixture():
     runtime = (ROOT / 'runtime.rs').read_text()
     preparation = (ROOT / 'preparation.rs').read_text()
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
-                 item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()')
+                 item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
     methods = '\n'.join(item(runtime, sig) for sig in ['    fn shared_compute(', '    fn compute_scheduler('])
     methods = methods.replace('super::object::Allocator', 'Allocator').replace('super::preparation::Lease', 'Lease').replace('super::initdata::', '')
     return r'''
 #![allow(dead_code)]
+use std::cell::Cell;
 use std::sync::{Mutex,MutexGuard,atomic::{AtomicBool,AtomicU64,Ordering}};
 type Result<T=()> = std::result::Result<T,i32>;
 const EIO:i32=-5;const EAGAIN:i32=-11;const ENODEV:i32=-19;const EBUSY:i32=-16;const ECANCELED:i32=-125;
+const RECOVERY_WAIT_MS:u32=26_000;
 static NOW:AtomicU64=AtomicU64::new(0);static CANCEL:AtomicBool=AtomicBool::new(false);static ALLOCATE:AtomicBool=AtomicBool::new(false);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
 mod kernel{pub mod time{pub fn msecs_to_jiffies(ms:u32)->u32{ms}}}
