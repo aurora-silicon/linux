@@ -145,7 +145,7 @@ pub(crate) const V25G83: Variant = Variant {
     registration: QueueRegistration::Firmware,
     mcache: true,
     mcache_dsid_client: Some(0x22),
-    few_primitives: false,
+    few_primitives: true,
     ray_traversal: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.

@@ -1647,7 +1647,7 @@ mod ta_mode_tests {
         assert!(!V26A428.ta_mode_1);
         assert!(pro.mcache);
         assert_eq!(pro.mcache_dsid_client, Some(0x22));
-        assert!(!pro.few_primitives);
+        assert!(pro.few_primitives);
         assert!(!max.mcache);
         assert_eq!(max.mcache_dsid_client, None);
         assert!(!max.few_primitives);
