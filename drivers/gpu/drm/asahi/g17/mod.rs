@@ -935,6 +935,27 @@ impl power::Control for Firmware {
     }
 }
 
+/// Every feature the M5 command set reports. GET_PARAMS leaves out the MSAA compression
+/// and mesh storage bits while those paths are off.
+const M5_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES
+    | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES
+    | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2) as u64
+    | crate::file::DRM_ASAHI_FEATURE_SPARSE_TILES
+    | crate::file::DRM_ASAHI_FEATURE_COMPUTE_MATRIX
+    | crate::file::DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES
+    | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2
+    | crate::file::DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS
+    | M5_MSAA_COMPRESSION_FEATURES
+    | crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
+const M5_MSAA_COMPRESSION_FEATURES: u64 = crate::file::DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION
+    | crate::file::DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION;
+/// Features 24 and 25, which no kernel may report again (see the UAPI header): userspace
+/// that knows them sends staged renders whose prefix fields the render command gives to
+/// its ray-query stages.
+const RETIRED_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS
+    | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) as u64;
+const _: () = assert!(M5_FEATURES & RETIRED_FEATURES == 0);
+
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
 /// Short control/retirement polls do not wait behind the longer idle deadline.
@@ -1813,21 +1834,14 @@ impl gpu::Gpu for Gpu {
                 u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
         }
         if variant.m5_commands {
-            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)
-                | crate::file::DRM_ASAHI_FEATURE_SPARSE_TILES
-                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_MATRIX
-                | crate::file::DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES
-                | crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES
-                | crate::file::DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS;
-            if queue::render::m5_render_submission::depth_msaa_compression_enabled() {
-                params.features |= crate::file::DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION
-                    | crate::file::DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION;
+            let mut features = M5_FEATURES;
+            if !queue::render::m5_render_submission::depth_msaa_compression_enabled() {
+                features &= !M5_MSAA_COMPRESSION_FEATURES;
             }
-            if crate::module_parameters::m5_mesh_storage_chunks.value() != 0 {
-                params.features |= crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
+            if crate::module_parameters::m5_mesh_storage_chunks.value() == 0 {
+                features &= !crate::file::DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
             }
+            params.features |= features;
         }
         params.gpu_generation = self.cfg.gpu_generation as u32;
         params.gpu_variant = self.cfg.identity.gpu_variant as u32;
