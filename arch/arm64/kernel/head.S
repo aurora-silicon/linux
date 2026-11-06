@@ -310,13 +310,17 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 #ifdef CONFIG_ARM64_CTXR_EXECMEM
 	/*
 	 * Kernel text inside an armed CTXR window can't execute at EL1, and
-	 * the window isn't known this early. Apple cores are VHE only, so they
-	 * go straight to VHE here on every entry and never run at EL1.
+	 * the window isn't known this early. Apple cores from the M4 generation
+	 * on (part numbers from 0x50) have CTXR and are VHE only, so they go
+	 * straight to VHE here on every entry and never run at EL1.
 	 */
 	mrs	x0, midr_el1
-	ubfx	x0, x0, #MIDR_IMPLEMENTOR_SHIFT, #8
-	cmp	x0, #ARM_CPU_IMP_APPLE
-	b.ne	.Lctxr_not_apple
+	ubfx	x1, x0, #MIDR_IMPLEMENTOR_SHIFT, #8
+	cmp	x1, #ARM_CPU_IMP_APPLE
+	b.ne	.Lctxr_no_direct_vhe
+	ubfx	x0, x0, #MIDR_PARTNUM_SHIFT, #12
+	cmp	x0, #0x50
+	b.lo	.Lctxr_no_direct_vhe
 
 	finalise_el2_state
 
@@ -341,7 +345,7 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	mov	w0, #BOOT_CPU_MODE_EL2
 	orr	x0, x0, #BOOT_CPU_FLAG_E2H
 	eret
-.Lctxr_not_apple:
+.Lctxr_no_direct_vhe:
 #endif
 
 	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF
