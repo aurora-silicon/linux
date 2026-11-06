@@ -1519,7 +1519,7 @@ impl super::Firmware {
             merged.insert(wait.sequence, wait.dependency).map_err(|_| EAGAIN)?;
         }
         let result = self.publish_compute_raw(owner, packet.clone(), merged.as_slice(),
-            native.as_slice(), deferred);
+            &[], deferred);
         if packet.is_published() {
             for queue in self.queues.compute.iter().flatten()
                 .filter_map(|entry| entry.queue.as_deref())
