@@ -203,6 +203,8 @@ struct dcp_panel {
 	bool has_mini_led;
 	/// peak panel luminance in nits, for EDR (desktop 26.x; 0 if unknown)
 	u32 peak_nits;
+	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
+	u32 edr_ceiling;
 };
 
 enum dcp_iomfb_method_profile {
@@ -594,11 +596,12 @@ struct apple_dcp {
 	bool output_edr;
 	bool edr_sent;
 	/*
-	 * EDR headroom the panel was last given, x1000 (0: not in use), and
-	 * a power off since, after which the ramp starts again from 1.0 (see
-	 * dcp_edr_prepare()).
+	 * EDR headroom the panel was last given, x1000 (0: not in use), the
+	 * SDR white in nits it was given for, and a power off since, after
+	 * which the ramp starts again from 1.0 (see dcp_edr_prepare()).
 	 */
 	u32 edr_hm;
+	u32 edr_sdr;
 	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
 

@@ -51,6 +51,7 @@
 #include "afk.h"
 #include "av.h"
 #include "dcp.h"
+#include "dcp-edr.h"
 #include "dcp-panel-adt.h"
 #include <linux/io.h>
 #include <linux/of_address.h>
@@ -878,9 +879,13 @@ static void dcp_panel_adt_identity(struct apple_dcp *dcp)
 	dcp->panel.width_mm = panel.width_mm;
 	dcp->panel.height_mm = panel.height_mm;
 	dcp->desktop->panel_adt_identity = panel.identity;
+	dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
 	dev_info(dcp->dev, "panel identity fallback: ADT %s, panel node %s, dimensions %ux%u mm\n",
 		 ret ? "unavailable" : "parsed", panel.found ? "present" : "absent",
 		 panel.width_mm, panel.height_mm);
+	if (dcp->panel.edr_ceiling)
+		dev_info(dcp->dev, "panel EDR headroom up to %u.%03u\n",
+			 dcp->panel.edr_ceiling / 1000, dcp->panel.edr_ceiling % 1000);
 }
 
 /* Internal panel identity has no detachable Type-C service or EDID transport. */
