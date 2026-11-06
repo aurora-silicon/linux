@@ -24,7 +24,10 @@ properties:
       - const: apple,t6000-pmp-v2
       - items:
           - enum:
+              - apple,t6030-pmp-v2
+              - apple,t6031-pmp-v2
               - apple,t6041-pmp-v2
+              - apple,t8122-pmp-v2
               - apple,t8132-pmp-v2
               - apple,t8140-pmp-v2
           - const: apple,t6000-pmp-v2
