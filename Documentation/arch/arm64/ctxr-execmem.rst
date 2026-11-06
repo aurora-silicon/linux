@@ -89,11 +89,15 @@ it up. Anything EL0 can execute therefore lives outside the window:
   not available to the rest of the system, so a window should be no larger than
   the executable code needs.
 
-The zero page stays in the window, so a program that jumps into fresh executable
-memory before writing it still gets there. When a window is active, an EL0
-instruction permission fault on a present, executable mapping of a window page
-logs the task and its address and PFN, then kills it with an uncatchable
-``SIGSEGV`` rather than retrying. Any other fault takes the usual path.
+* The zero page is part of the image too, and every untouched anonymous page
+  that is read before it is written maps it, executable mappings included. With
+  a window active, ``arch_setup_zero_pages()`` allocates the zero pages from
+  memblock instead, outside the window.
+
+As a backstop, when a window is active, an EL0 instruction permission fault on a
+present, executable mapping of a window page logs the task and its address and
+PFN, then kills it with an uncatchable ``SIGSEGV`` rather than retrying. Any
+other fault takes the usual path.
 
 EFI runtime services
 ====================

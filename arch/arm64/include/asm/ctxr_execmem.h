@@ -32,11 +32,18 @@ bool ctxr_exec_execmem_setup(void);
  * Warns once when it returns false.
  */
 bool ctxr_exec_efi_runtime_ok(void);
+
+/*
+ * True once ctxr_exec_reserve() has reserved a window. Valid from
+ * arm64_memblock_init() until the end of init.
+ */
+bool ctxr_exec_window_reserved(void);
 #else
 static inline void ctxr_exec_reserve(void) {}
 static inline void ctxr_exec_keep_reserved(void) {}
 static inline bool ctxr_exec_execmem_setup(void) { return false; }
 static inline bool ctxr_exec_efi_runtime_ok(void) { return true; }
+static inline bool ctxr_exec_window_reserved(void) { return false; }
 #endif
 
 #endif /* __ASM_CTXR_EXECMEM_H */

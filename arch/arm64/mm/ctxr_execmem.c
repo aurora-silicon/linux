@@ -309,6 +309,11 @@ fail:
 	return false;
 }
 
+bool __init ctxr_exec_window_reserved(void)
+{
+	return ctxr_active;
+}
+
 /*
  * A core enforcing the window can't fetch firmware code outside it, and
  * efi_rts_wq can run on any core. Misaligned code also makes the misaligned
