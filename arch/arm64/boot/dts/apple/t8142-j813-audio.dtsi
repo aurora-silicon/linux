@@ -1,0 +1,417 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M5) J813: sound through the AOP firmware.
+ *
+ * As on J873 (T8152), the AOP's AOPAudioService owns the audio fabric and
+ * runs the MCA serializers: "cout"/"cin" (CS42L84 headphone jack) on
+ * admac-base-ns TX2/RX2 and "spkr" (four SN012776) on TX0, their V/I sense
+ * on RX0 (ADT iop-audio-controller; RX1 is the firmware's speaker tap).
+ * The AOP itself is laid out like T8140's (ascwrap-v6, asc-mailbox-v4),
+ * including the setup port.
+ * Addresses are from the J813 ADT (arm-io offset 0x210000000).
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+
+&pmgr {
+	ps_i2c1: power-controller@350 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x350 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c1";
+	};
+
+	ps_i2c3: power-controller@360 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x360 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c3";
+	};
+};
+
+&{/soc} {
+	pinctrl_ap: pinctrl@39a000000 {
+		compatible = "apple,t8142-pinctrl", "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x3 0x9a000000 0x0 0x100000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_ap 0 0 224>;
+		apple,npins = <224>;
+		/*
+		 * Not every pin is the AP's: reading pin 78's register raises
+		 * an SError. Expose only the pins sound uses: 100 (jack IRQ),
+		 * 150 (amp IRQ) and 151 (amp shutdown).
+		 */
+		gpio-reserved-ranges = <0 100>, <101 49>, <152 72>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 348 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 349 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 350 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	pinctrl_nub: pinctrl@3881f0000 {
+		compatible = "apple,t8142-pinctrl", "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x3 0x881f0000 0x0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_nub 0 0 40>;
+		apple,npins = <40>;
+		/* Only pin 18 (jack codec reset), as on pinctrl_ap. */
+		gpio-reserved-ranges = <0 18>, <19 21>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 574 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 575 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 576 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 578 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 579 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 580 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	pmgr_aop: power-management@388284000 {
+		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x3 0x88284000 0x0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/*
+		 * Only the MCA serializer leaves (ADT AUDIO_MCA0_M..AUDIO_MCA5_M)
+		 * are the AP's, as on J873. Their parents AUDIO_A, AUDIO_FR,
+		 * AUDIO_P and AUDIO_BASE_NS_A (0x80, 0xb8, 0xd8, 0xf8) are the AOP
+		 * firmware's: iBoot leaves them off, the firmware's audio init
+		 * switches them off and polls for that (an AP-held auto-enable
+		 * made it time out with 0xe00002d6, so "aop-audio" never
+		 * registered and the firmware panicked in systemReady), and a
+		 * service's pw0 request raises them again.
+		 *
+		 * Likewise the microphone array's LEAP leaves (AUDIO_LEAP_MCA,
+		 * AUDIO_LEAP_S_A, AUDIO_LEAP_RX0) without their parents
+		 * AUDIO_LEAP_C and AUDIO_LEAP_A (0x138, 0xe0); hpai's pw0 raises
+		 * those.
+		 */
+		ps_audio_leap_mca: power-controller@100 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x100 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_leap_mca";
+		};
+
+		ps_audio_mca0_m: power-controller@108 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x108 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca0_m";
+		};
+
+		ps_audio_mca1_m: power-controller@110 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x110 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca1_m";
+		};
+
+		ps_audio_mca2_m: power-controller@118 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x118 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca2_m";
+		};
+
+		ps_audio_mca3_m: power-controller@120 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x120 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca3_m";
+		};
+
+		ps_audio_mca4_m: power-controller@128 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x128 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca4_m";
+		};
+
+		ps_audio_mca5_m: power-controller@130 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x130 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca5_m";
+		};
+
+		ps_audio_leap_s_a: power-controller@140 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x140 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_leap_s_a";
+		};
+
+		ps_audio_leap_rx0: power-controller@150 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x150 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_leap_rx0";
+		};
+	};
+
+	aop_mbox: mailbox@390608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x90608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 490 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 491 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 492 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 493 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	/*
+	 * The ADT's aop-exclave-mailbox, flagged exclave-assigned as on T8140,
+	 * is the AOP setup port the host drives. Its ADT reg (0x3d067c000) is
+	 * not behind the arm-io translation: AOP ASC + 0x4007c000, as on
+	 * T8140. ADT interrupts [497, 494], T8140's +100.
+	 */
+	aop_setup_mbox: mailbox@3d067c000 {
+		compatible = "apple,t8142-aop-setup-mailbox", "apple,t8140-aop-setup-mailbox";
+		reg = <0x3 0xd067c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 494 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 497 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		/* dart-aop stream 1: ADT vm-base-1 0x20000000000, as on T8140. */
+		iommus = <&aop_dart 1>;
+		apple,dma-range = <0x200 0x0 0x10 0x0>;
+		#mbox-cells = <0>;
+	};
+
+	/*
+	 * dart-aop: streams 0 (AOP), 3, 8 (admac-base-ns), 10 and 16 are the
+	 * AP's; 1, 9 and 11 are exclave streams, of which the host drives 1
+	 * (setup port) and 11 (admac-leap-s) on the raw boot. As on T8140, the
+	 * firmware's own mappings own the first slot, host buffers go above it.
+	 */
+	aop_dart: iommu@390fc0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x3 0x90fc0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 528 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	admac_base_ns: dma-controller@393800000 {
+		compatible = "apple,t8140-admac";
+		reg = <0x3 0x93800000 0x0 0x34000>;
+		dma-channels = <13>;
+		interrupts-extended = <&aic AIC_IRQ 549 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		#dma-cells = <1>;
+		iommus = <&aop_dart 8>;
+		apple,dma-range = <0x110 0x00000000 0x0 0x10000000>;
+	};
+
+	/*
+	 * admac-leap-s, for the microphone array (ADT audio-hp-mic ->
+	 * leap-s-adma-rx-0), through its admac-leap-s-rx-0-proxy aperture as
+	 * on T8140: the direct window (0x393200000) faults on per-channel
+	 * registers. dart-aop stream 11 with the ADT's vm-base-11/vm-size-11.
+	 * No power domain: the channel registers answer only with the LEAP
+	 * leaves up, which the audio driver raises (after hpai's pw0) before
+	 * it requests the channel; the controller touches no register at
+	 * probe. No resets: the firmware owns the LEAP.
+	 */
+	admac_leap_s: dma-controller@3d3200000 {
+		compatible = "apple,t8140-admac";
+		reg = <0x3 0xd3200000 0x0 0x34000>;
+		dma-channels = <9>;
+		interrupts-extended = <&aic AIC_IRQ 551 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		#dma-cells = <1>;
+		iommus = <&aop_dart 11>;
+		apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
+	};
+
+	i2c1: i2c@3a5014000 {
+		compatible = "apple,t8142-i2c", "apple,t8103-i2c";
+		reg = <0x3 0xa5014000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1248 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c1>;
+
+		jack_codec: codec@4b {
+			compatible = "cirrus,cs42l84";
+			reg = <0x4b>;
+			reset-gpios = <&pinctrl_nub 18 GPIO_ACTIVE_HIGH>;
+			interrupts-extended = <&pinctrl_ap 100 IRQ_TYPE_LEVEL_LOW>;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Jack";
+		};
+	};
+
+	/*
+	 * Four SN012776: left woofer (0x38, carries the shared shutdown and
+	 * interrupt lines), left tweeter, right woofer, right tweeter. The ADT
+	 * speaker-config lists them as 0x38, then its speaker1..3 (right
+	 * woofer, left tweeter, right tweeter): playback slots 0-3 and V/I
+	 * sense in 8-bit slots 0/2, 4/6, 8/10, 12/14 in that order. The sense
+	 * returns on two lines, the left pair and the right pair; the woofers
+	 * drive the other pair's slots to zero (ADT amp-tx-zd-config, see the
+	 * speaker dai-link). The firmware's speaker frame is 250 BCLKs of
+	 * 12 MHz (ADT audio-speaker stream), which the amplifiers' ratio
+	 * detection rejects.
+	 */
+	i2c3: i2c@3a501c000 {
+		compatible = "apple,t8142-i2c", "apple,t8103-i2c";
+		reg = <0x3 0xa501c000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1250 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c3>;
+
+		speaker_left_woofer: codec@38 {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x38>;
+			shutdown-gpios = <&pinctrl_ap 151 GPIO_ACTIVE_HIGH>;
+			interrupts-extended = <&pinctrl_ap 150 IRQ_TYPE_LEVEL_LOW>;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Left Woofer";
+			ti,imon-slot-no = <2>;
+			ti,vmon-slot-no = <0>;
+			ti,bclk-ratio = <250>;
+		};
+
+		speaker_left_tweeter: codec@39 {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x39>;
+			shutdown-gpios = <&pinctrl_ap 151 GPIO_ACTIVE_HIGH>;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Left Tweeter";
+			ti,imon-slot-no = <10>;
+			ti,vmon-slot-no = <8>;
+			ti,bclk-ratio = <250>;
+		};
+
+		speaker_right_woofer: codec@3b {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x3b>;
+			shutdown-gpios = <&pinctrl_ap 151 GPIO_ACTIVE_HIGH>;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Right Woofer";
+			ti,imon-slot-no = <6>;
+			ti,vmon-slot-no = <4>;
+			ti,bclk-ratio = <250>;
+		};
+
+		speaker_right_tweeter: codec@3c {
+			compatible = "ti,sn012776", "ti,tas2764";
+			reg = <0x3c>;
+			shutdown-gpios = <&pinctrl_ap 151 GPIO_ACTIVE_HIGH>;
+			#sound-dai-cells = <0>;
+			sound-name-prefix = "Right Tweeter";
+			ti,imon-slot-no = <14>;
+			ti,vmon-slot-no = <12>;
+			ti,bclk-ratio = <250>;
+		};
+	};
+
+	aop: aop@390c00000 {
+		compatible = "apple,t8142-aop", "apple,t8152-aop";
+		reg = <0x3 0x90c00000 0x0 0x1e0000>,
+		      <0x3 0x90600000 0x0 0x4000>;
+		reg-names = "mmio", "asc";
+		mboxes = <&aop_mbox>, <&aop_setup_mbox>;
+		mbox-names = "mbox", "setup";
+		iommus = <&aop_dart 0>;
+		apple,dma-range = <0x110 0x0 0x10 0x0>;
+
+		aop_audio: audio {
+			compatible = "apple,t8142-aop-audio", "apple,t8152-aop-audio";
+			/* The microphone card's name: AppleJ813HPAI. */
+			apple,chassis-name = "J813";
+			apple,machine-kind = "MacBook Air";
+			/* hpai: leap-s RX0 (Linux channel 1, odd = DEV_TO_MEM). */
+			dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+			       <&admac_base_ns 0>, <&admac_base_ns 1>,
+			       <&admac_leap_s 1>;
+			dma-names = "cout", "cin", "spkr", "sense", "hpai";
+			power-domains = <&ps_audio_mca0_m>, <&ps_audio_mca1_m>,
+					<&ps_audio_mca2_m>, <&ps_audio_mca3_m>,
+					<&ps_audio_mca4_m>, <&ps_audio_mca5_m>,
+					<&ps_audio_leap_s_a>, <&ps_audio_leap_rx0>,
+					<&ps_audio_leap_mca>;
+			power-domain-names = "mca0", "mca1", "mca2",
+					     "mca3", "mca4", "mca5",
+					     "leap_s_a", "leap_rx0", "leap_mca";
+			#sound-dai-cells = <1>;
+		};
+	};
+};
+
+/ {
+	sound {
+		compatible = "apple,j813-macaudio", "apple,macaudio";
+		model = "MacBook Air J813";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 0>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+
+		dai-link@1 {
+			reg = <1>;
+			link-name = "Speaker";
+			/*
+			 * Codecs in ADT speaker-config order, so that macaudio
+			 * gives them playback slots 0-3 as macOS does (left
+			 * channels in slots 0 and 2, right in 1 and 3).
+			 */
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-1 = <0xff0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woofer>, <&speaker_right_woofer>,
+					    <&speaker_left_tweeter>, <&speaker_right_tweeter>;
+			};
+		};
+	};
+};

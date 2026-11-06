@@ -21,6 +21,7 @@ properties:
     enum:
       - apple,t6040-ascwrap-v6
       - apple,t8140-ascwrap-v6
+      - apple,t8142-ascwrap-v6
       - apple,t6050-apif-ascwrap-v6
       - apple,t6050-ascwrap-v6
       - apple,t6050-x1n1-ascwrap-v6
