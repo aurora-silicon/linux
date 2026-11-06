@@ -595,6 +595,25 @@ struct dcpib_ep *dcpib_ep_start(struct dcpib *dcp, u8 epnum,
 		goto err;
 
 	dcp->eps[epnum - DCPIB_FIRST_EP] = ep;
+	apple_rtkit_adopt_ep(dcp->rtk, epnum);
+	/*
+	 * Aura leaves these sessions running with its scanout. INIT while the
+	 * messenger is active asserts in firmware. Stop only an explicitly
+	 * advertised live endpoint and require its acknowledgment before INIT.
+	 * Its old buffers remain reserved by the bootloader throughout.
+	 */
+	if (dcp->inherited_afk_endpoints & BIT(epnum - DCPIB_FIRST_EP)) {
+		ret = dcpib_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
+		if (ret)
+			goto err_unregister;
+		if (!wait_for_completion_timeout(&ep->stopped, DCPIB_TIMEOUT)) {
+			dev_err(dcp->dev, "inherited endpoint %#x did not stop\n", epnum);
+			ret = -ETIMEDOUT;
+			goto err_unregister;
+		}
+		dcp->inherited_afk_endpoints &= ~BIT(epnum - DCPIB_FIRST_EP);
+		dev_info(dcp->dev, "inherited endpoint %#x stopped\n", epnum);
+	}
 	/*
 	 * START_EP for an application endpoint of the adopted session; the
 	 * bootloader consumed the endpoint map, so apple_rtkit_start_ep()
@@ -608,7 +627,6 @@ struct dcpib_ep *dcpib_ep_start(struct dcpib *dcp, u8 epnum,
 		dev_err(dcp->dev, "failed to start endpoint %#x: %d\n", epnum, ret);
 		goto err_unregister;
 	}
-	apple_rtkit_adopt_ep(dcp->rtk, epnum);
 	ret = dcpib_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 	if (ret)
 		goto err_unregister;

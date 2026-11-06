@@ -371,6 +371,7 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	struct device_node *hdmi_np __free(device_node) = dcpib_hdmi_node();
 	int source = hdmi_np ? dcpib_hdmi_source(hdmi_np) : -ENODEV;
 	struct dcpib *dcp;
+	u32 inherited_afk_endpoints;
 	int ret;
 
 	/*
@@ -383,6 +384,12 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	ret = of_property_read_u32(dev->of_node, "apple,afk-active-endpoints",
+				   &inherited_afk_endpoints);
+	if (ret || inherited_afk_endpoints & ~GENMASK(15, 0))
+		return dev_err_probe(dev, -EINVAL,
+				     "bootloader AFK endpoint handoff required\n");
+
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
 	if (ret)
 		return ret;
@@ -391,6 +398,7 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	if (IS_ERR(dcp))
 		return PTR_ERR(dcp);
 	dcp->dev = dev;
+	dcp->inherited_afk_endpoints = inherited_afk_endpoints;
 	platform_set_drvdata(pdev, dcp);
 	mutex_init(&dcp->lock);
 	mutex_init(&dcp->rx_gate);
