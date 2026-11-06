@@ -15,6 +15,10 @@ static void apple_jpeg_hwrev_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, U32_MAX));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x110000));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x101008));
+	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x10f008));
+	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x101009));
+	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0x101008));
 	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(NULL, 0x110000));
 }
 
