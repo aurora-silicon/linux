@@ -60,6 +60,8 @@ pub(crate) struct Variant {
     pub(crate) registration: QueueRegistration,
     /// Render kick entries may name an MCache table.
     pub(crate) mcache: bool,
+    /// MCache client to register with each context's DSID, for this shared-data layout.
+    pub(crate) mcache_dsid_client: Option<usize>,
     /// Renders may set the few-primitives auxiliary framebuffer flag.
     pub(crate) few_primitives: bool,
     /// The firmware runs ray-traversal work (ray queries and intersection programs).
@@ -112,6 +114,8 @@ pub(crate) const V26A428: Variant = Variant {
     },
     registration: QueueRegistration::PoweredRenderPairs,
     mcache: true,
+    // The A18 Pro layout is not the G16S 26A428 layout.
+    mcache_dsid_client: None,
     few_primitives: true,
     ray_traversal: true,
     fragment_busy: true,
@@ -139,8 +143,8 @@ pub(crate) const V25G83: Variant = Variant {
     // Whether this build tolerates the MMIO registration is unknown; the M4 Pro has only run
     // without it.
     registration: QueueRegistration::Firmware,
-    mcache: false,
-    // A fragment stage with the few-primitives flag hangs.
+    mcache: true,
+    mcache_dsid_client: Some(0x22),
     few_primitives: false,
     ray_traversal: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
@@ -160,6 +164,9 @@ pub(crate) const V25F84: Variant = Variant {
     compute: super::compute::ComputeProgram::V25F84,
     opening_record: false,
     split_firmware_area: true,
+    mcache: false,
+    mcache_dsid_client: None,
+    few_primitives: false,
     ..V25G83
 };
 
