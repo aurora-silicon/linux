@@ -105,14 +105,14 @@ struct brcmf_if *brcmf_get_ifp(struct brcmf_pub *drvr, int ifidx)
 	return ifp;
 }
 
-void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
+int brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 {
-	s32 err;
+	s32 err, ret = 0;
 	u32 mode;
 
 	if (enable && brcmf_is_apmode_operating(ifp->drvr->wiphy)) {
 		brcmf_dbg(TRACE, "Skip ARP/ND offload enable when soft AP is running\n");
-		return;
+		return 0;
 	}
 
 	if (enable)
@@ -124,11 +124,13 @@ void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 	/* is simply not supported and err 0 will be returned                 */
 	err = brcmf_fil_iovar_int_set(ifp, "arp_ol", mode);
 	if (err) {
+		ret = err;
 		brcmf_dbg(TRACE, "failed to set ARP offload mode to 0x%x, err = %d\n",
 			  mode, err);
 	} else {
 		err = brcmf_fil_iovar_int_set(ifp, "arpoe", enable);
 		if (err) {
+			ret = err;
 			brcmf_dbg(TRACE, "failed to configure (%d) ARP offload err = %d\n",
 				  enable, err);
 		} else {
@@ -139,12 +141,16 @@ void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 
 	err = brcmf_fil_iovar_int_set(ifp, "ndoe", enable);
 	if (err) {
+		if (!ret)
+			ret = err;
 		brcmf_dbg(TRACE, "failed to configure (%d) ND offload err = %d\n",
 			  enable, err);
 	} else {
 		brcmf_dbg(TRACE, "successfully configured (%d) ND offload to 0x%x\n",
 			  enable, mode);
 	}
+
+	return ret;
 }
 
 static void _brcmf_set_multicast_list(struct work_struct *work)
