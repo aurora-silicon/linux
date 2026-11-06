@@ -44,9 +44,24 @@ Command line (bring-up / VM)
 
 A value that doesn't parse is ignored with a warning. So is a window from the
 command line that can't work because the image doesn't fit it or it isn't in
-DRAM, and the device tree's window then applies if there is one. A window from
-the device tree that can't work is fatal when enforcing, because the kernel
-can't run on the confined cores outside it.
+DRAM, and the device tree's window then applies if there is one.
+
+The secondary CPUs can only run code inside the device tree's window, and the
+boot CPU isn't confined. So when that window can't be used, the kernel logs why,
+leaves the secondaries in the bootloader and boots on the boot CPU alone, as with
+``nosmp``. That happens when the property is malformed (not four cells, a size of
+0, a base or size that isn't page aligned, or one that wraps), when the image
+doesn't fit the window or the window isn't in DRAM, when it can't be reserved,
+when no free memory is left in it for executable allocations, and when the kernel
+isn't running at EL2 (``kvm-arm.mode=nvhe`` or ``protected``, for example). With
+no such property nothing changes.
+
+The kernel doesn't check the device tree's window against ``CTXR_D``. The boot
+CPU's copy doesn't describe the window, and a secondary can only read its own
+once it is running kernel code, which it can't do unless the window already
+holds the image. The registers also don't exist on every Apple core, and an
+undefined system register read at that point can't be recovered. The bootloader
+reads ``CTXR_D`` when it chooses the window, so the check belongs there.
 
 ``enforce`` only decides whether a confinement violation found by the verifier
 (see below) is fatal. Whether the hardware confines a core does not depend on

@@ -51,6 +51,7 @@ static phys_addr_t ctxr_base __initdata;
 static phys_addr_t ctxr_size __initdata;
 static bool ctxr_enforce __initdata = true;
 static bool ctxr_active __initdata;
+static bool ctxr_hold_cpus __initdata;
 
 /* Read with the MMU off by cores entering init_kernel_el. */
 u32 ctxr_stay_el2 __section(".mmuoff.data.read");
@@ -116,8 +117,9 @@ static int __init ctxr_exec_enforce_param(char *arg)
 }
 early_param("ctxr_exec_enforce", ctxr_exec_enforce_param);
 
-static bool __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
-				 bool *enforce)
+/* 1 for a window, 0 for none, -EINVAL for one that can't be read. */
+static int __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
+				bool *enforce)
 {
 	unsigned long chosen;
 	const __be32 *prop;
@@ -125,21 +127,26 @@ static bool __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
 
 	chosen = of_get_flat_dt_subnode_by_name(of_get_flat_dt_root(), "chosen");
 	if ((long)chosen < 0)
-		return false;
+		return 0;
 
 	/* <base_hi base_lo size_hi size_lo> */
 	prop = of_get_flat_dt_prop(chosen, "aurora,ctxr-exec-window", &len);
-	if (!prop || len != 4 * sizeof(__be32))
-		return false;
+	if (!prop)
+		return 0;
+	if (len != 4 * sizeof(__be32))
+		return -EINVAL;
 
 	*base = ((u64)be32_to_cpu(prop[0]) << 32) | be32_to_cpu(prop[1]);
 	*size = ((u64)be32_to_cpu(prop[2]) << 32) | be32_to_cpu(prop[3]);
+	if (!*size || !PAGE_ALIGNED(*base) || !PAGE_ALIGNED(*size) ||
+	    *base + *size < *base)
+		return -EINVAL;
 
 	prop = of_get_flat_dt_prop(chosen, "aurora,ctxr-exec-enforce", &len);
 	if (prop && len == sizeof(__be32))
 		*enforce = !!be32_to_cpu(prop[0]);
 
-	return *size != 0;
+	return 1;
 }
 
 static void __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
@@ -237,11 +244,26 @@ void __init ctxr_exec_keep_reserved(void)
 		memblock_reserve(ctxr_base, ctxr_size);
 }
 
+/*
+ * The secondaries are confined to a window this kernel can't use, so they
+ * can't run it. The boot CPU isn't confined and carries on alone.
+ */
+static void __init ctxr_hold_secondaries(const char *why)
+{
+	ctxr_hold_cpus = true;
+	pr_err("%s: keeping the secondary CPUs offline\n", why);
+}
+
+bool __init ctxr_exec_secondaries_held(void)
+{
+	return ctxr_hold_cpus;
+}
+
 void __init ctxr_exec_reserve(void)
 {
 	phys_addr_t base = 0, size = 0;
 	bool enforce = true;
-	bool from_dt = ctxr_parse_dt(&base, &size, &enforce);
+	int dt = ctxr_parse_dt(&base, &size, &enforce);
 
 	if (ctxr_cmd_enforce >= 0)
 		enforce = ctxr_cmd_enforce;
@@ -253,13 +275,14 @@ void __init ctxr_exec_reserve(void)
 		pr_warn("ignoring ctxr_exec_window=\n");
 	}
 
-	if (!from_dt || ctxr_establish(base, size, enforce))
+	if (!dt)
 		return;
-
-	/* The bootloader armed this window, so the kernel can't run outside it. */
-	if (enforce)
-		panic("ctxr-execmem: cannot establish the executable window\n");
-	pr_warn("confinement disabled\n");
+	if (dt < 0)
+		ctxr_hold_secondaries("malformed aurora,ctxr-exec-window");
+	else if (!is_kernel_in_hyp_mode())
+		ctxr_hold_secondaries("window given but the kernel is not at EL2");
+	else if (!ctxr_establish(base, size, enforce))
+		ctxr_hold_secondaries("unusable window");
 }
 
 static void __init ctxr_pool_add_gap(struct gen_pool *pool, phys_addr_t from,
@@ -315,8 +338,7 @@ bool __init ctxr_exec_execmem_setup(void)
 fail_pool:
 	gen_pool_destroy(pool);
 fail:
-	if (ctxr_enforce)
-		panic("ctxr-execmem: cannot build the executable pool\n");
+	ctxr_hold_secondaries("no executable pool");
 	return false;
 }
 

@@ -41,12 +41,16 @@ bool ctxr_exec_efi_runtime_ok(void);
  * arm64_memblock_init() until the end of init.
  */
 bool ctxr_exec_window_reserved(void);
+
+/* True if cores confined to the window can't run this kernel. */
+bool ctxr_exec_secondaries_held(void);
 #else
 static inline void ctxr_exec_reserve(void) {}
 static inline void ctxr_exec_keep_reserved(void) {}
 static inline bool ctxr_exec_execmem_setup(void) { return false; }
 static inline bool ctxr_exec_efi_runtime_ok(void) { return true; }
 static inline bool ctxr_exec_window_reserved(void) { return false; }
+static inline bool ctxr_exec_secondaries_held(void) { return false; }
 #endif
 
 #endif /* __ASM_CTXR_EXECMEM_H */
