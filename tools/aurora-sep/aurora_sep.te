@@ -1,4 +1,4 @@
-policy_module(aurora_sep, 1.1.0)
+policy_module(aurora_sep, 1.1.1)
 
 ########################################
 #
@@ -11,6 +11,14 @@ policy_module(aurora_sep, 1.1.0)
 # the policy no longer knows.
 type aurora_sep_device_t;
 dev_node(aurora_sep_device_t)
+
+# aurora-sep-load, which loads the driver and checks that the enclave seals
+# and unseals a trusted key. It needs what the unconfined service domain gave
+# it, so it stays unconfined; its own domain gives its probe keys their own
+# label.
+type aurora_sep_load_t;
+type aurora_sep_load_exec_t;
+init_daemon_domain(aurora_sep_load_t, aurora_sep_load_exec_t)
 
 ########################################
 #
@@ -38,3 +46,14 @@ optional_policy(`
 	# targeted policy keeps fprintd from reading.
 	dev_read_input(fprintd_t)
 ')
+
+optional_policy(`
+	unconfined_domain(aurora_sep_load_t)
+')
+
+# The probe keys and their session keyring belong to the loader alone. A root
+# process that lists /proc/keys while the probe runs, such as the GDM session
+# worker at an automatic login, is asked for view on each of them: their user
+# view bit lets the check reach SELinux, which denies it, and the listing
+# leaves them out. That denial is the intended result, so do not log it.
+dontaudit domain aurora_sep_load_t:key view;
