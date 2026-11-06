@@ -377,8 +377,9 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	 * Without a USB-C display the bootloader drives HDMI from the main DCP
 	 * (source 0) and never starts DCPEXT0.
 	 */
-	if (dev->of_node == hdmi_np && source == 0) {
-		dev_info(dev, "HDMI is on the main DCP\n");
+	if (dev->of_node == hdmi_np && source != 1) {
+		dev_info(dev, "%s\n", source == 0 ? "HDMI is on the main DCP" :
+			 "no bootloader HDMI link to adopt");
 		return -ENODEV;
 	}
 
