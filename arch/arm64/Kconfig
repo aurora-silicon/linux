@@ -2556,8 +2556,9 @@ config ARM64_CTXR_EXECMEM
 	  A verifier sweeps the kernel page tables and reports (or, when the
 	  window is enforcing, panics on) any executable mapping that escapes.
 
-	  This has no effect unless a window is supplied at boot. If unsure,
-	  say N.
+	  This has no effect unless a window is supplied at boot, so a kernel
+	  for Apple silicon should say Y: the asahi config fragment does. Say N
+	  for other machines.
 
 config CC_HAVE_STACKPROTECTOR_SYSREG
 	def_bool $(cc-option,-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=0)
