@@ -45,6 +45,7 @@ properties:
               - apple,t8132-dart
               - apple,t8140-dart
               - apple,t8142-dart
+              - apple,t8152-dart
           - const: apple,t8110-dart
 
   apple,managed-sids:
