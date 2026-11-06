@@ -3665,11 +3665,24 @@ static int apple_pcie_tunnel_pci_notify(struct notifier_block *nb,
 
 	switch (action) {
 	case BUS_NOTIFY_ADD_DEVICE:
+		/*
+		 * T6050 adopted ports: no ASPM at all. On the J714c the N1 in its ROM
+		 * personality (no firmware yet) takes the SoC down 20-40 s after the link
+		 * first idles into L1; pcie_aspm=off runs clean.
+		 */
+		if (pcie->hw->adopt_link) {
+			if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT)
+				pcie_aspm_remove_cap(pdev, PCI_EXP_LNKCAP_ASPM_L0S |
+						     PCI_EXP_LNKCAP_ASPM_L1);
+			break;
+		}
 		pm_runtime_get_noresume(&pdev->dev);
 		if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT)
 			pcie_aspm_remove_cap(pdev, PCI_EXP_LNKCAP_ASPM_L1);
 		break;
 	case BUS_NOTIFY_DEL_DEVICE:
+		if (pcie->hw->adopt_link)
+			break;
 		pm_runtime_put_noidle(&pdev->dev);
 		break;
 	}
@@ -4112,7 +4125,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	}
 
 	/* Every function is added after this and removed before devres runs. */
-	if (pcie->tunnel_cold_init) {
+	if (pcie->tunnel_cold_init || pcie->hw->adopt_link) {
 		pcie->tunnel_pci_nb.notifier_call = apple_pcie_tunnel_pci_notify;
 		ret = bus_register_notifier(&pci_bus_type, &pcie->tunnel_pci_nb);
 		if (ret)
@@ -4667,6 +4680,48 @@ static void apple_pcie_remove(struct platform_device *pdev)
 	pci_unlock_rescan_remove();
 }
 
+/*
+ * A restart with an adopted port's link alive never reaches m1n1 on the J714c (hard
+ * reset needed). Put each adopted port back the way the boot stage leaves it on a
+ * cold start: bridge decoding off, link to L2, PERST# asserted, port and lane clocks
+ * stopped (the first half of apple_pcie_t6050_reset_root_port, without the restart).
+ */
+static void apple_pcie_shutdown(struct platform_device *pdev)
+{
+	struct pci_host_bridge *bridge = platform_get_drvdata(pdev);
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	struct apple_pcie_port *port;
+	struct pci_dev *rp;
+	u32 value;
+
+	if (!pcie->hw->adopt_link)
+		return;
+	mutex_lock(&pcie->lock);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->perst || !port->base || !port->phy)
+			continue;
+		rp = pci_get_domain_bus_and_slot(pci_domain_nr(bridge->bus), 0,
+						 PCI_DEVFN(port->idx, 0));
+		if (!rp)
+			continue;
+		pci_write_config_word(rp, PCI_COMMAND, 0);
+		if (!pci_read_config_dword(rp, PCI_PRIMARY_BUS, &value))
+			pci_write_config_dword(rp, PCI_PRIMARY_BUS, value & 0xff0000ff);
+		apple_pcie_port_writel(port, apple_pcie_port_readl(port, PORT_APPCLK) | 0x100,
+				       PORT_APPCLK);
+		apple_pcie_port_writel(port, 0x11, 0x88);
+		apple_pcie_t6050_wait(port, port->base, 0x88, 1, 0, 500000);
+		apple_pcie_t6050_wait(port, port->base, PORT_LINKSTS, BIT(6), BIT(6), 500000);
+		WRITE_ONCE(port->link_failed, true);
+		apple_pcie_t6050_perst(port, true);
+		writel(readl(port->phy) & ~BIT(31), port->phy);
+		apple_pcie_t6050_port_disable(port, rp);
+		dev_info(pcie->dev, "port %d held for the restart\n", port->idx);
+		pci_dev_put(rp);
+	}
+	mutex_unlock(&pcie->lock);
+}
+
 static int apple_pcie_mark_power_lost(struct pci_dev *pdev, void *unused)
 {
 	/*
@@ -5097,6 +5152,7 @@ MODULE_DEVICE_TABLE(of, apple_pcie_of_match);
 static struct platform_driver apple_pcie_driver = {
 	.probe	= apple_pcie_probe,
 	.remove	= apple_pcie_remove,
+	.shutdown = apple_pcie_shutdown,
 	.driver	= {
 		.name			= "pcie-apple",
 		.of_match_table		= apple_pcie_of_match,
