@@ -481,6 +481,63 @@ impl AsahiPlatformDriver {
     }
 }
 
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+impl AsahiPlatformDriver {
+    /// Probe the M6 GPU through the G18 backend.
+    ///
+    /// The parameter gate refuses before any MMIO, DMA, mailbox or processor access. A
+    /// diagnostic bring-up stage retains its firmware owner without a DRM device; the
+    /// application stage registers the render node over the started session.
+    pub(crate) fn probe_g18<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        soc: &'static hw::t8152::SocConfig,
+    ) -> Result<crate::g18::probe::G18Bound<'bound>> {
+        crate::g18::probe::admit_t8152(pdev)?;
+        let resources = regs::Resources::new(pdev)?;
+        let drm = drm::UnregisteredDevice::<AsahiDrmDriver>::new(pdev, Ok(()))?;
+        // SAFETY: The G18 adapter closes the binding in unbind before devres; probe errors
+        // drop this local owner while the bound callback is live.
+        let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
+        let started = crate::g18::probe::probe_t8152(pdev, &drm, soc)?;
+        let Some(gpu) = started.gpu else {
+            return Ok(crate::g18::probe::G18Bound {
+                runtime: started.runtime,
+                binding: Some(binding),
+                driver: None,
+            });
+        };
+        let data = try_pin_init!(AsahiDrmRegistrationData { gpu, resources });
+        // SAFETY: `reg` is stored in `AsahiPlatformDriverData` and dropped when the driver is
+        // unbound; it is never forgotten.
+        let reg = match unsafe { drm::Registration::new(pdev.as_ref(), drm, data, 0) } {
+            Ok(reg) => reg,
+            Err(error) => {
+                started.runtime.shutdown();
+                return Err(error);
+            }
+        };
+        dev_info!(
+            pdev.as_ref(),
+            "G18_DRM registered render node (aurora, apple,agx-t8152)\n"
+        );
+        Ok(crate::g18::probe::G18Bound {
+            runtime: started.runtime,
+            binding: None,
+            driver: Some(AsahiPlatformDriverData {
+                binding,
+                _device: reg.device().into(),
+                _reg: reg,
+                g17: None,
+                #[cfg(CONFIG_DRM_ASAHI_G16)]
+                g16: None,
+                raw_dev: core::ptr::null_mut(),
+                raw_stats: core::ptr::null_mut(),
+                stats: None,
+            }),
+        })
+    }
+}
+
 impl AsahiPlatformDriverData<'_> {
     pub(crate) fn close_binding(&self) {
         self.binding.close();
