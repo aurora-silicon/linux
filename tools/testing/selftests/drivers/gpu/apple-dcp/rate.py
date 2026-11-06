@@ -45,7 +45,8 @@ def parser_fixture(root):
     source = (base / 'parser.c').read_text()
     parser = source[source.index('#define DCP_PARSE_HEADER'):source.index('int parse_epic_service_init(')]
     metadata = (base / 'dcp-display-metadata.h').read_text()
-    metadata = block(metadata, 'struct dcp_display_metadata {') + ';\n'
+    metadata = (block(metadata, 'struct dcp_display_metadata {') + ';\n' +
+                block(metadata, 'struct dcp_color_space {') + ';\n')
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')

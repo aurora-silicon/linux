@@ -417,7 +417,7 @@ def panel_identity(root, output=None):
 struct apple_dcp {
     int fw_compat;bool has_panel;struct {bool lock;} metadata;
     struct {struct dcp_display_metadata panel_metadata, panel_adt_identity;u64 panel_metadata_generation;bool panel_metadata_valid;u8 panel_raw_edid[4096];size_t panel_raw_edid_size;} *desktop;
-    struct {u32 width_mm,height_mm,peak_nits;} panel;void *connector;
+    struct {u32 width_mm,height_mm,peak_nits;const struct dcp_color_space *color_target;} panel;void *connector;
 };
 static unsigned notifications;
 static bool dcp_has_panel(struct apple_dcp *d) {return d->has_panel;}
@@ -560,7 +560,7 @@ int main(int argc, char **argv)
     /* Another firmware/profile cannot publish a desktop panel identity. */
     desktop=(__typeof__(desktop)){0};d.fw_compat=2;dcp_panel_metadata_replace(&d,&metadata);
     assert(!desktop.panel_metadata_valid);
-    metadata.manufacturer[0]='?';assert(IS_ERR(dcp_panel_edid(&metadata,modes,3,345,223)));
+    metadata.manufacturer[0]='?';assert(IS_ERR(dcp_panel_edid(&metadata,NULL,modes,3,345,223)));
     return 0;
 }
 '''
