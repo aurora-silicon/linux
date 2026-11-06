@@ -595,16 +595,6 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
 						ADDR_INDIRECT);
 }
 
-/**
- * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
- *
- * @wiphy: wiphy device of new interface.
- * @name: name of the new interface.
- * @params: contains mac address for AP or STA device.
- * @type: interface type.
- *
- * Return: pointer to new vif on success, ERR_PTR(-errno) if not
- */
 static void brcmf_awdl_cleanup_locked(struct brcmf_cfg80211_info *cfg)
 {
 	struct brcmf_cfg80211_vif *vif;
@@ -866,6 +856,16 @@ int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
 	return err;
 }
 
+/**
+ * brcmf_apsta_add_vif() - create a new AP or STA virtual interface
+ *
+ * @wiphy: wiphy device of new interface.
+ * @name: name of the new interface.
+ * @params: contains mac address for AP or STA device.
+ * @type: interface type.
+ *
+ * Return: pointer to new vif on success, ERR_PTR(-errno) if not
+ */
 static
 struct wireless_dev *brcmf_apsta_add_vif(struct wiphy *wiphy, const char *name,
 					 struct vif_params *params,
@@ -4377,6 +4377,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			brcmf_configure_arp_nd_offload(ifp, true);
 		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
 				      cfg->wowl.pre_pmmode);
+		brcmf_bus_wowl_config(cfg->pub->bus_if, false);
 		cfg->wowl.active = false;
 		if (cfg->wowl.nd_enabled) {
 			brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
@@ -4389,20 +4390,38 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 	return 0;
 }
 
-static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
-				 struct brcmf_if *ifp,
-				 struct cfg80211_wowlan *wowl)
+static int brcmf_keepalive_start(struct brcmf_if *ifp,
+				 unsigned int interval);
+
+static int brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
+				struct brcmf_if *ifp,
+				struct cfg80211_wowlan *wowl)
 {
+	struct brcmf_pub *drvr = cfg->pub;
 	u32 wowl_config;
 	struct brcmf_wowl_wakeind_le wowl_wakeind;
+	bool arp_nd_disabled = false;
+	bool pm_saved = false;
+	int err;
 	u32 i;
 
 	brcmf_dbg(TRACE, "Suspend, wowl config.\n");
 
-	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ARP_ND))
-		brcmf_configure_arp_nd_offload(ifp, false);
-	brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM, &cfg->wowl.pre_pmmode);
-	brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_MAX);
+	if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ARP_ND)) {
+		err = brcmf_configure_arp_nd_offload(ifp, false);
+		if (err)
+			goto fail;
+		arp_nd_disabled = true;
+	}
+
+	err = brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM,
+					&cfg->wowl.pre_pmmode);
+	if (err)
+		goto fail;
+	pm_saved = true;
+	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_MAX);
+	if (err)
+		goto fail;
 
 	wowl_config = 0;
 	if (wowl->disconnect)
@@ -4412,24 +4431,34 @@ static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
 	if ((wowl->patterns) && (wowl->n_patterns)) {
 		wowl_config |= BRCMF_WOWL_NET;
 		for (i = 0; i < wowl->n_patterns; i++) {
-			brcmf_config_wowl_pattern(ifp, "add",
+			err = brcmf_config_wowl_pattern(ifp, "add",
 				(u8 *)wowl->patterns[i].pattern,
 				wowl->patterns[i].pattern_len,
 				(u8 *)wowl->patterns[i].mask,
 				wowl->patterns[i].pkt_offset);
+			if (err)
+				goto fail;
 		}
 	}
 	if (wowl->nd_config) {
-		brcmf_cfg80211_sched_scan_start(cfg->wiphy, ifp->ndev,
-						wowl->nd_config);
+		err = brcmf_cfg80211_sched_scan_start(cfg->wiphy, ifp->ndev,
+						       wowl->nd_config);
+		if (err)
+			goto fail;
 		wowl_config |= BRCMF_WOWL_PFN_FOUND;
 
 		cfg->wowl.nd_data_completed = false;
-		cfg->wowl.nd_enabled = true;
 		/* Now reroute the event for PFN to the wowl function. */
 		brcmf_fweh_unregister(cfg->pub, BRCMF_E_PFN_NET_FOUND);
-		brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
-				    brcmf_wowl_nd_results);
+		err = brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
+					  brcmf_wowl_nd_results);
+		if (err) {
+			brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
+					    brcmf_notify_sched_scan_results);
+			brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
+			goto fail;
+		}
+		cfg->wowl.nd_enabled = true;
 	}
 	if (wowl->gtk_rekey_failure)
 		wowl_config |= BRCMF_WOWL_GTK_FAILURE;
@@ -4437,12 +4466,47 @@ static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
 		wowl_config |= BRCMF_WOWL_UNASSOC;
 
 	memcpy(&wowl_wakeind, "clear", 6);
-	brcmf_fil_iovar_data_set(ifp, "wowl_wakeind", &wowl_wakeind,
-				 sizeof(wowl_wakeind));
-	brcmf_fil_iovar_int_set(ifp, "wowl", wowl_config);
-	brcmf_fil_iovar_int_set(ifp, "wowl_activate", 1);
+	err = brcmf_fil_iovar_data_set(ifp, "wowl_wakeind", &wowl_wakeind,
+				       sizeof(wowl_wakeind));
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_set(ifp, "wowl", wowl_config);
+	if (err)
+		goto fail;
+	err = brcmf_fil_iovar_int_set(ifp, "wowl_activate", 1);
+	if (err)
+		goto fail;
+	err = brcmf_keepalive_start(ifp, 30);
+	if (err)
+		goto fail;
 	brcmf_bus_wowl_config(cfg->pub->bus_if, true);
 	cfg->wowl.active = true;
+	return 0;
+
+fail:
+	/* Undo partial setup before asking cfg80211 to take its normal
+	 * disconnect path. Rollback is best effort; the setup error is the
+	 * reason retention was refused.
+	 */
+	brcmf_bus_wowl_config(cfg->pub->bus_if, false);
+	brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
+	brcmf_config_wowl_pattern(ifp, "clr", NULL, 0, NULL, 0);
+	if (cfg->wowl.nd_enabled) {
+		brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
+		brcmf_fweh_unregister(cfg->pub, BRCMF_E_PFN_NET_FOUND);
+		brcmf_fweh_register(cfg->pub, BRCMF_E_PFN_NET_FOUND,
+				    brcmf_notify_sched_scan_results);
+		cfg->wowl.nd_enabled = false;
+	}
+	if (pm_saved)
+		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+				      cfg->wowl.pre_pmmode);
+	if (arp_nd_disabled)
+		brcmf_configure_arp_nd_offload(ifp, true);
+	cfg->wowl.active = false;
+	bphy_err(drvr, "WoWLAN setup failed (%d), using disconnect fallback\n",
+		 err);
+	return err;
 }
 
 static int brcmf_keepalive_start(struct brcmf_if *ifp, unsigned int interval)
@@ -4470,6 +4534,7 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	struct net_device *ndev = cfg_to_ndev(cfg);
 	struct brcmf_if *ifp = netdev_priv(ndev);
 	struct brcmf_cfg80211_vif *vif;
+	int err;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
@@ -4508,10 +4573,11 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 
 	} else {
 		/* Configure WOWL parameters */
-		brcmf_configure_wowl(cfg, ifp, wowl);
-
-		/* Prevent disassociation due to inactivity with keep-alive */
-		brcmf_keepalive_start(ifp, 30);
+		err = brcmf_configure_wowl(cfg, ifp, wowl);
+		if (err) {
+			cfg->scan_status = 0;
+			return 1;
+		}
 	}
 
 exit:
