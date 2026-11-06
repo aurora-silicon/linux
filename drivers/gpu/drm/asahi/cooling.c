@@ -46,10 +46,6 @@ static int asahi_gpu_publish_cap(void *context, unsigned int mw)
 	 */
 	WRITE_ONCE(*words->ppm_target_mw, ppm);
 	WRITE_ONCE(*words->ppm_enabled, 1);
-	if (words->ppm_writeback) {
-		clean_word(words->ppm_target_mw);
-		clean_word(words->ppm_enabled);
-	}
 	WRITE_ONCE(*words->max_power_mw, mw);
 	clean_word(words->max_power_mw);
 	wmb();

@@ -167,7 +167,7 @@ pub(super) struct InitData {
     cluster: usize,
     bundle: usize,
     region_c: usize,
-    power_state: Option<(usize, usize, bool)>,
+    power_state: Option<(usize, usize)>,
     qos: usize,
     pb: usize,
     page_pool: usize,
@@ -1199,7 +1199,6 @@ impl InitData {
         self.power_state = Some((
             self.cluster,
             abi::private::STATUS_B + abi::PrimaryStatusB::POWER_STATE,
-            true,
         ));
         let fwctl_va = self.object(tables.fwctl)?.gpu_va();
         self.object_mut(self.cluster)?
@@ -1372,7 +1371,7 @@ impl InitData {
     ) -> Result<super::cooling::PowerWords> {
         let super::cooling::Layout::Common = layout;
         let region = self.object(self.region_c)?;
-        let (index, offset, ppm_writeback) = self.power_state.ok_or(EOPNOTSUPP)?;
+        let (index, offset) = self.power_state.ok_or(EOPNOTSUPP)?;
         let power = self.object(index)?;
         Ok(super::cooling::PowerWords {
             max_power_mw: region
@@ -1384,7 +1383,6 @@ impl InitData {
             ppm_target_mw: power
                 .pointer(offset + core::mem::offset_of!(abi::PowerState, ppm_target_mw), 4)?
                 .cast(),
-            ppm_writeback,
         })
     }
 

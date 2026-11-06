@@ -7,13 +7,12 @@ struct device;
 struct asahi_gpu_cooling;
 
 /* Separate typed fields, retained until unregister drains every callback.
- * RegionC is WB; PowerState may be WC (25G83) or WB (G17P).
+ * RegionC is WB; both admitted PowerState mappings are WC.
  */
 struct asahi_gpu_power_words {
 	u32 *max_power_mw;
 	u32 *ppm_enabled;
 	u32 *ppm_target_mw;
-	bool ppm_writeback;
 };
 struct asahi_gpu_cooling *asahi_gpu_cooling_register(struct device *dev,
 					const struct asahi_gpu_power_words *words);

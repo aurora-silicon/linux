@@ -104,7 +104,7 @@ impl InitData {
             false => self.object(objects.aon)?.gpu_va(),
         };
         let power_state_va = self.object(objects.power_state)?.gpu_va();
-        self.power_state = Some((objects.power_state, 0, false));
+        self.power_state = Some((objects.power_state, 0));
         let firmware_area_va = self.object(objects.firmware_area)?.gpu_va();
         let firmware_area_2_va = match objects.firmware_area_2 {
             Some(index) => self.object(index)?.gpu_va(),
