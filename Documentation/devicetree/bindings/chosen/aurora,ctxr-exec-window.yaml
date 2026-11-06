@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/chosen/aurora,ctxr-exec-window.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Executable window for a kernel running behind a CTXR
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+
+description:
+  On Apple silicon from the M4 generation on, the boot firmware arms a code
+  text execute range on the secondary CPUs, so privileged code there can only
+  be fetched from one physical window. The bootloader tells the kernel where
+  that window is, and the kernel keeps all of its executable code inside it.
+  See Documentation/arch/arm64/ctxr-execmem.rst.
+
+select:
+  properties:
+    $nodename:
+      const: chosen
+  required:
+    - $nodename
+
+properties:
+  $nodename:
+    const: chosen
+
+  aurora,ctxr-exec-window:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    description: The physical window the kernel's executable code has to stay in.
+    items:
+      - description:
+          Physical base of the window. Zero tells the kernel to anchor the
+          window on its own image.
+      - description: Size of the window in bytes.
+
+  aurora,ctxr-exec-enforce:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description:
+      One if code outside the window is fatal, zero if the kernel only reports
+      it. A window with no such property is enforcing.
+
+dependentRequired:
+  aurora,ctxr-exec-enforce: [ aurora,ctxr-exec-window ]
+
+additionalProperties: true
+...
