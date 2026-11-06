@@ -139,6 +139,14 @@ mod lockout_tests {
     }
 
     #[test]
+    fn match_cancel_is_empty() {
+        let op = sbio_match_cancel();
+        assert_eq!(op.opcode(), 0x0b);
+        assert_eq!(op.payload().len(), 0);
+        assert_eq!(sbio_match_policy().opcode(), 0x1f);
+    }
+
+    #[test]
     fn protected_config_unlock_words() {
         let mut raw = [0u8; SBIO_PROTECTED_CONFIG_LEN];
         raw[0..4].copy_from_slice(&1i32.to_le_bytes());
@@ -2007,6 +2015,17 @@ impl SepData {
         *self.match_context.lock() = Some(evaluation);
 
         let mut outcome = self.verify_one_image();
+        // The logical match operation ends with this verify: stop the enclave's
+        // match mode, as macOS does when its match operation ends.
+        match self.sbio_call(&crate::sbio::sbio_match_cancel()) {
+            SbioOutcome::Ok(_) => dev_info!(self.dev, "verify: match operation ended (MATCH_CANCEL)\n"),
+            _ => {
+                dev_err!(self.dev, "verify: MATCH_CANCEL failed; not reporting this verify as a match\n");
+                if matches!(outcome, bio::VerifyOutcome::Matched(_)) {
+                    outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                }
+            }
+        }
         if matches!(outcome, bio::VerifyOutcome::Matched(_))
             && !self.complete_unlock_evaluation(&evaluation, user)
         {
@@ -2218,6 +2237,15 @@ impl SepData {
             MatchStep::LockedOut => return self.enter_lockout(),
             MatchStep::Refused => return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
         };
+        // macOS reads the match policy after every answered result, before
+        // the image cleanup; neither a match nor a no-match counts without it.
+        match self.sbio_call(&crate::sbio::sbio_match_policy()) {
+            SbioOutcome::Ok(policy) if policy.len() == crate::sbio::SBIO_MATCH_POLICY_LEN => {}
+            _ => {
+                dev_err!(self.dev, "verify: MATCH_POLICY after the match result failed\n");
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+            }
+        }
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
             dev_err!(
                 self.dev,
@@ -5954,6 +5982,17 @@ impl MatchResult {
 
     pub(crate) fn matches(&self, user: UserId) -> bool {
         self.user_id == user.value()
+    }
+}
+
+const OP_SBIO_MATCH_CANCEL: u16 = 0x0b;
+/// Ends the enclave's match mode when a match operation ends. Empty.
+pub(crate) fn sbio_match_cancel() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_MATCH_CANCEL,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"MATCH_CANCEL",
     }
 }
 
