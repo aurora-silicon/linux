@@ -30,6 +30,11 @@ properties:
       - items:
           - const: apple,t8112-display-crossbar
           - const: apple,t8103-display-crossbar
+      - items:
+          - enum:
+              - apple,t6030-display-crossbar
+              - apple,t8122-display-crossbar
+          - const: apple,t6020-display-crossbar
 
   reg:
     maxItems: 1
