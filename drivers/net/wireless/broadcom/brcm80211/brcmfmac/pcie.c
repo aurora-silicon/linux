@@ -2958,7 +2958,18 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bus->ops = &brcmf_pcie_bus_ops;
 	bus->proto_type = BRCMF_PROTO_MSGBUF;
 	bus->chip = devinfo->coreid;
-	bus->wowl_supported = pci_pme_capable(pdev, PCI_D3hot);
+	bus->wowl_transport = true;
+	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
+	/* Apple Arm systems route the WLAN wake signal independently of the
+	 * endpoint's standard D3hot PME capability. Restrict that public
+	 * platform quirk to the chips used by the affected machines; firmware
+	 * WoWLAN support is probed separately before anything is advertised.
+	 */
+	if (!bus->wowl_wake &&
+	    of_machine_is_compatible("apple,arm-platform") &&
+	    (pdev->device == BRCM_PCIE_4378_DEVICE_ID ||
+	     pdev->device == BRCM_PCIE_4387_DEVICE_ID))
+		bus->wowl_wake = true;
 	bus->fwvid = drvdata[id->driver_data].vendor;
 	devinfo->fwseed = drvdata[id->driver_data].fw_seed;
 	dev_set_drvdata(&pdev->dev, bus);
