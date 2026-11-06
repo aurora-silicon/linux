@@ -600,7 +600,9 @@ def powerlog_framing(root):
 #define __le64 u64
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 enum epic_subtype { REPORT = 0xc0 };
-struct apple_dcp {void *dev;int fw_compat;struct {int iomfb_method_profile;} hw;struct {u32 nits;} brightness;};
+struct work_struct { unsigned scheduled; };
+static void __attribute__((unused)) schedule_work(struct work_struct *w) { w->scheduled++; }
+struct apple_dcp {void *dev;int fw_compat;struct {int iomfb_method_profile;} hw;struct {u32 nits,maximum;void *bl_dev;} brightness;struct work_struct bl_register_wq;};
 struct apple_epic_service;
 struct apple_dcp_afkep {struct apple_dcp *dcp;unsigned endpoint;struct apple_epic_service *service;};
 struct apple_epic_service_ops {int (*report)(struct apple_epic_service *,enum epic_subtype,const void *,size_t);};
