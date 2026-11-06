@@ -348,7 +348,7 @@ static const struct drm_connector_funcs dcpib_connector_funcs = {
 };
 
 static int dcpib_plane_atomic_check(struct drm_plane *plane,
-				    struct drm_atomic_state *state)
+				    struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *crtc_state = NULL;
@@ -438,7 +438,7 @@ static enum hrtimer_restart dcpib_swap_timer(struct hrtimer *t)
  * commit itself never waits, so a client's next frame is not held up.
  */
 static void dcpib_plane_atomic_update(struct drm_plane *plane,
-				      struct drm_atomic_state *state)
+				      struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
 	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
@@ -529,7 +529,7 @@ static const struct drm_plane_funcs dcpib_plane_funcs = {
 };
 
 static int dcpib_crtc_atomic_check(struct drm_crtc *crtc,
-				   struct drm_atomic_state *state)
+				   struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
 	struct dcpib *dcp = to_dcpib(crtc->dev);
@@ -643,7 +643,7 @@ void dcpib_av_started(struct dcpib *dcp)
 }
 
 static void dcpib_crtc_atomic_enable(struct drm_crtc *crtc,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
 	struct dcpib *dcp = to_dcpib(crtc->dev);
@@ -698,7 +698,7 @@ out:
 }
 
 static void dcpib_crtc_atomic_disable(struct drm_crtc *crtc,
-				      struct drm_atomic_state *state)
+				      struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(state, crtc);
 	struct dcpib *dcp = to_dcpib(crtc->dev);
