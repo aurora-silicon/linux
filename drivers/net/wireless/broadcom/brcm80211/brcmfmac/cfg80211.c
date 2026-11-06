@@ -2001,6 +2001,9 @@ brcmf_set_wsec_mode(struct net_device *ndev,
 			break;
 		case WLAN_CIPHER_SUITE_CCMP:
 			pval = AES_ENABLED;
+			/* SAE offload builds its own RSNE; select CCMP explicitly. */
+			algos = KEY_ALGO_MASK(CRYPTO_ALGO_AES_CCM);
+			mask = algos | KEY_ALGO_MASK(CRYPTO_ALGO_AES_GCM256);
 			break;
 		case WLAN_CIPHER_SUITE_AES_CMAC:
 			pval = AES_ENABLED;
