@@ -11,6 +11,7 @@ use crate::g17::{
     object::{Allocator, KernelObject, Pool},
     queue::render::{Pair, RenderAddresses},
 };
+use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
 
 struct BuildResources {
@@ -737,7 +738,13 @@ impl super::super::Backend {
             if packet.cancel_requested() || firmware.queues.render.entry(slot)?.closed {
                 return Err(ECANCELED);
             }
-            firmware.publish_render(self.owner, slot, packet, deferred)
+            firmware.publish_render(
+                self.owner,
+                slot,
+                packet,
+                self.backlog.load(Ordering::Acquire) > 1,
+                deferred,
+            )
         })();
         let result = (|| {
             if published.is_err() && !packet.is_published() {

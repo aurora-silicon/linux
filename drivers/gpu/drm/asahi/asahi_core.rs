@@ -235,5 +235,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g16_test_burst_publication: u32 {
+            default: 0,
+            description: "G16 TEST ONLY: publication arm (0=A; 2/4/8=B1 count-one; 102/104/108=B2 count-N)",
+        },
     },
 }

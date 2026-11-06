@@ -1161,6 +1161,10 @@ impl Backend {
                     self.shared.variant.pointers,
                     self.shared.operand_state,
                     self.shared.variant.compute,
+                    matches!(
+                        self.shared.variant.graph,
+                        super::fw::variant::InitGraph::V25G83
+                    ),
                 )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
@@ -1464,18 +1468,20 @@ impl compute::Host for DirectHost<'_> {
 impl super::Firmware {
     #[inline]
     fn publish_compute(&mut self, owner: u64, packet: Arc<super::job::Packet>,
-        dependencies: &[super::fw::kick::KickDependency], deferred: &mut DeferredBatch) -> Result
+        dependencies: &[super::fw::kick::KickDependency], more: bool,
+        deferred: &mut DeferredBatch) -> Result
     {
         if packet.completion.sources().is_some() {
-            self.publish_compute_inputs(owner, packet, dependencies, deferred)
+            self.publish_compute_inputs(owner, packet, dependencies, more, deferred)
         } else {
-            self.publish_compute_raw(owner, packet, dependencies, &[], deferred)
+            self.publish_compute_raw(owner, packet, dependencies, &[], more, deferred)
         }
     }
 
     #[inline(never)]
     fn publish_compute_inputs(&mut self, owner: u64, packet: Arc<super::job::Packet>,
-        dependencies: &[super::fw::kick::KickDependency], deferred: &mut DeferredBatch) -> Result
+        dependencies: &[super::fw::kick::KickDependency], more: bool,
+        deferred: &mut DeferredBatch) -> Result
     {
         if self.recovery.pending() || super::recovery::Memory::recovery_state(&self.init)? != 0 {
             return Err(EAGAIN);
@@ -1512,7 +1518,7 @@ impl super::Firmware {
             holds.push(hold, GFP_KERNEL)?;
         }
         let result = self.publish_compute_raw(owner, packet.clone(), merged.as_slice(),
-            native.as_slice(), deferred);
+            native.as_slice(), more, deferred);
         if packet.is_published() {
             for queue in self.queues.compute.iter().flatten()
                 .filter_map(|entry| entry.queue.as_deref())
@@ -1533,6 +1539,7 @@ impl super::Firmware {
         packet: Arc<super::job::Packet>,
         dependencies: &[super::fw::kick::KickDependency],
         native: &[super::sync_input::NativeWait],
+        more: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
         if self.recovery.pending() {
@@ -1567,9 +1574,9 @@ impl super::Firmware {
             generation: self.recovery.generation(),
         };
         if native.is_empty() {
-            queue.publish(packet, dependencies, &mut host, &mut |event| deferred.push(event))
+            queue.publish(packet, dependencies, more, &mut host, &mut |event| deferred.push(event))
         } else {
-            queue.publish_with_native_waits(packet, dependencies, native,
+            queue.publish_with_native_waits(packet, dependencies, native, more,
                 &mut host, &mut |event| deferred.push(event))
         }
     }
@@ -1821,7 +1828,8 @@ impl Backend {
             outer: Some(outer),
             generation: port.generation(),
         };
-        match queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)) {
+        let more = self.compute_backlog.load(Ordering::Acquire) > 1;
+        match queue.publish(packet.clone(), &[], more, &mut host, &mut |event| deferred.push(event)) {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
             result => Some(result),
         }
@@ -2032,7 +2040,14 @@ impl Backend {
             return Err(render::FALLBACK);
         }
         let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
-        match firmware.publish_compute(self.owner, packet.clone(), dependencies.as_slice(), deferred) {
+        let more = self.compute_backlog.load(Ordering::Acquire) > 1;
+        match firmware.publish_compute(
+            self.owner,
+            packet.clone(),
+            dependencies.as_slice(),
+            more,
+            deferred,
+        ) {
             Err(error) if (error == EBUSY || error == EAGAIN) && !packet.is_published() => {
                 Err(render::FALLBACK)
             }
@@ -2169,6 +2184,7 @@ impl Backend {
                 self.owner,
                 packet.clone(),
                 dependencies.as_slice(),
+                self.compute_backlog.load(Ordering::Acquire) > 1,
                 deferred,
             );
             if !packet.is_published()

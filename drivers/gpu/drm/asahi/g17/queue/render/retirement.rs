@@ -39,7 +39,7 @@ pub(crate) struct Window {
 
 impl Window {
     pub(crate) fn new(base: u32, count: u32, capacity: u32) -> Result<Self> {
-        if base >= capacity || !(2..=MAX_GROUP_ITEMS).contains(&count) || count >= capacity {
+        if base >= capacity || !(1..=MAX_GROUP_ITEMS).contains(&count) || count >= capacity {
             return Err(EINVAL);
         }
         Ok(Self {
@@ -444,6 +444,12 @@ impl<T> Tracker<T> {
 #[kunit_tests(asahi_g17_render_retirement)]
 mod executed_tests {
     use super::*;
+
+    #[test]
+    fn count_n_intermediate_descriptor_has_a_one_item_window() {
+        let window = Window::new(17, 1, crate::g17::fw::queue::ITEM_RING_ENTRIES).unwrap();
+        assert_eq!(window.target(), 18);
+    }
 
     fn snapshot(done: u32, write: u32, pass: [u64; 2]) -> Snapshot {
         Snapshot {

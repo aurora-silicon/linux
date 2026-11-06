@@ -253,6 +253,10 @@ impl ParkedPair {
             executed: self.executed,
             switch: None,
             published_completions: None,
+            publication_burst: super::super::publication_burst::State::configured(matches!(
+                self.variant.graph,
+                crate::g17::fw::variant::InitGraph::V25G83
+            )),
         }))
     }
 }

@@ -20,6 +20,13 @@ void asahi_g17_trace_publish(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 				__arch_counter_get_cntvct());
 }
 
+void asahi_g17_trace_burst(u8 engine, u8 qid, u16 count, bool notify)
+{
+	if (trace_asahi_g17_burst_enabled())
+		trace_asahi_g17_burst(engine, qid, count, notify,
+				      __arch_counter_get_cntvct());
+}
+
 void asahi_g17_trace_complete(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 			      u64 gpu_start, u64 gpu_end)
 {

@@ -657,6 +657,7 @@ impl crate::g17::Firmware {
         owner: u64,
         slot: u8,
         packet: &Arc<Packet>,
+        more: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
         use crate::g17::queue::render::PublicationLease;
@@ -717,6 +718,7 @@ impl crate::g17::Firmware {
                 packet.clone(),
                 &dependencies,
                 lease,
+                more,
                 host,
                 &mut |event| deferred.push(event),
             )

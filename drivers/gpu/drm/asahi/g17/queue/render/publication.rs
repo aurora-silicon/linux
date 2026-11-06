@@ -34,9 +34,10 @@ pub(super) struct Lane<'a> {
     config: QueueConfig,
     config_destination: *mut u64,
     config_present: bool,
-    announce: KickAnnounce,
+    announce: Option<KickAnnounce>,
     announce_destination: *mut KickAnnounce,
     prefix: usize,
+    items_count: usize,
     prefix_end: u32,
     pub(super) window: Window,
 }
@@ -53,9 +54,10 @@ impl<'a> Lane<'a> {
         config: QueueConfig,
         present: bool,
         timestamp: KickTimestamp,
+        announce_count: Option<u16>,
         lead: bool,
     ) -> Result<Self> {
-        let count = 2 + u32::from(present) + u32::from(lead);
+        let count = 1 + u32::from(present) + u32::from(lead) + u32::from(announce_count.is_some());
         let window = Window::new(base, count, ITEM_RING_ENTRIES)?;
         let offset = ordinal as usize % memory::RECORDS;
         let config_offset = memory::CONFIG[stage] + offset * memory::CONFIG_STRIDE;
@@ -95,7 +97,9 @@ impl<'a> Lane<'a> {
         if present {
             push(graph.config.gpu_va() + config_offset as u64);
         }
-        push(announce_va);
+        if announce_count.is_some() {
+            push(announce_va);
+        }
         Ok(Self {
             items,
             producer: graph
@@ -105,19 +109,34 @@ impl<'a> Lane<'a> {
             config,
             config_destination,
             config_present: present,
-            announce: KickAnnounce::new(
-                config.qid.try_into()?,
-                if stage == 0 {
-                    DataMaster::Tiling
-                } else {
-                    DataMaster::Fragment
-                },
-                timestamp,
-                config.priority as u8,
-            )?,
+            announce: announce_count
+                .map(|count| {
+                    KickAnnounce::new_count(
+                        config.qid.try_into()?,
+                        if stage == 0 {
+                            DataMaster::Tiling
+                        } else {
+                            DataMaster::Fragment
+                        },
+                        timestamp,
+                        config.priority as u8,
+                        count,
+                    )
+                })
+                .transpose()?,
             announce_destination,
-            prefix: count as usize - 1,
-            prefix_end: (base + count - 1) % ITEM_RING_ENTRIES,
+            prefix: if announce_count.is_some() {
+                count as usize - 1
+            } else {
+                0
+            },
+            items_count: count as usize,
+            prefix_end: (base
+                + if announce_count.is_some() {
+                    count - 1
+                } else {
+                    0
+                }) % ITEM_RING_ENTRIES,
             window,
         })
     }
@@ -143,10 +162,13 @@ impl<'a> Lane<'a> {
         }
     }
     fn announce(&self) {
+        let Some(announce) = self.announce else {
+            return;
+        };
         // SAFETY: The full record is inside the retained queue graph and is
         // exclusively owned by this ordinal. Publication follows its copy.
         unsafe {
-            self.announce_destination.write_unaligned(self.announce);
+            self.announce_destination.write_unaligned(announce);
         }
     }
     pub(super) fn publish_prefix(&self) {
@@ -157,7 +179,7 @@ impl<'a> Lane<'a> {
     }
     pub(super) fn publish_kick(&self) {
         self.announce();
-        self.items(self.prefix..self.prefix + 1);
+        self.items(self.prefix..self.items_count);
         fence(Ordering::SeqCst);
         self.producer.store(self.window.target(), Ordering::Relaxed);
     }
@@ -168,7 +190,7 @@ impl<'a> Lane<'a> {
         inner: &AtomicU32,
         next_inner: u32,
     ) {
-        self.items(0..self.prefix + 1);
+        self.items(0..self.items_count);
         self.config();
         self.announce();
         fence(Ordering::SeqCst);

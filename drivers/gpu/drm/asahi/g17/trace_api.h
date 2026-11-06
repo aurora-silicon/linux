@@ -13,6 +13,7 @@ struct dma_fence;
 bool asahi_g17_trace_publish_enabled(void);
 void asahi_g17_trace_publish(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 			     struct dma_fence *fence);
+void asahi_g17_trace_burst(u8 engine, u8 qid, u16 count, bool notify);
 void asahi_g17_trace_complete(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 			      u64 gpu_start, u64 gpu_end);
 void asahi_g17_trace_bind(u8 engine, u8 qid, u32 ctx, u8 kind);

@@ -604,6 +604,7 @@ pub(crate) struct Queue {
     retirement_proved: bool,
     source_readers: Arc<core::sync::atomic::AtomicU32>,
     source_hint: crate::g17::sync_input::ReaderHint,
+    publication_burst: super::publication_burst::State,
 }
 
 impl Queue {
@@ -618,6 +619,7 @@ impl Queue {
         pointers: PointerLayout,
         operand_state: &'static OperandState,
         program: ComputeProgram,
+        v25g83: bool,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, program)?;
@@ -674,6 +676,7 @@ impl Queue {
             retirement_proved: false,
             source_readers: Arc::new(core::sync::atomic::AtomicU32::new(0), GFP_KERNEL)?,
             source_hint: crate::g17::sync_input::ReaderHint::new(),
+            publication_burst: super::publication_burst::State::configured(v25g83),
         })
     }
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
@@ -1828,6 +1831,7 @@ impl Queue {
         if !self.can_rearm() {
             return Err(EAGAIN);
         }
+        self.publication_burst.reset();
         self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
         self.pool_phase = PoolPhase::Populated;
@@ -2170,10 +2174,11 @@ impl Queue {
         &mut self,
         packet: Arc<Packet>,
         dependencies: &[crate::g17::fw::kick::KickDependency],
+        more: bool,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        self.publish_with_native_waits(packet, dependencies, &[], host, defer)
+        self.publish_with_native_waits(packet, dependencies, &[], more, host, defer)
     }
 
     pub(in crate::g17) fn publish_with_native_waits(
@@ -2181,6 +2186,7 @@ impl Queue {
         packet: Arc<Packet>,
         dependencies: &[crate::g17::fw::kick::KickDependency],
         native: &[crate::g17::sync_input::NativeWait],
+        more: bool,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
@@ -2286,8 +2292,21 @@ impl Queue {
             .config_cache
             .and_then(|(config, at)| (at == epoch).then_some(config));
         let send_config = first || super::render::publication::required(cached, config);
-        let announce =
-            KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
+        let (next_publication_burst, burst) = self
+            .publication_burst
+            .plan(more, first || entry_signal || !native.is_empty());
+        let announce = burst
+            .announce
+            .map(|count| {
+                KickAnnounce::new_count(
+                    qid,
+                    DataMaster::Compute,
+                    kick_timestamp,
+                    policy.priority(),
+                    count,
+                )
+            })
+            .transpose()?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let kick_args = KickArgs {
             qid,
@@ -2458,8 +2477,10 @@ impl Queue {
             }
             prepared_kick.commit();
             self.submitted = self.submitted.checked_add(1).ok_or(EOVERFLOW)?;
-            let announce_va = self.graph.record(record_slot, ANNOUNCE, 0x40, announce)?;
-            producer = self.graph.append(producer, announce_va, || {})?;
+            if let Some(announce) = announce {
+                let announce_va = self.graph.record(record_slot, ANNOUNCE, 0x40, announce)?;
+                producer = self.graph.append(producer, announce_va, || {})?;
+            }
             fence(Ordering::SeqCst);
             if entry_signal {
                 let predecessor_va =
@@ -2481,6 +2502,7 @@ impl Queue {
                     self.outer_started & ring == 0,
                 )?,
             )?;
+            self.publication_burst = next_publication_burst;
             self.outer_started |= ring;
             self.installed = true;
             self.published_config = Some(identity);
@@ -2511,12 +2533,18 @@ impl Queue {
                     previous.publication = Some((packet.order.sequence, epoch));
                 }
             }
-            // Every publication rings its own pipe and priority class, as render
-            // publication does: pipe 2 (compute) in bits 1:0, priority class in
-            // bits 3:2. The generic work doorbell left the firmware to find the
-            // ring itself and delayed dispatch.
+            // The shipped arm rings every publication. Test arms expose only work already
+            // accepted by this logical scheduler and ring the tail of each bounded burst.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            if burst.notify {
+                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            }
+            crate::g17::trace::burst(
+                crate::g17::trace::COMPUTE,
+                qid,
+                burst.announce.unwrap_or(0),
+                burst.notify,
+            );
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();

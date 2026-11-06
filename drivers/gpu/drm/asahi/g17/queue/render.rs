@@ -197,6 +197,7 @@ pub(crate) struct Pair {
     /// Completion values of the two kicks of the last publication, kept with the configuration
     /// cache: what each queue holds once that publication completed.
     published_completions: Option<[u64; 2]>,
+    publication_burst: super::publication_burst::State,
 }
 impl Pair {
     #[inline(never)]
@@ -295,6 +296,10 @@ impl Pair {
             executed: 0,
             switch: None,
             published_completions: None,
+            publication_burst: super::publication_burst::State::configured(matches!(
+                variant.graph,
+                crate::g17::fw::variant::InitGraph::V25G83
+            )),
         }))
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
@@ -564,6 +569,7 @@ impl Pair {
         packet: Arc<Packet>,
         dependencies: &RenderDependencies,
         lease: PublicationLease,
+        more: bool,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
@@ -755,6 +761,9 @@ impl Pair {
         let [tiling_kick, fragment_kick] = &mut self.kicks;
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
+        let (next_publication_burst, burst) = self
+            .publication_burst
+            .plan(more, self.installed != [true; 2] || leads != [false; 2]);
         let memory = &mut *self.memory;
         let lanes = [
             publication::Lane::new(
@@ -765,6 +774,7 @@ impl Pair {
                 configs[0],
                 present[0],
                 kicks[0],
+                burst.announce,
                 leads[0],
             )?,
             publication::Lane::new(
@@ -775,6 +785,7 @@ impl Pair {
                 configs[1],
                 present[1],
                 kicks[1],
+                burst.announce,
                 leads[1],
             )?,
         ];
@@ -833,6 +844,7 @@ impl Pair {
             .map_err(|_| EBUSY)?;
         self.prepared = None;
         packet.mark_published();
+        self.publication_burst = next_publication_burst;
         lanes[1].publish_prefix();
         fragment_kick.commit();
         lanes[1].publish_kick();
@@ -918,6 +930,8 @@ impl Pair {
             (&fragment_slot, &tiling_slot, outer_next),
             lease.free_list_generation,
             policy.priority(),
+            burst.announce.unwrap_or(0),
+            burst.notify,
             &packet,
             defer,
         )
@@ -992,6 +1006,8 @@ impl Pair {
         (fragment_slot, tiling_slot, outer_next): (&WorkSlot, &WorkSlot, [u32; 2]),
         free_list_generation: u64,
         priority: u8,
+        announce_count: u16,
+        notify: bool,
         packet: &Arc<Packet>,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
@@ -999,7 +1015,15 @@ impl Pair {
             host.activate_render_pool(self.free_list.id(), free_list_generation)?;
             host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
-            host.notify_render(priority)?;
+            if notify {
+                host.notify_render(priority)?;
+            }
+            crate::g17::trace::burst(
+                crate::g17::trace::RENDER,
+                self.qids()[1],
+                announce_count,
+                notify,
+            );
             crate::g17::trace::publish(
                 crate::g17::trace::RENDER,
                 self.qids()[1],
@@ -1330,6 +1354,7 @@ impl Pair {
     pub(crate) fn resync(&mut self) {
         self.configs = [None; 2];
         self.published_completions = None;
+        self.publication_burst.reset();
         for kick in &mut self.kicks {
             kick.clear_parent_after_recovery();
         }
