@@ -30,4 +30,5 @@ nvme-fc-y				+= fc.o
 
 nvme-tcp-y				+= tcp.o
 
-nvme-apple-y				+= apple.o
+nvme-apple-y				+= apple.o apple-panic.o
+nvme-apple-$(CONFIG_NVME_APPLE_PANIC_KUNIT_TEST) += apple-panic-test.o
