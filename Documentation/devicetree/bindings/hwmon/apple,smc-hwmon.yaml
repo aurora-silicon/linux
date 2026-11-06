@@ -40,6 +40,28 @@ properties:
   compatible:
     const: apple,smc-hwmon
 
+  apple,soc-die-keys:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 32
+    items:
+      pattern: "^[A-Za-z0-9]{4}$"
+    description:
+      SMC FourCC keys for SoC die temperature sensors. Each key must report a
+      readable four-byte floating-point temperature in degrees Celsius. The
+      hottest reading supplies the macsmc_soc_die thermal zone. These channels
+      follow the temperature-* children in the listed order and are labelled
+      "SoC die <key>". Keys absent from the running firmware or with an
+      unsupported format are skipped. These channels do not change the indices
+      used by thermal-sensors references to temperature-* children.
+
+  apple,thermal-pressure-key:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^[A-Za-z0-9]{4}$"
+    description:
+      SMC FourCC key reporting the firmware thermal pressure level as a
+      readable signed 32-bit integer. This is exposed for monitoring only.
+
   apple,discover-temperatures:
     type: boolean
     description:
@@ -58,12 +80,10 @@ properties:
 
   "#cooling-cells":
     const: 3
+    deprecated: true
     description:
-      Makes the fans cooling devices for thermal zones. The first cell is the
-      zero-based index of a fan, counting the fan-* child nodes in order; the
-      other two are the lower and upper cooling state. State 0 leaves the fan
-      to the SMC; states 1 to 8 run it at speeds spread evenly from its
-      minimum to its maximum. A fan needs all four of its speed and mode keys.
+      Former fan cooling-device specifier. Fan policy is handled by the SMC
+      firmware; the driver no longer registers fan cooling devices.
 
 patternProperties:
   "^current-[A-Za-z0-9]{4}$":
@@ -94,6 +114,16 @@ patternProperties:
         $ref: /schemas/types.yaml#/definitions/string
         pattern: "^[A-Za-z0-9]{4}$"
         description: Writeable key to enable/disable manual fan control
+
+      apple,fan-manual-control:
+        type: boolean
+        description:
+          The SMC firmware of this machine accepts a manual speed for this
+          fan from the host and returns it to firmware control when asked,
+          so the fan's target speed can be set from the OS. Requires
+          apple,fan-target and apple,fan-mode. Without it the fan is only
+          monitored, and driven by the thermal framework where the SMC
+          node is a cooling device.
 
   "^power-[A-Za-z0-9]{4}$":
     $ref: "#/$defs/sensor"

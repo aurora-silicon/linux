@@ -177,8 +177,9 @@ impl Packet {
                         kernel::time::msecs_to_jiffies(10) as isize,
                     )
                 };
+                // An interrupted wait is not a producer failure.
                 if waited < 0 {
-                    return Err(super::dependency::inherited_error(Error::from_errno(waited as i32)));
+                    return Err(Error::from_errno(waited as i32));
                 }
                 if waited > 0 { break; }
             }
@@ -257,7 +258,7 @@ pub(crate) fn fence_status(fence: &Fence) -> i32 {
 fn check_status(fence: &Fence) -> Result {
     let status = fence_status(fence);
     if status < 0 {
-        Err(super::dependency::inherited_error(Error::from_errno(status)))
+        Err(super::dependency::PRODUCER_FAILED)
     } else {
         Ok(())
     }
@@ -425,8 +426,8 @@ impl Fences {
 impl<B: Backend> Scheduler<B> {
     pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
         let (credits, name) = match engine {
-            Engine::Render => (RENDER_CREDITS, c_str!("asahi_g17_render")),
-            Engine::Compute => (COMPUTE_CREDITS, c_str!("asahi_g17_compute")),
+            Engine::Render => (RENDER_CREDITS, c_str!("aurora_g17_render")),
+            Engine::Compute => (COMPUTE_CREDITS, c_str!("aurora_g17_compute")),
         };
         let scheduler = sched::Scheduler::new(dev.as_ref().as_ref(), 1, credits, 0, TIMEOUT_MS, name)?;
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;

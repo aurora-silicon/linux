@@ -965,6 +965,37 @@ void typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_restore);
 
+/* Type-C ports that probed before their USB4/Thunderbolt router */
+static BLOCKING_NOTIFIER_HEAD(typec_thunderbolt_switch_watchers);
+
+/**
+ * typec_thunderbolt_switch_watch - Watch for USB4/Thunderbolt switch registration
+ * @nb: Notifier called with TYPEC_THUNDERBOLT_SWITCH_ADDED and the new switch
+ *
+ * Lets a consumer that probed without its switch look it up again later. The
+ * callback runs under the registering driver's locks, so it must only schedule
+ * work. Look the switch up once more after registering the watcher: it may
+ * have registered in between.
+ */
+int typec_thunderbolt_switch_watch(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&typec_thunderbolt_switch_watchers,
+						nb);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_watch);
+
+/**
+ * typec_thunderbolt_switch_unwatch - Stop watching for switch registration
+ * @nb: Notifier registered with typec_thunderbolt_switch_watch()
+ *
+ * Waits for a callback that is already running to return.
+ */
+void typec_thunderbolt_switch_unwatch(struct notifier_block *nb)
+{
+	blocking_notifier_chain_unregister(&typec_thunderbolt_switch_watchers, nb);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_unwatch);
+
 static void typec_thunderbolt_switch_release(struct device *dev)
 {
 	kfree(to_typec_thunderbolt_switch_dev(dev));
@@ -1022,6 +1053,9 @@ typec_thunderbolt_switch_register(struct device *parent,
 		put_device(&sw_dev->dev);
 		return ERR_PTR(ret);
 	}
+
+	blocking_notifier_call_chain(&typec_thunderbolt_switch_watchers,
+				     TYPEC_THUNDERBOLT_SWITCH_ADDED, sw_dev);
 
 	return sw_dev;
 }

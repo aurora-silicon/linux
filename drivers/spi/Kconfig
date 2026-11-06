@@ -146,22 +146,23 @@ config SPI_APPLE_QSPI
 	help
 	  This enables support for Apple's command-FIFO QSPIMC controller.
 	  Unlike the ordinary Apple SPIMC block, QSPIMC accepts packed SPI
-	  memory descriptors and is used for the boot NOR on T8140 systems.
+	  memory descriptors and is used for the boot NOR on M3 and later
+	  systems.
 
-	  T8122/T8132 controllers default to read-only access. Only the pinned
-	  J613 NVRAM layout admits bounded writes after a runtime opt-in.
-	  On T8140 only the nvram partition accepts programs and erases; the
-	  rest of the boot NOR is read-only.
+	  The boot NOR defaults to read-only access. On the J613, J713, J616s
+	  and J700 a runtime opt-in admits bounded, verified page programs and
+	  4 KiB erases inside the nvram partition only; the rest of the boot
+	  NOR stays read-only.
 
 config SPI_APPLE_QSPI_KUNIT_TEST
-	tristate "KUnit tests for the Apple QSPIMC boot NOR write window" if !KUNIT_ALL_TESTS
+	tristate "KUnit tests for the Apple QSPIMC NVRAM write policy" if !KUNIT_ALL_TESTS
 	depends on KUNIT
 	depends on SPI_APPLE_QSPI || COMPILE_TEST
 	default KUNIT_ALL_TESTS
 	help
-	  Tests which T8140 boot NOR requests the QSPIMC driver admits: write
-	  enable control, and programs and erases inside the nvram partition
-	  only. No hardware is accessed.
+	  Tests which boot NOR requests the QSPIMC driver admits: write
+	  enable control, and page programs and 4 KiB erases inside the
+	  nvram partition only. No hardware is accessed.
 
 config SPI_AR934X
 	tristate "Qualcomm Atheros AR934X/QCA95XX SPI controller driver"

@@ -214,6 +214,8 @@ struct tb_nhi_ops {
  * PCIe host kept its link up: the tunnels are still active on resume.
  */
 #define QUIRK_KEEP_TUNNELS				BIT(7)
+/* The links of the host router must not enter CL states. */
+#define QUIRK_NO_HOST_CLX				BIT(8)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)
@@ -222,6 +224,13 @@ struct tb_nhi_ops {
 #define TB_HOST_DP_KEEP_DPRX_TIMEOUT	BIT(3)
 #define TB_HOST_DP_ADAPTER_QUIRKS		BIT(4)
 #define TB_HOST_DP_INITIAL_BW_GRANT	BIT(5)
+/*
+ * Both DP IN streams of a host PHY must run at one link rate. A DP tunnel
+ * alone on the host router offers up to HBR3; when more are needed, all of
+ * them offer HBR2 at most (two 4K60 streams fit), a tunnel up above that
+ * being set up again at HBR2 first.
+ */
+#define TB_HOST_DP_SHARED_RATE		BIT(6)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel

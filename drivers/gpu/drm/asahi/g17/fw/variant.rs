@@ -36,7 +36,15 @@ pub(crate) enum InitGraph {
     V25G83,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum QueueRegistration {
+    Firmware,
+    PoweredRenderPairs,
+    Mailbox,
+}
+
 /// The layouts and rules of one G17 firmware build.
+#[derive(Copy, Clone)]
 pub(crate) struct Variant {
     /// The initialization graph.
     pub(crate) graph: InitGraph,
@@ -49,8 +57,7 @@ pub(crate) struct Variant {
     pub(crate) qid_floor: usize,
     /// Host words of a queue's pointer block.
     pub(crate) pointers: PointerLayout,
-    /// The host registers each render pair through the GPU's MMIO queue ports.
-    pub(crate) mmio_pair_registration: bool,
+    pub(crate) registration: QueueRegistration,
     /// Render kick entries may name an MCache table.
     pub(crate) mcache: bool,
     /// Renders may set the few-primitives auxiliary framebuffer flag.
@@ -65,6 +72,11 @@ pub(crate) struct Variant {
     pub(crate) lead_commands: bool,
     /// Register programs of the render descriptors.
     pub(crate) programs: super::render::RegisterPrograms,
+    /// Use 0x1c890 = 1, 0x1c918 = 0 in V25G83-format tiling arrays (device/build policy).
+    pub(crate) ta_mode_1: bool,
+    pub(crate) compute: super::compute::ComputeProgram,
+    pub(crate) opening_record: bool,
+    pub(crate) split_firmware_area: bool,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -98,13 +110,17 @@ pub(crate) const V26A428: Variant = Variant {
         producer: 0x40,
         recovery_target: Some(0x50),
     },
-    mmio_pair_registration: true,
+    registration: QueueRegistration::PoweredRenderPairs,
     mcache: true,
     few_primitives: true,
     ray_traversal: true,
     fragment_busy: true,
     lead_commands: false,
     programs: super::render::RegisterPrograms::G17P,
+    ta_mode_1: false,
+    compute: super::compute::ComputeProgram::G17P,
+    opening_record: true,
+    split_firmware_area: false,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -122,20 +138,33 @@ pub(crate) const V25G83: Variant = Variant {
     },
     // Whether this build tolerates the MMIO registration is unknown; the M4 Pro has only run
     // without it.
-    mmio_pair_registration: false,
+    registration: QueueRegistration::Firmware,
     mcache: false,
     // A fragment stage with the few-primitives flag hangs.
     few_primitives: false,
-    // A stalled ray traversal wedges the GPU without a firmware recovery.
-    ray_traversal: false,
+    ray_traversal: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.
     fragment_busy: false,
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
+    ta_mode_1: false,
+    compute: super::compute::ComputeProgram::G17P,
+    opening_record: true,
+    split_firmware_area: false,
+};
+
+pub(crate) const V25F84: Variant = Variant {
+    qid_floor: 0,
+    registration: QueueRegistration::Mailbox,
+    compute: super::compute::ComputeProgram::V25F84,
+    opening_record: false,
+    split_firmware_area: true,
+    ..V25G83
 };
 
 const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
+    assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
 };

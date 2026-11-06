@@ -76,6 +76,8 @@ struct apple_epic_service {
 	/* Compact EPIC (desktop 26.x): the announced identity and OPEN state. */
 	char name[33];
 	s64 unit;
+	/* DCP poweron generation that announced this compact service. */
+	u32 power_gen;
 	bool defer_start;
 	bool started;
 
@@ -500,6 +502,14 @@ struct apple_dcp_afkep {
 	bool compact;
 	struct list_head compact_cmds;	/* lock */
 	bool compact_shutting_down;	/* lock */
+	/*
+	 * T8132 dcpext: a command that times out leaves an orphan in
+	 * compact_cmds, which takes its late reply, so that the reply never
+	 * completes a later identical command. Set once at init.
+	 */
+	bool compact_keep_orphans;
+	unsigned int compact_orphans;	/* lock */
+	wait_queue_head_t compact_orphan_wq;
 	/* A message went out in part; no further sends (lock). */
 	bool compact_tx_desync;
 	/* Replies to firmware calls, see afk_compact_reply_worker(). */
@@ -524,6 +534,9 @@ int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 int afk_start(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
+bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
+unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
+bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);

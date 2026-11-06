@@ -61,8 +61,10 @@ pub(crate) mod glue {
         fn asahi_g15_machine(compatible: *const core::ffi::c_char) -> bool;
         fn asahi_g15_hold_power(dev: *mut core::ffi::c_void);
         fn asahi_g15_release_power(dev: *mut core::ffi::c_void);
-        fn asahi_g15_module_get();
+        fn asahi_g15_module_try_get() -> bool;
+        fn asahi_g15_module_put();
         pub(crate) fn asahi_g15_reprobe();
+        pub(crate) fn asahi_g15_report_loader_gpu();
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
         fn asahi_g15_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g15_ram_within(start: u64, size: u64) -> bool;
@@ -70,7 +72,9 @@ pub(crate) mod glue {
         fn asahi_g15_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
         fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool;
         pub(crate) fn asahi_g15_pmp_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        pub(crate) fn asahi_g15_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
         pub(crate) fn asahi_g15_pmp_get(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        pub(crate) fn asahi_g15_pmp_ready() -> core::ffi::c_int;
         pub(crate) fn asahi_g15_pmp_put(dev: *mut core::ffi::c_void);
         fn asahi_g15_reserved_uat(index: u32, start: u64, size: u64) -> bool;
     }
@@ -120,12 +124,17 @@ pub(crate) mod glue {
         RETAINED.load(Ordering::Acquire)
     }
 
-    /// Pins this module until reboot, once (`__module_get(THIS_MODULE)`).
-    pub(crate) fn retain_module() {
-        if !RETAINED.swap(true, Ordering::AcqRel) {
-            // SAFETY: The module is live while its code runs; the reference is never put.
-            unsafe { asahi_g15_module_get() };
-        }
+    /// Pins this module until reboot, once (`try_module_get(THIS_MODULE)`, see `retain.rs`).
+    /// ENODEV, with nothing pinned or marked, once the module's removal has begun.
+    pub(crate) fn retain_module() -> Result {
+        crate::g15::retain::retain(
+            &RETAINED,
+            // SAFETY: Takes a reference to this module unless its removal has begun.
+            || unsafe { asahi_g15_module_try_get() },
+            // SAFETY: Drops only the reference this call took; the winner's is never put.
+            || unsafe { asahi_g15_module_put() },
+        )
+        .map_err(|_| ENODEV)
     }
 
     /// The phram "adt" export: start and size.
@@ -478,6 +487,17 @@ pub(crate) fn admit(
     } else if !glue::machine(cfg.machine) {
         dev_err!(dev, "G15: not a {} machine\n", cfg.name);
         return Err(ENODEV);
+    } else {
+        // No PMP vote here, but the first start follows the native display all the same.
+        // SAFETY: `dev` is the bound GPU device.
+        let ret = unsafe { glue::asahi_g15_display_prepare(dev.as_raw().cast()) };
+        if ret != 0 {
+            let err = Error::from_errno(ret);
+            if err != EPROBE_DEFER {
+                dev_err!(dev, "native display not admitted: {:?}\n", err);
+            }
+            return Err(err);
+        }
     }
     let adt = adt::read(dev, cfg)
         .inspect_err(|e| dev_err!(dev, "GPU regions not admitted: {:?}\n", e))?;
@@ -674,8 +694,16 @@ pub(crate) fn start(
         return Err(e);
     }
 
+    // Pin the module before anything firmware-visible. Once its removal has begun this fails
+    // and the firmware is left untouched, cleaned up as for a failed self-check: the vote is
+    // released and the session stays unretained.
+    if let Err(e) = glue::retain_module() {
+        dev_err!(d, "G15: the module is being removed; the firmware is not started\n");
+        // Mapped with cached firmware classes: never unmapped.
+        core::mem::forget(objects);
+        return Err(e);
+    }
     // From here on the firmware is touched: nothing it can reach is freed, the vote included.
-    glue::retain_module();
     vote.keep();
     let rtkit = match Rtkit::new(&d, shared) {
         Ok(rtkit) => rtkit,

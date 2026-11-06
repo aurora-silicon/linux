@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/imu/apple,aop-motion.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple AOP accelerometer and gyroscope
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  The Always-On Processor of Apple laptops reads the machine's inertial
+  sensor and reports acceleration and angular rate as two of its services.
+  Each node identifies one of those services. It has no application
+  processor MMIO or interrupt resource of its own.
+
+  A service starts reporting only once it has been sent the machine's three
+  calibration packets. The bootloader copies them from the Apple device tree
+  into the calibration properties below at every boot, so they are absent
+  from the device tree sources. Without them the sensor stays off.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6041-aop-accel
+              - apple,t8132-aop-accel
+          - const: apple,aop-accel
+      - items:
+          - enum:
+              - apple,t6041-aop-gyro
+              - apple,t8132-aop-gyro
+          - const: apple,aop-gyro
+
+  label:
+    description:
+      Where the sensor sits, "accel-base" for an accelerometer in the base
+      of a laptop.
+
+  apple,range-intrinsic-cal:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description:
+      The sensor's range calibration container, filled in by the bootloader.
+
+  apple,nominal-extrinsic-cal:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description:
+      The calibration container for the sensor's nominal mounting, filled in
+      by the bootloader.
+
+  apple,range-extrinsic-cal:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description:
+      The sensor's range mounting calibration container, filled in by the
+      bootloader.
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    accel {
+        compatible = "apple,t6041-aop-accel", "apple,aop-accel";
+        label = "accel-base";
+    };

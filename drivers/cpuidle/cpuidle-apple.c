@@ -124,18 +124,20 @@ static struct cpuidle_driver apple_idle_driver = {
 
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
-	bool t604x = of_device_is_compatible(pdev->dev.of_node, "apple,t6041-cpuidle");
+	struct device_node *np = pdev->dev.of_node;
+	bool wfi_only = of_device_is_compatible(np, "apple,t6041-cpuidle") ||
+			of_device_is_compatible(np, "apple,t8132-cpuidle");
 
 	/*
 	 * CPU PD writes CYC_OVRD, which is an undefined instruction on
-	 * T8140 and is not available to a T6050 guest. Their WFI already
-	 * lets the hardware power-gate idle secondary cores, so both
-	 * entries must use WFI. Keep index 1: the generic s2idle selector
-	 * skips fallback index 0, otherwise tick_freeze() and timekeeping
-	 * suspension are never reached.
+	 * T8140, the M4 SoCs (T6041, T8132) and T6050, where it is also not
+	 * available to a guest. Their WFI already lets the hardware
+	 * power-gate idle cores, so both entries must use WFI. Keep index 1:
+	 * the generic s2idle selector skips fallback index 0, otherwise
+	 * tick_freeze() and timekeeping suspension are never reached.
 	 */
 	if (of_machine_is_compatible("apple,t8140") ||
-	    of_machine_is_compatible("apple,t6050") || t604x)
+	    of_machine_is_compatible("apple,t6050") || wfi_only)
 		apple_idle_driver.states[STATE_PWRDOWN] = apple_idle_driver.states[STATE_WFI];
 
 	return cpuidle_register(&apple_idle_driver, NULL);
@@ -143,6 +145,7 @@ static int apple_cpuidle_probe(struct platform_device *pdev)
 
 static const struct of_device_id apple_cpuidle_of_match[] = {
 	{ .compatible = "apple,t6041-cpuidle" },
+	{ .compatible = "apple,t8132-cpuidle" },
 	{ .compatible = "apple,t8140-cpuidle" },
 	{ }
 };

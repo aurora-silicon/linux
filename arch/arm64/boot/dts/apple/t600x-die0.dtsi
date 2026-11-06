@@ -8,6 +8,45 @@
 
 &SOC_NODE {
 
+	ave_dart1: iommu@20d030000 {
+		compatible = "apple,t6000-dart";
+		reg = <0x2 0x0d030000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1028 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ave_dart0: iommu@20d040000 {
+		compatible = "apple,t6000-dart";
+		reg = <0x2 0x0d040000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1028 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	ave: video-codec@20d100000 {
+		compatible = "apple,t6000-ave";
+		reg = <0x2 0x0d100000 0 0x45c000>,
+		      <0x2 0x0d050000 0 0x8000>,
+		      <0x2 0x0d800000 0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1031 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1025 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1024 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1027 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1026 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+				<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+		status = "disabled";
+	};
+
 	ane_dart0: iommu@285800000 {
 		compatible = "apple,t6000-dart";
 		reg = <0x2 0x85800000 0x0 0x4000>;

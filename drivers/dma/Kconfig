@@ -105,7 +105,7 @@ config APPLE_SIO
 	  where it provides DMA services.
 
 config APPLE_SIO_KUNIT_TEST
-	bool "KUnit tests for the Apple SIO probe" if !KUNIT_ALL_TESTS
+	bool "KUnit tests for the Apple SIO probe and boot protocol" if !KUNIT_ALL_TESTS
 	depends on APPLE_SIO=y && KUNIT=y
 	depends on OF_OVERLAY
 	default KUNIT_ALL_TESTS
@@ -113,6 +113,7 @@ config APPLE_SIO_KUNIT_TEST
 	  Check which SIO device-tree nodes the probe goes on with: the
 	  generic SIO of the M1 and M2, and a T6030 SIO only with validated
 	  protocol-10 boot tables. The compatible selects the firmware layout.
+	  Also check protocol-9 table order, DMA array counts and ACK failures.
 
 config APPLE_SIO_T6030_KUNIT_TEST
 	bool "KUnit tests for the T6030 SIO boot-table check" if !KUNIT_ALL_TESTS

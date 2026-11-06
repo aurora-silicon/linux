@@ -32,16 +32,17 @@ config DRM_APPLE_AUDIO
 	select SND_DMAENGINE_PCM
 
 config DRM_APPLE_DCP_T6030_AUDIO
-	bool "HDMI audio through the T6030 external display processor"
+	bool "Native audio links through external display processors"
 	default y
 	depends on DRM_APPLE_AUDIO
 	help
 	  DP/HDMI audio of the external display processors of the M3 Pro
 	  (T6030, MacBook Pro J514S/J516S built-in HDMI port), whose DCP
 	  firmware 14.7 external role takes 32-byte audio link data and the
-	  native driver's link lifecycle. The audio service of every other
-	  DCP is driven unchanged. Say N to build the audio and element
-	  parser code exactly as before.
+	  native driver's link lifecycle. Also build the compact audio service
+	  binding for desktop 26.x external processors (T6041). Those audio
+	  interfaces remain disabled until SIO firmware support is available.
+	  Say N to omit native links and the desktop compact audio binding.
 
 config DRM_APPLE_DCP_T8132
 	bool "MacBook Air M4 (J713) internal panel"

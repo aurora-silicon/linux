@@ -93,7 +93,7 @@ void *apple_dart_dcp_scanout_alloc(struct device *dev, size_t size, dma_addr_t *
 	result = allocation->cpu;
 	goto unlock;
 pin_failure:
-	WRITE_ONCE(dcp->failed, true);
+	apple_dart_dcp_fail(dcp, "scanout mapping failed: %d", ret);
 	dev_err(dev, "Retaining %zu scanout bytes after SID0 mapping failure: %d\n", size, ret);
 	result = ERR_PTR(ret);
 	goto unlock;

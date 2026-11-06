@@ -76,6 +76,7 @@ int dcp_start(struct platform_device *pdev);
 int dcp_activate(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+bool dcp_hdr_metadata_live(struct platform_device *pdev);
 void dcp_retain_framebuffer(struct platform_device *pdev,
 			    struct dcp_fb_reference *entry);
 void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id);
@@ -102,6 +103,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 struct drm_display_mode *adjusted_mode);
 void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation);
 void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_np);
+int dcp_panel_read_color_target(struct apple_dcp *dcp, struct device_node *panel_np);
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 				     struct drm_connector *connector);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);

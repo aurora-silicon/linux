@@ -147,6 +147,10 @@ unsafe fn shared<'a>(cookie: *mut c_void) -> ArcBorrow<'a, Shared> {
 }
 
 /// RTKit crash callback: latches fail-stop.
+///
+/// # Safety
+///
+/// `cookie` must be the live Shared cookie registered with these RTKit operations.
 unsafe extern "C" fn rtkit_crashed(cookie: *mut c_void, _log: *const c_void, _size: usize) {
     // SAFETY: RTKit passes back the registered cookie.
     let shared = unsafe { shared(cookie) };
@@ -158,6 +162,10 @@ unsafe extern "C" fn rtkit_crashed(cookie: *mut c_void, _log: *const c_void, _si
 }
 
 /// RTKit message callback.
+///
+/// # Safety
+///
+/// `cookie` must be the live Shared cookie registered with these RTKit operations.
 unsafe extern "C" fn rtkit_recv(cookie: *mut c_void, endpoint: u8, message: u64) {
     // SAFETY: RTKit passes back the registered cookie.
     let shared = unsafe { shared(cookie) };
@@ -179,6 +187,10 @@ unsafe extern "C" fn rtkit_recv(cookie: *mut c_void, endpoint: u8, message: u64)
 
 /// EP 0x20 ring-service request, in the mailbox interrupt: wake only. The drain and the
 /// backend's completion check run in the poll work; the shared state outlives the mailbox.
+///
+/// # Safety
+///
+/// `cookie` must be the live Shared cookie registered with these RTKit operations.
 unsafe extern "C" fn rtkit_recv_early(cookie: *mut c_void, endpoint: u8, message: u64) -> bool {
     // SAFETY: RTKit passes back the registered cookie.
     let shared = unsafe { shared(cookie) };
@@ -194,6 +206,11 @@ unsafe extern "C" fn rtkit_recv_early(cookie: *mut c_void, endpoint: u8, message
 }
 
 /// Only the inherited crash buffer inside this session's firmware DATA, once.
+///
+/// # Safety
+///
+/// `cookie` must be the registered live Shared cookie. `bfr` must point to the
+/// writable RTKit buffer descriptor, exclusively borrowed for this callback.
 unsafe extern "C" fn rtkit_shmem_setup(
     cookie: *mut c_void,
     endpoint: u8,
@@ -203,7 +220,7 @@ unsafe extern "C" fn rtkit_shmem_setup(
     let shared = unsafe { shared(cookie) };
     // SAFETY: RTKit passes a valid buffer descriptor it owns for the duration of the call.
     let bfr = unsafe { &mut *bfr };
-    let (iova, size) = (bfr.iova as u64, bfr.size as u64);
+    let (iova, size) = (bfr.iova, bfr.size as u64);
     let data = &shared.data;
     let data_size = data.end - data.start;
     if endpoint != 1
@@ -245,6 +262,10 @@ unsafe extern "C" fn rtkit_shmem_setup(
 }
 
 /// Retained until reboot: no qualified stop path.
+///
+/// # Safety
+///
+/// This no-op callback accesses neither pointer and releases no storage.
 unsafe extern "C" fn rtkit_shmem_destroy(
     _cookie: *mut c_void,
     _bfr: *mut bindings::apple_rtkit_shmem,
@@ -436,8 +457,13 @@ pub(crate) fn admit(
     }
     let adt =
         adt::read(dev).inspect_err(|e| dev_err!(dev, "ADT GPU regions not admitted: {:?}\n", e))?;
-    crate::fwid::identify(dev, adt.text.clone(), adt.data.end - adt.data.start, cfg.firmware)
-        .inspect_err(|e| dev_err!(dev, "loaded GFX TEXT identity mismatch: {:?}\n", e))?;
+    crate::fwid::identify(
+        dev,
+        adt.text.clone(),
+        adt.data.end - adt.data.start,
+        cfg.firmware,
+    )
+    .inspect_err(|e| dev_err!(dev, "loaded GFX TEXT identity mismatch: {:?}\n", e))?;
     dev_info!(dev, "M4: firmware identity accepted\n");
     // Firmware objects are cleaned to the point of coherency by their DMA mapping: that needs
     // a device that is not DMA-coherent, as the synthesized node is.
