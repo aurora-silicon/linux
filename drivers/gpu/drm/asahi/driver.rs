@@ -172,7 +172,7 @@ macro_rules! asahi_of_device_table {
                     ProbeConfig::M5
                 ),
                 (
-                    of::DeviceId::new(c"apple,agx-t6050"),
+                    of::DeviceId::new(c"apple,agx-g17s"),
                     ProbeConfig::M5
                 ),
                 (
