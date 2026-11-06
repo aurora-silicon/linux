@@ -10,6 +10,7 @@
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
 #include <linux/bpf_defs.h>
+#include <linux/execmem.h>
 #include <linux/extable.h>
 #include <linux/kfence.h>
 #include <linux/signal.h>
@@ -19,6 +20,7 @@
 #include <linux/irqflags.h>
 #include <linux/kasan.h>
 #include <linux/kprobes.h>
+#include <linux/pagewalk.h>
 #include <linux/uaccess.h>
 #include <linux/page-flags.h>
 #include <linux/sched/signal.h>
@@ -602,6 +604,43 @@ static bool is_invalid_gcs_access(struct vm_area_struct *vma, u64 esr)
 	return false;
 }
 
+/*
+ * A core enforcing the CTXR window refuses EL0 fetches from it with a permission
+ * fault that the page tables don't explain. Nothing can fix that up, so a retry
+ * would fault forever with the task still runnable. The PFN may have no usable
+ * struct page, so only compare it.
+ */
+static bool el0_fetch_refused_by_window(struct mm_struct *mm, unsigned long addr,
+					unsigned long esr, unsigned int mm_flags)
+{
+	struct vm_area_struct *vma;
+	struct folio_walk fw;
+	unsigned long pfn = 0;
+
+	if (!is_el0_instruction_abort(esr) || !esr_fsc_is_permission_fault(esr) ||
+	    !execmem_confine_enforced())
+		return false;
+
+	if (mmap_read_lock_killable(mm))
+		return false;
+
+	vma = vma_lookup(mm, addr);
+	if (vma && (vma->vm_flags & VM_EXEC) && !fault_from_pkey(vma, mm_flags) &&
+	    folio_walk_start(&fw, vma, addr, FW_ZEROPAGE)) {
+		if (fw.level == FW_LEVEL_PTE && pte_user_exec(fw.pte))
+			pfn = pte_pfn(fw.pte);
+		folio_walk_end(&fw, vma);
+	}
+	mmap_read_unlock(mm);
+
+	if (!pfn || !execmem_confine_pfn_in_window(pfn))
+		return false;
+
+	pr_warn_ratelimited("%s[%d]: EL0 fetch at %#lx from pfn %#lx refused by the CTXR window, killing it\n",
+			    current->comm, task_pid_nr(current), addr, pfn);
+	return true;
+}
+
 static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 				   struct pt_regs *regs)
 {
@@ -678,6 +717,11 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	}
 
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+
+	if (el0_fetch_refused_by_window(mm, addr, esr, mm_flags)) {
+		force_fatal_sig(SIGSEGV);
+		return 0;
+	}
 
 	if (!(mm_flags & FAULT_FLAG_USER))
 		goto lock_mmap;
