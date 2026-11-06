@@ -104,8 +104,6 @@ struct macaudio_platform_cfg {
 	enum macaudio_amp_type amp;
 	enum macaudio_spkr_config speakers;
 	bool stereo;
-	/* The amps' highest gain ("Amp Gain Volume"); not for the SN012776 */
-	int amp_gain;
 	int safe_vol;
 	/*
 	 * The speaker codec's output widget, "OUT" (the TAS and SSM
@@ -1285,36 +1283,40 @@ static bool macaudio_speakers_allowed(const struct macaudio_platform_cfg *cfg)
 		 cfg->amp == AMP_MAX98360A);
 }
 
-/*
- * An SN012776's operating level: the second byte of its apple,speaker-config,
- * the amp's row of its group's speaker-config in the Mac's ADT, which the
- * boot loader copies to the amp's node. Only its low five bits are the level.
- */
-#define SN012776_ROW_LEN	4
-#define SN012776_ROW_LEVEL	1
-#define SN012776_LEVEL_MASK	0x1f
-/* The highest level the amp's "Amp Gain Volume" takes */
-#define SN012776_LEVEL_MAX	0x14
-
-static int macaudio_sn012776_level(struct device_node *amp)
+static bool macaudio_amp_has_adt_level(enum macaudio_amp_type amp)
 {
-	u8 row[SN012776_ROW_LEN];
-	int level;
-
-	if (of_property_count_u8_elems(amp, "apple,speaker-config") != SN012776_ROW_LEN ||
-	    of_property_read_u8_array(amp, "apple,speaker-config", row, SN012776_ROW_LEN))
-		return -ENOENT;
-
-	level = row[SN012776_ROW_LEVEL] & SN012776_LEVEL_MASK;
-	return level <= SN012776_LEVEL_MAX ? level : -ERANGE;
+	return amp == AMP_TAS5770 || amp == AMP_SN012776;
 }
 
 /*
- * Speakers on SN012776 amps run only when every amp has its level from the
+ * A supported amp's operating level: the second byte of its apple,speaker-config,
+ * the amp's row of its group's speaker-config in the Mac's ADT, which the
+ * boot loader copies to the amp's node. Only its low five bits are the level.
+ */
+#define MACAUDIO_AMP_ROW_LEN	4
+#define MACAUDIO_AMP_ROW_LEVEL	1
+#define MACAUDIO_AMP_LEVEL_MASK	0x1f
+/* The highest level the amp's "Amp Gain Volume" takes */
+#define MACAUDIO_AMP_LEVEL_MAX	0x14
+
+static int macaudio_amp_level(struct device_node *amp)
+{
+	u8 row[MACAUDIO_AMP_ROW_LEN];
+	int level;
+
+	if (of_property_count_u8_elems(amp, "apple,speaker-config") != MACAUDIO_AMP_ROW_LEN ||
+	    of_property_read_u8_array(amp, "apple,speaker-config", row, MACAUDIO_AMP_ROW_LEN))
+		return -ENOENT;
+
+	level = row[MACAUDIO_AMP_ROW_LEVEL] & MACAUDIO_AMP_LEVEL_MASK;
+	return level <= MACAUDIO_AMP_LEVEL_MAX ? level : -ERANGE;
+}
+
+/*
+ * Speakers on supported amps run only when every amp has its level from the
  * Mac; a boot loader that does not pass it leaves them off.
  */
-static bool macaudio_sn012776_levels_present(struct device *dev,
-					     struct device_node *codec)
+static bool macaudio_amp_levels_present(struct device *dev, struct device_node *codec)
 {
 	struct of_phandle_args args;
 	int i, n, level;
@@ -1324,7 +1326,7 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 		if (of_parse_phandle_with_args(codec, "sound-dai",
 					       "#sound-dai-cells", i, &args))
 			return false;
-		level = macaudio_sn012776_level(args.np);
+		level = macaudio_amp_level(args.np);
 		if (level < 0)
 			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
 				level == -ENOENT ? "no" : "out-of-range");
@@ -1338,19 +1340,22 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 static int macaudio_set_fixed_volume(struct snd_soc_card *card, const char *name,
 				     int value);
 
-/* Every SN012776's "Amp Gain Volume" is fixed at its own level */
-static int macaudio_fix_sn012776_levels(struct snd_soc_card *card)
+/* Every supported amp's "Amp Gain Volume" is fixed at its own level */
+static int macaudio_fix_amp_levels(struct snd_soc_card *card)
 {
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	struct snd_soc_component *component;
+	const char *compatible;
 	char name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 	int level, ret;
 
+	compatible = ma->cfg->amp == AMP_TAS5770 ? "ti,tas5770l" : "ti,sn012776";
 	for_each_card_components(card, component) {
 		struct device_node *np = component->dev->of_node;
 
-		if (!np || !of_device_is_compatible(np, "ti,sn012776"))
+		if (!np || !of_device_is_compatible(np, compatible))
 			continue;
-		level = macaudio_sn012776_level(np);
+		level = macaudio_amp_level(np);
 		if (level < 0)
 			return dev_err_probe(card->dev, level, "%pOF: no amp level\n", np);
 		snprintf(name, sizeof(name), "%s%sAmp Gain Volume",
@@ -1563,10 +1568,10 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 				dev_err(card->dev, "driver can't assure safety on this model, disabling speakers\n");
 				continue;
 			}
-			if (ma->cfg->amp == AMP_SN012776) {
+			if (macaudio_amp_has_adt_level(ma->cfg->amp)) {
 				struct device_node *spk_codec = of_get_child_by_name(np, "codec");
 				bool levels = spk_codec &&
-					macaudio_sn012776_levels_present(card->dev, spk_codec);
+					macaudio_amp_levels_present(card->dev, spk_codec);
 
 				of_node_put(spk_codec);
 				if (!levels) {
@@ -2469,8 +2474,6 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 	case AMP_TAS5770:
 		if (ma->cfg->stereo)
 			CHECK_CONCAT(macaudio_set_fixed_enum, "ASI1 Sel", "Left");
-
-		CHECK_CONCAT(macaudio_set_fixed_volume, "Amp Gain Volume", ma->cfg->amp_gain);
 		break;
 	case AMP_SN012776:
 		if (ma->cfg->stereo)
@@ -2478,7 +2481,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
 
 		/*
 		 * Each amp's gain is fixed at its level from the Mac's ADT
-		 * (macaudio_fix_sn012776_levels()). The tweeters' playback
+		 * (macaudio_fix_amp_levels()). The tweeters' playback
 		 * high-pass starts at the protection floor; the woofers keep
 		 * the corner the amps were given from the ADT.
 		 */
@@ -2533,8 +2536,8 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 
 	macaudio_protect_sense(card);
 
-	if (ma->cfg->amp == AMP_SN012776) {
-		int ret = macaudio_fix_sn012776_levels(card);
+	if (macaudio_amp_has_adt_level(ma->cfg->amp)) {
+		int ret = macaudio_fix_amp_levels(card);
 
 		if (ret)
 			return ret;
@@ -2649,24 +2652,24 @@ static const struct snd_soc_dapm_route macaudio_dapm_routes[] = {
 };
 
 /*
- *	enable	amp		speakers	stereo	gain	safe_vol
+ *	enable	amp		speakers	stereo	safe_vol
  *
- * An SN012776's gain is not here: each amp's operating level comes from the
+ * The amps' gain is not here: each amp's operating level comes from the
  * Mac's ADT, through the amp's apple,speaker-config.
  */
 struct macaudio_platform_cfg macaudio_j180_cfg = {
-	false,	AMP_SN012776,	SPKR_1W1T,	false,	0,	-20,
+	false,	AMP_SN012776,	SPKR_1W1T,	false,	-20,
 };
 struct macaudio_platform_cfg macaudio_j274_cfg = {
-	true,	AMP_TAS5770,	SPKR_1W,	false,	20,	-20,
+	true,	AMP_TAS5770,	SPKR_1W,	false,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j293_cfg = {
-	true,	AMP_TAS5770,	SPKR_2W,	true,	15,	-20,
+	true,	AMP_TAS5770,	SPKR_2W,	true,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j313_cfg = {
-	true,	AMP_TAS5770,	SPKR_1W,	true,	10,	-20,
+	true,	AMP_TAS5770,	SPKR_1W,	true,	-20,
 };
 
 /*
@@ -2694,35 +2697,35 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 };
 
 struct macaudio_platform_cfg macaudio_j314_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	-20,
 };
 
 /* Granted, the tweeters restore their DT corner (see tweeter_hpf_granted) */
 struct macaudio_platform_cfg macaudio_j316_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	-20,
 	.tweeter_hpf_granted = true,
 };
 
 struct macaudio_platform_cfg macaudio_j37x_j47x_cfg = {
-	true,	AMP_SN012776,	SPKR_1W,	false,	0,	-20,
+	true,	AMP_SN012776,	SPKR_1W,	false,	-20,
 };
 
 /* Granted, the tweeters restore their DT corner (see tweeter_hpf_granted) */
 struct macaudio_platform_cfg macaudio_j413_cfg = {
-	true,	AMP_SN012776,	SPKR_1W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_1W1T,	true,	-20,
 	.tweeter_hpf_granted = true,
 };
 
 struct macaudio_platform_cfg macaudio_j415_cfg = {
-	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W1T,	true,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j45x_cfg = {
-	false,	AMP_SSM3515,	SPKR_1W1T,	true,	9,	-20, /* TODO: gain?? */
+	false,	AMP_SSM3515,	SPKR_1W1T,	true,	-20,
 };
 
 struct macaudio_platform_cfg macaudio_j493_cfg = {
-	true,	AMP_SN012776,	SPKR_2W,	true,	0,	-20,
+	true,	AMP_SN012776,	SPKR_2W,	true,	-20,
 };
 
 /*
@@ -2813,7 +2816,7 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
 };
 
 struct macaudio_platform_cfg macaudio_fallback_cfg = {
-	false,	AMP_NONE,	SPKR_NONE,	false,	0,	0,
+	false,	AMP_NONE,	SPKR_NONE,	false,	0,
 };
 
 /*

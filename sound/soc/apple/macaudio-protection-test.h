@@ -702,7 +702,7 @@ static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 	struct macaudio_test_vol *vols[ARRAY_SIZE(names)];
 	struct snd_kcontrol *kctls[ARRAY_SIZE(names)];
 	struct macaudio_test_spk t;
-	const int level = 15;
+	const int level = 9;
 	unsigned int i;
 
 	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
@@ -737,7 +737,7 @@ static void macaudio_spk_amp_gain_is_fixed(struct kunit *test)
 	/* The speaker volumes and the headphone volume are not amp gains */
 	KUNIT_EXPECT_TRUE(test, t.vols[MACAUDIO_TEST_NR_SPK]->vd[0].access &
 			  SNDRV_CTL_ELEM_ACCESS_WRITE);
-	KUNIT_EXPECT_EQ(test, macaudio_set_fixed_volume(&t.ma->card, "* Missing Volume", 15),
+	KUNIT_EXPECT_EQ(test, macaudio_set_fixed_volume(&t.ma->card, "* Missing Volume", 3),
 			-EINVAL);
 }
 

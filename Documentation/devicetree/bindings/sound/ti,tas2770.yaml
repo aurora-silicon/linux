@@ -49,6 +49,16 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: TDM TX voltage sense time slot.
 
+  apple,speaker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description:
+      TAS5770L only. This amplifier's row of its group's speaker-config in
+      the Mac's boot ADT, copied by the boot loader. Its second byte is the
+      amplifier's operating level (AMP_LEVEL, low five bits); the others are
+      its receive and sense slots.
+
   ti,asi-format:
     deprecated: true
     $ref: /schemas/types.yaml#/definitions/uint32
