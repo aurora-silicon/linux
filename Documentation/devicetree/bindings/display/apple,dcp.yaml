@@ -119,7 +119,10 @@ properties:
           - description: Index into the provider's reg property.
           - description: Index in the firmware display register table.
           - description: Byte offset of the scratch register within the resource.
-    description: PMGR bandwidth scratch resource, display index and offset.
+    description: |
+      PMGR bandwidth scratch resource, display index and offset. On the T8132
+      external DCPs it is the pipe's 8-byte realtime bandwidth request slot,
+      which lies inside the display register window the index names (disp-4).
 
   apple,bw-doorbell:
     $ref: /schemas/types.yaml#/definitions/phandle-array
