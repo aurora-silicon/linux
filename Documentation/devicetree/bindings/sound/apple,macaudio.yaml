@@ -49,6 +49,15 @@ properties:
       read-only Speaker Variant ID control. GPIO polarity flags define each
       bit's logical level.
 
+  apple,allow-unsafe-tweeter-hpf:
+    type: boolean
+    description:
+      Allow a declared-crossover protection grant to restore a captured
+      tweeter high-pass corner that is Disabled or above 2 Hz. This is a
+      fail-closed exception for a machine whose independently verified
+      protection design intentionally requires that exact captured corner.
+      Without it, such a corner makes the machine driver refuse the grant.
+
 patternProperties:
   "^dai-link(@[0-9a-f]+)?$":
     description: |
