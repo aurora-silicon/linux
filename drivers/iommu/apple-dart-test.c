@@ -963,8 +963,52 @@ static void apple_dart_test_strict_engines(struct kunit *test)
 				       "%s", lazy[i]);
 }
 
+static void apple_dart_test_dynamic_sid_alloc_free(struct kunit *test)
+{
+	struct apple_dart_sid_allocator alloc;
+
+	KUNIT_ASSERT_EQ(test, apple_dart_sid_allocator_init(&alloc, 1, 252, 256), 0);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_alloc(&alloc), 1);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_alloc(&alloc), 2);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_free(&alloc, 1), 0);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_alloc(&alloc), 1);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_free(&alloc, 1), 0);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_free(&alloc, 1), -ENOENT);
+}
+
+static void apple_dart_test_dynamic_sid_exhaustion(struct kunit *test)
+{
+	struct apple_dart_sid_allocator alloc;
+	unsigned int sid;
+
+	KUNIT_ASSERT_EQ(test, apple_dart_sid_allocator_init(&alloc, 1, 252, 256), 0);
+	for (sid = 1; sid <= 252; sid++)
+		KUNIT_ASSERT_EQ(test, apple_dart_sid_alloc(&alloc), (int)sid);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_alloc(&alloc), -ENOSPC);
+}
+
+static void apple_dart_test_dynamic_sid_role_protection(struct kunit *test)
+{
+	struct apple_dart_sid_allocator alloc;
+	static const unsigned int roles[] = { 0, 253, 254, 255 };
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_allocator_init(&alloc, 0, 252, 256),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_dart_sid_allocator_init(&alloc, 1, 256, 256),
+			-EINVAL);
+	KUNIT_ASSERT_EQ(test, apple_dart_sid_allocator_init(&alloc, 1, 252, 256), 0);
+	for (i = 0; i < ARRAY_SIZE(roles); i++) {
+		KUNIT_EXPECT_FALSE(test, test_bit(roles[i], alloc.allocated));
+		KUNIT_EXPECT_EQ(test, apple_dart_sid_free(&alloc, roles[i]), -EPERM);
+	}
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
+	KUNIT_CASE(apple_dart_test_dynamic_sid_alloc_free),
+	KUNIT_CASE(apple_dart_test_dynamic_sid_exhaustion),
+	KUNIT_CASE(apple_dart_test_dynamic_sid_role_protection),
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),
 	KUNIT_CASE(apple_dart_test_independent_remap_roots),
 	KUNIT_CASE(apple_dart_test_before_attach),

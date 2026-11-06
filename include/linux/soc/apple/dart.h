@@ -139,6 +139,11 @@ int apple_dart_quiesce_commands(struct device *dev);
 int apple_dart_resume_commands(struct device *dev);
 int apple_dart_save_tunnel_state(struct device *dev);
 int apple_dart_restore_tunnel_state(struct device *dev);
+/* Resolve the dynamic ordinary SID reserved while configuring a PCI function. */
+int apple_dart_pcie_sid(struct device *dart_dev, struct device *master,
+			unsigned int rid, unsigned int *sid);
+int apple_dart_pcie_sid_range(struct device *dart_dev, unsigned int *first,
+			      unsigned int *last);
 /* Registered J713 managed radio provider, with no owned valid root or fault. */
 int apple_dart_radio_check_idle(struct device *dev);
 #else
@@ -146,6 +151,17 @@ static inline int apple_dart_quiesce_commands(struct device *dev) { return 0; }
 static inline int apple_dart_resume_commands(struct device *dev) { return 0; }
 static inline int apple_dart_save_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_restore_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_pcie_sid(struct device *dart_dev, struct device *master,
+				      unsigned int rid, unsigned int *sid)
+{
+	return -EOPNOTSUPP;
+}
+static inline int apple_dart_pcie_sid_range(struct device *dart_dev,
+					     unsigned int *first,
+					     unsigned int *last)
+{
+	return -EOPNOTSUPP;
+}
 static inline int apple_dart_radio_check_idle(struct device *dev) { return -EOPNOTSUPP; }
 #endif
 

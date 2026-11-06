@@ -203,6 +203,7 @@ struct hw_info {
 	u32 pwren_off_ms;
 	u32 pwren_on_ms;
 	bool sid_indexed_rid2sid;
+	bool dynamic_sids;
 	bool retain_clocks;
 	bool root_bus_only;
 	bool tunneled;
@@ -342,6 +343,7 @@ static const struct hw_info t6040_pciec_hw = {
 	.port_tunctrl		= 0x1088,
 	.max_rid2sid		= 256,
 	.sid_indexed_rid2sid	= true,
+	.dynamic_sids		= true,
 	.tunneled		= true,
 	.t8132_reset		= true,
 	.msimap_by_vector	= true,
@@ -417,6 +419,8 @@ struct apple_pcie {
 	bool			resume_failed; /* cleared only by teardown and reprobe */
 	struct reset_control	*reset;
 	u16			managed_sids;
+	u16			dynamic_sid_first;
+	u16			dynamic_sid_last;
 	bool			neo_config_ready;
 	u8			neo_secondary_bus;
 	struct device		*piodma_supplier;
@@ -999,6 +1003,20 @@ static const struct apple_pcie_reset_reg apple_pcie_tunnel_reset_regs[] = {
 	{ 0x824, 0x00000000 },
 };
 
+static void apple_pcie_clear_rid2sid(struct apple_pcie_port *port)
+{
+	struct apple_pcie *pcie = port->pcie;
+	unsigned int first = 0, last = pcie->hw->max_rid2sid - 1;
+	unsigned int sid;
+
+	if (pcie->hw->dynamic_sids) {
+		first = pcie->dynamic_sid_first;
+		last = pcie->dynamic_sid_last;
+	}
+	for (sid = first; sid <= last; sid++)
+		apple_pcie_rid2sid_write(port, sid, 0);
+}
+
 static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 {
 	int i;
@@ -1030,8 +1048,7 @@ static void apple_pcie_tunnel_reset_hardware(struct apple_pcie_port *port)
 		apple_pcie_port_writel(port, value, apple_pcie_tunnel_reset_regs[i].offset);
 	}
 
-	for (i = 0; i < port->pcie->hw->max_rid2sid; i++)
-		apple_pcie_rid2sid_write(port, i, 0);
+	apple_pcie_clear_rid2sid(port);
 	if (port->pcie->hw->t8132_reset)
 		for (i = 0; i < 256; i++)
 			apple_pcie_port_writel(port, 0, PORT_T602X_MSIMAP + 4 * i);
@@ -1041,7 +1058,7 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 {
 	struct apple_pcie *pcie = port->pcie;
 	u32 stat;
-	int i, ret;
+	int ret;
 
 	/*
 	 * A cable disconnect intentionally stops PCIe-C after destroying its
@@ -1092,8 +1109,7 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 		return dev_err_probe(pcie->dev, ret,
 				     "PCIe-C port did not become idle after hot reconnect\n");
 
-	for (i = 0; i < pcie->hw->max_rid2sid; i++)
-		apple_pcie_rid2sid_write(port, i, 0);
+	apple_pcie_clear_rid2sid(port);
 
 	dev_info(pcie->dev,
 		 "PCIe-C hardware reinitialized after cable reconnect\n");
@@ -1879,6 +1895,22 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (pcie->managed_sids) {
 		goto rid2sid_ready;
 	}
+	if (pcie->hw->dynamic_sids) {
+		for (i = pcie->dynamic_sid_first;
+		     i <= pcie->dynamic_sid_last; i++) {
+			if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
+				break;
+			apple_pcie_rid2sid_write(port, i, 0);
+		}
+		port->sid_map_sz = i;
+		if (i <= pcie->dynamic_sid_last) {
+			ret = dev_err_probe(pcie->dev, -ENODEV,
+				"%pOF: dynamic RID/SID entry %d is unavailable\n",
+				np, i);
+			goto err_teardown;
+		}
+		goto rid2sid_ready;
+	}
 
 	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
 	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
@@ -2215,6 +2247,33 @@ static int apple_pcie_managed_word(u16 managed, u32 rid, u32 sid, u32 *word)
 	return 0;
 }
 
+static int apple_pcie_dynamic_sid_range(struct apple_pcie *pcie)
+{
+	struct of_phandle_args iommu_spec = {};
+	struct platform_device *provider;
+	unsigned int first, last;
+	int ret;
+
+	if (!pcie->hw->dynamic_sids)
+		return 0;
+	ret = of_map_iommu_id(pcie->dev->of_node, 0, &iommu_spec);
+	if (ret)
+		return ret;
+	provider = of_find_device_by_node(iommu_spec.np);
+	of_node_put(iommu_spec.np);
+	if (!provider)
+		return -EPROBE_DEFER;
+	ret = apple_dart_pcie_sid_range(&provider->dev, &first, &last);
+	put_device(&provider->dev);
+	if (ret)
+		return ret;
+	if (!first || first > last || last >= pcie->hw->max_rid2sid)
+		return -EINVAL;
+	pcie->dynamic_sid_first = first;
+	pcie->dynamic_sid_last = last;
+	return 0;
+}
+
 static int apple_pcie_managed_admit(struct apple_pcie_port *port)
 {
 	u32 entries[16];
@@ -2299,6 +2358,7 @@ out_wifi:
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	struct platform_device *provider;
 	struct resource *res;
 	u32 sid, val, readback, rid = pci_dev_id(pdev);
 	struct apple_pcie_port *port;
@@ -2341,8 +2401,22 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	if (err)
 		return err;
 
+	if (pcie->hw->dynamic_sids) {
+		provider = of_find_device_by_node(iommu_spec.np);
+		if (!provider) {
+			of_node_put(iommu_spec.np);
+			return -EPROBE_DEFER;
+		}
+		err = apple_dart_pcie_sid(&provider->dev, &pdev->dev, rid, &sid);
+		put_device(&provider->dev);
+		if (err) {
+			of_node_put(iommu_spec.np);
+			return err;
+		}
+	} else {
+		sid = iommu_spec.args[0];
+	}
 	of_node_put(iommu_spec.np);
-	sid = iommu_spec.args[0];
 	mutex_lock(&port->pcie->lock);
 
 	if (port->pcie->managed_sids || port->pcie->hw->sid_indexed_rid2sid) {
@@ -3072,6 +3146,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	ret = apple_pcie_dynamic_sid_range(pcie);
+	if (ret)
+		return dev_err_probe(dev, ret, "dynamic SID provider unavailable\n");
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
 		u32 ids[15];
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
