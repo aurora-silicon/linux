@@ -106,9 +106,11 @@ fn f32_to_q30(bits: u32) -> Option<i32> {
 }
 
 fn decode(report: &[u8]) -> Option<[i32; 4]> {
-    let offset = match (report.first().copied()?, report.len()) {
-        (2, 108) => 28,
-        (3 | 4, 60) => 12,
+    // The report length varies with the firmware (the M4 Pro sends 52-byte
+    // type 3 reports), so only the quaternion has to fit.
+    let offset = match report.first().copied()? {
+        2 => 28,
+        3 | 4 => 12,
         // Type 1 is a five-byte state report and has no orientation.
         _ => return None,
     };

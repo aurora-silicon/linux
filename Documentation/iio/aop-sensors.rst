@@ -73,8 +73,8 @@ least two components smoothly while the norm remains close to one.
 
 The service's current report has a type byte followed by a versioned fixed
 layout. Type 2 is 108 bytes and carries little-endian IEEE-754 X, Y, Z and W
-at offset 28. Types 3 and 4 are 60 bytes and carry the same fields at offset
-12. Type 1 is a five-byte state report and does not update the IIO sample.
+at offset 28. Types 3 and 4 carry the same fields at offset 12; their length
+depends on the firmware (the M4 Pro sends 52-byte type 3 reports). Type 1 is a five-byte state report and does not update the IIO sample.
 The driver writes value 1 to property 61 first. Some firmware answers status
 0xe00002c7 (unsupported) for this service, which is harmless. The stream is
 armed by the consumer registration: the driver reads property 81 for the
