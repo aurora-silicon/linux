@@ -1385,6 +1385,7 @@ static_assert!(core::mem::offset_of!(RegionC, idle_power_off_delay) == 0x9bc);
 static_assert!(core::mem::offset_of!(RegionC, compute_watchdog) == 0x9cc);
 static_assert!(core::mem::offset_of!(RegionC, power_assert_tally) == 0xe51);
 static_assert!(size_of::<RegionC>() == 0x1000);
+static_assert!(core::mem::offset_of!(RegionC, max_power_mw) == 0x84);
 
 // SAFETY: `RegionC` consists of integers and arrays of integers only.
 unsafe impl Zeroable for RegionC {}
@@ -1813,8 +1814,6 @@ const POWER_STATE_WORDS: Words = &[
     (0x108, 0x42c80000, 1),
     (0x10c, 0x43c80000, 1),
     (0x110, 0xc8, 1),
-    (0x128, 1, 1),
-    (0x12c, 0x2616, 1),
     (0x130, 0x3f000000, 1),
     (0x134, 0x40cccccd, 1),
     (0x14c, 1, 1),
@@ -1900,15 +1899,21 @@ const SECONDARY_CONFIG_WORDS: Words = &[
 
 /// Power state the primary status B carries for the secondary instance,
 /// named by [`SecondaryRoot::power_state_va`].
-#[repr(C)]
-pub(crate) struct PowerState(pub(crate) [u8; 0x6c0]);
+pub(crate) use super::power::PowerState;
 
-// SAFETY: `PowerState` is a byte array.
+// SAFETY: `PowerState` contains only integers and byte arrays.
 unsafe impl Zeroable for PowerState {}
 
 impl PowerState {
     fn init(&mut self) {
-        fill_words(&mut self.0, POWER_STATE_WORDS);
+        // SAFETY: The repr(C) object consists entirely of initialized integer
+        // and byte-array storage; every bit pattern is valid.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::from_mut(self).cast(), size_of::<Self>())
+        };
+        fill_words(bytes, POWER_STATE_WORDS);
+        self.ppm_enabled = 1;
+        self.ppm_target_mw = 9750;
     }
 }
 

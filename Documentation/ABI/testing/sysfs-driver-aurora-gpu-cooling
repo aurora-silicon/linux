@@ -2,21 +2,19 @@ What:		/sys/devices/platform/.../gpu_power_ceiling
 Date:		November 2026
 Contact:		Asahi Linux contributors <asahi@lists.linux.dev>
 Description:
-		Read-only diagnostics for the common G16S/G17P firmware percent
-		ceiling. Present only after registration with a qualified firmware
-		layout. One key/value pair per line:
+		Read-only diagnostics for the admitted G16S/G17P absolute-power
+		actuator. One key/value pair per line:
 
-		requested_percent: 100 minus the thermal cooling state (0..100).
-		published_percent: the percent synchronously stored in all three
-		firmware mirrors, after composing the qualification backstop.
-		applied_percent: unsupported; host stores have no acknowledgement.
-		achieved_percent: unsupported; not inferred from a nominal OPP.
-		qualification_backstop_percent: maximum allowed host publication.
+		requested_state: thermal cooling state, 0..100.
+		requested_ceiling_mw: minimum of all retained requester ceilings.
+		applied_ceiling_mw: last completed host shared-memory publication.
+		provisional_floor_mw: 25 percent of the initialized maximum,
+		rounded down, but never zero. Pending hardware qualification.
+		achieved_ceiling_mw: unsupported; not inferred from a nominal OPP.
 
-		All numeric values are interface percentages, not watts, frequency
-		or a proven achieved utilization. The qualification backstop cannot
-		be released through this attribute. Firmware-reported achieved
-		pstate, when available, is independently exposed in agx_stats and
-		does not acknowledge a percent ceiling. J700 initialization is
-		refused while its firmware allocation-relative layout is unknown;
-		this attribute is consequently absent on that board.
+		Applied is a host publication, not firmware acknowledgement or
+		measured GPU power. The debugfs asahi-<device-name>-power/ceiling
+		file also reports separate RegionC/PPM readbacks, initialized max,
+		PPM enable and the thermal/fast-die/system/manual request slots.
+		State N requests max(25, 100 - N) percent of initialized power.
+		Critical shutdown never relies on the provisional floor.

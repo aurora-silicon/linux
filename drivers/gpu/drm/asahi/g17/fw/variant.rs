@@ -46,9 +46,8 @@ pub(crate) enum QueueRegistration {
 /// The layouts and rules of one G17 firmware build.
 #[derive(Copy, Clone)]
 pub(crate) struct Variant {
-    /// Resolved, allocation-relative, live percent-ceiling mirrors.
-    /// The clean setGPUMaxPower offsets alone do not identify an allocation.
-    pub(crate) power_ceiling: Option<crate::g17::cooling::Layout>,
+    /// Admitted live RegionC/PowerState layout. No host-object mirror model.
+    pub(crate) live_power: Option<crate::g17::cooling::Layout>,
     /// The initialization graph.
     pub(crate) graph: InitGraph,
     /// How the firmware acknowledges its initialization.
@@ -105,8 +104,7 @@ pub(crate) enum Firmware {
 
 /// The A18 Pro firmware (26A428).
 pub(crate) const V26A428: Variant = Variant {
-    // 0xf150/0xf2d0/0xf39c have no qualified allocation base yet.
-    power_ceiling: None,
+    live_power: Some(crate::g17::cooling::Layout::Common),
     graph: InitGraph::G17P,
     init_ack: InitAck::Message,
     power_on_done: true,
@@ -130,8 +128,7 @@ pub(crate) const V26A428: Variant = Variant {
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
 pub(crate) const V25G83: Variant = Variant {
-    // No independently established 25G83 mirror layout.
-    power_ceiling: None,
+    live_power: Some(crate::g17::cooling::Layout::Common),
     graph: InitGraph::V25G83,
     init_ack: InitAck::Status,
     // Never sent on the M4 Pro: the firmware has retired its opening record when it accepts
@@ -162,6 +159,8 @@ pub(crate) const V25G83: Variant = Variant {
 };
 
 pub(crate) const V25F84: Variant = Variant {
+    // This build has not been admitted for the live power actuator.
+    live_power: None,
     qid_floor: 0,
     registration: QueueRegistration::Mailbox,
     compute: super::compute::ComputeProgram::V25F84,

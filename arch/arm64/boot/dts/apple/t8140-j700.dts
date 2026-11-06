@@ -403,9 +403,9 @@
 		 * Provisional outer protection, not recovered Apple board limits.
 		 * The active-trip ladder works with the power_allocator governor's
 		 * non-power-actor path as well as step_wise. Equal map bounds give
-		 * exact percent requests, with the strictest zone winning. Critical
+		 * exact policy requests, with the strictest zone winning. Critical
 		 * shutdown remains independent of GPU probe and forward progress.
-		 * The last rung requests zero until a nonzero endpoint is qualified.
+		 * The actuator bounds the last rung at its provisional nonzero floor.
 		 */
 		smc-tp0t-thermal {
 			polling-delay-passive = <100>;

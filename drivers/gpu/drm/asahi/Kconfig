@@ -77,7 +77,7 @@ config DRM_ASAHI_COOLING_KUNIT_TEST
 	depends on KUNIT
 	default KUNIT_ALL_TESTS
 	help
-	  Exercise percent ceiling mapping, composition and failed publication
+	  Exercise absolute-power mapping, composition and failed publication
 	  without a GPU or Rust toolchain. The same production mapping and
 	  fake actuator cases also run on a host compiler.
 	  These tests do not qualify firmware layouts or thermal response.

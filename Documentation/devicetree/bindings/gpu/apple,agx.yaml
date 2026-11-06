@@ -98,10 +98,12 @@ properties:
   "#cooling-cells":
     const: 2
     description: |
-      GPU firmware percent ceiling. State N requests (100 - N) percent,
-      for N in 0..100. Firmware initialization fails if the live ceiling ABI
-      for the selected firmware is not established. A qualification backstop
-      may impose a stricter ceiling than requested by the thermal framework.
+      GPU firmware absolute-power ceiling. State N requests (100 - N)
+      percent of initialized maximum power, for N in 0..100, bounded below
+      by a provisional nonzero minimum until hardware qualifies the low end.
+      Firmware initialization fails if the live power layout for the selected
+      firmware is not established. Other policy owners may impose a stricter
+      ceiling than the thermal framework requests.
 
   operating-points-v2: true
 
