@@ -19,17 +19,11 @@
 
 	aliases {
 		ethernet0 = &ethernet0;
-		sio = &sio;
 	};
 };
 
 &dcp {
 	apple,connector-type = "HDMI-A";
-};
-
-/* remove once m1n1 enables sio nodes after setup */
-&sio {
-	status = "okay";
 };
 
 &dpaudio0 {
