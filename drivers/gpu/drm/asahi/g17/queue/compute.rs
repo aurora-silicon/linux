@@ -745,6 +745,20 @@ impl Queue {
     pub(crate) fn in_flight(&self) -> bool {
         self.active.len != 0 && !self.quarantined
     }
+    /// Priority of queued published work on a QID named by this completion
+    /// batch. Used only by the 25G83 post-completion diagnostic arm.
+    pub(crate) fn completion_rekick_priority(&self, masks: [u64; 2]) -> Option<u8> {
+        let qid = usize::from(self.qid());
+        let completed = masks[qid / 64] & (1u64 << (qid % 64)) != 0;
+        let mut active = self.active.iter().filter(|active| active.ticket.is_some());
+        let front = active.next()?;
+        // If the completed front was retained for a late stamp, a second
+        // retained command is the queued successor. If it retired, the new
+        // front has no completion observation and is itself the successor.
+        let queued = front.observed.is_none() || active.next().is_some();
+        (completed && queued && !self.quarantined)
+            .then(|| front.packet.context.policy().priority())
+    }
     /// The oldest command is a published long job (ray traversal or AS build) whose
     /// completion record the driver has not seen yet.
     pub(crate) fn long_job_running(&self) -> bool {

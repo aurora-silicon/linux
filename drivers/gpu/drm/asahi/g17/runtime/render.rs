@@ -1046,6 +1046,27 @@ impl Registry {
             )
         })
     }
+    /// Priorities with a fragment completion in `masks` and queued published
+    /// work. The caller coalesces each priority into one diagnostic re-kick.
+    pub(in crate::g17) fn render_completion_rekick_priorities(
+        &self,
+        masks: [u64; 2],
+    ) -> [bool; crate::g17::fw::queue::Policy::PRIORITIES as usize] {
+        let mut priorities =
+            [false; crate::g17::fw::queue::Policy::PRIORITIES as usize];
+        for pair in self
+            .render
+            .entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+        {
+            if let Some(priority) = pair.completion_rekick_priority(masks) {
+                priorities[usize::from(priority)] = true;
+            }
+        }
+        priorities
+    }
     pub(in crate::g17) fn retain_render_completions(&mut self, masks: [u64; 2]) {
         for entry in self.render.entries.iter_mut().flatten() {
             let mut hit = false;
