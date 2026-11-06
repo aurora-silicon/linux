@@ -8,6 +8,9 @@
 pub(super) const UNAVAILABLE: u32 = 0;
 pub(super) const VALID: u32 = 1;
 pub(super) const STALE: u32 = 2;
+/// The firmware never emits the record, so the capability cannot become
+/// valid. Chosen from the firmware match data, never from missing packets.
+pub(super) const UNSUPPORTED: u32 = 3;
 
 /// C read callback result; independent capabilities never imply one another.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,6 +41,10 @@ pub(super) struct Telemetry {
     timestamp: Option<u64>,
     /// Diagnostic interval only, never used as busy time.
     pub(super) delta_ticks: Option<u64>,
+    /// Host receive time of the newest utilisation delivery in this epoch.
+    delivery_ns: Option<u64>,
+    /// The last two intervals between utilisation deliveries in this epoch.
+    pub(super) delivery_intervals: [Option<u64>; 2],
 }
 
 impl Telemetry {
@@ -53,6 +60,32 @@ impl Telemetry {
         self.view.util_samples = 0;
         self.timestamp = None;
         self.delta_ticks = None;
+        self.delivery_ns = None;
+        self.delivery_intervals = [None; 2];
+    }
+
+    /// The firmware may publish several records per producer update: V25G83
+    /// produces a utilisation record every 8 ms but the host receives them
+    /// three at a time, every 24 ms. A sample is only late once the next
+    /// delivery is overdue, so the age limit runs on top of the delivery
+    /// interval. The shorter of the last two intervals is used, so one long
+    /// gap cannot extend the validity of the sample that follows it.
+    fn delivery_slack(&self) -> u64 {
+        match self.delivery_intervals {
+            [Some(a), Some(b)] => a.min(b),
+            _ => 0,
+        }
+    }
+
+    fn note_delivery(&mut self, host_ns: u64) {
+        match self.delivery_ns {
+            Some(last) if host_ns == last => return,
+            Some(last) if host_ns > last => {
+                self.delivery_intervals = [self.delivery_intervals[1], Some(host_ns - last)];
+            }
+            _ => self.delivery_intervals = [None; 2],
+        }
+        self.delivery_ns = Some(host_ns);
     }
 
     /// `max_age_ns` is a host policy (two nominal periods), not a packet duration.
@@ -62,6 +95,7 @@ impl Telemetry {
         match words[0] {
             0x13 => {
                 let values = [words[3], words[4], words[6]];
+                self.note_delivery(host_ns);
                 if values.iter().any(|&value| value > 100) {
                     self.view.util_status = UNAVAILABLE;
                     self.view.util_samples = 0;
@@ -106,8 +140,10 @@ impl Telemetry {
 
     pub(super) fn read(&self, now_ns: u64, max_age_ns: u64) -> Readout {
         let mut view = self.view;
-        let expired = |received| now_ns < received || now_ns - received >= max_age_ns;
-        // The oldest contributing sample bounds the whole averaging window.
+        let limit = max_age_ns.saturating_add(self.delivery_slack());
+        let expired = |received| now_ns < received || now_ns - received >= limit;
+        // The oldest contributing sample bounds the whole averaging window,
+        // measured against the next expected delivery plus the host policy.
         if view.util_status == VALID && expired(self.window_ns) {
             view.util_status = STALE;
         }
@@ -217,6 +253,38 @@ mod tests {
         stats.record(&zero, 102 + AGE, AGE);
         assert_eq!(stats.read(102 + AGE, AGE).pstate, 0);
         assert_eq!(stats.read(102 + AGE, AGE).pstate_status, VALID);
+    }
+
+    #[test]
+    fn batched_deliveries_stay_valid_until_the_next_one_is_late() {
+        const BATCH: u64 = 24_000_000;
+        let mut stats = Telemetry::default();
+        // Three 8 ms records per producer update, received together.
+        for n in 0..3u64 {
+            for _ in 0..3 {
+                stats.record(&U1, 1_000 + n * BATCH, AGE);
+            }
+        }
+        let last = 1_000 + 2 * BATCH;
+        assert_eq!(stats.delivery_intervals, [Some(BATCH), Some(BATCH)]);
+        assert_eq!(stats.read(last, AGE).util_samples, 3);
+        // Between two on-time deliveries the sample is valid.
+        assert_eq!(stats.read(last + BATCH - 1, AGE).util_status, VALID);
+        assert_eq!(stats.read(last + BATCH + AGE - 1, AGE).util_status, VALID);
+        // Once the next delivery is late by the host policy, it is stale.
+        assert_eq!(stats.read(last + BATCH + AGE, AGE).util_status, STALE);
+        // One long gap does not extend the next sample's validity.
+        stats.record(&U2, last + 10 * BATCH, AGE);
+        assert_eq!(stats.delivery_intervals, [Some(BATCH), Some(10 * BATCH)]);
+        assert_eq!(
+            stats.read(last + 10 * BATCH + BATCH + AGE, AGE).util_status,
+            STALE
+        );
+        // An epoch boundary forgets the cadence.
+        stats.invalidate();
+        stats.record(&U1, last + 20 * BATCH, AGE);
+        assert_eq!(stats.delivery_intervals, [None, None]);
+        assert_eq!(stats.read(last + 20 * BATCH + AGE, AGE).util_status, STALE);
     }
 
     #[test]
