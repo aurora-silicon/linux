@@ -55,26 +55,30 @@ static DEFINE_XARRAY(confine_chunks);
 /* serialises pool (de)allocation and the xarray */
 static DEFINE_MUTEX(confine_lock);
 
-int __init execmem_confine_init(phys_addr_t base, phys_addr_t size,
-				struct gen_pool *pool, bool enforce)
+void __init execmem_confine_set_window(phys_addr_t base, phys_addr_t size)
+{
+	confine_base = base;
+	confine_size = size;
+}
+
+int __init execmem_confine_init(struct gen_pool *pool, bool enforce)
 {
 	if (WARN_ON(confine_ready))
 		return -EBUSY;
-	if (WARN_ON(!pool || !size))
+	if (WARN_ON(!pool || !confine_size))
 		return -EINVAL;
 
-	confine_base = base;
-	confine_size = size;
 	confine_pool = pool;
 	confine_enforce = enforce;
 	smp_wmb();
 	confine_ready = true;
 
 	{
-		phys_addr_t end = base + size;
+		phys_addr_t end = confine_base + confine_size;
 
 		pr_info("window [%pa, %pa) (%llu MiB), %s\n",
-			&base, &end, (unsigned long long)(size >> 20),
+			&confine_base, &end,
+			(unsigned long long)(confine_size >> 20),
 			enforce ? "enforcing" : "reporting");
 	}
 	return 0;
@@ -105,7 +109,12 @@ static bool phys_in_window(phys_addr_t pa)
 
 bool execmem_confine_pfn_in_window(unsigned long pfn)
 {
-	return confine_ready && phys_in_window(PFN_PHYS(pfn));
+	return phys_in_window(PFN_PHYS(pfn));
+}
+
+bool __init execmem_confine_overlaps(phys_addr_t start, phys_addr_t size)
+{
+	return start < confine_base + confine_size && confine_base < start + size;
 }
 
 /* Window pages stay reserved for good, so one that isn't went to the allocator. */

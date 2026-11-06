@@ -203,6 +203,8 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size, bool enfor
 		return false;
 	}
 
+	execmem_confine_set_window(base, size);
+
 	ctxr_base = base;
 	ctxr_size = size;
 	ctxr_enforce = enforce;
@@ -212,6 +214,16 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size, bool enfor
 		&base, (unsigned long long)(size >> 20),
 		enforce ? "enforcing" : "reporting");
 	return true;
+}
+
+/*
+ * A reserved-memory node whose init fails goes back to memblock, which can leave a
+ * hole in the window for memblock_free_all() to release.
+ */
+void __init ctxr_exec_keep_reserved(void)
+{
+	if (ctxr_active)
+		memblock_reserve(ctxr_base, ctxr_size);
 }
 
 void __init ctxr_exec_reserve(void)
@@ -278,7 +290,7 @@ bool __init ctxr_exec_execmem_setup(void)
 		goto fail_pool;
 	}
 
-	if (execmem_confine_init(ctxr_base, ctxr_size, pool, ctxr_enforce)) {
+	if (execmem_confine_init(pool, ctxr_enforce)) {
 		pr_err("failed to register the window\n");
 		goto fail_pool;
 	}

@@ -228,8 +228,7 @@ struct execmem_range;
  *
  * Return: 0 on success, negative errno otherwise.
  */
-int execmem_confine_init(phys_addr_t base, phys_addr_t size,
-			 struct gen_pool *pool, bool enforce);
+int execmem_confine_init(struct gen_pool *pool, bool enforce);
 
 /* True once a window has been registered. */
 bool execmem_confine_active(void);
@@ -241,10 +240,19 @@ bool execmem_confine_enforced(void);
 void execmem_confine_window(phys_addr_t *base, phys_addr_t *size);
 
 /*
+ * Record the window once it is reserved. This comes ahead of the pool, so that
+ * nothing can release window pages between the two.
+ */
+void execmem_confine_set_window(phys_addr_t base, phys_addr_t size);
+
+/*
  * True if @pfn is in the window. Userspace can't execute from the window, so
  * such a page must never reach the page allocator.
  */
 bool execmem_confine_pfn_in_window(unsigned long pfn);
+
+/* True if any of [@start, @start + @size) is in the window. */
+bool execmem_confine_overlaps(phys_addr_t start, phys_addr_t size);
 
 /*
  * Internal backing allocator/free used by mm/execmem.c for EXECMEM_CONFINE
@@ -276,6 +284,7 @@ unsigned long execmem_confine_arch_verify(phys_addr_t base, phys_addr_t size,
 static inline bool execmem_confine_active(void) { return false; }
 static inline bool execmem_confine_enforced(void) { return false; }
 static inline bool execmem_confine_pfn_in_window(unsigned long pfn) { return false; }
+static inline bool execmem_confine_overlaps(phys_addr_t start, phys_addr_t size) { return false; }
 #endif /* CONFIG_EXECMEM_CONFINE */
 
 #endif /* _LINUX_EXECMEM_ALLOC_H */

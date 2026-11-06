@@ -16,6 +16,9 @@
  */
 void ctxr_exec_reserve(void);
 
+/* Close any hole left in the window before memblock releases free memory. */
+void ctxr_exec_keep_reserved(void);
+
 /*
  * Build the gen_pool over the reserved window and register it with the execmem
  * confinement core. Called from execmem_arch_setup(). Returns true when
@@ -31,6 +34,7 @@ bool ctxr_exec_execmem_setup(void);
 bool ctxr_exec_efi_runtime_ok(void);
 #else
 static inline void ctxr_exec_reserve(void) {}
+static inline void ctxr_exec_keep_reserved(void) {}
 static inline bool ctxr_exec_execmem_setup(void) { return false; }
 static inline bool ctxr_exec_efi_runtime_ok(void) { return true; }
 #endif
