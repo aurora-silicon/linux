@@ -847,9 +847,10 @@ void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_
 
 /*
  * Every internal panel gets an identity, so userspace can tell it apart and
- * keep per-display settings such as its brightness.
+ * keep per-display settings such as its brightness.  The identity state is
+ * allocated at probe (bind may fail and run again); bind fills it in.
  */
-static int dcp_panel_adt_identity(struct apple_dcp *dcp)
+static void dcp_panel_adt_identity(struct apple_dcp *dcp)
 {
 	bool desktop = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	struct dcp_panel_adt panel = {
@@ -880,26 +881,23 @@ static int dcp_panel_adt_identity(struct apple_dcp *dcp)
 		break;
 	}
 	of_node_put(np);
-	/* Bind runs again after an unbind; the identity is the same panel's. */
-	if (!dcp->panel_identity) {
-		dcp->panel_identity = devm_kzalloc(dcp->dev, sizeof(*dcp->panel_identity),
-						   GFP_KERNEL);
-		if (!dcp->panel_identity)
-			return -ENOMEM;
-	}
-	/* The board's OF panel dimensions remain valid if ADT has none. */
+	/*
+	 * The board's OF panel dimensions remain valid if ADT has none.  With
+	 * the notch hidden the modes are trimmed, so keep OF's adj-height-mm.
+	 */
 	dcp->panel.width_mm = panel.width_mm;
-	dcp->panel.height_mm = panel.height_mm;
-	dcp->panel_identity->adt = panel.identity;
+	if (!dcp->notch_height)
+		dcp->panel.height_mm = panel.height_mm;
+	if (dcp->panel_identity)
+		dcp->panel_identity->adt = panel.identity;
 	if (desktop)
 		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
 	dev_info(dcp->dev, "panel identity fallback: ADT %s, panel node %s, dimensions %ux%u mm\n",
 		 ret ? "unavailable" : "parsed", panel.found ? "present" : "absent",
-		 panel.width_mm, panel.height_mm);
+		 dcp->panel.width_mm, dcp->panel.height_mm);
 	if (dcp->panel.edr_ceiling)
 		dev_info(dcp->dev, "panel EDR headroom up to %u.%03u\n",
 			 dcp->panel.edr_ceiling / 1000, dcp->panel.edr_ceiling % 1000);
-	return 0;
 }
 
 /* Internal panel identity has no detachable Type-C service or EDID transport. */
@@ -5264,11 +5262,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dcp_panel_read_dimensions(dcp, panel_np);
 		of_node_put(panel_np);
 		/* The M4 IOMFB reports its fixed mode without an EDID. */
-		if (!iomfb_is_m4(dcp)) {
-			ret = dcp_panel_adt_identity(dcp);
-			if (ret)
-				return ret;
-		}
+		if (!iomfb_is_m4(dcp))
+			dcp_panel_adt_identity(dcp);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 	}
@@ -5837,6 +5832,23 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
+	/*
+	 * Probe-lifetime like the desktop state: component bind opens a devres
+	 * group on this device and releases it on failure or unbind.
+	 */
+	if (!iomfb_is_m4(dcp)) {
+		struct device_node *panel_np =
+			of_get_compatible_child(dev->of_node, "apple,panel-mini-led") ?:
+			of_get_compatible_child(dev->of_node, "apple,panel");
+
+		if (panel_np) {
+			of_node_put(panel_np);
+			dcp->panel_identity = devm_kzalloc(dev, sizeof(*dcp->panel_identity),
+							   GFP_KERNEL);
+			if (!dcp->panel_identity)
+				return -ENOMEM;
+		}
+	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)
