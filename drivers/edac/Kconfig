@@ -578,8 +578,8 @@ config EDAC_APPLE_SOC
 	depends on ARCH_APPLE || COMPILE_TEST
 	help
 	  Support for reporting memory-controller, fabric and other platform
-	  errors signalled by Apple silicon SoCs. Fatal errors are reported to
-	  the EDAC core before entering the normal kernel panic path.
+	  errors signalled by Apple silicon SoCs. Each error is counted in the
+	  EDAC core and logged; a source that stays asserted is masked.
 
 config EDAC_VERSALNET
 	tristate "AMD VersalNET DDR Controller"

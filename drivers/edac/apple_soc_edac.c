@@ -2,7 +2,7 @@
 /*
  * Apple SoC platform error reporting
  *
- * Copyright The Asahi Linux Contributors
+ * Copyright The Aurora Silicon Contributors
  */
 
 #include <linux/edac.h>
@@ -10,10 +10,21 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 
 #include "edac_module.h"
 
 #define APPLE_SOC_EDAC_NAME	"apple_soc_edac"
+
+/*
+ * The sources' status registers have no established acknowledge contract,
+ * so a line is masked when it fires and unmasked again after a backoff.
+ * A line still asserted after APPLE_SOC_EDAC_MAX_RETRIES backoffs stays
+ * masked; its count keeps the record.
+ */
+#define APPLE_SOC_EDAC_BACKOFF_MS	1000
+#define APPLE_SOC_EDAC_BACKOFF_MAX_MS	60000
+#define APPLE_SOC_EDAC_MAX_RETRIES	8
 
 struct apple_soc_edac_range {
 	u8 first;
@@ -35,6 +46,10 @@ struct apple_soc_edac_irq {
 	const char *source;
 	unsigned int index;
 	int irq;
+	unsigned int retries;
+	unsigned int backoff_ms;
+	unsigned long last_jiffies;
+	struct delayed_work rearm;
 };
 
 struct apple_soc_edac {
@@ -115,18 +130,48 @@ static const char *apple_soc_edac_source(const struct apple_soc_edac_hw *hw,
 	return NULL;
 }
 
+static void apple_soc_edac_rearm(struct work_struct *work)
+{
+	struct apple_soc_edac_irq *irq_data =
+		container_of(to_delayed_work(work), struct apple_soc_edac_irq,
+			     rearm);
+
+	enable_irq(irq_data->irq);
+}
+
 static irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
 {
 	struct apple_soc_edac_irq *irq_data = data;
 	struct apple_soc_edac *edac = irq_data->edac;
 	char msg[64];
 
-	/* Fatal sources do not return, but stop a second delivery while logging. */
+	/* The source cannot be cleared from here: keep the line masked. */
 	disable_irq_nosync(irq);
-	snprintf(msg, sizeof(msg), "%s source %u (IRQ %d)", irq_data->source,
-		 irq_data->index, irq);
+
+	snprintf(msg, sizeof(msg), "%s source %u", irq_data->source,
+		 irq_data->index);
 	edac_device_handle_ue(edac->dci, 0, 0, msg);
-	panic("Apple SoC fatal hardware error: %s", msg);
+	dev_err_ratelimited(edac->dev, "hardware error: %s (IRQ %d)\n", msg,
+			    irq);
+
+	/* A quiet minute since the last delivery restarts the backoff. */
+	if (time_after(jiffies, irq_data->last_jiffies +
+				msecs_to_jiffies(APPLE_SOC_EDAC_BACKOFF_MAX_MS))) {
+		irq_data->retries = 0;
+		irq_data->backoff_ms = APPLE_SOC_EDAC_BACKOFF_MS;
+	}
+	irq_data->last_jiffies = jiffies;
+
+	if (irq_data->retries++ >= APPLE_SOC_EDAC_MAX_RETRIES) {
+		dev_warn(edac->dev, "%s stays asserted, leaving IRQ %d masked\n",
+			 msg, irq);
+		return IRQ_HANDLED;
+	}
+
+	schedule_delayed_work(&irq_data->rearm,
+			      msecs_to_jiffies(irq_data->backoff_ms));
+	irq_data->backoff_ms = min(irq_data->backoff_ms * 2,
+				   APPLE_SOC_EDAC_BACKOFF_MAX_MS);
 
 	return IRQ_HANDLED;
 }
@@ -192,6 +237,9 @@ static int apple_soc_edac_probe(struct platform_device *pdev)
 		irq_data->source = source;
 		irq_data->index = i;
 		irq_data->irq = irq;
+		irq_data->backoff_ms = APPLE_SOC_EDAC_BACKOFF_MS;
+		irq_data->last_jiffies = jiffies;
+		INIT_DELAYED_WORK(&irq_data->rearm, apple_soc_edac_rearm);
 
 		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 						 apple_soc_edac_irq_thread,
@@ -208,7 +256,7 @@ static int apple_soc_edac_probe(struct platform_device *pdev)
 			enable_irq(edac->irqs[i].irq);
 	}
 
-	dev_info(&pdev->dev, "monitoring %u fatal error sources\n", requested);
+	dev_info(&pdev->dev, "monitoring %u error sources\n", requested);
 
 	return 0;
 
@@ -226,7 +274,10 @@ static void apple_soc_edac_remove(struct platform_device *pdev)
 	unsigned int i;
 
 	for (i = 0; i < edac->hw->num_irqs; i++) {
-		if (edac->irqs[i].source)
+		if (!edac->irqs[i].source)
+			continue;
+		/* A pending rearm would unbalance the disable below. */
+		if (!cancel_delayed_work_sync(&edac->irqs[i].rearm))
 			disable_irq(edac->irqs[i].irq);
 	}
 
@@ -253,6 +304,6 @@ static struct platform_driver apple_soc_edac_driver = {
 };
 module_platform_driver(apple_soc_edac_driver);
 
-MODULE_AUTHOR("The Asahi Linux Contributors");
+MODULE_AUTHOR("The Aurora Silicon Contributors");
 MODULE_DESCRIPTION("Apple SoC platform error reporting driver");
 MODULE_LICENSE("GPL");
