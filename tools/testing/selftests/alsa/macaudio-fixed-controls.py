@@ -74,12 +74,14 @@ struct macaudio_snd_data {
  struct snd_ctl_file *spk_owner; struct snd_soc_card card;
  struct snd_kcontrol **spk_hpfs; unsigned int *spk_hpf_granted;
  unsigned int spk_nr_hpfs, spk_hpf_safe; struct snd_ctl_elem_value *spk_uval;
+ bool spk_granted;
 };
 #define GFP_KERNEL 0
 #define devm_kcalloc(d, n, s, g) calloc(n, s)
 #define kzalloc_obj(o) calloc(1, sizeof(o))
 #define kfree free
 #define lockdep_assert_held(p) ((void)0)
+#define smp_load_acquire(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
 static void snd_ctl_notify(struct snd_card *c, int e, struct snd_ctl_elem_id *i) {}
 static struct snd_soc_dapm_context *snd_soc_dapm_kcontrol_to_dapm(struct snd_kcontrol *k) { return &k->component->dapm; }
 static struct snd_soc_card *snd_soc_dapm_to_card(struct snd_soc_dapm_context *d) { return d->card; }
@@ -224,6 +226,33 @@ static void sense_scenario(void)
   attempts += 5;
  }
 }
+/* The speaker route is fixed while protection is granted, for every file. */
+static void route_scenario(void)
+{
+ struct snd_kcontrol control = {0};
+ struct snd_soc_component reg = {0};
+ struct soc_enum e = { .items = 2, .mask = 1 };
+ struct snd_card card = { .controls = &control };
+ struct macaudio_snd_data ma = {0};
+ struct snd_soc_card soc = { .snd_card = &card, .data = &ma };
+ struct snd_ctl_file owner = {0}, other = {0};
+ struct snd_ctl_elem_value v = {0};
+ snprintf(control.id.name, sizeof(control.id.name), "%s", "Speaker Playback Mux");
+ control.count = 1; control.vd[0].access = 3; control.component = &reg; reg.dapm.card = &soc;
+ control.put = snd_soc_put_enum_double; control.private_value = (unsigned long)&e;
+ macaudio_protect_sense(&soc);
+ v.id = control.id; v.value.enumerated.item[0] = 1;
+ check(snd_ctl_elem_write(&card, &other, &v) == 0, "route writable while withdrawn", control.id.name);
+ ma.spk_owner = &owner; ma.spk_granted = true;
+ unsigned int before = reg.writes;
+ v.value.enumerated.item[0] = 0;
+ check(snd_ctl_elem_write(&card, &other, &v) == -EBUSY, "route fixed while granted (other file)", control.id.name);
+ check(snd_ctl_elem_write(&card, &owner, &v) == -EBUSY, "route fixed while granted (owner)", control.id.name);
+ check(before == reg.writes, "route denied before DAPM callback", control.id.name);
+ ma.spk_granted = false;
+ check(snd_ctl_elem_write(&card, &owner, &v) == 0, "route writable after withdrawal", control.id.name);
+ attempts += 4;
+}
 static void hpf_scenario(void)
 {
  const char * const texts[] = { "Disabled", "2 Hz", "50 Hz", "100 Hz", "200 Hz", "400 Hz", "800 Hz" };
@@ -257,6 +286,7 @@ int main(void)
 {
  int values[] = {0, 1, 2, 3, -1}; unsigned int p;
  sense_scenario();
+ route_scenario();
  hpf_scenario();
  for (p = 0; p < sizeof(values) / sizeof(values[0]); p++) {
   please_blow_up_my_speakers = values[p];
@@ -299,6 +329,8 @@ def main():
     parts += re.findall(r"^#define MACAUDIO_\w*HPF\w*\s.*$", ma, re.M)
     parts += [function(ma, "macaudio_sense_owner_check"),
               function(ma, "macaudio_sense_write_check"),
+              *([function(ma, "macaudio_route_check"), function(ma, "macaudio_route_write_check")]
+                if "static int macaudio_route_write_check(" in ma else []),
               function(ma, "macaudio_protect_sense"),
               function(ma, "macaudio_enum_item"),
               function(ma, "macaudio_spk_take_hpfs"),
