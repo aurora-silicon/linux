@@ -16,6 +16,8 @@ description:
 properties:
   compatible:
     oneOf:
+      - description: T8152 SMC with read-only hardware monitoring.
+        const: apple,t8152-smc
       - items:
           - enum:
               - apple,t6020-smc

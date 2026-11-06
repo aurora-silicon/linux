@@ -1689,7 +1689,25 @@ static const struct apple_mbox_hw apple_mbox_t6050_apif_ascwrap_v6_hw = {
 	.has_irq_controls = false,
 };
 
+/*
+ * T8152 SMC post-office mailbox: counted FIFOs share the status register.
+ * Interrupt masking is provided by the interrupt controller, not the mailbox.
+ */
+static const struct apple_mbox_hw apple_mbox_t8152_smc_hw = {
+	.counted_fifo = true,
+	.control_full = GENMASK(11, 8), /* free TX slots */
+	.control_empty = GENMASK(3, 0), /* RX occupancy */
+	.a2i_control = 0x20,
+	.a2i_send0 = 0x10,
+	.a2i_send1 = 0x18,
+	.i2a_control = 0x20,
+	.i2a_recv0 = 0x00,
+	.i2a_recv1 = 0x08,
+	.has_irq_controls = false,
+};
+
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t8152-smc-mailbox", .data = &apple_mbox_t8152_smc_hw },
 	{ .compatible = "apple,t6031-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8122-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8152-gfx-ascwrap-v8", .data = &apple_mbox_t8152_gfx_ascwrap_v8_hw },
