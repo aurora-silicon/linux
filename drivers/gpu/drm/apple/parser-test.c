@@ -1366,20 +1366,20 @@ static void parser_panel_identity(struct kunit *test)
 static void parser_panel_identity_stable(struct kunit *test)
 {
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
-	struct dcp_desktop_state *desktop = kunit_kzalloc(test, sizeof(*desktop), GFP_KERNEL);
+	struct dcp_panel_identity *id = kunit_kzalloc(test, sizeof(*id), GFP_KERNEL);
 	struct dcp_display_metadata metadata = {
 		.manufacturer = "TST", .name = "Synthetic", .product = 42, .serial = 1,
 	};
 	u64 generation;
 
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
-	KUNIT_ASSERT_NOT_NULL(test, desktop);
-	dcp->desktop = desktop;
+	KUNIT_ASSERT_NOT_NULL(test, id);
+	dcp->panel_identity = id;
 	dcp->fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
 	dcp->panel.width_mm = 345;
 	spin_lock_init(&dcp->metadata.lock);
 	dcp_panel_metadata_replace(dcp, &metadata);
-	generation = desktop->panel_metadata_generation;
+	generation = id->generation;
 	KUNIT_EXPECT_TRUE(test, dcp_panel_metadata_current(dcp, generation));
 	dcp_panel_metadata_replace(dcp, NULL);
 	dcp_panel_metadata_replace(dcp, &metadata);
@@ -1389,11 +1389,11 @@ static void parser_panel_identity_stable(struct kunit *test)
 		dcp_panel_metadata_replace(dcp, &partial);
 	}
 	KUNIT_EXPECT_TRUE(test, dcp_panel_metadata_current(dcp, generation));
-	KUNIT_EXPECT_EQ(test, desktop->panel_metadata.serial, 1U);
+	KUNIT_EXPECT_EQ(test, id->metadata.serial, 1U);
 	metadata.serial++;
 	dcp_panel_metadata_replace(dcp, &metadata);
 	KUNIT_EXPECT_FALSE(test, dcp_panel_metadata_current(dcp, generation));
-	KUNIT_EXPECT_EQ(test, desktop->panel_metadata.serial, 2U);
+	KUNIT_EXPECT_EQ(test, id->metadata.serial, 2U);
 }
 
 static void parser_identity_emit(void *data, const char *key, u32 len,
@@ -1454,10 +1454,13 @@ static void parser_panel_of_dimensions(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp->panel.height_mm, 223U);
 }
 
-static void parser_panel_j616s_publication(struct kunit *test)
+/* Publish a panel's ADT identity through dcp_get_modes() on a firmware profile. */
+static void parser_panel_publication(struct kunit *test,
+				     enum dcp_firmware_version fw_compat, bool desktop_state)
 {
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
 	struct dcp_desktop_state *desktop = kunit_kzalloc(test, sizeof(*desktop), GFP_KERNEL);
+	struct dcp_panel_identity *id = kunit_kzalloc(test, sizeof(*id), GFP_KERNEL);
 	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
 	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
 	struct dcp_panel_adt panel = {
@@ -1478,6 +1481,7 @@ static void parser_panel_j616s_publication(struct kunit *test)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, drm);
 	KUNIT_ASSERT_NOT_NULL(test, dcp);
 	KUNIT_ASSERT_NOT_NULL(test, desktop);
+	KUNIT_ASSERT_NOT_NULL(test, id);
 	KUNIT_ASSERT_NOT_NULL(test, pipeline);
 	KUNIT_ASSERT_NOT_NULL(test, connector);
 	ret = drmm_connector_init(drm, &connector->base, &parser_route_connector_funcs,
@@ -1492,11 +1496,12 @@ static void parser_panel_j616s_publication(struct kunit *test)
 	mutex_init(&dcp->dcpavserv.lock);
 	mutex_init(&dcp->hpd_mutex);
 	dcp->dev = dev;
-	dcp->desktop = desktop;
-	dcp->fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+	dcp->desktop = desktop_state ? desktop : NULL;
+	dcp->panel_identity = id;
+	dcp->fw_compat = fw_compat;
 	dcp->panel.width_mm = panel.width_mm;
 	dcp->panel.height_mm = panel.height_mm;
-	desktop->panel_adt_identity = panel.identity;
+	id->adt = panel.identity;
 	dcp->connector = connector;
 	dcp->modes = &mode;
 	dcp->nr_modes = 1;
@@ -1530,6 +1535,42 @@ static void parser_panel_j616s_publication(struct kunit *test)
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
 	dcp_modes_release(dcp);
+}
+
+static void parser_panel_j616s_publication(struct kunit *test)
+{
+	parser_panel_publication(test, DCP_FIRMWARE_V_26_6_DESKTOP, true);
+}
+
+/*
+ * A laptop panel on the H17P (Neo) or an M1/M2 firmware has no desktop
+ * state and no EDID transport: it still gets the ADT identity.
+ */
+static void parser_panel_h17p_publication(struct kunit *test)
+{
+	parser_panel_publication(test, DCP_FIRMWARE_H17P, false);
+}
+
+static void parser_panel_v13_5_publication(struct kunit *test)
+{
+	parser_panel_publication(test, DCP_FIRMWARE_V_13_5, false);
+}
+
+/* No internal panel identity: nothing is invented for the connector. */
+static void parser_panel_identity_absent(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct dcp_display_metadata metadata = { .manufacturer = "TST", .product = 42 };
+	u64 generation = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	dcp->fw_compat = DCP_FIRMWARE_H17P;
+	dcp->panel.width_mm = 300;
+	spin_lock_init(&dcp->metadata.lock);
+	dcp_panel_metadata_replace(dcp, &metadata);
+	KUNIT_EXPECT_FALSE(test, dcp_panel_metadata_current(dcp, 0));
+	KUNIT_EXPECT_EQ(test, PTR_ERR(dcp_panel_edid_snapshot(dcp, &panel_test_mode, 1,
+							       &generation)), -ENODEV);
 }
 
 static void blob_timing_dimension(struct parser_blob *blob, const char *key,
@@ -1637,6 +1678,9 @@ static void parser_desktop_metadata_timing(struct kunit *test)
 static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_panel_of_dimensions),
 	KUNIT_CASE(parser_panel_j616s_publication),
+	KUNIT_CASE(parser_panel_h17p_publication),
+	KUNIT_CASE(parser_panel_v13_5_publication),
+	KUNIT_CASE(parser_panel_identity_absent),
 	KUNIT_CASE(parser_adt_bounds),
 	KUNIT_CASE(parser_identity_bounds),
 	KUNIT_CASE(parser_panel_identity_stable),
