@@ -503,13 +503,17 @@ impl T8152AopAudio {
         self.run(&self.hpai)
     }
 
-    /// Microphone close, after the channel is released: a queued start
-    /// finishes first, then `pw0 ` and the leaves.
-    fn hpai_shutdown(&self) {
+    /// Finish a queued firmware start before retiring the DMA runtime.
+    fn flush_hpai_start(&self) {
         self.hpai_want_run.store(false, Relaxed);
         // SAFETY: the work item lives in `self`; flushing waits for a queued
         // `hpai_go`.
         unsafe { bindings::flush_work(Work::raw_get(&self.hpai_start_work)) };
+    }
+
+    /// Microphone close, after the channel is released: `pw0 ` then leaves.
+    fn hpai_shutdown(&self) {
+        self.flush_hpai_start();
         if self.hpai.running.load(Relaxed) {
             if let Err(e) = self.set_power(&self.hpai, POWER_STATE_PW0) {
                 dev_err!(self.dev, "hpai: pw0 failed: {:?}\n", e);
@@ -1157,10 +1161,25 @@ unsafe extern "C" fn mic_pcm_open(substream: *mut bindings::snd_pcm_substream) -
 unsafe extern "C" fn mic_pcm_close(substream: *mut bindings::snd_pcm_substream) -> i32 {
     // SAFETY: by the caller's contract.
     let data = unsafe { mic_data(substream) };
+    data.flush_hpai_start();
     // SAFETY: the dmaengine runtime was set up in `mic_pcm_open`.
     let ret = unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
     data.hpai_shutdown();
     ret
+}
+
+/// Finish queued firmware work and asynchronous DMA termination before ALSA
+/// reuses or frees the capture buffer, as in the T8140 capture path.
+///
+/// # Safety
+///
+/// Called by ALSA with a live microphone substream and dmaengine runtime.
+unsafe extern "C" fn mic_pcm_sync_stop(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    // SAFETY: by the caller's contract.
+    let data = unsafe { mic_data(substream) };
+    data.flush_hpai_start();
+    // SAFETY: the runtime remains live until close.
+    unsafe { bindings::snd_dmaengine_pcm_sync_stop(substream) }
 }
 
 /// # Safety
@@ -1243,7 +1262,7 @@ static MIC_PCM_OPS: bindings::snd_pcm_ops = bindings::snd_pcm_ops {
     hw_free: None,
     prepare: Some(mic_pcm_prepare),
     trigger: Some(mic_pcm_trigger),
-    sync_stop: None,
+    sync_stop: Some(mic_pcm_sync_stop),
     pointer: Some(bindings::snd_dmaengine_pcm_pointer),
     get_time_info: None,
     fill_silence: None,
@@ -1458,7 +1477,12 @@ impl platform::Driver for T8152AopAudioDriver {
         let mic = if data.leap.is_empty() {
             None
         } else {
-            match MicCard::new(&data) {
+            // Initialize the shared output service before exposing HPAI.
+            // This is standby only: no DMA, running state or codec unmute.
+            // No userspace stream can race this before card registration.
+            match data.set_power(&data.cout, POWER_STATE_PW0)
+                .and_then(|_| MicCard::new(&data))
+            {
                 Ok(card) => Some(card),
                 Err(e) => {
                     dev_err!(dev, "microphone card: {:?}\n", e);
