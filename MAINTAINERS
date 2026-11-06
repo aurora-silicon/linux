@@ -2136,6 +2136,7 @@ F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/aop_t8140.rs
 F:	tools/asahi/mt7932*
 F:	tools/testing/apple/
+F:	tools/testing/kunit/configs/apple_dockchannel_hid.config
 F:	tools/testing/kunit/configs/apple_firmware.config
 F:	tools/testing/kunit/configs/apple_t8140_bootstrap.config
 F:	tools/testing/kunit/configs/mt7932.config
