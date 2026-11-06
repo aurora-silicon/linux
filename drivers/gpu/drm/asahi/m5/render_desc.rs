@@ -152,7 +152,6 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) layers: u16,
     /// Sample count: 1, 2 or 4. Defaults to 1, so every existing parameter
     /// vector keeps its exact register program.
-    pub(crate) samples: u8,
     pub(crate) utile_width: u8,
     pub(crate) utile_height: u8,
     pub(crate) utile_config: u64,
@@ -282,7 +281,6 @@ impl G17pRenderParameters {
             merge_upper_x_bits: 0x3cdd_b3d9,
             merge_upper_y_bits: 0x3cdd_b3d9,
             layers: 1,
-            samples: 1,
             utile_width: 32,
             utile_height: 32,
             utile_config: 0xa000,
@@ -353,15 +351,9 @@ fn geometry(parameters: &G17pRenderParameters) -> Result<Geometry, RenderBuildEr
     }
     let utiles_per_tile_x = TILE_WIDTH / utile_width as u64;
     let utiles_per_tile_y = TILE_HEIGHT / utile_height as u64;
-    // Four samples split the utile in Y. Measured against Apple's own
-    // four-sample render: size1 0x14 -> 0x28, size3 0x20 -> 0x40 and
-    // macro_size 0x40004 -> 0x40008, where only the y term moves. All three
-    // follow from doubling this one term; two samples do not split.
-    let utiles_per_tile_y = if parameters.samples == 4 {
-        utiles_per_tile_y * 2
-    } else {
-        utiles_per_tile_y
-    };
+    // The UAPI's utile height already halves at four samples. Use the actual
+    // dimensions once; a second sample-count factor overallocates tile lists
+    // and publishes a macro size that disagrees with the native register set.
     let utiles_per_tile = utiles_per_tile_x * utiles_per_tile_y;
     let mtile_x1 = align((tiles_x + MACRO_TILES_X - 1) / MACRO_TILES_X, 4);
     let mtile_y1 = align((tiles_y + MACRO_TILES_Y - 1) / MACRO_TILES_Y, 4);
