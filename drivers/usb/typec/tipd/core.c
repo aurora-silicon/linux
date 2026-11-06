@@ -896,6 +896,9 @@ out:
 			dev_dbg(tps->dev, "Type-C connection deferred\n");
 		else if (cd321x_mux_still_held(cd321x, *held))
 			dev_dbg(tps->dev, "Type-C connection still held up: %d\n", ret);
+		/* The DCP route says which display waits; USB goes on. */
+		else if (cd321x_display_taken(ret, tps->h17_display))
+			dev_dbg(tps->dev, "Type-C display waits for a free pipeline: %d\n", ret);
 		else
 			dev_warn(tps->dev, "failed to configure Type-C connection: %d\n", ret);
 	} else if (cd321x->state.alt != cd321x->port_altmode_dp) {

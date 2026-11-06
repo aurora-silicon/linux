@@ -711,10 +711,15 @@ static void cd321x_display_taken_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, true));
 	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT, true));
 	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, true));
-	/* Other SoCs keep -EBUSY as the taken display. */
+	/*
+	 * Other SoCs: the DCP route's -ENOSPC (no free pipeline) is a taken
+	 * display too, so a dock on the other port keeps its USB path; -EBUSY
+	 * stays a taken display there.
+	 */
+	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC, false));
 	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-EBUSY, false));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ENOSPC, false));
 	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT, false));
 	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, false));
 }
 
