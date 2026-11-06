@@ -431,11 +431,11 @@ impl Feed {
     /// Whether the GPU itself is the bottleneck: passes follow each other with refill gaps
     /// under a quarter of their busy time, and the feed does not see host-refill-bound work.
     /// Lingers like streaming, so a pause of more than a few milliseconds ends it.
-    pub(crate) fn gpu_bound(&self) -> bool {
+    /// `now` is a monotonic time the caller read.
+    pub(crate) fn gpu_bound(&self, now: u64) -> bool {
         if !cfg!(CONFIG_CPU_FREQ) {
             return false;
         }
-        let now = Self::now();
         self.detector.bound(now) && !self.detector.wanted(now)
     }
 
