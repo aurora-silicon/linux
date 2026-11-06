@@ -35,6 +35,7 @@ def check(tree, output, dtc, board, soc, pmp_addr, report_addr, trial, avd_vmax=
         # unclaimed bit 10 before installing its core/perf graph.
         wrapper = ('#include "t8112-j413.dts"\n'
                    '&avd { power-domains = <&ps_avd_sys>; };\n'
+                   '&avd { /delete-property/ power-domain-names; };\n'
                    '&pmp_report_avd_sys { status = "disabled"; };\n')
         (output / f'{board}-{profile}.dts').write_text(wrapper)
         command += ['-I', str(board_dir), '-']
@@ -70,15 +71,20 @@ def check(tree, output, dtc, board, soc, pmp_addr, report_addr, trial, avd_vmax=
     for device, entry in (('dcp', 'pmp_report_disp0'), ('avd', 'pmp_report_avd_sys')):
         device_path = get(dtb, '/__symbols__', device)[0]
         entry_path = get(dtb, '/__symbols__', entry)[0]
-        power = get(dtb, device_path, 'power-domains', 'x')[0]
+        power = get(dtb, device_path, 'power-domains', 'x')
         expected = get(dtb, entry_path, 'phandle', 'x')[0]
         uses_report = trial and not (avd_vmax and device == 'avd')
-        assert (int(power, 16) == int(expected, 16)) == uses_report
+        if soc == 't8112' and device == 'avd' and trial and not avd_vmax:
+            core = get(dtb, device_path, 'resets', 'x')
+            assert power == [core[0], expected]
+            assert get(dtb, device_path, 'power-domain-names') == ['core', 'perf']
+        else:
+            assert (int(power[0], 16) == int(expected, 16)) == uses_report
+            if soc == 't8112' and device == 'avd':
+                assert power == get(dtb, device_path, 'resets', 'x')
+                assert get(dtb, device_path, 'power-domain-names', default=[]) == []
         if avd_vmax and device == 'avd':
             assert get(dtb, entry_path, 'status') == ['disabled']
-            assert (get(dtb, device_path, 'power-domains', 'x') ==
-                    get(dtb, device_path, 'resets', 'x'))
-            assert get(dtb, device_path, 'power-domain-names', default=[]) == []
     if soc == 't8112':
         gpu = get(dtb, '/__symbols__', 'gpu')[0]
         gfx = get(dtb, '/__symbols__', 'pmp_report_gfx')[0]

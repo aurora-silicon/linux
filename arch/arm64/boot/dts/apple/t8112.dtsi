@@ -1764,8 +1764,12 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 667 IRQ_TYPE_LEVEL_HIGH>,
 				<AIC_IRQ 668 IRQ_TYPE_LEVEL_HIGH>;
+			#ifdef APPLE_USE_PMP
 			power-domains = <&ps_avd_sys>, <&pmp_report_avd_sys>;
 			power-domain-names = "core", "perf";
+			#else
+			power-domains = <&ps_avd_sys>;
+			#endif
 			resets = <&ps_avd_sys>;
 			reg = <0x2 0x69080000 0x0 0x10000>,
 				<0x2 0x69090000 0x0 0x10000>,
