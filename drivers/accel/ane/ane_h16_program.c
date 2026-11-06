@@ -1160,7 +1160,10 @@ static int h16_wait_report(struct ane_h16_session *s, struct ane_h16_pending *re
 		if (s->lock && t->ops->service) {
 			t->ops->service(t->ctx);
 			mutex_unlock(s->lock);
-			ane_fw_poll_pause(now - start);
+			if (t->ops->pause)
+				t->ops->pause(t->ctx, now - start);
+			else
+				ane_fw_poll_pause(now - start);
 			mutex_lock(s->lock);
 		} else if (s->lock) {
 			mutex_unlock(s->lock);
