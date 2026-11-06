@@ -26,6 +26,7 @@
 #include <linux/execmem.h>
 #include <linux/genalloc.h>
 #include <linux/kasan.h>
+#include <linux/kmemleak.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
@@ -215,6 +216,13 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	    kasan_alloc_module_shadow(area->addr, size, GFP_KERNEL) < 0)
 		goto err_xa;
 
+	/*
+	 * __vmalloc_node_range() does these two for vmalloc memory. KASAN doesn't
+	 * tag executable memory, so the address stays as it is.
+	 */
+	area->addr = kasan_unpoison_vmalloc(area->addr, size, KASAN_VMALLOC_VM_ALLOC);
+	kmemleak_vmalloc(area, size, GFP_KERNEL);
+
 	return area->addr;
 
 err_xa:
@@ -260,6 +268,8 @@ bool execmem_confine_free(void *ptr)
 		return false;
 
 	nr = ck->size >> PAGE_SHIFT;
+
+	kmemleak_free(ptr);
 
 	/*
 	 * We bypass vfree(), so VM_FLUSH_RESET_PERMS does not run for us: drop
