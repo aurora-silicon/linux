@@ -48,6 +48,11 @@ DRAM, and the device tree's window then applies if there is one. A window from
 the device tree that can't work is fatal when enforcing, because the kernel
 can't run on the confined cores outside it.
 
+``enforce`` only decides whether a confinement violation found by the verifier
+(see below) is fatal. Whether the hardware confines a core does not depend on
+it, so everything else in this document applies whenever a window is active,
+enforcing or not.
+
 How it works
 ============
 
@@ -85,7 +90,7 @@ it up. Anything EL0 can execute therefore lives outside the window:
   the executable code needs.
 
 The zero page stays in the window, so a program that jumps into fresh executable
-memory before writing it still gets there. When the window is enforcing, an EL0
+memory before writing it still gets there. When a window is active, an EL0
 instruction permission fault on a present, executable mapping of a window page
 logs the task and its address and PFN, then kills it with an uncatchable
 ``SIGSEGV`` rather than retrying. Any other fault takes the usual path.
@@ -95,10 +100,10 @@ EFI runtime services
 
 EFI runtime code runs at EL2 on whichever core ``efi_rts_wq`` happens to be on,
 so on a confined core it has to be inside the window too. When a window is
-enforcing and any ``EFI_RUNTIME_SERVICES_CODE`` region is outside it, or isn't
+active and any ``EFI_RUNTIME_SERVICES_CODE`` region is outside it, or isn't
 aligned to the kernel's page size, the kernel warns once and turns runtime
 services off for that boot, as ``efi=noruntime`` would. When all of it is inside,
-runtime services stay on. A window in reporting mode leaves them on.
+runtime services stay on.
 
 What a confined machine gives up
 ================================
@@ -111,7 +116,7 @@ CPU hotplug
 kexec and crash kernels
     The relocation code runs from an ordinary page, outside the window, and a
     crash dump can start on a confined core, where it would hang during a panic.
-    While a window is enforcing, ``machine_kexec_prepare()`` refuses both, so
+    While a window is active, ``machine_kexec_prepare()`` refuses both, so
     ``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``.
 
 Hibernate

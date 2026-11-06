@@ -28,7 +28,7 @@ void ctxr_exec_keep_reserved(void);
 bool ctxr_exec_execmem_setup(void);
 
 /*
- * False if a window is enforcing and EFI runtime code can't run behind it.
+ * False if a window is active and EFI runtime code can't run behind it.
  * Warns once when it returns false.
  */
 bool ctxr_exec_efi_runtime_ok(void);

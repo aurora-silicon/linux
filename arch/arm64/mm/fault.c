@@ -618,7 +618,7 @@ static bool el0_fetch_refused_by_window(struct mm_struct *mm, unsigned long addr
 	unsigned long pfn = 0;
 
 	if (!is_el0_instruction_abort(esr) || !esr_fsc_is_permission_fault(esr) ||
-	    !execmem_confine_enforced())
+	    !execmem_confine_active())
 		return false;
 
 	if (mmap_read_lock_killable(mm))

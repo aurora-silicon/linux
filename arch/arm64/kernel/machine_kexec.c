@@ -59,7 +59,7 @@ int machine_kexec_prepare(struct kimage *kimage)
 	 * The relocation code runs from an ordinary page, outside the window,
 	 * and a crash dump can start on a core enforcing it.
 	 */
-	if (execmem_confine_enforced()) {
+	if (execmem_confine_active()) {
 		pr_err("Can't kexec: the kernel's code is confined to a CTXR window.\n");
 		return -EOPNOTSUPP;
 	}

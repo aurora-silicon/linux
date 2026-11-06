@@ -318,7 +318,7 @@ bool __init ctxr_exec_efi_runtime_ok(void)
 {
 	efi_memory_desc_t *md;
 
-	if (!IS_ENABLED(CONFIG_EFI) || !ctxr_active || !ctxr_enforce)
+	if (!IS_ENABLED(CONFIG_EFI) || !ctxr_active)
 		return true;
 
 	for_each_efi_memory_desc(md) {
