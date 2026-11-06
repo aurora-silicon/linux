@@ -96,6 +96,9 @@ patternProperties:
     properties:
       compatible:
         oneOf:
+          - items:
+              - const: apple,t6020-pmp-v2-report-entry
+              - const: apple,t6000-pmp-v2-report-entry
           - const: apple,t6000-pmp-v2-report-entry
           - const: apple,t8140-pmp-v2-report-entry
           - items:

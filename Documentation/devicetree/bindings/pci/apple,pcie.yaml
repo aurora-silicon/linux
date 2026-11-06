@@ -61,6 +61,9 @@ properties:
               - apple,t8122-pcie
           - const: apple,t6020-pcie
       - const: apple,t6020-pcie
+      - items:
+          - const: apple,t6020-pcie-ge
+          - const: apple,t6020-pcie
       - const: apple,t8140-pcie
       - const: apple,t8132-pcie
       - const: apple,t8103-pciec
