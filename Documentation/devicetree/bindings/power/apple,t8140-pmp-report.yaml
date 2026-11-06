@@ -47,6 +47,7 @@ properties:
     oneOf:
       - enum:
           - apple,t6000-pmp-v2-report
+          - apple,t6020-pmp-v2-report
           - apple,t6030-pmp-v2-report
           - apple,t6041-pmp-v2-report
           - apple,t8112-pmp-v2-report
