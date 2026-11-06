@@ -10,13 +10,13 @@ maintainers:
   - Ryan Murray <ryan@aurorasilicon.org>
 
 description: |
-  Each DisplayPort audio interface has no application-processor registers.
-  Samples arrive through SIO, and the graph connects the interface to port 0
-  of the display processor that owns its audio service. An interface without
-  an assigned display processor has no graph connection and remains disabled.
+  The external display processor provides a DisplayPort/HDMI audio service.
+  Its DisplayPort audio interface has no application-processor registers.
+  Samples arrive through SIO, and the graph connects this interface to
+  port 0 of the display processor that owns the audio service.
 
-  T6041 requires a generation-specific SIO firmware backend and a compatible
-  display audio service before these interfaces can be enabled.
+  T6041 interfaces remain disabled until a generation-specific SIO firmware
+  backend and loader handoff are available and display audio is qualified.
 
 select:
   properties:
@@ -59,26 +59,6 @@ required:
   - dmas
   - dma-names
   - power-domains
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6030-dpaudio
-    then:
-      required:
-        - ports
-
-  - if:
-      not:
-        required:
-          - ports
-    then:
-      properties:
-        status:
-          const: disabled
-      required:
-        - status
+  - ports
 
 additionalProperties: false

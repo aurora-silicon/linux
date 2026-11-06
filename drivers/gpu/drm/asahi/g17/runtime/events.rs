@@ -38,16 +38,19 @@ impl event::Transport for Service<'_> {
     }
     fn statistics(&mut self, role: Role) {
         let firmware = &mut *self.firmware;
+        firmware.observe_statistics_power();
         firmware
             .rings
             .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
+        firmware.observe_statistics_power();
     }
     fn drain(
         &mut self,
         role: Role,
         mut consume: impl FnMut(&mut Self, Event) -> Result<bool>,
     ) -> Result {
-        let mut events = channel::Events::new(role, self.firmware.primary.state.shared.variant.graph);
+        let mut events =
+            channel::Events::new(role, self.firmware.primary.state.shared.variant.graph);
         while let Some(event) =
             events.next(&self.firmware.primary.state.shared.dev, &self.firmware.init)?
         {
@@ -155,6 +158,9 @@ impl recovery::Queues for Service<'_> {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.firmware.queues.render_pass_started(qid, stamp)
     }
+    fn render_culprit(&self, blamed: u8) -> Option<u128> {
+        self.firmware.queues.render_culprit(blamed)
+    }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
         for queue in self
@@ -232,7 +238,9 @@ impl recovery::Queues for Service<'_> {
             })
     }
     fn report_blamed_render(&self, qid: u8) {
-        self.firmware.queues.report_render_recovery(qid, &self.firmware.port);
+        self.firmware
+            .queues
+            .report_render_recovery(qid, &self.firmware.port);
     }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self
@@ -264,11 +272,9 @@ impl Firmware {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
-            queue.release_witnessed(
-                state,
-                |owner| port.qos_complete(&[owner]),
-                &mut |event| deferred.push(event),
-            )?;
+            queue.release_witnessed(state, |owner| port.qos_complete(&[owner]), &mut |event| {
+                deferred.push(event)
+            })?;
         }
         Ok(())
     }
@@ -297,6 +303,7 @@ impl Firmware {
 
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
+        self.rings.invalidate_statistics();
         if self.recovery.restart_limit(super::now_ns()) {
             pr_warn!("G17: restart storm limit reached\n");
             return Err(ETIMEDOUT);
@@ -313,8 +320,15 @@ impl Firmware {
         });
         // Publishers without the device mutex stamp their tickets with this
         // mirror; they rejoin only after preparation admission reopens.
-        service.firmware.port.set_generation(service.firmware.recovery.generation());
+        service
+            .firmware
+            .port
+            .set_generation(service.firmware.recovery.generation());
+        service.firmware.rings.invalidate_statistics();
         let result = result?;
+        if result.leftover && service.firmware.recovery.forgive_restart() {
+            pr_warn!("G17: recovery dropped queued work of an already failed VM; not counted as a restart storm\n");
+        }
         if let Some(error) = result.target_error {
             dev_warn!(
                 shared.dev.as_ref(),
@@ -397,7 +411,8 @@ impl crate::g17::Shared {
         deferred.finish();
         crate::g17::trace::event(1);
         if recover {
-            self.preparations.wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
+            self.preparations
+                .wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }
         let _settled;
         let mut state = self.state.lock();
@@ -458,8 +473,10 @@ impl crate::g17::Shared {
             || self.progress.has_waiters()
             || self.queues.has_waiters()
             || self.renders.has_waiters()
-            || now.saturating_sub(self.housekeeping_ns.load(core::sync::atomic::Ordering::Relaxed))
-                >= HOUSEKEEPING_NS;
+            || now.saturating_sub(
+                self.housekeeping_ns
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            ) >= HOUSEKEEPING_NS;
         let mut lingers = None;
         let mut pools = None;
         let mut shrinking = false;

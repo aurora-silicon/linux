@@ -14,6 +14,7 @@ use kernel::drm::gem::BaseObject;
 struct Binding {
     gem: ARef<gem::Object>,
     offset: usize,
+    bind_sequence: u64,
 }
 struct Bindings {
     generation: u64,
@@ -115,6 +116,7 @@ impl Vm {
         &self,
         gem: &ARef<gem::Object>,
         update: &PreparedBinding,
+        bind_sequence: u64,
     ) -> RetiredBindings {
         let mut retired = RetiredBindings::new();
         if update.touched == 0 {
@@ -136,6 +138,7 @@ impl Vm {
                 *slot = Some(Binding {
                     gem: gem.clone(),
                     offset,
+                    bind_sequence,
                 });
             }
         }
@@ -173,6 +176,10 @@ impl Vm {
     }
 
     pub(crate) fn untrack_context_object(&self, gem: &gem::Object) {
+        self.untrack_context_object_before(gem, u64::MAX);
+    }
+
+    pub(super) fn untrack_context_object_before(&self, gem: &gem::Object, sequence: u64) {
         let Some(context) = self.context_bindings.as_ref() else {
             return;
         };
@@ -181,7 +188,8 @@ impl Vm {
         for slot in &mut bindings.slots {
             if slot
                 .as_ref()
-                .is_some_and(|binding| core::ptr::eq(&*binding.gem, gem))
+                .is_some_and(|binding| core::ptr::eq(&*binding.gem, gem)
+                    && binding.bind_sequence <= sequence)
             {
                 *slot = None;
                 touched = true;

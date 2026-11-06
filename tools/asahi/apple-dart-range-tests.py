@@ -43,26 +43,28 @@ struct io_pgtable { struct io_pgtable_cfg cfg; };
 struct apple_dart;
 struct apple_dart_stream_map { struct apple_dart *dart; unsigned long sidmap[1]; };
 struct apple_dart_hw { int (*invalidate_tlb)(struct apple_dart_stream_map *); };
-struct apple_dart { int num_streams, locked, version; void *dev; struct apple_dart_hw *hw; };
+struct apple_dart { int num_streams, locked, version; bool fw_mirror, fw_handoff, managed_sids; void *dev; struct apple_dart_hw *hw; };
 struct apple_dart_atomic_stream_map { struct apple_dart *dart; unsigned long sidmap[1]; };
 struct apple_dart_domain {
- void *pgtbl_ops, *dcp; struct apple_dart_atomic_stream_map streams[2]; int count;
+ void *pgtbl_ops; bool dcp; struct apple_dart_atomic_stream_map streams[2]; int count;
  u64 dma_offset, mask;
 };
 #define for_each_stream_map(i,d,m) for ((i)=0; (i)<(d)->count && ((m)=&(d)->streams[i],1); (i)++)
-static int powered, power_error, sync_error, range_error, syncs, ranges, fulls;
+static int powered, power_error, sync_error, range_error, syncs, ranges, fulls, firmware_flushes, quarantines, dcp_flushes;
 static u64 seen_first, seen_last;
-static int pm_runtime_resume_and_get(void *dev) { if (power_error) return power_error; powered++; return 0; }
+static int pm_runtime_resume_and_get(void *dev) { if (power_error && !dev) return power_error; powered++; return 0; }
 static void pm_runtime_put(void *dev) { assert(powered>0); powered--; }
-static int apple_dart_dcp_domain_flush(struct apple_dart_domain *domain) {
- (void)domain; assert(!"unexpected DCP dispatch in range fixture"); return -EINVAL;
-}
-static int apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg, struct apple_dart_stream_map *stream, bool sync) {
- assert(sync); syncs++; return sync_error;
+static int apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg, struct apple_dart_stream_map *stream, bool invalidate) {
+ assert(invalidate); syncs++; return sync_error;
 }
 static int apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream,
  int command, bool range, u64 first, u64 last) {
  assert(command==1 && range); ranges++; seen_first=first; seen_last=last; return range_error;
+}
+static int apple_dart_dcp_domain_flush(struct apple_dart_domain *domain) { assert(domain->dcp); dcp_flushes++; return -EAGAIN; }
+static void apple_dart_managed_quarantine(struct apple_dart *dart) { assert(dart->managed_sids); quarantines++; }
+static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream, u64 first, u64 last) {
+ firmware_flushes++; seen_first=first; seen_last=last; return range_error;
 }
 static int full(struct apple_dart_stream_map *stream) { fulls++; return 0; }
 '''
@@ -70,7 +72,7 @@ static int full(struct apple_dart_stream_map *stream) { fulls++; return 0; }
     source += r'''
 static void reset(void) {
  assert(powered==0); power_error=sync_error=range_error=syncs=ranges=fulls=0;
- seen_first=seen_last=0;
+ seen_first=seen_last=0; firmware_flushes=quarantines=dcp_flushes=0;
 }
 int main(void) {
  struct apple_dart_hw hw={.invalidate_tlb=full};
@@ -92,14 +94,35 @@ int main(void) {
  assert(fulls==1 && ranges==0 && syncs==0);
  reset(); dart.locked=1; sync_error=-EBUSY;
  assert(apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff)==-EBUSY);
- assert(ranges==0 && fulls==0 && powered==0);
+ assert(ranges==1 && fulls==0 && powered==0);
  reset(); power_error=-EHOSTDOWN;
  assert(apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff)==-EHOSTDOWN);
  assert(syncs==0 && ranges==0 && fulls==0 && powered==0);
  reset(); range_error=-ETIMEDOUT;
  assert(apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff)==-ETIMEDOUT);
  assert(ranges==1 && powered==0);
- reset(); domain.streams[0].sidmap[0]=0;
+ reset(); dart.managed_sids=true; range_error=-ETIMEDOUT;
+ assert(apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff)==-ETIMEDOUT);
+ assert(ranges==1 && quarantines==1 && powered==0);
+ reset(); sync_error=-EBUSY; range_error=-ETIMEDOUT;
+ assert(apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff)==-EBUSY);
+ assert(ranges==1 && quarantines==1 && powered==0);
+ reset(); dart.fw_mirror=true;
+ assert(!apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff));
+ assert(firmware_flushes==1 && ranges==0 && syncs==1);
+ reset(); dart.fw_mirror=false; dart.fw_handoff=true;
+ assert(!apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff));
+ assert(firmware_flushes==1 && ranges==0);
+ reset(); dart.fw_handoff=false; domain.dcp=true;
+ assert(apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff)==-EAGAIN);
+ assert(dcp_flushes==1 && ranges==0 && syncs==0);
+ reset(); domain.dcp=false;
+ struct apple_dart second=dart; second.dev=(void *)1;
+ domain.streams[1].dart=&second; domain.streams[1].sidmap[0]=1; domain.count=2;
+ power_error=-EHOSTDOWN;
+ assert(apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff)==-EHOSTDOWN);
+ assert(ranges==1 && syncs==1 && powered==0);
+ reset(); domain.count=1; domain.streams[0].sidmap[0]=0;
  assert(!apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff));
  assert(syncs==0 && ranges==0 && fulls==0 && powered==0);
  puts("PASS: device DVA, low window, legacy/unlocked fallback, sync/power/command errors and empty stream");

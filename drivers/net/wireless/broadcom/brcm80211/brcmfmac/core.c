@@ -1725,7 +1725,6 @@ int brcmf_netdev_wait_pend8021x(struct brcmf_if *ifp)
 void brcmf_bus_change_state(struct brcmf_bus *bus, enum brcmf_bus_state state)
 {
 	struct brcmf_pub *drvr = bus->drvr;
-	struct net_device *ndev;
 	int ifidx;
 
 	brcmf_dbg(TRACE, "%d -> %d\n", bus->state, state);
@@ -1737,16 +1736,10 @@ void brcmf_bus_change_state(struct brcmf_bus *bus, enum brcmf_bus_state state)
 
 	bus->state = state;
 
-	if (state == BRCMF_BUS_UP) {
-		for (ifidx = 0; ifidx < BRCMF_MAX_IFS; ifidx++) {
-			if ((drvr->iflist[ifidx]) &&
-			    (drvr->iflist[ifidx]->ndev)) {
-				ndev = drvr->iflist[ifidx]->ndev;
-				if (netif_queue_stopped(ndev))
-					netif_wake_queue(ndev);
-			}
-		}
-	}
+	for (ifidx = 0; ifidx < BRCMF_MAX_IFS; ifidx++)
+		brcmf_txflowblock_if(drvr->iflist[ifidx],
+				     BRCMF_NETIF_STOP_REASON_BUS,
+				     state != BRCMF_BUS_UP);
 }
 
 int __init brcmf_core_init(void)
@@ -1779,4 +1772,3 @@ void __exit brcmf_core_exit(void)
 	brcmf_usb_exit();
 	brcmf_pcie_exit();
 }
-

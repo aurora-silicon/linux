@@ -12,6 +12,7 @@
 #include "iomfb_plane.h"
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_framebuffer.h>
@@ -363,7 +364,7 @@ static u32 drm_format_to_dcp(u32 drm, enum drm_color_range range)
 static enum dcp_xfer_func get_xfer_func(bool is_yuv, enum drm_color_encoding enc)
 {
 	if (!is_yuv)
-		return DCP_XFER_FUNC_SDR;
+		return DCP_XFER_FUNC_SRGB;
 
 	switch (enc) {
 	case DRM_COLOR_YCBCR_BT601:
@@ -372,7 +373,7 @@ static enum dcp_xfer_func get_xfer_func(bool is_yuv, enum drm_color_encoding enc
 	case DRM_COLOR_YCBCR_BT2020:
 		return DCP_XFER_FUNC_BT1886;
 	default:
-		return DCP_XFER_FUNC_SDR;
+		return DCP_XFER_FUNC_SRGB;
 	}
 }
 
@@ -380,7 +381,7 @@ static enum dcp_colorspace get_colorspace(bool is_yuv,
 					  enum drm_color_encoding enc)
 {
 	if (!is_yuv)
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_P3_D65;
 
 	switch (enc) {
 	case DRM_COLOR_YCBCR_BT601:
@@ -388,9 +389,9 @@ static enum dcp_colorspace get_colorspace(bool is_yuv,
 	case DRM_COLOR_YCBCR_BT709:
 		return DCP_COLORSPACE_BT709;
 	case DRM_COLOR_YCBCR_BT2020:
-		return DCP_COLORSPACE_BG_BT2020;
+		return DCP_COLORSPACE_BT2020;
 	default:
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_P3_D65;
 	}
 }
 
@@ -429,7 +430,8 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 	 */
 	if (fmt->format == DRM_FORMAT_XRGB8888 ||
 	    fmt->format == DRM_FORMAT_XBGR8888 ||
-	    fmt->format == DRM_FORMAT_XBGR2101010)
+	    fmt->format == DRM_FORMAT_XBGR2101010 ||
+	    base->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
 		is_premultiplied = true;
 
 	new_state->src_rect = drm_to_dcp_rect_fp(&base->src);
@@ -742,11 +744,14 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   bool supports_l10r,
 				   bool supports_xrgb2101010,
 				   enum drm_plane_type type,
-				   bool interchange)
+				   bool interchange,
+				   bool premultiplied)
 {
 	struct apple_plane *plane;
+	unsigned int blend_modes;
 	const u32 *fmts;
 	u32 num_fmts;
+	int ret;
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
@@ -785,6 +790,18 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	if (IS_ERR(plane))
 		return ERR_PTR(PTR_ERR(plane));
+
+	/*
+	 * The surface flag is_premultiplied selects pre-multiplied blending;
+	 * without it DCP applies the alpha channel as coverage. Firmware whose
+	 * swap surface has no such flag only blends by coverage.
+	 */
+	blend_modes = BIT(DRM_MODE_BLEND_COVERAGE);
+	if (premultiplied)
+		blend_modes |= BIT(DRM_MODE_BLEND_PREMULTI);
+	ret = drm_plane_create_blend_mode_property(&plane->base, blend_modes);
+	if (ret)
+		return ERR_PTR(ret);
 
 	drm_plane_create_color_properties(&plane->base,
 					  (1 << DRM_COLOR_ENCODING_MAX) - 1,

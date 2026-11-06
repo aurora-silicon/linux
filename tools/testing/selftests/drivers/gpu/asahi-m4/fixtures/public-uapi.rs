@@ -77,10 +77,6 @@ pub struct drm_asahi_params_global {
     pub usc_generation: __u32,
     #[doc = " @gpu_hal_generation: Apple GPU HAL/command-stream generation.\n\n This is DRM_ASAHI_GPU_HAL_LEGACY for G13-G15,\n DRM_ASAHI_GPU_HAL_200 for G16 and G17P/G17A, and\n DRM_ASAHI_GPU_HAL_300 for G17G/G17S/G17C."]
     pub gpu_hal_generation: __u32,
-    /// Optional device-wide committed/resident-byte capacity; zero means no limit.
-    pub memory_limit: __u64,
-    /// Optional per-DRM-file committed-byte capacity; zero means no limit.
-    pub client_memory_limit: __u64,
 }
 impl Default for drm_asahi_params_global {
     fn default() -> Self {

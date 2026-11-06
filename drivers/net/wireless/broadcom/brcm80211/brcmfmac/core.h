@@ -226,11 +226,13 @@ struct brcmf_fws_mac_descriptor;
  *	netif stopped due to flowring full.
  * @BRCMF_NETIF_STOP_REASON_DISCONNECTED:
  *	netif stopped due to not being connected (STA mode).
+ * @BRCMF_NETIF_STOP_REASON_BUS: bus is unavailable for transmission.
  */
 enum brcmf_netif_stop_reason {
 	BRCMF_NETIF_STOP_REASON_FWS_FC = BIT(0),
 	BRCMF_NETIF_STOP_REASON_FLOW = BIT(1),
-	BRCMF_NETIF_STOP_REASON_DISCONNECTED = BIT(2)
+	BRCMF_NETIF_STOP_REASON_DISCONNECTED = BIT(2),
+	BRCMF_NETIF_STOP_REASON_BUS = BIT(3)
 };
 
 /**

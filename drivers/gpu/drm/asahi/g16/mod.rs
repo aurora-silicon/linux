@@ -91,7 +91,7 @@ use crate::driver::{AsahiDrmDevice, AsahiPlatformDriver};
 use crate::{alloc, gem, gpu, mmu, regs as shared_regs};
 
 /// Name of the G16 platform driver.
-pub(crate) const DRIVER_NAME: &CStr = c_str!("asahi-g16");
+pub(crate) const DRIVER_NAME: &CStr = c_str!("aurora-g16");
 
 /// GPU generation reported to userspace.
 pub(crate) const GPU_GENERATION: u32 = 16;
@@ -171,6 +171,7 @@ impl platform::Driver for Driver {
             if let Some(gpu) = &driver.g16 {
                 gpu.retain();
             }
+            driver.close_binding();
         }
     }
 }
@@ -397,7 +398,7 @@ impl Gpu {
         *shared.state.lock() = Some(firmware);
         // The engine's statistics file (a debugfs failure does not fail the probe).
         if let Err(error) = shared.start_engine() {
-            dev_warn!(dev.as_ref(), "G16: no asahi-g16 debugfs ({:?})\n", error);
+            dev_warn!(dev.as_ref(), "G16: no aurora-g16 debugfs ({:?})\n", error);
         }
         let gpu = Arc::new(
             Gpu {
@@ -616,9 +617,10 @@ impl gpu::Gpu for Gpu {
         _ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn crate::queue::Queue>> {
         Ok(KBox::new(
-            queue::Queue::new(self, vm, priority, usc_exec_base)?,
+            queue::Queue::new(self, vm, priority, usc_exec_base, usage)?,
             GFP_KERNEL,
         )?)
     }

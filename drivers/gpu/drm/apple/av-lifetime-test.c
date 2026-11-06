@@ -156,7 +156,6 @@ static struct av_life_test *av_life_setup(struct kunit *test, work_func_t owner_
 	dev_set_drvdata(t->dev, t->dcp);
 	spin_lock_init(&t->ep->lock);
 	INIT_LIST_HEAD(&t->ep->compact_cmds);
-	mutex_init(&t->ep->compact_tx_lock);
 	init_rwsem(&t->asrv->srv_rwsem);
 	INIT_WORK(&t->asrv->start_av_service_wq, owner_fn);
 	INIT_WORK(&t->asrv->terminate_wq, owner_fn);
@@ -487,7 +486,6 @@ static struct av_life_test *av_life_group_setup(struct kunit *test,
 		KUNIT_ASSERT_NOT_NULL(test, t->ep);
 		spin_lock_init(&t->ep->lock);
 		INIT_LIST_HEAD(&t->ep->compact_cmds);
-		mutex_init(&t->ep->compact_tx_lock);
 		t->ep->dcp = t->dcp;
 		t->wq = alloc_ordered_workqueue("av-lifetime-devres", 0);
 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t->wq);

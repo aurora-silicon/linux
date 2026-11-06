@@ -103,6 +103,17 @@ patternProperties:
           Requires a nonzero polling-delay-passive. If omitted, the governor
           retains its existing estimate of k_pu divided by ten per poll.
 
+      critical-samples:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        minimum: 1
+        description: |
+          Number of consecutive zone updates that must read at or above a
+          critical trip before it acts. For a sensor whose single readings
+          are noisy, this keeps one sample from shutting the system down
+          while a sustained excursion still does, after about this many
+          polling periods. Requires polling. If omitted, or 1, a critical
+          trip acts on the first reading at or above it.
+
       thermal-sensors:
         $ref: /schemas/types.yaml#/definitions/phandle-array
         maxItems: 1
@@ -247,6 +258,15 @@ patternProperties:
               minimum: 1
           required:
             - polling-delay-passive
+      - if:
+          required:
+            - critical-samples
+        then:
+          properties:
+            polling-delay:
+              minimum: 1
+          required:
+            - polling-delay
 
     required:
       - thermal-sensors

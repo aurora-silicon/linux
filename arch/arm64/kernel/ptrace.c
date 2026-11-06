@@ -30,6 +30,8 @@
 #include <linux/elf.h>
 #include <linux/rseq.h>
 
+#include <asm/apple_cpufeature.h>
+#include <asm/apple_amx.h>
 #include <asm/compat.h>
 #include <asm/cpufeature.h>
 #include <asm/debug-monitors.h>
@@ -1564,6 +1566,92 @@ static int poe_set(struct task_struct *target, const struct
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+static int apple_afpcr_active(struct task_struct *target,
+			      const struct user_regset *regset)
+{
+	return apple_afp_enabled(target) ? regset->n : 0;
+}
+
+static int apple_afpcr_get(struct task_struct *target,
+			   const struct user_regset *regset,
+			   struct membuf to)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return -EINVAL;
+
+	return membuf_store(&to, apple_afp_read_afpcr(target));
+}
+
+static int apple_afpcr_set(struct task_struct *target,
+			   const struct user_regset *regset, unsigned int pos,
+			   unsigned int count, const void *kbuf,
+			   const void __user *ubuf)
+{
+	u64 afpcr;
+	int ret;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return -EINVAL;
+
+	afpcr = apple_afp_read_afpcr(target);
+	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, &afpcr, 0, -1);
+	if (ret)
+		return ret;
+
+	apple_afp_write_afpcr(target, afpcr);
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_AMX
+static int apple_amx_active(struct task_struct *target,
+			    const struct user_regset *regset)
+{
+	return apple_amx_regset_active(target) ? regset->n : 0;
+}
+
+static int apple_amx_regs_get(struct task_struct *target,
+			      const struct user_regset *regset,
+			      struct membuf to)
+{
+	struct user_apple_amx *u;
+	int ret;
+
+	u = kmalloc(sizeof(*u), GFP_KERNEL);
+	if (!u)
+		return -ENOMEM;
+
+	ret = apple_amx_regset_get(target, u);
+	if (!ret)
+		ret = membuf_write(&to, u, sizeof(*u));
+	kfree(u);
+	return ret;
+}
+
+static int apple_amx_regs_set(struct task_struct *target,
+			      const struct user_regset *regset,
+			      unsigned int pos, unsigned int count,
+			      const void *kbuf, const void __user *ubuf)
+{
+	struct user_apple_amx *u;
+	int ret;
+
+	u = kmalloc(sizeof(*u), GFP_KERNEL);
+	if (!u)
+		return -ENOMEM;
+
+	ret = apple_amx_regset_get(target, u);
+	if (!ret)
+		ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf, u, 0,
+					 sizeof(*u));
+	if (!ret)
+		ret = apple_amx_regset_set(target, u);
+	kfree(u);
+	return ret;
+}
+#endif
+
 #ifdef CONFIG_ARM64_GCS
 static void task_gcs_to_user(struct user_gcs *user_gcs,
 			     const struct task_struct *target)
@@ -1658,6 +1746,12 @@ enum aarch64_regset {
 #endif
 #ifdef CONFIG_ARM64_GCS
 	REGSET_GCS,
+#endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	REGSET_APPLE_AFPCR,
+#endif
+#ifdef CONFIG_ARM64_APPLE_AMX
+	REGSET_APPLE_AMX,
 #endif
 };
 
@@ -1836,6 +1930,28 @@ static const struct user_regset aarch64_regsets[] = {
 		.align = sizeof(u64),
 		.regset_get = gcs_get,
 		.set = gcs_set,
+	},
+#endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	[REGSET_APPLE_AFPCR] = {
+		USER_REGSET_NOTE_TYPE(AURORA_APPLE_AFPCR),
+		.n = 1,
+		.size = sizeof(u64),
+		.align = sizeof(u64),
+		.active = apple_afpcr_active,
+		.regset_get = apple_afpcr_get,
+		.set = apple_afpcr_set,
+	},
+#endif
+#ifdef CONFIG_ARM64_APPLE_AMX
+	[REGSET_APPLE_AMX] = {
+		USER_REGSET_NOTE_TYPE(AURORA_APPLE_AMX),
+		.n = sizeof(struct user_apple_amx) / sizeof(u64),
+		.size = sizeof(u64),
+		.align = sizeof(u64),
+		.active = apple_amx_active,
+		.regset_get = apple_amx_regs_get,
+		.set = apple_amx_regs_set,
 	},
 #endif
 };
@@ -2547,7 +2663,14 @@ static int valid_compat_regs(struct user_pt_regs *regs)
 
 static int valid_native_regs(struct user_pt_regs *regs)
 {
-	regs->pstate &= ~SPSR_EL1_AARCH64_RES0_BITS;
+	u64 res0 = SPSR_EL1_AARCH64_RES0_BITS;
+
+	/* Apple's x86 parity and adjust flags live in bits 27:26 */
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) &&
+	    alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		res0 &= ~(PSR_APPLE_PF_BIT | PSR_APPLE_AF_BIT);
+
+	regs->pstate &= ~res0;
 
 	if (user_mode(regs) && !(regs->pstate & PSR_MODE32_BIT) &&
 	    (regs->pstate & PSR_D_BIT) == 0 &&

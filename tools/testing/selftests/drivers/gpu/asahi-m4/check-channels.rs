@@ -5,7 +5,7 @@ mod channels;
 #[path = "@KERNEL@/drivers/gpu/drm/asahi/g16/fw/graph.rs"]
 mod graph;
 mod fwid {
-@FIRMWARE_BUILD@
+@FWID_BUILD@
 }
 mod hw {pub enum GpuVariant {G}}
 struct Config {

@@ -64,6 +64,8 @@ struct apple_mbox {
 	bool active;
 	bool ascwrap_v6_cpu_running;
 	bool removing;
+	/* apple,hold-rx-in-sleep: receive IRQ masked across system sleep */
+	bool hold_rx_in_sleep;
 
 	int irq_recv_not_empty;
 	int irq_send_empty; /* < 0: no send-empty IRQ, TX polls */
@@ -87,8 +89,8 @@ struct apple_mbox {
 
 	/*
 	 * Protected by tx_lock: set while irq_send_empty is unmasked, so that
-	 * the IRQ handler, a failed send and provider removal mask it exactly
-	 * once between them.
+	 * the IRQ handler and provider removal mask it exactly once between
+	 * them.
 	 */
 	bool tx_irq_unmasked;
 };

@@ -309,6 +309,7 @@ struct brcmf_msgbuf {
 
 	struct workqueue_struct *txflow_wq;
 	struct work_struct txflow_work;
+	bool tx_suspended;
 	unsigned long *flow_map;
 	unsigned long *txstatus_done_map;
 
@@ -802,6 +803,9 @@ static void brcmf_msgbuf_flowring_worker(struct work_struct *work)
 
 	msgbuf = container_of(work, struct brcmf_msgbuf, flowring_work);
 
+	if (READ_ONCE(msgbuf->tx_suspended))
+		return;
+
 	while ((create = brcmf_msgbuf_dequeue_work(msgbuf))) {
 		brcmf_msgbuf_flowring_create_worker(msgbuf, create);
 		kfree(create);
@@ -922,6 +926,9 @@ static void brcmf_msgbuf_txflow_worker(struct work_struct *worker)
 	u32 flowid;
 
 	msgbuf = container_of(worker, struct brcmf_msgbuf, txflow_work);
+	if (READ_ONCE(msgbuf->tx_suspended))
+		return;
+
 	for_each_set_bit(flowid, msgbuf->flow_map, msgbuf->max_flowrings) {
 		clear_bit(flowid, msgbuf->flow_map);
 		brcmf_msgbuf_txflow(msgbuf, flowid);
@@ -1907,6 +1914,35 @@ fail:
 	return -ENOMEM;
 }
 
+
+/* Called after stopping and draining ndo_start_xmit, while PCIe is still up.
+ * IRQ completions may queue more work; workers leave it pending until resume.
+ */
+void brcmf_msgbuf_suspend(struct brcmf_pub *drvr)
+{
+	struct brcmf_msgbuf *msgbuf;
+
+	if (!drvr || !drvr->proto || !drvr->proto->pd)
+		return;
+	msgbuf = drvr->proto->pd;
+
+	WRITE_ONCE(msgbuf->tx_suspended, true);
+	cancel_work_sync(&msgbuf->flowring_work);
+	cancel_work_sync(&msgbuf->txflow_work);
+}
+
+void brcmf_msgbuf_resume(struct brcmf_pub *drvr)
+{
+	struct brcmf_msgbuf *msgbuf;
+
+	if (!drvr || !drvr->proto || !drvr->proto->pd)
+		return;
+	msgbuf = drvr->proto->pd;
+
+	WRITE_ONCE(msgbuf->tx_suspended, false);
+	schedule_work(&msgbuf->flowring_work);
+	queue_work(msgbuf->txflow_wq, &msgbuf->txflow_work);
+}
 
 void brcmf_proto_msgbuf_detach(struct brcmf_pub *drvr)
 {

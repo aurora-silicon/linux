@@ -106,8 +106,8 @@ properties:
   port:
     $ref: /schemas/graph.yaml#/properties/port
     description: >
-      Link to the SuperSpeed lanes of the Type-C connector, or to the DCP
-      DisplayPort output on a fixed DisplayPort PHY.
+      Link to the SuperSpeed lanes of the Type-C connector. Absent on a fixed
+      DisplayPort PHY.
 
   apple,tunable-axi2af:
     $ref: "#/$defs/apple,tunable"
@@ -174,6 +174,7 @@ allOf:
         "#reset-cells": false
         orientation-switch: false
         mode-switch: false
+        port: false
 
 additionalProperties: false
 
