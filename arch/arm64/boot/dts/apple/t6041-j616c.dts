@@ -158,6 +158,10 @@
 	status = "okay";
 };
 
+&mcc {
+	status = "okay";
+};
+
 &smc_hwmon {
 	temperature-TCMz {
 		apple,key-id = "TCMz";

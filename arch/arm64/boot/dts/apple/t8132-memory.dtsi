@@ -19,6 +19,27 @@
 		apple,pmp = <&pmp>;
 		status = "disabled";
 
+		/*
+		 * The external display pipes' bandwidth request (BWR) and
+		 * boost interface enables. The PMC ignores a pipe's bandwidth
+		 * and display clock votes while they are clear.
+		 */
+		pmc_dispext0: interface-dispext0 {
+			label = "dispext0-interface";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_dispext0_sys>;
+			apple,bwr-bit = <3>;
+			apple,boost-bit = <1>;
+		};
+
+		pmc_dispext1: interface-dispext1 {
+			label = "dispext1-interface";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_dispext1_sys>;
+			apple,bwr-bit = <4>;
+			apple,boost-bit = <2>;
+		};
+
 		clpc: performance-controller@3 {
 			compatible = "apple,t8132-clpc";
 			reg = <3>;

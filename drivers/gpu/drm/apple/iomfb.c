@@ -2135,8 +2135,7 @@ int dcp_get_modes(struct drm_connector *connector)
 		}
 	} else {
 		u64 generation = 0;
-		bool panel = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-			     dcp_has_panel(dcp);
+		bool panel = dcp->panel_identity && dcp_has_panel(dcp);
 		const struct drm_edid *derived = nr_modes ?
 			(panel ? dcp_panel_edid_snapshot(dcp, modes, nr_modes, &generation) :
 			 dcp_firmware_edid(dcp, &generation)) : ERR_PTR(-ENODATA);

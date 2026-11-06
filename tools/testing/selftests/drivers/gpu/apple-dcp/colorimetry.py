@@ -141,21 +141,21 @@ int main(int argc, char **argv)
     }
     /* A ProductAttributes-only setter must preserve the established colour. */
     struct apple_dcp d={.fw_compat=5,.has_panel=true,.connector=&d};
-    __typeof__(*d.desktop) state={0};d.desktop=&state;notifications=0;
+    __typeof__(*d.panel_identity) state={0};d.panel_identity=&state;notifications=0;
     dcp_panel_metadata_replace(&d,&p3);assert(notifications==1);
     struct dcp_display_metadata partial=decode(color_2,sizeof(color_2));
     dcp_panel_metadata_replace(&d,&partial);
-    assert(notifications==1 && !memcmp(&state.panel_metadata,&p3,sizeof(p3)));
+    assert(notifications==1 && !memcmp(&state.metadata,&p3,sizeof(p3)));
     /* Newly reported primaries with unknown gamma must not inherit an old gamma. */
     struct dcp_display_metadata unknown_gamma=decode(color_6,sizeof(color_6));
     dcp_panel_metadata_replace(&d,&unknown_gamma);
-    assert(notifications==2 && !state.panel_metadata.gamma && state.panel_metadata.white[0]);
+    assert(notifications==2 && !state.metadata.gamma && state.metadata.white[0]);
     dcp_panel_metadata_replace(&d,&partial);
-    assert(notifications==2 && !state.panel_metadata.gamma && state.panel_metadata.white[0]);
+    assert(notifications==2 && !state.metadata.gamma && state.metadata.white[0]);
     /* A replacement panel must not inherit another serial's colour data. */
     partial.serial++;
     dcp_panel_metadata_replace(&d,&partial);
-    assert(notifications==3 && !state.panel_metadata.gamma);
+    assert(notifications==3 && !state.metadata.gamma);
     return 0;
 }
 '''

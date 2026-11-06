@@ -557,6 +557,8 @@ struct apple_dcp {
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
     bool ext_backlight, has_panel;
+    /* External pipes carry no internal panel identity. */
+    void *panel_identity;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
