@@ -151,6 +151,7 @@ int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len)
 	memcpy(val, &data[1], len);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(tps6598x_block_read);
 
 static int tps6598x_block_write(struct tps6598x *tps, u8 reg,
 				const void *val, size_t len)
@@ -411,6 +412,7 @@ int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(tps6598x_exec_cmd_tmo);
 
 static int tps6598x_exec_cmd(struct tps6598x *tps, const char *cmd,
 			     size_t in_len, const u8 *in_data,
