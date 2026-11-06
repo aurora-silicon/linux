@@ -531,13 +531,7 @@ impl Port {
         // Observe gating before activity can wake the cores. A lockless
         // publisher cannot clear the decoder under the device mutex; this
         // epoch makes both the next drain and the next reader discard it.
-        if self
-            .regs
-            .as_ref()
-            .is_some_and(|regs| regs.g17_core_power() & 0xf == 0)
-        {
-            self.statistics_epoch.fetch_add(1, Ordering::Release);
-        }
+        // Experiment S: no per-submit core-power register read.
         self.last_submission_ns
             .store(super::now_ns(), Ordering::Relaxed);
         self.demand.set_active(true);
