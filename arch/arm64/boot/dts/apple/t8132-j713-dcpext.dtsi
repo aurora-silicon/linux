@@ -5,7 +5,8 @@
  * T8132 has two external display pipes, dispext0 and dispext1, each with
  * its own DCP, mailbox, DCP DART and display DART. They mirror the
  * internal display (t8132-j713-display.dtsi) at other bases and share its
- * firmware clock window (disp-4).
+ * firmware clock window (disp-4), which also holds their realtime bandwidth
+ * request slots in the PMC.
  *
  * iBoot starts both and leaves them quiesced, as it does the internal one.
  * When the boot loader hands them over (opt-in, and only after the internal
@@ -81,6 +82,7 @@
 		power-domains = <&ps_dispext0_cpu>;
 		dma-noncoherent;
 		apple,dcp-index = <1>;
+		apple,bw-scratch = <&pmgr_dcpext 0 4 0>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 
@@ -89,6 +91,17 @@
 			dma-noncoherent;
 			status = "disabled";
 		};
+	};
+
+	/*
+	 * The external pipes' realtime bandwidth request slots in the PMC,
+	 * 0x2c000 and 0x30000 into the window the dcpexts have as disp-4.
+	 */
+	pmgr_dcpext: power-management@38282c000 {
+		reg = <0x3 0x8282c000 0x0 0x8>,
+		      <0x3 0x82830000 0x0 0x8>;
+		reg-names = "dcpext0-bw-scratch", "dcpext1-bw-scratch";
+		#apple,bw-scratch-cells = <3>;
 	};
 
 	dcpext1_mbox: mailbox@48ae08000 {
@@ -142,6 +155,7 @@
 		power-domains = <&ps_dispext1_cpu>;
 		dma-noncoherent;
 		apple,dcp-index = <2>;
+		apple,bw-scratch = <&pmgr_dcpext 1 4 0>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 

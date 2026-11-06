@@ -205,6 +205,24 @@ struct dcp_panel {
 	u32 peak_nits;
 	/// EDR headroom ceiling x1000 from the ADT (desktop 26.x; 0 if none)
 	u32 edr_ceiling;
+	/// calibrated colour target from apple,color-gamut; NULL if not given
+	const struct dcp_color_space *color_target;
+};
+
+/*
+ * Identity of a fixed internal panel, for the EDID published on its
+ * connector.  Any processor with an internal panel allocates it; the boot
+ * loader's ADT supplies the fallback, and firmware metadata or a raw panel
+ * EDID replace that when the firmware reports one.  metadata.lock.
+ */
+struct dcp_panel_identity {
+	/* Identity supplied by this fixed panel, independent of optional color data. */
+	struct dcp_display_metadata metadata;
+	struct dcp_display_metadata adt;
+	u64 generation;
+	bool metadata_valid;
+	u8 raw_edid[4096];
+	size_t raw_edid_size;
 };
 
 enum dcp_iomfb_method_profile {
@@ -269,14 +287,7 @@ struct dcp_desktop_state {
 	 * element before the real one is selected.
 	 */
 	bool mode_live;
-	/* Identity supplied by this fixed panel, independent of optional color data. */
-	struct dcp_display_metadata panel_metadata;
-	struct dcp_display_metadata panel_adt_identity;
-	u64 panel_metadata_generation;
-	bool panel_metadata_valid;
 	atomic_t identity_log_count[4];
-	u8 panel_raw_edid[4096];
-	size_t panel_raw_edid_size;
 	/* RX records an unsupported callback until the modeset RPC has drained. */
 	bool modeset_active;
 	bool modeset_callback_error;
@@ -865,6 +876,8 @@ struct apple_dcp {
 
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;
+	/* Internal panel identity; NULL without an internal panel. */
+	struct dcp_panel_identity *panel_identity;
 };
 
 /* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
