@@ -60,6 +60,9 @@ ASAHI_TESTS = {
     'aop-bootargs-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
+    # 11eccbedc3ed writes frames without a transport-wide lock.
+    'mtp-tx-frame-tests.py': [(out(), PASS),
+                              (out() + ['--old-transport', '11eccbedc3ed'], PASS)],
     'ave-pm-tests.py': [(out(), PASS),
                          (out() + ['--old-ref', '4db3a5a22c43'], PASS)],
     'ave-probe-pm-tests.py': [(out(), PASS), (out() + ['--negative-control'], PASS)],
