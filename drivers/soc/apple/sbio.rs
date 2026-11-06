@@ -34,8 +34,16 @@ const LOCK_STATE_LOCKOUT: u16 = 0x40;
 const SBIO_NOTIFY_BG_OPS_READY: u8 = 0x03;
 /// How long a verify waits after its result for that notice.
 const BG_OPS_WAIT_MS: u32 = 1000;
+
+/// What collecting an announced background result led to.
+enum BgOps {
+    Nothing,
+    NotUpdated,
+    TemplatesUpdated,
+    Failed,
+}
 /// How long to wait after a background result for a component to need saving.
-const BG_OPS_SAVE_WAIT_MS: u32 = 2000;
+const BG_OPS_SAVE_WAIT_MS: u32 = 10_000;
 const BG_OPS_SAVE_POLL_MS: u32 = 50;
 
 /// How long a re-arm waits for the enclave to announce the cleared state.
@@ -139,6 +147,19 @@ mod lockout_tests {
         assert_eq!(parse_policy_answer(&2u32.to_le_bytes()), None);
         answer[16] = 1;
         assert_eq!(parse_policy_answer(&answer), None);
+    }
+
+    #[test]
+    fn bg_ops_result_discriminators() {
+        let mut r = [0u8; SBIO_BG_OPS_RESULT_LEN];
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::NoResult);
+        r[0] = 1;
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::TemplateListNotUpdated);
+        r[2] = 1;
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::TemplatesUpdated);
+        r[0] = 0;
+        assert_eq!(bg_ops_result_kind(&r), BgOpsResult::NoResult);
+        assert_eq!(bg_ops_result_kind(&[1u8]), BgOpsResult::NoResult);
     }
 
     #[test]
@@ -2003,7 +2024,12 @@ impl SepData {
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
             return;
         };
-        self.collect_bg_ops_result(c"before a verify");
+        // An unfinished template persistence blocks matching until it is done.
+        if !self.handle_bg_ops(c"before a verify") || !self.finish_owed_persistence() {
+            dev_err!(self.dev, "verify: the catacombs are not persisted after a template update; refusing before the capture\n");
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+            return;
+        }
         let Some(evaluation) = self.open_unlock_evaluation(user) else {
             dev_err!(
                 self.dev,
@@ -2042,8 +2068,13 @@ impl SepData {
             outcome,
             bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch | bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
         ) {
-            if self.await_and_collect_bg_ops(c"after a match result", BG_OPS_WAIT_MS) {
-                self.persist_after_bg_ops();
+            // A template update must be persisted (user, then master) before a
+            // match is reported.
+            if !self.await_and_handle_bg_ops(c"after a match result", BG_OPS_WAIT_MS)
+                && matches!(outcome, bio::VerifyOutcome::Matched(_))
+            {
+                dev_err!(self.dev, "verify: the background result was not handled; not reporting this verify as a match\n");
+                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
             }
         }
         // Keep the sensor up for the next verify unless the sensor itself
@@ -2942,7 +2973,7 @@ impl SepData {
                 self.reconcile_identities();
                 self.log_protected_unlock();
                 self.probe_unlock_evaluation();
-                self.collect_bg_ops_result(c"after the restore");
+                let _ = self.handle_bg_ops(c"after the restore");
             }
         } else if !listed {
             dev_warn!(self.dev, "sbio: device-view synchronisation or match policy unavailable\n");
@@ -3569,104 +3600,145 @@ impl SepData {
 
     /// Collects a background operation result the enclave announced, if
     /// any, as macOS does after every match. Logs only status and length.
-    /// Returns whether a result was collected.
-    fn collect_bg_ops_result(&self, why: &CStr) -> bool {
+    /// Collects one announced background operation result with an empty
+    /// 0x21. The reply must be status 0 and exactly
+    /// `SBIO_BG_OPS_RESULT_LEN` bytes; otherwise the result stays pending.
+    fn collect_bg_ops_result(&self, why: &CStr) -> BgOps {
         if !self.bg_ops_ready.xchg(false, Relaxed) {
-            return false;
+            return BgOps::Nothing;
         }
-        match self.sbio_transfer(&crate::sbio::sbio_bg_ops_result()) {
+        let done = match self.sbio_transfer(&crate::sbio::sbio_bg_ops_result()) {
+            Ok(done) if done.status.is_ok() && done.payload.len() == crate::sbio::SBIO_BG_OPS_RESULT_LEN => done,
             Ok(done) => {
-                dev_info!(
+                dev_err!(
                     self.dev,
-                    "sbio: collected the background operation result ({}): status {}, {} bytes\n",
+                    "sbio: background result ({}): status {}, {} bytes; left pending\n",
                     why,
                     done.status,
                     done.payload.len()
                 );
-                true
+                self.bg_ops_ready.store(true, Relaxed);
+                return BgOps::Failed;
             }
             Err(e) => {
-                dev_warn!(
-                    self.dev,
-                    "sbio: collecting the background operation result ({}) failed: {:?}\n",
-                    why,
-                    e
-                );
-                false
+                dev_err!(self.dev, "sbio: background result ({}) transfer failed: {:?}; left pending\n", why, e);
+                self.bg_ops_ready.store(true, Relaxed);
+                return BgOps::Failed;
             }
+        };
+        let kind = crate::sbio::bg_ops_result_kind(&done.payload);
+        dev_info!(self.dev, "sbio: background result ({}): {:?}\n", why, kind);
+        match kind {
+            crate::sbio::BgOpsResult::TemplatesUpdated => BgOps::TemplatesUpdated,
+            _ => BgOps::NotUpdated,
         }
     }
 
-    /// A background result can update templates after the post-match save
-    /// already ran. Wait briefly for the user or master component to report
-    /// a pending save, then save the user first and the master last, as
-    /// macOS does after a template update.
-    fn persist_after_bg_ops(&self) {
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
-            return;
-        };
-        let pending = |sep: &Self| -> Option<(bool, bool)> {
-            let reply = sep.read_component_states()?;
-            let states = crate::sbio::ComponentStates::new(&reply);
-            let p = |id: i32| {
-                states
-                    .state_for(id)
-                    .is_some_and(|s| s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
-            };
-            Some((
-                p(crate::sbio::CatacombUser::enrolling(user).value()),
-                p(crate::sbio::CatacombUser::MASTER.value()),
-            ))
-        };
-        let mut waited = 0;
-        let mut seen = pending(self);
-        while matches!(seen, Some((false, false))) && waited < BG_OPS_SAVE_WAIT_MS {
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(BG_OPS_SAVE_POLL_MS)));
-            waited += BG_OPS_SAVE_POLL_MS;
-            seen = pending(self);
-        }
-        dev_info!(
-            self.dev,
-            "sbio: after the background result: save pending (user, master) {:?} after {} ms\n",
-            seen,
-            waited
-        );
-        if matches!(seen, Some((false, false))) {
-            return;
-        }
-        // Called from the verify worker, which already holds catacomb_writer.
-        for (who, kind, what) in [
-            (crate::sbio::CatacombUser::enrolling(user), PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a background result"),
-            (crate::sbio::CatacombUser::MASTER, PRIVATE_TYPE_CATACOMB_MASTER, c"master catacomb after a background result"),
-        ] {
-            let Some(reply) = self.read_component_states() else {
-                dev_err!(self.dev, "sbio: cannot read state before saving the {}\n", what);
-                return;
-            };
-            let states = crate::sbio::ComponentStates::new(&reply);
-            if states
-                .state_for(who.value())
-                .is_some_and(|s| s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
-                && !self.save_catacomb(who, kind, what)
-            {
-                dev_err!(self.dev, "sbio: saving the {} failed\n", what);
-                return;
-            }
-        }
-        if !self.resnapshot_identity_keybag() {
-            dev_err!(self.dev, "sbio: identity-bag snapshot after the background result failed\n");
+    /// Collects an announced result and, when it updated the templates,
+    /// persists them. Returns false when matching must stop.
+    fn handle_bg_ops(&self, why: &CStr) -> bool {
+        match self.collect_bg_ops_result(why) {
+            BgOps::Nothing | BgOps::NotUpdated => true,
+            BgOps::Failed => false,
+            BgOps::TemplatesUpdated => self.persist_template_update(),
         }
     }
 
-    /// Waits up to `timeout_ms` for a background operation notice, then
-    /// collects it.
-    fn await_and_collect_bg_ops(&self, why: &CStr, timeout_ms: u32) -> bool {
+    fn await_and_handle_bg_ops(&self, why: &CStr, timeout_ms: u32) -> bool {
         let mut waited = 0;
         while !self.bg_ops_ready.load(Relaxed) && waited < timeout_ms {
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(LOCK_STATE_POLL_MS)));
             waited += LOCK_STATE_POLL_MS;
         }
-        self.collect_bg_ops_result(why)
+        self.handle_bg_ops(why)
+    }
+
+    /// The state bits of one component, from a fresh 0x6b.
+    fn component_state(&self, who: crate::sbio::CatacombUser) -> Option<u32> {
+        let reply = self.read_component_states()?;
+        crate::sbio::ComponentStates::new(&reply).state_for(who.value())
+    }
+
+    /// Waits until `who` is active and save-pending.
+    fn await_save_pending(&self, who: crate::sbio::CatacombUser) -> bool {
+        let mut waited = 0;
+        loop {
+            if self.component_state(who).is_some_and(|s| {
+                s & crate::sbio::COMPONENT_STATE_ACTIVE != 0
+                    && s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0
+            }) {
+                return true;
+            }
+            if waited >= BG_OPS_SAVE_WAIT_MS {
+                return false;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(BG_OPS_SAVE_POLL_MS)));
+            waited += BG_OPS_SAVE_POLL_MS;
+        }
+    }
+
+    /// A template update makes the user and then the master component
+    /// save-pending; macOS saves them as a pair, user first, master last.
+    /// A pair saved across generations makes the next boot's user load cold.
+    /// Each side is awaited, saved durably and confirmed in turn, then both
+    /// must show no pending save. Until that holds the obligation stays owed
+    /// and matching stays off.
+    fn persist_template_update(&self) -> bool {
+        self.persistence_owed.store(true, Relaxed);
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        let user_c = crate::sbio::CatacombUser::enrolling(user);
+        if !self.await_save_pending(user_c) {
+            dev_err!(self.dev, "sbio: template update: the user catacomb never became save-pending\n");
+            return false;
+        }
+        if !self.save_catacomb(user_c, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a template update") {
+            return false;
+        }
+        self.finish_owed_persistence()
+    }
+
+    /// Saves the master last once it is pending, then proves both sides
+    /// clean. Retried before each verify while an obligation is owed.
+    fn finish_owed_persistence(&self) -> bool {
+        if !self.persistence_owed.load(Relaxed) {
+            return true;
+        }
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        let user_c = crate::sbio::CatacombUser::enrolling(user);
+        // A user save left pending by an earlier failure goes first.
+        if self.component_state(user_c).is_some_and(|s| s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
+            && !self.save_catacomb(user_c, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a template update")
+        {
+            return false;
+        }
+        let master = crate::sbio::CatacombUser::MASTER;
+        if !self.await_save_pending(master) {
+            dev_err!(self.dev, "sbio: template update: the master catacomb never became save-pending\n");
+            return false;
+        }
+        if !self.save_catacomb(master, PRIVATE_TYPE_CATACOMB_MASTER, c"master catacomb after a template update") {
+            return false;
+        }
+        let clean = |s: Option<u32>| {
+            s.is_some_and(|s| {
+                s & crate::sbio::COMPONENT_STATE_ACTIVE != 0 && s & crate::sbio::COMPONENT_STATE_SAVE_PENDING == 0
+            })
+        };
+        if !clean(self.component_state(user_c)) || !clean(self.component_state(master)) {
+            dev_err!(self.dev, "sbio: template update: a component is still save-pending after the pair was saved\n");
+            return false;
+        }
+        if !self.resnapshot_identity_keybag() {
+            dev_err!(self.dev, "sbio: template update: identity-bag snapshot failed\n");
+            return false;
+        }
+        self.persistence_owed.store(false, Relaxed);
+        dev_info!(self.dev, "sbio: template update persisted (user, then master)\n");
+        true
     }
 
     fn sbio_continue(&self, cont: &transfer::Continuation) {
@@ -4378,7 +4450,7 @@ impl SepData {
         // The next verify opens a fresh unlock evaluation; nothing of the old
         // one is carried over.
         *self.match_context.lock() = None;
-        self.collect_bg_ops_result(c"at a password re-arm");
+        let _ = self.handle_bg_ops(c"at a password re-arm");
         if !self.save_lockout() {
             dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
         }
@@ -6066,6 +6138,30 @@ pub(crate) fn sbio_match_cancel() -> SbioOp {
         payload: pad_payload(&[]),
         payload_len: 0,
         name: c"MATCH_CANCEL",
+    }
+}
+
+/// The background operation result: a u16 "result present" word, a u16
+/// "template list updated" word, then the update record.
+pub(crate) const SBIO_BG_OPS_RESULT_LEN: usize = 0xc8e;
+const BG_OPS_PRESENT: usize = 0x000;
+const BG_OPS_UPDATED: usize = 0x002;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BgOpsResult {
+    NoResult,
+    TemplateListNotUpdated,
+    TemplatesUpdated,
+}
+
+pub(crate) fn bg_ops_result_kind(reply: &[u8]) -> BgOpsResult {
+    let word = |at: usize| u16::from_le_bytes([reply[at], reply[at + 1]]);
+    if reply.len() < BG_OPS_UPDATED + 2 || word(BG_OPS_PRESENT) == 0 {
+        BgOpsResult::NoResult
+    } else if word(BG_OPS_UPDATED) == 0 {
+        BgOpsResult::TemplateListNotUpdated
+    } else {
+        BgOpsResult::TemplatesUpdated
     }
 }
 

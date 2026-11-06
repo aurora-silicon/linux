@@ -688,6 +688,10 @@ struct SepData {
     // result is ready; it waits for the host to collect it with 0x21.
     bg_ops_ready: Atomic<bool>,
 
+    // A template update was announced and its user/master pair is not yet
+    // persisted; matching stays off until it is.
+    persistence_owed: Atomic<bool>,
+
     #[pin]
     enrol_identity_candidates: Mutex<KVec<[u8; bio::UUID_LEN]>>,
 
@@ -992,6 +996,7 @@ impl SepData {
                 match_context_generation: Atomic::new(0),
                 sensor_kept: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
+                persistence_owed: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
                 sensor_power_ns: Atomic::new(0),
