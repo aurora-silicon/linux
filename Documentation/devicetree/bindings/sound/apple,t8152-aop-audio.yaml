@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,t8152-aop-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152 AOP audio
+
+maintainers:
+  - Thomas Glanzmann <thomas@glanzmann.de>
+
+description:
+  Audio services of the T8152 Always-On Processor firmware, a child of the
+  AOP node. The firmware owns the audio fabric; the host feeds and drains the
+  serializers through ADMAC channels.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    const: apple,t8152-aop-audio
+
+  dmas:
+    items:
+      - description: Headset jack output
+      - description: Headset microphone input
+      - description: Internal speaker output
+      - description: Speaker sense input
+
+  dma-names:
+    items:
+      - const: cout
+      - const: cin
+      - const: spkr
+      - const: sense
+
+  power-domains:
+    items:
+      - description: Serializer 0
+      - description: Serializer 1
+      - description: Serializer 2
+      - description: Serializer 3
+      - description: Serializer 4
+      - description: Serializer 5
+
+  power-domain-names:
+    items:
+      - const: mca0
+      - const: mca1
+      - const: mca2
+      - const: mca3
+      - const: mca4
+      - const: mca5
+
+  "#sound-dai-cells":
+    const: 1
+    description:
+      AOP audio DAI identifier. 0 is the headset back-end, 3 the speaker
+      back-end.
+
+required:
+  - compatible
+  - dmas
+  - dma-names
+  - power-domains
+  - power-domain-names
+  - "#sound-dai-cells"
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    audio {
+      compatible = "apple,t8152-aop-audio";
+      dmas = <&admac 10>, <&admac 11>, <&admac 2>, <&admac 3>;
+      dma-names = "cout", "cin", "spkr", "sense";
+      power-domains = <&ps_mca0>, <&ps_mca1>, <&ps_mca2>,
+                      <&ps_mca3>, <&ps_mca4>, <&ps_mca5>;
+      power-domain-names = "mca0", "mca1", "mca2", "mca3", "mca4", "mca5";
+      #sound-dai-cells = <1>;
+    };
