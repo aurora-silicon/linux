@@ -60,6 +60,7 @@
 			device_type = "cpu";
 			reg = <0 0x0>;
 			operating-points-v2 = <&ecluster_opp>;
+			next-level-cache = <&l2_cache_0>;
 			performance-domains = <&cpufreq_e>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -70,6 +71,7 @@
 			device_type = "cpu";
 			reg = <0 0x1>;
 			operating-points-v2 = <&ecluster_opp>;
+			next-level-cache = <&l2_cache_0>;
 			performance-domains = <&cpufreq_e>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -80,6 +82,7 @@
 			device_type = "cpu";
 			reg = <0 0x2>;
 			operating-points-v2 = <&ecluster_opp>;
+			next-level-cache = <&l2_cache_0>;
 			performance-domains = <&cpufreq_e>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -90,6 +93,7 @@
 			device_type = "cpu";
 			reg = <0 0x3>;
 			operating-points-v2 = <&ecluster_opp>;
+			next-level-cache = <&l2_cache_0>;
 			performance-domains = <&cpufreq_e>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -100,6 +104,7 @@
 			device_type = "cpu";
 			reg = <0 0x4>;
 			operating-points-v2 = <&ecluster_opp>;
+			next-level-cache = <&l2_cache_0>;
 			performance-domains = <&cpufreq_e>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -110,6 +115,7 @@
 			device_type = "cpu";
 			reg = <0 0x5>;
 			operating-points-v2 = <&ecluster_opp>;
+			next-level-cache = <&l2_cache_0>;
 			performance-domains = <&cpufreq_e>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -120,6 +126,7 @@
 			device_type = "cpu";
 			reg = <0 0x10100>;
 			operating-points-v2 = <&pcluster_opp>;
+			next-level-cache = <&l2_cache_1>;
 			performance-domains = <&cpufreq_p>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -130,6 +137,7 @@
 			device_type = "cpu";
 			reg = <0 0x10101>;
 			operating-points-v2 = <&pcluster_opp>;
+			next-level-cache = <&l2_cache_1>;
 			performance-domains = <&cpufreq_p>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -140,6 +148,7 @@
 			device_type = "cpu";
 			reg = <0 0x10102>;
 			operating-points-v2 = <&pcluster_opp>;
+			next-level-cache = <&l2_cache_1>;
 			performance-domains = <&cpufreq_p>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
@@ -150,9 +159,26 @@
 			device_type = "cpu";
 			reg = <0 0x10103>;
 			operating-points-v2 = <&pcluster_opp>;
+			next-level-cache = <&l2_cache_1>;
 			performance-domains = <&cpufreq_p>;
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
+		};
+
+		/*
+		 * One shared L2 per cluster (MPIDR Aff1). Sizes are left out
+		 * until they are read from this machine's own device tree.
+		 */
+		l2_cache_0: l2-cache-0 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+		};
+
+		l2_cache_1: l2-cache-1 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
 		};
 	};
 
