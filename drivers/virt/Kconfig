@@ -13,6 +13,14 @@ menuconfig VIRT_DRIVERS
 
 if VIRT_DRIVERS
 
+config AURA_PV
+	tristate "Aura PV-KVM diagnostic client"
+	depends on ARM64
+	default m
+	help
+	  Build the opt-in Aura PV-KVM v0 discovery/RUN client. The module
+	  binds only when Aura publishes its compatible DT node.
+
 config VMGENID
 	tristate "Virtual Machine Generation ID driver"
 	default y
