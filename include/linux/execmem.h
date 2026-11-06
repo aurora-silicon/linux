@@ -274,6 +274,7 @@ unsigned long execmem_confine_arch_verify(phys_addr_t base, phys_addr_t size,
 					  unsigned long *nr_exec);
 #else
 static inline bool execmem_confine_active(void) { return false; }
+static inline bool execmem_confine_enforced(void) { return false; }
 static inline bool execmem_confine_pfn_in_window(unsigned long pfn) { return false; }
 #endif /* CONFIG_EXECMEM_CONFINE */
 

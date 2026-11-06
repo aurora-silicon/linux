@@ -59,8 +59,8 @@ Userspace
 =========
 
 On a core that enforces the window, EL0 can't execute from it either. The fetch
-takes a permission fault that the page tables don't explain, so the kernel
-retries it forever. Anything EL0 can execute therefore lives outside the window:
+takes a permission fault that the page tables don't explain, so nothing can fix
+it up. Anything EL0 can execute therefore lives outside the window:
 
 * The vDSO's code is part of the image, so userspace gets a copy in ordinary
   memory.
@@ -68,6 +68,12 @@ retries it forever. Anything EL0 can execute therefore lives outside the window:
   so freed ``__init`` memory stays reserved, as does an initrd in the window. RAM
   in the window that the pool doesn't use is not available to the rest of the
   system, so a window should be no larger than the executable code needs.
+
+The zero page stays in the window, so a program that jumps into fresh executable
+memory before writing it still gets there. When the window is enforcing, an EL0
+instruction permission fault on a present, executable mapping of a window page
+logs the task and its address and PFN, then kills it with an uncatchable
+``SIGSEGV`` rather than retrying. Any other fault takes the usual path.
 
 EFI runtime services
 ====================
