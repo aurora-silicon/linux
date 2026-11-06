@@ -1480,6 +1480,8 @@ impl AopData {
             b"als" => c_str!("als"),
             b"accel" => c_str!("accel"),
             b"gyro" => c_str!("gyro"),
+            b"devmotion6" => c_str!("devmotion6"),
+            b"als-temp" => c_str!("als-temp"),
             _ => {
                 return Ok(());
             }

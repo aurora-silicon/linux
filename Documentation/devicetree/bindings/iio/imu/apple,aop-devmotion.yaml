@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/imu/apple,aop-devmotion.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple AOP device-motion fusion service
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  The Always-On Processor of Apple laptops fuses the machine's inertial
+  sensors and reports an orientation quaternion through this service. The
+  service has no application-processor MMIO or interrupt resource of its own.
+
+properties:
+  compatible:
+    items:
+      - const: apple,t6041-aop-devmotion6
+      - const: apple,aop-devmotion6
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    devmotion6 {
+        compatible = "apple,t6041-aop-devmotion6", "apple,aop-devmotion6";
+    };
+
