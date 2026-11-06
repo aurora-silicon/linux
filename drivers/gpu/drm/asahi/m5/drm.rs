@@ -271,7 +271,7 @@ impl queue::Queue for M5Queue {
             parser.finish().map_err(|_| EINVAL)?;
             if let command::ParsedHardwareCommand::Compute { payload, attachments, .. } = command {
                 let timestamps = [payload.timestamps.start, payload.timestamps.end];
-                if payload.flags != 0 || payload.sampler_heap != 0 || payload.sampler_count != 0
+                if payload.flags != 0
                     || timestamps.iter().any(|t| t.handle != 0 || t.offset != 0) {
                     pr_err!("M5 compute admission rejected flags={:#x} sampler_heap={:#x} samplers={} timestamps={}\n",
                         payload.flags, payload.sampler_heap, payload.sampler_count,
@@ -369,7 +369,9 @@ impl queue::Queue for M5Queue {
     }
 }
 
-/// Admit the captured M5 single-layer render-state envelope. This is an experimental first-job ABI
+/// Admit the captured M5 single-layer render-state envelope. A sampler heap
+/// is admitted: translate range-checks it and the descriptor carries it
+/// (+0x87a/+0x882/+0x886 as on G17P). This is an experimental first-job ABI
 /// path, not an assertion that arbitrary Vulkan programs are supported.
 fn admit_reference_render(command: &command::UapiRenderCommand) -> Result {
     // A single 32-bit color target has an eight-byte aligned sample stride
@@ -388,7 +390,6 @@ fn admit_reference_render(command: &command::UapiRenderCommand) -> Result {
         || !(1..=command::M5_MAX_RENDER_DIMENSION).contains(&u32::from(command.height))
         || command.layers != 1
         || !sample_layout
-        || command.sampler_heap != 0 || command.sampler_count != 0
         || command.occlusion_query_base != 0
         || timestamps.iter().any(|timestamp| timestamp.handle != 0 || timestamp.offset != 0) {
         return Err(ENOTSUPP);
