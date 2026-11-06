@@ -361,17 +361,17 @@ static inline void cd321x_pm_remove(struct cd321x_pm_state *pm)
  * no free pipeline (dcp_typec_route_set()).  That lasts until the other
  * display goes away, so the port's USB path is set up without the display
  * and nothing is retried; the DCP route hands the display a pipeline when
- * one frees.  On T8140 and T8142 any other error, such as -EBUSY from a PHY
- * in the middle of a transition, is retried.  The other SoCs also take
- * -EBUSY as a taken display, as before.
+ * one frees.  Any other error, such as -EBUSY from a PHY in the middle of a
+ * transition, is retried.
  *
- * Without -ENOSPC here, an M1 or M2 with a monitor on one port and a dock
- * on the other failed the dock's whole Type-C connection, so the dock's
- * USB devices and network never came up.
+ * Taking only -EBUSY as a taken display on SoCs other than T8140 and T8142
+ * failed an M1 or M2 dock's whole Type-C connection when a monitor on the
+ * other port held the one external pipeline: the dock's USB devices and
+ * network never came up.
  */
-static inline bool cd321x_display_taken(int ret, bool h17)
+static inline bool cd321x_display_taken(int ret)
 {
-	return ret == -ENOSPC || (!h17 && ret == -EBUSY);
+	return ret == -ENOSPC;
 }
 
 enum cd321x_dp_send {

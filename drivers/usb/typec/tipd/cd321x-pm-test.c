@@ -702,25 +702,15 @@ static void cd321x_held_mux_other_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pm.mux_retries, 0);
 }
 
-/* Only a pipeline owned by another port skips the retry. */
+/* Only a pipeline owned by another port skips the retry, on every SoC. */
 static void cd321x_display_taken_test(struct kunit *test)
 {
-	/* T8140/T8142: a PHY mid-transition or a pending SAFE state is retried. */
-	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, true));
-	/*
-	 * Other SoCs: the DCP route's -ENOSPC (no free pipeline) is a taken
-	 * display too, so a dock on the other port keeps its USB path; -EBUSY
-	 * stays a taken display there.
-	 */
-	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC, false));
-	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-EBUSY, false));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, false));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT, false));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, false));
+	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC));
+	/* A PHY mid-transition or a pending SAFE state must be retried. */
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0));
 }
 
 static void cd321x_completion_failure_sequence_test(struct kunit *test)
