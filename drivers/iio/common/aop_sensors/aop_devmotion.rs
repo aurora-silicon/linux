@@ -522,7 +522,21 @@ impl MotionIio {
     fn new(pdev: &platform::Device<Core<'_>>, control: Arc<Control>) -> Result<(Self, Arc<State>)> {
         let dev = pdev.as_ref();
         let payload = control.get(PROP_FASTPATH_PAYLOAD_SIZE, 8)?;
-        let payload_len = usize::try_from(le_u64(&payload, 0).ok_or(EIO)?).map_err(|_| EINVAL)?;
+        // The reply is a 32-bit value on the M4 Pro; accept 64 bits as well.
+        let size = match payload.len() {
+            8.. => le_u64(&payload, 0),
+            4..=7 => le_u32(&payload, 0).map(u64::from),
+            _ => None,
+        };
+        let Some(size) = size else {
+            dev_err!(
+                dev,
+                "fast-path payload size reply is {} bytes\n",
+                payload.len()
+            );
+            return Err(EIO);
+        };
+        let payload_len = usize::try_from(size).map_err(|_| EINVAL)?;
         if !(5..=MAX_REPORT_LEN).contains(&payload_len) {
             dev_err!(dev, "invalid fast-path payload size {}\n", payload_len);
             return Err(EINVAL);
@@ -530,7 +544,15 @@ impl MotionIio {
         let stride = (payload_len + 75) & !63;
         let required = FASTPATH_HEADER_LEN + 2 * stride;
         let ring_size = (required + FASTPATH_PAGE_SIZE - 1) & !(FASTPATH_PAGE_SIZE - 1);
-        let ring = Coherent::<u8>::zeroed_slice(dev, ring_size, GFP_KERNEL)?;
+        // The AOP firmware writes the ring, so it is mapped through the AOP
+        // core's own DART stream: the service device has no DMA setup.
+        let aop_dev = dev.parent().ok_or(ENODEV)?;
+        // SAFETY: The AOP core unbinds its service devices before it unbinds
+        // itself, so the parent is bound while this probe runs. The reference
+        // is used only for the allocation; the buffer keeps its own device
+        // reference.
+        let aop_dev = unsafe { aop_dev.as_bound() };
+        let ring = Coherent::<u8>::zeroed_slice(aop_dev, ring_size, GFP_KERNEL)?;
         let spec = KBox::pin(
             Spec {
                 channels: [quaternion_channel(), timestamp_channel()],
