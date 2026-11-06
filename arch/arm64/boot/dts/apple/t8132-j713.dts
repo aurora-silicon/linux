@@ -541,6 +541,18 @@
 	apple,static-voters = <3>;
 };
 
+/*
+ * The PMC enables of an external pipe are set once the pipe's SYS state is
+ * on, and before its FE state powers on.
+ */
+&ps_dispext0_fe {
+	power-domains = <&ps_dispext0_sys>, <&pmc_dispext0>;
+};
+
+&ps_dispext1_fe {
+	power-domains = <&ps_dispext1_sys>, <&pmc_dispext1>;
+};
+
 &smc {
 	status = "okay";
 
