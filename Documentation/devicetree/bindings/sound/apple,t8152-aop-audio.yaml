@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/sound/apple,t8152-aop-audio.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8152 AOP audio
+title: Apple T8142 and T8152 AOP audio
 
 maintainers:
   - Thomas Glanzmann <thomas@glanzmann.de>
@@ -16,26 +16,63 @@ description:
 
 allOf:
   - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-aop-audio
+    then:
+      properties:
+        dmas:
+          minItems: 5
+        dma-names:
+          minItems: 5
+        power-domains:
+          minItems: 9
+        power-domain-names:
+          minItems: 9
+      required:
+        - apple,chassis-name
+        - apple,machine-kind
+    else:
+      properties:
+        dmas:
+          maxItems: 4
+        dma-names:
+          maxItems: 4
+        power-domains:
+          maxItems: 6
+        power-domain-names:
+          maxItems: 6
 
 properties:
   compatible:
-    const: apple,t8152-aop-audio
+    oneOf:
+      - const: apple,t8152-aop-audio
+      - items:
+          - const: apple,t8142-aop-audio
+          - const: apple,t8152-aop-audio
 
   dmas:
+    minItems: 4
     items:
       - description: Headset jack output
       - description: Headset microphone input
       - description: Internal speaker output
       - description: Speaker sense input
+      - description: Internal microphone array input
 
   dma-names:
+    minItems: 4
     items:
       - const: cout
       - const: cin
       - const: spkr
       - const: sense
+      - const: hpai
 
   power-domains:
+    minItems: 6
     items:
       - description: Serializer 0
       - description: Serializer 1
@@ -43,8 +80,12 @@ properties:
       - description: Serializer 3
       - description: Serializer 4
       - description: Serializer 5
+      - description: Secure LEAP ADMAC
+      - description: LEAP receive channel 0
+      - description: LEAP serializer
 
   power-domain-names:
+    minItems: 6
     items:
       - const: mca0
       - const: mca1
@@ -52,6 +93,17 @@ properties:
       - const: mca3
       - const: mca4
       - const: mca5
+      - const: leap_s_a
+      - const: leap_rx0
+      - const: leap_mca
+
+  apple,chassis-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Chassis identifier used to name the microphone card
+
+  apple,machine-kind:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Human-readable machine family used to name the microphone card
 
   "#sound-dai-cells":
     const: 1

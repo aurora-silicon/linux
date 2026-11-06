@@ -1239,7 +1239,7 @@ unsafe extern "C" fn mic_pcm_trigger(substream: *mut bindings::snd_pcm_substream
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
             data.hpai_want_run.store(true, Relaxed);
             // Err: already queued, and that run sees `hpai_want_run`.
-            let _ = workqueue::system().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
+            let _ = workqueue::system_dfl().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
         }
         _ => data.hpai_want_run.store(false, Relaxed),
     }
@@ -1477,7 +1477,8 @@ impl platform::Driver for T8152AopAudioDriver {
         let mic = if data.leap.is_empty() {
             None
         } else {
-            // Initialize the shared output service before exposing HPAI.
+            // J813 needs an output service initialized before HPAI can raise
+            // the shared fabric, even when no playback stream is requested.
             // This is standby only: no DMA, running state or codec unmute.
             // No userspace stream can race this before card registration.
             match data.set_power(&data.cout, POWER_STATE_PW0)
@@ -1485,7 +1486,7 @@ impl platform::Driver for T8152AopAudioDriver {
             {
                 Ok(card) => Some(card),
                 Err(e) => {
-                    dev_err!(dev, "microphone card: {:?}\n", e);
+                    dev_err!(dev, "microphone initialization: {:?}\n", e);
                     None
                 }
             }
