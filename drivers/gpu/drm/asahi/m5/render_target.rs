@@ -11,6 +11,9 @@ pub(crate) struct M5RenderTargetLayout {
     pub(crate) heapmeta_bytes: usize,
     pub(crate) target_bytes: usize,
     pub(crate) tpc_bytes: usize,
+    /// The TPC geometry size before page rounding: the TA descriptor's
+    /// +0x788 (the g17 M5 driver's `tpc_size`).
+    pub(crate) tpc_geometry_bytes: usize,
 }
 
 fn align(value: usize, alignment: usize) -> Option<usize> {
@@ -39,10 +42,12 @@ impl M5RenderTargetLayout {
         let heapmeta_offset = align(tilemap_bytes, 0x1000)?;
         let heapmeta_bytes = if layers > 1 { 0x300 } else { 0x200 };
         let target_bytes = align(heapmeta_offset.checked_add(heapmeta_bytes)?, PAGE_BYTES)?;
-        let tpc_bytes = align(8usize.checked_mul(per_mtile)?.checked_mul(utiles)?
+        let tpc_geometry_bytes = 8usize.checked_mul(per_mtile)?.checked_mul(utiles)?
             .checked_mul(16)?.checked_mul(layers as usize)?
-            .checked_mul(clusters as usize)?, PAGE_BYTES)?;
-        Some(Self { tilemap_bytes, heapmeta_offset, heapmeta_bytes, target_bytes, tpc_bytes })
+            .checked_mul(clusters as usize)?;
+        let tpc_bytes = align(tpc_geometry_bytes, PAGE_BYTES)?;
+        Some(Self { tilemap_bytes, heapmeta_offset, heapmeta_bytes, target_bytes, tpc_bytes,
+            tpc_geometry_bytes })
     }
 }
 

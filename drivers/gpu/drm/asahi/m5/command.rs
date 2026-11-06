@@ -1005,6 +1005,8 @@ fn translate_render_command_with_capacity<A: GpuAddressSpace>(
     parameters.height = command.height as u32;
     parameters.encoder = command.vdm_base;
     parameters.layers = command.layers;
+    parameters.samples = command.samples;
+    parameters.sample_size = command.sample_size;
     parameters.utile_width = command.utile_width;
     parameters.utile_height = command.utile_height;
     parameters.utile_config = utile_config;
