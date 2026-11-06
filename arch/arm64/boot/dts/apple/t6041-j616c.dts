@@ -348,8 +348,6 @@
 		height-mm = <223>;
 		adj-height-mm = <216>;
 		apple,max-brightness = <500>;
-		/* "Wide color (P3)" in the Apple technical specifications */
-		apple,color-gamut = "display-p3";
 	};
 };
 
