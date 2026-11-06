@@ -150,8 +150,7 @@ pub(crate) struct G17pRenderParameters {
     pub(crate) merge_upper_x_bits: u32,
     pub(crate) merge_upper_y_bits: u32,
     pub(crate) layers: u16,
-    /// Sample count: 1, 2 or 4. Defaults to 1, so every existing parameter
-    /// vector keeps its exact register program.
+    /// Utile dimensions in pixels, including the sample-layout adjustment.
     pub(crate) utile_width: u8,
     pub(crate) utile_height: u8,
     pub(crate) utile_config: u64,
