@@ -54,7 +54,7 @@ pub(crate) struct G18ComputeMemory {
 }
 
 struct G18ComputeProcess {
-    context: mmu::M5ExecutionContext,
+    context: mmu::G18ExecutionContext,
     // Same GEM pages and GPU VAs as the firmware-owned command/channel.
     aliases: [mmu::KernelMapping; 2],
 }

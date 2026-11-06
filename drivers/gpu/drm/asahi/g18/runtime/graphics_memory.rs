@@ -9,7 +9,7 @@ pub(crate) struct G18GraphicsMemory {
     // Root lease retracts before aliases/backing can drop. The live session
     // retains the whole job even after faults; this order also protects errors
     // during construction before publication.
-    context: mmu::M5ExecutionContext,
+    context: mmu::G18ExecutionContext,
     aliases: KVec<mmu::KernelMapping>,
     vdm_alias: Option<(u64, u64)>,
     ppp_aliased: bool,

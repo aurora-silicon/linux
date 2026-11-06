@@ -55,6 +55,13 @@ config DRM_ASAHI_G18
 	  Submission is synchronous: every command retires before the next
 	  one starts. The module parameters prefixed g18_ select the bring-up
 	  stage and the admitted command envelope.
+config DRM_ASAHI_M5
+	bool "Apple M5 (G17G, T8142) support (experimental)"
+	depends on DRM_ASAHI && ARM64
+	help
+	  Backend for the M5 GPU (J813 MacBook Air) running the 25G76
+	  firmware (RTKit-3255.160.4), as loaded and published by the aura
+	  boot loader (/chosen/aurora,m5-gpu-firmware-profile).
 
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"

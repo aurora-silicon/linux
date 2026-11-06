@@ -113,6 +113,8 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Mmu;
 mod bind;
 mod context;
 mod lifetime;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+mod m5_context;
 mod ppl;
 mod residency;
 mod shared;
@@ -121,10 +123,12 @@ mod t8152;
 pub(crate) use bind::PreparedUserBindBatch;
 pub(crate) use lifetime::VmJobGuard;
 #[cfg(CONFIG_DRM_ASAHI_G18)]
-pub(crate) use t8152::M5ExecutionContext;
+pub(crate) use t8152::G18ExecutionContext;
 /// The module-1134 name of the job guard G18 holds while a job uses a VM.
 #[cfg(CONFIG_DRM_ASAHI_G18)]
 pub(crate) type T8140VmJobGuard = VmJobGuard;
+#[cfg(CONFIG_DRM_ASAHI_M5)]
+pub(crate) use m5_context::M5ExecutionContext;
 pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 
 /// PPL magic number for the handoff region
@@ -1078,6 +1082,9 @@ pub(crate) struct Vm {
     device_binding: Arc<crate::binding::Gate>,
     dev: ARef<device::Device>,
     id: u64,
+    /// The range reserved for kernel-managed objects at creation.
+    #[cfg_attr(not(any(CONFIG_DRM_ASAHI_M5, CONFIG_DRM_ASAHI_G18)), allow(dead_code))]
+    kernel_range: Range<u64>,
     mapping_epoch: Option<Arc<MappingEpoch>>,
     bind_sequence: Arc<AtomicU64>,
     lifetime: Option<Arc<lifetime::VmLifetime>>,
@@ -1088,9 +1095,6 @@ pub(crate) struct Vm {
     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
-    /// The kernel range this VM was created with (`t8152::Vm::kernel_range`).
-    #[cfg(CONFIG_DRM_ASAHI_G18)]
-    kernel_range: Range<u64>,
 }
 no_debug!(Vm);
 
@@ -2238,14 +2242,12 @@ impl Vm {
             None
         };
         let bind_sequence = Arc::new(AtomicU64::new(0), GFP_KERNEL)?;
-        #[cfg(CONFIG_DRM_ASAHI_G18)]
-        let vm_kernel_range = kernel_range.clone();
         let unique_gpuvm = gpuvm::GpuVm::new::<Error, _>(
             c"Asahi::GpuVm",
             &dev,
             &*dummy_obj.gem,
             gpuvm_range,
-            kernel_range,
+            kernel_range.clone(),
             VmInner {
                 dev: dev.clone(),
                 is_kernel,
@@ -2267,6 +2269,7 @@ impl Vm {
             device_binding,
             dev: dev.as_ref().as_ref().into(),
             id,
+            kernel_range,
             gpuvm,
             mapping_epoch,
             bind_sequence,
@@ -2277,9 +2280,13 @@ impl Vm {
             status: None,
             dummy_obj: dummy_obj.gem.clone(),
             binding,
-            #[cfg(CONFIG_DRM_ASAHI_G18)]
-            kernel_range: vm_kernel_range,
         })
+    }
+
+    /// The range reserved for kernel-managed objects when this VM was created.
+    #[cfg_attr(not(any(CONFIG_DRM_ASAHI_M5, CONFIG_DRM_ASAHI_G18)), allow(dead_code))]
+    pub(crate) fn kernel_range(&self) -> Range<u64> {
+        self.kernel_range.clone()
     }
 
     /// Attach a status before sharing a newly created user VM with queues.
@@ -2626,9 +2633,24 @@ impl Vm {
         prot: Prot,
         guard: bool,
     ) -> Result<KernelMapping> {
-        let reserved_size = size
-            .checked_add(if guard { UAT_PGSZ } else { 0 })
-            .ok_or(EOVERFLOW)?;
+        self.map_at_with_guard_size(addr, size, gem, prot, if guard { UAT_PGSZ } else { 0 })
+    }
+
+    /// Map a GEM object into this Vm at a specific address, followed by an unmapped guard of
+    /// `guard_size` bytes (a multiple of the page size).
+    #[inline(never)]
+    pub(crate) fn map_at_with_guard_size(
+        &self,
+        addr: u64,
+        size: usize,
+        gem: &gem::Object,
+        prot: Prot,
+        guard_size: usize,
+    ) -> Result<KernelMapping> {
+        if guard_size & UAT_PGMSK != 0 {
+            return Err(EINVAL);
+        }
+        let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
         let _residency = self.enter_residency()?;
         // End the bound-device lease before entering firmware/GPUVM waits.
         let (_bind_lease, vm_bo) = {
@@ -3551,7 +3573,7 @@ impl Uat {
     /// Allocates a stable application context without changing the VM bind slot.
     /// Both roots and the generation remain unchanged for the lease's lifetime.
     pub(crate) fn new_execution_context(&self, vm: &Vm) -> Result<Arc<ExecutionContext>> {
-        // NoPeerRoots: T8152 publishes `t8152::M5ExecutionContext` leases (private empty upper
+        // NoPeerRoots: T8152 publishes `t8152::G18ExecutionContext` leases (private empty upper
         // root) instead of kernel-root upper halves.
         if self.inner.firmware == UatFirmware::Handoff || self.inner.firmware.is_no_peer() {
             return Err(EINVAL);

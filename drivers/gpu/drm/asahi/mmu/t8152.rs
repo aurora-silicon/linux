@@ -330,7 +330,7 @@ impl Uat {
     /// firmware session's lifetime.
     pub(crate) fn prepare_t8152_execution_context(
         &self, vm: &Vm,
-    ) -> Result<M5ExecutionContext> {
+    ) -> Result<G18ExecutionContext> {
         if !self.is_t8152_geometry() {
             return Err(ENODEV);
         }
@@ -363,7 +363,7 @@ impl Uat {
             .with_t8152_lifetime()?;
         let low = vm.clone();
         let roots = context_roots(context, &low, &high)?;
-        Ok(M5ExecutionContext { slot, low, high, roots, published: false })
+        Ok(G18ExecutionContext { slot, low, high, roots, published: false })
     }
 }
 
@@ -393,7 +393,7 @@ impl Drop for M5ContextSlot {
 /// Firmware owns contexts 0..2. Application contexts are claimed before any
 /// root becomes visible, and the lease retains both VM roots. The submission
 /// owner must retain the lease until completion or confirmed processor stop.
-pub(crate) struct M5ExecutionContext {
+pub(crate) struct G18ExecutionContext {
     slot: M5ContextSlot,
     low: Vm,
     high: Vm,
@@ -408,7 +408,7 @@ fn context_roots(context: usize, low: &Vm, high: &Vm) -> Result<[u64; 2]> {
     Ok([low.ttb() | tag, high.ttb() | tag])
 }
 
-impl M5ExecutionContext {
+impl G18ExecutionContext {
     pub(crate) fn vm(&self) -> &Vm { &self.low }
 
     pub(crate) fn context_id(&self) -> u8 { self.slot.context as u8 }
@@ -494,7 +494,7 @@ impl M5ExecutionContext {
     }
 }
 
-impl Drop for M5ExecutionContext {
+impl Drop for G18ExecutionContext {
     fn drop(&mut self) {
         self.retract();
     }
@@ -512,9 +512,6 @@ impl Vm {
         self.lifetime = Some(lifetime::VmLifetime::new()?);
         Ok(self)
     }
-
-    /// Application VA interval reserved by VM_CREATE for driver allocations.
-    pub(crate) fn kernel_range(&self) -> Range<u64> { self.kernel_range.clone() }
 
     /// The module-1134 name of [`Vm::retain_job`].
     pub(crate) fn retain_t8140_job(&self) -> Result<VmJobGuard> {

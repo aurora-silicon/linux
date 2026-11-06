@@ -245,9 +245,14 @@ impl<T: Operations> RtKit<T> {
         ..Self::VTABLE
     };
 
-    const G17P_VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+    const FIRMWARE_CRASHLOG_VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
         flags: Self::VTABLE.flags | bindings::APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG,
         ..Self::VTABLE
+    };
+
+    const G17P_VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        flags: Self::FIRMWARE_CRASHLOG_VTABLE.flags | bindings::APPLE_RTKIT_EARLY_CRASHLOG,
+        ..Self::FIRMWARE_CRASHLOG_VTABLE
     };
 
     /// Creates a new RTKit client for a given device and optional mailbox name or index.
@@ -273,11 +278,21 @@ impl<T: Operations> RtKit<T> {
         Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::COREANALYTICS_VTABLE)
     }
 
-    /// Creates a G17P client whose crash DVA belongs to the GPU UAT.
+    /// Creates a client whose co-processor keeps its crash buffer in memory it
+    /// maps itself and asks for it with that IOVA (the T8142 AOP).
+    pub fn new_with_firmware_crashlog(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+    ) -> Result<Self> {
+        Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::FIRMWARE_CRASHLOG_VTABLE)
+    }
+
+    /// Creates a G17P/G18G client whose crash DVA belongs to the GPU UAT.
     ///
-    /// The firmware's crashlog buffer request is acknowledged without mapping it, and a
-    /// crash reaches [`Operations::crashed`] with no host copy of the log. Other buffer
-    /// requests are handled as for [`RtKit::new`].
+    /// The crashlog endpoint starts before its map is acknowledged. The
+    /// firmware-owned buffer is acknowledged without mapping it on the CPU.
     pub fn new_g17p(
         dev: &device::Device,
         mbox_name: Option<&'static CStr>,

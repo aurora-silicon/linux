@@ -162,7 +162,7 @@ static bool apple_rtkit_firmware_owns_crashlog(struct apple_rtkit *rtk)
 static bool apple_rtkit_early_crashlog(struct apple_rtkit *rtk)
 {
 	return apple_rtkit_coproc_places_buffers(rtk) ||
-	       apple_rtkit_firmware_owns_crashlog(rtk);
+	       (rtk->ops->flags & APPLE_RTKIT_EARLY_CRASHLOG);
 }
 
 static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
@@ -244,8 +244,8 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	/*
-	 * For co-processors that place their own buffers, or only their
-	 * crashlog buffer, the crashlog endpoint is started before the map is
+	 * Co-processors that place all buffers, and clients that explicitly
+	 * request early crashlog startup, need the endpoint before the map is
 	 * acknowledged: G17P can request its crash DVA right after.
 	 */
 	if (apple_rtkit_early_crashlog(rtk) && base == 0 &&
@@ -423,12 +423,11 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
 		request.size, &request.iova);
 
-	/* This DVA belongs to the co-processor's own UAT: record it, unmapped. */
-	if (apple_rtkit_firmware_owns_crashlog(rtk) &&
+	if ((rtk->ops->flags & APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG) &&
 	    ep == APPLE_RTKIT_EP_CRASHLOG && request.iova) {
 		*buffer = request;
 		buffer->is_mapped = true;
-		goto reply;
+		return apple_rtkit_send_message(rtk, ep, msg, NULL, false);
 	}
 
 	if (request.iova && !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
@@ -757,12 +756,12 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
 
-	/* A firmware-owned crash buffer has no CPU mapping to copy from. */
-	if (apple_rtkit_firmware_owns_crashlog(rtk) &&
-	    !rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem) {
-		dev_err(rtk->dev,
-			"RTKit: firmware-owned crash log at DVA %pad (0x%zx bytes)\n",
-			&rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size);
+	/* A firmware-owned crash buffer has no CPU mapping to read the log from. */
+	if (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem) {
+		if (apple_rtkit_firmware_owns_crashlog(rtk))
+			dev_err(rtk->dev,
+				"RTKit: firmware-owned crash log at DVA %pad (0x%zx bytes)\n",
+				&rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size);
 		rtk->crashed = true;
 		if (rtk->ops->crashed)
 			rtk->ops->crashed(rtk->cookie, NULL, 0);

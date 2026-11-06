@@ -58,13 +58,14 @@ struct apple_rtkit_inherited_buffer {
 #define APPLE_RTKIT_NEEDS_COREANALYTICS	BIT(1)
 
 /*
- * The co-processor places its crashlog buffer in its own address space (the
- * G17P/G18G GPU UAT), not in this device's DMA domain. That buffer request is
- * acknowledged by sending it back unchanged, without mapping it, and a crash
- * is reported with no host copy of the log. The crashlog endpoint is started
- * while the endpoint map is handled. Other buffers are allocated as usual.
+ * The co-processor keeps its crash buffer in memory it maps itself (the T8142
+ * AOP) and asks for it with that IOVA: take the buffer as the firmware's,
+ * without a CPU mapping, and acknowledge the request unchanged.
  */
 #define APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG	BIT(2)
+
+/* Start the crashlog endpoint before acknowledging its endpoint map. */
+#define APPLE_RTKIT_EARLY_CRASHLOG		BIT(3)
 
 /*
  * Struct to represent implementation-specific RTKit operations.
