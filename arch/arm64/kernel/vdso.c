@@ -12,6 +12,7 @@
 #include <linux/elf.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/execmem.h>
 #include <linux/gfp.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -73,7 +74,7 @@ static struct page * __init vdso_code_page(unsigned long pfn)
 {
 	struct page *page;
 
-	if (!IS_ENABLED(CONFIG_ARM64_CTXR_EXECMEM))
+	if (!execmem_confine_active())
 		return pfn_to_page(pfn);
 
 	page = alloc_page(GFP_KERNEL);
