@@ -168,6 +168,7 @@ impl Context {
         execution: Arc<ExecutionContext>,
         owner_pid: u32,
         policy: Policy,
+        mcache_dsid_client: Option<usize>,
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
     ) -> Result<Self> {
@@ -180,7 +181,7 @@ impl Context {
             CpuMap::WriteCombined,
         )?;
         scheduler.initialize::<fw::Scheduler>(0, |value| {
-            value.init();
+            value.init(mcache_dsid_client.map(|client| (client, execution.id() as u8)));
             Ok(())
         })?;
         fence(Ordering::SeqCst);

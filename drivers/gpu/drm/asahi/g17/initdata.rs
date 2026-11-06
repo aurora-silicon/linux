@@ -122,7 +122,7 @@ impl ComputeScheduler {
             CpuMap::WriteCombined,
         )?;
         object.initialize::<super::fw::context::Scheduler>(0, |state| {
-            state.init();
+            state.init(None);
             Ok(())
         })?;
         fence(Ordering::SeqCst);
