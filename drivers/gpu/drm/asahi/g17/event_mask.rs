@@ -2,8 +2,8 @@
 
 //! Test-only G16 KSM kick event-mask arms.
 //!
-//! Arm A preserves the production masks byte for byte. The other arms add KSM
-//! event 253 independently to compute, tiling, fragment, the render
+//! Arm A preserves the production masks byte for byte. The other arms add one
+//! operator-selected event independently to compute, tiling, fragment, the render
 //! pair, or every engine. They exist only for controlled A/B boots and must not
 //! become the default without a separate correctness and latency result.
 
@@ -19,23 +19,20 @@ pub(crate) enum Engine {
     Fragment,
 }
 
-/// KSM event 253 in the fourth word of the 256-bit mask.
-const KSM_EVENT_253: u64 = 1 << 61;
-
 /// Test arm selected at module load.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Arm {
     /// Existing Linux masks, unchanged.
     A,
-    /// Add event 253 to compute only.
+    /// Add the selected event to compute only.
     C,
-    /// Add event 253 to tiling only.
+    /// Add the selected event to tiling only.
     T,
-    /// Add event 253 to fragment only.
+    /// Add the selected event to fragment only.
     F,
-    /// Add event 253 to both render stages.
+    /// Add the selected event to both render stages.
     R,
-    /// Add event 253 to all three engines.
+    /// Add the selected event to all three engines.
     M,
 }
 
@@ -63,61 +60,68 @@ impl Arm {
     }
 }
 
-fn mask(value: u8, engine: Engine) -> [u64; 4] {
+fn mask(value: u8, bit: u16, engine: Engine) -> [u64; 4] {
     let mut mask = match engine {
         Engine::Compute => COMPUTE_KICK_EVENT_MASK,
         Engine::Tiling | Engine::Fragment => RENDER_KICK_EVENT_MASK,
     };
-    if Arm::from_param(value).covers(engine) {
-        mask[3] |= KSM_EVENT_253;
+    if Arm::from_param(value).covers(engine) && bit < 256 {
+        mask[usize::from(bit / 64)] |= 1 << (bit % 64);
     }
     mask
 }
 
 /// Returns the mask for one kick under the selected test arm.
 pub(crate) fn selected(engine: Engine) -> [u64; 4] {
-    mask(module_parameters::g16_ksm_event_mask_arm.value(), engine)
+    mask(
+        module_parameters::g16_ksm_event_mask_arm.value(),
+        module_parameters::g16_ksm_event_mask_bit.value(),
+        engine,
+    )
 }
 
 #[kunit_tests(asahi_g17_ksm_event_mask)]
 mod tests {
     use super::*;
 
-    const COMPUTE_EVENT_253: [u64; 4] = [0, 0, 4, KSM_EVENT_253];
-    const RENDER_EVENT_253: [u64; 4] = [0, 0, 0, KSM_EVENT_253];
+    const EVENT: u64 = 1 << 17;
+    const COMPUTE_EVENT: [u64; 4] = [EVENT, 0, 4, 0];
+    const RENDER_EVENT: [u64; 4] = [EVENT, 0, 0, 0];
 
     #[test]
     fn arm_a_and_invalid_values_preserve_the_default() {
         for value in [0, 6, u8::MAX] {
-            assert_eq!(mask(value, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
-            assert_eq!(mask(value, Engine::Tiling), RENDER_KICK_EVENT_MASK);
-            assert_eq!(mask(value, Engine::Fragment), RENDER_KICK_EVENT_MASK);
+            assert_eq!(mask(value, 17, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
+            assert_eq!(mask(value, 17, Engine::Tiling), RENDER_KICK_EVENT_MASK);
+            assert_eq!(mask(value, 17, Engine::Fragment), RENDER_KICK_EVENT_MASK);
         }
+        assert_eq!(mask(5, 256, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
+        assert_eq!(mask(5, u16::MAX, Engine::Tiling), RENDER_KICK_EVENT_MASK);
     }
 
     #[test]
     fn single_engine_arms_are_isolated() {
-        assert_eq!(mask(1, Engine::Compute), COMPUTE_EVENT_253);
-        assert_eq!(mask(1, Engine::Tiling), RENDER_KICK_EVENT_MASK);
-        assert_eq!(mask(1, Engine::Fragment), RENDER_KICK_EVENT_MASK);
+        assert_eq!(mask(1, 17, Engine::Compute), COMPUTE_EVENT);
+        assert_eq!(mask(1, 17, Engine::Tiling), RENDER_KICK_EVENT_MASK);
+        assert_eq!(mask(1, 17, Engine::Fragment), RENDER_KICK_EVENT_MASK);
 
-        assert_eq!(mask(2, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
-        assert_eq!(mask(2, Engine::Tiling), RENDER_EVENT_253);
-        assert_eq!(mask(2, Engine::Fragment), RENDER_KICK_EVENT_MASK);
+        assert_eq!(mask(2, 17, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
+        assert_eq!(mask(2, 17, Engine::Tiling), RENDER_EVENT);
+        assert_eq!(mask(2, 17, Engine::Fragment), RENDER_KICK_EVENT_MASK);
 
-        assert_eq!(mask(3, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
-        assert_eq!(mask(3, Engine::Tiling), RENDER_KICK_EVENT_MASK);
-        assert_eq!(mask(3, Engine::Fragment), RENDER_EVENT_253);
+        assert_eq!(mask(3, 17, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
+        assert_eq!(mask(3, 17, Engine::Tiling), RENDER_KICK_EVENT_MASK);
+        assert_eq!(mask(3, 17, Engine::Fragment), RENDER_EVENT);
     }
 
     #[test]
     fn paired_and_all_engine_arms_cover_only_their_named_engines() {
-        assert_eq!(mask(4, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
-        assert_eq!(mask(4, Engine::Tiling), RENDER_EVENT_253);
-        assert_eq!(mask(4, Engine::Fragment), RENDER_EVENT_253);
+        assert_eq!(mask(4, 17, Engine::Compute), COMPUTE_KICK_EVENT_MASK);
+        assert_eq!(mask(4, 17, Engine::Tiling), RENDER_EVENT);
+        assert_eq!(mask(4, 17, Engine::Fragment), RENDER_EVENT);
 
-        assert_eq!(mask(5, Engine::Compute), COMPUTE_EVENT_253);
-        assert_eq!(mask(5, Engine::Tiling), RENDER_EVENT_253);
-        assert_eq!(mask(5, Engine::Fragment), RENDER_EVENT_253);
+        assert_eq!(mask(5, 17, Engine::Compute), COMPUTE_EVENT);
+        assert_eq!(mask(5, 17, Engine::Tiling), RENDER_EVENT);
+        assert_eq!(mask(5, 17, Engine::Fragment), RENDER_EVENT);
     }
 }

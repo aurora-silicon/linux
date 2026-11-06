@@ -220,5 +220,9 @@ module! {
             default: 0,
             description: "G16 TEST ONLY: KSM event-mask A/B arm (0=A, 1=C, 2=T, 3=F, 4=R, 5=M)",
         },
+        g16_ksm_event_mask_bit: u16 {
+            default: 256,
+            description: "G16 TEST ONLY: KSM event bit for a non-A mask arm (0..255; other=off)",
+        },
     },
 }
