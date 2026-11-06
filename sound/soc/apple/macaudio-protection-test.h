@@ -992,7 +992,50 @@ static void macaudio_sense_owned_writes(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), 0);
 }
 
+static void macaudio_route_is_protected(struct kunit *test)
+{
+	static const char *const names[] = { "Speaker Playback Mux", "Headphone Playback Mux" };
+	struct macaudio_test_spk t = {};
+	struct snd_kcontrol *mux[ARRAY_SIZE(names)];
+	unsigned int i;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j413_cfg, SN012776_0DB);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct snd_kcontrol_new tmpl = {
+			.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+			.name = names[i],
+			.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+			.info = snd_ctl_boolean_mono_info,
+		};
+
+		mux[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
+	}
+	macaudio_protect_sense(&t.ma->card);
+	KUNIT_EXPECT_TRUE(test, mux[0]->write_check == macaudio_route_write_check);
+	KUNIT_EXPECT_NULL(test, mux[1]->write_check);
+}
+
+static void macaudio_route_fixed_while_granted(struct kunit *test)
+{
+	struct macaudio_test_spk t = {};
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+	macaudio_test_take(test, &t);
+	/* Owned but not granted: the owner checks the route before it grants. */
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	macaudio_spk_unlock(t.spk);
+	KUNIT_EXPECT_EQ(test, macaudio_route_check(t.ma), 0);
+}
+
 static struct kunit_case macaudio_protection_cases[] = {
+	KUNIT_CASE(macaudio_route_is_protected),
+	KUNIT_CASE(macaudio_route_fixed_while_granted),
 	KUNIT_CASE(macaudio_sense_owned_writes),
 	KUNIT_CASE(macaudio_sense_controls_are_protected),
 	KUNIT_CASE(macaudio_spk_floor_from_binding),

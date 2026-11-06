@@ -1088,7 +1088,29 @@ static int macaudio_sense_write_check(struct snd_kcontrol *kctl, struct snd_ctl_
 	return macaudio_sense_owner_check(ma, file);
 }
 
-/* Match both mono and prefixed amp DAPM switches; leave jack controls alone. */
+/*
+ * The speaker route may not change under a grant: the owner admitted the
+ * front-end its engine drives, and another one routed to the speakers would
+ * reach the amps without protection until the owner noticed. Re-route only
+ * while protection is withdrawn.
+ */
+static int macaudio_route_check(struct macaudio_snd_data *ma)
+{
+	/* Pairs with the release in macaudio_spk_grant() */
+	return smp_load_acquire(&ma->spk_granted) ? -EBUSY : 0;
+}
+
+static int macaudio_route_write_check(struct snd_kcontrol *kctl, struct snd_ctl_file *file)
+{
+	struct snd_soc_card *card = snd_soc_dapm_to_card(snd_soc_dapm_kcontrol_to_dapm(kctl));
+
+	return macaudio_route_check(snd_soc_card_get_drvdata(card));
+}
+
+/*
+ * Match both mono and prefixed amp DAPM sense switches, and the speaker
+ * route; leave jack controls alone.
+ */
 static void macaudio_protect_sense(struct snd_soc_card *card)
 {
 	struct snd_kcontrol *kctl;
@@ -1099,6 +1121,8 @@ static void macaudio_protect_sense(struct snd_soc_card *card)
 		    !strcmp(kctl->id.name, "ISENSE Switch") ||
 		    !strcmp(kctl->id.name, "VSENSE Switch"))
 			kctl->write_check = macaudio_sense_write_check;
+		else if (!strcmp(kctl->id.name, "Speaker Playback Mux"))
+			kctl->write_check = macaudio_route_write_check;
 	}
 }
 
