@@ -21,9 +21,13 @@ allOf:
 
 properties:
   compatible:
-    enum:
-      - ti,tas2770
-      - ti,tas5770l # Apple variant
+    oneOf:
+      - enum:
+          - ti,tas2770
+          - ti,tas5770l # Apple variant
+      - items:
+          - const: ti,tas5770l
+          - const: ti,tas2770
 
   reg:
     maxItems: 1
