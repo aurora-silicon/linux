@@ -16,6 +16,7 @@ typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
 #define BIT_ULL(n) (1ULL << (n))
+#define GENMASK_ULL(h, l) ((~0ULL << (l)) & (~0ULL >> (63 - (h))))
 #define __ffs64(v) __builtin_ctzll(v)
 #define BIT(n) (1U << (n))
 #define IS_ENABLED(x) (x)
@@ -158,6 +159,9 @@ struct apple_pmp_report {
 	struct apple_pmp_start *start;
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
+	/* Provider-owned whole-word DVFS shadows; unused by T6030. */
+	u64 dvfs_words[64];
+	u64 dvfs_known;
 	bool defer;
 	unsigned int polls;
 	struct delayed_work ready_work;
