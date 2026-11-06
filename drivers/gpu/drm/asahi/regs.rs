@@ -770,6 +770,26 @@ impl G17Resources {
         self.sgx_read32::<G17_CORE_POWER>()
     }
 
+    /// M5: set the low bit of the PMGR boot control word at SGX+0xe90000, as the native
+    /// 25G76 driver does before either firmware role starts. The word reads 0x30000 (or
+    /// 0x30001 when already set) on J813; anything else is refused.
+    #[cfg(CONFIG_DRM_ASAHI_M5)]
+    pub(crate) fn m5_match_pmgr_boot_control(&self) -> Result {
+        const OFFSET: usize = 0xe90000;
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        let before = sgx.try_read32(OFFSET)?;
+        if before != 0x30000 && before != 0x30001 {
+            dev_err!(self.dev.as_ref(), "M5: unexpected PMGR boot control {:#x}\n", before);
+            return Err(EIO);
+        }
+        sgx.try_write32(before | 1, OFFSET)?;
+        if sgx.try_read32(OFFSET)? != 0x30001 {
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
     /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
     /// initialized.
     pub(crate) fn enable_g17_gating(&self) -> Result {
