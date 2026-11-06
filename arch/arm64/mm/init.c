@@ -43,6 +43,7 @@
 #include <asm/kernel-pgtable.h>
 #include <asm/kvm_host.h>
 #include <asm/memory.h>
+#include <asm/mte.h>
 #include <asm/numa.h>
 #include <asm/rsi.h>
 #include <asm/sections.h>
@@ -336,7 +337,34 @@ void __init bootmem_init(void)
 
 void __init arch_setup_zero_pages(void)
 {
-	__zero_page = phys_to_page(__pa_symbol(empty_zero_page));
+	unsigned long off;
+	void *zero = NULL;
+
+	/*
+	 * Every untouched anonymous page that is read before it is written
+	 * maps the zero page, executable mappings included, and EL0 can't
+	 * execute from an active CTXR window, where empty_zero_page lies.
+	 */
+	if (ctxr_exec_window_reserved()) {
+		zero = memblock_alloc(ARCH_ZERO_PAGE_SIZE, ARCH_ZERO_PAGE_SIZE);
+		if (!zero)
+			pr_warn("ctxr-execmem: no memory for a zero page outside the window\n");
+	}
+
+	if (!zero) {
+		__zero_page = phys_to_page(__pa_symbol(empty_zero_page));
+		return;
+	}
+
+	/*
+	 * As cpu_enable_mte() does for empty_zero_page: the zero page is
+	 * always mapped pte_special(), so nothing else clears its tags.
+	 */
+	if (system_supports_mte())
+		for (off = 0; off < ARCH_ZERO_PAGE_SIZE; off += PAGE_SIZE)
+			mte_clear_page_tags(zero + off);
+
+	__zero_page = virt_to_page(zero);
 }
 
 void __init arch_mm_preinit(void)
