@@ -35,6 +35,8 @@
 #include <linux/vmalloc.h>
 #include <linux/xarray.h>
 
+#include <asm/tlbflush.h>
+
 #include "internal.h"
 #include "vmalloc.h"
 
@@ -189,7 +191,7 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	vaddr = (unsigned long)area->addr;
 	err = vmap_pages_range(vaddr, vaddr + size, pgprot, pages, PAGE_SHIFT);
 	if (err)
-		goto err_pool;
+		goto err_map;	/* may be partly mapped */
 
 	/*
 	 * Publish the backing pages on the vm_struct. arm64's set_memory_rox()
@@ -231,16 +233,17 @@ err_xa:
 	mutex_unlock(&confine_lock);
 err_map:
 	free_vm_area(area);		/* unmaps the range and frees bookkeeping */
+	/*
+	 * free_vm_area() leaves the TLB flush to the lazy vmap purge: flush now,
+	 * before the pages can be mapped again for someone else.
+	 */
+	flush_tlb_kernel_range(vaddr, vaddr + size);
 	mutex_lock(&confine_lock);
 	gen_pool_free(confine_pool, pool_va, size);
 	mutex_unlock(&confine_lock);
 	kfree(ck);
 	kfree(pages);
 	return NULL;
-err_pool:
-	mutex_lock(&confine_lock);
-	gen_pool_free(confine_pool, pool_va, size);
-	mutex_unlock(&confine_lock);
 err_ck:
 	kfree(ck);
 err_pages:
@@ -280,6 +283,13 @@ bool execmem_confine_free(void *ptr)
 	set_memory_rw(vaddr, nr);
 
 	free_vm_area(ck->area);
+
+	/*
+	 * free_vm_area() leaves the TLB flush to the lazy vmap purge. Flush
+	 * before the pages go back to the pool, or a stale writable entry for
+	 * this address could reach the next module's text.
+	 */
+	flush_tlb_kernel_range(vaddr, vaddr + ck->size);
 
 	mutex_lock(&confine_lock);
 	gen_pool_free(confine_pool, ck->pool_va, ck->size);
