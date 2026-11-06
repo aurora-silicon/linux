@@ -168,7 +168,7 @@
 
 &display {
 	iommus = <&disp0_dart 0 0x0 0x0 0x0 0xfc000000>,
-		 <&dispext0_dart 0 0x0 0x0 0xf 0xffff0000>;
+		 <&dispext0_dart 0 0x0 0x0 0x0 0xfc000000>;
 };
 
 &dispext0_dart {
@@ -374,6 +374,7 @@
 		/* To be filled by the loader */
 		local-mac-address = [00 00 00 00 00 00];
 		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
 	};
 
 	bluetooth0: bluetooth@0,1 {

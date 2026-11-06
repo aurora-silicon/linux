@@ -35,6 +35,7 @@ use kernel::{
     },
     macros::versions,
     new_mutex,
+    new_spinlock,
     prelude::*,
     soc::apple::rtkit,
     sync::{
@@ -44,6 +45,7 @@ use kernel::{
         },
         Arc,
         Mutex,
+        SpinLock,
         UniqueArc, //
     },
     time::{
@@ -84,6 +86,7 @@ use crate::{
     queue,
     regs,
     stats,
+    stats_raw,
     workqueue, //
 };
 
@@ -258,6 +261,9 @@ pub(crate) struct GpuManager {
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
     stats: Arc<stats::StatsSnapshot>,
+    /// Last raw firmware statistics of this device, exported read-only
+    /// through `stats_raw`.
+    raw_stats: Arc<SpinLock<stats_raw::RawStatsSnapshot>>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[pin]
@@ -273,6 +279,11 @@ pub(crate) trait Gpu: Send + Sync {
 
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
+
+    /// The raw firmware statistics snapshot of this GPU, if its firmware reports any.
+    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
+        None
+    }
 
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
@@ -311,7 +322,7 @@ pub(crate) trait Gpu: Send + Sync {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
         if self.soft_faults() && self.supports_soft_faults() {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
         }
         flags
     }
@@ -827,6 +838,12 @@ impl GpuManager::ver {
         let buffer_mgr_clone = buffer_mgr.clone();
         let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
         let stats_snap_clone = stats_snap.clone();
+        // Per-device raw statistics snapshot, shared with the debugfs export.
+        let raw_stats_snap = Arc::pin_init(
+            new_spinlock!(stats_raw::RawStatsSnapshot::default(), "asahi_stats_raw"),
+            GFP_KERNEL,
+        )?;
+        let raw_stats_snap_clone = raw_stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -842,6 +859,7 @@ impl GpuManager::ver {
                     dev.into(),
                     alloc_ref,
                     stats_snap_clone,
+                    raw_stats_snap_clone,
                     u64::from(cfg.base_clock_hz),
                 )?,
             }),
@@ -869,6 +887,7 @@ impl GpuManager::ver {
                 crashed: AtomicBool::new(false),
                 event_manager,
                 stats: stats_snap.clone(),
+                raw_stats: raw_stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
@@ -1100,7 +1119,7 @@ impl GpuManager::ver {
                     virt_addr: U64(iova + off as u64),
                     total_size: (map.size * map.count * dies) as u32,
                     element_size: map.size as u32,
-                    readwrite: U64(map.writable as u64),
+                    readwrite: U64(u64::from(map.writable)),
                 };
             });
 
@@ -1150,20 +1169,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(fault) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
             }
             info
         })
@@ -1328,6 +1341,10 @@ impl GpuManager::ver {
 impl Gpu for GpuManager::ver {
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
         Some(self.stats.clone())
+    }
+
+    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
+        Some(self.raw_stats.clone())
     }
 
     fn as_any(&self) -> &dyn Any {

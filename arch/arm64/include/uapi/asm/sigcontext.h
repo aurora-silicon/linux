@@ -160,6 +160,33 @@ struct tpidr2_context {
 };
 
 /* FPMR context */
+/*
+ * Aurora: Apple AFPCR_EL0 (DAZ in bit 0, FTZ in bit 1) of a thread with the
+ * x86 floating-point mode on (PR_AURORA_SET_X86_FP). sigreturn restores it.
+ */
+#define APPLE_AFPCR_MAGIC	0x41465043
+
+struct apple_afpcr_context {
+	struct _aarch64_ctx head;
+	__u64 afpcr;
+};
+
+/*
+ * Aurora: Apple AMX register file (8 X, 8 Y and 64 Z rows of 64 bytes) of a
+ * thread that was between AMX SET and CLR when the signal arrived. The
+ * handler starts with AMX clear and may use it; sigreturn reloads regs and
+ * leaves the thread SET again if APPLE_AMX_SIG_SET is in flags.
+ */
+#define APPLE_AMX_MAGIC		0x414d5831
+#define APPLE_AMX_SIG_SET	(1 << 0)
+
+struct apple_amx_context {
+	struct _aarch64_ctx head;
+	__u32 flags;
+	__u32 __reserved;
+	__u8 regs[5120];
+};
+
 #define FPMR_MAGIC	0x46504d52
 
 struct fpmr_context {

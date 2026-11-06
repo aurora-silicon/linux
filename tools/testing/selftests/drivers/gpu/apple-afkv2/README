@@ -43,3 +43,14 @@ consumes 192 bytes at a 64-byte stride, and needs a 256-byte empty ring. The
 ring-admission block is extracted from the real transmitter to check this.
 The late-publication notifier is extracted to test asynchronous hotplug
 queueing and connector-registration, quiesce, routing and legacy guards.
+
+The compact slot allocator is extracted to model DCP poweron cycles without
+service teardown, on every compact endpoint (0x20-0x2f) and both DCPs, for
+64 generations. A service re-announced after a poweron replaces the same
+name, unit and binding in place, so the slot count stays bounded; the
+hotplug endpoints 0x27-0x29 also replace within a generation. DPAVCTRL's
+same-name, no-unit siblings announced in one generation stay separate, as
+do different identities. Free-slot capacity, reader pins and pending
+commands are checked
+separately. Publication and teardown are mocked; this does not test firmware
+power transitions or concurrent service users.

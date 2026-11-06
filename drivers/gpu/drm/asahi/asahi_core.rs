@@ -4,6 +4,7 @@
 //! Driver for the Apple AGX GPUs found in Apple Silicon SoCs.
 
 mod alloc;
+mod binding;
 mod buffer;
 mod channel;
 mod cleanup;
@@ -35,6 +36,7 @@ mod queue;
 mod regs;
 mod slotalloc;
 mod stats;
+mod stats_raw;
 mod sysfs_exports;
 mod timestamp;
 mod usage;
@@ -85,11 +87,13 @@ struct DriverModule {
 
 impl kernel::InPlaceModule for DriverModule {
     fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { binding::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
             #[cfg(CONFIG_DRM_ASAHI_G15)]
-            _g15 <- kernel::driver::Registration::new(c"asahi-g15", module),
+            _g15 <- kernel::driver::Registration::new(c"aurora-g15", module),
             _driver <- kernel::driver::Registration::new(
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
@@ -104,9 +108,10 @@ impl kernel::InPlaceModule for DriverModule {
 
 module! {
     type: DriverModule,
-    name: "asahi",
+    name: "aurora",
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
+    alias: ["asahi"],
     params: {
         debug_flags: u64 {
             default: 0,
@@ -166,7 +171,7 @@ module! {
         },
         g15_pb_max_blocks: u32 {
             default: 3072,
-            description: "G15: parameter-buffer growth maximum given to the firmware, blocks of 128 KiB (1024..4095 in effect; the blocks above it, up to 4095, answer partial renders; the 512 MiB heap is allocated either way)",
+            description: "G15: PB growth maximum given to the firmware, 128 KiB blocks (64..4095)",
         },
         g15_early_tiling: u32 {
             default: 0,

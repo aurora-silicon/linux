@@ -87,6 +87,18 @@ static void atcphy_test_target_mode_t8132(struct kunit *test)
 	state.alt = &dp;
 	state.mode = TYPEC_DP_STATE_D;
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	/* No DisplayPort-only lanes: the USB2 beside them still runs. */
+	state.mode = TYPEC_DP_STATE_C;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.mode = TYPEC_DP_STATE_E;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	/* SuperSpeed without the DP calibration: pin assignment D runs USB3. */
+	atcphy->t8132_ss = true;
+	atcphy->ss_tunables = true;
+	state.mode = TYPEC_DP_STATE_D;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB3);
+	state.mode = TYPEC_DP_STATE_C;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
 	state.alt = NULL;
 	state.mode = TYPEC_STATE_SAFE;
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
@@ -949,6 +961,33 @@ static void atcphy_test_election_held_usb(struct kunit *test)
 	atcphy_test_election_redrive(test, atcphy);
 }
 
+/* First pin-D handoff after probe: USB2 lanes and a parked PIPE. */
+static void atcphy_test_boot_pipe_retry(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_election(test);
+	struct atcphy_test_election *election = test->priv;
+
+	atcphy->mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	election->held = true;
+	KUNIT_ASSERT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3_DP);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	KUNIT_EXPECT_TRUE(test, atcphy->pipe_pending);
+	KUNIT_EXPECT_TRUE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&atcphy->usb3_port_work));
+
+	/* The same request must finish the handoff, not use the mode cache. */
+	election->held = false;
+	memset(election->steps.log, 0, sizeof(election->steps.log));
+	KUNIT_ASSERT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, election->steps.log, "g01");
+	KUNIT_EXPECT_TRUE(test, atcphy_usb3_port_ready(atcphy));
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_FALSE(test, atcphy->pipe_pending);
+}
+
 /*
  * Only the fixed-hub ports of a J700 have the Type-C driver retry a timeout
  * until it passes; every M1 and M2 port, and fixed-hub ports on other PHYs,
@@ -1131,6 +1170,41 @@ static void atcphy_test_t8132_rpm_busy(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
 }
 
+#ifdef CONFIG_SUSPEND
+/* An epoch with a host survives suspend-to-idle only; without one, or incomplete, never. */
+static void atcphy_test_t8132_system_suspend(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+	suspend_state_t target = pm_suspend_target_state;
+
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->t8132_ss = true;
+	dev_set_drvdata(atcphy->dev, atcphy);
+
+	pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+	atcphy->mode_dirty = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	atcphy->mode_dirty = false;
+
+	/* Without a host, as in a USB3 device role, nothing holds the domain */
+	atcphy->t8132_common_owned = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	atcphy->host_active = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy->t8132_suspended);
+	KUNIT_EXPECT_EQ(test, atcphy_resume(atcphy->dev), 0);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	pm_suspend_target_state = PM_SUSPEND_MEM;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	pm_suspend_target_state = target;
+}
+#endif
+
 /* The hold follows the busy state, with one reference at most. */
 static void atcphy_test_t8132_rpm_hold(struct kunit *test)
 {
@@ -1305,6 +1379,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_host_start_without_usb3),
 	KUNIT_CASE(atcphy_test_election_held_safe),
 	KUNIT_CASE(atcphy_test_election_held_usb),
+	KUNIT_CASE(atcphy_test_boot_pipe_retry),
 	KUNIT_CASE(atcphy_test_transient_timeouts),
 #if IS_REACHABLE(CONFIG_USB)
 	KUNIT_CASE(atcphy_test_usb3_root),
@@ -1328,6 +1403,9 @@ static struct kunit_case atcphy_t8132_pm_test_cases[] = {
 	KUNIT_CASE(atcphy_test_t8132_rpm_hold),
 	KUNIT_CASE(atcphy_test_t8132_restore_idle),
 	KUNIT_CASE(atcphy_test_t8132_restore_mode),
+#ifdef CONFIG_SUSPEND
+	KUNIT_CASE(atcphy_test_t8132_system_suspend),
+#endif
 	{}
 };
 

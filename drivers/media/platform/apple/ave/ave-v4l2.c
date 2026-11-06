@@ -9,6 +9,7 @@
  */
 #include <linux/delay.h>
 #include <linux/log2.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
@@ -29,19 +30,20 @@
  */
 #define AVE_MIN_W		320
 #define AVE_MIN_H		240
-#define AVE_MAX_W		2560
-#define AVE_MAX_H		1600
+#define AVE_MAX_W		4096
+#define AVE_MAX_H		2304
 #define AVE_STEP		16
 #define AVE_STRIDE_ALIGN	64
 #define AVE_DEFAULT_W		1920
 #define AVE_DEFAULT_H		1080
 /*
- * Buffer counts are limited so a full set fits the encoder's 256 MiB DART
- * window next to a session: each queue may use this much, counting every
- * buffer at the power-of-two size the DMA layer maps it with.
+ * Buffer counts are limited so the queues of a few concurrent sessions fit
+ * the encoder's 4 GiB DART window next to their session buffers: each queue
+ * may use this much, counting every buffer at the power-of-two size the DMA
+ * layer maps it with. That is 16 OUTPUT frames at 3840x2160.
  */
-#define AVE_OUTPUT_BUDGET	(80 * SZ_1M)
-#define AVE_CAPTURE_BUDGET	(40 * SZ_1M)
+#define AVE_OUTPUT_BUDGET	(256 * SZ_1M)
+#define AVE_CAPTURE_BUDGET	(128 * SZ_1M)
 #define AVE_MAX_QUEUE_BUFS	16
 #define AVE_RESTART_TRIES	10
 #define AVE_RESTART_WAIT_MS	100
@@ -53,6 +55,7 @@ static const u32 ave_coded_fmts[] = {
 
 static const u32 ave_raw_fmts[] = {
 	V4L2_PIX_FMT_NV12,
+	V4L2_PIX_FMT_P010,
 };
 
 static const struct v4l2_event ave_eos_event = {
@@ -73,21 +76,35 @@ static bool ave_fmt_listed(const u32 *list, unsigned int n, u32 fourcc)
 	return false;
 }
 
-static void ave_clamp_size(u32 *w, u32 *h)
+/* HEVC Main tier levels 5 to 5.2 allow at most this many luma samples. */
+#define AVE_HEVC_MAX_SAMPLES	8912896
+
+/* @coded is the coded format the size is for: HEVC caps the picture area. */
+static void ave_clamp_size(u32 coded, u32 *w, u32 *h)
 {
 	*w = clamp_t(u32, ALIGN(*w, 2), AVE_MIN_W, AVE_MAX_W);
 	*h = clamp_t(u32, ALIGN(*h, 2), AVE_MIN_H, AVE_MAX_H);
+	if (coded == V4L2_PIX_FMT_HEVC && *w * *h > AVE_HEVC_MAX_SAMPLES)
+		*h = rounddown(AVE_HEVC_MAX_SAMPLES / *w, 2);
 }
 
-/* Raw NV12, one buffer: Y plane, then interleaved CbCr at half height. */
-static void ave_fill_raw(struct v4l2_pix_format_mplane *f)
+/*
+ * Raw NV12 or P010, one buffer: Y plane, then interleaved CbCr at half
+ * height. P010 holds 10-bit samples in the high bits of 16-bit words; it
+ * is the input for HEVC Main 10. @coded is the context's coded format,
+ * which limits the size.
+ */
+static void ave_fill_raw(struct v4l2_pix_format_mplane *f, u32 coded)
 {
-	u32 stride, height;
+	u32 stride, height, bytes;
 
-	f->pixelformat = V4L2_PIX_FMT_NV12;
-	ave_clamp_size(&f->width, &f->height);
+	if (f->pixelformat != V4L2_PIX_FMT_P010 || coded != V4L2_PIX_FMT_HEVC)
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+	bytes = f->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
+	ave_clamp_size(coded, &f->width, &f->height);
 	/* Keep a client's stride, within reason, rounded to 64 bytes. */
-	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width, 2 * AVE_MAX_W),
+	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width * bytes,
+			       2 * AVE_MAX_W * bytes),
 		       AVE_STRIDE_ALIGN);
 	height = ALIGN(f->height, AVE_STEP);
 	f->num_planes = 1;
@@ -104,7 +121,7 @@ static void ave_fill_coded(struct v4l2_pix_format_mplane *f)
 
 	if (!ave_fmt_listed(ave_coded_fmts, ARRAY_SIZE(ave_coded_fmts), f->pixelformat))
 		f->pixelformat = ave_coded_fmts[0];
-	ave_clamp_size(&f->width, &f->height);
+	ave_clamp_size(f->pixelformat, &f->width, &f->height);
 	/* The firmware's coded-data capacity plus parameter sets and headers. */
 	min = ALIGN(3 * ALIGN(f->width, 32) * ALIGN(f->height, 16) / 2, SZ_16K) + SZ_64K;
 	f->num_planes = 1;
@@ -128,7 +145,7 @@ static void ave_reset_fmts(struct ave_ctx *ctx)
 	memset(src, 0, sizeof(*src));
 	src->width = dst->width;
 	src->height = dst->height;
-	ave_fill_raw(src);
+	ave_fill_raw(src, dst->pixelformat);
 	src->colorspace = V4L2_COLORSPACE_REC709;
 	src->xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	src->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -203,7 +220,7 @@ static int ave_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
 
-	ave_fill_raw(pix);
+	ave_fill_raw(pix, ctx->dst_fmt.pixelformat);
 	if (pix->colorspace == V4L2_COLORSPACE_DEFAULT) {
 		pix->colorspace = ctx->src_fmt.colorspace;
 		pix->xfer_func = ctx->src_fmt.xfer_func;
@@ -439,8 +456,10 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
 		ctx->hevc_max_qp = ctrl->val;
 		break;
-	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
+		ctx->hevc_profile = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
 	default:
@@ -500,8 +519,11 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 0, 51, 1, 51);
 
+	/* Main 10 takes P010 input; the profile is checked against it at STREAMON. */
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, 0,
+			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+			       ~(BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) |
+				 BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)),
 			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1, 0,
@@ -544,7 +566,7 @@ static int ave_queue_setup(struct vb2_queue *vq, unsigned int *nbufs, unsigned i
 	/* Frames stay with the firmware until encoded; keep one spare. */
 	if (V4L2_TYPE_IS_OUTPUT(vq->type) && have + *nbufs < AVE_MAX_SLOTS + 1)
 		*nbufs = AVE_MAX_SLOTS + 1 - have;
-	/* A full set of both queues must fit the encoder's 256 MiB DART window. */
+	/* A full set of both queues must fit the budget for the DART window. */
 	if (have >= max) {
 		dev_dbg(ctx->ave->dev, "%s queue already has its %u buffers\n",
 			V4L2_TYPE_IS_OUTPUT(vq->type) ? "OUTPUT" : "CAPTURE", max);
@@ -578,8 +600,14 @@ static int ave_buf_prepare(struct vb2_buffer *vb)
 static void ave_buf_queue(struct vb2_buffer *vb)
 {
 	struct ave_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+	unsigned long flags;
 
-	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
+	spin_lock_irqsave(&ctx->queue_lock, flags);
+	if (ctx->failed)
+		v4l2_m2m_buf_done(to_vb2_v4l2_buffer(vb), VB2_BUF_STATE_ERROR);
+	else
+		v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
+	spin_unlock_irqrestore(&ctx->queue_lock, flags);
 }
 
 static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
@@ -751,7 +779,9 @@ static int ave_session_begin(struct ave_ctx *ctx)
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
 		return -EBUSY;
 	/* A halted firmware restarts only from reset: let the power go first. */
-	if (READ_ONCE(ave->fw_state) == AVE_FW_HALTED)
+	if (READ_ONCE(ave->fw_state) == AVE_FW_HALTED ||
+	    READ_ONCE(ave->fw_state) == AVE_FW_BROKEN ||
+	    READ_ONCE(ave->fw_state) == AVE_FW_RECOVERING)
 		pm_runtime_suspend(ave->dev);
 	sess = ave_sess_create(ctx);
 	if (IS_ERR(sess)) {
@@ -862,10 +892,16 @@ static int ave_start_streaming(struct vb2_queue *q, unsigned int count)
 static void ave_stop_streaming(struct vb2_queue *q)
 {
 	struct ave_ctx *ctx = vb2_get_drv_priv(q);
+	struct vb2_queue *other = V4L2_TYPE_IS_OUTPUT(q->type) ?
+		v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx) :
+		v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx);
 
 	ave_session_end(ctx);
 	ave_reset_drain(ctx);
 	ave_return_bufs(ctx, q, VB2_BUF_STATE_ERROR);
+	/* vb2 hands queued buffers to buf_queue before the next STREAMON callback. */
+	if (!vb2_is_streaming(other))
+		WRITE_ONCE(ctx->failed, false);
 }
 
 static const struct vb2_ops ave_qops = {
@@ -886,7 +922,7 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 	src->drv_priv = ctx;
 	src->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	src->ops = &ave_qops;
-	src->mem_ops = &vb2_dma_contig_memops;
+	src->mem_ops = &ave_vb2_memops;
 	src->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	src->lock = &ctx->ave->vdev_lock;
 	src->dev = ctx->ave->dev;
@@ -909,17 +945,20 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 /*
  * Jobs. A job delivers finished frames to CAPTURE buffers and sends at most
  * one new frame. Up to five frames are inside the firmware at once; their
- * answers are collected by the job and, while frames are outstanding, by a
- * short poller, since the firmware interrupt is not wired up.
+ * answers are collected by the job and, between jobs, by the poll work, which
+ * the mailbox interrupt queues. While frames are outstanding the poll work
+ * also runs every AVE_WATCH_MS to catch a stuck or starved session.
  */
 
-#define AVE_POLL_MS		2
+#define AVE_WATCH_MS		25
 
 static int ave_job_ready(void *priv)
 {
 	struct ave_ctx *ctx = priv;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 
+	if (READ_ONCE(ctx->failed))
+		return 0;
 	if (atomic_read(&ctx->ready) || READ_ONCE(ctx->flush_pending))
 		return 1;
 	if (ctx->stopped || (ctx->draining && !ctx->drain_src))
@@ -968,6 +1007,8 @@ static bool ave_deliver(struct ave_ctx *ctx)
 			dst->flags |= V4L2_BUF_FLAG_LAST;
 			last = true;
 		}
+		ave_vb2_put(s->input_mem);
+		s->input_mem = NULL;
 		v4l2_m2m_buf_done(s->src, state);
 		s->src = NULL;
 		v4l2_m2m_buf_done(dst, state);
@@ -1086,16 +1127,22 @@ static void ave_job_fail(struct ave_ctx *ctx, int err)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+	unsigned long flags;
 
+	/* Publish the fatal error before any teardown that can wait on PM/IPC. */
+	spin_lock_irqsave(&ctx->queue_lock, flags);
+	WRITE_ONCE(ctx->failed, true);
+	vb2_queue_error(v4l2_m2m_get_src_vq(m2m));
+	vb2_queue_error(v4l2_m2m_get_dst_vq(m2m));
+	ave_return_bufs(ctx, v4l2_m2m_get_src_vq(m2m), VB2_BUF_STATE_ERROR);
+	ave_return_bufs(ctx, v4l2_m2m_get_dst_vq(m2m), VB2_BUF_STATE_ERROR);
+	spin_unlock_irqrestore(&ctx->queue_lock, flags);
+	cancel_delayed_work(&ctx->poll_work);
 	dev_err(ave->dev, "encoding failed: %d\n", err);
 	mutex_lock(&ave->hw_lock);
 	ave_session_close(ctx, false);
 	mutex_unlock(&ave->hw_lock);
 	ave_session_free(ctx);
-	ave_return_bufs(ctx, v4l2_m2m_get_src_vq(m2m), VB2_BUF_STATE_ERROR);
-	ave_return_bufs(ctx, v4l2_m2m_get_dst_vq(m2m), VB2_BUF_STATE_ERROR);
-	vb2_queue_error(v4l2_m2m_get_src_vq(m2m));
-	vb2_queue_error(v4l2_m2m_get_dst_vq(m2m));
 	ave_reset_drain(ctx);
 }
 
@@ -1106,6 +1153,9 @@ static void ave_run_work(struct work_struct *work)
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
 	bool eos = false, poll = false;
 	int ret = 0;
+
+	if (READ_ONCE(ctx->failed))
+		goto finish;
 
 	/*
 	 * After a drain the next frame starts a new session; after system
@@ -1156,13 +1206,17 @@ static void ave_run_work(struct work_struct *work)
 		ctx->stopped = true;
 		v4l2_event_queue_fh(&ctx->fh, &ave_eos_event);
 	} else if (poll) {
-		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
+		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_WATCH_MS));
 	}
+finish:
 	pm_runtime_mark_last_busy(ave->dev);
 	v4l2_m2m_job_finish(ave->m2m_dev, m2m);
 }
 
-/* Collect frame answers while frames are outstanding and no job runs. */
+/*
+ * Collect frame answers that came in while no job ran, and watch sessions
+ * with frames outstanding.
+ */
 static void ave_poll_work(struct work_struct *work)
 {
 	struct ave_ctx *ctx = container_of(to_delayed_work(work), struct ave_ctx, poll_work);
@@ -1170,7 +1224,9 @@ static void ave_poll_work(struct work_struct *work)
 	bool again = false, fail = false;
 
 	mutex_lock(&ave->hw_lock);
-	if (ctx->sess && ave_session_index(ave, ctx) >= 0) {
+	if (ctx->sess && ave->fw_state == AVE_FW_BROKEN) {
+		fail = true;
+	} else if (ctx->sess && ave_session_index(ave, ctx) >= 0) {
 		fail = ave_ipc_pump(ave, 0, NULL, NULL) != 0;
 		if (!fail && ave_sess_starved(ctx->sess) &&
 		    !v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx)) {
@@ -1187,7 +1243,7 @@ static void ave_poll_work(struct work_struct *work)
 			 */
 			dev_err(ave->dev, "%u frames unanswered for %u ms; firmware is stuck\n",
 				ctx->sess->busy, AVE_FRAME_WAIT_MS);
-			ave->fw_state = AVE_FW_BROKEN;
+			ave_fw_mark_broken(ave, -ETIMEDOUT, "frame timeout");
 			fail = true;
 		}
 		again = !fail && ctx->sess->busy;
@@ -1204,7 +1260,25 @@ static void ave_poll_work(struct work_struct *work)
 	else if (atomic_read(&ctx->ready))
 		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
 	if (again)
-		queue_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
+		queue_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_WATCH_MS));
+}
+
+/*
+ * The mailbox interrupt came while no ring wait ran: take the event and let
+ * the sessions it may concern deliver. Jobs and poll work run on the same
+ * ordered queue, so none runs right now.
+ */
+static void ave_irq_work(struct work_struct *work)
+{
+	struct ave_dev *ave = container_of(work, struct ave_dev, irq_work);
+
+	mutex_lock(&ave->hw_lock);
+	if (ave->fw_state == AVE_FW_RUNNING)
+		ave_ipc_pump(ave, 0, NULL, NULL);
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i] && atomic_read(&ave->sessions[i]->ready))
+			mod_delayed_work(ave->wq, &ave->sessions[i]->poll_work, 0);
+	mutex_unlock(&ave->hw_lock);
 }
 
 static void ave_device_run(void *priv)
@@ -1231,6 +1305,7 @@ static int ave_open(struct file *file)
 	if (!ctx)
 		return -ENOMEM;
 	ctx->ave = ave;
+	spin_lock_init(&ctx->queue_lock);
 	INIT_WORK(&ctx->run_work, ave_run_work);
 	INIT_DELAYED_WORK(&ctx->poll_work, ave_poll_work);
 	atomic_set(&ctx->ready, 0);
@@ -1294,10 +1369,16 @@ int ave_v4l2_register(struct ave_dev *ave)
 	ave->wq = alloc_ordered_workqueue("apple-ave", WQ_MEM_RECLAIM);
 	if (!ave->wq)
 		return -ENOMEM;
+	INIT_WORK(&ave->irq_work, ave_irq_work);
+	ret = ave_ipc_irq_init(ave, to_platform_device(ave->dev));
+	if (ret) {
+		dev_err_probe(ave->dev, ret, "cannot get the mailbox interrupt\n");
+		goto err_wq;
+	}
 
 	ret = v4l2_device_register(ave->dev, &ave->v4l2_dev);
 	if (ret)
-		goto err_wq;
+		goto err_irq;
 
 	ave->m2m_dev = v4l2_m2m_init(&ave_m2m_ops);
 	if (IS_ERR(ave->m2m_dev)) {
@@ -1324,6 +1405,9 @@ err_m2m:
 	v4l2_m2m_release(ave->m2m_dev);
 err_v4l2:
 	v4l2_device_unregister(&ave->v4l2_dev);
+err_irq:
+	free_irq(ave->irq, ave);
+	cancel_work_sync(&ave->irq_work);
 err_wq:
 	destroy_workqueue(ave->wq);
 	return ret;
@@ -1334,5 +1418,7 @@ void ave_v4l2_unregister(struct ave_dev *ave)
 	video_unregister_device(&ave->vdev);
 	v4l2_m2m_release(ave->m2m_dev);
 	v4l2_device_unregister(&ave->v4l2_dev);
+	free_irq(ave->irq, ave);
+	cancel_work_sync(&ave->irq_work);
 	destroy_workqueue(ave->wq);
 }

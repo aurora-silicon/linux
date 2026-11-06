@@ -25,32 +25,31 @@
 #include "ave.h"
 #include "ave-regs.h"
 
-#define AVE_RC_VBR			4
-#define AVE_RC_CBR			2
+#define AVE_RC_VBR 4
+#define AVE_RC_CBR 2
 
 /* Filler-data NAL unit types */
-#define AVE_H264_NAL_FILLER		12
-#define AVE_HEVC_NAL_FILLER		38
+#define AVE_H264_NAL_FILLER 12
+#define AVE_HEVC_NAL_FILLER 38
 
-#define AVE_H264_BASELINE		2
-#define AVE_H264_MAIN			4
-#define AVE_H264_HIGH			6
-#define AVE_HEVC_MAIN			1
+#define AVE_H264_BASELINE 2
+#define AVE_H264_MAIN 4
+#define AVE_H264_HIGH 6
+#define AVE_HEVC_MAIN 1
+#define AVE_HEVC_MAIN_10 2
+/* QpBdOffset: 10-bit HEVC lets the QP go 12 below the 8-bit range. */
+#define AVE_QP_BD_OFFSET_10 12
 
-#define AVE_META_BYTES			0xc000
+#define AVE_META_BYTES 0xc000
 /* Metadata words: coded bytes (twice), HEVC slice-header bytes, parameter sets */
-#define AVE_META_PAYLOAD		0x120
-#define AVE_META_HEVC_SHDR		0x128
-#define AVE_META_PAYLOAD2		0x12c
-#define AVE_META_PARAMS			0xb2a4
-#define AVE_META_SCAN_FROM		0x200
-#define AVE_SHDR_BYTES			(256 * 0x400)
-#define AVE_SHDR_ENTRY_BYTES		0x400
-#define AVE_CODED_MIN			0x3c000
-#define AVE_HDR_BYTES			0x12c000
-
-/* H.264 per-frame buffer (Process +0x58c8): unused in bit-rate modes */
-#define AVE_H264_FRAME_BUF		SZ_16K
+#define AVE_META_PAYLOAD 0x120
+#define AVE_META_HEVC_SHDR 0x128
+#define AVE_META_PAYLOAD2 0x12c
+#define AVE_META_PARAMS 0xb2a4
+#define AVE_META_SCAN_FROM 0x200
+#define AVE_SHDR_BYTES (256 * 0x400)
+#define AVE_SHDR_ENTRY_BYTES 0x400
+#define AVE_CODED_MIN 0x3c000
 
 /* Level limits: max frame size, max rate, max bit rate (kbit/s, Main). */
 struct ave_level {
@@ -61,20 +60,24 @@ struct ave_level {
 
 /* H.264 Table A-1, in V4L2 menu order (1, 1b, 1.1 ... 5.2); macroblocks. */
 static const struct ave_level ave_h264_levels[] = {
-	{ 99, 1485, 64 }, { 99, 1485, 128 }, { 396, 3000, 192 }, { 396, 6000, 384 },
-	{ 396, 11880, 768 }, { 396, 11880, 2000 }, { 792, 19800, 4000 },
-	{ 1620, 20250, 4000 }, { 1620, 40500, 10000 }, { 3600, 108000, 14000 },
-	{ 5120, 216000, 20000 }, { 8192, 245760, 20000 }, { 8192, 245760, 50000 },
-	{ 8704, 522240, 50000 }, { 22080, 589824, 135000 }, { 36864, 983040, 240000 },
+	{ 99, 1485, 64 },	    { 99, 1485, 128 },
+	{ 396, 3000, 192 },	    { 396, 6000, 384 },
+	{ 396, 11880, 768 },	    { 396, 11880, 2000 },
+	{ 792, 19800, 4000 },	    { 1620, 20250, 4000 },
+	{ 1620, 40500, 10000 },	    { 3600, 108000, 14000 },
+	{ 5120, 216000, 20000 },    { 8192, 245760, 20000 },
+	{ 8192, 245760, 50000 },    { 8704, 522240, 50000 },
+	{ 22080, 589824, 135000 },  { 36864, 983040, 240000 },
 	{ 36864, 2073600, 240000 },
 };
 
 /* HEVC Table A-8 (Main tier), in V4L2 menu order (1, 2, 2.1 ... 5.1); samples. */
 static const struct ave_level ave_hevc_levels[] = {
-	{ 36864, 552960, 128 }, { 122880, 3686400, 1500 }, { 245760, 7372800, 3000 },
-	{ 552960, 16588800, 6000 }, { 983040, 33177600, 10000 },
-	{ 2228224, 66846720, 12000 }, { 2228224, 133693440, 20000 },
-	{ 8912896, 267386880, 25000 }, { 8912896, 534773760, 40000 },
+	{ 36864, 552960, 128 },	       { 122880, 3686400, 1500 },
+	{ 245760, 7372800, 3000 },     { 552960, 16588800, 6000 },
+	{ 983040, 33177600, 10000 },   { 2228224, 66846720, 12000 },
+	{ 2228224, 133693440, 20000 }, { 8912896, 267386880, 25000 },
+	{ 8912896, 534773760, 40000 },
 };
 
 /*
@@ -114,6 +117,7 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->cw = ALIGN(p->width, 16);
 	p->ch = ALIGN(p->height, 16);
 	p->stride = ctx->src_fmt.plane_fmt[0].bytesperline;
+	p->sample_bytes = ctx->src_fmt.pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
 	p->mbs = (p->cw / 16) * (p->ch / 16);
 	p->fps_num = ctx->timeperframe.denominator;
 	p->fps_den = ctx->timeperframe.numerator;
@@ -143,6 +147,24 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	}
 	if (p->min_qp > p->max_qp)
 		p->min_qp = p->max_qp;
+
+	/*
+	 * HEVC Main 10 encodes P010 input; Main encodes NV12. The firmware
+	 * takes 16-bit samples for Main 10 (macOS converts 8-bit input to that
+	 * first), so other pairings are refused rather than converted.
+	 */
+	if ((p->codec == AVE_CODEC_HEVC &&
+	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
+	    (p->sample_bytes == 2))
+		return -EINVAL;
+	if (p->sample_bytes == 2) {
+		/* Only the 9003 layout's Main 10 fields are mapped. */
+		if (ctx->ave->layout->counted)
+			return -EOPNOTSUPP;
+		p->profile = AVE_HEVC_MAIN_10;
+		p->bit_depth = 10;
+		p->min_qp -= AVE_QP_BD_OFFSET_10;
+	}
 
 	/*
 	 * Reference structures as macOS sets them up: a B-frame pyramid,
@@ -180,7 +202,14 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->coded_cap = ALIGN(3 * (p->codec == AVE_CODEC_HEVC ? ALIGN(p->width, 32) :
 							       ALIGN(p->width, 16)) *
 			     ALIGN(p->height, 16) / 2, SZ_16K);
+	/* 10-bit sessions get a quarter more, as macOS sizes them. */
+	if (p->bit_depth == 10)
+		p->coded_cap = ALIGN(p->coded_cap * 5 / 4, SZ_16K);
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
+	if (ctx->ave->layout->counted &&
+	    (p->fps_num != 30ULL * p->fps_den ||
+	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
+		return -EOPNOTSUPP;
 	return 0;
 }
 
@@ -201,8 +230,8 @@ struct ave_buf_req {
 	unsigned long attrs;
 };
 
-#define AVE_MAX_BUF_REQS	(1 + 4 * AVE_MAX_REFS + 4 + 2 * AVE_TILE_BUFS + 2 + \
-				 3 * AVE_MAX_SLOTS)
+#define AVE_MAX_BUF_REQS \
+	(1 + 6 * AVE_MAX_REFS + 6 + 2 * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
 {
@@ -229,10 +258,11 @@ static void ave_req(struct ave_buf_req *r, unsigned int *n, struct ave_buf *b, s
 static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 {
 	const struct ave_params *p = &sess->p;
+	const struct ave_fw_layout *fw = ave->layout;
 	bool hevc = p->codec == AVE_CODEC_HEVC;
 	u32 w = p->width, h = p->height;
 	u32 w16 = DIV_ROUND_UP(w, 16), w32 = DIV_ROUND_UP(w, 32);
-	u32 h32 = DIV_ROUND_UP(h, 32), w64 = DIV_ROUND_UP(w, 64), h64 = DIV_ROUND_UP(h, 64);
+	u32 h32 = DIV_ROUND_UP(h, 32), h64 = DIV_ROUND_UP(h, 64);
 	const unsigned long nomap = DMA_ATTR_NO_KERNEL_MAPPING;
 	size_t ref_a, ref_b, ref_c, ref_d, tile, mapped = 0;
 	struct ave_buf_req *r;
@@ -244,20 +274,34 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		return -ENOMEM;
 
 	ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
+	if (p->bit_depth == 10)
+		ref_a = ref_a * 5 / 4;
 	ref_b = roundup_pow_of_two(w) * roundup_pow_of_two(h) / 32;
-	ref_c = hevc ? 512 * w64 * h64 : ALIGN(w, 64) * (ALIGN(h, 16) / 2 + 24);
+	ref_c = ave_lfs_ref_size(w, h, hevc, ave->variant->lfs_ref_scale);
 	ref_d = ALIGN(hevc ? 64 * w32 * h32 : 128 * p->mbs, SZ_16K);
 	tile = hevc ? 2304 * w32 * h64 : ALIGN(w, 16) * ALIGN(h, 64);
+	if (p->bit_depth == 10)
+		tile *= 2;
 
-	ave_req(r, &n, &sess->hdr, AVE_HDR_BYTES, 0, nomap);
+	ave_req(r, &n, &sess->hdr, fw->hdr_bytes, 0, nomap);
 	for (unsigned int i = 0; i < p->refs; i++) {
 		ave_req(r, &n, &sess->ref_a[i], ref_a, ref_a * 3 / 2, nomap);
 		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
 		ave_req(r, &n, &sess->ref_c[i], ref_c, 0, nomap);
 		ave_req(r, &n, &sess->ref_d[i], ref_d, 0, nomap);
+		if (fw->counted) {
+			ave_req(r, &n, &sess->ref_e[i], ref_a / 2, 0, nomap);
+			ave_req(r, &n, &sess->ref_f[i], ref_b / 4, 0, nomap);
+		}
 	}
 	ave_req(r, &n, &sess->mb, ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
-	ave_req(r, &n, &sess->row_a, hevc ? SZ_16K : ALIGN(256 * w16, SZ_16K), 0, nomap);
+	if (fw->counted && p->rc_mode == 3)
+		for (unsigned int i = 0; i < 2; i++)
+			ave_req(r, &n, &sess->mb_extra[i], ALIGN(82 * p->mbs, SZ_16K), 0, nomap);
+	/* HEVC: one 0x180-byte neighbour record per 64 pixels, at least 16 KiB. */
+	ave_req(r, &n, &sess->row_a,
+		ALIGN(hevc ? max_t(u32, 0x180 * DIV_ROUND_UP(w, 64), SZ_16K) : 256 * w16, SZ_16K),
+		0, nomap);
 	ave_req(r, &n, &sess->row_b, ALIGN(hevc ? 768 * w32 : 1024 * w16, SZ_16K), 0, nomap);
 	ave_req(r, &n, &sess->fixed, SZ_16K, 0, nomap);
 	for (unsigned int i = 0; i < (hevc ? 4 : AVE_TILE_BUFS); i++) {
@@ -269,14 +313,18 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 			ave_req(r, &n, &sess->hevc_extra[i], ALIGN(w * h32, SZ_16K), 0, nomap);
 	for (unsigned int s = 0; s < p->slots; s++) {
 		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0, 0);
-		ave_req(r, &n, &sess->slot[s].meta, AVE_META_BYTES, 0, 0);
-		/*
-		 * HEVC: slice headers. H.264: the per-frame buffer of Process
-		 * +0x58c8, which the firmware never wrote in any bit-rate
-		 * mode on hardware; one page.
-		 */
-		ave_req(r, &n, &sess->slot[s].aux, hevc ? AVE_SHDR_BYTES : AVE_H264_FRAME_BUF, 0,
-			hevc ? 0 : nomap);
+		ave_req(r, &n, &sess->slot[s].meta, fw->meta_bytes, 0, 0);
+		/* J700 has HEVC slice headers; 26A428 has a new small slot buffer. */
+		if (fw->counted) {
+			ave_req(r, &n, &sess->slot[s].extra, SZ_16K, 0, 0);
+			if (!hevc && p->rc_mode != 3)
+				ave_req(r, &n, &sess->slot[s].aux,
+					ALIGN(432 * p->mbs, SZ_16K), 0, nomap);
+		} else {
+			ave_req(r, &n, &sess->slot[s].aux,
+				hevc ? AVE_SHDR_BYTES : ALIGN(432 * p->mbs, SZ_16K), 0,
+				hevc ? 0 : nomap);
+		}
 	}
 
 	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
@@ -302,8 +350,12 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->ref_b[i]);
 		ave_free(ave, &sess->ref_c[i]);
 		ave_free(ave, &sess->ref_d[i]);
+		ave_free(ave, &sess->ref_e[i]);
+		ave_free(ave, &sess->ref_f[i]);
 	}
 	ave_free(ave, &sess->mb);
+	for (unsigned int i = 0; i < 2; i++)
+		ave_free(ave, &sess->mb_extra[i]);
 	ave_free(ave, &sess->row_a);
 	ave_free(ave, &sess->row_b);
 	ave_free(ave, &sess->fixed);
@@ -317,7 +369,10 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);
 		ave_free(ave, &sess->slot[s].aux);
+		ave_free(ave, &sess->slot[s].extra);
 		ave_free(ave, &sess->slot[s].bounce);
+		ave_vb2_put(sess->slot[s].input_mem);
+		sess->slot[s].input_mem = NULL;
 	}
 }
 
@@ -331,7 +386,7 @@ static void ave_note_copy(struct ave_ctx *ctx, u32 stride, const char *how)
 }
 
 /*
- * The input picture for @slot, as a DART address. The encoder reads NV12
+ * The input picture for @slot, as a DART address. The encoder reads NV12 (P010)
  * with the 64-byte aligned stride S_FMT reported and chroma right after
  * height luma lines. Some clients (ffmpeg's v4l2m2m encoder) fill the
  * buffer with their own, smaller line size instead, which shows in the
@@ -347,7 +402,7 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
 	u32 off = vb->planes[0].data_offset;
 	u32 used = vb2_get_plane_payload(vb, 0) - min(off, vb2_get_plane_payload(vb, 0));
 	u32 crows = DIV_ROUND_UP(p->height, 2), rows = p->height + crows;
-	u32 width = ALIGN(p->width, 2), stride;
+	u32 width = ALIGN(p->width, 2) * p->sample_bytes, stride;
 	struct ave_buf *b = &sess->slot[slot].bounce;
 	const u8 *from;
 	u8 *to;
@@ -461,24 +516,38 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	return sess;
 }
 
-/*
- * Free the buffers. A firmware that stopped answering in the middle of a
- * session may still write to them, and a freed DART range is soon handed
- * out again, so those stay allocated (until reboot, like the firmware
- * itself). Buffers the firmware never saw (no Start sent) always go.
- */
+/* Keep every firmware-visible allocation mapped until a confirmed power cycle. */
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
+	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
 
 	if (!sess)
 		return;
-	if (sess->handed && ctx->ave->fw_state == AVE_FW_BROKEN)
-		dev_warn(ctx->ave->dev, "keeping the buffers of a failed session\n");
-	else
-		ave_sess_free_bufs(ctx->ave, sess);
-	kfree(sess);
+	mutex_lock(&ave->hw_lock);
+	if (sess->handed && (ave->fw_state == AVE_FW_BROKEN ||
+			     ave->fw_state == AVE_FW_RECOVERING)) {
+		sess->failed_next = ave->failed_sessions;
+		ave->failed_sessions = sess;
+	} else {
+		ave_sess_free_bufs(ave, sess);
+		kfree(sess);
+	}
 	ctx->sess = NULL;
+	mutex_unlock(&ave->hw_lock);
+}
+
+/* Caller holds hw_lock and has verified that the coprocessor lost power. */
+void ave_sess_reap(struct ave_dev *ave)
+{
+	struct ave_session *sess;
+
+	lockdep_assert_held(&ave->hw_lock);
+	while ((sess = ave->failed_sessions)) {
+		ave->failed_sessions = sess->failed_next;
+		ave_sess_free_bufs(ave, sess);
+		kfree(sess);
+	}
 }
 
 int ave_sess_free_slot(struct ave_session *sess)
@@ -498,7 +567,7 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 	struct ave_slot *s = &sess->slot[slot];
 
 	memset(s->meta.cpu, 0, s->meta.size);
-	if (sess->p.codec == AVE_CODEC_HEVC)
+	if (sess->p.codec == AVE_CODEC_HEVC && s->aux.cpu)
 		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
 }
 
@@ -506,35 +575,41 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
  * A frame reply: +0x10 the session's client token, +0x20 the slot's
  * subtype, +0x40 status. Caller holds hw_lock.
  */
-void ave_sess_reply(struct ave_dev *ave, const u8 *msg, u32 len)
+void ave_sess_reply(struct ave_dev *ave, const struct ave_reply *reply)
 {
-	u64 client = get_unaligned_le64(msg + AVE_REPLY_CLIENT);
-	u32 subtype = get_unaligned_le32(msg + AVE_REPLY_SUBTYPE);
-	u32 slot = subtype - AVE_PROC_SUBTYPE;
+	u64 client = reply->client;
+	u32 subtype = reply->subtype;
+	u32 slot = subtype - ave->layout->process_subtype;
 	struct ave_session *sess = NULL;
 	struct ave_ctx *ctx = NULL;
 	struct ave_slot *s;
 
 	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
-		if (ave->sessions[i] && ave->sessions[i]->sess->client == client)
+		if (ave->sessions[i] &&
+		    ave->sessions[i]->sess->client == client)
 			ctx = ave->sessions[i];
 	if (ctx)
 		sess = ctx->sess;
-	if (!sess || len < AVE_REPLY_PROCESS_BYTES || slot >= sess->p.slots ||
-	    !sess->slot[slot].busy) {
-		dev_warn(ave->dev, "stray frame reply (client %llu subtype %#x len %u)\n",
-			 client, subtype, len);
+	if (!sess ||
+	    reply->bytes <
+		    (ave->layout->abi->transport->boot_config ? 0x50 : 0x48) ||
+	    slot >= sess->p.slots || !sess->slot[slot].busy) {
+		dev_warn(ave->dev,
+			 "stray frame reply (client %llu subtype %#x len %u)\n",
+			 client, subtype, reply->bytes);
 		return;
 	}
 	s = &sess->slot[slot];
 	sess->progress = jiffies;
-	s->status = get_unaligned_le32(msg + AVE_REPLY_STATUS);
+	s->status = reply->status;
 	if (s->status)
-		dev_dbg(ctx->ave->dev, "frame in slot %u: status %#x\n", slot, s->status);
+		dev_dbg(ctx->ave->dev, "frame in slot %u: status %#x\n", slot,
+			s->status);
 	s->busy = false;
 	s->done = true;
 	sess->busy--;
-	sess->done_fifo[(sess->done_head + sess->done_count) % AVE_MAX_SLOTS] = slot;
+	sess->done_fifo[(sess->done_head + sess->done_count) % AVE_MAX_SLOTS] =
+		slot;
 	sess->done_count++;
 	atomic_inc(&ctx->ready);
 }
@@ -653,7 +728,7 @@ static void ave_sess_dump(struct ave_ctx *ctx, struct ave_slot *s, const char *w
  * is not known; if the firmware's output never carries filler, the driver
  * adds it here.
  */
-#define AVE_FILLER_OVERHEAD	7	/* start code, NAL header, trailing bits */
+#define AVE_FILLER_OVERHEAD 7 /* start code, NAL header, trailing bits */
 
 static size_t ave_sess_cbr_fill(struct ave_ctx *ctx, u8 *out, size_t len, size_t room,
 				bool fw_filler)
@@ -790,7 +865,7 @@ bool ave_sess_stalled(struct ave_session *sess)
  * input came for a while, a Complete makes the firmware code what it holds,
  * as macOS does after the first frame.
  */
-#define AVE_STARVE_MS		50
+#define AVE_STARVE_MS 50
 
 bool ave_sess_starved(struct ave_session *sess)
 {

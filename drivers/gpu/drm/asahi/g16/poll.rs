@@ -56,7 +56,7 @@ impl HrTimerCallback for Shared {
     }
 }
 
-/// The `asahi-g16/stats` debugfs file contents.
+/// The `aurora-g16/stats` debugfs file contents.
 fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let state = shared.state.lock();
     match state.as_deref() {
@@ -79,6 +79,16 @@ impl Shared {
                 let evented = self.evented.swap(false, Ordering::AcqRel);
                 match firmware.poll(evented, &mut done) {
                     Ok(true) => self.rearm(firmware.engine.chan_wait),
+                    // Idle: one more pass after a window gives the state back. A failed
+                    // engine's poll no longer services power, so it has nothing to give back.
+                    Ok(false)
+                        if firmware.recovery.failed().is_none()
+                            && firmware.power.utilization.decaying() =>
+                    {
+                        self.mod_poll(kernel::time::msecs_to_jiffies(
+                            (super::power::policy::WINDOW_NS / 1_000_000) as u32,
+                        ))
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         firmware.fail_stop(error, &mut done);
@@ -172,14 +182,14 @@ impl Shared {
             // Dropping the previous handle cancels a still pending expiry before the timer
             // is started again.
             drop(handle.take());
-            *handle = Some(self.clone().start(Delta::from_micros(us as i64)));
+            *handle = Some(self.clone().start(Delta::from_micros(i64::from(us))));
         }
         self.mod_poll(1);
     }
 
-    /// Starts what the engine needs besides the firmware state: the `asahi-g16/stats` file.
+    /// Starts what the engine needs besides the firmware state: the `aurora-g16/stats` file.
     pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
-        let dir = debugfs::Dir::new(c_str!("asahi-g16"));
+        let dir = debugfs::Dir::new(c_str!("aurora-g16"));
         let file = KBox::pin_init(
             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
             GFP_KERNEL,
@@ -535,6 +545,7 @@ impl Firmware {
         if self.engine.flights.is_empty() {
             // Drained: a gap until the next publication.
             self.engine.stats.idle_from_ns = now_ns();
+            self.power.utilization.idle(self.engine.stats.idle_from_ns);
         }
         // The next prefix starts executing about now.
         self.renew_deadlines();
@@ -572,8 +583,8 @@ impl Firmware {
         let s = &mut self.engine.stats;
         if result.is_ok() {
             s.jobs += 1;
-            s.job_cmds += p.count() as u64;
-            s.job_max = s.job_max.max(p.count() as u64);
+            s.job_cmds += u64::from(p.count());
+            s.job_max = s.job_max.max(u64::from(p.count()));
         }
         complete(done, &job, Ok(()));
         // The rest of a compute horizon, after the first job (fence order).
@@ -584,8 +595,8 @@ impl Firmware {
                 Err(error) => complete(done, j2, Err(error)),
                 Ok(()) => {
                     s.jobs += 1;
-                    s.job_cmds += p2.count() as u64;
-                    s.job_max = s.job_max.max(p2.count() as u64);
+                    s.job_cmds += u64::from(p2.count());
+                    s.job_max = s.job_max.max(u64::from(p2.count()));
                 }
             }
             complete(done, j2, Ok(()));
@@ -761,8 +772,8 @@ impl Firmware {
             s.first_ns[kind] += first - f.published_ns;
             s.last_ns[kind] += last - f.published_ns;
         }
-        s.count[0] += f.computes as u64;
-        s.count[1] += f.renders as u64;
+        s.count[0] += u64::from(f.computes);
+        s.count[1] += u64::from(f.renders);
         if kind == 2 {
             s.count[2] += f.count as u64;
         }
@@ -834,7 +845,7 @@ impl Firmware {
         }
     }
 
-    /// The `asahi-g16/stats` contents. Scripts parse the keys: keep them stable.
+    /// The `aurora-g16/stats` contents. Scripts parse the keys: keep them stable.
     pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = &self.engine.stats;
         let slots = &self.slots.stats;
@@ -861,9 +872,13 @@ impl Firmware {
             super::recovery::logic::FIRMWARE_STAMP_PERIOD, self.engine.ordinal, self.engine.draw)?;
         writeln!(
             f,
-            "power: governor {} budget {} effective S{} temperature_mc {} updates {} sensor_errors {}",
-            self.power.governor, self.power.budget, self.power.effective,
-            self.power.temperature_mc, self.power.updates, self.power.sensor_errors
+            "power: governor {} budget {} demand S{} utilization {} effective S{} temperature_mc {} updates {} sensor_errors {}",
+            self.power.governor,
+            self.power.budget,
+            self.power.utilization.demand,
+            self.power.utilization.average,
+            self.power.effective, self.power.temperature_mc, self.power.updates,
+            self.power.sensor_errors
         )?;
         writeln!(
             f,

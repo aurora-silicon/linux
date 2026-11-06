@@ -182,6 +182,17 @@ semodule -i aurora_sep.pp
 restorecon /dev/sep-bio
 ```
 
+The module also lets fprintd read input event devices. libfprint follows the
+lid through their SW_LID switch to hide the reader while the lid is closed;
+without it fprintd logs "Permission denied" for `/dev/input/event*` and keeps
+offering Touch ID in clamshell. The device type, `aurora_sep_device_t`, is the
+one the distribution packages use for the same module, so moving between
+them keeps `/dev/sep-bio` labelled.
+
+`semodule -i` installs at priority 400, above the packages' 200, so a module
+loaded by hand keeps winning after a package is installed. Remove it then with
+`semodule -X 400 -r aurora_sep`.
+
 On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used

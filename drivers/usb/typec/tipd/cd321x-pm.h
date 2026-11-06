@@ -314,11 +314,14 @@ static inline unsigned int cd321x_pm_mux_held(struct cd321x_pm_state *pm,
 		pm->attempts_left = 0;
 		return 0;
 	}
-	if (pm->phase == CD321X_PM_RUNNING)
-		pm->attempts_left = CD321X_RESUME_ATTEMPTS;
-	else
-		pm->attempts_left++;
-	pm->phase = CD321X_PM_REVALIDATE;
+	/* A probe-time SAFE timeout joins this series without enabling workers. */
+	if (pm->phase != CD321X_PM_INITIALIZING) {
+		if (pm->phase == CD321X_PM_RUNNING)
+			pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+		else
+			pm->attempts_left++;
+		pm->phase = CD321X_PM_REVALIDATE;
+	}
 	pm->mux_retries++;
 	pm->mux_retry_ms = clamp(2 * pm->mux_retry_ms, CD321X_MUX_RETRY_MS,
 				 CD321X_MUX_RETRY_MAX_MS);

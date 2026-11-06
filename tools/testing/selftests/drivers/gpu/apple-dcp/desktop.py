@@ -206,6 +206,14 @@ def brightness_takeover(root):
         'static void dcp_backlight_sync_hint(',
         'int dcp_backlight_register(', 'static int dcp_set_brightness(',
         'static bool dcp_backlight_controls_device('))
+    # The 14.7 panel's nits policy and class operations (an M3 internal
+    # panel) never run on the desktop panel.
+    if 'static bool dcp_backlight_presents_nits(' in source:
+        functions = ('static bool iomfb_v14_7_panel_nits(struct apple_dcp *d) '
+                     '{(void)d;return false;}\n'
+                     'static const int dcp_backlight_ops_v14;\n' +
+                     block(source, 'static bool dcp_backlight_presents_nits(') +
+                     '\n' + functions)
     return prefix + r'''
 #include <stddef.h>
 #include <string.h>
@@ -233,7 +241,8 @@ struct backlight_device {struct backlight_properties props;void *data;bool ops_l
 struct apple_dcp {
     int fw_compat;bool quiescing;
     struct {int iomfb_method_profile;} hw;
-    struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;} brightness;
+    struct {u32 maximum,nits,dac;bool update;struct backlight_device *bl_dev;
+        u32 level,fade_from,fade_to;bool fading;unsigned long fade_start;int fade_work;} brightness;
     struct {bool lock;struct dcp_backlight_state state;unsigned long fade_start;
         int fade_work;void (*kick)(struct apple_dcp *);} backlight;
     struct {bool inherited_brightness_valid;u32 inherited_brightness;} *desktop;
@@ -280,6 +289,10 @@ static u32 calculate_dac(struct apple_dcp *d,int nits) {(void)d;(void)nits;asser
 static int drm_modeset_lock_single_interruptible(int *p) {(void)p;assert(false);return 0;}
 static void drm_modeset_unlock(int *p) {(void)p;assert(false);}
 static int dcp_backlight_update(struct apple_dcp *d) {(void)d;assert(false);return 0;}
+/* The DAC fade (M1/M2 firmware) never runs on the desktop panel. */
+#define system_freezable_wq NULL
+static bool dcp_dac_fade_starts(struct apple_dcp *d,u32 nits) {(void)d;(void)nits;assert(false);return false;}
+static void mod_delayed_work(void *q,int *w,unsigned delay) {(void)q;(void)w;(void)delay;assert(false);}
 ''' + functions + r'''
 int main(void)
 {
@@ -574,6 +587,7 @@ def powerlog_framing(root):
     prefix += block(afkh, 'struct epic_compact_desc {') + ';\n'
     prefix += '#undef kfree\n#define kfree(p) free((void *)(p))\n#define pr_err(...) ((void)0)\n'
     prefix += block(parser, 'int parse_system_log_mnits(')
+    prefix += block(parser, 'int parse_system_log_mnits_pairs(')
     prefix += r'''
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
@@ -581,6 +595,7 @@ def powerlog_framing(root):
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define __le64 u64
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
@@ -632,6 +647,20 @@ int main(void)
     memcpy(wire+16,report,8);
     afk_recv_compact_message(&ep,3,wire,23);
     assert(hints==2 && !service.users);
+    /* Headerless pairs, after the descriptor, on the desktop firmware only. */
+    struct dcp_system_ev_mnits mnits;
+    assert(!parse_system_log_mnits_pairs(report+8,sizeof(report)-8,&mnits));
+    assert(mnits.millinits==123000 && mnits.idac==42 && mnits.timestamp==1234);
+    hint=0;memset(wire+16,0,8);memcpy(wire+24,report+8,sizeof(report)-8);
+    afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
+    assert(hints==3 && hint==123000 && !service.users);
+    d.fw_compat=DCP_FIRMWARE_H17P;
+    afk_recv_compact_message(&ep,3,wire,sizeof(wire)-8);
+    assert(hints==3 && !service.users);
+    d.fw_compat=DCP_FIRMWARE_V_26_6_DESKTOP;
+    /* The first key without its value gives no reading. */
+    afk_recv_compact_message(&ep,3,wire,24+12);
+    assert(hints==3 && !service.users);
     return 0;
 }
 '''
@@ -741,8 +770,12 @@ def adt_identity(root):
         return bytes(out)+b''.join(children)
     panel=node({'product-id':42,'vendor-id':0x5274,'width-mm':345,'height-mm':223,
                 'serial-number':b'SYNTHETIC-PANEL','name':b'panel\0'})
+    # A synthetic potential headroom of 6.5; a nested node of that name is no
+    # panel backlight and must not override it.
+    backlight=node({'name':b'backlight\0','EDRPotentialHeadroom':0x68000},
+                   [node({'name':b'backlight\0','EDRPotentialHeadroom':0x10000})])
     data=node({'name':b'device-tree\0'},[node({'name':b'product\0'},[panel]),
-              node({'name':b'chosen\0','serial-number':b'PRIVATE-MACHINE'})])
+              node({'name':b'chosen\0','serial-number':b'PRIVATE-MACHINE'}),backlight])
     base=root/'drivers/gpu/drm/apple'
     source=(base/'dcp-panel-adt.c').read_text()
     source='\n'.join(l for l in source.splitlines() if not l.startswith('#include'))
@@ -774,6 +807,7 @@ int main(void)
     assert(panel.found && panel.width_mm==345 && panel.height_mm==223);
     assert(!strcmp(panel.identity.manufacturer,"TST") && panel.identity.product==42);
     assert(panel.identity.serial && panel.identity.serial==dcp_adt_serial((const u8 *)"SYNTHETIC-PANEL",15));
+    assert(panel.edr_potential_headroom==0x68000);
     for(unsigned n=0;n<sizeof(fixture);n++) {
         struct dcp_panel_adt old=panel;
         assert(dcp_panel_adt_parse(fixture,n,&panel)<0);
@@ -811,7 +845,7 @@ struct work_struct {int unused;};
 struct backlight_device {struct {int kobj;} dev;struct {u32 brightness;} props;};
 struct apple_dcp {
     int fw_compat;bool quiescing,crashed;
-    struct {struct backlight_device *bl_dev;} brightness;
+    struct {struct backlight_device *bl_dev;int fade_work;} brightness;
     struct {bool lock;struct dcp_backlight_state state;struct work_struct notify_work;int fade_work,retry_work;} backlight;
     struct {struct dcp_backlight_swap backlight;} *desktop;
 };
@@ -847,10 +881,10 @@ int main(void)
     dcp_backlight_desktop_finish(&d,9,true,false);assert(events==1);
     d.quiescing=true;dcp_backlight_notify(&d);assert(events==1);
     d.quiescing=false;d.fw_compat=1;dcp_backlight_notify(&d);assert(events==1);
-    dcp_backlight_stop(&d);assert(!cancelled && delayed_cancelled==2);
+    dcp_backlight_stop(&d);assert(!cancelled && delayed_cancelled==3);
     d.fw_compat=5;dcp_backlight_notify_release(&d);
     assert(!d.brightness.bl_dev && cancelled==1);dcp_backlight_notify(&d);assert(events==1);
-    dcp_backlight_stop(&d);assert(cancelled==2 && delayed_cancelled==4);
+    dcp_backlight_stop(&d);assert(cancelled==2 && delayed_cancelled==6);
     return 0;
 }
 '''
@@ -942,3 +976,157 @@ int main(void)
     return 0;
 }
 '''
+
+
+def gamma(root):
+    base = root / 'drivers/gpu/drm/apple'
+    header = (base / 'iomfb.h').read_text()
+    template = (base / 'iomfb_template.c').read_text()
+    prefix = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32, __le32;
+typedef int64_t s64;
+#define __packed __attribute__((packed))
+#define le32_to_cpu(v) (v)
+#define cpu_to_le32(v) (v)
+#define div_s64(a, b) ((a) / (b))
+'''
+    prefix += next(line for line in header.splitlines()
+                   if line.startswith('#define IOMFB_GAMMA_ENTRIES')) + '\n'
+    for name in ('req', 'resp'):
+        prefix += block(header, 'struct iomfb_gamma_table_' + name + ' {') + ';\n'
+    prefix += r'''
+struct drm_color_lut { u16 red, green, blue, reserved; };
+struct dcp_desktop_state {
+    struct iomfb_gamma_table_req *gamma_fw, *gamma_out;
+    struct drm_color_lut gamma_lut[IOMFB_GAMMA_ENTRIES];
+    bool gamma_user, gamma_fw_read, gamma_unusable;
+};
+struct apple_dcp { struct dcp_desktop_state *desktop; bool panel; void *dev; };
+static unsigned warnings, debug, swaps, writes;
+static bool dcp_has_panel(struct apple_dcp *dcp) { return dcp->panel; }
+static void *memchr_inv(const void *p, int c, size_t n)
+{
+    const unsigned char *bytes = p;
+    for (size_t i = 0; i < n; i++)
+        if (bytes[i] != c) return (void *)(bytes + i);
+    return NULL;
+}
+#define dev_warn(dev, ...) ((void)(dev), warnings++)
+#define dev_dbg(dev, ...) ((void)(dev), debug++)
+static void do_swap(struct apple_dcp *dcp, void *out, void *cookie)
+{ assert(dcp && !out && !cookie); swaps++; }
+static const int dcp_set_gamma_table_method;
+static struct iomfb_gamma_table_req sent;
+static void dcp_push(struct apple_dcp *dcp, bool oob, const int *method,
+                     size_t in_size, size_t out_size, void *in,
+                     void (*cb)(struct apple_dcp *, void *, void *), void *cookie)
+{
+    assert(!oob && method == &dcp_set_gamma_table_method);
+    assert(in_size == sizeof(sent));
+    assert(out_size == sizeof(struct iomfb_gamma_table_resp));
+    struct iomfb_gamma_table_resp reply = {0};
+    memcpy(&sent, in, sizeof(sent));
+    writes++;
+    cb(dcp, &reply, cookie);
+}
+'''
+    production = '\n'.join(block(template, 'static ' + signature) for signature in (
+        'u32 dcp_gamma_lookup(', 'void dcp_gamma_set_done(',
+        'void dcp_gamma_set(', 'void dcp_gamma_read('))
+    suffix = r'''
+static struct iomfb_gamma_table_req fw, output;
+static struct dcp_desktop_state state;
+static struct apple_dcp dcp;
+static struct iomfb_gamma_table_resp reply;
+static void reset(bool panel)
+{
+    memset(&fw, 0xa5, sizeof(fw));
+    memset(&output, 0, sizeof(output));
+    memset(&state, 0, sizeof(state));
+    memset(&reply, 0, sizeof(reply));
+    state.gamma_fw = &fw;
+    state.gamma_out = &output;
+    dcp = (struct apple_dcp){ .desktop = &state, .panel = panel };
+    warnings = debug = swaps = writes = 0;
+}
+static void increasing(void)
+{
+    /* Arbitrary synthetic scales: no assertion about the firmware encoding. */
+    for (unsigned ch = 0; ch < 3; ch++)
+        for (unsigned i = 0; i < IOMFB_GAMMA_ENTRIES; i++)
+            reply.table[ch][i] = (ch + 1) * i * i;
+}
+static void rejected(bool warn)
+{
+    dcp_gamma_read(&dcp, &reply, NULL);
+    assert(state.gamma_unusable && !state.gamma_fw_read);
+    assert(warnings == warn && swaps == 1 && writes == 0);
+    assert(debug == !warn);
+    /* Failure must not turn the reply into a calibration base. */
+    const unsigned char *bytes = (const void *)&fw;
+    for (size_t i = 0; i < sizeof(fw); i++) assert(bytes[i] == 0xa5);
+}
+int main(void)
+{
+    _Static_assert(sizeof(reply) == 3088, "gamma response size");
+    _Static_assert(offsetof(struct iomfb_gamma_table_resp, ret) == 3084,
+                   "gamma return status offset");
+    for (unsigned panel = 0; panel < 2; panel++) {
+        reset(panel); reply.ret = 2; rejected(panel);
+        reset(panel); reply.ret = 1; rejected(true);
+        reset(panel); reply.ret = 0x100; increasing(); rejected(true);
+        reset(panel); reply.ret = 2; increasing(); rejected(true);
+        reset(panel); rejected(true); /* Successful but empty table. */
+        for (unsigned ch = 0; ch < 3; ch++) {
+            reset(panel); increasing();
+            reply.table[ch][10] = reply.table[ch][9] - 1;
+            rejected(true);
+            reset(panel); increasing();
+            memset(reply.table[ch], 0, sizeof(reply.table[ch]));
+            rejected(true);
+        }
+        reset(panel);
+        dcp_gamma_read(&dcp, NULL, NULL);
+        assert(state.gamma_unusable && !state.gamma_fw_read);
+        assert(warnings == 1 && swaps == 1 && writes == 0);
+
+        reset(panel); increasing();
+        dcp_gamma_read(&dcp, &reply, NULL);
+        assert(state.gamma_fw_read && !state.gamma_unusable);
+        assert(!warnings && writes == 1 && swaps == 1);
+        assert(!sent.table_null);
+        assert(!memcmp(sent.table, reply.table, sizeof(sent.table)));
+        assert(!sent.padding[0] && !sent.padding[1] && !sent.padding[2]);
+
+        /* Nonlinear, independent RGB channels; endpoints and interpolation. */
+        state.gamma_user = true;
+        for (unsigned i = 0; i < IOMFB_GAMMA_ENTRIES; i++) {
+            state.gamma_lut[i].red = 0;
+            state.gamma_lut[i].green = 0x7fff;
+            state.gamma_lut[i].blue = 0xffff;
+        }
+        dcp_gamma_set(&dcp);
+        assert(writes == 2 && swaps == 2 && !warnings);
+        for (unsigned i = 0; i < IOMFB_GAMMA_ENTRIES; i++) {
+            assert(sent.table[0][i] == 0);
+            assert(sent.table[1][i] == 32767);
+            assert(sent.table[2][i] == 196608);
+        }
+        state.gamma_user = false;
+        dcp_gamma_set(&dcp);
+        assert(writes == 3 && swaps == 3 && !warnings);
+        assert(!memcmp(sent.table, reply.table, sizeof(sent.table)));
+    }
+    puts("gamma RPC status, admission, composition and restoration passed");
+    return 0;
+}
+'''
+    return prefix + production + suffix
