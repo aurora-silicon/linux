@@ -216,5 +216,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g16_ksm_event_mask_arm: u8 {
+            default: 0,
+            description: "G16 TEST ONLY: KSM event-mask A/B arm (0=A, 1=C, 2=T, 3=F, 4=R, 5=M)",
+        },
     },
 }

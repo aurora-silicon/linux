@@ -16,6 +16,7 @@ use crate::g17::{
     command::Validated,
     completion::Deferred,
     context::Context,
+    event_mask::{self, Engine},
     freelist::RenderPool,
     fw::{
         channels::WorkSlot,
@@ -709,7 +710,11 @@ impl Pair {
                 },
             },
             mcache,
-            event_mask: abi::RENDER_KICK_EVENT_MASK,
+            event_mask: event_mask::selected(if stage == 0 {
+                Engine::Tiling
+            } else {
+                Engine::Fragment
+            }),
             register_arrays: arrays,
             scs_enabled: ray_query[stage].scratch.enabled(),
             priority: policy.priority(),
@@ -2395,4 +2400,3 @@ mod completion_noted_tests {
         assert!(completion_noted([3, 68], both));
     }
 }
-
