@@ -1170,13 +1170,13 @@
 			reg-names = "smc", "sram";
 			mboxes = <&smc_mbox>;
 
-			smc_gpio: gpio@67500000 {
+			smc_gpio: gpio {
 				compatible = "apple,smc-gpio";
 				gpio-controller;
 				#gpio-cells = <2>;
 			};
 
-			smc_gpio_low: gpio@67700000 {
+			smc_gpio_low: gpio-low {
 				compatible = "apple,smc-low-gpio";
 				gpio-controller;
 				#gpio-cells = <2>;
@@ -1433,7 +1433,7 @@
 		};
 
 		nvme: nvme@38dcc0000 {
-			compatible = "apple,t6030-nvme-ans3", "apple,t8103-nvme-ans2";
+			compatible = "apple,t6030-nvme-ans2", "apple,t8103-nvme-ans2";
 			reg = <0x3 0x8dcc0000 0x0 0x60000>,
 			      <0x3 0x89400000 0x0 0x4000>;
 			reg-names = "nvme", "ans";
