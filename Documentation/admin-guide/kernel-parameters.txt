@@ -1148,9 +1148,11 @@ Kernel parameters
 
 	ctxr_exec_window=
 			[ARM64,EARLY] Confine kernel executable code to a
-			physical window, overriding the device tree. This is
-			for bring-up and VMs. A value that doesn't parse, or a
-			window that can't work, is ignored with a warning.
+			physical window. This is for bring-up and VMs. A value
+			that doesn't parse is ignored with a warning. The
+			kernel must be at EL2, and when the device tree carries
+			a window the given one must lie inside it; otherwise the
+			secondary CPUs are kept offline.
 			See Documentation/arch/arm64/ctxr-execmem.rst.
 			Format: <size>[KMG]@<base>[KMG]
 

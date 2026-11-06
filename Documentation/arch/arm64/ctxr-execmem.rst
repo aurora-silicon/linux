@@ -34,23 +34,23 @@ Command line (bring-up / VM)
         ctxr_exec_window=<size>@<base>   e.g. ctxr_exec_window=128M@0x40200000
         ctxr_exec_enforce=<bool>         (default: enforcing)
 
-    The command line overrides the device tree's window. ``size`` and ``base``
-    accept the usual ``K``/``M``/``G`` suffixes, and both are required. The last
-    use of an option wins.
+    ``size`` and ``base`` accept the usual ``K``/``M``/``G`` suffixes, and both
+    are required. The last use of an option wins. The kernel must be at EL2, and
+    when the device tree also carries a window the command-line one must lie
+    inside it: the command line can only pick a window within what the firmware
+    armed, never a different region. A value that doesn't parse is ignored with
+    a warning.
 
-A value that doesn't parse is ignored with a warning. So is a window from the
-command line that can't work because the image doesn't fit it or it isn't in
-DRAM, and the device tree's window then applies if there is one.
-
-The secondary CPUs can only run code inside the device tree's window, and the
-boot CPU isn't confined. So when that window can't be used, the kernel logs why,
+The secondary CPUs can only run code inside the window, and the boot CPU isn't
+confined. So when a window is given but can't be used, the kernel logs why,
 leaves the secondaries in the bootloader and boots on the boot CPU alone, as with
-``nosmp``. That happens when the property is malformed (not four cells, a base or
-size of 0 or not page aligned, or a window that wraps), when the image
-doesn't fit the window or the window isn't in DRAM, when it can't be reserved,
-when no free memory is left in it for executable allocations, and when the kernel
-isn't running at EL2 (``kvm-arm.mode=nvhe`` or ``protected``, for example). With
-no such property nothing changes.
+``nosmp``. That happens when the device-tree property is malformed (not four
+cells, a base or size of 0 or not page aligned, or a window that wraps), when the
+image doesn't fit the window or the window isn't in DRAM, when it can't be
+reserved, when no free memory is left in it for executable allocations, when the
+command-line window isn't inside the device-tree one, and when the kernel isn't
+running at EL2 (``kvm-arm.mode=nvhe`` or ``protected``, for example). With no
+window from either place, nothing changes.
 
 The kernel doesn't check the device tree's window against ``CTXR_D``. The
 bootloader reads ``CTXR_D`` when it chooses the window and reserves the rest of
