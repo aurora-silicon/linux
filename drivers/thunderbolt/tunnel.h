@@ -109,8 +109,19 @@ struct tb_tunnel {
 	/* host cap of a DP tunnel's link rate (Mb/s per lane, 0 none), and its bandwidth */
 	u32 max_rate;
 	int max_bw;
-	/* under TB_HOST_DP_HBR2_MAX: the link rate the DPTX was offered (Mb/s per lane) */
+	/*
+	 * Under TB_HOST_DP_SHARED_RATE (Mb/s per lane): the highest link rate
+	 * the connection manager allows, the one the DPTX was offered, and the
+	 * one both adapters take without the policy. @host_relink: to be set
+	 * up again at a higher rate once the debounce is over (alone now);
+	 * @host_relinked_up: set up so, and set up at HBR2 again if it does
+	 * not come up.
+	 */
+	u32 host_rate_limit;
 	u32 host_rate;
+	u32 host_max_rate;
+	bool host_relink;
+	bool host_relinked_up;
 	bool dprx_started;
 	bool dprx_canceled;
 	u64 host_dp_generation;
@@ -140,9 +151,74 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
 void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel);
 bool tb_apple_nhi_needs_bw_grant(struct tb_nhi *nhi);
 int tb_dp_cap_bandwidth(struct tb_tunnel *tunnel, int bw);
+unsigned int tb_dp_host_counted_bandwidth(u32 max_rate, u32 rate, u32 lanes);
 int tb_dp_reduce_bandwidth_shared(int max_bw, u32 in_rate, u32 in_lanes, u32 out_rate,
 				  u32 out_lanes, u32 shared_rate, u32 *new_rate, u32 *new_lanes);
+int tb_dp_host_reduce_bandwidth(int max_bw, u32 in_rate, u32 in_lanes, u32 out_rate,
+				u32 out_lanes, u32 shared_rate, u32 rate_limit,
+				u32 *new_rate, u32 *new_lanes);
 u32 tb_dp_host_shared_rate(const struct tb_tunnel *tunnel);
+
+/* TB_HOST_DP_SHARED_RATE link rates (Mb/s per lane) */
+#define TB_DP_HOST_RATE_ALONE	8100	/* HBR3: one DP tunnel on the host router */
+#define TB_DP_HOST_RATE_SHARED	5400	/* HBR2: more than one */
+
+/**
+ * enum tb_dp_relink - Whether a host DP tunnel is set up again at another rate
+ * @TB_DP_RELINK_NONE: It is not
+ * @TB_DP_RELINK_WAIT: Not now, it is decided again later
+ * @TB_DP_RELINK_NOW: It is, now
+ */
+enum tb_dp_relink {
+	TB_DP_RELINK_NONE,
+	TB_DP_RELINK_WAIT,
+	TB_DP_RELINK_NOW,
+};
+
+/*
+ * TB_HOST_DP_SHARED_RATE re-link work (ms): how long it waits to be decided
+ * again (also while system sleep is in progress), and the first of its
+ * TB_DP_RELINK_RETRIES retries, doubled each time, when the domain does not
+ * runtime resume.
+ */
+#define TB_DP_RELINK_DELAY_MS	2500
+#define TB_DP_RELINK_POLL_MS	500
+#define TB_DP_RELINK_RETRIES	5
+
+/*
+ * A re-link to a higher rate waits TB_DP_RELINK_DELAY_MS (the debounce),
+ * doubled up to TB_DP_RELINK_DELAY_MAX_MS while a second DP tunnel takes
+ * the rate back down within TB_DP_RELINK_CALM_MS of such a re-link.
+ */
+#define TB_DP_RELINK_DELAY_MAX_MS	40000
+#define TB_DP_RELINK_CALM_MS		60000
+
+/**
+ * struct tb_dp_pm_state - System sleep transitions, for host DP re-links
+ * @sleeping: From the start of a transition (its PREPARE event, before any
+ *	      other notifier) until it is over, its POST callbacks and any
+ *	      rollback included (tb_dp_pm_reopen())
+ * @reopen: The POST event came: reopen once the transition is over
+ */
+struct tb_dp_pm_state {
+	bool sleeping;
+	bool reopen;
+};
+
+u32 tb_dp_host_rate_for(unsigned int tunnels);
+enum tb_dp_relink tb_dp_relink_down(u32 rate, unsigned int tunnels, bool sleeping);
+bool tb_dp_pm_event(struct tb_dp_pm_state *s, unsigned long event);
+void tb_dp_pm_reopen(struct tb_dp_pm_state *s);
+unsigned int tb_dp_relink_retry_delay(unsigned int tries);
+u32 tb_dp_host_rate_after(unsigned int tunnels, bool recovering);
+bool tb_dp_relink_up_wanted(unsigned int tunnels, u32 rate, u32 max_rate, bool sleeping);
+enum tb_dp_relink tb_dp_relink_up(bool marked, unsigned int tunnels, u32 rate, u32 max_rate,
+				  bool pairable, bool sleeping, unsigned long now,
+				  unsigned long due);
+unsigned int tb_dp_relink_backoff(unsigned int delay_ms, bool flapping);
+enum tb_dp_relink tb_dp_relink_activation(bool relinked_up, bool active);
+bool tb_dp_host_drop_relink_up(struct tb_tunnel *tunnel);
+
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,
 				     int max_up, int max_down,

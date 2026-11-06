@@ -50,7 +50,7 @@ int main(int argc, char **argv)
 {
     assert(argc==3);
     struct apple_dcp d={.fw_compat=5,.has_panel=true};
-    __typeof__(*d.desktop) state={0};d.desktop=&state;
+    __typeof__(*d.panel_identity) state={0};d.panel_identity=&state;
     struct device_node np={DTS_VALUES};
     d.notch_height=74;
     if (!strcmp(argv[1],"dimensions")) {
@@ -76,7 +76,7 @@ int main(int argc, char **argv)
         assert(!memcmp(&panel,&before,sizeof(panel)));
     }
     d.panel.width_mm=panel.width_mm;d.panel.height_mm=panel.height_mm;
-    state.panel_adt_identity=panel.identity;
+    state.adt=panel.identity;
     struct dcp_display_mode mode=panel_test_mode, saved=mode;
     u64 generation=99;
     const struct drm_edid *edid=dcp_panel_edid_snapshot(&d,&mode,1,&generation);

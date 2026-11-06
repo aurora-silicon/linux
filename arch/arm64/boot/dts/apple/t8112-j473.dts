@@ -30,13 +30,6 @@
 	status = "okay";
 };
 
-&dcp {
-	status = "disabled";
-};
-
-&display {
-	iommus = <&dispext0_dart 0 0x0 0x0 0xf 0xffff0000>;
-};
 &dispext0_dart {
 	status = "okay";
 };
