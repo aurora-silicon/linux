@@ -9,7 +9,6 @@
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
-#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/property.h>
 #include <linux/spmi.h>
@@ -36,6 +35,8 @@ struct stockholm_model {
 	u16 irq_reg;		/* follower IRQ offset, side-effect-free read */
 	u16 standby_reg;	/* follower virtual command register */
 	u8 rx_trailer_len;	/* bytes drained after the NCI packet */
+	u8 follower_id;		/* expected value of id_reg */
+	u8 irq_offset;		/* expected base of the follower's IRQ block */
 	u8 standby_on;
 	u8 standby_off;
 	u32 startup_delay_us;
@@ -48,6 +49,8 @@ static const struct stockholm_model stockholm_model96 = {
 	.irq_reg = 0x105,
 	.standby_reg = 0x0,
 	.rx_trailer_len = 2,
+	.follower_id = 0x19,
+	.irq_offset = 0xe0,
 	.standby_on = 0x15,
 	.standby_off = 0x14,
 	.startup_delay_us = 10000,
@@ -293,33 +296,20 @@ static int stockholm_read_config(struct stockholm *st,
 				 const struct stockholm_model *model)
 {
 	struct device *dev = &st->sdev->dev;
-	u32 expected;
 	u8 value;
 	int ret;
-
-	ret = device_property_read_u32(dev, "apple,follower-id", &expected);
-	if (ret)
-		return dev_err_probe(dev, ret, "missing expected follower ID\n");
-	if (expected > U8_MAX)
-		return dev_err_probe(dev, -EINVAL, "invalid expected follower ID\n");
 
 	ret = spmi_ext_register_readl(st->sdev, model->id_reg, &value, 1);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read follower ID\n");
-	if (value != expected)
+	if (value != model->follower_id)
 		return dev_err_probe(dev, -ENODEV,
 				     "unexpected follower ID %#02x\n", value);
-
-	ret = device_property_read_u32(dev, "apple,irq-offset", &expected);
-	if (ret)
-		return dev_err_probe(dev, ret, "missing expected IRQ offset\n");
-	if (expected > U8_MAX)
-		return dev_err_probe(dev, -EINVAL, "invalid expected IRQ offset\n");
 
 	ret = spmi_ext_register_readl(st->sdev, model->irq_reg, &value, 1);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read IRQ offset\n");
-	if (value != expected)
+	if (value != model->irq_offset)
 		return dev_err_probe(dev, -ENODEV,
 				     "unexpected IRQ offset %#02x\n", value);
 
