@@ -48,7 +48,7 @@ struct apple_soc_edac_irq {
 	int irq;
 	unsigned int retries;
 	unsigned int backoff_ms;
-	unsigned long last_jiffies;
+	unsigned long armed_jiffies;
 	struct delayed_work rearm;
 };
 
@@ -59,11 +59,15 @@ struct apple_soc_edac {
 	struct apple_soc_edac_irq *irqs;
 };
 
-/* DCS IRQs drive a separate thermal loop and are intentionally omitted. */
+/*
+ * DCS IRQs drive a separate thermal loop and are intentionally omitted.
+ * The AMCC lines are left unclaimed as well: on the J616s all sixteen are
+ * asserted from boot and re-assert as soon as they are unmasked, and no
+ * acknowledge contract is established for them.
+ */
 static const struct apple_soc_edac_range t6041_error_ranges[] = {
 	{ 0, 9, "sep" },
 	{ 9, 1, "pmgr" },
-	{ 10, 16, "amcc" },
 	{ 26, 3, "sram" },
 	{ 45, 3, "ni0" },
 	{ 48, 4, "ni1" },
@@ -77,7 +81,6 @@ static const struct apple_soc_edac_range t6041_error_ranges[] = {
 };
 
 static const struct apple_soc_edac_range t8140_error_ranges[] = {
-	{ 0, 4, "amcc" },
 	{ 4, 1, "pmgr" },
 	{ 5, 9, "sep" },
 	{ 18, 1, "ni0" },
@@ -136,6 +139,7 @@ static void apple_soc_edac_rearm(struct work_struct *work)
 		container_of(to_delayed_work(work), struct apple_soc_edac_irq,
 			     rearm);
 
+	irq_data->armed_jiffies = jiffies;
 	enable_irq(irq_data->irq);
 }
 
@@ -154,13 +158,16 @@ static irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
 	dev_err_ratelimited(edac->dev, "hardware error: %s (IRQ %d)\n", msg,
 			    irq);
 
-	/* A quiet minute since the last delivery restarts the backoff. */
-	if (time_after(jiffies, irq_data->last_jiffies +
+	/*
+	 * A line that stayed quiet for a minute after its last unmask had
+	 * cleared: start the backoff again. One that fires straight after the
+	 * unmask is still asserted and keeps counting towards the limit.
+	 */
+	if (time_after(jiffies, irq_data->armed_jiffies +
 				msecs_to_jiffies(APPLE_SOC_EDAC_BACKOFF_MAX_MS))) {
 		irq_data->retries = 0;
 		irq_data->backoff_ms = APPLE_SOC_EDAC_BACKOFF_MS;
 	}
-	irq_data->last_jiffies = jiffies;
 
 	if (irq_data->retries++ >= APPLE_SOC_EDAC_MAX_RETRIES) {
 		dev_warn(edac->dev, "%s stays asserted, leaving IRQ %d masked\n",
@@ -203,7 +210,7 @@ static int apple_soc_edac_probe(struct platform_device *pdev)
 
 	edac->dev = &pdev->dev;
 	edac->hw = hw;
-	edac->dci = edac_device_alloc_ctl_info(0, "apple_soc", 1,
+	edac->dci = edac_device_alloc_ctl_info(0, (char *)dev_name(&pdev->dev), 1,
 					       "platform", 1, 0,
 					       edac_device_alloc_index());
 	if (!edac->dci)
@@ -238,7 +245,7 @@ static int apple_soc_edac_probe(struct platform_device *pdev)
 		irq_data->index = i;
 		irq_data->irq = irq;
 		irq_data->backoff_ms = APPLE_SOC_EDAC_BACKOFF_MS;
-		irq_data->last_jiffies = jiffies;
+		irq_data->armed_jiffies = jiffies;
 		INIT_DELAYED_WORK(&irq_data->rearm, apple_soc_edac_rearm);
 
 		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
