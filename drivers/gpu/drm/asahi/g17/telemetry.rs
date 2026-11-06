@@ -8,6 +8,9 @@
 pub(super) const UNAVAILABLE: u32 = 0;
 pub(super) const VALID: u32 = 1;
 pub(super) const STALE: u32 = 2;
+/// The firmware never emits the record, so the capability cannot become
+/// valid. Chosen from the firmware match data, never from missing packets.
+pub(super) const UNSUPPORTED: u32 = 3;
 
 /// C read callback result; independent capabilities never imply one another.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

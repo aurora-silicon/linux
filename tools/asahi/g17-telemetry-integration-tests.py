@@ -212,6 +212,30 @@ RUST_TESTS = r'''
     }
 
     #[test]
+    fn current_firmwares_report_pstate_unsupported_and_keep_utilisation() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        for graph in [InitGraph::V25G83,InitGraph::G17P] {
+            assert!(!stats::reports_pstate(graph));
+            let empty=stats::qualify(graph,telemetry::Readout::default());
+            assert_eq!((empty.util_status,empty.pstate_status),(telemetry::UNAVAILABLE,telemetry::UNSUPPORTED));
+            let init=initdata::InitData::new();
+            let mut rings=Rings::new(graph).unwrap();
+            init.push(Primary,[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0]);
+            // Even a decodable tag 0x10 does not override the firmware's match data.
+            init.push(Primary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
+            rings.drain_statistics(&dev,&init,Primary);
+            assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
+            let view=stats::qualify(graph,rings.read_statistics(1));
+            assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate,view.pstate_timestamp),
+                       (telemetry::VALID,97,telemetry::UNSUPPORTED,0,0));
+            rings.invalidate_statistics();
+            let view=stats::qualify(graph,rings.read_statistics(1));
+            assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
+        }
+    }
+
+    #[test]
     fn off_drains_and_invalid_boundary_producers_never_admit_live_data() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
@@ -424,10 +448,15 @@ int main(void) {
         } else {
             assert(strstr(now,"util_device_percent unsupported\n"));
             assert(strstr(now,"pstate unsupported\n"));
-            assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unsupported\n"));
+            assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unavailable\n"));
             assert(strstr(now,status==2?"utilisation_status stale\n":"utilisation_status unavailable\n"));
         }
     }
+    /* G16S/G17P: pstate unsupported by firmware, utilisation still valid. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"utilisation_status valid\nutil_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"
+                      "pstate_status unsupported\npstate unsupported\nrequested_frequency_hz unsupported\n"));
     struct device dev;
     struct asahi_gpu_memory memory={0};
     void *handle=NULL;
@@ -502,7 +531,10 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
             assert before in telemetry
             telemetry = telemetry.replace(before, after, 1)
     (work / 'telemetry.rs').write_text(telemetry)
-    policy = item((DRIVER / 'g17/stats.rs').read_text(), 'pub(super) const fn max_age_ns')
+    stats_rs = (DRIVER / 'g17/stats.rs').read_text()
+    policy = '\n'.join(item(stats_rs, signature) for signature in
+                       ['pub(super) const fn max_age_ns', 'pub(super) const fn reports_pstate',
+                        'pub(super) fn qualify('])
     (work / 'rings.rs').write_text(RUST_HEADER + 'mod stats { use super::fw::variant::InitGraph;\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
     # Rust resolves child modules relative to the inline parent's directory.

@@ -7,7 +7,10 @@
 
 struct device;
 
-/* Mirrors g17::telemetry::Readout, filled under the Rust device mutex. */
+/*
+ * Mirrors g17::telemetry::Readout, filled under the Rust device mutex.
+ * Status words: 0 unavailable, 1 valid, 2 stale, 3 unsupported by firmware.
+ */
 struct asahi_qualified_stats {
 	u32 util_status;
 	u32 pstate_status;

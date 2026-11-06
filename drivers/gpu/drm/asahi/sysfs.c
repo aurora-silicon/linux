@@ -56,10 +56,19 @@ struct asahi_stats_attribute {
 	struct notifier_block pm_notifier;
 };
 
-/* 0: unavailable, 1: valid, 2: stale; matches g17::telemetry. */
+/* 0: unavailable, 1: valid, 2: stale, 3: unsupported; matches g17::telemetry. */
 static const char *asahi_stats_quality(u32 status)
 {
-	return status == 1 ? "valid" : status == 2 ? "stale" : "unavailable";
+	switch (status) {
+	case 1:
+		return "valid";
+	case 2:
+		return "stale";
+	case 3:
+		return "unsupported";
+	default:
+		return "unavailable";
+	}
 }
 
 static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, char *buf)
@@ -80,14 +89,12 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 				   "util_device_percent unsupported\n");
 	}
 	/*
-	 * V25G83 and V26A428 accept tag 0x10 but never emit it, and no other
-	 * record carries the current pstate, so on these firmwares pstate is
-	 * unsupported rather than temporarily unavailable. A firmware that
-	 * does send it still reports valid or stale.
+	 * unsupported comes from the firmware match data (g17::stats): V25G83
+	 * and V26A428 never emit a pstate record, so it is not a transient
+	 * state. unavailable keeps meaning "no qualified sample yet".
 	 */
 	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
-			   snap.pstate_status ? asahi_stats_quality(snap.pstate_status) :
-						"unsupported");
+			   asahi_stats_quality(snap.pstate_status));
 	if (snap.pstate_status == 1)
 		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
 	else

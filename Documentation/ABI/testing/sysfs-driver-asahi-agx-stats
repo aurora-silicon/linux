@@ -79,14 +79,21 @@ Description:
 		The following keys replace the legacy keys on these firmwares:
 
 		utilisation_status, pstate_status
-		           utilisation_status is valid, stale, or unavailable.
-		           pstate_status is valid, stale, or unsupported: the
-		           V25G83 and V26A428 firmwares accept tag 0x10 but never
-		           emit it, and no other record carries the current
-		           pstate, so on these firmwares it reads unsupported.
-		           Numeric metrics are printed only while their
-		           capability is valid; otherwise their value is the
-		           string unsupported.
+		           One of valid, stale, unavailable or unsupported.
+		           unavailable means no qualified sample in the current
+		           epoch yet (for example right after boot, resume or
+		           a firmware restart); stale means the last sample is
+		           older than the age limit below or its epoch ended.
+		           unsupported is a fixed property of the firmware,
+		           taken from the driver's per-firmware match data, and
+		           never changes at runtime: the V25G83 and V26A428
+		           firmwares accept tag 0x10 but never emit it, and no
+		           other record carries the current pstate, so
+		           pstate_status always reads unsupported on G16S and
+		           G17P. utilisation_status is never unsupported on
+		           these firmwares. Numeric metrics are printed only
+		           while their capability is valid; otherwise their
+		           value is the string unsupported.
 
 		util_tiler_percent, util_renderer_percent, util_device_percent
 		           Unsigned integer percent (0..100), from tag 0x13
@@ -98,7 +105,9 @@ Description:
 		           A packet with any value above 100 invalidates the whole
 		           utilisation capability. Zero is a valid sample.
 
-		pstate     Logical selector 0..10 from tag 0x10 word 6. Words 1
+		pstate     Logical selector 0..10 from tag 0x10 word 6, on a
+		           firmware whose match data says it emits tag 0x10
+		           (none of the current G16S/G17P firmwares do). Words 1
 		           and 2 form a little-endian u64 firmware timestamp.
 		           The first timestamp establishes a baseline. Invalid
 		           selectors and backwards timestamps remove pstate
