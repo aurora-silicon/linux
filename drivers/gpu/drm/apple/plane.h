@@ -37,6 +37,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
 				   bool supports_xrgb2101010,
+				   bool xrgb_is_alpha,
 				   enum drm_plane_type type,
 				   bool interchange,
 				   bool premultiplied);

@@ -88,6 +88,7 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PHY_LANE_CFG_REFCLK1REQ	BIT(1)
 #define   PHY_LANE_CFG_REFCLK0ACK	BIT(2)
 #define   PHY_LANE_CFG_REFCLK1ACK	BIT(3)
+#define   PHY_LANE_CFG_REFBUF_OFF	BIT(4)
 #define   PHY_LANE_CFG_REFCLKEN		(BIT(9) | BIT(10))
 #define   PHY_LANE_CFG_REFCLKCGEN	(BIT(30) | BIT(31))
 #define PHY_LANE_CTL			0x00004
@@ -172,6 +173,10 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define PORT_T602X_MSIADDR	0x016c
 #define PORT_T602X_MSIADDR_HI	0x0170
 #define PORT_T602X_PERST	0x082c
+/* T8152: lane PIPE reset is released by clearing this after PERST#. */
+#define   PORT_T8152_PIPE_RST	BIT(16)
+#define PORT_T8152_PIPE_RST_STS	0x00a8
+#define   PORT_T8152_PIPE_RST_STS_LANES	GENMASK(3, 0)
 #define PORT_T602X_RID2SID	0x3000
 #define PORT_T602X_MSIMAP	0x3800
 
@@ -209,6 +214,13 @@ struct hw_info {
 	 * keeps its link while the domain stays on, see apple_pcie_hold_domain().
 	 */
 	bool s2idle_hold_domain;
+	/* AppleT8152PCIePort::_initializeRefclkBuffer clears REFBUF_OFF. */
+	bool refbuf_off;
+	/*
+	 * APCIECoreRCGen5Port::enablePortHardware: after PERST#, wait for the
+	 * lane PIPE reset status, then release PORT_T8152_PIPE_RST.
+	 */
+	bool pipe_rst;
 };
 
 static const struct hw_info t8103_hw = {
@@ -250,6 +262,20 @@ static const struct hw_info t8140_hw = {
 	.sid_indexed_rid2sid	= true,
 	.retain_clocks		= true,
 	.root_bus_only		= true,
+};
+
+/* T8152 (M6) apcie: T602x port layout, refclk buffer powered down by iBoot. */
+static const struct hw_info t8152_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 512,
+	.refbuf_off		= true,
+	.pipe_rst		= true,
 };
 
 static const struct hw_info t8103_pciec_hw = {
@@ -1521,6 +1547,11 @@ static int apple_pcie_setup_refclk(struct apple_pcie *pcie,
 	if (pcie->hw->phy_lane_ctl)
 		rmw_clear(PHY_LANE_CTL_CFGACC, port->phy + pcie->hw->phy_lane_ctl);
 
+	if (pcie->hw->refbuf_off) {
+		rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+		udelay(1);
+	}
+
 	rmw_set(PHY_LANE_CFG_REFCLKEN, port->phy + PHY_LANE_CFG);
 
 	if (pcie->hw->port_refclk)
@@ -1634,6 +1665,17 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		return ret;
 	for (u32 idx = 0; idx < num_aux_resets; idx++)
 		gpiod_set_value_cansleep(aux_reset[idx], 0);
+
+	if (pcie->hw->pipe_rst) {
+		ret = readl_relaxed_poll_timeout(port->base + PORT_T8152_PIPE_RST_STS,
+						 stat, stat & PORT_T8152_PIPE_RST_STS_LANES,
+						 1, 20000);
+		if (ret < 0) {
+			dev_err(pcie->dev, "port %pOF lanes stuck in PIPE reset\n", np);
+			return ret;
+		}
+		rmw_clear(PORT_T8152_PIPE_RST, port->base + pcie->hw->port_perst);
+	}
 
 	/* Wait for 100ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
 	msleep(100);
@@ -3941,6 +3983,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t6000-pciec",	.data = &t8112_pciec_hw },
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
+	{ .compatible = "apple,t8152-pcie",	.data = &t8152_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },

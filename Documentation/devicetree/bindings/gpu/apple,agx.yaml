@@ -22,6 +22,12 @@ properties:
           - apple,agx-t8132
           - apple,agx-t8140
       - items:
+          - const: apple,agx-t8103
+          - const: apple,agx-g13g
+      - items:
+          - const: apple,agx-t8112
+          - const: apple,agx-g14g
+      - items:
           - enum:
               - apple,agx-g13c
               - apple,agx-g13d
