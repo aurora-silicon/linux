@@ -42,11 +42,6 @@
 #include <asm/sections.h>
 #include <asm/virt.h>
 
-/* Window granularity when the base is derived rather than given. */
-#define CTXR_WINDOW_ALIGN	SZ_2M
-/* Default size if only "ctxr_exec_window" with no value is given. */
-#define CTXR_WINDOW_DEFAULT	SZ_128M
-
 static phys_addr_t ctxr_base __initdata;
 static phys_addr_t ctxr_size __initdata;
 static bool ctxr_enforce __initdata = true;
@@ -73,53 +68,50 @@ static int ctxr_nr_free __initdata;
 /* From the command line. A size of 0 means none was given. */
 static phys_addr_t ctxr_cmd_base __initdata;
 static phys_addr_t ctxr_cmd_size __initdata;
-static int ctxr_cmd_enforce __initdata = -1;
 
-/* ctxr_exec_window=[<size>[@<base>]]: with no size, the default one. */
+/* A page-aligned base and size, neither of them 0, that don't wrap. */
+static bool __init ctxr_window_valid(phys_addr_t base, phys_addr_t size)
+{
+	return base && size && PAGE_ALIGNED(base) && PAGE_ALIGNED(size) &&
+	       base + size > base;
+}
+
+/* ctxr_exec_window=<size>@<base> */
 static int __init ctxr_exec_window_param(char *arg)
 {
-	phys_addr_t base = 0, size = CTXR_WINDOW_DEFAULT;
-	char *p = arg, *end;
+	phys_addr_t base, size;
+	char *p, *end;
 
-	if (p && *p) {
-		size = memparse(p, &end);
-		if (end == p || !size)
-			goto bad;
-		if (*end == '@') {
-			p = end + 1;
-			base = memparse(p, &end);
-			if (end == p)
-				goto bad;
-		}
-		if (*end)
-			goto bad;
-	}
+	if (!arg)
+		goto bad;
+	size = memparse(arg, &end);
+	if (end == arg || *end != '@')
+		goto bad;
+	p = end + 1;
+	base = memparse(p, &end);
+	if (end == p || *end || !ctxr_window_valid(base, size))
+		goto bad;
 
 	ctxr_cmd_base = base;
 	ctxr_cmd_size = size;
 	return 0;
 
 bad:
-	pr_warn("ignoring ctxr_exec_window=%s\n", arg);
+	pr_warn("ignoring ctxr_exec_window=%s\n", arg ?: "");
 	return 0;
 }
 early_param("ctxr_exec_window", ctxr_exec_window_param);
 
 static int __init ctxr_exec_enforce_param(char *arg)
 {
-	bool enforce;
-
-	if (kstrtobool(arg, &enforce))
+	if (kstrtobool(arg, &ctxr_enforce))
 		pr_warn("ignoring ctxr_exec_enforce=%s\n", arg ?: "");
-	else
-		ctxr_cmd_enforce = enforce;
 	return 0;
 }
 early_param("ctxr_exec_enforce", ctxr_exec_enforce_param);
 
-/* 1 for a window, 0 for none, -EINVAL for one that can't be read. */
-static int __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
-				bool *enforce)
+/* 1 for a window, 0 for none, -EINVAL for one that can't be used as given. */
+static int __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size)
 {
 	unsigned long chosen;
 	const __be32 *prop;
@@ -138,15 +130,7 @@ static int __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
 
 	*base = ((u64)be32_to_cpu(prop[0]) << 32) | be32_to_cpu(prop[1]);
 	*size = ((u64)be32_to_cpu(prop[2]) << 32) | be32_to_cpu(prop[3]);
-	if (!*size || !PAGE_ALIGNED(*base) || !PAGE_ALIGNED(*size) ||
-	    *base + *size < *base)
-		return -EINVAL;
-
-	prop = of_get_flat_dt_prop(chosen, "aurora,ctxr-exec-enforce", &len);
-	if (prop && len == sizeof(__be32))
-		*enforce = !!be32_to_cpu(prop[0]);
-
-	return 1;
+	return ctxr_window_valid(*base, *size) ? 1 : -EINVAL;
 }
 
 /* Returns how much the pool would get, in whole pages. */
@@ -180,23 +164,11 @@ static phys_addr_t __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
 }
 
 /* Reserve a window. False, with the reason logged, if it can't work. */
-static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size, bool enforce)
+static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size)
 {
 	phys_addr_t img_start = __pa_symbol(_text), img_end = __pa_symbol(_end);
 	phys_addr_t dram_start = memblock_start_of_DRAM();
 	phys_addr_t dram_end = memblock_end_of_DRAM();
-
-	if (!base) {
-		/*
-		 * No base given: anchor the window on the image. If that would run
-		 * past the end of DRAM (the image is within @size of the top), slide
-		 * it down so it ends at DRAM's end while still covering the image.
-		 */
-		base = round_down(img_start, CTXR_WINDOW_ALIGN);
-		if (base + size > dram_end && dram_end - dram_start >= size)
-			base = max(round_down(dram_end - size, CTXR_WINDOW_ALIGN),
-				   round_up(dram_start, CTXR_WINDOW_ALIGN));
-	}
 
 	if (img_start < base || img_end > base + size) {
 		pr_err("kernel image [%pa, %pa) does not fit window [%pa, +%llu MiB)\n",
@@ -236,12 +208,11 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size, bool enfor
 
 	ctxr_base = base;
 	ctxr_size = size;
-	ctxr_enforce = enforce;
 	ctxr_active = true;
 
 	pr_info("reserved exec window [%pa, +%llu MiB), %s\n",
 		&base, (unsigned long long)(size >> 20),
-		enforce ? "enforcing" : "reporting");
+		ctxr_enforce ? "enforcing" : "reporting");
 	return true;
 }
 
@@ -273,15 +244,11 @@ bool __init ctxr_exec_secondaries_held(void)
 void __init ctxr_exec_reserve(void)
 {
 	phys_addr_t base = 0, size = 0;
-	bool enforce = true;
-	int dt = ctxr_parse_dt(&base, &size, &enforce);
-
-	if (ctxr_cmd_enforce >= 0)
-		enforce = ctxr_cmd_enforce;
+	int dt = ctxr_parse_dt(&base, &size);
 
 	/* A bad override leaves the machine as its bootloader described it. */
 	if (ctxr_cmd_size) {
-		if (ctxr_establish(ctxr_cmd_base, ctxr_cmd_size, enforce))
+		if (ctxr_establish(ctxr_cmd_base, ctxr_cmd_size))
 			return;
 		pr_warn("ignoring ctxr_exec_window=\n");
 	}
@@ -292,7 +259,7 @@ void __init ctxr_exec_reserve(void)
 		ctxr_hold_secondaries("malformed aurora,ctxr-exec-window");
 	else if (!is_kernel_in_hyp_mode())
 		ctxr_hold_secondaries("window given but the kernel is not at EL2");
-	else if (!ctxr_establish(base, size, enforce))
+	else if (!ctxr_establish(base, size))
 		ctxr_hold_secondaries("unusable window");
 }
 

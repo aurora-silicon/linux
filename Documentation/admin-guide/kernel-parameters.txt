@@ -1139,10 +1139,10 @@ Kernel parameters
 			Kconfig option.
 
 	ctxr_exec_enforce=
-			[ARM64,EARLY] Whether code outside the CTXR executable
-			window is fatal. Applies to a window from the device
-			tree or from ctxr_exec_window=, and overrides
-			aurora,ctxr-exec-enforce in the device tree.
+			[ARM64,EARLY] Whether executable code that the boot-time
+			check finds outside the CTXR executable window is
+			fatal. Applies to a window from the device tree or
+			from ctxr_exec_window=.
 			Format: <bool>
 			Default: 1
 
@@ -1156,8 +1156,7 @@ Kernel parameters
 			for bring-up and VMs. A value that doesn't parse, or a
 			window that can't work, is ignored with a warning.
 			See Documentation/arch/arm64/ctxr-execmem.rst.
-			Format: [<size>[KMG][@<base>[KMG]]]
-			Default size: 128M. Default base: from the kernel image.
+			Format: <size>[KMG]@<base>[KMG]
 
 	dasd=		[HW,NET]
 			See header of drivers/s390/block/dasd_devmap.c.

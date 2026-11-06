@@ -32,19 +32,11 @@ properties:
     description: The physical window the kernel's executable code has to stay in.
     items:
       - description:
-          Physical base of the window. Zero tells the kernel to anchor the
-          window on its own image.
-      - description: Size of the window in bytes.
-
-  aurora,ctxr-exec-enforce:
-    $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [0, 1]
-    description:
-      One if code outside the window is fatal, zero if the kernel only reports
-      it. A window with no such property is enforcing.
-
-dependentRequired:
-  aurora,ctxr-exec-enforce: [ aurora,ctxr-exec-window ]
+          Physical base of the window, not zero and aligned to the kernel's
+          page size.
+      - description:
+          Size of the window in bytes, not zero and aligned to the kernel's
+          page size.
 
 additionalProperties: true
 ...
