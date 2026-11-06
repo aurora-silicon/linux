@@ -25,6 +25,13 @@
 /* Failed tries to sleep before it waits for the next access */
 #define SN201202X_SLEEP_TRIES		3
 
+#define SN201202X_REG_LDCM_STATUS	0x74
+#define SN201202X_LDCM_DETECTED		BIT(2)
+#define SN201202X_LDCM_STATE		GENMASK(3, 1)
+#define SN201202X_LDCM_STATE_IDLE	0
+#define SN201202X_LDCM_RESULT		GENMASK(5, 4)
+#define SN201202X_LDCM_RETRY_MS		500
+
 static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 {
 	int err;
@@ -248,6 +255,78 @@ VISIBLE_IF_KUNIT const struct regmap_bus regmap_sn201202x = {
 };
 EXPORT_SYMBOL_IF_KUNIT(regmap_sn201202x);
 
+VISIBLE_IF_KUNIT enum typec_contaminant
+sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN])
+{
+	if (FIELD_GET(SN201202X_LDCM_STATE, status[1]) !=
+	    SN201202X_LDCM_STATE_IDLE)
+		return TYPEC_CONTAMINANT_UNKNOWN;
+
+	if ((status[0] & SN201202X_LDCM_DETECTED) &&
+	    (status[1] & SN201202X_LDCM_RESULT))
+		return TYPEC_CONTAMINANT_LIQUID;
+
+	return TYPEC_CONTAMINANT_NONE;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_decode);
+
+static int sn201202x_ldcm_update(struct tps6598x *tps)
+{
+	u8 status[SN201202X_LDCM_STATUS_LEN];
+	enum typec_contaminant contaminant;
+	int ret;
+
+	ret = tps6598x_block_read(tps, SN201202X_REG_LDCM_STATUS, status,
+				  sizeof(status));
+	contaminant = ret ? TYPEC_CONTAMINANT_UNKNOWN :
+			      sn201202x_ldcm_decode(status);
+	typec_set_contaminant(tps->port, contaminant);
+	tps->contaminant = contaminant;
+
+	if (ret)
+		return ret;
+	return contaminant == TYPEC_CONTAMINANT_UNKNOWN ? -EAGAIN : 0;
+}
+
+static void sn201202x_ldcm_work(struct work_struct *work)
+{
+	struct sn201202x *sn = container_of(to_delayed_work(work),
+					  struct sn201202x, ldcm_work);
+	struct tps6598x *tps = &sn->cd.tps;
+	int ret;
+
+	mutex_lock(&tps->lock);
+	ret = sn201202x_ldcm_update(tps);
+	/* Re-read cable state after the liquid event which this worker consumed. */
+	mod_delayed_work(system_freezable_wq, &sn->cd.resume_work, 0);
+	mutex_unlock(&tps->lock);
+
+	if (ret) {
+		dev_err_ratelimited(tps->dev,
+				    "liquid-detection status unavailable: %d\n", ret);
+		mod_delayed_work(system_freezable_wq, &sn->ldcm_work,
+				 msecs_to_jiffies(SN201202X_LDCM_RETRY_MS));
+	}
+}
+
+static void sn201202x_ldcm_event(struct tps6598x *tps)
+{
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	mod_delayed_work(system_freezable_wq, &sn->ldcm_work, 0);
+}
+
+static void sn201202x_ldcm_stop(struct tps6598x *tps)
+{
+	cancel_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
+}
+
+static const struct tipd_contaminant_ops sn201202x_contaminant_ops = {
+	.update = sn201202x_ldcm_update,
+	.event = sn201202x_ldcm_event,
+	.stop = sn201202x_ldcm_stop,
+};
+
 static struct regmap *__devm_regmap_init_sn201202x(struct spmi_device *sdev,
 						   const struct regmap_config *config,
 						   struct lock_class_key *lock_key,
@@ -441,7 +520,7 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_sleep_links);
 static bool sn201202x_sleep_event(struct tps6598x *tps)
 {
 	struct sn201202x *sn = tps_to_sn(tps);
-	struct cd321x_sleep_state st;
+	struct cd321x_sleep_state st = {};
 	u32 links = 0;
 	bool wake;
 	int ret;
@@ -456,7 +535,7 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 		ret = cd321x_sleep_events(tps, &st);
 	if (!ret)
 		links = sn201202x_sleep_links(&st);
-	wake = ret || (links & ~sn->sleep_links);
+	wake = ret || st.contaminant_event || (links & ~sn->sleep_links);
 	if (!ret)
 		sn->sleep_links = links;
 	spmi_command_sleep(sn->sdev);
@@ -480,7 +559,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	match = of_match_device(sn201202x_of_match, &device->dev);
 	if (!match)
 		return -EINVAL;
-	data = tipd_hw_variants[(enum tipd_hw_variant)match->data];
+	data = tipd_hw_variants[(enum tipd_hw_variant)(uintptr_t)match->data];
 
 	/*
 	 * tipd_init() defers until the connector's USB role switch (the dwc3)
@@ -507,6 +586,8 @@ static int sn201202x_probe(struct spmi_device *device)
 	mutex_init(&tps->lock);
 	tps->dev = &device->dev;
 	tps->data = data;
+	tps->contaminant_ops = &sn201202x_contaminant_ops;
+	INIT_DELAYED_WORK(&sn->ldcm_work, sn201202x_ldcm_work);
 
 	init_completion(&sn->select_completion);
 	init_completion(&sn->sleep_completion);
@@ -569,9 +650,11 @@ static int sn201202x_probe(struct spmi_device *device)
 
 	ret = tipd_init(tps);
 	if (ret) {
+		cancel_delayed_work_sync(&sn->ldcm_work);
 		spmi_command_sleep(device);
 		return ret;
 	}
+	sn201202x_ldcm_event(tps);
 
 	/* Events can latch before the IRQ is registered. Consume that state now. */
 	tps->data->irq_handler(tps->irq, tps);
@@ -690,11 +773,28 @@ out_put:
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
 
+static int sn201202x_prepare(struct device *dev)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+
+	cancel_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
+	return tipd_prepare(dev);
+}
+
+static void sn201202x_complete(struct device *dev)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+
+	/* Restore the detector snapshot before cable revalidation is thawed. */
+	tps->contaminant_ops->event(tps);
+	tipd_complete(dev);
+}
+
 MODULE_DEVICE_TABLE(of, sn201202x_of_match);
 
 static const struct dev_pm_ops sn201202x_pm_ops = {
-	.prepare = pm_sleep_ptr(tipd_prepare),
-	.complete = pm_sleep_ptr(tipd_complete),
+	.prepare = pm_sleep_ptr(sn201202x_prepare),
+	.complete = pm_sleep_ptr(sn201202x_complete),
 	SET_SYSTEM_SLEEP_PM_OPS(sn201202x_suspend, sn201202x_resume)
 	SET_RUNTIME_PM_OPS(sn201202x_runtime_suspend, sn201202x_runtime_resume, NULL)
 };

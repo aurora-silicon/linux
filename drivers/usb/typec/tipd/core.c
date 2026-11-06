@@ -1640,8 +1640,11 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 			dev_err(tps->dev, "controller setup recovery exhausted: %d\n", ret);
 		return ret;
 	}
-	if (ret)
+	if (ret) {
 		dev_warn(tps->dev, "restored controller power state and interrupt mask\n");
+		if (tps->contaminant_ops)
+			tps->contaminant_ops->event(tps);
+	}
 	/* Only a fresh snapshot may be applied after restoring the controller. */
 	cd321x->state_valid = false;
 	cd321x->pm.phase = CD321X_PM_REVALIDATE;
@@ -1672,11 +1675,13 @@ int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st)
 
 	lockdep_assert_held(&tps->lock);
 	st->usb_comm = false;
+	st->contaminant_event = false;
 	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
 	if (!ret && event)
 		ret = tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
 	if (ret)
 		return ret;
+	st->contaminant_event = event & SN201202X_INT_LDCM_UPDATE;
 	/* A controller that was reset is set up again on resume */
 	cd321x_check_setup(container_of(tps, struct cd321x, tps), event);
 
@@ -1722,6 +1727,10 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	}
 	if (cd321x_check_setup(container_of(tps, struct cd321x, tps), event) < 0)
 		goto err_unlock;
+	if (event & SN201202X_INT_LDCM_UPDATE && tps->contaminant_ops) {
+		tps->contaminant_ops->event(tps);
+		goto err_unlock;
+	}
 
 	if (!tps6598x_read_status(tps, &status))
 		goto err_lost;
@@ -2059,6 +2068,7 @@ tps6598x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	typec_cap.driver_data = tps;
 	typec_cap.ops = &tps6598x_ops;
 	typec_cap.fwnode = fwnode;
+	typec_cap.contaminant_detection = !!tps->contaminant_ops;
 
 	switch (TPS_SYSCONF_PORTINFO(conf)) {
 	case TPS_PORTINFO_SINK_ACCESSORY:
@@ -2988,6 +2998,15 @@ int tipd_init(struct tps6598x *tps)
 		goto err_mux_put;
 	}
 
+	if (tps->contaminant_ops) {
+		ret = tps->contaminant_ops->update(tps);
+		if (ret) {
+			dev_warn(tps->dev,
+				 "connector contaminant state unavailable: %d\n", ret);
+			ret = 0;
+		}
+	}
+
 	if (status & TPS_STATUS_PLUG_PRESENT) {
 		ret = -EINVAL;
 		if (!tps->data->read_power_status(tps))
@@ -3071,6 +3090,8 @@ void tipd_remove(struct tps6598x *tps)
 		cancel_delayed_work_sync(&tps->wq_poll);
 	else
 		devm_free_irq(tps->dev, tps->irq, tps);
+	if (tps->contaminant_ops)
+		tps->contaminant_ops->stop(tps);
 
 	if (tps->data->remove)
 		ret = tps->data->remove(tps);
@@ -3253,7 +3274,8 @@ static const struct tipd_data tipd_sn201202x_data = {
 	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
 		     APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
 		     APPLE_CD_REG_INT_PLUG_EVENT |
-		     SN201202X_INT_DP_SID_UPDATE,
+		     SN201202X_INT_DP_SID_UPDATE |
+		     SN201202X_INT_LDCM_UPDATE,
 	.tps_struct_size = sizeof(struct sn201202x),
 	.remove = cd321x_remove,
 	.register_port = cd321x_register_port,

@@ -644,6 +644,43 @@ static void sn201202x_sleep_links_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sn201202x_sleep_links(&dp), TPS_DATA_STATUS_DP_CONNECTION);
 }
 
+static void sn201202x_ldcm_dry_test(struct kunit *test)
+{
+	u8 status[SN201202X_LDCM_STATUS_LEN] = {};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_NONE);
+}
+
+static void sn201202x_ldcm_liquid_test(struct kunit *test)
+{
+	u8 status[SN201202X_LDCM_STATUS_LEN] = {};
+
+	status[0] = BIT(2);
+	status[1] = BIT(4);
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_LIQUID);
+
+	status[0] = 0;
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_NONE);
+	status[0] = BIT(2);
+	status[1] = 0;
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_NONE);
+}
+
+static void sn201202x_ldcm_busy_test(struct kunit *test)
+{
+	u8 status[SN201202X_LDCM_STATUS_LEN] = {
+		[0] = BIT(2),
+		[1] = BIT(1) | BIT(4),
+	};
+
+	KUNIT_EXPECT_EQ(test, sn201202x_ldcm_decode(status),
+			TYPEC_CONTAMINANT_UNKNOWN);
+}
+
 static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_sleep_cycle_test),
 	KUNIT_CASE(sn201202x_failed_wakeup_test),
@@ -651,6 +688,9 @@ static struct kunit_case sn201202x_pm_cases[] = {
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_test),
 	KUNIT_CASE(sn201202x_unconfirmed_sleep_failed_wakeup_test),
 	KUNIT_CASE(sn201202x_sleep_links_test),
+	KUNIT_CASE(sn201202x_ldcm_dry_test),
+	KUNIT_CASE(sn201202x_ldcm_liquid_test),
+	KUNIT_CASE(sn201202x_ldcm_busy_test),
 	KUNIT_CASE(sn201202x_idle_sleep_test),
 	KUNIT_CASE(sn201202x_atomic_access_test),
 	KUNIT_CASE(sn201202x_idle_sleep_retry_test),
