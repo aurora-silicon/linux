@@ -679,6 +679,15 @@ struct SepData {
     match_context: Mutex<Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
     match_context_generation: Atomic<u32>,
 
+    // Every live cold-match credential: the SCRD contexts that a flags-0
+    // verification of the designated bag satisfied (two per boot: before and
+    // after the Catacomb restore). Nothing deleted them, so a password re-arm
+    // added a new one beside the old ones while the old ones stayed live, and
+    // only a restart of the enclave dropped them. A re-arm now retires them
+    // all before it sets up the new one, as a restart does.
+    #[pin]
+    cold_match_contexts: Mutex<KVec<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
+
     // The sensor stayed powered and registered after the last verify, so the
     // next verify captures without a new bring-up, as macOS does. Cleared by
     // anything that powers the sensor off or resets it.
@@ -994,6 +1003,7 @@ impl SepData {
                 enrol_material <- new_mutex!(None),
                 match_context <- new_mutex!(None),
                 match_context_generation: Atomic::new(0),
+                cold_match_contexts <- new_mutex!(KVec::new()),
                 sensor_kept: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
                 persistence_owed: Atomic::new(false),
@@ -2097,8 +2107,45 @@ impl SepData {
             Some(acm_handle)
         })();
         let ok = established.is_some();
-        dev_info!(self.dev, "scrd: cold-match credential established {}\n", ok);
+        let live = match established {
+            Some(handle) => {
+                let mut contexts = self.cold_match_contexts.lock();
+                if contexts.push(handle, GFP_KERNEL).is_err() {
+                    dev_warn!(self.dev, "scrd: could not track the new cold-match credential\n");
+                }
+                contexts.len()
+            }
+            None => self.cold_match_contexts.lock().len(),
+        };
+        dev_info!(self.dev, "scrd: cold-match credential established {} ({} live)\n", ok, live);
         ok
+    }
+
+    /// Deletes every cold-match credential this boot set up. Returns how many
+    /// the enclave deleted and how many it refused. Logs counts only.
+    pub(crate) fn retire_cold_match_contexts(&self) -> (usize, usize) {
+        let old = core::mem::replace(&mut *self.cold_match_contexts.lock(), KVec::new());
+        let (mut deleted, mut refused) = (0usize, 0usize);
+        for handle in old.iter() {
+            match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
+                Some((0, _)) => deleted += 1,
+                other => {
+                    refused += 1;
+                    dev_warn!(
+                        self.dev,
+                        "scrd: deleting a cold-match credential answered {:?}\n",
+                        other.map(|(status, _)| status)
+                    );
+                }
+            }
+        }
+        dev_info!(
+            self.dev,
+            "scrd: retired {} cold-match credential(s), {} refused\n",
+            deleted,
+            refused
+        );
+        (deleted, refused)
     }
 
     /// Opens the evaluation one verify matches under: a fresh tracked

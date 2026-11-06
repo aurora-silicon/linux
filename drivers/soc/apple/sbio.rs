@@ -4458,6 +4458,35 @@ impl SepData {
         // one is carried over.
         *self.match_context.lock() = None;
         let _ = self.handle_bg_ops(c"at a password re-arm");
+        // The password verification alone leaves matching refused: the old
+        // cold-match credentials stay live until a restart of the enclave,
+        // and a restart is the only thing that has ever ended the refusal.
+        // Redo what a restart's cold-match preparation does, without the
+        // Catacomb loads: retire every cold-match credential, unlock the
+        // designated bag with its secret, and set up one new credential.
+        let (deleted, refused) = self.retire_cold_match_contexts();
+        let unlocked = self.unlock_special_bag();
+        if !self.establish_scrd_match_context(user) {
+            dev_err!(
+                self.dev,
+                "Touch ID: re-arm: no new cold-match credential after retiring {} ({} refused); Touch ID stays locked\n",
+                deleted,
+                refused
+            );
+            return None;
+        }
+        dev_info!(
+            self.dev,
+            "Touch ID: re-arm: cold-match preparation redone (retired {}, refused {}, special unlock {}, new credential true)\n",
+            deleted,
+            refused,
+            unlocked
+        );
+        // Bring the sensor up from a power cycle for the next verify, as
+        // after a restart.
+        let _ = sensor::idle();
+        self.sensor_kept.store(false, Relaxed);
+        sensor::power(false);
         if !self.save_lockout() {
             dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
         }
