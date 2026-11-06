@@ -37,6 +37,7 @@ properties:
               - apple,t6000-asc-mailbox
               - apple,t6020-asc-mailbox
               - apple,t6030-asc-mailbox
+              - apple,t6031-asc-mailbox
               - apple,t6041-asc-mailbox
           - const: apple,asc-mailbox-v4
 
@@ -61,6 +62,7 @@ properties:
           M3 GPU ASC mailboxes with no generic mailbox fallback. This keeps
           older kernels from binding before the GPU handoff is supported.
         enum:
+          - apple,t6030-agx-asc-mailbox
           - apple,t6031-agx-asc-mailbox
           - apple,t8122-agx-asc-mailbox
 
