@@ -20,7 +20,7 @@
 	#size-cells = <2>;
 	interrupt-parent = <&aic>;
 
-	/* Request the m1n1 RAM-only handoff, without PCIe/DAPF setup. */
+	/* Retain the RAM handoff and secondary CPU park contract. */
 	aurora,minimal-boot;
 
 	aliases {
@@ -282,3 +282,4 @@
 };
 
 #include "t8152-j873-gpu.dtsi"
+#include "t8152-j873-n1.dtsi"
