@@ -547,7 +547,7 @@ impl Completion {
     /// A firmware restart listed this command in its recovery table: it was in
     /// flight, so it may have run partly. Its stamps and completion record may
     /// still look like success. Unless a replay republishes it from the start,
-    /// it fails and the failure is always reported to the client.
+    /// it fails: its fence carries ECANCELED, and only a guilty VM is poisoned.
     pub(crate) fn note_interrupted(&self) {
         self.interrupted.store(true, Ordering::Release);
     }
@@ -563,12 +563,13 @@ impl Completion {
         (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
     }
 
-    /// ECANCELED stays silent only for work that was never interrupted (closed
-    /// or cancelled by its owner); every other failure reaches the client.
+    /// A non-poisoning ECANCELED or ENODATA (work a recovery discarded or dropped) stays out of
+    /// the VM status, as the UAPI documents for work another VM's recovery discarded:
+    /// Honeykrisp reads any status error as a lost device. Every other failure reaches the client.
     fn report(&self, error: Error) {
         if self.poisons(error) {
             self.status.record(error);
-        } else if error != ECANCELED || self.interrupted() {
+        } else if !discarded(error) {
             self.status.report_failure(error);
         }
     }
@@ -631,6 +632,11 @@ impl Completion {
         drop(lease);
     }
 
+    /// Whether the command still holds its VM pin: firmware may still own or replay it.
+    pub(crate) fn retains_vm(&self) -> bool {
+        self.vm_job.lock().is_some()
+    }
+
     fn release_healthy(&self) {
         if let Some(sources) = &self.sources {
             sources.release();
@@ -689,7 +695,9 @@ impl Completion {
             return;
         }
         self.status.record_if_device_loss(error);
-        if self.accepted.load(Ordering::Acquire) {
+        // As in complete(): a cancellation is not this client's device loss. A guilty VM
+        // already carries its own sticky error.
+        if self.accepted.load(Ordering::Acquire) && error != ECANCELED {
             self.status.report_failure(error);
         }
         self.release_healthy();
@@ -708,13 +716,20 @@ impl Completion {
             guard.quarantine();
         }
         if self.spared() {
-            self.status.report_failure(error);
+            if !discarded(error) {
+                self.status.report_failure(error);
+            }
         } else {
             self.report(error);
         }
         self.signal_terminal(Err(error));
         self.output.finish(Err(error));
     }
+}
+
+/// The errors of work a recovery discarded (ECANCELED) or dropped before it ran (ENODATA).
+fn discarded(error: Error) -> bool {
+    error == ECANCELED || error == ENODATA
 }
 
 /// Collected under the device mutex and executed only after releasing it.

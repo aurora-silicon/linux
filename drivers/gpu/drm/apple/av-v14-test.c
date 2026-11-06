@@ -29,9 +29,11 @@ struct av_v14_test {
 	bool successor_during_release;
 	u32 link_status;
 	u8 link_body[64];
+	bool replace_during_prepare;
 };
 
 static struct av_v14_test *av_v14_current;
+static void av_v14_replace(struct av_v14_test *t);
 
 static int av_v14_call(struct apple_epic_service *srv, u32 command, const void *body,
 		       size_t body_len, size_t body_pad, void *reply, size_t reply_len)
@@ -50,6 +52,10 @@ static int av_v14_call(struct apple_epic_service *srv, u32 command, const void *
 	if (body_len == sizeof(t->link_body)) {
 		memcpy(t->link_body, body, body_len);
 		put_unaligned_le32(t->link_status, reply + 48);
+		if (command == t->asrv->cmds.prepare && t->replace_during_prepare) {
+			t->replace_during_prepare = false;
+			av_v14_replace(t);
+		}
 	}
 	return 0;
 }
@@ -58,8 +64,6 @@ static void av_v14_card_disconnect(struct platform_device *pdev)
 {
 	av_v14_current->disconnects++;
 }
-
-static void av_v14_replace(struct av_v14_test *t);
 
 static void av_v14_release_link(struct platform_device *pdev, const u64 *gen)
 {
@@ -304,7 +308,9 @@ static void av_v14_link_instance(struct kunit *test)
 	old = t->asrv->gen;
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, old));
+	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_live(t->dcp->dev));
 	av_v14_replace(t);
+	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_live(t->dcp->dev));
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
 	KUNIT_ASSERT_EQ(test, t->ncalls, 3U);
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_STOP, &cookie), -ENODEV);
@@ -315,8 +321,66 @@ static void av_v14_link_instance(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
 	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
+	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_live(t->dcp->dev));
 	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE, &cookie), 0);
 	KUNIT_EXPECT_EQ(test, t->ncalls, 5U);
+}
+
+static void av_v14_prepare_rejects_unpublished_open(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	struct dcp_sound_cookie cookie = {};
+
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	av_v14_replace(t);
+	/* Same slot and pointer, but the PCM still owns the old instance. */
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie),
+			-ENODEV);
+	KUNIT_EXPECT_EQ(test, t->ncalls, 1U);
+	KUNIT_EXPECT_EQ(test, t->asrv->link_gen, 0ULL);
+}
+
+static void av_v14_prepare_replaced_during_reply(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	struct dcp_sound_cookie cookie = {};
+
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	t->replace_during_prepare = true;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie),
+			-ENODEV);
+	KUNIT_EXPECT_EQ(test, t->ncalls, 2U);
+	KUNIT_EXPECT_EQ(test, t->asrv->link_gen, 0ULL);
+}
+
+static void av_v14_failed_prepare_does_not_own_link(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	struct dcp_sound_cookie cookie = {};
+
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	t->link_status = 0xe00002ea;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie),
+			-EIO);
+	KUNIT_EXPECT_EQ(test, t->ncalls, 2U);
+	KUNIT_EXPECT_EQ(test, t->asrv->link_gen, 0ULL);
+}
+
+static void av_v14_failed_reprepare_drops_owner(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	struct dcp_sound_cookie cookie = {};
+	u64 gen;
+
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	gen = t->asrv->gen;
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
+	KUNIT_ASSERT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE, &cookie), 0);
+	t->link_status = 0xe00002ea;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie),
+			-EIO);
+	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, gen));
+	KUNIT_EXPECT_EQ(test, t->asrv->link_gen, 0ULL);
 }
 
 /* A Terminate from an instance that is not the published one does nothing. */
@@ -403,6 +467,10 @@ static struct kunit_case av_v14_cases[] = {
 	KUNIT_CASE_PARAM(av_v14_successor_during_release, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_v14_terminate_after_successor, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_v14_link_instance, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_prepare_rejects_unpublished_open, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_prepare_replaced_during_reply, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_failed_prepare_does_not_own_link, av_native_gen_params),
+	KUNIT_CASE_PARAM(av_v14_failed_reprepare_drops_owner, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_v14_terminate_unpublished, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_native_link_payload_status, av_native_gen_params),
 	KUNIT_CASE_PARAM(av_desktop_service_admission, av_native_gen_params),

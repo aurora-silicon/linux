@@ -8,6 +8,8 @@
 struct dcp_panel_adt {
 	struct dcp_display_metadata identity;
 	u32 width_mm, height_mm;
+	/* /backlight EDRPotentialHeadroom, 16.16; 0 if absent */
+	u32 edr_potential_headroom;
 	bool found;
 };
 

@@ -536,7 +536,6 @@
 		label = "fab4_soc";
 		power-domains = <&ps_afc>;
 		apple,always-on;
-		status = "disabled";
 	};
 
 	ps_sio_cpu: power-controller@130 {
@@ -1057,7 +1056,6 @@
 		#reset-cells = <0>;
 		label = "ane_sys";
 		power-domains = <&ps_fab5_soc>, <&ps_fab4_soc>;
-		status = "disabled";
 	};
 
 };
@@ -1835,7 +1833,6 @@
 		label = "fab5_soc";
 		power-domains = <&ps_afi>;
 		apple,always-on;
-		status = "disabled";
 	};
 
 	ps_sbr: power-controller@448 {
@@ -1949,7 +1946,6 @@
 		#reset-cells = <0>;
 		label = "ane_mpm";
 		power-domains = <&ps_ane_sys>;
-		status = "disabled";
 	};
 
 	ps_ane_cpu: power-controller@8 {
@@ -1959,7 +1955,6 @@
 		#reset-cells = <0>;
 		label = "ane_cpu";
 		power-domains = <&ps_ane_sys>;
-		status = "disabled";
 	};
 
 	ps_ane_td: power-controller@10 {
@@ -1969,7 +1964,6 @@
 		#reset-cells = <0>;
 		label = "ane_td";
 		power-domains = <&ps_ane_sys>;
-		status = "disabled";
 	};
 
 	ps_ane_base: power-controller@18 {
@@ -1979,7 +1973,6 @@
 		#reset-cells = <0>;
 		label = "ane_base";
 		power-domains = <&ps_ane_td>;
-		status = "disabled";
 	};
 };
 

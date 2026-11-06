@@ -69,7 +69,10 @@
 		reg-names = "asc", "sgx";
 		mboxes = <&agx_mbox>;
 		power-domains = <&ps_gfx>;
+		/* G16 is admitted on non-coherent DMA only. */
+		dma-noncoherent;
 		apple,pmp = <&pmp>;
+		apple,clpc = <&clpc>;
 		memory-region = <&gpu_ttbs>, <&gpu_pagetables>, <&gpu_handoff>,
 				<&gpu_shared_l2>, <&gpu_fw_text>, <&gpu_fw_data>;
 		memory-region-names = "ttbs", "pagetables", "handoff",
@@ -80,6 +83,8 @@
 		/* ASCWrap v6 contains the same mailbox aperture used by ASC v4. */
 		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x3 0x02608000 0x0 0x4000>;
+		/* Idle ring-service kicks need not wake the system. */
+		apple,hold-rx-in-sleep;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 994 IRQ_TYPE_LEVEL_HIGH>,
@@ -95,6 +100,8 @@
 &ps_gfx {
 	status = "okay";
 	power-domains = <&gfx_tvm>;
+	/* The G16 firmware stays live across suspend-to-idle. */
+	apple,sleep-retained;
 };
 
 /* The existing report provider owns readiness for shared PMP commands. */

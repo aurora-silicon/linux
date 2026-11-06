@@ -55,6 +55,11 @@ Both devices have a buffer that takes X, Y and Z together, with an optional
 timestamp taken when the report arrives. The reports stop when the system
 goes to sleep and start again, with the calibration resent, when it wakes.
 
+If both devices bind but every raw read returns ``ENODATA``, check the AOP
+core's ``nCal`` boot argument for the SoC. The T6040 firmware accepts the
+calibration and the report interval with ``nCal`` 0, but sends no reports;
+its own default, which the core keeps, is 1.
+
 
 Host regression tests require Python 3 and a Rust compiler::
 

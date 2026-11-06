@@ -15,6 +15,7 @@ struct dcp_m4_profile {
 	u32 swap_nullable;		/* ten nullable surface bytes */
 	u32 swap_tail;			/* final two bytes */
 	u32 swap_nits;			/* binary64 brightness */
+	u32 swap_intent;		/* swap intent, 0 for a present */
 	u32 disabled_color;		/* background with no surface */
 	u16 done_method;		/* swap completion callback */
 	u32 done_size;
@@ -28,6 +29,7 @@ static const struct dcp_m4_profile dcp_m4_profile_j713 = {
 	.panel_width = 2560, .panel_height = 1664, .boot_stride = 10240,
 	.swap_size = 0x1bd8, .swap_surface = 0x588, .swap_dva = 0xe38,
 	.swap_nullable = 0x1bcb, .swap_tail = 0x1bd6, .swap_nits = 0x35e,
+	.swap_intent = 0x17c,
 	.disabled_color = 0xff000000,
 	.done_method = 590, .done_size = 0x730, .open_method = 457,
 	.brightness_max = 500, .brightness_default = 120,

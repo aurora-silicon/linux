@@ -14,9 +14,9 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - [`Driver`] is a separate platform driver. T6030 has a module alias; its probe must wait
-//!   for the native display and PMP supplier before booting firmware. T6031 retains explicit
-//!   module loading. It calls [`crate::driver::AsahiPlatformDriver::probe_g15`].
+//! - [`Driver`] is a separate platform driver with a module alias. Its probe must wait for
+//!   the native display (T6030 and T6031) and the PMP supplier (T6030) before booting
+//!   firmware. It calls [`crate::driver::AsahiPlatformDriver::probe_g15`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
 //! - User VMs are shared-layer [`mmu::Vm`]s on a [`mmu::Uat::new_adopted`] UAT with tracked
@@ -45,6 +45,7 @@
 mod adt;
 mod board;
 mod boot;
+mod retain;
 
 // One admission rule for the generation mappings and shared adopted UAT.
 pub(crate) use boot::glue::memory_mode;
@@ -151,13 +152,15 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
         ),
     ]);
 
-// T6030 probe admission requires the native display and PMP supplier before
-// firmware starts. T6031 retains explicit loading until it has an equivalent
-// display-order admission gate.
+// Probe admission requires the native display before firmware starts (T6030
+// also its PMP supplier), so both may be loaded at device creation.
 kernel::of_device_table!(
     AUTOLOAD_OF_TABLE,
     @none,
-    [of::DeviceId::new(c_str!("apple,agx-t6030"))]
+    [
+        of::DeviceId::new(c_str!("apple,agx-t6030")),
+        of::DeviceId::new(c_str!("apple,agx-t6031")),
+    ]
 );
 
 /// The G15 platform adapter: the shared DRM registration probed through
@@ -226,6 +229,8 @@ static MODULE_READY: AtomicBool = AtomicBool::new(false);
 /// No fallible module initialization may follow this call.
 pub(crate) fn activate() {
     MODULE_READY.store(true, Ordering::Release);
+    // SAFETY: The helper only reads the device tree.
+    unsafe { boot::glue::asahi_g15_report_loader_gpu() };
     // SAFETY: Both pinned platform registrations are fully initialized and remain owned
     // by DriverModule. The C helper borrows their live driver pointer only for this call.
     unsafe { boot::glue::asahi_g15_reprobe() };
@@ -376,7 +381,7 @@ pub(crate) struct Firmware {
     pub(crate) recovery: recovery::Recovery,
     /// Render UMA/PB allocators, their spare set and parameter-buffer growth.
     pub(crate) pools: pools::Pools,
-    /// Live VMs and their exclusive TTBAT slots, and the client aliases of every user VM.
+    /// Live VMs and the client aliases of every user VM.
     pub(crate) vms: Arc<vm::Registry>,
 }
 
@@ -454,17 +459,18 @@ impl Gpu {
             },
             GFP_KERNEL,
         )?;
-        gpu.retain();
+        gpu.retain()?;
         Ok(gpu)
     }
 
     /// Keeps the firmware session and this module alive until reboot.
     ///
-    /// Takes the module reference once. Nothing firmware-reachable is freed on any path: the
+    /// Takes the module reference once; `boot::start` already took it before touching the
+    /// firmware, so this only confirms it. Nothing firmware-reachable is freed on any path: the
     /// RTKit callbacks hold [`Shared`], which holds the [`Firmware`] (or the [`boot::Orphan`] of a
     /// failed start) until reboot.
-    pub(crate) fn retain(&self) {
-        boot::glue::retain_module();
+    pub(crate) fn retain(&self) -> Result {
+        boot::glue::retain_module()
     }
 }
 
@@ -539,7 +545,21 @@ impl Firmware {
                 vms,
             },
         );
-        if let Err(e) = firmware.init_graphs() {
+        let result = firmware.init_graphs().and_then(|_| {
+            if cfg.platform != hw::Platform::AdtWithPmp {
+                return Ok(());
+            }
+            // A report before firmware startup is ACKed without enabling bandwidth scaling.
+            // Reassert it after setup, including the backend's final device control.
+            // SAFETY: This session retains its acknowledged T6030 AGX power vote.
+            let ret = unsafe { boot::glue::asahi_g15_pmp_ready() };
+            if ret == 0 {
+                Ok(())
+            } else {
+                Err(Error::from_errno(ret))
+            }
+        });
+        if let Err(e) = result {
             let Firmware {
                 session,
                 init,

@@ -296,9 +296,29 @@ static void ane_h16_event_rejections_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(&e, 0xa5, sizeof(e)), NULL);
 }
 
+static void ane_h16_execute_flags_test(struct kunit *test)
+{
+	struct ane_h16_execute_buffer buffer = test_buffer();
+	struct ane_h16_execute call = { .key = test_key, .buffers = &buffer, .buffer_count = 1 };
+	u8 *p = kunit_kmalloc(test, 0xca8, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	KUNIT_ASSERT_EQ(test, ane_h16_execute_encode(p, 0xca8, &call), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(p + ANE_H16_EXECUTE_FLAGS), 0U);
+	call.flags = ANE_H16_EXECUTE_FLAG_QUEUED;
+	KUNIT_ASSERT_EQ(test, ane_h16_execute_encode(p, 0xca8, &call), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(p + ANE_H16_EXECUTE_FLAGS), 1U);
+	/* Unknown flag bits are refused and leave the destination untouched. */
+	memset(p, 0xa5, 0xca8);
+	call.flags = BIT(1);
+	KUNIT_EXPECT_EQ(test, ane_h16_execute_encode(p, 0xca8, &call), -EINVAL);
+	KUNIT_EXPECT_EQ(test, p[ANE_H16_EXECUTE_FLAGS], (u8)0xa5);
+}
+
 static struct kunit_case ane_h16_execute_cases[] = {
 	KUNIT_CASE(ane_h16_execute_layout_test),
 	KUNIT_CASE(ane_h16_execute_counts_test),
+	KUNIT_CASE(ane_h16_execute_flags_test),
 	KUNIT_CASE(ane_h16_custom_bar_test),
 	KUNIT_CASE(ane_h16_execute_rejections_test),
 	KUNIT_CASE(ane_h16_bar_rejections_test),

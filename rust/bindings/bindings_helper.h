@@ -31,6 +31,7 @@
 #include <linux/acpi.h>
 #include <linux/gpu_buddy.h>
 #include <drm/drm_auth.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -169,7 +170,7 @@ const u32 BINDINGS_IIO_CHAN_INFO_PROCESSED = IIO_CHAN_INFO_PROCESSED;
 const u32 BINDINGS_IIO_CHAN_INFO_SCALE = IIO_CHAN_INFO_SCALE;
 const u32 BINDINGS_IIO_ANGL = IIO_ANGL;
 const u32 BINDINGS_IIO_LIGHT = IIO_LIGHT;
-const u32 BINDINGS_IIO_CCT = IIO_CCT;
+const u32 BINDINGS_IIO_COLORTEMP = IIO_COLORTEMP;
 const u32 BINDINGS_IIO_ACCEL = IIO_ACCEL;
 const u32 BINDINGS_IIO_ANGL_VEL = IIO_ANGL_VEL;
 const u32 BINDINGS_IIO_TIMESTAMP = IIO_TIMESTAMP;

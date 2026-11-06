@@ -177,8 +177,9 @@ impl Packet {
                         kernel::time::msecs_to_jiffies(10) as isize,
                     )
                 };
+                // An interrupted wait is not a producer failure.
                 if waited < 0 {
-                    return Err(super::dependency::inherited_error(Error::from_errno(waited as i32)));
+                    return Err(Error::from_errno(waited as i32));
                 }
                 if waited > 0 { break; }
             }
@@ -257,7 +258,7 @@ pub(crate) fn fence_status(fence: &Fence) -> i32 {
 fn check_status(fence: &Fence) -> Result {
     let status = fence_status(fence);
     if status < 0 {
-        Err(super::dependency::inherited_error(Error::from_errno(status)))
+        Err(super::dependency::PRODUCER_FAILED)
     } else {
         Ok(())
     }
@@ -401,6 +402,13 @@ pub(crate) struct Fences {
     pub(crate) ready: Fence,
     pub(crate) completed: Fence,
     pub(crate) publication: Option<Arc<super::completion::Publication>>,
+    pub(crate) owner: Arc<Completion>,
+}
+
+impl super::dependency::Retention for Fences {
+    fn retained(&self) -> bool {
+        self.owner.retains_vm()
+    }
 }
 
 impl Fences {
@@ -479,6 +487,6 @@ impl<B: Backend> Scheduler<B> {
             self.backend.count_backlog(&packet);
         }
         job.push();
-        Ok(Fences { ready, completed, publication: host_publication })
+        Ok(Fences { ready, completed, publication: host_publication, owner: packet.completion.clone() })
     }
 }

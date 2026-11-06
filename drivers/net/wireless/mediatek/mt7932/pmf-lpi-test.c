@@ -47,7 +47,16 @@ static void mt_pmf_admission_test(struct kunit *test)
 	request.crypto.n_akm_suites = 2;
 	request.crypto.akm_suites[0] = WLAN_AKM_SUITE_PSK;
 	request.crypto.akm_suites[1] = WLAN_AKM_SUITE_PSK_SHA256;
+	/* AKM 2 takes every MFP request; the AP's RSN decides at admission. */
+	for (i = NL80211_MFP_NO; i <= NL80211_MFP_OPTIONAL; i++) {
+		request.mfp = i;
+		KUNIT_EXPECT_EQ(test, mt7932_connect_auth(&request),
+				WLAN_AKM_SUITE_PSK);
+	}
+	request.mfp = NL80211_MFP_REQUIRED;
+	request.crypto.psk = NULL;
 	KUNIT_EXPECT_LT(test, mt7932_connect_auth(&request), 0);
+	request.crypto.psk = pmk;
 	KUNIT_EXPECT_LT(test,
 			mt7932_connect_admit(pmf_rsn, sizeof(pmf_rsn),
 					     WLAN_AKM_SUITE_PSK_SHA256,
@@ -92,17 +101,45 @@ static void mt_pmf_admission_test(struct kunit *test)
 			mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK_SHA256,
 					     NL80211_MFP_REQUIRED, &pmf),
 			0);
-	ies[19] = 2; /* legacy PSK cannot satisfy required PMF */
+	/* AKM 2 on an MFPC AP: firmware negotiates PMF for every request. */
+	ies[19] = 2;
+	for (i = NL80211_MFP_NO; i <= NL80211_MFP_OPTIONAL; i++) {
+		pmf = false;
+		KUNIT_EXPECT_EQ(test,
+				mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK,
+						     i, &pmf),
+				0);
+		KUNIT_EXPECT_TRUE(test, pmf);
+	}
+	/* AKM 2 on an MFPR AP: PMF is mandatory, so it cannot be refused. */
+	ies[20] |= 64;
+	for (i = NL80211_MFP_REQUIRED; i <= NL80211_MFP_OPTIONAL; i++) {
+		KUNIT_EXPECT_EQ(test,
+				mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK,
+						     i, &pmf),
+				0);
+		KUNIT_EXPECT_TRUE(test, pmf);
+	}
+	KUNIT_EXPECT_LT(test,
+			mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK,
+					     NL80211_MFP_NO, &pmf),
+			0);
+	/* AKM 2 on an AP without MFPC: no PMF, and required cannot join. */
+	ies[20] = 0;
 	KUNIT_EXPECT_LT(test,
 			mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK,
 					     NL80211_MFP_REQUIRED, &pmf),
 			0);
-	KUNIT_EXPECT_EQ(test,
-			mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK,
-					     NL80211_MFP_OPTIONAL, &pmf),
-			0);
-	KUNIT_EXPECT_FALSE(test, pmf);
-	ies[20] |= 64;
+	for (i = NL80211_MFP_NO; i <= NL80211_MFP_OPTIONAL;
+	     i += NL80211_MFP_OPTIONAL) {
+		pmf = true;
+		KUNIT_EXPECT_EQ(test,
+				mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK,
+						     i, &pmf),
+				0);
+		KUNIT_EXPECT_FALSE(test, pmf);
+	}
+	ies[20] = 64; /* MFPR without MFPC stays malformed */
 	KUNIT_EXPECT_LT(test,
 			mt7932_connect_admit(ies, 22, WLAN_AKM_SUITE_PSK,
 					     NL80211_MFP_OPTIONAL, &pmf),
