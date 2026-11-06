@@ -777,12 +777,19 @@ static void dcpib_pd_reset_work(struct work_struct *work)
 	drm_kms_helper_hotplug_event(&dcp->drm);
 }
 
-static void dcpib_swap_stop(void *data)
+void dcpib_kms_stop(struct dcpib *dcp)
 {
-	struct dcpib *dcp = data;
+	if (!dcp->kms_work_ready)
+		return;
 
 	hrtimer_cancel(&dcp->swap_timer);
 	cancel_work_sync(&dcp->swap_work);
+	cancel_work_sync(&dcp->pd_reset_work);
+}
+
+static void dcpib_swap_stop(void *data)
+{
+	dcpib_kms_stop(data);
 }
 
 int dcpib_kms_init(struct dcpib *dcp)
@@ -793,8 +800,10 @@ int dcpib_kms_init(struct dcpib *dcp)
 
 	dcp->pending = -1;
 	INIT_WORK(&dcp->swap_work, dcpib_swap_work);
+	INIT_WORK(&dcp->pd_reset_work, dcpib_pd_reset_work);
 	hrtimer_setup(&dcp->swap_timer, dcpib_swap_timer, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_ABS);
+	dcp->kms_work_ready = true;
 	ret = devm_add_action_or_reset(dcp->dev, dcpib_swap_stop, dcp);
 	if (ret)
 		return ret;
@@ -807,7 +816,6 @@ int dcpib_kms_init(struct dcpib *dcp)
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
-	INIT_WORK(&dcp->pd_reset_work, dcpib_pd_reset_work);
 	dcp->pd_reset_time = jiffies - 61 * HZ;
 
 	drm->mode_config.min_width = 320;
