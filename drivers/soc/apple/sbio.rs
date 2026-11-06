@@ -2027,7 +2027,8 @@ impl SepData {
         // An unfinished template persistence blocks matching until it is done.
         if !self.handle_bg_ops(c"before a verify") || !self.finish_owed_persistence() {
             dev_err!(self.dev, "verify: the catacombs are not persisted after a template update; refusing before the capture\n");
-            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
+            // Not a rejected finger: ask for another try.
+            self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY), token_bytes);
             return;
         }
         let Some(evaluation) = self.open_unlock_evaluation(user) else {
@@ -2074,7 +2075,7 @@ impl SepData {
                 && matches!(outcome, bio::VerifyOutcome::Matched(_))
             {
                 dev_err!(self.dev, "verify: the background result was not handled; not reporting this verify as a match\n");
-                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
         }
         // Keep the sensor up for the next verify unless the sensor itself
@@ -2160,7 +2161,9 @@ impl SepData {
             CaptureWait::Ready(n) => n,
             CaptureWait::Timeout => {
                 dev_warn!(self.dev, "verify: the capture ended without a frame\n");
-                return bio::VerifyOutcome::Failed(ENROL_STATUS_TIMEOUT);
+                // No finger came: nothing was compared, so ask again rather
+                // than report an error.
+                return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
             }
             CaptureWait::Fault(state) => {
                 dev_err!(
@@ -3715,9 +3718,13 @@ impl SepData {
         {
             return false;
         }
+        // macOS appends the master to every template-update save, last, and
+        // does not wait for it to report a pending save of its own: after the
+        // user save it usually reports none. A pair saved without it makes the
+        // next boot's user load cold.
         let master = crate::sbio::CatacombUser::MASTER;
-        if !self.await_save_pending(master) {
-            dev_err!(self.dev, "sbio: template update: the master catacomb never became save-pending\n");
+        if !self.component_state(master).is_some_and(|s| s & crate::sbio::COMPONENT_STATE_ACTIVE != 0) {
+            dev_err!(self.dev, "sbio: template update: the master catacomb is not active\n");
             return false;
         }
         if !self.save_catacomb(master, PRIVATE_TYPE_CATACOMB_MASTER, c"master catacomb after a template update") {
