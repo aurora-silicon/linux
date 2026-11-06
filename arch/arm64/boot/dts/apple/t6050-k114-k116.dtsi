@@ -225,6 +225,7 @@
 		 * out, so the interface stays off until it has been tested.
 		 */
 		kiwi: kiwi {
+			firmware-name = "apple/kiwi/firmware.hidf";
 			status = "disabled";
 		};
 	};
