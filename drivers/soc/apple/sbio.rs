@@ -28,6 +28,13 @@ const LOCKOUT_LOCKED: u32 = 1;
 const SBIO_NOTIFY_LOCK_STATE: u8 = 0x01;
 /// The lock-state bit that is set while the enclave refuses matches.
 const LOCK_STATE_LOCKOUT: u16 = 0x40;
+/// Message tag of the enclave's "background operation result ready" notice.
+/// The host answers it with BG_OPS_RESULT (0x21); until it does, the result
+/// stays queued in the enclave.
+const SBIO_NOTIFY_BG_OPS_READY: u8 = 0x03;
+/// How long a verify waits after its result for that notice.
+const BG_OPS_WAIT_MS: u32 = 1000;
+
 /// How long a re-arm waits for the enclave to announce the cleared state.
 const LOCK_STATE_WAIT_MS: u32 = 1000;
 const LOCK_STATE_POLL_MS: u32 = 10;
@@ -1985,6 +1992,7 @@ impl SepData {
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
             return;
         };
+        self.collect_bg_ops_result(c"before a verify");
         let Some(evaluation) = self.open_unlock_evaluation(user) else {
             dev_err!(
                 self.dev,
@@ -2008,6 +2016,12 @@ impl SepData {
         *self.match_context.lock() = None;
         self.close_unlock_evaluation(&evaluation);
         let _ = sensor::idle();
+        if matches!(
+            outcome,
+            bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch | bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
+        ) {
+            self.await_and_collect_bg_ops(c"after a match result", BG_OPS_WAIT_MS);
+        }
         // Keep the sensor up for the next verify unless the sensor itself
         // failed; then the next verify brings it up from a power cycle.
         if matches!(
@@ -2895,6 +2909,7 @@ impl SepData {
                 self.reconcile_identities();
                 self.log_protected_unlock();
                 self.probe_unlock_evaluation();
+                self.collect_bg_ops_result(c"after the restore");
             }
         } else if !listed {
             dev_warn!(self.dev, "sbio: device-view synchronisation or match policy unavailable\n");
@@ -3402,6 +3417,16 @@ impl SepData {
             self.on_lock_state_notification(msg.msg0);
             return;
         }
+        if marker == SBIO_NOTIFY_BG_OPS_READY {
+            // Collected from process context; this runs in the receive path.
+            dev_info!(self.dev, "sbio: the enclave has a background operation result ready\n");
+            self.bg_ops_ready.store(true, Relaxed);
+            self.sbio_wq.notify_all();
+            return;
+        }
+        if marker < transfer::MARKER_FIRST {
+            dev_info!(self.dev, "sbio: unhandled notification, tag {:#04x}\n", marker);
+        }
 
         if !self.sbio_ready.load(Relaxed) {
             return;
@@ -3507,6 +3532,40 @@ impl SepData {
             )));
             waited += LOCK_STATE_POLL_MS;
         }
+    }
+
+    /// Collects a background operation result the enclave announced, if
+    /// any, as macOS does after every match. Logs only status and length.
+    fn collect_bg_ops_result(&self, why: &CStr) {
+        if !self.bg_ops_ready.xchg(false, Relaxed) {
+            return;
+        }
+        match self.sbio_transfer(&crate::sbio::sbio_bg_ops_result()) {
+            Ok(done) => dev_info!(
+                self.dev,
+                "sbio: collected the background operation result ({}): status {}, {} bytes\n",
+                why,
+                done.status,
+                done.payload.len()
+            ),
+            Err(e) => dev_warn!(
+                self.dev,
+                "sbio: collecting the background operation result ({}) failed: {:?}\n",
+                why,
+                e
+            ),
+        }
+    }
+
+    /// Waits up to `timeout_ms` for a background operation notice, then
+    /// collects it.
+    fn await_and_collect_bg_ops(&self, why: &CStr, timeout_ms: u32) {
+        let mut waited = 0;
+        while !self.bg_ops_ready.load(Relaxed) && waited < timeout_ms {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(LOCK_STATE_POLL_MS)));
+            waited += LOCK_STATE_POLL_MS;
+        }
+        self.collect_bg_ops_result(why);
     }
 
     fn sbio_continue(&self, cont: &transfer::Continuation) {
@@ -4218,6 +4277,7 @@ impl SepData {
         // The next verify opens a fresh unlock evaluation; nothing of the old
         // one is carried over.
         *self.match_context.lock() = None;
+        self.collect_bg_ops_result(c"at a password re-arm");
         if !self.save_lockout() {
             dev_warn!(self.dev, "Touch ID: re-arm: the enclave's lockout record was not saved; a restart restores the older one\n");
         }
@@ -5894,6 +5954,18 @@ impl MatchResult {
 
     pub(crate) fn matches(&self, user: UserId) -> bool {
         self.user_id == user.value()
+    }
+}
+
+const OP_SBIO_BG_OPS_RESULT: u16 = 0x21;
+/// Collects the background operation result the enclave announced with a
+/// tag-0x03 notice. The request is empty.
+pub(crate) fn sbio_bg_ops_result() -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_BG_OPS_RESULT,
+        payload: pad_payload(&[]),
+        payload_len: 0,
+        name: c"BG_OPS_RESULT",
     }
 }
 
