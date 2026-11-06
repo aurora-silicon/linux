@@ -478,6 +478,51 @@
 		nonposted-mmio;
 		ranges;
 
+		error-handler {
+			compatible = "apple,t8140-error-handler", "apple,soc-error-handler";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 284 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 286 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 288 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 892 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 361 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 358 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 354 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 355 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 356 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 359 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 357 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 290 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 293 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 296 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 299 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 178 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 179 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 180 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		event-log-handler {
+			compatible = "apple,t8140-event-log", "apple,soc-event-log";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 233 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 261 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 278 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 652 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 644 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
 		jpeg0: jpeg@28d000000 {
 			compatible = "apple,t8140-jpeg";
 			reg = <0x2 0x8d000000 0x0 0x4000>;

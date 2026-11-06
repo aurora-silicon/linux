@@ -573,6 +573,14 @@ config EDAC_CORTEX_A72
 	  The detected and reported errors are from reading CPU/L2 memory error
 	  syndrome registers.
 
+config EDAC_APPLE_SOC
+	tristate "Apple SoC error reporting"
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  Support for reporting memory-controller, fabric and other platform
+	  errors signalled by Apple silicon SoCs. Fatal errors are reported to
+	  the EDAC core before entering the normal kernel panic path.
+
 config EDAC_VERSALNET
 	tristate "AMD VersalNET DDR Controller"
 	depends on CDX_CONTROLLER && ARCH_ZYNQMP
