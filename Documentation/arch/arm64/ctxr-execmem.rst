@@ -68,10 +68,11 @@ How it works
 * If the window's pool is exhausted the allocation fails, exactly as a hardware
   CTXR fault would prevent executing from outside the window; there is no buddy
   fallback.
-* Code in the window can't execute at EL1 on a confined core, and the window
-  isn't known at the first instruction, so cores from the M4 generation on switch
-  to VHE in ``init_kernel_el`` on every entry at EL2. Earlier cores don't have
-  CTXR and enter as they always have.
+* Code in the window can't execute at EL1 on a confined core. The boot CPU isn't
+  confined and enters as it always has, through EL1 and ``finalise_el2``. Once it
+  has reserved a window at EL2, it sets a flag that later entries read with the
+  MMU off, and those switch to VHE in ``init_kernel_el`` without running at EL1.
+  With no window, every core enters as it always has.
 
 Userspace
 =========

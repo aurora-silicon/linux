@@ -9,6 +9,9 @@
 #include <linux/types.h>
 
 #ifdef CONFIG_ARM64_CTXR_EXECMEM
+/* Set once the boot CPU has a window at EL2; see init_kernel_el. */
+extern u32 ctxr_stay_el2;
+
 /*
  * Parse the window (from the kernel command line or the device tree), validate
  * that the kernel image fits inside it, and reserve it from memblock. Called

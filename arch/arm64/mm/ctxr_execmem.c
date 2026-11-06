@@ -34,11 +34,13 @@
 #include <linux/string.h>
 #include <linux/types.h>
 
+#include <asm/cacheflush.h>
 #include <asm/ctxr_execmem.h>
 #include <asm/memory.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/sections.h>
+#include <asm/virt.h>
 
 /* Window granularity when the base is derived rather than given. */
 #define CTXR_WINDOW_ALIGN	SZ_2M
@@ -49,6 +51,9 @@ static phys_addr_t ctxr_base __initdata;
 static phys_addr_t ctxr_size __initdata;
 static bool ctxr_enforce __initdata = true;
 static bool ctxr_active __initdata;
+
+/* Read with the MMU off by cores entering init_kernel_el. */
+u32 ctxr_stay_el2 __section(".mmuoff.data.read");
 
 /*
  * Free, linear-mapped RAM inside the window, snapshotted just before the
@@ -204,6 +209,12 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size, bool enfor
 	}
 
 	execmem_confine_set_window(base, size);
+
+	if (is_kernel_in_hyp_mode()) {
+		WRITE_ONCE(ctxr_stay_el2, 1);
+		dcache_clean_inval_poc((unsigned long)&ctxr_stay_el2,
+				       (unsigned long)&ctxr_stay_el2 + sizeof(ctxr_stay_el2));
+	}
 
 	ctxr_base = base;
 	ctxr_size = size;

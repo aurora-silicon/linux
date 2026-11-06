@@ -309,18 +309,13 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 
 #ifdef CONFIG_ARM64_CTXR_EXECMEM
 	/*
-	 * Kernel text inside an armed CTXR window can't execute at EL1, and
-	 * the window isn't known this early. Apple cores from the M4 generation
-	 * on (part numbers from 0x50) have CTXR and are VHE only, so they go
-	 * straight to VHE here on every entry and never run at EL1.
+	 * A core confined to a CTXR window can't run the window's code at
+	 * EL1. Once the boot CPU has a window at EL2, later entries switch
+	 * to VHE here instead of going through EL1 and finalise_el2.
 	 */
-	mrs	x0, midr_el1
-	ubfx	x1, x0, #MIDR_IMPLEMENTOR_SHIFT, #8
-	cmp	x1, #ARM_CPU_IMP_APPLE
-	b.ne	.Lctxr_no_direct_vhe
-	ubfx	x0, x0, #MIDR_PARTNUM_SHIFT, #12
-	cmp	x0, #0x50
-	b.lo	.Lctxr_no_direct_vhe
+	adr_l	x0, ctxr_stay_el2
+	ldr	w0, [x0]
+	cbz	w0, .Lctxr_no_direct_vhe
 	/* A virtual EL2 without VHE, as nested KVM may give a guest. */
 	mrs	x0, id_aa64mmfr1_el1
 	ubfx	x0, x0, #ID_AA64MMFR1_EL1_VH_SHIFT, #4
