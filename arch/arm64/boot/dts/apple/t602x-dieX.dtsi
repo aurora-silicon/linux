@@ -160,7 +160,7 @@
 	};
 
 	DIE_NODE(pinctrl_nub): pinctrl@29e1f0000 {
-		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl", "apple,pinctrl";
+		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x2 0x9e1f0000 0x0 0x4000>;
 		power-domains = <&DIE_NODE(ps_nub_gpio)>;
 
@@ -189,7 +189,7 @@
 	};
 
 	DIE_NODE(pinctrl_aop): pinctrl@2a6820000 {
-		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl", "apple,pinctrl";
+		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x2 0xa6820000 0x0 0x4000>;
 
 		gpio-controller;
@@ -315,7 +315,7 @@
 	};
 
 	DIE_NODE(pinctrl_ap): pinctrl@39b028000 {
-		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl", "apple,pinctrl";
+		compatible = "apple,t6020-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x3 0x9b028000 0x0 0x4000>;
 
 		interrupt-parent = <&aic>;
@@ -371,7 +371,6 @@
 		dmas = <&DIE_NODE(sio) 0x66>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa1)>;
-		reset-domains = <&DIE_NODE(ps_dpa1)>;
 		status = "disabled";
 
 		ports {
@@ -392,7 +391,6 @@
 		dmas = <&DIE_NODE(sio) 0x68>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa2)>;
-		reset-domains = <&DIE_NODE(ps_dpa2)>;
 		status = "disabled";
 
 		ports {
@@ -416,7 +414,6 @@
 		dmas = <&DIE_NODE(sio) 0x6a>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa3)>;
-		reset-domains = <&DIE_NODE(ps_dpa3)>;
 		status = "disabled";
 
 		ports {
@@ -437,7 +434,6 @@
 		dmas = <&DIE_NODE(sio) 0x6c>;
 		dma-names = "tx";
 		power-domains = <&DIE_NODE(ps_dpa4)>;
-		reset-domains = <&DIE_NODE(ps_dpa4)>;
 		status = "disabled";
 
 		ports {
