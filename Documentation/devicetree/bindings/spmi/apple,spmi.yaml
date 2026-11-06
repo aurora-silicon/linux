@@ -53,25 +53,14 @@ properties:
   power-domains:
     maxItems: 1
 
-if:
-  properties:
-    compatible:
-      contains:
-        enum:
-          - apple,t8122-spmi
-          - apple,t6030-spmi
-          - apple,t6031-spmi
-then:
-  required:
-    - compatible
-    - reg
-    - interrupt-controller
+required:
+  - compatible
+  - reg
+
+dependentRequired:
+  interrupt-controller:
     - "#interrupt-cells"
     - interrupts
-else:
-  required:
-    - compatible
-    - reg
 
 unevaluatedProperties: false
 
