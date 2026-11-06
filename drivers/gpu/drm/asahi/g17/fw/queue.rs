@@ -624,21 +624,21 @@ static_assert!(core::mem::offset_of!(KickAnnounce, timestamp) == 0x09);
 static_assert!(core::mem::offset_of!(KickAnnounce, data_master) == 0x11);
 
 impl KickAnnounce {
-    /// Announces the entry of queue `qid` at priority class `priority`,
-    /// written at `timestamp`.
-    pub(crate) fn new(
+    /// Announces `count` consecutive committed entries ending at `timestamp`.
+    pub(crate) fn new_count(
         qid: u8,
         data_master: DataMaster,
         timestamp: KickTimestamp,
         priority: u8,
+        count: u16,
     ) -> Result<Self> {
-        if qid > QID_MAX || priority >= Policy::PRIORITIES {
+        if qid > QID_MAX || priority >= Policy::PRIORITIES || count == 0 {
             return Err(EINVAL);
         }
         Ok(Self {
             tag: CommandTag::KickAnnounce as u32,
             qid: u16::from(qid),
-            count: 1,
+            count,
             priority,
             timestamp: timestamp.get(),
             data_master: data_master as u32,

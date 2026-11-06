@@ -5,6 +5,7 @@
 
 pub(crate) mod compute;
 pub(crate) mod render;
+pub(super) mod publication_burst;
 
 use super::{
     command::{Parser, UscWindow, Validated},

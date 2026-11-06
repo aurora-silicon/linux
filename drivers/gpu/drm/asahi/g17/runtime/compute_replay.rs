@@ -79,7 +79,13 @@ impl Firmware {
                     let owner = owner.ok_or(EIO)?;
                     packet.check_replay_dependencies()?;
                     let dependencies = self.queues.render_prefix(owner, &packet)?;
-                    self.publish_compute(owner, packet.clone(), dependencies.as_slice(), deferred)
+                    self.publish_compute(
+                        owner,
+                        packet.clone(),
+                        dependencies.as_slice(),
+                        false,
+                        deferred,
+                    )
                 })() };
                 let recovery_wait = matches!(result, Err(EAGAIN) | Err(EBUSY))
                     && (self.recovery.pending()

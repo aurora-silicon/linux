@@ -334,6 +334,7 @@ impl Backend {
                 packet.clone(),
                 &dependencies,
                 loan.lease,
+                self.backlog.load(Ordering::Acquire) > 1,
                 &mut host,
                 &mut |event| deferred.push(event),
             );

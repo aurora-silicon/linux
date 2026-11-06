@@ -9,6 +9,7 @@ unsafe extern "C" {
     fn asahi_g17_trace_publish_enabled() -> bool;
     fn asahi_g17_trace_publish(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         fence: *mut bindings::dma_fence);
+    fn asahi_g17_trace_burst(engine: u8, qid: u8, count: u16, notify: bool);
     fn asahi_g17_trace_complete(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         gpu_start: u64, gpu_end: u64);
     fn asahi_g17_trace_bind(engine: u8, qid: u8, ctx: u32, kind: u8);
@@ -22,7 +23,8 @@ unsafe extern "C" {
 pub(super) const RENDER: u8 = 0;
 pub(super) const COMPUTE: u8 = 1;
 
-/// Called once the command's doorbell has been rung.
+/// Called once the command's outer publication is visible. A test arm may
+/// coalesce its doorbell with later already-accepted work.
 pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job::Packet>) {
     // SAFETY: Pure static-key query.
     if !unsafe { asahi_g17_trace_publish_enabled() } {
@@ -34,6 +36,13 @@ pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job
         asahi_g17_trace_publish(engine, qid, ordinal, packet.context.id(), packet.order.sequence,
             fence.raw())
     };
+}
+
+/// Tag-14 count appended by this publication (`0` for an intermediate count-N
+/// arm) and whether it rings the coalesced work doorbell.
+pub(super) fn burst(engine: u8, qid: u8, count: u16, notify: bool) {
+    // SAFETY: Plain values only.
+    unsafe { asahi_g17_trace_burst(engine, qid, count, notify) };
 }
 
 /// Called when exact completion with GPU timestamps is retired.
