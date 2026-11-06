@@ -55,6 +55,7 @@
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		apple,clock-protection = <&ps_prot 42>;
 	};
 
 	/* Display frontend DART: SID0 scanout, SID16 PIODMA. */
@@ -65,6 +66,7 @@
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		apple,clock-protection = <&ps_prot 8>;
 		status = "disabled"; /* Enabled by the loader. */
 	};
 
@@ -84,6 +86,7 @@
 		iommus = <&dcp_dart 23>;
 		power-domains = <&ps_disp_cpu>;
 		dma-noncoherent;
+		apple,pmc-interface = <&pmc_disp0>;
 		apple,j713-native-piodma;
 		apple,j713-native-scanout;
 		/* Full 2560x1664 panel including the notch rows, 224 ppi. */
