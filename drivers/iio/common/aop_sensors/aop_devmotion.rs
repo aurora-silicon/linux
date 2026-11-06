@@ -29,6 +29,10 @@ use kernel::{
 
 const SUBTYPE_SET_PROPERTY: u16 = 4;
 const PROP_INTERVAL: u32 = 0;
+/// Selects the firmware's built-in calibration. AppleSPUHIDDriver writes this
+/// even though devmotion6 has no service-specific calibration packets.
+const PROP_CALIBRATION_STATE: u32 = 61;
+const CALIBRATION_DEFAULT: u32 = 1;
 const INTERVAL_US: u32 = 20_000;
 const Q_FRAC_BITS: i32 = 30;
 
@@ -101,19 +105,38 @@ struct Control {
 }
 
 impl Control {
-    fn set_interval(&self, interval: u32) -> Result {
+    fn set(&self, prop: u32, value: u32) -> Result {
         let mut msg = KVec::with_capacity(12, GFP_KERNEL)?;
         msg.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
-        msg.extend_from_slice(&PROP_INTERVAL.to_le_bytes(), GFP_KERNEL)?;
-        msg.extend_from_slice(&interval.to_le_bytes(), GFP_KERNEL)?;
+        msg.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
+        msg.extend_from_slice(&value.to_le_bytes(), GFP_KERNEL)?;
         let status = self
             .aop
             .epic_call(&self.service, SUBTYPE_SET_PROPERTY, &msg)?;
         if status != 0 {
-            dev_err!(self.dev, "interval refused: status {:#x}\n", status);
+            dev_err!(
+                self.dev,
+                "property {} refused: status {:#x}\n",
+                prop,
+                status
+            );
             return Err(EIO);
         }
         Ok(())
+    }
+
+    /// Selects the default calibration before the first enable after probe.
+    fn initialize(&self) -> Result {
+        self.set(PROP_CALIBRATION_STATE, CALIBRATION_DEFAULT)?;
+        self.enable()
+    }
+
+    fn enable(&self) -> Result {
+        self.set(PROP_INTERVAL, INTERVAL_US)
+    }
+
+    fn disable(&self) -> Result {
+        self.set(PROP_INTERVAL, 0)
     }
 }
 
@@ -362,10 +385,10 @@ unsafe extern "C" fn pm_event(
     let hook = unsafe { &*nb.cast::<PmHook>() };
     let ret = match action as u32 {
         bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => {
-            hook.control.set_interval(0)
+            hook.control.disable()
         }
         bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => {
-            hook.control.set_interval(INTERVAL_US)
+            hook.control.enable()
         }
         _ => return bindings::NOTIFY_DONE as c_int,
     };
@@ -497,9 +520,9 @@ impl platform::Driver for IIOAopDevMotionDriver {
         let (mut iio, state) = MotionIio::new(pdev)?;
         let listener = FakehidRegistration::new(aop, service, state)?;
         let pm = PmHook::new(control.clone())?;
-        control.set_interval(INTERVAL_US)?;
+        control.initialize()?;
         if let Err(e) = iio.register() {
-            let _ = control.set_interval(0);
+            let _ = control.disable();
             return Err(e);
         }
         Ok(IIOAopDevMotionDriver {
@@ -512,7 +535,7 @@ impl platform::Driver for IIOAopDevMotionDriver {
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
         this.pm.unregister();
-        let _ = this.control.set_interval(0);
+        let _ = this.control.disable();
         this.listener.unregister();
     }
 }
