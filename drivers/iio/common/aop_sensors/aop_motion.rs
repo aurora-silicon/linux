@@ -277,6 +277,25 @@ impl FakehidListener for State {
     }
 }
 
+/// The threaded half of the poll function.
+///
+/// The trigger never fires, so this never runs; it exists because the IRQ
+/// core rejects a oneshot poll function without a threaded handler.
+///
+/// # Safety
+///
+/// The IIO core calls it with the device's `iio_poll_func`.
+unsafe extern "C" fn motion_trigger_handler(
+    _irq: core::ffi::c_int,
+    p: *mut core::ffi::c_void,
+) -> bindings::irqreturn_t {
+    let pf = p.cast::<bindings::iio_poll_func>();
+    // SAFETY: `p` is the poll function of a registered device that has a
+    // current trigger while its buffer runs.
+    unsafe { bindings::iio_trigger_notify_done((*(*pf).indio_dev).trig) };
+    bindings::irqreturn_IRQ_HANDLED as bindings::irqreturn_t
+}
+
 /// The only scan the device offers: X, Y and Z.
 static SCAN_MASKS: [usize; 2] = [0b111, 0];
 
@@ -467,13 +486,14 @@ impl MotionIio {
         // SAFETY: Both devices are valid. The buffer is released with the
         // platform device's resources; the IIO device holds its own
         // reference to it until it is freed. The poll function only stamps
-        // the time; the report listener pushes the scans.
+        // the time and completes the trigger; the report listener pushes the
+        // scans.
         let ret = unsafe {
             bindings::devm_iio_triggered_buffer_setup_ext(
                 dev.as_raw(),
                 indio_dev,
                 Some(bindings::iio_pollfunc_store_time),
-                None,
+                Some(motion_trigger_handler),
                 bindings::iio_buffer_direction_IIO_BUFFER_DIRECTION_IN,
                 ptr::null(),
                 ptr::null_mut(),
