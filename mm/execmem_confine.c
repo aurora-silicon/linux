@@ -92,19 +92,6 @@ bool execmem_confine_active(void)
 	return confine_ready;
 }
 
-bool execmem_confine_enforced(void)
-{
-	return confine_ready && confine_enforce;
-}
-
-void execmem_confine_window(phys_addr_t *base, phys_addr_t *size)
-{
-	if (base)
-		*base = confine_base;
-	if (size)
-		*size = confine_size;
-}
-
 static bool phys_in_window(phys_addr_t pa)
 {
 	return pa >= confine_base && pa < confine_base + confine_size;

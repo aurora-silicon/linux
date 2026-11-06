@@ -216,8 +216,6 @@ struct execmem_range;
 
 /**
  * execmem_confine_init - register the confined executable physical window
- * @base:	physical base of the window
- * @size:	size of the window in bytes
  * @pool:	gen_pool that hands out page-aligned chunks of the window
  *		(entries added with linear-map virtual addresses)
  * @enforce:	if true, a confinement violation found by the verifier is
@@ -232,12 +230,6 @@ int execmem_confine_init(struct gen_pool *pool, bool enforce);
 
 /* True once a window has been registered. */
 bool execmem_confine_active(void);
-
-/* True if confinement violations are fatal. */
-bool execmem_confine_enforced(void);
-
-/* Window bounds, valid only when execmem_confine_active(). */
-void execmem_confine_window(phys_addr_t *base, phys_addr_t *size);
 
 /*
  * Record the window once it is reserved. This comes ahead of the pool, so that
@@ -282,7 +274,6 @@ unsigned long execmem_confine_arch_verify(phys_addr_t base, phys_addr_t size,
 					  unsigned long *nr_exec);
 #else
 static inline bool execmem_confine_active(void) { return false; }
-static inline bool execmem_confine_enforced(void) { return false; }
 static inline bool execmem_confine_pfn_in_window(unsigned long pfn) { return false; }
 static inline bool execmem_confine_overlaps(phys_addr_t start, phys_addr_t size) { return false; }
 #endif /* CONFIG_EXECMEM_CONFINE */
