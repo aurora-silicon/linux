@@ -119,9 +119,12 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 		return -ENOMEM;
 
 	/* Keep the DMA device, domain usage and driver code valid until reset. */
+	if (!try_module_get(THIS_MODULE)) {
+		kfree(session);
+		return -ENODEV;
+	}
 	session->dev = get_device(dcp->dev);
 	session->group = iommu_group_get(dcp->dev);
-	__module_get(THIS_MODULE);
 	WRITE_ONCE(dcp->retain_dma, true);
 	mutex_lock(&dcp_retained_sessions_lock);
 	list_add_tail(&session->link, &dcp_retained_sessions);
