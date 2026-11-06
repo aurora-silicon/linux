@@ -6,6 +6,7 @@
  */
 
 #include <linux/edac.h>
+#include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -26,6 +27,26 @@
 #define APPLE_SOC_EDAC_BACKOFF_MAX_MS	60000
 #define APPLE_SOC_EDAC_MAX_RETRIES	8
 
+#define T6041_AMCC_REGS		4
+#define T6041_NI_REGS		25
+#define T6041_STATUS_REGS	(T6041_AMCC_REGS + T6041_NI_REGS)
+
+#define T6041_AMCC_ENABLE(plane, bank) \
+	(0x25000 + (plane) * 0x40000 + (bank) * 8)
+#define T6041_AMCC_STATUS(plane, bank) \
+	(T6041_AMCC_ENABLE(plane, bank) + 4)
+#define T6041_NI_STATUS		0x416c
+
+static const u32 t6041_amcc_error_mask[] = {
+	0x3fffffff,
+	0x7ca0afe0,
+	0x000000ff,
+	0x0000ffff,
+	0x0000ffff,
+	0x0000ffff,
+	0x0000ffff,
+};
+
 struct apple_soc_edac_range {
 	u8 first;
 	u8 count;
@@ -36,6 +57,7 @@ struct apple_soc_edac_hw {
 	const struct apple_soc_edac_range *ranges;
 	size_t nranges;
 	unsigned int num_irqs;
+	unsigned int num_status_regs;
 	bool event_log;
 };
 
@@ -57,17 +79,21 @@ struct apple_soc_edac {
 	struct edac_device_ctl_info *dci;
 	const struct apple_soc_edac_hw *hw;
 	struct apple_soc_edac_irq *irqs;
+	void __iomem **status_regs;
 };
 
 /*
  * DCS IRQs drive a separate thermal loop and are intentionally omitted.
- * The AMCC lines are left unclaimed as well: on the J616s all sixteen are
- * asserted from boot and re-assert as soon as they are unmasked, and no
- * acknowledge contract is established for them.
+ * NSC/NSI errors are fatal on the reference implementation; no returning
+ * acknowledge path is established for them, so leave those lines unclaimed.
  */
 static const struct apple_soc_edac_range t6041_error_ranges[] = {
 	{ 0, 9, "sep" },
 	{ 9, 1, "pmgr" },
+	{ 10, 4, "amcc0" },
+	{ 14, 4, "amcc1" },
+	{ 18, 4, "amcc2" },
+	{ 22, 4, "amcc3" },
 	{ 26, 3, "sram" },
 	{ 45, 3, "ni0" },
 	{ 48, 4, "ni1" },
@@ -76,8 +102,6 @@ static const struct apple_soc_edac_range t6041_error_ranges[] = {
 	{ 64, 2, "ni4" },
 	{ 66, 2, "ni5" },
 	{ 68, 2, "ni6" },
-	{ 70, 7, "nsc" },
-	{ 77, 12, "nsi" },
 };
 
 static const struct apple_soc_edac_range t8140_error_ranges[] = {
@@ -97,6 +121,7 @@ static const struct apple_soc_edac_hw t6041_error_hw = {
 	.ranges = t6041_error_ranges,
 	.nranges = ARRAY_SIZE(t6041_error_ranges),
 	.num_irqs = 89,
+	.num_status_regs = T6041_STATUS_REGS,
 };
 
 static const struct apple_soc_edac_hw t8140_error_hw = {
@@ -133,6 +158,55 @@ static const char *apple_soc_edac_source(const struct apple_soc_edac_hw *hw,
 	return NULL;
 }
 
+static bool apple_soc_edac_t6041_status(struct apple_soc_edac_irq *irq_data,
+					bool *error)
+{
+	struct apple_soc_edac *edac = irq_data->edac;
+	u32 status;
+	bool pending = false;
+	unsigned int i;
+
+	*error = false;
+
+	if (irq_data->index >= 10 && irq_data->index < 26) {
+		unsigned int amcc = (irq_data->index - 10) / 4;
+		unsigned int plane = (irq_data->index - 10) % 4;
+
+		for (i = 0; i < ARRAY_SIZE(t6041_amcc_error_mask); i++) {
+			void __iomem *reg = edac->status_regs[amcc] +
+					    T6041_AMCC_STATUS(plane, i);
+
+			status = readl(reg);
+			if (!status)
+				continue;
+
+			pending = true;
+			/* Only status bits enabled by the platform error policy count. */
+			*error |= status & t6041_amcc_error_mask[i];
+			writel(status, reg);
+		}
+
+		return pending;
+	}
+
+	if (irq_data->index >= 45 && irq_data->index < 70) {
+		void __iomem *reg = edac->status_regs[T6041_AMCC_REGS +
+						      irq_data->index - 45] +
+				    T6041_NI_STATUS;
+
+		status = readl(reg);
+		if (!status)
+			return false;
+
+		/* Bit 3 is not part of the platform error policy. */
+		*error = status & 0xf7;
+		writel(status, reg);
+		return true;
+	}
+
+	return false;
+}
+
 static void apple_soc_edac_rearm(struct work_struct *work)
 {
 	struct apple_soc_edac_irq *irq_data =
@@ -147,16 +221,34 @@ static irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
 {
 	struct apple_soc_edac_irq *irq_data = data;
 	struct apple_soc_edac *edac = irq_data->edac;
+	bool error;
 	char msg[64];
 
-	/* The source cannot be cleared from here: keep the line masked. */
+	if (edac->hw->num_status_regs &&
+	    apple_soc_edac_t6041_status(irq_data, &error)) {
+		if (!error)
+			return IRQ_HANDLED;
+
+		snprintf(msg, sizeof(msg), "%s source %u", irq_data->source,
+			 irq_data->index);
+		edac_device_handle_ue(edac->dci, 0, 0, msg);
+		dev_err_ratelimited(edac->dev, "hardware error: %s (IRQ %d)\n",
+				    msg, irq);
+		return IRQ_HANDLED;
+	}
+
+	/* No status was pending, or this source has no clear contract. */
 	disable_irq_nosync(irq);
 
 	snprintf(msg, sizeof(msg), "%s source %u", irq_data->source,
 		 irq_data->index);
-	edac_device_handle_ue(edac->dci, 0, 0, msg);
-	dev_err_ratelimited(edac->dev, "hardware error: %s (IRQ %d)\n", msg,
-			    irq);
+	if (!edac->hw->num_status_regs ||
+	    irq_data->index < 10 ||
+	    (irq_data->index >= 26 && irq_data->index < 29)) {
+		edac_device_handle_ue(edac->dci, 0, 0, msg);
+		dev_err_ratelimited(edac->dev,
+				    "hardware error: %s (IRQ %d)\n", msg, irq);
+	}
 
 	/*
 	 * A line that stayed quiet for a minute after its last unmask had
@@ -210,6 +302,19 @@ static int apple_soc_edac_probe(struct platform_device *pdev)
 
 	edac->dev = &pdev->dev;
 	edac->hw = hw;
+	if (hw->num_status_regs) {
+		edac->status_regs = devm_kcalloc(&pdev->dev, hw->num_status_regs,
+						 sizeof(*edac->status_regs),
+						 GFP_KERNEL);
+		if (!edac->status_regs)
+			return -ENOMEM;
+
+		for (i = 0; i < hw->num_status_regs; i++) {
+			edac->status_regs[i] = devm_platform_ioremap_resource(pdev, i);
+			if (IS_ERR(edac->status_regs[i]))
+				return PTR_ERR(edac->status_regs[i]);
+		}
+	}
 	edac->dci = edac_device_alloc_ctl_info(0, (char *)dev_name(&pdev->dev), 1,
 					       "platform", 1, 0,
 					       edac_device_alloc_index());
