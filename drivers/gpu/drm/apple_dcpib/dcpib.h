@@ -180,6 +180,11 @@ struct dcpib_port {
 };
 
 struct dcpib {
+	/* Stop new endpoint work before detaching a failed live session. */
+	struct mutex rx_gate;
+	bool stopping;
+	bool ready;
+	bool kms_work_ready;
 	struct device *dev;
 	struct drm_device drm;
 	struct apple_rtkit *rtk;
@@ -289,6 +294,8 @@ void dcpib_dma_free(struct dcpib *dcp, struct dcpib_dma *dma);
 
 /* iboot.c */
 int dcpib_iboot_init(struct dcpib *dcp);
+
+void dcpib_kms_stop(struct dcpib *dcp);
 int dcpib_ib_set_power(struct dcpib *dcp, bool on);
 int dcpib_ib_get_hpd(struct dcpib *dcp, u32 *timings, u32 *colors);
 int dcpib_ib_get_modes(struct dcpib *dcp);
