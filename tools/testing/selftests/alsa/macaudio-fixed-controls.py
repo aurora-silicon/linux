@@ -38,8 +38,12 @@ PREFIX = r'''
 #define SNDRV_CTL_ELEM_TYPE_ENUMERATED 3
 #define IS_ENABLED(x) VALIDATE
 #define unlikely(x) (x)
+#define CAP_SYS_ADMIN 21
+#define smp_load_acquire(p) (*(p))
 #define dev_err(...) ((void)0)
 #define dev_dbg(...) ((void)0)
+static bool is_admin = true;
+static bool capable(int cap) { return is_admin && cap == CAP_SYS_ADMIN; }
 struct snd_ctl_file { int unused; };
 struct snd_ctl_elem_id { char name[64]; unsigned int index; };
 struct snd_ctl_elem_value {
@@ -74,6 +78,8 @@ struct macaudio_snd_data {
  struct snd_ctl_file *spk_owner; struct snd_soc_card card;
  struct snd_kcontrol **spk_hpfs; unsigned int *spk_hpf_granted;
  unsigned int spk_nr_hpfs, spk_hpf_safe; struct snd_ctl_elem_value *spk_uval;
+ struct snd_kcontrol **spk_senses; unsigned int spk_nr_senses;
+ bool spk_granted, spk_hpf_unsafe, allow_unsafe_tweeter_hpf;
 };
 #define GFP_KERNEL 0
 #define devm_kcalloc(d, n, s, g) calloc(n, s)
@@ -203,13 +209,18 @@ static void sense_scenario(void)
   controls[i].put = snd_soc_put_enum_double; controls[i].private_value = (unsigned long)&e;
   controls[i].next = i < 6 ? &controls[i + 1] : NULL;
  }
- macaudio_protect_sense(&soc);
+ check(macaudio_protect_sense(&soc) == 0, "install sense protection", "sense");
  for (i = 0; i < 7; i++) for (j = 0; j < 2; j++) {
   struct snd_ctl_elem_value v = { .id = controls[i].id };
   v.id.index = j;
   ma.spk_owner = NULL;
-  check(snd_ctl_elem_write(&card, &other, &v) == 0, "unowned writable", names[i]);
+  is_admin = false;
+  check(snd_ctl_elem_write(&card, &other, &v) == (i < 6 ? -EPERM : 0),
+        "unowned seat write", names[i]);
+  is_admin = true;
+  check(snd_ctl_elem_write(&card, &other, &v) == 0, "unowned admin write", names[i]);
   ma.spk_owner = &owner;
+  is_admin = false;
   unsigned int before = regs[i].writes;
   int rc = snd_ctl_elem_write(&card, &other, &v);
   check(rc == (i < 6 ? -EPERM : 0), "other file during ownership", names[i]);
@@ -220,9 +231,12 @@ static void sense_scenario(void)
   check(snd_ctl_elem_write(&card, &other, &v) == (i < 6 ? -EPERM : 0), "sense lock is not protection ownership", names[i]);
   controls[i].vd[j].owner = NULL;
   ma.spk_owner = NULL;
-  check(snd_ctl_elem_write(&card, &other, &v) == 0, "after owner close", names[i]);
-  attempts += 5;
+  check(snd_ctl_elem_write(&card, &other, &v) == (i < 6 ? -EPERM : 0),
+        "seat write after owner close", names[i]);
+  is_admin = true;
+  attempts += 6;
  }
+ free(ma.spk_senses);
 }
 static void hpf_scenario(void)
 {
@@ -238,18 +252,20 @@ static void hpf_scenario(void)
  /* Every legal DT playback corner, including Disabled, must round trip. */
  for (initial = 0; initial < 7; initial++) {
   ma.spk_nr_hpfs = 0;
+  ma.spk_hpf_unsafe = false;
   for (i = 0; i < 2; i++) {
    snprintf(controls[i].id.name, sizeof(controls[i].id.name), "%s Tweeter HPF Corner Frequency", i ? "Right" : "Left");
    controls[i].count = 1; controls[i].vd[0].access = 3;
    controls[i].info = enum_info; controls[i].get = enum_get; controls[i].put = snd_soc_put_enum_double;
    controls[i].private_value = (unsigned long)&e; controls[i].component = &regs[i]; controls[i].texts = texts;
-   controls[i].next = i ? NULL : &controls[1]; regs[i].reg = (initial + i) % 7;
+   controls[i].next = i ? NULL : &controls[1]; regs[i].reg = initial;
   }
   check(macaudio_spk_take_hpfs(&ma) == 0, "capture DT corner", "HPF");
+  check(ma.spk_hpf_unsafe == (initial != 1), "classify captured corner", "HPF");
   check(macaudio_spk_set_hpf(&ma, false) == 0, "floor", "HPF");
   check(regs[0].reg == 6 && regs[1].reg == 6, "safe 800 Hz", "HPF");
   check(macaudio_spk_set_hpf(&ma, true) == 0, "grant", "HPF");
-  for (i = 0; i < 2; i++) check(regs[i].reg == (initial + i) % 7, "restore each amp DT corner", "HPF");
+  for (i = 0; i < 2; i++) check(regs[i].reg == initial, "restore each amp DT corner", "HPF");
   free(ma.spk_hpfs); free(ma.spk_hpf_granted);
  }
 }
@@ -299,6 +315,9 @@ def main():
     parts += re.findall(r"^#define MACAUDIO_\w*HPF\w*\s.*$", ma, re.M)
     parts += [function(ma, "macaudio_sense_owner_check"),
               function(ma, "macaudio_sense_write_check"),
+              function(ma, "macaudio_route_check"),
+              function(ma, "macaudio_route_write_check"),
+              function(ma, "macaudio_is_sense_control"),
               function(ma, "macaudio_protect_sense"),
               function(ma, "macaudio_enum_item"),
               function(ma, "macaudio_spk_take_hpfs"),

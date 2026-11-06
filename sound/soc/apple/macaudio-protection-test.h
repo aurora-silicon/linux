@@ -17,6 +17,24 @@ struct macaudio_test_vol {
 	int fail;
 };
 
+struct macaudio_test_switch {
+	bool value;
+	int fail;
+};
+
+static int macaudio_test_switch_put(struct snd_kcontrol *kctl,
+				    struct snd_ctl_elem_value *uval)
+{
+	struct macaudio_test_switch *sw = kctl->private_data;
+	bool changed;
+
+	if (sw->fail)
+		return sw->fail;
+	changed = sw->value != !!uval->value.integer.value[0];
+	sw->value = !!uval->value.integer.value[0];
+	return changed;
+}
+
 static struct macaudio_test_vol *macaudio_test_vol(struct snd_kcontrol *kctl)
 {
 	return container_of((struct soc_mixer_control *)kctl->private_value,
@@ -965,7 +983,7 @@ static void macaudio_sense_controls_are_protected(struct kunit *test)
 
 		sense[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
 	}
-	macaudio_protect_sense(&t.ma->card);
+	KUNIT_ASSERT_EQ(test, macaudio_protect_sense(&t.ma->card), 0);
 	for (i = 0; i < ARRAY_SIZE(names) - 1; i++)
 		KUNIT_EXPECT_TRUE(test, sense[i]->write_check == macaudio_sense_write_check);
 	KUNIT_EXPECT_NULL(test, sense[ARRAY_SIZE(names) - 1]->write_check);
@@ -975,9 +993,18 @@ static void macaudio_sense_owned_writes(struct kunit *test)
 {
 	struct macaudio_test_spk t = {};
 	struct snd_ctl_file other = {};
+	const struct cred *old;
+	struct cred *seat;
 
 	macaudio_test_spk_card(test, &t, &macaudio_j413_cfg, SN012776_0DB);
+	/* An unowned privileged setup may write; a seat process may not. */
 	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), 0);
+	seat = prepare_creds();
+	KUNIT_ASSERT_NOT_NULL(test, seat);
+	cap_lower(seat->cap_effective, CAP_SYS_ADMIN);
+	old = override_creds(seat);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), -EPERM);
+	revert_creds(old);
 	macaudio_test_take(test, &t);
 	/* Ownership alone excludes every other file, even before a grant. */
 	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, t.owner), 0);
@@ -988,8 +1015,58 @@ static void macaudio_sense_owned_writes(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), -EPERM);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
 	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), -EPERM);
+	/* The owner's file remains authorized if its process drops capability. */
+	old = override_creds(seat);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, t.owner), 0);
+	revert_creds(old);
 	macaudio_spk_unlock(t.spk);
 	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), 0);
+	old = override_creds(seat);
+	KUNIT_EXPECT_EQ(test, macaudio_sense_owner_check(t.ma, &other), -EPERM);
+	revert_creds(old);
+	put_cred(seat);
+}
+
+static void macaudio_sense_floor_forces_switches_on(struct kunit *test)
+{
+	static const char *const names[] = { "ISENSE Switch", "VSENSE Switch" };
+	struct macaudio_test_switch sw[ARRAY_SIZE(names)] = {};
+	struct macaudio_test_spk t = {};
+	unsigned int i;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j413_cfg, SN012776_0DB);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct snd_kcontrol_new tmpl = {
+			.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+			.name = names[i],
+			.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+			.info = snd_ctl_boolean_mono_info,
+			.put = macaudio_test_switch_put,
+		};
+
+		macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, &sw[i]);
+	}
+	KUNIT_ASSERT_EQ(test, macaudio_protect_sense(&t.ma->card), 0);
+	KUNIT_EXPECT_EQ(test, t.ma->spk_nr_senses, (unsigned int)ARRAY_SIZE(names));
+
+	/* A new owner cannot inherit switches that were off in the restart gap. */
+	macaudio_test_take(test, &t);
+	for (i = 0; i < ARRAY_SIZE(sw); i++)
+		KUNIT_EXPECT_TRUE(test, sw[i].value);
+
+	/* Any state the old owner left behind is repaired before it is gone. */
+	for (i = 0; i < ARRAY_SIZE(sw); i++)
+		sw[i].value = false;
+	macaudio_spk_unlock(t.spk);
+	for (i = 0; i < ARRAY_SIZE(sw); i++)
+		KUNIT_EXPECT_TRUE(test, sw[i].value);
+
+	/* A switch that cannot be enabled makes the floor permanently fail. */
+	sw[0].value = false;
+	sw[0].fail = -EIO;
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_TRUE(test, t.ma->spk_floor_failed);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EIO);
 }
 
 static void macaudio_route_is_protected(struct kunit *test)
@@ -1010,7 +1087,7 @@ static void macaudio_route_is_protected(struct kunit *test)
 
 		mux[i] = macaudio_test_add_kctl(test, t.ma->card.snd_card, &tmpl, NULL);
 	}
-	macaudio_protect_sense(&t.ma->card);
+	KUNIT_ASSERT_EQ(test, macaudio_protect_sense(&t.ma->card), 0);
 	KUNIT_EXPECT_TRUE(test, mux[0]->write_check == macaudio_route_write_check);
 	KUNIT_EXPECT_NULL(test, mux[1]->write_check);
 }
@@ -1037,6 +1114,7 @@ static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_route_is_protected),
 	KUNIT_CASE(macaudio_route_fixed_while_granted),
 	KUNIT_CASE(macaudio_sense_owned_writes),
+	KUNIT_CASE(macaudio_sense_floor_forces_switches_on),
 	KUNIT_CASE(macaudio_sense_controls_are_protected),
 	KUNIT_CASE(macaudio_spk_floor_from_binding),
 	KUNIT_CASE(macaudio_spk_grant_needs_owner_and_valid_lease),

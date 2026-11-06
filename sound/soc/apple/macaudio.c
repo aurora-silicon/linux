@@ -31,6 +31,7 @@
 #include <linux/kthread.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
@@ -265,6 +266,11 @@ struct macaudio_snd_data {
 	unsigned int spk_nr_hpfs;
 	unsigned int spk_hpf_safe;
 	unsigned int *spk_hpf_granted;
+	bool spk_hpf_unsafe;
+	bool allow_unsafe_tweeter_hpf;
+	/* V/I sense switches are forced on whenever protection is floored. */
+	struct snd_kcontrol **spk_senses;
+	unsigned int spk_nr_senses;
 	/*
 	 * The owner's engine runs the crossover ahead of the amps, so a grant
 	 * may open the tweeters' high-pass. Written under spk_mutex.
@@ -422,6 +428,8 @@ static long macaudio_spk_gain(const struct macaudio_snd_data *ma, bool granted)
 }
 
 #define MACAUDIO_TWEETER_HPF_SAFE	"800 Hz"
+#define MACAUDIO_TWEETER_HPF_DISABLED	"Disabled"
+#define MACAUDIO_TWEETER_HPF_GRANTED_MAX	"2 Hz"
 #define MACAUDIO_TWEETER_HPF_NAME	"* Tweeter HPF Corner Frequency"
 
 /*
@@ -460,6 +468,29 @@ static int macaudio_spk_set_hpf(struct macaudio_snd_data *ma, bool granted)
 			snd_ctl_notify(ma->card.snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
 				       &kctl->id);
 		}
+	}
+	return err;
+}
+
+/* Keep every protection sense path alive before a new owner can inherit it. */
+static int macaudio_spk_enable_sense(struct macaudio_snd_data *ma)
+{
+	struct snd_ctl_elem_value *uval = ma->spk_uval;
+	int ret, err = 0;
+	unsigned int i;
+
+	for (i = 0; i < ma->spk_nr_senses; i++) {
+		if (!ma->spk_senses[i]->put) {
+			if (!err)
+				err = -EINVAL;
+			continue;
+		}
+		memset(uval, 0, sizeof(*uval));
+		uval->id = ma->spk_senses[i]->id;
+		uval->value.integer.value[0] = 1;
+		ret = ma->spk_senses[i]->put(ma->spk_senses[i], uval);
+		if (ret < 0 && !err)
+			err = ret;
 	}
 	return err;
 }
@@ -614,6 +645,11 @@ static void macaudio_spk_floor(struct macaudio_snd_data *ma, const char *reason)
 		dev_crit(ma->card.dev,
 			 "tweeter safe high-pass not set on every amp: speaker playback refused\n");
 	}
+	if (macaudio_spk_enable_sense(ma) < 0) {
+		WRITE_ONCE(ma->spk_floor_failed, true);
+		dev_crit(ma->card.dev,
+			 "speaker sense not enabled on every amp: speaker playback refused\n");
+	}
 
 	if (was && ma->spk_kctl) {
 		if (closed_ahead)
@@ -667,6 +703,11 @@ static int macaudio_spk_grant(struct macaudio_snd_data *ma, long ms)
 	 * this caller.
 	 */
 	kthread_flush_work(&ma->spk_stop_work);
+	if (ma->spk_xover && ma->spk_hpf_unsafe && !ma->allow_unsafe_tweeter_hpf) {
+		dev_err_ratelimited(ma->card.dev,
+				    "unsafe captured tweeter high-pass: protection grant refused\n");
+		return -ERANGE;
+	}
 
 	/*
 	 * The tweeters' filter opens before the amps go up, never after, and
@@ -1077,7 +1118,9 @@ static const struct snd_kcontrol_new macaudio_spk_xover_control = {
 /* ALSA serializes this with protection lock/unlock, including file close. */
 static int macaudio_sense_owner_check(struct macaudio_snd_data *ma, struct snd_ctl_file *file)
 {
-	return ma->spk_owner && ma->spk_owner != file ? -EPERM : 0;
+	if (ma->spk_owner)
+		return ma->spk_owner == file ? 0 : -EPERM;
+	return capable(CAP_SYS_ADMIN) ? 0 : -EPERM;
 }
 
 static int macaudio_sense_write_check(struct snd_kcontrol *kctl, struct snd_ctl_file *file)
@@ -1111,19 +1154,39 @@ static int macaudio_route_write_check(struct snd_kcontrol *kctl, struct snd_ctl_
  * Match both mono and prefixed amp DAPM sense switches, and the speaker
  * route; leave jack controls alone.
  */
-static void macaudio_protect_sense(struct snd_soc_card *card)
+static bool macaudio_is_sense_control(struct snd_kcontrol *kctl)
 {
+	return snd_soc_control_matches(kctl, "* ISENSE Switch") ||
+	       snd_soc_control_matches(kctl, "* VSENSE Switch") ||
+	       !strcmp(kctl->id.name, "ISENSE Switch") ||
+	       !strcmp(kctl->id.name, "VSENSE Switch");
+}
+
+static int macaudio_protect_sense(struct snd_soc_card *card)
+{
+	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(card);
 	struct snd_kcontrol *kctl;
+	unsigned int nr = 0;
+
+	list_for_each_entry(kctl, &card->snd_card->controls, list)
+		if (macaudio_is_sense_control(kctl))
+			nr++;
+	if (nr) {
+		ma->spk_senses = devm_kcalloc(card->dev, nr, sizeof(*ma->spk_senses),
+					      GFP_KERNEL);
+		if (!ma->spk_senses)
+			return -ENOMEM;
+	}
 
 	list_for_each_entry(kctl, &card->snd_card->controls, list) {
-		if (snd_soc_control_matches(kctl, "* ISENSE Switch") ||
-		    snd_soc_control_matches(kctl, "* VSENSE Switch") ||
-		    !strcmp(kctl->id.name, "ISENSE Switch") ||
-		    !strcmp(kctl->id.name, "VSENSE Switch"))
+		if (macaudio_is_sense_control(kctl)) {
 			kctl->write_check = macaudio_sense_write_check;
-		else if (!strcmp(kctl->id.name, "Speaker Playback Mux"))
+			ma->spk_senses[ma->spk_nr_senses++] = kctl;
+		} else if (!strcmp(kctl->id.name, "Speaker Playback Mux")) {
 			kctl->write_check = macaudio_route_write_check;
+		}
 	}
+	return 0;
 }
 
 /*
@@ -1204,7 +1267,7 @@ static int macaudio_spk_take_hpfs(struct macaudio_snd_data *ma)
 	struct snd_kcontrol *kctl;
 	struct snd_ctl_elem_value *uval;
 	unsigned int i, nr = 0;
-	int safe, ret;
+	int disabled, granted_max, safe, ret;
 
 	if (!ma->cfg->tweeter_hpf_granted)
 		return 0;
@@ -1228,8 +1291,10 @@ static int macaudio_spk_take_hpfs(struct macaudio_snd_data *ma)
 		if (!snd_soc_control_matches(kctl, MACAUDIO_TWEETER_HPF_NAME))
 			continue;
 		safe = macaudio_enum_item(kctl, MACAUDIO_TWEETER_HPF_SAFE);
-		if (safe < 0) {
-			ret = safe;
+		disabled = macaudio_enum_item(kctl, MACAUDIO_TWEETER_HPF_DISABLED);
+		granted_max = macaudio_enum_item(kctl, MACAUDIO_TWEETER_HPF_GRANTED_MAX);
+		if (safe < 0 || disabled < 0 || granted_max < 0) {
+			ret = safe < 0 ? safe : disabled < 0 ? disabled : granted_max;
 			goto out;
 		}
 		/* Capture before fixup installs the floor: the codec loaded the DT. */
@@ -1238,6 +1303,13 @@ static int macaudio_spk_take_hpfs(struct macaudio_snd_data *ma)
 		ret = kctl->get(kctl, uval);
 		if (ret < 0)
 			goto out;
+		if (uval->value.enumerated.item[0] > safe) {
+			ret = -ERANGE;
+			goto out;
+		}
+		if (uval->value.enumerated.item[0] == disabled ||
+		    uval->value.enumerated.item[0] > granted_max)
+			ma->spk_hpf_unsafe = true;
 		if (ma->spk_nr_hpfs && safe != ma->spk_hpf_safe) {
 			ret = -EINVAL;
 			goto out;
@@ -2531,7 +2603,12 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
 	if (!ma->has_speakers)
 		return 0;
 
-	macaudio_protect_sense(card);
+	{
+		int ret = macaudio_protect_sense(card);
+
+		if (ret)
+			return ret;
+	}
 
 	if (ma->cfg->amp == AMP_SN012776) {
 		int ret = macaudio_fix_sn012776_levels(card);
@@ -2940,7 +3017,7 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 		return ret;
 
 	data->speaker_id_gpios = devm_gpiod_get_array_optional(dev, "speaker-id",
-							       GPIOD_IN);
+							 GPIOD_IN);
 	if (IS_ERR(data->speaker_id_gpios))
 		return dev_err_probe(dev, PTR_ERR(data->speaker_id_gpios),
 				     "Failed to get speaker ID inputs\n");
@@ -2948,6 +3025,8 @@ static int macaudio_snd_platform_probe(struct platform_device *pdev)
 	    (!data->speaker_id_gpios->ndescs ||
 	     data->speaker_id_gpios->ndescs > MACAUDIO_MAX_SPEAKER_ID_GPIOS))
 		return dev_err_probe(dev, -EINVAL, "Invalid speaker ID input count\n");
+	data->allow_unsafe_tweeter_hpf =
+		device_property_read_bool(dev, "apple,allow-unsafe-tweeter-hpf");
 
 	/*
 	 * Without sense the PCM2 link is gone, and a card whose front-ends

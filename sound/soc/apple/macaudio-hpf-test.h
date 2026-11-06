@@ -370,19 +370,30 @@ static void macaudio_hpf_crossover_cleared_with_the_owner(struct kunit *test)
 	macaudio_test_expect_vols(test, &h.t, SN012776_0DB);
 }
 
-static void macaudio_hpf_restores_each_dt_corner(struct kunit *test)
+static void macaudio_hpf_refuses_unsafe_dt_corners(struct kunit *test)
 {
 	struct macaudio_test_hpfs h = {};
 	const unsigned int corners[] = { 0, 3, MACAUDIO_TEST_HPF_2HZ };
 
-	/* Capture different DT values, including a disabled playback HPF. */
+	/* Disabled and above 2 Hz are both unsafe for a declared crossover. */
 	macaudio_test_hpf_card_corners(test, &h, &macaudio_j413_cfg, 0, corners);
+	macaudio_test_take_with_xover(test, &h.t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &h.t, 30), -ERANGE);
+	macaudio_test_expect_hpf(test, &h, MACAUDIO_TEST_HPF_800HZ);
+	macaudio_test_expect_vols(test, &h.t, 0);
+}
+
+static void macaudio_hpf_dt_can_allow_unsafe_corners(struct kunit *test)
+{
+	struct macaudio_test_hpfs h = {};
+	const unsigned int corners[] = { 0, 3, MACAUDIO_TEST_HPF_2HZ };
+
+	macaudio_test_hpf_card_corners(test, &h, &macaudio_j413_cfg, 0, corners);
+	h.t.ma->allow_unsafe_tweeter_hpf = true;
 	macaudio_test_take_with_xover(test, &h.t);
 	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &h.t, 30), 0);
 	KUNIT_EXPECT_EQ(test, h.hpf[0].item, 0U);
 	KUNIT_EXPECT_EQ(test, h.hpf[1].item, 3U);
-	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &h.t, 0), 0);
-	macaudio_test_expect_hpf(test, &h, MACAUDIO_TEST_HPF_800HZ);
 }
 
 static struct kunit_case macaudio_hpf_cases[] = {
@@ -392,7 +403,8 @@ static struct kunit_case macaudio_hpf_cases[] = {
 	KUNIT_CASE(macaudio_hpf_failed_restore_is_a_failed_floor),
 	KUNIT_CASE(macaudio_hpf_failed_open_floors),
 	KUNIT_CASE(macaudio_hpf_other_machines_stay_at_800hz),
-	KUNIT_CASE(macaudio_hpf_restores_each_dt_corner),
+	KUNIT_CASE(macaudio_hpf_refuses_unsafe_dt_corners),
+	KUNIT_CASE(macaudio_hpf_dt_can_allow_unsafe_corners),
 	KUNIT_CASE(macaudio_hpf_undeclared_grant_keeps_800hz),
 	KUNIT_CASE(macaudio_hpf_crossover_latched_by_grant),
 	KUNIT_CASE(macaudio_hpf_crossover_is_the_owners),
