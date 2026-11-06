@@ -6,6 +6,7 @@
  * Copyright (C) Huawei Futurewei Technologies.
  */
 
+#include <linux/execmem.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/kernel.h>
@@ -54,6 +55,15 @@ void machine_kexec_cleanup(struct kimage *kimage)
  */
 int machine_kexec_prepare(struct kimage *kimage)
 {
+	/*
+	 * The relocation code runs from an ordinary page, outside the window,
+	 * and a crash dump can start on a core enforcing it.
+	 */
+	if (execmem_confine_enforced()) {
+		pr_err("Can't kexec: the kernel's code is confined to a CTXR window.\n");
+		return -EOPNOTSUPP;
+	}
+
 	if (kimage->type != KEXEC_TYPE_CRASH && cpus_are_stuck_in_kernel()) {
 		pr_err("Can't kexec: CPUs are stuck in the kernel.\n");
 		return -EBUSY;

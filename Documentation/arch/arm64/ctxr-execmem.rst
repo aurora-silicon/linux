@@ -85,6 +85,14 @@ aligned to the kernel's page size, the kernel warns once and turns runtime
 services off for that boot, as ``efi=noruntime`` would. When all of it is inside,
 runtime services stay on. A window in reporting mode leaves them on.
 
+kexec and crash kernels
+=======================
+
+The relocation code runs from an ordinary page, outside the window, and a crash
+dump can start on a confined core, where it would hang during a panic. While a
+window is enforcing, ``machine_kexec_prepare()`` therefore refuses both, so
+``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``.
+
 Verifying confinement
 =====================
 
