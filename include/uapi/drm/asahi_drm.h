@@ -371,11 +371,11 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD = (1UL) << 16,
 
 	/*
-	 * Bits 17 to 28 belong to the M5 (G17G/G17S) runtime, which reports
-	 * them; this kernel never does. They are listed so that the numbers are
-	 * not given to anything else, and userspace reads every kernel's
-	 * features the same way. Bits 25 and 27 are also reserved for that
-	 * runtime.
+	 * Bits 17 to 28 belong to the M5 (G17G/G17S) command set. This kernel
+	 * reports them only on M5 GPUs, and never bits 24 and 25 (see
+	 * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES). They are listed so that the
+	 * numbers are not given to anything else, and userspace reads every
+	 * kernel's features the same way.
 	 */
 
 	/** @DRM_ASAHI_FEATURE_RENDER_RESOURCES: M5: per-program render storage. */
@@ -404,13 +404,18 @@ enum drm_asahi_feature {
 
 	/**
 	 * @DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS: M5: a compute prefix for a
-	 * render's tiling half.
+	 * render's tiling half, in a shorter command form. Retired with
+	 * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES, for the same reason.
 	 */
 	DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS = (1UL) << 24,
 
 	/**
 	 * @DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES: M5: render commands accept
-	 * DRM_ASAHI_RENDER_STAGE_PREFIXES.
+	 * DRM_ASAHI_RENDER_STAGE_PREFIXES in a shorter command form. Retired: no
+	 * kernel may report this bit or bit 24 again. Userspace that sees either
+	 * sends staged renders of 352 or 368 bytes with prefix fields at bytes
+	 * 336 to 367, which struct drm_asahi_cmd_render gives to its ray-query
+	 * stages. Staged renders use DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2.
 	 */
 	DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES = (1UL) << 25,
 
@@ -447,7 +452,8 @@ enum drm_asahi_feature {
 	 * not report it. Bits 31 and 32 belong to the G18 (M6, T8152) backend,
 	 * which alone reports them. Bit 32 is
 	 * DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES, defined after this enum so
-	 * that the enum keeps its 32-bit type.
+	 * that the enum keeps its 32-bit type. Bit 33,
+	 * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2, is defined there too.
 	 */
 
 	/**
@@ -468,6 +474,14 @@ enum drm_asahi_feature {
  * drm_asahi_feature; a 64-bit enumerator would widen that enum's type.
  */
 #define DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES ((1ULL) << 32)
+
+/*
+ * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: M5: render commands accept
+ * DRM_ASAHI_RENDER_STAGE_PREFIXES as the complete struct
+ * drm_asahi_cmd_render_m5. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 ((1ULL) << 33)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
@@ -1401,7 +1415,7 @@ enum drm_asahi_render_flags {
 	 * waited on to completion. The payload must be the complete struct
 	 * drm_asahi_cmd_render_m5. Not combined with
 	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS. Requires
-	 * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES.
+	 * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2.
 	 */
 	DRM_ASAHI_RENDER_STAGE_PREFIXES = (1U << 23),
 
