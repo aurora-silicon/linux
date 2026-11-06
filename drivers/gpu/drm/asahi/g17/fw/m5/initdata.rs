@@ -1789,6 +1789,8 @@ pub(crate) struct Board {
     pub(crate) idle_standby_us: Option<u32>,
     /// The active memory cache controller mask, where it differs from the inherited 0xf.
     mcc_mask: Option<u64>,
+    /// HwData +0x100c and +0x1048 (all cores), where the board sets them.
+    topology_words: Option<(u32, u32)>,
     /// The hotspot at which the thermal governor's fan curve starts, millidegrees C.
     pub(crate) fan_curve_start_mc: i32,
     /// Whether the host encodings are the G17D ones measured on the M5 Ultra
@@ -1813,6 +1815,7 @@ pub(crate) const J714: Board = Board {
     controller_defaults: Some(encode_m5_policy_controller_defaults),
     idle_standby_us: None,
     mcc_mask: None,
+    topology_words: None,
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
 };
@@ -1830,11 +1833,13 @@ pub(crate) const J716C: Board = Board {
     register_windows: &J716C_REGISTER_WINDOWS,
     min_parameter_buffer: 0x0030_0000,
     render_pool: (0x80_0000, 1 << 33),
-    // J714's controller configuration, for a part with J714's calibration only.
-    calibration: Some([0xd2035701, 0xac3a1280, 0x0a281d81]),
-    controller_defaults: Some(encode_m5_policy_controller_defaults),
+    // Its own controller configuration, for a part with this calibration.
+    calibration: Some([0x7e4a4902, 0x8c4f3362, 0x96be56e5]),
+    controller_defaults: Some(encode_m5_policy_controller_defaults_j716c),
     idle_standby_us: None,
-    mcc_mask: None,
+    // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
+    mcc_mask: Some(0xff),
+    topology_words: Some((16, 40)),
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
 };
@@ -1865,6 +1870,7 @@ pub(crate) const J775D: Board = Board {
     idle_standby_us: Some(3500),
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
     mcc_mask: Some(0xff),
+    topology_words: None,
     // The SMC raises the fans in its automatic mode from a 97 C hotspot under a sustained
     // full-chip load, with the CPU and GPU still at their top states: the curve starts there,
     // above the SMC's own start rather than below it.
@@ -2298,6 +2304,10 @@ pub(crate) fn encode_m5_hw_data(
     put_u32(out, 0x272c, 1);
     if let Some(mask) = board.mcc_mask {
         put_u64(out, 0x10a8, mask);
+    }
+    if let Some((word, cores)) = board.topology_words {
+        put_u32(out, 0x100c, word);
+        put_u32(out, 0x1048, cores);
     }
     // The inherited J813 minimum parameter-buffer size is replaced per board.
     put_u32(out, 0x26b0, board.min_parameter_buffer);
@@ -2738,6 +2748,34 @@ pub(crate) fn encode_m5_policy_controller_defaults(out: &mut [u8]) -> Result<(),
         (0x12280, 0x43d60000),
     ];
     for &(offset, value) in INITIAL { put_u32(policy, offset, value); }
+    Ok(())
+}
+
+/// Initial controller inputs for J716c with its matched calibration: the J714
+/// defaults, including the relative power curves, with this chip's leakage
+/// values (clusters 0-3, base, AFR) and its maximum power (196098 mW), and the
+/// found masks of its AON PTD records (RT0g and RT1g, then RT0r) next to their
+/// tags.
+pub(crate) fn encode_m5_policy_controller_defaults_j716c(out: &mut [u8]) -> Result<(), InitdataError> {
+    encode_m5_policy_controller_defaults(out)?;
+    let policy = &mut out[M5_SHARED_LAYOUT.policy..M5_SHARED_LAYOUT.policy + M5_POLICY_SIZE];
+    const MAXIMUM_POWER: u32 = 196_098;
+    const MAXIMUM_POWER_F32: u32 = 0x483f_8080;
+    for offset in [M5_POLICY_MAXIMUM_POWER, 0xad0, 0x44a4, 0x44a8, 0x44ac, 0x45e4] {
+        put_u32(policy, offset, MAXIMUM_POWER);
+    }
+    for offset in [0x9f4, 0x45e0] {
+        put_u32(policy, offset, MAXIMUM_POWER_F32);
+    }
+    for (index, value) in [0x4524_9000, 0x451f_9000, 0x451f_9000, 0x4524_9000].into_iter().enumerate() {
+        put_u32(policy, 0x121b0 + index * 4, value);
+    }
+    for index in 0..4 {
+        put_u32(policy, 0x12230 + index * 4, 0x434d_8000);
+    }
+    put_u32(policy, 0x12280, 0x44b1_8000);
+    put_u32(policy, 0x11a64, 3);
+    put_u32(policy, 0x11a74, 1);
     Ok(())
 }
 
