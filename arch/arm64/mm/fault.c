@@ -607,14 +607,14 @@ static bool is_invalid_gcs_access(struct vm_area_struct *vma, u64 esr)
 /*
  * A core enforcing the CTXR window refuses EL0 fetches from it with a permission
  * fault that the page tables don't explain. Nothing can fix that up, so a retry
- * would fault forever with the task still runnable. The PFN may have no usable
- * struct page, so only compare it.
+ * would fault forever with the task still runnable. The window page may be
+ * mapped without a struct page (a driver's remap_pfn_range() of an image
+ * buffer), so fall back to a raw PFN walk and only ever compare the PFN.
  */
 static bool el0_fetch_refused_by_window(struct mm_struct *mm, unsigned long addr,
 					unsigned long esr, unsigned int mm_flags)
 {
 	struct vm_area_struct *vma;
-	struct folio_walk fw;
 	unsigned long pfn = 0;
 
 	if (!is_el0_instruction_abort(esr) || !esr_fsc_is_permission_fault(esr) ||
@@ -625,11 +625,20 @@ static bool el0_fetch_refused_by_window(struct mm_struct *mm, unsigned long addr
 		return false;
 
 	vma = vma_lookup(mm, addr);
-	if (vma && (vma->vm_flags & VM_EXEC) && !fault_from_pkey(vma, mm_flags) &&
-	    folio_walk_start(&fw, vma, addr, FW_ZEROPAGE)) {
-		if (fw.level == FW_LEVEL_PTE && pte_user_exec(fw.pte))
-			pfn = pte_pfn(fw.pte);
-		folio_walk_end(&fw, vma);
+	if (vma && (vma->vm_flags & VM_EXEC) && !fault_from_pkey(vma, mm_flags)) {
+		struct follow_pfnmap_args pfnmap = { .vma = vma, .address = addr,
+						     .allow_subpage = true };
+		struct folio_walk fw;
+
+		if (folio_walk_start(&fw, vma, addr, FW_ZEROPAGE)) {
+			if (fw.level == FW_LEVEL_PTE && pte_user_exec(fw.pte))
+				pfn = pte_pfn(fw.pte);
+			folio_walk_end(&fw, vma);
+		} else if ((vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP)) &&
+			   !follow_pfnmap_start(&pfnmap)) {
+			pfn = pfnmap.pfn;
+			follow_pfnmap_end(&pfnmap);
+		}
 	}
 	mmap_read_unlock(mm);
 

@@ -107,8 +107,10 @@ it up. Anything EL0 can execute therefore lives outside the window:
 
 As a backstop, when a window is active, an EL0 instruction permission fault on a
 present, executable mapping of a window page logs the task and its address and
-PFN, then kills it with an uncatchable ``SIGSEGV`` rather than retrying. Any
-other fault takes the usual path.
+PFN, then kills it with an uncatchable ``SIGSEGV`` rather than retrying. The
+mapping is resolved to a PFN either through its folio or, for a ``VM_PFNMAP`` or
+``VM_MIXEDMAP`` mapping with no struct page (a driver's ``remap_pfn_range()`` of
+an image buffer), through a raw PFN walk. Any other fault takes the usual path.
 
 EFI runtime services
 ====================
