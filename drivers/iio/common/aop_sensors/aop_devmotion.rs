@@ -33,6 +33,10 @@ const PROP_INTERVAL: u32 = 0;
 /// even though devmotion6 has no service-specific calibration packets.
 const PROP_CALIBRATION_STATE: u32 = 61;
 const CALIBRATION_DEFAULT: u32 = 1;
+/// The status a calibration-state write is answered with when the service
+/// already holds a state from an earlier start in the same AOP session (a
+/// rebind, a resume, or a warm reboot); the stream can be started as is.
+const STATUS_UNSUPPORTED: u32 = 0xe000_02c7;
 const INTERVAL_US: u32 = 20_000;
 const Q_FRAC_BITS: i32 = 30;
 
@@ -106,6 +110,10 @@ struct Control {
 
 impl Control {
     fn set(&self, prop: u32, value: u32) -> Result {
+        self.set_allowing(prop, value, 0)
+    }
+
+    fn set_allowing(&self, prop: u32, value: u32, also_ok: u32) -> Result {
         let mut msg = KVec::with_capacity(12, GFP_KERNEL)?;
         msg.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
         msg.extend_from_slice(&prop.to_le_bytes(), GFP_KERNEL)?;
@@ -113,7 +121,7 @@ impl Control {
         let status = self
             .aop
             .epic_call(&self.service, SUBTYPE_SET_PROPERTY, &msg)?;
-        if status != 0 {
+        if status != 0 && (also_ok == 0 || status != also_ok) {
             dev_err!(
                 self.dev,
                 "property {} refused: status {:#x}\n",
@@ -127,7 +135,7 @@ impl Control {
 
     /// Selects the default calibration before the first enable after probe.
     fn initialize(&self) -> Result {
-        self.set(PROP_CALIBRATION_STATE, CALIBRATION_DEFAULT)?;
+        self.set_allowing(PROP_CALIBRATION_STATE, CALIBRATION_DEFAULT, STATUS_UNSUPPORTED)?;
         self.enable()
     }
 
