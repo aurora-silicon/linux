@@ -1547,6 +1547,14 @@ static struct cpufreq_driver apple_soc_cpufreq_driver = {
 	.fast_switch	= apple_soc_cpufreq_fast_switch,
 	.register_em	= cpufreq_register_em_with_opp,
 	.set_boost	= cpufreq_boost_set_sw,
+	/*
+	 * The turbo-mode OPPs of M1, M1 Pro/Max and M2 are the frequencies
+	 * the firmware grants a cluster while its other cores sleep in CPU PD,
+	 * as it does under macOS, which runs them by default. Start with them
+	 * allowed; cpufreq/boost and the per-policy boost files still turn
+	 * them off. Policies without boost frequencies are not affected.
+	 */
+	.boost_enabled	= true,
 	.suspend	= apple_soc_cpufreq_suspend,
 };
 
