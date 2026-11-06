@@ -498,6 +498,40 @@ impl SepData {
         })
     }
 
+    /// Locks the special handle's bag: state 1, flags 1, no secret, in the
+    /// same request form as `sks_req_unlock_special`.
+    pub(crate) fn sks_req_lock_special(
+        &self,
+        special: crate::sks::SpecialHandle,
+        healthy: Healthy,
+    ) -> Result<SksRequest> {
+        let Healthy(()) = healthy;
+        let mut body = image::Body::new();
+        if self.profile.key_store != profile::KeyStore::Variant5 {
+            body.put_u32(0)?;
+            body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+            body.put_i32(special.value())?;
+            body.put_i32(LockState::Locked.wire())?;
+            body.put_u64(SKS_LOCK_FLAGS)?;
+            body.put_blob(&[])?;
+            let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+            let len = self.sks_image_len(&img)?;
+            let msg = crate::sks::encode_sks_device_state_transition(self.sks_next_seq(), len);
+            return Ok(SksRequest { name: crate::sks::SKS_DEVICE_STATE_NAME, msg, img });
+        }
+        body.put_u32(SKS_LOCK_STATE_VARIANT)?;
+        body.put_u64(crate::sks::SKS_CLIENT_ID)?;
+        body.put_i32(special.value())?;
+        body.put_i32(LockState::Locked.wire())?;
+        body.put_blob(&[])?;
+        body.put_u64(SKS_LOCK_FLAGS)?;
+        let img = image::build_request(self.sks_ipc_version(), self.sks_timestamp_us(), &body)?;
+        let len = self.sks_image_len(&img)?;
+        let msg =
+            crate::sks::encode_sks_change_lock_state(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        Ok(SksRequest { name: crate::sks::SKS_LOCK_STATE_NAME, msg, img })
+    }
+
     /// `0x18` device-state transition to unlocked, the 13.5 identity-session
     /// unlock: `device_state_transition` for the session's handle and secret,
     /// with state 0 and flags 0.
