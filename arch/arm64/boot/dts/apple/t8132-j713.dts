@@ -127,6 +127,25 @@
 		};
 	};
 
+	reserved-memory {
+		/*
+		 * iBoot loads the ISP firmware outside the kernel's memory, at
+		 * addresses that move with the boot firmware. The boot loader
+		 * fills these placeholders from the ADT's isp segment-ranges: reg,
+		 * and iommu-addresses where the firmware runs them, from
+		 * 0x100_0000_0000 on. The driver checks that the coprocessor's
+		 * reset vector is this text before it starts the firmware.
+		 */
+		isp_fw_text: isp-firmware-text { };
+
+		isp_fw_data: isp-firmware-data { };
+
+		/* the firmware's 20 MiB main memory, the driver allocates above it */
+		isp_heap: isp-heap {
+			iommu-addresses = <&isp 0x100 0x0 0x0 0x1400000>;
+		};
+	};
+
 	/*
 	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
 	 * and that no OS switches. The ADT gives the flash no supply.
@@ -135,6 +154,34 @@
 		compatible = "regulator-fixed";
 		regulator-name = "nor-flash-vcc";
 		regulator-always-on;
+	};
+};
+
+/*
+ * The boot loader enables the ISP and its DARTs once it has filled the
+ * firmware placeholders and set apple,platform-id, the ADT isp node's
+ * sensor-type (the J713 ADT has no cam-connections-scheme).
+ */
+&isp {
+	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+	memory-region-names = "text", "data", "heap";
+
+	/* The front camera, an IMX958: configuration 5, as on the J616s. */
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <0 0 1920 1080>;
+		};
+		/* 1280x720 */
+		preset1 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 0 1280 720>;
+		};
 	};
 };
 
