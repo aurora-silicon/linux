@@ -85,6 +85,8 @@
 #define AJ_QTBL(t)			(0x1100 + 0x40 * (t))
 
 #define AJ_HWREV_MASK			0xffff0fff
+/* ADT hw-type 0x101008; its stepping nibble is masked off like T8140's. */
+#define AJ_HWREV_T6041			0x100008
 #define AJ_HWREV_T8140			0x110000
 
 struct apple_jpeg_variant {
@@ -92,8 +94,14 @@ struct apple_jpeg_variant {
 	u32 hwrev;
 };
 
-/* T6041 has the engine too, but its register layout is not qualified. */
-static const struct apple_jpeg_variant apple_jpeg_t6041 = { };
+/*
+ * T6041 identifies as 0x101008 but uses the same 64-bit address layout and
+ * encode programming as T8140.
+ */
+static const struct apple_jpeg_variant apple_jpeg_t6041 = {
+	.hwrev_mask = AJ_HWREV_MASK,
+	.hwrev = AJ_HWREV_T6041,
+};
 
 static const struct apple_jpeg_variant apple_jpeg_t8140 = {
 	.hwrev_mask = AJ_HWREV_MASK,
