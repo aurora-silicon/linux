@@ -151,6 +151,97 @@ static void dchid_short_input_test(struct kunit *test)
 	dchid_packet_work(&work->work);
 }
 
+static void dchid_firmware_parser_test(struct kunit *test)
+{
+	struct {
+		struct fw_header hdr;
+		u8 payload[8];
+	} __packed image = {
+		.hdr = {
+			.magic = cpu_to_le32(FW_MAGIC),
+			.version = cpu_to_le32(FW_VER),
+			.hdr_length = cpu_to_le32(sizeof(struct fw_header)),
+			.data_length = cpu_to_le32(8),
+			.iface_offset = cpu_to_le32(3),
+		},
+		.payload = { 0xa5, 0x5a, 0x11, 0, 0x22, 0x33, 0x44, 0x55 },
+	};
+	struct dchid_fw_payload payload = { .offset = SIZE_MAX };
+	size_t length;
+
+	for (length = 0; length < sizeof(image); length++) {
+		KUNIT_EXPECT_EQ(test, dchid_parse_firmware(&image, length, &payload),
+				-EINVAL);
+		KUNIT_EXPECT_EQ(test, payload.offset, SIZE_MAX);
+	}
+
+	KUNIT_ASSERT_EQ(test,
+			dchid_parse_firmware(&image, sizeof(image), &payload), 0);
+	KUNIT_EXPECT_EQ(test, payload.offset, sizeof(struct fw_header));
+	KUNIT_EXPECT_EQ(test, payload.length, sizeof(image.payload));
+	KUNIT_EXPECT_EQ(test, payload.iface_offset, 3U);
+}
+
+static void dchid_firmware_bounds_test(struct kunit *test)
+{
+	struct fw_header hdr = {
+		.magic = cpu_to_le32(FW_MAGIC),
+		.version = cpu_to_le32(FW_VER),
+		.hdr_length = cpu_to_le32(sizeof(hdr)),
+		.data_length = cpu_to_le32(1),
+	};
+	struct dchid_fw_payload payload;
+
+	KUNIT_EXPECT_EQ(test, dchid_parse_firmware(&hdr, sizeof(hdr), &payload),
+			-EINVAL);
+	hdr.data_length = cpu_to_le32(U32_MAX);
+	KUNIT_EXPECT_EQ(test, dchid_parse_firmware(&hdr, sizeof(hdr), &payload),
+			-EINVAL);
+	hdr.data_length = cpu_to_le32(1);
+	hdr.iface_offset = cpu_to_le32(1);
+	KUNIT_EXPECT_EQ(test, dchid_parse_firmware(&hdr, sizeof(hdr) + 1, &payload),
+			-EINVAL);
+	hdr.iface_offset = 0;
+	hdr.hdr_length = cpu_to_le32(U32_MAX);
+	KUNIT_EXPECT_EQ(test, dchid_parse_firmware(&hdr, sizeof(hdr), &payload),
+			-EINVAL);
+}
+
+static void dchid_kiwi_raw_report_test(struct kunit *test)
+{
+	struct dchid_iface *iface = test->priv;
+	struct dchid_hdr hdr = {};
+	struct {
+		struct dchid_subhdr sub;
+		u8 report[24];
+	} __packed frame = {
+		.sub = { .flags = FIELD_PREP(FLAGS_GROUP, HID_INPUT_REPORT),
+			 .length = 24 },
+		.report = { 0x5a, 1, 0, 4, 0, 0xa5, 0x5a },
+	};
+	void *payload;
+	size_t length;
+
+	iface->name = "kiwi";
+	hdr.length = sizeof(frame);
+	KUNIT_ASSERT_EQ(test,
+			dchid_parse_subpacket(&hdr, &frame, &payload, &length),
+			HID_INPUT_REPORT);
+	KUNIT_EXPECT_EQ(test, length, sizeof(frame.report));
+	KUNIT_EXPECT_PTR_EQ(test, payload, frame.report);
+	KUNIT_EXPECT_EQ(test, *(u8 *)payload, 0x5a);
+	KUNIT_EXPECT_FALSE(test, dchid_wake_report(iface, &frame));
+
+	/* The outer transport rejects every truncated application header. */
+	for (hdr.length = 0; hdr.length < sizeof(frame.sub); hdr.length++)
+		KUNIT_EXPECT_EQ(test, dchid_parse_subpacket(&hdr, &frame, &payload,
+							    &length), -EMSGSIZE);
+	hdr.length = sizeof(frame) - 1;
+	KUNIT_EXPECT_EQ(test,
+			dchid_parse_subpacket(&hdr, &frame, &payload, &length),
+			-EMSGSIZE);
+}
+
 static void dchid_init_descriptor_test(struct kunit *test)
 {
 	struct dchid_iface *iface = test->priv;
@@ -264,6 +355,9 @@ static struct kunit_case dchid_parser_cases[] = {
 	KUNIT_CASE(dchid_ack_copy_test),
 	KUNIT_CASE(dchid_init_bounds_test),
 	KUNIT_CASE(dchid_short_input_test),
+	KUNIT_CASE(dchid_firmware_parser_test),
+	KUNIT_CASE(dchid_firmware_bounds_test),
+	KUNIT_CASE(dchid_kiwi_raw_report_test),
 	KUNIT_CASE(dchid_init_descriptor_test),
 	KUNIT_CASE(dchid_packet_checksum_test),
 	KUNIT_CASE(dchid_ring_wrap_test),

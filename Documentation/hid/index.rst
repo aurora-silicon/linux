@@ -18,6 +18,7 @@ Human Interface Devices (HID)
 
    hid-alps
    apple-j700-multitouch
+   apple-kiwi-touchscreen
    intel-ish-hid
    intel-thc-hid
    amd-sfh-hid

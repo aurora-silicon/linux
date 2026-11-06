@@ -33,8 +33,9 @@ config HID_DOCKCHANNEL_PARSER_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Build tests that pass malformed MTP frames to the initialization,
-	  input-report and acknowledgment handlers. Cover short headers,
-	  oversized lengths, interface indices and acknowledgment identity.
-	  The tests run without a DockChannel or HID device.
+	  input-report, firmware-container and acknowledgment handlers. Cover
+	  short headers, oversized lengths, interface indices, raw touchscreen
+	  reports and acknowledgment identity. The tests run without a
+	  DockChannel or HID device.
 
 endmenu

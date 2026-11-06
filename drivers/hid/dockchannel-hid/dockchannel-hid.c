@@ -139,12 +139,18 @@ struct dchid_stm_id {
 #define FW_VER 1
 
 struct fw_header {
-	u32 magic;
-	u32 version;
-	u32 hdr_length;
-	u32 data_length;
-	u32 iface_offset;
+	__le32 magic;
+	__le32 version;
+	__le32 hdr_length;
+	__le32 data_length;
+	__le32 iface_offset;
 } __packed;
+
+struct dchid_fw_payload {
+	size_t offset;
+	size_t length;
+	size_t iface_offset;
+};
 
 struct dchid_work {
 	struct work_struct work;
@@ -599,12 +605,38 @@ static int dchid_send_firmware(struct dchid_iface *iface, void *firmware, size_t
 	return dchid_comm_cmd(iface->dchid, &msg, sizeof(msg));
 }
 
+static int dchid_parse_firmware(const void *data, size_t size,
+				struct dchid_fw_payload *payload)
+{
+	const struct fw_header *hdr = data;
+	size_t hdr_length, data_length, iface_offset;
+
+	if (size < sizeof(*hdr))
+		return -EINVAL;
+
+	hdr_length = le32_to_cpu(hdr->hdr_length);
+	data_length = le32_to_cpu(hdr->data_length);
+	iface_offset = le32_to_cpu(hdr->iface_offset);
+
+	if (le32_to_cpu(hdr->magic) != FW_MAGIC ||
+	    le32_to_cpu(hdr->version) != FW_VER ||
+	    hdr_length < sizeof(*hdr) || hdr_length > size ||
+	    !data_length || data_length > size - hdr_length ||
+	    (iface_offset && iface_offset >= data_length))
+		return -EINVAL;
+
+	payload->offset = hdr_length;
+	payload->length = data_length;
+	payload->iface_offset = iface_offset;
+	return 0;
+}
+
 static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t *size)
 {
 	int ret;
 	const char *fw_name;
 	const struct firmware *fw;
-	struct fw_header *hdr;
+	struct dchid_fw_payload payload;
 	u8 *fw_data;
 
 	ret = of_property_read_string(iface->of_node, "firmware-name", &fw_name);
@@ -619,37 +651,25 @@ static int dchid_get_firmware(struct dchid_iface *iface, void **firmware, size_t
 	if (ret)
 		return ret;
 
-	if (fw->size < sizeof(*hdr)) {
-		dev_warn(iface->dchid->dev, "%s: firmware too short for its header\n",
-			 fw_name);
-		ret = -EINVAL;
-		goto done;
-	}
-
-	hdr = (struct fw_header *)fw->data;
-
-	if (hdr->magic != FW_MAGIC || hdr->version != FW_VER ||
-		hdr->hdr_length < sizeof(*hdr) || hdr->hdr_length > fw->size ||
-		(hdr->hdr_length + (size_t)hdr->data_length) > fw->size ||
-		hdr->iface_offset >= hdr->data_length) {
+	ret = dchid_parse_firmware(fw->data, fw->size, &payload);
+	if (ret) {
 		dev_warn(iface->dchid->dev, "%s: invalid firmware header\n",
 			 fw_name);
-		ret = -EINVAL;
 		goto done;
 	}
 
-	fw_data = devm_kmemdup(iface->dchid->dev, fw->data + hdr->hdr_length,
-			       hdr->data_length, GFP_KERNEL);
+	fw_data = devm_kmemdup(iface->dchid->dev, fw->data + payload.offset,
+			       payload.length, GFP_KERNEL);
 	if (!fw_data) {
 		ret = -ENOMEM;
 		goto done;
 	}
 
-	if (hdr->iface_offset)
-		fw_data[hdr->iface_offset] = iface->index;
+	if (payload.iface_offset)
+		fw_data[payload.iface_offset] = iface->index;
 
 	*firmware = fw_data;
-	*size = hdr->data_length;
+	*size = payload.length;
 
 done:
 	release_firmware(fw);
@@ -699,6 +719,7 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 
 static int dchid_start_interface(struct dchid_iface *iface)
 {
+	bool reset_after_firmware = !strcmp(iface->name, "multi-touch");
 	void *fw;
 	size_t size;
 	int ret;
@@ -727,7 +748,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			goto err;
 	}
 
-	/* Only multi-touch has firmware */
+	/* Any named interface can carry a DT-selected firmware payload. */
 	if (fw && size) {
 
 		/* Send firmware to the device */
@@ -750,7 +771,15 @@ static int dchid_start_interface(struct dchid_iface *iface)
 			goto err;
 		}
 
-		/* After loading firmware, multi-touch needs a reset */
+		/*
+		 * The reset sequence is a property of the trackpad, not of command
+		 * 0x95. Other bootloadable interfaces must not inherit those power
+		 * transitions without their own independently established sequence.
+		 */
+		if (!reset_after_firmware)
+			return 0;
+
+		/* After loading firmware, multi-touch needs a reset. */
 		dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
 		if (iface->power_method == DCHID_POWER_METHOD_2) {
 			/* The retained session is already off while reset is asserted. */
@@ -1222,37 +1251,44 @@ static void dchid_handle_report(struct dchid_iface *iface, void *data, size_t le
 	hid_input_report(iface->hid, HID_INPUT_REPORT, data, length, 1);
 }
 
+static int dchid_parse_subpacket(const struct dchid_hdr *hdr, void *data,
+				 void **payload, size_t *length)
+{
+	struct dchid_subhdr *shdr = data;
+
+	if (hdr->length < sizeof(*shdr) ||
+	    shdr->length > hdr->length - sizeof(*shdr))
+		return -EMSGSIZE;
+
+	*payload = data + sizeof(*shdr);
+	*length = shdr->length;
+	return FIELD_GET(FLAGS_GROUP, shdr->flags);
+}
+
 static void dchid_packet_work(struct work_struct *ws)
 {
 	struct dchid_work *work = container_of(ws, struct dchid_work, work);
-	struct dchid_subhdr *shdr = (void *)work->data;
 	struct dockchannel_hid *dchid = work->iface->dchid;
-	u8 *payload = work->data + sizeof(*shdr);
+	void *payload;
+	size_t length;
 	int type;
 
 	if (READ_ONCE(dchid->stopping))
 		goto out;
 
-	if (work->hdr.length < sizeof(*shdr)) {
-		dev_err(dchid->dev, "Short packet (%u bytes) for iface %d\n",
+	type = dchid_parse_subpacket(&work->hdr, work->data, &payload, &length);
+	if (type < 0) {
+		dev_err(dchid->dev, "Malformed packet (%u bytes) for iface %d\n",
 			work->hdr.length, work->hdr.iface);
 		goto out;
 	}
 
-	if (shdr->length + sizeof(*shdr) > work->hdr.length) {
-		dev_err(dchid->dev, "Bad sub header length (%hu > %zu)\n",
-			shdr->length, work->hdr.length - sizeof(*shdr));
-		goto out;
-	}
-
-	type = FIELD_GET(FLAGS_GROUP, shdr->flags);
-
 	switch (type) {
 	case HID_INPUT_REPORT:
 		if (work->hdr.iface == IFACE_COMM)
-			dchid_handle_event(dchid, payload, shdr->length);
+			dchid_handle_event(dchid, payload, length);
 		else
-			dchid_handle_report(work->iface, payload, shdr->length);
+			dchid_handle_report(work->iface, payload, length);
 		break;
 	default:
 		dev_err(dchid->dev, "Received unknown packet type %d\n", type);
