@@ -155,6 +155,7 @@ ASAHI_TESTS = {
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
+    'rtkit-retained-tests.py': [(out(), PASS)],
     't6030-clock-tests.py': [(out(), PASS)],
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-display-linkage-tests.py': [(out('--output') + ['--conf', '{conf}'], PASS)],

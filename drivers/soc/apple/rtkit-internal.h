@@ -63,6 +63,15 @@ struct apple_rtkit {
 	struct work_struct sync_ack_work;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	/* Endpoints started in this session; kept by a retained wake. */
+	DECLARE_BITMAP(started, APPLE_RTKIT_MAX_ENDPOINTS);
+	/*
+	 * apple_rtkit_wake_retained() in progress: the endpoint map is answered
+	 * with the started endpoints and nothing is started again; a QUIESCED
+	 * report gets one ON request.
+	 */
+	bool retained_wake;
+	bool retained_on_sent;
 
 	struct apple_rtkit_shmem ioreport_buffer;
 	struct apple_rtkit_shmem coreanalytics_buffer;
