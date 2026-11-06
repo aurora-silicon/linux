@@ -1898,6 +1898,12 @@ impl Pair {
             visit(active.packet.completion.status());
         }
     }
+    /// The context ID (UAT slot) of every in-flight packet.
+    pub(crate) fn visit_contexts(&self, visit: &mut dyn FnMut(u32)) {
+        for active in self.active.iter() {
+            visit(active.packet.context.id());
+        }
+    }
     pub(crate) fn classify(&self, classify: &dyn Fn(&Arc<VmStatus>) -> recovery::Class) {
         for active in self.active.iter() {
             active

@@ -193,6 +193,42 @@ impl Sources {
         }
         culprit().map_or(Attribution::Firmware, Attribution::Queues)
     }
+
+    /// A page fault's MMU record names the UAT slots of the faulting accesses. Firmware blames
+    /// a queue it chose, which can be a bystander's (a compute write fault blamed on a render
+    /// queue of another VM). When the in-flight work of those slots (`culprit`) does not include
+    /// the blamed queue, that work is blamed instead; without such evidence the firmware's blame
+    /// stands.
+    pub(super) fn fault_override(
+        &self,
+        attribution: Attribution,
+        blamed: Option<u8>,
+        slots: u64,
+        culprit: impl FnOnce(u64) -> Option<u128>,
+    ) -> Attribution {
+        if self.reason != Some(PAGE_FAULT) || attribution != Attribution::Firmware || slots == 0 {
+            return attribution;
+        }
+        let Some(blamed) = blamed else {
+            return attribution;
+        };
+        match culprit(slots) {
+            Some(qids) if qids != 0 && qids & (1u128 << blamed) == 0 => Attribution::Queues(qids),
+            _ => attribution,
+        }
+    }
+}
+
+/// The QIDs of every queue with an in-flight packet in one of the UAT `slots`. `visit` reports
+/// each in-flight packet as its queue's QIDs and its context ID (the UAT slot it runs in).
+pub(crate) fn fault_qids(slots: u64, visit: impl FnOnce(&mut dyn FnMut(u128, u32))) -> Option<u128> {
+    let mut qids = 0;
+    visit(&mut |queue, context| {
+        if 1u64.checked_shl(context).is_some_and(|bit| bit & slots != 0) {
+            qids |= queue;
+        }
+    });
+    (qids != 0).then_some(qids)
 }
 
 #[kernel::macros::kunit_tests(asahi_g17_recovery_sources)]
@@ -289,5 +325,77 @@ mod tests {
         sources.reason = Some(0);
         assert_eq!(sources.host_fallback(Attribution::NoCulprit, || panic!("slot evidence")),
             Attribution::NoCulprit);
+    }
+
+    /// The in-flight work of 2026-11-06 12:37:58: WoW's render pair (QIDs 65 and 66, four
+    /// renders in context 19) and a compute test's queue 60 in context 17.
+    fn incident(slots: u64) -> Option<u128> {
+        fault_qids(slots, |visit| {
+            for _ in 0..4 {
+                visit(3 << 65, 19);
+            }
+            visit(1 << 60, 17);
+        })
+    }
+
+    #[test]
+    fn a_page_fault_in_another_vm_moves_firmware_blame() {
+        // Both MMU banks: write ReadOnly, units CMP(2)/CMP(0), vm_slot 17. Firmware blamed
+        // queue 66; slot 5's key read 0, so slot identity could not check it.
+        let mut sources = Sources::sample(1 << 5, |_| Some((0, 0)));
+        sources.reason = Some(PAGE_FAULT);
+        let attribution = sources.attribute(Some(66), |_, _| panic!("unknown key"));
+        assert_eq!(attribution, Attribution::Firmware);
+        let attribution = sources.host_fallback(attribution, || panic!("page fault"));
+        assert_eq!(sources.fault_override(attribution, Some(66), 1 << 17, incident),
+            Attribution::Queues(1 << 60));
+    }
+
+    #[test]
+    fn a_page_fault_in_the_blamed_vm_keeps_firmware_blame() {
+        let mut sources = Sources::sample(1 << 5, |_| Some((0, 0)));
+        sources.reason = Some(PAGE_FAULT);
+        assert_eq!(sources.fault_override(Attribution::Firmware, Some(66), 1 << 19, incident),
+            Attribution::Firmware);
+        // Both VMs faulted: the blamed queue is among the culprits.
+        assert_eq!(sources.fault_override(Attribution::Firmware, Some(66), (1 << 17) | (1 << 19),
+            incident), Attribution::Firmware);
+    }
+
+    #[test]
+    fn a_page_fault_without_slot_evidence_keeps_firmware_blame() {
+        let mut sources = Sources::sample(1 << 5, |_| Some((0, 0)));
+        sources.reason = Some(PAGE_FAULT);
+        // No decodable fault in either bank (reason 3 with clear status words).
+        assert_eq!(sources.fault_override(Attribution::Firmware, Some(66), 0, |_| panic!("no fault")),
+            Attribution::Firmware);
+        // No in-flight work runs in the faulting slot.
+        assert_eq!(sources.fault_override(Attribution::Firmware, Some(66), 1 << 23, incident),
+            Attribution::Firmware);
+        // Firmware blamed no queue: the recovery table alone decides, as before.
+        assert_eq!(sources.fault_override(Attribution::Firmware, None, 1 << 17, |_| panic!("no blame")),
+            Attribution::Firmware);
+    }
+
+    #[test]
+    fn fault_slots_never_override_a_timeout_or_slot_evidence() {
+        let mut sources = Sources::sample(1 << 5, |_| Some((0, 0)));
+        sources.reason = Some(2);
+        assert_eq!(sources.fault_override(Attribution::Firmware, Some(66), 1 << 17, |_| panic!("timeout")),
+            Attribution::Firmware);
+        sources.reason = Some(PAGE_FAULT);
+        assert_eq!(sources.fault_override(Attribution::NoCulprit, Some(66), 1 << 17, |_| panic!("slots")),
+            Attribution::NoCulprit);
+        assert_eq!(sources.fault_override(Attribution::Queues(1 << 38), Some(66), 1 << 17,
+            |_| panic!("slots")), Attribution::Queues(1 << 38));
+    }
+
+    #[test]
+    fn fault_qids_match_contexts_by_uat_slot() {
+        assert_eq!(incident(1 << 17), Some(1 << 60));
+        assert_eq!(incident(1 << 19), Some(3 << 65));
+        assert_eq!(incident(0), None);
+        // A context ID beyond the mask's 64 slots never matches.
+        assert_eq!(fault_qids(u64::MAX, |visit| visit(1 << 7, 64)), None);
     }
 }
