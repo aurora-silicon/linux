@@ -40,6 +40,9 @@ static void dcpib_rtk_recv(void *cookie, u8 ep, u64 message)
 	struct dcpib *dcp = cookie;
 	struct dcpib_ep *e = NULL;
 
+	mutex_lock(&dcp->rx_gate);
+	if (dcp->stopping)
+		goto out;
 	if (ep >= DCPIB_FIRST_EP && ep < DCPIB_FIRST_EP + DCPIB_NR_EPS)
 		e = dcp->eps[ep - DCPIB_FIRST_EP];
 	if (e)
@@ -47,6 +50,8 @@ static void dcpib_rtk_recv(void *cookie, u8 ep, u64 message)
 	else
 		dev_dbg(dcp->dev, "message %#llx for idle endpoint %#x\n",
 			message, ep);
+out:
+	mutex_unlock(&dcp->rx_gate);
 }
 
 static void dcpib_rtk_crashed(void *cookie, const void *crashlog, size_t size)
@@ -128,22 +133,12 @@ static const struct drm_driver dcpib_drm_driver = {
  * endpoints explicitly (dcpib_ep_start), as drm/apple does for live M5
  * sessions.
  */
-static void dcpib_rtkit_free(void *data)
-{
-	apple_rtkit_free(data);
-}
-
 static int dcpib_boot(struct dcpib *dcp)
 {
-	int ret;
-
 	dcp->rtk = apple_rtkit_init_adopted(dcp->dev, dcp, NULL, 0,
 					    &dcpib_rtkit_ops);
 	if (IS_ERR(dcp->rtk))
 		return PTR_ERR(dcp->rtk);
-	ret = devm_add_action_or_reset(dcp->dev, dcpib_rtkit_free, dcp->rtk);
-	if (ret)
-		return ret;
 	return apple_rtkit_adopt_running(dcp->rtk);
 }
 
@@ -366,10 +361,11 @@ static void dcpib_av_work(struct work_struct *work)
 	struct dcpib *dcp = container_of(to_delayed_work(work), struct dcpib,
 					 av_work);
 
-	dcpib_reset_mode(dcp);
+	if (READ_ONCE(dcp->ready))
+		dcpib_reset_mode(dcp);
 }
 
-static int dcpib_probe(struct platform_device *pdev)
+static int dcpib_probe_inner(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *hdmi_np __free(device_node) = dcpib_hdmi_node();
@@ -396,6 +392,7 @@ static int dcpib_probe(struct platform_device *pdev)
 	dcp->dev = dev;
 	platform_set_drvdata(pdev, dcp);
 	mutex_init(&dcp->lock);
+	mutex_init(&dcp->rx_gate);
 	INIT_DELAYED_WORK(&dcp->av_work, dcpib_av_work);
 	of_property_read_u32(dev->of_node, "apple,die", &dcp->die);
 
@@ -496,9 +493,42 @@ static int dcpib_probe(struct platform_device *pdev)
 	ret = drm_dev_register(&dcp->drm, 0);
 	if (ret)
 		return ret;
+	WRITE_ONCE(dcp->ready, true);
 	if (dcp->hpd_gpio || dcp->pd)
 		drmm_kms_helper_poll_init(&dcp->drm);
 	drm_client_setup(&dcp->drm, NULL);
+	return 0;
+}
+
+static int dcpib_probe(struct platform_device *pdev)
+{
+	struct dcpib *dcp;
+	int ret;
+
+	platform_set_drvdata(pdev, NULL);
+	ret = dcpib_probe_inner(pdev);
+	dcp = platform_get_drvdata(pdev);
+	if (!ret || !dcp || IS_ERR_OR_NULL(dcp->rtk))
+		return ret;
+
+	/*
+	 * Once adopted, the DCP may still DMA into our buffers on any error.
+	 * Gate RX before draining endpoint work; keep RTKit available until
+	 * every sender has stopped. Do not reclaim firmware-visible storage
+	 * or let driver-core retry a partially started session.
+	 */
+	WRITE_ONCE(dcp->ready, false);
+	mutex_lock(&dcp->rx_gate);
+	dcp->stopping = true;
+	mutex_unlock(&dcp->rx_gate);
+	flush_workqueue(dcp->wq);
+	cancel_delayed_work_sync(&dcp->av_work);
+	dcpib_kms_stop(dcp);
+	apple_rtkit_free_retaining_buffers(dcp->rtk);
+	dcp->rtk = NULL;
+	dev_err(dcp->dev,
+		"initialization failed (%d); live DMA resources retained until reboot\n",
+		ret);
 	return 0;
 }
 
@@ -517,7 +547,13 @@ static struct platform_driver dcpib_platform_driver = {
 	},
 	.probe = dcpib_probe,
 };
-module_platform_driver(dcpib_platform_driver);
+
+/* There is no safe firmware shutdown/handoff yet; never unload this module. */
+static int __init dcpib_init(void)
+{
+	return platform_driver_register(&dcpib_platform_driver);
+}
+module_init(dcpib_init);
 
 MODULE_DESCRIPTION("Apple T8152 DCP display driver (iBoot interface)");
 MODULE_LICENSE("Dual MIT/GPL");
