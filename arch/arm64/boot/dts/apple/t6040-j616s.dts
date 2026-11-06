@@ -26,6 +26,30 @@
 	brcm,board-type = "apple,hostomel";
 };
 
+&smc {
+	smc_gpio_low_stockholm: gpio-low {
+		compatible = "apple,smc-low-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+		apple,output-templates = <0xe 0x00800000>;
+	};
+};
+
+&aop_spmi0 {
+	status = "okay";
+
+	stockholm: nfc@9 {
+		compatible = "apple,stockholm-nci";
+		reg = <9 SPMI_USID>;
+		interrupt-parent = <&aop_spmi0>;
+		interrupts = <229 IRQ_TYPE_EDGE_RISING>,
+			     <230 IRQ_TYPE_EDGE_RISING>,
+			     <227 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wake", "data-ready", "error";
+		enable-gpios = <&smc_gpio_low_stockholm 0xe GPIO_ACTIVE_HIGH>;
+	};
+};
+
 &panel {
 	compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
 	width-mm = <345>;

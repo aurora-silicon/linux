@@ -905,6 +905,19 @@
 			status = "disabled";
 		};
 
+		aop_spmi0: spmi@100914000 {
+			compatible = "apple,t8140-spmi", "apple,t8103-spmi";
+			reg = <0x1 0x00914000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 432 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_aop_spmi0>;
+			status = "disabled";
+		};
+
 		smc: smc@30c600000 {
 			compatible = "apple,t8140-smc", "apple,t8103-smc";
 			reg = <0x3 0x0c600000 0x0 0x4000>,
