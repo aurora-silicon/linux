@@ -6,6 +6,7 @@
 use super::DeferredBatch;
 use crate::g17::{
     channel, event,
+    completion_rekick::{self, Engine},
     fw::channels::{Event, FreeListCompletion, TvbGrowRequest},
     recovery,
     status::VmStatus,
@@ -254,6 +255,68 @@ impl recovery::Queues for Service<'_> {
 }
 
 impl Firmware {
+    /// Runs after the firmware event ring, compute completion ring and render
+    /// observations have all been drained for this worker turn. Each selected
+    /// priority receives at most one ordinary work notification per engine.
+    fn completion_rekick(&self, masks: [u64; 2]) -> Result {
+        use crate::g17::fw::queue::Policy;
+
+        let compute_enabled = completion_rekick::selected_for(
+            self.variant.graph,
+            Engine::Compute,
+            true,
+            true,
+        );
+        let render_enabled = completion_rekick::selected_for(
+            self.variant.graph,
+            Engine::Render,
+            true,
+            true,
+        );
+        if !compute_enabled && !render_enabled {
+            return Ok(());
+        }
+        let mut compute = [false; Policy::PRIORITIES as usize];
+        if compute_enabled {
+            for queue in self
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+            {
+                if let Some(priority) = queue.completion_rekick_priority(masks) {
+                    compute[usize::from(priority)] = true;
+                }
+            }
+        }
+        let render = if render_enabled {
+            self.queues.render_completion_rekick_priorities(masks)
+        } else {
+            [false; Policy::PRIORITIES as usize]
+        };
+        for priority in 0..Policy::PRIORITIES {
+            for (engine, pipe, selected) in [
+                (crate::g17::trace::COMPUTE, 2u64, compute[usize::from(priority)]),
+                (
+                    crate::g17::trace::RENDER,
+                    0u64,
+                    render[usize::from(priority)],
+                ),
+            ] {
+                if !selected {
+                    continue;
+                }
+                let message =
+                    (0x83 << crate::g17::MSG_TYPE_SHIFT) | pipe | u64::from(priority) << 2;
+                crate::g17::trace::doorbell(engine, || self.bridge.regs.g17_core_power());
+                crate::g17::trace::message(crate::g17::trace::REKICK, message);
+                self.primary.notify(message)?;
+            }
+        }
+        Ok(())
+    }
+
     fn release_compute_witnesses(&mut self, deferred: &mut DeferredBatch) -> Result {
         let state = recovery::Memory::recovery_state(&self.init)?;
         let port = &self.port;
@@ -427,6 +490,7 @@ impl crate::g17::Shared {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }
+        firmware.completion_rekick(masks)?;
         let now = super::now_ns();
         let compute = firmware
             .queues

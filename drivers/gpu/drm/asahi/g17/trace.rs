@@ -67,6 +67,9 @@ pub(super) fn doorbell(engine: u8, power: impl FnOnce() -> u32) {
 pub(super) const MAILBOX: u8 = 0;
 pub(super) const CONTROL: u8 = 1;
 pub(super) const EFFORT: u8 = 2;
+/// Test-only post-completion work notification. The value is the following
+/// ordinary mailbox message, also recorded with [`MAILBOX`].
+pub(super) const REKICK: u8 = 3;
 
 /// A host-to-firmware message: a mailbox message, a device-control record by
 /// opcode, or a new performance effort value.

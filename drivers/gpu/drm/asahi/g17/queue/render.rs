@@ -347,6 +347,15 @@ impl Pair {
     pub(crate) fn published_in_flight(&self) -> bool {
         !self.quarantined && self.active.iter().any(|active| active.outer_published)
     }
+    /// Priority of queued published work after this pair's fragment
+    /// completion. Used only by the 25G83 post-completion diagnostic arm.
+    pub(crate) fn completion_rekick_priority(&self, masks: [u64; 2]) -> Option<u8> {
+        let mut active = self.active.iter().filter(|active| active.outer_published);
+        let front = active.next()?;
+        let queued = front.drained_result.is_none() || active.next().is_some();
+        (completion_noted(self.qids(), masks) && queued && !self.quarantined)
+            .then(|| front.packet.context.policy().priority())
+    }
     pub(crate) fn room(&self) -> bool {
         !self.quarantined && self.owner.is_some() && self.prepared.is_none() && self.active.room()
     }
@@ -2395,4 +2404,3 @@ mod completion_noted_tests {
         assert!(completion_noted([3, 68], both));
     }
 }
-
