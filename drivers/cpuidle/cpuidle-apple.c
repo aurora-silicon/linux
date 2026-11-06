@@ -122,21 +122,25 @@ static struct cpuidle_driver apple_idle_driver = {
 	.state_count = STATE_COUNT,
 };
 
+/* SoCs whose CYC_OVRD the OS can write: M1 to M3. */
+static const char *const apple_cyc_ovrd_machines[] = {
+	"apple,t8103", "apple,t6000", "apple,t6001", "apple,t6002",
+	"apple,t8112", "apple,t6020", "apple,t6021", "apple,t6022",
+	"apple,t8122", "apple,t6030", "apple,t6031", "apple,t6032",
+	"apple,t6034",
+	NULL
+};
+
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
-	struct device_node *np = pdev->dev.of_node;
-	bool wfi_only = of_device_is_compatible(np, "apple,t6041-cpuidle") ||
-			of_device_is_compatible(np, "apple,t8132-cpuidle");
-
 	/*
-	 * CPU PD writes CYC_OVRD, which is an undefined instruction on
-	 * T8140 and the M4 SoCs (T6041, T8132). Their WFI already lets
-	 * the hardware power-gate idle cores, so both entries must use
-	 * WFI. Keep index 1: the generic s2idle selector skips fallback
-	 * index 0, otherwise tick_freeze() and timekeeping suspension are
-	 * never reached.
+	 * CPU PD writes CYC_OVRD, which only M1 to M3 let the OS write. From
+	 * M4 on it is locked and the write is undefined, and WFI already
+	 * power-gates an idle core, so both entries use WFI. Keep index 1:
+	 * the generic s2idle selector skips fallback index 0, otherwise
+	 * tick_freeze() and timekeeping suspension are never reached.
 	 */
-	if (of_machine_is_compatible("apple,t8140") || wfi_only)
+	if (!of_machine_compatible_match(apple_cyc_ovrd_machines))
 		apple_idle_driver.states[STATE_PWRDOWN] = apple_idle_driver.states[STATE_WFI];
 
 	return cpuidle_register(&apple_idle_driver, NULL);
