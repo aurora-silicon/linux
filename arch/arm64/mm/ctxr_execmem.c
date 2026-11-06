@@ -11,7 +11,7 @@
  *
  * This file owns the arm64 end of that contract:
  *   - it learns the window from the device tree (/chosen/aurora,ctxr-exec-window,
- *     emitted by the EL2 monitor) or the command line (ctxr_exec_window=, used
+ *     emitted by the bootloader) or the command line (ctxr_exec_window=, used
  *     for VM/simulated bring-up),
  *   - reserves it from memblock and checks the image fits,
  *   - carves the non-image remainder into a gen_pool and hands it to the generic

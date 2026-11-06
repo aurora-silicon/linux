@@ -2549,7 +2549,7 @@ config ARM64_CTXR_EXECMEM
 	  executable physical page must live inside it.
 
 	  With this option the kernel reserves a single window — described by
-	  the EL2 monitor in /chosen/aurora,ctxr-exec-window, or by the
+	  the bootloader in /chosen/aurora,ctxr-exec-window, or by the
 	  "ctxr_exec_window=" command-line option for VM bring-up — places the
 	  static image inside it, and backs every run-time executable allocation
 	  (modules, BPF, kprobes, ftrace) with pages drawn from the remainder.

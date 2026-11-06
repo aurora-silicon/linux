@@ -11,7 +11,7 @@ fixed physical window. Outside it, the fetch takes an instruction abort.
 
 To run the kernel at EL2 behind such a window (instead of dropping it to EL1),
 **every** executable physical page must live inside one window: the static image
-(placed there by the boot monitor) and every run-time executable allocation.
+(placed there by the bootloader) and every run-time executable allocation.
 
 ``CONFIG_ARM64_CTXR_EXECMEM`` makes that possible. It is inert unless a window
 is supplied at boot, so it is safe to leave enabled on machines that do not need
@@ -21,7 +21,7 @@ Supplying the window
 ====================
 
 Device tree (production)
-    The EL2 monitor emits, under ``/chosen``::
+    The bootloader emits, under ``/chosen``::
 
         aurora,ctxr-exec-window = <base_hi base_lo size_hi size_lo>;
         aurora,ctxr-exec-enforce = <1>;   /* optional, default 1 */
@@ -54,6 +54,10 @@ How it works
 * If the window's pool is exhausted the allocation fails, exactly as a hardware
   CTXR fault would prevent executing from outside the window; there is no buddy
   fallback.
+* Code in the window can't execute at EL1 on a confined core, and the window
+  isn't known at the first instruction, so cores from the M4 generation on switch
+  to VHE in ``init_kernel_el`` on every entry at EL2. Earlier cores don't have
+  CTXR and enter as they always have.
 
 Userspace
 =========
