@@ -126,6 +126,12 @@ Description:
 		32 ms for V26A428 (two nominal periods). These are conservative
 		host policies, not firmware guarantees about packet duration.
 		The oldest contributing utilisation sample bounds its window.
+		The firmware can publish several records per producer update
+		(V25G83 produces one every 8 ms and the host receives them three
+		at a time, every 24 ms), so the age limit is added to the
+		shorter of the last two delivery intervals seen in the current
+		epoch: utilisation reads stale only once the next delivery is
+		late by the limit, never between two on-time deliveries.
 		A logical pstate has no qualified periodic-report cadence and
 		remains valid until a replacement or an epoch boundary; its
 		host receive time is retained in diagnostics, not used to invent

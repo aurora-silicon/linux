@@ -49,9 +49,10 @@ mod device {
 mod fmt { pub use std::fmt::*; }
 macro_rules! dev_err { ($dev:expr, $($t:tt)*) => { let _ = ($dev, format_args!($($t)*)); }; }
 mod g17 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NOW: AtomicU64 = AtomicU64::new(1);
-    fn now_ns() -> u64 { NOW.load(Ordering::Relaxed) }
+    use std::sync::atomic::Ordering;
+    // Per test thread, so a test that moves the clock cannot race the others.
+    thread_local! { static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(1) }; }
+    fn now_ns() -> u64 { NOW.with(|now| now.get()) }
     #[derive(Clone, Copy, Debug)]
     enum Role { Primary = 0, Secondary = 1 }
     mod trace { pub fn report(_:u8, _:u8, _:&[u32;18]) {} pub fn message(_:u32,_:u64) {} pub const CONTROL:u32=0; }
@@ -233,6 +234,26 @@ RUST_TESTS = r'''
             let view=stats::qualify(graph,rings.read_statistics(1));
             assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
         }
+    }
+
+    #[test]
+    fn one_drain_is_one_utilisation_delivery() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
+        // Three 8 ms records per producer update, one update every 24 ms.
+        for n in 0..3u64 {
+            NOW.with(|now| now.set(1_000+n*24_000_000));
+            for _ in 0..3 { init.push(Primary,util); }
+            rings.drain_statistics(&dev,&init,Primary);
+        }
+        let last=1_000+2*24_000_000;
+        assert!(report(&rings).contains("delivery_intervals_ns=[Some(24000000), Some(24000000)]"),"{}",report(&rings));
+        assert_eq!(rings.read_statistics(last+16_000_000).util_status,telemetry::VALID);
+        assert_eq!(rings.read_statistics(last+39_999_999).util_status,telemetry::VALID);
+        assert_eq!(rings.read_statistics(last+40_000_000).util_status,telemetry::STALE);
     }
 
     #[test]
@@ -487,7 +508,7 @@ def main():
     ap.add_argument('--out', type=Path)
     ap.add_argument('--baseline', default='ebcf9cb777a434867e9d880892ee2b46887728bb',
                     help='revision containing the legacy formatter')
-    ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age',
+    ap.add_argument('--mutation', choices=['fields', 'range', 'timestamp', 'age', 'delivery',
                                            'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format'])
     args = ap.parse_args()
     work = args.out or Path(tempfile.mkdtemp(prefix='asahi-g17-telemetry-'))
@@ -515,7 +536,8 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
         'range': ('value > 100', 'value > 101'),
         'timestamp': ('u64::from(words[1]) | (u64::from(words[2]) << 32)',
                       'u64::from(words[2]) | (u64::from(words[1]) << 32)'),
-        'age': ('now_ns - received >= max_age_ns', 'now_ns - received > max_age_ns'),
+        'age': ('now_ns - received >= limit', 'now_ns - received > limit'),
+        'delivery': ('[Some(a), Some(b)] => a.min(b),', '[Some(a), Some(b)] => a.max(b),'),
         'quarantine': ('.any(|rings| rings[ReportRing::Statistics as usize])', '.any(|_| false)'),
         'epoch': ('self.discard_statistics = [true; 2]', 'self.discard_statistics = [false; 2]'),
         'cutoff': ('accept_statistics && statistics_cutoff.is_none()', 'accept_statistics'),

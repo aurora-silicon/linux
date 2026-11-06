@@ -138,10 +138,10 @@ impl Rings {
             self.statistics_powered, self.statistics_cutoff
         )?;
         let view = self.read_statistics(super::now_ns());
-        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={} pstate={}",
+        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={} pstate={} delivery_intervals_ns={:?}",
             self.max_age_ns, view.util_status, view.util_host_ns, view.util_samples,
             view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks,
-            view.tiler, view.renderer, view.device, view.pstate)
+            view.tiler, view.renderer, view.device, view.pstate, self.telemetry.delivery_intervals)
     }
 
     pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
@@ -215,6 +215,14 @@ impl Rings {
         if consumer >= capacity || producer >= capacity {
             return Err(EIO);
         }
+        // One receive time per drain: records the firmware published in one
+        // producer update are one delivery (see Telemetry::note_delivery).
+        // Only a statistics drain with records reads the clock.
+        let host_ns = if matches!(ring, ReportRing::Statistics) && consumer != producer {
+            super::now_ns()
+        } else {
+            0
+        };
         while consumer != producer {
             if matches!(ring, ReportRing::Statistics) && *statistics_cutoff == Some(consumer) {
                 *statistics_cutoff = None;
@@ -229,7 +237,6 @@ impl Rings {
                 return Err(EIO);
             }
             if matches!(ring, ReportRing::Statistics) {
-                let host_ns = super::now_ns();
                 let admitted = accept_statistics && statistics_cutoff.is_none();
                 reports.record(role, words, host_ns, admitted);
                 if admitted {
