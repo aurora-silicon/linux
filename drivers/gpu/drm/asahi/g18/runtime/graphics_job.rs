@@ -289,7 +289,7 @@ impl G18GraphicsJob {
     /// Caller has allocated/retained PB and pool owners and filled all native
     /// fields. In particular a default resource word is not an admitted policy.
     #[inline(never)]
-    pub(crate) fn encode(&mut self, dev: &AsahiDrmDevice, inputs: &cmd::G18RenderCommandInputs) -> Result {
+    pub(crate) fn encode(&mut self, _dev: &AsahiDrmDevice, inputs: &cmd::G18RenderCommandInputs) -> Result {
         if self.encoded.is_some() || self.controls.ta.resource_word == 0
             || self.controls.fragment.resource_word == 0
             || inputs.context_id != u32::from(self.context_id())
