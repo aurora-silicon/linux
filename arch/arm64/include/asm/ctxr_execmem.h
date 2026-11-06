@@ -23,9 +23,16 @@ void ctxr_exec_reserve(void);
  * EXECMEM_CONFINE.
  */
 bool ctxr_exec_execmem_setup(void);
+
+/*
+ * False if a window is enforcing and EFI runtime code can't run behind it.
+ * Warns once when it returns false.
+ */
+bool ctxr_exec_efi_runtime_ok(void);
 #else
 static inline void ctxr_exec_reserve(void) {}
 static inline bool ctxr_exec_execmem_setup(void) { return false; }
+static inline bool ctxr_exec_efi_runtime_ok(void) { return true; }
 #endif
 
 #endif /* __ASM_CTXR_EXECMEM_H */

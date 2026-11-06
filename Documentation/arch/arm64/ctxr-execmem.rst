@@ -69,16 +69,27 @@ retries it forever. Anything EL0 can execute therefore lives outside the window:
   in the window that the pool doesn't use is not available to the rest of the
   system, so a window should be no larger than the executable code needs.
 
+EFI runtime services
+====================
+
+EFI runtime code runs at EL2 on whichever core ``efi_rts_wq`` happens to be on,
+so on a confined core it has to be inside the window too. When a window is
+enforcing and any ``EFI_RUNTIME_SERVICES_CODE`` region is outside it, or isn't
+aligned to the kernel's page size, the kernel warns once and turns runtime
+services off for that boot, as ``efi=noruntime`` would. When all of it is inside,
+runtime services stay on. A window in reporting mode leaves them on.
+
 Verifying confinement
 =====================
 
 The feature carries its own verifier, which is what stands in for the hardware
 fault when testing in a VM:
 
-* At ``late_initcall`` the kernel sweeps its page tables and reports the number
-  of EL1-executable leaf mappings and how many resolve outside the window. When
-  the window is enforcing, a non-zero count is fatal. It also counts window
-  pages that reached the page allocator as violations.
+* At ``late_initcall`` the kernel sweeps its page tables, and ``efi_mm`` when
+  runtime services are on, and reports the number of EL1-executable leaf mappings
+  and how many resolve outside the window. When the window is enforcing, a
+  non-zero count is fatal. It also counts window pages that reached the page
+  allocator as violations.
 * ``/sys/kernel/debug/execmem_confine`` re-runs the sweep on read and reports
   window bounds, pool usage and ``PASS``/``FAIL``. Init memory is freed after
   ``late_initcall``, and an initrd can be, so this is the check that covers them.

@@ -22,6 +22,7 @@
 
 #define pr_fmt(fmt) "ctxr-execmem: " fmt
 
+#include <linux/efi.h>
 #include <linux/execmem.h>
 #include <linux/genalloc.h>
 #include <linux/kernel.h>
@@ -267,10 +268,40 @@ fail:
 }
 
 /*
+ * A core enforcing the window can't fetch firmware code outside it, and
+ * efi_rts_wq can run on any core. Misaligned code also makes the misaligned
+ * regions after it executable, wherever they are.
+ */
+bool __init ctxr_exec_efi_runtime_ok(void)
+{
+	efi_memory_desc_t *md;
+
+	if (!IS_ENABLED(CONFIG_EFI) || !ctxr_active || !ctxr_enforce)
+		return true;
+
+	for_each_efi_memory_desc(md) {
+		phys_addr_t start = md->phys_addr;
+		phys_addr_t end = start + (md->num_pages << EFI_PAGE_SHIFT);
+
+		if (md->type != EFI_RUNTIME_SERVICES_CODE)
+			continue;
+		if (start >= ctxr_base && end <= ctxr_base + ctxr_size &&
+		    PAGE_ALIGNED(start) && PAGE_ALIGNED(end))
+			continue;
+
+		pr_warn("EFI runtime services off: firmware code [%pa, %pa) is outside the window or misaligned\n",
+			&start, &end);
+		return false;
+	}
+
+	return true;
+}
+
+/*
  * Page-table sweep used by the confinement verifier. For every privileged
- * (PXN-clear) executable leaf in the kernel page tables, count it and flag any
- * whose physical output lies outside the window. This is what stands in, in a
- * VM, for the hardware CTXR fault.
+ * (PXN-clear) executable leaf in the kernel and EFI page tables, count it and
+ * flag any whose physical output lies outside the window. This is what stands
+ * in, in a VM, for the hardware CTXR fault.
  */
 struct ctxr_verify {
 	struct ptdump_state ptdump;
@@ -359,6 +390,15 @@ unsigned long execmem_confine_arch_verify(phys_addr_t base, phys_addr_t size,
 	};
 
 	ptdump_walk_pgd(&v.ptdump, &init_mm, NULL);
+
+	/* EFI runtime code has its own page tables, at user addresses. */
+	if (efi_enabled(EFI_RUNTIME_SERVICES)) {
+		v.ptdump.range = (struct ptdump_range[]) {
+			{ 0, TASK_SIZE_64 },
+			{ 0, 0 }
+		};
+		ptdump_walk_pgd(&v.ptdump, &efi_mm, NULL);
+	}
 
 	if (nr_exec)
 		*nr_exec = v.nr_exec;
