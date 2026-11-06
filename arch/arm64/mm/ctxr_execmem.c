@@ -64,29 +64,59 @@ static struct {
 } ctxr_free[CTXR_MAX_FREE] __initdata;
 static int ctxr_nr_free __initdata;
 
-static bool __init ctxr_parse_cmdline(phys_addr_t *base, phys_addr_t *size,
-				      bool *enforce)
+/*
+ * Command-line overrides, filled in by parse_early_param() before
+ * arm64_memblock_init() runs ctxr_exec_reserve(). The last occurrence of each
+ * option wins, as for any other kernel parameter.
+ */
+static phys_addr_t ctxr_cmd_base __initdata;
+static phys_addr_t ctxr_cmd_size __initdata;
+static bool ctxr_cmd_window __initdata;
+static bool ctxr_cmd_enforce __initdata;
+static bool ctxr_cmd_enforce_set __initdata;
+
+/* ctxr_exec_window[=<size>[@<base>]] */
+static int __init ctxr_exec_window_param(char *arg)
 {
-	const char *p;
+	phys_addr_t size = CTXR_WINDOW_DEFAULT, base = 0;
 	char *endp;
 
-	p = strstr(boot_command_line, "ctxr_exec_window=");
-	if (!p)
+	if (arg && *arg) {
+		size = memparse(arg, &endp);
+		if (*endp == '@')
+			base = memparse(endp + 1, &endp);
+		if (*endp || !size) {
+			pr_err("ignoring malformed ctxr_exec_window=%s\n", arg);
+			return -EINVAL;
+		}
+	}
+
+	ctxr_cmd_size = size;
+	ctxr_cmd_base = base;	/* 0: derive from the image below */
+	ctxr_cmd_window = true;
+	return 0;
+}
+early_param("ctxr_exec_window", ctxr_exec_window_param);
+
+/* ctxr_exec_enforce=<bool>: applies to a window from either source. */
+static int __init ctxr_exec_enforce_param(char *arg)
+{
+	if (kstrtobool(arg, &ctxr_cmd_enforce)) {
+		pr_err("ignoring malformed ctxr_exec_enforce=%s\n", arg ?: "");
+		return -EINVAL;
+	}
+	ctxr_cmd_enforce_set = true;
+	return 0;
+}
+early_param("ctxr_exec_enforce", ctxr_exec_enforce_param);
+
+static bool __init ctxr_parse_cmdline(phys_addr_t *base, phys_addr_t *size)
+{
+	if (!ctxr_cmd_window)
 		return false;
-	p += strlen("ctxr_exec_window=");
 
-	*size = memparse(p, &endp);
-	if (!*size)
-		*size = CTXR_WINDOW_DEFAULT;
-	if (*endp == '@')
-		*base = memparse(endp + 1, NULL);
-	else
-		*base = 0;	/* derive from the image below */
-
-	p = strstr(boot_command_line, "ctxr_exec_enforce=");
-	if (p)
-		*enforce = (p[strlen("ctxr_exec_enforce=")] != '0');
-
+	*base = ctxr_cmd_base;
+	*size = ctxr_cmd_size;
 	return true;
 }
 
@@ -147,12 +177,16 @@ void __init ctxr_exec_reserve(void)
 	phys_addr_t dram_start, dram_end;
 	bool enforce = true;
 
-	if (!ctxr_parse_cmdline(&base, &size, &enforce) &&
+	if (!ctxr_parse_cmdline(&base, &size) &&
 	    !ctxr_parse_dt(&base, &size, &enforce))
 		return;
 
 	if (!size)
 		return;
+
+	/* The command line overrides the device tree's enforce setting. */
+	if (ctxr_cmd_enforce_set)
+		enforce = ctxr_cmd_enforce;
 
 	img_start = __pa_symbol(_text);
 	img_end = __pa_symbol(_end);
