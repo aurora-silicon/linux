@@ -200,12 +200,6 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size)
 
 	execmem_confine_set_window(base, size);
 
-	if (is_kernel_in_hyp_mode()) {
-		WRITE_ONCE(ctxr_stay_el2, 1);
-		dcache_clean_inval_poc((unsigned long)&ctxr_stay_el2,
-				       (unsigned long)&ctxr_stay_el2 + sizeof(ctxr_stay_el2));
-	}
-
 	ctxr_base = base;
 	ctxr_size = size;
 	ctxr_active = true;
@@ -247,20 +241,28 @@ void __init ctxr_exec_reserve(void)
 	int dt = ctxr_parse_dt(&base, &size);
 
 	/* A bad override leaves the machine as its bootloader described it. */
-	if (ctxr_cmd_size) {
-		if (ctxr_establish(ctxr_cmd_base, ctxr_cmd_size))
-			return;
+	if (ctxr_cmd_size && ctxr_establish(ctxr_cmd_base, ctxr_cmd_size))
+		goto done;
+	if (ctxr_cmd_size)
 		pr_warn("ignoring ctxr_exec_window=\n");
-	}
 
-	if (!dt)
-		return;
 	if (dt < 0)
 		ctxr_hold_secondaries("malformed aurora,ctxr-exec-window");
-	else if (!is_kernel_in_hyp_mode())
+	else if (dt && !is_kernel_in_hyp_mode())
 		ctxr_hold_secondaries("window given but the kernel is not at EL2");
-	else if (!ctxr_establish(base, size))
+	else if (dt && !ctxr_establish(base, size))
 		ctxr_hold_secondaries("unusable window");
+
+done:
+	/*
+	 * Secondaries and resuming CPUs read ctxr_stay_el2 with the MMU off, so
+	 * set it on every boot (0 when no window is active) and clean it to the
+	 * PoC here, before any secondary is released. The boot CPU never reads
+	 * it. See init_kernel_el.
+	 */
+	WRITE_ONCE(ctxr_stay_el2, ctxr_active);
+	dcache_clean_inval_poc((unsigned long)&ctxr_stay_el2,
+			       (unsigned long)&ctxr_stay_el2 + sizeof(ctxr_stay_el2));
 }
 
 static void __init ctxr_pool_add_gap(struct gen_pool *pool, phys_addr_t from,

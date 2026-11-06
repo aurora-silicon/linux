@@ -117,6 +117,9 @@ SYM_CODE_START(primary_entry)
 	blr	x2
 
 1:	mov	x0, x19
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	mov	x22, xzr			// boot CPU: never read the CTXR flag
+#endif
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	mov	x20, x0
 
@@ -309,10 +312,14 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 
 #ifdef CONFIG_ARM64_CTXR_EXECMEM
 	/*
-	 * A core confined to a CTXR window can't run the window's code at
-	 * EL1. Once the boot CPU has a window at EL2, later entries switch
-	 * to VHE here instead of going through EL1 and finalise_el2.
+	 * A core confined to a CTXR window can't run the window's code at EL1,
+	 * so once a window is active it switches to VHE here instead of going
+	 * through EL1 and finalise_el2. Only a secondary or a resuming CPU is
+	 * ever confined (x22 == 1): the boot CPU's first entry (x22 == 0) is
+	 * not, and it runs before ctxr_stay_el2 is set and cleaned to the PoC,
+	 * so it must not read the flag at all.
 	 */
+	cbz	x22, .Lctxr_no_direct_vhe
 	adr_l	x0, ctxr_stay_el2
 	ldr	w0, [x0]
 	cbz	w0, .Lctxr_no_direct_vhe
@@ -372,6 +379,9 @@ SYM_FUNC_END(init_kernel_el)
 	 */
 SYM_FUNC_START(secondary_holding_pen)
 	mov	x0, xzr
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	mov	x22, #1				// a secondary may be confined
+#endif
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	mrs	x2, mpidr_el1
 	mov_q	x1, MPIDR_HWID_BITMASK
@@ -390,6 +400,9 @@ SYM_FUNC_END(secondary_holding_pen)
 	 */
 SYM_FUNC_START(secondary_entry)
 	mov	x0, xzr
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	mov	x22, #1				// a secondary may be confined
+#endif
 	bl	init_kernel_el			// w0=cpu_boot_mode
 	b	secondary_startup
 SYM_FUNC_END(secondary_entry)
