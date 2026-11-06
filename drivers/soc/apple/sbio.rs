@@ -1963,12 +1963,19 @@ impl SepData {
 
         self.settle_before_capture();
 
-        // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
-        if !self.bring_sensor_online_for_verify() {
+        // macOS registers the sensor once and keeps it for later matches: no
+        // power cycle, CLEAR_STATE or re-registration per touch. Do the same
+        // while the sensor stayed up since the last verify.
+        if self.sensor_kept.load(Relaxed) {
+            dev_info!(self.dev, "verify: sensor still registered from the last verify; no new bring-up\n");
+        } else if !self.bring_sensor_online_for_verify() {
+            // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
             dev_err!(self.dev, "verify: the sensor did not come back online\n");
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
             return;
+        } else {
+            self.sensor_kept.store(true, Relaxed);
         }
 
         // Each verify matches under its own unlock evaluation: a context whose
@@ -1984,6 +1991,7 @@ impl SepData {
                 "verify: the unlock evaluation did not open; refusing before the capture. This is not a non-matching finger\n"
             );
             let _ = sensor::idle();
+            self.sensor_kept.store(false, Relaxed);
             sensor::power(false);
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
             return;
@@ -2000,7 +2008,15 @@ impl SepData {
         *self.match_context.lock() = None;
         self.close_unlock_evaluation(&evaluation);
         let _ = sensor::idle();
-        sensor::power(false);
+        // Keep the sensor up for the next verify unless the sensor itself
+        // failed; then the next verify brings it up from a power cycle.
+        if matches!(
+            outcome,
+            bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR) | bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY)
+        ) {
+            self.sensor_kept.store(false, Relaxed);
+            sensor::power(false);
+        }
         self.note_capture_end();
         match &outcome {
             bio::VerifyOutcome::Matched(_) => self.bio_nomatch_streak.store(0, Relaxed),
@@ -2235,6 +2251,7 @@ impl SepData {
 
     pub(crate) fn run_enrolment(&self) {
         self.enrol_frames_accepted.store(0, Relaxed);
+        self.sensor_kept.store(false, Relaxed);
 
         if !self.bring_sensor_online() {
             dev_err!(self.dev, "enrol: the sensor did not come back online\n");
@@ -2359,6 +2376,7 @@ impl SepData {
         }
 
         let _ = sensor::idle();
+        self.sensor_kept.store(false, Relaxed);
         sensor::power(false);
         self.note_capture_end();
 
@@ -2649,6 +2667,7 @@ impl SepData {
     }
 
     fn wake_sensor(&self) -> Option<PatchLoaded> {
+        self.sensor_kept.store(false, Relaxed);
         let _source = sensor::power_source();
         self.sensor_power_ns.store(shim::boottime_ns(), Relaxed);
         let cycled = sensor::power_cycle();
@@ -3786,6 +3805,8 @@ impl SepData {
     /// ones, and wait for the enrol or verify work to stop touching the sensor
     /// before devices go down.
     pub(crate) fn sleep_prepare(&self) {
+        // Power may be removed across the sleep; register afresh after it.
+        self.sensor_kept.store(false, Relaxed);
         let woke = {
             let mut session = self.bio_session.lock();
             self.suspending.store(true, Relaxed);

@@ -679,6 +679,11 @@ struct SepData {
     match_context: Mutex<Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
     match_context_generation: Atomic<u32>,
 
+    // The sensor stayed powered and registered after the last verify, so the
+    // next verify captures without a new bring-up, as macOS does. Cleared by
+    // anything that powers the sensor off or resets it.
+    sensor_kept: Atomic<bool>,
+
     #[pin]
     enrol_identity_candidates: Mutex<KVec<[u8; bio::UUID_LEN]>>,
 
@@ -981,6 +986,7 @@ impl SepData {
                 enrol_material <- new_mutex!(None),
                 match_context <- new_mutex!(None),
                 match_context_generation: Atomic::new(0),
+                sensor_kept: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
                 sensor_power_ns: Atomic::new(0),
@@ -2568,6 +2574,7 @@ impl SepData {
             );
         }
 
+        self.sensor_kept.store(false, Relaxed);
         sensor::power(false);
         sensor::unregister_driver();
         self.release_firmware_mapping();
