@@ -487,6 +487,8 @@ unsafe extern "C" fn display_send(cookie: *const kernel::ffi::c_void, word: u64)
     match word {
         0x0020f50100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) },
         0x0020f80100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 1) },
+        // DISP released while its DCP has powered the display domains down.
+        0x0020f80000000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 0) },
         _ => EINVAL.to_errno(),
     }
 }
