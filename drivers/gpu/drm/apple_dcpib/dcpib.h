@@ -189,6 +189,7 @@ struct dcpib {
 	struct drm_device drm;
 	struct apple_rtkit *rtk;
 	struct workqueue_struct *wq;
+	u32 inherited_afk_endpoints;
 
 	struct dcpib_ep *eps[DCPIB_NR_EPS];
 	struct dcpib_ep *iboot_ep;
