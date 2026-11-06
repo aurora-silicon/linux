@@ -76,9 +76,13 @@ The service's current report has a type byte followed by a versioned fixed
 layout. Type 2 is 108 bytes and carries little-endian IEEE-754 X, Y, Z and W
 at offset 28. Types 3 and 4 are 60 bytes and carry the same fields at offset
 12. Type 1 is a five-byte state report and does not update the IIO sample.
-Reports begin after property 0 is set to a non-zero interval in microseconds;
-the driver requests 50 Hz, writes zero around system sleep, and restores the
-interval after resume. This fused stream needs no separate calibration blob.
+The driver first selects the firmware's built-in calibration by writing value
+1 to property 61, then writes a non-zero interval in microseconds to property
+0. The order matters: setting the interval alone is accepted but does not
+start the fusion stream. The driver requests 50 Hz, writes a zero interval
+around system sleep, and restores that interval after resume; the calibration
+state persists across this power transition. This fused stream needs no
+separate calibration blob.
 
 Board temperature
 =================
