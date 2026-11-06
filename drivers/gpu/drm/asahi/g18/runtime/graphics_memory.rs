@@ -36,7 +36,7 @@ impl G18GraphicsMemory {
             // is rebuilt from Mesa's parameters. It needs only the colour-a
             // page layout, which is mapped here with zeroed contents.
             Err(e) if e == ENOENT && profile == 1
-                && *crate::g18::params::g18_initdata_test.value() == 10 =>
+                && crate::g18::params::g18_initdata_test.value() == 10 =>
                 return Self::layout_only(dev, uat),
             Err(e) => return Err(e),
         };
