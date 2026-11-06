@@ -221,8 +221,9 @@ pub(crate) const T8103: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
-    // macOS shares this enclave: keep Linux to its own xART records.
-    xart_guard: 1,
+    // Off: Touch ID setup on a cold-boot SEP rewrites a session record that
+    // predates Linux, so the guard would only block it.
+    xart_guard: 0,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
@@ -262,9 +263,8 @@ pub(crate) const T6000: PlatformProfile = PlatformProfile {
     persistent_enrol: true,
     nonce_session: false,
     // As T8103. On J316s, creating the identity keybag also rewrites a
-    // session record that predates Linux. The guard refuses that, so the
-    // keybag can only be created there with xart_guard=0.
-    xart_guard: 1,
+    // session record that predates Linux.
+    xart_guard: 0,
 };
 
 pub(crate) const T6020: PlatformProfile = PlatformProfile {
