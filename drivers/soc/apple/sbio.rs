@@ -34,6 +34,9 @@ const LOCK_STATE_LOCKOUT: u16 = 0x40;
 const SBIO_NOTIFY_BG_OPS_READY: u8 = 0x03;
 /// How long a verify waits after its result for that notice.
 const BG_OPS_WAIT_MS: u32 = 1000;
+/// How long to wait after a background result for a component to need saving.
+const BG_OPS_SAVE_WAIT_MS: u32 = 2000;
+const BG_OPS_SAVE_POLL_MS: u32 = 50;
 
 /// How long a re-arm waits for the enclave to announce the cleared state.
 const LOCK_STATE_WAIT_MS: u32 = 1000;
@@ -2039,7 +2042,9 @@ impl SepData {
             outcome,
             bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch | bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT)
         ) {
-            self.await_and_collect_bg_ops(c"after a match result", BG_OPS_WAIT_MS);
+            if self.await_and_collect_bg_ops(c"after a match result", BG_OPS_WAIT_MS) {
+                self.persist_after_bg_ops();
+            }
         }
         // Keep the sensor up for the next verify unless the sensor itself
         // failed; then the next verify brings it up from a power cycle.
@@ -3564,36 +3569,104 @@ impl SepData {
 
     /// Collects a background operation result the enclave announced, if
     /// any, as macOS does after every match. Logs only status and length.
-    fn collect_bg_ops_result(&self, why: &CStr) {
+    /// Returns whether a result was collected.
+    fn collect_bg_ops_result(&self, why: &CStr) -> bool {
         if !self.bg_ops_ready.xchg(false, Relaxed) {
-            return;
+            return false;
         }
         match self.sbio_transfer(&crate::sbio::sbio_bg_ops_result()) {
-            Ok(done) => dev_info!(
-                self.dev,
-                "sbio: collected the background operation result ({}): status {}, {} bytes\n",
-                why,
-                done.status,
-                done.payload.len()
-            ),
-            Err(e) => dev_warn!(
-                self.dev,
-                "sbio: collecting the background operation result ({}) failed: {:?}\n",
-                why,
-                e
-            ),
+            Ok(done) => {
+                dev_info!(
+                    self.dev,
+                    "sbio: collected the background operation result ({}): status {}, {} bytes\n",
+                    why,
+                    done.status,
+                    done.payload.len()
+                );
+                true
+            }
+            Err(e) => {
+                dev_warn!(
+                    self.dev,
+                    "sbio: collecting the background operation result ({}) failed: {:?}\n",
+                    why,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// A background result can update templates after the post-match save
+    /// already ran. Wait briefly for the user or master component to report
+    /// a pending save, then save the user first and the master last, as
+    /// macOS does after a template update.
+    fn persist_after_bg_ops(&self) {
+        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return;
+        };
+        let pending = |sep: &Self| -> Option<(bool, bool)> {
+            let reply = sep.read_component_states()?;
+            let states = crate::sbio::ComponentStates::new(&reply);
+            let p = |id: i32| {
+                states
+                    .state_for(id)
+                    .is_some_and(|s| s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
+            };
+            Some((
+                p(crate::sbio::CatacombUser::enrolling(user).value()),
+                p(crate::sbio::CatacombUser::MASTER.value()),
+            ))
+        };
+        let mut waited = 0;
+        let mut seen = pending(self);
+        while matches!(seen, Some((false, false))) && waited < BG_OPS_SAVE_WAIT_MS {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(BG_OPS_SAVE_POLL_MS)));
+            waited += BG_OPS_SAVE_POLL_MS;
+            seen = pending(self);
+        }
+        dev_info!(
+            self.dev,
+            "sbio: after the background result: save pending (user, master) {:?} after {} ms\n",
+            seen,
+            waited
+        );
+        if matches!(seen, Some((false, false))) {
+            return;
+        }
+        // Called from the verify worker, which already holds catacomb_writer.
+        for (who, kind, what) in [
+            (crate::sbio::CatacombUser::enrolling(user), PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a background result"),
+            (crate::sbio::CatacombUser::MASTER, PRIVATE_TYPE_CATACOMB_MASTER, c"master catacomb after a background result"),
+        ] {
+            let Some(reply) = self.read_component_states() else {
+                dev_err!(self.dev, "sbio: cannot read state before saving the {}\n", what);
+                return;
+            };
+            let states = crate::sbio::ComponentStates::new(&reply);
+            if states
+                .state_for(who.value())
+                .is_some_and(|s| s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
+                && !self.save_catacomb(who, kind, what)
+            {
+                dev_err!(self.dev, "sbio: saving the {} failed\n", what);
+                return;
+            }
+        }
+        if !self.resnapshot_identity_keybag() {
+            dev_err!(self.dev, "sbio: identity-bag snapshot after the background result failed\n");
         }
     }
 
     /// Waits up to `timeout_ms` for a background operation notice, then
     /// collects it.
-    fn await_and_collect_bg_ops(&self, why: &CStr, timeout_ms: u32) {
+    fn await_and_collect_bg_ops(&self, why: &CStr, timeout_ms: u32) -> bool {
         let mut waited = 0;
         while !self.bg_ops_ready.load(Relaxed) && waited < timeout_ms {
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(LOCK_STATE_POLL_MS)));
             waited += LOCK_STATE_POLL_MS;
         }
-        self.collect_bg_ops_result(why);
+        self.collect_bg_ops_result(why)
     }
 
     fn sbio_continue(&self, cont: &transfer::Continuation) {
