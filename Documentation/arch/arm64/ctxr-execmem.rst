@@ -56,12 +56,11 @@ when no free memory is left in it for executable allocations, and when the kerne
 isn't running at EL2 (``kvm-arm.mode=nvhe`` or ``protected``, for example). With
 no such property nothing changes.
 
-The kernel doesn't check the device tree's window against ``CTXR_D``. The boot
-CPU's copy doesn't describe the window, and a secondary can only read its own
-once it is running kernel code, which it can't do unless the window already
-holds the image. The registers also don't exist on every Apple core, and an
-undefined system register read at that point can't be recovered. The bootloader
-reads ``CTXR_D`` when it chooses the window, so the check belongs there.
+The kernel doesn't check the device tree's window against ``CTXR_D``. The
+bootloader reads ``CTXR_D`` when it chooses the window and reserves the rest of
+the armed range, so the check belongs there. The registers also don't exist on
+every Apple core, and an undefined system register read this early can't be
+recovered.
 
 ``enforce`` only decides whether a confinement violation found by the verifier
 (see below) is fatal. Whether the hardware confines a core does not depend on
