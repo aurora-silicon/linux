@@ -67,6 +67,21 @@ properties:
       already be unmasked at admission; the OS preserves the inherited global
       error-mask policy rather than changing it for these streams.
 
+  apple,dynamic-sid-range:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    items:
+      - const: 1
+        description: First ordinary SID, inclusive.
+      - const: 252
+        description: Last ordinary SID, inclusive.
+    description: >
+      Contiguous pool of ordinary SIDs allocated to PCIe requester IDs. The
+      requester ID supplied by iommu-map is an allocation key rather than a
+      fixed SID. SIDs outside this range are reserved roles and are never
+      allocated, freed, or otherwise modified by the dynamic allocator.
+
   reg:
     minItems: 1
     items:
@@ -181,6 +196,17 @@ allOf:
     then:
       required:
         - reg-names
+  - if:
+      required:
+        - apple,dynamic-sid-range
+    then:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6041-dart
+        apple,managed-sids: false
+        apple,bypass-sids: false
+        apple,remap-streams: false
 
 additionalProperties: false
 

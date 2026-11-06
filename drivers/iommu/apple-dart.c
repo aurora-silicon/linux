@@ -261,6 +261,48 @@ struct apple_dart_fw_root {
 	u64 *accepted;
 };
 
+struct apple_dart_sid_allocator {
+	DECLARE_BITMAP(allocated, DART_MAX_STREAMS);
+	unsigned int first;
+	unsigned int last;
+};
+
+static int apple_dart_sid_allocator_init(struct apple_dart_sid_allocator *alloc,
+					 unsigned int first, unsigned int last,
+					 unsigned int num_streams)
+{
+	if (!first || first > last || last >= num_streams ||
+	    num_streams > DART_MAX_STREAMS)
+		return -EINVAL;
+
+	bitmap_zero(alloc->allocated, DART_MAX_STREAMS);
+	alloc->first = first;
+	alloc->last = last;
+	return 0;
+}
+
+static int apple_dart_sid_alloc(struct apple_dart_sid_allocator *alloc)
+{
+	unsigned int sid;
+
+	sid = find_next_zero_bit(alloc->allocated, alloc->last + 1,
+				 alloc->first);
+	if (sid > alloc->last)
+		return -ENOSPC;
+	__set_bit(sid, alloc->allocated);
+	return sid;
+}
+
+static int apple_dart_sid_free(struct apple_dart_sid_allocator *alloc,
+			       unsigned int sid)
+{
+	if (sid < alloc->first || sid > alloc->last)
+		return -EPERM;
+	if (!test_and_clear_bit(sid, alloc->allocated))
+		return -ENOENT;
+	return 0;
+}
+
 /*
  * Private structure associated with each DART device.
  *
@@ -345,6 +387,10 @@ struct apple_dart {
 	bool managed_failed;
 	/* Serialize owned TCR publication against IRQ quarantine. */
 	spinlock_t managed_lock;
+	/* Ordinary PCIe-C SIDs; role SIDs outside the DT range stay untouched. */
+	bool dynamic_sids;
+	struct mutex dynamic_sid_lock;
+	struct apple_dart_sid_allocator dynamic_sid_alloc;
 
 	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
 	u8 remap_target[DART_MAX_STREAMS];
@@ -380,6 +426,17 @@ struct apple_dart {
 	 */
 	int locked_retire_err[DART_MAX_STREAMS];
 };
+
+static unsigned int apple_dart_owned_sid_first(const struct apple_dart *dart)
+{
+	return dart->dynamic_sids ? dart->dynamic_sid_alloc.first : 0;
+}
+
+static unsigned int apple_dart_owned_sid_last(const struct apple_dart *dart)
+{
+	return dart->dynamic_sids ? dart->dynamic_sid_alloc.last :
+		dart->num_streams - 1;
+}
 
 #ifndef MODULE
 static struct kexec_blocker apple_dart_radio_kexec = {
@@ -656,6 +713,11 @@ struct apple_dart_master_cfg {
 	dma_addr_t dma_max;
 
 	struct apple_dart_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
+	struct {
+		struct apple_dart *dart;
+		u16 rid;
+		u16 sid;
+	} dynamic_sids[MAX_DARTS_PER_DEVICE];
 };
 
 /*
@@ -1713,6 +1775,34 @@ static int apple_dart_read_remaps(struct apple_dart *dart)
 	return 0;
 }
 
+static int apple_dart_read_dynamic_sid_range(struct apple_dart *dart)
+{
+	u32 range[2];
+	int ret;
+
+	if (!dart->dynamic_sids)
+		return 0;
+	if (!dart->tunneled || dart->hw->type != DART_T8110 ||
+	    !of_device_is_compatible(dart->dev->of_node, "apple,t6041-dart"))
+		return -EINVAL;
+	if (of_property_count_u32_elems(dart->dev->of_node,
+					"apple,dynamic-sid-range") !=
+	    ARRAY_SIZE(range))
+		return -EINVAL;
+	ret = of_property_read_u32_array(dart->dev->of_node,
+					 "apple,dynamic-sid-range", range,
+					 ARRAY_SIZE(range));
+	if (ret)
+		return ret;
+	/* T6040 role SIDs 253/255 (bypass) and 254 (PIODMA) are immutable. */
+	if (range[0] != 1 || range[1] != 252)
+		return -EINVAL;
+
+	return apple_dart_sid_allocator_init(&dart->dynamic_sid_alloc,
+					     range[0], range[1],
+					     dart->num_streams);
+}
+
 static void apple_dart_hw_apply_remaps(struct apple_dart *dart)
 {
 	int sid;
@@ -1789,7 +1879,12 @@ static int apple_dart_hw_finish_reset(struct apple_dart *dart)
 		}
 	}
 
-	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
+	if (dart->dynamic_sids)
+		bitmap_set(stream_map.sidmap, dart->dynamic_sid_alloc.first,
+			   dart->dynamic_sid_alloc.last -
+			   dart->dynamic_sid_alloc.first + 1);
+	else
+		bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 	ret = dart->hw->invalidate_tlb(&stream_map);
 	if (ret)
 		dev_err(dart->dev, "failed to flush the TLBs after reset: %d\n", ret);
@@ -2003,21 +2098,28 @@ static void apple_dart_managed_quarantine(struct apple_dart *dart)
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
+	u32 sidmap[BITS_TO_U32(DART_MAX_STREAMS)];
 	int i;
 
 	if (dart->managed_sids || dart->cold_ane)
 		return -EBUSY;
 	stream_map.dart = dart;
 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
-	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
+	if (dart->dynamic_sids)
+		bitmap_set(stream_map.sidmap, dart->dynamic_sid_alloc.first,
+			   dart->dynamic_sid_alloc.last -
+			   dart->dynamic_sid_alloc.first + 1);
+	else
+		bitmap_set(stream_map.sidmap, 0, dart->num_streams);
 
 	apple_dart_hw_disable_dma(&stream_map);
 	apple_dart_hw_clear_all_ttbrs(&stream_map);
 	apple_dart_hw_apply_remaps(dart);
 
-	/* enable all streams globally since TCR is used to control isolation */
+	/* Dynamic ownership enables only ordinary streams, never role SIDs. */
+	bitmap_to_arr32(sidmap, stream_map.sidmap, dart->num_streams);
 	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
-		apple_dart_writel(dart, U32_MAX,
+		apple_dart_writel(dart, dart->dynamic_sids ? sidmap[i] : U32_MAX,
 				   dart->hw->enable_streams + 4 * i);
 
 	return apple_dart_hw_finish_reset(dart);
@@ -2824,6 +2926,26 @@ static void apple_dart_release_device(struct device *dev)
 		pm_runtime_put(stream_map->dart->dev);
 	}
 
+	for (i = 0; i < MAX_DARTS_PER_DEVICE; i++) {
+		struct apple_dart *dart = cfg->dynamic_sids[i].dart;
+
+		if (!dart)
+			continue;
+		mutex_lock(&dart->dynamic_sid_lock);
+		ret = apple_dart_sid_free(&dart->dynamic_sid_alloc,
+					  cfg->dynamic_sids[i].sid);
+		mutex_unlock(&dart->dynamic_sid_lock);
+		if (ret)
+			dev_err_ratelimited(dart->dev,
+				"failed to free dynamic SID%u for RID%04x: %d\n",
+				cfg->dynamic_sids[i].sid,
+				cfg->dynamic_sids[i].rid, ret);
+		else
+			dev_dbg(dev, "freed dynamic SID%u for RID%04x\n",
+				cfg->dynamic_sids[i].sid,
+				cfg->dynamic_sids[i].rid);
+	}
+
 	kfree(cfg);
 }
 
@@ -2980,6 +3102,7 @@ static int apple_dart_of_xlate(struct device *dev,
 	struct apple_dart *cfg_dart;
 	dma_addr_t dma_max;
 	dma_addr_t dma_min;
+	unsigned int rid = args->args[0];
 	int i, sid;
 
 	put_device(&iommu_pdev->dev);
@@ -2988,7 +3111,14 @@ static int apple_dart_of_xlate(struct device *dev,
 	if (i)
 		return i;
 
-	sid = args->args[0];
+	if (dart->dynamic_sids &&
+	    (args->args_count != 1 || !dev_is_pci(dev) || rid > U16_MAX))
+		return -EINVAL;
+	/* The root port is not a downstream DMA requester and consumes no SID. */
+	if (dart->dynamic_sids &&
+	    pci_is_root_bus(to_pci_dev(dev)->bus))
+		return -ENODEV;
+	sid = rid;
 	if (dart->cold_ane && sid != 0)
 		return -EPERM;
 	if (dart->managed_sids &&
@@ -3030,25 +3160,99 @@ static int apple_dart_of_xlate(struct device *dev,
 			return -EINVAL;
 	}
 
-	cfg->supports_bypass &= dart->supports_bypass && !dart->managed_sids && !dart->cold_ane;
+	cfg->supports_bypass &= dart->supports_bypass && !dart->managed_sids &&
+		!dart->cold_ane && !dart->dynamic_sids;
 	cfg->locked |= dart->locked;
 
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
 		if (cfg->stream_maps[i].dart == dart) {
+			if (dart->dynamic_sids)
+				return cfg->dynamic_sids[i].dart == dart &&
+				       cfg->dynamic_sids[i].rid == rid ? 0 : -EINVAL;
 			set_bit(sid, cfg->stream_maps[i].sidmap);
 			return 0;
 		}
 	}
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
 		if (!cfg->stream_maps[i].dart) {
+			if (dart->dynamic_sids) {
+				mutex_lock(&dart->dynamic_sid_lock);
+				sid = apple_dart_sid_alloc(&dart->dynamic_sid_alloc);
+				mutex_unlock(&dart->dynamic_sid_lock);
+				if (sid < 0)
+					return sid;
+				cfg->dynamic_sids[i].dart = dart;
+				cfg->dynamic_sids[i].rid = rid;
+				cfg->dynamic_sids[i].sid = sid;
+			}
 			cfg->stream_maps[i].dart = dart;
 			set_bit(sid, cfg->stream_maps[i].sidmap);
+			if (dart->dynamic_sids)
+				dev_dbg(dev, "allocated dynamic SID%u for RID%04x\n",
+					sid, rid);
 			return 0;
 		}
 	}
 
 	return -EINVAL;
 }
+
+int apple_dart_pcie_sid(struct device *dart_dev, struct device *master,
+			unsigned int rid, unsigned int *sid)
+{
+	struct apple_dart_master_cfg *cfg;
+	struct apple_dart *dart;
+	int i, ret = -ENOENT;
+
+	if (!dart_dev || !master || !sid || rid > U16_MAX)
+		return -EINVAL;
+	if (dart_dev->driver != &apple_dart_driver.driver ||
+	    !device_is_bound(dart_dev))
+		return -EPROBE_DEFER;
+	dart = dev_get_drvdata(dart_dev);
+	if (!dart || !dart->dynamic_sids || !READ_ONCE(dart->iommu.ready))
+		return -EOPNOTSUPP;
+	cfg = dev_iommu_priv_get(master);
+	if (!cfg)
+		return -ENODEV;
+
+	mutex_lock(&dart->dynamic_sid_lock);
+	for (i = 0; i < MAX_DARTS_PER_DEVICE; i++) {
+		if (cfg->dynamic_sids[i].dart != dart ||
+		    cfg->dynamic_sids[i].rid != rid)
+			continue;
+		if (!test_bit(cfg->dynamic_sids[i].sid,
+			      dart->dynamic_sid_alloc.allocated)) {
+			ret = -EIO;
+			break;
+		}
+		*sid = cfg->dynamic_sids[i].sid;
+		ret = 0;
+		break;
+	}
+	mutex_unlock(&dart->dynamic_sid_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_pcie_sid);
+
+int apple_dart_pcie_sid_range(struct device *dart_dev, unsigned int *first,
+			      unsigned int *last)
+{
+	struct apple_dart *dart;
+
+	if (!dart_dev || !first || !last)
+		return -EINVAL;
+	if (dart_dev->driver != &apple_dart_driver.driver ||
+	    !device_is_bound(dart_dev))
+		return -EPROBE_DEFER;
+	dart = dev_get_drvdata(dart_dev);
+	if (!dart || !dart->dynamic_sids || !READ_ONCE(dart->iommu.ready))
+		return -EOPNOTSUPP;
+	*first = dart->dynamic_sid_alloc.first;
+	*last = dart->dynamic_sid_alloc.last;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dart_pcie_sid_range);
 
 #if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
 /*
@@ -4203,6 +4407,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		return -EOPNOTSUPP;
 	dart->per_stream = of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 			   of_device_is_compatible(dev->of_node, "apple,t8142-dart");
+	dart->dynamic_sids =
+		of_property_present(dev->of_node, "apple,dynamic-sid-range");
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
 		u32 ids[2];
 
@@ -4217,6 +4423,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->managed_sids = BIT(1) | BIT(2);
 	}
 	spin_lock_init(&dart->managed_lock);
+	mutex_init(&dart->dynamic_sid_lock);
 	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
 	dart->dispext = j713_dispext;
 	spin_lock_init(&dart->dispext_pm_lock);
@@ -4346,7 +4553,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 			dart->supports_bypass = true;
 			dart->ias = DART_PCIEC_ADDR_WIDTH;
 			dart->oas = DART_PCIEC_ADDR_WIDTH;
-			dart->num_streams = DART_PCIEC_STREAMS;
+			dart->num_streams = dart->dynamic_sids ? DART_MAX_STREAMS :
+				DART_PCIEC_STREAMS;
 			dart->four_level = true;
 			/* T8132 PCIe-C DARTs keep per-stream exception records. */
 			if (of_device_is_compatible(dev->of_node, "apple,t8132-dart"))
@@ -4470,6 +4678,10 @@ params_done:
 		goto err_clk_disable;
 	}
 
+	ret = apple_dart_read_dynamic_sid_range(dart);
+	if (ret)
+		goto err_clk_disable;
+
 	/*
 	 * v2.2 moved the exception bitmap to 0x4000 and the per-stream
 	 * exception records to 0x8000. A node whose reg stops short of them
@@ -4486,6 +4698,11 @@ params_done:
 	ret = apple_dart_read_remaps(dart);
 	if (ret)
 		goto err_clk_disable;
+	if (dart->dynamic_sids &&
+	    !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {
+		ret = -EINVAL;
+		goto err_clk_disable;
+	}
 
 	/* A hot-plug PCIe-C DART has no retained/locked translation context. */
 	if (tunneled)
@@ -4970,7 +5187,8 @@ static void apple_dart_save_state(struct apple_dart *dart)
 {
 	unsigned int sid, idx;
 
-	for (sid = 0; sid < dart->num_streams; sid++) {
+	for (sid = apple_dart_owned_sid_first(dart);
+	     sid <= apple_dart_owned_sid_last(dart); sid++) {
 		dart->save_tcr[sid] = apple_dart_readl(dart,
 						       DART_TCR(dart, sid));
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
@@ -5043,7 +5261,8 @@ static bool apple_dart_state_retained(struct apple_dart *dart)
 	bool live = false;
 	unsigned int sid, idx;
 
-	for (sid = 0; sid < dart->num_streams; sid++) {
+	for (sid = apple_dart_owned_sid_first(dart);
+	     sid <= apple_dart_owned_sid_last(dart); sid++) {
 		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
 
 		if (tcr != dart->save_tcr[sid])
@@ -5079,7 +5298,8 @@ static int apple_dart_invalidate_each_stream(struct apple_dart *dart)
 	unsigned int sid;
 	int ret;
 
-	for (sid = 0; sid < dart->num_streams; sid++) {
+	for (sid = apple_dart_owned_sid_first(dart);
+	     sid <= apple_dart_owned_sid_last(dart); sid++) {
 		struct apple_dart_stream_map stream_map = { .dart = dart };
 
 		__set_bit(sid, stream_map.sidmap);
@@ -5176,7 +5396,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	 * point to the page tables in use. Leaving them cleared would fault
 	 * every DMA of the consumers until the next reset.
 	 */
-	for (sid = 0; sid < dart->num_streams; sid++) {
+	for (sid = apple_dart_owned_sid_first(dart);
+	     sid <= apple_dart_owned_sid_last(dart); sid++) {
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 			apple_dart_writel(dart, dart->save_ttbr[sid][idx],
 					  DART_TTBR(dart, sid, idx));

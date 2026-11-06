@@ -313,6 +313,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1606 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			/* SID0 is invalid; 253/255 are bypass and 254 is PIODMA. */
+			apple,dynamic-sid-range = <1 252>;
 			status = "disabled";
 		};
 
@@ -343,8 +345,7 @@
 			msi-parent = <&usb4_0_pcie>;
 			msi-ranges = <&aic AIC_IRQ 2103 IRQ_TYPE_EDGE_RISING 32>;
 			apple,msi-vector-base = <0x20>;
-			iommu-map = <0x0 &apciec0_dart 0x0 0x100>;
-			iommu-map-mask = <0xff>;
+			iommu-map = <0x0 &apciec0_dart 0x0 0x10000>;
 			bus-range = <0x0 0x80>;
 			#address-cells = <3>;
 			#size-cells = <2>;
@@ -383,6 +384,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1638 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			/* SID0 is invalid; 253/255 are bypass and 254 is PIODMA. */
+			apple,dynamic-sid-range = <1 252>;
 			status = "disabled";
 		};
 
@@ -413,8 +416,7 @@
 			msi-parent = <&usb4_1_pcie>;
 			msi-ranges = <&aic AIC_IRQ 2135 IRQ_TYPE_EDGE_RISING 32>;
 			apple,msi-vector-base = <0x40>;
-			iommu-map = <0x0 &apciec1_dart 0x0 0x100>;
-			iommu-map-mask = <0xff>;
+			iommu-map = <0x0 &apciec1_dart 0x0 0x10000>;
 			bus-range = <0x0 0x80>;
 			#address-cells = <3>;
 			#size-cells = <2>;
@@ -453,6 +455,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1670 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
+			/* SID0 is invalid; 253/255 are bypass and 254 is PIODMA. */
+			apple,dynamic-sid-range = <1 252>;
 			status = "disabled";
 		};
 
@@ -483,8 +487,7 @@
 			msi-parent = <&usb4_2_pcie>;
 			msi-ranges = <&aic AIC_IRQ 2167 IRQ_TYPE_EDGE_RISING 32>;
 			apple,msi-vector-base = <0x60>;
-			iommu-map = <0x0 &apciec2_dart 0x0 0x100>;
-			iommu-map-mask = <0xff>;
+			iommu-map = <0x0 &apciec2_dart 0x0 0x10000>;
 			bus-range = <0x0 0x80>;
 			#address-cells = <3>;
 			#size-cells = <2>;
