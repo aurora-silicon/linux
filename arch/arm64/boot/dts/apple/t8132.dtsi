@@ -474,8 +474,15 @@
 			compatible = "apple,t8132-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
 			#size-cells = <1>;
-			reg = <0x3 0x80700000 0 0x14000>;
+			/* Up to the display CPU's power-gate retention registers. */
+			reg = <0x3 0x80700000 0 0x26000>;
 			/* child nodes are added in t8132-pmgr.dtsi */
+		};
+
+		/* Clock protection slices guarding power states of DART domains. */
+		ps_prot: syscon@38079c000 {
+			compatible = "apple,t8132-ps-prot", "syscon";
+			reg = <0x3 0x8079c000 0 0x4000>;
 		};
 
 		aic: interrupt-controller@381000000 {
