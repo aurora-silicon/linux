@@ -19,7 +19,14 @@ properties:
       - enum:
           - apple,j274-macaudio
           - apple,j293-macaudio
+          - apple,j313-macaudio
           - apple,j314-macaudio
+          - apple,j413-macaudio
+          - apple,j415-macaudio
+          - apple,j456-macaudio
+          - apple,j457-macaudio
+          - apple,j473-macaudio
+          - apple,j493-macaudio
           - apple,j614-macaudio
           - apple,j614-macaudio-jack
           - apple,j616-macaudio
