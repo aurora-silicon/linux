@@ -68,65 +68,66 @@ struct apple_dart_dcp {
 	} while (0)
 
 /*
- * J713 external display DART: its power not confirmed since sleep (from
- * suspend until its firmware powers it up again): no register of it may be
- * read or written, and nothing is retired for that.
+ * A power-gated display DART (see struct apple_dart): its power not
+ * confirmed since it may have gone off (from sleep, or from a power-down by
+ * its DCP, until it is confirmed on again): no register of it may be read or
+ * written, and nothing is retired for that.
  */
-static inline bool apple_dart_dispext_unconfirmed(const struct apple_dart *dart)
+static inline bool apple_dart_pm_unconfirmed(const struct apple_dart *dart)
 {
-	return dart->dispext && READ_ONCE(dart->dispext_unverified);
+	return dart->power_gated && READ_ONCE(dart->pm_unverified);
 }
 
 /*
- * A use of an external display DART's registers, taken at the start of an
+ * A use of a power-gated display DART's registers, taken at the start of an
  * operation and dropped at its end, and only with its power confirmed:
- * false (the caller returns -EAGAIN, nothing retired) from sleep until its
- * next confirmed power-up. Inside it the operation's steps, flushes included,
- * run unchecked: an invalidation (sleep) waits for it to end. Any other
- * DART: always true, no count.
+ * false (the caller returns -EAGAIN, nothing retired) from the moment it may
+ * go off until its next confirmed power-up. Inside it the operation's steps,
+ * flushes included, run unchecked: an invalidation waits for it to end. Any
+ * other DART: always true, no count.
  */
-static inline bool apple_dart_dispext_get(struct apple_dart *dart)
+static inline bool apple_dart_pm_get(struct apple_dart *dart)
 {
 	unsigned long flags;
 	bool ok;
 
-	if (!dart->dispext)
+	if (!dart->power_gated)
 		return true;
-	spin_lock_irqsave(&dart->dispext_pm_lock, flags);
-	ok = !dart->dispext_unverified;
+	spin_lock_irqsave(&dart->pm_gate_lock, flags);
+	ok = !dart->pm_unverified;
 	if (ok)
-		dart->dispext_users++;
-	spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+		dart->pm_users++;
+	spin_unlock_irqrestore(&dart->pm_gate_lock, flags);
 	return ok;
 }
 
-static inline void apple_dart_dispext_put(struct apple_dart *dart)
+static inline void apple_dart_pm_put(struct apple_dart *dart)
 {
 	unsigned long flags;
 
-	if (!dart->dispext)
+	if (!dart->power_gated)
 		return;
-	spin_lock_irqsave(&dart->dispext_pm_lock, flags);
-	if (!--dart->dispext_users)
-		wake_up_all(&dart->dispext_wq);
-	spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+	spin_lock_irqsave(&dart->pm_gate_lock, flags);
+	if (!--dart->pm_users)
+		wake_up_all(&dart->pm_wq);
+	spin_unlock_irqrestore(&dart->pm_gate_lock, flags);
 }
 
 /*
- * Sleep: no power confirmed from now on, a new generation (a check
- * still under way confirms nothing), and every use in flight waited for.
- * @suspend: asleep until the matching resume (no check runs then).
+ * Sleep or a power-down: no power confirmed from now on, a new generation (a
+ * check still under way confirms nothing), and every use in flight waited
+ * for. @suspend: asleep until the matching resume (no check runs then).
  */
-static inline void apple_dart_dispext_invalidate(struct apple_dart *dart, bool suspend)
+static inline void apple_dart_pm_invalidate(struct apple_dart *dart, bool suspend)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&dart->dispext_pm_lock, flags);
-	dart->dispext_unverified = true;
-	dart->dispext_sleeping = suspend;
-	dart->dispext_gen++;
-	spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
-	wait_event(dart->dispext_wq, !READ_ONCE(dart->dispext_users));
+	spin_lock_irqsave(&dart->pm_gate_lock, flags);
+	dart->pm_unverified = true;
+	dart->pm_sleeping = suspend;
+	dart->pm_gen++;
+	spin_unlock_irqrestore(&dart->pm_gate_lock, flags);
+	wait_event(dart->pm_wq, !READ_ONCE(dart->pm_users));
 }
 
 /* Every borrowed stream of @dart, for one reason. */
@@ -207,7 +208,7 @@ static bool apple_dart_dcp_registers(struct apple_dart_dcp *dcp)
 	struct apple_dart *dart = dcp->dart;
 	u32 protect, ttbr, tcr, streams;
 
-	/* An external display DART's callers hold a use of it (apple_dart_dispext_get()). */
+	/* An external display DART's callers hold a use of it (apple_dart_pm_get()). */
 	if (READ_ONCE(dcp->failed))
 		return false;
 	protect = readl(dart->regs + DART_T8110_PROTECT);
@@ -643,7 +644,7 @@ static phys_addr_t apple_dart_dcp_translate(struct apple_dart_dcp *dcp, u64 iova
 	 * An external display DART's registers only inside a use of them (its
 	 * power confirmed, a sleep waits for it): none, no lookup.
 	 */
-	if (dcp->failed || !apple_dart_dispext_get(dcp->dart))
+	if (dcp->failed || !apple_dart_pm_get(dcp->dart))
 		goto out;
 	used = true;
 	if (!apple_dart_dcp_registers(dcp))
@@ -675,7 +676,7 @@ static phys_addr_t apple_dart_dcp_translate(struct apple_dart_dcp *dcp, u64 iova
 out:
 	spin_unlock_irqrestore(&dcp->lock, flags);
 	if (used)
-		apple_dart_dispext_put(dcp->dart);
+		apple_dart_pm_put(dcp->dart);
 	return phys;
 }
 
@@ -1375,13 +1376,13 @@ static size_t apple_dart_dcp_unmap(struct apple_dart_dcp *dcp, u64 iova,
 	 * has no generic DMA user (its host mappings are the private window and
 	 * scanout APIs, which never come through here).
 	 */
-	if (!apple_dart_dispext_get(dcp->dart)) {
+	if (!apple_dart_pm_get(dcp->dart)) {
 		dev_err_ratelimited(dcp->dart->dev, "SID%u unmap at %llx while unconfirmed since sleep: refused\n",
 				    dcp->sid, iova);
 		return 0;
 	}
 	unmapped = __apple_dart_dcp_unmap(dcp, iova, size, count, gather);
-	apple_dart_dispext_put(dcp->dart);
+	apple_dart_pm_put(dcp->dart);
 	return unmapped;
 }
 

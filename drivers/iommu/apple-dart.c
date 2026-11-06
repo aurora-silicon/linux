@@ -320,20 +320,27 @@ struct apple_dart {
 	/* A J713 external display DART, borrowed from its external DCP */
 	bool dispext;
 	/*
-	 * J713 external display DART: its power confirmation across
-	 * sleep, under dispext_pm_lock (a spinlock: only these fields, never
+	 * A display DART whose power can go away under its borrowed streams:
+	 * an external display DART across sleep (its firmware powers it), or an
+	 * internal one powered down by its DCP. Its registers are used only
+	 * with its power confirmed (apple_dart_pm_get()).
+	 */
+	bool power_gated;
+	/*
+	 * Power-gated display DART: its power confirmation across
+	 * sleep, under pm_gate_lock (a spinlock: only these fields, never
 	 * across a register access): unverified from suspend until a state
 	 * check at a D572(1) of the current generation, which every suspend
 	 * and resume moves on; sleeping between suspend and resume; and the
-	 * register uses in flight (apple_dart_dispext_get()), which an
-	 * invalidation waits for (dispext_wq).
+	 * register uses in flight (apple_dart_pm_get()), which an
+	 * invalidation waits for (pm_wq).
 	 */
-	spinlock_t dispext_pm_lock;
-	bool dispext_unverified;
-	bool dispext_sleeping;
-	u64 dispext_gen;
-	unsigned int dispext_users;
-	wait_queue_head_t dispext_wq;
+	spinlock_t pm_gate_lock;	/* the pm_* fields below */
+	bool pm_unverified;
+	bool pm_sleeping;
+	u64 pm_gen;
+	unsigned int pm_users;
+	wait_queue_head_t pm_wq;
 	u32 dispext_protect, dispext_lock;	/* PROTECT and PROTECT_LOCK as adopted */
 	/* Retained radio/display state left in place across suspend-to-idle. */
 	bool s2idle_kept;
@@ -1576,10 +1583,10 @@ static int apple_dart_dcp_invalidate_tlb_gated(struct apple_dart_stream_map *str
 {
 	int ret;
 
-	if (!apple_dart_dispext_get(stream_map->dart))
+	if (!apple_dart_pm_get(stream_map->dart))
 		return -EAGAIN;
 	ret = apple_dart_dcp_invalidate_tlb(stream_map);
-	apple_dart_dispext_put(stream_map->dart);
+	apple_dart_pm_put(stream_map->dart);
 	return ret;
 }
 
@@ -2036,10 +2043,10 @@ static int apple_dart_dcp_domain_flush(struct apple_dart_domain *domain)
 	struct apple_dart *dart = domain->dcp->dart;
 	int ret;
 
-	if (!apple_dart_dispext_get(dart))
+	if (!apple_dart_pm_get(dart))
 		return -EAGAIN;
 	ret = __apple_dart_dcp_domain_flush(domain);
-	apple_dart_dispext_put(dart);
+	apple_dart_pm_put(dart);
 	return ret;
 }
 
@@ -2785,11 +2792,11 @@ static struct iommu_device *apple_dart_probe_device(struct device *dev)
 		int ret = -EINVAL;
 
 		/* An external display DART's registers only inside a use. */
-		if (borrowed && !apple_dart_dispext_get(borrowed->dart)) {
+		if (borrowed && !apple_dart_pm_get(borrowed->dart)) {
 			ret = -EAGAIN;
 		} else if (borrowed) {
 			ret = apple_dart_dcp_validate(borrowed, dev);
-			apple_dart_dispext_put(borrowed->dart);
+			apple_dart_pm_put(borrowed->dart);
 		}
 		if (ret)
 			return ERR_PTR(ret);
@@ -3054,7 +3061,7 @@ static int apple_dart_of_xlate(struct device *dev,
 #if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
 /*
  * The check, inside a use of the DART's registers (on an external display
- * DART, apple_dart_dispext_get() by the caller).
+ * DART, apple_dart_pm_get() by the caller).
  */
 static int __apple_dart_dcp_check(struct device *dev)
 {
@@ -3126,10 +3133,10 @@ int apple_dart_dcp_check(struct device *dev)
 	if (!domain || domain->owner != &apple_dart_iommu_ops || !to_dart_domain(domain)->dcp)
 		return __apple_dart_dcp_check(dev);
 	dart = to_dart_domain(domain)->dcp->dart;
-	if (!apple_dart_dispext_get(dart))
+	if (!apple_dart_pm_get(dart))
 		return -EAGAIN;
 	ret = __apple_dart_dcp_check(dev);
-	apple_dart_dispext_put(dart);
+	apple_dart_pm_put(dart);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_dcp_check);
@@ -4261,8 +4268,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	spin_lock_init(&dart->managed_lock);
 	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
 	dart->dispext = j713_dispext;
-	spin_lock_init(&dart->dispext_pm_lock);
-	init_waitqueue_head(&dart->dispext_wq);
+	dart->power_gated = j713_dispext;
+	spin_lock_init(&dart->pm_gate_lock);
+	init_waitqueue_head(&dart->pm_wq);
 	if (j713_dcpext)
 		dart->dcp_instance = &dcp_adt_external[res->start == 0x48a340000ULL];
 	else if (j713_dispext)
@@ -5061,7 +5069,7 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 			return -EBUSY;
 		if (apple_dart_has_borrowed(dart))
-			apple_dart_dispext_invalidate(dart, true);
+			apple_dart_pm_invalidate(dart, true);
 		return 0;
 	}
 	/*
@@ -5183,13 +5191,13 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	/*
 	 * An adopted external display DART may be off now, its display with it,
 	 * and nothing confirms otherwise: no register of it is read or written
-	 * (apple_dart_dispext_unconfirmed()) until its firmware powers it up
+	 * (apple_dart_pm_unconfirmed()) until its firmware powers it up
 	 * again; the state check then (apple_dart_dcp_dispext_state()) runs
 	 * first: kept, it goes on; lost, it is retired, saying so.
 	 */
 	if (dart->dispext) {
 		if (apple_dart_has_borrowed(dart)) {
-			apple_dart_dispext_invalidate(dart, false);
+			apple_dart_pm_invalidate(dart, false);
 			dev_dbg(dev, "external display DART unconfirmed after sleep\n");
 		}
 		return 0;
@@ -5290,16 +5298,16 @@ static int apple_dart_dispext_verify(struct apple_dart *dart, const char *when)
 	 * not while asleep (between suspend and resume nothing confirms its
 	 * power), and an invalidation meanwhile waits for it to end.
 	 */
-	spin_lock_irqsave(&dart->dispext_pm_lock, flags);
-	if (dart->dispext_sleeping) {
-		spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+	spin_lock_irqsave(&dart->pm_gate_lock, flags);
+	if (dart->pm_sleeping) {
+		spin_unlock_irqrestore(&dart->pm_gate_lock, flags);
 		dev_dbg(dart->dev, "external display DART %s during sleep: not checked\n", when);
 		return -EAGAIN;
 	}
-	gen = dart->dispext_gen;
-	was = dart->dispext_unverified;
-	dart->dispext_users++;
-	spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+	gen = dart->pm_gen;
+	was = dart->pm_unverified;
+	dart->pm_users++;
+	spin_unlock_irqrestore(&dart->pm_gate_lock, flags);
 
 	protect = readl(dart->regs + DART_T8110_PROTECT);
 	lock = readl(dart->regs + DART_T8110_PROTECT_LOCK);
@@ -5319,14 +5327,14 @@ static int apple_dart_dispext_verify(struct apple_dart *dart, const char *when)
 	kept &= (protect & lock & DART_T8110_PROTECT_TTBR_TCR) ==
 		(dart->dispext_protect & dart->dispext_lock & DART_T8110_PROTECT_TTBR_TCR);
 
-	spin_lock_irqsave(&dart->dispext_pm_lock, flags);
+	spin_lock_irqsave(&dart->pm_gate_lock, flags);
 	/* Only a check of the current generation confirms: a sleep since voids it. */
-	current_gen = gen == dart->dispext_gen;
+	current_gen = gen == dart->pm_gen;
 	if (kept && current_gen)
-		dart->dispext_unverified = false;
-	if (!--dart->dispext_users)
-		wake_up_all(&dart->dispext_wq);
-	spin_unlock_irqrestore(&dart->dispext_pm_lock, flags);
+		dart->pm_unverified = false;
+	if (!--dart->pm_users)
+		wake_up_all(&dart->pm_wq);
+	spin_unlock_irqrestore(&dart->pm_gate_lock, flags);
 
 	dev_dbg(dart->dev, "external display DART %s: protect %08x lock %08x (adopted %08x/%08x): state %s%s%s\n",
 		when, protect, lock, dart->dispext_protect, dart->dispext_lock,
