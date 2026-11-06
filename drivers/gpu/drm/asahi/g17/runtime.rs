@@ -1482,6 +1482,11 @@ impl super::Firmware {
         }
         let sources = packet.completion.sources().ok_or(EINVAL)?.clone();
         sources.check()?;
+        // Experiment G: keep the CPU wait for a consumer queue's first command.
+        if !self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.owner() == Some(owner) && queue.installed()) {
+            return Err(EAGAIN);
+        }
         let mut merged = super::dependency::Frontier::new();
         for dependency in dependencies { merged.insert(0, *dependency)?; }
         let mut holds = KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
