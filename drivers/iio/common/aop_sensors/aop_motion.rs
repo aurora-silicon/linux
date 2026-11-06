@@ -390,6 +390,9 @@ impl MotionIio {
                 ],
                 info: bindings::iio_info {
                     read_raw: Some(motion_read_raw),
+                    // The buffer fills from the AOP's reports, not from a
+                    // trigger, so only the device's own trigger fits it.
+                    validate_trigger: Some(bindings::iio_validate_own_trigger),
                     ..Default::default()
                 },
                 _p: PhantomPinned,
@@ -432,13 +435,46 @@ impl MotionIio {
             _spec: spec,
             registered: false,
         };
+        // The buffer fills as the AOP reports, so the trigger never fires.
+        // It exists because userspace finds a buffered sensor through its
+        // trigger: iio-sensor-proxy looks for "<name>-dev<id>" and does not
+        // use a buffer without one.
+        // SAFETY: `dev` is valid and `indio_dev` is allocated; the format
+        // takes the device name and its id, both valid here.
+        let module = kernel::module::this_module::<crate::LocalModule>();
+        let trig = unsafe {
+            bindings::__devm_iio_trigger_alloc(
+                dev.as_raw(),
+                module.as_ptr(),
+                c"%s-dev%d".as_char_ptr(),
+                kind.name.as_char_ptr(),
+                bindings::iio_device_id(indio_dev),
+            )
+        };
+        if trig.is_null() {
+            return Err(ENOMEM);
+        }
+        // SAFETY: `trig` was allocated above; it is unregistered and freed
+        // with the platform device's resources, after the IIO device that
+        // holds a reference to it.
+        let ret = unsafe { bindings::devm_iio_trigger_register(dev.as_raw(), trig) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        // SAFETY: `indio_dev` is not registered yet; the reference taken
+        // here is dropped when the IIO device is released.
+        unsafe { (*indio_dev).trig = bindings::iio_trigger_get(trig) };
         // SAFETY: Both devices are valid. The buffer is released with the
         // platform device's resources; the IIO device holds its own
-        // reference to it until it is freed.
+        // reference to it until it is freed. The poll function only stamps
+        // the time; the report listener pushes the scans.
         let ret = unsafe {
-            bindings::devm_iio_kfifo_buffer_setup_ext(
+            bindings::devm_iio_triggered_buffer_setup_ext(
                 dev.as_raw(),
                 indio_dev,
+                Some(bindings::iio_pollfunc_store_time),
+                None,
+                bindings::iio_buffer_direction_IIO_BUFFER_DIRECTION_IN,
                 ptr::null(),
                 ptr::null_mut(),
             )
