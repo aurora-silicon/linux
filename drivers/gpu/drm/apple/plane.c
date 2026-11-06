@@ -364,7 +364,7 @@ static u32 drm_format_to_dcp(u32 drm, enum drm_color_range range)
 static enum dcp_xfer_func get_xfer_func(bool is_yuv, enum drm_color_encoding enc)
 {
 	if (!is_yuv)
-		return DCP_XFER_FUNC_SDR;
+		return DCP_XFER_FUNC_SRGB;
 
 	switch (enc) {
 	case DRM_COLOR_YCBCR_BT601:
@@ -373,7 +373,7 @@ static enum dcp_xfer_func get_xfer_func(bool is_yuv, enum drm_color_encoding enc
 	case DRM_COLOR_YCBCR_BT2020:
 		return DCP_XFER_FUNC_BT1886;
 	default:
-		return DCP_XFER_FUNC_SDR;
+		return DCP_XFER_FUNC_SRGB;
 	}
 }
 
@@ -381,7 +381,7 @@ static enum dcp_colorspace get_colorspace(bool is_yuv,
 					  enum drm_color_encoding enc)
 {
 	if (!is_yuv)
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_P3_D65;
 
 	switch (enc) {
 	case DRM_COLOR_YCBCR_BT601:
@@ -389,9 +389,9 @@ static enum dcp_colorspace get_colorspace(bool is_yuv,
 	case DRM_COLOR_YCBCR_BT709:
 		return DCP_COLORSPACE_BT709;
 	case DRM_COLOR_YCBCR_BT2020:
-		return DCP_COLORSPACE_BG_BT2020;
+		return DCP_COLORSPACE_BT2020;
 	default:
-		return DCP_COLORSPACE_NATIVE;
+		return DCP_COLORSPACE_P3_D65;
 	}
 }
 
