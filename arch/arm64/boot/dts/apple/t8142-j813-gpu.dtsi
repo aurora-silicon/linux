@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * M5 (T8142) GPU, laid out like the A18 Pro's (t8140.dtsi). Addresses and
+ * interrupts are from the J813 ADT (sgx, gfx-asc, gfx1-asc, pmgr reg[48]).
+ * The bootloader fills the uat-* regions from iBoot's raw-boot handoff, the
+ * gfx-data regions from the firmware DATA segments iBoot loaded, and the
+ * OPPs from sgx perf-states.
+ */
+
+/ {
+	aliases {
+		gpu = &gpu;
+	};
+
+	reserved-memory {
+		/* gfx-asc and gfx1-asc __DATA (ADT sgx gfx-data, gfx1-data) */
+		gfx_data: gfx-data {
+			reg = <0 0 0 0>;
+		};
+
+		gfx1_data: gfx1-data {
+			reg = <0 0 0 0>;
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+		};
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		/* 13 entries in perf-state order, filled in by the bootloader */
+		opp00 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp01 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp02 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp03 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp04 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp05 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp06 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp07 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp08 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp09 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp10 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp11 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+		opp12 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+	};
+};
+
+&{/soc} {
+	pmgr_gpu: power-management@580e80000 {
+		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <5 0x80e80000 0 0x30000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ps_gpx: power-controller@0 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x0 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "gpx";
+			apple,always-on; /* critical */
+		};
+
+		ps_gfx: power-controller@110 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x110 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "gfx";
+			power-domains = <&ps_gpx>;
+		};
+	};
+
+	gpu: gpu@582600000 {
+		compatible = "apple,agx-t8142";
+		reg = <0x5 0x82600000 0x0 0x88000>,
+		      <0x5 0x80000000 0x0 0x4000000>;
+		reg-names = "asc", "sgx";
+		mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+		power-domains = <&ps_gfx>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+				<&uat_l2_pagetables>, <&gfx_data>, <&gfx1_data>;
+		memory-region-names = "ttbs", "pagetables", "handoff",
+				      "shared-l2", "gfx-data", "gfx1-data";
+		operating-points-v2 = <&gpu_opp>;
+		/* Holds the DCS and fabric floor while GPU work is in flight. */
+		apple,clpc = <&clpc>;
+	};
+
+	gfx_mbox: mailbox@582600000 {
+		compatible = "apple,t8142-ascwrap-v6";
+		reg = <0x5 0x82600000 0x0 0x88000>,
+		      <0x5 0x82050000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 1123 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1126 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+	};
+
+	gfx1_mbox: mailbox@582e00000 {
+		compatible = "apple,t8142-ascwrap-v6";
+		reg = <0x5 0x82e00000 0x0 0x88000>,
+		      <0x5 0x82850000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 1127 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1130 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX1";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+	};
+};
