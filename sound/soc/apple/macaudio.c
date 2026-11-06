@@ -2716,8 +2716,8 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
 struct macaudio_platform_cfg macaudio_j873_cfg = {
 	/*
 	 * No qualified speaker protection exists for J873 yet (no verified
-	 * sense path, thermal model or power budget), so the speaker stays off
-	 * unless please_blow_up_my_speakers is set; the jack is unaffected.
+	 * sense path, thermal model or power budget), so the speaker stays off.
+	 * There is no module-parameter bypass; the jack is unaffected.
 	 */
 	.enable_speakers = false,
 	.amp = AMP_SN012776,
@@ -2744,8 +2744,8 @@ struct macaudio_platform_cfg macaudio_j873_cfg = {
  * The jack is a CS42L84 on "cout"; the speakers are four SN012776 (one
  * woofer and one tweeter per side) on "spkr", whose voltage and current
  * sense return on the same stream. As on the other SN012776 laptops, the
- * speaker volume stays locked until a protection daemon (speakersafetyd)
- * holds it.
+ * speakers remain at the protection floor until in-graph protection owns
+ * the Speaker Protection control and supplies a live grant.
  */
 struct macaudio_platform_cfg macaudio_j813_cfg = {
 	.enable_speakers = true,
