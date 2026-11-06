@@ -165,7 +165,11 @@
 		compatible = "apple,j615-macaudio", "apple,j415-macaudio", "apple,macaudio";
 		model = "MacBook Air J615";
 
+		#address-cells = <1>;
+		#size-cells = <0>;
+
 		dai-link@0 {
+			reg = <0>;
 			link-name = "Speakers";
 			dai-tdm-idle-mode-0 = "zero";
 			dai-tdm-idle-mode-3 = "zero";
@@ -182,6 +186,7 @@
 		};
 
 		dai-link@1 {
+			reg = <1>;
 			link-name = "Headphone Jack";
 
 			cpu {
