@@ -321,6 +321,10 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	ubfx	x0, x0, #MIDR_PARTNUM_SHIFT, #12
 	cmp	x0, #0x50
 	b.lo	.Lctxr_no_direct_vhe
+	/* A virtual EL2 without VHE, as nested KVM may give a guest. */
+	mrs	x0, id_aa64mmfr1_el1
+	ubfx	x0, x0, #ID_AA64MMFR1_EL1_VH_SHIFT, #4
+	cbz	x0, .Lctxr_no_direct_vhe
 
 	finalise_el2_state
 
