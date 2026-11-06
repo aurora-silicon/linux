@@ -1710,7 +1710,7 @@ impl super::Firmware {
             owner,
             packet.clone(),
             merged.as_slice(),
-            native.as_slice(),
+            &[],
             deferred,
         );
         if packet.is_published() {
