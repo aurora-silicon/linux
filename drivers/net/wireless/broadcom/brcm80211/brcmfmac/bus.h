@@ -159,7 +159,8 @@ struct brcmf_bus_stats {
  * @chiprev: revision of the dongle chip.
  * @fwvid: firmware vendor-support identifier of the device.
  * @always_use_fws_queue: bus wants use queue also when fwsignal is inactive.
- * @wowl_supported: is wowl supported by bus driver.
+ * @wowl_transport: bus can keep the firmware running during system sleep.
+ * @wowl_wake: platform can route a wake signal from the device.
  * @ops: callbacks for this bus instance.
  * @msgbuf: msgbuf protocol parameters provided by bus layer.
  * @list: member used to add this bus instance to linked list.
@@ -180,7 +181,8 @@ struct brcmf_bus {
 	u32 chiprev;
 	enum brcmf_fwvendor fwvid;
 	bool always_use_fws_queue;
-	bool wowl_supported;
+	bool wowl_transport;
+	bool wowl_wake;
 	bool removing;		/* device removal in progress; quiesce async work */
 	struct mutex bus_reset_lock;
 
