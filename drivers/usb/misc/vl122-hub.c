@@ -21,7 +21,7 @@
 #define HUB_RESET_TIMEOUT_US 1000000
 #define HUB_RELEASE_DELAY_MS 100
 /* The management interface needs a moment after reset before it answers. */
-#define HUB_ASSERT_SETTLE_US 2000
+#define HUB_ASSERT_SETTLE_US 20000
 
 #define USB_VENDOR_ID_GENESYS_LOGIC 0x05e3
 #define USB_VENDOR_ID_VIA_LABS 0x2109
