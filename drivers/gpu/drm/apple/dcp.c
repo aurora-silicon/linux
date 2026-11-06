@@ -1060,7 +1060,7 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 	}
 	/* The caller supplies the same retained catalog it is publishing. */
 	edid = size ? drm_edid_alloc(raw, size) :
-		dcp_panel_edid(&metadata, modes, count,
+		dcp_panel_edid(&metadata, dcp->panel.color_target, modes, count,
 			       dcp->panel.width_mm, dcp->panel.height_mm);
 	kfree(raw);
 	if (!edid)
@@ -1070,6 +1070,29 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 		return ERR_PTR(-ESTALE);
 	}
 	return edid;
+}
+
+/*
+ * The panel's calibrated colour target, for an EDID when the firmware
+ * publishes no chromaticities. An unknown name is ignored, not guessed.
+ */
+int dcp_panel_read_color_target(struct apple_dcp *dcp, struct device_node *panel_np)
+{
+	const struct dcp_color_space *target;
+	const char *name;
+	int ret;
+
+	dcp->panel.color_target = NULL;
+	ret = of_property_read_string(panel_np, "apple,color-gamut", &name);
+	if (ret == -EINVAL)
+		return 0;
+	if (ret)
+		return ret;
+	target = dcp_color_space_lookup(name);
+	if (IS_ERR(target))
+		return PTR_ERR(target);
+	dcp->panel.color_target = target;
+	return 0;
 }
 
 void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation)
@@ -5242,6 +5265,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		panel_np = of_get_compatible_child(dev->of_node, "apple,panel");
 
 	if (panel_np) {
+		/* Every internal panel, whichever firmware drives it. */
+		if (dcp_panel_read_color_target(dcp, panel_np))
+			dev_warn(dev, "ignoring invalid panel apple,color-gamut\n");
 		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 			/*
 			 * Desktop 26.x swaps carry nits, and the panel node

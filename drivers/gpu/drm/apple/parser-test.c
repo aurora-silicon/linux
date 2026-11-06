@@ -1349,18 +1349,142 @@ static void parser_panel_identity(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
 	KUNIT_ASSERT_EQ(test, parse_panel_metadata(&ctx, &metadata), 0);
 	KUNIT_EXPECT_STREQ(test, metadata.name, "Synthetic Int");
-	edid = dcp_panel_edid(&metadata, modes, ARRAY_SIZE(modes), 345, 223);
+	edid = dcp_panel_edid(&metadata, NULL, modes, ARRAY_SIZE(modes), 345, 223);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(edid));
 	KUNIT_EXPECT_TRUE(test, drm_edid_valid(edid));
 	raw = drm_edid_raw(edid);
 	KUNIT_EXPECT_EQ(test, le16_to_cpu(raw->product_id.product_code), 42);
 	KUNIT_EXPECT_EQ(test, le32_to_cpu(raw->product_id.serial_number), 0x12345678U);
+	/* No colour target: nominal D65 white, no primaries, undefined gamma. */
 	KUNIT_EXPECT_EQ(test, raw->gamma, 0xff);
+	KUNIT_EXPECT_EQ(test, raw->red_x, 0);
+	KUNIT_EXPECT_EQ(test, raw->green_y, 0);
+	KUNIT_EXPECT_EQ(test, raw->white_x, 320 >> 2);
+	KUNIT_EXPECT_EQ(test, raw->white_y, 337 >> 2);
 	KUNIT_EXPECT_EQ(test, le16_to_cpu(raw->detailed_timings[0].pixel_clock), 54001);
 	KUNIT_EXPECT_EQ(test, raw->detailed_timings[3].data.other_data.data.range.min_vfreq, 24);
 	KUNIT_EXPECT_EQ(test, raw->detailed_timings[3].data.other_data.data.range.max_vfreq, 120);
 	KUNIT_EXPECT_EQ(test, modes[0].mode.clock, 540005);
 	drm_edid_free(edid);
+}
+
+static const struct dcp_display_mode panel_color_mode = {
+	.mode = {
+		.clock = 540005, .hdisplay = 3456, .hsync_start = 3500,
+		.hsync_end = 3550, .htotal = 4000, .vdisplay = 2160,
+		.vsync_start = 2165, .vsync_end = 2170, .vtotal = 2250,
+		.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
+	},
+};
+
+static const struct edid *panel_color_edid(struct kunit *test,
+					   const struct dcp_display_metadata *metadata,
+					   const char *gamut)
+{
+	const struct dcp_color_space *target = gamut ? dcp_color_space_lookup(gamut) : NULL;
+	const struct drm_edid *edid;
+	struct edid *copy;
+
+	KUNIT_ASSERT_FALSE(test, IS_ERR(target));
+	edid = dcp_panel_edid(metadata, target, &panel_color_mode, 1, 345, 223);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(edid));
+	KUNIT_EXPECT_TRUE(test, drm_edid_valid(edid));
+	copy = kunit_kzalloc(test, sizeof(*copy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, copy);
+	memcpy(copy, drm_edid_raw(edid), sizeof(*copy));
+	drm_edid_free(edid);
+	return copy;
+}
+
+/* 10-bit EDID chromaticity: high eight bits plus two low bits. */
+static u32 panel_color_coord(const struct edid *raw, unsigned int i)
+{
+	const u8 hi[] = { raw->red_x, raw->red_y, raw->green_x, raw->green_y,
+			  raw->blue_x, raw->blue_y, raw->white_x, raw->white_y };
+	u8 lo = i < 4 ? raw->red_green_lo : raw->blue_white_lo;
+
+	return hi[i] << 2 | (lo >> (6 - 2 * (i % 4)) & 3);
+}
+
+static void parser_panel_color_target(struct kunit *test)
+{
+	/* Display P3 and sRGB primaries, then D65, in units of 1/1024. */
+	static const u32 p3[] = { 696, 328, 271, 707, 154, 61, 320, 337 };
+	static const u32 srgb[] = { 655, 338, 307, 614, 154, 61, 320, 337 };
+	struct dcp_display_metadata metadata = {
+		.manufacturer = "APP", .product = 0x616, .name = "Apple Panel",
+	};
+	const struct edid *raw;
+
+	KUNIT_EXPECT_TRUE(test, IS_ERR(dcp_color_space_lookup("adobe-rgb")));
+	KUNIT_EXPECT_TRUE(test, IS_ERR(dcp_color_space_lookup("")));
+	KUNIT_EXPECT_TRUE(test, IS_ERR(dcp_color_space_lookup(NULL)));
+
+	/* No firmware chromaticity: the DT target supplies P3, D65 and 2.2. */
+	raw = panel_color_edid(test, &metadata, "display-p3");
+	for (unsigned int i = 0; i < ARRAY_SIZE(p3); i++)
+		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), p3[i]);
+	KUNIT_EXPECT_EQ(test, raw->gamma, 120);
+	raw = panel_color_edid(test, &metadata, "srgb");
+	for (unsigned int i = 0; i < ARRAY_SIZE(srgb); i++)
+		KUNIT_EXPECT_EQ(test, panel_color_coord(raw, i), srgb[i]);
+	KUNIT_EXPECT_EQ(test, raw->gamma, 120);
+
+	/* Incomplete firmware colour data falls back to the target. */
+	metadata.chromaticity[0][0] = 44608;
+	raw = panel_color_edid(test, &metadata, "display-p3");
+	KUNIT_EXPECT_EQ(test, panel_color_coord(raw, 1), p3[1]);
+
+	/* Complete firmware chromaticities win over the target. */
+	metadata = (struct dcp_display_metadata) {
+		.manufacturer = "APP", .product = 0x616, .name = "Apple Panel",
+		.chromaticity = { { 44608, 20288 }, { 16960, 40448 }, { 9344, 5184 } },
+		.white = { 20544, 21568 },
+	};
+	raw = panel_color_edid(test, &metadata, "display-p3");
+	KUNIT_EXPECT_EQ(test, panel_color_coord(raw, 0), 697U);
+	KUNIT_EXPECT_EQ(test, panel_color_coord(raw, 1), 317U);
+	KUNIT_EXPECT_EQ(test, panel_color_coord(raw, 6), 321U);
+	KUNIT_EXPECT_EQ(test, raw->gamma, 0xff);
+}
+
+static void parser_panel_of_color_target(struct kunit *test)
+{
+	char p3[] = "display-p3", srgb[] = "srgb", bad[] = "adobe-rgb";
+	char unterminated[] = { 's', 'r', 'g', 'b' };
+	struct property gamut = { .name = "apple,color-gamut" };
+	struct device_node node = {};
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	/* No property keeps today's white-only EDID. */
+	KUNIT_EXPECT_EQ(test, dcp_panel_read_color_target(dcp, &node), 0);
+	KUNIT_EXPECT_NULL(test, dcp->panel.color_target);
+
+	node.properties = &gamut;
+	gamut.value = p3;
+	gamut.length = sizeof(p3);
+	KUNIT_EXPECT_EQ(test, dcp_panel_read_color_target(dcp, &node), 0);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->panel.color_target);
+	KUNIT_EXPECT_STREQ(test, dcp->panel.color_target->name, "display-p3");
+	gamut.value = srgb;
+	gamut.length = sizeof(srgb);
+	KUNIT_EXPECT_EQ(test, dcp_panel_read_color_target(dcp, &node), 0);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->panel.color_target);
+	KUNIT_EXPECT_STREQ(test, dcp->panel.color_target->name, "srgb");
+
+	/* Unknown or malformed values are rejected and leave no target. */
+	gamut.value = bad;
+	gamut.length = sizeof(bad);
+	KUNIT_EXPECT_EQ(test, dcp_panel_read_color_target(dcp, &node), -EINVAL);
+	KUNIT_EXPECT_NULL(test, dcp->panel.color_target);
+	gamut.value = p3;
+	gamut.length = sizeof(p3);
+	dcp_panel_read_color_target(dcp, &node);
+	gamut.value = unterminated;
+	gamut.length = sizeof(unterminated);
+	KUNIT_EXPECT_LT(test, dcp_panel_read_color_target(dcp, &node), 0);
+	KUNIT_EXPECT_NULL(test, dcp->panel.color_target);
 }
 
 static void parser_panel_identity_stable(struct kunit *test)
@@ -1685,6 +1809,8 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_identity_bounds),
 	KUNIT_CASE(parser_panel_identity_stable),
 	KUNIT_CASE(parser_panel_identity),
+	KUNIT_CASE(parser_panel_color_target),
+	KUNIT_CASE(parser_panel_of_color_target),
 	KUNIT_CASE(parser_score_presence),
 	KUNIT_CASE(parser_legacy_ties),
 	KUNIT_CASE(parser_color_presence),

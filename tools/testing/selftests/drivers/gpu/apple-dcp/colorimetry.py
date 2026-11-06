@@ -37,6 +37,9 @@ def panel(root, output):
     for i, value in enumerate(inputs):
         raw = bytearray(struct.pack('<I', 0xd3)); fixture['wire'](value, raw)
         unit += 'static const u8 color_%u[]={%s};\n' % (i, ','.join(map(str, raw)))
+    unit += 'static const u8 *const colors[]={%s};\n' % ','.join('color_%u' % i for i in range(len(inputs)))
+    unit += 'static const size_t sizes[]={%s};\n' % ','.join('sizeof(color_%u)' % i for i in range(len(inputs)))
+    unit += 'static const unsigned inputs=%u;\n' % len(inputs)
     unit += r'''
 static struct dcp_display_metadata decode(const u8 *raw, size_t size)
 {
@@ -52,7 +55,7 @@ static const struct dcp_display_mode timing={.mode={
     .flags=DRM_MODE_FLAG_PHSYNC|DRM_MODE_FLAG_PVSYNC,.type=DRM_MODE_TYPE_PREFERRED}};
 static void check(const struct dcp_display_metadata *metadata, bool color, const char *path)
 {
-    const struct drm_edid *edid=dcp_panel_edid(metadata,&timing,1,300,170);
+    const struct drm_edid *edid=dcp_panel_edid(metadata,NULL,&timing,1,300,170);
     assert(!IS_ERR(edid) && drm_edid_valid(edid));
     const u8 *raw=(const void *)&edid->raw;
     if(color) {
@@ -72,6 +75,15 @@ static void check(const struct dcp_display_metadata *metadata, bool color, const
         assert(!raw[25] && !(raw[26]&0xf0));
     }
     if(path) {FILE *file=fopen(path,"wb");assert(file);assert(fwrite(raw,128,1,file)==1);fclose(file);}
+    drm_edid_free(edid);
+}
+/* EDID bytes 23..34: gamma, features and the ten-bit chromaticities. */
+static void colour(const struct dcp_display_metadata *metadata,
+                   const struct dcp_color_space *target, u8 *out)
+{
+    const struct drm_edid *edid=dcp_panel_edid(metadata,target,&timing,1,300,170);
+    assert(!IS_ERR(edid) && drm_edid_valid(edid));
+    memcpy(out,(const u8 *)&edid->raw+23,12);
     drm_edid_free(edid);
 }
 int main(int argc, char **argv)
@@ -94,6 +106,39 @@ int main(int argc, char **argv)
     check(&invalid,false,NULL);
     invalid=p3;invalid.white[0]=1;invalid.white[1]=1;check(&invalid,false,NULL);
     invalid=p3;invalid.chromaticity[0][0]=65535;check(&invalid,false,NULL);
+    /* The DT colour target names the same standard coordinates as the fixtures. */
+    const struct dcp_color_space *p3_target=dcp_color_space_lookup("display-p3");
+    const struct dcp_color_space *srgb_target=dcp_color_space_lookup("srgb");
+    assert(!IS_ERR(p3_target) && !IS_ERR(srgb_target));
+    assert(IS_ERR(dcp_color_space_lookup("p3")) && IS_ERR(dcp_color_space_lookup("")) &&
+           IS_ERR(dcp_color_space_lookup(NULL)) && IS_ERR(dcp_color_space_lookup("Display-P3")));
+    assert(!memcmp(p3_target->chromaticity,p3.chromaticity,sizeof(p3.chromaticity)));
+    assert(!memcmp(p3_target->white,p3.white,sizeof(p3.white)) && p3_target->gamma==p3.gamma);
+    assert(!memcmp(srgb_target->chromaticity,srgb.chromaticity,sizeof(srgb.chromaticity)));
+    assert(!memcmp(srgb_target->white,srgb.white,sizeof(srgb.white)) && srgb_target->gamma==srgb.gamma);
+    {
+        u8 firmware[12],named[12],plain[12];
+        struct dcp_display_metadata none=decode(color_2,sizeof(color_2));
+        /* No firmware primaries: the target gives the firmware-equivalent EDID. */
+        colour(&p3,NULL,firmware);colour(&none,p3_target,named);
+        assert(!memcmp(firmware,named,sizeof(named)) && named[0]==120);
+        colour(&srgb,NULL,firmware);colour(&none,srgb_target,named);
+        assert(!memcmp(firmware,named,sizeof(named)));
+        /* Firmware primaries win over a different target. */
+        colour(&srgb,p3_target,named);assert(!memcmp(firmware,named,sizeof(named)));
+        /* Absent, partial or rejected firmware colour falls back to the target. */
+        colour(&p3,NULL,firmware);
+        for (unsigned i=2;i<inputs;i++) {
+            struct dcp_display_metadata m=decode(colors[i],sizes[i]);
+            if (i==6) continue; /* primaries without gamma are firmware colour */
+            colour(&m,p3_target,named);assert(!memcmp(firmware,named,sizeof(named)));
+        }
+        struct dcp_display_metadata rejected=p3;rejected.chromaticity[0][0]=65535;
+        colour(&rejected,p3_target,named);assert(!memcmp(firmware,named,sizeof(named)));
+        /* Without a target the white-only block is unchanged. */
+        colour(&none,NULL,plain);
+        assert(plain[0]==255 && !plain[2] && !(plain[3]&0xf0));
+    }
     /* A ProductAttributes-only setter must preserve the established colour. */
     struct apple_dcp d={.fw_compat=5,.has_panel=true,.connector=&d};
     __typeof__(*d.panel_identity) state={0};d.panel_identity=&state;notifications=0;
