@@ -104,6 +104,8 @@ enum {
 	DPAVSERV_ENDPOINT = 0x28,
 	DPAVSERV_ENDPOINT_V2 = 0x2a,
 	AV_ENDPOINT = 0x29,
+	/* Firmware 27 publishes DCPAVAudioInterface on 0x2b. */
+	AV_ENDPOINT_V27 = 0x2b,
 	/* Desktop 26.x separates the audio service from AV device control. */
 	AV_AUDIO_ENDPOINT_DESKTOP = 0x2b,
 	DPTX_ENDPOINT = 0x2a,
