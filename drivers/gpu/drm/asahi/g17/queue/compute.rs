@@ -30,13 +30,6 @@ const DESCRIPTORS: usize = 32;
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
-const NATIVE_WAIT_OFFSET: usize = 0x900;
-const NATIVE_WAIT_STRIDE: usize = 0x60;
-// A submission can name every physical compute channel. Keep the complete
-// wait list inside its own cached slot, including the last retained slot.
-const CACHED_RECORD_STRIDE: usize = (NATIVE_WAIT_OFFSET
-    + crate::g17::kick::COMPUTE_CHANNELS * NATIVE_WAIT_STRIDE)
-    .next_power_of_two();
 const CONFIG: usize = 0;
 const ANNOUNCE: usize = 0x800;
 const PREDECESSOR: usize = 0x400;
@@ -202,8 +195,8 @@ impl Graph {
         let cached_records = objects.allocate(
             alloc,
             Family::QueueConfig,
-            RECORD_SLOTS * CACHED_RECORD_STRIDE,
-            RECORD_SLOTS * CACHED_RECORD_STRIDE,
+            RECORD_SLOTS * RECORD_STRIDE,
+            RECORD_SLOTS * RECORD_STRIDE,
             prot,
             cpu,
         )?;
@@ -1324,48 +1317,23 @@ mod admission_tests {
     use super::*;
 
     #[test]
-    fn complete_native_wait_list_fits_every_cached_slot() {
-        let waits = crate::g17::kick::COMPUTE_CHANNELS;
+    fn every_record_fits_its_slot() {
         for slot in 0..RECORD_SLOTS {
-            for index in 0..waits {
-                let start = record_start(
-                    slot,
-                    NATIVE_WAIT_OFFSET + index * NATIVE_WAIT_STRIDE,
-                    NATIVE_WAIT_STRIDE,
-                    CACHED_RECORD_STRIDE,
-                )
-                .unwrap();
-                assert!(start >= slot * CACHED_RECORD_STRIDE);
-                assert!(start + NATIVE_WAIT_STRIDE <= (slot + 1) * CACHED_RECORD_STRIDE);
+            for (offset, window) in [(CONFIG, 0xc0), (PREDECESSOR, 0x400), (ANNOUNCE, 0x40)] {
+                let start = record_start(slot, offset, window, RECORD_STRIDE).unwrap();
+                assert!(start >= slot * RECORD_STRIDE);
+                assert!(start + window <= (slot + 1) * RECORD_STRIDE);
             }
         }
     }
 
     #[test]
     fn record_window_cannot_overwrite_the_next_slot() {
-        // The nineteenth wait used to cross the old slot boundary silently.
-        let offset = NATIVE_WAIT_OFFSET + 18 * NATIVE_WAIT_STRIDE;
-        assert_eq!(
-            record_start(0, offset, NATIVE_WAIT_STRIDE, RECORD_STRIDE),
-            Err(EINVAL)
-        );
-        assert!(record_start(0, offset, NATIVE_WAIT_STRIDE, CACHED_RECORD_STRIDE).is_ok());
-        assert_eq!(
-            record_start(RECORD_SLOTS, 0, 1, CACHED_RECORD_STRIDE),
-            Err(EINVAL)
-        );
-        assert_eq!(
-            record_start(0, usize::MAX, 1, CACHED_RECORD_STRIDE),
-            Err(EINVAL)
-        );
-        assert_eq!(
-            record_start(0, CACHED_RECORD_STRIDE, 1, CACHED_RECORD_STRIDE),
-            Err(EINVAL)
-        );
-        assert_eq!(
-            record_start(0, CACHED_RECORD_STRIDE - 1, 1, CACHED_RECORD_STRIDE),
-            Ok(CACHED_RECORD_STRIDE - 1)
-        );
+        assert_eq!(record_start(0, RECORD_STRIDE - 0x40, 0x41, RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(RECORD_SLOTS, 0, 1, RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, usize::MAX, 1, RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, RECORD_STRIDE, 1, RECORD_STRIDE), Err(EINVAL));
+        assert_eq!(record_start(0, RECORD_STRIDE - 1, 1, RECORD_STRIDE), Ok(RECORD_STRIDE - 1));
     }
 
     #[test]
@@ -2093,12 +2061,12 @@ impl Graph {
         value: T,
     ) -> Result<u64> {
         let (object, start) = if let Some(slot) = slot {
-            let (object, stride): (&mut KernelObject, usize) = if offset == ANNOUNCE {
-                (&mut self.records, RECORD_STRIDE)
+            let object: &mut KernelObject = if offset == ANNOUNCE {
+                &mut self.records
             } else {
-                (&mut self.cached_records, CACHED_RECORD_STRIDE)
+                &mut self.cached_records
             };
-            (object, record_start(slot, offset, window, stride)?)
+            (object, record_start(slot, offset, window, RECORD_STRIDE)?)
         } else {
             let start = record_start(0, offset, window, GRAPH_SIZE - 0x6800)?;
             (&mut *self.graph, 0x6800 + start)
@@ -2173,17 +2141,6 @@ impl Queue {
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        self.publish_with_native_waits(packet, dependencies, &[], host, defer)
-    }
-
-    pub(in crate::g17) fn publish_with_native_waits(
-        &mut self,
-        packet: Arc<Packet>,
-        dependencies: &[crate::g17::fw::kick::KickDependency],
-        native: &[crate::g17::sync_input::NativeWait],
-        host: &mut impl Host,
-        defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
         use crate::g17::fw::{
             channels::WorkSlot,
             compute::{ComputeArgs, ComputeDescriptor, COMPUTE_KICK_EVENT_MASK, COMPUTE_QOS_CLASS},
@@ -2217,26 +2174,11 @@ impl Queue {
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
         let first = !self.installed && self.ordinal == 0;
-        // The first prototype only waits on an installed consumer channel.
-        // A retry without a published source falls back to completion on CPU.
-        if first && !native.is_empty() {
-            return Err(EAGAIN);
-        }
-        if native.len() > crate::g17::kick::COMPUTE_CHANNELS {
-            return Err(EINVAL);
-        }
         let entry_signal = first
             || dependencies
                 .iter()
                 .any(|dependency| dependency.qid() != qid);
         item_capacity(self.graph.cursors()?, entry_signal)?;
-        if !native.is_empty() {
-            let cursors = self.graph.cursors()?;
-            let free = (cursors.consumer + cursors.count - cursors.producer - 1) % cursors.count;
-            if free < (if entry_signal { 4 } else { 3 }) + native.len() as u32 {
-                return Err(EAGAIN);
-            }
-        }
         let record_slot = (!first).then_some(self.ordinal as usize % RECORD_SLOTS);
         if let Some(slot) = record_slot {
             self.graph.ensure_record_slot(slot)?;
@@ -2356,20 +2298,6 @@ impl Queue {
                 None
             };
             let cursors = self.graph.cursors()?;
-            let mut wait_vas = KVec::with_capacity(native.len(), GFP_KERNEL)?;
-            for (index, wait) in native.iter().enumerate() {
-                let record = wait.bytes(
-                    crate::g17::fw::stamp_value(kick_timestamp.get() as u32),
-                    packet.order.sequence,
-                );
-                let address = self.graph.record(
-                    record_slot,
-                    NATIVE_WAIT_OFFSET + index * NATIVE_WAIT_STRIDE,
-                    NATIVE_WAIT_STRIDE,
-                    record,
-                )?;
-                wait_vas.push(address, GFP_KERNEL)?;
-            }
             let kick_ring_va = self.kick.low_va();
             let prepared_kick = self.kick.prepare_entry(&kick_args)?;
             let mut producer;
@@ -2411,25 +2339,18 @@ impl Queue {
                     })?;
             } else {
                 let target = self.pool.reserve_submission()?;
-                producer = (|| -> Result<u32> {
-                    let mut before_descriptor = cursors.producer;
-                    for &wait in &wait_vas {
-                        before_descriptor = self.graph.append(before_descriptor, wait, || {
-                            packet.mark_published();
-                            visible = true;
-                        })?;
-                    }
-                    self.graph.append(before_descriptor, descriptor_high, || {
+                producer = self
+                    .graph
+                    .append(cursors.producer, descriptor_high, || {
                         packet.mark_published();
                         visible = true;
                     })
-                })()
-                .or_else(|error| {
-                    if !visible {
-                        self.pool.cancel_unpublished(target)?;
-                    }
-                    Err(error)
-                })?;
+                    .or_else(|error| {
+                        if !visible {
+                            self.pool.cancel_unpublished(target)?;
+                        }
+                        Err(error)
+                    })?;
                 visible = true;
                 self.unpublished_binding = false;
                 let qos = host.qos_publish(
@@ -2914,13 +2835,7 @@ impl Queue {
             )
             .ok_or(EIO)?;
             let hold = self.source_hint.hold(&self.source_readers)?;
-            return Ok(Some((
-                active.published,
-                dependency,
-                self.graph.support.gpu_va() + STAMP as u64,
-                u32::from(self.qid()),
-                hold,
-            )));
+            return Ok(Some((active.published, dependency, hold)));
         }
         Ok(None)
     }
@@ -2937,11 +2852,9 @@ impl Queue {
     }
 }
 
-/// Publication, dependency, stamp address, queue and the retained source hold.
+/// Publication, dependency and the retained source hold.
 pub(crate) type SourceDependency = (
     u64,
     crate::g17::fw::kick::KickDependency,
-    u64,
-    u32,
     crate::g17::sync_input::Hold,
 );

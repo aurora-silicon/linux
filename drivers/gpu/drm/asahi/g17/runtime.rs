@@ -1469,7 +1469,7 @@ impl super::Firmware {
         if packet.completion.sources().is_some() {
             self.publish_compute_inputs(owner, packet, dependencies, deferred)
         } else {
-            self.publish_compute_raw(owner, packet, dependencies, &[], deferred)
+            self.publish_compute_raw(owner, packet, dependencies, deferred)
         }
     }
 
@@ -1485,8 +1485,7 @@ impl super::Firmware {
         let mut merged = super::dependency::Frontier::new();
         for dependency in dependencies { merged.insert(0, *dependency)?; }
         let mut holds = KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
-        let mut native: KVec<super::sync_input::NativeWait> =
-            KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
+        let mut producers: KVec<u8> = KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
         for source in &sources.sources {
             if source.submission.source_status()? { continue; }
             let found = self.queues.compute.iter_mut().flatten()
@@ -1496,33 +1495,33 @@ impl super::Firmware {
                     Ok(None) => None,
                     result => Some(result),
                 }).ok_or(EAGAIN)??;
-            let Some((sequence, dependency, stamp_va, event_slot, hold)) = found else {
+            let Some((sequence, dependency, hold)) = found else {
                 return Err(EAGAIN);
             };
-            // The completion-wait record orders the consumer behind its
-            // source; naming the source in the kick entry as well only adds
-            // a second, slower wait and a predecessor record.
-            let wait = super::sync_input::NativeWait { sequence, dependency, stamp_va, event_slot };
-            if let Some(old) = native.iter_mut().find(|old|
-                old.dependency.qid() == dependency.qid()) {
-                if sequence > old.sequence { *old = wait; }
-            } else {
-                native.push(wait, GFP_KERNEL)?;
+            // The source orders the consumer through its kick entry: the
+            // firmware parks the consumer on the producer's completion and
+            // wakes it when that kick retires. A queue command ahead of the
+            // kick would instead hold the consumer queue until a later
+            // scheduler pass. The newest kick of a producer queue covers its
+            // older ones. Producer QIDs are compute QIDs and never collide
+            // with the render prefix; a full kick entry keeps the CPU wait.
+            merged.insert(sequence, dependency).map_err(|_| EAGAIN)?;
+            if !producers.contains(&dependency.qid()) {
+                producers.push(dependency.qid(), GFP_KERNEL)?;
             }
             holds.push(hold, GFP_KERNEL)?;
         }
-        let result = self.publish_compute_raw(owner, packet.clone(), merged.as_slice(),
-            native.as_slice(), deferred);
+        let result = self.publish_compute_raw(owner, packet.clone(), merged.as_slice(), deferred);
         if packet.is_published() {
             for queue in self.queues.compute.iter().flatten()
                 .filter_map(|entry| entry.queue.as_deref())
-                .filter(|queue| native.iter().any(|wait| wait.dependency.qid() == queue.qid()))
+                .filter(|queue| producers.contains(&queue.qid()))
             {
                 for source in &sources.sources { queue.note_input_consumer(source); }
             }
             sources.set_holds(holds);
             super::sync_input::note_published();
-            super::sync_input::note_native(native.len());
+            super::sync_input::note_native(producers.len());
         }
         result
     }
@@ -1532,7 +1531,6 @@ impl super::Firmware {
         owner: u64,
         packet: Arc<super::job::Packet>,
         dependencies: &[super::fw::kick::KickDependency],
-        native: &[super::sync_input::NativeWait],
         deferred: &mut DeferredBatch,
     ) -> Result {
         if self.recovery.pending() {
@@ -1566,12 +1564,7 @@ impl super::Firmware {
             qids: &mut queues.qids,
             generation: self.recovery.generation(),
         };
-        if native.is_empty() {
-            queue.publish(packet, dependencies, &mut host, &mut |event| deferred.push(event))
-        } else {
-            queue.publish_with_native_waits(packet, dependencies, native,
-                &mut host, &mut |event| deferred.push(event))
-        }
+        queue.publish(packet, dependencies, &mut host, &mut |event| deferred.push(event))
     }
 }
 

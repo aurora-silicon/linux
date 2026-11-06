@@ -137,35 +137,7 @@ pub(super) fn counters() -> (u64, u64) {
     (CONVERTED.load(Ordering::Relaxed), PUBLISHED.load(Ordering::Relaxed))
 }
 
-/// A revalidated compute completion dependency for a direct work descriptor.
-#[derive(Clone, Copy)]
-pub(super) struct NativeWait {
-    pub(super) sequence: u64,
-    pub(super) dependency: super::fw::kick::KickDependency,
-    pub(super) stamp_va: u64,
-    pub(super) event_slot: u32,
-}
-impl NativeWait {
-    pub(super) fn bytes(&self, consumer_stamp: u32, uuid: u64) -> [u8; 0x48] {
-        let mut out = [0; 0x48];
-        let timestamp = self.dependency.word() & ((1u64 << 40) - 1);
-        for (offset, value) in [
-            (0, 4u32),
-            (0x14, u32::from(self.dependency.qid())),
-            (0x18, super::fw::stamp_value(timestamp as u32)),
-            (0x24, self.event_slot),
-            (0x28, consumer_stamp),
-            (0x34, 1),
-        ] {
-            out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        for (offset, value) in [(4, self.stamp_va), (0xc, timestamp), (0x2c, uuid)] {
-            out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        out
-    }
-}
-
+/// Producer queues named in consumer kick entries.
 static NATIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(super) fn note_native(count: usize) { NATIVE.fetch_add(count as u64, Ordering::Relaxed); }
 pub(super) fn native_count() -> u64 { NATIVE.load(Ordering::Relaxed) }
@@ -173,32 +145,6 @@ pub(super) fn native_count() -> u64 { NATIVE.load(Ordering::Relaxed) }
 #[kunit_tests(asahi_g17_input_wait)]
 mod tests {
     use super::*;
-    use crate::g17::fw::kick::{KickDependency, KickTimestamp};
-
-    #[test]
-    fn completion_record_preserves_distinct_event_and_queue_domains() {
-        let wait = NativeWait {
-            sequence: 1,
-            dependency: KickDependency::new(37,
-                KickTimestamp::new(0x12_3456_789a).unwrap()).unwrap(),
-            stamp_va: 0x1122_3344_5566_7788,
-            event_slot: 7,
-        };
-        // Protocol fixture includes the unaligned stamp pointer, full 40-bit
-        // timestamp, wrapped 24-bit stamp and independent legacy event slot.
-        let expected: [u8; 0x48] = [
-            4, 0, 0, 0, 0x88, 0x77, 0x66, 0x55,
-            0x44, 0x33, 0x22, 0x11, 0x9a, 0x78, 0x56, 0x34,
-            0x12, 0, 0, 0, 37, 0, 0, 0,
-            0, 0x9a, 0x78, 0x56, 0, 0, 0, 0,
-            0, 0, 0, 0, 7, 0, 0, 0,
-            0, 0xcc, 0xbb, 0xaa, 8, 7, 6, 5,
-            4, 3, 2, 1, 1, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        assert_eq!(wait.bytes(0xaabb_cc00, 0x0102_0304_0506_0708), expected);
-    }
 
     #[test]
     fn failed_loan_acquisition_never_wraps_or_releases_another_reader() {
