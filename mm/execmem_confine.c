@@ -26,6 +26,7 @@
 #include <linux/execmem.h>
 #include <linux/genalloc.h>
 #include <linux/kasan.h>
+#include <linux/kmemleak.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
@@ -33,6 +34,8 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/xarray.h>
+
+#include <asm/tlbflush.h>
 
 #include "internal.h"
 #include "vmalloc.h"
@@ -125,6 +128,8 @@ static unsigned long confine_count_freed_pages(void)
 void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 			    pgprot_t pgprot, unsigned long vm_flags)
 {
+	bool kasan_shadow = range->flags & EXECMEM_KASAN_SHADOW;
+	kasan_vmalloc_flags_t kasan_flags;
 	struct confine_chunk *ck;
 	struct vm_struct *area;
 	struct page **pages;
@@ -137,6 +142,10 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 
 	size = PAGE_ALIGN(size);
 	nr = size >> PAGE_SHIFT;
+
+	/* kasan_alloc_module_shadow() registers the area with kmemleak. */
+	if (kasan_shadow)
+		vm_flags |= VM_DEFER_KMEMLEAK;
 
 	/*
 	 * Reserve the virtual area inside the range (then the fallback range)
@@ -179,7 +188,7 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	vaddr = (unsigned long)area->addr;
 	err = vmap_pages_range(vaddr, vaddr + size, pgprot, pages, PAGE_SHIFT);
 	if (err)
-		goto err_pool;
+		goto err_map;	/* may be partly mapped */
 
 	/*
 	 * Publish the backing pages on the vm_struct. arm64's set_memory_rox()
@@ -202,9 +211,22 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 	if (err)
 		goto err_map;
 
-	if ((range->flags & EXECMEM_KASAN_SHADOW) &&
-	    kasan_alloc_module_shadow(area->addr, size, GFP_KERNEL) < 0)
-		goto err_xa;
+	/*
+	 * As __vmalloc_node_range() does once a VM_ALLOC area is mapped: mark it
+	 * accessible to KASAN and, unless the module shadow below registers it,
+	 * tell kmemleak about it. kasan_alloc_module_shadow() wants the
+	 * untagged address.
+	 */
+	if (kasan_shadow) {
+		if (kasan_alloc_module_shadow(area->addr, size, GFP_KERNEL) < 0)
+			goto err_xa;
+	}
+	kasan_flags = KASAN_VMALLOC_VM_ALLOC;
+	if (pgprot_val(pgprot) == pgprot_val(PAGE_KERNEL))
+		kasan_flags |= KASAN_VMALLOC_PROT_NORMAL;
+	area->addr = kasan_unpoison_vmalloc(area->addr, size, kasan_flags);
+	if (!kasan_shadow)
+		kmemleak_vmalloc(area, size, GFP_KERNEL);
 
 	return area->addr;
 
@@ -214,16 +236,17 @@ err_xa:
 	mutex_unlock(&confine_lock);
 err_map:
 	free_vm_area(area);		/* unmaps the range and frees bookkeeping */
+	/*
+	 * free_vm_area() leaves the TLB flush to the lazy vmap purge: flush now,
+	 * before the pages can be handed out again as someone's text.
+	 */
+	flush_tlb_kernel_range(vaddr, vaddr + size);
 	mutex_lock(&confine_lock);
 	gen_pool_free(confine_pool, pool_va, size);
 	mutex_unlock(&confine_lock);
 	kfree(ck);
 	kfree(pages);
 	return NULL;
-err_pool:
-	mutex_lock(&confine_lock);
-	gen_pool_free(confine_pool, pool_va, size);
-	mutex_unlock(&confine_lock);
 err_ck:
 	kfree(ck);
 err_pages:
@@ -235,7 +258,7 @@ err_area:
 
 bool execmem_confine_free(void *ptr)
 {
-	unsigned long vaddr = (unsigned long)ptr;
+	unsigned long vaddr = (unsigned long)kasan_reset_tag(ptr);
 	struct confine_chunk *ck;
 	unsigned int nr;
 
@@ -251,6 +274,7 @@ bool execmem_confine_free(void *ptr)
 		return false;
 
 	nr = ck->size >> PAGE_SHIFT;
+	kmemleak_free(ptr);
 
 	/*
 	 * We bypass vfree(), so VM_FLUSH_RESET_PERMS does not run for us: drop
@@ -261,6 +285,12 @@ bool execmem_confine_free(void *ptr)
 	set_memory_rw(vaddr, nr);
 
 	free_vm_area(ck->area);
+	/*
+	 * free_vm_area() leaves the TLB flush to the lazy vmap purge. Flush
+	 * before the pages go back to the pool, or a stale entry for this VA
+	 * could still write to them once they are someone else's text.
+	 */
+	flush_tlb_kernel_range(vaddr, vaddr + ck->size);
 
 	mutex_lock(&confine_lock);
 	gen_pool_free(confine_pool, ck->pool_va, ck->size);
