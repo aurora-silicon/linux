@@ -9,6 +9,7 @@ unsafe extern "C" {
     fn asahi_g17_trace_publish_enabled() -> bool;
     fn asahi_g17_trace_publish(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         fence: *mut bindings::dma_fence);
+    fn asahi_g17_trace_publication_burst(engine: u8, count: u8, flush: bool);
     fn asahi_g17_trace_complete(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         gpu_start: u64, gpu_end: u64);
     fn asahi_g17_trace_bind(engine: u8, qid: u8, ctx: u32, kind: u8);
@@ -22,7 +23,15 @@ unsafe extern "C" {
 pub(super) const RENDER: u8 = 0;
 pub(super) const COMPUTE: u8 = 1;
 
-/// Called once the command's doorbell has been rung.
+/// One scheduler publication joined a pending work-doorbell group, or flushed
+/// it at a dependency, failure, cancellation or size boundary.
+pub(super) fn burst(engine: u8, count: u8, flush: bool) {
+    // SAFETY: Plain values only.
+    unsafe { asahi_g17_trace_publication_burst(engine, count, flush) };
+}
+
+/// Called once the command's descriptor, kick and outer record are visible.
+/// A publication-burst tracepoint records the later shared doorbell boundary.
 pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job::Packet>) {
     // SAFETY: Pure static-key query.
     if !unsafe { asahi_g17_trace_publish_enabled() } {

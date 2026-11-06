@@ -106,8 +106,10 @@ impl crate::g17::queue::render::Host for DirectHost<'_> {
     }
     /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2.
     fn notify_render(&mut self, priority: u8) -> Result {
-        self.port
-            .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2)
+        self.port.notify_engine(
+            crate::g17::trace::RENDER,
+            (0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2,
+        )
     }
     fn note_submission(&mut self) -> Result {
         // Counted, with full effort witnessed, before the pair was lent.
@@ -334,6 +336,7 @@ impl Backend {
                 packet.clone(),
                 &dependencies,
                 loan.lease,
+                true,
                 &mut host,
                 &mut |event| deferred.push(event),
             );

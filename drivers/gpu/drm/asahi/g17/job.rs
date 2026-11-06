@@ -298,7 +298,11 @@ pub(crate) trait Backend: Send + Sync {
     fn long_job_beside(&self, _packet: &Arc<Packet>) -> bool { false }
     /// Return true only after taking publication ownership and recording its result.
     fn try_early(&self, packet: &Arc<Packet>) -> bool;
-    fn count_backlog(&self, packet: &Packet);
+    /// Bracket one fully validated multi-command ioctl. Implementations may
+    /// expose its independent announcements before one final work doorbell.
+    fn begin_publication_burst(&self) -> Result { Ok(()) }
+    fn end_publication_burst(&self) -> Result { Ok(()) }
+    fn count_backlog(&self, packet: &Arc<Packet>);
 }
 
 struct Job<B: Backend> {

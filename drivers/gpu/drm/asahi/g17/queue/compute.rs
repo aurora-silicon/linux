@@ -2170,10 +2170,11 @@ impl Queue {
         &mut self,
         packet: Arc<Packet>,
         dependencies: &[crate::g17::fw::kick::KickDependency],
+        notify: bool,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
-        self.publish_with_native_waits(packet, dependencies, &[], host, defer)
+        self.publish_with_native_waits(packet, dependencies, &[], notify, host, defer)
     }
 
     pub(in crate::g17) fn publish_with_native_waits(
@@ -2181,6 +2182,7 @@ impl Queue {
         packet: Arc<Packet>,
         dependencies: &[crate::g17::fw::kick::KickDependency],
         native: &[crate::g17::sync_input::NativeWait],
+        notify: bool,
         host: &mut impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
     ) -> Result {
@@ -2511,12 +2513,12 @@ impl Queue {
                     previous.publication = Some((packet.order.sequence, epoch));
                 }
             }
-            // Every publication rings its own pipe and priority class, as render
-            // publication does: pipe 2 (compute) in bits 1:0, priority class in
-            // bits 3:2. The generic work doorbell left the firmware to find the
-            // ring itself and delayed dispatch.
-            fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            // A scheduler burst exposes consecutive count-one announcements
+            // first and rings this pipe after the final outer record.
+            if notify {
+                fence(Ordering::SeqCst);
+                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            }
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();

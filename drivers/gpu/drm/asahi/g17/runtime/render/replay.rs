@@ -100,7 +100,7 @@ impl Firmware {
                 return Ok(false);
             }
         }
-        match self.publish_render(owner, slot as u8, &packet, deferred) {
+        match self.publish_render(owner, slot as u8, &packet, true, deferred) {
             Ok(()) => {
                 self.with_render(slot, |pair, _| pair.finish_replay(&packet))?;
                 Ok(true)

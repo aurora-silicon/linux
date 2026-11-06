@@ -502,19 +502,31 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 && matches!(&pending[0].0, Validated::Compute { .. })
                 && !pending[0].2.has_outputs();
             let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
-            for (command, order, destinations) in pending {
-                let guard = guards.next().ok_or(EIO)?;
-                self.enqueue(
-                    id,
-                    command,
-                    order,
-                    guard,
-                    &aggregate,
-                    outputs.inputs(),
-                    destinations,
-                )?;
+            let burst = pending.len() > 1;
+            if burst {
+                self.backend.begin_publication_burst()?;
             }
-            Ok(())
+            let enqueued = (|| {
+                for (command, order, destinations) in pending {
+                    let guard = guards.next().ok_or(EIO)?;
+                    self.enqueue(
+                        id,
+                        command,
+                        order,
+                        guard,
+                        &aggregate,
+                        outputs.inputs(),
+                        destinations,
+                    )?;
+                }
+                Ok(())
+            })();
+            let flushed = if burst {
+                self.backend.end_publication_burst()
+            } else {
+                Ok(())
+            };
+            enqueued.and(flushed)
         })();
         // Everything this ioctl publishes is visible; release what it pruned.
         self.finished.clear();

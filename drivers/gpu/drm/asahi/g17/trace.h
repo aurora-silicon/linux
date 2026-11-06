@@ -43,6 +43,23 @@ TRACE_EVENT(asahi_g17_publish,
 		  __entry->counter)
 );
 
+TRACE_EVENT(asahi_g17_publication_burst,
+	TP_PROTO(u8 engine, u8 count, bool flush),
+	TP_ARGS(engine, count, flush),
+	TP_STRUCT__entry(
+		__field(u8, engine)
+		__field(u8, count)
+		__field(bool, flush)
+	),
+	TP_fast_assign(
+		__entry->engine = engine;
+		__entry->count = count;
+		__entry->flush = flush;
+	),
+	TP_printk("engine=%u count=%u flush=%u", __entry->engine,
+		  __entry->count, __entry->flush)
+);
+
 TRACE_EVENT(asahi_g17_complete,
 	TP_PROTO(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 		 u64 gpu_start, u64 gpu_end, u64 counter),

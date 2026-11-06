@@ -11,6 +11,76 @@ use core::sync::atomic::Ordering;
 use kernel::{dma_fence::Fence, drm::sched, prelude::*, sync::Arc};
 
 impl Backend {
+    fn publication_burst_tracked(&self, packet: &Arc<Packet>) -> bool {
+        self.publication_burst.lock().tracked(packet)
+    }
+
+    fn flush_publication_engine(&self, engine: Engine) -> Result {
+        use core::sync::atomic::{fence, Ordering};
+        let lease = self.shared.preparations.enter(false)?;
+        let port = self.shared.port(&lease).ok_or(ENODEV)?;
+        let pipe: u64 = match engine {
+            Engine::Render => 0,
+            Engine::Compute => 2,
+        };
+        fence(Ordering::SeqCst);
+        port.notify_engine(
+            match engine {
+                Engine::Render => crate::g17::trace::RENDER,
+                Engine::Compute => crate::g17::trace::COMPUTE,
+            },
+            (0x83 << crate::g17::MSG_TYPE_SHIFT)
+                | pipe
+                | u64::from(self.context.policy().priority()) << 2,
+        )
+    }
+
+    fn flush_publication_burst(&self, packet: &Packet) -> Result {
+        self.flush_publication_engine(packet.engine())
+    }
+
+    pub(in crate::g17::runtime) fn ioctl_publication_burst_open(&self) -> bool {
+        self.publication_burst.lock().ioctl_open()
+    }
+
+    pub(in crate::g17::runtime) fn note_ioctl_publication(&self, packet: &Packet) -> Result {
+        let engine = packet.engine();
+        let flush = self.publication_burst.lock().note_ioctl(engine);
+        crate::g17::trace::burst(
+            match engine {
+                Engine::Render => crate::g17::trace::RENDER,
+                Engine::Compute => crate::g17::trace::COMPUTE,
+            },
+            if flush { super::PUBLICATION_BURST_MAX } else { 0 },
+            flush,
+        );
+        if flush {
+            self.flush_publication_engine(engine)?;
+        }
+        Ok(())
+    }
+
+    /// Remove one scheduler packet from the publication window. A successful
+    /// head keeps its doorbell pending only across a contiguous dependency-free
+    /// successor, and never across more than the bounded group.
+    fn complete_publication_burst(&self, packet: &Arc<Packet>, published: bool) -> Result {
+        let decision = self.publication_burst.lock().finish(packet, published);
+        if decision.tracked {
+            crate::g17::trace::burst(
+                match packet.engine() {
+                    Engine::Render => crate::g17::trace::RENDER,
+                    Engine::Compute => crate::g17::trace::COMPUTE,
+                },
+                decision.count,
+                decision.flush,
+            );
+        }
+        if decision.flush {
+            self.flush_publication_burst(packet)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn release_backlog(&self, packet: &Packet) {
         if packet.take_backlog() {
             self.backlog_of(packet).fetch_sub(1, Ordering::AcqRel);
@@ -24,7 +94,7 @@ impl Backend {
         }
     }
 
-    fn stop_after_error(&self) {
+    pub(in crate::g17::runtime) fn stop_after_error(&self) {
         // Scheduler/fence callbacks never synchronously join builders or RTKit
         // receive work. The event worker performs the bounded runtime stop.
         self.shared.lose_device_quietly();
@@ -232,6 +302,12 @@ impl job::Backend for Backend {
         let mut deferred = match DeferredBatch::publication() {
             Ok(batch) => batch,
             Err(error) => {
+                if let Err(flush) = self.complete_publication_burst(&packet, false) {
+                    self.stop_after_error();
+                    dev_warn!(self.shared.dev.as_ref(),
+                        "Could not flush G17 publication burst after allocation failure: {:?}\n",
+                        flush);
+                }
                 self.release_backlog(&packet);
                 if packet.completion.status().get() != 0 {
                     <Self as job::Backend>::fail_vm(self, error);
@@ -240,16 +316,26 @@ impl job::Backend for Backend {
                 return Err(error);
             }
         };
-        let result = if !packet.begin_publication() {
+        let batched = self.publication_burst_tracked(&packet);
+        let notify = !batched;
+        let mut result = if !packet.begin_publication() {
             Err(ECANCELED)
         } else if packet.completion.status().get() != 0 {
             Err(EIO)
         } else {
             match packet.engine() {
-                Engine::Compute => self.compute_packet(&packet, &mut deferred),
-                Engine::Render => self.render_packet(&packet, &mut deferred),
+                Engine::Compute => self.compute_packet(&packet, notify, &mut deferred),
+                Engine::Render => self.render_packet(&packet, notify, &mut deferred),
             }
         };
+        if batched {
+            if let Err(error) = self.complete_publication_burst(&packet, packet.is_published()) {
+                self.stop_after_error();
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
         if packet.engine() == Engine::Compute {
             self.hold_claim(None);
         }
@@ -280,6 +366,12 @@ impl job::Backend for Backend {
     }
 
     fn cancel(&self, packet: Arc<Packet>) {
+        if let Err(error) = self.complete_publication_burst(&packet, false) {
+            self.stop_after_error();
+            dev_warn!(self.shared.dev.as_ref(),
+                "Could not flush G17 publication burst during cancellation: {:?}\n",
+                error);
+        }
         self.release_backlog(&packet);
         if packet.engine() == Engine::Compute {
             self.hold_claim(None);
@@ -361,8 +453,35 @@ impl job::Backend for Backend {
         }
     }
 
-    fn count_backlog(&self, packet: &Packet) {
+    fn begin_publication_burst(&self) -> Result {
+        self.publication_burst.lock().begin_ioctl()
+    }
+
+    fn end_publication_burst(&self) -> Result {
+        let pending = self.publication_burst.lock().end_ioctl();
+        let mut result = Ok(());
+        for (engine, count) in [Engine::Render, Engine::Compute].into_iter().zip(pending) {
+            if count == 0 {
+                continue;
+            }
+            crate::g17::trace::burst(
+                match engine {
+                    Engine::Render => crate::g17::trace::RENDER,
+                    Engine::Compute => crate::g17::trace::COMPUTE,
+                },
+                count,
+                true,
+            );
+            if let Err(error) = self.flush_publication_engine(engine) {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    fn count_backlog(&self, packet: &Arc<Packet>) {
         packet.count_backlog();
         self.backlog_of(packet).fetch_add(1, Ordering::AcqRel);
+        let _ = self.publication_burst.lock().track(packet.clone());
     }
 }

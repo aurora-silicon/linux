@@ -657,6 +657,156 @@ mod uninstalled_cleanup_tests {
     }
 }
 
+const PUBLICATION_BURST_MAX: u8 = 8;
+const PUBLICATION_BACKLOG_MAX: usize = 32;
+
+struct BurstDecision {
+    tracked: bool,
+    flush: bool,
+    count: u8,
+}
+
+#[derive(Default)]
+struct BurstWindow {
+    pending: u8,
+}
+
+impl BurstWindow {
+    fn finish(&mut self, published: bool, current_ready: bool, next_ready: bool) -> (bool, u8) {
+        if published {
+            self.pending = self.pending.saturating_add(1);
+        }
+        if published && current_ready && next_ready && self.pending < PUBLICATION_BURST_MAX {
+            return (false, self.pending);
+        }
+        let count = core::mem::take(&mut self.pending);
+        (count != 0, count)
+    }
+}
+
+/// Backlog order for one logical queue's two DRM scheduler entities.
+///
+/// Only dependency-free neighbours are joined. A failed or cancelled head
+/// ends the current group, so a work doorbell can never be stranded behind a
+/// job which the scheduler will not run.
+struct PublicationBurst {
+    queues: [KVec<Arc<super::job::Packet>>; 2],
+    windows: [BurstWindow; 2],
+    ioctl_open: bool,
+    ioctl_pending: [u8; 2],
+}
+
+impl PublicationBurst {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            queues: [
+                KVec::with_capacity(PUBLICATION_BACKLOG_MAX, GFP_KERNEL)?,
+                KVec::with_capacity(PUBLICATION_BACKLOG_MAX, GFP_KERNEL)?,
+            ],
+            windows: [BurstWindow::default(), BurstWindow::default()],
+            ioctl_open: false,
+            ioctl_pending: [0; 2],
+        })
+    }
+
+    fn track(&mut self, packet: Arc<super::job::Packet>) -> bool {
+        self.queues[packet.engine().index()]
+            .push_within_capacity(packet)
+            .is_ok()
+    }
+
+    fn tracked(&self, packet: &Arc<super::job::Packet>) -> bool {
+        self.queues[packet.engine().index()]
+            .iter()
+            .any(|queued| Arc::ptr_eq(queued, packet))
+    }
+
+    fn begin_ioctl(&mut self) -> Result {
+        if self.ioctl_open {
+            return Err(EBUSY);
+        }
+        self.ioctl_open = true;
+        Ok(())
+    }
+
+    fn ioctl_open(&self) -> bool {
+        self.ioctl_open
+    }
+
+    fn note_ioctl(&mut self, engine: super::job::Engine) -> bool {
+        let pending = &mut self.ioctl_pending[engine.index()];
+        *pending = pending.saturating_add(1);
+        if *pending < PUBLICATION_BURST_MAX {
+            return false;
+        }
+        *pending = 0;
+        true
+    }
+
+    fn end_ioctl(&mut self) -> [u8; 2] {
+        self.ioctl_open = false;
+        core::mem::take(&mut self.ioctl_pending)
+    }
+
+    fn finish(&mut self, packet: &Arc<super::job::Packet>, published: bool) -> BurstDecision {
+        let index = packet.engine().index();
+        let Some(position) = self.queues[index]
+            .iter()
+            .position(|queued| Arc::ptr_eq(queued, packet))
+        else {
+            return BurstDecision { tracked: false, flush: false, count: 0 };
+        };
+        let head = position == 0;
+        let _ = self.queues[index].remove(position);
+        if !head {
+            return BurstDecision { tracked: true, flush: false, count: 0 };
+        }
+        let next = self.queues[index].first();
+        let (flush, count) = self.windows[index].finish(
+            published,
+            !packet.has_dependencies(),
+            next.is_some_and(|next| !next.has_dependencies() && !next.cancel_requested()),
+        );
+        if !flush {
+            return BurstDecision {
+                tracked: true,
+                flush: false,
+                count,
+            };
+        }
+        BurstDecision { tracked: true, flush, count }
+    }
+}
+
+#[kunit_tests(asahi_g17_publication_burst)]
+mod publication_burst_tests {
+    use super::*;
+
+    #[test]
+    fn depth_one_flushes_immediately() {
+        let mut window = BurstWindow::default();
+        assert_eq!(window.finish(true, true, false), (true, 1));
+    }
+
+    #[test]
+    fn dependency_free_work_is_bounded() {
+        let mut window = BurstWindow::default();
+        for count in 1..PUBLICATION_BURST_MAX {
+            assert_eq!(window.finish(true, true, true), (false, count));
+        }
+        assert_eq!(window.finish(true, true, true), (true, PUBLICATION_BURST_MAX));
+        assert_eq!(window.finish(true, true, false), (true, 1));
+    }
+
+    #[test]
+    fn failure_or_dependency_boundary_flushes_pending_work() {
+        let mut window = BurstWindow::default();
+        assert_eq!(window.finish(true, true, true), (false, 1));
+        assert_eq!(window.finish(false, true, true), (true, 1));
+        assert_eq!(window.finish(true, false, true), (true, 1));
+    }
+}
+
 /// An immutable logical owner shared by its two scheduler entities. Installed
 /// physical graphs retain the context independently of this frontend lifetime.
 #[pin_data]
@@ -666,6 +816,11 @@ pub(super) struct Backend {
     owner: u64,
     backlog: core::sync::atomic::AtomicU32,
     compute_backlog: core::sync::atomic::AtomicU32,
+    /// Scheduler packets which may expose consecutive count-one announcements
+    /// before one work doorbell. The scheduler still owns execution order,
+    /// dependencies, watchdogs and completion fences.
+    #[pin]
+    publication_burst: kernel::sync::Mutex<PublicationBurst>,
     closed: core::sync::atomic::AtomicBool,
     /// The cell of the compute queue this owner last published to under the device mutex,
     /// with the shared compute objects mapped into its VM. Direct publication revalidates the
@@ -772,6 +927,7 @@ impl Backend {
         }
         drop(state);
         let admission = slot.pool().clone();
+        let publication_burst = PublicationBurst::new()?;
         Ok((
             Arc::pin_init(
                 pin_init!(Self {
@@ -780,6 +936,7 @@ impl Backend {
                     owner,
                     backlog: core::sync::atomic::AtomicU32::new(0),
                     compute_backlog: core::sync::atomic::AtomicU32::new(0),
+                    publication_burst <- kernel::new_mutex!(publication_burst, "g17::Backend::publication_burst"),
                     closed: core::sync::atomic::AtomicBool::new(false),
                     direct <- kernel::new_mutex!(None, "g17::Backend::direct"),
                     claimed <- kernel::new_mutex!(None, "g17::Backend::claimed"),
@@ -1464,18 +1621,20 @@ impl compute::Host for DirectHost<'_> {
 impl super::Firmware {
     #[inline]
     fn publish_compute(&mut self, owner: u64, packet: Arc<super::job::Packet>,
-        dependencies: &[super::fw::kick::KickDependency], deferred: &mut DeferredBatch) -> Result
+        dependencies: &[super::fw::kick::KickDependency], notify: bool,
+        deferred: &mut DeferredBatch) -> Result
     {
         if packet.completion.sources().is_some() {
-            self.publish_compute_inputs(owner, packet, dependencies, deferred)
+            self.publish_compute_inputs(owner, packet, dependencies, notify, deferred)
         } else {
-            self.publish_compute_raw(owner, packet, dependencies, &[], deferred)
+            self.publish_compute_raw(owner, packet, dependencies, &[], notify, deferred)
         }
     }
 
     #[inline(never)]
     fn publish_compute_inputs(&mut self, owner: u64, packet: Arc<super::job::Packet>,
-        dependencies: &[super::fw::kick::KickDependency], deferred: &mut DeferredBatch) -> Result
+        dependencies: &[super::fw::kick::KickDependency], notify: bool,
+        deferred: &mut DeferredBatch) -> Result
     {
         if self.recovery.pending() || super::recovery::Memory::recovery_state(&self.init)? != 0 {
             return Err(EAGAIN);
@@ -1512,7 +1671,7 @@ impl super::Firmware {
             holds.push(hold, GFP_KERNEL)?;
         }
         let result = self.publish_compute_raw(owner, packet.clone(), merged.as_slice(),
-            native.as_slice(), deferred);
+            native.as_slice(), notify, deferred);
         if packet.is_published() {
             for queue in self.queues.compute.iter().flatten()
                 .filter_map(|entry| entry.queue.as_deref())
@@ -1533,6 +1692,7 @@ impl super::Firmware {
         packet: Arc<super::job::Packet>,
         dependencies: &[super::fw::kick::KickDependency],
         native: &[super::sync_input::NativeWait],
+        notify: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
         if self.recovery.pending() {
@@ -1567,9 +1727,10 @@ impl super::Firmware {
             generation: self.recovery.generation(),
         };
         if native.is_empty() {
-            queue.publish(packet, dependencies, &mut host, &mut |event| deferred.push(event))
+            queue.publish(packet, dependencies, notify, &mut host,
+                &mut |event| deferred.push(event))
         } else {
-            queue.publish_with_native_waits(packet, dependencies, native,
+            queue.publish_with_native_waits(packet, dependencies, native, notify,
                 &mut host, &mut |event| deferred.push(event))
         }
     }
@@ -1821,7 +1982,8 @@ impl Backend {
             outer: Some(outer),
             generation: port.generation(),
         };
-        match queue.publish(packet.clone(), &[], &mut host, &mut |event| deferred.push(event)) {
+        match queue.publish(packet.clone(), &[], true, &mut host,
+            &mut |event| deferred.push(event)) {
             Err(error) if (error == EAGAIN || error == EBUSY) && !packet.is_published() => None,
             result => Some(result),
         }
@@ -1959,14 +2121,23 @@ impl Backend {
                 return true;
             }
         };
-        let result = match self.compute_direct_packet(packet, &mut deferred) {
-            Some(result) => result,
-            None => self.compute_inline(packet, &mut deferred),
+        let batched = self.ioctl_publication_burst_open();
+        let mut result = match (!batched).then(|| self.compute_direct_packet(packet, &mut deferred)) {
+            Some(Some(result)) => result,
+            _ => self.compute_inline(packet, !batched, &mut deferred),
         };
         if matches!(result, Err(error) if error == render::FALLBACK) && !packet.is_published() {
             deferred.finish();
             packet.abandon_publication();
             return false;
+        }
+        if batched && packet.is_published() {
+            if let Err(error) = self.note_ioctl_publication(packet) {
+                self.stop_after_error();
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
         }
         let result = self
             .finish_publication(packet, result, &mut deferred)
@@ -1995,6 +2166,7 @@ impl Backend {
     fn compute_inline(
         &self,
         packet: &Arc<super::job::Packet>,
+        notify: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
@@ -2032,7 +2204,8 @@ impl Backend {
             return Err(render::FALLBACK);
         }
         let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
-        match firmware.publish_compute(self.owner, packet.clone(), dependencies.as_slice(), deferred) {
+        match firmware.publish_compute(self.owner, packet.clone(), dependencies.as_slice(), notify,
+            deferred) {
             Err(error) if (error == EBUSY || error == EAGAIN) && !packet.is_published() => {
                 Err(render::FALLBACK)
             }
@@ -2071,13 +2244,16 @@ impl Backend {
     fn compute_packet(
         &self,
         packet: &Arc<super::job::Packet>,
+        notify: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
         packet.check_dependencies()?;
         let super::command::Validated::Compute { scratch, .. } = &packet.command else { return Err(EINVAL); };
         let required = super::fw::compute_pool::required_blocks(self.shared.compute_blocks, self.shared.active_cores, scratch.pages())?;
-        if let Some(result) = self.compute_direct(packet, required, deferred) {
-            return result;
+        if notify {
+            if let Some(result) = self.compute_direct(packet, required, deferred) {
+                return result;
+            }
         }
         // A bound queue needs none of ensure_compute's admission passes. Try
         // without them; the publication section below checks the same state.
@@ -2169,6 +2345,7 @@ impl Backend {
                 self.owner,
                 packet.clone(),
                 dependencies.as_slice(),
+                notify,
                 deferred,
             );
             if !packet.is_published()

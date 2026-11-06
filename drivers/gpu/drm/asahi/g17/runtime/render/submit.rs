@@ -36,9 +36,10 @@ impl Backend {
     pub(in crate::g17) fn render_packet(
         &self,
         packet: &Arc<Packet>,
+        notify: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        self.render_with_lease(packet, None, deferred)
+        self.render_with_lease(packet, None, notify, deferred)
     }
 
     /// Reserve identities before attaching a lease to the packet. An empty
@@ -351,6 +352,7 @@ impl Backend {
         &self,
         packet: &Arc<Packet>,
         early: Option<RenderLease>,
+        notify: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
         packet.check_dependencies()?;
@@ -369,7 +371,11 @@ impl Backend {
         // The pair this owner last published to directly: a lease on it goes
         // straight to the direct path, whose lend checks everything the
         // identity check would.
-        let known = self.direct_slot.load(Ordering::Relaxed);
+        let known = if notify {
+            self.direct_slot.load(Ordering::Relaxed)
+        } else {
+            0
+        };
         let lease = match early.take() {
             Some(lease) => Some(lease),
             None if known != 0 => self
@@ -471,7 +477,7 @@ impl Backend {
                 }
                 result => result?,
             }
-            match self.prepare_render(slot, packet, deferred, sleep) {
+            match self.prepare_render(slot, packet, deferred, sleep, notify) {
                 Err(error) if !packet.is_published() && error == ENOSPC => {
                     self.wait_render_capacity(&mut seen, &mut capacity, sleep)?;
                     continue;
@@ -533,7 +539,8 @@ impl Backend {
                 return true;
             }
         };
-        let result = self.render_with_lease(packet, Some(admission), &mut deferred);
+        let batched = self.ioctl_publication_burst_open();
+        let mut result = self.render_with_lease(packet, Some(admission), !batched, &mut deferred);
         if matches!(result, Err(error) if error == FALLBACK) && !packet.is_published() {
             // Contention before anything became visible: the ioctl does not
             // sleep. Return the lease and the claim; the scheduler publishes
@@ -543,6 +550,14 @@ impl Backend {
             drop(lease);
             packet.abandon_publication();
             return false;
+        }
+        if batched && packet.is_published() {
+            if let Err(error) = self.note_ioctl_publication(packet) {
+                self.stop_after_error();
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
         }
         let result = self
             .finish_publication(packet, result, &mut deferred)
@@ -657,6 +672,7 @@ impl crate::g17::Firmware {
         owner: u64,
         slot: u8,
         packet: &Arc<Packet>,
+        notify: bool,
         deferred: &mut DeferredBatch,
     ) -> Result {
         use crate::g17::queue::render::PublicationLease;
@@ -717,6 +733,7 @@ impl crate::g17::Firmware {
                 packet.clone(),
                 &dependencies,
                 lease,
+                notify,
                 host,
                 &mut |event| deferred.push(event),
             )

@@ -472,9 +472,15 @@ impl Port {
 
     /// Rings the primary coprocessor's doorbell.
     pub(super) fn notify(&self, message: u64) -> Result {
+        self.notify_engine(super::trace::COMPUTE, message)
+    }
+
+    /// Rings one work pipe after all records in a scheduler publication burst
+    /// are visible.
+    pub(super) fn notify_engine(&self, engine: u8, message: u64) -> Result {
         // SAFETY: The session's primary coprocessor owns the mailbox and outlives the port.
         let mailbox = unsafe { &*self.views()?.mailbox };
-        super::trace::doorbell(super::trace::COMPUTE, || {
+        super::trace::doorbell(engine, || {
             self.regs.as_ref().map_or(0, |regs| regs.g17_core_power())
         });
         super::trace::message(super::trace::MAILBOX, message);

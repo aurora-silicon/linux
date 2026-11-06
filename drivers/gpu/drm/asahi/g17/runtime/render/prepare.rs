@@ -625,6 +625,7 @@ impl super::super::Backend {
         packet: &Arc<Packet>,
         deferred: &mut super::super::DeferredBatch,
         sleep: bool,
+        notify: bool,
     ) -> Result {
         let lease = self.enter_preparation(sleep)?;
         let dev = self.shared.drm()?;
@@ -737,7 +738,7 @@ impl super::super::Backend {
             if packet.cancel_requested() || firmware.queues.render.entry(slot)?.closed {
                 return Err(ECANCELED);
             }
-            firmware.publish_render(self.owner, slot, packet, deferred)
+            firmware.publish_render(self.owner, slot, packet, notify, deferred)
         })();
         let result = (|| {
             if published.is_err() && !packet.is_published() {
