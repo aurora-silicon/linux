@@ -308,6 +308,14 @@ void __init bootmem_init(void)
 {
 	unsigned long min, max;
 
+	/*
+	 * unflatten_device_tree() has run fdt_scan_reserved_mem_late(), which
+	 * can free a failed reserved-memory node and punch a hole in the
+	 * window. Close it before arch_reserve_crashkernel() can place the
+	 * crash kernel there, only for it to be freed later as a window page.
+	 */
+	ctxr_exec_keep_reserved();
+
 	min = PFN_UP(memblock_start_of_DRAM());
 	max = PFN_DOWN(memblock_end_of_DRAM());
 
@@ -370,8 +378,6 @@ void __init arch_setup_zero_pages(void)
 void __init arch_mm_preinit(void)
 {
 	unsigned int flags = SWIOTLB_VERBOSE;
-
-	ctxr_exec_keep_reserved();
 
 	if (max_pfn <= PFN_DOWN(arm64_dma_phys_limit)) {
 		/*
