@@ -1517,8 +1517,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 				dev_dbg(dcp->dev, "DisplayAttributes without sink identity: %d\n",
 					ret);
 			dcp_firmware_metadata_attributes(dcp, ret ? NULL : &metadata);
-		} else if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-			   dcp_has_panel(dcp)) {
+		} else if (dcp->panel_identity && dcp_has_panel(dcp)) {
 			struct dcp_display_metadata metadata;
 
 			ret = parse_panel_metadata(&metadata_ctx, &metadata);
