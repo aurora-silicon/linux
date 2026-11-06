@@ -136,6 +136,7 @@ impl G18GraphicsJob {
     }
 
     pub(crate) fn vm(&self) -> &mmu::Vm { self.program.vm() }
+    pub(crate) fn layout_only_payload(&self) -> bool { self.program.layout_only_payload() }
     pub(crate) fn context_id(&self) -> u8 { self.program.context_id() }
     pub(crate) fn scheduler_record(&self) -> Result<u64> { Ok(self.scheduler.binding(0)?.record) }
     pub(crate) fn queues(&mut self) -> &mut G18GraphicsQueues { &mut self.queues }
@@ -288,7 +289,7 @@ impl G18GraphicsJob {
     /// Caller has allocated/retained PB and pool owners and filled all native
     /// fields. In particular a default resource word is not an admitted policy.
     #[inline(never)]
-    pub(crate) fn encode(&mut self, dev: &AsahiDrmDevice, inputs: &cmd::G18RenderCommandInputs) -> Result {
+    pub(crate) fn encode(&mut self, _dev: &AsahiDrmDevice, inputs: &cmd::G18RenderCommandInputs) -> Result {
         if self.encoded.is_some() || self.controls.ta.resource_word == 0
             || self.controls.fragment.resource_word == 0
             || inputs.context_id != u32::from(self.context_id())
