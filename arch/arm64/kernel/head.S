@@ -307,6 +307,51 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	msr	vbar_el2, x0
 	isb
 
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	/*
+	 * Kernel text inside an armed CTXR window can't execute at EL1, and
+	 * the window isn't known this early. Apple cores from the M4 generation
+	 * on (part numbers from 0x50) have CTXR and are VHE only, so they go
+	 * straight to VHE here on every entry and never run at EL1.
+	 */
+	mrs	x0, midr_el1
+	ubfx	x1, x0, #MIDR_IMPLEMENTOR_SHIFT, #8
+	cmp	x1, #ARM_CPU_IMP_APPLE
+	b.ne	.Lctxr_no_direct_vhe
+	ubfx	x0, x0, #MIDR_PARTNUM_SHIFT, #12
+	cmp	x0, #0x50
+	b.lo	.Lctxr_no_direct_vhe
+	/* A virtual EL2 without VHE, as nested KVM may give a guest. */
+	mrs	x0, id_aa64mmfr1_el1
+	ubfx	x0, x0, #ID_AA64MMFR1_EL1_VH_SHIFT, #4
+	cbz	x0, .Lctxr_no_direct_vhe
+
+	finalise_el2_state
+
+	mov_q	x0, HCR_HOST_VHE_FLAGS
+	msr_hcr_el2 x0
+	isb
+
+	mrs	x0, mdcr_el2
+	bic	x0, x0, #MDCR_EL2_E2PB_MASK
+	bic	x0, x0, #MDCR_EL2_E2TB_MASK
+	msr	mdcr_el2, x0
+
+	mov_q	x0, INIT_SCTLR_EL1_MMU_OFF
+	msr_s	SYS_SCTLR_EL12, x0
+	pre_disable_mmu_workaround
+	msr	sctlr_el1, x0
+	isb
+
+	mov	x0, #(PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT | PSR_MODE_EL2h)
+	msr	spsr_el2, x0
+
+	mov	w0, #BOOT_CPU_MODE_EL2
+	orr	x0, x0, #BOOT_CPU_FLAG_E2H
+	eret
+.Lctxr_no_direct_vhe:
+#endif
+
 	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF
 
 	mrs	x0, hcr_el2
