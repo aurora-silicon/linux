@@ -48,11 +48,14 @@ properties:
           - const: phy-apb
           - const: aux
           - const: aux-ps
-        minItems: 3
+          - const: phy-ps
+          - const: coproc-ps
         description:
-          DCP coprocessor, the HDMI dptx-phy blocks, and optionally the AP
+          DCP coprocessor, the HDMI dptx-phy blocks, the AP
           DisplayPort AUX controller that reads the sink's EDID with its
-          PMGR power state
+          PMGR power state, and the read-only PMGR power states for the
+          HDMI PHY and DCPEXT CPU. The driver only adopts the bootloader's
+          powered link and must check these states before accessing the PHY.
       - items:
           - const: coproc
           - const: dp-clock
