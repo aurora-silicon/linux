@@ -175,6 +175,18 @@ static int cd2e22_probe(struct i2c_client *client)
 	phy_set_drvdata(cd2e22->phy, cd2e22);
 	i2c_set_clientdata(client, cd2e22);
 
+	/*
+	 * Tune as soon as the repeater is reachable, as the firmware does; the
+	 * PHY init and system resume reapply the same list.
+	 */
+	if (cd2e22->tunable) {
+		guard(mutex)(&cd2e22->lock);
+		ret = cd2e22_apply_tunable_locked(cd2e22);
+		if (ret)
+			return ret;
+		cd2e22->initialized = true;
+	}
+
 	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
 	return PTR_ERR_OR_ZERO(provider);
 }

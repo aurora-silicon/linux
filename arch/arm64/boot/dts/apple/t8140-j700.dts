@@ -494,7 +494,7 @@
 	usb_hub_i2c: usb-hub@2c {
 		compatible = "via,vl122";
 		reg = <0x2c>;
-		reset-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_HIGH>;
 		usb-hub = <&vl122_hub>;
 
 		/*

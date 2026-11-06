@@ -20,6 +20,8 @@
 #define HUB_RESET_POLL_US 1000
 #define HUB_RESET_TIMEOUT_US 1000000
 #define HUB_RELEASE_DELAY_MS 100
+/* The management interface needs a moment after reset before it answers. */
+#define HUB_ASSERT_SETTLE_US 2000
 
 #define USB_VENDOR_ID_GENESYS_LOGIC 0x05e3
 #define USB_VENDOR_ID_VIA_LABS 0x2109
@@ -155,6 +157,7 @@ static int vl122_configure(struct vl122_hub *hub)
 
 	/* The sideband registers are available only while reset is held. */
 	gpiod_set_value_cansleep(hub->reset_gpio, 1);
+	fsleep(HUB_ASSERT_SETTLE_US);
 
 	ret = read_poll_timeout(regmap_read, err, !err, HUB_RESET_POLL_US,
 				HUB_RESET_TIMEOUT_US, false, hub->regmap, 0,

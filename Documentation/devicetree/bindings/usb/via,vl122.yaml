@@ -24,6 +24,9 @@ properties:
 
   reset-gpios:
     maxItems: 1
+    description:
+      Hub reset. The management interface only answers while the hub is
+      held in reset.
 
   usb-hub:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -65,7 +68,7 @@ examples:
         usb-hub@2c {
             compatible = "via,vl122";
             reg = <0x2c>;
-            reset-gpios = <&gpio 142 GPIO_ACTIVE_LOW>;
+            reset-gpios = <&gpio 142 GPIO_ACTIVE_HIGH>;
             apple,tunable-vl = [ 07 ff 55 00 ];
             apple,tunable-vlf0 = [ 07 ff aa 00 ];
             apple,tunable-gl = [ 09 7f 08 00 ];
