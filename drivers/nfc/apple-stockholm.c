@@ -5,15 +5,14 @@
  * Copyright The Asahi Linux Contributors
  */
 
-#include <linux/crc-ccitt.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
+#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/property.h>
 #include <linux/spmi.h>
-#include <linux/unaligned.h>
 
 #include <net/nfc/nci_core.h>
 
@@ -25,24 +24,30 @@
 				 NFC_PROTO_ISO15693_MASK | \
 				 NFC_PROTO_NFC_DEP_MASK)
 
+#define STOCKHOLM_ERROR_STATUS0_REG	0x4
+#define STOCKHOLM_ERROR_STATUS1_REG	0x7
+#define STOCKHOLM_ERROR_STATUS2_REG	0x8
+
 /* Transport parameters of one controller model. */
 struct stockholm_model {
-	u16 data_reg;		/* non-incrementing NCI FIFO */
+	u16 tx_reg;		/* non-incrementing NCI transmit FIFO */
+	u16 rx_reg;		/* non-incrementing NCI receive FIFO */
 	u16 id_reg;		/* follower ID, side-effect-free read */
 	u16 irq_reg;		/* follower IRQ offset, side-effect-free read */
 	u16 standby_reg;	/* follower virtual command register */
-	u8 irq_offset;
+	u8 rx_trailer_len;	/* bytes drained after the NCI packet */
 	u8 standby_on;
 	u8 standby_off;
 	u32 startup_delay_us;
 };
 
 static const struct stockholm_model stockholm_model96 = {
-	.data_reg = 0x1000,
+	.tx_reg = 0x1000,
+	.rx_reg = 0x80,
 	.id_reg = 0x100,
 	.irq_reg = 0x105,
 	.standby_reg = 0x0,
-	.irq_offset = 0xa0,
+	.rx_trailer_len = 2,
 	.standby_on = 0x15,
 	.standby_off = 0x14,
 	.startup_delay_us = 10000,
@@ -53,15 +58,16 @@ struct stockholm {
 	struct nci_dev *ndev;
 	struct gpio_desc *enable_gpio;
 	struct mutex io_lock;
-	u16 data_reg;
+	u16 tx_reg;
+	u16 rx_reg;
 	u16 standby_reg;
+	u8 rx_trailer_len;
 	u8 standby_on;
 	u8 standby_off;
 	u32 startup_delay_us;
 	int data_irq;
 	int wake_irq;
 	int error_irq;
-	bool crc16;
 	bool powered;
 };
 
@@ -72,7 +78,7 @@ static int stockholm_fifo_read(struct stockholm *st, u8 *buf, size_t len)
 
 	while (len) {
 		chunk = min_t(size_t, len, 8);
-		ret = spmi_ext_register_readl(st->sdev, st->data_reg, buf, chunk);
+		ret = spmi_ext_register_readl(st->sdev, st->rx_reg, buf, chunk);
 		if (ret)
 			return ret;
 		buf += chunk;
@@ -89,7 +95,7 @@ static int stockholm_fifo_write(struct stockholm *st, const u8 *buf, size_t len)
 
 	while (len) {
 		chunk = min_t(size_t, len, 8);
-		ret = spmi_ext_register_writel(st->sdev, st->data_reg, buf, chunk);
+		ret = spmi_ext_register_writel(st->sdev, st->tx_reg, buf, chunk);
 		if (ret)
 			return ret;
 		buf += chunk;
@@ -162,9 +168,6 @@ static int stockholm_nci_close(struct nci_dev *ndev)
 static int stockholm_nci_send(struct nci_dev *ndev, struct sk_buff *skb)
 {
 	struct stockholm *st = nci_get_drvdata(ndev);
-	u8 *frame = skb->data;
-	size_t len = skb->len;
-	u16 crc;
 	int ret;
 
 	if (!st->powered) {
@@ -172,24 +175,10 @@ static int stockholm_nci_send(struct nci_dev *ndev, struct sk_buff *skb)
 		return -EHOSTDOWN;
 	}
 
-	if (st->crc16) {
-		frame = kmalloc(len + sizeof(crc), GFP_KERNEL);
-		if (!frame) {
-			kfree_skb(skb);
-			return -ENOMEM;
-		}
-		memcpy(frame, skb->data, len);
-		crc = crc_ccitt(0xffff, frame, len);
-		put_unaligned_be16(crc, frame + len);
-		len += sizeof(crc);
-	}
-
 	mutex_lock(&st->io_lock);
-	ret = stockholm_fifo_write(st, frame, len);
+	ret = stockholm_fifo_write(st, skb->data, skb->len);
 	mutex_unlock(&st->io_lock);
 
-	if (st->crc16)
-		kfree(frame);
 	if (ret)
 		kfree_skb(skb);
 	else
@@ -222,8 +211,8 @@ static irqreturn_t stockholm_data_irq_thread(int irq, void *data)
 	struct stockholm *st = data;
 	struct nci_ctrl_hdr hdr;
 	struct sk_buff *skb = NULL;
-	size_t nci_len, wire_len;
-	u16 expected, received;
+	u8 trailer[2];
+	size_t nci_len;
 	int ret;
 
 	mutex_lock(&st->io_lock);
@@ -232,30 +221,20 @@ static irqreturn_t stockholm_data_irq_thread(int irq, void *data)
 		goto out_unlock;
 
 	nci_len = sizeof(hdr) + hdr.plen;
-	wire_len = nci_len + (st->crc16 ? sizeof(received) : 0);
-	skb = alloc_skb(wire_len, GFP_KERNEL);
+	skb = alloc_skb(nci_len, GFP_KERNEL);
 	if (!skb) {
 		ret = -ENOMEM;
 		goto out_unlock;
 	}
 
 	skb_put_data(skb, &hdr, sizeof(hdr));
-	ret = stockholm_fifo_read(st, skb_put(skb, wire_len - sizeof(hdr)),
-				  wire_len - sizeof(hdr));
+	ret = stockholm_fifo_read(st, skb_put(skb, hdr.plen), hdr.plen);
+	/* The two model-96 trailer bytes are not part of the NCI packet. */
+	if (!ret && st->rx_trailer_len)
+		ret = stockholm_fifo_read(st, trailer, st->rx_trailer_len);
 	mutex_unlock(&st->io_lock);
 	if (ret)
 		goto out_free;
-
-	if (st->crc16) {
-		received = get_unaligned_be16(skb->data + nci_len);
-		expected = crc_ccitt(0xffff, skb->data, nci_len);
-		if (received != expected) {
-			dev_err_ratelimited(&st->sdev->dev,
-					    "NCI transport CRC mismatch\n");
-			goto out_free;
-		}
-		skb_trim(skb, nci_len);
-	}
 
 	nci_recv_frame(st->ndev, skb);
 	return IRQ_HANDLED;
@@ -283,8 +262,30 @@ static irqreturn_t stockholm_wake_irq_thread(int irq, void *data)
 static irqreturn_t stockholm_error_irq_thread(int irq, void *data)
 {
 	struct stockholm *st = data;
+	u8 status[3];
+	int ret;
 
-	dev_err_ratelimited(&st->sdev->dev, "SPMI transport error interrupt\n");
+	mutex_lock(&st->io_lock);
+	ret = spmi_ext_register_readl(st->sdev, STOCKHOLM_ERROR_STATUS0_REG,
+				      &status[0], 1);
+	if (!ret)
+		ret = spmi_ext_register_readl(st->sdev,
+					      STOCKHOLM_ERROR_STATUS1_REG,
+					      &status[1], 1);
+	if (!ret)
+		ret = spmi_ext_register_readl(st->sdev,
+					      STOCKHOLM_ERROR_STATUS2_REG,
+					      &status[2], 1);
+	mutex_unlock(&st->io_lock);
+
+	if (ret)
+		dev_err_ratelimited(&st->sdev->dev,
+				    "SPMI transport error; status read failed: %d\n",
+				    ret);
+	else
+		dev_err_ratelimited(&st->sdev->dev,
+				    "SPMI transport error: status %#02x/%#02x/%#02x\n",
+				    status[0], status[1], status[2]);
 	return IRQ_HANDLED;
 }
 
@@ -292,20 +293,33 @@ static int stockholm_read_config(struct stockholm *st,
 				 const struct stockholm_model *model)
 {
 	struct device *dev = &st->sdev->dev;
+	u32 expected;
 	u8 value;
 	int ret;
+
+	ret = device_property_read_u32(dev, "apple,follower-id", &expected);
+	if (ret)
+		return dev_err_probe(dev, ret, "missing expected follower ID\n");
+	if (expected > U8_MAX)
+		return dev_err_probe(dev, -EINVAL, "invalid expected follower ID\n");
 
 	ret = spmi_ext_register_readl(st->sdev, model->id_reg, &value, 1);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read follower ID\n");
-	if (value != st->sdev->usid)
+	if (value != expected)
 		return dev_err_probe(dev, -ENODEV,
 				     "unexpected follower ID %#02x\n", value);
+
+	ret = device_property_read_u32(dev, "apple,irq-offset", &expected);
+	if (ret)
+		return dev_err_probe(dev, ret, "missing expected IRQ offset\n");
+	if (expected > U8_MAX)
+		return dev_err_probe(dev, -EINVAL, "invalid expected IRQ offset\n");
 
 	ret = spmi_ext_register_readl(st->sdev, model->irq_reg, &value, 1);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read IRQ offset\n");
-	if (value != model->irq_offset)
+	if (value != expected)
 		return dev_err_probe(dev, -ENODEV,
 				     "unexpected IRQ offset %#02x\n", value);
 
@@ -330,13 +344,13 @@ static int stockholm_probe(struct spmi_device *sdev)
 	model = device_get_match_data(dev);
 	if (!model)
 		return -ENODEV;
-	st->data_reg = model->data_reg;
+	st->tx_reg = model->tx_reg;
+	st->rx_reg = model->rx_reg;
 	st->standby_reg = model->standby_reg;
+	st->rx_trailer_len = model->rx_trailer_len;
 	st->standby_on = model->standby_on;
 	st->standby_off = model->standby_off;
 	st->startup_delay_us = model->startup_delay_us;
-	st->crc16 = device_property_read_bool(dev, "apple,transport-crc16");
-
 	st->enable_gpio = devm_gpiod_get(dev, "enable", GPIOD_ASIS);
 	if (IS_ERR(st->enable_gpio))
 		return dev_err_probe(dev, PTR_ERR(st->enable_gpio),
