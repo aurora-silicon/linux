@@ -518,6 +518,7 @@ static int apple_spmi_probe(struct platform_device *pdev)
 
 static const struct of_device_id apple_spmi_match_table[] = {
 	{ .compatible = "apple,t8142-spmi", .data = &apple_spmi_gen4 },
+	{ .compatible = "apple,t8152-spmi", .data = &apple_spmi_gen4 },
 	{ .compatible = "apple,t8103-spmi", .data = &apple_spmi_gen1 },
 	{ .compatible = "apple,spmi", .data = &apple_spmi_gen1 },
 	{}

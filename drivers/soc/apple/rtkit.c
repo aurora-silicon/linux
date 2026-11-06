@@ -1222,6 +1222,19 @@ bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_has_endpoint);
 
+/*
+ * A co-processor adopted from the bootloader has already sent its endpoint
+ * map. A client that starts one of its application endpoints by hand
+ * registers it here, so its messages are not reported as undiscovered.
+ */
+void apple_rtkit_adopt_ep(struct apple_rtkit *rtk, u8 ep)
+{
+	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
+	    ep < APPLE_RTKIT_MAX_ENDPOINTS)
+		set_bit(ep, rtk->endpoints);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_adopt_ep);
+
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 {
 	u64 msg;

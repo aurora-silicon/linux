@@ -30,40 +30,20 @@ impl G18GraphicsMemory {
             _ => return Err(EINVAL),
         };
         if !uat.is_t8152_geometry() || mmu::UAT_PGSZ != payload::PAGE_BYTES { return Err(ENODEV); }
-        let firmware = Firmware::request(name, dev.as_ref().as_ref())?;
+        let firmware = match Firmware::request(name, dev.as_ref().as_ref()) {
+            Ok(firmware) => firmware,
+            // Stage 10 executes no capture bytes: every application command
+            // is rebuilt from Mesa's parameters. It needs only the colour-a
+            // page layout, which is mapped here with zeroed contents.
+            Err(e) if e == ENOENT && profile == 1
+                && crate::g18::params::g18_initdata_test.value() == 10 =>
+                return Self::layout_only(dev, uat),
+            Err(e) => return Err(e),
+        };
         let input = payload::GraphicsPayload::parse(firmware.data()).map_err(|_| EINVAL)?;
         if input.capture() as u32 != profile { return Err(EINVAL); }
-        let vm = uat.new_t8152_compute_fixture_vm()?;
-        let context = uat.prepare_t8152_execution_context(&vm)?;
-        let mut pages = KVec::new();
-        let mut aliases = KVec::new();
-        for index in 0..input.page_count() {
-            let source = input.page(index).ok_or(EINVAL)?;
-            // Captured usage flags are not PTE permissions. These private
-            // fixture mappings have an explicit diagnostic RW policy.
-            let mut page = MappedObject::new_wc_at(dev, &vm, source.address,
-                payload::PAGE_BYTES, mmu::PROT_GPU_SHARED_RW)?;
-            page.with_bytes_mut(|out| {
-                out.copy_from_slice(source.bytes);
-                if (payload::OUTPUT..payload::OUTPUT + payload::OUTPUT_BYTES).contains(&source.address) {
-                    out.fill(0xa5);
-                }
-                Ok(())
-            })?;
-            if source.address < 0x78000 {
-                aliases.push(page.map_alias_at(&vm, va::COMPACT_BIAS + source.address,
-                    mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
-                for delta in [0, va::PAGE - 1] {
-                    if vm.translate_iova(source.address + delta)?
-                        != vm.translate_iova(va::COMPACT_BIAS + source.address + delta)? {
-                        return Err(EFAULT);
-                    }
-                }
-            }
-            vm.translate_iova(source.address)?;
-            vm.translate_iova(source.address + va::PAGE - 1)?;
-            pages.push(page, GFP_KERNEL)?;
-        }
+        let (context, aliases, pages) = Self::map_pages(dev, uat,
+            (0..input.page_count()).map(|index| input.page(index).map(|page| (page.address, Some(page.bytes)))))?;
         let mut command = KVec::new();
         command.extend_from_slice(input.command(), GFP_KERNEL)?;
         let owner = Self { context, aliases, vdm_alias: None, ppp_aliased: false, pages, capture: input.capture(), command,
@@ -73,6 +53,58 @@ impl G18GraphicsMemory {
             profile, owner.pages.len(), owner.aliases.len(), owner.body_digest, owner.command_digest,
             owner.context_id(), owner.roots());
         Ok(owner)
+    }
+
+    /// The colour-a VM layout without its capture: zeroed pages, no command.
+    fn layout_only(dev: &AsahiDrmDevice, uat: &mmu::Uat) -> Result<Self> {
+        let (context, aliases, pages) = Self::map_pages(dev, uat,
+            payload::color_a_pages().map(|(address, _)| Some((address, None))))?;
+        let owner = Self { context, aliases, vdm_alias: None, ppp_aliased: false, pages,
+            capture: payload::Capture::ColorA, command: KVec::new(), body_digest: 0, command_digest: 0 };
+        fence(Ordering::SeqCst);
+        dev_info!(dev.as_ref(), "G18_RENDER_PAYLOAD layout-only colour-a pages={} low_aliases={} context={} roots={:x?}; no capture, stage 10 encodes from Mesa only\n",
+            owner.pages.len(), owner.aliases.len(), owner.context_id(), owner.roots());
+        Ok(owner)
+    }
+
+    /// True when no capture was loaded: there is no H1 command to encode.
+    pub(crate) fn layout_only_payload(&self) -> bool { self.command.is_empty() }
+
+    fn map_pages<'a>(dev: &AsahiDrmDevice, uat: &mmu::Uat,
+        sources: impl Iterator<Item = Option<(u64, Option<&'a [u8]>)>>)
+        -> Result<(mmu::G18ExecutionContext, KVec<mmu::KernelMapping>, KVec<MappedObject>)> {
+        let vm = uat.new_t8152_compute_fixture_vm()?;
+        let context = uat.prepare_t8152_execution_context(&vm)?;
+        let mut pages = KVec::new();
+        let mut aliases = KVec::new();
+        for source in sources {
+            let (address, bytes) = source.ok_or(EINVAL)?;
+            // Captured usage flags are not PTE permissions. These private
+            // fixture mappings have an explicit diagnostic RW policy.
+            let mut page = MappedObject::new_wc_at(dev, &vm, address,
+                payload::PAGE_BYTES, mmu::PROT_GPU_SHARED_RW)?;
+            page.with_bytes_mut(|out| {
+                match bytes { Some(bytes) => out.copy_from_slice(bytes), None => out.fill(0) }
+                if (payload::OUTPUT..payload::OUTPUT + payload::OUTPUT_BYTES).contains(&address) {
+                    out.fill(0xa5);
+                }
+                Ok(())
+            })?;
+            if address < 0x78000 {
+                aliases.push(page.map_alias_at(&vm, va::COMPACT_BIAS + address,
+                    mmu::PROT_GPU_SHARED_RW)?, GFP_KERNEL)?;
+                for delta in [0, va::PAGE - 1] {
+                    if vm.translate_iova(address + delta)?
+                        != vm.translate_iova(va::COMPACT_BIAS + address + delta)? {
+                        return Err(EFAULT);
+                    }
+                }
+            }
+            vm.translate_iova(address)?;
+            vm.translate_iova(address + va::PAGE - 1)?;
+            pages.push(page, GFP_KERNEL)?;
+        }
+        Ok((context, aliases, pages))
     }
 
     pub(crate) fn vm(&self) -> &mmu::Vm { self.context.vm() }
