@@ -1676,9 +1676,6 @@ impl super::Firmware {
             let Some((sequence, dependency, stamp_va, event_slot, hold)) = found else {
                 return Err(EAGAIN);
             };
-            // The completion-wait record orders the consumer behind its
-            // source; naming the source in the kick entry as well only adds
-            // a second, slower wait and a predecessor record.
             let wait = super::sync_input::NativeWait {
                 sequence,
                 dependency,
@@ -1696,6 +1693,18 @@ impl super::Firmware {
                 native.push(wait, GFP_KERNEL)?;
             }
             holds.push(hold, GFP_KERNEL)?;
+        }
+        // The completion-wait record only re-checks the source stamp when the
+        // scheduler next visits the consumer. Naming the newest source kick of
+        // each producer queue in the consumer's kick entry parks the consumer
+        // on that producer's completion, so it is woken when the producer
+        // retires instead of on a later scheduler pass. Producer QIDs are
+        // compute QIDs and never collide with the render prefix. A full kick
+        // entry keeps the CPU wait.
+        for wait in native.iter() {
+            merged
+                .insert(wait.sequence, wait.dependency)
+                .map_err(|_| EAGAIN)?;
         }
         let result = self.publish_compute_raw(
             owner,
