@@ -1,23 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Common G16S/G17P percent-ceiling owner. No PMP vote or effort-floor write.
+//! Common G16S/G17P absolute-power ceiling owner.
 
 use super::{fw::variant::Variant, initdata::InitData};
 use core::{ffi::c_void, ptr::NonNull};
 use kernel::{c_str, device, prelude::*, sync::aref::ARef};
 
 extern "C" {
-    fn asahi_gpu_cooling_register(dev: *mut c_void, mirrors: *const *mut u32) -> *mut c_void;
+    fn asahi_gpu_cooling_register(dev: *mut c_void, words: *const PowerWords) -> *mut c_void;
     fn asahi_gpu_cooling_unregister(cooling: *mut c_void);
     fn asahi_gpu_cooling_rearm(cooling: *mut c_void);
 }
 
-/// A fully resolved layout in the WC hardware-data bundle. Offsets include
-/// the allocation-relative base, not an offset into a host driver object.
-/// Only firmware ABI tables may supply these; DT never supplies addresses.
+/// Exact RegionC/PowerState pairing admitted for live publication.
 #[derive(Clone, Copy)]
-pub(crate) struct Layout {
-    pub(crate) mirrors: [usize; 3],
+pub(crate) enum Layout {
+    /// G17P 26A428 and G16S 25G83, RegionC::max_power_mw at +0x84.
+    Common,
+}
+
+/// C ABI; these are independent typed members, never numeric bundle offsets.
+#[repr(C)]
+pub(super) struct PowerWords {
+    pub(super) max_power_mw: *mut u32,
+    pub(super) ppm_enabled: *mut u32,
+    pub(super) ppm_target_mw: *mut u32,
+    pub(super) ppm_writeback: bool,
 }
 
 fn required(dev: &device::Device) -> Result<bool> {
@@ -35,11 +43,8 @@ fn required(dev: &device::Device) -> Result<bool> {
 /// Check before starting either processor. A board requiring cooling must
 /// never silently fall back to unrestricted submission with a missing ABI.
 pub(super) fn admit(dev: &device::Device, variant: &Variant) -> Result {
-    if required(dev)? && variant.power_ceiling.is_none() {
-        dev_err!(
-            dev,
-            "GPU cooling ABI base unresolved; refusing GPU initialization\n"
-        );
+    if required(dev)? && variant.live_power.is_none() {
+        dev_err!(dev, "GPU live power layout not admitted\n");
         return Err(EOPNOTSUPP);
     }
     Ok(())
@@ -67,13 +72,13 @@ impl Cooling {
         if !required(dev)? {
             return Ok(None);
         }
-        let layout = variant.power_ceiling.as_ref().ok_or(EOPNOTSUPP)?;
-        let mirrors = init.cooling_mirrors(layout)?;
-        // SAFETY: The owner keeps all validated WC words mapped until after
-        // Drop drains the C callbacks. Registration publishes the 25% backstop
-        // before INIT, port attachment or any work publication.
+        let layout = variant.live_power.as_ref().ok_or(EOPNOTSUPP)?;
+        let words = init.cooling_words(layout)?;
+        // SAFETY: The owner keeps all validated shared words mapped until after
+        // Drop drains the C callbacks. Registration publishes the provisional
+        // 25% floor before INIT, port attachment or any work publication.
         let inner = kernel::error::from_err_ptr(unsafe {
-            asahi_gpu_cooling_register(dev.as_raw().cast(), mirrors.as_ptr())
+            asahi_gpu_cooling_register(dev.as_raw().cast(), &words)
         })?;
         Ok(Some(Self {
             inner: NonNull::new(inner).ok_or(ENOMEM)?,
@@ -82,7 +87,7 @@ impl Cooling {
     }
 
     pub(super) fn rearm(&self) {
-        // SAFETY: The C allocation and all three mappings are still owned.
+        // SAFETY: The C allocation and the power mappings are still owned.
         unsafe { asahi_gpu_cooling_rearm(self.inner.as_ptr()) };
     }
 }
