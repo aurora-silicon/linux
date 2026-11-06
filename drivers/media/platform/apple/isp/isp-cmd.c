@@ -28,6 +28,9 @@ int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int
 	struct isp_message *req;
 	int err;
 
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
 #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
 	KUNIT_STATIC_STUB_REDIRECT(isp_cmd_send, isp, args, insize, outsize, timeout);
 #endif

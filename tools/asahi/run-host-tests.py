@@ -39,7 +39,7 @@ KILL = 'kill'
 
 # A killed mutant shows the failing control: a C assertion or abort (-6), or
 # a Rust panic (exit 101). A Python traceback means the harness itself broke.
-KILL_SIGN = re.compile(r'Assertion|": -6\b|"exit": 101\b|panicked at')
+KILL_SIGN = re.compile(r'FAIL line [0-9]+|Assertion|": -6\b|"exit": 101\b|panicked at')
 BROKEN_SIGN = re.compile(r'Traceback \(most recent call last\)')
 
 
@@ -56,6 +56,9 @@ ASAHI_TESTS = {
     # The old revision reports a DART fault that clears before the second latch read as success.
     'ane-tm-transient-fault-tests.py': [([], PASS),
                                         (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
+    'isp-preview-tests.py': [([], PASS)],
+    'isp-preview-flow-tests.py': [([], PASS)],
+    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']] + [(['--suite', suite, '--control', control] + out(), KILL) for suite, controls in [('session', ['send', 'overwrite', 'stop', 'reset']), ('buffers', ['rollback']), ('receive', ['drain']), ('returns', ['address', 'pool', 'duplicate', 'snapshot']), ('queue', ['queue-error'])] for control in controls],
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
@@ -194,7 +197,7 @@ def jobs(work, conf, dtc):
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
     missing = sorted(found - known)
-    gone = sorted(known - found)
+    gone = sorted(name for name in known if not (ASAHI / name).is_file())
     if missing or gone:
         for name in missing:
             print(f'not registered in {Path(__file__).name}: tools/asahi/{name}', file=sys.stderr)
