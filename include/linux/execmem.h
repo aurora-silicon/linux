@@ -255,16 +255,6 @@ void *execmem_confine_alloc(struct execmem_range *range, size_t size,
 bool execmem_confine_free(void *ptr);
 
 /*
- * Verify that no EL1-executable mapping resolves to a physical page outside
- * the window and that no window page reached the page allocator. Returns the
- * number of violations; fills in the number of executable leaf mappings
- * inspected when @nr_exec is non-NULL. Implemented generically for the confined
- * allocations; the page-table sweep is provided per-architecture by
- * execmem_confine_arch_verify().
- */
-unsigned long execmem_confine_verify(unsigned long *nr_exec);
-
-/*
  * Architecture page-table sweep. Walk the kernel page tables and, for every
  * privileged-executable leaf entry, add 1 to *@nr_exec and, if its output
  * physical address lies outside [base, base + size), add 1 to the return

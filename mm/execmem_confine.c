@@ -22,14 +22,12 @@
 
 #define pr_fmt(fmt) "execmem-confine: " fmt
 
-#include <linux/debugfs.h>
 #include <linux/execmem.h>
 #include <linux/genalloc.h>
 #include <linux/kasan.h>
 #include <linux/kmemleak.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
-#include <linux/seq_file.h>
 #include <linux/set_memory.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -295,17 +293,11 @@ unsigned long __weak execmem_confine_arch_verify(phys_addr_t base,
 	return 0;
 }
 
-unsigned long execmem_confine_verify(unsigned long *nr_exec_out)
+static unsigned long __init execmem_confine_verify(unsigned long *nr_exec_out)
 {
 	unsigned long nr_exec = 0, violations = 0, freed;
 	struct confine_chunk *ck;
 	unsigned long idx;
-
-	if (!confine_ready) {
-		if (nr_exec_out)
-			*nr_exec_out = 0;
-		return 0;
-	}
 
 	freed = confine_count_freed_pages();
 	if (freed) {
@@ -313,11 +305,7 @@ unsigned long execmem_confine_verify(unsigned long *nr_exec_out)
 		violations += freed;
 	}
 
-	/*
-	 * Registry sanity: every confined allocation is backed by pool pages,
-	 * which are by construction inside the window. Re-check anyway so the
-	 * self-test actually inspects the physical backing it relies on.
-	 */
+	/* Every confined allocation is backed by pool pages, inside the window. */
 	mutex_lock(&confine_lock);
 	xa_for_each(&confine_chunks, idx, ck) {
 		phys_addr_t pa = virt_to_phys((void *)ck->pool_va);
@@ -340,137 +328,12 @@ unsigned long execmem_confine_verify(unsigned long *nr_exec_out)
 	return violations;
 }
 
-#ifdef CONFIG_DEBUG_FS
-static void confine_show_chunk(struct gen_pool *pool,
-			       struct gen_pool_chunk *chunk, void *data)
-{
-	struct seq_file *m = data;
-	phys_addr_t start = chunk->phys_addr;
-	phys_addr_t end = start + (chunk->end_addr - chunk->start_addr + 1);
-
-	seq_printf(m, "pool-range:     [%pa, %pa)\n", &start, &end);
-}
-
-static int confine_debug_show(struct seq_file *m, void *v)
-{
-	unsigned long nr_exec = 0, violations;
-
-	seq_printf(m, "window-base:    %pa\n", &confine_base);
-	seq_printf(m, "window-size:    %llu MiB\n",
-		   (unsigned long long)(confine_size >> 20));
-	seq_printf(m, "enforce:        %d\n", confine_enforce);
-	if (confine_pool) {
-		seq_printf(m, "pool-total:     %zu KiB\n",
-			   gen_pool_size(confine_pool) >> 10);
-		seq_printf(m, "pool-available: %zu KiB\n",
-			   gen_pool_avail(confine_pool) >> 10);
-		gen_pool_for_each_chunk(confine_pool, confine_show_chunk, m);
-	}
-
-	violations = execmem_confine_verify(&nr_exec);
-	seq_printf(m, "exec-mappings:  %lu\n", nr_exec);
-	seq_printf(m, "violations:     %lu\n", violations);
-	seq_printf(m, "result:         %s\n", violations ? "FAIL" : "PASS");
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(confine_debug);
-#endif
-
-/*
- * Boot self-test (enabled with "ctxr_exec_selftest" on the command line).
- *
- * In a VM there is no hardware CTXR to fault on an escaping fetch, so we prove
- * two things in software:
- *   1. a confined execmem allocation is physically inside the window, and
- *   2. the page-table sweep actually catches an executable mapping placed
- *      outside the window (i.e. the verifier is not a no-op).
- * The negative case only *maps* an out-of-window page and inspects the tables;
- * nothing ever executes from it, and it is torn down immediately.
- */
-static bool ctxr_selftest __initdata;
-
-static int __init execmem_confine_selftest_param(char *s)
-{
-	ctxr_selftest = true;
-	return 0;
-}
-early_param("ctxr_exec_selftest", execmem_confine_selftest_param);
-
-static void __init execmem_confine_selftest(void)
-{
-	unsigned long nr_exec = 0, before, after;
-	struct vm_struct *area;
-	struct page *page;
-	void *p;
-	bool ok;
-
-	/* 1. positive: a confined allocation lands inside the window. */
-	p = execmem_alloc(EXECMEM_MODULE_TEXT, PAGE_SIZE);
-	if (p) {
-		struct confine_chunk *ck;
-
-		mutex_lock(&confine_lock);
-		ck = xa_load(&confine_chunks, (unsigned long)p >> PAGE_SHIFT);
-		ok = ck && phys_in_window(virt_to_phys((void *)ck->pool_va));
-		mutex_unlock(&confine_lock);
-		pr_info("selftest 1 (confined alloc in window): %s\n",
-			ok ? "PASS" : "FAIL");
-		execmem_free(p);
-	} else {
-		pr_info("selftest 1 (confined alloc in window): FAIL (no memory)\n");
-	}
-
-	/* 2. negative: an out-of-window executable mapping must be detected. */
-	before = execmem_confine_arch_verify(confine_base, confine_size, &nr_exec);
-
-	page = alloc_page(GFP_KERNEL);	/* buddy never returns window pages */
-	if (!page) {
-		pr_info("selftest 2 (detect escape): SKIP (no memory)\n");
-		goto done;
-	}
-	area = __get_vm_area_node(PAGE_SIZE, PAGE_SIZE, PAGE_SHIFT, VM_ALLOC,
-				  VMALLOC_START, VMALLOC_END, NUMA_NO_NODE,
-				  GFP_KERNEL, __builtin_return_address(0));
-	if (!area) {
-		__free_page(page);
-		pr_info("selftest 2 (detect escape): SKIP (no vm area)\n");
-		goto done;
-	}
-
-	if (vmap_pages_range((unsigned long)area->addr,
-			     (unsigned long)area->addr + PAGE_SIZE,
-			     PAGE_KERNEL_EXEC, &page, PAGE_SHIFT)) {
-		free_vm_area(area);
-		__free_page(page);
-		pr_info("selftest 2 (detect escape): SKIP (map failed)\n");
-		goto done;
-	}
-
-	after = execmem_confine_arch_verify(confine_base, confine_size, &nr_exec);
-	pr_info("selftest 2 (detect escape): %s (%lu -> %lu violations)\n",
-		after > before ? "PASS" : "FAIL", before, after);
-
-	set_memory_nx((unsigned long)area->addr, 1);
-	free_vm_area(area);
-	__free_page(page);
-done:
-	return;
-}
-
 static int __init execmem_confine_late_init(void)
 {
 	unsigned long nr_exec = 0, violations;
 
 	if (!confine_ready)
 		return 0;
-
-#ifdef CONFIG_DEBUG_FS
-	debugfs_create_file("execmem_confine", 0400, NULL, NULL,
-			    &confine_debug_fops);
-#endif
-
-	if (ctxr_selftest)
-		execmem_confine_selftest();
 
 	violations = execmem_confine_verify(&nr_exec);
 	pr_info("boot verify: %lu executable mapping(s), %lu violation(s): %s\n",

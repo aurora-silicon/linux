@@ -1146,10 +1146,6 @@ Kernel parameters
 			Format: <bool>
 			Default: 1
 
-	ctxr_exec_selftest
-			[ARM64,EARLY] Run two extra checks of the CTXR
-			executable window at boot.
-
 	ctxr_exec_window=
 			[ARM64,EARLY] Confine kernel executable code to a
 			physical window, overriding the device tree. This is

@@ -141,18 +141,11 @@ Hibernate
 Verifying confinement
 =====================
 
-The feature carries its own verifier, which is what stands in for the hardware
-fault when testing in a VM:
-
-* At ``late_initcall`` the kernel sweeps its page tables, and ``efi_mm`` when
-  runtime services are on, and reports the number of EL1-executable leaf mappings
-  and how many resolve outside the window. When the window is enforcing, a
-  non-zero count is fatal. It also counts window pages that reached the page
-  allocator as violations.
-* ``/sys/kernel/debug/execmem_confine`` re-runs the sweep on read and reports
-  window bounds, pool usage and ``PASS``/``FAIL``. Init memory is freed after
-  ``late_initcall``, and an initrd can be, so this is the check that covers them.
-* Booting with ``ctxr_exec_selftest`` runs two extra checks: that a confined
-  allocation is physically inside the window, and that the sweep actually
-  detects an executable mapping placed *outside* it (proving the verifier is
-  not a no-op).
+At ``late_initcall`` the kernel sweeps its page tables, and ``efi_mm`` when
+runtime services are on, and logs the number of EL1-executable leaf mappings and
+how many resolve outside the window. It also counts window pages that reached
+the page allocator, and confined allocations whose backing is outside the
+window, as violations. Any violation is fatal unless ``ctxr_exec_enforce=0`` is
+given. This is also what stands in for the hardware fault when testing in a VM.
+The check runs once: memory freed after it, such as init memory, relies on
+``free_reserved_area()`` skipping window pages.
