@@ -45,7 +45,10 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
-		/* Filled by the loader. */
+		smc-firmware@30de00000 {
+			reg = <3 0x0de00000 0 0x120000>;
+			no-map;
+		};
 	};
 
 	memory@10000000000 {
@@ -236,6 +239,35 @@
 			compatible = "apple,t8152-cluster-cpufreq";
 			reg = <2 0x11e20000 0 0x1000>;
 			#performance-domain-cells = <0>;
+		};
+
+		smc_mbox: mailbox@30c710080 {
+			compatible = "apple,t8152-smc-mailbox";
+			reg = <3 0x0c710080 0 0x80>;
+			interrupts = <AIC_IRQ 760 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 759 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		smc: smc@30c600000 {
+			compatible = "apple,t8152-smc";
+			reg = <3 0x0c600000 0 0x74000>,
+			      <3 0x0de00000 0 0x120000>;
+			reg-names = "smc", "sram";
+			mboxes = <&smc_mbox>;
+
+			hwmon {
+				compatible = "apple,smc-hwmon";
+				apple,discover-temperatures;
+
+				fan-F0Ac {
+					apple,key-id = "F0Ac";
+					apple,fan-minimum = "F0Mn";
+					apple,fan-maximum = "F0Mx";
+					label = "Fan";
+				};
+			};
 		};
 
 		dockchannel: serial@30812c000 {
