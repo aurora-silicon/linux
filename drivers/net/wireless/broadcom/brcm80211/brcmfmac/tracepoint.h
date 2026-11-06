@@ -79,6 +79,29 @@ TRACE_EVENT(brcmf_hexdump,
 	TP_printk("hexdump [addr=%lx, length=%lu]", __entry->addr, __entry->len)
 );
 
+TRACE_EVENT(brcmf_flowring_delete,
+	TP_PROTO(u16 flowid, u8 ifidx, int outstanding, u32 queue_len,
+		 int bus_state),
+	TP_ARGS(flowid, ifidx, outstanding, queue_len, bus_state),
+	TP_STRUCT__entry(
+		__field(u16, flowid)
+		__field(u8, ifidx)
+		__field(int, outstanding)
+		__field(u32, queue_len)
+		__field(int, bus_state)
+	),
+	TP_fast_assign(
+		__entry->flowid = flowid;
+		__entry->ifidx = ifidx;
+		__entry->outstanding = outstanding;
+		__entry->queue_len = queue_len;
+		__entry->bus_state = bus_state;
+	),
+	TP_printk("flowid=%u ifidx=%u outstanding=%d queue_len=%u bus_state=%d",
+		  __entry->flowid, __entry->ifidx, __entry->outstanding,
+		  __entry->queue_len, __entry->bus_state)
+);
+
 TRACE_EVENT(brcmf_bcdchdr,
 	TP_PROTO(void *data),
 	TP_ARGS(data),

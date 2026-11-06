@@ -1618,22 +1618,27 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 	void *ret_ptr;
 	u8 ifidx;
 	int err;
+	int outstanding;
 	int retry = BRCMF_MAX_TXSTATUS_WAIT_RETRIES;
 
 	/* make sure it is not in txflow */
 	brcmf_commonring_lock(commonring_del);
 	flow->rings[flowid]->status = RING_CLOSING;
 	brcmf_commonring_unlock(commonring_del);
+	ifidx = brcmf_flowring_ifidx_get(flow, flowid);
 
 	/* wait for commonring txflow finished */
 	while (retry && atomic_read(&commonring_del->outstanding_tx)) {
 		usleep_range(5000, 10000);
 		retry--;
 	}
-	if (!retry) {
-		brcmf_err("timed out waiting for txstatus\n");
-		atomic_set(&commonring_del->outstanding_tx, 0);
-	}
+	outstanding = atomic_read(&commonring_del->outstanding_tx);
+	trace_brcmf_flowring_delete(flowid, ifidx, outstanding,
+				    skb_queue_len(&flow->rings[flowid]->skblist),
+				    drvr->bus_if->state);
+	if (outstanding)
+		brcmf_err("timed out waiting for txstatus: flowid=%u outstanding=%d\n",
+			  flowid, outstanding);
 
 	/* no need to submit if firmware can not be reached */
 	if (drvr->bus_if->state != BRCMF_BUS_UP) {
@@ -1653,8 +1658,6 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
 	}
 
 	delete = (struct msgbuf_tx_flowring_delete_req *)ret_ptr;
-
-	ifidx = brcmf_flowring_ifidx_get(msgbuf->flow, flowid);
 
 	delete->msg.msgtype = MSGBUF_TYPE_FLOW_RING_DELETE;
 	delete->msg.ifidx = ifidx;
