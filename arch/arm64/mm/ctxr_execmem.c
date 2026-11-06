@@ -64,31 +64,52 @@ static struct {
 } ctxr_free[CTXR_MAX_FREE] __initdata;
 static int ctxr_nr_free __initdata;
 
-static bool __init ctxr_parse_cmdline(phys_addr_t *base, phys_addr_t *size,
-				      bool *enforce)
+/* From the command line. A size of 0 means none was given. */
+static phys_addr_t ctxr_cmd_base __initdata;
+static phys_addr_t ctxr_cmd_size __initdata;
+static int ctxr_cmd_enforce __initdata = -1;
+
+/* ctxr_exec_window=[<size>[@<base>]]: with no size, the default one. */
+static int __init ctxr_exec_window_param(char *arg)
 {
-	const char *p;
-	char *endp;
+	phys_addr_t base = 0, size = CTXR_WINDOW_DEFAULT;
+	char *p = arg, *end;
 
-	p = strstr(boot_command_line, "ctxr_exec_window=");
-	if (!p)
-		return false;
-	p += strlen("ctxr_exec_window=");
+	if (p && *p) {
+		size = memparse(p, &end);
+		if (end == p || !size)
+			goto bad;
+		if (*end == '@') {
+			p = end + 1;
+			base = memparse(p, &end);
+			if (end == p)
+				goto bad;
+		}
+		if (*end)
+			goto bad;
+	}
 
-	*size = memparse(p, &endp);
-	if (!*size)
-		*size = CTXR_WINDOW_DEFAULT;
-	if (*endp == '@')
-		*base = memparse(endp + 1, NULL);
-	else
-		*base = 0;	/* derive from the image below */
+	ctxr_cmd_base = base;
+	ctxr_cmd_size = size;
+	return 0;
 
-	p = strstr(boot_command_line, "ctxr_exec_enforce=");
-	if (p)
-		*enforce = (p[strlen("ctxr_exec_enforce=")] != '0');
-
-	return true;
+bad:
+	pr_warn("ignoring ctxr_exec_window=%s\n", arg);
+	return 0;
 }
+early_param("ctxr_exec_window", ctxr_exec_window_param);
+
+static int __init ctxr_exec_enforce_param(char *arg)
+{
+	bool enforce;
+
+	if (kstrtobool(arg, &enforce))
+		pr_warn("ignoring ctxr_exec_enforce=%s\n", arg ?: "");
+	else
+		ctxr_cmd_enforce = enforce;
+	return 0;
+}
+early_param("ctxr_exec_enforce", ctxr_exec_enforce_param);
 
 static bool __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
 				 bool *enforce)
@@ -141,23 +162,12 @@ static void __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
 	}
 }
 
-void __init ctxr_exec_reserve(void)
+/* Reserve a window. False, with the reason logged, if it can't work. */
+static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size, bool enforce)
 {
-	phys_addr_t base = 0, size = 0, img_start, img_end;
-	phys_addr_t dram_start, dram_end;
-	bool enforce = true;
-
-	if (!ctxr_parse_cmdline(&base, &size, &enforce) &&
-	    !ctxr_parse_dt(&base, &size, &enforce))
-		return;
-
-	if (!size)
-		return;
-
-	img_start = __pa_symbol(_text);
-	img_end = __pa_symbol(_end);
-	dram_start = memblock_start_of_DRAM();
-	dram_end = memblock_end_of_DRAM();
+	phys_addr_t img_start = __pa_symbol(_text), img_end = __pa_symbol(_end);
+	phys_addr_t dram_start = memblock_start_of_DRAM();
+	phys_addr_t dram_end = memblock_end_of_DRAM();
 
 	if (!base) {
 		/*
@@ -175,13 +185,13 @@ void __init ctxr_exec_reserve(void)
 		pr_err("kernel image [%pa, %pa) does not fit window [%pa, +%llu MiB)\n",
 		       &img_start, &img_end, &base,
 		       (unsigned long long)(size >> 20));
-		goto fail;
+		return false;
 	}
 
 	if (base < dram_start || base + size > dram_end) {
 		pr_err("window [%pa, +%llu MiB) is not within DRAM\n",
 		       &base, (unsigned long long)(size >> 20));
-		goto fail;
+		return false;
 	}
 
 	/* Must run before the window is reserved, or every range looks taken. */
@@ -190,7 +200,7 @@ void __init ctxr_exec_reserve(void)
 	if (memblock_reserve(base, size)) {
 		pr_err("failed to reserve window [%pa, +%llu MiB)\n",
 		       &base, (unsigned long long)(size >> 20));
-		goto fail;
+		return false;
 	}
 
 	ctxr_base = base;
@@ -201,9 +211,29 @@ void __init ctxr_exec_reserve(void)
 	pr_info("reserved exec window [%pa, +%llu MiB), %s\n",
 		&base, (unsigned long long)(size >> 20),
 		enforce ? "enforcing" : "reporting");
-	return;
+	return true;
+}
 
-fail:
+void __init ctxr_exec_reserve(void)
+{
+	phys_addr_t base = 0, size = 0;
+	bool enforce = true;
+	bool from_dt = ctxr_parse_dt(&base, &size, &enforce);
+
+	if (ctxr_cmd_enforce >= 0)
+		enforce = ctxr_cmd_enforce;
+
+	/* A bad override leaves the machine as its bootloader described it. */
+	if (ctxr_cmd_size) {
+		if (ctxr_establish(ctxr_cmd_base, ctxr_cmd_size, enforce))
+			return;
+		pr_warn("ignoring ctxr_exec_window=\n");
+	}
+
+	if (!from_dt || ctxr_establish(base, size, enforce))
+		return;
+
+	/* The bootloader armed this window, so the kernel can't run outside it. */
 	if (enforce)
 		panic("ctxr-execmem: cannot establish the executable window\n");
 	pr_warn("confinement disabled\n");
