@@ -63,7 +63,6 @@ config NFC_VIRTUAL_NCI
 config NFC_APPLE_STOCKHOLM
 	tristate "Apple Stockholm NFC controller over SPMI"
 	depends on NFC_NCI && SPMI && GPIOLIB
-	select CRC_CCITT
 	help
 	  This enables the NCI transport used by Apple Stockholm NFC and
 	  embedded Secure Element controllers connected over SPMI.
