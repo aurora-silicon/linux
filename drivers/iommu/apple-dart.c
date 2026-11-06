@@ -25,6 +25,8 @@
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
+#include <linux/regmap.h>
 #include <linux/kexec.h>
 #include <linux/minmax.h>
 #include <linux/mm.h>
@@ -190,6 +192,27 @@
 #define DART_T8110_ENABLE_STREAMS  0xc00
 #define DART_T8110_DISABLE_STREAMS 0xc20
 
+/* Per-port outstanding transactions; the port counts are in PARAMS2. */
+#define DART_T8110_OUTSTANDING(port) (0x230 + 4 * (port))
+#define DART_T8110_PARAMS2_READ_PORTS  GENMASK(18, 16)
+#define DART_T8110_PARAMS2_WRITE_PORTS GENMASK(22, 20)
+/* How long the power-down and power-up wait for transactions to drain. */
+#define DART_T8110_IDLE_TIMEOUT_US 1000
+/* TLB command of the power-down path: flush everything, also stream table state. */
+#define DART_T8110_TLB_CMD_POWERDOWN (DART_T8110_TLB_CMD_V2 | DART_T8110_TLB_CMD_STT)
+
+/*
+ * PS_PROT ("clock protection") bank: one slice per protected DART. An
+ * enabled slice (bit 4) guards a power-state register of the DART's power
+ * domain; the native DART power-down clears bit 4 after its streams are
+ * disabled and flushed, and power-up sets it again.
+ */
+#define APPLE_PS_PROT_ENABLE		0x20
+#define APPLE_PS_PROT_LOCK		0x24
+#define APPLE_PS_PROT_SLICE(n)		(0x100 + 0x40 * (n))
+#define APPLE_PS_PROT_SLICES		64
+#define APPLE_PS_PROT_SLICE_ON		BIT(4)
+
 #define DART_T8110_TCR                  0x1000
 #define DART_T8110_TCR_REMAP            GENMASK(11, 8)
 #define DART_T8110_TCR_REMAP_ENABLE     BIT(7)
@@ -326,6 +349,17 @@ struct apple_dart {
 	 * with its power confirmed (apple_dart_pm_get()).
 	 */
 	bool power_gated;
+	/*
+	 * Internal display DART: powered down by its DCP (from
+	 * apple_dart_dcp_power_off() until apple_dart_dcp_power_on(); changed
+	 * only under apple_dart_host_lock()), with what the power-up checks
+	 * and restores.
+	 */
+	bool host_off;
+	u32 off_streams, off_protect, off_lock;
+	/* Its clock-protection slice in the PS_PROT bank, if it has one. */
+	struct regmap *ps_prot;
+	u32 ps_prot_slice, ps_prot_saved;
 	/*
 	 * Power-gated display DART: its power confirmation across
 	 * sleep, under pm_gate_lock (a spinlock: only these fields, never
@@ -2036,15 +2070,23 @@ static int __apple_dart_dcp_domain_flush(struct apple_dart_domain *domain);
 /*
  * Borrowed DCP domains have no io-pgtable; their flush ignores the range.
  * On an external display DART only with its power confirmed: -EAGAIN
- * (nothing retired) from sleep until its next confirmed power-up.
+ * (nothing retired) from sleep until its next confirmed power-up. An
+ * internal display DART that its DCP has powered down needs none: nothing
+ * is cached, and its power-up flushes every update made before it (they
+ * hold the stream's lock, which the power-up takes; apple_dart_host_lock()).
+ * A power-up that completed meanwhile confirmed the power in the same step.
  */
 static int apple_dart_dcp_domain_flush(struct apple_dart_domain *domain)
 {
 	struct apple_dart *dart = domain->dcp->dart;
 	int ret;
 
-	if (!apple_dart_pm_get(dart))
-		return -EAGAIN;
+	if (!apple_dart_pm_get(dart)) {
+		if (READ_ONCE(dart->host_off))
+			return 0;
+		if (!dart->ps_prot || !apple_dart_pm_get(dart))
+			return -EAGAIN;
+	}
 	ret = __apple_dart_dcp_domain_flush(domain);
 	apple_dart_pm_put(dart);
 	return ret;
@@ -4269,6 +4311,18 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
 	dart->dispext = j713_dispext;
 	dart->power_gated = j713_dispext;
+	if (j713_display && of_property_present(dev->of_node, "apple,clock-protection")) {
+		/* Its DCP can power it down: see apple_dart_dcp_power_off(). */
+		dart->ps_prot = syscon_regmap_lookup_by_phandle_args(dev->of_node,
+								     "apple,clock-protection",
+								     1, &dart->ps_prot_slice);
+		if (IS_ERR(dart->ps_prot))
+			return dev_err_probe(dev, PTR_ERR(dart->ps_prot),
+					     "clock-protection bank\n");
+		if (dart->ps_prot_slice >= APPLE_PS_PROT_SLICES)
+			return -EINVAL;
+		dart->power_gated = true;
+	}
 	spin_lock_init(&dart->pm_gate_lock);
 	init_waitqueue_head(&dart->pm_wq);
 	if (j713_dcpext)
@@ -5188,6 +5242,9 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	/* No reset or restore: see apple_dart_suspend(). */
 	if (dart->cold_ane)
 		return 0;
+	/* Powered down by its DCP, which restores it at power-up. */
+	if (READ_ONCE(dart->host_off))
+		return 0;
 	/*
 	 * An adopted external display DART may be off now, its display with it,
 	 * and nothing confirms otherwise: no register of it is read or written
@@ -5278,6 +5335,259 @@ static const struct of_device_id apple_dart_of_match[] = {
 MODULE_DEVICE_TABLE(of, apple_dart_of_match);
 
 #if IS_ENABLED(CONFIG_APPLE_DART_J713_DCP)
+/* The internal display DART of a DCP consumer (its firmware or display stream). */
+static struct apple_dart *apple_dart_dcp_consumer(struct device *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct apple_dart_domain *dd;
+
+	if (!domain || domain->owner != &apple_dart_iommu_ops)
+		return NULL;
+	dd = to_dart_domain(domain);
+	if (!dd->dcp || dd->dcp->owner != dev || dd->dcp->dart->dispext ||
+	    !dd->dcp->dart->ps_prot)
+		return NULL;
+	return dd->dcp->dart;
+}
+
+static int apple_dart_tlb_command(struct apple_dart *dart, u32 command)
+{
+	u32 status;
+
+	writel(command, dart->regs + DART_T8110_TLB_CMD);
+	return readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
+					 !(status & DART_T8110_TLB_CMD_BUSY), 1,
+					 DART_STREAM_COMMAND_BUSY_TIMEOUT);
+}
+
+/*
+ * Nothing in flight: no fault (-EIO), and no TLB command or outstanding
+ * transaction (-EBUSY, which can drain).
+ */
+static int apple_dart_idle(struct apple_dart *dart)
+{
+	u32 params = readl(dart->regs + DART_PARAMS2);
+	unsigned int ports = max(FIELD_GET(DART_T8110_PARAMS2_READ_PORTS, params),
+				 FIELD_GET(DART_T8110_PARAMS2_WRITE_PORTS, params));
+
+	if (!ports || ports > 4 || apple_dart_fault_pending(dart))
+		return -EIO;
+	if (readl(dart->regs + DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY)
+		return -EBUSY;
+	for (unsigned int port = 0; port < ports; port++)
+		if (readl(dart->regs + DART_T8110_OUTSTANDING(port)))
+			return -EBUSY;
+	return 0;
+}
+
+/* Idle, giving transactions and a command just issued time to drain. */
+static int apple_dart_wait_idle(struct apple_dart *dart)
+{
+	int ret, idle;
+
+	ret = read_poll_timeout_atomic(apple_dart_idle, idle, idle != -EBUSY, 1,
+				       DART_T8110_IDLE_TIMEOUT_US, false, dart);
+	return ret ?: idle;
+}
+
+/* Its PS_PROT bank enabled and not locked: its slice can be switched. */
+static int apple_dart_ps_prot_usable(struct apple_dart *dart)
+{
+	u32 enable, lock;
+	int ret;
+
+	ret = regmap_read(dart->ps_prot, APPLE_PS_PROT_ENABLE, &enable) ?:
+	      regmap_read(dart->ps_prot, APPLE_PS_PROT_LOCK, &lock);
+	if (!ret && (!(enable & BIT(0)) || (lock & BIT(0))))
+		ret = -EPERM;
+	return ret;
+}
+
+static int apple_dart_ps_prot_set(struct apple_dart *dart, u32 value)
+{
+	unsigned int reg = APPLE_PS_PROT_SLICE(dart->ps_prot_slice), now;
+	int ret;
+
+	ret = regmap_write(dart->ps_prot, reg, value);
+	if (!ret)
+		ret = regmap_read(dart->ps_prot, reg, &now);
+	return ret ?: now == value ? 0 : -EIO;
+}
+
+/*
+ * Whether apple_dart_dcp_power_off() can run for @dev's DART, changing
+ * nothing: its DCP asks before the first step of its power-down.
+ */
+int apple_dart_dcp_power_check(struct device *dev)
+{
+	struct apple_dart *dart = apple_dart_dcp_consumer(dev);
+	struct apple_dart_dcp *streams[3];
+
+	if (!dart)
+		return -ENODEV;
+	if (READ_ONCE(dart->host_off))
+		return -EALREADY;
+	streams[0] = dart->dcp;
+	streams[1] = dart->frontend[0];
+	streams[2] = dart->frontend[1];
+	for (unsigned int i = 0; i < ARRAY_SIZE(streams); i++)
+		if (streams[i] && READ_ONCE(streams[i]->failed))
+			return -EIO;
+	return apple_dart_ps_prot_usable(dart);
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_power_check);
+
+/*
+ * J713 internal display DART, before its DCP powers the display domains
+ * down (its DCP CPU stopped, the DART's masters idle): as the native DART
+ * power-down does, disable its enabled streams, flush with the power-down
+ * TLB command and clear its clock-protection slice. From here until
+ * apple_dart_dcp_power_on() its registers are not used: its commands are
+ * gated, its generic DMA streams update their page tables in memory only
+ * (apple_dart_host_lock()) and system sleep leaves it alone. On failure its
+ * borrowed streams are retired.
+ * @dev is a consumer: the DCP (firmware DART) or its PIODMA (display DART).
+ */
+static int apple_dart_host_power_off(struct apple_dart *dart)
+{
+	unsigned long flags;
+	u32 enabled;
+	const char *why;
+	int ret;
+
+	if (READ_ONCE(dart->host_off))
+		return -EALREADY;
+	/*
+	 * Page-table updates stay in memory from now on; then no use of its
+	 * registers either, and the uses in flight are waited for.
+	 */
+	apple_dart_host_lock(dart, &flags);
+	WRITE_ONCE(dart->host_off, true);
+	apple_dart_host_unlock(dart, flags);
+	apple_dart_pm_invalidate(dart, false);
+	apple_dart_quiesce_commands(dart->dev);
+
+	why = "not idle";
+	ret = apple_dart_wait_idle(dart);
+	if (ret)
+		goto fail;
+	why = "clock protection";
+	ret = apple_dart_ps_prot_usable(dart) ?:
+	      regmap_read(dart->ps_prot, APPLE_PS_PROT_SLICE(dart->ps_prot_slice),
+			  &dart->ps_prot_saved);
+	if (ret)
+		goto fail;
+
+	/* What power-up checks: the translations and their lock, and the streams. */
+	apple_dart_save_state(dart);
+	dart->off_protect = readl(dart->regs + DART_T8110_PROTECT);
+	dart->off_lock = readl(dart->regs + DART_T8110_PROTECT_LOCK);
+	dart->off_streams = readl(dart->regs + DART_T8110_ENABLE_STREAMS);
+
+	why = "stream disable";
+	writel(dart->off_streams, dart->regs + DART_T8110_DISABLE_STREAMS);
+	enabled = readl(dart->regs + DART_T8110_ENABLE_STREAMS);
+	ret = enabled ? -EIO : 0;
+	if (ret)
+		goto fail;
+	why = "power-down flush";
+	ret = apple_dart_tlb_command(dart, DART_T8110_TLB_CMD_POWERDOWN) ?:
+	      apple_dart_wait_idle(dart);
+	if (ret)
+		goto fail;
+	if (dart->ps_prot_saved & APPLE_PS_PROT_SLICE_ON) {
+		why = "clock protection off";
+		ret = apple_dart_ps_prot_set(dart, dart->ps_prot_saved & ~APPLE_PS_PROT_SLICE_ON);
+		if (ret)
+			goto fail;
+	}
+	dev_dbg(dart->dev, "powered down: streams %08x, clock protection %08x\n",
+		dart->off_streams, dart->ps_prot_saved);
+	return 0;
+fail:
+	apple_dart_fail_borrowed(dart, "power-down: %s (%d)", why, ret);
+	return ret;
+}
+
+int apple_dart_dcp_power_off(struct device *dev)
+{
+	struct apple_dart *dart = apple_dart_dcp_consumer(dev);
+
+	return dart ? apple_dart_host_power_off(dart) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_power_off);
+
+/*
+ * After its DCP powered the display domains up again, before the DCP CPU
+ * runs: restore the clock-protection slice, check that the DART kept its
+ * translations and their lock (it is not rebuilt), flush, and enable the
+ * streams that were enabled at power-down. Its registers are then usable
+ * again. On failure its borrowed streams are retired.
+ */
+static int apple_dart_host_power_on(struct apple_dart *dart)
+{
+	unsigned long flags;
+	const char *why;
+	int ret;
+
+	if (!READ_ONCE(dart->host_off))
+		return -EALREADY;
+	why = "clock protection on";
+	ret = apple_dart_ps_prot_set(dart, dart->ps_prot_saved);
+	if (ret)
+		goto fail;
+	why = "state lost";
+	ret = -EIO;
+	if (readl(dart->regs + DART_T8110_ENABLE_STREAMS) ||
+	    readl(dart->regs + DART_T8110_PROTECT) != dart->off_protect ||
+	    readl(dart->regs + DART_T8110_PROTECT_LOCK) != dart->off_lock ||
+	    !apple_dart_state_retained(dart))
+		goto fail;
+	why = "commands";
+	ret = apple_dart_resume_commands(dart->dev);
+	if (ret)
+		goto fail;
+
+	/*
+	 * The flush, the streams and the confirmed power are one step for the
+	 * streams' page-table updates (apple_dart_host_lock()): the flush covers
+	 * every update made while the DART was down, and every later update
+	 * finds it powered.
+	 */
+	apple_dart_host_lock(dart, &flags);
+	why = "flush";
+	ret = apple_dart_wait_idle(dart) ?:
+	      apple_dart_tlb_command(dart, DART_T8110_TLB_CMD_V2);
+	if (!ret) {
+		why = "stream enable";
+		writel(dart->off_streams, dart->regs + DART_T8110_ENABLE_STREAMS);
+		if (readl(dart->regs + DART_T8110_ENABLE_STREAMS) != dart->off_streams)
+			ret = -EIO;
+	}
+	if (!ret) {
+		WRITE_ONCE(dart->host_off, false);
+		spin_lock(&dart->pm_gate_lock);
+		dart->pm_unverified = false;
+		spin_unlock(&dart->pm_gate_lock);
+	}
+	apple_dart_host_unlock(dart, flags);
+	if (ret)
+		goto fail;
+	dev_dbg(dart->dev, "powered up: state kept, streams %08x\n", dart->off_streams);
+	return 0;
+fail:
+	apple_dart_fail_borrowed(dart, "power-up: %s (%d)", why, ret);
+	return ret;
+}
+
+int apple_dart_dcp_power_on(struct device *dev)
+{
+	struct apple_dart *dart = apple_dart_dcp_consumer(dev);
+
+	return dart ? apple_dart_host_power_on(dart) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_dart_dcp_power_on);
+
 /*
  * J713 external DCP: whether an adopted external display DART kept its
  * state, its power on (the caller's to know): the TTBR/TCR lock (PROTECT

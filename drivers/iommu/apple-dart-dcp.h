@@ -130,6 +130,36 @@ static inline void apple_dart_pm_invalidate(struct apple_dart *dart, bool suspen
 	wait_event(dart->pm_wq, !READ_ONCE(dart->pm_users));
 }
 
+/*
+ * The locks of every borrowed stream of @dart, in a fixed order (SID23, then
+ * SID0, then SID16). An internal display DART's host_off changes only with
+ * all of them held, so under any one of them it is stable: while it is set,
+ * the DART's DCP has it powered down (or powering down), and its generic DMA
+ * streams (SID0, SID23) update their page tables in memory only, with no
+ * register used; its power-up flushes every translation, with these locks
+ * held, before it enables the streams again.
+ */
+static void apple_dart_host_lock(struct apple_dart *dart, unsigned long *flags)
+{
+	struct apple_dart_dcp *streams[] = { dart->dcp, dart->frontend[0], dart->frontend[1] };
+	unsigned int held = 0;
+
+	local_irq_save(*flags);
+	for (unsigned int i = 0; i < ARRAY_SIZE(streams); i++)
+		if (streams[i])
+			spin_lock_nested(&streams[i]->lock, held++);
+}
+
+static void apple_dart_host_unlock(struct apple_dart *dart, unsigned long flags)
+{
+	struct apple_dart_dcp *streams[] = { dart->frontend[1], dart->frontend[0], dart->dcp };
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(streams); i++)
+		if (streams[i])
+			spin_unlock(&streams[i]->lock);
+	local_irq_restore(flags);
+}
+
 /* Every borrowed stream of @dart, for one reason. */
 #define apple_dart_fail_borrowed(dart, fmt, ...)				\
 	do {									\
@@ -638,6 +668,18 @@ static phys_addr_t apple_dart_dcp_translate(struct apple_dart_dcp *dcp, u64 iova
 		pte = dcp->expected[root][leaf];
 		if (pte)
 			phys = dcp_dart_pte_phys(pte) | (iova & (DCP_DART_PAGE - 1));
+		goto out;
+	}
+	/*
+	 * Powered down by its DCP (stable under this lock): no register, so
+	 * only the host-owned leaves, which expected[] mirrors.
+	 */
+	if (READ_ONCE(dcp->dart->host_off)) {
+		if (!test_bit(root, dcp->foreign) && dcp->expected[root]) {
+			pte = dcp->expected[root][leaf];
+			if (pte)
+				phys = dcp_dart_pte_phys(pte) | (iova & (DCP_DART_PAGE - 1));
+		}
 		goto out;
 	}
 	/*
@@ -1368,6 +1410,14 @@ static size_t apple_dart_dcp_unmap(struct apple_dart_dcp *dcp, u64 iova,
 	size_t unmapped;
 
 	/*
+	 * An internal display DART that its DCP powers down: no use of its
+	 * registers is needed. Under the stream's lock __apple_dart_dcp_unmap()
+	 * sees whether the DART is powered (apple_dart_host_lock()), and while it
+	 * is not, only updates the page tables.
+	 */
+	if (dcp->dart->ps_prot)
+		return __apple_dart_dcp_unmap(dcp, iova, size, count, gather);
+	/*
 	 * On an external display DART, only inside a use of its registers.
 	 * Returning 0 (nothing unmapped) is not safe for general DMA teardown:
 	 * the caller would take the IOVA as unmapped and reuse it, or free
@@ -1420,8 +1470,13 @@ static size_t __apple_dart_dcp_unmap(struct apple_dart_dcp *dcp, u64 iova,
 	while (cleared < count && dcp->table[root][leaf + cleared])
 		WRITE_ONCE(dcp->table[root][leaf + cleared++], 0);
 	dma_wmb();
-	/* Strict SID0: invalidate before the IOVA or its pages can be reused. */
-	if (cleared && dcp->sid == 0 && apple_dart_dcp_flush(dcp)) {
+	/*
+	 * Strict SID0: invalidate before the IOVA or its pages can be reused.
+	 * Not while its DCP has the DART powered down: nothing is cached then,
+	 * and the power-up flushes before it enables the streams.
+	 */
+	if (cleared && dcp->sid == 0 && !READ_ONCE(dcp->dart->host_off) &&
+	    apple_dart_dcp_flush(dcp)) {
 		/* A stale translation may survive: republish the leaves and keep the pages. */
 		for (size_t i = 0; i < cleared; i++)
 			WRITE_ONCE(dcp->table[root][leaf + i], dcp->expected[root][leaf + i]);
