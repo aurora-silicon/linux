@@ -228,7 +228,7 @@ static void dchid_kiwi_raw_report_test(struct kunit *test)
 			dchid_parse_subpacket(&hdr, &frame, &payload, &length),
 			HID_INPUT_REPORT);
 	KUNIT_EXPECT_EQ(test, length, sizeof(frame.report));
-	KUNIT_EXPECT_PTR_EQ(test, payload, frame.report);
+	KUNIT_EXPECT_PTR_EQ(test, payload, &frame.report[0]);
 	KUNIT_EXPECT_EQ(test, *(u8 *)payload, 0x5a);
 	KUNIT_EXPECT_FALSE(test, dchid_wake_report(iface, &frame));
 
