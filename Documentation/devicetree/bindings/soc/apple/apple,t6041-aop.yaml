@@ -107,6 +107,18 @@ properties:
     description: The gyroscope service.
     unevaluatedProperties: false
 
+  devmotion6:
+    type: object
+    $ref: /schemas/iio/imu/apple,aop-devmotion.yaml#
+    description: The device-motion fusion service.
+    unevaluatedProperties: false
+
+  als-temp:
+    type: object
+    $ref: /schemas/iio/temperature/apple,aop-temp.yaml#
+    description: The board temperature sensor service.
+    unevaluatedProperties: false
+
 required:
   - compatible
   - reg
@@ -158,6 +170,14 @@ examples:
 
             gyro {
                 compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
+            };
+
+            devmotion6 {
+                compatible = "apple,t6041-aop-devmotion6", "apple,aop-devmotion6";
+            };
+
+            als-temp {
+                compatible = "apple,t6041-aop-als-temp", "apple,aop-als-temp";
             };
         };
     };

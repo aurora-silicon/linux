@@ -7,8 +7,9 @@ Apple AOP sensors
 The AOP firmware announces sensor services over EPIC. The AOP core matches
 each service to a child node in the device tree and forwards its fake-HID
 reports to the corresponding IIO driver. Ambient light (``als``), lid
-angle (``las``), acceleration (``accel``) and angular rate (``gyro``) use
-this same transport; no HID bus device is created.
+angle (``las``), acceleration (``accel``), angular rate (``gyro``), fused
+device motion (``devmotion6``) and board temperature (``als-temp``) use this
+same transport; no HID bus device is created.
 
 Lid angle
 =========
@@ -60,6 +61,42 @@ core's ``nCal`` boot argument for the SoC. The T6040 firmware accepts the
 calibration and the report interval with ``nCal`` 0, but sends no reports;
 its own default, which the core keeps, is 1.
 
+Device-motion fusion
+====================
+
+Enable ``CONFIG_IIO_AOP_SENSOR_DEVMOTION``. The device is named
+``aop-sensors-devmotion6`` and exposes one ``IIO_ROT`` channel modified as a
+quaternion. Direct reads return four signed values in W, X, Y, Z order; their
+fixed scale is ``1 / 2^30``. The buffered channel uses the same four-value
+Q30 representation followed by an optional host timestamp. At rest the
+quaternion norm should be close to one, and tilting the laptop should move at
+least two components smoothly while the norm remains close to one.
+
+The service's current report has a type byte followed by a versioned fixed
+layout. Type 2 is 108 bytes and carries little-endian IEEE-754 X, Y, Z and W
+at offset 28. Types 3 and 4 are 60 bytes and carry the same fields at offset
+12. Type 1 is a five-byte state report and does not update the IIO sample.
+Reports begin after property 0 is set to a non-zero interval in microseconds;
+the driver requests 50 Hz, writes zero around system sleep, and restores the
+interval after resume. This fused stream needs no separate calibration blob.
+
+Board temperature
+=================
+
+Enable ``CONFIG_IIO_AOP_SENSOR_TEMP``. The device is named
+``aop-sensors-als-temp``. ``in_temp_input`` and buffered samples are in
+millidegrees Celsius, following the IIO temperature ABI, and
+``sampling_frequency`` is one hertz. The 14-byte report stores signed Q16.16
+degrees Celsius at offset 2; the driver timestamps it on receipt.
+
+The bootloader may provide ``apple,temp-offset-calibration``,
+``apple,absolute-temp-offset-cal``, ``apple,absolute-temp-offset-fcm-cal`` and
+``apple,absolute-temp-offset-bcm-cal`` containers. Location-zero packets are
+sent unchanged before the one-hertz interval. If none are present the driver
+warns and selects the firmware's default calibration state; otherwise it
+selects the calibrated state. A missing optional calibration therefore does
+not hide an otherwise usable sensor.
+
 
 Host regression tests require Python 3 and a Rust compiler::
 
@@ -92,3 +129,33 @@ On J616s, or another supported laptop:
    A readable feature report alone does not prove unsolicited reports
    arrive. Establish that transport behaviour before adding any polling
    or firmware setup request.
+
+To test the two additional J616s services without rebooting, replace the
+module names below with their installed paths if the distribution does not
+put them in the normal module tree::
+
+  modprobe -r aop_devmotion aop_temp
+  modprobe aop_devmotion
+  modprobe aop_temp
+
+Find the devices by name rather than assuming IIO numbers::
+
+  for d in /sys/bus/iio/devices/iio:device*; do
+          printf '%s: ' "$d"; cat "$d/name"
+  done
+  iio_info
+
+For ``aop-sensors-devmotion6``, enable ``in_rot_quaternion_en`` and the
+timestamp if desired, then run ``iio_readdev``. Four signed Q30 values make
+one quaternion sample. Flat and stationary, the values should be stable and
+their scaled squared norm close to one. Tilt the left, right and display
+edges in turn; components should change continuously rather than jump or
+remain zero. For ``aop-sensors-als-temp``, ``cat in_temp_input`` should show a
+plausible board temperature in millidegrees and ``iio_readdev`` should yield
+one signed 32-bit temperature plus the optional timestamp each second.
+
+After testing, suspend and resume once and verify both streams restart. A
+missing device means the AOP did not announce the service or its child did
+not bind; ``ENODATA`` means it announced and bound but has not delivered a
+valid sample. Record ``dmesg`` around either case, including property refusal,
+report-size, AOP timeout and DART messages.
