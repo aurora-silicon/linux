@@ -1429,6 +1429,11 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
+	/* Keep every local role and data path down until the connector is dry. */
+	if (tps->contaminant_ops &&
+	    tps->contaminant != TYPEC_CONTAMINANT_NONE)
+		status &= ~TPS_STATUS_PLUG_PRESENT;
+
 	if ((tps->status ^ status) & TPS_STATUS_PLUG_PRESENT)
 		cd321x_pm_new_connection(&cd321x->pm);
 	tps->status = status;
@@ -1627,6 +1632,9 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 	if (cd321x->pm.phase == CD321X_PM_REMOVED ||
 	    (!cd321x->pm.setup_pending && !(event & ~cd321x_irq_mask(tps))))
 		return 0;
+	/* A reset may have removed controller-side contaminant mitigation. */
+	if (tps->contaminant_ops)
+		tps->contaminant_ops->invalidate(tps);
 	ret = cd321x_setup_run(&cd321x->pm, event, cd321x_irq_mask(tps),
 			       &cd321x_setup_ops, cd321x);
 	if (cd321x->pm.phase == CD321X_PM_PREPARED ||
@@ -1728,6 +1736,7 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	if (cd321x_check_setup(container_of(tps, struct cd321x, tps), event) < 0)
 		goto err_unlock;
 	if (event & SN201202X_INT_LDCM_UPDATE && tps->contaminant_ops) {
+		tps->contaminant = TYPEC_CONTAMINANT_UNKNOWN;
 		tps->contaminant_ops->event(tps);
 		goto err_unlock;
 	}
@@ -2942,9 +2951,10 @@ int tipd_init(struct tps6598x *tps)
 
 	/*
 	 * A controller found in "DBMa" is used as it is. Nothing below issues a
-	 * 4CC command (the S0 power state switch above only does if the
-	 * controller is not in S0 already), so probing neither leaves the debug
-	 * mode nor disturbs a Debug USB or serial route set up before Linux.
+	 * mode-changing 4CC command (the S0 power state switch above only does
+	 * if the controller is not in S0 already), so probing neither leaves the
+	 * debug mode nor disturbs a Debug USB or serial route set up before
+	 * Linux. The LDCM safety command below does not change controller mode.
 	 * Remember it, so that the debugfs interface never tears that mode down.
 	 */
 	tps->dbma_at_probe = ret == TPS_MODE_DBMA;

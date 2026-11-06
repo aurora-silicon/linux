@@ -320,7 +320,14 @@ struct tps6598x;
 struct tipd_contaminant_ops {
 	int (*update)(struct tps6598x *tps);
 	void (*event)(struct tps6598x *tps);
+	void (*invalidate)(struct tps6598x *tps);
 	void (*stop)(struct tps6598x *tps);
+};
+
+struct sn201202x_ldcm_ops {
+	int (*read)(void *ctx, enum typec_contaminant *contaminant);
+	int (*set_mitigation)(void *ctx, bool enable);
+	void (*publish)(void *ctx, enum typec_contaminant contaminant);
 };
 
 struct tipd_data {
@@ -486,6 +493,7 @@ struct sn201202x {
 	/* Failed tries to sleep while idle since it last slept, gave up or was accessed */
 	unsigned int sleep_tries;
 	struct delayed_work ldcm_work;
+	bool ldcm_mitigated;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -555,6 +563,8 @@ extern const struct regmap_bus regmap_sn201202x;
 u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st);
 enum typec_contaminant
 sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN]);
+int sn201202x_ldcm_update_state(void *ctx,
+				const struct sn201202x_ldcm_ops *ops);
 #endif
 
 #endif /* __TPS6598X_H__ */

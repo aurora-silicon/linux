@@ -26,6 +26,7 @@
 #define SN201202X_SLEEP_TRIES		3
 
 #define SN201202X_REG_LDCM_STATUS	0x74
+#define SN201202X_LDCM_MITIGATE		BIT(6)
 #define SN201202X_LDCM_DETECTED		BIT(2)
 #define SN201202X_LDCM_STATE		GENMASK(3, 1)
 #define SN201202X_LDCM_STATE_IDLE	0
@@ -270,22 +271,96 @@ sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN])
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_decode);
 
-static int sn201202x_ldcm_update(struct tps6598x *tps)
+static int sn201202x_ldcm_read(void *ctx,
+			      enum typec_contaminant *contaminant)
 {
+	struct tps6598x *tps = ctx;
 	u8 status[SN201202X_LDCM_STATUS_LEN];
-	enum typec_contaminant contaminant;
 	int ret;
 
 	ret = tps6598x_block_read(tps, SN201202X_REG_LDCM_STATUS, status,
 				  sizeof(status));
-	contaminant = ret ? TYPEC_CONTAMINANT_UNKNOWN :
-			      sn201202x_ldcm_decode(status);
+	*contaminant = ret ? TYPEC_CONTAMINANT_UNKNOWN :
+			     sn201202x_ldcm_decode(status);
+	return ret;
+}
+
+static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
+{
+	struct tps6598x *tps = ctx;
+	struct sn201202x *sn = tps_to_sn(tps);
+	u8 command = enable ? SN201202X_LDCM_MITIGATE : 0;
+	int ret;
+
+	/* Successful task completion is the controller's mitigation ACK. */
+	ret = tps6598x_exec_cmd_tmo(tps, "LDCM", sizeof(command), &command,
+				   0, NULL, 1000, 0);
+	if (!ret)
+		sn->ldcm_mitigated = enable;
+	return ret;
+}
+
+static void sn201202x_ldcm_publish(void *ctx,
+				   enum typec_contaminant contaminant)
+{
+	struct tps6598x *tps = ctx;
+
 	typec_set_contaminant(tps->port, contaminant);
 	tps->contaminant = contaminant;
+}
 
-	if (ret)
+VISIBLE_IF_KUNIT int
+sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops)
+{
+	enum typec_contaminant contaminant;
+	int read_ret, ret;
+
+	read_ret = ops->read(ctx, &contaminant);
+	if (read_ret || contaminant != TYPEC_CONTAMINANT_NONE) {
+		ret = ops->set_mitigation(ctx, true);
+		if (ret) {
+			ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
+			return ret;
+		}
+
+		ops->publish(ctx, contaminant);
+		if (read_ret)
+			return read_ret;
+		return contaminant == TYPEC_CONTAMINANT_UNKNOWN ? -EAGAIN : 0;
+	}
+
+	ret = ops->set_mitigation(ctx, false);
+	if (ret) {
+		ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
 		return ret;
+	}
+
+	/* Do not report dry if liquid appeared while mitigation was removed. */
+	read_ret = ops->read(ctx, &contaminant);
+	if (read_ret || contaminant != TYPEC_CONTAMINANT_NONE) {
+		ret = ops->set_mitigation(ctx, true);
+		if (ret) {
+			ops->publish(ctx, TYPEC_CONTAMINANT_UNKNOWN);
+			return ret;
+		}
+	}
+
+	ops->publish(ctx, contaminant);
+	if (read_ret)
+		return read_ret;
 	return contaminant == TYPEC_CONTAMINANT_UNKNOWN ? -EAGAIN : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_ldcm_update_state);
+
+static const struct sn201202x_ldcm_ops sn201202x_ldcm_ops = {
+	.read = sn201202x_ldcm_read,
+	.set_mitigation = sn201202x_ldcm_set_mitigation,
+	.publish = sn201202x_ldcm_publish,
+};
+
+static int sn201202x_ldcm_update(struct tps6598x *tps)
+{
+	return sn201202x_ldcm_update_state(tps, &sn201202x_ldcm_ops);
 }
 
 static void sn201202x_ldcm_work(struct work_struct *work)
@@ -316,6 +391,15 @@ static void sn201202x_ldcm_event(struct tps6598x *tps)
 	mod_delayed_work(system_freezable_wq, &sn->ldcm_work, 0);
 }
 
+static void sn201202x_ldcm_invalidate(struct tps6598x *tps)
+{
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	tps->contaminant = TYPEC_CONTAMINANT_UNKNOWN;
+	sn->ldcm_mitigated = false;
+	sn201202x_ldcm_event(tps);
+}
+
 static void sn201202x_ldcm_stop(struct tps6598x *tps)
 {
 	cancel_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
@@ -324,6 +408,7 @@ static void sn201202x_ldcm_stop(struct tps6598x *tps)
 static const struct tipd_contaminant_ops sn201202x_contaminant_ops = {
 	.update = sn201202x_ldcm_update,
 	.event = sn201202x_ldcm_event,
+	.invalidate = sn201202x_ldcm_invalidate,
 	.stop = sn201202x_ldcm_stop,
 };
 
@@ -523,6 +608,7 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 	struct cd321x_sleep_state st = {};
 	u32 links = 0;
 	bool wake;
+	int ldcm_ret = 0;
 	int ret;
 
 	guard(mutex)(&tps->lock);
@@ -535,7 +621,10 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 		ret = cd321x_sleep_events(tps, &st);
 	if (!ret)
 		links = sn201202x_sleep_links(&st);
-	wake = ret || st.contaminant_event || (links & ~sn->sleep_links);
+	if (!ret && st.contaminant_event)
+		ldcm_ret = sn201202x_ldcm_update(tps);
+	wake = ret || ldcm_ret || st.contaminant_event ||
+	       (links & ~sn->sleep_links);
 	if (!ret)
 		sn->sleep_links = links;
 	spmi_command_sleep(sn->sdev);
@@ -716,6 +805,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	 */
 	if (tps->irq)
 		disable_irq(tps->irq);
+	scoped_guard(mutex, &tps->lock)
+		tps->contaminant = TYPEC_CONTAMINANT_UNKNOWN;
 	/* Awake, also from idle sleep, until resume */
 	err = pm_runtime_resume_and_get(dev);
 	if (err) {
@@ -776,8 +867,22 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
 static int sn201202x_prepare(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
+	int ret;
 
-	cancel_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
+	cancel_delayed_work_sync(&sn->ldcm_work);
+	mutex_lock(&tps->lock);
+	ret = sn201202x_ldcm_update(tps);
+	mutex_unlock(&tps->lock);
+	if (ret && !sn->ldcm_mitigated) {
+		/* Do not enter sleep without a dry snapshot or mitigation ACK. */
+		sn201202x_ldcm_event(tps);
+		return ret;
+	}
+	if (ret)
+		dev_warn(tps->dev,
+			 "connector state unavailable; entering sleep mitigated: %d\n",
+			 ret);
 	return tipd_prepare(dev);
 }
 
