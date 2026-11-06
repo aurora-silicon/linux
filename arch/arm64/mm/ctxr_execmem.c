@@ -149,9 +149,10 @@ static int __init ctxr_parse_dt(phys_addr_t *base, phys_addr_t *size,
 	return 1;
 }
 
-static void __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
+/* Returns how much the pool would get, in whole pages. */
+static phys_addr_t __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
 {
-	phys_addr_t start, end, wend = base + size;
+	phys_addr_t start, end, wend = base + size, usable = 0;
 	u64 i;
 
 	ctxr_nr_free = 0;
@@ -171,7 +172,11 @@ static void __init ctxr_snapshot_free(phys_addr_t base, phys_addr_t size)
 		ctxr_free[ctxr_nr_free].start = start;
 		ctxr_free[ctxr_nr_free].end = end;
 		ctxr_nr_free++;
+		if (round_down(end, PAGE_SIZE) > PAGE_ALIGN(start))
+			usable += round_down(end, PAGE_SIZE) - PAGE_ALIGN(start);
 	}
+
+	return usable;
 }
 
 /* Reserve a window. False, with the reason logged, if it can't work. */
@@ -206,8 +211,14 @@ static bool __init ctxr_establish(phys_addr_t base, phys_addr_t size, bool enfor
 		return false;
 	}
 
-	/* Must run before the window is reserved, or every range looks taken. */
-	ctxr_snapshot_free(base, size);
+	/*
+	 * Must run before the window is reserved, or every range looks taken.
+	 * The pool is built after the secondaries start, so check it now.
+	 */
+	if (!ctxr_snapshot_free(base, size)) {
+		pr_err("window has no free space for executable allocations\n");
+		return false;
+	}
 
 	if (memblock_reserve(base, size)) {
 		pr_err("failed to reserve window [%pa, +%llu MiB)\n",
@@ -307,10 +318,8 @@ bool __init ctxr_exec_execmem_setup(void)
 		return false;
 
 	pool = gen_pool_create(PAGE_SHIFT, NUMA_NO_NODE);
-	if (!pool) {
-		pr_err("failed to create the window pool\n");
+	if (!pool)
 		goto fail;
-	}
 
 	/*
 	 * Only memory that was free before the window was reserved joins the
@@ -319,15 +328,8 @@ bool __init ctxr_exec_execmem_setup(void)
 	for (i = 0; i < ctxr_nr_free; i++)
 		ctxr_pool_add_gap(pool, ctxr_free[i].start, ctxr_free[i].end);
 
-	if (!gen_pool_size(pool)) {
-		pr_err("window has no free space for executable allocations\n");
-		goto fail_pool;
-	}
-
-	if (execmem_confine_init(pool, ctxr_enforce)) {
-		pr_err("failed to register the window\n");
-		goto fail_pool;
-	}
+	if (!gen_pool_size(pool) || execmem_confine_init(pool, ctxr_enforce))
+		goto fail;
 
 	pr_info("executable pool: %zu MiB usable in %d range(s) of a %llu MiB window (%llu MiB already reserved)\n",
 		gen_pool_size(pool) >> 20, ctxr_nr_free,
@@ -335,11 +337,9 @@ bool __init ctxr_exec_execmem_setup(void)
 		(unsigned long long)((ctxr_size - gen_pool_size(pool)) >> 20));
 	return true;
 
-fail_pool:
-	gen_pool_destroy(pool);
 fail:
-	ctxr_hold_secondaries("no executable pool");
-	return false;
+	/* Only an allocation failure gets here, and confined CPUs are running. */
+	panic("ctxr-execmem: cannot build the executable pool\n");
 }
 
 bool __init ctxr_exec_window_reserved(void)
