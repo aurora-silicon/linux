@@ -308,9 +308,10 @@ impl queue::Queue for M5Queue {
                 return Err(ENOTSUPP);
             };
             admit_reference_render(&payload).map_err(|error| {
-                pr_err!("M5 render admission rejected size={}x{} layers={} utiles={}x{} samples={}\n",
+                pr_err!("M5 render admission rejected size={}x{} layers={} utiles={}x{} samples={} sample_bytes={} positions={:#x}\n",
                     payload.width, payload.height, payload.layers,
-                    payload.utile_width, payload.utile_height, payload.samples);
+                    payload.utile_width, payload.utile_height, payload.samples,
+                    payload.sample_size, payload.multisample_control);
                 error
             })?;
             command::validate_m5_reference_depth(&payload, &address_space)
@@ -371,12 +372,14 @@ impl queue::Queue for M5Queue {
 /// Admit the captured M5 single-layer render-state envelope. This is an experimental first-job ABI
 /// path, not an assertion that arbitrary Vulkan programs are supported.
 fn admit_reference_render(command: &command::UapiRenderCommand) -> Result {
+    // A single 32-bit color target has an eight-byte aligned sample stride
+    // in Mesa's tilebuffer layout; sample_size includes that padding.
     let sample_layout = match command.samples {
         1 => command.utile_width == 32 && command.utile_height == 32,
         2 => command.utile_width == 32 && command.utile_height == 32
-            && command.sample_size == 4 && command.multisample_control == 0x44cc,
+            && command.sample_size == 8 && command.multisample_control == 0x44cc,
         4 => command.utile_width == 32 && command.utile_height == 16
-            && command.sample_size == 4 && command.multisample_control == 0xeaa2_6e26,
+            && command.sample_size == 8 && command.multisample_control == 0xeaa2_6e26,
         _ => false,
     };
     let timestamps = [command.vertex_timestamps.start, command.vertex_timestamps.end,
