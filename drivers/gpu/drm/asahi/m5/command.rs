@@ -754,116 +754,86 @@ fn validate_zls<A: GpuAddressSpace>(
     Ok(())
 }
 
-/// Bounded M5 D32 clear/store envelope, alongside the original color-only
-/// profile. Native 25G76 supplies ff00ff dimensions and 80044 with compression;
-/// bits2/6 select compression, while bit19 stores the depth plane. Geometry,
-/// stencil absence, and application programs are checked by the M5 caller.
+/// Validate the complete single-layer M5 Z/S allocations before their unused
+/// array strides are discarded. AIL stores samples in an expanded 2D surface:
+/// 2x doubles Y, and 4x doubles both axes. The dimensions register stays in pixels.
 pub(crate) fn validate_m5_reference_depth<A: GpuAddressSpace>(
     command: &UapiRenderCommand,
     address_space: &A,
 ) -> Result<(), UapiTranslateError> {
-    let depth = command.depth;
-    if depth.base == 0 {
-        // No depth plane. The surface may still carry an inert stencil one,
-        // which contributes nothing but its compression pair and the shared
-        // pixel dimensions; a render that transfers it is refused with the
-        // rest of the stencil profile.
-        let stencil_only = command.stencil.base != 0
-            && command.zls_control
-                == if command.stencil.compression_base != 0 { 0x110 } else { 0 }
-            && command.depth_dimensions
-                == ((u32::from(command.width) - 1)
-                    | ((u32::from(command.height) - 1) << 16));
-        return if depth.compression_base == 0 && depth.stride == 0
-            && depth.compression_stride == 0
-            && (stencil_only
-                || (command.zls_control == 0 && command.depth_dimensions == 0)) {
-            Ok(())
-        } else {
-            Err(UapiTranslateError::ZlsFields)
-        };
-    }
-    let compressed = depth.compression_base != 0;
-    // The control word's load and store bits are the only part a render
-    // chooses: bit15 loads the depth plane and bit19 stores it, and a render
-    // that neither tests nor writes depth sets neither, which is how a
-    // conformance surface with an unused depth buffer arrives. Everything
-    // else -- the compression pair in bits 2 and 6, the GPU tiling, the 32F
-    // format -- is the witnessed profile and stays exact. depth_flags reaches
-    // register 0x15319 unchanged either way, so the admitted envelope is the
-    // set of load/store combinations over that fixed remainder.
-    let compression_bits = if compressed { 0x44 } else { 0 };
-    // Bits 25-26 select the depth format: 0 is 32-bit float, 2 is 16-bit
-    // unorm. The narrow plane was captured on 25G76 alongside the wide one
-    // and moves nothing else in the register program except the clear value
-    // and one ISP flag, both of which the caller derives. Its compression
-    // metadata has no witness, so a compressed 16-bit plane stays out.
-    let z16 = command.zls_control & (3 << 25) == (2 << 25);
-    if z16 && compressed {
-        return Err(UapiTranslateError::ZlsFields);
-    }
-    let format_bits = if z16 { 2 << 25 } else { 0 };
-    // A stencil plane may be attached without being transferred: a surface
-    // with a depth-stencil buffer carries one for every render, whether or
-    // not the render uses it. Its compression pair in bits 4 and 8 describes
-    // the attached layout and is the only stencil state admitted here --
-    // loading or storing the plane (bits 14 and 18) needs its own witnesses,
-    // as does the stencil unit in the graphics record.
-    let stencil_compression_bits =
-        if command.stencil.compression_base != 0 { 0x110 } else { 0 };
-    let control_transfers = command.zls_control & 0x88000;
-    let expected_control =
-        compression_bits | stencil_compression_bits | format_bits | control_transfers;
     let width = u32::from(command.width);
     let height = u32::from(command.height);
     if !(1..=M5_MAX_RENDER_DIMENSION).contains(&width)
         || !(1..=M5_MAX_RENDER_DIMENSION).contains(&height)
-        || command.layers != 1 || (compressed && (width < 16 || height < 16)) {
+        || command.layers != 1 || !matches!(command.samples, 1 | 2 | 4) {
         return Err(UapiTranslateError::ZlsFields);
     }
-    // AIL tiles are 16 KiB whatever the format: 64x64 at four bytes a pixel,
-    // 128x64 at two. While both axes fit one tile the level is a whole
-    // number of them; if either axis is smaller, the level uses a
-    // power-of-two miptail aligned to a 128-byte cacheline. Single-layer M5
-    // surfaces are not page-padded.
-    let (tile_width, bytes_per_pixel) = if z16 { (128u32, 2u64) } else { (64u32, 4u64) };
-    let data_bytes = if width >= tile_width && height >= 64 {
-        u64::from(width.div_ceil(tile_width)) * u64::from(height.div_ceil(64)) * 0x4000
-    } else {
-        (u64::from(width.next_power_of_two())
-            * u64::from(height.next_power_of_two()) * bytes_per_pixel)
-            .div_ceil(128) * 128
-    };
-    let metadata_bytes = (u64::from(width.next_power_of_two().div_ceil(16))
-        * u64::from(height.next_power_of_two().div_ceil(16)) * 8).div_ceil(128) * 128;
-    let dimensions = (width - 1) | ((height - 1) << 16);
-    if command.depth_dimensions != dimensions
-        || command.zls_control != expected_control
-        // The clear value is whatever the application asked for; it reaches
-        // register 0x15301 verbatim and is only consumed when the render
-        // actually clears the plane.
-        || (command.depth_clear & 0x7fffffff) > 0x7f800000
-        // Image suballocations and small miptails use cacheline alignment;
-        // the backing VM pages remain independently validated below.
-        || depth.base & 0x7f != 0 || depth.compression_base & 0x7f != 0
-        // Both strides are array strides, and the M5 caller zeroes them
-        // because native single-layer ZLS does not encode one. Every render
-        // admitted here is single-layer -- layers != 1 is refused above -- so
-        // the value that arrives is whatever the userspace packer computed
-        // and the hardware never sees it: for a surface smaller than a page
-        // Mesa's (pages - 1) << 14 | 1 underflows to 0xffffc001. Comparing it
-        // would refuse a valid render over a field that is discarded. The
-        // backing store is still validated in full below, from the
-        // dimensions rather than from either stride.
-        || (!compressed && depth.compression_stride != 0) {
-        return Err(UapiTranslateError::ZlsFields);
+    let sample_width = width * if command.samples == 4 { 2 } else { 1 };
+    let sample_height = height * if command.samples > 1 { 2 } else { 1 };
+    let depth = command.depth;
+    let stencil = command.stencil;
+    let z16 = command.zls_control & (3 << 25) == (2 << 25);
+    let mut expected_control = 0;
+    for (plane, bytes_per_sample, transfers, compression) in [
+        (depth, if z16 { 2u64 } else { 4u64 }, 0x88000u64, 0x44u64),
+        (stencil, 1u64, 0x44000u64, 0x110u64),
+    ] {
+        if plane.base == 0 {
+            if plane.compression_base != 0 || plane.stride != 0
+                || plane.compression_stride != 0 {
+                return Err(UapiTranslateError::ZlsFields);
+            }
+            continue;
+        }
+        let compressed = plane.compression_base != 0;
+        // Compressed Z16 remains outside the captured layout. Both Z32 and
+        // S8 compression use 8-byte metadata records for 16x16 sample tiles.
+        if plane.base & 0x7f != 0 || plane.compression_base & 0x7f != 0
+            || (!compressed && plane.compression_stride != 0)
+            || (compressed && (bytes_per_sample == 2
+                || sample_width < 16 || sample_height < 16)) {
+            return Err(UapiTranslateError::ZlsFields);
+        }
+        expected_control |= command.zls_control & transfers;
+        if compressed { expected_control |= compression; }
+        // AIL tiles contain 16 KiB: 64x64 Z32, 128x64 Z16, 128x128 S8.
+        // A miptail smaller than either tile axis is power-of-two padded and
+        // cacheline aligned, rather than rounded to a whole 16-KiB page.
+        let (tile_width, tile_height) = match bytes_per_sample {
+            4 => (64u32, 64u32),
+            2 => (128, 64),
+            _ => (128, 128),
+        };
+        let data_bytes = if sample_width >= tile_width && sample_height >= tile_height {
+            u64::from(sample_width.div_ceil(tile_width))
+                * u64::from(sample_height.div_ceil(tile_height)) * 0x4000
+        } else {
+            (u64::from(sample_width.next_power_of_two())
+                * u64::from(sample_height.next_power_of_two()) * bytes_per_sample)
+                .div_ceil(128) * 128
+        };
+        require_range(address_space, plane.base, data_bytes, GpuAccess::ReadWrite)?;
+        if compressed {
+            let metadata_bytes = (u64::from(sample_width.next_power_of_two().div_ceil(16))
+                * u64::from(sample_height.next_power_of_two().div_ceil(16)) * 8)
+                .div_ceil(128) * 128;
+            require_range(address_space, plane.compression_base, metadata_bytes,
+                GpuAccess::ReadWrite)?;
+        }
     }
-    // Validate the entire resized surface and metadata before the
-    // M5 caller removes the unused single-layer array stride fields.
-    require_range(address_space, depth.base, data_bytes, GpuAccess::ReadWrite)?;
-    if compressed {
-        require_range(address_space, depth.compression_base, metadata_bytes,
-            GpuAccess::ReadWrite)?;
+    if depth.base != 0 {
+        if z16 { expected_control |= 2 << 25; }
+        if (command.depth_clear & 0x7fffffff) > 0x7f800000 {
+            return Err(UapiTranslateError::ZlsFields);
+        }
+    }
+    let dimensions = if depth.base != 0 || stencil.base != 0 {
+        (width - 1) | ((height - 1) << 16)
+    } else { 0 };
+    // Exact matching rejects unknown format bits and transfer requests for
+    // an absent plane, as well as mismatched compression/base-address pairs.
+    if command.zls_control != expected_control || command.depth_dimensions != dimensions {
+        return Err(UapiTranslateError::ZlsFields);
     }
     Ok(())
 }
