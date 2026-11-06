@@ -7,6 +7,13 @@
 
 #include "t604x.dtsi"
 
+/delete-node/ &usb4_0_dart;
+/delete-node/ &apciec0_dart;
+/delete-node/ &usb4_1_dart;
+/delete-node/ &apciec1_dart;
+/delete-node/ &usb4_2_dart;
+/delete-node/ &apciec2_dart;
+
 /* The M4 Pro has five cores in each P cluster. */
 /delete-node/ &cpu_p05;
 /delete-node/ &cpu_p15;
@@ -65,3 +72,5 @@
 	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <273066666656>;
 	apple,bandwidth-class-bytes-per-second = /bits/ 64 <273000000000>;
 };
+
+#include "t6040-usb4.dtsi"

@@ -333,6 +333,21 @@ static const struct hw_info t8132_pciec_hw = {
 	.s2idle_hold_domain	= true,
 };
 
+static const struct hw_info t6040_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_msiaddr_hi	= PORT_MSIADDR + 4,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_tunctrl		= 0x1088,
+	.max_rid2sid		= 256,
+	.sid_indexed_rid2sid	= true,
+	.tunneled		= true,
+	.t8132_reset		= true,
+	.msimap_by_vector	= true,
+	.s2idle_hold_domain	= true,
+};
+
 static const struct of_device_id apple_pcie_of_match[];
 
 /**
@@ -2010,7 +2025,8 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	 * 32-vector slice. Keep endpoint MSI data local, and route its table
 	 * entry to the corresponding shared-window vector.
 	 */
-	if (pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw) {
+	if (pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw ||
+	    pcie->hw == &t6040_pciec_hw) {
 		struct resource ecam;
 		u32 expected_base, aic_base;
 
@@ -2027,6 +2043,21 @@ static int apple_msi_init(struct apple_pcie *pcie)
 				expected_base = 0x40;
 				break;
 			case 0xf30000000ULL:
+				expected_base = 0x60;
+				break;
+			default:
+				goto invalid_slice;
+			}
+		} else if (of_machine_is_compatible("apple,t6040")) {
+			aic_base = 2071;
+			switch (ecam.start) {
+			case 0x1c50000000ULL:
+				expected_base = 0x20;
+				break;
+			case 0x1c60000000ULL:
+				expected_base = 0x40;
+				break;
+			case 0x1c70000000ULL:
 				expected_base = 0x60;
 				break;
 			default:
@@ -2077,7 +2108,8 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	}
 
 	/* Keep map targets within the supported 8-bit range. */
-	if ((pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw) &&
+	if ((pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw ||
+	     pcie->hw == &t6040_pciec_hw) &&
 	    (!pcie->nvecs || pcie->nvecs > 256 ||
 	     pcie->msi_vector_base >
 	     FIELD_MAX(PORT_MSIMAP_TARGET) + 1 - pcie->nvecs)) {
@@ -3976,6 +4008,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 };
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t6040-pciec",	.data = &t6040_pciec_hw },
 	{ .compatible = "apple,t8132-pciec",	.data = &t8132_pciec_hw },
 	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
 	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },
