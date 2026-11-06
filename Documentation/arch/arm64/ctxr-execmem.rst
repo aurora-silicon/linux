@@ -24,20 +24,29 @@ Device tree (production)
     The bootloader emits, under ``/chosen``::
 
         aurora,ctxr-exec-window = <base_hi base_lo size_hi size_lo>;
-        aurora,ctxr-exec-enforce = <1>;   /* optional, default 1 */
 
     A ``base`` of 0 tells the kernel to anchor the window on its own loaded
-    image (rounded down to 2 MiB). ``size`` is the window size in bytes.
+    image (rounded down to 2 MiB). ``size`` is the window size in bytes. The
+    window is enforcing unless ``aurora,ctxr-exec-enforce = <0>`` is also
+    there, which aura doesn't emit. See
+    ``Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml``.
 
 Command line (bring-up / VM)
     ::
 
-        ctxr_exec_window=<size>[@<base>]   e.g. ctxr_exec_window=128M
-        ctxr_exec_enforce=0                 (default: enforcing)
+        ctxr_exec_window=[<size>[@<base>]]   e.g. ctxr_exec_window=128M
+        ctxr_exec_enforce=<bool>             (default: enforcing)
 
-    The command line overrides the device tree. ``size`` accepts the usual
-    ``K``/``M``/``G`` suffixes; if ``@base`` is omitted it is derived from the
-    kernel image.
+    The command line overrides the device tree, and ``ctxr_exec_enforce=``
+    applies to a window from either place. ``size`` accepts the usual
+    ``K``/``M``/``G`` suffixes and defaults to 128 MiB; if ``@base`` is omitted
+    it is derived from the kernel image. The last use of an option wins.
+
+A value that doesn't parse is ignored with a warning. So is a window from the
+command line that can't work because the image doesn't fit it or it isn't in
+DRAM, and the device tree's window then applies if there is one. A window from
+the device tree that can't work is fatal when enforcing, because the kernel
+can't run on the confined cores outside it.
 
 How it works
 ============
@@ -69,9 +78,11 @@ it up. Anything EL0 can execute therefore lives outside the window:
 * The vDSO's code is part of the image, so userspace gets a copy in ordinary
   memory.
 * No window page reaches the page allocator. ``free_reserved_area()`` skips them,
-  so freed ``__init`` memory stays reserved, as does an initrd in the window. RAM
-  in the window that the pool doesn't use is not available to the rest of the
-  system, so a window should be no larger than the executable code needs.
+  so freed ``__init`` memory stays reserved, as does an initrd in the window. A
+  CMA area that overlaps the window isn't activated, and a reserved-memory node
+  whose init fails stays reserved. RAM in the window that the pool doesn't use is
+  not available to the rest of the system, so a window should be no larger than
+  the executable code needs.
 
 The zero page stays in the window, so a program that jumps into fresh executable
 memory before writing it still gets there. When the window is enforcing, an EL0
@@ -89,13 +100,23 @@ aligned to the kernel's page size, the kernel warns once and turns runtime
 services off for that boot, as ``efi=noruntime`` would. When all of it is inside,
 runtime services stay on. A window in reporting mode leaves them on.
 
-kexec and crash kernels
-=======================
+What a confined machine gives up
+================================
 
-The relocation code runs from an ordinary page, outside the window, and a crash
-dump can start on a confined core, where it would hang during a panic. While a
-window is enforcing, ``machine_kexec_prepare()`` therefore refuses both, so
-``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``.
+CPU hotplug
+    The kernel runs at EL2 with no monitor below it, so no PSCI, and CPUs start
+    through spin-table, which has no way to take a CPU down. The CPUs have no
+    ``online`` file in sysfs, and anything that needs them offline fails.
+
+kexec and crash kernels
+    The relocation code runs from an ordinary page, outside the window, and a
+    crash dump can start on a confined core, where it would hang during a panic.
+    While a window is enforcing, ``machine_kexec_prepare()`` refuses both, so
+    ``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``.
+
+Hibernate
+    Resume runs from a ``trans_pgd`` page outside the window. This is unchanged
+    and untested under a window.
 
 Verifying confinement
 =====================
