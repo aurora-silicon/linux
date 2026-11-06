@@ -35,9 +35,17 @@ Command line (bring-up / VM)
         ctxr_exec_window=<size>[@<base>]   e.g. ctxr_exec_window=128M
         ctxr_exec_enforce=0                 (default: enforcing)
 
-    The command line overrides the device tree. ``size`` accepts the usual
+    ``ctxr_exec_window=`` overrides the device tree's window, and
+    ``ctxr_exec_enforce=`` overrides the enforce setting of a window from either
+    source. Both are ordinary early parameters: the last occurrence wins, and a
+    malformed value is ignored with an error. ``size`` accepts the usual
     ``K``/``M``/``G`` suffixes; if ``@base`` is omitted it is derived from the
     kernel image.
+
+``enforce`` only decides whether a confinement violation found by the verifier
+(see below) is fatal. Whether the hardware confines a core does not depend on
+it, so everything else in this document applies whenever a window is active,
+enforcing or not.
 
 How it works
 ============
@@ -74,7 +82,7 @@ it up. Anything EL0 can execute therefore lives outside the window:
   system, so a window should be no larger than the executable code needs.
 
 The zero page stays in the window, so a program that jumps into fresh executable
-memory before writing it still gets there. When the window is enforcing, an EL0
+memory before writing it still gets there. When a window is active, an EL0
 instruction permission fault on a present, executable mapping of a window page
 logs the task and its address and PFN, then kills it with an uncatchable
 ``SIGSEGV`` rather than retrying. Any other fault takes the usual path.
@@ -84,17 +92,17 @@ EFI runtime services
 
 EFI runtime code runs at EL2 on whichever core ``efi_rts_wq`` happens to be on,
 so on a confined core it has to be inside the window too. When a window is
-enforcing and any ``EFI_RUNTIME_SERVICES_CODE`` region is outside it, or isn't
+active and any ``EFI_RUNTIME_SERVICES_CODE`` region is outside it, or isn't
 aligned to the kernel's page size, the kernel warns once and turns runtime
 services off for that boot, as ``efi=noruntime`` would. When all of it is inside,
-runtime services stay on. A window in reporting mode leaves them on.
+runtime services stay on.
 
 kexec and crash kernels
 =======================
 
 The relocation code runs from an ordinary page, outside the window, and a crash
 dump can start on a confined core, where it would hang during a panic. While a
-window is enforcing, ``machine_kexec_prepare()`` therefore refuses both, so
+window is active, ``machine_kexec_prepare()`` therefore refuses both, so
 ``kexec_load()`` and ``kexec_file_load()`` fail with ``EOPNOTSUPP``.
 
 Verifying confinement
