@@ -2,9 +2,9 @@
 
 //! The once-per-boot module pin taken before the firmware is first touched.
 //!
-//! A started firmware session that is never freed (G15's, and G17's on M5) keeps RTKit and
-//! mailbox callbacks into this module, so the module must stay loaded until reboot from the
-//! first firmware-visible write on.
+//! A started firmware session that is never freed (every backend's: G15, G16, G18, the M5
+//! RAM-boot path, and G17 on M5) keeps RTKit and mailbox callbacks into this module, so the
+//! module must stay loaded until reboot from the first firmware-visible write on.
 //! `__module_get` alone does not ensure that: a deferred or asynchronous probe can run while
 //! an ordinary rmmod is already past its reference check, and the module is then unloaded
 //! under a running firmware. `try_module_get` fails once removal has begun, so the pin is
