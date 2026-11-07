@@ -24,3 +24,5 @@
 &framebuffer0 {
 	power-domains = <&ps_dispext0_fe>, <&ps_dptx_phy>;
 };
+
+#include "t8132-j773g-audio.dtsi"

@@ -1327,3 +1327,7 @@
 };
 
 #include "t8132-memory.dtsi"
+
+#include "t8132-peripherals.dtsi"
+
+#include "t8132-peripheral-buses.dtsi"

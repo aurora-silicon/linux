@@ -14,67 +14,126 @@ description: |
   preloaded by the bootloader. Its two DART instances translate the same stream. The
   bootloader supplies two reserved firmware regions and their IOVA mappings.
 
-properties:
-  compatible:
-    enum:
-      - apple,t6000-ave
-      - apple,t6041-ave
-      - apple,t8112-ave
-      - apple,t8140-ave
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-ave
+          - apple,t6041-ave
+          - apple,t8112-ave
+          - apple,t8140-ave
+          - apple,t8132-ave
+  required:
+    - compatible
 
-  reg:
-    items:
-      - description: Codec registers
-      - description: Mailbox registers
-      - description: Coprocessor registers
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-ave
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-ave
+            - const: apple,ave
 
-  reg-names:
-    items:
-      - const: codec
-      - const: mailbox
-      - const: coproc
+        reg:
+          minItems: 5
+          maxItems: 5
 
-  interrupts:
-    items:
-      - description: Mailbox, raised when the firmware posts to a host ring
-      - description: Codec interrupt handled by the firmware
-      - description: Codec interrupt handled by the firmware
-      - description: Codec interrupt handled by the firmware
-      - description: Codec interrupt handled by the firmware
+        interrupts:
+          minItems: 5
+          maxItems: 5
 
-  power-domains:
-    minItems: 5
-    maxItems: 6
+        power-domains:
+          minItems: 1
+          maxItems: 6
 
-  power-domain-names:
-    minItems: 5
-    items:
-      - const: dma
-      - const: pipe4
-      - const: pipe5
-      - const: me0
-      - const: me1
-      - const: perf
-        description: |
-          A performance floor the encoder needs to run at full speed, held
-          while the encoder is powered (for example the SoC rail floor of a
-          PMC).
+        iommus:
+          minItems: 1
+          maxItems: 2
 
-  iommus:
-    maxItems: 2
+        clocks:
+          minItems: 1
+          maxItems: 1
 
-  memory-region:
-    items:
-      - description: Preloaded firmware text
-      - description: Preloaded firmware data
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
 
-required:
-  - compatible
-  - reg
-  - reg-names
-  - interrupts
-  - power-domains
-  - power-domain-names
-  - iommus
+      additionalProperties: false
+    else:
+      properties:
+        compatible:
+          enum:
+            - apple,t6000-ave
+            - apple,t6041-ave
+            - apple,t8112-ave
+            - apple,t8140-ave
 
-additionalProperties: false
+        reg:
+          items:
+            - description: Codec registers
+            - description: Mailbox registers
+            - description: Coprocessor registers
+
+        reg-names:
+          items:
+            - const: codec
+            - const: mailbox
+            - const: coproc
+
+        interrupts:
+          items:
+            - description: Mailbox, raised when the firmware posts to a host ring
+            - description: Codec interrupt handled by the firmware
+            - description: Codec interrupt handled by the firmware
+            - description: Codec interrupt handled by the firmware
+            - description: Codec interrupt handled by the firmware
+
+        power-domains:
+          minItems: 5
+          maxItems: 6
+
+        power-domain-names:
+          minItems: 5
+          items:
+            - const: dma
+            - const: pipe4
+            - const: pipe5
+            - const: me0
+            - const: me1
+            - const: perf
+              description: |
+                A performance floor the encoder needs to run at full speed, held
+                while the encoder is powered (for example the SoC rail floor of a
+                PMC).
+
+        iommus:
+          maxItems: 2
+
+        memory-region:
+          items:
+            - description: Preloaded firmware text
+            - description: Preloaded firmware data
+
+      required:
+        - compatible
+        - reg
+        - reg-names
+        - interrupts
+        - power-domains
+        - power-domain-names
+        - iommus
+
+      additionalProperties: false
