@@ -140,6 +140,26 @@
 		status = "disabled";
 	};
 
+	/* ADT /arm-io/admac-leap-s; the existing AP proxy is separate. */
+	admac_leap_secure: dma-controller@313200000 {
+		compatible = "apple,t8140-admac-secure", "apple,admac-secure";
+		reg = <0x3 0x13200000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <18>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 451 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&aop_dart 11>;
+		power-domains = <&ps_audio_leap_s_a>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/dcp0-expert. */
+	/* ADT /arm-io/dcp-exclave-ioreporting. */
+	dcp_ioreporting: dcp-ioreporting {
+		compatible = "apple,t8140-dcp-ioreporting", "apple,dcp-ioreporting";
+		status = "disabled";
+	};
+
 	/* ADT /arm-io/dcp0-expert. */
 	dcp_expert: display-expert@3082b8044 {
 		compatible = "apple,t8140-dcp-expert", "apple,dcp-expert";
@@ -562,9 +582,12 @@
 };
 
 / {
-	xspmi_controller: spmi-proxy-controller {
+	xspmi_controller: spmi-proxy-controller@348614000 {
 		compatible = "apple,t8140-xspmi-controller", "apple,xspmi-controller";
-		apple,proxy = <&xspmi_proxy>;
+		reg = <0x3 0x48614000 0x0 0x4000>;
+		apple,read-queue-depth = <256>;
+		apple,write-queue-depth = <256>;
+		apple,response-vector = <256>;
 		status = "disabled";
 	};
 
@@ -572,6 +595,85 @@
 		compatible = "apple,t8140-smc-mogul", "apple,smc-mogul";
 		apple,smc = <&smc>;
 		apple,control-address = <0x10>;
+		status = "disabled";
+	};
+};
+
+/* Register-less DP audio interfaces: ADT DMA channels and PMGR gates. */
+/ {
+
+	dpaudio0: audio-controller-0 {
+		compatible = "apple,t8140-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x64>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa0>;
+		/* No qualified firmware audio route is assigned at boot. */
+		status = "disabled";
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t8140-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+		/* No qualified firmware audio route is assigned at boot. */
+		status = "disabled";
+	};
+};
+
+/* Firmware audio endpoints with no qualified independent host client. */
+/ {
+
+	/* ADT /arm-io/iop-voicetrigger-controller/audio-vt-device. */
+	audio_voice_trigger: audio-voice-trigger {
+		compatible = "apple,t8140-audio-voice-trigger", "apple,audio-voice-trigger";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/audio-mca-loopback. */
+	audio_mca_loopback: audio-mca-loopback {
+		compatible = "apple,t8140-audio-mca-loopback", "apple,audio-mca-loopback";
+		dmas = <&admac_base_ns 6>, <&admac_base_ns 7>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/audio-leap-internal-loopback. */
+	audio_leap_loopback: audio-leap-loopback {
+		compatible = "apple,t8140-audio-leap-loopback", "apple,audio-leap-loopback";
+		dmas = <&admac_leap_ns 8>, <&admac_leap_ns 9>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/lp-mic-device. */
+	audio_low_power_mic: audio-low-power-mic {
+		compatible = "apple,t8140-audio-low-power-mic", "apple,audio-low-power-mic";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/lp-mic-io-buffer-device. */
+	audio_mic_buffer: audio-mic-buffer {
+		compatible = "apple,t8140-audio-mic-buffer", "apple,audio-mic-buffer";
+		iommus = <&aop_dart 9>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/siri-listening-device. */
+	audio_listening_client: audio-listening-client {
+		compatible = "apple,t8140-audio-listening-client", "apple,audio-listening-client";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/audio-speaker-tap. */
+	audio_speaker_tap: audio-speaker-tap {
+		compatible = "apple,t8140-audio-speaker-tap", "apple,audio-speaker-tap";
+		dmas = <&admac_base_ns 3>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/lp-mic-injection-device. */
+	audio_mic_injection: audio-mic-injection {
+		compatible = "apple,t8140-audio-mic-injection", "apple,audio-mic-injection";
+		dmas = <&admac_base_ns 10>;
 		status = "disabled";
 	};
 };

@@ -339,3 +339,78 @@
 		status = "disabled";
 	};
 };
+
+/* Register-less DP audio interfaces: ADT DMA channels and PMGR gates. */
+/ {
+
+	dpaudio0: audio-controller-0 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x64>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa0>;
+		/* No qualified firmware audio route is assigned at boot. */
+		status = "disabled";
+	};
+
+	dpaudio3: audio-controller-3 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x6a>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa3>;
+		/* No qualified firmware audio route is assigned at boot. */
+		status = "disabled";
+	};
+
+	dpaudio4: audio-controller-4 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x6c>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa4>;
+		/* No qualified firmware audio route is assigned at boot. */
+		status = "disabled";
+	};
+};
+
+
+/* Firmware audio endpoints with no qualified independent host client. */
+/ {
+
+	/* ADT /arm-io/iop-voicetrigger-controller/audio-vt-device. */
+	audio_voice_trigger: audio-voice-trigger {
+		compatible = "apple,t6041-audio-voice-trigger", "apple,audio-voice-trigger";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/audio-mca-loopback. */
+	audio_mca_loopback: audio-mca-loopback {
+		compatible = "apple,t6041-audio-mca-loopback", "apple,audio-mca-loopback";
+		dmas = <&admac1 6>, <&admac1 7>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/audio-leap-internal-loopback. */
+	audio_leap_loopback: audio-leap-loopback {
+		compatible = "apple,t6041-audio-leap-loopback", "apple,audio-leap-loopback";
+		dmas = <&admac0 8>, <&admac0 9>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/lp-mic-device. */
+	audio_low_power_mic: audio-low-power-mic {
+		compatible = "apple,t6041-audio-low-power-mic", "apple,audio-low-power-mic";
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/lp-mic-io-buffer-device. */
+	audio_mic_buffer: audio-mic-buffer {
+		compatible = "apple,t6041-audio-mic-buffer", "apple,audio-mic-buffer";
+		iommus = <&aop_dart 8>;
+		status = "disabled";
+	};
+
+	/* ADT /arm-io/iop-audio-controller/siri-listening-device. */
+	audio_listening_client: audio-listening-client {
+		compatible = "apple,t6041-audio-listening-client", "apple,audio-listening-client";
+		status = "disabled";
+	};
+};
