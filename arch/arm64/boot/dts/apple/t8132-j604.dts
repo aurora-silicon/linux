@@ -34,3 +34,19 @@
 &fpwm1 {
 	status = "okay";
 };
+
+/*
+ * CPU DVFS and deep idle, as on the J713. This machine has a fan, so
+ * it does not need the board thermal owner the fanless Airs wait for.
+ */
+&cpufreq_e {
+	status = "okay";
+};
+
+&cpufreq_p {
+	status = "okay";
+};
+
+&cpuidle {
+	status = "okay";
+};

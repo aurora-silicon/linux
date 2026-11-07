@@ -17,3 +17,19 @@
 	model = "Apple iMac (24-inch, 4x USB-C, M4, 2024)";
 	chassis-type = "all-in-one";
 };
+
+/*
+ * CPU DVFS and deep idle, as on the J713. This machine has a fan, so
+ * it does not need the board thermal owner the fanless Airs wait for.
+ */
+&cpufreq_e {
+	status = "okay";
+};
+
+&cpufreq_p {
+	status = "okay";
+};
+
+&cpuidle {
+	status = "okay";
+};
