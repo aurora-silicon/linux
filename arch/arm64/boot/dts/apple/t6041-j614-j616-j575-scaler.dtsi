@@ -39,7 +39,8 @@
 	};
 };
 
-&pmgr_mini {
+/* PMGR group 1 resolves via ps-groups to the main bank at 0x502280000. */
+&pmgr {
 	ps_msr1: ps_msr1_dart: power-controller@3b0 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x3b0 4>;
