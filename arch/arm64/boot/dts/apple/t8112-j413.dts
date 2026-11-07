@@ -348,3 +348,30 @@
 		status = "disabled";
 	};
 };
+
+&aop_spmi0 {
+	radio-pmu@e {
+		compatible = "apple,t8112-wifibt-pmu", "apple,radio-pmu";
+		reg = <0xe SPMI_USID>;
+		status = "disabled";
+	};
+};
+
+&aop_spmi1 {
+	interrupt-controller;
+	#interrupt-cells = <2>;
+
+	nfc@c {
+		compatible = "apple,t8112-stockholm-spmi", "apple,stockholm-spmi";
+		reg = <0xc SPMI_USID>;
+		interrupt-parent = <&aop_spmi1>;
+		interrupts = <160 IRQ_TYPE_NONE>,
+			     <161 IRQ_TYPE_NONE>,
+			     <162 IRQ_TYPE_NONE>,
+			     <163 IRQ_TYPE_NONE>,
+			     <164 IRQ_TYPE_NONE>,
+			     <165 IRQ_TYPE_NONE>,
+			     <166 IRQ_TYPE_NONE>;
+		status = "disabled";
+	};
+};
