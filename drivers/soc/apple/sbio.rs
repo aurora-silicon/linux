@@ -254,6 +254,27 @@ mod lockout_tests {
     }
 
     #[test]
+    fn identities_list_replies_parse() {
+        use crate::sbio::{identities_list_users, IDENTITIES_LIST_MAX, IDENTITIES_RECORD_LEN};
+        // Empty: a user without identities.
+        assert_eq!(identities_list_users(&[]).map(|u| u.count()), Some(0));
+        // Two records, users 1000 and 501, UUIDs opaque.
+        let mut reply = [0u8; 2 * IDENTITIES_RECORD_LEN];
+        reply[0..4].copy_from_slice(&1000i32.to_le_bytes());
+        reply[20..24].copy_from_slice(&501i32.to_le_bytes());
+        reply[4..20].fill(0xaa);
+        let mut users = identities_list_users(&reply).unwrap();
+        assert_eq!(users.next(), Some(1000));
+        assert_eq!(users.next(), Some(501));
+        assert_eq!(users.next(), None);
+        // A partial record or a reply over macOS's 600 bytes is malformed.
+        assert!(identities_list_users(&reply[..21]).is_none());
+        let big = [0u8; IDENTITIES_LIST_MAX + IDENTITIES_RECORD_LEN];
+        assert!(identities_list_users(&big).is_none());
+        assert_eq!(identities_list_users(&big[..IDENTITIES_LIST_MAX]).map(|u| u.count()), Some(30));
+    }
+
+    #[test]
     fn token_ages_name_their_reason() {
         assert_eq!(TokenAge::Fresh.lock_reason(), bio::LOCK_REASON_NONE);
         assert_eq!(TokenAge::NotUnlocked.lock_reason(), bio::LOCK_REASON_NOT_UNLOCKED);
@@ -1288,6 +1309,85 @@ impl SepData {
 
     /// Reads the Linux user's protected configuration once and logs whether
     /// it allows unlock. Only the two symbolic states are logged.
+    /// Lists the enclave's identities per user with GET_IDENTITIES_LIST, as
+    /// macOS reconciles its users: this user's, and how many belong to
+    /// other users of the shared enclave (another OS's users). Counts only;
+    /// identity UUIDs are never logged. Read-only.
+    fn log_identity_inventory(&self) {
+        let own_request = crate::sbio::sbio_identities_list(SBIO_PROBE_USER_ID);
+        let own = match self.sbio_call(&own_request) {
+            SbioOutcome::Ok(reply) => match crate::sbio::identities_list_users(&reply) {
+                Some(users) => {
+                    let (mut mine, mut foreign) = (0usize, 0usize);
+                    for user in users {
+                        if user == SBIO_PROBE_USER_ID {
+                            mine += 1;
+                        } else {
+                            foreign += 1;
+                        }
+                    }
+                    if foreign > 0 {
+                        dev_warn!(
+                            self.dev,
+                            "sbio: GET_IDENTITIES_LIST for user {} returned {} record(s) of other users\n",
+                            SBIO_PROBE_USER_ID,
+                            foreign
+                        );
+                    }
+                    Some(mine)
+                }
+                None => {
+                    dev_warn!(
+                        self.dev,
+                        "sbio: GET_IDENTITIES_LIST reply is malformed ({} bytes)\n",
+                        reply.len()
+                    );
+                    None
+                }
+            },
+            _ => {
+                dev_info!(
+                    self.dev,
+                    "sbio: GET_IDENTITIES_LIST for user {} was not answered\n",
+                    SBIO_PROBE_USER_ID
+                );
+                None
+            }
+        };
+        let all_request = crate::sbio::sbio_identities_list(crate::sbio::IDENTITIES_ALL_USERS);
+        let all = match self.sbio_call(&all_request) {
+            SbioOutcome::Ok(reply) => crate::sbio::identities_list_users(&reply).map(|users| {
+                let mut others = 0usize;
+                let mut total = 0usize;
+                for user in users {
+                    total += 1;
+                    if user != SBIO_PROBE_USER_ID {
+                        others += 1;
+                    }
+                }
+                (total, others)
+            }),
+            _ => None,
+        };
+        match (own, all) {
+            (Some(mine), Some((total, others))) => dev_info!(
+                self.dev,
+                "Touch ID: the enclave lists {} identity/identities for user {}, {} for other users ({} in all)\n",
+                mine,
+                SBIO_PROBE_USER_ID,
+                others,
+                total
+            ),
+            (Some(mine), None) => dev_info!(
+                self.dev,
+                "Touch ID: the enclave lists {} identity/identities for user {}; the all-users list was not answered\n",
+                mine,
+                SBIO_PROBE_USER_ID
+            ),
+            _ => {}
+        }
+    }
+
     fn log_protected_unlock(&self) {
         let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
             return;
@@ -3707,6 +3807,7 @@ impl SepData {
             dev_info!(self.dev, "sbio: restore-ready after device-view proof {}\n", self.templates_restored.load(Relaxed));
             if self.templates_restored.load(Relaxed) {
                 self.reconcile_identities();
+                self.log_identity_inventory();
                 self.log_protected_unlock();
                 self.probe_unlock_evaluation();
                 let _ = self.handle_bg_ops(c"after the restore");
@@ -7008,6 +7109,39 @@ const IR_SELECTOR: usize = 20;
 const IR_SELECTOR_BUILTIN: u32 = 1;
 static_assert!(IR_SELECTOR == IDENTITY_V1_LEN);
 static_assert!(IR_SELECTOR + 4 <= IDENTITY_RECORD_LEN);
+
+const OP_SBIO_IDENTITIES_LIST: u16 = 0x6e;
+/// Every user in a GET_IDENTITIES_LIST filter.
+pub(crate) const IDENTITIES_ALL_USERS: i32 = -1;
+/// One record: the owning user, then the identity's 16-byte UUID.
+pub(crate) const IDENTITIES_RECORD_LEN: usize = 20;
+/// macOS gives the reply 600 bytes: at most 30 records.
+pub(crate) const IDENTITIES_LIST_MAX: usize = 600;
+
+/// GetIdentitiesList: the enclave's identities of one user, or of every
+/// user for `IDENTITIES_ALL_USERS`. Read-only; macOS uses it to reconcile
+/// its users' identities, for example after removing a user.
+pub(crate) fn sbio_identities_list(filter: i32) -> SbioOp {
+    SbioOp {
+        opcode: OP_SBIO_IDENTITIES_LIST,
+        payload: pad_payload(&filter.to_le_bytes()),
+        payload_len: 4,
+        name: c"GET_IDENTITIES_LIST",
+    }
+}
+
+/// The owning user of each record of a GET_IDENTITIES_LIST reply, or `None`
+/// for a malformed reply. An empty reply is a user without identities.
+pub(crate) fn identities_list_users(reply: &[u8]) -> Option<impl Iterator<Item = i32> + '_> {
+    if reply.len() > IDENTITIES_LIST_MAX || reply.len() % IDENTITIES_RECORD_LEN != 0 {
+        return None;
+    }
+    Some(
+        reply
+            .chunks_exact(IDENTITIES_RECORD_LEN)
+            .map(|r| i32::from_le_bytes([r[0], r[1], r[2], r[3]])),
+    )
+}
 
 const OP_SBIO_LIST_IDENTITIES: u16 = 0x7a;
 pub(crate) fn sbio_list_identities() -> SbioOp {
