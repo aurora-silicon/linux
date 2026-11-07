@@ -69,6 +69,9 @@
 
 #define REG_INTSTATE		0x700
 #define REG_INTMASK		0x704
+/* The cluster registers the driver writes all lie below this offset */
+#define CLUSTER_REGS_END	0x800
+#define CLUSTER_NREGS		(CLUSTER_REGS_END / 4)
 
 /* Bases of serdes units (relative to cluster) */
 #define CLUSTER_RXA_OFF	0x200
@@ -148,6 +151,16 @@ struct mca_cluster {
 
 	unsigned int bclk_ratio;
 
+	/*
+	 * Every value written to the cluster's registers, kept so that they
+	 * can be written again after a system sleep took the MCA's power
+	 * (see mca_resume_early()).
+	 */
+	u32 regs[CLUSTER_NREGS];
+	DECLARE_BITMAP(regs_written, CLUSTER_NREGS);
+	u32 dma_adapter[2];
+	unsigned long dma_adapter_written;
+
 	/* Masks etc. picked up via the set_tdm_slot method */
 	int tdm_slots;
 	int tdm_slot_width;
@@ -179,13 +192,32 @@ struct mca_data {
 	struct mca_cluster clusters[] __counted_by(nclusters);
 };
 
+static void mca_write(struct mca_cluster *cl, int regoffset, u32 val)
+{
+	if (!WARN_ON_ONCE(regoffset < 0 || regoffset >= CLUSTER_REGS_END || regoffset % 4)) {
+		cl->regs[regoffset / 4] = val;
+		__set_bit(regoffset / 4, cl->regs_written);
+	}
+	writel_relaxed(val, cl->base + regoffset);
+}
+
 static void mca_modify(struct mca_cluster *cl, int regoffset, u32 mask, u32 val)
 {
-	__iomem void *ptr = cl->base + regoffset;
 	u32 newval;
 
-	newval = (val & mask) | (readl_relaxed(ptr) & ~mask);
-	writel_relaxed(newval, ptr);
+	newval = (val & mask) | (readl_relaxed(cl->base + regoffset) & ~mask);
+	mca_write(cl, regoffset, newval);
+}
+
+/* @b: 0 for the cluster's DMA adapter A, 1 for B */
+static void mca_write_dma_adapter(struct mca_cluster *cl, int b, u32 val)
+{
+	struct mca_data *mca = cl->host;
+
+	cl->dma_adapter[b] = val;
+	__set_bit(b, &cl->dma_adapter_written);
+	writel_relaxed(val, mca->switch_base +
+		       (b ? REG_DMA_ADAPTER_B(cl->no) : REG_DMA_ADAPTER_A(cl->no)));
 }
 
 /*
@@ -324,7 +356,7 @@ static int mca_fe_enable_clocks(struct mca_cluster *cl)
 		return -EINVAL;
 	}
 
-	writel_relaxed(cl->no + 1, cl->base + REG_SYNCGEN_MCLK_SEL);
+	mca_write(cl, REG_SYNCGEN_MCLK_SEL, cl->no + 1);
 	mca_modify(cl, REG_SYNCGEN_STATUS, SYNCGEN_STATUS_EN,
 		   SYNCGEN_STATUS_EN);
 	mca_modify(cl, REG_STATUS, STATUS_MCLK_EN, STATUS_MCLK_EN);
@@ -389,8 +421,7 @@ static int mca_fe_prepare(struct snd_pcm_substream *substream,
 			return -EINVAL;
 		}
 
-		writel_relaxed(port + 6 + 1,
-			       cl->base + REG_SYNCGEN_MCLK_SEL);
+		mca_write(cl, REG_SYNCGEN_MCLK_SEL, port + 6 + 1);
 		mca_modify(cl, REG_SYNCGEN_STATUS, SYNCGEN_STATUS_EN,
 			   SYNCGEN_STATUS_EN);
 	}
@@ -432,7 +463,6 @@ static int mca_configure_serdes(struct mca_cluster *cl, int serdes_unit,
 				unsigned int mask, int slots, int nchans,
 				int slot_width, bool is_tx, int portmask)
 {
-	__iomem void *serdes_base = cl->base + serdes_unit;
 	u32 serdes_conf, serdes_conf_mask;
 
 	serdes_conf_mask = SERDES_CONF_WIDTH_MASK | SERDES_CONF_NCHANS;
@@ -476,21 +506,16 @@ static int mca_configure_serdes(struct mca_cluster *cl, int serdes_unit,
 		   serdes_conf_mask, serdes_conf);
 
 	if (is_tx) {
-		writel_relaxed(0xffffffff,
-			       serdes_base + REG_TX_SERDES_SLOTMASK);
-		writel_relaxed(~((u32)mca_crop_mask(mask, nchans)),
-			       serdes_base + REG_TX_SERDES_SLOTMASK + 0x4);
-		writel_relaxed(0xffffffff,
-			       serdes_base + REG_TX_SERDES_SLOTMASK + 0x8);
-		writel_relaxed(~((u32)mask),
-			       serdes_base + REG_TX_SERDES_SLOTMASK + 0xc);
+		mca_write(cl, serdes_unit + REG_TX_SERDES_SLOTMASK, 0xffffffff);
+		mca_write(cl, serdes_unit + REG_TX_SERDES_SLOTMASK + 0x4,
+			  ~((u32)mca_crop_mask(mask, nchans)));
+		mca_write(cl, serdes_unit + REG_TX_SERDES_SLOTMASK + 0x8, 0xffffffff);
+		mca_write(cl, serdes_unit + REG_TX_SERDES_SLOTMASK + 0xc, ~((u32)mask));
 	} else {
-		writel_relaxed(0xffffffff,
-			       serdes_base + REG_RX_SERDES_SLOTMASK);
-		writel_relaxed(~((u32)mca_crop_mask(mask, nchans)),
-			       serdes_base + REG_RX_SERDES_SLOTMASK + 0x4);
-		writel_relaxed(portmask,
-			       serdes_base + REG_RX_SERDES_PORT);
+		mca_write(cl, serdes_unit + REG_RX_SERDES_SLOTMASK, 0xffffffff);
+		mca_write(cl, serdes_unit + REG_RX_SERDES_SLOTMASK + 0x4,
+			  ~((u32)mca_crop_mask(mask, nchans)));
+		mca_write(cl, serdes_unit + REG_RX_SERDES_PORT, portmask);
 	}
 
 	return 0;
@@ -592,10 +617,8 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 		   SERDES_CONF_BCLK_POL, serdes_conf);
 	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART);
-	writel_relaxed(bitstart,
-		       cl->base + CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART);
+	mca_write(cl, CLUSTER_TX_OFF + REG_TX_SERDES_BITSTART, bitstart);
+	mca_write(cl, CLUSTER_RX_OFF + REG_RX_SERDES_BITSTART, bitstart);
 
 	return 0;
 
@@ -698,26 +721,18 @@ static int mca_fe_hw_params(struct snd_pcm_substream *substream,
 		 FIELD_PREP(DMA_ADAPTER_RX_MSB_PAD, pad);
 
 #ifndef USE_RXB_FOR_CAPTURE
-	writel_relaxed(regval, mca->switch_base + REG_DMA_ADAPTER_A(cl->no));
+	mca_write_dma_adapter(cl, 0, regval);
 #else
-	if (is_tx)
-		writel_relaxed(regval,
-			       mca->switch_base + REG_DMA_ADAPTER_A(cl->no));
-	else
-		writel_relaxed(regval,
-			       mca->switch_base + REG_DMA_ADAPTER_B(cl->no));
+	mca_write_dma_adapter(cl, is_tx ? 0 : 1, regval);
 #endif
 
 	if (!mca_fe_clocks_in_use(cl)) {
 		/*
 		 * Set up FSYNC duty cycle as even as possible.
 		 */
-		writel_relaxed((bclk_ratio / 2) - 1,
-			       cl->base + REG_SYNCGEN_HI_PERIOD);
-		writel_relaxed(((bclk_ratio + 1) / 2) - 1,
-			       cl->base + REG_SYNCGEN_LO_PERIOD);
-		writel_relaxed(FIELD_PREP(MCLK_CONF_DIV, 0x1),
-			       cl->base + REG_MCLK_CONF);
+		mca_write(cl, REG_SYNCGEN_HI_PERIOD, (bclk_ratio / 2) - 1);
+		mca_write(cl, REG_SYNCGEN_LO_PERIOD, ((bclk_ratio + 1) / 2) - 1);
+		mca_write(cl, REG_MCLK_CONF, FIELD_PREP(MCLK_CONF_DIV, 0x1));
 
 		ret = clk_set_rate(cl->clk_parent, bclk_ratio * samp_rate);
 		if (ret) {
@@ -838,8 +853,7 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 	fe_cl = mca_dai_to_cluster(snd_soc_rtd_to_cpu(fe, 0));
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		writel_relaxed(PORT_DATA_SEL_TXA(fe_cl->no),
-			       cl->base + REG_PORT_DATA_SEL);
+		mca_write(cl, REG_PORT_DATA_SEL, PORT_DATA_SEL_TXA(fe_cl->no));
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_TX_DATA,
 			   PORT_ENABLES_TX_DATA);
 	}
@@ -860,8 +874,7 @@ static int mca_be_startup(struct snd_pcm_substream *substream,
 		return 0;
 	}
 
-	writel_relaxed(FIELD_PREP(PORT_CLOCK_SEL, fe_cl->no + 1),
-		       cl->base + REG_PORT_CLOCK_SEL);
+	mca_write(cl, REG_PORT_CLOCK_SEL, FIELD_PREP(PORT_CLOCK_SEL, fe_cl->no + 1));
 	mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_CLOCKS,
 		   PORT_ENABLES_CLOCKS);
 
@@ -907,7 +920,7 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_TX_DATA, 0);
-		writel_relaxed(0, cl->base + REG_PORT_DATA_SEL);
+		mca_write(cl, REG_PORT_DATA_SEL, 0);
 	}
 
 	if (!fe_cl->clk_provider)
@@ -920,7 +933,7 @@ static void mca_be_shutdown(struct snd_pcm_substream *substream,
 		 * Turn off the lights (clocks).
 		 */
 		mca_modify(cl, REG_PORT_ENABLES, PORT_ENABLES_CLOCKS, 0);
-		writel_relaxed(0, cl->base + REG_PORT_CLOCK_SEL);
+		mca_write(cl, REG_PORT_CLOCK_SEL, 0);
 		scoped_guard(mutex, &mca->port_mutex)
 			cl->port_clk_driver = -1;
 
@@ -1252,6 +1265,113 @@ static int mca_pcm_new(struct snd_soc_component *component,
 	return 0;
 }
 
+/*
+ * A system sleep powers the MCA off: the audio_p and cluster power domains
+ * are switched off with everything else, whatever runtime PM holds, and
+ * every register the driver wrote is lost. ASoC then resumes the card as if
+ * nothing happened: it unmutes the codecs of every open playback stream,
+ * and a re-prepare finds the clocks marked in use and leaves them alone, so
+ * a stream that stays open across the sleep gets no bit clock or frame sync
+ * at all. Codecs whose mute state needs the TDM clock (TAS2764/SN012776)
+ * then latch clock and over-current faults.
+ *
+ * Write the registers back before the card resumes (early resume runs
+ * before any device's resume): the configuration first, then the enables of
+ * the clocks, the sync generator and the ports, as the driver sets them up.
+ * A SERDES comes back stopped, as the suspended stream left it: its trigger
+ * starts it.
+ *
+ * Only the state of what is in use comes back: all of a cluster whose power
+ * domain the driver holds (pd_link), and the port registers of a cluster
+ * whose port a front-end clocks. Anything else is set up again at its next
+ * use, as after any runtime power-down, and its domain may be off.
+ */
+static bool mca_reg_enables(unsigned int off)
+{
+	switch (off) {
+	case REG_STATUS:
+	case REG_SYNCGEN_STATUS:
+	case REG_PORT_ENABLES:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static u32 mca_reg_restore_value(unsigned int off, u32 val)
+{
+	switch (off) {
+	case CLUSTER_RXA_OFF + REG_SERDES_STATUS:
+	case CLUSTER_TXA_OFF + REG_SERDES_STATUS:
+	case CLUSTER_RXB_OFF + REG_SERDES_STATUS:
+	case CLUSTER_TXB_OFF + REG_SERDES_STATUS:
+		return val & ~(SERDES_STATUS_EN | SERDES_STATUS_RST);
+	default:
+		return val;
+	}
+}
+
+static bool mca_reg_is_port(unsigned int off)
+{
+	return off == REG_PORT_ENABLES || off == REG_PORT_CLOCK_SEL ||
+	       off == REG_PORT_DATA_SEL;
+}
+
+/*
+ * @all: every register written (the cluster's domain is held), else only
+ * those of its port. @enables: the enables, else everything but them.
+ */
+static void mca_restore_cluster(struct mca_cluster *cl, bool all, bool enables)
+{
+	unsigned int i, off;
+
+	for_each_set_bit(i, cl->regs_written, CLUSTER_NREGS) {
+		off = i * 4;
+		if (off == REG_INTSTATE || mca_reg_enables(off) != enables)
+			continue;
+		if (!all && !mca_reg_is_port(off))
+			continue;
+		writel_relaxed(mca_reg_restore_value(off, cl->regs[i]), cl->base + off);
+	}
+}
+
+static int mca_resume_early(struct device *dev)
+{
+	struct mca_data *mca = dev_get_drvdata(dev);
+	bool all[MAX_NCLUSTERS], port[MAX_NCLUSTERS];
+	struct mca_cluster *cl;
+	int i, b;
+
+	scoped_guard(mutex, &mca->port_mutex) {
+		for (i = 0; i < mca->nclusters; i++) {
+			cl = &mca->clusters[i];
+			all[i] = cl->pd_link;
+			port[i] = cl->port_clk_driver >= 0;
+		}
+	}
+
+	for (i = 0; i < mca->nclusters; i++) {
+		cl = &mca->clusters[i];
+		if (!all[i] && !port[i])
+			continue;
+		mca_restore_cluster(cl, all[i], false);
+		for (b = 0; b < 2; b++)
+			if (all[i] && test_bit(b, &cl->dma_adapter_written))
+				writel_relaxed(cl->dma_adapter[b], mca->switch_base +
+					       (b ? REG_DMA_ADAPTER_B(cl->no) :
+						    REG_DMA_ADAPTER_A(cl->no)));
+	}
+	for (i = 0; i < mca->nclusters; i++)
+		if (all[i] || port[i])
+			mca_restore_cluster(&mca->clusters[i], all[i], true);
+
+	return 0;
+}
+
+static const struct dev_pm_ops mca_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, mca_resume_early)
+};
+
 static const struct snd_soc_component_driver mca_component = {
 	.name = "apple-mca",
 	.open = mca_pcm_open,
@@ -1460,6 +1580,7 @@ static struct platform_driver apple_mca_driver = {
 	.driver = {
 		.name = "apple-mca",
 		.of_match_table = apple_mca_of_match,
+		.pm = pm_sleep_ptr(&mca_pm_ops),
 	},
 	.probe = apple_mca_probe,
 	.remove = apple_mca_remove,

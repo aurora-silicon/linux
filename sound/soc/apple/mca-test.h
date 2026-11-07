@@ -96,3 +96,99 @@ static struct kunit_suite mca_capture_sync_suite = {
 	.test_cases = mca_capture_sync_cases,
 };
 kunit_test_suite(mca_capture_sync_suite);
+
+/*
+ * The registers kept for a system sleep: every write, the last value of each,
+ * and the write-back after the sleep with the enables last and the SERDES
+ * stopped. The "hardware" is a buffer here.
+ */
+struct mca_test_regs {
+	struct mca_cluster cl;
+	u32 hw[CLUSTER_NREGS];
+};
+
+static struct mca_test_regs *mca_test_regs_new(struct kunit *test)
+{
+	struct mca_test_regs *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	t->cl.base = (void __iomem *)t->hw;
+	return t;
+}
+
+static void mca_sleep_regs_follow_writes(struct kunit *test)
+{
+	struct mca_test_regs *t = mca_test_regs_new(test);
+
+	mca_write(&t->cl, REG_SYNCGEN_HI_PERIOD, 31);
+	mca_write(&t->cl, REG_SYNCGEN_HI_PERIOD, 15);
+	mca_modify(&t->cl, REG_STATUS, STATUS_MCLK_EN, STATUS_MCLK_EN);
+	mca_modify(&t->cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF, SERDES_CONF_NCHANS, 5);
+
+	KUNIT_EXPECT_EQ(test, t->cl.regs[REG_SYNCGEN_HI_PERIOD / 4], 15U);
+	KUNIT_EXPECT_EQ(test, t->hw[REG_SYNCGEN_HI_PERIOD / 4], 15U);
+	KUNIT_EXPECT_EQ(test, t->cl.regs[REG_STATUS / 4], (u32)STATUS_MCLK_EN);
+	KUNIT_EXPECT_EQ(test, t->cl.regs[(CLUSTER_TX_OFF + REG_TX_SERDES_CONF) / 4], 5U);
+	KUNIT_EXPECT_TRUE(test, test_bit(REG_SYNCGEN_HI_PERIOD / 4, t->cl.regs_written));
+	KUNIT_EXPECT_FALSE(test, test_bit(REG_SYNCGEN_LO_PERIOD / 4, t->cl.regs_written));
+}
+
+static void mca_sleep_regs_restore_in_order(struct kunit *test)
+{
+	struct mca_test_regs *t = mca_test_regs_new(test);
+	unsigned int txs = CLUSTER_TX_OFF + REG_SERDES_STATUS;
+
+	mca_write(&t->cl, REG_MCLK_CONF, 0x100);
+	mca_write(&t->cl, REG_SYNCGEN_STATUS, SYNCGEN_STATUS_EN);
+	mca_write(&t->cl, REG_PORT_ENABLES, PORT_ENABLES_CLOCKS | PORT_ENABLES_TX_DATA);
+	mca_write(&t->cl, txs, SERDES_STATUS_EN | SERDES_STATUS_RST | BIT(4));
+
+	/* The sleep: the hardware is back at its reset values */
+	memset(t->hw, 0, sizeof(t->hw));
+
+	mca_restore_cluster(&t->cl, true, false);
+	KUNIT_EXPECT_EQ(test, t->hw[REG_MCLK_CONF / 4], 0x100U);
+	/* No enable before every configuration register is back */
+	KUNIT_EXPECT_EQ(test, t->hw[REG_SYNCGEN_STATUS / 4], 0U);
+	KUNIT_EXPECT_EQ(test, t->hw[REG_PORT_ENABLES / 4], 0U);
+	/* The SERDES comes back stopped */
+	KUNIT_EXPECT_EQ(test, t->hw[txs / 4], (u32)BIT(4));
+
+	mca_restore_cluster(&t->cl, true, true);
+	KUNIT_EXPECT_EQ(test, t->hw[REG_SYNCGEN_STATUS / 4], (u32)SYNCGEN_STATUS_EN);
+	KUNIT_EXPECT_EQ(test, t->hw[REG_PORT_ENABLES / 4],
+			(u32)(PORT_ENABLES_CLOCKS | PORT_ENABLES_TX_DATA));
+	/* Never written: left alone */
+	KUNIT_EXPECT_EQ(test, t->hw[REG_SYNCGEN_LO_PERIOD / 4], 0U);
+}
+
+/* A cluster whose domain is not held gets only its port back */
+static void mca_sleep_regs_port_only(struct kunit *test)
+{
+	struct mca_test_regs *t = mca_test_regs_new(test);
+
+	mca_write(&t->cl, REG_MCLK_CONF, 0x100);
+	mca_write(&t->cl, REG_PORT_CLOCK_SEL, FIELD_PREP(PORT_CLOCK_SEL, 2));
+	mca_write(&t->cl, REG_PORT_ENABLES, PORT_ENABLES_CLOCKS);
+	memset(t->hw, 0, sizeof(t->hw));
+
+	mca_restore_cluster(&t->cl, false, false);
+	mca_restore_cluster(&t->cl, false, true);
+	KUNIT_EXPECT_EQ(test, t->hw[REG_MCLK_CONF / 4], 0U);
+	KUNIT_EXPECT_EQ(test, t->hw[REG_PORT_CLOCK_SEL / 4], (u32)FIELD_PREP(PORT_CLOCK_SEL, 2));
+	KUNIT_EXPECT_EQ(test, t->hw[REG_PORT_ENABLES / 4], (u32)PORT_ENABLES_CLOCKS);
+}
+
+static struct kunit_case mca_sleep_regs_cases[] = {
+	KUNIT_CASE(mca_sleep_regs_follow_writes),
+	KUNIT_CASE(mca_sleep_regs_restore_in_order),
+	KUNIT_CASE(mca_sleep_regs_port_only),
+	{}
+};
+
+static struct kunit_suite mca_sleep_regs_suite = {
+	.name = "apple-mca-sleep-regs",
+	.test_cases = mca_sleep_regs_cases,
+};
+
+kunit_test_suite(mca_sleep_regs_suite);
