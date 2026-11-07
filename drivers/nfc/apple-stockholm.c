@@ -1,43 +1,53 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple Stockholm NFC controller transport over SPMI
+ * Apple Stockholm NFC controller and embedded Secure Element over SPMI
  *
- * Copyright The Asahi Linux Contributors
+ * Stockholm is an NCI controller with an embedded Secure Element. On the
+ * Macs it sits on its own SPMI bus and is enabled through an SMC GPIO (VEN).
+ * The Mac parts report no RF interfaces and no listen-mode routing in
+ * CORE_INIT, so there is no NFC reader to offer the NFC core: the controller
+ * only fronts the Secure Element. This driver checks that the follower is
+ * present, reads the controller identity once and then holds the controller
+ * in its deepest power state (VEN low) for the life of the system.
+ *
+ * Copyright The Aurora Silicon Contributors
  */
 
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/spmi.h>
+#include <linux/unaligned.h>
 
-#include <net/nfc/nci_core.h>
+#include <net/nfc/nci.h>
 
-#define STOCKHOLM_NFC_PROTOCOLS	(NFC_PROTO_JEWEL_MASK | \
-				 NFC_PROTO_MIFARE_MASK | \
-				 NFC_PROTO_FELICA_MASK | \
-				 NFC_PROTO_ISO14443_MASK | \
-				 NFC_PROTO_ISO14443_B_MASK | \
-				 NFC_PROTO_ISO15693_MASK | \
-				 NFC_PROTO_NFC_DEP_MASK)
+#define STOCKHOLM_FIFO_CHUNK		8
+#define STOCKHOLM_NCI_TIMEOUT_MS	500
 
 #define STOCKHOLM_ERROR_STATUS0_REG	0x4
 #define STOCKHOLM_ERROR_STATUS1_REG	0x7
 #define STOCKHOLM_ERROR_STATUS2_REG	0x8
+
+/* NCI 1.x CORE_INIT_RSP: status, 4 feature bytes, RF interface count. */
+#define STOCKHOLM_INIT_RSP_RF_COUNT	5
+/* After the RF list: connections, routing (2), control size, large (2). */
+#define STOCKHOLM_INIT_RSP_TAIL		6
+#define STOCKHOLM_INIT_RSP_MANUF_LEN	5
 
 /* Transport parameters of one controller model. */
 struct stockholm_model {
 	u16 tx_reg;		/* non-incrementing NCI transmit FIFO */
 	u16 rx_reg;		/* non-incrementing NCI receive FIFO */
 	u16 id_reg;		/* follower ID, side-effect-free read */
-	u16 irq_reg;		/* follower IRQ offset, side-effect-free read */
+	u16 irq_reg;		/* follower IRQ base, side-effect-free read */
 	u16 standby_reg;	/* follower virtual command register */
-	u8 rx_trailer_len;	/* bytes drained after the NCI packet */
 	u8 follower_id;		/* expected value of id_reg */
-	u8 irq_offset;		/* expected base of the follower's IRQ block */
-	u8 standby_on;
+	u8 irq_base;		/* expected value of irq_reg */
 	u8 standby_off;
 	u32 startup_delay_us;
 };
@@ -48,30 +58,27 @@ static const struct stockholm_model stockholm_model96 = {
 	.id_reg = 0x100,
 	.irq_reg = 0x105,
 	.standby_reg = 0x0,
-	.rx_trailer_len = 0,
 	.follower_id = 0x19,
-	.irq_offset = 0xe0,
-	.standby_on = 0x15,
+	.irq_base = 0xe0,
 	.standby_off = 0x14,
 	.startup_delay_us = 10000,
 };
 
 struct stockholm {
 	struct spmi_device *sdev;
-	struct nci_dev *ndev;
+	const struct stockholm_model *model;
 	struct gpio_desc *enable_gpio;
-	struct mutex io_lock;
-	u16 tx_reg;
-	u16 rx_reg;
-	u16 standby_reg;
-	u8 rx_trailer_len;
-	u8 standby_on;
-	u8 standby_off;
-	u32 startup_delay_us;
 	int data_irq;
-	int wake_irq;
 	int error_irq;
-	bool powered;
+
+	/* Serialises FIFO access and the awaited-response state below. */
+	struct mutex io_lock;
+	struct completion rx_done;
+	bool rx_waiting;
+	u8 rx_hdr[2];		/* awaited packet: MT/GID and OID bytes */
+	u8 rx_len;
+	u8 rx_payload[NCI_MAX_PAYLOAD_SIZE];
+	u8 pkt[NCI_CTRL_HDR_SIZE + NCI_MAX_PAYLOAD_SIZE];
 };
 
 static int stockholm_fifo_read(struct stockholm *st, u8 *buf, size_t len)
@@ -80,8 +87,9 @@ static int stockholm_fifo_read(struct stockholm *st, u8 *buf, size_t len)
 	int ret;
 
 	while (len) {
-		chunk = min_t(size_t, len, 8);
-		ret = spmi_ext_register_readl(st->sdev, st->rx_reg, buf, chunk);
+		chunk = min_t(size_t, len, STOCKHOLM_FIFO_CHUNK);
+		ret = spmi_ext_register_readl(st->sdev, st->model->rx_reg, buf,
+					      chunk);
 		if (ret)
 			return ret;
 		buf += chunk;
@@ -97,8 +105,9 @@ static int stockholm_fifo_write(struct stockholm *st, const u8 *buf, size_t len)
 	int ret;
 
 	while (len) {
-		chunk = min_t(size_t, len, 8);
-		ret = spmi_ext_register_writel(st->sdev, st->tx_reg, buf, chunk);
+		chunk = min_t(size_t, len, STOCKHOLM_FIFO_CHUNK);
+		ret = spmi_ext_register_writel(st->sdev, st->model->tx_reg,
+					       buf, chunk);
 		if (ret)
 			return ret;
 		buf += chunk;
@@ -108,161 +117,79 @@ static int stockholm_fifo_write(struct stockholm *st, const u8 *buf, size_t len)
 	return 0;
 }
 
-static int stockholm_set_standby(struct stockholm *st, bool standby)
+static int stockholm_standby_off(struct stockholm *st)
 {
-	u8 value = standby ? st->standby_on : st->standby_off;
+	u8 value = st->model->standby_off;
 
-	return spmi_ext_register_writel(st->sdev, st->standby_reg, &value, 1);
+	return spmi_ext_register_writel(st->sdev, st->model->standby_reg,
+					&value, 1);
 }
 
-static int stockholm_set_power(struct stockholm *st, bool on)
+static int stockholm_power_on(struct stockholm *st)
 {
+	u32 delay = st->model->startup_delay_us;
 	int ret;
 
-	if (st->powered == on)
-		return 0;
-
-	ret = gpiod_direction_output(st->enable_gpio, on);
+	ret = gpiod_direction_output(st->enable_gpio, 1);
 	if (ret)
 		return ret;
 
-	st->powered = on;
-	if (on) {
-		usleep_range(st->startup_delay_us,
-			     st->startup_delay_us + max_t(u32, 100, st->startup_delay_us / 10));
-		ret = stockholm_set_standby(st, false);
-		if (ret)
-			dev_dbg(&st->sdev->dev, "standby exit failed: %d\n", ret);
-	}
+	usleep_range(delay, delay + delay / 10);
+	ret = stockholm_standby_off(st);
+	if (ret)
+		dev_dbg(&st->sdev->dev, "standby exit failed: %d\n", ret);
 
 	return 0;
 }
 
-static int stockholm_nci_open(struct nci_dev *ndev)
+static int stockholm_park(struct stockholm *st)
 {
-	struct stockholm *st = nci_get_drvdata(ndev);
 	int ret;
 
-	mutex_lock(&st->io_lock);
-	ret = stockholm_set_power(st, true);
-	if (!ret)
-		enable_irq(st->data_irq);
-	mutex_unlock(&st->io_lock);
-
-	return ret;
-}
-
-static int stockholm_nci_close(struct nci_dev *ndev)
-{
-	struct stockholm *st = nci_get_drvdata(ndev);
-	int ret;
-
-	disable_irq(st->data_irq);
-	mutex_lock(&st->io_lock);
-	ret = stockholm_set_standby(st, false);
+	ret = stockholm_standby_off(st);
 	if (ret)
 		dev_dbg(&st->sdev->dev, "standby disable failed: %d\n", ret);
-	ret = stockholm_set_power(st, false);
-	mutex_unlock(&st->io_lock);
 
-	return ret;
+	return gpiod_direction_output(st->enable_gpio, 0);
 }
 
-static int stockholm_nci_send(struct nci_dev *ndev, struct sk_buff *skb)
-{
-	struct stockholm *st = nci_get_drvdata(ndev);
-	int ret;
-
-	if (!st->powered) {
-		kfree_skb(skb);
-		return -EHOSTDOWN;
-	}
-
-	mutex_lock(&st->io_lock);
-	ret = stockholm_fifo_write(st, skb->data, skb->len);
-	mutex_unlock(&st->io_lock);
-
-	if (ret)
-		kfree_skb(skb);
-	else
-		consume_skb(skb);
-
-	return ret;
-}
-
-static int stockholm_nci_post_setup(struct nci_dev *ndev)
-{
-	struct stockholm *st = nci_get_drvdata(ndev);
-
-	dev_info(&st->sdev->dev,
-		 "NCI %u.%u, manufacturer %#02x, firmware identity %#08x\n",
-		 ndev->nci_ver >> 4, ndev->nci_ver & 0xf,
-		 ndev->manufact_id, ndev->manufact_specific_info);
-
-	return 0;
-}
-
-static const struct nci_ops stockholm_nci_ops = {
-	.open = stockholm_nci_open,
-	.close = stockholm_nci_close,
-	.send = stockholm_nci_send,
-	.post_setup = stockholm_nci_post_setup,
-};
-
-static irqreturn_t stockholm_data_irq_thread(int irq, void *data)
+static irqreturn_t stockholm_data_irq(int irq, void *data)
 {
 	struct stockholm *st = data;
-	struct nci_ctrl_hdr hdr;
-	struct sk_buff *skb = NULL;
-	u8 trailer[2];
-	size_t nci_len;
+	u8 *hdr = st->pkt;
+	u8 plen = 0;
 	int ret;
 
 	mutex_lock(&st->io_lock);
-	ret = stockholm_fifo_read(st, (u8 *)&hdr, sizeof(hdr));
-	if (ret)
-		goto out_unlock;
-
-	nci_len = sizeof(hdr) + hdr.plen;
-	skb = alloc_skb(nci_len, GFP_KERNEL);
-	if (!skb) {
-		ret = -ENOMEM;
-		goto out_unlock;
+	ret = stockholm_fifo_read(st, hdr, NCI_CTRL_HDR_SIZE);
+	if (!ret) {
+		plen = nci_plen(hdr);
+		ret = stockholm_fifo_read(st, hdr + NCI_CTRL_HDR_SIZE, plen);
+	}
+	if (ret) {
+		mutex_unlock(&st->io_lock);
+		dev_err_ratelimited(&st->sdev->dev, "NCI receive failed: %d\n",
+				    ret);
+		return IRQ_HANDLED;
 	}
 
-	skb_put_data(skb, &hdr, sizeof(hdr));
-	ret = stockholm_fifo_read(st, skb_put(skb, hdr.plen), hdr.plen);
-	/* The two model-96 trailer bytes are not part of the NCI packet. */
-	if (!ret && st->rx_trailer_len)
-		ret = stockholm_fifo_read(st, trailer, st->rx_trailer_len);
+	/* Ignore the packet boundary flag; match MT, GID and OID. */
+	if (st->rx_waiting && (hdr[0] & 0xef) == st->rx_hdr[0] &&
+	    (hdr[1] & 0x3f) == st->rx_hdr[1]) {
+		memcpy(st->rx_payload, hdr + NCI_CTRL_HDR_SIZE, plen);
+		st->rx_len = plen;
+		st->rx_waiting = false;
+		complete(&st->rx_done);
+	} else {
+		dev_dbg(&st->sdev->dev, "dropped NCI packet %02x %02x len %u\n",
+			hdr[0], hdr[1], plen);
+	}
 	mutex_unlock(&st->io_lock);
-	if (ret)
-		goto out_free;
 
-	nci_recv_frame(st->ndev, skb);
-	return IRQ_HANDLED;
-
-out_unlock:
-	mutex_unlock(&st->io_lock);
-out_free:
-	if (!ret)
-		ret = -EBADMSG;
-	if (ret)
-		dev_err_ratelimited(&st->sdev->dev, "NCI receive failed: %d\n", ret);
-	if (skb)
-		kfree_skb(skb);
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t stockholm_wake_irq_thread(int irq, void *data)
-{
-	struct stockholm *st = data;
-
-	pm_wakeup_event(&st->sdev->dev, 0);
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t stockholm_error_irq_thread(int irq, void *data)
+static irqreturn_t stockholm_error_irq(int irq, void *data)
 {
 	struct stockholm *st = data;
 	u8 status[3];
@@ -283,155 +210,198 @@ static irqreturn_t stockholm_error_irq_thread(int irq, void *data)
 
 	if (ret)
 		dev_err_ratelimited(&st->sdev->dev,
-				    "SPMI transport error; status read failed: %d\n",
+				    "transport error, status read failed: %d\n",
 				    ret);
 	else
 		dev_err_ratelimited(&st->sdev->dev,
-				    "SPMI transport error: status %#02x/%#02x/%#02x\n",
+				    "transport error, status %02x/%02x/%02x\n",
 				    status[0], status[1], status[2]);
+
 	return IRQ_HANDLED;
 }
 
-static int stockholm_read_config(struct stockholm *st,
-				 const struct stockholm_model *model)
+/*
+ * Send one NCI control command and wait for its response. Returns the
+ * response payload length; the payload is left in st->rx_payload.
+ */
+static int stockholm_nci_cmd(struct stockholm *st, u16 opcode,
+			     const u8 *payload, u8 plen)
+{
+	u8 cmd[NCI_CTRL_HDR_SIZE + 2] = {};
+	unsigned long left;
+	int ret;
+
+	if (plen > sizeof(cmd) - NCI_CTRL_HDR_SIZE)
+		return -EINVAL;
+
+	cmd[0] = nci_opcode_gid(opcode);
+	nci_mt_set(cmd, NCI_MT_CMD_PKT);
+	cmd[1] = nci_opcode_oid(opcode);
+	cmd[2] = plen;
+	if (plen)
+		memcpy(cmd + NCI_CTRL_HDR_SIZE, payload, plen);
+
+	mutex_lock(&st->io_lock);
+	reinit_completion(&st->rx_done);
+	st->rx_hdr[0] = (NCI_MT_RSP_PKT << 5) | nci_opcode_gid(opcode);
+	st->rx_hdr[1] = nci_opcode_oid(opcode);
+	st->rx_waiting = true;
+	ret = stockholm_fifo_write(st, cmd, NCI_CTRL_HDR_SIZE + plen);
+	if (ret)
+		st->rx_waiting = false;
+	mutex_unlock(&st->io_lock);
+	if (ret)
+		return ret;
+
+	left = wait_for_completion_timeout(&st->rx_done,
+				msecs_to_jiffies(STOCKHOLM_NCI_TIMEOUT_MS));
+
+	mutex_lock(&st->io_lock);
+	if (!left && st->rx_waiting) {
+		st->rx_waiting = false;
+		ret = -ETIMEDOUT;
+	} else {
+		ret = st->rx_len;
+	}
+	mutex_unlock(&st->io_lock);
+
+	return ret;
+}
+
+/* CORE_RESET and CORE_INIT, then log what the controller reports. */
+static int stockholm_identify(struct stockholm *st)
+{
+	struct device *dev = &st->sdev->dev;
+	u8 reset_type = NCI_RESET_TYPE_RESET_CONFIG;
+	const u8 *rsp = st->rx_payload;
+	unsigned int n_rf, tail;
+	u8 version;
+	int len;
+
+	len = stockholm_nci_cmd(st, NCI_OP_CORE_RESET_CMD, &reset_type, 1);
+	if (len < 0)
+		return len;
+	if (len < 1 || rsp[0] != NCI_STATUS_OK)
+		return -EIO;
+	/* Only the NCI 1.x reset response carries the version (3 bytes). */
+	if (len != 3)
+		return -EOPNOTSUPP;
+	version = rsp[1];
+
+	len = stockholm_nci_cmd(st, NCI_OP_CORE_INIT_CMD, NULL, 0);
+	if (len < 0)
+		return len;
+	if (len <= STOCKHOLM_INIT_RSP_RF_COUNT || rsp[0] != NCI_STATUS_OK)
+		return -EIO;
+
+	n_rf = rsp[STOCKHOLM_INIT_RSP_RF_COUNT];
+	tail = STOCKHOLM_INIT_RSP_RF_COUNT + 1 + n_rf + STOCKHOLM_INIT_RSP_TAIL;
+	if (len < tail + STOCKHOLM_INIT_RSP_MANUF_LEN)
+		return -EIO;
+
+	dev_info(dev,
+		 "NCI %u.%u controller, manufacturer %#04x, firmware %08x, %u RF interfaces; parked off\n",
+		 version >> 4, version & 0xf, rsp[tail],
+		 get_unaligned_le32(&rsp[tail + 1]), n_rf);
+
+	return 0;
+}
+
+static int stockholm_check_follower(struct stockholm *st)
 {
 	struct device *dev = &st->sdev->dev;
 	u8 value;
 	int ret;
 
-	ret = spmi_ext_register_readl(st->sdev, model->id_reg, &value, 1);
+	ret = spmi_ext_register_readl(st->sdev, st->model->id_reg, &value, 1);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read follower ID\n");
-	if (value != model->follower_id)
+	if (value != st->model->follower_id)
 		return dev_err_probe(dev, -ENODEV,
-				     "unexpected follower ID %#02x\n", value);
+				     "unexpected follower ID %#04x\n", value);
 
-	ret = spmi_ext_register_readl(st->sdev, model->irq_reg, &value, 1);
+	ret = spmi_ext_register_readl(st->sdev, st->model->irq_reg, &value, 1);
 	if (ret)
-		return dev_err_probe(dev, ret, "failed to read IRQ offset\n");
-	if (value != model->irq_offset)
+		return dev_err_probe(dev, ret, "failed to read IRQ base\n");
+	if (value != st->model->irq_base)
 		return dev_err_probe(dev, -ENODEV,
-				     "unexpected IRQ offset %#02x\n", value);
+				     "unexpected IRQ base %#04x\n", value);
 
 	return 0;
+}
+
+static int stockholm_request_irq(struct stockholm *st, const char *name,
+				 irq_handler_t thread_fn)
+{
+	struct device *dev = &st->sdev->dev;
+	int irq, ret;
+
+	irq = fwnode_irq_get_byname(dev_fwnode(dev), name);
+	if (irq < 0)
+		return dev_err_probe(dev, irq, "no %s interrupt\n", name);
+
+	ret = devm_request_threaded_irq(dev, irq, NULL, thread_fn,
+					IRQF_ONESHOT | IRQF_NO_AUTOEN,
+					dev_name(dev), st);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to request %s IRQ\n",
+				     name);
+
+	return irq;
 }
 
 static int stockholm_probe(struct spmi_device *sdev)
 {
 	struct device *dev = &sdev->dev;
-	const struct stockholm_model *model;
 	struct stockholm *st;
-	int ven, ret;
+	int ret, err;
 
 	st = devm_kzalloc(dev, sizeof(*st), GFP_KERNEL);
 	if (!st)
 		return -ENOMEM;
 
 	st->sdev = sdev;
-	mutex_init(&st->io_lock);
-	spmi_device_set_drvdata(sdev, st);
-
-	model = device_get_match_data(dev);
-	if (!model)
+	st->model = device_get_match_data(dev);
+	if (!st->model)
 		return -ENODEV;
-	st->tx_reg = model->tx_reg;
-	st->rx_reg = model->rx_reg;
-	st->standby_reg = model->standby_reg;
-	st->rx_trailer_len = model->rx_trailer_len;
-	st->standby_on = model->standby_on;
-	st->standby_off = model->standby_off;
-	st->startup_delay_us = model->startup_delay_us;
+	mutex_init(&st->io_lock);
+	init_completion(&st->rx_done);
+
 	st->enable_gpio = devm_gpiod_get(dev, "enable", GPIOD_ASIS);
 	if (IS_ERR(st->enable_gpio))
 		return dev_err_probe(dev, PTR_ERR(st->enable_gpio),
 				     "failed to get VEN GPIO\n");
-	ven = gpiod_get_value_cansleep(st->enable_gpio);
-	dev_dbg(dev, "VEN at probe: %d\n", ven);
 
-	ret = stockholm_set_power(st, true);
+	st->data_irq = stockholm_request_irq(st, "data-ready",
+					     stockholm_data_irq);
+	if (st->data_irq < 0)
+		return st->data_irq;
+	st->error_irq = stockholm_request_irq(st, "error",
+					      stockholm_error_irq);
+	if (st->error_irq < 0)
+		return st->error_irq;
+
+	ret = stockholm_power_on(st);
 	if (ret)
-		return dev_err_probe(dev, ret, "failed to enable controller\n");
+		return dev_err_probe(dev, ret, "failed to raise VEN\n");
 
-	ret = stockholm_read_config(st, model);
-	if (ret)
-		goto err_poweroff;
-
-	st->ndev = nci_allocate_device(&stockholm_nci_ops,
-					STOCKHOLM_NFC_PROTOCOLS, 0, 0);
-	if (!st->ndev) {
-		ret = -ENOMEM;
-		goto err_poweroff;
-	}
-	nci_set_parent_dev(st->ndev, dev);
-	nci_set_drvdata(st->ndev, st);
-
-	st->data_irq = fwnode_irq_get_byname(dev_fwnode(dev), "data-ready");
-	if (st->data_irq < 0) {
-		ret = st->data_irq;
-		goto err_free_nci;
-	}
-	ret = devm_request_threaded_irq(dev, st->data_irq, NULL,
-					stockholm_data_irq_thread, IRQF_ONESHOT,
-					dev_name(dev), st);
-	if (ret)
-		goto err_free_nci;
-	disable_irq(st->data_irq);
-
-	st->wake_irq = fwnode_irq_get_byname(dev_fwnode(dev), "host-wake");
-	if (st->wake_irq >= 0) {
-		ret = devm_request_threaded_irq(dev, st->wake_irq, NULL,
-						stockholm_wake_irq_thread,
-						IRQF_ONESHOT, dev_name(dev), st);
-		if (ret)
-			goto err_free_nci;
-		device_init_wakeup(dev, true);
+	ret = stockholm_check_follower(st);
+	if (!ret) {
+		enable_irq(st->error_irq);
+		enable_irq(st->data_irq);
+		err = stockholm_identify(st);
+		disable_irq(st->data_irq);
+		disable_irq(st->error_irq);
+		if (err)
+			dev_warn(dev, "identity read failed (%d); parked off\n",
+				 err);
 	}
 
-	st->error_irq = fwnode_irq_get_byname(dev_fwnode(dev), "error");
-	if (st->error_irq >= 0) {
-		ret = devm_request_threaded_irq(dev, st->error_irq, NULL,
-						stockholm_error_irq_thread,
-						IRQF_ONESHOT, dev_name(dev), st);
-		if (ret)
-			goto err_free_nci;
-	}
+	err = stockholm_park(st);
+	if (err)
+		return dev_err_probe(dev, err, "failed to park VEN low\n");
 
-	ret = nci_register_device(st->ndev);
-	if (ret)
-		goto err_free_nci;
-
-	ret = stockholm_set_standby(st, false);
-	if (ret)
-		dev_dbg(dev, "initial standby disable failed: %d\n", ret);
-	ret = stockholm_set_power(st, false);
-	if (ret)
-		dev_warn(dev, "failed to park VEN low: %d\n", ret);
-	else
-		dev_info(dev, "registered NCI device and parked VEN low\n");
-
-	return 0;
-
-err_free_nci:
-	nci_free_device(st->ndev);
-err_poweroff:
-	stockholm_set_power(st, false);
 	return ret;
-}
-
-static void stockholm_remove(struct spmi_device *sdev)
-{
-	struct stockholm *st = spmi_device_get_drvdata(sdev);
-
-	nci_unregister_device(st->ndev);
-	nci_free_device(st->ndev);
-	stockholm_set_power(st, false);
-}
-
-static void stockholm_shutdown(struct spmi_device *sdev)
-{
-	struct stockholm *st = spmi_device_get_drvdata(sdev);
-
-	stockholm_set_power(st, false);
 }
 
 static const struct of_device_id stockholm_of_match[] = {
@@ -442,8 +412,6 @@ MODULE_DEVICE_TABLE(of, stockholm_of_match);
 
 static struct spmi_driver stockholm_driver = {
 	.probe = stockholm_probe,
-	.remove = stockholm_remove,
-	.shutdown = stockholm_shutdown,
 	.driver = {
 		.name = "apple-stockholm",
 		.of_match_table = stockholm_of_match,
@@ -452,5 +420,5 @@ static struct spmi_driver stockholm_driver = {
 module_spmi_driver(stockholm_driver);
 
 MODULE_AUTHOR("Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>");
-MODULE_DESCRIPTION("Apple Stockholm NFC controller over SPMI");
+MODULE_DESCRIPTION("Apple Stockholm NFC controller and Secure Element (power and identity)");
 MODULE_LICENSE("GPL");
