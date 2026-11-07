@@ -23,9 +23,16 @@ properties:
       - items:
           - const: apple,t8140-scaler
           - const: apple,scaler
+      - items:
+          - enum:
+              - apple,t8112-scaler
+              - apple,t6020-scaler
+              - apple,t6021-scaler
+              - apple,t6022-scaler
+          - const: apple,scaler
 
   reg:
-    minItems: 4
+    minItems: 3
     maxItems: 4
     description: Register apertures in hardware-description order.
 
@@ -35,7 +42,7 @@ properties:
 
   power-domains:
     minItems: 2
-    maxItems: 2
+    maxItems: 3
 
   iommus:
     minItems: 2
@@ -52,8 +59,22 @@ required:
   - reg
   - interrupts
   - power-domains
-  - resets
   - iommus
-  - clocks
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum: ['apple,t6041-scaler', 'apple,t8140-scaler']
+    then:
+      properties:
+        reg:
+          minItems: 4
+        power-domains:
+          maxItems: 2
+      required:
+        - resets
+        - clocks
 
 additionalProperties: false

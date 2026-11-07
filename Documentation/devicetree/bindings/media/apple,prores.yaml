@@ -19,7 +19,12 @@ properties:
     oneOf:
       - const: apple,t8140-prores
       - items:
-          - const: apple,t6041-prores
+          - enum:
+              - apple,t6041-prores
+              - apple,t8112-prores
+              - apple,t6020-prores
+              - apple,t6021-prores
+              - apple,t6022-prores
           - const: apple,prores
 
   reg:
@@ -39,7 +44,8 @@ properties:
     maxItems: 2
 
   iommus:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   power-domains:
     minItems: 1

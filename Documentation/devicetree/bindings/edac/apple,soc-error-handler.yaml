@@ -29,14 +29,32 @@ properties:
       - items:
           - const: apple,t8140-event-log
           - const: apple,soc-event-log
+      - items:
+          - enum:
+              - apple,t8112-error-handler
+              - apple,t6020-error-handler
+              - apple,t6021-error-handler
+              - apple,t6022-error-handler
+          - const: apple,soc-error-handler
+      - items:
+          - enum:
+              - apple,t8112-event-log
+              - apple,t6020-event-log
+              - apple,t6021-event-log
+              - apple,t6022-event-log
+          - const: apple,soc-event-log
+
+  power-domains:
+    maxItems: 1
+    description: Power domain needed for the associated error-source registers.
 
   interrupts:
     minItems: 9
-    maxItems: 89
+    maxItems: 322
 
   reg:
     minItems: 10
-    maxItems: 25
+    maxItems: 255
     description: |
       T6041 uses the qualified per-source NI status apertures in interrupt
       order. T8140 publishes its native error/event register banks in

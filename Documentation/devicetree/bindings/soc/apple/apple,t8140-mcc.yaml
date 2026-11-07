@@ -24,6 +24,13 @@ properties:
       - items:
           - const: apple,t6041-mcc
           - const: apple,t8140-mcc
+      - items:
+          - enum:
+              - apple,t8112-mcc
+              - apple,t6020-mcc
+              - apple,t6021-mcc
+              - apple,t6022-mcc
+          - const: apple,mcc
 
   reg:
     description: Per-plane blocks on T8140, or the two multicast apertures on T8132.

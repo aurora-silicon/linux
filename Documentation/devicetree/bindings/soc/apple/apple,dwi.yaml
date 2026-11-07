@@ -22,6 +22,13 @@ properties:
       - items:
           - const: apple,t8140-dwi
           - const: apple,dwi
+      - items:
+          - enum:
+              - apple,t8112-dwi
+              - apple,t6020-dwi
+              - apple,t6021-dwi
+              - apple,t6022-dwi
+          - const: apple,dwi
 
   reg:
     maxItems: 1

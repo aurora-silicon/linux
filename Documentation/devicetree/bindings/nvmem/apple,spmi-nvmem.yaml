@@ -22,8 +22,11 @@ properties:
           - apple,baku-pmic
           - apple,chapel-pmic
           - apple,maverick-pmic
+          - apple,mirabeau-pmic
+          - apple,monaco-pmic
           - apple,sera-pmic
           - apple,stowe-pmic
+          - apple,vale-pmic
       - const: apple,spmi-nvmem
 
   reg:
@@ -31,6 +34,9 @@ properties:
 
   battery-monitor:
     $ref: /schemas/power/supply/apple,battery-monitor.yaml#
+
+  interrupts:
+    maxItems: 1
 
   rtc:
     $ref: /schemas/rtc/apple,j700-pmu-rtc.yaml#
