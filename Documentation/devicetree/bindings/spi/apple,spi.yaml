@@ -31,6 +31,9 @@ properties:
               - apple,t8112-spi
               - apple,t6000-spi
           - const: apple,spi
+      - items:
+          - const: apple,t6000-spi
+          - const: apple,t8103-spi
 
   reg:
     maxItems: 1

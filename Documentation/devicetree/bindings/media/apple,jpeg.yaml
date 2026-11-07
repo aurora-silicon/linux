@@ -12,8 +12,9 @@ maintainers:
 description: |
   Apple Silicon JPEG engines are directly programmed memory-to-memory codecs.
   Each engine has a dedicated interrupt and DART stream. Multiple engines can
-  share a power domain. The power controller manages the gate; no separate
-  clock or firmware interface is required.
+  share a power domain. The power controller manages the gate. Earlier
+  engines also identify native input-clock selectors. The codec has no
+  firmware interface.
 
   On T6041 the DMA window reserves one 4 GiB slice of the DART high alias for
   the engine's 32-bit buffer pointer registers. T8140 engines take 64-bit
@@ -21,9 +22,15 @@ description: |
 
 properties:
   compatible:
-    enum:
-      - apple,t6041-jpeg
-      - apple,t8140-jpeg
+    oneOf:
+      - enum:
+          - apple,t6041-jpeg
+          - apple,t8140-jpeg
+      - items:
+          - enum:
+              - apple,t8103-jpeg
+              - apple,t6000-jpeg
+          - const: apple,jpeg
 
   reg:
     maxItems: 1
@@ -33,6 +40,10 @@ properties:
 
   iommus:
     maxItems: 1
+
+  clocks:
+    minItems: 1
+    maxItems: 2
 
   power-domains:
     minItems: 1

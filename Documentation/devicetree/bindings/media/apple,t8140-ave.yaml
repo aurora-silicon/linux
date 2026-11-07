@@ -16,23 +16,35 @@ description: |
 
 properties:
   compatible:
-    enum:
-      - apple,t6000-ave
-      - apple,t6041-ave
-      - apple,t8112-ave
-      - apple,t8140-ave
+    oneOf:
+      - enum:
+          - apple,t6000-ave
+          - apple,t6000-ave
+          - apple,t8112-ave
+          - apple,t6041-ave
+          - apple,t8112-ave
+          - apple,t8140-ave
+      - items:
+          - const: apple,t8103-ave
+          - const: apple,ave
 
   reg:
+    minItems: 3
     items:
       - description: Codec registers
       - description: Mailbox registers
       - description: Coprocessor registers
+      - description: Power-management registers
+      - description: Firmware PIO aperture
 
   reg-names:
+    minItems: 3
     items:
       - const: codec
       - const: mailbox
       - const: coproc
+      - const: pmgr
+      - const: pio
 
   interrupts:
     items:
@@ -41,6 +53,9 @@ properties:
       - description: Codec interrupt handled by the firmware
       - description: Codec interrupt handled by the firmware
       - description: Codec interrupt handled by the firmware
+
+  clocks:
+    maxItems: 1
 
   power-domains:
     minItems: 5
@@ -76,5 +91,18 @@ required:
   - power-domains
   - power-domain-names
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum: ["apple,t6041-ave", "apple,t8140-ave"]
+    then:
+      properties:
+        reg:
+          maxItems: 3
+        reg-names:
+          maxItems: 3
 
 additionalProperties: false
