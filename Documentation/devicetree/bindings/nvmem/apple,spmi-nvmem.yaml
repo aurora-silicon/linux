@@ -22,8 +22,10 @@ properties:
           - apple,baku-pmic
           - apple,chapel-pmic
           - apple,maverick-pmic
+          - apple,monaco-pmic
           - apple,sera-pmic
           - apple,stowe-pmic
+          - apple,vale-pmic
       - const: apple,spmi-nvmem
 
   reg:
