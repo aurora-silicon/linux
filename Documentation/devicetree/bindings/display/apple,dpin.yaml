@@ -12,32 +12,112 @@ maintainers:
 description: |
   DisplayPort ingress registers and interrupt for a USB4 display tunnel.
 
-properties:
-  compatible:
-    items:
-      - enum:
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
           - apple,t6000-dpin
           - apple,t6020-dpin
           - apple,t6021-dpin
           - apple,t6022-dpin
           - apple,t6030-dpin
           - apple,t6031-dpin
+          - apple,t6032-dpin
           - apple,t6041-dpin
           - apple,t8103-dpin
           - apple,t8112-dpin
           - apple,t8122-dpin
-      - const: apple,dpin
+          - apple,t8132-dpin
+  required:
+    - compatible
 
-  reg:
-    maxItems: 1
-    description: Register apertures in hardware-description order.
+properties:
+  compatible: true
 
-  interrupts:
-    maxItems: 1
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-dpin
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-dpin
+            - const: apple,dpin
 
-required:
-  - compatible
-  - reg
-  - interrupts
+        reg:
+          maxItems: 1
 
-additionalProperties: false
+        interrupts:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-dpin
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-dpin
+                  - const: apple,dpin
+
+              reg:
+                maxItems: 1
+
+              interrupts:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+          else:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6000-dpin
+                      - apple,t6020-dpin
+                      - apple,t6021-dpin
+                      - apple,t6022-dpin
+                      - apple,t6030-dpin
+                      - apple,t6031-dpin
+                      - apple,t6041-dpin
+                      - apple,t8103-dpin
+                      - apple,t8112-dpin
+                      - apple,t8122-dpin
+                  - const: apple,dpin
+
+              reg:
+                maxItems: 1
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+
+            additionalProperties: false
+
+unevaluatedProperties: false
