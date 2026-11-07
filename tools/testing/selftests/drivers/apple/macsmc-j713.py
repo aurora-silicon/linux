@@ -96,10 +96,20 @@ static int apple_smc_write_u64(struct apple_smc *smc, smc_key key, u64 value)
         parts.append(block(source, marker))
     # Compile the actual probe assignments, so the test also checks board selection.
     assignments = re.search(r"\tsmcgp->j713 = [^;]+;\n\tmutex_init\([^;]+;", source).group()
-    parts += [r'''
+    boards = re.search(r"^static const char \*const macsmc_j713_reg_on_boards\[\] = \{.*?^\};\n",
+                       source, re.M | re.S).group()
+    parts += [boards, r'''
 static bool board_j713;
 static bool of_machine_is_compatible(const char *name)
 { assert(!strcmp(name, "apple,j713")); return board_j713; }
+/* The board list must keep the J713; the other boards take the same path. */
+static bool of_machine_compatible_match(const char *const *compats)
+{
+    for (; *compats; compats++)
+        if (!strcmp(*compats, "apple,j713"))
+            return of_machine_is_compatible(*compats);
+    return false;
+}
 static void profile_init(struct macsmc_gpio *smcgp)
 {
 ''', assignments, r'''

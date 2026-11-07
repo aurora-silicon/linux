@@ -44,6 +44,19 @@
 #define MACSMC_J713_RADIO_REG_ON_TEMPLATE	0x00800000
 
 /*
+ * The M4 Macs with the J713's radio reg-on: the J604 and J773g ADTs have the
+ * same function; the iMacs (J623, J624) have no ADT yet and are assumed to.
+ */
+static const char *const macsmc_j713_reg_on_boards[] = {
+	"apple,j604",
+	"apple,j623",
+	"apple,j624",
+	"apple,j713",
+	"apple,j773g",
+	NULL
+};
+
+/*
  * Commands 0-6 are, presumably, the intended API.
  * Command 0xff lets you get/set the pin configuration in detail directly,
  * but the bit meanings seem not to be stable between devices/PMU hardware
@@ -363,7 +376,7 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
-	smcgp->j713 = of_machine_is_compatible("apple,j713");
+	smcgp->j713 = of_machine_compatible_match(macsmc_j713_reg_on_boards);
 	mutex_init(&smcgp->j713_reg_on_lock);
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
