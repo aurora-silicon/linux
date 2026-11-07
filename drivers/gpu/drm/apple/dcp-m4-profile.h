@@ -24,12 +24,13 @@ struct dcp_m4_profile {
 	u32 brightness_max, brightness_default;
 	u32 width_mm, height_mm;
 	/*
-	 * The qualified preferred timing, horizontal then vertical: Active,
-	 * Total, FrontPorch, SyncWidth, BackPorch, PreciseSyncRate,
+	 * The qualified preferred timing (ID 2), horizontal then vertical:
+	 * Active, Total, FrontPorch, SyncWidth, BackPorch, PreciseSyncRate,
 	 * SyncPolarity, PixelRepetition. NULL: none, so the panel is not
 	 * adopted.
 	 */
 	const u32 (*timing)[8];
+	u32 timing_elements;		/* most timing elements reported */
 };
 
 static const u32 dcp_m4_timing_j713[2][8] = {
@@ -47,7 +48,7 @@ static const struct dcp_m4_profile dcp_m4_profile_j713 = {
 	.done_method = 590, .done_size = 0x730, .open_method = 457,
 	.brightness_max = 500, .brightness_default = 120,
 	.width_mm = 0, .height_mm = 0,
-	.timing = dcp_m4_timing_j713,
+	.timing = dcp_m4_timing_j713, .timing_elements = 1,
 };
 
 /* The J715's panel timing, as macOS reports it (TimingElements, ID 2). */
@@ -67,7 +68,7 @@ static const struct dcp_m4_profile dcp_m4_profile_j715 = {
 	.done_method = 590, .done_size = 0x730, .open_method = 457,
 	.brightness_max = 500, .brightness_default = 120,
 	.width_mm = 0, .height_mm = 0,
-	.timing = dcp_m4_timing_j715,
+	.timing = dcp_m4_timing_j715, .timing_elements = 1,
 };
 
 static const struct dcp_m4_profile *const dcp_m4_profiles[] = {
