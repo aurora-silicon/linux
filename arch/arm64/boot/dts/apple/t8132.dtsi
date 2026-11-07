@@ -920,6 +920,7 @@
 
 #include "t8132-pmgr.dtsi"
 #include "t8132-usb4.dtsi"
+#include "t8132-pciec-tunables.dtsi"
 
 /* Shared controller resources; board files select the qualified devices. */
 &soc {
