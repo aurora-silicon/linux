@@ -287,11 +287,12 @@
 		reg-names = "config", "rc",
 			    "port0", "port1", "port2", "port3",
 			    "phy0", "phy1", "phy2", "phy3";
-		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&wifi_clkreq_pins &eth_clkreq_pins>;
-		#size-cells = <2>;
 		#address-cells = <3>;
+		#size-cells = <2>;
 		bus-range = <0 2>;
 		iommu-map-mask = <0xffff>;
 		iommu-map = <0x100 &pcie_dart 1 2>, <0x200 &apcie2_dart 1 1>;
@@ -308,12 +309,15 @@
 		port00: pci@0,0 {
 			reg = <0 0 0 0 0>;
 			ranges;
-			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+					<0 0 0 2 &port00 0 0 0 1>,
+					<0 0 0 3 &port00 0 0 0 2>,
+					<0 0 0 4 &port00 0 0 0 3>;
 			interrupt-map-mask = <0 0 0 7>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-			#size-cells = <2>;
 			#address-cells = <3>;
+			#size-cells = <2>;
 			/* ADT /amfm reg_on gP13 */
 			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 			reset-gpios = <&pinctrl 4 GPIO_ACTIVE_LOW>;
