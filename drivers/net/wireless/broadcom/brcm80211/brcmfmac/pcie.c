@@ -424,6 +424,8 @@ struct brcmf_pciedev_info {
 	bool wowl_enabled;
 	bool wowl_irq;
 	bool irq_wake_enabled;
+	bool wakeup_created;
+	bool wakeup_capable;
 	u8 dma_idx_sz;
 	void *idxbuf;
 	u32 idxbuf_sz;
@@ -1157,13 +1159,16 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 	    !of_property_present(pdev->dev.of_node, "interrupts") &&
 	    !of_property_present(pdev->dev.of_node, "interrupts-extended")) {
 		if (!device_may_wakeup(&pdev->dev)) {
+			devinfo->wakeup_capable = device_can_wakeup(&pdev->dev);
 			ret = device_init_wakeup(&pdev->dev, true);
 			if (ret) {
-				device_init_wakeup(&pdev->dev, false);
+				device_set_wakeup_capable(&pdev->dev,
+							  devinfo->wakeup_capable);
 				free_irq(pdev->irq, devinfo);
 				pci_disable_msi(pdev);
 				return ret;
 			}
+			devinfo->wakeup_created = true;
 		}
 		devinfo->wowl_irq = true;
 		bus->wowl_wake = true;
@@ -1192,10 +1197,12 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 		return;
 
 	brcmf_pcie_disable_irq_wake(devinfo);
-	if (devinfo->wowl_irq) {
-		device_init_wakeup(&pdev->dev, false);
-		devinfo->wowl_irq = false;
+	if (devinfo->wakeup_created) {
+		device_wakeup_disable(&pdev->dev);
+		device_set_wakeup_capable(&pdev->dev, devinfo->wakeup_capable);
+		devinfo->wakeup_created = false;
 	}
+	devinfo->wowl_irq = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
