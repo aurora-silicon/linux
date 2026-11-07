@@ -183,7 +183,7 @@
 	};
 };
 
-/* Providers also supplied by the existing standalone boot profile. */
+/* Native interfaces shared by the hardware-only board descriptions. */
 &{/soc} {
 	pcie0_dart: iommu@488000000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";

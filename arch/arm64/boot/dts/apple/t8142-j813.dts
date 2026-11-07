@@ -407,20 +407,15 @@
 
 #include "t8142-peripherals.dtsi"
 
-/* This chassis does not expose this peripheral instance. */
+/* Peripheral instances not exposed by this chassis. */
 /delete-node/ &pcie2_dart;
 
-/* This chassis does not expose this peripheral instance. */
 /delete-node/ &pciec3_dart;
 
-/* This chassis does not expose this peripheral instance. */
 /delete-node/ &acio3_dart;
 
-/* This chassis does not expose this peripheral instance. */
 /delete-node/ &dwc3_3_dart;
 
-/* This chassis does not expose this peripheral instance. */
 /delete-node/ &apcie2_piodma;
 
-/* This chassis does not expose this peripheral instance. */
 /delete-node/ &apciec3_piodma;
