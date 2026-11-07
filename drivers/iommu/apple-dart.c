@@ -4112,20 +4112,20 @@ static int apple_dart_probe(struct platform_device *pdev)
 	bool j713_display, j713_dcpext, j713_dispext, j713_radio;
 
 	/*
-	 * The J713/J715 internal display DARTs are live: DCP firmware (SID23)
+	 * The M4 internal display DARTs are live: DCP firmware (SID23)
 	 * and the scanout/PIODMA frontend (SID0/SID16) keep using them. Leave
 	 * both untouched until userspace, with its watchdog armed, opts in.
 	 */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	j713_display = res && !tunneled && apple_t8132_air() &&
+	j713_display = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x30a300000ULL || res->start == 0x30a340000ULL);
 	/* The external DCP firmware DARTs (SID23) of dcpext0 and dcpext1. */
-	j713_dcpext = res && !tunneled && apple_t8132_air() &&
+	j713_dcpext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286340000ULL || res->start == 0x48a340000ULL);
 	/* The external display DARTs (SID0/SID16) of dispext0 and dispext1. */
-	j713_dispext = res && !tunneled && apple_t8132_air() &&
+	j713_dispext = res && !tunneled && apple_t8132_firmware_path() &&
 		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
 		(res->start == 0x286300000ULL || res->start == 0x48a300000ULL);
 	/* The radio DART's fault interrupt is not described by the loader. */
