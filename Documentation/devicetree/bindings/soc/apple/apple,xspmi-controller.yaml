@@ -10,8 +10,10 @@ maintainers:
   - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 
 description: |
-  External SPMI controller firmware endpoint. Its bus access is mediated
-  by a proxy follower; it has no independently published AP MMIO aperture.
+  External SPMI controller queue aperture, published separately from the
+  non-secure bus and its SPMI proxy follower. The queue aperture is owned
+  by secure firmware; the response vector is local to this transport and
+  is not an AIC interrupt number.
 
 properties:
   compatible:
@@ -20,12 +22,26 @@ properties:
           - apple,t8140-xspmi-controller
       - const: apple,xspmi-controller
 
-  apple,proxy:
-    $ref: /schemas/types.yaml#/definitions/phandle
-    description: SPMI follower implementing the firmware proxy transport.
+  reg:
+    maxItems: 1
+
+  apple,read-queue-depth:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Number of entries in the read request queue.
+
+  apple,write-queue-depth:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Number of entries in the write request queue.
+
+  apple,response-vector:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Local response vector of the firmware transport.
 
 required:
   - compatible
-  - apple,proxy
+  - reg
+  - apple,read-queue-depth
+  - apple,write-queue-depth
+  - apple,response-vector
 
 additionalProperties: false
