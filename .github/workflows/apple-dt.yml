@@ -1,7 +1,15 @@
 name: Apple DT validation
 
 on:
+  push:
+    branches: [integration/aurora]
+    paths:
+      - 'arch/arm64/boot/dts/apple/**'
+      - 'Documentation/devicetree/**'
+      - 'scripts/dtc/**'
+      - '.github/workflows/apple-dt.yml'
   pull_request:
+    branches: [integration/aurora]
     paths:
       - 'arch/arm64/boot/dts/apple/**'
       - 'Documentation/devicetree/**'
