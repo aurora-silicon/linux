@@ -253,8 +253,8 @@ static int stockholm_nci_cmd(struct stockholm *st, u16 opcode,
 	if (ret)
 		return ret;
 
-	left = wait_for_completion_timeout(&st->rx_done,
-				msecs_to_jiffies(STOCKHOLM_NCI_TIMEOUT_MS));
+	left = msecs_to_jiffies(STOCKHOLM_NCI_TIMEOUT_MS);
+	left = wait_for_completion_timeout(&st->rx_done, left);
 
 	mutex_lock(&st->io_lock);
 	if (!left && st->rx_waiting) {
