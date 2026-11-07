@@ -11,10 +11,16 @@
 #include <linux/cred.h>
 #include <linux/delay.h>
 
+#define MACAUDIO_TEST_HIST 32
+
 struct macaudio_test_vol {
 	struct soc_mixer_control mc;
 	long value;
 	int fail;
+	/* Every value written, in order, while @record */
+	bool record;
+	long hist[MACAUDIO_TEST_HIST];
+	unsigned int nhist;
 };
 
 static struct macaudio_test_vol *macaudio_test_vol(struct snd_kcontrol *kctl)
@@ -44,6 +50,8 @@ static int macaudio_test_vol_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_
 
 	if (vol->fail)
 		return vol->fail;
+	if (vol->record && vol->nhist < MACAUDIO_TEST_HIST)
+		vol->hist[vol->nhist++] = uval->value.integer.value[0];
 	changed = vol->value != uval->value.integer.value[0];
 	vol->value = uval->value.integer.value[0];
 	return changed;
@@ -130,6 +138,9 @@ static void macaudio_test_spk_card(struct kunit *test, struct macaudio_test_spk 
 	INIT_LIST_HEAD(&card->ctl_files);
 	init_rwsem(&card->controls_rwsem);
 	rwlock_init(&card->controls_rwlock);
+	/* Powered (D0), as a bound card is */
+	init_waitqueue_head(&card->power_sleep);
+	snd_refcount_init(&card->power_ref);
 	ma->card.snd_card = card;
 	ma->card.dev = dev;
 	INIT_LIST_HEAD(&ma->card.rtd_list);
@@ -846,6 +857,211 @@ static void macaudio_spk_sleep_skips_a_card_without_speakers(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_pm_notify(&ma->pm_nb, PM_POST_SUSPEND, NULL), NOTIFY_DONE);
 }
 
+/* alsactl's restore and mixers leave the ownership controls alone */
+static void macaudio_spk_ownership_controls_are_inactive(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+	unsigned int want = SNDRV_CTL_ELEM_ACCESS_READWRITE |
+			    SNDRV_CTL_ELEM_ACCESS_VOLATILE |
+			    SNDRV_CTL_ELEM_ACCESS_INACTIVE;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, t.spk->vd[0].access & want, want);
+	KUNIT_EXPECT_EQ(test, t.xover->vd[0].access & want, want);
+	/* Still the owner's to write */
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
+}
+
+static void macaudio_test_record(struct macaudio_test_spk *t)
+{
+	unsigned int i;
+
+	for (i = 0; i < MACAUDIO_TEST_NR_VOLS; i++) {
+		macaudio_test_vol(t->vols[i])->record = true;
+		macaudio_test_vol(t->vols[i])->nhist = 0;
+	}
+}
+
+/* The steps a withdrawal wrote to one amp: falling, ending at the floor */
+static unsigned int macaudio_test_expect_ramp(struct kunit *test, struct macaudio_test_spk *t,
+					      unsigned int amp)
+{
+	struct macaudio_test_vol *vol = macaudio_test_vol(t->vols[amp]);
+	unsigned int i;
+
+	KUNIT_ASSERT_GT(test, vol->nhist, 0U);
+	for (i = 1; i < vol->nhist; i++)
+		KUNIT_EXPECT_LT(test, vol->hist[i], vol->hist[i - 1]);
+	KUNIT_EXPECT_LT(test, vol->hist[0], (long)SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, vol->hist[vol->nhist - 1], 0L);
+	return vol->nhist;
+}
+
+/*
+ * A release, the owner gone or replaced while its lease runs: the amps
+ * ramp down before the stream stops, and the whole withdrawal is short.
+ */
+static void macaudio_spk_withdrawal_ramps(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+	unsigned int i, n;
+	ktime_t t0;
+	s64 us;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MAX_MS), 0);
+	macaudio_test_record(&t);
+	t0 = ktime_get();
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	us = ktime_us_delta(ktime_get(), t0);
+	KUNIT_EXPECT_LT(test, us, 20 * USEC_PER_MSEC);
+	/* Every step, unless a slow machine ran into the ramp's limit */
+	for (i = 0; i < MACAUDIO_TEST_NR_SPK; i++) {
+		n = macaudio_test_expect_ramp(test, &t, i);
+		KUNIT_EXPECT_GE(test, n, 2U);
+		KUNIT_EXPECT_LE(test, n, (unsigned int)ARRAY_SIZE(macaudio_spk_ramp_db) + 1);
+	}
+	KUNIT_EXPECT_EQ(test, macaudio_test_vol(t.vols[MACAUDIO_TEST_NR_SPK])->nhist, 0U);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+
+	/* The owner's file closes */
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MAX_MS), 0);
+	macaudio_test_record(&t);
+	macaudio_spk_unlock(t.spk);
+	macaudio_test_expect_ramp(test, &t, 0);
+	macaudio_test_expect_vols(test, &t, 0);
+}
+
+/* Never past the lease: a withdrawal at its end stops at once */
+static void macaudio_spk_ramp_ends_with_the_lease(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+	struct macaudio_test_vol *vol;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MAX_MS), 0);
+	macaudio_test_record(&t);
+	/* As if the lease ended now; the timer has not run yet */
+	mutex_lock(&t.ma->spk_mutex);
+	WRITE_ONCE(t.ma->spk_lease_end, ktime_get());
+	macaudio_spk_floor_ramped(t.ma, "test");
+	mutex_unlock(&t.ma->spk_mutex);
+	vol = macaudio_test_vol(t.vols[0]);
+	KUNIT_ASSERT_EQ(test, vol->nhist, 1U);
+	KUNIT_EXPECT_EQ(test, vol->hist[0], 0L);
+}
+
+/* A lapse and a sleep go straight to the floor */
+static void macaudio_spk_hard_withdrawals_do_not_ramp(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MIN_MS), 0);
+	macaudio_test_record(&t);
+	msleep(3 * SPEAKER_LEASE_MIN_MS);
+	macaudio_test_settle(t.ma);
+	KUNIT_ASSERT_EQ(test, macaudio_test_vol(t.vols[0])->nhist, 1U);
+	KUNIT_EXPECT_EQ(test, macaudio_test_vol(t.vols[0])->hist[0], 0L);
+
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	macaudio_test_record(&t);
+	macaudio_pm_notify(&t.ma->pm_nb, PM_SUSPEND_PREPARE, NULL);
+	KUNIT_ASSERT_EQ(test, macaudio_test_vol(t.vols[0])->nhist, 1U);
+	KUNIT_EXPECT_EQ(test, macaudio_test_vol(t.vols[0])->hist[0], 0L);
+	macaudio_pm_notify(&t.ma->pm_nb, PM_POST_SUSPEND, NULL);
+}
+
+/* The J700's software gain goes straight to its floor too */
+static void macaudio_spk_j700_does_not_ramp(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j700_cfg, MAX98360A_0DB);
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	macaudio_test_record(&t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 0), 0);
+	KUNIT_ASSERT_EQ(test, macaudio_test_vol(t.vols[0])->nhist, 1U);
+	KUNIT_EXPECT_EQ(test, macaudio_test_vol(t.vols[0])->hist[0], (long)MAX98360A_DB(-20));
+}
+
+struct macaudio_test_unlock {
+	struct snd_kcontrol *spk;
+	struct completion done;
+};
+
+static int macaudio_test_unlock_fn(void *data)
+{
+	struct macaudio_test_unlock *u = data;
+
+	macaudio_spk_unlock(u->spk);
+	complete(&u->done);
+	return 0;
+}
+
+/*
+ * The owner dies while the card resumes: the gate closes at once, the amps
+ * are written only once the card is back at D0, and never ramped.
+ */
+static void macaudio_spk_floor_waits_for_the_resume(struct kunit *test)
+{
+	struct snd_card *card;
+	struct macaudio_test_unlock u;
+	struct macaudio_test_spk t;
+	struct task_struct *task;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	card = t.ma->card.snd_card;
+	macaudio_test_take(test, &t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, SPEAKER_LEASE_MAX_MS), 0);
+	macaudio_test_record(&t);
+
+	/* ASoC's resume work: D2 until the codecs and streams are back */
+	snd_power_change_state(card, SNDRV_CTL_POWER_D2);
+	u.spk = t.spk;
+	init_completion(&u.done);
+	task = kthread_run(macaudio_test_unlock_fn, &u, "spk-unlock");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	msleep(20);
+	KUNIT_EXPECT_FALSE(test, completion_done(&u.done));
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(t.ma->spk_granted));
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(t.ma));
+	KUNIT_EXPECT_EQ(test, macaudio_test_vol(t.vols[0])->nhist, 0U);
+	macaudio_test_expect_vols(test, &t, SN012776_0DB);
+
+	snd_power_change_state(card, SNDRV_CTL_POWER_D0);
+	KUNIT_ASSERT_GT(test, wait_for_completion_timeout(&u.done, HZ), 0UL);
+	KUNIT_ASSERT_EQ(test, macaudio_test_vol(t.vols[0])->nhist, 1U);
+	macaudio_test_expect_vols(test, &t, 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&card->power_ref.count), 0);
+}
+
+/* A grant needs a powered card */
+static void macaudio_spk_grant_needs_d0(struct kunit *test)
+{
+	struct macaudio_test_spk t;
+	struct snd_card *card;
+
+	macaudio_test_spk_card(test, &t, &macaudio_j316_cfg, SN012776_0DB);
+	card = t.ma->card.snd_card;
+	macaudio_test_take(test, &t);
+	snd_power_change_state(card, SNDRV_CTL_POWER_D2);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), -EBUSY);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 0L);
+	macaudio_test_expect_vols(test, &t, 0);
+	snd_power_change_state(card, SNDRV_CTL_POWER_D0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &t, 30), 0);
+	KUNIT_EXPECT_EQ(test, macaudio_test_read(test, &t), 1L);
+}
+
 /* A front-end driving the speaker back-end, as DPCM connects them */
 struct macaudio_test_fe {
 	struct snd_soc_dai_link fe_link, be_link;
@@ -1060,6 +1276,13 @@ static struct kunit_case macaudio_protection_cases[] = {
 	KUNIT_CASE(macaudio_spk_sleep_skips_a_card_without_speakers),
 	KUNIT_CASE(macaudio_spk_refused_starts_are_counted),
 	KUNIT_CASE(macaudio_spk_refusals_are_quiet),
+	KUNIT_CASE(macaudio_spk_ownership_controls_are_inactive),
+	KUNIT_CASE(macaudio_spk_withdrawal_ramps),
+	KUNIT_CASE(macaudio_spk_ramp_ends_with_the_lease),
+	KUNIT_CASE(macaudio_spk_hard_withdrawals_do_not_ramp),
+	KUNIT_CASE(macaudio_spk_j700_does_not_ramp),
+	KUNIT_CASE(macaudio_spk_floor_waits_for_the_resume),
+	KUNIT_CASE(macaudio_spk_grant_needs_d0),
 	{}
 };
 
