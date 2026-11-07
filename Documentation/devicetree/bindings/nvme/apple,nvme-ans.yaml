@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/nvme/apple,nvme-ans.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple ANS NVM Express host controller
@@ -9,97 +10,59 @@ title: Apple ANS NVM Express host controller
 maintainers:
   - Sven Peter <sven@svenpeter.dev>
 
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,nvme-ans2"
+              - "apple,rtkit-handoff"
+              - "apple,sart"
+              - "apple,sart.yaml."
+              - "apple,t6000-nvme-ans2"
+              - "apple,t6020-nvme-ans2"
+              - "apple,t6030-nvme-ans2"
+              - "apple,t6031-nvme-ans2"
+              - "apple,t6041-nvme-ans2"
+              - "apple,t8015-nvme-ans2"
+              - "apple,t8103-nvme-ans2"
+              - "apple,t8112-nvme-ans2"
+              - "apple,t8122-nvme-ans2"
+              - "apple,t8132-nvme-ans2"
+              - "apple,t8140-nvme-ans2"
+              - "apple,t8142-nvme-ans2"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          items:
+            -
+              const: "apple,t6050-nvme-ans2"
+            -
+              const: "apple,nvme-ans"
+      required:
+        - "compatible"
+
 properties:
-  compatible:
-    oneOf:
-      - const: apple,t8015-nvme-ans2
-      - const: apple,t6041-nvme-ans2
-      - items:
-          - enum:
-              - apple,t6020-nvme-ans2
-              - apple,t6030-nvme-ans2
-              - apple,t6031-nvme-ans2
-              - apple,t8122-nvme-ans2
-          - const: apple,t8103-nvme-ans2
-      - const: apple,t8132-nvme-ans2
-      - items:
-          - const: apple,t8132-nvme-ans2
-          - const: apple,t8103-nvme-ans2
-      - items:
-          - const: apple,t8140-nvme-ans2
-          - const: apple,t8132-nvme-ans2
-      - items:
-          - const: apple,t8142-nvme-ans2
-          - const: apple,t8140-nvme-ans2
-      - items:
-          - enum:
-              # Do not add additional SoC to this list.
-              - apple,t8103-nvme-ans2
-              - apple,t8112-nvme-ans2
-              - apple,t6000-nvme-ans2
-          - const: apple,nvme-ans2
-
-  reg:
-    minItems: 2
-    items:
-      - description: NVMe controller registers, including the NVMMU
-          registers on SoCs without a separate NVMMU region
-      - description: ANS2 co-processor control registers
-      - description: NVMMU registers, a separate region since T8132 (and
-          on T604x)
-
-  reg-names:
-    oneOf:
-      - minItems: 2
-        items:
-          - const: nvme
-          - const: ans
-          - const: nvmmu
-      - items:
-          - const: nvme
-          - const: nvmmu
-          - const: ans
-
-  resets:
-    maxItems: 1
-    description:
-      Reset of the ANS2 co-processor. On T8140 asserting it raises an
-      SError, so it cannot be used to restart the co-processor there.
-
-  power-domains:
-    # two domains for t8103, three for t6000, t6020, t6041 and t8140
-    minItems: 2
-    items:
-      - description: power domain for the NVMe controller.
-      - description: power domain for the first PCIe bus connecting the NVMe
-          controller to the storage modules.
-      - description: optional power domain for the second PCIe bus
-          connecting the NVMe controller to the storage modules (T6000,
-          T6020), or for the PCIe PHY of the link to the storage (T8140).
-
-  power-domain-names:
-    minItems: 2
-    items:
-      - const: ans
-      - const: apcie0
-      - enum:
-          - apcie1
-          - apcie_phy
-
+  compatible: true
+  reg: true
+  reg-names: true
+  resets: true
+  power-domains: true
+  power-domain-names: true
   mboxes:
     maxItems: 1
     description: Mailbox of the ANS2 co-processor
-
-  interrupts:
-    maxItems: 1
-
+  interrupts: true
   apple,sart:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: |
       Reference to the SART address filter.
 
       The SART address filter is documented in iommu/apple,sart.yaml.
-
   apple,rtkit-handoff:
     $ref: /schemas/types.yaml#/definitions/string
     const: nvme-disabled-v1
@@ -108,76 +71,222 @@ properties:
       with the NVMe controller disabled and its queues drained. The kernel
       adopts that RTKit session without renegotiating it. Shared firmware
       buffers must remain reserved and protected by the SART.
+  iommus: true
+  clocks: true
+  status: true
 
 allOf:
   - if:
-      properties:
-        compatible:
-          not:
-            contains:
-              enum:
-                - apple,t8132-nvme-ans2
-                - apple,t8140-nvme-ans2
+      anyOf:
+        -
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-nvme-ans2"
+                -
+                  const: "apple,nvme-ans"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
     then:
-      properties:
-        apple,rtkit-handoff: false
-
-  - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,t6000-nvme-ans2
-              - apple,t6020-nvme-ans2
-              - apple,t6031-nvme-ans2
-              - apple,t6041-nvme-ans2
-              - apple,t8140-nvme-ans2
-    then:
-      properties:
-        power-domains:
-          minItems: 3
-        power-domain-names:
-          minItems: 3
+      oneOf:
+        -
+          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-nvme-ans2"
+                -
+                  const: "apple,nvme-ans"
+            status:
+              const: "disabled"
+            reg:
+              minItems: 10
+              maxItems: 10
+              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+            interrupts:
+              minItems: 5
+              maxItems: 5
+            clocks:
+              maxItems: 3
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+            - "interrupts"
+            - "clocks"
+          additionalProperties: false
     else:
       properties:
-        power-domains:
-          maxItems: 2
-        power-domain-names:
-          maxItems: 2
-
-  - if:
-      properties:
         compatible:
-          contains:
-            enum:
-              - apple,t6041-nvme-ans2
-              - apple,t8132-nvme-ans2
-              - apple,t8140-nvme-ans2
-    then:
-      properties:
-        reg:
-          minItems: 3
-        reg-names:
-          minItems: 3
-    else:
-      properties:
-        reg:
-          maxItems: 2
-        reg-names:
-          maxItems: 2
+          oneOf:
+            - const: apple,t8015-nvme-ans2
+            - const: apple,t6041-nvme-ans2
+            - items:
+                - enum:
+                    - apple,t6020-nvme-ans2
+                    - apple,t6030-nvme-ans2
+                    - apple,t6031-nvme-ans2
+                    - apple,t8122-nvme-ans2
+                - const: apple,t8103-nvme-ans2
+            - const: apple,t8132-nvme-ans2
+            - items:
+                - const: apple,t8132-nvme-ans2
+                - const: apple,t8103-nvme-ans2
+            - items:
+                - const: apple,t8140-nvme-ans2
+                - const: apple,t8132-nvme-ans2
+            - items:
+                - const: apple,t8142-nvme-ans2
+                - const: apple,t8140-nvme-ans2
+            - items:
+                - enum:
+                    # Do not add additional SoC to this list.
+                    - apple,t8103-nvme-ans2
+                    - apple,t8112-nvme-ans2
+                    - apple,t6000-nvme-ans2
+                - const: apple,nvme-ans2
 
-required:
-  - compatible
-  - reg
-  - reg-names
-  - resets
-  - power-domains
-  - power-domain-names
-  - mboxes
-  - interrupts
-  - apple,sart
+        reg:
+          minItems: 2
+          items:
+            - description: NVMe controller registers, including the NVMMU
+                registers on SoCs without a separate NVMMU region
+            - description: ANS2 co-processor control registers
+            - description: NVMMU registers, a separate region since T8132 (and
+                on T604x)
 
-additionalProperties: false
+        reg-names:
+          oneOf:
+            - minItems: 2
+              items:
+                - const: nvme
+                - const: ans
+                - const: nvmmu
+            - items:
+                - const: nvme
+                - const: nvmmu
+                - const: ans
+
+        resets:
+          maxItems: 1
+          description:
+            Reset of the ANS2 co-processor. On T8140 asserting it raises an
+            SError, so it cannot be used to restart the co-processor there.
+
+        power-domains:
+          # two domains for t8103, three for t6000, t6020, t6041 and t8140
+          minItems: 2
+          items:
+            - description: power domain for the NVMe controller.
+            - description: power domain for the first PCIe bus connecting the NVMe
+                controller to the storage modules.
+            - description: optional power domain for the second PCIe bus
+                connecting the NVMe controller to the storage modules (T6000,
+                T6020), or for the PCIe PHY of the link to the storage (T8140).
+
+        power-domain-names:
+          minItems: 2
+          items:
+            - const: ans
+            - const: apcie0
+            - enum:
+                - apcie1
+                - apcie_phy
+
+        mboxes:
+          maxItems: 1
+          description: Mailbox of the ANS2 co-processor
+
+        interrupts:
+          maxItems: 1
+
+        apple,sart:
+          $ref: /schemas/types.yaml#/definitions/phandle
+          description: |
+            Reference to the SART address filter.
+
+            The SART address filter is documented in iommu/apple,sart.yaml.
+
+        apple,rtkit-handoff:
+          $ref: /schemas/types.yaml#/definitions/string
+          const: nvme-disabled-v1
+          description: |
+            Added at boot when the bootloader leaves the ANS firmware running,
+            with the NVMe controller disabled and its queues drained. The kernel
+            adopts that RTKit session without renegotiating it. Shared firmware
+            buffers must remain reserved and protected by the SART.
+      allOf:
+        - if:
+            properties:
+              compatible:
+                not:
+                  contains:
+                    enum:
+                      - apple,t8132-nvme-ans2
+                      - apple,t8140-nvme-ans2
+          then:
+            properties:
+              apple,rtkit-handoff: false
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6000-nvme-ans2
+                    - apple,t6020-nvme-ans2
+                    - apple,t6031-nvme-ans2
+                    - apple,t6041-nvme-ans2
+                    - apple,t8140-nvme-ans2
+          then:
+            properties:
+              power-domains:
+                minItems: 3
+              power-domain-names:
+                minItems: 3
+          else:
+            properties:
+              power-domains:
+                maxItems: 2
+              power-domain-names:
+                maxItems: 2
+
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6041-nvme-ans2
+                    - apple,t8132-nvme-ans2
+                    - apple,t8140-nvme-ans2
+          then:
+            properties:
+              reg:
+                minItems: 3
+              reg-names:
+                minItems: 3
+          else:
+            properties:
+              reg:
+                maxItems: 2
+              reg-names:
+                maxItems: 2
+      required:
+        - compatible
+        - reg
+        - reg-names
+        - resets
+        - power-domains
+        - power-domain-names
+        - mboxes
+        - interrupts
+        - apple,sart
+      additionalProperties: false
 
 examples:
   - |

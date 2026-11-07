@@ -478,6 +478,23 @@ properties:
           - const: apple,t6041
           - const: apple,arm-platform
 
+      - description: Apple T6050 SoC based platforms
+        items:
+          - enum:
+              - apple,j714c
+              - apple,j714s
+              - apple,j716c
+              - apple,j716s
+              - apple,j775c
+              - apple,j775d
+              - apple,j873s
+              - apple,k114c
+              - apple,k114s
+              - apple,k116c
+              - apple,k116s
+          - const: apple,t6050
+          - const: apple,arm-platform
+
   aurora,minimal-boot:
     type: boolean
     description:

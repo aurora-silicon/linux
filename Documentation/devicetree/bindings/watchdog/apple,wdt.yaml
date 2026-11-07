@@ -2,6 +2,7 @@
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/watchdog/apple,wdt.yaml#
+
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: Apple SoC Watchdog
@@ -9,51 +10,142 @@ title: Apple SoC Watchdog
 maintainers:
   - Sven Peter <sven@svenpeter.dev>
 
-allOf:
-  - $ref: watchdog.yaml#
+select:
+  anyOf:
+    -
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "apple,s5l8960x-wdt"
+              - "apple,s8000-wdt"
+              - "apple,t6000-wdt"
+              - "apple,t6020-wdt"
+              - "apple,t6030-wdt"
+              - "apple,t6031-wdt"
+              - "apple,t6041-wdt"
+              - "apple,t6050-wdt"
+              - "apple,t7000-wdt"
+              - "apple,t8010-wdt"
+              - "apple,t8015-wdt"
+              - "apple,t8103-wdt"
+              - "apple,t8112-wdt"
+              - "apple,t8122-wdt"
+              - "apple,t8132-wdt"
+              - "apple,t8140-wdt"
+              - "apple,wdt"
+      required:
+        - "compatible"
+    -
+      properties:
+        compatible:
+          items:
+            -
+              const: "apple,t6050-wdt"
+            -
+              const: "apple,wdt"
+      required:
+        - "compatible"
 
 properties:
-  compatible:
-    oneOf:
-      - items:
-          - enum:
-              - apple,t6020-wdt
-              - apple,t6030-wdt
-              - apple,t6031-wdt
-              - apple,t6041-wdt
-              - apple,t8122-wdt
-              - apple,t8132-wdt
-              - apple,t8140-wdt
-          - const: apple,t8103-wdt
-      - items:
-          - enum:
-              # Do not add additional SoC to this list.
-              - apple,s5l8960x-wdt
-              - apple,t7000-wdt
-              - apple,s8000-wdt
-              - apple,t8010-wdt
-              - apple,t8015-wdt
-              - apple,t8103-wdt
-              - apple,t8112-wdt
-              - apple,t6000-wdt
-          - const: apple,wdt
+  compatible: true
+  reg: true
+  clocks: true
+  interrupts: true
+  iommus: true
+  power-domains: true
+  resets: true
+  status: true
 
-  reg:
-    maxItems: 1
+allOf:
+  - if:
+      anyOf:
+        -
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-wdt"
+                -
+                  const: "apple,wdt"
+            status:
+              const: "disabled"
+          required:
+            - "compatible"
+            - "status"
+    then:
+      oneOf:
+        -
+          description: "T6050 native resource description. Firmware ownership, backend support and enables require separate qualification. This variant remains disabled and contains no programming sequences or firmware data."
+          properties:
+            compatible:
+              items:
+                -
+                  const: "apple,t6050-wdt"
+                -
+                  const: "apple,wdt"
+            status:
+              const: "disabled"
+            reg:
+              minItems: 5
+              maxItems: 5
+              description: "Native register apertures in hardware-interface order, including shared auxiliary views."
+            interrupts:
+              minItems: 2
+              maxItems: 2
+            clocks:
+              maxItems: 1
+          required:
+            - "compatible"
+            - "reg"
+            - "status"
+            - "interrupts"
+            - "clocks"
+          additionalProperties: false
+    else:
+      allOf:
+        - $ref: watchdog.yaml#
+      properties:
+        compatible:
+          oneOf:
+            - items:
+                - enum:
+                    - apple,t6020-wdt
+                    - apple,t6030-wdt
+                    - apple,t6031-wdt
+                    - apple,t6041-wdt
+                    - apple,t6050-wdt
+                    - apple,t8122-wdt
+                    - apple,t8132-wdt
+                    - apple,t8140-wdt
+                - const: apple,t8103-wdt
+            - items:
+                - enum:
+                    # Do not add additional SoC to this list.
+                    - apple,s5l8960x-wdt
+                    - apple,t7000-wdt
+                    - apple,s8000-wdt
+                    - apple,t8010-wdt
+                    - apple,t8015-wdt
+                    - apple,t8103-wdt
+                    - apple,t8112-wdt
+                    - apple,t6000-wdt
+                - const: apple,wdt
 
-  clocks:
-    maxItems: 1
+        reg:
+          maxItems: 1
 
-  interrupts:
-    maxItems: 1
+        clocks:
+          maxItems: 1
 
-required:
-  - compatible
-  - reg
-  - clocks
-  - interrupts
-
-unevaluatedProperties: false
+        interrupts:
+          maxItems: 1
+      required:
+        - compatible
+        - reg
+        - clocks
+        - interrupts
+      unevaluatedProperties: false
 
 examples:
   - |
