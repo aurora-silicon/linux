@@ -26,10 +26,13 @@ properties:
           - const: apple,t8140-mcc
       - items:
           - enum:
-              - apple,t8112-mcc
               - apple,t6020-mcc
               - apple,t6021-mcc
               - apple,t6022-mcc
+              - apple,t6030-mcc
+              - apple,t6031-mcc
+              - apple,t8112-mcc
+              - apple,t8122-mcc
           - const: apple,mcc
 
   reg:

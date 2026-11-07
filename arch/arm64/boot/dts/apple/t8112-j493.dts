@@ -25,6 +25,8 @@
 	aliases {
 		bluetooth0 = &bluetooth0;
 		keyboard = &keyboard;
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
 		sep = &sep;
 		touchbar0 = &touchbar0;
 		wifi0 = &wifi0;

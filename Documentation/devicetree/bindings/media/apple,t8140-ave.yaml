@@ -10,9 +10,9 @@ maintainers:
   - Miguel Cruz <7362641+Acelogic@users.noreply.github.com>
 
 description: |
-  The T6000, T6041, T8112 and T8140 AVE coprocessors encode video using firmware
-  preloaded by the bootloader. Its two DART instances translate the same stream. The
-  bootloader supplies two reserved firmware regions and their IOVA mappings.
+  The AVE coprocessor encodes video using firmware preloaded by the bootloader.
+  DART instances translate its DMA streams. The bootloader supplies the firmware
+  memory handoff and IOVA mappings.
 
 properties:
   compatible:
@@ -27,16 +27,15 @@ properties:
               - apple,t6020-ave
               - apple,t6021-ave
               - apple,t6022-ave
+              - apple,t6030-ave
+              - apple,t6031-ave
+              - apple,t8122-ave
           - const: apple,ave
 
   reg:
     minItems: 3
-    items:
-      - description: Codec registers
-      - description: Mailbox registers
-      - description: Coprocessor registers
-      - description: Power control registers
-      - description: Fabric register aperture
+    maxItems: 5
+    description: Codec, mailbox, coprocessor and generation-specific auxiliary banks.
 
   reg-names:
     minItems: 3
@@ -56,7 +55,7 @@ properties:
       - description: Codec interrupt handled by the firmware
 
   power-domains:
-    minItems: 5
+    minItems: 1
     maxItems: 6
 
   power-domain-names:
@@ -85,10 +84,37 @@ properties:
 required:
   - compatible
   - reg
-  - reg-names
   - interrupts
   - power-domains
-  - power-domain-names
   - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6020-ave
+              - apple,t6021-ave
+              - apple,t6022-ave
+              - apple,t6030-ave
+              - apple,t6031-ave
+              - apple,t8122-ave
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 5
+    else:
+      properties:
+        reg:
+          minItems: 3
+          maxItems: 3
+        power-domains:
+          minItems: 5
+          maxItems: 6
+      required:
+        - reg-names
+        - power-domain-names
 
 additionalProperties: false

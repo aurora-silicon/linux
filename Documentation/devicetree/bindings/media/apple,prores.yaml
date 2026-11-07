@@ -20,17 +20,20 @@ properties:
       - const: apple,t8140-prores
       - items:
           - enum:
-              - apple,t6041-prores
-              - apple,t8112-prores
               - apple,t6020-prores
               - apple,t6021-prores
               - apple,t6022-prores
+              - apple,t6030-prores
+              - apple,t6031-prores
+              - apple,t6041-prores
+              - apple,t8112-prores
+              - apple,t8122-prores
           - const: apple,prores
 
   reg:
     minItems: 2
     maxItems: 3
-    description: Engine, wrapper and (on T6041) auxiliary register windows.
+    description: Engine, wrapper and generation-specific auxiliary register windows.
 
   reg-names:
     minItems: 2
@@ -65,7 +68,6 @@ properties:
 required:
   - compatible
   - reg
-  - reg-names
   - interrupts
   - iommus
   - power-domains
@@ -75,7 +77,38 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t6041-prores
+            enum:
+              - apple,t6030-prores
+              - apple,t6031-prores
+              - apple,t8122-prores
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 3
+        power-domains:
+          maxItems: 1
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6020-prores
+              - apple,t6021-prores
+              - apple,t6022-prores
+              - apple,t8112-prores
+    then:
+      properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          maxItems: 2
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6041-prores
     then:
       properties:
         reg:
@@ -86,14 +119,27 @@ allOf:
           maxItems: 3
         interrupts:
           maxItems: 1
+        iommus:
+          maxItems: 1
       required:
         - resets
-    else:
+        - reg-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8140-prores
+    then:
       properties:
         reg:
           maxItems: 2
         reg-names:
           maxItems: 2
+        iommus:
+          maxItems: 1
+      required:
+        - reg-names
 
 additionalProperties: false
 
