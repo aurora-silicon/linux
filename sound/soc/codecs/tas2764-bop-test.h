@@ -135,7 +135,7 @@ static void tas2764_dcb_from_dt(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[1], 0xa5);
 }
 
-/* No property: the registers keep their reset values */
+/* No property: explicitly program the SN012776 fallback on every amp. */
 static void tas2764_dcb_absent(struct kunit *test)
 {
 	struct tas2764_priv *tas2764;
@@ -144,7 +144,9 @@ static void tas2764_dcb_absent(struct kunit *test)
 	tas2764 = tas2764_dcb_test_parse(test, "tas2764-kunit-bop-none",
 					 DEVID_SN012776, &ret);
 	KUNIT_EXPECT_EQ(test, ret, 0);
-	KUNIT_EXPECT_FALSE(test, tas2764->have_dc_blk);
+	KUNIT_EXPECT_TRUE(test, tas2764->have_dc_blk);
+	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[0], 0x01);
+	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[1], 0x00);
 }
 
 /* One byte cannot hold both registers: the probe fails */
